@@ -1,6 +1,6 @@
 {
   "name": "dsh-codearts-auth",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "deepseek-harness plugin: CodeArts (Huawei Cloud) browser login, storing the temporary credential via ctx.credentials",
   "type": "module",
   "main": "lib/index.js",
@@ -65,9 +65,9 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-commands": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-commands": "^0.1.7-rc.1",
+    "@deepseek-ai/dsh-credentials": "^0.1.7-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.7-rc.1",
     "@deepseek-ai/schemastery": "^3.18.4"
   },
   "dependencies": {
@@ -77,9 +77,9 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-commands": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-commands": "^0.1.7-rc.1",
+    "@deepseek-ai/dsh-credentials": "^0.1.7-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.7-rc.1",
     "@deepseek-ai/schemastery": "^3.18.4",
     "@types/node": "^22.0.0",
     "cross-env": "^7.0.3",

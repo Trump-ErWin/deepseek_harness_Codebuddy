@@ -46,6 +46,7 @@ import {
 } from './trae.js'
 import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.js'
 import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
+import { traeCooldownFor } from './trae-cooldown.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
@@ -989,10 +990,17 @@ export class TraeAdapter extends LlmAdapter {
         const maxRotate = TRAE_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
           if (currentAccountId && recordsTraeRateLimit(lastKind)) {
+            // 冷却时长按**类别**取（2026-09-26 修）：原实现一律用 1 小时兜底 ⇒
+            // quota-exceeded（4008 = ide_credits **月度**耗尽）也只冷却 1 小时，
+            // 1 小时后耗尽的账号被再次选中，又是 4008 —— 用户看到的就是
+            // 「轮换好像不行，每次都我手动切」。月度级耗尽必须长冷却（7 天，
+            // 覆盖到下次配额重置）；上游若给出明确重置时间应以那个为准，
+            // 但 4008 响应里没有可靠的重置字段，故改的是兜底值本身。
+            const cooldownMs = traeCooldownFor(lastKind)
             await this.options.accountPool.updateModelRateLimit(
               currentAccountId,
               options.model,
-              Date.now() + TRAE_RATE_LIMIT_FALLBACK_MS,
+              Date.now() + cooldownMs,
             )
           }
           const next = await this.options.accountPool.getAvailableAccount(
