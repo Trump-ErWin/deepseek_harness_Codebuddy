@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import { QoderAdapter } from '../../src/qoder-adapter.js'
+import {
+  QoderAdapter,
+  QODER_QUEUE_MAX_ATTEMPTS,
+  parseQoderQueueError,
+  qoderQueueDelayMs,
+} from '../../src/qoder-adapter.js'
 import { QODER } from '../../src/qoder-product.js'
 import { buildQoderCredential, parseQoderTokenPayload, type QoderCredential } from '../../src/qoder.js'
 
@@ -460,5 +465,229 @@ describe('QoderAdapter 图片输入', () => {
 
     expect(readImage).toHaveBeenCalledTimes(1)
     expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+  })
+})
+
+/**
+ * ## 真实缺陷（用户报障，2026-09-27）：Qoder 的**排队错误**被当成认证失败
+ *
+ * 用户给的两条真实错误（都是 HTTP 403 + 业务码 `10605`）：
+ *
+ * ```
+ * 国际版: {"code":"10605","message":"{\"isQueued\":true,…,\"retryAfterSeconds\":30,
+ *          \"serviceAvailable\":false,\"waitTime\":30}"}      → 真排队 30s
+ * 中国版: {"code":"10605","message":"{\"isQueued\":false,…,\"retryAfterSeconds\":2,
+ *          \"serviceAvailable\":true,\"waitTime\":0}"}        → 瞬时，等 2s 即成功
+ * ```
+ *
+ * ⚠️ **关键结构**：`message` 是**一个 JSON 字符串**（不是对象），必须**二次解析**。
+ * 客户端 `lFc()` 为此递归遍历 `data`/`result`/`message`/`body`，字符串则
+ * `JSON.parse`。旧实现只读顶层 `code`，因此从未识别出排队。
+ *
+ * 客户端的权威算法（obf 产物取证，`scripts/probe-qoder-queue-error.mjs`）：
+ * - 排队码 `mRA="10605"` → `model_queued`；认证码 `MF="105"` → `auth_error`
+ *   —— **两者互相独立**（`rJc()`），不能都归为 AUTH；
+ * - 延迟优先序（`kJa()`/`EV()`/`IRA()`）：`retry_after_ms` → `retryAfterMs`
+ *   → `queue.retryAfterSeconds×1000` → 兜底 `Retry-After` 响应头；
+ * - 决策（`W7c()`）：**有 `retryAfterMs` 就精确等它**，没有才退避。
+ */
+describe('QoderAdapter 排队错误（10605 model_queued）', () => {
+  /** 构造一条真实的 403 排队响应（`message` 是 JSON 字符串）。 */
+  function queueResponse(info: Record<string, unknown>): Response {
+    return new Response(
+      JSON.stringify({ code: '10605', message: JSON.stringify(info) }),
+      { status: 403, headers: { 'Content-Type': 'application/json' } },
+    )
+  }
+
+  /** 国际版真排队：等 30s。 */
+  const REAL_QUEUED = {
+    isQueued: true, modelKey: 'qfmodel', queueCount: 0, queueType: 'p3',
+    retryAfterSeconds: 30, serviceAvailable: false, waitTime: 30,
+  }
+  /** 中国版瞬时排队：等 2s，重试即成功。 */
+  const REAL_TRANSIENT = {
+    isQueued: false, modelKey: 'qfmodel', queueCount: 0, queueType: 'p3',
+    retryAfterSeconds: 2, serviceAvailable: true, waitTime: 0,
+  }
+
+  describe('parseQoderQueueError（纯函数：二次解析 message）', () => {
+    it('解析出排队信息（message 是 JSON 字符串，必须二次解析）', () => {
+      const info = parseQoderQueueError(JSON.stringify({ code: '10605', message: JSON.stringify(REAL_QUEUED) }))
+      expect(info).toEqual(REAL_QUEUED)
+    })
+
+    it('中国版瞬时排队同样解析出来', () => {
+      const info = parseQoderQueueError(JSON.stringify({ code: '10605', message: JSON.stringify(REAL_TRANSIENT) }))
+      expect(info).toEqual(REAL_TRANSIENT)
+    })
+
+    it('非 10605 的 403（真认证失败）不算排队', () => {
+      // 认证失败的业务码是 105，不是 10605 —— 两者**必须分开**（客户端 rJc()）。
+      expect(parseQoderQueueError(JSON.stringify({ code: '105', message: 'login expired' }))).toBeUndefined()
+      expect(parseQoderQueueError(JSON.stringify({ code: '10605', message: 'not json' }))).toBeUndefined()
+      expect(parseQoderQueueError('not json at all')).toBeUndefined()
+      expect(parseQoderQueueError('')).toBeUndefined()
+    })
+
+    it('message 是对象而非字符串时也能取到（上游形态变化时更鲁棒）', () => {
+      const info = parseQoderQueueError(JSON.stringify({ code: '10605', message: REAL_QUEUED }))
+      expect(info).toEqual(REAL_QUEUED)
+    })
+
+    it('code 兼容字符串与数字两种编码', () => {
+      expect(parseQoderQueueError(JSON.stringify({ code: 10605, message: JSON.stringify(REAL_TRANSIENT) })))
+        .toEqual(REAL_TRANSIENT)
+    })
+  })
+
+  describe('qoderQueueDelayMs（纯函数：延迟换算与封顶）', () => {
+    it('小于 10 秒按服务端的值（2s → 2000ms）', () => {
+      expect(qoderQueueDelayMs({ retryAfterSeconds: 2 })).toBe(2000)
+      expect(qoderQueueDelayMs({ retryAfterSeconds: 0 })).toBe(0)
+      expect(qoderQueueDelayMs({ retryAfterSeconds: 9 })).toBe(9000)
+    })
+
+    it('≥ 10 秒封顶到 10 秒（30s → 10000ms）', () => {
+      // 用户明确要求：大于 10 秒就按 10 秒排队（避免一次阻塞 30 秒，
+      // 分多次尝试更稳 —— 后端可能提前放行）。
+      expect(qoderQueueDelayMs({ retryAfterSeconds: 10 })).toBe(10_000)
+      expect(qoderQueueDelayMs({ retryAfterSeconds: 30 })).toBe(10_000)
+      expect(qoderQueueDelayMs({ retryAfterSeconds: 3600 })).toBe(10_000)
+    })
+
+    it('优先用 retry_after_ms / retryAfterMs（毫秒口径，同样封顶）', () => {
+      // 客户端 kJa() 的优先序：retry_after_ms → retryAfterMs → retryAfterSeconds×1000
+      expect(qoderQueueDelayMs({ retry_after_ms: 1500, retryAfterSeconds: 30 })).toBe(1500)
+      expect(qoderQueueDelayMs({ retryAfterMs: 2500 })).toBe(2500)
+      // 毫秒值超上限同样封顶
+      expect(qoderQueueDelayMs({ retry_after_ms: 99_999 })).toBe(10_000)
+    })
+
+    it('非法值被忽略，退回退避（而不是等 NaN 毫秒）', () => {
+      // 客户端 W7c() 对非有限/负值直接判 fail；我们取保守：退回退避。
+      expect(qoderQueueDelayMs({ retryAfterSeconds: -5 })).toBeUndefined()
+      expect(qoderQueueDelayMs({ retryAfterSeconds: Number.NaN })).toBeUndefined()
+      expect(qoderQueueDelayMs({})).toBeUndefined()
+      expect(qoderQueueDelayMs({ retryAfterSeconds: '2' as never })).toBeUndefined()
+    })
+
+    it('非排队错误不产生延迟', () => {
+      expect(qoderQueueDelayMs(undefined)).toBeUndefined()
+    })
+  })
+
+  describe('stream 行为：排队时内部等待并重试', () => {
+    it('瞬时排队（2s）等待后重试即成功，且**不刷新凭据**', async () => {
+      const refresh = vi.fn(async () => {})
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        // 第 1 次排队，第 2 次成功（与用户观察一致：一次重试就能过）
+        return call === 1
+          ? queueResponse(REAL_TRANSIENT)
+          : envelopeResponse([textFrame('好了'), finishFrame])
+      }) as unknown as typeof fetch
+
+      const sleeps: number[] = []
+      const pending = collectWith(makeAdapter({
+        fetchImpl, refresh, sleep: async (ms) => { sleeps.push(ms) },
+      }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+      const chunks = await pending
+      expect(sleeps, '应按服务端给的 2s 等待').toEqual([2000])
+      // ⚠️ 排队不是认证问题：绝不能刷新凭据（旧实现会先 refresh 再重试）
+      expect(refresh, '排队期间不应刷新凭据').not.toHaveBeenCalled()
+      expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    })
+
+    it('真排队（30s）按 10s 封顶等待，多次重试直到成功', async () => {
+      const refresh = vi.fn(async () => {})
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        if (call <= 3) return queueResponse(REAL_QUEUED)
+        return envelopeResponse([textFrame('排到了'), finishFrame])
+      }) as unknown as typeof fetch
+
+      const sleeps: number[] = []
+      const chunks = await collectWith(makeAdapter({
+        fetchImpl, refresh, sleep: async (ms) => { sleeps.push(ms) },
+      }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+      // 30s 被压到 10s（用户要求：>10s 按 10s 排）
+      expect(sleeps).toEqual([10_000, 10_000, 10_000])
+      expect(refresh).not.toHaveBeenCalled()
+      expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    })
+
+    it('排队次数超过上限后抛错（不无限阻塞）', async () => {
+      const fetchImpl = vi.fn(async () => queueResponse(REAL_QUEUED)) as unknown as typeof fetch
+      const sleeps: number[] = []
+      const adapter = makeAdapter({
+        fetchImpl,
+        sleep: async (ms) => { sleeps.push(ms); if (sleeps.length > QODER_QUEUE_MAX_ATTEMPTS + 5) throw new Error('sleep 未收敛') },
+      })
+
+      await expect(collectWith(adapter, {
+        model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })).rejects.toThrow(/排队|queue/i)
+
+      // 精确上限：不多不少
+      expect(sleeps.length).toBe(QODER_QUEUE_MAX_ATTEMPTS)
+      expect(QODER_QUEUE_MAX_ATTEMPTS).toBe(180)
+    })
+
+    it('等待期间 signal 中止则立即停止（不再重试）', async () => {
+      const controller = new AbortController()
+      const fetchImpl = vi.fn(async () => queueResponse(REAL_QUEUED)) as unknown as typeof fetch
+      const adapter = makeAdapter({
+        fetchImpl,
+        sleep: async () => { controller.abort() },
+      })
+
+      await expect(collectWith(adapter, {
+        model: 'qfmodel',
+        signal: controller.signal,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })).rejects.toThrow()
+    })
+
+    it('真认证失败（非 10605 的 403）仍走 refresh + AUTH（不误判为排队）', async () => {
+      const refresh = vi.fn(async () => {})
+      const fetchImpl = vi.fn(async () => new Response(
+        JSON.stringify({ code: '105', message: 'login expired' }),
+        { status: 403, headers: { 'Content-Type': 'application/json' } },
+      )) as unknown as typeof fetch
+
+      const sleeps: number[] = []
+      await expect(collectWith(makeAdapter({
+        fetchImpl, refresh, sleep: async (ms) => { sleeps.push(ms) },
+      }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+        .rejects.toThrow()
+
+      expect(sleeps, '认证失败不该走排队等待').toEqual([])
+      expect(refresh, '认证失败应触发续期').toHaveBeenCalled()
+    })
+
+    it('排队总时长上限可用 DSH_QODER_QUEUE_TIMEOUT_MS 覆盖', async () => {
+      // ⚠️ 上限判定是**时间**驱动（默认 30 分钟），单测不能真等 —— 这里设 0，
+      // 语义是「立即判超时」，从而在毫秒级验证该开关确实生效且**不被 180 次
+      // 次数上限抢先命中**（两者的判定顺序是实现细节，此用例锁住它）。
+      process.env.DSH_QODER_QUEUE_TIMEOUT_MS = '0'
+      try {
+        const fetchImpl = vi.fn(async () => queueResponse(REAL_QUEUED)) as unknown as typeof fetch
+        const sleeps: number[] = []
+        await expect(collectWith(makeAdapter({
+          fetchImpl, sleep: async (ms) => { sleeps.push(ms) },
+        }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+          .rejects.toThrow(/排队等待超时/)
+
+        // 上限为 0 → 第一次排队即判超时，**一次都不等**（而不是把 180 次耗完）。
+        expect(sleeps).toEqual([])
+      } finally {
+        delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+      }
+    })
   })
 })

@@ -94,6 +94,59 @@
      ⚠️ 已做**反向验证**：让 `qoderContentParts` 恒返回 undefined（= 修复前行为）
      时其中 4 条会失败，故不是同义反复。
 
+8. **排队错误（业务码 `10605`）必须识别、按服务端延迟等待，且与认证失败分开**
+   —— **真实缺陷**（用户报障，2026-09-27）：国际版「排队 30 秒、5 次重试都没过」；
+   中国版「一次重试就能成功却被当失败」。
+
+   **四种 403 的语义互不相同，绝不能合并**（客户端 `rJc()` 就是分开映射的）：
+
+   | 形态 | 判据 | 处理 |
+   |---|---|---|
+   | **排队** | 业务码 `10605`（客户端 `mRA`）→ `model_queued` | **内部按服务端延迟等待后重试**，不刷新凭据、不换账号 |
+   | 认证失败 | 业务码 `105`（客户端 `MF`）→ `auth_error`，或 401 | 续期凭据后重试（**唯一**该走 refresh 的情形） |
+   | 重复请求 | 客户端 `_TA="duplicate_request"` | 直接重发，**不**续期 |
+   | 签名无效 | `Signature invalid (101)` | 见上文第 2 条（签名头被覆盖） |
+
+   ⚠️ **排队信息藏在 `message` 里，且 `message` 是「一个 JSON 字符串」**：
+   ```json
+   {"code":"10605","message":"{\"isQueued\":true,…,\"retryAfterSeconds\":30,…}"}
+   ```
+   必须**二次解析**（客户端 `lFc()` 递归遍历 `data`/`result`/`message`/`body`，
+   字符串再 `JSON.parse`）。**只读顶层 `code` 永远拿不到排队参数** —— 这是旧实现
+   从未识别出排队的直接原因（`parseQoderQueueError()` 复刻了该行为）。
+
+   ⚠️ **延迟的取值优先序**（客户端 `kJa()`/`EV()`/`IRA()`）：
+   `retry_after_ms` → `retryAfterMs` → `retryAfterSeconds × 1000`
+   → 兜底 `Retry-After` 响应头（纯数字当**秒**，否则 HTTP 日期）。
+
+   ⚠️ **用户定下的等待规则**（`qoderQueueDelayMs()`，**不要擅自改**）：
+   - 服务端给的排队时间 **< 10 秒 → 按它的值**（如 2s → 等 2s，重试即成功）；
+   - **≥ 10 秒 → 封顶 10 秒**（`QODER_QUEUE_MAX_DELAY_MS`）—— 避免一次阻塞
+     30 秒让 UI 长期停在「运行中」且无法区分「排队」与「卡死」；
+   - **最多 180 次**（`QODER_QUEUE_MAX_ATTEMPTS`，与 CodeArts 惯例一致）
+     → 10s × 180 = 最长 30 分钟；总时长可用 `DSH_QODER_QUEUE_TIMEOUT_MS` 覆盖。
+   - ⚠️ **超时判定必须先于次数判定**：反过来写会让「180 次空转」在绝大多数情况下
+     先生效，使 `DSH_QODER_QUEUE_TIMEOUT_MS` **形同虚设**（写用例时实测到了）。
+   - ⚠️ **该环境变量不能写成 `parseInt(…) || 默认值`**：`0` 是合法值（表示「不等」，
+     单测靠它验证开关），而 `0` 是 falsy 会被 `||` 静默换成 30 分钟。
+
+   ⚠️ **为什么不用 harness 的 `retryPolicy`**：它的 `DEFAULT_RETRYABLE_CODES` 是
+   `[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]` **不含 `QUEUE`/`AUTH`**，
+   且它的退避是**固定参数**（`initialDelayMs=500`、`maxDelayMs=10_000`、
+   `maxRetries=5`），**没有 per-error「服务端指定延迟」的通道** ——
+   500/1000/2000/4000/8000 共约 15.5 秒，永远等不到服务端要的 30 秒。
+   故排队必须在**适配器内部**自己等（与 CodeArts 的 `QUEUE_RETRY_DELAY_MS` 同思路，
+   但延迟**来自服务端**而非固定 10 秒）。
+
+   ⚠️ **两站同时受益**：`qoder` 与 `qodercn` 共用同一个 `QoderAdapter`。
+
+   排查脚本 `scripts/probe-qoder-queue-error.mjs`（只读、离线：按客户端算法
+   解析两种真实错误并打印该等多久）。回归用例在 `tests/unit/qoder-adapter.spec.ts`
+   的「排队错误（10605 model_queued）」段（16 条：纯函数解析/换算 + stream 行为，
+   含「瞬时排队等 2s 即成功且**不刷新凭据**」「30s 压到 10s」「超上限抛错」
+   「认证失败不误判为排队」）。sleep 可注入，全部毫秒级完成。
+   ⚠️ 已做**反向验证**：把封顶改回 30s → 3 条失败；去掉二次解析 → 6 条失败。
+
 ⚠️ **`src/qoder-auth-wasm.wasm`（298 KB）随插件分发**，构建时由 `scripts/copy-assets.mjs` 复制到 `lib/`（`tsc` 不搬 `.wasm`）。`build:all` 已含该步骤。
 
 ⚠️ **WASM 提取自 Qoder `0.3.4`**（runtime `1.1.57`）。升级方式：

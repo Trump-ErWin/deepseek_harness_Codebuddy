@@ -47,6 +47,169 @@ import {
 export const PROVIDER = 'qoder'
 
 /**
+ * Qoder 的**排队**业务码（客户端 obf 产物里的 `mRA = "10605"`）。
+ *
+ * ⚠️ **与认证码 `105` 是两回事，绝不能合并**（客户端 `rJc()` 分开映射）：
+ * ```js
+ * function rJc(A,e){ return A===mRA ? yD : A===MF ? "auth_error" : … }
+ * //                  ↑10605→"model_queued"  ↑105→"auth_error"
+ * ```
+ * 早期实现把所有 403 都当认证失败（`httpErrorCode(403)==='AUTH'`），于是
+ * 排队错误走了「续期凭据 + harness 的 5 次通用退避」这条**完全无关**的路径。
+ */
+export const QODER_QUEUE_CODE = '10605'
+
+/**
+ * 单次排队等待的**封顶**（毫秒）。
+ *
+ * 用户要求（2026-09-27）：服务端给的排队时间**小于 10 秒就按它**，
+ * **大于 10 秒按 10 秒**。理由：一次阻塞 30 秒会让 UI 长时间停在「运行中」
+ * 且无法区分「在排队」与「卡死」；而分多次短等待更稳 —— 后端可能提前放行。
+ */
+export const QODER_QUEUE_MAX_DELAY_MS = 10_000
+
+/**
+ * 排队重试的**次数上限**。
+ *
+ * 与同仓库 CodeArts 适配器的既有惯例一致（`QUEUE_MAX_ATTEMPTS = 180`）。
+ * 配合 10s 封顶，最长可覆盖 30 分钟的真实排队。
+ */
+export const QODER_QUEUE_MAX_ATTEMPTS = 180
+
+/**
+ * 排队总时长上限（毫秒），可用 `DSH_QODER_QUEUE_TIMEOUT_MS` 覆盖。
+ *
+ * ⚠️ **不能用 `parseInt(…) || 默认值`**：`0` 是**合法**配置（表示「不等，立即
+ * 判超时」，单测就靠它验证该开关），而 `0` 是 falsy，会被 `||` 静默换成 30 分钟
+ * —— 那会让这个开关在「想关掉排队等待」时**恰好失效**。故显式判 `undefined`。
+ */
+function resolveQueueTimeoutMs(): number {
+  const raw = process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+  if (raw === undefined || raw.length === 0) return 30 * 60_000
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 30 * 60_000
+}
+
+/** 排队错误里我们关心的字段（客户端 `PJa()` 的裁剪版）。 */
+export interface QoderQueueInfo {
+  isQueued?: boolean
+  modelKey?: string
+  queueCount?: number
+  queueType?: string
+  serviceAvailable?: boolean
+  retryAfterSeconds?: number
+  waitTime?: number
+  /** 毫秒口径的延迟（客户端 `kJa()` 优先取这个）。 */
+  retry_after_ms?: number
+  retryAfterMs?: number
+}
+
+/** 只接受有限数字（与客户端的 `RE()` 同口径）。 */
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/**
+ * 读 `AbortSignal.aborted`（**刻意做成函数**）。
+ *
+ * 为什么不能内联 `signal?.aborted === true`：TS 会在 `await` 之前的一次
+ * early-throw 之后把该表达式**静态窄化**为字面量 `false`，于是「等待期间被
+ * 中止」这第二次检查会被判为「无重叠的比较」而**编译报错** —— 那个报错本身
+ * 是假阳性（`aborted` 是随时间的可变状态）。经函数读取即可保留真实语义，
+ * 也把「这里为什么再查一次」的意图写清楚。
+ */
+function isAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true
+}
+
+/**
+ * 从一段响应体里解析**排队信息**；不是排队则返回 undefined。
+ *
+ * ## ⚠️ 为什么必须**递归二次解析**
+ *
+ * 真实响应体长这样（用户报障原文）：
+ * ```json
+ * {"code":"10605","message":"{\"isQueued\":true,…,\"retryAfterSeconds\":30,…}"}
+ * ```
+ * `message` 是**一个 JSON 字符串**，不是对象 —— 只读顶层 `code` 永远拿不到
+ * `retryAfterSeconds`，这正是旧实现从未识别出排队的直接原因。
+ *
+ * 客户端 `lFc()` 就是为此递归遍历 `data` / `result` / `message` / `body`，
+ * 遇到字符串再试 `JSON.parse`。本函数复刻这一行为（含 `message` 本身是对象
+ * 的形态，对上游格式变化更鲁棒）。
+ *
+ * @param body - 响应体原文（或已解析的对象）。
+ * @returns 排队信息；`code` 非 {@link QODER_QUEUE_CODE} 或没有排队字段时 undefined。
+ */
+export function parseQoderQueueError(body: unknown): QoderQueueInfo | undefined {
+  let root: unknown = body
+  if (typeof body === 'string') {
+    try { root = JSON.parse(body) } catch { return undefined }
+  }
+  if (root === null || typeof root !== 'object') return undefined
+
+  // 广度优先展开 data / result / message / body（客户端 lFc() 的键集）。
+  const seen = new Set<unknown>()
+  const nodes: Array<Record<string, unknown>> = []
+  const queue: unknown[] = [root]
+  while (queue.length > 0) {
+    const node = queue.shift()
+    if (node === null || typeof node !== 'object' || seen.has(node)) continue
+    seen.add(node)
+    const record = node as Record<string, unknown>
+    nodes.push(record)
+    for (const key of ['data', 'result', 'message', 'body']) {
+      const value = record[key]
+      if (value !== null && typeof value === 'object') queue.push(value)
+      else if (typeof value === 'string' && value.length > 0) {
+        try { queue.push(JSON.parse(value)) } catch { /* 非 JSON，忽略 */ }
+      }
+    }
+  }
+
+  // 业务码必须命中 10605（兼容字符串与数字编码）—— 认证码 105 不算。
+  const hasQueueCode = nodes.some((node) => node.code === QODER_QUEUE_CODE
+    || node.code === Number(QODER_QUEUE_CODE))
+  if (!hasQueueCode) return undefined
+
+  // 取第一个含排队标志的节点（客户端 dFc()/PJa() 同口径）。
+  const info = nodes.find((node) => node.isQueued !== undefined || node.serviceAvailable !== undefined)
+  if (info === undefined) return undefined
+
+  const out: QoderQueueInfo = {}
+  if (typeof info.isQueued === 'boolean') out.isQueued = info.isQueued
+  if (typeof info.modelKey === 'string' && info.modelKey.length > 0) out.modelKey = info.modelKey
+  if (typeof info.queueType === 'string' && info.queueType.length > 0) out.queueType = info.queueType
+  if (typeof info.serviceAvailable === 'boolean') out.serviceAvailable = info.serviceAvailable
+  for (const key of ['queueCount', 'retryAfterSeconds', 'waitTime', 'retry_after_ms', 'retryAfterMs'] as const) {
+    const value = readFiniteNumber(info[key])
+    if (value !== undefined) out[key] = Math.trunc(value)
+  }
+  return out
+}
+
+/**
+ * 算出本次排队该等多久（毫秒）；无法判定时返回 undefined（交调用方退避）。
+ *
+ * ## 取值的优先级与封顶（客户端 `kJa()` / `EV()` / `W7c()` 的口径）
+ *
+ * 1. `retry_after_ms` → 2. `retryAfterMs` → 3. `retryAfterSeconds × 1000`；
+ * 任一命中即用它，并**封顶** {@link QODER_QUEUE_MAX_DELAY_MS}（10 秒）。
+ *
+ * ⚠️ **非法值一律忽略而不是当 0**：客户端 `W7c()` 对非有限/负值直接判 `fail`。
+ * 我们把它们当「没有服务端延迟」→ 退回退避，避免把 `NaN` 当延迟传给定时器
+ * （那会变成「立即重试」的忙循环，把 5 次机会瞬间烧掉）。
+ */
+export function qoderQueueDelayMs(info: QoderQueueInfo | undefined): number | undefined {
+  if (info === undefined) return undefined
+  const ms = readFiniteNumber(info.retry_after_ms) ?? readFiniteNumber(info.retryAfterMs)
+  const fromSeconds = readFiniteNumber(info.retryAfterSeconds)
+  const raw = ms ?? (fromSeconds === undefined ? undefined : fromSeconds * 1000)
+  if (raw === undefined || raw < 0) return undefined
+  return Math.min(Math.trunc(raw), QODER_QUEUE_MAX_DELAY_MS)
+}
+
+/**
  * 把 DSH 的工具 schema 映射成加密端点认的 `tools[]`。
  *
  * 形态取自客户端 `$Hc(A)`：
@@ -265,6 +428,13 @@ export interface QoderAdapterOptions {
   product?: QoderProduct
   /** 注入的 fetch（测试用）。 */
   fetchImpl?: typeof fetch
+  /**
+   * 注入的休眠实现（**测试用**）。
+   *
+   * 排队重试要真等（最长 10s × 180 次），单测不能真睡 —— 注入后即可断言
+   * 「等了几次、每次多久」，并在毫秒级完成。
+   */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
 /** Qoder 模型适配器。使用 Bearer access_token 鉴权，仅支持 SSE。 */
@@ -281,6 +451,28 @@ export class QoderAdapter extends LlmAdapter {
     this.fallbackIndex = new Map(
       (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
     )
+  }
+
+  /**
+   * 可中止的休眠；信号中止时立即 resolve（不抛错，由调用方检查 signal）。
+   *
+   * ⚠️ **必须响应 `signal`**：排队等待最长可达 30 分钟，用户中途取消会话时
+   * 不能让 generator 卡在 `setTimeout` 里 —— 那会表现为「点了停止但没反应」。
+   */
+  private async sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (this.options.sleep !== undefined) {
+      await this.options.sleep(ms, signal)
+      return
+    }
+    if (ms <= 0 || signal?.aborted === true) return
+    await new Promise<void>((resolve) => {
+      const onAbort = (): void => { clearTimeout(timer); resolve() }
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, ms)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
   }
 
   /**
@@ -504,15 +696,88 @@ export class QoderAdapter extends LlmAdapter {
 
     // 3. 发送（⚠️ 头必须原样透传：Authorization 是 WASM 生成的
     //    `Bearer COSY.<载荷>.<签名>`，用普通 Bearer 覆盖会 403 Signature invalid）
-    let response = await this.sendEncrypted(await buildRequest(credential), options)
-    if (response.status === 401 || response.status === 403) {
-      await this.options.refresh()
-      const refreshed = await this.options.resolveCredential()
-      if (refreshed === undefined || refreshed.access_token.length === 0) {
-        throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status })
-      }
-      credential = await this.ensureUid(refreshed)
+    //
+    // ## 三种 403 的语义**互不相同**，必须分开处理
+    //
+    // | 形态 | 判据 | 处理 |
+    // |---|---|---|
+    // | **排队** | 业务码 `10605`（`model_queued`） | 按服务端给的延迟**内部等待后重试**（见下） |
+    // | 重复请求 | 业务码（客户端 `_TA="duplicate_request"`） | 不刷新凭据，直接重发一次 |
+    // | 认证失败 | 业务码 `105`（`auth_error`）或 401 | 续期凭据后重试（**唯一**该走 refresh 的情形） |
+    //
+    // ⚠️ **真实缺陷**（用户报障，2026-09-27）：旧实现把**所有** 401/403 都当认证
+    // 失败 → 排队时白白续期一次，再落到 harness 的 5 次通用退避（500/1000/2000/
+    // 4000/8000 ≈ 共 15.5 秒）—— 而服务端明确要求等 30 秒，于是**永远等不到**；
+    // 中国版那条「等 2 秒就能成功」的瞬时排队也因走错路径而反复失败。
+    const queueDeadline = Date.now() + resolveQueueTimeoutMs()
+    let queueAttempts = 0
+    let authRefreshed = false
+    let duplicateRetried = false
+    let response: Response
+    for (;;) {
       response = await this.sendEncrypted(await buildRequest(credential), options)
+
+      if (!response.ok && (response.status === 401 || response.status === 403)) {
+        // ⚠️ 必须**先读体再判断**，且 body 只能读一次 —— 排队信息就藏在
+        // `message` 那个 JSON 字符串里（见 `parseQoderQueueError`）。
+        const errorText = await response.text().catch(() => '')
+        const queueInfo = parseQoderQueueError(errorText)
+
+        if (queueInfo !== undefined) {
+          queueAttempts += 1
+          // ⚠️ **先判时间、再判次数**：时间上限是硬约束（用户可调），
+          // 而次数上限只是防御性兜底。反过来写会让「180 次空转」在绝大多数
+          // 情况下先生效，使 `DSH_QODER_QUEUE_TIMEOUT_MS` 形同虚设
+          // （写这条用例时实测到了：期望「排队等待超时」，实际报「超过 180 次」）。
+          if (Date.now() > queueDeadline) {
+            throw new LlmError('qoder: 排队等待超时', 'QUEUE', { status: response.status })
+          }
+          if (queueAttempts > QODER_QUEUE_MAX_ATTEMPTS) {
+            throw new LlmError(
+              `qoder: 排队重试超过上限（${QODER_QUEUE_MAX_ATTEMPTS} 次）`,
+              'QUEUE', { status: response.status },
+            )
+          }
+          if (options.signal?.aborted === true) {
+            throw new LlmError('qoder: 排队等待期间请求已取消', 'QUEUE')
+          }
+          const waitMs = qoderQueueDelayMs(queueInfo)
+          // ⚠️ 拿不到服务端延迟时**不忙等**：用一个保守的短退避，避免瞬间
+          // 烧掉 180 次机会（客户端 W7c() 此时会退回 ltA() 指数退避）。
+          await this.sleep(waitMs ?? 1_000, options.signal)
+          // ⚠️ 这次检查**不是**上一次的重复：它检测的是「**等待期间**被中止」。
+          // `AbortSignal.aborted` 是随时间的可变状态，但 TS 会静态窄化成字面量
+          // `false` 而报「无重叠」—— 故经一个**不透明函数**读取，避免静态收窄
+          // 掩盖这个真实场景（`await` 之后状态可能已变）。
+          if (isAborted(options.signal)) {
+            throw new LlmError('qoder: 排队等待期间请求已取消', 'QUEUE')
+          }
+          // ⚠️ 排队**不刷新凭据**、不换账号：它与认证和额度都无关。
+          continue
+        }
+
+        // 非排队：认证失败才续期（且每次请求最多一次，避免刷爆 userinfo）。
+        if (!authRefreshed) {
+          authRefreshed = true
+          await this.options.refresh()
+          const refreshed = await this.options.resolveCredential()
+          if (refreshed === undefined || refreshed.access_token.length === 0) {
+            throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status })
+          }
+          credential = await this.ensureUid(refreshed)
+          continue
+        }
+        throw new LlmError(`qoder: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+      }
+
+      // 重复请求（客户端 `duplicate_request`）：凭据没问题，重发一次即可。
+      // 归在 403 分支之外是因为它同样以 403 返回，但**不该**续期。
+      if (!response.ok && response.status === 409 && !duplicateRetried) {
+        duplicateRetried = true
+        continue
+      }
+
+      break
     }
 
     if (!response.ok) {
