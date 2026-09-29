@@ -28,6 +28,7 @@ import type { LoomyAuth } from './loomy-auth.js'
 import type { LoomyCredential } from './loomy.js'
 import { RACCOON } from './raccoon-product.js'
 import type { RaccoonAuth } from './raccoon-auth.js'
+import type { ZcodeAuth } from './zcode-auth.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
 import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
@@ -637,6 +638,7 @@ export function registerJetHubRpc(
   cline: ClineAuth,
   loomy: LoomyAuth,
   raccoon: RaccoonAuth,
+  zcode: ZcodeAuth,
   /**
    * provider → 适配器实例（可选）。
    *
@@ -649,7 +651,7 @@ export function registerJetHubRpc(
   ctx.inject(['connection'], (connectionCtx) => {
     registerJetHubEndpoints(
       connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai,
-      qoder, qoderCn, trae, cline, loomy, raccoon, modelAdapters,
+      qoder, qoderCn, trae, cline, loomy, raccoon, zcode, modelAdapters,
     )
   })
 }
@@ -708,6 +710,7 @@ function registerJetHubEndpoints(
   cline: ClineAuth,
   loomy: LoomyAuth,
   raccoon: RaccoonAuth,
+  zcode: ZcodeAuth,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
