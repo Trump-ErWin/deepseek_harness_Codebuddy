@@ -97,3 +97,13 @@ docs/minimax-protocol-notes.md
 # 探针在缺该文件时整体跳过（见 tests/e2e/image-probe-shared.ts 的 hasFixture），
 # 要跑图片压力探测请自备一张 ≥2000×1200 且不含个人信息的截图放到这个路径。
 tests/fixtures/test.png
+
+# 探针遗留与打包产物：**不入库**（2026-10-01 加）。
+#
+# `_diff.txt` / `_r8probe/` 是排查过程中导出的对比文本与被解包的 tarball 目录，
+# `*.tgz` 是 `pnpm pack` 的产物 —— 三者都是「本机排查时顺手留下」的东西，
+# 对仓库其它人无意义，且 tarball 每次构建都不同（会被反复写进历史）。
+# 曾经误 `git add -A` 提交过一次，已用 `git rm --cached` 撤回。
+_diff.txt
+_r8probe/
+*.tgz
