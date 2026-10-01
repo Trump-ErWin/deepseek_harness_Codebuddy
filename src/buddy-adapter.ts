@@ -18,6 +18,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { RATE_LIMIT_FALLBACK_MS, isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
@@ -36,7 +37,6 @@ import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import {
   registerAdapterIdempotent,
-  registerConfigurableProvidersIdempotent,
 } from './llm-register-compat.js'
 
 /**
@@ -216,8 +216,8 @@ export interface BuddyAdapterOptions {
    * 产品配置；默认为 CodeBuddy。
    *
    * 决定请求身份标识（X-Product-Code / User-Agent）、模型元数据的 provider
-   * 字段、providerInfo 的展示名，以及 registerBuddyLlm 注册的路由与
-   * settingsNs。两个内置产品（CodeBuddy / WorkBuddy）共用同一后端与协议，
+   * 字段、providerInfo 的展示名，以及 registerBuddyLlm 注册的路由名。
+   * 两个内置产品（CodeBuddy / WorkBuddy）共用同一后端与协议，
    * 差异全部由本配置承载。
    */
   product?: BuddyProduct
@@ -783,6 +783,11 @@ export class BuddyAdapter extends LlmAdapter {
   private readonly sessionId: string
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: BuddyRemoteModel[] | undefined
+  /**
+   * 目录加载闸门：并发去重 + 失败/空结果冷却。
+   * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
+   */
+  private readonly catalogGate = new RemoteCatalogGate()
   /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
   private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
   /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
@@ -857,25 +862,27 @@ export class BuddyAdapter extends LlmAdapter {
   }
 
   private async ensureRemoteModels(): Promise<void> {
-    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
-    try {
-      const models = await this.options.fetchRemoteModels()
-      if (models.length > 0) {
-        // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
-        // 注入逻辑）：远端下发的上下文窗口优先于静态 fallback 表；
-        // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
-        const reconciled = this.reconcileWithFallback(models)
-        this.remoteModels = reconciled
-        this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]))
-        this.remoteContextWindows = new Map(
-          reconciled
-            .filter((model) => model.contextWindow !== undefined)
-            .map((model) => [model.id, model.contextWindow as number]),
-        )
-      }
-    } catch {
-      // 远端不可用：回退静态列表
-    }
+    const fetchRemote = this.options.fetchRemoteModels
+    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // 闸门：并发去重 + 失败/空结果冷却（详见 src/remote-catalog-gate.ts 的
+    // 实测依据）。Buddy 的目录端点超时上限 60s，失败不冷却会让首屏在
+    // 「每个模型重试一次」的放大下长时间空转。
+    await this.catalogGate.run(async () => {
+      const models = await fetchRemote()
+      if (models.length === 0) return false
+      // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
+      // 注入逻辑）：远端下发的上下文窗口优先于静态 fallback 表；
+      // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
+      const reconciled = this.reconcileWithFallback(models)
+      this.remoteModels = reconciled
+      this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]))
+      this.remoteContextWindows = new Map(
+        reconciled
+          .filter((model) => model.contextWindow !== undefined)
+          .map((model) => [model.id, model.contextWindow as number]),
+      )
+      return true
+    })
   }
 
   /**
@@ -2238,22 +2245,14 @@ function positiveMaxTokens(value: number | undefined): number | undefined {
 /**
  * 在 ctx.llm 上注册 CodeBuddy 系产品的 provider 路由与适配器。
  *
- * 路由名、配置页展示名与 settingsNs 全部由产品配置驱动：
- * CodeBuddy 得到 `buddy`，WorkBuddy 得到 `workbuddy`。
- * `settingsNs` 经 `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是各产品的
- * `llm-<id>` 命名空间；0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，
- * 故解析为本插件条目 id。
+ * 路由名与展示名由产品配置驱动：CodeBuddy 得到 `buddy`，WorkBuddy 得到 `workbuddy`。
+ *
+ * ⚠️ 刻意**不**调用 `ctx.llm.registerConfigurableProviders`（即不向「设置 → 模型 →
+ * 提供商」声明配置行）：账号、模型开关与模型目录都由 Jet Hub 设置页管理，声明只会
+ * 在该页留下无人使用的行。原因、依据与恢复方式见 `llm-register-compat.ts` 模块头。
  */
 export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): BuddyAdapter {
   const product = options.product ?? CODEBUDDY
-  registerConfigurableProvidersIdempotent(ctx.llm, [
-    {
-      provider: product.id,
-      displayName: product.displayName,
-      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-      settingsPath: [],
-    },
-  ])
   const adapter = new BuddyAdapter(options)
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、

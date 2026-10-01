@@ -24,6 +24,7 @@ import { ZcodeAuth } from './zcode-auth.js'
 import { registerZcodeLlm } from './zcode-adapter.js'
 import { ZCODE } from './zcode-product.js'
 import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
+import type { CarrierOutcome } from './captcha-carrier.js'
 import type { ZcodeCredential } from './zcode.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
@@ -64,9 +65,11 @@ export const inject = ['credentials', 'commands', 'llm']
  * ⚠️ **DSH 0.1.7-rc.1 起，settings 表单的命名空间就是 profile 条目 id**
  * （本插件的条目 id 是 `codearts-auth`），且只投影本条目 Config 中标记了
  * `.volatile()` 的字段。因此这里保留一个 `providers` 映射：
- * - 它是六个 provider 各自 `registerConfigurableProviders({ settingsNs })` 的
- *   落地位置（0.1.7 下 `settingsNs` = 本条目 id），模型设置页据此把 provider
- *   判定为「已配置」（判据见 `dsh-client-ui-settings-models` 的 `configured`）；
+ * - **历史**：它曾是各 provider 用 `registerConfigurableProviders({ settingsNs })`
+ *   声明时的落地位置，模型设置页据此把它们判定为「已配置」（判据见
+ *   `dsh-client-ui-settings-models` 的 `configured`）。**2026-10-01 起本插件不再
+ *   声明可配置 provider**（见 `llm-register-compat.ts` 模块头），该映射因此没有
+ *   消费者，保留它只为不改变 `settings.describe()` 的既有形状；
  * - 本插件的凭据与账号管理**不**走这里（那是 Jet Hub 的账号池 +
  *   `ctx.credentials`），故该字段只承接一个宽松映射，不参与业务读取。
  *
@@ -87,10 +90,13 @@ export const Config = Schema.object({
  *   `refFor → deriveKeyRef(provider)` 处以
  *   `provider.toUpperCase is not a function` 崩溃，故注册后回读 `describe()` 自检。
  * - **0.1.7-rc.1**：settings 换成 `SettingsForms`，**没有 `register`**，命名
- *   空间只能是 profile 条目 id —— 此时不再（也无法）注册；各 provider 的
- *   `settingsNs` 由 `settingsNamespaceFor()` 指向本插件条目 id，模型设置页照常
- *   工作。这里刻意**静默跳过**：旧实现在这条分支上会打一条误导性的
+ *   空间只能是 profile 条目 id —— 此时不再（也无法）注册。这里刻意**静默跳过**：
+ *   旧实现在这条分支上会打一条误导性的
  *   「settings 服务不可用」告警（启动日志实证）。
+ *
+ * ⚠️ **2026-10-01 起各 provider 不再声明为可配置 provider**（`settingsNamespaceFor`
+ * 因此没有调用方），模型设置页不再有这些 namespace 的消费者 —— 这份注册此后只影响
+ * ≤0.1.6 的老契约 profile，属遗留行为，本次未一并删除。
  */
 function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
   const settings = settingsOf(ctx)
@@ -199,16 +205,17 @@ export function apply(ctx: Context): void {
   // （老契约没有 configure()，静默跳过）。
   suppressAutoSettingsPage(ctx)
 
-  // provider 配置命名空间的注册**只在老契约（≤0.1.6）下需要**：
-  // 那时 `settings.register` 可用，六个 namespace 分别对应 codearts 路由、
+  // provider 配置命名空间的注册**只在老契约（≤0.1.6）下执行**：
+  // 那时 `settings.register` 可用，十二个 namespace 分别对应 codearts 路由、
   // CodeBuddy（buddy）、WorkBuddy（workbuddy）、LobsterAI（lobsterai）、
-  // Qoder（qoder）、TRAE（trae）—— 后五者由 registerBuddyLlm /
-  // registerLobsteraiLlm / registerQoderLlm / registerTraeLlm 以
-  // `llm-${product.id}` 派生。
+  // Qoder（qoder / qodercn）、TRAE（trae）、Cline（cline）、Loomy（loomy）、
+  // Raccoon（raccoon）、MiniMax（minimax）与 Zcode（zcode）。
   //
   // 0.1.7-rc.1 起 settings 换成 SettingsForms（无 register），命名空间只能是
-  // profile 条目 id，故这里不做任何注册；各 provider 的 settingsNs 由
-  // `settingsNamespaceFor()` 解析为本插件条目 id。
+  // profile 条目 id，故这里不做任何注册。
+  //
+  // ⚠️ 2026-10-01 起各 provider 已**不再**声明为可配置 provider，故这批 namespace
+  // 在模型设置页上已无消费者（详见该函数头的说明）。
   registerProviderSettings(
     ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
     'llm-qoder', 'llm-qodercn', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
@@ -665,6 +672,19 @@ export function apply(ctx: Context): void {
   // 服务名由 ClineAuth 依 product.id 派生，注册为 ctx.clineAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 Cline 面板。
   const cline = new ClineAuth(ctx)
+  /**
+   * 「本次实际使用的是哪个 Cline **池账号**」——「订阅额度 → 请求记录」的
+   * 「账号」列按它归属，面板也是用这个 id 过滤的。
+   *
+   * ⚠️ 与 `activeQoderAccountId` 同因：必须在 `resolveCredential` 里记录
+   * **实际返回的那个账号**，不能事后自己再查一次池 —— 池的选号是即时决策，
+   * 与适配器本次拿到的凭据可能已经不是一个账号。
+   *
+   * ⚠️ 真实缺陷（用户报障「请求记录中数据空白」）：此处曾**完全没有**这个通道，
+   * 适配器只好退回记凭据里的 `account_id`（`usr-…`），而面板按池 id
+   * （`cline-bb211a53`）过滤 → 两个 id 空间不一致 → 表格永远空白。
+   */
+  let activeClineAccountId = ''
   const clineAdapter = registerClineLlm(ctx, {
     credentialRef: credentialRef(CLINE.defaultCredentialRef),
     resolveCredential: async (modelId?: string) => {
@@ -674,6 +694,8 @@ export function apply(ctx: Context): void {
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
       const available = await pool.getAvailableAccount(CLINE.id, modelId ?? '')
+      // 记录实际选中的池账号（空串 = 回退到单凭据 ref 模式，见适配器注释）。
+      activeClineAccountId = available?.entry.id ?? ''
       if (available) return available.credential as ClineCredential
       const resolved = await ctx.credentials.resolve(credentialRef(CLINE.defaultCredentialRef))
       if (!resolved) return undefined
@@ -704,6 +726,8 @@ export function apply(ctx: Context): void {
     // 32 张（≈122 MiB）才 `TRANSPORT` —— 余量比其他家大，但仍需兜住长会话。
     readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
+    // 「请求记录」的账号归属（见上面的 `activeClineAccountId`）。
+    currentAccountId: () => activeClineAccountId.length > 0 ? activeClineAccountId : undefined,
     product: CLINE,
   })
 
@@ -983,7 +1007,7 @@ export function apply(ctx: Context): void {
     // ⚠️ **必须走远端** —— 客户端内置静态表只有 3 个模型，远端下发 4 个，
     // 照抄内置表会漏掉 `MiniMax-M3.1-Flash-Preview`（用户截图里选中的那个）。
     // 失败时返回兜底表（适配器侧也有兜底）。
-    fetchRemoteModels: () => minimax.fetchModels(pool),
+    fetchRemoteModels: () => minimax.fetchRemoteModelsOnly(pool),
     // 图片字节桥接：模态按模型判定（远端 `modalities.input` 含 image，
     // 只有 M3.1-Flash-Preview 与 M3 是）。适配器声明不支持时会**报错**，
     // 不会把图片发出去让服务端 400。
@@ -1026,8 +1050,9 @@ export function apply(ctx: Context): void {
 // 与其余 provider 的三处差异（全部实测）：
 //   1. 协议是 **Anthropic Messages**（不是 OpenAI 兼容）——
 //      见 `zcode-anthropic.ts` 的转换层。
-//   2. 每请求要产出一个**一次性**的阿里云 captcha（约 1.2 秒）——
-//      见 `zcode-captcha.ts`。
+//   2. captcha **按需**产出（默认不带验证头探一次，被 `3007` 拒才 mint，并按
+//      「账号 × 模型」记 2 分钟）—— 见 `zcode-captcha.ts` 与 `captcha-requirement.ts`；
+//      mint 的耗时口径与「上游并非每次都要验证」的实测见 README 的 ZCode 章节。
 //   3. 请求体必须带官方身份块与首轮日期块，否则上游回 `3012` ——
 //      见 `zcode-identity.ts`。
 //
@@ -1046,7 +1071,21 @@ export function apply(ctx: Context): void {
 // Jet Hub 登录时创建的那个 ref（`ZCODE_ACCOUNT_XXXX`），而不是只认固定的
 // `ZCODE_CREDENTIAL`。不传的话「登录成功但面板显示未配置」——
 // 且该缺口会被「回退读官方凭据文件」掩盖，只有没装官方客户端的用户才看得到。
-const zcode = new ZcodeAuth(ctx, { accountPool: pool })
+const zcode = new ZcodeAuth(ctx, {
+  accountPool: pool,
+  /**
+   * ★ 二期内部载体（`src/captcha-carrier.ts`）的诊断日志。
+   *
+   * 那两条告警（「内部载体的 param 被上游拒（第 N 次）」「累计拒 3 次 ⇒ 本次运行禁用
+   * 内部载体」）是排查「内部载体为什么没起作用 / 为什么被自动关掉」的**唯一**线索，
+   * 缺省不接就等于线上什么都看不见。
+   * ⚠ 取 logger 用两级可选链（同文件既有的 `log` / `makeReadImageRequest` 写法）：
+   *   宿主某些形态不给 logger，写成点号直调会让调用点所在的产出路径抛 TypeError。
+   */
+  carrierLog: (message: string) => {
+    ctx.logger?.warn?.(message)
+  },
+})
 /**
  * captcha 配置：优先向服务端索取，失败回退内置兜底值。
  *
@@ -1114,24 +1153,20 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     return await zcode.current()
   },
   refresh: async () => {
-    // ⚠ ZCode **没有** refresh 端点（与 Loomy 恒 false 同类，但原因不同）：
-    // 凭据是**静态**的（在官方客户端登录一次就固定下来）。
-    // 这里做的是「重读磁盘凭据并回写账号条目」——
-    // 使用户在官方客户端重新登录后，本插件无需重启即可用上新凭据。
-    const credential = await zcode.current()
-    if (credential === undefined) return
-    const available = await pool.getAvailableAccount(ZCODE.id, '')
-    // ⚠ `getAvailableAccount` 返回的可能是 `null`（本仓库该 API 的约定），
-    // 只判 `undefined` 会漏掉它 —— 用显式判空覆盖两者。
-    if (available === null || available === undefined) return
-    try {
-      await ctx.credentials.set(
-        credentialRef(available.entry.credentialRef),
-        JSON.stringify(credential),
-      )
-    } catch {
-      // 回写失败不影响请求（请求走磁盘凭据）。静默即可。
-    }
+    /**
+     * ⚠ ZCode **没有** refresh 端点（与 Loomy 恒 false 同类，但原因不同）：
+     * 凭据是**静态**的（在官方客户端登录一次就固定下来）。
+     *
+     * 这里做的是「重读凭据并回写账号条目」，使官方客户端重新登录后不重启即可生效。
+     *
+     * ⚠⚠ **绝不能用 `current()` + `getAvailableAccount()` 的组合**（审查发现的
+     * 真实缺陷，与 `refreshAll` 里记录的那个数据破坏同类）：`current()` 会**先读池**
+     * 且**不看 `enabled`**（它按数组顺序取第一个能解析的），而 `getAvailableAccount`
+     * **会过滤 `enabled`** —— 两者选的可能是**不同账号**，于是「把 A 的凭据写进 B 的
+     * ref」，30 分钟一轮就会串掉整池。
+     * 正确做法是交给 `refreshAll`：它逐账号读**自己的** ref、写回**自己的** ref。
+     */
+    await zcode.refreshAll(pool)
   },
   // ⚠ captcha 是**一次性**的 —— 每次调用都必须现产一个新 param。
   // 走 `zcode.mintCaptcha`：整个插件**共用一台**常驻浏览器
@@ -1143,7 +1178,45 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     const config = await resolveZcodeCaptchaConfig()
     return await zcode.mintCaptcha(config, options)
   },
+  /**
+   * ★ 二期内部载体：推理热路径取 param 走**载体链**（内部供给槽优先，等不到才落
+   * 上面那条 chromium 链）。与 `mintCaptcha` 的差别只有「返回值带来源」这一层。
+   *
+   * ⚠ 这两条回调**必须都在**：少接一条，被 `3007` 拒的那一发就退回普通入口重新取，
+   *   归因（内部 vs chromium）就此丢失 —— 累计拒绝到阈值的自动禁用也就永远到不了。
+   * ⚠ 载体链不可用（`DSH_ZCODE_INTERNAL_CARRIER=0` / web 版从未收到贡献）时
+   *   `zcode.mintCaptchaParam` 自己会退回那条 chromium 链 ⇒ 这里不需要判断开关。
+   */
+  mintCaptchaParam: async (options?: { signal?: AbortSignal }) => {
+    const config = await resolveZcodeCaptchaConfig()
+    return await zcode.mintCaptchaParam(config, options)
+  },
+  mintCaptchaAfterRejection: async (
+    outcome: CarrierOutcome,
+    options?: { signal?: AbortSignal },
+  ) => {
+    const config = await resolveZcodeCaptchaConfig()
+    return await zcode.mintCaptchaAfterRejection(outcome, config, options)
+  },
   captchaRegion: ZCODE_CAPTCHA_FALLBACK.region,
+  /**
+   * 诊断日志：把「先探后取」的前置耗时与补产事件接到宿主 logger。
+   *
+   * ⚠ **必须注入** —— 适配器里那三条出口（`zcode-adapter.ts` 的
+   * `前置耗时 …`、`上游要求 captcha（3007）…`、`captcha 被拒（3007），换新 param 重试`）
+   * 全走 `this.options.log?.()`，缺省**完全不输出**（见 `ZcodeAdapterOptions.log`
+   * 的注释）。不接上就是：带 captcha 的那一发比不带的慢一次 mint（稳态约 0.4–0.5
+   * 秒、首次含 chromium 冷启动 4.2 秒；口径见 README 的 ZCode 章节）在外部**没有任何可看的证据**
+   * —— 「先探后取到底生效没有」只能靠猜。
+   *
+   * ⚠ 取 logger 用可选链 `?.info?.()`：与同文件既有防御写法一致
+   * （`makeReadImageRequest` 的降级告警、`refreshAllCredentials` 的批量续期告警
+   * 都是 `ctx.logger?.warn?.(...)`）。宿主没给 logger 时**静默**，
+   * 绝不能在推理路径上抛错。
+   */
+  log: (message: string) => {
+    ctx.logger?.info?.(message)
+  },
   /**
    * ⚠ **图片字节桥接** —— 这是图片能真正发出去的关键。
    *
@@ -1164,7 +1237,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   readImageRequest: makeReadImageRequest(ctx),
   // 模型目录用静态白名单（实测可用的两个）—— 上游模型池含
   // 实测返回空响应的两条（GLM-5-Turbo / GLM-5.2），故不枚举远端。
-  fetchRemoteModels: () => zcode.fetchModels(),
+  fetchRemoteModels: () => zcode.fetchRemoteModelsOnly(),
   accountPool: pool,
   product: ZCODE,
   // 就绪判据 = 有可用凭据（插件自存或官方客户端凭据）。
@@ -1178,6 +1251,26 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   currentAccountId: () => activeZcodeAccountId.get(ZCODE.id),
 })
 
+/**
+ * ⚠ **必须用 `fetchRemoteModelsOnly()` 而不是 `fetchModels()`**（来自 PR #31
+ * `05e4ad7`，保留其与桥无关的部分；本地桥 `zcode-bridge.ts` 已随 PR #29 的
+ * 过时方案一并弃用，故这里只剩适配器这**一个**消费点）。
+ *
+ * 为什么必须有这条：适配器判「这次拿到目录了吗」的判据是「返回空数组」。
+ * 若接线用 `fetchModels()`（失败时回吐兜底表），那个判据**永不命中**
+ * ⇒ 兜底表被当成远端结果写进 `remoteModels` 并永久缓存，用户登录 /
+ * 网络恢复后**再也不会重拉**（连失败冷却都不会开），只能重启 DSH。
+ * 「回退兜底表」这件事只应由**展示侧**（适配器）做一次。
+ *
+ * ## 为什么不接本地桥（原 PR 的说明，保留供日后参考）
+ *
+ * 原 PR 让 ZCode 同时走一条「官方 pi-ai 声明式 provider + 本地 Anthropic
+ * 透明桥」的镜像 route（`zcode-free`），其核心假设是「每个请求必须现产
+ * captcha」。该假设已被 master 的大重构（`19226ca`）推翻：ZCode 3.14.4 起
+ * **推理不再校验 captcha**，只有领取才要 —— 桥每请求白产一个，白烧设备级
+ * 验证配额（阿里云同设备 150 次/小时）。故**只保留**「目录拉取不污染缓存 +
+ * 自愈两闸 + 写盘串行化」这些与桥无关的修复，桥与镜像整个弃用。
+ */
 
   // 一次性修复**老 TRAE 账号**的展示名（与上面 Raccoon 同类，同因）：
   // 服务端 ScreenName 是**按 uid 自动生成的默认名**（`用户26815487395`），
@@ -1259,12 +1352,20 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     }
   }
 
-  // 启动时如果有任何可续期账号，安排定期续期。
+  // 启动时只要账号池非空，就安排首轮续期 + 定期续期。
   //
-  // ⚠️ 判据只看 `refreshable`，**不看 `enabled`**：停用只影响账号池的自动
-  // 选号，不该让凭据停止续期。早期这里写成 `a.refreshable && a.enabled`，
-  // 于是「所有账号都被停用」时续期定时器**根本不启动**，凭据一路过期到
-  // refresh_token 失效，用户重新启用后只能重新登录（真实缺陷）。
+  // ⚠️ 判据是「**池里有账号**」，不是「有 `refreshable` 的账号」（2026-10-02 修订）。
+  // 原先写成 `accounts.some(a => a.refreshable)`，于是这个定时器**是否武装**
+  // 取决于那批可能已经被误标成 false 的布尔 —— 而它存在的意义恰恰是去修正误标。
+  // 本次事故实测：36 条账号只剩 3 条 `true`（raccoon / minimax / cline 各一），
+  // 只要那三条被删或被同样误标，**codearts 的自愈与启动首轮会一起消失**，
+  // 且日志里一个字都不会有。各家 `refreshAll` 内部本来就按凭据材料 / 是否过期
+  // 过滤（`loomy` 只探已过期的、其余看 `refreshableOf(credential)`），
+  // 所以放宽这里的判据最多多一次本地遍历，不会白发请求。
+  //
+  // ⚠️ 仍然**不看 `enabled`**（AGENTS.md 既有铁律）：停用只影响自动选号，
+  // 不该让凭据停止续期。早期写成 `a.refreshable && a.enabled`，于是
+  // 「所有账号都被停用」时续期定时器根本不启动，凭据一路烂到 refresh_token 失效。
   //
   // ⚠️ **必须立刻先跑一轮**（issue !IKIRTT 的主缺陷）：早先这里只有
   // `setInterval`，第一次处理要等满一个周期。短寿命 provider（cline 1 小时、
@@ -1274,8 +1375,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 只对「距过期不足 1 小时」的账号发续期请求，其余只做一次本地对账 ——
   // 既补上了首轮，又不会在启动时打出几十个无谓请求。
   pool.listAllAccounts().then(accounts => {
-    const hasRefreshable = accounts.some(a => a.refreshable)
-    if (!hasRefreshable) return
+    if (accounts.length === 0) return
     void refreshAllCredentials()
     const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
     refreshTimer.unref?.()

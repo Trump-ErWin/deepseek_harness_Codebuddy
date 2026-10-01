@@ -9,7 +9,11 @@
  *           account.reset / account.resetAll / login.poll /
  *           credits.status / credits.claimAll / credits.balances /
  *           model.list / model.setDisabled /
+ *           captcha.demand / captcha.carrierUrl / captcha.contribute（内部载体，
+ *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
  *           backup.export / backup.import / backup.status
+ * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
+ * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -31,6 +35,8 @@ import type { RaccoonAuth } from './raccoon-auth.js'
 import type { ZcodeAuth } from './zcode-auth.js'
 import { ZCODE } from './zcode-product.js'
 import type { ZcodeCredential } from './zcode.js'
+import { phoneFromUserId, isUsableZcodeCredential } from './zcode.js'
+import type { ZcodeBalanceResult } from './zcode-upstream.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
 import { MINIMAX } from './minimax-product.js'
@@ -64,6 +70,8 @@ import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits
 import { isTraeRefreshable, traeCredentialExpiresAtMs, traeDisplayNickname } from './trae.js'
 import type { TraeCredential } from './trae.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
+import { fetchClineUsageLimits } from './cline-quota.js'
+import { clineUpstreamOf, readClineRequestHistory } from './cline-request-log.js'
 import {
   clineCredentialExpiresAtMs,
   isClineRefreshable,
@@ -81,6 +89,12 @@ import {
   type CreditBalance,
 } from './credits.js'
 import { CODEBUDDY, WORKBUDDY, productById, type BuddyProduct } from './product.js'
+import {
+  captchaDemand,
+  putSuppliedParam,
+} from './captcha-supply.js'
+import { ZCODE_CAPTCHA_FALLBACK, type ZcodeCaptchaConfig } from './zcode-captcha.js'
+import { buildCarrierPageHtml } from './zcode-carrier-page.js'
 import {
   claimLobsteraiDailyCheckin,
   fetchLobsteraiCreditBalance,
@@ -129,6 +143,10 @@ import type {
   RpcCreditsClaimSummary,
   RpcCreditsBalancesRequest,
   RpcCreditsBalancesResponse,
+  RpcClineQuotaRequest,
+  RpcClineQuotaResponse,
+  RpcClineRequestLogRequest,
+  RpcClineRequestLogResponse,
   RpcCreditsClaimAccountResult,
   RpcSendSmsRequest,
   RpcSendSmsResponse,
@@ -147,10 +165,32 @@ import type {
   RpcModelSetDisabledResponse,
   RpcModelSetAllDisabledRequest,
   RpcModelSetAllDisabledResponse,
+  RpcModelSetDisabledManyRequest,
+  RpcModelSetDisabledManyResponse,
+  RpcProviderStatusRequest,
+  RpcProviderStatusResponse,
+  RpcProviderSetEnabledRequest,
+  RpcProviderSetEnabledResponse,
+  RpcCaptchaDemandResponse,
+  RpcCaptchaCarrierUrlResponse,
+  RpcCaptchaContributeRequest,
+  RpcCaptchaContributeResponse,
+  ProviderStatus,
+
+  ProviderAccountStatus,
 } from './types.js'
 
 /** Jet Hub RPC API 路径 */
 export const JET_HUB_API_PATH = '/api/jet-hub'
+/**
+ * 内部 captcha **载体页**的 GET 路径（与 GUI 同源，故 `<webview>` 能导航过来）。
+ *
+ * ⚠ 它挂在 `/api/` 前缀下，因而不是「随便一个静态页」：DSH 的 `/api` 路由会先过
+ *   Connection 的 Host/Origin 栏与**浏览器会话认证**（`dsh-client-connection` 的
+ *   `admit()` ⇒ 未认证回 401）。桌面版的 guest 与 GUI 是否同 partition、
+ *   因而带得上那份会话 cookie，属 Task 5 的**实测项**，不在这里放宽。
+ */
+export const CAPTCHA_CARRIER_PATH = '/api/jet-hub/captcha-carrier'
 /** Gateway RPC 端点名（connection.rpc.call 的 endpoint 参数） */
 const JET_HUB_ENDPOINT = 'jet-hub'
 
@@ -675,7 +715,7 @@ export function registerJetHubRpc(
  * 只声明用到的方法（结构化类型），避免让本模块依赖五个具体适配器类。
  */
 export interface ModelCatalogSource {
-  listAllModels(): readonly { id: string; name: string }[]
+  listAllModels(): readonly { id: string; name: string; isFree?: boolean }[]
 }
 
 /**
@@ -706,6 +746,38 @@ function broadcastCatalogChanged(ctx: Context): void {
     ctx.emit('llm/adapters-updated')
   } catch (error) {
     ctx.logger.warn(`[jet-hub] 广播模型目录变更事件失败：${String(error)}`)
+  }
+}
+
+/**
+ * 取某 provider 的**全量模型 id**（不套黑名单），供「关闭全部」与「关闭供应商」共用。
+ *
+ * 两条路径的优先级（与 `model.list` 保持一致的取舍，但**不需要展示名**：
+ * 这里只要 id 来写黑名单，故不走 `model.list` 那套回填 disabled 的复杂逻辑）：
+ * 1. 优先 `modelAdapters[provider].listAllModels()` —— **同步**，不触发远端拉取；
+ * 2. 缺失时退化 `llm.listModels(provider)` —— 异步，且**结果已被黑名单过滤**。
+ *
+ * ⚠️ 第 2 条路径拿不到「已关闭」的模型（它们不在 `listModels` 返回值里），
+ * 故它写出的黑名单是**不完整**的。这对「关闭全部」无影响（已关闭的本就无需再关），
+ * 但意味着**不能用它判断「是否全部已关闭」** —— 状态判定必须用
+ * `listAllModels()` 的全量目录（见 `provider.status`）。
+ *
+ * @returns `{ ids }` 成功；`{ error }` 失败原因（调用方据此拒绝且**不落盘**）。
+ */
+async function fullCatalogIds(
+  ctx: Context,
+  modelAdapters: Readonly<Record<string, ModelCatalogSource>> | undefined,
+  provider: string,
+): Promise<{ ids: string[] } | { error: string }> {
+  const all = modelAdapters?.[provider]?.listAllModels()
+  if (all !== undefined) return { ids: all.map((model) => model.id) }
+  const llm = llmServiceOf(ctx)
+  if (llm === undefined) return { error: 'llm 服务不可用' }
+  try {
+    return { ids: (await llm.listModels(provider)).map((model) => model.id) }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    return { error: `读取模型列表失败：${reason}` }
   }
 }
 
@@ -824,13 +896,213 @@ function registerJetHubEndpoints(
     },
   })
 
+  /**
+   * 载体页要用的 captcha 配置：**远端优先、拉不到就兜底**。
+   *
+   * ⚠ 远端那次请求**不是**在 GET 处理里现加的额外开销 —— `fetchCaptchaConfig()`
+   * 自带 60 秒 TTL 缓存（`src/zcode-auth.ts` 的 `captchaConfigCacheInstance`），
+   * 与推理侧 `index.ts` 走的是同一份缓存实例。
+   * ⚠ 拉不到（无凭据 / 网络失败 / 该形态的 zcode 实例没有这个方法）一律回落
+   *   `ZCODE_CAPTCHA_FALLBACK`：载体页**必须**给得出去。回 500 的话，client 那边
+   *   表现为「导航成功但没有 `window.__zcodeCaptcha`」，比配置旧一点难查得多。
+   */
+  async function carrierCaptchaConfig(): Promise<ZcodeCaptchaConfig> {
+    try {
+      const remote = await zcode.fetchCaptchaConfig()
+      return remote ?? ZCODE_CAPTCHA_FALLBACK
+    } catch {
+      return ZCODE_CAPTCHA_FALLBACK
+    }
+  }
+
+  /**
+   * 内部载体的载体页（**旧路由：已不是 guest 的入口**，见下面的取证）。
+   *
+   * ## ⚠⚠ 它**不可能**被 `<webview>` guest 加载（评审 C1/C2，2026-10-02 实测取证）
+   * 这条路由挂在应用自己的 host 上，而桌面版主进程对 guest 有两道硬闸
+   * （DSH Desktop 0.2.0-rc.2，`resources/app.asar/lib/main.js`）：
+   * - `allowedNavigation(value)` = http(s) + 无账号密码 + `!isApplicationHost(url)`；
+   * - `isApplicationHost(url)` = **`url.port === host.port` 且（主机相同或回环）**；
+   * - `configureSession().onBeforeRequest` 对命中者直接 `callback({ cancel: true })`；
+   * - guest 的 partition 是 `dsh-sidebar-browser-${randomUUID()}`（**无 `persist:`**），
+   *   Host 的会话 cookie 在 `defaultSession` 里 ⇒ 即便加载到了也过不了 `/api/*` 的认证。
+   *
+   * ⇒ 内部载体的真正入口是**独立回环端口上的小服务**
+   * （`src/captcha-carrier-server.ts`，地址由 `captcha.carrierUrl` 这条 RPC 给）。
+   *
+   * ## 那为什么还留着这条
+   * ① 它是**手工诊断**用的：web 版下 GUI 就是 `http://127.0.0.1:<port>`，
+   *   在浏览器标签里直接打开这一页可以验证「载体页本身能不能产 param」；
+   * ② 表达式只有这一份（`buildCarrierPageHtml`），删路由不会让逻辑分叉；
+   * ③ 保留 = 不破坏既有 `CAPTCHA_CARRIER_PATH` 契约（`tests/unit/zcode-carrier-rpc.spec.ts`）。
+   * ⚠ **别再把 client 导航指回这里** —— 那正是评审 C1/C2 指出的「收益恒为 0」的成因。
+   *
+   * ⚠ 只读、无凭据：这条 GET 不接收任何参数，输出里不含 JWT / token；
+   *   产出的 param 由 guest 自己经 `captcha.contribute` 回传，**不**经这条路由。
+   */
+  connection.fetch.register({
+    path: CAPTCHA_CARRIER_PATH,
+    methods: ['GET'],
+    requestBody: 'buffered' as const,
+    async fetch(request: Request): Promise<Response> {
+      /**
+       * ⚠ 真实挂载下这条**永远轮不到**：dsh 的分发器按 `methods` 集合筛过才调本 handler
+       * （`@deepseek-ai/dsh-client-connection` 里 `fetchRoutes.get(pathname)` +
+       * `methods.has(request.method)`）。留着它不是防御性装饰，是为了**不依赖挂载假设**：
+       * 直接调 handler 的用例（本仓库的 connection 替身就是这么跑的）要能自己判 405，
+       * 且将来有人把 `methods` 放宽成含 POST 时，这里不会静默把 RPC 流量当页面接走。
+       */
+      if (request.method !== 'GET') {
+        return new Response('method not allowed', { status: 405 })
+      }
+      const html = buildCarrierPageHtml(await carrierCaptchaConfig())
+      return new Response(html, {
+        status: 200,
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          // 每次都现渲染：配置跟着远端 60 秒 TTL 变，缓存这份只会让载体页拿旧 SceneId。
+          'cache-control': 'no-store',
+        },
+      })
+    },
+  })
+
+  /**
+   * 给 `account.list` 的返回项补上**只存在于凭据里**的展示字段（账号名 / 手机号）。
+   *
+   * ## 为什么只能在 RPC 层补
+   *
+   * 账号池（`jet-hub/state.json`）的条目只有 `id`/`provider`/`nickname`/
+   * `credentialRef` 等字段，**没有**账号名与手机号 —— 它们在**凭据**里
+   * （`user_info.displayName` 与由 17 位 `user_id` 派生的手机号）。
+   * 且 `sanitizeAccounts`（`src/jet-hub-store.ts:173-191`）只保留三个字段，
+   * 写回池也会被丢掉。故每次列表时从**各账号自己的 ref** 现读。
+   *
+   * ## ⚠ 只对 zcode 做，且逐条独立失败
+   *
+   * - 只认 `zcode`：其余 11 个 provider 的凭证形状不同，通读一遍纯属浪费
+   *   （`account.list` 是进面板就发的热路径）。
+   * - 单条解析失败**不影响整行**：拿不到就不补字段，绝不让账号列表整体失败
+   *   （列表可用性远比这两个展示字段重要）。
+   *
+   * ## 取值顺序：先信凭据里已存的，再现场派生
+   *
+   * 新凭据由 `readZcodeCredential` / `startLogin` 直接写入 `account_name` /
+   * `phone`；**旧凭据**（本次改动之前登录的）没有这两个字段，故现场兜底：
+   * 手机号从 `user_id` 派生、账号名回退到**不像占位串**的 `account_label`。
+   */
+  async function enrichAccountIdentity(
+    accounts: readonly ProviderAccountStatus[],
+    provider: string,
+  ): Promise<ProviderAccountStatus[]> {
+    if (provider !== ZCODE.id) return [...accounts]
+    const out: ProviderAccountStatus[] = []
+    for (const account of accounts) {
+      try {
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (!resolved) { out.push(account); continue }
+        const credential = JSON.parse(resolved.value) as ZcodeCredential
+        const accountName = typeof credential.account_name === 'string'
+          && credential.account_name.trim().length > 0
+          ? credential.account_name.trim()
+          // 旧凭据没有 account_name：只有 `account_label` 不是占位串时才能当名字用。
+          // `id:xxxxxx` 与 `设备xxxxxxxx` 都是兜底产物，展示它们等于没展示。
+          : (typeof credential.account_label === 'string'
+            && credential.account_label.trim().length > 0
+            && !/^id:/.test(credential.account_label)
+            && !/^设备/.test(credential.account_label)
+            ? credential.account_label.trim()
+            : undefined)
+        const phone = typeof credential.phone === 'string' && credential.phone.trim().length > 0
+          ? credential.phone.trim()
+          : phoneFromUserId(credential.user_id)
+        out.push({
+          ...account,
+          ...(accountName !== undefined ? { accountName } : {}),
+          ...(phone !== undefined ? { phone } : {}),
+        })
+      } catch {
+        // 凭据损坏/未配置：保留原条目（这些账号在卡片上会由额度那一栏报错说明）。
+        out.push(account)
+      }
+    }
+    return out
+  }
+
+  /**
+   * 把上游余额**逐桶**映射成 `CreditBalance`。
+   *
+   * ## 为什么必须逐桶（而不是只取首桶）
+   *
+   * `CreditBalance` 的形状是 `{total, packages[], expiredTotal?}` 这类**积分包**
+   * 结构，而 ZCode 是「按模型分的 token 额度池」。上游一个 resource bucket
+   * = 一个模型一段额度，故**一个桶一个包**。
+   *
+   * ⚠ 旧实现只取 `buckets[0]`（经 `result.planName`）拼**一个**包，但
+   * `balance.total` 用的是 `result.remaining`（**全桶汇总**）—— 多桶账号下
+   * 那个包的数字比它自己的 `totalUnits` 还大，自相矛盾，且其余模型的额度
+   * 被**静默丢掉**，用户看不出「GLM-5.3 与 GLM-5.3-Flash 各剩多少」。
+   *
+   * ## 空桶的兜底
+   *
+   * 上游可能一个桶都不给（实测企业版之外仍有账号只有 0 桶）。此时**不能**返回
+   * 空 `packages`（前端会显示成「没有额度」而不是「查不到」），故给一个具名占位包，
+   * 让 UI 至少能显示「0 / 0」并带上 `result.planName`。
+   */
+  function buildZcodeBalance(result: ZcodeBalanceResult): CreditBalance {
+    const packages: CreditBalance['packages'] = result.buckets.map((bucket) => {
+      const remaining = bucket.availableUnits ?? bucket.remainingUnits ?? 0
+      const total = bucket.totalUnits ?? 0
+      return {
+        name: bucket.showName ?? result.planName ?? 'ZCode 免费额度',
+        // ⚠ 单位是 **token**（不是 credit）—— 如实标注，
+        // 避免用户以为 ZCode 有 1 亿积分。
+        unit: 'token',
+        remaining,
+        total,
+        used: Math.max(0, total - remaining),
+        active: true,
+        // ZCode 的额度按日刷新（`period: 'one_time'` 的活动包到点失效），
+        // 故周期起止都留空，只用 `expiredTime` 给到期时刻。
+        cycleStartTime: '',
+        cycleEndTime: '',
+        expiredTime: bucket.expiresAt !== undefined
+          ? new Date(bucket.expiresAt * 1000).toISOString()
+          : (result.expiresAt !== undefined ? new Date(result.expiresAt * 1000).toISOString() : ''),
+      }
+    })
+    if (packages.length === 0) {
+      packages.push({
+        name: result.planName ?? 'ZCode 免费额度',
+        unit: 'token',
+        remaining: result.remaining,
+        total: result.total,
+        used: Math.max(0, result.total - result.remaining),
+        active: true,
+        cycleStartTime: '',
+        cycleEndTime: '',
+        expiredTime: result.expiresAt !== undefined
+          ? new Date(result.expiresAt * 1000).toISOString()
+          : '',
+      })
+    }
+    return {
+      // 仍是**全桶汇总**，与 `packages` 逐项之和一致（`fetchZcodeBalance` 的
+      // `:251-260` 就是这么累加的）。
+      total: result.remaining,
+      // ZCode 不在同一响应里区分「已失效包」，故为 0。
+      expiredTotal: 0,
+      packages,
+    }
+  }
+
   /** 分发端点方法到对应的处理器 */
   async function handleMethod(method: string, payload: unknown, _signal: AbortSignal): Promise<unknown> {
     switch (method) {
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
         const accounts = await pool.listAccounts(req.provider)
-        return { ok: true, value: { accounts } }
+        return { ok: true, value: { accounts: await enrichAccountIdentity(accounts, req.provider) } }
       }
 
       case 'account.create': {
@@ -1251,6 +1523,41 @@ function registerJetHubEndpoints(
            * 若用户**已经**装并登录了官方客户端，则不必点这个按钮 ——
            * `refreshAll` / 首次加载时会自动把官方凭据固化进来。
            */
+          /**
+           * ★★ **先复用本机已有账号，不要「点一次多一条」**（用户报障 ⑯）。
+           *
+           * ## 报障原文
+           *
+           * 「然后账号应该读取有效的本地账号凭证，而不是点了添加就多一个，
+           * 还没有删除账号的按钮」
+           *
+           * ## 两道复用（都**不新起** OAuth，故点下去不会多出条目）
+           *
+           * ① **孤儿条目修复**：池里有「条目在、凭据从未写入」的账号
+           *    （上一次登录被进程重启打断的产物）⇒ 把本机官方凭据补进去
+           *    并回填昵称，直接返回该条目。这同时治好了 ⑦「凭据未配置」。
+           * ② **同一账号已在池里**：本机官方凭据的 `user_id` 已属于某个条目
+           *    ⇒ 什么都不用做，如实告知「已存在」并返回它的 id —— 不建新条目、
+           *    不弹浏览器（否则用户会以为是新账号，实际会多出一条重复记录）。
+           *
+           * ⚠ 「本机有没有官方凭据」是**必要条件**：没装客户端、或没登录过时
+           * 两者都跳过，照旧走下面的 OAuth 流程（那是「装完即用」的保证）。
+           */
+          const orphanId = await zcode.adoptIntoOrphanAccount(pool).catch(() => undefined)
+          if (orphanId !== undefined) {
+            // `loginUrl` 用**空串**而不是 undefined：与 `loginMode: 'sms'` 的既有约定
+            // 一致（「没有可打开的 URL」），前端据 `reused` 分支处理。
+            return { ok: true, value: { accountId: orphanId, loginUrl: '', reused: true } }
+          }
+          const local = await zcode.localCredential()
+          if (local !== undefined && typeof local.user_id === 'string' && local.user_id.length > 0) {
+            const holder = await pool.findAccountIdByIdentityField(
+              ZCODE.id, 'user_id', local.user_id,
+            )
+            if (holder.length > 0) {
+              return { ok: true, value: { accountId: holder, loginUrl: '', reused: true } }
+            }
+          }
           const started = await zcode.startLogin({ refName })
           // 先登记占位条目（无凭据），使前端 `login.poll` 能立即看到该账号；
           // 登录成功后再回填昵称。失败则删除占位条目。
@@ -1470,10 +1777,24 @@ function registerJetHubEndpoints(
         const accounts = await pool.listAllAccounts()
         const entry = accounts.find((a) => a.id === req.accountId)
         if (!entry) return { ok: true, value: { done: false } }
-        // 检查凭据是否已实际写入（占位条目没有凭据）
+        // 检查凭据是否已实际写入（占位条目没有凭据）。
+        //
+        // ⚠ **不能只判「resolve 出了非空字符串」**（审查发现）：占位条目被
+        //   `credentials.set` 写入过一段**残缺 JSON** 时（例如只有 `zcode_jwt`、
+        //   没有 `device_mid`），`resolve` 照样返回字符串，UI 就会弹「账号已添加」
+        //   而实际上该账号一发请求就 `凭据无效`。这里对 zcode 追加**形状校验**。
         const ref = credentialRef(entry.credentialRef)
         const resolved = await ctx.credentials.resolve(ref)
         if (!resolved) return { ok: true, value: { done: false } }
+        if (entry.provider === ZCODE.id) {
+          let parsed: unknown
+          try {
+            parsed = JSON.parse(resolved.value)
+          } catch {
+            return { ok: true, value: { done: false } }
+          }
+          if (!isUsableZcodeCredential(parsed)) return { ok: true, value: { done: false } }
+        }
         return { ok: true, value: { done: true, success: true } }
       }
 
@@ -2053,7 +2374,7 @@ function registerJetHubEndpoints(
            * ZCode 的「一键领取」= 补激活上报 → preview → 逐个 claim。
            *
            * ⚠ **每个 plan 都要重新产一个 captcha**（captcha 一次性，
-           * 复用会得 `3007`）—— 故不能复用 `collectClaimResults`
+           * 复用会得 `3007`，这条路径每个 plan 都现产新的）—— 故不能复用 `collectClaimResults`
            * 那套「一个凭据一次 claim」的形状（它假设 `claim()` 内部
            * 自己处理幂等），这里自己遍历账号与 plan。
            *
@@ -2405,32 +2726,23 @@ function registerJetHubEndpoints(
               /**
                * ⚠ `CreditBalance` 的形状是 `{total, packages[], expiredTotal?}`
                * 这类**积分包**结构，而 ZCode 是「按日的 token 额度池」。
-               * 两者结构不同，故这里用**一个包**如实映射：
-               * `total` 填剩余额度、包名用上游的 `show_name`（模型名）。
-               * 这样 UI 能显示数值与来源，且不伪装成多包积分账户。
+               * 两者结构不同，故**逐桶**如实映射 —— 上游一个 resource bucket
+               * 就是一个包，包名用 `show_name`（实测是模型名，如
+               * `GLM-5.3-Flash`）。
+               *
+               * ## ⚠⚠ 这里曾经只映射 `buckets[0]`（真实缺陷）
+               *
+               * 旧实现只取 `result.planName`（= `buckets[0]?.showName`）拼**一个**
+               * 包 —— 多桶账号的其余额度被**静默丢掉**，UI 上看起来只有
+               * 一个模型的额度。而 `result.remaining` / `total` 却是**全桶汇总**，
+               * 于是那一个包的数字比它自己的 `totalUnits` 还大，自相矛盾。
+               *
+               * 实测（本机账号）上游只回一个桶（`GLM-5.3-Flash`），
+               * 但**不能按「只有一个桶」来写** —— 那正是把缺陷固化成契约；
+               * 且用户要看的恰恰是「GLM-5.3 与 GLM-5.3-Flash 各自剩多少」，
+               * 前端需要按模型逐行渲染、缺桶的模型显示占位。
                */
-              balance: {
-                total: result.remaining,
-                // ZCode 不在同一响应里区分「已失效包」，故为 0。
-                expiredTotal: 0,
-                packages: [{
-                  name: result.planName ?? 'ZCode 免费额度',
-                  // ⚠ 单位是 **token**（不是 credit）—— 如实标注，
-                  // 避免用户以为 ZCode 有 1 亿积分。
-                  unit: 'token',
-                  remaining: result.remaining,
-                  total: result.total,
-                  used: Math.max(0, result.total - result.remaining),
-                  active: true,
-                  // ZCode 的额度按日刷新（`period: 'one_time'` 的活动包到点失效），
-                  // 故周期起止都留空，只用 `expiredTime` 给到期时刻。
-                  cycleStartTime: '',
-                  cycleEndTime: '',
-                  expiredTime: result.expiresAt !== undefined
-                    ? new Date(result.expiresAt * 1000).toISOString()
-                    : '',
-                }],
-              },
+              balance: buildZcodeBalance(result),
             })
           }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
@@ -2453,6 +2765,106 @@ function registerJetHubEndpoints(
             accounts: values,
             windowDays: buddyExpiringWindowDays(),
           } satisfies RpcCreditsBalancesResponse,
+        }
+      }
+
+      // ── Cline「订阅额度」：官方额度窗口 + 请求记录 ──
+      //
+      // 参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分。
+      // 两者都用 Cline 网关自己的端点（不是本地记账），故与「余额」是三份
+      // 互不相同的读数：余额答「还剩多少」，额度答「各时间窗用掉百分之几」，
+      // 请求记录答「每一笔花了多少」。
+      //
+      // ⚠️ **两个端点都只认 Cline**（额度端点路径里的 `users/me` 与请求记录的
+      // `usages` 都是 Cline 网关的形状）。别的 provider 一律 `bad-request` ——
+      // 这正是「不要在 UI 上吞掉错误，而是不发起这个请求」那条既有约定的
+      // 服务端一半（客户端另由 `supportsSubscriptionQuota` 门控）。
+      case 'cline.quota': {
+        const req = payload as RpcClineQuotaRequest
+        if (typeof req.provider !== 'string' || req.provider !== CLINE.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        const accounts = await pool.listAccounts(req.provider)
+        const values: RpcClineQuotaResponse['accounts'] = []
+        for (const account of accounts) {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) {
+            values.push({
+              accountId: account.id, nickname: account.nickname,
+              ok: false, windows: [], error: '凭据未配置',
+            })
+            continue
+          }
+          let credential: ClineCredential
+          try {
+            credential = JSON.parse(resolved.value) as ClineCredential
+          } catch {
+            values.push({
+              accountId: account.id, nickname: account.nickname,
+              ok: false, windows: [], error: '凭据解析失败',
+            })
+            continue
+          }
+          const result = await fetchClineUsageLimits(credential, CLINE)
+          values.push({
+            accountId: account.id,
+            nickname: account.nickname,
+            ok: result.ok,
+            windows: result.windows,
+            // ⚠️ 失败时带上**具体原因**（含 HTTP 状态与网关文案），
+            // 而不是笼统一句「查询失败」—— 面板要显示原因而非 0%。
+            ...result.error === undefined ? {} : { error: result.error },
+          })
+        }
+        return { ok: true, value: { accounts: values } satisfies RpcClineQuotaResponse }
+      }
+
+      case 'cline.requestLog': {
+        const req = payload as RpcClineRequestLogRequest
+        if (typeof req.provider !== 'string' || req.provider !== CLINE.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
+        }
+        // 记录是**本插件自己发出的请求流水**(进程内存,重启即丢,见
+        // src/cline-request-log.ts),不是网关的 /usages —— 后者记的是该账号
+        // 在官方所有渠道的消费:没有延迟/首块时间,表格字段也对不齐参考实现。
+        //
+        // ⚠️ `accountId` 必传(按账号过滤)——「订阅额度」面板用**同一个**
+        // 翻页索引同时切额度窗口与请求记录,两个区域必须看同一个账号。
+        // ⚠️ 记录可能是**失败**行(error 有值):失败的请求是排查
+        // 「为什么没回复」的第一线索,与成功行同表展示、错误消息随行给出。
+        return {
+          ok: true,
+          value: {
+            rows: readClineRequestHistory({ accountId: req.accountId, limit: req.limit }).map((row) => ({
+              ts: row.ts,
+              model: row.model,
+              // ⚠️ **优先用网关报的真实上游渠道**（`alibaba` 等，见
+              // `src/cline-routing.ts`）；它没报时才回落到模型命名空间
+              // （`cline-pass` / `cline-free`）—— 后者是**订阅通道**
+              // （甚至可能是厂商名），不是 serving channel，用户报障点正在于此。
+              upstream: row.upstream.length > 0 ? row.upstream : clineUpstreamOf(row.model),
+              // ⚠️ 必须透传「是否收到 usage」：表格据此把未知显示成 `—`,
+              // 而不是 0（0 会被读成「瞬间完成、没花 token」）。
+              usageReported: row.usageReported,
+              inputTokens: row.inputTokens,
+              outputTokens: row.outputTokens,
+              ...row.cacheReadTokens !== undefined ? { cacheReadTokens: row.cacheReadTokens } : {},
+              ...row.reasoningTokens !== undefined ? { reasoningTokens: row.reasoningTokens } : {},
+              // 推理强度：空串也照传（展示层据「空串 ⇒ 不渲染那一行」判断，
+              // 若在这里省略字段，前端就得同时处理 undefined 与 '' 两种缺省）。
+              effort: row.effort,
+              ttftMs: row.ttftMs,
+              // ⚠️ 首个**正文**块耗时必须透传：展示层的「输出速率」拿它当分母
+              // 起点（分子是正文 token 数）。缺了它速率会虚高到物理不可能的值
+              // —— 用户报障的 `11814.8 t/s` 就是分子分母跨阶段的产物。
+              ttfcMs: row.ttfcMs,
+              totalMs: row.totalMs,
+              ...row.error !== undefined ? { error: row.error } : {},
+            })),
+          } satisfies RpcClineRequestLogResponse,
         }
       }
 
@@ -2498,7 +2910,7 @@ function registerJetHubEndpoints(
         // 对话框模型选择器读的仍是过滤后的 `listModels`，可见性行为完全不变。
         const catalogSource = modelAdapters?.[req.provider]
         const all = catalogSource?.listAllModels()
-        let catalog: Array<{ id: string; name: string }>
+        let catalog: Array<{ id: string; name: string; isFree?: boolean }>
         if (all !== undefined) {
           catalog = [...all]
           // 全量目录里若仍有黑名单命中却缺失者，一并补上（保底，正常不会发生）。
@@ -2521,6 +2933,10 @@ function registerJetHubEndpoints(
             id: model.id,
             name: model.name,
             disabled: disabledMap[model.id] === true,
+            // ⚠️ 免费标记**照原样透传，缺失就不写**（不编造 `false`）：Jet Hub 的
+            // 模型列表按「计费/来源」分组，把「适配器没报」当成「按量计费」是
+            // 保守归组，但字段本身仍保持「未知」语义（与全仓约定一致）。
+            ...model.isFree === undefined ? {} : { isFree: model.isFree },
           })),
         }
         return { ok: true, value }
@@ -2545,6 +2961,49 @@ function registerJetHubEndpoints(
         // 必须广播：否则开关只写进磁盘、界面一直显示旧目录（成因见该函数注释）。
         broadcastCatalogChanged(ctx)
         const value: RpcModelSetDisabledResponse = {
+          provider: req.provider,
+          disabledModels: pool.listDisabledModels(req.provider),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 批量打开/关闭**指定的一批**模型（Jet Hub 模型列表里「按分组」的
+       * 本组全开 / 本组全关）。
+       *
+       * ⚠️ **不能复用 `model.setAllDisabled`**：那个的范围是「该 provider 的
+       * 全部模型」，且打开方向会清空整张黑名单（含用户特意关着的其它组）。
+       * 分组开关只动本组的 id，故服务端需要一个「按子集清除」的路径
+       * （`AccountPool.clearModelsDisabled`）。
+       *
+       * 与另外两个开关端点同约定：`disabled` 不做默认值猜测、只落盘一次、
+       * 只广播一次（逐条调用会写 N 次文档、广播 N 次）。
+       */
+      case 'model.setDisabledMany': {
+        const req = payload as RpcModelSetDisabledManyRequest
+        if (
+          typeof req.provider !== 'string' || req.provider.length === 0
+          || !Array.isArray(req.modelIds)
+          || typeof req.disabled !== 'boolean'
+        ) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'provider、modelIds（数组）与 disabled（布尔）必填' },
+          }
+        }
+        // 去重 + 剔除非字符串/空串：前端按组传 id，重复项或脏值只会白写一次文档。
+        const ids = [...new Set(req.modelIds.filter((id): id is string => typeof id === 'string' && id.length > 0))]
+        if (ids.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'modelIds 不能为空' } }
+        }
+        if (req.disabled) await pool.setModelsDisabled(req.provider, ids)
+        else await pool.clearModelsDisabled(req.provider, ids)
+        ctx.logger.info(
+          `[jet-hub] ${req.disabled ? '关闭' : '打开'} ${req.provider} 的 ${ids.length} 个模型（按分组）`,
+        )
+        // 与其它开关端点一致：必须广播，否则界面一直显示旧目录。
+        broadcastCatalogChanged(ctx)
+        const value: RpcModelSetDisabledManyResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
         }
@@ -2581,26 +3040,15 @@ function registerJetHubEndpoints(
         }
         if (req.disabled) {
           // 关闭全部：先取全量目录，再一次性写入黑名单。
-          let ids: string[]
-          const all = modelAdapters?.[req.provider]?.listAllModels()
-          if (all !== undefined) {
-            ids = all.map((model) => model.id)
-          } else {
-            const llm = llmServiceOf(ctx)
-            if (llm === undefined) {
-              // 目录读不出来就**不落盘**：否则会写入一个不完整的黑名单，
-              // 用户看到「关了一半」且无从判断原因。
-              return { ok: false, error: { code: 'bad-request', message: 'llm 服务不可用' } }
-            }
-            try {
-              ids = (await llm.listModels(req.provider)).map((model) => model.id)
-            } catch (error) {
-              const reason = error instanceof Error ? error.message : String(error)
-              return { ok: false, error: { code: 'bad-request', message: `读取模型列表失败：${reason}` } }
-            }
+          // 目录读取的三条分支（适配器 → llm → 失败即拒绝）与「关闭供应商」
+          // 完全一致，故共用 fullCatalogIds；⚠️ 失败时**不落盘** ——
+          // 否则会写入一个不完整的黑名单，用户看到「关了一半」且无从判断原因。
+          const catalog = await fullCatalogIds(ctx, modelAdapters, req.provider)
+          if ('error' in catalog) {
+            return { ok: false, error: { code: 'bad-request', message: catalog.error } }
           }
-          await pool.setModelsDisabled(req.provider, ids)
-          ctx.logger.info(`[jet-hub] 关闭 ${req.provider} 的全部 ${ids.length} 个模型`)
+          await pool.setModelsDisabled(req.provider, catalog.ids)
+          ctx.logger.info(`[jet-hub] 关闭 ${req.provider} 的全部 ${catalog.ids.length} 个模型`)
         } else {
           // 打开全部：纯本地操作，不读目录 —— 目录故障时用户仍应能把开关全打开。
           await pool.clearDisabledModels(req.provider)
@@ -2612,6 +3060,224 @@ function registerJetHubEndpoints(
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
         }
+        return { ok: true, value }
+      }
+
+      /**
+       * 读取多个供应商的汇总状态（Jet Hub 左侧导航分组 + 一键开关据此渲染）。
+       *
+       * 为什么一次取全部：8 个供应商若逐个查，就是 16 次往返，且每次都要走
+       * 异步凭据解析。这里**全程只用同步的内存副本**，不产生任何网络请求：
+       * - 模型目录用 `modelAdapters[provider].listAllModels()`（同步；它内部
+       *   在冷缓存时会**后台**补拉，但不阻塞本次返回）；
+       * - 账号用 `pool.listAccountsByProvider()`（同步读内存）。
+       *
+       * ⚠️ **不得**改用 `pool.listAccounts()` —— 那个方法会对每个账号调
+       * `credentials.describe()`（异步 IO），8 个供应商逐个解析凭据会明显
+       * 拖慢设置页首屏，而我们**只需要计数**，不需要凭据状态。
+       *
+       * 适配器缺失（外部/旧适配器）时 `total = 0`、`closed = false`：
+       * 保守判为「未关闭」，让用户可以尝试操作，而不是误报成已关闭。
+       */
+      case 'provider.status': {
+        const req = payload as RpcProviderStatusRequest
+        if (!Array.isArray(req.providers) || req.providers.some((id) => typeof id !== 'string')) {
+          return { ok: false, error: { code: 'bad-request', message: 'providers 必须是字符串数组' } }
+        }
+        const statuses: Record<string, ProviderStatus> = {}
+        for (const provider of req.providers) {
+          // 空 id 不进结果：它不可能对应任何 provider，留着只会让前端多一个
+          // 无意义的键（前端按 PROVIDERS 取，多出来的键会被忽略，但脏数据不该产生）。
+          if (provider.length === 0) continue
+          const catalog = modelAdapters?.[provider]?.listAllModels()
+          const total = catalog?.length ?? 0
+          // ⚠️ `listAllModels()` **不带 disabled 字段**，故必须另取黑名单再按 id 计数。
+          const disabledMap = pool.listDisabledModels(provider)
+          let disabled = 0
+          if (catalog !== undefined) {
+            for (const model of catalog) {
+              // 与 `disabledModelsFor` 的判定对齐：只有显式 true 才算已关闭。
+              if (disabledMap[model.id] === true) disabled++
+            }
+          }
+          const entries = pool.listAccountsByProvider(provider)
+          statuses[provider] = {
+            models: { total, disabled },
+            accounts: {
+              total: entries.length,
+              // 与适配器一致的判据：`enabled !== false` 视为启用
+              //（老文档可能缺该字段，缺省语义等同启用）。
+              enabled: entries.filter((entry) => entry.enabled !== false).length,
+            },
+            closed: total > 0 && disabled === total,
+          }
+        }
+        const value: RpcProviderStatusResponse = { statuses }
+        return { ok: true, value }
+      }
+
+      /**
+       * 供应商级一键开关（Jet Hub 左侧每个供应商行尾的开关）。
+       *
+       * ## 语义（用户已确认）
+       *
+       * - `enabled: false`（关闭）= **关闭它的全部模型** + **停用它的全部账号**；
+       * - `enabled: true`（打开）= 清空它的模型黑名单 + 启用它的全部账号。
+       *
+       * ## ⚠️ 关闭方向的顺序不可颠倒：先关模型，再停账号
+       *
+       * 「是否已关闭」的判据是**模型是否全关**（见 `provider.status` 的 `closed`）。
+       * 先关模型可保证：即使随后停账号失败，状态判定依然自洽（该供应商确实已关闭），
+       * 用户重试一次即可补齐账号。反过来先停账号、再关模型，中途失败会留下
+       * 「账号全停用但模型仍可见」的中间态 —— 用户在对话框里还能选到它的模型，
+       * 却没有任何可用账号，这正是本次要消除的落差。
+       *
+       * ## ⚠️ 「不关闭模型就不关闭供应商」
+       *
+       * 关闭方向必须拿到模型目录：读失败、或目录**为空**时**整个操作失败**，
+       * 既不落盘也不广播。绝不能「关不掉模型就只停账号」—— 那会让供应商
+       * 显示成已关闭而模型其实还在，用户按关闭的预期却仍能选到它。
+       *
+       * ## 打开方向不读目录
+       *
+       * 与 `model.setAllDisabled` 的「打开全部」同理：直接清空黑名单，这样
+       * 「曾被关闭、后来从服务端目录下线」的历史遗留键才能被清掉；且目录故障时
+       * 用户仍应能把开关全打开。
+       */
+      case 'provider.setEnabled': {
+        const req = payload as RpcProviderSetEnabledRequest
+        // ⚠️ `enabled` 不做默认值猜测：缺失或非布尔一律拒绝。默认成 true 会静默
+        // 打开用户特意关闭的供应商；默认成 false 则反向静默关闭 —— 两个方向都是
+        // 灾难性且难察觉的（与 model.setAllDisabled 同约定）。
+        if (typeof req.provider !== 'string' || req.provider.length === 0 || typeof req.enabled !== 'boolean') {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'provider 与非空布尔 enabled 必填' },
+          }
+        }
+        let modelCount = 0
+        if (req.enabled) {
+          // 打开：清空黑名单（返回被清掉的条目数，供提示）。null 表示本就无关闭项。
+          const cleared = pool.listDisabledModels(req.provider)
+          await pool.clearDisabledModels(req.provider)
+          modelCount = Object.keys(cleared).length
+        } else {
+          const catalog = await fullCatalogIds(ctx, modelAdapters, req.provider)
+          if ('error' in catalog) {
+            // 目录读不出来 → 整个关闭操作失败，**不落盘、不广播**。
+            return { ok: false, error: { code: 'bad-request', message: catalog.error } }
+          }
+          if (catalog.ids.length === 0) {
+            // 「不关闭模型就不关闭供应商」的落点。
+            return {
+              ok: false,
+              error: { code: 'bad-request', message: '该供应商没有可关闭的模型，未做任何变更' },
+            }
+          }
+          await pool.setModelsDisabled(req.provider, catalog.ids)
+          modelCount = catalog.ids.length
+        }
+        // 账号状态**在模型之后**处理（顺序理由见上）。返回实际变更数，
+        // 已是目标状态的账号不计入，避免提示夸大成「已停用 N 个」。
+        const accountCount = await pool.setAccountsEnabled(req.provider, req.enabled)
+        // 两个方向都改变 listModels 的结果（关/开黑名单），**必须广播**，
+        // 否则对话框的模型选择器要重启才更新（成因见 broadcastCatalogChanged）。
+        broadcastCatalogChanged(ctx)
+        ctx.logger.info(
+          `[jet-hub] ${req.enabled ? '打开' : '关闭'}供应商 ${req.provider}：`
+          + `${req.enabled ? '清空' : '写入'} ${modelCount} 个模型、`
+          + `${req.enabled ? '启用' : '停用'} ${accountCount} 个账号`,
+        )
+        const value: RpcProviderSetEnabledResponse = {
+          provider: req.provider,
+          enabled: req.enabled,
+          models: modelCount,
+          accounts: accountCount,
+        }
+        return { ok: true, value }
+      }
+
+      // ── 内部 captcha 载体（二期）──
+      //
+      // 这两条是**客户端驱动**的通道：DSH 的 `connection.fetch` 只有
+      // `client-request` / `server-response` 两种消息（server 无法反向要求 GUI 干活），
+      // 所以「server 要 param」只能被表达成一个**需求位**，由 GUI 轮询着读，
+      // 产出来再 POST 回这条 contribute。语义与取舍见 `src/captcha-supply.ts` 文件头。
+      //
+      // ⚠ web 版：GUI 里没有 `dshDesktop.browser` ⇒ 没人读需求位、也没人贡献
+      //   ⇒ 槽长期为空 ⇒ 载体链直接退回既有 chromium 路径，行为不变。
+
+      /** client 心跳问「现在要不要产 param」——不需要时 client 一次都不产（零配额消耗）。 */
+      case 'captcha.demand': {
+        const value: RpcCaptchaDemandResponse = { active: captchaDemand() }
+        return { ok: true, value }
+      }
+
+      /**
+       * ★ 评审 C1/C2：client 每轮问一次「载体页在哪个地址」。
+       *
+       * ## 为什么是 RPC 而不是 client 里的一个常量
+       * 载体页**不能**挂在插件自己的 `/api/…` 上：桌面版主进程的
+       * `allowedNavigation()` / `onBeforeRequest` 都会以 `isApplicationHost(url)`
+       * 拒掉「**端口相同** 且 主机相同/回环」的地址（asar `lib/main.js`），
+       * 而那个端口就是 Host 自己的端口 ⇒ guest 连文档都建不起来。
+       * 换端口才绕得开 ⇒ 端口是 server 运行时挑的，client 只能**问**（见
+       * `src/captcha-carrier-server.ts` 文件头的完整取证）。
+       *
+       * ## 返回 `null` 的含义
+       * 服务没起（`DSH_ZCODE_INTERNAL_CARRIER=0` / 候选端口全被占）。client 拿到
+       * `null` 就记一条 `no-carrier-url` 并**安静返回**：不建 guest、不导航。
+       * ⚠ 这是 web 版之外的另一条「安静退出」路径，别把它当错误报。
+       */
+      case 'captcha.carrierUrl': {
+        // ⚠ 判一下方法存不存在：这条 RPC 允许「没有内部载体能力」的宿主形态（老插件
+        //   骨架 / 替身）回答，**回 null 即可**，不该把整次分派变成错误。
+        const url = typeof zcode.carrierPageUrl === 'function'
+          ? await zcode.carrierPageUrl()
+          : null
+        const value: RpcCaptchaCarrierUrlResponse = { url: url ?? null }
+        return { ok: true, value }
+      }
+
+      /** client 把内部载体产的 param 放进供给槽（一次性，取走即清）。 */
+      case 'captcha.contribute': {
+        const req = payload as RpcCaptchaContributeRequest
+        /**
+         * param 的「产出时刻」= **server 到达时刻 − client 报告的相对耗时**。
+         *
+         * ⚠ 不用 client 的绝对时间戳：那会把跨端时钟漂移引进时效闸（快了永不判过期、
+         *   慢了一投放就过期 ⇒ 内部载体静默永不可用，日志还看着像「client 没产」）。
+         * ⚠ 也不用纯到达时刻：那会把年龄**低估**一个 client→server 的跳数。
+         *   相对耗时是同机单向差值，比绝对时钟可靠 ⇒ 两者结合既无漂移也不低估。
+         * elapsedMs 缺失/非法时退回到达时刻（保守地偏小年龄，由 PARAM_MAX_AGE_MS 兜住）。
+         */
+        const elapsed = typeof req.elapsedMs === 'number' && Number.isSafeInteger(req.elapsedMs)
+          && req.elapsedMs >= 0 && req.elapsedMs < 5 * 60_000 ? req.elapsedMs : 0
+        const interactive = req.interactive === true
+        const accepted = putSuppliedParam(
+          typeof req.param === 'string' ? req.param : '',
+          Date.now() - elapsed,
+          { interactive },
+        )
+        ctx.logger.info(
+          `[jet-hub] zcode 内部载体贡献 param: accepted=${String(accepted)} elapsedMs=${String(elapsed)}`
+          + `${interactive ? ' interactive=true' : ''}`,
+        )
+        /**
+         * ⚠ 交互式必须**显式告警**（评审 I2）：那是 SDK 被降级成滑块/拼图的唯一信号，
+         *   也是这台机器**设备信誉下降**的唯一预警 —— chromium 那条腿早就有同样的
+         *   `warn`（见 `ZcodeAuth.captchaPoolInstance()`），内部载体这段此前只打进
+         *   client 控制台，host 侧一个字都看不到（等于没有预警）。
+         * ⚠ 只在被**收下**时告警：被拒的那条（垃圾 param）报「交互式」是噪声。
+         */
+        if (accepted && interactive) {
+          ctx.logger?.warn?.(
+            '[jet-hub] zcode 内部载体的 captcha 被降级为**交互式验证**（滑块/拼图）—— '
+            + '设备信誉可能已下降；内部载体的价值是「去掉对 chromium 的依赖」，'
+            + '不是绕过风控，请降低调用频率或稍后再试。',
+          )
+        }
+        const value: RpcCaptchaContributeResponse = { accepted }
         return { ok: true, value }
       }
 

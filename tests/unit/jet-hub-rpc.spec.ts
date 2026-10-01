@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  recordClineRequest,
+  resetClineRequestHistory,
+} from '../../src/cline-request-log.js'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
@@ -7,9 +11,14 @@ import {
   collectCreditBalances,
   collectCreditsStatus,
   computeClaimSummary,
+  JET_HUB_API_PATH,
   registerJetHubRpc,
 } from '../../src/jet-hub-rpc.js'
 import type { CreditsEndpointDeps } from '../../src/jet-hub-rpc.js'
+// ⚠️ 下面每个 `connection.fetch` 替身都**按 path 挑处理器**（用 `JET_HUB_API_PATH`）。
+// 本模块除了 RPC 的 POST 端点还注册了内部载体的 GET 路由；替身若写成
+// 「谁最后注册就记谁」，加一条路由就会让所有 RPC 用例莫名其妙地打到载体页上，
+// 表现为成片 405 —— 与本次改动毫无关系，极难归因。别把它「简化」回去。
 import { AccountPool } from '../../src/account-pool.js'
 import type { ClaimOutcome, CheckinStatus, CreditBalance } from '../../src/credits.js'
 import { WORKBUDDY } from '../../src/product.js'
@@ -628,7 +637,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
 
     const ctx = {
       get: (key: string) => key === 'connection'
-        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         : undefined,
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
@@ -714,7 +723,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     let handler: Handler | undefined
     const ctx = {
       get: (key: string) => key === 'connection'
-        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         : undefined,
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
@@ -761,7 +770,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     let handler: Handler | undefined
     const ctx = {
       get: (key: string) => key === 'connection'
-        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         : undefined,
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
@@ -915,7 +924,9 @@ describe('model.list / model.setDisabled 端点', () => {
         if (key === 'connection') {
           return {
             fetch: {
-              register: (config: { fetch: Handler }) => { handler = config.fetch },
+              register: (config: { path: string; fetch: Handler }) => {
+                if (config.path === JET_HUB_API_PATH) handler = config.fetch
+              },
             },
           }
         }
@@ -1437,6 +1448,157 @@ describe('model.list / model.setDisabled 端点', () => {
       expect(emitted).toEqual([])
     })
   })
+
+  /**
+   * 分组批量端点 `model.setDisabledMany`（Jet Hub 模型列表按「计费/来源」分组后的
+   * 「本组全开 / 本组全关」，用户 2026-10-01 要求）。
+   *
+   * ⚠️ **与 `model.setAllDisabled` 的区别就是本组用例的判据**：那个的范围是
+   * 「该 provider 的全部模型」，且**打开方向会清空整张黑名单**。若分组开关
+   * 图省事复用它会怎样？——「打开『订阅额度』这一组」会把用户特意关着的
+   * 「按量计费」那 400 多条**一起打开**。所以这里逐条锁住「只动传入的 id」。
+   */
+  describe('model.setDisabledMany（按分组批量开关）', () => {
+    it('disabled:true 只关闭传入的那批（其它已关闭项与已打开项都不受影响）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true } },
+      })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['glm-5.2'],
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      // hy3 本来就关着（保持），glm-5.2 新关，deepseek-v4-flash 仍然开着
+      expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true, 'glm-5.2': true } })
+    })
+
+    /**
+     * ⚠️ **这条是本端点的存在理由**：打开方向必须**只**删传入的 id。
+     *
+     * 若实现里误用 `clearDisabledModels`（清空整个 provider），这里会断成 `{}`
+     * —— 用户「只打开订阅额度那一组」会连带打开按量计费的全部模型。
+     */
+    it('disabled:false 只打开传入的那批，**不清空整张黑名单**', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true, 'glm-5.2': true, 'deepseek-v4-flash': true } },
+      })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['hy3', 'glm-5.2'],
+        disabled: false,
+      })
+
+      expect(result.ok).toBe(true)
+      // 只有 hy3/glm-5.2 被打开；deepseek-v4-flash 保持关闭
+      expect(storedValue().disabledModels).toEqual({ buddy: { 'deepseek-v4-flash': true } })
+    })
+
+    it('某个 provider 的关闭项被清空时删掉整个键（配置不膨胀）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true }, workbuddy: { 'gpt-5.4': true } },
+      })
+
+      await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['hy3'], disabled: false })
+
+      // buddy 整个键被删掉，workbuddy 不受影响
+      expect(storedValue().disabledModels).toEqual({ workbuddy: { 'gpt-5.4': true } })
+    })
+
+    it('黑名单按 provider 隔离（关 buddy 不动 workbuddy）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { workbuddy: { 'gpt-5.4': true } },
+      })
+
+      await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['hy3'], disabled: true })
+
+      expect(storedValue().disabledModels).toEqual({
+        workbuddy: { 'gpt-5.4': true },
+        buddy: { hy3: true },
+      })
+    })
+
+    /** 批量**只广播一次**：分组里可能有 460 条，逐条调用会打 460 次目录刷新。 */
+    it('只广播一次 llm/adapters-updated', async () => {
+      const { call, emitted } = registerEndpoints({ models: MODELS })
+
+      await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['hy3', 'glm-5.2'],
+        disabled: true,
+      })
+
+      expect(emitted).toEqual(['llm/adapters-updated'])
+    })
+
+    it('返回写入后的完整黑名单（与其它两个开关端点同结构）', async () => {
+      const { call } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['hy3'],
+        disabled: true,
+      })
+
+      expect(result.value).toEqual({ provider: 'buddy', disabledModels: { hy3: true } })
+    })
+
+    /** ⚠️ 空数组直接拒：空组不该出现在界面上（前端按钮也已禁用）。 */
+    it('modelIds 为空数组 → bad-request，不落盘也不广播', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: [],
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('modelIds')
+      expect(storedValue().disabledModels).toBeUndefined()
+      expect(emitted).toEqual([])
+    })
+
+    it('modelIds 全是脏值（空串 / 非字符串）→ 同样拒（去重剔净后为空）', async () => {
+      const { call, emitted } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['', 42, null],
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(false)
+      expect(emitted).toEqual([])
+    })
+
+    /** ⚠️ `disabled` 不做默认值猜测（与单条/全量端点同约定）。 */
+    it('disabled 非布尔 → bad-request（不猜默认值）', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['hy3'] })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('disabled')
+      expect(storedValue().disabledModels).toBeUndefined()
+      expect(emitted).toEqual([])
+    })
+
+    it('provider 非字符串或空串 → bad-request', async () => {
+      const { call, emitted } = registerEndpoints({ models: MODELS })
+
+      expect((await call('model.setDisabledMany', { modelIds: ['hy3'], disabled: true })).ok).toBe(false)
+      expect((await call('model.setDisabledMany', { provider: '', modelIds: ['hy3'], disabled: true })).ok).toBe(false)
+      expect(emitted).toEqual([])
+    })
+  })
 })
 
 /**
@@ -1473,7 +1635,7 @@ describe('积分端点的 provider 能力边界', () => {
     let handler: Handler | undefined
     const ctx: Record<string, unknown> = {
       get: (key: string) => key === 'connection'
-        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         : undefined,
       // 生产代码用惰性注入挂载 connection 端点（见 registerJetHubRpc 的说明）：
       // 替身必须提供 inject，否则会以 `ctx.inject is not a function` 抛错。
@@ -1657,7 +1819,7 @@ describe('account.reorder 端点', () => {
     } as never)
     const ctx = {
       get: (key: string) => key === 'connection'
-        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         : undefined,
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
@@ -1725,5 +1887,802 @@ describe('account.reorder 端点', () => {
     expect(result.ok).toBe(true)
     // buddy 的两个账号在各自原下标上互换，codearts 仍在中间
     expect(orderInStore()).toEqual(['b2', 'c1', 'b1'])
+  })
+})
+
+/**
+ * 供应商级一键开关：`provider.status`（读）与 `provider.setEnabled`（写）。
+ *
+ * 这套用例的重点是几条**不能被"改动"破坏的不变式**：
+ * 1. 关闭方向必须**先关模型、再停账号**（顺序反了会留下「账号全停但模型可见」的中间态）；
+ * 2. 目录读失败或目录为空时**整个操作失败、不落盘、不广播**（「不关闭模型就不关闭供应商」）；
+ * 3. 两个方向都必须广播 `llm/adapters-updated`（否则对话框选择器要重启才更新）；
+ * 4. `enabled` 非布尔一律拒绝（不猜默认值）。
+ */
+describe('provider.status / provider.setEnabled 端点', () => {
+  type Handler = (request: Request) => Promise<Response>
+
+  function setup(options: {
+    /** `listAllModels()` 的返回值（不套黑名单的全量目录）；省略则模拟「适配器缺失」。 */
+    catalog?: Array<{ id: string; name: string }>
+    /** 初始黑名单。 */
+    disabledModels?: Record<string, Record<string, boolean>>
+    /** 初始账号（只用到 provider / enabled）。 */
+    accounts?: Array<{ id: string; provider: string; enabled: boolean }>
+    /** 省略 llm 服务，验证「目录读不出来」的降级路径。 */
+    withoutLlm?: boolean
+    /** 让 llm.listModels 抛错。 */
+    listModelsError?: string
+    /** 让 `ctx.emit` 抛错，验证「广播失败不反噬已落盘的开关」。 */
+    emitThrows?: boolean
+    /** 是否提供适配器（false = 模拟外部/旧适配器，只有 llm 可用）。 */
+    withAdapter?: boolean
+  } = {}) {
+    let stored: Record<string, unknown> = {
+      // ⚠️ 账号条目必须补齐 `credentialRef`（非空）与 `createdAt`/`refreshable`：
+      // `sanitizeAccounts` 会把缺 `credentialRef` 的条目**整条丢弃**，于是
+      // 「停用全部账号」会返回 0、用例假失败。这个替身曾因此踩过一次。
+      accounts: (options.accounts ?? []).map((a, i) => ({
+        nickname: a.id,
+        credentialRef: `${a.provider.toUpperCase()}_ACCOUNT_T${i + 1}`,
+        createdAt: Date.now(),
+        refreshable: true,
+        ...a,
+      })),
+      ...options.disabledModels !== undefined ? { disabledModels: options.disabledModels } : {},
+    }
+    let handler: Handler | undefined
+    const emitted: string[] = []
+    /** 记录每次写入的顺序，用于断言「先关模型、后停账号」。 */
+    const writeOrder: string[] = []
+
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? {
+            register: () => ({
+              get: () => stored,
+              replace: async (value: Record<string, unknown>) => {
+                // 判定这次写入是「账号」还是「模型黑名单」：前者有非空 accounts
+                // 且黑名单未变；用更直接的判据 —— 对比写入前后的字段差异。
+                const prevDisabled = JSON.stringify((stored as { disabledModels?: unknown }).disabledModels ?? {})
+                const nextDisabled = JSON.stringify((value as { disabledModels?: unknown }).disabledModels ?? {})
+                if (prevDisabled !== nextDisabled) writeOrder.push('models')
+                const prevAccounts = JSON.stringify((stored as { accounts?: unknown }).accounts ?? [])
+                const nextAccounts = JSON.stringify((value as { accounts?: unknown }).accounts ?? [])
+                if (prevAccounts !== nextAccounts) writeOrder.push('accounts')
+                stored = value
+              },
+            }),
+          }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: false, writable: true }),
+        resolve: async () => undefined,
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+
+    const adapter = options.catalog !== undefined && options.withAdapter !== false
+      ? { listAllModels: () => options.catalog! }
+      : undefined
+
+    const ctx = {
+      get: (key: string) => {
+        if (key === 'connection') {
+          return { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
+        }
+        if (key === 'llm' && options.withoutLlm !== true) {
+          return {
+            listModels: async (provider: string) => {
+              if (options.listModelsError !== undefined) throw new Error(options.listModelsError)
+              const disabled = ((stored.disabledModels as Record<string, Record<string, boolean>> | undefined)?.[provider]) ?? {}
+              // 复刻真实适配器：黑名单命中的模型不出现在 listModels 结果里。
+              return (options.catalog ?? [])
+                .filter(m => disabled[m.id] !== true)
+                .map(m => ({ ...m, provider }))
+            },
+          }
+        }
+        return undefined
+      },
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      emit: (event: string) => {
+        if (options.emitThrows === true) throw new Error('listener exploded')
+        emitted.push(event)
+      },
+    }
+
+    registerJetHubRpc(
+      // ⚠️ **位置参数**：auth 实例是按顺序传的，每新增一个 provider 都要在这里
+      // 补一个 `{}` 占位，否则 `modelAdapters` 会错位落到最后一个 auth 形参上。
+      // 加 Raccoon（第 9 个）时本地就因此踩过一次：`modelAdapters` 落到 `raccoon`
+      // 上 → `listAllModels()` 读不到 → `provider.status` 的 total 恒为 0、
+      // 三条用例假失败。改签名后请 `grep -n 'registerJetHubRpc(' tests/` 全部补齐。
+      // ⚠️ 合并上游 `qoderCn`（第 8 个）时**第四次**踩到同一个坑：git 认为本文件
+      // 「无冲突」（改动分散在不同段落），但 `qoderCn` 插入后这里的占位整体错位
+      // 一位 → `modelAdapters` 落到 `raccoon` 上 → 上面那三条用例再次假失败。
+      // **合并新增 provider 后必须重跑本组用例，不能只看 git 是否报冲突。**
+      // ⚠️ **第六次**（2026-10-01，为提交独立 PR 而把本分支重建到最新上游）：
+      // 上游此后又加了 `minimax` 与 `zcode` ⇒ 这里少两个占位、`modelAdapters`
+      // 落到 `zcode` 上，本组 3 条用例**再次**以完全相同的形态失败。
+      // 判据永远是同一条：`provider.status` 的 `total` 恒为 0 ⇒ 先数占位。
+      ctx as never, pool,
+      {} as never, // codearts
+      {} as never, // buddy
+      {} as never, // workbuddy
+      {} as never, // lobsterai
+      {} as never, // qoder
+      {} as never, // qoderCn
+      {} as never, // trae
+      {} as never, // cline
+      {} as never, // loomy
+      {} as never, // raccoon
+      {} as never, // minimax
+      {} as never, // zcode
+      (adapter !== undefined ? { buddy: adapter } : undefined) as never,
+    )
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+          payload: { method, payload },
+        }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { message: string } } }
+      return body.result
+    }
+
+    return {
+      call,
+      emitted,
+      writeOrder,
+      storedDisabled: () => (stored.disabledModels as Record<string, Record<string, boolean>> | undefined) ?? {},
+      storedAccounts: () => (stored.accounts as Array<{ id: string; provider: string; enabled: boolean }> | undefined) ?? [],
+    }
+  }
+
+  const CATALOG = [
+    { id: 'glm-5.2', name: 'GLM-5.2' },
+    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+    { id: 'hy3', name: 'Hy3' },
+  ]
+
+  describe('provider.status', () => {
+    it('全部模型都已关闭时 closed 为 true', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+      })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      expect(result.ok).toBe(true)
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      expect(s.models).toEqual({ total: 3, disabled: 3 })
+      expect(s.closed).toBe(true)
+    })
+
+    it('⚠️ 只关了一部分时 closed 为 false（不能按「关过」判）', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { hy3: true } },
+      })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      expect(s.models).toEqual({ total: 3, disabled: 1 })
+      expect(s.closed).toBe(false)
+    })
+
+    it('⚠️ 没有任何模型时 closed 必须为 false（「没有模型可关」≠「已关闭」）', async () => {
+      const { call } = setup({ catalog: [] })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      expect(s.models.total).toBe(0)
+      expect(s.closed).toBe(false)
+    })
+
+    it('⚠️ 适配器缺失时保守判为未关闭（不误报已关闭）', async () => {
+      const { call } = setup({ catalog: CATALOG, withAdapter: false, disabledModels: { buddy: { 'glm-5.2': true } } })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses.buddy
+      expect(s.closed).toBe(false)
+    })
+
+    it('回传账号计数（enabled 只统计启用的）', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        accounts: [
+          { id: 'b1', provider: 'buddy', enabled: true },
+          { id: 'b2', provider: 'buddy', enabled: false },
+          { id: 'c1', provider: 'codearts', enabled: true },
+        ],
+      })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { accounts: { total: number; enabled: number } }> }).statuses.buddy
+      // 只统计本 provider，codearts 的账号不计入
+      expect(s.accounts).toEqual({ total: 2, enabled: 1 })
+    })
+
+    it('一次查询多个供应商，各自独立判定', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+      })
+      const result = await call('provider.status', { providers: ['buddy', 'qoder'] })
+      const statuses = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses
+      expect(statuses.buddy.closed).toBe(true)
+      // qoder 没有目录 → 未关闭
+      expect(statuses.qoder?.closed ?? false).toBe(false)
+    })
+
+    it('providers 非字符串数组 → bad-request', async () => {
+      const { call } = setup({ catalog: CATALOG })
+      expect((await call('provider.status', { providers: 'buddy' })).ok).toBe(false)
+      expect((await call('provider.status', { providers: [1, 2] })).ok).toBe(false)
+      expect((await call('provider.status', {})).ok).toBe(false)
+    })
+
+    it('provider.status 是只读的：不写盘、不广播', async () => {
+      const { call, emitted, writeOrder } = setup({ catalog: CATALOG })
+      await call('provider.status', { providers: ['buddy'] })
+      expect(emitted).toEqual([])
+      expect(writeOrder).toEqual([])
+    })
+  })
+
+  describe('provider.setEnabled（关闭方向）', () => {
+    it('关闭：把全部模型写入黑名单，并停用全部账号', async () => {
+      const { call, storedDisabled, storedAccounts } = setup({
+        catalog: CATALOG,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(true)
+      expect(result.value).toMatchObject({ provider: 'buddy', enabled: false, models: 3, accounts: 1 })
+      expect(Object.keys(storedDisabled().buddy).sort()).toEqual(['deepseek-v4-flash', 'glm-5.2', 'hy3'])
+      expect(storedAccounts()[0].enabled).toBe(false)
+    })
+
+    it('⚠️ 顺序必须是「先关模型、再停账号」', async () => {
+      // 判据是模型是否全关；先关模型可保证中途失败时状态仍自洽。
+      const { call, writeOrder } = setup({
+        catalog: CATALOG,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(writeOrder).toEqual(['models', 'accounts'])
+    })
+
+    it('关闭后广播 llm/adapters-updated（否则界面要重启才更新）', async () => {
+      const { call, emitted } = setup({ catalog: CATALOG })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(emitted).toContain('llm/adapters-updated')
+    })
+
+    it('⚠️ 目录读失败 → 整个操作失败，不落盘、不广播', async () => {
+      const { call, emitted, writeOrder, storedDisabled } = setup({
+        catalog: CATALOG,
+        withAdapter: false,
+        withoutLlm: true,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toBeTruthy()
+      // 三条关键断言：不写黑名单、不停账号、不广播
+      expect(storedDisabled().buddy).toBeUndefined()
+      expect(writeOrder).toEqual([])
+      expect(emitted).toEqual([])
+    })
+
+    it('⚠️ llm.listModels 抛错同样不落盘、不广播', async () => {
+      const { call, emitted, writeOrder } = setup({
+        catalog: CATALOG,
+        withAdapter: false,
+        listModelsError: 'boom',
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(false)
+      expect(writeOrder).toEqual([])
+      expect(emitted).toEqual([])
+    })
+
+    it('⚠️ 目录为空 → 拒绝且不落盘（「不关闭模型就不关闭供应商」的落点）', async () => {
+      const { call, emitted, writeOrder, storedAccounts } = setup({
+        catalog: [],
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('没有可关闭的模型')
+      // ⚠️ 关键：绝不能「关不掉模型就只停账号」——那会让它显示成已关闭而模型仍在。
+      expect(writeOrder).toEqual([])
+      expect(emitted).toEqual([])
+      expect(storedAccounts()[0].enabled).toBe(true)
+    })
+
+    it('已是目标状态时 accounts 计数为 0（不谎报已停用 N 个）', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: false }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.value).toMatchObject({ models: 3, accounts: 0 })
+    })
+
+    it('无账号时关闭仍可执行（关模型、停 0 个账号）', async () => {
+      const { call } = setup({ catalog: CATALOG })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(true)
+      expect(result.value).toMatchObject({ models: 3, accounts: 0 })
+    })
+  })
+
+  describe('provider.setEnabled（打开方向）', () => {
+    it('打开：清空该 provider 的黑名单，并启用全部账号，且广播', async () => {
+      const { call, emitted, storedDisabled, storedAccounts } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { 'glm-5.2': true, hy3: true } },
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: false }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      expect(result.ok).toBe(true)
+      expect(result.value).toMatchObject({ models: 2, accounts: 1 })
+      expect(storedDisabled().buddy).toBeUndefined()
+      expect(storedAccounts()[0].enabled).toBe(true)
+      expect(emitted).toContain('llm/adapters-updated')
+    })
+
+    it('⚠️ 打开方向不读目录：目录缺失/故障时仍能把开关全打开', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        withAdapter: false,
+        withoutLlm: true,
+        disabledModels: { buddy: { 'glm-5.2': true } },
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      expect(result.ok).toBe(true)
+    })
+
+    it('⚠️ 只清本 provider 的黑名单，不波及其它 provider', async () => {
+      const { call, storedDisabled } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { hy3: true }, trae: { 'glm-5.2': true } },
+      })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      expect(storedDisabled().buddy).toBeUndefined()
+      expect(storedDisabled().trae).toEqual({ 'glm-5.2': true })
+    })
+
+    it('⚠️ 打开也要广播（两个方向都改变 listModels 结果）', async () => {
+      const { call, emitted } = setup({ catalog: CATALOG })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      expect(emitted).toEqual(['llm/adapters-updated'])
+    })
+  })
+
+  describe('provider.setEnabled（参数校验与健壮性）', () => {
+    it('enabled 非布尔（缺失 / 字符串 / 数字）一律 bad-request，且不落盘', async () => {
+      const { call, writeOrder, emitted } = setup({
+        catalog: CATALOG,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      expect((await call('provider.setEnabled', { provider: 'buddy' })).ok).toBe(false)
+      expect((await call('provider.setEnabled', { provider: 'buddy', enabled: 'false' })).ok).toBe(false)
+      expect((await call('provider.setEnabled', { provider: 'buddy', enabled: 0 })).ok).toBe(false)
+      // ⚠️ 不做默认值猜测：一次字段名写错不该静默改动用户数据
+      expect(writeOrder).toEqual([])
+      expect(emitted).toEqual([])
+    })
+
+    it('provider 缺失或空串 → bad-request', async () => {
+      const { call } = setup({ catalog: CATALOG })
+      expect((await call('provider.setEnabled', { enabled: false })).ok).toBe(false)
+      expect((await call('provider.setEnabled', { provider: '', enabled: false })).ok).toBe(false)
+    })
+
+    it('⚠️ 广播抛错仍算成功（通知失败不得反噬已落盘的开关）', async () => {
+      const { call, storedDisabled } = setup({ catalog: CATALOG, emitThrows: true })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(true)
+      // 开关确实已落盘
+      expect(Object.keys(storedDisabled().buddy)).toHaveLength(3)
+    })
+  })
+})
+
+/**
+ * Cline「订阅额度」端点（`cline.quota` / `cline.requestLog`）。
+ *
+ * 参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分。
+ *
+ * 这里守住四条真正的不变式：
+ * 1. **只认 cline** —— 其余 provider 一律 `bad-request`（前端另有
+ *    `supportsSubscriptionQuota` 门控，两侧必须一致）。
+ * 2. **额度逐账号隔离** —— 一个账号凭据坏掉不能让整批失败，
+ *    否则多账号用户会因为「有一个号没配凭据」而完全看不到额度。
+ * 3. **游标只走 `?cursor=`** —— 网关对 `page`/`offset` 静默忽略，
+ *    传错会表现为「点了加载更多还是同一批」（最难排查的一类静默错误）。
+ * 4. **请求记录失败是载荷（`ok:false`）而不是 RPC 错误** ——
+ *    面板要保留已加载的行、只在下方显示原因。
+ */
+describe('cline.quota / cline.requestLog 端点', () => {
+  type Handler = (request: Request) => Promise<Response>
+
+  /** 凭据形态与实测一致（`account_id` 是 `usr-…`）。 */
+  const CLINE_CREDENTIAL = {
+    access_token: 'workos:eyJhbGciOiJSUzI1NiIs',
+    refresh_token: 'tmgEeM2rd9ybYoWpXl8JqUfvK',
+    account_id: 'usr-01M3BCV4FYCGJKAWD3MJG3DBQM',
+    email: 'ijetlee@163.com',
+  }
+
+  const LIMITS_RESPONSE = {
+    success: true,
+    data: {
+      limits: [
+        { type: 'five_hour', percentUsed: 12.5, resetsAt: '2026-09-29T10:00:00.000Z' },
+        { type: 'weekly', percentUsed: 68, resetsAt: '2026-10-05T00:00:00.000Z' },
+      ],
+    },
+  }
+
+  const USAGES_RESPONSE = {
+    success: true,
+    data: {
+      nextToken: 'tok-2',
+      items: [{ createdAt: '2026-09-29T07:12:00.000Z', aiModelName: 'DeepSeek', aiModelTypeName: 'cline-free', totalTokens: 49, creditsUsed: 0, costUsd: 1320 }],
+    },
+  }
+
+  function setup(options: {
+    /** 初始账号（provider 固定 cline）。 */
+    accounts?: Array<{ id: string; enabled: boolean }>
+    /** `ctx.credentials.resolve` 的返回值：`'valid'` = 合法凭据 JSON，`'missing'` = 未配置。 */
+    credential?: 'valid' | 'missing'
+  } = {}) {
+    const accounts = options.accounts ?? [{ id: 'acc-1', enabled: true }]
+    const stored: Record<string, unknown> = {
+      accounts: accounts.map((a, i) => ({
+        id: a.id,
+        nickname: `号${i + 1}`,
+        provider: 'cline',
+        enabled: a.enabled,
+        credentialRef: `CLINE_ACCOUNT_T${i + 1}`,
+        createdAt: Date.now(),
+        refreshable: true,
+      })),
+    }
+    let handler: Handler | undefined
+
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? { register: () => ({ get: () => stored, replace: async () => {} }) }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: false, writable: true }),
+        resolve: async () => undefined,
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+
+    /**
+     * ⚠️ `ctx.credentials` 是**服务注入的直接属性**（`ctx.credentials.resolve`），
+     * 不是经 `ctx.get('credentials')` 取的 —— 写成后者会让端点在运行时抛
+     * `Cannot read properties of undefined (reading 'resolve')`，
+     * 而 RPC 把它包成 `jet-hub/handler-failed`，看起来像「方法不存在」。
+     */
+    const credentials = {
+      describe: async () => ({ configured: false, writable: true }),
+      resolve: async () => (options.credential === 'missing'
+        ? undefined
+        : { value: JSON.stringify(CLINE_CREDENTIAL) }),
+      set: async () => {},
+      unset: async () => {},
+    }
+
+    const ctx = {
+      credentials,
+      get: (key: string) => {
+        if (key === 'connection') {
+          // ⚠ 必须**按 path 精确匹配**（真实 dsh 是 `fetchRoutes.get(url.pathname)` 精确命中）：
+          //   不看 path 的「最后注册的赢」替身，会被**后注册**的另一条路由偷走
+          //   （当前是 `GET /api/jet-hub/captcha-carrier` 载体页路由）⇒ 本组测试的
+          //   POST 落到载体页 handler 上 → 405 `method not allowed` → JSON.parse 炸。
+          //   这是 AGENTS.md「合并上游新增端点后必须重跑位置占位组」那条纪律的复发。
+          return { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
+        }
+        return undefined
+      },
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      emit: () => {},
+    }
+
+    registerJetHubRpc(
+      // ⚠️ 位置参数：新增 provider 会让 `modelAdapters` 错位（本仓库已踩四次）。
+      // 本组用例不依赖 modelAdapters，但**占位数量必须与签名一致**。
+      ctx as never, pool,
+      {} as never, // codearts
+      {} as never, // buddy
+      {} as never, // workbuddy
+      {} as never, // lobsterai
+      {} as never, // qoder
+      {} as never, // qoderCn
+      {} as never, // trae
+      {} as never, // cline
+      {} as never, // loomy
+      {} as never, // raccoon
+    )
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub', payload: { method, payload } }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { message: string } } }
+      return body.result
+    }
+
+    return { call }
+  }
+
+  /** 桩掉全局 fetch 并记录每次请求的 URL。 */
+  function stubFetch(handler: (url: string) => Response) {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      return handler(url)
+    }))
+    return urls
+  }
+
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  describe('cline.quota', () => {
+    it('回传各账号的额度窗口（按网关原序）', async () => {
+      stubFetch(() => new Response(JSON.stringify(LIMITS_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      const result = await call('cline.quota', { provider: 'cline' })
+      expect(result.ok).toBe(true)
+      const accounts = (result.value as { accounts: Array<{ ok: boolean; windows: Array<{ type: string }> }> }).accounts
+      expect(accounts).toHaveLength(1)
+      expect(accounts[0]!.ok).toBe(true)
+      expect(accounts[0]!.windows.map(w => w.type)).toEqual(['five_hour', 'weekly'])
+    })
+
+    it('用 users/me 端点（不依赖账号 id）', async () => {
+      const urls = stubFetch(() => new Response(JSON.stringify(LIMITS_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      await call('cline.quota', { provider: 'cline' })
+      expect(urls[0]).toBe('https://api.cline.bot/api/v1/users/me/plan/usage-limits')
+    })
+
+    /**
+     * ⚠️ 非 cline 一律 bad-request：前端 `supportsSubscriptionQuota` 只对 cline
+     * 渲染按钮，两侧必须一致，否则就是「按钮在、点了报错」。
+     */
+    it('非 cline 的 provider → bad-request，且不发请求', async () => {
+      const urls = stubFetch(() => new Response(JSON.stringify(LIMITS_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      for (const provider of ['buddy', 'qoder', 'loomy', '']) {
+        expect((await call('cline.quota', { provider })).ok, provider).toBe(false)
+      }
+      expect(urls).toEqual([])
+    })
+
+    /**
+     * ⚠️ 一个账号没配凭据只影响它自己：多账号用户不该因为其中一个号
+     * 凭据缺失就完全看不到额度。
+     */
+    it('逐账号隔离：凭据未配置的账号带原因，其余照常', async () => {
+      // 第一个账号走 missing 分支由 credential 选项控制；这里用两个账号 +
+      // 按 ref 区分较麻烦，故直接验证「missing 时不发请求且带原因」这一半。
+      stubFetch(() => new Response(JSON.stringify(LIMITS_RESPONSE), { status: 200 }))
+      const { call } = setup({ accounts: [{ id: 'acc-1', enabled: true }], credential: 'missing' })
+      const result = await call('cline.quota', { provider: 'cline' })
+      expect(result.ok).toBe(true)
+      const accounts = (result.value as { accounts: Array<{ ok: boolean; error?: string; windows: unknown[] }> }).accounts
+      expect(accounts[0]!.ok).toBe(false)
+      expect(accounts[0]!.error).toBe('凭据未配置')
+      expect(accounts[0]!.windows).toEqual([])
+    })
+
+    it('网关报错时该账号 ok:false 并带 HTTP 状态与文案', async () => {
+      stubFetch(() => new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 }))
+      const { call } = setup()
+      const result = await call('cline.quota', { provider: 'cline' })
+      const accounts = (result.value as { accounts: Array<{ ok: boolean; error?: string }> }).accounts
+      expect(accounts[0]!.ok).toBe(false)
+      expect(accounts[0]!.error).toContain('HTTP 401')
+      expect(accounts[0]!.error).toContain('Unauthorized')
+    })
+
+    /** ⚠️ 查不到**不能显示成 0%**（0% 是「没用过」的语义）。 */
+    it('查询失败时 windows 为空且 ok:false（不返回 0% 的假读数）', async () => {
+      stubFetch(() => new Response(JSON.stringify({ success: true, data: {} }), { status: 200 }))
+      const { call } = setup()
+      const result = await call('cline.quota', { provider: 'cline' })
+      const accounts = (result.value as { accounts: Array<{ ok: boolean; windows: unknown[] }> }).accounts
+      expect(accounts[0]!.ok).toBe(false)
+      expect(accounts[0]!.windows).toEqual([])
+    })
+  })
+
+  describe('cline.requestLog', () => {
+    /** 种入一条本地流水记录(模块级可变状态,用例间会泄漏,须先清)。 */
+    const seedOne = (entry: Parameters<typeof recordClineRequest>[0]) => {
+      resetClineRequestHistory()
+      recordClineRequest(entry)
+    }
+
+    it('回传当前账号的记录,字段对齐参考实现', async () => {
+      seedOne({
+        model: 'cline-pass/deepseek-v4.1-flash',
+        accountId: 'acc-1',
+        usageReported: true,
+        inputTokens: 100,
+        outputTokens: 25,
+        cacheReadTokens: 400,
+        reasoningTokens: 89,
+        effort: 'high',
+        ttftMs: 320,
+        // 首个**正文**块耗时：速率的分子分母都要落在正文阶段，必须透传
+        ttfcMs: 1800,
+        totalMs: 4200,
+      })
+      const { call } = setup()
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      expect(result.ok).toBe(true)
+      const value = result.value as {
+        rows: Array<{
+          ts: number
+          model: string
+          upstream: string
+          usageReported: boolean
+          inputTokens: number
+          outputTokens: number
+          cacheReadTokens?: number
+          reasoningTokens?: number
+          effort: string
+          ttftMs: number
+          ttfcMs: number
+          totalMs: number
+        }>
+      }
+      expect(value.rows).toHaveLength(1)
+      expect(value.rows[0]).toEqual({
+        ts: expect.any(Number),
+        model: 'cline-pass/deepseek-v4.1-flash',
+        // 网关没报路由时回落到模型 id 的「/ 前缀」（两个维度，见 RPC 侧注释）
+        upstream: 'cline-pass',
+        // ⚠️ 必须透传：表格据此把「网关没发 usage」显示成 `—`（不是 0）
+        usageReported: true,
+        inputTokens: 100,
+        outputTokens: 25,
+        // 缓存命中：有值才出现（表格的 ⚡ 那一项）
+        cacheReadTokens: 400,
+        reasoningTokens: 89,
+        // 推理强度：**空串也照传**（前端据「空串 ⇒ 不渲染那一行」判断）
+        effort: 'high',
+        ttftMs: 320,
+        ttfcMs: 1800,
+        totalMs: 4200,
+      })
+    })
+
+    /**
+     * ⚠️ 用户报障「上游显示的不正确」：**网关报的真实渠道优先**，
+     * 它没报时才回落到模型命名空间（`cline-pass` 那类订阅通道名）。
+     */
+    it('upstream 优先用网关报的渠道；未报时回落到模型命名空间', async () => {
+      seedOne({
+        model: 'cline-pass/deepseek-v4.1-flash',
+        accountId: 'acc-1',
+        usageReported: true,
+        inputTokens: 1,
+        outputTokens: 1,
+        effort: '',
+        upstream: 'alibaba',
+        ttftMs: 320,
+        totalMs: 4200,
+      })
+      const { call } = setup()
+      const withRoute = (await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' }))
+        .value as { rows: Array<{ upstream: string }> }
+      expect(withRoute.rows[0]!.upstream).toBe('alibaba')
+
+      // 网关没报路由（空串）⇒ 回落成模型命名空间，而不是编造渠道名
+      seedOne({
+        model: 'cline-pass/deepseek-v4.1-flash',
+        accountId: 'acc-1',
+        usageReported: true,
+        inputTokens: 1,
+        outputTokens: 1,
+        effort: '',
+        upstream: '',
+        ttftMs: 320,
+        totalMs: 4200,
+      })
+      const noRoute = (await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' }))
+        .value as { rows: Array<{ upstream: string }> }
+      expect(noRoute.rows[0]!.upstream).toBe('cline-pass')
+    })
+
+    /** ⚠️ 未收到 usage 帧时 token 全为 0，但 `usageReported:false` 必须透传。 */
+    it('未收到 usage 帧时 usageReported:false 透传（0 不等于未知）', async () => {
+      seedOne({
+        model: 'cline-pass/deepseek-v4.1-flash',
+        accountId: 'acc-1',
+        usageReported: false,
+        inputTokens: 0,
+        outputTokens: 0,
+        effort: '',
+        ttftMs: 320,
+        totalMs: 4200,
+      })
+      const { call } = setup()
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      const row = (result.value as { rows: Array<Record<string, unknown>> }).rows[0]!
+      expect(row.usageReported).toBe(false)
+      expect(row.effort).toBe('')
+      expect('cacheReadTokens' in row).toBe(false)
+      expect('reasoningTokens' in row).toBe(false)
+    })
+
+    it('按 accountId 过滤:别的账号的记录不混进来', async () => {
+      seedOne({ model: 'm', accountId: 'acc-other', inputTokens: 1, outputTokens: 2, ttftMs: 3, totalMs: 4 })
+      const { call } = setup()
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      expect(result.ok).toBe(true)
+      expect((result.value as { rows: unknown[] }).rows).toEqual([])
+    })
+
+    it('无记录时返回空数组(而不是错误)', async () => {
+      resetClineRequestHistory()
+      const { call } = setup()
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      expect(result.ok).toBe(true)
+      expect((result.value as { rows: unknown[] }).rows).toEqual([])
+    })
+
+    /**
+     * ⚠️ 失败行**随行回传 error**:失败的请求是排查「为什么没回复」的
+     * 第一线索(429 / 11140 安全策略 / 网络错误各是不同的原因)。
+     */
+    it('失败行随行回传 error', async () => {
+      seedOne({
+        model: 'm', accountId: 'acc-1',
+        inputTokens: 0, outputTokens: 0, ttftMs: 0, totalMs: 5,
+        error: 'cline: transport error: ECONNRESET',
+      })
+      const { call } = setup()
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      const rows = (result.value as { rows: Array<{ error?: string }> }).rows
+      expect(rows[0]!.error).toContain('ECONNRESET')
+    })
+
+    it('非 cline 的 provider → bad-request(与额度端点同规)', async () => {
+      const { call } = setup()
+      for (const provider of ['buddy', 'qoder', '']) {
+        expect((await call('cline.requestLog', { provider, accountId: 'acc-1' })).ok, provider).toBe(false)
+      }
+    })
+
+    it('accountId 为空 → bad-request(不猜默认值)', async () => {
+      const { call } = setup()
+      expect((await call('cline.requestLog', { provider: 'cline', accountId: '' })).ok).toBe(false)
+      expect((await call('cline.requestLog', { provider: 'cline' })).ok).toBe(false)
+    })
   })
 })

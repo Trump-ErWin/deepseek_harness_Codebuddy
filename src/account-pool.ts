@@ -77,6 +77,13 @@ export class AccountPool {
   private permanentLockCache: PermanentLockMap = {}
   /** 是否已完成首次载入。 */
   private loaded = false
+  /**
+   * 状态文档落盘的**串行链**（见 {@link queueStoreSave}）。
+   *
+   * ⚠ 它必须存在：内层重新读一次快照只能保证「读→改」这半原子，而
+   * `store.save()` 本身是异步的，两个写者的 `save` 可以乱序完成。
+   */
+  private storeChain: Promise<void> = Promise.resolve()
   /** 锁定表的独立后端（权威落盘点）。 */
   private readonly lockStore: PermanentLockStore
 
@@ -134,6 +141,56 @@ export class AccountPool {
   }
 
   /**
+   * 串行化状态文档的落盘，并在**轮到本次时**重新取一次快照。
+   *
+   * ## 为什么 `removeAccount` 里的重读不够（真实缺陷，审查发现）
+   *
+   * `await this.writeAccounts(this.readAccounts().filter(...))` 只保证了
+   * 「读 → 改」之间没有 `await`（内存那半确实原子），但
+   * {@link writeAccounts} 内部的 `await this.store.save(...)` 是**异步**的
+   * （`SettingsStore.save` → `await this.scope.replace(...)`）。两个写者各自的
+   * `save` 可以**乱序完成**：后完成者带着它更早的快照覆盖磁盘 ⇒ 磁盘与
+   * `this.cache` 分叉。实测形态（探针复现真实 IO 交错）：
+   *
+   * - 并发 `removeAccount('a')` / `removeAccount('b')`（先发起的后完成）：
+   *   `cache=["keep"]` 而 `disk=["b","keep"]` ⇒ **已删除的账号在磁盘上复活**，
+   *   下次进程启动它又回来；
+   * - `removeAccount('victim')` 与 `addAccount(added)` 交错：
+   *   `cache=["added","keep"]` 而 `disk=["keep"]` ⇒ **新增账号被静默丢失**。
+   *
+   * ⚠ 仅 `SettingsStore` 这类**异步** `replace` 后端中招；`FileStore.save` 是
+   * 同步的 `writeFileSync` + `renameSync`（见 `src/jet-hub-store.ts`），整段
+   * RMW 本来就原子、免疫此竞态。故不能靠「换个后端」绕过，只能在
+   * `AccountPool` 这一层把写排队。
+   *
+   * ## 做法
+   *
+   * 把本次写挂到 {@link storeChain} 尾部，**在轮到它执行时**才从进程内权威副本
+   * 取快照，于是「取快照」与「写磁盘」之间隔着前面所有已排队的写。磁盘上因此
+   * 永远是「最后一次排队的写」的内容，与 `this.cache` / `this.modelCache` 收敛。
+   *
+   * ⚠ 三条数据**必须取自同一时刻**：账号、黑名单、锁定镜像字段共用一次快照，
+   * 否则会出现「同一份文档里两个字段自相矛盾」（与 {@link lockFields} 的约定一致）。
+   *
+   * ⚠ 失败**照常向调用方抛出**（与改造前的 `writeAccounts` 一致：登录成功后落盘
+   * 失败必须让 `account.create` 报错，不能静默假装成功）。同时用一条
+   * `.catch()` 派生量更新 {@link storeChain}，让**链本身不被一次失败打断**
+   * ——否则后续所有写都会跟着拒绝，账号池进入永不落盘状态。
+   */
+  private queueStoreSave(): Promise<void> {
+    if (this.store.kind === 'memory') return Promise.resolve()
+    const next = this.storeChain.then(async () => {
+      await this.store.save({
+        accounts: this.cache,
+        disabledModels: this.modelCache,
+        ...this.lockFields(),
+      })
+    })
+    this.storeChain = next.catch(() => {})
+    return next
+  }
+
+  /**
    * 持久化账号列表（同时更新进程内权威副本）。
    *
    * **必须连同黑名单一起写回**：两种后端都是整体写入，
@@ -146,11 +203,7 @@ export class AccountPool {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，账号变更未落盘')
       return
     }
-    await this.store.save({
-      accounts,
-      disabledModels: this.modelCache,
-      ...this.lockFields(),
-    })
+    await this.queueStoreSave()
   }
 
   /**
@@ -221,6 +274,100 @@ export class AccountPool {
   }
 
   /**
+   * 批量**打开**一批模型（Jet Hub 模型列表里**按分组**的「本组全开」）。
+   *
+   * ## 与 {@link clearDisabledModels} 的区别是**范围**（勿混）
+   *
+   * 后者清空该 provider 的**全部**键，并刻意顺带清掉「已下线模型」的历史死键；
+   * 本方法**只删传入的 id**。分组开关必须用本方法 —— 用「清空」会把用户特意
+   * 关着的其它组一起打开（那正是分组开关要避免的事）。
+   *
+   * ⚠️ **无实际变更不落盘**：传进来的 id 若本来就不在黑名单里（例如该组已经
+   * 全开），删不掉任何键，此时不该产生一次文档重写与目录广播 ——
+   * 与 {@link setModelsDisabled} 的「空列表不落盘」是同一条精神。
+   */
+  async clearModelsDisabled(provider: string, modelIds: readonly string[]): Promise<void> {
+    if (modelIds.length === 0) return
+    // 同 setModelsDisabled：写路径必须自己保证已载入，否则会拿未载入的空表
+    // 去判「有没有变更」，进而漏掉磁盘上真实存在的关闭项。
+    this.ensureLoaded()
+    const perProvider = this.modelCache[provider]
+    if (perProvider === undefined) return
+    const nextPerProvider = { ...perProvider }
+    let changed = false
+    for (const id of modelIds) {
+      if (nextPerProvider[id] === true) {
+        delete nextPerProvider[id]
+        changed = true
+      }
+    }
+    if (!changed) return
+    const next: ModelDisableMap = { ...this.modelCache }
+    // 与 setModelDisabled 同约定：该 provider 一个关闭项都不剩时删掉整个键，
+    // 配置文件不随开关操作膨胀。
+    if (Object.keys(nextPerProvider).length === 0) delete next[provider]
+    else next[provider] = nextPerProvider
+    await this.writeModels(next)
+  }
+
+  /**
+   * 批量启用/停用某 provider 的**全部**账号（Jet Hub 左侧供应商一键开关）。
+   *
+   * ## 为什么需要批量方法
+   *
+   * 供应商级开关的语义是「关闭该供应商」= 关掉它的全部模型（黑名单）+
+   * 停用它的全部账号。前者复用 {@link setModelsDisabled}，后者没有现成路径 ——
+   * 逐账号调 {@link updateAccount} 会写 N 次完整文档（且每次都可能与其它
+   * provider 的改动互相覆盖），故这里一次落盘。
+   *
+   * ## 与「账号级开关」的区别（勿混）
+   *
+   * 账号级开关（账号卡片上的「停用/启用」）只动**单个**账号，且带
+   * 「是否连带关闭该 provider 模型」的询问（见前端 `toggleAccount`）。
+   * 本方法只动 `enabled`，**不碰模型黑名单**、不做任何询问 ——
+   * 模型那侧由调用方（`provider.setEnabled` 端点）按固定顺序显式处理。
+   *
+   * ## 语义要点
+   *
+   * - **只改本 provider 的账号**：账号存在一个全局数组里（各 provider 混排），
+   *   与 {@link reorderAccounts} 的隔离约定一致，绝不波及其它 provider。
+   * - **幂等且无变更不落盘**：全部已是目标状态时直接返回 0，不产生无意义的
+   *   文档重写（与 {@link setModelsDisabled} 的「空列表不落盘」同精神）。
+   * - ⚠️ **返回「实际变更数」而非「命中数」**：调用方用它给用户提示
+   *   （如「已停用 2 个账号」）。若返回命中数，全部本就停用时也会报「已停用 2 个」，
+   *   用户会以为发生了他没预料到的改动。
+   *
+   * @param provider - provider id（`this.product.id`，不要写死字面量）
+   * @param enabled - 目标状态：true 启用 / false 停用
+   * @returns 实际被改变的账号数
+   */
+  async setAccountsEnabled(provider: string, enabled: boolean): Promise<number> {
+    // ⚠️ 必须先确保已载入：本类只在**读**方法里调 `ensureLoaded()`，若首次访问
+    // 就是写操作，`this.cache` 还是初始空数组 —— 这里虽然会按 provider 过滤后
+    // 才写，但 `writeAccounts` 是**整体替换**，未载入时写回等于把磁盘上其它
+    // provider 的账号全部抹掉（与 setModelsDisabled 的教训同型，后果更严重）。
+    this.ensureLoaded()
+    const accounts = this.cache
+    let changed = 0
+    const next = accounts.map((entry) => {
+      if (entry.provider !== provider) return entry
+      // 只把「显式 boolean」与目标比较：老文档里 enabled 可能缺失，
+      // 缺失语义等同启用（与适配器 `enabled !== false` 的判定保持一致）。
+      const current = entry.enabled !== false
+      if (current === enabled) return entry
+      changed++
+      return { ...entry, enabled }
+    })
+    // 无实际变更不落盘：避免一次「没有任何改动」的开关操作产生文档重写。
+    if (changed === 0) return 0
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 已${enabled ? '启用' : '停用'} ${provider} 的 ${changed} 个账号`,
+    )
+    return changed
+  }
+
+  /**
    * 清空某 provider 的全部关闭项（Jet Hub 模型列表的「打开全部」）。
    *
    * ⚠️ **刻意不看模型目录**：直接删掉该 provider 在黑名单里的**全部**键，
@@ -248,12 +395,9 @@ export class AccountPool {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，模型黑名单变更未落盘')
       return
     }
-    // 与 writeAccounts 对称：整体写入必须携带账号列表，否则会被清空。
-    await this.store.save({
-      accounts: this.cache,
-      disabledModels,
-      ...this.lockFields(),
-    })
+    // 与 writeAccounts 对称：整体写入必须携带账号列表，否则会被清空 ——
+    // 快照由 queueStoreSave 在轮到本次时统一取（三份数据同源）。
+    await this.queueStoreSave()
   }
 
   /**
@@ -321,15 +465,14 @@ export class AccountPool {
       await this.lockStore.save({ ...this.permanentLockCache })
     }
     if (this.store.kind === 'memory') return
-    try {
-      await this.store.save({
-        accounts: this.cache,
-        disabledModels: this.modelCache,
-        ...this.lockFields(),
-      })
-    } catch (error) {
-      this.ctx.logger?.warn?.(`[jet-hub] 锁定镜像字段写入失败（独立文档已保存，不影响本侧选号）: ${String(error)}`)
-    }
+    // 走同一条写队列，避免与账号/黑名单的写乱序覆盖（见 {@link queueStoreSave}）。
+    // ⚠ 这里**必须吞掉**异常（与改造前一致）：镜像写失败只让另一条工作区的面板
+    // 显示旧值，不该让面板上的「锁定」按钮报错 —— 权威文档已经落好了。
+    await this.queueStoreSave().catch(error => {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] 锁定镜像字段写入失败（独立文档已保存，不影响本侧选号）: ${String(error)}`,
+      )
+    })
   }
 
   /** 锁定表的当前快照（备份导出用；权威来自独立文档）。 */
@@ -424,13 +567,17 @@ export class AccountPool {
 
   /** 删除账号（同时清理凭据） */
   async removeAccount(id: string): Promise<void> {
-    const accounts = this.readAccounts()
-    const entry = accounts.find(a => a.id === id)
+    const entry = this.readAccounts().find(a => a.id === id)
     if (!entry) return
     try {
       await this.ctx.credentials.unset(credentialRef(entry.credentialRef))
     } catch { /* 凭据可能已被删除 */ }
-    await this.writeAccounts(accounts.filter(a => a.id !== id))
+    // ⚠ **必须重新读一次**（真实缺陷，审查发现）：`credentials.unset` 会挂起若干
+    // 微任务/IO，期间并发的 `addAccount` 已经把新条目写进 `this.cache` 与磁盘。
+    // 若此时拿 `await` **之前**的快照做 filter 再整体写回，那个新账号会被静默丢失
+    // —— 而 `account.create`（登录成功即 addAccount）与 `account.delete` 天然可并发。
+    // 重新读之后到 `writeAccounts` 之间没有 `await`，因而这一段是原子的。
+    await this.writeAccounts(this.readAccounts().filter(a => a.id !== id))
   }
 
   /**

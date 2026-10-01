@@ -439,7 +439,10 @@ describe('providerInfo / prepareCall / registerMinimaxLlm', () => {
       .rejects.toMatchObject({ code: 'MISSING_CREDENTIAL' })
   })
 
-  it('registerMinimaxLlm 注册配置项与适配器', async () => {
+  it('registerMinimaxLlm 只注册适配器，不声明可配置 provider（设置页不留行）', async () => {
+    // ⚠️ 2026-10-01（用户要求）：账号、模型开关与模型目录都在 Jet Hub 设置页管理，
+    // 声明只会在「设置 → 模型 → 提供商」留下无人使用的行。机制与代价评估见
+    // src/llm-register-compat.ts 模块头。
     const registered: unknown[] = []
     const ctx = {
       llm: {
@@ -457,15 +460,55 @@ describe('providerInfo / prepareCall / registerMinimaxLlm', () => {
       product: MINIMAX,
     })
     expect(adapter).toBeInstanceOf(MinimaxAdapter)
-    expect(registered[0]).toEqual([
-      {
-        provider: 'minimax',
-        displayName: 'MiniMax Code',
-        settingsNs: 'llm-minimax',
-        settingsPath: [],
-      },
-    ])
-    expect(registered[1]).toEqual([['minimax'], adapter])
+    // 唯一一次登记就是 adapter 路由：configurable 目录一次都没碰。
+    expect(registered).toHaveLength(1)
+    expect(registered[0]).toEqual([['minimax'], adapter])
+  })
+})
+
+/**
+ * ⚠ **目录缓存不得被兜底表污染**（全仓同型缺陷，2026-08 起长期存在）。
+ *
+ * 原实现 `this.remoteModels = fallback; return fallback` 把兜底表当成「已加载」
+ * 记下 ⇒ 一次瞬时失败就让它**整个进程生命周期**都只剩兜底模型：用户看不到自己的
+ * 模型，且无从触发重试（`if (this.remoteModels !== undefined) return` 永远短路），
+ * 只能重启 DSH。同批修好的还有 loomy / raccoon / zcode。
+ *
+ * 另见 `tests/unit/remote-catalog-gate.spec.ts`（并发去重 + 失败冷却）。
+ */
+describe('MinimaxAdapter 目录缓存语义（★ 兜底表不进缓存）', () => {
+  function makeEager(fetchRemoteModels: () => Promise<readonly MinimaxModelEntry[]>): MinimaxAdapter {
+    return new MinimaxAdapter({
+      credentialRef: 'MINIMAX_ACCESS_TOKEN' as never,
+      resolveCredential: async () => undefined,
+      refresh: async () => {},
+      fetchRemoteModels,
+      product: MINIMAX,
+    })
+  }
+
+  it('★ 远端抛错时不把兜底表写进 remoteModels', async () => {
+    const adapter = makeEager(async () => { throw new Error('network down') })
+    expect((await adapter.listModels('minimax')).length).toBeGreaterThan(0)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+
+  it('★ 远端返回空目录时不落缓存，且只拉一次（不被每个模型的 resolveModel 放大）', async () => {
+    let calls = 0
+    const adapter = makeEager(async () => { calls += 1; return [] })
+    expect((await adapter.listModels('minimax')).length).toBeGreaterThan(0)
+    expect((await adapter.listModels('minimax')).length).toBeGreaterThan(0)
+    await adapter.resolveModel('minimax', M31!.id)
+    expect(calls).toBe(1)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+
+  it('远端成功时缓存生效（不破坏既有「成功即缓存」约定）', async () => {
+    let calls = 0
+    const adapter = makeEager(async () => { calls += 1; return [M31!] })
+    await adapter.listModels('minimax')
+    await adapter.listModels('minimax')
+    expect(calls).toBe(1)
   })
 })
 

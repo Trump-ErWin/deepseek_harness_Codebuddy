@@ -80,6 +80,28 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
   refreshError?: string
   /** 来源（env/file 等） */
   source?: string
+  /**
+   * 账号名（用户名，如 `mylzscy4`）。
+   *
+   * ## 为什么不在 `ProviderAccountEntry` 上
+   *
+   * 账号池（`jet-hub/state.json`）的条目**不存**这个值 —— 它只在**凭据**里
+   * （`user_info.displayName`）。本字段是 `account.list` 在返回前**现从该账号
+   * 自己的 credential ref 里读出来**的派生值，故属于「状态」而非「存储」。
+   *
+   * 为什么不写回池：凭据可能被用户在别处更新（换账号名）、且池的
+   * `sanitizeAccounts`（`src/jet-hub-store.ts:173-191`）只保留
+   * `id`/`provider`/`credentialRef` 三个字段，写进去也会被丢掉。
+   */
+  accountName?: string
+  /**
+   * 脱敏手机号（`159****0100`）。
+   *
+   * ⚠ 由 17 位 `user_id` 前 11 位**派生**（上游不下发手机号字段），
+   * 取不到合法前缀时**不设该字段** —— 宁可不显示，也不猜。详见
+   * `src/zcode.ts` 的 `phoneFromUserId`。
+   */
+  phone?: string
 }
 
 /** Jet Hub 在 ctx.settings 中的 schema */
@@ -130,6 +152,19 @@ export interface RpcCreateAccountResponse {
    * 行为必须逐字节不变。
    */
   loginMode?: 'url' | 'sms'
+  /**
+   * 本次「添加账号」**没有新建条目**，而是复用了池里已有的账号。
+   *
+   * ## 为什么需要这个字段（用户报障 ⑯）
+   *
+   * 「账号应该读取有效的本地账号凭证，而不是点了添加就多一个」——
+   * 当本机已有可用凭据（官方客户端写的）时，`account.create` 不再新起 OAuth，
+   * 而是复用/修复已有条目。此时 `loginUrl` 为**空串**（没有可打开的页面）。
+   *
+   * ⚠ 前端**必须**先看这个字段再判空：只看 `loginUrl` 为空会把它当成
+   * 「后端没返回登录地址」而报错，把一次成功操作显示成失败。
+   */
+  reused?: boolean
 }
 
 export interface RpcPollLoginRequest {
@@ -397,6 +432,124 @@ export interface RpcCreditsBalancesResponse {
 
 /**
  * ========================================
+ * Cline 订阅额度与请求记录
+ * ========================================
+ *
+ * 与 `credits.balances`（余额）**语义不同，两个端点不能互相替代**：
+ *
+ * | | 余额 | 订阅额度 | 请求记录 |
+ * |---|---|---|---|
+ * | 回答的问题 | 还剩多少钱 | 各时间窗用掉百分之几 | 每一笔请求花了多少 |
+ * | 端点 | `/users/{id}/balance` | `/users/me/plan/usage-limits` | `/users/{id}/usages` |
+ *
+ * 参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分
+ * （见 `src/cline-quota.ts` 的模块头注释）。
+ */
+
+/** RPC: 查询某 provider 的**订阅额度窗口**（当前只有 Cline 支持）。 */
+export interface RpcClineQuotaRequest {
+  provider: string
+}
+
+/**
+ * 单个账号的订阅额度读数。
+ *
+ * ⚠️ **`ok:false` 与「窗口为 0 个」是两件不同的事**：前者是查询失败
+ * （凭据失效、网关报错），后者是「账号确实没有任何额度窗口」。
+ * 面板对两者的文案必须不同 —— 把失败显示成「无额度」会让用户
+ * 以为额度没了（与本仓库「查不到不显示成 0」的一贯约定同源）。
+ */
+export interface RpcClineQuotaAccount {
+  accountId: string
+  nickname: string
+  ok: boolean
+  /** 窗口按网关原序透传（网关新增窗口类型时无需改插件）。 */
+  windows: Array<{ type: string; percentUsed: number; resetsAt: string }>
+  error?: string
+}
+
+/** RPC: 订阅额度响应。 */
+export interface RpcClineQuotaResponse {
+  accounts: RpcClineQuotaAccount[]
+}
+
+/**
+ * RPC: 查询**请求记录**（本插件自己发出的推理请求流水，按时间倒序）。
+ *
+ * ⚠️ **不是**网关的 `/users/{id}/usages`（那是该账号在官方所有渠道的
+ * 消费账单：没有延迟/首块时间，表格字段也对不齐参考实现）。见
+ * `src/cline-request-log.ts`。
+ *
+ * `accountId` 必传：面板用**同一个**翻页索引同时切「额度窗口」与
+ * 「请求记录」，两个区域必须看同一个账号。
+ */
+export interface RpcClineRequestLogRequest {
+  provider: string
+  accountId: string
+  /** 最多返回多少条（省略用上限）。 */
+  limit?: number
+}
+
+/** 请求记录的一行。 */
+export interface RpcClineRequestLogRow {
+  /** 请求**发起**时刻（毫秒时间戳）。 */
+  ts: number
+  /** 模型 id（wire 上的 `model`）。 */
+  model: string
+  /**
+   * 真正服务这笔请求的**上游渠道**（网关下发的路由元数据，如 `alibaba`）。
+   *
+   * ⚠️ 与「模型命名空间」（`cline-pass` / `cline-free`）**不是一回事**：
+   * 后者是订阅通道，甚至可能是厂商名（`deepseek/…`）。网关本次没报路由时
+   * 这里回落到命名空间 —— 取值顺序见 `src/cline-routing.ts` 与 RPC 侧注释。
+   */
+  upstream: string
+  /**
+   * 是否收到过 usage 帧。
+   *
+   * ⚠️ 与「token 为 0」不是一回事：网关没发 usage 时（abort / 上游提前断开）
+   * 必须显示 `—`，给 0 会被读成「瞬间完成、没花 token」（参考实现同约定）。
+   */
+  usageReported: boolean
+  /** 输入 token（未命中缓存的部分）。 */
+  inputTokens: number
+  /** 输出 token。 */
+  outputTokens: number
+  /** 缓存命中的输入 token（表格的 ⚡ 那一项；缺失时省略）。 */
+  cacheReadTokens?: number
+  /** 思考 token（表格的 🧠 那一项；缺失时省略）。 */
+  reasoningTokens?: number
+  /**
+   * 本次请求的**推理强度**（DSH 注入的 `options.reasoningEffort`）。
+   *
+   * ⚠️ 空串 = 本次没指定，展示层据此**整行不渲染**（参考实现同约定）；
+   * 不要改成 `'auto'` —— 那会被读成「确实选了自动这一档」。
+   */
+  effort: string
+  /** 首个内容块耗时（毫秒）—— 解释「为什么等了这么久才出字」。 */
+  ttftMs: number
+  /**
+   * 首个**正文**块耗时（毫秒；0 = 本次没有任何正文/工具调用块）。
+   *
+   * ⚠️ 「输出速率」必须让分子分母落在**正文阶段**：分子 =
+   * `outputTokens − reasoningTokens`（思考 token 计入 `completion_tokens`，
+   * 且产生于 `ttftMs` 之前），分母 = `totalMs − ttfcMs`。缺这个字段，
+   * 速率会把思考 token 除进正文窗口 → 虚高到物理不可能的值（用户报障）。
+   */
+  ttfcMs: number
+  /** 全程耗时（毫秒）。 */
+  totalMs: number
+  /** 失败原因；成功行省略。 */
+  error?: string
+}
+
+/** RPC: 请求记录响应（最新在前）。 */
+export interface RpcClineRequestLogResponse {
+  rows: RpcClineRequestLogRow[]
+}
+
+/**
+ * ========================================
  * 短信验证码登录（仅 Loomy）
  * ========================================
  *
@@ -505,6 +658,14 @@ export interface RpcModelListEntry {
   name: string
   /** true = 已关闭（不出现在对话框的模型选择里）。 */
   disabled: boolean
+  /**
+   * 是否为**免费额度模型**（适配器按远端 `free` 集合判定的权威标记）。
+   *
+   * ⚠️ **缺失 = 该适配器没报**（不是「确认收费」）：Jet Hub 的模型列表按
+   * 「计费/来源」分组时，缺失项**保守归入「按量计费」**，但字段本身保持
+   * 「未知」语义 —— 不编造 `false`（与全仓「未知不编造」的约定一致）。
+   */
+  isFree?: boolean
 }
 
 /** RPC: 列出某 provider 的模型响应 */
@@ -545,6 +706,94 @@ export interface RpcModelSetAllDisabledRequest {
 
 /** RPC: 批量打开/关闭响应（回传写入后的完整黑名单，与单条端点同结构） */
 export type RpcModelSetAllDisabledResponse = RpcModelSetDisabledResponse
+
+/**
+ * RPC: 批量打开/关闭**指定的一批**模型（Jet Hub 模型列表里「按分组」的
+ * 本组全开 / 本组全关）。
+ *
+ * 与 {@link RpcModelSetAllDisabledRequest} 的区别是**范围**：那个是「该 provider
+ * 的全部模型」（且打开方向刻意顺带清掉已下线模型的历史死键），本端点只动传进来
+ * 的 id —— **分组开关必须用本端点**，否则一次「本组全开」会把用户特意关着的
+ * 其它组一起打开。
+ *
+ * ⚠️ `modelIds` **不接受空数组**：空组不该出现在界面上（前端按钮也按
+ * `bulkButtonState` 禁用），服务端再拒一次，避免一次无意义的写入与广播。
+ * ⚠️ `disabled` 同样**没有默认值**（与单条/全量端点同约定）。
+ */
+export interface RpcModelSetDisabledManyRequest {
+  provider: string
+  modelIds: string[]
+  disabled: boolean
+}
+
+/** RPC: 分组批量开关响应（回传写入后的完整黑名单，与其它两个开关端点同结构） */
+export type RpcModelSetDisabledManyResponse = RpcModelSetDisabledResponse
+
+/**
+ * 单个供应商的汇总状态（Jet Hub 左侧导航的分组与一键开关据此渲染）。
+ *
+ * 存在的意义：左侧要一次拿到**全部**供应商的状态才能分组，若逐个供应商调
+ * `account.list` + `model.list`，8 个供应商就是 16 次往返，且每次都要走
+ * 异步的凭据解析。这里一次返回，且服务端全程只用**同步的内存副本**。
+ */
+export interface ProviderStatus {
+  /** 模型计数：total 为**不套黑名单**的全量目录条数，disabled 为其中已关闭的条数。 */
+  models: { total: number; disabled: number }
+  /** 账号计数：enabled 为其中处于启用状态的条数。 */
+  accounts: { total: number; enabled: number }
+  /**
+   * 该供应商是否**已关闭**。
+   *
+   * 判据：`models.total > 0 && models.disabled === models.total` ——
+   * **全部模型都已关闭**才算关闭。两条边界都不能省：
+   * - `total > 0`：没有任何可用模型时**不算**「已关闭」（没有模型可关，
+   *   就不该说它被关闭了），此时前端把开关置为不可用；
+   * - `disabled === total`：只要还剩一个打开的模型，该供应商就仍是「已打开」。
+   *
+   * ⚠️ 与前端 `allModelsDisabled(models)`（`plugin-src/client/account-model-link.js`）
+   * 的判据**语义同源、形态不同**：那个函数看的是模型**条目数组**，这里看的是计数。
+   * 两者必须同步修改，否则「左侧说已关闭、账号联动说没全关」会自相矛盾。
+   */
+  closed: boolean
+}
+
+/** RPC: 读取多个供应商的汇总状态请求 */
+export interface RpcProviderStatusRequest {
+  /** 要查询的 provider id 列表（Jet Hub 一次性传全部 8 个）。 */
+  providers: string[]
+}
+
+/** RPC: 读取多个供应商的汇总状态响应 */
+export interface RpcProviderStatusResponse {
+  /** provider id → 状态。请求里未识别的 id 不出现在结果中。 */
+  statuses: Record<string, ProviderStatus>
+}
+
+/**
+ * RPC: 供应商级一键开关请求。
+ *
+ * 语义（用户已确认）：
+ * - `enabled: false`（关闭）= **先关掉它的全部模型，再停用它的全部账号**；
+ * - `enabled: true`（打开）= 清空它的模型黑名单，并启用它的全部账号。
+ *
+ * `enabled` **没有默认值**：缺失或非布尔一律拒绝。与
+ * {@link RpcModelSetAllDisabledRequest} 同理 —— 默认成 `true` 会静默打开
+ * 用户特意关闭的供应商，默认成 `false` 则反向静默关闭，两个方向都难察觉。
+ */
+export interface RpcProviderSetEnabledRequest {
+  provider: string
+  enabled: boolean
+}
+
+/** RPC: 供应商级一键开关响应（回传实际变更数，供前端给出准确提示）。 */
+export interface RpcProviderSetEnabledResponse {
+  provider: string
+  enabled: boolean
+  /** 实际被写入黑名单的模型数（关闭方向）或清空的条目数（打开方向）。 */
+  models: number
+  /** 实际被改变的账号数（已是目标状态的账号不计入）。 */
+  accounts: number
+}
 
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
@@ -697,4 +946,65 @@ export interface RpcBackupStatusResponse {
   accounts: number
   /** 缺 `expiresAt` 的账号条目数（疑似自动恢复产物）。 */
   withoutExpiry: number
+}
+
+/**
+ * RPC: 内部载体问「现在要不要产 param」。
+ *
+ * 需求位为 `false` 时 client **一次都不产**（零配额消耗）——阿里云按同设备
+ * 每小时 150 次限流，白产比不产更贵（判据见 `src/captcha-supply.ts` 文件头
+ * 「与预取池的区别」）。
+ */
+export interface RpcCaptchaDemandResponse {
+  active: boolean
+}
+
+/**
+ * RPC: 内部载体问「载体页在哪个地址」（评审 C1/C2）。
+ *
+ * ⚠ 为什么 client 不能自己拼：载体页必须待在**一个与 Host 端口不同**的回环端口上
+ *   ——桌面版主进程的 `allowedNavigation()` / `onBeforeRequest` 都以
+ *   `isApplicationHost(url)` 拒绝「端口相同 + 主机相同/回环」的地址
+ *   （DSH Desktop 0.2.0-rc.2，`app.asar/lib/main.js`）。
+ *   端口由 server 运行时挑（`src/captcha-carrier-server.ts`）⇒ 只能问。
+ *
+ * ⚠ `null` = **现在没有可用地址**（env 关掉 / 候选端口全被占）。client 拿到它就
+ *   安静退出（本轮不建 guest、不导航）；这不是错误，别当异常报。
+ */
+export interface RpcCaptchaCarrierUrlResponse {
+  url: string | null
+}
+
+/**
+ * RPC: 内部载体回传一个 param。
+ *
+ * ⚠ **故意没有** `atMs` / 任何绝对时间戳字段：产出时刻由 server 用
+ * 「自己的到达时刻 − `elapsedMs`」推算（见 `jet-hub-rpc.ts` 的该 case 注释）。
+ * client 传绝对时间戳会把跨端时钟漂移引进时效闸 —— 快了永不判过期、
+ * 慢了一投放就过期，两种都表现为**内部载体静默不可用**。
+ */
+export interface RpcCaptchaContributeRequest {
+  /** guest 里 SDK 产出的 param。空串/全空白一律不收。 */
+  param: string
+  /**
+   * client 侧「开始产 → 发这条 RPC」的**相对耗时**（毫秒）。
+   *
+   * 相对耗时是同机单向差值，比绝对时钟可靠；非法值（负数、非整数、
+   * ≥ 5 分钟）一律退回 0，即按到达时刻记账。
+   */
+  elapsedMs?: number
+  /**
+   * 这一发是不是被降级成了**交互式验证**（评审 I2）。
+   *
+   * ⚠ 这是内部载体**唯一**的设备信誉预警：chromium 那条腿在
+   *   `ZcodeAuth.captchaPoolInstance()` 里已经会 `warn`，而内部载体这段此前
+   *   只打进 client 控制台 —— host 侧看不到，等于没有预警。
+   * 缺省 / 非 `true` 一律当「无感通过」（不要把缺字段说成有）。
+   */
+  interactive?: boolean
+}
+
+/** RPC: 内部载体回传 param 的结果（`false` = 没进槽，client 可决定要不要重试）。 */
+export interface RpcCaptchaContributeResponse {
+  accepted: boolean
 }
