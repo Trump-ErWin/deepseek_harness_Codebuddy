@@ -44,11 +44,27 @@ const SRC = readFileSync(
   'utf8',
 )
 
-/** 截取某个函数的源码（从 `function NAME` 到下一个顶层 `}` 之后）。 */
+/** 截取某个函数的源码（从 `function NAME` 到**大括号配平**的闭合 `}`）。
+ *
+ * ⚠ 不能用 `indexOf('\n}\n')` 找结尾（2026-10-02 实测）：上游 19226ca 重做后，
+ * `hideWindowWindows` 内部嵌了**内层 function/回调**（EnumWindows 回调等），
+ * 它们自己的闭合 `\n}\n` 被误当函数结尾 ⇒ 截断片段不含 `-File`/`ascii`/
+ * `powershell.exe` ⇒ 三条断言假失败。改为**大括号计数配平**：从函数体 `{` 起
+ * 数配对，归零即真结尾。 */
 function fnSource(name: string): string {
   const start = SRC.indexOf(`function ${name}`)
   expect(start, `找不到 function ${name}`).toBeGreaterThan(0)
-  return SRC.slice(start, SRC.indexOf('\n}\n', start))
+  const bodyStart = SRC.indexOf('{', start)
+  let depth = 0
+  for (let i = bodyStart; i < SRC.length; i++) {
+    const ch = SRC[i]
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) return SRC.slice(start, i + 1)
+    }
+  }
+  return SRC.slice(start)
 }
 
 describe('Linux：parseWmctrlList 解析 wmctrl -lp', () => {
