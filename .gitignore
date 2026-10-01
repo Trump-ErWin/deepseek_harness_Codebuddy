@@ -97,3 +97,7 @@ docs/minimax-protocol-notes.md
 # 探针在缺该文件时整体跳过（见 tests/e2e/image-probe-shared.ts 的 hasFixture），
 # 要跑图片压力探测请自备一张 ≥2000×1200 且不含个人信息的截图放到这个路径。
 tests/fixtures/test.png
+
+# ����������npm/pnpm pack ���ɵ� tarball ����⣨2026-10-01��
+*.tgz
+
