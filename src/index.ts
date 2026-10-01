@@ -27,6 +27,9 @@ import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
 import type { ZcodeCredential } from './zcode.js'
 import { AccountPool } from './account-pool.js'
+import { ModelGate } from './model-gate.js'
+import { startZcodeBridge, type ZcodeBridgeHandle } from './zcode-bridge.js'
+import { MIRROR_ROUTE, syncPiAiMirror } from './pi-ai-mirror.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
@@ -1123,6 +1126,17 @@ const resolveZcodeCaptchaConfig = async (): Promise<{ region: string; prefix: st
  * ⇒ 在 `resolveCredential` 里记录**实际返回的那个账号**，供适配器查询。
  */
 const activeZcodeAccountId = new Map<string, string | undefined>()
+/**
+ * 上游发车闸门：**直连适配器与本地桥共用同一个实例**。
+ *
+ * ⚠ 不能各建一个 —— `ModelGate` 的语义是「距上次**发车**至少间隔 gapMs」
+ * 且 zcode 是 `serialize: true`（串行），两个实例等于两套互不知情的串行队列，
+ * 同时用两条 route 时会并发打到上游（`3009` 并发限流）。
+ */
+const zcodeGate = new ModelGate({
+  serialize: ZCODE.serializeUpstream,
+  gaps: ZCODE.modelGapMs,
+})
 const zcodeAdapter = registerZcodeLlm(ctx, {
   credentialRef: credentialRef(ZCODE.defaultCredentialRef),
   resolveCredential: async (modelId?: string) => {
@@ -1253,7 +1267,84 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
    * 不要改成 `pool.getAvailableAccount(...)` 之类「再问一次池」的实现。
    */
   currentAccountId: () => activeZcodeAccountId.get(ZCODE.id),
+  // 与本地桥共用同一个闸门实例（理由见 `zcodeGate` 的注释）。
+  gate: zcodeGate,
 })
+
+/**
+ * ===== 本地 Anthropic 透明桥（官方 `llm-pi-ai` 声明式 provider 的后端）=====
+ *
+ * ## 目的（用户 2026-10-01 定案）
+ *
+ * 让 ZCode 通道走**官方模板**：模型卡片由 `dsh-client-ui-settings-models`
+ * 用 pi-ai 的 `ModelListEditor` 原生渲染（`contextWindow` / `maxTokens`
+ * 可在设置里改），三档思考强度经 `reasoningEfforts` 进 composer 的模型选择器。
+ * 桥只做「协议转写 + 身份块注入 + 一次性 captcha」，业务逻辑全部复用
+ * `zcode-adapter.ts` 里已经实测过的那些判据。
+ *
+ * ## 与直连 route（`zcode`）的关系
+ *
+ * 两条 route **并存、互不干扰**：
+ *   - `zcode`：本插件 `registerAdapter` 的原生适配器，Jet Hub 面板与
+ *     `agent-default-model` 仍可用，功能最全（图片、按模型限流标记）；
+ *   - `zcode-free`：`llm-pi-ai` 声明、走这座桥，卡片/编辑器/档位全官方原生。
+ * 两者共用同一个 `zcodeGate` 与同一个账号池，所以不会并发超限。
+ *
+ * ## ⚠ 绝不在这里 `registerConfigurableProviders` 声明 `zcode-free`
+ *
+ * `llm-pi-ai` 已经把 `providers.<route>` 登记进 directory，
+ * 再声明一次会抛 `DUPLICATE_DIRECTORY` 并打断整个 profile 加载
+ * （详见 `pi-ai-mirror.ts` 的文件头注释）。
+ */
+let zcodeBridge: ZcodeBridgeHandle | undefined
+/** 桥的启动是异步的，而 `apply` 是同步函数 —— 故用 IIFE 顶住，失败只降级。 */
+void (async (): Promise<void> => {
+  try {
+    zcodeBridge = await startZcodeBridge({
+      product: ZCODE,
+      // 与适配器**同一条**凭据解析链：账号池优先、`ZcodeAuth.current()` 兜底
+      //（后者已实现「插件自存优先 → 官方客户端凭据回退」）。
+      resolveCredential: async (modelId?: string) => {
+        const available = await pool.getAvailableAccount(ZCODE.id, modelId ?? '')
+        if (available) {
+          activeZcodeAccountId.set(ZCODE.id, available.entry.id)
+          return available.credential as unknown as ZcodeCredential
+        }
+        activeZcodeAccountId.set(ZCODE.id, undefined)
+        return await zcode.current()
+      },
+      mintCaptcha: async (options?: { signal?: AbortSignal }) => {
+        const config = await resolveZcodeCaptchaConfig()
+        return await zcode.mintCaptcha(config, options)
+      },
+      captchaRegion: ZCODE_CAPTCHA_FALLBACK.region,
+      fetchRemoteModels: () => zcode.fetchModels(),
+      accountPool: pool,
+      currentAccountId: () => activeZcodeAccountId.get(ZCODE.id),
+      gate: zcodeGate,
+      logger: {
+        info: (message: string) => ctx.logger.info(message),
+        warn: (message: string) => ctx.logger.warn(message),
+      },
+    })
+    const mirror = await syncPiAiMirror(ctx, zcodeBridge, {
+      logger: {
+        info: (message: string) => ctx.logger.info(message),
+        warn: (message: string) => ctx.logger.warn(message),
+      },
+    })
+    if (!mirror.written) {
+      // ⚠ 只 warn：镜像不可用绝不该影响 `zcode` 直连通道（那条是主体）。
+      ctx.logger.warn(`[zcode-bridge] 声明式镜像 provider 未写入：${mirror.reason ?? '未知原因'}`)
+    }
+  } catch (error) {
+    // 桥起不来（端口耗尽等）同样只降级 —— 直连 route 不受影响。
+    ctx.logger.warn(
+      `[zcode-bridge] 本地桥启动失败，官方模板镜像「${MIRROR_ROUTE}」不可用`
+      + `（直连 zcode 通道不受影响）：${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+})()
 
 
   // 一次性修复**老 TRAE 账号**的展示名（与上面 Raccoon 同类，同因）：
@@ -1378,6 +1469,9 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
       // ⚠ 必须 dispose captcha 浏览器 —— 否则会留下孤儿 chromium
       //（约 200-400MB，且用户没有界面能关掉它）。
       zcodeAdapter.stop()
+      // ⚠ 同理必须关掉本地桥的 HTTP 服务：`zcodeAdapter.stop()` 管不到它，
+      // 漏掉就会留一个占着端口的监听（插件热重载后会累积）。
+      void zcodeBridge?.close()
     }, 'jet-hub: multi-account refresh scheduler')
   }).catch((error: unknown) => {
     // ⚠️ 原来这个 `.then()` **没有** `.catch()`：`listAllAccounts()` 一旦 reject
@@ -1403,6 +1497,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     zcode.stop()
     // 同上：captcha 浏览器必须随插件一起回收。
     zcodeAdapter.stop()
+    // 同上：本地桥的监听也必须一起回收。
+    void zcodeBridge?.close()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Jet Hub RPC 注册 =====
@@ -1429,3 +1525,32 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters)
   ctx.provide('accountPool', pool)
 }
+
+/**
+ * ⚠ **必须**把 Config 挂成 `apply` 的静态属性（2026-10-01 补，实测缺陷）。
+ *
+ * cordis 建 runtime 时取的是**传入 plugin 对象的** `Config`：
+ *
+ * ```js
+ * const callback = this.resolve(plugin);   // 函数式插件 → 返回函数本身
+ * runtime = { name, callback, fibers: ..., Config: plugin.Config };
+ * ```
+ *
+ * 而 `resolve()`（`RegistryService.resolve`）：
+ *
+ * ```js
+ * if (typeof plugin === "function") return plugin;   // ← 函数式插件走这条
+ * if (isApplicable(plugin)) return plugin.apply;
+ * ```
+ *
+ * 如果 loader 把**裸 `apply` 函数**传进来，那么 `plugin` 就是那个函数 ——
+ * `plugin.Config` 只有在 **`apply.Config` 存在**时才取得到。
+ * 仅靠模块级 `export const Config` 时，`runtime.Config` 会是 undefined，
+ * 于是 settings 的 `schema(entry)` 返回 undefined、`describe()` 跳过这个
+ * entry → **没有 namespace → 模型设置页渲染不出这个 provider**
+ *（`pi-ai-mirror.ts` 写的镜像 route 也就没有归属，扩展槽同样认领不到）。
+ *
+ * 挂成静态属性是两种传法下都成立的写法，故无副作用地消除这个不确定性。
+ * 先例：`free-glm/src/index.ts:1428`。
+ */
+apply.Config = Config
