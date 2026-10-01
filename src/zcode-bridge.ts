@@ -272,17 +272,28 @@ export async function startZcodeBridge(options: ZcodeBridgeOptions): Promise<Zco
 
   let remoteModels: readonly ZcodeRemoteModelLike[] | undefined
 
-  /** 模型目录：远端优先，失败/为空回退兜底表。 */
+  /**
+   * 模型目录：远端优先，失败/为空回退兜底表。
+   *
+   * ⚠ **只有真远端结果才进 `remoteModels`**（B4，审查发现）。原实现是
+   * `remoteModels = fetched.length > 0 ? fetched : product.fallbackModels`
+   * —— 兜底表一旦被写进缓存，`/health`、`/v1/models`、以及启动期
+   * `syncPiAiMirror` 的 `bridge.models()` 就**永久**停在兜底表上：用户登录
+   * 后镜像 route 的模型列表也不会更新，只能重启 DSH。
+   *
+   * 兜底表是**纯本地、零成本**的，每次现算即可，没有任何理由缓存它。
+   * 与 9 个适配器侧 `RemoteCatalogGate` 的语义保持一致。
+   */
   const loadModels = async (): Promise<readonly ZcodeRemoteModelLike[]> => {
     if (remoteModels !== undefined) return remoteModels
     let fetched: readonly ZcodeRemoteModelLike[] = []
     try {
       fetched = (await options.fetchRemoteModels?.()) ?? []
     } catch (error) {
-      logger?.warn?.(`[zcode-bridge] 远端模型目录拉取失败，回退兜底表：${String(error)}`)
+      logger?.warn?.(`[zcode-bridge] 远端模型目录拉取失败，本次用兜底表：${String(error)}`)
     }
-    remoteModels = fetched.length > 0 ? fetched : product.fallbackModels
-    return remoteModels
+    if (fetched.length > 0) remoteModels = fetched
+    return fetched.length > 0 ? fetched : product.fallbackModels
   }
 
   /** 额度用尽时换账号（与 `zcode-adapter.ts` 的 `switchAccountOnQuota` 同语义）。 */
