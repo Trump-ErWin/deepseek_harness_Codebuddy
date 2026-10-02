@@ -165,6 +165,29 @@ export const CREDITS_CAPABILITIES = Object.freeze({
    * `src/zcode-auth.ts` 的 `claimDaily`）。
    */
   zcode: Object.freeze({ balance: true, dailyCheckin: true }),
+  /**
+   * OpenCode：**显示**额度行，但语义不是「余额」而是「**通道可用性**」。
+   *
+   * ## 为什么不是 `balance: false`（2026-10-02 改，用户报障「只有 opencode 没有显示」）
+   *
+   * 我曾登记 `balance: false`，理由是「Zen 是按量计费的网关，没有可查询的
+   * 余额数字」。但那个登记**把整个徽标挡死了** —— 组件第一件事就是
+   * `supportsCreditBalance(provider)`，为 false 直接 `return null`，
+   * 用户看到的就是「opencode 没有用量」，而 Zen 明明有额度（余额耗尽会回
+   * `402 Insufficient account funds`）。
+   *
+   * ## 改后的口径
+   *
+   * Zen **没有公开的余额 API**（实测 15 个候选路径全 404，见
+   * `docs/superpowers/specs/2026-10-02-opencode-zen-endpoint-matrix.md`），
+   * 所以徽标展示**我们真正测得到的东西**：每个通道（账号槽 / 匿名通道）
+   * 当前是否可用、是否处于限额冷却。数据来自本地 `modelRateLimits`，
+   * **零网络请求**。宿主侧见 `jet-hub-rpc.ts` 的 `OPENCODE.id` 分支。
+   *
+   * ⚠️ 徽标会显示「N 通道」而非「N 积分」——这是**如实**的，不要改成
+   * 假装有余额数字（那会在用户充值后显示错误的数字）。
+   */
+  opencode: Object.freeze({ balance: true, dailyCheckin: false }),
 });
 
 /**

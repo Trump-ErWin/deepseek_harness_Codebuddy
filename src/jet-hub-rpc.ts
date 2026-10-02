@@ -19,6 +19,15 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from './account-pool.js'
+import { isGatewayEnabled } from './openai-gateway/config.js'
+import { collectGatewayModelIds } from './openai-gateway/models.js'
+import {
+  applyGatewayDesiredState,
+  gatewayAddress,
+  gatewayApiKey,
+  isGatewayRunning,
+  setGatewayDesiredEnabled,
+} from './openai-gateway/runtime.js'
 import type { CodeArtsAuth } from './service.js'
 import type { CodeArtsCredential } from './types.js'
 import type { BuddyAuth } from './buddy-auth.js'
@@ -115,6 +124,8 @@ import {
   retestAllAccounts,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
+import { handleOpencodeRpc } from './opencode-rpc.js'
+import { OPENCODE } from './opencode-product.js'
 import type {
   ProviderAccountEntry,
   RpcBackupExportResponse,
@@ -171,14 +182,29 @@ import type {
   RpcProviderStatusResponse,
   RpcProviderSetEnabledRequest,
   RpcProviderSetEnabledResponse,
+  RpcGatewayStatusResponse,
+  RpcGatewaySetEnabledRequest,
+  RpcGatewayModel,
   RpcCaptchaDemandResponse,
   RpcCaptchaCarrierUrlResponse,
   RpcCaptchaContributeRequest,
   RpcCaptchaContributeResponse,
+  RpcUsageBadgeRequest,
+  RpcUsageBadgeResponse,
+  RpcUsageBadgePreferenceRequest,
+  RpcUsageBadgePreferenceResponse,
+  RpcUsageAutoCheckinRequest,
+  RpcUsageAutoCheckinResponse,
   ProviderStatus,
 
   ProviderAccountStatus,
 } from './types.js'
+import {
+  BADGE_PREFERENCES,
+  createBadgePreferenceStore,
+} from './badge-preferences.js'
+import { createUsageBadge, type BadgeRpcResult } from './usage-badge.js'
+import { createAutoCheckin, createAutoCheckinStore } from './auto-checkin.js'
 
 /** Jet Hub RPC API 路径 */
 export const JET_HUB_API_PATH = '/api/jet-hub'
@@ -345,16 +371,20 @@ export const PERMANENT_LOCK_PROVIDERS: ReadonlySet<string> = new Set([
  */
 export function computeClaimSummary(outcomes: readonly ClaimOutcome[]): RpcCreditsClaimSummary {
   const summary: RpcCreditsClaimSummary = {
-    claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
+    claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
   }
   for (const outcome of outcomes) {
     switch (outcome.kind) {
       case 'claimed':
         summary.claimed += 1
         summary.totalCredit += outcome.credit
+        // ⚠️ 只有**覆盖今天**的领取才算「今天已处理」。`coversToday:false` 是
+        // 渠道自己标的（当前是 Qoder 刷新前那一轮），见 `credits.ts` 的字段说明。
+        if (outcome.coversToday !== false) summary.coversToday += 1
         break
       case 'already-claimed':
         summary.alreadyClaimed += 1
+        if (outcome.coversToday !== false) summary.coversToday += 1
         break
       case 'inactive':
         summary.inactive += 1
@@ -646,26 +676,58 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
   return results
 }
 
+/** `ctx.llm` 上本模块实际用到的部分。 */
+type LlmServiceLike = {
+  listProviders?(): readonly { id: string }[]
+  listModels(provider: string): Promise<Array<{ id: string; name: string }>>
+  listAllModels?(provider: string): readonly { id: string; name: string }[]
+}
+
 /**
  * 读取 `ctx.llm` 用于枚举 provider 的模型目录。
  *
- * 用 `ctx.get` 而不是 `inject`：Jet Hub 的账号管理是主要职责，模型开关只是
- * 附加能力；llm 服务缺失时账号面板仍应可用，只是「显示列表」按钮报错。
+ * ## ⚠️ 必须**优先属性访问** `ctx.llm`
+ *
+ * `src/index.ts` 里 `mountOpenAiGateway` 传的是 `ctx.llm`（属性），而本模块
+ * 原先只走 `ctx.get('llm')`。在 connection 上下文里后者可能拿不到
+ * `listProviders` —— 结果是**同一时刻**两个页面给出矛盾答案：
+ * `/v1/models` 正常返回 36 个模型，而设置页的清单恒为 0 个。
+ * 两处服务来源不一致还会让「纠错建议里给的 ID」与「网关实际接受的 ID」可能不同。
+ *
+ * 用 `ctx.get`（而非插件级 `inject`）作回退：Jet Hub 的账号管理是主要职责，
+ * 模型开关只是附加能力；llm 服务完全缺失时账号面板仍应可用。
  *
  * `listAllModels` 是本插件适配器额外提供的**不受用户黑名单影响**的完整目录
- * （见各适配器的同名方法）。DSH 的 `llm` 服务只保证 `listModels`，故这里把它
- * 声明为可选：缺失时退化为「用 listModels 的结果 + 黑名单补回裸 id」。
+ * （见各适配器的同名方法）。DSH 的 `llm` 服务只保证 `listModels`，故它与
+ * `listProviders` 都声明为可选。
  */
-function llmServiceOf(ctx: Context): {
-  listModels(provider: string): Promise<Array<{ id: string; name: string }>>
-  listAllModels?(provider: string): readonly { id: string; name: string }[]
-} | undefined {
-  return ctx.get('llm') as
-    | {
-      listModels(provider: string): Promise<Array<{ id: string; name: string }>>
-      listAllModels?(provider: string): readonly { id: string; name: string }[]
+function llmServiceOf(ctx: Context): LlmServiceLike | undefined {
+  const direct = (ctx as unknown as { llm?: LlmServiceLike }).llm
+  if (direct !== undefined && direct !== null) return direct
+  return ctx.get('llm') as LlmServiceLike | undefined
+}
+
+/**
+ * 列出可用于枚举目录的 provider。
+ *
+ * ⚠️ `listProviders` 取不到时**用已注册适配器的 key 兜底** —— 那些 key 就是本
+ * 插件注册的 provider 全集，比「什么都没有」有用得多。仍取不到才返回
+ * `undefined`（调用方据此给出明确原因，而不是显示一个空清单让用户去猜）。
+ */
+function providerIdsOf(
+  llm: LlmServiceLike | undefined,
+  modelAdapters: Readonly<Record<string, ModelCatalogSource>> | undefined,
+): readonly { id: string }[] | undefined {
+  if (llm?.listProviders !== undefined) {
+    try {
+      const listed = llm.listProviders()
+      if (Array.isArray(listed) && listed.length > 0) return listed
+    } catch {
+      // 落到下面的兜底。
     }
-    | undefined
+  }
+  const keys = Object.keys(modelAdapters ?? {})
+  return keys.length > 0 ? keys.map((id) => ({ id })) : undefined
 }
 
 /**
@@ -848,6 +910,70 @@ function registerJetHubEndpoints(
    * 且它不含任何秘密（不能用于认证）。
    */
   const pendingSmsMsgid = new Map<string, { phone: string; msgid: string }>()
+
+  /**
+   * 用量徽标的显示偏好（`$DSH_HOME/jet-hub/ui-preferences.json`）。
+   *
+   * ⚠️ 与账号池**分开**的独立文档：`state.json` 是整体替换语义，同机另一条工作区
+   * 里的旧版本代码整体重写它时不会带上不认识的键 —— 理由与后果见
+   * `badge-preferences.ts` 的文件头。
+   */
+  const badgePreferences = createBadgePreferenceStore(ctx)
+
+  /**
+   * 「每日首次启动自动签到」（独立文档 `auto-checkin.json`）。
+   *
+   * ⚠️ **不维护第二份「哪些渠道能签到」的名单**：判据交给下面的 `claim` ——
+   * `credits.claimAll` 对不支持的渠道会**不发上游请求**就返回明确错误，本执行体
+   * 把它计为「跳过」。客户端的能力表（`credits-capabilities.js`）仍是唯一权威。
+   *
+   * ⚠️ 「有账号的渠道」由账号池派生（`pool.listAllAccounts()` 只是同步内存副本
+   * 的异步外壳），不遍历 12 个渠道里没账号的那些 —— 那些调下去只会拿到空结果。
+   */
+  const autoCheckin = createAutoCheckin({
+    store: createAutoCheckinStore(ctx),
+    listProviderIds: async () => {
+      const accounts = await pool.listAllAccounts()
+      return [...new Set(accounts.map((entry) => entry.provider))].sort()
+    },
+    claim: (provider) =>
+      handleMethod('credits.claimAll', { provider }) as Promise<BadgeRpcResult<RpcCreditsClaimAllResponse>>,
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // 启动时排定一轮（延迟 30s；内部自己判开关与「今天是否已跑」）。
+  autoCheckin.start()
+  /**
+   * ⚠️ `ctx.effect` 必须**可选调用**：本文件此前没用过它，而大量单测的 ctx 桩是
+   * 最小化的（没有 `effect`）—— 直接调用会让 138 条无关用例报
+   * `ctx.effect is not a function`（2026-10-02 实测到）。真实宿主里它一定存在，
+   * 故这里的降级只影响桩环境，不影响生产环境的清理语义。
+   */
+  ctx.effect?.(() => () => autoCheckin.stop(), 'jet-hub: auto checkin')
+
+  /**
+   * 用量徽标读数服务（宿主侧 TTL 缓存 + 只保留启用账号 + 附加订阅读数）。
+   *
+   * ⚠️ **取数直接复用内部 `handleMethod`**，不另写 provider 分派：
+   * `credits.balances` 的 12 条分支（含 codearts 的「Token 计费账户」文案、
+   * zcode 的逐桶折算等）是唯一口径，复制一份必然漂移。
+   * 第三个参数是 `AbortSignal` 且在当前实现里未被使用，故这里传 `undefined`
+   *（该形参是下划线命名 = 有意未用）。
+   *
+   * ⚠️ 订阅窗口**只对 Cline** 存在（能力矩阵里的 `subscriptionQuota`）—— 这个
+   * 「哪个渠道有窗口」的判断留在装配层，`usage-badge.ts` 因此不认识任何具体渠道。
+   */
+  const usageBadge = createUsageBadge({
+    collectBalances: (provider) =>
+      handleMethod('credits.balances', { provider }) as Promise<BadgeRpcResult<RpcCreditsBalancesResponse>>,
+    collectQuota: (provider) =>
+      provider === CLINE.id
+        ? handleMethod('cline.quota', { provider }) as Promise<BadgeRpcResult<RpcClineQuotaResponse>>
+        : undefined,
+    listAccounts: (provider) => pool.listAccountsByProvider(provider),
+    readPreference: () => badgePreferences.load(),
+    readAutoCheckin: () => autoCheckin.state(),
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
 
   connection.fetch.register({
     path: JET_HUB_API_PATH,
@@ -1096,8 +1222,26 @@ function registerJetHubEndpoints(
     }
   }
 
-  /** 分发端点方法到对应的处理器 */
-  async function handleMethod(method: string, payload: unknown, _signal: AbortSignal): Promise<unknown> {
+  /**
+   * 分发端点方法到对应的处理器。
+   *
+   * ⚠️ **opencode 的方法在此之前先试一次**（2026-10-02 修）。
+   *
+   * 背景：`opencode-rpc.ts` 曾自己调 `rpc.register('jet-hub', …)`，以为能与
+   * 本文件的 handler 并存。真机报障「添加失败：unknown method:
+   * opencode.addAnonymous」—— Jet Hub **只有这一条通道**（本函数的
+   * `connection.fetch.register`），它的 `switch` 穷举所有方法，
+   * `default` 直接回 `unknown method` 且不让路。
+   *
+   * ⚠️ 顺序很重要：必须放在 `switch` **之前**、且 `handleOpencodeRpc` 对不认识
+   * 的方法返回 `undefined` —— 否则 opencode 的方法名永远落不到这里，
+   * 反过来（switch 先匹配）又会被别的 provider 的 case 误吞。
+   */
+  async function handleMethod(method: string, payload: unknown, _signal?: AbortSignal): Promise<unknown> {
+    if (method.startsWith('opencode.')) {
+      const handled = await handleOpencodeRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
     switch (method) {
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
@@ -2336,6 +2480,26 @@ function registerJetHubEndpoints(
             },
           }
         }
+        if (req.provider === 'workbuddy') {
+          // WorkBuddy **国际版没有签到接口**：客户端能力矩阵登记为
+          // `workbuddy: { balance: true, dailyCheckin: false }`，故它从不渲染
+          // 「一键领取积分」按钮、也从不调用本方法 —— 也就是说这条守卫此前
+          // **缺失但没被触发**（真实缺陷，2026-10-02 补）。
+          //
+          // ⚠️ 为什么必须补：没有它时 `workbuddy` 会落到下面 `productById` 拿到的
+          // buddy 产品上，用**国际版**凭据去发国内版的签到请求 —— 必然失败，而且是
+          // 一次真实的上游请求。而「每日首次启动自动签到」（`src/auto-checkin.ts`）
+          // 正是靠「调用 `claimAll`、按返回的信封判跳过」来决定遍历范围的，它**不维护
+          // 第二份能力名单** ⇒ 这里漏一个守卫，它就会真去发一轮必然失败的请求。
+          // 两处是同源改动，别只改一半。
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: 'WorkBuddy 国际版不支持每日签到（其后端没有签到接口）',
+            },
+          }
+        }
         if (req.provider === RACCOON.id) {
           // raccoon **没有签到端点**：每日 300 积分由服务端按日自动发放
           //（账单里的 `daily_grant`，实测注册后 1 分钟即到账），
@@ -2525,6 +2689,68 @@ function registerJetHubEndpoints(
               ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
             })
           }
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === OPENCODE.id) {
+          // ⚠️⚠️ **这里不查远端余额**（设计决定，2026-10-02，与用户确认走「限额状态」路 A）。
+          //
+          // ## 为什么
+          //
+          // OpenCode Zen **没有公开的余额查询端点**：实测 `/zen/v1/` 下的
+          // `balance` / `credits` / `usage` / `billing` / `quota` / `limits` /
+          // `subscription` / `workspace` 等 15 个候选路径**全部 404**
+          // （返回官网页面 HTML，不是 API 的 JSON 404）。
+          // 它确实有额度概念（余额耗尽回 `402 Insufficient account funds`），
+          // 但那个数字只在控制台网页里看，没有 API 可查。
+          //
+          // ⇒ 徽标展示**我们真正测得到的东西**：每个通道（账号槽 / 匿名通道）
+          // 当前是否可用、是否处于限额冷却。数据全部来自**本地状态**
+          // （账号池的 `modelRateLimits` 与 `enabled`），**零网络请求**。
+          //
+          // ## 语义映射（不伪装成「余额」）
+          //
+          // `CreditBalance.total` 在此表示「**当前可用通道数**」，单位固定
+          // 「通道」；限额中的通道数放进 `expiredTotal`，面板据此显示
+          // 「另有 N 限额中」——与其它 provider 的「已失效资源包」口径一致，
+          // 徽标的 UI 逻辑不用改。
+          const values = accounts.map((account) => {
+            const now = Date.now()
+            const limits = Object.entries(account.modelRateLimits ?? {})
+            const limitedUntil = limits.reduce((max, [, resetAt]) => Math.max(max, Number(resetAt) || 0), 0)
+            // 只数**尚未到期**的限额（已过期的交给 sweepExpiredRateLimits 清理）。
+            const limitedModels = limits.filter(([, resetAt]) => Number(resetAt) > now).length
+            const available = account.enabled && limitedUntil <= now ? 1 : 0
+            // ⚠️ `CreditPackage` 的必填字段对 opencode 大多**无意义**
+            // （remaining/used/cycle* 都是「资源包计费周期」的概念，
+            // 而我们表达的是「通道是否可用」）。按类型要求填中性值，
+            // 徽标 UI 实际只读 `unit` / `total` / `active`（见 badge-model.js
+            // 的 creditGroupsOf），故这些字段不会出现在展示里。
+            const balance: CreditBalance = {
+              total: available,
+              packages: [{
+                name: limitedModels > 0 ? `${limitedModels} 个模型限额中` : '可用通道',
+                unit: '通道',
+                remaining: available,
+                total: available,
+                used: 0,
+                active: true,
+                cycleStartTime: '',
+                cycleEndTime: '',
+                expiredTime: '',
+              }],
+              expiredTotal: account.enabled && limitedUntil > now ? 1 : 0,
+            }
+            return {
+              accountId: account.id,
+              nickname: account.nickname,
+              balance,
+              ...(!account.enabled
+                ? { error: '已停用' }
+                : limitedUntil > now
+                  ? { error: `限额中，${new Date(limitedUntil).toLocaleString('zh-CN')} 恢复` }
+                  : {}),
+            }
+          })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
         if (req.provider === TRAE.id) {
@@ -3197,6 +3423,120 @@ function registerJetHubEndpoints(
         return { ok: true, value }
       }
 
+      // ── 本机 OpenAI 网关（`src/openai-gateway/`）──
+      case 'gateway.getEnabled': {
+        // ⚠️ **每个字段独立降级**：这里是设置页唯一的网关状态来源，任何一个附属
+        // 字段采集失败都不该让**整个面板变空白**（开关、地址、密钥全看不到），
+        // 更不该把用户挡在「关掉网关」这条自救路径之外。
+        // 失败一律降级为 null / []，并在 logger 里带上是哪一步失败的。
+        const degrade = async <T,>(step: string, run: () => T | Promise<T>, fallback: T): Promise<T> => {
+          try {
+            return await run()
+          } catch (error) {
+            ctx.logger.warn(
+              `[jet-hub] gateway.getEnabled 的「${step}」读取失败，该字段降级为默认值：${String(error)}`,
+            )
+            return fallback
+          }
+        }
+        const blockedByEnv = await degrade('env 开关', () => !isGatewayEnabled(process.env), true)
+        const apiKey = await degrade('API Key', () => gatewayApiKey(), null)
+        const address = await degrade('监听地址', () => (blockedByEnv ? null : gatewayAddress() ?? null), null)
+        const llm = llmServiceOf(ctx)
+        const listed = llm?.listProviders !== undefined
+          ? (() => {
+            try {
+              const value = llm.listProviders!()
+              return Array.isArray(value) && value.length > 0 ? value : undefined
+            } catch { return undefined }
+          })()
+          : undefined
+        const adapters = Object.keys(modelAdapters ?? {}).map((id) => ({ id }))
+        const providers = listed ?? (adapters.length > 0 ? adapters : undefined)
+        // 目录来源要让**空状态能自解释**：用户看到空清单时必须能分辨「我没登录」
+        // 与「宿主没给出任何可枚举的 provider」。
+        const modelsSource: RpcGatewayStatusResponse['modelsSource'] =
+          listed !== undefined ? 'catalog' : (adapters.length > 0 ? 'adapters' : 'none')
+        const value: RpcGatewayStatusResponse = {
+          enabled: await degrade('开关状态', () => pool.gatewayEnabled(), true),
+          running: await degrade('运行态', () => isGatewayRunning(), false),
+          blockedByEnv,
+          // 被 env 停用时即使 `enabled` 为真也不会监听，此时**不**回显地址，
+          // 否则设置页会显示一个根本连不上的 URL。
+          address,
+          // ⚠️ 明文凭据：只用于设置页展示与复制，**不进日志**。
+          apiKey: apiKey === null
+            ? null
+            : { value: apiKey.value, fromEnv: apiKey.fromEnv, path: apiKey.path },
+          // 有些 agent（如 ZCode）不会主动扫目录，要靠用户手工填 ID，
+          // 故这里把目录一并回传，让设置页内嵌展示。
+          models: await degrade('模型目录', async () => {
+            if (providers === undefined) {
+              // ⚠️ 不能静默返回空：那会让用户以为是自己没登录，而真实原因是
+              // 宿主根本没给出任何可枚举的 provider。modelsSource 会把这件事
+              // 如实带到 UI 上。
+              ctx.logger.warn('[jet-hub] gateway.getEnabled：既取不到 llm.listProviders，也没有任何已注册适配器可作兜底，模型清单为空')
+              return [] as RpcGatewayModel[]
+            }
+            return collectGatewayModelIds(
+              { listProviders: () => providers, listModels: (provider) => llm!.listModels(provider) },
+              (provider, error) => {
+                ctx.logger.warn(`[jet-hub] ${provider} 模型目录读取失败，已从网关列表跳过：${String(error)}`)
+              },
+            )
+          }, [] as RpcGatewayModel[]),
+          modelsSource,
+        }
+        return { ok: true, value }
+      }
+
+      case 'gateway.setEnabled': {
+        const req = payload as RpcGatewaySetEnabledRequest
+        // ⚠️ 不做默认值猜测，与 `provider.setEnabled` 同约定：
+        // 默认成 true 会静默打开用户特意关闭的网关。
+        if (typeof req.enabled !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        }
+        // 先落盘再启停：启停失败（端口冲突）不该让已写入的开关回滚成
+        // 「看起来没生效」——状态与运行态分开，由 status 的 running 字段区分。
+        await pool.setGatewayEnabled(req.enabled)
+        setGatewayDesiredEnabled(req.enabled)
+        await applyGatewayDesiredState()
+        const blockedByEnv = !isGatewayEnabled(process.env)
+        ctx.logger.info(
+          `[jet-hub] ${req.enabled ? '打开' : '关闭'}本机 OpenAI 网关`
+          + `${blockedByEnv ? '（已被 DSH_OPENAI_GATEWAY_ENABLED 阻止）' : isGatewayRunning() ? '' : '（未在监听）'}`,
+        )
+        // 开关切换会创建/销毁实例，密钥随之可能从「尚无」变成「已生成」。
+        const key = gatewayApiKey()
+        const llm = llmServiceOf(ctx)
+        // 刚打开网关 ⇒ 目录可能刚从空变成有值，必须重新采集。
+        // ⚠️ 同样不让目录采集拖垮整个响应：它只是回传的附加值。
+        const providers = req.enabled ? providerIdsOf(llm, modelAdapters) : undefined
+        const modelsSource: RpcGatewayStatusResponse['modelsSource'] = !req.enabled
+          ? 'none'
+          : (llm?.listProviders !== undefined ? 'catalog' : (Object.keys(modelAdapters ?? {}).length > 0 ? 'adapters' : 'none'))
+        const models = providers === undefined
+          ? []
+          : await collectGatewayModelIds({
+            listProviders: () => providers,
+            listModels: (provider) => llm!.listModels(provider),
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] gateway.setEnabled 的模型目录刷新失败：${String(error)}`)
+            return [] as RpcGatewayModel[]
+          })
+        const value: RpcGatewayStatusResponse = {
+          enabled: req.enabled,
+          running: isGatewayRunning(),
+          blockedByEnv,
+          address: blockedByEnv ? null : gatewayAddress() ?? null,
+          apiKey: key === null ? null : { value: key.value, fromEnv: key.fromEnv, path: key.path },
+          models,
+          modelsSource,
+        }
+        return { ok: true, value }
+      }
+
       // ── 内部 captcha 载体（二期）──
       //
       // 这两条是**客户端驱动**的通道：DSH 的 `connection.fetch` 只有
@@ -3326,6 +3666,118 @@ function registerJetHubEndpoints(
           accounts: state.accounts.length,
           withoutExpiry: state.accounts.filter((entry) => entry.expiresAt === undefined).length,
         }
+        return { ok: true, value }
+      }
+
+      /**
+       * 用量徽标读数（会话输入区、模型选择器旁那枚）。
+       *
+       * ## 与 `credits.balances` 的关系
+       *
+       * 读数是**同一份**（本分支内部直接复用 `credits.balances` 的实现，见
+       * `usageBadge` 的装配注释），差别只有三处：
+       * 1. 只返回**启用**账号，并给出 `disabledCount`（停用账号不进合计）；
+       * 2. 多带一份订阅读数（窗口 / 套餐），判定表在 `src/badge-subscription.ts`；
+       * 3. 带**宿主侧 TTL 缓存**（`cached` 标出来）—— 徽标按分钟轮询，而余额是
+       *    逐账号顺序打上游的（`collectCreditBalances` 的「顺序查询，避免并发
+       *    触发风控」），不缓存会让上游请求数随轮询线性放大。
+       *
+       * ⚠️ 未知 provider 的 `bad-request` 由内层 `credits.balances` 给出（那里
+       * 已有 12 条分派与 `unsupported provider` 的统一文案），本分支**原样透传**，
+       * 不另立一份 provider 名单 —— 两份名单必然漂移。
+       *
+       * ⚠️ `force: true` = 绕过缓存（手动刷新、签到之后）。
+       */
+      case 'usage.badge': {
+        const req = payload as RpcUsageBadgeRequest
+        const provider = typeof req.provider === 'string' ? req.provider.trim() : ''
+        if (provider.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 不能为空' } }
+        }
+        const value = await usageBadge.read(provider, req.force === true ? { force: true } : {})
+        // `read()` 返回的就是本端点的响应信封（`{ ok, value|error }`），直接透传。
+        return value
+      }
+
+      /**
+       * 用量徽标的显示偏好（读 / 写，**全局一个**，不分渠道）。
+       *
+       * ⚠️ `preference` 省略时**只读**（徽标首次渲染与设置面板初始化都用它）；
+       * 给出时必须是 `auto` / `subscription` / `credits` 之一。
+       *
+       * ⚠️ 非法值**拒绝**而不是静默回落：回落会让「设置没生效」看起来像
+       * 「保存成功」（用户改完刷新，界面仍按旧口径显示，且没有任何提示）。
+       * 磁盘脏数据的容错在 `sanitizeBadgePreference`（那条路径面对的不是用户输入）。
+       */
+      case 'usage.badgePreference': {
+        const req = payload as RpcUsageBadgePreferenceRequest
+        if (req.preference === undefined) {
+          const value: RpcUsageBadgePreferenceResponse = { preference: badgePreferences.load() }
+          return { ok: true, value }
+        }
+        if (!(BADGE_PREFERENCES as readonly unknown[]).includes(req.preference)) {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: `preference 必须是 ${BADGE_PREFERENCES.join(' / ')} 之一（收到：${JSON.stringify(req.preference)}）`,
+            },
+          }
+        }
+        await badgePreferences.save(req.preference)
+        const value: RpcUsageBadgePreferenceResponse = { preference: badgePreferences.load() }
+        return { ok: true, value }
+      }
+
+      /**
+       * 「每日首次启动自动签到」开关（读 / 写，**全局一个**，不分渠道）。
+       *
+       * ⚠️ `enabled` 省略时**只读**；给出时必须是布尔值。非法值拒绝而不是静默
+       * 回落 —— 理由与 `usage.badgePreference` 完全一致（回落会让「设置没生效」
+       * 看起来像「保存成功」）。
+       *
+       * ⚠️ 写入 `true` 时宿主会**立刻尝试跑一轮**（今天已跑过则由执行体内部拦住）：
+       * 否则用户今天打开开关要等到明天才有动作，看起来像没生效。返回值里的
+       * `running` 会立刻为 `true`，界面据此显示「进行中」。
+       */
+      case 'usage.autoCheckin': {
+        const req = payload as RpcUsageAutoCheckinRequest
+        /**
+         * 关闭那行**常驻**的自动签到状态文字。
+         *
+         * ⚠️ 与 `enabled` 分开判而不是「先 dismiss 再 enabled」：两者语义独立，
+         * 一次请求只该做一件事 —— 否则 `{ dismiss: true, enabled: true }` 会
+         * 既关文字又改开关，客户端将来误传就难查。
+         */
+        if (req.dismiss !== undefined) {
+          if (typeof req.dismiss !== 'boolean') {
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message: `dismiss 必须是布尔值（收到：${JSON.stringify(req.dismiss)}）`,
+              },
+            }
+          }
+          if (req.dismiss) {
+            const value: RpcUsageAutoCheckinResponse = { autoCheckin: await autoCheckin.dismiss() }
+            return { ok: true, value }
+          }
+        }
+        if (req.enabled === undefined) {
+          const value: RpcUsageAutoCheckinResponse = { autoCheckin: autoCheckin.state() }
+          return { ok: true, value }
+        }
+        if (typeof req.enabled !== 'boolean') {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: `enabled 必须是布尔值（收到：${JSON.stringify(req.enabled)}）`,
+            },
+          }
+        }
+        const value: RpcUsageAutoCheckinResponse = { autoCheckin: await autoCheckin.setEnabled(req.enabled) }
         return { ok: true, value }
       }
 

@@ -31,6 +31,7 @@ import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } 
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
+import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 import { BuddyBalanceSelector, pickBuddyAccount } from './buddy-balance-selector.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -48,6 +49,58 @@ import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
 import { MINIMAX } from './minimax-product.js'
 import type { MinimaxCredential } from './minimax.js'
+import { registerOpencodeLlm } from './opencode-adapter.js'
+// ⚠️ opencode 的 RPC 由 `jet-hub-rpc.ts` 的 handleMethod 统一分派
+// （它调 handleOpencodeRpc），本文件**不再**单独注册端点 —— 详见
+// `opencode-rpc.ts` 模块头「为什么是被主 switch 调用」。
+import {
+  ensureDefaultAnonymousSlot, listIdentitySlots, type PoolEntrySnapshot,
+} from './opencode-auth.js'
+import { OPENCODE } from './opencode-product.js'
+import { deriveProjectId, opencodeUserAgent } from './opencode.js'
+import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './opencode-capability.js'
+import { closeAllProxyDispatchers } from './opencode-proxy.js'
+import { execFile } from 'node:child_process'
+
+/**
+ * 懒加载的 OpenCode UA：首个请求要发时才探测本机 opencode 版本，探测一次即缓存。
+ *
+ * ⚠️ 拿不到**不阻塞、不抛错**，回退 `OPENCODE.defaultUserAgent`：UA 只是一个伪装
+ * 维度，服务端并未校验其真实性（opencode2dsh 实测），不值得为此延迟启动。
+ * 探测最多等 2 秒；本机没装 opencode 是**正常情况**（匿名通道照样能用）。
+ * ⚠️ 用 `execFile` 而非 `exec`：**不经过 shell**，参数不会被解释；带
+ * `windowsHide` 免得在 Windows 上闪一个黑框。
+ * ⚠️ 缓存 Promise 而非结果：并发首请求只会 spawn 一次探测进程。
+ */
+function lazyOpencodeUserAgent(): () => string {
+  let pending: Promise<string> | undefined
+  return () => {
+    pending ??= new Promise<string>((resolve) => {
+      execFile('opencode', ['--version'], { timeout: 2000, windowsHide: true }, (_err, stdout) => {
+        resolve(typeof stdout === 'string' ? stdout : '')
+      })
+    })
+      .then((out) => {
+        const version = out.match(/(\d+\.\d+\.\d+)/)?.[1]
+        return version === undefined ? OPENCODE.defaultUserAgent : `opencode/${version}`
+      })
+      .catch(() => OPENCODE.defaultUserAgent)
+    // 同步取值：缓存命中时立刻有值；未命中时用产品默认（不阻塞首个请求）。
+    let cached = OPENCODE.defaultUserAgent
+    void pending.then((ua) => { cached = ua })
+    return cached
+  }
+}
+
+/**
+ * 拉取 Zen 模型目录的超时（毫秒）。
+ *
+ * ⚠️ 桌面版实测：到 `opencode.ai` 的 fetch 可能**永不 settle**（宿主网络
+ * 异常），而 `loadOpencodeCatalog` 的兜底分支只有在内层 Promise **结束**
+ * 后才可能执行。挂死时模型列表与用量徽标会同时空白（用户报障 2026-10-02）。
+ * 8 秒足够覆盖正常路径（实测首字节 720ms 量级），又不会让 UI 干等太久。
+ */
+const OPENCODE_CATALOG_TIMEOUT_MS = 8_000
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -324,6 +377,14 @@ export function apply(ctx: Context): void {
     /** 报错文案里的产品名（用户要知道去哪个面板解锁）。 */
     displayName: string
     modelId?: string
+    /**
+     * 本次请求的模型是否**免费**（消耗 0 积分），由调用方用
+     * `BuddyAdapter.isFreeModel()` 判定后传入。
+     *
+     * ⚠️ 必须是**已确认**的免费：`true` 会跳过余额分档（即不受永久积分锁定约束），
+     * 误判成免费会让付费模型绕开锁定、真烧掉永久积分。故调用方只在确定时传 true。
+     */
+    isFreeModel?: boolean
   }): Promise<{ credential?: BuddyCredential; tried: Set<string> }> => {
     const tried = new Set<string>()
     const candidates = pool
@@ -338,6 +399,23 @@ export function apply(ctx: Context): void {
         return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
       })
       .map(a => ({ id: a.id, credentialRef: a.credentialRef }))
+
+    // 免费模型（消耗 0 积分）不受「锁定永久积分」约束：锁定要保护的是
+    // 「别把永久积分烧掉」，而免费模型既不扣临时积分也不扣永久积分，
+    // 却被那道门一并拦下，报出「账号有余额却没有可用账号」的矛盾错误（真实报障）。
+    //
+    // 这里**只按候选顺序取凭据**，不做余额分档 —— 免费模型没有「该烧哪个包」
+    // 的选择问题，余额查询因此完全不必要（也顺带省掉一次网络请求）。
+    // 限流过滤仍然生效（上面的 filter），不会因免费而绕开模型级限流标记。
+    if (options.isFreeModel === true) {
+      for (const candidate of candidates) {
+        const credential = await resolveBuddyCredentialByRef(candidate.credentialRef)
+        if (credential !== undefined) return { credential, tried }
+        tried.add(candidate.id)
+      }
+      // 免费模型下若凭据全坏，仍落到下面的常规路径，以复用既有的错误语义
+      // （凭据问题应报「凭据不可用」，而不是被误报成「额度已用尽」）。
+    }
 
     const allowPermanent = !pool.permanentLocked(options.product.id)
 
@@ -381,6 +459,9 @@ export function apply(ctx: Context): void {
         selector: buddyBalanceSelector,
         displayName: 'CodeBuddy',
         modelId,
+        // 免费模型跳过「锁定 + 临期积分」这道门（判据见 BuddyAdapter.isFreeModel）。
+        // `buddyAdapter` 在此处是自引用：闭包只在注册完成后才执行，故无 TDZ 问题。
+        isFreeModel: await buddyAdapter.isFreeModel(modelId),
       })
       if (picked.credential) return picked.credential
       // 回退到账号池的既有选择（凭据损坏的账号已被 tried 排除），最后才退单凭据 ref。
@@ -429,6 +510,10 @@ export function apply(ctx: Context): void {
         selector: workbuddyBalanceSelector,
         displayName: 'WorkBuddy',
         modelId,
+        // 免费模型跳过「锁定 + 临期积分」这道门（判据见 BuddyAdapter.isFreeModel）。
+        // 用户报障「账户可用却提示没有可用账号」正是缺了这一条：免费模型不扣积分，
+        // 却被永久积分锁定拦下。
+        isFreeModel: await workbuddyAdapter.isFreeModel(modelId),
       })
       if (picked.credential) return picked.credential
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
@@ -1421,6 +1506,137 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     zcodeAdapter.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
+  // ===== OpenCode Zen（账号槽 + 匿名槽平权混合池）=====
+  //
+  // 形态与前面所有 provider 相同：进程内 LlmAdapter 直发远端，无子进程、无端口。
+  // 两处独有语义：
+  // 1. **身份 = 槽**：账号槽（手动粘贴的 `sk-` key，可各配代理）+ 匿名槽
+  //    （凭证就是字面量 `public`，永远本机出口）。免费模型下全槽**平权**轮换，
+  //    收费模型只走账号槽（匿名凭证只被服务端认作免费通道）。
+  // 2. **每账号可配代理**：NAT 后的多台 PC 共享一个出口 IP，而 Zen 的匿名通道
+  //    按出口 IP 限流 ⇒ 要真正分开只能给各账号各配一条出口（`opencode-proxy.ts`）。
+  //
+  // ⚠️ 指纹派生的**唯一作用是防关联**（opencode 协议层没有机器指纹），
+  // 不参与配额计算 —— 换配额桶只能靠换 key 或换代理。
+  // ⚠️ 版本探测**不能**在 apply 里 await（apply 是同步函数）：那会让插件启动
+  // 阻塞最多 2 秒。改为**懒加载**：首个请求要发时才探测并缓存，探测失败直接
+  // 用 `OPENCODE.defaultUserAgent`（UA 只是伪装维度，服务端未校验真实性）。
+  const opencodeUA = lazyOpencodeUserAgent()
+  const opencodeAdapter = registerOpencodeLlm(ctx, {
+    identitySlots: async () => listIdentitySlots(
+      await Promise.all(pool.listAccountsByProvider(OPENCODE.id).map(async (entry) => {
+        const resolved = await ctx.credentials
+          .resolve(credentialRef(entry.credentialRef))
+          .catch(() => undefined)
+        let parsed: { api_key?: string } = {}
+        if (resolved !== undefined) {
+          try {
+            parsed = JSON.parse(resolved.value) as typeof parsed
+          } catch {
+            // 凭据损坏：回退到匿名凭证，让用户看到「凭据未配置」而不是整条崩掉
+          }
+        }
+        const apiKey = parsed.api_key ?? OPENCODE.anonymousKey
+        // ⚠️⚠️ **指纹代次必须以账号池为权威重算**（本任务最容易漏的一步）：
+        // 「指纹」按钮只把 generation 写进账号条目
+        // （`updateOpencodeFingerprintGeneration`），凭据里的 `fingerprint`
+        // 仍是添加账号时的旧值。若直接透传凭据里的 fingerprint，代次涨了而
+        // project id **纹丝不动** —— 用户点了「指纹」却什么都没换，且**不报错**，
+        // 是最难排查的一类静默失效。
+        const generation = Math.max(
+          pool.opencodeFingerprintGenerationFor(entry.id),
+          0,
+        )
+        // ⚠️ **identity 选择**：匿名槽的 api_key 全是 `public`，用它派生会让
+        // N 条匿名通道拿到**同一个指纹**（彼此无法区分）。故匿名槽改用
+        // **条目 id** 作 identity —— 这正是「多个匿名账号各有独立指纹」的实现点。
+        const identity = apiKey === OPENCODE.anonymousKey ? entry.id : apiKey
+        const snapshot: PoolEntrySnapshot = {
+          id: entry.id,
+          enabled: entry.enabled,
+          apiKey,
+          proxy: pool.opencodeProxyFor(entry.id),
+          fingerprint: { projectId: deriveProjectId(identity, generation), generation },
+        }
+        return snapshot
+      })),
+      // 取值一次即可：`listIdentitySlots` 要的是字符串，不是惰性函数。
+      // 首次调用时可能还是产品默认值（探测在后台跑），后续请求才用真机版本 ——
+      // 宁可前几次 UA 用兜底值，也不让插件启动阻塞在 2 秒的子进程上。
+      opencodeUA(),
+    ),
+    // ⚠️⚠️ **必须有超时**（真机事故 2026-10-02）：桌面版到 opencode.ai 的
+    // fetch 可能**永不 settle**（与同源的 remote.session 故障都是宿主网络问题）。
+    // 没有超时 → `loadOpencodeCatalog` 的 try/catch 永远走不到 →
+    // `listModels` 永不返回 → **模型列表与徽标同时空白**（用户报障）。
+    // 有超时则超时后回退兜底表，UI 立刻可用（只是暂时看不到付费模型）。
+    fetchRemoteCatalog: (slot, signal) => fetch(`${OPENCODE.baseUrl}${OPENCODE.modelsPath}`, {
+      headers: { authorization: `Bearer ${slot.apiKey}` },
+      // 组合两个信号：调用方给的（取消）+ 自己的超时（防挂死）。
+      signal: signal === undefined
+        ? AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)
+        : AbortSignal.any([signal, AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)]),
+    }),
+    disabledModels: () => pool.disabledModelsFor(OPENCODE.id),
+    markLimited: async (slotId, modelId, resetAtMs) => {
+      // 匿名条目同样落盘：它是池里的一条普通条目，限额标记在面板可见、
+      // 可用「重测/清除」恢复（早期把匿名槽当进程内状态，重启即丢）。
+      await pool.updateModelRateLimit(slotId, modelId, resetAtMs)
+    },
+    warn: (message) => ctx.logger.warn(`[codearts-auth] ${message}`),
+    // ⚠️ 图片字节桥接：Zen 有多个免费模型实测支持图片输入（big-pickle /
+    // space-bunny-free / mimo-v2.6 / mimo-v2.5，2026-10-02 真机验证），
+    // 模态由 `opencode-capability.ts` 按远端 models.dev 播报。
+    // ⚠️ 不接 `readImageRequest`（缩放桥接）：Zen 免费通道对图片体积的
+    // 限制**未实测**，不凭猜测加一层压缩（Qoder/Raccoon 是实测撞到体积
+    // 限制才接的）。先发原图，撞到限制再按实测加。
+    readImage: makeReadImage(ctx),
+  })
+  // 保证至少有一条匿名通道（零账号也能用免费模型）。
+  //
+  // ⚠️ **不 await**：`apply()` 是同步的（不能 await），而这里是异步 IO。
+  // 走 fire-and-forget —— 它只是「补一条默认条目」，失败最坏结果是用户
+  // 手动点「+ 添加匿名通道」，而 `listIdentitySlots` 每次请求都实时读池，
+  // 补完立即生效，不需要等它。
+  void ensureDefaultAnonymousSlot(
+    (entry) => pool.addAccount(entry),
+    (refName, value) => ctx.credentials.set(credentialRef(refName), value),
+    () => pool.listAccountsByProvider(OPENCODE.id),
+    // ⚠️ 判据是「池里有没有匿名条目」而不是「有没有账号」：用户若主动
+    // 删光了匿名通道，那是明确选择，不该每次启动又塞回来（删除会像失灵）。
+    () => pool.listAccountsByProvider(OPENCODE.id).some((e) => e.id.startsWith(`${OPENCODE.id}-anon-`)),
+  ).then((id) => {
+    if (id !== '') ctx.logger.info(`[codearts-auth] 已为 OpenCode 创建默认匿名通道：${id}`)
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[codearts-auth] 创建默认 OpenCode 匿名通道失败：${String(error)}`)
+  })
+
+  // 预热模型能力表（models.dev）。
+  //
+  // ⚠️⚠️ **两条硬约定**（真机事故 2026-10-02）：
+  // 1. 渲染路径上**只读同步缓存**，永不 await 网络 —— 我最初在 `listModels`
+  //    里 await 这个拉取，而它 5 MB / 慢则 1.4s、宿主网络异常时**永不返回**，
+  //    于是模型选择器一直空白（用户报障「一直卡着」）。
+  // 2. 拉取完成要**广播目录变更**：能力表是能力判定的来源，DSH 已经用
+  //    「纯文本」渲染过一帧，不广播它不会重算（免费模型会一直显示不支持图片）。
+  //
+  // 首次运行磁盘没缓存时，本次刷新可能晚于首帧几十秒；那段时间能力按纯文本
+  // 保守处理（见 opencode-capability.ts 的模块头）。
+  primeOpencodeCapabilities()
+  refreshOpencodeCapabilities(() => {
+    try {
+      ctx.emit('llm/adapters-updated')
+    } catch (error) {
+      ctx.logger.warn(`[codearts-auth] 广播 OpenCode 能力更新失败：${String(error)}`)
+    }
+  })
+  // ⚠️ 这里**不再**调 `registerOpencodeRpc`：opencode 的端点已并入
+  // `registerJetHubRpc` 内部的 handleMethod（见 `opencode-rpc.ts` 模块头）。
+  // 代理 dispatcher 是常驻连接池：插件卸载必须回收，否则进程退出会挂住。
+  // ⚠️ 用仓库既有的 `ctx.effect(() => () => …)` 回收模式；cordis 的 Events
+  // 里**没有** `dispose` 事件（`ctx.on('dispose', …)` 直接类型报错）。
+  ctx.effect(() => () => { void closeAllProxyDispatchers() })
+
   // ===== Jet Hub RPC 注册 =====
   // provider → 适配器实例：Jet Hub「显示列表」需要 `listAllModels()`（不受用户
   // 黑名单影响的全量目录，带最终展示名/倍率）。DSH 的 `ctx.llm` 只保证
@@ -1440,8 +1656,12 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     raccoon: raccoonAdapter,
     minimax: minimaxAdapter,
     zcode: zcodeAdapter,
+    opencode: opencodeAdapter,
   }
 
   registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters)
+  // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
+  // 自行降级为日志，绝不会让插件 apply() 失败。
+  mountOpenAiGateway(ctx, pool)
   ctx.provide('accountPool', pool)
 }

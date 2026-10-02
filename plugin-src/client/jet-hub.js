@@ -12,6 +12,7 @@ import {
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
+import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
 import {
   formatExpirySplitLine,
   formatPoolSplitLine,
@@ -25,6 +26,20 @@ import {
   disablingLeavesNoEnabledAccount,
 } from './account-model-link.js';
 import { bulkButtonState } from './model-bulk.js';
+import {
+  copyToClipboard,
+  formatModelIdList,
+  gatewayApiKeyHint,
+  gatewayButtonLabel,
+  gatewayButtonTitle,
+  gatewayEndpoint,
+  gatewayModelsCurl,
+  gatewayModelsHint,
+  gatewayStatusLines,
+  gatewaySwitchDisabled,
+  gatewayToggleNotice,
+  modelCapabilityBadge,
+} from './openai-gateway-panel.js';
 import {
   filterModels,
   isFilterActive,
@@ -42,6 +57,20 @@ import {
 } from './model-groups.js';
 import { formatRowTokensPerSecond } from './tokens-per-second.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
+import {
+  formatCredits,
+  formatTokens,
+  formatUnits,
+  unitLabel,
+} from './credits-format.js';
+import {
+  quotaWindowLabel,
+  quotaWindowsOf,
+  quotaResetsIn,
+  quotaTone,
+  quotaPercentValue,
+  formatQuotaPercent,
+} from './quota-format.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -213,6 +242,15 @@ const MINIMAX_ICON = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0i
  */
 const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgklEQVR42u3XsRGAIAyF4UxgYe0g7j+FpZtgRwN36stLAhruqP+v4ICIdNaybsViy92yCj+CeMW7CO94gwgFRMUrIgFTAPbzgPe/Aa5nAInTAGicAtDE1QBtXAVgxGEAeuIpAFYYArDj81xEoQDLd+A1ID8k3wTkXDDEaDbEcBo1nl/XXoK4yMqvMgAAAABJRU5ErkJggg==';
 
+/**
+ * OpenCode 面板图标（内联 SVG data URL，手绘）。
+ *
+ * ⚠️ 与 Qoder / LobsterAI / TRAE 同款做法：opencode 没有可取的小图标资源，
+ * 走内联 SVG（体积小、无色差、20×20 下清晰）。
+ * 图形：深色圆角方块 + 白色终端提示符（`>` 加下划线），呼应 CLI 形象。
+ */
+const OPENCODE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzEyMTYxZCIvPjxwYXRoIGQ9Ik02LjUgOC41IDEwLjUgMTJsLTQgMy41IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBkPSJNMTIuNSAxNmg1IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48L3N2Zz4=';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -247,7 +285,27 @@ const PROVIDERS = Object.freeze([
    * 「弹窗 + 登录轮询」路径。
    */
   { id: 'zcode', label: 'ZCode (智谱)', icon: ZCODE_ICON, logoClass: 'zcode' },
+  /**
+   * OpenCode（第 12 个 provider）。
+   *
+   * ⚠️ label 必须与 `OPENCODE.displayName` **逐字一致**（'OpenCode'）：
+   * rail 宽度算式与 `tests/unit/opencode-client-panel.spec.ts` 的跨文件
+   * 一致性断言都依赖它（raccoon 那条同理，改一处会连锁失败）。
+   */
+  { id: 'opencode', label: 'OpenCode', icon: OPENCODE_ICON, logoClass: 'opencode' },
 ]);
+
+/**
+ * 渠道 id → 展示名。
+ *
+ * ⚠️ **唯一的渠道名来源**：用量徽标（`./usage-badge.js`）与设置页左栏都走它，
+ * 不要在别处再抄一份 `{ codearts: 'CodeArts (华为云)', … }` —— 那样改名时必然
+ * 出现「徽标写着旧名字、设置页写着新名字」的分裂。查不到时**原样返回 id**：
+ * 徽标宁可显示一个裸 id（可排查），也不要显示空白。
+ */
+export function providerLabel(id) {
+  return PROVIDERS.find(p => p.id === id)?.label ?? id;
+}
 
 /**
  * 积分能力判定见 `./credits-capabilities.js`。
@@ -324,64 +382,12 @@ function summarizeProbe(kind, res) {
 }
 
 /**
- * 把积分余额格式化成一行文案。
- *
- * 保留两位小数：服务端下发的精确值就是两位（如 247.87），而整数版字段
- * 会截断成 247 —— IDE 顶部显示的 "Credits Balance 347.87" 用的是精确值，
- * 这里必须对齐，否则用户会以为插件算错了。
+ * 积分 / token 数值的格式化已搬到 `./credits-format.js`（纯函数模块）：
+ * 会话输入区的**用量徽标**同样要显示余额，而它的折叠态文案必须可单测 ——
+ * 本文件顶部 `import * as React from 'react'`，而 react 是宿主注入的 external
+ * （node_modules 里没有），任何 import 本文件的测试都跑不起来。
+ * 搬出去同时保证了「徽标」与「设置页」不可能显示出两个不同的数字。
  */
-function formatCredits(value) {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
-  // 整数不显示多余的小数位（100 而不是 100.00），有小数才保留两位
-  return Number.isInteger(value) ? String(value) : value.toFixed(2);
-}
-
-/**
- * 把 **token 计数**格式化成人类可读的 `xx.yyM` / `x.yyK`。
- *
- * ## ⚠ 为什么需要它（真实缺陷）
- *
- * 用户报障：「智谱 plan 给的不是积分是 tokens，应该显示 `Token: xx.yyM` 这种格式」。
- *
- * 上游 `billing/balance` 的桶里有明确单位声明（实测）：
- * ```json
- * { "meter": "model_usage", "unit_type": "token",
- *   "total_units": 100000000, "remaining_units": 94539275 }
- * ```
- * Host 侧已如实标注 `unit: 'token'`，但客户端此前**完全不消费 `unit`** ——
- * 于是界面显示 `94539275`（无单位、看起来像 1 亿积分，量级也读不出来）。
- *
- * 规则（与常见 token 展示一致）：
- *   - `>= 1e6` → `94.54M`
- *   - `>= 1e3` → `945.39K`
- *   - 其余     → 原样整数
- *
- * ⚠ 小数位**固定两位**（`94.54M` 而不是 `94.5M`）：token 余额的百位变化
- * 对用户有意义（差 0.04M = 4 万 token），一位小数会把它们抹平。
- */
-function formatTokens(value) {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
-  const abs = Math.abs(value);
-  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
-  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`;
-  return String(Math.round(value));
-}
-
-/**
- * 按**单位**选择格式化函数。
- *
- * ⚠ 这是 `unit` 字段的唯一消费点 —— 加新单位（如 `credit`）时改这里，
- * 不要在渲染处写 `if (provider === 'zcode')` 那种分支（会漏掉别的 provider）。
- */
-function formatUnits(value, unit) {
-  if (unit === 'token') return formatTokens(value);
-  return formatCredits(value);
-}
-
-/** 单位的展示名（账号卡片上的标签）。 */
-function unitLabel(unit) {
-  return unit === 'token' ? 'Token' : '积分';
-}
 
 /**
  * 把一个包的明细格式化成 tooltip 的一行。
@@ -523,7 +529,21 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
       : null));
 }
 
-function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag }) {
+/**
+ * 该账号条目是否为 opencode 的匿名通道。
+ *
+ * ⚠️ 判据是**条目 id 前缀**（`opencode-anon-`）而不是凭据内容：客户端拿不到
+ * 凭据（它存在 `ctx.credentials` 里，面板只拿得到 `credentialRef`），而 id 前缀
+ * 是宿主与客户端之间约定好的（见 `opencode-rpc.ts` 的 `addAnonymous`）。
+ */
+function isAnonymousAccountId(accountId) {
+  return String(accountId || '').indexOf('opencode-anon-') === 0;
+}
+
+function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
+  // ⚠️ opencode 专属：传了才渲染「代理」「指纹」两个按钮（见按钮区注释）。
+  // 前者额外需要 current 代理串，故签名与 onRetest 略有不同。
+  onOpenProxy, onRotateFingerprint }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -613,7 +633,18 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         'data-tone': account.enabled ? 'on' : 'off',
         // 同账号名：hover 出资源包列表（两处都挂，用户 hover 哪个都能看见）。
         title: accountTitle,
-      }, account.enabled ? '已启用' : '已停用')),
+      }, account.enabled ? '已启用' : '已停用'),
+      // ⚠️ 匿名通道标记：它不需要 key、只用于免费模型，额度按**出口 IP** 计。
+      // 标注出来是为了让用户知道「这几条不是登录账号」，
+      // 以及为什么给它们配不同代理才会各自获得独立额度。
+      provider === 'opencode' && isAnonymousAccountId(account.id)
+        ? React.createElement('span', {
+            className: 'dim-jh-accountTag',
+            'data-tone': 'on',
+            title: '匿名通道：无需 API key，仅用于免费模型。'
+              + '额度按出口 IP 计算 —— 给它单独配置代理，才会获得独立额度。',
+          }, '匿名')
+        : null),
     React.createElement('dl', { className: 'dim-jh-accountMeta' },
       React.createElement('div', { className: 'dim-jh-metaRow' },
         React.createElement('dt', null, '凭据'),
@@ -707,6 +738,31 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         className: 'dim-jh-btn',
         onClick: () => onToggle(account.id, !account.enabled),
       }, account.enabled ? '停用' : '启用'),
+      // ⚠️ 仅 opencode：出口代理与指纹轮换是该 provider **独有**的账号维度
+      // （其余 provider 没有这两项）。用 props 存在性开关而非
+      // `provider === 'opencode'` 硬判断 —— 前者让 AccountCard 无需知道
+      // provider 列表，也避免以后新增同类 provider 时漏改。
+      // 位置在「停用」之后、「删除」之前：删除按钮带 data-kind='danger'，
+      // 是这一行的视觉终点，不能被挤到中间。
+      onOpenProxy
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            // ⚠️ tooltip 必须解释「不设置会怎样」：看到「代理」按钮很容易
+            // 当成锦上添花，实际不设 = 与其它账号共用同一出口（同一份额度）。
+            title: account.opencodeProxy
+              ? '出口代理：' + account.opencodeProxy + '（点击修改）'
+              : '设置该账号的出口代理；不设置则与其它未设代理的账号共享本机出口 IP',
+            onClick: () => onOpenProxy(account.id, account.opencodeProxy || ''),
+          }, '代理')
+        : null,
+      onRotateFingerprint
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: '轮换该账号的指纹（生成新的 project id；用于怀疑多个账号被关联时）',
+            disabled: busy,
+            onClick: () => onRotateFingerprint(account.id),
+          }, '指纹')
+        : null,
       React.createElement('button', {
         className: 'dim-jh-btn',
         'data-kind': 'danger',
@@ -1133,100 +1189,10 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
 }
 
 /**
- * 额度窗口类型 → 中文标签。
- *
- * ⚠️ **未识别的类型原样显示**，而不是丢弃或归入「其它」：网关新增窗口
- * （例如将来的 `daily`）时，面板立刻就能显示出新窗口，不必等插件发版 ——
- * 这与后端「窗口按网关原序透传、不映射到固定形状」是同一个设计。
+ * 额度窗口的标签 / 排序 / 百分比 / 倒计时已搬到 `./quota-format.js`（纯函数模块），
+ * 理由同上面的数值格式化：会话输入区的**用量徽标**要显示同一份订阅读数，
+ * 而它的文案必须可单测；且两个界面共用同一套窗口顺序与夹取口径。
  */
-/**
- * 已知额度窗口及其**固定顺序**（与参考实现 `dsh-cline-pass` 同款）。
- *
- * ⚠️ 已知窗口按此顺序排在前，网关下发的**未知窗口追加在后** ——
- * 纯按网关原序会让新窗口插到中间，同一账号两次读数的排列可能不同。
- */
-const QUOTA_WINDOWS = Object.freeze([
-  ['five_hour', '5 小时'],
-  ['weekly', '本周'],
-  ['monthly', '本月'],
-]);
-
-/** 额度窗口类型 → 中文标签（未识别时原样返回，不丢弃也不归入「其它」）。 */
-function quotaWindowLabel(type) {
-  const known = QUOTA_WINDOWS.find(([id]) => id === type);
-  return known === undefined ? type : known[1];
-}
-
-/**
- * 窗口排序：**已知窗口按固定顺序在前，未知窗口追加在后**（参考实现同款）。
- * 这样网关新增窗口（如 `daily`）时面板立刻多一行，不必为它发插件版本。
- * @returns `[type, label, window]` 三元组数组。
- */
-function quotaWindowsOf(windows) {
-  const known = new Map(windows.map((win) => [String(win.type), win]));
-  const ordered = QUOTA_WINDOWS
-    .filter(([type]) => known.has(type))
-    .map(([type, label]) => [type, label, known.get(type)]);
-  const extra = windows
-    .filter((win) => !QUOTA_WINDOWS.some(([type]) => type === String(win.type)))
-    .map((win) => [String(win.type), String(win.type), win]);
-  return [...ordered, ...extra];
-}
-
-/**
- * 额度重置的**粗粒度**倒计时（参考实现同款）：
- * 「3 天 4 小时」/「4 小时 5 分钟」/「5 分钟」。
- *
- * ⚠️ 粗粒度是刻意的：额度重置是一眼扫过去的信息，秒级精度只会让面板
- * 无谓重渲染，对用户也没有意义。
- * 已过期 / 缺失 / 不可解析一律返回**空串**（不显示「已过期」这类噪音）。
- */
-function quotaCountdown(resetsAt) {
-  const at = Date.parse(String(resetsAt ?? ''));
-  if (!Number.isFinite(at)) return '';
-  const minutes = Math.round((at - Date.now()) / 60_000);
-  if (minutes <= 0) return '';
-  const days = Math.floor(minutes / 1440);
-  const hours = Math.floor((minutes % 1440) / 60);
-  const mins = minutes % 60;
-  if (days > 0) return `${days} 天 ${hours} 小时`;
-  if (hours > 0) return `${hours} 小时 ${mins} 分钟`;
-  return `${Math.max(1, mins)} 分钟`;
-}
-
-/** 「{倒计时}后重置」；没有可读倒计时时返回空串（那一行不渲染）。 */
-function quotaResetsIn(resetsAt) {
-  const left = quotaCountdown(resetsAt);
-  return left === '' ? '' : `${left}后重置`;
-}
-
-/**
- * 额度百分比 → 色调（参考实现同款三档）：≥90 红 / ≥70 黄 / 其余绿。
- *
- * ⚠️ 只给「值得反应」的两档染色，正常读数保持绿色 —— 全部染成品牌蓝会让
- * 「用掉九成」和「用掉一成」看起来一样，额度条就失去了警示作用。
- */
-function quotaTone(percent) {
-  if (!Number.isFinite(percent)) return 'ok';
-  if (percent >= 90) return 'error';
-  if (percent >= 70) return 'warn';
-  return 'ok';
-}
-
-/**
- * 百分比取值：**先夹取到 0–100**（参考实现同款）。
- * 进度条宽度与百分比文案共用这一个值，两者口径必须一致。
- */
-function quotaPercentValue(percent) {
-  const n = Number(percent ?? 0);
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(100, n));
-}
-
-/** 百分比文案：夹取后**四舍五入到整数**（参考实现同款）。 */
-function formatQuotaPercent(percent) {
-  return `${Math.round(quotaPercentValue(percent))}%`;
-}
 
 /**
  * 时间戳 → 请求记录里的「时间」列（参考实现同款）。
@@ -1765,6 +1731,18 @@ function ProviderPanel({ provider, rpcCall }) {
    * 没必要让整个登录流程作废。
    */
   const [loginUrlForManual, setLoginUrlForManual] = React.useState(null);
+  /**
+   * 出口代理弹窗状态：{ accountId, current } 或 null。
+   *
+   * ⚠️ **独立于** `loginUrlForManual`：那个是登录链接兜底弹窗，两者共存时
+   * 共用一个 state 会让开代理弹窗把登录链接顶掉（表现为链接凭空消失）。
+   */
+  const [proxyModal, setProxyModal] = React.useState(null);
+  // 「添加 opencode 账号」弹窗：null（关闭）或 { error }。
+  // ⚠️ 输入框内容**不放 state**（用 ref + DOM 读值）：API key 是凭据，
+  // 进 state 会随每次重渲染经过整棵组件树，也会被 devtools 组件树检查器读到。
+  const [keyModal, setKeyModal] = React.useState(null);
+  const keyInputRef = React.useRef(null);
 
   /**
    * 拖拽排序状态：正在拖的账号 id 与当前悬停的目标账号 id。
@@ -2089,11 +2067,64 @@ function ProviderPanel({ provider, rpcCall }) {
     if (mounted.current) setCreating(false);
   };
 
+  /**
+   * 真正提交一个 opencode 账号（由「添加账号」弹窗的确认按钮调用）。
+   *
+   * ⚠️ 错误**留在弹窗内**展示，不 `setPhase('error')`：后者会把整个账号列表
+   * 换成错误态，用户刚填的 key 与错误信息一起消失，只能刷新重试。
+   */
+  const submitOpencodeKey = async (rawKey) => {
+    const key = String(rawKey == null ? '' : rawKey).trim();
+    // 空串 = 没填就点确认：静默关弹窗，不报错（免费通道本来就能用）。
+    if (key === '') return;
+    await submitOpencodeEntry('opencode.addAccount', { apiKey: key });
+  };
+
+  /**
+   * 添加一条**匿名通道**（无需 key）。
+   *
+   * 匿名通道是账号池里的一条普通条目（`api_key` 为字面量 `public`），于是
+   * 拖拽排序 / 停用 / 删除 / 代理 / 指纹代次全部复用既有机制 —— 这正是
+   * 「多条匿名通道各走各的出口」的实现方式。
+   *
+   * ⚠️ 指纹分离**不增加配额**（匿名按出口 IP 限额，实测换 key/伪装头/指纹
+   * 全部无效）；要多份额度必须给不同匿名通道配**不同代理**。弹窗里已说明。
+   */
+  const submitAnonymous = async () => {
+    await submitOpencodeEntry('opencode.addAnonymous', {});
+  };
+
+  /** 两个添加入口的公共收尾（成功关弹窗并刷新；失败把错误留在弹窗里）。 */
+  const submitOpencodeEntry = async (method, payload) => {
+    setCreating(true);
+    setError(null);
+    try {
+      const res = await rpcCall(method, payload);
+      setKeyModal(null);
+      await loadAccounts();
+      // 重复 key 时后端返回 existed（复用已有账号）—— 这不是错误，
+      // 但要明确告知，否则用户会以为第二次粘贴白费了。
+      if (res && res.existed) setProbeNotice('该 key 已存在，已为你定位到原有账号。');
+    } catch (caught) {
+      setKeyModal({ error: caught && caught.message ? caught.message : '未知错误' });
+    } finally {
+      setCreating(false);
+    }
+  };
+
   const createAccount = async () => {
     // ⚠ 已有一轮登录在跑时直接忽略（真实缺陷）：`creating` 在返回 loginUrl 后
     // 会被 `finally` 无条件释放，按钮随即恢复可点，再点一次会叠加第二个轮询 +
     // 宿主再插一条占位账号。以轮询句柄作为重入闸门，比 UI 的 disabled 更可靠。
     if (pollRef.current !== 0) return;
+    // ⚠️ opencode 的登录**不跳浏览器**，而是开自绘弹窗粘贴 API key；
+    // 走 `setKeyModal` 而不是下面的 `account.create` 流程。
+    // 弹窗里另有两个入口：粘贴 key（submitOpencodeKey）与添加匿名通道（submitAnonymous）。
+    if (provider === 'opencode') {
+      setKeyModal({ error: '' });
+      return;
+    }
+
     setCreating(true);
     let accountId = '';
     let loginUrl = '';
@@ -2286,6 +2317,23 @@ function ProviderPanel({ provider, rpcCall }) {
       await loadAccounts();
     } catch (caught) {
       console.error('[jet-hub] delete failed:', caught);
+    }
+  };
+
+  /**
+   * 轮换某账号的指纹（仅 opencode）。
+   *
+   * ⚠️ 二次确认是有意的：它不是「修复失败」的操作，而是**预防性**手段
+   * （怀疑多个账号被上游关联时换一份新身份）。没有确认框的话，用户容易
+   * 当成普通按钮随手点，点了也不知道发生了什么。
+   */
+  const rotateFingerprint = async (accountId) => {
+    if (!confirm('轮换该账号的指纹？将生成新的 project id（用于与其他账号区分）。')) return;
+    try {
+      await rpcCall('opencode.rotateFingerprint', { accountId });
+      await loadAccounts();
+    } catch (caught) {
+      alert('轮换失败：' + (caught?.message || String(caught)));
     }
   };
 
@@ -2568,9 +2616,28 @@ function ProviderPanel({ provider, rpcCall }) {
             React.createElement('button', { className: 'dim-jh-btn', onClick: loadAccounts }, '重新读取'))
         : accounts.length === 0
           ? React.createElement('div', { className: 'dim-jh-empty' },
-              React.createElement('p', null, '尚未配置账号'),
-              React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。'))
+              // ⚠️ opencode 的「新建」是**粘贴 API key**、不是浏览器登录，
+              // 空态文案必须跟着变 —— 否则用户会去找一个根本不存在的登录页。
+              provider === 'opencode'
+                ? React.createElement('div', null,
+                    React.createElement('p', null,
+                      '尚未添加账号。免费模型无需账号即可使用；添加自己的 API key 可启用付费模型，并为每个账号配置独立出口。'),
+                    React.createElement('p', { className: 'dim-jh-hint' },
+                      'API key 在 opencode.ai/auth 生成，形如 sk-…'))
+                : React.createElement('div', null,
+                    React.createElement('p', null, '尚未配置账号'),
+                    React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。')))
           : React.createElement('div', null,
+              // ⚠️ opencode 专属策略提示：必须说清「多账号 ≠ 多额度」——
+              // 匿名通道按出口 IP 限流，同一出口下的多个账号共用一份额度。
+              // 不解释的话，用户加了 5 个号却只看到一份配额，会以为功能坏了。
+              provider === 'opencode'
+                ? React.createElement('p', { className: 'dim-jh-hint' },
+                    '免费模型在所有通道间自动轮换，收费模型仅「API key 账号」可用。'
+                    + '匿名通道无需 key，可添加多条、各自配代理；'
+                    + '注意额度按**出口 IP** 计算 —— 多条通道共用一个出口不会增加额度，'
+                    + '分别配不同代理才会各自获得独立额度。')
+                : null,
               // 排序提示：顺序会真实影响自动选号，必须让用户知道，否则
               // 「拖了有什么用」无从得知。仅两个以上账号时才显示。
               accounts.length > 1
@@ -2609,6 +2676,14 @@ function ProviderPanel({ provider, rpcCall }) {
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),
                 onReset: (id) => void runLimitAction('reset', id),
+                // ⚠️ 仅 opencode：这两个回调只在该 provider 下传，
+                // AccountCard 靠「props 存在性」决定是否渲染按钮。
+                ...(provider === 'opencode'
+                  ? {
+                      onOpenProxy: (id, current) => setProxyModal({ accountId: id, current }),
+                      onRotateFingerprint: (id) => void rotateFingerprint(id),
+                    }
+                  : {}),
                 // 新手任务（仅 Loomy）：一次性 10000 分，每号只能领一次。
                 // 与「一键领取积分」（每日签到）是**不同**的操作，故独立按钮。
                 onClaimOnboarding: canClaimOnboarding
@@ -2634,6 +2709,38 @@ function ProviderPanel({ provider, rpcCall }) {
       ? React.createElement(ClineQuotaPanel, {
           rpcCall,
           onClose: () => setShowQuota(false),
+        })
+      : null,
+    // 出口代理弹窗（仅 opencode）：覆盖层，与上面两个弹窗各自独立 state，
+    // 同时打开也只是叠加，不会互相顶掉。
+    //
+    // ⚠️⚠️ **必须用 `React.createElement(组件, props)`，不能直接调用函数**
+    // （真实事故 2026-10-02）：这两个弹窗内部有 `useState`，若在
+    // ProviderPanel 的渲染过程中**直接函数调用**，它们的 hook 会被算进
+    // ProviderPanel —— 于是「打开弹窗」与「关闭弹窗」两次渲染的 hook 数量
+    // 不同，React 抛 #310（"Rendered more hooks than during the previous render"），
+    // 整个设置页崩成白屏。仓库其它弹窗（ModelListPanel / BackupPanel /
+    // ClineQuotaPanel）都是 `createElement` 形式，正是这个原因。
+    proxyModal
+      ? React.createElement(OpencodeProxyModal, {
+          // ⚠️ 传最小 ctx 门面而不是整个面板：弹窗只需要 rpc，
+          // 这样它在单测/复用时不必拖上整个 ProviderPanel 的依赖。
+          ctx: { rpc: (payload) => rpcCall(payload.method, payload.payload) },
+          accountId: proxyModal.accountId,
+          current: proxyModal.current,
+          onClose: () => setProxyModal(null),
+        })
+      : null,
+    // 「添加 opencode 账号」弹窗：自绘而非 window.prompt ——
+    // DSH 客户端沙箱里 prompt() 直接抛 `prompt() is not supported`（真机报障）。
+    keyModal
+      ? React.createElement(OpencodeKeyModal, {
+          error: keyModal.error,
+          busy: creating,
+          inputRef: keyInputRef,
+          onSubmit: (value) => void submitOpencodeKey(value),
+          onSubmitAnonymous: () => void submitAnonymous(),
+          onClose: () => setKeyModal(null),
         })
       : null);
 }
@@ -3124,6 +3231,190 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
       })))));
 }
 
+/**
+ * 「本机 OpenAI 网关」弹窗。
+ *
+ * 展示三件用户配外部客户端时真正需要的信息：**开关**、**对外地址**、**密钥在哪**。
+ *
+ * ⚠️ 三条约束：
+ * 1. **地址只在真监听时显示**：端口可被 `DSH_OPENAI_GATEWAY_PORT` 改过，
+ *    没在监听时回显一个连不上的地址比不显示更糟。
+ * 2. **不在这里显示 API Key 本身**：密钥是凭据，弹窗里明文展示等于把凭据复制到
+ *    剪贴板/截图里。只告诉用户它存在哪、由哪个环境变量覆盖。
+ * 3. **状态全部来自宿主侧**（`gateway.getEnabled`），前端不拿 `enabled` 自行
+ *    推导运行态 —— 端口冲突与 env 停用都会让两者不一致。
+ */
+function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
+  const [copied, setCopied] = React.useState(false);
+  const [revealed, setRevealed] = React.useState(false);
+  const [modelsOpen, setModelsOpen] = React.useState(false);
+  const [idsCopied, setIdsCopied] = React.useState(false);
+  const apiKey = status?.apiKey ?? null;
+  const models = status?.models ?? [];
+
+  // 每次重新打开/换密钥后复位：否则上一条「已复制」会挂在新密钥旁边误导用户。
+  React.useEffect(() => { setCopied(false); setRevealed(false); }, [status?.apiKey?.value]);
+  React.useEffect(() => { setIdsCopied(false); }, [models.length]);
+
+  React.useEffect(() => {
+    const onKeyDown = (event) => { if (event.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  /**
+   * 复制密钥。失败（无 Clipboard API / 非用户手势 / 权限被拒）必须给回退：
+   * 直接把密钥显示出来让用户手动选中，否则就是「点了没反应」。
+   */
+  const handleCopy = async () => {
+    if (!apiKey) return;
+    const ok = await copyToClipboard(apiKey.value);
+    if (ok) {
+      setCopied(true);
+      return;
+    }
+    setRevealed(true);
+    setCopied(false);
+  };
+
+  /**
+   * 复制全部模型 ID（每行一个）。
+   *
+   * 失败时展开列表让用户手动选中 —— 与密钥同理，不能「点了没反应」。
+   */
+  const handleCopyModelIds = async () => {
+    const text = formatModelIdList(models);
+    if (!text) return;
+    const ok = await copyToClipboard(text);
+    setIdsCopied(ok);
+    if (!ok) setModelsOpen(true);
+  };
+
+  const disabled = gatewaySwitchDisabled(status);
+  const action = status?.enabled ? '关闭' : '打开';
+
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
+  },
+  React.createElement('div', {
+    className: 'dim-jh-modal',
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': '本机 OpenAI 网关',
+  },
+  React.createElement('div', { className: 'dim-jh-modalHead' },
+    React.createElement('div', { className: 'dim-jh-modalTitle' },
+      React.createElement('strong', null, '本机 OpenAI 网关')),
+    React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        title: '重新读取网关状态。',
+        onClick: () => void onReload(),
+      }, '刷新'),
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'data-kind': 'primary',
+        onClick: onClose,
+      }, '完成'))),
+  React.createElement('div', { className: 'dim-jh-modalBody' },
+    React.createElement('label', { className: 'dim-jh-modelRow' },
+      React.createElement('span', { className: 'dim-jh-modelInfo' },
+        React.createElement('strong', { className: 'dim-jh-modelName' }, '启用本机网关'),
+        React.createElement('code', { className: 'dim-jh-modelId' },
+          action + '（在 127.0.0.1 监听，供 Pi / Continue / Cline / OpenCode 等客户端调用）')),
+      React.createElement('input', {
+        type: 'checkbox',
+        className: 'dim-jh-switch',
+        role: 'switch',
+        checked: status?.enabled === true,
+        // 被 env 停用时禁用而非「点了没反应」：让用户做一次明知无效的操作更困惑。
+        disabled: disabled || busy,
+        'aria-label': action + '本机网关',
+        onChange: () => void onToggle(!(status?.enabled === true)),
+      })),
+    gatewayStatusLines(status).map((line, index) =>
+      React.createElement('p', { key: `status-${index}`, className: 'dim-jh-modalHint' }, line)),
+    // 凭据区：默认**不**渲染明文（设置页会被截图/录屏/投屏）。点「复制」直接
+    // 进剪贴板；复制失败（无 Clipboard API、非用户手势、权限被拒）则退回显示
+    // 明文供手动选中 —— 绝不能变成「点了没反应」。
+    React.createElement('p', { className: 'dim-jh-modalHint' },
+      '鉴权用 Authorization: Bearer <网关 API Key>。'),
+    apiKey
+      ? React.createElement('div', { className: 'dim-jh-modelPanelActions', style: { marginTop: '4px' } },
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          'data-kind': 'primary',
+          title: '把密钥复制到剪贴板。明文会进入剪贴板历史，注意别在不信任的机器上这么做。',
+          onClick: () => void handleCopy(),
+        }, copied ? '已复制 ✓' : '复制 API Key'),
+        revealed
+          ? React.createElement('code', {
+            className: 'dim-jh-modelId',
+            style: { userSelect: 'all' },
+          }, apiKey.value)
+          : React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: '自动复制不可用时用它显示明文，供手动选中。',
+            onClick: () => setRevealed(true),
+          }, '显示明文'))
+      : null,
+    React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayApiKeyHint(apiKey)),
+
+    // ── 模型目录 ──
+    // 存在的理由：有些 agent（ZCode 等）**不会**主动扫 `/v1/models`，要靠用户
+    // 手工把 ID 填进配置。而该端点需要 Bearer 头，浏览器地址栏直接打开只会得到
+    // 401 —— 所以清单必须出现在设置页里。
+    React.createElement('p', { className: 'dim-jh-modalHint', style: { marginTop: '16px' } },
+      React.createElement('strong', null, '模型 ID（可用的完整清单）')),
+    React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayModelsHint(models, status?.modelsSource)),
+    React.createElement('div', { className: 'dim-jh-modelPanelActions', style: { marginTop: '4px' } },
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'data-kind': 'primary',
+        disabled: models.length === 0,
+        title: '把全部模型 ID 每行一个复制到剪贴板。',
+        onClick: () => void handleCopyModelIds(),
+      }, idsCopied ? '已复制 ✓' : `复制全部 ${models.length} 个 ID`),
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'aria-expanded': modelsOpen ? 'true' : 'false',
+        onClick: () => setModelsOpen(open => !open),
+      }, modelsOpen ? '收起' : '展开清单')),
+    modelsOpen
+      ? React.createElement('div', { className: 'dim-jh-modelList', style: { marginTop: '6px' } },
+        models.map(model => {
+          // 「可发图片」只标在支持的那个上 —— 用户据此挑模型，而不是靠撞一次
+          // unsupported_content 才知道。数据来自宿主，与 /v1/models 同源。
+          const badge = modelCapabilityBadge(model);
+          return React.createElement('div', { key: model.id, className: 'dim-jh-modelRow' },
+            React.createElement('span', { className: 'dim-jh-modelInfo' },
+              React.createElement('code', { className: 'dim-jh-modelId' }, model.id),
+              React.createElement('span', { className: 'dim-jh-modelName' }, model.name),
+              badge
+                ? React.createElement('span', { className: 'dim-jh-modelBadge', title: '该模型接受图片输入。' }, badge)
+                : null));
+        }))
+      : null,
+    React.createElement('p', { className: 'dim-jh-modalHint' },
+      '也可以用命令行查看同一份目录（地址栏直接打开会返回 401，因为它需要 Bearer 头）：'),
+    React.createElement('code', {
+      className: 'dim-jh-modelId',
+      style: { display: 'block', marginTop: '4px', userSelect: 'all' },
+    }, gatewayModelsCurl(gatewayEndpoint(status))),
+    React.createElement('p', { className: 'dim-jh-modalHint' },
+      '网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 —— 真正的隔离靠密钥，'
+      + '不要把它配置进任何浏览器端工具或扩展。'),
+    notice
+      ? React.createElement('div', {
+        className: 'dim-jh-probeNotice',
+        'data-tone': notice.tone,
+        role: notice.tone === 'error' ? 'alert' : 'status',
+        style: { marginTop: '10px' },
+      }, React.createElement('div', null, notice.text))
+      : null)));
+}
+
 export function JetHubPage({ close, rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
@@ -3162,8 +3453,65 @@ export function JetHubPage({ close, rpcCall }) {
    * 用户就看不到自己刚做的那个操作的结果了。
    */
   const [providerNotice, setProviderNotice] = React.useState(null);
+  /**
+   * 本机网关的开关面板可见性与状态。
+   *
+   * ⚠️ `gatewayStatus` 初值为 `null`（= 未知），**不能**默认成「已开启」：
+   * 未知时按钮文字与开关都必须退化成中性态，否则一次读取失败就会让 UI 显示
+   * 「网关开着」而用户其实连不上。判据见 `openai-gateway-panel.js`。
+   */
+  const [showGateway, setShowGateway] = React.useState(false);
+  const [gatewayStatus, setGatewayStatus] = React.useState(null);
+  const [gatewayBusy, setGatewayBusy] = React.useState(false);
+  const [gatewayNotice, setGatewayNotice] = React.useState(null);
   const mounted = React.useRef(true);
   React.useEffect(() => () => { mounted.current = false; }, []);
+
+  /**
+   * 读取网关状态。
+   *
+   * 失败**不抛**、也不把 `gatewayStatus` 置成任何「像是有值」的状态：保持
+   * `null` 让 UI 退化成「读取中/未知」，并在提示条里说明原因。
+   */
+  const loadGatewayStatus = React.useCallback(async () => {
+    try {
+      const res = await rpcCall('gateway.getEnabled', {});
+      if (!mounted.current) return;
+      setGatewayStatus(res);
+    } catch (caught) {
+      console.error('[jet-hub] read gateway status failed:', caught);
+      if (!mounted.current) return;
+      setGatewayStatus(null);
+      setGatewayNotice({ tone: 'error', text: '读取网关状态失败：' + (caught?.message || '未知错误') });
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => { void loadGatewayStatus(); }, [loadGatewayStatus]);
+
+  /**
+   * 打开/关闭网关。
+   *
+   * ⚠️ **不做乐观更新**：网关是否真在监听取决于端口占用与环境变量两件前端看不见
+   * 的事，本地先改会让开关显示「已开启」而实际没跑起来。一律以服务端回传为准。
+   */
+  const toggleGateway = React.useCallback(async (nextEnabled) => {
+    setGatewayBusy(true);
+    setGatewayNotice(null);
+    try {
+      const res = await rpcCall('gateway.setEnabled', { enabled: nextEnabled });
+      if (!mounted.current) return;
+      setGatewayStatus(res);
+      setGatewayNotice({ tone: 'ok', text: gatewayToggleNotice(res, nextEnabled) });
+    } catch (caught) {
+      console.error('[jet-hub] toggle gateway failed:', caught);
+      if (!mounted.current) return;
+      // 保留原状态：重新拉一次以确保与服务端一致。
+      setGatewayNotice({ tone: 'error', text: '操作失败：' + (caught?.message || '未知错误') });
+      await loadGatewayStatus();
+    } finally {
+      if (mounted.current) setGatewayBusy(false);
+    }
+  }, [rpcCall, loadGatewayStatus]);
 
   /**
    * 读取全部供应商的汇总状态。
@@ -3433,7 +3781,7 @@ export function JetHubPage({ close, rpcCall }) {
     React.createElement('header', { className: 'dim-jh-header' },
       React.createElement('div', { className: 'dim-jh-brand' },
         React.createElement('strong', { className: 'dim-jh-brandName' }, 'Jet Hub'),
-        React.createElement('p', { className: 'dim-jh-brandDesc' }, 'Provider 凭据管理与多账号支持')),
+        React.createElement('p', { className: 'dim-jh-brandDesc' }, '提供商凭据与多账号管理')),
       React.createElement('div', { className: 'dim-jh-headerActions' },
         // 「供应商开关」在页头，而不是左侧每个供应商行尾（!25 的原形态）：
         // 它是破坏性批量操作，与「选择看哪个供应商」这个高频无害动作分开摆放，
@@ -3448,7 +3796,12 @@ export function JetHubPage({ close, rpcCall }) {
             + '关闭一个供应商 = 关闭它的全部模型并停用它的全部账号。',
           'aria-haspopup': 'dialog',
           'aria-expanded': showProviderSwitches ? 'true' : 'false',
-          onClick: () => setShowProviderSwitches(true),
+          onClick: () => {
+            // 与网关弹窗互斥：两者都是 position:fixed 的全屏覆盖层，
+            // 同时打开会叠在一起，而 ESC 只关掉后挂载的那个。
+            setShowGateway(false);
+            setShowProviderSwitches(true);
+          },
         }, '供应商'),
         // 一键签到在备份/恢复**左侧**（需求指定位置）
         React.createElement('button', {
@@ -3464,6 +3817,20 @@ export function JetHubPage({ close, rpcCall }) {
           // 递增版号强制重新挂载，让账号列表与模型目录立即反映新状态。
           onImported: () => setVersion(v => v + 1),
         }),
+        // 本机网关开关。⚠️ 文字刻意只写「网关」（见「供应商」按钮上方的同款
+        // 注释）：页头按钮排成一行，长文字会把右端「关闭」挤到第二行。
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          title: gatewayButtonTitle(gatewayStatus),
+          'aria-haspopup': 'dialog',
+          'aria-expanded': showGateway ? 'true' : 'false',
+          onClick: () => {
+            setShowProviderSwitches(false);
+            setShowGateway(true);
+            setGatewayNotice(null);
+            void loadGatewayStatus();
+          },
+        }, gatewayButtonLabel(gatewayStatus)),
         close ? React.createElement('button', {
           className: 'dim-jh-btn',
           onClick: close,
@@ -3520,6 +3887,18 @@ export function JetHubPage({ close, rpcCall }) {
           onToggle: toggleProvider,
           onReload: loadProviderStatuses,
           onClose: () => setShowProviderSwitches(false),
+        })
+      : null,
+    // 同款做法：网关开关也是覆盖层，且与「供应商开关」互斥 —— 两者都是
+    // `position: fixed` 的全屏弹窗，同时打开会叠在一起、ESC 只关掉后挂载的那个。
+    showGateway
+      ? React.createElement(GatewayPanel, {
+          status: gatewayStatus,
+          busy: gatewayBusy,
+          notice: gatewayNotice,
+          onToggle: toggleGateway,
+          onReload: loadGatewayStatus,
+          onClose: () => setShowGateway(false),
         })
       : null);
 }

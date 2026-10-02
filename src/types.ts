@@ -1,4 +1,5 @@
 import type { DpopPrivateJwk } from './oauth.js'
+import type { BadgePreference } from './badge-preferences.js'
 
 /** snap-manager ticket 端点响应的传输格式。 */
 export interface CodeArtsCredentialResponse {
@@ -72,6 +73,32 @@ export interface ProviderAccountEntry {
    * 缺省/0 = 使用凭据原始 `device_id`，既有账号行为完全不变。
    */
   traeCheckinDeviceGeneration?: number
+  /**
+   * **opencode** 账号的出口代理（空/缺省 = 直连）。
+   *
+   * ⚠️ 代理是**账号维度**的：一个 NAT 后的多台 PC 共享同一出口 IP，而
+   * OpenCode Zen 的匿名通道按**出口 IP** 限流、认证通道按**账号**限流，
+   * 故「让各账号真正分开」只能给各账号各配一条出口。
+   *
+   * 空串是合法值（= 用户显式清除了代理，回到「与其它无代理账号共享本机
+   * 出口」），**不可**用 falsy 判据把它与「未设置」混为一谈 ——
+   * 那会让面板上的「清除代理」点了没反应。
+   */
+  opencodeProxy?: string
+  /**
+   * **opencode** 账号的指纹代次（见 `src/opencode.ts` 的 `deriveProjectId`）。
+   *
+   * 只存**整数代次**而非指纹本体：project id 由 `(api_key, generation)`
+   * 唯一决定，用户点「轮换」时 +1 即可整体换一份新 project id，
+   * 无需让调用方拼哈希（与 `traeCheckinDeviceGeneration` 同款取舍）。
+   *
+   * ⚠️ 接线层必须**以本字段为权威**重新派生 project id（`max(本字段,
+   * 凭据内代次)`），不能直接透传凭据里的 `fingerprint` ——
+   * 否则代次涨了而 project id 不变，且不报错，是最难排查的一类静默失效。
+   *
+   * 缺省/0 = 用凭据里派生的初始指纹。
+   */
+  opencodeFingerprintGeneration?: number
 }
 
 /** 账号详细状态（返回给 Client 展示） */
@@ -316,6 +343,15 @@ export interface RpcCreditsClaimSummary {
   alreadyClaimed: number
   inactive: number
   failed: number
+  /**
+   * 其中**能证明「今天这一轮已被处理」**的条数（`claimed` + `alreadyClaimed`
+   * 里 `coversToday !== false` 的那些）。
+   *
+   * ⚠️ 它**不是** `claimed + alreadyClaimed`：那两项里可能混着「刷新前那一轮」的
+   * 痕迹（Qoder 活动 10:00 UTC+8 才刷新），拿它们记账会导致当天新额度整天漏领。
+   * 判据见 `src/credits.ts` 的 `ClaimOutcomeCommon.coversToday`。
+   */
+  coversToday: number
 }
 /** RPC: 一键领取积分响应 */
 export interface RpcCreditsClaimAllResponse {
@@ -795,6 +831,92 @@ export interface RpcProviderSetEnabledResponse {
   accounts: number
 }
 
+/**
+ * RPC: 本机 OpenAI 网关状态。
+ *
+ * ⚠️ 三个字段必须**分开回传**，不能只回一个 `enabled`：设置页里的开关读的是
+ * `enabled`（用户的选择），而端口是否真的在监听取决于另外两个条件 ——
+ * `blockedByEnv` 为真时，用户的选择**不会**让网关跑起来（`env` 是运维级
+ * 停用，优先级更高）。只回一个布尔会让 UI 显示「已打开」而实际没监听，
+ * 用户完全无从判断该改哪里。
+ */
+export interface RpcGatewayStatusResponse {
+  /** 用户在设置页里的选择（持久化状态）。 */
+  enabled: boolean
+  /** 当前是否真的在监听端口。 */
+  running: boolean
+  /** 是否被 `DSH_OPENAI_GATEWAY_ENABLED` 显式停用（此时设置页改开关无效）。 */
+  blockedByEnv: boolean
+  /** 实际监听地址；未运行或被 env 停用时为 `null`。 */
+  address: { host: string; port: number } | null
+  /**
+   * 网关正在使用的凭据。
+   *
+   * ⚠️ 明文密钥。网关尚未创建过实例时为 `null`（例如被 env 停用、或插件刚
+   * 启动还没起过网关），此时设置页应提示「启用后自动生成」而**不是**编一个
+   * 占位串 —— 复制出去必然 401，比不给更让人困惑。
+   */
+  apiKey: RpcGatewayApiKey | null
+  /**
+   * 当前可用的模型 ID 列表（`provider/模型名`）。
+   *
+   * 存在的理由：**有些 agent 不会主动扫描模型目录**（如 ZCode），要靠用户
+   * 手工把 ID 填进它的配置。而 `/v1/models` 需要 Bearer 鉴权，浏览器地址栏
+   * 直接打开只会得到 401 —— 用户在设置页外没有任何途径看到这些 ID。
+   *
+   * ⚠️ 无凭据的 provider 已在采集阶段被跳过，故不会出现在这里。
+   */
+  models: RpcGatewayModel[]
+  /**
+   * 目录是从哪来的 —— 用于在清单为空时**说清原因**。
+   *
+   * ⚠️ 这个字段存在的唯一理由：此前 `models: []` 只有一种含义，用户看到
+   * 「还没有可用模型」就去检查自己的登录，而真实原因可能是宿主根本没给出任何
+   * 可枚举的 provider（插件加载异常）。空状态必须能自解释。
+   *
+   * - `catalog`：来自 `ctx.llm.listProviders()`（权威，正常路径）
+   * - `adapters`：该方法不可用，退化为用本插件已注册的适配器 key 枚举
+   * - `none`：两者都拿不到，目录必然为空
+   */
+  modelsSource: 'catalog' | 'adapters' | 'none'
+}
+
+/** RPC: 网关可用的模型条目（设置页内嵌展示用）。 */
+export interface RpcGatewayModel {
+  /** 可直接填进 agent 配置的完整 ID（`provider/模型名`）。 */
+  id: string
+  /** 模型展示名，仅供人辨认。 */
+  name: string
+  /**
+   * 模型接受的输入模态（如 `['text']`、`['text','image']`）。
+   *
+   * 设置页据此标出**哪些模型能发图片** —— 不标的话用户只能靠撞一次
+   * `unsupported_content` 才知道。缺省为 `['text']`（与各适配器「不声明即
+   * 保守按 text 处理」一致）。
+   */
+  input: readonly string[]
+}
+
+/** RPC: 本机 OpenAI 网关开关写入请求。 */
+export interface RpcGatewaySetEnabledRequest {
+  enabled: boolean
+}
+
+/**
+ * RPC: 网关凭据信息。
+ *
+ * ⚠️ 这是**明文凭据**，只应回传给调用方用于展示/复制，**不得**写进日志。
+ * 单独成类型是为了让「拿到它」这件事在代码里显式可见，便于 review 时留意。
+ */
+export interface RpcGatewayApiKey {
+  /** 密钥本体。 */
+  value: string
+  /** 是否来自 `DSH_OPENAI_GATEWAY_API_KEY`（此时 UI 不该显示文件路径）。 */
+  fromEnv: boolean
+  /** 密钥文件路径；`fromEnv` 为真时为 `null`。 */
+  path: string | null
+}
+
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
   access_key_id: string
@@ -1007,4 +1129,169 @@ export interface RpcCaptchaContributeRequest {
 /** RPC: 内部载体回传 param 的结果（`false` = 没进槽，client 可决定要不要重试）。 */
 export interface RpcCaptchaContributeResponse {
   accepted: boolean
+}
+
+/**
+ * ========================================
+ * 用量徽标（模型选择器旁）
+ * ========================================
+ *
+ * 一个端点回答「当前选中的渠道还剩多少」，供会话输入区那枚徽标使用：
+ * 折叠态给一个数字（订阅优先 / 积分兜底），展开后给逐账号明细。
+ *
+ * ⚠️ 与 `credits.balances` 的关系：**读数是同一份**（本端点内部直接复用
+ * `credits.balances` 的实现），差别有三处 ——
+ * 1. 只返回**启用**账号（停用账号不计入合计，另给 `disabledCount` 说明）；
+ * 2. 多带一份订阅读数（窗口 / 套餐），形状由 `badge-subscription.ts` 判定；
+ * 3. 结果带**宿主侧 TTL 缓存**（`cached` 标出来），因为徽标会按分钟轮询，
+ *    而余额是逐账号打上游的（见 `collectCreditBalances` 的「顺序查询」）。
+ */
+
+/** RPC: 读取用量徽标读数。 */
+export interface RpcUsageBadgeRequest {
+  /** 渠道 id（与 provider id 同名，即模型选择器里的路由 id）。 */
+  provider: string
+  /** `true` = 绕过宿主 TTL 缓存（手动刷新、签到之后用）。 */
+  force?: boolean
+}
+
+/**
+ * 套餐读数（**折叠态只显示一条**，故每个账号先折算成一条）。
+ *
+ * ⚠️ 与窗口式订阅（Cline）是**两种形态**，不要合并：
+ * 窗口答「各时间窗用掉百分之几」，套餐答「这份套餐还剩多少额度」。
+ */
+export interface RpcUsageBadgePlanReading {
+  /** 展示名：套餐包名，或「整个余额即套餐」时的固定名（见 `badge-subscription.ts`）。 */
+  name: string
+  remaining: number
+  total: number
+  /** 额度单位（`credits` / `token`），渲染标签与数字格式化都按它走。 */
+  unit: string
+  /** 扣费截止（毫秒）；缺省 = 服务端未下发（**不是**已过期）。 */
+  deductionEndTime?: number
+}
+
+/** 套餐读数：一个账号一条（`plan` 为 `null` = 该账号没有可用套餐包）。 */
+export interface RpcUsageBadgePlanAccount {
+  accountId: string
+  nickname: string
+  plan: RpcUsageBadgePlanReading | null
+  /** 余额本身查询失败时的原因（与 `plan: null` 严格区分）。 */
+  error?: string
+}
+
+/** 订阅读数：窗口（Cline）或套餐（Qoder / ZCode / 两个 buddy）。 */
+export type RpcUsageBadgeSubscription =
+  | { kind: 'windows'; accounts: RpcClineQuotaAccount[] }
+  | { kind: 'plan'; accounts: RpcUsageBadgePlanAccount[] }
+
+/** RPC: 用量徽标读数响应。 */
+export interface RpcUsageBadgeResponse {
+  /** 回显请求的渠道（前端并发切换时据此对号，避免把 A 的读数画到 B 上）。 */
+  provider: string
+  /** 宿主**生成**这份读数的时刻（毫秒）；UI 的「更新于」用它，不用到达时刻。 */
+  generatedAt: number
+  /** `true` = 命中宿主 TTL 缓存（这一轮没有真的打上游）。 */
+  cached: boolean
+  /** 逐账号余额（**仅启用账号**），形状与 `credits.balances` 一致。 */
+  accounts: RpcCreditsBalanceAccount[]
+  /** 被停用而**未计入**的账号数（弹窗脚注说明用；为 0 时不渲染脚注）。 */
+  disabledCount: number
+  /** 临时 / 长期分桶的窗口天数（沿用 `credits.balances` 的口径）。 */
+  windowDays?: number
+  /** 订阅读数；该渠道没有订阅数据、或订阅查询失败时**整个字段缺席**。 */
+  subscription?: RpcUsageBadgeSubscription
+  /** 当前生效的显示偏好（顺带回传，省一次往返）。 */
+  preference: BadgePreference
+  /**
+   * 「每日首次启动自动签到」的实时状态（顺带回传，供弹窗右上角那盏状态灯）。
+   *
+   * ⚠️ 与 `preference` 同理**不进 TTL 缓存**：`running` / `ranToday` 会在宿主
+   * 后台任务跑起来后变化，缓存住会让界面一直停在旧状态（看起来像「开关点了没反应」）。
+   */
+  autoCheckin: RpcUsageAutoCheckinState
+}
+
+/**
+ * RPC: 读写「用量徽标显示偏好」。
+ *
+ * ⚠️ `preference` **省略 = 只读**；给出时必须是 `auto` / `subscription` /
+ * `credits` 三者之一 —— 非法值一律 `bad-request`，**不做**静默回落
+ *（回落会让「设置没生效」看起来像「保存成功」）。读取侧的容错在
+ * `sanitizeBadgePreference`，那里面对的是**磁盘上的脏数据**，不是用户输入。
+ */
+export interface RpcUsageBadgePreferenceRequest {
+  preference?: BadgePreference
+}
+
+/** RPC: 用量徽标显示偏好响应（回显写入后的生效值）。 */
+export interface RpcUsageBadgePreferenceResponse {
+  preference: BadgePreference
+}
+
+/**
+ * 「每日首次启动自动签到」的实时状态。
+ *
+ * 语义要点（用户 2026-10-02 的需求：「每日第一次打开 DSH 可以按照这个状态是否
+ * 自动签到，并记录签到状态，不多次重复触发」）：
+ * - 开关是**全局**的（不分渠道），作用范围是**全部有账号的渠道**；
+ * - 「今天」按 **UTC+8** 日界算（各渠道的每日额度都按 UTC+8 结算）；
+ * - `lastDate` 就是「不多次重复触发」的凭据：等于今天 ⇒ 当天不再自动跑。
+ */
+export interface RpcUsageAutoCheckinState {
+  /**
+   * 开关是否打开。默认**打开**（`auto-checkin.ts` 的 `DEFAULT_AUTO_CHECKIN`：
+   * 用户 2026-10-02 明确要求「自动签到默认保持打开」）。⚠️ 本注释早于那次
+   * 决定、写的是「默认关闭」，已按实现更正 —— 改默认值前先改这里，别让注释
+   * 与实现分家（那正是本 PR 审查发现的一处矛盾）。
+   */
+  enabled: boolean
+  /** 上次**完成**自动签到的 UTC+8 日期（`YYYY-MM-DD`）；空串 = 从未跑过。 */
+  lastDate: string
+  /** 今天是否已经自动签到过（`lastDate` 等于今天）。 */
+  ranToday: boolean
+  /** 正在执行中（刚打开开关会立刻跑一轮，此时为 true）。 */
+  running: boolean
+  /** 上次结果摘要（中文短句，展示在状态灯提示里）。 */
+  lastResult: string
+  /** 上次跑完的时刻（毫秒）；0 = 从未跑过。面板上的时间戳用它。 */
+  lastAt: number
+  /**
+   * **逐渠道**结果（顺序即遍历顺序，文本形如 `2 个 +800` / `今天已领` /
+   * `无签到接口` / `出错`）。
+   *
+   * 用户 2026-10-02：「自动签到状态下，下方应该也显示文字状态，这样才能够知道
+   * 各个渠道的签到状态」—— 汇总句看不出是哪个渠道，故这里给逐渠道明细。
+   */
+  channels: Array<{ provider: string; text: string }>
+  /**
+   * 用户是否已手动关闭那行**常驻**的自动签到状态文字。
+   *
+   * ⚠️ 判据是「关闭的是当前这一轮」：新一轮跑出结果后自动变回 `false`
+   *（否则用户关过一次就再也看不到新结果了）。
+   */
+  dismissed: boolean
+}
+
+/**
+ * RPC: 读写「每日首次启动自动签到」开关，以及关闭常驻状态文字。
+ *
+ * ⚠️ `enabled` 与 `dismiss` 都**省略 = 只读**；给出时必须是布尔值 —— 非法值一律
+ * `bad-request`，**不做**静默回落（与本仓库 `usage.badgePreference` 同口径：
+ * 回落会让「设置没生效」看起来像「保存成功」）。磁盘脏数据的容错在
+ * `sanitizeAutoCheckin`。
+ * ⚠️ 打开开关时宿主会**立刻尝试一轮**（今天已跑过则内部拦住）：否则用户今天点了
+ * 开关要等到明天才有动作，看起来像没生效。
+ * ⚠️ `dismiss: true` 只关掉**当前这一轮**的状态文字（下一轮结果会重新出现）——
+ * 手动签到的结果提示是按时自动消失的，两者语义不同，别合并。
+ */
+export interface RpcUsageAutoCheckinRequest {
+  enabled?: boolean
+  dismiss?: boolean
+}
+
+/** RPC: 自动签到开关响应（回显写入后的生效状态）。 */
+export interface RpcUsageAutoCheckinResponse {
+  autoCheckin: RpcUsageAutoCheckinState
 }

@@ -75,6 +75,16 @@ export class AccountPool {
    * 详见 `src/permanent-lock-store.ts` 的文件头。
    */
   private permanentLockCache: PermanentLockMap = {}
+  /**
+   * 「本机 OpenAI 网关」开关的进程内副本。
+   *
+   * 缺键语义是**启用**（与 `jet-hub-store.ts` 的 `sanitizeGatewayEnabled`
+   * 同一方向）：老用户升级后网关行为与升级前完全一致，不会被静默关掉。
+   *
+   * ⚠️ 与 {@link permanentLockCache} 不同，它**不需要**独立文档：丢失本键
+   * 的唯一后果是回到默认启用，用户再关一次即可。
+   */
+  private gatewayEnabledCache = true
   /** 是否已完成首次载入。 */
   private loaded = false
   /**
@@ -105,6 +115,8 @@ export class AccountPool {
       // 黑名单是后来才加入的字段：老文档里没有它，缺失时保持空表
       // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
       this.modelCache = state.disabledModels
+      // 网关开关同理：老文档没有该键 → 保持默认启用。
+      this.gatewayEnabledCache = state.gatewayEnabled !== false
     }
     this.loadLocks(state)
   }
@@ -184,6 +196,9 @@ export class AccountPool {
         accounts: this.cache,
         disabledModels: this.modelCache,
         ...this.lockFields(),
+        // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
+        // 分两次快照会让同一份文档里的字段互相矛盾。
+        gatewayEnabled: this.gatewayEnabledCache,
       })
     })
     this.storeChain = next.catch(() => {})
@@ -229,6 +244,37 @@ export class AccountPool {
   listDisabledModels(provider: string): Record<string, boolean> {
     this.ensureLoaded()
     return { ...(this.modelCache[provider] ?? {}) }
+  }
+
+  /**
+   * 「本机 OpenAI 网关」当前是否启用。
+   *
+   * 缺键语义为**启用**（老用户升级后行为不变），见
+   * {@link gatewayEnabledCache}。
+   */
+  gatewayEnabled(): boolean {
+    this.ensureLoaded()
+    return this.gatewayEnabledCache
+  }
+
+  /**
+   * 打开/关闭本机 OpenAI 网关并落盘。
+   *
+   * ⚠️ 这里**只改状态**，不负责启停 HTTP server —— 真正的启停由
+   * `src/openai-gateway/runtime.ts` 在调用方做完持久化后接手。两者分开是为了
+   * 让「存开关」与「跑进程」各自可单测，且启停失败不会把已写入的开关回滚成
+   * 看似没生效的样子。
+   */
+  async setGatewayEnabled(enabled: boolean): Promise<void> {
+    this.ensureLoaded()
+    if (this.gatewayEnabledCache === enabled) return
+    this.gatewayEnabledCache = enabled
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，网关开关仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
   }
 
   /**
@@ -1000,6 +1046,74 @@ export class AccountPool {
   traeCheckinDeviceGenerationFor(accountId: string): number {
     const entry = this.readAccounts().find(a => a.id === accountId)
     const value = entry?.traeCheckinDeviceGeneration
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+  }
+
+  /**
+   * 设置/清除某 opencode 账号的出口代理。
+   *
+   * ⚠️ **空串是合法输入**（用户显式清除代理 → 回到「与其它无代理账号共享
+   * 本机出口」），故这里**不能**用 `if (!proxy) return` 早退，否则「清除」
+   * 按钮点了会静默无效。清除时**删键**而不是写空串，避免下游把空串误当成
+   * 「配了一个空地址」。
+   *
+   * 与 `updateModelRateLimit` 同款：在**最新快照**上做局部合并后整体写回，
+   * 避免与并发的账号操作互相覆盖。
+   */
+  async setOpencodeProxy(accountId: string, proxy: string): Promise<void> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] setOpencodeProxy: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const next = [...accounts]
+    const entry = { ...next[idx]! }
+    if (proxy.trim().length === 0) delete entry.opencodeProxy
+    else entry.opencodeProxy = proxy
+    next[idx] = entry
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 账号 ${accountId} 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+    )
+  }
+
+  /** 读取某 opencode 账号的代理（未设置时为空串）。 */
+  opencodeProxyFor(accountId: string): string {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    return entry?.opencodeProxy ?? ''
+  }
+
+  /**
+   * 记录 opencode 指纹轮换代次。
+   *
+   * ⚠️ 只接受**比现值更大**的代次：乱序/重复回调把代次写回小值会让用户
+   * 以为已轮换、实际指纹没换（TRAE 同款判据，见 `updateTraeCheckinDeviceGeneration`）。
+   */
+  async updateOpencodeFingerprintGeneration(accountId: string, generation: number): Promise<void> {
+    if (!Number.isFinite(generation) || generation <= 0) return
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] updateOpencodeFingerprintGeneration: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const current = accounts[idx]!.opencodeFingerprintGeneration ?? 0
+    if (generation <= current) return
+    const next = [...accounts]
+    next[idx] = { ...next[idx]!, opencodeFingerprintGeneration: generation }
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(`[jet-hub] 账号 ${accountId} 指纹代次 → ${generation}`)
+  }
+
+  /** 读取 opencode 指纹代次（未设置时为 0）。 */
+  opencodeFingerprintGenerationFor(accountId: string): number {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    const value = entry?.opencodeFingerprintGeneration
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
   }
 
