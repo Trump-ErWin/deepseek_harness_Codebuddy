@@ -150,6 +150,15 @@ const STYLES = `
 .dim-jh-btn[data-kind="danger"]:hover:not(:disabled) { color: #b3261e; border-color: #d93025; background: rgb(217 48 37 / 6%); }
 .dim-jh-btn:disabled { opacity: 0.5; cursor: default; }
 
+/* ZCode 登录渠道选择（BigModel 国内 / z.ai 国际）。
+   ⚠️ 与 .dim-jh-btn 同高（26px ≈ 18 行高 + 4×2 padding + 1×2 border），
+   且 margin-right:auto 把它推到工具栏左侧、其余按钮仍靠右 —— 这样它
+   在视觉上是「新建账号」的前置选项，而不是又一个并列动作。 */
+.dim-jh-zcProvider { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); }
+.dim-jh-zcSelect { box-sizing: border-box; height: 26px; padding: 0 6px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 8px; background: var(--dsw-alias-bg-layer-3, #fff); color: var(--dsw-alias-label-primary, #1f2329); font-size: 12px; line-height: 18px; cursor: pointer; }
+.dim-jh-zcSelect:disabled { opacity: 0.5; cursor: default; }
+.dim-jh-zcSelect:focus-visible { outline: none; border-color: #1677ff; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 20%, transparent); }
+
 /* 纯图标按钮（如「领取新手任务」的礼物图标）。
    ⚠️ 存在的理由：.dim-jh-accountActions 是 flex-wrap: nowrap，
    行内已有 5 个文字按钮，再加一个「领取新手任务」会被挤出容器（用户报障）。

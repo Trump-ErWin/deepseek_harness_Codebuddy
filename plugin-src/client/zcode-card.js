@@ -414,13 +414,17 @@ function ZcodeProviderCardBody({ rpcCall }) {
    *  ⚠⚠ **`reused` 分支必判**：本机已有可用凭据时，后端**不新建条目、不返回 loginUrl**
    *  （用户报障「点了添加就多一个」的修复）。若只看 `loginUrl` 为空就报
    *  「后端未返回登录地址」，会把一次成功操作显示成失败。 */
-  const createAccount = async () => {
+  const createAccount = async (forceNew) => {
     // ⚠ 已有一轮登录在跑时直接忽略（真实缺陷）：`busy` 曾在返回 loginUrl 后立刻清零，
     // 按钮随即恢复可点，再点一次会叠加第二个轮询 + 宿主再插一条占位账号。
     if (pollRef.current !== 0) return;
     setBusy('create'); setNotice(null);
     try {
-      const res = await call('account.create', { provider: PROVIDER, zcodeProvider }) || {};
+      const res = await call('account.create', {
+        provider: PROVIDER,
+        zcodeProvider,
+        ...(forceNew === true ? { forceNew: true } : {}),
+      }) || {};
       if (!mounted.current) return;
       const { accountId, loginUrl, reused } = res;
       if (reused) {
@@ -515,9 +519,17 @@ function ZcodeProviderCardBody({ rpcCall }) {
 
   // 三键共用：任一键在跑、或 rpcCall 缺失时一律禁用。
   const disabled = busy !== null || typeof rpcCall !== 'function';
-  const btn = (key, idle, running, onClick, extra) =>
-    h('button', { className: 'dim-jh-zcBtn', disabled, onClick, ...extra },
-      busy === key ? running : idle);
+  /**
+   * ⚠️ `busyKey` 与 `idleKey` 分开：两个登录按钮（添加账号 / 登录其他账号）
+   * 共用同一个 `busy='create'`（`createAccount` 只置这一个值），若按同一个
+   * key 判文案，未点击的那个会永远显示「登录中…」。
+   */
+  const btn = (idleKey, idle, running, onClick, extra) => {
+    const isLoginBtn = idleKey === 'create' || idleKey === 'create-new';
+    const runningNow = busy === (isLoginBtn ? 'create' : idleKey);
+    return h('button', { className: 'dim-jh-zcBtn', disabled, onClick, ...extra },
+      runningNow ? running : idle);
+  };
 
   /** 折叠行右侧：账号数 + **号池两模型总额度**（用户明确要求「右边应该显示号池两个
    *  模型的总额度」）。放这里而不是身体里，是为了**折叠态也能一眼看到**。
@@ -582,7 +594,10 @@ function ZcodeProviderCardBody({ rpcCall }) {
             },
               h('option', { value: 'bigmodel' }, 'BigModel（国内）'),
               h('option', { value: 'zai' }, 'z.ai（国际）'))),
-          btn('create', '添加账号', '登录中…', createAccount),
+          btn('create', '添加账号', '登录中…', () => createAccount(false)),
+          // 「登录其他账号」：跳过后端两道复用检查，用于本机已登录的账号已在池里时
+          // 再登第二个。⚠️ 授权页仍复用浏览器登录态 —— 需先登出或用无痕窗口。
+          btn('create-new', '登录其他账号', '登录中…', () => createAccount(true)),
           // ⚠ 必须包一层：`refreshCredits` 的第一个形参是 `silent`，直接把函数交给
           //   onClick 会把**事件对象**当 silent（真值）传进去 ⇒ 点按钮反而静默无提示。
           btn('refresh', '刷新积分', '查询中…', () => refreshCredits(false)),

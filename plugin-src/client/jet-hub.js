@@ -1705,6 +1705,14 @@ function ProviderPanel({ provider, rpcCall }) {
   const [phase, setPhase] = React.useState('loading');
   const [error, setError] = React.useState(null);
   const [creating, setCreating] = React.useState(false);
+  /**
+   * ZCode 登录渠道（仅 `provider === 'zcode'` 时用）。
+   *
+   * ZCode 服务端支持两个 OAuth provider，授权页与凭据落点都不同：
+   * `bigmodel`（智谱开放平台，国内）与 `zai`（z.ai 国际版）。
+   * 缺省 `bigmodel`，与后端 `req.zcodeProvider ?? 'bigmodel'` 对齐。
+   */
+  const [zcodeProvider, setZcodeProvider] = React.useState('bigmodel');
   // 正在进行的限流操作：null | 'one' | 'all'。用于禁用按钮并显示进度。
   const [probeBusy, setProbeBusy] = React.useState(null);
   // 上一次重测/重置的结果文案（成功或失败）。
@@ -2112,7 +2120,7 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
-  const createAccount = async () => {
+  const createAccount = async (forceNew) => {
     // ⚠ 已有一轮登录在跑时直接忽略（真实缺陷）：`creating` 在返回 loginUrl 后
     // 会被 `finally` 无条件释放，按钮随即恢复可点，再点一次会叠加第二个轮询 +
     // 宿主再插一条占位账号。以轮询句柄作为重入闸门，比 UI 的 disabled 更可靠。
@@ -2129,8 +2137,12 @@ function ProviderPanel({ provider, rpcCall }) {
     let accountId = '';
     let loginUrl = '';
     try {
-      console.log('[jet-hub] account.create request, provider =', provider);
-      const res = await rpcCall('account.create', { provider });
+      console.log('[jet-hub] account.create request, provider =', provider, 'forceNew =', forceNew === true);
+      // ZCode 带渠道（`bigmodel` 国内 / `zai` 国际）与「强制新建」；
+      // 其余 provider 两个字段都不带（后端逐字节不变）。
+      const res = await rpcCall('account.create', provider === 'zcode'
+        ? { provider, zcodeProvider, ...(forceNew === true ? { forceNew: true } : {}) }
+        : { provider });
       console.log('[jet-hub] account.create response =', res);
       accountId = res.accountId;
       loginUrl = res.loginUrl;
@@ -2539,13 +2551,44 @@ function ProviderPanel({ provider, rpcCall }) {
               ? '处理中…'
               : (permanentLocked ? '解锁永久积分' : '锁定永久积分'))
           : null,
+        // ZCode 登录渠道：必须在「+ 新建账号」**之前**，且登录进行中时禁用
+        // （换渠道决定弹哪个授权页，中途改会与正在轮询的那一轮不一致）。
+        provider === 'zcode'
+          ? React.createElement('label', {
+              className: 'dim-jh-zcProvider',
+              title: 'ZCode 登录渠道：BigModel（智谱开放平台，国内）或 z.ai（国际版）。'
+                + '两个渠道的授权页与凭据各自独立，可用它登录另一个账号。',
+            },
+            '渠道',
+            React.createElement('select', {
+              className: 'dim-jh-zcSelect',
+              value: zcodeProvider,
+              disabled: creating,
+              onChange: (event) => setZcodeProvider(event.target.value),
+            },
+              React.createElement('option', { value: 'bigmodel' }, 'BigModel（国内）'),
+              React.createElement('option', { value: 'zai' }, 'z.ai（国际）')))
+          : null,
         React.createElement('button', {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
           title: '通过浏览器登录一个新的账号并加入账号池。',
-          onClick: () => void createAccount(),
+          onClick: () => void createAccount(false),
           disabled: creating,
-        }, creating ? '正在登录…' : '+ 新建账号'))),
+        }, creating ? '正在登录…' : '+ 新建账号'),
+        // 「登录其他账号」：跳过后端的两道复用检查，用于**本机已登录的账号
+        // 已在池里**时再登第二个（否则后端直接返回 reused，浏览器都不开）。
+        // ⚠️ 授权页仍复用浏览器登录态 —— 提示里写明需先登出或用无痕窗口。
+        provider === 'zcode'
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: '再登录一个不同的 ZCode 账号。'
+                + '若授权页直接跳过了登录（复用浏览器已有登录态），'
+                + '请先在浏览器登出该站点，或用无痕窗口打开授权链接。',
+              onClick: () => void createAccount(true),
+              disabled: creating,
+            }, '登录其他账号')
+          : null)),
     probeNotice
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
