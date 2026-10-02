@@ -293,6 +293,12 @@ function ZcodeProviderCardBody({ rpcCall }) {
   const [busy, setBusy] = React.useState(null); // 三键共用，值为正在跑的键
   const [notice, setNotice] = React.useState(null);
   const [manualLoginUrl, setManualLoginUrl] = React.useState(null);
+  /**
+   * 登录渠道：ZCode 服务端支持两个 OAuth provider，授权页与凭据落点都不同
+   * （`bigmodel` → bigmodel.cn 国内；`zai` → chat.z.ai 国际版）。
+   * 缺省 `bigmodel`，与后端 `req.zcodeProvider ?? 'bigmodel'` 对齐。
+   */
+  const [zcodeProvider, setZcodeProvider] = React.useState('bigmodel');
   const mounted = React.useRef(false);
   const call = React.useCallback((endpoint, payload) => rpcCall(endpoint, payload), [rpcCall]);
   /** 登录轮询的定时器（0 = 没在跑）。⚠ 必须能被**卸载清理**拿到 —— 见下面 useEffect。 */
@@ -414,7 +420,7 @@ function ZcodeProviderCardBody({ rpcCall }) {
     if (pollRef.current !== 0) return;
     setBusy('create'); setNotice(null);
     try {
-      const res = await call('account.create', { provider: PROVIDER }) || {};
+      const res = await call('account.create', { provider: PROVIDER, zcodeProvider }) || {};
       if (!mounted.current) return;
       const { accountId, loginUrl, reused } = res;
       if (reused) {
@@ -562,6 +568,20 @@ function ZcodeProviderCardBody({ rpcCall }) {
                     busy, onDelete: deleteAccount,
                   }))),
         h('div', { className: 'dim-jh-zcActions' },
+          /**
+           * 登录渠道选择。⚠️ 必须在「添加账号」**之前**、且登录进行中时禁用 ——
+           * 换渠道会决定弹哪个授权页，中途改会与正在轮询的那一轮不一致。
+           */
+          h('label', { className: 'dim-jh-zcProvider' },
+            '渠道',
+            h('select', {
+              className: 'dim-jh-zcSelect',
+              value: zcodeProvider,
+              disabled: busy !== null,
+              onChange: (event) => setZcodeProvider(event.target.value),
+            },
+              h('option', { value: 'bigmodel' }, 'BigModel（国内）'),
+              h('option', { value: 'zai' }, 'z.ai（国际）'))),
           btn('create', '添加账号', '登录中…', createAccount),
           // ⚠ 必须包一层：`refreshCredits` 的第一个形参是 `silent`，直接把函数交给
           //   onClick 会把**事件对象**当 silent（真值）传进去 ⇒ 点按钮反而静默无提示。

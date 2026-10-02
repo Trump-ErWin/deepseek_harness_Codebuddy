@@ -471,6 +471,11 @@ const STYLES = `
 .dim-jh-zcBtn[data-kind="primary"]:hover:not(:disabled) { border-color: var(--dsw-alias-button-primary-hover); background: var(--dsw-alias-button-primary-hover); }
 .dim-jh-zcBtn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dsw-alias-border-l3); }
 .dim-jh-zcBtn:disabled { opacity: .4; cursor: default; }
+/* 登录渠道选择（BigModel 国内 / z.ai 国际）—— 与按钮同高，靠左不参与右对齐 */
+.dim-jh-zcProvider { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; color: var(--dsw-alias-label-secondary); font-size: 12px; line-height: 18px; }
+.dim-jh-zcSelect { box-sizing: border-box; height: 28px; padding: 0 8px; border: .5px solid var(--dsw-alias-border-l3); border-radius: 14px; background: 0 0; color: var(--dsw-alias-label-primary); font-size: 12px; line-height: 18px; cursor: pointer; }
+.dim-jh-zcSelect:disabled { opacity: .4; cursor: default; }
+.dim-jh-zcSelect:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dsw-alias-border-l3); }
 
 .dim-jh-zcEmpty { padding: 2px 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
 .dim-jh-zcEmpty p { margin: 0 0 4px; }

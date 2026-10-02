@@ -172,6 +172,102 @@ describe('ZCode 登录：③ 轮询', () => {
     expect(outcome.kind).toBe('failed')
   })
 
+  /**
+   * `zai`（chat.z.ai 国际版）登录的 ready 响应把第三方 token 放在 `data.zai`
+   * 而不是 `data.bigmodel`。
+   *
+   * 权威依据是官方 bundle 的 ready 解析器（`zcode.cjs` 的 `W7s`），它只读
+   * `data.zai.access_token` 并把 `zai` 作为**通用**第三方凭据分支。
+   *
+   * 历史缺陷：解析器把 `bigmodel.access_token` 写成**必需**，于是 `zai` 登录
+   * 在「缺关键字段」处失败 —— 用户拿到授权却存不进凭据。
+   */
+  it('★ status=ready 且只有 data.zai → 解析成功（zai 登录）', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      code: 0,
+      data: {
+        status: 'ready',
+        token: 'zai-jwt-token',
+        user: { user_id: '88321783240281243', name: 'zai 用户' },
+        zai: { access_token: 'zai-access', refresh_token: 'zai-refresh' },
+      },
+    }), { status: 200 })) as unknown as typeof fetch
+    const outcome = await pollZcodeLogin(flow, fetchImpl)
+    expect(outcome.kind).toBe('ready')
+    if (outcome.kind === 'ready') {
+      expect(outcome.result.zcodeJwt).toBe('zai-jwt-token')
+      expect(outcome.result.zaiAccessToken).toBe('zai-access')
+      // bigmodel 侧必须留空，不能把 zai 的 token 张冠李戴
+      expect(outcome.result.bigmodelAccessToken).toBeUndefined()
+      expect(outcome.result.bigmodelRefreshToken).toBe('zai-refresh')
+      expect(outcome.result.userId).toBe('88321783240281243')
+    }
+  })
+
+  it('★ data.zai 与 data.bigmodel 同时存在 → 两者各自解析（不互相覆盖）', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      code: 0,
+      data: {
+        status: 'ready',
+        token: 'jwt',
+        user: { user_id: 'u1' },
+        zai: { access_token: 'zai-tok' },
+        bigmodel: { access_token: 'bm-tok' },
+      },
+    }), { status: 200 })) as unknown as typeof fetch
+    const outcome = await pollZcodeLogin(flow, fetchImpl)
+    expect(outcome.kind).toBe('ready')
+    if (outcome.kind === 'ready') {
+      expect(outcome.result.zaiAccessToken).toBe('zai-tok')
+      expect(outcome.result.bigmodelAccessToken).toBe('bm-tok')
+    }
+  })
+
+  it('★ 两个第三方块都缺 → failed（不能拿半截凭据当成功）', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      code: 0, data: { status: 'ready', token: 't', user: { user_id: 'u' } },
+    }), { status: 200 })) as unknown as typeof fetch
+    const outcome = await pollZcodeLogin(flow, fetchImpl)
+    expect(outcome.kind).toBe('failed')
+  })
+
+  it('★ startZcodeLogin 透传 provider=zai（授权页走 chat.z.ai）', async () => {
+    let seenBody: unknown
+    const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      seenBody = JSON.parse(String(init?.body))
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          flow_id: 'flow-zai',
+          authorize_url: 'https://chat.z.ai/api/oauth/authorize?client_id=x',
+          expires_at: Math.floor(Date.now() / 1000) + 600,
+          poll_interval_sec: 2,
+        },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+    const flowZai = await startZcodeLogin(fetchImpl, { provider: 'zai' })
+    expect(seenBody).toEqual({ provider: 'zai' })
+    expect(flowZai.authorizeUrl).toContain('chat.z.ai')
+  })
+
+  it('★ startZcodeLogin 缺省 provider 仍为 bigmodel（既有行为不变）', async () => {
+    let seenBody: unknown
+    const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      seenBody = JSON.parse(String(init?.body))
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          flow_id: 'flow-bm',
+          authorize_url: 'https://bigmodel.cn/login?appId=zcode',
+          expires_at: Math.floor(Date.now() / 1000) + 600,
+          poll_interval_sec: 2,
+        },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+    await startZcodeLogin(fetchImpl)
+    expect(seenBody).toEqual({ provider: 'bigmodel' })
+  })
+
   it('★ 网络抖动 → pending（**不算失败**，否则会误报授权失败）', async () => {
     const fetchImpl = vi.fn(async () => { throw new Error('socket hang up') }) as unknown as typeof fetch
     expect((await pollZcodeLogin(flow, fetchImpl)).kind).toBe('pending')
