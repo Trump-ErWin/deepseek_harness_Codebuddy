@@ -228,6 +228,8 @@ export interface ZcodeCredential {
   user_id?: string
   /** 大模型 access token（`oauth:bigmodel:access_token`），备用身份。 */
   bigmodel_access_token?: string
+  /** 大模型 access token（`oauth:zai:access_token`），`zai` 登录时填这里。 */
+  zai_access_token?: string
   /** Coding Plan api-key（zai 侧），仅 ultra 通道需要。 */
   coding_plan_key_zai?: string
   /** Coding Plan api-key（bigmodel 侧），仅 ultra 通道需要。 */

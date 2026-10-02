@@ -1702,7 +1702,11 @@ function registerJetHubEndpoints(
               return { ok: true, value: { accountId: holder, loginUrl: '', reused: true } }
             }
           }
-          const started = await zcode.startLogin({ refName })
+          const started = await zcode.startLogin({
+            refName,
+            // ⚠️ 缺省 `'bigmodel'`（既有行为不变）；`'zai'` 走 chat.z.ai 国际版。
+            provider: req.zcodeProvider ?? 'bigmodel',
+          })
           // 先登记占位条目（无凭据），使前端 `login.poll` 能立即看到该账号；
           // 登录成功后再回填昵称。失败则删除占位条目。
           await pool.addAccount({

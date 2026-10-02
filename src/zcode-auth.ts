@@ -51,7 +51,7 @@ import { buildCarrierPageHtml } from './zcode-carrier-page.js'
 import { captchaDemand, captchaSupplyStats, setCaptchaDemand } from './captcha-supply.js'
 import { SerialQueue } from './serial-queue.js'
 import { TtlCache } from './ttl-cache.js'
-import { generateDeviceMid, runZcodeLogin } from './zcode-login.js'
+import { generateDeviceMid, runZcodeLogin, type ZcodeLoginProvider } from './zcode-login.js'
 import {
   claimZcodePlan,
   fetchZcodeBalance,
@@ -657,7 +657,7 @@ export class ZcodeAuth extends Service {
    * ⚠ 与本文件其它方法不同，这个方法**不是幂等的**：每次调用都会向
    * 服务端申请一条新的授权流程。前端只在用户点「添加账号」时调一次。
    */
-  async startLogin(options: { refName?: string; appVersion?: string } = {}): Promise<{
+  async startLogin(options: { refName?: string; appVersion?: string; provider?: ZcodeLoginProvider } = {}): Promise<{
     loginUrl: string | undefined
     result: Promise<{ refName: string; credential: ZcodeCredential }>
   }> {
@@ -681,6 +681,7 @@ export class ZcodeAuth extends Service {
       const loginResult = await runZcodeLogin({
         fetchImpl: this.fetchImpl,
         appVersion: options.appVersion ?? this.product.appVersionFallback,
+        provider: options.provider,
         onAuthorizeUrl: (url) => resolveUrl(url),
       })
       /** 登录成功后组装凭据，并生成**自用**的 device_mid（见下）。 */
@@ -706,7 +707,19 @@ export class ZcodeAuth extends Service {
          * 同一账号重新登录会变（见 `zcode.ts` 的字段注释）。
          */
         ...loginResult.userId.length > 0 ? { user_id: loginResult.userId } : {},
-        bigmodel_access_token: loginResult.bigmodelAccessToken,
+        /**
+         * 第三方 access token：按登录 provider 落在对应字段。
+         *
+         * ⚠ 两者**都可能是 `undefined`**（只会有其一），故用条件展开而不是
+         * 直接赋值 —— 否则会给凭据写进 `bigmodel_access_token: undefined`
+         * 这样的键。该字段只作**备用身份**，不参与推理（推理用 `zcode_jwt`）。
+         */
+        ...loginResult.bigmodelAccessToken !== undefined
+          ? { bigmodel_access_token: loginResult.bigmodelAccessToken }
+          : {},
+        ...loginResult.zaiAccessToken !== undefined
+          ? { zai_access_token: loginResult.zaiAccessToken }
+          : {},
         account_label: loginResult.displayName,
         /**
          * 账号名与脱敏手机号（供账号卡片展示，见 `src/zcode.ts` 的字段注释）。

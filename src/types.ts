@@ -159,6 +159,19 @@ export interface RpcCreateAccountRequest {
    * 不需要手机号；Loomy 走**短信验证码**登录，故须由前端先收集。
    */
   phone?: string
+  /**
+   * 登录渠道（**仅 ZCode 需要**）。
+   *
+   * ZCode 服务端支持两个 OAuth provider，凭据落点不同（见
+   * `zcode-login.ts` 的 `ZCODE_LOGIN_PROVIDER` 注释）：
+   *
+   * - `'bigmodel'`（缺省）：智谱开放平台（国内），授权页 `bigmodel.cn`
+   * - `'zai'`：z.ai 国际版，授权页 `chat.z.ai`
+   *
+   * ⚠️ **缺省必须视为 `'bigmodel'`**：既有调用方不传该字段，
+   * 行为必须逐字节不变。
+   */
+  zcodeProvider?: 'bigmodel' | 'zai'
 }
 export interface RpcCreateAccountResponse {
   accountId: string
