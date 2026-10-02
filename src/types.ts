@@ -159,6 +159,36 @@ export interface RpcCreateAccountRequest {
    * 不需要手机号；Loomy 走**短信验证码**登录，故须由前端先收集。
    */
   phone?: string
+  /**
+   * 登录渠道（**仅 ZCode 需要**）。
+   *
+   * ZCode 服务端支持两个 OAuth provider，凭据落点不同（见
+   * `zcode-login.ts` 的 `ZCODE_LOGIN_PROVIDER` 注释）：
+   *
+   * - `'bigmodel'`（缺省）：智谱开放平台（国内），授权页 `bigmodel.cn`
+   * - `'zai'`：z.ai 国际版，授权页 `chat.z.ai`
+   *
+   * ⚠️ **缺省必须视为 `'bigmodel'`**：既有调用方不传该字段，
+   * 行为必须逐字节不变。
+   */
+  zcodeProvider?: 'bigmodel' | 'zai'
+  /**
+   * 强制新建账号（**仅 ZCode 需要**）。
+   *
+   * 后端默认会做两道复用检查（收编孤儿条目 / 本机凭据已在池里就复用），
+   * 目的是修「点一次添加就多一条」。但那两道检查**在渠道判断之前**，
+   * 于是也挡住了「同一个人想加第二个账号」—— 本机官方客户端登的账号
+   * 已在池里时，点「新建账号」直接返回 `reused`，浏览器都不开。
+   *
+   * `true` ⇒ 跳过这两道，直接走 OAuth。
+   *
+   * ⚠️ 跳过复用不等于能拿到第二个账号：授权页仍复用浏览器登录态，
+   * 用户需先在浏览器登出或用无痕窗口（实测 `bigmodel.cn` / `chat.z.ai`
+   * 都不认 `prompt=login` 之类参数）。
+   *
+   * ⚠️ 缺省 `false`，既有调用方行为逐字节不变。
+   */
+  forceNew?: boolean
 }
 export interface RpcCreateAccountResponse {
   accountId: string

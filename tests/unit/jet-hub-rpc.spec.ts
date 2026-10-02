@@ -848,6 +848,106 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
   })
 
   /**
+   * `forceNew: true` 必须**跳过两道复用检查**，直接走 OAuth。
+   *
+   * ## 为什么需要这个开关（用户报障）
+   *
+   * 两道复用检查（收编孤儿条目 / 本机凭据已在池里就复用）是为「点一次添加
+   * 就多一条」设计的，但它们**在渠道判断之前**，于是把「同一个人想加第二个
+   * 账号」也一并挡掉了：本机官方客户端登的账号已在池里时，点「新建账号」
+   * 直接返回 `{reused:true, loginUrl:''}`，**浏览器根本不开**，用户无从登录
+   * 第二个号。换 `zai` 渠道也一样被挡（复用检查读的是 bigmodel 的凭据文件，
+   * 与渠道无关）。
+   *
+   * 本用例锁死：`forceNew: true` ⇒ 不返回 reused、必须调 `startLogin`。
+   */
+  it('zcode 的 forceNew 跳过复用检查并直接开始登录', async () => {
+    let handler: Handler | undefined
+    let startLoginCalls = 0
+    let adopted = 0
+    const ctx = {
+      get: (key: string) => key === 'connection'
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
+        : undefined,
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      credentials: { resolve: async () => undefined, set: async () => {}, unset: async () => {} },
+    }
+    const pool = {
+      addAccount: async () => {},
+      updateAccount: async () => {},
+      removeAccount: async () => {},
+      listAccounts: async () => [],
+      listAccountsByProvider: async () => [],
+      findAccountIdByIdentityField: async () => 'existing-zcode-account',
+    }
+    const zcode = {
+      async adoptIntoOrphanAccount() { adopted += 1; return undefined },
+      async localCredential() {
+        return { user_id: '88321783240281243', zcode_jwt: 'jwt' }
+      },
+      async startLogin() {
+        startLoginCalls += 1
+        return {
+          loginUrl: 'https://chat.z.ai/api/oauth/authorize?client_id=x',
+          result: new Promise(() => {}),
+        }
+      },
+    }
+    // ⚠️ 位置参数：zcode 是第 13 个（见 registerJetHubRpc 签名）。
+    registerJetHubRpc(
+      ctx as never, pool as never,
+      {} as never, // codearts
+      {} as never, // buddy
+      {} as never, // workbuddy
+      {} as never, // lobsterai
+      {} as never, // qoder
+      {} as never, // qoderCn
+      {} as never, // trae
+      {} as never, // cline
+      {} as never, // loomy
+      {} as never, // raccoon
+      {} as never, // minimax
+      zcode as never, // zcode
+    )
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const invoke = async (payload: Record<string, unknown>) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+          payload: { method: 'account.create', payload },
+        }),
+      }))
+      return (await response.json() as {
+        result: { ok: boolean; value?: { loginUrl?: string; reused?: boolean } }
+      }).result
+    }
+
+    // ① 不带 forceNew：本机凭据已在池里 ⇒ 复用，且**不开**浏览器。
+    //    ⚠️ 这条路径**会**先调 `adoptIntoOrphanAccount`（返回 undefined 表示
+    //    没有可收编的孤儿条目），再落到 `localCredential` 那条 —— 故这里
+    //    收编计数是 1，不是 0。
+    const reused = await invoke({ provider: 'zcode' })
+    expect(reused.ok).toBe(true)
+    expect(reused.value?.reused).toBe(true)
+    expect(reused.value?.loginUrl).toBe('')
+    expect(startLoginCalls, '复用路径不得调 startLogin').toBe(0)
+    expect(adopted, '复用路径会先探一次孤儿条目').toBe(1)
+
+    // ② 带 forceNew：跳过复用 ⇒ 必须真的开始登录。
+    const forced = await invoke({ provider: 'zcode', forceNew: true, zcodeProvider: 'zai' })
+    expect(forced.ok).toBe(true)
+    expect(forced.value?.reused, 'forceNew 不得返回 reused').toBeUndefined()
+    expect(forced.value?.loginUrl).toContain('chat.z.ai')
+    expect(startLoginCalls, 'forceNew 必须调 startLogin').toBe(1)
+    // 关键：跳过复用 ⇒ 连孤儿探测都不该发生（计数仍是 ① 留下的 1）。
+    expect(adopted, 'forceNew 不得走收编路径').toBe(1)
+  })
+
+  /**
    * 前端源码级守卫：`createAccount` 不得再劫持当前页面。
    *
    * 组件无法在单测里渲染（react 不在本仓库依赖内），故与
@@ -858,7 +958,10 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
   it('createAccount 不再用 window.location.href 跳转主页面', () => {
     const here = dirname(fileURLToPath(import.meta.url))
     const source = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
-    const start = source.indexOf('const createAccount = async () => {')
+    // ⚠️ 签名带形参（`async (forceNew) =>`，ZCode 的「登录其他账号」用它跳过复用）。
+    // 按 `const createAccount = async ` 定位，不把形参写进断言 —— 否则每次加参数
+    // 都要改这条守卫，而它真正要守的是**函数体里不得有页面跳转**。
+    const start = source.indexOf('const createAccount = async ')
     expect(start).toBeGreaterThan(-1)
     // 取到下一个顶层函数定义为止，避免把文件其余部分一起扫进来。
     const rest = source.slice(start)
