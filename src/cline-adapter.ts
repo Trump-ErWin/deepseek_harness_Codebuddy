@@ -647,10 +647,11 @@ export class ClineAdapter extends LlmAdapter {
         const tried = new Set<string>()
         if (currentAccountId.length > 0) tried.add(currentAccountId)
         const maxRotate = CLINE_MAX_ROTATE - 1
-        // 最后一次失败的原样信息（状态码 + 上游文案）—— 全部账号都不可用时
-        // 必须把它带给用户，否则「限流」与「额度耗尽」在 UI 上长得一模一样，
-        // 用户（和排障的人）都无从判断该等还是该去充值。
-        let lastFailure = `HTTP ${response.status} ${errorDetail(errorText)}`.trim()
+        // ⚠️ 不再拼「最后一次失败的原样信息」：它会把上游英文整句复述进最终错误，
+        // 而 `clineExhaustedAdvice` 已把语义（限流 / 当日免费额度 / 额度耗尽）用
+        // 中文说清 —— 两遍叠加会让消息变成其它 provider 的两三倍长
+        // （用户 2026-10-03 报障「这个报告和其它的供应商比起来是不是太长了」）。
+        // 上游原文只在**没识别出语义**时由那个函数附上（见 src/cline-rate-limit.ts）。
         /**
          * 记下「刚失败的那个账号被限流到什么时候」。
          *
@@ -690,7 +691,6 @@ export class ClineAdapter extends LlmAdapter {
             return
           }
           errorText = await response.text().catch(() => '')
-          lastFailure = `HTTP ${response.status} ${errorDetail(errorText)}`.trim()
           if (!isClineRotatableFailure(response.status, errorText)) break
         }
         // 循环退出前最后失败的那个账号（见 markLimited 的注释）。
@@ -705,8 +705,10 @@ export class ClineAdapter extends LlmAdapter {
             ? clineRateLimitResetAt(response, errorText, options.model)
             : undefined,
         )
+        // ⚠️ 文案要短（用户报障「比其它供应商长」）：前缀只说「哪个模型、账号都用完了」，
+        // 其余全部交给 `clineExhaustedAdvice` —— 原始报文不再出现在这里。
         throw new LlmError(
-          `cline: 模型 ${options.model} 的所有账号均不可用（${lastFailure}）。${advice}`,
+          `cline: 模型 ${options.model} 的所有账号均不可用 —— ${advice}`,
           'QUOTA_EXCEEDED',
         )
       }

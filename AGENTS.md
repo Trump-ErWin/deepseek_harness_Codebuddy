@@ -7587,7 +7587,7 @@ POST https://api.cline.bot/api/v1/chat/completions   model=cline-free/deepseek-v
 
 | 形态 | 判据（报文原文） | 正确动作 | 处理 |
 |---|---|---|---|
-| **当日免费额度** | `Daily free limit reached` + `Try again in 19h 39m` | **等不到头**；改用同一账号的**另一个免费模型** | 标记 = 服务端给的时长；文案点明「按天结算 + 按模型单独计算」 |
+| **当日免费额度** | `Daily free limit reached` + `Try again in 19h 39m` | **等不到头**；改用同一账号的**另一个免费模型** | 标记 = 服务端给的时长；文案只说「按天结算、按模型单独计 + 预计 N 小时后重置 + 可先改用其它免费模型」 |
 | **短时限流** | `Rate limit exceeded` 一类 | 等一会儿 / 换账号 | 标记 = 报文时长 → 头 → 兜底 1 小时 |
 | **402 额度耗尽** | `Insufficient credits` | 去 app.cline.bot 充值 | **不写倒计时**（但仍换号） |
 
@@ -7643,7 +7643,7 @@ POST /api/v1/chat/completions  model=cline-pass/deepseek-v4.1-flash
 | 1 | 标记时长取值序：`retry-after` 头（秒数 / HTTP 日期，**0 是合法值**）→ **报文里的 `Try again in 19h 39m`** → 通用绝对时刻句式 → 兜底快照 | `src/cline-rate-limit.ts` 的 `clineRateLimitResetAt` |
 | 2 | `recordsClineRateLimit` **只认 429**（402 不写徽章，但仍换号 —— 「不写徽章 ≠ 不换号」） | 同上 |
 | 3 | cline 的 `resolveCredential` 接上 `throwIfAllAccountsRateLimited(CLINE, modelId)`，且**必须先于**单凭据 ref 兜底 | `src/index.ts` |
-| 4 | 全部账号失败时报错带**最后一笔的状态码 + 上游文案**，并按「免费额度 / 短时限流 / 402」给**三种不同**建议 | `clineExhaustedAdvice` |
+| 4 | 全部账号失败时按「免费额度 / 短时限流 / 402」给**三种不同**建议；**识别出语义就不再复述上游原文**（只在没识别出时附上），文案保持简短 | `clineExhaustedAdvice` |
 | 5 | 每个失败账号（含最后一个）都写标记 | `cline-adapter.ts` 的 `markLimited` |
 
 ⚠️ **这三件事收敛在 `src/cline-rate-limit.ts` 一处**（原先 `clineExhaustedAdvice` /
@@ -7653,6 +7653,47 @@ POST /api/v1/chat/completions  model=cline-pass/deepseek-v4.1-flash
 `2 minutes` 里的 `m`，少了它会把 2 分钟算成 4 分钟（时长直接翻倍）。
 ⚠️ 共享的全局正则**每次用前重置 `lastIndex`**（`matchAll` 会复制 `lastIndex`），
 否则第二次调用的结果随调用次数漂移。
+
+### ⚠️ 报错**文案的长度**也是需求（真实报障第三次，2026-10-03）
+
+用户原话：「可以，cline 显示正常，不过这个报告和其它的供应商比起来是不是太长了？改简短点吧。」
+
+**病根不是话说错，而是同一件事说了两遍**：
+
+```
+cline: 模型 cline-free/deepseek-v4.1-flash 的所有账号均不可用（HTTP 429 Error 429: Daily free
+limit reached on model deepseek/deepseek-v4.1-flash. Try again in 19h 39m）。这是该模型的**当日
+免费额度**已用尽（HTTP 429 Daily free limit reached）—— 免费额度按天结算、且**按模型单独
+计算**，盯着它等不会提前恢复，服务端给出的解禁时刻是 2026/10/4 18:49:21（约 18.7 小时后）。
+要立刻继续，可改用**同一个账号的另一个免费（cline-free/*）模型**，或换其它 provider / 账号
+```
+
+`（…）` 里那段是**上游英文原文**，后面的中文又把它解释了一遍 —— 两者信息完全重叠，
+消息长度因此是其它 provider 的两三倍（对照：`lobsterai` 的
+`模型 X 所有账号均不可用（明细）` ≈ 60 字符、`codearts` 的额度文案 ≈ 100 字符）。
+
+⚠️ 第二个坑：**错误气泡不渲染 markdown**，`**加粗**` 会**原样显示星号**
+（用户截图里就是 `**当日免费额度**`）。错误消息只能写纯文本。
+
+**修法**（`clineExhaustedAdvice`）：
+
+| # | 规矩 | 判据 |
+|---|---|---|
+| 1 | **识别出语义就不再复述原文**（免费额度 / 402 两种都识别得出），只留「是什么 + 何时恢复 + 现在改用什么」 | 单测 `not.toContain('Daily free limit reached')` |
+| 2 | **没识别出语义时仍附原文**（那是唯一排障线索） | 单测 `toContain('Rate limit exceeded')` |
+| 3 | 纯文本，不用 `**` | 单测 `not.toContain('**')` |
+| 4 | 长度上限：单条建议 < 100 字符、最终 `error.message` < 150 字符 | 单测的长度断言（改文案别撑回去） |
+
+改后同一条消息：**135 字符**（原 ≈ 270）。
+
+```
+cline: 模型 cline-free/deepseek-v4.1-flash 的所有账号均不可用 —— 当日免费额度已用尽（HTTP 429），
+预计 19.7 小时后重置（2026/10/4 19:49:20）；额度按天结算、按模型单独计 —— 可先改用其它免费模型
+```
+
+⚠️ **代价**：这条路径的报文**不进请求记录**（`stream()` 在 `consumeWithLog` 之前就抛了），
+所以「原文」不再出现在任何面向用户的地方 —— 排障时按本文件上方那节的思路重跑一次直连探针即可
+（`parseClineRateLimitHint` 只认 `Daily free limit reached` 这个标记，得到的中文结论是可反推的）。
 
 ### 余额查询「fetch failed」是**另一回事**（不是本次改动造成的）
 
@@ -7671,8 +7712,8 @@ POST /api/v1/chat/completions  model=cline-pass/deepseek-v4.1-flash
 `Daily free limit` / 单位可省略 / 多段累加 / `2 minutes` 不翻倍 / `0s` 合法 / 句末无关数字
 不计数 / 非 JSON 与 `{error:"…"}` 外壳 / 取值优先级四条 / 三种建议话术）、
 `cline-adapter.spec.ts` 的「限流标记」段（8 条：429+头 → 用 600 秒 / 429 无头 → 1 小时快照 /
-HTTP 日期 / **★ 实测报文 → 19h39m 且文案含「按天结算」与 `cline-pass`** /
-**★ 轮次用尽时最后一个账号也被标记** / 402 不写标记且文案含「充值」/ 报错含状态码与上游原文 /
+HTTP 日期 / **★ 实测报文 → 19h39m，且文案**不含**原文、含「按天结算」「按模型单独计」、
+长度 < 150** / **★ 轮次用尽时最后一个账号也被标记** / 402 不写标记且文案含「充值」 /
 无池账号不写标记）、`tests/unit/retry-after.spec.ts`（10 条）、
 `buddy-ratelimit-misreport.spec.ts` 的「cline 同型缺陷」接线段（4 条）。
 ⚠️ 已做**反向验证**：把「报文时长」那条分支短路 → 2 条变红；去掉循环后的补标记 → 2 条变红。

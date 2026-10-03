@@ -155,22 +155,33 @@ describe('clineExhaustedAdvice：三种 429/402 的动作必须分开说', () =>
     expect(advice).toContain('当日免费额度')
     // ⚠️ 必须点出**按天结算**：否则用户仍会以为「再等等就好」。
     expect(advice).toContain('按天结算')
-    // ⚠️ 必须点出**按模型单独计算**：实测同一时刻 mimo / muse-spark 仍 200，
+    // ⚠️ 必须点出**按模型单独计**：实测同一时刻 mimo / muse-spark 仍 200，
     // 故「换另一个免费模型」是真的可用动作。
-    expect(advice).toContain('按模型单独计算')
-    expect(advice).toContain('另一个免费')
+    expect(advice).toContain('按模型单独计')
+    expect(advice).toContain('其它免费模型')
     // ⚠️ **绝不能**建议 cline-pass：那是**订阅**通道，本账号实测
     // 403 ENTITLEMENT_ERROR（有余额但没订阅计划）。
     expect(advice).not.toContain('cline-pass')
     // 解禁时刻要写出来，用户不必自己猜（本地时钟形态；具体时区随机器）。
     expect(advice).toMatch(/\d{4}\/\d{1,2}\/\d{1,2}/)
-    expect(advice).toMatch(/约 \d+(\.\d)? 小时后/)
+    expect(advice).toMatch(/预计 \d+(\.\d)? 小时后重置/)
+    // ⚠️ 不得复述上游英文原文：用户 2026-10-03 报障「比其它供应商长太多」，
+    // 病根就是把这句话和我们的中文解释各说了一遍。
+    expect(advice).not.toContain('Daily free limit')
+    expect(advice).not.toMatch(/Try again in/)
+    // ⚠️ 不得出现 markdown 加粗：错误气泡**不渲染 markdown**，星号会原样显示
+    // （用户截图里就是 `**当日免费额度**`）。
+    expect(advice).not.toContain('**')
+    // 长度上限：与其它 provider 的额度文案同量级（用户明确要求「改简短点」）。
+    expect(advice.length).toBeLessThan(100)
   })
 
-  it('普通 429（短时限流）仍是「等一会儿 / 换账号」', () => {
+  it('普通 429（短时限流）仍是「等一会儿 / 换账号」，且不丢原文（未识别语义才附）', () => {
     const hint = parseClineRateLimitHint(JSON.stringify({ error: { message: 'Rate limit exceeded' } }))
     const advice = clineExhaustedAdvice(429, hint)
     expect(advice).toContain('限流')
+    // 这一支**没有**识别出专门语义，原文必须保留（排障线索）。
+    expect(advice).toContain('Rate limit exceeded')
     expect(advice).not.toContain('cline-pass')
   })
 
