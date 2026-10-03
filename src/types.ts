@@ -317,6 +317,40 @@ export interface RpcRetestResponse {
   clearedCount: number
 }
 
+/**
+ * 「测试」单个账号：**无条件**真发一次请求（不依赖是否存在限流标记）。
+ *
+ * 与 {@link RpcRetestAccountRequest} 的区别是**触发条件**：重测只测那些已经有
+ * `modelRateLimits` 标记的模型（无标记即零请求），测试则不看标记、直接挑一个
+ * 模型发出去。它补齐的是「账号到底还能不能用」在没有历史 429 时**没有手动
+ * 探活入口**的缺口。
+ */
+export interface RpcTestAccountRequest {
+  accountId: string
+  /** 指定要测的模型 id；省略则由服务端推断（见 `testAccount` 的 `testModelFor`）。 */
+  modelId?: string
+}
+
+/**
+ * 「测试」结果。
+ *
+ * ⚠️ 它**不带** `cleared` / `tested` 字段，这是刻意的：测试不写任何存储
+ * （不清标记、不写回新的重置时刻），所以没有「清除了几条」可报。
+ * 结果里的 `resetTimeMs` 仅供展示。
+ */
+export interface RpcTestAccountResponse {
+  accountId: string
+  nickname?: string
+  /** 实际发出请求用的模型 id；推断失败时为空串。 */
+  modelId: string
+  /** 服务端接受并完成了这次请求。 */
+  ok: boolean
+  /** 失败时的可读原因（`仍受限：…` / `无法确认：…`）。 */
+  message?: string
+  /** 失败且上游给出重置时刻时带出（**不落盘**）。 */
+  resetTimeMs?: number
+}
+
 /** 重置单个账号的限流标记（不测试，直接清除）。 */
 export interface RpcResetAccountRequest {
   accountId: string
@@ -472,6 +506,31 @@ export interface RpcCreditsBalanceAccount {
   balance: import('./credits.js').CreditBalance | null
   /** 查询失败的原因，供 UI 提示（成功时为 undefined）。 */
   error?: string
+  /**
+   * 与余额**并列**的附加读数（不属于余额语义，故不塞进 `CreditBalance`）。
+   *
+   * 目前只有 Gemini 用：它的「账号规格」（Google AI Pro / Free）来自
+   * `loadCodeAssist`，与配额是两个端点，但搭同一次 `credits.balances` 回来。
+   * 缺省 = 该 provider 没有附加读数 / 这次没取到 ⇒ 面板不渲染对应行。
+   */
+  extra?: RpcCreditsBalanceExtra
+}
+
+/**
+ * 逐账号附加读数。
+ *
+ * ⚠️ 用**对象**而不是把字段平铺到 {@link RpcCreditsBalanceAccount} 上：
+ * 平铺会让 `usage-badge.ts` / 卡片里所有逐账号形状的断言都跟着膨胀，
+ * 而这类读数注定还会增加（每加一个 provider 就多一批字段）。
+ */
+export interface RpcCreditsBalanceExtra {
+  /**
+   * 账号规格短标签（`Pro` / `Free` / `Ultra`）。
+   *
+   * `title` 放上游原文（`Google AI Pro（g1-pro-tier）`），hover 才看得到
+   * —— 面板空间只够一个词。
+   */
+  accountTier?: { label: string; title: string }
 }
 
 /** RPC: 查询积分余额响应 */

@@ -93,6 +93,30 @@ vi.mock('../../src/zcode-adapter.js', () => {
   return { ZcodeAdapter: MockZcodeAdapter }
 })
 
+vi.mock('../../src/gemini-adapter.js', () => {
+  /**
+   * Gemini 的桩。
+   *
+   * 与 Qoder / ZCode 同理：真实推理链路要带 Google OAuth 凭据打 Cloud Code
+   * 上游，单测里跑不通，故判据取「构造了哪个适配器 + 带了哪份产品配置」。
+   *
+   * ⚠️ 这也是**唯一**能在单测里守住「gemini 没落进 else 分支」的地方：落进
+   * else 意味着拿 Google 的 Bearer 令牌去让 `CodeArtsAdapter` 做华为云
+   * SDK-HMAC-SHA256 签名，请求必然失败，且用户看到的是无法归因的报错。
+   */
+  class MockGeminiAdapter {
+    static readonly instances: Array<{ product?: { id: string } }> = []
+    constructor(options: { product?: { id: string } }) {
+      MockGeminiAdapter.instances.push(options)
+    }
+    // eslint-disable-next-line require-yield
+    async *stream(): AsyncGenerator<never> {
+      throw new LlmError('频率限制', 'RATE_LIMIT')
+    }
+  }
+  return { GeminiAdapter: MockGeminiAdapter }
+})
+
 /**
  * `CodeArtsAdapter` 换成桩，但保留 `isRateLimited` 等**真实导出**。
  *
@@ -169,6 +193,14 @@ async function zcodeInstances(): Promise<Array<{ product?: { id: string } }>> {
     ZcodeAdapter: { instances: Array<{ product?: { id: string } }> }
   }
   return mod.ZcodeAdapter.instances
+}
+
+/** 取 Gemini 桩的构造记录。 */
+async function geminiInstances(): Promise<Array<{ product?: { id: string } }>> {
+  const mod = await import('../../src/gemini-adapter.js') as unknown as {
+    GeminiAdapter: { instances: Array<{ product?: { id: string } }> }
+  }
+  return mod.GeminiAdapter.instances
 }
 
 /**
@@ -383,6 +415,7 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline / zcode 不�
     ;(await codeartsInstances()).length = 0
     ;(await qoderInstances()).length = 0
     ;(await zcodeInstances()).length = 0
+    ;(await geminiInstances()).length = 0
   })
 
   afterEach(() => {
@@ -490,6 +523,41 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline / zcode 不�
     expect(calls).toHaveLength(0)
   })
 
+  /**
+   * gemini 这条与 zcode 同款：写 `modelRateLimits`、落过 else 分支的风险最高
+   * （它是本仓库最新加入的 provider，且**不在** `updateModelRateLimit` 的老名单里，
+   * 新增 provider 漏接 `probeWithAdapter` 的分派表在本仓库已复发四次）。
+   */
+  it('gemini 账号走 GeminiAdapter 而非 CodeArtsAdapter', async () => {
+    const calls = stubFetch()
+    const { retestAccount } = await import('../../src/account-probe.js')
+    const id = 'gemini-1'
+    const result = await retestAccount(makePool([makeEntry({
+      id,
+      provider: 'gemini',
+      credentialRef: 'GEMINI_ACCOUNT_TEST',
+      /**
+       * ⚠️ 必须带上限流标记：`retestAccount` 的探测目标是
+       * `Object.keys(entry.modelRateLimits)`，没有标记时它**根本不会构造适配器**
+       * —— 那样这条用例会变成**假绿**（既抓不到缺陷，也守不住修复）。
+       */
+      modelRateLimits: { 'gemini-3.8-flash': Date.now() + 3_600_000 },
+    })]), id)
+
+    expect(result.tested).toBe(1)
+    expect(result.stillLimited).toHaveLength(1)
+
+    const gemini = await geminiInstances()
+    expect(gemini).toHaveLength(1)
+    // ⚠️ 断言的是 `product.id`（不是「构造了哪个类」）：分派按产品判定，
+    // 带错产品配置会让适配器把请求发到错的端点。
+    expect(gemini[0]?.product?.id).toBe('gemini')
+    // 核心断言：**没有**构造 CodeArtsAdapter（否则就是拿 Google 令牌去做华为云 HMAC 签名）。
+    expect(await codeartsInstances()).toHaveLength(0)
+    // 桩适配器在构造后立刻抛错，故不该有任何真实请求发出。
+    expect(calls).toHaveLength(0)
+  })
+
   it('codearts 账号仍然走 CodeArtsAdapter（else 分支没有被改坏）', async () => {
     const calls = stubFetch()
     const { retestAccount } = await import('../../src/account-probe.js')
@@ -502,6 +570,7 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline / zcode 不�
     expect(await codeartsInstances()).toHaveLength(1)
     // 反向对照：codearts 不该被分派给 Qoder / Cline 的链路。
     expect(await qoderInstances()).toHaveLength(0)
+    expect(await geminiInstances()).toHaveLength(0)
     expect(calls).toHaveLength(0)
   })
 })

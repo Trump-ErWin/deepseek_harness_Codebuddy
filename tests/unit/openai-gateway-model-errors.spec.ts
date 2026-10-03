@@ -39,6 +39,12 @@ describe('looksLikeMissingModel', () => {
     }
   })
 
+  it('认得本插件自己的措辞（gemini 拒绝未知模型名）', () => {
+    // 实测：`gemini/gemini-9.9-fake` 曾静默跑出 3.8 的答案，加上校验后这条
+    // 错误必须也走「模型不存在」通道，否则用户看到的是 502（会被白重试）。
+    expect(looksLikeMissingModel('gemini: 模型 "gemini-9.9-fake" 不在本 provider 目录中（仅支持 gemini-3.8-flash）')).toBe(true)
+  })
+
   it('⚠️ 其它错误不得被误判成模型不存在', () => {
     // 这几条都是真实的 INVALID_REQUEST / 其它失败形态，误判会让用户去查模型名
     // 而真正的参数错误被掩盖。
@@ -48,6 +54,9 @@ describe('looksLikeMissingModel', () => {
       'Billing daily count exceeded',
       'rate limit exceeded',
       'the model returned an internal error',
+      '模型返回了无效内容',
+      '目录服务暂时不可用',
+      'provider 未配置',
       '',
     ]) {
       expect(looksLikeMissingModel(text), text).toBe(false)
@@ -72,6 +81,16 @@ describe('normalizeUpstreamFailure', () => {
     expect(normalizeUpstreamFailure({
       status: 502, type: 'server_error', code: 'SERVER', message: 'upstream exploded',
     })).toEqual({ status: 502, type: 'server_error', code: 'SERVER' })
+  })
+
+  it('本插件自己的「不在目录中」措辞同样翻成 404', () => {
+    const result = normalizeUpstreamFailure({
+      status: 502,
+      type: 'server_error',
+      code: 'INVALID_REQUEST',
+      message: 'gemini: 模型 "gemini-9.9-fake" 不在本 provider 目录中（仅支持 gemini-3.8-flash）',
+    })
+    expect(result).toEqual({ status: 404, type: 'invalid_request_error', code: 'model_not_found' })
   })
 
   it('余额不足等 INVALID_REQUEST 不会被当成模型不存在', () => {

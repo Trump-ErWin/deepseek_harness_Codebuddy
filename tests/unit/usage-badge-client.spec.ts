@@ -572,8 +572,10 @@ describe('用量徽标：号多了以后的两条整理（2026-10-03 用户要�
   })
 
   it('折叠只收明细，**不隐藏结论**（合计在节标题、失败数在脚注，都在折叠之外）', () => {
-    // 合计那一句在折叠逻辑（ordered/hidden/shown）**之前**算好，与展开状态无关
-    const sumBlock = badge.slice(badge.indexOf('const sum = view.groups.map'), badge.indexOf('const { shown, hidden } = orderCreditRows('))
+    // 合计那一句在折叠逻辑（ordered/hidden/shown）**之前**算好，与展开状态无关。
+    // ⚠️ 起点是 `quotaGroup` 那两行：配额单位（Gemini）的 `sum` 走三分支，
+    // 不再是裸的 `const sum = view.groups.map(...)`（见 badge-model.js 的 readingOf）。
+    const sumBlock = badge.slice(badge.indexOf('const quotaGroup = view.groups.find'), badge.indexOf('const { shown, hidden } = orderCreditRows('))
     expect(sumBlock.length).toBeGreaterThan(0)
     expect(sumBlock).toContain('view.groups.map')
     expect(sumBlock).not.toContain('creditsExpanded')

@@ -1031,6 +1031,7 @@ describe('model.list / model.setDisabled 端点', () => {
       {} as never, // raccoon
       {} as never, // minimax
       {} as never, // zcode（2026-09-29 新增，紧随 raccoon）
+      {} as never, // gemini（2026-10-03 新增，追加在 zcode 之后）
       options.modelAdapters as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -2097,6 +2098,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
       {} as never, // raccoon
       {} as never, // minimax
       {} as never, // zcode
+      {} as never, // gemini（新 provider 一律追加在末尾，见 registerJetHubRpc 注释）
       (adapter !== undefined ? { buddy: adapter } : undefined) as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -2387,6 +2389,226 @@ describe('provider.status / provider.setEnabled 端点', () => {
  * 4. **请求记录失败是载荷（`ok:false`）而不是 RPC 错误** ——
  *    面板要保留已加载的行、只在下方显示原因。
  */
+describe('account.test 端点（**无条件**真发一次请求）', () => {
+  type Handler = (request: Request) => Promise<Response>
+
+  /** 一份形状合法的 Gemini 凭据：只要 `access_token` 非空，适配器就会走到 fetch。 */
+  const GEMINI_CREDENTIAL = JSON.stringify({
+    access_token: 'AT-gemini',
+    refresh_token: 'RT-gemini',
+    expiry: '2099-01-01T00:00:00Z',
+    email: 'yinghaolin12@gmail.com',
+  })
+
+  /**
+   * 桩掉全局 `fetch` 并记录 URL。
+   *
+   * ⚠️ **必须在调用 RPC 之前**替换：`probeWithAdapter` 构造适配器时不注入
+   * `fetchImpl`，适配器取的是全局 `fetch`；不桩就会真的把探测消息发到 Google。
+   * 一律回 429，让用例的结论是「仍受限」，但关键在于是**谁**把请求发到了**哪里**。
+   */
+  function stubFetch(): string[] {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      calls.push(String(input))
+      return new Response('{"error":{"code":429,"message":"rate limit exceeded"}}', {
+        status: 429,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+    return calls
+  }
+
+  function setup(options: {
+    /** 初始限流标记；省略 = 账号**没有**任何标记（这正是测试按钮要覆盖的场景）。 */
+    modelRateLimits?: Record<string, number>
+    /** 该 provider 的全量目录；省略则模拟「适配器缺失」（退化到 llm.listModels）。 */
+    catalog?: Array<{ id: string; name: string }>
+    /** 省略 llm 服务，验证「目录读不出来」的降级路径。 */
+    withoutLlm?: boolean
+  } = {}) {
+    let stored: Record<string, unknown> = {
+      accounts: [{
+        id: 'gemini-1',
+        provider: 'gemini',
+        nickname: 'Gemini 测试号',
+        enabled: true,
+        credentialRef: 'GEMINI_ACCOUNT_TEST',
+        createdAt: 1,
+        refreshable: true,
+        ...(options.modelRateLimits === undefined ? {} : { modelRateLimits: options.modelRateLimits }),
+      }],
+    }
+    let handler: Handler | undefined
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? {
+            register: () => ({
+              get: () => stored,
+              replace: async (value: Record<string, unknown>) => { stored = value },
+            }),
+          }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: true, writable: true }),
+        // ⚠️ 必须返回**真凭据**：返回 undefined 时 `makeDefaultProbe` 会以
+        // 「凭据不可用」提前返回，适配器根本不会被构造 —— 那条路径下本组用例
+        // 会变成假绿（断言不到「真发了请求」）。
+        resolve: async () => ({ value: GEMINI_CREDENTIAL }),
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+
+    const adapter = options.catalog === undefined ? undefined : { listAllModels: () => options.catalog! }
+
+    const ctx = {
+      get: (key: string) => {
+        if (key === 'connection') {
+          return { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
+        }
+        if (key === 'llm' && options.withoutLlm !== true) {
+          return { listModels: async (provider: string) => (options.catalog ?? []).map(m => ({ ...m, provider })) }
+        }
+        return undefined
+      },
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      credentials: { resolve: async () => undefined },
+    }
+
+    registerJetHubRpc(
+      // ⚠️ 位置参数（16 个）：漏一个就会让 modelAdapters 错位，判据是
+      // 「目录读不出来 / total 恒为 0」。见上一组用例的详细注释。
+      ctx as never, pool,
+      {} as never, // codearts
+      {} as never, // buddy
+      {} as never, // workbuddy
+      {} as never, // lobsterai
+      {} as never, // qoder
+      {} as never, // qoderCn
+      {} as never, // trae
+      {} as never, // cline
+      {} as never, // loomy
+      {} as never, // raccoon
+      {} as never, // minimax
+      {} as never, // zcode
+      {} as never, // gemini
+      (adapter !== undefined ? { gemini: adapter } : undefined) as never,
+    )
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+          payload: { method, payload },
+        }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { message: string } } }
+      return body.result
+    }
+
+    return { call, storedLimits: () => (stored.accounts as Array<{ modelRateLimits?: Record<string, number> }>)[0]?.modelRateLimits }
+  }
+
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  /**
+   * ⚠️ 这条是本功能的**核心断言**：账号**没有任何限流标记**时，`account.test`
+   * 依然真发了一次请求。
+   *
+   * 对照物是 `account.retest`：它在 `modelIds.length === 0` 处提前返回、零请求
+   * （见 `account-probe.spec.ts` 的「没有任何限流标记时不发请求」）。用户报障
+   * 「重测按钮你确认过会发请求吗，为什么响应这么快？」说的就是那个提前返回。
+   */
+  it('账号没有限流标记时依然真发一次请求（重测在此场景下零请求）', async () => {
+    const calls = stubFetch()
+    const { call } = setup({ catalog: [{ id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' }] })
+
+    const result = await call('account.test', { accountId: 'gemini-1' })
+
+    expect(result.ok).toBe(true)
+    const value = result.value as { modelId: string; ok: boolean; message?: string }
+    expect(value.modelId).toBe('gemini-3.8-flash')
+    // 桩回 429 ⇒ 结论是「仍受限」，但请求确实发出去了。
+    expect(value.ok).toBe(false)
+    expect(value.message).toContain('仍受限')
+    // 核心：请求确实发出去了，且打在 Gemini 的流式端点上。
+    // ⚠️ 次数是 **2** 而不是 1：适配器在 429 时会先**换端点**重试一次
+    // （`gemini-adapter.ts` 的 `endpointSwitched` 分支），daily 与 sandbox
+    // 各打一次。故这里断言「至少一次 + 首次命中 daily」，而不是写死 1。
+    expect(calls.length).toBeGreaterThanOrEqual(1)
+    expect(calls[0]).toContain('daily-cloudcode-pa.googleapis.com')
+    expect(calls[0]).toContain('/v1internal:streamGenerateContent')
+    // 反向：没有任何请求打到 Google 之外的地方（凭据没被发给错的 host）。
+    expect(calls.every((url) => url.includes('googleapis.com'))).toBe(true)
+  })
+
+  it('测试**不写任何存储**：不清标记、不写回新的重置时刻', async () => {
+    const marker = Date.now() + 3_600_000
+    stubFetch()
+    const { call, storedLimits } = setup({
+      modelRateLimits: { 'gemini-3.8-flash': marker },
+      catalog: [{ id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' }],
+    })
+
+    await call('account.test', { accountId: 'gemini-1' })
+
+    // ⚠️ 这是与重测的硬性分野：重测成功会清标记、失败会写回上游新时刻；
+    // 测试必须一个字节都不改（它只是「手动探活」，不改变选号状态）。
+    expect(storedLimits()).toEqual({ 'gemini-3.8-flash': marker })
+  })
+
+  it('有标记时优先测标记里的模型，且**不**去读目录（目录不可用也能测）', async () => {
+    const calls = stubFetch()
+    // withoutLlm + 无适配器 ⇒ fullCatalogIds 必然失败；若实现先读目录，这条会 bad-request。
+    const { call } = setup({ modelRateLimits: { 'gemini-3.8-flash-high': Date.now() + 1000 }, withoutLlm: true })
+
+    const result = await call('account.test', { accountId: 'gemini-1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.value as { modelId: string }).modelId).toBe('gemini-3.8-flash-high')
+    expect(calls.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('显式指定 modelId 时以它为准', async () => {
+    const calls = stubFetch()
+    const { call } = setup({ modelRateLimits: { 'gemini-3.8-flash-low': Date.now() + 1000 } })
+
+    const result = await call('account.test', { accountId: 'gemini-1', modelId: 'gemini-3.8-flash-tiered' })
+
+    expect((result.value as { modelId: string }).modelId).toBe('gemini-3.8-flash-tiered')
+    expect(calls.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('无标记且目录读不出来 → bad-request，且**不**发请求（不猜模型名）', async () => {
+    const calls = stubFetch()
+    const { call } = setup({ withoutLlm: true })
+
+    const result = await call('account.test', { accountId: 'gemini-1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.message).toContain('无法确定要测试的模型')
+    // 猜一个模型名发出去会得到与账号无关的 404，把两件事混成一条报错。
+    expect(calls).toHaveLength(0)
+  })
+
+  it('缺 accountId / 账号不存在 → bad-request', async () => {
+    const calls = stubFetch()
+    const { call } = setup({ catalog: [{ id: 'm', name: 'M' }] })
+
+    for (const payload of [{}, { accountId: '' }, { accountId: 'ghost' }]) {
+      const result = await call('account.test', payload)
+      expect(result.ok, JSON.stringify(payload)).toBe(false)
+    }
+    expect(calls).toHaveLength(0)
+  })
+})
+
 describe('cline.quota / cline.requestLog 端点', () => {
   type Handler = (request: Request) => Promise<Response>
 
