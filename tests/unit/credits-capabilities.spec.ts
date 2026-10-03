@@ -6,12 +6,14 @@ import { dirname, resolve } from 'node:path'
 import {
   CREDITS_CAPABILITIES,
   PERMANENT_LOCK_EXPIRING_WINDOW_DAYS,
+  RATE_LIMIT_CAPABILITIES,
   checkinProviders,
   permanentLockCopy,
   supportsCreditBalance,
   supportsDailyCheckin,
   supportsOnboardingTasks,
   supportsPermanentLock,
+  supportsRateLimit,
   supportsSubscriptionQuota,
 } from '../../plugin-src/client/credits-capabilities.js'
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
@@ -211,6 +213,52 @@ describe('积分能力矩阵', () => {
       expect(CREDITS_CAPABILITIES, `缺少 ${id} 的能力登记`).toHaveProperty(id)
     }
     expect(Object.keys(CREDITS_CAPABILITIES).sort()).toEqual([...providerIds].sort())
+  })
+})
+
+/**
+ * ⚠️ **模型限流按钮门控**（Gemini 报障，2026-10-03）。
+ *
+ * 用户原话：「重测按钮你确认过会发请求吗，为什么响应这么快？可以移除吗」。
+ * 取证结论：当时该账号条目**没有 `modelRateLimits` 标记**，
+ * `retestAccount` 在 `modelIds.length === 0` 处提前返回 ⇒ 一次请求都没发，
+ * 所以「响应快」。但这不代表按钮无害：Gemini 的限流是**服务端配额窗口制**
+ * （5 小时窗口 + 周窗口），本地标记清掉、重测通过，配额一点没恢复 ——
+ * 「重测」只会白烧本就紧张的窗口配额，「重置」只会把受限账号放回池里再撞 429。
+ * 故与 Loomy 同处登记 `false`（**理由不同**，见
+ * {@link RATE_LIMIT_CAPABILITIES} 的注释）。
+ */
+describe('模型限流按钮门控（重测 / 重置）', () => {
+  it('gemini 显式登记为「限流不由这组按钮管辖」', () => {
+    expect(RATE_LIMIT_CAPABILITIES.gemini?.rateLimit).toBe(false)
+    expect(supportsRateLimit('gemini')).toBe(false)
+  })
+
+  it('未登记的 provider 仍默认视为有限流（不得因新增登记而收紧默认值）', () => {
+    // 反例：任何未登记的 id 都必须保持 true，否则将来新增 provider 漏登记时
+    // 老用户会凭空失去「重测 / 重置」按钮 —— 那是可见的功能回退。
+    expect(supportsRateLimit('codearts')).toBe(true)
+    expect(supportsRateLimit('zcode')).toBe(true)
+    expect(supportsRateLimit('不存在的 provider')).toBe(true)
+  })
+
+  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好两个）', () => {
+    const disabled = Object.entries(RATE_LIMIT_CAPABILITIES)
+      .filter(([, caps]) => caps.rateLimit === false)
+      .map(([id]) => id)
+      .sort()
+    // loomy：根本不返回限流错误；gemini：限流是服务端配额窗口制。
+    expect(disabled).toEqual(['gemini', 'loomy'])
+  })
+
+  it('客户端源码里按钮仍走 supportsRateLimit 门控（不是在本文件另写白名单）', () => {
+    // 与 loomy-client.spec.ts 同源断言，这里补上「不得复辟硬编码 provider 判断」。
+    const codeLines = readClientSource()
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(codeLines).toContain('showRateLimitActions: supportsRateLimit(provider)')
+    expect(codeLines).not.toMatch(/showRateLimitActions:\s*provider\s*!==/)
   })
 })
 

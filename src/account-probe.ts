@@ -217,7 +217,7 @@ async function probeWithAdapter(
   // 3. 加了 trae 分支后**仍漏掉 qoder / qodercn / cline** → 三者同样落入
   //    else，被交给 CodeArtsAdapter 用华为云 HMAC 签名去发 Qoder / Cline
   //    凭据。它们的「重测 / 重置」按钮**确实会渲染**（`RATE_LIMIT_CAPABILITIES`
-  //    对未登记的 provider 默认视为有限流，只有 loomy 显式登记为 false），
+  //    对未登记的 provider 默认视为有限流，当时只有 loomy 显式登记为 false），
   //    且 Qoder 的额度受限**每次都会**写 `modelRateLimits`（按 UTC+8 当日
   //    24:00 标记），于是「点重测 → 拿到签名错误 → 标记也清不掉」成为稳定
   //    可复现的死循环；

@@ -223,18 +223,42 @@ export const CREDITS_CAPABILITIES = Object.freeze({
  * 积分能力的约定是「默认关闭」（未登记就不发请求，避免必然失败的请求）。
  * 但限流按钮**是既有 UI**：若这里也默认关闭，将来新增 provider 时忘记登记，
  * 会让老用户**凭空失去**「重测 / 重置」按钮 —— 那是可见的功能回退。
- * 故这里默认**开启**，只有明确知道「该渠道不会限流」时才显式登记 `false`。
+ * 故这里默认**开启**。
+ *
+ * ## 登记 `false` 的判据（2026-10-03 纳入 Gemini 后重写）
+ *
+ * 不是「该渠道不会限流」，而是「**该渠道的限流不由这组按钮的语义管辖**」。
+ * 目前两个子类都登记 `false`：
+ * - Loomy：**根本不返回限流错误** —— 重测永远测不出东西，重置没有标记可清；
+ * - Gemini：**限流是服务端配额窗口制** —— 本地标记与重测都不改变配额本身，
+ *   按钮只剩「白烧配额」与「把受限账号放回池里再撞一次」两种副作用。
+ *
+ * 落地问法：「这个按钮点下去，能不能让用户**少**受限一次？」答否即 `false`。
  */
 export const RATE_LIMIT_CAPABILITIES = Object.freeze({
   // Loomy（讯飞）：**不返回限流错误** —— 积分耗尽时静默降级为扣永久积分，
   // 故「重测 / 重置」这组按钮对它无意义（重测还会白烧积分）。
   loomy: Object.freeze({ rateLimit: false }),
+  // Gemini（Google Cloud Code）：**理由与 Loomy 不同** —— 它确实会回 429，
+  // `gemini-adapter.ts` 也确实会写 `modelRateLimits`（60s 冷却 / 401 时 300s）。
+  // 但它的限流是**服务端配额窗口制**（5 小时窗口 + 周窗口），不是「等一会儿
+  // 就好」的临时冷却：本地标记清掉、重测通过，配额本身一点没恢复，下一次
+  // 请求立刻又是 429。于是这组按钮对 Gemini 只剩副作用：
+  //   - 「重测」会对每个被标记的模型**真发一条消息**，白烧本就紧张的窗口配额，
+  //     且结论恒为「仍然受限」（判据见 `src/account-probe.ts` 的 `retestAccount`）；
+  //   - 「重置」只清本地标记，把账号重新放回可选用池，随即再撞 429 再写回来。
+  // 真正能改变状态的动作是**换账号**或**等窗口 resetTime**，两者都不在这组按钮里。
+  // 用户报障原文：「重测按钮你确认过会发请求吗，为什么响应这么快？可以移除吗」
+  // （响应快是因为当时该账号没有 `modelRateLimits` 标记，`retestAccount` 在
+  // `modelIds.length === 0` 处提前返回，一次请求都没发）。
+  gemini: Object.freeze({ rateLimit: false }),
 });
 
 /**
  * 该 provider 的请求是否会因**模型限流**被拒（决定是否渲染「重测 / 重置」）。
  *
- * ⚠️ 默认 `true`（未登记即视为有限流），理由见 {@link RATE_LIMIT_CAPABILITIES}。
+ * ⚠️ 默认 `true`（未登记即视为有限流），理由与登记判据见
+ * {@link RATE_LIMIT_CAPABILITIES}。
  */
 export function supportsRateLimit(provider) {
   return RATE_LIMIT_CAPABILITIES[provider]?.rateLimit !== false;
