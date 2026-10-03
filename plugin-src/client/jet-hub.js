@@ -737,6 +737,18 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
           account.expiresAt
             ? `${formatTime(account.expiresAt) || '未知'}${account.refreshable ? ' · 自动续期' : ''}`
             : '未知')),
+      // 账号规格（目前只有 Gemini 有）：Pro / Free / Ultra。
+      //
+      // ⚠️ 判据是 `extra.accountTier` 有值才渲染 —— 取不到档位（上游改协议、
+      // 网络失败、非 Gemini 的 provider）时**整行不出现**，不显示「未知」也不
+      // 报错：它只是一栏附注信息，不该制造一条无法修复的提示。
+      // `title` 放上游原文（`Google AI Pro（g1-pro-tier）`），面板只放得下一个词。
+      credits?.extra?.accountTier
+        ? React.createElement('div', { className: 'dim-jh-metaRow' },
+            React.createElement('dt', null, '账号规格'),
+            React.createElement('dd', { title: credits.extra.accountTier.title },
+              credits.extra.accountTier.label))
+        : null,
       // 不支持积分余额的 provider 不渲染该行：留着它只能显示「查询失败」，
       // 而失败原因是「这个 provider 根本没有此接口」——与其展示一条无法修复
       // 的错误，不如不展示。
@@ -1962,7 +1974,10 @@ function ProviderPanel({ provider, rpcCall }) {
       if (!mounted.current) return;
       const next = {};
       for (const item of res.accounts || []) {
-        next[item.accountId] = { balance: item.balance, error: item.error };
+        // `extra` 是逐账号的**附加读数**（目前只有 Gemini 的账号规格 Pro/Free/
+        // Ultra 走这里）。它跟 `balance`/`error` 并列，必须原样带上 —— 漏掉它
+        // 卡片就永远不显示那一行，而 RPC 那边看不出任何异常。
+        next[item.accountId] = { balance: item.balance, error: item.error, extra: item.extra };
       }
       setCredits(next);
       // 窗口天数随余额一起回来（buddy 系 + TRAE 带）——积分行据此分「临时 / 长期」。

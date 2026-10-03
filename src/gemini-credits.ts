@@ -54,6 +54,13 @@
  * 没有 access_token 时返回 `{ balance: null, error: '尚未授权 Google 账号' }`
  * （照原版 `MessageUnauthorized`）。面板靠这条文案区分「没登录」与
  * 「查询失败」—— 把它抛成异常会让账号卡片显示成故障。
+ *
+ * ## 账号规格（`tier`）搭这趟车
+ *
+ * 面板还要显示「这是 Pro 还是 Free」。规格来自 `loadCodeAssist`，与配额是
+ * **两个端点**，但**并行发在同一次调用里**（面板 30 秒刷一次，多一个独立
+ * RPC 只会多一份编排）。取到的档位挂在 {@link GeminiBalanceResult.tier} 上，
+ * 失败就 `undefined`（不渲染那一行），**绝不影响配额行**。
  */
 
 import { roundCredits, type CreditBalance, type CreditPackage } from './credits.js'
@@ -62,6 +69,8 @@ import {
   GEMINI_CREDITS_TIMEOUT_MS,
   GEMINI_DEFAULT_PROJECT,
   GEMINI_ENDPOINT_SANDBOX,
+  GEMINI_LOAD_CODE_ASSIST_BODY,
+  GEMINI_LOAD_CODE_ASSIST_PATH,
   GEMINI_QUOTA_CACHE_TTL_MS,
   GEMINI_QUOTA_PATH,
   geminiHeaders,
@@ -84,6 +93,66 @@ export const GEMINI_WINDOW_LABEL_WEEKLY = '周窗口'
 /** 配额单位：剩余**百分比**。 */
 const GEMINI_QUOTA_UNIT = '%'
 
+/**
+ * 账号规格（Google 档位）。
+ *
+ * ⚠️ **判据是 `paidTier`，不是 `currentTier`**：实测两个账号的 `currentTier`
+ * 都是 `{id:'free-tier',name:'Antigravity'}`，**完全一样**；真正区分「有没有
+ * Google AI Pro」的是 `paidTier`（`g1-pro-tier` / `Google AI Pro` 对
+ * `free-tier` / `Antigravity Starter Quota`）。原版 `project.go:25-34` 的
+ * `loadCodeAssistResponse` **没有 `paidTier` 字段**，所以原版做不到这件事
+ * —— 这是我们的新增能力，不要"对齐原版"把它删掉。
+ *
+ * ⚠️ `currentTier` 只作兜底（`paidTier` 缺席时）。
+ */
+export interface GeminiAccountTier {
+  /** 上游档位 id（`g1-pro-tier` / `free-tier`），hover 里原样展示。 */
+  readonly id: string
+  /** 上游档位名（`Google AI Pro`），hover 里原样展示。 */
+  readonly name: string
+  /** 面板上的短标签：`Pro` / `Free` / `Ultra`。 */
+  readonly label: string
+}
+
+/**
+ * 档位 id / 名 → 面板短标签。
+ *
+ * 顺序有意义：`Ultra` → `Pro` → `Free`。上游把「Pro 但已降级」也叫
+ * `free-tier`（`Antigravity Starter Quota`），故不能只看 id 的 `-tier` 后缀。
+ */
+function tierLabel(id: string, name: string): string {
+  const combined = `${id} ${name}`.toLowerCase()
+  if (combined.includes('ultra')) return 'Ultra'
+  if (combined.includes('pro')) return 'Pro'
+  if (combined.includes('free')) return 'Free'
+  return name !== '' ? name : id
+}
+
+/** 取一个 tier 对象里的 id / name；两者都空即视为不存在。 */
+function pickTier(raw: unknown): { id: string; name: string } | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+  const record = raw as Record<string, unknown>
+  const id = typeof record.id === 'string' ? record.id : ''
+  const name = typeof record.name === 'string' ? record.name : ''
+  if (id === '' && name === '') return undefined
+  return { id, name }
+}
+
+/**
+ * 从 `loadCodeAssist` 响应里解出账号规格。
+ *
+ * ⚠️ 只读 `paidTier` / `currentTier` 的 `id` / `name`。响应里还有
+ * `description`、`privacyNotice.noticeText`（一大段英文隐私说明）、
+ * `allowedTiers` —— **一个都不要展示**。
+ */
+export function parseGeminiAccountTier(payload: unknown): GeminiAccountTier | undefined {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
+  const record = payload as Record<string, unknown>
+  const tier = pickTier(record.paidTier) ?? pickTier(record.currentTier)
+  if (tier === undefined) return undefined
+  return { id: tier.id, name: tier.name, label: tierLabel(tier.id, tier.name) }
+}
+
 /** 归一后的一个配额窗口。 */
 export interface GeminiQuotaWindow {
   readonly bucketId: string
@@ -99,6 +168,13 @@ export interface GeminiQuotaWindow {
 export interface GeminiBalanceResult {
   balance: CreditBalance | null
   error?: string
+  /**
+   * 账号规格（`loadCodeAssist` 顺带取的档位）。
+   *
+   * ⚠️ **可选且与 `error` 无关**：档位查询失败（网络/上游改协议）绝不能让
+   * 配额行跟着报错 —— 它只是一栏附注信息。拿不到就不渲染那一行。
+   */
+  tier?: GeminiAccountTier
 }
 
 /** {@link fetchGeminiCreditBalance} 的可选参数。 */
@@ -265,6 +341,22 @@ async function requestQuota(
   fetcher: typeof fetch,
 ): Promise<GeminiBalanceResult> {
   const project = credential.cloudaicompanionProject ?? GEMINI_DEFAULT_PROJECT
+  // ⚠️ 档位与配额**并行**发，且档位失败绝不污染配额结果（`catch` 吞成
+  // `undefined`）：面板的「账号规格」是一栏附注，不能因为它挂了就把整行
+  // 变成错误 —— 那正是「测试能发请求、配额却报错」那类误报的翻版。
+  const [quota, tier] = await Promise.all([
+    requestQuotaSummary(credential, fetcher, project),
+    requestAccountTier(credential, fetcher).catch(() => undefined),
+  ])
+  return tier === undefined ? quota : { ...quota, tier }
+}
+
+/** 配额本体（`retrieveUserQuotaSummary`）。 */
+async function requestQuotaSummary(
+  credential: GeminiCredential,
+  fetcher: typeof fetch,
+  project: string,
+): Promise<GeminiBalanceResult> {
   let response: Response
   try {
     response = await fetcher(`${GEMINI_ENDPOINT_SANDBOX}${GEMINI_QUOTA_PATH}`, {
@@ -308,6 +400,35 @@ async function requestQuota(
     return { balance: null, error: '配额响应里没有 Gemini 配额桶' }
   }
   return { balance: toGeminiCreditBalance(fiveHour, weekly) }
+}
+
+/**
+ * 账号规格（`loadCodeAssist`）。
+ *
+ * 请求体是**逐字常量** {@link GEMINI_LOAD_CODE_ASSIST_BODY}（对齐原版
+ * `project.go:97-103` 的抓包，content-length 恰为 38）—— 不要"顺手"把
+ * `cloudaicompanionProject` 塞进去，原版注释明确它不带。
+ *
+ * 解不出档位就返回 `undefined`（面板不渲染那一行），**不编造**。
+ */
+async function requestAccountTier(
+  credential: GeminiCredential,
+  fetcher: typeof fetch,
+): Promise<GeminiAccountTier | undefined> {
+  const response = await fetcher(`${GEMINI_ENDPOINT_SANDBOX}${GEMINI_LOAD_CODE_ASSIST_PATH}`, {
+    method: 'POST',
+    headers: geminiHeaders(credential),
+    body: GEMINI_LOAD_CODE_ASSIST_BODY,
+    signal: AbortSignal.timeout(GEMINI_CREDITS_TIMEOUT_MS),
+  })
+  if (!response.ok) return undefined
+  const text = await response.text().catch(() => '')
+  if (text === '') return undefined
+  try {
+    return parseGeminiAccountTier(JSON.parse(text))
+  } catch {
+    return undefined
+  }
 }
 
 /** 错误 → 一行可读文案。 */

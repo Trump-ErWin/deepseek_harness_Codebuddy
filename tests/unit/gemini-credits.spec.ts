@@ -65,11 +65,21 @@ function upstreamPayload(fiveHour = 0.99, weekly = 0.99): unknown {
   }
 }
 
-/** 让 fetch 返回给定响应，并记录调用。 */
+/**
+ * 让 fetch 返回给定响应，并记录**配额端点**的调用。
+ *
+ * ⚠️ 只记录配额端点：`fetchGeminiCreditBalance` 现在同一次调用里还会并行发
+ * `loadCodeAssist`（取账号规格），若把它也记进来，下面所有
+ * `expect(calls).toHaveLength(n)` 都要跟着翻倍 —— 而那些断言守的是配额查询的
+ * 次数与形状，与档位无关。档位请求这里一律回 404（⇒ 拿不到档位 ⇒ 不渲染
+ * 那一行），保证它不影响配额断言。
+ */
 function stubQuota(response: () => Response) {
   const calls: Array<{ url: string; init: RequestInit }> = []
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    calls.push({ url: String(input), init: init ?? {} })
+    const url = String(input)
+    if (url.includes('loadCodeAssist')) return new Response('', { status: 404 })
+    calls.push({ url, init: init ?? {} })
     return response()
   }))
   return calls

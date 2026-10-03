@@ -61,10 +61,23 @@ export const GEMINI_ENDPOINTS: readonly string[] = [GEMINI_ENDPOINT_DAILY, GEMIN
 export const GEMINI_GENERATE_PATH = '/v1internal:generateContent'
 /** 流式推理路径（SSE）。 */
 export const GEMINI_STREAM_PATH = '/v1internal:streamGenerateContent?alt=sse'
-/** 配额查询路径（**Summary 变体**，请求体为空对象）。 */
+/** 配额查询路径（**Summary 变体**，请求体见 `gemini-credits.ts`）。 */
 export const GEMINI_QUOTA_PATH = '/v1internal:retrieveUserQuotaSummary'
-/** 项目探测路径（仅在显式要求时才用，默认不探）。 */
+/**
+ * 账号档位 / 项目探测路径。
+ *
+ * 面板的「账号规格」一栏用它（原版 `project.go:15` 的 `loadCodeAssistPath`，
+ * 但原版的 `loadCodeAssistResponse` **没有 `paidTier` 字段**，故原版区分不开
+ * pro / free —— 见 `gemini-credits.ts` 的 `parseGeminiAccountTier`）。
+ */
 export const GEMINI_LOAD_CODE_ASSIST_PATH = '/v1internal:loadCodeAssist'
+/**
+ * 档位探测的请求体（**逐字**，content-length 恰为 38）。
+ *
+ * ⚠️ 对齐原版 `project.go:97-103`：**不带** `platform` / `pluginType` /
+ * `cloudaicompanionProject`，多一个字段就可能被上游识别成非官方客户端。
+ */
+export const GEMINI_LOAD_CODE_ASSIST_BODY = '{"metadata":{"ideType":"ANTIGRAVITY"}}'
 
 // ---------------------------------------------------------------------------
 // 身份伪装（逐字常量，不许随机）

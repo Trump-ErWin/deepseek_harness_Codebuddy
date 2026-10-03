@@ -525,7 +525,9 @@ describe('Gemini credits.balances', () => {
     expect(rows[0]?.balance?.total).toBe(70) // (80 + 60) / 2
     expect(rows[0]?.balance?.packages.map((p) => p.name)).toEqual(['5 小时窗口', '周窗口'])
     // ⚠️ 配额查询走 sandbox 端点（与推理端点的首选不同）。
-    expect(seen[0]).toBe(`${GEMINI_ENDPOINT_SANDBOX}${GEMINI_QUOTA_PATH}`)
+    // 用 `toContain` 而不是 `seen[0]`：同一次调用里还会**并行**发
+    // `loadCodeAssist`（取账号规格），两个请求的先后不该被这条断言锁死。
+    expect(seen).toContain(`${GEMINI_ENDPOINT_SANDBOX}${GEMINI_QUOTA_PATH}`)
   })
 
   it('★ 未授权（无 access_token）回可读文案，而不是「余额查询失败」', async () => {
