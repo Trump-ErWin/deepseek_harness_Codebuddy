@@ -6,7 +6,7 @@
  * 通道名 jet-hub → 路径 /api/jet-hub
  * 端点方法：account.list / account.create / account.update / account.delete /
  *           account.reorder / account.refresh / account.retest / account.retestAll /
- *           account.reset / account.resetAll / login.poll /
+ *           account.test / account.reset / account.resetAll / login.poll /
  *           credits.status / credits.claimAll / credits.balances /
  *           model.list / model.setDisabled /
  *           captcha.demand / captcha.carrierUrl / captcha.contribute（内部载体，
@@ -57,6 +57,10 @@ import {
   fetchMinimaxCreditBalance,
   fetchMinimaxSigninStatus,
 } from './minimax-credits.js'
+import { GEMINI, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
+import type { GeminiCredential } from './gemini.js'
+import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
+import { fetchGeminiCreditBalance } from './gemini-credits.js'
 import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
@@ -118,10 +122,12 @@ import {
   fetchTraeCreditBalance,
 } from './trae-credits.js'
 import {
+  pickTestModel,
   resetAccount,
   resetAllAccounts,
   retestAccount,
   retestAllAccounts,
+  testAccount,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
@@ -145,6 +151,8 @@ import type {
   RpcRefreshAccountResponse,
   RpcRetestAccountRequest,
   RpcRetestAllRequest,
+  RpcTestAccountRequest,
+  RpcTestAccountResponse,
   RpcResetAccountRequest,
   RpcResetAllRequest,
   RpcCreditsStatusRequest,
@@ -755,6 +763,15 @@ export function registerJetHubRpc(
   minimax: MinimaxAuth,
   zcode: ZcodeAuth,
   /**
+   * Gemini（Google Cloud Code Assist 免费线）实例（本地回调 OAuth）。
+   *
+   * ⚠️ **必须排在最后一个 provider 形参位**（即 `zcode` 之后、`modelAdapters`
+   * 之前）：本仓库全部 `registerJetHubRpc` 调用点都是**位置传参**，历史上已因
+   * 少传/插队错位复发 6 次。新 provider 一律**追加**在末尾，既有的 14 个调用点
+   * 才不用逐个补占位。
+   */
+  gemini: GeminiAuth,
+  /**
    * provider → 适配器实例（可选）。
    *
    * 用于「显示列表」拿到**不受用户黑名单影响**的全量目录（`listAllModels`），
@@ -766,7 +783,7 @@ export function registerJetHubRpc(
   ctx.inject(['connection'], (connectionCtx) => {
     registerJetHubEndpoints(
       connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai,
-      qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters,
+      qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters,
     )
   })
 }
@@ -859,6 +876,7 @@ function registerJetHubEndpoints(
   raccoon: RaccoonAuth,
   minimax: MinimaxAuth,
   zcode: ZcodeAuth,
+  gemini: GeminiAuth,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1785,6 +1803,63 @@ function registerJetHubEndpoints(
             void pool.removeAccount(id).catch(() => {})
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+        } else if (provider === GEMINI.id) {
+          /**
+           * Gemini（Cloud Code Assist）走**浏览器回调式 OAuth**（本地
+           * `createServer` 监听 `127.0.0.1` 的 `/oauth-callback`）。
+           *
+           * ⚠️ 与 zcode / codearts 同型：**必须先返回 URL 再等结果** ——
+           * `window.open` 只在用户手势窗口内有效，等授权完成才返回 URL
+           * 会让弹窗被浏览器拦截（AGENTS.md 记过 CodeArts 的同类缺陷）。
+           * `GeminiAuth.startLogin` 内部已保证「立即返回」，这里不得 `await result`。
+           *
+           * ⚠️ 先登记**占位条目**（无凭据），使前端 `login.poll` 能立即看到
+           * 该账号；登录成功后再回填昵称与 `expiresAt`。失败则删除占位条目，
+           * 不留幽灵账号（照 MINIMAX.id 分支的已验证形态）。
+           */
+          await pool.addAccount({
+            id,
+            provider: GEMINI.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let geminiStarted: StartedGeminiLoginFlow
+          try {
+            geminiStarted = await gemini.startLogin()
+          } catch (error) {
+            // 回调端口占用/网络失败：删掉占位条目，不留幽灵账号。
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 Gemini 登录（本地回调服务启动失败）：${reason}`)
+          }
+
+          geminiStarted.result.then(async (credential) => {
+            const result = await gemini.persistLogin(credential, { refName })
+            await pool.updateAccount(id, {
+              // ⚠️ `accountId` 是 OIDC `sub`（**不是**邮箱 —— 邮箱会被用户改掉）。
+              // 取不到时退化为池 id。
+              nickname: result.accountId === undefined
+                ? id
+                : `Gemini ${result.accountId.slice(0, 8)}`,
+              // ⚠️ **必须用 `geminiCredentialExpiresAtMs`**：它认 `expiry`
+              //（RFC3339）与 `expires_in`，取不到就返回 `undefined` ——
+              // 传 `undefined` 是「不知道」，不会被写成 0 而让 UI 显示「已过期」。
+              expiresAt: geminiCredentialExpiresAtMs(credential),
+              // ⚠️ Google OAuth 默认 `access_type=offline`，故 refresh_token
+              // 必定下发；这里仍按凭据本体如实判定，不写死 true。
+              refreshable: isGeminiRefreshable(credential),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${GEMINI.id} login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: geminiStarted.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -1905,6 +1980,14 @@ function registerJetHubEndpoints(
                * 重启 DSH。凭据不可用时如实抛错（让用户知道要去官方客户端登录）。
                */
               await zcode.refreshAccountCredential(entry.credentialRef, pool, entry.id)
+              break
+            case GEMINI.id:
+              // Gemini **有** refresh 端点（`oauth2.googleapis.com/token` 的
+              // `refresh_token` grant），这里是真续期。
+              // ⚠️ 必须传 pool + entry.id —— 续期后要把新的 `expiresAt` 写回
+              // 账号池，否则 UI 一直显示「已过期」而实际能正常发消息。
+              // ⚠️ Google 会**轮换 refresh_token**，`GeminiAuth` 内部已回写新值。
+              await gemini.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
@@ -2235,6 +2318,58 @@ function registerJetHubEndpoints(
       case 'account.retestAll': {
         const req = payload as RpcRetestAllRequest
         const value = await retestAllAccounts(pool, req.provider)
+        return { ok: true, value }
+      }
+
+      // ── 限流标记：测试（**无条件**发一次真实请求）──
+      //
+      // ⚠️ 与 `account.retest` 的区别是**触发条件**，不是措辞：
+      // `retestAccount` 只测那些已经有 `modelRateLimits` 标记的模型，没有标记时
+      // 在 `modelIds.length === 0` 处提前返回、一次请求都不发。于是「这个账号
+      // 到底还能不能用」在**没有历史 429** 时没有手动探活入口 —— 用户点「重测」
+      // 看到瞬间返回，会以为按钮失灵（真实报障：「重测按钮你确认过会发请求吗，
+      // 为什么响应这么快？」）。`account.test` 补齐的就是这个缺口。
+      //
+      // ⚠️ 它**不写任何存储**：不清标记、不写回新的重置时刻。测出「仍受限」只
+      // 如实回报给用户看，不落盘 —— 落盘会把「一次手动探活」变成「改变选号
+      // 状态」，那是重测的语义。
+      case 'account.test': {
+        const req = payload as RpcTestAccountRequest
+        const accountId = req.accountId
+        if (typeof accountId !== 'string' || accountId === '') {
+          return { ok: false, error: { code: 'bad-request', message: '缺少 accountId' } }
+        }
+        const entry = pool.findAccount(accountId)
+        if (entry === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `账号 ${accountId} 不存在` } }
+        }
+
+        // 模型推断：显式指定 > 已有的限流标记（用户最可能想看的就是它）> 全量目录第一个。
+        // ⚠️ 只有前两者都拿不到时才去读目录 —— `fullCatalogIds` 在读不到时返回
+        // `{ error }`，若无条件先读它，一个「明明有标记可测」的账号会因为目录服务
+        // 暂时不可用而被拒，属于自造的失败。
+        //
+        // 目录也读不出来时如实报错，**不**猜一个模型名发出去（猜错会得到与账号
+        // 无关的 404，把「账号不可用」和「模型名不对」两件事混成一条报错）。
+        let modelId = pickTestModel(entry, [], req.modelId)
+        if (modelId === '') {
+          const catalog = await fullCatalogIds(ctx, modelAdapters, entry.provider)
+          if ('error' in catalog) {
+            return {
+              ok: false,
+              error: { code: 'bad-request', message: `无法确定要测试的模型：${catalog.error}` },
+            }
+          }
+          modelId = pickTestModel(entry, catalog.ids, req.modelId)
+        }
+        if (modelId === '') {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: `${entry.provider} 没有可测试的模型` },
+          }
+        }
+
+        const value: RpcTestAccountResponse = await testAccount(pool, accountId, modelId)
         return { ok: true, value }
       }
 
@@ -2790,6 +2925,28 @@ function registerJetHubEndpoints(
           const values = await collectCreditBalances<MinimaxCredential, undefined>(accounts, undefined, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalance: (credential) => fetchMinimaxCreditBalance(credential),
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === GEMINI.id) {
+          // 余额 = **配额窗口**（不是充值积分）：`POST
+          // /v1internal:retrieveUserQuotaSummary` 两个桶（`gemini-5h` /
+          // `gemini-weekly`）的剩余比例。
+          //
+          // ⚠️ 用 `fetchBalanceDetailed`（而非 `fetchBalance`）：Gemini 的
+          // 「未授权」与「查询失败」是**两回事** —— 前者要显示「尚未授权 Google
+          // 账号」、后者要显示具体原因（网络/HTTP/响应形状）。
+          // `collectCreditBalances` 会把 `{balance: null, error}` 原样透传给
+          // 卡片（helper 只在 `error` 缺失时才补「余额查询失败」），故这里
+          // **不需要**像 CLINE 分支那样手写 for 循环。
+          //
+          // ⚠️ 第二实参传 `GEMINI` 而不是 minimax 那样的 `undefined`：
+          // `fetchGeminiCreditBalance` 的第二形参就是 product（端点/超时来自
+          // 产品配置）。
+          const values = await collectCreditBalances<GeminiCredential, typeof GEMINI>(accounts, GEMINI, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchBalanceDetailed: (credential) => fetchGeminiCreditBalance(credential, GEMINI),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }

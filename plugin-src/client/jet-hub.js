@@ -6,6 +6,7 @@ import {
   supportsDailyCheckin,
   supportsOnboardingTasks,
   supportsRateLimit,
+  supportsAccountTest,
   supportsPermanentLock,
   supportsSubscriptionQuota,
   permanentLockCopy,
@@ -61,6 +62,8 @@ import {
   formatCredits,
   formatTokens,
   formatUnits,
+  formatQuotaLine,
+  formatQuotaDetail,
   unitLabel,
 } from './credits-format.js';
 import {
@@ -251,6 +254,18 @@ const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAA
  */
 const OPENCODE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzEyMTYxZCIvPjxwYXRoIGQ9Ik02LjUgOC41IDEwLjUgMTJsLTQgMy41IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBkPSJNMTIuNSAxNmg1IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48L3N2Zz4=';
 
+/**
+ * Gemini Code Assist 面板图标（内联 SVG data URL，手绘）。
+ *
+ * ⚠️ 与 Qoder / LobsterAI / TRAE / OpenCode 同款做法：Gemini 的官方星形
+ * 标志没有可取的小尺寸位图资源，走内联 SVG（体积小、无色差、20×20 下清晰）。
+ * 图形：蓝紫渐变四角星 + 右上小星（官方品牌色的近似，非逐像素复刻）。
+ *
+ * ⚠️ 必须自带图形与底色 —— 容器按 `logoClass: 'gemini'` 给**白底**
+ *（见 `jet-hub-styles.js` 的 `.dim-jh-providerIcon.gemini`）。
+ */
+const GEMINI_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIxIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjNDI4NUY0Ii8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjOUI3MkNCIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDJjLjQgMy45IDIuMSA2LjYgNiA4LTMuOSAxLjQtNS42IDQuMS02IDgtLjQtMy45LTIuMS02LjYtNi04IDMuOS0xLjQgNS42LTQuMSA2LThaIiBmaWxsPSJ1cmwoI2cpIi8+PHBhdGggZD0iTTE5LjUgMTRjLjIgMS43LjkgMi45IDIuNiAzLjUtMS43LjYtMi40IDEuOC0yLjYgMy41LS4yLTEuNy0uOS0yLjktMi42LTMuNSAxLjctLjYgMi40LTEuOCAyLjYtMy41WiIgZmlsbD0idXJsKCNnKSIvPjwvc3ZnPg==';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -293,6 +308,19 @@ const PROVIDERS = Object.freeze([
    * 一致性断言都依赖它（raccoon 那条同理，改一处会连锁失败）。
    */
   { id: 'opencode', label: 'OpenCode', icon: OPENCODE_ICON, logoClass: 'opencode' },
+  /**
+   * Gemini Code Assist（Google Cloud Code 免费线，第 14 个 provider）。
+   *
+   * ⚠️ label 必须与 `GEMINI.displayName` **逐字一致**（`src/gemini.ts` 的
+   * `displayName: 'Gemini Code Assist'`）：rail 宽度算式（`.dim-jh-rail` 的
+   * 228px）与跨文件一致性断言都依赖它。这条是本表里**最长**的 label，
+   * 但它仍短于既有的「WorkBuddy (国际版)」（141px 实测），故不会撑破 rail。
+   *
+   * ⚠️ 登录走**浏览器回调式 OAuth**（本地 `127.0.0.1` 起回调服务），
+   * 后端在 `account.create` 里**立即返回 loginUrl** —— 前端与其余 provider
+   * 共用同一条「弹窗 + 登录轮询」路径，无需特殊分支。
+   */
+  { id: 'gemini', label: 'Gemini Code Assist', icon: GEMINI_ICON, logoClass: 'gemini' },
 ]);
 
 /**
@@ -355,6 +383,18 @@ const RESET_HELP = '直接清除本账号的全部「限额重置」标记，不
 const RESET_ALL_HELP = '直接清除本页全部账号（含已停用）的「限额重置」标记，不发送任何请求。';
 
 /**
+ * 「测试」按钮的说明。
+ *
+ * ⚠️ 措辞必须讲清「与重测的区别」：用户会本能地把两者混为一谈，然后以为
+ * 「测试」只是重测的别名。真正的区别是**触发条件**——重测只测已有标记的模型，
+ * 没有标记时一次请求都不发；测试无条件真发一次。
+ */
+const TEST_HELP = '无条件真实发送一条最小消息给这个账号（不依赖是否存在「限额重置」标记），'
+  + '用来确认账号当下到底还能不能用。与「重测」的区别：重测只测**已有标记**的模型，'
+  + '没有标记时一次请求都不发；测试不看标记，直接挑一个模型发出去。'
+  + '只回报结果，不修改任何限流标记。会消耗少量模型额度。';
+
+/**
  * 「显示列表」按钮的说明。
  *
  * 措辞必须讲清两点，否则用户会以为关掉开关就等于删除模型：
@@ -379,6 +419,20 @@ function summarizeProbe(kind, res) {
   if (still > 0) parts.push(`${still} 条仍受限`);
   if (parts.length === 0) parts.push('没有可重测的限流标记');
   return parts.join('，');
+}
+
+/**
+ * 把一次「测试」的响应汇总成一行可读文案。
+ *
+ * ⚠️ 必须与 `summarizeProbe` 分开写：测试的响应里**没有** `accounts` / `clearedCount`
+ * 字段（它不写存储、没有「清除了几条」可报），拿它去喂 `summarizeProbe` 会得到
+ * 「没有可重测的限流标记」——把「测试失败」说成「没什么可测的」，是彻底的误报。
+ */
+function summarizeTest(res) {
+  const model = res?.modelId || '未知模型';
+  if (res?.ok) return `测试通过：${model} 正常返回`;
+  const reason = res?.message || '仍受限';
+  return `测试未通过：${model} — ${reason}`;
 }
 
 /**
@@ -456,6 +510,18 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
   const total = formatUnits(balance.total, unit) ?? '0';
   const activeCount = all.filter(p => p.active).length;
   /**
+   * 配额窗口（Gemini）：主行显示**逐窗口百分比**，不显示均值。
+   *
+   * 用户报障原文：「95 积分；为什么显示的是积分不是额度，计划里应该说了会显示额度」。
+   * 两层错误叠在一起：标签走了 `unitLabel` 的「其余 ⇒ 积分」兜底分支，
+   * 数字走了 `formatCredits` 的两位小数（94.5 ⇒ `94.50`）。而 94.5 本身还是
+   * 两个窗口剩余比例的**平均**——一个上游根本不存在的数。逐窗口列出来
+   * 才是这份读数本来的形状（计划 §3.3：「5 小时窗口 99% / 周窗口 99%」）。
+   *
+   * ⚠️ 非配额单位时 `quotaText` 为 `null`，下面全部走老分支，**零影响**。
+   */
+  const quotaText = formatQuotaLine(all, unit);
+  /**
    * ⚠️ 分类在**渲染的这一刻**用当前时间现算，绝不存进 state、也不缓存到别处：
    * 「临时 / 永久」等于「距扣费截止是否满 N 天」，而宿主长期开着、时间只向前流 ——
    * 一笔距到期 15 天 30 秒的余额，用户什么都不做，半分钟后就越过线。
@@ -474,6 +540,13 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     all.length > 1 ? `共 ${all.length} 个资源包，${activeCount} 个有效` : null,
     ...all.map(pkg => formatPackageLine(pkg, windowDays, now)),
   ].filter(Boolean).join('\n');
+  /**
+   * 配额窗口的明细与主行**都换成百分比口径**。
+   *
+   * ⚠️ 明细绝不能沿用上面的 `formatPackageLine`（`95 / 100` 会被读成
+   * 「95 个积分，一共 100 个」）——见 `formatQuotaDetail` 的注释。
+   */
+  const quotaDetail = quotaText === null ? null : formatQuotaDetail(all);
   /**
    * Loomy / Raccoon 的「当日刷新池」必须**单独显示**（用户明确要求）。
    *
@@ -496,9 +569,11 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     React.createElement('dt', null, label),
     React.createElement('dd', {
       className: 'dim-jh-creditValue',
-      title: detail || undefined,
+      title: quotaDetail ?? (detail || undefined),
     },
-    React.createElement('strong', { className: 'dim-jh-creditTotal' }, total),
+    // ⚠️ 配额窗口显示**逐窗口百分比**而不是均值：均值（94.5）既不是上游给的数，
+    // 在「额度」这个标签下更会被读成 94.5 个积分。见 quotaText 的注释。
+    React.createElement('strong', { className: 'dim-jh-creditTotal' }, quotaText ?? total),
     // 当日池分桶（loomy / raccoon）：`formatPoolSplitLine` 已覆盖原先硬编码的
     // loomy 两池判据，且对 Raccoon 的「每日积分」同样成立（用户 2026-09-29 要求）。
     // ⚠ 数字按**包自身的单位**格式化（remote 的单位支持）：池可能来自
@@ -518,11 +593,18 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
             + '长期 = 其余积分（锁定永久积分后不参与消耗）。',
         }, expiryText)
       : null,
-    !poolSplitText && !expiryText && all.length > 1
+    // ⚠️ 配额单位（Gemini）下**不渲染**这句：它的两个「包」是 5 小时窗口与
+    // 周窗口，不是资源包 —— 说「2/2 个资源包有效」既没信息量又误导
+    // （用户报障原文：「不要渲染 / 2/2 个资源包有效」）。窗口自身的读数
+    // 已由上面的 `quotaText` 逐条列出，这里再补一句纯属噪音。
+    // ⚠️ 非配额单位（真正由多个资源包构成余额的 provider）行为**逐字不变**。
+    quotaText === null && !poolSplitText && !expiryText && all.length > 1
       ? React.createElement('span', { className: 'dim-jh-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
     // 失效额度单独提示：它们仍在服务端响应里，但不计入上面的数字
+    // ⚠️ 配额单位下恒不渲染（`expiredTotal` 就是 0），留着分支只为不改变
+    // 其它 provider 的行为。
     balance.expiredTotal > 0
       ? React.createElement('span', { className: 'dim-jh-creditExpired' },
           `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)
@@ -540,7 +622,7 @@ function isAnonymousAccountId(accountId) {
   return String(accountId || '').indexOf('opencode-anon-') === 0;
 }
 
-function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
+function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onTest, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
   // ⚠️ opencode 专属：传了才渲染「代理」「指纹」两个按钮（见按钮区注释）。
   // 前者额外需要 current 代理串，故签名与 onRetest 略有不同。
   onOpenProxy, onRotateFingerprint }) {
@@ -718,6 +800,25 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         : null,
       // 卡片级「重测 / 重置」同样只对会限流的 provider 有意义
       // （Loomy 不返回限流错误，故这两个按钮对它永远禁用 —— 直接不渲染）。
+      //
+      // ⚠️ 「测试」与上面两个**互不替代**，故用**独立**的 props 存在性开关
+      // （与 `onOpenProxy` 同款约定）：重测只测已有标记的模型、没有标记时零请求；
+      // 测试无条件真发一次。当前 Gemini 恰好只登记了测试、没登记重测 —— 若把
+      // 两者绑在同一个开关上，就会出现「要么都渲染（重测对它无意义）、要么
+      // 都不渲染（测试消失）」的二选一。
+      //
+      // ⚠️ 该行是 `flex-wrap: nowrap`，多一个按钮就可能溢出（见上方礼物图标
+      // 按钮的注释）。故「测试」放在最前，且**只有**在 provider 同时登记了
+      // 测试与重测时才会出现 6 个按钮 —— 当前没有任何 provider 两者皆登记。
+      onTest
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: TEST_HELP,
+            // 不依赖 hasAnyLimit：测试的意义正是「没有标记时也能探活」。
+            disabled: busy,
+            onClick: () => onTest(account.id),
+          }, '测试')
+        : null,
       showRateLimitActions
         ? React.createElement('button', {
             className: 'dim-jh-btn',
@@ -2496,6 +2597,40 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 「测试」：**无条件**真发一次请求（不依赖是否存在限流标记）。
+   *
+   * ⚠️ 刻意**不**复用 `runLimitAction`：那条路径的文案汇总（`summarizeProbe`）
+   * 读的是 `res.accounts` / `res.clearedCount`，而 `account.test` 返回的是
+   * 扁平的 `{ modelId, ok, message }` —— 复用会得到「没有可重测的限流标记」，
+   * 把「测试失败」误报成「没什么可测的」。
+   *
+   * 复用 `probeBusy` 状态（置 `'one'`）：它同时驱动卡片的 `busy` 与按钮禁用，
+   * 测试期间不该允许并发点其它按钮。
+   */
+  const runTestAction = async (accountId) => {
+    setProbeBusy('one');
+    setProbeNotice(null);
+    try {
+      const res = await rpcCall('account.test', { accountId });
+      if (!mounted.current) return;
+      const text = summarizeTest(res);
+      // 仍受限/无法确认时把原始原因也列出来，否则用户只看到「未通过」会以为按钮失灵。
+      const details = res && res.ok === false && res.message
+        ? [`${res.nickname || res.accountId} · ${res.modelId || '未知模型'}：${res.message}`]
+        : [];
+      setProbeNotice({ tone: res?.ok ? 'ok' : 'warn', text, details });
+      // 测试不写存储，故无需 loadAccounts() —— 但刷新一次无害且能顺带更新凭据有效期。
+      await loadAccounts();
+    } catch (caught) {
+      console.error('[jet-hub] account test failed:', caught);
+      if (!mounted.current) return;
+      setProbeNotice({ tone: 'error', text: `测试失败：${caught?.message || '未知错误'}`, details: [] });
+    } finally {
+      if (mounted.current) setProbeBusy(null);
+    }
+  };
+
   return React.createElement('section', { 'aria-label': `${provider} 账号管理` },
     // 标题与按钮分开成两块（而不是同一行的 space-between）：操作按钮多达 5 个，
     // 与面板标题挤在一行时既会被压缩又会溢出。标题独占一行、按钮组另起一行
@@ -2751,6 +2886,13 @@ function ProviderPanel({ provider, rpcCall }) {
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),
                 onReset: (id) => void runLimitAction('reset', id),
+                // ⚠️ 「测试」用**独立**的能力位（`supportsAccountTest`）与独立的
+                // props 存在性开关，不能挂在 `showRateLimitActions` 上：Gemini
+                // 恰好只登记了测试、没登记重测（它的限流是配额窗口制，重测无意义），
+                // 绑一起就会二选一地消失一个按钮。
+                onTest: supportsAccountTest(provider)
+                  ? (id) => void runTestAction(id)
+                  : undefined,
                 // ⚠️ 仅 opencode：这两个回调只在该 provider 下传，
                 // AccountCard 靠「props 存在性」决定是否渲染按钮。
                 ...(provider === 'opencode'
