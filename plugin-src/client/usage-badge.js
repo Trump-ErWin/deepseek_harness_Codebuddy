@@ -43,7 +43,7 @@ import {
   quotaPercentValue,
   formatQuotaPercent,
 } from './quota-format.js';
-import { formatUnits, unitLabel } from './credits-format.js';
+import { formatUnits, formatQuotaLine, unitLabel, QUOTA_UNIT } from './credits-format.js';
 import {
   formatExpirySplitLine,
   formatPoolSplitLine,
@@ -860,7 +860,16 @@ function UsageBadgeActive(props) {
   function renderCredits() {
     const accounts = value?.accounts ?? [];
     const windowDays = value?.windowDays;
-    const sum = view.groups.map((group) => `${formatUnits(group.total, group.unit) ?? '?'} ${group.label}`).join(' · ');
+    /**
+     * ⚠️ 配额单位（Gemini）**不求和、也不算均值**：窗口是并行的百分比，
+     * 累加没有语义（两个账号各 50% 加起来是 100%？），而宿主侧的 `total`
+     * 本身已经是两个窗口剩余比例的平均值 —— 上游根本没有那个数。
+     * 这类单位改为逐账号列出窗口行（见 {@link balanceLine}）。
+     */
+    const quotaGroup = view.groups.find((group) => group.unit === QUOTA_UNIT);
+    const sum = quotaGroup !== undefined
+      ? (quotaGroup.quotaLines ?? []).join(' · ')
+      : view.groups.map((group) => `${formatUnits(group.total, group.unit) ?? '?'}${group.label}`).join(' · ');
     // 排序与折叠是**纯逻辑**（含「读不到数的排最后」「稳定排序」两条不变量），
     // 放在 badge-model.js 里由单测锁死 —— 组件里看不见 react 的测试跑不起来。
     const { shown, hidden } = orderCreditRows(accounts, {
@@ -870,10 +879,14 @@ function UsageBadgeActive(props) {
     return React.createElement('div', { key: 'credits', className: 'dim-jh-badgeSection' }, [
       // 合计放进节标题右侧，省掉一整行
       React.createElement('div', { key: 'title', className: 'dim-jh-badgeSectionTitle' }, [
-        React.createElement('span', { key: 'l' }, '积分'),
+        // ⚠️ 节标题按单位走：配额窗口（Gemini）是「额度」不是「积分」——
+        // 说成积分就是撒谎（计划 §3.3：「不要假装成积分数字」）。
+        React.createElement('span', { key: 'l' },
+          quotaGroup === undefined ? '积分' : unitLabel(quotaGroup.unit)),
         accounts.length === 0 || sum === ''
           ? null
-          : React.createElement('span', { key: 'sum', className: 'dim-jh-badgeSectionSum' }, `合计 ${sum}`),
+          : React.createElement('span', { key: 'sum', className: 'dim-jh-badgeSectionSum' },
+            quotaGroup === undefined ? `合计 ${sum}` : sum),
       ]),
       ...(accounts.length === 0
         ? [React.createElement('div', { key: 'empty', className: 'dim-jh-badgeNote' },
@@ -1042,7 +1055,17 @@ function UsageBadgeActive(props) {
 
 /** 一个账号的余额行（数值 + 单位）。 */
 function balanceLine(balance) {
-  const unit = (balance.packages || []).find((pkg) => pkg && pkg.unit)?.unit;
+  const packages = balance.packages || [];
+  const unit = packages.find((pkg) => pkg && pkg.unit)?.unit;
+  /**
+   * ⚠️ 配额窗口（Gemini）**不显示均值 + 「额度」**，而是逐窗口百分比。
+   *
+   * 「94.50 额度」这个形状是错的：94.50 是两个窗口剩余比例的均值，
+   * 上游根本没有这个数，而「额度」这个标签下它会被读成 94.5 个额度。
+   * 逐窗口列出来才是这份读数本来的形状（与设置页账号卡片同一函数）。
+   */
+  const quota = formatQuotaLine(packages, unit);
+  if (quota !== null) return quota;
   const text = formatUnits(balance.total, unit) ?? '0';
   return `${text} ${unitLabel(unit)}`;
 }
@@ -1057,6 +1080,23 @@ function balanceLine(balance) {
 function splitLine(balance, windowDays, provider) {
   const packages = balance.packages || [];
   const unit = packages.find((pkg) => pkg && pkg.unit)?.unit;
+  /**
+   * 配额窗口（Gemini）：灰色小字显示**各窗口的重置倒计时**。
+   *
+   * 它替代了本行的原职责（「长期 / 临时」分桶）：配额包没有 `deductionEndTime`，
+   * 也不是「每日池」，两条分桶路径都不命中 ⇒ 原先这一行恒为空。
+   * 而对配额读数来说，用户唯一需要补的信息正是「这个窗口什么时候回来」——
+   * 剩下的百分比本身已经在主行里逐窗口列出来了。
+   */
+  if (unit === QUOTA_UNIT) {
+    const parts = [];
+    for (const pkg of packages) {
+      if (!pkg) continue;
+      const left = quotaResetsIn(pkg.cycleEndTime);
+      if (left.length > 0) parts.push(`${pkg.name || '未命名'} ${left}`);
+    }
+    return parts.join(' · ');
+  }
   const format = (value) => formatUnits(value, unit);
   const poolText = formatPoolSplitLine(packages, format, provider === 'loomy' ? '永久' : '长期');
   if (poolText !== null) return poolText;

@@ -62,6 +62,9 @@ const STYLES = `
  * 故容器保持透明（加白底反而会出现一圈突兀的方块）。
  */
 .dim-jh-providerIcon.zcode { background: transparent; }
+/* Gemini Code Assist：内联 SVG 自带蓝紫渐变星形，白底容器中显示清晰。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
+.dim-jh-providerIcon.gemini { background: white; }
 
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }
@@ -184,6 +187,11 @@ const STYLES = `
 .dim-jh-probeNotice[data-tone="error"] { border-color: color-mix(in srgb, #d93025 35%, var(--dsw-alias-border-l2, #eef0f3)); background: rgb(217 48 37 / 8%); color: #b3261e; }
 .dim-jh-probeDetails { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 2px; }
 .dim-jh-probeDetails li { font-size: 12px; line-height: 18px; }
+/* 授权链接 + 复制按钮同行。链接不设 min-width: 0 时，300+ 字符的 URL 会把按钮顶出可视区。 */
+.dim-jh-loginLinkRow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
+.dim-jh-loginLink { flex: 1 1 240px; min-width: 0; color: var(--dsw-alias-link); word-break: break-all; }
+/* 复制失败时把链接变成一次点击全选，用户能直接 Ctrl+C。 */
+.dim-jh-loginLinkRow[data-copy-state="failed"] .dim-jh-loginLink { user-select: all; }
 
 /* 登录弹窗 */
 .dim-jh-loginOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; z-index: 1000; }

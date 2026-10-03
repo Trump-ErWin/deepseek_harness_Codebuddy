@@ -16,7 +16,7 @@ import {
 } from '../../plugin-src/client/badge-model.js'
 // 宿主侧的同一份枚举：两边必须逐字一致（`usage.badgePreference` 会拒绝非法值）
 import { BADGE_PREFERENCES as HOST_BADGE_PREFERENCES } from '../../src/badge-preferences.js'
-import { formatUnits, unitLabel } from '../../plugin-src/client/credits-format.js'
+import { formatUnits, formatQuotaLine, unitLabel, QUOTA_UNIT } from '../../plugin-src/client/credits-format.js'
 
 /**
  * 用量徽标**折叠态**的纯逻辑回归（不依赖 react，故可直接 import 真实现）。
@@ -639,5 +639,94 @@ describe('与设置页共用同一套格式化（防止两处数字不一致）'
     expect(formatUnits(94_539_275, 'token')).toBe('94.54M')
     expect(unitLabel('token')).toBe('Token')
     expect(unitLabel(undefined)).toBe('积分')
+  })
+})
+
+/**
+ * 用户报障（2026-10-03）原文：「95 积分；为什么显示的是积分不是额度，
+ * 计划里应该说了会显示额度」。
+ *
+ * 三层错误叠在一起：标签（`unitLabel` 的「其余 ⇒ 积分」兜底）、
+ * 数字（`formatCredits` 把 94.5 补成 `94.50`）、以及 94.5 本身——
+ * 它是宿主把两个窗口剩余比例取的平均值，**上游根本没有这个数**。
+ * 计划 §3.3 明确要求「面板会显示『5 小时窗口 99% / 周窗口 99%』
+ * 而非『N 积分』……不要假装成积分数字」。
+ */
+describe('配额窗口（Gemini）：逐窗口百分比，不显示均值也不显示「积分」', () => {
+  /** 配额包：单位 `%`，`remaining` 是剩余百分比。 */
+  const quotaPkg = (name, remaining, cycleEndTime = '') => ({
+    name, unit: QUOTA_UNIT, remaining, total: 100, used: 100 - remaining,
+    active: true, cycleStartTime: '', cycleEndTime, expiredTime: '',
+  })
+
+  /** 配额账号行：`total` 是宿主算的两窗口均值（这里就是真实形状）。 */
+  const quotaRow = (accountId, packages) => ({
+    accountId,
+    nickname: accountId,
+    balance: {
+      total: packages.reduce((sum, item) => sum + item.remaining, 0) / packages.length,
+      packages,
+      expiredTotal: 0,
+    },
+  })
+
+  it('单位 `%` 走百分比格式化与「额度」标签', () => {
+    expect(formatUnits(94.5, QUOTA_UNIT)).toBe('95%')
+    expect(unitLabel(QUOTA_UNIT)).toBe('额度')
+  })
+
+  it('逐窗口列出各自的剩余百分比，不做求和也不取均值', () => {
+    const packages = [quotaPkg('5 小时窗口', 0), quotaPkg('周窗口', 90)]
+    expect(formatQuotaLine(packages, QUOTA_UNIT)).toBe('5 小时窗口 0% · 周窗口 90%')
+  })
+
+  it('非配额单位返回 null（调用方原样走积分 / token 分支，零影响）', () => {
+    expect(formatQuotaLine([pkg('Bonus Pack', 100)], 'credits')).toBe(null)
+    expect(formatQuotaLine(undefined, QUOTA_UNIT)).toBe(null)
+  })
+
+  it('分组带逐账号窗口行，且均值不再出现在文案里', () => {
+    const groups = creditGroupsOf([quotaRow('a', [quotaPkg('5 小时窗口', 0), quotaPkg('周窗口', 90)])])
+    expect(groups.groups[0].quotaLines).toEqual(['5 小时窗口 0% · 周窗口 90%'])
+    const view = badgeView({ providerLabel: 'Gemini', accounts: [quotaRow('a', [quotaPkg('5 小时窗口', 0), quotaPkg('周窗口', 90)])] })
+    expect(view.mode).toBe('credits')
+    // ⚠️ 分隔符是 ` • `（`BADGE_SEP`，上游 2026-10-03 改的）；` · ` 只用于读数内部。
+    expect(view.text).toBe('Gemini • 5 小时窗口 0% · 周窗口 90%')
+    // 「合计 45 额度」是被修掉的形状：均值既不是上游的数，「合计」也暗示可累加
+    expect(view.text).not.toContain('合计')
+    expect(view.text).not.toContain('45')
+  })
+
+  it('色调取**最紧张**的窗口，不被均值抹平', () => {
+    // 均值 (0+90)/2 = 45% ⇒ 老判据 `total > 0` 会画绿点，而 5 小时窗口已耗尽
+    const view = badgeView({ providerLabel: 'Gemini', accounts: [quotaRow('a', [quotaPkg('5 小时窗口', 0), quotaPkg('周窗口', 90)])] })
+    expect(view.tone).toBe('error')
+  })
+
+  it('窗口都宽裕时是 ok（不是一律告警）', () => {
+    const view = badgeView({ providerLabel: 'Gemini', accounts: [quotaRow('a', [quotaPkg('5 小时窗口', 80), quotaPkg('周窗口', 90)])] })
+    expect(view.tone).toBe('ok')
+  })
+
+  it('多账号：逐账号各自的窗口行并列，不跨账号求和', () => {
+    const view = badgeView({
+      providerLabel: 'Gemini',
+      accounts: [quotaRow('a', [quotaPkg('周窗口', 90)]), quotaRow('b', [quotaPkg('周窗口', 30)])],
+    })
+    expect(view.text).toBe('Gemini • 周窗口 90% · 周窗口 30%')
+  })
+
+  it('包上没有可用数字时给出「额度不可用」，不画成 0', () => {
+    const broken = { accountId: 'a', nickname: 'a', balance: { total: 0, packages: [quotaPkg('周窗口', undefined)], expiredTotal: 0 } }
+    const view = badgeView({ providerLabel: 'Gemini', accounts: [broken] })
+    expect(view.text).toBe('Gemini • 额度不可用')
+  })
+
+  it('其它单位的文案与色调逐字不变（回归护栏）', () => {
+    const credits = badgeView({ providerLabel: 'ZCode', accounts: [row('a', [pkg('Bonus Pack', 100)])] })
+    expect(credits.text).toBe('ZCode • 100积分')
+    expect(credits.tone).toBe('ok')
+    const tokens = badgeView({ providerLabel: 'ZCode', accounts: [row('a', [pkg('GLM-5.2', 94_539_275, 'token')])] })
+    expect(tokens.text).toBe('ZCode • 94.54MToken')
   })
 })

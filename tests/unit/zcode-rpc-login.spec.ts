@@ -515,11 +515,14 @@ describe('ZCode Jet Hub 登录接入', () => {
     const call = /registerJetHubRpc\(([^)]*)\)/.exec(source)
     expect(call?.[1]).toBeDefined()
     const args = (call?.[1] ?? '').split(',').map((s) => s.trim())
-    // ctx, pool, 然后 12 个 provider（合并后 minimax 排在 zcode 前），最后 modelAdapters。
-    expect(args.length).toBe(15)
-    expect(args[args.length - 4]).toBe('raccoon')
-    expect(args[args.length - 3]).toBe('minimax')
-    expect(args[args.length - 2]).toBe('zcode')
+    // ctx, pool, 然后 13 个 provider（minimax → zcode → gemini），最后 modelAdapters。
+    // ⚠️ 新 provider 一律**追加在末尾**（gemini 排在 zcode 之后），既有调用点
+    // 才不用逐个补占位 —— 见 `registerJetHubRpc` 签名上方的注释。
+    expect(args.length).toBe(16)
+    expect(args[args.length - 5]).toBe('raccoon')
+    expect(args[args.length - 4]).toBe('minimax')
+    expect(args[args.length - 3]).toBe('zcode')
+    expect(args[args.length - 2]).toBe('gemini')
     expect(args[args.length - 1]).toBe('modelAdapters')
   })
 })
