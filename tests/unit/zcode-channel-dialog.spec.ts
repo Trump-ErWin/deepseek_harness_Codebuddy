@@ -13,44 +13,45 @@
  *
  * ⚠ 纯源码契约：这类 UI 位置没有单测能真正跑起来（要起 React 树），
  *   而它恰恰是最容易被"顺手改回去"的地方 —— 改回去不会有任何测试失败。
+ *
+ * ## ⚠ 入口只剩一个（Gitee issue IKJLHQ）
+ *
+ * 第二个入口曾是官方「设置 → 模型 → 模型卡片」里的 ZCode 账号区
+ * （`plugin-src/client/zcode-card.js`）。它靠占用 keyed 槽
+ * `settings.models.provider-card` 的 `llm-pi-ai` key 实现，而该 key 与其它
+ * 第三方 pi-ai 扩展**物理互斥**（同 key 的第二个注册者被 `SlotCore.register`
+ * 抛错、渲染侧每个 key 只取 ledger 里首个 live 条目）—— 已整体移除，
+ * ZCode 账号管理现在只在 Jet Hub 页。本文件最后两条用例把这条红线钉住。
  */
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 const dir = dirname(fileURLToPath(import.meta.url))
 const panel = readFileSync(resolve(dir, '../../plugin-src/client/jet-hub.js'), 'utf8')
-const card = readFileSync(resolve(dir, '../../plugin-src/client/zcode-card.js'), 'utf8')
+const entry = readFileSync(resolve(dir, '../../plugin-src/client/index.js'), 'utf8')
 const styles = readFileSync(resolve(dir, '../../plugin-src/client/jet-hub-styles.js'), 'utf8')
 
 describe('★ 渠道选择在「新建账号弹窗」里，不在按钮旁', () => {
-  it('★ 两个入口都改为「点按钮 → 开弹窗」（不再直接调 createAccount）', () => {
+  it('★ 按钮改为「点按钮 → 开弹窗」（不再直接调 createAccount）', () => {
     expect(panel, 'jet-hub.js 按钮应开弹窗').toContain('onClick: () => setPendingLogin(false)')
-    expect(card, 'zcode-card.js 按钮应开弹窗').toContain("btn('create', '添加账号', '登录中…', () => setPendingLogin(false))")
   })
 
-  it('★ 两个入口都有 pendingLogin 状态（弹窗开着 + 要 forceNew 不可能不同步）', () => {
+  it('★ 有 pendingLogin 状态（弹窗开着 + 要 forceNew 不可能不同步）', () => {
     expect(panel).toMatch(/const \[pendingLogin, setPendingLogin\] = React\.useState\(undefined\)/)
-    expect(card).toMatch(/const \[pendingLogin, setPendingLogin\] = React\.useState\(undefined\)/)
   })
 
-  it('★ 两个入口的弹窗都含渠道选择与两个选项', () => {
-    for (const [name, src] of [['jet-hub.js', panel], ['zcode-card.js', card]] as const) {
-      expect(src, `${name} 缺弹窗遮罩`).toContain('dim-jh-zcDialogMask')
-      expect(src, `${name} 缺国内选项`).toContain("value: 'bigmodel'")
-      expect(src, `${name} 缺国际选项`).toContain("value: 'zai'")
-    }
+  it('★ 弹窗含渠道选择与两个选项', () => {
+    expect(panel, '缺弹窗遮罩').toContain('dim-jh-zcDialogMask')
+    expect(panel, '缺国内选项').toContain("value: 'bigmodel'")
+    expect(panel, '缺国际选项').toContain("value: 'zai'")
   })
-
 
   it('★ ★ 渠道不再渲染在按钮旁（按钮的 onClick 里不得直接调 createAccount）', () => {
     // 这是本次改动的**核心**：按钮直接调 createAccount ⇒ 渠道无处可选
     expect(panel, 'jet-hub.js 按钮仍在直接调 createAccount').not.toMatch(
       /onClick: \(\) => void createAccount\(false\)/,
-    )
-    expect(card, 'zcode-card.js 按钮仍在直接调 createAccount').not.toMatch(
-      /btn\('create',[^\n]*\(\) => createAccount\(false\)\)/,
     )
   })
 
@@ -59,29 +60,23 @@ describe('★ 渠道选择在「新建账号弹窗」里，不在按钮旁', () 
     expect(panel).toMatch(/\{ provider, zcodeProvider/)
     // ⚠ 断言的是 `account.create` 的**载荷里真的带它**，不是「文件里出现过这个词」——
     //   后者会在载荷被删、而弹窗里还留着同名 state 时误判为通过（反向验证抓到过）。
-    expect(card).toMatch(/await call\('account\.create',[\s\S]{0,200}?zcodeProvider/)
+    expect(panel).toMatch(/await rpcCall\('account\.create',[\s\S]{0,200}?zcodeProvider/)
   })
 
   it('★ ★ 弹窗是**条件渲染**的（不是常驻），且条件是 pendingLogin', () => {
     // ⚠ 只查「有没有 zcDialogMask」不够：把条件写成 `false` 后文本仍在，
     //   弹窗却永远不渲染（反向验证的变异 2 就是这样溜过去的）。
-    for (const [name, src] of [['jet-hub.js', panel], ['zcode-card.js', card]] as const) {
-      expect(src, `${name} 弹窗未挂在 pendingLogin 条件上`)
-        .toMatch(/pendingLogin === undefined \? null : (React\.createElement|h)\(/)
-    }
+    expect(panel, '弹窗未挂在 pendingLogin 条件上')
+      .toMatch(/pendingLogin === undefined \? null : (React\.createElement|h)\(/)
   })
 
-  it('★ 两个入口的国际选项文案保留（删了就只剩国内）', () => {
-    for (const [name, src] of [['jet-hub.js', panel], ['zcode-card.js', card]] as const) {
-      expect(src, `${name} 国际选项文案缺失`).toContain('z.ai（chat.z.ai，国际版）')
-    }
+  it('★ 国际选项文案保留（删了就只剩国内）', () => {
+    expect(panel, '国际选项文案缺失').toContain('z.ai（chat.z.ai，国际版）')
   })
 
   it('★ 「确定」才发起登录（点确定 → createAccount()，无参）', () => {
     // ⚠ 撤掉「登录其他账号」后 createAccount 不再收 forceNew（用户 2026-10-02）
-    for (const src of [panel, card]) {
-      expect(src, '确定回调不得再传 forceNew').not.toMatch(/createAccount\(forceNew\)/)
-    }
+    expect(panel, '确定回调不得再传 forceNew').not.toMatch(/createAccount\(forceNew\)/)
   })
 
   it('★ 弹窗样式齐备（否则弹出来是透明的无边框块）', () => {
@@ -101,5 +96,57 @@ describe('★ 渠道选择在「新建账号弹窗」里，不在按钮旁', () 
     // 报错看起来像 CSS 写错、实际是 JS 语法问题。
     const ticks = (styles.match(/`/g) ?? []).length
     expect(ticks, 'styles 反引号数不为 2，模板字符串可能被破坏').toBe(2)
+  })
+})
+
+/**
+ * Gitee issue IKJLHQ 的红线。
+ *
+ * `settings.models.provider-card` 是 **keyed** 槽，其 `key` 的语义是
+ * 「这张卡片的 `settingsNs`」—— 官方按 `entryKey = row.entry.settingsNs` 精确查表
+ * （`dsh-client-ui-settings-models` 的 `renderSlot(..., { entryKey })`），
+ * 且 `entriesOfSlot` 对每个 key 只返回 **ledger（注册顺序）里的首个 live 条目**：
+ *
+ * - 同 key + 同 priority 的第二个 `register` **抛错**（`already has an entry for key`）；
+ * - 换 priority 只能免掉那次抛错，仍然只有一个 winner，**不构成共存**；
+ * - 换一个"独立 key"（如 `llm-pi-ai-zcode`）会让**我们自己的卡片**不再被查表命中。
+ *
+ * zcode 没有自己的适配器家族（`dsh-llm-pi-ai` 把所有 route 目录行的 `settingsNs`
+ * 统一设成 `llm-pi-ai`），所以想「就近」把账号 UI 放进官方卡片，就只能抢这个 key，
+ * 而抢的结果是同装 `@linxin666/dsh-client-ui-model-capabilities` 的用户
+ * **模型能力编辑面板静默消失**（对方把 register 包在 try/catch 里吞掉错误）。
+ *
+ * ⇒ 账号管理只放 Jet Hub 页。这几条用例防止有人"顺手把就近卡片加回来"。
+ */
+describe('★ IKJLHQ：不得再占用 settings.models.provider-card 的 llm-pi-ai key', () => {
+  // ⚠ 判据必须是「**没有 inject/register 这个槽**」，不能断言「文件里没有这个字符串」——
+  //   index.js 的文件头注释里就写着这个名字（那正是解释为什么不注册的依据）。
+  const SLOT_RE = /slots\.inject\(\s*['"]settings\.models\.provider-card['"]/
+  const REGISTER_RE = /slots\.register\([\s\S]{0,120}?['"]settings\.models\.provider-card['"]/
+
+  it('★ 客户端入口不再注册 provider-card 槽', () => {
+    expect(entry, 'index.js 仍在 inject settings.models.provider-card').not.toMatch(SLOT_RE)
+    expect(entry, 'index.js 仍在 register settings.models.provider-card').not.toMatch(REGISTER_RE)
+    expect(entry, 'index.js 仍引用已删的卡片组件').not.toMatch(/zcode-card/)
+  })
+
+  it('★ 卡片组件文件已删除，且无人 import 它', () => {
+    const cardPath = resolve(dir, '../../plugin-src/client/zcode-card.js')
+    expect(existsSync(cardPath), 'zcode-card.js 还在（账号管理应只在 Jet Hub 页）').toBe(false)
+    expect(panel, 'jet-hub.js 仍引用 zcode-card').not.toMatch(/zcode-card/)
+    expect(styles, 'jet-hub-styles.js 仍引用 zcode-card').not.toMatch(/zcode-card\.js/)
+  })
+
+  it('★ 全仓客户端源码不再注入/注册该槽（防新增第二个占用者）', () => {
+    for (const name of ['index.js', 'jet-hub.js', 'usage-badge.js', 'zcode-carrier.js']) {
+      const src = readFileSync(resolve(dir, '../../plugin-src/client/', name), 'utf8')
+      expect(src, `${name} 仍在 inject 该槽`).not.toMatch(SLOT_RE)
+      expect(src, `${name} 仍在 register 该槽`).not.toMatch(REGISTER_RE)
+    }
+  })
+
+  it('★ 说明「为什么不能注册」的红线注释仍在（删组件时别把依据一起删了）', () => {
+    expect(entry, 'index.js 缺少 IKJLHQ 的互斥说明')
+      .toMatch(/IKJLHQ[\s\S]{0,2000}llm-pi-ai/)
   })
 })

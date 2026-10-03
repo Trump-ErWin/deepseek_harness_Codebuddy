@@ -1,12 +1,42 @@
 /**
  * Jet Hub 管理页面客户端插件。
  *
- * 注册三处：
+ * 注册两处：
  * 1. `settings.section` —— Jet Hub 设置页面；
- * 2. `settings.models.provider-card`（keyed 槽）—— 把 ZCode 的账号按键
- *    嵌进官方「设置 → 模型 → 模型卡片 → 编辑」里；
- * 3. `conversation.input.right`（list 槽，会话作用域）—— 模型选择器旁的
+ * 2. `conversation.input.right`（list 槽，会话作用域）—— 模型选择器旁的
  *    **用量徽标**（订阅优先 / 积分兜底，点击展开明细）。
+ *
+ * ## ⚠⚠️ 刻意**不**注册 `settings.models.provider-card`（Gitee issue IKJLHQ）
+ *
+ * 那个 keyed 槽的 `key` 语义**不是**自由命名空间，而是「这张卡片的
+ * `settingsNs`」：官方渲染时按 `entryKey = row.entry.settingsNs` 精确查表
+ * （`dsh-client-ui-settings-models/lib/client.js`）：
+ *
+ * ```js
+ * renderSlot('settings.models.provider-card', { provider: row.entry, ... }, { entryKey: row.entry.settingsNs })
+ * // 渲染侧：entriesOfSlot(slot).find(e => e.options.key === entryKey) —— 每 key 只渲染一个 winner
+ * ```
+ *
+ * 后果是**同一个 `settingsNs` 上的第三方扩展互斥**：
+ * - `SlotCore.register` 对「同 key + 同 priority」的第二个注册者**直接抛错**
+ *   （`keyed slot "…" already has an entry for key "…"`）；
+ * - `entriesOfSlot` 按 **ledger（注册）顺序**取每个 cell 的首个 live 条目，
+ *   **`priority` 不参与排序** —— 换 priority 只能免掉那次抛错，仍然只有一个 winner；
+ * - 谁 bundle 先到谁赢，后到的那方要么抛错（未捕获时 `slots.inject` 会 `stop()`
+ *   并 `queueMicrotask(throw)`）、要么被 try/catch 静默吞掉而**无声消失**。
+ *
+ * 本插件曾以 `key: 'llm-pi-ai'` 注册 ZCode 卡片，于是与同样扩展 pi-ai 家族的
+ * `@linxin666/dsh-client-ui-model-capabilities`（它的 `PI_AI_SETTINGS_NAMESPACE`
+ * 注释就写着「the card slot's key」）**互斥**：两插件共存时，谁先到谁渲染，
+ * 另一方的模型能力编辑面板**静默消失**（用户报障 IKJLHQ）。
+ *
+ * ⚠️ **换独立 key（`llm-pi-ai-zcode` 之类）并不能共存，只会让 ZCode 卡片自己消失** ——
+ * 官方是按 `entryKey` 精确 `find`，换个 key 直接落空。而 zcode 本来就没有自己的
+ * 适配器家族：`dsh-llm-pi-ai` 把**所有** route 目录行的 `settingsNs` 统一设成
+ * `llm-pi-ai`，用户手工加的 `zcode` route 也一样。
+ *
+ * ⇒ 结论：ZCode 账号管理**只在 Jet Hub 设置页**（本页功能完整）。别为了「就近操作」
+ * 把这个槽抢回来 —— 那等于让所有装了第三方 pi-ai 扩展的用户失去他们的面板。
  */
 
 export const name = 'jet-hub-client'
@@ -41,7 +71,6 @@ import { callManagementRpc, unwrapRpcResult } from '../management-rpc.mjs'
 import { installJetHubStyles } from './jet-hub-styles.js'
 import { JET_HUB_RPC_CHANNEL, JetHubPage, providerLabel } from './jet-hub.js'
 import { startCarrierContribution } from './zcode-carrier.js'
-import { ZcodeProviderCard } from './zcode-card.js'
 import { UsageBadge } from './usage-badge.js'
 
 export function apply(ctx) {
@@ -72,22 +101,6 @@ export function apply(ctx) {
     label: () => 'Jet Hub',
     inject: () => ({ rpcCall }),
   }, JetHubPage))
-
-  /**
-   * 官方「模型卡片 → 编辑」里的 provider-card 槽。
-   *
-   * ⚠ 三条硬约束（改这里之前先读 `zcode-card.js` 顶部注释）：
-   * 1. 该槽是 **keyed** 槽，注册必须用 **`key`**（不是 `id`），否则
-   *    `dsh-client-ui-slots` 抛 `keyed slot "..." requires options.key`；
-   * 2. 全部 `llm-pi-ai` route 共用同一个 `settingsNs`（`llm-pi-ai`），
-   *    故这里注册一次会收到该家族**每一张**卡片 —— 「是不是 zcode 这一行」
-   *    由组件内部按 `props.provider.provider` 自判，**不能**按 `settingsNs` 判；
-   * 3. `inject` 里的 `rpcCall` 与上面 settings.section 用的是同一个闭包函数。
-   */
-  ctx.slots.inject('settings.models.provider-card', () => ctx.slots.register(
-    { name: 'settings.models.provider-card', key: 'llm-pi-ai', inject: () => ({ rpcCall }) },
-    ZcodeProviderCard,
-  ))
 
   /**
    * 模型选择器旁的**用量徽标**（`conversation.input.right`）。
