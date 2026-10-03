@@ -208,8 +208,8 @@ export class GeminiAdapter extends LlmAdapter {
     if (maxTokens !== undefined && Number.isSafeInteger(maxTokens) && maxTokens > 0) {
       resolved.defaultMaxTokens = maxTokens
     }
-    // ⚠️ lite 无档位 ⇒ 返回 undefined ⇒ **不声明**（空数组会让面板显示一个
-    // 点不开的空下拉框）。
+    // ⚠️ 无档位的模型（例如用户手填的未知 id）⇒ `undefined` ⇒ **不声明**
+    //（空数组会让面板显示一个点不开的空下拉框）。
     if (entry !== undefined) {
       const reasoning = geminiReasoningInfo(entry)
       if (reasoning !== undefined) resolved.reasoning = reasoning
