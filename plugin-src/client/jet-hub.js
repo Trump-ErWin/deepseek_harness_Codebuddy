@@ -61,6 +61,8 @@ import {
   formatCredits,
   formatTokens,
   formatUnits,
+  formatQuotaLine,
+  formatQuotaDetail,
   unitLabel,
 } from './credits-format.js';
 import {
@@ -481,6 +483,18 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
   const total = formatUnits(balance.total, unit) ?? '0';
   const activeCount = all.filter(p => p.active).length;
   /**
+   * 配额窗口（Gemini）：主行显示**逐窗口百分比**，不显示均值。
+   *
+   * 用户报障原文：「95 积分；为什么显示的是积分不是额度，计划里应该说了会显示额度」。
+   * 两层错误叠在一起：标签走了 `unitLabel` 的「其余 ⇒ 积分」兜底分支，
+   * 数字走了 `formatCredits` 的两位小数（94.5 ⇒ `94.50`）。而 94.5 本身还是
+   * 两个窗口剩余比例的**平均**——一个上游根本不存在的数。逐窗口列出来
+   * 才是这份读数本来的形状（计划 §3.3：「5 小时窗口 99% / 周窗口 99%」）。
+   *
+   * ⚠️ 非配额单位时 `quotaText` 为 `null`，下面全部走老分支，**零影响**。
+   */
+  const quotaText = formatQuotaLine(all, unit);
+  /**
    * ⚠️ 分类在**渲染的这一刻**用当前时间现算，绝不存进 state、也不缓存到别处：
    * 「临时 / 永久」等于「距扣费截止是否满 N 天」，而宿主长期开着、时间只向前流 ——
    * 一笔距到期 15 天 30 秒的余额，用户什么都不做，半分钟后就越过线。
@@ -499,6 +513,13 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     all.length > 1 ? `共 ${all.length} 个资源包，${activeCount} 个有效` : null,
     ...all.map(pkg => formatPackageLine(pkg, windowDays, now)),
   ].filter(Boolean).join('\n');
+  /**
+   * 配额窗口的明细与主行**都换成百分比口径**。
+   *
+   * ⚠️ 明细绝不能沿用上面的 `formatPackageLine`（`95 / 100` 会被读成
+   * 「95 个积分，一共 100 个」）——见 `formatQuotaDetail` 的注释。
+   */
+  const quotaDetail = quotaText === null ? null : formatQuotaDetail(all);
   /**
    * Loomy / Raccoon 的「当日刷新池」必须**单独显示**（用户明确要求）。
    *
@@ -521,9 +542,11 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     React.createElement('dt', null, label),
     React.createElement('dd', {
       className: 'dim-jh-creditValue',
-      title: detail || undefined,
+      title: quotaDetail ?? (detail || undefined),
     },
-    React.createElement('strong', { className: 'dim-jh-creditTotal' }, total),
+    // ⚠️ 配额窗口显示**逐窗口百分比**而不是均值：均值（94.5）既不是上游给的数，
+    // 在「额度」这个标签下更会被读成 94.5 个积分。见 quotaText 的注释。
+    React.createElement('strong', { className: 'dim-jh-creditTotal' }, quotaText ?? total),
     // 当日池分桶（loomy / raccoon）：`formatPoolSplitLine` 已覆盖原先硬编码的
     // loomy 两池判据，且对 Raccoon 的「每日积分」同样成立（用户 2026-09-29 要求）。
     // ⚠ 数字按**包自身的单位**格式化（remote 的单位支持）：池可能来自
@@ -548,6 +571,8 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
     // 失效额度单独提示：它们仍在服务端响应里，但不计入上面的数字
+    // ⚠️ 配额单位下恒不渲染（`expiredTotal` 就是 0），留着分支只为不改变
+    // 其它 provider 的行为。
     balance.expiredTotal > 0
       ? React.createElement('span', { className: 'dim-jh-creditExpired' },
           `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)

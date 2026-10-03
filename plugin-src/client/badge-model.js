@@ -24,7 +24,7 @@
  * 单位一致，但代码里不做这个假设 —— 出现两种单位时按单位分组并列显示。
  */
 
-import { formatUnits, unitLabel } from './credits-format.js';
+import { formatUnits, formatQuotaLine, unitLabel, QUOTA_UNIT } from './credits-format.js';
 import { quotaWindowsOf, quotaPercentValue, quotaTone } from './quota-format.js';
 
 /**
@@ -108,7 +108,16 @@ export function windowPreview(windows, limit = 2) {
  * - `failedCount` 单独给出，供 UI 说明「另有 N 个账号读取失败」——
  *   **不要把失败画成 0**（0 会被读成「额度用光了」）。
  *
- * @returns `{ groups: [{ unit, label, total, accountCount }], failedCount, okCount }`
+ * ⚠️ **配额单位（{@link QUOTA_UNIT}）不求和、也不显示均值**：窗口是并行的
+ * 百分比，`balance.total` 只是宿主侧把两个窗口剩余比例取的平均（94.5）——
+ * 上游根本没有这个数，累加更是无意义（两个账号各 50% 加起来是 100%？）。
+ * 这类单位改为**逐账号列出各自的窗口行**（`quotaLines`），由
+ * {@link textOf} 原样展示。
+ *
+ * ⚠️ `quotaLines` / `quotaRemainings` 两个键**只在配额单位下存在**：其它单位
+ * 的分组形状与改动前逐字相同（有测试直接 `toEqual` 整个分组对象）。
+ *
+ * @returns `{ groups: [{ unit, label, total, accountCount, quotaLines?, quotaRemainings? }], failedCount, okCount }`
  */
 export function creditGroupsOf(accounts) {
   const rows = Array.isArray(accounts) ? accounts : [];
@@ -128,6 +137,17 @@ export function creditGroupsOf(accounts) {
     const group = byUnit.get(unit) ?? { unit, label: unitLabel(unit), total: 0, accountCount: 0 };
     group.total += balance.total;
     group.accountCount += 1;
+    if (unit === QUOTA_UNIT) {
+      const line = formatQuotaLine(balance.packages, unit);
+      group.quotaLines = group.quotaLines ?? [];
+      group.quotaRemainings = group.quotaRemainings ?? [];
+      if (line !== null) group.quotaLines.push(line);
+      for (const pkg of Array.isArray(balance.packages) ? balance.packages : []) {
+        if (pkg && typeof pkg.remaining === 'number' && Number.isFinite(pkg.remaining)) {
+          group.quotaRemainings.push(pkg.remaining);
+        }
+      }
+    }
     byUnit.set(unit, group);
   }
   // 顺序固定：单位名排序（通常只有一个分组；多单位时顺序稳定，避免每次渲染抖动）
@@ -273,6 +293,18 @@ function textOf({ mode, providerLabel, windows, planGroups, groups, accounts, fa
     return `${providerLabel} · ${best.name} ${range} ${best.label}`;
   }
   if (mode === 'credits') {
+    /**
+     * ⚠️ 配额单位（Gemini）**不显示「合计 94.50 额度」**：那 94.50 是宿主把
+     * 两个窗口剩余比例取的平均值，上游根本没有这个数，而「合计」这个词又暗示
+     * 可累加——配额窗口是并行百分比，没有「一共」的语义。
+     * 改为逐账号列出各自的窗口行（与设置页账号卡片同一个 `formatQuotaLine`）。
+     */
+    const quotaGroup = groups.find((group) => group.unit === QUOTA_UNIT);
+    if (quotaGroup !== undefined) {
+      const lines = quotaGroup.quotaLines ?? [];
+      if (lines.length === 0) return `${providerLabel} · 额度不可用`;
+      return `${providerLabel} · ${lines.join(' · ')}`;
+    }
     const parts = groups.map((group) => `${formatUnits(group.total, group.unit) ?? '?'} ${group.label}`);
     return `${providerLabel} · 合计 ${parts.join(' · ')}`;
   }
@@ -289,6 +321,14 @@ function toneOf({ mode, windows, planGroups, groups, accounts }) {
   }
   if (mode === 'plan') return planGroups[0].remaining > 0 ? 'ok' : 'warn';
   if (mode === 'credits') {
+    // ⚠️ 配额单位用**最紧张的那个窗口**判色调（与 windows 模式同一套三档）：
+    // 用 `group.total > 0`（均值）会把「5 小时窗口已耗尽、周窗口还剩 90%」
+    // 的账号画成绿点 —— 那个 45% 的均值正好绕过告警线。
+    const quotaGroup = groups.find((group) => group.unit === QUOTA_UNIT);
+    if (quotaGroup !== undefined) {
+      const remainings = quotaGroup.quotaRemainings ?? [];
+      return remainings.length === 0 ? 'warn' : quotaTone(100 - Math.min(...remainings));
+    }
     return groups.some((group) => group.total > 0) ? 'ok' : 'warn';
   }
   return accounts.length > 0 ? 'error' : 'muted';
