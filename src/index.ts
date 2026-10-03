@@ -49,6 +49,11 @@ import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
 import { MINIMAX } from './minimax-product.js'
 import type { MinimaxCredential } from './minimax.js'
+import { GeminiAuth } from './gemini-auth.js'
+import { registerGeminiLlm } from './gemini-adapter.js'
+import { GEMINI } from './gemini.js'
+import type { GeminiCredential } from './gemini.js'
+import { createGeminiSigStore } from './gemini-sigstore.js'
 import { registerOpencodeLlm } from './opencode-adapter.js'
 // ⚠️ opencode 的 RPC 由 `jet-hub-rpc.ts` 的 handleMethod 统一分派
 // （它调 handleOpencodeRpc），本文件**不再**单独注册端点 —— 详见
@@ -272,7 +277,7 @@ export function apply(ctx: Context): void {
   registerProviderSettings(
     ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
     'llm-qoder', 'llm-qodercn', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
-    'llm-minimax', 'llm-zcode',
+    'llm-minimax', 'llm-zcode', 'llm-gemini',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -1106,6 +1111,76 @@ export function apply(ctx: Context): void {
     product: MINIMAX,
   })
 
+  // ===== Gemini（Google Cloud Code Assist 免费线）=====
+  //
+  // ⚠️ **只做 OAuth**（用户拍板）：API key / AI Studio 两条线不做 —— 免费线
+  // 是 Cloud Code 项目制，凭据就是 Google OAuth 的 access_token + refresh_token。
+  //
+  // 与其余 provider 的四处**形态差异**（全部来自 `docs/GEMINI-PORT-PLAN.md`
+  // §2.2 的抓包实测，**不许"顺手统一"**）：
+  //   1. 请求走**双层信封**（`{model, project, request:{contents,…}}`），且
+  //      **必须逐层字母序序列化** —— 上游对字段顺序敏感，原版靠 Go 的 map
+  //      键自动排序实现；TS 的 `JSON.stringify` 按插入序，故走
+  //      `marshalAlphabetical`（见 `gemini.ts`）。
+  //   2. 五个身份头**逐字写死**（`geminiHeaders`），且流式请求**刻意不带
+  //      `Accept`**（与抓包一致）。
+  //   3. `thoughtSignature` 是**跨轮状态**：`functionCall` 上的签名要落盘、
+  //      下一轮按「工具名 + 规范化参数」回填，否则多轮工具调用必被上游拒。
+  //      故这里建一个独立的 `gemini-sigs.json` 缓存（**不放 state.json** ——
+  //      那是整体替换语义，会被别的写入覆盖掉）。
+  //   4. 模型暴露 1 个 `gemini-3.8-flash` + 4 档 efforts（低/中/高/自适应），
+  //      外加无档位的 `gemini-3.8-flash-lite`；**不**暴露带后缀的模型名。
+  //
+  // 服务名由 GeminiAuth 依 product.id 派生，注册为 ctx.geminiAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的 Gemini 面板。
+  const gemini = new GeminiAuth(ctx)
+  const geminiSigStore = createGeminiSigStore(ctx)
+  const geminiAdapter = registerGeminiLlm(ctx, {
+    credentialRef: credentialRef(GEMINI.defaultCredentialRef),
+    resolveCredential: async (modelId?: string) => {
+      // ⚠️ provider 实参用 GEMINI.id 而非字面量（同 minimax 的既有约定：
+      // 写死字面量在改名/多产品场景下会静默查不到账号）。
+      const available = await pool.getAvailableAccount(GEMINI.id, modelId ?? '')
+      // `getAvailableAccount` 的凭据类型是历史遗留的联合类型，与
+      // `GeminiCredential` 无充分重叠，故经 `unknown` 转换；运行时安全性由
+      // provider 过滤保证（查询用 `GEMINI.id`，取到的必是 gemini 凭据）。
+      if (available) return available.credential as unknown as GeminiCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(GEMINI.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as GeminiCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // ⚠️ 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
+      // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
+      const available = await pool.getAvailableAccount(GEMINI.id, '')
+      if (available) {
+        // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
+        // 账号池，否则 UI 一直显示「已过期」而实际能正常发消息。
+        // ⚠️ `getAvailableAccount` 返回 **`{ entry, credential }`** 两层 ——
+        // 账号 id 与 credentialRef 在 **`available.entry`** 里，**不是**
+        // `available.id` / `available.credentialRef`（那是 `undefined`，
+        // 会让续期**静默写不回账号池**）。
+        await gemini.refreshAccountCredential(
+          available.entry.credentialRef, pool, available.entry.id,
+        )
+      } else {
+        await gemini.refresh()
+      }
+    },
+    // 模型表是**静态**的（用户拍板：不拉远端目录，Cloud Code 没有模型列表端点）。
+    // 故这里不传 `fetchRemoteModels`。
+    // 图片两跳：先按 640,000 px 预算取缩放版，拿不到才发原图。
+    readImage: makeReadImage(ctx),
+    readImageRequest: makeReadImageRequest(ctx),
+    sigStore: geminiSigStore,
+    accountPool: pool,
+    product: GEMINI,
+  })
+
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
   //
   // 早期实现把服务端的 `name` 直接当昵称用，而实测它是**自动生成的默认名**
@@ -1421,6 +1496,10 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     // 使用户在官方客户端重新登录后无需重启 DSH。
     // ⚠ 只按 `refreshable` 过滤、**不看 `enabled`**（AGENTS.md 既有约定）。
     ['zcode', (p) => zcode.refreshAll(p)],
+    // ⚠️ Gemini **可续期**（Google OAuth 的 refresh_token，且会轮换）。
+    // ⚠️ 漏了这一行定时器不武装：凭据到期后**不会自动续期**，
+    // 用户会看到「每隔一小时就要重新登录」，且日志里一个字都没有。
+    ['gemini', (p) => gemini.refreshAll(p)],
   ]
 
   async function refreshAllCredentials(): Promise<void> {
@@ -1655,11 +1734,17 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     loomy: loomyAdapter,
     raccoon: raccoonAdapter,
     minimax: minimaxAdapter,
+    gemini: geminiAdapter,
     zcode: zcodeAdapter,
     opencode: opencodeAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters)
+  // 插件卸载前把签名缓存落盘：`stream()` 每次结束都 flush，但用户可能
+  // 直接关掉 DSH 而上一轮的 flush 还在排队 —— 落一次盘几乎零成本，
+  // 丢的却是「下一轮工具调用能不能带上签名」。
+  ctx.effect(() => () => { void geminiSigStore.flush().catch(() => {}) })
+
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters)
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
   // 自行降级为日志，绝不会让插件 apply() 失败。
   mountOpenAiGateway(ctx, pool)

@@ -188,6 +188,24 @@ export const CREDITS_CAPABILITIES = Object.freeze({
    * 假装有余额数字（那会在用户充值后显示错误的数字）。
    */
   opencode: Object.freeze({ balance: true, dailyCheckin: false }),
+  /**
+   * Gemini Code Assist（Google Cloud Code 免费线）：**只有余额**，没有签到。
+   *
+   * - **余额**：`POST /v1internal:retrieveUserQuotaSummary`（**只读**），
+   *   返回 `{groups:[{displayName, buckets:[…]}]}`，我们只取两个桶：
+   *   `gemini-5h`（5 小时窗口）与 `gemini-weekly`（周窗口）。
+   *   ⚠️ 量纲是**剩余比例**（`remainingFraction`，0~1）而不是积分 ——
+   *   面板按百分比展示，与 ZCode 的 token 量纲同理，能力矩阵只回答
+   *   「有没有这项能力」，量纲差异在卡片上如实标注。
+   *
+   * - ⚠️ **不登记 `dailyCheckin`，且这不是遗漏** —— Cloud Code 免费线是
+   *   纯配额制，**没有可调用的签到/领取端点**。登记它会让用户每次点击都
+   *   必然失败（与 Raccoon 那条同因：签到是服务端按日自动发放的）。
+   *
+   * - ⚠️ 未授权时后端返回 `{balance: null, error: '尚未授权 Google 账号'}`，
+   *   卡片显示原因而不是 0 —— 与「配额真的用完了」是**两回事**。
+   */
+  gemini: Object.freeze({ balance: true, dailyCheckin: false }),
 });
 
 /**

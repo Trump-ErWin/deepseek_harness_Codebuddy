@@ -62,6 +62,9 @@ const STYLES = `
  * 故容器保持透明（加白底反而会出现一圈突兀的方块）。
  */
 .dim-jh-providerIcon.zcode { background: transparent; }
+/* Gemini Code Assist：内联 SVG 自带蓝紫渐变星形，白底容器中显示清晰。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
+.dim-jh-providerIcon.gemini { background: white; }
 
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }
