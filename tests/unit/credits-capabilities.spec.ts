@@ -4,11 +4,13 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import {
+  ACCOUNT_TEST_CAPABILITIES,
   CREDITS_CAPABILITIES,
   PERMANENT_LOCK_EXPIRING_WINDOW_DAYS,
   RATE_LIMIT_CAPABILITIES,
   checkinProviders,
   permanentLockCopy,
+  supportsAccountTest,
   supportsCreditBalance,
   supportsDailyCheckin,
   supportsOnboardingTasks,
@@ -259,6 +261,52 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
       .join('\n')
     expect(codeLines).toContain('showRateLimitActions: supportsRateLimit(provider)')
     expect(codeLines).not.toMatch(/showRateLimitActions:\s*provider\s*!==/)
+  })
+})
+
+/**
+ * ⚠️ **「测试」按钮的能力门控**（用户 m03338：「增加测试按钮，真实的发一次请求」）。
+ *
+ * 与「重测」的硬性区别是**触发条件**：重测只测已有 `modelRateLimits` 标记的
+ * 模型，没有标记时零请求；测试不看标记、无条件真发一次。因此两者必须用
+ * **独立**的能力位与 props 开关 —— 当前 Gemini 恰好只登记测试、没登记重测，
+ * 若绑在同一个开关上就会二选一地消失一个按钮。
+ */
+describe('账号「测试」按钮门控', () => {
+  it('gemini 登记为支持测试', () => {
+    expect(ACCOUNT_TEST_CAPABILITIES.gemini?.test).toBe(true)
+    expect(supportsAccountTest('gemini')).toBe(true)
+  })
+
+  it('未登记的 provider 一律不渲染（默认关闭，与限流表相反）', () => {
+    // ⚠️ 默认必须是 false：这是**全新**按钮，没有存量用户，未验证的渠道不该出现。
+    expect(supportsAccountTest('codearts')).toBe(false)
+    expect(supportsAccountTest('zcode')).toBe(false)
+    expect(supportsAccountTest('loomy')).toBe(false)
+    expect(supportsAccountTest('不存在的 provider')).toBe(false)
+  })
+
+  it('客户端源码里「测试」走独立开关，不挂在 showRateLimitActions 上', () => {
+    const codeLines = readClientSource()
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(codeLines).toContain('onTest: supportsAccountTest(provider)')
+    // 反例：把测试绑到限流开关上会让 Gemini 拿不到按钮（它登记的是 false）。
+    expect(codeLines).not.toMatch(/onTest:\s*showRateLimitActions/)
+    expect(codeLines).not.toMatch(/onTest:\s*supportsRateLimit/)
+  })
+
+  it('「测试」的结果汇总与「重测」分开写（响应结构不同）', () => {
+    // account.test 返回扁平 { modelId, ok, message }，没有 accounts/clearedCount。
+    // 若拿它去喂 summarizeProbe，会得到「没有可重测的限流标记」——
+    // 把「测试失败」误报成「没什么可测的」。
+    const codeLines = readClientSource()
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(codeLines).toContain('function summarizeTest(res)')
+    expect(codeLines).toContain('summarizeTest(res)')
   })
 })
 

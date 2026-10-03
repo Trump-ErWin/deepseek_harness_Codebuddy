@@ -6,6 +6,7 @@ import {
   supportsDailyCheckin,
   supportsOnboardingTasks,
   supportsRateLimit,
+  supportsAccountTest,
   supportsPermanentLock,
   supportsSubscriptionQuota,
   permanentLockCopy,
@@ -382,6 +383,18 @@ const RESET_HELP = '直接清除本账号的全部「限额重置」标记，不
 const RESET_ALL_HELP = '直接清除本页全部账号（含已停用）的「限额重置」标记，不发送任何请求。';
 
 /**
+ * 「测试」按钮的说明。
+ *
+ * ⚠️ 措辞必须讲清「与重测的区别」：用户会本能地把两者混为一谈，然后以为
+ * 「测试」只是重测的别名。真正的区别是**触发条件**——重测只测已有标记的模型，
+ * 没有标记时一次请求都不发；测试无条件真发一次。
+ */
+const TEST_HELP = '无条件真实发送一条最小消息给这个账号（不依赖是否存在「限额重置」标记），'
+  + '用来确认账号当下到底还能不能用。与「重测」的区别：重测只测**已有标记**的模型，'
+  + '没有标记时一次请求都不发；测试不看标记，直接挑一个模型发出去。'
+  + '只回报结果，不修改任何限流标记。会消耗少量模型额度。';
+
+/**
  * 「显示列表」按钮的说明。
  *
  * 措辞必须讲清两点，否则用户会以为关掉开关就等于删除模型：
@@ -406,6 +419,20 @@ function summarizeProbe(kind, res) {
   if (still > 0) parts.push(`${still} 条仍受限`);
   if (parts.length === 0) parts.push('没有可重测的限流标记');
   return parts.join('，');
+}
+
+/**
+ * 把一次「测试」的响应汇总成一行可读文案。
+ *
+ * ⚠️ 必须与 `summarizeProbe` 分开写：测试的响应里**没有** `accounts` / `clearedCount`
+ * 字段（它不写存储、没有「清除了几条」可报），拿它去喂 `summarizeProbe` 会得到
+ * 「没有可重测的限流标记」——把「测试失败」说成「没什么可测的」，是彻底的误报。
+ */
+function summarizeTest(res) {
+  const model = res?.modelId || '未知模型';
+  if (res?.ok) return `测试通过：${model} 正常返回`;
+  const reason = res?.message || '仍受限';
+  return `测试未通过：${model} — ${reason}`;
 }
 
 /**
@@ -595,7 +622,7 @@ function isAnonymousAccountId(accountId) {
   return String(accountId || '').indexOf('opencode-anon-') === 0;
 }
 
-function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
+function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onTest, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
   // ⚠️ opencode 专属：传了才渲染「代理」「指纹」两个按钮（见按钮区注释）。
   // 前者额外需要 current 代理串，故签名与 onRetest 略有不同。
   onOpenProxy, onRotateFingerprint }) {
@@ -773,6 +800,25 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         : null,
       // 卡片级「重测 / 重置」同样只对会限流的 provider 有意义
       // （Loomy 不返回限流错误，故这两个按钮对它永远禁用 —— 直接不渲染）。
+      //
+      // ⚠️ 「测试」与上面两个**互不替代**，故用**独立**的 props 存在性开关
+      // （与 `onOpenProxy` 同款约定）：重测只测已有标记的模型、没有标记时零请求；
+      // 测试无条件真发一次。当前 Gemini 恰好只登记了测试、没登记重测 —— 若把
+      // 两者绑在同一个开关上，就会出现「要么都渲染（重测对它无意义）、要么
+      // 都不渲染（测试消失）」的二选一。
+      //
+      // ⚠️ 该行是 `flex-wrap: nowrap`，多一个按钮就可能溢出（见上方礼物图标
+      // 按钮的注释）。故「测试」放在最前，且**只有**在 provider 同时登记了
+      // 测试与重测时才会出现 6 个按钮 —— 当前没有任何 provider 两者皆登记。
+      onTest
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: TEST_HELP,
+            // 不依赖 hasAnyLimit：测试的意义正是「没有标记时也能探活」。
+            disabled: busy,
+            onClick: () => onTest(account.id),
+          }, '测试')
+        : null,
       showRateLimitActions
         ? React.createElement('button', {
             className: 'dim-jh-btn',
@@ -2518,6 +2564,40 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 「测试」：**无条件**真发一次请求（不依赖是否存在限流标记）。
+   *
+   * ⚠️ 刻意**不**复用 `runLimitAction`：那条路径的文案汇总（`summarizeProbe`）
+   * 读的是 `res.accounts` / `res.clearedCount`，而 `account.test` 返回的是
+   * 扁平的 `{ modelId, ok, message }` —— 复用会得到「没有可重测的限流标记」，
+   * 把「测试失败」误报成「没什么可测的」。
+   *
+   * 复用 `probeBusy` 状态（置 `'one'`）：它同时驱动卡片的 `busy` 与按钮禁用，
+   * 测试期间不该允许并发点其它按钮。
+   */
+  const runTestAction = async (accountId) => {
+    setProbeBusy('one');
+    setProbeNotice(null);
+    try {
+      const res = await rpcCall('account.test', { accountId });
+      if (!mounted.current) return;
+      const text = summarizeTest(res);
+      // 仍受限/无法确认时把原始原因也列出来，否则用户只看到「未通过」会以为按钮失灵。
+      const details = res && res.ok === false && res.message
+        ? [`${res.nickname || res.accountId} · ${res.modelId || '未知模型'}：${res.message}`]
+        : [];
+      setProbeNotice({ tone: res?.ok ? 'ok' : 'warn', text, details });
+      // 测试不写存储，故无需 loadAccounts() —— 但刷新一次无害且能顺带更新凭据有效期。
+      await loadAccounts();
+    } catch (caught) {
+      console.error('[jet-hub] account test failed:', caught);
+      if (!mounted.current) return;
+      setProbeNotice({ tone: 'error', text: `测试失败：${caught?.message || '未知错误'}`, details: [] });
+    } finally {
+      if (mounted.current) setProbeBusy(null);
+    }
+  };
+
   return React.createElement('section', { 'aria-label': `${provider} 账号管理` },
     // 标题与按钮分开成两块（而不是同一行的 space-between）：操作按钮多达 5 个，
     // 与面板标题挤在一行时既会被压缩又会溢出。标题独占一行、按钮组另起一行
@@ -2731,6 +2811,13 @@ function ProviderPanel({ provider, rpcCall }) {
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),
                 onReset: (id) => void runLimitAction('reset', id),
+                // ⚠️ 「测试」用**独立**的能力位（`supportsAccountTest`）与独立的
+                // props 存在性开关，不能挂在 `showRateLimitActions` 上：Gemini
+                // 恰好只登记了测试、没登记重测（它的限流是配额窗口制，重测无意义），
+                // 绑一起就会二选一地消失一个按钮。
+                onTest: supportsAccountTest(provider)
+                  ? (id) => void runTestAction(id)
+                  : undefined,
                 // ⚠️ 仅 opencode：这两个回调只在该 provider 下传，
                 // AccountCard 靠「props 存在性」决定是否渲染按钮。
                 ...(provider === 'opencode'

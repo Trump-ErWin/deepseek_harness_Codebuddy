@@ -6,7 +6,7 @@
  * 通道名 jet-hub → 路径 /api/jet-hub
  * 端点方法：account.list / account.create / account.update / account.delete /
  *           account.reorder / account.refresh / account.retest / account.retestAll /
- *           account.reset / account.resetAll / login.poll /
+ *           account.test / account.reset / account.resetAll / login.poll /
  *           credits.status / credits.claimAll / credits.balances /
  *           model.list / model.setDisabled /
  *           captcha.demand / captcha.carrierUrl / captcha.contribute（内部载体，
@@ -122,10 +122,12 @@ import {
   fetchTraeCreditBalance,
 } from './trae-credits.js'
 import {
+  pickTestModel,
   resetAccount,
   resetAllAccounts,
   retestAccount,
   retestAllAccounts,
+  testAccount,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
@@ -149,6 +151,8 @@ import type {
   RpcRefreshAccountResponse,
   RpcRetestAccountRequest,
   RpcRetestAllRequest,
+  RpcTestAccountRequest,
+  RpcTestAccountResponse,
   RpcResetAccountRequest,
   RpcResetAllRequest,
   RpcCreditsStatusRequest,
@@ -2309,6 +2313,58 @@ function registerJetHubEndpoints(
       case 'account.retestAll': {
         const req = payload as RpcRetestAllRequest
         const value = await retestAllAccounts(pool, req.provider)
+        return { ok: true, value }
+      }
+
+      // ── 限流标记：测试（**无条件**发一次真实请求）──
+      //
+      // ⚠️ 与 `account.retest` 的区别是**触发条件**，不是措辞：
+      // `retestAccount` 只测那些已经有 `modelRateLimits` 标记的模型，没有标记时
+      // 在 `modelIds.length === 0` 处提前返回、一次请求都不发。于是「这个账号
+      // 到底还能不能用」在**没有历史 429** 时没有手动探活入口 —— 用户点「重测」
+      // 看到瞬间返回，会以为按钮失灵（真实报障：「重测按钮你确认过会发请求吗，
+      // 为什么响应这么快？」）。`account.test` 补齐的就是这个缺口。
+      //
+      // ⚠️ 它**不写任何存储**：不清标记、不写回新的重置时刻。测出「仍受限」只
+      // 如实回报给用户看，不落盘 —— 落盘会把「一次手动探活」变成「改变选号
+      // 状态」，那是重测的语义。
+      case 'account.test': {
+        const req = payload as RpcTestAccountRequest
+        const accountId = req.accountId
+        if (typeof accountId !== 'string' || accountId === '') {
+          return { ok: false, error: { code: 'bad-request', message: '缺少 accountId' } }
+        }
+        const entry = pool.findAccount(accountId)
+        if (entry === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `账号 ${accountId} 不存在` } }
+        }
+
+        // 模型推断：显式指定 > 已有的限流标记（用户最可能想看的就是它）> 全量目录第一个。
+        // ⚠️ 只有前两者都拿不到时才去读目录 —— `fullCatalogIds` 在读不到时返回
+        // `{ error }`，若无条件先读它，一个「明明有标记可测」的账号会因为目录服务
+        // 暂时不可用而被拒，属于自造的失败。
+        //
+        // 目录也读不出来时如实报错，**不**猜一个模型名发出去（猜错会得到与账号
+        // 无关的 404，把「账号不可用」和「模型名不对」两件事混成一条报错）。
+        let modelId = pickTestModel(entry, [], req.modelId)
+        if (modelId === '') {
+          const catalog = await fullCatalogIds(ctx, modelAdapters, entry.provider)
+          if ('error' in catalog) {
+            return {
+              ok: false,
+              error: { code: 'bad-request', message: `无法确定要测试的模型：${catalog.error}` },
+            }
+          }
+          modelId = pickTestModel(entry, catalog.ids, req.modelId)
+        }
+        if (modelId === '') {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: `${entry.provider} 没有可测试的模型` },
+          }
+        }
+
+        const value: RpcTestAccountResponse = await testAccount(pool, accountId, modelId)
         return { ok: true, value }
       }
 
