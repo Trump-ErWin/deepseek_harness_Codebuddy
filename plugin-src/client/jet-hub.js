@@ -38,7 +38,7 @@ import {
   gatewayCardLabel,
   gatewayEffortRows,
   gatewayEffortsEmptyHint,
-  gatewayEffortsHint,
+  gatewayEffortsHintLines,
   gatewayEffortsText,
   gatewayModelKeyOf,
   filterEffortRows,
@@ -4008,7 +4008,15 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
     React.createElement('div', { className: 'dim-jh-gatewaySection' },
       React.createElement('p', { className: 'dim-jh-gatewaySectionTitle' },
         React.createElement('strong', null, '思考档位对照表')),
-      React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayEffortsHint(models)),
+      // ⚠️ 说明**一行一个 p**（与弹窗顶部 gatewayStatusLines 同款做法）。
+      // 用户 2026-10-04 第三次报障：这两句原先拼成一整段交给浏览器断行，
+      // 于是品牌名被从中间切开 —— 前一行结尾是「CC」、下一行开头是「Switch」。
+      // 两句本就各说一件事，各占一行既不会断开品牌名，也更好读。
+      gatewayEffortsHintLines(models).map((line, index) =>
+        React.createElement('p', {
+          key: `efforts-hint-${index}`,
+          className: 'dim-jh-modalHint dim-jh-gatewayLine',
+        }, line)),
       // ⚠️ 用户 2026-10-04 要求这两个按钮**互换位置**，与模型清单那段保持一致
       //（那边是「复制全部 …」在前、「展开清单」在后）。顺序统一后，
       // 三段里的按钮位置可预期，用户不必每段重新找。
