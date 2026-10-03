@@ -1687,37 +1687,20 @@ function registerJetHubEndpoints(
            * ⚠ 「本机有没有官方凭据」是**必要条件**：没装客户端、或没登录过时
            * 两者都跳过，照旧走下面的 OAuth 流程（那是「装完即用」的保证）。
            *
-           * ## ⚠️ `forceNew`：用户明确要**再登一个账号**时跳过两道复用
-           *
-           * 上面两条复用是为「点一次多一条」设计的，但它们**在渠道判断之前**，
-           * 于是把「同一个人想加第二个账号」也一并挡掉了：
-           *
-           * - 本机官方客户端登的是 A（`user_id` 已在池里）⇒ 每次点「新建账号」
-           *   都直接返回 `reused`，**浏览器根本不开**，用户无从登录 B。
-           * - 换 `zai` 渠道也一样被挡 —— 复用检查读的是 bigmodel 的凭据文件，
-           *   与渠道无关。
-           *
-           * 故 `forceNew: true` 时跳过这两道，直接走 OAuth。
-           * ⚠️ 跳过复用**不等于**能拿到第二个账号：授权页仍复用浏览器里的登录态
-           * （实测 `bigmodel.cn` / `chat.z.ai` 都不认 `prompt=login` 之类参数），
-           * 用户需先在浏览器登出、或用无痕窗口 —— 前端在提示里写明这一点。
-           */
-          const forceNew = req.forceNew === true
-          const orphanId = forceNew ? undefined : await zcode.adoptIntoOrphanAccount(pool).catch(() => undefined)
+             */
+          const orphanId = await zcode.adoptIntoOrphanAccount(pool).catch(() => undefined)
           if (orphanId !== undefined) {
             // `loginUrl` 用**空串**而不是 undefined：与 `loginMode: 'sms'` 的既有约定
             // 一致（「没有可打开的 URL」），前端据 `reused` 分支处理。
             return { ok: true, value: { accountId: orphanId, loginUrl: '', reused: true } }
           }
-          if (!forceNew) {
-            const local = await zcode.localCredential()
-            if (local !== undefined && typeof local.user_id === 'string' && local.user_id.length > 0) {
-              const holder = await pool.findAccountIdByIdentityField(
-                ZCODE.id, 'user_id', local.user_id,
-              )
-              if (holder.length > 0) {
-                return { ok: true, value: { accountId: holder, loginUrl: '', reused: true } }
-              }
+          const local = await zcode.localCredential()
+          if (local !== undefined && typeof local.user_id === 'string' && local.user_id.length > 0) {
+            const holder = await pool.findAccountIdByIdentityField(
+              ZCODE.id, 'user_id', local.user_id,
+            )
+            if (holder.length > 0) {
+              return { ok: true, value: { accountId: holder, loginUrl: '', reused: true } }
             }
           }
           const started = await zcode.startLogin({
