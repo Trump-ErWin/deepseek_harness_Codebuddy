@@ -16,6 +16,7 @@ import {
   gatewayEffortsCurl,
   gatewayEffortsEmptyHint,
   gatewayEffortsHint,
+  gatewayEffortsHintLines,
   gatewayEffortsText,
   gatewayModelKeyOf,
   gatewayProviderOf,
@@ -544,6 +545,35 @@ describe('思考档位对照表', () => {
     expect(gatewayEffortsHint([])).toContain('不下发该参数')
   })
 
+  it('★ 说明文案**按行**给出，品牌名 CC Switch 不得被行尾断开（用户 2026-10-04 第三次报障）', () => {
+    const lines = gatewayEffortsHintLines([TRAE, PLAIN, NO_EFFORT])
+    // ⚠️ 判据是「两行」而不是「拼起来含某串」：用户看到的缺陷正是**拼成一整段**
+    // 交给浏览器断行，结果前一行的结尾是「CC」、下一行开头是「Switch」。
+    // 只锁关键词的话，退回单行拼法照样绿（品牌名仍会被切断），故必须锁行结构。
+    expect(lines).toHaveLength(2)
+    // 第一行讲数量与图例。
+    expect(lines[0]).toContain('已开启的 3 个模型')
+    expect(lines[0]).toContain('有 2 个可选思考档位')
+    expect(lines[0]).toContain('1 个不同名')
+    // 第二行讲那一列填到哪 + 边界，且**整句**都在同一行里（品牌名与它不被拆开）。
+    expect(lines[1]).toContain('「客户端该填」为 CC Switch 需配置的映射档位')
+    expect(lines[1]).toContain('未登记的档位名称将被拒绝')
+    // ⚠️ 「CC Switch」必须以**整个词**出现在同一行内 —— 这是本次报障的正题。
+    // 若哪天有人把品牌名写成 'CC' + 换行 + 'Switch'，或插了换行符，这条会红。
+    expect(lines.some((line) => line.includes('CC Switch'))).toBe(true)
+    // 品牌名不得被拆到两行里去（拼接后仍要能搜到完整词，且各半不得单独成行）。
+    expect(lines.some((line) => line.trim() === 'CC')).toBe(false)
+    expect(lines.some((line) => line.startsWith('Switch'))).toBe(false)
+  })
+
+  it('单行形态仍由行数组拼出（既有断言与 README 的口径不变）', () => {
+    const models = [TRAE, PLAIN, NO_EFFORT]
+    // ⚠️ 拼接口径必须与行数组一致 —— 否则「读到的文案」与「屏幕上显示的」会分叉。
+    expect(gatewayEffortsHint(models)).toBe(gatewayEffortsHintLines(models).join(''))
+    // 空表时是一行，拼接后仍是那句。
+    expect(gatewayEffortsHintLines([NO_EFFORT])).toHaveLength(1)
+  })
+
   it('★ 对照表 curl 模板本身仍可用，但**弹窗里不再渲染**（与模型目录同理）', () => {
     const curl = gatewayEffortsCurl('http://127.0.0.1:9999/v1')
     expect(curl).toContain('127.0.0.1:9999/v1/reasoning-efforts')
@@ -554,7 +584,12 @@ describe('思考档位对照表', () => {
 
   it('面板确实渲染了对照表，且数据来自宿主的档位视图', () => {
     expect(source).toContain('gatewayEffortRows(models)')
-    expect(source).toContain('gatewayEffortsHint(models)')
+    // ⚠️ 接线锁的是**行数组那个函数**，不是拼接用的 gatewayEffortsHint：
+    // 后者一用就退回「拼成一整段交给浏览器断行」，正是品牌名被切开的缺陷。
+    expect(source).toContain('gatewayEffortsHintLines(models)')
+    // ⚠️ 同时锁「一行一个 p」的渲染结构（只锁函数名的话，有人把它 join 回来照样绿）。
+    expect(source).toMatch(/gatewayEffortsHintLines\(models\)\.map\(/)
+    expect(source).toMatch(/efforts-hint-\$\{index\}/)
     expect(source).toContain('客户端该填')
     // 空表不能让用户点开一个什么都没有的区块。
     expect(source).toMatch(/disabled:\s*effortRows\.length === 0/)

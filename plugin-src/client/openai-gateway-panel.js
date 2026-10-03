@@ -449,7 +449,7 @@ export function filterEffortRows(rows, query) {
 }
 
 /**
- * 对照表的说明文案。
+ * 对照表的说明文案（**按行**给出）。
  *
  * ⚠️ 两件事必须说清，否则用户会以为「表里有我没开的模型」，或者去试一个必然失败的写法：
  * 1. 这张表**只含已开启的模型**（关掉的不会出现）—— 故句子开头必须写「**已开启的**」；
@@ -461,13 +461,21 @@ export function filterEffortRows(rows, query) {
  * 界面文案与用例都锁的是「会被拒绝」，改这段注释时**别把它改回「不会失败」**
  * （`openai-gateway-panel.spec.ts` 里有 `not.toContain('也不会报错')` 守着）。
  *
+ * ⚠️ 返回值是**行数组**而不是一整段（用户 2026-10-04 第三次报障）。
+ * 原先两句拼成一串，浏览器在行尾按**空格**断行，于是品牌名被从中间切开 ——
+ * 用户看到的正是前一行结尾是「CC」、下一行开头是「Switch」。
+ * 品牌名断行会让人怀疑是不是把字写错了，而这两句本来就各说一件事
+ * （第一句讲数量与图例，第二句讲那一列填到哪 + 边界），各占一行更清楚。
+ * ⚠️ 做法与本报文既有 `gatewayStatusLines` 一致（弹窗顶部那三行就是这么给的）：
+ * 判据出纯函数、渲染层只负责「一行一个 p」，**不要**在渲染层拆字符串。
+ *
  * @param {Array<object> | null | undefined} models
- * @returns {string}
+ * @returns {string[]}
  */
-export function gatewayEffortsHint(models) {
+export function gatewayEffortsHintLines(models) {
   const rows = gatewayEffortRows(models);
   if (rows.length === 0) {
-    return '当前已开启的模型都没声明思考档位：网关不下发该参数，按模型默认走。';
+    return ['当前已开启的模型都没声明思考档位：网关不下发该参数，按模型默认走。'];
   }
   const lossy = rows.filter((row) => row.lossy).length;
   const enabled = Array.isArray(models) ? models.length : rows.length;
@@ -484,9 +492,28 @@ export function gatewayEffortsHint(models) {
   //      去试一个必然失败的写法；错误里本来就会列出该模型可用的档位。
   // 删掉的是：「可直接抄进 CC Switch / Codex」（被前半句取代）、「关掉的模型不在
   // 表里」（上方第一句的「已开启的」已表达同一约束）、以及括号里的举例（如 turbo）。
-  return `已开启的 ${enabled} 个模型里，有 ${rows.length} 个可选思考档位`
-    + `${lossy > 0 ? `（${lossy} 个不同名，标「需对照」）` : ''}。`
-    + '「客户端该填」为 CC Switch 需配置的映射档位，未登记的档位名称将被拒绝。';
+  return [
+    `已开启的 ${enabled} 个模型里，有 ${rows.length} 个可选思考档位`
+      + `${lossy > 0 ? `（${lossy} 个不同名，标「需对照」）` : ''}。`,
+    '「客户端该填」为 CC Switch 需配置的映射档位，未登记的档位名称将被拒绝。',
+  ];
+}
+
+/**
+ * 对照表说明的**单行**形态（把上面的行拼起来）。
+ *
+ * ⚠️ 保留它是为了不动既有调用方与断言的口径（README、用例、变异脚本都按一整串读）。
+ * 面板渲染**必须**用 `gatewayEffortsHintLines` —— 拼成一行再交给浏览器断行，
+ * 正是品牌名被从中间切开的那个缺陷（见该函数的注释）。
+ *
+ * ⚠️ 拼接用**全角空格以外的普通空格**：它只用于「一整串」这种读法
+ * （长度上限、关键词包含），不进入任何渲染路径，故不必考虑断行。
+ *
+ * @param {Array<object> | null | undefined} models
+ * @returns {string}
+ */
+export function gatewayEffortsHint(models) {
+  return gatewayEffortsHintLines(models).join('');
 }
 
 /**
