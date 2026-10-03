@@ -340,6 +340,8 @@ export class GeminiAdapter extends LlmAdapter {
       throw new LlmError(
         `gemini: 模型 "${options.model}" 不在本 provider 目录中（仅支持 ${GEMINI_UPSTREAM_FLASH}）`,
         'INVALID_REQUEST',
+        // 模型名写错是确定性失败：带上 404，网关才不会把它当 502 让客户端白重试。
+        { status: 404 },
       )
     }
 

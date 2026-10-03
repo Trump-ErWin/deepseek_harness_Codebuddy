@@ -19,7 +19,15 @@
  * 之后，客户端会把它当成配置错误提示用户。
  */
 
-/** 判据刻意**窄**：CodeArts 的 `INVALID_REQUEST` 还覆盖参数非法、余额不足等。 */
+/**
+ * 判据刻意**窄**：CodeArts 的 `INVALID_REQUEST` 还覆盖参数非法、余额不足等。
+ *
+ * ⚠️ 最后两条是**本插件自己的措辞**（`gemini.ts` / `gemini-adapter.ts` 的
+ * 「模型 "X" 不在本 provider 目录中（仅支持 …）」）。把自家文案写进通用判据表
+ * 是刻意的取舍：那条错误虽已自带 `status: 404`（走 `failureToOpenAiError`），
+ * 但只有在这里命中，`type` 才会从硬编码的 `server_error` 变成
+ * `invalid_request_error`、`code` 变成 `model_not_found`，并触发「你是不是想用 X」。
+ */
 const MISSING_MODEL_PATTERNS: readonly RegExp[] = [
   /model\s+is\s+not\s+registered/i,
   /model\s+not\s+registered/i,
@@ -29,6 +37,7 @@ const MISSING_MODEL_PATTERNS: readonly RegExp[] = [
   /model\s+does\s+not\s+exist/i,
   /invalid\s+model/i,
   /模型不存在/,
+  /不在本\s*provider\s*目录中/i,
 ]
 
 /**

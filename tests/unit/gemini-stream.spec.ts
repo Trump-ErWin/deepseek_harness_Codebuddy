@@ -171,6 +171,9 @@ describe('gemini stream · 凭据与请求形状', () => {
     const error = await capture(adapter, options({ model: 'gemini-9.9-fake' }))
     expect(error?.code).toBe('INVALID_REQUEST')
     expect(error?.message).toContain('gemini-9.9-fake')
+    // ⚠️ 状态码是给网关看的：只读 `failure.status`（顶层无 status），缺了它
+    // 这条确定性失败会以 502 离开网关，被客户端当服务端故障反复重试。
+    expect(error?.failure?.status).toBe(404)
     expect(calls).toHaveLength(0)
     // 纯本地判定：连凭据续期都不该触发
     expect(refreshCalls.count).toBe(0)

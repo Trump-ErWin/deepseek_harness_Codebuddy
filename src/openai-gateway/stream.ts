@@ -111,7 +111,16 @@ function consumeChunk(state: Accumulated, chunk: StreamChunk): Record<string, un
       return undefined
     case 'finish':
       if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
-        return { error: { message: failureMessage(chunk.reason), type: 'server_error', code: chunk.reason.failure.code } }
+        // ⚠️ 把上游自带的状态码一并带出来（`LlmError` 把它放在 `failure.status`）：
+        // 少了它，下游只能退化成 502，模型名写错这种确定性失败会被客户端白重试。
+        return {
+          error: {
+            message: failureMessage(chunk.reason),
+            type: 'server_error',
+            code: chunk.reason.failure.code,
+            status: chunk.reason.failure.status,
+          },
+        }
       }
       state.finishReason = finishReason(chunk.reason)
       return { delta: {}, finish_reason: state.finishReason }
@@ -133,12 +142,13 @@ export async function* toOpenAiSse(
       const event = consumeChunk(state, chunk)
       if (event === undefined) continue
       if ('error' in event) {
-        const error = event.error as { message?: unknown; type?: unknown; code?: unknown }
+        const error = event.error as { message?: unknown; type?: unknown; code?: unknown; status?: unknown }
         const message = typeof error.message === 'string' ? error.message : 'upstream error'
         // 上游「模型不存在」以 502 离开网关时会被客户端当成可重试故障重试，
         // 但它是确定性失败 —— 翻成 404 让客户端提示用户改配置。
         const normalized = normalizeUpstreamFailure({
-          status: 502,
+          // 上游自带状态码（如 gemini 拒绝未知模型名时的 404）优先，否则才退化成 502。
+          status: typeof error.status === 'number' ? error.status : 502,
           type: typeof error.type === 'string' ? error.type : 'server_error',
           code: typeof error.code === 'string' ? error.code : 'upstream_error',
           message,
@@ -192,11 +202,13 @@ export async function collectOpenAiCompletion(
     for await (const chunk of chunks) {
       const event = consumeChunk(state, chunk)
       if (event?.error) {
+        const detail = event.error as Record<string, unknown>
         throw new OpenAiGatewayError(
-          String((event.error as Record<string, unknown>).message),
-          502,
+          String(detail.message),
+          // 上游自带状态码优先（模型名不存在 = 404），否则才当可重试的服务端故障。
+          typeof detail.status === 'number' && detail.status >= 400 && detail.status <= 599 ? detail.status : 502,
           'server_error',
-          String((event.error as Record<string, unknown>).code ?? 'upstream_error'),
+          String(detail.code ?? 'upstream_error'),
         )
       }
     }
@@ -240,8 +252,14 @@ export function failureToOpenAiError(error: unknown): { status: number; body: { 
   if (error instanceof OpenAiGatewayError) {
     return { status: error.status, body: { error: { message: error.message, type: error.type, code: error.code } } }
   }
-  const value = error as { code?: unknown; status?: unknown; message?: unknown } | undefined
-  const status = typeof value?.status === 'number' && value.status >= 400 && value.status <= 599 ? value.status : 502
+  // ⚠️ `LlmError` 的 `status` **不是顶层属性**（实测 `'status' in e === false`），
+  // 它只落在 `e.failure.status`（`@deepseek-ai/dsh-llm` 的 `LlmFailure`）。
+  // 只读顶层等于没读 —— 上游声明的 404 会一路退化成 502 并被客户端反复重试。
+  const value = error as
+    | { code?: unknown; status?: unknown; failure?: { status?: unknown }; message?: unknown }
+    | undefined
+  const raw = typeof value?.status === 'number' ? value.status : value?.failure?.status
+  const status = typeof raw === 'number' && raw >= 400 && raw <= 599 ? raw : 502
   return {
     status,
     body: { error: {

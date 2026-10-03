@@ -435,6 +435,9 @@ export function geminiModelSpec(modelId: string, effort?: string): GeminiModelSp
     throw new LlmError(
       `gemini: 模型 "${modelId}" 不在本 provider 目录中（仅支持 ${GEMINI_UPSTREAM_FLASH}）`,
       'INVALID_REQUEST',
+      // ⚠️ `status` 只落在 `LlmError.failure`（不是顶层属性），且网关的
+      // `failureToOpenAiError` 两处都要读 —— 见 `openai-gateway/stream.ts`。
+      { status: 404 },
     )
   }
   const tier = geminiEffortToTier(effort)
