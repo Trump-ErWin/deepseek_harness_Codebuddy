@@ -9,11 +9,13 @@
  * 故：**不要**为了「看起来更整齐」调整本文件里的期望字符串。
  */
 import { describe, expect, it } from 'vitest'
+import { LlmError } from '@deepseek-ai/dsh-llm'
 import {
   GEMINI_DEFAULT_PROJECT,
   GEMINI_EFFORT_IDS,
   GEMINI_FALLBACK_MODELS,
   GEMINI_SESSION_ID_INFER,
+  geminiCanonicalModelId,
   geminiEffortLabel,
   geminiEffortToTier,
   geminiModelSpec,
@@ -139,6 +141,44 @@ describe('档位映射', () => {
     ])
     expect(info?.efforts.map((effort) => effort.name)).toEqual(['低', '中', '高', '自适应'])
     expect(String(info?.defaultEffort)).toBe('medium')
+  })
+})
+
+describe('模型 id 严格校验（未知 id 必须拒绝，不得静默落回 3.8）', () => {
+  it('合法 id 的 upstream 带对应档位后缀', () => {
+    expect(geminiModelSpec('gemini-3.8-flash', 'high').upstream).toBe('gemini-3.8-flash-high')
+    expect(geminiModelSpec('gemini-3.8-flash', 'low').upstream).toBe('gemini-3.8-flash-low')
+    // 缺省档位 = medium（同 geminiEffortToTier 默认分支）
+    expect(geminiModelSpec('gemini-3.8-flash').upstream).toBe('gemini-3.8-flash-medium')
+  })
+
+  it('带档位的 3.8 名放行（限流标记 / account.test 探测传的就是它）', () => {
+    // 归一化剥掉档位后缀后命中目录；upstream 仍由 effort 决定（缺省 medium）。
+    expect(geminiModelSpec('gemini-3.8-flash-high').upstream).toBe('gemini-3.8-flash-medium')
+    expect(geminiModelSpec('gemini-3.8-flash-tiered', 'high').upstream).toBe('gemini-3.8-flash-high')
+  })
+
+  it('未知 id 抛 INVALID_REQUEST（曾实测假名 200 静默跑 3.8）', () => {
+    for (const bad of ['gemini-3.7-flash', 'gemini-3.7-flash-high', 'gemini-9.9-fake', 'totally-bogus', '']) {
+      let thrown: unknown
+      try {
+        geminiModelSpec(bad)
+      } catch (error) {
+        thrown = error
+      }
+      expect(thrown, `id "${bad}" 应被拒绝`).toBeInstanceOf(LlmError)
+      expect((thrown as LlmError).failure.code).toBe('INVALID_REQUEST')
+      expect((thrown as LlmError).message).toContain(bad === '' ? '""' : bad)
+    }
+  })
+
+  it('geminiCanonicalModelId：只剥已知档位后缀，不误伤其他名字', () => {
+    expect(geminiCanonicalModelId('gemini-3.8-flash-high')).toBe('gemini-3.8-flash')
+    expect(geminiCanonicalModelId('gemini-3.8-flash-tiered')).toBe('gemini-3.8-flash')
+    expect(geminiCanonicalModelId('gemini-3.8-flash')).toBe('gemini-3.8-flash')
+    // 非档位后缀不动
+    expect(geminiCanonicalModelId('gemini-3.7-flash')).toBe('gemini-3.7-flash')
+    expect(geminiCanonicalModelId('totally-bogus')).toBe('totally-bogus')
   })
 })
 
