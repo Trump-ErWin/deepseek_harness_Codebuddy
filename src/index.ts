@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { LlmError } from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
 import { registerCodeArtsLlm } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
@@ -26,7 +27,7 @@ import { ZCODE } from './zcode-product.js'
 import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
 import type { ZcodeCredential } from './zcode.js'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
@@ -454,6 +455,51 @@ export function apply(ctx: Context): void {
     return { tried }
   }
 
+  /**
+   * 在「候选为空、即将退到单凭据 ref」这一刻，先证明失败原因是不是**限流**。
+   *
+   * ## 它修的是什么（真实缺陷，2026-10-03）
+   *
+   * 用户报障：`/compact` 连续四次报
+   * 「Compaction could not produce a useful summary」，会话日志里 `compaction/end`
+   * 携带的真实错误却是 `buddy: no usable credential; log in from the Jet Hub
+   * panel first` —— 而当时 Jet Hub 里 buddy 账号**已登录、已启用**，只是它被
+   * `deepseek-v4.1-flash` 的模型级限流标记挡住（解禁时刻就在
+   * `modelRateLimits` 里）。
+   *
+   * 链路：唯一的启用账号被限流 → `pickBuddyCredential` 的候选筛成空集 →
+   * `select()` 只能回一个笼统的 `exhausted`（`reason` 在未锁定时被丢弃）→
+   * 退到单凭据 ref `BUDDY_ACCESS_TOKEN`，而 Jet Hub 登录只写
+   * `BUDDY_ACCOUNT_XXX`、该 ref **根本不存在** → 适配器抛 `MISSING_CREDENTIAL`。
+   *
+   * 即：**凭据问题被误报成「没登录」，而真实原因是限流**。用户据此去重新
+   * 登录，方向完全错。这与本仓库已记录的同类病根一致 —— 用默认归类代替了
+   * 对业务语义的判断（qoder 的 `110` 被误归 `SERVER`、`10605` 排队被漏判）。
+   *
+   * ⚠️ 这里**只改错误语义，不改可用性**：没有账号可用就是没有，压缩该失败
+   * 仍然失败；修的是「用户看到的原因」。绝不静默换模型、也绝不绕过限流标记。
+   *
+   * @param product - 目标 provider（用其 `id` 与 `displayName`）。
+   * @param modelId - 本次请求的模型；空串时不做判定（与选号侧约定一致）。
+   * @throws LlmError 带 `QUOTA_EXCEEDED` 码与解禁时刻，仅当**所有**启用账号
+   *   都在该模型上受限时；其余情形静默返回，交给原有的 `MISSING_CREDENTIAL`。
+   */
+  const throwIfAllAccountsRateLimited = (product: BuddyProduct, modelId?: string): void => {
+    const limited = allAccountsRateLimitedForModel(
+      // 只统计**启用**账号：停用账号本就不参与自动选号，把它们算进来会
+      // 让「有一个号被停用」的普通情况被误报成「全部限流」。
+      pool.listAccountsByProvider(product.id).filter(a => a.enabled),
+      modelId ?? '',
+    )
+    if (limited === undefined) return
+    throw new LlmError(
+      `${product.displayName}：模型 ${modelId} 的可用账号均在限流中，`
+      + `最近一个将于 ${new Date(limited.resetAtMs).toLocaleString('zh-CN')} 解禁。`
+      + `可改用其它 provider / 模型，或等待解禁后再试（无需重新登录）。`,
+      'QUOTA_EXCEEDED',
+    )
+  }
+
   const buddy = new BuddyAuth(ctx)
   const buddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
@@ -477,6 +523,9 @@ export function apply(ctx: Context): void {
       //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中。
       const available = await pool.getAvailableAccount(CODEBUDDY.id, modelId ?? '', picked.tried)
       if (available) return available.credential as BuddyCredential
+      // 退到单凭据 ref 之前先证明失败原因：全被模型限流时报明确的限流错误，
+      // 而不是让它降级成误导性的 MISSING_CREDENTIAL（见该助手的说明）。
+      throwIfAllAccountsRateLimited(CODEBUDDY, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))
       if (!resolved) return undefined
       try {
@@ -525,6 +574,8 @@ export function apply(ctx: Context): void {
       // provider 实参用 WORKBUDDY.id 而非字面量 'workbuddy'（同类坑见上）。
       const available = await pool.getAvailableAccount(WORKBUDDY.id, modelId ?? '', picked.tried)
       if (available) return available.credential as BuddyCredential
+      // 同 buddy：区分「全部限流」与「真的没登录」（见该助手的说明）。
+      throwIfAllAccountsRateLimited(WORKBUDDY, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(WORKBUDDY.defaultCredentialRef))
       if (!resolved) return undefined
       try {
