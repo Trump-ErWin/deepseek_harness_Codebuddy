@@ -160,8 +160,10 @@ export class GeminiAuth extends Service {
   /**
    * 落盘凭据（登录成功后调用）。
    *
-   * ⚠️ 返回 `accountId`（OIDC `sub`）供调用方构造展示名 ——
-   * 邮箱会被用户改掉，`sub` 不会。
+   * ⚠️ 返回的 `accountId` 是 OIDC `sub` —— 它只适合当**稳定标识**
+   *（换邮箱、改昵称都不影响），**不要**拿它拼展示名：`sub` 是 21 位数字，
+   * 截前 8 位得到 `Gemini 10500520` 这种用户认不出的名字（2026-10-03 报障）。
+   * 展示名走 `geminiAccountLabel`（邮箱优先，回退 `sub`）。
    */
   async persistLogin(
     credential: GeminiCredential,
