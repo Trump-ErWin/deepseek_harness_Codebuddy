@@ -13,16 +13,18 @@
  * | 凭据来源 | 解密磁盘 `~/.zcode/v2/credentials.json`（AES-256-GCM） | 浏览器登录拿 token |
  * | 协议 | **Anthropic Messages**（非 OpenAI） | 其余多为 OpenAI 兼容 |
  * | 验证前置 | **按需**产出阿里云 captcha（索要时才产，稳态一次约 0.4–0.5 秒） | 无 |
- * | 请求体准入 | **必须带官方身份块 + 首轮日期块**（否则 3012） | 无 |
+ * | 请求体准入 | **必须带官方身份块**（否则 405 + `3012`） | 无 |
  * | 续期 | 无（静态凭据） | 多数有 refresh_token |
  *
  * ## 三个必须真的做到的点
  *
  * 1. **`system` 必须带官方身份块** —— 缺了上游回 `3012 unusual activity`
- *    （实测矩阵见 `zcode-identity.ts`）。且这是**请求体内容**层面的判据，
- *    与 HTTP 头、运行时无关。
- * 2. **首轮 user 消息要带 `<system-reminder>` 日期块** —— 桥侧源码称之为
- *    「3012 的最后一个开关」。
+ *    （HTTP **405**；实测矩阵见 `zcode-identity.ts`）。且这是**请求体内容**层面的判据，
+ *    与 HTTP 头、运行时、请求频率、多轮历史、`tools` 都无关
+ *    （2026-10-03 逐项排除，见 README 的「3012」章节）。
+ * 2. **首轮 user 消息带 `<system-reminder>` 日期块** —— 官方如此，照发。
+ *    ⚠ **但它不是 3012 的判据**（去掉照样 200）；桥侧源码当年称它是
+ *    「3012 的最后一个开关」，2026-10-03 实测已推翻。
  * 3. **`tools` 必须真的下发**（转成 Anthropic 的扁平 `input_schema` 形态）——
  *    Qoder 与 TRAE 都因漏发而让模型在正文里臆造 XML 工具调用、harness
  *    认不出 → 任务终止。
@@ -102,6 +104,13 @@ import {
   noteProbeFirst,
 } from './captcha-requirement.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
+import {
+  describeZcodeRequestShape,
+  formatZcodeDiagnostic,
+  noteZcodeRequestFailed,
+  noteZcodeRequestOk,
+  noteZcodeRequestSent,
+} from './zcode-diagnostics.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
 export const PROVIDER = 'zcode'
@@ -701,8 +710,9 @@ export class ZcodeAdapter extends LlmAdapter {
      *
      * ⚠ 三个必须做对的点：
      *   - `system` 是顶层块数组，且第一块必须是官方 `cliPrefix`
-     *     （缺了回 3012）
-     *   - 首轮 user 消息要带 `<system-reminder>` 日期块
+     *     （**唯一**的 3012 判据；缺了回 405 + 3012）
+     *   - 首轮 user 消息带 `<system-reminder>` 日期块（官方如此，
+     *     但实测**不是** 3012 的判据 —— 见 `zcode-identity.ts` 头注释）
      *   - `tools` 是**扁平** `input_schema` 形态（不是 OpenAI 的嵌套 `function`）
      */
     const wire = serializeMessages(options.messages, imageUrls)
@@ -935,6 +945,18 @@ export class ZcodeAdapter extends LlmAdapter {
         }
 
         const upstreamStartedAt = Date.now()
+        /**
+         * ★ 记「已发出」（Gitee issue IKJI0Y 的可观测诊断）。
+         *
+         * ⚠ 必须在 `sendUpstream` **之前**记，且用 `upstreamStartedAt`：
+         * 否则「距上一条 zcode 请求隔了多久」会把本次自己的排队/mint 等待
+         * 算进去，算出一个没有排查价值的大数。
+         *
+         * ⚠ `activeAccountId` 是**局部可变状态**（切号后会变），与
+         * `zcode-adapter.ts` 里额度切号那段是同一条纪律 —— 标记必须记在
+         * 真正发出这条请求的账号上，否则切到 B 之后失败会把账记到 A 头上。
+         */
+        noteZcodeRequestSent(activeAccountId, upstreamStartedAt)
         response = await this.sendUpstream({
           url: channelRequest.url,
           headers,
@@ -951,6 +973,7 @@ export class ZcodeAdapter extends LlmAdapter {
          */
         const headersMs = Date.now() - upstreamStartedAt
         if (response.ok) {
+          noteZcodeRequestOk(activeAccountId, Date.now())
           if (captchaParam === undefined) {
             // 不带也成功 ⇒ 上游当前不要验证，清掉记忆回到最省路径。
             clearCaptchaRequirement(requirementKey)
@@ -966,6 +989,7 @@ export class ZcodeAdapter extends LlmAdapter {
         }
 
         const text = await response.text().catch(() => '')
+        noteZcodeRequestFailed(activeAccountId)
 
         // ① 额度用尽 / 无权益 → **换账号**（不是重试）
         if (isZcodeQuotaExhausted(response.status, text)) {
@@ -1096,8 +1120,37 @@ export class ZcodeAdapter extends LlmAdapter {
         }
 
         // ④ 其余错误：按既有映射如实抛出（3012 等不可重试类不变）
+        /**
+         * ★ **只在 `3012` 上附诊断**（Gitee issue IKJI0Y）。
+         *
+         * ## 为什么只给 3012 加
+         *
+         * - `3012` 是**唯一一个用户既什么都做不了、又完全看不出原因**的错误：
+         *   冷却惩罚不可逆 ⇒ 不可重试；而既有文案只有固定句 + 原始响应，
+         *   连「是不是这个账号自身的问题」都无法回答。
+         * - 其它码（`3009`/`1005`/`3007`）的文案**本身就说明了原因**，
+         *   且都各自有单测钉住措辞 ⇒ 附加诊断只会让那些文案变脏。
+         *
+         * ## 形态取自「已构造好的 body」而不是常量
+         *
+         * `body.system` / `body.messages` 就是**即将发出去**的那份（重试与
+         * 切号都复用同一份），故诊断到的是**线上形态**。真出现「身份块没进去」
+         * 时它会显示 0 字符 —— 而不是显示常量里的 2898 把问题盖住。
+         *
+         * ⚠ 上面的 {@link noteZcodeRequestFailed} 已经把本次算作一次失败，
+         * 故这里诊断到的「失败 N」含本次，这是有意的（用户看到的就是当次）。
+         */
+        const diagnostic = text.includes('3012')
+          ? formatZcodeDiagnostic({
+            accountId: activeAccountId,
+            sentAt: upstreamStartedAt,
+            status: response.status,
+            shape: describeZcodeRequestShape(body.system, body.messages),
+            now: Date.now(),
+          })
+          : undefined
         throw new LlmError(
-          `zcode: ${describeUpstreamError(response.status, text)}`,
+          `zcode: ${describeUpstreamError(response.status, text, diagnostic)}`,
           httpErrorCodeForZcode(response.status, text),
           { status: response.status },
         )
@@ -1612,11 +1665,30 @@ export function withToolCacheBreakpoint<T extends object>(
 /**
  * 把上游错误翻成人能看懂的一句话。
  *
- * ⚠ 两个业务码要单独说清，因为它们的**处理方式完全不同**：
+ * ## 两个业务码要单独说清，因为它们的**处理方式完全不同**：
  * - `3007` = captcha 校验失败（**可重试**：换个新 param 即可）
  * - `3012` = 风控拦截（**不要重试**：有账号冷却惩罚，重复触发会升级封禁）
+ *
+ * ## `3012` 会附带一行**可观测诊断**（Gitee issue IKJI0Y）
+ *
+ * 3012 是唯一一个「用户什么都做不了、又完全看不出原因」的错误：冷却惩罚
+ * 不可逆，而既有文案只有固定句 + 原始响应。issue 的原话是
+ * 「目前唯一能确认的是身份块字符数这一项，而它恰好是正常的」——
+ * 即诊断信息缺到连**排除法**都做不了。
+ *
+ * ⇒ `diagnostic` 由调用方（`stream()`）组装，内容见
+ * {@link formatZcodeDiagnostic}：**只含账号序号、进程内计数、间隔、
+ * 实测身份块字符数、日期块有无**，**不含任何凭据**。
+ * 未提供时行为与原来逐字一致（单测直接调用本函数的用例不受影响）。
  */
-export function describeUpstreamError(status: number, body: string): string {
+export function describeUpstreamError(
+  status: number,
+  body: string,
+  diagnostic?: string,
+): string {
+  const diag = typeof diagnostic === 'string' && diagnostic.length > 0
+    ? `本机诊断：${diagnostic}\n`
+    : ''
   const trimmed = body.trim()
   let code: unknown
   let message: unknown
@@ -1653,7 +1725,8 @@ export function describeUpstreamError(status: number, body: string): string {
     return (
       `上游风控拦截（3012 unusual activity）。` +
       `⚠ 该错误有账号冷却惩罚（30 分钟，反复触发会升级到 24 小时乃至停用），` +
-      `请勿连续重试。原始响应：${suffix}`
+      `请勿连续重试。\n${diag}` +
+      `原始响应：${suffix}`
     )
   }
   if (code === 1002 || status === 401) {
