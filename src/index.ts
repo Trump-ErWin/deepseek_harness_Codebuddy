@@ -33,6 +33,7 @@ import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
+import { installLoopResume } from './loop-recovery.js'
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 import { BuddyBalanceSelector, pickBuddyAccount } from './buddy-balance-selector.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -1816,5 +1817,10 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
   // 自行降级为日志，绝不会让插件 apply() 失败。
   mountOpenAiGateway(ctx, pool)
+  // 思考死循环被中止后的**自动续跑**：把此前必须由用户手打「继续」的那一步
+  // 自动化（真实报障 2026-10-04，见 `loop-recovery.ts` 模块头）。
+  // ⚠️ 它依赖 `agents` 服务，故内部用 `ctx.inject(['agents'], …)` 挂载：
+  // 该服务缺席的 profile 里本功能整体不生效，不会让插件永久 pending。
+  installLoopResume(ctx)
   ctx.provide('accountPool', pool)
 }
