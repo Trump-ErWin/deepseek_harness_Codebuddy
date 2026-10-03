@@ -490,10 +490,16 @@ describe('ClineAdapter 限流与换号判定', () => {
     expect(isClineRotatableFailure(500, 'internal error')).toBe(false)
   })
 
-  it('只有 429 / 402 记限流徽章（徽章含义必须是「受限」而非「出过错」）', () => {
+  it('★ 只有 429 记限流徽章 —— 402（额度耗尽）没有「多久后重置」可言', () => {
+    // 徽章的含义是「受限，某时刻后可能自动解禁」。402 是 Cline 官方文档里的
+    // `Insufficient credits`（去 app.cline.bot 充值），记成 60 分钟倒计时会让用户白等
+    // ——真实报障：「倒计时结束了我再去连为什么还是失败了，显示要 60 分钟后？」
+    // 与 `recordsLobsteraiRateLimit` 同约定：不写徽章 **≠** 不换号（402 仍会换号）。
     expect(recordsClineRateLimit(429, '')).toBe(true)
-    expect(recordsClineRateLimit(402, '')).toBe(true)
+    expect(recordsClineRateLimit(402, '')).toBe(false)
     expect(recordsClineRateLimit(400, 'insufficient credit')).toBe(false)
+    // 换号判据不受影响：402 仍值得试下一个账号（它可能有余额）。
+    expect(isClineRotatableFailure(402, '')).toBe(true)
   })
 
   it('地域限制（403 not available in your region）不被误判为凭据问题，且不白跑续期', async () => {
@@ -572,6 +578,122 @@ describe('ClineAdapter 限流与换号判定', () => {
     const chunks = await collect(adapter)
     expect(call).toBe(2)
     expect(chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')).toBe('ok')
+  })
+})
+
+/**
+ * 限流标记**写多长**、以及全部账号失败时**报什么**。
+ *
+ * ## 真实报障（2026-10-03）
+ *
+ * 用户：「倒计时结束了我再去连为什么还是失败了，显示要 60 分钟后？」
+ *
+ * 两处根因：① 标记写的一直是 `Date.now() + 60 分钟`（**忽略了 Cline 在 429 上
+ * 给出的真实 `retry-after`**），而且每次失败都从当下重新计一遍 —— 用户等完再试，
+ * 只要上游仍拒绝就还是「60 分钟后」；② 402（额度耗尽）被一视同仁地记成 60 分钟，
+ * 而它**永远**不会因为等而恢复。③ 全部账号失败时的报错把状态码与上游文案都丢了，
+ * 用户（与排障的人）分不出该等还是该去充值。
+ */
+describe('Cline 限流标记：用服务端给的时间，402 不倒数', () => {
+  type MarkCall = { accountId: string; model: string; resetAtMs: number }
+
+  /** 桩池：记录标记调用，且**永不**给出下一个账号（让失败路径直接走到最终报错）。 */
+  function poolStub(calls: MarkCall[]) {
+    return {
+      disabledModelsFor: () => new Set<string>(),
+      hasLoggedInAccount: async () => true,
+      updateModelRateLimit: async (accountId: string, model: string, resetAtMs: number) => {
+        calls.push({ accountId, model, resetAtMs })
+      },
+      getAvailableAccount: async () => null,
+    } as never
+  }
+
+  const responds = (status: number, body: unknown, headers: Record<string, string> = {}) =>
+    (async () => new Response(JSON.stringify(body), { status, headers })) as unknown as typeof fetch
+
+  it('★ 429 带 retry-after → 标记用服务端给的秒数（不再是写死的 1 小时）', async () => {
+    const calls: MarkCall[] = []
+    const before = Date.now()
+    const adapter = makeAdapter({
+      currentAccountId: () => 'acc-1',
+      accountPool: poolStub(calls),
+      fetchImpl: responds(429, { error: { message: 'rate limit exceeded' } }, { 'retry-after': '600' }),
+    })
+    await expect(collect(adapter)).rejects.toThrow(/429/)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].accountId).toBe('acc-1')
+    expect(calls[0].model).toBe('cline-free/deepseek-v4.1-flash')
+    // 600 秒（± 执行耗时）；关键是**远小于** 1 小时，即真的读了响应头。
+    expect(calls[0].resetAtMs - before).toBeGreaterThan(590_000)
+    expect(calls[0].resetAtMs - before).toBeLessThan(610_000)
+  })
+
+  it('429 没给 retry-after → 退到快照式兜底（1 小时，与 buddy 同口径）', async () => {
+    const calls: MarkCall[] = []
+    const before = Date.now()
+    const adapter = makeAdapter({
+      currentAccountId: () => 'acc-1',
+      accountPool: poolStub(calls),
+      fetchImpl: responds(429, { error: 'too many requests' }),
+    })
+    await expect(collect(adapter)).rejects.toThrow(/429/)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].resetAtMs - before).toBeGreaterThan(3_500_000)
+    expect(calls[0].resetAtMs - before).toBeLessThan(3_700_000)
+  })
+
+  it('retry-after 是 HTTP 日期时同样采用', async () => {
+    const calls: MarkCall[] = []
+    const before = Date.now()
+    const adapter = makeAdapter({
+      currentAccountId: () => 'acc-1',
+      accountPool: poolStub(calls),
+      fetchImpl: responds(429, { error: 'slow down' }, { 'retry-after': new Date(before + 120_000).toUTCString() }),
+    })
+    await expect(collect(adapter)).rejects.toThrow(/429/)
+    expect(calls[0].resetAtMs - before).toBeGreaterThan(110_000)
+    expect(calls[0].resetAtMs - before).toBeLessThan(130_000)
+  })
+
+  it('★ 402（额度耗尽）**不写**任何倒计时标记 —— 等多久都不会好', async () => {
+    const calls: MarkCall[] = []
+    const adapter = makeAdapter({
+      currentAccountId: () => 'acc-1',
+      accountPool: poolStub(calls),
+      fetchImpl: responds(402, { error: { message: 'Insufficient credits' } }),
+    })
+    const error = await collect(adapter).catch((e: Error) => e as Error & { code?: string })
+    expect(calls).toEqual([])
+    expect(error.code).toBe('QUOTA_EXCEEDED')
+    // 唯一有效的动作必须出现在文案里，否则用户只会去等。
+    expect(error.message).toContain('402')
+    expect(error.message).toContain('充值')
+  })
+
+  it('★ 全部账号失败时，报错带上真实状态码与上游文案（否则分不出「等」还是「充值」）', async () => {
+    const adapter = makeAdapter({
+      currentAccountId: () => 'acc-1',
+      accountPool: poolStub([]),
+      fetchImpl: responds(429, { error: { message: 'rate limit exceeded' } }),
+    })
+    const error = await collect(adapter).catch((e: Error) => e as Error)
+    expect(error.message).toContain('HTTP 429')
+    expect(error.message).toContain('rate limit exceeded')
+    expect(error.message).toContain('限流')
+    expect(error.message).toContain('cline-free/deepseek-v4.1-flash')
+  })
+
+  it('没有池账号（currentAccountId 为空）时不写标记，但仍如实报错', async () => {
+    // ⚠️ 标记是按**池账号**记的（`modelRateLimits` 挂在账号条目上）：
+    // 走单凭据 ref 的老模式没有账号条目，写标记会落到一个不存在的键上。
+    const calls: MarkCall[] = []
+    const adapter = makeAdapter({
+      accountPool: poolStub(calls),
+      fetchImpl: responds(429, { error: 'rate limit' }, { 'retry-after': '60' }),
+    })
+    await expect(collect(adapter)).rejects.toThrow(/429/)
+    expect(calls).toEqual([])
   })
 })
 
