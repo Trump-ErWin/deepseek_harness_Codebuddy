@@ -1823,6 +1823,8 @@ function ProviderPanel({ provider, rpcCall }) {
    *
    * ⚠ 这里**不再**承载 `forceNew` —— 「登录其他账号」已按用户 2026-10-02 的
    *   要求撤销（见同批提交），它现在只回答「弹窗开没开」。
+   * ⚠ 弹窗**只服务 zcode**：本组件是通用面板，其余 provider 的「+ 新建账号」
+   *   直接发起登录（见按钮的 `provider === 'zcode'` 分流与弹窗条件的第二道门）。
    */
   const [pendingLogin, setPendingLogin] = React.useState(undefined);
   // 正在进行的限流操作：null | 'one' | 'all'。用于禁用按钮并显示进度。
@@ -2707,18 +2709,25 @@ function ProviderPanel({ provider, rpcCall }) {
               ? '处理中…'
               : (permanentLocked ? '解锁永久积分' : '锁定永久积分'))
           : null,
+        // ⚠️ 渠道弹窗**只服务 ZCode**：非 zcode 直接发起登录，与「搬进弹窗」
+        //   之前逐字等价。上游 15ccae5 把渠道选择搬进弹窗时丢了这层门控，
+        //   于是全部 14 个 provider 点「+ 新建账号」都弹出一个「添加 ZCode 账号」。
         React.createElement('button', {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
           title: '通过浏览器登录一个新的账号并加入账号池。',
-          onClick: () => setPendingLogin(false),
+          onClick: provider === 'zcode'
+            ? () => setPendingLogin(false)
+            : () => void createAccount(),
           disabled: creating,
         }, creating ? '正在登录…' : '+ 新建账号'),
         // ★ 渠道选择对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
         //
         // ⚠ 两个入口（这里与 `zcode-card.js`）各有一份：它们是**不同的组件**、
         //   不同的状态源，抽公共组件会牵动 PR #38 已打通的 props 通路，收益不抵风险。
-        pendingLogin === undefined ? null : React.createElement(
+        // ⚠ `provider !== 'zcode'` 是**必需的第二道门**：本组件是通用面板（服务
+        //   全部 provider），只靠按钮那道门不够 —— 状态被别处改动时仍会漏出弹窗。
+        pendingLogin === undefined || provider !== 'zcode' ? null : React.createElement(
           'div',
             {
               className: 'dim-jh-zcDialogMask',
