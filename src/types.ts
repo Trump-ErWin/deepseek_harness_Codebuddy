@@ -506,6 +506,31 @@ export interface RpcCreditsBalanceAccount {
   balance: import('./credits.js').CreditBalance | null
   /** 查询失败的原因，供 UI 提示（成功时为 undefined）。 */
   error?: string
+  /**
+   * 与余额**并列**的附加读数（不属于余额语义，故不塞进 `CreditBalance`）。
+   *
+   * 目前只有 Gemini 用：它的「账号规格」（Google AI Pro / Free）来自
+   * `loadCodeAssist`，与配额是两个端点，但搭同一次 `credits.balances` 回来。
+   * 缺省 = 该 provider 没有附加读数 / 这次没取到 ⇒ 面板不渲染对应行。
+   */
+  extra?: RpcCreditsBalanceExtra
+}
+
+/**
+ * 逐账号附加读数。
+ *
+ * ⚠️ 用**对象**而不是把字段平铺到 {@link RpcCreditsBalanceAccount} 上：
+ * 平铺会让 `usage-badge.ts` / 卡片里所有逐账号形状的断言都跟着膨胀，
+ * 而这类读数注定还会增加（每加一个 provider 就多一批字段）。
+ */
+export interface RpcCreditsBalanceExtra {
+  /**
+   * 账号规格短标签（`Pro` / `Free` / `Ultra`）。
+   *
+   * `title` 放上游原文（`Google AI Pro（g1-pro-tier）`），hover 才看得到
+   * —— 面板空间只够一个词。
+   */
+  accountTier?: { label: string; title: string }
 }
 
 /** RPC: 查询积分余额响应 */

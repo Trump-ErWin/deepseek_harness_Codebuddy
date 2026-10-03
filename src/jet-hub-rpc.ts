@@ -161,6 +161,7 @@ import type {
   RpcCreditsClaimAllResponse,
   RpcCreditsClaimSummary,
   RpcCreditsBalancesRequest,
+  RpcCreditsBalanceExtra,
   RpcCreditsBalancesResponse,
   RpcClineQuotaRequest,
   RpcClineQuotaResponse,
@@ -455,7 +456,7 @@ export interface CreditsEndpointDeps<
   fetchBalanceDetailed?: (
     credential: TCredential,
     product: TProduct,
-  ) => Promise<{ balance: CreditBalance | null; error?: string }>
+  ) => Promise<{ balance: CreditBalance | null; error?: string; extra?: RpcCreditsBalanceExtra }>
   /** 单账号异常时的告警出口（不参与控制流）。 */
   warn?: (message: string) => void
   /**
@@ -651,6 +652,7 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
   for (const entry of accounts) {
     let balance: CreditBalance | null = null
     let error: string | undefined
+    let extra: RpcCreditsBalanceExtra | undefined
     try {
       const resolved = await deps.resolve(credentialRef(entry.credentialRef))
       if (resolved === undefined) {
@@ -662,6 +664,7 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
           const detailed = await fetchDetailed(credential, product)
           balance = detailed.balance
           error = detailed.error
+          extra = detailed.extra
           if (balance === null && error === undefined) error = '余额查询失败'
         } else {
           balance = await fetchBalance(credential, product)
@@ -679,6 +682,7 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
       nickname: entry.nickname,
       balance,
       ...error === undefined ? {} : { error },
+      ...extra === undefined ? {} : { extra },
     })
   }
   return results
@@ -2947,9 +2951,25 @@ function registerJetHubEndpoints(
           // ⚠️ 第二实参传 `GEMINI` 而不是 minimax 那样的 `undefined`：
           // `fetchGeminiCreditBalance` 的第二形参就是 product（端点/超时来自
           // 产品配置）。
+          //
+          // ⚠️ 账号规格（Pro / Free / Ultra）搭这趟车回来：`loadCodeAssist` 与
+          // 配额是同一函数里**并行**发的两个端点，档位挂在 `result.tier` 上。
+          // 这里把它翻译成面板要的 `extra.accountTier` —— `label` 是短标签
+          // （面板只放得下一个词），`title` 是上游原文（hover 才看得到）。
+          // 档位取不到时 `extra` 缺席，面板不渲染那一行（**不是错误**）。
           const values = await collectCreditBalances<GeminiCredential, typeof GEMINI>(accounts, GEMINI, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalanceDetailed: (credential) => fetchGeminiCreditBalance(credential, GEMINI),
+            fetchBalanceDetailed: async (credential) => {
+              const { balance, error, tier } = await fetchGeminiCreditBalance(credential, GEMINI)
+              const extra: RpcCreditsBalanceExtra | undefined = tier === undefined
+                ? undefined
+                : { accountTier: { label: tier.label, title: `${tier.name}（${tier.id}）` } }
+              return {
+                balance,
+                ...error === undefined ? {} : { error },
+                ...extra === undefined ? {} : { extra },
+              }
+            },
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
