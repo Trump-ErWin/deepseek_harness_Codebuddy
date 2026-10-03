@@ -752,6 +752,48 @@ allowBuilds 判定，不换 commit 会得到假的"成功"）：
    唯一跨版本可用的是 `dangerouslyAllowAllBuilds: true`（代价：放行该 profile 里所有依赖的
    构建脚本）。改完请照上表重跑一遍验证 —— 尤其**要换新 commit**，否则缓存会骗你。
 
+## ⚠⚠️ 客户端**不得**注册 `settings.models.provider-card` 槽（Issue IKJLHQ）
+
+**真实缺陷**（用户报障，Gitee issue IKJLHQ，2026-10-03）：本插件曾以
+`key: 'llm-pi-ai'` 向官方「设置 → 模型 → 模型卡片」注册 ZCode 账号卡片，与
+同样扩展 pi-ai 家族的 `@linxin666/dsh-client-ui-model-capabilities` **互斥**，
+后者被**静默顶掉** —— 所有第三方 provider 卡片上的推理档位编辑面板消失，无任何报错。
+
+**已修**（本分支）：整块移除 `plugin-src/client/zcode-card.js` 与该注册，
+ZCode 账号管理**只在 Jet Hub 设置页**。回归用例在
+`tests/unit/zcode-channel-dialog.spec.ts` 的「IKJLHQ」段（4 条 + 反向验证过）。
+
+### 机制（依据官方包 `@deepseek-ai/dsh-client-ui-slots` / `-renderer` 0.2.0-rc.2）
+
+| 事实 | 出处 |
+|---|---|
+| 该槽的 `key` 语义 = **那张卡片的 `settingsNs`** | 官方 `dsh-client-ui-settings-models/lib/client.js:2150`：`renderSlot('settings.models.provider-card', {...}, { entryKey: row.entry.settingsNs })` |
+| 渲染侧按 `entryKey` **精确 find**，只渲染**一个** winner | `-renderer/lib/client.js:1154`：`entriesOfSlot(slot).find(e => e.options.key === opts.entryKey)` |
+| `entriesOfSlot` 取 ledger（**注册顺序**）里每 cell 首个 live 条目，**`priority` 不参与排序** | `-slots/lib/index.js:285-290` |
+| 同 key + 同 priority 的第二个 `register` **直接抛** `keyed slot "…" already has an entry for key "…"` | `-slots/lib/index.js:177-178` |
+| `slots.inject` 的回调抛错 ⇒ `stop()` 掉整个 inject 并 `queueMicrotask(throw)` | `-renderer/lib/client.js:1375-1388` |
+
+⇒ **同一个 `settingsNs` 上的第三方扩展是物理互斥的**，「换 key」与「换 priority」都
+**不能**变成共存：
+
+- 换独立 key（`llm-pi-ai-zcode`）⇒ 官方 `find()` 落空 ⇒ **我们自己的卡片永不渲染**；
+- 换 priority ⇒ 两条都注册成功，但 winner 仍只有 ledger 里第一个 ⇒ 低优先级那条
+  **永远不渲染**（错误提示里那句 `lowest renders` 只是让它不抛错的手段，别当真）。
+
+⚠ **zcode 没有自己的适配器家族**：`dsh-llm-pi-ai/lib/index.js:2492/2535` 把
+**所有** route 目录行的 `settingsNs` 统一设成 `llm-pi-ai`，用户手工加的 `zcode`
+route 也一样 ⇒ 想「就近」把账号 UI 塞进官方卡片，就只能抢那个 key。
+⚠ 即使把 ZCode 恢复成独立家族也**治不了**：用户手工加的那条 `zcode` route
+仍然 settingsNs = `llm-pi-ai`，照样撞。
+⚠ 对照 `@mars-sea/dsh-commandcode-provider` 用 `llm-commandcode`「互不冲突」是**误解**：
+它 `const NS = "llm-commandcode"`（`lib/index.js:9936`）**本身就是独立适配器家族**，
+那个 key 恰是它卡片行的真实 `settingsNs`；不冲突只是因为整族都是自己的。
+caps 插件的注释已经把话说明了：`/** The official adapter family this plugin
+extends (the card slot's key). */ PI_AI_SETTINGS_NAMESPACE = 'llm-pi-ai'`。
+
+⚠ **只有 zcode 撞是因为本仓库只有这一处 keyed 注册**；其余 11 个 provider 的账号
+管理都在 Jet Hub 页，不碰官方卡片槽。任何新插件想给官方模型卡片加扩展，都会撞。
+
 ## 技术栈与约束
 
 - **Node.js**：`^22.19.0 || >=24.0.0`
