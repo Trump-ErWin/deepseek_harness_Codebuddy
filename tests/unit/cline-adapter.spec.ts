@@ -5,9 +5,9 @@ import { dirname, resolve } from 'node:path'
 import {
   ClineAdapter,
   isClineRotatableFailure,
-  recordsClineRateLimit,
   sanitizeClineToolParameters,
 } from '../../src/cline-adapter.js'
+import { recordsClineRateLimit } from '../../src/cline-rate-limit.js'
 import { CLINE } from '../../src/cline-product.js'
 import { mergeClineModels, type ClineModel } from '../../src/cline-models.js'
 import type { ClineCredential } from '../../src/cline.js'
@@ -654,6 +654,70 @@ describe('Cline 限流标记：用服务端给的时间，402 不倒数', () => 
     await expect(collect(adapter)).rejects.toThrow(/429/)
     expect(calls[0].resetAtMs - before).toBeGreaterThan(110_000)
     expect(calls[0].resetAtMs - before).toBeLessThan(130_000)
+  })
+
+  /**
+   * ⚠️ **实测报文**（2026-10-03 23:10 直连 Cline，见 `probe-cline-live.mjs`）：
+   * 只有 429 + `no-retry: true`，**没有 `retry-after` 头**，等待时长写在英文
+   * 句子里（`Try again in 19h 39m`）。用户第二次报障「还是 60 分钟」就是这条。
+   */
+  const REAL_DAILY_FREE = {
+    error: {
+      code: 'INFERENCE_CAP_ERROR',
+      message: 'Error 429: Daily free limit reached on model deepseek/deepseek-v4.1-flash. Try again in 19h 39m',
+    },
+  }
+
+  it('★ 实测的「当日免费额度」429 → 标记写服务端给的 19 小时 39 分，且文案点明按天结算', async () => {
+    const calls: MarkCall[] = []
+    const before = Date.now()
+    const adapter = makeAdapter({
+      currentAccountId: () => 'acc-1',
+      accountPool: poolStub(calls),
+      fetchImpl: responds(429, REAL_DAILY_FREE),
+    })
+    const error = await collect(adapter).catch((e: Error) => e as Error)
+    expect(calls).toHaveLength(1)
+    const waitMs = calls[0].resetAtMs - before
+    expect(waitMs).toBeGreaterThan(((19 * 60) + 39) * 60_000 - 1_000)
+    expect(waitMs).toBeLessThan(((19 * 60) + 39) * 60_000 + 1_000)
+    // 上游原文必须原样带给用户（否则「限流」与「免费额度用尽」无从区分）。
+    expect(error.message).toContain('Daily free limit reached')
+    // 动作必须说清：等不到头（按天结算 + 按模型单独计算）+ 换另一个免费模型。
+    expect(error.message).toContain('按天结算')
+    expect(error.message).toContain('按模型单独计算')
+    // ⚠️ **不能**建议 cline-pass：实测本账号 403 ENTITLEMENT_ERROR（有余额、无订阅）。
+    expect(error.message).not.toContain('cline-pass')
+    // 解禁时刻（本地时钟）与「约 N 小时后」都要有。
+    // eslint-disable-next-line no-irregular-whitespace
+    expect(error.message).toMatch(/约 \d+(\.\d)? 小时后/)
+  })
+
+  it('★ 换号预算用尽时，**最后**一个账号也必须被标记（否则下一轮又选回它）', async () => {
+    // 原实现把标记写在**下一轮的开头**，于是「轮次用尽而退出」时最后一个账号
+    // 永远不会被标记 —— 本机 cline 只有一个账号，这条尤其致命：失败后它仍被
+    // 判定为可用，下一次请求立刻再撞一次同样的墙。
+    const calls: MarkCall[] = []
+    let next = 0
+    const accounts = ['acc-2', 'acc-3']
+    const adapter = makeAdapter({
+      currentAccountId: () => 'acc-1',
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        hasLoggedInAccount: async () => true,
+        updateModelRateLimit: async (accountId: string, model: string, resetAtMs: number) => {
+          calls.push({ accountId, model, resetAtMs })
+        },
+        getAvailableAccount: async () => {
+          const id = accounts[next]
+          next += 1
+          return id === undefined ? null : { entry: { id }, credential: cred }
+        },
+      } as never,
+      fetchImpl: responds(429, { error: { message: 'rate limit exceeded' } }),
+    })
+    await expect(collect(adapter)).rejects.toThrow(/429/)
+    expect(calls.map((c) => c.accountId)).toEqual(['acc-1', 'acc-2', 'acc-3'])
   })
 
   it('★ 402（额度耗尽）**不写**任何倒计时标记 —— 等多久都不会好', async () => {

@@ -7548,56 +7548,132 @@ max ultra`）。CC Switch 把那 8 个（连英文描述）**硬编码在自己�
 `openai-gateway-server.spec.ts` 的「思考档位」段（HTTP 层实测那三条雷 + 对照表端点）、
 `openai-gateway-panel.spec.ts`（对照表行与文案 / 搜索判据 / 不截断排版）。
 
-## ⚠️ Cline 限流：倒计时必须用服务端给的 `retry-after`，402 不许倒数（真实报障，2026-10-03）
+## ⚠️ Cline 限流：倒计时用**报文里的人类可读时长**，402 不许倒数（真实报障两次，2026-10-03）
 
-**用户报障**：「倒计时结束了我再去连为什么还是失败了，显示要 60 分钟后？」
+**用户报障 ①**：「倒计时结束了我再去连为什么还是失败了，显示要 60 分钟后？」
+**用户报障 ②**（当晚，第一次修完并重启后）：「还是 60 分钟，而且连余额也查询失败了」
 
-**三处根因**（前两处在 `src/cline-adapter.ts`，第三处在 `src/index.ts`）：
+### 第二次报障推翻的结论（**这是本节最值钱的一条**）
 
-1. **写死的 60 分钟，而且完全没读 `retry-after`**：标记写的是
-   `Date.now() + CLINE_RATE_LIMIT_FALLBACK_MS`。
+第一次修复时我**只按文档推断**，在注释里写下「Cline 在 429 上**会给出** `retry-after`
+（官方错误码表 + 它自己客户端的 long-retry-after 分支）」，于是只加了「读响应头」。
+**实测证伪** —— 直连取证（`probe-cline-live.mjs`，2026-10-03 23:10）：
+
+```
+POST https://api.cline.bot/api/v1/chat/completions   model=cline-free/deepseek-v4.1-flash
+→ HTTP 429
+  date: Sat, 03 Oct 2026 15:10:33 GMT
+  no-retry: true                       ← 没有任何 retry-after / x-ratelimit-reset
+  x-request-id: JvXBMYgDCJKhLXnaJOXdzCnouwNjqVlJ
+  {"error":{"code":"INFERENCE_CAP_ERROR",
+    "message":"Error 429: Daily free limit reached on model
+               deepseek/deepseek-v4.1-flash. Try again in 19h 39m"}}
+```
+
+⇒ 真实等待是 **19 小时 39 分**（当日免费额度），而代码读到的是「没有时间」→ 退回
+**1 小时的快照兜底**。用户等满 1 小时再试当然还是 429，而且每失败一次就从当下重算
+一小时 ⇒「永远 60 分钟」可以无限循环。
+
+⚠️ **两条可复用的教训**：
+
+1. **「报文里没有机器可读的时间」≠「报文里没有时间」**。Cline 把时长写在**英文句子**
+   里（`Try again in 19h 39m`）。同类句式还有 `Try again in 5m` / `1h 30m` / `45s`。
+   排查限流务必把**原始报文原文**打出来看，别只看响应头。
+2. **文档推断不能当实测**。上一版的结论来自官方错误码表，方向对（Cline 确实分
+   WAIT/STOP），但**协议细节是错的** —— 这与 qoder「某次实测没看到就推广成不存在」、
+   TRAE「带 code 的回调」是同一类错误。
+
+### 429 有**三种**语义，动作互不相同（都只能靠文案区分）
+
+| 形态 | 判据（报文原文） | 正确动作 | 处理 |
+|---|---|---|---|
+| **当日免费额度** | `Daily free limit reached` + `Try again in 19h 39m` | **等不到头**；改用同一账号的**另一个免费模型** | 标记 = 服务端给的时长；文案点明「按天结算 + 按模型单独计算」 |
+| **短时限流** | `Rate limit exceeded` 一类 | 等一会儿 / 换账号 | 标记 = 报文时长 → 头 → 兜底 1 小时 |
+| **402 额度耗尽** | `Insufficient credits` | 去 app.cline.bot 充值 | **不写倒计时**（但仍换号） |
+
+⚠️ **免费额度是「按模型」单独计的**（同一时刻实测，同一个账号）：
+
+| 模型 | 结果 |
+|---|---|
+| `cline-free/deepseek-v4.1-flash` | 429 `Daily free limit reached … Try again in 19h 29m` |
+| `cline-free/mimo-v2.6-flash` | **200** |
+| `cline-free/muse-spark-1.3-contributor` | **200** |
+
+标记也只能落到那一个模型键上（`modelRateLimits[model]`）。
+
+⚠️⚠️ **`cline-pass/*` 不是「有余额就能用」的备用通道** —— 第一版建议写成
+「改用同一账号的 `cline-pass/*` 付费通道（走账号余额）」，**实测证伪**：
+
+```
+POST /api/v1/chat/completions  model=cline-pass/deepseek-v4.1-flash
+→ HTTP 403 {"error":{"code":"ENTITLEMENT_ERROR",
+             "message":"Error 403: the user is not subscribed to required model plan"}}
+```
+
+该账号**有余额**（`/balance` → `balance: 500000`）但**没有订阅计划**
+（`/users/me/plan/usage-limits` → `404 no plan history found for user`）。`cline-pass/*`
+是**订阅**通道 ⇒ 文案里**不许再提它**。教训与本节第 2 条同源：**推荐动作必须实测过**
+（我凭「有余额就走付费」的直觉写了一句话，用户照做只会再撞一次墙）。
+
+### 三处根因（第一次报障的 1~3 + 第二次报障的 4~5）
+
+1. **写死的 60 分钟，且没有 Cline 专属解析**：标记写的是 `Date.now() + 3_600_000`。
    **证据**：`~/.dsh/jet-hub/state.json` 里 cline 那条是 `…:59.963Z` —— `.963`
-   毫秒正是 `Date.now()+3_600_000` 的指纹（服务端给的时间不会带这种随机毫秒）；
-   同一个文件里 buddy 的 `…:07.000Z`、codearts 的 `16:00:00.000Z` 都是「整」值。
-   ⇒ 那个倒计时**既不等于服务端的解禁时刻**，又每次失败都从当下重算 —— 用户等完
-   再试，只要上游仍拒绝就还是「60 分钟后」，可以无限循环。而 Cline 在 429 上
-   **是会给出** `retry-after` 的（官方错误码表 + 它自己客户端的 long-retry-after 分支）。
-2. **402 也被记成倒计时**：官方语义是 `Insufficient credits`（去 app.cline.bot 充值），
-   **等多久都不会恢复** —— 记成 60 分钟只会让用户白等。
+   毫秒正是 `Date.now()+3_600_000` 的指纹（同一文件里 buddy 的 `…:07.000Z`、
+   codearts 的 `16:00:00.000Z` 都是「整」值）。
+2. **402 也被记成倒计时**：官方语义是 `Insufficient credits`，**等多久都不会恢复**。
 3. **被自己的标记挡住时报「请先登录」**：池把被标记的账号筛掉（`account-pool.ts`
    的 `Date.now() >= resetAt` 过滤）→ `resolveCredential` 回 `undefined` → 适配器抛
    `cline: no usable credential; log in first`。凭据明明在、账号也登录着，用户却被
    指去重新登录。这与 buddy 那次（`buddy-ratelimit-misreport.spec.ts` 记着）**同型**：
    buddy / workbuddy 早已接上 `throwIfAllAccountsRateLimited`，**cline 漏了**。
+4. **只读响应头 ⇒ 实测报文下仍然退回 60 分钟**（见上「第二次报障」）。
+5. **⚠️ 换号预算用尽时，最后失败的那个账号从来没被标记**：原来的写法把标记放在
+   **下一轮的开头**（`for` 里第一件事就是标记「上一轮失败的那个账号」），于是当
+   `round` 用尽而退出循环时，**最后一个**账号永远不会被标记 —— 它下一次又被
+   `getAvailableAccount` 选中，立刻再撞一次同样的墙。本机 cline 只有**一个**账号，
+   这条尤其致命（`getAvailableAccount` 立刻返回 null 就退出，看似「标记了」）。
+   ⇒ 现在 `markLimited()` 在**每次失败后**调用（用 `markedAccountId` 防重复），
+   循环结束后再补一次。
 
-**修法（四条，勿回退）**：
+**修法（勿回退）**：
 
 | # | 改什么 | 位置 |
 |---|---|---|
-| 1 | 标记时长 = `retry-after` 头（秒数 / HTTP 日期，**0 是合法值**）→ 错误体 → 兜底 `RATE_LIMIT_FALLBACK_MS` 快照 | `clineRateLimitResetAt` |
-| 2 | `recordsClineRateLimit` **只认 429**（402 不写徽章，但仍换号 —— 「不写徽章 ≠ 不换号」） | `cline-adapter.ts` |
+| 1 | 标记时长取值序：`retry-after` 头（秒数 / HTTP 日期，**0 是合法值**）→ **报文里的 `Try again in 19h 39m`** → 通用绝对时刻句式 → 兜底快照 | `src/cline-rate-limit.ts` 的 `clineRateLimitResetAt` |
+| 2 | `recordsClineRateLimit` **只认 429**（402 不写徽章，但仍换号 —— 「不写徽章 ≠ 不换号」） | 同上 |
 | 3 | cline 的 `resolveCredential` 接上 `throwIfAllAccountsRateLimited(CLINE, modelId)`，且**必须先于**单凭据 ref 兜底 | `src/index.ts` |
-| 4 | 全部账号失败时报错带**最后一笔的状态码 + 上游文案**，并按 429/402 给不同行动建议（等 vs 充值） | `clineExhaustedAdvice` |
+| 4 | 全部账号失败时报错带**最后一笔的状态码 + 上游文案**，并按「免费额度 / 短时限流 / 402」给**三种不同**建议 | `clineExhaustedAdvice` |
+| 5 | 每个失败账号（含最后一个）都写标记 | `cline-adapter.ts` 的 `markLimited` |
 
-⚠️ `retry-after` 的解析已收敛到 `src/retry-after.ts`（原先 `opencode-adapter.ts` 与
-`opencode-product.ts` 各有一份几乎逐字相同的私有实现）。三个**必须一致**的细节：
+⚠️ **这三件事收敛在 `src/cline-rate-limit.ts` 一处**（原先 `clineExhaustedAdvice` /
+`recordsClineRateLimit` 在适配器里、解析在别处，改一处必漏另一处）。
 
-- **`0` 是合法值**（「立即解除」），判空必须用 `=== undefined`；任何 falsy 判据都会
-  把 0 当成「未知」，于是一个刚被限流的账号被白白锁一小时；
-- **纯数字必须走「秒」分支**：落到 `Date.parse('900')` 会解析成 1970 年 → 差值巨大
-  负数 → 被 `Math.max(0, …)` 抹成 0 → 账号**无限空转**；
-- **负数按无效处理**（`Date.parse('-5')` 是**合法**的 ISO 年份，同样会变 0）——
-  这一条是两个旧副本都没有的，犯错的后果同上。
+⚠️ 时长 token 的正则**必须带尾部 `(?![a-z])`**：`minutes?` 与 `m` 两个分支都能匹配
+`2 minutes` 里的 `m`，少了它会把 2 分钟算成 4 分钟（时长直接翻倍）。
+⚠️ 共享的全局正则**每次用前重置 `lastIndex`**（`matchAll` 会复制 `lastIndex`），
+否则第二次调用的结果随调用次数漂移。
 
-⚠️ 助手 `throwIfAllAccountsRateLimited` 的 `product` 参数已从 `BuddyProduct` 放宽为
-`{ id: string; displayName: string }`（`ClineProduct` 与 `BuddyProduct` 是两个类型，
-写死前者 cline 就复用不了）。
+### 余额查询「fetch failed」是**另一回事**（不是本次改动造成的）
 
-⚠️ **别把 429 与 402 合并成一句「请稍后再试」**：用户的动作相反（等 vs 充值），
-这也是 Cline 客户端自己修过的那条（cline/cline#10139 `WAIT vs STOP not distinguished`）。
+面板那次 `余额查询网络失败：fetch failed` 与限流无关，且**不可复现**：`probe-cline-stability.mjs`
+对 `GET /api/v1/users/{id}/balance` 连打 5 次全部 **HTTP 200**（`balance: 500000`）。
+它是插件宿主进程里的一次**瞬时传输失败**（`fetch failed` 是 undici 的连接层 TypeError）。
+⚠️ 关键**反证**：面板的积分/额度走 `ctx.credentials.resolve`，**不经过**
+`resolveCredential`，所以第 3 条那个限流前置检查**碰不到它** —— 别把它算到限流修复头上。
+排查时先直连同一端点看是否健康，再怀疑代码。
 
-**回归用例**：`tests/unit/retry-after.spec.ts`（10 条：秒数 / HTTP 日期 / 0 / 负数 /
-垃圾值 / 两种取头方式同答案）、`cline-adapter.spec.ts` 的「限流标记：用服务端给的时间，
-402 不倒数」段（6 条：429+头 → 用 600 秒 / 429 无头 → 1 小时快照 / HTTP 日期 /
-402 不写标记且文案含「充值」/ 报错含状态码与上游原文 / 无池账号不写标记）、
+⚠️ 顺带实测（同一探针）：`GET /api/v1/users/me/plan/usage-limits` 对该账号回
+**404 `no plan history found for user`** —— 这是「没有订阅计划」的**正常**形态（不是故障），
+「订阅额度」那一行据此显示原因即可。
+
+**回归用例**：`tests/unit/cline-rate-limit.spec.ts`（19 条：实测报文 → 19h39m + 认
+`Daily free limit` / 单位可省略 / 多段累加 / `2 minutes` 不翻倍 / `0s` 合法 / 句末无关数字
+不计数 / 非 JSON 与 `{error:"…"}` 外壳 / 取值优先级四条 / 三种建议话术）、
+`cline-adapter.spec.ts` 的「限流标记」段（8 条：429+头 → 用 600 秒 / 429 无头 → 1 小时快照 /
+HTTP 日期 / **★ 实测报文 → 19h39m 且文案含「按天结算」与 `cline-pass`** /
+**★ 轮次用尽时最后一个账号也被标记** / 402 不写标记且文案含「充值」/ 报错含状态码与上游原文 /
+无池账号不写标记）、`tests/unit/retry-after.spec.ts`（10 条）、
 `buddy-ratelimit-misreport.spec.ts` 的「cline 同型缺陷」接线段（4 条）。
+⚠️ 已做**反向验证**：把「报文时长」那条分支短路 → 2 条变红；去掉循环后的补标记 → 2 条变红。
+
