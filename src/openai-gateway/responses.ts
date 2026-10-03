@@ -112,6 +112,27 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 
 /**
+ * 工具名归一化：**trim + 拒绝空名**。
+ *
+ * ⚠️ 全仓库**唯一**的工具名入口。工具名在三个地方各算一遍：
+ * 请求侧摊平（{@link flattenResponsesTools}）、响应侧还原表
+ * （{@link responsesNamespaceToolMap}）、历史回放（{@link toMessages}）。
+ * 三处曾经用三套不同的清洗口径 —— 摊平侧 `String(child.name ?? '')`（不 trim、
+ * 空名照样拼成 `ns____`），还原侧 `nonEmptyString(...)?.trim()`，历史侧又只做
+ * 非空判定 —— 于是子工具名带首尾空格时**发给上游的名字与还原表的键对不上**，
+ * 客户端收到一个自己没声明过的工具名（正是 {@link flatNamespaceToolName} 注释里
+ * 要防的故障）；空名则凭空多出一个幽灵工具，永远还原不回来。
+ *
+ * ⇒ 这里**必须 trim**：trim 与不 trim 指向两个不同的工具名，而 trim 后的那个
+ * 才与客户端在 `tools` 里声明的语义一致。
+ */
+function normalizeToolName(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed.length === 0 ? undefined : trimmed
+}
+
+/**
  * 取出 `reasoning.effort` 的**原始请求值**，交给
  * {@link import('./messages.js').normalizeReasoningEffort} 归一化。
  *
@@ -211,29 +232,17 @@ export function flatNamespaceToolName(namespace: string, name: string): string {
 /**
  * 从请求体算出「扁平名 → `{namespace, name}`」的还原表。
  *
- * ⚠️ 与摊平**同源**（都走 {@link flatNamespaceToolName}），且**不靠跨函数状态**
- * 传递：响应侧要还原 `function_call` 的名字，而它拿到的只有请求体，重算一遍
- * 比让 server 把 map 一路穿进来更不容易漏（cc-switch 的成熟实现也是这个思路）。
+ * ⚠️ 与摊平**同源**：两者都走 {@link flattenResponsesTools} 这**一次遍历**。
+ * 早先这里是独立重算的，于是两边的清洗口径一旦不同就会漂移（见
+ * {@link normalizeToolName} 的注释）；现在连「谁占了哪个名字」的判定也是同一份，
+ * 不会出现「顶层工具占了名字、子工具被丢弃，还原表却仍把它映射回 namespace」。
+ * 不靠跨函数状态传递：响应侧要还原 `function_call` 的名字，而它拿到的只有请求体，
+ * 重算一遍比让 server 把 map 一路穿进来更不容易漏（cc-switch 的成熟实现也是这个思路）。
  */
 export function responsesNamespaceToolMap(
   body: OpenAiResponsesRequest,
 ): Map<string, { namespace: string; name: string }> {
-  const map = new Map<string, { namespace: string; name: string }>()
-  if (!Array.isArray(body.tools)) return map
-  for (const tool of body.tools) {
-    if (!isObject(tool) || tool.type !== 'namespace') continue
-    const namespace = nonEmptyString(tool.name)?.trim()
-    if (namespace === undefined || namespace.length === 0) continue
-    const children = Array.isArray(tool.tools) ? tool.tools : []
-    for (const child of children) {
-      if (!isObject(child) || child.type !== 'function') continue
-      const name = nonEmptyString(child.name)?.trim()
-      if (name === undefined || name.length === 0) continue
-      const flat = flatNamespaceToolName(namespace, name)
-      if (!map.has(flat)) map.set(flat, { namespace, name })
-    }
-  }
-  return map
+  return flattenResponsesTools(body.tools).nsMap
 }
 
 /** 摊平后仍无法表达、因而被丢弃的工具（供调用方记日志）。 */
@@ -269,26 +278,43 @@ export interface DroppedTool {
 function toChatTools(raw: unknown, onDrop?: (tool: DroppedTool) => void): unknown {
   if (raw === undefined || raw === null) return undefined
   if (!Array.isArray(raw)) throw new OpenAiGatewayError('tools must be an array')
-  const converted: unknown[] = []
-  const push = (value: Record<string, unknown>): void => {
-    const flat = isObject(value.function) ? value.function : value
-    if (typeof flat.name !== 'string' || flat.name.length === 0) {
-      throw new OpenAiGatewayError('function tool requires a non-empty name')
-    }
-    converted.push({
-      type: 'function',
-      function: {
-        name: flat.name,
-        description: flat.description,
-        parameters: flat.parameters,
-      },
-    })
-  }
+  return flattenResponsesTools(raw, onDrop).tools
+}
+
+/** 摊平后的一个 function 工具（Chat 形状）。 */
+interface FlatTool {
+  type: 'function'
+  function: { name: string; description: unknown; parameters: unknown }
+}
+
+/**
+ * `tools` 数组 → 摊平后的 function 列表 **+** 还原表（**一次遍历同时产出**）。
+ *
+ * 之所以合在一起而不是两个函数各算一遍：`name` 的清洗、namespace 的摊平、
+ * 「谁占了哪个名字」这三件事只要有一处各算各的，两侧就会漂移，而漂移的症状是
+ * 「上游按 A 名字调用、网关按 B 名字还原」—— 客户端配不上任何工具，模型却以为
+ * 调通了（见 {@link flatNamespaceToolName} 与 {@link normalizeToolName}）。
+ *
+ * **名字占用是「先来先到」**：顶层 function 与摊平后的子工具共用一个命名空间，
+ * 后到的同名者被**丢弃并记日志**（不能报 400 —— 那会让整个会话不可用，而丢一个
+ * 重复声明的工具代价小得多）。⚠️ 还原表必须与「实际发出去的那批」同进同退：
+ * 若顶层工具占了名字而子工具被丢弃，还原表却仍把它映射回 `{namespace, name}`，
+ * 上游对那个顶层工具的调用就会被**误报成另一个工具**（静默误路由）。
+ */
+function flattenResponsesTools(
+  raw: unknown,
+  onDrop?: (tool: DroppedTool) => void,
+): { tools: FlatTool[]; nsMap: Map<string, { namespace: string; name: string }> } {
+  const tools: FlatTool[] = []
+  const nsMap = new Map<string, { namespace: string; name: string }>()
+  if (!Array.isArray(raw)) return { tools, nsMap }
+  const used = new Set<string>()
+
   for (const value of raw) {
     if (!isObject(value)) throw new OpenAiGatewayError('tool must be an object')
     if (value.type === 'namespace') {
-      const namespace = nonEmptyString(value.name)?.trim()
-      if (namespace === undefined || namespace.length === 0) {
+      const namespace = normalizeToolName(value.name)
+      if (namespace === undefined) {
         throw new OpenAiGatewayError('namespace tool requires a non-empty name')
       }
       const children = value.tools
@@ -302,7 +328,22 @@ function toChatTools(raw: unknown, onDrop?: (tool: DroppedTool) => void): unknow
           onDrop?.({ type: String(child.type), name: nonEmptyString(child.name) })
           continue
         }
-        push({ ...child, name: flatNamespaceToolName(namespace, String(child.name ?? '')) })
+        const name = normalizeToolName(child.name)
+        if (name === undefined) {
+          // ⚠️ **不能**把空名照样摊平：`flatNamespaceToolName(ns, '')` 会拼出
+          // `ns____` 这样的幽灵名，绕过 `push` 的非空校验发给上游，而还原表因
+          // 「空名跳过」永远配不上它 ⇒ 模型能调一个客户端没声明过的工具。
+          onDrop?.({ type: 'function', name: undefined })
+          continue
+        }
+        const flat = flatNamespaceToolName(namespace, name)
+        if (used.has(flat)) {
+          onDrop?.({ type: 'function', name: flat })
+          continue
+        }
+        used.add(flat)
+        nsMap.set(flat, { namespace, name })
+        tools.push({ type: 'function', function: { name: flat, description: child.description, parameters: child.parameters } })
       }
       continue
     }
@@ -310,9 +351,17 @@ function toChatTools(raw: unknown, onDrop?: (tool: DroppedTool) => void): unknow
       onDrop?.({ type: String(value.type), name: nonEmptyString(value.name) })
       continue
     }
-    push(value)
+    const flat = isObject(value.function) ? value.function : value
+    const name = normalizeToolName(flat.name)
+    if (name === undefined) throw new OpenAiGatewayError('function tool requires a non-empty name')
+    if (used.has(name)) {
+      onDrop?.({ type: 'function', name })
+      continue
+    }
+    used.add(name)
+    tools.push({ type: 'function', function: { name, description: flat.description, parameters: flat.parameters } })
   }
-  return converted
+  return { tools, nsMap }
 }
 
 /** `function_call_output.output` 可能是字符串，也可能是内容块数组。 */
@@ -395,12 +444,15 @@ async function toMessages(
       // `call_id` 才是与 `function_call_output` 配对的那个 id；`id`（fc_…）
       // 只是 item 身份。两者都可能出现，优先 `call_id`，缺了才退回 `id`。
       const callId = nonEmptyString(raw.call_id) ?? nonEmptyString(raw.id)
-      const bare = nonEmptyString(raw.name)
+      // ⚠️ 用 {@link normalizeToolName} 而非 `nonEmptyString`：历史里的名字必须与
+      // `tools` 侧**逐字符**一致，否则上游会认为模型调用了一个它没见过的工具。
+      // 早先这里不 trim，而还原表 trim、摊平侧也不 trim，三处两两不等。
+      const bare = normalizeToolName(raw.name)
       // 带 `namespace` 的历史调用要换回**摊平名**：工具是以 `ns__child` 声明给
       // 上游的，历史里若还留着 `namespace: ns / name: child`，上游会认为模型
       // 调用了一个它从没见过的工具（与 Qoder 那条「工具历史必须与 tools 同形」
       // 的教训同型）。
-      const namespace = nonEmptyString(raw.namespace)
+      const namespace = normalizeToolName(raw.namespace)
       const name = bare !== undefined && namespace !== undefined
         ? flatNamespaceToolName(namespace, bare)
         : bare
@@ -453,10 +505,16 @@ function assertSupported(body: OpenAiResponsesRequest): void {
     if (format !== undefined && format !== null) {
       if (!isObject(format)) throw new OpenAiGatewayError('text.format must be an object')
       const kind = format.type
-      if (kind !== undefined && kind !== 'text') {
+      // ⚠️ **缺 `type` 也要报错**，不能当「没设格式」放行：本文件的响应固定回
+      // `text: { format: { type: 'text' } }`（见 responseJson），客户端于是认定拿到的
+      // 是纯文本。而 `{format: {name, schema}}`（漏了 type 的结构化输出请求）一旦被
+      // 静默放行，用户会拿到**不合规的 JSON**却毫无察觉 —— 与本文件「语义会变的
+      // 字段绝不静默忽略」的原则直接冲突（`background` / `top_p≠1` 都是这么处理的）。
+      if (kind !== 'text') {
         throw unsupported(
-          `text.format ${JSON.stringify(String(kind))} 不被支持：DSH 的模型请求没有结构化输出`
-          + '（response_format）通道。网关不假装按 schema 约束 —— 那会让客户端以为拿到的是合规 JSON。',
+          `text.format ${JSON.stringify(kind === undefined ? format : String(kind))} 不被支持：`
+          + 'DSH 的模型请求没有结构化输出（response_format）通道。'
+          + '网关不假装按 schema 约束 —— 那会让客户端以为拿到的是合规 JSON。',
         )
       }
     }
@@ -1080,6 +1138,18 @@ export async function* toResponsesSse(
         if (!open.has(chunk.index)) {
           // `call_id` / `name` 只在这一帧里出现，故 function_call 项**延迟到这时**
           // 才打开 —— `output_item.added` 必须带上它们，否则客户端配不上 call_id。
+          //
+          // ⚠️ **首帧 `id` 为空时的已知边角**：`call_id: ''` 会原样进
+          // `output_item.added`，而该事件发出去就改不了了 ⇒ 严格按 `added` 配对的
+          // 客户端会配错。**刻意不在这里做非空校验**：改成「空 id 就不开项」会让
+          // `function_call_arguments.delta` 先于任何 item 发出，事件序列反而破；
+          // 「空 id 就等下一帧」则要额外攒 pending 帧，收益（一个罕见边角）小于
+          // 它引入的序列风险。
+          //
+          // ✅ 实际上**能自愈**：`applyItemChunk` 只允许非空 id 覆盖，而 DSH 的
+          // 组装块（`block-end`）必然带来真实 id，所以 `output_item.done` 与最终
+          // `response.output` 里的 `call_id` 是**正确**的 —— 以那两者为准的客户端
+          // （含官方 SDK）不受影响。见 tests 里的「首帧空 id 也能被 block-end 修正」。
           for (const event of openItem(chunk.index, 'function_call', {
             callId: String(chunk.id), name: chunk.name,
           })) yield event

@@ -27,10 +27,18 @@
  * 于是「永远 60 分钟」可以无限循环。
  *
  * ⚠️ 这里的 `Daily free limit` 还带一层**语义**差异，不能只当「等多久」：
- * 它是**按天结算的免费额度**（该账号的 `cline-free/*` 通道），等下去才会恢复；
- * 而同一账号的 `cline-pass/*` 通道走**账号余额**，立刻就能用。坏了的是
- * 「用户以为等 1 小时就好」，故话术必须把这两件事分开说（见
- * {@link clineExhaustedAdvice}）。
+ * 它是**按天结算的免费额度**（该账号的 `cline-free/*` 通道），等下去才会恢复。
+ * 坏了的是「用户以为等 1 小时就好」，故话术必须把「是什么 + 何时恢复 + 现在能做什么」
+ * 三件事分开说（见 {@link clineExhaustedAdvice}）。
+ *
+ * ⚠️⚠️ **别把 `cline-pass/*` 当成「换个通道立刻就能用」的出路**：它是**订阅**通道，
+ * 不是「有余额就能用」。实测同一个账号（`balance: 500000`，有余额）请求
+ * `cline-pass/deepseek-v4.1-flash` 回 **403 `ENTITLEMENT_ERROR`**
+ * （`the user is not subscribed to required model plan`），额度端点
+ * `/api/v1/users/me/plan/usage-limits` 也是 `404 no plan history found for user`
+ * —— 有余额但**没有订阅计划**。完整报文见本文件 {@link clineExhaustedAdvice} 的注释，
+ * 那里的「⚠️ 不要建议改用 cline-pass」才是结论，本段曾与之矛盾（凭直觉推荐了一个
+ * 没验证过的动作，用户照做只会再撞一次墙）。
  *
  * ## 取值优先级（与 buddy / lobsterai 同序，只是多了一层 Cline 专属解析）
  *

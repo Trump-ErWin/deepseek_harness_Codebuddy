@@ -324,9 +324,21 @@ describe('思考档位对照表', () => {
     // openai_efforts 缺失时给空串而不是 undefined（否则 UI 会渲染出 "undefined"）。
     expect(gatewayEffortRow({ id: 'x', reasoning: { efforts: [{ id: 'turbo', name: 'T' }] } })?.fill).toBe('')
     expect(gatewayEffortRow({ id: 'x', reasoning: { efforts: [{ id: 'turbo', name: 'T' }] } })?.name).toBe('')
+    // ⚠️ 上游给了个**没登记**的私有 id（没有 canonical）时，这一档**任何规范名都表达
+    // 出来**，`declared` 比 `fill` 多一档 —— 必须标「需对照」，否则用户看到一档填不
+    // 出来的东西却没有任何解释。原判据只认「canonical 与 id 不同」，恰恰漏了这种。
+    const unregistered = gatewayEffortRow({
+      id: 'x',
+      reasoning: {
+        efforts: [{ id: 'turbo', name: 'T' }, { id: 'high', name: 'H', canonical: 'high' }],
+        openai_efforts: ['high'],
+      },
+    })
+    expect(unregistered?.fill).toBe('high')
+    expect(unregistered?.lossy).toBe(true)
   })
 
-  it('★ 说明文案必须同时说清「只含已开启的模型」「照该填那一列才精确」「填别的也不会失败」', () => {
+  it('★ 说明文案：不能说「填什么都不会报错」—— 未登记的写法是真会 400 的', () => {
     const hint = gatewayEffortsHint([TRAE, PLAIN, NO_EFFORT])
     // 用户看到「14 个」时会以为网关只认得 14 个模型 —— 必须点明这是**已开启**的数量。
     expect(hint).toContain('当前已开启的 3 个模型')
@@ -336,6 +348,11 @@ describe('思考档位对照表', () => {
     expect(hint).toContain('按强度就近')
     expect(hint).toContain('CC Switch')
     expect(hint).toContain('关掉的模型不会出现在这张表里')
+    // ⚠️ 边界必须照实说：强度序只登记了 12 个名字（8 规范名 + off/light/on/extra_high），
+    // `turbo` 这类未登记的写法会被拒绝。让用户去试一个必然 400 的写法是误导。
+    expect(hint).toContain('off / light / on / extra_high')
+    expect(hint).toContain('会被拒绝')
+    expect(hint).not.toContain('也不会报错')
   })
 
   it('一个模型都没声明档位时说明「网关不会下发该参数」', () => {
