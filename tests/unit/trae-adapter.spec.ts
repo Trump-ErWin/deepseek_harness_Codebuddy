@@ -1484,6 +1484,86 @@ describe('TRAE 适配器 · 消息序列化（真实缺陷回归）', () => {
     expect(JSON.stringify(toolMsg.content)).toContain('内容')
   })
 
+  /**
+   * ⚠️ **真实缺陷**（2026-10-04，用户报障）：`read_image` 之后，整个会话在 trae 下
+   * **永久无法对话** —— 上游恒定回
+   * `code=4027 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`，
+   * 5 次重试与「继续」全都无效（坏报文被持久化，每次请求原样重放）。
+   *
+   * 根因：工具结果内嵌图片被 `userContentParts` **递归**收进一条多模态 user 消息，
+   * 而这条 user 消息被排在 `role:'tool'` **之前** —— assistant(tool_calls) 与它的
+   * tool 结果之间插了一条 user 消息，违反上游配对约束。
+   * 图片必须照 `pendingToolImages` 的设计挂到 tool 消息**之后**。
+   */
+  it('⚠️ 工具结果内嵌图片不得插在 role:tool 之前（4027 真实缺陷回归）', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+      remoteModels: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', multimodal: true }],
+      readImage: async () => ({ data: new Uint8Array([137, 80, 78, 71]), mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
+      model: 'deepseek-v4.1-flash',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'call_img', name: 'read_image', arguments: '{}' }],
+        },
+        {
+          // DSH 0.1.7 的一等工具结果消息（真实会话里的形态）。
+          role: 'tool',
+          toolCallId: 'call_img',
+          content: [
+            { type: 'text', text: '<path>x.png</path>' },
+            { type: 'image', attachment: { attachmentId: 'att-1' } },
+          ],
+        },
+      ],
+    } as unknown as GenerateOptions)
+
+    const messages = sentBody(fetcher).messages as Array<Record<string, any>>
+    const assistantIndex = messages.findIndex((m) => m.role === 'assistant')
+    const toolIndex = messages.findIndex((m) => m.role === 'tool')
+    expect(toolIndex, '工具结果必须下发').toBeGreaterThan(-1)
+    // 紧邻：中间插任何消息（尤其带图的 user 消息）都会被上游 4027 拒收。
+    expect(toolIndex, 'role:tool 必须紧跟其 assistant tool_calls').toBe(assistantIndex + 1)
+    // 图片不能被这次重排弄丢，且必须排在 tool 之后。
+    const imageIndex = messages.findIndex((m) => JSON.stringify(m.content ?? '').includes('image_url'))
+    expect(imageIndex, '图片不得静默丢失').toBeGreaterThan(-1)
+    expect(imageIndex, '图片应挂在 tool 消息之后').toBeGreaterThan(toolIndex)
+  })
+
+  it('⚠️ 同一条 user 消息既带图片又带工具结果时，图片仍发出且排在 tool 之后', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+      remoteModels: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', multimodal: true }],
+      readImage: async () => ({ data: new Uint8Array([137, 80, 78, 71]), mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
+      model: 'deepseek-v4.1-flash',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'call_1', name: 'read', arguments: '{}' }],
+        },
+        {
+          // ≤0.1.6 的旧形态：工具结果与图片搭载在同一条 user 消息里。
+          role: 'user',
+          content: [
+            { type: 'image', attachment: { attachmentId: 'att-1' } },
+            { type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: '文件内容' }] },
+          ],
+        },
+      ],
+    } as unknown as GenerateOptions)
+
+    const messages = sentBody(fetcher).messages as Array<Record<string, any>>
+    const assistantIndex = messages.findIndex((m) => m.role === 'assistant')
+    const toolIndex = messages.findIndex((m) => m.role === 'tool')
+    expect(toolIndex).toBe(assistantIndex + 1)
+    const imageIndex = messages.findIndex((m) => JSON.stringify(m.content ?? '').includes('image_url'))
+    expect(imageIndex, '外侧图片不得被静默丢弃').toBeGreaterThan(toolIndex)
+  })
+
   it('孤儿 tool-call 被剔除（会话自愈，避免上游 400）', async () => {
     const { adapter, fetcher } = makeAdapter({
       responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
