@@ -7,6 +7,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import {
+  pickTestModel,
   resetAccount,
   resetAllAccounts,
   retestAccount,
@@ -353,5 +354,43 @@ describe('testAccount', () => {
     const res = await testAccount(pool, 'buddy-1', 'm', { probe })
 
     expect(res.nickname).toBe('测试号')
+  })
+})
+
+/**
+ * 「测试」要发哪个模型：`pickTestModel` 的优先级。
+ *
+ * 这是纯函数（无 IO），但它是整条测试链路里**唯一决定请求内容**的一步 ——
+ * 挑错了就会得到一个与账号无关的 404，把「账号不可用」和「模型名不对」
+ * 混成同一条报错，用户据此会去做完全错误的动作（重新登录）。
+ */
+describe('pickTestModel', () => {
+  it('显式指定优先于一切', () => {
+    const entry = makeEntry({ modelRateLimits: { 'marked-model': Date.now() + 1_000 } })
+    expect(pickTestModel(entry, ['catalog-a', 'catalog-b'], 'explicit')).toBe('explicit')
+  })
+
+  it('空串不算显式指定（回落到标记）', () => {
+    // ⚠️ `req.modelId` 来自客户端，可能是 `''`；若把空串当成「已指定」，
+    // 就会拿着空模型名发出去，得到一条与账号无关的 400。
+    const entry = makeEntry({ modelRateLimits: { 'marked-model': Date.now() + 1_000 } })
+    expect(pickTestModel(entry, ['catalog-a'], '')).toBe('marked-model')
+  })
+
+  it('标记优先于目录：用户最想看的正是被标记的那个模型', () => {
+    const entry = makeEntry({ modelRateLimits: { 'marked-model': Date.now() + 1_000 } })
+    expect(pickTestModel(entry, ['catalog-a', 'catalog-b'])).toBe('marked-model')
+  })
+
+  it('没有标记时取目录第一个', () => {
+    const entry = makeEntry({ modelRateLimits: undefined })
+    expect(pickTestModel(entry, ['catalog-a', 'catalog-b'])).toBe('catalog-a')
+  })
+
+  it('标记与目录都拿不到时返回空串，**不猜**一个模型名', () => {
+    // 调用方拿到空串必须如实报错（`account.test` 端点据此回 bad-request）。
+    // 猜一个名字发出去会得到 404，与「账号不可用」无法区分。
+    const entry = makeEntry({ modelRateLimits: undefined })
+    expect(pickTestModel(entry, [])).toBe('')
   })
 })
