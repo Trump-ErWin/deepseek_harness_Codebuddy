@@ -10,6 +10,7 @@ import {
   describeBadgeError,
   formatUpdatedAt,
   normalizeBadgePreference,
+  orderCreditRows,
   planGroupsOf,
   windowPreview,
 } from '../../plugin-src/client/badge-model.js'
@@ -469,6 +470,122 @@ describe('折叠态三段结构（真实报障：数字被截掉）', () => {
     expect(credits.reading).toBe('200积分')
     const tokens = badgeView({ providerLabel: 'ZCode (智谱)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('GLM-5.2', 94_539_275, 'token')])] })
     expect(tokens.reading).toBe('94.54MToken')
+  })
+})
+
+/**
+ * 「合计不完整」的提示（2026-10-03，用户要求）。
+ *
+ * 账号越多越容易撞上：六个号里坏一个，胶囊上的合计就少一截，而数字本身
+ * **看不出任何异常**（色调仍是 ok）。故必须单独给一句说明，由渲染层挂成角标。
+ */
+describe('incompleteNote：合计少算了账号时要说明', () => {
+  const ok = row('a', [pkg('Bonus Pack', 100)])
+  const dead = row('b', null, '凭据未配置')
+
+  it('积分模式：有账号读不到 → 说清「是余额没读到」「不计入合计」', () => {
+    const view = badgeView({ providerLabel: 'WorkBuddy (国际版)', preference: 'auto', subscription: undefined, accounts: [ok, dead] })
+    expect(view.mode).toBe('credits')
+    expect(view.reading).toBe('100积分')
+    expect(view.incompleteNote).toBe('另有 1 个账号的余额读取失败，未计入合计')
+    expect(view.failedCount).toBe(1)
+  })
+
+  it('它**不进** reading / text —— 那是纯读数，供 title 与读屏单独拼', () => {
+    const view = badgeView({ providerLabel: 'WorkBuddy (国际版)', preference: 'auto', subscription: undefined, accounts: [ok, dead] })
+    expect(view.text).toBe('WorkBuddy (国际版) • 100积分')
+    expect(view.reading).not.toContain('读取失败')
+    expect(view.text).not.toContain('读取失败')
+  })
+
+  it('全部读到数 → 空串（没有提示要显示）', () => {
+    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [ok, row('c', [pkg('Bonus Pack', 50)])] })
+    expect(view.incompleteNote).toBe('')
+  })
+
+  it('一个都没读到 → 也空串（模式已回落到「用量不可用」，再加一句是噪音）', () => {
+    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [dead, row('c', null, '网络超时')] })
+    expect(view.mode).toBe('empty')
+    expect(view.reading).toBe('用量不可用')
+    expect(view.incompleteNote).toBe('')
+  })
+
+  it('窗口 / 套餐模式**不套用**这句话（它们本来就不是合计，说了就是错的）', () => {
+    const windows = {
+      kind: 'windows',
+      accounts: [{ accountId: 'a', nickname: 'a', ok: true, windows: [{ type: 'five_hour', percentUsed: 6, resetsAt: '' }] }],
+    }
+    const windowView = badgeView({ providerLabel: 'Cline', preference: 'subscription', subscription: windows, accounts: [ok, dead] })
+    expect(windowView.mode).toBe('windows')
+    expect(windowView.incompleteNote).toBe('')
+
+    const plan = { kind: 'plan', accounts: [{ accountId: 'a', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credit' } }] }
+    const planView = badgeView({ providerLabel: 'CodeBuddy', preference: 'subscription', subscription: plan, accounts: [ok, dead] })
+    expect(planView.mode).toBe('plan')
+    expect(planView.incompleteNote).toBe('')
+  })
+
+  it('占位态（读取中 / 首屏失败）也有这个字段 —— 调用方不必做形状判断', () => {
+    expect(badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: undefined, accounts: [], loading: true }).incompleteNote).toBe('')
+    expect(badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: undefined, accounts: [], failed: true }).incompleteNote).toBe('')
+  })
+})
+
+/**
+ * 弹窗积分列表的排序 + 折叠（2026-10-03 用户要求）。
+ *
+ * 为什么值得单测：这两条规则都是**看不见的**——排序错了用户只会觉得「找不到能用的
+ * 那个号」，折叠边界错了只会觉得「怎么少了一个号」。而组件里那部分测不到
+ * （`usage-badge.js` 依赖宿主注入的 react，本仓库装不了），故逻辑必须住在这里。
+ */
+describe('orderCreditRows：按余额降序 + 折叠', () => {
+  const acc = (id, total) => ({ accountId: id, nickname: id, balance: total === null ? null : { total, packages: [], expiredTotal: 0 } })
+  const ids = (rows) => rows.map((row) => row.accountId)
+
+  it('按余额降序（用户先要看到「还有哪个号能用」）', () => {
+    const { shown, hidden } = orderCreditRows([acc('a', 10), acc('b', 300), acc('c', 50)], { limit: 5, expanded: false })
+    expect(ids(shown)).toEqual(['b', 'c', 'a'])
+    expect(hidden).toBe(0)
+  })
+
+  it('读不到数的排**最后**（不能当 0 混进小余额里 —— 那格显示的是错误文案）', () => {
+    const { shown } = orderCreditRows([acc('dead', null), acc('a', 5), acc('b', 100)], { limit: 5, expanded: false })
+    expect(ids(shown)).toEqual(['b', 'a', 'dead'])
+  })
+
+  it('排序稳定：余额相同的账号保持原顺序（否则每次渲染 DOM 抖动）', () => {
+    const first = orderCreditRows([acc('a', 100), acc('b', 100), acc('c', 100)], { limit: 5, expanded: false })
+    const second = orderCreditRows([acc('a', 100), acc('b', 100), acc('c', 100)], { limit: 5, expanded: false })
+    expect(ids(first.shown)).toEqual(['a', 'b', 'c'])
+    expect(ids(second.shown)).toEqual(['a', 'b', 'c'])
+  })
+
+  it('折叠：只给 limit 条，`hidden` 如实报出被收起的条数', () => {
+    const rows = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((id, index) => acc(id, index))
+    const collapsed = orderCreditRows(rows, { limit: 5, expanded: false })
+    expect(collapsed.shown).toHaveLength(5)
+    expect(collapsed.hidden).toBe(2)
+    // 「展开其余 N 个」按 hidden 报数，展开后 hidden 不变（按钮换成「收起」）
+    const expanded = orderCreditRows(rows, { limit: 5, expanded: true })
+    expect(expanded.shown).toHaveLength(7)
+    expect(expanded.hidden).toBe(2)
+  })
+
+  it('刚好等于 limit 时不产生折叠按钮（hidden 为 0）', () => {
+    const rows = ['a', 'b', 'c', 'd', 'e'].map((id, index) => acc(id, index))
+    expect(orderCreditRows(rows, { limit: 5, expanded: false }).hidden).toBe(0)
+  })
+
+  it('脏数据不炸：非数组 / 缺 limit 都退化，不抛错', () => {
+    expect(orderCreditRows(undefined, { limit: 5 }).shown).toEqual([])
+    expect(orderCreditRows(null, {}).shown).toEqual([])
+    expect(ids(orderCreditRows([acc('a', 1)], {}).shown)).toEqual([])   // limit 缺省 0 ⇒ 不显示
+  })
+
+  it('不改动入参数组（组件每轮都拿同一个数组，原地排序会污染宿主给的读数）', () => {
+    const rows = [acc('a', 1), acc('b', 2)]
+    orderCreditRows(rows, { limit: 5, expanded: false })
+    expect(ids(rows)).toEqual(['a', 'b'])
   })
 })
 

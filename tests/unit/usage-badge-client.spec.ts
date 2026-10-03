@@ -561,6 +561,76 @@ describe('用量徽标：依赖与样式', () => {
   })
 })
 
+describe('用量徽标：号多了以后的两条整理（2026-10-03 用户要求）', () => {
+  const badge = read('plugin-src/client/usage-badge.js')
+  const styles = read('plugin-src/client/jet-hub-styles.js')
+
+  it('折叠阈值是 5，且「展开其余 N 个」由可见文案如实报数', () => {
+    expect(badge).toMatch(/export const CREDITS_COLLAPSED_LIMIT = 5;/)
+    expect(badge).toMatch(/展开其余 \$\{hidden\} 个账号/)
+    expect(badge).toMatch(/creditsExpanded \? '收起' : /)
+  })
+
+  it('折叠只收明细，**不隐藏结论**（合计在节标题、失败数在脚注，都在折叠之外）', () => {
+    // 合计那一句在折叠逻辑（ordered/hidden/shown）**之前**算好，与展开状态无关
+    const sumBlock = badge.slice(badge.indexOf('const sum = view.groups.map'), badge.indexOf('const { shown, hidden } = orderCreditRows('))
+    expect(sumBlock.length).toBeGreaterThan(0)
+    expect(sumBlock).toContain('view.groups.map')
+    expect(sumBlock).not.toContain('creditsExpanded')
+    // 脚注（失败账号数所在处）同样不看展开状态
+    expect(badge).toMatch(/function renderFoot\(\)/)
+    const foot = badge.slice(badge.indexOf('function renderFoot()'), badge.indexOf('function balanceLine'))
+    expect(foot.length).toBeGreaterThan(0)
+    expect(foot).not.toContain('creditsExpanded')
+  })
+
+  it('排序与折叠都走纯函数 orderCreditRows（组件里不再各写一份，逻辑由 badge-model.spec 锁）', () => {
+    expect(badge).toMatch(/import \{[\s\S]*?orderCreditRows[\s\S]*?\} from '\.\/badge-model\.js'/)
+    expect(badge).toMatch(/orderCreditRows\(accounts, \{/)
+    expect(badge).toMatch(/limit: CREDITS_COLLAPSED_LIMIT/)
+    // ⚠️ 组件里不得再自带排序实现：两份必然分叉（且组件的实现测不到，因为没装 react）
+    expect(codeOf(badge)).not.toMatch(/function balanceOrder\(/)
+  })
+
+  it('展开状态随渠道切换重置（否则会显得「折叠时灵时不灵」）', () => {
+    const effect = badge.slice(badge.indexOf('// 换渠道时先清空旧读数'), badge.indexOf('}, [provider]);'))
+    expect(effect).toContain('setCreditsExpanded(false)')
+  })
+
+  it('胶囊在合计不完整时挂一个警示角标，且它与读数同级 flex:none（不能被省略号吃掉）', () => {
+    expect(badge).toContain("className: 'dim-jh-badgeWarn'")
+    const warn = styles.slice(styles.indexOf('.dim-jh-badgeWarn'), styles.indexOf('.dim-jh-badgeWarn') + 200)
+    expect(warn).toMatch(/flex: none/)
+    // ⚠️ 顺序断言：警示必须在读数**之后**（先看数字，再看补语）。
+    // 用整份源码里的绝对位置比，不要切片 —— 对象字面量里 key 在 className 之前，
+    // 按 key 切会切错（第一版就这么写红过）。
+    const readingIdx = badge.indexOf("className: 'dim-jh-badgeReading'")
+    const warnIdx = badge.indexOf("className: 'dim-jh-badgeWarn'")
+    expect(readingIdx).toBeGreaterThan(0)
+    expect(warnIdx).toBeGreaterThan(readingIdx)
+  })
+
+  it('警示标记 aria-hidden（同一句话已进 aria-label，不重复念），解释走 title', () => {
+    const warn = badge.slice(badge.indexOf("key: 'incomplete'"), badge.indexOf("key: 'incomplete'") + 400)
+    expect(warn).toContain("'aria-hidden': 'true'")
+    expect(warn).toContain('title: view.incompleteNote')
+    expect(badge).toMatch(/aria-label': ariaLabel/)
+    expect(badge).toMatch(/view\.incompleteNote === '' \? '' : `（\$\{view\.incompleteNote\}）`/)
+  })
+
+  it('按钮 title 三段拼接：读数 → 不完整说明 → 失败原因（都要留，空串跳过）', () => {
+    const title = badge.slice(badge.indexOf('const title = [view.text'), badge.indexOf('const title = [view.text') + 200)
+    expect(title).toContain('view.text')
+    expect(title).toContain('view.incompleteNote')
+    expect(title).toContain('view.failureReason')
+    expect(title).toContain("filter((part) => part !== '')")
+  })
+
+  it('弹窗脚注复用同一句话，不另写一份措辞', () => {
+    expect(badge).toMatch(/parts\.push\(view\.incompleteNote === '' \? `\$\{view\.failedCount\} 个账号读取失败` : view\.incompleteNote\)/)
+  })
+})
+
 describe('格式化函数下沉（徽标与设置页共用同一口径）', () => {
   const hub = read('plugin-src/client/jet-hub.js')
 

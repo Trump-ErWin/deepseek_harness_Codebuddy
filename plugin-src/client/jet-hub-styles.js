@@ -630,6 +630,13 @@ const STYLES = `
    承担，两者最坏缩到 0 也放得下（读数最宽约 97px + 分隔符与内边距 ≈ 131px
    < 186px 上限）。 */
 .dim-jh-badgeReading { flex: none; min-width: 0; white-space: nowrap; }
+/* 「这个读数不完整」的标记（合计少算了账号时才出现），排在读数**之后**。
+   ⚠️ 必须与读数同级 flex: none：它是**补语**，被省略号吃掉就等于没标 —— 而它要
+   提醒的恰恰是「别把这个数字当真」，看不见比不标更糟。
+   ⚠️ 用 warn 而不是 error：账号读不到多半是临时的（凭据过期 / 网络抖动），
+   error 是留给「整个渠道都不可用」的（那会走 empty 模式）。
+   字号小一档并压紧行高，让它读起来像角标而不是读数的一部分。 */
+.dim-jh-badgeWarn { flex: none; font-size: 10px; line-height: 1; color: var(--dsw-alias-state-warn-primary); cursor: help; }
 
 /* ② 窄屏收敛：只留状态点，文字与 chevron 让位给模型选择器。
  * 阈值 720px 是实测桌面版在 100% 缩放下「徽标 216px + 模型选择器 ≥ 240px」的临界值。
@@ -731,6 +738,12 @@ const STYLES = `
 .dim-jh-badgeNotice[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); }
 .dim-jh-badgeFail { font-size: 10px; line-height: 14px; color: var(--dsw-alias-state-error-primary); }
 .dim-jh-badgeFoot { font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-tertiary); }
+/* 「展开其余 N 个账号」/「收起」：纯文字按钮，左对齐、不占满宽。
+   ⚠️ 刻意**不复用** .dim-jh-badgeAction：那条规则是 flex:1 的实心按钮（用于签到），
+   放在明细列表下面会抢走视觉焦点 —— 用户要的是「明细可以收起来」，不是一个主操作。
+   align-self: flex-start 是因为父容器 .dim-jh-badgePop 是 flex 列（默认 stretch）。 */
+.dim-jh-badgeMore { align-self: flex-start; margin-top: 3px; padding: 1px 0; border: 0; background: none; font: inherit; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-link); cursor: pointer; }
+.dim-jh-badgeMore:hover { color: var(--dsw-alias-brand-primary); text-decoration: underline; }
 
 `
 
