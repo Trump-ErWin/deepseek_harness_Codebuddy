@@ -16,6 +16,19 @@
 > 删 `GEMINI_UPSTREAM_FLASH_LITE` 常量、静态表缩为 1 条(`gemini-3.8-flash`)、
 > `geminiModelSpec` 去掉 lite 分支(模型名**恒**带档位后缀),相关 spec 同步改写。
 > 现暴露 **1 个模型 + 4 档 efforts**。
+>
+> **2026-10-03 追补(用户「为什么显示的是积分不是额度」)**:§3.3 承诺过
+> 「面板会显示『5 小时窗口 99% / 周窗口 99%』而非『N 积分』」,但实现层违背了它 ——
+> `credits-format.js` 的 `unitLabel` / `formatUnits` 是二值函数(只认 `token` 与
+> 「其余」),`%` 落进兜底分支 ⇒ 面板把配额读成「**积分 94.50**」。而 94.5 本身
+> 还是宿主 `toGeminiCreditBalance` 把两个窗口剩余比例取的平均值,**上游根本没有这个数**。
+> 修复(客户端四处,host 侧一行未动):
+> `credits-format.js` 新增 `QUOTA_UNIT = '%'`、`formatQuota`、`formatQuotaLine`、
+> `formatQuotaDetail`,`unitLabel` 对 `%` 返回**「额度」**;`jet-hub.js` 的
+> `CreditBalanceRow` 主行/hover 明细改走逐窗口百分比;`badge-model.js` 的
+> `creditGroupsOf` 对配额单位**不求和**、改收 `quotaLines`,折叠态文案与色调改用
+> **最紧张的窗口**;`usage-badge.js` 的 `balanceLine` 同样逐窗口、`splitLine` 改显示
+> 各窗口重置倒计时。其它 provider 的文案与色调逐字不变(回归用例锁定)。
 > 源项目:`F:\project\cmdc-pak-align-wb`(Go,本仓库,gemini 线原型)
 > 目标项目:**当前工作区** `F:\project\dsh-codearts-plugin`(TypeScript,DSH 插件 `dsh-codearts-auth`)
 
