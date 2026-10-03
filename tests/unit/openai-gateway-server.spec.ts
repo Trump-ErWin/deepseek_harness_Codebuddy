@@ -363,3 +363,116 @@ describe('模型不存在：状态码翻译与纠错建议', () => {
     }
   })
 })
+
+/**
+ * `/v1/responses`（OpenAI Responses API）。
+ *
+ * ⚠️ 两个端点**同时可用**（用户 2026-10-03 的决定）：不做「格式开关」，
+ * 客户端用哪套协议由它自己请求的 URL 决定 —— 互斥开关只会让另一个协议的客户端
+ * 在切换后突然失效。
+ */
+describe('Responses API 出口', () => {
+  it('非流式：返回 response 对象；鉴权与模型路由与 Chat 路径同一套', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm, env: ENV(port) })
+    await gateway.start()
+    try {
+      // 无 key ⇒ 401（同一个鉴权闸门）。
+      expect((await call(port, '/v1/responses', {
+        method: 'POST', body: { model: 'qoder/qfmodel', input: 'hello' },
+      })).status).toBe(401)
+
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: { model: 'qoder/qfmodel', input: 'hello' },
+      })
+      expect(result.status).toBe(200)
+      const parsed = JSON.parse(result.body)
+      expect(parsed.object).toBe('response')
+      expect(parsed.status).toBe('completed')
+      expect(parsed.model).toBe('qoder/qfmodel')
+      expect(parsed.output[0].content[0].text).toBe('hello')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('流式：给出 Responses 的事件序列，且**不**发 data: [DONE]', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm, env: ENV(port) })
+    await gateway.start()
+    try {
+      const response = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: { model: 'qoder/qfmodel', input: 'hello', stream: true },
+      })
+      expect(response.status).toBe(200)
+      expect(response.body).toContain('event: response.created')
+      expect(response.body).toContain('event: response.output_text.delta')
+      expect(response.body).toContain('event: response.completed')
+      expect(response.body).not.toContain('[DONE]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('max_output_tokens 同样经过 CodeArts 的输出预算钳制（两个端点共用同一份归一化）', async () => {
+    const port = await freePort()
+    let actualMaxTokens: number | undefined
+    const captureLlm = {
+      ...llm,
+      resolveModelInfo: async () => ({ provider: 'codearts', id: 'GLM-5.2', name: 'GLM-5.2' }),
+      stream: (options: { maxTokens?: number; signal?: AbortSignal }) => {
+        actualMaxTokens = options.maxTokens
+        return responseStream(options.signal)
+      },
+    }
+    const gateway = createOpenAiGateway({ llm: captureLlm, env: ENV(port) })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: {
+          model: 'codearts/GLM-5.2', input: 'hello', max_output_tokens: 128000, stream: false,
+        },
+      })
+      expect(result.status).toBe(200)
+      // Chat 端实测 128000 会被上游拒绝，65536 可正常推理 —— 换了协议不能绕过钳制。
+      expect(actualMaxTokens).toBe(65536)
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('⚠️ 语义会变的字段明确回 400（不静默忽略）', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm, env: ENV(port) })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: {
+          model: 'qoder/qfmodel', input: 'hello', previous_response_id: 'resp_1',
+        },
+      })
+      expect(result.status).toBe(400)
+      expect(JSON.parse(result.body).error.code).toBe('unsupported_parameter')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('模型解析不了时同样回 404（不是会被重试的 502）', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({
+      llm: { ...llm, resolveModelInfo: async () => { throw new Error('unknown provider or model') } },
+      env: ENV(port),
+    })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: { model: 'nosuch/nosuch', input: 'hello' },
+      })
+      expect(result.status).toBe(404)
+      expect(JSON.parse(result.body).error.code).toBe('model_not_found')
+    } finally {
+      await gateway.close()
+    }
+  })
+})
