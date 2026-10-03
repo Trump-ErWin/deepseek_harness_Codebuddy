@@ -44,14 +44,96 @@ describe('用量徽标：槽位接线', () => {
   it('⚠️⚠️ 徽标宽度必须收敛（否则挤压右侧模型选择器）', () => {
     // 真机报障 2026-10-02：徽标 flex:none + max-width:280px 把模型选择器
     // 压到只剩几十 px，**图标被挤没**（用户要放大到很大才看得见）。
-    // 两级收敛（用户定 1+2）：基础 150px，窄屏（<720px）只剩状态点。
+    // 两级收敛（用户定 1+2）：基础宽度有上限，窄屏（<720px）只剩状态点。
     const styles = read('plugin-src/client/jet-hub-styles.js')
     const btn = /\.dim-jh-badgeBtn \{[^}]*max-width:\s*(\d+)px/.exec(styles)
     expect(btn, '应能解析出徽标按钮的 max-width').not.toBeNull()
-    expect(Number(btn![1]), '徽标基础宽度应 ≤ 160px（给模型选择器留 ≥130px）')
-      .toBeLessThanOrEqual(160)
+    // ⚠️ 上限从语义定：胶囊要装得下「最长渠道名 + 读数」而不出省略号。
+    // 实测最长两例 —— WorkBuddy (国际版) • 200积分 = 179.3px、
+    // LobsterAI (有道) • 842.06积分 = 172.3px（Edge，宿主 UI 字体栈，dsf 1 与 1.5
+    // 都量过，差异 <0.4px）。186px 给最宽那例留 6.7px 余量 —— 字体回退时字宽会变，
+    // 贴着 180 写没有裕度。
+    // 2026-10-03 从 150px 提上来（原报障：数字被省略号截掉）。上限放到 200px
+    // 是为了给「更长渠道名」留空间，同时仍远低于会挤坏模型选择器的 280px（旧缺陷）。
+    expect(Number(btn![1]), '徽标基础宽度应能装下最长的「渠道名 • 读数」，且 ≤200px')
+      .toBeGreaterThanOrEqual(180)
+    expect(Number(btn![1]), '徽标基础宽度不得超过 200px（否则又回到挤压模型选择器的老路）')
+      .toBeLessThanOrEqual(200)
     expect(styles, '窄屏应收敛为只剩状态点').toMatch(/@media \(max-width: 720px\)/)
     expect(styles, '需 min-width:0 才能真正收缩/省略').toMatch(/min-width: 0/)
+  })
+
+  it('⚠️⚠️ 折叠态必须渲染成**多个** span（否则数字仍会被截掉）', () => {
+    // 真实报障 2026-10-03：胶囊显示成「LobsterAI (有道) · 合计 …」，数字被截掉。
+    // 根因是**结构**而非宽度：整句塞进一个 overflow:hidden 的 span，省略号
+    // 从右往左吃，吃掉的正是用户唯一想看的数字。
+    const styles = read('plugin-src/client/jet-hub-styles.js')
+    // ⚠️ 反面断言一律用 codeOf（去注释）：本仓库注释里大量引用被禁止的写法，
+    // 直接对全文断言会把注释本身判成违规 —— 本次就真踩了（我把「不得复用
+    // .dim-jh-badgeValue」写进了注释，于是 not.toContain 把注释当成了违规）。
+    const badge = codeOf(read('plugin-src/client/usage-badge.js'))
+    // 三段各自独立成 span
+    expect(badge).toContain("className: 'dim-jh-badgeText'")
+    expect(badge).toContain("className: 'dim-jh-badgeName'")
+    expect(badge).toContain("className: 'dim-jh-badgeSep'")
+    // ⚠️ 类名是 Reading 而**不是** Value：那个名字已被弹窗里的读数占用，
+    // 那条规则带 font-weight:600 且排在样式表更后面 —— 同名会让胶囊里的数字被静默
+    // 加粗、并拿到 flex:none 而**无法收缩**（正是本次报障的形态，而且很难看出来）。
+    // ⚠️ 断言必须**限定在折叠态那一块**内：弹窗里本来就用 .dim-jh-badgeValue
+    //（那是它的正当用途），对整个文件断言 not.toContain 会误伤。
+    const collapsedAt = badge.indexOf('const collapsed = React.createElement')
+    const collapsedEnd = badge.indexOf('return React.createElement(\'div\'', collapsedAt)
+    expect(collapsedAt, '应有折叠态 collapsed 的构造').toBeGreaterThan(-1)
+    expect(collapsedEnd, '应能取到折叠态构造的结尾').toBeGreaterThan(collapsedAt)
+    const collapsedBlock = badge.slice(collapsedAt, collapsedEnd)
+    expect(collapsedBlock, '折叠态读数不得复用弹窗的 .dim-jh-badgeValue 类名')
+      .not.toContain('dim-jh-badgeValue')
+    expect(collapsedBlock).toContain("className: 'dim-jh-badgeReading'")
+    // ⚠️ 反向断言：整句不能再被当作**单个文本子节点**塞进那几个 span。
+    // （view.text 仍用于 title / aria-label，故只禁止它以「唯一子节点」的形态出现。）
+    expect(badge, '整句不应再作为唯一子节点直接渲染')
+      .not.toMatch(/className: 'dim-jh-badgeText' \}, view\.text\)/)
+    // 名字进 name、读数进 reading（不是反的）
+    expect(badge).toContain('}, view.name)')
+    expect(badge).toContain('}, view.reading)')
+    expect(badge, '读数不能渲染进名字那个 span（会显示成「200积分 • WorkBuddy」）')
+      .not.toMatch(/dim-jh-badgeName' \}, view\.reading\)/)
+    // 让位顺序由 flex-shrink 表达：detail(999) > name(99)，而**读数不参与收缩**。
+    const shrink = (cls: string) => {
+      const rule = new RegExp('\\.' + cls + ' \\{[^}]*flex:\\s*0\\s+(\\d+)\\s+auto').exec(styles)
+      expect(rule, '应能解析 .' + cls + ' 的 flex-shrink').not.toBeNull()
+      return Number(rule![1])
+    }
+    expect(shrink('dim-jh-badgeDetail'), '包名最先让位').toBeGreaterThan(shrink('dim-jh-badgeName'))
+    // ⚠️⚠️ 读数必须是 flex: none（**完全不收缩**）—— 这是本缺陷的第二个成因，
+    // 而且比第一个隐蔽得多：哪怕只分到 0.77px 的收缩，text-overflow: ellipsis
+    // 也会命中（触发条件是 scrollWidth > clientWidth，亚像素级就够），
+    // 于是最后一个字被换成「…」，视觉上和整段被截一样严重。
+    // ⚠️ 而且它**用 clientWidth 量不出来**（取整：53.97 报成 54，判为未截断）——
+    // 我第一版就写成 flex: 0 1 auto 并用 clientWidth 断言「读数完整」，
+    // 用例全绿而截图里明写着「347.87积…」。故这里锁死 flex: none。
+    expect(styles, '读数不得参与收缩（亚像素收缩也会触发省略号）')
+      .toMatch(/\.dim-jh-badgeReading \{[^}]*flex:\s*none/)
+    expect(styles, '读数不得带 text-overflow: ellipsis')
+      .not.toMatch(/\.dim-jh-badgeReading \{[^}]*text-overflow/)
+    // 分隔符不参与收缩（否则「•」会先被挤掉）
+    expect(styles).toMatch(/\.dim-jh-badgeSep \{[^}]*flex:\s*none/)
+    // ⚠️ 间距必须用 margin：flex 容器把 span 之间只含空白的文本节点渲染成零宽。
+    expect(styles).toMatch(/\.dim-jh-badgeSep \{[^}]*margin:\s*0 3px/)
+  })
+
+  it('⚠️⚠️ 窄屏「只留状态点」的媒体查询必须排在 .dim-jh-badgeText 之后', () => {
+    // 两者特异性相同（都是单个类），胜负由**源顺序**决定。媒体查询一旦被排到
+    // 「.dim-jh-badgeText { display: flex }」之前，窄屏下 display:none 会被
+    // 后面的 display:flex 覆盖 —— 文字重新出现并挤压模型选择器（静默回归，
+    // 因为在宽窗口下看不出任何异常）。
+    const styles = read('plugin-src/client/jet-hub-styles.js')
+    const textRuleAt = styles.indexOf('.dim-jh-badgeText { display: flex')
+    const mediaAt = styles.indexOf('@media (max-width: 720px) { .dim-jh-badgeText')
+    expect(textRuleAt, '应有 .dim-jh-badgeText { display: flex ... }').toBeGreaterThan(-1)
+    expect(mediaAt, '应有隐藏 .dim-jh-badgeText 的窄屏媒体查询').toBeGreaterThan(-1)
+    expect(mediaAt, '媒体查询必须晚于 display:flex 规则，否则 display:none 会被覆盖')
+      .toBeGreaterThan(textRuleAt)
   })
 
   it('⚠️⚠️ 同时注入 sessions / remote / remote.session（真机事故根因）', () => {
