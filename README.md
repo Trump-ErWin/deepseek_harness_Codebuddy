@@ -1933,27 +1933,62 @@ Muse Spark 1.3 Contributor · 免费
 
 ### 限流与额度耗尽（429 / 402）：倒计时用**服务端给的时间**
 
-Cline 的两种「暂时用不了」在官方错误码表里语义完全不同，处理也必须不同：
+Cline 的几种「暂时用不了」语义完全不同，处理也必须不同：
 
 | HTTP | 官方语义 | 插件的处理 |
 |---|---|---|
-| **429** | Rate limit exceeded | 记「限额重置」徽章，倒计时**优先用 `retry-after` 响应头**（秒数或 HTTP 日期），拿不到才用 1 小时快照兜底；并换到下一个账号重试 |
+| **429 `Daily free limit reached`** | **当日免费额度**用尽（按天结算，且**按模型**单独计） | 记「限额重置」徽章，倒计时**用报文里那个时长**（如 `Try again in 19h 39m`）；文案点明「按天结算 + 按模型单独计算」，并建议换**同一账号的另一个免费模型** |
+| **429** 其它 | Rate limit exceeded | 记徽章，倒计时按 `retry-after` 响应头 → 报文的 `Try again in …` → 通用绝对时刻句式 → 1 小时快照兜底；并换到下一个账号重试 |
 | **402** | Insufficient credits（去 app.cline.bot 充值） | **不记倒计时** —— 等多久都不会恢复；仍会换号（别的账号可能有余额），全失败时报明「额度已用尽……请到 app.cline.bot 充值」 |
 
-⚠️ **倒计时必须是服务端说的那个数**（真实报障 2026-10-03：「倒计时结束了我再去连
-为什么还是失败了，显示要 60 分钟后？」）。早期实现写死 `Date.now() + 60 分钟`、
-**完全没读 `retry-after`**，于是那个数字既不等于服务端的解禁时刻，又每次失败都从
-当下重新计一遍 —— 用户等完再试，只要上游仍拒绝就还是「60 分钟后」，可以无限循环。
+⚠️ **倒计时必须是服务端说的那个数**（真实报障 2026-10-03，报障两次）。第一版写死
+`Date.now() + 60 分钟`；第二版改成读 `retry-after` 响应头 —— **实测该头根本不存在**：
+
+```
+POST https://api.cline.bot/api/v1/chat/completions   （model = cline-free/deepseek-v4.1-flash）
+→ HTTP 429   no-retry: true                ← 没有任何 retry-after
+  {"error":{"code":"INFERENCE_CAP_ERROR",
+    "message":"Error 429: Daily free limit reached on model
+               deepseek/deepseek-v4.1-flash. Try again in 19h 39m"}}
+```
+
+真实等待是 **19 小时 39 分**，而代码读到的是「没有时间」→ 退回 1 小时快照 ⇒ 用户
+等满一小时再试当然还是 429，而每次失败又从当下重算一小时 ——「永远 60 分钟」可以无限
+循环。现在的解析见 `src/cline-rate-limit.ts`（认 `19h 39m` / `1h 30m` / `45s` 等写法，
+也认非 JSON 的错误页）。
+
+⚠️ **免费额度是按「账号 + 模型」计的**（同一时刻实测，同一个账号）：
+
+| 模型 | 结果 |
+|---|---|
+| `cline-free/deepseek-v4.1-flash` | 429 `Daily free limit reached … Try again in 19h 29m` |
+| `cline-free/mimo-v2.6-flash` | **200**（正常出字） |
+| `cline-free/muse-spark-1.3-contributor` | **200** |
+
+⇒ 一个免费模型到顶时，**换同一个账号的另一个 `cline-free/*` 模型可立刻继续**。
+
+⚠️ **别把 `cline-pass/*` 当成「有余额就能用」的备用通道**：它是**订阅**通道。实测该账号
+（余额 `500000`）请求 `cline-pass/deepseek-v4.1-flash` 回
+**403 `ENTITLEMENT_ERROR: the user is not subscribed to required model plan`**，其
+`/plan/usage-limits` 也是 `404 no plan history found for user`。故错误文案里**不提**它。
 
 ⚠️ **全部账号都不可用时，报错带上最后一笔的真实状态码与上游文案**，例如：
 
 ```
-cline: 模型 cline-free/deepseek-v4.1-flash 的所有账号均不可用（HTTP 429 rate limit exceeded）。
-这是限流（HTTP 429）—— 等一段时间再试，或改用其它 provider / 账号
+cline: 模型 cline-free/deepseek-v4.1-flash 的所有账号均不可用（HTTP 429 Error 429: Daily free
+limit reached on model deepseek/deepseek-v4.1-flash. Try again in 19h 39m）。这是该模型的**当日
+免费额度**已用尽（HTTP 429 Daily free limit reached）—— 免费额度按天结算、且**按模型单独
+计算**，盯着它等不会提前恢复，服务端给出的解禁时刻是 2026/10/4 18:49:xx（约 19.6 小时后）。
+要立刻继续，可改用**同一个账号的另一个免费（cline-free/*）模型**，或换其它 provider / 账号
 ```
 
-需要这个是因为「限流」与「额度耗尽」在 UI 上原本长得一模一样，而用户的动作相反
-（等 vs 充值）—— 这也正是 Cline 客户端自己修过的那条（cline/cline#10139）。
+需要这个是因为「限流」「免费额度用尽」「额度耗尽」在 UI 上原本长得一模一样，而用户的
+动作相反（等 / 换模型 / 充值）—— 这也正是 Cline 客户端自己修过的那条
+（cline/cline#10139 `WAIT vs STOP not distinguished`）。
+
+⚠️ **每个失败的账号都会被记上标记**（含换号预算用尽时的**最后一个**）：早期实现把标记
+写在「下一轮的开头」，于是最后一个账号永远不写 —— 下一次取号又会选中它，立刻再撞一次
+同样的墙（单账号用户尤其致命）。
 
 > 账号卡片亮着「限额重置 · x 分钟后」时，点卡片上的「**重置**」可立刻清掉标记再试
 > （不发请求）。那个标记只是「上一次失败时的快照」，服务端常在它到期前就放行。
