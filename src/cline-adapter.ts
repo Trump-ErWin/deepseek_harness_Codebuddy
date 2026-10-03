@@ -294,7 +294,7 @@ export class ClineAdapter extends LlmAdapter {
    *    模型（`cline-pass/*` 等）。
    *
    * ⚠️ **这是「支持图片的模型发不了图」的修复点**：修复前只看第 1 级，而它
-   * 全表只有 5 条 `cline-free/*` 条目 ⇒ `cline-pass/*` 等**全部**被播报成
+   * 全表只有寥寥几条 `cline-free/*` 条目 ⇒ `cline-pass/*` 等**全部**被播报成
    * 纯文本 ⇒ DSH 根本不把图片送进来。详见 `src/cline-models-dev.ts`。
    *
    * ⚠️ 没有结论时保守报 `text`（宁可少报能力，也不要报一个服务端不认的模态）

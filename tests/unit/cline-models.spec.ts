@@ -35,7 +35,9 @@ describe('parseClineRecommendedModels', () => {
     expect(parsed.clinePass.map((e) => e.id)).toEqual(['cline-pass/mimo-v2.6-flash', 'cline-pass/glm-5.3'])
   })
 
-  it('free 数组正是用户截图那 5 个免费模型', () => {
+  it('free 数组逐条解析（2026-09-25 抓到的 5 条，含后来被下线的 gemini-3.8-flash）', () => {
+    // ⚠️ 本 fixture 是**历史报文**，只用来锁解析行为；远端 `free` 现为 4 条
+    // （2026-10-03 复测），兜底表与 `tests/unit/cline.spec.ts` 已同步。
     const parsed = parseClineRecommendedModels(RECOMMENDED_FIXTURE)
     expect(parsed.free.map((e) => e.id).sort()).toEqual([
       'cline-free/deepseek-v4.1-flash',
@@ -195,9 +197,8 @@ describe('mergeClineModels', () => {
     expect(entry?.name).not.toBe('openai/gpt-6-luna')
   })
 
-  it('远端 `free` 数组里的模型即使不在兜底表也被标免费（如 gemini-3.8-flash 的远端来源）', () => {
-    // 兜底表已补上 gemini-3.8-flash，但**远端才是权威** ——
-    // 这里用一个兜底表完全没有的新免费 id 验证集合判定生效。
+  it('远端 `free` 数组里的模型即使不在兜底表也被标免费', () => {
+    // **远端才是权威** —— 这里用一个兜底表完全没有的新免费 id 验证集合判定生效。
     const models = mergeClineModels(CLINE, {
       freeIds: ['brand-new/free-model-x'],
       remoteIds: [],
@@ -211,7 +212,8 @@ describe('mergeClineModels', () => {
   it('两个来源都为空时仍返回兜底表（离线可用）', () => {
     const models = mergeClineModels(CLINE, { freeIds: [], remoteIds: [], entries: [] })
     expect(models.length).toBe(CLINE.fallbackModels.length)
-    expect(models.filter((m) => m.isFree)).toHaveLength(5)
+    // 4 = 远端 `free` 数组的当前条数（2026-10-03 复测；gemini-3.8-flash 已下线）。
+    expect(models.filter((m) => m.isFree)).toHaveLength(4)
   })
 
   it('`clinePass` 里的订阅制模型**不**被判为免费', () => {

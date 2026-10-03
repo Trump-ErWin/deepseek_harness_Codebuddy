@@ -2025,6 +2025,12 @@ limit reached on model … Try again in 19h 39m）`，**再用中文解释一遍
 
 ### Gemini 系模型的两个 400（已修）
 
+> ⚠️ **2026-10-03 补记**：`cline-free/gemini-3.8-flash` 已被 Cline 下线（不在
+> `recommended-models` 的 `free` 数组里，直连该 id 回 `404 model not found`），
+> 故兜底表已删除该条目。本节保留为**历史记录** —— 两个修法都是通用的：
+> `clampClineMaxTokens` 对任何模型都生效，`sanitizeClineToolParameters()` 是为
+> **所有**模型服务的安全网（任何严格校验工具 `enum` 的上游都会踩到）。
+
 `cline-free/gemini-3.8-flash` 曾「发消息即失败」。错误体里一次请求有**两个
 provider 尝试、两个不同的错误**，是两个独立根因：
 

@@ -2788,9 +2788,12 @@ re-authenticate your Cline account."* —— 与真实原因**毫不相干**，�
 远端 `free` 集合 ∪ `:free` 后缀 ∪ `cline-free/` 前缀 ∪ 兜底表 `isFree`。
 与 CodeArts benefit 集合同一约定。
 
-⚠️ **兜底表不足以覆盖免费集合**：sidecar 内嵌目录缺
-`cline-free/gemini-3.8-flash`（远端 `free` 有），故 `cline-product.ts` 的兜底表
-手工补上了它 —— 否则离线时用户看不到截图里的那个模型。
+⚠️ **兜底表要与远端 `free` 数组同步**：sidecar 内嵌目录里**没有** `cline-free/*`
+与 `stealth/space-bunny-alpha`（只有远端 `free` 下发），故 `cline-product.ts` 的兜底表
+手工补上它们 —— 否则离线时用户看不到免费模型。
+⚠️ 2026-10-03 复测：`free` **只剩 4 条**，`cline-free/gemini-3.8-flash` 已被 Cline
+下线（直连回 `404 {"error":"model not found"}`），兜底表、单测与 e2e 清单已同步删除它。
+**别照抄旧版本的表把它加回来**。
 
 ⚠️ **`clinePass` 不是免费集合**：它是 Cline Pass 订阅制模型（`cline-pass/*`），
 按订阅额度计费。实测 14 个，误判为免费会误导用户。
@@ -2848,6 +2851,12 @@ IDE 的模型选择器旁有思考强度菜单（`None / Low / Medium / High / E
 设计文档：`docs/superpowers/specs/2026-09-25-cline-reasoning-effort-design.md`。
 
 ### ⚠️ 坑 5：Gemini 系有两个**独立**的 400，且各自只在部分 provider 上暴露
+
+⚠️ **2026-10-03 补记**：`cline-free/gemini-3.8-flash` 已被 Cline 下线（不在 `free`
+数组里、直连回 `404 model not found`），故兜底表里那条已删除。本节保留为**历史记录**，
+因为两个根因的教训与模型无关：**①表里的数值必须实测**（别照抄邻居的值）、
+**②`sanitizeClineToolParameters()` 是为所有模型服务的安全网**（任何严格校验工具
+`enum` 的上游都会踩到），二者都**不可因这条模型下线而回退**。
 
 用户报障（2026-09-25）：给 `cline-free/gemini-3.8-flash` 发消息即失败。错误体里
 一次请求有**两个 provider 尝试、两个不同的错误**：
