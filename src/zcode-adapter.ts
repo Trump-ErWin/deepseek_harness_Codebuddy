@@ -68,9 +68,12 @@ import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import type { ZcodeCredential } from './zcode.js'
 import { ZCODE, type ZcodeFallbackModel, type ZcodeProduct, type ZcodeRemoteModelLike } from './zcode-product.js'
 import {
-  ZCODE_PLAN_MESSAGES_URL,
-  buildZcodeHeaders,
-} from './zcode-upstream.js'
+  buildChannelRequest,
+  describeChannels,
+  resolveChannelFor,
+  shouldFallbackToOtherChannel,
+  type ZcodeChannel,
+} from './zcode-transport.js'
 import {
   buildZcodeSystemBlocks,
   withContextPrefix,
@@ -907,20 +910,33 @@ export class ZcodeAdapter extends LlmAdapter {
           mintMs = Date.now() - mintStartedAt
         }
 
-        const headers = buildZcodeHeaders(credential, {
-          authorization: `Bearer ${credential.zcode_jwt}`,
+        /**
+         * ★ **按通道组装请求**（2026-10-03，ZCode 双通道）。
+         *
+         * 原来这里恒用 `ZCODE_PLAN_MESSAGES_URL` + `zcode_jwt`，即只有积分通道。
+         * 现在按 {@link resolveChannelFor} 选腿：
+         * - `start-plan`（积分，**优先**）：`zcode.z.ai` + `zcode_jwt` —— 与原行为逐字一致
+         * - `coding-plan`（订阅）：`api.z.ai` + `coding_plan_key_*`
+         *
+         * ⚠ **captcha 头在 transport 之上叠加**：`buildChannelRequest` 只管端点与
+         * 凭据，而 captcha 是**两条通道共用**的可选头（param 一次性，每轮重产）。
+         * 这里保持"有 param 就带上"的既有语义。
+         */
+        const requestChannel = resolveChannelFor(credential, options.model)
+        const channelRequest = buildChannelRequest(credential, requestChannel, JSON.stringify(body))
+        const headers = {
+          ...channelRequest.headers,
           ...(captchaParam === undefined
             ? {}
             : {
-              captcha: {
-                param: captchaParam,
-                region: this.options.captchaRegion ?? 'cn',
-              },
+              'x-aliyun-captcha-verify-param': captchaParam,
+              'x-aliyun-captcha-verify-region': this.options.captchaRegion ?? 'cn',
             }),
-        })
+        }
 
         const upstreamStartedAt = Date.now()
         response = await this.sendUpstream({
+          url: channelRequest.url,
           headers,
           body,
           signal: controller.signal,
@@ -975,6 +991,57 @@ export class ZcodeAdapter extends LlmAdapter {
             'QUOTA_EXCEEDED',
             { status: response.status },
           )
+        }
+
+        // ①′ ★ **额度/资源包用尽 ⇒ 换另一条通道重试一次**（2026-10-03）。
+        //
+        // 位置在①之后：① 已经**切过账号**或已耗尽切号轮次
+        // （`isZcodeQuotaExhausted` 覆盖的码比这里宽），这时换通道
+        // （换端点 + 换凭据）比直接报 QUOTA_EXCEEDED 更有价值 ——
+        // 积分通道的额度与订阅通道的额度是**两份独立的**。
+        //
+        // ⚠ 只认 429 + 1005/1113（见 `shouldFallbackToOtherChannel`）：
+        // 401/1002（凭据失效）与 3012（风控，重试会加重冷却惩罚）都不换。
+        // ⚠ 换腿前先确认**另一条通道真的可用**（`describeChannels`），
+        //   否则等于用一个没有凭据的端点再撞一次 401，把一次明确失败变成两次。
+        // ⚠ ⚠⚠ 换腿**不重产 captcha**：`captchaParam` 是**一次性**的，
+        //   上一发已被上游消费；重发必须**现产新的**。这里保守起见只在
+        //   `captchaParam === undefined`（上游当下不索要验证）时换腿 ——
+        //   带了 param 的那一发被拒属于另一类问题，走 ③ 的 3007 分支。
+        if (
+          shouldFallbackToOtherChannel(response.status, text)
+          && !switchedAccount
+          && captchaParam === undefined
+          && attempt < this.product.concurrencyRetryMax
+        ) {
+          const current: ZcodeChannel = requestChannel
+          const other: ZcodeChannel = current === 'start-plan' ? 'coding-plan' : 'start-plan'
+          const otherReady = describeChannels(credential).find((i) => i.channel === other)?.available === true
+          if (otherReady) {
+            this.options.log?.(
+              `zcode: ${current} 额度用尽（HTTP ${response.status}）⇒ 换 ${other} 重发一次`,
+            )
+            const otherRequest = buildChannelRequest(credential, other, JSON.stringify(body))
+            const otherResponse = await this.sendUpstream({
+              url: otherRequest.url,
+              headers: otherRequest.headers,
+              body,
+              signal: controller.signal,
+              userSignal: options.signal,
+              timeoutMs,
+              model: options.model,
+            })
+            if (otherResponse.ok) {
+              // 换腿成功 ⇒ 把它当作本轮的正式响应继续往下走（读流 / usage）
+              response = otherResponse
+              break
+            }
+            // 换腿也失败 ⇒ 落回原有错误处理（用**原**通道的 status/text，
+            //   免得把「换腿失败」报成用户看到的那个错误）
+            this.options.log?.(
+              `zcode: 换 ${other} 仍失败（HTTP ${otherResponse.status}）⇒ 回到 ${current} 的错误处理`,
+            )
+          }
         }
 
         // ② 并发限流 → 退避后再试（**不**换账号：换谁都一样撞）
@@ -1176,6 +1243,7 @@ export class ZcodeAdapter extends LlmAdapter {
    * 暴涨到 2500-3100ms。
    */
   private async sendUpstream(input: {
+    url: string
     headers: Record<string, string>
     body: Record<string, unknown>
     signal: AbortSignal
@@ -1183,11 +1251,11 @@ export class ZcodeAdapter extends LlmAdapter {
     timeoutMs: number
     model: string
   }): Promise<Response> {
-    const { headers, body, signal, userSignal, timeoutMs, model } = input
+    const { url, headers, body, signal, userSignal, timeoutMs, model } = input
     try {
       return await this.gate.run(
         model,
-        async () => await this.fetchImpl(ZCODE_PLAN_MESSAGES_URL, {
+        async () => await this.fetchImpl(url, {
           method: 'POST',
           headers,
           body: JSON.stringify(body),

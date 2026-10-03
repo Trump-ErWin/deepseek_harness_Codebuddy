@@ -1806,6 +1806,25 @@ function ProviderPanel({ provider, rpcCall }) {
   const [phase, setPhase] = React.useState('loading');
   const [error, setError] = React.useState(null);
   const [creating, setCreating] = React.useState(false);
+  /**
+   * ZCode 登录渠道（仅 `provider === 'zcode'` 时用）。
+   *
+   * ZCode 服务端支持两个 OAuth provider，授权页与凭据落点都不同：
+   * `bigmodel`（智谱开放平台，国内）与 `zai`（z.ai 国际版）。
+   * 缺省 `bigmodel`，与后端 `req.zcodeProvider ?? 'bigmodel'` 对齐。
+   */
+  const [zcodeProvider, setZcodeProvider] = React.useState('bigmodel');
+  /**
+   * ★ 弹窗是否开着（`false` = 关着）。
+   *
+   * 渠道选择搬进弹窗后（用户 2026-10-03），`zcodeProvider` 只在**弹窗打开期间**
+   * 被改动 —— 发起登录那一刻它就是本轮要用的渠道，
+   * 避免了「授权页已开、渠道又被改掉」的不一致。
+   *
+   * ⚠ 这里**不再**承载 `forceNew` —— 「登录其他账号」已按用户 2026-10-02 的
+   *   要求撤销（见同批提交），它现在只回答「弹窗开没开」。
+   */
+  const [pendingLogin, setPendingLogin] = React.useState(undefined);
   // 正在进行的限流操作：null | 'one' | 'all'。用于禁用按钮并显示进度。
   const [probeBusy, setProbeBusy] = React.useState(null);
   // 上一次重测/重置的结果文案（成功或失败）。
@@ -2116,7 +2135,11 @@ function ProviderPanel({ provider, rpcCall }) {
       const res = await rpcCall('credits.claimAll', { provider });
       const { summary, results } = res;
       const parts = [];
-      if (summary.claimed > 0) parts.push(`${summary.claimed} 个账号领取成功（+${summary.totalCredit} 积分）`);
+      // ⚠ **不带 `totalCredit`**（2026-10-03）：
+    //   `summary.totalCredit` 把不同 provider 的额度**直接相加** —— 而 ZCode 的
+    //   单位是 token、其余是积分，1 亿 token 与 100 积分加成一个数字只会误导。
+    //   真实额度在下方逐账号明细里（已按单位渲染）。
+    if (summary.claimed > 0) parts.push(`${summary.claimed} 个账号领取成功`);
       if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今日已领取`);
       if (summary.inactive > 0) parts.push(`${summary.inactive} 个活动未开启`);
       if (summary.failed > 0) parts.push(`${summary.failed} 个失败`);
@@ -2131,7 +2154,14 @@ function ProviderPanel({ provider, rpcCall }) {
       for (const item of results || []) {
         const outcome = item.outcome || {};
         if (outcome.kind === 'claimed') {
-          details.push(`${item.nickname || item.accountId}：领取成功 +${outcome.credit} 积分`);
+          // ★ 单位感知（2026-10-03）：ZCode 的 credit 是 **token**，不是积分。
+    //   后端 `toClaimOutcome` 现在会带上 `unit: token` 与真实额度
+    //   （实测 100000000），这里用现成的 formatUnits/unitLabel 渲染。
+    const unit = outcome.unit === 'token' ? 'token' : 'credit'
+    details.push(
+      `${item.nickname || item.accountId}：领取成功 `
+      + `+${formatUnits(outcome.credit, unit)} ${unitLabel(unit)}`,
+    )
         } else if (outcome.kind === 'already-claimed') {
           details.push(`${item.nickname || item.accountId}：${outcome.message || '今天已领取'}`);
         } else if (outcome.kind === 'inactive') {
@@ -2231,7 +2261,10 @@ function ProviderPanel({ provider, rpcCall }) {
     let loginUrl = '';
     try {
       console.log('[jet-hub] account.create request, provider =', provider);
-      const res = await rpcCall('account.create', { provider });
+      // ZCode 带渠道（`bigmodel` 国内 / `zai` 国际）；其余 provider 不带（后端逐字节不变）。
+      const res = await rpcCall('account.create', provider === 'zcode'
+        ? { provider, zcodeProvider }
+        : { provider });
       console.log('[jet-hub] account.create response =', res);
       accountId = res.accountId;
       loginUrl = res.loginUrl;
@@ -2678,9 +2711,51 @@ function ProviderPanel({ provider, rpcCall }) {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
           title: '通过浏览器登录一个新的账号并加入账号池。',
-          onClick: () => void createAccount(),
+          onClick: () => setPendingLogin(false),
           disabled: creating,
-        }, creating ? '正在登录…' : '+ 新建账号'))),
+        }, creating ? '正在登录…' : '+ 新建账号'),
+        // ★ 渠道选择对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
+        //
+        // ⚠ 两个入口（这里与 `zcode-card.js`）各有一份：它们是**不同的组件**、
+        //   不同的状态源，抽公共组件会牵动 PR #38 已打通的 props 通路，收益不抵风险。
+        pendingLogin === undefined ? null : React.createElement(
+          'div',
+            {
+              className: 'dim-jh-zcDialogMask',
+              onClick: () => setPendingLogin(undefined),
+            },
+            React.createElement('div', {
+              className: 'dim-jh-zcDialog',
+              onClick: (event) => event.stopPropagation(),
+            },
+              React.createElement('h3', { className: 'dim-jh-zcDialogTitle' },
+                '添加 ZCode 账号'),
+              React.createElement('p', { className: 'dim-jh-zcDialogHint' },
+                '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，',
+                '可用 z.ai（国际）登录另一个账号。'),
+              React.createElement('label', { className: 'dim-jh-zcProvider' },
+                '登录渠道',
+                React.createElement('select', {
+                  className: 'dim-jh-zcSelect',
+                  value: zcodeProvider,
+                  onChange: (event) => setZcodeProvider(event.target.value),
+                },
+                  React.createElement('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
+                  React.createElement('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）'))),
+              React.createElement('div', { className: 'dim-jh-zcDialogActions' },
+                React.createElement('button', {
+                  className: 'dim-jh-btn',
+                  onClick: () => setPendingLogin(undefined),
+                }, '取消'),
+                React.createElement('button', {
+                  className: 'dim-jh-btn',
+                  'data-kind': 'primary',
+                  onClick: () => {
+                    setPendingLogin(undefined)
+                    void createAccount()
+                  },
+                }, '确定并打开认证页'))),
+        )),
     probeNotice
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
@@ -2884,7 +2959,7 @@ function ProviderPanel({ provider, rpcCall }) {
           onSubmitAnonymous: () => void submitAnonymous(),
           onClose: () => setKeyModal(null),
         })
-      : null);
+      : null));
 }
 
 /**

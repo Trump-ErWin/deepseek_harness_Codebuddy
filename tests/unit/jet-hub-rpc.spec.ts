@@ -848,6 +848,21 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
   })
 
   /**
+   * `forceNew: true` 必须**跳过两道复用检查**，直接走 OAuth。
+   *
+   * ## 为什么需要这个开关（用户报障）
+   *
+   * 两道复用检查（收编孤儿条目 / 本机凭据已在池里就复用）是为「点一次添加
+   * 就多一条」设计的，但它们**在渠道判断之前**，于是把「同一个人想加第二个
+   * 账号」也一并挡掉了：本机官方客户端登的账号已在池里时，点「新建账号」
+   * 直接返回 `{reused:true, loginUrl:''}`，**浏览器根本不开**，用户无从登录
+   * 第二个号。换 `zai` 渠道也一样被挡（复用检查读的是 bigmodel 的凭据文件，
+   * 与渠道无关）。
+   *
+   * 本用例锁死：`forceNew: true` ⇒ 不返回 reused、必须调 `startLogin`。
+   */
+
+  /**
    * 前端源码级守卫：`createAccount` 不得再劫持当前页面。
    *
    * 组件无法在单测里渲染（react 不在本仓库依赖内），故与
@@ -858,7 +873,10 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
   it('createAccount 不再用 window.location.href 跳转主页面', () => {
     const here = dirname(fileURLToPath(import.meta.url))
     const source = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
-    const start = source.indexOf('const createAccount = async () => {')
+    // ⚠️ 签名带形参（`async (forceNew) =>`，ZCode 的「登录其他账号」用它跳过复用）。
+    // 按 `const createAccount = async ` 定位，不把形参写进断言 —— 否则每次加参数
+    // 都要改这条守卫，而它真正要守的是**函数体里不得有页面跳转**。
+    const start = source.indexOf('const createAccount = async ')
     expect(start).toBeGreaterThan(-1)
     // 取到下一个顶层函数定义为止，避免把文件其余部分一起扫进来。
     const rest = source.slice(start)

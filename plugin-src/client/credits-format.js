@@ -16,9 +16,34 @@
  *
  * ## ⚠️ 单位的唯一消费点
  *
- * {@link formatUnits} 与 {@link unitLabel} 是 `unit` 字段的全仓消费点。加新单位
- * （如 `credit`）时改这里，**不要**在渲染处写 `if (provider === 'zcode')` 那种
- * 分支 —— 那会漏掉别的 provider，且徽标与设置页会各写一份。
+ * {@link normalizeUnit} / {@link formatUnits} / {@link unitLabel} 是 `unit` 字段的
+ * 全仓消费点。加新单位（如 `credit`）时改这里，**不要**在渲染处写
+ * `if (provider === 'zcode')` 那种分支 —— 那会漏掉别的 provider，且徽标与设置页
+ * 会各写一份。
+ *
+ * ## ⚠️ 单位必须先归一，再当**分组键**用（真实缺陷，2026-10-03）
+ *
+ * 用户报障：WorkBuddy 国际版有**两个账号**，胶囊却显示成
+ * `WorkBuddy (国际版) • 341.78积分 · 100积分`（两个数并排），账号再多就成一长串。
+ *
+ * 根因不是「多账号没法合计」，而是**服务端把同一个单位拼成两种写法**。实测
+ * （`probe-workbuddy-units.mjs` 逐包打印原值）：
+ *
+ * | 账号 | 包 | `unit` 原值 |
+ * |---|---|---|
+ * | `…01CC739A` | Bonus Pack 241.78 / Free Plan Subscription 100 | `credit` / `credits` |
+ * | `…297957E1` | Free Plan Subscription 100 | `credits` |
+ *
+ * 折叠态按**原始字符串**分组（`credit` ≠ `credits`）⇒ 两个账号落进两个分组 ⇒
+ * 渲染成两个「积分」。而 {@link unitLabel} 把两者都显示成「积分」——**同一句话里
+ * 出现两个一模一样的单位标签**，用户只能读成「把所有号的积分都列出来了」。
+ *
+ * ⚠️ 口径：**分组键必须与展示名同源**。凡是 {@link unitLabel} 会显示成「积分」的
+ * 单位串，就必须落进同一个分组；否则文案里必然出现 `A积分 · B积分` 这种把同一
+ * 单位拆成两段的形态。故分组键一律走 {@link normalizeUnit}，**不要**用原值。
+ *
+ * ⚠️ `token` 与积分**不可互相折算**，故仍分成两组并列显示（ZCode 是 token，其余
+ * 是积分）——归一化只收敛同义写法，不跨量纲求和。
  */
 
 /**
@@ -91,6 +116,30 @@ export const QUOTA_UNIT = '%';
 export function formatQuota(value) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
   return `${Math.round(value)}%`;
+}
+
+/**
+ * 把单位串归一到**展示口径**，返回 `'token'` 或 `'credit'`。
+ *
+ * ⚠️ 这不是「格式化偏好」，而是**语义等价类的代表元**：服务端对同一个单位有多种
+ * 拼法（实测 `credit` / `credits` / 空串；`USD`、`积分` 等历史写法同理），而
+ * {@link unitLabel} 只认 `token` 一个特例 —— 其余**全部**显示成「积分」。
+ * 于是「展示口径」天然只有两类，故这里也只返回两类。
+ *
+ * ⚠️ **分组键（`creditGroupsOf` / `planGroupsOf`）必须用它**，不能用原值：
+ * 用原值会让 `credit` 与 `credits` 各成一组，渲染出两个「积分」（见文件头表）。
+ * 归一化之后，胶囊对**任意账号数**都只有一个数字 —— 这正是用户要的「一共能用」。
+ *
+ * ⚠️ **配额单位（{@link QUOTA_UNIT}）不参与归一**：它既不是 token 也不是积分，
+ * 归成 credit 会把 Gemini 的窗口百分比混进积分合计里求和。调用方（分组键）必须
+ * 先判 `QUOTA_UNIT` 再落到这里 —— 见 `badge-model.js` 的 `groupKeyOf`。
+ *
+ * ⚠️ 与宿主侧 `src/credits.ts` 的 `normalizeCreditUnit` **必须逐字等价**
+ * （宿主算套餐读数、客户端算余额分组，两边不一致会出现「套餐一个单位、余额另一个」
+ * 这种自相矛盾）。一致性由 `tests/unit/usage-badge-client.spec.ts` 逐项比对锁死。
+ */
+export function normalizeUnit(unit) {
+  return unit === 'token' ? 'token' : 'credit';
 }
 
 /**

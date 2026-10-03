@@ -101,7 +101,7 @@ describe('badgePlanFor', () => {
       name: 'Free Plan Subscription',
       remaining: 300,
       total: 500,
-      unit: 'credits',
+      unit: 'credit',
       deductionEndTime: 1_700_000_000_000,
     })
   })
@@ -162,8 +162,18 @@ describe('badgePlanFor', () => {
     }
   })
 
-  it('单位缺失时按空串走（调用方 unitLabel 会显示「积分」）', () => {
-    const plan = badgePlanFor('zcode', balance([pkg('桶', 5, 10, { unit: '' })], 5))
-    expect(plan?.unit).toBe('')
+  /**
+   * ⚠️ 单位**下发前就归一**（2026-10-03 改）。
+   *
+   * 旧断言是「缺失时按空串走」—— 那时客户端按原值分组，空串与 `credits` 会各成
+   * 一组，渲染出两个「积分」。现在宿主与客户端都归一到展示口径，故这里断言
+   * `'credit'`：它与 `credits` / `''` / `USD` 是同一个语义等价类。
+   */
+  it('单位缺失 / 同义异拼一律归一到 credit（调用方 unitLabel 显示「积分」）', () => {
+    expect(badgePlanFor('zcode', balance([pkg('桶', 5, 10, { unit: '' })], 5))?.unit).toBe('credit')
+    expect(badgePlanFor('zcode', balance([pkg('桶', 5, 10, { unit: 'credits' })], 5))?.unit).toBe('credit')
+    expect(badgePlanFor('zcode', balance([pkg('桶', 5, 10, { unit: 'USD' })], 5))?.unit).toBe('credit')
+    // 只有 token 是另一个等价类（与积分不可折算）
+    expect(badgePlanFor('zcode', balance([pkg('桶', 5, 10, { unit: 'token' })], 5))?.unit).toBe('token')
   })
 })

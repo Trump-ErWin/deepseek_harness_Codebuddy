@@ -42,6 +42,21 @@ export const ZCODE_ORIGIN = 'https://zcode.z.ai'
 /** 免费额度通道的 Anthropic 端点。 */
 export const ZCODE_PLAN_MESSAGES_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/anthropic/v1/messages`
 
+/**
+ * 按通道返回「Messages」端点。
+ *
+ * ⚠ **积分制（`start-plan`）无论账号是 bigmodel 还是 zai，都走 `zcode.z.ai`**
+ * —— 官方分派表（`resources/config/provider/zcode-builtin.json`）的规则 2/5
+ * 明确如此，2026-10-03 实测复核。**不要**因为账号是国际版就改域名。
+ *
+ * ⚠ 订阅制（`coding-plan`）才走 `api.z.ai`（官方规则 0/1，2026-10-03 实测
+ * `GET https://api.z.ai/api/anthropic/v1/models` 返回 200 + 11 个模型）。
+ */
+export function zcodeMessagesUrl(channel: 'start-plan' | 'coding-plan'): string {
+  if (channel === 'coding-plan') return 'https://api.z.ai/api/anthropic/v1/messages'
+  return ZCODE_PLAN_MESSAGES_URL
+}
+
 /** 额度余额端点（**需要 Authorization**）。 */
 export const ZCODE_BILLING_BALANCE_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/billing/balance`
 
@@ -134,6 +149,18 @@ export interface ZcodeBalanceResult {
   expiresAt?: number
   /** 显示名（首个桶的模型名）。 */
   planName?: string
+  /**
+   * ★ 可领活动摘要（来自 `billing/preview`）。
+   *
+   * ⚠ **必需存在的原因**（2026-10-03 实测）：每日赠送的 start-plan 额度
+   * **不在 `buckets` 里**，只在 `preview.plans` 里 ——
+   * 同一账号 `balances` 返回 0 个桶、`preview` 返回 `…start-plan-trust-1003`。
+   * 只读 `buckets` 会让面板显示 0，而用户实际能领 1 亿 tokens。
+   *
+   * ⚠ 取不到时是**空数组**（不 undefined）：preview 失败属降级，
+   * 绝不能让它影响 `remaining`/`total` 本身。
+   */
+  claimablePlans: ZcodeClaimablePlanSummary[]
 }
 
 /** 一次可领活动。 */
@@ -141,6 +168,20 @@ export interface ZcodeClaimablePlan {
   planId: string
   priority: number
   name?: string
+  /**
+   * ★ 本次领取能拿到的**额度数值**（实测自 `plan.entitlements[].grant_units`）。
+   *
+   * ⚠ 上游**不在** plan 顶层给额度，只在 `entitlements[]` 里。拿不到时
+   *   留 undefined —— 此时 `toClaimOutcome` 退回 0（不谎报）。
+   */
+  grantUnits?: number
+  /**
+   * ★ 额度单位（`'token'` / 缺省按积分）。
+   *
+   * ⚠ ZCode 下发 `unit_type: "token"`，**不是**积分 —— 展示必须走
+   *   `formatUnits`/`unitLabel`（`plugin-src/client/credits-format.js`）。
+   */
+  unitType?: string
 }
 
 /** 领取结果。 */
@@ -226,7 +267,8 @@ export async function fetchZcodeBalance(
   const data = parsed.data
   if (data === undefined) return undefined
   if (typeof data.displayMode === 'string' && data.displayMode === 'enterprise') {
-    return { enterprise: true, buckets: [], remaining: 0, total: 0 }
+    // ⚠ 企业版**不下发额度数字**，也就没有可领活动 ⇒ 不发 preview 请求。
+    return { enterprise: true, buckets: [], remaining: 0, total: 0, claimablePlans: [] }
   }
 
   const rawBuckets = Array.isArray(data.balances) ? data.balances : []
@@ -265,6 +307,65 @@ export async function fetchZcodeBalance(
     total,
     expiresAt,
     planName: buckets[0]?.showName,
+    claimablePlans: await fetchClaimablePlans(credential, fetchImpl),
+  }
+}
+
+/** `ZcodeBalanceResult` 里由 `preview` 带出的可领活动。 */
+export interface ZcodeClaimablePlanSummary {
+  planId: string
+  showName?: string
+  amount?: number
+}
+
+/**
+ * 取「可领活动」摘要（**只读**，不消耗额度）。
+ *
+ * ## 为什么 balance 要带它（2026-10-03 实测）
+ *
+ * 同一账号：
+ * ```
+ * GET /billing/balance  → data.balances = []                          ← 0 个桶
+ * GET /billing/preview  → data.plans[0].plan_id = …start-plan-trust-1003
+ * ```
+ * ⇒ **每日赠送的 start-plan 额度不在 `balances` 桶里**，只在 `plans` 里。
+ * 只读 `balances` ⇒ 面板显示 0，而用户实际能领 1 亿 tokens。
+ *
+ * ⚠ **失败一律降级为空数组**，绝不影响 `balance` 本身 ——
+ *   余额是主体，preview 是补充。
+ *
+ * ⚠ 走**同一个** `preview` 端点与 `fetchZcodeClaimablePlans` 一致；
+ *   这里只是不解析成领取结果、只留展示要的三个字段（少一次字段耦合）。
+ */
+async function fetchClaimablePlans(
+  credential: ZcodeCredential,
+  fetchImpl: typeof fetch,
+): Promise<ZcodeClaimablePlanSummary[]> {
+  try {
+    const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
+    const response = await fetchWithTimeout(
+      fetchImpl,
+      `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`,
+      { method: 'GET', headers: buildZcodeHeaders(credential, { json: false }) },
+      15_000,
+    )
+    if (!response.ok) return []
+    const parsed = await response.json() as { data?: { plans?: unknown } }
+    const raw = Array.isArray(parsed.data?.plans) ? parsed.data.plans : []
+    const out: ZcodeClaimablePlanSummary[] = []
+    for (const item of raw as Array<Record<string, unknown>>) {
+      if (typeof item !== 'object' || item === null) continue
+      const planId = item['plan_id']
+      if (typeof planId !== 'string' || planId.length === 0) continue
+      out.push({
+        planId,
+        ...(typeof item['name'] === 'string' ? { showName: item['name'] } : {}),
+        ...(typeof item['amount'] === 'number' ? { amount: item['amount'] } : {}),
+      })
+    }
+    return out
+  } catch {
+    return []
   }
 }
 
@@ -323,10 +424,22 @@ export async function fetchZcodeClaimablePlans(
     if (typeof item !== 'object' || item === null) continue
     const record = item as Record<string, unknown>
     if (typeof record.plan_id !== 'string' || record.plan_id.length === 0) continue
+    /**
+     * ★ 额度取自 `entitlements[]`（2026-10-03 实测）——
+     * plan 顶层**没有**额度字段，只有 `entitlements[0].grant_units`。
+     * 不读它 ⇒ `toClaimOutcome` 只能填 0 ⇒ 面板显示「+0 积分」。
+     */
+    const ents = Array.isArray(record.entitlements)
+      ? record.entitlements as Array<Record<string, unknown>>
+      : []
+    const first = ents[0] ?? {}
+    const grantUnits = num(first.grant_units)
     plans.push({
       planId: record.plan_id,
       priority: num(record.priority) ?? 0,
       name: typeof record.name === 'string' ? record.name : undefined,
+      ...(grantUnits === undefined ? {} : { grantUnits }),
+      ...(typeof first.unit_type === 'string' ? { unitType: first.unit_type } : {}),
     })
   }
   // priority 降序（与官方/第三方实现一致：先领高优先级）。
