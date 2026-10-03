@@ -141,11 +141,12 @@ describe('ClineAdapter 模型目录', () => {
     expect(entry?.name).toBe('DeepSeek V4.1 Flash · 免费')
   })
 
-  it('未加载完成时 listAllModels 回退兜底表（仍含 5 个免费模型）', () => {
+  it('未加载完成时 listAllModels 回退兜底表（仍含 4 个免费模型）', () => {
     const adapter = makeAdapter({ loadModels: async () => { throw new Error('offline') } })
     const models = adapter.listAllModels()
     expect(models.length).toBe(CLINE.fallbackModels.length)
-    expect(models.filter((m) => m.name.includes('免费'))).toHaveLength(5)
+    // 4 = 远端 `free` 数组的当前条数（2026-10-03 复测；gemini-3.8-flash 已下线）。
+    expect(models.filter((m) => m.name.includes('免费'))).toHaveLength(4)
   })
 
   it('远端目录两个端点都失败时仍返回兜底表', async () => {
@@ -154,7 +155,7 @@ describe('ClineAdapter 模型目录', () => {
     })
     const models = await adapter.listModels('cline')
     expect(models.length).toBe(CLINE.fallbackModels.length)
-    expect(models.filter((m) => m.name.includes('免费'))).toHaveLength(5)
+    expect(models.filter((m) => m.name.includes('免费'))).toHaveLength(4)
   })
 
   it('黑名单过滤只作用于 listModels，不影响 listAllModels', async () => {
@@ -882,7 +883,7 @@ describe('Cline 接线（源码级回归）', () => {
    * ⚠️⚠️ **真实缺陷**（用户报障 2026-09-30）：「这个插件中支持图片的模型
    * 发送不了图片」。
    *
-   * 根因：图片能力原先**只看本地兜底表**（全表只有 5 条 `cline-free/*`），
+   * 根因：图片能力原先**只看本地兜底表**（全表只有寥寥几条 `cline-free/*`），
    * 于是 `cline-pass/*` 一律被播报成纯文本 ⇒ DSH 根本不把图片送进来。
    * 修复后补上 models.dev 这一级（见 `src/cline-modalities.ts`）。
    *
@@ -1085,7 +1086,7 @@ describe('Cline 接线（源码级回归）', () => {
     // ③ 图片能力随之播报 —— DSH 据此才会把图片送进适配器
     expect(byId.get('cline-pass/kimi-k2.7-code')?.inputModalities).toEqual(['text', 'image'])
     // ④ 本地兜底表的策展条目不受影响
-    expect(byId.get('cline-free/gemini-3.8-flash')?.inputModalities).toEqual(['text', 'image'])
+    expect(byId.get('cline-free/mimo-v2.6-flash')?.inputModalities).toEqual(['text', 'image'])
   })
 
   it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {
@@ -1104,7 +1105,7 @@ describe('Cline 接线（源码级回归）', () => {
  * （审查发现的死代码）。
  *
  * `mergeClineModels` 会**无条件**把兜底表并进 `models`（这是展示需要 —— 目录服务
- * 抖动时用户的模型列表不该整个消失），实测两个端点全挂时 `models.length` 仍是 5。
+ * 抖动时用户的模型列表不该整个消失），实测两个端点全挂时 `models.length` 仍等于兜底表条数。
  * 故 `if (models.length === 0) return false` 永远不命中 ⇒ 冷却永不触发，
  * 兜底表被当成远端结果永久缓存（`if (this.remoteModels !== undefined) return` 短路），
  * 网络恢复后也不会重拉，只能重启 DSH。
