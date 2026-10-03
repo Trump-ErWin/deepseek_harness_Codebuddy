@@ -72,7 +72,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { basename, isAbsolute, join, posix } from 'node:path'
 
 /** 阿里云 captcha 配置（服务端下发；此处为实测兜底值）。 */
 export interface ZcodeCaptchaConfig {
@@ -196,31 +196,30 @@ export function validateCaptchaParam(param: unknown): { ok: boolean; reason?: st
 }
 
 /**
- * 浏览器可执行文件的候选位置（按优先级）。
+ * macOS 的 app bundle → `Contents/MacOS/` 下的可执行文件名。
  *
- * ## ⚠ 两个必须防的坑（都实测踩过）
- *
- * ### 1. 空环境变量会产生**相对路径**
- *
- * `join('', 'Google', 'Chrome', …)` 返回 `Google\Chrome\…` —— 一个**相对路径**，
- * `existsSync` 会相对**当前工作目录**解析。于是「当前目录下恰好有个同名文件」
- * 会被误判成浏览器，而真正的浏览器却找不到。
- *
- * ⇒ 只接受**绝对路径**候选（`isAbsolute` 过滤）。
- *
- * ### 2. `USERPROFILE` 不等于家目录
- *
- * scoop 的安装位置在 `~/.scoop` 或 `~/scoop` 下，而 `~` 应当用
- * `os.homedir()` 求（它还会看 `HOME`，且在 `USERPROFILE` 被改写时仍正确）。
- * 用 `process.env.USERPROFILE` 拼路径会在「环境变量异常/被沙箱改写」时失效 ——
- * 实测：把 `USERPROFILE` 指到沙箱后，原本可用的 scoop chromium 就找不到了。
+ * ⚠️ **顺序即优先级**：Chrome → Chromium → Edge → Brave，与 Windows 候选链
+ * （Chrome → Chromium → Edge）**同序**追加 —— 别把 Edge/Brave 提到 Chrome 前面
+ * （同 {@link browserCandidates} 的 ①②③ 编号口径）。
+ * ⚠️ `Microsoft Edge` / `Brave Browser` **不带扩展名**：macOS 的 app bundle
+ * 内部就是这个名字，与 Windows 的 `msedge.exe` / `brave.exe` 不同。
  */
-export function findBrowserExecutable(): string | undefined {
-  const localAppData = process.env.LOCALAPPDATA ?? ''
-  const programFiles = process.env.PROGRAMFILES ?? ''
-  const programFilesX86 = process.env['PROGRAMFILES(X86)'] ?? ''
-  const home = homedir()
-  const candidates = [
+const MAC_BROWSER_BUNDLES: ReadonlyArray<readonly [bundle: string, exe: string]> = [
+  ['Google Chrome.app', 'Google Chrome'],
+  ['Chromium.app', 'Chromium'],
+  ['Microsoft Edge.app', 'Microsoft Edge'],
+  ['Brave Browser.app', 'Brave Browser'],
+]
+
+/** Windows 候选链（逐字保留自重构前，⚠️ 改这里等于动本仓库绝大多数用户）。 */
+function windowsBrowserCandidates(
+  env: Record<string, string | undefined>,
+  home: string,
+): string[] {
+  const localAppData = env.LOCALAPPDATA ?? ''
+  const programFiles = env.PROGRAMFILES ?? ''
+  const programFilesX86 = env['PROGRAMFILES(X86)'] ?? ''
+  return [
     /**
      * ① scoop 的 **显式声明的**根目录优先于默认推导。
      *
@@ -228,11 +227,11 @@ export function findBrowserExecutable(): string | undefined {
      * 用户设了它们就说明默认路径不对。若排在 `~/scoop` 之后，会出现
      * 「旧默认路径恰好存在 → 用它，而用户实际在用的那个被忽略」。
      */
-    ...(process.env.SCOOP !== undefined && process.env.SCOOP.trim().length > 0
-      ? [join(process.env.SCOOP.trim(), 'apps', 'chromium', 'current', 'chrome.exe')]
+    ...(env.SCOOP !== undefined && env.SCOOP.trim().length > 0
+      ? [join(env.SCOOP.trim(), 'apps', 'chromium', 'current', 'chrome.exe')]
       : []),
-    ...(process.env.SCOOP_GLOBAL !== undefined && process.env.SCOOP_GLOBAL.trim().length > 0
-      ? [join(process.env.SCOOP_GLOBAL.trim(), 'apps', 'chromium', 'current', 'chrome.exe')]
+    ...(env.SCOOP_GLOBAL !== undefined && env.SCOOP_GLOBAL.trim().length > 0
+      ? [join(env.SCOOP_GLOBAL.trim(), 'apps', 'chromium', 'current', 'chrome.exe')]
       : []),
     // ② scoop 默认根目录（`~/scoop`）。实测可用。
     join(home, 'scoop', 'apps', 'chromium', 'current', 'chrome.exe'),
@@ -248,15 +247,89 @@ export function findBrowserExecutable(): string | undefined {
     join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
     join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
   ]
-  const override = process.env.ZCODE_CHROME_PATH
+}
+
+/**
+ * macOS 候选链：每个浏览器先找 `/Applications`，再找 `~/Applications`
+ * （Mac 上把 app 拖进「应用程序」文件夹会装到后者，而**两者都是常规位置**）。
+ *
+ * ⚠⚠ **必须用 `posix.join`，不能用 `join`**（真实缺陷，2026-10-03，Gitee issue IKJKNT）。
+ *
+ * `join` 按**宿主**平台选分隔符：本仓库的 CI 与绝大多数开发机是 Windows，
+ * 在那里执行本函数会拼出 `/Applications\Google Chrome.app\Contents\MacOS\…`
+ * —— 在真机 macOS 上完全正常（那里 `join` 就是 `posix.join`），
+ * 但这意味着**整条 darwin 分支在 Windows 上不可测、CI 永远测不到**。
+ * 显式 `posix.join` 与 mac 上的行为逐字一致，同时让本分支可被单测锁死。
+ * 回归用例见 `tests/unit/zcode-browser-macos.spec.ts` 的「一个反斜杠都没有」。
+ */
+function macBrowserCandidates(home: string): string[] {
+  const roots = ['/Applications', posix.join(home, 'Applications')]
+  const candidates: string[] = []
+  for (const [bundle, exe] of MAC_BROWSER_BUNDLES) {
+    for (const root of roots) {
+      candidates.push(posix.join(root, bundle, 'Contents', 'MacOS', exe))
+    }
+  }
+  return candidates
+}
+
+/**
+ * 浏览器可执行文件的**候选链**（按优先级，`ZCODE_CHROME_PATH` 恒排第一）。
+ *
+ * ## 为什么抽成**纯函数**
+ *
+ * 候选链按平台分叉后，**macOS 分支在本仓库的 Windows CI 上一次都执行不到** ——
+ * 直接写在 `findBrowserExecutable()` 里，这条路径会永远「静默通过」，
+ * 直到用户报障（issue IKJKNT 就是这么来的）。抽出来后 darwin 分支是
+ * 纯字符串计算，可在任何平台断言。
+ *
+ * 三个入参都可注入，正是为了这个：`platform` 定分支、`env` 造 scoop /
+ * `ZCODE_CHROME_PATH`、`home` 造 `~/Applications`。
+ *
+ * ## ⚠ 两个必须防的坑（都实测踩过）
+ *
+ * ### 1. 空环境变量会产生**相对路径**
+ *
+ * `join('', 'Google', 'Chrome', …)` 返回 `Google\Chrome\…` —— 一个**相对路径**，
+ * `existsSync` 会相对**当前工作目录**解析。于是「当前目录下恰好有个同名文件」
+ * 会被误判成浏览器，而真正的浏览器却找不到。
+ *
+ * ⇒ {@link findBrowserExecutable} 只接受**绝对路径**候选（`isAbsolute` 过滤）。
+ *
+ * ### 2. `USERPROFILE` 不等于家目录
+ *
+ * scoop 的安装位置在 `~/.scoop` 或 `~/scoop` 下，而 `~` 应当用
+ * `os.homedir()` 求（它还会看 `HOME`，且在 `USERPROFILE` 被改写时仍正确）。
+ * 用 `process.env.USERPROFILE` 拼路径会在「环境变量异常/被沙箱改写」时失效 ——
+ * 实测：把 `USERPROFILE` 指到沙箱后，原本可用的 scoop chromium 就找不到了。
+ */
+export function browserCandidates(
+  input: {
+    platform?: NodeJS.Platform
+    env?: Record<string, string | undefined>
+    home?: string
+  } = {},
+): string[] {
+  const platform = input.platform ?? process.platform
+  const env = input.env ?? process.env
+  const home = input.home ?? homedir()
+  const candidates = platform === 'darwin'
+    ? macBrowserCandidates(home)
+    : windowsBrowserCandidates(env, home)
+  const override = env.ZCODE_CHROME_PATH
   if (typeof override === 'string' && override.trim().length > 0) {
     candidates.unshift(override.trim())
   }
-  for (const candidate of candidates) {
+  return candidates
+}
+
+/** 在候选链里挑第一个**存在**的绝对路径。 */
+export function findBrowserExecutable(): string | undefined {
+  for (const candidate of browserCandidates()) {
     try {
       /**
        * ⚠ 只接受**绝对路径**：空环境变量产生的相对路径会相对 CWD 解析，
-       * 可能误匹配同名本地文件（见函数头第 1 条）。
+       * 可能误匹配同名本地文件（见 {@link browserCandidates} 的坑 1）。
        */
       if (candidate.length === 0 || !isAbsolute(candidate)) continue
       if (existsSync(candidate)) return candidate
@@ -265,6 +338,55 @@ export function findBrowserExecutable(): string | undefined {
     }
   }
   return undefined
+}
+
+/**
+ * 找不到浏览器时的**用户可执行提示**（按平台说人话）。
+ *
+ * ## 为什么必须分平台（Gitee issue IKJKNT）
+ *
+ * 修复前是单一口径：「已尝试 scoop chromium / Chrome / Chromium / Edge；
+ * 可用 ZCODE_CHROME_PATH 显式指定 **chrome.exe** 路径。」
+ * —— macOS 上 **scoop 根本不存在**、`chrome.exe` 也不是那个文件名
+ * （见 {@link MAC_BROWSER_BUNDLES}），用户照着提示做只会更懵。
+ * 回归用例见 `tests/unit/zcode-browser-macos.spec.ts`。
+ */
+export function browserNotFoundMessage(platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'darwin') {
+    return '已尝试 /Applications 与 ~/Applications 下的 Google Chrome / Chromium / Microsoft Edge / Brave；' +
+      '可用 ZCODE_CHROME_PATH 显式指定可执行文件路径' +
+      '（如 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome）。'
+  }
+  if (platform === 'win32') {
+    return '已尝试 scoop chromium / Chrome / Chromium / Edge；' +
+      '可用 ZCODE_CHROME_PATH 显式指定 chrome.exe 路径。'
+  }
+  return '已尝试 Chrome / Chromium / Edge 的常见安装位置；' +
+    '可用 ZCODE_CHROME_PATH 显式指定可执行文件路径。'
+}
+
+/**
+ * 该可执行文件是否是**系统 Edge**（候选链的最后几档）。
+ *
+ * ## 为什么单独抽成纯函数
+ * 「实际用了哪个浏览器」需要被**告警**（issue IKJLB1 的期望行为 2：
+ * 用户不知道系统在拿 Edge 兜底）。告警条件必须可测，故不留在 `launch()` 里。
+ *
+ * ⚠️ 判据是**文件名**（不区分大小写），而不是路径里搜 `Edge`：
+ * 前者对 `…\Microsoft\Edge\Application\msedge.exe`、scoop 布局、
+ * macOS 的 `…/Microsoft Edge.app/Contents/MacOS/Microsoft Edge` 以及
+ * 用户经 `ZCODE_CHROME_PATH` 指向的 Edge 副本都成立；
+ * 后者会把路径中恰好含 "Edge" 字样的第三方 chromium 误报成系统 Edge。
+ *
+ * ⚠⚠ **macOS 那个名字是同型缺陷的修复**（2026-10-03，issue IKJKNT）：
+ * 原判据只认 `msedge.exe`，而 macOS 包内二进制叫 **`Microsoft Edge`**
+ * （无扩展名）⇒ Mac 用户落到 Edge 兜底时**一声不吭**，与 IKJLB1
+ * 的期望行为 2 直接冲突。补这个别名时别把判据改成 `includes('edge')`
+ * —— 那会把 `Brave Browser` 之类的路径误伤。
+ */
+export function isEdgeExecutable(executable: string): boolean {
+  const name = basename(executable).toLowerCase()
+  return name === 'msedge.exe' || name === 'microsoft edge'
 }
 
 /** 极简 CDP 客户端（用 Node 内置 WebSocket，**零第三方依赖**）。 */
@@ -617,6 +739,17 @@ export interface ZcodeCaptchaBrowserOptions {
    * **两个都不来**，于是永久挂起（且因为不抛错，`pageBusy` 也不会复位）。
    */
   connectTimeoutMs?: number
+  /**
+   * 诊断输出（可选，缺省静默）。
+   *
+   * ⚠ 只用于**说明性**信息，目前只有一条：实际落到系统 Edge 兜底时告警
+   * （Gitee issue IKJLB1 的期望行为 2 —— 此前 Edge 是被静默选中的，
+   * 用户既不知道用了哪个浏览器，也不知道该去哪换）。
+   *
+   * ⚠ 形参与 `src/captcha-carrier.ts` 的 `CaptchaCarrierDeps.log` 一致，
+   * 由 `zcode-auth.ts` 传 `ctx.logger` 进来；**不给也不影响功能**。
+   */
+  log?: (message: string) => void
 }
 
 /**
@@ -995,8 +1128,20 @@ export class ZcodeCaptchaBrowser {
    * 故用该标志把取页串行化（并发调用排队，而不是拿到同一个页面）。
    */
   private pageBusy = false
+  /** 诊断输出（见 {@link ZcodeCaptchaBrowserOptions.log}），缺省 undefined = 静默。 */
+  private readonly log: ((message: string) => void) | undefined
+  /**
+   * 浏览器**起不来 / 自己没了**的可读原因（由 `launch()` 里的
+   * `'error'` / `'exit'` 监听写入，见该处注释）。
+   *
+   * `undefined` = 一切正常。轮询循环每轮检查它，命中即立刻失败 ——
+   * 否则「浏览器秒退」要白等满 `readyTimeoutMs`（默认 30 秒）才报错。
+   */
+  private spawnFailure: Error | undefined
 
-  constructor(private readonly options: ZcodeCaptchaBrowserOptions = {}) {}
+  constructor(private readonly options: ZcodeCaptchaBrowserOptions = {}) {
+    this.log = options.log
+  }
 
   /** 浏览器是否已就绪。 */
   get ready(): boolean {
@@ -1020,12 +1165,43 @@ export class ZcodeCaptchaBrowser {
   private async launch(): Promise<void> {
     const executable = this.options.executablePath ?? findBrowserExecutable()
     if (executable === undefined) {
+      /**
+       * ⚠ 文案按平台生成（2026-10-03，issue IKJKNT）：原先是单一口径
+       * 「已尝试 scoop chromium / Chrome / Chromium / Edge；用 ZCODE_CHROME_PATH
+       * 显式指定 chrome.exe 路径」—— 在 macOS 上 scoop 不存在、`chrome.exe`
+       * 也不是那个文件名，Mac 用户照着做只会更懵。口径见 {@link browserNotFoundMessage}。
+       */
       throw new Error(
         'zcode: 找不到可用的浏览器（用于产出阿里云 captcha）。' +
-          '已尝试 scoop chromium / Chrome / Chromium / Edge；' +
-          '可用 ZCODE_CHROME_PATH 显式指定 chrome.exe 路径。',
+          browserNotFoundMessage(),
       )
     }
+
+    /**
+     * ★ **Edge 兜底必须出声**（Gitee issue IKJLB1 的期望行为 2）。
+     *
+     * 候选链里 Edge 排最后（见 {@link findBrowserExecutable} 的 ⑤），于是
+     * **没装 Chrome/Chromium 的机器上它是唯一可选项** —— 而这是国内 Windows
+     * 的常见状态。原先它被**静默**选中：用户既不知道用的是哪个浏览器，
+     * 也不知道该去哪换，于是只能靠翻崩溃日志反推。
+     *
+     * ⚠️ 只在**确实落到 Edge** 时告警：装了 Chrome/Chromium 的用户不受打扰。
+     * ⚠️ 判断用文件名（`msedge.exe`）而不是 `includes('Edge')` ——
+     * 前者对路径里的 `Microsoft\Edge\` 与 scoop 布局都成立，且不会把
+     * `ZCODE_CHROME_PATH` 指向的第三方 chromium 误报成 Edge。
+     */
+    if (isEdgeExecutable(executable)) {
+      this.log?.(
+        '[jet-hub] zcode captcha 未检测到 Chrome/Chromium，改用系统 Edge（msedge.exe）产出 —— ' +
+        '若 Edge 异常导致 captcha 失败，可安装 Chrome/Chromium 或用 ZCODE_CHROME_PATH 指定其它浏览器。',
+      )
+    }
+
+    /**
+     * 每次 `launch()` 都是一次全新的尝试：上一次的失败原因必须清掉，
+     * 否则上一轮「浏览器起不来」会让后续**所有**轮次秒失败。
+     */
+    this.spawnFailure = undefined
 
     this.profileDir = mkdtempSync(join(tmpdir(), 'zcode-captcha-'))
     /**
@@ -1077,10 +1253,80 @@ export class ZcodeCaptchaBrowser {
       detached: process.platform !== 'win32',
     })
 
+    /**
+     * ★★ **必须监听 `error` 与 `exit`**（真实缺陷，2026-10-03，Gitee issue IKJLB1）
+     *
+     * ## 为什么这是**能杀掉整个宿主**的缺陷（不是「浏览器崩了」的泛泛之谈）
+     *
+     * `ChildProcess` 是 EventEmitter，而 **`'error'` 事件在没有监听器时会被
+     * `throw` 成未捕获异常**。实测（`spawn` 一个不存在的绝对路径、且不注册
+     * `error`）：
+     *
+     * ```
+     * Error: spawn …\msedge.exe ENOENT
+     *   throw er; // Unhandled 'error' event
+     * → 进程立刻退出，exit code = 1
+     * ```
+     *
+     * 插件是通过 `ctx.plugin()` 跑在 **dsh desktop host 进程内**的，而
+     * `cordis` 没有装 `uncaughtException` / `unhandledRejection` 处理器 ⇒
+     * 插件侧的未捕获异常会**直接终止 host**；Electron main 收到 `close`
+     * 回调（`app.asar/lib/main.js:3724` 打印 `dsh desktop host exited with …`）
+     * 便弹出宿主级错误框。
+     *
+     * ⚠️ **触发条件是「起不来」而非「崩溃」**：`exit` 事件有监听器时不会抛，
+     * 所以浏览器**运行中崩溃**只会被静默吞掉（实测：父进程存活、exit code 0）。
+     * 真正致命的是 spawn 阶段的 `ENOENT` / `EACCES` / `EPERM` —— 也就是
+     * 「候选链选中的那个 exe 存在但打不开」（权限、被占用、文件损坏、
+     * Edge 正在自我更新等）。
+     *
+     * ⚠️ 同仓库 `src/qoder-machine.ts` 的 `child.once('error', …)` 是现成范式
+     * —— 证明这里此前是**遗漏**而非有意。
+     */
+    const child = this.child
+    child.once('error', (error: Error) => {
+      /**
+       * ⚠️ 存起来**而不是就地抛**：此刻 `launch()` 还在下面的轮询循环里，
+       * 直接抛会变成「循环外的 promise rejection」，而 `start()` 仍会等满
+       * `readyTimeoutMs` 才返回。存下来让循环**下一轮立刻**失败（见下）。
+       */
+      this.spawnFailure = new Error(
+        `zcode: 浏览器无法启动（${executable}）：${error.message}` +
+        '。可安装 Chrome/Chromium，或用 ZCODE_CHROME_PATH 指定其它 chromium 内核浏览器。',
+      )
+    })
+    child.once('exit', (code, signal) => {
+      /**
+       * 判据是「`this.child` 还是不是它」——因为 `killProcessTree()` 会先把
+       * `this.child` 置空，故**主动停机**（`dispose()` / 轮询超时 / 端口错配）
+       * 走到这里时 `this.child !== child`，只有**浏览器自己没了**才等于。
+       * ⇒ 不需要额外的 `stopping` 标志，也不会把正常清理误报成崩溃。
+       */
+      if (this.child !== child) return
+      this.child = undefined
+      const how = signal !== null && signal !== undefined
+        ? `signal=${signal}`
+        : `code=${String(code)}`
+      this.spawnFailure ??= new Error(
+        `zcode: 浏览器进程异常退出（${executable}，${how}）` +
+        '。请重试，或用 ZCODE_CHROME_PATH 指定其它 chromium 内核浏览器。',
+      )
+    })
+
     const timeoutMs = this.options.readyTimeoutMs ?? 30_000
     const deadline = Date.now() + timeoutMs
     let debuggerUrl: string | undefined
     while (Date.now() < deadline) {
+      /**
+       * ⚠️ **每轮先看 `spawnFailure`**：浏览器起不来 / 秒退时立刻失败，
+       * 而不是白等满 `readyTimeoutMs`（默认 30 秒）才报一个含糊的「超时」。
+       * 旧实现的用户体感就是「签到卡住半分钟然后失败」—— 根因就在这里。
+       */
+      if (this.spawnFailure !== undefined) {
+        const failure = this.spawnFailure
+        this.kill()
+        throw failure
+      }
       try {
         const response = await fetch(`http://127.0.0.1:${this.port}/json/version`, {
           signal: AbortSignal.timeout(2_000),
@@ -1099,7 +1345,12 @@ export class ZcodeCaptchaBrowser {
     }
     if (debuggerUrl === undefined) {
       this.kill()
-      throw new Error(`zcode: 浏览器调试端口未就绪（${timeoutMs}ms 超时）`)
+      /**
+       * ⚠️ 走到这里若 `spawnFailure` 已就位，优先抛它 ——
+       * 「浏览器起不来」比「端口没就绪」更贴近根因，用户才知道该换浏览器。
+       */
+      throw this.spawnFailure
+        ?? new Error(`zcode: 浏览器调试端口未就绪（${timeoutMs}ms 超时）`)
     }
     /**
      * ★ **确认应答的确实是我们启动的那个浏览器**（防「连到旧实例」）。
