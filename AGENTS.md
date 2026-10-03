@@ -5647,6 +5647,79 @@ mode  = CFB, padding = NoPadding
 因为 `100002 params_invalid_error: param phone invalid` **无法区分**
 「号码格式错」与「该区号不支持」，不做未验证的猜测。
 
+### 11. ⚠️ `tags` 里的 `vision` **不是**图片能力契约（真实缺陷，用户 2026-10-03 报障）
+
+**症状**：给 `sn-deepseek-v4-1-flash`（DeepSeek-V4.1-Flash）发图，模型回
+「无法读取图片 / 不支持图片」。
+
+⚠️ **根因不是配置写错，而是「信息在源头就不存在」** —— 远端**从未下发**模态字段：
+
+穷举 `model_catalog` 9 个条目的**键并集**：顶层 14 个键、`params` **只有**
+`context_window` 与 `max_tokens`；用
+`/modal|vision|image|img|multimodal|media|type|capab|support|input|output/i`
+扫描，**命中 0 个**。⇒ 唯一的信号是 `tags`，而它被实测证伪。
+
+**根因链（每一步都是「静默」）：**
+
+1. `normalizeRemoteModel` 把「`tags` 含 `vision`」当成服务端能力声明；
+2. `sn-deepseek-v4-1-flash` 的 `tags` 是
+   `["general","code","html","analysis","reasoning","auto"]` —— **没有** `vision`
+   （`display_description` 也只写「通用对话、代码开发、复杂分析」，不提图像识别）；
+3. ⇒ `inputModalities` 播报 `['text']`；
+4. ⇒ ⚠️ **DSH 在 `LlmRuntime` 里把图片替换成文本占位符**
+   （`dsh-llm/lib/index.js` 的 `projectImagesForTextModel`，产出
+   `[image omitted because this model accepts text only; attachment sha256:…]`）
+   —— **图片根本没发出去**，请求体里压根没有图片；
+5. ⇒ 用户看到模型说「读不到图」，而端点其实完全正常。
+
+⚠️ **判据是「模型真的读得出来吗」，不是「远端怎么说」**（同 Qoder 那条
+「IDE 能否用同一模型」）。实测：同一张**随机 6 位数字**图（模型无法猜）打
+`POST /api/web/llm/v2/chat/completions`：
+
+| 模型 | 远端 tags 含 vision | 实测读图 |
+|---|---|---|
+| `sn-deepseek-v4-1-flash` | ❌ | ✅ **5/5**（208063/942977/999889/123015/478368） |
+| `sn-glm-5-3-flash` | ❌ | ✅ 1/1 |
+| `sn-sensenova-6-8-flash` | ✅ | ✅ 2/2 |
+| `sn-sensenova-6-8-flash-lite` | ✅ | ✅ 1/1 |
+| `sn-kimi-k3` | ✅ | ✅ 1/1 |
+| `sn-glm-5-3` | ✅ | ⚠️ **1/3**（provider 侧节点不一致，见下） |
+
+⇒ **6 个可见模型全部能读图**。`tags` 的真实用途是**客户端「Raccoon-Auto 选模」的
+偏好标签**（`TASK_TAG_PATTERNS` 给消息打 vision 标记后挑一个带 `vision` 的模型），
+它回答的是「该模型适不适合处理这类任务」，**不是**「能不能吃图」。
+
+**修法**（与 `buddy-adapter.ts` 的 `IMAGE_CAPABILITY_OVERRIDES` 同构）：
+`RACCOON_IMAGE_CAPABILITY_OVERRIDES` 白名单 + `raccoonSupportsImage(id, tags)`，
+**两条路径都要改** —— 远端解析（`raccoon-auth.ts`）与本地兜底表（`raccoon-product.ts`）。
+⚠️ 兜底表与远端判定是**两个真相源**，用单测「兜底表的图片能力与远端实测 tags 判定
+逐条一致」锁死，防它们悄悄分叉（同 Qoder「两处等待逻辑必须共用同一实现」的教训）。
+
+⚠️ **别改成「该家恒支持图片」**：白名单只覆盖**实测确认**的个案，将来上架纯文本
+模型时，恒 true 会把图放行、让上游回一个更难懂的 400 —— 错误更晚、更难排查。
+
+⚠️ **实测时的两个坑**（否则会得到假的「不支持」）：
+
+1. **必须关思考**，否则 `reasoning_tokens` 吃光 `max_tokens`、正文恒为空
+   （首轮 64 token 全被 `reasoning_tokens: 64` 吃掉 → 6 个模型全部「失败」）。
+   唯一有效通道是 `extra_body.thinking:{type:'disabled'}`（见本文档
+   `RACCOON_EFFORT_*` 段）；
+2. **`sn-glm-5-3-flash` 会 400 拒绝该参数**（「该模型始终思考，不支持关闭思考；
+   请使用 low、high 或 max」）—— 测它时**不能**发 `thinking`，需另跑一轮。
+
+⚠️ **`sn-glm-5-3` 节点不一致是 provider 侧缺陷，不归我们**：3 次只对 1 次，两次回
+「当前模型不支持图片或视频输入」/「未收到任何图片」。错误体暴露网关有 3 个
+fallback 组（`raccoon-4eb26a` / `raccoon-0c119c` / `raccoon-ecc5fd`），
+**部分节点是纯文本的**。它本来就带 `vision` 标签、我们一直在发图，
+**本次修复不改变它的行为** —— 遇到时换模型即可，别改我们的声明。
+
+排查脚本（只读、gitignored）：`scripts/probe-raccoon-vision.mjs`（打远端原始
+条目）、`scripts/probe-raccoon-vision-real.mjs`（真实发图，支持 `PROBE_MODELS`
+与 `NO_THINKING=1`）、`scripts/probe-raccoon-catalog-fields.mjs`（穷举键并集）。
+回归用例在 `tests/unit/raccoon-product.spec.ts` 的「图片能力判定（tags 不是能力
+契约）」段与 `tests/unit/raccoon-adapter.spec.ts` 的两条 ⚠️ 用例。
+⚠️ 已做**反向验证**：白名单清空 → 4 条变红；兜底表改回 `false` → 2 条变红。
+
 ### e2e 探针
 
 ```
