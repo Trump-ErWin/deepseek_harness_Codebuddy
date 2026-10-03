@@ -4,14 +4,18 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import {
+  ACCOUNT_TEST_CAPABILITIES,
   CREDITS_CAPABILITIES,
   PERMANENT_LOCK_EXPIRING_WINDOW_DAYS,
+  RATE_LIMIT_CAPABILITIES,
   checkinProviders,
   permanentLockCopy,
+  supportsAccountTest,
   supportsCreditBalance,
   supportsDailyCheckin,
   supportsOnboardingTasks,
   supportsPermanentLock,
+  supportsRateLimit,
   supportsSubscriptionQuota,
 } from '../../plugin-src/client/credits-capabilities.js'
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
@@ -211,6 +215,98 @@ describe('积分能力矩阵', () => {
       expect(CREDITS_CAPABILITIES, `缺少 ${id} 的能力登记`).toHaveProperty(id)
     }
     expect(Object.keys(CREDITS_CAPABILITIES).sort()).toEqual([...providerIds].sort())
+  })
+})
+
+/**
+ * ⚠️ **模型限流按钮门控**（Gemini 报障，2026-10-03）。
+ *
+ * 用户原话：「重测按钮你确认过会发请求吗，为什么响应这么快？可以移除吗」。
+ * 取证结论：当时该账号条目**没有 `modelRateLimits` 标记**，
+ * `retestAccount` 在 `modelIds.length === 0` 处提前返回 ⇒ 一次请求都没发，
+ * 所以「响应快」。但这不代表按钮无害：Gemini 的限流是**服务端配额窗口制**
+ * （5 小时窗口 + 周窗口），本地标记清掉、重测通过，配额一点没恢复 ——
+ * 「重测」只会白烧本就紧张的窗口配额，「重置」只会把受限账号放回池里再撞 429。
+ * 故与 Loomy 同处登记 `false`（**理由不同**，见
+ * {@link RATE_LIMIT_CAPABILITIES} 的注释）。
+ */
+describe('模型限流按钮门控（重测 / 重置）', () => {
+  it('gemini 显式登记为「限流不由这组按钮管辖」', () => {
+    expect(RATE_LIMIT_CAPABILITIES.gemini?.rateLimit).toBe(false)
+    expect(supportsRateLimit('gemini')).toBe(false)
+  })
+
+  it('未登记的 provider 仍默认视为有限流（不得因新增登记而收紧默认值）', () => {
+    // 反例：任何未登记的 id 都必须保持 true，否则将来新增 provider 漏登记时
+    // 老用户会凭空失去「重测 / 重置」按钮 —— 那是可见的功能回退。
+    expect(supportsRateLimit('codearts')).toBe(true)
+    expect(supportsRateLimit('zcode')).toBe(true)
+    expect(supportsRateLimit('不存在的 provider')).toBe(true)
+  })
+
+  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好两个）', () => {
+    const disabled = Object.entries(RATE_LIMIT_CAPABILITIES)
+      .filter(([, caps]) => caps.rateLimit === false)
+      .map(([id]) => id)
+      .sort()
+    // loomy：根本不返回限流错误；gemini：限流是服务端配额窗口制。
+    expect(disabled).toEqual(['gemini', 'loomy'])
+  })
+
+  it('客户端源码里按钮仍走 supportsRateLimit 门控（不是在本文件另写白名单）', () => {
+    // 与 loomy-client.spec.ts 同源断言，这里补上「不得复辟硬编码 provider 判断」。
+    const codeLines = readClientSource()
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(codeLines).toContain('showRateLimitActions: supportsRateLimit(provider)')
+    expect(codeLines).not.toMatch(/showRateLimitActions:\s*provider\s*!==/)
+  })
+})
+
+/**
+ * ⚠️ **「测试」按钮的能力门控**（用户 m03338：「增加测试按钮，真实的发一次请求」）。
+ *
+ * 与「重测」的硬性区别是**触发条件**：重测只测已有 `modelRateLimits` 标记的
+ * 模型，没有标记时零请求；测试不看标记、无条件真发一次。因此两者必须用
+ * **独立**的能力位与 props 开关 —— 当前 Gemini 恰好只登记测试、没登记重测，
+ * 若绑在同一个开关上就会二选一地消失一个按钮。
+ */
+describe('账号「测试」按钮门控', () => {
+  it('gemini 登记为支持测试', () => {
+    expect(ACCOUNT_TEST_CAPABILITIES.gemini?.test).toBe(true)
+    expect(supportsAccountTest('gemini')).toBe(true)
+  })
+
+  it('未登记的 provider 一律不渲染（默认关闭，与限流表相反）', () => {
+    // ⚠️ 默认必须是 false：这是**全新**按钮，没有存量用户，未验证的渠道不该出现。
+    expect(supportsAccountTest('codearts')).toBe(false)
+    expect(supportsAccountTest('zcode')).toBe(false)
+    expect(supportsAccountTest('loomy')).toBe(false)
+    expect(supportsAccountTest('不存在的 provider')).toBe(false)
+  })
+
+  it('客户端源码里「测试」走独立开关，不挂在 showRateLimitActions 上', () => {
+    const codeLines = readClientSource()
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(codeLines).toContain('onTest: supportsAccountTest(provider)')
+    // 反例：把测试绑到限流开关上会让 Gemini 拿不到按钮（它登记的是 false）。
+    expect(codeLines).not.toMatch(/onTest:\s*showRateLimitActions/)
+    expect(codeLines).not.toMatch(/onTest:\s*supportsRateLimit/)
+  })
+
+  it('「测试」的结果汇总与「重测」分开写（响应结构不同）', () => {
+    // account.test 返回扁平 { modelId, ok, message }，没有 accounts/clearedCount。
+    // 若拿它去喂 summarizeProbe，会得到「没有可重测的限流标记」——
+    // 把「测试失败」误报成「没什么可测的」。
+    const codeLines = readClientSource()
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(codeLines).toContain('function summarizeTest(res)')
+    expect(codeLines).toContain('summarizeTest(res)')
   })
 })
 
