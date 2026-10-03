@@ -169,6 +169,9 @@ describe('模型 id 严格校验（未知 id 必须拒绝，不得静默落回 3
       expect(thrown, `id "${bad}" 应被拒绝`).toBeInstanceOf(LlmError)
       expect((thrown as LlmError).failure.code).toBe('INVALID_REQUEST')
       expect((thrown as LlmError).message).toContain(bad === '' ? '""' : bad)
+      // ⚠️ 必须带 404：网关只读 `failure.status`（顶层没有 status），缺了它
+      // 模型名写错会以 502 离开网关并被 OpenAI 客户端反复重试（白耗额度）。
+      expect((thrown as LlmError).failure.status).toBe(404)
     }
   })
 
