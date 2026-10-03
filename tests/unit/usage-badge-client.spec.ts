@@ -584,3 +584,36 @@ describe('格式化函数下沉（徽标与设置页共用同一口径）', () =
     expect(hub).toContain('export function providerLabel(id)')
   })
 })
+
+/**
+ * ⚠️ 单位归一的**两侧口径一致**（真实缺陷，2026-10-03）。
+ *
+ * 宿主把逐账号余额折算成订阅读数（`src/badge-subscription.ts` 的 `unitOf`），
+ * 客户端把逐账号余额分组求和（`credits-format.js` 的 `normalizeUnit`）。两处都
+ * 要把 `credit` / `credits` / 空串收敛掉，否则「套餐按一个单位、余额按另一个」
+ * 会在同一枚徽标里自相矛盾。
+ *
+ * ⚠️ 客户端代码不能 import 宿主代码（esbuild 的客户端 bundle 没有 Node 依赖），
+ * 故只能各写一份 —— 这个用例就是那份「必须逐字等价」的契约。
+ */
+describe('单位归一：宿主与客户端同一口径', () => {
+  /** 抽样要覆盖真实服务端下发过的拼法（逐包实测，见 probe-workbuddy-units.mjs）。 */
+  const SAMPLES = ['credit', 'credits', 'Credit', 'CREDITS', '', 'USD', '积分', '通道', 'token', 'Token', 'TOKEN']
+
+  it('normalizeCreditUnit（宿主）与 normalizeUnit（客户端）逐项一致', async () => {
+    const { normalizeCreditUnit } = await import('../../src/credits.js')
+    const { normalizeUnit } = await import('../../plugin-src/client/credits-format.js')
+    for (const unit of SAMPLES) {
+      expect(normalizeUnit(unit), unit).toBe(normalizeCreditUnit(unit))
+    }
+  })
+
+  it('只有 token 单独成类，其余一律归为 credit（与 unitLabel「积分」同源）', async () => {
+    const { normalizeUnit, unitLabel } = await import('../../plugin-src/client/credits-format.js')
+    for (const unit of SAMPLES) {
+      expect(normalizeUnit(unit), unit).toBe(unit === 'token' ? 'token' : 'credit')
+      // 归一到 credit 的单位，展示名必须是「积分」，且**只有一种**写法
+      expect(unitLabel(normalizeUnit(unit)), unit).toBe(unit === 'token' ? 'Token' : '积分')
+    }
+  })
+})
