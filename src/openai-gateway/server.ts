@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -9,6 +10,14 @@ import { toGenerateOptions, OpenAiGatewayError, parseModelRoute, normalizeReason
 import type { AttachmentBridge, ImageLimits } from './images.js'
 import { collectGatewayModelIds, collectGatewayModels, toOpenAiModels } from './models.js'
 import { findCaseInsensitiveSuggestion, looksLikeMissingModel } from './model-errors.js'
+import {
+  collectResponsesResult,
+  responsesMaxOutputTokens,
+  responsesReasoningEffort,
+  toResponsesGenerateOptions,
+  toResponsesSse,
+  type OpenAiResponsesRequest,
+} from './responses.js'
 import { collectOpenAiCompletion, failureToOpenAiError, toOpenAiSse } from './stream.js'
 
 export interface GatewayLogger {
@@ -193,45 +202,28 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
     return modelIdsHint
   }
 
-  const handleChat = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+  /**
+   * 两个端点共用的「请求生命周期」外壳：绑定取消、统一错误翻译。
+   *
+   * ⚠️ **必须共用**：`/v1/chat/completions` 与 `/v1/responses` 的错误出口若各写
+   * 一遍，迟早出现「同一个错误在一个 URL 上回 404、在另一个上回 502」——
+   * 而 502 会被客户端当可重试故障白耗额度，这正是当初引入 404 翻译要修的问题。
+   */
+  const withRequest = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+    run: (signal: AbortSignal) => Promise<void>,
+  ): Promise<void> => {
     const controller = new AbortController()
     active.add(controller)
     const abort = () => controller.abort()
-    request.once('aborted', abort)
-    response.once('close', () => {
+    const onClose = () => {
       if (!response.writableEnded) controller.abort()
-    })
+    }
+    request.once('aborted', abort)
+    response.once('close', onClose)
     try {
-      const body = await readJson(request, controller.signal)
-      const route = parseModelRoute(body.model)
-      const modelInfo = await resolveModelInfo(route, controller.signal)
-      const reasoningEffort = normalizeReasoningEffort(body.reasoning_effort, modelInfo, route.provider, route.model)
-      const requestedMaxTokens = body.max_completion_tokens ?? body.max_tokens
-      const maxTokens = typeof requestedMaxTokens === 'number'
-        ? normalizeMaxTokens(requestedMaxTokens, route.provider, route.model)
-        : undefined
-      const generate = await toGenerateOptions(body, controller.signal, reasoningEffort, maxTokens, {
-        bridge: options.attachments,
-        limits: options.imageLimits,
-      })
-      const stream = options.llm.stream(generate)
-      const fullId = `${route.provider}/${route.model}`
-      if (body.stream === true) {
-        response.writeHead(200, {
-          'content-type': 'text/event-stream; charset=utf-8',
-          'cache-control': 'no-cache, no-transform',
-          connection: 'keep-alive',
-          'access-control-allow-origin': '*',
-        })
-        for await (const event of toOpenAiSse(stream, undefined, fullId, makeSuggestion(fullId))) {
-          if (controller.signal.aborted || response.destroyed) break
-          response.write(event)
-        }
-        if (!response.writableEnded) response.end()
-      } else {
-        const result = await collectOpenAiCompletion(stream, undefined, fullId, makeSuggestion(fullId))
-        jsonResponse(response, 200, result)
-      }
+      await run(controller.signal)
     } catch (error) {
       if (!response.headersSent && !response.destroyed) {
         const converted = failureToOpenAiError(error)
@@ -239,8 +231,89 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       }
     } finally {
       request.removeListener('aborted', abort)
+      response.removeListener('close', onClose)
       active.delete(controller)
     }
+  }
+
+  /** SSE 响应头（两个端点的流式出口一致）。 */
+  const writeSseHead = (response: ServerResponse): void => {
+    response.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'access-control-allow-origin': '*',
+    })
+  }
+
+  const handleChat = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+    await withRequest(request, response, async (signal) => {
+      const body = await readJson(request, signal)
+      const route = parseModelRoute(body.model)
+      const modelInfo = await resolveModelInfo(route, signal)
+      const reasoningEffort = normalizeReasoningEffort(body.reasoning_effort, modelInfo, route.provider, route.model)
+      const requestedMaxTokens = body.max_completion_tokens ?? body.max_tokens
+      const maxTokens = typeof requestedMaxTokens === 'number'
+        ? normalizeMaxTokens(requestedMaxTokens, route.provider, route.model)
+        : undefined
+      const generate = await toGenerateOptions(body, signal, reasoningEffort, maxTokens, {
+        bridge: options.attachments,
+        limits: options.imageLimits,
+      })
+      const stream = options.llm.stream(generate)
+      const fullId = `${route.provider}/${route.model}`
+      if (body.stream === true) {
+        writeSseHead(response)
+        for await (const event of toOpenAiSse(stream, undefined, fullId, makeSuggestion(fullId))) {
+          if (signal.aborted || response.destroyed) break
+          response.write(event)
+        }
+        if (!response.writableEnded) response.end()
+      } else {
+        const result = await collectOpenAiCompletion(stream, undefined, fullId, makeSuggestion(fullId))
+        jsonResponse(response, 200, result)
+      }
+    })
+  }
+
+  /**
+   * `POST /v1/responses`（OpenAI Responses API）。
+   *
+   * 与 `handleChat` 的差别**只在协议外壳**：模型路由、思考档位归一化、输出预算
+   * 钳制（`normalizeMaxTokens`）、纠错建议、取消与错误翻译全部同源 —— 换了个
+   * URL 就换了套行为是最难排查的一类缺陷。
+   */
+  const handleResponses = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+    await withRequest(request, response, async (signal) => {
+      const body = await readJson(request, signal) as OpenAiResponsesRequest
+      const route = parseModelRoute(body.model)
+      const modelInfo = await resolveModelInfo(route, signal)
+      const reasoningEffort = normalizeReasoningEffort(responsesReasoningEffort(body), modelInfo, route.provider, route.model)
+      const requestedMaxTokens = responsesMaxOutputTokens(body)
+      const maxTokens = requestedMaxTokens === undefined
+        ? undefined
+        : normalizeMaxTokens(requestedMaxTokens, route.provider, route.model)
+      const generate = await toResponsesGenerateOptions(body, signal, reasoningEffort, maxTokens, {
+        bridge: options.attachments,
+        limits: options.imageLimits,
+      })
+      const stream = options.llm.stream(generate)
+      const fullId = `${route.provider}/${route.model}`
+      // 响应 id 由网关生成：本网关**无状态**，这个 id 只用于客户端关联，
+      // 不能拿它回来查（`GET /v1/responses/{id}` 一律 404）。
+      const responseId = `resp_${randomUUID().replaceAll('-', '')}`
+      if (body.stream === true) {
+        writeSseHead(response)
+        for await (const event of toResponsesSse(stream, responseId, fullId, body, makeSuggestion(fullId))) {
+          if (signal.aborted || response.destroyed) break
+          response.write(event)
+        }
+        if (!response.writableEnded) response.end()
+      } else {
+        const result = await collectResponsesResult(stream, responseId, fullId, body, makeSuggestion(fullId))
+        jsonResponse(response, 200, result)
+      }
+    })
   }
 
   const requestHandler = (request: IncomingMessage, response: ServerResponse): void => {
@@ -262,12 +335,12 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       void handleModels(response).catch(error => jsonResponse(response, 502, { error: { message: String(error), type: 'server_error', code: 'model_list_failed' } }))
       return
     }
-    if (path === '/v1/chat/completions' && request.method === 'POST') {
+    if ((path === '/v1/chat/completions' || path === '/v1/responses') && request.method === 'POST') {
       if (!request.headers['content-type']?.toLowerCase().startsWith('application/json')) {
         jsonResponse(response, 415, { error: { message: 'Content-Type must be application/json', type: 'invalid_request_error', code: 'invalid_content_type' } })
         return
       }
-      void handleChat(request, response)
+      void (path === '/v1/responses' ? handleResponses(request, response) : handleChat(request, response))
       return
     }
     jsonResponse(response, 404, { error: { message: 'Not found', type: 'invalid_request_error', code: 'not_found' } })

@@ -7279,3 +7279,75 @@ JS，里面的 JSDoc 写反引号没问题 —— 但**从它们复制片段进 
 ⚠️ 实测数值（无头浏览器，比较 `getBoundingClientRect` 的渲染宽度与自然宽度 ——
 不能用 clientWidth / scrollWidth，两者会四舍五入）：带角标后 193.56px → **202.19px**，
 名字与读数都不出省略号，仍在 216px 上限内。
+## ⚠️ 本机 OpenAI 网关：两个协议端点**同时可用**，不要做「格式开关」（2026-10-03）
+
+出口在 `src/openai-gateway/`，对外两个端点：
+
+```text
+POST /v1/chat/completions   ← OpenAI Chat Completions（`server.ts` + `messages.ts` + `stream.ts`）
+POST /v1/responses          ← OpenAI Responses API（`responses.ts`）
+GET  /v1/models             ← 两套协议共用同一份目录
+```
+
+⚠️ **用户 2026-10-03 的决定：加 Responses API，但明确否掉了「格式切换开关」** ——
+两个端点**始终都在**，客户端用哪套协议由它请求的 URL 决定。互斥开关只会让「另一个
+协议的客户端在切换后突然失效」，而网关侧面本来就没有互斥的理由。
+
+⚠️ **凡是两套协议共有的东西，只允许有一份实现**（各写一份必然漂移，且漂移的症状是
+「同一件事在 /v1/chat/completions 对、在 /v1/responses 错」这种极难归因的差异）：
+
+| 关注点 | 唯一实现 | 谁在用 |
+|---|---|---|
+| 图片入站（data URL → 附件 → `ImageBlock`） | `messages.ts` 的 `partsFromContent` | 两个端点（Responses 先经 `chatPartsFromResponses` 改写外壳） |
+| 纯文本提取 / 「工具结果不能带图」 | `messages.ts` 的 `textFromContent` | 同上 |
+| 工具 schema 校验 | `messages.ts` 的 `convertTools` | Responses 先经 `toChatTools` 把**扁平**工具写成 Chat 的嵌套形状 |
+| 输出预算校验 + 钳制 | `tokenValue` / `normalizeMaxTokens` | `max_tokens` 与 `max_output_tokens` 走同一判据 |
+| 思考档位归一化（三态） | `normalizeReasoningEffort` | `reasoning_effort` 与 `reasoning.effort` |
+| 取消、错误翻译、CORS、SSE 头 | `server.ts` 的 `withRequest` / `writeSseHead` | 两个端点 |
+
+⚠️ 改这些共享件时**必须同时想两个端点**：`openai-gateway-server.spec.ts` 的
+「Responses API 出口」段里有几条**跨端点**用例（钳制、404 翻译、鉴权）专门锁这件事。
+
+### 两处与 Chat 端点**有意不同**（改 `responses.ts` 前先读文件头）
+
+1. **文本以 `block-end` 的组装块为权威**（`finalText`）。DSH 的正文死循环截断与泄漏
+   清洗**只在 `block-end` 上生效**（`openai-compat.ts` / `buddy-adapter.ts` 的注释、
+   `scripts/verify-blockend-override.ts`）。Chat 端点只累加 delta，触发死循环时会把重复
+   正文交给客户端；Responses 端点取 `block-end`。⚠️ **不要去「顺手统一」Chat 端点** ——
+   那会改动一个已被线上流量验证过的端点，属于本次任务之外的越界重构（与
+   `openai-compat.ts` 那条「只服务 qoder」的约定同因）。
+2. **失败事件的 `error.code` 只放官方枚举值**（`server_error` / `rate_limit_exceeded`）。
+   Responses 的 `Response.error.code` 在官方 SDK 里是 **Literal 枚举**，把 DSH 的内部码
+   （`SERVER` / `QUOTA_EXCEEDED` / `incomplete_stream`）塞进去，客户端会在**解析失败事件**
+   时抛校验错误 —— 用户看到「客户端崩了」，而真实原因是上游错误。
+   精确码放 `error.dsh_code`、本该返回的 HTTP 状态放 `error.status`（Chat 端点的 SSE 错误
+   帧里也有同名字段，口径一致）。
+
+### 明确**报 400** 的字段（不静默忽略）
+
+`previous_response_id`（网关无状态、不存响应，`GET /v1/responses/{id}` 一律 404）、
+`background`、`text.format`（DSH 没有结构化输出通道，**不假装**按 schema 约束）、
+非 1 的 `top_p`（`GenerateOptions` 没有 topP）、`item_reference`、非 `function` 工具、
+`input_image.file_id`。
+**接受但忽略**：`store` / `include` / `prompt_cache_key` / `metadata` / `user` /
+`truncation` / `service_tier` / `safety_identifier` / `parallel_tool_calls`。
+⚠️ 判据是「**语义会不会变**」：会变的必须报错（否则用户以为设置生效了），
+不会变的（无状态转发下本就无处安放）接受即可。
+
+### 其它必须记住的点
+
+- **连续的 assistant item 必须合并成一条消息**（`toMessages`）：Responses 把「助手说
+  一句话」与「助手发起工具调用」拆成两个 item，照 item 一一映射会让**每个用过工具的
+  会话**都给上游留下两条连续 assistant 消息 —— Anthropic 系适配器要求 user/assistant
+  交替，这类历史会被上游拒绝。
+- **`function_call` 的 item 延迟到第一帧 delta 才打开**：`call_id` / `name` 只出现在
+  delta 里，而 `output_item.added` 必须带上它们，否则客户端配不上 call_id。
+- **`block-end` 的块必须能被单独收下**（无 delta 时也要建项）：Chat 端点会整段丢掉它，
+  Responses 端点按块内容补齐一个完整项（用例「只发 block-end 的块不会被丢掉」）。
+- **不发 `data: [DONE]`**：那是 Chat Completions 的收尾约定，Responses 以
+  `response.completed` / `response.failed` 结束。
+- 面板（`openai-gateway-panel.js` 的 `gatewayStatusLines`）在**运行中**时会说明
+  「同一地址同时提供两种协议」——⚠️ 措辞必须是「同时提供」，**不能写「可切换」**
+  （用例会红）。
+- 回归用例：`tests/unit/openai-gateway-responses.spec.ts`（转换 + 流式/非流式事件序列）
+  与 `tests/unit/openai-gateway-server.spec.ts` 的「Responses API 出口」段（HTTP 层）。
