@@ -175,10 +175,16 @@ $key = (Get-Content "$env:USERPROFILE\.dsh\openai-gateway\api-key" -Raw).Trim()
   `function_call_output`、`input_image`（内联 base64 data URL，走**与 Chat 端点同一份**
   附件入站）、`reasoning`（**刻意丢弃**：它承载的是上游加密的思考内容，网关没有可回放的等价物）。
 - **`instructions`** → DSH 的 system 消息。
-- **`tools`**：**扁平**（Responses 原生）与**嵌套**（Chat 形状）两种写法都认，但只支持
-  `function` 类型；`web_search` / `file_search` / `computer_use` / `mcp` 一律明确报错
-  （网关没有这些执行体，静默丢弃会让模型永远等不到工具结果）。
-- `tool_choice`（`auto` / `none`）、`max_output_tokens`（与 Chat 端点**同一份**钳制规则）、
+- **`tools`**：`function`（**扁平**（Responses 原生）与**嵌套**（Chat 形状）两种写法都认）、
+  以及 Codex 0.142+ 的 **`namespace`** 分组容器 —— namespace 只是把相关工具分个组，
+  里面的 function 子工具会被**摊平**成 `<namespace>__<child>` 交给模型（包括标了
+  `defer_loading` 的），返回调用时再**还原**成 `{name, namespace}`（Codex 的工具表按
+  `(namespace, name)` 索引，只回扁平名它会认为「模型调了个不存在的工具」）。
+  见下「Codex 的 namespace 工具」。
+  **无法表达的其它类型**（`custom` / `tool_search` / `web_search` / `file_search` /
+  `computer_use` / `mcp`）会被**丢弃并在日志里记一条 warning** —— **不会**让你整轮对话失败。
+- `tool_choice`（`auto` / `none`；`{type:'namespace'}` 降级为 `auto`）、
+  `max_output_tokens`（与 Chat 端点**同一份**钳制规则）、
   `temperature`、`reasoning.effort`（与 Chat 端点**同一份**档位归一化）。
 - 流式与非流式。流式事件顺序与官方一致：
   `response.created` → `response.output_item.added` / `response.output_text.delta` /
@@ -188,9 +194,31 @@ $key = (Get-Content "$env:USERPROFILE\.dsh\openai-gateway\api-key" -Raw).Trim()
   ⚠️ **不发 `data: [DONE]`** —— 那是 Chat Completions 的收尾约定，Responses 的流以
   `response.completed` 结束。
 
+#### Codex 的 namespace 工具（真实报障修复，2026-10-03）
+
+Codex App / CLI 0.142+ 用私有的 Responses 扩展声明工具：
+
+```json
+{ "type": "namespace", "name": "mcp__files__", "description": "…",
+  "tools": [ { "type": "function", "name": "read", "parameters": {…} } ] }
+```
+
+`namespace` 对上游来说只是**分组**，真正的可调用工具是里面的 function。网关把它摊平成
+`mcp__files____read`（`<namespace>__<child>`；超 64 字符时截断 + 8 位哈希后缀，避免长名字
+碰撞），并在返回 `function_call` 时还原：
+
+```json
+{ "type": "function_call", "call_id": "call_1", "name": "read", "namespace": "mcp__files__", "arguments": "…" }
+```
+
+⚠️ 摊平前网关对 `namespace` / `custom` 是**直接回 400**，症状是 Codex 整轮对话都跑不起来
+（`tool type namespace is not supported（网关只提供 function 工具）`）—— 「一个工具类型不认识」
+的代价不该是「整个会话不可用」，故现在改成摊平或丢弃 + 记 warning。同款处理在
+cc-switch / sub2api / Codex 自身（PR #29602）里也是这么做的。
+
 **明确报 400**（不静默忽略，免得用户以为设置生效了）：`previous_response_id`
 （网关无状态、不保存响应）、`background`、`text.format`（DSH 没有结构化输出通道，
-不假装按 schema 约束）、非 1 的 `top_p`、`item_reference`、非 `function` 类型工具。
+不假装按 schema 约束）、非 1 的 `top_p`、`item_reference`。
 
 **接受但忽略**（网关是无状态转发）：`store` / `include` / `prompt_cache_key` /
 `metadata` / `user` / `truncation` / `service_tier` / `safety_identifier` /

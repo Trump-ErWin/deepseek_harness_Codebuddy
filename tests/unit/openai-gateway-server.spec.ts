@@ -475,4 +475,41 @@ describe('Responses API 出口', () => {
       await gateway.close()
     }
   })
+
+  /**
+   * **真实报障回归**（2026-10-03）：Codex App 接网关后整轮对话失败
+   * `tool type namespace is not supported（网关只提供 function 工具）`。
+   * namespace 只是分组容器 ⇒ 摊平即可；表达不了的（custom / tool_search）
+   * 只丢弃 + 记日志，**绝不能**让请求失败。
+   */
+  it('★ Codex 的 namespace / custom / tool_search 工具：回 200，子工具摊平后到达上游', async () => {
+    const port = await freePort()
+    let seenTools: unknown
+    const captureLlm = {
+      ...llm,
+      stream: (options: { tools?: unknown; signal?: AbortSignal }) => {
+        seenTools = options.tools
+        return responseStream(options.signal)
+      },
+    }
+    const gateway = createOpenAiGateway({ llm: captureLlm, env: ENV(port) })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: {
+          model: 'qoder/qfmodel',
+          input: 'hello',
+          tools: [
+            { type: 'namespace', name: 'mcp__files__', tools: [{ type: 'function', name: 'read', parameters: {} }] },
+            { type: 'custom', name: 'apply_patch' },
+            { type: 'tool_search' },
+          ],
+        },
+      })
+      expect(result.status).toBe(200)
+      expect(seenTools).toEqual([{ name: 'mcp__files____read', description: '', parameters: {} }])
+    } finally {
+      await gateway.close()
+    }
+  })
 })

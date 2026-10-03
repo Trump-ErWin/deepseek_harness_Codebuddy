@@ -3,7 +3,9 @@ import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { OpenAiGatewayError } from '../../src/openai-gateway/messages.js'
 import {
   collectResponsesResult,
+  flatNamespaceToolName,
   responsesMaxOutputTokens,
+  responsesNamespaceToolMap,
   responsesReasoningEffort,
   toResponsesGenerateOptions,
   toResponsesSse,
@@ -152,7 +154,6 @@ describe('Responses API 请求转换', () => {
       ['text.format', { model: 'qoder/qfmodel', input: 'hi', text: { format: { type: 'json_schema' } } }],
       ['top_p', { model: 'qoder/qfmodel', input: 'hi', top_p: 0.5 }],
       ['item_reference', { model: 'qoder/qfmodel', input: [{ type: 'item_reference', id: 'msg_1' }] }],
-      ['web_search 工具', { model: 'qoder/qfmodel', input: 'hi', tools: [{ type: 'web_search' }] }],
       ['file_id 图片', { model: 'qoder/qfmodel', input: [{ type: 'message', role: 'user', content: [{ type: 'input_image', file_id: 'file-1' }] }] }],
       ['tool_choice required', { model: 'qoder/qfmodel', input: 'hi', tool_choice: 'required' }],
       ['input 为空', { model: 'qoder/qfmodel', input: [] }],
@@ -167,6 +168,114 @@ describe('Responses API 请求转换', () => {
     await expect(toResponsesGenerateOptions({
       model: 'qoder/qfmodel', input: 'hi', text: { format: { type: 'text' }, verbosity: 'low' },
     }, abort())).resolves.toBeTruthy()
+  })
+
+  /**
+   * Codex 0.142+ 的工具声明形状（**真实报障，2026-10-03**）。
+   *
+   * 报障原文：`tool type namespace is not supported（网关只提供 function 工具）`
+   * —— 代价是**整轮对话不可用**，而 namespace 只是**分组容器**，里面的 function
+   * 完全可以表达给模型。故这里锁死「摊平 + 响应侧还原 + 表达不了的丢弃」三条。
+   */
+  it('★ namespace 工具必须摊平（不是报错）：子工具以 <namespace>__<child> 声明给上游', async () => {
+    const dropped: string[] = []
+    const options = await toResponsesGenerateOptions({
+      model: 'qoder/qfmodel',
+      input: 'hi',
+      tools: [
+        { type: 'function', name: 'plain_tool', parameters: {} },
+        {
+          type: 'namespace',
+          name: 'mcp__files__',
+          description: '文件相关',
+          tools: [
+            { type: 'function', name: 'read', description: '读文件', parameters: { type: 'object' } },
+            { type: 'function', name: 'write', parameters: {} },
+            // `defer_loading`（延迟加载，本应由 tool_search 搜出来）：那套机制我们
+            // 表达不了，**照样摊平**给模型 —— 否则工具等于凭空消失。
+            { type: 'function', name: 'deferred', parameters: {}, defer_loading: true },
+            // namespace 里的非 function 子工具（如 custom）无法表达 ⇒ 丢弃 + 上报。
+            { type: 'custom', name: 'apply_patch' },
+          ],
+        },
+      ],
+    }, abort(), undefined, undefined, {}, (tool) => dropped.push(`${tool.type}/${tool.name}`))
+
+    expect(options.tools?.map(tool => tool.name)).toEqual([
+      'plain_tool',
+      'mcp__files____read',
+      'mcp__files____write',
+      'mcp__files____deferred',
+    ])
+    expect(options.tools?.[1]).toEqual({
+      name: 'mcp__files____read', description: '读文件', parameters: { type: 'object' },
+    })
+    expect(dropped).toEqual(['custom/apply_patch'])
+  })
+
+  it('★ 顶层无法表达的工具类型：丢弃 + 上报，绝不 400（否则 Codex 整轮失败）', async () => {
+    const dropped: string[] = []
+    const options = await toResponsesGenerateOptions({
+      model: 'qoder/qfmodel',
+      input: 'hi',
+      tools: [
+        { type: 'tool_search' },
+        { type: 'custom', name: 'apply_patch', format: { type: 'grammar' } },
+        { type: 'web_search' },
+        { type: 'function', name: 'shell', parameters: {} },
+      ],
+    }, abort(), undefined, undefined, {}, (tool) => dropped.push(tool.type))
+    expect(options.tools?.map(tool => tool.name)).toEqual(['shell'])
+    expect(dropped).toEqual(['tool_search', 'custom', 'web_search'])
+  })
+
+  it('tool_choice 为 namespace 时降级成 auto（而不是让整轮 400）', async () => {
+    const options = await toResponsesGenerateOptions({
+      model: 'qoder/qfmodel',
+      input: 'hi',
+      tool_choice: { type: 'namespace', name: 'mcp__files__' },
+      tools: [{ type: 'namespace', name: 'mcp__files__', tools: [{ type: 'function', name: 'read', parameters: {} }] }],
+    }, abort())
+    // DSH 只认 auto/none：降级后模型仍能从已摊平的工具里挑（cc-switch / sub2api 同款）。
+    expect(options.tools?.map(tool => tool.name)).toEqual(['mcp__files____read'])
+  })
+
+  it('扁平名确定性：两侧各自算也一致，超 64 字符时截断且不碰撞', () => {
+    expect(flatNamespaceToolName('mcp__files__', 'read')).toBe('mcp__files____read')
+    // 请求侧摊平与响应侧还原是两次独立计算，必须逐字符一致。
+    const map = responsesNamespaceToolMap({
+      tools: [{
+        type: 'namespace',
+        name: 'mcp__files__',
+        tools: [{ type: 'function', name: 'read', parameters: {} }],
+      }],
+    })
+    expect(map.get(flatNamespaceToolName('mcp__files__', 'read'))).toEqual({
+      namespace: 'mcp__files__', name: 'read',
+    })
+
+    const longA = 'a'.repeat(80)
+    const longB = `${'a'.repeat(79)}b`
+    const flatA = flatNamespaceToolName('ns', longA)
+    const flatB = flatNamespaceToolName('ns', longB)
+    expect(flatA.length).toBeLessThanOrEqual(64)
+    expect(flatB.length).toBeLessThanOrEqual(64)
+    // 纯截断会让这两个长名字撞在一起 —— 8 位哈希后缀就是为了防这个。
+    expect(flatA).not.toBe(flatB)
+  })
+
+  it('历史里带 namespace 的 function_call 必须换回扁平名（否则上游认为调了个没见过的工具）', async () => {
+    const options = await toResponsesGenerateOptions({
+      model: 'qoder/qfmodel',
+      input: [
+        { type: 'message', role: 'user', content: '读一下' },
+        { type: 'function_call', call_id: 'call-1', name: 'read', namespace: 'mcp__files__', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call-1', output: '内容' },
+      ],
+    }, abort())
+    expect(options.messages[1].content).toContainEqual(expect.objectContaining({
+      type: 'tool-call', id: 'call-1', name: 'mcp__files____read',
+    }))
   })
 })
 
@@ -235,6 +344,28 @@ describe('Responses API 输出（非流式）', () => {
     expect(output[0]).toMatchObject({
       type: 'function_call', status: 'completed', call_id: 'call-1', name: 'read', arguments: '{"path":"a"}',
     })
+  })
+
+  it('★ namespace 工具的调用要还原成 {name, namespace}（Codex 按 (namespace, name) 索引工具）', async () => {
+    const nsRequest: OpenAiResponsesRequest = {
+      model: 'qoder/qfmodel',
+      input: 'hi',
+      tools: [{
+        type: 'namespace',
+        name: 'mcp__files__',
+        tools: [{ type: 'function', name: 'read', parameters: {} }],
+      }],
+    }
+    const result = await collectResponsesResult(chunks([
+      { type: 'tool-call-delta', index: 0, id: 'call-1' as never, name: 'mcp__files____read', argumentsDelta: '{"path":"a"}' },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]), 'resp_ns', 'qoder/qfmodel', nsRequest)
+    const output = result.output as Array<Record<string, any>>
+    // ⚠️ 只回扁平名 `mcp__files____read` 的话，Codex 会认为「模型调了一个不存在的工具」。
+    expect(output[0]).toMatchObject({
+      type: 'function_call', call_id: 'call-1', name: 'read', namespace: 'mcp__files__',
+    })
+    expect(JSON.stringify(result)).not.toContain('mcp__files____read')
   })
 
   it('模型只给了思考：output 里出现 reasoning 项（summary_text）而不是丢失', async () => {
@@ -340,6 +471,31 @@ describe('Responses API 输出（流式）', () => {
     const completed = events.at(-1)!.data.response
     expect(completed.status).toBe('completed')
     expect(completed.output[0]).toMatchObject({ type: 'function_call', call_id: 'call-9', name: 'read' })
+  })
+
+  it('★ 流式：namespace 工具的三个 function_call 事件都要还原（added / arguments.done / done）', async () => {
+    const nsRequest: OpenAiResponsesRequest = {
+      model: 'qoder/qfmodel',
+      input: 'hi',
+      tools: [{
+        type: 'namespace',
+        name: 'mcp__files__',
+        tools: [{ type: 'function', name: 'read', parameters: {} }],
+      }],
+    }
+    const events = await readSse(chunks([
+      { type: 'tool-call-delta', index: 0, id: 'call-1' as never, name: 'mcp__files____read', argumentsDelta: '{}' },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]), nsRequest)
+
+    const added = events.find(event => event.event === 'response.output_item.added')!.data.item
+    expect(added).toMatchObject({ name: 'read', namespace: 'mcp__files__' })
+    const argsDone = events.find(event => event.event === 'response.function_call_arguments.done')!.data
+    expect(argsDone).toMatchObject({ name: 'read', namespace: 'mcp__files__' })
+    const itemDone = events.find(event => event.event === 'response.output_item.done')!.data.item
+    expect(itemDone).toMatchObject({ name: 'read', namespace: 'mcp__files__' })
+    // 扁平名是对上游的中间表示，绝不能漏给客户端。
+    expect(events.map(event => JSON.stringify(event.data)).join('')).not.toContain('mcp__files____read')
   })
 
   it('上游在流里报错：以 response.failed 收尾（HTTP 已经 200，状态码改不了）', async () => {
