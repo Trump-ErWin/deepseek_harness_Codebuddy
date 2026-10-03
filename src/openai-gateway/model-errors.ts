@@ -52,6 +52,46 @@ export function looksLikeMissingModel(message: string): boolean {
 }
 
 /**
+ * 没有可用状态码时的兜底值。
+ *
+ * 502 而非 500：它在 OpenAI 客户端眼里明确是「服务端故障」⇒ **可重试**，
+ * 而 500 有时被当成「请求本身有问题」而不重试。
+ */
+export const GATEWAY_FALLBACK_STATUS = 502
+
+/**
+ * 把上游自带的状态码收敛成「可作为错误码透出」的值。
+ *
+ * ## ⚠️ 为什么必须有这个门禁（三处出口，缺一不可）
+ *
+ * 门禁是 `400 ≤ status ≤ 599`。**上下界都必要**：
+ *
+ * - **下界 400**：`src/llm-adapter.ts`（codearts）有**三处**故意用
+ *   `{ status: 200 }` 表示「HTTP 是 200，但流里的内容是业务失败」
+ *   （`QUOTA_EXCEEDED` / `BENEFIT_NOT_FOUND` / `INVALID_REQUEST`）。宿主
+ *   `normalizeLlmFailure` 只校验 `100 ≤ status ≤ 599`，**不过滤 2xx**，所以这个 200
+ *   会一路活到网关。一条**错误**帧里带 `"status": 200` 是自相矛盾的 ——
+ *   客户端若读 `error.status` 判成败，会把「额度用尽」读成成功。而在流式下
+ *   网关自己的 HTTP 状态改不了（流已发出 200），这个字段是**唯一的**错误信号载体。
+ * - **上界 599**：由宿主保证（`LlmError` 构造器与 `failureSnapshot` 都拒
+ *   100–599 之外的值），这里只是与下界对称、便于阅读。
+ *
+ * ⚠️ **这个函数存在的理由是消除重复**：修复前 `failureToOpenAiError` 与
+ * `collectOpenAiCompletion` 都有门禁，唯独 `toOpenAiSse` 漏了 —— 于是**同一条
+ * codearts 配额错误，走非流式得 502（对）、走流式得 200（错）**。
+ * 三处各写一遍判据就一定会再漂移一次，故收敛到这一个函数。
+ *
+ * ⚠️ 5xx 会**原样透出**（不归 502），这是刻意的：上游的 500/503/504 本就可重试，
+ * 原样透出比统一改成 502 更准。把「5xx 也不穿透」当修复会把 503 降级成 4xx 语义，
+ * 让本该重试的故障失去重试机会。
+ */
+export function upstreamStatusOrFallback(status: unknown): number {
+  return typeof status === 'number' && status >= 400 && status <= 599
+    ? status
+    : GATEWAY_FALLBACK_STATUS
+}
+
+/**
  * 把上游失败归一化成对客户端更准确的状态码。
  *
  * 非模型类失败**原样返回** —— 宁可保持 502 让客户端重试，也不要把它误标成

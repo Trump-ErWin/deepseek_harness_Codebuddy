@@ -518,6 +518,23 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
   const readRpc = (): string =>
     readFileSync(resolve(HERE, '../../src/jet-hub-rpc.ts'), 'utf8')
 
+  /** `registerJetHubRpc` 签名里的形参名，按声明顺序（去掉注释与 `?`）。 */
+  const registerJetHubRpcParams = (): string[] => {
+    const signature = /export function registerJetHubRpc\(([\s\S]*?)\n\): void/.exec(readRpc())
+    expect(signature?.[1], '应能取到 registerJetHubRpc 的签名').toBeDefined()
+    return (signature?.[1] ?? '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => /^\w+\??:/.test(line))
+      .map((line) => line.replace(/[?:].*$/, ''))
+  }
+
+  /** 客户端 `PROVIDERS` 表里的 provider id，按声明顺序。 */
+  const clientProviderIds = (): string[] => {
+    const block = /const PROVIDERS = Object\.freeze\(\[([\s\S]*?)\n\]\);/.exec(readClient('jet-hub.js'))
+    return [...(block?.[1] ?? '').matchAll(/id: '([^']+)'/g)].map((m) => m[1])
+  }
+
   it('★ account.create 有 zcode 分支（否则报 unknown provider）', () => {
     const source = readRpc()
     expect(source).toMatch(/else if \(provider === ZCODE\.id\) \{/)
@@ -558,6 +575,50 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
   it('index.ts 把 llm-zcode 加入 registerProviderSettings（老契约需要）', () => {
     const source = readFileSync(resolve(HERE, '../../src/index.ts'), 'utf8')
     expect(source).toMatch(/'llm-zcode'/)
+  })
+
+  /**
+   * ★ 派生式不变量：**客户端 PROVIDERS 的条数 == RPC 签名里的 provider 形参数**。
+   *
+   * ## 为什么要这条（已有的三处断言都不够）
+   *
+   * `zcode-rpc-login.spec.ts:521` 锁的是 `args.length === 16`、
+   * `minimax-rpc.spec.ts` / `gemini-rpc.spec.ts` 锁的是**末尾几个位置的名字** ——
+   * 全是**硬编码**。硬编码与硬编码会**一起漂移**：将来加了第 15 个 provider，
+   * 有人同步把 `16` 改成 `17`、把 `gemini` 后面补上名字，断言照样全绿，
+   * 但**中间**某个 provider 的位置已经错位（位置传参下错位 = 拿 A 的实例当 B 用）。
+   *
+   * 而本条把数字**从客户端 PROVIDERS 表派生**，于是「客户端多了一个面板、
+   * 服务端却没接线」这种真实故障无处可藏。
+   *
+   * ## 唯一的豁免：`opencode`
+   *
+   * 它的 RPC 由 `handleMethod` 统一分派到 `handleOpencodeRpc`，**不占形参位**
+   * （见 `src/index.ts` 的注册注释）。所以个数是 `N - 1`。
+   * ⚠️ 豁免本身必须被**验证**（见下面第二条断言），否则「少接了一个」与
+   * 「本来就该少一个」就分不开了。
+   */
+  it('★ RPC 形参个数由客户端 PROVIDERS 表派生（别用硬编码数字）', () => {
+    const params = registerJetHubRpcParams()
+    const clientIds = clientProviderIds()
+    expect(clientIds.length).toBe(14)
+    // 16 = ctx + pool + (14 - opencode) + modelAdapters
+    expect(params.length).toBe(clientIds.length + 2)
+    // 末两位必须是 gemini 与 modelAdapters（gemini 排在 provider 末尾位）。
+    expect(params.at(-1)).toBe('modelAdapters')
+    expect(params.at(-2)).toBe('gemini')
+  })
+
+  it('★ 唯一不占形参位的是 opencode（豁免被验证，不是被假设）', () => {
+    const params = registerJetHubRpcParams()
+    const clientIds = clientProviderIds()
+    // 客户端有它
+    expect(clientIds).toContain('opencode')
+    // 但 RPC 签名里没有它 —— 且**只有**它没有。
+    // ⚠️ 形参名 `qoderCn`（驼峰）对应客户端表里的 `qodercn`，故先过一遍别名表。
+    const alias: Readonly<Record<string, string>> = { qodercn: 'qoderCn' }
+    const withoutSlot = clientIds.filter((id) => !params.includes(alias[id] ?? id))
+    expect(withoutSlot).toEqual(['opencode'])
   })
 })
 
