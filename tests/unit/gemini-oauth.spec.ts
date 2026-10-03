@@ -1,11 +1,14 @@
 /**
  * Gemini OAuth 单测。
  *
- * 守的是原版踩过的三个坑：
+ * 守的是原版踩过的四个坑：
  * 1. token 端点**必须**带 `client_secret`（否则 `invalid_request`，症状是
  *    「浏览器授权成功但账号不出现」）；
  * 2. `state` 不匹配的回调必须拒绝；
- * 3. 续期响应里给了新 `refresh_token` 必须回写（Google 偶尔轮换）。
+ * 3. 续期响应里给了新 `refresh_token` 必须回写（Google 偶尔轮换）；
+ * 4. 身份**必须**优先取自令牌响应自带的 `id_token` —— 只靠 userinfo 那次
+ *    跨域请求时，它一失败（当时还静默吞异常）昵称就退化成池 id
+ *    （2026-10-03 报障 `gemini-6a53dbca`）。
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -19,12 +22,13 @@ import {
   exchangeGeminiCode,
   fetchGeminiUserInfo,
   geminiExpiryFrom,
+  geminiIdentityFromIdToken,
   parseGeminiTokenGrant,
   refreshGeminiCredential,
   revokeGeminiToken,
   startGeminiOAuthFlow,
 } from '../../src/gemini-oauth.js'
-import { parseGeminiCredential } from '../../src/gemini.js'
+import { geminiAccountLabel, parseGeminiCredential } from '../../src/gemini.js'
 
 const previousId = process.env.CMDC_PAK_GOOGLE_CLIENT_ID
 const previousSecret = process.env.CMDC_PAK_GOOGLE_CLIENT_SECRET
@@ -42,6 +46,11 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: { 'content-type': 'application/json' },
   })
+}
+
+/** 造一个未签名形态的 `id_token`（只做 base64url 编码，与服务端结构同形）。 */
+function idToken(payload: Record<string, unknown>): string {
+  return `hdr.${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}.sig`
 }
 
 /** 抓取 fetch 的调用参数（工厂按调用序号产出响应）。 */
@@ -116,6 +125,32 @@ describe('令牌解析', () => {
     expect(grant.token_type).toBe('Bearer')
     expect(grant.expires_in).toBe(3600)
   })
+
+  it('id_token 被保留（身份的第一来源，不再依赖 userinfo）', () => {
+    const token = idToken({ sub: 'sub-9', email: 'u@example.com' })
+    expect(parseGeminiTokenGrant({ access_token: 'AT', expires_in: 3600, id_token: token }).id_token)
+      .toBe(token)
+    // 缺席时不写该字段（避免把 undefined 混进落盘 JSON）。
+    expect('id_token' in parseGeminiTokenGrant({ access_token: 'AT', expires_in: 3600 })).toBe(false)
+  })
+})
+
+describe('id_token 解身份', () => {
+  it('取 sub 与 email（不验签，仅 base64url 解码）', () => {
+    expect(geminiIdentityFromIdToken(idToken({ sub: 's1', email: 'a@b.c', aud: 'x' })))
+      .toEqual({ sub: 's1', email: 'a@b.c' })
+  })
+
+  it('形态不对一律返回空对象（身份不该让授权失败）', () => {
+    expect(geminiIdentityFromIdToken('')).toEqual({})
+    expect(geminiIdentityFromIdToken('no-dots')).toEqual({})
+    expect(geminiIdentityFromIdToken('hdr.!!!not-base64!!!.sig')).toEqual({})
+    expect(geminiIdentityFromIdToken(`hdr.${Buffer.from('[1,2]').toString('base64url')}.sig`)).toEqual({})
+  })
+
+  it('空字符串字段被忽略（不回填空值）', () => {
+    expect(geminiIdentityFromIdToken(idToken({ sub: '', email: '' }))).toEqual({})
+  })
 })
 
 describe('凭据构造', () => {
@@ -140,6 +175,43 @@ describe('凭据构造', () => {
     })
     // 落盘再解析仍等价（凭据必须能被 parseGeminiCredential 读回）。
     expect(parseGeminiCredential(JSON.stringify(credential))).toEqual(credential)
+  })
+
+  it('id_token 优先于既有凭据，且不丢 refresh_token/project', () => {
+    const credential = credentialFromGeminiGrant(
+      {
+        access_token: 'AT',
+        token_type: 'Bearer',
+        expires_in: 3600,
+        id_token: idToken({ sub: 'sub-NEW', email: 'new@b.c' }),
+      },
+      { refresh_token: 'RT_OLD', sub: 'sub-OLD', email: 'old@b.c', cloudaicompanionProject: 'proj' },
+    )
+    expect(credential).toMatchObject({
+      access_token: 'AT',
+      refresh_token: 'RT_OLD',
+      sub: 'sub-NEW',
+      email: 'new@b.c',
+      cloudaicompanionProject: 'proj',
+    })
+    // 展示名因此可算（这就是 2026-10-03 报障的根因面）。
+    expect(geminiAccountLabel(credential)).toBe('new@b.c')
+  })
+
+  it('id_token 解不出身份时退到既有凭据（续期响应不带 id_token 的形态）', () => {
+    const credential = credentialFromGeminiGrant(
+      { access_token: 'AT', token_type: 'Bearer', expires_in: 3600, id_token: 'broken' },
+      { sub: 'sub-OLD', email: 'old@b.c' },
+    )
+    expect(credential.sub).toBe('sub-OLD')
+    expect(credential.email).toBe('old@b.c')
+  })
+
+  it('两者都没有时**不编造**身份（昵称回落到池 id 是唯一诚实行为）', () => {
+    const credential = credentialFromGeminiGrant({ access_token: 'AT', token_type: 'Bearer', expires_in: 3600 })
+    expect(credential.sub).toBeUndefined()
+    expect(credential.email).toBeUndefined()
+    expect(geminiAccountLabel(credential)).toBeUndefined()
   })
 })
 
@@ -202,6 +274,15 @@ describe('userinfo 与撤销', () => {
     expect(await fetchGeminiUserInfo('AT', { fetcher: boom })).toEqual({})
   })
 
+  it('失败原因经 onFailure 上报（曾经的静默吞异常让现场零线索）', async () => {
+    const reasons: string[] = []
+    const unauthorized = (async () => json({ error: 'x' }, 401)) as unknown as typeof fetch
+    await fetchGeminiUserInfo('AT', { fetcher: unauthorized, onFailure: (r) => reasons.push(r) })
+    const boom = (async () => { throw new Error('network down') }) as unknown as typeof fetch
+    await fetchGeminiUserInfo('AT', { fetcher: boom, onFailure: (r) => reasons.push(r) })
+    expect(reasons).toEqual(['userinfo 返回 HTTP 401', 'network down'])
+  })
+
   it('撤销失败不上抛（登出不能被网络问题卡住）', async () => {
     const boom = (async () => { throw new Error('network') }) as unknown as typeof fetch
     await expect(revokeGeminiToken('AT', { fetcher: boom })).resolves.toBeUndefined()
@@ -211,12 +292,12 @@ describe('userinfo 与撤销', () => {
 
 describe('两步式授权流程', () => {
   it('立即返回 loginUrl，回调携带正确 state 时完成交换', async () => {
-    const { fetcher } = captureFetch((index) => {
-      // 第 0 次是 token 交换，第 1 次是 userinfo。
-      return index === 0
-        ? json({ access_token: 'AT', refresh_token: 'RT', expires_in: 3600 })
-        : json({ id: 'sub-9', email: 'u@example.com' })
-    })
+    const { calls, fetcher } = captureFetch(json({
+      access_token: 'AT',
+      refresh_token: 'RT',
+      expires_in: 3600,
+      id_token: idToken({ sub: 'sub-9', email: 'u@example.com' }),
+    }))
     const started = await startGeminiOAuthFlow({ fetcher, callbackPort: 0 })
     try {
       const url = new URL(started.loginUrl)
@@ -237,9 +318,43 @@ describe('两步式授权流程', () => {
       expect(credential.sub).toBe('sub-9')
       expect(credential.email).toBe('u@example.com')
       expect(credential.expiry).toBeDefined()
+      // ⚠️ 身份来自 id_token ⇒ **只有一次请求**（token 交换），不再打 userinfo。
+      expect(calls.map((call) => call.url)).toEqual(['https://oauth2.googleapis.com/token'])
     } finally {
       await started.close()
       await started.close() // 幂等
+    }
+  })
+
+  it('id_token 缺席时才兜底 userinfo（第 1 次请求），且失败上报原因', async () => {
+    const { calls, fetcher } = captureFetch((index) => {
+      // 第 0 次是 token 交换（无 id_token），第 1 次是兜底 userinfo（失败）。
+      return index === 0
+        ? json({ access_token: 'AT', refresh_token: 'RT', expires_in: 3600 })
+        : json({ error: 'x' }, 401)
+    })
+    const reasons: string[] = []
+    const started = await startGeminiOAuthFlow({
+      fetcher,
+      callbackPort: 0,
+      onIdentityFailure: (reason) => reasons.push(reason),
+    })
+    try {
+      const url = new URL(started.loginUrl)
+      const state = url.searchParams.get('state') ?? ''
+      const redirect = new URL(url.searchParams.get('redirect_uri') ?? '')
+      await fetch(`http://127.0.0.1:${redirect.port}${GEMINI_CALLBACK_PATH}?code=CODE&state=${state}`)
+      const credential = await started.result
+      // 登录本身仍然成功，只是没有身份 —— 不能因此抛错。
+      expect(credential.access_token).toBe('AT')
+      expect(credential.sub).toBeUndefined()
+      expect(calls.map((call) => call.url)).toEqual([
+        'https://oauth2.googleapis.com/token',
+        'https://www.googleapis.com/oauth2/v2/userinfo',
+      ])
+      expect(reasons).toEqual(['userinfo 返回 HTTP 401'])
+    } finally {
+      await started.close()
     }
   })
 

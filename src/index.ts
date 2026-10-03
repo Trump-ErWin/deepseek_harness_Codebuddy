@@ -1465,6 +1465,22 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     ctx.logger.warn(`[jet-hub] 修正 LobsterAI 账号显示名失败：${String(error)}`)
   })
 
+  // 一次性修复**老 Gemini 账号**的展示名（同类，成因见 `gemini-auth.ts` 的
+  // `repairAccountNicknames`）：旧版本解析令牌响应时丢掉了 `id_token`，身份只剩
+  // userinfo 一次可静默失败的跨域请求，失败即让昵称退化成池 id（`gemini-6a53dbca`）。
+  // 光改代码只影响新登录的账号，故这里主动补一次。
+  //
+  // ⚠️ 幂等 + 失败不阻塞启动（`repairAccountNicknames` 内部逐账号 catch）。
+  void gemini.repairAccountNicknames(pool).then((repaired) => {
+    if (repaired.length > 0) {
+      ctx.logger.info(
+        `[jet-hub] 已修正 ${repaired.length} 个 Gemini 账号的显示名（改用 Google 账号邮箱）：${repaired.join(', ')}`,
+      )
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[jet-hub] 修正 Gemini 账号显示名失败：${String(error)}`)
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
