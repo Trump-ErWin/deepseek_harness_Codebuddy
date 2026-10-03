@@ -695,14 +695,21 @@ function UsageBadgeActive(props) {
   /**
    * 显示偏好：分段控件（本仓库无 `<select>` 先例，故用按钮组 + `aria-pressed`）。
    *
-   * 不再单占一行写「显示偏好」：三个标签（自动 / 优先订阅 / 优先积分）自带含义，
+   * 不再单占一行写「显示偏好」：三个标签（自动 / 优先订阅 / 只看积分）自带含义，
    * 容器的 title 里给出完整解释 —— 省一行而信息不丢。
+   *
+   * ⚠️ 三档不是「同一个轴的强弱」，而是**两条不同的轴**（2026-10-03 语义反转后）：
+   * `auto` 与 `credits` 都显示余额，但**只有 auto 会在没有余额读数时回落**到
+   * 窗口/套餐；`subscription` 干脆不看余额。标签名因此必须让用户看出
+   * 「只看积分」比「自动」更**强制**（旧名「优先积分」读起来像 auto 的同义词）。
    */
   function renderPreference() {
     return React.createElement('div', {
       key: 'pref',
       className: 'dim-jh-badgePref',
-      title: '显示偏好：决定徽标优先显示订阅还是积分（「优先积分」也是套餐判定不准时的兜底）',
+      // ⚠️ 三档的差别必须写清：auto 与 credits 在**有订阅时**表现不同
+      //（auto 会回落，credits 不回落到订阅）—— 只说「优先显示哪个」会让人以为两档一样。
+      title: '显示偏好：「自动」= 优先显示一共能用的余额（没有余额读数才显示订阅窗口/套餐）；「优先订阅」= 只看窗口与套餐；「只看积分」= 强制只显示余额，也是套餐判定不准时的兜底',
     }, [
       ...BADGE_PREFERENCES.map((item) => React.createElement('button', {
         key: item,

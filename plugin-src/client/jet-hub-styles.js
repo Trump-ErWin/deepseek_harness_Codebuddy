@@ -545,27 +545,34 @@ const STYLES = `
  *
  * ## 两级收敛（用户定：1+2）
  *
- * ① 基础宽度从 280px 收窄到 **186px**（文字超出走省略号，
- *    已有 min-width:0 + ellipsis 支撑）—— 给模型选择器让出空间，同时够显示
- *    「渠道名 + 读数」。
+ * ## 宽度：**内容自适应**，216px 只是上限（不是目标宽度）
  *
- *    ⚠️ 2026-10-03 从 150px 提到 186px。起因是真实报障：胶囊显示成
- *    「LobsterAI (有道) · 合计 …」，**数字被截掉**。
- *    修法分两层（见 badge-model.js 的 readingOf 与 usage-badge.js 的三段式渲染）：
- *    · **结构**：把「渠道名」与「读数」拆成可独立收缩的 span，名字先让位；
- *    · **尺寸**：留够「最长渠道名 + 读数」的完整宽度 —— 实测用户报障的两例
- *      （WorkBuddy (国际版) • 200积分 = 179.3px、LobsterAI (有道) • 842.06积分
- *      = 172.3px）在 186px 下**都不出省略号**，且对最宽那例留 6.7px 余量
- *      （字体回退时字宽会变，贴着 180 写没有裕度）。
+ * 胶囊本身是**内容自适应**的：宽度由实际文字撑开，短内容就短
+ * （Cline • 5积分 仅 93px），不会有固定留白。下面的 max-width 只在
+ * 内容**过长**时兜底，防止挤压右侧的模型选择器。
  *
- *    ⚠️ **这 +36px 是实打实的**，不要按「只是写明 border-box」理解：
- *    ⚠️ button 元素**本来就是 border-box**（UA 默认样式表），故旧值 150px 就是
- *    150px 的实际占位 —— 下面的 box-sizing 是**显式写出来**（防止哪天元素换成
- *    span/div 时语义悄悄变成内容盒），并不是把 150 缩成了别的数。
- *    多占的这 36px 由 ② 与 .dim-jh-badge 的 flex:0 1 auto 兜底：
- *    窗口变窄时胶囊**自己先让位**（退化顺序见 .dim-jh-badgeName/Detail），
- *    而不是把模型选择器挤出去 —— 后者正是 2026-10-02 那次报障的形态。
- *    ⚠️⚠️ 本段注释里**不能出现反引号**（本文件整体是 JS 模板字符串，会提前终止）。
+ * ⚠️ 2026-10-03 上限从 150px 提到 **216px**（用户报障「供应商名字显示不完整」
+ * 之后又提了一次）。两次报障、同一条链路的两个不同成因：
+ * 1. **数字被截**（第一次）：整句塞进一个 overflow:hidden 的 span，省略号从右往左
+ *    吃掉了余额。修法是**结构**（拆成可独立收缩的 span，见 badge-model.js 的
+ *    readingOf 与 usage-badge.js 的三段式渲染）；
+ * 2. **渠道名被截**（第二次）：结构修好后，186px 仍不够长渠道名 + 长余额，
+ *    于是省略号落到**名字**上（用户截图：CodeArts (华为…）。216px 解决它。
+ *
+ * **216 是量出来的，不是拍的**：实测 13 个渠道展示名 × 10 种现实读数
+ * （含 123456.78积分 / 9499.84积分 / 94.54MToken / 0积分）共 130 组，
+ * 需要的最宽度是 **209.34px**（WorkBuddy (国际版) • 123456.78积分），
+ * 216px 全部装得下且留 6.7px 余量（字体回退时字宽会变）。
+ *
+ * ⚠️ **上限不能再往上放**：实测把上限放到「无上限」时，极窄 composer（220px）
+ * 下胶囊会**溢出容器 8.3px** —— 那正是 2026-10-02「模型选择器图标被挤没」
+ * 的形态。内容自适应 + 合理上限，两者缺一不可。
+ * 兜底退化顺序：超长时**渠道名**先出省略号，**余额一个字都不会少**
+ * （.dim-jh-badgeReading 是 flex: none）。
+ *
+ * ⚠️ button 元素**本来就是 border-box**（UA 默认样式表），故下面的 box-sizing
+ * 是**显式写出**（防止哪天元素换成 span/div 时语义悄悄变成内容盒），不是修复。
+ * ⚠️⚠️ 本段注释里**不能出现反引号**（本文件整体是 JS 模板字符串，会提前终止）。
  * ② 容器再窄时（< 720px，媒体查询挂在**全局宽度**上：composer 宽度受
  *    侧栏影响，用容器查询无法表达「右侧还剩多少」）**只留状态点**，
  *    文字与 chevron 全部隐藏 —— 此时代理器优先级让给模型选择器。 */
@@ -578,7 +585,7 @@ const STYLES = `
    border-box（实测 offsetWidth 与 max-width 相等）。写上它只为在元素类型被改
    （span/div 默认是 content-box）时语义不悄悄漂移 —— 那种情况下 max-width 会从
    「占位宽度」变成「内容宽度」，胶囊会突然变宽 19px 而这行代码看着毫无变化。 */
-.dim-jh-badgeBtn { box-sizing: border-box; display: flex; align-items: center; gap: 5px; max-width: 186px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
+.dim-jh-badgeBtn { box-sizing: border-box; display: flex; align-items: center; gap: 5px; max-width: 216px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
 .dim-jh-badgeBtn:hover { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeBtn[aria-expanded="true"] { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); }
 /* 三段式文本容器：渠道名 + 分隔符 + 读数。
@@ -625,7 +632,7 @@ const STYLES = `
 .dim-jh-badgeReading { flex: none; min-width: 0; white-space: nowrap; }
 
 /* ② 窄屏收敛：只留状态点，文字与 chevron 让位给模型选择器。
- * 阈值 720px 是实测桌面版在 100% 缩放下「徽标 186px + 模型选择器 ≥ 240px」的临界值。
+ * 阈值 720px 是实测桌面版在 100% 缩放下「徽标 216px + 模型选择器 ≥ 240px」的临界值。
  * ⚠️⚠️ 本段的**位置**是功能性的，不要为了排版把它挪到 .dim-jh-badgeText 之前：
  * 它与 ".dim-jh-badgeText { display: flex }" 特异性相同（都是单个类），
  * 靠**源顺序**决定胜负 —— 一旦被排到前面，窄屏下 display:none 会被
