@@ -41,7 +41,6 @@ import {
   gatewayToggleNotice,
   modelCapabilityBadge,
 } from './openai-gateway-panel.js';
-import { LoginFallbackNotice } from './login-link.js';
 import {
   filterModels,
   isFilterActive,
@@ -1854,6 +1853,8 @@ function ProviderPanel({ provider, rpcCall }) {
    * 没必要让整个登录流程作废。
    */
   const [loginUrlForManual, setLoginUrlForManual] = React.useState(null);
+  /** 兜底登录链接的复制结果：null=未复制，true=已复制，false=复制失败。 */
+  const [loginLinkCopied, setLoginLinkCopied] = React.useState(null);
   /**
    * 出口代理弹窗状态：{ accountId, current } 或 null。
    *
@@ -2310,6 +2311,7 @@ function ProviderPanel({ provider, rpcCall }) {
           // 这里**不**调 setError：本函数运行时 phase 是 'ready'，错误文案只在
           // 'error' 阶段渲染，设了也看不见；提示由下面的 loginUrlForManual 区块负责。
           setLoginUrlForManual(loginUrl);
+          setLoginLinkCopied(null);
         }
         // 轮询等待登录完成。
         // ⚠ 超时**不用**另起的 `setTimeout`，而是记 deadline 在轮询里判：这样全场只有
@@ -2814,20 +2816,32 @@ function ProviderPanel({ provider, rpcCall }) {
           : null)
       : null,
     // 弹窗被拦截：给出可点击的登录链接 + 复制按钮。不劫持当前页面（见 createAccount 的说明）。
-    //
-    // ⚠️ 复制按钮不是「顺手加的」：授权 URL 带 client_id / scope / state，长度 300+
-    //    字符，用户此处的真实动作是**把它复制到别处**（换浏览器 / 发手机 / 贴命令行）。
-    //    只给一个 <a> 时用户只能手工框选，漏一个字符就是「授权失败」的假象
-    //    （用户 2026-10-03 报障「授权链接没有复制按钮」）。
-    // ⚠️ 与 `zcode-card.js` 共用 `LoginFallbackNotice`，不要在这里再写一份。
+    // 链接 300+ 字符，用户此刻唯一动作就是复制到别处；手工框选漏一个字符会得到「授权失败」假象。
     loginUrlForManual
-      ? React.createElement(LoginFallbackNotice, {
-          url: loginUrlForManual,
-          message: '登录窗口被浏览器拦截，请手动打开下方链接完成登录：',
-          noticeClassName: 'dim-jh-probeNotice',
-          linkClassName: 'dim-jh-loginLink',
-          buttonClassName: 'dim-jh-btn',
-        })
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': 'warn',
+          role: 'alert',
+        },
+        React.createElement('div', null, '登录窗口被浏览器拦截，请手动打开下方链接完成登录：'),
+        React.createElement('div', {
+          className: 'dim-jh-loginLinkRow',
+          'data-copy-state': loginLinkCopied === false ? 'failed' : 'idle',
+        },
+          React.createElement('a', {
+            className: 'dim-jh-loginLink',
+            href: loginUrlForManual,
+            target: '_blank',
+            rel: 'noopener noreferrer',
+          }, loginUrlForManual),
+          // type='button' 必须有：按钮若落在表单里，默认 submit 会连带提交表单。
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            type: 'button',
+            title: loginLinkCopied === false ? '复制失败：请手动选中链接后按 Ctrl+C' : '复制授权链接',
+            onClick: async () => setLoginLinkCopied(await copyToClipboard(loginUrlForManual)),
+          }, loginLinkCopied === true ? '已复制 ✓'
+            : loginLinkCopied === false ? '复制失败，请手动选中' : '复制链接')))
       : null,
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')

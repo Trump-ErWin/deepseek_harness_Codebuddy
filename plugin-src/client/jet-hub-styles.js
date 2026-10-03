@@ -187,20 +187,11 @@ const STYLES = `
 .dim-jh-probeNotice[data-tone="error"] { border-color: color-mix(in srgb, #d93025 35%, var(--dsw-alias-border-l2, #eef0f3)); background: rgb(217 48 37 / 8%); color: #b3261e; }
 .dim-jh-probeDetails { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 2px; }
 .dim-jh-probeDetails li { font-size: 12px; line-height: 18px; }
-
-/* 登录链接兜底行：链接 + 复制按钮（login-link.js 渲染，jet-hub 与 zcode 共用）。
-   ⚠️ 链接必须可收缩（min-width: 0）且 word-break: break-all —— 授权 URL 带
-   client_id / scope / state，长度 300+ 字符，不换行会把复制按钮挤出可视区。
-   此前 .dim-jh-loginLink 全文零规则，链接继承了提示块的 secondary 色。 */
+/* 授权链接 + 复制按钮同行。链接不设 min-width: 0 时，300+ 字符的 URL 会把按钮顶出可视区。 */
 .dim-jh-loginLinkRow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
 .dim-jh-loginLink { flex: 1 1 240px; min-width: 0; color: var(--dsw-alias-link); word-break: break-all; }
-/* 复制失败的回退：把链接切成「点一下全选」。
-   ⚠️ 这是失败态唯一的补救动作 —— 剪贴板被浏览器拒绝时用户仍能手动复制，
-   删掉它按钮失败就真的毫无反应（copyToClipboard 注释里那条红线）。
-   ⚠️ 两个类名都要列：jet-hub 用 .dim-jh-loginLink、zcode 卡片用 .dim-jh-zcLink，
-   它们是同一行的两种皮肤（见 login-link.js），漏一个就有一半用户拿不到回退。 */
-.dim-jh-loginLinkRow[data-copy-state="failed"] .dim-jh-loginLink,
-.dim-jh-loginLinkRow[data-copy-state="failed"] .dim-jh-zcLink { user-select: all; }
+/* 复制失败时把链接变成一次点击全选，用户能直接 Ctrl+C。 */
+.dim-jh-loginLinkRow[data-copy-state="failed"] .dim-jh-loginLink { user-select: all; }
 
 /* 登录弹窗 */
 .dim-jh-loginOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; z-index: 1000; }
@@ -527,9 +518,7 @@ const STYLES = `
 .dim-jh-zcNotice[data-tone="warn"] { color: var(--dsw-alias-state-warn-label); background: var(--dsw-alias-state-warn-tertiary); }
 .dim-jh-zcNotice[data-tone="error"] { color: var(--dsw-alias-state-error-primary); background: var(--dsw-alias-interactive-bg-hover-danger); }
 .dim-jh-zcNotice ul { margin: 4px 0 0; padding-left: 18px; }
-/* ⚠️ flex/min-width 与 .dim-jh-loginLink 保持一致：两者都是 .dim-jh-loginLinkRow
-   里的链接，不设 min-width: 0 时长 URL 会把同一行的复制按钮挤出可视区。 */
-.dim-jh-zcLink { flex: 1 1 240px; min-width: 0; color: var(--dsw-alias-link); word-break: break-all; }
+.dim-jh-zcLink { color: var(--dsw-alias-link); word-break: break-all; }
 
 /* ── 用量徽标（会话输入区，模型选择器旁） ────────────────────────────────
    折叠态是一枚紧凑按钮，浮层用 position:absolute + bottom:calc(100% + 8px)
