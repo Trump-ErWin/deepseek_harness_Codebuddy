@@ -9,6 +9,13 @@
 > 全量 `vitest run` 仅 `tests/unit/opencode-proxy-live.spec.ts` 2 例红(自建代理 harness 与
 > undici 8.11.2 的环境性不兼容,**移植前基线同红**,与本次改动无关)。
 > §九 的真机验证(thinking 显示 + 签名回填)仍留给用户。
+>
+> **2026-10-03 追补(用户「不要 lite 模型」)**:真机探针实测 `gemini-3.8-flash-lite`
+> 在两端点上**恒 404**(`{"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}`,
+> 与是否传档位无关)⇒ 该模型名不在本账号准入表内。已**整体移除** lite:
+> 删 `GEMINI_UPSTREAM_FLASH_LITE` 常量、静态表缩为 1 条(`gemini-3.8-flash`)、
+> `geminiModelSpec` 去掉 lite 分支(模型名**恒**带档位后缀),相关 spec 同步改写。
+> 现暴露 **1 个模型 + 4 档 efforts**。
 > 源项目:`F:\project\cmdc-pak-align-wb`(Go,本仓库,gemini 线原型)
 > 目标项目:**当前工作区** `F:\project\dsh-codearts-plugin`(TypeScript,DSH 插件 `dsh-codearts-auth`)
 

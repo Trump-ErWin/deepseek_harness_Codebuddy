@@ -1128,8 +1128,9 @@ export function apply(ctx: Context): void {
   //      下一轮按「工具名 + 规范化参数」回填，否则多轮工具调用必被上游拒。
   //      故这里建一个独立的 `gemini-sigs.json` 缓存（**不放 state.json** ——
   //      那是整体替换语义，会被别的写入覆盖掉）。
-  //   4. 模型暴露 1 个 `gemini-3.8-flash` + 4 档 efforts（低/中/高/自适应），
-  //      外加无档位的 `gemini-3.8-flash-lite`；**不**暴露带后缀的模型名。
+  //   4. 模型暴露 1 个 `gemini-3.8-flash` + 4 档 efforts（低/中/高/自适应）；
+  //      **不**暴露带后缀的模型名，也**不**暴露 lite（上游恒 404，用户
+  //      2026-10-03 拍板移除）。
   //
   // 服务名由 GeminiAuth 依 product.id 派生，注册为 ctx.geminiAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 Gemini 面板。

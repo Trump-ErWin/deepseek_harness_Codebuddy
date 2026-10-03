@@ -427,16 +427,6 @@ describe('gemini stream · 换号救场', () => {
 })
 
 describe('gemini stream · 档位与模型', () => {
-  it('lite 模型名不带档位后缀，档位被忽略', async () => {
-    const { calls } = recordingFetch([() => okStream()])
-    await drain(
-      makeAdapter({ credential: cred('AT') }),
-      options({ model: 'gemini-3.8-flash-lite', reasoningEffort: 'high' as never }),
-    )
-    const body = JSON.parse(String(calls[0]!.init.body)) as { model: string }
-    expect(body.model).toBe('gemini-3.8-flash-lite')
-  })
-
   it('未知档位被丢弃（回落到默认 medium，不发一个上游不认的档）', async () => {
     const { calls } = recordingFetch([() => okStream()])
     await drain(
@@ -447,21 +437,21 @@ describe('gemini stream · 档位与模型', () => {
     expect(body.model).toBe('gemini-3.8-flash-medium')
   })
 
-  it('lite 模型上声明档位也会被忽略（它没有 effortOptions）', async () => {
+  it('未知模型 id 也被拼上默认档后缀（model 名是准入钥匙，档位才是行为）', async () => {
     const { calls } = recordingFetch([() => okStream()])
     await drain(
       makeAdapter({ credential: cred('AT') }),
-      options({ model: 'gemini-3.8-flash-lite', reasoningEffort: 'low' as never }),
+      options({ model: 'gemini-9.9-imaginary', reasoningEffort: 'low' as never }),
     )
     const body = JSON.parse(String(calls[0]!.init.body)) as {
       model: string
       request: { generationConfig: { thinkingConfig: Record<string, unknown> } }
     }
-    expect(body.model).toBe('gemini-3.8-flash-lite')
-    // 低档预算 1000，且**恒带** includeThoughts。
+    // 未知模型没有 effortOptions ⇒ 档位被丢弃 ⇒ 回落到 medium。
+    expect(body.model).toBe('gemini-3.8-flash-medium')
     expect(body.request.generationConfig.thinkingConfig).toEqual({
       includeThoughts: true,
-      thinkingBudget: 1_000,
+      thinkingBudget: 4_000,
     })
   })
 
@@ -508,13 +498,14 @@ describe('gemini 模型目录与声明契约', () => {
     expect(models).toEqual([])
   })
 
-  it('★ 有账号时暴露恰好 2 个模型，且 lite 声明 supportsImage 带来的 image 模态', async () => {
+  it('★ 有账号时暴露恰好 1 个模型，且声明 image 模态', async () => {
     const adapter = makeAdapter({ credential: cred('AT'), pool: gatePool(true) })
     const models = await adapter.listModels(GEMINI.id)
-    expect(models.map((m) => m.id)).toEqual(['gemini-3.8-flash', 'gemini-3.8-flash-lite'])
-    expect(models.map((m) => m.provider)).toEqual([GEMINI.id, GEMINI.id])
-    // 两个模型都支持图片（入口用 `-lite` 也能带图）。
+    expect(models.map((m) => m.id)).toEqual(['gemini-3.8-flash'])
+    expect(models.map((m) => m.provider)).toEqual([GEMINI.id])
     expect(models.every((m) => m.inputModalities?.includes('image'))).toBe(true)
+    // ⚠️ **不暴露 lite**（用户 2026-10-03 拍板：上游恒 404）。
+    expect(models.some((m) => m.id.includes('lite'))).toBe(false)
     // ⚠️ **不认领 `claude-*`**（计划 §八.1）：认领会让用户选 claude 时走 gemini。
     expect(models.some((m) => m.id.startsWith('claude'))).toBe(false)
   })
@@ -522,10 +513,10 @@ describe('gemini 模型目录与声明契约', () => {
   it('★ 被禁用的模型从目录里剔除（禁用是 provider 级共享状态）', async () => {
     const adapter = makeAdapter({
       credential: cred('AT'),
-      pool: gatePool(true, ['gemini-3.8-flash-lite']),
+      pool: gatePool(true, ['gemini-3.8-flash']),
     })
     const models = await adapter.listModels(GEMINI.id)
-    expect(models.map((m) => m.id)).toEqual(['gemini-3.8-flash'])
+    expect(models).toEqual([])
   })
 
   it('★ resolveModel 声明 1M 上下文 + 四个档位 + medium 为默认档', async () => {
@@ -543,11 +534,9 @@ describe('gemini 模型目录与声明契约', () => {
     expect(String(resolved.reasoning?.defaultEffort)).toBe('medium')
   })
 
-  it('★ lite 不声明档位（空数组会让面板显示一个点不开的空下拉框）', async () => {
+  it('★ 未知模型不编造档位声明（宁可让 DSH 用默认，也不给一个点不开的空下拉框）', async () => {
     const adapter = makeAdapter({ credential: cred('AT'), pool: gatePool(true) })
-    const resolved = await adapter.resolveModel(GEMINI.id, 'gemini-3.8-flash-lite')
-    expect(resolved.context?.contextWindow).toBe(1_000_000)
-    // ⚠️ 必须是 `undefined` 而不是 `{efforts: []}`。
+    const resolved = await adapter.resolveModel(GEMINI.id, 'gemini-9.9-imaginary')
     expect(resolved.reasoning).toBeUndefined()
   })
 

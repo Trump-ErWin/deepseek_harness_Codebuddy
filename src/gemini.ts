@@ -24,7 +24,11 @@
  * ## 实测确认的三条事实（计划 §七）
  *
  * - **模型名是准入钥匙**：发裸 `gemini-3.8-flash` 上游 404，必须带档位后缀
- *   （`gemini-3.8-flash-high`）。唯一例外是 lite（本身即完整名）。
+ *   （`gemini-3.8-flash-high`）。
+ * - **lite 已整体移除**（用户 2026-10-03 拍板「不要 lite 模型」）：真机实测
+ *   `gemini-3.8-flash-lite` 在两端点上**恒 404**
+ *   （`{"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}`），
+ *   与是否传档位无关 ⇒ 该模型名不在本账号的准入表里，暴露它只会让用户选中即失败。
  * - **思考预算是自由旋钮**：名字叫 `medium` 但预算给 10000 → 实测 213 token；
  *   给 4000 → 164 token。名字只是标签，预算才是行为。
  * - **「关闭思考」是假关**：关掉 `includeThoughts` 照样思考照样计费
@@ -302,8 +306,6 @@ export type GeminiTier = 'low' | 'medium' | 'high' | 'tiered'
 
 /** 主模型上游名（**不带**档位后缀，后缀由 {@link geminiModelSpec} 拼）。 */
 export const GEMINI_UPSTREAM_FLASH = 'gemini-3.8-flash'
-/** lite 模型上游名（**本身即完整名**，不带档位后缀）。 */
-export const GEMINI_UPSTREAM_FLASH_LITE = 'gemini-3.8-flash-lite'
 
 export const GEMINI_BUDGET_LOW = 1_000
 export const GEMINI_BUDGET_MEDIUM = 4_000
@@ -347,8 +349,9 @@ export interface GeminiModelEntry {
 /**
  * 静态模型表（用户拍板：**静态表**，不拉远端目录）。
  *
- * 暴露 2 条：主模型带 4 档 efforts，lite 不带 efforts。
+ * 暴露 1 条：主模型带 4 档 efforts。
  * ⚠️ **不暴露 4 个带后缀的模型名** —— 档位走 efforts 下拉框。
+ * ⚠️ **不暴露 lite**（用户 2026-10-03 拍板）：上游恒 404，暴露即坑。
  */
 export const GEMINI_FALLBACK_MODELS: readonly GeminiModelEntry[] = [
   {
@@ -359,13 +362,6 @@ export const GEMINI_FALLBACK_MODELS: readonly GeminiModelEntry[] = [
     supportsImage: true,
     effortOptions: GEMINI_EFFORT_IDS,
     defaultEffort: GEMINI_DEFAULT_EFFORT,
-  },
-  {
-    id: GEMINI_UPSTREAM_FLASH_LITE,
-    name: 'Gemini 3.8 Flash Lite',
-    contextWindow: GEMINI_CONTEXT_WINDOW,
-    maxTokens: GEMINI.maxOutputTokens,
-    supportsImage: true,
   },
 ]
 
@@ -392,7 +388,7 @@ export function geminiThinkingBudget(tier: GeminiTier): number {
 
 /** 一次请求的模型规格。 */
 export interface GeminiModelSpec {
-  /** 真正发给上游的模型名（带档位后缀，lite 除外）。 */
+  /** 真正发给上游的模型名（带档位后缀）。 */
   readonly upstream: string
   readonly tier: GeminiTier
   readonly thinkingBudget: number
@@ -403,17 +399,9 @@ export interface GeminiModelSpec {
 /**
  * 由「模型 id + 用户选的档位」得出上游模型规格。
  *
- * ⚠️ lite 走低档预算但**不带档位后缀** —— 它的模型名本身就是完整准入钥匙。
+ * ⚠️ 模型名必须带档位后缀 —— 它是上游的准入钥匙（见文件头实测）。
  */
 export function geminiModelSpec(modelId: string, effort?: string): GeminiModelSpec {
-  if (modelId === GEMINI_UPSTREAM_FLASH_LITE) {
-    return {
-      upstream: GEMINI_UPSTREAM_FLASH_LITE,
-      tier: 'low',
-      thinkingBudget: GEMINI_BUDGET_LOW,
-      includeThoughts: true,
-    }
-  }
   const tier = geminiEffortToTier(effort)
   return {
     upstream: `${GEMINI_UPSTREAM_FLASH}-${tier}`,

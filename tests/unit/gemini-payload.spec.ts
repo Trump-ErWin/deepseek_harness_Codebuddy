@@ -86,21 +86,13 @@ describe('信封字节金标准（计划 §六）', () => {
     ).toEqual({ includeThoughts: true })
   })
 
-  it('lite 档：模型名不带后缀，且不声明 efforts', () => {
-    const spec = geminiModelSpec('gemini-3.8-flash-lite', 'high')
-    expect(spec.upstream).toBe('gemini-3.8-flash-lite')
-    const envelope = translateGeminiRequest({
-      modelId: 'gemini-3.8-flash-lite',
-      spec,
-      messages: [msg('user', [{ type: 'text', text: 'hi' }])],
-      sessionId: GEMINI_SESSION_ID_INFER,
-      requestId: 'agent/1/aaaaaaaa',
-    })
-    expect(envelope.model).toBe('gemini-3.8-flash-lite')
-
-    const lite = GEMINI_FALLBACK_MODELS.find((entry) => entry.id === 'gemini-3.8-flash-lite')
-    expect(lite).toBeDefined()
-    expect(geminiReasoningInfo(lite!)).toBeUndefined()
+  it('模型表只有 1 条（lite 已移除：上游恒 404，暴露即坑）', () => {
+    expect(GEMINI_FALLBACK_MODELS.map((entry) => entry.id)).toEqual(['gemini-3.8-flash'])
+    const only = GEMINI_FALLBACK_MODELS[0]!
+    // 档位声明仍然齐备（中文名，用户拍板）。
+    expect(geminiReasoningInfo(only)?.efforts?.map((e) => String(e.id))).toEqual([
+      ...GEMINI_EFFORT_IDS,
+    ])
   })
 
   it('project 默认 aicode-consumers，可覆盖', () => {
