@@ -41,6 +41,7 @@ import {
   gatewayToggleNotice,
   modelCapabilityBadge,
 } from './openai-gateway-panel.js';
+import { LoginFallbackNotice } from './login-link.js';
 import {
   filterModels,
   isFilterActive,
@@ -2812,20 +2813,21 @@ function ProviderPanel({ provider, rpcCall }) {
                 React.createElement('li', { key: index }, line)))
           : null)
       : null,
-    // 弹窗被拦截：给出可点击的登录链接。不劫持当前页面（见 createAccount 的说明）。
+    // 弹窗被拦截：给出可点击的登录链接 + 复制按钮。不劫持当前页面（见 createAccount 的说明）。
+    //
+    // ⚠️ 复制按钮不是「顺手加的」：授权 URL 带 client_id / scope / state，长度 300+
+    //    字符，用户此处的真实动作是**把它复制到别处**（换浏览器 / 发手机 / 贴命令行）。
+    //    只给一个 <a> 时用户只能手工框选，漏一个字符就是「授权失败」的假象
+    //    （用户 2026-10-03 报障「授权链接没有复制按钮」）。
+    // ⚠️ 与 `zcode-card.js` 共用 `LoginFallbackNotice`，不要在这里再写一份。
     loginUrlForManual
-      ? React.createElement('div', {
-          className: 'dim-jh-probeNotice',
-          'data-tone': 'warn',
-          role: 'alert',
-        },
-        React.createElement('div', null, '登录窗口被浏览器拦截，请手动打开下方链接完成登录：'),
-        React.createElement('a', {
-          className: 'dim-jh-loginLink',
-          href: loginUrlForManual,
-          target: '_blank',
-          rel: 'noopener noreferrer',
-        }, loginUrlForManual))
+      ? React.createElement(LoginFallbackNotice, {
+          url: loginUrlForManual,
+          message: '登录窗口被浏览器拦截，请手动打开下方链接完成登录：',
+          noticeClassName: 'dim-jh-probeNotice',
+          linkClassName: 'dim-jh-loginLink',
+          buttonClassName: 'dim-jh-btn',
+        })
       : null,
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')

@@ -29,6 +29,7 @@
  */
 import * as React from 'react';
 import { createPortal } from 'react-dom';
+import { LoginFallbackNotice } from './login-link.js';
 const h = React.createElement; // 短别名控制行数，同 React.createElement
 /** 账号池与 Jet Hub RPC 的 provider 名（旧直连 route，`src/zcode-product.ts` 的 `ZCODE.id`）。 */
 const PROVIDER = 'zcode';
@@ -567,12 +568,18 @@ function ZcodeProviderCardBody({ rpcCall }) {
             title: '号池各模型剩余额度合计' }, poolLine) : null,
           h('span', { className: 'dim-jh-zcCount' }, count))),
       h('div', { className: 'dim-jh-zcBody' },
-        // 弹窗被拦截：只给可点击链接，不劫持当前页面。
+        // 弹窗被拦截：只给可点击链接 + 复制按钮，不劫持当前页面。
+        // ⚠️ 与 `jet-hub.js` 共用 `LoginFallbackNotice`（用户 2026-10-03 报障
+        //    「只有链接没有复制按钮」—— 两处是同一个缺陷的副本，必须一起修）。
+        //    按钮类名用 `.dim-jh-zcBtn` 以匹配本卡片自己的皮肤。
         manualLoginUrl
-          ? h('div', { className: 'dim-jh-zcNotice', 'data-tone': 'warn', role: 'alert' },
-              h('div', null, '登录窗口未弹出，请点此链接完成登录：'),
-              h('a', { className: 'dim-jh-zcLink', href: manualLoginUrl,
-                target: '_blank', rel: 'noopener noreferrer' }, manualLoginUrl))
+          ? h(LoginFallbackNotice, {
+              url: manualLoginUrl,
+              message: '登录窗口未弹出，请点此链接完成登录：',
+              noticeClassName: 'dim-jh-zcNotice',
+              linkClassName: 'dim-jh-zcLink',
+              buttonClassName: 'dim-jh-zcBtn',
+            })
           : null,
         phase === 'loading'
           ? h('div', { className: 'dim-jh-zcEmpty' }, '正在读取账号列表…')
