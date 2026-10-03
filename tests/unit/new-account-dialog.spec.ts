@@ -47,13 +47,86 @@ function stripComments (source: string): string {
 
 const jetHubCode = stripComments(jetHubSource)
 
-/** PROVIDERS 里此刻存在的全部 provider id（用它当「遍历全部面板」的样本源）。 */
-const PROVIDER_IDS = [
-  'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn',
-  'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'opencode',
-] as const
+/**
+ * ⚠⚠ **从源码真读** `PROVIDERS` 的 id 列表，**不要**在这里硬编码。
+ *
+ * ## 为什么（本轮真踩过）
+ *
+ * 本文件原先写死一份 provider 列表当遍历样本。实测变异：把
+ * `newAccountAsksChannel` 改成 `provider === 'zcode' || provider === 'newbie'`
+ * （模拟「新增一个需要预选渠道的 provider」）—— **14 条测试全绿**。
+ * 原因就是遍历样本里没有 `newbie`，测试压根没走到它。
+ *
+ * ⇒ 两层问题：
+ *  ① **硬编码副本必然与 `PROVIDERS` 漂移**（新增 provider 时测试不会自动纳入）；
+ *  ② 真正的判据不是「逐个 id 检查」，而是**下面那条不变式**
+ *     （弹窗判据 ⟺ 载荷带渠道），它对**任意** id 都成立，不需要枚举。
+ *
+ * 保留遍历仍然有价值（能把「某个具体 provider 被误判」指名道姓地报出来），
+ * 但样本必须来自真源。
+ */
+function readProviderIds (): string[] {
+  const start = jetHubSource.indexOf('const PROVIDERS = Object.freeze([')
+  const end = jetHubSource.indexOf(']);', start)
+  if (start < 0 || end < 0) throw new Error('未能定位 PROVIDERS 字面量，解析方式需随结构变更更新')
+  const block = jetHubSource.slice(start, end)
+  const ids = [...block.matchAll(/\bid:\s*'([a-z0-9]+)'/g)].map((m) => m[1])
+  // ⚠ 解析失败会得到空数组，而「遍历空数组」的断言**照样全绿** ——
+  //   那是本轮最危险的一种假绿（比缺测试更坏：看起来测了，其实没测）。
+  //   故显式设一道数量下限，解析器一失配就立刻红。
+  if (ids.length < 10) throw new Error(`PROVIDERS 只解析出 ${ids.length} 个 id，解析器大概率已失配`)
+  return ids
+}
+
+const PROVIDER_IDS = readProviderIds()
+
+/**
+ * ⚠ **合成探针 id**：真实 `PROVIDERS` 里**还没有**、但将来很可能出现的新 provider 名。
+ *
+ * ## 为什么需要它们（本轮两次踩坑才想清楚）
+ *
+ * 只遍历 `PROVIDERS` 是**抓不到**「新增 provider 忘了改另一处」的 ——
+ * 新 provider 此刻**恰恰还不在列表里**，遍历永远轮不到它。
+ * （第一版我以为「不变式对任意 id 成立所以不用枚举」，实测变异全绿，
+ * 证明那个想法是错的：不变式仍然是**逐个 id 求值**的，样本从哪来很关键。）
+ *
+ * 所以把「将来可能出现的名字」也放进样本：只要实现里出现了对某个合成名的
+ * 特殊分支，而另一处没有，这条就会对不上。
+ *
+ * ⚠⚠ **覆盖上限要说清楚**：它**不是**保证。若将来新增的 provider 叫
+ * `tencent-hunyuan` 这种探针里没有的名字，且只改了一处，仍会漏。
+ * 它抓到的是**最常见的形态**（随手起个 `newbie` / `new-provider` /
+ * 改一个字）—— 这类漏网的真正防线仍是 `new-account.js` 里那条
+ * 「将来新增 provider，两个函数都要看」的注释。**测试与注释各挡一层，
+ * 没有任何一层是完备的。**
+ */
+const PROBE_IDS = ['newbie', 'new-provider', 'zzz', 'some-future-provider', 'codearts2']
 
 describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）', () => {
+  /**
+   * ★★ **本组的核心不变式**：对每个样本 id，
+   * 「弹窗问渠道」⟺「载荷带 zcodeProvider」，两者必须同时成立。
+   *
+   * ## 为什么它比逐个枚举更强
+   *
+   * `newAccountAsksChannel`（白名单）与 `buildCreateAccountPayload`（排除法）
+   * **判据方向相反**，这是刻意的独立性设计（提单人 review 时确认保留），
+   * 代价就是**将来新增 provider 时容易只改一处**。本条把「两处必须同步」
+   * 变成可执行判据：**只改任一处，另一处立刻对不上，红。**
+   *
+   * ⚠ 样本 = 真实 `PROVIDERS` ∪ 合成探针。**只有真实列表是不够的**
+   * （新增 provider 那一刻它还不在列表里），见上面 `PROBE_IDS` 的说明。
+   */
+  it('★★ 不变式：弹窗判据 ⟺ 载荷带渠道（真实 provider + 合成探针）', () => {
+    for (const id of [...PROVIDER_IDS, ...PROBE_IDS]) {
+      const asks = newAccountAsksChannel(id)
+      const has = Object.prototype.hasOwnProperty.call(
+        buildCreateAccountPayload(id, 'zai'), 'zcodeProvider',
+      )
+      expect(asks, `${id}：弹窗判据(${asks}) 与载荷带渠道(${has}) 不一致 —— 将来新增 provider 时两处都要改`).toBe(has)
+    }
+  })
+
   it('★ 只有 zcode 需要先问登录渠道，其余 provider 点按钮即登录', () => {
     expect(newAccountAsksChannel('zcode')).toBe(true)
     // ⚠ 这条对**全部** provider 取一遍：A1 的形态是「弹窗对 provider 零分支」，
@@ -172,7 +245,24 @@ describe('E2. zcodeProvider 必须过白名单（IKJLK3 E2）', () => {
  * | ⑥ 恢复 `console.log(..., res)` | D 组**2 条** | 第 2 条（保留可定位字段）一并红 |
  * | ⑦ `normalizeZcodeLoginProvider` 直接 `return raw as ZcodeLoginProvider` | E2 组「未登记值回落」+「缺省仍是 bigmodel」共 **2 条** | ⚠ 红的第二组是「缺省」而非「已登记值」：透传后连 `undefined` 都不再回落成 `bigmodel`，这才是去掉白名单的真正后果 |
  * | ⑧ 调用点改回 `provider: req.zcodeProvider ?? 'bigmodel'` | E2 组「调用点走归一函数」**1 条** | |
+ * | ⑨ **只改弹窗判据**：`\|\| provider === 'newbie'`，载荷没跟上 | 不变式**1 条** | 见下方「两次踩坑」 |
+ * | ⑩ **只改载荷**：`&& provider !== 'newbie'`，弹窗没跟上 | 不变式**1 条** | ⑨⑩ 合起来守「两处必须同步」 |
  *
- * ⚠ 变异 ① 只红 3 条而非更多是**预期的**：接线那条锁的是「判据被调用」，
- *   而非「判据返回什么」—— 后者由变异 ① 覆盖，两条各管一面。
+ * ### ⚠ ⑨⑩ 之前失败过两轮 —— 记下来，别重复
+ *
+ * 变异 ⑨（只改弹窗判据）第一次跑是 **14 条全绿**。两次错法：
+ *
+ * 1. **第一版**：遍历样本是**手写的硬编码 provider 列表**。`newbie` 不在里面，
+ *    测试压根没走到它。⇒ 已改成从 `jet-hub.js` 真读 `PROVIDERS`。
+ * 2. **第二版**：改成了「不变式对**任意** id 成立，不依赖列表」——
+ *    **这句话是错的**。不变式仍是**逐个 id 求值**的，而新 provider 此刻
+ *    **恰恰还不在 `PROVIDERS` 里**，遍历永远轮不到它。第二次跑仍全绿。
+ *    ⇒ 已改为样本 = 真实 `PROVIDERS` ∪ 合成探针 id（`PROBE_IDS`）。
+ *
+ * ⚠ 教训：**「不依赖枚举」不等于「不需要枚举」** —— 只要判据是逐样本求值，
+ * 样本从哪来就是决定性的。又一次印证「断言写对了却拦不住回归更常见」。
+ *
+ * ⚠ 探针的**覆盖上限是明说的**：新增 provider 叫 `tencent-hunyuan` 这类
+ * 探针外的名字且只改一处，仍会漏。真正的第二道防线是 `new-account.js` 里
+ * 「将来新增 provider，两个函数都要看」那段注释。**两层都不完备，别指望单靠测试。**
  */
