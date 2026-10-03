@@ -164,6 +164,27 @@ afterEach(() => {
 })
 
 describe('gemini stream · 凭据与请求形状', () => {
+  it('未知模型 id 抛 INVALID_REQUEST（先查表，不取凭据不发请求）', async () => {
+    const { calls } = recordingFetch([() => okStream()])
+    const refreshCalls = { count: 0 }
+    const adapter = makeAdapter({ refreshCalls })
+    const error = await capture(adapter, options({ model: 'gemini-9.9-fake' }))
+    expect(error?.code).toBe('INVALID_REQUEST')
+    expect(error?.message).toContain('gemini-9.9-fake')
+    expect(calls).toHaveLength(0)
+    // 纯本地判定：连凭据续期都不该触发
+    expect(refreshCalls.count).toBe(0)
+  })
+
+  it('带档位的模型 id（限流标记/探测形态）照常发请求', async () => {
+    const { calls } = recordingFetch([() => okStream()])
+    await drain(makeAdapter({ credential: cred('AT') }), options({ model: 'gemini-3.8-flash-high' }))
+    expect(calls.length).toBeGreaterThanOrEqual(1)
+    const body = JSON.parse(String(calls[0]!.init.body)) as { model: string }
+    // upstream 由 effort 决定（未传档位 = medium），不是 id 后缀
+    expect(body.model).toBe('gemini-3.8-flash-medium')
+  })
+
   it('无凭据抛 MISSING_CREDENTIAL（不发请求）', async () => {
     const { calls } = recordingFetch([() => okStream()])
     const adapter = makeAdapter({})
@@ -437,23 +458,9 @@ describe('gemini stream · 档位与模型', () => {
     expect(body.model).toBe('gemini-3.8-flash-medium')
   })
 
-  it('未知模型 id 也被拼上默认档后缀（model 名是准入钥匙，档位才是行为）', async () => {
-    const { calls } = recordingFetch([() => okStream()])
-    await drain(
-      makeAdapter({ credential: cred('AT') }),
-      options({ model: 'gemini-9.9-imaginary', reasoningEffort: 'low' as never }),
-    )
-    const body = JSON.parse(String(calls[0]!.init.body)) as {
-      model: string
-      request: { generationConfig: { thinkingConfig: Record<string, unknown> } }
-    }
-    // 未知模型没有 effortOptions ⇒ 档位被丢弃 ⇒ 回落到 medium。
-    expect(body.model).toBe('gemini-3.8-flash-medium')
-    expect(body.request.generationConfig.thinkingConfig).toEqual({
-      includeThoughts: true,
-      thinkingBudget: 4_000,
-    })
-  })
+  // （原「未知模型 id 也被拼上默认档后缀」用例已随严格校验移除：
+  //  未知 id 现在在查表处直接抛 INVALID_REQUEST，见「凭据与请求形状」段 ——
+  //  静默落回 3.8 正是本次修复的行为。）
 
   it('自适应档只发 includeThoughts（不发 thinkingBudget）', async () => {
     const { calls } = recordingFetch([() => okStream()])

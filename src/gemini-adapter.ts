@@ -40,6 +40,8 @@ import {
   GEMINI_MAX_IMAGE_BYTES_INLINE,
   GEMINI_SESSION_ID_INFER,
   GEMINI_STREAM_PATH,
+  GEMINI_UPSTREAM_FLASH,
+  geminiCanonicalModelId,
   geminiFallbackEntries,
   geminiHeaders,
   geminiModelSpec,
@@ -324,6 +326,23 @@ export class GeminiAdapter extends LlmAdapter {
    * 6. 全部试完 → 抛 `QUOTA_EXCEEDED`（不无限切）。
    */
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    // ⚠️ 模型名**先查表再取凭据**：未知 id 立即拒绝（纯本地判定，零网络、
+    // 零凭据成本）。放行的后果是上游对未知模型名**静默接受并落回
+    // gemini-3.8-flash**（实测假名 200、正常作答 —— 名字根本不参与上游
+    // 路由），用户选错模型时拿到的是错误模型的答案且无任何征兆，比报错
+    // 难查得多。错误码用 INVALID_REQUEST：不在 harness 可重试集合（不白
+    // 退避），也不是 AUTH/QUOTA（不触发换号/续期）。
+    // ⚠️ 限流标记 / `account.test` 探测链路传来的是**带档位的名字**
+    // （写标记用请求原始 id），先归一化再查表 —— 否则「测一下被限流的
+    // 档位」会被误拒（探测功能回归）。
+    const entry = this.loadModels().find((item) => item.id === geminiCanonicalModelId(options.model))
+    if (entry === undefined) {
+      throw new LlmError(
+        `gemini: 模型 "${options.model}" 不在本 provider 目录中（仅支持 ${GEMINI_UPSTREAM_FLASH}）`,
+        'INVALID_REQUEST',
+      )
+    }
+
     let credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || isGeminiExpired(credential)) {
       await this.options.refresh()
@@ -333,7 +352,6 @@ export class GeminiAdapter extends LlmAdapter {
       throw new LlmError('gemini: no usable credential; log in first', 'MISSING_CREDENTIAL')
     }
 
-    const entry = this.loadModels().find((item) => item.id === options.model)
     const requested = options.reasoningEffort === undefined
       ? undefined
       : String(options.reasoningEffort)

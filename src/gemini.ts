@@ -37,7 +37,7 @@
 
 import { randomBytes } from 'node:crypto'
 import type { LlmModelReasoningInfo } from '@deepseek-ai/dsh-llm'
-import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { DEFAULT_IMAGE_PIXEL_BUDGET } from './image-budget.js'
 
 // ---------------------------------------------------------------------------
@@ -397,19 +397,46 @@ export interface GeminiModelSpec {
 }
 
 /**
+ * 归一化模型 id：剥掉档位后缀（`-low/-medium/-high/-tiered`），得到目录裸名。
+ *
+ * ⚠️ 限流标记（`modelRateLimits` 的 key）与 `account.test` 探测链路记录 /
+ * 传递的可能是**带档位的名字**（写标记时用的是请求原始 id），而静态表的 id
+ * 是裸名 —— 两处校验都必须先归一化，否则「测一下被限流的档位」会被误拒。
+ * ⚠️ 只剥**已知档位**后缀：未来加第二个模型时，若其真名恰好以档位词结尾
+ * （如 `gemini-x-high`），这里会把它误剥成 `gemini-x` —— 届时必须改为
+ * 「按目录表全名优先匹配」再回落剥后缀。
+ */
+export function geminiCanonicalModelId(modelId: string): string {
+  for (const tier of GEMINI_EFFORT_IDS) {
+    if (modelId.endsWith(`-${tier}`)) return modelId.slice(0, modelId.length - tier.length - 1)
+  }
+  return modelId
+}
+
+/**
  * 由「模型 id + 用户选的档位」得出上游模型规格。
  *
  * ⚠️ 模型名必须带档位后缀 —— 它是上游的准入钥匙（见文件头实测）。
  *
- * ⚠️ **`modelId` 当前刻意未使用**：静态表（{@link GEMINI_FALLBACK_MODELS}）只
- * 暴露 `gemini-3.8-flash` 一个模型，upstream 恒为 `gemini-3.8-flash-<tier>`，
- * 任何传进来的 id 都落到同一个真实模型上。这是**有意的宽容**（网关实测
- * `gemini/gemini-9.9-fake`、`gemini/totally-bogus` 均 200 并正常作答，因为
- * 名字根本没参与上游请求），不是遗漏。
+ * ⚠️ **`modelId` 严格校验**：静态表（{@link GEMINI_FALLBACK_MODELS}）只暴露
+ * `gemini-3.8-flash` 一个模型，upstream 恒为 `gemini-3.8-flash-<tier>`。
+ * 曾经「任何 id 都放行」是有意的宽容（网关实测 `gemini/gemini-9.9-fake`、
+ * `gemini/totally-bogus` 均 200 并正常作答 —— 名字根本没参与上游请求），
+ * 但宽容的代价是**用户写错模型名时静默跑出 3.8 的答案且无任何征兆**
+ * （不报错、不降级、答案就是不对，极难排查），故改为拒绝：未知 id 直接抛
+ * `INVALID_REQUEST`，不发上游请求。带档位的 3.8 名（`gemini-3.8-flash-high`
+ * 等，来自限流标记 / 探测链路）经 {@link geminiCanonicalModelId} 归一化后
+ * 放行。
  * **加第二个模型时必须先用 `modelId` 选 upstream** —— 否则表里两个模型会撞车
- * （用户选 A、实际跑 B），且症状是「不报错、不降级、答案就是不对」，极难查。
+ * （用户选 A、实际跑 B），症状与上述宽容完全相同。
  */
 export function geminiModelSpec(modelId: string, effort?: string): GeminiModelSpec {
+  if (geminiCanonicalModelId(modelId) !== GEMINI_UPSTREAM_FLASH) {
+    throw new LlmError(
+      `gemini: 模型 "${modelId}" 不在本 provider 目录中（仅支持 ${GEMINI_UPSTREAM_FLASH}）`,
+      'INVALID_REQUEST',
+    )
+  }
   const tier = geminiEffortToTier(effort)
   return {
     upstream: `${GEMINI_UPSTREAM_FLASH}-${tier}`,
