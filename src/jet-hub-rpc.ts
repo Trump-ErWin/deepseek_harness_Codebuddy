@@ -46,6 +46,7 @@ import { ZCODE } from './zcode-product.js'
 import type { ZcodeCredential } from './zcode.js'
 import { phoneFromUserId, isUsableZcodeCredential } from './zcode.js'
 import type { ZcodeBalanceResult } from './zcode-upstream.js'
+import { ZCODE_LOGIN_PROVIDER, type ZcodeLoginProvider } from './zcode-login.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
 import { MINIMAX } from './minimax-product.js'
@@ -234,6 +235,43 @@ function shortId(): string {
   const buf = new Uint8Array(4)
   crypto.getRandomValues(buf)
   return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * ZCode 登录渠道的白名单归一。
+ *
+ * ## 为什么要有这道
+ *
+ * `account.create` 的载荷来自**客户端自报**（RPC 入口没有 schema 校验），
+ * 而 `ZcodeLoginProvider` 只是个 TypeScript 联合类型 —— 运行时任何字符串都能进来。
+ * 原先只写 `req.zcodeProvider ?? 'bigmodel'`：缺省兜底是对的，但**没有校验**，
+ * 传入 `zhiPu` / `ZAI`（大小写不同）这类未登记值会被原样送进
+ * `startZcodeLogin` → 打到一个不存在的授权端点，表现为
+ * 「授权页打不开」或「轮询到超时」这类极难定位的失败。
+ *
+ * ## 为什么**回落**而不是报错
+ *
+ * 回落方向与既有的 `?? 'bigmodel'` 兜底一致：老客户端、新客户端、
+ * 手改过载荷的用户都还能登录（只是用缺省渠道）。且前端只会下发下拉框里的
+ * 两个值，正常路径永远走不到这条分支 —— 它是**兜底**不是**主路径**。
+ * 真正非法的输入会留一条 `console.warn`（与本文件其余告警同一惯例），
+ * 便于事后发现是哪个客户端在发怪值。
+ *
+ * @param raw 客户端自报的渠道（可能未登记）
+ * @returns 可安全交给 `zcode.startLogin` 的渠道
+ */
+export function normalizeZcodeLoginProvider(raw: string | undefined): ZcodeLoginProvider {
+  if (raw === 'zai') return 'zai'
+  if (raw !== ZCODE_LOGIN_PROVIDER) {
+    // ⚠ 只在**非缺省**时记 warn：`undefined` 是绝大多数调用方的形态（老客户端不传），
+    //   对它刷日志等于每建一个账号多一行噪音，会把真正的异常埋掉。
+    if (raw !== undefined) {
+      console.warn(
+        `[jet-hub] 未登记的 zcode 登录渠道 ${JSON.stringify(raw)}，已回落到 ${ZCODE_LOGIN_PROVIDER}`,
+      )
+    }
+  }
+  return ZCODE_LOGIN_PROVIDER
 }
 
 /** 解析 Buddy 凭据 JSON；解析失败返回 undefined。 */
@@ -1728,7 +1766,12 @@ function registerJetHubEndpoints(
           const started = await zcode.startLogin({
             refName,
             // ⚠️ 缺省 `'bigmodel'`（既有行为不变）；`'zai'` 走 chat.z.ai 国际版。
-            provider: req.zcodeProvider ?? 'bigmodel',
+            // ⚠️ 必须过白名单（真实修复，Gitee issue IKJLK3 E2）：`req` 是**客户端
+            //   自报**的（RPC 载荷没有 schema 校验），原先只做 `?? 'bigmodel'` 兜底，
+            //   任何其它字符串都会被原样送进 `startZcodeLogin` → 打到一个不存在的
+            //   授权端点，表现为「授权页打不开 / 轮询到超时」这类难以定位的失败。
+            //   未登记值一律回落到缺省渠道并记日志（不报错，见下）。
+            provider: normalizeZcodeLoginProvider(req.zcodeProvider),
           })
           // 先登记占位条目（无凭据），使前端 `login.poll` 能立即看到该账号；
           // 登录成功后再回填昵称。失败则删除占位条目。
