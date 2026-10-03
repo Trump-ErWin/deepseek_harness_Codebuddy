@@ -1013,6 +1013,7 @@ describe('model.list / model.setDisabled 端点', () => {
       {} as never, // raccoon
       {} as never, // minimax
       {} as never, // zcode（2026-09-29 新增，紧随 raccoon）
+      {} as never, // gemini（2026-10-03 新增，追加在 zcode 之后）
       options.modelAdapters as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -2079,6 +2080,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
       {} as never, // raccoon
       {} as never, // minimax
       {} as never, // zcode
+      {} as never, // gemini（新 provider 一律追加在末尾，见 registerJetHubRpc 注释）
       (adapter !== undefined ? { buddy: adapter } : undefined) as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')

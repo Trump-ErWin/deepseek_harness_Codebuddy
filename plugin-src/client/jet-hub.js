@@ -251,6 +251,18 @@ const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAA
  */
 const OPENCODE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzEyMTYxZCIvPjxwYXRoIGQ9Ik02LjUgOC41IDEwLjUgMTJsLTQgMy41IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBkPSJNMTIuNSAxNmg1IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48L3N2Zz4=';
 
+/**
+ * Gemini Code Assist 面板图标（内联 SVG data URL，手绘）。
+ *
+ * ⚠️ 与 Qoder / LobsterAI / TRAE / OpenCode 同款做法：Gemini 的官方星形
+ * 标志没有可取的小尺寸位图资源，走内联 SVG（体积小、无色差、20×20 下清晰）。
+ * 图形：蓝紫渐变四角星 + 右上小星（官方品牌色的近似，非逐像素复刻）。
+ *
+ * ⚠️ 必须自带图形与底色 —— 容器按 `logoClass: 'gemini'` 给**白底**
+ *（见 `jet-hub-styles.js` 的 `.dim-jh-providerIcon.gemini`）。
+ */
+const GEMINI_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIxIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjNDI4NUY0Ii8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjOUI3MkNCIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDJjLjQgMy45IDIuMSA2LjYgNiA4LTMuOSAxLjQtNS42IDQuMS02IDgtLjQtMy45LTIuMS02LjYtNi04IDMuOS0xLjQgNS42LTQuMSA2LThaIiBmaWxsPSJ1cmwoI2cpIi8+PHBhdGggZD0iTTE5LjUgMTRjLjIgMS43LjkgMi45IDIuNiAzLjUtMS43LjYtMi40IDEuOC0yLjYgMy41LS4yLTEuNy0uOS0yLjktMi42LTMuNSAxLjctLjYgMi40LTEuOCAyLjYtMy41WiIgZmlsbD0idXJsKCNnKSIvPjwvc3ZnPg==';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -293,6 +305,19 @@ const PROVIDERS = Object.freeze([
    * 一致性断言都依赖它（raccoon 那条同理，改一处会连锁失败）。
    */
   { id: 'opencode', label: 'OpenCode', icon: OPENCODE_ICON, logoClass: 'opencode' },
+  /**
+   * Gemini Code Assist（Google Cloud Code 免费线，第 14 个 provider）。
+   *
+   * ⚠️ label 必须与 `GEMINI.displayName` **逐字一致**（`src/gemini.ts` 的
+   * `displayName: 'Gemini Code Assist'`）：rail 宽度算式（`.dim-jh-rail` 的
+   * 228px）与跨文件一致性断言都依赖它。这条是本表里**最长**的 label，
+   * 但它仍短于既有的「WorkBuddy (国际版)」（141px 实测），故不会撑破 rail。
+   *
+   * ⚠️ 登录走**浏览器回调式 OAuth**（本地 `127.0.0.1` 起回调服务），
+   * 后端在 `account.create` 里**立即返回 loginUrl** —— 前端与其余 provider
+   * 共用同一条「弹窗 + 登录轮询」路径，无需特殊分支。
+   */
+  { id: 'gemini', label: 'Gemini Code Assist', icon: GEMINI_ICON, logoClass: 'gemini' },
 ]);
 
 /**

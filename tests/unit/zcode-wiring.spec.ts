@@ -466,10 +466,10 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     expect(ids).toContain('codearts')
     expect(ids).toContain('raccoon')
     // ⚠️ 计数会随 provider 增删变化（2026-09-30 加 minimax：11 → 12；
-    // 2026-10-01 加 opencode：12 → 13）。
+    // 2026-10-01 加 opencode：12 → 13；2026-10-03 加 gemini：13 → 14）。
     // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
     // 上面的具体 id；若将来再加 provider，记得同步这里。
-    expect(ids).toHaveLength(13)
+    expect(ids).toHaveLength(14)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -542,8 +542,9 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
 
   it('index.ts 把 zcode 接进 registerJetHubRpc 与 modelAdapters', () => {
     const source = readFileSync(resolve(HERE, '../../src/index.ts'), 'utf8')
-    // ⚠️ 2026-09-30 合并后 minimax 排在 zcode 之前 —— 用 .* 容忍中间插队者。
-    expect(source).toMatch(/registerJetHubRpc\(ctx, pool, service, .*raccoon,.*zcode, modelAdapters\)/)
+    // ⚠️ 2026-09-30 合并后 minimax 排在 zcode 之前；2026-10-03 加 gemini 时
+    // 按「新 provider 追加在末尾」的惯例排在 zcode 之后 —— 用 .* 容忍中间插队者。
+    expect(source).toMatch(/registerJetHubRpc\(ctx, pool, service, .*raccoon,.*zcode,.*gemini, modelAdapters\)/)
     expect(source).toMatch(/zcode: zcodeAdapter/)
   })
 
