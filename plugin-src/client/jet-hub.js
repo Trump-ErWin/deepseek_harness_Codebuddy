@@ -3798,7 +3798,7 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
   React.createElement('div', {
-    className: 'dim-jh-modal',
+    className: 'dim-jh-modal dim-jh-gatewayModal',
     role: 'dialog',
     'aria-modal': 'true',
     'aria-label': '本机 OpenAI 网关',
@@ -3834,20 +3834,29 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
         onChange: () => void onToggle(!(status?.enabled === true)),
       })),
     gatewayStatusLines(status).map((line, index) =>
-      React.createElement('p', { key: `status-${index}`, className: 'dim-jh-modalHint' }, line)),
+      // ⚠️ 顶部三行是同一段话，用更紧的 .dim-jh-gatewayLine（再叠上弹窗级的
+      // 6px 会显得像三段互不相干的内容）。
+      React.createElement('p', {
+        key: `status-${index}`,
+        className: 'dim-jh-modalHint dim-jh-gatewayLine',
+      }, line)),
     // 凭据区：默认**不**渲染明文（设置页会被截图/录屏/投屏）。点「复制」直接
     // 进剪贴板；复制失败（无 Clipboard API、非用户手势、权限被拒）则退回显示
     // 明文供手动选中 —— 绝不能变成「点了没反应」。
-    React.createElement('p', { className: 'dim-jh-modalHint' },
-      '鉴权用 Authorization: Bearer <网关 API Key>。'),
+    //
+    // ⚠️ 用户 2026-10-04 要求精简：原先是一行「鉴权用 Authorization: Bearer
+    // <网关 API Key>。」+ 下面一排按钮，现改为「API KEY：」与两个按钮**同一行**。
+    // Bearer 那半句没丢 —— 它移到了 CC Switch 之外的客户端需要的信息里，见 README
+    // 的「鉴权使用」；面板上只留用户真正要抄的两个东西（地址、密钥）。
     apiKey
-      ? React.createElement('div', { className: 'dim-jh-modelPanelActions', style: { marginTop: '4px' } },
+      ? React.createElement('div', { className: 'dim-jh-gatewayKeyRow', style: { marginTop: '6px' } },
+        React.createElement('span', { className: 'dim-jh-modalHint dim-jh-gatewayKeyLabel' }, 'API KEY：'),
         React.createElement('button', {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
           title: '把密钥复制到剪贴板。明文会进入剪贴板历史，注意别在不信任的机器上这么做。',
           onClick: () => void handleCopy(),
-        }, copied ? '已复制 ✓' : '复制 API Key'),
+        }, copied ? '已复制 ✓' : '复制密钥'),
         revealed
           ? React.createElement('code', {
             className: 'dim-jh-modelId',
@@ -3858,8 +3867,15 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
             title: '自动复制不可用时用它显示明文，供手动选中。',
             onClick: () => setRevealed(true),
           }, '显示明文'))
+      : React.createElement('p', { className: 'dim-jh-modalHint' },
+        'API KEY：尚未生成（启用网关时会自动创建）。'),
+    // ⚠️ 只有拿到密钥时才补这一行来源说明：`apiKey` 为空时上面那句
+    // 「尚未生成（启用网关时会自动创建）」已经把事情说完，而
+    // `gatewayApiKeyHint(null)` 说的是同一件事 —— 两句并排就是冗余，
+    // 与本次「精简臃肿」的目标正好相反。
+    apiKey
+      ? React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayApiKeyHint(apiKey))
       : null,
-    React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayApiKeyHint(apiKey)),
 
     // ── 模型目录 ──
     // 存在的理由：有些 agent（ZCode 等）**不会**主动扫 `/v1/models`，要靠用户
@@ -3909,7 +3925,7 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
       })
       : null,
     React.createElement('p', { className: 'dim-jh-modalHint' },
-      '也可以用命令行查看同一份目录（地址栏直接打开会返回 401，因为它需要 Bearer 头）：'),
+      '命令行查看同一份目录（需 Bearer 头，地址栏直接打开会 401）：'),
     React.createElement('code', {
       className: 'dim-jh-modelId',
       style: { display: 'block', marginTop: '4px', userSelect: 'all' },
@@ -3995,7 +4011,7 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
           }))
       : null,
     React.createElement('p', { className: 'dim-jh-modalHint' },
-      '同一份对照表也可以用命令行查看（同样需要 Bearer 头）：'),
+      '命令行查看同一份对照表（同样需 Bearer 头）：'),
     React.createElement('code', {
       className: 'dim-jh-modelId',
       style: { display: 'block', marginTop: '4px', userSelect: 'all' },
