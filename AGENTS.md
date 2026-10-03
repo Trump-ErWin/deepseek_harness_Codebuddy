@@ -7522,8 +7522,28 @@ max ultra`）。CC Switch 把那 8 个（连英文描述）**硬编码在自己�
 （`translate(canonicalFor(id), declared) === id`）；把几个渠道的档位混成一个集合再反查
 没有意义 —— 用例里按渠道分别验。
 
+⚠️⚠️ **面板对照表不复用模型清单的行样式**（用户反馈，2026-10-03：「你这对照表字符过长
+都被省略了」）：`dim-jh-modelId` / `dim-jh-modelName` 带 `max-width: 46%` +
+`text-overflow: ellipsis` + `white-space: nowrap`（模型清单要紧凑，那是刻意的），
+而对照表那两行**正是用户要抄走的内容** —— 截断等于让这个功能失效。
+故对照表用自己那套 `dim-jh-effortRow` / `dim-jh-effortHead` / `dim-jh-effortModel` /
+`dim-jh-effortLine`（`overflow-wrap: anywhere`，**不得**出现 `ellipsis` / `nowrap`）。
+`openai-gateway-panel.spec.ts` 的「排版（不截断）」段锁死了这两点（样式不得截断 +
+渲染处不得用 `dim-jh-modelName`）。
+
+⚠️ **对照表的搜索比模型清单多匹配「档位名」**（`matchesEffortQuery` 复用
+`matchesModelQuery` 之后**再补**真实档位名与该填的规范名）：最常用的查法就是
+「哪个渠道有 `xhigh`」「界面上的 Max 到底是哪个 id」—— 后者正是用户踩过的坑。
+**别**为了「统一」把它换成只认 id/name（用例里有一条专门锁这个差异）。
+空搜索词 = 未搜索（原样返回、不复制）这条约定与模型清单共用 `model-filter.js` 的
+`isFilterActive`，不要各写一份。
+
+⚠️ 对照表**只含已开启的模型**（数据来自适配器 `listModels` 的黑名单过滤，
+与对话框模型选择器同源）。文案必须点明「当前已开启的 N 个模型里…」——
+否则用户看到「14 个」会以为网关只认得 14 个模型（他实际这么反馈过）。
+
 **回归用例**：`tests/unit/reasoning-ladder.spec.ts`（强度序 / 三条规则 / 同族约束 /
 反查往返）、`openai-gateway-messages.spec.ts`（翻译 + 通知 + 未知仍 400 + 不下发）、
 `openai-gateway-models.spec.ts`（档位视图 + 容错 + 两处同源）、
 `openai-gateway-server.spec.ts` 的「思考档位」段（HTTP 层实测那三条雷 + 对照表端点）、
-`openai-gateway-panel.spec.ts`（对照表行与文案）。
+`openai-gateway-panel.spec.ts`（对照表行与文案 / 搜索判据 / 不截断排版）。
