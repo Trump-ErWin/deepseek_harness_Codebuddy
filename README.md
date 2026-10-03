@@ -1,5 +1,7 @@
 # dsh-codearts-auth
 
+> **使用声明**：本代码随便使用，但**不要转发到 GitHub** —— 免费的羊毛，中国人先享受。🐑
+
 deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走新式 IAM OAuth
 （portal `/authorize` 授权 → 本地 `/oauth/callback` 回调 → STS token 端点换取含
 `refresh_token` 的凭据），到期前静默续期，无需再次打开浏览器；旧 ticket 流程保留
