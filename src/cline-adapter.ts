@@ -32,6 +32,8 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { RATE_LIMIT_FALLBACK_MS, parseRateLimitError } from './llm-adapter.js'
+import { retryAfterMsFromResponse } from './retry-after.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { isClineExpired, clineHeaders, type ClineCredential } from './cline.js'
@@ -641,12 +643,16 @@ export class ClineAdapter extends LlmAdapter {
         const tried = new Set<string>()
         if (currentAccountId.length > 0) tried.add(currentAccountId)
         const maxRotate = CLINE_MAX_ROTATE - 1
+        // 最后一次失败的原样信息（状态码 + 上游文案）—— 全部账号都不可用时
+        // 必须把它带给用户，否则「限流」与「额度耗尽」在 UI 上长得一模一样，
+        // 用户（和排障的人）都无从判断该等还是该去充值。
+        let lastFailure = `HTTP ${response.status} ${errorDetail(errorText)}`.trim()
         for (let round = 0; round < maxRotate; round++) {
           if (currentAccountId.length > 0 && recordsClineRateLimit(response.status, errorText)) {
             await this.options.accountPool.updateModelRateLimit(
               currentAccountId,
               options.model,
-              Date.now() + CLINE_RATE_LIMIT_FALLBACK_MS,
+              clineRateLimitResetAt(response, errorText, options.model),
             )
           }
           const next = await this.options.accountPool.getAvailableAccount(
@@ -666,10 +672,13 @@ export class ClineAdapter extends LlmAdapter {
             return
           }
           errorText = await response.text().catch(() => '')
+          lastFailure = `HTTP ${response.status} ${errorDetail(errorText)}`.trim()
           if (!isClineRotatableFailure(response.status, errorText)) break
         }
         throw new LlmError(
-          `cline: 模型 ${options.model} 的所有账号均不可用（限流或额度耗尽），请稍后再试`,
+          `cline: 模型 ${options.model} 的所有账号均不可用（${lastFailure}）`
+          + '。'
+          + clineExhaustedAdvice(response.status),
           'QUOTA_EXCEEDED',
         )
       }
@@ -868,8 +877,61 @@ export class ClineAdapter extends LlmAdapter {
   }
 }
 
-/** 限流标记的兜底时长（1 小时；与 buddy / lobsterai 同口径）。 */
-const CLINE_RATE_LIMIT_FALLBACK_MS = 3_600_000
+/**
+ * 本次限流**服务端要求等多久**（毫秒），拿不到时才兜底。
+ *
+ * ## 它修的是什么（真实缺陷，2026-10-03 用户报障）
+ *
+ * 用户：「倒计时结束了我再去连为什么还是失败了，显示要 60 分钟后？」
+ *
+ * 原因：标记写的一直是 `Date.now() + 60 分钟` 这个**固定值**，而 Cline 在 429 上是
+ * **会给出真实等待时长**的（见官方错误码表；它自己的客户端还专门有 long-retry-after
+ * 的处理分支）。于是那个倒计时既不等于服务端的解禁时刻，又每次失败都从**当下**
+ * 重新计一遍 —— 用户等完了再试，只要上游仍拒绝就还是「60 分钟后」，可以无限循环。
+ *
+ * 取值按「服务端说什么就是什么」：
+ * 1. **`retry-after` 响应头**（秒数或 HTTP 日期）—— 精确，且 0 是合法值；
+ * 2. 错误体里能解析出的时刻（复用 `parseRateLimitError`，与 buddy / lobsterai 同源）；
+ * 3. 都没有才退到 {@link RATE_LIMIT_FALLBACK_MS} 的**快照式**兜底（与 buddy 同口径；
+ *    面板徽章的 tooltip 已写明「只反映上一次 429 时的快照，服务端常在重置时间前
+ *    提前放行」，故这不是「假装知道」，而是「等一会儿再探」）。
+ */
+function clineRateLimitResetAt(response: Response, body: string, model: string): number {
+  const headerMs = retryAfterMsFromResponse(response.headers)
+  // ⚠️ `0` 是合法值（「立即解除」），必须用 `=== undefined` 判空。
+  if (headerMs !== undefined) return Date.now() + headerMs
+  return parseRateLimitError(body, model, response.status)?.resetTimeMs
+    ?? Date.now() + RATE_LIMIT_FALLBACK_MS
+}
+
+/**
+ * 全部账号都不可用时给用户的**行动建议**。
+ *
+ * ⚠️ 429 与 402 的动作**完全不同**，合并成一句「请稍后再试」会让 402 的用户白等：
+ * Cline 官方错误码表里 **402 = `Insufficient credits`**（去 app.cline.bot 充值）、
+ * **429 = `Rate limit exceeded`**（等一下重试）。这也正是 Cline 客户端自己修过的
+ * 那条（cline/cline#10139：`WAIT vs STOP not distinguished`）。
+ */
+function clineExhaustedAdvice(status: number): string {
+  if (status === 402) {
+    return '额度已用尽（HTTP 402 Insufficient credits）—— 等待不会恢复，'
+      + '请到 app.cline.bot 充值，或改用其它 provider'
+  }
+  if (status === 429) return '这是限流（HTTP 429）—— 等一段时间再试，或改用其它 provider / 账号'
+  return '请稍后再试，或改用其它 provider / 账号'
+}
+
+/**
+ * 该失败是否应**记为模型的限流标记**（让 UI 亮出「限额重置」徽章）。
+ *
+ * ⚠️ **只有 429**：徽章的含义必须是「受限，某时刻后可能自动解禁」。
+ * **402（额度耗尽）没有「多久后重置」可言** —— 记成一个 60 分钟倒计时会让用户
+ * 白等（而正确动作是去充值）。这与 `recordsLobsteraiRateLimit` 的约定一致：
+ * **不写徽章 ≠ 不换号**，402 仍然会换号重试（别的账号可能有余额）。
+ */
+export function recordsClineRateLimit(status: number, _body: string): boolean {
+  return status === 429
+}
 
 /**
  * 该失败是否值得**换号重试**。
@@ -895,18 +957,6 @@ export const CLINE_CREDIT_MARKERS: readonly string[] = [
   'credit', 'payment required', 'exceeded',
   '积分不足', '额度不足', '余额不足', '频率限制', '超出限制',
 ]
-
-/**
- * 该失败是否应**记为模型的限流标记**（让 UI 亮出「限额重置」徽章）。
- *
- * 只覆盖真正表达「这个模型/账号此刻不可用」的状态码：429 与 402。
- * 文案命中的 4xx（如 400 + 含 "credit" 的措辞）**不记徽章** ——
- * 徽章的含义必须是「受限」，而不是「这个账号出过错」
- * （与 `recordsLobsteraiRateLimit` 同约定）。
- */
-export function recordsClineRateLimit(status: number, _body: string): boolean {
-  return status === 429 || status === 402
-}
 
 /**
  * 该失败是否是**与凭据无关的访问限制**（地域封锁 / 模型未开通）。

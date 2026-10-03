@@ -249,4 +249,46 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       expect(indexCode).toContain('const resolved = await ctx.credentials.resolve')
     })
   })
+
+  /**
+   * **cline 也接上了这条**（2026-10-03 用户报障，同型缺陷）。
+   *
+   * 症状与 buddy 那次**一模一样但报错文案不同**：用户等完限流倒计时再连，得到的是
+   * `cline: no usable credential; log in first` —— 凭据明明在、账号也登录着，
+   * 只是被 `cline-free/deepseek-v4.1-flash` 的模型级限流标记挡住。
+   *
+   * ⚠️ cline 的取号调用**不带 `tried`**（它只有一个显式回退路径，与 buddy 的
+   * `pickBuddyCredential` 不同），故接线断言的锚点必须按它的实际写法写，
+   * 不能照抄 buddy 那组（照抄会永远红）。
+   */
+  describe('接线（源码级）：cline 同型缺陷', () => {
+    it('cline 的兜底路径也插入了限流判定', () => {
+      expect(indexCode).toContain('throwIfAllAccountsRateLimited(CLINE, modelId)')
+    })
+
+    it('判定**先于**单凭据 ref 兜底 —— 否则仍会降级成「请先登录」', () => {
+      const check = indexCode.indexOf('throwIfAllAccountsRateLimited(CLINE, modelId)')
+      const fallback = indexCode.indexOf('ctx.credentials.resolve(credentialRef(CLINE.defaultCredentialRef))')
+      expect(check).toBeGreaterThan(-1)
+      expect(fallback).toBeGreaterThan(-1)
+      expect(check).toBeLessThan(fallback)
+    })
+
+    it('判定放在 getAvailableAccount 之后（池里还有号时不该报限流）', () => {
+      const available = indexCode.indexOf('getAvailableAccount(CLINE.id, modelId ?? \'\')')
+      const check = indexCode.indexOf('throwIfAllAccountsRateLimited(CLINE, modelId)')
+      expect(available).toBeGreaterThan(-1)
+      expect(available).toBeLessThan(check)
+    })
+
+    it('助手的 product 参数只要求 id / displayName（cline 与 buddy 是两个类型）', () => {
+      // 写死 `product: BuddyProduct` 会让 cline 无法复用；断言签名已放宽。
+      // ⚠️ 不能按「第一个 `{`」切签名——类型字面量自己就带 `{`，会切在 `product: ` 上
+      // （写用例时实测到）。取固定长度的窗口。
+      const fnStart = indexCode.indexOf('const throwIfAllAccountsRateLimited')
+      const signature = indexCode.slice(fnStart, fnStart + 400)
+      expect(signature).toContain('{ id: string; displayName: string }')
+      expect(signature).not.toContain('BuddyProduct')
+    })
+  })
 })

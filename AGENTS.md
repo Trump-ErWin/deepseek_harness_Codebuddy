@@ -7547,3 +7547,57 @@ max ultra`）。CC Switch 把那 8 个（连英文描述）**硬编码在自己�
 `openai-gateway-models.spec.ts`（档位视图 + 容错 + 两处同源）、
 `openai-gateway-server.spec.ts` 的「思考档位」段（HTTP 层实测那三条雷 + 对照表端点）、
 `openai-gateway-panel.spec.ts`（对照表行与文案 / 搜索判据 / 不截断排版）。
+
+## ⚠️ Cline 限流：倒计时必须用服务端给的 `retry-after`，402 不许倒数（真实报障，2026-10-03）
+
+**用户报障**：「倒计时结束了我再去连为什么还是失败了，显示要 60 分钟后？」
+
+**三处根因**（前两处在 `src/cline-adapter.ts`，第三处在 `src/index.ts`）：
+
+1. **写死的 60 分钟，而且完全没读 `retry-after`**：标记写的是
+   `Date.now() + CLINE_RATE_LIMIT_FALLBACK_MS`。
+   **证据**：`~/.dsh/jet-hub/state.json` 里 cline 那条是 `…:59.963Z` —— `.963`
+   毫秒正是 `Date.now()+3_600_000` 的指纹（服务端给的时间不会带这种随机毫秒）；
+   同一个文件里 buddy 的 `…:07.000Z`、codearts 的 `16:00:00.000Z` 都是「整」值。
+   ⇒ 那个倒计时**既不等于服务端的解禁时刻**，又每次失败都从当下重算 —— 用户等完
+   再试，只要上游仍拒绝就还是「60 分钟后」，可以无限循环。而 Cline 在 429 上
+   **是会给出** `retry-after` 的（官方错误码表 + 它自己客户端的 long-retry-after 分支）。
+2. **402 也被记成倒计时**：官方语义是 `Insufficient credits`（去 app.cline.bot 充值），
+   **等多久都不会恢复** —— 记成 60 分钟只会让用户白等。
+3. **被自己的标记挡住时报「请先登录」**：池把被标记的账号筛掉（`account-pool.ts`
+   的 `Date.now() >= resetAt` 过滤）→ `resolveCredential` 回 `undefined` → 适配器抛
+   `cline: no usable credential; log in first`。凭据明明在、账号也登录着，用户却被
+   指去重新登录。这与 buddy 那次（`buddy-ratelimit-misreport.spec.ts` 记着）**同型**：
+   buddy / workbuddy 早已接上 `throwIfAllAccountsRateLimited`，**cline 漏了**。
+
+**修法（四条，勿回退）**：
+
+| # | 改什么 | 位置 |
+|---|---|---|
+| 1 | 标记时长 = `retry-after` 头（秒数 / HTTP 日期，**0 是合法值**）→ 错误体 → 兜底 `RATE_LIMIT_FALLBACK_MS` 快照 | `clineRateLimitResetAt` |
+| 2 | `recordsClineRateLimit` **只认 429**（402 不写徽章，但仍换号 —— 「不写徽章 ≠ 不换号」） | `cline-adapter.ts` |
+| 3 | cline 的 `resolveCredential` 接上 `throwIfAllAccountsRateLimited(CLINE, modelId)`，且**必须先于**单凭据 ref 兜底 | `src/index.ts` |
+| 4 | 全部账号失败时报错带**最后一笔的状态码 + 上游文案**，并按 429/402 给不同行动建议（等 vs 充值） | `clineExhaustedAdvice` |
+
+⚠️ `retry-after` 的解析已收敛到 `src/retry-after.ts`（原先 `opencode-adapter.ts` 与
+`opencode-product.ts` 各有一份几乎逐字相同的私有实现）。三个**必须一致**的细节：
+
+- **`0` 是合法值**（「立即解除」），判空必须用 `=== undefined`；任何 falsy 判据都会
+  把 0 当成「未知」，于是一个刚被限流的账号被白白锁一小时；
+- **纯数字必须走「秒」分支**：落到 `Date.parse('900')` 会解析成 1970 年 → 差值巨大
+  负数 → 被 `Math.max(0, …)` 抹成 0 → 账号**无限空转**；
+- **负数按无效处理**（`Date.parse('-5')` 是**合法**的 ISO 年份，同样会变 0）——
+  这一条是两个旧副本都没有的，犯错的后果同上。
+
+⚠️ 助手 `throwIfAllAccountsRateLimited` 的 `product` 参数已从 `BuddyProduct` 放宽为
+`{ id: string; displayName: string }`（`ClineProduct` 与 `BuddyProduct` 是两个类型，
+写死前者 cline 就复用不了）。
+
+⚠️ **别把 429 与 402 合并成一句「请稍后再试」**：用户的动作相反（等 vs 充值），
+这也是 Cline 客户端自己修过的那条（cline/cline#10139 `WAIT vs STOP not distinguished`）。
+
+**回归用例**：`tests/unit/retry-after.spec.ts`（10 条：秒数 / HTTP 日期 / 0 / 负数 /
+垃圾值 / 两种取头方式同答案）、`cline-adapter.spec.ts` 的「限流标记：用服务端给的时间，
+402 不倒数」段（6 条：429+头 → 用 600 秒 / 429 无头 → 1 小时快照 / HTTP 日期 /
+402 不写标记且文案含「充值」/ 报错含状态码与上游原文 / 无池账号不写标记）、
+`buddy-ratelimit-misreport.spec.ts` 的「cline 同型缺陷」接线段（4 条）。
