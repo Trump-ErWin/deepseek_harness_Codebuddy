@@ -545,20 +545,92 @@ const STYLES = `
  *
  * ## 两级收敛（用户定：1+2）
  *
- * ① 基础宽度从 280px 收窄到 **150px**（文字超出走省略号，已有 min-width:0
- *    + ellipsis 支撑）—— 给模型选择器让出约 130px，够显示「图标+名字+▾」。
+ * ① 基础宽度从 280px 收窄到 **186px**（文字超出走省略号，
+ *    已有 min-width:0 + ellipsis 支撑）—— 给模型选择器让出空间，同时够显示
+ *    「渠道名 + 读数」。
+ *
+ *    ⚠️ 2026-10-03 从 150px 提到 186px。起因是真实报障：胶囊显示成
+ *    「LobsterAI (有道) · 合计 …」，**数字被截掉**。
+ *    修法分两层（见 badge-model.js 的 readingOf 与 usage-badge.js 的三段式渲染）：
+ *    · **结构**：把「渠道名」与「读数」拆成可独立收缩的 span，名字先让位；
+ *    · **尺寸**：留够「最长渠道名 + 读数」的完整宽度 —— 实测用户报障的两例
+ *      （WorkBuddy (国际版) • 200积分 = 179.3px、LobsterAI (有道) • 842.06积分
+ *      = 172.3px）在 186px 下**都不出省略号**，且对最宽那例留 6.7px 余量
+ *      （字体回退时字宽会变，贴着 180 写没有裕度）。
+ *
+ *    ⚠️ **这 +36px 是实打实的**，不要按「只是写明 border-box」理解：
+ *    ⚠️ button 元素**本来就是 border-box**（UA 默认样式表），故旧值 150px 就是
+ *    150px 的实际占位 —— 下面的 box-sizing 是**显式写出来**（防止哪天元素换成
+ *    span/div 时语义悄悄变成内容盒），并不是把 150 缩成了别的数。
+ *    多占的这 36px 由 ② 与 .dim-jh-badge 的 flex:0 1 auto 兜底：
+ *    窗口变窄时胶囊**自己先让位**（退化顺序见 .dim-jh-badgeName/Detail），
+ *    而不是把模型选择器挤出去 —— 后者正是 2026-10-02 那次报障的形态。
+ *    ⚠️⚠️ 本段注释里**不能出现反引号**（本文件整体是 JS 模板字符串，会提前终止）。
  * ② 容器再窄时（< 720px，媒体查询挂在**全局宽度**上：composer 宽度受
  *    侧栏影响，用容器查询无法表达「右侧还剩多少」）**只留状态点**，
  *    文字与 chevron 全部隐藏 —— 此时代理器优先级让给模型选择器。 */
-.dim-jh-badge { position: relative; display: flex; align-items: center; flex: none; min-width: 0; }
-.dim-jh-badgeBtn { display: flex; align-items: center; gap: 5px; max-width: 150px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
+/* ⚠️ flex: 0 1 auto（而非 none）：胶囊自身也要能收缩。它是 flex: none 时
+   宽度只由 max-width 兜底，而 max-width 只在**内容超标**时生效 —— 容器更窄时
+   它会连同右侧模型选择器一起溢出。允许收缩后，空间不足时胶囊与选择器一起让位，
+   且胶囊内部退化是有序的（先名字出省略号，数字最后才动）。 */
+.dim-jh-badge { position: relative; display: flex; align-items: center; flex: 0 1 auto; min-width: 0; }
+/* ⚠️ box-sizing 是**显式写出**的，不是修复：button 的 UA 默认样式表本就是
+   border-box（实测 offsetWidth 与 max-width 相等）。写上它只为在元素类型被改
+   （span/div 默认是 content-box）时语义不悄悄漂移 —— 那种情况下 max-width 会从
+   「占位宽度」变成「内容宽度」，胶囊会突然变宽 19px 而这行代码看着毫无变化。 */
+.dim-jh-badgeBtn { box-sizing: border-box; display: flex; align-items: center; gap: 5px; max-width: 186px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
 .dim-jh-badgeBtn:hover { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeBtn[aria-expanded="true"] { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); }
+/* 三段式文本容器：渠道名 + 分隔符 + 读数。
+   ⚠️ 必须是 flex 容器，两个文本子项才能各自独立收缩（这正是「数字不被截」的前提）。 */
+.dim-jh-badgeText { display: flex; align-items: center; min-width: 0; }
+/* ⚠️ 让位顺序：中段说明(999) → 渠道名(99) → 读数(none，**不参与收缩**)。
+   收缩量按 flex-shrink × flex-basis 加权分配，999 与 99 相差一个数量级，
+   故「包名先走、渠道名其次」，读数一个字都不会少。
+   flex-grow 一律为 0：胶囊是内容自适应宽度，任何 grow 都只会让它在宽容器里虚胖。
+   min-width:0 是省略号生效的前提（flex 子项默认 min-width:auto，会撑破 max-width）。 */
+.dim-jh-badgeName { flex: 0 99 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 分隔符「•」：定宽不收缩，两侧间距由 margin 给。
+   ⚠️ 这里的 3px **不能**换成前后空格：flex 容器把 span 之间只含空白的文本节点
+   渲染成**零宽**（实测 gap=0，节点还在但看不见），空格会静默消失。
+   带空格的那份写法（BADGE_SEP = ' • '）只用于 title / aria-label 那句整文。 */
+.dim-jh-badgeSep { flex: none; margin: 0 3px; }
+/* 中段说明（只有套餐模式有值，如包名 Free Plan Subscription）。
+   ⚠️ 收缩权重**最大**（999）：它比渠道名更该让位 —— 包名多为样板字、且长，
+   而用户认得出自己选的渠道。
+   ⚠️ 它被压到 0 宽时（内容过长）该节点仍在，会留下一个「悬空的分隔符」；
+   这在胶囊这一行是可接受的（完整文案在 title 与弹窗里），故不额外做条件渲染。 */
+.dim-jh-badgeDetail { flex: 0 999 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ⚠️⚠️ 读数必须 flex: none（**完全不收缩**），不能写 flex: 0 1 auto。
+   这是第二处、也是更隐蔽的一处「数字被截」成因，**靠截图才发现**：
+
+   收缩量按 flex-shrink × flex-basis 加权分配，读数那一份虽小却**不为零** ——
+   实测读数被分到 0.77px 的收缩（getBoundingClientRect 宽 78.23 / 内容宽 79）。
+   而 text-overflow: ellipsis 的触发条件是 scrollWidth > clientWidth，
+   **亚像素级的收缩就足以命中** ⇒ 最后一个字被换成「…」，
+   视觉上和「整段被截」一样严重。
+
+   ⚠️ 更坑的是**量不出来**：clientWidth 取整，53.97 报成 54，
+   于是 scrollWidth > clientWidth 判为 false —— 我用它写的「数字是否完整」
+   断言一路全绿，而截图里明明白白写着「347.87积…」。
+   教训：判断省略号要看**截图**或用小数宽度（getBoundingClientRect），
+   不能用取整后的 clientWidth。
+
+   ⚠️ 类名刻意**不叫 .dim-jh-badgeValue**：那个名字已被弹窗读数占用，且那条规则
+   （font-weight:600）排在样式表更后面 —— 同名会让胶囊数字被静默加粗。
+
+   ⇒ 读数恒定完整；全部收缩由 .dim-jh-badgeDetail(999) 与 .dim-jh-badgeName(99)
+   承担，两者最坏缩到 0 也放得下（读数最宽约 97px + 分隔符与内边距 ≈ 131px
+   < 186px 上限）。 */
+.dim-jh-badgeReading { flex: none; min-width: 0; white-space: nowrap; }
+
 /* ② 窄屏收敛：只留状态点，文字与 chevron 让位给模型选择器。
- * 阈值 720px 是实测桌面版在 100% 缩放下「徽标 150px + 模型选择器 ≥ 240px」的临界值。 */
+ * 阈值 720px 是实测桌面版在 100% 缩放下「徽标 186px + 模型选择器 ≥ 240px」的临界值。
+ * ⚠️⚠️ 本段的**位置**是功能性的，不要为了排版把它挪到 .dim-jh-badgeText 之前：
+ * 它与 ".dim-jh-badgeText { display: flex }" 特异性相同（都是单个类），
+ * 靠**源顺序**决定胜负 —— 一旦被排到前面，窄屏下 display:none 会被
+ * 后面的 display:flex 覆盖，文字重新出现并挤压模型选择器（静默回归）。 */
 @media (max-width: 720px) { .dim-jh-badgeText, .dim-jh-badgeBtn > svg, .dim-jh-badgeBtn > .dim-jh-badgeChevron { display: none; } .dim-jh-badgeBtn { max-width: none; padding: 2px 6px; } }
-/* min-width:0 是省略号生效的前提（flex 子项默认 min-width:auto，会撑破 max-width） */
-.dim-jh-badgeText { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .dim-jh-badgeDot { width: 5px; height: 5px; flex: none; border-radius: 999px; background: var(--dsw-alias-state-success-primary); }
 .dim-jh-badgeDot[data-tone="warn"] { background: var(--dsw-alias-state-warn-primary); }
 .dim-jh-badgeDot[data-tone="error"] { background: var(--dsw-alias-state-error-primary); }

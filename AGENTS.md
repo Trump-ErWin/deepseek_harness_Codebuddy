@@ -6945,3 +6945,77 @@ client **每轮**问 `captcha.carrierUrl`（`null` ⇒ 记 `no-carrier-url` 并�
 ⚠ 这条降级链**领取路径也接上了**（`claimDailyWith` 内，评审 C4）：领取端点**始终**索要 captcha
 且校验前置于 plan 校验，是内部 param 最容易被拒的地方；重发**上限一次**，
 换 chromium 后仍被拒的文案要能让用户看出「这更像设备信誉问题」。
+## ⚠️⚠️ 用量徽标折叠态：渠道名与读数**必须是两个元素**（真实报障，2026-10-03）
+
+**报障**：胶囊显示成 `LobsterAI (有道) · 合计 …` —— **数字被截掉**，而渠道名完整。
+
+**根因不在宽度，在结构**：原先整句是**一个** `overflow: hidden; text-overflow: ellipsis`
+的 span，省略号从右往左吃，被吃掉的恰好是用户唯一想看的东西（还剩多少）。
+⇒ 把 `badgeView()` 的返回拆成 `name` / `detail` / `reading` **三个字段**
+（`plugin-src/client/badge-model.js`），渲染层再给**不同的收缩权重**
+（`usage-badge.js` 的三段式 `collapsed` + `jet-hub-styles.js` 的三条规则）：
+
+| 段 | 类 | flex-shrink | 让位顺序 |
+|---|---|---|---|
+| 渠道名 | `.dim-jh-badgeName` | 99 | 第二 |
+| 包名（仅套餐模式） | `.dim-jh-badgeDetail` | 999 | 第一 |
+| 读数 | `.dim-jh-badgeReading` | **`flex: none`** | **不让位** |
+| `•` | `.dim-jh-badgeSep` | `flex: none` + `margin: 0 3px` | 不参与 |
+
+### ⚠️ 读数必须 `flex: none` —— 这是第二个、更隐蔽的成因
+
+给读数留 `flex-shrink: 1`（哪怕幅度极小）时，加权分配仍会分给它**不到 1px** 的收缩
+（实测 78.23 宽 / 内容 79），而 `text-overflow: ellipsis` 的触发条件是
+`scrollWidth > clientWidth` —— **亚像素级收缩就足以命中**，最后一个字被换成「…」，
+视觉上和整段被截一样严重。故读数的 `flex` 是 `none`，**不是** `0 1 auto`。
+
+### ⚠️⚠️ 这条缺陷**用 `clientWidth` 量不出来**（我因此假绿了一整轮）
+
+`clientWidth` 与 `scrollWidth` **都取整**：
+- `clientWidth` 把 53.97 报成 54 ⇒ `scrollWidth > clientWidth` 判为 **false**（漏判）；
+- `scrollWidth` **向上**取整，内容 39.79 报成 40 ⇒ `rect < scrollWidth` 恒成立（误判）。
+
+我第一次写的断言用 `scrollWidth > clientWidth` 判「数字是否完整」，**全部通过**，
+而**截图里明写着 `347.87积…`**。⇒ **判定省略号只能靠截图**，或量一个
+**同字体的自然宽度参照元素**再与元素实际宽度比（`tests` 里没做渲染测试，
+故这一条只能靠改样式时人工截图复核 —— 见下）。
+
+### 测量数据（Edge headless，宿主 UI 字体栈，dsf 1 与 1.5 都量过）
+
+| 用例 | 自然宽度 | 186px 下 |
+|---|---|---|
+| `WorkBuddy (国际版) • 200积分` | 179.3px | 完整 |
+| `LobsterAI (有道) • 842.06积分` | 172.3px | 完整 |
+| `WorkBuddy (国际版) • 347.87积分` | 193.6px | 名字省略，**数字完整** |
+| `CodeBuddy (腾讯) • Free Plan Subscription 300 / 500积分` | 309px | 包名+名字省略，**数字完整** |
+
+⚠️ 宽度上限取 **186px**（原 150px）：对最宽的那个报障样例留 6.7px 余量。
+⚠️ `<button>` **本来就是 `border-box`**（UA 默认样式表），故这次是**实打实多占 36px**，
+不要按「只是写明 box-sizing」理解；多占的空间由 `.dim-jh-badge` 的 `flex: 0 1 auto`
+（**不是 `none`**）兜底 —— 窄窗口下胶囊自己先让位，而不是把模型选择器挤出去
+（后者正是 2026-10-02 那次报障的形态）。
+
+### ⚠️ 两个静态陷阱（都有用例守着）
+
+1. **类名不能复用 `.dim-jh-badgeValue`** —— 那个名字已被**浮层**里的读数占用，
+   规则带 `font-weight: 600` 且排在样式表**更后面**（同特异性 ⇒ 后者胜），
+   沿用同名会让胶囊里的数字被静默**加粗**。故胶囊用 `.dim-jh-badgeReading`。
+2. **窄屏「只留状态点」的媒体查询必须排在 `.dim-jh-badgeText { display: flex }` 之后** ——
+   两者特异性相同，胜负由**源顺序**决定；排到前面会让 `display: none` 被
+   `display: flex` 覆盖，窄屏下文字重新出现并挤压模型选择器（宽窗口下完全看不出）。
+
+### ⚠️ 分隔符的间距只能用 CSS，不能用字符串里的空格
+
+`BADGE_SEP = ' • '`（带空格）**只用于 `title` / `aria-label` 那句整文**。
+渲染层里 `•` 是独立 span，间距靠 `margin` —— 因为 **flex 容器把 span 之间只含空白的
+文本节点渲染成零宽**（实测 gap=0：节点还在、看不见），空格会静默消失。
+
+### ⚠️ `jet-hub-styles.js` 的注释**不能出现反引号**（本次又踩一次）
+
+该文件的 `STYLES` 是模板字符串。我在标出「报障原文」时写了反引号，
+`node --check` 直接报 `Unexpected identifier`。已有一条用例扫徽标那一段的注释块。
+⚠️ 注意 `\``（转义）**也会**在产物里留下真反引号 —— 该用例照样会红。用「」代替。
+
+⚠️ 这条只对**模板字符串所在的文件**成立：`badge-model.js` / `usage-badge.js` 是普通
+JS，里面的 JSDoc 写反引号没问题 —— 但**从它们复制片段进 `jet-hub-styles.js` 就会炸**。
+动手前先确认目标文件是不是模板字符串。

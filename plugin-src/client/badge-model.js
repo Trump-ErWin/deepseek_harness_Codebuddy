@@ -40,6 +40,16 @@ export const BADGE_PREFERENCES = Object.freeze(['auto', 'subscription', 'credits
 export const DEFAULT_BADGE_PREFERENCE = 'auto';
 
 /**
+ * 折叠态里**渠道名与读数之间**的分隔符（用户 2026-10-03 定：''供应商 • 剩余积分''）。
+ *
+ * ⚠️ 它是一个常量而不是各处手写的字符串：完整文案（{@link badgeView} 的 `text`，
+ * 供 title / aria-label 用）由 `名字 + BADGE_SEP + 读数` 拼出，而胶囊里那三段是
+ * **三个独立的 span**（名字可收缩、读数不可）。两边若各写一份字形，改一处就会
+ * 出现「悬浮提示写着 • 而胶囊里是 ·」这种不一致。
+ */
+export const BADGE_SEP = ' • ';
+
+/**
  * 「宿主进程跑的是旧代码」的用户提示（真实故障，2026-10-02 用户报障）。
  *
  * ## 故障长什么样
@@ -189,8 +199,11 @@ export function planGroupsOf(rows) {
  *   用户会以为账号丢了（真实报障，2026-10-02）。
  * @param input.failed - **首次读数失败且无任何数据**（显示「用量不可用」而不是
  *   「未配置启用账号」）：两种情况用户要做的下一步完全不同。
- * @returns `{ mode, text, tone, groups, planGroups, windows, failedCount, okCount, failureReason }`
+ * @returns `{ mode, name, detail, reading, text, tone, groups, planGroups, windows, failedCount, okCount, failureReason }`
  *   - `mode`：`'loading' | 'windows' | 'plan' | 'credits' | 'empty'`（**回落之后**的实际模式）；
+ *   - `name` / `detail` / `reading`：三段内容，**分开**给渲染层（见 {@link readingOf} 的说明）；
+ *     恒有 `text === composeText(name, detail, reading)`；
+ *   - `text`：完整一行，用于 `title` / `aria-label`；
  *   - `tone`：`'ok' | 'warn' | 'error' | 'muted'`（徽标圆点用）。
  */
 export function badgeView(input) {
@@ -201,11 +214,20 @@ export function badgeView(input) {
   const loading = input?.loading === true;
   const failed = input?.failed === true;
 
-  /** 空/加载状态的统一返回（保持与成功路径同一组键，调用方不必做形状判断）。 */
-  const placeholder = (mode, text, tone) => ({
+  /**
+   * 空/加载状态的统一返回（保持与成功路径同一组键，调用方不必做形状判断）。
+   *
+   * ⚠️ 入参是**读数**而不是整句文案：渠道名在这里补上，于是 `name` / `reading` /
+   * `text` 三者**不可能**自洽不了（否则会出现「文案里有名字、`name` 是空的」
+   * 这种半改状态，而胶囊只渲染 `name` + `reading`）。
+   */
+  const placeholder = (mode, reading, tone) => ({
     mode,
     preference,
-    text,
+    name: providerLabel,
+    detail: '',
+    reading,
+    text: composeText(providerLabel, '', reading),
     tone,
     groups: [],
     planGroups: [],
@@ -216,9 +238,9 @@ export function badgeView(input) {
   });
 
   // 首屏：读数还没到 → 明确的「读取中…」，**不要**说成「未配置启用账号」。
-  if (loading) return placeholder('loading', `${providerLabel} · 读取中…`, 'muted');
+  if (loading) return placeholder('loading', '读取中…', 'muted');
   // 首次读数就失败（且没有任何有效数据）→ 「用量不可用」，与「没有账号」区分开。
-  if (failed && accounts.length === 0) return placeholder('empty', `${providerLabel} · 用量不可用`, 'error');
+  if (failed && accounts.length === 0) return placeholder('empty', '用量不可用', 'error');
 
   const { groups, failedCount, okCount } = creditGroupsOf(accounts);
   /**
@@ -247,10 +269,15 @@ export function badgeView(input) {
         ? 'credits'
         : 'empty';
 
+  const { detail, reading } = readingOf({ mode, windows, planGroups, groups, accounts, failedCount });
+
   return {
     mode,
     preference,
-    text: textOf({ mode, providerLabel, windows, planGroups, groups, accounts, failedCount }),
+    name: providerLabel,
+    detail,
+    reading,
+    text: composeText(providerLabel, detail, reading),
     tone: toneOf({ mode, windows, planGroups, groups, accounts }),
     groups,
     planGroups,
@@ -261,24 +288,75 @@ export function badgeView(input) {
   };
 }
 
-/** 折叠态文案（各模式一行）。 */
-function textOf({ mode, providerLabel, windows, planGroups, groups, accounts, failedCount }) {
+/**
+ * 把折叠态拆成**三段**：渠道名 → 可选的中段说明 → 读数。
+ *
+ * 名字与读数由 {@link badgeView} 直接给出，本函数只负责拼出**整句文案**（`text`），
+ * 供 `title` / `aria-label` 与读屏使用。三者恒满足：
+ *
+ * ```
+ * text === name + BADGE_SEP + (detail === '' ? '' : detail + ' ') + reading
+ * ```
+ *
+ * ⚠️ 渲染层**不**用这个字符串，而是按同一组字段渲染成多个 span（见
+ * {@link readingOf} 的说明）—— 两条路径共用同一份字段，故不可能显示成两样。
+ */
+function composeText(name, detail, reading) {
+  const middle = detail === '' ? '' : `${detail} `;
+  return `${name}${BADGE_SEP}${middle}${reading}`;
+}
+
+/**
+ * 折叠态的**三段内容**（渠道名与两段读数）。
+ *
+ * ## 为什么把「名字」与「读数」拆开返回（真实报障，2026-10-03）
+ *
+ * 用户报障：胶囊显示成 `LobsterAI (有道) · 合计 …`，**后面的数字被截掉了**。
+ *
+ * 根因不在宽度，而在结构：原先整句是**一个** `overflow: hidden` 的 span，省略号
+ * 从右往左吃 —— 而被吃掉的那一段恰恰是用户唯一想看的东西（还剩多少）。渠道名
+ * 反而完整保留。故这里拆成独立字段，渲染层再给**不同的收缩权重**。
+ *
+ * ## 口径（用户 2026-10-03 定）
+ *
+ * ```
+ * WorkBuddy (国际版) • 200积分
+ * LobsterAI (有道) • 842.06积分
+ * ```
+ *
+ * - 分隔符是 {@link BADGE_SEP}（` • `），不是原来的 ` · `（那个仍用于**读数内部**
+ *   的多段分隔，如 `5 小时 6% · 本周 2%`）；
+ * - 积分模式下**去掉「合计」**：胶囊只有一行，那个词占位却不提供信息，多账号明细
+ *   与合计都在弹窗里逐条列出（节标题右侧的 `合计 ${sum}` 仍在）；
+ * - 数值与单位**之间不留空格**（`200积分` 而不是 `200 积分`）—— 与用户给的
+ *   样例逐字一致，也省下每个单位约 3px（胶囊按 px 计费）。
+ *
+ * @returns `{ detail, reading }`
+ *   - `detail`：中段说明（**只有套餐模式**有值 —— 包名如 `Free Plan Subscription`；
+ *     它在渲染层是**最先**被省略的那个，因为数字比包名重要）。其余模式为空串；
+ *   - `reading`：真正的读数，渲染层**最后**才动它。
+ */
+function readingOf({ mode, windows, planGroups, groups, accounts, failedCount }) {
   if (mode === 'windows') {
+    // 窗口读数分不出「说明」与「数值」：`5 小时 6%` 是一个整体，拆开会出现
+    // 「5 小时」被单独留下而百分号被截的荒唐结果。故整段进 reading。
     const parts = windows.map((win) => `${win.label} ${win.percent}%`);
-    return `${providerLabel} · ${parts.join(' · ')}`;
+    return { detail: '', reading: parts.join(' · ') };
   }
   if (mode === 'plan') {
     const best = planGroups[0];
     const range = `${formatUnits(best.remaining, best.unit) ?? '?'} / ${formatUnits(best.total, best.unit) ?? '?'}`;
-    return `${providerLabel} · ${best.name} ${range} ${best.label}`;
+    // ⚠️ 包名进 detail、`剩余 / 总量 + 单位` 进 reading：包名（多为
+    // `Free Plan Subscription` 这类样板字）比数字长得多且信息量低。
+    return { detail: best.name, reading: `${range}${best.label}` };
   }
   if (mode === 'credits') {
-    const parts = groups.map((group) => `${formatUnits(group.total, group.unit) ?? '?'} ${group.label}`);
-    return `${providerLabel} · 合计 ${parts.join(' · ')}`;
+    // `group.label` 就是 unitLabel(unit)（'积分' / 'Token'），故直接贴紧数值。
+    const parts = groups.map((group) => `${formatUnits(group.total, group.unit) ?? '?'}${group.label}`);
+    return { detail: '', reading: parts.join(' · ') };
   }
   // empty：区分「没有启用账号」与「全部读取失败」——两者给用户的下一步完全不同。
-  if (accounts.length > 0 && failedCount > 0) return `${providerLabel} · 用量不可用`;
-  return `${providerLabel} · 未配置启用账号`;
+  return { detail: '', reading: accounts.length > 0 && failedCount > 0 ? '用量不可用' : '未配置启用账号' };
 }
 
 /** 徽标色调（圆点）。 */

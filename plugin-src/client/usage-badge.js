@@ -553,6 +553,47 @@ function UsageBadgeActive(props) {
   const tone = failed && snapshot === null ? 'error' : view.tone;
   const title = view.failureReason === '' ? view.text : `${view.text}\n${view.failureReason}`;
 
+  /**
+   * 折叠态那一行：**按三段渲染，而不是一个字符串**（真实报障，2026-10-03）。
+   *
+   * ## 报障与根因
+   *
+   * 用户看到 `LobsterAI (有道) · 合计 …` —— 数字被截掉了。根因不是宽度不够，
+   * 而是原先**整句**塞进一个 `overflow: hidden` 的 span：省略号从右往左吃，
+   * 被吃掉的恰好是用户唯一想看的那个数（还剩多少），渠道名反而完整。
+   *
+   * ## 三段的让位顺序
+   *
+   * ```
+   * [渠道名（先让位）] • [包名（更先让位）] [读数（最后才动）]
+   * ```
+   *
+   * 由 CSS 的 flex 权重决定（见 jet-hub-styles.js 的 .dim-jh-badgeName /
+   * .dim-jh-badgeDetail 的 flex-shrink 注释）：空间不足时**先**截渠道名，
+   * 再次截包名，**数字最后**才出省略号。
+   *
+   * ⚠️ 分隔符单独成 span 且用 CSS margin 给间距，**不要**把间距写成
+   * `' • '` 里的空格：flex 容器会丢弃 span 之间只含空白的文本节点，空格会消失
+   * （实测：三段的 DOM textContent 拼出来是 `名字•读数`，没有空格）。
+   * 带空格的那份整句仍由 `view.text` 提供给 title / aria-label。
+   *
+   * ⚠️ `key` 必须稳定：这里用固定的字符串键（同一组 span 每轮只换文本），
+   * 否则每次读数到达都会重建 DOM 节点，胶囊会出现一次性闪烁。
+   */
+  const collapsed = React.createElement('span', { key: 'text', className: 'dim-jh-badgeText' }, [
+    React.createElement('span', { key: 'name', className: 'dim-jh-badgeName' }, view.name),
+    React.createElement('span', { key: 'sep', className: 'dim-jh-badgeSep' }, '•'),
+    // 空串时**不渲染**该节点：留一个空 span 会白吃一个 5px 的 gap
+    //（.dim-jh-badgeText 用的是 .dim-jh-badgeBtn 的 gap）。只有套餐模式有中段。
+    view.detail === ''
+      ? null
+      : React.createElement('span', { key: 'detail', className: 'dim-jh-badgeDetail' }, view.detail),
+    // ⚠️ 类名是 Reading 而**不是** Value：.dim-jh-badgeValue 已被弹窗里的读数占用
+    //（那条规则带 font-weight:600，且排在样式表更后面 —— 同名会让胶囊里的数字
+    // 被静默加粗、并拿到 flex:none 而无法收缩）。
+    React.createElement('span', { key: 'value', className: 'dim-jh-badgeReading' }, view.reading),
+  ]);
+
   return React.createElement('div', { className: 'dim-jh-badge', ref: root }, [
     React.createElement('button', {
       key: 'btn',
@@ -564,7 +605,7 @@ function UsageBadgeActive(props) {
       onClick: () => setOpen((was) => !was),
     }, [
       React.createElement('span', { key: 'dot', className: 'dim-jh-badgeDot', 'data-tone': tone }),
-      React.createElement('span', { key: 'text', className: 'dim-jh-badgeText' }, view.text),
+      collapsed,
     ]),
     open ? renderPopover() : null,
   ]);

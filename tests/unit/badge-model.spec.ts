@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   BADGE_PREFERENCE_LABELS,
   BADGE_PREFERENCES,
+  BADGE_SEP,
   DEFAULT_BADGE_PREFERENCE,
   HOST_STALE_HINT,
   badgeView,
@@ -165,14 +166,21 @@ describe('badgeView：模式与文案', () => {
   it('auto：有窗口显示窗口（文案含窗口名与百分比）', () => {
     const view = badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: windows, accounts: [row('a', [pkg('Cline 账户余额', 5)])] })
     expect(view.mode).toBe('windows')
-    expect(view.text).toBe('Cline · 5 小时 6% · 本周 2%')
+    // ⚠️ 分隔符是 BADGE_SEP（' • '），不再是 ' · '；' · ' 只用于读数**内部**分段。
+    expect(view.text).toBe('Cline • 5 小时 6% · 本周 2%')
+    expect(view.name).toBe('Cline')
+    expect(view.detail).toBe('')
+    expect(view.reading).toBe('5 小时 6% · 本周 2%')
     expect(view.tone).toBe('ok')
   })
 
   it('auto：无窗口有套餐时显示套餐（剩余 / 总量 + 单位）', () => {
     const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: plan, accounts: [row('a', [pkg('Bonus Pack', 20)])] })
     expect(view.mode).toBe('plan')
-    expect(view.text).toBe('CodeBuddy · Free Plan Subscription 300 / 500 积分')
+    expect(view.text).toBe('CodeBuddy • Free Plan Subscription 300 / 500积分')
+    // 包名进 detail（渲染层里**最先**被省略的那一段），数字进 reading
+    expect(view.detail).toBe('Free Plan Subscription')
+    expect(view.reading).toBe('300 / 500积分')
   })
 
   it('auto：两者都没有时显示积分合计', () => {
@@ -183,13 +191,16 @@ describe('badgeView：模式与文案', () => {
       accounts: [row('a', [pkg('Bonus Pack', 100)]), row('b', [pkg('Bonus Pack', 96.87)])],
     })
     expect(view.mode).toBe('credits')
-    expect(view.text).toBe('CodeBuddy · 合计 196.87 积分')
+    // 用户 2026-10-03 定：胶囊里不再写「合计」（那个词占位但不提供信息）
+    expect(view.text).toBe('CodeBuddy • 196.87积分')
+    expect(view.reading).toBe('196.87积分')
+    expect(view.detail).toBe('')
   })
 
   it('credits 偏好：即使有窗口也显示积分（套餐误判时的兜底开关）', () => {
     const view = badgeView({ providerLabel: 'Cline', preference: 'credits', subscription: windows, accounts: [row('a', [pkg('Cline 账户余额', 5)])] })
     expect(view.mode).toBe('credits')
-    expect(view.text).toBe('Cline · 合计 5 积分')
+    expect(view.text).toBe('Cline • 5积分')
   })
 
   it('subscription 偏好：行为与 auto 相同（窗口优先，其次套餐）', () => {
@@ -201,7 +212,7 @@ describe('badgeView：模式与文案', () => {
     const empty = { kind: 'windows', accounts: [{ accountId: 'a', nickname: 'a', ok: true, windows: [] }] }
     const view = badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: empty, accounts: [row('a', [pkg('Cline 账户余额', 12)])] })
     expect(view.mode).toBe('credits')
-    expect(view.text).toBe('Cline · 合计 12 积分')
+    expect(view.text).toBe('Cline • 12积分')
   })
 
   it('窗口取第一个**读到数**的账号（失败的账号不参与）', () => {
@@ -213,7 +224,7 @@ describe('badgeView：模式与文案', () => {
       ],
     }
     const view = badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: mixed, accounts: [row('good', [pkg('Cline 账户余额', 1)])] })
-    expect(view.text).toBe('Cline · 5 小时 33%')
+    expect(view.text).toBe('Cline • 5 小时 33%')
   })
 
   it('token 渠道按 M 显示（ZCode 的 1 亿 token 不能画成「1 亿积分」）', () => {
@@ -223,18 +234,18 @@ describe('badgeView：模式与文案', () => {
       subscription: undefined,
       accounts: [row('a', [pkg('GLM-5.2', 94_539_275, 'token')])],
     })
-    expect(view.text).toBe('ZCode (智谱) · 合计 94.54M Token')
+    expect(view.text).toBe('ZCode (智谱) • 94.54MToken')
   })
 
   it('没有启用账号 → 明确文案；全部读取失败 → 另一句（下一步动作不同）', () => {
     const none = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [] })
     expect(none.mode).toBe('empty')
-    expect(none.text).toBe('CodeBuddy · 未配置启用账号')
+    expect(none.text).toBe('CodeBuddy • 未配置启用账号')
     expect(none.tone).toBe('muted')
 
     const allFailed = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [row('a', null, '凭据未配置')] })
     expect(allFailed.mode).toBe('empty')
-    expect(allFailed.text).toBe('CodeBuddy · 用量不可用')
+    expect(allFailed.text).toBe('CodeBuddy • 用量不可用')
     expect(allFailed.tone).toBe('error')
     expect(allFailed.failureReason).toBe('凭据未配置')
   })
@@ -276,7 +287,7 @@ describe('badgeView：首屏状态（真实报障的回归）', () => {
     // 报障（2026-10-02）：徽标一开始显示「未配置启用账号」，其实只是还没读到。
     const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [], loading: true })
     expect(view.mode).toBe('loading')
-    expect(view.text).toBe('CodeBuddy · 读取中…')
+    expect(view.text).toBe('CodeBuddy • 读取中…')
     expect(view.tone).toBe('muted')
     expect(view.groups).toEqual([])
   })
@@ -284,7 +295,7 @@ describe('badgeView：首屏状态（真实报障的回归）', () => {
   it('首次读数就失败 → 「用量不可用」，与「没有账号」区分开', () => {
     const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [], failed: true })
     expect(view.mode).toBe('empty')
-    expect(view.text).toBe('CodeBuddy · 用量不可用')
+    expect(view.text).toBe('CodeBuddy • 用量不可用')
     expect(view.tone).toBe('error')
   })
 
@@ -299,7 +310,65 @@ describe('badgeView：首屏状态（真实报障的回归）', () => {
       failed: false,
     })
     expect(view.mode).toBe('credits')
-    expect(view.text).toBe('CodeBuddy · 合计 100 积分')
+    expect(view.text).toBe('CodeBuddy • 100积分')
+  })
+})
+
+/**
+ * 用户 2026-10-03 报障的回归：胶囊显示成「LobsterAI (有道) · 合计 …」，
+ * **数字被截掉**。
+ *
+ * 两条断言分别锁住「修法的两半」，缺一不可：
+ * 1. 文案口径（本文件）—— 分隔符与「名字 / 中段 / 读数」三段字段；
+ * 2. 结构（usage-badge-client.spec.ts）—— 渲染成**多个** span 且各有收缩权重。
+ *
+ * ⚠️ 只锁 ① 是不够的：文案再对，塞回一个 overflow:hidden 的 span 里照样会把
+ * 数字省略掉 —— 那正是本次报障的形态。
+ */
+describe('折叠态三段结构（真实报障：数字被截掉）', () => {
+  it('恒有 text === name + BADGE_SEP + detail + reading（渲染层与整句不会走偏）', () => {
+    const cases = [
+      { providerLabel: 'WorkBuddy (国际版)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 200)])] },
+      { providerLabel: 'LobsterAI (有道)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 842.06)])] },
+      {
+        providerLabel: 'CodeBuddy',
+        preference: 'auto',
+        subscription: { kind: 'plan', accounts: [{ accountId: 'a', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credits' } }] },
+        accounts: [],
+      },
+      { providerLabel: 'Cline', preference: 'credits', subscription: undefined, accounts: [], loading: true },
+      { providerLabel: 'Cline', preference: 'credits', subscription: undefined, accounts: [] },
+    ]
+    for (const input of cases) {
+      const view = badgeView(input)
+      const middle = view.detail === '' ? '' : `${view.detail} `
+      expect(view.text, input.providerLabel).toBe(`${view.name}${BADGE_SEP}${middle}${view.reading}`)
+      // 三段都不该自带分隔符（否则渲染层会出现两个「•」）
+      expect(view.name).not.toContain('•')
+      expect(view.detail).not.toContain('•')
+      expect(view.reading).not.toContain('•')
+    }
+  })
+
+  it('分隔符是单独常量（渲染层与文案共用同一个字形，不会一边 • 一边 ·）', () => {
+    expect(BADGE_SEP).toBe(' • ')
+    const view = badgeView({ providerLabel: 'LobsterAI (有道)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 842.06)])] })
+    expect(view.text).toBe('LobsterAI (有道) • 842.06积分')
+    expect(view.text.split(BADGE_SEP)).toEqual(['LobsterAI (有道)', '842.06积分'])
+  })
+
+  it('用户给的两个样例逐字命中', () => {
+    const workbuddy = badgeView({ providerLabel: 'WorkBuddy (国际版)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 200)])] })
+    expect(workbuddy.text).toBe('WorkBuddy (国际版) • 200积分')
+    const lobster = badgeView({ providerLabel: 'LobsterAI (有道)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 842.06)])] })
+    expect(lobster.text).toBe('LobsterAI (有道) • 842.06积分')
+  })
+
+  it('数值与单位之间不留空格（省 px，且与用户样例一致）', () => {
+    const credits = badgeView({ providerLabel: 'Cline', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Cline 账户余额', 200)])] })
+    expect(credits.reading).toBe('200积分')
+    const tokens = badgeView({ providerLabel: 'ZCode (智谱)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('GLM-5.2', 94_539_275, 'token')])] })
+    expect(tokens.reading).toBe('94.54MToken')
   })
 })
 
