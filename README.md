@@ -285,7 +285,7 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
-除 `codearts` 外，插件另注册十个独立的 provider 路由：`buddy`（见
+除 `codearts` 外，插件另注册十三个独立的 provider 路由：`buddy`（见
 [buddy provider](#buddy-provider)）、`workbuddy`（见
 [WorkBuddy provider](#workbuddy-provider)）、`lobsterai`（见
 [LobsterAI provider](#lobsterai-provider有道龙虾)）、`qoder`（见
@@ -295,8 +295,10 @@ Tokens 福利）。
 [Cline provider](#cline-provider)）、`loomy`（见
 [Loomy provider](#loomy-provider讯飞办公助手)）、`raccoon`（见
 [Raccoon Work provider](#raccoon-work-provider商汤小浣熊)）、`minimax`（见
-[MiniMax Code provider](#minimax-code-provider中国版)）与 `zcode`（见
-[ZCode provider](#zcode-provider智谱-zai-免费额度)）。十二者互不覆盖，可同时使用。
+[MiniMax Code provider](#minimax-code-provider中国版)）、`zcode`（见
+[ZCode provider](#zcode-provider智谱-zai-免费额度)）、`opencode` 与 `gemini`（见
+[Gemini provider](#gemini-providergoogle-gemini-code-assist)）。
+十四者互不覆盖，可同时使用。
 
 ## 用量徽标（模型选择器旁那枚胶囊）
 
@@ -2763,3 +2765,205 @@ ZCode 免费通道**只认 Anthropic Messages**（实测 `zcode-plan` 下的
 ⚠️ **空响应必须显式抛 `EMPTY_RESPONSE`** —— Anthropic SSE 没有 `[DONE]`
 可做锚点，若不检查就会「干净地停止、无任何报错」
 （与 Qoder 那次静默失败的形态完全一致）。
+
+## Gemini provider（Google Gemini Code Assist）
+
+第 14 个 provider，走 **Google Cloud Code Assist 免费线**
+（`daily-cloudcode-pa.googleapis.com`），浏览器回调式 OAuth 登录。
+
+**登录入口：Jet Hub 设置页的 Gemini Code Assist 面板**（与其余 provider 一致）。
+⚠️ 不注册斜杠命令。编程式调用见 `ctx.geminiAuth` 的
+`login()` / `startLogin()` / `refreshAccountCredential(refName, pool, accountId)` /
+`refreshAll(pool)` / `repairAccountNicknames(pool)`。
+
+⚠️ **只做 OAuth 一条线**（用户 2026-10-03 拍板）：API key 与 AI Studio
+（`generativelanguage.googleapis.com`）两条线都不做 —— 免费线是 Cloud Code 项目制，
+凭据就是 Google OAuth 的 `access_token` + `refresh_token`。
+
+实施计划与全部取证记录见 [`docs/GEMINI-PORT-PLAN.md`](docs/GEMINI-PORT-PLAN.md)。
+
+### ⚠️ 与其余 provider 完全不同的五点
+
+1. **请求体是双层信封，且每一层键都按字母序排列** ——
+   `{model, project, request:{contents, generationConfig, sessionId}, requestId, userAgent}`。
+   ⚠️ **这是 Go / TS 的语义差，不是风格问题**：上游 Go 用 `encoding/json` 序列化 map，
+   键**自动**字母序；TypeScript 的 `JSON.stringify` 按 V8 插入序，**不保证字母序**。
+   直接 `JSON.stringify(envelope)` 大概率对不上。实现走 `marshalAlphabetical()`，
+   并由 `tests/unit/gemini-payload.spec.ts` 的**353 字节逐字金标准**锁死。
+2. **五个身份头恒定**（`geminiHeaders()`，抓包跨会话逐字不变）：
+
+   ```
+   User-Agent: antigravity/4.3.0 (cmdc-pak)
+   x-client-name: antigravity
+   x-client-version: 4.3.0
+   x-machine-id: cmdc-pak
+   x-vscode-sessionid: proxy
+   ```
+
+   ⚠️ **一律不发** `x-goog-api-key` / `x-goog-api-client`；**流式请求刻意不带 `Accept`**。
+   ⚠️ `x-machine-id` / `x-vscode-sessionid` 看着像设备指纹，但上游写死的就是
+   `cmdc-pak` / `proxy` 两个占位串（UA 括号里也是原版自己的产品名）。
+   **别「为了更像真实客户端」生成随机值** —— 同一账号前后 machine-id 不一致可能触发
+   服务端的设备指纹一致性校验。
+3. **`thoughtSignature` 是跨轮状态** —— 模型在 `functionCall` 上回签名，必须落盘、
+   下一轮按「工具名 + 规范化参数」回填，否则多轮工具调用必被上游拒。落盘位置是
+   `$DSH_HOME/jet-hub/gemini-sigs.json`（**独立文件**，不放 `state.json` —— 那是整体
+   替换语义，会被别的写入覆盖掉）。签名被拒时做**一次去签重试**兜底。
+4. **`project` 与 `sessionId` 是预置常量、禁止随机化** —— `project` 恒为
+   `"aicode-consumers"`；真实推理的 `sessionId` 恒为 `3124275334370613369`，
+   冒烟（面板连通测试）恒为 `-6686302828062879362`（**负数**，两串不同不能混用）。
+   只有 `requestId = agent/<unix_ms>/<8hex>` 是每请求随机的。
+   ⚠️ 上游的会话归并与额度统计挂在这两个串上，改成随机会让服务端认不出是同一会话，
+   **`thoughtSignature` 回填会断**。
+5. **模型名是准入键** —— 裸 `gemini-3.8-flash` 直接 404，**档位后缀必需**
+   （`-low` / `-medium` / `-high` / `-tiered`）。`modelId` 走**严格校验**：
+   不在静态表里就抛错（此前写错模型名会**静默跑 3.8**）。
+
+### 模型目录（1 个模型 + 4 档）
+
+`listModels` **不发网络请求**（Cloud Code 没有模型列表端点），暴露静态表一条：
+
+| 模型 id | 上下文窗口 | 档位（默认「中」） |
+|---|---|---|
+| `gemini-3.8-flash` | 1,000,000 | 低 / 中 / 高 / 自适应（默认中） |
+
+⚠️ **只暴露主模型名，不暴露 4 个带后缀的名字** —— 档位走 DSH 的思考强度下拉框
+（`resolveModel().reasoning.efforts`，展示名给中文即中文界面）。
+上游名由 `geminiModelSpec()` 拼成 `gemini-3.8-flash-<tier>`；
+`tiered` 档的 `thinkingConfig` **不带** `thinkingBudget`（其余三档为
+low=1000 / medium=4000 / high=10000）。
+
+⚠️ **不认领 `claude-*` 别名**（2026-10-03 定）：DSH `/v1/models` 会合并所有 provider 的
+模型列表，认领 `claude-sonnet` 会让用户选 claude 时走 gemini（「选了 claude 怎么是
+gemini 在回答」），且将来真加了 Claude provider 会撞名导致分派不可预测。
+⚠️ **lite 不暴露**：上游恒 404（用户 2026-10-03 拍板移除）。
+
+### 图片
+
+图片走**两跳**，职责分离：
+
+1. **插件侧缩放**（防御性接入，照 `buddy-adapter.ts` 的既有做法）—— 先按
+   `imagePixelBudget` 预算（默认 `DEFAULT_IMAGE_PIXEL_BUDGET` = 640,000 px）取缩放版，
+   拿不到才发原图。⚠️ 这**不是**从原项目移植的行为：原版是纯 base64 透传、
+   不做缩放，也没探过 Cloud Code 免费线的视觉 token 预算。先接上无害防御，
+   最多图片质量略降。
+2. **翻译成 `inlineData`**（原项目忠实移植）—— base64 校验（清洗换行 / 空格）、
+   `media_type` 缺省 `image/png`、**URL 形态直接跳过**（避免 SSRF），
+   产出 `{ mimeType, data }`。
+
+### 错误归类与救场（两层：换端点 + 换号）
+
+⚠️ **不能写成「429/5xx → LlmError」** —— 那样 quota 会被当 `SERVER` 白重试 5 次
+（500/1000/2000/4000/8000 ≈ 15.5 秒）。
+
+| 错误形态 | 归类 | 处理 | 冷却 |
+|---|---|---|---|
+| 429 限流（`five_hour` / `weekly`） | `RATE_LIMIT` | 连续 2 次 429 → 切下一个可用账号 | 原账号 60s |
+| 401 凭据失效 | `AUTH` | 切下一个可用账号重试 | 原账号 300s |
+| 400 quota / permission | `QUOTA_EXCEEDED` | 先换端点；端点也撞 → 换账号 | — |
+| 403 / 404 | `SERVER` | 先换端点；端点也撞 → 换账号 | — |
+| 签名错误 | 专用 | 去签重试一次 | — |
+| 5xx / 网络抖动 | `SERVER` / `TRANSPORT` | 走 harness 退避 | — |
+| 切完仍失败 | — | 透传原错误（两个号都挂，面板可见） | — |
+
+⚠️ **端点轮换的预期要压低**：`daily-cloudcode-pa.googleapis.com` 与
+`daily-cloudcode-pa.sandbox.googleapis.com` 在能测的两类错误（404、project）上
+**行为完全一致**，背后大概率是同一套模型注册表与配额服务。换端点**零成本无害**，
+但**不能当 quota 类错误的有效解法** —— 主救场维度是**换账号**。
+
+⚠️ 切号照既有七处惯例：`tried` 集合跨重试保留（否则在两个账号间无限来回）；
+`activeAccountId` 是 `stream()` 内的局部可变状态，**不能**每次问
+`options.currentAccountId()` 回调（回调返回池当前默认账号，切号后不跟着变）；
+全部受限时如实抛 `QUOTA_EXCEEDED`，不无限切。
+
+### 配额（5 小时 / 周两个窗口）
+
+端点 `POST {endpoint}/v1internal:retrieveUserQuotaSummary`，**请求体是空对象 `{}`**
+（不带 `project`），身份头同推理请求。
+
+⚠️ 面板按**逐窗口百分比**显示（`5 小时窗口 99% / 周窗口 99%`），**不显示均值** ——
+两个窗口的均值（如 94.5）既不是上游给的数，在「额度」标签下更会被读成 94.5 个积分
+（用户 2026-10-03 报障：「为什么显示的是积分不是额度」）。同理，配额单位下**不渲染**
+「N/M 个资源包有效」—— 它的两个「包」是时间窗口，不是资源包。
+配额单位是 `'%'`（`QUOTA_UNIT`），`unitLabel()` 对它显示**「额度」**而不是「积分」，
+且**不参与** `normalizeUnit()` 归一（归成 credit 会把窗口百分比混进积分合计里求和）；
+`formatQuotaLine` / `formatQuotaDetail` 在非配额单位下返回 `null`，
+调用方原样走积分 / token 的老分支，**零影响**。
+
+账号规格（Pro / Free / Ultra）来自另一个端点 `loadCodeAssist`，与配额**搭同一次**
+`credits.balances` 回来（`RpcCreditsBalanceExtra.accountTier`），取不到时整行不渲染。
+
+⚠️ 能力矩阵登记为 `{ balance: true, dailyCheckin: false }` —— **没有签到接口**，
+故面板不渲染「一键领取积分」；`rateLimit: false`（限流是服务端配额窗口制，
+清本地标记毫无意义），故不渲染「重测 / 重置」；`test: true`，见下。
+
+### 「测试」按钮（Gemini 独有）
+
+面板的每个账号卡多一个**「测试」**按钮：无条件真实发一条最小消息，只回报
+「这一发成功了吗」，**不写任何存储**。它与既有的「重测 / 重置」是**两件事**：
+
+| | 触发条件 | 存储副作用 | 发请求 |
+|---|---|---|---|
+| **测试** | 不看限流标记，**无条件** | **一个字节都不写** | 是 |
+| **重测** | 只测**已有标记**的模型（无标记即零请求） | 清除通过的标记、写回新重置时刻 | 是 |
+| **重置** | — | 直接清除全部标记 | 否 |
+
+⚠️ 被测模型由 `pickTestModel` 按「调用方显式指定 > 已有的限流标记 > 全量目录第一个」
+决定；三者都拿不到时**如实报错而不猜一个模型名**（猜错会得到与账号无关的 404，
+把「账号不可用」与「模型名不对」混成同一条报错）。
+
+⚠️ 「测试」与「重测」**各用一个独立能力开关**（`ACCOUNT_TEST_CAPABILITIES` /
+`RATE_LIMIT_CAPABILITIES`），不能绑在一起 —— Gemini 恰好只登记了测试、没登记重测，
+绑同一个开关会让其中一个按钮消失。当前只有 Gemini 登记了测试。
+
+### 凭据与续期
+
+凭据字段 `access_token` / `refresh_token` / `token_type` / `expires_in` / `expiry` /
+`sub` / `email` / `cloudaicompanionProject`；ref 前缀 `GEMINI_ACCOUNT_<HEX>`。
+`Valid()` 留 60 秒余量，**Ensure 语义 = 用前刷新**；⚠️ **refresh_token 轮换后必须
+立即回写**（`refresh` 回调传 `pool` + `entry.id` 回写 `expiresAt`，否则 UI 一直显示
+「已过期」而实际能正常发消息）。
+
+⚠️ **`resolveCredential` 用的凭据与 `refresh` 要续期的那一份必须是同一个账号** ——
+否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
+
+⚠️ **昵称取令牌响应的 `id_token` 里的 `email`**，不再依赖 userinfo 调用
+（`www.googleapis.com/oauth2/v2/userinfo` 是**可静默失败**的跨域请求，失败就让昵称
+退化成池 id —— 用户报障「卡片显示 Gemini 10500520」/「显示 `gemini-6a53dbca`」）。
+`index.ts` 在 apply 时跑一次 `repairAccountNicknames(pool)` 补修老账号，幂等且失败不阻塞启动。
+
+⚠️ Gemini **可续期**（Google OAuth 的 refresh_token，且会轮换），所以
+`refreshAll` 定时器里**必须**登记 `['gemini', …]` 那一行 —— 漏了定时器不武装，
+凭据到期后不会自动续期，用户会看到「每隔一小时就要重新登录」且日志里一个字都没有。
+
+### ⚠️ 附带的三处跨 provider 改动
+
+本 provider 接线时顺手修的三处**影响全部 14 个 provider**，评审时须单独看：
+
+1. **网关状态码穿透**（`src/openai-gateway/stream.ts`）——
+   ⚠️ `LlmError` 的状态码**不在顶层**（`'status' in e === false`），只在
+   `e.failure.status`（`@deepseek-ai/dsh-llm` 的 `LlmFailure`）。原实现只读顶层
+   ⇒ 上游声明的 404 一路退化成 502，**确定性失败被 OpenAI 客户端白重试 5 次**。
+   修后 `toOpenAiSse` / `collectOpenAiCompletion` / `failureToOpenAiError` 三处都优先
+   用上游自带的状态码，无则才退 502。
+2. **`MISSING_MODEL_PATTERNS` 加了一条自家文案**（`model-errors.ts`）——
+   `/不在本\s*provider\s*目录中/i`（gemini 拒绝未知模型名时的措辞）。只有命中它，
+   `type` 才会从硬编码的 `server_error` 变成 `invalid_request_error`、`code` 变成
+   `model_not_found` 并触发「你是不是想用 X」。该条只匹配本插件自己的措辞，
+   不会误伤其他 provider。
+3. **`registerJetHubRpc` 多了第 14 个位置参数**（`zcode` 之后、`modelAdapters` 之前）——
+   只有一个调用点，但「新 provider 一律**追加在末尾**」是硬约定（插队会让既有调用点
+   静默错位），由 `zcode-wiring` / `minimax-rpc` / `gemini-rpc` 三个 spec 锁住实参顺序。
+
+### ⚠️ 排查取证
+
+`docs/GEMINI-PORT-PLAN.md` 是完整取证记录（两轮 MITM 抓包 + oracle 探针）。
+⚠️ 常量基准是 **cmdc-pak 0.8.6.1 + 0.8.8**；**0.8.9 未取证**（全量字符串加密，
+静态分析失效），在钉死前不要把「前两版恒定」推广到 0.8.9。
+
+⚠️ **仓库内没有 `test:e2e:gemini` 探针**（14 个 provider 里 12 个有，
+zcode 同样没有）—— 端点全部在 `*.googleapis.com`，无法在无 Google 通路的网络
+环境下运行。本 provider 的验证手段是 9 个 `tests/unit/gemini-*.spec.ts`
+（共 94 条，全部桩件、零网络、零额度）。真机验证请在有 Google 通路的机器上手动
+走一遍：新建账号 → 发带工具调用的多轮消息 → 确认 thinking 显示与签名回填。
+

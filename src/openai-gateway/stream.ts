@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { FinishReason, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { OpenAiGatewayError } from './messages.js'
-import { normalizeUpstreamFailure } from './model-errors.js'
+import { normalizeUpstreamFailure, upstreamStatusOrFallback } from './model-errors.js'
 
 /**
  * 失败后给出纠错建议的钩子。
@@ -148,7 +148,9 @@ export async function* toOpenAiSse(
         // 但它是确定性失败 —— 翻成 404 让客户端提示用户改配置。
         const normalized = normalizeUpstreamFailure({
           // 上游自带状态码（如 gemini 拒绝未知模型名时的 404）优先，否则才退化成 502。
-          status: typeof error.status === 'number' ? error.status : 502,
+          // ⚠️ 门禁（400–599）不能省：codearts 会用 `{ status: 200 }` 表示业务失败，
+          // 原样透出会让「额度用尽」在客户端眼里读成成功。另两处出口已有同一门禁。
+          status: upstreamStatusOrFallback(error.status),
           type: typeof error.type === 'string' ? error.type : 'server_error',
           code: typeof error.code === 'string' ? error.code : 'upstream_error',
           message,
@@ -206,7 +208,7 @@ export async function collectOpenAiCompletion(
         throw new OpenAiGatewayError(
           String(detail.message),
           // 上游自带状态码优先（模型名不存在 = 404），否则才当可重试的服务端故障。
-          typeof detail.status === 'number' && detail.status >= 400 && detail.status <= 599 ? detail.status : 502,
+          upstreamStatusOrFallback(detail.status),
           'server_error',
           String(detail.code ?? 'upstream_error'),
         )
@@ -259,7 +261,7 @@ export function failureToOpenAiError(error: unknown): { status: number; body: { 
     | { code?: unknown; status?: unknown; failure?: { status?: unknown }; message?: unknown }
     | undefined
   const raw = typeof value?.status === 'number' ? value.status : value?.failure?.status
-  const status = typeof raw === 'number' && raw >= 400 && raw <= 599 ? raw : 502
+  const status = upstreamStatusOrFallback(raw)
   return {
     status,
     body: { error: {
