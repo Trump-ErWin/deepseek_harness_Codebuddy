@@ -25,6 +25,7 @@ import {
   filterEffortRows,
   matchesEffortQuery,
   gatewayModelsCurl,
+  gatewayModelsEmptyHint,
   gatewayModelsHint,
   gatewayStatusLines,
   gatewaySwitchDisabled,
@@ -36,6 +37,17 @@ import { matchesModelQuery } from '../../plugin-src/client/model-filter.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(resolve(HERE, '../../plugin-src/client/jet-hub.js'), 'utf8')
+
+/**
+ * 剥掉源码里的注释。
+ *
+ * ⚠️ 断言「源码里不得出现某个选择器」时必须先剥注释：本文件多处注释**特意**写着
+ * 「第一版是 `.dim-jh-gatewayModal .dim-jh-gatewayModelRow .dim-jh-modelId`，那是错的」
+ * —— 直接 `not.toContain` 会把**这句警戒**当成缺陷命中（假红）。
+ * 这个坑本仓库踩过多次（`'鉴权用 Authorization` / `额度按**出口 IP** 计算` 同类）。
+ */
+const stripCommentsOf = (src: string) =>
+  src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
 
 const RUNNING = { enabled: true, running: true, blockedByEnv: false, address: { host: '127.0.0.1', port: 8326 } }
 const OFF = { enabled: false, running: false, blockedByEnv: false, address: null }
@@ -249,23 +261,47 @@ describe('模型 ID 清单（ZCode 等不会自动扫目录的客户端靠它）
     // ⚠️ MODELS 里是 codearts + cline 共 **2** 家（写 3 会是假红）。
     expect(hint).toContain('2 个供应商')
     expect(hint).toContain('大小写')
-    // 同名模型跨 provider 不是同一个 —— 用户最常见的误配来源。
-    expect(hint).toContain('不同供应商')
+    // ⚠️ 「已开启」这个限定词不能丢：网关目录来自各适配器的 listModels，
+    // 而它按用户在 Jet Hub 里关掉的模型过滤 —— 少了这三个字，用户会把
+    // 「14 个」读成「网关总共只认这 14 个模型」，进而以为关掉的模型也调不了。
+    expect(hint).toContain('共开启')
   })
 
-  it('★ 提示语已精简（用户 2026-10-04 要求），但不许删掉会致误配的事实', () => {
-    // 用户报障：这几段介绍「非常冗长」。
+  it('★ 提示语已精简到**一句**（用户 2026-10-04 第二次要求），但不许删掉会致误配的事实', () => {
+    // 用户报障：这几段介绍「非常冗长」；第二轮要求「精简里面的语句」。
     const hint = gatewayModelsHint(MODELS, 'catalog')
-    // ⚠️ 精简的判据用**行数**而不是字符数：臃肿的观感来自被折成好几行。
-    // 面板宽 min(560px)，12px 字号下一行约 40 个中文字，故 100 字以内基本是 2 行。
-    expect(hint.length).toBeLessThanOrEqual(100)
-    // 三条不能删的事实仍在：数量、前缀大小写、短名 vs 完整 ID。
+    // ⚠️ 判据用**长度上限**而不是「恰好等于某串」：长度为 0 的空串也满足
+    // 一切 toContain，故长度上限必须与下面的正向断言同用才有意义。
+    // 面板宽 min(560px)，12px 字号下一行约 40 个中文字，故 60 字以内必然是 1 行。
+    expect(hint.length).toBeLessThanOrEqual(60)
+    // 三项事实仍在：数量、供应商数、大小写。
+    expect(hint).toContain('个可用模型')
+    expect(hint).toContain('个供应商')
     expect(hint).toContain('大小写')
-    expect(hint).toContain('供应商前缀')
-    expect(hint).toContain('复制出去的始终是完整 ID')
+    // ⚠️ 被删掉的两句不是丢了信息，而是**换了更近的位置**：前缀规则在卡片头
+    // tooltip（「供应商 key：xxx（模型 ID 的前缀就是它）」）、短名 vs 完整 ID
+    // 在两个复制按钮的 tooltip（「每行一个完整 ID」）。见下面那两条用例。
+    expect(hint).not.toContain('必须带供应商前缀')
+    expect(hint).not.toContain('复制出去的始终是完整 ID')
     // 删掉的是举例与铺垫（这些是「冗长」的来源）。
     expect(hint).not.toContain('例如 codearts 与 buddy')
     expect(hint).not.toContain('不会自动扫描')
+  })
+
+  it('★ 精简后**前缀规则与短名差异**必须仍在面板里能找到（只是换了位置）', () => {
+    // 「精简」最容易犯的错是把信息删掉。这两条是用户配错 ID 的直接原因，
+    // 故它们必须落在**用户抄 ID 时眼睛所在的地方**：卡片头与复制按钮。
+    const panel = source.slice(
+      source.indexOf('function GatewayCards('),
+      source.indexOf('export function JetHubPage'),
+    )
+    // ① 前缀规则：卡片头 tooltip 里明确「模型 ID 的前缀就是供应商 key」。
+    expect(panel).toContain('（模型 ID 的前缀就是它）')
+    // ② 短名 vs 完整 ID：复制按钮的 tooltip 写明复制出来的是完整 ID
+    //    （行内显示的却是短名 —— 两者不同正是用户抄错的来源）。
+    expect(panel).toContain('每行一个完整 ID')
+    expect(panel).toMatch(/title: '把模型 ID 每行一个复制到剪贴板/)
+    expect(panel).toContain("copyNoun: '个完整模型 ID'")
   })
 
   it('⚠️ 空清单必须能自解释：区分「没登录」与「宿主没给出 provider」', () => {
@@ -276,31 +312,82 @@ describe('模型 ID 清单（ZCode 等不会自动扫目录的客户端靠它）
     expect(gatewayModelsHint([], 'catalog')).toContain('还没有可用模型')
   })
 
+  it('★ 搜索筛空时的提示要能区分「被搜没了」与「没有可用模型」', () => {
+    // 用户要求给模型清单也加搜索框；加了搜索就必须有这一条，
+    // 否则搜不到时的那张白卷会被读成「网关里一个模型都没有」。
+    expect(gatewayModelsEmptyHint('banana')).toContain('没有匹配「banana」')
+    // 要顺便教会用户能搜什么，否则他只会换个词继续试。
+    expect(gatewayModelsEmptyHint('banana')).toContain('展示名')
+    expect(gatewayModelsEmptyHint('')).toContain('当前没有可用模型')
+    expect(gatewayModelsEmptyHint()).toContain('当前没有可用模型')
+  })
+
   it('目录来自适配器兜底时说明它可能不完整', () => {
     const hint = gatewayModelsHint(MODELS, 'adapters')
     expect(hint).toContain('已注册的适配器')
   })
 
-  it('curl 模板含正确端口，但**绝不含**明文密钥', () => {
+  it('★ curl 模板本身仍可用（函数留给 README 与其它入口），但**弹窗里不再渲染**', () => {
+    // ⚠️ 用户 2026-10-04 要求删掉弹窗里那两段 curl 命令（它们与 README 重复，
+    // 且是「三坨字混在一起」的一部分）。**函数保留**：它是纯函数、有独立价值
+    // （README 的说明与将来的 CLI 入口都可能用），只是不再出现在面板上。
     const curl = gatewayModelsCurl('http://127.0.0.1:9999/v1')
     expect(curl).toContain('127.0.0.1:9999/v1/models')
     expect(curl).toContain('Authorization: Bearer')
     // ⚠️ 命令会进剪贴板历史、可能被贴进聊天里，不能把真 key 写进去。
     expect(curl).toContain('把你的 API Key 贴在这里')
-  })
-
-  it('地址栏直接打开会 401 这件事必须提前告诉用户', () => {
-    expect(gatewayModelsHint(MODELS)).not.toContain('401')
-    // 说明文案在面板里，单独断言渲染处带这句（精简后措辞已收紧，见下一条）。
-    expect(source).toContain('地址栏直接打开会 401')
+    // 弹窗里不得再出现它（及其说明句）。
+    expect(source).not.toContain('gatewayModelsCurl(')
+    expect(source).not.toContain('命令行查看同一份目录')
+    expect(source).not.toContain('地址栏直接打开会 401')
   })
 
   it('面板确实渲染了清单与「复制全部 ID」按钮', () => {
-    expect(source).toContain('formatModelIdList(models)')
+    // ⚠️ 复制的对象是**筛出来的**模型（与对照表同一口径）：按钮上写着 N，
+    // 而 N 取自 `visibleModels.length` —— 复制全量会让用户以为搜索没生效。
+    expect(source).toContain('formatModelIdList(visibleModels)')
     expect(source).toContain('handleCopyModelIds')
-    expect(source).toContain('复制全部')
+    // ⚠️ 按钮上的 N 与复制出的行数必须**同源**：只锁 `复制全部` 是不够的
+    // （把 N 改回全量时会假绿，实测踩到过），故这里连插值一起锁。
+    expect(source).toMatch(/复制全部 \$\{visibleModels\.length\} 个 ID/)
+    // 被复制的内容为空时按钮禁用（避免复制到一个空串）。
+    expect(source).toMatch(/disabled: visibleModels\.length === 0/)
     // 复制失败必须展开清单让用户手动选中。
     expect(source).toMatch(/setIdsCopied\(ok\)[\s\S]{0,120}setModelsOpen\(true\)/)
+  })
+
+  it('★ 搜索框渲染在**展开区之内**，收起时清空搜索词', () => {
+    // 用户 2026-10-04 要求：「搜索功能应当在展开后才可用，而不是像现在这样放在外面，
+    // 模型ID的展开清单里也应该加个搜索栏。」
+    // ⚠️ 判据必须是**结构性的**（搜索框出现在 modelsOpen 的三元分支之后），
+    // 而不是「源码里有没有那串 placeholder」—— 后者在搜索框挪回外面时依然成立。
+    const section = source.slice(
+      // ⚠️ 分界注释在第四批（第二轮）加了段号前缀（「第 2 段：」/「第 3 段：」）——
+      // 锚点跟着改。**别**用「模型目录」这类裸词：`gatewayModelsHint` 的注释里也有。
+      source.indexOf('// ── 第 2 段：模型目录 ──'),
+      source.indexOf('// ── 第 3 段：思考档位对照表 ──'),
+    )
+    expect(section, '分界注释必须能定位（改了注释就要改这里）').not.toBe('')
+    // ⚠️ 锚点取**展开分支本身**（`modelsOpen ? React.createElement(React.Fragment`），
+    // 拿第一个 `modelsOpen` 是不够的：操作行里的 `'aria-expanded': modelsOpen`
+    // 也在它前面，那样写会退化成「搜索框在操作行之后」这种弱判据。
+    // 中间还夹着几行 `//` 注释，故用「注释行可选」的写法。
+    const openAt = section.search(/modelsOpen\s*(?:\/\/[^\n]*\n\s*)*\?\s*React\.createElement\(React\.Fragment/)
+    expect(openAt, '应能定位到展开分支').toBeGreaterThan(-1)
+    // 搜索框在展开分支之后 ⇒ 它在展开区之内（收起时不渲染）。
+    // ⚠️ 匹配带引号的属性名（`'aria-label':`）—— 这与渲染处的写法一致，
+    // 且注释里提到「搜索模型 ID」时不会被误命中。
+    const searchInputAt = section.indexOf("'aria-label': '搜索模型 ID'")
+    expect(searchInputAt, '模型清单的搜索框应存在').toBeGreaterThan(-1)
+    expect(searchInputAt).toBeGreaterThan(openAt)
+    // 收起时必须清掉搜索词，否则不可见的筛子会让下次展开少掉一半行。
+    expect(section).toMatch(/if \(modelsOpen\) setModelsQuery\(''\)/)
+    // 空结果自解释（与对照表同一条约定）。
+    expect(section).toContain('gatewayModelsEmptyHint(modelsQuery)')
+    // ⚠️ 搜索判据必须复用 model-filter.js 的 filterModels（只匹配 id/展示名）。
+    // 若误用对照表那套 filterEffortRows，「搜 max」会命中一堆没有该功能的模型。
+    // 该行在组件顶部的派生值区（不在这一段里），故按全文断言。
+    expect(source).toContain('filterModels(models, { query: modelsQuery })')
   })
 })
 
@@ -422,32 +509,34 @@ describe('思考档位对照表', () => {
   it('★ 说明文案：不能说「填什么都不会报错」—— 未登记的写法是真会 400 的', () => {
     const hint = gatewayEffortsHint([TRAE, PLAIN, NO_EFFORT])
     // 用户看到「14 个」时会以为网关只认得 14 个模型 —— 必须点明这是**已开启**的数量。
-    expect(hint).toContain('当前已开启的 3 个模型')
+    expect(hint).toContain('已开启的 3 个模型')
     expect(hint).toContain('有 2 个可选思考档位')
     // 只有 TRAE 那行是「需对照」，数量必须如实。
     expect(hint).toContain('1 个不同名')
     expect(hint).toContain('CC Switch')
-    expect(hint).toContain('关掉的模型不在表里')
     // ⚠️ 边界必须照实说：强度序只登记了 12 个名字（8 规范名 + off/light/on/extra_high），
-    // `turbo` 这类未登记的写法会被拒绝。让用户去试一个必然 400 的写法是误导。
-    expect(hint).toContain('turbo')
-    expect(hint).toContain('会被拒绝')
+    // 未登记的写法会被拒绝。让用户去试一个必然 400 的写法是误导。
+    expect(hint).toContain('未登记的档位名称将被拒绝')
     expect(hint).not.toContain('也不会报错')
   })
 
-  it('★ 说明文案已精简（用户 2026-10-04 要求），但边界与列含义仍照实', () => {
+  it('★ 说明文案已精简到**两句**（用户 2026-10-04 第二次要求），但边界与列含义仍照实', () => {
     const hint = gatewayEffortsHint([TRAE, PLAIN, NO_EFFORT])
     // ⚠️ 判据用**长度上限**而不是「恰好等于某串」：长度为 0 的空串也满足
     // 一切 toContain，故长度上限必须与下面的正向断言同用才有意义。
-    // 原版实测 169 字（折 4 行），现压到 105 字以内（约 2 行）。
-    expect(hint.length).toBeLessThanOrEqual(105)
-    // 「可直接抄那一列」这句是功能入口，不能删。
-    expect(hint).toContain('可直接抄进')
-    // ⚠️ 私有档位名不再逐个列举（表里本就看得见），但「未登记会被拒」必须留着。
-    expect(hint).toContain('会被拒绝')
+    // 上一版实测 105 字（约 2 行），本版压到 85 字以内（必然 2 行）。
+    expect(hint.length).toBeLessThanOrEqual(85)
+    // 「标「需对照」」是**图例**：卡片上的徽章就写着这三个字，不带这句无从解释。
+    expect(hint).toContain('需对照')
+    // 「客户端该填」那一列的去向（CC Switch 的映射档位）与边界都必须留着。
+    expect(hint).toContain('客户端该填')
+    expect(hint).toContain('未登记的档位名称将被拒绝')
     expect(hint).not.toContain('按强度就近')
-    // 供应商数量不再重复（卡片头已写明是哪一家）。
+    // 供应商数量不重复（卡片头已写明是哪一家）。
     expect(hint).not.toContain('个供应商')
+    // ⚠️ 用户给的原文里举例（如 turbo）已被删掉：边界照旧，只是不再点名。
+    // 若哪天有人按旧用例把它加回来，这条会提醒他长度预算已被收紧。
+    expect(hint).not.toContain('turbo')
   })
 
   it('一个模型都没声明档位时说明「网关不下发该参数」', () => {
@@ -455,16 +544,17 @@ describe('思考档位对照表', () => {
     expect(gatewayEffortsHint([])).toContain('不下发该参数')
   })
 
-  it('curl 模板指向对照表端点，且**绝不含**明文密钥', () => {
+  it('★ 对照表 curl 模板本身仍可用，但**弹窗里不再渲染**（与模型目录同理）', () => {
     const curl = gatewayEffortsCurl('http://127.0.0.1:9999/v1')
     expect(curl).toContain('127.0.0.1:9999/v1/reasoning-efforts')
     expect(curl).toContain('把你的 API Key 贴在这里')
+    expect(source).not.toContain('gatewayEffortsCurl(')
+    expect(source).not.toContain('命令行查看同一份对照表')
   })
 
   it('面板确实渲染了对照表，且数据来自宿主的档位视图', () => {
     expect(source).toContain('gatewayEffortRows(models)')
     expect(source).toContain('gatewayEffortsHint(models)')
-    expect(source).toContain('gatewayEffortsCurl(gatewayEndpoint(status))')
     expect(source).toContain('客户端该填')
     // 空表不能让用户点开一个什么都没有的区块。
     expect(source).toMatch(/disabled:\s*effortRows\.length === 0/)
@@ -600,6 +690,27 @@ describe('思考档位对照表：复制与空结果文案', () => {
     // 换了搜索词要复位「已复制」，否则那句提示讲的是另一批行。
     expect(source).toMatch(/setEffortsCopied\(false\)[\s\S]{0,40}\[models\.length,\s*effortsQuery\]/)
   })
+
+  it('★ 搜索框渲染在**展开区之内**（用户 2026-10-04 要求），收起时清空搜索词', () => {
+    // 原话：「搜索功能应当在展开后才可用，而不是像现在这样放在外面」。
+    // ⚠️ 判据必须是**结构性的**（搜索框出现在 effortsOpen 的三元分支之后），
+    // 而不是「源码里有没有那串 placeholder」—— 后者在搜索框挪回外面时依然成立。
+    const section = source.slice(
+      source.indexOf('// ── 第 3 段：思考档位对照表 ──'),
+      source.indexOf('网关只绑定 127.0.0.1'),
+    )
+    expect(section, '分界注释必须能定位（改了注释就要改这里）').not.toBe('')
+    // ⚠️ 锚点取**展开分支本身**，而不是第一个 `effortsOpen`：操作行里的
+    // `'aria-expanded': effortsOpen` 也在它前面，那样写会退化成弱判据。
+    const openAt = section.search(/effortsOpen\s*(?:\/\/[^\n]*\n\s*)*\?\s*React\.createElement\(React\.Fragment/)
+    expect(openAt, '应能定位到展开分支').toBeGreaterThan(-1)
+    // ⚠️ 匹配带引号的属性名（`'aria-label':`），注释里的「搜索思考档位」不受影响。
+    const searchInputAt = section.indexOf("'aria-label': '搜索思考档位'")
+    expect(searchInputAt, '对照表的搜索框应存在').toBeGreaterThan(-1)
+    expect(searchInputAt).toBeGreaterThan(openAt)
+    // 收起时必须清掉搜索词，否则不可见的筛子会让下次展开少掉一半行。
+    expect(section).toMatch(/if \(effortsOpen\) setEffortsQuery\(''\)/)
+  })
 })
 
 /**
@@ -639,7 +750,7 @@ describe('思考档位对照表的排版（不截断）', () => {
     // ⚠️ 取渲染处的注释做起点（`handleCopyEfforts` 的注释里也提到这几个字，
     // 从那里切会把上面的模型清单一起圈进来）。
     const effortSection = source.slice(
-      source.indexOf('// ── 思考档位对照表'),
+      source.indexOf('// ── 第 3 段：思考档位对照表'),
       source.indexOf('网关只绑定 127.0.0.1'),
     )
     expect(effortSection).not.toBe('')
@@ -736,7 +847,10 @@ describe('按供应商分组（一个供应商一张卡片）', () => {
    * 另一批数据）时，用例照样全绿。故这里额外锁三处**接线**。
    */
   it('★ 两处清单都真的走了分组卡片（模型清单 + 档位对照表）', () => {
-    expect(source).toContain('groupGatewayModels(models)')
+    // ⚠️ 模型清单的卡片建在**筛出来的模型**上（`visibleModels`），与对照表同一口径：
+    // 建在全量 `models` 上时，搜索会出现「卡片头写着 8 个、卡里只有 1 行」的矛盾读数。
+    expect(source).toContain('groupGatewayModels(visibleModels)')
+    expect(source).not.toContain('groupGatewayModels(models)')
     // ⚠️ 对照表的卡片必须建在**筛出来的行**上：若建在全量 `effortRows` 上，
     // 搜索时会出现「卡片头写着 8 个、卡里只有 1 行」的自相矛盾读数。
     expect(source).toContain('groupGatewayEntries(visibleEffortRows')
@@ -747,6 +861,333 @@ describe('按供应商分组（一个供应商一张卡片）', () => {
     expect(source).toContain('gatewayModelKeyOf(model)')
     expect(source).toContain('gatewayModelKeyOf(row)')
     expect(source).toContain('formatModelIdList(card.entries)')
+  })
+
+  it('★ 两处清单的搜索都让卡片展开（`searching` 两处都传了）', () => {
+    // 少了 `searching`，搜到的结果会藏在默认折叠的大卡片里 —— 用户会以为「搜不到」。
+    // 与对照表同一取舍（model-groups.js 的 groupExpanded）。
+    expect(source.match(/searching: modelsFiltering/g)).toHaveLength(2)
+    expect(source.match(/searching: effortsFiltering/g)).toHaveLength(2)
+  })
+})
+
+/**
+ * 网关弹窗里「胶囊」（行内 ID 块、能力标记、卡片标题）的完整显示。
+ *
+ * **用户报障（2026-10-04）**：「网关这里面的所有胶囊内容都没有完整显示，应当修正
+ * 使其完整显示内容」。根因是 `.dim-jh-modelId` / `.dim-jh-modelBadge` /
+ * `.dim-jh-gatewayCardToggle` 这三个类**天生带截断**（`max-width` + `ellipsis` +
+ * `nowrap`），而它们本是给**模型列表**设计的（那里一行里还要塞下开关，紧凑是刻意的）。
+ * 网关弹窗里这些内容恰恰是要被读、被抄的。
+ *
+ * ⚠️ 故修法必须在 `.dim-jh-gatewayModal` 前缀下覆盖，**不能**直接改那三个通用类。
+ */
+describe('网关弹窗的胶囊不截断（用户报障 2026-10-04）', () => {
+  const styles = readFileSync(resolve(HERE, '../../plugin-src/client/jet-hub-styles.js'), 'utf8')
+  /**
+   * 取出某条规则体。
+   *
+   * ⚠️ 两个易错点：
+   * 1. 选择器里的 `.` 必须**全部**转义：`.dim-jh-modelId` 不转义会匹配到
+   *    `Xdim-jh-modelId`，将来多一条相似规则就可能取错那条而给出假绿；
+   * 2. 选择器必须出现在**行首或逗号之后** —— 本文件里注释也会提到类名
+   *    （如「.dim-jh-modelId 是 max-width 46%…」），不锚定行首就会把注释
+   *    当成规则、取到下面那条无关的规则体而给出假绿。
+   *
+   * 多选择器规则（`A,\nB { … }`）返回**同一份**体：网关的胶囊覆盖就是这种写法。
+   */
+  const rule = (selector: string) => {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const match = styles.match(new RegExp(`(?:^|[,\\n])[ \\t]*${escaped}[ \\t]*(?=[,{])[^{}]*\\{([^}]*)\\}`))
+    return match?.[1] ?? ''
+  }
+
+  it('★ 网关弹窗内的 ID 胶囊必须能换行（去掉 max-width 夹取），且不截断', () => {
+    // ⚠️⚠️ 判据是**两级通配**（弹窗 + 类名），**不许夹中间祖先**。
+    // 这里返工过一次，务必看懂再改：
+    //   第一版写成 `.dim-jh-gatewayModal .dim-jh-gatewayModelRow .dim-jh-modelId`
+    //   （外加 KeyRow / CardBody 两条），只覆盖到**卡片内**的胶囊。用户随后截图框出
+    //   三处仍在截断的地方，它们的祖先链各不相同：
+    //     · 开关行：.dim-jh-modalBody > .dim-jh-modelRow > .dim-jh-modelInfo > code
+    //     · 两处 curl 代码块：.dim-jh-modalBody > code
+    //   三条带祖先的规则**一条都匹配不上**，于是「供 Pi / Cont…」与两行 curl 照旧被吃。
+    // ⚠️ 当时的机械审计脚本也没抓到 —— 它只查**类名**有没有被某条网关规则覆盖，
+    //   而 .dim-jh-modelId 在卡片那条里"有覆盖"，于是整体判通过。
+    //   **教训：判断会不会被截断要看元素的祖先链，不能看类名是否出现过。**
+    const body = rule('.dim-jh-gatewayModal .dim-jh-modelId')
+    expect(body, '应有一条网关专用的覆盖规则').not.toBe('')
+    expect(body).toContain('max-width: none')
+    expect(body).toContain('overflow-wrap: anywhere')
+    expect(body).toContain('white-space: normal')
+    expect(body).not.toContain('ellipsis')
+    // 模型展示名同理（原先只在模型列表里才允许收缩 + 截断）。
+    const name = rule('.dim-jh-gatewayModal .dim-jh-modelName')
+    expect(name).toContain('white-space: normal')
+    expect(name).not.toContain('ellipsis')
+  })
+
+  it('★ 覆盖规则不得夹中间祖先（否则开关行与 curl 代码块又会被截断）', () => {
+    // 上一条证明「有一条两级通配规则在」；这一条堵住「有人把祖先限定加回来」。
+    // ⚠️ 必须**先剥掉注释**再解析选择器：上一条规则的注释里就写着
+    //   「第一版写成 .dim-jh-gatewayModal .dim-jh-gatewayModelRow .dim-jh-modelId」
+    // 直接正则会把**那句注释**当成一条规则命中（假红）—— 与「not.toContain 命中注释」
+    // 是同一个坑：判据必须作用在**真规则**上。
+    const stripped = styles.replace(/\/\*[\s\S]*?\*\//g, '')
+    const rules = [...stripped.matchAll(/([^{}]+)\{([^}]*)\}/g)]
+      .filter(([, sel, b]) => sel.includes('.dim-jh-gatewayModal') && sel.includes('.dim-jh-modelId')
+        && /text-overflow:\s*clip/.test(b))
+      .map(([, sel]) => sel)
+    expect(rules.length, '应有网关内的 ID 胶囊覆盖规则').toBeGreaterThan(0)
+    for (const sel of rules) {
+      for (const one of sel.split(',').map(s => s.trim())) {
+        if (!one.includes('.dim-jh-modelId')) continue
+        // 两级选择器 = `.dim-jh-gatewayModal .dim-jh-modelId`（中间正好一个空格）
+        expect(one, `不允许夹中间祖先：${one}`)
+          .toMatch(/^\.dim-jh-gatewayModal\s+\.dim-jh-modelId$/)
+      }
+    }
+  })
+
+  it('★ 弹窗内**不得再有第二条**给 .dim-jh-modelId 设宽度上限的规则', () => {
+    // 这条来自一次变异「存活」：把已删掉的
+    //   .dim-jh-gatewayModelRow .dim-jh-modelId { max-width: 52% }
+    // 加回两级通配**之后**（同优先级 (0,2,0)，后者胜），卡片内 ID 又被夹到 52%。
+    // 上面那条「不得夹中间祖先」只筛 `text-overflow: clip` 的规则，**抓不到它**
+    // （它只设 max-width，不带 clip）—— 故必须单独堵这个洞。
+    const stripped = styles.replace(/\/\*[\s\S]*?\*\//g, '')
+    // ⚠️ 解析 CSS**不能**用 `/([^{}]+)\{([^{}]*)\}/g` 这类正则：
+    //   它可以从任意位置起匹配，选择器组会跨过前一条规则的 `}` 一路吃掉前文，
+    //   于是 selector/body 角色互换（实测解析出
+    //   `SEL="A { x: 1 }" BODY="A "` 这种鬼东西），判据永远不命中 ⇒ 变异假存活。
+    //   必须按花括号深度**扫描**。这里用 rulesOf 正确切分顶层规则。
+    const rulesOf = (css: string) => {
+      const out: Array<{ sel: string, body: string }> = []
+      const stack: number[] = []
+      let selStart = 0
+      let bodyStart = -1
+      for (let i = 0; i < css.length; i++) {
+        const ch = css[i]
+        if (ch === '{') {
+          if (stack.length === 0) bodyStart = i + 1
+          stack.push(i)
+        } else if (ch === '}') {
+          const open = stack.pop()
+          if (open === undefined) continue
+          if (stack.length === 0) {
+            out.push({ sel: css.slice(selStart, open), body: css.slice(bodyStart, i) })
+            selStart = i + 1
+          }
+        }
+      }
+      return out
+    }
+    // 反向自检：扫描器必须真的能解析出规则，否则「没找到违规」只是「什么都没解析出来」。
+    expect(rulesOf(stripped).length, '扫描器应能解析出规则').toBeGreaterThan(100)
+
+    const offenders = rulesOf(stripped)
+      .filter(r => /\.dim-jh-modelId\b/.test(r.sel) && /max-width:\s*(?!none)\S/.test(r.body))
+      .map(r => r.sel.trim().replace(/\s+/g, ' ') + ' { ' + (r.body.trim().match(/max-width:[^;]*/)?.[0] ?? '') + ' }')
+      // 允许的只有模型列表那份基础规则（.dim-jh-modelId 单独出现，46%，在网关之外且刻意）。
+      .filter(one => !/^\.dim-jh-modelId \{/.test(one))
+    expect(offenders, '网关弹窗内不得再有给 .dim-jh-modelId 设上限的规则').toEqual([])
+  })
+
+  it('★ 去掉上限后，开关行的标题「启用本机网关」不得被副标题挤断', () => {
+    // ⚠️ 这是**修截断时新引入的**排版退化（渲染截图发现）：
+    //   胶囊不再有 max-width 上限后把整行吃光，而 .dim-jh-modelName 是
+    //   `flex: 0 1 auto`（可收缩）⇒ 标题被压成「启用本机网」「关」两行。
+    //   修法是让**标题**保持固有宽度、由副标题去换行。
+    // ⚠️ 判据用 `> .dim-jh-modelName`（直接子元素）而不是 `.dim-jh-modelName`：
+    //   后者会连卡片行里的模型展示名一起命中，而那里的收缩是刻意的
+    //   （长展示名必须能给胶囊让位，见 GatewayModelRow）。
+    const stripped = styles.replace(/\/\*[\s\S]*?\*\//g, '')
+    const m = /\.dim-jh-gatewayModal \.dim-jh-modelInfo > \.dim-jh-modelName \{([^{}]*)\}/.exec(stripped)
+    expect(m, '开关行标题应有「保持固有宽度」的规则').not.toBeNull()
+    expect(m![1]).toContain('flex: none')
+    // ⚠️ 反向：**不能**把这条写成通配（那会把卡片行的展示名也钉死，长名横向溢出）。
+    expect(stripped).not.toMatch(/\.dim-jh-gatewayModal \.dim-jh-modelName \{[^}]*flex: none/)
+  })
+
+  it('★ 弹窗里每个 .dim-jh-modelId 渲染点，祖先链都被两级通配覆盖', () => {
+    // 上一条锁的是「选择器长什么样」；这一条锁**渲染处确实存在这些位置**，
+    // 否则「改成通配」可能只是因为我把那几处渲染删掉了（那就不是修好，是移走）。
+    // ⚠️ 用**整个 GatewayPanel 到文末**做区间：卡片行渲染在 GatewayModelRow 里，
+    // 用 `indexOf('export function JetHubPage')` 截断会把它们切掉（实测踩到）。
+    const panel = source.slice(source.indexOf('function GatewayPanel('))
+    // ① 开关行那个 code（用户 2026-10-04 要求把客户端列举删掉，只剩这一句）
+    expect(panel).toContain('在 127.0.0.1 监听，供客户端调用')
+    // ② 卡片行内的模型 ID（在 GatewayModelRow 里，同一个文件）
+    expect(source).toContain('gatewayModelKeyOf(model)')
+    // ③ API KEY 明文那块也用它（显示明文时，祖先只有 gatewayKeyRow）
+    expect(panel).toContain("className: 'dim-jh-gatewayKeyRow'")
+    expect(panel).toMatch(/apiKey\.value/)
+    // ⚠️ 两处 curl 代码块**已被用户要求删除**（它们曾是这条判据的第 4/5 个渲染点）。
+    //    删掉之后 `.dim-jh-modelId` 在弹窗里仍有 3 个位置、祖先链各不相同 ——
+    //    故两级通配**仍然必需**，这条判据没有因为删 curl 而失效。
+    expect(stripCommentsOf(panel)).not.toContain('gatewayModelsCurl(')
+    // 这些位置**没有**共同的中间祖先 —— 故只能两级通配。
+    expect(stripCommentsOf(source)).not.toContain('dim-jh-gatewayModelRow .dim-jh-modelId')
+  })
+
+  it('★ 卡片标题不再截断（长供应商名被截成 deepseek-accou… 是用户报障的形态）', () => {
+    const body = rule('.dim-jh-gatewayCardToggle')
+    expect(body).not.toBe('')
+    expect(body).not.toContain('ellipsis')
+    expect(body).not.toContain('nowrap')
+    // 长供应商名要能落到第二行显示，而不是被省略号吃掉。
+    expect(body).toContain('overflow-wrap: anywhere')
+  })
+
+  it('★ 能力标记（可发图片 / 需对照）在网关弹窗内允许换行', () => {
+    const body = rule('.dim-jh-gatewayModal .dim-jh-modelBadge')
+    expect(body).not.toBe('')
+    expect(body).toContain('white-space: normal')
+    expect(body).not.toContain('nowrap')
+  })
+
+  it('★ 模型列表那份紧凑样式**没被顺手改坏**（截断是那里的刻意设计）', () => {
+    // 网关的修法必须**只**作用在 .dim-jh-gatewayModal 之内：模型列表面向 478 条
+    // 目录，一行里还要放开关，去掉 max-width/ellipsis 会把整列撑坏。
+    expect(rule('.dim-jh-modelId')).toContain('max-width: 46%')
+    expect(rule('.dim-jh-modelId')).toContain('ellipsis')
+    expect(rule('.dim-jh-modelBadge')).toContain('flex: none')
+    expect(rule('.dim-jh-modelBadge')).toContain('nowrap')
+  })
+
+  it('★ 「可发图片」徽标仍保留 flex: none 的兜底（模型列表那份）', () => {
+    // 上一条已锁；这里再单独点名，因为它是 2026-10-03 那条报障的直接回归点。
+    expect(rule('.dim-jh-modelBadge')).toContain('flex: none')
+  })
+})
+
+/**
+ * 「下面的四个按钮也按复制密钥的大小来统一」（用户 2026-10-04）。
+ *
+ * 四个按钮 = 复制全部 N 个 ID / 展开清单 / 展开对照表 / 复制对照表。
+ * 它们原先走通用的 `.dim-jh-btn`（约 28px 高），比同行 18px 高的文字高 10px，
+ * 既撑高行、又与上面密钥行的两个小按钮观感割裂。
+ */
+describe('网关弹窗的按钮尺寸统一（用户要求与「复制密钥」同款）', () => {
+  const styles = readFileSync(resolve(HERE, '../../plugin-src/client/jet-hub-styles.js'), 'utf8')
+
+  it('★ 密钥行与清单操作行**共用同一条**小号按钮规则', () => {
+    // ⚠️ 判据是「同一条规则里同时出现两个选择器」：各写一份迟早一处改了另一处没改。
+    const match = styles.match(/\.dim-jh-gatewayKeyRow \.dim-jh-btn,\s*\.dim-jh-gatewayModal \.dim-jh-gatewayActions \.dim-jh-btn \{([^}]*)\}/)
+    expect(match, '两个选择器应写在同一条规则里').not.toBeNull()
+    const body = match![1]
+    // 与密钥行原先那套完全一致（padding 2px 8px / 11px / 16px / 圆角 6px）。
+    expect(body).toContain('padding: 2px 8px')
+    expect(body).toContain('font-size: 11px')
+    expect(body).toContain('line-height: 16px')
+    expect(body).toContain('border-radius: 6px')
+  })
+
+  it('★ 两处操作行都挂上了 dim-jh-gatewayActions 钩子（接线，不只是样式在) ', () => {
+    // 纯样式在、但没人挂类名 = 尺寸根本没生效（「判据还在但没人调用」的同型缺陷）。
+    const hooks = source.match(/className: 'dim-jh-modelPanelActions dim-jh-gatewayActions'/g)
+    expect(hooks, '模型清单与对照表两个操作行都要挂钩子').toHaveLength(2)
+  })
+
+  it('★ 通用按钮没被改小（30+ 处调用点：页头、卡片头…）', () => {
+    const generic = /\.dim-jh-btn \{([^}]*)\}/.exec(styles)?.[1] ?? ''
+    expect(generic).toContain('padding: 4px 12px')
+    expect(generic).toContain('line-height: 18px')
+  })
+
+  it('★ 操作行允许换行 —— 按钮文案带动态计数，nowrap 会被推出容器', () => {
+    // ⚠️ 这条来自一次**机械审计**（audit-gateway-pills.mjs）：把网关弹窗用到的类
+    // 与样式表里带截断属性的类求交集，`.dim-jh-btn` 因 `white-space: nowrap` 落在交集里。
+    // nowrap 本身对按钮是对的（防按钮内文字折行），但它在窄容器里的真实风险是
+    // 「按钮被整体推出容器、点不到」—— 而这两行的文案带着**模型数/行数**，
+    // 数字变长就会发生。故操作行必须能换行。
+    // ⚠️ 本段没有 pills 那段里的 `rule()` 辅助函数（不同 describe 作用域），此处就地取。
+    const body = /\.dim-jh-gatewayModal \.dim-jh-gatewayActions \{([^}]*)\}/.exec(styles)?.[1] ?? ''
+    expect(body, '操作行应有网关专用规则').not.toBe('')
+    expect(body).toContain('flex-wrap: wrap')
+    // 间距仍与密钥行一致。
+    expect(body).toContain('gap: 6px')
+  })
+})
+
+/**
+ * 用户 2026-10-04 第四批（第二轮）的四条要求。
+ *
+ * 原话：「① 修改『启用本机网关』右边的那个胶囊为『在 127.0.0.1 监听，供客户端调用』。
+ * ② 思考档位对照表里的『展开对照表』与『复制对照表』两个按钮位置互换。
+ * ③ 删掉这两段：命令行查看同一份目录/对照表 + 那两条 curl。
+ * ④ 这三个红框框起来的不同的功能段，能明显的区分开来。」
+ */
+describe('网关弹窗第四批（第二轮）：胶囊文案 / 按钮顺序 / 删 curl / 分段', () => {
+  const styles = readFileSync(resolve(HERE, '../../plugin-src/client/jet-hub-styles.js'), 'utf8')
+  const css = styles.slice(styles.indexOf('`') + 1, styles.lastIndexOf('`'))
+  /** 剥注释：注释里会**引用**被判为禁止的写法（本轮踩过多次假红）。 */
+  const code = (src: string) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+  const panel = source.slice(source.indexOf('function GatewayPanel('))
+
+  it('① 开关行胶囊只留「在 127.0.0.1 监听，供客户端调用」', () => {
+    expect(panel).toContain("'在 127.0.0.1 监听，供客户端调用'")
+    // ⚠️ 客户端列举必须删掉 —— 它是窄面板下折行、且把「打开/关闭」动作词挤远的成因。
+    // 但要**先剥注释**：说明「原先列了 Pi / Continue …」的注释里原样写着它们。
+    expect(code(panel)).not.toContain('Pi / Continue')
+    // ⚠️ 「打开/关闭」这个动作词不能跟着一起删：胶囊里现在不含它了，
+    // 它由开关的 aria-label 承担（读屏与 tooltip 仍能说清点下去会发生什么）。
+    expect(panel).toMatch(/'aria-label': action \+ '本机网关'/)
+  })
+
+  it('② 对照表两个按钮互换：复制在前、展开在后（与模型清单那段一致）', () => {
+    // 判据是**顺序**，不是「两个按钮都在」。
+    const copyAt = panel.indexOf('复制对照表（${visibleEffortRows.length} 行）')
+    const toggleAt = panel.indexOf('收起对照表')
+    expect(copyAt, '复制按钮应在').toBeGreaterThan(-1)
+    expect(toggleAt, '展开按钮应在').toBeGreaterThan(-1)
+    expect(copyAt, '复制按钮必须排在展开按钮之前').toBeLessThan(toggleAt)
+    // 反向：模型清单那段本来就是「复制 → 展开」，两段口径必须一致。
+    const idsAt = panel.indexOf('复制全部 ${visibleModels.length} 个 ID')
+    const listAt = panel.indexOf("'收起清单'")
+    expect(idsAt).toBeLessThan(listAt)
+  })
+
+  it('③ 两段 curl 命令与它们的说明句都从弹窗里删掉了', () => {
+    const stripped = code(panel)
+    expect(stripped).not.toContain('命令行查看同一份目录')
+    expect(stripped).not.toContain('命令行查看同一份对照表')
+    expect(stripped).not.toContain('gatewayModelsCurl(')
+    expect(stripped).not.toContain('gatewayEffortsCurl(')
+    // ⚠️ 「地址栏直接打开会 401」那句 401 说明是 curl 段的标题的一半，一并删掉；
+    // 但**这个事实本身不能丢** —— 它已由 README 承担（`README.md` 的「模型清单」节）。
+    expect(stripped).not.toContain('地址栏直接打开会 401')
+    const readme = readFileSync(resolve(HERE, '../../README.md'), 'utf8')
+    expect(readme, '401 这件事必须在 README 里仍有交代').toContain('401')
+  })
+
+  it('④ 三段各有一个 .dim-jh-gatewaySection 容器，且段间有分隔', () => {
+    // 结构：三个段容器（开关+连接信息 / 模型 ID / 思考档位对照表）。
+    expect((panel.match(/className: 'dim-jh-gatewaySection'/g) || []).length, '应恰好三段')
+      .toBe(3)
+    // 段标题只有后两段有（第一段以开关行为锚，无需标题）。
+    expect((panel.match(/className: 'dim-jh-gatewaySectionTitle'/g) || []).length).toBe(2)
+    // ⚠️ 分隔靠 `A + B` **相邻兄弟**选择器：写成 `.dim-jh-gatewaySection` 通配
+    // 会给第一段也加上边框，紧贴弹窗标题的一条横线看着像多出来的分隔条。
+    expect(css).toMatch(/\.dim-jh-gatewaySection \+ \.dim-jh-gatewaySection \{[^}]*border-top/)
+    expect(css).toMatch(/\.dim-jh-gatewaySection \+ \.dim-jh-gatewaySection \{[^}]*margin-top/)
+    // ⚠️ 段标题必须比段内说明**更重**：两者同为 12px 灰字时分隔线的效果会被抵消。
+    const title = /\.dim-jh-gatewaySectionTitle \{([^}]*)\}/.exec(css)?.[1] ?? ''
+    expect(title).toContain('font-weight: 600')
+    expect(title).not.toContain('8f959e')
+  })
+
+  it('④ 末尾那条安全提示是**脚注**，与三段分开（它不属于任何一段）', () => {
+    const foot = /\.dim-jh-gatewayModal \.dim-jh-gatewayFootnote \{([^}]*)\}/.exec(css)?.[1] ?? ''
+    expect(foot, '脚注应有自己的规则').not.toBe('')
+    expect(foot).toContain('border-top')
+    // 渲染处确实用了这个类，且出现在「思考档位对照表」之后。
+    expect(panel).toContain('dim-jh-modalHint dim-jh-gatewayFootnote')
+    expect(panel.indexOf('dim-jh-gatewayFootnote')).toBeGreaterThan(panel.indexOf('思考档位对照表'))
+    // ⚠️ 它必须在**最后一个段容器之外**：判据是「脚注那行之后不再有段容器的收尾」——
+    // 用「脚注是 dim-jh-modalBody 的最后一个子元素」这个更稳的说法：
+    // 脚注之后只应剩 notice 段（它本来就是弹窗级的提示，不属于三段之一）。
+    const after = panel.slice(panel.indexOf('dim-jh-gatewayFootnote'))
+    expect(after).not.toContain("className: 'dim-jh-gatewaySection'")
   })
 })
 
