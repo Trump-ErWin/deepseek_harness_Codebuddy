@@ -31,6 +31,54 @@ declare module '@deepseek-ai/cordis' {
 const EMPTY_MODEL_SET: ReadonlySet<string> = new Set<string>()
 
 /**
+ * 判定「某 provider 的启用账号是否**全部**因目标模型处于限流期」。
+ *
+ * ## 为什么需要它
+ *
+ * 选号按 `modelRateLimits[modelId]` 过滤候选（见本类的 `getAvailableAccount`
+ * 与 `src/index.ts` 的 `pickBuddyCredential`）。当一个 provider 只有**一个**
+ * 启用账号、而它恰好被标记了该模型的限流时，候选集变成空集，调用链一路
+ * 返回 `undefined`，最终由适配器抛出「no usable credential; log in from the
+ * Jet Hub panel first」—— 而**凭据其实是好的、账号也是启用的**，用户被指去
+ * 重新登录，方向完全错。
+ *
+ * 本函数把这种情形**证明**出来：返回非 `undefined` 即表示「这批账号全都因
+ * 该模型受限」，调用方据此报带解禁时刻的明确错误。
+ *
+ * ⚠️ **判据必须窄**，两条边界都不能松：
+ * - 空 `modelId`（未知目标模型）直接返回 `undefined` —— 与选号侧约定一致
+ *   （空 modelId 不做限流过滤），否则会把「未登录」误报成「限流」。
+ *   这条**不是**冗余守卫：`updateModelRateLimit` 不校验 modelId，理论上可能
+ *   落下一个 `modelRateLimits['']` 脏键，没有它就会被当成真实限流上报；
+ * - 只要**任一**账号没有该模型的未过期标记，整体即不成立 —— 那种情况下
+ *   候选本就非空，轮不到本函数说话。
+ *
+ * ℹ️ 空 `accounts` 无需单独早退：循环不执行 → `earliest` 保持 `undefined`
+ * → 末尾守卫返回 `undefined`。（曾写过一条 `accounts.length === 0` 早退，
+ * 反向验证证明它**不可区分**、纯冗余，故删除。）
+ *
+ * @param accounts - 该 provider 的**启用**账号（调用方负责按 `enabled` 过滤）。
+ * @param modelId - 目标模型 id；空串表示不判定。
+ * @param now - 当前时刻（毫秒），供测试注入。
+ * @returns 最早的解禁时刻与账号数；不满足条件时为 `undefined`。
+ */
+export function allAccountsRateLimitedForModel(
+  accounts: readonly ProviderAccountEntry[],
+  modelId: string,
+  now: number = Date.now(),
+): { resetAtMs: number; accountCount: number } | undefined {
+  if (modelId.length === 0) return undefined
+  let earliest: number | undefined
+  for (const account of accounts) {
+    const resetAt = account.modelRateLimits?.[modelId]
+    // 与选号侧同一判据：缺标记 / 0 / 已过期都算「不受限」→ 整体不成立。
+    if (resetAt === undefined || resetAt === 0 || now >= resetAt) return undefined
+    earliest = earliest === undefined ? resetAt : Math.min(earliest, resetAt)
+  }
+  return earliest === undefined ? undefined : { resetAtMs: earliest, accountCount: accounts.length }
+}
+
+/**
  * AccountPool —— 多账号管理核心
  *
  * 职责：
