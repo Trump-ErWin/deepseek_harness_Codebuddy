@@ -1937,7 +1937,7 @@ Cline 的几种「暂时用不了」语义完全不同，处理也必须不同�
 
 | HTTP | 官方语义 | 插件的处理 |
 |---|---|---|
-| **429 `Daily free limit reached`** | **当日免费额度**用尽（按天结算，且**按模型**单独计） | 记「限额重置」徽章，倒计时**用报文里那个时长**（如 `Try again in 19h 39m`）；文案点明「按天结算 + 按模型单独计算」，并建议换**同一账号的另一个免费模型** |
+| **429 `Daily free limit reached`** | **当日免费额度**用尽（按天结算，且**按模型**单独计） | 记「限额重置」徽章，倒计时**用报文里那个时长**（如 `Try again in 19h 39m`）；文案只说「按天结算、按模型单独计 + 预计 N 小时后重置 + 可先改用其它免费模型」（**不复述英文原文**，见下） |
 | **429** 其它 | Rate limit exceeded | 记徽章，倒计时按 `retry-after` 响应头 → 报文的 `Try again in …` → 通用绝对时刻句式 → 1 小时快照兜底；并换到下一个账号重试 |
 | **402** | Insufficient credits（去 app.cline.bot 充值） | **不记倒计时** —— 等多久都不会恢复；仍会换号（别的账号可能有余额），全失败时报明「额度已用尽……请到 app.cline.bot 充值」 |
 
@@ -1972,17 +1972,24 @@ POST https://api.cline.bot/api/v1/chat/completions   （model = cline-free/deeps
 **403 `ENTITLEMENT_ERROR: the user is not subscribed to required model plan`**，其
 `/plan/usage-limits` 也是 `404 no plan history found for user`。故错误文案里**不提**它。
 
-⚠️ **全部账号都不可用时，报错带上最后一笔的真实状态码与上游文案**，例如：
+⚠️ **全部账号都不可用时，报错只给「是什么 + 何时恢复 + 现在能做什么」**，例如：
 
 ```
-cline: 模型 cline-free/deepseek-v4.1-flash 的所有账号均不可用（HTTP 429 Error 429: Daily free
-limit reached on model deepseek/deepseek-v4.1-flash. Try again in 19h 39m）。这是该模型的**当日
-免费额度**已用尽（HTTP 429 Daily free limit reached）—— 免费额度按天结算、且**按模型单独
-计算**，盯着它等不会提前恢复，服务端给出的解禁时刻是 2026/10/4 18:49:xx（约 19.6 小时后）。
-要立刻继续，可改用**同一个账号的另一个免费（cline-free/*）模型**，或换其它 provider / 账号
+cline: 模型 cline-free/deepseek-v4.1-flash 的所有账号均不可用 —— 当日免费额度已用尽（HTTP 429），
+预计 19.7 小时后重置（2026/10/4 19:49:20）；额度按天结算、按模型单独计 —— 可先改用其它免费模型
 ```
 
-需要这个是因为「限流」「免费额度用尽」「额度耗尽」在 UI 上原本长得一模一样，而用户的
+⚠️ **不要在上面的文案里复述上游英文原文**（真实报障 2026-10-03：「这个报告和其它的供应商
+比起来是不是太长了？改简短点吧」）。早先的写法把原文整句塞进 `（HTTP 429 Error 429: Daily free
+limit reached on model … Try again in 19h 39m）`，**再用中文解释一遍**，于是同一件事说了两遍，
+消息长约 270 字符（其它 provider 的同类文案是 60~110 字符）。现在的规则：
+
+1. **识别出语义就不再复述原文**（免费额度 / 402 两种都识别得出），原文只在**没识别出语义**时
+   才附上（那种情况它才是唯一的排障线索）；
+2. **错误消息里不能写 markdown** —— 气泡不渲染它，`**加粗**` 会**原样显示星号**；
+3. 长度有单测上限锁（建议 < 100 字符、整条 < 150 字符），改文案时别把它撑回去。
+
+需要区分这几种失败是因为「限流」「免费额度用尽」「额度耗尽」在 UI 上原本长得一模一样，而用户的
 动作相反（等 / 换模型 / 充值）—— 这也正是 Cline 客户端自己修过的那条
 （cline/cline#10139 `WAIT vs STOP not distinguished`）。
 

@@ -212,6 +212,18 @@ export function recordsClineRateLimit(status: number, _body: string): boolean {
  * 后两类都由 429 下发，**只能靠文案区分** —— 这正是 cline/cline#10139
  * （`WAIT vs STOP not distinguished`）那类缺陷的同一个坑。
  *
+ * ⚠️ **长度也是需求**（用户 2026-10-03 报障：「这个报告和其它的供应商比起来是不是
+ * 太长了」）。原因不是话说得不对，而是**同一件事说了两遍**：先把上游英文整句复述进
+ * `（HTTP 429 Error 429: Daily free limit reached on model … Try again in 19h 39m）`，
+ * 再用中文解释一遍 ⇒ 消息长度变成其它 provider 的两三倍（对照 `codearts` 的
+ * 额度文案 ≈ 100 字符、`lobsterai` 的「所有账号均不可用（明细）」≈ 60 字符）。三条规矩：
+ *
+ * 1. **识别出语义就不再复述原文**（免费额度 / 402 两种都识别得出来）：我们的文案
+ *    已把「是什么 + 何时恢复 + 现在能做什么」说全，原文只在**没识别出语义**时才附上；
+ * 2. **不用 markdown**：`**加粗**` 在 harness 的错误气泡里**原样显示星号**
+ *    （用户截图里就是 `**当日免费额度**`），这里只能写纯文本；
+ * 3. 目标长度 ≈ 130 字符以内，单测有上限锁（改文案时别把它撑回去）。
+ *
  * ⚠️ **不要建议「改用 `cline-pass/*` 付费通道」**：那是**订阅**通道，不是「有余额就能用」。
  * 实测（2026-10-03 23:20，同一个账号）：
  *
@@ -253,16 +265,19 @@ export function clineExhaustedAdvice(
       + '请到 app.cline.bot 充值，或改用其它 provider'
   }
   if (status === 429 && hint?.dailyFree === true) {
+    // 只留三件事：是什么、何时能再试、现在改用什么。**不再复述上游英文原文**
+    // （见上方「长度也是需求」），也不再写「盯着它等没用」那类解释性从句 ——
+    // 「预计 N 小时后重置」本身已经说了「等不到头」。
     const when = resetAtMs === undefined
       ? ''
-      : `，服务端给出的解禁时刻是 ${new Date(resetAtMs).toLocaleString('zh-CN')}`
-        + `（约 ${formatResetIn(resetAtMs)}后）`
-    return '这是该模型的**当日免费额度**已用尽（HTTP 429 Daily free limit reached）'
-      + '—— 免费额度按天结算、且**按模型单独计算**，盯着它等不会提前恢复'
-      + when
-      + '。要立刻继续，可改用**同一个账号的另一个免费（cline-free/*）模型**，'
-      + '或换其它 provider / 账号'
+      : `，预计 ${formatResetIn(resetAtMs)}后重置（${new Date(resetAtMs).toLocaleString('zh-CN')}）`
+    return `当日免费额度已用尽（HTTP 429）${when}`
+      + '；额度按天结算、按模型单独计 —— 可先改用其它免费模型'
   }
-  if (status === 429) return '这是限流（HTTP 429）—— 等一段时间再试，或改用其它 provider / 账号'
+  if (status === 429) {
+    // ⚠️ 只有**没识别出语义**时才附上游原文（上面两种已识别，复述只会重复）。
+    const detail = hint?.message === undefined || hint.message.length === 0 ? '' : `：${hint.message}`
+    return `限流（HTTP 429${detail}）—— 稍后重试，或改用其它 provider / 账号`
+  }
   return '请稍后再试，或改用其它 provider / 账号'
 }

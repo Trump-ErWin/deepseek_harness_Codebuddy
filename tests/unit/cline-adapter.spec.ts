@@ -668,7 +668,7 @@ describe('Cline 限流标记：用服务端给的时间，402 不倒数', () => 
     },
   }
 
-  it('★ 实测的「当日免费额度」429 → 标记写服务端给的 19 小时 39 分，且文案点明按天结算', async () => {
+  it('★ 实测的「当日免费额度」429 → 标记写服务端给的 19 小时 39 分，且文案简短、不复述原文', async () => {
     const calls: MarkCall[] = []
     const before = Date.now()
     const adapter = makeAdapter({
@@ -681,16 +681,19 @@ describe('Cline 限流标记：用服务端给的时间，402 不倒数', () => 
     const waitMs = calls[0].resetAtMs - before
     expect(waitMs).toBeGreaterThan(((19 * 60) + 39) * 60_000 - 1_000)
     expect(waitMs).toBeLessThan(((19 * 60) + 39) * 60_000 + 1_000)
-    // 上游原文必须原样带给用户（否则「限流」与「免费额度用尽」无从区分）。
-    expect(error.message).toContain('Daily free limit reached')
-    // 动作必须说清：等不到头（按天结算 + 按模型单独计算）+ 换另一个免费模型。
+    // ⚠️ **不再复述上游英文原文**（用户 2026-10-03 报障「比其它供应商长太多」）：
+    // 语义由我们的文案表达，原文复述会与中文解释重复一遍。判据反过来断言。
+    expect(error.message).not.toContain('Daily free limit reached')
+    expect(error.message).toContain('当日免费额度已用尽')
+    // 动作必须说清：等不到头（按天结算 + 按模型单独计）+ 换另一个免费模型。
     expect(error.message).toContain('按天结算')
-    expect(error.message).toContain('按模型单独计算')
+    expect(error.message).toContain('按模型单独计')
     // ⚠️ **不能**建议 cline-pass：实测本账号 403 ENTITLEMENT_ERROR（有余额、无订阅）。
     expect(error.message).not.toContain('cline-pass')
-    // 解禁时刻（本地时钟）与「约 N 小时后」都要有。
-    // eslint-disable-next-line no-irregular-whitespace
-    expect(error.message).toMatch(/约 \d+(\.\d)? 小时后/)
+    // 解禁时刻（本地时钟）与「预计 N 小时后重置」都要有。
+    expect(error.message).toMatch(/预计 \d+(\.\d)? 小时后重置（\d{4}\/\d{1,2}\/\d{1,2}/)
+    // ⚠️ 长度上限：这条消息原先 ≈ 270 字符，是其它 provider 的两三倍。
+    expect(error.message.length).toBeLessThan(150)
   })
 
   it('★ 换号预算用尽时，**最后**一个账号也必须被标记（否则下一轮又选回它）', async () => {
