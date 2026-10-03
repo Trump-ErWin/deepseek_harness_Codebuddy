@@ -9,6 +9,10 @@ import {
   gatewayButtonLabel,
   gatewayButtonTitle,
   gatewayEndpoint,
+  gatewayEffortRow,
+  gatewayEffortRows,
+  gatewayEffortsCurl,
+  gatewayEffortsHint,
   gatewayModelsCurl,
   gatewayModelsHint,
   gatewayStatusLines,
@@ -250,5 +254,96 @@ describe('模型能力标记（可发图片）', () => {
   it('样式里有这个类，且锁住 flex: none（否则会被 id/name 挤没）', () => {
     const styles = readFileSync(resolve(HERE, '../../plugin-src/client/jet-hub-styles.js'), 'utf8')
     expect(styles).toMatch(/\.dim-jh-modelBadge \{[^}]*flex: none/)
+  })
+})
+
+/**
+ * 思考档位对照表。
+ *
+ * 背景（真实缺陷）：各 provider 的档位 id 是上游私有值，而 OpenAI 协议的客户端
+ * 只有固定 8 档词汇。用户照 DSH 界面上的名字填进 CC Switch（LobsterAI 的 Max →
+ * `max`、Cline 的 Extra → `xhigh`、TRAE 的 Light/Extra High → `low`/`xhigh`），
+ * 网关按 id 校验，全部 400 —— 整轮对话不可用，而两端都看不出原因。
+ */
+describe('思考档位对照表', () => {
+  const TRAE = {
+    id: 'trae/deepseek-v4.1-flash',
+    name: 'Flash',
+    reasoning: {
+      efforts: [
+        { id: 'light', name: 'Light', canonical: 'low' },
+        { id: 'high', name: 'High', canonical: 'high' },
+        { id: 'extra_high', name: 'Extra High', canonical: 'xhigh' },
+      ],
+      default: 'high',
+      openai_efforts: ['low', 'high', 'xhigh'],
+    },
+  }
+  /** 档位名与客户端一致的行：不该被标「需对照」。 */
+  const PLAIN = {
+    id: 'qoder/dfmodel',
+    name: 'DeepSeek-Flash',
+    reasoning: {
+      efforts: [{ id: 'low', name: '低', canonical: 'low' }, { id: 'high', name: '高', canonical: 'high' }],
+      openai_efforts: ['low', 'high'],
+    },
+  }
+  const NO_EFFORT = { id: 'zcode/GLM-5.3', name: 'GLM' }
+
+  it('★ 一行同时给出「真实档位」与「客户端该填」（只给一个都救不了用户）', () => {
+    const row = gatewayEffortRow(TRAE)
+    // 真实档位要把 id 与 DSH 界面上的 name 都给出来：用户就是照 name 填错的。
+    expect(row?.declared).toBe('light（Light） · high（High） · extra_high（Extra High）')
+    expect(row?.fill).toBe('low, high, xhigh')
+    expect(row?.lossy).toBe(true)
+  })
+
+  it('档位名与客户端一致的行不标「需对照」', () => {
+    expect(gatewayEffortRow(PLAIN)?.lossy).toBe(false)
+  })
+
+  it('⚠️ 未声明档位的模型不产生行（「不知道」≠「一个都没有」）', () => {
+    expect(gatewayEffortRow(NO_EFFORT)).toBeNull()
+    expect(gatewayEffortRow({ id: 'x', reasoning: { efforts: [], openai_efforts: [] } })).toBeNull()
+    expect(gatewayEffortRows([TRAE, NO_EFFORT, PLAIN]).map(row => row.id))
+      .toEqual(['trae/deepseek-v4.1-flash', 'qoder/dfmodel'])
+  })
+
+  it('脏输入不抛错（宿主字段缺失/形态不符时面板仍要能渲染）', () => {
+    expect(gatewayEffortRows(null)).toEqual([])
+    expect(gatewayEffortRows(undefined)).toEqual([])
+    expect(gatewayEffortRow(null)).toBeNull()
+    expect(gatewayEffortRow({ id: 'x', reasoning: { efforts: 'nope' as never } })).toBeNull()
+    // openai_efforts 缺失时给空串而不是 undefined（否则 UI 会渲染出 "undefined"）。
+    expect(gatewayEffortRow({ id: 'x', reasoning: { efforts: [{ id: 'turbo', name: 'T' }] } })?.fill).toBe('')
+  })
+
+  it('★ 说明文案必须同时说清「照最后一列填才精确」与「填别的也不会失败」', () => {
+    const hint = gatewayEffortsHint([TRAE, PLAIN, NO_EFFORT])
+    expect(hint).toContain('2 个模型')
+    // 只有 TRAE 那行是「需对照」，数量必须如实。
+    expect(hint).toContain('1 个的档位名与 OpenAI 客户端不同')
+    expect(hint).toContain('按强度就近')
+    expect(hint).toContain('CC Switch')
+  })
+
+  it('一个模型都没声明档位时说明「网关不会下发该参数」', () => {
+    expect(gatewayEffortsHint([NO_EFFORT])).toContain('不会下发该参数')
+    expect(gatewayEffortsHint([])).toContain('不会下发该参数')
+  })
+
+  it('curl 模板指向对照表端点，且**绝不含**明文密钥', () => {
+    const curl = gatewayEffortsCurl('http://127.0.0.1:9999/v1')
+    expect(curl).toContain('127.0.0.1:9999/v1/reasoning-efforts')
+    expect(curl).toContain('把你的 API Key 贴在这里')
+  })
+
+  it('面板确实渲染了对照表，且数据来自宿主的档位视图', () => {
+    expect(source).toContain('gatewayEffortRows(models)')
+    expect(source).toContain('gatewayEffortsHint(models)')
+    expect(source).toContain('gatewayEffortsCurl(gatewayEndpoint(status))')
+    expect(source).toContain('客户端该填')
+    // 空表不能让用户点开一个什么都没有的区块。
+    expect(source).toMatch(/disabled:\s*effortRows\.length === 0/)
   })
 })

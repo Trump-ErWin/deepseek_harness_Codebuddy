@@ -7459,3 +7459,71 @@ GET  /v1/models             ← 两套协议共用同一份目录
   （用例会红）。
 - 回归用例：`tests/unit/openai-gateway-responses.spec.ts`（转换 + 流式/非流式事件序列）
   与 `tests/unit/openai-gateway-server.spec.ts` 的「Responses API 出口」段（HTTP 层）。
+
+## ⚠️ 思考档位有**两套词汇表**：网关必须翻译，客户端表达不出私有 id（真实报障，2026-10-03）
+
+**用户报障的形态**：在 CC Switch（给 Codex 生成模型目录的那一层）里按 DSH 界面显示的
+名字填「思考等级」，之后 Codex 每一轮都失败 ——
+`400 reasoning effort "max" is not supported by the selected DSH model`。
+用户从两端都看不出为什么，只能一档一档试。
+
+**根因**：各 provider 的档位 `id` 就是**上游 wire 值**，与客户端能表达的词汇不是一套：
+
+| provider | DSH 界面上显示（= adapter 的 `name`） | wire id（网关校验的） | 客户端照填 → 旧行为 |
+|---|---|---|---|
+| LobsterAI | 关闭 / 高 / **Max** | `off` / `high` / **`xhigh`** | `max` → 400 |
+| Cline | None / … / **Extra** | `none` / … / **`max`** | `xhigh` → 400 |
+| TRAE | **Light** / High / **Extra High** | **`light`** / `high` / **`extra_high`** | `low` / `xhigh` → 400 |
+| Raccoon | **开启 / 关闭** | **`on`** / `off` | 恰好能用 |
+
+⚠️ **`id` 与 `name` 不是同一个概念**，仓库里已有两处同款教训：
+`lobsterai-adapter.ts` 的 `reasoningFor`（Issue #IKHCZF：最强档显示成 XHigh，而产品侧
+叫 Max）、`cline-product.ts` 的 `CLINE_REASONING_EFFORTS`（`{id:'max', name:'Extra'}`）。
+DSH 的选择器渲染 `name`、发请求用 `id`；**网关校验的也是 `id`**。
+
+⚠️ **客户端侧是硬约束**：OpenAI 协议只有固定 8 档（`none minimal low medium high xhigh
+max ultra`）。CC Switch 把那 8 个（连英文描述）**硬编码在自己的产物里**
+（`cc-switch.exe` 里可抠出这张表，它写进 `cc-switch-model-catalog.json` 再交给 Codex 的
+`model_catalog_json`），它**表达不出** `light` / `extra_high` / `on` / `off`。
+⇒ 「让客户端来查我们对齐」这条路走不通，**只能网关翻译**。
+
+**实现（强度序的唯一权威：`src/reasoning-ladder.ts`）**：
+
+- `REASONING_EFFORT_RANK` 是强度序的**唯一副本**（`trae-adapter.ts` 挑默认档也读它，
+  不再自带一份表）；`CANONICAL_REASONING_EFFORTS` 就是客户端那 8 个。
+- `translateReasoningEffort` 三条规则：① **精确命中**声明的 id → 原样（私有 id 与
+  上游新冒出来的名字都靠这条通过）；② **登记过**的名字 → 同族就近，**同距取更强的一档**
+  （与 raccoon 那条「宁可多思考，不可静默关掉」同因）；③ 没有同族候选 →
+  `unexpressible`，完全不认识 → `unknown`。
+- `normalizeReasoningEffort`（`messages.ts`）：`unknown` **仍然 400**（拼错不该被静默
+  翻译，且报错里带上该模型可用档位）；`unexpressible` **不下发 + 记 warning**；
+  翻译成功记 **info** —— 这是加了翻译层之后的**正常路径**（CC Switch 给 TRAE 的 `low`
+  每一轮都会被翻译），用 warn 会把日志刷满、反而掩盖真正的异常。
+- ⚠️ **只在同族内翻译**：`off`/`none`（rank 0）与其余各档**互不翻译**。
+  把「少想一点」翻译成「完全不想」= 静默关掉功能，比 400 更糟。
+- ⚠️ **未登记强度的声明 id 不参与就近匹配**（不知道强度就不猜）。
+- `provider === 'codearts'` 的短路保留：该 provider 只有开/关两态，任何名字都等价。
+
+**可查询（三个出口，必须同源）**：
+
+| 出口 | 内容 |
+|---|---|
+| `GET /v1/models` 的 `reasoning` | `efforts`（带 `canonical`）+ `default` + `openai_efforts` |
+| `GET /v1/reasoning-efforts` | 逐模型 + 8 个规范名**逐一的结局**（exact / mapped / unexpressible / ignored） |
+| 设置页弹窗「思考档位对照表」 | 同一份数据（`gatewayEffortRows` 纯函数 + RPC 的 `models[].reasoning`） |
+
+⚠️ **`ignored`（模型没声明档位）与 `unexpressible`（声明了但没有这一族）必须分开报**：
+前者网关什么都没做（按模型默认走），后者是用户明确要的档位没生效。合并会让排查看不出差异。
+
+⚠️ **判据（与工具那条同源）**：拒绝的收益（让用户知道某档没生效）远小于代价
+（整轮不可用，且客户端**没有**能表达私有 id 的写法 ⇒ 用户无从修复）。
+
+⚠️ 反查 `canonicalReasoningEffortFor` **只在单个模型的声明集合内**保证往返自洽
+（`translate(canonicalFor(id), declared) === id`）；把几个渠道的档位混成一个集合再反查
+没有意义 —— 用例里按渠道分别验。
+
+**回归用例**：`tests/unit/reasoning-ladder.spec.ts`（强度序 / 三条规则 / 同族约束 /
+反查往返）、`openai-gateway-messages.spec.ts`（翻译 + 通知 + 未知仍 400 + 不下发）、
+`openai-gateway-models.spec.ts`（档位视图 + 容错 + 两处同源）、
+`openai-gateway-server.spec.ts` 的「思考档位」段（HTTP 层实测那三条雷 + 对照表端点）、
+`openai-gateway-panel.spec.ts`（对照表行与文案）。

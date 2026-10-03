@@ -513,3 +513,141 @@ describe('Responses API 出口', () => {
     }
   })
 })
+
+/**
+ * 思考档位的**翻译层 + 可查询**（真实缺陷：CC Switch 的档位表与 provider 私有 id
+ * 对不上，用户照着 DSH 界面上的名字填，得到 400 + 整轮不可用）。
+ */
+describe('OpenAI gateway 思考档位（翻译层与对照表）', () => {
+  const TRAE = {
+    listProviders: () => [{ id: 'trae' }],
+    listModels: async () => [{ provider: 'trae', id: 'deepseek-v4.1-flash', name: 'Flash' }],
+    resolveModelInfo: async () => ({
+      provider: 'trae',
+      id: 'deepseek-v4.1-flash',
+      name: 'Flash',
+      reasoning: {
+        efforts: [
+          { id: 'light', name: 'Light' },
+          { id: 'high', name: 'High' },
+          { id: 'extra_high', name: 'Extra High' },
+        ],
+        defaultEffort: 'high',
+      },
+    }),
+    stream: (options: { signal?: AbortSignal }) => responseStream(options.signal),
+  }
+
+  it('★ 客户端填的是通用档位名、模型认的是私有 id：请求成功且下发的是私有 id', async () => {
+    // CC Switch 里 TRAE 这一行现在填的是 `low, high, xhigh` —— 修好前这三个
+    // 里有两个直接 400（整轮失败）。修好后应当照强度落到 light / high / extra_high。
+    const port = await freePort()
+    const seen: Array<string | undefined> = []
+    const captureLlm = {
+      ...TRAE,
+      stream: (options: { reasoningEffort?: string; signal?: AbortSignal }) => {
+        seen.push(options.reasoningEffort)
+        return responseStream(options.signal)
+      },
+    }
+    const gateway = createOpenAiGateway({ llm: captureLlm, env: ENV(port) })
+    await gateway.start()
+    try {
+      for (const effort of ['low', 'high', 'xhigh']) {
+        const result = await call(port, '/v1/responses', {
+          method: 'POST', key: 'test-key', body: { model: 'trae/deepseek-v4.1-flash', input: 'hi', reasoning: { effort } },
+        })
+        expect(result.status, effort).toBe(200)
+      }
+      // `none` 则无处可去（TRAE 这模型没有关闭档）→ 不下发该参数，但请求仍然成功。
+      const none = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: { model: 'trae/deepseek-v4.1-flash', input: 'hi', reasoning: { effort: 'none' } },
+      })
+      expect(none.status).toBe(200)
+      expect(seen).toEqual(['light', 'high', 'extra_high', undefined])
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('★ 完全不认识的档位名仍然 400（拼错不该被静默翻译），且报错带上可用档位', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm: { ...TRAE }, env: ENV(port) })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: { model: 'trae/deepseek-v4.1-flash', input: 'hi', reasoning: { effort: 'banana' } },
+      })
+      expect(result.status).toBe(400)
+      const parsed = JSON.parse(result.body)
+      expect(parsed.error.code).toBe('unsupported_reasoning_effort')
+      expect(parsed.error.message).toContain('light, high, extra_high')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('/v1/models 带上档位视图（工具据此就能填对，不必猜）', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm: { ...TRAE }, env: ENV(port) })
+    await gateway.start()
+    try {
+      const models = JSON.parse((await call(port, '/v1/models', { key: 'test-key' })).body)
+      expect(models.data[0].reasoning).toEqual({
+        efforts: [
+          { id: 'light', name: 'Light', canonical: 'low' },
+          { id: 'high', name: 'High', canonical: 'high' },
+          { id: 'extra_high', name: 'Extra High', canonical: 'xhigh' },
+        ],
+        default: 'high',
+        openai_efforts: ['low', 'high', 'xhigh'],
+      })
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('★ GET /v1/reasoning-efforts：给出「该填哪几个」与 8 个规范名逐一的结局', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm: { ...TRAE }, env: ENV(port) })
+    await gateway.start()
+    try {
+      // 与其它端点同一套鉴权：地址栏直接打开会 401。
+      expect((await call(port, '/v1/reasoning-efforts')).status).toBe(401)
+      const body = JSON.parse((await call(port, '/v1/reasoning-efforts', { key: 'test-key' })).body)
+      expect(body.canonical).toEqual(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+      expect(body.data).toHaveLength(1)
+      expect(body.data[0].id).toBe('trae/deepseek-v4.1-flash')
+      expect(body.data[0].openai_efforts).toEqual(['low', 'high', 'xhigh'])
+      const resolution = (requested: string) => body.data[0].resolutions.find((row: { requested: string }) => row.requested === requested)
+      expect(resolution('low')).toEqual({ requested: 'low', outcome: 'mapped', applied: 'light' })
+      expect(resolution('high')).toEqual({ requested: 'high', outcome: 'exact', applied: 'high' })
+      expect(resolution('xhigh')).toEqual({ requested: 'xhigh', outcome: 'mapped', applied: 'extra_high' })
+      // TRAE 这模型没有关闭档 → 客户端要 none 时网关不下发该参数。
+      expect(resolution('none')).toEqual({ requested: 'none', outcome: 'unexpressible' })
+      expect(body.data[0].default).toBe('high')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('未声明档位的模型也出现在对照表里（说明「网关不会下发档位」）', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({
+      llm: {
+        ...TRAE,
+        resolveModelInfo: async () => ({ provider: 'trae', id: 'deepseek-v4.1-flash', name: 'Flash' }),
+      },
+      env: ENV(port),
+    })
+    await gateway.start()
+    try {
+      const body = JSON.parse((await call(port, '/v1/reasoning-efforts', { key: 'test-key' })).body)
+      expect(body.data[0]).toMatchObject({ id: 'trae/deepseek-v4.1-flash', efforts: [], openai_efforts: [] })
+      // 8 个规范名全部标记为「不下发」（网关按模型默认走），而不是「无法表达」。
+      expect(body.data[0].resolutions.every((row: { outcome: string }) => row.outcome === 'ignored')).toBe(true)
+    } finally {
+      await gateway.close()
+    }
+  })
+})

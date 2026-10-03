@@ -20,7 +20,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from './account-pool.js'
 import { isGatewayEnabled } from './openai-gateway/config.js'
-import { collectGatewayModelIds } from './openai-gateway/models.js'
+import { collectGatewayEffortViews, collectGatewayModels, toGatewayModelIds, type GatewayModelSource } from './openai-gateway/models.js'
 import {
   applyGatewayDesiredState,
   gatewayAddress,
@@ -719,6 +719,13 @@ type LlmServiceLike = {
   listProviders?(): readonly { id: string }[]
   listModels(provider: string): Promise<Array<{ id: string; name: string }>>
   listAllModels?(provider: string): readonly { id: string; name: string }[]
+  /**
+   * 可选：解析单个模型的精确元信息（**思考档位**只在这里）。
+   *
+   * ⚠️ 声明为可选：网关的档位对照表是附加能力，宿主没提供时目录照常返回，
+   * 只是每个模型不带档位字段。
+   */
+  resolveModelInfo?(provider: string, model: string, signal?: AbortSignal): Promise<unknown>
 }
 
 /**
@@ -743,6 +750,36 @@ function llmServiceOf(ctx: Context): LlmServiceLike | undefined {
   const direct = (ctx as unknown as { llm?: LlmServiceLike }).llm
   if (direct !== undefined && direct !== null) return direct
   return ctx.get('llm') as LlmServiceLike | undefined
+}
+
+/**
+ * 采集网关目录（**含思考档位视图**）。
+ *
+ * ⚠️ 两个 RPC 分支（`gateway.getEnabled` / `gateway.setEnabled`）必须共用本函数：
+ * 设置页看到的档位与 `/v1/reasoning-efforts` 返回的必须同源，各算一遍必然漂移，
+ * 而漂移的症状是「照着设置页填的对不上网关实际接受的」—— 本功能存在的全部理由
+ * 就是消灭这种对照错误，自己再造一个就毫无意义了。
+ *
+ * 档位要逐模型 `resolveModelInfo` 才拿得到（`listModels` 不带），成本是每个模型
+ * 一次**读缓存**的调用（远端目录刚被 `listModels` 拉过），与 DSH 自己
+ * `buildModelCatalog` 的形状一致。
+ */
+async function collectGatewayCatalog(
+  llm: LlmServiceLike | undefined,
+  providers: readonly { id: string }[],
+  onError: (provider: string, error: unknown) => void,
+): Promise<RpcGatewayModel[]> {
+  const source: GatewayModelSource = {
+    listProviders: () => providers,
+    listModels: (provider) => llm!.listModels(provider),
+  }
+  const resolve = llm?.resolveModelInfo
+  if (typeof resolve === 'function') {
+    source.resolveModelInfo = (provider, model) => resolve.call(llm, provider, model)
+  }
+  const groups = await collectGatewayModels(source, onError)
+  const views = await collectGatewayEffortViews(source, groups, onError)
+  return toGatewayModelIds(groups, views)
 }
 
 /**
@@ -3526,12 +3563,9 @@ function registerJetHubEndpoints(
               ctx.logger.warn('[jet-hub] gateway.getEnabled：既取不到 llm.listProviders，也没有任何已注册适配器可作兜底，模型清单为空')
               return [] as RpcGatewayModel[]
             }
-            return collectGatewayModelIds(
-              { listProviders: () => providers, listModels: (provider) => llm!.listModels(provider) },
-              (provider, error) => {
-                ctx.logger.warn(`[jet-hub] ${provider} 模型目录读取失败，已从网关列表跳过：${String(error)}`)
-              },
-            )
+            return collectGatewayCatalog(llm, providers, (provider, error) => {
+              ctx.logger.warn(`[jet-hub] ${provider} 模型目录读取失败，已从网关列表跳过：${String(error)}`)
+            })
           }, [] as RpcGatewayModel[]),
           modelsSource,
         }
@@ -3566,9 +3600,8 @@ function registerJetHubEndpoints(
           : (llm?.listProviders !== undefined ? 'catalog' : (Object.keys(modelAdapters ?? {}).length > 0 ? 'adapters' : 'none'))
         const models = providers === undefined
           ? []
-          : await collectGatewayModelIds({
-            listProviders: () => providers,
-            listModels: (provider) => llm!.listModels(provider),
+          : await collectGatewayCatalog(llm, providers, (provider, error) => {
+            ctx.logger.warn(`[jet-hub] ${provider} 模型目录读取失败，已从网关列表跳过：${String(error)}`)
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] gateway.setEnabled 的模型目录刷新失败：${String(error)}`)
             return [] as RpcGatewayModel[]

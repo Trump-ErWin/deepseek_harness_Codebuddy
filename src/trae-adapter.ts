@@ -23,6 +23,7 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { reasoningRankOf } from './reasoning-ladder.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import {
@@ -81,22 +82,10 @@ const TRAE_EFFORT_NAMES: Readonly<Record<string, string>> = {
  * ⚠️ **只用于挑「默认档」，不参与 wire 取值** —— wire 值就是远端
  * `reasoning_effort_config.options` 里的字符串本身，本表改了也不会影响下发。
  *
- * 覆盖 TRAE 实测出现过的全部档位；上游若新增档位，走
- * {@link strongestTraeEffort} 的第 3 条退化规则（取数组末项）。
+ * ⚠️ 表本体已收敛到 `src/reasoning-ladder.ts`（网关做「OpenAI 规范名 → 私有 id」
+ * 翻译时用的是**同一份**强度序）。两处各写一份必然漂移，而漂移的症状是
+ * 「同一个档位在挑默认档与在网关翻译时算出不同结果」。
  */
-const TRAE_EFFORT_RANK: Readonly<Record<string, number>> = {
-  off: 0,
-  none: 0,
-  minimal: 1,
-  light: 2,
-  low: 3,
-  medium: 4,
-  high: 5,
-  extra_high: 6,
-  xhigh: 7,
-  max: 8,
-}
-
 /**
  * 从 `options` 里挑**最强**的一档作默认值。
  *
@@ -114,9 +103,7 @@ function strongestTraeEffort(options: readonly string[]): string | undefined {
   let best: string | undefined
   let bestRank = -1
   for (const option of options) {
-    const rank = Object.prototype.hasOwnProperty.call(TRAE_EFFORT_RANK, option)
-      ? TRAE_EFFORT_RANK[option]
-      : undefined
+    const rank = reasoningRankOf(option)
     if (rank !== undefined && rank > bestRank) {
       best = option
       bestRank = rank
