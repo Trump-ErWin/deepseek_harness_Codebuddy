@@ -57,7 +57,7 @@ import {
   fetchMinimaxCreditBalance,
   fetchMinimaxSigninStatus,
 } from './minimax-credits.js'
-import { GEMINI, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
+import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiCredential } from './gemini.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
 import { fetchGeminiCreditBalance } from './gemini-credits.js'
@@ -1838,13 +1838,16 @@ function registerJetHubEndpoints(
           }
 
           geminiStarted.result.then(async (credential) => {
-            const result = await gemini.persistLogin(credential, { refName })
+            // ⚠️ 不接收 `persistLogin` 的返回值：它给的是 OIDC `sub`，只适合当稳定
+            // 标识。展示名一律走 `geminiAccountLabel`（见下）。
+            await gemini.persistLogin(credential, { refName })
             await pool.updateAccount(id, {
-              // ⚠️ `accountId` 是 OIDC `sub`（**不是**邮箱 —— 邮箱会被用户改掉）。
-              // 取不到时退化为池 id。
-              nickname: result.accountId === undefined
-                ? id
-                : `Gemini ${result.accountId.slice(0, 8)}`,
+              // ⚠️ 用 `geminiAccountLabel`（邮箱优先）而非 `accountId.slice(0, 8)`：
+              // `sub` 是 21 位数字，截前 8 位得到 `Gemini 10500520` 这种**不可辨认**
+              // 的展示名（用户报障 2026-10-03）。`sub` 的价值是「稳定标识」，不是
+              // 「显示名」—— 展示要的是可辨识，邮箱正好。
+              // 取不到邮箱时该函数回退 `sub`，两者都无则退化为池 id。
+              nickname: geminiAccountLabel(credential) ?? id,
               // ⚠️ **必须用 `geminiCredentialExpiresAtMs`**：它认 `expiry`
               //（RFC3339）与 `expires_in`，取不到就返回 `undefined` ——
               // 传 `undefined` 是「不知道」，不会被写成 0 而让 UI 显示「已过期」。

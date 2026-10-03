@@ -301,7 +301,7 @@ describe('Gemini Jet Hub 登录接入', () => {
     expect(parsed.email).toBe('spec@example.com')
   }, 20_000)
 
-  it('登录成功后账号昵称被回填（不再显示裸 id）', async () => {
+  it('登录成功后账号昵称被回填为邮箱（不是 sub 前 8 位）', async () => {
     const { call } = makeRpc()
     const created = await call('account.create', { provider: GEMINI.id })
     const accountId = created.value.accountId as string
@@ -312,11 +312,16 @@ describe('Gemini Jet Hub 登录接入', () => {
     while (Date.now() < deadline) {
       const listed = await call('account.list', { provider: GEMINI.id })
       nickname = String(listed.value.accounts.find((a: { id: string }) => a.id === accountId)?.nickname ?? '')
-      if (nickname.startsWith('Gemini ')) break
+      // 占位条目的昵称就是池 id；变了说明回填已经发生。
+      if (nickname !== accountId) break
       await new Promise((r) => setTimeout(r, 100))
     }
-    // `persistLogin` 回 `credential.sub`，RPC 取前 8 位。
-    expect(nickname).toBe('Gemini spec-sub')
+    // `geminiAccountLabel` 邮箱优先 —— 桩 userinfo 回了 `spec@example.com`。
+    // ⚠️ 曾经这里断言 `'Gemini spec-sub'`（`sub` 前 8 位），那是**不可辨认**的
+    // 展示名，2026-10-03 用户报障后改为邮箱优先，见 `geminiAccountLabel`。
+    expect(nickname).toBe('spec@example.com')
+    // 顺带钉住反面：不得再拼 `sub` 前缀。
+    expect(nickname.startsWith('Gemini ')).toBe(false)
   }, 20_000)
 
   it('★ 登录成功后 refreshable 被回填为 true（否则续期定时器不会碰它）', async () => {
