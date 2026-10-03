@@ -11,6 +11,7 @@ import {
   resetAllAccounts,
   retestAccount,
   retestAllAccounts,
+  testAccount,
 } from '../../src/account-probe.js'
 import type { ProbePool } from '../../src/account-probe.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
@@ -270,5 +271,87 @@ describe('限流判定（isRateLimitFailure 经由默认探测暴露的行为）
       const error = new LlmError('频率限制', code)
       expect(error.code).toBe(code)
     }
+  })
+})
+
+/**
+ * 「测试」：**无条件**真发一次请求（用户 m03338 的需求）。
+ *
+ * 与 `retestAccount` 的硬性区别（这组用例存在的全部理由）：
+ * - 触发条件：重测只测 `Object.keys(entry.modelRateLimits)`，没有标记时
+ *   **零请求**提前返回；测试不看标记，直接发。
+ * - 存储副作用：重测会清标记、写回新的重置时刻；测试**一个字节都不写**。
+ */
+describe('testAccount', () => {
+  it('没有限流标记时依然真发一次请求（这正是重测做不到的事）', async () => {
+    const pool = makePool([makeEntry({ modelRateLimits: undefined })])
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({ modelId, ok: true }))
+
+    const res = await testAccount(pool, 'buddy-1', 'deepseek-v4.1-flash', { probe })
+
+    expect(probe).toHaveBeenCalledTimes(1)
+    expect(res.ok).toBe(true)
+    expect(res.modelId).toBe('deepseek-v4.1-flash')
+  })
+
+  it('不写任何存储：成功时不调 clearModelRateLimits', async () => {
+    const pool = makePool([makeEntry()])
+    const before = JSON.stringify(pool.get('buddy-1')?.modelRateLimits)
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({ modelId, ok: true }))
+
+    await testAccount(pool, 'buddy-1', 'deepseek-v4.1-flash', { probe })
+
+    // ⚠️ 这是与重测的**关键分野**：重测成功会清标记，测试必须原封不动。
+    expect(pool.cleared).toHaveLength(0)
+    expect(JSON.stringify(pool.get('buddy-1')?.modelRateLimits)).toBe(before)
+  })
+
+  it('仍受限时如实回报原因，且**不**写回新的重置时刻', async () => {
+    const pool = makePool([makeEntry()])
+    const before = pool.get('buddy-1')?.modelRateLimits?.['deepseek-v4.1-flash']
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({
+      modelId,
+      ok: false,
+      message: '仍受限：频率限制',
+      resetTimeMs: Date.now() + 7_200_000,
+    }))
+
+    const res = await testAccount(pool, 'buddy-1', 'deepseek-v4.1-flash', { probe })
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toContain('仍受限')
+    // 结果里带出上游时刻（供展示），但**不落盘**。
+    expect(res.resetTimeMs).toBeGreaterThan(Date.now())
+    expect(pool.updated).toHaveLength(0)
+    expect(pool.get('buddy-1')?.modelRateLimits?.['deepseek-v4.1-flash']).toBe(before)
+  })
+
+  it('账号不存在时返回错误而不抛异常', async () => {
+    const pool = makePool([])
+    const probe = vi.fn()
+    const res = await testAccount(pool, 'ghost', 'm', { probe })
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toContain('不存在')
+    expect(probe).not.toHaveBeenCalled()
+  })
+
+  it('探测函数抛错时收敛为可读原因，不冒泡', async () => {
+    const pool = makePool([makeEntry()])
+    const probe = vi.fn(async () => { throw new Error('凭据已失效') })
+
+    const res = await testAccount(pool, 'buddy-1', 'm', { probe })
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toBe('无法确认：凭据已失效')
+  })
+
+  it('回传昵称，便于多账号时区分是哪一个', async () => {
+    const pool = makePool([makeEntry({ nickname: '测试号' })])
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({ modelId, ok: true }))
+
+    const res = await testAccount(pool, 'buddy-1', 'm', { probe })
+
+    expect(res.nickname).toBe('测试号')
   })
 })

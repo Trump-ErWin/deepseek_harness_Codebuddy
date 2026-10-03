@@ -59,6 +59,7 @@ import type {
   ProviderAccountEntry,
   RpcResetResponse,
   RpcRetestResponse,
+  RpcTestAccountResponse,
 } from './types.js'
 
 /**
@@ -448,6 +449,84 @@ export async function retestAllAccounts(
   return {
     accounts,
     clearedCount: accounts.reduce((sum, a) => sum + a.cleared.length, 0),
+  }
+}
+
+/**
+ * 挑一个「测试」要用的模型 id（纯函数，无 IO —— 便于单测覆盖优先级）。
+ *
+ * 优先级：调用方显式指定 > 已有的限流标记 > 全量目录第一个。
+ *
+ * ## 为什么标记优先于目录
+ *
+ * 用户点「测试」最常见的动机是「这个账号显示着限流标记，它到底恢复了没有」，
+ * 而那个标记指向的模型正是他关心的。取目录第一个（如 CodeBuddy 的
+ * `glm-5.2`）会测一个与标记无关的模型 —— 结果既不能清标记、也不能解释标记。
+ *
+ * ## 为什么没有目录时返回空串而不是猜一个
+ *
+ * 猜错的模型名会得到 404，把「账号不可用」与「模型名不对」两件事混成同一条
+ * 报错，用户据此会去做完全错误的动作（重新登录）。故调用方拿到空串时应
+ * **如实报错**，而不是发出去。
+ *
+ * @param catalogIds 该 provider 的全量模型目录（调用方按需读取，可为空数组）。
+ */
+export function pickTestModel(
+  entry: ProviderAccountEntry,
+  catalogIds: readonly string[],
+  requested?: string,
+): string {
+  if (typeof requested === 'string' && requested !== '') return requested
+  const marked = Object.keys(entry.modelRateLimits ?? {})[0]
+  if (marked !== undefined) return marked
+  return catalogIds[0] ?? ''
+}
+
+/**
+ * 「测试」单个账号：**无条件**真发一次请求，且不做任何存储写入。
+ *
+ * ## 与 {@link retestAccount} 的区别（这是本函数存在的全部理由）
+ *
+ * `retestAccount` 的触发条件是 `Object.keys(entry.modelRateLimits ?? {})`：
+ * 账号没有限流标记时它在 `modelIds.length === 0` 处**提前返回，一次请求都不发**。
+ * 于是「这个账号到底还能不能用」在**没有历史 429** 时没有任何手动探活入口 ——
+ * 用户点「重测」看到瞬间返回，会以为按钮失灵（真实报障：
+ * 「重测按钮你确认过会发请求吗，为什么响应这么快？」）。
+ *
+ * `testAccount` 不看标记、不下发清除指令、不写回重置时刻：它只回答
+ * 「这一发请求成功了吗」。故它**不需要** `modelRateLimits` 存在，
+ * 也不改变任何存储状态 —— 这一点与重测是硬性区别，不可为了复用而合并。
+ *
+ * @param modelId 要测的模型 id，由 {@link pickTestModel} 决定。
+ */
+export async function testAccount(
+  pool: ProbePool,
+  accountId: string,
+  modelId: string,
+  deps: ProbeDeps = {},
+): Promise<RpcTestAccountResponse> {
+  const entry = pool.findAccount(accountId)
+  if (entry === undefined) {
+    return { accountId, modelId, ok: false, message: `账号 ${accountId} 不存在` }
+  }
+
+  const probe = deps.probe ?? makeDefaultProbe(pool, deps.timeoutMs ?? PROBE_TIMEOUT_MS)
+  let outcome: ProbeModelResult
+  try {
+    outcome = await probe(entry, modelId)
+  } catch (error) {
+    // 探测函数本身抛错（凭据解析异常等）：如实回报，不冒泡成 handler-failed。
+    const reason = error instanceof Error ? error.message : String(error)
+    return { accountId, modelId, ok: false, message: `无法确认：${reason}` }
+  }
+
+  return {
+    accountId,
+    ...entry.nickname === undefined ? {} : { nickname: entry.nickname },
+    modelId: outcome.modelId,
+    ok: outcome.ok,
+    ...outcome.message === undefined ? {} : { message: outcome.message },
+    ...outcome.resetTimeMs === undefined ? {} : { resetTimeMs: outcome.resetTimeMs },
   }
 }
 

@@ -265,6 +265,41 @@ export function supportsRateLimit(provider) {
 }
 
 /**
+ * 各 provider 是否支持账号卡片上的「**测试**」按钮（无条件真发一次请求探活）。
+ *
+ * ## 与「重测」的区别（这是它存在的全部理由）
+ *
+ * 「重测」的触发条件是**该账号已有 `modelRateLimits` 标记**：没有标记时
+ * `retestAccount` 在 `modelIds.length === 0` 处提前返回、**一次请求都不发**。
+ * 于是「这个账号到底还能不能用」在**没有历史 429** 时没有任何手动探活入口 ——
+ * 用户点「重测」看到瞬间返回，会以为按钮失灵（真实报障：
+ * 「重测按钮你确认过会发请求吗，为什么响应这么快？」）。
+ * 「测试」不看标记，直接挑一个模型真发出去，且**不写任何存储**。
+ *
+ * ## 为什么默认**关闭**（与上面的限流表相反）
+ *
+ * 限流按钮是**既有 UI**，默认关闭会让老用户凭空失去按钮（可见的功能回退）。
+ * 「测试」是**全新按钮**，没有存量用户，故遵循积分能力表的约定：默认关闭，
+ * 只在明确验证过「这个渠道真的能探活」时才登记。未登记 ⇒ 不渲染。
+ *
+ * 目前只登记 Gemini —— 本窗口只验证过它（`src/account-probe.ts` 的
+ * `testAccount` 走的就是 gemini 的分派支），其余 provider 未验证前不铺开。
+ */
+export const ACCOUNT_TEST_CAPABILITIES = Object.freeze({
+  gemini: Object.freeze({ test: true }),
+});
+
+/**
+ * 该 provider 的账号卡片是否渲染「测试」按钮。
+ *
+ * ⚠️ 默认 `false`（未登记即不渲染），理由与登记判据见
+ * {@link ACCOUNT_TEST_CAPABILITIES}。
+ */
+export function supportsAccountTest(provider) {
+  return ACCOUNT_TEST_CAPABILITIES[provider]?.test === true;
+}
+
+/**
  * 「锁定永久积分」窗口：距**扣费截止**不足 15 天的积分算临时（会很快作废，优先烧掉），
  * 其余算永久。
  *
