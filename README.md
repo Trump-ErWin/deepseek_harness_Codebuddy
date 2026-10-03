@@ -2106,6 +2106,28 @@ pnpm test:e2e:loomy-chat   # ⚠️ 发一次推理：默认 qwen3.8-flash（x0.
    难排查。用户可直接选 `sn-deepseek-v4-1-flash`（`ability_level: 3`、
    带 `auto` 标签，即自动选模在复杂任务下最可能选中的那个）。
 
+6. **⚠️ `tags` 里的 `vision` 不是图片能力契约**（2026-10-03 修复的真实缺陷）。
+
+   远端 `model_catalog` **根本没有下发**模态字段：穷举 9 个条目的键并集，
+   顶层 14 个键、`params` 只有 `context_window` 与 `max_tokens`，
+   用 `/modal|vision|image|img|multimodal|…/i` 扫描**命中 0 个**。
+   唯一信号是 `tags` —— 而 `sn-deepseek-v4-1-flash` 的 `tags` **不含** `vision`。
+
+   早期实现据此判它「不支持图片」，于是 `inputModalities` 播报 `['text']`，
+   **DSH 在 `LlmRuntime` 里把图片替换成文本占位符**（`[image omitted because this
+   model accepts text only; …]`）—— **图片根本没发出去**，用户只看到模型说读不到图。
+
+   实测（同一张随机 6 位数字图，模型无法猜）：**6 个可见模型全部能读图**，
+   含 tags 不含 `vision` 的 `sn-deepseek-v4-1-flash`（**5/5**）与 `sn-glm-5-3-flash`（1/1）。
+   `tags` 的真实用途是客户端「Raccoon-Auto 选模」的**偏好标签**，不是能力声明。
+
+   修法：`RACCOON_IMAGE_CAPABILITY_OVERRIDES` 白名单（仅覆盖实测确认的个案），
+   远端解析与本地兜底表两条路径都接。未改成「该家恒支持」——
+   将来上架纯文本模型时那会放行后被上游 400，错误更晚更难懂。
+
+   ⚠️ `sn-glm-5-3` 偶发读不到图（实测 3 次中 1 次），是**网关节点不一致**
+   （部分 fallback 组是纯文本的），属 provider 侧缺陷；遇到时换模型即可。
+
 ### 模型目录（6 个 `visible:true`）
 
 倍率取 `billing_effective_multiplier`（**当前生效价**，已含促销），
