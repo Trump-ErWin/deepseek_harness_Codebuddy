@@ -311,7 +311,9 @@ describe('createUsageBadge：订阅读数', () => {
     if (!result.ok) return
     expect(result.value.subscription?.kind).toBe('plan')
     const rows = result.value.subscription?.kind === 'plan' ? result.value.subscription.accounts : []
-    expect(rows).toEqual([{ accountId: 'a', nickname: 'a', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credits' } }])
+    // ⚠️ unit 是**归一后**的展示口径（'credit'），不是包上的原值（'credits'）——
+    // 否则客户端会把 credit / credits 拆成两组（真实缺陷，2026-10-03）。
+    expect(rows).toEqual([{ accountId: 'a', nickname: 'a', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credit' } }])
   })
 
   it('该渠道没有订阅形态时**不带** subscription 字段', async () => {

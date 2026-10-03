@@ -35,11 +35,16 @@
  * **回落**到下一个候选：否则徽标会显示成 `Cline · `（只有渠道名、没有数字），
  * 比显示余额更没用。
  *
- * ⚠️ 多单位**绝不跨单位求和**：ZCode 的额度是 token，其余是积分。同一渠道内
- * 单位一致，但代码里不做这个假设 —— 出现两种单位时按单位分组并列显示。
+ * ⚠️ 多单位**绝不跨量纲求和**：ZCode 的额度是 token，其余是积分，两者不可折算，
+ * 故按单位分组并列显示。
+ *
+ * ⚠️ 但**分组键必须先归一**（`normalizeUnit`）：同一个单位服务端会有多种拼法
+ * （实测 `credit` / `credits` / 空串），按原值分组会把同一渠道拆成两组、
+ * 渲染出 `341.78积分 · 100积分` 这种「两个一样的标签并排」的文案
+ * （真实报障，2026-10-03）。详见 `credits-format.js` 文件头。
  */
 
-import { formatUnits, unitLabel } from './credits-format.js';
+import { formatUnits, normalizeUnit, unitLabel } from './credits-format.js';
 import { quotaWindowsOf, quotaPercentValue, quotaTone } from './quota-format.js';
 
 /**
@@ -143,6 +148,13 @@ export function windowPreview(windows, limit = 2) {
  * - `failedCount` 单独给出，供 UI 说明「另有 N 个账号读取失败」——
  *   **不要把失败画成 0**（0 会被读成「额度用光了」）。
  *
+ * ⚠️ 分组键是 {@link normalizeUnit} 的结果，**不是**包上的原始 `unit` 字符串。
+ * 真实缺陷（2026-10-03）：WorkBuddy 国际版两个账号的包分别是 `unit: 'credit'` 与
+ * `unit: 'credits'`（服务端同义异拼），按原值分组会把它们拆成两组，胶囊于是渲染
+ * `341.78积分 · 100积分` —— 两个一模一样的「积分」标签并排，账号一多就成一长串。
+ * 归一到展示口径后，**任意账号数都只产生一个数字**（`441.78积分`）。
+ * 详见 `credits-format.js` 文件头。
+ *
  * @returns `{ groups: [{ unit, label, total, accountCount }], failedCount, okCount }`
  */
 export function creditGroupsOf(accounts) {
@@ -158,8 +170,9 @@ export function creditGroupsOf(accounts) {
     }
     okCount += 1;
     // 单位从**包**上取（ZCode 是 token，其余是积分）；一个包都没有时按空串走
-    // `unitLabel` 的默认（「积分」）——与账号卡片的口径一致。
-    const unit = firstUnitOf(balance.packages) ?? '';
+    // `normalizeUnit` 的默认（积分）——与账号卡片的口径一致。
+    // ⚠️ 取到原值后**必须**归一：同义异拼（credit / credits / ''）不能各成一组。
+    const unit = normalizeUnit(firstUnitOf(balance.packages) ?? '');
     const group = byUnit.get(unit) ?? { unit, label: unitLabel(unit), total: 0, accountCount: 0 };
     group.total += balance.total;
     group.accountCount += 1;
@@ -177,6 +190,10 @@ export function creditGroupsOf(accounts) {
  * 多账号下「按包名汇总」才回答得了那个问题（弹窗里再逐账号列出）。
  * 排序按剩余额度降序 ⇒ 折叠态取第一条即「最大的那份套餐」。
  *
+ * ⚠️ 分组键里的单位同样走 {@link normalizeUnit}：同一份套餐在不同账号上可能被
+ * 服务端拼成 `credit` / `credits`，用原值当键会把**同一个包**拆成两组，
+ * 于是「N 个账号合计」变成「每个账号一组」（与 `creditGroupsOf` 同款缺陷）。
+ *
  * @returns `[{ name, unit, label, remaining, total, accountCount, deductionEndTime }]`
  */
 export function planGroupsOf(rows) {
@@ -185,7 +202,7 @@ export function planGroupsOf(rows) {
   for (const row of list) {
     const plan = row?.plan;
     if (!plan) continue;
-    const unit = typeof plan.unit === 'string' ? plan.unit : '';
+    const unit = normalizeUnit(typeof plan.unit === 'string' ? plan.unit : '');
     const key = `${String(plan.name)}\u0000${unit}`;
     const group = byKey.get(key) ?? {
       name: String(plan.name),

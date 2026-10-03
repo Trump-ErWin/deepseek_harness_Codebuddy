@@ -97,7 +97,7 @@ describe('窗口预览', () => {
 describe('积分的按单位分组', () => {
   it('单账号：合计即该账号余额', () => {
     const groups = creditGroupsOf([row('a', [pkg('Bonus Pack', 100), pkg('Free Plan', 96.87)])])
-    expect(groups.groups).toEqual([{ unit: 'credits', label: '积分', total: 196.87, accountCount: 1 }])
+    expect(groups.groups).toEqual([{ unit: 'credit', label: '积分', total: 196.87, accountCount: 1 }])
     expect(groups.failedCount).toBe(0)
     expect(groups.okCount).toBe(1)
   })
@@ -109,7 +109,7 @@ describe('积分的按单位分组', () => {
       row('c', [pkg('GLM-5.2', 94_539_275, 'token')]),
     ])
     expect(groups.groups).toEqual([
-      { unit: 'credits', label: '积分', total: 150, accountCount: 2 },
+      { unit: 'credit', label: '积分', total: 150, accountCount: 2 },
       { unit: 'token', label: 'Token', total: 94_539_275, accountCount: 1 },
     ])
   })
@@ -123,7 +123,58 @@ describe('积分的按单位分组', () => {
 
   it('一个包都没有时按空单位分组（显示为「积分」）', () => {
     const groups = creditGroupsOf([{ accountId: 'a', nickname: 'a', balance: { total: 5, packages: [], expiredTotal: 0 } }])
-    expect(groups.groups).toEqual([{ unit: '', label: '积分', total: 5, accountCount: 1 }])
+    expect(groups.groups).toEqual([{ unit: 'credit', label: '积分', total: 5, accountCount: 1 }])
+  })
+
+  /**
+   * ⚠️ 真实缺陷回归（2026-10-03，用户报障：胶囊显示 `341.78积分 · 100积分`）。
+   *
+   * 服务端对**同一个单位**有两种拼法，逐包实测（`probe-workbuddy-units.mjs`）：
+   * 账号 `…01CC739A` 的包是 `credit`（Bonus Pack 241.78）+ `credits`
+   * （Free Plan Subscription 100），账号 `…297957E1` 的是 `credits`。
+   * 按原值分组会把两个账号拆成两组，渲染出两个一模一样的「积分」标签。
+   *
+   * 下面这组用例就是那两个账号的**原样形状**：断言「几个账号都只产生一个数字」。
+   */
+  it('同义异拼（credit / credits / 空串）必须落进同一组 —— 两个账号一个合计', () => {
+    const groups = creditGroupsOf([
+      { accountId: 'a', nickname: 'a', balance: { total: 341.78, packages: [pkg('Bonus Pack', 241.78, 'credit'), pkg('Free Plan Subscription', 100, 'credits')], expiredTotal: 0 } },
+      { accountId: 'b', nickname: 'b', balance: { total: 100, packages: [pkg('Free Plan Subscription', 100, 'credits')], expiredTotal: 0 } },
+    ])
+    expect(groups.groups).toEqual([{ unit: 'credit', label: '积分', total: 441.78, accountCount: 2 }])
+  })
+
+  /** 折叠态整句：这才是用户实际看到的那一行（分组对了文案才可能对）。 */
+  it('WorkBuddy 国际版两个账号 → 只显示一个合计（不再并排两个「积分」）', () => {
+    const accounts = [
+      { accountId: 'a', nickname: 'a', balance: { total: 341.78, packages: [pkg('Bonus Pack', 241.78, 'credit')], expiredTotal: 0 } },
+      { accountId: 'b', nickname: 'b', balance: { total: 100, packages: [pkg('Free Plan Subscription', 100, 'credits')], expiredTotal: 0 } },
+    ]
+    const view = badgeView({ providerLabel: 'WorkBuddy (国际版)', preference: 'auto', subscription: undefined, accounts })
+    expect(view.text).toBe('WorkBuddy (国际版) • 441.78积分')
+    // 保护性断言：文案里「积分」只出现一次（旧缺陷的形态是两个）
+    expect(view.reading.split('积分')).toHaveLength(2)
+  })
+
+  it('账号数再多也只产生一个数字（5–6 个号不会拉成长串）', () => {
+    const units = ['credit', 'credits', '', 'Credit', 'CREDITS']
+    const accounts = units.map((unit, i) => ({
+      accountId: `a${i}`, nickname: `a${i}`,
+      balance: { total: 100, packages: [pkg('Bonus Pack', 100, unit)], expiredTotal: 0 },
+    }))
+    const view = badgeView({ providerLabel: 'WorkBuddy (国际版)', preference: 'auto', subscription: undefined, accounts })
+    expect(view.text).toBe('WorkBuddy (国际版) • 500积分')
+  })
+
+  it('token 与积分**仍然分开**（归一化只收敛同义拼法，不跨量纲求和）', () => {
+    const view = badgeView({
+      providerLabel: 'ZCode',
+      preference: 'auto',
+      subscription: undefined,
+      accounts: [row('a', [pkg('GLM-5.2', 94_539_275, 'token')]), row('b', [pkg('Bonus Pack', 100, 'credits')])],
+    })
+    // 分组按单位名排序（credit < token），故积分在前
+    expect(view.text).toBe('ZCode • 100积分 · 94.54MToken')
   })
 })
 
@@ -147,6 +198,20 @@ describe('套餐的归组', () => {
     expect(groups).toHaveLength(1)
     expect(groups[0].unit).toBe('token')
     expect(groups[0].label).toBe('Token')
+  })
+
+  /**
+   * ⚠️ 与 `creditGroupsOf` 同款缺陷的另一处：分组键里也含单位。
+   * 同一份套餐在不同账号上被服务端拼成 `credit` / `credits` 时，若用原值当键，
+   * 弹窗里的「2 个账号合计」会退化成两行、每行各一个账号。
+   */
+  it('同一份套餐的单位拼法不同（credit / credits）必须合并成一条', () => {
+    const groups = planGroupsOf([
+      { accountId: 'a', plan: { name: 'Free Plan Subscription', remaining: 100, total: 500, unit: 'credits' } },
+      { accountId: 'b', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credit' } },
+    ])
+    expect(groups).toHaveLength(1)
+    expect(groups[0]).toMatchObject({ name: 'Free Plan Subscription', remaining: 400, total: 1000, accountCount: 2, unit: 'credit' })
   })
 })
 
