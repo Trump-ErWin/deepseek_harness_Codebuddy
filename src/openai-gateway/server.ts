@@ -6,9 +6,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, LlmModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { loadOrCreateApiKey, type ApiKeySource } from './auth.js'
 import { resolveGatewayConfig, type OpenAiGatewayConfig } from './config.js'
-import { toGenerateOptions, OpenAiGatewayError, parseModelRoute, normalizeReasoningEffort, normalizeMaxTokens, type OpenAiChatRequest } from './messages.js'
+import { toGenerateOptions, OpenAiGatewayError, parseModelRoute, normalizeReasoningEffort, normalizeMaxTokens, type OpenAiChatRequest, type ReasoningEffortNotice } from './messages.js'
 import type { AttachmentBridge, ImageLimits } from './images.js'
-import { collectGatewayModelIds, collectGatewayModels, toOpenAiModels } from './models.js'
+import { collectGatewayEffortViews, collectGatewayModelIds, collectGatewayModels, toGatewayModelIds, toOpenAiModels } from './models.js'
+import { effortResolutions } from './effort-view.js'
+import { CANONICAL_REASONING_EFFORTS } from '../reasoning-ladder.js'
 import { findCaseInsensitiveSuggestion, looksLikeMissingModel } from './model-errors.js'
 import {
   collectResponsesResult,
@@ -142,7 +144,54 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
     const groups = await collectGatewayModels(options.llm, (provider, error) => {
       logger.warn(`[openai-gateway] ${provider} 模型目录读取失败，已从 /v1/models 跳过：${describe(error)}`)
     })
-    jsonResponse(response, 200, { object: 'list', data: toOpenAiModels(groups) })
+    // 档位视图是**附加信息**：某个模型解析不出来就只是它没有该字段，
+    // 绝不能让整份目录跟着失败（同理，见 collectGatewayEffortViews 的注释）。
+    const effortViews = await collectGatewayEffortViews(options.llm, groups, (provider, error) => {
+      logger.warn(`[openai-gateway] ${provider}：${describe(error)}`)
+    })
+    jsonResponse(response, 200, { object: 'list', data: toOpenAiModels(groups, effortViews) })
+  }
+
+  /**
+   * `GET /v1/reasoning-efforts`：**思考档位对照表**（本网关特有的只读端点）。
+   *
+   * ## 为什么需要它（真实缺陷）
+   *
+   * 各 provider 的档位 id 是上游 wire 值（`light` / `extra_high` / `xhigh` / `on`），
+   * 而走 OpenAI 协议的客户端只有固定 8 档词汇。客户端**无法表达**那些私有 id，
+   * 用户只能照 DSH 界面上显示的名字（Max / Extra / Extra High）猜着填，
+   * 猜错就是 400。翻译层让「猜错也不会失败」，本端点让「不必猜」：
+   * 每个模型的 `openai_efforts` 就是可以直接抄进客户端的那一组，
+   * `resolutions` 则把 8 个规范名逐一的结局说清（原样 / 就近 / 无法表达 / 不下发）。
+   *
+   * ⚠️ `/v1/models` 里也带同一份视图（`reasoning` 字段）。两处**必须同源**：
+   * 这里给人和脚本查，那里给会自动扫目录的工具查；各算一遍必然漂移。
+   */
+  const handleReasoningEfforts = async (response: ServerResponse): Promise<void> => {
+    const groups = await collectGatewayModels(options.llm, (provider, error) => {
+      logger.warn(`[openai-gateway] ${provider} 模型目录读取失败，已从 /v1/reasoning-efforts 跳过：${describe(error)}`)
+    })
+    const effortViews = await collectGatewayEffortViews(options.llm, groups, (provider, error) => {
+      logger.warn(`[openai-gateway] ${provider}：${describe(error)}`)
+    })
+    jsonResponse(response, 200, {
+      object: 'list',
+      // 客户端能说出口的全部档位名（由弱到强）。CC Switch 的档位多选器就是这 8 个。
+      canonical: [...CANONICAL_REASONING_EFFORTS],
+      data: toGatewayModelIds(groups, effortViews).map((model) => {
+        const reasoning = model.reasoning
+        const declared = reasoning?.efforts.map((effort) => effort.id) ?? []
+        return {
+          id: model.id,
+          efforts: reasoning?.efforts ?? [],
+          ...reasoning?.default === undefined ? {} : { default: reasoning.default },
+          // 可以直接抄进 OpenAI 客户端的规范名；`efforts` 为空时它也为空
+          // （该模型不声明档位 → 网关不下发任何档位，按模型默认走）。
+          openai_efforts: reasoning?.openai_efforts ?? [],
+          resolutions: effortResolutions(declared),
+        }
+      }),
+    })
   }
 
   /**
@@ -246,12 +295,43 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
     })
   }
 
+  /**
+   * 档位被「翻译」或「丢弃」时记一条日志。
+   *
+   * ⚠️ 两种情况必须分开记，且**级别不同**：
+   *
+   * - `translated`（客户端给的是通用名、模型用的是私有 id，已就近下发）用 `info`：
+   *   加了翻译层之后这是**正常路径**（CC Switch 给 TRAE 的 `low` 每一轮都会被翻译），
+   *   用 warn 会把日志刷满，反而掩盖真正的异常；
+   * - `unexpressible`（模型根本没有这一族的档位，本次不下发）用 `warn`：
+   *   用户的设置确实没生效，这是需要被看见的事。
+   *
+   * 两件事都不回给客户端（OpenAI 协议里没有承载它的位置），故日志 + 对照表端点
+   * （`GET /v1/reasoning-efforts`）是它们唯一的出口。
+   */
+  const logEffortNotice = (route: { provider: string; model: string }, notice: ReasoningEffortNotice): void => {
+    const target = `${route.provider}/${route.model}`
+    if (notice.outcome === 'translated') {
+      logger.info(
+        `[openai-gateway] ${target}：思考档位 ${notice.requested} 不是该模型声明的 id，`
+        + `已按强度就近下发 ${notice.applied}`,
+      )
+      return
+    }
+    logger.warn(
+      `[openai-gateway] ${target}：思考档位 ${notice.requested} 无法表达`
+      + '（该模型没有这一族的档位），本次不下发该参数、按模型默认走',
+    )
+  }
+
   const handleChat = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     await withRequest(request, response, async (signal) => {
       const body = await readJson(request, signal)
       const route = parseModelRoute(body.model)
       const modelInfo = await resolveModelInfo(route, signal)
-      const reasoningEffort = normalizeReasoningEffort(body.reasoning_effort, modelInfo, route.provider, route.model)
+      const reasoningEffort = normalizeReasoningEffort(
+        body.reasoning_effort, modelInfo, route.provider, route.model, (notice) => logEffortNotice(route, notice),
+      )
       const requestedMaxTokens = body.max_completion_tokens ?? body.max_tokens
       const maxTokens = typeof requestedMaxTokens === 'number'
         ? normalizeMaxTokens(requestedMaxTokens, route.provider, route.model)
@@ -288,7 +368,10 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       const body = await readJson(request, signal) as OpenAiResponsesRequest
       const route = parseModelRoute(body.model)
       const modelInfo = await resolveModelInfo(route, signal)
-      const reasoningEffort = normalizeReasoningEffort(responsesReasoningEffort(body), modelInfo, route.provider, route.model)
+      const reasoningEffort = normalizeReasoningEffort(
+        responsesReasoningEffort(body), modelInfo, route.provider, route.model,
+        (notice) => logEffortNotice(route, notice),
+      )
       const requestedMaxTokens = responsesMaxOutputTokens(body)
       const maxTokens = requestedMaxTokens === undefined
         ? undefined
@@ -342,6 +425,12 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
     const path = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
     if (path === '/v1/models' && request.method === 'GET') {
       void handleModels(response).catch(error => jsonResponse(response, 502, { error: { message: String(error), type: 'server_error', code: 'model_list_failed' } }))
+      return
+    }
+    // 本网关特有的只读端点：思考档位对照表（见 handleReasoningEfforts 的理由）。
+    // ⚠️ 路径不放在 `/v1/models/…` 之下：客户端会把那些路径当模型 ID 解析。
+    if (path === '/v1/reasoning-efforts' && request.method === 'GET') {
+      void handleReasoningEfforts(response).catch(error => jsonResponse(response, 502, { error: { message: String(error), type: 'server_error', code: 'model_list_failed' } }))
       return
     }
     if ((path === '/v1/chat/completions' || path === '/v1/responses') && request.method === 'POST') {

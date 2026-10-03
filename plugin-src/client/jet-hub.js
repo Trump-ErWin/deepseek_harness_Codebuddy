@@ -34,6 +34,9 @@ import {
   gatewayButtonLabel,
   gatewayButtonTitle,
   gatewayEndpoint,
+  gatewayEffortRows,
+  gatewayEffortsCurl,
+  gatewayEffortsHint,
   gatewayModelsCurl,
   gatewayModelsHint,
   gatewayStatusLines,
@@ -3367,9 +3370,11 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
   const [copied, setCopied] = React.useState(false);
   const [revealed, setRevealed] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
+  const [effortsOpen, setEffortsOpen] = React.useState(false);
   const [idsCopied, setIdsCopied] = React.useState(false);
   const apiKey = status?.apiKey ?? null;
   const models = status?.models ?? [];
+  const effortRows = gatewayEffortRows(models);
 
   // 每次重新打开/换密钥后复位：否则上一条「已复制」会挂在新密钥旁边误导用户。
   React.useEffect(() => { setCopied(false); setRevealed(false); }, [status?.apiKey?.value]);
@@ -3521,6 +3526,44 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
       className: 'dim-jh-modelId',
       style: { display: 'block', marginTop: '4px', userSelect: 'all' },
     }, gatewayModelsCurl(gatewayEndpoint(status))),
+
+    // ── 思考档位对照表 ──
+    // 存在的理由：各 provider 的档位 id 是**上游私有值**（TRAE 的 light/extra_high、
+    // LobsterAI 的 xhigh（界面上叫 Max）、Cline 的 max（界面上叫 Extra）），而走
+    // OpenAI 协议的客户端只有固定 8 档词汇，表达不出这些私有值。用户照 DSH 界面上
+    // 的名字填进 CC Switch/Codex，撞 400 且两端都看不出原因。
+    // 网关现在按强度自动翻译（填错不再失败），但**精确对应**只有一列答案 —— 就是这里。
+    React.createElement('p', { className: 'dim-jh-modalHint', style: { marginTop: '16px' } },
+      React.createElement('strong', null, '思考档位对照表')),
+    React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayEffortsHint(models)),
+    React.createElement('div', { className: 'dim-jh-modelPanelActions', style: { marginTop: '4px' } },
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'aria-expanded': effortsOpen ? 'true' : 'false',
+        // 没有模型声明档位时禁用而非「点了没反应」：展开一张空表毫无意义。
+        disabled: effortRows.length === 0,
+        onClick: () => setEffortsOpen(open => !open),
+      }, effortsOpen ? '收起对照表' : `展开对照表（${effortRows.length} 行）`)),
+    effortsOpen
+      ? React.createElement('div', { className: 'dim-jh-modelList', style: { marginTop: '6px' } },
+        effortRows.map(row => React.createElement('div', { key: row.id, className: 'dim-jh-modelRow' },
+          React.createElement('span', { className: 'dim-jh-modelInfo' },
+            React.createElement('code', { className: 'dim-jh-modelId' }, row.id),
+            React.createElement('span', { className: 'dim-jh-modelName' }, `真实档位：${row.declared}`),
+            React.createElement('span', { className: 'dim-jh-modelName' }, `客户端该填：${row.fill}`),
+            row.lossy
+              ? React.createElement('span', {
+                className: 'dim-jh-modelBadge',
+                title: '该模型的档位名与 OpenAI 客户端不同名：照 DSH 界面上的名字填，网关会按强度就近翻译。',
+              }, '需对照')
+              : null))))
+      : null,
+    React.createElement('p', { className: 'dim-jh-modalHint' },
+      '同一份对照表也可以用命令行查看（同样需要 Bearer 头）：'),
+    React.createElement('code', {
+      className: 'dim-jh-modelId',
+      style: { display: 'block', marginTop: '4px', userSelect: 'all' },
+    }, gatewayEffortsCurl(gatewayEndpoint(status))),
     React.createElement('p', { className: 'dim-jh-modalHint' },
       '网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 —— 真正的隔离靠密钥，'
       + '不要把它配置进任何浏览器端工具或扩展。'),

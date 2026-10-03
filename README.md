@@ -48,6 +48,7 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 
 ```text
 GET  http://127.0.0.1:8326/v1/models
+GET  http://127.0.0.1:8326/v1/reasoning-efforts  ← 思考档位对照表（本网关特有）
 POST http://127.0.0.1:8326/v1/chat/completions    ← OpenAI Chat Completions
 POST http://127.0.0.1:8326/v1/responses           ← OpenAI Responses API
 ```
@@ -162,6 +163,64 @@ $key = (Get-Content "$env:USERPROFILE\.dsh\openai-gateway\api-key" -Raw).Trim()
 > 流式请求下 HTTP 状态码已经发出是 200，该信息会放进 SSE 错误帧的 `error.status` /
 > `error.code`。网关**不会**在请求前用目录做白名单拦截 —— 有些 provider 支持目录
 > 之外的模型，显式请求仍交给 DSH 路由处理。
+
+### 思考档位：各 provider 的私有 id ↔ OpenAI 客户端的规范名
+
+**这一节是给「在客户端里填思考等级」的人看的** —— 这里是本网关最容易踩、且踩了
+完全看不出原因的地方（真实报障）。
+
+各 provider 的档位 `id` 就是**上游的 wire 值**，彼此既不同名、也不同数量；而走
+OpenAI 协议的客户端（Codex 的档位选择器、为它生成模型目录的 CC Switch）只有
+**固定 8 档**词汇：`none / minimal / low / medium / high / xhigh / max / ultra`。
+用户只能照 DSH 界面上显示的**名字**去填客户端，于是必然撞车：
+
+| provider | DSH 界面上显示 | 客户端会照填 | 模型真实认的（wire id） | 修好前 |
+| --- | --- | --- | --- | --- |
+| LobsterAI | 关闭 / 高 / **Max** | `none, high, max` | `off` / `high` / **`xhigh`** | 选 Max → 400，整轮不可用 |
+| Cline | None / Low / Medium / High / **Extra** | `none, low, high, xhigh` | `none` / … / **`max`** | 选 Extra → 400 |
+| TRAE | Light / High / **Extra High** | `low, high, xhigh` | **`light`** / `high` / **`extra_high`** | 两个值直接 400 |
+| Raccoon | **开启 / 关闭** | `none, high` | **`on`** / `off` | 恰好能用 |
+| Qoder / Buddy / WorkBuddy / ZCode / deepseek-account | 与客户端同名 | — | 同名 | 正常 |
+
+处理分两半，**缺一不可**：
+
+**1. 网关按强度就近翻译**（`src/reasoning-ladder.ts` 是唯一的强度序权威）。
+客户端那 8 个规范名总能落到该模型同族的某一档：`max → xhigh`、`xhigh → max`、
+`low → light`、`xhigh → extra_high`。**填错不再导致失败**，只会被就近翻译
+（记一条 `info` 日志）。
+
+- ⚠️ **只在同族内翻译**：要「开思考」绝不会落到 `off`，要「关闭」不会落到 `high`
+  —— 把「少想一点」翻译成「完全不想」等于静默关掉功能，比报错更糟。
+- 模型**没有这一族**的档位（例如给只有 `high` 的 WorkBuddy 要 `none`）：
+  **不下发该参数**、按模型默认走，并记一条 **warning**（你的设置确实没生效）。
+- **完全不认识的写法**（拼错的 `banana`）仍然返回 **400**，并在报错里列出该模型
+  可用的档位 —— 那不是「名字不通用」，是调用方写错了，静默翻译会让拼写错误
+  变成「档位悄悄不生效」。
+- **CodeArts 例外**：该 provider 只有开/关两态，任何档位名都等价（一律二值化）。
+
+**2. 可查询「该填哪几个」**：
+
+- `GET /v1/models`：每个模型多了 `reasoning` 字段（模型真实 id + 客户端该填的规范名）；
+- `GET /v1/reasoning-efforts`（本网关特有）：逐模型对照表，把 8 个规范名**逐一的
+  结局**都列出来 —— `exact`（原样） / `mapped`（就近成 `applied`） /
+  `unexpressible`（模型没这一族，不下发） / `ignored`（模型不声明档位，一律不下发）；
+- 设置页「网关」弹窗里的「**思考档位对照表**」是同一份数据（标「需对照」的行就是
+  上面那张表里的前三个 provider），弹窗底部还给了现成 curl。
+
+```json
+{ "id": "trae/deepseek-v4.1-flash",
+  "reasoning": {
+    "efforts": [ { "id": "light",      "name": "Light",      "canonical": "low"   },
+                 { "id": "high",       "name": "High",       "canonical": "high"  },
+                 { "id": "extra_high", "name": "Extra High", "canonical": "xhigh" } ],
+    "default": "high",
+    "openai_efforts": [ "low", "high", "xhigh" ] } }
+```
+
+> ⚠️ **CC Switch 的档位多选器只有那 8 个固定值**（每个还带硬编码英文描述，写在它
+> 自己的产物里），所以它**表达不出** `light` / `extra_high` / `on` / `off` 这类私有
+> id —— 「让客户端自己查对」这条路走不通，**翻译层才是解法**。
+> 填 `openai_efforts` 能精确对应；填别的（包括照 DSH 界面上的名字填）也不会失败。
 
 ### OpenAI Responses API（`/v1/responses`）
 
