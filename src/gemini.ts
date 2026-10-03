@@ -400,6 +400,14 @@ export interface GeminiModelSpec {
  * 由「模型 id + 用户选的档位」得出上游模型规格。
  *
  * ⚠️ 模型名必须带档位后缀 —— 它是上游的准入钥匙（见文件头实测）。
+ *
+ * ⚠️ **`modelId` 当前刻意未使用**：静态表（{@link GEMINI_FALLBACK_MODELS}）只
+ * 暴露 `gemini-3.8-flash` 一个模型，upstream 恒为 `gemini-3.8-flash-<tier>`，
+ * 任何传进来的 id 都落到同一个真实模型上。这是**有意的宽容**（网关实测
+ * `gemini/gemini-9.9-fake`、`gemini/totally-bogus` 均 200 并正常作答，因为
+ * 名字根本没参与上游请求），不是遗漏。
+ * **加第二个模型时必须先用 `modelId` 选 upstream** —— 否则表里两个模型会撞车
+ * （用户选 A、实际跑 B），且症状是「不报错、不降级、答案就是不对」，极难查。
  */
 export function geminiModelSpec(modelId: string, effort?: string): GeminiModelSpec {
   const tier = geminiEffortToTier(effort)
