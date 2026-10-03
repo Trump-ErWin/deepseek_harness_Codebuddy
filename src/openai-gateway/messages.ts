@@ -117,8 +117,12 @@ export function normalizeReasoningEffort(
  * ⚠️ 图片走 `image_url` → 附件 → `ImageBlock`（见 `./images.ts`），**异步**。
  * 附件服务缺失时（`bridge` 为 undefined）必须抛错而不是静默丢图：静默丢弃会让
  * 用户以为模型看到了图，而答案其实是基于文本生成的。
+ *
+ * ⚠️ 本函数同时被 `/v1/responses` 复用（`responses.ts` 把 Responses 的内容块
+ * 转成 Chat 形状后调它）—— **图片入站只有这一份实现**，两套协议各写一份必然
+ * 漂移成「Chat 端能收图、Responses 端报错」。
  */
-async function partsFromContent(
+export async function partsFromContent(
   content: unknown,
   bridge: AttachmentBridge | undefined,
   limits: ImageLimits,
@@ -170,8 +174,13 @@ async function partsFromContent(
   return blocks
 }
 
-/** 提取纯文本（仅用于需要字符串的场景；带图的 content 走 partsFromContent）。 */
-function textFromContent(content: unknown): string {
+/**
+ * 提取纯文本（仅用于需要字符串的场景；带图的 content 走 partsFromContent）。
+ *
+ * ⚠️ 同样被 `/v1/responses` 复用（`responses.ts` 的 `outputText`）—— 「工具结果
+ * 不能带图」这条判据必须两个端点一致。
+ */
+export function textFromContent(content: unknown): string {
   if (typeof content === 'string') return content
   if (content === null || content === undefined) return ''
   if (!Array.isArray(content)) {
@@ -192,7 +201,13 @@ function textFromContent(content: unknown): string {
   }).join('')
 }
 
-function newMessage(
+/**
+ * 造一条 DSH 消息。
+ *
+ * ⚠️ **导出**给 `responses.ts` 用：两个端点造出来的消息必须同形（同样的 id/source
+ * 构造），否则同一份历史在两个端点上的来源标记不同，排查时会误导。
+ */
+export function createGatewayMessage(
   role: Message['role'],
   content: Message['content'],
   source: Message['source'],
@@ -232,25 +247,25 @@ async function convertMessage(
   const value = raw as OpenAiChatMessage
   const role = value.role
   if (role === 'system') {
-    return newMessage('system', [{ type: 'text', text: textFromContent(value.content) }], {
+    return createGatewayMessage('system', [{ type: 'text', text: textFromContent(value.content) }], {
       kind: 'plugin', plugin: 'dsh-openai-gateway',
     })
   }
   if (role === 'user') {
     // ⚠️ user 消息走 parts：图片在这里被真正接收（其它角色不接受图片）。
-    return newMessage('user', await partsFromContent(value.content, bridge, limits), { kind: 'user' })
+    return createGatewayMessage('user', await partsFromContent(value.content, bridge, limits), { kind: 'user' })
   }
   if (role === 'assistant') {
     const text = textFromContent(value.content)
     const content: Message['content'] = text.length > 0 ? [{ type: 'text', text }] : []
     if (value.tool_calls !== undefined) content.push(...convertToolCalls(value.tool_calls))
-    return newMessage('assistant', content, { kind: 'model', provider, model })
+    return createGatewayMessage('assistant', content, { kind: 'model', provider, model })
   }
   if (role === 'tool') {
     if (typeof value.tool_call_id !== 'string' || value.tool_call_id.length === 0) {
       throw new OpenAiGatewayError('tool messages require tool_call_id')
     }
-    return newMessage('user', [{
+    return createGatewayMessage('user', [{
       type: 'tool-result',
       toolCallId: value.tool_call_id as never,
       content: [{ type: 'text', text: textFromContent(value.content) }],
@@ -259,7 +274,13 @@ async function convertMessage(
   throw new OpenAiGatewayError(`unsupported message role: ${String(role)}`)
 }
 
-function convertTools(raw: unknown): ToolSchema[] | undefined {
+/**
+ * Chat 形状的 tools → DSH 的 ToolSchema。
+ *
+ * ⚠️ 被 `/v1/responses` 复用：`responses.ts` 先把 Responses 的**扁平**工具定义
+ * 改写成 Chat 的嵌套形状，再交给这里做校验。工具 schema 的校验口径只有这一份。
+ */
+export function convertTools(raw: unknown): ToolSchema[] | undefined {
   if (raw === undefined) return undefined
   if (!Array.isArray(raw)) throw new OpenAiGatewayError('tools must be an array')
   return raw.map((value) => {
@@ -289,7 +310,13 @@ export function parseModelRoute(value: unknown): { provider: string; model: stri
   return { provider: value.slice(0, slash), model: value.slice(slash + 1) }
 }
 
-function tokenValue(value: unknown, name: string): number | undefined {
+/**
+ * 正整数字段的校验（`max_tokens` / `max_completion_tokens` / `max_output_tokens`）。
+ *
+ * ⚠️ 被 `/v1/responses` 复用（`responsesMaxOutputTokens`），三个字段的判据必须
+ * 完全一致，否则「同一个数字在 Chat 端合法、在 Responses 端报错」会被当成缺陷。
+ */
+export function tokenValue(value: unknown, name: string): number | undefined {
   if (value === undefined) return undefined
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
     throw new OpenAiGatewayError(`${name} must be a positive integer`)

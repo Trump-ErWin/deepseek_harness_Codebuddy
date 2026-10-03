@@ -11,8 +11,13 @@ import { normalizeUpstreamFailure } from './model-errors.js'
  */
 export type SuggestionHook = (message: string) => string | undefined | Promise<string | undefined>
 
-/** 把「你可能是想用 X」拼到错误消息后面。 */
-async function withSuggestion(message: string, suggest: SuggestionHook | undefined): Promise<string> {
+/**
+ * 把「你可能是想用 X」拼到错误消息后面。
+ *
+ * ⚠️ 导出给 `responses.ts` 复用：两个端点的纠错建议必须逐字一致，
+ * 否则同一次误填在两个 URL 上会得到不同的提示。
+ */
+export async function withSuggestion(message: string, suggest: SuggestionHook | undefined): Promise<string> {
   if (suggest === undefined) return message
   try {
     const hint = await suggest(message)
