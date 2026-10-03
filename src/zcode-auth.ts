@@ -41,6 +41,7 @@ import {
   type ZcodeCredential,
 } from './zcode.js'
 import { ZCODE, type ZcodeProduct, type ZcodeRemoteModelLike } from './zcode-product.js'
+import type { ZcodeClaimablePlan } from './zcode-upstream.js'
 import { ZcodeCaptchaBrowser, ZCODE_CAPTCHA_FALLBACK, validateCaptchaParam } from './zcode-captcha.js'
 import { CaptchaPool, captchaPoolConfigFromEnv } from './captcha-pool.js'
 import { captchaRequirementObservability } from './captcha-requirement.js'
@@ -1457,7 +1458,7 @@ export class ZcodeAuth extends Service {
             ))
             continue
           }
-          outcomes.push(toClaimOutcome(outcome, plan.planId))
+          outcomes.push(toClaimOutcome(outcome, plan.planId, { plan }))
         } catch (error) {
           outcomes.push({
             kind: 'failed',
@@ -1786,19 +1787,31 @@ export class ZcodeAuth extends Service {
 export function toClaimOutcome(
   outcome: ZcodeClaimOutcome,
   planId: string,
-  options: { internalRetried?: boolean } = {},
+  options: { internalRetried?: boolean; plan?: ZcodeClaimablePlan } = {},
 ): ClaimOutcome {
   if (outcome.ok) {
     if (outcome.alreadyClaimed === true) {
       return { kind: 'already-claimed', message: `额度已领取过（${planId}）` }
     }
     /**
-     * ⚠ ZCode 的额度单位是 **token**，不是「积分」—— 而 `ClaimOutcome` 的
-     * `claimed` 分支强制要求 `credit: number` 与 `streakDays`。
-     * 这里填 0 并在文案里说明，避免把 token 数伪装成积分
-     * （那会让 Jet Hub 的汇总把 1 亿 token 显示成 1 亿积分）。
+     * ★ 填**真实额度**（2026-10-03）。
+     *
+     * 此前固定填 0（注释称「避免把 token 伪装成积分」），于是面板显示
+     * 「领取成功 +0 积分」而用户实际拿到 1 亿 token —— 真实报障。
+     * 额度取自 `plan.entitlements[0].grant_units`（实测 100000000）。
+     *
+     * ⚠ **单位照实传**：ZCode 下发 token，前端据此用 formatTokens
+     *   显示「Token 100.00M」而不是「1 亿积分」。
      */
-    return { kind: 'claimed', credit: 0, streakDays: 0, isStreakDay: false }
+    const grantUnits = options.plan?.grantUnits
+    const unitType = options.plan?.unitType
+    return {
+      kind: 'claimed',
+      credit: grantUnits ?? 0,
+      streakDays: 0,
+      isStreakDay: false,
+      ...(unitType === 'token' ? { unit: 'token' as const } : {}),
+    }
   }
   // 3007 = captcha 失败；给出可操作的提示而不是裸码。
   if (outcome.code === 3007) {

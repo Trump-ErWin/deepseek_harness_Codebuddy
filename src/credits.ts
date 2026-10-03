@@ -146,7 +146,22 @@ export interface ClaimOutcomeCommon {
 }
 
 export type ClaimOutcome =
-  | (ClaimOutcomeCommon & { kind: 'claimed'; credit: number; streakDays: number; isStreakDay: boolean; delayedMessage?: string })
+  | (ClaimOutcomeCommon & {
+      kind: 'claimed'
+      credit: number
+      streakDays: number
+      isStreakDay: boolean
+      delayedMessage?: string
+      /**
+       * ★ `credit` 的单位（2026-10-03 新增）。
+       *
+       * ⚠ **缺省按「积分」处理** ⇒ 其余 provider 行为逐字不变。
+       *   ZCode 下发 `unit_type: "token"`（实测），1 亿 token 若按积分显示
+       *   就是错的 ⇒ 它显式传 `unit: token`。
+       *   展示侧用 `formatUnits(credit, unit)` / `unitLabel(unit)`。
+       */
+      unit?: 'token' | 'credit'
+    })
   | (ClaimOutcomeCommon & { kind: 'already-claimed'; message: string })
   | (ClaimOutcomeCommon & { kind: 'inactive'; message: string; actionRequired?: boolean })
   | (ClaimOutcomeCommon & { kind: 'failed'; code: number; message: string })

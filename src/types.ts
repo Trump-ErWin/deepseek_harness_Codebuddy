@@ -188,7 +188,6 @@ export interface RpcCreateAccountRequest {
    *
    * ⚠️ 缺省 `false`，既有调用方行为逐字节不变。
    */
-  forceNew?: boolean
 }
 export interface RpcCreateAccountResponse {
   accountId: string

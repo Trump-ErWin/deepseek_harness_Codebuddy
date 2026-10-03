@@ -150,14 +150,6 @@ const STYLES = `
 .dim-jh-btn[data-kind="danger"]:hover:not(:disabled) { color: #b3261e; border-color: #d93025; background: rgb(217 48 37 / 6%); }
 .dim-jh-btn:disabled { opacity: 0.5; cursor: default; }
 
-/* ZCode 登录渠道选择（BigModel 国内 / z.ai 国际）。
-   ⚠️ 与 .dim-jh-btn 同高（26px ≈ 18 行高 + 4×2 padding + 1×2 border），
-   且 margin-right:auto 把它推到工具栏左侧、其余按钮仍靠右 —— 这样它
-   在视觉上是「新建账号」的前置选项，而不是又一个并列动作。 */
-.dim-jh-zcProvider { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); }
-.dim-jh-zcSelect { box-sizing: border-box; height: 26px; padding: 0 6px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 8px; background: var(--dsw-alias-bg-layer-3, #fff); color: var(--dsw-alias-label-primary, #1f2329); font-size: 12px; line-height: 18px; cursor: pointer; }
-.dim-jh-zcSelect:disabled { opacity: 0.5; cursor: default; }
-.dim-jh-zcSelect:focus-visible { outline: none; border-color: #1677ff; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 20%, transparent); }
 
 /* 纯图标按钮（如「领取新手任务」的礼物图标）。
    ⚠️ 存在的理由：.dim-jh-accountActions 是 flex-wrap: nowrap，
@@ -481,10 +473,34 @@ const STYLES = `
 .dim-jh-zcBtn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dsw-alias-border-l3); }
 .dim-jh-zcBtn:disabled { opacity: .4; cursor: default; }
 /* 登录渠道选择（BigModel 国内 / z.ai 国际）—— 与按钮同高，靠左不参与右对齐 */
-.dim-jh-zcProvider { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; color: var(--dsw-alias-label-secondary); font-size: 12px; line-height: 18px; }
-.dim-jh-zcSelect { box-sizing: border-box; height: 28px; padding: 0 8px; border: .5px solid var(--dsw-alias-border-l3); border-radius: 14px; background: 0 0; color: var(--dsw-alias-label-primary); font-size: 12px; line-height: 18px; cursor: pointer; }
+.dim-jh-zcProvider { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; color: var(--dsw-alias-label-secondary, GrayText); font-size: 12px; line-height: 18px; }
+/* ⚠ background/color 的变量**必须带 fallback**（真实报障 2026-10-03：下拉里两项
+   全是白的，只有 hover 才看见内容）。
+   两个原因叠加：
+   ① 原写法 background 设为全透明（0 0）+ color 用了无 fallback 的变量
+      —— 变量在弹窗 scope 里取不到时 color 整条失效，退回继承。
+   ② ⚠ Windows/Electron 下 **option 的背景不继承 select 的 background**，
+      由系统主题决定；文字却**继承** color。
+   ⇒ 浅色系统上就是「白底 + 失效/白字」⇒ 看不见。
+   修法：① 变量都带 fallback，且 fallback 用 **CSS 系统色**（Canvas/CanvasText），
+   它跟随系统深浅色；② 给 option 单独声明背景与文字色。
+   ⚠⚠ 本注释里**绝不能出现反引号**（STYLES 是模板字符串，见 AGENTS.md）。 */
+.dim-jh-zcSelect { box-sizing: border-box; height: 28px; padding: 0 8px; border: .5px solid var(--dsw-alias-border-l3, #dee0e3); border-radius: 14px; background: var(--dsw-alias-bg-layer-3, Canvas); color: var(--dsw-alias-label-primary, CanvasText); font-size: 12px; line-height: 18px; cursor: pointer; }
+/* ⚠ 必须单独声明：option 的背景不继承 select（见上）。缺这条就是「下拉项全白」。 */
+.dim-jh-zcSelect option { color: var(--dsw-alias-label-primary, CanvasText); background-color: var(--dsw-alias-bg-layer-3, Canvas); }
 .dim-jh-zcSelect:disabled { opacity: .4; cursor: default; }
-.dim-jh-zcSelect:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dsw-alias-border-l3); }
+.dim-jh-zcSelect:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dsw-alias-border-l3, #dee0e3); }
+.dim-jh-zcDialogMask { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .45); }
+.dim-jh-zcDialog { box-sizing: border-box; width: min(420px, calc(100vw - 32px)); padding: 18px 20px; border-radius: 10px; background: var(--dsw-alias-bg-layer-3, Canvas); box-shadow: 0 8px 32px rgba(0, 0, 0, .28); }
+/* ⚠ 背景**必须**用 bg-layer-3（真实报障 2026-10-03：深色主题下弹窗是白的）。
+   原先写的是 --dsw-alias-surface —— 那是**猜的变量名，DSH 里并不存在**，
+   于是 fallback 里的浅色生效 ⇒ 深色主题下白底 + 浅色字，几乎看不见。
+   本文件通篇用 bg-layer-1/2/3；fallback 用 CSS 系统色 Canvas（跟随系统深浅），
+   这样变量取不到时也不会退回浅色。 */
+.dim-jh-zcDialogTitle { margin: 0 0 6px; font-size: 15px; font-weight: 600; color: var(--dsw-alias-label-primary, CanvasText); }
+.dim-jh-zcDialogHint { margin: 0 0 12px; font-size: 12px; line-height: 17px; color: var(--dsw-alias-label-tertiary, GrayText); }
+.dim-jh-zcDialog .dim-jh-zcProvider { display: flex; align-items: center; gap: 8px; margin: 0 0 16px; font-size: 13px; }
+.dim-jh-zcDialogActions { display: flex; justify-content: flex-end; gap: 8px; }
 
 .dim-jh-zcEmpty { padding: 2px 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
 .dim-jh-zcEmpty p { margin: 0 0 4px; }

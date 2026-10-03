@@ -299,6 +299,19 @@ function ZcodeProviderCardBody({ rpcCall }) {
    * 缺省 `bigmodel`，与后端 `req.zcodeProvider ?? 'bigmodel'` 对齐。
    */
   const [zcodeProvider, setZcodeProvider] = React.useState('bigmodel');
+  /**
+   * ★ 待确认的登录（`undefined` = 没在弹窗里）。
+   *
+   * ★ 弹窗是否开着（`false` = 关着）。
+   *
+   * 渠道选择搬进弹窗后（用户 2026-10-03），`zcodeProvider` 只在**弹窗打开期间**
+   * 被改动 —— 发起登录那一刻它就是本轮要用的渠道，
+   * 避免了「授权页已开、渠道又被改掉」的不一致。
+   *
+   * ⚠ 这里**不再**承载 `forceNew` —— 「登录其他账号」已按用户 2026-10-02 的
+   *   要求撤销（见同批提交），它现在只回答「弹窗开没开」。
+   */
+  const [pendingLogin, setPendingLogin] = React.useState(undefined);
   const mounted = React.useRef(false);
   const call = React.useCallback((endpoint, payload) => rpcCall(endpoint, payload), [rpcCall]);
   /** 登录轮询的定时器（0 = 没在跑）。⚠ 必须能被**卸载清理**拿到 —— 见下面 useEffect。 */
@@ -414,7 +427,7 @@ function ZcodeProviderCardBody({ rpcCall }) {
    *  ⚠⚠ **`reused` 分支必判**：本机已有可用凭据时，后端**不新建条目、不返回 loginUrl**
    *  （用户报障「点了添加就多一个」的修复）。若只看 `loginUrl` 为空就报
    *  「后端未返回登录地址」，会把一次成功操作显示成失败。 */
-  const createAccount = async (forceNew) => {
+  const createAccount = async () => {
     // ⚠ 已有一轮登录在跑时直接忽略（真实缺陷）：`busy` 曾在返回 loginUrl 后立刻清零，
     // 按钮随即恢复可点，再点一次会叠加第二个轮询 + 宿主再插一条占位账号。
     if (pollRef.current !== 0) return;
@@ -423,7 +436,6 @@ function ZcodeProviderCardBody({ rpcCall }) {
       const res = await call('account.create', {
         provider: PROVIDER,
         zcodeProvider,
-        ...(forceNew === true ? { forceNew: true } : {}),
       }) || {};
       if (!mounted.current) return;
       const { accountId, loginUrl, reused } = res;
@@ -520,13 +532,10 @@ function ZcodeProviderCardBody({ rpcCall }) {
   // 三键共用：任一键在跑、或 rpcCall 缺失时一律禁用。
   const disabled = busy !== null || typeof rpcCall !== 'function';
   /**
-   * ⚠️ `busyKey` 与 `idleKey` 分开：两个登录按钮（添加账号 / 登录其他账号）
-   * 共用同一个 `busy='create'`（`createAccount` 只置这一个值），若按同一个
-   * key 判文案，未点击的那个会永远显示「登录中…」。
+   * ⚠️ `busyKey` 与 `idleKey` 分开：按钮在跑时显示 `running` 文案。
    */
   const btn = (idleKey, idle, running, onClick, extra) => {
-    const isLoginBtn = idleKey === 'create' || idleKey === 'create-new';
-    const runningNow = busy === (isLoginBtn ? 'create' : idleKey);
+    const runningNow = busy === idleKey;
     return h('button', { className: 'dim-jh-zcBtn', disabled, onClick, ...extra },
       runningNow ? running : idle);
   };
@@ -580,29 +589,47 @@ function ZcodeProviderCardBody({ rpcCall }) {
                     busy, onDelete: deleteAccount,
                   }))),
         h('div', { className: 'dim-jh-zcActions' },
-          /**
-           * 登录渠道选择。⚠️ 必须在「添加账号」**之前**、且登录进行中时禁用 ——
-           * 换渠道会决定弹哪个授权页，中途改会与正在轮询的那一轮不一致。
-           */
-          h('label', { className: 'dim-jh-zcProvider' },
-            '渠道',
-            h('select', {
-              className: 'dim-jh-zcSelect',
-              value: zcodeProvider,
-              disabled: busy !== null,
-              onChange: (event) => setZcodeProvider(event.target.value),
-            },
-              h('option', { value: 'bigmodel' }, 'BigModel（国内）'),
-              h('option', { value: 'zai' }, 'z.ai（国际）'))),
-          btn('create', '添加账号', '登录中…', () => createAccount(false)),
-          // 「登录其他账号」：跳过后端两道复用检查，用于本机已登录的账号已在池里时
-          // 再登第二个。⚠️ 授权页仍复用浏览器登录态 —— 需先登出或用无痕窗口。
-          btn('create-new', '登录其他账号', '登录中…', () => createAccount(true)),
+          // ⚠ 渠道选择**搬走了** —— 现在在点按钮后弹出的对话框里
+          //   （用户 2026-10-03：「登录渠道应在新建账号出来后的窗口中选择，
+          //   然后再弹出国际版国内版不同的认证页面」）。
+          //   原来它只是按钮旁一个与两个入口共用的开关：改了它也不知道
+          //   会不会影响正在跑的那一轮登录（授权页已开，改了也没用）。
+          //   放进弹窗后「选渠道」与「发起登录」是同一个原子动作。
+          btn('create', '添加账号', '登录中…', () => setPendingLogin(false)),
           // ⚠ 必须包一层：`refreshCredits` 的第一个形参是 `silent`，直接把函数交给
           //   onClick 会把**事件对象**当 silent（真值）传进去 ⇒ 点按钮反而静默无提示。
           btn('refresh', '刷新积分', '查询中…', () => refreshCredits(false)),
           btn('claim', '一键领取积分', '领取中…', claimAll, { 'data-kind': 'primary' })))),
     // ⚠ 结果提示**刻意留在折叠区之外**：用户点完「一键领取」后若顺手收起，失败原因
     // 不该跟着消失（收起态下也要能看到上一次的结果）。
-    noticeNode(notice));
+    noticeNode(notice),
+    // ★ 渠道选择对话框（见 pendingLogin 的注释）
+    pendingLogin === undefined ? null : h(
+      'div', { className: 'dim-jh-zcDialogMask', onClick: () => setPendingLogin(undefined) },
+      h('div', { className: 'dim-jh-zcDialog', onClick: (event) => event.stopPropagation() },
+        h('h3', { className: 'dim-jh-zcDialogTitle' }, '添加 ZCode 账号'),
+        h('p', { className: 'dim-jh-zcDialogHint' },
+          '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，',
+          '可用 z.ai（国际）登录另一个账号。'),
+        h('label', { className: 'dim-jh-zcProvider' },
+          '登录渠道',
+          h('select', {
+            className: 'dim-jh-zcSelect',
+            value: zcodeProvider,
+            onChange: (event) => setZcodeProvider(event.target.value),
+          },
+            h('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
+            h('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）'))),
+        h('div', { className: 'dim-jh-zcDialogActions' },
+          h('button', { className: 'dim-jh-btn', onClick: () => setPendingLogin(undefined) }, '取消'),
+          h({
+            tag: 'button',
+            className: 'dim-jh-btn',
+            'data-kind': 'primary',
+            onClick: () => {
+              setPendingLogin(undefined)
+              void createAccount()
+            },
+          }, '确定并打开认证页'))),
+  ));
 }
