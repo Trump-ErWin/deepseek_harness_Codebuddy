@@ -29,6 +29,23 @@
 > `creditGroupsOf` 对配额单位**不求和**、改收 `quotaLines`,折叠态文案与色调改用
 > **最紧张的窗口**;`usage-badge.js` 的 `balanceLine` 同样逐窗口、`splitLine` 改显示
 > 各窗口重置倒计时。其它 provider 的文案与色调逐字不变(回归用例锁定)。
+>
+> **2026-10-03 追补(用户「不要渲染 / 2/2 个资源包有效」)**:配额单位下再补一道门控 ——
+> `jet-hub.js` 的 `CreditBalanceRow` 把「N/M 个资源包有效」那句从三重门控改为四重
+> (新增 `quotaText === null &&`)。理由:Gemini 的两个「包」是 **5 小时窗口 / 周窗口**,
+> 不是资源包;窗口读数已由 `quotaText` 逐条列出,再补一句「2/2 个资源包有效」既无信息量
+> 又误导。非配额单位恒 `quotaText === null` ⇒ 行为**逐字不变**。
+>
+> **2026-10-03 追补(用户「重测按钮你确认过会发请求吗，为什么响应这么快？可以移除吗」)**:
+> 响应快是因为**当时该账号没有 `modelRateLimits` 标记**,`retestAccount` 在
+> `modelIds.length === 0` 处提前返回,一次请求都没发。但这不代表按钮无害:Gemini 的限流是
+> **服务端配额窗口制**(5 小时 + 周窗口),不是「等一会儿就好」的临时冷却 —— 本地标记清掉、
+> 重测通过,配额一点没恢复。故在 `RATE_LIMIT_CAPABILITIES` 里给 `gemini` 登记
+> `rateLimit: false`,与 Loomy 同处但**理由不同**(Loomy 是根本不返回限流错误)。
+> 登记判据随之重写:「**该渠道的限流不由这组按钮的语义管辖**」,落地问法 =
+> 「这个按钮点下去,能不能让用户**少**受限一次?」答否即 `false`。
+> 客户端调用点一行未动(`supportsRateLimit(provider)` 仍是唯一门控),故
+> `loomy-client.spec.ts` 的源码字符串断言全部照旧通过。
 > 源项目:`F:\project\cmdc-pak-align-wb`(Go,本仓库,gemini 线原型)
 > 目标项目:**当前工作区** `F:\project\dsh-codearts-plugin`(TypeScript,DSH 插件 `dsh-codearts-auth`)
 

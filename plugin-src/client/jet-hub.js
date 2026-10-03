@@ -566,7 +566,12 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
             + '长期 = 其余积分（锁定永久积分后不参与消耗）。',
         }, expiryText)
       : null,
-    !poolSplitText && !expiryText && all.length > 1
+    // ⚠️ 配额单位（Gemini）下**不渲染**这句：它的两个「包」是 5 小时窗口与
+    // 周窗口，不是资源包 —— 说「2/2 个资源包有效」既没信息量又误导
+    // （用户报障原文：「不要渲染 / 2/2 个资源包有效」）。窗口自身的读数
+    // 已由上面的 `quotaText` 逐条列出，这里再补一句纯属噪音。
+    // ⚠️ 非配额单位（真正由多个资源包构成余额的 provider）行为**逐字不变**。
+    quotaText === null && !poolSplitText && !expiryText && all.length > 1
       ? React.createElement('span', { className: 'dim-jh-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
