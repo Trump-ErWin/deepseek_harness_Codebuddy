@@ -41,7 +41,7 @@ import {
   fetchRaccoonUserInfo,
   refreshRaccoonCredential,
 } from './raccoon-oauth.js'
-import { RACCOON, type RaccoonProduct } from './raccoon-product.js'
+import { RACCOON, raccoonSupportsImage, type RaccoonProduct } from './raccoon-product.js'
 import {
   startRaccoonLoginFlow,
   type StartedRaccoonLoginFlow,
@@ -177,7 +177,12 @@ function normalizeRemoteModel(entry: Record<string, unknown>): RaccoonRemoteMode
     name: raccoonDisplayName(meta),
     contextWindow: readPositiveInt(params.context_window ?? entry.context_window),
     maxTokens: readPositiveInt(params.max_tokens),
-    supportsImage: tags.includes('vision') || tags.includes('image') || tags.includes('image-understanding'),
+    // ⚠️ **不能只看 tags**：`vision` 是客户端「Raccoon-Auto 选模」的偏好标签，
+    // 不是服务端能力契约（远端根本没有模态字段，已穷举证实）。`tags` 不含
+    // `vision` 的 `sn-deepseek-v4-1-flash` 实测能看图（5/5 读对随机数字），
+    // 只认 tags 会让它被 DSH 投影成文本占位符 —— 图片根本发不出去。
+    // 证据与取舍见 `raccoon-product.ts` 的 RACCOON_IMAGE_CAPABILITY_OVERRIDES。
+    supportsImage: raccoonSupportsImage(id, tags),
   }
 }
 

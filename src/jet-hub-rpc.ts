@@ -1704,7 +1704,8 @@ function registerJetHubEndpoints(
            *
            * ⚠ 「本机有没有官方凭据」是**必要条件**：没装客户端、或没登录过时
            * 两者都跳过，照旧走下面的 OAuth 流程（那是「装完即用」的保证）。
-           */
+           *
+             */
           const orphanId = await zcode.adoptIntoOrphanAccount(pool).catch(() => undefined)
           if (orphanId !== undefined) {
             // `loginUrl` 用**空串**而不是 undefined：与 `loginMode: 'sms'` 的既有约定
@@ -1720,7 +1721,11 @@ function registerJetHubEndpoints(
               return { ok: true, value: { accountId: holder, loginUrl: '', reused: true } }
             }
           }
-          const started = await zcode.startLogin({ refName })
+          const started = await zcode.startLogin({
+            refName,
+            // ⚠️ 缺省 `'bigmodel'`（既有行为不变）；`'zai'` 走 chat.z.ai 国际版。
+            provider: req.zcodeProvider ?? 'bigmodel',
+          })
           // 先登记占位条目（无凭据），使前端 `login.poll` 能立即看到该账号；
           // 登录成功后再回填昵称。失败则删除占位条目。
           await pool.addAccount({

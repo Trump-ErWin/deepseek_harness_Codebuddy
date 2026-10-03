@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { RACCOON } from '../../src/raccoon-product.js'
+import { RACCOON, raccoonSupportsImage } from '../../src/raccoon-product.js'
 import { RaccoonAdapter, registerRaccoonLlm } from '../../src/raccoon-adapter.js'
 import type { RaccoonRemoteModel } from '../../src/raccoon-adapter.js'
 import type { RaccoonCredential } from '../../src/raccoon.js'
@@ -68,7 +68,13 @@ function makeAdapter(patch: {
         }),
         contextWindow: Number(params.context_window ?? 0),
         maxTokens: Number(params.max_tokens ?? 0),
-        supportsImage: Array.isArray(m.tags) && (m.tags as string[]).includes('vision'),
+        // ⚠️ **必须调生产函数**，不要在测试里复刻一份镜像实现 —— 否则单测
+        // 测的是「测试自己写的那份逻辑」，生产改了它不会变红。
+        // 真实实现在 `raccoonSupportsImage`（白名单 ∪ tags）。
+        supportsImage: raccoonSupportsImage(
+          String(m.name),
+          Array.isArray(m.tags) ? (m.tags as string[]).map((t) => String(t).toLowerCase()) : [],
+        ),
       }
     }),
     ...patch.pool === undefined ? {} : { accountPool: patch.pool },
@@ -216,6 +222,43 @@ describe('resolveModel', () => {
       .toEqual(['text', 'image'])
     const without = makeAdapter({ models: [remoteModel({ tags: ['general'] })] })
     expect((await without.resolveModel('raccoon', 'sn-glm-5-3')).inputModalities)
+      .toEqual(['text'])
+  })
+
+  /**
+   * ⚠️ 真实缺陷回归（2026-10-03，用户报障「给 DeepSeek-V4.1-Flash 发图提示不支持」）。
+   *
+   * 远端 `tags` 不含 `vision` **不代表**模型不能看图 —— 那是客户端选模偏好。
+   * 判据是「模型真的读得出来吗」，实测 5/5 读对随机数字。
+   *
+   * ⚠️ 后果链：`inputModalities` 报 `['text']` ⇒ DSH 在 `LlmRuntime` 里把图片
+   * 换成文本占位符 ⇒ **图片根本发不出去**，用户看到「模型说读不到图」。
+   */
+  it('⚠️ tags 不含 vision 但实测能看图的模型仍声明 image（修复前恒为 text）', async () => {
+    const adapter = makeAdapter({
+      models: [
+        remoteModel({
+          name: 'sn-deepseek-v4-1-flash',
+          description: 'DeepSeek-V4.1-Flash',
+          // 实测的远端 tags：确实不含 vision
+          tags: ['general', 'code', 'html', 'analysis', 'reasoning', 'auto'],
+        }),
+      ],
+    })
+    const resolved = await adapter.resolveModel('raccoon', 'sn-deepseek-v4-1-flash')
+    expect(resolved.inputModalities).toEqual(['text', 'image'])
+
+    // 目录里也必须带 image —— 设置页的模型卡据此显示可发图
+    const listed = await adapter.listModels('raccoon')
+    expect(listed.find((m) => m.id === 'sn-deepseek-v4-1-flash')?.inputModalities)
+      .toEqual(['text', 'image'])
+  })
+
+  it('⚠️ 未知模型不被白名单误放行（不得无条件声明 image）', async () => {
+    const adapter = makeAdapter({
+      models: [remoteModel({ name: 'sn-not-a-real-model', tags: ['general'] })],
+    })
+    expect((await adapter.resolveModel('raccoon', 'sn-not-a-real-model')).inputModalities)
       .toEqual(['text'])
   })
 })
