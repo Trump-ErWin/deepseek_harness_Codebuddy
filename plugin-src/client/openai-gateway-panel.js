@@ -292,17 +292,24 @@ export function gatewayCardLabel(provider, labelOf) {
 export function gatewayModelsHint(models, source) {
   if (!models || models.length === 0) {
     if (source === 'none') {
-      return '拿不到任何 provider 列表，模型清单无法读取。'
-        + '这不是登录问题 —— 通常是 DSH 侧的模型服务尚未就绪，重启 DSH 或稍后点「刷新」再试。';
+      // ⚠️ 这两句是**空状态的指路**（用户报障过：每个 provider 都登录了却是 0 个，
+      // 而旧文案让他去查登录，怎么都对不上）。精简时保留「不是登录问题」这个
+      // 反直觉判断 —— 它正是省掉用户半小时排查的那句。
+      return '拿不到任何 provider 列表（不是登录问题）：通常是 DSH 侧模型服务未就绪，重启 DSH 或点「刷新」再试。';
     }
-    return '还没有可用模型：登录至少一个供应商后，点「刷新」即可看到可用的模型 ID。';
+    return '还没有可用模型：登录至少一个供应商后点「刷新」。';
   }
   const providers = new Set(models.map(model => gatewayProviderOf(model))).size;
-  const base = `共 ${models.length} 个可用模型，来自 ${providers} 个供应商（下面按供应商分组）。`
-    + '有些客户端（如 ZCode）不会自动扫描模型目录，需要从这里把模型 ID 复制到它的配置里。'
-    + '卡片里显示的是模型名，复制出去的始终是「供应商/模型名」完整 ID；'
-    + 'ID 区分大小写，且必须带供应商前缀 —— 同名模型在不同供应商下也是不同模型'
-    + '（例如 codearts 与 buddy 各有一份 deepseek-v4.1-flash）。';
+  // ⚠️ 用户 2026-10-04 要求精简（原文 5 句、约 130 字，被折成 4 行）。
+  // 精简**只删冗余解释，不删会导致误配的事实**，故留下三条：
+  //   1. 数量与供应商数（用户要看「有没有我的渠道」）；
+  //   2. ID 必须带供应商前缀且区分大小写（**这条删了必然误配**）；
+  //   3. 行内是短名、复制出去的是完整 ID（两者的差异不说清就会抄错）。
+  // 删掉的是：举例（codearts/buddy 各有一份 flash）、「有些客户端不会自动扫目录」
+  // 的铺垫（下面的 curl 行已经在讲怎么取目录）、「点刷新」的引导。
+  const base = `共 ${models.length} 个可用模型，来自 ${providers} 个供应商。`
+    + 'ID 区分大小写，且必须带供应商前缀（同名模型在不同供应商下是不同模型）；'
+    + '行内显示短名，复制出去的始终是完整 ID。';
   return source === 'adapters'
     ? base + '（当前目录来自本插件已注册的适配器，可能不含 DSH 自带的模型）'
     : base;
@@ -439,22 +446,25 @@ export function filterEffortRows(rows, query) {
 export function gatewayEffortsHint(models) {
   const rows = gatewayEffortRows(models);
   if (rows.length === 0) {
-    return '当前已开启的模型里没有声明思考档位的：网关不会下发该参数，一律按模型默认走。';
+    return '当前已开启的模型都没声明思考档位：网关不下发该参数，按模型默认走。';
   }
   const lossy = rows.filter((row) => row.lossy).length;
   const enabled = Array.isArray(models) ? models.length : rows.length;
-  const providers = new Set(rows.map((row) => gatewayProviderOf(row))).size;
+  // ⚠️ 用户 2026-10-04 要求精简（原文 4 句、实测 169 字，被折成 4 行）。留下的三条
+  // 都是**不删的事实**：① 数量（「14 个」会被误读成网关只认 14 个模型，故必须点明
+  // 「已开启的」）；② 「客户端该填」那一列可直接抄；③ 边界 —— 未登记的写法**真会 400**，
+  // 不让用户去试一个必然失败的写法。
+  // 删掉的是：私有档位名逐个列举（off/light/on/extra_high 在表里本来就看得到）、
+  // 「按强度就近翻译」的机制解释、以及「按供应商分组，来自 N 个供应商」
+  // （卡片头本就写着是哪一家，这里再说一遍是冗余）。
   return `当前已开启的 ${enabled} 个模型里，有 ${rows.length} 个可选思考档位`
-    + `${lossy > 0 ? `，其中 ${lossy} 个的档位名与 OpenAI 客户端不同（见下方标「需对照」的行）` : ''}`
-    + `（按供应商分组，来自 ${providers} 个供应商）。`
-    + '「客户端该填」那一列可以直接抄进 CC Switch / Codex 的思考等级设置，与模型真实档位一一对应。'
+    + `${lossy > 0 ? `（${lossy} 个不同名，标「需对照」）` : ''}。`
+    + '「客户端该填」可直接抄进 CC Switch / Codex；'
     // ⚠️ 别写成「填什么都不会报错」：强度序只登记了 12 个名字（8 个规范名 + 上游私有的
     // off / light / on / extra_high），`turbo` 这类未登记的写法是**真会 400** 的
     // （见 reasoning-ladder.ts 的 REASONING_EFFORT_RANK）。照实说，用户才不会去试一个
     // 必然失败的写法；错误里本来就会列出该模型可用的档位。
-    + '这 8 个之外，上游私有的 off / light / on / extra_high 也能识别（按强度就近落到模型的某一档，会记日志）；'
-    + '再往外的写法（如 turbo）会被拒绝，错误里会列出该模型可用的档位。'
-    + '在插件里关掉的模型不会出现在这张表里。';
+    + '未登记的写法（如 turbo）会被拒绝，关掉的模型不在表里。';
 }
 
 /**
@@ -555,13 +565,15 @@ export function gatewayStatusLines(status) {
   if (status.running) {
     const endpoint = gatewayEndpoint(status)
     return [
-      '网关正在运行。把外部客户端的 OpenAI 兼容地址设为下面这一行。',
-      endpoint ? `地址：${endpoint}` : '',
-      // ⚠️ 必须说清「两种协议同时可用」：Responses API 是后加的（2026-10-03），
-      // 老用户从面板上看不出它存在，会以为网关只支持 Chat Completions。
-      // ⚠️ 也**不能**说成「可切换」：两个端点同时都在，没有互斥开关。
-      '同一地址同时提供两种协议：/chat/completions（OpenAI Chat Completions）'
-      + '与 /responses（OpenAI Responses API）—— 用哪一套由客户端请求的路径决定。',
+      // ⚠️ 用户 2026-10-04 要求精简（原三句「网关正在运行 / 把外部客户端的… /
+      // 地址：…」合并成下面这组短行）。**语义必须保住两条**：
+      //   1. 推荐 CC Switch —— 它是本仓库对 Codex/Cline 那类客户端的既有推荐入口；
+      //   2. **两种协议都要点名**：Responses API 是后加的，不说就没人知道它存在。
+      // ⚠️ 措辞不得写成「可切换」：两个端点同时都在，没有互斥开关（用例会红）。
+      '推荐使用 CC Switch 进行网关配置。',
+      '协议支持：OpenAI Chat Completions 与 OpenAI Responses API。',
+      // 地址单列一行（带端口），它是用户要抄走的东西。
+      endpoint ? `API 请求地址：${endpoint}` : '',
     ].filter(Boolean)
   }
   if (status.enabled) {

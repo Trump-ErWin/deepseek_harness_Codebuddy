@@ -288,6 +288,27 @@ const STYLES = `
 /* 搜索结果为空时的提示（与其它空状态同款观感）。 */
 .dim-jh-effortEmpty { padding: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
+/* ── 网关弹窗的排版收紧（用户 2026-10-04 要求：「这几段话之间的行间距小一点」）──
+   ⚠️ 必须加 .dim-jh-gatewayModal 前缀：.dim-jh-modalHint 是**共用**类，
+   另有 24 处调用点（账号面板、opencode 弹窗、备份弹窗…），本次只该动网关弹窗
+   —— 全局把 10px 改成 6px 会悄悄改掉那些页面的观感。
+   本弹窗有 8 处说明行，10px × 8 ≈ 80px 空隙，收成 6px 后观感明显紧凑。 */
+.dim-jh-gatewayModal .dim-jh-modalHint { margin-top: 6px; }
+/* 弹窗顶部那三行是**同一段话**（推荐 / 协议 / 地址），彼此再紧一档，
+   否则它们看起来像三个互不相干的段落。 */
+.dim-jh-gatewayModal .dim-jh-gatewayLine { margin-top: 4px; }
+
+/* ── 密钥行：小号按钮，不让按钮把这一行撑高 ──
+   ⚠️ 用户 2026-10-04 报障：「复制密钥」「显示明文」大到把这行撑开。
+   根因是 .dim-jh-btn 是**通用**按钮（padding 4px 12px + line-height 18px
+   ⇒ 约 28px 高），而同行只有 18px 高的说明文字 —— 按钮比文字高 10px，
+   整行的高度就被它顶起来了。这里单独压到约 22px，与文字行接近。
+   ⚠️ 不能直接改 .dim-jh-btn（30+ 处调用点：页头、卡片头、对照表…）。 */
+.dim-jh-gatewayKeyRow { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.dim-jh-gatewayKeyRow .dim-jh-btn { padding: 2px 8px; font-size: 11px; line-height: 16px; border-radius: 6px; }
+/* 「API KEY：」标签：与按钮同基线、不可压缩（否则窄面板下会折成两行）。 */
+.dim-jh-gatewayKeyRow .dim-jh-gatewayKeyLabel { flex: none; margin: 0; }
+
 /* ── 网关清单：**一个供应商一张卡片**（模型清单与档位对照表共用）──
    用户 2026-10-03 报障：此前按「一个模型一行」平铺，同一家的
    deepseek-account/deepseek-flash 与 deepseek-account/deepseek-v4-pro

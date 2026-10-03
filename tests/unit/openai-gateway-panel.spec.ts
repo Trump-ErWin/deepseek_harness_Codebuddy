@@ -69,17 +69,32 @@ describe('本机网关面板的文案与判定', () => {
   it('「已选择开启但没监听」必须与「运行中」说不同的话', () => {
     // 这两种状态在 UI 上都表现为 enabled=true，只靠 enabled 推导会显示
     // 「已开启」而用户连不上。
-    expect(gatewayStatusLines(RUNNING).join()).toContain('正在运行')
+    expect(gatewayStatusLines(RUNNING).join()).toContain('CC Switch')
     expect(gatewayStatusLines(WANTED_BUT_DOWN).join()).toContain('没有在监听')
     expect(gatewayStatusLines(WANTED_BUT_DOWN).join()).toContain('端口')
   })
 
+  it('★ 运行中的三行文案精简且信息完整（用户 2026-10-04 要求）', () => {
+    // 用户报障：网关页「非常臃肿」，要求精简这第一段。
+    // 精简**不许把信息减掉**，故逐项锁住三行各自的职责：
+    const lines = gatewayStatusLines(RUNNING)
+    expect(lines).toHaveLength(3)
+    // ① 指向 CC Switch（本仓库对 Codex/Cline 那类客户端的既有推荐入口）
+    expect(lines[0]).toContain('CC Switch')
+    // ② 两种协议都点名（Responses API 是后加的，不说就没人知道它存在）
+    expect(lines[1]).toContain('Chat Completions')
+    expect(lines[1]).toContain('Responses API')
+    // ③ 地址单独一行、带真实端口（端口可被 env 改过）
+    expect(lines[2]).toContain('http://127.0.0.1:8326/v1')
+    // ⚠️ 精简后不得留下旧版的冗长句式。
+    expect(lines.join()).not.toContain('把外部客户端的')
+  })
+
   it('★ 运行中必须说清「两种协议同时可用」（Responses API 是后加的，面板不说就没人知道）', () => {
     const lines = gatewayStatusLines(RUNNING).join()
-    expect(lines).toContain('/chat/completions')
-    expect(lines).toContain('/responses')
-    // ⚠️ 措辞必须是「同时提供」，不是「可切换」：两端点同时都在，没有互斥开关。
-    expect(lines).toContain('同时提供')
+    expect(lines).toContain('Chat Completions')
+    expect(lines).toContain('Responses API')
+    // ⚠️ 措辞不得写成「可切换」：两端点同时都在，没有互斥开关。
     expect(lines).not.toContain('切换')
   })
 
@@ -165,6 +180,48 @@ describe('凭据的展示与复制', () => {
     // 复制失败必须退回显示明文，不能让按钮点了没反应。
     expect(body).toMatch(/setRevealed\(true\)[\s\S]{0,80}setCopied\(false\)/)
   })
+
+  it('★ 「API KEY：」与两个按钮在同一行（用户 2026-10-04 要求精简）', () => {
+    // 旧版是三截：一行「鉴权用 Authorization: Bearer <网关 API Key>。」+
+    // 下面单独一排按钮。用户要求精简成一行「API KEY：⌈复制密钥⌋⌈显示明文⌋」。
+    const body = source.slice(
+      source.indexOf('function GatewayPanel('),
+      source.indexOf('export function JetHubPage'),
+    )
+    // 标签与按钮必须在**同一个容器**里（否则又变回两行）。
+    //
+    // ⚠️ 窗口必须收紧到 160 字：写成 400 字会**假装**锁住了 —— 把「API KEY：」
+    // 挪到容器外、紧挨着的兄弟节点上（真的又变回两行）时，400 字窗口仍然命得中，
+    // 变异测试里这个锁会存活。收紧后顺序也被锁死：容器 → 标签 → 复制按钮。
+    expect(body).toMatch(/dim-jh-gatewayKeyRow'[\s\S]{0,160}'API KEY：'[\s\S]{0,300}'复制密钥'/)
+    expect(body).toContain("'显示明文'")
+    // ⚠️ 那行冗长的 Bearer 说明已移除（协议与鉴权方式在 README 里有完整说明；
+    // 面板上只留用户真正要抄的两个东西：地址与密钥）。
+    //
+    // ⚠️ 必须匹配**带引号的字面量** `'鉴权用 Authorization`：紧邻的注释里也写着
+    // 这句原文（用来说明「原先是什么」），只匹配裸短语会把注释误判成没删干净。
+    expect(body).not.toContain("'鉴权用 Authorization")
+  })
+
+  it('⚠️ 没有密钥时也要给出「API KEY：」一行，而不是整块消失', () => {
+    // 整块消失会让用户以为面板坏了；说清「启用后自动生成」才是指路。
+    const body = source.slice(
+      source.indexOf('function GatewayPanel('),
+      source.indexOf('export function JetHubPage'),
+    )
+    expect(body).toMatch(/API KEY：尚未生成/)
+  })
+
+  it('⚠️ 没有密钥时不重复说两遍「未生成」（精简的反面就是冗余）', () => {
+    // `apiKey` 为空时，「API KEY：尚未生成（启用网关时会自动创建）」已经说完，
+    // 而 gatewayApiKeyHint(null) 讲的是同一件事 —— 两句并排是冗余。
+    // 故来源说明那一行必须与「有密钥」同门控。
+    const body = source.slice(
+      source.indexOf('function GatewayPanel('),
+      source.indexOf('export function JetHubPage'),
+    )
+    expect(body).toMatch(/apiKey\s*\?\s*React\.createElement\('p',\s*\{[^}]*\},\s*gatewayApiKeyHint\(apiKey\)\)\s*:\s*null/)
+  })
 })
 
 describe('模型 ID 清单（ZCode 等不会自动扫目录的客户端靠它）', () => {
@@ -189,16 +246,33 @@ describe('模型 ID 清单（ZCode 等不会自动扫目录的客户端靠它）
   it('提示语给出数量，并点明「ID 区分大小写」这个实测踩过的坑', () => {
     const hint = gatewayModelsHint(MODELS, 'catalog')
     expect(hint).toContain('3 个')
+    // ⚠️ MODELS 里是 codearts + cline 共 **2** 家（写 3 会是假红）。
+    expect(hint).toContain('2 个供应商')
     expect(hint).toContain('大小写')
     // 同名模型跨 provider 不是同一个 —— 用户最常见的误配来源。
     expect(hint).toContain('不同供应商')
+  })
+
+  it('★ 提示语已精简（用户 2026-10-04 要求），但不许删掉会致误配的事实', () => {
+    // 用户报障：这几段介绍「非常冗长」。
+    const hint = gatewayModelsHint(MODELS, 'catalog')
+    // ⚠️ 精简的判据用**行数**而不是字符数：臃肿的观感来自被折成好几行。
+    // 面板宽 min(560px)，12px 字号下一行约 40 个中文字，故 100 字以内基本是 2 行。
+    expect(hint.length).toBeLessThanOrEqual(100)
+    // 三条不能删的事实仍在：数量、前缀大小写、短名 vs 完整 ID。
+    expect(hint).toContain('大小写')
+    expect(hint).toContain('供应商前缀')
+    expect(hint).toContain('复制出去的始终是完整 ID')
+    // 删掉的是举例与铺垫（这些是「冗长」的来源）。
+    expect(hint).not.toContain('例如 codearts 与 buddy')
+    expect(hint).not.toContain('不会自动扫描')
   })
 
   it('⚠️ 空清单必须能自解释：区分「没登录」与「宿主没给出 provider」', () => {
     // 实机报障：用户每个 provider 都登录了，清单却是 0 个，而提示却说
     // 「还没有可用模型，登录至少一个供应商」—— 用户照着去查登录怎么都对不上。
     expect(gatewayModelsHint([], 'none')).toContain('拿不到任何 provider 列表')
-    expect(gatewayModelsHint([], 'none')).toContain('这不是登录问题')
+    expect(gatewayModelsHint([], 'none')).toContain('不是登录问题')
     expect(gatewayModelsHint([], 'catalog')).toContain('还没有可用模型')
   })
 
@@ -217,8 +291,8 @@ describe('模型 ID 清单（ZCode 等不会自动扫目录的客户端靠它）
 
   it('地址栏直接打开会 401 这件事必须提前告诉用户', () => {
     expect(gatewayModelsHint(MODELS)).not.toContain('401')
-    // 说明文案在面板里，单独断言渲染处带这句。
-    expect(source).toContain('地址栏直接打开会返回 401')
+    // 说明文案在面板里，单独断言渲染处带这句（精简后措辞已收紧，见下一条）。
+    expect(source).toContain('地址栏直接打开会 401')
   })
 
   it('面板确实渲染了清单与「复制全部 ID」按钮', () => {
@@ -351,20 +425,34 @@ describe('思考档位对照表', () => {
     expect(hint).toContain('当前已开启的 3 个模型')
     expect(hint).toContain('有 2 个可选思考档位')
     // 只有 TRAE 那行是「需对照」，数量必须如实。
-    expect(hint).toContain('1 个的档位名与 OpenAI 客户端不同')
-    expect(hint).toContain('按强度就近')
+    expect(hint).toContain('1 个不同名')
     expect(hint).toContain('CC Switch')
-    expect(hint).toContain('关掉的模型不会出现在这张表里')
+    expect(hint).toContain('关掉的模型不在表里')
     // ⚠️ 边界必须照实说：强度序只登记了 12 个名字（8 规范名 + off/light/on/extra_high），
     // `turbo` 这类未登记的写法会被拒绝。让用户去试一个必然 400 的写法是误导。
-    expect(hint).toContain('off / light / on / extra_high')
+    expect(hint).toContain('turbo')
     expect(hint).toContain('会被拒绝')
     expect(hint).not.toContain('也不会报错')
   })
 
-  it('一个模型都没声明档位时说明「网关不会下发该参数」', () => {
-    expect(gatewayEffortsHint([NO_EFFORT])).toContain('不会下发该参数')
-    expect(gatewayEffortsHint([])).toContain('不会下发该参数')
+  it('★ 说明文案已精简（用户 2026-10-04 要求），但边界与列含义仍照实', () => {
+    const hint = gatewayEffortsHint([TRAE, PLAIN, NO_EFFORT])
+    // ⚠️ 判据用**长度上限**而不是「恰好等于某串」：长度为 0 的空串也满足
+    // 一切 toContain，故长度上限必须与下面的正向断言同用才有意义。
+    // 原版实测 169 字（折 4 行），现压到 105 字以内（约 2 行）。
+    expect(hint.length).toBeLessThanOrEqual(105)
+    // 「可直接抄那一列」这句是功能入口，不能删。
+    expect(hint).toContain('可直接抄进')
+    // ⚠️ 私有档位名不再逐个列举（表里本就看得见），但「未登记会被拒」必须留着。
+    expect(hint).toContain('会被拒绝')
+    expect(hint).not.toContain('按强度就近')
+    // 供应商数量不再重复（卡片头已写明是哪一家）。
+    expect(hint).not.toContain('个供应商')
+  })
+
+  it('一个模型都没声明档位时说明「网关不下发该参数」', () => {
+    expect(gatewayEffortsHint([NO_EFFORT])).toContain('不下发该参数')
+    expect(gatewayEffortsHint([])).toContain('不下发该参数')
   })
 
   it('curl 模板指向对照表端点，且**绝不含**明文密钥', () => {

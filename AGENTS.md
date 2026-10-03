@@ -7548,8 +7548,11 @@ GET  /v1/models             ← 两套协议共用同一份目录
 - **不发 `data: [DONE]`**：那是 Chat Completions 的收尾约定，Responses 以
   `response.completed` / `response.failed` 结束。
 - 面板（`openai-gateway-panel.js` 的 `gatewayStatusLines`）在**运行中**时会说明
-  「同一地址同时提供两种协议」——⚠️ 措辞必须是「同时提供」，**不能写「可切换」**
-  （用例会红）。
+  「协议支持：OpenAI Chat Completions 与 OpenAI Responses API」（⚠️ 措辞不得写成
+  「可切换」，两个端点同时都在、没有互斥开关，用例会红）。该段文案在 2026-10-04
+  按用户要求**精简过**（原三句「网关正在运行 / 把外部客户端的… / 地址：…」合并为
+  三行短句：推荐 CC Switch、协议支持、API 请求地址）—— 精简**不减信息**，
+  「两种协议都点名」与「地址带真实端口」两条仍有独立用例锁着。
 - 回归用例：`tests/unit/openai-gateway-responses.spec.ts`（转换 + 流式/非流式事件序列）
   与 `tests/unit/openai-gateway-server.spec.ts` 的「Responses API 出口」段（HTTP 层）。
 
