@@ -752,6 +752,68 @@ allowBuilds 判定，不换 commit 会得到假的"成功"）：
    唯一跨版本可用的是 `dangerouslyAllowAllBuilds: true`（代价：放行该 profile 里所有依赖的
    构建脚本）。改完请照上表重跑一遍验证 —— 尤其**要换新 commit**，否则缓存会骗你。
 
+## ⚠ 「通用面板」里的按钮与弹窗**必须按 provider 分支**（Issue IKJLK3）
+
+**真实缺陷**（Gitee issue IKJLK3，用户报障，2026-10-03）：Jet Hub 的
+`ProviderPanel`（`plugin-src/client/jet-hub.js`）按 `provider` prop 复用**同一个组件**，
+于是「+ 新建账号」按钮存在于**全部 13 个 provider 的面板**里，而 2026-10-03 刚搬进去的
+**登录渠道弹窗是 zCode 专用**的（标题硬编码「添加 ZCode 账号」+ 一个渠道 `<select>`）。
+二者没有分支，后果是**三个同源缺陷**：
+
+| 现象 | 根因 |
+|---|---|
+| 在 CodeArts / Qoder 等面板点「+ 新建账号」，弹出的是「添加 ZCode 账号」 | 按钮无条件 `setPendingLogin(false)` |
+| 弹窗里选 bigmodel / z.ai **没有落点** | 载荷构造 `provider === 'zcode' ? {provider, zcodeProvider} : {provider}`，非 zcode 那一支不传 |
+| opencode 要点**两层**弹窗 | 按钮先弹 ZCode 渠道窗，点「确定」才走到 `setKeyModal` 的 API key 表单 |
+
+⇒ 修法是**判据收进纯函数**，不写在组件里：
+`plugin-src/client/new-account.js` 的 `newAccountAsksChannel(provider)` 与
+`buildCreateAccountPayload(provider, zcodeProvider)`（与 `account-model-link.js` /
+`model-bulk.js` 同样做法：单测环境是 `node`、**react 不在依赖内**，
+组件渲染不了，判据必须抽出来才能**真跑**覆盖）。语义定为
+**「只有 zcode 先问渠道，其余 provider 点按钮即登录」**。
+
+⚠ **三条同源教训**（下次在通用面板加 provider 专属 UI 前先过一遍）：
+
+1. **判据方向要选失败安全的那边**：`newAccountAsksChannel` 写成**白名单**
+   （`provider === 'zcode'`）而不是「排除法」。将来新增 provider 忘了改这里，
+   后果是「少问一次」而非「弹错窗」—— 少一次确认是降级，弹错窗是破坏。
+2. **「通用组件里的 provider 专属 UI」是接线 bug，不只是漏一个 `if`**：
+   按钮 `onClick` 与弹窗渲染处**两处都要接**（渲染处那道是防御性的），
+   回归用例也分两条守 —— 只锁纯函数会被「判据还在但没人调用」绕过。
+3. ⚠ **既有测试会贴死写法**：`tests/unit/zcode-channel-dialog.spec.ts` 原本断言
+   `onClick: () => setPendingLogin(false)` 与 `pendingLogin === undefined ? null :`，
+   分支化后全部变红。⚠ 那**不是**要改实现去迁就测试 —— 要把断言改成锁**意图**
+   （「zCode 面板仍必须先弹窗」「条件仍挂在 `pendingLogin` 上」），
+   并在注释里写明为什么放宽，否则下一个改写法的人会照着把分支删回去。
+
+⚠ **同类问题还有服务端那一半**（E2）：`account.create` 的 `zcodeProvider`
+原先只有 `?? 'bigmodel'` 兜底、**无白名单** —— RPC 载荷是**客户端自报**的
+（入口无 schema 校验），`ZcodeLoginProvider` 只是 TS 联合类型，运行时任何字符串都能进来，
+未登记值会被原样送进 `startZcodeLogin` 打到不存在的授权端点（表现为「授权页打不开 /
+轮询超时」这类极难定位的失败）。现由 `normalizeZcodeLoginProvider()` 归一，
+**回落**（与既有缺省兜底同向，不报错，老客户端照常能登录）+ 非缺省时 `console.warn`。
+
+⚠ **提单人对 E1 的判断有误，别照抄**：「`account.create` 未校验 provider，会一路走到链尾」
+—— 链尾**本来就有**兜底 `else { return unknown provider }`，且 `id` 只在分支内使用，
+未知 provider **不会**被写进账号池。不必再加一道重复校验。
+
+⚠ **`dim-jh-zcDialog*` 类名已经不准**了：它是**通用弹窗样式**（`jet-hub.js` 与
+`zcode-card.js` 两个入口共用）。曾想改名，但两个文件 + 样式表一起动、收益仅是可读性，
+故保留名字 —— 别再据类名判断「这段 UI 只属于 zCode」。
+
+⚠ 另两条同 issue 的低频项：登录重入闸门 `if (pollRef.current !== 0) return`
+**不能静默 return**（弹窗确定按钮是「先关弹窗再调 createAccount」，
+早退时用户只看到「点了没反应」，要复用 `probeNotice` 给提示）；
+`console.log('account.create response =', res)` 会把**含 OAuth state 的 loginUrl**
+打进控制台（用户截图求助时外泄），只记 `provider` 与本地 `accountId`。
+
+回归用例 `tests/unit/new-account-dialog.spec.ts`（14 条，做过 8 个变异的反向验证）。
+⚠ 写这类源码级断言时**必须先定位再匹配**：`jet-hub.js` 里有 **3 处**
+`pollRef.current !== 0`（另两处在 `stopPoll` 的清理里），只按字面量找第一个
+会命中无关代码；且断言要对**剥掉注释**的文本做，否则文件头为记录旧实现写下的
+那行字就能喂绿（本轮修的正是「登录渠道选择」，注释里必然提到它）。
+
 ## 技术栈与约束
 
 - **Node.js**：`^22.19.0 || >=24.0.0`
