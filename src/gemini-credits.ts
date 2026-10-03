@@ -5,9 +5,28 @@
  *
  * ## 端点与身份
  *
- * `POST {sandbox}/v1internal:retrieveUserQuotaSummary`，请求体是**空对象 `{}`**
- * （**不带 project** —— 原版注释明确），身份头与推理请求**完全一致**
- * （`geminiHeaders`），Bearer 用 `access_token`。
+ * `POST {sandbox}/v1internal:retrieveUserQuotaSummary`，身份头与推理请求
+ * **完全一致**（`geminiHeaders`），Bearer 用 `access_token`。
+ *
+ * ## ⚠️ 请求体**必须带 `project`**（2026-10-03 修正）
+ *
+ * 原版（`quota.go:25`）发的是空对象 `{}`，那是**单账号**抓包的结论。实测第二个
+ * Google 账号（`yinghaolin521@gmail.com`）用 `{}` 会被拒：
+ *
+ * ```
+ * 403 PERMISSION_DENIED  SUBSCRIPTION_REQUIRED (#3501)
+ * "You do not have a valid license of this product."
+ * ```
+ *
+ * 而**同一个 token、同一组身份头**，只要请求体带上 `{"project":"aicode-consumers"}`
+ * 就 200 —— 唯一的变量就是 `project`。同一账号的**推理**请求本来就在信封里带
+ * `project`（`gemini-messages.ts:278`），所以只有配额这条链路会 403：
+ * 面板显示「凭据已失效」，而「测试」按钮照样能发请求（用户 m07113 报障）。
+ *
+ * 字段名是 `project`，**不是** `cloudaicompanionProject` —— 后者会 400
+ * `Unknown name "cloudaicompanionProject": Cannot find field.`。值取凭据里的
+ * `cloudaicompanionProject`（`loadCodeAssist` 的回报，实测恒为 `aicode-consumers`），
+ * 缺失时退到 {@link GEMINI_DEFAULT_PROJECT}。
  *
  * ⚠️ 走 **sandbox** 端点而不是 daily：原版 `baseFor(path)` 把
  * `loadCodeAssistPath` / `retrieveQuotaPath` 两类路径固定路由到 sandbox，
@@ -41,6 +60,7 @@ import { roundCredits, type CreditBalance, type CreditPackage } from './credits.
 import {
   GEMINI,
   GEMINI_CREDITS_TIMEOUT_MS,
+  GEMINI_DEFAULT_PROJECT,
   GEMINI_ENDPOINT_SANDBOX,
   GEMINI_QUOTA_CACHE_TTL_MS,
   GEMINI_QUOTA_PATH,
@@ -244,6 +264,7 @@ async function requestQuota(
   credential: GeminiCredential,
   fetcher: typeof fetch,
 ): Promise<GeminiBalanceResult> {
+  const project = credential.cloudaicompanionProject ?? GEMINI_DEFAULT_PROJECT
   let response: Response
   try {
     response = await fetcher(`${GEMINI_ENDPOINT_SANDBOX}${GEMINI_QUOTA_PATH}`, {
@@ -251,8 +272,8 @@ async function requestQuota(
       // ⚠️ 身份头与推理请求**完全一致**（含五个伪装头）；流式才刻意不带 Accept，
       // 配额是普通 JSON 请求，`includeAccept` 保持默认 false 与抓包一致。
       headers: geminiHeaders(credential),
-      // ⚠️ 空对象，**不带 project**（原版口径）。
-      body: '{}',
+      // ⚠️ 必须带 `project`（见文件头注释）：空对象 `{}` 对第二个账号会 403。
+      body: JSON.stringify({ project }),
       signal: AbortSignal.timeout(GEMINI_CREDITS_TIMEOUT_MS),
     })
   } catch (error) {
@@ -263,8 +284,11 @@ async function requestQuota(
   if (!response.ok) {
     return {
       balance: null,
+      // ⚠️ 403 有两种成因，文案不能一概说"凭据已失效"：本账号缺 5 小时窗口时
+      // 上游对 `{}` 回 `SUBSCRIPTION_REQUIRED`，凭据其实是好的（用户报障形态）。
+      // 这里把上游的 `reason` 透出来，否则面板只会误导人去重新登录。
       error: response.status === 401 || response.status === 403
-        ? `凭据已失效（HTTP ${response.status}），请重新登录该账号`
+        ? `配额查询被拒（HTTP ${response.status}）${quotaRejectionHint(text)}`
         : `配额查询失败（HTTP ${response.status}）：${text.slice(0, 200)}`,
     }
   }
@@ -289,4 +313,36 @@ async function requestQuota(
 /** 错误 → 一行可读文案。 */
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * 从 403/401 的响应体里挖出一句能指向真因的话。
+ *
+ * 上游的错误体是 `{"error":{"status":"PERMISSION_DENIED","details":[{"reason":
+ * "SUBSCRIPTION_REQUIRED",…}]}}`。凭据真失效时通常是 `UNAUTHENTICATED` /
+ * `invalid_grant`；`SUBSCRIPTION_REQUIRED` 则完全是另一回事（账号形态差异，
+ * 不是凭据问题）。挖不出就把正文前 160 字附上，别吞掉现场。
+ */
+function quotaRejectionHint(text: string): string {
+  try {
+    const payload: unknown = JSON.parse(text)
+    if (typeof payload === 'object' && payload !== null) {
+      const error = (payload as Record<string, unknown>).error
+      if (typeof error === 'object' && error !== null) {
+        const record = error as Record<string, unknown>
+        const details = Array.isArray(record.details) ? record.details : []
+        const reason = details
+          .map((item) => (typeof item === 'object' && item !== null
+            ? (item as Record<string, unknown>).reason
+            : undefined))
+          .find((value): value is string => typeof value === 'string' && value !== '')
+        const message = typeof record.message === 'string' ? record.message : ''
+        if (reason !== undefined) return `（${reason}）：${message.slice(0, 160)}`
+        if (message !== '') return `：${message.slice(0, 160)}`
+      }
+    }
+  } catch {
+    // 非 JSON 就走下面的兜底。
+  }
+  return text === '' ? '' : `：${text.slice(0, 160)}`
 }
