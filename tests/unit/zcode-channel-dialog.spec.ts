@@ -13,6 +13,13 @@
  *
  * ⚠ 纯源码契约：这类 UI 位置没有单测能真正跑起来（要起 React 树），
  *   而它恰恰是最容易被"顺手改回去"的地方 —— 改回去不会有任何测试失败。
+ *
+ * ## 第二个守护目标：弹窗**只服务 zcode**（2026-10-03 补）
+ *
+ * 上游 `15ccae5` 把渠道选择搬进弹窗时丢了 `provider === 'zcode'` 门控 ⇒
+ * **全部 14 个 provider** 点「+ 新建账号」都弹出「添加 ZCode 账号」。功能不坏
+ * （确定后仍按各自 provider 登录），但多一层无意义弹窗 + 错误标题。
+ * `jet-hub.js` 是通用面板，必须有**两道门**：按钮分流 + 弹窗条件。
  */
 import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -25,9 +32,23 @@ const card = readFileSync(resolve(dir, '../../plugin-src/client/zcode-card.js'),
 const styles = readFileSync(resolve(dir, '../../plugin-src/client/jet-hub-styles.js'), 'utf8')
 
 describe('★ 渠道选择在「新建账号弹窗」里，不在按钮旁', () => {
-  it('★ 两个入口都改为「点按钮 → 开弹窗」（不再直接调 createAccount）', () => {
-    expect(panel, 'jet-hub.js 按钮应开弹窗').toContain('onClick: () => setPendingLogin(false)')
+  it('★ zcode 入口改为「点按钮 → 开弹窗」（不再直接调 createAccount）', () => {
+    // ⚠ jet-hub.js 是**通用面板**（服务全部 provider），按钮必须分流：
+    //   zcode 开弹窗，其余 provider 直接发起登录（与「搬进弹窗」之前逐字等价）。
+    expect(panel, 'jet-hub.js 的 zcode 分支应开弹窗').toMatch(
+      /onClick: provider === 'zcode'\s*\?\s*\(\) => setPendingLogin\(false\)\s*:\s*\(\) => void createAccount\(\)/,
+    )
+    // zcode-card.js 只服务 zcode，无需分流。
     expect(card, 'zcode-card.js 按钮应开弹窗').toContain("btn('create', '添加账号', '登录中…', () => setPendingLogin(false))")
+  })
+
+  it('★ ★ 渠道弹窗只服务 zcode（非 zcode 不得弹「添加 ZCode 账号」）', () => {
+    // ⚠ **真实缺陷回归**：上游 15ccae5 把渠道选择搬进弹窗时丢了
+    //   `provider === 'zcode'` 门控 ⇒ 全部 14 个 provider 点「+ 新建账号」
+    //   都弹出「添加 ZCode 账号」，里面的渠道下拉对其毫无意义。
+    //   两道门缺一不可：按钮分流 + 弹窗条件。删掉任一道，本用例必红。
+    expect(panel, '按钮缺 provider 分流').toContain("onClick: provider === 'zcode'")
+    expect(panel, '弹窗条件缺 provider 门控').toContain("pendingLogin === undefined || provider !== 'zcode'")
   })
 
   it('★ 两个入口都有 pendingLogin 状态（弹窗开着 + 要 forceNew 不可能不同步）', () => {
@@ -65,9 +86,11 @@ describe('★ 渠道选择在「新建账号弹窗」里，不在按钮旁', () 
   it('★ ★ 弹窗是**条件渲染**的（不是常驻），且条件是 pendingLogin', () => {
     // ⚠ 只查「有没有 zcDialogMask」不够：把条件写成 `false` 后文本仍在，
     //   弹窗却永远不渲染（反向验证的变异 2 就是这样溜过去的）。
+    // ⚠ jet-hub.js 多一道 `|| provider !== 'zcode'`（通用面板必需），
+    //   故正则容忍该后缀；zcode-card.js 是 zcode 专属，保持单条件。
     for (const [name, src] of [['jet-hub.js', panel], ['zcode-card.js', card]] as const) {
       expect(src, `${name} 弹窗未挂在 pendingLogin 条件上`)
-        .toMatch(/pendingLogin === undefined \? null : (React\.createElement|h)\(/)
+        .toMatch(/pendingLogin === undefined(?:\s*\|\|[^?]*)?\s*\?\s*null\s*:\s*(React\.createElement|h)\(/)
     }
   })
 
