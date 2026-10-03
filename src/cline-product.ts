@@ -140,8 +140,12 @@ export interface ClineProduct {
  * （实测 `Select-String 'cline-free/'` 零命中）—— 免费模型**只**由
  * `recommended-models` 下发。这是「只调 `/models` 会看不到任何免费模型」的原因。
  *
- * ⚠️ 内嵌目录**缺 `stealth/space-bunny-alpha` 与 `cline-free/*`**（远端 `free` 才有），
- * 故这里把它们补进兜底表；否则离线时用户看不到免费模型。
+ * ⚠️ 内嵌目录（`cline-models.ts` 的 `BUILTIN_MODEL_CATALOG`）**缺
+ * `stealth/space-bunny-alpha` 与 `cline-free/*`**，它们只由 `recommended-models`
+ * 的 `free` 数组下发；故本兜底表把它们补上，否则离线 / 远端失败时用户看不到免费模型。
+ * ⚠️ **别把「内嵌目录」与「本兜底表」当成同一个东西**（早先的注释正是这么写的，
+ * 「内嵌目录缺 `cline-free/*`」紧跟着下面这张**含有 3 条 `cline-free/*`** 的表，
+ * 读起来自相矛盾）。内嵌目录缺的、由本表补的 —— 说的是**来源**，不是本表的内容。
  *
  * ⚠️ **这条表要与远端 `free` 数组同步**。2026-10-03 复测：`free` 只剩 **4 条**
  * （`gemini-3.8-flash` 已被 Cline 下线 —— 直连该模型回

@@ -306,6 +306,78 @@ describe('AccountPool', () => {
     expect(list[0].modelRateLimits?.['deepseek-v4-flash']).toBe(resetAt)
   })
 
+  // ⚠️ 「只接受更长者」是 cline「永远 60 分钟」的**最后一道防线**：各 provider 的解析
+  // 末端都有一个短的兜底值（cline 是 1 小时，真值可能是 19h39m），无脑覆盖会让
+  // 并发请求里「先写真值、后写兜底」的那个赢，于是每次失败都从当下重算一小时。
+  describe('updateModelRateLimit 只接受更长的解禁时刻', () => {
+    it('★ 兜底的短值不得覆盖已有的长标记', async () => {
+      await pool.addAccount(makeMockAccount())
+      const real = Date.now() + 19 * 3600_000 + 39 * 60_000   // 报文里的 19h39m
+      const fallback = Date.now() + 3600_000                   // 解析失败的 1 小时兜底
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', real)
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', fallback)
+      const list = await pool.listAccounts('buddy')
+      expect(list[0].modelRateLimits?.['deepseek-v4-flash']).toBe(real)
+    })
+
+    it('更长的值仍能覆盖（兜底先到、真值后到是正常顺序）', async () => {
+      await pool.addAccount(makeMockAccount())
+      const fallback = Date.now() + 3600_000
+      const real = Date.now() + 19 * 3600_000
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', fallback)
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', real)
+      const list = await pool.listAccounts('buddy')
+      expect(list[0].modelRateLimits?.['deepseek-v4-flash']).toBe(real)
+    })
+
+    it('相等时跳过写盘（语义无差别，省一次 IO）', async () => {
+      await pool.addAccount(makeMockAccount())
+      const at = Date.now() + 3600_000
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', at)
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', at)
+      const list = await pool.listAccounts('buddy')
+      expect(list[0].modelRateLimits?.['deepseek-v4-flash']).toBe(at)
+    })
+
+    it('★ NaN/Infinity 必须被忽略（写进去 = 该模型被永久限流，且 sweep 清不掉）', async () => {
+      await pool.addAccount(makeMockAccount())
+      const real = Date.now() + 19 * 3600_000
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', real)
+      // 三个都不得动既有标记，也不得把非法值写进去
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', Number.NaN)
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', Number.POSITIVE_INFINITY)
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-pro', Number.NaN)
+      const list = await pool.listAccounts('buddy')
+      const a1 = list.find(a => a.id === 'buddy-001')!
+      expect(a1.modelRateLimits?.['deepseek-v4-flash']).toBe(real)
+      expect(a1.modelRateLimits?.['deepseek-v4-pro']).toBeUndefined()
+    })
+
+    it('现值是非有限的坏数据时，新值应当把它修掉', async () => {
+      await pool.addAccount(makeMockAccount({ modelRateLimits: { 'deepseek-v4-flash': Number.NaN } }))
+      const t = Date.now() + 3600_000
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', t)
+      const list = await pool.listAccounts('buddy')
+      expect(list[0].modelRateLimits?.['deepseek-v4-flash']).toBe(t)
+    })
+
+    it('不影响别的模型与别的账号', async () => {
+      await pool.addAccount(makeMockAccount())
+      await pool.addAccount(makeMockAccount({ id: 'buddy-002' }))
+      const t = Date.now() + 19 * 3600_000
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', t)
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-pro', t + 1000)
+      await pool.updateModelRateLimit('buddy-002', 'deepseek-v4-flash', t + 2000)
+      await pool.updateModelRateLimit('buddy-001', 'deepseek-v4-flash', Date.now() + 1000)
+      const list = await pool.listAccounts('buddy')
+      const a1 = list.find(a => a.id === 'buddy-001')!
+      const a2 = list.find(a => a.id === 'buddy-002')!
+      expect(a1.modelRateLimits?.['deepseek-v4-pro']).toBe(t + 1000)
+      expect(a1.modelRateLimits?.['deepseek-v4-flash']).toBe(t)
+      expect(a2.modelRateLimits?.['deepseek-v4-flash']).toBe(t + 2000)
+    })
+  })
+
   it('should sweep expired rate limits', async () => {
     await pool.addAccount(makeMockAccount({
       modelRateLimits: { 'deepseek-v4-flash': Date.now() - 1000, 'deepseek-v4-pro': Date.now() + 3600000 },

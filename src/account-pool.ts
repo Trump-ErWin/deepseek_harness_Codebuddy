@@ -1005,6 +1005,20 @@ export class AccountPool {
    * settings scope 的 get() 返回的是服务内部快照，可能滞后于磁盘；
    * 但 replace() 是整体替换，因此这里每次都在最新快照上合并，
    * 避免"写 A 的限流 → 读旧快照 → 写 B 的限流"把 A 的记录抹掉。
+   *
+   * ⚠️ **只接受比现值更大的解禁时刻**（与
+   * {@link updateTraeCheckinDeviceGeneration} 同一约定）：
+   *
+   * 各 provider 的限流解析都有「解析不出时长 → 退回一个兜底值」的末端，而那个兜底
+   * 通常是**短**的（cline 是 1 小时，而真实等待可能是 19 小时 39 分）。于是同一个
+   * (账号, 模型) 上先写入的**真值**会被后写入的**兜底**覆盖 ——
+   * cline「倒计时结束了还是失败，显示又 60 分钟」正是这样无限循环的。
+   *
+   * 并发场景最容易踩：同一 provider 的两个请求，一个拿到可解析的报文（写 19h39m），
+   * 另一个拿到被 CDN 包成 HTML 的 429（写 1h），**后写的赢**。
+   *
+   * ⇒ 这里取「更长者」。真值被丢掉的风险不用担心：所有调用方写入的都是**未来**
+   * 时刻，而过期的标记由 {@link sweepExpiredRateLimits} 清理。
    */
   async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number): Promise<void> {
     const accounts = this.readAccounts()
@@ -1015,8 +1029,28 @@ export class AccountPool {
       )
       return
     }
+    // ⚠️ 无效时刻（NaN / ±Infinity）必须**直接拒绝**，不能当「很短的解禁时刻」处理：
+    // 写进去之后所有比较都恒为 false（该模型被永久限流、sweep 也清不掉），
+    // 而 `new Date(NaN).toISOString()` 还会让下面那条日志直接抛 `Invalid time value`。
+    if (!Number.isFinite(resetAtMs)) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] updateModelRateLimit: 账号 ${accountId} 模型 ${modelId} 收到非有限的解禁时刻 `
+        + `${String(resetAtMs)}，已忽略（否则该模型会被永久限流）`,
+      )
+      return
+    }
+    const current = accounts[idx]!.modelRateLimits?.[modelId]
+    // ⚠️ 判据用 `>=`：相等时无需写盘（省一次 IO），语义上也无差别。
+    // 现值非有限（旧数据损坏）时**允许**被新值修掉 —— 那正是写它的机会。
+    if (Number.isFinite(current) && current! >= resetAtMs) {
+      this.ctx.logger?.info?.(
+        `[jet-hub] updateModelRateLimit: 账号 ${accountId} 模型 ${modelId} 已有更长的限流标记 `
+        + `(${new Date(current!).toISOString()} ≥ ${new Date(resetAtMs).toISOString()})，本次不覆盖`,
+      )
+      return
+    }
     const next = [...accounts]
-    const entry = { ...next[idx] }
+    const entry = { ...next[idx]! }
     entry.modelRateLimits = { ...entry.modelRateLimits, [modelId]: resetAtMs }
     next[idx] = entry
     await this.writeAccounts(next)

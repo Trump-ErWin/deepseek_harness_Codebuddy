@@ -13,8 +13,11 @@
  * `recommended-models` 下发 —— 这正是「只调 `/models` 会看不到任何免费模型」
  * 的原因，也是本模块必须同时打两个端点的理由。
  *
- * ⚠️ 内嵌兜底表与远端 `free` 数组**不完全重合**：`stealth/space-bunny-alpha` 与
- * `cline-free/*` 只在远端 `free` 里，反之 `/models` 有大量兜底表没有的付费模型。
+ * ⚠️ **内嵌目录**（`BUILTIN_MODEL_CATALOG`）与远端 `free` 数组**不完全重合**：
+ * `stealth/space-bunny-alpha` 与 `cline-free/*` 不在内嵌目录里、只由远端 `free` 下发，
+ * 反之 `/models` 有大量内嵌目录没有的付费模型。
+ * ⚠️ 「内嵌目录」与 `cline-product.ts` 的**兜底表**（`CLINE_FALLBACK_MODELS`）是两个
+ * 东西：后者**已经含有** `cline-free/*` 条目，说的只是它不来自内嵌目录。
  * 故正确做法是**合并**，而不是「远端失败就用兜底」的简单回退。
  * （2026-10-03 复测：`free` 只剩 4 条，`cline-free/gemini-3.8-flash` 已被上游下线。）
  *

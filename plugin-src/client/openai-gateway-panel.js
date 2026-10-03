@@ -215,7 +215,12 @@ export function gatewayEffortRow(model) {
     fill: Array.isArray(reasoning.openai_efforts) ? reasoning.openai_efforts.join(', ') : '',
     // 「真实 id 与应填的规范名不完全一致」= 客户端侧的显示名会与 DSH 界面不同，
     // 这类行才是用户真正会看错的，值得在 UI 上标出来。
-    lossy: efforts.some((effort) => effort.canonical !== undefined && effort.canonical !== effort.id),
+    //
+    // ⚠️ **`canonical === undefined`（上游给了个没登记的私有 id，如 `turbo`）也算**：
+    // 那种档位**任何规范名都表达不出来**，`fill` 列会比 `declared` 列少一档。
+    // 原判据只认「canonical 与 id 不同」，于是这种行恰恰**不标徽章** ——
+    // 用户看到一档填不出来的东西，却没有任何解释。
+    lossy: efforts.some((effort) => effort.canonical === undefined || effort.canonical !== effort.id),
   };
 }
 
@@ -287,7 +292,12 @@ export function gatewayEffortsHint(models) {
   return `当前已开启的 ${enabled} 个模型里，有 ${rows.length} 个可选思考档位`
     + `${lossy > 0 ? `，其中 ${lossy} 个的档位名与 OpenAI 客户端不同（见下方标「需对照」的行）` : ''}。`
     + '「客户端该填」那一列可以直接抄进 CC Switch / Codex 的思考等级设置，与模型真实档位一一对应。'
-    + '填这 8 个以外的写法也不会报错：网关会按强度就近落到模型的某一档（会记日志）。'
+    // ⚠️ 别写成「填什么都不会报错」：强度序只登记了 12 个名字（8 个规范名 + 上游私有的
+    // off / light / on / extra_high），`turbo` 这类未登记的写法是**真会 400** 的
+    // （见 reasoning-ladder.ts 的 REASONING_EFFORT_RANK）。照实说，用户才不会去试一个
+    // 必然失败的写法；错误里本来就会列出该模型可用的档位。
+    + '这 8 个之外，上游私有的 off / light / on / extra_high 也能识别（按强度就近落到模型的某一档，会记日志）；'
+    + '再往外的写法（如 turbo）会被拒绝，错误里会列出该模型可用的档位。'
     + '在插件里关掉的模型不会出现在这张表里。';
 }
 

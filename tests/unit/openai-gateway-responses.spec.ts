@@ -152,6 +152,9 @@ describe('Responses API 请求转换', () => {
       ['previous_response_id', { model: 'qoder/qfmodel', input: 'hi', previous_response_id: 'resp_1' }],
       ['background', { model: 'qoder/qfmodel', input: 'hi', background: true }],
       ['text.format', { model: 'qoder/qfmodel', input: 'hi', text: { format: { type: 'json_schema' } } }],
+      // ⚠️ 漏写 `type` 的结构化输出请求：响应固定回 `text:{format:{type:'text'}}`，
+      // 静默放行等于骗客户端说「拿到的是纯文本」，用户会拿到不合规的 JSON 而不知情。
+      ['text.format 缺 type', { model: 'qoder/qfmodel', input: 'hi', text: { format: { name: 'x', schema: { type: 'object' } } } }],
       ['top_p', { model: 'qoder/qfmodel', input: 'hi', top_p: 0.5 }],
       ['item_reference', { model: 'qoder/qfmodel', input: [{ type: 'item_reference', id: 'msg_1' }] }],
       ['file_id 图片', { model: 'qoder/qfmodel', input: [{ type: 'message', role: 'user', content: [{ type: 'input_image', file_id: 'file-1' }] }] }],
@@ -264,6 +267,67 @@ describe('Responses API 请求转换', () => {
     expect(flatA).not.toBe(flatB)
   })
 
+  // ⚠️ 下面三条锁的是「工具名清洗口径必须三处一致」这个不变式。修复前摊平侧用
+  // `String(child.name ?? '')`（不 trim）、还原表 trim、历史回放两者都不管 —— 三套口径
+  // 两两不等，症状是模型调通了、客户端却收到一个自己没声明过的工具名。
+  it('★ 工具名带首尾空白时：摊平 / 还原表 / 历史回放三处必须逐字符一致', async () => {
+    const tools = [{
+      type: 'namespace', name: 'mcp__files__',
+      tools: [{ type: 'function', name: ' read ', parameters: {} }],
+    }]
+    const options = await toResponsesGenerateOptions({ model: 'qoder/qfmodel', input: 'hi', tools }, abort())
+    const flat = options.tools?.map(tool => tool.name)
+    // 发给上游的名字是 trim 后的（与客户端声明的语义一致）
+    expect(flat).toEqual(['mcp__files____read'])
+    // 还原表的键必须就是那个**实际发出去**的名字，否则响应侧永远配不上
+    expect([...responsesNamespaceToolMap({ tools }).keys()]).toEqual(flat)
+    // 历史回放也要换回同一个扁平名
+    const replay = await toResponsesGenerateOptions({
+      model: 'qoder/qfmodel',
+      input: [{ type: 'function_call', call_id: 'c1', name: ' read ', namespace: 'mcp__files__', arguments: '{}' }],
+    }, abort())
+    expect(replay.messages[0].content).toContainEqual(expect.objectContaining({
+      type: 'tool-call', name: flat![0],
+    }))
+  })
+
+  it('★ 子工具名为空时不得凭空造出 `ns____` 幽灵工具（还原表永远配不上它）', async () => {
+    const dropped: Array<{ type: string; name?: string }> = []
+    const options = await toResponsesGenerateOptions({
+      model: 'qoder/qfmodel',
+      input: 'hi',
+      tools: [{
+        type: 'namespace', name: 'mcp__files__',
+        tools: [{ type: 'function', name: '', parameters: {} }, { type: 'function', name: '  ', parameters: {} }],
+      }],
+    }, abort(), undefined, undefined, {}, tool => dropped.push(tool))
+    // 空名与纯空白名都表达不了工具 —— 丢弃，且**一个都不能发出去**
+    expect(options.tools).toEqual([])
+    expect(dropped).toEqual([{ type: 'function', name: undefined }, { type: 'function', name: undefined }])
+    expect(JSON.stringify(options.messages)).not.toContain('mcp__files____')
+  })
+
+  it('★ 顶层工具与摊平名撞车时先来先到，且被丢弃的那个不得进还原表（否则静默误路由）', async () => {
+    const tools = [
+      // 顶层普通工具**故意**取 namespace 摊平后会得到的那个名字
+      { type: 'function', name: 'mcp__files____read', parameters: {} },
+      { type: 'namespace', name: 'mcp__files__', tools: [{ type: 'function', name: 'read', parameters: {} }] },
+    ]
+    const options = await toResponsesGenerateOptions({ model: 'qoder/qfmodel', input: 'hi', tools }, abort())
+    expect(options.tools?.map(tool => tool.name)).toEqual(['mcp__files____read'])
+    // ⚠️ 若还原表仍把 `mcp__files____read` 映射回 `{namespace:'mcp__files__'}`，
+    // 上游对**那个顶层工具**的调用就会被报成 namespace 里的另一个工具。
+    expect(responsesNamespaceToolMap({ tools }).has('mcp__files____read')).toBe(false)
+  })
+
+  it('★ 反向验证：还原表对「请求里没发出去的工具」一律为空', async () => {
+    // 只声明 namespace 里的非 function 子工具 —— 全被丢弃，还原表必须为空
+    const tools = [{ type: 'namespace', name: 'mcp__files__', tools: [{ type: 'custom', name: 'apply_patch' }] }]
+    const options = await toResponsesGenerateOptions({ model: 'qoder/qfmodel', input: 'hi', tools }, abort())
+    expect(options.tools).toEqual([])
+    expect(responsesNamespaceToolMap({ tools }).size).toBe(0)
+  })
+
   it('历史里带 namespace 的 function_call 必须换回扁平名（否则上游认为调了个没见过的工具）', async () => {
     const options = await toResponsesGenerateOptions({
       model: 'qoder/qfmodel',
@@ -331,6 +395,45 @@ describe('Responses API 输出（非流式）', () => {
     ]), 'resp_3', 'qoder/qfmodel', request)
     const output = result.output as Array<Record<string, any>>
     expect(output[0].content[0].text).toBe('重复')
+  })
+
+  // ⚠️ 上面那条只锁了**非流式**。流式侧的 done 事件（output_text.done /
+  // content_part.done / output_item.done）走的是另一条组装路径，而「正文以 block-end
+  // 为权威」正是本 PR 声明的两处有意差异之一 —— 少了这条，差一个实现就会静默地
+  // 把截断后的文本又放回去（Chat 端点确实那样，但那是本 PR 之外的行为）。
+  it('★ 流式侧同样以 block-end 为权威（done 事件与 completed 都不能放回未截断的文本）', async () => {
+    const events = await readSse(chunks([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: '重复重复重复' },
+      { type: 'block-end', index: 0, block: { type: 'text', text: '重复' } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]))
+    const textDone = events.find(event => event.event === 'response.output_text.done')
+    expect(textDone?.data.text).toBe('重复')
+    const itemDone = events.find(event => event.event === 'response.output_item.done')
+    expect(itemDone?.data.item.content[0].text).toBe('重复')
+    const completed = events.find(event => event.event === 'response.completed')
+    expect(completed?.data.response.output[0].content[0].text).toBe('重复')
+  })
+
+  // ⚠️ 锁住「首帧 call_id 为空也能被 block-end 修正」这一自愈路径（见 responses.ts
+  // 里 tool-call-delta 分支的注释）：added 事件带的是空串，但 done 与最终 output
+  // 必须是真实 id —— 官方 SDK 以这两者为准。
+  it('首帧 call_id 为空时：output_item.done 与最终 output 必须被 block-end 修正为真实 id', async () => {
+    const events = await readSse(chunks([
+      { type: 'tool-call-delta', index: 0, id: '' as never, name: 'read', argumentsDelta: '{"pa' },
+      { type: 'tool-call-delta', index: 0, id: '' as never, name: undefined, argumentsDelta: 'th":"a"}' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-real' as never, name: 'read', arguments: '{"path":"a"}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]))
+    const added = events.find(event => event.event === 'response.output_item.added')
+    // 首帧没有 id ⇒ added 只能带空串（该事件发出去就改不了，见实现里的注释）
+    expect(added?.data.item.call_id).toBe('')
+    const done = events.find(event => event.event === 'response.output_item.done')
+    expect(done?.data.item.call_id).toBe('call-real')
+    expect(done?.data.item.arguments).toBe('{"path":"a"}')
+    const completed = events.find(event => event.event === 'response.completed')
+    expect(completed?.data.response.output[0].call_id).toBe('call-real')
   })
 
   it('工具调用：function_call 项带 call_id / name / arguments（block-end 覆盖参数）', async () => {
