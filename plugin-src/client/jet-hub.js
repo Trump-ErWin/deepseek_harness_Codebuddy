@@ -25,6 +25,7 @@ import {
   allModelsDisabled,
   disablingLeavesNoEnabledAccount,
 } from './account-model-link.js';
+import { buildCreateAccountPayload, newAccountAsksChannel } from './new-account.js';
 import { bulkButtonState } from './model-bulk.js';
 import {
   copyToClipboard,
@@ -273,7 +274,11 @@ const PROVIDERS = Object.freeze([
   { id: 'raccoon', label: 'Raccoon (商汤)', icon: RACCOON_ICON, logoClass: 'raccoon' },
   { id: 'minimax', label: 'MiniMax Code', icon: MINIMAX_ICON, logoClass: 'minimax' },
   /**
-   * ZCode（智谱）—— 第十个 provider。
+   * ZCode（智谱）。
+   *
+   * ⚠️ 注释**刻意不写「第几个 provider」**（Gitee issue IKJLK3 F2）：这种序号型
+   *   注释在增删 provider 时必然失效 —— 原来这里写「第十个」、下面 opencode 那条
+   *   写「第 12 个」，两者都已与实际顺序对不上，却一直没人发现。改用不含序号的表述。
    *
    * ⚠️ 用『ZCode (智谱)』，与 `ZCODE.displayName` 保持一致；长度也刻意
    * 控制在不会触发换行/省略号的范围内（见上面 workbuddy 那条的算式）。
@@ -281,16 +286,22 @@ const PROVIDERS = Object.freeze([
    * ⚠️ 它走**标准两步式登录**（与 codearts / qoder / trae 同型）：
    * 后端立刻返回官方授权 URL（`https://bigmodel.cn/login?appId=zcode…`），
    * 前端弹窗、用户在浏览器授权，后端轮询到 `status: "ready"` 后拿到 token。
-   * 故它**不需要任何特殊分支** —— 与其余 provider 共用同一条
+   * 唯一的例外是**登录渠道要先问一句**（`bigmodel` / `zai`，见 `new-account.js`）——
+   * 这两个渠道的授权页与凭据落点都不同，必须由用户选。
+   * 除那一次选择外，它**不需要任何特殊分支** —— 与其余 provider 共用同一条
    * 「弹窗 + 登录轮询」路径。
    */
   { id: 'zcode', label: 'ZCode (智谱)', icon: ZCODE_ICON, logoClass: 'zcode' },
   /**
-   * OpenCode（第 12 个 provider）。
+   * OpenCode。
    *
    * ⚠️ label 必须与 `OPENCODE.displayName` **逐字一致**（'OpenCode'）：
    * rail 宽度算式与 `tests/unit/opencode-client-panel.spec.ts` 的跨文件
    * 一致性断言都依赖它（raccoon 那条同理，改一处会连锁失败）。
+   *
+   * ⚠️ 它是**唯一不跳浏览器**的 provider：登录走自绘的 API key 弹窗
+   * （`OpencodeKeyModal`），故 `createAccount` 在最前面就改道、**不会**走到
+   * 下面的「弹窗 + 轮询」路径 —— 也因此它**不**经过 zCode 的渠道选择弹窗。
    */
   { id: 'opencode', label: 'OpenCode', icon: OPENCODE_ICON, logoClass: 'opencode' },
 ]);
@@ -2143,10 +2154,19 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   const createAccount = async () => {
-    // ⚠ 已有一轮登录在跑时直接忽略（真实缺陷）：`creating` 在返回 loginUrl 后
+    // ⚠ 已有一轮登录在跑时**必须拦住**（真实缺陷）：`creating` 在返回 loginUrl 后
     // 会被 `finally` 无条件释放，按钮随即恢复可点，再点一次会叠加第二个轮询 +
     // 宿主再插一条占位账号。以轮询句柄作为重入闸门，比 UI 的 disabled 更可靠。
-    if (pollRef.current !== 0) return;
+    //
+    // ⚠⚠ 但拦住之后**不能静默 return**（Gitee issue IKJLK3 B）：弹窗的确定按钮是
+    //   「先关弹窗、再调 createAccount」，早退时用户看到的是「点了没反应」，
+    //   分不清「没反应」与「正在处理」—— 这正是 issue 里那条
+    //   「新建账号弹窗卡死、只能重启 dsh」报障的观感来源。
+    //   本面板没有独立的 create 提示位，复用 probeNotice 区块渲染。
+    if (pollRef.current !== 0) {
+      setProbeNotice({ tone: 'warn', text: '上一次登录仍在进行中，请先完成或等待它结束。', details: [] })
+      return
+    }
     // ⚠️ opencode 的登录**不跳浏览器**，而是开自绘弹窗粘贴 API key；
     // 走 `setKeyModal` 而不是下面的 `account.create` 流程。
     // 弹窗里另有两个入口：粘贴 key（submitOpencodeKey）与添加匿名通道（submitAnonymous）。
@@ -2159,14 +2179,17 @@ function ProviderPanel({ provider, rpcCall }) {
     let accountId = '';
     let loginUrl = '';
     try {
-      console.log('[jet-hub] account.create request, provider =', provider);
-      // ZCode 带渠道（`bigmodel` 国内 / `zai` 国际）；其余 provider 不带（后端逐字节不变）。
-      const res = await rpcCall('account.create', provider === 'zcode'
-        ? { provider, zcodeProvider }
-        : { provider });
-      console.log('[jet-hub] account.create response =', res);
+      // ⚠⚠ **不许打印完整响应**（信息泄露，Gitee issue IKJLK3 D）：
+      //   `res` 含 `loginUrl`，而它由服务端的 `fetchAuthState` 生成、**携带 OAuth state**。
+      //   用户在 DevTools 里截图 / 复制日志求助时会把它一起外泄，state 在登录窗口内
+      //   可被重放。⇒ 这里只记 provider 与本地生成的 `accountId`（不是凭据）。
+      //
+      // ⚠ `zcodeProvider` 只在 zcode 时下发（`buildCreateAccountPayload` 内部分支），
+      //   其余 provider 的载荷与接入渠道弹窗前**逐字节相同**。
+      const res = await rpcCall('account.create', buildCreateAccountPayload(provider, zcodeProvider));
       accountId = res.accountId;
       loginUrl = res.loginUrl;
+      console.log('[jet-hub] account.create ok, provider =', provider, ', accountId =', accountId);
       // ⚠ **`reused` 分支必判**（与 `zcode-card.js` 一致）：本机已有可用凭据时
       // 后端**不新建条目、不返回 loginUrl**（用户报障「点了添加就多一个」的修复），
       // 返回的是 `{reused:true, loginUrl:''}`。若只看 `loginUrl` 为空就报
@@ -2576,14 +2599,35 @@ function ProviderPanel({ provider, rpcCall }) {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
           title: '通过浏览器登录一个新的账号并加入账号池。',
-          onClick: () => setPendingLogin(false),
+          // ⚠⚠ **必须按 provider 分支**（真实缺陷，Gitee issue IKJLK3 A1/A2/A3）：
+          //   这个按钮在**每一个** provider 的面板里都有，而下面的弹窗是
+          //   **zCode 专用**的（登录渠道下拉）。原先无条件 `setPendingLogin(false)`，
+          //   于是「在 CodeArts 面板点新建账号」弹出的也是「添加 ZCode 账号」，
+          //   里面的下拉还不会下发（载荷里没有 `zcodeProvider`），
+          //   opencode 则要用户先过一遍 ZCode 弹窗才看到自己的 API key 表单。
+          //   ⇒ 判据收在 `newAccountAsksChannel()`：只有 zcode 先问渠道，
+          //   其余 provider 点按钮即发起登录。**别把它改回无条件开弹窗。**
+          onClick: () => {
+            if (newAccountAsksChannel(provider)) setPendingLogin(false)
+            else void createAccount()
+          },
           disabled: creating,
         }, creating ? '正在登录…' : '+ 新建账号'),
         // ★ 渠道选择对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
         //
         // ⚠ 两个入口（这里与 `zcode-card.js`）各有一份：它们是**不同的组件**、
         //   不同的状态源，抽公共组件会牵动 PR #38 已打通的 props 通路，收益不抵风险。
-        pendingLogin === undefined ? null : React.createElement(
+        //   （那个组件本身就是 zCode 专用面板，弹窗内容天然正确，故**无需**分支。）
+        //
+        // ⚠ `newAccountAsksChannel(provider)` 这道是**防御性**的：按钮已经分支过，
+        //   正常路径下非 zcode 永远不会把 `pendingLogin` 置为「开」。
+        //   但状态是活的（用户切 provider 时本面板会重新挂载，理论上仍可能
+        //   残留一帧），漏掉它就会退回 issue 里那个「非 zcode 弹出 ZCode 窗」的形态。
+        //
+        // ⚠ 类名 `dim-jh-zcDialog*` 名字里带 zc，但它**已是通用弹窗样式**（两个
+        //   入口共用，见 `jet-hub-styles.js`），**不是** zCode 专用标记。
+        //   曾想改名，但两个文件 + 样式表一起动、收益仅是可读性，故保留名字。
+        pendingLogin === undefined || !newAccountAsksChannel(provider) ? null : React.createElement(
           'div',
             {
               className: 'dim-jh-zcDialogMask',

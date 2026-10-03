@@ -26,7 +26,14 @@ const styles = readFileSync(resolve(dir, '../../plugin-src/client/jet-hub-styles
 
 describe('★ 渠道选择在「新建账号弹窗」里，不在按钮旁', () => {
   it('★ 两个入口都改为「点按钮 → 开弹窗」（不再直接调 createAccount）', () => {
-    expect(panel, 'jet-hub.js 按钮应开弹窗').toContain('onClick: () => setPendingLogin(false)')
+    // ⚠ 2026-10-03 之后 jet-hub.js 侧改成了**按 provider 分支**（Gitee issue IKJLK3 A1/A2/A3）：
+    //   「+ 新建账号」按钮存在于**每一个** provider 的面板里，而弹窗是 zCode 专用的。
+    //   无条件开弹窗 ⇒ 在 CodeArts 面板也弹出「添加 ZCode 账号」（A1），
+    //   opencode 则要点完 ZCode 弹窗才看到自己的 API key 表单（A3）。
+    //   ⇒ 这里守的**不变式**收敛成「zCode 面板仍必须先弹窗选渠道」，
+    //     判据本身由 `new-account.js` 的 `newAccountAsksChannel` 承担。
+    expect(panel, 'jet-hub.js 的 zcode 分支应开弹窗')
+      .toMatch(/if \(newAccountAsksChannel\(provider\)\) setPendingLogin\(false\)/)
     expect(card, 'zcode-card.js 按钮应开弹窗').toContain("btn('create', '添加账号', '登录中…', () => setPendingLogin(false))")
   })
 
@@ -56,18 +63,26 @@ describe('★ 渠道选择在「新建账号弹窗」里，不在按钮旁', () 
 
   it('★ 渠道仍随 account.create 发出（搬位置不改数据通路）', () => {
     // ⚠ 这是 PR #38 已打通的通路，本次只改 UI 位置，**不得**弄丢
-    expect(panel).toMatch(/\{ provider, zcodeProvider/)
+    // ⚠ 2026-10-03：jet-hub.js 侧的载荷构造搬进了 `new-account.js` 的
+    //   `buildCreateAccountPayload`（同一份模块被 `tests/unit/new-account-dialog.spec.ts`
+    //   真跑覆盖）。故这里断言**调用点**传了渠道，而不是文件里有那个字面量。
+    expect(panel).toMatch(/buildCreateAccountPayload\(provider, zcodeProvider\)/)
     // ⚠ 断言的是 `account.create` 的**载荷里真的带它**，不是「文件里出现过这个词」——
     //   后者会在载荷被删、而弹窗里还留着同名 state 时误判为通过（反向验证抓到过）。
+    expect(panel).toMatch(/rpcCall\('account\.create',[\s\S]{0,200}?zcodeProvider/)
     expect(card).toMatch(/await call\('account\.create',[\s\S]{0,200}?zcodeProvider/)
   })
 
   it('★ ★ 弹窗是**条件渲染**的（不是常驻），且条件是 pendingLogin', () => {
     // ⚠ 只查「有没有 zcDialogMask」不够：把条件写成 `false` 后文本仍在，
     //   弹窗却永远不渲染（反向验证的变异 2 就是这样溜过去的）。
+    // ⚠ 2026-10-03：jet-hub.js 侧的条件多了一条 `|| !newAccountAsksChannel(provider)`
+    //   （非 zcode 面板即使状态被置开也不渲染，见 IKJLK3 A1）。
+    //   这里守的不变式是「**仍然挂在 pendingLogin 上**」——把前半句匹配成
+    //   `pendingLogin === undefined ... ? null :` 即足够，不必贴死整个表达式。
     for (const [name, src] of [['jet-hub.js', panel], ['zcode-card.js', card]] as const) {
       expect(src, `${name} 弹窗未挂在 pendingLogin 条件上`)
-        .toMatch(/pendingLogin === undefined \? null : (React\.createElement|h)\(/)
+        .toMatch(/pendingLogin === undefined[\s\S]{0,80}?\? null : (React\.createElement|h)\(/)
     }
   })
 
