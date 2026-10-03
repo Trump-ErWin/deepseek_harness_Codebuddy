@@ -181,7 +181,12 @@ export function creditGroupsOf(accounts) {
     // 单位从**包**上取（ZCode 是 token，其余是积分）；一个包都没有时按空串走
     // `normalizeUnit` 的默认（积分）——与账号卡片的口径一致。
     // ⚠️ 取到原值后**必须**归一：同义异拼（credit / credits / ''）不能各成一组。
-    const unit = normalizeUnit(firstUnitOf(balance.packages) ?? '');
+    // ⚠️ 但**配额单位（{@link QUOTA_UNIT}）不参与归一**：`normalizeUnit` 只认
+    // `token` 一个特例，把 `'%'` 也塞进去会得到 `'credit'`，于是
+    // `unit === QUOTA_UNIT` 永远为假 —— `quotaLines` / `quotaRemainings` 两个键
+    // 再也挂不上，色调也退回「均值 > 0 即绿」的老缺陷（真实回归，2026-10-03 合并时踩到）。
+    const rawUnit = firstUnitOf(balance.packages) ?? '';
+    const unit = rawUnit === QUOTA_UNIT ? QUOTA_UNIT : normalizeUnit(rawUnit);
     const group = byUnit.get(unit) ?? { unit, label: unitLabel(unit), total: 0, accountCount: 0 };
     group.total += balance.total;
     group.accountCount += 1;
