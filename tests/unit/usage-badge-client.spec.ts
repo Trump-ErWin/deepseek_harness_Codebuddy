@@ -44,14 +44,109 @@ describe('用量徽标：槽位接线', () => {
   it('⚠️⚠️ 徽标宽度必须收敛（否则挤压右侧模型选择器）', () => {
     // 真机报障 2026-10-02：徽标 flex:none + max-width:280px 把模型选择器
     // 压到只剩几十 px，**图标被挤没**（用户要放大到很大才看得见）。
-    // 两级收敛（用户定 1+2）：基础 150px，窄屏（<720px）只剩状态点。
+    // 两级收敛（用户定 1+2）：基础宽度有上限，窄屏（<720px）只剩状态点。
     const styles = read('plugin-src/client/jet-hub-styles.js')
     const btn = /\.dim-jh-badgeBtn \{[^}]*max-width:\s*(\d+)px/.exec(styles)
     expect(btn, '应能解析出徽标按钮的 max-width').not.toBeNull()
-    expect(Number(btn![1]), '徽标基础宽度应 ≤ 160px（给模型选择器留 ≥130px）')
-      .toBeLessThanOrEqual(160)
+    // ⚠️ 两个维度都要满足，缺一不可：
+    // ① **内容自适应**：.dim-jh-badgeBtn 不设 width，由文字撑开
+    //    （短内容就短：Cline • 5积分 仅 93px）；
+    // ② **上限兜底**：max-width 必须 ≥ 实测最宽需求，且 ≤ 会挤坏模型选择器的值。
+    //
+    // 实测（Edge，宿主 UI 字体栈，dsf 1 与 1.5 都量过，差异 <0.4px）：
+    // 13 个渠道展示名 × 10 种现实读数（含 123456.78积分 / 9499.84积分 /
+    // 94.54MToken / 0积分）共 130 组，最宽需求 **209.34px**
+    //（WorkBuddy (国际版) • 123456.78积分）。
+    //
+    // ⚠️ 下界取 210（刚够最宽需求），上界取 240 —— 实测把上限放到「无上限」时，
+    // 极窄 composer（220px）下胶囊会**溢出容器 8.3px**，那正是 2026-10-02
+    //「模型选择器图标被挤没」的形态。故既有上限、又不能太小。
+    expect(Number(btn![1]), '徽标上限应能装下最长的「渠道名 • 读数」（实测需求 209.34px）')
+      .toBeGreaterThanOrEqual(210)
+    expect(Number(btn![1]), '徽标上限不得超过 240px（否则窄容器下会溢出、挤压模型选择器）')
+      .toBeLessThanOrEqual(240)
+    // ⚠️ 反向断言：不得写成固定 width（那会让短内容也占满，
+    // 既浪费横向空间，又让「内容自适应」失效）。
+    // 只取该规则体本身来判，避免正则跨规则误伤。
+    const btnRule = /\.dim-jh-badgeBtn \{([^}]*)\}/.exec(styles)
+    expect(btnRule, '应能取到 .dim-jh-badgeBtn 的规则体').not.toBeNull()
+    expect(btnRule![1], '胶囊不得设固定宽度（会破坏内容自适应）')
+      .not.toMatch(/(^|[;\s])width:/)
     expect(styles, '窄屏应收敛为只剩状态点').toMatch(/@media \(max-width: 720px\)/)
     expect(styles, '需 min-width:0 才能真正收缩/省略').toMatch(/min-width: 0/)
+  })
+
+  it('⚠️⚠️ 折叠态必须渲染成**多个** span（否则数字仍会被截掉）', () => {
+    // 真实报障 2026-10-03：胶囊显示成「LobsterAI (有道) · 合计 …」，数字被截掉。
+    // 根因是**结构**而非宽度：整句塞进一个 overflow:hidden 的 span，省略号
+    // 从右往左吃，吃掉的正是用户唯一想看的数字。
+    const styles = read('plugin-src/client/jet-hub-styles.js')
+    // ⚠️ 反面断言一律用 codeOf（去注释）：本仓库注释里大量引用被禁止的写法，
+    // 直接对全文断言会把注释本身判成违规 —— 本次就真踩了（我把「不得复用
+    // .dim-jh-badgeValue」写进了注释，于是 not.toContain 把注释当成了违规）。
+    const badge = codeOf(read('plugin-src/client/usage-badge.js'))
+    // 三段各自独立成 span
+    expect(badge).toContain("className: 'dim-jh-badgeText'")
+    expect(badge).toContain("className: 'dim-jh-badgeName'")
+    expect(badge).toContain("className: 'dim-jh-badgeSep'")
+    // ⚠️ 类名是 Reading 而**不是** Value：那个名字已被弹窗里的读数占用，
+    // 那条规则带 font-weight:600 且排在样式表更后面 —— 同名会让胶囊里的数字被静默
+    // 加粗、并拿到 flex:none 而**无法收缩**（正是本次报障的形态，而且很难看出来）。
+    // ⚠️ 断言必须**限定在折叠态那一块**内：弹窗里本来就用 .dim-jh-badgeValue
+    //（那是它的正当用途），对整个文件断言 not.toContain 会误伤。
+    const collapsedAt = badge.indexOf('const collapsed = React.createElement')
+    const collapsedEnd = badge.indexOf('return React.createElement(\'div\'', collapsedAt)
+    expect(collapsedAt, '应有折叠态 collapsed 的构造').toBeGreaterThan(-1)
+    expect(collapsedEnd, '应能取到折叠态构造的结尾').toBeGreaterThan(collapsedAt)
+    const collapsedBlock = badge.slice(collapsedAt, collapsedEnd)
+    expect(collapsedBlock, '折叠态读数不得复用弹窗的 .dim-jh-badgeValue 类名')
+      .not.toContain('dim-jh-badgeValue')
+    expect(collapsedBlock).toContain("className: 'dim-jh-badgeReading'")
+    // ⚠️ 反向断言：整句不能再被当作**单个文本子节点**塞进那几个 span。
+    // （view.text 仍用于 title / aria-label，故只禁止它以「唯一子节点」的形态出现。）
+    expect(badge, '整句不应再作为唯一子节点直接渲染')
+      .not.toMatch(/className: 'dim-jh-badgeText' \}, view\.text\)/)
+    // 名字进 name、读数进 reading（不是反的）
+    expect(badge).toContain('}, view.name)')
+    expect(badge).toContain('}, view.reading)')
+    expect(badge, '读数不能渲染进名字那个 span（会显示成「200积分 • WorkBuddy」）')
+      .not.toMatch(/dim-jh-badgeName' \}, view\.reading\)/)
+    // 让位顺序由 flex-shrink 表达：detail(999) > name(99)，而**读数不参与收缩**。
+    const shrink = (cls: string) => {
+      const rule = new RegExp('\\.' + cls + ' \\{[^}]*flex:\\s*0\\s+(\\d+)\\s+auto').exec(styles)
+      expect(rule, '应能解析 .' + cls + ' 的 flex-shrink').not.toBeNull()
+      return Number(rule![1])
+    }
+    expect(shrink('dim-jh-badgeDetail'), '包名最先让位').toBeGreaterThan(shrink('dim-jh-badgeName'))
+    // ⚠️⚠️ 读数必须是 flex: none（**完全不收缩**）—— 这是本缺陷的第二个成因，
+    // 而且比第一个隐蔽得多：哪怕只分到 0.77px 的收缩，text-overflow: ellipsis
+    // 也会命中（触发条件是 scrollWidth > clientWidth，亚像素级就够），
+    // 于是最后一个字被换成「…」，视觉上和整段被截一样严重。
+    // ⚠️ 而且它**用 clientWidth 量不出来**（取整：53.97 报成 54，判为未截断）——
+    // 我第一版就写成 flex: 0 1 auto 并用 clientWidth 断言「读数完整」，
+    // 用例全绿而截图里明写着「347.87积…」。故这里锁死 flex: none。
+    expect(styles, '读数不得参与收缩（亚像素收缩也会触发省略号）')
+      .toMatch(/\.dim-jh-badgeReading \{[^}]*flex:\s*none/)
+    expect(styles, '读数不得带 text-overflow: ellipsis')
+      .not.toMatch(/\.dim-jh-badgeReading \{[^}]*text-overflow/)
+    // 分隔符不参与收缩（否则「•」会先被挤掉）
+    expect(styles).toMatch(/\.dim-jh-badgeSep \{[^}]*flex:\s*none/)
+    // ⚠️ 间距必须用 margin：flex 容器把 span 之间只含空白的文本节点渲染成零宽。
+    expect(styles).toMatch(/\.dim-jh-badgeSep \{[^}]*margin:\s*0 3px/)
+  })
+
+  it('⚠️⚠️ 窄屏「只留状态点」的媒体查询必须排在 .dim-jh-badgeText 之后', () => {
+    // 两者特异性相同（都是单个类），胜负由**源顺序**决定。媒体查询一旦被排到
+    // 「.dim-jh-badgeText { display: flex }」之前，窄屏下 display:none 会被
+    // 后面的 display:flex 覆盖 —— 文字重新出现并挤压模型选择器（静默回归，
+    // 因为在宽窗口下看不出任何异常）。
+    const styles = read('plugin-src/client/jet-hub-styles.js')
+    const textRuleAt = styles.indexOf('.dim-jh-badgeText { display: flex')
+    const mediaAt = styles.indexOf('@media (max-width: 720px) { .dim-jh-badgeText')
+    expect(textRuleAt, '应有 .dim-jh-badgeText { display: flex ... }').toBeGreaterThan(-1)
+    expect(mediaAt, '应有隐藏 .dim-jh-badgeText 的窄屏媒体查询').toBeGreaterThan(-1)
+    expect(mediaAt, '媒体查询必须晚于 display:flex 规则，否则 display:none 会被覆盖')
+      .toBeGreaterThan(textRuleAt)
   })
 
   it('⚠️⚠️ 同时注入 sessions / remote / remote.session（真机事故根因）', () => {
@@ -399,8 +494,13 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
 
   it('偏好做成三段等分控件（不再单占一行写「显示偏好」）', () => {
     expect(styles).toMatch(/\.dim-jh-badgePrefBtn \{[^}]*flex: 1/)
-    // 解释性文案改到容器 title 上，信息不丢
-    expect(badge).toContain('显示偏好：决定徽标优先显示订阅还是积分')
+    // 解释性文案改到容器 title 上，信息不丢。
+    // ⚠️ 断言三档的**语义差别**而不只是「有一句解释」：2026-10-03 语义反转后
+    // 「自动」与「只看积分」都显示余额，差别在**是否回落**到订阅 —— title 里
+    // 不写清这点，用户会以为两档一样（旧 title 只写「优先显示订阅还是积分」）。
+    expect(badge).toContain('显示偏好：')
+    expect(badge, 'title 必须说明「自动」会回落').toContain('没有余额读数才显示订阅')
+    expect(badge, 'title 必须说明「只看积分」是强制的').toContain('强制只显示余额')
     expect(badge).not.toContain("'显示偏好'")
   })
 
@@ -461,6 +561,76 @@ describe('用量徽标：依赖与样式', () => {
   })
 })
 
+describe('用量徽标：号多了以后的两条整理（2026-10-03 用户要求）', () => {
+  const badge = read('plugin-src/client/usage-badge.js')
+  const styles = read('plugin-src/client/jet-hub-styles.js')
+
+  it('折叠阈值是 5，且「展开其余 N 个」由可见文案如实报数', () => {
+    expect(badge).toMatch(/export const CREDITS_COLLAPSED_LIMIT = 5;/)
+    expect(badge).toMatch(/展开其余 \$\{hidden\} 个账号/)
+    expect(badge).toMatch(/creditsExpanded \? '收起' : /)
+  })
+
+  it('折叠只收明细，**不隐藏结论**（合计在节标题、失败数在脚注，都在折叠之外）', () => {
+    // 合计那一句在折叠逻辑（ordered/hidden/shown）**之前**算好，与展开状态无关
+    const sumBlock = badge.slice(badge.indexOf('const sum = view.groups.map'), badge.indexOf('const { shown, hidden } = orderCreditRows('))
+    expect(sumBlock.length).toBeGreaterThan(0)
+    expect(sumBlock).toContain('view.groups.map')
+    expect(sumBlock).not.toContain('creditsExpanded')
+    // 脚注（失败账号数所在处）同样不看展开状态
+    expect(badge).toMatch(/function renderFoot\(\)/)
+    const foot = badge.slice(badge.indexOf('function renderFoot()'), badge.indexOf('function balanceLine'))
+    expect(foot.length).toBeGreaterThan(0)
+    expect(foot).not.toContain('creditsExpanded')
+  })
+
+  it('排序与折叠都走纯函数 orderCreditRows（组件里不再各写一份，逻辑由 badge-model.spec 锁）', () => {
+    expect(badge).toMatch(/import \{[\s\S]*?orderCreditRows[\s\S]*?\} from '\.\/badge-model\.js'/)
+    expect(badge).toMatch(/orderCreditRows\(accounts, \{/)
+    expect(badge).toMatch(/limit: CREDITS_COLLAPSED_LIMIT/)
+    // ⚠️ 组件里不得再自带排序实现：两份必然分叉（且组件的实现测不到，因为没装 react）
+    expect(codeOf(badge)).not.toMatch(/function balanceOrder\(/)
+  })
+
+  it('展开状态随渠道切换重置（否则会显得「折叠时灵时不灵」）', () => {
+    const effect = badge.slice(badge.indexOf('// 换渠道时先清空旧读数'), badge.indexOf('}, [provider]);'))
+    expect(effect).toContain('setCreditsExpanded(false)')
+  })
+
+  it('胶囊在合计不完整时挂一个警示角标，且它与读数同级 flex:none（不能被省略号吃掉）', () => {
+    expect(badge).toContain("className: 'dim-jh-badgeWarn'")
+    const warn = styles.slice(styles.indexOf('.dim-jh-badgeWarn'), styles.indexOf('.dim-jh-badgeWarn') + 200)
+    expect(warn).toMatch(/flex: none/)
+    // ⚠️ 顺序断言：警示必须在读数**之后**（先看数字，再看补语）。
+    // 用整份源码里的绝对位置比，不要切片 —— 对象字面量里 key 在 className 之前，
+    // 按 key 切会切错（第一版就这么写红过）。
+    const readingIdx = badge.indexOf("className: 'dim-jh-badgeReading'")
+    const warnIdx = badge.indexOf("className: 'dim-jh-badgeWarn'")
+    expect(readingIdx).toBeGreaterThan(0)
+    expect(warnIdx).toBeGreaterThan(readingIdx)
+  })
+
+  it('警示标记 aria-hidden（同一句话已进 aria-label，不重复念），解释走 title', () => {
+    const warn = badge.slice(badge.indexOf("key: 'incomplete'"), badge.indexOf("key: 'incomplete'") + 400)
+    expect(warn).toContain("'aria-hidden': 'true'")
+    expect(warn).toContain('title: view.incompleteNote')
+    expect(badge).toMatch(/aria-label': ariaLabel/)
+    expect(badge).toMatch(/view\.incompleteNote === '' \? '' : `（\$\{view\.incompleteNote\}）`/)
+  })
+
+  it('按钮 title 三段拼接：读数 → 不完整说明 → 失败原因（都要留，空串跳过）', () => {
+    const title = badge.slice(badge.indexOf('const title = [view.text'), badge.indexOf('const title = [view.text') + 200)
+    expect(title).toContain('view.text')
+    expect(title).toContain('view.incompleteNote')
+    expect(title).toContain('view.failureReason')
+    expect(title).toContain("filter((part) => part !== '')")
+  })
+
+  it('弹窗脚注复用同一句话，不另写一份措辞', () => {
+    expect(badge).toMatch(/parts\.push\(view\.incompleteNote === '' \? `\$\{view\.failedCount\} 个账号读取失败` : view\.incompleteNote\)/)
+  })
+})
+
 describe('格式化函数下沉（徽标与设置页共用同一口径）', () => {
   const hub = read('plugin-src/client/jet-hub.js')
 
@@ -482,5 +652,38 @@ describe('格式化函数下沉（徽标与设置页共用同一口径）', () =
 
   it('providerLabel 从 jet-hub.js 导出（渠道名的唯一来源）', () => {
     expect(hub).toContain('export function providerLabel(id)')
+  })
+})
+
+/**
+ * ⚠️ 单位归一的**两侧口径一致**（真实缺陷，2026-10-03）。
+ *
+ * 宿主把逐账号余额折算成订阅读数（`src/badge-subscription.ts` 的 `unitOf`），
+ * 客户端把逐账号余额分组求和（`credits-format.js` 的 `normalizeUnit`）。两处都
+ * 要把 `credit` / `credits` / 空串收敛掉，否则「套餐按一个单位、余额按另一个」
+ * 会在同一枚徽标里自相矛盾。
+ *
+ * ⚠️ 客户端代码不能 import 宿主代码（esbuild 的客户端 bundle 没有 Node 依赖），
+ * 故只能各写一份 —— 这个用例就是那份「必须逐字等价」的契约。
+ */
+describe('单位归一：宿主与客户端同一口径', () => {
+  /** 抽样要覆盖真实服务端下发过的拼法（逐包实测，见 probe-workbuddy-units.mjs）。 */
+  const SAMPLES = ['credit', 'credits', 'Credit', 'CREDITS', '', 'USD', '积分', '通道', 'token', 'Token', 'TOKEN']
+
+  it('normalizeCreditUnit（宿主）与 normalizeUnit（客户端）逐项一致', async () => {
+    const { normalizeCreditUnit } = await import('../../src/credits.js')
+    const { normalizeUnit } = await import('../../plugin-src/client/credits-format.js')
+    for (const unit of SAMPLES) {
+      expect(normalizeUnit(unit), unit).toBe(normalizeCreditUnit(unit))
+    }
+  })
+
+  it('只有 token 单独成类，其余一律归为 credit（与 unitLabel「积分」同源）', async () => {
+    const { normalizeUnit, unitLabel } = await import('../../plugin-src/client/credits-format.js')
+    for (const unit of SAMPLES) {
+      expect(normalizeUnit(unit), unit).toBe(unit === 'token' ? 'token' : 'credit')
+      // 归一到 credit 的单位，展示名必须是「积分」，且**只有一种**写法
+      expect(unitLabel(normalizeUnit(unit)), unit).toBe(unit === 'token' ? 'Token' : '积分')
+    }
   })
 })
