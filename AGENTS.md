@@ -769,7 +769,7 @@ ZCode 账号管理**只在 Jet Hub 设置页**。回归用例在
 |---|---|
 | 该槽的 `key` 语义 = **那张卡片的 `settingsNs`** | 官方 `dsh-client-ui-settings-models/lib/client.js:2150`：`renderSlot('settings.models.provider-card', {...}, { entryKey: row.entry.settingsNs })` |
 | 渲染侧按 `entryKey` **精确 find**，只渲染**一个** winner | `-renderer/lib/client.js:1154`：`entriesOfSlot(slot).find(e => e.options.key === opts.entryKey)` |
-| `entriesOfSlot` 取 ledger（**注册顺序**）里每 cell 首个 live 条目，**`priority` 不参与排序** | `-slots/lib/index.js:285-290` |
+| `entriesOfSlot` 取 ledger 里每 cell 首个 live 条目；ledger 按 **`priority` 升序**（同 priority 才是注册顺序） | `-slots/lib/index.js:221` + `:285-290` |
 | 同 key + 同 priority 的第二个 `register` **直接抛** `keyed slot "…" already has an entry for key "…"` | `-slots/lib/index.js:177-178` |
 | `slots.inject` 的回调抛错 ⇒ `stop()` 掉整个 inject 并 `queueMicrotask(throw)` | `-renderer/lib/client.js:1375-1388` |
 
@@ -777,8 +777,9 @@ ZCode 账号管理**只在 Jet Hub 设置页**。回归用例在
 **不能**变成共存：
 
 - 换独立 key（`llm-pi-ai-zcode`）⇒ 官方 `find()` 落空 ⇒ **我们自己的卡片永不渲染**；
-- 换 priority ⇒ 两条都注册成功，但 winner 仍只有 ledger 里第一个 ⇒ 低优先级那条
-  **永远不渲染**（错误提示里那句 `lowest renders` 只是让它不抛错的手段，别当真）。
+- 换 priority ⇒ 两条都注册成功，但 winner 是 **`priority` 数值更小**的那条
+  （错误提示里的 `lowest renders` 是字面为真的）；仍然**只有一个** winner ⇒ 依旧不是共存。
+  即：想抢赢就得用更小的 `priority`，而那正是「挤掉对方」。
 
 ⚠ **zcode 没有自己的适配器家族**：`dsh-llm-pi-ai/lib/index.js:2492/2535` 把
 **所有** route 目录行的 `settingsNs` 统一设成 `llm-pi-ai`，用户手工加的 `zcode`
