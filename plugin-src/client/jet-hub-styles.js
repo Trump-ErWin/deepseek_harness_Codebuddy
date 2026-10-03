@@ -545,20 +545,106 @@ const STYLES = `
  *
  * ## 两级收敛（用户定：1+2）
  *
- * ① 基础宽度从 280px 收窄到 **150px**（文字超出走省略号，已有 min-width:0
- *    + ellipsis 支撑）—— 给模型选择器让出约 130px，够显示「图标+名字+▾」。
+ * ## 宽度：**内容自适应**，216px 只是上限（不是目标宽度）
+ *
+ * 胶囊本身是**内容自适应**的：宽度由实际文字撑开，短内容就短
+ * （Cline • 5积分 仅 93px），不会有固定留白。下面的 max-width 只在
+ * 内容**过长**时兜底，防止挤压右侧的模型选择器。
+ *
+ * ⚠️ 2026-10-03 上限从 150px 提到 **216px**（用户报障「供应商名字显示不完整」
+ * 之后又提了一次）。两次报障、同一条链路的两个不同成因：
+ * 1. **数字被截**（第一次）：整句塞进一个 overflow:hidden 的 span，省略号从右往左
+ *    吃掉了余额。修法是**结构**（拆成可独立收缩的 span，见 badge-model.js 的
+ *    readingOf 与 usage-badge.js 的三段式渲染）；
+ * 2. **渠道名被截**（第二次）：结构修好后，186px 仍不够长渠道名 + 长余额，
+ *    于是省略号落到**名字**上（用户截图：CodeArts (华为…）。216px 解决它。
+ *
+ * **216 是量出来的，不是拍的**：实测 13 个渠道展示名 × 10 种现实读数
+ * （含 123456.78积分 / 9499.84积分 / 94.54MToken / 0积分）共 130 组，
+ * 需要的最宽度是 **209.34px**（WorkBuddy (国际版) • 123456.78积分），
+ * 216px 全部装得下且留 6.7px 余量（字体回退时字宽会变）。
+ *
+ * ⚠️ **上限不能再往上放**：实测把上限放到「无上限」时，极窄 composer（220px）
+ * 下胶囊会**溢出容器 8.3px** —— 那正是 2026-10-02「模型选择器图标被挤没」
+ * 的形态。内容自适应 + 合理上限，两者缺一不可。
+ * 兜底退化顺序：超长时**渠道名**先出省略号，**余额一个字都不会少**
+ * （.dim-jh-badgeReading 是 flex: none）。
+ *
+ * ⚠️ button 元素**本来就是 border-box**（UA 默认样式表），故下面的 box-sizing
+ * 是**显式写出**（防止哪天元素换成 span/div 时语义悄悄变成内容盒），不是修复。
+ * ⚠️⚠️ 本段注释里**不能出现反引号**（本文件整体是 JS 模板字符串，会提前终止）。
  * ② 容器再窄时（< 720px，媒体查询挂在**全局宽度**上：composer 宽度受
  *    侧栏影响，用容器查询无法表达「右侧还剩多少」）**只留状态点**，
  *    文字与 chevron 全部隐藏 —— 此时代理器优先级让给模型选择器。 */
-.dim-jh-badge { position: relative; display: flex; align-items: center; flex: none; min-width: 0; }
-.dim-jh-badgeBtn { display: flex; align-items: center; gap: 5px; max-width: 150px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
+/* ⚠️ flex: 0 1 auto（而非 none）：胶囊自身也要能收缩。它是 flex: none 时
+   宽度只由 max-width 兜底，而 max-width 只在**内容超标**时生效 —— 容器更窄时
+   它会连同右侧模型选择器一起溢出。允许收缩后，空间不足时胶囊与选择器一起让位，
+   且胶囊内部退化是有序的（先名字出省略号，数字最后才动）。 */
+.dim-jh-badge { position: relative; display: flex; align-items: center; flex: 0 1 auto; min-width: 0; }
+/* ⚠️ box-sizing 是**显式写出**的，不是修复：button 的 UA 默认样式表本就是
+   border-box（实测 offsetWidth 与 max-width 相等）。写上它只为在元素类型被改
+   （span/div 默认是 content-box）时语义不悄悄漂移 —— 那种情况下 max-width 会从
+   「占位宽度」变成「内容宽度」，胶囊会突然变宽 19px 而这行代码看着毫无变化。 */
+.dim-jh-badgeBtn { box-sizing: border-box; display: flex; align-items: center; gap: 5px; max-width: 216px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
 .dim-jh-badgeBtn:hover { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeBtn[aria-expanded="true"] { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); }
+/* 三段式文本容器：渠道名 + 分隔符 + 读数。
+   ⚠️ 必须是 flex 容器，两个文本子项才能各自独立收缩（这正是「数字不被截」的前提）。 */
+.dim-jh-badgeText { display: flex; align-items: center; min-width: 0; }
+/* ⚠️ 让位顺序：中段说明(999) → 渠道名(99) → 读数(none，**不参与收缩**)。
+   收缩量按 flex-shrink × flex-basis 加权分配，999 与 99 相差一个数量级，
+   故「包名先走、渠道名其次」，读数一个字都不会少。
+   flex-grow 一律为 0：胶囊是内容自适应宽度，任何 grow 都只会让它在宽容器里虚胖。
+   min-width:0 是省略号生效的前提（flex 子项默认 min-width:auto，会撑破 max-width）。 */
+.dim-jh-badgeName { flex: 0 99 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 分隔符「•」：定宽不收缩，两侧间距由 margin 给。
+   ⚠️ 这里的 3px **不能**换成前后空格：flex 容器把 span 之间只含空白的文本节点
+   渲染成**零宽**（实测 gap=0，节点还在但看不见），空格会静默消失。
+   带空格的那份写法（BADGE_SEP = ' • '）只用于 title / aria-label 那句整文。 */
+.dim-jh-badgeSep { flex: none; margin: 0 3px; }
+/* 中段说明（只有套餐模式有值，如包名 Free Plan Subscription）。
+   ⚠️ 收缩权重**最大**（999）：它比渠道名更该让位 —— 包名多为样板字、且长，
+   而用户认得出自己选的渠道。
+   ⚠️ 它被压到 0 宽时（内容过长）该节点仍在，会留下一个「悬空的分隔符」；
+   这在胶囊这一行是可接受的（完整文案在 title 与弹窗里），故不额外做条件渲染。 */
+.dim-jh-badgeDetail { flex: 0 999 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ⚠️⚠️ 读数必须 flex: none（**完全不收缩**），不能写 flex: 0 1 auto。
+   这是第二处、也是更隐蔽的一处「数字被截」成因，**靠截图才发现**：
+
+   收缩量按 flex-shrink × flex-basis 加权分配，读数那一份虽小却**不为零** ——
+   实测读数被分到 0.77px 的收缩（getBoundingClientRect 宽 78.23 / 内容宽 79）。
+   而 text-overflow: ellipsis 的触发条件是 scrollWidth > clientWidth，
+   **亚像素级的收缩就足以命中** ⇒ 最后一个字被换成「…」，
+   视觉上和「整段被截」一样严重。
+
+   ⚠️ 更坑的是**量不出来**：clientWidth 取整，53.97 报成 54，
+   于是 scrollWidth > clientWidth 判为 false —— 我用它写的「数字是否完整」
+   断言一路全绿，而截图里明明白白写着「347.87积…」。
+   教训：判断省略号要看**截图**或用小数宽度（getBoundingClientRect），
+   不能用取整后的 clientWidth。
+
+   ⚠️ 类名刻意**不叫 .dim-jh-badgeValue**：那个名字已被弹窗读数占用，且那条规则
+   （font-weight:600）排在样式表更后面 —— 同名会让胶囊数字被静默加粗。
+
+   ⇒ 读数恒定完整；全部收缩由 .dim-jh-badgeDetail(999) 与 .dim-jh-badgeName(99)
+   承担，两者最坏缩到 0 也放得下（读数最宽约 97px + 分隔符与内边距 ≈ 131px
+   < 186px 上限）。 */
+.dim-jh-badgeReading { flex: none; min-width: 0; white-space: nowrap; }
+/* 「这个读数不完整」的标记（合计少算了账号时才出现），排在读数**之后**。
+   ⚠️ 必须与读数同级 flex: none：它是**补语**，被省略号吃掉就等于没标 —— 而它要
+   提醒的恰恰是「别把这个数字当真」，看不见比不标更糟。
+   ⚠️ 用 warn 而不是 error：账号读不到多半是临时的（凭据过期 / 网络抖动），
+   error 是留给「整个渠道都不可用」的（那会走 empty 模式）。
+   字号小一档并压紧行高，让它读起来像角标而不是读数的一部分。 */
+.dim-jh-badgeWarn { flex: none; font-size: 10px; line-height: 1; color: var(--dsw-alias-state-warn-primary); cursor: help; }
+
 /* ② 窄屏收敛：只留状态点，文字与 chevron 让位给模型选择器。
- * 阈值 720px 是实测桌面版在 100% 缩放下「徽标 150px + 模型选择器 ≥ 240px」的临界值。 */
+ * 阈值 720px 是实测桌面版在 100% 缩放下「徽标 216px + 模型选择器 ≥ 240px」的临界值。
+ * ⚠️⚠️ 本段的**位置**是功能性的，不要为了排版把它挪到 .dim-jh-badgeText 之前：
+ * 它与 ".dim-jh-badgeText { display: flex }" 特异性相同（都是单个类），
+ * 靠**源顺序**决定胜负 —— 一旦被排到前面，窄屏下 display:none 会被
+ * 后面的 display:flex 覆盖，文字重新出现并挤压模型选择器（静默回归）。 */
 @media (max-width: 720px) { .dim-jh-badgeText, .dim-jh-badgeBtn > svg, .dim-jh-badgeBtn > .dim-jh-badgeChevron { display: none; } .dim-jh-badgeBtn { max-width: none; padding: 2px 6px; } }
-/* min-width:0 是省略号生效的前提（flex 子项默认 min-width:auto，会撑破 max-width） */
-.dim-jh-badgeText { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .dim-jh-badgeDot { width: 5px; height: 5px; flex: none; border-radius: 999px; background: var(--dsw-alias-state-success-primary); }
 .dim-jh-badgeDot[data-tone="warn"] { background: var(--dsw-alias-state-warn-primary); }
 .dim-jh-badgeDot[data-tone="error"] { background: var(--dsw-alias-state-error-primary); }
@@ -652,6 +738,12 @@ const STYLES = `
 .dim-jh-badgeNotice[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); }
 .dim-jh-badgeFail { font-size: 10px; line-height: 14px; color: var(--dsw-alias-state-error-primary); }
 .dim-jh-badgeFoot { font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-tertiary); }
+/* 「展开其余 N 个账号」/「收起」：纯文字按钮，左对齐、不占满宽。
+   ⚠️ 刻意**不复用** .dim-jh-badgeAction：那条规则是 flex:1 的实心按钮（用于签到），
+   放在明细列表下面会抢走视觉焦点 —— 用户要的是「明细可以收起来」，不是一个主操作。
+   align-self: flex-start 是因为父容器 .dim-jh-badgePop 是 flex 列（默认 stretch）。 */
+.dim-jh-badgeMore { align-self: flex-start; margin-top: 3px; padding: 1px 0; border: 0; background: none; font: inherit; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-link); cursor: pointer; }
+.dim-jh-badgeMore:hover { color: var(--dsw-alias-brand-primary); text-decoration: underline; }
 
 `
 

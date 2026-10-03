@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   BADGE_PREFERENCE_LABELS,
   BADGE_PREFERENCES,
+  BADGE_SEP,
   DEFAULT_BADGE_PREFERENCE,
   HOST_STALE_HINT,
   badgeView,
@@ -9,6 +10,7 @@ import {
   describeBadgeError,
   formatUpdatedAt,
   normalizeBadgePreference,
+  orderCreditRows,
   planGroupsOf,
   windowPreview,
 } from '../../plugin-src/client/badge-model.js'
@@ -96,7 +98,7 @@ describe('窗口预览', () => {
 describe('积分的按单位分组', () => {
   it('单账号：合计即该账号余额', () => {
     const groups = creditGroupsOf([row('a', [pkg('Bonus Pack', 100), pkg('Free Plan', 96.87)])])
-    expect(groups.groups).toEqual([{ unit: 'credits', label: '积分', total: 196.87, accountCount: 1 }])
+    expect(groups.groups).toEqual([{ unit: 'credit', label: '积分', total: 196.87, accountCount: 1 }])
     expect(groups.failedCount).toBe(0)
     expect(groups.okCount).toBe(1)
   })
@@ -108,7 +110,7 @@ describe('积分的按单位分组', () => {
       row('c', [pkg('GLM-5.2', 94_539_275, 'token')]),
     ])
     expect(groups.groups).toEqual([
-      { unit: 'credits', label: '积分', total: 150, accountCount: 2 },
+      { unit: 'credit', label: '积分', total: 150, accountCount: 2 },
       { unit: 'token', label: 'Token', total: 94_539_275, accountCount: 1 },
     ])
   })
@@ -122,7 +124,58 @@ describe('积分的按单位分组', () => {
 
   it('一个包都没有时按空单位分组（显示为「积分」）', () => {
     const groups = creditGroupsOf([{ accountId: 'a', nickname: 'a', balance: { total: 5, packages: [], expiredTotal: 0 } }])
-    expect(groups.groups).toEqual([{ unit: '', label: '积分', total: 5, accountCount: 1 }])
+    expect(groups.groups).toEqual([{ unit: 'credit', label: '积分', total: 5, accountCount: 1 }])
+  })
+
+  /**
+   * ⚠️ 真实缺陷回归（2026-10-03，用户报障：胶囊显示 `341.78积分 · 100积分`）。
+   *
+   * 服务端对**同一个单位**有两种拼法，逐包实测（`probe-workbuddy-units.mjs`）：
+   * 账号 `…01CC739A` 的包是 `credit`（Bonus Pack 241.78）+ `credits`
+   * （Free Plan Subscription 100），账号 `…297957E1` 的是 `credits`。
+   * 按原值分组会把两个账号拆成两组，渲染出两个一模一样的「积分」标签。
+   *
+   * 下面这组用例就是那两个账号的**原样形状**：断言「几个账号都只产生一个数字」。
+   */
+  it('同义异拼（credit / credits / 空串）必须落进同一组 —— 两个账号一个合计', () => {
+    const groups = creditGroupsOf([
+      { accountId: 'a', nickname: 'a', balance: { total: 341.78, packages: [pkg('Bonus Pack', 241.78, 'credit'), pkg('Free Plan Subscription', 100, 'credits')], expiredTotal: 0 } },
+      { accountId: 'b', nickname: 'b', balance: { total: 100, packages: [pkg('Free Plan Subscription', 100, 'credits')], expiredTotal: 0 } },
+    ])
+    expect(groups.groups).toEqual([{ unit: 'credit', label: '积分', total: 441.78, accountCount: 2 }])
+  })
+
+  /** 折叠态整句：这才是用户实际看到的那一行（分组对了文案才可能对）。 */
+  it('WorkBuddy 国际版两个账号 → 只显示一个合计（不再并排两个「积分」）', () => {
+    const accounts = [
+      { accountId: 'a', nickname: 'a', balance: { total: 341.78, packages: [pkg('Bonus Pack', 241.78, 'credit')], expiredTotal: 0 } },
+      { accountId: 'b', nickname: 'b', balance: { total: 100, packages: [pkg('Free Plan Subscription', 100, 'credits')], expiredTotal: 0 } },
+    ]
+    const view = badgeView({ providerLabel: 'WorkBuddy (国际版)', preference: 'auto', subscription: undefined, accounts })
+    expect(view.text).toBe('WorkBuddy (国际版) • 441.78积分')
+    // 保护性断言：文案里「积分」只出现一次（旧缺陷的形态是两个）
+    expect(view.reading.split('积分')).toHaveLength(2)
+  })
+
+  it('账号数再多也只产生一个数字（5–6 个号不会拉成长串）', () => {
+    const units = ['credit', 'credits', '', 'Credit', 'CREDITS']
+    const accounts = units.map((unit, i) => ({
+      accountId: `a${i}`, nickname: `a${i}`,
+      balance: { total: 100, packages: [pkg('Bonus Pack', 100, unit)], expiredTotal: 0 },
+    }))
+    const view = badgeView({ providerLabel: 'WorkBuddy (国际版)', preference: 'auto', subscription: undefined, accounts })
+    expect(view.text).toBe('WorkBuddy (国际版) • 500积分')
+  })
+
+  it('token 与积分**仍然分开**（归一化只收敛同义拼法，不跨量纲求和）', () => {
+    const view = badgeView({
+      providerLabel: 'ZCode',
+      preference: 'auto',
+      subscription: undefined,
+      accounts: [row('a', [pkg('GLM-5.2', 94_539_275, 'token')]), row('b', [pkg('Bonus Pack', 100, 'credits')])],
+    })
+    // 分组按单位名排序（credit < token），故积分在前
+    expect(view.text).toBe('ZCode • 100积分 · 94.54MToken')
   })
 })
 
@@ -147,6 +200,20 @@ describe('套餐的归组', () => {
     expect(groups[0].unit).toBe('token')
     expect(groups[0].label).toBe('Token')
   })
+
+  /**
+   * ⚠️ 与 `creditGroupsOf` 同款缺陷的另一处：分组键里也含单位。
+   * 同一份套餐在不同账号上被服务端拼成 `credit` / `credits` 时，若用原值当键，
+   * 弹窗里的「2 个账号合计」会退化成两行、每行各一个账号。
+   */
+  it('同一份套餐的单位拼法不同（credit / credits）必须合并成一条', () => {
+    const groups = planGroupsOf([
+      { accountId: 'a', plan: { name: 'Free Plan Subscription', remaining: 100, total: 500, unit: 'credits' } },
+      { accountId: 'b', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credit' } },
+    ])
+    expect(groups).toHaveLength(1)
+    expect(groups[0]).toMatchObject({ name: 'Free Plan Subscription', remaining: 400, total: 1000, accountCount: 2, unit: 'credit' })
+  })
 })
 
 describe('badgeView：模式与文案', () => {
@@ -162,17 +229,59 @@ describe('badgeView：模式与文案', () => {
     accounts: [{ accountId: 'a', nickname: 'a', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credits' } }],
   }
 
-  it('auto：有窗口显示窗口（文案含窗口名与百分比）', () => {
+  /**
+   * ⚠️ 2026-10-03 **优先级反转**（用户报障）：
+   * 胶囊显示「个人体验版 500 / 500积分」，而设置页里可用积分是 2434.96。
+   * 套餐读数是「某一份包还剩多少」，余额才是「一共还能用多少」—— 前者必然少报。
+   * 故 `auto` 改为**余额优先**，窗口/套餐退到 `subscription` 档。
+   */
+  it('auto：**余额优先**——即使有窗口与套餐，也显示一共能用的积分', () => {
     const view = badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: windows, accounts: [row('a', [pkg('Cline 账户余额', 5)])] })
-    expect(view.mode).toBe('windows')
-    expect(view.text).toBe('Cline · 5 小时 6% · 本周 2%')
+    expect(view.mode).toBe('credits')
+    expect(view.text).toBe('Cline • 5积分')
+    expect(view.reading).toBe('5积分')
+    expect(view.detail).toBe('')
     expect(view.tone).toBe('ok')
   })
 
-  it('auto：无窗口有套餐时显示套餐（剩余 / 总量 + 单位）', () => {
-    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: plan, accounts: [row('a', [pkg('Bonus Pack', 20)])] })
+  it('auto：有套餐包也有余额时显示**余额合计**（用户报障的那一例）', () => {
+    // 复刻报障现场：有「体验版」套餐包，但余额合计是 2434.96
+    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: plan, accounts: [row('a', [pkg('个人体验版', 2434.96)])] })
+    expect(view.mode).toBe('credits')
+    expect(view.text).toBe('CodeBuddy • 2434.96积分')
+    // ⚠️ 套餐读数**没有消失**，只是不再是折叠态的默认 —— 它仍在返回结构里
+    expect(view.planGroups).toHaveLength(1)
+    expect(view.windows).toEqual([])
+  })
+
+  it('subscription 偏好：窗口优先（想盯百分比的人切这一档）', () => {
+    const view = badgeView({ providerLabel: 'Cline', preference: 'subscription', subscription: windows, accounts: [row('a', [pkg('Cline 账户余额', 5)])] })
+    expect(view.mode).toBe('windows')
+    // ⚠️ 分隔符是 BADGE_SEP（' • '），不再是 ' · '；' · ' 只用于读数**内部**分段。
+    expect(view.text).toBe('Cline • 5 小时 6% · 本周 2%')
+    expect(view.name).toBe('Cline')
+    expect(view.detail).toBe('')
+    expect(view.reading).toBe('5 小时 6% · 本周 2%')
+  })
+
+  it('subscription 偏好：无窗口时显示套餐（剩余 / 总量 + 单位）', () => {
+    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'subscription', subscription: plan, accounts: [row('a', [pkg('Bonus Pack', 20)])] })
     expect(view.mode).toBe('plan')
-    expect(view.text).toBe('CodeBuddy · Free Plan Subscription 300 / 500 积分')
+    expect(view.text).toBe('CodeBuddy • Free Plan Subscription 300 / 500积分')
+    // 包名进 detail（渲染层里**最先**被省略的那一段），数字进 reading
+    expect(view.detail).toBe('Free Plan Subscription')
+    expect(view.reading).toBe('300 / 500积分')
+  })
+
+  it('三种偏好的候选顺序各自完整（不允许某档漏掉回落）', () => {
+    // auto：余额 → 窗口 → 套餐（三级回落，任一级为空都要继续往下走）
+    const noCredits = { kind: 'windows', accounts: [{ accountId: 'a', nickname: 'a', ok: true, windows: [{ type: 'five_hour', percentUsed: 6, resetsAt: '' }] }] }
+    expect(badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: noCredits, accounts: [row('a', null, '查询失败')] }).mode).toBe('windows')
+    expect(badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: plan, accounts: [row('a', null, '查询失败')] }).mode).toBe('plan')
+    // subscription：窗口 → 套餐 → 余额
+    expect(badgeView({ providerLabel: 'CodeBuddy', preference: 'subscription', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 20)])] }).mode).toBe('credits')
+    // credits：**只看余额**（有窗口也不显示窗口）
+    expect(badgeView({ providerLabel: 'Cline', preference: 'credits', subscription: windows, accounts: [row('a', [pkg('Cline 账户余额', 5)])] }).mode).toBe('credits')
   })
 
   it('auto：两者都没有时显示积分合计', () => {
@@ -183,25 +292,23 @@ describe('badgeView：模式与文案', () => {
       accounts: [row('a', [pkg('Bonus Pack', 100)]), row('b', [pkg('Bonus Pack', 96.87)])],
     })
     expect(view.mode).toBe('credits')
-    expect(view.text).toBe('CodeBuddy · 合计 196.87 积分')
+    // 用户 2026-10-03 定：胶囊里不再写「合计」（那个词占位但不提供信息）
+    expect(view.text).toBe('CodeBuddy • 196.87积分')
+    expect(view.reading).toBe('196.87积分')
+    expect(view.detail).toBe('')
   })
 
   it('credits 偏好：即使有窗口也显示积分（套餐误判时的兜底开关）', () => {
     const view = badgeView({ providerLabel: 'Cline', preference: 'credits', subscription: windows, accounts: [row('a', [pkg('Cline 账户余额', 5)])] })
     expect(view.mode).toBe('credits')
-    expect(view.text).toBe('Cline · 合计 5 积分')
-  })
-
-  it('subscription 偏好：行为与 auto 相同（窗口优先，其次套餐）', () => {
-    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'subscription', subscription: plan, accounts: [row('a', [pkg('Bonus Pack', 20)])] })
-    expect(view.mode).toBe('plan')
+    expect(view.text).toBe('Cline • 5积分')
   })
 
   it('窗口存在但一条都没有时**回落**到积分（不能显示成只有渠道名）', () => {
     const empty = { kind: 'windows', accounts: [{ accountId: 'a', nickname: 'a', ok: true, windows: [] }] }
     const view = badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: empty, accounts: [row('a', [pkg('Cline 账户余额', 12)])] })
     expect(view.mode).toBe('credits')
-    expect(view.text).toBe('Cline · 合计 12 积分')
+    expect(view.text).toBe('Cline • 12积分')
   })
 
   it('窗口取第一个**读到数**的账号（失败的账号不参与）', () => {
@@ -212,8 +319,11 @@ describe('badgeView：模式与文案', () => {
         { accountId: 'good', nickname: 'good', ok: true, windows: [{ type: 'five_hour', percentUsed: 33, resetsAt: '' }] },
       ],
     }
-    const view = badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: mixed, accounts: [row('good', [pkg('Cline 账户余额', 1)])] })
-    expect(view.text).toBe('Cline · 5 小时 33%')
+    // ⚠️ 显式用 subscription 档：auto 已改为**余额优先**，用它就测不到窗口选取了
+    // （那正是本用例存在的意义 —— 别为了「让 auto 也过」而弱化断言）。
+    const view = badgeView({ providerLabel: 'Cline', preference: 'subscription', subscription: mixed, accounts: [row('good', [pkg('Cline 账户余额', 1)])] })
+    expect(view.mode).toBe('windows')
+    expect(view.text).toBe('Cline • 5 小时 33%')
   })
 
   it('token 渠道按 M 显示（ZCode 的 1 亿 token 不能画成「1 亿积分」）', () => {
@@ -223,18 +333,18 @@ describe('badgeView：模式与文案', () => {
       subscription: undefined,
       accounts: [row('a', [pkg('GLM-5.2', 94_539_275, 'token')])],
     })
-    expect(view.text).toBe('ZCode (智谱) · 合计 94.54M Token')
+    expect(view.text).toBe('ZCode (智谱) • 94.54MToken')
   })
 
   it('没有启用账号 → 明确文案；全部读取失败 → 另一句（下一步动作不同）', () => {
     const none = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [] })
     expect(none.mode).toBe('empty')
-    expect(none.text).toBe('CodeBuddy · 未配置启用账号')
+    expect(none.text).toBe('CodeBuddy • 未配置启用账号')
     expect(none.tone).toBe('muted')
 
     const allFailed = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [row('a', null, '凭据未配置')] })
     expect(allFailed.mode).toBe('empty')
-    expect(allFailed.text).toBe('CodeBuddy · 用量不可用')
+    expect(allFailed.text).toBe('CodeBuddy • 用量不可用')
     expect(allFailed.tone).toBe('error')
     expect(allFailed.failureReason).toBe('凭据未配置')
   })
@@ -242,9 +352,11 @@ describe('badgeView：模式与文案', () => {
 
 describe('badgeView：色调', () => {
   function toneOfWindows(percent) {
+    // ⚠️ subscription 档：auto 已改为余额优先，用它拿到的是**余额**的色调，
+    // 就测不到「取最紧张的那个窗口」这条规则了。
     return badgeView({
       providerLabel: 'Cline',
-      preference: 'auto',
+      preference: 'subscription',
       subscription: { kind: 'windows', accounts: [{ accountId: 'a', nickname: 'a', ok: true, windows: [{ type: 'five_hour', percentUsed: percent, resetsAt: '' }] }] },
       accounts: [row('a', [pkg('Cline 账户余额', 1)])],
     }).tone
@@ -276,7 +388,7 @@ describe('badgeView：首屏状态（真实报障的回归）', () => {
     // 报障（2026-10-02）：徽标一开始显示「未配置启用账号」，其实只是还没读到。
     const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [], loading: true })
     expect(view.mode).toBe('loading')
-    expect(view.text).toBe('CodeBuddy · 读取中…')
+    expect(view.text).toBe('CodeBuddy • 读取中…')
     expect(view.tone).toBe('muted')
     expect(view.groups).toEqual([])
   })
@@ -284,7 +396,7 @@ describe('badgeView：首屏状态（真实报障的回归）', () => {
   it('首次读数就失败 → 「用量不可用」，与「没有账号」区分开', () => {
     const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [], failed: true })
     expect(view.mode).toBe('empty')
-    expect(view.text).toBe('CodeBuddy · 用量不可用')
+    expect(view.text).toBe('CodeBuddy • 用量不可用')
     expect(view.tone).toBe('error')
   })
 
@@ -299,7 +411,181 @@ describe('badgeView：首屏状态（真实报障的回归）', () => {
       failed: false,
     })
     expect(view.mode).toBe('credits')
-    expect(view.text).toBe('CodeBuddy · 合计 100 积分')
+    expect(view.text).toBe('CodeBuddy • 100积分')
+  })
+})
+
+/**
+ * 用户 2026-10-03 报障的回归：胶囊显示成「LobsterAI (有道) · 合计 …」，
+ * **数字被截掉**。
+ *
+ * 两条断言分别锁住「修法的两半」，缺一不可：
+ * 1. 文案口径（本文件）—— 分隔符与「名字 / 中段 / 读数」三段字段；
+ * 2. 结构（usage-badge-client.spec.ts）—— 渲染成**多个** span 且各有收缩权重。
+ *
+ * ⚠️ 只锁 ① 是不够的：文案再对，塞回一个 overflow:hidden 的 span 里照样会把
+ * 数字省略掉 —— 那正是本次报障的形态。
+ */
+describe('折叠态三段结构（真实报障：数字被截掉）', () => {
+  it('恒有 text === name + BADGE_SEP + detail + reading（渲染层与整句不会走偏）', () => {
+    const cases = [
+      { providerLabel: 'WorkBuddy (国际版)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 200)])] },
+      { providerLabel: 'LobsterAI (有道)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 842.06)])] },
+      {
+        providerLabel: 'CodeBuddy',
+        preference: 'auto',
+        subscription: { kind: 'plan', accounts: [{ accountId: 'a', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credits' } }] },
+        accounts: [],
+      },
+      { providerLabel: 'Cline', preference: 'credits', subscription: undefined, accounts: [], loading: true },
+      { providerLabel: 'Cline', preference: 'credits', subscription: undefined, accounts: [] },
+    ]
+    for (const input of cases) {
+      const view = badgeView(input)
+      const middle = view.detail === '' ? '' : `${view.detail} `
+      expect(view.text, input.providerLabel).toBe(`${view.name}${BADGE_SEP}${middle}${view.reading}`)
+      // 三段都不该自带分隔符（否则渲染层会出现两个「•」）
+      expect(view.name).not.toContain('•')
+      expect(view.detail).not.toContain('•')
+      expect(view.reading).not.toContain('•')
+    }
+  })
+
+  it('分隔符是单独常量（渲染层与文案共用同一个字形，不会一边 • 一边 ·）', () => {
+    expect(BADGE_SEP).toBe(' • ')
+    const view = badgeView({ providerLabel: 'LobsterAI (有道)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 842.06)])] })
+    expect(view.text).toBe('LobsterAI (有道) • 842.06积分')
+    expect(view.text.split(BADGE_SEP)).toEqual(['LobsterAI (有道)', '842.06积分'])
+  })
+
+  it('用户给的两个样例逐字命中', () => {
+    const workbuddy = badgeView({ providerLabel: 'WorkBuddy (国际版)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 200)])] })
+    expect(workbuddy.text).toBe('WorkBuddy (国际版) • 200积分')
+    const lobster = badgeView({ providerLabel: 'LobsterAI (有道)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 842.06)])] })
+    expect(lobster.text).toBe('LobsterAI (有道) • 842.06积分')
+  })
+
+  it('数值与单位之间不留空格（省 px，且与用户样例一致）', () => {
+    const credits = badgeView({ providerLabel: 'Cline', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('Cline 账户余额', 200)])] })
+    expect(credits.reading).toBe('200积分')
+    const tokens = badgeView({ providerLabel: 'ZCode (智谱)', preference: 'credits', subscription: undefined, accounts: [row('a', [pkg('GLM-5.2', 94_539_275, 'token')])] })
+    expect(tokens.reading).toBe('94.54MToken')
+  })
+})
+
+/**
+ * 「合计不完整」的提示（2026-10-03，用户要求）。
+ *
+ * 账号越多越容易撞上：六个号里坏一个，胶囊上的合计就少一截，而数字本身
+ * **看不出任何异常**（色调仍是 ok）。故必须单独给一句说明，由渲染层挂成角标。
+ */
+describe('incompleteNote：合计少算了账号时要说明', () => {
+  const ok = row('a', [pkg('Bonus Pack', 100)])
+  const dead = row('b', null, '凭据未配置')
+
+  it('积分模式：有账号读不到 → 说清「是余额没读到」「不计入合计」', () => {
+    const view = badgeView({ providerLabel: 'WorkBuddy (国际版)', preference: 'auto', subscription: undefined, accounts: [ok, dead] })
+    expect(view.mode).toBe('credits')
+    expect(view.reading).toBe('100积分')
+    expect(view.incompleteNote).toBe('另有 1 个账号的余额读取失败，未计入合计')
+    expect(view.failedCount).toBe(1)
+  })
+
+  it('它**不进** reading / text —— 那是纯读数，供 title 与读屏单独拼', () => {
+    const view = badgeView({ providerLabel: 'WorkBuddy (国际版)', preference: 'auto', subscription: undefined, accounts: [ok, dead] })
+    expect(view.text).toBe('WorkBuddy (国际版) • 100积分')
+    expect(view.reading).not.toContain('读取失败')
+    expect(view.text).not.toContain('读取失败')
+  })
+
+  it('全部读到数 → 空串（没有提示要显示）', () => {
+    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [ok, row('c', [pkg('Bonus Pack', 50)])] })
+    expect(view.incompleteNote).toBe('')
+  })
+
+  it('一个都没读到 → 也空串（模式已回落到「用量不可用」，再加一句是噪音）', () => {
+    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [dead, row('c', null, '网络超时')] })
+    expect(view.mode).toBe('empty')
+    expect(view.reading).toBe('用量不可用')
+    expect(view.incompleteNote).toBe('')
+  })
+
+  it('窗口 / 套餐模式**不套用**这句话（它们本来就不是合计，说了就是错的）', () => {
+    const windows = {
+      kind: 'windows',
+      accounts: [{ accountId: 'a', nickname: 'a', ok: true, windows: [{ type: 'five_hour', percentUsed: 6, resetsAt: '' }] }],
+    }
+    const windowView = badgeView({ providerLabel: 'Cline', preference: 'subscription', subscription: windows, accounts: [ok, dead] })
+    expect(windowView.mode).toBe('windows')
+    expect(windowView.incompleteNote).toBe('')
+
+    const plan = { kind: 'plan', accounts: [{ accountId: 'a', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credit' } }] }
+    const planView = badgeView({ providerLabel: 'CodeBuddy', preference: 'subscription', subscription: plan, accounts: [ok, dead] })
+    expect(planView.mode).toBe('plan')
+    expect(planView.incompleteNote).toBe('')
+  })
+
+  it('占位态（读取中 / 首屏失败）也有这个字段 —— 调用方不必做形状判断', () => {
+    expect(badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: undefined, accounts: [], loading: true }).incompleteNote).toBe('')
+    expect(badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: undefined, accounts: [], failed: true }).incompleteNote).toBe('')
+  })
+})
+
+/**
+ * 弹窗积分列表的排序 + 折叠（2026-10-03 用户要求）。
+ *
+ * 为什么值得单测：这两条规则都是**看不见的**——排序错了用户只会觉得「找不到能用的
+ * 那个号」，折叠边界错了只会觉得「怎么少了一个号」。而组件里那部分测不到
+ * （`usage-badge.js` 依赖宿主注入的 react，本仓库装不了），故逻辑必须住在这里。
+ */
+describe('orderCreditRows：按余额降序 + 折叠', () => {
+  const acc = (id, total) => ({ accountId: id, nickname: id, balance: total === null ? null : { total, packages: [], expiredTotal: 0 } })
+  const ids = (rows) => rows.map((row) => row.accountId)
+
+  it('按余额降序（用户先要看到「还有哪个号能用」）', () => {
+    const { shown, hidden } = orderCreditRows([acc('a', 10), acc('b', 300), acc('c', 50)], { limit: 5, expanded: false })
+    expect(ids(shown)).toEqual(['b', 'c', 'a'])
+    expect(hidden).toBe(0)
+  })
+
+  it('读不到数的排**最后**（不能当 0 混进小余额里 —— 那格显示的是错误文案）', () => {
+    const { shown } = orderCreditRows([acc('dead', null), acc('a', 5), acc('b', 100)], { limit: 5, expanded: false })
+    expect(ids(shown)).toEqual(['b', 'a', 'dead'])
+  })
+
+  it('排序稳定：余额相同的账号保持原顺序（否则每次渲染 DOM 抖动）', () => {
+    const first = orderCreditRows([acc('a', 100), acc('b', 100), acc('c', 100)], { limit: 5, expanded: false })
+    const second = orderCreditRows([acc('a', 100), acc('b', 100), acc('c', 100)], { limit: 5, expanded: false })
+    expect(ids(first.shown)).toEqual(['a', 'b', 'c'])
+    expect(ids(second.shown)).toEqual(['a', 'b', 'c'])
+  })
+
+  it('折叠：只给 limit 条，`hidden` 如实报出被收起的条数', () => {
+    const rows = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((id, index) => acc(id, index))
+    const collapsed = orderCreditRows(rows, { limit: 5, expanded: false })
+    expect(collapsed.shown).toHaveLength(5)
+    expect(collapsed.hidden).toBe(2)
+    // 「展开其余 N 个」按 hidden 报数，展开后 hidden 不变（按钮换成「收起」）
+    const expanded = orderCreditRows(rows, { limit: 5, expanded: true })
+    expect(expanded.shown).toHaveLength(7)
+    expect(expanded.hidden).toBe(2)
+  })
+
+  it('刚好等于 limit 时不产生折叠按钮（hidden 为 0）', () => {
+    const rows = ['a', 'b', 'c', 'd', 'e'].map((id, index) => acc(id, index))
+    expect(orderCreditRows(rows, { limit: 5, expanded: false }).hidden).toBe(0)
+  })
+
+  it('脏数据不炸：非数组 / 缺 limit 都退化，不抛错', () => {
+    expect(orderCreditRows(undefined, { limit: 5 }).shown).toEqual([])
+    expect(orderCreditRows(null, {}).shown).toEqual([])
+    expect(ids(orderCreditRows([acc('a', 1)], {}).shown)).toEqual([])   // limit 缺省 0 ⇒ 不显示
+  })
+
+  it('不改动入参数组（组件每轮都拿同一个数组，原地排序会污染宿主给的读数）', () => {
+    const rows = [acc('a', 1), acc('b', 2)]
+    orderCreditRows(rows, { limit: 5, expanded: false })
+    expect(ids(rows)).toEqual(['a', 'b'])
   })
 })
 
