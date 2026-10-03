@@ -1136,6 +1136,63 @@ oauth 用例变红。四条各自独立锁死，**别把它们当同义反复删
 - 适配器必须以 `this.product.id` 作为 provider 实参查询账号池（写死 `'buddy'` 会让 WorkBuddy 永远匹配不到账号）
 - 限流后按池中「已启用且不在重置时间内」的下一个账号自动重试；全部耗尽才抛 `QUOTA_EXCEEDED`
 
+### ⚠️⚠️ 全部账号被**模型限流**时，必须报限流，不能报成「未登录」（真实缺陷，2026-10-03）
+
+**用户报障**：`/compact` 连续四次失败，UI 只显示通用文案
+「Compaction could not produce a useful summary」。解出会话日志后，`compaction/end`
+携带的真实错误是：
+
+```
+buddy: no usable credential; log in from the Jet Hub panel first
+```
+
+而当时 Jet Hub 里 buddy 账号**已登录、已启用、凭据完好** —— 真实原因是它被
+`deepseek-v4.1-flash` 的**模型级限流**挡住（解禁时刻就存在 `modelRateLimits` 里）。
+用户被指去「重新登录」，方向完全错。
+
+**链路**（四个环节都正确，合起来却报出假原因）：
+
+1. 唯一的启用账号带该模型的未过期限流标记 → `pickBuddyCredential`
+   （`src/index.ts`）的候选筛成**空集**；
+2. `select()`（`src/buddy-balance-selector.ts`）对空候选只能回一个笼统的
+   `{kind:'exhausted'}`，**未锁定时 `reason` 被丢弃**；
+3. 调用方退到**单凭据 ref** `BUDDY_ACCESS_TOKEN` —— 而 Jet Hub 登录只写
+   `BUDDY_ACCOUNT_XXX`，该 ref **从未存在过** → `resolveCredential` 返回 `undefined`；
+4. 适配器据此抛 `MISSING_CREDENTIAL`（`src/buddy-adapter.ts`）。
+
+⇒ 与 qoder 的 `110` 被误归 `SERVER`、`10605` 排队被漏判是**同一个病根**：
+**用默认归类代替了对业务语义的判断**。
+
+**修法**：新增纯判据 `allAccountsRateLimitedForModel()`（`src/account-pool.ts`），
+在「候选为空、即将退到单凭据 ref」这一刻**证明**失败原因。位置必须是
+`getAvailableAccount` **之后**、`ctx.credentials.resolve` **之前**：
+池里还有号时不该报限流，而退到单凭据之后就来不及了。
+
+- ⚠️ **只改错误语义，不改可用性**：没有账号可用就是没有，压缩该失败仍然失败；
+  修的是「用户看到的原因」。**绝不静默换模型**（那是替用户做决定），
+  **绝不绕过限流标记**（那会让标记形同虚设）。
+- ⚠️ **判据必须窄**，与选号侧严格同口径（缺标记 / `0` / `now >= resetAt` 都算不受限），
+  且空 `modelId` 直接不判定 —— 选号侧约定空 modelId 不做限流过滤
+  （`if (modelId.length === 0) return true`），不同口径会把「未登录」误报成「限流」。
+  ⚠️ 该空串守卫**不是**冗余：`updateModelRateLimit` **不校验** modelId，
+  理论上可落下 `modelRateLimits['']` 脏键，没有它就会被当成真实限流上报。
+- ⚠️ **只统计启用账号**（`.filter(a => a.enabled)`）：停用账号本就不参与自动选号，
+  把它们算进来会让「有一个号被停用」的普通情况被误报成「全部限流」。
+- ⚠️ **错误码取 `QUOTA_EXCEEDED`**（本仓库既有惯例，且**不在**
+  `DEFAULT_RETRYABLE_CODES` 里）；**不可取 `AUTH`** —— 那会把整条 message
+  换成「API 密钥无效」（判据见下文「安全策略拦截」那条的取证），
+  精心写的解禁时刻在 UI 上一个字都看不到。
+- ⚠️ **文案必须带解禁时刻与「无需重新登录」**：只说「限流」而不给时间，
+  用户仍会去重登或干等。
+- ⚠️ **两处都要接**（`CODEBUDDY` / `WORKBUDDY` 各一处），否则两个 provider 行为不一致。
+- 测试：`tests/unit/buddy-ratelimit-misreport.spec.ts`（19 条：行为级判据 + 源码级接线
+  + 回归保护）。⚠️ 已做**反向验证**：移除两处判定调用 → 3 条变红；
+  逐条破坏判据（去 `modelId` 空串守卫 → 1 条、去 `resetAt===undefined` → 2 条、
+  去 `now>=resetAt` → 2 条、去 `resetAt===0` → 1 条、最早解禁改最晚 → 1 条）。
+  ⚠️ 写用例时注意：断言「判定先于单凭据兜底」**不能只搜 ref 名** ——
+  `BUDDY_CREDENTIAL_REF` 在文件更早处（import 与注册）也出现，会命中错位置
+  （实测 `check=12308` 反而大于 `fallback=751`）；锚点要用**完整的兜底调用语句**。
+
 ### 账号顺序 = 选号优先级（Jet Hub 拖拽排序）
 
 **数组顺序本身就是 `getAvailableAccount` 的候选优先级**，即自动选号与限流换号的实际取号顺序。
