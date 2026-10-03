@@ -983,6 +983,26 @@ export interface RpcGatewayModel {
    * 保守按 text 处理」一致）。
    */
   input: readonly string[]
+  /**
+   * 思考档位视图（与 `/v1/models` 的 `reasoning` 字段**同一份**）。
+   *
+   * 存在的理由与 `models` 相同，但更硬：各 provider 的档位 id 是**上游私有值**
+   * （TRAE 的 `light`/`extra_high`、LobsterAI 的 `xhigh`（界面上叫 Max）、
+   * Cline 的 `max`（界面上叫 Extra）），而 OpenAI 客户端只有固定 8 档词汇。
+   * 用户只能照 DSH 界面上的名字猜着填，猜错就是 400。
+   * `openai_efforts` 就是「该填哪几个」的机读答案。
+   *
+   * 缺省表示该模型**未声明**档位（网关不下发该参数、按模型默认走），
+   * 与「声明了但为空」不是一回事。
+   */
+  reasoning?: {
+    /** 模型真实接受的 id，以及它在客户端里该写成的规范名。 */
+    efforts: Array<{ id: string; name: string; canonical?: string }>
+    /** 适配器配置的默认档（省略表示交给上游默认）。 */
+    default?: string
+    /** 可直接填进客户端的规范名清单（与 `efforts` 一一对应，无翻译损失）。 */
+    openai_efforts: string[]
+  }
 }
 
 /** RPC: 本机 OpenAI 网关开关写入请求。 */

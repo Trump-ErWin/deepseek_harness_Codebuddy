@@ -126,13 +126,14 @@ suite('Cline 只读探针（不发模型请求、不续期）', () => {
     console.log(`  ${parsed.clinePass.length} 个：${parsed.clinePass.slice(0, 4).map((e) => e.id).join(', ')}…`)
 
     expect(parsed.free.length, '远端应至少下发一个免费模型').toBeGreaterThan(0)
-    // 截图里的 5 个应当都在（若某个被下线，本断言会失败并提示需同步兜底表）
+    // 兜底表里的 4 个应当都在（若某个被下线，本断言会失败并提示需同步兜底表）。
+    // ⚠️ 2026-10-03：第 5 个 `cline-free/gemini-3.8-flash` 已被 Cline 下线
+    // （直连回 `404 model not found`），故从本清单与兜底表里一并移除。
     const freeIds = new Set(parsed.free.map((entry) => entry.id))
     for (const id of [
       'stealth/space-bunny-alpha',
       'cline-free/mimo-v2.6-flash',
       'cline-free/deepseek-v4.1-flash',
-      'cline-free/gemini-3.8-flash',
       'cline-free/muse-spark-1.3-contributor',
     ]) {
       expect(freeIds.has(id), `免费模型 ${id} 已不在远端 free 数组中（需更新兜底表与文档）`).toBe(true)

@@ -2788,9 +2788,12 @@ re-authenticate your Cline account."* —— 与真实原因**毫不相干**，�
 远端 `free` 集合 ∪ `:free` 后缀 ∪ `cline-free/` 前缀 ∪ 兜底表 `isFree`。
 与 CodeArts benefit 集合同一约定。
 
-⚠️ **兜底表不足以覆盖免费集合**：sidecar 内嵌目录缺
-`cline-free/gemini-3.8-flash`（远端 `free` 有），故 `cline-product.ts` 的兜底表
-手工补上了它 —— 否则离线时用户看不到截图里的那个模型。
+⚠️ **兜底表要与远端 `free` 数组同步**：sidecar 内嵌目录里**没有** `cline-free/*`
+与 `stealth/space-bunny-alpha`（只有远端 `free` 下发），故 `cline-product.ts` 的兜底表
+手工补上它们 —— 否则离线时用户看不到免费模型。
+⚠️ 2026-10-03 复测：`free` **只剩 4 条**，`cline-free/gemini-3.8-flash` 已被 Cline
+下线（直连回 `404 {"error":"model not found"}`），兜底表、单测与 e2e 清单已同步删除它。
+**别照抄旧版本的表把它加回来**。
 
 ⚠️ **`clinePass` 不是免费集合**：它是 Cline Pass 订阅制模型（`cline-pass/*`），
 按订阅额度计费。实测 14 个，误判为免费会误导用户。
@@ -2848,6 +2851,12 @@ IDE 的模型选择器旁有思考强度菜单（`None / Low / Medium / High / E
 设计文档：`docs/superpowers/specs/2026-09-25-cline-reasoning-effort-design.md`。
 
 ### ⚠️ 坑 5：Gemini 系有两个**独立**的 400，且各自只在部分 provider 上暴露
+
+⚠️ **2026-10-03 补记**：`cline-free/gemini-3.8-flash` 已被 Cline 下线（不在 `free`
+数组里、直连回 `404 model not found`），故兜底表里那条已删除。本节保留为**历史记录**，
+因为两个根因的教训与模型无关：**①表里的数值必须实测**（别照抄邻居的值）、
+**②`sanitizeClineToolParameters()` 是为所有模型服务的安全网**（任何严格校验工具
+`enum` 的上游都会踩到），二者都**不可因这条模型下线而回退**。
 
 用户报障（2026-09-25）：给 `cline-free/gemini-3.8-flash` 发消息即失败。错误体里
 一次请求有**两个 provider 尝试、两个不同的错误**：
@@ -7341,3 +7350,380 @@ JS，里面的 JSDoc 写反引号没问题 —— 但**从它们复制片段进 
 ⚠️ 实测数值（无头浏览器，比较 `getBoundingClientRect` 的渲染宽度与自然宽度 ——
 不能用 clientWidth / scrollWidth，两者会四舍五入）：带角标后 193.56px → **202.19px**，
 名字与读数都不出省略号，仍在 216px 上限内。
+## ⚠️ 本机 OpenAI 网关：两个协议端点**同时可用**，不要做「格式开关」（2026-10-03）
+
+出口在 `src/openai-gateway/`，对外两个端点：
+
+```text
+POST /v1/chat/completions   ← OpenAI Chat Completions（`server.ts` + `messages.ts` + `stream.ts`）
+POST /v1/responses          ← OpenAI Responses API（`responses.ts`）
+GET  /v1/models             ← 两套协议共用同一份目录
+```
+
+⚠️ **用户 2026-10-03 的决定：加 Responses API，但明确否掉了「格式切换开关」** ——
+两个端点**始终都在**，客户端用哪套协议由它请求的 URL 决定。互斥开关只会让「另一个
+协议的客户端在切换后突然失效」，而网关侧面本来就没有互斥的理由。
+
+⚠️ **凡是两套协议共有的东西，只允许有一份实现**（各写一份必然漂移，且漂移的症状是
+「同一件事在 /v1/chat/completions 对、在 /v1/responses 错」这种极难归因的差异）：
+
+| 关注点 | 唯一实现 | 谁在用 |
+|---|---|---|
+| 图片入站（data URL → 附件 → `ImageBlock`） | `messages.ts` 的 `partsFromContent` | 两个端点（Responses 先经 `chatPartsFromResponses` 改写外壳） |
+| 纯文本提取 / 「工具结果不能带图」 | `messages.ts` 的 `textFromContent` | 同上 |
+| 工具 schema 校验 | `messages.ts` 的 `convertTools` | Responses 先经 `toChatTools` 把**扁平**工具写成 Chat 的嵌套形状 |
+| 输出预算校验 + 钳制 | `tokenValue` / `normalizeMaxTokens` | `max_tokens` 与 `max_output_tokens` 走同一判据 |
+| 思考档位归一化（三态） | `normalizeReasoningEffort` | `reasoning_effort` 与 `reasoning.effort` |
+| 取消、错误翻译、CORS、SSE 头 | `server.ts` 的 `withRequest` / `writeSseHead` | 两个端点 |
+
+⚠️ 改这些共享件时**必须同时想两个端点**：`openai-gateway-server.spec.ts` 的
+「Responses API 出口」段里有几条**跨端点**用例（钳制、404 翻译、鉴权）专门锁这件事。
+
+### 两处与 Chat 端点**有意不同**（改 `responses.ts` 前先读文件头）
+
+1. **文本以 `block-end` 的组装块为权威**（`finalText`）。DSH 的正文死循环截断与泄漏
+   清洗**只在 `block-end` 上生效**（`openai-compat.ts` / `buddy-adapter.ts` 的注释、
+   `scripts/verify-blockend-override.ts`）。Chat 端点只累加 delta，触发死循环时会把重复
+   正文交给客户端；Responses 端点取 `block-end`。⚠️ **不要去「顺手统一」Chat 端点** ——
+   那会改动一个已被线上流量验证过的端点，属于本次任务之外的越界重构（与
+   `openai-compat.ts` 那条「只服务 qoder」的约定同因）。
+2. **失败事件的 `error.code` 只放官方枚举值**（`server_error` / `rate_limit_exceeded`）。
+   Responses 的 `Response.error.code` 在官方 SDK 里是 **Literal 枚举**，把 DSH 的内部码
+   （`SERVER` / `QUOTA_EXCEEDED` / `incomplete_stream`）塞进去，客户端会在**解析失败事件**
+   时抛校验错误 —— 用户看到「客户端崩了」，而真实原因是上游错误。
+   精确码放 `error.dsh_code`、本该返回的 HTTP 状态放 `error.status`（Chat 端点的 SSE 错误
+   帧里也有同名字段，口径一致）。
+
+### ⚠️⚠️ Codex 的 `namespace` / `custom` / `tool_search` 工具**不能报错**（真实报障，2026-10-03）
+
+**用户报障**：Codex App 接本网关后整轮对话直接失败，界面上只有一句
+`tool type namespace is not supported（网关只提供 function 工具）`
+（`toChatTools` 的第一版实现）。
+
+**根因**：Codex 0.142+ 用它私有的 Responses 扩展声明工具 ——
+`{type:'namespace', name:'mcp__files__', tools:[{type:'function', name:'read', …}]}`
+外加 `{type:'custom'}`（自由文法工具，如 `apply_patch`）与 `{type:'tool_search'}`。
+这一批形状在第三方网关上普遍翻车（ollama / llama.cpp / xAI 都有对应 issue）。
+而 **namespace 只是分组容器** —— 里面的 function 完全可以表达给模型。
+
+**修法与理由**（`responses.ts` 的「工具」一节有完整注释）：
+
+| 形状 | 处理 |
+|---|---|
+| `function`（顶层） | 原样转 `ToolSchema` |
+| `namespace` 里的 `function` 子工具 | **摊平成 `<namespace>__<child>`**（含 `defer_loading` 的） |
+| `custom` / `tool_search` / `web_search` / `mcp` … | **丢弃 + `onDrop` 上报**（server 侧记 warning） |
+
+⚠️ **判据是「代价与收益是否对等」**：报错的收益只是「让用户知道某个工具没被转发」，
+代价却是**整个会话不可用**。故「无法表达的工具」一律降级为丢弃 + 记日志，
+**绝不 400**。（这与本仓库「不静默丢弃用户显式设置」并不冲突：那条针对的是
+**语义会变**的标量字段 —— `previous_response_id` / `text.format` / 非 1 的 `top_p`，
+它们一旦被忽略，用户以为生效了的设置会给出**错的结果**。）
+
+⚠️ **必须「摊平 + 还原」成对做，且两侧算法同源**：
+- 摊平名只有一份实现 `flatNamespaceToolName()` = `<namespace>__<child>`，
+  超 64 字符截断 + 8 位 sha256 后缀（纯截断会让长名字碰撞）。
+  命名法与 Codex 自己（PR #29602）及 cc-switch / sub2api 一致。
+- **响应侧必须还原**成 `{name: <child>, namespace: <ns>}`（`output_item.added` /
+  `function_call_arguments.done` / `output_item.done` / `response.completed` 四处都要）：
+  Codex 的工具表按 `(namespace, name)` 索引，只回扁平名它会认为
+  「模型调用了一个不存在的工具」。
+- **历史里的 `function_call` 也要换回扁平名**：否则上游看到「工具以 `ns__child`
+  声明、历史却调了 `child`」，等于调了一个没声明过的工具。
+- `tool_choice: {type:'namespace'}` **降级为 `auto`**（DSH 只认 auto/none；降级后
+  模型仍能从已摊平的工具里挑）。
+- ⚠️ 还原表**不靠跨函数状态传递**：`responsesNamespaceToolMap(request)` 从请求体
+  独立重算（cc-switch 同款思路），比让 server 把 map 一路穿进来更不容易漏。
+
+回归用例（`openai-gateway-responses.spec.ts` 6 条 + server spec 1 条）：namespace 摊平、
+`custom`/`tool_search` 丢弃且上报、`tool_choice` 降级、扁平名确定性（含 80 字符长名
+不碰撞）、历史 `function_call` 换名、非流式与流式两处还原、HTTP 层回 200。
+
+### 明确**报 400** 的字段（不静默忽略）
+
+`previous_response_id`（网关无状态、不存响应，`GET /v1/responses/{id}` 一律 404）、
+`background`、`text.format`（DSH 没有结构化输出通道，**不假装**按 schema 约束）、
+非 1 的 `top_p`（`GenerateOptions` 没有 topP）、`item_reference`、
+`input_image.file_id`。
+**接受但忽略**：`store` / `include` / `prompt_cache_key` / `metadata` / `user` /
+`truncation` / `service_tier` / `safety_identifier` / `parallel_tool_calls`。
+⚠️ 判据是「**语义会不会变**」：会变的必须报错（否则用户以为设置生效了），
+不会变的（无状态转发下本就无处安放）接受即可。
+⚠️ **工具类型不属于这一类**（见上一节）：它要按「代价与收益」判，丢弃 + 记日志。
+
+### 其它必须记住的点
+
+- **连续的 assistant item 必须合并成一条消息**（`toMessages`）：Responses 把「助手说
+  一句话」与「助手发起工具调用」拆成两个 item，照 item 一一映射会让**每个用过工具的
+  会话**都给上游留下两条连续 assistant 消息 —— Anthropic 系适配器要求 user/assistant
+  交替，这类历史会被上游拒绝。
+- **`function_call` 的 item 延迟到第一帧 delta 才打开**：`call_id` / `name` 只出现在
+  delta 里，而 `output_item.added` 必须带上它们，否则客户端配不上 call_id。
+- **`block-end` 的块必须能被单独收下**（无 delta 时也要建项）：Chat 端点会整段丢掉它，
+  Responses 端点按块内容补齐一个完整项（用例「只发 block-end 的块不会被丢掉」）。
+- **不发 `data: [DONE]`**：那是 Chat Completions 的收尾约定，Responses 以
+  `response.completed` / `response.failed` 结束。
+- 面板（`openai-gateway-panel.js` 的 `gatewayStatusLines`）在**运行中**时会说明
+  「同一地址同时提供两种协议」——⚠️ 措辞必须是「同时提供」，**不能写「可切换」**
+  （用例会红）。
+- 回归用例：`tests/unit/openai-gateway-responses.spec.ts`（转换 + 流式/非流式事件序列）
+  与 `tests/unit/openai-gateway-server.spec.ts` 的「Responses API 出口」段（HTTP 层）。
+
+## ⚠️ 思考档位有**两套词汇表**：网关必须翻译，客户端表达不出私有 id（真实报障，2026-10-03）
+
+**用户报障的形态**：在 CC Switch（给 Codex 生成模型目录的那一层）里按 DSH 界面显示的
+名字填「思考等级」，之后 Codex 每一轮都失败 ——
+`400 reasoning effort "max" is not supported by the selected DSH model`。
+用户从两端都看不出为什么，只能一档一档试。
+
+**根因**：各 provider 的档位 `id` 就是**上游 wire 值**，与客户端能表达的词汇不是一套：
+
+| provider | DSH 界面上显示（= adapter 的 `name`） | wire id（网关校验的） | 客户端照填 → 旧行为 |
+|---|---|---|---|
+| LobsterAI | 关闭 / 高 / **Max** | `off` / `high` / **`xhigh`** | `max` → 400 |
+| Cline | None / … / **Extra** | `none` / … / **`max`** | `xhigh` → 400 |
+| TRAE | **Light** / High / **Extra High** | **`light`** / `high` / **`extra_high`** | `low` / `xhigh` → 400 |
+| Raccoon | **开启 / 关闭** | **`on`** / `off` | 恰好能用 |
+
+⚠️ **`id` 与 `name` 不是同一个概念**，仓库里已有两处同款教训：
+`lobsterai-adapter.ts` 的 `reasoningFor`（Issue #IKHCZF：最强档显示成 XHigh，而产品侧
+叫 Max）、`cline-product.ts` 的 `CLINE_REASONING_EFFORTS`（`{id:'max', name:'Extra'}`）。
+DSH 的选择器渲染 `name`、发请求用 `id`；**网关校验的也是 `id`**。
+
+⚠️ **客户端侧是硬约束**：OpenAI 协议只有固定 8 档（`none minimal low medium high xhigh
+max ultra`）。CC Switch 把那 8 个（连英文描述）**硬编码在自己的产物里**
+（`cc-switch.exe` 里可抠出这张表，它写进 `cc-switch-model-catalog.json` 再交给 Codex 的
+`model_catalog_json`），它**表达不出** `light` / `extra_high` / `on` / `off`。
+⇒ 「让客户端来查我们对齐」这条路走不通，**只能网关翻译**。
+
+**实现（强度序的唯一权威：`src/reasoning-ladder.ts`）**：
+
+- `REASONING_EFFORT_RANK` 是强度序的**唯一副本**（`trae-adapter.ts` 挑默认档也读它，
+  不再自带一份表）；`CANONICAL_REASONING_EFFORTS` 就是客户端那 8 个。
+- `translateReasoningEffort` 三条规则：① **精确命中**声明的 id → 原样（私有 id 与
+  上游新冒出来的名字都靠这条通过）；② **登记过**的名字 → 同族就近，**同距取更强的一档**
+  （与 raccoon 那条「宁可多思考，不可静默关掉」同因）；③ 没有同族候选 →
+  `unexpressible`，完全不认识 → `unknown`。
+- `normalizeReasoningEffort`（`messages.ts`）：`unknown` **仍然 400**（拼错不该被静默
+  翻译，且报错里带上该模型可用档位）；`unexpressible` **不下发 + 记 warning**；
+  翻译成功记 **info** —— 这是加了翻译层之后的**正常路径**（CC Switch 给 TRAE 的 `low`
+  每一轮都会被翻译），用 warn 会把日志刷满、反而掩盖真正的异常。
+- ⚠️ **只在同族内翻译**：`off`/`none`（rank 0）与其余各档**互不翻译**。
+  把「少想一点」翻译成「完全不想」= 静默关掉功能，比 400 更糟。
+- ⚠️ **未登记强度的声明 id 不参与就近匹配**（不知道强度就不猜）。
+- `provider === 'codearts'` 的短路保留：该 provider 只有开/关两态，任何名字都等价。
+
+**可查询（三个出口，必须同源）**：
+
+| 出口 | 内容 |
+|---|---|
+| `GET /v1/models` 的 `reasoning` | `efforts`（带 `canonical`）+ `default` + `openai_efforts` |
+| `GET /v1/reasoning-efforts` | 逐模型 + 8 个规范名**逐一的结局**（exact / mapped / unexpressible / ignored） |
+| 设置页弹窗「思考档位对照表」 | 同一份数据（`gatewayEffortRows` 纯函数 + RPC 的 `models[].reasoning`） |
+
+⚠️ **`ignored`（模型没声明档位）与 `unexpressible`（声明了但没有这一族）必须分开报**：
+前者网关什么都没做（按模型默认走），后者是用户明确要的档位没生效。合并会让排查看不出差异。
+
+⚠️ **判据（与工具那条同源）**：拒绝的收益（让用户知道某档没生效）远小于代价
+（整轮不可用，且客户端**没有**能表达私有 id 的写法 ⇒ 用户无从修复）。
+
+⚠️ 反查 `canonicalReasoningEffortFor` **只在单个模型的声明集合内**保证往返自洽
+（`translate(canonicalFor(id), declared) === id`）；把几个渠道的档位混成一个集合再反查
+没有意义 —— 用例里按渠道分别验。
+
+⚠️⚠️ **面板对照表不复用模型清单的行样式**（用户反馈，2026-10-03：「你这对照表字符过长
+都被省略了」）：`dim-jh-modelId` / `dim-jh-modelName` 带 `max-width: 46%` +
+`text-overflow: ellipsis` + `white-space: nowrap`（模型清单要紧凑，那是刻意的），
+而对照表那两行**正是用户要抄走的内容** —— 截断等于让这个功能失效。
+故对照表用自己那套 `dim-jh-effortRow` / `dim-jh-effortHead` / `dim-jh-effortModel` /
+`dim-jh-effortLine`（`overflow-wrap: anywhere`，**不得**出现 `ellipsis` / `nowrap`）。
+`openai-gateway-panel.spec.ts` 的「排版（不截断）」段锁死了这两点（样式不得截断 +
+渲染处不得用 `dim-jh-modelName`）。
+
+⚠️ **对照表的搜索比模型清单多匹配「档位名」**（`matchesEffortQuery` 复用
+`matchesModelQuery` 之后**再补**真实档位名与该填的规范名）：最常用的查法就是
+「哪个渠道有 `xhigh`」「界面上的 Max 到底是哪个 id」—— 后者正是用户踩过的坑。
+**别**为了「统一」把它换成只认 id/name（用例里有一条专门锁这个差异）。
+空搜索词 = 未搜索（原样返回、不复制）这条约定与模型清单共用 `model-filter.js` 的
+`isFilterActive`，不要各写一份。
+
+⚠️ 对照表**只含已开启的模型**（数据来自适配器 `listModels` 的黑名单过滤，
+与对话框模型选择器同源）。文案必须点明「当前已开启的 N 个模型里…」——
+否则用户看到「14 个」会以为网关只认得 14 个模型（他实际这么反馈过）。
+
+**回归用例**：`tests/unit/reasoning-ladder.spec.ts`（强度序 / 三条规则 / 同族约束 /
+反查往返）、`openai-gateway-messages.spec.ts`（翻译 + 通知 + 未知仍 400 + 不下发）、
+`openai-gateway-models.spec.ts`（档位视图 + 容错 + 两处同源）、
+`openai-gateway-server.spec.ts` 的「思考档位」段（HTTP 层实测那三条雷 + 对照表端点）、
+`openai-gateway-panel.spec.ts`（对照表行与文案 / 搜索判据 / 不截断排版）。
+
+## ⚠️ Cline 限流：倒计时用**报文里的人类可读时长**，402 不许倒数（真实报障两次，2026-10-03）
+
+**用户报障 ①**：「倒计时结束了我再去连为什么还是失败了，显示要 60 分钟后？」
+**用户报障 ②**（当晚，第一次修完并重启后）：「还是 60 分钟，而且连余额也查询失败了」
+
+### 第二次报障推翻的结论（**这是本节最值钱的一条**）
+
+第一次修复时我**只按文档推断**，在注释里写下「Cline 在 429 上**会给出** `retry-after`
+（官方错误码表 + 它自己客户端的 long-retry-after 分支）」，于是只加了「读响应头」。
+**实测证伪** —— 直连取证（`probe-cline-live.mjs`，2026-10-03 23:10）：
+
+```
+POST https://api.cline.bot/api/v1/chat/completions   model=cline-free/deepseek-v4.1-flash
+→ HTTP 429
+  date: Sat, 03 Oct 2026 15:10:33 GMT
+  no-retry: true                       ← 没有任何 retry-after / x-ratelimit-reset
+  x-request-id: JvXBMYgDCJKhLXnaJOXdzCnouwNjqVlJ
+  {"error":{"code":"INFERENCE_CAP_ERROR",
+    "message":"Error 429: Daily free limit reached on model
+               deepseek/deepseek-v4.1-flash. Try again in 19h 39m"}}
+```
+
+⇒ 真实等待是 **19 小时 39 分**（当日免费额度），而代码读到的是「没有时间」→ 退回
+**1 小时的快照兜底**。用户等满 1 小时再试当然还是 429，而且每失败一次就从当下重算
+一小时 ⇒「永远 60 分钟」可以无限循环。
+
+⚠️ **两条可复用的教训**：
+
+1. **「报文里没有机器可读的时间」≠「报文里没有时间」**。Cline 把时长写在**英文句子**
+   里（`Try again in 19h 39m`）。同类句式还有 `Try again in 5m` / `1h 30m` / `45s`。
+   排查限流务必把**原始报文原文**打出来看，别只看响应头。
+2. **文档推断不能当实测**。上一版的结论来自官方错误码表，方向对（Cline 确实分
+   WAIT/STOP），但**协议细节是错的** —— 这与 qoder「某次实测没看到就推广成不存在」、
+   TRAE「带 code 的回调」是同一类错误。
+
+### 429 有**三种**语义，动作互不相同（都只能靠文案区分）
+
+| 形态 | 判据（报文原文） | 正确动作 | 处理 |
+|---|---|---|---|
+| **当日免费额度** | `Daily free limit reached` + `Try again in 19h 39m` | **等不到头**；改用同一账号的**另一个免费模型** | 标记 = 服务端给的时长；文案只说「按天结算、按模型单独计 + 预计 N 小时后重置 + 可先改用其它免费模型」 |
+| **短时限流** | `Rate limit exceeded` 一类 | 等一会儿 / 换账号 | 标记 = 报文时长 → 头 → 兜底 1 小时 |
+| **402 额度耗尽** | `Insufficient credits` | 去 app.cline.bot 充值 | **不写倒计时**（但仍换号） |
+
+⚠️ **免费额度是「按模型」单独计的**（同一时刻实测，同一个账号）：
+
+| 模型 | 结果 |
+|---|---|
+| `cline-free/deepseek-v4.1-flash` | 429 `Daily free limit reached … Try again in 19h 29m` |
+| `cline-free/mimo-v2.6-flash` | **200** |
+| `cline-free/muse-spark-1.3-contributor` | **200** |
+
+标记也只能落到那一个模型键上（`modelRateLimits[model]`）。
+
+⚠️⚠️ **`cline-pass/*` 不是「有余额就能用」的备用通道** —— 第一版建议写成
+「改用同一账号的 `cline-pass/*` 付费通道（走账号余额）」，**实测证伪**：
+
+```
+POST /api/v1/chat/completions  model=cline-pass/deepseek-v4.1-flash
+→ HTTP 403 {"error":{"code":"ENTITLEMENT_ERROR",
+             "message":"Error 403: the user is not subscribed to required model plan"}}
+```
+
+该账号**有余额**（`/balance` → `balance: 500000`）但**没有订阅计划**
+（`/users/me/plan/usage-limits` → `404 no plan history found for user`）。`cline-pass/*`
+是**订阅**通道 ⇒ 文案里**不许再提它**。教训与本节第 2 条同源：**推荐动作必须实测过**
+（我凭「有余额就走付费」的直觉写了一句话，用户照做只会再撞一次墙）。
+
+### 三处根因（第一次报障的 1~3 + 第二次报障的 4~5）
+
+1. **写死的 60 分钟，且没有 Cline 专属解析**：标记写的是 `Date.now() + 3_600_000`。
+   **证据**：`~/.dsh/jet-hub/state.json` 里 cline 那条是 `…:59.963Z` —— `.963`
+   毫秒正是 `Date.now()+3_600_000` 的指纹（同一文件里 buddy 的 `…:07.000Z`、
+   codearts 的 `16:00:00.000Z` 都是「整」值）。
+2. **402 也被记成倒计时**：官方语义是 `Insufficient credits`，**等多久都不会恢复**。
+3. **被自己的标记挡住时报「请先登录」**：池把被标记的账号筛掉（`account-pool.ts`
+   的 `Date.now() >= resetAt` 过滤）→ `resolveCredential` 回 `undefined` → 适配器抛
+   `cline: no usable credential; log in first`。凭据明明在、账号也登录着，用户却被
+   指去重新登录。这与 buddy 那次（`buddy-ratelimit-misreport.spec.ts` 记着）**同型**：
+   buddy / workbuddy 早已接上 `throwIfAllAccountsRateLimited`，**cline 漏了**。
+4. **只读响应头 ⇒ 实测报文下仍然退回 60 分钟**（见上「第二次报障」）。
+5. **⚠️ 换号预算用尽时，最后失败的那个账号从来没被标记**：原来的写法把标记放在
+   **下一轮的开头**（`for` 里第一件事就是标记「上一轮失败的那个账号」），于是当
+   `round` 用尽而退出循环时，**最后一个**账号永远不会被标记 —— 它下一次又被
+   `getAvailableAccount` 选中，立刻再撞一次同样的墙。本机 cline 只有**一个**账号，
+   这条尤其致命（`getAvailableAccount` 立刻返回 null 就退出，看似「标记了」）。
+   ⇒ 现在 `markLimited()` 在**每次失败后**调用（用 `markedAccountId` 防重复），
+   循环结束后再补一次。
+
+**修法（勿回退）**：
+
+| # | 改什么 | 位置 |
+|---|---|---|
+| 1 | 标记时长取值序：`retry-after` 头（秒数 / HTTP 日期，**0 是合法值**）→ **报文里的 `Try again in 19h 39m`** → 通用绝对时刻句式 → 兜底快照 | `src/cline-rate-limit.ts` 的 `clineRateLimitResetAt` |
+| 2 | `recordsClineRateLimit` **只认 429**（402 不写徽章，但仍换号 —— 「不写徽章 ≠ 不换号」） | 同上 |
+| 3 | cline 的 `resolveCredential` 接上 `throwIfAllAccountsRateLimited(CLINE, modelId)`，且**必须先于**单凭据 ref 兜底 | `src/index.ts` |
+| 4 | 全部账号失败时按「免费额度 / 短时限流 / 402」给**三种不同**建议；**识别出语义就不再复述上游原文**（只在没识别出时附上），文案保持简短 | `clineExhaustedAdvice` |
+| 5 | 每个失败账号（含最后一个）都写标记 | `cline-adapter.ts` 的 `markLimited` |
+
+⚠️ **这三件事收敛在 `src/cline-rate-limit.ts` 一处**（原先 `clineExhaustedAdvice` /
+`recordsClineRateLimit` 在适配器里、解析在别处，改一处必漏另一处）。
+
+⚠️ 时长 token 的正则**必须带尾部 `(?![a-z])`**：`minutes?` 与 `m` 两个分支都能匹配
+`2 minutes` 里的 `m`，少了它会把 2 分钟算成 4 分钟（时长直接翻倍）。
+⚠️ 共享的全局正则**每次用前重置 `lastIndex`**（`matchAll` 会复制 `lastIndex`），
+否则第二次调用的结果随调用次数漂移。
+
+### ⚠️ 报错**文案的长度**也是需求（真实报障第三次，2026-10-03）
+
+用户原话：「可以，cline 显示正常，不过这个报告和其它的供应商比起来是不是太长了？改简短点吧。」
+
+**病根不是话说错，而是同一件事说了两遍**：
+
+```
+cline: 模型 cline-free/deepseek-v4.1-flash 的所有账号均不可用（HTTP 429 Error 429: Daily free
+limit reached on model deepseek/deepseek-v4.1-flash. Try again in 19h 39m）。这是该模型的**当日
+免费额度**已用尽（HTTP 429 Daily free limit reached）—— 免费额度按天结算、且**按模型单独
+计算**，盯着它等不会提前恢复，服务端给出的解禁时刻是 2026/10/4 18:49:21（约 18.7 小时后）。
+要立刻继续，可改用**同一个账号的另一个免费（cline-free/*）模型**，或换其它 provider / 账号
+```
+
+`（…）` 里那段是**上游英文原文**，后面的中文又把它解释了一遍 —— 两者信息完全重叠，
+消息长度因此是其它 provider 的两三倍（对照：`lobsterai` 的
+`模型 X 所有账号均不可用（明细）` ≈ 60 字符、`codearts` 的额度文案 ≈ 100 字符）。
+
+⚠️ 第二个坑：**错误气泡不渲染 markdown**，`**加粗**` 会**原样显示星号**
+（用户截图里就是 `**当日免费额度**`）。错误消息只能写纯文本。
+
+**修法**（`clineExhaustedAdvice`）：
+
+| # | 规矩 | 判据 |
+|---|---|---|
+| 1 | **识别出语义就不再复述原文**（免费额度 / 402 两种都识别得出），只留「是什么 + 何时恢复 + 现在改用什么」 | 单测 `not.toContain('Daily free limit reached')` |
+| 2 | **没识别出语义时仍附原文**（那是唯一排障线索） | 单测 `toContain('Rate limit exceeded')` |
+| 3 | 纯文本，不用 `**` | 单测 `not.toContain('**')` |
+| 4 | 长度上限：单条建议 < 100 字符、最终 `error.message` < 150 字符 | 单测的长度断言（改文案别撑回去） |
+
+改后同一条消息：**135 字符**（原 ≈ 270）。
+
+```
+cline: 模型 cline-free/deepseek-v4.1-flash 的所有账号均不可用 —— 当日免费额度已用尽（HTTP 429），
+预计 19.7 小时后重置（2026/10/4 19:49:20）；额度按天结算、按模型单独计 —— 可先改用其它免费模型
+```
+
+⚠️ **代价**：这条路径的报文**不进请求记录**（`stream()` 在 `consumeWithLog` 之前就抛了），
+所以「原文」不再出现在任何面向用户的地方 —— 排障时按本文件上方那节的思路重跑一次直连探针即可
+（`parseClineRateLimitHint` 只认 `Daily free limit reached` 这个标记，得到的中文结论是可反推的）。
+
+### 余额查询「fetch failed」是**另一回事**（不是本次改动造成的）
+
+面板那次 `余额查询网络失败：fetch failed` 与限流无关，且**不可复现**：`probe-cline-stability.mjs`
+对 `GET /api/v1/users/{id}/balance` 连打 5 次全部 **HTTP 200**（`balance: 500000`）。
+它是插件宿主进程里的一次**瞬时传输失败**（`fetch failed` 是 undici 的连接层 TypeError）。
+⚠️ 关键**反证**：面板的积分/额度走 `ctx.credentials.resolve`，**不经过**
+`resolveCredential`，所以第 3 条那个限流前置检查**碰不到它** —— 别把它算到限流修复头上。
+排查时先直连同一端点看是否健康，再怀疑代码。
+
+⚠️ 顺带实测（同一探针）：`GET /api/v1/users/me/plan/usage-limits` 对该账号回
+**404 `no plan history found for user`** —— 这是「没有订阅计划」的**正常**形态（不是故障），
+「订阅额度」那一行据此显示原因即可。
+
+**回归用例**：`tests/unit/cline-rate-limit.spec.ts`（19 条：实测报文 → 19h39m + 认
+`Daily free limit` / 单位可省略 / 多段累加 / `2 minutes` 不翻倍 / `0s` 合法 / 句末无关数字
+不计数 / 非 JSON 与 `{error:"…"}` 外壳 / 取值优先级四条 / 三种建议话术）、
+`cline-adapter.spec.ts` 的「限流标记」段（8 条：429+头 → 用 600 秒 / 429 无头 → 1 小时快照 /
+HTTP 日期 / **★ 实测报文 → 19h39m，且文案**不含**原文、含「按天结算」「按模型单独计」、
+长度 < 150** / **★ 轮次用尽时最后一个账号也被标记** / 402 不写标记且文案含「充值」 /
+无池账号不写标记）、`tests/unit/retry-after.spec.ts`（10 条）、
+`buddy-ratelimit-misreport.spec.ts` 的「cline 同型缺陷」接线段（4 条）。
+⚠️ 已做**反向验证**：把「报文时长」那条分支短路 → 2 条变红；去掉循环后的补标记 → 2 条变红。
+

@@ -272,6 +272,22 @@ const STYLES = `
    flex: none 是必需的 —— 它是行尾的固定标签，参与收缩会被 id/name 挤没。 */
 .dim-jh-modelBadge { flex: none; padding: 1px 6px; border-radius: 5px; background: var(--dsw-alias-color-success-light, #e8ffea); color: var(--dsw-alias-color-success, #00875a); font-size: 11px; line-height: 16px; white-space: nowrap; }
 
+/* ── 思考档位对照表 ──
+   与模型清单的行**刻意不同**：那两行的 id/name 用 ellipsis 截断（清单要紧凑），
+   而对照表的内容本身就是用户要抄的东西 —— 截断等于让功能失效
+   （真实反馈：「你这对照表字符过长都被省略了」）。
+   故这里用 grid 竖排：第一行模型 id + 徽标，后两行整宽、可换行、可选中复制。
+   ⚠️ 绝不能加 text-overflow: ellipsis / white-space: nowrap。 */
+.dim-jh-effortRow { display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; min-width: 0; padding: 7px 8px; border-radius: 8px; }
+.dim-jh-effortRow:hover { background: var(--dsw-alias-bg-layer-2, #f7f8fa); }
+.dim-jh-effortHead { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* 模型 id 在这里允许换行（对照表不追求单行紧凑），但仍优先占满剩余宽度。 */
+.dim-jh-effortModel { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-effortLine { min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #4e5969); }
+.dim-jh-effortLabel { color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 搜索结果为空时的提示（与其它空状态同款观感）。 */
+.dim-jh-effortEmpty { padding: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+
 /* ── 模型列表的「计费/来源」分组（订阅 / 免费 / Cline Cloud / 按量计费）──
    分组由 model-groups.js 的纯函数决定（判据见其模块注释）；这里只管观感。
    ⚠️ 组头是**独立的 div**，绝不能包进 .dim-jh-modelRow 的 <label> 里 ——

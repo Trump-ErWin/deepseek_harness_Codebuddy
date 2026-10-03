@@ -1,3 +1,5 @@
+import { effortView, type GatewayEffortView } from './effort-view.js'
+
 export interface GatewayModelInfo {
   id: string
   name: string
@@ -22,6 +24,13 @@ export interface OpenAiModel {
   context_window?: number
   max_tokens?: number
   input?: readonly string[]
+  /**
+   * 思考档位的**机读视图**（附加字段，OpenAI 规范里没有这个语义）。
+   *
+   * ⚠️ 模型**没声明**档位时**整个字段缺省**（而不是给空数组）——「不知道」与
+   * 「一个都没有」对客户端是两件事，见 `effort-view.ts` 的 `effortView`。
+   */
+  reasoning?: GatewayEffortView
 }
 
 export function toOpenAiModelId(provider: string, model: string): string {
@@ -32,6 +41,13 @@ export function toOpenAiModelId(provider: string, model: string): string {
 export interface GatewayModelSource {
   listProviders(): readonly { id: string }[]
   listModels(provider: string): Promise<readonly GatewayModelInfo[]>
+  /**
+   * 可选：解析某个模型的**精确**元信息（档位在这里，`listModels` 不带）。
+   *
+   * ⚠️ 声明为可选是刻意的：它是**附加能力**。宿主没提供（旧版本、单测替身）时
+   * 目录照常返回，只是不带档位视图 —— 绝不能因为拿不到档位就让整个目录失败。
+   */
+  resolveModelInfo?(provider: string, model: string, signal?: AbortSignal): Promise<unknown>
 }
 
 /**
@@ -93,28 +109,99 @@ export async function collectGatewayModels(
 export async function collectGatewayModelIds(
   llm: GatewayModelSource,
   onError?: (provider: string, error: unknown) => void,
-): Promise<Array<{ id: string; name: string; input: readonly string[] }>> {
+  effortViews?: ReadonlyMap<string, GatewayEffortView>,
+): Promise<Array<{ id: string; name: string; input: readonly string[]; reasoning?: GatewayEffortView }>> {
   const groups = await collectGatewayModels(llm, onError)
-  return groups.flatMap(({ provider, models }) => models.map((model) => ({
-    id: toOpenAiModelId(provider, model.id),
-    name: model.name,
-    input: Array.isArray(model.inputModalities) && model.inputModalities.length > 0
-      ? [...model.inputModalities]
-      : ['text'],
+  return toGatewayModelIds(groups, effortViews)
+}
+
+/**
+ * 分组目录 → 扁平行（设置页/面板用）。
+ *
+ * ⚠️ 抽成**纯函数**是为了让「已经采集过分组与档位」的调用方直接复用，
+ * 而不是再走一遍 `collectGatewayModelIds` 把目录拉第二次
+ * （重复采集的症状是同一份清单里两次出现不同的档位）。
+ */
+export function toGatewayModelIds(
+  groups: readonly GatewayProviderModels[],
+  effortViews?: ReadonlyMap<string, GatewayEffortView>,
+): Array<{ id: string; name: string; input: readonly string[]; reasoning?: GatewayEffortView }> {
+  return groups.flatMap(({ provider, models }) => models.map((model) => {
+    const id = toOpenAiModelId(provider, model.id)
+    const reasoning = effortViews?.get(id)
+    return {
+      id,
+      name: model.name,
+      input: Array.isArray(model.inputModalities) && model.inputModalities.length > 0
+        ? [...model.inputModalities]
+        : ['text'],
+      ...reasoning === undefined ? {} : { reasoning },
+    }
+  }))
+}
+
+/**
+ * 逐个模型解析**档位视图**（key = `provider/model`）。
+ *
+ * ## 为什么要单独解析
+ *
+ * DSH 的 `LlmModelInfo`（`listModels` 的产物）**不带**档位，档位只在
+ * `resolveModelInfo` 的 `LlmResolvedModelInfo.reasoning` 里。而档位正是本网关
+ * 最需要公开的东西 —— 各 provider 的档位 id 私有（`light` / `extra_high` /
+ * `xhigh` / `on`），客户端不查就只能猜，猜错就是 400。
+ *
+ * ## 成本与容错
+ *
+ * 每个模型一次 `resolveModelInfo`：它读的是适配器**已缓存**的远端目录
+ * （`listModels` 刚拉过），故不产生额外网络请求；DSH 自己的 `buildModelCatalog`
+ * 也是「每个 provider listModels 后逐个 resolveModelInfo」的同一形状。
+ * 逐模型 catch：单个模型解析失败只是**它**没有档位字段，不影响整个目录。
+ */
+export async function collectGatewayEffortViews(
+  llm: GatewayModelSource,
+  groups: readonly GatewayProviderModels[],
+  onError?: (provider: string, error: unknown) => void,
+): Promise<Map<string, GatewayEffortView>> {
+  const views = new Map<string, GatewayEffortView>()
+  const resolve = llm?.resolveModelInfo
+  // 宿主不提供该能力时**静默返回空表**：档位是附加信息，拿不到就不发字段，
+  // 不能让整份目录跟着失败。
+  if (typeof resolve !== 'function') return views
+  await Promise.all(groups.flatMap(({ provider, models }) => models.map(async (model) => {
+    try {
+      const info = await resolve.call(llm, provider, model.id) as {
+        reasoning?: { efforts?: readonly { id?: unknown; name?: unknown }[]; defaultEffort?: unknown }
+      } | undefined
+      const view = effortView(info?.reasoning?.efforts, info?.reasoning?.defaultEffort)
+      if (view !== undefined) views.set(toOpenAiModelId(provider, model.id), view)
+    } catch (error) {
+      onError?.(provider, new Error(
+        `${model.id} 的档位解析失败（该模型不带档位字段，目录本身照常返回）：`
+        + `${error instanceof Error ? error.message : String(error)}`,
+      ))
+    }
   })))
+  return views
 }
 
 /** 将 DSH 的 provider 分组目录转换为 OpenAI models 响应中的 data 项。 */
-export function toOpenAiModels(groups: readonly GatewayProviderModels[]): OpenAiModel[] {
-  return groups.flatMap(({ provider, models }) => models.map((model) => ({
-    id: toOpenAiModelId(provider, model.id),
-    object: 'model' as const,
-    created: 0,
-    owned_by: provider,
-    name: model.name,
-    ...model.description === undefined ? {} : { description: model.description },
-    ...model.contextWindow === undefined ? {} : { context_window: model.contextWindow },
-    ...model.maxTokens === undefined ? {} : { max_tokens: model.maxTokens },
-    ...model.inputModalities === undefined ? {} : { input: model.inputModalities },
-  })))
+export function toOpenAiModels(
+  groups: readonly GatewayProviderModels[],
+  effortViews?: ReadonlyMap<string, GatewayEffortView>,
+): OpenAiModel[] {
+  return groups.flatMap(({ provider, models }) => models.map((model) => {
+    const reasoning = effortViews?.get(toOpenAiModelId(provider, model.id))
+    return {
+      id: toOpenAiModelId(provider, model.id),
+      object: 'model' as const,
+      created: 0,
+      owned_by: provider,
+      name: model.name,
+      ...model.description === undefined ? {} : { description: model.description },
+      ...model.contextWindow === undefined ? {} : { context_window: model.contextWindow },
+      ...model.maxTokens === undefined ? {} : { max_tokens: model.maxTokens },
+      ...model.inputModalities === undefined ? {} : { input: model.inputModalities },
+      ...reasoning === undefined ? {} : { reasoning },
+    }
+  }))
 }

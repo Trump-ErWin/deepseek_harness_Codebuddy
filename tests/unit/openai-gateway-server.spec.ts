@@ -363,3 +363,291 @@ describe('模型不存在：状态码翻译与纠错建议', () => {
     }
   })
 })
+
+/**
+ * `/v1/responses`（OpenAI Responses API）。
+ *
+ * ⚠️ 两个端点**同时可用**（用户 2026-10-03 的决定）：不做「格式开关」，
+ * 客户端用哪套协议由它自己请求的 URL 决定 —— 互斥开关只会让另一个协议的客户端
+ * 在切换后突然失效。
+ */
+describe('Responses API 出口', () => {
+  it('非流式：返回 response 对象；鉴权与模型路由与 Chat 路径同一套', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm, env: ENV(port) })
+    await gateway.start()
+    try {
+      // 无 key ⇒ 401（同一个鉴权闸门）。
+      expect((await call(port, '/v1/responses', {
+        method: 'POST', body: { model: 'qoder/qfmodel', input: 'hello' },
+      })).status).toBe(401)
+
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: { model: 'qoder/qfmodel', input: 'hello' },
+      })
+      expect(result.status).toBe(200)
+      const parsed = JSON.parse(result.body)
+      expect(parsed.object).toBe('response')
+      expect(parsed.status).toBe('completed')
+      expect(parsed.model).toBe('qoder/qfmodel')
+      expect(parsed.output[0].content[0].text).toBe('hello')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('流式：给出 Responses 的事件序列，且**不**发 data: [DONE]', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm, env: ENV(port) })
+    await gateway.start()
+    try {
+      const response = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: { model: 'qoder/qfmodel', input: 'hello', stream: true },
+      })
+      expect(response.status).toBe(200)
+      expect(response.body).toContain('event: response.created')
+      expect(response.body).toContain('event: response.output_text.delta')
+      expect(response.body).toContain('event: response.completed')
+      expect(response.body).not.toContain('[DONE]')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('max_output_tokens 同样经过 CodeArts 的输出预算钳制（两个端点共用同一份归一化）', async () => {
+    const port = await freePort()
+    let actualMaxTokens: number | undefined
+    const captureLlm = {
+      ...llm,
+      resolveModelInfo: async () => ({ provider: 'codearts', id: 'GLM-5.2', name: 'GLM-5.2' }),
+      stream: (options: { maxTokens?: number; signal?: AbortSignal }) => {
+        actualMaxTokens = options.maxTokens
+        return responseStream(options.signal)
+      },
+    }
+    const gateway = createOpenAiGateway({ llm: captureLlm, env: ENV(port) })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: {
+          model: 'codearts/GLM-5.2', input: 'hello', max_output_tokens: 128000, stream: false,
+        },
+      })
+      expect(result.status).toBe(200)
+      // Chat 端实测 128000 会被上游拒绝，65536 可正常推理 —— 换了协议不能绕过钳制。
+      expect(actualMaxTokens).toBe(65536)
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('⚠️ 语义会变的字段明确回 400（不静默忽略）', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm, env: ENV(port) })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: {
+          model: 'qoder/qfmodel', input: 'hello', previous_response_id: 'resp_1',
+        },
+      })
+      expect(result.status).toBe(400)
+      expect(JSON.parse(result.body).error.code).toBe('unsupported_parameter')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('模型解析不了时同样回 404（不是会被重试的 502）', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({
+      llm: { ...llm, resolveModelInfo: async () => { throw new Error('unknown provider or model') } },
+      env: ENV(port),
+    })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: { model: 'nosuch/nosuch', input: 'hello' },
+      })
+      expect(result.status).toBe(404)
+      expect(JSON.parse(result.body).error.code).toBe('model_not_found')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  /**
+   * **真实报障回归**（2026-10-03）：Codex App 接网关后整轮对话失败
+   * `tool type namespace is not supported（网关只提供 function 工具）`。
+   * namespace 只是分组容器 ⇒ 摊平即可；表达不了的（custom / tool_search）
+   * 只丢弃 + 记日志，**绝不能**让请求失败。
+   */
+  it('★ Codex 的 namespace / custom / tool_search 工具：回 200，子工具摊平后到达上游', async () => {
+    const port = await freePort()
+    let seenTools: unknown
+    const captureLlm = {
+      ...llm,
+      stream: (options: { tools?: unknown; signal?: AbortSignal }) => {
+        seenTools = options.tools
+        return responseStream(options.signal)
+      },
+    }
+    const gateway = createOpenAiGateway({ llm: captureLlm, env: ENV(port) })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: {
+          model: 'qoder/qfmodel',
+          input: 'hello',
+          tools: [
+            { type: 'namespace', name: 'mcp__files__', tools: [{ type: 'function', name: 'read', parameters: {} }] },
+            { type: 'custom', name: 'apply_patch' },
+            { type: 'tool_search' },
+          ],
+        },
+      })
+      expect(result.status).toBe(200)
+      expect(seenTools).toEqual([{ name: 'mcp__files____read', description: '', parameters: {} }])
+    } finally {
+      await gateway.close()
+    }
+  })
+})
+
+/**
+ * 思考档位的**翻译层 + 可查询**（真实缺陷：CC Switch 的档位表与 provider 私有 id
+ * 对不上，用户照着 DSH 界面上的名字填，得到 400 + 整轮不可用）。
+ */
+describe('OpenAI gateway 思考档位（翻译层与对照表）', () => {
+  const TRAE = {
+    listProviders: () => [{ id: 'trae' }],
+    listModels: async () => [{ provider: 'trae', id: 'deepseek-v4.1-flash', name: 'Flash' }],
+    resolveModelInfo: async () => ({
+      provider: 'trae',
+      id: 'deepseek-v4.1-flash',
+      name: 'Flash',
+      reasoning: {
+        efforts: [
+          { id: 'light', name: 'Light' },
+          { id: 'high', name: 'High' },
+          { id: 'extra_high', name: 'Extra High' },
+        ],
+        defaultEffort: 'high',
+      },
+    }),
+    stream: (options: { signal?: AbortSignal }) => responseStream(options.signal),
+  }
+
+  it('★ 客户端填的是通用档位名、模型认的是私有 id：请求成功且下发的是私有 id', async () => {
+    // CC Switch 里 TRAE 这一行现在填的是 `low, high, xhigh` —— 修好前这三个
+    // 里有两个直接 400（整轮失败）。修好后应当照强度落到 light / high / extra_high。
+    const port = await freePort()
+    const seen: Array<string | undefined> = []
+    const captureLlm = {
+      ...TRAE,
+      stream: (options: { reasoningEffort?: string; signal?: AbortSignal }) => {
+        seen.push(options.reasoningEffort)
+        return responseStream(options.signal)
+      },
+    }
+    const gateway = createOpenAiGateway({ llm: captureLlm, env: ENV(port) })
+    await gateway.start()
+    try {
+      for (const effort of ['low', 'high', 'xhigh']) {
+        const result = await call(port, '/v1/responses', {
+          method: 'POST', key: 'test-key', body: { model: 'trae/deepseek-v4.1-flash', input: 'hi', reasoning: { effort } },
+        })
+        expect(result.status, effort).toBe(200)
+      }
+      // `none` 则无处可去（TRAE 这模型没有关闭档）→ 不下发该参数，但请求仍然成功。
+      const none = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: { model: 'trae/deepseek-v4.1-flash', input: 'hi', reasoning: { effort: 'none' } },
+      })
+      expect(none.status).toBe(200)
+      expect(seen).toEqual(['light', 'high', 'extra_high', undefined])
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('★ 完全不认识的档位名仍然 400（拼错不该被静默翻译），且报错带上可用档位', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm: { ...TRAE }, env: ENV(port) })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/responses', {
+        method: 'POST', key: 'test-key', body: { model: 'trae/deepseek-v4.1-flash', input: 'hi', reasoning: { effort: 'banana' } },
+      })
+      expect(result.status).toBe(400)
+      const parsed = JSON.parse(result.body)
+      expect(parsed.error.code).toBe('unsupported_reasoning_effort')
+      expect(parsed.error.message).toContain('light, high, extra_high')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('/v1/models 带上档位视图（工具据此就能填对，不必猜）', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm: { ...TRAE }, env: ENV(port) })
+    await gateway.start()
+    try {
+      const models = JSON.parse((await call(port, '/v1/models', { key: 'test-key' })).body)
+      expect(models.data[0].reasoning).toEqual({
+        efforts: [
+          { id: 'light', name: 'Light', canonical: 'low' },
+          { id: 'high', name: 'High', canonical: 'high' },
+          { id: 'extra_high', name: 'Extra High', canonical: 'xhigh' },
+        ],
+        default: 'high',
+        openai_efforts: ['low', 'high', 'xhigh'],
+      })
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('★ GET /v1/reasoning-efforts：给出「该填哪几个」与 8 个规范名逐一的结局', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm: { ...TRAE }, env: ENV(port) })
+    await gateway.start()
+    try {
+      // 与其它端点同一套鉴权：地址栏直接打开会 401。
+      expect((await call(port, '/v1/reasoning-efforts')).status).toBe(401)
+      const body = JSON.parse((await call(port, '/v1/reasoning-efforts', { key: 'test-key' })).body)
+      expect(body.canonical).toEqual(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+      expect(body.data).toHaveLength(1)
+      expect(body.data[0].id).toBe('trae/deepseek-v4.1-flash')
+      expect(body.data[0].openai_efforts).toEqual(['low', 'high', 'xhigh'])
+      const resolution = (requested: string) => body.data[0].resolutions.find((row: { requested: string }) => row.requested === requested)
+      expect(resolution('low')).toEqual({ requested: 'low', outcome: 'mapped', applied: 'light' })
+      expect(resolution('high')).toEqual({ requested: 'high', outcome: 'exact', applied: 'high' })
+      expect(resolution('xhigh')).toEqual({ requested: 'xhigh', outcome: 'mapped', applied: 'extra_high' })
+      // TRAE 这模型没有关闭档 → 客户端要 none 时网关不下发该参数。
+      expect(resolution('none')).toEqual({ requested: 'none', outcome: 'unexpressible' })
+      expect(body.data[0].default).toBe('high')
+    } finally {
+      await gateway.close()
+    }
+  })
+
+  it('未声明档位的模型也出现在对照表里（说明「网关不会下发档位」）', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({
+      llm: {
+        ...TRAE,
+        resolveModelInfo: async () => ({ provider: 'trae', id: 'deepseek-v4.1-flash', name: 'Flash' }),
+      },
+      env: ENV(port),
+    })
+    await gateway.start()
+    try {
+      const body = JSON.parse((await call(port, '/v1/reasoning-efforts', { key: 'test-key' })).body)
+      expect(body.data[0]).toMatchObject({ id: 'trae/deepseek-v4.1-flash', efforts: [], openai_efforts: [] })
+      // 8 个规范名全部标记为「不下发」（网关按模型默认走），而不是「无法表达」。
+      expect(body.data[0].resolutions.every((row: { outcome: string }) => row.outcome === 'ignored')).toBe(true)
+    } finally {
+      await gateway.close()
+    }
+  })
+})

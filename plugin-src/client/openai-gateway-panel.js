@@ -51,6 +51,10 @@
  * @param {string} value 要复制的文本
  * @returns {Promise<boolean>} 是否写入成功
  */
+// ⚠️ 搜索判据与模型清单**共用同一份实现**（`model-filter.js`）：两处各写一套
+// 「空搜索词算命中全部」之类的约定，迟早漂移成「同一句话在两张表里搜出不同结果」。
+import { isFilterActive, matchesModelQuery } from './model-filter.js';
+
 export async function copyToClipboard(value) {
   try {
     if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false;
@@ -170,6 +174,168 @@ export function gatewayModelsCurl(endpoint) {
 }
 
 /**
+ * 思考档位对照表的**一行**（每个声明了档位的模型一行）。
+ *
+ * ## 这一列为什么必须存在（真实缺陷）
+ *
+ * 各 provider 的档位 id 是**上游自己的叫法**，而 OpenAI 协议的客户端只有固定
+ * 8 档词汇（`none…ultra`，CC Switch 的档位多选器就是这 8 个）。用户只能照 DSH
+ * 界面上显示的名字去填客户端，于是必然撞车：
+ *
+ * | 界面上看到的 | 客户端照填 | 模型真实认的 |
+ * |---|---|---|
+ * | LobsterAI 的 **Max** | `max` | `xhigh` |
+ * | Cline 的 **Extra** | `xhigh` | `max` |
+ * | TRAE 的 **Light / Extra High** | `low` / `xhigh` | `light` / `extra_high` |
+ *
+ * 网关现在会按强度**自动翻译**（填错不再 400），但「精确对应」仍然只有一列答案：
+ * 即 `openai_efforts`。故把它渲染出来，用户抄一次就永久正确。
+ *
+ * ⚠️ **这张表只含「已开启」的模型**：数据来自各适配器的 `listModels`，而它按用户在
+ * Jet Hub 里关掉的模型（黑名单）过滤。故表里的行数与模型选择器同源，不会出现
+ * 「关掉的模型还在这里占位」。
+ *
+ * ⚠️ 返回 `null` 表示该模型**没有声明**档位（网关不下发该参数）。
+ * 调用方必须跳过它，而不是渲染一行空表 —— 「不知道」与「一个都没有」是两件事。
+ *
+ * @param {{ id: string, name?: string, reasoning?: { efforts?: Array<{ id: string, name: string, canonical?: string }>, default?: string, openai_efforts?: readonly string[] } } | null | undefined} model
+ * @returns {{ id: string, name: string, declared: string, fill: string, lossy: boolean } | null}
+ */
+export function gatewayEffortRow(model) {
+  const reasoning = model?.reasoning;
+  const efforts = reasoning?.efforts;
+  if (!Array.isArray(efforts) || efforts.length === 0) return null;
+  return {
+    id: model.id,
+    // 展示名留给搜索用（与模型清单的搜索共用 matchesModelQuery）。
+    name: typeof model.name === 'string' ? model.name : '',
+    // 两个名字都给出来：`id` 是网关实际下发的 wire 值，`name` 是 DSH 界面上的叫法
+    // （用户就是照它填错的，故两列都得能对上）。
+    declared: efforts.map((effort) => `${effort.id}（${effort.name}）`).join(' · '),
+    fill: Array.isArray(reasoning.openai_efforts) ? reasoning.openai_efforts.join(', ') : '',
+    // 「真实 id 与应填的规范名不完全一致」= 客户端侧的显示名会与 DSH 界面不同，
+    // 这类行才是用户真正会看错的，值得在 UI 上标出来。
+    lossy: efforts.some((effort) => effort.canonical !== undefined && effort.canonical !== effort.id),
+  };
+}
+
+/**
+ * 全部模型的档位对照行（跳过未声明档位的模型）。
+ *
+ * @param {Array<object> | null | undefined} models
+ * @returns {Array<{ id: string, name: string, declared: string, fill: string, lossy: boolean }>}
+ */
+export function gatewayEffortRows(models) {
+  if (!Array.isArray(models)) return [];
+  return models.map(gatewayEffortRow).filter(Boolean);
+}
+
+/**
+ * 单行是否命中搜索词。
+ *
+ * ⚠️ **比模型清单的搜索多匹配「档位」** —— 这正是这张表最常用的查法：
+ * 「哪些渠道有 `xhigh`？」「界面上的 Max 到底是哪个 id？」。
+ * 故判据是「模型 id / 展示名（复用 `matchesModelQuery`，与模型清单同一口径）
+ * **或**真实档位名 / 该填的规范名」。
+ *
+ * @param {{ id?: string, name?: string, declared?: string, fill?: string } | null | undefined} row
+ * @param {string} query
+ * @returns {boolean}
+ */
+export function matchesEffortQuery(row, query) {
+  if (matchesModelQuery(row, query)) return true;
+  const needle = typeof query === 'string' ? query.trim().toLowerCase() : '';
+  if (needle.length === 0) return true;
+  return `${row?.declared ?? ''} ${row?.fill ?? ''}`.toLowerCase().includes(needle);
+}
+
+/**
+ * 按搜索词过滤对照表。
+ *
+ * 无搜索词时**原样返回入参**（不复制、不改顺序）：与 `model-filter.js` 的
+ * 「未搜索」口径一致（空串不是「搜索空串」）。
+ *
+ * @param {Array<object> | null | undefined} rows
+ * @param {string} query
+ * @returns {Array<object>}
+ */
+export function filterEffortRows(rows, query) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!isFilterActive({ query })) return list;
+  return list.filter((row) => matchesEffortQuery(row, query));
+}
+
+/**
+ * 对照表的说明文案。
+ *
+ * ⚠️ 三件事必须说清，否则用户会以为「填错了就是坏的」「表里有我没开的模型」，
+ * 或者反过来「随便填」：
+ * 1. 这张表**只含已开启的模型**（关掉的不会出现）；
+ * 2. 填**规范名**（「客户端该填」那一列）才能精确对应；
+ * 3. 填别的**也不会失败** —— 网关按强度就近翻译（本次新增的行为）。
+ *
+ * @param {Array<object> | null | undefined} models
+ * @returns {string}
+ */
+export function gatewayEffortsHint(models) {
+  const rows = gatewayEffortRows(models);
+  if (rows.length === 0) {
+    return '当前已开启的模型里没有声明思考档位的：网关不会下发该参数，一律按模型默认走。';
+  }
+  const lossy = rows.filter((row) => row.lossy).length;
+  const enabled = Array.isArray(models) ? models.length : rows.length;
+  return `当前已开启的 ${enabled} 个模型里，有 ${rows.length} 个可选思考档位`
+    + `${lossy > 0 ? `，其中 ${lossy} 个的档位名与 OpenAI 客户端不同（见下方标「需对照」的行）` : ''}。`
+    + '「客户端该填」那一列可以直接抄进 CC Switch / Codex 的思考等级设置，与模型真实档位一一对应。'
+    + '填这 8 个以外的写法也不会报错：网关会按强度就近落到模型的某一档（会记日志）。'
+    + '在插件里关掉的模型不会出现在这张表里。';
+}
+
+/**
+ * 搜索结果为空时的提示。
+ *
+ * ⚠️ 空结果必须能自解释：要能区分「被搜索词筛没了」与「本来就没有声明档位的模型」，
+ * 否则用户会以为网关坏了、或者以为模型没登录。
+ *
+ * @param {string} [query]
+ * @returns {string}
+ */
+export function gatewayEffortsEmptyHint(query) {
+  const needle = typeof query === 'string' ? query.trim() : '';
+  if (needle.length === 0) return '当前没有模型声明思考档位。';
+  return `没有匹配「${needle}」的模型。搜索会匹配模型 id / 展示名，也会匹配档位名`
+    + '（真实 id 与 DSH 界面上的叫法都算，例如 xhigh / Max / Extra）。';
+}
+
+/**
+ * 对照表的纯文本形态（供「复制」按钮写进剪贴板）。
+ *
+ * 与面板渲染共用同一批行，故复制到的内容与屏幕上看到的必然一致。
+ *
+ * @param {Array<{ id: string, declared: string, fill: string }> | null | undefined} rows
+ * @returns {string}
+ */
+export function gatewayEffortsText(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  return list.map((row) => [
+    row.id,
+    `  真实档位：${row.declared}`,
+    `  客户端该填：${row.fill}`,
+  ].join('\n')).join('\n\n');
+}
+
+/**
+ * 查看档位对照表的命令模板（同样**不含密钥**）。
+ *
+ * @param {string | null | undefined} endpoint
+ * @returns {string}
+ */
+export function gatewayEffortsCurl(endpoint) {
+  const base = endpoint ? endpoint.replace(/\/v1$/, '') : 'http://127.0.0.1:8326'
+  return `curl ${base}/v1/reasoning-efforts -H "Authorization: Bearer <把你的 API Key 贴在这里>"`
+}
+
+/**
  * 页头按钮的 tooltip。
  *
  * @param {GatewayStatus | null | undefined} status
@@ -221,6 +387,11 @@ export function gatewayStatusLines(status) {
     return [
       '网关正在运行。把外部客户端的 OpenAI 兼容地址设为下面这一行。',
       endpoint ? `地址：${endpoint}` : '',
+      // ⚠️ 必须说清「两种协议同时可用」：Responses API 是后加的（2026-10-03），
+      // 老用户从面板上看不出它存在，会以为网关只支持 Chat Completions。
+      // ⚠️ 也**不能**说成「可切换」：两个端点同时都在，没有互斥开关。
+      '同一地址同时提供两种协议：/chat/completions（OpenAI Chat Completions）'
+      + '与 /responses（OpenAI Responses API）—— 用哪一套由客户端请求的路径决定。',
     ].filter(Boolean)
   }
   if (status.enabled) {

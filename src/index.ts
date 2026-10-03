@@ -479,12 +479,17 @@ export function apply(ctx: Context): void {
    * ⚠️ 这里**只改错误语义，不改可用性**：没有账号可用就是没有，压缩该失败
    * 仍然失败；修的是「用户看到的原因」。绝不静默换模型、也绝不绕过限流标记。
    *
-   * @param product - 目标 provider（用其 `id` 与 `displayName`）。
+   * @param product - 目标 provider（用其 `id` 与 `displayName`）。**只要求这两个字段**：
+   *   除 buddy / workbuddy 外，cline 也接这条（它同样会因模型级限流被挡住，
+   *   而 `ClineProduct` 与 `BuddyProduct` 是两个类型）。
    * @param modelId - 本次请求的模型；空串时不做判定（与选号侧约定一致）。
    * @throws LlmError 带 `QUOTA_EXCEEDED` 码与解禁时刻，仅当**所有**启用账号
    *   都在该模型上受限时；其余情形静默返回，交给原有的 `MISSING_CREDENTIAL`。
    */
-  const throwIfAllAccountsRateLimited = (product: BuddyProduct, modelId?: string): void => {
+  const throwIfAllAccountsRateLimited = (
+    product: { id: string; displayName: string },
+    modelId?: string,
+  ): void => {
     const limited = allAccountsRateLimitedForModel(
       // 只统计**启用**账号：停用账号本就不参与自动选号，把它们算进来会
       // 让「有一个号被停用」的普通情况被误报成「全部限流」。
@@ -838,6 +843,12 @@ export function apply(ctx: Context): void {
       // 记录实际选中的池账号（空串 = 回退到单凭据 ref 模式，见适配器注释）。
       activeClineAccountId = available?.entry.id ?? ''
       if (available) return available.credential as ClineCredential
+      // ⚠️ 与 buddy / workbuddy 同因（真实缺陷，2026-10-03 用户报障）：
+      // 唯一的 cline 账号被**模型级限流**标记挡住时，候选会筛成空集，最终降级成
+      // `cline: no usable credential; log in first` —— 凭据明明在、账号也登录着，
+      // 用户却被指去重新登录，方向完全错。故必须在退到单凭据 ref **之前**
+      // 先把「其实是限流，预计 X 后解禁」说清楚。
+      throwIfAllAccountsRateLimited(CLINE, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(CLINE.defaultCredentialRef))
       if (!resolved) return undefined
       try {
