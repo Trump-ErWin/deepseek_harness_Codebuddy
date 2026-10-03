@@ -101,8 +101,15 @@ function makeCtx(): {
  *
  * ⚠️ 回调那一步（用户浏览器 → 本地 server）**不走这个桩** —— 它必须真的发到
  * `startGeminiOAuthFlow` 起的本地服务器上，见 `authorize()`。
+ *
+ * ⚠️ 令牌响应**默认带 `id_token`**：授权 URL 带 `openid` scope，真实 Google
+ * 必然返回它，身份就该从这里解（`withIdToken: false` 才模拟缺席、走 userinfo 兜底）。
  */
-function makeFetchStub(calls: { token: number; userinfo: number }): typeof fetch {
+function makeFetchStub(
+  calls: { token: number; userinfo: number },
+  options: { withIdToken?: boolean } = {},
+): typeof fetch {
+  const withIdToken = options.withIdToken !== false
   return (async (input: string | URL | Request) => {
     const url = String(input)
     if (url === 'https://oauth2.googleapis.com/token') {
@@ -113,6 +120,9 @@ function makeFetchStub(calls: { token: number; userinfo: number }): typeof fetch
         expires_in: 3600,
         token_type: 'Bearer',
         scope: 'openid https://www.googleapis.com/auth/cloud-platform',
+        ...withIdToken
+          ? { id_token: specIdToken({ sub: 'spec-sub-1234', email: 'spec@example.com' }) }
+          : {},
       }), { status: 200 })
     }
     if (url.startsWith('https://www.googleapis.com/oauth2/v2/userinfo')) {
@@ -123,12 +133,17 @@ function makeFetchStub(calls: { token: number; userinfo: number }): typeof fetch
   }) as unknown as typeof fetch
 }
 
+/** 造一个未签名形态的 `id_token`（只 base64url 编码，与真实结构同形）。 */
+function specIdToken(payload: Record<string, unknown>): string {
+  return `hdr.${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}.sig`
+}
+
 /** 装配一套 RPC（gemini 用**真实 GeminiAuth** + 桩 fetch）。 */
-function makeRpc() {
+function makeRpc(options: { withIdToken?: boolean } = {}) {
   const { ctx, credentials, handler } = makeCtx()
   const pool = new AccountPool(ctx)
   const calls = { token: 0, userinfo: 0 }
-  const gemini = new GeminiAuth(ctx, { fetchImpl: makeFetchStub(calls) })
+  const gemini = new GeminiAuth(ctx, { fetchImpl: makeFetchStub(calls, options) })
   registerJetHubRpc(
     ctx, pool,
     // ⚠️ **13 个 provider 形参**，逐个具名 —— 少一个就错位（见文件头第 1 条）。
@@ -278,7 +293,20 @@ describe('Gemini Jet Hub 登录接入', () => {
 
     await waitForLogin(call, accountId)
     expect(calls.token).toBe(1)
-    // userinfo 用来回填 sub/email（身份只是展示信息，失败也不该让授权失败）。
+    // ⚠️ 身份来自令牌响应自带的 `id_token` ⇒ **一次 userinfo 都不该发**。
+    // 2026-10-03 报障（昵称退化成 `gemini-6a53dbca`）就是因为原来只靠这次
+    // 可静默失败的跨域请求。
+    expect(calls.userinfo).toBe(0)
+  }, 20_000)
+
+  it('★ 令牌响应缺 id_token 时才兜底 userinfo（且登录仍然成功）', async () => {
+    const { call, calls } = makeRpc({ withIdToken: false })
+    const created = await call('account.create', { provider: GEMINI.id })
+    const accountId = created.value.accountId as string
+    await authorize(created.value.loginUrl as string, { code: 'SPEC-CODE' })
+
+    await waitForLogin(call, accountId)
+    expect(calls.token).toBe(1)
     expect(calls.userinfo).toBe(1)
   }, 20_000)
 
@@ -316,7 +344,7 @@ describe('Gemini Jet Hub 登录接入', () => {
       if (nickname !== accountId) break
       await new Promise((r) => setTimeout(r, 100))
     }
-    // `geminiAccountLabel` 邮箱优先 —— 桩 userinfo 回了 `spec@example.com`。
+    // `geminiAccountLabel` 邮箱优先 —— 邮箱来自桩令牌响应里的 `id_token`。
     // ⚠️ 曾经这里断言 `'Gemini spec-sub'`（`sub` 前 8 位），那是**不可辨认**的
     // 展示名，2026-10-03 用户报障后改为邮箱优先，见 `geminiAccountLabel`。
     expect(nickname).toBe('spec@example.com')

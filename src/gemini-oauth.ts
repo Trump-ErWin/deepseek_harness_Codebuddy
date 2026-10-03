@@ -121,6 +121,21 @@ export interface GeminiTokenGrant {
   token_type: string
   expires_in: number
   scope?: string
+  /**
+   * OIDC `id_token`。授权 URL 带 `openid` scope，故令牌端点**必然**返回它 ——
+   * 身份从这里解，不再依赖 userinfo 那次可静默失败的跨域请求。
+   */
+  id_token?: string
+}
+
+/**
+ * 账号身份。
+ *
+ * `sub` 是 OIDC 的稳定标识（邮箱可改、`sub` 不变）；`email` 只用于展示。
+ */
+export interface GeminiUserInfo {
+  sub?: string
+  email?: string
 }
 
 /**
@@ -157,7 +172,34 @@ export function parseGeminiTokenGrant(payload: unknown, previousRefreshToken?: s
   if (refreshToken !== undefined && refreshToken !== '') grant.refresh_token = refreshToken
   const scope = typeof record.scope === 'string' ? record.scope : ''
   if (scope !== '') grant.scope = scope
+  const idToken = typeof record.id_token === 'string' ? record.id_token : ''
+  if (idToken !== '') grant.id_token = idToken
   return grant
+}
+
+/**
+ * 从 `id_token` 解出身份（`sub` / `email`）。
+ *
+ * ⚠️ **不验签**：该值只用于展示名与稳定标识，不作为鉴权依据（与
+ * `src/buddy.ts` 的 `jwtExpiresAtMs` 同口径）；令牌端点的响应本身已由 TLS 保护。
+ * 任何解析失败返回 `{}` 而不抛错 —— 身份不该让授权失败。
+ */
+export function geminiIdentityFromIdToken(idToken: string): GeminiUserInfo {
+  if (typeof idToken !== 'string' || idToken === '') return {}
+  const parts = idToken.split('.')
+  if (parts.length < 2) return {}
+  let payload: unknown
+  try {
+    payload = JSON.parse(Buffer.from(parts[1] ?? '', 'base64url').toString('utf8'))
+  } catch {
+    return {}
+  }
+  if (typeof payload !== 'object' || payload === null) return {}
+  const record = payload as Record<string, unknown>
+  const out: GeminiUserInfo = {}
+  if (typeof record.sub === 'string' && record.sub !== '') out.sub = record.sub
+  if (typeof record.email === 'string' && record.email !== '') out.email = record.email
+  return out
 }
 
 /** 由 `expires_in`（秒）算出 RFC3339 过期时刻。 */
@@ -182,8 +224,13 @@ export function credentialFromGeminiGrant(
   if (refreshToken !== undefined && refreshToken !== '') credential.refresh_token = refreshToken
   const scope = grant.scope ?? previous.scope
   if (scope !== undefined && scope !== '') credential.scope = scope
-  if (previous.sub !== undefined && previous.sub !== '') credential.sub = previous.sub
-  if (previous.email !== undefined && previous.email !== '') credential.email = previous.email
+  // 身份优先取 `id_token`（与 `access_token` 同一次响应自带，零额外请求、
+  // 无失败面），退到既有凭据 —— 后者覆盖「续期响应不带 id_token」的形态。
+  const identity = grant.id_token === undefined ? {} : geminiIdentityFromIdToken(grant.id_token)
+  const sub = identity.sub ?? previous.sub
+  if (sub !== undefined && sub !== '') credential.sub = sub
+  const email = identity.email ?? previous.email
+  if (email !== undefined && email !== '') credential.email = email
   if (previous.cloudaicompanionProject !== undefined && previous.cloudaicompanionProject !== '') {
     credential.cloudaicompanionProject = previous.cloudaicompanionProject
   }
@@ -275,28 +322,32 @@ export async function refreshGeminiCredential(
   return parseGeminiTokenGrant(payload, refreshToken)
 }
 
-/** userinfo 返回的身份（`id` 就是 OIDC 的 `sub`）。 */
-export interface GeminiUserInfo {
-  sub?: string
-  email?: string
-}
-
 /**
- * 拉账号身份。
+ * 拉账号身份（`id_token` 缺席时的**兜底**）。
  *
  * ⚠️ 用 `id`（= `sub`）当账号主键：邮箱用户可以随时改，`sub` 不会变。
- * 失败**不抛错**（身份只是展示信息，不该让整个授权失败）。
+ * 失败**不抛错**（身份只是展示信息，不该让整个授权失败），但会通过
+ * `onFailure` 上报原因 —— 2026-10-03 用户报障「昵称退化成池 id」时这里
+ * 静默吞掉了一切异常，导致无从排查。
  */
 export async function fetchGeminiUserInfo(
   accessToken: string,
-  options: { fetcher?: typeof fetch; signal?: AbortSignal } = {},
+  options: {
+    fetcher?: typeof fetch
+    signal?: AbortSignal
+    /** 失败原因上报口（默认静默，仅供诊断日志）。 */
+    onFailure?: (reason: string) => void
+  } = {},
 ): Promise<GeminiUserInfo> {
   const fetcher = options.fetcher ?? fetch
   const init: RequestInit = { headers: { Authorization: `Bearer ${accessToken}` } }
   if (options.signal !== undefined) init.signal = options.signal
   try {
     const response = await fetcher(GEMINI_USERINFO_ENDPOINT, init)
-    if (!response.ok) return {}
+    if (!response.ok) {
+      options.onFailure?.(`userinfo 返回 HTTP ${response.status}`)
+      return {}
+    }
     const payload = (await response.json()) as unknown
     if (typeof payload !== 'object' || payload === null) return {}
     const record = payload as Record<string, unknown>
@@ -304,7 +355,8 @@ export async function fetchGeminiUserInfo(
     if (typeof record.id === 'string' && record.id !== '') out.sub = record.id
     if (typeof record.email === 'string' && record.email !== '') out.email = record.email
     return out
-  } catch {
+  } catch (error) {
+    options.onFailure?.(error instanceof Error ? error.message : String(error))
     return {}
   }
 }
@@ -341,6 +393,13 @@ export interface GeminiOAuthOptions {
   callbackPort?: number
   /** 授权总预算，默认 {@link GEMINI_AUTH_FLOW_TIMEOUT_MS}。 */
   timeoutMs?: number
+  /**
+   * 身份兜底（userinfo）失败时的上报口。
+   *
+   * ⚠️ 这是 2026-10-03 报障的直接教训：`fetchGeminiUserInfo` 曾把一切异常
+   * 静默吞成 `{}`，于是「昵称退化成池 id」在现场**零日志可查**。
+   */
+  onIdentityFailure?: (reason: string) => void
 }
 
 /** 回调成功后展示的页面（原版逐字）。 */
@@ -476,10 +535,17 @@ export async function startGeminiOAuthFlow(
     }),
   ]).then(async (code) => {
     const grant = await exchangeGeminiCode(code, redirectUri, { fetcher })
+    // `credentialFromGeminiGrant` 已从 `id_token` 解出 sub/email（授权 URL 带
+    // `openid`，令牌响应必然带 id_token）—— 正常情况下这里**不再发 userinfo**。
     const credential = credentialFromGeminiGrant(grant)
-    const user = await fetchGeminiUserInfo(credential.access_token, { fetcher })
-    if (user.sub !== undefined) credential.sub = user.sub
-    if (user.email !== undefined) credential.email = user.email
+    if (credential.sub !== undefined && credential.email !== undefined) return credential
+    // 兜底：id_token 缺席或解不出身份时才补一次 userinfo。
+    const user = await fetchGeminiUserInfo(credential.access_token, {
+      fetcher,
+      onFailure: options.onIdentityFailure,
+    })
+    if (credential.sub === undefined && user.sub !== undefined) credential.sub = user.sub
+    if (credential.email === undefined && user.email !== undefined) credential.email = user.email
     return credential
   })
 

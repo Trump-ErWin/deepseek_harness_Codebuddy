@@ -28,6 +28,7 @@ import {
 import { SerialQueue } from './serial-queue.js'
 import {
   GEMINI,
+  geminiAccountLabel,
   geminiCredentialExpiresAtMs,
   isGeminiRefreshable,
   parseGeminiCredential,
@@ -36,6 +37,7 @@ import {
 } from './gemini.js'
 import {
   credentialFromGeminiGrant,
+  fetchGeminiUserInfo,
   refreshGeminiCredential,
   startGeminiOAuthFlow,
   type StartedGeminiLoginFlow,
@@ -149,6 +151,14 @@ export class GeminiAuth extends Service {
     const started = await startGeminiOAuthFlow({
       fetcher: this.fetchImpl,
       ...this.options.callbackPort === undefined ? {} : { callbackPort: this.options.callbackPort },
+      // 身份正常情况下从令牌响应的 `id_token` 解出（零额外请求）；这里的
+      // userinfo 只是兜底。**兜底失败必须留日志** —— 2026-10-03 用户报障
+      // 「昵称退化成池 id」时，失败被静默吞成 `{}`，现场零线索可查。
+      onIdentityFailure: (reason) => {
+        this.ctx.logger?.warn?.(
+          `[gemini] 登录时兜底拉取账号身份失败（不影响登录，但昵称可能退化成账号 id）：${reason}`,
+        )
+      },
     })
     // 与 `cline-auth.ts:230-233` 同理：结果可能早于调用方 `await` 而落定，
     // 先挂空处理器避免「未处理的拒绝」告警（错误仍会传给真正的消费者）。
@@ -332,6 +342,71 @@ export class GeminiAuth extends Service {
         }
       }
     }
+  }
+
+  /**
+   * 一次性修复**老账号**的展示名（与 `RaccoonAuth` / `TraeAuth` 同一模式）。
+   *
+   * 成因：2026-10-03 之前的版本在解析令牌响应时丢掉了 `id_token`，身份只剩
+   * 「userinfo 那次跨域请求」这一个失败面；它一失败（且当时**静默吞异常**），
+   * 凭据就只落了 token 而无 `sub`/`email`，`geminiAccountLabel` 返 `undefined`，
+   * 账号昵称于是退化成一串池 id（`gemini-6a53dbca`），用户认不出是谁。
+   *
+   * 光改代码只影响**新登录**的账号，故这里在启动时主动补一次。
+   *
+   * ## 契约
+   *
+   * - **幂等**：昵称已是目标值时不算变化，不触发写入。
+   * - **失败不阻塞**：逐账号 catch，任何异常只记 warn。
+   * - **只读补字段**：最多发一次 userinfo GET（不续期、不换 token），
+   *   且**拿不到就什么都不做** —— 绝不退回去用凭据里的池 id 重算昵称，
+   *   那会覆盖掉用户在 Jet Hub 里手动改过的昵称。
+   *
+   * @returns 被修复的账号 id 列表（供日志）
+   */
+  async repairAccountNicknames(pool: AccountPool): Promise<string[]> {
+    const repaired: string[] = []
+    let entries: Awaited<ReturnType<AccountPool['listAccounts']>>
+    try {
+      entries = await pool.listAccounts(this.product.id)
+    } catch {
+      return repaired
+    }
+
+    for (const entry of entries) {
+      try {
+        const ref = credentialRef(entry.credentialRef)
+        const resolved = await this.ctx.credentials.resolve(ref)
+        if (!resolved) continue
+        let credential = parseGeminiCredential(resolved.value)
+        if (credential === undefined) continue
+
+        // 缺身份时补一次 userinfo（只读 GET）。注意此处**不写日志失败**——
+        // 老账号的 access_token 可能早已过期，拿不到是常态，不值得刷告警。
+        if (geminiAccountLabel(credential) === undefined) {
+          const info = await fetchGeminiUserInfo(credential.access_token, { fetcher: this.fetchImpl })
+          if (info.sub === undefined && info.email === undefined) continue
+          credential = { ...credential }
+          if (info.sub !== undefined) credential.sub = info.sub
+          if (info.email !== undefined) credential.email = info.email
+          await this.ctx.credentials.set(ref, JSON.stringify(credential))
+        }
+
+        const target = geminiAccountLabel(credential)
+        // ⚠️ 只在**确实变化**时写账号池：`updateAccount` 是整体 replace，
+        // 每次启动都写会平白落盘一次（同 Raccoon / Trae 的处理）。
+        if (target !== undefined && target !== entry.nickname) {
+          await pool.updateAccount(entry.id, { nickname: target })
+          repaired.push(entry.id)
+        }
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          `[gemini] 修复账号 ${entry.id} 的显示名失败（不影响使用）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+    return repaired
   }
 
   /**
