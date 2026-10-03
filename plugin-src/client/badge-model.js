@@ -241,12 +241,14 @@ export function planGroupsOf(rows) {
  *   用户会以为账号丢了（真实报障，2026-10-02）。
  * @param input.failed - **首次读数失败且无任何数据**（显示「用量不可用」而不是
  *   「未配置启用账号」）：两种情况用户要做的下一步完全不同。
- * @returns `{ mode, name, detail, reading, text, tone, groups, planGroups, windows, failedCount, okCount, failureReason }`
+ * @returns `{ mode, name, detail, reading, text, tone, groups, planGroups, windows, failedCount, okCount, failureReason, incompleteNote }`
  *   - `mode`：`'loading' | 'windows' | 'plan' | 'credits' | 'empty'`（**回落之后**的实际模式）；
  *   - `name` / `detail` / `reading`：三段内容，**分开**给渲染层（见 {@link readingOf} 的说明）；
  *     恒有 `text === composeText(name, detail, reading)`；
  *   - `text`：完整一行，用于 `title` / `aria-label`；
- *   - `tone`：`'ok' | 'warn' | 'error' | 'muted'`（徽标圆点用）。
+ *   - `tone`：`'ok' | 'warn' | 'error' | 'muted'`（徽标圆点用）；
+ *   - `incompleteNote`：读数**不完整**时的说明（目前只有积分合计会缺账号），
+ *     空串表示完整 —— 渲染层据此决定要不要在胶囊上挂一个警示标记。
  */
 export function badgeView(input) {
   const providerLabel = String(input?.providerLabel ?? 'Jet Hub');
@@ -277,6 +279,7 @@ export function badgeView(input) {
     failedCount: 0,
     okCount: 0,
     failureReason: '',
+    incompleteNote: '',
   });
 
   // 首屏：读数还没到 → 明确的「读取中…」，**不要**说成「未配置启用账号」。
@@ -327,6 +330,28 @@ export function badgeView(input) {
 
   const { detail, reading } = readingOf({ mode, windows, planGroups, groups, accounts, failedCount });
 
+  /**
+   * 「这个数字不完整」的提示（2026-10-03，用户要求：多账号时合计会**静默少报**）。
+   *
+   * ## 为什么只在 `credits` 模式给
+   *
+   * 只有积分模式读数是**跨账号的合计** —— 少读一个账号，合计就少一截，而胶囊上
+   * 完全看不出来（`tone` 仍是 `ok`，弹窗脚注又在弹窗里）。账号越多越容易撞上：
+   * 六个号里坏一个，用户会把「少了一截的合计」当成真实余额。
+   *
+   * 窗口模式按设计只显示**某一个账号**的窗口，套餐模式显示的是「最大的那份套餐」，
+   * 两者都不是合计，套用「未计入合计」这句话是不准确的 —— 宁可不标，也不说错。
+   *
+   * ⚠️ `okCount > 0` 是必要的：一个都没读到（`okCount === 0`）时模式会回落到
+   * `empty`，读数本身就是「用量不可用」，再加一句「未计入合计」纯属噪音。
+   *
+   * ⚠️ 文案必须说清**是什么没读到**（「余额读取失败」）而不是笼统的「有账号异常」：
+   * 用户据此判断的是「这个数能不能信」，指向不明就没法判断。
+   */
+  const incompleteNote = mode === 'credits' && okCount > 0 && failedCount > 0
+    ? `另有 ${failedCount} 个账号的余额读取失败，未计入合计`
+    : '';
+
   return {
     mode,
     preference,
@@ -341,6 +366,7 @@ export function badgeView(input) {
     failedCount,
     okCount,
     failureReason,
+    incompleteNote,
   };
 }
 
@@ -441,6 +467,48 @@ function firstUnitOf(packages) {
   if (!Array.isArray(packages)) return undefined;
   const hit = packages.find((pkg) => pkg && typeof pkg.unit === 'string' && pkg.unit.length > 0);
   return hit === undefined ? undefined : hit.unit;
+}
+
+/**
+ * 积分列表的排序键：**余额大的在前，读不到数的排最后**。
+ *
+ * ⚠️ 读不到数的行必须排最后，不能用 0 代替：`0` 会把它们插进「余额很小」的位置，
+ * 而它们那一格显示的是**错误文案** —— 夹在数字中间会被误读成一个很小的余额。
+ */
+function balanceOrder(row) {
+  const total = row?.balance?.total;
+  return typeof total === 'number' && Number.isFinite(total) ? total : Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * 弹窗里积分列表的**排序 + 折叠**（纯函数，2026-10-03 用户要求）。
+ *
+ * ## 两条规则
+ *
+ * 1. **按余额降序**：账号是「用完一个换下一个」的资源，用户要先看到的正是
+ *    「还有哪个号能用」。原来的顺序是账号池的插入顺序，与余额无关。
+ *    ⚠️ 读不到数的行排最后（见 {@link balanceOrder}）。
+ * 2. **超过 `limit` 个就折叠**：6 个号本来是**十二行**（每号两行：数值 + 分桶
+ *    说明），足够把弹窗撑得比窗口还高。折叠后固定 limit 行 + 一行「展开其余 N 个」。
+ *
+ * ⚠️ 折叠**不隐藏任何结论**：合计在节标题、读取失败数在脚注，两者都在折叠之外。
+ * 收起来的只是逐账号明细 —— 那本来就是「要核对时才看」的东西。
+ *
+ * ⚠️ 排序必须**稳定**（`Array.prototype.sort` 在现代 JS 里已保证）：两个余额相同的
+ * 账号每次渲染互换位置会让 DOM 抖动，用户会以为数字在变。
+ *
+ * @param rows - 逐账号余额行（`RpcCreditsBalanceAccount[]`，可能含 `balance: null`）。
+ * @param options.limit - 折叠前显示的条数（`CREDITS_COLLAPSED_LIMIT`）。
+ * @param options.expanded - 用户是否点了「展开」。
+ * @returns `{ shown, hidden }` —— `shown` 是要渲染的那些行，`hidden` 是被收起的条数
+ *   （0 表示没有可折叠的，渲染层据此决定要不要那个按钮）。
+ */
+export function orderCreditRows(rows, options = {}) {
+  const limit = Number.isFinite(options.limit) ? options.limit : 0;
+  const ordered = [...(Array.isArray(rows) ? rows : [])]
+    .sort((a, b) => balanceOrder(b) - balanceOrder(a));
+  const hidden = Math.max(0, ordered.length - limit);
+  return { shown: options.expanded === true ? ordered : ordered.slice(0, limit), hidden };
 }
 
 /**

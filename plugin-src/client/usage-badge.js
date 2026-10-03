@@ -32,6 +32,7 @@ import {
   badgeView,
   describeBadgeError,
   formatUpdatedAt,
+  orderCreditRows,
   BADGE_PREFERENCES,
   BADGE_PREFERENCE_LABELS,
 } from './badge-model.js';
@@ -70,6 +71,17 @@ export const BADGE_POLL_MS = 60_000;
  */
 export const CLAIM_NOTICE_MS = 8_000;
 export const CLAIM_NOTICE_WARN_MS = 20_000;
+
+/**
+ * 弹窗里积分列表**折叠前**显示的账号数（用户 2026-10-03 要求）。
+ *
+ * 取 5 而不是 3：普通用户手里多是 2–3 个号，5 行以内不折；而 6 个号原本是
+ * **十二行**（每个号两行：数值 + 分桶说明），足够把弹窗撑得比窗口还高。
+ *
+ * ⚠️ 折叠**不隐藏任何结论**：合计在节标题、读取失败数在脚注，两者都在折叠之外。
+ * 收起来的只是逐账号明细 —— 那份明细本来就是「要核对时才看」的东西。
+ */
+export const CREDITS_COLLAPSED_LIMIT = 5;
 
 /**
  * 目录解析失败后的重试退避（毫秒）。
@@ -249,6 +261,13 @@ function UsageBadgeActive(props) {
   const [claimProgress, setClaimProgress] = React.useState(null);
   /** 领取结果：`{ tone, text, notes }`；`notes` 是**需要用户操作**的提示（后端显式字段）。 */
   const [claimNotice, setClaimNotice] = React.useState(null);
+  /**
+   * 弹窗里积分列表是否已展开（超过 {@link CREDITS_COLLAPSED_LIMIT} 个账号时才有意义）。
+   *
+   * ⚠️ 会随渠道切换重置（见下面那个 `[provider]` 副作用）：不重置的话，在 A 渠道
+   * 点过「展开」，切到 B 渠道时会直接看到全量列表 —— 用户会以为折叠功能时灵时不灵。
+   */
+  const [creditsExpanded, setCreditsExpanded] = React.useState(false);
   const root = React.useRef(null);
   /** 供定时器与按钮调用的「读一次」入口（每次渲染替换，避免闭包过期）。 */
   const read = React.useRef(() => {});
@@ -260,6 +279,8 @@ function UsageBadgeActive(props) {
     setClaimNotice(null);
     setPrefError('');
     setAutoError('');
+    // 「展开其余 N 个」是**本渠道**的一次操作，换渠道即失效（理由见它的声明处）。
+    setCreditsExpanded(false);
   }, [provider]);
 
   React.useEffect(() => {
@@ -551,7 +572,14 @@ function UsageBadgeActive(props) {
   };
 
   const tone = failed && snapshot === null ? 'error' : view.tone;
-  const title = view.failureReason === '' ? view.text : `${view.text}\n${view.failureReason}`;
+  // 悬浮提示按「读数 → 不完整说明 → 失败原因」三段拼，空串全部跳过（不留空行）。
+  // ⚠️ 不完整说明（`incompleteNote`）与失败原因（`failureReason`）**都要留**：
+  // 前者说「这个数不完整」，后者说「为什么」—— 只说前者用户不知道该去修什么。
+  const title = [view.text, view.incompleteNote, view.failureReason]
+    .filter((part) => part !== '')
+    .join('\n');
+  // 读屏用户看不到那个警示标记，故把同一句话并进 aria-label。
+  const ariaLabel = `${label} 用量：${view.text}${view.incompleteNote === '' ? '' : `（${view.incompleteNote}）`}`;
 
   /**
    * 折叠态那一行：**按三段渲染，而不是一个字符串**（真实报障，2026-10-03）。
@@ -592,6 +620,26 @@ function UsageBadgeActive(props) {
     //（那条规则带 font-weight:600，且排在样式表更后面 —— 同名会让胶囊里的数字
     // 被静默加粗、并拿到 flex:none 而无法收缩）。
     React.createElement('span', { key: 'value', className: 'dim-jh-badgeReading' }, view.reading),
+    /**
+     * 「这个数字不完整」的标记（用户 2026-10-03 要求）。
+     *
+     * 合计少算了几个账号时，数字本身**看不出任何异常**，故必须有个可见标记 ——
+     * 但它是**补语而不是读数**，故：
+     * - 单独成 span，`flex: none`（与读数同级）：被省略号吃掉就等于没标；
+     * - 排在读数**之后**：不干扰「先看数字」的阅读顺序；
+     * - 不参与 `view.text`：那句话是 `title` / `aria-label` 用的纯读数。
+     *
+     * ⚠️ `aria-hidden` 是**故意**的：同一句话已经并进按钮的 `aria-label`，
+     * 不隐藏会被读屏念两遍。鼠标用户的解释走 `title`。
+     */
+    view.incompleteNote === ''
+      ? null
+      : React.createElement('span', {
+        key: 'incomplete',
+        className: 'dim-jh-badgeWarn',
+        title: view.incompleteNote,
+        'aria-hidden': 'true',
+      }, '⚠'),
   ]);
 
   return React.createElement('div', { className: 'dim-jh-badge', ref: root }, [
@@ -600,7 +648,7 @@ function UsageBadgeActive(props) {
       type: 'button',
       className: 'dim-jh-badgeBtn',
       'aria-expanded': open,
-      'aria-label': `${label} 用量：${view.text}`,
+      'aria-label': ariaLabel,
       title,
       onClick: () => setOpen((was) => !was),
     }, [
@@ -791,11 +839,34 @@ function UsageBadgeActive(props) {
     ]);
   }
 
-  /** 积分区：逐账号余额（含失败原因与分桶文案）。 */
+  /**
+   * 积分区：逐账号余额（含失败原因与分桶文案）。
+   *
+   * ## 账号多了以后的两条整理（用户 2026-10-03 要求）
+   *
+   * 1. **按余额降序**：账号是「用完一个换下一个」的资源，用户要先看到的正是
+   *    「还有哪个号能用」。原来的顺序是池的插入顺序，与余额无关。
+   *    ⚠️ 读取失败的账号**排在最后**（`balance === null`）—— 它们没有数字可比，
+   *    混在中间只会把有用的行往下挤；且失败行的数值位写的是错误原因，插在
+   *    数字序列里会让人误读成「这个号余额很小」。
+   * 2. **超过 {@link CREDITS_COLLAPSED_LIMIT} 个就折叠**：六个号原本是十二行
+   *    （每号两行），弹窗被撑得比窗口还高。折叠后固定 5 行 + 一行「展开其余 N 个」。
+   *    ⚠️ 合计与失败账号数**不受折叠影响**（合计在节标题、失败数在脚注），
+   *    折叠只是把明细收起来，不隐藏结论。
+   *    ⚠️ 因为失败行排在最后，**被收起的通常正是读不到数的那些**（6 个号里有 1 个
+   *    失败 ⇒ 恰好收它一个）。这是有意的：明细区优先给「能用的号」，而失败这件事
+   *    已经由脚注与胶囊上的警示角标说了；要排查时点一下展开即可。
+   */
   function renderCredits() {
     const accounts = value?.accounts ?? [];
     const windowDays = value?.windowDays;
     const sum = view.groups.map((group) => `${formatUnits(group.total, group.unit) ?? '?'} ${group.label}`).join(' · ');
+    // 排序与折叠是**纯逻辑**（含「读不到数的排最后」「稳定排序」两条不变量），
+    // 放在 badge-model.js 里由单测锁死 —— 组件里看不见 react 的测试跑不起来。
+    const { shown, hidden } = orderCreditRows(accounts, {
+      limit: CREDITS_COLLAPSED_LIMIT,
+      expanded: creditsExpanded,
+    });
     return React.createElement('div', { key: 'credits', className: 'dim-jh-badgeSection' }, [
       // 合计放进节标题右侧，省掉一整行
       React.createElement('div', { key: 'title', className: 'dim-jh-badgeSectionTitle' }, [
@@ -807,7 +878,7 @@ function UsageBadgeActive(props) {
       ...(accounts.length === 0
         ? [React.createElement('div', { key: 'empty', className: 'dim-jh-badgeNote' },
           value?.disabledCount > 0 ? '该渠道的账号全部已停用' : '该渠道还没有账号（可在 Jet Hub 设置页添加）')]
-        : accounts.map((row) => React.createElement('div', { key: row.accountId, className: 'dim-jh-badgeRow' }, [
+        : shown.map((row) => React.createElement('div', { key: row.accountId, className: 'dim-jh-badgeRow' }, [
           React.createElement('div', { key: 'head', className: 'dim-jh-badgeRowHead' }, [
             React.createElement('span', {
               key: 'l',
@@ -826,6 +897,15 @@ function UsageBadgeActive(props) {
             ? null
             : renderNote(splitLine(row.balance, windowDays, provider)),
         ]))),
+      hidden === 0
+        ? null
+        : React.createElement('button', {
+          key: 'more',
+          type: 'button',
+          className: 'dim-jh-badgeMore',
+          'aria-expanded': creditsExpanded,
+          onClick: () => setCreditsExpanded((was) => !was),
+        }, creditsExpanded ? '收起' : `展开其余 ${hidden} 个账号`),
     ]);
   }
 
@@ -950,7 +1030,10 @@ function UsageBadgeActive(props) {
   function renderFoot() {
     const parts = [];
     if (value?.disabledCount > 0) parts.push(`另有 ${value.disabledCount} 个账号已停用，未计入`);
-    if (view.failedCount > 0) parts.push(`${view.failedCount} 个账号读取失败`);
+    // ⚠️ 优先复用 `incompleteNote` 那句话：同一个事实（有几个账号没读到）在两个
+    // 界面各写一份措辞，改一处就会出现「胶囊说A、弹窗说B」的偏差。
+    // 只有积分模式才有那句话（窗口/套餐不是合计），故其余模式保留简写。
+    if (view.failedCount > 0) parts.push(view.incompleteNote === '' ? `${view.failedCount} 个账号读取失败` : view.incompleteNote);
     if (failed && snapshot !== null) parts.push('本次刷新失败，显示的是上一次读数');
     if (parts.length === 0) return null;
     return React.createElement('div', { key: 'foot', className: 'dim-jh-badgeFoot' }, parts.join(' · '));
