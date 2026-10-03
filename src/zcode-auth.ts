@@ -1106,7 +1106,15 @@ export class ZcodeAuth extends Service {
     this.captchaPool ??= new CaptchaPool({
       mint: async (options) => {
         try {
-          this.captchaBrowser ??= new ZcodeCaptchaBrowser()
+          /**
+           * ⚠ `log` 接线：候选链落到系统 Edge 时会告警一次（issue IKJLB1）。
+           * 之前是**静默**选中的，用户既不知道用了哪个浏览器、也不知道该去哪换。
+           * 用 `warn` 而非 `error` —— captcha 只是领取路径的一环，失败由下面的
+           * catch 正常上报，不该在正常降级时刷错误级日志。
+           */
+          this.captchaBrowser ??= new ZcodeCaptchaBrowser({
+            log: (message) => { this.ctx.logger?.warn?.(message) },
+          })
           const outcome = await this.captchaBrowser.mintWithOutcome(
             this.captchaMintConfig ?? ZCODE_CAPTCHA_FALLBACK,
             options,
