@@ -34,15 +34,20 @@ import {
   gatewayApiKeyHint,
   gatewayButtonLabel,
   gatewayButtonTitle,
+  gatewayCardExpanded,
+  gatewayCardLabel,
   gatewayEndpoint,
   gatewayEffortRows,
   gatewayEffortsCurl,
   gatewayEffortsEmptyHint,
   gatewayEffortsHint,
   gatewayEffortsText,
+  gatewayModelKeyOf,
   filterEffortRows,
   gatewayModelsCurl,
   gatewayModelsHint,
+  groupGatewayEntries,
+  groupGatewayModels,
   gatewayStatusLines,
   gatewaySwitchDisabled,
   gatewayToggleNotice,
@@ -3535,6 +3540,121 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
 }
 
 /**
+ * 网关清单里的一行模型（**只读**，没有开关）。
+ *
+ * ⚠️ 与模型列表的 `ModelToggle` 不同，这里**刻意不用 `<label>`**：网关弹窗只做
+ * 「把 ID 抄走」这一件事，行内没有任何控件；用 label 会让整行带上「可点」的错觉
+ * （模型列表那边踩过「双 checkbox 让点文字变成勾选」的同型坑，见 `model-filter.js`）。
+ *
+ * ⚠️ 行内只显示**去掉供应商前缀**的模型名（`gatewayModelKeyOf`），完整 ID 放在
+ * tooltip 与「复制」里。理由：实测 `codearts/deepseek-v4.1-flash` 这类 id 占满整行，
+ * 在 id 单元格 `max-width: 46%` 的夹取下跌成 `codearts/deepse…`，模型名反而读不出来；
+ * 而卡片标题已经把供应商写清楚了，前缀是纯重复。
+ */
+function GatewayModelRow({ model }) {
+  // 「可发图片」只标在支持的那个上 —— 用户据此挑模型，而不是靠撞一次
+  // unsupported_content 才知道。数据来自宿主，与 /v1/models 同源。
+  const badge = modelCapabilityBadge(model);
+  return React.createElement('div', {
+    className: 'dim-jh-gatewayModelRow',
+    // tooltip = 完整 ID（可直接选中复制）+ 展示名，截图/复制时信息不丢。
+    title: `${model.id}\n${model.name || ''}`.trim(),
+  },
+    React.createElement('code', { className: 'dim-jh-modelId' }, gatewayModelKeyOf(model)),
+    React.createElement('span', { className: 'dim-jh-modelName' }, model.name || model.id),
+    badge
+      ? React.createElement('span', { className: 'dim-jh-modelBadge', title: '该模型接受图片输入。' }, badge)
+      : null);
+}
+
+/**
+ * 思考档位对照表里的一行（**只读**）。
+ *
+ * ⚠️ 与模型清单的行分开写：这里要显示「真实档位 / 客户端该填」两列，
+ * 而正文允许换行（用户反馈过「字符过长被省略」，见下面的类注释），
+ * 与模型行「单行 + 省略号」的排版目标完全不同。
+ */
+function GatewayEffortRow({ row }) {
+  return React.createElement('div', {
+    className: 'dim-jh-effortRow',
+    title: `${row.id}\n真实档位：${row.declared}\n客户端该填：${row.fill}`,
+  },
+    React.createElement('div', { className: 'dim-jh-effortHead' },
+      // 卡片头已写明供应商，行内显示去掉前缀的名字；完整 id 在 tooltip 与复制里。
+      React.createElement('code', { className: 'dim-jh-effortModel' }, gatewayModelKeyOf(row)),
+      row.lossy
+        ? React.createElement('span', {
+          className: 'dim-jh-modelBadge',
+          title: '该模型的档位名与 OpenAI 客户端不同名：照 DSH 界面上的名字填，网关会按强度就近翻译。',
+        }, '需对照')
+        : null),
+    React.createElement('div', { className: 'dim-jh-effortLine' },
+      React.createElement('span', { className: 'dim-jh-effortLabel' }, '真实档位：'),
+      row.declared),
+    React.createElement('div', { className: 'dim-jh-effortLine' },
+      React.createElement('span', { className: 'dim-jh-effortLabel' }, '客户端该填：'),
+      row.fill));
+}
+
+/**
+ * 把一批条目按供应商渲染成**卡片**（模型清单与档位对照表共用）。
+ *
+ * ⚠️ **共用**是刻意的：两处的分组口径（`groupGatewayEntries`）、折叠规则
+ * （`gatewayCardExpanded`）、卡片头（标题 + 条数 + 「复制本组」）理应完全一致 ——
+ * 用户看到的是同一种「一家供应商一张卡」的形态，各写一套迟早一处改了另一处没改。
+ *
+ * @param {object} props
+ * @param {Array<object>} props.cards `groupGatewayEntries` 的产物
+ * @param {(row: object) => object} props.renderRow 行渲染函数
+ * @param {(provider: string) => boolean} props.isExpanded 该卡片此刻是否展开
+ * @param {(provider: string) => void} props.onToggle 折叠开关
+ * @param {(card: object) => void} props.onCopy 复制该卡片（部分）
+ * @param {(provider: string) => boolean} props.isCopied 该卡片是否刚复制成功
+ * @param {string} props.foldSuffix 条数单位，如「个模型」
+ * @param {string} props.foldLabel `counts.fold` 的含义，如「可发图片」「需对照」；
+ *   为空串表示这一批条目没有第二类计数（不显示那段）。
+ * @param {string} props.copyNoun 复制按钮 tooltip 里的量词，如「个完整模型 ID」
+ */
+function GatewayCards({ cards, renderRow, isExpanded, onToggle, onCopy, isCopied, foldSuffix, foldLabel, copyNoun }) {
+  return React.createElement('div', { className: 'dim-jh-gatewayCards', style: { marginTop: '6px' } },
+    cards.map(card => {
+      const expanded = isExpanded(card.provider);
+      const label = gatewayCardLabel(card.provider, providerLabel);
+      return React.createElement('div', {
+        // ⚠️ 供应商 key 拿不到时用 `__unknown__`：`key: ''` 会让 React 报警并可能丢行。
+        key: card.provider === '' ? '__unknown__' : card.provider,
+        className: 'dim-jh-gatewayCard',
+      },
+        React.createElement('div', { className: 'dim-jh-gatewayCardHead' },
+          React.createElement('button', {
+            className: 'dim-jh-gatewayCardToggle',
+            'aria-expanded': expanded ? 'true' : 'false',
+            // tooltip 里给出**原始 provider key**：卡片标题是展示名，
+            // 而用户要复制进配置的是 ID 里的那个 key，两者可能不同。
+            title: card.provider === ''
+              ? '这些条目没有回传供应商字段（上游数据异常），仍照实列出。'
+              : `供应商 key：${card.provider}（模型 ID 的前缀就是它）`,
+            onClick: () => onToggle(card.provider),
+          }, `${expanded ? '▾' : '▸'} ${label}`),
+          React.createElement('span', { className: 'dim-jh-gatewayCardCount' },
+            card.counts.fold > 0 && foldLabel !== ''
+              ? `${card.counts.total} ${foldSuffix} · ${card.counts.fold} 个${foldLabel}`
+              : `${card.counts.total} ${foldSuffix}`),
+          React.createElement('button', {
+            className: 'dim-jh-btn dim-jh-gatewayCardBtn',
+            title: `只复制「${label}」这一家的 ${card.counts.total} ${copyNoun}（每行一个完整 ID）。`,
+            onClick: () => onCopy(card),
+          }, isCopied(card.provider) ? '已复制 ✓' : '复制本组')),
+        expanded
+          ? React.createElement('div', { className: 'dim-jh-gatewayCardBody' },
+            card.entries.map((entry, index) => React.createElement(
+              // ⚠️ 同一 id 重复出现时 key 会撞（上游缺陷），补下标保证 React 不丢行。
+              React.Fragment, { key: `${card.provider}#${entry.id}#${index}` }, renderRow(entry))))
+          : null);
+    }));
+}
+
+/**
  * 「本机 OpenAI 网关」弹窗。
  *
  * 展示三件用户配外部客户端时真正需要的信息：**开关**、**对外地址**、**密钥在哪**。
@@ -3555,18 +3675,44 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
   const [effortsQuery, setEffortsQuery] = React.useState('');
   const [effortsCopied, setEffortsCopied] = React.useState(false);
   const [idsCopied, setIdsCopied] = React.useState(false);
+  /**
+   * 每张供应商卡片各自的展开态（`provider → 用户点过的布尔`）。
+   * 只在用户**点过**之后才有值，此前由 `gatewayCardExpanded` 按条数给默认值。
+   * 模型清单与对照表各一套：两者的条目数与折叠阈值都不同，共用一个对象会让
+   * 「展开 model 家的模型清单」连带动了「展开 model 家的档位表」。
+   */
+  const [modelCardToggles, setModelCardToggles] = React.useState({});
+  const [effortCardToggles, setEffortCardToggles] = React.useState({});
+  /** 刚复制成功的那张卡片（provider key），用于把按钮打成「已复制 ✓」。 */
+  const [copiedModelCard, setCopiedModelCard] = React.useState(null);
+  const [copiedEffortCard, setCopiedEffortCard] = React.useState(null);
   const apiKey = status?.apiKey ?? null;
   const models = status?.models ?? [];
+  /**
+   * 按供应商折成卡片（用户 2026-10-03 要求：一家供应商一张卡，而不是一个模型一行）。
+   *
+   * ⚠️ 分组判据在纯函数 `groupGatewayModels` / `groupGatewayEntries` 里
+   * （单测环境没有 react，组件渲染不了 —— 判据必须抽出来才能真跑覆盖）。
+   */
+  const modelCards = groupGatewayModels(models);
   const effortRows = gatewayEffortRows(models);
   // ⚠️ 搜索在**渲染时**做，不改 effortRows 本身：清空搜索即恢复全量。
   const visibleEffortRows = filterEffortRows(effortRows, effortsQuery);
   const effortsFiltering = isFilterActive({ query: effortsQuery });
+  /**
+   * 对照表也折成**同一套供应商卡片**。
+   *
+   * ⚠️ 先在**筛出来的行**上分组（不是先分组再筛）：卡片头部的条数必须与卡内实际
+   * 行数一致，否则搜索时会出现「卡片写着 8 个、里面只有 1 行」的矛盾读数。
+   */
+  const effortCards = groupGatewayEntries(visibleEffortRows, (row) => row.lossy);
 
   // 每次重新打开/换密钥后复位：否则上一条「已复制」会挂在新密钥旁边误导用户。
   React.useEffect(() => { setCopied(false); setRevealed(false); }, [status?.apiKey?.value]);
-  React.useEffect(() => { setIdsCopied(false); }, [models.length]);
+  // ⚠️ 目录换了一批就复位「已复制」：否则旧卡片的勾会留在同名卡片上。
+  React.useEffect(() => { setIdsCopied(false); setCopiedModelCard(null); }, [models.length]);
   // 换了搜索词还留着上一条「已复制 ✓」会误导（那条讲的是另一批行）。
-  React.useEffect(() => { setEffortsCopied(false); }, [models.length, effortsQuery]);
+  React.useEffect(() => { setEffortsCopied(false); setCopiedEffortCard(null); }, [models.length, effortsQuery]);
 
   React.useEffect(() => {
     const onKeyDown = (event) => { if (event.key === 'Escape') onClose(); };
@@ -3603,6 +3749,20 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
   };
 
   /**
+   * 复制**一张卡片**的模型 ID（每行一个完整的 `provider/模型名`）。
+   *
+   * ⚠️ 复制的是**完整 ID**，不是行内显示的短名字：客户端配置要的是前者，
+   * 抄一个短名字进去必然 404。行内显示短名只是为了不被截断（见 `GatewayModelRow`）。
+   */
+  const handleCopyCardIds = async (card) => {
+    const text = formatModelIdList(card.entries);
+    if (!text) return;
+    const ok = await copyToClipboard(text);
+    setCopiedModelCard(ok ? card.provider : null);
+    if (!ok) setModelsOpen(true);
+  };
+
+  /**
    * 复制思考档位对照表。有搜索词时只复制**筛出来的那些行** ——
    * 用户搜完再复制，拿到的正是屏幕上看到的内容（复制全量会让人以为搜索没生效）。
    *
@@ -3614,6 +3774,20 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
     if (!text) return;
     const ok = await copyToClipboard(text);
     setEffortsCopied(ok);
+    if (!ok) setEffortsOpen(true);
+  };
+
+  /**
+   * 复制**一张卡片**的档位对照（只含该供应商的行）。
+   *
+   * 与「复制对照表」的区别只是范围：用户常只需一家（例如只在配 Codex 的
+   * `trae` 那一档），复制全量反而要自己再挑。
+   */
+  const handleCopyCardEfforts = async (card) => {
+    const text = gatewayEffortsText(card.entries);
+    if (!text) return;
+    const ok = await copyToClipboard(text);
+    setCopiedEffortCard(ok ? card.provider : null);
     if (!ok) setEffortsOpen(true);
   };
 
@@ -3706,21 +3880,33 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
         className: 'dim-jh-btn',
         'aria-expanded': modelsOpen ? 'true' : 'false',
         onClick: () => setModelsOpen(open => !open),
-      }, modelsOpen ? '收起' : '展开清单')),
+      }, modelsOpen ? '收起清单' : '展开清单')),
     modelsOpen
-      ? React.createElement('div', { className: 'dim-jh-modelList', style: { marginTop: '6px' } },
-        models.map(model => {
-          // 「可发图片」只标在支持的那个上 —— 用户据此挑模型，而不是靠撞一次
-          // unsupported_content 才知道。数据来自宿主，与 /v1/models 同源。
-          const badge = modelCapabilityBadge(model);
-          return React.createElement('div', { key: model.id, className: 'dim-jh-modelRow' },
-            React.createElement('span', { className: 'dim-jh-modelInfo' },
-              React.createElement('code', { className: 'dim-jh-modelId' }, model.id),
-              React.createElement('span', { className: 'dim-jh-modelName' }, model.name),
-              badge
-                ? React.createElement('span', { className: 'dim-jh-modelBadge', title: '该模型接受图片输入。' }, badge)
-                : null));
-        }))
+      // 按**供应商**分组渲染：一家一张卡片，卡片头写清是哪家、有几条、
+      // 几条能发图片，卡内才是它自己的模型。用户报障（2026-10-03）——
+      // 此前平铺成「一个模型一行」，同一家的 deepseek-account/deepseek-flash
+      // 与 deepseek-account/deepseek-v4-pro 看起来毫无关系，
+      // 而用户真正要对照的正是「一家供应商下有哪些模型」。
+      ? React.createElement(GatewayCards, {
+        cards: modelCards,
+        renderRow: (model) => React.createElement(GatewayModelRow, { model }),
+        isExpanded: (provider) => gatewayCardExpanded(
+          modelCards.find(card => card.provider === provider),
+          { toggled: modelCardToggles[provider] },
+        ),
+        onToggle: (provider) => setModelCardToggles(prev => ({
+          ...prev,
+          [provider]: !gatewayCardExpanded(
+            modelCards.find(card => card.provider === provider),
+            { toggled: prev[provider] },
+          ),
+        })),
+        onCopy: (card) => void handleCopyCardIds(card),
+        isCopied: (provider) => copiedModelCard === provider,
+        foldSuffix: '个模型',
+        foldLabel: '可发图片',
+        copyNoun: '个完整模型 ID',
+      })
       : null,
     React.createElement('p', { className: 'dim-jh-modalHint' },
       '也可以用命令行查看同一份目录（地址栏直接打开会返回 401，因为它需要 Bearer 头）：'),
@@ -3780,27 +3966,33 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
           }, effortsCopied ? '已复制 ✓' : `复制对照表（${visibleEffortRows.length} 行）`)
         : null),
     effortsOpen
-      ? React.createElement('div', { className: 'dim-jh-modelList', style: { marginTop: '6px' } },
-        visibleEffortRows.length === 0
+      ? (visibleEffortRows.length === 0
           // 空结果必须能自解释，否则用户会以为网关坏了（而不是被搜索词筛没了）。
           ? React.createElement('div', { className: 'dim-jh-effortEmpty' }, gatewayEffortsEmptyHint(effortsQuery))
-          : visibleEffortRows.map(row => React.createElement('div', { key: row.id, className: 'dim-jh-effortRow' },
-            React.createElement('div', { className: 'dim-jh-effortHead' },
-              // ⚠️ 这里**不能**用 .dim-jh-modelId：它带 max-width 46% + ellipsis 截断，
-              // 而对照表的内容正是用户要抄的东西（真实反馈：字符过长被省略了）。
-              React.createElement('code', { className: 'dim-jh-effortModel' }, row.id),
-              row.lossy
-                ? React.createElement('span', {
-                  className: 'dim-jh-modelBadge',
-                  title: '该模型的档位名与 OpenAI 客户端不同名：照 DSH 界面上的名字填，网关会按强度就近翻译。',
-                }, '需对照')
-                : null),
-            React.createElement('div', { className: 'dim-jh-effortLine' },
-              React.createElement('span', { className: 'dim-jh-effortLabel' }, '真实档位：'),
-              row.declared),
-            React.createElement('div', { className: 'dim-jh-effortLine' },
-              React.createElement('span', { className: 'dim-jh-effortLabel' }, '客户端该填：'),
-              row.fill))))
+          // ⚠️ 与模型清单**同一套卡片形态**（`GatewayCards`）：两处都是
+          // 「一家供应商一张卡」，用户不必学两种读法。
+          : React.createElement(GatewayCards, {
+            cards: effortCards,
+            renderRow: (row) => React.createElement(GatewayEffortRow, { row }),
+            isExpanded: (provider) => gatewayCardExpanded(
+              effortCards.find(card => card.provider === provider),
+              // ⚠️ 有搜索词时一律展开：命中结果藏在折叠卡里，用户会以为「搜不到」
+              // （与 `model-groups.js` 的同一取舍）。
+              { toggled: effortCardToggles[provider], searching: effortsFiltering },
+            ),
+            onToggle: (provider) => setEffortCardToggles(prev => ({
+              ...prev,
+              [provider]: !gatewayCardExpanded(
+                effortCards.find(card => card.provider === provider),
+                { toggled: prev[provider], searching: effortsFiltering },
+              ),
+            })),
+            onCopy: (card) => void handleCopyCardEfforts(card),
+            isCopied: (provider) => copiedEffortCard === provider,
+            foldSuffix: '个可选档位',
+            foldLabel: '需对照',
+            copyNoun: '个模型的档位对照',
+          }))
       : null,
     React.createElement('p', { className: 'dim-jh-modalHint' },
       '同一份对照表也可以用命令行查看（同样需要 Bearer 头）：'),

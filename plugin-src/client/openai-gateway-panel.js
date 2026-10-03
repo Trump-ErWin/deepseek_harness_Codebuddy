@@ -133,6 +133,152 @@ export function formatModelIdList(models) {
 }
 
 /**
+ * 条目所属的供应商 key。
+ *
+ * ⚠️ **优先取采集侧给的 `provider`**，只在它缺失时才按首个 `/` 切 `id` 兜底。
+ * 兜底分支与网关自己的路由口径**同源**（`src/openai-gateway/messages.ts` 的
+ * `parseModelRoute` 同样用 `indexOf('/')` 切第一个斜杠），所以兜底出来的分组
+ * 与「能不能调用成功」不会矛盾 —— 这是它能安全兜底的前提。
+ *
+ * 但兜底**不是**首选：模型名里允许带斜杠（实测 Cline 的
+ * `cline/anthropic/claude-sonnet-5.5`），一旦某家的模型名以 `/` 开头，
+ * 或 provider key 本身含 `/`，反推就会错位。故正常路径一律用权威字段。
+ *
+ * @param {{ id?: string, provider?: string } | null | undefined} entry
+ * @returns {string} 拿不到时返回 `''`（调用方据此归入「未知」卡片，而不是丢行）
+ */
+export function gatewayProviderOf(entry) {
+  const provider = entry?.provider
+  if (typeof provider === 'string' && provider !== '') return provider
+  const id = typeof entry?.id === 'string' ? entry.id : ''
+  const slash = id.indexOf('/')
+  return slash > 0 ? id.slice(0, slash) : ''
+}
+
+/**
+ * 条目在**供应商内部**的名字（不含 `<provider>/` 前缀）。
+ *
+ * 卡片已经按供应商分组，行内再重复一遍前缀是纯噪声：实测
+ * `codearts/deepseek-v4.1-flash` 这类 id 会占掉整行的宽度，在窄面板的夹取下跌成
+ * `codearts/deepse…` —— 用户既看不出模型名，也读不到能复制的 ID。
+ * 故行内只显示这一段的**可读名字**，而「复制」始终复制完整 `id`。
+ *
+ * @param {{ id?: string, provider?: string, model?: string } | null | undefined} entry
+ * @returns {string} 拿不到时退回完整 `id`（宁可多显示前缀，也不要给空行）
+ */
+export function gatewayModelKeyOf(entry) {
+  const inner = entry?.model
+  if (typeof inner === 'string' && inner !== '') return inner
+  const id = typeof entry?.id === 'string' ? entry.id : ''
+  const provider = gatewayProviderOf(entry)
+  if (provider !== '' && id.startsWith(provider + '/')) return id.slice(provider.length + 1)
+  return id
+}
+
+/**
+ * 卡片**默认**展开的最大条目数。
+ *
+ * 超过它就默认折叠：网关清单是**全 provider 汇总**，Cline 一家实测近 500 条，
+ * 全展开等于把弹窗撑成没法翻的长条（用户在找的是「哪家有哪些模型」，不是
+ * 「一次看完 500 行」）。折叠是**可见的**（卡片头上有条数），不会让人以为丢了行。
+ * 与 `model-groups.js` 的 `groupExpanded` 同一取舍（那里默认折叠「按量计费」大桶）。
+ */
+export const GATEWAY_CARD_AUTOCOLLAPSE_AT = 24
+
+/**
+ * 把条目按供应商折成**一个供应商一张卡片**。
+ *
+ * 用户报障（2026-10-03）：`deepseek-account/deepseek-flash` 与
+ * `deepseek-account/deepseek-v4-pro` 被平铺成两行，看不出它们同属一家 ——
+ * 而用户真正要对照的正是「一家供应商下有哪些模型」。
+ *
+ * - **卡片顺序保持目录原序**（首次出现的先后），与「组内不重排」同一口径；
+ * - 供应商 key 拿不到（条目畸形）时归入 `''` 那张卡，**不丢行**：
+ *   少一个 ID 会让用户照着一份不完整的清单配客户端；
+ * - 不做去重：同一 `id` 出现两次是上游的事，这里如实显示（去重会掩盖上游缺陷）。
+ *
+ * ⚠️ 模型清单与思考档位对照表**共用**本函数（前者传模型条目、后者传对照行），
+ * 故它只依赖 `provider` / `id` 两个字段 —— 两处的分组口径因此不可能漂移。
+ *
+ * @param {Array<object> | null | undefined} entries
+ * @param {(entry: object) => boolean} [countFold] 统计「这一类」条目的数量
+ * @returns {Array<{ provider: string, entries: Array<object>, counts: { total: number, fold: number } }>}
+ */
+export function groupGatewayEntries(entries, countFold) {
+  const list = Array.isArray(entries) ? entries : []
+  const byProvider = new Map()
+  for (const entry of list) {
+    const provider = gatewayProviderOf(entry)
+    let bucket = byProvider.get(provider)
+    if (bucket === undefined) {
+      bucket = []
+      byProvider.set(provider, bucket)
+    }
+    bucket.push(entry)
+  }
+  return [...byProvider].map(([provider, bucket]) => ({
+    provider,
+    entries: bucket,
+    counts: {
+      total: bucket.length,
+      fold: typeof countFold === 'function' ? bucket.filter(countFold).length : 0,
+    },
+  }))
+}
+
+/**
+ * 把模型清单折成**一个供应商一张卡片**（子项是该供应商的模型）。
+ *
+ * `counts.fold` 是其中**能发图片**的条数（卡片头上据此给个总览）。
+ *
+ * @param {Array<object> | null | undefined} models
+ * @returns {Array<{ provider: string, entries: Array<object>, counts: { total: number, fold: number } }>}
+ */
+export function groupGatewayModels(models) {
+  return groupGatewayEntries(models, (model) => modelSupportsImage(model))
+}
+
+/**
+ * 这张卡片此刻是否展开。
+ *
+ * 优先级（从高到低，与 `model-groups.js` 的 `groupExpanded` 同构）：
+ * 1. **用户显式点过**（`toggled` 是布尔）—— 用户的选择永远优先；
+ * 2. 有生效中的搜索/筛选时一律展开（否则搜到的结果藏在折叠卡里，
+ *    用户会以为「搜不到」—— 这与对照表搜索的取舍同源）；
+ * 3. 默认值：条数超过 {@link GATEWAY_CARD_AUTOCOLLAPSE_AT} 的卡片折叠。
+ *
+ * @param {{ counts?: { total?: number } } | null | undefined} card
+ * @param {{ toggled?: boolean, searching?: boolean }} [options]
+ * @returns {boolean}
+ */
+export function gatewayCardExpanded(card, options = {}) {
+  const toggled = options.toggled
+  if (toggled === true || toggled === false) return toggled
+  if (options.searching === true) return true
+  return (card?.counts?.total ?? 0) <= GATEWAY_CARD_AUTOCOLLAPSE_AT
+}
+
+/**
+ * 卡片标题：供应商 key → 给人看的名字。
+ *
+ * 供应商 key 拿不到时（条目畸形）给一个**可解释**的标题，而不是空字符串：
+ * 空标题会让用户以为界面坏了，而这其实是上游数据的问题。
+ *
+ * @param {string} provider
+ * @param {(id: string) => string} [labelOf] 渠道名查询（设置页传 `providerLabel`）
+ * @returns {string}
+ */
+export function gatewayCardLabel(provider, labelOf) {
+  if (provider === '') return '（未标注供应商）'
+  if (typeof labelOf === 'function') {
+    const label = labelOf(provider)
+    // ⚠️ 查不到时 `providerLabel` 原样返回 id，仍是可读的；只有拿到空串才退回 id。
+    if (typeof label === 'string' && label !== '') return label
+  }
+  return provider
+}
+
+/**
  * 模型目录的说明文案。
  *
  * ⚠️ 空清单必须**自解释**：此前只说「还没有可用模型，登录至少一个供应商」，
@@ -151,9 +297,12 @@ export function gatewayModelsHint(models, source) {
     }
     return '还没有可用模型：登录至少一个供应商后，点「刷新」即可看到可用的模型 ID。';
   }
-  const base = `共 ${models.length} 个可用模型。`
+  const providers = new Set(models.map(model => gatewayProviderOf(model))).size;
+  const base = `共 ${models.length} 个可用模型，来自 ${providers} 个供应商（下面按供应商分组）。`
     + '有些客户端（如 ZCode）不会自动扫描模型目录，需要从这里把模型 ID 复制到它的配置里。'
-    + 'ID 区分大小写；同名模型在不同供应商下也是不同模型（例如 codearts 与 buddy 各有一份 deepseek-v4.1-flash）。';
+    + '卡片里显示的是模型名，复制出去的始终是**完整的「供应商/模型名」**；'
+    + 'ID 区分大小写，且必须带供应商前缀 —— 同名模型在不同供应商下也是不同模型'
+    + '（例如 codearts 与 buddy 各有一份 deepseek-v4.1-flash）。';
   return source === 'adapters'
     ? base + '（当前目录来自本插件已注册的适配器，可能不含 DSH 自带的模型）'
     : base;
@@ -207,6 +356,11 @@ export function gatewayEffortRow(model) {
   if (!Array.isArray(efforts) || efforts.length === 0) return null;
   return {
     id: model.id,
+    // ⚠️ 带上权威供应商与内部模型名：对照表也要按供应商折成卡片，而行内只显示
+    // **去掉前缀**的名字（与模型清单同一取舍，见 `gatewayModelKeyOf`）。
+    // 复制出去的仍是完整 `id`（客户端配置要的是它）。
+    provider: gatewayProviderOf(model),
+    model: gatewayModelKeyOf(model),
     // 展示名留给搜索用（与模型清单的搜索共用 matchesModelQuery）。
     name: typeof model.name === 'string' ? model.name : '',
     // 两个名字都给出来：`id` 是网关实际下发的 wire 值，`name` 是 DSH 界面上的叫法
@@ -289,8 +443,10 @@ export function gatewayEffortsHint(models) {
   }
   const lossy = rows.filter((row) => row.lossy).length;
   const enabled = Array.isArray(models) ? models.length : rows.length;
+  const providers = new Set(rows.map((row) => gatewayProviderOf(row))).size;
   return `当前已开启的 ${enabled} 个模型里，有 ${rows.length} 个可选思考档位`
-    + `${lossy > 0 ? `，其中 ${lossy} 个的档位名与 OpenAI 客户端不同（见下方标「需对照」的行）` : ''}。`
+    + `${lossy > 0 ? `，其中 ${lossy} 个的档位名与 OpenAI 客户端不同（见下方标「需对照」的行）` : ''}`
+    + `（按供应商分组，来自 ${providers} 个供应商）。`
     + '「客户端该填」那一列可以直接抄进 CC Switch / Codex 的思考等级设置，与模型真实档位一一对应。'
     // ⚠️ 别写成「填什么都不会报错」：强度序只登记了 12 个名字（8 个规范名 + 上游私有的
     // off / light / on / extra_high），`turbo` 这类未登记的写法是**真会 400** 的
@@ -321,6 +477,10 @@ export function gatewayEffortsEmptyHint(query) {
  * 对照表的纯文本形态（供「复制」按钮写进剪贴板）。
  *
  * 与面板渲染共用同一批行，故复制到的内容与屏幕上看到的必然一致。
+ *
+ * ⚠️ 复制的是**完整 id**（`provider/模型名`），不是行内显示的短名字：
+ * 客户端配置要的是前者，抄一个短名字进去必然 404。这一点与模型清单的
+ * 「复制」口径完全一致。
  *
  * @param {Array<{ id: string, declared: string, fill: string }> | null | undefined} rows
  * @returns {string}

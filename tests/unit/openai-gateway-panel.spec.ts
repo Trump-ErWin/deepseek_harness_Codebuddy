@@ -8,6 +8,8 @@ import {
   gatewayApiKeyHint,
   gatewayButtonLabel,
   gatewayButtonTitle,
+  gatewayCardExpanded,
+  gatewayCardLabel,
   gatewayEndpoint,
   gatewayEffortRow,
   gatewayEffortRows,
@@ -15,6 +17,11 @@ import {
   gatewayEffortsEmptyHint,
   gatewayEffortsHint,
   gatewayEffortsText,
+  gatewayModelKeyOf,
+  gatewayProviderOf,
+  groupGatewayEntries,
+  groupGatewayModels,
+  GATEWAY_CARD_AUTOCOLLAPSE_AT,
   filterEffortRows,
   matchesEffortQuery,
   gatewayModelsCurl,
@@ -549,5 +556,184 @@ describe('思考档位对照表的排版（不截断）', () => {
     )
     expect(effortSection).not.toBe('')
     expect(effortSection).not.toContain('dim-jh-modelName')
+  })
+})
+
+/**
+ * 「一个供应商一张卡片」（用户报障 2026-10-03）。
+ *
+ * 用户原话：`deepseek-account/deepseek-flash` 与 `deepseek-account/deepseek-v4-pro`
+ * 这是同一家供应商 `deepseek-account` 的，却分为了两个卡片（当时是一个模型一行）。
+ * 用户要的形态是「供应商 → 它名下有哪些模型」。
+ *
+ * ⚠️ 分组判据必须抽成纯函数才能真跑覆盖：单测环境是 `node`，react 不在依赖内。
+ */
+describe('按供应商分组（一个供应商一张卡片）', () => {
+  const MODELS = [
+    { id: 'deepseek-account/deepseek-flash', provider: 'deepseek-account', model: 'deepseek-flash', name: 'Flash' },
+    { id: 'deepseek-account/deepseek-v4-pro', provider: 'deepseek-account', model: 'deepseek-v4-pro', name: 'Pro' },
+    { id: 'codearts/GLM-5.2', provider: 'codearts', model: 'GLM-5.2', name: 'GLM' },
+  ]
+
+  it('★ 用户报障的那两条必须落在同一张卡片里', () => {
+    const cards = groupGatewayModels(MODELS)
+    const ds = cards.find(card => card.provider === 'deepseek-account')
+    expect(ds?.entries.map(entry => entry.model)).toEqual(['deepseek-flash', 'deepseek-v4-pro'])
+    // 卡片数 = 供应商数（不是模型数）。
+    expect(cards.map(card => card.provider)).toEqual(['deepseek-account', 'codearts'])
+  })
+
+  it('卡片顺序 = 目录原序（首次出现的先后），不重排', () => {
+    const shuffled = [MODELS[2], MODELS[1], MODELS[0]]
+    expect(groupGatewayModels(shuffled).map(card => card.provider)).toEqual(['codearts', 'deepseek-account'])
+  })
+
+  it('★ 卡片头的条数如实统计（总数 + 可发图片数）', () => {
+    const cards = groupGatewayModels([
+      { id: 'a/x', provider: 'a', model: 'x', name: 'X', input: ['text', 'image'] },
+      { id: 'a/y', provider: 'a', model: 'y', name: 'Y', input: ['text'] },
+    ])
+    expect(cards[0].counts).toEqual({ total: 2, fold: 1 })
+  })
+
+  it('★ provider 缺失时按首个斜杠兜底（与网关路由同源），仍不丢行', () => {
+    // 宿主字段缺失（旧版本/替身）时的降级路径：能分组，只是分组由 id 反推。
+    const cards = groupGatewayModels([{ id: 'codearts/GLM-5.2', name: 'GLM' }])
+    expect(cards.map(card => card.provider)).toEqual(['codearts'])
+  })
+
+  it('⚠️ 拿不到 provider（id 里没斜杠）归入「未知」卡片，**不丢行**', () => {
+    // 少一个 ID 会让用户照着一份不完整的清单配客户端，故宁可单列一张卡。
+    const cards = groupGatewayModels([{ id: 'bogus', name: 'B' }, ...MODELS])
+    expect(cards.map(card => card.provider)).toEqual(['', 'deepseek-account', 'codearts'])
+    expect(cards[0].entries).toHaveLength(1)
+    // 未知那张卡要有**可解释**的标题，空标题会让用户以为界面坏了。
+    expect(gatewayCardLabel('')).toContain('未标注供应商')
+  })
+
+  it('脏输入不抛错（面板在数据未就绪时也要能渲染）', () => {
+    expect(groupGatewayModels(null)).toEqual([])
+    expect(groupGatewayModels(undefined)).toEqual([])
+    expect(groupGatewayModels('nope' as never)).toEqual([])
+    expect(gatewayProviderOf(null)).toBe('')
+    expect(gatewayProviderOf({ id: '/leading' })).toBe('')
+  })
+
+  it('⚠️ 不去重：同一 id 出现两次是上游的事，如实显示（去重会掩盖上游缺陷）', () => {
+    const cards = groupGatewayModels([MODELS[0], MODELS[0]])
+    expect(cards[0].counts.total).toBe(2)
+  })
+
+  it('★ 模型清单与档位对照表共用同一套分组判据（两处口径不可能漂移）', () => {
+    // 对照行只有 provider/id/model 三个字段，groupGatewayEntries 也只依赖它们。
+    const rows = [
+      { id: 'trae/deepseek-v4.1-flash', provider: 'trae', model: 'deepseek-v4.1-flash', name: 'F' },
+      { id: 'trae/deepseek-v4-pro', provider: 'trae', model: 'deepseek-v4-pro', name: 'P' },
+      { id: 'lobsterai/deepseek-flash', provider: 'lobsterai', model: 'deepseek-flash', name: 'L' },
+    ]
+    expect(groupGatewayEntries(rows).map(card => card.provider)).toEqual(['trae', 'lobsterai'])
+    // ⚠️ 对照表的分组必须发生在**筛出来的行**上（否则卡片头写着 8 个、里面只有 1 行）。
+    expect(groupGatewayEntries(rows.slice(0, 1)).map(card => card.counts.total)).toEqual([1])
+  })
+
+  it('卡片标题走渠道名（查不到时退回 provider key，不显示空白）', () => {
+    expect(gatewayCardLabel('codearts', () => 'CodeArts (华为云)')).toBe('CodeArts (华为云)')
+    expect(gatewayCardLabel('codearts')).toBe('codearts')
+    // 回调给出空串时也要退回 id，否则标题会是空白。
+    expect(gatewayCardLabel('codearts', () => '')).toBe('codearts')
+  })
+
+  /**
+   * ⚠️ 纯函数的正确性**不足以**证明面板接对了：判据还在、但没人调用（或调用了
+   * 另一批数据）时，用例照样全绿。故这里额外锁三处**接线**。
+   */
+  it('★ 两处清单都真的走了分组卡片（模型清单 + 档位对照表）', () => {
+    expect(source).toContain('groupGatewayModels(models)')
+    // ⚠️ 对照表的卡片必须建在**筛出来的行**上：若建在全量 `effortRows` 上，
+    // 搜索时会出现「卡片头写着 8 个、卡里只有 1 行」的自相矛盾读数。
+    expect(source).toContain('groupGatewayEntries(visibleEffortRows')
+    expect(source).not.toContain('groupGatewayEntries(effortRows')
+    // 两种清单都渲染成卡片（同一套形态，用户不必学两种读法）。
+    expect(source.match(/React\.createElement\(GatewayCards, \{/g)).toHaveLength(2)
+    // 行内用短名字、复制用完整 id（两处都不能搞反）。
+    expect(source).toContain('gatewayModelKeyOf(model)')
+    expect(source).toContain('gatewayModelKeyOf(row)')
+    expect(source).toContain('formatModelIdList(card.entries)')
+  })
+})
+
+/**
+ * 行内只显示**去掉供应商前缀**的模型名（用户要的「模型名显示别那么乱」）。
+ *
+ * 卡片头已经写明供应商，行内再重复前缀是纯噪声：实测
+ * `codearts/deepseek-v4.1-flash` 这类 id 占满整行，在 `max-width: 46%` 的夹取下跌成
+ * `codearts/deepse…` —— 用户既看不出模型名，也读不到能复制的 ID。
+ */
+describe('卡片内的模型名（去掉供应商前缀）', () => {
+  it('★ 用宿主给的权威 model 字段，不靠切 id', () => {
+    expect(gatewayModelKeyOf({ id: 'codearts/GLM-5.2', provider: 'codearts', model: 'GLM-5.2' }))
+      .toBe('GLM-5.2')
+  })
+
+  it('⚠️ model 缺失时按前缀剥一次，剥不掉就退回完整 id（绝不返回空行）', () => {
+    expect(gatewayModelKeyOf({ id: 'codearts/GLM-5.2', provider: 'codearts' })).toBe('GLM-5.2')
+    // 前缀对不上（字段畸形）时不能硬切，否则会切出半个 ID。
+    expect(gatewayModelKeyOf({ id: 'codearts/GLM-5.2', provider: 'other' })).toBe('codearts/GLM-5.2')
+    expect(gatewayModelKeyOf({ id: 'bogus' })).toBe('bogus')
+    expect(gatewayModelKeyOf(null)).toBe('')
+  })
+
+  it('⚠️ 模型名里带斜杠时只剥 provider 那一段（不是按斜杠切一半）', () => {
+    expect(gatewayModelKeyOf({
+      id: 'cline/anthropic/claude-sonnet-5.5', provider: 'cline', model: 'anthropic/claude-sonnet-5.5',
+    })).toBe('anthropic/claude-sonnet-5.5')
+  })
+
+  it('★ 对照表行同样只显示短名字，但复制出去的仍是完整 id', () => {
+    const row = gatewayEffortRow({
+      id: 'trae/deepseek-v4.1-flash',
+      provider: 'trae',
+      model: 'deepseek-v4.1-flash',
+      name: 'Flash',
+      reasoning: { efforts: [{ id: 'high', name: 'High', canonical: 'high' }], openai_efforts: ['high'] },
+    })
+    expect(row?.model).toBe('deepseek-v4.1-flash')
+    expect(row?.provider).toBe('trae')
+    // ⚠️ 复制用的 `id` 必须保持完整 —— 抄一个短名字进客户端必然 404。
+    expect(row?.id).toBe('trae/deepseek-v4.1-flash')
+    expect(gatewayEffortsText([row!])).toContain('trae/deepseek-v4.1-flash')
+  })
+})
+
+/**
+ * 卡片的折叠规则。
+ *
+ * 网关清单是**全 provider 汇总**，Cline 一家实测近 500 条，全展开等于把弹窗
+ * 撑成没法翻的长条（用户找的是「哪家有哪些模型」，不是「一次看完 500 行」）。
+ */
+describe('供应商卡片的折叠', () => {
+  const small = { counts: { total: 3, fold: 0 } }
+  const huge = { counts: { total: GATEWAY_CARD_AUTOCOLLAPSE_AT + 1, fold: 0 } }
+
+  it('默认：小卡片展开，超过阈值的折叠（折叠是可见的，不会让人以为丢了行）', () => {
+    expect(gatewayCardExpanded(small)).toBe(true)
+    expect(gatewayCardExpanded(huge)).toBe(false)
+    expect(gatewayCardExpanded({ counts: { total: GATEWAY_CARD_AUTOCOLLAPSE_AT } })).toBe(true)
+  })
+
+  it('★ 用户点过之后以用户为准（两个方向都要生效）', () => {
+    expect(gatewayCardExpanded(huge, { toggled: true })).toBe(true)
+    expect(gatewayCardExpanded(small, { toggled: false })).toBe(false)
+  })
+
+  it('★ 有搜索词时一律展开 —— 否则搜到的结果藏在折叠卡里，用户以为「搜不到」', () => {
+    expect(gatewayCardExpanded(huge, { searching: true })).toBe(true)
+    // ⚠️ 但用户**显式折叠过**的仍要听用户的（优先级：点过 > 搜索 > 默认）。
+    expect(gatewayCardExpanded(huge, { toggled: false, searching: true })).toBe(false)
+  })
+
+  it('脏输入退化为展开（宁可多显示，也不要藏起来）', () => {
+    expect(gatewayCardExpanded(null)).toBe(true)
+    expect(gatewayCardExpanded({})).toBe(true)
   })
 })

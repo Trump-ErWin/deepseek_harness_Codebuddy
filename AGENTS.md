@@ -7624,6 +7624,50 @@ max ultra`）。CC Switch 把那 8 个（连英文描述）**硬编码在自己�
 `openai-gateway-panel.spec.ts` 的「排版（不截断）」段锁死了这两点（样式不得截断 +
 渲染处不得用 `dim-jh-modelName`）。
 
+### ⚠️ 两处清单都按**供应商折成卡片**（用户要求，2026-10-03）
+
+**用户报障**：「`deepseek-account/deepseek-flash` 和 `deepseek-account/deepseek-v4-pro`
+这是同一家供应商 `deepseek-account` 的，却分为了两个卡片」（当时是**一个模型一行**的平铺）；
+同一条反馈还要求「模型 ID 这里显示各模型名也很乱，希望能像对照表一样改进下」。
+⇒ **模型清单与思考档位对照表都改成一个供应商一张卡片**，卡内子项是它的模型。
+
+判据全在纯函数里（单测环境是 `node`、**react 不在依赖内**，组件渲染不了）：
+
+| 函数 | 作用 |
+|---|---|
+| `groupGatewayEntries(entries, countFold)` | 按 provider 折卡片（模型清单与对照表**共用**，口径不可能漂移） |
+| `groupGatewayModels(models)` | 上面那个的模型清单版本，`counts.fold` = 可发图片条数 |
+| `gatewayProviderOf(entry)` | 取供应商 key：**优先宿主的权威 `provider` 字段**，缺失才按首个 `/` 兜底 |
+| `gatewayModelKeyOf(entry)` | 卡内**短名字**（去掉 `<provider>/` 前缀）；拿不到就退回完整 id |
+| `gatewayCardExpanded(card, {toggled, searching})` | 折叠规则：点过 > 搜索中展开 > 超阈值折叠 |
+| `gatewayCardLabel(provider, labelOf)` | 卡片标题（走 `providerLabel`，查不到退回 key） |
+
+⚠️⚠️ **`provider` / `model` 必须由宿主侧给出，前端不得自己切 `id`**：模型名里**允许带
+斜杠**（实测 `cline/anthropic/claude-sonnet-5.5`），反推在正常数据上恰好也对，但那是**巧合**
+而非契约。故 `toGatewayModelIds` 回传权威拆分，RPC 类型 `RpcGatewayModel` 带上
+`provider` / `model` 两个字段；`openai-gateway-models.spec.ts` 锁死
+`provider + '/' + model === id`（逐字，三种形态）。
+
+⚠️ **卡片头两个数字都必须如实**：总数与第二类计数。对照表的第二类计数是「需对照」
+（`lossy`），模型清单的是「可发图片」—— 故 `GatewayCards` 用 `foldLabel` 参数区分，
+**不能**把「可发图片」写死在组件里（否则对照表会显示「8 个可选档位 · 2 个可发图片」）。
+
+⚠️ **对照表的分组必须发生在「筛出来的行」上**（`groupGatewayEntries(visibleEffortRows…)`），
+不是先分组再筛：否则搜索时卡片头会出现「写着 8 个、卡里只有 1 行」的自相矛盾读数。
+用例里有一条专门用 `expect(source).not.toContain('groupGatewayEntries(effortRows')` 把它锁住。
+
+⚠️ **行内显示短名字，复制出去的永远是完整 ID**：`formatModelIdList(card.entries)` 用的是
+`id` 字段。搞反的症状是「照着卡片复制了一个短名字进客户端 ⇒ 必然 404」。
+卡片头已写明供应商，行内再重复前缀只会把整行挤成省略号。
+
+⚠️ 已做**反向验证**（8 个变异，全部变红）：分组退化成「一个模型一张卡」（= 用户报障原形态）、
+行内改回完整 id、折叠忽略用户点击、搜索时不强制展开、宿主不回传权威拆分、
+对照表分组建在全量行上、复制本组改复制短名字、未知供应商标题给空串。
+
+⚠️ 供应商 key 拿不到时归入 `''` 那张卡（标题「（未标注供应商）」），**不丢行** ——
+少一个 ID 会让用户照着一份不完整的清单去配客户端。也**不去重**：同一 id 出现两次是上游的事，
+去重会掩盖上游缺陷。
+
 ⚠️ **对照表的搜索比模型清单多匹配「档位名」**（`matchesEffortQuery` 复用
 `matchesModelQuery` 之后**再补**真实档位名与该填的规范名）：最常用的查法就是
 「哪个渠道有 `xhigh`」「界面上的 Max 到底是哪个 id」—— 后者正是用户踩过的坑。

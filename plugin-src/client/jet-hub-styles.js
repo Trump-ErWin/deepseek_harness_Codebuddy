@@ -288,6 +288,37 @@ const STYLES = `
 /* 搜索结果为空时的提示（与其它空状态同款观感）。 */
 .dim-jh-effortEmpty { padding: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
+/* ── 网关清单：**一个供应商一张卡片**（模型清单与档位对照表共用）──
+   用户 2026-10-03 报障：此前按「一个模型一行」平铺，同一家的
+   deepseek-account/deepseek-flash 与 deepseek-account/deepseek-v4-pro
+   看起来毫无关系；用户真正要对照的是「哪家有哪些模型」，故改成分组卡片。
+   分组判据在 openai-gateway-panel.js 的 groupGatewayEntries（纯函数，可单测）。
+   ⚠️ 本文件整体是 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。 */
+.dim-jh-gatewayCards { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+/* 卡片：细边框 + 圆角，与复用的分组头（.dim-jh-modelGroup）同一种规格语言。
+   ⚠️ min-width: 0 是**必需**的：卡片是 grid 项，默认 min-width: auto 会被
+   内部长 id 撑开，从而把整个弹窗顶出横向滚动条（模型列表踩过同一个坑）。 */
+.dim-jh-gatewayCard { min-width: 0; border: .5px solid var(--dsw-alias-border-l3, #e5e5e5); border-radius: 10px; overflow: hidden; }
+/* 卡片头：吸顶。清单很长时滚到底部仍要能看出「我在哪一家」。
+   背景用不透明层色，否则卡内行会从下面透出来。 */
+.dim-jh-gatewayCardHead { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 8px; min-width: 0; padding: 6px 8px; background: var(--dsw-alias-bg-layer-2, #f7f8fa); border-bottom: .5px solid var(--dsw-alias-border-l3, #e5e5e5); }
+/* 卡片标题（可点，折叠开关）：占满剩余宽度，长供应商名可截断。 */
+.dim-jh-gatewayCardToggle { flex: 1 1 auto; min-width: 0; padding: 2px 0; border: 0; background: transparent; color: var(--dsw-alias-label-primary, #1f2329); font-size: 12.5px; line-height: 18px; font-weight: 600; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.dim-jh-gatewayCardToggle:hover { color: var(--dsw-alias-brand-primary, #1677ff); }
+.dim-jh-gatewayCardCount { flex: none; font-size: 11px; line-height: 17px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); }
+.dim-jh-gatewayCardHead .dim-jh-gatewayCardBtn { flex: none; padding: 2px 8px; font-size: 11px; }
+.dim-jh-gatewayCardBody { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; padding: 3px 4px 5px; }
+/* 一行模型（**只读**，无开关）：短名字 + 展示名 + 能力标记。
+   ⚠️ 行内显示的是去掉供应商前缀的名字（见 gatewayModelKeyOf）—— 卡片头已经
+   写清了是哪一家，再重复一遍前缀只会把整行挤到只剩省略号。
+   ⚠️ 这里刻意**不用** .dim-jh-modelRow：那个类带 cursor: pointer 与 hover 底色，
+   是给「整行可点切换开关」的 label 用的，用在这里会被读成可点。 */
+.dim-jh-gatewayModelRow { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 5px 6px; border-radius: 6px; }
+.dim-jh-gatewayModelRow:hover { background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
+/* 短名字的宽度上限比模型列表里宽（46% → 52%）：这里没有开关要留位置，
+   而模型名本身就是用户要辨认的东西，读不全就失去意义。 */
+.dim-jh-gatewayModelRow .dim-jh-modelId { max-width: 52%; }
+
 /* ── 模型列表的「计费/来源」分组（订阅 / 免费 / Cline Cloud / 按量计费）──
    分组由 model-groups.js 的纯函数决定（判据见其模块注释）；这里只管观感。
    ⚠️ 组头是**独立的 div**，绝不能包进 .dim-jh-modelRow 的 <label> 里 ——

@@ -64,6 +64,40 @@ describe('collectGatewayModels（目录采集的容错口径）', () => {
     expect((await collectGatewayModelIds(source))[0].id).toBe('cline/anthropic/claude-sonnet-5.5')
   })
 
+  /**
+   * ⚠️ 设置页按「一家供应商一张卡片」分组，靠的就是这两个字段。
+   *
+   * 前端**不能**自己按首个 `/` 反推：模型名里允许带斜杠（上一条），
+   * 反推出来的 `provider` 会变成 `cline` 而名字是 `anthropic/claude-sonnet-5.5` ——
+   * 在斜杠模型上恰好也对，但那是巧合；真正的契约是采集侧给的拆分。
+   * 这里锁的是「字段就是采集时的 provider/模型名，一个字符都没加工」。
+   */
+  it('★ 回传权威的 provider / model 拆分（前端据此分组，不靠切 id 反推）', async () => {
+    const source = {
+      listProviders: () => [{ id: 'cline' }],
+      listModels: async () => [{ id: 'anthropic/claude-sonnet-5.5', name: 'Claude' }],
+    }
+    const [entry] = await collectGatewayModelIds(source)
+    expect(entry.provider).toBe('cline')
+    // ⚠️ `model` 是**带斜杠的完整模型名**（`anthropic/...`），不是 `claude-sonnet-5.5`：
+    // 它就是 `listModels` 给的那个 id，网关路由也按它拼回完整 ID。
+    expect(entry.model).toBe('anthropic/claude-sonnet-5.5')
+    expect(`${entry.provider}/${entry.model}`).toBe(entry.id)
+  })
+
+  it('★ provider 与 model 拼回去必须逐字等于 id（分组与路由不会错位）', async () => {
+    // 覆盖三种形态：普通、模型名带斜杠、provider 名里带连字符。
+    const source = {
+      listProviders: () => [{ id: 'deepseek-account' }, { id: 'cline' }],
+      listModels: async (provider: string) => (provider === 'cline'
+        ? [{ id: 'anthropic/claude-sonnet-5.5', name: 'C' }]
+        : [{ id: 'deepseek-flash', name: 'D' }, { id: 'deepseek-v4-pro', name: 'P' }]),
+    }
+    for (const entry of await collectGatewayModelIds(source)) {
+      expect(`${entry.provider}/${entry.model}`, entry.id).toBe(entry.id)
+    }
+  })
+
   // 以下三条是**实机报障**后复现出来的畸形输入（真实 DSH service 的形态与类型
   // 声明可能不一致）。它们曾让目录采集直接抛错，进而把设置页**整个状态读取**
   // 一起拖垮 —— 用户连开关、地址、密钥都看不到。
