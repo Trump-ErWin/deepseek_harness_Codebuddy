@@ -7385,16 +7385,62 @@ GET  /v1/models             ← 两套协议共用同一份目录
    精确码放 `error.dsh_code`、本该返回的 HTTP 状态放 `error.status`（Chat 端点的 SSE 错误
    帧里也有同名字段，口径一致）。
 
+### ⚠️⚠️ Codex 的 `namespace` / `custom` / `tool_search` 工具**不能报错**（真实报障，2026-10-03）
+
+**用户报障**：Codex App 接本网关后整轮对话直接失败，界面上只有一句
+`tool type namespace is not supported（网关只提供 function 工具）`
+（`toChatTools` 的第一版实现）。
+
+**根因**：Codex 0.142+ 用它私有的 Responses 扩展声明工具 ——
+`{type:'namespace', name:'mcp__files__', tools:[{type:'function', name:'read', …}]}`
+外加 `{type:'custom'}`（自由文法工具，如 `apply_patch`）与 `{type:'tool_search'}`。
+这一批形状在第三方网关上普遍翻车（ollama / llama.cpp / xAI 都有对应 issue）。
+而 **namespace 只是分组容器** —— 里面的 function 完全可以表达给模型。
+
+**修法与理由**（`responses.ts` 的「工具」一节有完整注释）：
+
+| 形状 | 处理 |
+|---|---|
+| `function`（顶层） | 原样转 `ToolSchema` |
+| `namespace` 里的 `function` 子工具 | **摊平成 `<namespace>__<child>`**（含 `defer_loading` 的） |
+| `custom` / `tool_search` / `web_search` / `mcp` … | **丢弃 + `onDrop` 上报**（server 侧记 warning） |
+
+⚠️ **判据是「代价与收益是否对等」**：报错的收益只是「让用户知道某个工具没被转发」，
+代价却是**整个会话不可用**。故「无法表达的工具」一律降级为丢弃 + 记日志，
+**绝不 400**。（这与本仓库「不静默丢弃用户显式设置」并不冲突：那条针对的是
+**语义会变**的标量字段 —— `previous_response_id` / `text.format` / 非 1 的 `top_p`，
+它们一旦被忽略，用户以为生效了的设置会给出**错的结果**。）
+
+⚠️ **必须「摊平 + 还原」成对做，且两侧算法同源**：
+- 摊平名只有一份实现 `flatNamespaceToolName()` = `<namespace>__<child>`，
+  超 64 字符截断 + 8 位 sha256 后缀（纯截断会让长名字碰撞）。
+  命名法与 Codex 自己（PR #29602）及 cc-switch / sub2api 一致。
+- **响应侧必须还原**成 `{name: <child>, namespace: <ns>}`（`output_item.added` /
+  `function_call_arguments.done` / `output_item.done` / `response.completed` 四处都要）：
+  Codex 的工具表按 `(namespace, name)` 索引，只回扁平名它会认为
+  「模型调用了一个不存在的工具」。
+- **历史里的 `function_call` 也要换回扁平名**：否则上游看到「工具以 `ns__child`
+  声明、历史却调了 `child`」，等于调了一个没声明过的工具。
+- `tool_choice: {type:'namespace'}` **降级为 `auto`**（DSH 只认 auto/none；降级后
+  模型仍能从已摊平的工具里挑）。
+- ⚠️ 还原表**不靠跨函数状态传递**：`responsesNamespaceToolMap(request)` 从请求体
+  独立重算（cc-switch 同款思路），比让 server 把 map 一路穿进来更不容易漏。
+
+回归用例（`openai-gateway-responses.spec.ts` 6 条 + server spec 1 条）：namespace 摊平、
+`custom`/`tool_search` 丢弃且上报、`tool_choice` 降级、扁平名确定性（含 80 字符长名
+不碰撞）、历史 `function_call` 换名、非流式与流式两处还原、HTTP 层回 200。
+
 ### 明确**报 400** 的字段（不静默忽略）
 
 `previous_response_id`（网关无状态、不存响应，`GET /v1/responses/{id}` 一律 404）、
 `background`、`text.format`（DSH 没有结构化输出通道，**不假装**按 schema 约束）、
-非 1 的 `top_p`（`GenerateOptions` 没有 topP）、`item_reference`、非 `function` 工具、
+非 1 的 `top_p`（`GenerateOptions` 没有 topP）、`item_reference`、
 `input_image.file_id`。
 **接受但忽略**：`store` / `include` / `prompt_cache_key` / `metadata` / `user` /
 `truncation` / `service_tier` / `safety_identifier` / `parallel_tool_calls`。
 ⚠️ 判据是「**语义会不会变**」：会变的必须报错（否则用户以为设置生效了），
 不会变的（无状态转发下本就无处安放）接受即可。
+⚠️ **工具类型不属于这一类**（见上一节）：它要按「代价与收益」判，丢弃 + 记日志。
 
 ### 其它必须记住的点
 

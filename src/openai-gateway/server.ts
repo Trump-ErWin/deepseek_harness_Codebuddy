@@ -296,6 +296,15 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       const generate = await toResponsesGenerateOptions(body, signal, reasoningEffort, maxTokens, {
         bridge: options.attachments,
         limits: options.imageLimits,
+      }, (dropped) => {
+        // ⚠️ 丢弃是**有意**的降级（拒绝会让 Codex 这类客户端的整轮对话直接失败，
+        // 见 responses.ts 文件头「工具」一节），但绝不能连日志都没有 ——
+        // 否则「模型看不到某个工具」这件事在事后无从解释。
+        logger.warn(
+          `[openai-gateway] /v1/responses：工具类型 ${dropped.type}`
+          + `${dropped.name === undefined ? '' : `（${dropped.name}）`}`
+          + ' 无法用 DSH 的 ToolSchema 表达，已从本次请求丢弃',
+        )
       })
       const stream = options.llm.stream(generate)
       const fullId = `${route.provider}/${route.model}`

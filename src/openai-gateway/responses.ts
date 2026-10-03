@@ -41,9 +41,24 @@
  * 本仓库是被明令禁止的（见 `messages.ts` 的 `normalizeReasoningEffort` 同款
  * 教训）。故 `previous_response_id` / `background` / `text.format`（结构化输出）/
  * `top_p`（非 1 时）一律**明确报 400**。
+ *
+ * ## 工具：能表达的就摊平，表达不了的就丢弃并记日志（**不是报错**）
+ *
+ * Codex 0.142+ 用私有的 Responses 扩展声明工具：`{type:'namespace', …}` 分组
+ * 容器、`{type:'custom'}` 自由文法工具、`{type:'tool_search'}` 延迟加载检索。
+ * 这批形状在第三方网关上普遍翻车（ollama / llama.cpp / xAI 都有对应 issue），
+ * 也正是本文件第一版**报错**的地方 —— 用户看到的是一句
+ * `tool type namespace is not supported`，代价却是**整轮对话不可用**。
+ *
+ * 现在的口径（与 sub2api / cc-switch 的成熟做法一致）：
+ * - `namespace` 里的 **function 子工具摊平**成 `<namespace>__<child>`
+ *   （见 {@link flatNamespaceToolName}），响应侧再把 `function_call` 还原成
+ *   `{name, namespace}`（见 {@link responsesNamespaceToolMap}）；
+ * - `custom` / `tool_search` / `web_search` 等**无法**用 DSH 的 `ToolSchema`
+ *   表达的类型：丢弃 + warning（调用方通过 `onDrop` 接），**绝不让请求失败**。
  */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, FinishReason, GenerateOptions, Message, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { DEFAULT_IMAGE_LIMITS, type AttachmentBridge, type ImageLimits } from './images.js'
@@ -169,36 +184,135 @@ function chatPartsFromResponses(content: unknown): unknown {
 }
 
 /**
+ * namespace 子工具的**扁平名**。
+ *
+ * Codex 0.142+ 用它私有的 Responses 扩展声明 MCP / 插件工具：
+ * `{type:'namespace', name:'mcp__files__', tools:[{type:'function', name:'read', …}]}`
+ * —— namespace 只是一个**分组容器**，真正能被模型调用的仍是里面的 function。
+ * 而 DSH 的工具表是**扁平**的（`ToolSchema = {name, description, parameters}`），
+ * 故必须把它摊平成 `<namespace>__<child>`。
+ *
+ * ⚠️ **必须确定性**：请求侧摊平（{@link toChatTools}）与响应侧还原
+ * （{@link responsesNamespaceToolMap}）各自独立算这个名字，两边算法不一致就会
+ * 「上游按 A 名字调用、网关却按 B 名字还原」，客户端配不上任何工具。故只有这一份实现。
+ * ⚠️ 命名法 `namespace__child` 与 Codex 自己（PR #29602「Flatten namespace tools
+ * for providers without wrappers」）以及各家代理（sub2api、cc-switch）一致。
+ * ⚠️ 超过 64 字符时截断 + 8 位 sha256 后缀：OpenAI 兼容端点的 function name
+ * 上限普遍是 64，纯截断会让长名字之间互相碰撞（碰撞的两条用例在 cc-switch 里
+ * 是直接报错的，这里靠后缀避免）。
+ */
+export function flatNamespaceToolName(namespace: string, name: string): string {
+  const flat = `${namespace}__${name}`
+  if (flat.length <= 64) return flat
+  const digest = createHash('sha256').update(flat).digest('hex').slice(0, 8)
+  return `${flat.slice(0, 55)}_${digest}`
+}
+
+/**
+ * 从请求体算出「扁平名 → `{namespace, name}`」的还原表。
+ *
+ * ⚠️ 与摊平**同源**（都走 {@link flatNamespaceToolName}），且**不靠跨函数状态**
+ * 传递：响应侧要还原 `function_call` 的名字，而它拿到的只有请求体，重算一遍
+ * 比让 server 把 map 一路穿进来更不容易漏（cc-switch 的成熟实现也是这个思路）。
+ */
+export function responsesNamespaceToolMap(
+  body: OpenAiResponsesRequest,
+): Map<string, { namespace: string; name: string }> {
+  const map = new Map<string, { namespace: string; name: string }>()
+  if (!Array.isArray(body.tools)) return map
+  for (const tool of body.tools) {
+    if (!isObject(tool) || tool.type !== 'namespace') continue
+    const namespace = nonEmptyString(tool.name)?.trim()
+    if (namespace === undefined || namespace.length === 0) continue
+    const children = Array.isArray(tool.tools) ? tool.tools : []
+    for (const child of children) {
+      if (!isObject(child) || child.type !== 'function') continue
+      const name = nonEmptyString(child.name)?.trim()
+      if (name === undefined || name.length === 0) continue
+      const flat = flatNamespaceToolName(namespace, name)
+      if (!map.has(flat)) map.set(flat, { namespace, name })
+    }
+  }
+  return map
+}
+
+/** 摊平后仍无法表达、因而被丢弃的工具（供调用方记日志）。 */
+export interface DroppedTool {
+  type: string
+  name?: string
+}
+
+/**
  * Responses 的工具定义 → Chat 形状。
  *
- * Responses 的工具是**扁平**的（`{type:'function', name, description, parameters}`），
- * Chat 的是**嵌套**的（`{type:'function', function:{…}}`）。同时容忍嵌套形态：
- * 有些客户端会把 Chat 的 tools 原样发过来，为此报 400 毫无收益。
+ * - **`function`**：扁平（Responses 原生）与嵌套（Chat 形状）两种写法都认
+ *   （有些客户端会把 Chat 的 tools 原样发过来，为此报 400 毫无收益）。
+ * - **`namespace`**：把里面的 function 子工具**摊平**成顶层 function
+ *   （见 {@link flatNamespaceToolName}）。⚠️ 包括标了 `defer_loading: true` 的
+ *   子工具 —— 那套「延迟加载 + 用 `tool_search` 搜出来」的机制我们表达不了，
+ *   直接给模型反而不会丢工具（cc-switch / sub2api 同样如此处理）。
+ * - **其余类型**（`custom` / `tool_search` / `web_search` / `file_search` /
+ *   `computer_use` / `mcp` …）：**丢弃并通过 `onDrop` 报告**，
+ *   但**绝不让整轮请求失败**。
  *
- * 非 function 类工具（`web_search` / `file_search` / `computer_use` / `mcp` …）
- * 一律明确报错：网关没有这些执行体，静默丢弃会让模型永远等不到那个工具的结果。
+ * ## 为什么这里从「一律报错」改成「丢弃 + 上报」（真实报障，2026-10-03）
+ *
+ * Codex App 接网关后整轮对话直接失败：
+ * `tool type namespace is not supported（网关只提供 function 工具）`。
+ * 用户看到的是「连不上」，而根因只是**一个工具类型不认识** —— 报错的代价是
+ * 整个会话不可用，收益却只是「让用户知道某个工具没被转发」。两者不对等。
+ * 而 `custom`（自由文法工具，如 Codex 的 `apply_patch`）与 `tool_search`
+ * 确实**无法**用 `ToolSchema` 表达，丢弃后 Codex 仍有 `shell` 等 function 工具
+ * 可用；把这些也变成致命错误，等于让「Codex 能不能用网关」取决于它这一版
+ * 恰好带了哪些运行时工具。
  */
-function toChatTools(raw: unknown): unknown {
+function toChatTools(raw: unknown, onDrop?: (tool: DroppedTool) => void): unknown {
   if (raw === undefined || raw === null) return undefined
   if (!Array.isArray(raw)) throw new OpenAiGatewayError('tools must be an array')
-  return raw.map((value) => {
-    if (!isObject(value)) throw new OpenAiGatewayError('tool must be an object')
-    if (value.type !== 'function') {
-      throw unsupported(`tool type ${String(value.type)} is not supported（网关只提供 function 工具）`)
-    }
+  const converted: unknown[] = []
+  const push = (value: Record<string, unknown>): void => {
     const flat = isObject(value.function) ? value.function : value
     if (typeof flat.name !== 'string' || flat.name.length === 0) {
       throw new OpenAiGatewayError('function tool requires a non-empty name')
     }
-    return {
+    converted.push({
       type: 'function',
       function: {
         name: flat.name,
         description: flat.description,
         parameters: flat.parameters,
       },
+    })
+  }
+  for (const value of raw) {
+    if (!isObject(value)) throw new OpenAiGatewayError('tool must be an object')
+    if (value.type === 'namespace') {
+      const namespace = nonEmptyString(value.name)?.trim()
+      if (namespace === undefined || namespace.length === 0) {
+        throw new OpenAiGatewayError('namespace tool requires a non-empty name')
+      }
+      const children = value.tools
+      if (!Array.isArray(children)) {
+        throw new OpenAiGatewayError('namespace tool requires a tools array')
+      }
+      for (const child of children) {
+        if (!isObject(child)) throw new OpenAiGatewayError('namespace child tool must be an object')
+        if (child.type !== 'function') {
+          // namespace 里的非 function 子工具（如 `custom`）同样表达不了。
+          onDrop?.({ type: String(child.type), name: nonEmptyString(child.name) })
+          continue
+        }
+        push({ ...child, name: flatNamespaceToolName(namespace, String(child.name ?? '')) })
+      }
+      continue
     }
-  })
+    if (value.type !== 'function') {
+      onDrop?.({ type: String(value.type), name: nonEmptyString(value.name) })
+      continue
+    }
+    push(value)
+  }
+  return converted
 }
 
 /** `function_call_output.output` 可能是字符串，也可能是内容块数组。 */
@@ -281,7 +395,15 @@ async function toMessages(
       // `call_id` 才是与 `function_call_output` 配对的那个 id；`id`（fc_…）
       // 只是 item 身份。两者都可能出现，优先 `call_id`，缺了才退回 `id`。
       const callId = nonEmptyString(raw.call_id) ?? nonEmptyString(raw.id)
-      const name = nonEmptyString(raw.name)
+      const bare = nonEmptyString(raw.name)
+      // 带 `namespace` 的历史调用要换回**摊平名**：工具是以 `ns__child` 声明给
+      // 上游的，历史里若还留着 `namespace: ns / name: child`，上游会认为模型
+      // 调用了一个它从没见过的工具（与 Qoder 那条「工具历史必须与 tools 同形」
+      // 的教训同型）。
+      const namespace = nonEmptyString(raw.namespace)
+      const name = bare !== undefined && namespace !== undefined
+        ? flatNamespaceToolName(namespace, bare)
+        : bare
       if (callId === undefined || name === undefined || typeof raw.arguments !== 'string') {
         throw new OpenAiGatewayError('function_call requires call_id, name and string arguments')
       }
@@ -352,6 +474,8 @@ function assertSupported(body: OpenAiResponsesRequest): void {
  * @param reasoningEffortOverride 网关归一化后的档位（三态，见
  *   `messages.ts` 的 `normalizeReasoningEffort`）。
  * @param maxTokensOverride 已归一化的输出预算（`normalizeMaxTokens` 的结果）。
+ * @param onDrop 无法表达、已被丢弃的工具类型（调用方据此记一条 warning ——
+ *   丢弃是**有意**的降级，不能连日志都没有）。
  */
 export async function toResponsesGenerateOptions(
   body: OpenAiResponsesRequest,
@@ -359,17 +483,24 @@ export async function toResponsesGenerateOptions(
   reasoningEffortOverride?: string | null,
   maxTokensOverride?: number,
   images: { bridge?: AttachmentBridge; limits?: ImageLimits } = {},
+  onDrop?: (tool: DroppedTool) => void,
 ): Promise<GenerateOptions> {
   assertSupported(body)
   const { provider, model } = parseModelRoute(body.model)
   const limits = images.limits ?? DEFAULT_IMAGE_LIMITS
 
   // 工具选择：与 Chat 路径同一口径 —— DSH 只能表达 auto / none。
-  const toolChoice = body.tool_choice
+  // ⚠️ `{type:'namespace', name}`（「只在这个 namespace 里选」）按 cc-switch /
+  // sub2api 的成熟做法**降级成 auto**，而不是回 400：降级后模型仍能从已摊平的
+  // 工具里挑，语义损失可接受；回 400 则会让 Codex 的整轮对话直接失败。
+  const requestedChoice = body.tool_choice
+  const toolChoice = isObject(requestedChoice) && requestedChoice.type === 'namespace'
+    ? 'auto'
+    : requestedChoice
   if (toolChoice !== undefined && toolChoice !== 'auto' && toolChoice !== 'none') {
     throw new OpenAiGatewayError('only tool_choice auto and none are supported')
   }
-  const tools = convertTools(toChatTools(body.tools))
+  const tools = convertTools(toChatTools(body.tools, onDrop))
   if (toolChoice === 'none' && tools !== undefined && tools.length > 0) {
     throw unsupported('tool_choice none with tools cannot be represented by DSH')
   }
@@ -534,7 +665,27 @@ function usageJson(usage: TokenUsage): Record<string, unknown> {
   }
 }
 
-function outputItemJson(item: ResponsesItemState): Record<string, unknown> {
+/**
+ * 把上游返回的**扁平名**还原成客户端认的 `{name, namespace}`。
+ *
+ * ⚠️ **必须还原**：Codex 的工具注册表是按 `(namespace, name)` 索引的（cc-switch 与
+ * sub2api 都把这一步做在响应侧），只回 `mcp__files____read` 这种扁平名它配不上
+ * 任何工具 —— 表现为「模型调了工具但客户端说没有这个工具」。没在还原表里
+ * （普通顶层工具）就原样返回。
+ */
+function restoreToolName(
+  item: ResponsesItemState,
+  nsMap: Map<string, { namespace: string; name: string }> | undefined,
+): { name: string; namespace?: string } {
+  const name = item.name ?? ''
+  const entry = nsMap?.get(name)
+  return entry === undefined ? { name } : { name: entry.name, namespace: entry.namespace }
+}
+
+function outputItemJson(
+  item: ResponsesItemState,
+  nsMap?: Map<string, { namespace: string; name: string }>,
+): Record<string, unknown> {
   if (item.kind === 'reasoning') {
     const text = finalText(item)
     return {
@@ -544,12 +695,14 @@ function outputItemJson(item: ResponsesItemState): Record<string, unknown> {
     }
   }
   if (item.kind === 'function_call') {
+    const restored = restoreToolName(item, nsMap)
     return {
       id: item.id,
       type: 'function_call',
       status: 'completed',
       call_id: item.callId ?? '',
-      name: item.name ?? '',
+      name: restored.name,
+      ...restored.namespace === undefined ? {} : { namespace: restored.namespace },
       arguments: finalArguments(item),
     }
   }
@@ -620,8 +773,11 @@ function statusOf(state: Accumulated): 'completed' | 'incomplete' {
   return state.finishReason === 'length' ? 'incomplete' : 'completed'
 }
 
-function outputOf(items: readonly ResponsesItemState[]): Record<string, unknown>[] {
-  const output = items.filter(hasContent).map(outputItemJson)
+function outputOf(
+  items: readonly ResponsesItemState[],
+  nsMap?: Map<string, { namespace: string; name: string }>,
+): Record<string, unknown>[] {
+  const output = items.filter(hasContent).map(item => outputItemJson(item, nsMap))
   // 空回复：保留一个空 message 项 —— 客户端不认空的 `output[]`。
   if (output.length === 0) output.push(outputItemJson(newItem(-1, 0, 'message')))
   return output
@@ -680,6 +836,8 @@ export async function collectResponsesResult(
   const state: Accumulated = {}
   const items: ResponsesItemState[] = []
   const open = new Map<number, ResponsesItemState>()
+  // 摊平名 → `{namespace, name}`：响应侧要把 `function_call` 还原成客户端认的形态。
+  const nsMap = responsesNamespaceToolMap(request)
   let outputIndex = 0
   try {
     for await (const chunk of chunks) {
@@ -729,7 +887,7 @@ export async function collectResponsesResult(
     model,
     request,
     status: statusOf(state),
-    output: outputOf(items),
+    output: outputOf(items, nsMap),
     usage: state.usage === undefined ? null : usageJson(state.usage),
   })
 }
@@ -757,11 +915,14 @@ export async function* toResponsesSse(
   const open = new Map<number, ResponsesItemState>()
   let outputIndex = 0
   let sequence = 0
+  // 摊平名 → `{namespace, name}`：`function_call` 事件必须还原成客户端认的形态
+  // （Codex 的工具表按 `(namespace, name)` 索引，只给扁平名它配不上任何工具）。
+  const nsMap = responsesNamespaceToolMap(request)
 
   const emit = (type: string, payload: Record<string, unknown>): string =>
     `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: sequence++, ...payload })}\n\n`
   const snapshot = (status: ResponsesStatus, usage: Record<string, unknown> | null, error?: Record<string, unknown> | null): Record<string, unknown> =>
-    responseJson({ id: responseId, model, request, status, output: status === 'in_progress' ? [] : outputOf(items), usage, error })
+    responseJson({ id: responseId, model, request, status, output: status === 'in_progress' ? [] : outputOf(items, nsMap), usage, error })
   const emitStatus = (status: ResponsesStatus, usage: Record<string, unknown> | null, error?: Record<string, unknown> | null): string =>
     emit(`response.${status}`, { response: snapshot(status, usage, error) })
 
@@ -799,6 +960,7 @@ export async function* toResponsesSse(
         }),
       ]
     }
+    const restored = restoreToolName(item, nsMap)
     return [emit('response.output_item.added', {
       output_index: item.outputIndex,
       item: {
@@ -806,7 +968,8 @@ export async function* toResponsesSse(
         type: 'function_call',
         status: 'in_progress',
         call_id: item.callId ?? '',
-        name: item.name ?? '',
+        name: restored.name,
+        ...restored.namespace === undefined ? {} : { namespace: restored.namespace },
         arguments: '',
       },
     })]
@@ -842,17 +1005,19 @@ export async function* toResponsesSse(
         }),
       )
     } else {
+      const restored = restoreToolName(item, nsMap)
       events.push(emit('response.function_call_arguments.done', {
         item_id: item.id,
         output_index: item.outputIndex,
-        name: item.name ?? '',
+        name: restored.name,
+        ...restored.namespace === undefined ? {} : { namespace: restored.namespace },
         arguments: finalArguments(item),
       }))
     }
     // `added` 与 `done` 必须成对：客户端按 added 建行、按 done 定稿，
     // 只发 added 会留下一个永远「进行中」的空项。空内容的项由 `outputOf`
     // 挡在 `response.completed` 之外，不必在这里另做一套判据。
-    events.push(emit('response.output_item.done', { output_index: item.outputIndex, item: outputItemJson(item) }))
+    events.push(emit('response.output_item.done', { output_index: item.outputIndex, item: outputItemJson(item, nsMap) }))
     items.push(item)
     return events
   }
