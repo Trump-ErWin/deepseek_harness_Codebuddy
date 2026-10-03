@@ -72,7 +72,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { basename, isAbsolute, join } from 'node:path'
 
 /** 阿里云 captcha 配置（服务端下发；此处为实测兜底值）。 */
 export interface ZcodeCaptchaConfig {
@@ -265,6 +265,22 @@ export function findBrowserExecutable(): string | undefined {
     }
   }
   return undefined
+}
+
+/**
+ * 该可执行文件是否是**系统 Edge**（候选链的第 ⑤ 档）。
+ *
+ * ## 为什么单独抽成纯函数
+ * 「实际用了哪个浏览器」需要被**告警**（issue IKJLB1 的期望行为 2：
+ * 用户不知道系统在拿 Edge 兜底）。告警条件必须可测，故不留在 `launch()` 里。
+ *
+ * ⚠️ 判据是**文件名** `msedge.exe`（不区分大小写），而不是路径里搜 `Edge`：
+ * 前者对 `…\Microsoft\Edge\Application\msedge.exe`、scoop 布局、以及
+ * 用户经 `ZCODE_CHROME_PATH` 指向的 Edge 副本都成立；后者会把路径中
+ * 恰好含 "Edge" 字样的第三方 chromium 误报成系统 Edge。
+ */
+export function isEdgeExecutable(executable: string): boolean {
+  return basename(executable).toLowerCase() === 'msedge.exe'
 }
 
 /** 极简 CDP 客户端（用 Node 内置 WebSocket，**零第三方依赖**）。 */
@@ -617,6 +633,17 @@ export interface ZcodeCaptchaBrowserOptions {
    * **两个都不来**，于是永久挂起（且因为不抛错，`pageBusy` 也不会复位）。
    */
   connectTimeoutMs?: number
+  /**
+   * 诊断输出（可选，缺省静默）。
+   *
+   * ⚠ 只用于**说明性**信息，目前只有一条：实际落到系统 Edge 兜底时告警
+   * （Gitee issue IKJLB1 的期望行为 2 —— 此前 Edge 是被静默选中的，
+   * 用户既不知道用了哪个浏览器，也不知道该去哪换）。
+   *
+   * ⚠ 形参与 `src/captcha-carrier.ts` 的 `CaptchaCarrierDeps.log` 一致，
+   * 由 `zcode-auth.ts` 传 `ctx.logger` 进来；**不给也不影响功能**。
+   */
+  log?: (message: string) => void
 }
 
 /**
@@ -995,8 +1022,20 @@ export class ZcodeCaptchaBrowser {
    * 故用该标志把取页串行化（并发调用排队，而不是拿到同一个页面）。
    */
   private pageBusy = false
+  /** 诊断输出（见 {@link ZcodeCaptchaBrowserOptions.log}），缺省 undefined = 静默。 */
+  private readonly log: ((message: string) => void) | undefined
+  /**
+   * 浏览器**起不来 / 自己没了**的可读原因（由 `launch()` 里的
+   * `'error'` / `'exit'` 监听写入，见该处注释）。
+   *
+   * `undefined` = 一切正常。轮询循环每轮检查它，命中即立刻失败 ——
+   * 否则「浏览器秒退」要白等满 `readyTimeoutMs`（默认 30 秒）才报错。
+   */
+  private spawnFailure: Error | undefined
 
-  constructor(private readonly options: ZcodeCaptchaBrowserOptions = {}) {}
+  constructor(private readonly options: ZcodeCaptchaBrowserOptions = {}) {
+    this.log = options.log
+  }
 
   /** 浏览器是否已就绪。 */
   get ready(): boolean {
@@ -1026,6 +1065,32 @@ export class ZcodeCaptchaBrowser {
           '可用 ZCODE_CHROME_PATH 显式指定 chrome.exe 路径。',
       )
     }
+
+    /**
+     * ★ **Edge 兜底必须出声**（Gitee issue IKJLB1 的期望行为 2）。
+     *
+     * 候选链里 Edge 排最后（见 {@link findBrowserExecutable} 的 ⑤），于是
+     * **没装 Chrome/Chromium 的机器上它是唯一可选项** —— 而这是国内 Windows
+     * 的常见状态。原先它被**静默**选中：用户既不知道用的是哪个浏览器，
+     * 也不知道该去哪换，于是只能靠翻崩溃日志反推。
+     *
+     * ⚠️ 只在**确实落到 Edge** 时告警：装了 Chrome/Chromium 的用户不受打扰。
+     * ⚠️ 判断用文件名（`msedge.exe`）而不是 `includes('Edge')` ——
+     * 前者对路径里的 `Microsoft\Edge\` 与 scoop 布局都成立，且不会把
+     * `ZCODE_CHROME_PATH` 指向的第三方 chromium 误报成 Edge。
+     */
+    if (isEdgeExecutable(executable)) {
+      this.log?.(
+        '[jet-hub] zcode captcha 未检测到 Chrome/Chromium，改用系统 Edge（msedge.exe）产出 —— ' +
+        '若 Edge 异常导致 captcha 失败，可安装 Chrome/Chromium 或用 ZCODE_CHROME_PATH 指定其它浏览器。',
+      )
+    }
+
+    /**
+     * 每次 `launch()` 都是一次全新的尝试：上一次的失败原因必须清掉，
+     * 否则上一轮「浏览器起不来」会让后续**所有**轮次秒失败。
+     */
+    this.spawnFailure = undefined
 
     this.profileDir = mkdtempSync(join(tmpdir(), 'zcode-captcha-'))
     /**
@@ -1077,10 +1142,80 @@ export class ZcodeCaptchaBrowser {
       detached: process.platform !== 'win32',
     })
 
+    /**
+     * ★★ **必须监听 `error` 与 `exit`**（真实缺陷，2026-10-03，Gitee issue IKJLB1）
+     *
+     * ## 为什么这是**能杀掉整个宿主**的缺陷（不是「浏览器崩了」的泛泛之谈）
+     *
+     * `ChildProcess` 是 EventEmitter，而 **`'error'` 事件在没有监听器时会被
+     * `throw` 成未捕获异常**。实测（`spawn` 一个不存在的绝对路径、且不注册
+     * `error`）：
+     *
+     * ```
+     * Error: spawn …\msedge.exe ENOENT
+     *   throw er; // Unhandled 'error' event
+     * → 进程立刻退出，exit code = 1
+     * ```
+     *
+     * 插件是通过 `ctx.plugin()` 跑在 **dsh desktop host 进程内**的，而
+     * `cordis` 没有装 `uncaughtException` / `unhandledRejection` 处理器 ⇒
+     * 插件侧的未捕获异常会**直接终止 host**；Electron main 收到 `close`
+     * 回调（`app.asar/lib/main.js:3724` 打印 `dsh desktop host exited with …`）
+     * 便弹出宿主级错误框。
+     *
+     * ⚠️ **触发条件是「起不来」而非「崩溃」**：`exit` 事件有监听器时不会抛，
+     * 所以浏览器**运行中崩溃**只会被静默吞掉（实测：父进程存活、exit code 0）。
+     * 真正致命的是 spawn 阶段的 `ENOENT` / `EACCES` / `EPERM` —— 也就是
+     * 「候选链选中的那个 exe 存在但打不开」（权限、被占用、文件损坏、
+     * Edge 正在自我更新等）。
+     *
+     * ⚠️ 同仓库 `src/qoder-machine.ts` 的 `child.once('error', …)` 是现成范式
+     * —— 证明这里此前是**遗漏**而非有意。
+     */
+    const child = this.child
+    child.once('error', (error: Error) => {
+      /**
+       * ⚠️ 存起来**而不是就地抛**：此刻 `launch()` 还在下面的轮询循环里，
+       * 直接抛会变成「循环外的 promise rejection」，而 `start()` 仍会等满
+       * `readyTimeoutMs` 才返回。存下来让循环**下一轮立刻**失败（见下）。
+       */
+      this.spawnFailure = new Error(
+        `zcode: 浏览器无法启动（${executable}）：${error.message}` +
+        '。可安装 Chrome/Chromium，或用 ZCODE_CHROME_PATH 指定其它 chromium 内核浏览器。',
+      )
+    })
+    child.once('exit', (code, signal) => {
+      /**
+       * 判据是「`this.child` 还是不是它」——因为 `killProcessTree()` 会先把
+       * `this.child` 置空，故**主动停机**（`dispose()` / 轮询超时 / 端口错配）
+       * 走到这里时 `this.child !== child`，只有**浏览器自己没了**才等于。
+       * ⇒ 不需要额外的 `stopping` 标志，也不会把正常清理误报成崩溃。
+       */
+      if (this.child !== child) return
+      this.child = undefined
+      const how = signal !== null && signal !== undefined
+        ? `signal=${signal}`
+        : `code=${String(code)}`
+      this.spawnFailure ??= new Error(
+        `zcode: 浏览器进程异常退出（${executable}，${how}）` +
+        '。请重试，或用 ZCODE_CHROME_PATH 指定其它 chromium 内核浏览器。',
+      )
+    })
+
     const timeoutMs = this.options.readyTimeoutMs ?? 30_000
     const deadline = Date.now() + timeoutMs
     let debuggerUrl: string | undefined
     while (Date.now() < deadline) {
+      /**
+       * ⚠️ **每轮先看 `spawnFailure`**：浏览器起不来 / 秒退时立刻失败，
+       * 而不是白等满 `readyTimeoutMs`（默认 30 秒）才报一个含糊的「超时」。
+       * 旧实现的用户体感就是「签到卡住半分钟然后失败」—— 根因就在这里。
+       */
+      if (this.spawnFailure !== undefined) {
+        const failure = this.spawnFailure
+        this.kill()
+        throw failure
+      }
       try {
         const response = await fetch(`http://127.0.0.1:${this.port}/json/version`, {
           signal: AbortSignal.timeout(2_000),
@@ -1099,7 +1234,12 @@ export class ZcodeCaptchaBrowser {
     }
     if (debuggerUrl === undefined) {
       this.kill()
-      throw new Error(`zcode: 浏览器调试端口未就绪（${timeoutMs}ms 超时）`)
+      /**
+       * ⚠️ 走到这里若 `spawnFailure` 已就位，优先抛它 ——
+       * 「浏览器起不来」比「端口没就绪」更贴近根因，用户才知道该换浏览器。
+       */
+      throw this.spawnFailure
+        ?? new Error(`zcode: 浏览器调试端口未就绪（${timeoutMs}ms 超时）`)
     }
     /**
      * ★ **确认应答的确实是我们启动的那个浏览器**（防「连到旧实例」）。
