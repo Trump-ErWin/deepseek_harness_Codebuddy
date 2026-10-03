@@ -300,7 +300,7 @@ export function gatewayModelsHint(models, source) {
   const providers = new Set(models.map(model => gatewayProviderOf(model))).size;
   const base = `共 ${models.length} 个可用模型，来自 ${providers} 个供应商（下面按供应商分组）。`
     + '有些客户端（如 ZCode）不会自动扫描模型目录，需要从这里把模型 ID 复制到它的配置里。'
-    + '卡片里显示的是模型名，复制出去的始终是**完整的「供应商/模型名」**；'
+    + '卡片里显示的是模型名，复制出去的始终是「供应商/模型名」完整 ID；'
     + 'ID 区分大小写，且必须带供应商前缀 —— 同名模型在不同供应商下也是不同模型'
     + '（例如 codearts 与 buddy 各有一份 deepseek-v4.1-flash）。';
   return source === 'adapters'
