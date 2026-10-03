@@ -48,17 +48,30 @@ describe('用量徽标：槽位接线', () => {
     const styles = read('plugin-src/client/jet-hub-styles.js')
     const btn = /\.dim-jh-badgeBtn \{[^}]*max-width:\s*(\d+)px/.exec(styles)
     expect(btn, '应能解析出徽标按钮的 max-width').not.toBeNull()
-    // ⚠️ 上限从语义定：胶囊要装得下「最长渠道名 + 读数」而不出省略号。
-    // 实测最长两例 —— WorkBuddy (国际版) • 200积分 = 179.3px、
-    // LobsterAI (有道) • 842.06积分 = 172.3px（Edge，宿主 UI 字体栈，dsf 1 与 1.5
-    // 都量过，差异 <0.4px）。186px 给最宽那例留 6.7px 余量 —— 字体回退时字宽会变，
-    // 贴着 180 写没有裕度。
-    // 2026-10-03 从 150px 提上来（原报障：数字被省略号截掉）。上限放到 200px
-    // 是为了给「更长渠道名」留空间，同时仍远低于会挤坏模型选择器的 280px（旧缺陷）。
-    expect(Number(btn![1]), '徽标基础宽度应能装下最长的「渠道名 • 读数」，且 ≤200px')
-      .toBeGreaterThanOrEqual(180)
-    expect(Number(btn![1]), '徽标基础宽度不得超过 200px（否则又回到挤压模型选择器的老路）')
-      .toBeLessThanOrEqual(200)
+    // ⚠️ 两个维度都要满足，缺一不可：
+    // ① **内容自适应**：.dim-jh-badgeBtn 不设 width，由文字撑开
+    //    （短内容就短：Cline • 5积分 仅 93px）；
+    // ② **上限兜底**：max-width 必须 ≥ 实测最宽需求，且 ≤ 会挤坏模型选择器的值。
+    //
+    // 实测（Edge，宿主 UI 字体栈，dsf 1 与 1.5 都量过，差异 <0.4px）：
+    // 13 个渠道展示名 × 10 种现实读数（含 123456.78积分 / 9499.84积分 /
+    // 94.54MToken / 0积分）共 130 组，最宽需求 **209.34px**
+    //（WorkBuddy (国际版) • 123456.78积分）。
+    //
+    // ⚠️ 下界取 210（刚够最宽需求），上界取 240 —— 实测把上限放到「无上限」时，
+    // 极窄 composer（220px）下胶囊会**溢出容器 8.3px**，那正是 2026-10-02
+    //「模型选择器图标被挤没」的形态。故既有上限、又不能太小。
+    expect(Number(btn![1]), '徽标上限应能装下最长的「渠道名 • 读数」（实测需求 209.34px）')
+      .toBeGreaterThanOrEqual(210)
+    expect(Number(btn![1]), '徽标上限不得超过 240px（否则窄容器下会溢出、挤压模型选择器）')
+      .toBeLessThanOrEqual(240)
+    // ⚠️ 反向断言：不得写成固定 width（那会让短内容也占满，
+    // 既浪费横向空间，又让「内容自适应」失效）。
+    // 只取该规则体本身来判，避免正则跨规则误伤。
+    const btnRule = /\.dim-jh-badgeBtn \{([^}]*)\}/.exec(styles)
+    expect(btnRule, '应能取到 .dim-jh-badgeBtn 的规则体').not.toBeNull()
+    expect(btnRule![1], '胶囊不得设固定宽度（会破坏内容自适应）')
+      .not.toMatch(/(^|[;\s])width:/)
     expect(styles, '窄屏应收敛为只剩状态点').toMatch(/@media \(max-width: 720px\)/)
     expect(styles, '需 min-width:0 才能真正收缩/省略').toMatch(/min-width: 0/)
   })
@@ -481,8 +494,13 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
 
   it('偏好做成三段等分控件（不再单占一行写「显示偏好」）', () => {
     expect(styles).toMatch(/\.dim-jh-badgePrefBtn \{[^}]*flex: 1/)
-    // 解释性文案改到容器 title 上，信息不丢
-    expect(badge).toContain('显示偏好：决定徽标优先显示订阅还是积分')
+    // 解释性文案改到容器 title 上，信息不丢。
+    // ⚠️ 断言三档的**语义差别**而不只是「有一句解释」：2026-10-03 语义反转后
+    // 「自动」与「只看积分」都显示余额，差别在**是否回落**到订阅 —— title 里
+    // 不写清这点，用户会以为两档一样（旧 title 只写「优先显示订阅还是积分」）。
+    expect(badge).toContain('显示偏好：')
+    expect(badge, 'title 必须说明「自动」会回落').toContain('没有余额读数才显示订阅')
+    expect(badge, 'title 必须说明「只看积分」是强制的').toContain('强制只显示余额')
     expect(badge).not.toContain("'显示偏好'")
   })
 

@@ -163,24 +163,59 @@ describe('badgeView：模式与文案', () => {
     accounts: [{ accountId: 'a', nickname: 'a', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credits' } }],
   }
 
-  it('auto：有窗口显示窗口（文案含窗口名与百分比）', () => {
+  /**
+   * ⚠️ 2026-10-03 **优先级反转**（用户报障）：
+   * 胶囊显示「个人体验版 500 / 500积分」，而设置页里可用积分是 2434.96。
+   * 套餐读数是「某一份包还剩多少」，余额才是「一共还能用多少」—— 前者必然少报。
+   * 故 `auto` 改为**余额优先**，窗口/套餐退到 `subscription` 档。
+   */
+  it('auto：**余额优先**——即使有窗口与套餐，也显示一共能用的积分', () => {
     const view = badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: windows, accounts: [row('a', [pkg('Cline 账户余额', 5)])] })
+    expect(view.mode).toBe('credits')
+    expect(view.text).toBe('Cline • 5积分')
+    expect(view.reading).toBe('5积分')
+    expect(view.detail).toBe('')
+    expect(view.tone).toBe('ok')
+  })
+
+  it('auto：有套餐包也有余额时显示**余额合计**（用户报障的那一例）', () => {
+    // 复刻报障现场：有「体验版」套餐包，但余额合计是 2434.96
+    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: plan, accounts: [row('a', [pkg('个人体验版', 2434.96)])] })
+    expect(view.mode).toBe('credits')
+    expect(view.text).toBe('CodeBuddy • 2434.96积分')
+    // ⚠️ 套餐读数**没有消失**，只是不再是折叠态的默认 —— 它仍在返回结构里
+    expect(view.planGroups).toHaveLength(1)
+    expect(view.windows).toEqual([])
+  })
+
+  it('subscription 偏好：窗口优先（想盯百分比的人切这一档）', () => {
+    const view = badgeView({ providerLabel: 'Cline', preference: 'subscription', subscription: windows, accounts: [row('a', [pkg('Cline 账户余额', 5)])] })
     expect(view.mode).toBe('windows')
     // ⚠️ 分隔符是 BADGE_SEP（' • '），不再是 ' · '；' · ' 只用于读数**内部**分段。
     expect(view.text).toBe('Cline • 5 小时 6% · 本周 2%')
     expect(view.name).toBe('Cline')
     expect(view.detail).toBe('')
     expect(view.reading).toBe('5 小时 6% · 本周 2%')
-    expect(view.tone).toBe('ok')
   })
 
-  it('auto：无窗口有套餐时显示套餐（剩余 / 总量 + 单位）', () => {
-    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: plan, accounts: [row('a', [pkg('Bonus Pack', 20)])] })
+  it('subscription 偏好：无窗口时显示套餐（剩余 / 总量 + 单位）', () => {
+    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'subscription', subscription: plan, accounts: [row('a', [pkg('Bonus Pack', 20)])] })
     expect(view.mode).toBe('plan')
     expect(view.text).toBe('CodeBuddy • Free Plan Subscription 300 / 500积分')
     // 包名进 detail（渲染层里**最先**被省略的那一段），数字进 reading
     expect(view.detail).toBe('Free Plan Subscription')
     expect(view.reading).toBe('300 / 500积分')
+  })
+
+  it('三种偏好的候选顺序各自完整（不允许某档漏掉回落）', () => {
+    // auto：余额 → 窗口 → 套餐（三级回落，任一级为空都要继续往下走）
+    const noCredits = { kind: 'windows', accounts: [{ accountId: 'a', nickname: 'a', ok: true, windows: [{ type: 'five_hour', percentUsed: 6, resetsAt: '' }] }] }
+    expect(badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: noCredits, accounts: [row('a', null, '查询失败')] }).mode).toBe('windows')
+    expect(badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: plan, accounts: [row('a', null, '查询失败')] }).mode).toBe('plan')
+    // subscription：窗口 → 套餐 → 余额
+    expect(badgeView({ providerLabel: 'CodeBuddy', preference: 'subscription', subscription: undefined, accounts: [row('a', [pkg('Bonus Pack', 20)])] }).mode).toBe('credits')
+    // credits：**只看余额**（有窗口也不显示窗口）
+    expect(badgeView({ providerLabel: 'Cline', preference: 'credits', subscription: windows, accounts: [row('a', [pkg('Cline 账户余额', 5)])] }).mode).toBe('credits')
   })
 
   it('auto：两者都没有时显示积分合计', () => {
@@ -203,11 +238,6 @@ describe('badgeView：模式与文案', () => {
     expect(view.text).toBe('Cline • 5积分')
   })
 
-  it('subscription 偏好：行为与 auto 相同（窗口优先，其次套餐）', () => {
-    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'subscription', subscription: plan, accounts: [row('a', [pkg('Bonus Pack', 20)])] })
-    expect(view.mode).toBe('plan')
-  })
-
   it('窗口存在但一条都没有时**回落**到积分（不能显示成只有渠道名）', () => {
     const empty = { kind: 'windows', accounts: [{ accountId: 'a', nickname: 'a', ok: true, windows: [] }] }
     const view = badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: empty, accounts: [row('a', [pkg('Cline 账户余额', 12)])] })
@@ -223,7 +253,10 @@ describe('badgeView：模式与文案', () => {
         { accountId: 'good', nickname: 'good', ok: true, windows: [{ type: 'five_hour', percentUsed: 33, resetsAt: '' }] },
       ],
     }
-    const view = badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: mixed, accounts: [row('good', [pkg('Cline 账户余额', 1)])] })
+    // ⚠️ 显式用 subscription 档：auto 已改为**余额优先**，用它就测不到窗口选取了
+    // （那正是本用例存在的意义 —— 别为了「让 auto 也过」而弱化断言）。
+    const view = badgeView({ providerLabel: 'Cline', preference: 'subscription', subscription: mixed, accounts: [row('good', [pkg('Cline 账户余额', 1)])] })
+    expect(view.mode).toBe('windows')
     expect(view.text).toBe('Cline • 5 小时 33%')
   })
 
@@ -253,9 +286,11 @@ describe('badgeView：模式与文案', () => {
 
 describe('badgeView：色调', () => {
   function toneOfWindows(percent) {
+    // ⚠️ subscription 档：auto 已改为余额优先，用它拿到的是**余额**的色调，
+    // 就测不到「取最紧张的那个窗口」这条规则了。
     return badgeView({
       providerLabel: 'Cline',
-      preference: 'auto',
+      preference: 'subscription',
       subscription: { kind: 'windows', accounts: [{ accountId: 'a', nickname: 'a', ok: true, windows: [{ type: 'five_hour', percentUsed: percent, resetsAt: '' }] }] },
       accounts: [row('a', [pkg('Cline 账户余额', 1)])],
     }).tone

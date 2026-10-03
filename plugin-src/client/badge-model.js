@@ -8,16 +8,31 @@
  * 把「该显示什么」全部搬到本模块后，三态偏好 × 三种数据形态的**每一种组合**
  * 都能被单测逐条锁死（见 `tests/unit/badge-model.spec.ts`）。
  *
- * ## 显示优先级（用户 2026-10-01 定：窗口 > 套餐包 > 积分）
+ * ## 显示优先级（用户 2026-10-03 改：**余额优先**）
  *
  * | 偏好 | 行为 |
  * |---|---|
- * | `auto`（默认） | 有订阅读数就显示订阅（窗口优先，其次套餐包），否则积分 |
- * | `subscription` | 同上，但**不会**因为「订阅读数为 0/空」就回落到积分吗？——会回落，见下 |
- * | `credits` | 始终显示积分（也是套餐判定误判时的兜底开关） |
+ * | `auto`（默认） | **余额优先**；没有余额读数才依次回落到窗口、套餐 |
+ * | `subscription` | 窗口优先，其次套餐，最后余额（想盯百分比的人用这个档） |
+ * | `credits` | 只看余额（也是套餐判定误判时的兜底开关） |
+ *
+ * ## ⚠️ 为什么 `auto` 从「订阅优先」改成「余额优先」（真实报障，2026-10-03）
+ *
+ * 用户报障：CodeBuddy 胶囊显示「个人体验版 500 / 500积分」，而设置页里明明写着
+ * **可用积分 2434.96**。两者都是真的，但**回答的不是同一个问题**：
+ *
+ * - 套餐读数是「某一份套餐包还剩多少 / 共有多少」——它只是余额里的一份，
+ *   服务端还会下发「体验版」这类样板包；拿它当读数会**少报**可用额度；
+ * - 余额读数是「这个渠道**一共**还能用多少」——这才是用户看胶囊要的答案。
+ *
+ * 旧口径（窗口 > 套餐 > 积分）在这种「既有套餐包又有余额」的渠道上必然少报，
+ * 且**看起来像数据错误**（用户原话：「图3里显示我能用的积分足足 2436.96 呢」）。
+ *
+ * ⚠️ 窗口与套餐读数**没有删掉**：它们仍在浮层里（逐账号明细 / 订阅额度区），
+ * 且 `subscription` 档位可以随时切回去。改的只是**折叠态默认显示哪一个**。
  *
  * ⚠️ 「订阅读数存在但内容为空」（例如账号 `ok:true` 却 `windows: []`）必须
- * **回落到积分**：否则徽标会显示成 `Cline · `（只有渠道名、没有数字），
+ * **回落**到下一个候选：否则徽标会显示成 `Cline · `（只有渠道名、没有数字），
  * 比显示余额更没用。
  *
  * ⚠️ 多单位**绝不跨单位求和**：ZCode 的额度是 token，其余是积分。同一渠道内
@@ -86,11 +101,21 @@ export function describeBadgeError(error, fallback = '') {
   return message.length > 0 ? message : fallback;
 }
 
-/** 偏好的展示名（弹窗里的三态开关）。 */
+/**
+ * 偏好的展示名（弹窗里的三态开关）。
+ *
+ * ⚠️ 2026-10-03 语义反转后，`auto` 与 `credits` 的含义**不再对等**：
+ * - `auto` = **余额优先**（没有余额读数才回落到窗口/套餐）；
+ * - `subscription` = 只看订阅（窗口 > 套餐 > 余额）；
+ * - `credits` = **只看余额**（不回落到订阅 —— 它是套餐误判时的兜底开关）。
+ *
+ * 故 `auto` 的展示名保留「自动」（不写「优先积分」），否则三档里两档同义、
+ * 用户无法从名字看出差别。真正的区别写在 title 里（见 usage-badge.js）。
+ */
 export const BADGE_PREFERENCE_LABELS = Object.freeze({
   auto: '自动',
   subscription: '优先订阅',
-  credits: '优先积分',
+  credits: '只看积分',
 });
 
 /** 归一化偏好：未知值一律回落到默认（宿主若返回脏值，UI 不该崩）。 */
@@ -256,18 +281,32 @@ export function badgeView(input) {
   const windowAccount = windowRows.find((row) => row?.ok === true) ?? windowRows[0];
   const windows = windowAccount === undefined ? [] : windowPreview(windowAccount.windows);
   const planGroups = subscription?.kind === 'plan' ? planGroupsOf(subscription.accounts) : [];
-  const wantsSubscription = preference !== 'credits';
 
   const failureReason = firstFailureReason(accounts);
 
-  /** 订阅形态缺失（或内容为空）时一律回落 —— 见文件头的 ⚠️。 */
-  const mode = wantsSubscription && windows.length > 0
-    ? 'windows'
-    : wantsSubscription && planGroups.length > 0
-      ? 'plan'
-      : groups.length > 0
-        ? 'credits'
-        : 'empty';
+  /**
+   * 模式 = 按**偏好排出的候选顺序**里第一个有内容的（见文件头的优先级表）。
+   *
+   * ⚠️ 用「有序候选表 + find」而不是嵌套三元：旧写法把「偏好」与「形态」两个维度
+   * 揉进一个条件表达式，加一档就要重排整棵嵌套，极易把某个组合写漏
+   * （旧代码里 `wantsSubscription` 一个布尔同时承担「是否看订阅」与
+   * 「是否允许回落」两义）。候选表让每种偏好**一眼可读**。
+   *
+   * ⚠️ 每个候选都必须判「**有内容**」而不是「存在」：账号 `ok:true` 但
+   * `windows: []` / 包全失效时，订阅对象是在的、内容却是空的 ——
+   * 直接选中它会显示成 `Cline · `（只有渠道名，没有数字）。
+   */
+  const candidates = preference === 'subscription'
+    ? ['windows', 'plan', 'credits']
+    : preference === 'credits'
+      ? ['credits']
+      : ['credits', 'windows', 'plan'];
+  const hasContent = {
+    credits: groups.length > 0,
+    windows: windows.length > 0,
+    plan: planGroups.length > 0,
+  };
+  const mode = candidates.find((candidate) => hasContent[candidate]) ?? 'empty';
 
   const { detail, reading } = readingOf({ mode, windows, planGroups, groups, accounts, failedCount });
 
