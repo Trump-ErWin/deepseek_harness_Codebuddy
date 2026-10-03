@@ -164,11 +164,10 @@ afterEach(() => {
 })
 
 describe('gemini stream · 凭据与请求形状', () => {
-  it('未知模型 id 抛 INVALID_REQUEST（先查表，不取凭据不发请求）', async () => {
+  it('未知模型 id 抛 INVALID_REQUEST（先查表，不取凭据不发请求不续期）', async () => {
     const { calls } = recordingFetch([() => okStream()])
     const refreshCalls = { count: 0 }
-    const adapter = makeAdapter({ refreshCalls })
-    const error = await capture(adapter, options({ model: 'gemini-9.9-fake' }))
+    const error = await capture(makeAdapter({ refreshCalls }), options({ model: 'gemini-9.9-fake' }))
     expect(error?.code).toBe('INVALID_REQUEST')
     expect(error?.message).toContain('gemini-9.9-fake')
     // ⚠️ 状态码是给网关看的：只读 `failure.status`（顶层无 status），缺了它
@@ -179,24 +178,12 @@ describe('gemini stream · 凭据与请求形状', () => {
     expect(refreshCalls.count).toBe(0)
   })
 
-  it('带档位的模型 id（限流标记/探测形态）照常发请求', async () => {
-    const { calls } = recordingFetch([() => okStream()])
-    await drain(makeAdapter({ credential: cred('AT') }), options({ model: 'gemini-3.8-flash-high' }))
-    expect(calls.length).toBeGreaterThanOrEqual(1)
-    const body = JSON.parse(String(calls[0]!.init.body)) as { model: string }
-    // upstream 由 effort 决定（未传档位 = medium），不是 id 后缀
-    expect(body.model).toBe('gemini-3.8-flash-medium')
-  })
+  it('无凭据抛 MISSING_CREDENTIAL（不发请求）；凭据过期则先 refresh 再取新凭据', async () => {
+    const empty = recordingFetch([() => okStream()])
+    const missing = await capture(makeAdapter({}), options())
+    expect(missing?.code).toBe('MISSING_CREDENTIAL')
+    expect(empty.calls).toHaveLength(0)
 
-  it('无凭据抛 MISSING_CREDENTIAL（不发请求）', async () => {
-    const { calls } = recordingFetch([() => okStream()])
-    const adapter = makeAdapter({})
-    const error = await capture(adapter, options())
-    expect(error?.code).toBe('MISSING_CREDENTIAL')
-    expect(calls).toHaveLength(0)
-  })
-
-  it('凭据过期时先 refresh 再取新凭据', async () => {
     const refreshCalls = { count: 0 }
     const { calls } = recordingFetch([() => okStream()])
     const adapter = makeAdapter({
@@ -210,36 +197,34 @@ describe('gemini stream · 凭据与请求形状', () => {
     expect(chunks.length).toBeGreaterThan(0)
   })
 
-  it('请求发往 daily 端点、带流式路径，且**不带 Accept**', async () => {
+  it('请求发往 daily + 流式路径、不带 Accept、身份头齐、body 字母序且模型名带档位后缀', async () => {
     const { calls } = recordingFetch([() => okStream()])
-    await drain(makeAdapter({ credential: cred('AT') }), options())
+    await drain(makeAdapter({ credential: cred('AT') }), options({ reasoningEffort: 'high' as never }))
     expect(calls[0]!.url).toBe(`${GEMINI_ENDPOINT_DAILY}${GEMINI_STREAM_PATH}`)
     const headers = calls[0]!.init.headers as Headers
+    // ⚠️ 流式**刻意不带** Accept（上游按它分流，带了会走非流式语义）。
     expect(headers.get('Accept')).toBeNull()
     expect(headers.get('x-client-name')).toBe('antigravity')
     expect(headers.get('User-Agent')).toContain('antigravity/')
-  })
-
-  it('请求体是字母序信封，且模型名带档位后缀', async () => {
-    const { calls } = recordingFetch([() => okStream()])
-    await drain(makeAdapter({ credential: cred('AT') }), options({ reasoningEffort: 'high' as never }))
-    const body = JSON.parse(String(calls[0]!.init.body)) as Record<string, unknown>
+    const body = JSON.parse(String(calls[0]!.init.body)) as Record<string, unknown> & { model: string }
     expect(body.model).toBe('gemini-3.8-flash-high')
     expect(body.request).toBeDefined()
     // 字母序：model < project < request < requestId < userAgent
     const keys = Object.keys(body)
     expect(keys).toEqual([...keys].sort())
+
+    // 带档位的模型 id（限流标记/探测形态）照常发；upstream 由 effort 决定而非 id 后缀。
+    const tiered = recordingFetch([() => okStream()])
+    await drain(makeAdapter({ credential: cred('AT') }), options({ model: 'gemini-3.8-flash-high' }))
+    expect(JSON.parse(String(tiered.calls[0]!.init.body)).model).toBe('gemini-3.8-flash-medium')
   })
 })
 
 describe('gemini stream · 空响应与网络失败', () => {
-  it('ok 但没有 body → EMPTY_RESPONSE', async () => {
+  it('ok 但无 body → EMPTY_RESPONSE；fetch 抛错 → TRANSPORT（交给 harness 退避）', async () => {
     recordingFetch([() => new Response(null, { status: 200 })])
-    const error = await capture(makeAdapter({ credential: cred('AT') }), options())
-    expect(error?.code).toBe('EMPTY_RESPONSE')
-  })
+    expect((await capture(makeAdapter({ credential: cred('AT') }), options()))?.code).toBe('EMPTY_RESPONSE')
 
-  it('fetch 抛错 → TRANSPORT（交给 harness 退避）', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('fetch failed') }))
     const error = await capture(makeAdapter({ credential: cred('AT') }), options())
     expect(error?.code).toBe('TRANSPORT')
@@ -253,7 +238,7 @@ describe('gemini stream · 空响应与网络失败', () => {
   })
 })
 
-describe('gemini stream · 签名去签重试', () => {
+describe('gemini stream · 签名往返', () => {
   const history = [
     { role: 'user', content: [{ type: 'text', text: '读文件' }] },
     { role: 'assistant', content: [{ type: 'tool-call', id: 't1', name: 'read_file', arguments: '{"path":"a.go"}' }] },
@@ -296,27 +281,23 @@ describe('gemini stream · 签名去签重试', () => {
   })
 })
 
-describe('gemini stream · 端点救场', () => {
-  it('403 先翻到 sandbox 端点，再失败才归类 SERVER（无池时）', async () => {
-    const { calls } = recordingFetch([() => new Response('forbidden', { status: 403 })])
+describe('gemini stream · 端点与续期救场', () => {
+  it('403 先翻到 sandbox 端点，再失败才归类 SERVER（无池时）；429 也先翻端点', async () => {
+    const forbidden = recordingFetch([() => new Response('forbidden', { status: 403 })])
     const error = await capture(makeAdapter({ credential: cred('AT') }), options())
-    expect(calls).toHaveLength(2)
-    expect(calls[0]!.url.startsWith(GEMINI_ENDPOINT_DAILY)).toBe(true)
-    expect(calls[1]!.url.startsWith(GEMINI_ENDPOINT_SANDBOX)).toBe(true)
+    expect(forbidden.calls).toHaveLength(2)
+    expect(forbidden.calls[0]!.url.startsWith(GEMINI_ENDPOINT_DAILY)).toBe(true)
+    expect(forbidden.calls[1]!.url.startsWith(GEMINI_ENDPOINT_SANDBOX)).toBe(true)
     // ⚠️ 403 归 SERVER 而不是 AUTH —— 否则会把用户引向「重新登录」这个无效动作。
     expect(error?.code).toBe('SERVER')
     expect(error?.failure?.status).toBe(403)
+
+    // 端点切换只做一次，不无限来回。
+    const limited = recordingFetch([() => new Response('rate limited', { status: 429 })])
+    expect((await capture(makeAdapter({ credential: cred('AT') }), options()))?.code).toBe('RATE_LIMIT')
+    expect(limited.calls).toHaveLength(2)
   })
 
-  it('429 也先翻端点（端点切换只做一次，不无限来回）', async () => {
-    const { calls } = recordingFetch([() => new Response('rate limited', { status: 429 })])
-    const error = await capture(makeAdapter({ credential: cred('AT') }), options())
-    expect(calls).toHaveLength(2)
-    expect(error?.code).toBe('RATE_LIMIT')
-  })
-})
-
-describe('gemini stream · 401 先续期', () => {
   it('401 → 续期一次后用新凭据重试，**不换端点也不换号**', async () => {
     const refreshCalls = { count: 0 }
     const rateLimited: string[] = []
@@ -342,7 +323,7 @@ describe('gemini stream · 401 先续期', () => {
 })
 
 describe('gemini stream · 换号救场', () => {
-  it('429 换到下一个账号并成功（新凭据、回到默认端点）', async () => {
+  it('429 换到下一个账号并成功（新凭据、回到默认端点、冷却 60 秒打在旧账号上）', async () => {
     const { calls } = recordingFetch([
       () => new Response('rate limited', { status: 429 }),
       () => new Response('rate limited', { status: 429 }),
@@ -395,86 +376,54 @@ describe('gemini stream · 换号救场', () => {
     expect(marks[0]!.at - Date.now()).toBeLessThanOrEqual(300_000)
   })
 
-  it('所有账号都不可用 → QUOTA_EXCEEDED（不无限循环）', async () => {
-    const { calls } = recordingFetch([() => new Response('rate limited', { status: 429 })])
-    const adapter = makeAdapter({
-      credential: cred('AT-1'),
-      pool: makePool({ current: 'acc-1', next: [] }),
-    })
-    const error = await capture(adapter, options())
+  it('全不可用 → QUOTA_EXCEEDED（不无限循环）；换号带上起始账号且最多换 3 个', async () => {
+    const exhausted = recordingFetch([() => new Response('rate limited', { status: 429 })])
+    const error = await capture(
+      makeAdapter({ credential: cred('AT-1'), pool: makePool({ current: 'acc-1', next: [] }) }),
+      options(),
+    )
     expect(error?.code).toBe('QUOTA_EXCEEDED')
     expect(error?.message).toMatch(/所有账号均不可用/)
     // 一次端点切换 + 一次换号失败判定，不该再多。
-    expect(calls.length).toBeLessThanOrEqual(3)
-  })
+    expect(exhausted.calls.length).toBeLessThanOrEqual(3)
 
-  it('换号后仍限流 → 继续换到第三个账号（GEMINI_MAX_ROTATE = 3）', async () => {
-    const { calls } = recordingFetch([
+    // 起始账号会先按凭据反查并加入 tried（不会换回自己）；换到第三个账号才成功。
+    const seen: Array<string[]> = []
+    const rotated = recordingFetch([
       () => new Response('rate limited', { status: 429 }),
       () => new Response('rate limited', { status: 429 }),
       () => new Response('rate limited', { status: 429 }),
       () => new Response('rate limited', { status: 429 }),
       () => okStream(),
     ])
-    const adapter = makeAdapter({
+    const chunks = await drain(makeAdapter({
       credential: cred('AT-1'),
       pool: makePool({
         current: 'acc-1',
         next: [{ id: 'acc-2', token: 'AT-2' }, { id: 'acc-3', token: 'AT-3' }],
-      }),
-    })
-    const chunks = await drain(adapter, options())
-    expect(chunks.length).toBeGreaterThan(0)
-    // 最后一次成功请求用的是第三个账号。
-    expect((calls.at(-1)!.init.headers as Headers).get('Authorization')).toBe('Bearer AT-3')
-  })
-
-  it('起始账号会先按凭据反查并加入 tried（不会换回自己）', async () => {
-    const seen: Array<string[]> = []
-    const { calls } = recordingFetch([
-      () => new Response('rate limited', { status: 429 }),
-      () => new Response('rate limited', { status: 429 }),
-      () => okStream(),
-    ])
-    const adapter = makeAdapter({
-      credential: cred('AT-1'),
-      pool: makePool({
-        current: 'acc-1',
-        next: [{ id: 'acc-2', token: 'AT-2' }],
         onQuery: (exclude) => seen.push([...exclude]),
       }),
-    })
-    await drain(adapter, options())
-    expect(calls).toHaveLength(3)
+    }), options())
+    expect(chunks.length).toBeGreaterThan(0)
+    expect((rotated.calls.at(-1)!.init.headers as Headers).get('Authorization')).toBe('Bearer AT-3')
     expect(seen[0]).toEqual(['acc-1'])
   })
 })
 
-describe('gemini stream · 档位与模型', () => {
-  it('未知档位被丢弃（回落到默认 medium，不发一个上游不认的档）', async () => {
-    const { calls } = recordingFetch([() => okStream()])
-    await drain(
-      makeAdapter({ credential: cred('AT') }),
-      options({ reasoningEffort: 'ultra' as never }),
-    )
-    const body = JSON.parse(String(calls[0]!.init.body)) as { model: string }
-    expect(body.model).toBe('gemini-3.8-flash-medium')
-  })
+describe('gemini stream · 档位', () => {
+  it('未知档位回落到默认 medium；自适应档只发 includeThoughts', async () => {
+    const unknown = recordingFetch([() => okStream()])
+    await drain(makeAdapter({ credential: cred('AT') }), options({ reasoningEffort: 'ultra' as never }))
+    expect(JSON.parse(String(unknown.calls[0]!.init.body)).model).toBe('gemini-3.8-flash-medium')
 
-  // （原「未知模型 id 也被拼上默认档后缀」用例已随严格校验移除：
-  //  未知 id 现在在查表处直接抛 INVALID_REQUEST，见「凭据与请求形状」段 ——
-  //  静默落回 3.8 正是本次修复的行为。）
-
-  it('自适应档只发 includeThoughts（不发 thinkingBudget）', async () => {
-    const { calls } = recordingFetch([() => okStream()])
-    await drain(
-      makeAdapter({ credential: cred('AT') }),
-      options({ reasoningEffort: 'tiered' as never }),
-    )
-    const body = JSON.parse(String(calls[0]!.init.body)) as {
+    const tiered = recordingFetch([() => okStream()])
+    await drain(makeAdapter({ credential: cred('AT') }), options({ reasoningEffort: 'tiered' as never }))
+    const body = JSON.parse(String(tiered.calls[0]!.init.body)) as {
       request: { generationConfig: { thinkingConfig: Record<string, unknown> } }
     }
     expect(body.request.generationConfig.thinkingConfig).toEqual({ includeThoughts: true })
+
+    // 未知 id 不再静默落回 3.8 —— 那正是本次修复的行为，见「凭据与请求形状」段。
   })
 
   it('sessionId 可被覆盖（缺省用 GEMINI_SESSION_ID_INFER）', async () => {
@@ -500,15 +449,20 @@ describe('gemini 模型目录与声明契约', () => {
     } as unknown as AccountPool
   }
 
-  it('★ 门控：没有已登录账号时 listModels 返回空数组（不是抛错、不是只隐藏一部分）', async () => {
-    const adapter = makeAdapter({ credential: cred('AT'), pool: gatePool(false) })
-    const models = await adapter.listModels(GEMINI.id)
+  it('★ 门控：无已登录账号返空数组（不抛错）；被禁用的模型从目录剔除', async () => {
+    const anonymous = makeAdapter({ credential: cred('AT'), pool: gatePool(false) })
     // ⚠️ **空数组**（隐藏整个 provider 分组），且**不抛错** —— 抛错会让面板上
     // 多出一条 provider 级报错，用户看到的是「插件坏了」而不是「还没登录」。
-    expect(models).toEqual([])
+    expect(await anonymous.listModels(GEMINI.id)).toEqual([])
+
+    const disabled = makeAdapter({
+      credential: cred('AT'),
+      pool: gatePool(true, ['gemini-3.8-flash']),
+    })
+    expect(await disabled.listModels(GEMINI.id)).toEqual([])
   })
 
-  it('★ 有账号时暴露恰好 1 个模型，且声明 image 模态', async () => {
+  it('★ 有账号时暴露恰好 1 个模型、声明 image、不含 lite、不认领 claude-*', async () => {
     const adapter = makeAdapter({ credential: cred('AT'), pool: gatePool(true) })
     const models = await adapter.listModels(GEMINI.id)
     expect(models.map((m) => m.id)).toEqual(['gemini-3.8-flash'])
@@ -520,16 +474,7 @@ describe('gemini 模型目录与声明契约', () => {
     expect(models.some((m) => m.id.startsWith('claude'))).toBe(false)
   })
 
-  it('★ 被禁用的模型从目录里剔除（禁用是 provider 级共享状态）', async () => {
-    const adapter = makeAdapter({
-      credential: cred('AT'),
-      pool: gatePool(true, ['gemini-3.8-flash']),
-    })
-    const models = await adapter.listModels(GEMINI.id)
-    expect(models).toEqual([])
-  })
-
-  it('★ resolveModel 声明 1M 上下文 + 四个档位 + medium 为默认档', async () => {
+  it('★ resolveModel 声明 1M 上下文 + 四个中文档位 + medium 默认档', async () => {
     const adapter = makeAdapter({ credential: cred('AT'), pool: gatePool(true) })
     const resolved = await adapter.resolveModel(GEMINI.id, 'gemini-3.8-flash')
     expect(resolved.context?.contextWindow).toBe(1_000_000)
@@ -544,13 +489,7 @@ describe('gemini 模型目录与声明契约', () => {
     expect(String(resolved.reasoning?.defaultEffort)).toBe('medium')
   })
 
-  it('★ 未知模型不编造档位声明（宁可让 DSH 用默认，也不给一个点不开的空下拉框）', async () => {
-    const adapter = makeAdapter({ credential: cred('AT'), pool: gatePool(true) })
-    const resolved = await adapter.resolveModel(GEMINI.id, 'gemini-9.9-imaginary')
-    expect(resolved.reasoning).toBeUndefined()
-  })
-
-  it('★ 未知模型不编造上下文窗口（宁可让 DSH 用默认值）', async () => {
+  it('★ 未知模型不编造上下文窗口也不编造档位（宁可让 DSH 用默认值）', async () => {
     const adapter = makeAdapter({ credential: cred('AT'), pool: gatePool(true) })
     const resolved = await adapter.resolveModel(GEMINI.id, 'gemini-9.9-imaginary')
     expect(resolved.context).toBeUndefined()

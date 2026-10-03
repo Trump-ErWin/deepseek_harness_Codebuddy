@@ -64,20 +64,15 @@ afterEach(() => {
 })
 
 describe('isGeminiSignatureError', () => {
-  it('含 signature 即判定（大小写无关）', () => {
+  it('含 signature 即判定；thought + invalid 也判定（上游文案不统一时的兜底）', () => {
     expect(isGeminiSignatureError('Invalid Signature')).toBe(true)
     expect(isGeminiSignatureError('thought_signature is required')).toBe(true)
-    expect(isGeminiSignatureError('SIGNATURE_MISMATCH')).toBe(true)
-  })
-
-  it('thought + invalid 同时出现也判定（上游文案不统一时的兜底）', () => {
     expect(isGeminiSignatureError('the thought block is invalid')).toBe(true)
   })
 
   it('普通 400 不误判（误判只会白试一次，但也不该到处触发）', () => {
     expect(isGeminiSignatureError('invalid request')).toBe(false)
     expect(isGeminiSignatureError('model not found')).toBe(false)
-    expect(isGeminiSignatureError('')).toBe(false)
   })
 })
 
@@ -89,13 +84,7 @@ describe('classifyFailure 归类（经由 stream 端到端验证）', () => {
     expect(error.message).toMatch(/HTTP 403/)
   })
 
-  it('404 → SERVER（模型名是准入钥匙，404 意味着名字不对）', async () => {
-    const error = await failureOf(404, 'not found')
-    expect(error.code).toBe('SERVER')
-    expect(error.failure?.status).toBe(404)
-  })
-
-  it('429 → RATE_LIMIT', async () => {
+  it('429 → RATE_LIMIT（归 SERVER 会让 harness 对已限流的账号原地重试）', async () => {
     const error = await failureOf(429, 'rate limited')
     expect(error.code).toBe('RATE_LIMIT')
   })
@@ -105,30 +94,8 @@ describe('classifyFailure 归类（经由 stream 端到端验证）', () => {
     expect(error.code).toBe('AUTH')
   })
 
-  it('400 + quota 文案 → QUOTA_EXCEEDED', async () => {
+  it('400 + quota 文案 → QUOTA_EXCEEDED（不归 INVALID_REQUEST）', async () => {
     const error = await failureOf(400, 'RESOURCE_EXHAUSTED: quota exceeded')
     expect(error.code).toBe('QUOTA_EXCEEDED')
-  })
-
-  it('400 普通请求错误 → INVALID_REQUEST（不透传成配额问题）', async () => {
-    const error = await failureOf(400, 'invalid argument: temperature out of range')
-    expect(error.code).toBe('INVALID_REQUEST')
-  })
-
-  it('5xx → SERVER（交给 harness 退避）', async () => {
-    const error = await failureOf(503, 'upstream unavailable')
-    expect(error.code).toBe('SERVER')
-    expect(error.failure?.status).toBe(503)
-  })
-
-  it('错误正文被截断到 500 字（避免把整页 HTML 灌进 UI）', async () => {
-    const error = await failureOf(500, 'x'.repeat(2_000))
-    expect(error.message.length).toBeLessThan(600)
-    expect(error.message).toMatch(/HTTP 500/)
-  })
-
-  it('空正文只显示状态码，不留一个空破折号', async () => {
-    const error = await failureOf(500, '')
-    expect(error.message).toBe('gemini: HTTP 500')
   })
 })

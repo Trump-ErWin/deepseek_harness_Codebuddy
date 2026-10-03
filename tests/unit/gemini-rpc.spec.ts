@@ -138,12 +138,17 @@ function specIdToken(payload: Record<string, unknown>): string {
   return `hdr.${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}.sig`
 }
 
-/** 装配一套 RPC（gemini 用**真实 GeminiAuth** + 桩 fetch）。 */
-function makeRpc(options: { withIdToken?: boolean } = {}) {
+/**
+ * 装配一套 RPC。
+ *
+ * 默认 gemini 位用**真实 `GeminiAuth` + 桩 fetch**（登录链路要真跑）；传
+ * `gemini` 可换成只记录实参的桩（用于 `account.refresh` 的分派断言）。
+ */
+function makeRpc(options: { withIdToken?: boolean; gemini?: unknown } = {}) {
   const { ctx, credentials, handler } = makeCtx()
   const pool = new AccountPool(ctx)
   const calls = { token: 0, userinfo: 0 }
-  const gemini = new GeminiAuth(ctx, { fetchImpl: makeFetchStub(calls, options) })
+  const gemini = options.gemini ?? new GeminiAuth(ctx, { fetchImpl: makeFetchStub(calls, options) })
   registerJetHubRpc(
     ctx, pool,
     // ⚠️ **13 个 provider 形参**，逐个具名 —— 少一个就错位（见文件头第 1 条）。
@@ -195,19 +200,25 @@ async function authorize(loginUrl: string, options: { code?: string; state?: str
   return response.status
 }
 
-/** 轮询 `login.poll` 直到 done 或超时。 */
+/** 轮询直到条件成立（默认 10 秒）。 */
+async function waitUntil(check: () => Promise<boolean>, label: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await check()) return
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  throw new Error(`等待超时：${label}`)
+}
+
+/** 轮询 `login.poll` 直到 done。 */
 async function waitForLogin(
   call: (method: string, payload: unknown) => Promise<any>,
   accountId: string,
-  timeoutMs = 10_000,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
+  await waitUntil(async () => {
     const polled = await call('login.poll', { accountId, provider: GEMINI.id })
-    if (polled.value?.done === true) return
-    await new Promise((r) => setTimeout(r, 100))
-  }
-  throw new Error(`等待登录完成超时（${accountId}）`)
+    return polled.value?.done === true
+  }, `登录完成（${accountId}）`)
 }
 
 /**
@@ -220,59 +231,44 @@ async function waitForLogin(
 async function waitForGone(
   call: (method: string, payload: unknown) => Promise<any>,
   accountId: string,
-  timeoutMs = 10_000,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
+  await waitUntil(async () => {
     const listed = await call('account.list', { provider: GEMINI.id })
-    const alive = (listed.value.accounts as Array<{ id: string }>).some((a) => a.id === accountId)
-    if (!alive) return
-    await new Promise((r) => setTimeout(r, 100))
-  }
-  throw new Error(`等待占位账号被清理超时（${accountId}）`)
+    return !(listed.value.accounts as Array<{ id: string }>).some((a) => a.id === accountId)
+  }, `占位账号被清理（${accountId}）`)
 }
 
 describe('Gemini Jet Hub 登录接入', () => {
-  it('★ account.create 返回真实 Google 授权 URL（不是 unknown provider）', async () => {
-    const { call } = makeRpc()
-    const result = await call('account.create', { provider: GEMINI.id })
-    expect(result.ok).toBe(true)
-    expect(typeof result.value.accountId).toBe('string')
-    expect(result.value.accountId.startsWith('gemini-')).toBe(true)
-    const url = new URL(result.value.loginUrl as string)
+  it('★ account.create 立刻返回真实 Google 授权 URL，并登记一个不可续期的占位账号', async () => {
+    const { call, calls } = makeRpc()
+    const started = Date.now()
+    const created = await call('account.create', { provider: GEMINI.id })
+    expect(created.ok).toBe(true)
+    // ⚠️ 必须立刻返回：`window.open` 只在用户手势窗口内有效，等授权完成再返回
+    // 弹窗就会被浏览器拦掉。
+    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(calls.token).toBe(0)
+    expect(calls.userinfo).toBe(0)
+
+    const url = new URL(created.value.loginUrl as string)
     expect(url.origin).toBe('https://accounts.google.com')
-    // 授权 URL 的必备参数：`access_type=offline` + `prompt=consent` 才能拿到
-    // refresh_token（少了它们只能拿到 1 小时有效的 access_token，到期即掉线）。
+    // `access_type=offline` + `prompt=consent` 才能拿到 refresh_token（少了它们
+    // 只有 1 小时有效的 access_token，到期即掉线）。
     expect(url.searchParams.get('access_type')).toBe('offline')
     expect(url.searchParams.get('prompt')).toBe('consent')
     expect(url.searchParams.get('response_type')).toBe('code')
     expect(url.searchParams.get('redirect_uri')).toMatch(/^http:\/\/localhost:\d+\/oauth-callback$/)
     // ⚠️ 刻意**不做 PKCE**（用户拍板：与上游 Go 实现一致）。
     expect(url.searchParams.get('code_challenge')).toBeNull()
-  })
 
-  it('★ account.create 立刻返回（不等授权完成）—— 否则 window.open 被拦', async () => {
-    const { call, calls } = makeRpc()
-    const started = Date.now()
-    const result = await call('account.create', { provider: GEMINI.id })
-    const elapsed = Date.now() - started
-    expect(result.ok).toBe(true)
-    expect(elapsed).toBeLessThan(1_000)
-    // 还没人授权 ⇒ 一次令牌交换都不该发生。
-    expect(calls.token).toBe(0)
-    expect(calls.userinfo).toBe(0)
-  })
-
-  it('account.create 登记占位账号（前端立刻可见）', async () => {
-    const { call } = makeRpc()
-    const created = await call('account.create', { provider: GEMINI.id })
+    const accountId = created.value.accountId as string
+    expect(accountId.startsWith('gemini-')).toBe(true)
     const listed = await call('account.list', { provider: GEMINI.id })
-    const entry = listed.value.accounts.find((a: { id: string }) => a.id === created.value.accountId)
-    expect(entry).toBeDefined()
+    const entry = listed.value.accounts.find((a: { id: string }) => a.id === accountId)
     expect(entry.provider).toBe(GEMINI.id)
+    expect(entry.enabled).toBe(true)
     // 尚未拿到凭据 ⇒ 不可续期（拿到后由后台回填）。
     expect(entry.refreshable).toBe(false)
-    expect(entry.enabled).toBe(true)
   })
 
   it('★ 占位账号存在但凭据未写入时 login.poll 必须回 done:false', async () => {
@@ -283,20 +279,48 @@ describe('Gemini Jet Hub 登录接入', () => {
     expect(polled.value.done).toBe(false)
   })
 
-  it('★ 走完真实本地回调：换令牌 → 凭据落盘 → login.poll 报 done', async () => {
-    const { call, calls } = makeRpc()
+  it('★ 走完真实本地回调：换令牌一次、不查 userinfo、凭据落盘、昵称回填邮箱、refreshable 回填', async () => {
+    const { call, pool, credentials, calls } = makeRpc()
     const created = await call('account.create', { provider: GEMINI.id })
     const accountId = created.value.accountId as string
 
     // 扮演浏览器点「允许」。
     expect(await authorize(created.value.loginUrl as string, { code: 'SPEC-CODE' })).toBe(200)
-
     await waitForLogin(call, accountId)
     expect(calls.token).toBe(1)
     // ⚠️ 身份来自令牌响应自带的 `id_token` ⇒ **一次 userinfo 都不该发**。
     // 2026-10-03 报障（昵称退化成 `gemini-6a53dbca`）就是因为原来只靠这次
     // 可静默失败的跨域请求。
     expect(calls.userinfo).toBe(0)
+
+    // 凭据以 JSON 落进 ctx.credentials；refresh_token 是「下次续期不要求用户
+    // 重新登录」的唯一凭据，必须落盘。
+    const entry = (await pool.listAllAccounts()).find((a) => a.id === accountId)
+    expect(entry).toBeDefined()
+    expect(entry?.refreshable).toBe(true)
+    // `expiresAt` 也要写回，否则卡片一直显示「已过期」。
+    expect(entry!.expiresAt! - Date.now()).toBeGreaterThan(3_000_000)
+
+    const stored = await credentials.resolve(entry!.credentialRef)
+    const parsed = JSON.parse(stored!.value) as Record<string, unknown>
+    expect(parsed.access_token).toBe('SPEC-AT')
+    expect(parsed.refresh_token).toBe('SPEC-RT')
+    expect(parsed.sub).toBe('spec-sub-1234')
+    expect(parsed.email).toBe('spec@example.com')
+
+    // 昵称回填是后台 `.then` 的最后一步，可能晚于 `login.poll` 报 done。
+    await waitUntil(async () => {
+      const listed = await call('account.list', { provider: GEMINI.id })
+      const nickname = listed.value.accounts.find((a: { id: string }) => a.id === accountId)?.nickname
+      return nickname !== accountId
+    }, '昵称回填')
+    const listed = await call('account.list', { provider: GEMINI.id })
+    const nickname = String(listed.value.accounts.find((a: { id: string }) => a.id === accountId)?.nickname)
+    // `geminiAccountLabel` 邮箱优先 —— 邮箱来自桩令牌响应里的 `id_token`。
+    // ⚠️ 曾经这里断言 `'Gemini spec-sub'`（`sub` 前 8 位），那是**不可辨认**的
+    // 展示名，2026-10-03 用户报障后改为邮箱优先，见 `geminiAccountLabel`。
+    expect(nickname).toBe('spec@example.com')
+    expect(nickname.startsWith('Gemini ')).toBe(false)
   }, 20_000)
 
   it('★ 令牌响应缺 id_token 时才兜底 userinfo（且登录仍然成功）', async () => {
@@ -310,87 +334,26 @@ describe('Gemini Jet Hub 登录接入', () => {
     expect(calls.userinfo).toBe(1)
   }, 20_000)
 
-  it('★ 凭据以 JSON 落进 ctx.credentials（含 refresh_token）', async () => {
-    const { call, pool, credentials } = makeRpc()
-    const created = await call('account.create', { provider: GEMINI.id })
-    const accountId = created.value.accountId as string
-    await authorize(created.value.loginUrl as string, { code: 'SPEC-CODE' })
-    await waitForLogin(call, accountId)
-
-    const entry = (await pool.listAllAccounts()).find((a) => a.id === accountId)
-    expect(entry).toBeDefined()
-    const stored = await credentials.resolve(entry!.credentialRef)
-    expect(stored).toBeDefined()
-    const parsed = JSON.parse(stored!.value) as Record<string, unknown>
-    expect(parsed.access_token).toBe('SPEC-AT')
-    // ⚠️ refresh_token 是「下次续期不要求用户重新登录」的唯一凭据，必须落盘。
-    expect(parsed.refresh_token).toBe('SPEC-RT')
-    expect(parsed.sub).toBe('spec-sub-1234')
-    expect(parsed.email).toBe('spec@example.com')
-  }, 20_000)
-
-  it('登录成功后账号昵称被回填为邮箱（不是 sub 前 8 位）', async () => {
-    const { call } = makeRpc()
-    const created = await call('account.create', { provider: GEMINI.id })
-    const accountId = created.value.accountId as string
-    await authorize(created.value.loginUrl as string, { code: 'SPEC-CODE' })
-
-    const deadline = Date.now() + 10_000
-    let nickname = ''
-    while (Date.now() < deadline) {
-      const listed = await call('account.list', { provider: GEMINI.id })
-      nickname = String(listed.value.accounts.find((a: { id: string }) => a.id === accountId)?.nickname ?? '')
-      // 占位条目的昵称就是池 id；变了说明回填已经发生。
-      if (nickname !== accountId) break
-      await new Promise((r) => setTimeout(r, 100))
-    }
-    // `geminiAccountLabel` 邮箱优先 —— 邮箱来自桩令牌响应里的 `id_token`。
-    // ⚠️ 曾经这里断言 `'Gemini spec-sub'`（`sub` 前 8 位），那是**不可辨认**的
-    // 展示名，2026-10-03 用户报障后改为邮箱优先，见 `geminiAccountLabel`。
-    expect(nickname).toBe('spec@example.com')
-    // 顺带钉住反面：不得再拼 `sub` 前缀。
-    expect(nickname.startsWith('Gemini ')).toBe(false)
-  }, 20_000)
-
-  it('★ 登录成功后 refreshable 被回填为 true（否则续期定时器不会碰它）', async () => {
-    const { call, pool } = makeRpc()
-    const created = await call('account.create', { provider: GEMINI.id })
-    const accountId = created.value.accountId as string
-    await authorize(created.value.loginUrl as string, { code: 'SPEC-CODE' })
-    await waitForLogin(call, accountId)
-
-    const entry = (await pool.listAllAccounts()).find((a) => a.id === accountId)
-    expect(entry?.refreshable).toBe(true)
-    // `expiresAt` 也要写回，否则卡片一直显示「已过期」。
-    expect(typeof entry?.expiresAt).toBe('number')
-    expect(entry!.expiresAt! - Date.now()).toBeGreaterThan(3_000_000)
-  }, 20_000)
-
-  it('★ state 不符的回调被拒，且不会误把凭据写进账号', async () => {
-    const { call, pool, credentials, calls } = makeRpc()
-    const created = await call('account.create', { provider: GEMINI.id })
-    const accountId = created.value.accountId as string
-
-    expect(await authorize(created.value.loginUrl as string, { code: 'SPEC-CODE', state: 'forged-state' })).toBe(400)
+  it('★ state 不符 / 用户点取消：400 拒、不换令牌、占位账号被清理、凭据一行不写', async () => {
+    const forged = makeRpc()
+    const forgedCreated = await forged.call('account.create', { provider: GEMINI.id })
+    const forgedId = forgedCreated.value.accountId as string
+    expect(await authorize(forgedCreated.value.loginUrl as string, {
+      code: 'SPEC-CODE', state: 'forged-state',
+    })).toBe(400)
     // 换令牌一次都不该发生。
-    expect(calls.token).toBe(0)
-
+    expect(forged.calls.token).toBe(0)
     // ⚠️ 失败的登录会被后台清理：占位账号**被删掉**（不是留个坏账号在列表里）。
-    await waitForGone(call, accountId)
-    // 且凭据存储里一行都没写。
-    expect(credentials.snapshot()).toHaveLength(0)
-  }, 20_000)
+    await waitForGone(forged.call, forgedId)
+    expect(forged.credentials.snapshot()).toHaveLength(0)
 
-  it('★ 用户在 Google 页点「取消」：回调带 error，不落任何凭据', async () => {
-    const { call, credentials, calls } = makeRpc()
-    const created = await call('account.create', { provider: GEMINI.id })
-    const accountId = created.value.accountId as string
-
-    expect(await authorize(created.value.loginUrl as string, { error: 'access_denied' })).toBe(400)
-    expect(calls.token).toBe(0)
-
-    await waitForGone(call, accountId)
-    expect(credentials.snapshot()).toHaveLength(0)
+    const denied = makeRpc()
+    const deniedCreated = await denied.call('account.create', { provider: GEMINI.id })
+    const deniedId = deniedCreated.value.accountId as string
+    expect(await authorize(deniedCreated.value.loginUrl as string, { error: 'access_denied' })).toBe(400)
+    expect(denied.calls.token).toBe(0)
+    await waitForGone(denied.call, deniedId)
+    expect(denied.credentials.snapshot()).toHaveLength(0)
   }, 20_000)
 })
 
@@ -398,52 +361,24 @@ describe('Gemini Jet Hub 登录接入', () => {
  * `account.refresh` 的分派（行为级）。
  *
  * ⚠️ 用桩 auth 而非真实 `GeminiAuth`：这里要守的是「RPC 把哪个实例、哪三个实参
- * 交给了谁」，真实续期协议已由 `gemini-credits.spec.ts` / oauth 侧覆盖。
+ * 交给了谁」，真实续期协议已由 oauth / credits 侧覆盖。
  *
  * 三个实参缺一不可 —— 尤其是 `pool` + `entry.id`（issue !IKIRTT：早先只有
  * raccoon 传了，其余 provider「刷新」下去凭据续好了、UI 纹丝不动）。
  */
 describe('Gemini account.refresh 分派', () => {
-  function makeRefreshRpc() {
-    const { ctx, handler } = makeCtx()
-    const pool = new AccountPool(ctx)
-    const seen: Array<{ ref: string; accountId?: string; withPool: boolean }> = []
-    const geminiStub = {
-      async refreshAccountCredential(ref: string, p?: unknown, accountId?: string) {
-        seen.push({ ref, accountId, withPool: p !== undefined })
-      },
-    }
-    registerJetHubRpc(
-      ctx, pool,
-      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
-      geminiStub as never, // gemini
-      undefined,
-    )
-    const h = handler()
-    if (h === undefined) throw new Error('handler 未注册')
-    const call = async (method: string, payload: unknown) => {
-      const res = await h(new Request('http://localhost/api/jet-hub', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ type: 'client-request', rpcId: 'r1', method: 'jet-hub', payload: { method, payload } }),
-      }))
-      const body = await res.json() as { result: { ok: boolean; value?: any; error?: { message: string } } }
-      return body.result
-    }
-    return { call, pool, seen }
-  }
-
   it('★ gemini 账号走 gemini 实例，且带上 pool + entry.id', async () => {
-    const { call, pool, seen } = makeRefreshRpc()
+    const seen: Array<{ ref: string; accountId?: string; withPool: boolean }> = []
+    const { call, pool } = makeRpc({
+      gemini: {
+        async refreshAccountCredential(ref: string, p?: unknown, accountId?: string) {
+          seen.push({ ref, accountId, withPool: p !== undefined })
+        },
+      },
+    })
     await pool.addAccount({
-      id: 'gemini-1',
-      provider: GEMINI.id,
-      nickname: 'spec',
-      enabled: true,
-      credentialRef: 'GEMINI_ACCOUNT_SPEC',
-      createdAt: 1,
-      refreshable: true,
+      id: 'gemini-1', provider: GEMINI.id, nickname: 'spec', enabled: true,
+      credentialRef: 'GEMINI_ACCOUNT_SPEC', createdAt: 1, refreshable: true,
     })
 
     const result = await call('account.refresh', { accountId: 'gemini-1' })
@@ -469,30 +404,6 @@ describe('Gemini credits.balances', () => {
   beforeEach(() => { clearGeminiCreditCache() })
   afterEach(() => { vi.unstubAllGlobals() })
 
-  function makeCreditsRpc() {
-    const { ctx, credentials, handler } = makeCtx()
-    const pool = new AccountPool(ctx)
-    registerJetHubRpc(
-      ctx, pool,
-      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
-      new GeminiAuth(ctx) as never, // gemini
-      undefined,
-    )
-    const h = handler()
-    if (h === undefined) throw new Error('handler 未注册')
-    const call = async (method: string, payload: unknown) => {
-      const res = await h(new Request('http://localhost/api/jet-hub', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ type: 'client-request', rpcId: 'r1', method: 'jet-hub', payload: { method, payload } }),
-      }))
-      const body = await res.json() as { result: { ok: boolean; value?: any; error?: { message: string } } }
-      return body.result
-    }
-    return { call, pool, credentials }
-  }
-
   const QUOTA = {
     groups: [{
       buckets: [
@@ -502,12 +413,16 @@ describe('Gemini credits.balances', () => {
     }],
   }
 
-  it('★ 配额窗口转成两个包（5 小时 + 周），汇总是平均值', async () => {
-    const { call, pool, credentials } = makeCreditsRpc()
+  async function seedAccount(pool: AccountPool, credentialRef: string) {
     await pool.addAccount({
       id: 'gemini-1', provider: GEMINI.id, nickname: 'spec', enabled: true,
-      credentialRef: 'GEMINI_ACCOUNT_SPEC', createdAt: 1, refreshable: true,
+      credentialRef, createdAt: 1, refreshable: true,
     })
+  }
+
+  it('★ 配额窗口转成两个包（5 小时 + 周）且汇总是平均值；未授权回可读文案', async () => {
+    const { call, pool, credentials } = makeRpc()
+    await seedAccount(pool, 'GEMINI_ACCOUNT_SPEC')
     await credentials.set('GEMINI_ACCOUNT_SPEC', JSON.stringify({ access_token: 'AT-QUOTA' }))
 
     const seen: string[] = []
@@ -518,7 +433,7 @@ describe('Gemini credits.balances', () => {
 
     const result = await call('credits.balances', { provider: GEMINI.id })
     expect(result.ok).toBe(true)
-    const rows = result.value.accounts as Array<{ accountId: string; balance: { total: number; packages: Array<{ name: string; remaining: number }> } | null; error?: string }>
+    const rows = result.value.accounts as Array<{ accountId: string; balance: { total: number; packages: Array<{ name: string }> } | null; error?: string }>
     expect(rows).toHaveLength(1)
     expect(rows[0]?.accountId).toBe('gemini-1')
     expect(rows[0]?.error).toBeUndefined()
@@ -528,23 +443,14 @@ describe('Gemini credits.balances', () => {
     // 用 `toContain` 而不是 `seen[0]`：同一次调用里还会**并行**发
     // `loadCodeAssist`（取账号规格），两个请求的先后不该被这条断言锁死。
     expect(seen).toContain(`${GEMINI_ENDPOINT_SANDBOX}${GEMINI_QUOTA_PATH}`)
-  })
 
-  it('★ 未授权（无 access_token）回可读文案，而不是「余额查询失败」', async () => {
-    const { call, pool } = makeCreditsRpc()
-    await pool.addAccount({
-      id: 'gemini-1', provider: GEMINI.id, nickname: 'spec', enabled: true,
-      credentialRef: 'GEMINI_ACCOUNT_SPEC', createdAt: 1, refreshable: true,
-    })
-
-    const result = await call('credits.balances', { provider: GEMINI.id })
-    expect(result.ok).toBe(true)
-    const rows = result.value.accounts as Array<{ balance: unknown; error?: string }>
-    expect(rows[0]?.balance).toBeNull()
-    // 「凭据未配置」与「尚未授权 Google 账号」是两回事：前者是账号池层面，
-    // 后者是凭据内容层面。这里凭据缺失 ⇒ helper 记「凭据未配置」。
-    expect(typeof rows[0]?.error).toBe('string')
-    expect(rows[0]!.error!.length).toBeGreaterThan(0)
+    // 凭据缺失 ⇒ 「凭据未配置」（账号池层面），而不是「余额查询失败」。
+    vi.unstubAllGlobals()
+    const bare = makeRpc()
+    await seedAccount(bare.pool, 'GEMINI_ACCOUNT_SPEC')
+    const missing = await bare.call('credits.balances', { provider: GEMINI.id })
+    expect(missing.value.accounts[0]?.balance).toBeNull()
+    expect(missing.value.accounts[0]?.error?.length).toBeGreaterThan(0)
   })
 })
 
@@ -552,8 +458,9 @@ describe('Gemini 接线点（源码断言）', () => {
   const here = dirname(fileURLToPath(import.meta.url))
   const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8')
   const rpcSource = readFileSync(resolve(here, '../../src/jet-hub-rpc.ts'), 'utf8')
+  const probeSource = readFileSync(resolve(here, '../../src/account-probe.ts'), 'utf8')
 
-  it('⚠️ index.ts 六处接线点齐全', () => {
+  it('⚠️ index.ts 接线点齐全，且签名缓存在卸载时落盘', () => {
     expect(indexSource).toContain("from './gemini-auth.js'")
     expect(indexSource).toContain("'llm-gemini'")
     expect(indexSource).toContain('new GeminiAuth(ctx)')
@@ -562,20 +469,15 @@ describe('Gemini 接线点（源码断言）', () => {
     expect(indexSource).toContain("['gemini', (p) => gemini.refreshAll(p)]")
     expect(indexSource).toContain('gemini: geminiAdapter')
     expect(indexSource).toMatch(/loomy, raccoon, minimax, zcode, gemini, modelAdapters/)
-  })
-
-  it('⚠️ 签名缓存必须在插件卸载时落盘（丢的是下一轮能不能带签名）', () => {
+    // 丢的是下一轮能不能带签名。
     expect(indexSource).toContain('geminiSigStore.flush()')
   })
 
-  it('⚠️ jet-hub-rpc.ts 三处分支齐全，且都用 GEMINI.id 分派', () => {
+  it('⚠️ jet-hub-rpc 三处分支齐全；account-probe 的分派表已含 gemini', () => {
     expect(rpcSource).toContain('provider === GEMINI.id')
     expect(rpcSource).toContain('case GEMINI.id:')
     expect(rpcSource).toContain('fetchGeminiCreditBalance(credential, GEMINI)')
-  })
-
-  it('⚠️ account-probe 的分派表已含 gemini（漏了会被华为云 HMAC 签名发 Google 凭据）', () => {
-    const probeSource = readFileSync(resolve(here, '../../src/account-probe.ts'), 'utf8')
+    // ⚠️ 漏了会被华为云 HMAC 签名发 Google 凭据。
     expect(probeSource).toContain('entry.provider === GEMINI.id')
     expect(probeSource).toContain('new GeminiAdapter({')
   })
