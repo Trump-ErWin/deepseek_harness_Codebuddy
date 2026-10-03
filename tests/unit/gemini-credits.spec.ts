@@ -30,6 +30,7 @@ import {
 } from '../../src/gemini-credits.js'
 import {
   GEMINI,
+  GEMINI_DEFAULT_PROJECT,
   GEMINI_ENDPOINT_SANDBOX,
   GEMINI_QUOTA_PATH,
   type GeminiCredential,
@@ -231,13 +232,13 @@ describe('fetchGeminiCreditBalance · 未授权', () => {
 })
 
 describe('fetchGeminiCreditBalance · 请求形状', () => {
-  it('POST 到 sandbox 的配额端点，空对象请求体，带身份头', async () => {
+  it('POST 到 sandbox 的配额端点，带 project 的请求体，带身份头', async () => {
     const calls = stubQuota(jsonOk(upstreamPayload()))
     await fetchGeminiCreditBalance(credential())
     expect(calls).toHaveLength(1)
     expect(calls[0]!.url).toBe(`${GEMINI_ENDPOINT_SANDBOX}${GEMINI_QUOTA_PATH}`)
     expect(calls[0]!.init.method).toBe('POST')
-    expect(calls[0]!.init.body).toBe('{}')
+    expect(calls[0]!.init.body).toBe(JSON.stringify({ project: GEMINI_DEFAULT_PROJECT }))
     const headers = calls[0]!.init.headers as Headers
     expect(headers.get('Authorization')).toBe('Bearer AT')
     expect(headers.get('x-client-name')).toBe('antigravity')
@@ -305,10 +306,10 @@ describe('fetchGeminiCreditBalance · 失败文案', () => {
     expect(result.error).toMatch(/配额查询网络失败/)
   })
 
-  it('401 / 403 → 明确的「重新登录」指引', async () => {
+  it('401 / 403 → 带状态码，并把上游的 reason 透出来', async () => {
     stubQuota(() => new Response('unauthorized', { status: 401 }))
     const result = await fetchGeminiCreditBalance(credential('AT-401'))
-    expect(result.error).toBe('凭据已失效（HTTP 401），请重新登录该账号')
+    expect(result.error).toBe('配额查询被拒（HTTP 401）：unauthorized')
   })
 
   it('其他 HTTP 失败带上状态码与正文片段', async () => {
