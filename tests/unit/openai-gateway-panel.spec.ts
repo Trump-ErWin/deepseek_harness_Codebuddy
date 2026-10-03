@@ -58,6 +58,15 @@ describe('本机网关面板的文案与判定', () => {
     expect(gatewayStatusLines(WANTED_BUT_DOWN).join()).toContain('端口')
   })
 
+  it('★ 运行中必须说清「两种协议同时可用」（Responses API 是后加的，面板不说就没人知道）', () => {
+    const lines = gatewayStatusLines(RUNNING).join()
+    expect(lines).toContain('/chat/completions')
+    expect(lines).toContain('/responses')
+    // ⚠️ 措辞必须是「同时提供」，不是「可切换」：两端点同时都在，没有互斥开关。
+    expect(lines).toContain('同时提供')
+    expect(lines).not.toContain('切换')
+  })
+
   it('被 env 停用时开关禁用，且明确指出原因与 env 名', () => {
     expect(gatewaySwitchDisabled(ENV_BLOCKED)).toBe(true)
     expect(gatewaySwitchDisabled(RUNNING)).toBe(false)

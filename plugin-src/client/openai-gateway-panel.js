@@ -221,6 +221,11 @@ export function gatewayStatusLines(status) {
     return [
       '网关正在运行。把外部客户端的 OpenAI 兼容地址设为下面这一行。',
       endpoint ? `地址：${endpoint}` : '',
+      // ⚠️ 必须说清「两种协议同时可用」：Responses API 是后加的（2026-10-03），
+      // 老用户从面板上看不出它存在，会以为网关只支持 Chat Completions。
+      // ⚠️ 也**不能**说成「可切换」：两个端点同时都在，没有互斥开关。
+      '同一地址同时提供两种协议：/chat/completions（OpenAI Chat Completions）'
+      + '与 /responses（OpenAI Responses API）—— 用哪一套由客户端请求的路径决定。',
     ].filter(Boolean)
   }
   if (status.enabled) {

@@ -38,15 +38,18 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
 见 [模型列表开关](#模型列表开关黑名单)。
 
-## 本机 OpenAI Chat Completions 网关
+## 本机 OpenAI 网关（Chat Completions + Responses API）
 
-插件启动后会在 `127.0.0.1:8326` 提供标准 OpenAI Chat Completions 接口，供 Pi、Continue、Cline、OpenCode 或其他兼容客户端使用。网关复用 Jet Hub 已登录账号和现有 provider 适配器，不把上游凭据复制到客户端。
+插件启动后会在 `127.0.0.1:8326` 提供**两套**标准 OpenAI 接口，供 Pi、Continue、Cline、OpenCode、Codex 或其他兼容客户端使用。网关复用 Jet Hub 已登录账号和现有 provider 适配器，不把上游凭据复制到客户端。
+
+⚠️ **两个端点同时可用，没有「格式开关」**：客户端用哪一套协议，由它自己请求的路径决定。做成互斥开关只会让「另一个协议的客户端在切换后突然失效」，而网关这边本来就没有互斥的理由 —— 两者共用同一份 provider 路由、账号池与图片入站。
 
 接口：
 
 ```text
 GET  http://127.0.0.1:8326/v1/models
-POST http://127.0.0.1:8326/v1/chat/completions
+POST http://127.0.0.1:8326/v1/chat/completions    ← OpenAI Chat Completions
+POST http://127.0.0.1:8326/v1/responses           ← OpenAI Responses API
 ```
 
 鉴权使用：
@@ -159,6 +162,53 @@ $key = (Get-Content "$env:USERPROFILE\.dsh\openai-gateway\api-key" -Raw).Trim()
 > 流式请求下 HTTP 状态码已经发出是 200，该信息会放进 SSE 错误帧的 `error.status` /
 > `error.code`。网关**不会**在请求前用目录做白名单拦截 —— 有些 provider 支持目录
 > 之外的模型，显式请求仍交给 DSH 路由处理。
+
+### OpenAI Responses API（`/v1/responses`）
+
+给**只认 Responses 协议**的客户端（Codex CLI 及同类 agent）用：它们发的是
+`input` / `instructions` / `max_output_tokens`，并且只解析 Responses 的 SSE 事件。
+
+支持的字段：
+
+- **`input`**：字符串，或 item 数组 —— `message`（`user` / `assistant` / `system` /
+  `developer`，简写 `{role, content}` 也认）、`function_call`、
+  `function_call_output`、`input_image`（内联 base64 data URL，走**与 Chat 端点同一份**
+  附件入站）、`reasoning`（**刻意丢弃**：它承载的是上游加密的思考内容，网关没有可回放的等价物）。
+- **`instructions`** → DSH 的 system 消息。
+- **`tools`**：**扁平**（Responses 原生）与**嵌套**（Chat 形状）两种写法都认，但只支持
+  `function` 类型；`web_search` / `file_search` / `computer_use` / `mcp` 一律明确报错
+  （网关没有这些执行体，静默丢弃会让模型永远等不到工具结果）。
+- `tool_choice`（`auto` / `none`）、`max_output_tokens`（与 Chat 端点**同一份**钳制规则）、
+  `temperature`、`reasoning.effort`（与 Chat 端点**同一份**档位归一化）。
+- 流式与非流式。流式事件顺序与官方一致：
+  `response.created` → `response.output_item.added` / `response.output_text.delta` /
+  `response.reasoning_summary_text.delta` / `response.function_call_arguments.delta` →
+  `response.output_item.done` → `response.completed`（被截断时是 `response.incomplete`，
+  失败时是 `response.failed`）。
+  ⚠️ **不发 `data: [DONE]`** —— 那是 Chat Completions 的收尾约定，Responses 的流以
+  `response.completed` 结束。
+
+**明确报 400**（不静默忽略，免得用户以为设置生效了）：`previous_response_id`
+（网关无状态、不保存响应）、`background`、`text.format`（DSH 没有结构化输出通道，
+不假装按 schema 约束）、非 1 的 `top_p`、`item_reference`、非 `function` 类型工具。
+
+**接受但忽略**（网关是无状态转发）：`store` / `include` / `prompt_cache_key` /
+`metadata` / `user` / `truncation` / `service_tier` / `safety_identifier` /
+`parallel_tool_calls`。
+
+两处与 Chat 端点**有意不同**（理由写在 `src/openai-gateway/responses.ts` 的文件头）：
+
+1. **文本以 DSH 的 `block-end` 组装块为权威**。DSH 的正文死循环截断与泄漏清洗**只在
+   `block-end` 上生效**，而 Chat 端点只累加 delta —— 上游一旦触发正文死循环，Chat 端点会
+   把重复正文一并交给客户端，本端点按协议本意取 `block-end`（`output_text.done` 与
+   `output_item.done` 用的都是它）。
+2. **失败事件的 `error.code` 只放官方枚举值**（`server_error` / `rate_limit_exceeded`）。
+   精确的 DSH 错误码在 `error.dsh_code`、本该返回的 HTTP 状态在 `error.status` ——
+   把 `SERVER` 这类内部码塞进 `code`，会让按枚举校验的官方 SDK 在解析失败事件时抛错，
+   用户看到「客户端崩了」而不是上游的真实原因。
+
+`GET /v1/responses/{id}` **不提供**：网关不存储响应，一律 404。会话状态由客户端自己维护
+（把完整 `input` 一起发过来）。
 
 第一期支持流式/非流式文本、reasoning、工具调用、工具结果、用量和请求取消。图片暂不静默丢弃：当前网关无法把外部 OpenAI 图片引用安全转换为 DSH 附件时，会明确返回不支持错误。
 
