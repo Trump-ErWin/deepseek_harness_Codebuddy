@@ -51,6 +51,10 @@
  * @param {string} value 要复制的文本
  * @returns {Promise<boolean>} 是否写入成功
  */
+// ⚠️ 搜索判据与模型清单**共用同一份实现**（`model-filter.js`）：两处各写一套
+// 「空搜索词算命中全部」之类的约定，迟早漂移成「同一句话在两张表里搜出不同结果」。
+import { isFilterActive, matchesModelQuery } from './model-filter.js';
+
 export async function copyToClipboard(value) {
   try {
     if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false;
@@ -187,11 +191,15 @@ export function gatewayModelsCurl(endpoint) {
  * 网关现在会按强度**自动翻译**（填错不再 400），但「精确对应」仍然只有一列答案：
  * 即 `openai_efforts`。故把它渲染出来，用户抄一次就永久正确。
  *
+ * ⚠️ **这张表只含「已开启」的模型**：数据来自各适配器的 `listModels`，而它按用户在
+ * Jet Hub 里关掉的模型（黑名单）过滤。故表里的行数与模型选择器同源，不会出现
+ * 「关掉的模型还在这里占位」。
+ *
  * ⚠️ 返回 `null` 表示该模型**没有声明**档位（网关不下发该参数）。
  * 调用方必须跳过它，而不是渲染一行空表 —— 「不知道」与「一个都没有」是两件事。
  *
- * @param {{ id: string, reasoning?: { efforts?: Array<{ id: string, name: string, canonical?: string }>, default?: string, openai_efforts?: readonly string[] } } | null | undefined} model
- * @returns {{ id: string, declared: string, fill: string, lossy: boolean } | null}
+ * @param {{ id: string, name?: string, reasoning?: { efforts?: Array<{ id: string, name: string, canonical?: string }>, default?: string, openai_efforts?: readonly string[] } } | null | undefined} model
+ * @returns {{ id: string, name: string, declared: string, fill: string, lossy: boolean } | null}
  */
 export function gatewayEffortRow(model) {
   const reasoning = model?.reasoning;
@@ -199,6 +207,8 @@ export function gatewayEffortRow(model) {
   if (!Array.isArray(efforts) || efforts.length === 0) return null;
   return {
     id: model.id,
+    // 展示名留给搜索用（与模型清单的搜索共用 matchesModelQuery）。
+    name: typeof model.name === 'string' ? model.name : '',
     // 两个名字都给出来：`id` 是网关实际下发的 wire 值，`name` 是 DSH 界面上的叫法
     // （用户就是照它填错的，故两列都得能对上）。
     declared: efforts.map((effort) => `${effort.id}（${effort.name}）`).join(' · '),
@@ -213,7 +223,7 @@ export function gatewayEffortRow(model) {
  * 全部模型的档位对照行（跳过未声明档位的模型）。
  *
  * @param {Array<object> | null | undefined} models
- * @returns {Array<{ id: string, declared: string, fill: string, lossy: boolean }>}
+ * @returns {Array<{ id: string, name: string, declared: string, fill: string, lossy: boolean }>}
  */
 export function gatewayEffortRows(models) {
   if (!Array.isArray(models)) return [];
@@ -221,11 +231,48 @@ export function gatewayEffortRows(models) {
 }
 
 /**
- * 对照表上方的说明文案。
+ * 单行是否命中搜索词。
  *
- * ⚠️ 两件事必须说清，否则用户会以为「填错了就是坏的」或者反过来「随便填」：
- * 1. 填**规范名**（最后一列）才能精确对应；
- * 2. 填别的**也不会失败** —— 网关按强度就近翻译（这是本次新增的行为）。
+ * ⚠️ **比模型清单的搜索多匹配「档位」** —— 这正是这张表最常用的查法：
+ * 「哪些渠道有 `xhigh`？」「界面上的 Max 到底是哪个 id？」。
+ * 故判据是「模型 id / 展示名（复用 `matchesModelQuery`，与模型清单同一口径）
+ * **或**真实档位名 / 该填的规范名」。
+ *
+ * @param {{ id?: string, name?: string, declared?: string, fill?: string } | null | undefined} row
+ * @param {string} query
+ * @returns {boolean}
+ */
+export function matchesEffortQuery(row, query) {
+  if (matchesModelQuery(row, query)) return true;
+  const needle = typeof query === 'string' ? query.trim().toLowerCase() : '';
+  if (needle.length === 0) return true;
+  return `${row?.declared ?? ''} ${row?.fill ?? ''}`.toLowerCase().includes(needle);
+}
+
+/**
+ * 按搜索词过滤对照表。
+ *
+ * 无搜索词时**原样返回入参**（不复制、不改顺序）：与 `model-filter.js` 的
+ * 「未搜索」口径一致（空串不是「搜索空串」）。
+ *
+ * @param {Array<object> | null | undefined} rows
+ * @param {string} query
+ * @returns {Array<object>}
+ */
+export function filterEffortRows(rows, query) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!isFilterActive({ query })) return list;
+  return list.filter((row) => matchesEffortQuery(row, query));
+}
+
+/**
+ * 对照表的说明文案。
+ *
+ * ⚠️ 三件事必须说清，否则用户会以为「填错了就是坏的」「表里有我没开的模型」，
+ * 或者反过来「随便填」：
+ * 1. 这张表**只含已开启的模型**（关掉的不会出现）；
+ * 2. 填**规范名**（「客户端该填」那一列）才能精确对应；
+ * 3. 填别的**也不会失败** —— 网关按强度就近翻译（本次新增的行为）。
  *
  * @param {Array<object> | null | undefined} models
  * @returns {string}
@@ -233,13 +280,48 @@ export function gatewayEffortRows(models) {
 export function gatewayEffortsHint(models) {
   const rows = gatewayEffortRows(models);
   if (rows.length === 0) {
-    return '当前没有模型声明思考档位：网关不会下发该参数，一律按模型默认走。';
+    return '当前已开启的模型里没有声明思考档位的：网关不会下发该参数，一律按模型默认走。';
   }
   const lossy = rows.filter((row) => row.lossy).length;
-  return `共 ${rows.length} 个模型可选思考档位`
+  const enabled = Array.isArray(models) ? models.length : rows.length;
+  return `当前已开启的 ${enabled} 个模型里，有 ${rows.length} 个可选思考档位`
     + `${lossy > 0 ? `，其中 ${lossy} 个的档位名与 OpenAI 客户端不同（见下方标「需对照」的行）` : ''}。`
     + '「客户端该填」那一列可以直接抄进 CC Switch / Codex 的思考等级设置，与模型真实档位一一对应。'
-    + '填这 8 个以外的写法也不会报错：网关会按强度就近落到模型的某一档（会记日志）。';
+    + '填这 8 个以外的写法也不会报错：网关会按强度就近落到模型的某一档（会记日志）。'
+    + '在插件里关掉的模型不会出现在这张表里。';
+}
+
+/**
+ * 搜索结果为空时的提示。
+ *
+ * ⚠️ 空结果必须能自解释：要能区分「被搜索词筛没了」与「本来就没有声明档位的模型」，
+ * 否则用户会以为网关坏了、或者以为模型没登录。
+ *
+ * @param {string} [query]
+ * @returns {string}
+ */
+export function gatewayEffortsEmptyHint(query) {
+  const needle = typeof query === 'string' ? query.trim() : '';
+  if (needle.length === 0) return '当前没有模型声明思考档位。';
+  return `没有匹配「${needle}」的模型。搜索会匹配模型 id / 展示名，也会匹配档位名`
+    + '（真实 id 与 DSH 界面上的叫法都算，例如 xhigh / Max / Extra）。';
+}
+
+/**
+ * 对照表的纯文本形态（供「复制」按钮写进剪贴板）。
+ *
+ * 与面板渲染共用同一批行，故复制到的内容与屏幕上看到的必然一致。
+ *
+ * @param {Array<{ id: string, declared: string, fill: string }> | null | undefined} rows
+ * @returns {string}
+ */
+export function gatewayEffortsText(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  return list.map((row) => [
+    row.id,
+    `  真实档位：${row.declared}`,
+    `  客户端该填：${row.fill}`,
+  ].join('\n')).join('\n\n');
 }
 
 /**

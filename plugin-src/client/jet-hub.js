@@ -36,7 +36,10 @@ import {
   gatewayEndpoint,
   gatewayEffortRows,
   gatewayEffortsCurl,
+  gatewayEffortsEmptyHint,
   gatewayEffortsHint,
+  gatewayEffortsText,
+  filterEffortRows,
   gatewayModelsCurl,
   gatewayModelsHint,
   gatewayStatusLines,
@@ -3371,14 +3374,21 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
   const [revealed, setRevealed] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
   const [effortsOpen, setEffortsOpen] = React.useState(false);
+  const [effortsQuery, setEffortsQuery] = React.useState('');
+  const [effortsCopied, setEffortsCopied] = React.useState(false);
   const [idsCopied, setIdsCopied] = React.useState(false);
   const apiKey = status?.apiKey ?? null;
   const models = status?.models ?? [];
   const effortRows = gatewayEffortRows(models);
+  // ⚠️ 搜索在**渲染时**做，不改 effortRows 本身：清空搜索即恢复全量。
+  const visibleEffortRows = filterEffortRows(effortRows, effortsQuery);
+  const effortsFiltering = isFilterActive({ query: effortsQuery });
 
   // 每次重新打开/换密钥后复位：否则上一条「已复制」会挂在新密钥旁边误导用户。
   React.useEffect(() => { setCopied(false); setRevealed(false); }, [status?.apiKey?.value]);
   React.useEffect(() => { setIdsCopied(false); }, [models.length]);
+  // 换了搜索词还留着上一条「已复制 ✓」会误导（那条讲的是另一批行）。
+  React.useEffect(() => { setEffortsCopied(false); }, [models.length, effortsQuery]);
 
   React.useEffect(() => {
     const onKeyDown = (event) => { if (event.key === 'Escape') onClose(); };
@@ -3414,9 +3424,23 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
     if (!ok) setModelsOpen(true);
   };
 
+  /**
+   * 复制思考档位对照表。有搜索词时只复制**筛出来的那些行** ——
+   * 用户搜完再复制，拿到的正是屏幕上看到的内容（复制全量会让人以为搜索没生效）。
+   *
+   * 失败时展开对照表让用户手动选中：与密钥、模型 ID 两处同理，
+   * 绝不能「点了没反应」。
+   */
+  const handleCopyEfforts = async () => {
+    const text = gatewayEffortsText(visibleEffortRows);
+    if (!text) return;
+    const ok = await copyToClipboard(text);
+    setEffortsCopied(ok);
+    if (!ok) setEffortsOpen(true);
+  };
+
   const disabled = gatewaySwitchDisabled(status);
   const action = status?.enabled ? '关闭' : '打开';
-
   return React.createElement('div', {
     className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
@@ -3533,9 +3557,33 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
     // OpenAI 协议的客户端只有固定 8 档词汇，表达不出这些私有值。用户照 DSH 界面上
     // 的名字填进 CC Switch/Codex，撞 400 且两端都看不出原因。
     // 网关现在按强度自动翻译（填错不再失败），但**精确对应**只有一列答案 —— 就是这里。
+    //
+    // ⚠️ 数据只含**已开启**的模型（来自适配器 listModels 的黑名单过滤），
+    // 故与对话框里的模型选择器同源。
     React.createElement('p', { className: 'dim-jh-modalHint', style: { marginTop: '16px' } },
       React.createElement('strong', null, '思考档位对照表')),
     React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayEffortsHint(models)),
+    // 搜索：对照表本身要能按**档位名**查（「哪些渠道有 xhigh？」「界面上的 Max 是哪个 id？」
+    // —— 后者是用户真踩过的坑）。故判据比模型清单的搜索多匹配档位名，
+    // 但「空搜索词 = 未搜索」的约定与它共用同一份实现（model-filter.js）。
+    effortRows.length > 0
+      ? React.createElement('div', { className: 'dim-jh-modelFilterBar' },
+          React.createElement('input', {
+            type: 'search',
+            className: 'dim-jh-input dim-jh-modelSearch',
+            placeholder: '搜索模型 id、展示名或档位名（如 xhigh / Max / Extra）…',
+            value: effortsQuery,
+            'aria-label': '搜索思考档位',
+            onChange: (event) => setEffortsQuery(event.target.value),
+          }),
+          effortsFiltering
+            ? React.createElement('button', {
+                className: 'dim-jh-btn',
+                title: '清空搜索词，恢复完整对照表。',
+                onClick: () => setEffortsQuery(''),
+              }, '清空搜索')
+            : null)
+      : null,
     React.createElement('div', { className: 'dim-jh-modelPanelActions', style: { marginTop: '4px' } },
       React.createElement('button', {
         className: 'dim-jh-btn',
@@ -3543,20 +3591,38 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
         // 没有模型声明档位时禁用而非「点了没反应」：展开一张空表毫无意义。
         disabled: effortRows.length === 0,
         onClick: () => setEffortsOpen(open => !open),
-      }, effortsOpen ? '收起对照表' : `展开对照表（${effortRows.length} 行）`)),
+      }, effortsOpen ? '收起对照表' : `展开对照表（${effortRows.length} 行）`),
+      // 复制的是**当前筛出来的那些行**：用户搜完再复制，拿到的正是屏幕上看到的内容。
+      effortRows.length > 0
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            'data-kind': 'primary',
+            title: '把对照表（含真实档位与该填的值）复制到剪贴板。有搜索词时只复制筛出来的行。',
+            onClick: () => void handleCopyEfforts(),
+          }, effortsCopied ? '已复制 ✓' : `复制对照表（${visibleEffortRows.length} 行）`)
+        : null),
     effortsOpen
       ? React.createElement('div', { className: 'dim-jh-modelList', style: { marginTop: '6px' } },
-        effortRows.map(row => React.createElement('div', { key: row.id, className: 'dim-jh-modelRow' },
-          React.createElement('span', { className: 'dim-jh-modelInfo' },
-            React.createElement('code', { className: 'dim-jh-modelId' }, row.id),
-            React.createElement('span', { className: 'dim-jh-modelName' }, `真实档位：${row.declared}`),
-            React.createElement('span', { className: 'dim-jh-modelName' }, `客户端该填：${row.fill}`),
-            row.lossy
-              ? React.createElement('span', {
-                className: 'dim-jh-modelBadge',
-                title: '该模型的档位名与 OpenAI 客户端不同名：照 DSH 界面上的名字填，网关会按强度就近翻译。',
-              }, '需对照')
-              : null))))
+        visibleEffortRows.length === 0
+          // 空结果必须能自解释，否则用户会以为网关坏了（而不是被搜索词筛没了）。
+          ? React.createElement('div', { className: 'dim-jh-effortEmpty' }, gatewayEffortsEmptyHint(effortsQuery))
+          : visibleEffortRows.map(row => React.createElement('div', { key: row.id, className: 'dim-jh-effortRow' },
+            React.createElement('div', { className: 'dim-jh-effortHead' },
+              // ⚠️ 这里**不能**用 .dim-jh-modelId：它带 max-width 46% + ellipsis 截断，
+              // 而对照表的内容正是用户要抄的东西（真实反馈：字符过长被省略了）。
+              React.createElement('code', { className: 'dim-jh-effortModel' }, row.id),
+              row.lossy
+                ? React.createElement('span', {
+                  className: 'dim-jh-modelBadge',
+                  title: '该模型的档位名与 OpenAI 客户端不同名：照 DSH 界面上的名字填，网关会按强度就近翻译。',
+                }, '需对照')
+                : null),
+            React.createElement('div', { className: 'dim-jh-effortLine' },
+              React.createElement('span', { className: 'dim-jh-effortLabel' }, '真实档位：'),
+              row.declared),
+            React.createElement('div', { className: 'dim-jh-effortLine' },
+              React.createElement('span', { className: 'dim-jh-effortLabel' }, '客户端该填：'),
+              row.fill))))
       : null,
     React.createElement('p', { className: 'dim-jh-modalHint' },
       '同一份对照表也可以用命令行查看（同样需要 Bearer 头）：'),
