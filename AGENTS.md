@@ -7869,6 +7869,110 @@ jsonl，同一 `call_id` 两个不同 `id`）：
 放过，必须断言**内层块类型数组**（`['image']` / `['text','image']`）与
 **附件服务 `saveImage` 的调用次数**。
 
+## ⚠⚠️ 腾讯系内容级风控：system 里的客户端模板句会被**整轮拦死**（Issue IKJNA1）
+
+**用户报障**（Gitee issue IKJNA1，2026-10-04）：ZCode 经本机 OpenAI 网关调
+`workbuddy/deepseek-v4.1-flash` 稳定失败，ZCode 侧只显示
+`provider_code=INVALID_REQUEST reason=unknown`；网关侧原始报错是
+
+```text
+workbuddy: 请求被安全策略拦截，请稍后重试或联系支持。 Illegal API invocation from an unapproved channel
+```
+
+DSH 直连同一模型正常 ⇒ 差别只在**外部客户端往 system 里注了什么**。
+
+### 根因（本机 2026-10-05 实测复现，`www.workbuddy.ai` 与 `copilot.tencent.com` **两端点一致**）
+
+腾讯网关按**请求内容指纹**拦截，与账号、凭据、请求头、tools 全无关。最小充分
+触发串是 ZCode 内建的 gitStatus 模板句常量
+（`$Js="Main branch (you will usually use this for PRs)"`，拼在
+`Main branch … : <分支名>` 那一行，每个 git 仓库里的会话必然注入）。
+
+| 探针（`max_tokens=16`，被拦不耗额度） | 结果 |
+|---|---|
+| 中性 system | ✅ 200 |
+| `Main branch (you will usually use this for PRs): master` | ❌ 400 `code:11128` |
+| `Main branch: master`（只留标签） | ✅ 200 |
+| 换分支名（`dev`） | ❌ 400 ⇒ **分支值无关** |
+| 句中 / 段中被别的句子夹住 | ❌ 400 ⇒ **位置无关** |
+| **改写该句**为 `Main branch (PRs usually go here)` | ✅ 200 |
+| 同一句放进 **user** 消息 | ✅ 200 ⇒ **只拦 system** |
+| 同一句放进 **tool** 消息 | ✅ 200 ⇒ 同上 |
+| 指纹在**第二条** system（非 `messages[0]`） | ❌ 400 ⇒ **所有 system 都要改** |
+| 只差一个词（`normally` 替 `usually`） | ✅ 200 ⇒ **逐字符**匹配 |
+| 内层多一个空格 | ✅ 200 ⇒ 同上 |
+| **全小写 / 全大写** | ❌ 400 ⇒ **大小写不敏感** |
+
+⚠️ **本机客户端侧对不上号**：本地装的是 ZCode **3.14.3**，其 asar 里
+`Main branch` / `you will usually use this for PRs` **命中 0 次**（issue 报障用的是
+3.14.4）。取证脚本 `scripts/probe-zcode-gitstatus-fingerprint.mjs`（按字节流找，
+⚠️ **不能用 rg**：asar 是 297MB 单行二进制，rg 的行长上限会静默漏报 ——
+`-o ".{200}Current branch:.{300}"` 返回 0 而 `-c "Current branch"` 返回 1）。
+⇒ 「客户端一定注入这一句」这条来自 issue 报告者的 3.14.4，**服务端那一半已本机实测**。
+
+### 修法：网关出站方向的**表驱动**窄改写
+
+`src/openai-gateway/tencent-fingerprint.ts`，只对 `buddy` / `workbuddy`，
+只改 **system** 消息，三处接入点（**改一处漏两处 = 换一个端点又被拦**）：
+
+| 端点 | 接入点 |
+|---|---|
+| `/v1/chat/completions` | `messages.ts` 的 `convertMessage`（`role==='system'` 分支） |
+| `/v1/responses` | `responses.ts` 的 `toMessages`（input 里的 `system` / `developer`） |
+| `/v1/responses` | `responses.ts` 的 `toResponsesGenerateOptions`（**`instructions`** —— Responses 端唯一的 system 通道，客户端常把整份系统提示词放这里） |
+
+四条实现约束（每条都对应上表一行实测，改动时别把它们「简化」掉）：
+
+1. **只动 system**：`user` / `assistant` / `tool` 一概不碰（改它们没有收益，
+   却会篡改用户原话与工具输出）。
+2. **所有** system 消息都改，不只 `messages[0]`。
+3. **大小写不敏感的精确字面量**（`new RegExp(escapeRegExp(find), 'gi')`）：
+   `i` 是必需的（全小写 / 全大写都被拦），但**不能**泛化成正则/关键词黑名单
+   （只差一个词、多一个空格服务端都放行）。
+4. **不含指纹的文本逐字节不变**：腾讯侧按前缀缓存，无谓地重建字符串会让每轮
+   都算新前缀、白吃缓存命中 ⇒ 实现里有一次 `toLowerCase().includes()` 预检。
+
+⚠️ **表驱动而不是写死一处**：屏蔽名单服务端掌握、可能随时更新，任何客户端将来
+都可能撞上新指纹。新增一条 = 表里加一行 + 一条用例。
+
+### ⚠️⚠️ 千万不要把 `11128` 加进 `isContentRejection`
+
+`buddy-adapter.ts` 的 `isContentRejection`（11140 / `request illegal` /
+`安全审核|safety review`）**维持现状是正确的**。11128 是**内容级**拦截 ——
+同一账号换掉那一句就 200。认成账号级会走
+`markPolicyBlockedAccount` → **30 分钟账号冷却**（`policyBlockResetAtMs`），
+而池里每个账号都会在同一句上被拦 ⇒ 把「一句话被拦」放大成「整个账号池半小时
+不可用」。
+
+⚠️ **实测的 HTTP 400 形态根本走不到那个判据**（400 在适配器里是「非法请求」早退），
+所以这层保护真正生效的地方是**流内**那条通道（HTTP 200 + 无 `choices` 的错误帧，
+`buddy-adapter.ts:1855`）。回归用例按此设计：`buddy-adapter.spec.ts` 的
+「内容级风控（11128）」段，**流内那条才会红**（已做反向验证：把 `11128` 加进
+`isContentRejection` → 该用例红；400 那条不红，别拿它当判据）。
+
+### 端到端实发验证（已通过）
+
+`scripts/verify-workbuddy-gitstatus-e2e.ts`（`npx tsx`）走**插件真实链路**：
+ZCode 形状的 OpenAI 请求体 → `toGenerateOptions`（含改写）→ **真实** `BuddyAdapter`
+（真实 fetch / 凭据 / 产品配置）→ 腾讯线上。对照组是同一份请求体**绕过**网关转换。
+
+```text
+provider = workbuddy   model = deepseek-v4.1-flash
+① 修复前（绕过网关转换，system 原样）
+   ❌ INVALID_REQUEST  Illegal API invocation from an unapproved channel
+② 修复后（走网关转换）
+   ✅ 正文："1+1 等于 2。"  [block-start,reasoning-delta,text-delta,usage,block-end,finish]
+```
+
+`--cn` 换 CodeBuddy 中国版同样通过（`① ❌ / ② ✅`）。
+
+只读探针 `scripts/probe-workbuddy-gitstatus-fingerprint.mjs`（绕开适配器、逐账号发
+同一条对照请求；`--cn` 切 CodeBuddy）可随时重跑复核上表。
+
+回归用例在 `tests/unit/openai-gateway-tencent-fingerprint.spec.ts`（17 条）。
+⚠️ 已做**反向验证**：正则去掉 `i` → 大小写用例红；`instructions` 那处改回原样 →
+Responses 端用例红。
+
 ## ⚠️ 思考档位有**两套词汇表**：网关必须翻译，客户端表达不出私有 id（真实报障，2026-10-03）
 
 **用户报障的形态**：在 CC Switch（给 Codex 生成模型目录的那一层）里按 DSH 界面显示的
