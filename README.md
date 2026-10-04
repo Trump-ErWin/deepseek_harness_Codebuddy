@@ -335,6 +335,38 @@ cc-switch / sub2api / Codex 自身（PR #29602）里也是这么做的。
 `GET /v1/responses/{id}` **不提供**：网关不存储响应，一律 404。会话状态由客户端自己维护
 （把完整 `input` 一起发过来）。
 
+#### 用量口径：`input_tokens` **含**缓存命中（真实报障修复，2026-10-04）
+
+**现象**：接入 Codex 后，同一个会话用 `raccoon` 时上下文进度条「搞半天只占 5%」，
+换成 `trae` 就「正常显示占了 300k 多」。
+
+**根因**是两种「缓存算不算输入」的口径冲突：DSH 内部 `inputTokens` **只含未命中缓存**
+的部分（命中单列 `cacheReadTokens`），而 OpenAI 官方的 `input_tokens` / `prompt_tokens`
+**含缓存**。旧实现把 DSH 口径原样发出，Codex 再按官方口径算
+`input_tokens - cached_tokens`（`saturating_sub`）⇒ 夹到 0 ⇒ 总数只剩 output。
+
+| 时刻（真实会话） | 真实上下文 | 修复前显示 | 修复后 |
+| --- | --- | --- | --- |
+| raccoon 会话中 | 56,225 | **5.56%** | 5.99% |
+| raccoon 会话末 | 208,258 | **0.15%** | 21.99% |
+| trae 会话末 | 326,134 | 34.39%（本就正确） | 34.39% |
+
+⚠️ **trae 之所以「正常」不是它被修好了，而是它不报缓存** —— 它的适配器从不算
+`cacheReadTokens`，旧公式恰好等于完整上下文。**受影响的是所有开前缀缓存的 provider**
+（raccoon / buddy / workbuddy / lobsterai / qoder / qodercn / cline / loomy /
+opencode / minimax / zcode / gemini / codearts）。
+
+⚠️ **这不只是显示问题**：Codex 判断该不该自动压缩用的就是同一个数，
+计量恒定在 0.1%~5% ⇒ `model_auto_compact_token_limit` **永远不会触发**，
+真实上下文会一路涨到撞上模型硬限直接报错。
+
+两个端点现在都发**官方口径**（`input_tokens` 含缓存、命中量在
+`input_tokens_details.cached_tokens` 里单列且**仍是它的子集**），转换只有一份实现
+（`src/openai-gateway/usage.ts`），避免再次出现「只修了一个端点」。
+Chat 端点同时补发官方的 `prompt_tokens_details.cached_tokens` /
+`completion_tokens_details.reasoning_tokens`，并保留 `prompt_cache_hit_tokens`
+等私有字段供本仓库既有消费者使用。
+
 第一期支持流式/非流式文本、reasoning、工具调用、工具结果、用量和请求取消。图片暂不静默丢弃：当前网关无法把外部 OpenAI 图片引用安全转换为 DSH 附件时，会明确返回不支持错误。
 
 
