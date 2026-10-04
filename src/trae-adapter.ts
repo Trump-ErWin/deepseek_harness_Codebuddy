@@ -452,13 +452,33 @@ function serializeTraeMessages(
     )
     const text = contentToText(message.content)
     // 图片：仅当本请求带图（imageUrls 非 undefined）时升级为多模态 parts。
-    const parts = imageUrls === undefined ? undefined : userContentParts(content, imageUrls)
-    if (parts !== undefined) {
-      // 有图：正文与图片合并为一条多模态 user 消息（parts 里已含文本块）。
-      flushToolImages()
-      wire.push({ role: 'user', content: parts })
-    } else if (text.length > 0 || toolResults.length === 0) {
-      wire.push({ role: 'user', content: text })
+    //
+    // ⚠️ **只收本消息自己的图片**（`outerContent` 先剔掉工具结果块）：工具结果内嵌的
+    // 图片由下面 `pendingToolImages` 挂到 `role:'tool'` **之后**；在这里一并收进来会把
+    // 它们排到 tool 消息**之前**（成因见下 `deferred` 的注释与 4027 回归用例）。
+    const outerContent = content.filter(
+      (block) => !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'),
+    )
+    const parts = imageUrls === undefined ? undefined : userContentParts(outerContent, imageUrls)
+    // ⚠️⚠️ **带工具结果时这条 user 消息必须延后到 `role:'tool'` 之后**：上游要求
+    // tool 消息是「紧跟其 assistant `tool_calls` 的应答」，两者之间插任何消息
+    // （哪怕只是本消息的正文或图片）都会被拒。
+    //
+    // **真实缺陷**（2026-10-04 用户报障）：`read_image`（工具结果内嵌图片）之后，
+    // 整条会话在 trae 下**永久无法对话** —— 上游恒定回
+    // `code=4027 Messages with role 'tool' must be a response to a preceding message
+    // with 'tool_calls'`；坏报文已落进会话历史，每次请求原样重放，5 次重试与
+    // 「继续」全部无效，只有换 provider 才能恢复。
+    const deferred = toolResults.length > 0
+    if (!deferred) {
+      // 无工具结果：维持原语义立即发出（有图发多模态 parts，否则发纯文本）。
+      if (parts !== undefined) {
+        // 有图：正文与图片合并为一条多模态 user 消息（parts 里已含文本块）。
+        flushToolImages()
+        wire.push({ role: 'user', content: parts })
+      } else {
+        wire.push({ role: 'user', content: text })
+      }
     }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 tool_call 同样会被上游拒绝。
@@ -476,6 +496,11 @@ function serializeTraeMessages(
         tool_call_id: String(result.toolCallId),
         content: contentToText(result.content) || (innerParts !== undefined ? TOOL_RESULT_IMAGE_TEXT : '(no output)'),
       })
+    }
+    // 延后的正文/图片：排在 `role:'tool'` 之后（成因见上方 `deferred` 的注释）。
+    if (deferred && (parts !== undefined || text.length > 0)) {
+      flushToolImages()
+      wire.push({ role: 'user', content: parts ?? text })
     }
     flushToolImages()
   }
