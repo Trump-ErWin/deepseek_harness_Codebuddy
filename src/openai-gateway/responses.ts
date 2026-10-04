@@ -831,11 +831,23 @@ function statusOf(state: Accumulated): 'completed' | 'incomplete' {
   return state.finishReason === 'length' ? 'incomplete' : 'completed'
 }
 
+/**
+ * 组装最终的 `output[]`。
+ *
+ * ⚠️ **必须按 `outputIndex` 排序**（2026-10-04 修）：`output_index` 的语义就是
+ * 「本项在 `output` 数组里的下标」。而项落进 `items` 的顺序取决于**收尾顺序**
+ * （buddy 等适配器先发工具块的 `block-end`、后发正文块），与**开启顺序**不一致
+ * —— 于是正文可能排在自己的工具调用之后，客户端把助手这一轮的历史读成「先调工具、
+ * 后说话」，与模型真实产出相反。
+ */
 function outputOf(
   items: readonly ResponsesItemState[],
   nsMap?: Map<string, { namespace: string; name: string }>,
 ): Record<string, unknown>[] {
-  const output = items.filter(hasContent).map(item => outputItemJson(item, nsMap))
+  const output = [...items]
+    .sort((a, b) => a.outputIndex - b.outputIndex)
+    .filter(hasContent)
+    .map(item => outputItemJson(item, nsMap))
   // 空回复：保留一个空 message 项 —— 客户端不认空的 `output[]`。
   if (output.length === 0) output.push(outputItemJson(newItem(-1, 0, 'message')))
   return output
@@ -894,28 +906,35 @@ export async function collectResponsesResult(
   const state: Accumulated = {}
   const items: ResponsesItemState[] = []
   const open = new Map<number, ResponsesItemState>()
+  /**
+   * 已收尾的块索引：**一个块只允许收尾一次**。
+   *
+   * ⚠️ 少了这道闸门，任何「先被收尾、随后又来一个 `block-end`」的块都会再新建一个
+   * 同索引项 —— 同一次工具调用于是发出**两个** `function_call`、共用同一个
+   * `call_id`（见 {@link toResponsesSse} 里对用户报障的完整说明）。
+   */
+  const closed = new Set<number>()
   // 摊平名 → `{namespace, name}`：响应侧要把 `function_call` 还原成客户端认的形态。
   const nsMap = responsesNamespaceToolMap(request)
   let outputIndex = 0
   try {
     for await (const chunk of chunks) {
-      if (chunk.type === 'block-start') {
-        // 块切换 ⇒ 先收尾，保证 output 的顺序与真实产出顺序一致。
-        for (const [index, item] of open) { items.push(item); open.delete(index) }
-        continue
-      }
+      // ⚠️ `block-start` 不做事：块之间**可以并行开启**，各自由自己的
+      // `block-end` 收尾（理由与后果见 {@link toResponsesSse} 里的同款注释）。
+      if (chunk.type === 'block-start') continue
       if (chunk.type === 'block-end') {
-        let item = open.get(chunk.index)
-        if (item === undefined) {
-          item = newItem(chunk.index, outputIndex++, kindOfBlock(chunk.block.type))
-        } else {
-          open.delete(chunk.index)
-        }
+        // 一个块只允许收尾一次（与 `BlockAssembler` 的「first close wins」同款）。
+        if (closed.has(chunk.index)) continue
+        const item = open.get(chunk.index) ?? newItem(chunk.index, outputIndex++, kindOfBlock(chunk.block.type))
+        open.delete(chunk.index)
         applyItemChunk(item, chunk)
+        closed.add(chunk.index)
         items.push(item)
         continue
       }
       if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta' || chunk.type === 'tool-call-delta') {
+        // 已收尾的块再来 delta 属于畸形流：忽略，绝不新建项（否则又是重复项）。
+        if (closed.has(chunk.index)) continue
         let item = open.get(chunk.index)
         if (item === undefined) {
           item = newItem(chunk.index, outputIndex++, chunk.type === 'text-delta' ? 'message' : chunk.type === 'reasoning-delta' ? 'reasoning' : 'function_call')
@@ -971,6 +990,8 @@ export async function* toResponsesSse(
   const state: Accumulated = {}
   const items: ResponsesItemState[] = []
   const open = new Map<number, ResponsesItemState>()
+  /** 已收尾的块索引：**一个块只允许收尾一次**（理由见下面的 `block-start` 分支）。 */
+  const closed = new Set<number>()
   let outputIndex = 0
   let sequence = 0
   // 摊平名 → `{namespace, name}`：`function_call` 事件必须还原成客户端认的形态
@@ -1076,6 +1097,7 @@ export async function* toResponsesSse(
     // 只发 added 会留下一个永远「进行中」的空项。空内容的项由 `outputOf`
     // 挡在 `response.completed` 之外，不必在这里另做一套判据。
     events.push(emit('response.output_item.done', { output_index: item.outputIndex, item: outputItemJson(item, nsMap) }))
+    closed.add(item.index)
     items.push(item)
     return events
   }
@@ -1094,13 +1116,29 @@ export async function* toResponsesSse(
 
   try {
     for await (const chunk of chunks) {
-      if (chunk.type === 'block-start') {
-        // 新块开始 ⇒ 先收尾已开着的项：协议要求项按 `output_index` 顺序闭合，
-        // 而新块的 delta 必然排在旧块之后（各适配器都是顺序产出块）。
-        for (const event of closeAll()) yield event
-        continue
-      }
+      // ⚠️⚠️ **这里刻意什么都不做**（2026-10-04 修，真实缺陷）。
+      //
+      // 早先在每个 `block-start` 上 `closeAll()`，理由是「协议要求项按
+      // `output_index` 顺序闭合」。那个前提是错的，代价还极大：
+      // **并行工具调用会同时开着多个块** —— 上游依次发
+      // `block-start[0] tool-call` / `delta[0]` / `block-start[1] tool-call` /
+      // `delta[1]`，而全部 `block-end` 要等流末尾才到（各适配器都在收尾循环里
+      // 统一补发，见 `buddy-adapter.ts` 的 `toolOrder` 段）。于是 `block-start[1]`
+      // 到达时 [0] **在参数只到一半时就被收尾**并从 `open` 删除；等真正的
+      // `block-end[0]` 到达，下面的 `block-end` 分支找不到它，就**新建了一个
+      // 同索引项** ⇒ 同一次工具调用发出**两个** `function_call`、共用同一个
+      // `call_id`。Codex 对此判
+      // `tool calls and tool results do not match, please start a new conversation and retry`
+      // 并**终止整轮对话**（用户报障 2026-09-04，会话证据见 AGENTS.md「网关弹窗」相邻章节）。
+      //
+      // 正确语义与 DSH 的权威实现 `BlockAssembler` 一致：**块之间可以并行开启**，
+      // 各自由自己的 `block-end` 收尾；到流末尾仍未收尾的才由 `closeAll()` 兜底。
+      // 这与「一个块只能收尾一次」（下面的 `closed` 闸门）是一对，缺一条就会重复。
+      if (chunk.type === 'block-start') continue
       if (chunk.type === 'block-end') {
+        // 一个块只允许收尾一次：已经收尾过的索引直接忽略
+        // （与 `BlockAssembler` 的「first close wins」同款）。
+        if (closed.has(chunk.index)) continue
         const existing = open.get(chunk.index)
         if (existing !== undefined) {
           applyItemChunk(existing, chunk)
@@ -1120,6 +1158,8 @@ export async function* toResponsesSse(
         continue
       }
       if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') {
+        // 已收尾的块再来 delta 属于畸形流：忽略，绝不新建项（否则又是重复项）。
+        if (closed.has(chunk.index)) continue
         if (!open.has(chunk.index)) {
           for (const event of openItem(chunk.index, chunk.type === 'text-delta' ? 'message' : 'reasoning')) yield event
         }
@@ -1135,6 +1175,8 @@ export async function* toResponsesSse(
         continue
       }
       if (chunk.type === 'tool-call-delta') {
+        // 同上：已收尾的块不得因散帧再开一个新项。
+        if (closed.has(chunk.index)) continue
         if (!open.has(chunk.index)) {
           // `call_id` / `name` 只在这一帧里出现，故 function_call 项**延迟到这时**
           // 才打开 —— `output_item.added` 必须带上它们，否则客户端配不上 call_id。

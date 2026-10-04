@@ -481,6 +481,52 @@ describe('Responses API 输出（非流式）', () => {
     expect(output[0].summary).toEqual([{ type: 'summary_text', text: '想一想' }])
   })
 
+  // 与上面那条流式用例同因同修：非流式路径同样有「提前收尾 ⇒ 新建重复项」的缺陷。
+  it('★ 并行工具调用（非流式）：不得出现重复 call_id，且参数取 block-end 权威值', async () => {
+    const result = await collectResponsesResult(chunks([
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 0, id: 'call_A' as never, name: 'read', argumentsDelta: '{"p"' },
+      { type: 'block-start', index: 1, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 1, id: 'call_B' as never, name: 'read', argumentsDelta: '{"p"' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_A' as never, name: 'read', arguments: '{"path":"a"}' } },
+      { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'call_B' as never, name: 'read', arguments: '{"path":"b"}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]), 'resp_par', 'qoder/qfmodel', request)
+    const calls = (result.output as Array<Record<string, any>>).filter(item => item.type === 'function_call')
+    expect(calls.map(call => call.call_id)).toEqual(['call_A', 'call_B'])
+    expect(calls.map(call => call.arguments)).toEqual(['{"path":"a"}', '{"path":"b"}'])
+  })
+
+  it('畸形流（非流式）：重复的 block-end 不得变成两个项', async () => {
+    const result = await collectResponsesResult(chunks([
+      { type: 'tool-call-delta', index: 0, id: 'call-1' as never, name: 'read', argumentsDelta: '{"p"' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-1' as never, name: 'read', arguments: '{"path":"a"}' } },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-1' as never, name: 'read', arguments: '{"path":"CLOBBERED"}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]), 'resp_dup', 'qoder/qfmodel', request)
+    const calls = (result.output as Array<Record<string, any>>).filter(item => item.type === 'function_call')
+    expect(calls).toHaveLength(1)
+    expect(calls[0].arguments).toBe('{"path":"a"}')
+  })
+
+  it('畸形流（非流式）：block-end 之后的 delta 不得再开一个新项', async () => {
+    const result = await collectResponsesResult(chunks([
+      { type: 'text-delta', index: 0, text: '你好' },
+      { type: 'block-end', index: 0, block: { type: 'text', text: '你好' } },
+      { type: 'text-delta', index: 0, text: '（散帧）' },
+      { type: 'tool-call-delta', index: 1, id: 'call-1' as never, name: 'read', argumentsDelta: '{}' },
+      { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'call-1' as never, name: 'read', arguments: '{}' } },
+      { type: 'tool-call-delta', index: 1, id: 'call-1' as never, name: 'read', argumentsDelta: 'garbage' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]), 'resp_stray', 'qoder/qfmodel', request)
+    const output = result.output as Array<Record<string, any>>
+    expect(output).toHaveLength(2)
+    expect(output.filter(item => item.type === 'message')).toHaveLength(1)
+    expect(output.filter(item => item.type === 'function_call')).toHaveLength(1)
+    expect(output.find(item => item.type === 'message').content[0].text).toBe('你好')
+    expect(output.find(item => item.type === 'function_call').arguments).toBe('{}')
+  })
+
   it('上游「模型不存在」翻成 404 + 纠错建议（不是会被重试的 502）', async () => {
     await expect(collectResponsesResult(chunks([
       { type: 'finish', reason: { kind: 'error', failure: { code: 'INVALID_REQUEST', message: 'codearts: The model is not registered' } } },
@@ -550,10 +596,16 @@ describe('Responses API 输出（流式）', () => {
     const names = events.map(event => event.event)
     expect(names).toContain('response.reasoning_summary_text.delta')
     expect(names).toContain('response.output_text.delta')
-    // `block-start` 先收尾前一项：reasoning 的 done 必须排在正文的 added 之前。
-    const reasoningDone = names.indexOf('response.output_item.done')
-    const textAdded = names.lastIndexOf('response.output_item.added')
-    expect(reasoningDone).toBeLessThan(textAdded)
+    // ⚠️ 这里**不再**断言「reasoning 的 done 排在正文的 added 之前」（2026-10-04 改）。
+    // 那条断言锁的是旧实现「一遇到 block-start 就把还开着的块收尾」的行为，而那个行为
+    // 正是并行工具调用发出重复 `function_call` 的成因（见下方 `★ 并行工具调用` 两条）。
+    // 块现在可以并行开启、各自等自己的 `block-end` 收尾；本用例的 reasoning 没有
+    // `block-end`，故它到流末尾才收尾。断言改为锁**意图**：两个块各成一个项。
+    const doneIndexes = events
+      .filter(event => event.event === 'response.output_item.done')
+      .map(event => event.data.output_index)
+    expect([...doneIndexes].sort((a, b) => a - b)).toEqual([0, 1])
+    expect(events.at(-1)!.data.response.output.map((item: any) => item.type)).toEqual(['reasoning', 'message'])
     expect(events.find(event => event.event === 'response.reasoning_summary_text.delta')!.data.output_index).toBe(0)
     expect(events.find(event => event.event === 'response.output_text.delta')!.data.output_index).toBe(1)
   })
@@ -574,6 +626,107 @@ describe('Responses API 输出（流式）', () => {
     const completed = events.at(-1)!.data.response
     expect(completed.status).toBe('completed')
     expect(completed.output[0]).toMatchObject({ type: 'function_call', call_id: 'call-9', name: 'read' })
+  })
+
+  // ⚠️⚠️ **真实缺陷回归**（2026-10-04，用户报障「开启网关在 Codex 里用 CodeBuddy」）：
+  // Codex 报 `tool calls and tool results do not match, please start a new conversation and retry`
+  // 并**终止整轮对话**。根因是网关在每个 `block-start` 上把**还开着的**块提前收尾，
+  // 于是同一个块真正的 `block-end` 到达时找不到已收尾的项、**又新建了一个** ——
+  // 同一次工具调用发出两个 `function_call`、共用同一个 `call_id`。
+  //
+  // 这不是边角：各适配器的 `block-end` **全部集中在流末尾补发**
+  // （见 `buddy-adapter.ts` 的 `toolOrder` 段：先发全部工具块，再发正文/思考块），
+  // 所以**只要有两个并行工具调用就必然触发**。
+  it('★ 并行工具调用：每个调用只能有一个 function_call 项（重复 call_id 会让 Codex 终止整轮对话）', async () => {
+    const events = await readSse(chunks([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: '我先看一下两个目录。' },
+      { type: 'block-start', index: 1, blockType: 'tool-call' },
+      // ⚠️ 参数故意只给一半：真正的完整参数在下面的 `block-end` 里（权威覆盖）。
+      { type: 'tool-call-delta', index: 1, id: 'call_A' as never, name: 'exec_command', argumentsDelta: '{"cmd"' },
+      { type: 'block-start', index: 2, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 2, id: 'call_B' as never, name: 'exec_command', argumentsDelta: '{"cmd"' },
+      // 工具块的 block-end 先到（与真实适配器的收尾顺序一致），正文块最后。
+      { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'call_A' as never, name: 'exec_command', arguments: '{"cmd":"a"}' } },
+      { type: 'block-end', index: 2, block: { type: 'tool-call', id: 'call_B' as never, name: 'exec_command', arguments: '{"cmd":"b"}' } },
+      { type: 'block-end', index: 0, block: { type: 'text', text: '我先看一下两个目录。' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]), request)
+
+    const doneItems = events
+      .filter(event => event.event === 'response.output_item.done')
+      .map(event => event.data.item)
+    const calls = doneItems.filter(item => item.type === 'function_call')
+    // 两个调用、两个不同的 call_id —— 重复的那个正是 Codex 判定「对不上」的原因。
+    expect(calls.map(call => call.call_id)).toEqual(['call_A', 'call_B'])
+    expect(new Set(calls.map(call => call.call_id)).size).toBe(calls.length)
+    // 正文块也只成一个项（旧实现同样会把它复制一份）。
+    expect(doneItems.filter(item => item.type === 'message')).toHaveLength(1)
+
+    const completed = events.at(-1)!.data.response
+    // `output` 必须按模型真实产出顺序（正文在前、工具在后），而不是按收尾顺序。
+    expect(completed.output.map((item: any) => item.type)).toEqual(['message', 'function_call', 'function_call'])
+    expect(completed.output.filter((item: any) => item.type === 'function_call').map((item: any) => item.call_id))
+      .toEqual(['call_A', 'call_B'])
+    // ⚠️ 参数取 `block-end` 的权威值：提前收尾会丢掉它、退回只到一半的 delta。
+    expect(completed.output.map((item: any) => item.arguments).filter(Boolean)).toEqual(['{"cmd":"a"}', '{"cmd":"b"}'])
+  })
+
+  // ⚠️ 与上面那条同属「同一索引被收尾两次」的另一条通道：重复的 `block-end`。
+  // 少了 `closed` 闸门时，第二次 `block-end` 找不到已收尾的项、**又新建一个**，
+  // 于是同一次调用出现两个 `function_call`（参数还可能被第二帧覆盖成残缺值）。
+  it('畸形流：重复的 block-end 不得再开一个新项', async () => {
+    const events = await readSse(chunks([
+      { type: 'tool-call-delta', index: 0, id: 'call-1' as never, name: 'read', argumentsDelta: '{"p"' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-1' as never, name: 'read', arguments: '{"path":"a"}' } },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-1' as never, name: 'read', arguments: '{"path":"CLOBBERED"}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]), request)
+    const doneItems = events
+      .filter(event => event.event === 'response.output_item.done')
+      .map(event => event.data.item)
+    expect(doneItems).toHaveLength(1)
+    // `BlockAssembler` 的契约是「first close wins」：第二次收尾不得改写参数。
+    expect(doneItems[0].arguments).toBe('{"path":"a"}')
+    const completed = events.at(-1)!.data.response
+    expect(completed.output.filter((item: any) => item.type === 'function_call')).toHaveLength(1)
+  })
+
+  it('畸形流：block-end 之后又来的 delta 不得再开一个新项', async () => {
+    const events = await readSse(chunks([
+      { type: 'tool-call-delta', index: 0, id: 'call-1' as never, name: 'read', argumentsDelta: '{}' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-1' as never, name: 'read', arguments: '{}' } },
+      { type: 'tool-call-delta', index: 0, id: 'call-1' as never, name: 'read', argumentsDelta: 'garbage' },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]), request)
+    expect(events.filter(event => event.event === 'response.output_item.done')).toHaveLength(1)
+  })
+
+  // ⚠️ 与上一条同因：正文块已收尾后又来 `text-delta`。少了 delta 分支的 `closed`
+  // 闸门，它会再开一个新正文项，客户端看到的是**同一段话出现两次**。
+  it('畸形流：block-end 之后的正文 delta 不得再开一个新项', async () => {
+    const events = await readSse(chunks([
+      { type: 'text-delta', index: 0, text: '你好' },
+      { type: 'block-end', index: 0, block: { type: 'text', text: '你好' } },
+      { type: 'text-delta', index: 0, text: '（散帧）' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]), request)
+    expect(events.filter(event => event.event === 'response.output_item.done')).toHaveLength(1)
+    const completed = events.at(-1)!.data.response
+    expect(completed.output).toHaveLength(1)
+    expect(completed.output[0].content[0].text).toBe('你好')
+  })
+
+  it('畸形流：重复的 block-end（正文）同样只成一个项', async () => {
+    const events = await readSse(chunks([
+      { type: 'text-delta', index: 0, text: '你好' },
+      { type: 'block-end', index: 0, block: { type: 'text', text: '你好' } },
+      { type: 'block-end', index: 0, block: { type: 'text', text: 'CLOBBERED' } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]), request)
+    const completed = events.at(-1)!.data.response
+    expect(completed.output).toHaveLength(1)
+    expect(completed.output[0].content[0].text).toBe('你好')
   })
 
   it('★ 流式：namespace 工具的三个 function_call 事件都要还原（added / arguments.done / done）', async () => {
