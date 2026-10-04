@@ -110,9 +110,31 @@ export async function collectGatewayModelIds(
   llm: GatewayModelSource,
   onError?: (provider: string, error: unknown) => void,
   effortViews?: ReadonlyMap<string, GatewayEffortView>,
-): Promise<Array<{ id: string; name: string; input: readonly string[]; reasoning?: GatewayEffortView }>> {
+): Promise<GatewayModelIdEntry[]> {
   const groups = await collectGatewayModels(llm, onError)
   return toGatewayModelIds(groups, effortViews)
+}
+
+/**
+ * 设置页面板渲染一行的**权威字段**。
+ *
+ * ⚠️ `provider` / `model` 是**采集侧给的拆分**，不是前端从 `id` 切出来的。
+ * 模型名里允许带斜杠（实测 Cline 的 `cline/anthropic/claude-sonnet-5.5`），
+ * 按首个 `/` 反推虽然与网关自己的路由口径同源（`messages.ts` 的
+ * `parseModelRoute` 同样用 `indexOf('/')`），但一旦某家 provider 的模型名
+ * 以 `/` 开头、或 provider key 本身含 `/`，反推就会错位。
+ * 分组是「哪家有哪些模型」这个**用户语义**，理应由采集侧决定而不是猜。
+ */
+export interface GatewayModelIdEntry {
+  /** 可直接填进 agent 配置的完整 ID（`provider/模型名`）。 */
+  id: string
+  /** 该条目所属的 provider key（**权威值**，非从 `id` 切出）。 */
+  provider: string
+  /** provider 内部的模型名（不含 `<provider>/` 前缀）。 */
+  model: string
+  name: string
+  input: readonly string[]
+  reasoning?: GatewayEffortView
 }
 
 /**
@@ -125,12 +147,16 @@ export async function collectGatewayModelIds(
 export function toGatewayModelIds(
   groups: readonly GatewayProviderModels[],
   effortViews?: ReadonlyMap<string, GatewayEffortView>,
-): Array<{ id: string; name: string; input: readonly string[]; reasoning?: GatewayEffortView }> {
+): GatewayModelIdEntry[] {
   return groups.flatMap(({ provider, models }) => models.map((model) => {
     const id = toOpenAiModelId(provider, model.id)
     const reasoning = effortViews?.get(id)
     return {
       id,
+      // ⚠️ 这两个字段**必须由这里给出**（见 `GatewayModelIdEntry` 的注释）：
+      // 前端没有别的地方能拿到权威拆分。
+      provider,
+      model: model.id,
       name: model.name,
       input: Array.isArray(model.inputModalities) && model.inputModalities.length > 0
         ? [...model.inputModalities]

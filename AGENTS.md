@@ -7600,8 +7600,11 @@ GET  /v1/models             ← 两套协议共用同一份目录
 - **不发 `data: [DONE]`**：那是 Chat Completions 的收尾约定，Responses 以
   `response.completed` / `response.failed` 结束。
 - 面板（`openai-gateway-panel.js` 的 `gatewayStatusLines`）在**运行中**时会说明
-  「同一地址同时提供两种协议」——⚠️ 措辞必须是「同时提供」，**不能写「可切换」**
-  （用例会红）。
+  「协议支持：OpenAI Chat Completions 与 OpenAI Responses API」（⚠️ 措辞不得写成
+  「可切换」，两个端点同时都在、没有互斥开关，用例会红）。该段文案在 2026-10-04
+  按用户要求**精简过**（原三句「网关正在运行 / 把外部客户端的… / 地址：…」合并为
+  三行短句：推荐 CC Switch、协议支持、API 请求地址）—— 精简**不减信息**，
+  「两种协议都点名」与「地址带真实端口」两条仍有独立用例锁着。
 - 回归用例：`tests/unit/openai-gateway-responses.spec.ts`（转换 + 流式/非流式事件序列）
   与 `tests/unit/openai-gateway-server.spec.ts` 的「Responses API 出口」段（HTTP 层）。
 
@@ -7676,6 +7679,50 @@ max ultra`）。CC Switch 把那 8 个（连英文描述）**硬编码在自己�
 `openai-gateway-panel.spec.ts` 的「排版（不截断）」段锁死了这两点（样式不得截断 +
 渲染处不得用 `dim-jh-modelName`）。
 
+### ⚠️ 两处清单都按**供应商折成卡片**（用户要求，2026-10-03）
+
+**用户报障**：「`deepseek-account/deepseek-flash` 和 `deepseek-account/deepseek-v4-pro`
+这是同一家供应商 `deepseek-account` 的，却分为了两个卡片」（当时是**一个模型一行**的平铺）；
+同一条反馈还要求「模型 ID 这里显示各模型名也很乱，希望能像对照表一样改进下」。
+⇒ **模型清单与思考档位对照表都改成一个供应商一张卡片**，卡内子项是它的模型。
+
+判据全在纯函数里（单测环境是 `node`、**react 不在依赖内**，组件渲染不了）：
+
+| 函数 | 作用 |
+|---|---|
+| `groupGatewayEntries(entries, countFold)` | 按 provider 折卡片（模型清单与对照表**共用**，口径不可能漂移） |
+| `groupGatewayModels(models)` | 上面那个的模型清单版本，`counts.fold` = 可发图片条数 |
+| `gatewayProviderOf(entry)` | 取供应商 key：**优先宿主的权威 `provider` 字段**，缺失才按首个 `/` 兜底 |
+| `gatewayModelKeyOf(entry)` | 卡内**短名字**（去掉 `<provider>/` 前缀）；拿不到就退回完整 id |
+| `gatewayCardExpanded(card, {toggled, searching})` | 折叠规则：点过 > 搜索中展开 > 超阈值折叠 |
+| `gatewayCardLabel(provider, labelOf)` | 卡片标题（走 `providerLabel`，查不到退回 key） |
+
+⚠️⚠️ **`provider` / `model` 必须由宿主侧给出，前端不得自己切 `id`**：模型名里**允许带
+斜杠**（实测 `cline/anthropic/claude-sonnet-5.5`），反推在正常数据上恰好也对，但那是**巧合**
+而非契约。故 `toGatewayModelIds` 回传权威拆分，RPC 类型 `RpcGatewayModel` 带上
+`provider` / `model` 两个字段；`openai-gateway-models.spec.ts` 锁死
+`provider + '/' + model === id`（逐字，三种形态）。
+
+⚠️ **卡片头两个数字都必须如实**：总数与第二类计数。对照表的第二类计数是「需对照」
+（`lossy`），模型清单的是「可发图片」—— 故 `GatewayCards` 用 `foldLabel` 参数区分，
+**不能**把「可发图片」写死在组件里（否则对照表会显示「8 个可选档位 · 2 个可发图片」）。
+
+⚠️ **对照表的分组必须发生在「筛出来的行」上**（`groupGatewayEntries(visibleEffortRows…)`），
+不是先分组再筛：否则搜索时卡片头会出现「写着 8 个、卡里只有 1 行」的自相矛盾读数。
+用例里有一条专门用 `expect(source).not.toContain('groupGatewayEntries(effortRows')` 把它锁住。
+
+⚠️ **行内显示短名字，复制出去的永远是完整 ID**：`formatModelIdList(card.entries)` 用的是
+`id` 字段。搞反的症状是「照着卡片复制了一个短名字进客户端 ⇒ 必然 404」。
+卡片头已写明供应商，行内再重复前缀只会把整行挤成省略号。
+
+⚠️ 已做**反向验证**（8 个变异，全部变红）：分组退化成「一个模型一张卡」（= 用户报障原形态）、
+行内改回完整 id、折叠忽略用户点击、搜索时不强制展开、宿主不回传权威拆分、
+对照表分组建在全量行上、复制本组改复制短名字、未知供应商标题给空串。
+
+⚠️ 供应商 key 拿不到时归入 `''` 那张卡（标题「（未标注供应商）」），**不丢行** ——
+少一个 ID 会让用户照着一份不完整的清单去配客户端。也**不去重**：同一 id 出现两次是上游的事，
+去重会掩盖上游缺陷。
+
 ⚠️ **对照表的搜索比模型清单多匹配「档位名」**（`matchesEffortQuery` 复用
 `matchesModelQuery` 之后**再补**真实档位名与该填的规范名）：最常用的查法就是
 「哪个渠道有 `xhigh`」「界面上的 Max 到底是哪个 id」—— 后者正是用户踩过的坑。
@@ -7684,14 +7731,319 @@ max ultra`）。CC Switch 把那 8 个（连英文描述）**硬编码在自己�
 `isFilterActive`，不要各写一份。
 
 ⚠️ 对照表**只含已开启的模型**（数据来自适配器 `listModels` 的黑名单过滤，
-与对话框模型选择器同源）。文案必须点明「当前已开启的 N 个模型里…」——
+与对话框模型选择器同源）。文案必须点明「已开启的 N 个模型里…」——
 否则用户看到「14 个」会以为网关只认得 14 个模型（他实际这么反馈过）。
+
+### ⚠️ 网关弹窗第四批：文案再精简 + 搜索移进展开区 + 胶囊不截断（用户要求，2026-10-04）
+
+四条要求**一次提出**（原话）：
+
+> ①「下面的四个按钮，也按 `复制密钥` `显示明文` 的大小来统一。」
+> ② 模型 ID 描述改为 `共开启 14 个可用模型，来自 12 个供应商，ID 区分大小写。`
+> ③ 思考档位对照表描述改为「已开启的 N 个模型里，有 N 个可选思考档位（N 个不同名，标「需对照」）。」
+> ＋「「客户端该填」为 CC Switch 需配置的映射档位，未登记的档位名称将被拒绝。」
+> ④「搜索功能应当在展开后才可用，而不是像现在这样放在外面，模型 ID 的展开清单里也应该加个搜索栏。」
+> ⑤「网关这里面的所有胶囊内容都没有完整显示，应当修正使其完整显示内容。」
+
+**① 按钮尺寸统一 —— 判据是「同一条 CSS 规则」而不是「两处都写了 2px 8px」**
+
+`.dim-jh-btn` 是通用按钮（`padding: 4px 12px` + `line-height: 18px` ⇒ 约 28px 高），
+30+ 处调用点（页头 / 模型面板 / 卡片头 / 对照表），**绝不能直接改它**。
+密钥行那套小号尺寸（`2px 8px` / 11px / 16px / 圆角 6px ⇒ 约 22px）抽成
+**一条合并规则**：
+
+```css
+.dim-jh-gatewayKeyRow .dim-jh-btn,
+.dim-jh-gatewayModal .dim-jh-gatewayActions .dim-jh-btn { padding: 2px 8px; font-size: 11px; line-height: 16px; border-radius: 6px; }
+```
+
+两处操作行挂同一个钩子类 `dim-jh-gatewayActions`（与 `dim-jh-modelPanelActions`
+并存）。⚠️ 用例必须同时锁**样式**与**接线**：只锁样式时「类名忘了挂」照样绿
+（变异「四个按钮的钩子少挂一个」就是为它准备的）；只锁接线时样式被改小/改大也看不出来。
+
+**②③ 文案精简到一句 / 两句 —— 但删掉的信息必须**换位置**，不能丢**
+
+| 删掉的句子 | 移到了哪里 |
+|---|---|
+| 「必须带供应商前缀」 | 卡片头 tooltip：`供应商 key：xxx（模型 ID 的前缀就是它）` |
+| 「行内显示短名，复制出去的始终是完整 ID」 | 复制按钮 tooltip：`每行一个完整 ID` + `disabled: visibleModels.length === 0` |
+| 「关掉的模型不在表里」 | 模型清单那句的「**已开启**」已表达同一约束 |
+
+⚠️ 故「精简」的回归用例**不能只断言「旧句子不在了」**，还要断言新位置仍在
+（`openai-gateway-panel.spec.ts` 里那条「前缀规则与短名差异必须仍在面板里能找到」）。
+否则下次有人「顺手再精简一轮」时，信息是真的消失了，而用例全绿。
+
+⚠️ **对照表说明里的举例（如 `turbo`）被删掉了，但边界照旧**：强度序只登记 12 个名字
+（8 规范名 + 上游私有的 off/light/on/extra_high），未登记的写法**真会 400**。
+用例锁的是「未登记的档位名称将被拒绝」这半句，**不要**因为旧用例里有 `toContain('turbo')`
+就把它加回去（长度预算已收到 85 字）。
+
+⚠️ 写这类「同一句话在正文与注释里各出现一次」的变异时，**锚点必须带行首的 `+ '`**：
+`String.replace` 只替换**第一处**，只写那句话会把**注释**改掉、真正的 UI 文案原样存活
+⇒ 变异假存活。本次实测踩到过（`mutate-gateway-text.mjs` 的「未登记…会被拒绝」那条）。
+
+**④ 搜索移进展开区 —— 两处都要，且收起时必须清空搜索词**
+
+- 两处搜索框都渲染在 `xxxOpen ? React.createElement(React.Fragment, null, …)` **之内**
+  （不是挂在外面常驻占位）；新增了模型清单的搜索（`modelsQuery` / `visibleModels` /
+  `gatewayModelsEmptyHint`），判据复用 `model-filter.js` 的 `filterModels`
+  —— ⚠️ **不能**换成对照表那套 `filterEffortRows`（它还会匹配档位名，「搜 max」
+  会命中一堆没这个功能的模型）。
+- ⚠️ **收起时必须清空搜索词**（`if (modelsOpen) setModelsQuery('')`）：搜索框一收起就
+  不可见，筛子却还在生效 —— 下次展开会莫名其妙少掉一半行，而用户完全无从察觉。
+- ⚠️ 用户说「按 `复制密钥` 的大小统一」时，「复制全部 N 个 ID」的 **N 必须同步改成
+  `visibleModels.length`**：按钮上写着 N、复制出的却是全量，用户会以为搜索没生效。
+  用例要连**插值**一起锁（只锁 `复制全部` 时把 N 改回全量会假绿，实测踩到）。
+- ⚠️ 两处搜索都要给卡片传 `searching`（`{ toggled, searching: … }`），否则命中的行
+  藏在默认折叠的大卡片里 ⇒ 用户以为「搜不到」。
+- ⚠️ 「搜索框在展开区之内」的回归用例必须**锚定展开分支本身**
+  （`/modelsOpen\s*(?:\/\/[^\n]*\n\s*)*\?\s*React\.createElement\(React\.Fragment/`）：
+  只取第一个 `modelsOpen` 是不够的 —— 操作行里的 `'aria-expanded': modelsOpen`
+  也在它前面，那样写会退化成「搜索框在操作行之后」这种弱判据。
+
+**⑤ 胶囊不截断 —— 必须加 `.dim-jh-gatewayModal` 前缀覆盖，且只覆盖该覆盖的**
+
+用户报障的「胶囊」= `.dim-jh-modelId`（行内 ID 块）/ `.dim-jh-modelBadge`
+（「可发图片」「需对照」）/ `.dim-jh-effortModel` / `.dim-jh-gatewayCardToggle`
+（卡片标题）。前三个**天生带截断**（`max-width: 46%` + `ellipsis` + `nowrap`），
+而那是给**模型列表**设计的（一行里还要塞下开关，紧凑是刻意的；见 `model-filter.js`
+的模块注释）。修法：
+
+```css
+.dim-jh-gatewayModal .dim-jh-gatewayModelRow .dim-jh-modelId,
+.dim-jh-gatewayModal .dim-jh-gatewayKeyRow .dim-jh-modelId,
+.dim-jh-gatewayModal .dim-jh-gatewayCardBody .dim-jh-modelId { max-width: none; overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+```
+
+⚠️ **两处例外，刻意保持截断**：
+- 弹窗顶部那行开关说明的胶囊（「打开（在 127.0.0.1 监听，供 Pi / Continue / Cline…）」）
+  —— 它是全弹窗最长的单行文本，不截断会独占两三行；完整信息在「API 请求地址」里已有；
+- 卡片标题**改为换行**而不是去掉截断了事：`.dim-jh-gatewayCardHead` 改成
+  `align-items: flex-start; flex-wrap: wrap`，标题 `overflow-wrap: anywhere`，
+  计数与「复制本组」`flex: 0 0 auto; margin-left: auto` 落到第二行。
+  长供应商名此前被吃成 `deepseek-accou…`，而标题正是用户**唯一**能确认「这一家是谁」的地方。
+
+⚠️⚠️ **不要靠「我把记得的几个类都覆盖了」来收工 —— 要用机械审计**
+（`audit-gateway-pills.mjs`，本地脚本、不入库）：**枚举**网关弹窗渲染区间里用到的
+全部 `dim-jh-*` 类，与样式表里**带截断属性**（`text-overflow: ellipsis` /
+`white-space: nowrap` / `max-width: N%`）的规则求**交集**，交集里每一项必须是
+「有 `.dim-jh-gatewayModal` 覆盖」或「在 EXPECTED 里写明保留理由」，否则退出码非 0。
+当前结果：**39 个类 / 28 个带截断 / 交集 5 个 / 未覆盖且未声明 0 个**。
+
+这次审计**真的抓出两个我漏掉的类**，别删这个脚本：
+- `.dim-jh-btn` —— 它的 `white-space: nowrap` 也在交集里。**它不是内容截断**
+  （防的是按钮内文字折行），但它在窄容器里的真实风险是「按钮被整体推出容器、点不到」，
+  而这两个操作行的文案带**动态计数**（「复制全部 1234 个 ID」）。故给
+  `.dim-jh-gatewayModal .dim-jh-gatewayActions` 加 `flex-wrap: wrap`。
+  ⚠️ 这条**不能**靠「我实测 364px 下没溢出」收工 —— 那是**当前数据（15 个模型）**的结论，
+  换成 1234 个模型就不成立。要按「任意计数都成立」来设计。
+- `.dim-jh-gatewayCardCount` —— 它的 `nowrap` 是**刻意保留**的：它是一行读数，
+  折成两行比占宽更难看；`overflow` 是 visible，真放不下时由卡片头的 `flex-wrap`
+  把它**整块**挪到第二行，而不是切掉文字。
+
+⚠️ **例外条目要在审计脚本里写明依据，且依据必须是实测而非印象**：脚本末尾的 NOTES
+记着三组数字 —— 560px 下 12 个受关注胶囊元素 `scrollWidth - clientWidth` 全为 0；
+320px 下弹窗无横向溢出、操作行子元素右边界均未越出容器；
+长 provider key 让卡片头子元素 top 由 `[367,367,367]` 变 `[367,393,393]`（整块换行）。
+
+### ⚠️⚠️ 上面那套「胶囊不截断」**第一次是没修好的** —— 选择器夹了中间祖先
+
+用户第二次截图框出**三处仍在截断**的地方（我在同一轮里报了「全部修好」，是错的）：
+
+| 位置 | 实际祖先链 | 我第一版的选择器 |
+|---|---|---|
+| 开关行胶囊 | modalBody > modelRow > modelInfo > code.modelId | 要求 .dim-jh-gatewayModelRow ❌ |
+| curl 代码块（模型目录） | modalBody > code.modelId | 要求上面三类之一 ❌ |
+| curl 代码块（档位对照表） | modalBody > code.modelId | 同上 ❌ |
+
+三条规则写成了「弹窗 + **中间祖先** + 类名」，**只覆盖到卡片内**那一处。
+症状与用户看到的一致：`供 Pi / Cont…`、`curl … -H "…"` 被吃掉。
+
+**修法**：覆盖规则只写**两级通配**（弹窗 + 类名），这样对弹窗内该类的**任何**祖先链都生效。
+
+⚠️⚠️ **两条比代码更值钱的教训**：
+
+1. **审计判据必须落到「元素」而不是「类名」**。第一版审计脚本枚举的是
+   「弹窗里用到的**类名**有没有被某条网关规则覆盖」—— modelId 在卡片那条规则里
+   「有覆盖」，于是**整体判通过**，而用户框出的三处一个都没被覆盖。
+   **同一个类名在弹窗里可以有多种祖先链**，「类名出现过」推不出「每个实例都被覆盖」。
+   ⇒ 现在的判据：**覆盖规则必须是两级通配**（"对任意祖先链都生效"的充分条件，
+   可纯静态判定）；「每个实例是否真的完整」交给真实 DOM 逐个量 `scrollWidth`。
+   ⚠️ 同理，**量测也必须逐个元素遍历**，不能按选择器挑着量 ——
+   `measure-gateway-v3.mjs` 第一版的 `watch` 列表里**根本没有 curl 那两条选择器**，
+   于是它一直报「0 个被截断」而用户看到的是被切掉的文本。
+   **改这里的量测时，遍历 `modal.querySelectorAll('.dim-jh-modelId')` 全量，别写白名单。**
+2. **用户说"还是没修好"时，先把"我上次的验证是否真的覆盖了症状"当成第一嫌疑**。
+   我上次的证据（DOM 量 12 个元素、0 截断）本身是**真的**，但它量的元素集合是
+   **我自己挑的** —— 挑漏了用户实际看的那三处。**证据为真 ≠ 覆盖了症状。**
+
+⚠️ **顺带删掉的一条会"骗人"的规则**：原有一条
+`.dim-jh-gatewayModelRow .dim-jh-modelId { max-width: 52% }`
+（把模型列表的 46% 放宽到 52%）。它与两级通配**优先级完全相同 (0,2,0)**，
+于是谁生效**只取决于源码先后**。已删除 —— 保留它就是留一个「靠写在对的位置才不出事」
+的地雷（有人把新规则贴到它后面，截断就回来了）。
+用例里有一条专门堵这个洞：**弹窗内不得再有第二条给 `.dim-jh-modelId` 设上限的规则**。
+
+⚠️ **修截断顺带引入过的第三次退化（渲染截图才发现，务必回归）**：
+去掉胶囊的 `max-width` 后它把开关行整行宽度吃光，而 `.dim-jh-modelName` 是
+`flex: 0 1 auto`（可收缩）⇒ 标题「启用本机网关」被压成「启用本机网」「关」两行。
+修法：`.dim-jh-gatewayModal .dim-jh-modelInfo > .dim-jh-modelName { flex: none; }`
+（**只**钉开关行的标题，用**直接子选择器** —— 卡片行里展示名的收缩是刻意的，
+写成通配会让长展示名横向溢出）。
+
+⚠️ **本仓库的 CSS 解析陷阱（写用例时踩到）**：`jet-hub-styles.js` 整个 CSS 在一条模板串里，
+想按规则遍历**不能**用 `/([^{}]+)\{([^}]*)\}/g` —— 它可以从任意位置起匹配，
+选择器组会跨过前一条规则的 `}` 吃掉前文，selector/body **角色互换**
+（实测解析出 `SEL="A { x: 1 }" BODY="A "`），判据永远不命中 ⇒ **变异假存活**。
+必须按花括号深度**扫描**（见 `openai-gateway-panel.spec.ts` 里的 `rulesOf`），
+并在解析后加一条「解析出的规则数 > 100」的反向自检 —— 否则「没找到违规」可能只是
+「什么都没解析出来」。
+
+⚠️ **反向验证已扩到 30 个变异（全红）**，本轮新增 4 个都是这次返工的直接回归点：
+覆盖规则退回带中间祖先、把 52% 写回通配之后、整条覆盖删掉、开关行标题退回可收缩。
+
+### ⚠️ 网关弹窗第四批（第二轮）：胶囊文案 / 按钮顺序 / 删 curl / **三段分隔**
+
+用户 2026-10-04 的第二轮四条要求（原话）：
+
+> ①「修改『启用本机网关』右边的那个胶囊为『在 127.0.0.1 监听，供客户端调用』。」
+> ②「思考档位对照表里的『展开对照表』与『复制对照表』两个按钮位置互换。」
+> ③「删掉这两段：命令行查看同一份目录/对照表 + 那两条 curl。」
+> ④「这三个红框框起来的不同的功能段，能明显的区分开来，现在的效果就是这三坨字全混在一起有点难看清。」
+
+**① 胶囊只留「在 127.0.0.1 监听，供客户端调用」**：原先列了 Pi / Continue / Cline /
+OpenCode 四个客户端名，窄面板下折成两行，还把「打开/关闭」那个动作词挤到很后面。
+客户端列举属于 README 的内容。⚠️ **动作词没丢** —— 它由开关的 `aria-label`
+（`action + '本机网关'`）承担；用例里有一条专门锁它没被一起删掉。
+
+**② 对照表两个按钮互换**（复制在前、展开在后）：与模型清单那段统一，三段里按钮位置
+可预期。⚠️ 用例锁的是**顺序**（`indexOf(copy) < indexOf(toggle)`），不只是「两个都在」。
+
+**③ 删掉两段 curl**：`gatewayModelsCurl` / `gatewayEffortsCurl` **两个纯函数保留**
+（有独立价值，README 与将来的 CLI 入口可能用），只是不再出现在面板上；
+`jet-hub.js` 里对应的三个 import（连同 `gatewayEndpoint`）一并移除。
+⚠️ 「地址栏直接打开会 401」这句是 curl 段标题的一半，也一并删了 ——
+**但那个事实不能丢**，它由 README 承担（用例里有一条断言 README 仍含 `401`）。
+
+**④ 三段分隔（这是本轮最容易做错的一条）**：
+做法是每段包一个 `.dim-jh-gatewaySection`，段间用
+`border-top` + 更大间距切开，并给后两段加 `.dim-jh-gatewaySectionTitle`（13px/600 深色）。
+
+⚠️⚠️ **三个必须记住的点**：
+
+1. **分隔规则必须写相邻兄弟选择器**（`.dim-jh-gatewaySection + .dim-jh-gatewaySection`）：
+   写成 `.dim-jh-gatewaySection { border-top }` 会给**第一段**也加上边框 ——
+   它紧贴弹窗标题，那条横线看起来像多出来的分隔条。
+2. **段标题不能沿用 `.dim-jh-modalHint` 那套 12px 灰字**：段标题与段内说明同为灰色时，
+   分隔线的效果会被抵消（用户仍然分不清哪一行是标题）。用 13px/600 深色。
+3. **脚注（安全提示）不属于任何一段**，单独一个 `.dim-jh-gatewayFootnote`。
+
+⚠️⚠️ **量测要量「分隔是否真的生效」，不能只看 CSS 里有 border-top**：
+选择器写错（例如 DOM 中间夹了别的兄弟节点）时规则**根本不生效**，而静态检查照样绿。
+`measure-sections.mjs` 在真实 DOM 里读每段的 `getComputedStyle().borderTopWidth`
+与几何位置，并断言「后两段里真的有可见上边框的 = 2/2」。当前实测：
+第 1 段 `border-top = 0px none`，第 2/3 段各 `1px solid` + `padding-top 10px` + 段间距 12px。
+
+⚠️ **mockup 自身会出错，而且会被误读成产品缺陷**（本轮实测踩到）：
+`measure-gateway-v3.html` 少了一个 `</div>`，第 3 段被**嵌进**第 2 段里，
+于是量测报「第 3 段 border-top = 0px」—— 看起来像 CSS 写错了，实际是 mockup 的问题。
+⇒ 加了 `check-mockup-balance.mjs`：按行统计 `<div>` 开闭，要求**最终深度 = 0 且过程中
+最小深度 = 0**，不配平就退出码非 0。**改 mockup 后先跑它，再跑量测。**
+
+⚠️ **改渲染代码后必须重跑变异测试**：本轮因为「整段包进 section（缩进 +2）+ 段分界
+注释改名 + 按钮调序」，一次性**失效了 7 条锚点**，而锚点失配在工具里的表现是
+**「存活」**（像锁失效了，其实是脚本没跟上源码）。已逐条按新缩进修正，
+并把「第 2/3 段」写进分界注释 —— ⚠️ **改动那两处分界注释就必须同步改单测里的锚点**
+（`openai-gateway-panel.spec.ts` 有两处 `indexOf('// ── 第 2 段：模型目录 ──')`）。
+本轮的**新变异**：胶囊退回客户端列举、按钮顺序换回「展开在前」、把 curl 段加回来、
+删掉段间分隔规则、段标题退回灰字。**现共 35 个变异，全红。**
+
+### ⚠️⚠️ 网关弹窗第四批（第三轮）：对照表说明**按行**给出（品牌名被行尾切开）
+
+用户原话：
+> 「『客户端该填』为 CC Switch 需配置的映射档位，未登记的档位名称将被拒绝。」
+> 这句话换行显示吧，现在这样接在上一句后面的话，CC Switch 这个单词会被截断。
+
+**根因不是字符串写错，而是「交给浏览器断行」**：两句原先拼成一整串放进**同一个 `<p>`**，
+浏览器在行尾按**空格**断行 —— `CC` 留在上一行、`Switch` 落到下一行。
+⚠️ 所以 `toContain('CC Switch')` 在**修复前后都成立**（文案字符串一直是完整的），
+**任何基于字符串的断言都测不出这个缺陷**。判据只能是**行结构**。
+
+**修法**（与本报文既有 `gatewayStatusLines` 完全同款，弹窗顶部那三行就是这么给的）：
+- 纯函数改为 `gatewayEffortsHintLines(models)` → **返回字符串数组**（空表时 1 行，正常 2 行）；
+- 渲染层 `gatewayEffortsHintLines(models).map(...)` → **一行一个 `<p>`**；
+- 保留 `gatewayEffortsHint(models)` = `lines.join('')`，只为不动既有断言/README 的一整串口径。
+  ⚠️ **面板渲染绝不能调它** —— 一调就退回「拼成一整段交给浏览器断行」，
+  正是本次缺陷的形态（用例里有 `source).toContain('gatewayEffortsHintLines(models)')`
+  与 `.map(` 两条同时守着这一点）。
+
+⚠️⚠️ **量测这种缺陷时踩到的两个坑（都会让检查「永远绿」）**：
+
+1. **探针选错了元素 → 自证通过**。第一版用
+   `querySelectorAll('.dim-jh-gatewaySection .dim-jh-modalHint').find(p => p.textContent.includes('CC Switch'))`
+   选目标，而**第 1 段顶部那句「推荐使用 CC Switch 进行网关配置。」也含 `CC Switch`** ——
+   `find` 命中的是它，量的是那句短文案（实测 `offsetWidth` 191、行矩形 1 个），
+   于是第 3 段无论怎么排都报「未断开」。⇒ 判据必须**同时**锁「第 3 段」与「客户端该填」。
+2. **块级元素的 `getClientRects()` 只返回外框一个矩形**，不是每行一个 ——
+   用 `p.getClientRects().length` 判「占几行」是错的，会得到恒为 1 的假象。
+   逐行矩形必须对 **Range** 取（`range.selectNodeContents(node)`）。
+
+⚠️ **证明「修好了」必须同时给出修复前后的对照**，且要找到**真的会断开**的形态：
+单点量测（560px）在**修复前后都不断开** —— 那样即使通过也证明不了任何事。
+`measure-brand2.mjs` 的负向对照（`measure-brand-wrap-old.html`，把两句拼回一段）当前实测：
+
+| | 含品牌名那行 | `CC`→`Switch` 的字符 top |
+|---|---|---|
+| 旧版（拼成一整段） | 高 **36px**（2 行） | **562 → 580（跨行）** |
+| 新版（一行一个 `<p>`） | 高 **18px**（1 行） | 584 → 584（同一行） |
+
+这正是用户截图里「CC Switch 被截断」的机制 —— 字符级证据比「看起来好了」可靠。
+
+⚠️ **改动返回值形态必须同步改变异锚点**：`gatewayEffortsHint` 由「拼接字符串」改为
+「行数组」后，`mutate-gateway-text.mjs` 里三条锚点（`+ '…';` → `'…',`）全部失配，
+而失配在工具里的表现是**「存活」**（像锁失效，实为脚本滞后）。已修正，并新增两条变异：
+「两句被拼回一整段」「渲染层把说明行 join 回一整段」。**现共 37 个变异，全红。**
+
+⚠️ 写这种「同一句话在正文与注释里各出现一次」的变异时，**锚点必须带行首引号与行尾逗号**：
+`String.replace` 只替换**第一处**，只写那句话会把**注释**改掉、真正的 UI 文案原样存活
+⇒ 变异假存活。
+
+⚠️ 另外两个本轮踩到的工具坑：
+- 源码是 **CRLF**，锚点按 `\n` 写会全部「未命中」。既不能直接拿 `\n` 锚点匹配，
+  也不能命中后整篇写成 LF（那会让**每一行**都变成「已修改」，diff 被污染成几千行）。
+  做法：把锚点自身转成 CRLF，在**原始文本**上替换，行尾一律不动。
+- 一次性反向验证脚本用完要 `--restore` 还原，并确认 `git diff --stat` 只有预期文件。
+
+⚠️ **回归用例**（`openai-gateway-panel.spec.ts`）锁的是**行结构**而不是关键词：
+`expect(lines).toHaveLength(2)`、`lines[1]` 含完整「「客户端该填」为 CC Switch 需配置的映射档位」、
+`lines.some(l => l.includes('CC Switch'))`、且 `lines` 里不得有单独成行的 `'CC'` 或
+以 `'Switch'` 开头的行。**反向验证过**：退回单行 → `toHaveLength(2)` 变红；
+渲染层 join 回一段 → `.map(` 那条变红。
+
+⚠️ 用例要**同时**锁「网关弹窗内不截断」与「模型列表那份紧凑样式没被顺手改坏」
+（`.dim-jh-modelId` 仍须有 `max-width: 46%` + `ellipsis`、`.dim-jh-modelBadge` 仍须 `flex: none`）
+—— 只锁前者的实现可以简单到「把全局那三条删掉」，那会把 478 条的模型列表撑坏。
+
+⚠️ **写取规则体的 `rule()` 辅助函数时两个坑**（本次都踩到）：
+1. 选择器里的 `.` 必须**全部**转义：`.dim-jh-modelId` 不转义会匹配 `Xdim-jh-modelId`；
+2. 选择器必须锚定**行首或逗号之后**（`(?:^|[,\n])[ \t]*<sel>[ \t]*(?=[,{])[^{}]*\{…\}`）——
+   `jet-hub-styles.js` 的注释里也会提到类名（如「`.dim-jh-modelId` 是 max-width 46%…」），
+   不锚定就会把**注释**当成规则、取到下面那条无关规则体而给出假绿。
+
+⚠️ **`jet-hub-styles.js` 整体是一个 JS 模板字符串，注释里不能出现反引号** ——
+本次差点因此构建失败（新写的 9 处注释里都用了反引号括类名，已全部改成裸写）。
+改完用 `Select-String -Pattern '\`'` 数一下：**全文只应有首尾那 2 个**。
+
+⚠️ 已做**反向验证**（25 个变异，全部变红，见 `mutate-gateway-text.mjs`）：
+两条文案各退旧版、丢「已开启」、丢「大小写」、丢边界句、删「需对照」图例、
+空结果不给提示、两处搜索框各挪出展开区、两处收起不清搜索词、按钮 N 退回全量、
+卡片建在全量模型上、少传一个 `searching`、少挂一个钩子类、胶囊退回截断、标题退回省略号。
 
 **回归用例**：`tests/unit/reasoning-ladder.spec.ts`（强度序 / 三条规则 / 同族约束 /
 反查往返）、`openai-gateway-messages.spec.ts`（翻译 + 通知 + 未知仍 400 + 不下发）、
 `openai-gateway-models.spec.ts`（档位视图 + 容错 + 两处同源）、
 `openai-gateway-server.spec.ts` 的「思考档位」段（HTTP 层实测那三条雷 + 对照表端点）、
-`openai-gateway-panel.spec.ts`（对照表行与文案 / 搜索判据 / 不截断排版）。
+`openai-gateway-panel.spec.ts`（对照表行与文案 / 搜索判据 / 不截断排版 / 按钮尺寸 / 胶囊）。
 
 ## ⚠️ Cline 限流：倒计时用**报文里的人类可读时长**，402 不许倒数（真实报障两次，2026-10-03）
 

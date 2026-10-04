@@ -287,6 +287,166 @@ const STYLES = `
 .dim-jh-effortLabel { color: var(--dsw-alias-label-tertiary, #8f959e); }
 /* 搜索结果为空时的提示（与其它空状态同款观感）。 */
 .dim-jh-effortEmpty { padding: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 档位对照行里的模型名也**不得截断**（用户 2026-10-04：「所有胶囊内容都没有
+   完整显示」）。这里本就没写 ellipsis，但补一条**显式**声明把意图锁住：
+   下面「网关弹窗里的胶囊」那条 .dim-jh-modelId 规则不该被误用到它身上，
+   而将来若有人给 .dim-jh-effortModel 加上截断，这条会立刻在单测里变红。
+   ⚠️ 本文件整体是一个 JS 模板字符串，注释里**不能出现反引号** —— 会提前
+   终止字符串（见 .dim-jh-iconBtn 处的同款警告）。 */
+.dim-jh-gatewayModal .dim-jh-effortModel { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+
+/* ── 网关弹窗的排版收紧（用户 2026-10-04 要求：「这几段话之间的行间距小一点」）──
+   ⚠️ 必须加 .dim-jh-gatewayModal 前缀：.dim-jh-modalHint 是**共用**类，
+   另有 24 处调用点（账号面板、opencode 弹窗、备份弹窗…），本次只该动网关弹窗
+   —— 全局把 10px 改成 6px 会悄悄改掉那些页面的观感。
+   本弹窗有 8 处说明行，10px × 8 ≈ 80px 空隙，收成 6px 后观感明显紧凑。 */
+.dim-jh-gatewayModal .dim-jh-modalHint { margin-top: 6px; }
+/* 弹窗顶部那三行是**同一段话**（推荐 / 协议 / 地址），彼此再紧一档，
+   否则它们看起来像三个互不相干的段落。
+   ⚠️ 现在「思考档位对照表」那段的两句说明也用这个类（同样是一段话拆成两行，
+   为的是不让品牌名 CC Switch 在行尾被从中间切开）。 */
+.dim-jh-gatewayModal .dim-jh-gatewayLine { margin-top: 4px; }
+
+/* ── 三段功能区的**分隔**（用户 2026-10-04：「这三坨字全混在一起有点难看清」）──
+   用户把弹窗分成三块：① 开关 + 连接信息（推荐 / 协议 / 地址 / API KEY）
+   ② 模型 ID 清单 ③ 思考档位对照表。
+   此前三段之间只靠一个 16px 的 margin，而每段内部又各有若干行 12px 灰字，
+   视觉上连成一片 —— 用户找不到「下一块从哪开始」。
+
+   做法：段间用**一条上边框 + 更大的上间距**切开，段内保持原有的紧凑。
+   ⚠️ 用 border-top 而不是背景色块：弹窗会被截图，色块在深色主题下还要另配
+   一整套 token（本文件别处同理，见 .dim-jh-gatewayCards 的注释）。
+   ⚠️ 第一段**不要**上边框（它紧跟在弹窗标题下，加线会像多出一条分隔条）。 */
+.dim-jh-gatewaySection { display: block; }
+.dim-jh-gatewaySection + .dim-jh-gatewaySection {
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px solid var(--dsw-alias-border-l2, #eef0f3);
+}
+/* 段标题比正文说明重一档，作为「这块讲什么」的锚点。
+   ⚠️ 不能沿用 .dim-jh-modalHint 那套 12px 灰字 —— 段标题与段内说明同为灰色时，
+   分隔线的效果会被抵消（用户仍然分不清哪一行是标题）。 */
+.dim-jh-gatewaySectionTitle { margin: 0; font-size: 13px; line-height: 19px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
+/* 段内第一行紧跟段标题，不再叠那 6px。 */
+.dim-jh-gatewaySectionTitle + .dim-jh-modalHint { margin-top: 3px; }
+/* 弹窗末尾那条安全提示：与上面三段拉开，且**不属于任何一段**（它是整个弹窗的脚注）。 */
+.dim-jh-gatewayModal .dim-jh-gatewayFootnote { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--dsw-alias-border-l2, #eef0f3); }
+
+/* ── 密钥行：小号按钮，不让按钮把这一行撑高 ──
+   ⚠️ 用户 2026-10-04 报障：「复制密钥」「显示明文」大到把这行撑开。
+   根因是 .dim-jh-btn 是**通用**按钮（padding 4px 12px + line-height 18px
+   ⇒ 约 28px 高），而同行只有 18px 高的说明文字 —— 按钮比文字高 10px，
+   整行的高度就被它顶起来了。这里单独压到约 22px，与文字行接近。
+   ⚠️ 不能直接改 .dim-jh-btn（30+ 处调用点：页头、卡片头、对照表…）。
+   ⚠️ 用户随后又要求「下面的四个按钮也按复制密钥的大小来统一」，故把
+   清单/对照表那两个操作行（.dim-jh-gatewayActions）并进同一条规则 ——
+   两处必须是**同一条规则**，各写一份迟早一处改了另一处没改。 */
+.dim-jh-gatewayKeyRow { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.dim-jh-gatewayKeyRow .dim-jh-btn,
+.dim-jh-gatewayModal .dim-jh-gatewayActions .dim-jh-btn { padding: 2px 8px; font-size: 11px; line-height: 16px; border-radius: 6px; }
+/* 「API KEY：」标签：与按钮同基线、不可压缩（否则窄面板下会折成两行）。 */
+.dim-jh-gatewayKeyRow .dim-jh-gatewayKeyLabel { flex: none; margin: 0; }
+/* 下方两个操作行（模型清单 / 思考档位对照表）的间距也向密钥行看齐（8px → 6px）：
+   四个按钮既然压成小号，原来的 8px 间隔配小按钮会显得松散。
+   ⚠️ 另加 flex-wrap: wrap：.dim-jh-modelPanelActions 默认是 nowrap
+   （页头那两三个固定按钮用它没问题），而这两行的按钮文案带**动态计数**
+   （「复制全部 1234 个 ID」「复制对照表（1234 行）」），计数一长，nowrap
+   会把按钮推出容器、点不到。实测当前数据（15 个模型）在 364px 窄弹窗下不出问题，
+   但那是**当前数据**的结论 —— 换行让它对任意计数都成立。
+   ⚠️ 本文件整体是一个 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。
+   我在这条注释里用反引号括了一次类名，直接把文件从中间截断、构建产物语法错误 ——
+   写类名时**裸写**，要强调就用「」或**。 */
+.dim-jh-gatewayModal .dim-jh-gatewayActions { gap: 6px; flex-wrap: wrap; }
+
+/* ── 网关清单：**一个供应商一张卡片**（模型清单与档位对照表共用）──
+   用户 2026-10-03 报障：此前按「一个模型一行」平铺，同一家的
+   deepseek-account/deepseek-flash 与 deepseek-account/deepseek-v4-pro
+   看起来毫无关系；用户真正要对照的是「哪家有哪些模型」，故改成分组卡片。
+   分组判据在 openai-gateway-panel.js 的 groupGatewayEntries（纯函数，可单测）。
+   ⚠️ 本文件整体是 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。 */
+.dim-jh-gatewayCards { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+/* 卡片：细边框 + 圆角，与复用的分组头（.dim-jh-modelGroup）同一种规格语言。
+   ⚠️ min-width: 0 是**必需**的：卡片是 grid 项，默认 min-width: auto 会被
+   内部长 id 撑开，从而把整个弹窗顶出横向滚动条（模型列表踩过同一个坑）。 */
+.dim-jh-gatewayCard { min-width: 0; border: .5px solid var(--dsw-alias-border-l3, #e5e5e5); border-radius: 10px; overflow: hidden; }
+/* 卡片头：吸顶。清单很长时滚到底部仍要能看出「我在哪一家」。
+   背景用不透明层色，否则卡内行会从下面透出来。 */
+.dim-jh-gatewayCardHead { position: sticky; top: 0; z-index: 2; display: flex; align-items: flex-start; flex-wrap: wrap; gap: 4px 8px; min-width: 0; padding: 6px 8px; background: var(--dsw-alias-bg-layer-2, #f7f8fa); border-bottom: .5px solid var(--dsw-alias-border-l3, #e5e5e5); }
+/* 卡片标题（可点，折叠开关）：占满剩余宽度。
+   ⚠️ 用户 2026-10-04 报障「网关里的胶囊内容都没有完整显示」：此处原先是
+   ellipsis + nowrap，长供应商名（或展示名）被截成 deepseek-accou…，
+   而卡片标题正是用户**唯一**能确认「这一家是谁」的地方。
+   改为换行显示：整行放不下时 title 独占一行，计数与「复制本组」按钮落到第二行。
+   ⚠️ 绝不能加回 text-overflow: ellipsis / white-space: nowrap。 */
+.dim-jh-gatewayCardToggle { flex: 1 1 auto; min-width: 0; padding: 2px 0; border: 0; background: transparent; color: var(--dsw-alias-label-primary, #1f2329); font-size: 12.5px; line-height: 18px; font-weight: 600; text-align: left; overflow-wrap: anywhere; cursor: pointer; }
+.dim-jh-gatewayCardToggle:hover { color: var(--dsw-alias-brand-primary, #1677ff); }
+/* 计数与按钮：可以掉到第二行，但**不换行、不截断**（flex: none 保证不被挤没）。 */
+.dim-jh-gatewayCardCount { flex: 0 0 auto; margin-left: auto; font-size: 11px; line-height: 17px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--dsw-alias-label-tertiary, #8f959e); }
+.dim-jh-gatewayCardHead .dim-jh-gatewayCardBtn { flex: none; padding: 2px 8px; font-size: 11px; }
+.dim-jh-gatewayCardBody { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; padding: 3px 4px 5px; }
+/* 一行模型（**只读**，无开关）：短名字 + 展示名 + 能力标记。
+   ⚠️ 行内显示的是去掉供应商前缀的名字（见 gatewayModelKeyOf）—— 卡片头已经
+   写清了是哪一家，再重复一遍前缀只会把整行挤到只剩省略号。
+   ⚠️ 这里刻意**不用** .dim-jh-modelRow：那个类带 cursor: pointer 与 hover 底色，
+   是给「整行可点切换开关」的 label 用的，用在这里会被读成可点。 */
+.dim-jh-gatewayModelRow { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 5px 6px; border-radius: 6px; }
+.dim-jh-gatewayModelRow:hover { background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
+/* ⚠️ 这里曾有一条「.dim-jh-gatewayModelRow .dim-jh-modelId { max-width: 52% }」
+   （把模型列表那 46% 的上限放宽到 52%）。**已删除**，别再写回来：
+   它的优先级 (0,2,0) 与下面那条两级通配 (0,2,0) **完全相同**，
+   于是谁生效**只取决于源码先后** —— 一个纯粹靠「写在对的位置」维持的假象。
+   下面那条把 max-width 直接设成 none（且覆盖了开关行与 curl 代码块），
+   一行里本该完整显示的东西，不该还留一个 52% 的上限等着被谁「压过去」。
+   ⚠️ 本文件是 JS 模板字符串，注释里**绝不能出现反引号**（我在这条注释上
+   第四次踩到同一个坑）—— 类名与代码一律裸写。 */
+
+/* ── 网关弹窗里的「胶囊」一律完整显示（用户报障 2026-10-04）──
+   原话：「网关这里面的所有胶囊内容都没有完整显示，应当修正使其完整显示内容」。
+   胶囊 = 行内的 <code> ID 块（.dim-jh-modelId）、能力标记（.dim-jh-modelBadge）、
+   档位对照行里的模型名（.dim-jh-effortModel）。
+
+   ⚠️ 根因是那三个类**天生带截断**，而且是给**别处**设计的：
+   .dim-jh-modelId 是 max-width 46% + ellipsis + nowrap（模型列表要紧凑，
+   一行里还得塞下开关）；.dim-jh-modelBadge 是 nowrap；模型名同理。
+   而网关弹窗里这些内容**就是要被读/被抄的东西** —— 截断等于让功能失效。
+
+   ⚠️ 只能加 .dim-jh-gatewayModal 前缀：.dim-jh-modelId 在模型列表里
+   另有用途（那里的紧凑是刻意的，见 model-filter.js 的模块注释），
+   全局去掉 max-width 会把整个模型列表撑坏。
+
+   ⚠️⚠️ **选择器只能写「弹窗 + 类名」两级，绝不能夹中间祖先**（这里返工过一次）：
+   第一版写的是「弹窗 + gatewayModelRow + modelId」这类**带中间祖先**的三条规则，
+   结果**只覆盖到了卡片内的胶囊**。用户随即又截图框出三处仍在截断的地方，
+   它们的祖先链各不相同：
+     - 开关行：modalBody > modelRow > modelInfo > code
+     - 两处 curl 代码块：modalBody > code
+   三条祖先限定规则**一条都匹配不上** ⇒ 用户看到的还是「供 Pi / Cont…」与
+   「curl … -H "…"」被吃掉。
+   ⚠️ 当时的「机械审计」脚本也没抓到，因为它只检查**类名**有没有被某条网关规则
+   覆盖 —— modelId 在卡片那条规则里「有覆盖」，于是整体判通过。
+   **教训：判断一个元素会不会被截断，必须看它实际的祖先链，不能看类名是否出现过。**
+   现在改成两级通配，弹窗内任何位置的这个类都生效（含 API KEY 明文那块 code）。
+   ⚠️ 本文件整体是 JS 模板字符串，注释里**绝不能出现反引号** ——
+   我在上面这段注释里用反引号括类名，第三次踩到了同一个坑（构建直接失败）。
+   要强调就用「」或 ** 包住类名，永远裸写。 */
+.dim-jh-gatewayModal .dim-jh-modelId,
+.dim-jh-gatewayModal .dim-jh-modelName {
+  max-width: none; overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere;
+}
+/* 能力标记（「可发图片」「需对照」）：短标签，但 flex: none + nowrap 会在
+   窄面板下被挤出可视区 —— 允许换行远比被切掉好。 */
+.dim-jh-gatewayModal .dim-jh-modelBadge {
+  flex: 0 0 auto; white-space: normal; overflow-wrap: anywhere;
+}
+/* ⚠️ 顶部开关行的标题「启用本机网关」**不许被挤**（去掉 ID 胶囊的 max-width 后
+   新引入的问题）：胶囊不再有 46% 上限，于是它把整行宽度吃光，
+   而 .dim-jh-modelName 是 flex: 0 1 auto（可收缩）⇒ 标题被压成
+   「启用本机网」「关」两行。
+   判据：网关弹窗的开关行里，标题保持固有宽度（flex: none），
+   让**副标题**去换行 —— 副标题是补充说明，标题是动作主体。
+   ⚠️ 本文件是 JS 模板字符串，注释里**绝不能出现反引号**（又踩了一次，第五次）。 */
+.dim-jh-gatewayModal .dim-jh-modelInfo > .dim-jh-modelName { flex: none; }
+/* 搜索/空结果的容器：与对照表的 .dim-jh-effortEmpty 同款观感。 */
+.dim-jh-gatewayEmpty { padding: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* ── 模型列表的「计费/来源」分组（订阅 / 免费 / Cline Cloud / 按量计费）──
    分组由 model-groups.js 的纯函数决定（判据见其模块注释）；这里只管观感。
