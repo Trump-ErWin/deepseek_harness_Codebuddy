@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   clineExhaustedAdvice,
   clineRateLimitResetAt,
@@ -148,7 +148,35 @@ describe('clineRateLimitResetAt：取值优先级', () => {
 })
 
 describe('clineExhaustedAdvice：三种 429/402 的动作必须分开说', () => {
+  /**
+   * ⚠ 下面两条把时钟**钉死**（2026-10-04 修复）。
+   *
+   * 原因：`clineExhaustedAdvice` → `formatResetIn(resetAtMs)` 内部取**真实**
+   * `Date.now()`，而 `resetAt` 是硬编码的**绝对时刻**。两者之差随「什么时候跑
+   * 这条用例」变化，于是文案在三种形态之间跳：
+   *
+   * | 距 `resetAt` | `formatResetIn` 输出 | 原断言 `/预计 \d+(\.\d)? 小时后重置/` |
+   * |---|---|---|
+   * | > 1 小时 | `1.8 小时` | ✅ |
+   * | 1 分钟 ~ 1 小时 | `43 分钟` | ❌ |
+   * | ≤ 0 | `即将重置` | ❌ |
+   *
+   * ⇒ 原用例**只在 UTC 09:49 之前的那个窗口里成立**，之后永久变红
+   * （实测 2026-10-04 10:06 UTC：`expected '…预计 43 分钟后重置…'`）。
+   * **与被测代码无关**，是脚手架把「当前时刻」当成了常量。
+   *
+   * ⚠ 用 `vi.setSystemTime` 而不是把 `resetAt` 改成 `Date.now() + N`：
+   * 后者会让断言**跟着实现漂**（`N` 取多少都能过），且丢掉「跨过 1 小时
+   * 分界会换措辞」这个真正需要锁住的行为。
+   */
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   it('★ 当日免费额度：说清「等不到头」并给出立刻可用的通道', () => {
+    // 钉在距重置 1 小时 49 分 ⇒ 走「小时」分支。
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-04T09:00:00.000Z'))
     const hint = parseClineRateLimitHint(REAL_DAILY_FREE_BODY)
     const resetAt = Date.parse('2026-10-04T10:49:00.000Z')
     const advice = clineExhaustedAdvice(429, hint, resetAt)
@@ -174,6 +202,38 @@ describe('clineExhaustedAdvice：三种 429/402 的动作必须分开说', () =>
     expect(advice).not.toContain('**')
     // 长度上限：与其它 provider 的额度文案同量级（用户明确要求「改简短点」）。
     expect(advice.length).toBeLessThan(100)
+  })
+
+  it('★ 距重置不足 1 小时时改说「N 分钟」（分界另一侧也要锁）', () => {
+    /**
+     * ⚠ 这条是上面那条的**另一半**：只锁「小时」分支的话，把 1 小时的分界
+     * 改掉（比如 `3_600_000` → `7_200_000`）不会有任何用例变红。
+     * 两个分支都必须锁，阈值才是被测行为而不是实现细节。
+     */
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-04T10:20:00.000Z'))
+    const advice = clineExhaustedAdvice(
+      429,
+      parseClineRateLimitHint(REAL_DAILY_FREE_BODY),
+      Date.parse('2026-10-04T10:49:00.000Z'),
+    )
+    expect(advice).toMatch(/预计 29 分钟后重置/)
+    // ⚠ 分钟分支同样不得退化成 markdown / 复述原文（与上面那条同款约束）。
+    expect(advice).not.toContain('**')
+    expect(advice).not.toContain('Daily free limit')
+    expect(advice.length).toBeLessThan(100)
+  })
+
+  it('已过解禁时刻时说「即将重置」，不报负数时长', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-04T11:00:00.000Z'))
+    const advice = clineExhaustedAdvice(
+      429,
+      parseClineRateLimitHint(REAL_DAILY_FREE_BODY),
+      Date.parse('2026-10-04T10:49:00.000Z'),
+    )
+    expect(advice).toContain('即将重置')
+    expect(advice).not.toMatch(/预计 -\d/)
   })
 
   it('普通 429（短时限流）仍是「等一会儿 / 换账号」，且不丢原文（未识别语义才附）', () => {
