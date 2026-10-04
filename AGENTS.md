@@ -7722,6 +7722,75 @@ pub fn tokens_in_context_window(&self) -> u64 {
 - 回归用例：`tests/unit/openai-gateway-responses.spec.ts`（转换 + 流式/非流式事件序列）
   与 `tests/unit/openai-gateway-server.spec.ts` 的「Responses API 出口」段（HTTP 层）。
 
+### ⚠️⚠️ 工具结果**可以带图**：`textFromContent` 不能用在 tool 结果上（真实报障，2026-10-04）
+
+**用户报障**：在 Codex 里走本机网关接 **TRAE**，一让模型看图就整轮失败：
+
+```
+{"error":{"message":"tool 消息的内容不能包含图片","type":"unsupported_content","code":"unsupported_content"}}
+```
+
+用户当场就问「trae 是可以发送图片的啊？」—— **这个怀疑是对的**：TRAE 确实支持图片，
+而且它**支持工具结果内嵌的图片**（`read_image` 那类）。这句报错**不是 trae 说的**，
+是**本网关自己抛的**（`messages.ts` 的 `textFromContent`）。
+
+**根因**：工具结果（Chat 的 `role:'tool'` / Responses 的 `function_call_output`）
+原先都只走 `textFromContent`，而它对 `image_url` **一律抛错**。于是：
+
+- Codex 的 `view_image` 工具把读到的图**直接放进 `function_call_output.output`**
+  （`[{type:'input_image',image_url:'data:image/png;base64,…'}]`）；
+- 网关解析该 item 时立刻 400 ⇒ **整轮对话失败**；
+- ⚠️ 更糟的是**坏报文已落进会话历史**，之后每次请求原样重放 ——
+  用户连点两次「继续」都是同一个错（实测 ordinal 2748 与 2758 逐字相同）。
+
+**会话证据**（`~/.codex/sessions/2026/10/02/rollout-…-01a0fc83….jsonl`）：
+
+| ordinal | 内容 |
+|---|---|
+| 2736 | `function_call_output`，`call_id=call_7ec7d6b4…`，output = `[{type:'input_image'}]` |
+| 2738 | `function_call_output`，`call_id=call_e1a02c4f…`，output = `[{type:'input_image'}]` |
+| 2748 | `task_complete` ← **`tool 消息的内容不能包含图片`** |
+| 2758 | `task_complete` ← 同一错误（重放历史） |
+
+⚠️ **同一会话里 ordinal 920/921 也有带图的 `view_image` 结果却没失败** ——
+别被它误导。那两轮跑的是 `gpt-6.1-sol`（**没有 `provider/` 前缀**），
+根本没过本网关（`parseModelRoute` 对无前缀的 model 直接抛错，走的是另一条路径）。
+**判据：只有 `provider/model` 形态的请求才会到达本网关**，对照时先看模型名。
+
+**修法**（两条协议路径必须**同时**改，判据只有一份）：
+
+| 位置 | 修法 |
+|---|---|
+| `messages.ts` 的 `role:'tool'` | content 改走 **`partsFromContent`**（与 user 消息同一份图片入站实现） |
+| `responses.ts` 的 `function_call_output` | 新增 `outputParts()`，同样走 `partsFromContent` |
+
+⚠️ **`textFromContent` 的图片分支保留但改文案**：仍会走到它的只剩
+`assistant` / `system`（这两种角色的 content 本就**没有**图片通道，适配器只声明文本
+输出）。**必须继续明确报错**——静默压成空串会让用户以为图发出去了。
+
+⚠️ **适配器侧早已支持，缺陷只在网关**：`trae-adapter.ts` 的 `collectImages` /
+`userContentParts` 会**递归**消费 `tool-result` 的内层图片，并把它挂到 `role:'tool'`
+**之后**的独立 user 消息（`pendingToolImages`）—— 那是上游 `code=4027` 那条真实缺陷的
+修法（见 `tests/unit/trae-adapter.spec.ts` 的「工具结果内嵌图片不得插在 role:tool 之前」）。
+**所以这里不需要动适配器**，网关只要把图正确放进 `tool-result` 的内层即可。
+
+**判据不能只是「不报错」**：图片必须**真的落进 `tool-result` 的内层 content**。
+静默压成文本或丢掉同样是缺陷（用户以为模型看到了图，答案却是凭文本猜的）。
+
+**反向验证**（`mutate-tool-image.mjs`，5 个变异全击杀 / 0 存活）：
+
+| 变异 | 变红的用例 |
+|---|---|
+| Responses 退回 `textFromContent` | ★ 工具结果的 output 带图时…（两条） |
+| Chat 退回 `textFromContent` | ★ role=tool 的内容带图时… |
+| Responses **静默丢弃**图片 | ★ 工具结果的 output 带图时…（两条） |
+| Chat **静默丢弃**图片 | ★ role=tool 的内容带图时… |
+| assistant 带图改为静默丢弃 | assistant 带图仍明确报错 |
+
+⚠️ **「静默丢弃」那两个变异是本次最关键的一条**：只断言「不抛错」的用例会被它们
+放过，必须断言**内层块类型数组**（`['image']` / `['text','image']`）与
+**附件服务 `saveImage` 的调用次数**。
+
 ## ⚠️ 思考档位有**两套词汇表**：网关必须翻译，客户端表达不出私有 id（真实报障，2026-10-03）
 
 **用户报障的形态**：在 CC Switch（给 Codex 生成模型目录的那一层）里按 DSH 界面显示的
