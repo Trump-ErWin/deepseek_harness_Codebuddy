@@ -178,6 +178,16 @@ $key = (Get-Content "$env:USERPROFILE\.dsh\openai-gateway\api-key" -Raw).Trim()
 > 限制取自附件服务的 `imageLimits`：单张 ≤ 20MB、单条消息 ≤ 20 张 / 200MB、
 > 边长 ≤ 8192，支持 `png` / `jpeg` / `webp` / `gif`。同一张图重复发送按内容寻址
 > （`sha256:`）去重，不会重复占空间。
+>
+> **工具结果同样可以带图**（2026-10-04 修）：Codex 的 `view_image`、DSH 的 `read_image`
+> 这类工具会把图片直接放进**工具结果**里（Chat 的 `role:"tool"` content /
+> Responses 的 `function_call_output.output`）。网关把这类图片走**与 user 消息同一份**
+> 入站实现落成 `ImageBlock`，再由各适配器挂到 `role:"tool"` **之后**的独立 user 消息
+> （上游要求 tool 消息紧跟其 `tool_calls`，中间插消息会被拒）。
+> ⚠️ 早先工具结果只走纯文本提取，遇到图片**直接 400**「tool 消息的内容不能包含图片」，
+> 且坏报文会落进历史被每轮重放 —— 一让模型看图整条会话就废掉，只能换 provider 恢复。
+> `assistant` / `system` 的 content **没有**图片通道（适配器只声明文本输出），
+> 这两种角色带图仍会明确报错而不是静默丢弃。
 
 > 💡 填错模型名时网关会返回 `404` + `model_not_found`（**不是** 502 —— 502 会被
 > 客户端当成可重试故障白耗额度），并在消息里附上正确拼写，例如：

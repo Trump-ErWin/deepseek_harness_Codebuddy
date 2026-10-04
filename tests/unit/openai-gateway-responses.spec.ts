@@ -88,6 +88,61 @@ describe('Responses API 请求转换', () => {
     }))
   })
 
+  // ⚠️⚠️ **真实缺陷回归**（2026-10-04，用户报障）：「codex 里用 trae 出现
+  // tool 消息的内容不能包含图片」。Codex 的 `view_image` 把读到的图直接放进
+  // `function_call_output.output`（`[{type:'input_image',image_url:'data:…'}]`），
+  // 而网关原先对工具结果只走 `textFromContent` —— 它对图片**一律抛错** ⇒
+  // 一让模型看图整轮就 400，且坏报文落进历史被每次重放，换 provider 才能恢复。
+  //
+  // ⚠️ 判据不能只是「不报错」：**图片必须真的落进 tool-result 的内层 content**。
+  // 静默压成文本/丢掉同样是缺陷（用户以为模型看到了图）。
+  it('★ 工具结果的 output 带图时：图片落进 tool-result 内层（不是报错，也不是静默丢弃）', async () => {
+    const saved: string[] = []
+    const imageBridge = {
+      saveImage: async ({ data, mediaType }: { data: Uint8Array; mediaType: string }) => {
+        saved.push(mediaType)
+        return { attachmentId: `sha256:${mediaType}:${data.length}`, mediaType }
+      },
+    }
+    const options = await toResponsesGenerateOptions({
+      model: 'trae/deepseek-v4.1-flash',
+      input: [
+        { type: 'function_call', id: 'fc_1', call_id: 'call-1', name: 'view_image', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call-1', output: [
+          { type: 'input_image', image_url: PNG, detail: 'high' },
+        ] },
+      ],
+    }, abort(), undefined, undefined, { bridge: imageBridge })
+
+    const results = options.messages
+      .flatMap(message => message.content ?? [])
+      .filter(block => block.type === 'tool-result')
+    expect(results).toHaveLength(1)
+    expect(results[0].content.map(block => block.type)).toEqual(['image'])
+    expect(results[0].content[0]).toMatchObject({ type: 'image' })
+    // 图片真的经附件服务落盘了（不是凭空造一个块）。
+    expect(saved).toEqual(['image/png'])
+  })
+
+  it('★ 工具结果 output 为「文字 + 图」时两类块都在且顺序保持', async () => {
+    const options = await toResponsesGenerateOptions({
+      model: 'trae/deepseek-v4.1-flash',
+      input: [
+        { type: 'function_call', id: 'fc_1', call_id: 'call-1', name: 'view_image', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call-1', output: [
+          { type: 'input_text', text: '截图如下' },
+          { type: 'input_image', image_url: PNG },
+        ] },
+      ],
+    }, abort(), undefined, undefined, { bridge })
+
+    const results = options.messages
+      .flatMap(message => message.content ?? [])
+      .filter(block => block.type === 'tool-result')
+    expect(results[0].content.map(block => block.type)).toEqual(['text', 'image'])
+    expect(results[0].content[0]).toMatchObject({ type: 'text', text: '截图如下' })
+  })
+
   it('★ 连续的 assistant 项合并成一条消息（否则每个用过工具的会话都会给上游留下两条连续 assistant）', async () => {
     const options = await toResponsesGenerateOptions({
       model: 'qoder/qfmodel',

@@ -2,6 +2,17 @@ import { describe, expect, it } from 'vitest'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { parseModelRoute, toGenerateOptions, OpenAiGatewayError, normalizeReasoningEffort, normalizeMaxTokens, type ReasoningEffortNotice } from '../../src/openai-gateway/messages.js'
 
+/** 1×1 透明 PNG 的 data URL（图片入站用例共用，与 responses spec 同一份）。 */
+const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+
+/** 附件服务替身：记录落盘次数，便于断言「图片真的到了」而非「没报错」。 */
+const bridge = {
+  saveImage: async ({ data, mediaType }: { data: Uint8Array; mediaType: string }) => ({
+    attachmentId: `sha256:${mediaType}:${data.length}`,
+    mediaType,
+  }),
+}
+
 /**
  * `reasoning_effort` 的归一化。
  *
@@ -210,6 +221,43 @@ describe('OpenAI gateway request conversion', () => {  it('parses a namespaced m
     expect(normalizeReasoningEffort('high', undefined, 'codearts', 'deepseek-v4-flash')).toBe('on')
     expect(normalizeReasoningEffort('max', undefined, 'codearts', 'deepseek-v4-flash')).toBe('on')
     expect(normalizeReasoningEffort('none', undefined, 'codearts', 'deepseek-v4-flash')).toBe('off')
+  })
+
+  // ⚠️ 与 Responses 路径同因同修（缺陷在共享的 `textFromContent` 判据上）：
+  // `role:'tool'` 的 content 也支持图片，两条协议必须一致 ——
+  // 只修一条会让「同一份历史在两个端点上一条能跑、一条 400」。
+  it('★ role=tool 的内容带图时：图片落进 tool-result 内层（Chat 路径同样修好）', async () => {
+    const saved: string[] = []
+    const imageBridge = {
+      saveImage: async ({ data, mediaType }: { data: Uint8Array; mediaType: string }) => {
+        saved.push(mediaType)
+        return { attachmentId: `sha256:${mediaType}:${data.length}`, mediaType }
+      },
+    }
+    const options = await toGenerateOptions({
+      model: 'trae/deepseek-v4.1-flash',
+      messages: [
+        { role: 'assistant', content: null, tool_calls: [
+          { id: 'call-1', type: 'function', function: { name: 'view_image', arguments: '{}' } },
+        ] },
+        { role: 'tool', tool_call_id: 'call-1', content: [{ type: 'image_url', image_url: { url: PNG } }] },
+      ],
+    }, new AbortController().signal, undefined, undefined, { bridge: imageBridge })
+
+    const results = options.messages
+      .flatMap(message => message.content ?? [])
+      .filter(block => block.type === 'tool-result')
+    expect(results).toHaveLength(1)
+    expect(results[0].content.map(block => block.type)).toEqual(['image'])
+    expect(saved).toEqual(['image/png'])
+  })
+
+  it('assistant 带图仍明确报错（没有图片通道，不得静默丢弃）', async () => {
+    await expect(toGenerateOptions({
+      model: 'trae/deepseek-v4.1-flash',
+      messages: [{ role: 'assistant', content: [{ type: 'image_url', image_url: { url: PNG } }] }],
+    }, new AbortController().signal, undefined, undefined, { bridge }))
+      .rejects.toThrow(/不能包含图片/)
   })
 
   it('rejects forced function tool choice in the first version', async () => {
