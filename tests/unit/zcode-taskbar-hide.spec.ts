@@ -140,19 +140,26 @@ describe('Linux：buildLinuxSkipTaskbarArgs', () => {
   })
 })
 
-describe('平台分派：三个平台各走哪条路', () => {
-  it('★ win32 → Windows 实现；linux → Linux 实现；darwin → 不做', () => {
+describe('平台分派：各平台走哪条路', () => {
+  it('★ win32 → Windows 实现；linux → Linux 实现；darwin → macOS 实现（osascript 最小化）', () => {
     const src = fnSource('hideWindowFromTaskbar')
     expect(src).toMatch(/platform === 'win32'[\s\S]{0,60}hideWindowWindows\(pid\)/)
     expect(src).toMatch(/platform === 'linux'[\s\S]{0,60}hideWindowLinux\(pid\)/)
-    // macOS 明确不做（并在注释里写明理由）——不应误落到某条 Linux/Windows 分支
-    expect(src).toContain('macOS')
+    // macOS 走自己的实现，且不得误落到 Windows/Linux 那两条分支上。
+    expect(src).toMatch(/platform === 'darwin'[\s\S]{0,60}hideWindowMacos\(pid, exeName\)/)
     expect(src).not.toMatch(/darwin'\s*\)\s*hideWindowWindows/)
+    expect(src).not.toMatch(/darwin'\s*\)\s*hideWindowLinux/)
   })
 
   it('★ 整个分派被 try 包住（任何平台失败都不能影响 captcha）', () => {
     const src = fnSource('hideWindowFromTaskbar')
     expect(src).toMatch(/try \{[\s\S]*hideWindowWindows[\s\S]*catch \{/)
+  })
+
+  it('★ 调用点必须受 `hide` 门控（hideWindow:false 的语义是「别动我的窗口」）', () => {
+    const src = fnSource('launch')
+    expect(src).toMatch(/if \(hide && this\.child\?\.pid !== undefined\)/)
+    expect(src).toMatch(/hideWindowFromTaskbar\(this\.child\.pid, basename\(executable\)\)/)
   })
 })
 
