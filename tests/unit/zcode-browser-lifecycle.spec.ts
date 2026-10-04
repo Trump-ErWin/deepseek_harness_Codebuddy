@@ -27,19 +27,27 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { sourceScope } from '../helpers/source-scope.js'
 
 const SRC = readFileSync(
   resolve(dirname(fileURLToPath(import.meta.url)), '../../src/zcode-captcha.ts'),
   'utf8',
 )
 
+/**
+ * ⚠ 取方法体**必须**走 `sourceScope().fn()`，不能用 `indexOf('\n  }\n')` 切片 ——
+ * 那样在 CRLF 检出（本机 `core.autocrlf=true`）下返回 -1，于是 `slice` 切到
+ * **文件尾部**：断言看似通过，实际检查的是整个文件，分不清命中的是不是这个方法。
+ * 缘由见 `tests/helpers/source-scope.ts` 的文件头（Gitee issue IKJMG1）。
+ */
+const scope = sourceScope(SRC, 'zcode-captcha.ts')
+
 describe('浏览器进程树清理（防泄漏）', () => {
   it('★ 必须用 spawnSync（同步）而非 spawn —— 异步会让调用方以为已清理', () => {
     // ⚠ 这是本缺陷的**核心**：异步 taskkill 后立即返回，旧实例还活着占端口。
     expect(SRC).toContain("spawnSync('taskkill'")
     // 且不得在 killProcessTree 里用异步 spawn（否则又变成 fire-and-forget）。
-    const killTree = SRC.slice(SRC.indexOf('private killProcessTree'))
-    const body = killTree.slice(0, killTree.indexOf('\n  }\n'))
+    const body = scope.fn('killProcessTree')
     expect(body).not.toMatch(/[^S]spawn\('taskkill'/)
   })
 
@@ -106,8 +114,7 @@ describe('临时 profile 清理', () => {
   })
 
   it('dispose 会先杀进程树再删目录', () => {
-    const dispose = SRC.slice(SRC.indexOf('dispose(): void'))
-    const body = dispose.slice(0, dispose.indexOf('\n  }\n'))
+    const body = scope.fn('dispose')
     expect(body.indexOf('this.kill()')).toBeLessThan(body.indexOf('tryRemove(0)'))
   })
 })
