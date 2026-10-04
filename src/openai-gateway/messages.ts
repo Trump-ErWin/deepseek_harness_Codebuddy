@@ -238,10 +238,16 @@ export function textFromContent(content: unknown): string {
     }
     const item = part as { type?: unknown; text?: unknown }
     if (item.type === 'text' && typeof item.text === 'string') return item.text
-    // ⚠️ 这里**不再**因为 image_url 抛错：图片由 partsFromContent 异步处理。
-    // 但纯文本路径（如 tool 消息）遇到图片仍然要拒绝 —— 它拿不到附件桥接。
+    // ⚠️ 图片由 `partsFromContent` 异步处理（user 消息与 **工具结果**都走它）。
+    // 仍会走到这里的只有 assistant / system —— 这两种角色的 content 本就**没有**
+    // 图片通道（适配器只声明文本输出），故明确拒绝而不是静默压成空串。
     if (item.type === 'image_url') {
-      throw new OpenAiGatewayError('tool 消息的内容不能包含图片', 400, 'unsupported_content', 'unsupported_content')
+      throw new OpenAiGatewayError(
+        'assistant / system 消息的内容不能包含图片（只有 user 消息与工具结果支持图片）',
+        400,
+        'unsupported_content',
+        'unsupported_content',
+      )
     }
     throw new OpenAiGatewayError('message.content contains an unsupported part')
   }).join('')
@@ -311,10 +317,17 @@ async function convertMessage(
     if (typeof value.tool_call_id !== 'string' || value.tool_call_id.length === 0) {
       throw new OpenAiGatewayError('tool messages require tool_call_id')
     }
+    // ⚠️ 工具结果的 content **同样支持图片**（2026-10-04 修，真实报障）。
+    // 早先这里走 `textFromContent`，而它对 `image_url` 一律抛错 ⇒
+    // 「读图类工具」（Codex 的 `view_image`、DSH 的 `read_image`）的结果
+    // 让整轮对话 400（用户看到「tool 消息的内容不能包含图片」）。
+    // 图片走与 user 消息**同一份**入站实现（附件服务落盘），故这里复用
+    // `partsFromContent`；各适配器本就递归消费 `tool-result` 的内嵌图片
+    // （见 `trae-adapter.ts` 的 `collectImages` / `userContentParts`）。
     return createGatewayMessage('user', [{
       type: 'tool-result',
       toolCallId: value.tool_call_id as never,
-      content: [{ type: 'text', text: textFromContent(value.content) }],
+      content: await partsFromContent(value.content, bridge, limits),
     }], { kind: 'tool', callId: value.tool_call_id as never })
   }
   throw new OpenAiGatewayError(`unsupported message role: ${String(role)}`)
