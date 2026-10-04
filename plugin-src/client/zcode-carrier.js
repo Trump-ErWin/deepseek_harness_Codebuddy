@@ -130,7 +130,7 @@ const CARRIER_FAILURE_LABELS = Object.freeze({
   [CARRIER_FAILURE.slotRejected]: 'param 已产出但供给槽没收（server 判不合格：垃圾产物 / 空串 / 异常短）',
   [CARRIER_FAILURE.roundCrashed]: '这一轮整条路抛了（guest 失联 / RPC 通道断）⇒ 已回收 guest，下轮重建',
   [CARRIER_FAILURE.noCarrierUrl]: 'server 说现在没有载体页地址（DSH_ZCODE_INTERNAL_CARRIER=0 或候选端口全被占）'
-    + ' ⇒ 这是**安静**的一类，不是故障；本窗口照旧走外挂 chromium',
+    + ' ⇒ 这是「安静」的一类，不是故障；本窗口照旧走外挂 chromium',
   [CARRIER_FAILURE.acquireFailed]: '主进程没给出租约（acquire 抛错或形状不对）⇒ 内部载体在此桌面壳不可用',
 })
 
@@ -715,7 +715,7 @@ export function startCarrierContribution (options = {}) {
       log('info', `${LOG_PREFIX} 已贡献一个 param：elapsedMs=${String(payload.elapsedMs)}ms`
         + '（从「本轮开始产」起算，含导航 + SDK + 等待 ⇒ server 拿它反推产出时刻）、'
         + `paramLen=${String(payload.param.length)} 字符`
-        + `${payload.interactive ? '、**已被降级成交互式验证**（设备信誉预警，已回传 host）' : ''}`)
+        + `${payload.interactive ? '、已被降级成交互式验证（设备信誉预警，已回传 host）' : ''}`)
       return true
     }
     reportFailure(CARRIER_FAILURE.slotRejected,
