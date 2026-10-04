@@ -973,6 +973,24 @@ export interface RpcGatewayStatusResponse {
 export interface RpcGatewayModel {
   /** 可直接填进 agent 配置的完整 ID（`provider/模型名`）。 */
   id: string
+  /**
+   * 该条目所属的 provider key（**采集侧给的权威拆分**，不是从 `id` 切出来的）。
+   *
+   * ⚠️ 存在的理由：设置页要按「一家供应商一张卡片」分组，而模型名里**允许带
+   * 斜杠**（实测 Cline 的 `cline/anthropic/claude-sonnet-5.5`）。前端按首个 `/`
+   * 反推 provider 在正常数据上恰好也对，但那是**巧合**而非契约 —— 一旦某家
+   * provider 的模型名以 `/` 开头、或 provider key 本身含 `/`，反推就错位，
+   * 表现为「模型被分到了不存在的那一家」。分组是用户的语义，故由采集侧给定。
+   */
+  provider: string
+  /**
+   * provider **内部**的模型名（不含 `<provider>/` 前缀）。
+   *
+   * 卡片头已经把供应商写清楚了，行内再重复一遍前缀只是噪声：实测
+   * `codearts/deepseek-v4.1-flash` 这类 id 会占满整行，窄面板下被截成
+   * `codearts/deepse…` —— 用户既看不出模型名，也读不到能复制的 ID。
+   */
+  model: string
   /** 模型展示名，仅供人辨认。 */
   name: string
   /**

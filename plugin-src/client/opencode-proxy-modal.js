@@ -291,7 +291,7 @@ export function OpencodeKeyModal({ error, busy, inputRef, onSubmit, onSubmitAnon
             // 不同匿名通道配**不同代理**；指纹分离的价值是防关联。
             // 不说清楚的话，用户加 5 条匿名通道却只看到一份额度，会以为坏了。
             React.createElement('p', { className: 'dim-jh-hint' },
-              '注意：匿名通道的额度按**出口 IP** 计算。多条匿名通道若共用同一个出口，'
+              '注意：匿名通道的额度按「出口 IP」计算。多条匿名通道若共用同一个出口，'
               + '额度不会增加；给它们分别配置不同代理，才会各自获得独立额度。'),
             error
               ? React.createElement('p', { className: 'dim-jh-error', role: 'alert' }, '添加失败：' + error)
