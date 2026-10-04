@@ -52,9 +52,18 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { ZcodeCaptchaBrowser, validateCaptchaParam } from '../../src/zcode-captcha.js'
+import { sourceScope } from '../helpers/source-scope.js'
 
 const SRC_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/zcode-captcha.ts')
 const SRC = readFileSync(SRC_PATH, 'utf8')
+
+/**
+ * ⚠ 取方法体**必须**走 `sourceScope().fn()`，不能用 `indexOf('\n  }\n')` 切片 ——
+ * 那样在 CRLF 检出（本机 `core.autocrlf=true`）下返回 -1，于是 `slice` 切到
+ * **文件尾部**：断言看似通过，实际检查的是整个文件，分不清命中的是不是这个方法。
+ * 缘由见 `tests/helpers/source-scope.ts` 的文件头（Gitee issue IKJMG1）。
+ */
+const scope = sourceScope(SRC, 'zcode-captcha.ts')
 
 /** 构造一个**合法的** captcha param（过 `validateCaptchaParam`）。 */
 function makeValidParam(certifyId = 'CERT123'): string {
@@ -269,8 +278,7 @@ describe('源码契约：这三条都是实测踩过的坑，别改回去', () =
   })
 
   it('★ `mintOnPage` 必须按 `prepared` 守卫准备步骤', () => {
-    const start = SRC.indexOf('private async mintOnPage')
-    const body = SRC.slice(start, SRC.indexOf('\n  }\n', start))
+    const body = scope.fn('mintOnPage')
     expect(body).toMatch(/if \(page\.prepared !== true\) \{/)
     // 准备块里必须包含 DOM 重置与 SDK 注入
     expect(body).toMatch(/document\.body\.innerHTML|buildDomExpression\(\)/)

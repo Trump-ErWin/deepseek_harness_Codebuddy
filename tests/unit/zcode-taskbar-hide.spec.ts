@@ -38,18 +38,24 @@ import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { buildLinuxSkipTaskbarArgs, parseWmctrlList } from '../../src/zcode-captcha.js'
+import { sourceScope } from '../helpers/source-scope.js'
 
 const SRC = readFileSync(
   resolve(dirname(fileURLToPath(import.meta.url)), '../../src/zcode-captcha.ts'),
   'utf8',
 )
 
-/** 截取某个函数的源码（从 `function NAME` 到下一个顶层 `}` 之后）。 */
-function fnSource(name: string): string {
-  const start = SRC.indexOf(`function ${name}`)
-  expect(start, `找不到 function ${name}`).toBeGreaterThan(0)
-  return SRC.slice(start, SRC.indexOf('\n}\n', start))
-}
+/**
+ * 截取某个函数的源码 —— **恰好是它自己**。
+ *
+ * ⚠ 这里**不能**手写「找下一个列 0 的 `}`」：那在 CRLF 检出下会返回整个文件
+ * 尾部（断言恒真、却分不清命中的是不是这个函数），在 LF 检出下会截到函数体内
+ * 第一个列 0 的 `}`（本函数的 PowerShell 脚本内联了一段 C#，其类体闭合括号正好
+ * 落在列 0）⇒ Windows 侧 7 条源码契约假失败。**两个方向都错**（issue IKJMG1），
+ * 完整缘由见 `tests/helpers/source-scope.ts` 的文件头。
+ */
+const scope = sourceScope(SRC, 'zcode-captcha.ts')
+const fnSource = scope.fn
 
 describe('Linux：parseWmctrlList 解析 wmctrl -lp', () => {
   /** 真实格式（文档语义）：id 桌面号 pid 主机名 标题 */
