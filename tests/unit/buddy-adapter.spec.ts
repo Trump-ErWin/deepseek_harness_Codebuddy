@@ -2853,3 +2853,119 @@ describe('安全策略拦截（11140）：账号冷却 + 流内错误帧', () =>
     expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
   })
 })
+
+/**
+ * 内容级风控（`code 11128`）**不是账号级拦截** —— Gitee issue IKJNA1。
+ *
+ * ## 实测报文（本机 2026-10-05，workbuddy / CodeBuddy 双端点一致）
+ *
+ * ```json
+ * {"code":11128,"msg":"Illegal API invocation from an unapproved channel",
+ *  "requestId":"…","displayMsg":{"en":"The request was blocked by security policy…"}}
+ * ```
+ *
+ * 触发条件是 **system 里的某个模板句**（ZCode 的 gitStatus 注入
+ * `Main branch (you will usually use this for PRs)`），与账号无关：同一账号
+ * 换掉那一句就通（HTTP 200）。
+ *
+ * ## 因此这批用例锁的是「**不要**把它认成账号拦截」
+ *
+ * 认成账号级会走 `isContentRejection` → 换号 + 标 30 分钟冷却
+ * （`policyBlockResetAtMs`）。而换号对内容级拦截**完全无效**：池里每个账号
+ * 都会在同一句上被拦，等于把整个账号池白锁 30 分钟，用户的整轮 agent 对话
+ * 在这半小时内全废 —— 故障从「一句话被拦」放大成「半小时不可用」。
+ *
+ * 真正的修法在网关出站方向把那一句改写掉，见
+ * `tests/unit/openai-gateway-tencent-fingerprint.spec.ts`。
+ */
+describe('内容级风控（11128）：不得当成账号级拦截换号/冷却', () => {
+  const unapprovedChannelBody = JSON.stringify({
+    code: 11128,
+    msg: 'Illegal API invocation from an unapproved channel',
+    requestId: 'c888aa59-d5e0-4047-a74c-6b6999f3004f',
+    displayMsg: {
+      en: 'The request was blocked by security policy. Please retry later or contact support.',
+      zh: '请求被安全策略拦截，请稍后重试或联系支持。',
+    },
+  })
+
+  /** 与上面 11140 那组同构的账号池替身（记录冷却标记）。 */
+  function recordingPool(accounts: Array<{ id: string; token: string }>) {
+    const recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    return {
+      recorded,
+      async findAccountIdByCredential(_provider: string, identity: string) {
+        return accounts.find((a) => a.token === identity)?.id ?? ''
+      },
+      async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number) {
+        recorded.push({ accountId, modelId, resetAtMs })
+      },
+      async getAvailableAccount(
+        _provider: string,
+        _modelId: string,
+        exclude?: ReadonlySet<string>,
+      ) {
+        const next = accounts.find((a) => exclude === undefined || !exclude.has(a.id))
+        if (next === undefined) return null
+        return { entry: { id: next.id }, credential: makeCredential({ access_token: next.token }) }
+      },
+      disabledModelsFor: () => new Set<string>(),
+    }
+  }
+
+  it('★ HTTP 400 + 11128：只发一次、不换号、不标 30 分钟冷却', async () => {
+    // 这条是**行为锁**：400 在适配器里走的是「非法请求」早退分支，本来就
+    // 不会进入换号/冷却那几条 —— 即便有人日后把 11128 加进
+    // `isContentRejection`，这一条也不会红（真正会红的是下面那条流内用例，
+    // 因为只有流内那条通道会真的调用该判据）。
+    const pool = recordingPool([
+      { id: 'acct-1', token: 'AT1' },
+      { id: 'acct-2', token: 'AT2' },
+    ])
+    let calls = 0
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('不该走到续期') },
+      accountPool: pool,
+      fetchImpl: async () => {
+        calls += 1
+        return new Response(unapprovedChannelBody, { status: 400 })
+      },
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    // 错误必须**抛出来**：静默吞掉会让客户端只显示 reason=unknown（issue 报障原句）。
+    expect(error).toBeInstanceOf(LlmError)
+    // 只发一次：换号对内容级拦截毫无意义，多发只是白烧往返。
+    expect(calls).toBe(1)
+    // 关键判据：一个账号都不许被标冷却。
+    expect(pool.recorded).toEqual([])
+  })
+
+  it('★ HTTP 200 + 流内 11128 帧：同样不得标账号冷却（这条才是判据真会被用到的地方）', async () => {
+    // 判据 `isContentRejection` 在**流内**那条通道（HTTP 200 + 无 choices 的
+    // 错误帧）会被直接调用。若把 11128 加进去，命中后走的是
+    // `markPolicyBlockedAccount` —— 也就是「30 分钟账号冷却」。
+    // 而 11128 是**内容级**拦截（同一账号换掉那一句就 200），冷却纯属误伤：
+    // 池里每个账号都会在同一句上被拦，用户半小时内整池不可用。
+    //
+    // 期望：这一帧**不**被当成 11140 那样的账号级拦截，因此不标冷却。
+    const pool = recordingPool([{ id: 'acct-1', token: 'AT1' }])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: pool,
+      fetchImpl: async () => sseResponse(`data: ${unapprovedChannelBody}\n\n`),
+    })
+    await collectChunks(adapter, streamOptions).catch(() => undefined)
+    expect(pool.recorded).toEqual([])
+  })
+
+  it('★ 11128 报文里出现「安全审核 / safety review」字样也**不**触发账号冷却', () => {
+    // 11128 的 displayMsg 措辞（「blocked by security policy」）与 11140 极近。
+    // 判据若被顺手放宽成「看到安全字样就算」，后果同上：整个池被锁 30 分钟。
+    expect(unapprovedChannelBody).toContain('11128')
+    expect(unapprovedChannelBody).not.toContain('11140')
+    expect(unapprovedChannelBody).not.toContain('request illegal')
+    // 措辞确实与 11140 高度相似 —— 这正是判据必须按 code 而非按文案收窄的原因。
+    expect(unapprovedChannelBody).toMatch(/security policy/i)
+  })
+})
