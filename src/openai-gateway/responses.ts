@@ -25,10 +25,17 @@
  *    ⚠️ 代价：同一个上游响应，两个端点在「正文死循环被截断」这种少数情况下
  *    会给出不同的文本。**这是本端点更正确**，不是缺陷；Chat 路径保持原样是
  *    因为「不顺手改既有端点的行为」。
- * 2. **`usage` 的字段口径与 Chat 路径一致**（`input_tokens` 是**未命中缓存**
- *    的输入，缓存命中单列在 `input_tokens_details.cached_tokens`）。OpenAI 官方
- *    的 `input_tokens` 含缓存命中，这里刻意不跟随：同一请求在两个端点上的
- *    数字必须能直接对比，否则「换了个 URL 用量就变了」会被当成计费缺陷。
+ * 2. **`usage` 的字段口径与 Chat 路径一致**（`input_tokens` 是**含缓存命中**
+ *    的总输入，命中部分单列在 `input_tokens_details.cached_tokens`）。
+ *    这正是 OpenAI 官方口径，也是 Codex 的判据（它算 `input_tokens - cached`
+ *    得未命中量，见 `usage.ts`）。
+ *    ⚠️ **这里曾经写反过**：初版刻意发 DSH 的互斥口径（`input_tokens` 只含
+ *    未命中），理由是「同一请求在两个端点上的数字必须能直接对比」。方向没错
+ *    —— 错在**统一到了错误的那一边**：OpenAI 官方 `input_tokens` 本就含缓存，
+ *    发不含缓存的会让标准客户端（Codex）把缓存量当成负输入而夹到 0，
+ *    上下文占用被少算上百倍，自动压缩永不触发。
+ *    现在两端都统一到**官方口径**，可对比性同样成立。
+ *    完整事故记录与实测数据见 `usage.ts` 文件头。
  *
  * ## 明确**接受但不生效**的字段
  *
@@ -73,6 +80,7 @@ import {
 } from './messages.js'
 import { normalizeUpstreamFailure } from './model-errors.js'
 import { failureToOpenAiError, withSuggestion, type SuggestionHook } from './stream.js'
+import { toOpenAiUsage } from './usage.js'
 
 /** 请求体形状（只声明我们用到的字段；其余原样忽略）。 */
 export interface OpenAiResponsesRequest {
@@ -712,14 +720,25 @@ function applyStateChunk(state: Accumulated, chunk: StreamChunk): void {
   state.finishReason = finishReasonOf(chunk.reason)
 }
 
+/**
+ * DSH 的用量 → OpenAI Responses API 的 `usage`。
+ *
+ * ⚠️ 口径转换全部在 `usage.ts` 里（两个端点共用一份判断）—— **本缺陷就是
+ * 因为两端各写一份、且都写错了才发生的**。这里只负责改字段名。
+ *
+ * ⚠️ `input_tokens` **含缓存命中**（官方口径），命中部分在
+ * `input_tokens_details.cached_tokens` 里**单列但仍是它的子集**。
+ * 详见 `usage.ts` 文件头的事故记录（用户报障：接入 Codex 后 raccoon 的
+ * 上下文占用被少算上百倍）。
+ */
 function usageJson(usage: TokenUsage): Record<string, unknown> {
+  const normalized = toOpenAiUsage(usage)
   return {
-    // ⚠️ 与 /v1/chat/completions 的口径一致（见文件头第 2 条差异）。
-    input_tokens: usage.inputTokens,
-    input_tokens_details: { cached_tokens: usage.cacheReadTokens ?? 0 },
-    output_tokens: usage.outputTokens,
-    output_tokens_details: { reasoning_tokens: usage.reasoningTokens ?? 0 },
-    total_tokens: usage.totalTokens ?? usage.inputTokens + usage.outputTokens,
+    input_tokens: normalized.inputTokens,
+    input_tokens_details: { cached_tokens: normalized.cachedTokens },
+    output_tokens: normalized.outputTokens,
+    output_tokens_details: { reasoning_tokens: normalized.reasoningTokens ?? 0 },
+    total_tokens: normalized.totalTokens,
   }
 }
 

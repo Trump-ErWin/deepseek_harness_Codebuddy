@@ -369,11 +369,13 @@ describe('Responses API 输出（非流式）', () => {
     expect(output[0]).toMatchObject({ type: 'message', status: 'completed', role: 'assistant' })
     expect(output[0].content[0]).toMatchObject({ type: 'output_text', text: '你好' })
     expect(result.usage).toEqual({
-      input_tokens: 3,
+      // ⚠️ DSH 的 inputTokens(3) 是**未命中**部分，官方口径要加上命中(1) → 4。
+      input_tokens: 4,
       input_tokens_details: { cached_tokens: 1 },
       output_tokens: 2,
       output_tokens_details: { reasoning_tokens: 1 },
-      total_tokens: 5,
+      // 上游报的 totalTokens(5) 比「含缓存拼出来的 6」小 —— 取较大者（见 usage.ts）。
+      total_tokens: 6,
     })
   })
 
