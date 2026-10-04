@@ -342,6 +342,16 @@ cc-switch / sub2api / Codex 自身（PR #29602）里也是这么做的。
    把 `SERVER` 这类内部码塞进 `code`，会让按枚举校验的官方 SDK 在解析失败事件时抛错，
    用户看到「客户端崩了」而不是上游的真实原因。
 
+⚠️ **一个工具调用只能有一个 `function_call` 项**（真实缺陷，2026-10-04）：网关曾在每个
+`block-start` 上把还开着的块提前收尾，而各 provider 适配器的 `block-end` 都集中在流末尾
+补发 —— 于是**并行两个工具调用**时，先开的那个会用残缺的 delta 参数被收尾，真正的
+`block-end` 到达时又新建一个同索引项，同一次调用发出两个共用 `call_id` 的
+`function_call`。Codex 判定「工具调用与结果对不上」并**终止整轮对话**
+（`tool calls and tool results do not match, please start a new conversation and retry`）。
+现在块之间**可以并行开启**、各自由自己的 `block-end` 收尾，且一个块**只能收尾一次**
+（与 DSH 内部 `BlockAssembler` 的语义一致）；`output[]` 另按 `output_index` 排序，
+使顺序与模型真实产出顺序一致。
+
 `GET /v1/responses/{id}` **不提供**：网关不存储响应，一律 404。会话状态由客户端自己维护
 （把完整 `input` 一起发过来）。
 

@@ -7709,6 +7709,84 @@ pub fn tokens_in_context_window(&self) -> u64 {
   交替，这类历史会被上游拒绝。
 - **`function_call` 的 item 延迟到第一帧 delta 才打开**：`call_id` / `name` 只出现在
   delta 里，而 `output_item.added` 必须带上它们，否则客户端配不上 call_id。
+### ⚠️⚠️ 块**可以并行开启**，一个块也只能收尾一次（真实报障，2026-10-04）
+
+**用户报障**：在 Codex 里用本机网关接 CodeBuddy，第一轮就整轮失败：
+
+```
+stream disconnected before completion: buddy: 工具记录不完整，请新建任务
+tool calls and tool results do not match, please start a new conversation and retry
+```
+
+⚠️ 前半句是**网关上游**（buddy）的话，后半句才是 **Codex 自己的判据** —— 别把整句
+当上游错误去查上游；**判据是后半句**，它说的是「工具调用与工具结果对不上」。
+
+**根因不在适配器，在网关的响应侧**（`src/openai-gateway/responses.ts`）。
+早先的实现把 `block-start` 当成「块切换」的信号，收到它就 `closeAll()` 把**还开着的**
+项全部收尾（理由写的是「协议要求项按 `output_index` 顺序闭合」，那个前提是错的）。
+可各适配器的 `block-end` **全部集中在流末尾补发**（见 `buddy-adapter.ts` 的
+`toolOrder` 段：先发全部工具块、再发正文/思考块）。于是：
+
+1. `block-start[0] tool-call` → 开项；
+2. `block-start[1] tool-call` → **把 [0] 提前收尾并从 `open` 删除**（此时 [0] 的参数
+   只有 delta 累积的过程量，`block-end` 的权威覆盖**还没到**）；
+3. 流末尾 `block-end[0]` 到达 → `open` 里找不到它 → **又新建了一个同索引项**。
+
+⇒ 同一次工具调用发出**两个** `function_call`、**共用同一个 `call_id`**，客户端据此
+判定「调用与结果对不上」并终止整轮。会话日志里的铁证（`~/.codex/sessions/` 的 rollout
+jsonl，同一 `call_id` 两个不同 `id`）：
+
+| ordinal | type | id | call_id |
+|---|---|---|---|
+| 13 | function_call | `fc_0b93c794…` | `call_00_KBnaF3NJZEpUhky4QjDE8134` |
+| 14 | function_call | `fc_68918ef8…` | `call_00_KBnaF3NJZEpUhky4QjDE8134` ← **重复** |
+| 15 | function_call | `fc_5aa68279…` | `call_01_btOPnboew8O1tFdmA7st8674` |
+
+同一形态也复制了正文与 reasoning（ordinal 12/17、10/19 逐字相同）。
+⚠️ **不是边角**：只要**并行两个工具调用**就必然触发，而 Codex 默认就爱并行调用。
+
+**修法（两条是一对，缺一条就会重复）**：
+
+| 规则 | 做法 | 少了它会怎样 |
+|---|---|---|
+| 块**可以并行开启** | `block-start` **什么都不做**（不 `closeAll`），只有 `block-end` 收尾；流末尾仍未收尾的才由 `closeAll()` 兜底 | 提前收尾 ⇒ 丢 `block-end` 的权威参数、且真正的 `block-end` 会新建重复项 |
+| 一个块**只能收尾一次** | `closed: Set<number>` 闸门，挡在 `block-end` 与三个 delta 分支上 | 重复的 `block-end` / 已收尾后又来的散帧 ⇒ 又是重复项 |
+
+⚠️ **这两条正是 DSH 权威实现 `BlockAssembler` 的语义**（`packages/llm/llm/src/assembler.ts`）：
+`block-start` 只在**索引首次出现**时登记（`if (!this.partials.has(chunk.index))`），
+`block-end` 是「**first close wins**」（`if (partial.block) return`），
+已收尾块的散帧一律忽略。**改响应侧前先读它** —— 网关只是把这套语义搬到 HTTP 边界上，
+不要自己发明。
+
+⚠️ **`outputOf` 必须按 `outputIndex` 排序**：`output_index` 的语义就是「本项在
+`output` 数组里的下标」，而项落进数组的顺序取决于**收尾顺序**（工具块先收尾、正文块后
+收尾），与模型真实产出顺序相反。不排序时客户端会把助手这一轮读成「先调工具、后说话」。
+⚠️ 这也是**上面那个 bug 的另一半成因**：一开始只观察到「顺序不对」，若当时只加排序，
+重复项依然存在 —— 两者必须一起修。
+
+**反向验证**（`mutate-dup-callid.mjs`，7 个变异全击杀 / 0 存活）：
+
+| 变异 | 变红的用例 |
+|---|---|
+| `block-start` 恢复 `closeAll` | ★ 并行工具调用：每个调用只能有一个 function_call 项 |
+| 去掉流式 `block-end` 的 `closed` 闸门 | 畸形流：重复的 block-end（工具 / 正文两条） |
+| 去掉非流式 `block-end` 的 `closed` 闸门 | 畸形流（非流式）：重复的 block-end 不得变成两个项 |
+| 去掉流式 text/reasoning delta 的闸门 | 畸形流：block-end 之后的正文 delta 不得再开一个新项 |
+| 去掉流式 tool-call delta 的闸门 | 畸形流：block-end 之后又来的 delta 不得再开一个新项 |
+| 去掉非流式 delta 的闸门 | 畸形流（非流式）：block-end 之后的 delta 不得再开一个新项 |
+| 去掉 `outputOf` 的排序 | ★ 并行工具调用（同时锁顺序与唯一性） |
+
+⚠️ **写这套用例时踩到的坑，下次别重犯**：第一版只加了「并行工具调用」一条用例，
+反向验证直接暴露 **2 个存活变异**（`closedDeltaStream` / `closedDeltaNonStream`）——
+「block-end 之后又来的 delta」这类畸形流此前**没有任何用例覆盖**，那两处闸门等于**没被锁住**。
+**判据：每条防御性分支都要有一个专门打破它的变异**，否则「加了防御」只是观感。
+
+⚠️ **端到端证据必须包含阴性对照**：`verify-live-dup-callid.mjs` 对**部署前的网关**
+发一次真实的双工具并行请求，得到 **3 个** `function_call`、`call_00` 重复
+（与用户会话日志逐字同形）；部署修复后同一脚本得到 **2 个**、无重复。
+⚠️ 该脚本**要求真的拿到 ≥ 2 个调用**，只拿到 1 个时它报「本次证据无效」并退出码 2 ——
+因为单调用形态**根本不会触发**这个缺陷，拿它当证据是自证。
+
 - **`block-end` 的块必须能被单独收下**（无 delta 时也要建项）：Chat 端点会整段丢掉它，
   Responses 端点按块内容补齐一个完整项（用例「只发 block-end 的块不会被丢掉」）。
 - **不发 `data: [DONE]`**：那是 Chat Completions 的收尾约定，Responses 以
