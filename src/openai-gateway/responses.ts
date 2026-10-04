@@ -364,16 +364,30 @@ function flattenResponsesTools(
   return { tools, nsMap }
 }
 
-/** `function_call_output.output` 可能是字符串，也可能是内容块数组。 */
-function outputText(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (value === undefined || value === null) return ''
+/**
+ * `function_call_output.output` 可能是字符串，也可能是内容块数组。
+ *
+ * ⚠️ **必须支持图片**（2026-10-04 修，真实报障）：Codex 的 `view_image` 工具把
+ * 读到的图直接放进 `output`（`[{type:'input_image',image_url:'data:…'}]`）。
+ * 早先这里走 `textFromContent`，它对图片**直接抛错** ⇒ 用户一让模型看图，
+ * 整轮对话就 400「tool 消息的内容不能包含图片」，且坏报文落进历史后被**每次重放**，
+ * 换 provider 才能恢复（会话证据：ordinal 2736/2738 的 `view_image` 结果，
+ * 紧随其后的 2748 就是该错误）。
+ *
+ * 图片与 user 消息走**同一份**入站实现（附件服务落盘 → `ImageBlock`），
+ * 故这里复用 `partsFromContent`，不另写一套。
+ */
+async function outputParts(
+  value: unknown,
+  bridge: AttachmentBridge | undefined,
+  limits: ImageLimits,
+): Promise<Message['content']> {
+  if (typeof value === 'string') return [{ type: 'text', text: value }]
+  if (value === undefined || value === null) return [{ type: 'text', text: '' }]
   if (!Array.isArray(value)) {
     throw new OpenAiGatewayError('function_call_output.output must be a string or an array of content parts')
   }
-  // 走 `textFromContent`：它对图片块有明确文案（工具结果不能带图），
-  // 不会出现「静默只取到文本」的失真。
-  return textFromContent(chatPartsFromResponses(value))
+  return partsFromContent(chatPartsFromResponses(value), bridge, limits)
 }
 
 function assistantItemSource(provider: string, model: string): Message['source'] {
@@ -468,7 +482,7 @@ async function toMessages(
       messages.push(createGatewayMessage('user', [{
         type: 'tool-result',
         toolCallId: callId as never,
-        content: [{ type: 'text', text: outputText(raw.output) }],
+        content: await outputParts(raw.output, bridge, limits),
       }], { kind: 'tool', callId: callId as never }))
       continue
     }
