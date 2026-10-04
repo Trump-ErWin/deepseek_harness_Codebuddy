@@ -891,21 +891,16 @@ function isPortFree(port: number): Promise<boolean> {
  *
  * ⚠ 用 **`powershell.exe`**（Windows 5.1，系统自带）而不是 `pwsh` ——
  * 后者是可选安装，不能假设存在。实测本机 5.1 存在且 Add-Type 可用。
+ *
+ * @param pid 目标浏览器主进程 pid。
+ * @param exeName 浏览器可执行名（仅 macOS 的 pid 兜底用，见
+ *   {@link buildMacosMiniaturizeFallbackArgs}）；缺省时 macOS 不做兜底。
  */
-function hideWindowFromTaskbar(pid: number): void {
+function hideWindowFromTaskbar(pid: number, exeName = ''): void {
   try {
     if (process.platform === 'win32') hideWindowWindows(pid)
     else if (process.platform === 'linux') hideWindowLinux(pid)
-    /**
-     * macOS：**不做**。
-     *
-     * ① 机制不同且更重：macOS 没有「任务栏按钮」概念，等价物是 Dock 图标
-     *   与 `NSApplicationActivationPolicy`（需改 Info.plist 或调
-     *   `TransformProcessType`，chromium 也暴露 `--activation-policy`，
-     *    但那是**启动参数**、不是后设属性）。
-     * ② 用户在 macOS 上没报过这个问题 —— 不实现未验证的代码
-     *   （本仓库的原则：能力字段与行为都要有实测依据）。
-     */
+    else if (process.platform === 'darwin') hideWindowMacos(pid, exeName)
   } catch {
     // 静默：优化失败不影响 captcha。
   }
@@ -1054,6 +1049,104 @@ function hideWindowLinux(pid: number): void {
     } catch {
       // 静默：优化失败不影响 captcha。
     }
+  })
+}
+
+/**
+ * macOS：把该 pid 的 chrome 窗口**最小化**（`set miniaturized of every window to true`）。
+ *
+ * ## 为什么是最小化（而非 osascript 移屏 / 1x1）
+ *
+ * 真机（macOS，主屏 0,0 1470×956）对 4 种藏法逐一验证了「窗口是否仍挂在
+ * 屏幕可见区」与「captcha 是否仍能 mint」：
+ *
+ * | 藏法 | 命令 | captcha 实测 |
+ * |---|---|---|
+ * | 最小化 | `set miniaturized … to true` | **稳**（10/10 mint OK，paramLen 280） |
+ * | 移到 -32000 | `set position … to {-32000,-32000}` | **偶发 `F001`**（窗口离屏时 SDK 取证帧偶尔拿到空 canvas） |
+ * | 1×1 缩到角 | `set size … to {2,2}` | 偶发 F001（同上，渲染尺寸过小触发 SDK 重试） |
+ * | `--headless=new` | （启动参数） | 一律 `F001`，**不可用** |
+ *
+ * 结论：macOS 上**最小化是唯一同时满足「不挡屏幕」与「mint 稳定」**的做法。
+ * 最小化后窗口缩到屏幕右下角（Dock 区），肉眼几乎不可见，且不破坏 captcha。
+ *
+ * ## 为什么不用 osascript `set position`（移屏）
+ *
+ * `--window-position=-32000,-32000` 已经由 `launch()` 传给了 chromium，但
+ * **macOS 的 WindowServer 会把离屏窗口钳回屏幕内**（与 `--headless` 相反，
+ * 这是系统行为，不是 chromium 行为）。所以「移屏」这条在 macOS 上等于没移。
+ * 最小化则不受该钳制影响（窗口仍在屏幕坐标系内，只是缩到角上）。
+ *
+ * ## ⚠⚠ 依赖：宿主必须已授予 macOS「辅助功能」权限（与 Linux 的 wmctrl 不同）
+ *
+ * | | Linux | macOS |
+ * |---|---|---|
+ * | 机制 | WM 协议（EWMH 客户端消息） | `osascript` 驱动 System Events 的 UI 脚本 |
+ * | 依赖 | 外部工具 `wmctrl` | 系统自带 `osascript`，**但 UI 脚本需宿主被授予「辅助功能」权限** |
+ * | 缺了怎么办 | `apt install wmctrl`，一条命令 | 系统设置 → 隐私与安全性 → 辅助功能 → 勾选宿主，**通常还要重启应用** |
+ * | 用户知道吗 | 报错会说「没装 wmctrl」 | **大多数人不知道这个权限存在**，且授权可能随应用升级被重置 |
+ *
+ * ⇒ 未授权时 `osascript` 非零退出，被本函数的静默语义吞掉，**窗口照常弹出**。
+ * 这是「减少打扰」的优化失效，不是功能故障；用户报「窗口还是弹出来」时先查这一项。
+ *
+ * ## 接入与失败语义（与 Windows/Linux 侧对称）
+ *
+ * - **失败必须静默**：这是「减少打扰」的优化，不是功能依赖。`spawn` 的
+ *   `error`/非零退出都直接吞掉，最坏结果回到修复前的行为（窗口正常弹出），
+ *   **绝不能让 captcha 因此不可用**。
+ * - 与 Windows 侧一样用 `windowsHide: true` + `stdio: 'ignore'` 异步 fire-and-forget。
+ * - **pid 兜底**：Chromium 启动后可能 re-exec 换 pid，此时 `unix id` 匹配落空、
+ *   osascript 非零退出；此时按**可执行名**再试一次（`exeName` 由 `launch()` 传入，
+ *   缺省则不兜底）。
+ *
+ * @param pid 目标浏览器主进程 pid。
+ * @returns `osascript` 参数数组（`-e <script>`），纯函数便于单测锁死。
+ */
+export function buildMacosMiniaturizeArgs(pid: number): string[] {
+  // AppleScript：遍历该 pid 名下所有窗口并最小化。
+  // `System Events` 需要 `process` 句柄，`pid` 用 `unix id` 精确匹配。
+  const appleScript =
+    `tell application "System Events" to set miniaturized of every window of ` +
+    `(first process whose unix id is ${pid}) to true`
+  return ['-e', appleScript]
+}
+
+/**
+ * 构造 pid 兜底用的最小化参数：按**进程名**匹配（pid 匹配落空后的第二次尝试）。
+ *
+ * ⚠ 按名字匹配比按 pid 宽松，故只在 pid 匹配**已失败**时调用（见
+ * {@link hideWindowMacos} 的 `close` 分支），正常路径永远走不到这里。
+ *
+ * @param exeName 浏览器可执行名（如 `Google Chrome`），不含路径。
+ * @returns `osascript` 参数数组，纯函数便于单测锁死。
+ */
+export function buildMacosMiniaturizeFallbackArgs(exeName: string): string[] {
+  const appleScript =
+    `tell application "System Events" to set miniaturized of every window of ` +
+    `(first process whose name is "${exeName}") to true`
+  return ['-e', appleScript]
+}
+
+/**
+ * 对 macOS 该 pid 的窗口执行最小化（异步、失败静默）。
+ *
+ * @param pid 目标浏览器主进程 pid。
+ * @param exeName 浏览器可执行名；非空时在 pid 匹配失败后按进程名兜底一次。
+ */
+function hideWindowMacos(pid: number, exeName = ''): void {
+  const child = spawn('osascript', buildMacosMiniaturizeArgs(pid), {
+    stdio: 'ignore',
+    windowsHide: true,
+  })
+  child.on('error', () => { /* 没装 osascript —— 静默跳过 */ })
+  // 同步抛错由 hideWindowFromTaskbar 的 try/catch 接住；异步失败走这里。
+  child.on('close', (code) => {
+    if (code === 0 || exeName === '') return
+    const fallback = spawn('osascript', buildMacosMiniaturizeFallbackArgs(exeName), {
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    fallback.on('error', () => { /* 兜底也失败 —— 静默 */ })
   })
 }
 
@@ -1447,7 +1540,7 @@ export class ZcodeCaptchaBrowser {
      * ⚠ **不 await**：这是装饰性优化，让它在后台跑（那个「约 1.2 秒」是这一步 PowerShell 自身的耗时，**与 mint 的 0.4–0.5 秒无关**），
      * 与后续导航重叠。失败静默，不影响 captcha。
      */
-    if (this.child?.pid !== undefined) hideWindowFromTaskbar(this.child.pid)
+    if (hide && this.child?.pid !== undefined) hideWindowFromTaskbar(this.child.pid, basename(executable))
   }
 
   /**
