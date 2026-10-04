@@ -1925,7 +1925,7 @@ function ProviderPanel({ provider, rpcCall }) {
   /**
    * 登录轮询定时器句柄。
    *
-   * ⚠ **真实缺陷**（2026-10-01，与 `zcode-card.js` 同型）：原实现把句柄存成
+   * ⚠ **真实缺陷**（2026-10-01；同一缺陷也出现在已随 IKJLHQ 移除的官方卡片账号区里）：原实现把句柄存成
    * `createAccount` 的**局部变量**，于是
    * ① `setInterval` 只在「轮询成功」分支里 `clearInterval`，超时用的是另一个
    *    `setTimeout(() => clearInterval(pollTimer), 300000)` —— 组件在这 5 分钟内
@@ -2230,7 +2230,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 停表 + 收尾：清掉轮询句柄，并在**组件仍挂载**时释放 busy。
    *
    * 所有结束路径（成功 / 超时 / 卸载）都必须走这里，否则 busy 会永久卡住或
-   * 句柄泄漏（与 `zcode-card.js` 的 `stopPoll` 同语义）。
+   * 句柄泄漏（这条规则对已随 IKJLHQ 移除的官方卡片账号区同样成立）。
    */
   const stopPoll = () => {
     if (pollRef.current !== 0) { clearInterval(pollRef.current); pollRef.current = 0; }
@@ -2319,7 +2319,7 @@ function ProviderPanel({ provider, rpcCall }) {
       accountId = res.accountId;
       loginUrl = res.loginUrl;
       console.log('[jet-hub] account.create ok, provider =', provider, ', accountId =', accountId);
-      // ⚠ **`reused` 分支必判**（与 `zcode-card.js` 一致）：本机已有可用凭据时
+      // ⚠ **`reused` 分支必判**（本条判据在已随 IKJLHQ 移除的官方卡片账号区里也写过）：本机已有可用凭据时
       // 后端**不新建条目、不返回 loginUrl**（用户报障「点了添加就多一个」的修复），
       // 返回的是 `{reused:true, loginUrl:''}`。若只看 `loginUrl` 为空就报
       // 「后端未返回登录地址」，会把一次成功操作显示成失败。
@@ -2363,7 +2363,7 @@ function ProviderPanel({ provider, rpcCall }) {
         // 轮询等待登录完成。
         // ⚠ 超时**不用**另起的 `setTimeout`，而是记 deadline 在轮询里判：这样全场只有
         //   一个句柄（pollRef），卸载清理与超时都不会漏掉第二个定时器。
-        // ⚠ `reused` 分支必判（与 `zcode-card.js` 一致）：本机已有可用凭据时后端
+        // ⚠ `reused` 分支必判（同上，`account.create` 契约）：本机已有可用凭据时后端
         //   **不新建条目、不返回 loginUrl**；只看 `loginUrl` 为空就报错会把一次
         //   成功操作显示成失败（后端 `account.create` 返回 `{reused:true, loginUrl:''}`）。
         const deadline = Date.now() + 300000;
@@ -2782,18 +2782,18 @@ function ProviderPanel({ provider, rpcCall }) {
         }, creating ? '正在登录…' : '+ 新建账号'),
         // ★ 渠道选择对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
         //
-        // ⚠ 两个入口（这里与 `zcode-card.js`）各有一份：它们是**不同的组件**、
-        //   不同的状态源，抽公共组件会牵动 PR #38 已打通的 props 通路，收益不抵风险。
-        //   （`zcode-card.js` 本身就是 zCode 专用面板，弹窗内容天然正确，故**无需**分支。）
-        //
         // ⚠ `newAccountAsksChannel(provider)` 这道是**防御性**的：按钮已经分支过，
         //   正常路径下非 zcode 永远不会把 `pendingLogin` 置为「开」。
         //   但状态是活的（用户切 provider 时本面板会重新挂载，理论上仍可能
         //   残留一帧），漏掉它就会退回 issue 里那个「非 zcode 弹出 ZCode 窗」的形态。
         //
-        // ⚠ 类名 `dim-jh-zcDialog*` 名字里带 zc，但它**已是通用弹窗样式**（两个
-        //   入口共用，见 `jet-hub-styles.js`），**不是** zCode 专用标记。
-        //   曾想改名，但两个文件 + 样式表一起动、收益仅是可读性，故保留名字。
+        // ⚠ 类名 `dim-jh-zcDialog*` 名字里带 zc，但它**已是通用弹窗样式**
+        //   （见 `jet-hub-styles.js`），**不是** zCode 专用标记。
+        //   曾想改名，但样式表一起动、收益仅是可读性，故保留名字。
+        //
+        // ⚠ 本弹窗原先有**两个入口**（这里与官方模型卡片里的 ZCode 账号区）；后者
+        //   已随 Gitee issue IKJLHQ 整体移除（它占用的 provider-card 槽 key 与第三方
+        //   pi-ai 扩展互斥，机制见 index.js 文件头）—— 现在只剩本处一个入口。
         pendingLogin === undefined || !newAccountAsksChannel(provider) ? null : React.createElement(
           'div',
             {
