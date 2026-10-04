@@ -74,6 +74,7 @@ import {
   formatUnits,
   formatQuotaLine,
   formatQuotaDetail,
+  formatClaimGains,
   unitLabel,
 } from './credits-format.js';
 import {
@@ -4332,6 +4333,9 @@ export function JetHubPage({ close, rpcCall }) {
     // 单独收集、单独渲染：混进计数行会被读漏，而这类提示的价值就在于被看到。
     const notes = [];
     let totalCredit = 0;
+    // ★ 按单位分组的合计（2026-10-04，真实缺陷）：见下方累加处的说明。
+    //   `totalCredit` 保留只为兜底旧宿主（无 `totalByUnit` 时按积分处理）。
+    const totalByUnit = { token: 0, credit: 0 };
     let failed = 0;
     for (const provider of checkinProviders()) {
       const label = PROVIDERS.find(p => p.id === provider)?.label || provider;
@@ -4349,8 +4353,17 @@ export function JetHubPage({ close, rpcCall }) {
         // 用 else-if 短路，否则后者的信息被前者的分支吞掉。
         const bits = [];
         if (s.claimed > 0) {
-          totalCredit += s.totalCredit;
-          bits.push(`+${s.totalCredit}`);
+          // ★ 按单位分别累加（2026-10-04，真实缺陷）：`s.totalCredit` 是**跨单位
+          //   求和** —— ZCode 的 1 亿 token 与其余渠道的积分会被加成一个数，并
+          //   在汇总行标成「积分」（用户报障原文：`ZCode（智谱）+100000000
+          //   （共 +100000100）`）。单位必须一路带着走，故这里读 `totalByUnit`。
+          const byUnit = s.totalByUnit || { credit: s.totalCredit, token: 0 };
+          totalByUnit.credit += Number(byUnit.credit) || 0;
+          totalByUnit.token += Number(byUnit.token) || 0;
+          // ⚠️ 逐渠道那行也按单位渲染：原先写裸数字（`+100000000`），既看不出
+          //   单位、量级也读不出来。缺 `totalByUnit` 的旧宿主回落到「按积分」。
+          const amount = formatClaimGains(byUnit);
+          if (amount !== null) bits.push(`+${amount}`);
         }
         if (s.alreadyClaimed > 0) bits.push(`${s.alreadyClaimed} 个今日已领`);
         if (s.inactive > 0) bits.push(`${s.inactive} 个暂无活动`);
@@ -4390,11 +4403,17 @@ export function JetHubPage({ close, rpcCall }) {
       if (!mounted.current) return;
     }
     if (!mounted.current) return;
+    // ★ 汇总行按单位分别报（2026-10-04，真实缺陷）：原先写 `（共 +${totalCredit} 积分）`，
+    //   而 `totalCredit` 是跨单位求和 —— 用户报障的 `（共 +100000100）` 就是它。
+    //   期望形态是 `（共 +100.00MToken, +100积分）`（见 `formatClaimGains`）。
+    const totalAmount = formatClaimGains(
+      totalByUnit.token > 0 || totalByUnit.credit > 0 ? totalByUnit : { credit: totalCredit },
+    );
     setCheckinNotice({
       // 有待用户处理的提示时用 warn 色调，让那条提示更显眼
       tone: failed > 0 || notes.length > 0 ? 'warn' : 'ok',
       text: parts.length > 0
-        ? `一键签到：${parts.join('，')}${totalCredit > 0 ? `（共 +${totalCredit} 积分）` : ''}`
+        ? `一键签到：${parts.join('，')}${totalAmount === null ? '' : `（共 +${totalAmount}）`}`
         : '一键签到：没有可领取的渠道',
       notes,
     });

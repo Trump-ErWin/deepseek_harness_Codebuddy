@@ -43,7 +43,7 @@ import {
   quotaPercentValue,
   formatQuotaPercent,
 } from './quota-format.js';
-import { formatUnits, formatQuotaLine, unitLabel, QUOTA_UNIT } from './credits-format.js';
+import { formatUnits, formatQuotaLine, formatClaimGains, unitLabel, QUOTA_UNIT } from './credits-format.js';
 import {
   formatExpirySplitLine,
   formatPoolSplitLine,
@@ -525,6 +525,8 @@ function UsageBadgeActive(props) {
     const parts = [];
     const notes = [];
     let totalCredit = 0;
+    // ★ 按单位分组的合计（2026-10-04，真实缺陷）：见下方累加处的说明。
+    const totalByUnit = { token: 0, credit: 0 };
     let failed = 0;
     for (let index = 0; index < providers.length; index += 1) {
       const id = providers[index];
@@ -533,8 +535,14 @@ function UsageBadgeActive(props) {
         const summary = result?.summary || {};
         const bits = [];
         if (summary.claimed > 0) {
-          totalCredit += Number(summary.totalCredit) || 0;
-          bits.push(`+${Math.round(Number(summary.totalCredit) || 0)}`);
+          // ★ 按单位分别累加（2026-10-04，真实缺陷）：`summary.totalCredit` 是
+          //   **跨单位求和**，会把 ZCode 的 1 亿 token 与积分加成一个数并标成
+          //   「积分」（用户报障原文：`（共 +100000100）`）。单位必须一路带着走。
+          const byUnit = summary.totalByUnit || { credit: summary.totalCredit, token: 0 };
+          totalByUnit.credit += Number(byUnit.credit) || 0;
+          totalByUnit.token += Number(byUnit.token) || 0;
+          const amount = formatClaimGains(byUnit);
+          if (amount !== null) bits.push(`+${amount}`);
         }
         if (summary.alreadyClaimed > 0) bits.push(`${summary.alreadyClaimed} 个今日已领`);
         if (summary.inactive > 0) bits.push(`${summary.inactive} 个暂无活动`);
@@ -559,10 +567,15 @@ function UsageBadgeActive(props) {
       }
       setClaimProgress({ done: index + 1, total: providers.length });
     }
+    // ★ 汇总行按单位分别报（2026-10-04，真实缺陷）：原先写 `（共 +${totalCredit} 积分）`，
+    //   而 `totalCredit` 是跨单位求和 —— 用户报障的 `（共 +100000100）` 就是它。
+    const totalAmount = formatClaimGains(
+      totalByUnit.token > 0 || totalByUnit.credit > 0 ? totalByUnit : { credit: totalCredit },
+    );
     setClaimNotice({
       tone: failed > 0 || notes.length > 0 ? 'warn' : 'ok',
       text: parts.length > 0
-        ? `全部渠道：${parts.join('；')}${totalCredit > 0 ? `（共 +${Math.round(totalCredit)} 积分）` : ''}`
+        ? `全部渠道：${parts.join('；')}${totalAmount === null ? '' : `（共 +${totalAmount}）`}`
         : '全部渠道：没有可领取的渠道',
       notes,
     });
@@ -1119,7 +1132,17 @@ function summarizeClaim(result) {
   const summary = result?.summary;
   if (summary === undefined) return { tone: 'ok', text: '签到完成', notes: [] };
   const parts = [];
-  if (summary.claimed > 0) parts.push(`${summary.claimed} 个账号领取成功，共 +${Math.round(Number(summary.totalCredit) || 0)} 积分`);
+  if (summary.claimed > 0) {
+    // ★ 单位感知（2026-10-04，真实缺陷）：原先写 `共 +${summary.totalCredit} 积分`，
+    //   把 ZCode 的 token 标成了积分。`totalByUnit` 缺省时回落到「按积分」，
+    //   以兼容旧宿主响应（与 `coversToday` 的兜底同思路）。
+    const amount = formatClaimGains(
+      summary.totalByUnit || { credit: Number(summary.totalCredit) || 0, token: 0 },
+    );
+    parts.push(amount === null
+      ? `${summary.claimed} 个账号领取成功`
+      : `${summary.claimed} 个账号领取成功，共 ${amount}`);
+  }
   if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今天已领`);
   if (summary.inactive > 0) parts.push(`${summary.inactive} 个活动未开启`);
   if (summary.failed > 0) {
