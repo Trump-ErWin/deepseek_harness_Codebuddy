@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { FinishReason, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { OpenAiGatewayError } from './messages.js'
 import { normalizeUpstreamFailure, upstreamStatusOrFallback } from './model-errors.js'
+import { toOpenAiUsage } from './usage.js'
 
 /**
  * 失败后给出纠错建议的钩子。
@@ -52,13 +53,36 @@ function finishReason(reason: FinishReason): string {
   }
 }
 
-function usageJson(usage: TokenUsage): Record<string, number> {
+/**
+ * DSH 的用量 → OpenAI Chat Completions 的 `usage`。
+ *
+ * ⚠️ 口径转换全部在 `usage.ts` 里（两个端点共用一份判断，见该文件头）。
+ * 这里只负责**改字段名**：`inputTokens`（已含缓存）→ `prompt_tokens`。
+ *
+ * ⚠️ 两个**私有**字段保留是**有意的向后兼容**，不是冗余：
+ * - `prompt_cache_hit_tokens` 是 DeepSeek 系的私有名，本仓库多个适配器
+ *   （`buddy-adapter.ts` / `openai-compat.ts` / `llm-adapter.ts` 等）在**读**它；
+ * - 顶层 `reasoning_tokens` 同理由旧版网关发出，删掉会让既有消费者读不到。
+ * 官方字段（`prompt_tokens_details.cached_tokens` /
+ * `completion_tokens_details.reasoning_tokens`）**必须同时给**：
+ * Codex 等标准客户端只认官方形态。
+ */
+function usageJson(usage: TokenUsage): Record<string, unknown> {
+  const normalized = toOpenAiUsage(usage)
   return {
-    prompt_tokens: usage.inputTokens,
-    completion_tokens: usage.outputTokens,
-    total_tokens: usage.totalTokens ?? usage.inputTokens + usage.outputTokens,
-    ...usage.reasoningTokens === undefined ? {} : { reasoning_tokens: usage.reasoningTokens },
-    ...usage.cacheReadTokens === undefined ? {} : { prompt_cache_hit_tokens: usage.cacheReadTokens },
+    prompt_tokens: normalized.inputTokens,
+    completion_tokens: normalized.outputTokens,
+    total_tokens: normalized.totalTokens,
+    // 官方明细：`cached_tokens` 是 `prompt_tokens` 的**子集**（见 `usage.ts`）。
+    prompt_tokens_details: { cached_tokens: normalized.cachedTokens },
+    ...normalized.reasoningTokens === undefined
+      ? {}
+      : {
+          reasoning_tokens: normalized.reasoningTokens,
+          completion_tokens_details: { reasoning_tokens: normalized.reasoningTokens },
+        },
+    // 私有兼容字段（见上方注释）：只在真有缓存命中时才发，避免凭空多出 0。
+    ...normalized.cachedTokens > 0 ? { prompt_cache_hit_tokens: normalized.cachedTokens } : {},
   }
 }
 

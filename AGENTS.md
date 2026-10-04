@@ -7555,6 +7555,7 @@ GET  /v1/models             ← 两套协议共用同一份目录
 | 工具 schema 校验 | `messages.ts` 的 `convertTools` | Responses 先经 `toChatTools` 把**扁平**工具写成 Chat 的嵌套形状 |
 | 输出预算校验 + 钳制 | `tokenValue` / `normalizeMaxTokens` | `max_tokens` 与 `max_output_tokens` 走同一判据 |
 | 思考档位归一化（三态） | `normalizeReasoningEffort` | `reasoning_effort` 与 `reasoning.effort` |
+| **用量口径**（DSH 互斥 → OpenAI 含缓存） | `usage.ts` 的 `toOpenAiUsage` | `stream.ts` 与 `responses.ts` 各自的 `usageJson` **只改字段名** |
 | 取消、错误翻译、CORS、SSE 头 | `server.ts` 的 `withRequest` / `writeSseHead` | 两个端点 |
 
 ⚠️ 改这些共享件时**必须同时想两个端点**：`openai-gateway-server.spec.ts` 的
@@ -7574,6 +7575,74 @@ GET  /v1/models             ← 两套协议共用同一份目录
    时抛校验错误 —— 用户看到「客户端崩了」，而真实原因是上游错误。
    精确码放 `error.dsh_code`、本该返回的 HTTP 状态放 `error.status`（Chat 端点的 SSE 错误
    帧里也有同名字段，口径一致）。
+
+### ⚠️⚠️ 用量口径：`input_tokens` / `prompt_tokens` **必须含缓存命中**（真实报障，2026-10-04）
+
+**用户报障**：接入 Codex 后，「raccoon 的上下文显示好像不太对 —— 搞半天就占了 5%，
+一换成 trae 就正常显示占了 300k 多」。
+
+**根因是两种「缓存算不算输入」的口径冲突**：
+
+| | DSH `TokenUsage` | OpenAI `usage` |
+|---|---|---|
+| 输入 | `inputTokens` **只含未命中缓存**；命中单列 `cacheReadTokens` | `prompt_tokens` / `input_tokens` 是**含缓存**的总输入 |
+| 明细 | 无 | `prompt_tokens_details.cached_tokens` 是上者的**子集**（不是并列项） |
+
+DSH 侧口径见 `src/types.ts` 的注释，以及各适配器统一在做的那一步减法
+（`openai-compat.ts:892`、`buddy-adapter.ts:1988`、`lobsterai-adapter.ts:1488`、
+`llm-adapter.ts:1797`、`gemini-messages.ts:455`）—— 它们把上游**含缓存**的
+`prompt_tokens` 减成 DSH 的互斥口径。**网关这一跳必须减回去**。
+
+旧实现原样发 DSH 口径，Codex 再按官方口径算 `input_tokens - cached_tokens`
+（`saturating_sub`）⇒ 夹到 **0** ⇒ 总数只剩 output。实测（rollout
+`…01a0fc83….jsonl` 的 `token_usage_record`，逐帧对得上）：
+
+| 时刻 | 真实上下文 | 修复前 | 修复后 |
+|---|---|---|---|
+| raccoon 会话中 | 56,225 | **5.56%** ← 用户看到的「5%」 | 5.99% |
+| raccoon 会话末 | 208,258 | **0.15%** | 21.99% |
+| trae 会话末 | 326,134 | 34.39% ← 用户看到的「300k多」 | 34.39% |
+
+⚠️ **trae 之所以「正常」不是它被修好了，而是它不报缓存** ——
+`trae-adapter.ts` 的 `token_usage` 只读 `prompt_tokens` / `completion_tokens`，
+从不算 `cacheReadTokens`，旧公式恰好等于完整上下文。
+⇒ **受影响的是所有开前缀缓存的 provider**，只有 trae 幸免。
+
+⚠️ **这不只是显示问题**：Codex 判断该不该自动压缩用的就是同一个数
+（`tokens_in_context_window()`）。计量恒定在 0.1%~5% ⇒
+`model_auto_compact_token_limit` **永远不会触发**，真实上下文会一路涨到撞上
+模型硬限直接报错，而不是优雅地压缩。
+
+**Codex 的权威判据**（`agcodex_protocol::protocol::TokenUsage`，与 openai/codex 同源）：
+```rust
+pub fn non_cached_input(&self) -> u64 {
+    self.input_tokens.saturating_sub(self.cached_input())   // ← 它要减，说明 input_tokens 含缓存
+}
+pub fn tokens_in_context_window(&self) -> u64 {
+    self.total_tokens.saturating_sub(self.reasoning_output_tokens.unwrap_or(0))
+}
+```
+
+**修法**：转换抽成**唯一一份** `src/openai-gateway/usage.ts` 的 `toOpenAiUsage()`，
+两端各自的 `usageJson` **只改字段名**（这正是「共享判断只留一份」那条规矩的又一次应用 ——
+本缺陷的成因就是两端各写一份且都写错）。三条实现要点：
+
+1. `inputTokens + cacheReadTokens + cacheWriteTokens` —— 缓存写入同样是这一轮真实发出的输入
+   （Anthropic 的 `cache_creation_input_tokens`），但**不是**「命中」，故不进 `cachedTokens`；
+2. `total` 取 `max(上游报的, 自己拼的)` —— 上游报的数若**不含缓存**（14 个 provider 无法穷举验证）
+   直接采信就会原样重现本缺陷。**只会多算、绝不漏算**，因为漏算的代价是自动压缩永不触发；
+3. Chat 端点补发官方的 `prompt_tokens_details.cached_tokens` /
+   `completion_tokens_details.reasoning_tokens`，**并保留** `prompt_cache_hit_tokens` /
+   顶层 `reasoning_tokens` 这两个私有字段（本仓库多个适配器在**读**它们，删掉会破坏既有消费者）。
+
+⚠️ 回归用例 `tests/unit/openai-gateway-usage.spec.ts`（12 条，含「两端对同一份用量给出
+相同数字」「cachedTokens 是 inputTokens 的子集而非并列项」「上游 total 不含缓存也不得采信」）。
+⚠️ 已做**反向验证**（`mutate-usage.mjs`，7 个变异 **7/7 全被杀死**）：还原缺陷行、
+把 cached 当并列项、漏掉 cacheWrite、直接采信上游 total、只改一个端点、漏发官方明细字段。
+
+⚠️ 这是 `6f352ca`（Chat 出口）与 `c19917a`（Responses 出口）就带着的既有缺陷，
+**不是**第 7、8 轮引入的；只是**接入 Codex 用 Responses 端点之后才暴露** ——
+在那之前没有消费者会这样解读这两个字段。
 
 ### ⚠️⚠️ Codex 的 `namespace` / `custom` / `tool_search` 工具**不能报错**（真实报障，2026-10-03）
 
