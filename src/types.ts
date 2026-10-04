@@ -400,6 +400,29 @@ export interface RpcCreditsClaimSummary {
    * 判据见 `src/credits.ts` 的 `ClaimOutcomeCommon.coversToday`。
    */
   coversToday: number
+  /**
+   * ★ **按单位分组**的领取合计（2026-10-04）。
+   *
+   * ## 为什么必须有它（真实缺陷，用户报障）
+   *
+   * 用户报障原文：
+   * > 插件的这个一键签到，Zcode 获得的是 token 数量，但是这里显示成获得积分。
+   * > 正文「…ZCode（智谱）+100000000（共 +100000100）」
+   * > 应当显示为「…ZCode（智谱）+100Mtoken（共 +100Mtoken, +100积分）」
+   *
+   * 根因是 {@link totalCredit} 这个标量**把不同量纲加在了一起**：ZCode 的额度
+   * 单位是 token、其余渠道是积分，1 亿 token + 100 积分 = `100000100`，
+   * 而下游拿到的只有一个数、只能标成「积分」。故单位必须在**汇总这一层**
+   * 就分开保留。
+   *
+   * ⚠️ 两个键**恒存在**（没有该单位的领取时为 `0`），不要写成可选 ——
+   * 消费方（`auto-checkin.ts` / 两个客户端面板）都要读它，可选字段会让
+   * 「宿主旧版本没这个字段」与「本次真的没有 token」混为一谈。
+   *
+   * ⚠️ {@link totalCredit} **保留**：它是既有字段，且对**单一单位**的渠道
+   * （其余 11 个）语义完全正确。消费方若只需一个数，应先确认本次只有一个单位。
+   */
+  totalByUnit: import('./credits.js').ClaimTotalsByUnit
 }
 /** RPC: 一键领取积分响应 */
 export interface RpcCreditsClaimAllResponse {

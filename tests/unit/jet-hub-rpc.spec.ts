@@ -34,7 +34,47 @@ describe('积分领取结果汇总', () => {
     ]
     expect(computeClaimSummary(outcomes)).toEqual({
       claimed: 2, totalCredit: 150, alreadyClaimed: 1, inactive: 0, failed: 1, coversToday: 3,
+      totalByUnit: { token: 0, credit: 150 },
     })
+  })
+
+  /**
+   * ★ **根因所在**（真实缺陷，用户报障 2026-10-04）：
+   * > Zcode 获得的是 token 数量，但是这里显示成获得积分。
+   * > 正文「…ZCode（智谱）+100000000（共 +100000100）」
+   * > 应当显示为「…ZCode（智谱）+100Mtoken（共 +100Mtoken, +100积分）」
+   *
+   * `totalCredit` 是**跨单位求和**的标量 —— 1 亿 token 与 100 积分加在一起后，
+   * 下游拿到的是一个数、无从分辨单位，只能标成「积分」。故单位必须在**汇总
+   * 这一层**就分开保留（`totalByUnit`），而不是在文案层猜。
+   *
+   * ⚠️ 这条用例同时锁死「`totalCredit` 保留原语义」：它是既有契约，
+   * 且对**单一单位**的渠道（其余 11 个）完全正确。改它才是破坏性改动。
+   */
+  it('★★ token 与积分**分列**，不跨单位相加（用户报障的根因）', () => {
+    const outcomes: ClaimOutcome[] = [
+      { kind: 'claimed', credit: 100_000_000, streakDays: 0, isStreakDay: false, unit: 'token' },
+      { kind: 'claimed', credit: 100, streakDays: 0, isStreakDay: false },
+    ]
+    const summary = computeClaimSummary(outcomes)
+    // 单位分开保留 —— 这是修复的核心
+    expect(summary.totalByUnit).toEqual({ token: 100_000_000, credit: 100 })
+    // 标量仍在，但**不得**再用于展示（它是跨单位求和的产物）
+    expect(summary.totalCredit).toBe(100_000_100)
+  })
+
+  it('★ 未声明 unit 的领取按积分计（其余 11 个渠道逐字不变）', () => {
+    const summary = computeClaimSummary([
+      { kind: 'claimed', credit: 800, streakDays: 1, isStreakDay: false },
+    ])
+    expect(summary.totalByUnit).toEqual({ token: 0, credit: 800 })
+  })
+
+  it('★ unit 为未知值时按积分兜底（脏数据不制造出第三种单位）', () => {
+    const summary = computeClaimSummary([
+      { kind: 'claimed', credit: 50, streakDays: 0, isStreakDay: false, unit: 'credits' } as ClaimOutcome,
+    ])
+    expect(summary.totalByUnit).toEqual({ token: 0, credit: 50 })
   })
 
   /**
@@ -51,6 +91,7 @@ describe('积分领取结果汇总', () => {
     ]
     expect(computeClaimSummary(outcomes)).toEqual({
       claimed: 1, totalCredit: 100, alreadyClaimed: 1, inactive: 0, failed: 0, coversToday: 0,
+      totalByUnit: { token: 0, credit: 100 },
     })
   })
 
@@ -81,6 +122,7 @@ describe('积分领取结果汇总', () => {
   it('空数组返回全 0', () => {
     expect(computeClaimSummary([])).toEqual({
       claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
+      totalByUnit: { token: 0, credit: 0 },
     })
   })
 
@@ -256,6 +298,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     expect(response.results.every(r => r.outcome.kind === 'claimed')).toBe(true)
     expect(response.summary).toEqual({
       claimed: 3, totalCredit: 300, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 3,
+      totalByUnit: { token: 0, credit: 300 },
     })
   })
 
@@ -284,6 +327,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     expect(claimed).toHaveLength(2)
     expect(response.summary).toEqual({
       claimed: 2, totalCredit: 200, alreadyClaimed: 0, inactive: 0, failed: 1, coversToday: 2,
+      totalByUnit: { token: 0, credit: 200 },
     })
   })
 
@@ -1812,6 +1856,7 @@ describe('积分端点的 provider 能力边界', () => {
     expect(result.ok).toBe(true)
     expect((result.value as { summary: unknown }).summary).toEqual({
       claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
+      totalByUnit: { token: 0, credit: 0 },
     })
   })
 
