@@ -905,6 +905,28 @@ export interface RpcProviderSetEnabledResponse {
 }
 
 /**
+ * RPC: 读取供应商自定义显示顺序（Jet Hub「供应商开关」弹窗的拖拽排序）。
+ *
+ * `order` 为空数组表示用户尚未自定义（或文档缺失该键），展示侧按 `PROVIDERS`
+ * 的声明顺序渲染（见 `plugin-src/client/provider-toggle.js` 的
+ * `sortOpenProvidersByOrder`）。
+ */
+export interface RpcGetProviderOrderResponse {
+  order: string[]
+}
+
+/**
+ * RPC: 写入供应商自定义显示顺序。
+ *
+ * 数组含**全部**供应商 id：拖拽提交时 = 拖后的「已打开」序列 + 已关闭的
+ * 按声明序缀尾。展示侧对数组中不认识 / 缺失的 id 都有稳定兜底，故插件
+ * 跨版本增删 provider 时不需要迁移（见 `sortOpenProvidersByOrder`）。
+ */
+export interface RpcSetProviderOrderRequest {
+  order: string[]
+}
+
+/**
  * RPC: 本机 OpenAI 网关状态。
  *
  * ⚠️ 三个字段必须**分开回传**，不能只回一个 `enabled`：设置页里的开关读的是
