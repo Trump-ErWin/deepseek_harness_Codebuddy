@@ -4,7 +4,8 @@ import {
   markGatewayChannel,
   GATEWAY_CHANNEL_MARK,
 } from '../../src/openai-gateway/channel.js'
-import { recordThroughStream, wrapAdapterWithTokenLedger } from '../../src/llm-register-compat.js'
+import { registerAdapterIdempotent, recordThroughStream, wrapAdapterWithTokenLedger } from '../../src/llm-register-compat.js'
+import { withDeadModelPruning } from '../../src/dead-model-store.js'
 import {
   attachTokenLedgerStore,
   peekLedgerAccount,
@@ -398,5 +399,111 @@ describe('★ attachTokenLedgerStore：成对挂载与所有权校验（fiber �
     dispose() // 重入：令牌已换代 ⇒ 必须让位
     recordTokenUsage(usage())
     expect(store.appended).toEqual(['S'])
+  })
+})
+
+/**
+ * ★★ 回归（合并 PR 66 时发现的**顺序敏感**致命隐患，2026-10-06）
+ *
+ * `registerAdapterIdempotent` 里现在有**两层** Proxy 包装：Token 记账
+ * （`wrapAdapterWithTokenLedger`）与「已失效模型」剔除（`withDeadModelPruning`，
+ * PR 66 引入）。**两者的嵌套顺序是语义性的，写反不会报错，只会让记账静默失效。**
+ *
+ * ## 为什么顺序有语义
+ *
+ * dsh-llm 的 `adapterStream` 走的是 `adapter.prepareCall(...)` 返回的
+ * `adapterCall.stream(options)`（`dsh-llm/lib/index.js`：
+ * `dispatch = (options) => adapterCall.stream(options)`），
+ * **不直接调用顶层 `adapter.stream`**。
+ *
+ * 而本仓库**全部**适配器的 `prepareCall` 都写成转发形式：
+ *
+ * ```ts
+ * stream: (options) => this.stream(options)
+ * ```
+ *
+ * ⇒ 记账是否生效取决于 `prepareCall` 执行时 **`this` 指向谁**：
+ * - **记账在内**（正确）：剔除层用 `.apply(obj, …)` 调用，`obj` 是它包着的
+ *   **记账 Proxy** ⇒ `this` = 记账 Proxy ⇒ `this.stream` 命中记账陷阱 ✅
+ * - **记账在外**（错误）：`this` 落到**裸适配器** ⇒ 绕过记账 Proxy
+ *   ⇒ 请求照常跑、账本永远为空 ❌（"看起来正常"的静默失效）
+ *
+ * ⚠️ 本用例**按 dsh-llm 的真实驱动路径**（`prepareCall → call.stream`）走
+ * **真实的 `registerAdapterIdempotent`**，而不是直接调 `wrapped.stream` ——
+ * 后者正是掩盖该隐患的原因（现有记账用例都是直接调顶层 `stream`）。
+ */
+describe('★★ 两层包装的嵌套顺序（记账在内 / 剔除在外）', () => {
+  /** 忠实模拟真实适配器：prepareCall 转发 this.stream（14 个适配器同款）。 */
+  class PrepareCallAdapter {
+    topStreamCalls = 0
+    providerInfo() { return { id: 'codearts', name: 'CodeArts' } }
+    providerRetryPolicy() { return undefined }
+    async listModels() { return [] }
+    async prepareCall() {
+      return {
+        model: { provider: 'codearts', id: 'm', name: 'M' },
+        stream: (options: unknown) => this.stream(options),
+      }
+    }
+    async *stream() {
+      this.topStreamCalls += 1
+      yield { type: 'usage', usage: { inputTokens: 11, outputTokens: 5 } }
+    }
+  }
+
+  /** 按 dsh-llm 真实方式驱动：prepareCall → call.stream。 */
+  async function driveByPrepareCall(adapter: unknown): Promise<number> {
+    const reg = adapter as {
+      prepareCall: (p: string, m: string) => Promise<{ stream: (o: unknown) => AsyncIterable<unknown> }>
+    }
+    const call = await reg.prepareCall('codearts', 'm')
+    let n = 0
+    for await (const _ of call.stream({ provider: 'codearts', model: 'm' })) n += 1
+    return n
+  }
+
+  afterEach(() => { resetTokenLedgerForTests() })
+
+  it('★★ 经真实 registerAdapterIdempotent + prepareCall 路径，记账必须生效', async () => {
+    resetTokenLedgerForTests()
+    let registered: unknown
+    const llm = {
+      registerConfigurableProviders: () => undefined,
+      registerAdapter: (_p: readonly string[], adapter: unknown) => { registered = adapter; return () => {} },
+    } as never
+
+    registerAdapterIdempotent(llm, ['codearts'], new PrepareCallAdapter(), () => {})
+    const chunks = await driveByPrepareCall(registered)
+
+    expect(chunks).toBe(1)
+    const entries = readTokenLedger().entries
+    expect(entries, '走 prepareCall 路径时记账不得被绕过').toHaveLength(1)
+    expect(entries[0]!.provider).toBe('codearts')
+    expect(entries[0]!.model).toBe('m')
+    expect(entries[0]!.inputTokens).toBe(11)
+    expect(entries[0]!.outputTokens).toBe(5)
+  })
+
+  it('★★ 顺序写反（记账在外）时记账会静默失效 —— 锁定这个反例防被改回去', async () => {
+    resetTokenLedgerForTests()
+    // 故意用**错误顺序**：记账在外、剔除在内
+    const wrong = wrapAdapterWithTokenLedger(
+      ['codearts'],
+      withDeadModelPruning(['codearts'], new PrepareCallAdapter() as never) as never,
+    )
+    await driveByPrepareCall(wrong)
+    // 这是"错误顺序"的可观测后果：账本为空（不是抛错，所以极难发现）
+    expect(readTokenLedger().entries, '错误顺序下记账失效（本断言是反例，不是期望行为）').toHaveLength(0)
+  })
+
+  it('★★ 正确顺序下两层都在位：记账生效且 listModels 仍可用', async () => {
+    resetTokenLedgerForTests()
+    const correct = withDeadModelPruning(
+      ['codearts'],
+      wrapAdapterWithTokenLedger(['codearts'], new PrepareCallAdapter() as never) as never,
+    ) as unknown as { listModels: (p: string) => Promise<unknown[]> }
+    await driveByPrepareCall(correct)
+    expect(readTokenLedger().entries).toHaveLength(1)
+    expect(Array.isArray(await correct.listModels('codearts'))).toBe(true)
   })
 })
