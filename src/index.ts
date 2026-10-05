@@ -1199,6 +1199,9 @@ export function apply(ctx: Context): void {
   // 不注册斜杠命令：入口在 Jet Hub 的 Gemini 面板。
   const gemini = new GeminiAuth(ctx)
   const geminiSigStore = createGeminiSigStore(ctx)
+  // ⚠️ 项目号探测缓存必须**在这里建一次、长期复用** —— 每次 `stream()` 现造
+  // 等于没有跨请求缓存，每轮推理都会多打一次 `loadCodeAssist`。
+  const geminiProjectCache = new Map<string, string>()
   const geminiAdapter = registerGeminiLlm(ctx, {
     credentialRef: credentialRef(GEMINI.defaultCredentialRef),
     resolveCredential: async (modelId?: string) => {
@@ -1243,6 +1246,19 @@ export function apply(ctx: Context): void {
     sigStore: geminiSigStore,
     accountPool: pool,
     product: GEMINI,
+    // 项目号：缺省**自动探测**（`loadCodeAssist` 的 `cloudaicompanionProject`），
+    // 不是恒为 `aicode-consumers`（那只是探测为空时的兜底）。
+    projectCache: geminiProjectCache,
+    persistProject: async (value: string) => {
+      // ⚠️ 回写到**解析凭据时所用的那个账号**，不是默认单凭据 ref ——
+      // 写错对象会让另一个账号的凭据被污染。
+      const available = await pool.getAvailableAccount(GEMINI.id, '')
+      const ref = available
+        ? available.entry.credentialRef
+        : credentialRef(GEMINI.defaultCredentialRef)
+      await ctx.credentials.set(credentialRef(ref), value)
+    },
+    ...ctx.logger === undefined ? {} : { logger: ctx.logger },
   })
 
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
