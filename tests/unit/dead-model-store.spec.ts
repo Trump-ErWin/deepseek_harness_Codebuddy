@@ -106,6 +106,11 @@ describe('isModelGoneError —— 必须**不**判为模型失效（误判会藏
     ['★跨句：后半句说的是镜像不是模型', 'model x is fine. the container image does not exist', 'SERVER'],
     ['★跨句：分号后的从句', 'the config file model list is fine; however this build does not exist on the server', 'SERVER'],
     ['★跨句：配置项列表 vs 不存在的构建', 'model list ok. the bundle does not exist', 'SERVER'],
+    // ⚠️⚠️ `model_not_found` 在**遥测/日志**里常是**字段名**，后面紧跟别的内容
+    // （2026-10-06 复审实测）。只加 `\b` 词边界不够 —— 它会把**可用模型藏 30 天**。
+    ['★遥测字段名（不是错误）', 'error_class=model_not_found, retry allowed', 'SERVER'],
+    ['★指标名（不是错误）', 'the model_not_found metric was not exported', 'SERVER'],
+    ['★作为别名前缀', 'model_not_found_reason=upstream', 'SERVER'],
   ]
   for (const [label, message, code] of negatives) {
     it(label, () => {
@@ -313,7 +318,10 @@ describe('withDeadModelPruning —— 持久化', () => {
     //
     // 现在用**另一个**provider 的独立 state 目录，把 `jet-hub` 段**占成文件**：
     // `FileDeadModelStore.save` 里的 `mkdirSync(join(path,'..'), {recursive:true})`
-    // 必然抛 ENOTDIR，而该异常被 `persist` 捕获只记日志。
+    // 会失败（⚠️ 实测抛的是 **EEXIST** 而非 ENOTDIR —— `recursive` 对「末段已存在
+    // 且不是目录」抛 EEXIST；这里按实测写，别再写成 ENOTDIR），异常被 `persist`
+    // 捕获只记日志。
+    // ⚠️ 已做反向验证：把 `persist` 的 catch 去掉后本用例红。
     const blockedDir = mkdtempSync(join(tmpdir(), 'dsh-dead-model-blocked-'))
     const jetHubDir = join(blockedDir, 'jet-hub')
     writeFileSync(jetHubDir, 'not-a-directory', 'utf-8')
@@ -544,6 +552,41 @@ describe('clearDeadModels —— 用户唯一的自愈路径', () => {
     expect((await wrapped.listModels()).some((m) => m.id === 'gone-1')).toBe(false)
     clearDeadModels('rec-visible', 'gone-1')
     expect((await wrapped.listModels()).some((m) => m.id === 'gone-1')).toBe(true)
+  })
+
+  /**
+   * ⚠️ 回归（2026-10-06 复审实测）：`configureDeadModelStore` 在 HMR / fiber 重启
+   * 时会被**再调一次**（见 `llm-register-compat.ts` 模块头记录的重启竞态）。
+   * 若它直接清 `cache`，**尚未落盘的内存记录**就永久丢失 —— 在「无法定位 home、
+   * 只存在于内存」的**降级路径**下是真实的数据丢失。
+   *
+   * ⚠️ 判据必须构造**降级**场景：正常路径下记录早已落盘，重注入后读回来自然还在，
+   * 那样的用例抓不住本缺陷（同义反复 —— 第一版就是这么写的，反向验证时全绿）。
+   * 这里把 `jet-hub` 段占成文件让 `persist` 必然失败，使记录**只存在于内存**，
+   * 此时重注入才暴露问题。
+   */
+  it('★ configureDeadModelStore 二次调用不丢「仅内存」的记录（先落盘再丢弃）', () => {
+    const blockedDir = mkdtempSync(join(tmpdir(), 'dsh-dead-model-nohome-'))
+    const previous = process.env.DSH_JET_HUB_STATE_DIR
+    writeFileSync(join(blockedDir, 'jet-hub'), 'not-a-directory', 'utf-8')
+    configureDeadModelStore({ logger: undefined } as never)
+    process.env.DSH_JET_HUB_STATE_DIR = blockedDir
+    configureDeadModelStore({ logger: undefined } as never)
+    try {
+      clearDeadModels('cfg-keep')
+      recordDeadModel('cfg-keep', 'mem-only', 'x')
+      expect([...deadModelIdsFor('cfg-keep')], '前提：记录已在内存').toEqual(['mem-only'])
+
+      // 模拟 HMR / fiber 重启时再次注入（此时 persist 仍失败 ⇒ 只能靠内存）。
+      configureDeadModelStore({ logger: undefined } as never)
+
+      expect([...deadModelIdsFor('cfg-keep')], '重注入后仅内存的记录必须还在').toEqual(['mem-only'])
+    } finally {
+      clearDeadModels('cfg-keep')
+      process.env.DSH_JET_HUB_STATE_DIR = previous
+      configureDeadModelStore({ logger: undefined } as never)
+      rmSync(blockedDir, { recursive: true, force: true })
+    }
   })
 
   it('清空一个 provider 不会波及其它 provider（跨 provider 隔离）', () => {
