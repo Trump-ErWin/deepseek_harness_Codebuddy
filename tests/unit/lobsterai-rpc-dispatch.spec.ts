@@ -4,10 +4,14 @@
  * 覆盖两个**既有缺陷**（T7 修复）：
  *
  * 1. **workbuddy 分支缺失**：原实现只判 `codearts` / `buddy`，workbuddy 落入
- *    else 抛 `Unknown provider` —— 即 WorkBuddy 账号卡片的「刷新」按钮一直是坏的。
+ *    else 抛 `Unknown provider` —— 即 `account.refresh` 端点对 WorkBuddy 完全不可用。
  * 2. **刷错凭据**：原实现调 `service.refresh()`，而该方法读写的是该 provider 的
- *    **默认单凭据 ref**（如 `BUDDY_ACCESS_TOKEN`），Jet Hub 账号卡片对应的却是
- *    `BUDDY_ACCOUNT_XXX` —— 于是「刷新这个账号」实际刷的是另一个凭据。
+ *    **默认单凭据 ref**（如 `BUDDY_ACCESS_TOKEN`），要刷的却是池内条目的
+ *    `BUDDY_ACCOUNT_XXX` —— 于是「刷这个账号」实际刷的是另一个凭据。
+ *
+ * ⚠ **本端点没有面板入口**（issue IKJOZA 取证）：账号卡片上并没有「刷新」按钮，
+ * 调用方是仓库外的脚本/手工 RPC。这段说明原先写的是「账号卡片的『刷新』按钮」，
+ * 那是失实的 —— 本文件末尾的「issue IKJOZA」段有完整取证。
  *
  * 这两个缺陷都无法靠 `collect*` 那类纯函数测试发现（它们不在那条代码路径上），
  * 因此这里直接驱动 `registerJetHubRpc` 注册的 HTTP 处理器，断言真实分派行为。
@@ -268,7 +272,15 @@ describe('account.refresh 分派（T7 回归）', () => {
  * 故这里必须额外锁死顶层 `ok`，并断言**失败时 value 根本不存在**。
  */
 describe('account.refresh 失败语义（issue IKJOZA）', () => {
-  /** 让指定 provider 的续期**抛错**，其余照常。 */
+  /**
+   * 让指定 provider 的续期**抛错**，其余照常。
+   *
+   * ⚠ **必须覆盖 `registerJetHubRpc` 的全部 15 个 provider 形参**（位置传参，
+   * 少传即错位 —— 该函数历史上已因此错位复发 6 次）。缺一个形参时该 provider
+   * 拿到 `undefined`，一旦换成它**根本走不到它自己的失败分支**：
+   * 初版只造了 7 个桩，于是 issue 里真实出现过的 `raccoon` / `minimax` 两条失败
+   * 路径**零覆盖**，还把 raccoon 的报错挂到了 `trae` 上凑数。
+   */
   function makeThrowingStub(throwing: string, message: string) {
     const stub = (name: string) => ({
       refreshAccountCredential: async () => {
@@ -284,6 +296,12 @@ describe('account.refresh 失败语义（issue IKJOZA）', () => {
       qoder: stub('qoder'),
       qodercn: stub('qodercn'),
       trae: stub('trae'),
+      cline: stub('cline'),
+      loomy: stub('loomy'),
+      raccoon: stub('raccoon'),
+      minimax: stub('minimax'),
+      zcode: stub('zcode'),
+      gemini: stub('gemini'),
     }
   }
 
@@ -300,6 +318,12 @@ describe('account.refresh 失败语义（issue IKJOZA）', () => {
       services.qoder as never,
       services.qodercn as never,
       services.trae as never,
+      services.cline as never,
+      services.loomy as never,
+      services.raccoon as never,
+      services.minimax as never,
+      services.zcode as never,
+      services.gemini as never,
     )
     const response = await getHandler()(new Request('http://127.0.0.1/api/jet-hub', {
       method: 'POST',
@@ -317,11 +341,18 @@ describe('account.refresh 失败语义（issue IKJOZA）', () => {
     return body.result
   }
 
-  // issue 报告里出现过的三条真实错误，逐条锁定「失败仍回 ok:true 就得红」。
+  /**
+   * issue 报告里出现过的真实错误，逐条锁定「失败仍回 ok:true 就得红」。
+   *
+   * ⚠ **provider 与文案必须对位**（初版把 raccoon 的报错挂在 `trae` 上，因为
+   * `makeThrowingStub` 当时没有 raccoon/minimax 的桩）：挂错 provider 时，
+   * 该 provider 自己的失败分支**根本没被走到**，等于零覆盖 —— 后来谁在那个
+   * 分支里加个 early return，也不会有任何用例会红。
+   */
   const REPORTED = [
     { provider: 'codearts', message: "CodeArts token request failed: 400 {errorCode: 'STS5.1806', errorMsg: \"invalid refresh token: 'the refresh token has been used'\"}" },
-    { provider: 'buddy', message: '[buddy] 账号 buddy-1 的 refresh_token 已失效，请重新登录' },
-    { provider: 'trae', message: 'raccoon 登录态已过期' },
+    { provider: 'minimax', message: 'minimax refresh_token 已失效' },
+    { provider: 'raccoon', message: 'raccoon 登录态已过期' },
   ] as const
 
   for (const { provider, message } of REPORTED) {
@@ -339,6 +370,22 @@ describe('account.refresh 失败语义（issue IKJOZA）', () => {
       const accounts = [entry(provider, `${provider.toUpperCase()}_ACCOUNT_F`)]
       const result = await callRefreshFailing(accounts, `${provider}-1`, provider, message)
       expect(result.error?.message).toBe(message)
+    })
+  }
+
+  /**
+   * 全部 13 个 provider 逐个覆盖。
+   *
+   * ⚠ `switch` 新增 case 时这条会**静默失效**（新 provider 既不在本表里、
+   * 又仍被 `makeThrowingStub` 造了桩），故另有一条 case 数量断言兜底。
+   */
+  for (const provider of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn',
+    'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini'] as const) {
+    it(`${provider} 分支的失败也走同一条 ok:false 通道`, async () => {
+      const accounts = [entry(provider, `${provider.toUpperCase()}_ACCOUNT_F`)]
+      const result = await callRefreshFailing(accounts, `${provider}-1`, provider, `${provider} boom`)
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toBe(`${provider} boom`)
     })
   }
 

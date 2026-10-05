@@ -487,7 +487,7 @@ export function createPoolRefresh(
   return async () => {
     const available = await pool.getAvailableAccount(productId, '')
     // ⚠️ 必须传 `pool` + `entry.id`（issue !IKIRTT）：这条是**发消息途中**按需续期
-    // 的路径（比账号卡片点「刷新」触发得频繁得多），不回写有效期就会让 UI 继续
+    // 的路径（比 RPC `account.refresh` 触发得频繁得多），不回写有效期就会让 UI 继续
     // 挂着「已过期」—— 早先七个 provider 的 `refreshAccountCredential` 没有
     // 回写能力时这里也无从传起，现在补全。
     if (available) {

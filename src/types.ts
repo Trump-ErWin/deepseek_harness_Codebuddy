@@ -484,7 +484,7 @@ export interface RpcLoomyPermanentLockResponse {
  *
  * ⚠️ 判据不同但**开关语义相同**（「只消耗会近期作废的积分」），故共用一个端点
  * 与一张持久化表，而不是每个 provider 加一条 case —— 平行分支越多，漏接概率越高
- * （WorkBuddy 的「刷新」按钮就是这么一直坏着的）。
+ * （`account.refresh` 端点对 workbuddy 漏接 case 就是这么一直坏着的）。
  *
  * `locked` 省略表示**只读查询**；给出布尔值表示写入。
  */

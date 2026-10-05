@@ -186,12 +186,25 @@ async function refreshAllCredentials(): Promise<void> {
 ```typescript
 // account.refresh
 case 'buddy-eu':
-  await buddyEu.refreshAccountCredential(entry.credentialRef)
+  // ⚠⚠ **必须传 pool + entry.id**（issue IKIRTT）：续期后要把新的 expiresAt 回写
+  // 账号池条目，否则凭据续好了、UI 一直显示「已过期」，用户没有自救手段。
+  // 这两个参数是**可选**的，漏传**能编译、类型全绿**，但会静默丢回写 ——
+  // `tests/unit/refresh-bootstrap-wiring.spec.ts` 会逐个 case 扫这条不变式。
+  await buddyEu.refreshAccountCredential(entry.credentialRef, pool, entry.id)
   break
 
 // account.create —— 与 buddy/workbuddy 共用 productById 分支，无需改动
 // 但需在 registerJetHubRpc 签名中增加 buddyEu 参数，并传入
 ```
+
+⚠ **不要**在 `account.refresh` 的 catch 里回 `ok:true` + `value.success:false`：
+客户端 `unwrapRpcResult`（`plugin-src/management-rpc.mjs`）只判 `ok === true`，
+只判 `ok` 的调用方会把续期失败读成成功（issue IKJOZA，真实代价是 18 次里 17 次失败
+被显示成「✅」）。**判据**：catch 里的失败若**没有**额外的判别字段（`done` /
+`results[]` 之类），就是业务终态，必须回 `ok:false + error:{code:'bad-request', message:<原异常文案>}`。
+
+⚠ 本端点**没有面板入口** —— 账号卡片上并没有「刷新」按钮，调用方是仓库外的
+脚本/手工 RPC（issue IKJOZA 取证）。
 
 ### A4. 客户端侧
 
@@ -426,8 +439,9 @@ if (provider === 'deepseek-official') {
 }
 
 // 3. account.refresh —— switch 加新 case
+//    ⚠ 必须传 pool + entry.id，否则 expiresAt 不回写账号池（issue IKIRTT，见 A3）
 case 'deepseek-official':
-  await deepseekOfficial.refreshAccountCredential(entry.credentialRef)
+  await deepseekOfficial.refreshAccountCredential(entry.credentialRef, pool, entry.id)
   break
 
 // 4. credits.* —— 加新分支（如有积分能力）
@@ -497,7 +511,7 @@ export const CREDITS_CAPABILITIES = Object.freeze({
 ### 续期与账号池
 
 - [ ] `refreshAll()` **只按 `refreshable` 过滤，不看 `enabled`**（真实缺陷教训）
-- [ ] `refreshAccountCredential()` 读写指定 ref，不碰默认单凭据 ref（否则 Jet Hub 刷新按钮刷错凭据）
+- [ ] `refreshAccountCredential(refName, pool, accountId)` 读写指定 ref，不碰默认单凭据 ref（否则 Jet Hub 续期刷错凭据）
 - [ ] `getAvailableAccount` 调用时传入 `this.product.id`（而不是写死字面量；WorkBuddy 踩过坑）
 
 ### 两步式登录
@@ -511,7 +525,8 @@ export const CREDITS_CAPABILITIES = Object.freeze({
 ### `jet-hub-rpc.ts`
 
 - [ ] `account.create` 有该 provider 的分支
-- [ ] `account.refresh` 的 switch 有该 provider 的 case
+- [ ] `account.refresh` 的 switch 有该 provider 的 case，且**每个 case 都传了 `pool` 与 `entry.id`**
+- [ ] `account.refresh` 的 catch 回 `ok:false + error`，不是 `ok:true + value.success:false`（issue IKJOZA）
 - [ ] `credits.*` 各端点有该 provider 的分支（如果它有积分能力的话）
 - [ ] 没有写死字面量（如 `LOBSTERAI.id` 代替 `'lobsterai'`）
 

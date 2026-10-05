@@ -1356,12 +1356,15 @@ pool.listAllAccounts().then(accounts => {
 
 > ⚠️ **发现的既有 bug 1**（`jet-hub-rpc.ts:452-476`）：`account.refresh` 的分支
 > 只处理 `codearts` 与 `buddy`，**`workbuddy` 会落到 `else` 抛
-> `Unknown provider: workbuddy`**。即当前 WorkBuddy 账号卡片的「刷新」按钮是坏的。
+> ``Unknown provider: workbuddy``**。即该端点对 WorkBuddy 完全不可用。
+> ⚠ 本文档初稿把它记作「账号卡片的『刷新』按钮是坏的」——**该说法不成立**：
+> 账号卡片上并没有「刷新」按钮（按钮是 测试/重测/重置/停用/代理/指纹/删除），
+> ``account.refresh`` 没有面板入口，调用方是仓库外的脚本/手工 RPC（issue IKJOZA 取证）。
 >
 > ⚠️ **发现的既有 bug 2**（同处）：分支里调的是 `codearts.refresh()` /
 > `buddy.refresh()` —— 这两个方法刷新的是**默认单凭据 ref**
 > （`BuddyAuth.refresh()` 用 `this.credentialRefName` = `BUDDY_ACCESS_TOKEN`），
-> **不是该账号的 `entry.credentialRef`**。所以对账号池里的多账号点刷新，
+> **不是该账号的 `entry.credentialRef`**。所以对账号池里的多账号发起续期，
 > 刷的是另一个凭据。修法：按 `entry.credentialRef` 解析凭据后用该凭据刷新。
 
 #### C. 推荐做法
