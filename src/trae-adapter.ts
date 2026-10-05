@@ -53,6 +53,7 @@ import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableT
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
+import { reportLedgerAccount } from './token-ledger.js'
 
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae'
@@ -923,6 +924,8 @@ export class TraeAdapter extends LlmAdapter {
           this.product.id,
           credential.access_token,
         )
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+        if (currentAccountId !== '') reportLedgerAccount(this.product.id, currentAccountId)
       } catch {
         // 账号不匹配不影响请求
       }

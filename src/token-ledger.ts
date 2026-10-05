@@ -40,6 +40,15 @@ export interface TokenLedgerEntry {
   /** 模型 id（wire 上的 `model`）。 */
   model: string
   /**
+   * **服务本笔请求的账号**（账号池条目 id）。
+   *
+   * ⚠️ 第 2 期（账号维度）加入。归属口径与 cline-request-log 相同：
+   * 以**实际解析出凭据的账号**为准（`resolveCredential` / 池查询回报）。
+   * 取不到时为空串 —— 未知账号与「没有账号体系」不能混成一个假 id，
+   * 展示层对空串整段不渲染（或归入「未归属」）。
+   */
+  accountId?: string
+  /**
    * 是否收到过 usage chunk。
    *
    * ⚠️ 与「token 为 0」**不是一回事**：没收到 usage（abort / 上游提前断开 /
@@ -63,7 +72,7 @@ export interface TokenLedgerEntry {
   error?: string
 }
 
-/** 渠道 → provider → 模型 三级聚合的一行（模型粒度）。 */
+/** 渠道 → provider → 账号 → 模型 聚合里模型粒度的一行。 */
 export interface TokenLedgerModelRow {
   model: string
   /** 请求数（含失败）。 */
@@ -79,10 +88,18 @@ export interface TokenLedgerModelRow {
   errors: number
 }
 
-/** 一个 provider 下的聚合（模型行 + 自身小计）。 */
+/** 一个 provider 下、某个账号的聚合（模型行 + 自身小计）。 */
+export interface TokenLedgerAccountRow {
+  /** 账号池条目 id；空串 = 未归属（凭据解析没回报的请求）。 */
+  accountId: string
+  models: TokenLedgerModelRow[]
+  totals: Omit<TokenLedgerModelRow, 'model'>
+}
+
+/** 一个 provider 下的聚合（账号行 + 自身小计）。 */
 export interface TokenLedgerProviderRow {
   provider: string
-  models: TokenLedgerModelRow[]
+  accounts: TokenLedgerAccountRow[]
   totals: Omit<TokenLedgerModelRow, 'model'>
 }
 
@@ -107,6 +124,96 @@ export const TOKEN_LEDGER_LIMIT = 500
 /** 内存中的流水（最新在前）。 */
 let ledger: TokenLedgerEntry[] = []
 
+/**
+ * 「该 provider 最近一次解析出的账号」注册表（第 2 期 · 账号维度）。
+ *
+ * ## 为什么是「最近一次」而不是「本次」
+ *
+ * 账号归属的**权威**来源在各适配器内部（`currentAccountId` 局部变量），
+ * 包装层（`recordThroughStream`）看不到它。为不重写 13 个适配器，采用
+ * **侧信道回报**：`index.ts` 的 `resolveCredential` 回调与各适配器的
+ * 凭据解析点调用 {@link reportLedgerAccount}，包装层在**收到 usage 帧**
+ * 时读取（彼时凭据必然已解析，见 `llm-register-compat.ts` 的时序说明）。
+ *
+ * ## 归属精度（如实写进 issue 的近似声明）
+ *
+ * - **单账号 provider**（绝大多数用户每个 provider 只登一个号）⇒ 精确。
+ * - **多账号 + 流内换号**：归属记录的是「解析出凭据的那个账号」——
+ *   即本轮请求的**起点**。换号（额度用尽等）后 usage 归到新账号要等
+ *   该账号再次回报；在换号即时性上它是**近似**，不是 cline-request-log
+ *   那种「最终服务账号」的精确口径。
+ * - 并发流共用同一 provider 的注册表槽位 ⇒ 交错时按「最后回报」归属。
+ *   这是把改动收敛到侧信道的**有意取舍**（全量精确需改 13 个适配器的
+ *   内部状态机，收益比不符）。
+ */
+const reportedAccounts = new Map<string, string>()
+
+/**
+ * 回报「该 provider 最近解析出的账号」（凭据解析点调用）。
+ *
+ * ⚠️ 绝不抛错：它与 {@link recordTokenUsage} 同在推理关键路径上。
+ * 空串 / 非串入参直接忽略（不清空旧值 —— 清空语义属于 {@link clearLedgerAccount}）。
+ */
+export function reportLedgerAccount(provider: string, accountId: string): void {
+  try {
+    if (typeof provider !== 'string' || provider.length === 0) return
+    if (typeof accountId !== 'string' || accountId.length === 0) return
+    reportedAccounts.set(provider.slice(0, 64), accountId.slice(0, 64))
+  } catch {
+    // 回报失败绝不反噬推理。
+  }
+}
+
+/** 读取该 provider 当前记录的账号（包装层在 usage 帧到达时调用）。 */
+export function peekLedgerAccount(provider: string): string {
+  return reportedAccounts.get(provider) ?? ''
+}
+
+/** 诊断用：注册表当前条数。 */
+export function ledgerAccountCount(): number {
+  return reportedAccounts.size
+}
+
+/** 测试专用：清空回报表。 */
+export function resetLedgerAccountsForTests(): void {
+  reportedAccounts.clear()
+}
+
+/**
+ * 每日聚合的**持久化挂载点**（第 2 期 · 落盘）。
+ *
+ * 由 `index.ts` 在插件启动时 `attachTokenLedgerPersistence(...)` 注入；
+ * 记账路径只调这个回调，不关心它存到哪 —— 与 `record()` 绝不抛错同款约束，
+ * 持久化失败绝不能反噬推理。
+ */
+let persistenceHook: ((day: string, entry: TokenLedgerEntry) => void) | undefined
+
+/**
+ * 注入持久化回调（插件启动时调用一次）。
+ *
+ * @param hook - 收到 **UTC+8 日键**与该笔记录；实现方自行做日聚合与落盘节流。
+ *   传 `undefined` = 卸载（测试隔离用）。
+ */
+export function attachTokenLedgerPersistence(
+  hook: ((day: string, entry: TokenLedgerEntry) => void) | undefined,
+): void {
+  persistenceHook = hook
+}
+
+/**
+ * **UTC+8 日键**（`YYYY-MM-DD`）。
+ *
+ * ⚠️ 必须用**算术**换算（+8h 后取 UTC 日期），绝不能用 `Date.setHours` 等
+ * 本机时区方法 —— 与 `qoder-adapter.ts` 的 `nextUtc8DayStartMs` 同一条纪律：
+ * 各渠道的每日额度都按 UTC+8 结算，本机时区不同（出差/改设置）会算错日界。
+ */
+export function utc8DayKey(ts: number): string {
+  const shifted = new Date(ts + 8 * 60 * 60 * 1000)
+  const month = String(shifted.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(shifted.getUTCDate()).padStart(2, '0')
+  return `${shifted.getUTCFullYear()}-${month}-${day}`
+}
+
 /** 数值字段的统一钳制：非有限值/负数 → 0，截断小数。 */
 function clampCount(value: unknown): number {
   const n = Number(value)
@@ -125,12 +232,15 @@ export function recordTokenUsage(entry: Omit<TokenLedgerEntry, 'ts'>): void {
     const cacheRead = clampCount(entry.cacheReadTokens)
     const cacheWrite = clampCount(entry.cacheWriteTokens)
     const reasoning = clampCount(entry.reasoningTokens)
-    ledger.unshift(Object.freeze({
+    // 账号：空串/缺失统一省略字段（「未归属」与「空账号」不伪造）。
+    const accountId = typeof entry.accountId === 'string' ? entry.accountId.slice(0, 64) : ''
+    const record = Object.freeze({
       ts: Date.now(),
       // channel 只认两个合法值，垃圾值一律落回 `direct`（保守缺省）。
       channel: entry.channel === 'gateway' ? 'gateway' : 'direct',
       provider: String(entry.provider ?? '').slice(0, 64),
       model: String(entry.model ?? '').slice(0, 160),
+      ...(accountId.length > 0 ? { accountId } : {}),
       usageReported,
       inputTokens: clampCount(entry.inputTokens),
       outputTokens: clampCount(entry.outputTokens),
@@ -143,8 +253,16 @@ export function recordTokenUsage(entry: Omit<TokenLedgerEntry, 'ts'>): void {
       ...(typeof entry.error === 'string' && entry.error.length > 0
         ? { error: entry.error.slice(0, 200) }
         : {}),
-    }) as TokenLedgerEntry)
+    }) as TokenLedgerEntry
+    ledger.unshift(record)
     if (ledger.length > TOKEN_LEDGER_LIMIT) ledger.length = TOKEN_LEDGER_LIMIT
+    // 每日聚合落盘（第 2 期）：回调内部自己节流与兜错，这里不再包 try ——
+    // 挂载点契约要求 hook 绝不抛错（见 attachTokenLedgerPersistence 的说明）。
+    try {
+      persistenceHook?.(utc8DayKey(record.ts), record)
+    } catch {
+      // 持久化失败绝不反噬推理（双重防御：hook 违约也不炸）。
+    }
   } catch {
     // 记账失败绝不反噬推理（见函数注释）。
   }
@@ -189,16 +307,16 @@ function sumTokens(t: Omit<TokenLedgerModelRow, 'model'>): number {
  *
  * 纯读取、不改状态；每次按需重建聚合树（见模块头「不为 O(n) 引入双写」）。
  * 聚合与明细都来自同一份 `ledger`，**天然同源**——不存在「树与小计各算一遍」
- * 的口径漂移。各级排序：渠道按 `direct → gateway`、provider/模型按 token
+ * 的口径漂移。各级排序：渠道按 `direct → gateway`、provider/账号/模型按 token
  * 合计降序（谁烧得多谁在前）。
  */
 export function readTokenLedger(options: { limit?: number } = {}): TokenLedgerSnapshot {
   const limit = Math.max(0, Math.min(options.limit ?? TOKEN_LEDGER_LIMIT, TOKEN_LEDGER_LIMIT))
 
-  // ── 第一遍：逐条累加进三级聚合（全局小计顺路算出）──
+  // ── 第一遍：逐条累加进四级聚合（全局小计顺路算出）──
   const totals = emptyTotals()
-  /** channel → provider → model → 聚合行 */
-  const channelMap = new Map<TokenLedgerEntry['channel'], Map<string, Map<string, Omit<TokenLedgerModelRow, 'model'>>>>()
+  /** channel → provider → account → model → 聚合行 */
+  const channelMap = new Map<TokenLedgerEntry['channel'], Map<string, Map<string, Map<string, Omit<TokenLedgerModelRow, 'model'>>>>>()
   for (const entry of ledger) {
     accumulate(totals, entry)
     let providers = channelMap.get(entry.channel)
@@ -206,10 +324,18 @@ export function readTokenLedger(options: { limit?: number } = {}): TokenLedgerSn
       providers = new Map()
       channelMap.set(entry.channel, providers)
     }
-    let models = providers.get(entry.provider)
+    let accounts = providers.get(entry.provider)
+    if (accounts === undefined) {
+      accounts = new Map()
+      providers.set(entry.provider, accounts)
+    }
+    // ⚠️ 空账号统一落 `'-'` 桶（Map 键不能缺失）：它是**真实存在的分组**
+    // （「未归属」——凭据解析没回报的请求），不能并进任何一个账号。
+    const accountKey = entry.accountId !== undefined && entry.accountId.length > 0 ? entry.accountId : '-'
+    let models = accounts.get(accountKey)
     if (models === undefined) {
       models = new Map()
-      providers.set(entry.provider, models)
+      accounts.set(accountKey, models)
     }
     let row = models.get(entry.model)
     if (row === undefined) {
@@ -224,20 +350,28 @@ export function readTokenLedger(options: { limit?: number } = {}): TokenLedgerSn
     .sort(([a], [b]) => (a === 'direct' ? -1 : 1) - (b === 'direct' ? -1 : 1))
     .map(([channel, providers]) => {
       const channelTotals = emptyTotals()
-      const providerRows: TokenLedgerProviderRow[] = [...providers.entries()].map(([provider, models]) => {
+      const providerRows: TokenLedgerProviderRow[] = [...providers.entries()].map(([provider, accounts]) => {
         const providerTotals = emptyTotals()
-        const modelRows: TokenLedgerModelRow[] = [...models.entries()].map(([model, row]) => {
-          // provider 小计 = 其各模型行之和
-          for (const key of Object.keys(row) as (keyof typeof row)[]) {
-            providerTotals[key] += row[key]
+        const accountRows: TokenLedgerAccountRow[] = [...accounts.entries()].map(([accountId, models]) => {
+          const accountTotals = emptyTotals()
+          const modelRows: TokenLedgerModelRow[] = [...models.entries()].map(([model, row]) => {
+            // 账号小计 = 其各模型行之和
+            for (const key of Object.keys(row) as (keyof typeof row)[]) {
+              accountTotals[key] += row[key]
+            }
+            return { model, ...row }
+          }).sort((a, b) => sumTokens(b) - sumTokens(a))
+          // provider 小计 = 其各账号之和
+          for (const key of Object.keys(accountTotals) as (keyof typeof accountTotals)[]) {
+            providerTotals[key] += accountTotals[key]
           }
-          return { model, ...row }
-        }).sort((a, b) => sumTokens(b) - sumTokens(a))
+          return { accountId, models: modelRows, totals: accountTotals }
+        }).sort((a, b) => sumTokens(b.totals) - sumTokens(a.totals))
         // 渠道小计 = 其各 provider 之和
         for (const key of Object.keys(providerTotals) as (keyof typeof providerTotals)[]) {
           channelTotals[key] += providerTotals[key]
         }
-        return { provider, models: modelRows, totals: providerTotals }
+        return { provider, accounts: accountRows, totals: providerTotals }
       }).sort((a, b) => sumTokens(b.totals) - sumTokens(a.totals))
       return { channel, providers: providerRows, totals: channelTotals }
     })
@@ -262,4 +396,81 @@ export function resetTokenLedgerForTests(): void {
 /** 当前保留的流水条数（诊断用）。 */
 export function tokenLedgerSize(): number {
   return ledger.length
+}
+
+/**
+ * **每日聚合**的落盘负载（第 2 期持久化）。
+ *
+ * 键结构：`日键 → 渠道|provider|账号|模型 → 累计值`。与「明细不持久化」的
+ * 决策一致：明细在 UI 已有内存版（500 条），落盘只解决「重启后还能看历史
+ * 总量」的诉求，而这个诉求的天然粒度就是**日**。
+ */
+export interface TokenLedgerDayKey {
+  channel: 'direct' | 'gateway'
+  provider: string
+  /** 空串 = 未归属。 */
+  accountId: string
+  model: string
+}
+
+/** 一个日聚合桶的累计值。 */
+export interface TokenLedgerDayBucket {
+  requests: number
+  reportedRequests: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+  errors: number
+}
+
+/** 每日聚合表：`日键 → (桶键 → 桶)`。序列化形态由 store 负责。 */
+export type TokenLedgerDayMap = Map<string, Map<string, TokenLedgerDayBucket>>
+
+/** 桶键（同进程内用 `|` 拼；含转义，见 `dayBucketKeyOf`）。 */
+export function dayBucketKeyOf(key: TokenLedgerDayKey): string {
+  // ⚠️ provider/model/accountId 都可能含 `|`？账号池 id 与模型 id 实测不含，
+  // 但防御性转义：把 `|` 换成 `/`（丢失可接受，它只影响极端名字的分桶边界）。
+  const esc = (s: string): string => s.replaceAll('|', '/')
+  return `${key.channel}|${esc(key.provider)}|${esc(key.accountId)}|${esc(key.model)}`
+}
+
+/** 把一笔记录累加进日聚合表（store 的 load/merge 共用）。 */
+export function mergeDayEntry(days: TokenLedgerDayMap, entry: TokenLedgerEntry): void {
+  const day = utc8DayKey(entry.ts)
+  let buckets = days.get(day)
+  if (buckets === undefined) {
+    buckets = new Map()
+    days.set(day, buckets)
+  }
+  const key = dayBucketKeyOf({
+    channel: entry.channel,
+    provider: entry.provider,
+    accountId: entry.accountId ?? '',
+    model: entry.model,
+  })
+  let bucket = buckets.get(key)
+  if (bucket === undefined) {
+    bucket = {
+      requests: 0,
+      reportedRequests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
+      errors: 0,
+    }
+    buckets.set(key, bucket)
+  }
+  bucket.requests += 1
+  if (entry.usageReported) bucket.reportedRequests += 1
+  if (entry.error !== undefined) bucket.errors += 1
+  if (!entry.usageReported) return
+  bucket.inputTokens += entry.inputTokens
+  bucket.outputTokens += entry.outputTokens
+  bucket.cacheReadTokens += entry.cacheReadTokens ?? 0
+  bucket.cacheWriteTokens += entry.cacheWriteTokens ?? 0
+  bucket.reasoningTokens += entry.reasoningTokens ?? 0
 }

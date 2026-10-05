@@ -33,6 +33,7 @@ import { providerCatalogVisible, type AccountPool } from './account-pool.js'
 import { collectImages, httpErrorCode } from './openai-compat.js'
 import { projectRequestImage } from './image-budget.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
+import { reportLedgerAccount } from './token-ledger.js'
 import {
   GEMINI,
   GEMINI_ENDPOINTS,
@@ -380,6 +381,8 @@ export class GeminiAdapter extends LlmAdapter {
         .findAccountIdByCredential(this.product.id, credential.access_token)
         .catch(() => '')
     }
+    // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+    if (currentAccountId !== '') reportLedgerAccount(this.product.id, currentAccountId)
     const tried = new Set<string>()
     if (currentAccountId !== '') tried.add(currentAccountId)
 

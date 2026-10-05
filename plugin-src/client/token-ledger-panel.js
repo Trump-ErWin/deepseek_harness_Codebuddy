@@ -81,13 +81,19 @@ export function formatEntryTime(ts) {
 }
 
 /**
- * 弹窗副标题：说明账本的存在形态（进程内存、重启即丢）。
+ * 弹窗副标题：说明账本的存在形态。
  *
- * ⚠️ 这句话是**诚实务必**：账本不持久化，如果副标题只写「Token 用量」，
- * 用户会把它当成历史统计，重启后看到归零会以为数据丢了（报障成本高）。
+ * ⚠️ 第 2 期起**日聚合已落盘**（`token-ledger.json`）——「重启后清空」只对
+ * **明细表**成立。副标题必须把两者说清，不能笼统说「重启清空」误导用户
+ * 以为历史总量也丢了。
  */
 export function ledgerSubtitle() {
-  return '本机流水 · 重启后清空';
+  return '本机流水 · 明细重启清空 · 日累计已存盘';
+}
+
+/** 账号显示名：空串（未归属）给中性占位，其余原样。 */
+export function accountLabel(accountId) {
+  return typeof accountId === 'string' && accountId.length > 0 ? accountId : '未归属';
 }
 
 /**
