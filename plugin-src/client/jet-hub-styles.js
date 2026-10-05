@@ -290,6 +290,58 @@ const STYLES = `
    flex: none 是必需的 —— 它是行尾的固定标签，参与收缩会被 id/name 挤没。 */
 .dim-jh-modelBadge { flex: none; padding: 1px 6px; border-radius: 5px; background: var(--dsw-alias-color-success-light, #e8ffea); color: var(--dsw-alias-color-success, #00875a); font-size: 11px; line-height: 16px; white-space: nowrap; }
 
+/* ── 已下架（失效）模型（2026-10-06 复审 !66）──
+   ⚠️ **必须放在上面 .dim-jh-modelName / .dim-jh-modelId 基础规则之后**：
+   tests/unit/model-filter.spec.ts 的 ruleOf() 按**源码顺序**取第一条匹配规则，
+   把带 [data-dead] 的规则写在前面会让它误取到本块、跳过基础规则。
+   ⚠️⚠️ **本块内禁止出现反引号**（AGENTS.md 红线：样式是模板字符串，注释里的
+   反引号会提前闭合模板；tests/unit/zcode-channel-dialog.spec.ts 有专门用例守着）。
+   与「已关闭」**必须视觉可区分**：一个是用户的主动选择（开关可拨回），
+   一个是系统判定上游已移除（只能点「重新显示」恢复）。若长得一样，用户会去拨
+   那个根本不存在的开关，于是以为「模型被吞了、插件有 bug」。
+   ⇒ 用左侧警示竖条 + 琥珀色角标，与「已关闭」的纯淡出区分开。 */
+.dim-jh-modelRow[data-dead="true"] { box-shadow: inset 3px 0 0 var(--dsw-alias-warning, #d48806); }
+.dim-jh-modelRow[data-dead="true"] .dim-jh-modelInfo { opacity: 1; }
+.dim-jh-modelRow[data-dead="true"] .dim-jh-modelName { color: var(--dsw-alias-warning, #d48806); }
+.dim-jh-modelDead {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-warning, #d48806);
+  background: color-mix(in srgb, var(--dsw-alias-warning, #d48806) 12%, transparent);
+}
+.dim-jh-modelRestore {
+  flex: none;
+  padding: 2px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--dsw-alias-text-secondary, #4e5969);
+  background: var(--dsw-alias-bg-layer-2, #f7f8fa);
+  border: 1px solid var(--dsw-alias-border-l2, #dfe1e5);
+  cursor: pointer;
+}
+.dim-jh-modelRestore:hover:not(:disabled) {
+  color: #1677ff;
+  border-color: color-mix(in srgb, #1677ff 40%, var(--dsw-alias-border-l2, #dfe1e5));
+}
+.dim-jh-modelRestore:disabled { opacity: 0.5; cursor: default; }
+/* 顶部批量恢复条 */
+.dim-jh-modelDeadBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 6px 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--dsw-alias-text-secondary, #4e5969);
+  background: color-mix(in srgb, var(--dsw-alias-warning, #d48806) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-warning, #d48806) 26%, transparent);
+}
+
 /* ── 思考档位对照表 ──
    与模型清单的行**刻意不同**：那两行的 id/name 用 ellipsis 截断（清单要紧凑），
    而对照表的内容本身就是用户要抄的东西 —— 截断等于让功能失效

@@ -533,6 +533,14 @@ class FileStore implements JetHubStore {
  *
  * 优先级：`DSH_JET_HUB_STATE_DIR`（单测隔离用）→ `profileContext.home`
  * → `$DSH_HOME` → `~/.dsh`。与 `dsh-home-paths` 的 `resolveDshHome` 同序。
+ *
+ * ⚠️ `ctx` **必传**（2026-10-06 复审 !66 收紧）：本函数是**所有**插件状态文档
+ * （`state.json` / `permanent-locks.json` / `badge-preferences` / `auto-checkin` /
+ * `gemini-sigstore` / `dead-models`）的**唯一** home 解析入口，必须保证它们落在
+ * 同一目录。PR !66 曾把它放宽成可选、并在 `dead-model-store` 里传 `undefined` ——
+ * 那会**跳过优先级更高的 `profileContext.home`**，在 profile home 与 `$DSH_HOME`
+ * 不相等时把失效表写到另一个目录，造成「账号池在 A、失效表在 B」的分裂，
+ * 正是 `permanent-lock-store.ts:129-133` 明确警告过必须避免的情况。
  */
 export function resolveJetHubHome(ctx: Context): string | undefined {
   const override = process.env.DSH_JET_HUB_STATE_DIR

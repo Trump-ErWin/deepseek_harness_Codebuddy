@@ -6,6 +6,122 @@
 - **正文输出**（正文回复、代码注释说明、总结、文档）一律使用中文。
 - 代码标识符、关键字、类型名称、变量名等保持英文不变。
 
+## ⚠️ 包装适配器时必须包 `prepareCall`，不是 `stream`（PR !66 复审，2026-10-06）
+
+**真实缺陷**：`src/dead-model-store.ts` 的 `withDeadModelPruning` 用 Proxy 包装
+适配器，初版只拦 `listModels` / `listAllModels` / `stream` ⇒ **在生产环境完全不生效**
+（42 条单测全绿，因为测试直接调 `proxy.stream`，绕过了真实路径）。
+
+### 1. 生产路径**只走 `prepareCall`**，不直接调 `adapter.stream`
+
+本仓库全部 14 个适配器都实现了：
+
+```ts
+async prepareCall(provider, model, signal) {
+  return { model: await this.resolveModel(...), stream: (options) => this.stream(options) }
+}
+```
+
+`prepareCall` 被 `value.bind(obj)` 绑到**原始对象**，故 `this` 是原对象，
+`this.stream` 拿到的是**原始 stream** ⇒ **完全绕过 Proxy**。
+而 dsh-llm 的两条运行时路径只调它：
+
+- `node_modules/@deepseek-ai/dsh-llm/lib/index.js:1597` → `adapterCall.stream(options)`
+- 同文件 `:1667` → `dispatch = (options) => adapterCall.stream(options)`
+
+⇒ **只包 `stream` 是不够的**；而且只包 `prepareCall` 本身**也不够** ——
+真实错误发生在 `call.stream(options)` 的**迭代过程中**
+（`:1691` `iterator = dispatch(...)[Symbol.asyncIterator]()`，`:1701` `iterator.next()`），
+必须包装 **`prepareCall` 返回的那个 `call.stream`**。
+
+⚠️ 排查这类问题的通用手法：**别问「哪个成员被包了」，去 `node_modules` 里读
+消费者的真实调用链**。本仓库已有先例（`prepareCall` shim 的注释记录了
+`registration.adapter.prepareCall is not a function` 的报障）。
+
+### 2. `registerXxxLlm` 返回的是**原始实例**，不是 Proxy
+
+各 `registerXxxLlm` 里 `return adapter`（`new XxxAdapter(...)`），
+只有 `registerAdapterIdempotent` 把**代理**注册进 `ctx.llm`。
+于是 `src/index.ts` 的 `modelAdapters` 拿到的是 raw 实例 ⇒
+Jet Hub 设置页的 `listAllModels` 完全看不到剔除效果。
+
+⚠️ 更隐蔽的是 `jet-hub-rpc.ts` 的 `model.list` **两条路径**：
+先 `await llm.listModels()`（走代理，已剔除），紧接着用
+`modelAdapters[provider].listAllModels()`（走 raw，**未剔除**）**覆盖**回去。
+⇒ `index.ts` 里两处必须**用同一个包装函数**，否则前功尽弃。
+
+### 3. 剔除的东西**必须能恢复** —— 与 `disabledModels` 的既有约定对齐
+
+失效模型被剔除后用户**选不到** ⇒ 不可能靠「再成功一次」自愈 ⇒ 记录永不自动清除
+（只能等 30 天 TTL）。若设置页也不显示它，用户就**连开关都摸不着**，
+一次误判 = 该模型被永久隐藏。
+
+这正是 `jet-hub-rpc.ts` 里既有的、必须避免的根因（「用户再也无法重新打开」）。
+⇒ `model.list` 必须把 dead 模型**补回目录**并带 `dead: true`，
+客户端给「重新显示」按钮，走 `model.clearDead` 端点。
+**能藏，但必须能找回。**
+
+### 4. 判据的正则窗口**不能排除点号**
+
+初版用 `[^.!?]{0,N}` 做窗口，而**本仓库几乎所有模型 id 都带小数点**
+（`deepseek-v4.1-flash` / `gpt-5.6-astra` / 最长的
+`cline-free/muse-spark-1.3-contributor` 37 字符）⇒ 英文路径对带点 id **全部漏判**。
+
+⚠️ 初版那条注释「窗口要够宽」只对**中文分支**成立，英文分支**从未验证**。
+⇒ 英文窗口只排除**句子终止符**（`!?` 与换行），**保留 `.`**，并放宽到 64。
+⚠️ 判据里的注释**必须与实测一致**：拿一个样例验了中文路径就以为整体成立，
+是这类缺陷的典型成因。
+
+### 5. `not supported` / `not available` **不是**下架证据
+
+初版把 `available` / `supported` 与 `found`/`exist` 并列，于是这 6 条
+**换个套餐 / 换个地域就能恢复**的文案被当成下架：
+
+```
+cline: model not supported in this plan    ← 换套餐就好
+model not available in your region         ← 换区就好
+```
+
+而误判后模型被藏 30 天且**用户无法自愈**。这与文件头「`unsupported` 单独出现不算」
+的口径本来就矛盾 ⇒ **只认 `found` / `exist`**。
+
+⚠️ 本仓库多处错误文案带 `model` 字样（`model "x" does not accept image input.`），
+都靠 `IGNORED_CODES`（`UNSUPPORTED_CONTENT` 等）与排除词挡住 ——
+**改判据时必须把这些真实文案一起重跑**，不能只看自己造的样例。
+
+### 6. 排除词要带词边界
+
+`expired` 无修饰会命中 `model expired-v3 does not exist`（模型名里含 expired）；
+`quota` / `insufficient` 同理。中文排除词（额度 / 积分 / 余额）**不要**收紧 ——
+它们的方向是「宁可漏判不可误伤」，符合本仓库总原则。
+
+### 7. `resolveJetHubHome` 的 `ctx` **必须必传**
+
+它是**所有**插件状态文档（`state.json` / `permanent-locks.json` /
+`badge-preferences` / `auto-checkin` / `gemini-sigstore` / `dead-models`）的
+**唯一** home 解析入口。PR !66 曾把它放宽成可选并传 `undefined` ——
+那会**跳过优先级更高的 `profileContext.home`**，在 profile home 与 `$DSH_HOME`
+不相等时把文档写到**另一个目录**，造成「账号池在 A、失效表在 B」的分裂，
+正是 `permanent-lock-store.ts` 明确警告过必须避免的情况。
+
+### 8. 单测要覆盖**真实调用链**，不是被包装的那一层
+
+初版 42 条用例全绿却完全测不到生产路径。⇒ 包装类改动的回归用例必须：
+① 造一个与真实适配器**同款形状**的替身（`prepareCall` 里 `this.stream`）；
+② 经 `prepareCall` 走一遍；③ 做**反向验证**（把修复回退，用例必须变红）。
+⚠️ 初版还有一条**同义反复**用例（注释声称构造了失败路径、实际什么都没构造），
+任何不崩的实现都能过 —— 这种用例比没有更危险。
+
+### 9. 客户端 CSS 的两条红线（都已有专门用例守着）
+
+- **注释里禁止出现反引号**（样式是模板字符串，会提前闭合）——
+  `zcode-channel-dialog.spec.ts` 守着。
+- ⚠️ 新增带 `[data-dead]` 这类**属性选择器**的规则时，必须放在基础规则**之后**：
+  `model-filter.spec.ts` 的 `ruleOf()` 按**源码顺序**取第一条匹配规则，
+  写在前面会让它误取到新块、跳过基础规则（表现为「可收缩」断言假失败）。
+
+---
+
 ## 项目概述
 
 本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）、`raccoon`（商汤 **Raccoon Work** / 小浣熊）与 `minimax`（**MiniMax Code 中国版**，首个 **Anthropic Messages** 协议族）十个 LLM provider 路由。

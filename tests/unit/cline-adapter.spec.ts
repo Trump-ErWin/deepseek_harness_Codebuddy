@@ -804,7 +804,7 @@ describe('Cline 接线（源码级回归）', () => {
     expect(source).toMatch(/cline\.refreshAll\((?:pool|p)\)/)
     expect(source).toContain('cline.stop()')
     // Jet Hub「显示列表」需要适配器实例
-    expect(source).toContain('cline: clineAdapter')
+    expect(source).toMatch(/cline: pruned\([^)]*,\s*clineAdapter\)/)
     // ⚠️ 形参是**位置参数**，新增 provider 会插在 cline 与 modelAdapters 之间。
     // 只断言「cline 在 modelAdapters 之前」，**不要**写死整串前缀
     // —— 那会让每加一个 provider 都假失败（加 Loomy、Raccoon、QoderCN 时各踩一次）。

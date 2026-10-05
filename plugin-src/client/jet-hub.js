@@ -917,25 +917,46 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
  * 一旦再插入第二个 checkbox（如曾经加过的多选勾选框），浏览器会把点击激活到
  * **第一个**可标记控件，「点模型名」就变成切换那个新控件、可见性开关纹丝不动
  * （实测确认的行为倒退）。若将来确需多选，必须先把行容器改成 `<div>`。
+ *
+ * ⚠️⚠️ 「重新显示」按钮**必须 `e.stopPropagation()` + `e.preventDefault()`**
+ * （2026-10-06 复审 !66）：失效模型被上游下架后，用户若不点这个按钮就**永远无法**
+ * 恢复 —— 因为记录的唯一自愈路径是 30 天 TTL 过期（模型选不到 ⇒ 不可能再成功
+ * ⇒ 记录永不自动清除）。按钮虽然 `type="button"`，它仍嵌在 `<label>` 内，
+ * 点击会冒泡到 label 并**顺带切换可见性开关** —— 必须拦下。
+ *
+ * @param {{ model: {id: string, name?: string, disabled?: boolean, dead?: boolean},
+ *           busy: boolean, onToggle: Function, onRestore: Function }} props
  */
-function ModelToggle({ model, busy, onToggle }) {
+function ModelToggle({ model, busy, onToggle, onRestore }) {
+  const dead = model.dead === true;
   return React.createElement('label', {
     className: 'dim-jh-modelRow',
     'data-disabled': model.disabled ? 'true' : 'false',
-    title: model.id,
+    'data-dead': dead ? 'true' : 'false',
+    title: dead ? `${model.id}（上游已下架，点击「重新显示」可恢复）` : model.id,
   },
     React.createElement('span', { className: 'dim-jh-modelInfo' },
       React.createElement('strong', { className: 'dim-jh-modelName' }, model.name || model.id),
+      dead ? React.createElement('span', { className: 'dim-jh-modelDead' }, '已下架') : null,
       React.createElement('code', { className: 'dim-jh-modelId' }, model.id)),
-    React.createElement('input', {
-      type: 'checkbox',
-      className: 'dim-jh-switch',
-      role: 'switch',
-      checked: !model.disabled,
-      disabled: busy,
-      'aria-label': `${model.name || model.id} 是否在模型选择中显示`,
-      onChange: () => onToggle(model.id, !model.disabled),
-    }));
+    dead
+      // ⚠️ 失效模型**不渲染可见性开关**：它已被剔除出目录，开关没有意义；
+      //    只给一个「重新显示」按钮（= 清掉失效记录）。
+      ? React.createElement('button', {
+        type: 'button',
+        className: 'dim-jh-modelRestore',
+        disabled: busy,
+        onClick: (event) => { event.preventDefault(); event.stopPropagation(); onRestore(model.id); },
+      }, '重新显示')
+      : React.createElement('input', {
+        type: 'checkbox',
+        className: 'dim-jh-switch',
+        role: 'switch',
+        checked: !model.disabled,
+        disabled: busy,
+        'aria-label': `${model.name || model.id} 是否在模型选择中显示`,
+        onChange: () => onToggle(model.id, !model.disabled),
+      }));
 }
 
 /**
@@ -957,6 +978,8 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const [toggleError, setToggleError] = React.useState(null);
   // 正在提交的模型 id 集合：只禁用被点的那一行，避免整表锁死。
   const [busyIds, setBusyIds] = React.useState(() => new Set());
+  /** 「全部重新显示」是否在提交（批量恢复失效记录）。 */
+  const [deadRestoreBusy, setDeadRestoreBusy] = React.useState(false);
   /**
    * 批量开关（打开全部 / 关闭全部）是否正在提交。
    *
@@ -1046,8 +1069,70 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
     }
   };
 
+  /**
+   * 「重新显示」某个被判定为失效的模型（清掉它的失效记录）。
+   *
+   * ⚠️ **这是用户唯一的自愈路径**（2026-10-06 复审 !66 确认）：失效记录不会被
+   * 「再成功一次」清掉（模型已被剔除出目录 ⇒ 用户选不到 ⇒ 不可能再成功），
+   * 只能靠 30 天 TTL 过期或点这个按钮。没有它，一次误判就等于该模型被永久隐藏。
+   *
+   * ⚠️ **不动黑名单**：服务端只删失效记录（`disabled` 保持原值），避免顺带
+   * 把用户特意关着的模型打开。
+   */
+  const restoreModel = async (modelId) => {
+    setBusyIds((prev) => new Set(prev).add(modelId));
+    try {
+      await rpcCall('model.clearDead', { provider, modelId });
+      if (!mounted.current) return;
+      // ⚠️ **必须整表重载，不能只翻 `dead` 标志**（2026-10-06 复审实测）：
+      // 该模型重新进入目录后展示名要靠 `listAllModels()` 才能拿全 ——
+      // 而设置页里原先那条是端点用**裸 id** 补回的（`{ id, name: id }`，
+      // 见 `jet-hub-rpc.ts` 的 dead 回填路径）。只翻标志会让它继续显示裸 id，
+      // 用户要点「刷新」或重开面板才看得到真名。与 `restoreAllDead` 保持一致。
+      await load();
+    } catch (caught) {
+      console.error('[jet-hub] restore dead model failed:', caught);
+      if (!mounted.current) return;
+      setToggleError(caught?.message || '恢复模型失败');
+    } finally {
+      if (mounted.current) {
+        setBusyIds((prev) => {
+          const next = new Set(prev);
+          next.delete(modelId);
+          return next;
+        });
+      }
+    }
+  };
+
   const all = models || [];
   const hiddenCount = all.filter(m => m.disabled).length;
+  /** 被判定为已下架的条数（用于顶部提示「已隐藏 N 个下架模型」）。 */
+  const deadCount = all.filter(m => m.dead === true).length;
+
+  /**
+   * 批量恢复该 provider 的全部失效模型（`model.clearDead` 省略 `modelId`）。
+   *
+   * ⚠️ 走**单次请求**而不是循环逐个调：误判往往同时命中多个模型，逐个点既慢
+   * 又容易漏。服务端只清失效记录，不动黑名单。
+   */
+  const restoreAllDead = async () => {
+    if (deadCount === 0) return;
+    if (!confirm(`确认把 ${deadCount} 个「已下架」模型重新显示？若它们确实已被上游移除，使用时会再次失败并被重新隐藏。`)) return;
+    setDeadRestoreBusy(true);
+    try {
+      await rpcCall('model.clearDead', { provider });
+      if (!mounted.current) return;
+      // 全量重载：恢复后的条目要拿回展示名/免费标记（补回的裸 id 只有 id）。
+      await load();
+    } catch (caught) {
+      console.error('[jet-hub] restore all dead models failed:', caught);
+      if (!mounted.current) return;
+      setToggleError(caught?.message || '恢复模型失败');
+    } finally {
+      if (mounted.current) setDeadRestoreBusy(false);
+    }
+  };
   const providerLabel = PROVIDERS.find(p => p.id === provider)?.label || provider;
   // 「已经是目标状态」时对应按钮必须禁用，否则点了看不到任何变化、像是坏了。
   const bulk = bulkButtonState(models, bulkBusy);
@@ -1195,6 +1280,19 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
           }, '完成'))),
       React.createElement('p', { className: 'dim-jh-modalHint' },
         '关闭开关后该模型不再出现在对话框的模型选择里；其余模型（含服务端新增的）默认显示。'),
+      // ⚠️ 失效模型提示条：它们已被上游下架并从目录剔除，故单独说明「为什么看不见」
+      // 并给出**批量**恢复入口（逐个点很麻烦，而误判往往不止一个）。
+      phase === 'ready' && deadCount > 0
+        ? React.createElement('div', { className: 'dim-jh-modelDeadBar' },
+            React.createElement('span', null,
+              `有 ${deadCount} 个模型被上游下架，已自动从列表隐藏。`),
+            React.createElement('button', {
+              className: 'dim-jh-btn',
+              disabled: deadRestoreBusy,
+              title: '清空该供应商的失效模型记录，让它们重新出现在列表里。',
+              onClick: () => void restoreAllDead(),
+            }, deadRestoreBusy ? '恢复中…' : '全部重新显示'))
+        : null,
       // 搜索 + 状态筛选：Cline 的目录实测近 500 条，没有它就只能一页页翻。
       // 只在列表可用时渲染（载入中/出错时没有可筛的内容）。
       phase === 'ready' && all.length > 0
@@ -1311,6 +1409,7 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
                                 // 分组批量也算「批量」，故一并计入。
                                 busy: busyIds.has(model.id) || bulkBusy || groupBusy !== null,
                                 onToggle: (id, disabled) => void toggleModel(id, disabled),
+                                onRestore: (id) => void restoreModel(id),
                               })))
                           : null);
                     })))));

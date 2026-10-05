@@ -11,7 +11,9 @@ describe('index.ts 接线', () => {
     expect(index).toMatch(/registerOpencodeLlm\(/)
   })
   it('modelAdapters 含 opencode（「显示列表」要用，否则面板只显示裸 id）', () => {
-    expect(index).toMatch(/opencode:\s*opencodeAdapter/)
+    // ⚠️ 2026-10-06 复审 !66：登记项经 `pruned(...)` 包装（致命缺陷修复之一），
+    // 否则 Jet Hub 拿到原始实例、看不到「已失效模型」剔除。
+    expect(index).toMatch(/opencode:\s*pruned\([^)]*,\s*opencodeAdapter\)/)
   })
   it('账号槽从账号池读（保持手动排序）', () => {
     expect(index).toMatch(/pool\.listAccountsByProvider\(OPENCODE\.id\)/)
