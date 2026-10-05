@@ -206,32 +206,64 @@ const RACCOON_QUOTA_COOLDOWN_MS = 24 * 3_600_000
 const RACCOON_RATE_LIMIT_COOLDOWN_MS = 3_600_000
 
 /**
- * 该失败是否值得「换下一个账号」重试。
+ * raccoon 的失败类别。**「要不要换号」与「要不要写冷却」是两件事**，
+ * 由本分类分别决定（混为一谈曾酿成事故，见下）。
  *
- * **可换**：余额/额度耗尽（`14018 Credits exhausted` 等——这是用户报障的
- * 主场景）、限流（429）、认证（401/403——单号凭据失效时池里可能有别的好号）。
+ * | 类别 | 判据 | 换号？ | 写冷却？ |
+ * |---|---|---|---|
+ * | `quota` | `14018` / `Credits exhausted` / `insufficient` / 「积分·额度·余额 + 不足·耗尽」/ `quota exceeded`；HTTP 402 | ✅ | ✅ 24h（日配额） |
+ * | `rate` | HTTP 429 | ✅ | ✅ 1h |
+ * | `auth` | HTTP 401 / 403（如 `code=200003 authorization_verify_error`） | ✅ | ❌ **绝不写** |
+ * | `other` | 其余 4xx（400 参数错等） | ❌ | ❌ |
  *
- * **不可换**：其余 4xx（400 参数错、404 路由错等）——换号无益，请求本身
- * 有问题，换谁都会失败；按原错误抛，避免吞成「均不可用」。
+ * ## 为什么 `auth` 必须「换号但不写冷却」（真实事故，2026-10-06 凌晨）
  *
- * 判据用「文案 + 状态码」双通道（与 `isRateLimited` 同构）：
- * 状态码 429 恒真；额度类**必须靠文案**（raccoon 的耗尽实测回 402/400，
- * 没有 HTTP 层的专用状态码——故文案判据是主通道，宽松词表会误伤，
- * 限定在「积分/额度/余额 + 耗尽」的确定性组合上）。
+ * 上游网关对**全池**回 `401 + authorization_verify_error`（网关侧授权校验故障，
+ * 与某个号的额度无关）。当时的实现把 401 也当「可换号」，且冷却时长写成
+ * `status === 429 ? 1h : 24h` ⇒ 401 落到 **24h**，于是一次请求内的换号循环
+ * 连试 6 个号、给每个都写了 24 小时 ⇒ 池内候选筛空 ⇒
+ * **整个 provider 被封一天**（下一次请求报 `no usable credential; log in first`）。
+ *
+ * buddy 的既有实现正是分开的：只有限流类写标记，认证类只 `continue` 换号。
+ * 认证失败是**账号态**（凭据失效），不是「该模型冷却」；写标记会让池把无辜
+ * 账号长期排除，且把网关侧故障放大成全池不可用。
  */
-export function shouldRotateRaccoonAccount(errorText: string, status: number): boolean {
-  if (status === 429 || status === 402) return true
-  if (status === 401 || status === 403) return true
+export type RaccoonFailureClass = 'quota' | 'rate' | 'auth' | 'other'
+
+/** 判定失败类别（文案 + 状态码双通道，与 `isRateLimited` 同构）。 */
+export function classifyRaccoonFailure(errorText: string, status: number): RaccoonFailureClass {
   const lower = errorText.toLowerCase()
-  return (
-    lower.includes('14018')
+  const quotaText = lower.includes('14018')
     || lower.includes('credits exhausted')
     || lower.includes('insufficient')
     || (lower.includes('积分') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('额度') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('余额') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('quota') && (lower.includes('exceeded') || lower.includes('exhausted')))
-  )
+  if (quotaText || status === 402) return 'quota'
+  if (status === 429) return 'rate'
+  if (status === 401 || status === 403) return 'auth'
+  return 'other'
+}
+
+/**
+ * 该失败是否值得「换下一个账号」重试。
+ *
+ * 可换：额度耗尽、限流、认证（另一号的 token 可能有效）。
+ * 不可换：其余 4xx（400 参数错、404 路由错等）——换号无益，请求本身有问题，
+ * 换谁都会失败；按原错误抛，避免吞成「均不可用」。
+ */
+export function shouldRotateRaccoonAccount(errorText: string, status: number): boolean {
+  return classifyRaccoonFailure(errorText, status) !== 'other'
+}
+
+/**
+ * 该类别是否要写冷却标记。
+ *
+ * ⚠️ `auth` 不在其中 —— 见 {@link RaccoonFailureClass} 的事故说明。
+ */
+export function recordsRaccoonRateLimit(cls: RaccoonFailureClass): boolean {
+  return cls === 'quota' || cls === 'rate'
 }
 
 /** Raccoon Work 模型适配器。 */
@@ -545,24 +577,30 @@ export class RaccoonAdapter extends LlmAdapter {
        *   按原错误抛（避免把「请求本身有问题」吞成「均不可用」）。
        * - **每个账号只试一次**：`tried` 传给 `getAvailableAccount`——不排除
        *   会拿回同一个号（池排序不因失败而变），换号形同虚设。
-       * - **换号前先标记**：`updateModelRateLimit` 把坏号记在该模型上
-       *   （UI 的「限额重置」徽章 + 下次选号自动跳过的依据）。
+       * - **只有配额 / 限流类才写冷却**（`recordsRaccoonRateLimit`）：
+       *   认证类（401/403）**只换号、绝不写标记** —— 详见
+       *   {@link RaccoonFailureClass} 记的 2026-10-06 全池被封事故。
        * - **全部试完才报错**，且带**最后一次**的真实原因——笼统的
        *   「所有账号均不可用」会丢掉服务端真正说的东西（buddy 上同款教训）。
-       * - **冷却时长**：raccoon 的额度错误没有可靠的重置字段（与 trae 4008
-       *   同形），按**日配额**记 24 小时兜底；429 记 1 小时。
+       * - **冷却时长按类别**：`quota` 记 24 小时（日配额；无可靠重置字段，
+       *   与 trae 4008 同形）、`rate` 记 1 小时。
        */
-      if (this.options.accountPool && shouldRotateRaccoonAccount(errorText, status)) {
+      let failureClass = classifyRaccoonFailure(errorText, status)
+      if (this.options.accountPool && failureClass !== 'other') {
         const tried = new Set<string>()
         if (activeAccountId) tried.add(activeAccountId)
         const maxRotate = RACCOON_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
-          // 先标记当前坏号（UI 徽章 + 下次选号跳过的依据）。
-          if (activeAccountId) {
+          // 只在 quota / rate 类写标记（UI 徽章 + 下次选号跳过的依据）。
+          // ⚠️ auth 类**不写**：认证失败是账号态而非模型冷却，写了会把
+          //    网关侧授权故障放大成「全池封 24h」（2026-10-06 事故）。
+          if (activeAccountId && recordsRaccoonRateLimit(failureClass)) {
             await this.options.accountPool.updateModelRateLimit(
               activeAccountId,
               options.model,
-              Date.now() + (status === 429 ? RACCOON_RATE_LIMIT_COOLDOWN_MS : RACCOON_QUOTA_COOLDOWN_MS),
+              Date.now() + (failureClass === 'rate'
+                ? RACCOON_RATE_LIMIT_COOLDOWN_MS
+                : RACCOON_QUOTA_COOLDOWN_MS),
             )
           }
           const next = await this.options.accountPool.getAvailableAccount(
@@ -585,14 +623,17 @@ export class RaccoonAdapter extends LlmAdapter {
           }
           errorText = await response.text().catch(() => '')
           status = response.status
-          if (!shouldRotateRaccoonAccount(errorText, status)) {
+          failureClass = classifyRaccoonFailure(errorText, status)
+          if (failureClass === 'other') {
             // 新账号失败但不是可换号类别：按原错误分类抛出（buddy 同款）。
             throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
           }
         }
         throw new LlmError(
           `raccoon: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
-          status === 429 ? 'RATE_LIMIT' : 'QUOTA_EXCEEDED',
+          failureClass === 'rate' ? 'RATE_LIMIT'
+            : failureClass === 'auth' ? 'AUTH'
+              : 'QUOTA_EXCEEDED',
           { status },
         )
       }

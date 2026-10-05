@@ -627,6 +627,113 @@ describe('RaccoonAdapter 请求级账号轮换（余额耗尽无感切号）', (
     expect((error as Error).message).toContain('param is invalid')
   })
 
+  /**
+   * ★ 授权类失败**绝不写冷却标记**（真实回归，2026-10-06 凌晨全池被封 24h）。
+   *
+   * ## 事故经过（证据链）
+   *
+   * 上游网关开始对**全池**回 `HTTP 401 + code=200003 authorization_verify_error`
+   * ——这是**网关侧**的授权校验失败（不是某个号的额度问题）。当时的实现把
+   * 「401/403」也算「可换号」**并且**在每次换号前写冷却标记，冷却时长取
+   * `status === 429 ? 1h : 24h` ⇒ 401 落到 **24 小时**。
+   *
+   * 于是一个请求内的换号循环连试 6 个号、给每个都写了 24h：
+   * → 池内该模型候选筛空 → 下一次请求报 `no usable credential; log in first`
+   * → **整个 provider 被封 24 小时**（用户手动清标记才恢复）。
+   *
+   * ## 正确语义（对齐 buddy 的既有实现）
+   *
+   * buddy 的换号循环里，**只有限流类**才写标记；认证类（401/403）只
+   * `continue` 换下一个号、**不写标记** —— 因为「凭据失效」是**账号态**而非
+   * 「该模型冷却」，写标记会让池把无辜账号长期排除，且网关侧的授权故障会
+   * 把整池一起封掉（正是本次事故）。
+   */
+  it('★ 401 授权失败（authorization_verify_error）：换号但**绝不写冷却标记**', async () => {
+    const { pool, marks } = makePoolStub()
+    const fetcher = vi.fn(async (_url: string, init: RequestInit) => {
+      const auth = String(new Headers(init.headers).get('Authorization') ?? '')
+      if (auth.includes('tok-A')) {
+        return new Response(
+          JSON.stringify({ code: 200003, message: 'authorization_verify_error' }),
+          { status: 401 },
+        )
+      }
+      return sse([JSON.stringify({ choices: [{ delta: { content: '二号账号正常' } }] })])
+    })
+    const adapter = makeAdapter({
+      pool: pool as unknown as AccountPool,
+      fetcher: fetcher as unknown as typeof fetch,
+      credential: { access_token: 'tok-A', refresh_token: 'r' },
+    })
+    const chunks = await collect(adapter, {})
+
+    // 换号仍要发生（另一号的 token 可能是好的）
+    expect(fetcher.mock.calls.length).toBeGreaterThan(1)
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    // 但**一个标记都不能写**（回归断言：旧实现写了 24h → 全池被封）
+    expect(marks).toEqual([])
+  })
+
+  it('★ 401 打遍全池：仍不写任何标记（池保持可用，网关恢复后即自愈）', async () => {
+    const { pool, marks } = makePoolStub()
+    const fetcher = vi.fn(async () => new Response(
+      JSON.stringify({ code: 200003, message: 'authorization_verify_error' }),
+      { status: 401 },
+    ))
+    const adapter = makeAdapter({
+      pool: pool as unknown as AccountPool,
+      fetcher: fetcher as unknown as typeof fetch,
+      credential: { access_token: 'tok-A', refresh_token: 'r' },
+    })
+    const error = await collect(adapter, {}).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain('所有账号')
+    // 关键：全池失败也**不留任何标记**（旧实现会把 6 个号各封 24h）
+    expect(marks).toEqual([])
+  })
+
+  it('429 限流才写标记，且时长是 1 小时档（不是 24 小时）', async () => {
+    const { pool, marks } = makePoolStub()
+    const fetcher = vi.fn(async (_url: string, init: RequestInit) => {
+      const auth = String(new Headers(init.headers).get('Authorization') ?? '')
+      if (auth.includes('tok-A')) return new Response('', { status: 429 })
+      return sse([JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })])
+    })
+    const adapter = makeAdapter({
+      pool: pool as unknown as AccountPool,
+      fetcher: fetcher as unknown as typeof fetch,
+      credential: { access_token: 'tok-A', refresh_token: 'r' },
+    })
+    await collect(adapter, {})
+
+    expect(marks.length).toBe(1)
+    const cooldown = marks[0].resetAtMs - Date.now()
+    expect(cooldown).toBeGreaterThan(50 * 60_000)   // ≈1h
+    expect(cooldown).toBeLessThanOrEqual(60 * 60_000)
+  })
+
+  it('额度耗尽（14018）写的是 24 小时档（日配额，与 429 区分）', async () => {
+    const { pool, marks } = makePoolStub()
+    const fetcher = vi.fn(async (_url: string, init: RequestInit) => {
+      const auth = String(new Headers(init.headers).get('Authorization') ?? '')
+      if (auth.includes('tok-A')) {
+        return new Response(JSON.stringify({ error: { message: '14018 Credits exhausted' } }), { status: 402 })
+      }
+      return sse([JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })])
+    })
+    const adapter = makeAdapter({
+      pool: pool as unknown as AccountPool,
+      fetcher: fetcher as unknown as typeof fetch,
+      credential: { access_token: 'tok-A', refresh_token: 'r' },
+    })
+    await collect(adapter, {})
+
+    expect(marks.length).toBe(1)
+    const cooldown = marks[0].resetAtMs - Date.now()
+    expect(cooldown).toBeGreaterThan(23 * 3_600_000)
+  })
+
   it('已产出正文后流内报错不重发（防重复计费，与 trae 哨兵同款）', async () => {
     const { pool } = makePoolStub()
     let call = 0

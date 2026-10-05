@@ -539,4 +539,53 @@ describe('LoomyAdapter 请求级账号轮换（余额耗尽无感切号）', () 
     // findAccountIdByCredential 会被调一次——那是记账键反查，不是换号）。
     expect(picks.length).toBe(0)
   })
+
+  /**
+   * ★ 认证类（401/403）**换号但不写冷却标记** —— 真实事故回归（2026-10-06）。
+   *
+   * 上游网关对全池回 `401 + authorization_verify_error`（网关侧授权故障）。
+   * 旧实现把 401 也写 24h 冷却 ⇒ 一个请求连试 6 个号、每个封 24h ⇒
+   * **整个 provider 被封一天**，下一次请求报 `no usable credential; log in first`。
+   * 语义对齐 buddy：只有限流类写标记，认证类只换号。
+   */
+  it('★ 401 授权失败：换号但绝不写冷却标记（全池失败也不写）', async () => {
+    const { pool, marks } = makePoolStub()
+    let call = 0
+    const fetcher = vi.fn(async () => {
+      call += 1
+      // 一号 401；二号正常
+      if (call === 1) {
+        return new Response(JSON.stringify({ code: 200003, message: 'authorization_verify_error' }), { status: 401 })
+      }
+      return new Response(
+        'data: {"choices":[{"index":0,"delta":{"content":"二号正常"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    }) as unknown as typeof fetch
+
+    const adapter = makeAdapter({ resolveCredential: async () => CRED_A, accountPool: pool as never, fetchImpl: fetcher })
+    const chunks: unknown[] = []
+    for await (const c of adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) chunks.push(c)
+
+    expect(fetcher.mock.calls.length).toBeGreaterThan(1)
+    expect(chunks.some((c) => (c as { type?: string }).type === 'text-delta')).toBe(true)
+    expect(marks).toEqual([])
+  })
+
+  it('★ 401 打遍全池：不留任何标记（池保持可用）', async () => {
+    const { pool, marks } = makePoolStub()
+    const fetcher = (async () =>
+      new Response(JSON.stringify({ code: 200003, message: 'authorization_verify_error' }), { status: 401 })) as unknown as typeof fetch
+    const adapter = makeAdapter({ resolveCredential: async () => CRED_A, accountPool: pool as never, fetchImpl: fetcher })
+    const error = await adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    } as never).next().then(() => null).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(Error)
+    expect(marks).toEqual([])
+  })
 })

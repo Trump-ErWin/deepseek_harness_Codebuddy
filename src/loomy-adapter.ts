@@ -234,27 +234,52 @@ const LOOMY_QUOTA_COOLDOWN_MS = 24 * 3_600_000
 const LOOMY_RATE_LIMIT_COOLDOWN_MS = 3_600_000
 
 /**
- * 该失败是否值得「换下一个账号」重试。判据与 {@link shouldRotateRaccoonAccount}
- * 同构（raccoon 与 loomy 的额度错误形态同族：`14018 Credits exhausted`，
- * HTTP 层无专用状态码，文案是主通道；词表限「积分/额度/余额 + 不足/耗尽」的
- * 确定性组合，避免误伤正文里恰好讨论「余额」的 4xx）。
+ * Loomy 的失败类别。**「要不要换号」与「要不要写冷却」是两件事**——
+ * 认证类（401/403）只换号、**绝不写冷却**。
  *
- * 导出仅供单测锁定判据本身——只靠调用点顺序兜不住边界（`isRateLimited`
- * 的 429 边界那次已验证过）。
+ * ⚠️ 真实事故（2026-10-06 凌晨，raccoon 同型实现上暴露）：上游网关对**全池**
+ * 回 `401 + authorization_verify_error`（网关侧授权校验故障）。当时把 401 也算
+ * 「可换号」且在换号前写冷却、时长取 `status === 429 ? 1h : 24h` ⇒ 一个请求内
+ * 连试 6 个号、每个写 24h ⇒ 池内候选筛空 ⇒ **整个 provider 被封一天**
+ * （下一次请求报 `no usable credential; log in first`）。
+ * buddy 的既有实现是分开的：只有限流类写标记，认证类只 `continue`。
  */
-export function shouldRotateLoomyAccount(errorText: string, status: number): boolean {
-  if (status === 429 || status === 402) return true
-  if (status === 401 || status === 403) return true
+export type LoomyFailureClass = 'quota' | 'rate' | 'auth' | 'other'
+
+/**
+ * 判定失败类别（与 {@link RaccoonFailureClass} 同构——raccoon 与 loomy 的额度
+ * 错误形态同族：`14018 Credits exhausted`，HTTP 层无专用状态码，文案是主通道；
+ * 词表限「积分/额度/余额 + 不足/耗尽」的确定性组合，避免误伤正文里恰好讨论
+ * 「余额」的 4xx）。
+ */
+export function classifyLoomyFailure(errorText: string, status: number): LoomyFailureClass {
   const lower = errorText.toLowerCase()
-  return (
-    lower.includes('14018')
+  const quotaText = lower.includes('14018')
     || lower.includes('credits exhausted')
     || lower.includes('insufficient')
     || (lower.includes('积分') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('额度') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('余额') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('quota') && (lower.includes('exceeded') || lower.includes('exhausted')))
-  )
+  if (quotaText || status === 402) return 'quota'
+  if (status === 429) return 'rate'
+  if (status === 401 || status === 403) return 'auth'
+  return 'other'
+}
+
+/**
+ * 该失败是否值得「换下一个账号」重试。
+ *
+ * 导出仅供单测锁定判据本身——只靠调用点顺序兜不住边界（`isRateLimited`
+ * 的 429 边界那次已验证过）。
+ */
+export function shouldRotateLoomyAccount(errorText: string, status: number): boolean {
+  return classifyLoomyFailure(errorText, status) !== 'other'
+}
+
+/** 该类别是否要写冷却标记（`auth` 不在其中，见 {@link LoomyFailureClass}）。 */
+export function recordsLoomyRateLimit(cls: LoomyFailureClass): boolean {
+  return cls === 'quota' || cls === 'rate'
 }
 
 /** Loomy 模型适配器。chat 端点用 Bearer，业务端点用 token。 */
@@ -586,25 +611,31 @@ export class LoomyAdapter extends LlmAdapter {
        *
        * ## 语义对齐 buddy
        *
-       * - **可换**：额度耗尽（14018 / Credits / 积分不足等）、429；
+       * - **可换**：额度耗尽（14018 / Credits / 积分不足等）、429、认证（401/403）；
        *   **不可换**：其余 4xx（换号无益，按原错误抛）。
-       * - **每个账号只试一次**（`tried` 传池）；**换号前先标记**该模型
-       *   （24h 兜底——Loomy 日额度无可靠重置字段，与 trae 4008 同形）。
+       * - **每个账号只试一次**（`tried` 传池）。
+       * - **只有配额 / 限流类才写冷却**（24h / 1h）；**认证类只换号、绝不写标记**
+       *   —— 详见 {@link LoomyFailureClass} 记的 2026-10-06 全池被封事故。
        * - **全部试完才报错**，带最后一次的真实原因。
        * - ⚠️ 换到的号**绕过余额选号器**（直接用池的候选凭据）——选号器的
        *   排序在「有余额的号」内部才有意义，此处候选已明确是坏号链，
        *   池的手动顺序就是最合理的次序。
        */
-      if (this.options.accountPool && shouldRotateLoomyAccount(errorText, status)) {
+      let failureClass = classifyLoomyFailure(errorText, status)
+      if (this.options.accountPool && failureClass !== 'other') {
         const tried = new Set<string>()
         if (activeAccountId) tried.add(activeAccountId)
         const maxRotate = LOOMY_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
-          if (activeAccountId) {
+          // ⚠️ auth 类**不写标记**：认证失败是账号态而非模型冷却，写了会把
+          //    网关侧授权故障放大成「全池封 24h」（2026-10-06 事故）。
+          if (activeAccountId && recordsLoomyRateLimit(failureClass)) {
             await this.options.accountPool.updateModelRateLimit(
               activeAccountId,
               options.model,
-              Date.now() + (status === 429 ? LOOMY_RATE_LIMIT_COOLDOWN_MS : LOOMY_QUOTA_COOLDOWN_MS),
+              Date.now() + (failureClass === 'rate'
+                ? LOOMY_RATE_LIMIT_COOLDOWN_MS
+                : LOOMY_QUOTA_COOLDOWN_MS),
             )
           }
           const next = await this.options.accountPool.getAvailableAccount(
@@ -629,13 +660,16 @@ export class LoomyAdapter extends LlmAdapter {
           }
           errorText = await response.text().catch(() => '')
           status = response.status
-          if (!shouldRotateLoomyAccount(errorText, status)) {
+          failureClass = classifyLoomyFailure(errorText, status)
+          if (failureClass === 'other') {
             throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
           }
         }
         throw new LlmError(
           `loomy: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
-          status === 429 ? 'RATE_LIMIT' : 'QUOTA_EXCEEDED',
+          failureClass === 'rate' ? 'RATE_LIMIT'
+            : failureClass === 'auth' ? 'AUTH'
+              : 'QUOTA_EXCEEDED',
           { status },
         )
       }
