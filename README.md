@@ -3407,13 +3407,46 @@ ZCode 免费通道**只认 Anthropic Messages**（实测 `zcode-plan` 下的
    下一轮按「工具名 + 规范化参数」回填，否则多轮工具调用必被上游拒。落盘位置是
    `$DSH_HOME/jet-hub/gemini-sigs.json`（**独立文件**，不放 `state.json` —— 那是整体
    替换语义，会被别的写入覆盖掉）。签名被拒时做**一次去签重试**兜底。
-4. **`project` 与 `sessionId` 是预置常量、禁止随机化** —— `project` 恒为
-   `"aicode-consumers"`；真实推理的 `sessionId` 恒为 `3124275334370613369`，
-   冒烟（面板连通测试）恒为 `-6686302828062879362`（**负数**，两串不同不能混用）。
-   只有 `requestId = agent/<unix_ms>/<8hex>` 是每请求随机的。
-   ⚠️ 上游的会话归并与额度统计挂在这两个串上，改成随机会让服务端认不出是同一会话，
-   **`thoughtSignature` 回填会断**。
-5. **模型名是准入键** —— 裸 `gemini-3.8-flash` 直接 404，**档位后缀必需**
+4. **`project` 自动探测、`sessionId` 内容派生 + 升代自愈** —— `project` **不是恒值**：
+   启动时探 `loadCodeAssist` 的 `cloudaicompanionProject`，`aicode-consumers` 只是
+   探测**为空**时的兜底（免费档常态）。三级缓存：进程内 → 凭据字段 → 现探。
+   ⚠️ **探测失败 ≠ 探测到空**：失败（网络/非 2xx）时**不发推理**，与原版一致
+   （注入 500 实测：原版只在端点间重试 LCA + quota）。详见 `src/gemini-project.ts`。
+   `sessionId` 由 `(project, 首条 user 文本, lane)` **确定性派生**
+   （`deriveGeminiSessionId`）：同一对话内稳定（保住上游 prompt cache 命中），
+   不同对话隔离；推理与冒烟用不同 lane。只有 `requestId = agent/<unix_ms>/<8hex>`
+   是每请求随机的。
+   ⚠️ 2026-10-05 更正：此处此前写"`project` 与 `sessionId` 都是预置常量"。
+   真机对照实验证明 sessionId 的两个"常量"只是**特定输入的输出**。把它写死会让
+   所有用户、所有对话共用一个会话，而原版的会话归并与 **`thoughtSignature` 回填**
+   都挂在这个字段上 —— 共用的后果是它们全部错乱。
+   注意：原版哈希本体未反推出来，故 sessionId 取值**不与原版逐字相同**，
+   对齐的是依赖维度。
+5. **会话升代自愈（1M 累计超限）** —— 上游按 `sessionId` 在**服务端**累计对话输入；
+   长工具循环会把累计推过 1M，此后该 sessionId 的**每个**请求都 400
+   `The input token count exceeds the maximum number of tokens allowed 1048576`，
+   直到该服务端会话过期 —— 即**对话永久卡死**。削本地历史没用（累计在服务端、按
+   sessionId 计），唯一出路是**升代换一个全新 sessionId**（`deriveGeminiSessionId` 的
+   `generation` 入参）。判据与语义抄自 `Antigravity-Manager` 的 `[FIX session-1M]`，
+   wb 独立实现同一机制（`SessionOverflowBump`）。**升代有界**（一次请求最多一代），
+   显式钉住 `sessionId` 时不升代。
+6. **上下文超限归 `CONTEXT_WINDOW_EXCEEDED`（触发自动压缩）** —— 上游回
+   `The input token count (N) exceeds the maximum number of tokens allowed (M)` 时，
+   ⚠️ **harness 的 `isContextWindowExceededError` 认不出这句话**（它要求出现
+   `context` 字样，而这句一个都没有 —— 与 `buddy-adapter.ts` 当年漏判
+   「prompt is too long」是同一类缺陷），故本仓库补了一条专属判据。
+   归成 `INVALID_REQUEST` 的后果**不对称**：`dsh-compaction-basic` 的 listener
+   第一行就是 `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()`
+   ⇒ 连一次压缩的机会都没有，长会话越过窗口后每轮报废。
+   处置是**升级式**的：先升代（便宜），升过仍失败才归溢出交 harness 压缩。
+7. **请求体上限发送前真检查** —— `GEMINI_MAX_REQUEST_BODY_BYTES`（64MB）此前
+   **定义了但全仓零引用**（看着有防护，实际没有），现已接上，超限同样归
+   `CONTEXT_WINDOW_EXCEEDED` 而不是死路 `INVALID_REQUEST`。
+8. **签名 miss 按工具名兜底** —— 精确键吃逐字参数，长任务里参数漂移（路径/
+   时间戳变化）是必然事件。miss 时回退取**该工具名最近一次**签名，避免走去签
+   重试丢掉整条思考链。工具名随条目一起持久化（键是 sha256 不可逆，不存名字
+   无法重建索引）。
+9. **模型名是准入键** —— 裸 `gemini-3.8-flash` 直接 404，**档位后缀必需**
    （`-low` / `-medium` / `-high` / `-tiered`）。`modelId` 走**严格校验**：
    不在静态表里就抛错（此前写错模型名会**静默跑 3.8**）。
 
