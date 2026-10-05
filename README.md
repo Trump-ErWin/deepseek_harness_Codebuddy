@@ -71,6 +71,8 @@ Authorization: Bearer <网关 API Key>
 
 设置页里的开关状态存在 `$DSH_HOME/jet-hub/state.json` 的 `gatewayEnabled` 字段（缺省为启用）。它**不进**账号备份/恢复 —— 恢复一份旧备份不会顺手改变你本机的网关开关。
 
+「供应商开关」弹窗里**拖动行**排出来的显示顺序存在同一文档的 `providerOrder` 字段（缺省为 `[]`，即按声明顺序）。同样是纯展示偏好：插件更新只替换包目录、不触碰该文档，顺序不会丢；把它删掉也只是回到默认顺序，重拖一次即可。已关闭的供应商恒按默认顺序沉在底部，**不参与**拖拽 —— 重新打开某个曾排序过的供应商，它会回到你当时给它排的位置。
+
 ### 拿到地址与密钥
 
 两者都在 **Jet Hub 设置页 → 页头「网关」按钮**里：
@@ -2165,16 +2167,23 @@ Cline 的免费模型由远端 `GET /api/v1/ai/cline/recommended-models` 的 **`
 ```
 Space Bunny Alpha · 免费
 MiMo-V2.6-Flash · 免费
-DeepSeek V4.1 Flash · 免费
-Gemini 3.8 Flash · 免费
 Muse Spark 1.3 Contributor · 免费
 ```
+
+⚠️ **兜底表是编译期快照，上游撤掉某个免费模型时它不会自己跟着变** ——
+而陈旧条目会让用户看到一个标着「免费」的模型、选中却回
+`404 {"error":"model not found"}`。已经发生过两次：`gemini-3.8-flash`
+（2026-10-03）、`deepseek-v4.1-flash`（2026-10-05）。
+
+为此 `mergeClineModels` **只在远端不可用时**整表兜底；远端成功下发目录时，
+它会丢弃「远端已不认识」的兜底条目（**在线状态下不会把下架模型复活**）。
+判定「某个兜底免费模型是否已被上游下架」用 `pnpm test:e2e:cline`（只读、零额度）。
 
 ⚠️ **免费与付费是两组不同的模型 id**，不是同一模型的两种档位：
 
 | 免费（`free` 数组下发） | 按量计费（同名前缀不同） |
 |---|---|
-| `cline-free/deepseek-v4.1-flash` | `deepseek/deepseek-v4.1-flash` |
+| `cline-free/mimo-v2.6-flash` | `xiaomi/mimo-v2.6-flash` |
 
 插件的判定基于**完整 id**（远端 `free` 集合 ∪ `:free` 后缀 ∪ `cline-free/`
 前缀 ∪ 静态兜底），**不做名字模糊匹配** —— 否则会把付费条目误标为免费，
@@ -2353,7 +2362,7 @@ pnpm build:client                                      # 改完必须重建
 
 ```
 pnpm test:e2e:cline        # 只读：凭据/前缀证据/余额/免费集合，零 token 消耗
-pnpm test:e2e:cline-chat   # ⚠️ 发一次推理：默认只发 cline-free/deepseek-v4.1-flash
+pnpm test:e2e:cline-chat   # ⚠️ 发一次推理：默认只发 cline-free/mimo-v2.6-flash
 ```
 
 ⚠️ 推理探针**默认只请求一个免费模型**。其余免费模型需显式设置

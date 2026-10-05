@@ -7,15 +7,16 @@
  * `free` 数组），随时可能被撤销或改为计费。若探针无条件遍历「远端说是免费」
  * 的那批模型，一旦某个模型转为计费，一次 e2e 就会**按付费价刷掉真实 token**。
  *
- * 故本探针的默认行为是：**只请求 `cline-free/deepseek-v4.1-flash`** ——
- * 用户明确指定为日常验证用的那一个。其余免费模型必须显式 opt-in。
+ * 故本探针的默认行为是：**只请求 `DEFAULT_MODEL`**（当前
+ * `cline-free/mimo-v2.6-flash`）—— 用户明确指定为日常验证用的那一个。
+ * 其余免费模型必须显式 opt-in。
  *
  * ## 三重闸门
  *
  * ```
  * DSH_CLINE_CHAT_E2E=1                       必需
  * DSH_CLINE_CHAT_E2E_CONFIRM=yes             必需（防误跑）
- * DSH_CLINE_CHAT_E2E_ALL_FREE=1              可选：才遍历其余 4 个免费模型
+ * DSH_CLINE_CHAT_E2E_ALL_FREE=1              可选：才遍历其余免费模型
  * ```
  *
  * 另有 `DSH_CLINE_MODEL` 可指定单个被测模型（⚠️ 指定付费模型会消耗额度）。
@@ -44,8 +45,14 @@ const suite = RUN ? describe : describe.skip
  *
  * 选它的理由：用户明确要求 e2e 只用这一个（避免其余免费模型将来转为计费后
  * 被自动刷 token）。
+ *
+ * ⚠️ **原为 `cline-free/deepseek-v4.1-flash`，2026-10-05 被上游下架**
+ * （移出远端 `free` 数组、直连回 `404 {"error":"model not found"}`），
+ * 沿用会让本探针在 `assertFreeModel` 处直接失败（「模型不在目录中」）。
+ * 改用仍在册的 `cline-free/mimo-v2.6-flash`（实测 HTTP 200、正常出字）。
+ * 换默认模型时**必须同时**确认它在远端 `free` 数组里，见文件末尾的联动断言。
  */
-const DEFAULT_MODEL = 'cline-free/deepseek-v4.1-flash'
+const DEFAULT_MODEL = 'cline-free/mimo-v2.6-flash'
 
 /** 是否遍历远端下发的**全部**免费模型（默认关）。 */
 const ALL_FREE = process.env.DSH_CLINE_CHAT_E2E_ALL_FREE === '1'
@@ -53,10 +60,14 @@ const ALL_FREE = process.env.DSH_CLINE_CHAT_E2E_ALL_FREE === '1'
 /** 显式指定的模型（优先于默认值）。 */
 const EXPLICIT_MODEL = process.env.DSH_CLINE_MODEL
 
-/** 远端 free 集合里的其余 3 个。 */
+/**
+ * 远端 free 集合里的其余免费模型（**不含** `DEFAULT_MODEL`）。
+ *
+ * ⚠️ 与默认模型去重：否则 `DSH_CLINE_CHAT_E2E_ALL_FREE=1` 会对同一个模型
+ * 发两次请求，白白多花一次免费额度。
+ */
 const OTHER_FREE = [
   'stealth/space-bunny-alpha',
-  'cline-free/mimo-v2.6-flash',
   'cline-free/muse-spark-1.3-contributor',
 ]
 
@@ -153,7 +164,7 @@ async function streamOnce(
   return { status: response.status, text, reasoning, frames, raw }
 }
 
-suite('Cline 推理探针（默认只请求 cline-free/deepseek-v4.1-flash）', () => {
+suite('Cline 推理探针（默认只请求 cline-free/mimo-v2.6-flash）', () => {
   const entries = readClineCredentialsFromDshStore()
 
   it('至少有一个已登录的 Cline 账号', () => {
@@ -163,7 +174,7 @@ suite('Cline 推理探针（默认只请求 cline-free/deepseek-v4.1-flash）', 
     ).toBeGreaterThan(0)
   })
 
-  it('免费模型推理链路返回 SSE（默认 deepseek-v4.1-flash）', async () => {
+  it('免费模型推理链路返回 SSE（默认 cline-free/mimo-v2.6-flash）', async () => {
     const { credential } = entries[0]!
     const model = EXPLICIT_MODEL ?? DEFAULT_MODEL
 
@@ -235,12 +246,23 @@ suite('Cline 推理探针（默认只请求 cline-free/deepseek-v4.1-flash）', 
     expect(() => assertFreeModel(paid, paid.id, new Set())).toThrow(/不是免费模型/)
     expect(() => assertFreeModel(undefined, 'ghost/model', new Set())).toThrow(/不在目录中/)
     // 免费模型通过
-    const free: ClineModel = { id: 'cline-free/deepseek-v4.1-flash', name: 'x', isFree: true }
+    const free: ClineModel = { id: DEFAULT_MODEL, name: 'x', isFree: true }
     expect(() => assertFreeModel(free, free.id, new Set([free.id]))).not.toThrow()
   })
 
   it('默认模型是免费的那一个（防止有人误改默认值）', () => {
-    expect(DEFAULT_MODEL).toBe('cline-free/deepseek-v4.1-flash')
+    expect(DEFAULT_MODEL).toBe('cline-free/mimo-v2.6-flash')
     expect(DEFAULT_MODEL.startsWith('cline-free/')).toBe(true)
+    // ⚠️ 与兜底表联动：换默认模型时若忘了同步兜底表，这里会先红 ——
+    // 比跑到网络请求才发现「模型不在目录中」要省事得多。
+    expect(
+      CLINE.fallbackModels.some((m) => m.id === DEFAULT_MODEL && m.isFree === true),
+      `默认模型 ${DEFAULT_MODEL} 不在兜底表的免费条目里（换默认模型时需同步兜底表）`,
+    ).toBe(true)
+  })
+
+  it('OTHER_FREE 与默认模型不重复（避免重复消耗免费额度）', () => {
+    expect(OTHER_FREE).not.toContain(DEFAULT_MODEL)
+    expect(new Set(OTHER_FREE).size).toBe(OTHER_FREE.length)
   })
 })

@@ -87,6 +87,20 @@ export interface JetHubState {
    * 缺键语义为**启用**：老用户升级后行为与升级前完全一致。
    */
   gatewayEnabled?: boolean
+  /**
+   * 供应商自定义显示顺序（「供应商开关」弹窗的拖拽排序，2026-10-06）。
+   *
+   * ⚠️ 与 `gatewayEnabled` 同级、**可以**住在这里：老版本代码整体重写
+   * `state.json` 时丢掉本键的后果仅仅是**顺序回到声明顺序**——纯展示偏好，
+   * 可逆、重拖一次即恢复（对照 `loomyPermanentLocked` 的不可逆性，那才需要
+   * 独立文档）。缺键 / 空数组语义为「未自定义」。
+   *
+   * 数组含**全部**供应商 id：拖拽提交时 = 拖后的「已打开」序列 + 已关闭的
+   * 按声明序缀尾。展示侧（`plugin-src/client/provider-toggle.js` 的
+   * `sortOpenProvidersByOrder`）对数组中不认识 / 缺失的 id 都有稳定兜底，
+   * 故插件跨版本增删 provider 时不需要任何迁移。
+   */
+  providerOrder?: string[]
 }
 
 /** 持久化后端的能力标识，供调用方决定要不要告警。 */
@@ -113,6 +127,7 @@ const jetHubSchema = Schema.object({
   disabledModels: Schema.dict(Schema.any()).default({}),
   loomyPermanentLocked: Schema.boolean().default(false),
   gatewayEnabled: Schema.boolean().default(true),
+  providerOrder: Schema.array(Schema.string()).default([]),
 })
 
 /**
@@ -127,6 +142,27 @@ const jetHubSchema = Schema.object({
  */
 export function sanitizeGatewayEnabled(raw: unknown): boolean {
   return raw !== false
+}
+
+/**
+ * 归一化供应商自定义显示顺序（{@link JetHubState.providerOrder}）。
+ *
+ * 只保留非空字符串 id 并**去重**（保留首次出现位置）；非数组一律视为
+ * 「无自定义顺序」（空数组）。⚠️ 这里**不做** provider 合法性校验：
+ * 合法集合随插件版本变化，在此过滤会让「新版本加入 provider → 被旧版本
+ * 代码重写文档」场景下的顺序无法保留 —— 展示层对数组中不认识 / 缺失的
+ * id 自带稳定兜底，脏条目天然无害。
+ */
+export function sanitizeProviderOrder(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const id of raw) {
+    if (typeof id !== 'string' || id.length === 0 || seen.has(id)) continue
+    seen.add(id)
+    result.push(id)
+  }
+  return result
 }
 
 /**
@@ -229,6 +265,7 @@ class SettingsStore implements JetHubStore {
         disabledModels?: unknown
         loomyPermanentLocked?: unknown
         gatewayEnabled?: unknown
+        providerOrder?: unknown
       }
       | undefined
     if (value === undefined || value === null) return undefined
@@ -239,6 +276,8 @@ class SettingsStore implements JetHubStore {
       loomyPermanentLocked: value.loomyPermanentLocked === true,
       // 老文档没这个键 → 启用，与升级前行为一致。
       gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+      // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
+      providerOrder: sanitizeProviderOrder(value.providerOrder),
     }
   }
 
@@ -251,6 +290,8 @@ class SettingsStore implements JetHubStore {
       loomyPermanentLocked: state.loomyPermanentLocked === true,
       // 开关丢失只会让网关回到默认启用（可逆），故接受老版本重写时丢掉本键。
       gatewayEnabled: state.gatewayEnabled !== false,
+      // 顺序丢失只会回到声明顺序（可逆，重拖一次即恢复），同理接受丢失。
+      providerOrder: state.providerOrder ?? [],
     })
   }
 }
@@ -411,6 +452,7 @@ class FileStore implements JetHubStore {
         disabledModels?: unknown
         loomyPermanentLocked?: unknown
         gatewayEnabled?: unknown
+        providerOrder?: unknown
       }
       return {
         accounts: sanitizeAccounts(value.accounts),
@@ -419,6 +461,8 @@ class FileStore implements JetHubStore {
         loomyPermanentLocked: value.loomyPermanentLocked === true,
         // 老文档没这个键 → 启用，与升级前行为一致。
         gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+        // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
+        providerOrder: sanitizeProviderOrder(value.providerOrder),
       }
     } catch (error) {
       this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，本次以空列表启动: ${String(error)}`)
@@ -464,6 +508,8 @@ class FileStore implements JetHubStore {
         loomyPermanentLocked: false,
         // 恢复出的文档本来就不含任何开关信息 → 启用（与全新安装一致）。
         gatewayEnabled: true,
+        // 凭据文件里也没有顺序信息 → 空数组（未自定义，与全新安装一致）。
+        providerOrder: [],
       }
       try {
         this.write(state)
