@@ -1422,6 +1422,18 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     const config = await resolveZcodeCaptchaConfig()
     return await zcode.mintCaptchaAfterRejection(outcome, config, options)
   },
+  /**
+   * captcha 的 region —— **只是「连配置都没有」时的最后兜底**，正常路径不生效。
+   *
+   * ⚠ region 必须与产 param 的那份配置同源（真实缺陷，Gitee issue IKJNPS；
+   *   领取路径与推理路径各有一个实例）。上面三个 mint 回调都会走
+   *   `resolveZcodeCaptchaConfig()`，它把远端配置写进适配器
+   *   （`setCaptchaConfig`）⇒ 组头时适配器读的是 `captchaConfig.region`，
+   *   这里这个字面量只在自建浏览器那条腿（没有任何注入回调）且从未拉到配置时兜底。
+   *
+   * ⚠ 别把它写回「无条件生效」——服务端下发的 region 因账号/渠道而异
+   * （作者账号是 `cn`，z.ai 国际渠道实测 `sgp`），写死只会在 cn 区账号上碰巧正确。
+   */
   captchaRegion: ZCODE_CAPTCHA_FALLBACK.region,
   /**
    * 诊断日志：把「先探后取」的前置耗时与补产事件接到宿主 logger。

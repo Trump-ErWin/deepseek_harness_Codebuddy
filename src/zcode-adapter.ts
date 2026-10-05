@@ -940,7 +940,20 @@ export class ZcodeAdapter extends LlmAdapter {
             ? {}
             : {
               'x-aliyun-captcha-verify-param': captchaParam,
-              'x-aliyun-captcha-verify-region': this.options.captchaRegion ?? 'cn',
+              /**
+               * ★ region 必须与**产 param 的那份配置**同源（同型缺陷，与 issue IKJNPS
+               * 的领取路径一模一样，这里是第二个实例）。
+               *
+               * `this.captchaConfig` 由 `index.ts` 的 `resolveZcodeCaptchaConfig()`
+               * 在 mint 回调里写入（`setCaptchaConfig`），而 mint **先于**组头发生
+               * （上面那两行）⇒ 这里读到的一定是本次 param 用的那份。
+               * ⚠ 别只留 `this.options.captchaRegion ?? 'cn'`：那个兜底常量只在
+               *   cn 区账号上碰巧正确，非 cn 区（服务端下发 `sgp`）会让每一次
+               *   3007 补产重发**必然**再撞一次同一个 `3007`（而重发只有一次机会）。
+               */
+              'x-aliyun-captcha-verify-region': this.captchaConfig?.region
+                ?? this.options.captchaRegion
+                ?? 'cn',
             }),
         }
 

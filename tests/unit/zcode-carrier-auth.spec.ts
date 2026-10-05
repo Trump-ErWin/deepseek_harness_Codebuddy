@@ -916,8 +916,10 @@ describe('观测与接线', () => {
     // ② ★ `finally` 里清位（漏掉就是白烧设备级配额的最坏形态）
     expect(body).toMatch(/finally \{[\s\S]{0,200}?setCaptchaDemand\(false\)/)
     // ③ 逐 plan 的产出走「内部载体优先」那一层，而不是裸的注入回调
-    //    （评审 C4：返回值带 `source`，claim 才知道 3007 该不该记到载体头上）
-    expect(body).toMatch(/const minted = await this\.mintClaimCaptcha\(mintCaptcha\)/)
+    //    （评审 C4：返回值带 `source`，claim 才知道 3007 该不该记到载体头上）。
+    //    ⚠ 第二个实参 `captchaConfig` 是**同源约束**的一部分（issue IKJNPS）：
+    //    param 与 region 必须用同一份配置，少传/多拉一次都会让非 cn 区账号恒 `3007`。
+    expect(body).toMatch(/const minted = await this\.mintClaimCaptcha\(mintCaptcha, captchaConfig\)/)
   })
 
   it('★ 反向看守：`zcode-adapter.ts` 里**不得**再出现 `setCaptchaDemand(`', () => {
