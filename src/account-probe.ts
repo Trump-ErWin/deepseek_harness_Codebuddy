@@ -44,7 +44,7 @@ import { qoderProductById } from './qoder-product.js'
 import { clineProductById } from './cline-product.js'
 import { zcodeProductById } from './zcode-product.js'
 import { GeminiAdapter } from './gemini-adapter.js'
-import { GEMINI } from './gemini.js'
+import { GEMINI, GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js'
 import type { BuddyCredential } from './buddy.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
@@ -321,11 +321,24 @@ async function probeWithAdapter(
     // 落 else 会被交给**华为云 HMAC 签名**的 CodeArtsAdapter 去发 Google 凭据，
     // 探测必然失败，而账号卡片上的「重测」永远清不掉那个标记。
     //
-    // 探测只发一次最小纯文本请求，不涉及图片/工具，故除 product 外无需其它钩子。
+    // 探测只发一次最小纯文本请求，不涉及图片/工具，故除 product 与 lane 外
+    // 无需其它钩子。
+    //
+    // ⚠️ lane 必须是 `smoke`：原版实测冒烟路径与推理路径的 sessionId **不同**
+    //（同 prompt 同预算下取值不同，说明 lane 进了哈希）。不传会让探测流量与
+    // 真实推理混进同一个会话，污染会话归并与 thoughtSignature 回填。
+    //
+    // ⚠️ `project` **显式钉兜底串**，与上面「刻意不传 accountPool / fetchRemoteModels」
+    // 同一个理由：探测是**轻量存活检查**，要的是一次到推理端点的真请求。
+    // 若走自动探测，会先多打一次 `loadCodeAssist`，且 LCA 失败（限流/网络抖动）
+    // 会让探测报「项目号探测失败」而不是它真正要报的「账号仍受限」—— 反而掩盖
+    // 了用户点「重测」想知道的答案。探测**不写**任何东西（不传 persistProject）。
     adapter = new GeminiAdapter({
       credentialRef: ref,
       resolveCredential: async () => credential as GeminiCredential,
       refresh: async () => {},
+      sessionLane: GEMINI_SESSION_LANE_SMOKE,
+      project: GEMINI_DEFAULT_PROJECT,
       product: GEMINI,
     })
   } else {
