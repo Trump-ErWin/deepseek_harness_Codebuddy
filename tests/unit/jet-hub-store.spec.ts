@@ -16,6 +16,7 @@ import {
   sanitizeDisabledModels,
   sanitizeGatewayEnabled,
   sanitizePermanentLocks,
+  sanitizeProviderOrder,
 } from '../../src/jet-hub-store.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
@@ -106,6 +107,8 @@ describe('老契约后端（SettingsStore）', () => {
       disabledModels: { buddy: { 'glm-5.2': true } },
       loomyPermanentLocked: false,
       gatewayEnabled: true,
+      // save 未携带顺序 → 写出空数组（未自定义），读回同值。
+      providerOrder: [],
     })
     // ⚠️ 锁定表**不进**这份文档：它是同机多 profile 共享的，旧版本代码全量重写
     // 时不会携带自己不认识的键 —— 表放这儿会被静默抹掉（详见
@@ -174,6 +177,8 @@ describe('文件后端（FileStore）', () => {
       loomyPermanentLocked: false,
       // 网关开关缺省启用 —— 与升级前行为一致
       gatewayEnabled: true,
+      // 顺序缺省空数组（未自定义）—— 与升级前行为一致
+      providerOrder: [],
     })
     // 落盘文本里也不该出现锁定表（它属于 permanent-locks.json）
     expect(readFileSync(statePath, 'utf-8')).not.toContain('permanentLocks')
@@ -405,6 +410,8 @@ describe('文件后端（FileStore）', () => {
       loomyPermanentLocked: false,
       // 写盘时缺省即启用：读回应如实带回这个默认值。
       gatewayEnabled: true,
+      // 顺序缺省空数组（未自定义）：读回同值。
+      providerOrder: [],
     })
   })
 })
@@ -469,5 +476,27 @@ describe('归一化', () => {
     const input = { buddy: true }
     mergeLegacyLoomyLock(input, true)
     expect(input).toEqual({ buddy: true })
+  })
+
+  /**
+   * 供应商自定义顺序（「供应商开关」弹窗拖拽排序，2026-10-06）。
+   *
+   * ⚠️ 刻意**不做** provider 合法性校验：合法集合随插件版本变化，在这里过滤
+   * 会让「新版本加入 provider → 被旧版本代码重写文档」场景下的顺序无法保留。
+   * 展示层（provider-toggle.js 的 sortOpenProvidersByOrder）对未知 id 自带
+   * 稳定兜底，脏条目天然无害 —— 所以这里只挡「明显不是 id」的值。
+   */
+  it('sanitizeProviderOrder：只留非空字符串并去重（保持首个出现位置）', () => {
+    expect(sanitizeProviderOrder(['buddy', 'zcode', 'buddy', 'trae']))
+      .toEqual(['buddy', 'zcode', 'trae'])
+    expect(sanitizeProviderOrder(['buddy', '', 42, null, { id: 'x' }, 'zcode']))
+      .toEqual(['buddy', 'zcode'])
+  })
+
+  it('sanitizeProviderOrder：非数组一律视为未自定义（空数组）', () => {
+    expect(sanitizeProviderOrder(undefined)).toEqual([])
+    expect(sanitizeProviderOrder(null)).toEqual([])
+    expect(sanitizeProviderOrder('buddy')).toEqual([])
+    expect(sanitizeProviderOrder({ 0: 'buddy' })).toEqual([])
   })
 })
