@@ -49,7 +49,7 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
     expect(index).toMatch(
       /registerJetHubRpc\([\s\S]*?qoder,[\s\S]*?modelAdapters\)/,
     )
-    expect(index, 'qoder 适配器须登记进映射').toContain('qoder: qoderAdapter')
+    expect(index, 'qoder 适配器须登记进映射').toMatch(/qoder: pruned\([^)]*,\s*qoderAdapter\)/)
   })
 
   it('续期调度不看 enabled（AGENTS.md 强制约定）', () => {
@@ -180,7 +180,9 @@ describe('QoderCN 宿主侧接线（src/index.ts）', () => {
   })
 
   it('CN 适配器登记进 modelAdapters', () => {
-    expect(index).toContain('qodercn: qoderCnAdapter')
+    // ⚠️ 2026-10-06 复审 !66：登记项经 `pruned(...)` 包装（致命缺陷修复之一 ——
+    // 否则 Jet Hub 拿到原始实例，「已失效模型」剔除对设置页不生效）。
+    expect(index).toMatch(/qodercn: pruned\([^)]*,\s*qoderCnAdapter\)/)
   })
 
   it('registerJetHubRpc 把 qoderCn 作为 qoder 之后的位置参数传入', () => {

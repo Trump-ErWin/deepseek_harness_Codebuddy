@@ -133,6 +133,7 @@ import {
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
+import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
 import type {
   ProviderAccountEntry,
@@ -191,6 +192,8 @@ import type {
   RpcModelSetAllDisabledResponse,
   RpcModelSetDisabledManyRequest,
   RpcModelSetDisabledManyResponse,
+  RpcModelClearDeadRequest,
+  RpcModelClearDeadResponse,
   RpcProviderStatusRequest,
   RpcProviderStatusResponse,
   RpcProviderSetEnabledRequest,
@@ -3405,11 +3408,32 @@ function registerJetHubEndpoints(
             ...filteredOut.map((id) => ({ id, name: id })),
           ]
         }
+        // ⚠️⚠️ 「已失效模型」必须**显式列出且可恢复**（2026-10-06 复审 !66 实测）。
+        //
+        // 背景：`withDeadModelPruning` 会把已失效模型从 `listModels` / `listAllModels`
+        // 两侧剔除，于是它既不在 `all` 里、也不在 `disabledMap` 里 —— 上面的两条
+        // 补回路径都救不回它。结果是**模型从设置页彻底消失，连开关都摸不着**，
+        // 用户永远无法自行恢复（这正是本段注释在 `:3370-3375` 列为必须避免的根因：
+        // 「用户再也无法重新打开」）。
+        //
+        // ⇒ 这里把 dead 表里的 id 补回目录，并带上 `dead: true` 让客户端灰显 +
+        // 提供「重新显示」入口（`model.clearDead`）。**方向必须与黑名单相反**：
+        // 失效模型**永远**列出（哪怕被用户关着），否则用户没有恢复路径。
+        const dead = deadModelIdsFor(req.provider)
+        if (dead.size > 0) {
+          const known = new Set(catalog.map((model) => model.id))
+          for (const id of dead) {
+            if (!known.has(id)) catalog.push({ id, name: id })
+          }
+        }
         const value: RpcModelListResponse = {
           models: catalog.map((model) => ({
             id: model.id,
             name: model.name,
             disabled: disabledMap[model.id] === true,
+            // ⚠️ **照实透传**：缺失即 false，**不推导**（黑名单命中也算用户主动关的，
+            // 不是失效）。客户端据它灰显并显示「重新显示」按钮。
+            dead: dead.has(model.id),
             // ⚠️ 免费标记**照原样透传，缺失就不写**（不编造 `false`）：Jet Hub 的
             // 模型列表按「计费/来源」分组，把「适配器没报」当成「按量计费」是
             // 保守归组，但字段本身仍保持「未知」语义（与全仓约定一致）。
@@ -3440,6 +3464,48 @@ function registerJetHubEndpoints(
         const value: RpcModelSetDisabledResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 把模型从「已失效」表里移除，让它重新出现在目录中。
+       *
+       * ## 为什么必须有这个端点（2026-10-06 复审 !66 确认）
+       *
+       * 失效记录的唯一自愈路径是 TTL 过期（默认 30 天）—— 因为模型被剔除后用户
+       * **选不到**，不可能靠「再成功一次」触发清除。所以**误判一次 = 该模型被
+       * 藏 30 天且用户毫无办法**，这与 Jet Hub 已有的模型开关完全不对等
+       * （用户能一键关，却不能一键复活）。
+       *
+       * ⚠️ **不动黑名单**：`disabledModels` 是用户主动选择，失效表是系统推断，
+       * 两者必须分开清除 —— 否则「重新显示」会顺带打开用户特意关着的模型。
+       *
+       * ⚠️ `modelId` **没有默认值**：传 `""`/非字符串一律拒绝（避免字段名写错
+       * 导致「静默清空全表」）。省略该字段才是「清空该 provider 全部」。
+       */
+      case 'model.clearDead': {
+        const req = payload as RpcModelClearDeadRequest
+        if (typeof req.provider !== 'string' || req.provider.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 必填' } }
+        }
+        if (req.modelId !== undefined && (typeof req.modelId !== 'string' || req.modelId.length === 0)) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'modelId 必须是非空字符串，或省略以恢复全部' },
+          }
+        }
+        const removed = clearDeadModels(req.provider, req.modelId)
+        // 必须广播：与三个开关端点同约定，否则客户端目录（`llm/adapters-updated`
+        // 三个触发源之一）不复位，用户点了「重新显示」界面却不动。
+        broadcastCatalogChanged(ctx)
+        ctx.logger.info(
+          `[jet-hub] 恢复 ${removed} 个失效模型：${req.provider}`
+          + `${req.modelId === undefined ? '' : `/${req.modelId}`}`,
+        )
+        const value: RpcModelClearDeadResponse = {
+          provider: req.provider,
+          deadModels: [...deadModelIdsFor(req.provider)],
         }
         return { ok: true, value }
       }

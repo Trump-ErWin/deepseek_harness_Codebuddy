@@ -63,7 +63,9 @@ describe('Raccoon 在 index.ts 的接线', () => {
   })
 
   it('modelAdapters 里登记了 raccoon', () => {
-    expect(indexSource).toMatch(/const modelAdapters[\s\S]*?raccoon: raccoonAdapter/)
+    // ⚠️ 2026-10-06 复审 !66：登记项经 `pruned(...)` 包装（否则 Jet Hub 拿到原始
+    // 实例、「已失效模型」剔除对设置页不生效）。
+    expect(indexSource).toMatch(/const modelAdapters[\s\S]*?raccoon: pruned\([^)]*,\s*raccoonAdapter\)/)
   })
 
   it('registerJetHubRpc 传入了 raccoon', () => {

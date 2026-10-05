@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
-import { registerCodeArtsLlm } from './llm-adapter.js'
+import { registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
 import { registerLobsteraiLlm } from './lobsterai-adapter.js'
 import { registerQoderLlm } from './qoder-adapter.js'
@@ -40,7 +40,7 @@ import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
-import { configureDeadModelStore } from './dead-model-store.js'
+import { configureDeadModelStore, withDeadModelPruning } from './dead-model-store.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
@@ -1815,23 +1815,43 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // provider → 适配器实例：Jet Hub「显示列表」需要 `listAllModels()`（不受用户
   // 黑名单影响的全量目录，带最终展示名/倍率）。DSH 的 `ctx.llm` 只保证
   // `listModels`，不透传自定义方法，故这里显式把实例传下去。
+  //
+  // ⚠️⚠️ **必须走 `withDeadModelPruning`，不能直接用 `registerXxxLlm` 的返回值**
+  // （致命缺陷，2026-10-06 复审 !66 实测）：那些函数返回的是 `new XxxAdapter(...)`
+  // —— **原始实例**，而 `registerAdapterIdempotent` 只把**代理**注册进了 `ctx.llm`。
+  // 于是 `jet-hub-rpc` 的 `model.list` 先 `await llm.listModels()`（走代理，已剔除），
+  // 紧接着又用本表的 `listAllModels()` **覆盖**成全量目录（走原始，**未剔除**）⇒
+  // 已失效模型被加回设置页，PR 想修的「用户仍看到下架模型」原问题**完全没修到**。
+  //
+  // 这里复用与注册**同一个**包装函数，确保两条路径的可见性一致。
+  // ⚠️ `codearts` 不在 `modelAdapters` 的常规形态里，但它同样需要该包装。
+  //
+  // ⚠️ 包装失败**不阻断启动**：回退到原始实例即可（它只是显示层的收敛）。
+  const pruned = <T extends object>(provider: string, adapter: T): T => {
+    try {
+      return withDeadModelPruning([provider], adapter)
+    } catch (error) {
+      ctx.logger.warn(`[jet-hub] ${provider} 的失效模型剔除包装失败，使用原适配器: ${String(error)}`)
+      return adapter
+    }
+  }
   const modelAdapters: Record<string, { listAllModels(): readonly { id: string; name: string }[] }> = {
     // `codearts` 是 registerCodeArtsLlm 返回的**适配器实例**（与 CodeArtsAuth
     // 服务实例 `service` 不同名，故这里可以简写）。
-    codearts,
-    buddy: buddyAdapter,
-    workbuddy: workbuddyAdapter,
-    lobsterai: lobsteraiAdapter,
-    qoder: qoderAdapter,
-    qodercn: qoderCnAdapter,
-    trae: traeAdapter,
-    cline: clineAdapter,
-    loomy: loomyAdapter,
-    raccoon: raccoonAdapter,
-    minimax: minimaxAdapter,
-    gemini: geminiAdapter,
-    zcode: zcodeAdapter,
-    opencode: opencodeAdapter,
+    codearts: pruned(CODEARTS_PROVIDER, codearts),
+    buddy: pruned('buddy', buddyAdapter),
+    workbuddy: pruned('workbuddy', workbuddyAdapter),
+    lobsterai: pruned(LOBSTERAI.id, lobsteraiAdapter),
+    qoder: pruned(QODER.id, qoderAdapter),
+    qodercn: pruned(QODER_CN.id, qoderCnAdapter),
+    trae: pruned(TRAE.id, traeAdapter),
+    cline: pruned(CLINE.id, clineAdapter),
+    loomy: pruned(LOOMY.id, loomyAdapter),
+    raccoon: pruned(RACCOON.id, raccoonAdapter),
+    minimax: pruned(MINIMAX.id, minimaxAdapter),
+    gemini: pruned(GEMINI.id, geminiAdapter),
+    zcode: pruned(ZCODE.id, zcodeAdapter),
+    opencode: pruned(OPENCODE.id, opencodeAdapter),
   }
 
   // 插件卸载前把签名缓存落盘：`stream()` 每次结束都 flush，但用户可能
