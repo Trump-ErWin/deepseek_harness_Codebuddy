@@ -104,6 +104,61 @@ export function avgPerfText(row) {
   return '首字 ' + (ttft ?? '—') + ' · ' + (tps ?? '—');
 }
 
+// ───────────────────── 历史视图（第 4 期）─────────────────────
+
+/** 历史窗口选项（与服务端 RPC 约定一致；0 = 全部）。 */
+export const HISTORY_RANGES = [
+  { key: 'today', label: '今日', days: 1 },
+  { key: '7d', label: '近 7 天', days: 7 },
+  { key: '30d', label: '近 30 天', days: 30 },
+  { key: 'all', label: '全部', days: 0 },
+];
+
+/** 窗口 key → sinceDays（0 = 全部历史）。未知 key 回退全部。 */
+export function rangeDaysOf(key) {
+  const hit = HISTORY_RANGES.find((r) => r.key === key);
+  return hit === undefined ? 0 : hit.days;
+}
+
+/** 今日的 UTC+8 日键（与服务端 utc8DayKey 同算法；用于高亮柱状图当前日）。 */
+export function todayDayKey() {
+  const shifted = new Date(Date.now() + 8 * 60 * 60 * 1000);
+  const pad = (x) => String(x).padStart(2, '0');
+  return shifted.getUTCFullYear() + '-' + pad(shifted.getUTCMonth() + 1) + '-' + pad(shifted.getUTCDate());
+}
+
+/**
+ * 趋势图数据：每日一行（日键 + token 合计 + 请求数），新在前，最多 maxBars 根。
+ *
+ * ⚠️ 缺数据的天**不补零**（历史里没有键就是没用过）—— 补零需要造日历序列，
+ * 会让「最近 30 天」在数据稀疏时出现一长排空柱，观感差且信息量为零。
+ */
+export function trendBars(historyDays, maxBars = 30) {
+  const list = Array.isArray(historyDays) ? historyDays : [];
+  const today = todayDayKey();
+  return list.slice(0, maxBars).map((d) => ({
+    day: d?.day ?? '',
+    isToday: d?.day === today,
+    requests: d?.totals?.requests ?? 0,
+    tokens: (d?.totals?.inputTokens ?? 0) + (d?.totals?.outputTokens ?? 0),
+  }));
+}
+
+/** 柱高百分比（相对最大值；最大值为 0 时全部给最小可见高度）。 */
+export function barHeightPercent(tokens, maxTokens) {
+  const max = typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 0;
+  const t = typeof tokens === 'number' && tokens > 0 ? tokens : 0;
+  if (max === 0 || t === 0) return 0;
+  // 保底 4%：极小值也能看见柱子（否则只在最大值那根可见）。
+  return Math.max(4, Math.round((t / max) * 100));
+}
+
+/** 历史窗口标题（弹窗内小节标题）。 */
+export function historyTitle(rangeKey) {
+  const hit = HISTORY_RANGES.find((r) => r.key === rangeKey);
+  return '历史用量 · ' + (hit === undefined ? '全部' : hit.label);
+}
+
 /** 时间格式化（HH:MM:SS）：明细表不需要日期（流水只覆盖最近 500 笔）。 */
 export function formatEntryTime(ts) {
   const d = typeof ts === 'number' && Number.isFinite(ts) ? new Date(ts) : null;

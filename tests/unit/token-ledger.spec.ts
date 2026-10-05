@@ -5,6 +5,7 @@ import {
   mergeDayEntry,
   peekLedgerAccount,
   readTokenLedger,
+  readTokenLedgerHistory,
   recordTokenUsage,
   reportLedgerAccount,
   resetLedgerAccountsForTests,
@@ -357,5 +358,80 @@ describe('utc8DayKey / mergeDayEntry（第 2 期 · 日聚合）', () => {
       attachTokenLedgerPersistence(undefined)
     }
     expect(tokenLedgerSize()).toBeGreaterThanOrEqual(1)
+  })
+})
+
+describe('readTokenLedgerHistory（第 4 期 · 历史视图）', () => {
+  /** 用真实记账路径造日聚合表（与落盘数据同源）。 */
+  function makeDays(entries: Array<Parameters<typeof recordTokenUsage>[0]>): TokenLedgerDayMap {
+    const days: TokenLedgerDayMap = new Map()
+    for (const e of entries) mergeDayEntry(days, e)
+    return days
+  }
+  const DAY1 = Date.UTC(2026, 9, 4, 2, 0, 0) // UTC+8 2026-10-04 10:00
+  const DAY2 = Date.UTC(2026, 9, 5, 2, 0, 0) // UTC+8 2026-10-05 10:00
+  const DAY9 = Date.UTC(2026, 9, 12, 2, 0, 0) // UTC+8 2026-10-12 10:00
+
+  it('日聚合 → 聚合树：结构与内存快照同形，各级小计 = 子级之和', () => {
+    const days = makeDays([
+      { ...OK, ts: DAY1, inputTokens: 100, outputTokens: 10 },
+      { ...OK, ts: DAY1, channel: 'gateway', provider: 'qoder', inputTokens: 50, outputTokens: 5 },
+    ])
+    const { days: history, totals } = readTokenLedgerHistory(days)
+    expect(history).toHaveLength(1)
+    const day1 = history[0]!
+    expect(day1.day).toBe('2026-10-04')
+    expect(day1.channels).toHaveLength(2)
+    const direct = day1.channels[0]!
+    expect(direct.totals.inputTokens).toBe(100)
+    expect(direct.totals.outputTokens).toBe(10)
+    // 窗口合计 = 全部日之和
+    expect(totals.inputTokens).toBe(150)
+    expect(totals.requests).toBe(2)
+  })
+
+  it('均值：历史小计按全部样本 Σ/份数（跨日不「均值的均值」）', () => {
+    const days = makeDays([
+      { ...OK, ts: DAY1, ttftMs: 100, durationMs: 1100, outputTokens: 100 },
+      { ...OK, ts: DAY2, ttftMs: 300, durationMs: 1300, outputTokens: 100 },
+    ])
+    const { totals } = readTokenLedgerHistory(days)
+    // (100+300)/2 = 200
+    expect(totals.avgTtftMs).toBe(200)
+  })
+
+  it('sinceDays 窗口：只含最近 N 天（含今天）；未来日键恒被裁掉', () => {
+    const days = makeDays([
+      { ...OK, ts: DAY9 }, // UTC+8 2026-10-12 —— 相对今天（2026-10-05）在未来
+      { ...OK, ts: DAY1 }, // UTC+8 2026-10-04 —— 昨天
+      { ...OK, ts: DAY2 }, // UTC+8 2026-10-05 —— 今天
+    ])
+    // 全部历史：未来键被裁 ⇒ 只剩 10-04 与 10-05
+    const all = readTokenLedgerHistory(days)
+    expect(all.days.map((d) => d.day)).toEqual(['2026-10-05', '2026-10-04'])
+    // 近 7 天：10-04 / 10-05 都在窗口内
+    const week = readTokenLedgerHistory(days, { sinceDays: 7 })
+    expect(week.days.map((d) => d.day)).toEqual(['2026-10-05', '2026-10-04'])
+    // 窗口裁掉旧日：近 1 天（仅今日）只剩 10-05
+    const today = readTokenLedgerHistory(days, { sinceDays: 1 })
+    expect(today.days.map((d) => d.day)).toEqual(['2026-10-05'])
+    expect(today.totals.requests).toBe(1)
+  })
+
+  it('未来日键（手工编辑）不展示也不入合计', () => {
+    const future = Date.now() + 40 * 24 * 60 * 60 * 1000
+    const days = makeDays([
+      { ...OK, ts: future },
+      { ...OK, ts: DAY1 },
+    ])
+    const { days: history, totals } = readTokenLedgerHistory(days)
+    expect(history.map((d) => d.day)).not.toContain(utc8DayKey(future))
+    expect(totals.requests).toBe(1)
+  })
+
+  it('空表 / 空 day：返回空数组不抛错', () => {
+    expect(readTokenLedgerHistory(new Map()).days).toEqual([])
+    const days: TokenLedgerDayMap = new Map([['2026-10-04', new Map()]])
+    expect(readTokenLedgerHistory(days).days).toEqual([])
   })
 })
