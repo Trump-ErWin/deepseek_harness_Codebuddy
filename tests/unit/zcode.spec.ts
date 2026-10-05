@@ -45,6 +45,8 @@ import {
 import {
   describeUpstreamError,
   httpErrorCodeForZcode,
+  isZcodeQuotaExhausted,
+  isZcodeConcurrencyLimited,
 } from '../../src/zcode-adapter.js'
 import { toClaimOutcome, emptyCheckinStatus } from '../../src/zcode-auth.js'
 
@@ -461,6 +463,45 @@ describe('ZCode 请求头与错误映射', () => {
   it('★ 1113（余额不足）映射到 QUOTA_EXCEEDED —— 不可重试', () => {
     expect(httpErrorCodeForZcode(429, '{"code":"1113"}')).toBe('QUOTA_EXCEEDED')
     expect(httpErrorCodeForZcode(429, '余额不足或无可用资源包')).toBe('QUOTA_EXCEEDED')
+  })
+
+  /**
+   * ★ 上游把**并发限流**装进**额度码**下发（2026-10-06 凌晨真实故障）。
+   *
+   * 实测 wire：`429 + {"code":1005,"msg":"user concurrency limit exceeded"}` ——
+   * `code` 说是额度（1005），`msg` 说是并发。当时的报错链：
+   *   适配器换号/退避都正确 → 全部候选仍 429 → 最终文案按**码**归类（1005）⇒
+   *   报「额度用尽——请等待额度重置或更换账号」，而 msg 明说
+   *   「user concurrency limit exceeded」（等一下就能过）——**建议全错**，
+   *   且让用户以为账号额度出了问题。
+   *
+   * 正确语义：**msg 的并发文案优先于 code 的额度语义** —— 并发是「等一下就能过」，
+   * 报并发 + 可重试（RATE_LIMIT）；额度判定（isZcodeQuotaExhausted）不得命中
+   * （否则把可用账号错标 24h 冷却）。
+   */
+  const MIXED_BODY = '{"code":1005,"msg":"user concurrency limit exceeded"}'
+
+  it('★ 码装错了：1005 码 + 并发文案 ⇒ describeUpstreamError 报**并发限流**（不报额度）', () => {
+    const text = describeUpstreamError(429, MIXED_BODY)
+    expect(text).toMatch(/并发限流/)
+    expect(text).not.toMatch(/额度用尽/)
+    expect(text).toContain('user concurrency limit exceeded')
+  })
+
+  it('★ 同型 body ⇒ httpErrorCodeForZcode = RATE_LIMIT（可重试：等一下就能过）', () => {
+    expect(httpErrorCodeForZcode(429, MIXED_BODY)).toBe('RATE_LIMIT')
+  })
+
+  it('★ 同型 body ⇒ isZcodeQuotaExhausted = false（不得把可用账号错标冷却）', () => {
+    expect(isZcodeQuotaExhausted(429, MIXED_BODY)).toBe(false)
+    expect(isZcodeConcurrencyLimited(429, MIXED_BODY)).toBe(true)
+  })
+
+  it('★ 真·额度错误不受影响（1005 + exceed quota limit 仍报额度 + 不可重试）', () => {
+    const body = '{"code":1005,"msg":"exceed quota limit"}'
+    expect(isZcodeQuotaExhausted(429, body)).toBe(true)
+    expect(describeUpstreamError(429, body)).toMatch(/额度用尽/)
+    expect(httpErrorCodeForZcode(429, body)).toBe('QUOTA_EXCEEDED')
   })
 
   it('401 / 1002 映射到 AUTH', () => {

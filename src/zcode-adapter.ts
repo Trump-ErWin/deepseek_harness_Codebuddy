@@ -1718,10 +1718,16 @@ export function describeUpstreamError(
    * ⚠ 两个**限流/额度**码要单独说清，因为用户该做的事完全不同：
    * - `3009` 并发限流：**等一下再试**（我们已经退避重试过，仍失败说明窗口更长）
    * - `1005` 额度用尽：等额度重置或**换账号**（重试无意义）
+   *
+   * 🔴 **并发文案的判定必须先于 1005 码分支**（2026-10-06 凌晨真实故障）：
+   * 上游会把并发限流的文案装进额度码下发——实测
+   * `429 + {"code":1005,"msg":"user concurrency limit exceeded"}`。按码先判
+   * 会报「额度用尽——请等待额度重置或更换账号」，而 msg 明说等一下就能过，
+   * **建议全错**。故：正文含并发文案 ⇒ 一律按并发报（无论 code 是 3009 还是 1005）。
    */
-  if (code === 3009 || trimmed.includes('3009')) {
+  if (code === 3009 || trimmed.includes('3009') || isZcodeConcurrencyLimited(status, trimmed)) {
     return (
-      `上游并发限流（3009 model concurrency limit exceeded）——` +
+      `上游并发限流（model concurrency limit exceeded）——` +
       `已按退避重试仍未通过，请稍后重试。原始响应：${suffix}`
     )
   }
@@ -1760,16 +1766,23 @@ export function describeUpstreamError(
  * | 上游 | 映射 | 会被重试吗 | 理由 |
  * |---|---|---|---|
  * | `3007` captcha | `RATE_LIMIT` | **是** | 换新 param 就能过，值得重试 |
+ * | **并发文案**（装在任意码里） | `RATE_LIMIT` | **是** | 等一下就能过（2026-10-06 事故） |
  * | `3012` 风控 | `PERMISSION` | **否** | 有账号冷却惩罚，重试会加重 |
  * | `1002`/401 | `AUTH` | 否 | 需用户重新登录 |
- * | `1113` 余额 | `QUOTA_EXCEEDED` | **否** | 确定性错误（要充值） |
+ * | `1113` 余额 / `1005` 额度 | `QUOTA_EXCEEDED` | **否** | 确定性错误（等重置/充值） |
  * | 其余 5xx | `SERVER` | 是 | 暂时性 |
  */
 export function httpErrorCodeForZcode(status: number, body: string): string {
   const trimmed = body.trim()
+  // 🔴 并发文案**先于**额度码判定：上游曾把并发限流装进 1005 码下发
+  // （429 + {"code":1005,"msg":"user concurrency limit exceeded"}，2026-10-06），
+  // 按码先判会让一个「等一下就能过」的瞬态错误被报成不可重试的「额度用尽」。
+  if (isZcodeConcurrencyLimited(status, trimmed)) return 'RATE_LIMIT'
   if (trimmed.includes('3007')) return 'RATE_LIMIT'
   if (trimmed.includes('3012')) return 'PERMISSION'
-  if (trimmed.includes('1113') || trimmed.includes('余额不足')) return 'QUOTA_EXCEEDED'
+  if (trimmed.includes('1113') || trimmed.includes('余额不足') || trimmed.includes('1005')) {
+    return 'QUOTA_EXCEEDED'
+  }
   if (status === 401 || trimmed.includes('1002')) return 'AUTH'
   if (status === 429) return 'RATE_LIMIT'
   if (status >= 500) return 'SERVER'
