@@ -509,3 +509,149 @@ describe('RaccoonAdapter 目录缓存语义（★ 兜底表不进缓存）', () 
     expect(calls).toBe(1)
   })
 })
+
+/**
+ * 请求级账号轮换（★ 2026-10-05，用户报障「余额用完一个号就卡死，不切下一个号」）。
+ *
+ * ## 症状与根因
+ *
+ * raccoon 的 `resolveCredential` 会从账号池取号（有 6 个账号），但适配器的
+ * stream() **没有任何请求级换号逻辑**：首个账号余额耗尽（上游报
+ * `14018 Credits exhausted`）时错误直接抛给 harness —— 而池按「手动顺序」
+ * 取号，下次请求仍取回同一个坏号 ⇒ 表现为「卡死在一个号上」。
+ *
+ * ## 对齐目标：buddy 的语义
+ *
+ * `buddy-adapter.ts` 的既有实现（本项目「无感换号」的基准）：
+ *
+ * 1. HTTP 层失败且可换号（限流/额度/认证）⇒ 标记当前账号该模型受限 →
+ *    `getAvailableAccount(provider, model, tried)` 取下一个 → 重发；
+ * 2. `tried` 集合保证每个账号只试一次（不排除会拿回同一个号）；
+ * 3. 全部候选试完才报「所有账号均不可用」，且带上**最后一次**的真实原因；
+ * 4. 非限流类错误（如 400 参数错）**不换号**——换号无益，按原错误抛。
+ *
+ * 本 describe 锁定 raccoon 对齐该语义；SSE 层（流内错误帧）的约束是
+ * 「已产出正文后绝不重发」（防重复计费），与 trae 的既有哨兵同款。
+ */
+describe('RaccoonAdapter 请求级账号轮换（余额耗尽无感切号）', () => {
+  /** 两个账号的池桩：按 exclude 排除已试过的号，记录标记调用。 */
+  function makePoolStub() {
+    const marks: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    const picks: Array<ReadonlySet<string> | undefined> = []
+    const accounts = [
+      { id: 'raccoon-A', token: 'tok-A' },
+      { id: 'raccoon-B', token: 'tok-B' },
+    ]
+    const pool = {
+      updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+        marks.push({ accountId, modelId, resetAtMs })
+      },
+      getAvailableAccount: async (_provider: string, _model: string, exclude?: ReadonlySet<string>) => {
+        picks.push(exclude)
+        for (const a of accounts) {
+          if (exclude?.has(a.id)) continue
+          return { entry: { id: a.id }, credential: { access_token: a.token, refresh_token: 'r' } }
+        }
+        return null
+      },
+      // ⚠️ 生产里适配器靠它把「首号凭据」反查成账号 id（轮换记账的键）。
+      // 桩必须复刻该行为，否则轮换退化为「不标记」——测试就测不到真实形状。
+      findAccountIdByCredential: async (_provider: string, identity: string) =>
+        accounts.find((a) => a.token === identity)?.id ?? '',
+    }
+    return { pool, marks, picks, accounts }
+  }
+
+  const sse = (frames: string[]) => sseResponse(frames)
+
+  it('★ 一号余额耗尽（14018）→ 标记该模型 + 切二号重发成功', async () => {
+    const { pool, marks, picks } = makePoolStub()
+
+    // 按请求头里的 Authorization 区分是哪个账号发的请求。
+    // 首发凭据 = 池给的第一个号（对齐生产：resolveCredential 从池取号）。
+    const seenAuth: string[] = []
+    let call = 0
+    const fetcher = vi.fn(async (_url: string, init: RequestInit) => {
+      call += 1
+      seenAuth.push(String(new Headers(init.headers).get('Authorization') ?? ''))
+      if (call === 1) {
+        return new Response(JSON.stringify({ error: { message: '14018 Credits exhausted' } }), { status: 402 })
+      }
+      return sse([
+        JSON.stringify({ choices: [{ delta: { content: '从二号账号返回' } }] }),
+      ])
+    })
+
+    const adapter = makeAdapter({
+      pool: pool as unknown as AccountPool,
+      fetcher: fetcher as unknown as typeof fetch,
+      credential: { access_token: 'tok-A', refresh_token: 'r' },
+    })
+    const chunks = await collect(adapter, {})
+
+    // 枢纽断言：必须真的换号重发，且用户拿到的是二号账号的成功响应。
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(seenAuth[0]).toContain('tok-A')
+    expect(seenAuth[1]).toContain('tok-B')
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    // 换号前必须把坏号标记在该模型上（下次选号自动跳过它）。
+    expect(marks.some((m) => m.accountId === 'raccoon-A' && m.modelId === 'sn-glm-5-3')).toBe(true)
+    // 取号必须传 exclude（否则池按手动顺序恒取回一号，换号形同虚设）。
+    expect(picks[0]?.has('raccoon-A') ?? picks[0] === undefined).toBe(true)
+  })
+
+  it('★ 两号都耗尽 → 报「所有账号均不可用」并带最后一次的真实原因', async () => {
+    const { pool } = makePoolStub()
+    const fetcher = vi.fn(async (_url: string, init: RequestInit) => {
+      const auth = String(new Headers(init.headers).get('Authorization') ?? '')
+      return new Response(
+        JSON.stringify({ error: { message: `14018 exhausted (${auth.includes('tok-B') ? 'B' : 'A'})` } }),
+        { status: 402 },
+      )
+    })
+    const adapter = makeAdapter({ pool: pool as unknown as AccountPool, fetcher: fetcher as unknown as typeof fetch })
+    const error = await collect(adapter, {}).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain('所有账号')
+    expect((error as Error).message).toContain('B') // 最后一次的真实原因，不是笼统的"均受限"
+  })
+
+  it('非额度类错误（400 参数错）不换号 —— 换号无益，按原错误抛', async () => {
+    const { pool } = makePoolStub()
+    const fetcher = vi.fn(async () => new Response('{"error":{"message":"param is invalid"}}', { status: 400 }))
+    const adapter = makeAdapter({ pool: pool as unknown as AccountPool, fetcher: fetcher as unknown as typeof fetch })
+    const error = await collect(adapter, {}).catch((e: unknown) => e)
+
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect((error as Error).message).toContain('param is invalid')
+  })
+
+  it('已产出正文后流内报错不重发（防重复计费，与 trae 哨兵同款）', async () => {
+    const { pool } = makePoolStub()
+    let call = 0
+    const fetcher = vi.fn(async () => {
+      call += 1
+      if (call === 1) {
+        return sse([
+          JSON.stringify({ choices: [{ delta: { content: '已经发出的一半内容' } }] }),
+          JSON.stringify({ error: { message: '14018 exhausted mid-stream' } }),
+        ])
+      }
+      return sse([JSON.stringify({ choices: [{ delta: { content: '不该出现' } }] })])
+    })
+    const adapter = makeAdapter({ pool: pool as unknown as AccountPool, fetcher: fetcher as unknown as typeof fetch })
+    const chunks: StreamChunk[] = []
+    let streamError: unknown
+    try {
+      for await (const c of adapter.stream({
+        provider: 'raccoon', model: 'sn-glm-5-3',
+        messages: [{ role: 'user', content: 'hi' }],
+      } as unknown as GenerateOptions)) chunks.push(c)
+    } catch (e) { streamError = e }
+
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(chunks.some((c) => c.type === 'text-delta' && String((c as { text?: string }).text ?? '').includes('一半内容'))).toBe(true)
+    expect(streamError).toBeInstanceOf(Error)
+  })
+})

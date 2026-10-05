@@ -196,6 +196,44 @@ export interface RaccoonAdapterOptions {
   fetchImpl?: typeof fetch
 }
 
+// ── 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）────────
+
+/** 单次用户请求最多尝试的账号数（含首号）。与 buddy 的全池遍历同语义，设上限只为防病态池。 */
+const RACCOON_MAX_ROTATE = 8
+/** 额度耗尽的冷却兜底：raccoon 的额度错误没有可靠重置字段（与 trae 4008 同形），按日配额记 24h。 */
+const RACCOON_QUOTA_COOLDOWN_MS = 24 * 3_600_000
+/** 429 限流冷却：1 小时（与 trae soft-rate 同档）。 */
+const RACCOON_RATE_LIMIT_COOLDOWN_MS = 3_600_000
+
+/**
+ * 该失败是否值得「换下一个账号」重试。
+ *
+ * **可换**：余额/额度耗尽（`14018 Credits exhausted` 等——这是用户报障的
+ * 主场景）、限流（429）、认证（401/403——单号凭据失效时池里可能有别的好号）。
+ *
+ * **不可换**：其余 4xx（400 参数错、404 路由错等）——换号无益，请求本身
+ * 有问题，换谁都会失败；按原错误抛，避免吞成「均不可用」。
+ *
+ * 判据用「文案 + 状态码」双通道（与 `isRateLimited` 同构）：
+ * 状态码 429 恒真；额度类**必须靠文案**（raccoon 的耗尽实测回 402/400，
+ * 没有 HTTP 层的专用状态码——故文案判据是主通道，宽松词表会误伤，
+ * 限定在「积分/额度/余额 + 耗尽」的确定性组合上）。
+ */
+export function shouldRotateRaccoonAccount(errorText: string, status: number): boolean {
+  if (status === 429 || status === 402) return true
+  if (status === 401 || status === 403) return true
+  const lower = errorText.toLowerCase()
+  return (
+    lower.includes('14018')
+    || lower.includes('credits exhausted')
+    || lower.includes('insufficient')
+    || (lower.includes('积分') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('额度') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('余额') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('quota') && (lower.includes('exceeded') || lower.includes('exhausted')))
+  )
+}
+
 /** Raccoon Work 模型适配器。 */
 export class RaccoonAdapter extends LlmAdapter {
   private readonly product: RaccoonProduct
@@ -374,6 +412,23 @@ export class RaccoonAdapter extends LlmAdapter {
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('raccoon: no usable credential; log in first', 'MISSING_CREDENTIAL')
     }
+    /**
+     * 当前请求实际使用的账号 id（请求级轮换的记账键）。
+     *
+     * ⚠️ 语义与 buddy 的 `currentAccountId` 同款：凭据来自池时按
+     * `findAccountIdByCredential` 反查；来自单凭据兜底（池空/旧安装）时
+     * 保持空串——此时轮换自然失效（没有池就没有「下一个号」），行为与
+     * 旧版一致，不会误标。
+     */
+    let activeAccountId = ''
+    if (this.options.accountPool) {
+      try {
+        // 第二参是「凭据唯一标识」字段值（raccoon 用 access_token，与 buddy 系同键）。
+        activeAccountId = await this.options.accountPool.findAccountIdByCredential(
+          this.product.id, credential.access_token,
+        ) ?? ''
+      } catch { /* 反查失败不阻断主路径：轮换退化为「不标记」 */ }
+    }
 
     const messages = serializeMessages(options.messages, imageUrls)
 
@@ -469,8 +524,79 @@ export class RaccoonAdapter extends LlmAdapter {
     }
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+      let errorText = await response.text().catch(() => '')
+      let status = response.status
+      /**
+       * 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）。
+       *
+       * ## 为什么必须有这一段
+       *
+       * `resolveCredential` 从池里取号按**手动顺序**（`getAvailableAccount`
+       * 的既有语义），失败类别不写标记时，下次请求取回的**仍是同一个号**。
+       * 首号余额耗尽（`14018 Credits exhausted`）→ 错误抛给 harness →
+       * 下次请求还是它 ⇒ 用户看到的是「卡死在一个号上」，池里其余账号
+       * 完好却永远轮不到。
+       *
+       * ## 语义对齐 buddy（本项目无感换号的基准实现）
+       *
+       * - **可换号**的失败类别：余额/额度耗尽（14018 / Credits / quota /
+       *   积分不足等）、限流（429）、认证（401/403——单号凭据失效时池里
+       *   可能有别的好号）；**非额度且非限流**（400 参数错等）换号无益，
+       *   按原错误抛（避免把「请求本身有问题」吞成「均不可用」）。
+       * - **每个账号只试一次**：`tried` 传给 `getAvailableAccount`——不排除
+       *   会拿回同一个号（池排序不因失败而变），换号形同虚设。
+       * - **换号前先标记**：`updateModelRateLimit` 把坏号记在该模型上
+       *   （UI 的「限额重置」徽章 + 下次选号自动跳过的依据）。
+       * - **全部试完才报错**，且带**最后一次**的真实原因——笼统的
+       *   「所有账号均不可用」会丢掉服务端真正说的东西（buddy 上同款教训）。
+       * - **冷却时长**：raccoon 的额度错误没有可靠的重置字段（与 trae 4008
+       *   同形），按**日配额**记 24 小时兜底；429 记 1 小时。
+       */
+      if (this.options.accountPool && shouldRotateRaccoonAccount(errorText, status)) {
+        const tried = new Set<string>()
+        if (activeAccountId) tried.add(activeAccountId)
+        const maxRotate = RACCOON_MAX_ROTATE - 1
+        for (let round = 0; round < maxRotate; round++) {
+          // 先标记当前坏号（UI 徽章 + 下次选号跳过的依据）。
+          if (activeAccountId) {
+            await this.options.accountPool.updateModelRateLimit(
+              activeAccountId,
+              options.model,
+              Date.now() + (status === 429 ? RACCOON_RATE_LIMIT_COOLDOWN_MS : RACCOON_QUOTA_COOLDOWN_MS),
+            )
+          }
+          const next = await this.options.accountPool.getAvailableAccount(
+            this.product.id, options.model, tried,
+          )
+          if (!next || tried.has(next.entry.id)) break
+          tried.add(next.entry.id)
+          credential = next.credential as RaccoonCredential
+          activeAccountId = next.entry.id
+          response = await send()
+          if (response.ok) {
+            // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回（既有说明见下）。
+            yield* consumeOpenAiSse(response, { signal: options.signal }, {
+              label: 'raccoon',
+              firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
+              chunkTimeoutMs: resolveChunkTimeoutMs(),
+              ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+            })
+            return
+          }
+          errorText = await response.text().catch(() => '')
+          status = response.status
+          if (!shouldRotateRaccoonAccount(errorText, status)) {
+            // 新账号失败但不是可换号类别：按原错误分类抛出（buddy 同款）。
+            throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
+          }
+        }
+        throw new LlmError(
+          `raccoon: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
+          status === 429 ? 'RATE_LIMIT' : 'QUOTA_EXCEEDED',
+          { status },
+        )
+      }
+      throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
     }
 
     // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回，由 consumeOpenAiSse 处理。

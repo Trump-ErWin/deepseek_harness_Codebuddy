@@ -224,6 +224,39 @@ export interface LoomyAdapterOptions {
   fetchImpl?: typeof fetch
 }
 
+// ── 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）────────
+
+/** 单次用户请求最多尝试的账号数（含首号）。与 buddy/raccoon 同语义，设上限只为防病态池。 */
+const LOOMY_MAX_ROTATE = 8
+/** 额度耗尽的冷却兜底：Loomy 的日额度（每日 5000）无可靠重置字段，按日配额记 24h。 */
+const LOOMY_QUOTA_COOLDOWN_MS = 24 * 3_600_000
+/** 429 限流冷却：1 小时（与 trae soft-rate 同档）。 */
+const LOOMY_RATE_LIMIT_COOLDOWN_MS = 3_600_000
+
+/**
+ * 该失败是否值得「换下一个账号」重试。判据与 {@link shouldRotateRaccoonAccount}
+ * 同构（raccoon 与 loomy 的额度错误形态同族：`14018 Credits exhausted`，
+ * HTTP 层无专用状态码，文案是主通道；词表限「积分/额度/余额 + 不足/耗尽」的
+ * 确定性组合，避免误伤正文里恰好讨论「余额」的 4xx）。
+ *
+ * 导出仅供单测锁定判据本身——只靠调用点顺序兜不住边界（`isRateLimited`
+ * 的 429 边界那次已验证过）。
+ */
+export function shouldRotateLoomyAccount(errorText: string, status: number): boolean {
+  if (status === 429 || status === 402) return true
+  if (status === 401 || status === 403) return true
+  const lower = errorText.toLowerCase()
+  return (
+    lower.includes('14018')
+    || lower.includes('credits exhausted')
+    || lower.includes('insufficient')
+    || (lower.includes('积分') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('额度') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('余额') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('quota') && (lower.includes('exceeded') || lower.includes('exhausted')))
+  )
+}
+
 /** Loomy 模型适配器。chat 端点用 Bearer，业务端点用 token。 */
 export class LoomyAdapter extends LlmAdapter {
   private readonly product: LoomyProduct
@@ -428,6 +461,19 @@ export class LoomyAdapter extends LlmAdapter {
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('loomy: no usable credential; log in first', 'MISSING_CREDENTIAL')
     }
+    /**
+     * 当前请求实际使用的账号 id（请求级轮换的记账键）。语义与 raccoon 同款：
+     * 按 access_token 反查池内条目；单凭据兜底时保持空串（无池即无「下一个号」，
+     * 轮换自然失效，不误标）。
+     */
+    let activeAccountId = ''
+    if (this.options.accountPool) {
+      try {
+        activeAccountId = await this.options.accountPool.findAccountIdByCredential(
+          this.product.id, credential.access_token,
+        ) ?? ''
+      } catch { /* 反查失败不阻断主路径 */ }
+    }
 
     const messages = serializeMessages(options.messages, imageUrls)
 
@@ -521,11 +567,79 @@ export class LoomyAdapter extends LlmAdapter {
         throw new LlmError('loomy: credential expired and refresh failed', 'AUTH', { status: response.status })
       }
       response = await send(refreshed.access_token)
+      if (response.ok) credential = refreshed
     }
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+      let errorText = await response.text().catch(() => '')
+      let status = response.status
+      /**
+       * 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）。
+       *
+       * ## 为什么余额选号器救不了这个场景
+       *
+       * `loomy-balance-selector` 只在**取号时**按余额分档——余额查询与
+       * 实际扣费是两个时刻：查询时有钱、推理请求打过去时上游判额度耗尽
+       * （`14018 Credits exhausted`，日额度按次计费）。错误抛给 harness 后，
+       * 下次取号余额查询仍返回同样的排序，**同一个号被再次选中** ⇒
+       * 「卡死在一个号上」，直到它的余额 API 也刷新为止。
+       *
+       * ## 语义对齐 buddy
+       *
+       * - **可换**：额度耗尽（14018 / Credits / 积分不足等）、429；
+       *   **不可换**：其余 4xx（换号无益，按原错误抛）。
+       * - **每个账号只试一次**（`tried` 传池）；**换号前先标记**该模型
+       *   （24h 兜底——Loomy 日额度无可靠重置字段，与 trae 4008 同形）。
+       * - **全部试完才报错**，带最后一次的真实原因。
+       * - ⚠️ 换到的号**绕过余额选号器**（直接用池的候选凭据）——选号器的
+       *   排序在「有余额的号」内部才有意义，此处候选已明确是坏号链，
+       *   池的手动顺序就是最合理的次序。
+       */
+      if (this.options.accountPool && shouldRotateLoomyAccount(errorText, status)) {
+        const tried = new Set<string>()
+        if (activeAccountId) tried.add(activeAccountId)
+        const maxRotate = LOOMY_MAX_ROTATE - 1
+        for (let round = 0; round < maxRotate; round++) {
+          if (activeAccountId) {
+            await this.options.accountPool.updateModelRateLimit(
+              activeAccountId,
+              options.model,
+              Date.now() + (status === 429 ? LOOMY_RATE_LIMIT_COOLDOWN_MS : LOOMY_QUOTA_COOLDOWN_MS),
+            )
+          }
+          const next = await this.options.accountPool.getAvailableAccount(
+            this.product.id, options.model, tried,
+          )
+          if (!next || tried.has(next.entry.id)) break
+          tried.add(next.entry.id)
+          const nextCred = next.credential as unknown as LoomyCredential
+          if (nextCred === undefined || nextCred.access_token.length === 0) break
+          activeAccountId = next.entry.id
+          response = await send(nextCred.access_token)
+          if (response.ok) {
+            credential = nextCred
+            // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回（既有说明见下）。
+            yield* consumeOpenAiSse(response, { signal: options.signal }, {
+              label: 'loomy',
+              firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
+              chunkTimeoutMs: resolveChunkTimeoutMs(),
+              ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+            })
+            return
+          }
+          errorText = await response.text().catch(() => '')
+          status = response.status
+          if (!shouldRotateLoomyAccount(errorText, status)) {
+            throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
+          }
+        }
+        throw new LlmError(
+          `loomy: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
+          status === 429 ? 'RATE_LIMIT' : 'QUOTA_EXCEEDED',
+          { status },
+        )
+      }
+      throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
     }
 
     // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回，由 consumeOpenAiSse 处理。

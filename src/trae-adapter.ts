@@ -189,6 +189,25 @@ const TRAE_MAX_ROTATE = 3
 const TRAE_ROTATABLE_STREAM_ERROR = 'TRAE_ROTATABLE_STREAM_ERROR'
 
 /**
+ * 哨兵错误的**结构化随行物**（2026-10-05 加）。
+ *
+ * 为什么不用 `LlmErrorOptions` 的自由字段：那是 dsh-llm 的**官方校验契约**
+ * （只有 status / providerRetryAfterMs / requestId，塞 `{kind}` 会 TS 报错）；
+ * 而 `Error.cause` 的语义本就是「附加结构化诊断」，是标准通道。
+ * 外层换号循环从 `cause` 里取回流内 errorCode，重分类后按类别定冷却时长
+ * （详见使用处注释）。
+ */
+class TraeStreamErrorCause extends Error {
+  constructor(
+    readonly code: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'TraeStreamErrorCause'
+  }
+}
+
+/**
  * 流内错误是否**值得换号**。
  *
  * 与 HTTP 层共用同一张判据表（{@link classifyTraeError}），避免两处各写一套
@@ -1146,11 +1165,23 @@ export class TraeAdapter extends LlmAdapter {
           // 标记当前账号在本模型上受限（UI 据此亮「限额重置」徽章）。
           //
           // ⚠️ 与 HTTP 层同款：只标记**该模型**，该账号在别的模型上仍可用。
+          //
+          // ⚠️ 冷却时长必须**按类别**取（2026-10-05 修）：从哨兵错误的
+          // `cause` 里取回流内 errorCode，重分类后走与 HTTP 层**同一张**
+          // `traeCooldownFor` 表——quota-exceeded 24h、hard-plan 7d、
+          // soft-rate 1h。旧实现一律 1h 兜底，额度耗尽的账号 1 小时后被
+          // 选回、又 4008（同款缺陷的流内第二实例，见抛出点注释）。
           if (currentAccountId.length > 0) {
+            const cause = (error as { cause?: unknown }).cause
+            const streamCode = cause instanceof TraeStreamErrorCause ? cause.code : undefined
+            const kind = streamCode !== undefined
+              ? classifyTraeError(0, JSON.stringify({ code: streamCode, message: cause?.message }))
+              : undefined
+            const cooldownMs = kind !== undefined ? traeCooldownFor(kind) : TRAE_RATE_LIMIT_FALLBACK_MS
             await this.options.accountPool.updateModelRateLimit(
               currentAccountId,
               options.model,
-              Date.now() + TRAE_RATE_LIMIT_FALLBACK_MS,
+              Date.now() + cooldownMs,
             )
           }
           // 取下一个账号。
@@ -1532,7 +1563,17 @@ export class TraeAdapter extends LlmAdapter {
                   if (ev.errorCode !== undefined && ev.errorMessage !== undefined) {
                     const message = traeStreamErrorMessage(ev.errorCode, ev.errorMessage, options.model)
                     if (isRotatableStreamError(ev.errorCode) && !gotAnyContent) {
-                      throw new LlmError(message, TRAE_ROTATABLE_STREAM_ERROR)
+                      // ⚠️ **errorCode 必须随哨兵带出**（2026-10-05 修）：外层标记
+                      // 冷却时长按类别取（quota 24h / soft 1h）。`LlmErrorOptions`
+                      // 是**官方校验契约**（只有 status/providerRetryAfterMs/requestId，
+                      // 塞自由字段会被 `LlmError` 构造器拒绝）⇒ 走 `cause` 通道：
+                      // Error.cause 本就用于「附加结构化诊断」，把 errorCode 编码进
+                      // 一个轻量 Error 对象。裸 message 会丢掉类别 ⇒ 外层只能退回
+                      // 1 小时兜底 ⇒ 流内额度耗尽的账号 1h 后又被选回、又 4008
+                      // （HTTP 层同款缺陷已于 09-26 修过，流内侧漏改 = 第二实例）。
+                      throw new LlmError(message, TRAE_ROTATABLE_STREAM_ERROR, {
+                        cause: new TraeStreamErrorCause(ev.errorCode, ev.errorMessage),
+                      })
                     }
                     // 4001（模型不可调用）不换号：换账号也是同一模型被拒。
                     throw new LlmError(
