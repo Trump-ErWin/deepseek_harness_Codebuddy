@@ -312,15 +312,25 @@ export const PERMANENT_LOCK_EXPIRING_WINDOW_DAYS = 15;
 /**
  * 该 provider 是否支持「锁定永久积分」（只消耗会近期作废的积分）。
  *
- * ⚠️ 目前三家具备，**理由各不相同**：
- * - `loomy`：服务端直接给两个池 —— `dailyBalance`（**当日**到期，次日重发）
- *   与 `balance`（注册奖励 + 新手任务，不过期）。
- * - `buddy` / `workbuddy`：一个账号常同时有多个资源包，**没有现成字段**，
- *   要按包的 `DeductionEndTime` 距今是否满 {@link PERMANENT_LOCK_EXPIRING_WINDOW_DAYS}
- *   天现算（实测国际版是「Bonus Pack 14 天 + Free Plan 扣费截止 8 年后」，
- *   中国版是「体验版套餐 + 30/365 天的拉新与裂变包」）。
+ * ⚠️ 目前五家具备，**依据分两类**：
  *
- * 其余渠道的积分模型里没有「会不会作废」这一层区分，登记进来只会多一个无效按钮。
+ * **服务端直接给两个命名池**：
+ * - `loomy`：`dailyBalance`（**当日**到期，次日重发）与 `balance`（注册奖励 + 新手任务，不过期）。
+ *
+ * **按逐包到期时间现算**（同一个 `splitBuddyCreditsByExpiry`，与 provider 无关）：
+ * - `buddy` / `workbuddy`：一个账号常同时有多个资源包，按包的 `DeductionEndTime`
+ *   距今是否满 {@link PERMANENT_LOCK_EXPIRING_WINDOW_DAYS} 天现算（实测国际版是
+ *   「Bonus Pack 14 天 + Free Plan 扣费截止 8 年后」，中国版是「体验版套餐 +
+ *   30/365 天的拉新与裂变包」）。
+ * - `trae`：条目级 `expire_time`（秒级 Unix 时间戳，见 `src/trae-credits.ts` 的取证注释）。
+ * - `lobsterai`：`expiresAt`（ISO 8601，已归一化到 `deductionEndTime`）。
+ *
+ * ⚠️ 后两家**没有「每日额度 / 永久积分」两个命名池**，但同样能按到期时间分桶 ——
+ * 对锁定功能而言，判据只需「会不会马上作废」，与池的名字无关。它们的余额面板
+ * 也早已用同一个窗口分「长期 / 临时」（见 `src/jet-hub-rpc.ts` 的 `credits.balances`）。
+ *
+ * 其余渠道的积分模型里没有逐包到期时间（或根本没有资源包列表），
+ * 分不出两桶，登记进来只会多一个无效按钮。
  *
  * ⚠️ 必须与后端 `src/jet-hub-rpc.ts` 的 `PERMANENT_LOCK_PROVIDERS` 一致：
  * 不一致会出现「按钮渲染出来了，点了却报 bad-request」。
@@ -328,7 +338,8 @@ export const PERMANENT_LOCK_EXPIRING_WINDOW_DAYS = 15;
  * 为 false 时面板**不得**渲染该按钮，也不得发起 `credits.permanentLock`。
  */
 export function supportsPermanentLock(provider) {
-  return provider === 'loomy' || provider === 'buddy' || provider === 'workbuddy';
+  return provider === 'loomy' || provider === 'buddy' || provider === 'workbuddy'
+    || provider === 'trae' || provider === 'lobsterai'
 }
 
 /**
@@ -369,7 +380,12 @@ export function supportsCreditPackageList(provider) {
  *          锁定成功提示 / 解锁成功提示。
  */
 export function permanentLockCopy(provider, windowDays) {
-  if (provider === 'buddy' || provider === 'workbuddy') {
+  // ⚠️ 判据是「**是否按到期时间分桶**」，不是「是不是 buddy」：trae / lobsterai 与
+  // buddy 系走同一套 `splitBuddyCreditsByExpiry`，窗口天数对它们同样有意义，
+  // 故必须共用这套带天数的文案（否则会错误地落到下面 Loomy 那套「每日赠送额度」文案，
+  // 而它们根本没有「每日额度」这个概念）。
+  if (provider === 'buddy' || provider === 'workbuddy'
+    || provider === 'trae' || provider === 'lobsterai') {
     const days = normalizeWindowDays(windowDays);
     return Object.freeze({
       days,
