@@ -184,7 +184,9 @@ describe('mergeClineModels', () => {
 
   it('兜底表里的元数据被保留（上下文窗口 / 输出上限 / 图片能力）', () => {
     const models = mergeClineModels(CLINE, remote)
-    const entry = models.find((m) => m.id === 'cline-free/deepseek-v4.1-flash')
+    // ⚠️ 用**仍在兜底表**的条目断言：`cline-free/deepseek-v4.1-flash` 已于
+    // 2026-10-05 被 Cline 下架、随之从兜底表删除（见 cline-product.ts）。
+    const entry = models.find((m) => m.id === 'cline-free/mimo-v2.6-flash')
     expect(entry?.contextWindow).toBe(1_048_576)
     expect(entry?.maxTokens).toBe(131_072)
     expect(entry?.supportsImage).toBe(true)
@@ -212,8 +214,10 @@ describe('mergeClineModels', () => {
   it('两个来源都为空时仍返回兜底表（离线可用）', () => {
     const models = mergeClineModels(CLINE, { freeIds: [], remoteIds: [], entries: [] })
     expect(models.length).toBe(CLINE.fallbackModels.length)
-    // 4 = 远端 `free` 数组的当前条数（2026-10-03 复测；gemini-3.8-flash 已下线）。
-    expect(models.filter((m) => m.isFree)).toHaveLength(4)
+    // 兜底表当前全是免费模型（2026-10-05 复测：`free` 数组 3 条）。
+    // ⚠️ 断言与表联动而非写死数字：上游每次撤免费模型都要同步这张表，
+    // 写死会让「同步表」这个动作连带弄红一个无关的用例。
+    expect(models.filter((m) => m.isFree)).toHaveLength(CLINE.fallbackModels.length)
   })
 
   it('`clinePass` 里的订阅制模型**不**被判为免费', () => {
@@ -221,5 +225,98 @@ describe('mergeClineModels', () => {
     const models = mergeClineModels(CLINE, remote)
     const pass = models.find((m) => m.id === 'cline-pass/glm-5.3')
     expect(pass?.isFree).toBe(false)
+  })
+})
+
+/**
+ * ⚠️ **核心回归**：兜底表里的**已下架**条目不得被「复活」。
+ *
+ * 真实报障（2026-10-05）：`cline-free/deepseek-v4.1-flash` 被 Cline 从 `free`
+ * 数组移除后，模型列表里**仍然**出现、**仍然**标着「免费」，用户选中即回
+ * `404 {"error":"model not found"}`。根因是合并时把兜底表**无条件整表并回**
+ * （展示需要），且 `isClineFreeModel` 的判定回落到兜底表的 `isFree`。
+ *
+ * ⚠️ 该缺陷**重启不会消失**：合并发生在每次全新加载时。
+ *
+ * 覆盖矩阵（含可能误伤的降级态）：
+ * | 远端状态 | 期望 |
+ * |---|---|
+ * | 健康（`entries` 非空） | 丢弃远端不认识的兜底条目 |
+ * | 离线（三者全空） | **整表保留**（免费模型的唯一来源） |
+ * | `recommended-models` 挂、`/models` 通 | **整表保留**（免费集合权威性未知） |
+ * | 免费模型被全部下架 | 丢弃全部兜底免费条目 |
+ */
+describe('mergeClineModels —— 兜底表不得复活已下架模型', () => {
+  /** 2026-10-05 复测的真实 `free` 数组（3 条）。 */
+  const LIVE_FREE = [
+    'stealth/space-bunny-alpha',
+    'cline-free/mimo-v2.6-flash',
+    'cline-free/muse-spark-1.3-contributor',
+  ]
+  const liveRemote = {
+    freeIds: LIVE_FREE,
+    remoteIds: ['fireworks/ember-1'],
+    entries: LIVE_FREE.map((id) => ({ id })),
+  }
+
+  it('远端健康时，兜底表里「远端已不认识」的条目不再进列表', () => {
+    const models = mergeClineModels(CLINE, liveRemote)
+    const removed = 'cline-free/deepseek-v4.1-flash'
+    expect(models.some((m) => m.id === removed)).toBe(false)
+    // 强调：免费判定**仍**认它（前缀分支），所以它没进列表**只**能是因为被过滤
+    // —— 否则这条断言会在「判定被顺带改坏」时假绿。
+    expect(isClineFreeModel(removed)).toBe(true)
+  })
+
+  it('远端健康时，在册的 3 个免费模型都在且标免费', () => {
+    const models = mergeClineModels(CLINE, liveRemote)
+    const byId = new Map(models.map((m) => [m.id, m]))
+    for (const id of LIVE_FREE) expect(byId.get(id)?.isFree, id).toBe(true)
+  })
+
+  it('已下架条目同时从兜底表删除（数据与机制双向锁）', () => {
+    expect(CLINE.fallbackModels.some((m) => m.id === 'cline-free/deepseek-v4.1-flash')).toBe(false)
+  })
+
+  it('离线（三者全空）时整表保留 —— 此时兜底表是免费模型的唯一来源', () => {
+    const models = mergeClineModels(CLINE, { freeIds: [], remoteIds: [], entries: [] })
+    expect(models.map((m) => m.id).sort()).toEqual(CLINE.fallbackModels.map((m) => m.id).sort())
+  })
+
+  it('`recommended-models` 挂掉但 `/models` 通时，兜底免费模型不得被误删', () => {
+    // ⚠️ 最容易误伤的降级态：`/models` 有 460 个 id，若判据写成「远端有数据就
+    // 过滤」，会把免费兜底整表删光 —— 用户明明还能用免费模型，列表里却一个都没有。
+    const models = mergeClineModels(CLINE, {
+      freeIds: [],
+      remoteIds: ['fireworks/ember-1'],
+      entries: [],
+    })
+    for (const model of CLINE.fallbackModels) {
+      expect(models.some((m) => m.id === model.id), model.id).toBe(true)
+    }
+  })
+
+  it('免费模型被上游**全部**下架时，兜底免费条目全部丢弃', () => {
+    // 判据必须用 `entries` 非空（`recommended-models` 成功下发）而非 `freeIds`
+    // 非空：后者在「全撤」时也合法为空，只看它会把这种情况误判成「端点挂掉」，
+    // 反而保留整张已经全部失效的兜底表。
+    const models = mergeClineModels(CLINE, {
+      freeIds: [],
+      remoteIds: [],
+      entries: [{ id: 'anthropic/claude-sonnet-5.5' }],
+    })
+    expect(models.filter((m) => m.isFree)).toHaveLength(0)
+    expect(models.some((m) => m.id === 'anthropic/claude-sonnet-5.5')).toBe(true)
+  })
+
+  it('远端下发兜底表里没有的模型时照常列出（过滤不会误伤新模型）', () => {
+    const models = mergeClineModels(CLINE, {
+      freeIds: ['brand-new/free-x'],
+      remoteIds: [],
+      entries: [{ id: 'brand-new/free-x', name: 'Brand New' }],
+    })
+    const entry = models.find((m) => m.id === 'brand-new/free-x')
+    expect(entry?.isFree).toBe(true)
+    expect(entry?.name).toBe('Brand New')
   })
 })

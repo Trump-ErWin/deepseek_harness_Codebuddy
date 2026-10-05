@@ -259,6 +259,24 @@ const STYLES = `
 .dim-jh-modelRow:hover { background: var(--dsw-alias-bg-layer-2, #f7f8fa); }
 /* 已关闭的模型整体降透明度：一眼能看出哪些被隐藏了 */
 .dim-jh-modelRow[data-disabled="true"] .dim-jh-modelInfo { opacity: 0.5; }
+
+/* 「供应商开关」弹窗的行拖拽（2026-10-06）。
+   视觉语言与账号卡片（.dim-jh-accountCard[data-dragging] 系）完全一致：
+   源行淡出虚线、落点行画插入线。
+   ⚠️ 这几行**必须带 .dim-jh-modal 作用域前缀**：.dim-jh-modelRow 是共享类名，
+   ModelToggle（模型列表弹窗）与 GatewayPanel 也在用它们。那些行不设
+   data-dropBefore/After，伪元素无 content 故不渲染，但给它们挂 position:relative
+   仍是作用域过宽 —— 将来任一处加 absolute 子元素都会莫名受影响。
+   与既有的 .dim-jh-modal .dim-jh-probeNotice 同一收窄惯例。
+   ⚠️⚠️ 本文件整体是一个 JS **模板字符串**：注释里**禁止**出现反引号，
+   否则会提前终止字符串、把后面的 CSS 当成代码解析（实测报 TS2304）。 */
+.dim-jh-modal .dim-jh-modelRow { position: relative; }
+.dim-jh-modal .dim-jh-modelRow[data-dragging="true"] { opacity: 0.4; border-style: dashed; }
+.dim-jh-modal .dim-jh-modelRow[data-dropBefore="true"]::before { content: ''; position: absolute; left: 0; right: 0; top: -5px; height: 3px; border-radius: 2px; background: #1677ff; }
+.dim-jh-modal .dim-jh-modelRow[data-dropAfter="true"]::after { content: ''; position: absolute; left: 0; right: 0; bottom: -5px; height: 3px; border-radius: 2px; background: #1677ff; }
+/* 拖拽柄在弹窗行里略收窄：行高比账号卡片矮（padding 7px vs 14px），
+   16px 宽的柄会顶着模型名，缩到 14px 并把 gap 让出来。 */
+.dim-jh-modal .dim-jh-modelRow .dim-jh-dragHandle { width: 14px; }
 .dim-jh-modelInfo { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
 /* 名称与 id 都必须能收缩（min-width: 0 + 可收缩的 flex-basis），否则长内容会
    顶宽整行。展示名优先保留，故 id 另加 max-width 上限。
