@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { LoomyAdapter, parseLoomyRemoteModels } from '../../src/loomy-adapter.js'
 import type { LoomyCredential } from '../../src/loomy.js'
@@ -420,5 +420,172 @@ describe('LoomyAdapter.providerInfo', () => {
 
   it('provider 非法时回退到产品 id（避免 undefined.toUpperCase 崩）', () => {
     expect(makeAdapter().providerInfo(undefined as never).id).toBe('loomy')
+  })
+})
+
+/**
+ * 请求级账号轮换（★ 2026-10-05，用户报障「余额用完一个号就卡死」）。
+ *
+ * ## 为什么余额选号器救不了
+ *
+ * `loomy-balance-selector` 只在**取号时**按余额分档；余额查询与实际扣费是
+ * 两个时刻——查询时有钱、推理时上游报 `14018`，错误直接抛 harness，
+ * 下次取号还是同一个号 ⇒ 「卡死在一个号上」。
+ *
+ * 本 describe 锁定：HTTP 层额度耗尽 → 标记坏号该模型 24h → `tried` 换下一个
+ * → 重发成功；全部耗尽才报错且带最后一次真实原因；非额度类 4xx 不换号。
+ * 语义与 raccoon / buddy 三处对齐（同一张判据形状，各家用各家的词表）。
+ */
+describe('LoomyAdapter 请求级账号轮换（余额耗尽无感切号）', () => {
+  const CRED_A: LoomyCredential = { access_token: 'tok-A', userid: 'ua', phone: '13800000001' }
+  const CRED_B: LoomyCredential = { access_token: 'tok-B', userid: 'ub', phone: '13800000002' }
+
+  function makePoolStub() {
+    const marks: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    const picks: Array<ReadonlySet<string> | undefined> = []
+    const accounts = [
+      { id: 'loomy-A', cred: CRED_A },
+      { id: 'loomy-B', cred: CRED_B },
+    ]
+    const pool = {
+      updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+        marks.push({ accountId, modelId, resetAtMs })
+      },
+      getAvailableAccount: async (_provider: string, _model: string, exclude?: ReadonlySet<string>) => {
+        picks.push(exclude)
+        for (const a of accounts) {
+          if (exclude?.has(a.id)) continue
+          return { entry: { id: a.id }, credential: a.cred }
+        }
+        return null
+      },
+      findAccountIdByCredential: async (_provider: string, identity: string) =>
+        accounts.find((a) => a.cred.access_token === identity)?.id ?? '',
+    }
+    return { pool, marks, picks }
+  }
+
+  const sseOk = () => new Response(
+    'data: {"choices":[{"index":0,"delta":{"content":"从二号账号返回"}}]}\n\ndata: [DONE]\n\n',
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  )
+
+  it('★ 一号额度耗尽（14018）→ 标记该模型 + 切二号重发成功', async () => {
+    const { pool, marks, picks } = makePoolStub()
+    const seenAuth: string[] = []
+    let call = 0
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      call += 1
+      seenAuth.push(String(new Headers(init?.headers).get('Authorization') ?? ''))
+      if (call === 1) {
+        return new Response(JSON.stringify({ error: { message: '14018 Credits exhausted' } }), { status: 402 })
+      }
+      return sseOk()
+    }) as unknown as typeof fetch
+
+    const adapter = makeAdapter({
+      // 首发凭据 = 池的第一号（对齐生产：resolveCredential 从池选号）。
+      resolveCredential: async () => CRED_A,
+      accountPool: pool as never,
+      fetchImpl: fetcher,
+    })
+    const chunks: unknown[] = []
+    for await (const c of adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) chunks.push(c)
+
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(seenAuth[0]).toContain('tok-A')
+    expect(seenAuth[1]).toContain('tok-B')
+    expect(chunks.some((c) => (c as { type?: string }).type === 'text-delta')).toBe(true)
+    expect(marks.some((m) => m.accountId === 'loomy-A' && m.modelId === 'MiniMax-M3')).toBe(true)
+    expect(picks[0]?.has('loomy-A') ?? false).toBe(true)
+  })
+
+  it('★ 两号都耗尽 → 报「所有账号均不可用」并带最后一次的真实原因', async () => {
+    const { pool } = makePoolStub()
+    const fetcher = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const auth = String(new Headers(init?.headers).get('Authorization') ?? '')
+      return new Response(
+        JSON.stringify({ error: { message: `14018 exhausted (${auth.includes('tok-B') ? 'B' : 'A'})` } }),
+        { status: 402 },
+      )
+    }) as unknown as typeof fetch
+
+    const adapter = makeAdapter({ resolveCredential: async () => CRED_A, accountPool: pool as never, fetchImpl: fetcher })
+    const error = await adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    } as never).next().then(() => null).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain('所有账号')
+    expect((error as Error).message).toContain('B')
+  })
+
+  it('非额度类 4xx（400 参数错）不换号', async () => {
+    const { pool, picks } = makePoolStub()
+    const fetcher = (async () =>
+      new Response('{"error":{"message":"param is invalid"}}', { status: 400 })) as unknown as typeof fetch
+    const adapter = makeAdapter({ resolveCredential: async () => CRED_A, accountPool: pool as never, fetchImpl: fetcher })
+    const error = await adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    } as never).next().then(() => null).catch((e: unknown) => e)
+
+    expect((error as Error).message).toContain('param is invalid')
+    // 不换号：pool 的取号一次都没被调用（stream 里轮换块整体跳过；
+    // findAccountIdByCredential 会被调一次——那是记账键反查，不是换号）。
+    expect(picks.length).toBe(0)
+  })
+
+  /**
+   * ★ 认证类（401/403）**换号但不写冷却标记** —— 真实事故回归（2026-10-06）。
+   *
+   * 上游网关对全池回 `401 + authorization_verify_error`（网关侧授权故障）。
+   * 旧实现把 401 也写 24h 冷却 ⇒ 一个请求连试 6 个号、每个封 24h ⇒
+   * **整个 provider 被封一天**，下一次请求报 `no usable credential; log in first`。
+   * 语义对齐 buddy：只有限流类写标记，认证类只换号。
+   */
+  it('★ 401 授权失败：换号但绝不写冷却标记（全池失败也不写）', async () => {
+    const { pool, marks } = makePoolStub()
+    let call = 0
+    const fetcher = vi.fn(async () => {
+      call += 1
+      // 一号 401；二号正常
+      if (call === 1) {
+        return new Response(JSON.stringify({ code: 200003, message: 'authorization_verify_error' }), { status: 401 })
+      }
+      return new Response(
+        'data: {"choices":[{"index":0,"delta":{"content":"二号正常"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    }) as unknown as typeof fetch
+
+    const adapter = makeAdapter({ resolveCredential: async () => CRED_A, accountPool: pool as never, fetchImpl: fetcher })
+    const chunks: unknown[] = []
+    for await (const c of adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) chunks.push(c)
+
+    expect(fetcher.mock.calls.length).toBeGreaterThan(1)
+    expect(chunks.some((c) => (c as { type?: string }).type === 'text-delta')).toBe(true)
+    expect(marks).toEqual([])
+  })
+
+  it('★ 401 打遍全池：不留任何标记（池保持可用）', async () => {
+    const { pool, marks } = makePoolStub()
+    const fetcher = (async () =>
+      new Response(JSON.stringify({ code: 200003, message: 'authorization_verify_error' }), { status: 401 })) as unknown as typeof fetch
+    const adapter = makeAdapter({ resolveCredential: async () => CRED_A, accountPool: pool as never, fetchImpl: fetcher })
+    const error = await adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    } as never).next().then(() => null).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(Error)
+    expect(marks).toEqual([])
   })
 })

@@ -32,8 +32,11 @@ const noSuchRuntimeInfo = join(fallbackStateDir, 'no-such-runtime-info')
 export default defineConfig({
   test: {
     include: ['tests/unit/**/*.spec.ts'],
+    // （PR #64 审查 3 已撤 exclude）：cline-icon / loomy-docs 两个 spec 自带
+    // skipIf/existsSync 优雅降级，依赖缺失时「通过 + 跳过」而非失败 ⇒
+    // 无需在配置里排除——排除反而把回归价值藏掉了。
     environment: 'node',
-    // ⚠️ 必须排在 env 之前生效：它按测试文件重设状态目录（见文件头）。
+    // ⚠️ 必须排在 env 之��生效：它按测试文件重设状态目录（见文件头）。
     setupFiles: ['./tests/setup-isolation.ts'],
     env: {
       DSH_JET_HUB_STATE_DIR: fallbackStateDir,

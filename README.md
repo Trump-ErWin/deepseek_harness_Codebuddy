@@ -2165,6 +2165,18 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
 > 尚未实现：真实 CN IDE 的 `llm_utils_chat` / `create_agent_task` **请求体是加密的**
 > （配 `x-helios` / `x-medusa` / `x-neptune`）；实测仅换版本头解不开依赖它的模型
 > （`deepseek-v4-flash` 等）。属独立工作量。
+>
+> 🚫 **2026-09-24 实测更正（勿据此去啃加密通道）**：上面这条与
+> `docs/trae-integration-plan.md:235` 是**另一条协议**的描述——加密端点属 **CN IDE
+> 3.3.94 新协议**，而本插件走**旧 SOLO 协议**，两者不是同一条路。
+> **实测 `deepseek-v4.1-flash` 在现有 SOLO 链路上就已可用**：走现成的
+> `traeSOLOHeaders` + `transformToSOLOBody`（`function:"solo_agent"`）真发请求
+> ⇒ **HTTP 200**、`event:done` 正常、`token_usage` 正常回传，模型自报
+> `deepseek-v4.1-flash`。⇒ **做 4.1 不需要实现 `x-helios`/`x-medusa`/`x-neptune`**。
+> ⚠️ 若手工拼 body 报 `4001 expr_path=usage missing required parameter`，**不是缺
+> `usage` 字段也不是加密问题**，而是没走 `transformToSOLOBody`（它注入 `config_name`
+> 并规范化 content）；`traeSOLOHeaders` 第 3 参 `stream` 必须为 `true`。
+> （对照：已知可用的 `glm-5.3` 用同样错误构造报**完全相同**的错。）
 
 > 实现依据见 `docs/trae-integration-plan.md`（协议逆向自
 > [`trae2api`](https://github.com/Sliverkiss/traework2api) 及其衍生项目）。
