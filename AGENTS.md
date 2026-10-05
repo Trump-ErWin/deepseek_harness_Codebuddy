@@ -2896,8 +2896,8 @@ re-authenticate your Cline account."* —— 与真实原因**毫不相干**，�
 
 ### ⚠️ 坑 2：免费模型是**独立 id**，且只由 `recommended-models` 下发
 
-`cline-free/deepseek-v4.1-flash`（免费）与 `deepseek/deepseek-v4.1-flash`
-（按量计费）是**两个不同条目**。绝不可用「名字含 deepseek」之类模糊匹配判免费 ——
+`cline-free/mimo-v2.6-flash`（免费）与 `xiaomi/mimo-v2.6-flash`
+（按量计费）是**两个不同条目**。绝不可用「名字含 mimo」之类模糊匹配判免费 ——
 那会让用户按免费预期使用却被计费。
 
 两个端点**必须都打**，理由各有实测依据：
@@ -2919,9 +2919,31 @@ re-authenticate your Cline account."* —— 与真实原因**毫不相干**，�
 ⚠️ **兜底表要与远端 `free` 数组同步**：sidecar 内嵌目录里**没有** `cline-free/*`
 与 `stealth/space-bunny-alpha`（只有远端 `free` 下发），故 `cline-product.ts` 的兜底表
 手工补上它们 —— 否则离线时用户看不到免费模型。
-⚠️ 2026-10-03 复测：`free` **只剩 4 条**，`cline-free/gemini-3.8-flash` 已被 Cline
-下线（直连回 `404 {"error":"model not found"}`），兜底表、单测与 e2e 清单已同步删除它。
-**别照抄旧版本的表把它加回来**。
+
+⚠️⚠️ **兜底表是编译期快照，会落后 —— 且陈旧条目曾让用户「选中即 404」**
+（真实报障 2026-10-05）：`cline-free/deepseek-v4.1-flash` 被移出远端 `free` 数组
+（**3 条**）后，仍以「免费」出现在模型列表里，用户选中即回
+`404 {"error":"model not found"}`。**重启不会消失** —— 合并发生在每次全新加载时。
+
+根因：`mergeClineModels` **无条件**把整张兜底表并回结果，且
+`isClineFreeModel` 对 `cline-free/` 前缀恒判免费。
+**已修**（本分支）：兜底表改为**有条件并入** —— 远端成功下发目录时丢弃
+「远端已不认识」的条目，只在远端不可用时整表兜底。
+判据用 `remote.entries.length > 0` 而**非** `freeIds.length > 0`：后者在
+「上游把免费模型**全部**撤掉」时也合法为空，只看它会把「全撤」误判成
+「端点挂掉」，反而保留整张已失效的表。
+
+⚠️ **已发生两次，同步清单**（**别照抄旧版本的表把它们加回来**）：
+`gemini-3.8-flash`（2026-10-03）、`deepseek-v4.1-flash`（2026-10-05）。
+判定「某个兜底免费模型是否已被下架」用 **`pnpm test:e2e:cline`**（只读、零额度）。
+
+⚠️ **审计过全部 13 张兜底表，不能一刀切**（2026-10-05）：只有 cline 是「**并入型**」
+（`mergeClineModels` 无条件并回）故有此缺陷；buddy / codebuddy / workbuddy 是
+「**白名单型**」（`reconcileWithFallback` **以兜底表为准**，做目录比对反而会删掉
+「你权用、只是 CLI token 看不到」的可用模型 —— 见 `product.ts` 里 `hy4-preview`
+的补录注释）；lobsterai / loomy / minimax / raccoon / trae / zcode / gemini /
+opencode 是「**仅回退型**」（`remoteModels ?? fallback`，远端整体替换，无双源合并）；
+qoder / qoder-cn 端点是 WASM 签名、兜底表是唯一来源，无数据可比对。
 
 ⚠️ **`clinePass` 不是免费集合**：它是 Cline Pass 订阅制模型（`cline-pass/*`），
 按订阅额度计费。实测 14 个，误判为免费会误导用户。
