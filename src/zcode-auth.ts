@@ -1,14 +1,22 @@
 /**
  * ZCode 认证/凭据服务（`ctx.zcodeAuth`）。
  *
+ * ## 凭据的**唯一**来源：插件自己的授权流
+ *
+ * 用户在 Jet Hub 面板点「添加账号」→ 走官方 CLI 设备授权流
+ * （`zcode-login.ts`）→ 凭据写进 `ctx.credentials`。
+ * **不读取本机 ZCode 客户端的任何数据**（2026-10-05 决策，理由见
+ * `zcode.ts` 文件头）。
+ *
  * ## 与其它 auth 服务的关键差异
  *
- * 其它 `ctx.xxxAuth` 管「浏览器登录 → 拿 token → 续期」。
- * ZCode **没有登录流程** —— 用户在官方 ZCode 客户端里登录一次，
- * 凭据就落在磁盘上（`~/.zcode/v2/credentials.json`，AES-256-GCM 加密）。
+ * 其它 `ctx.xxxAuth` 管「浏览器登录 → 拿 token → **续期**」。
+ * ZCode 的凭据是**静态**的（JWT 的 payload 里没有 `exp`）⇒ **不可续期**，
+ * 失效时上游回 401/1002，由适配器归为 AUTH 提示用户重新登录。
+ *
  * 本服务的职责是：
  *
- * 1. **读凭据**：解密磁盘凭据（`zcode.ts`）—— **不需要任何实例在跑**
+ * 1. **登录与存凭据**（`startLogin` / `login`），含顺带换取 coding-plan key
  * 2. **探活**：凭据是否可用（能不能拿到额度）
  * 3. **额度**：`billing/balance`
  * 4. **签到**：补激活上报 → preview → claim（每个 plan 单独 mint captcha）
@@ -37,7 +45,6 @@ import type { ClaimOutcome } from './credits.js'
 import {
   isUsableZcodeCredential,
   phoneFromUserId,
-  readZcodeCredential,
   type ZcodeCredential,
 } from './zcode.js'
 import { ZCODE, type ZcodeProduct, type ZcodeRemoteModelLike } from './zcode-product.js'
@@ -58,6 +65,7 @@ import { captchaDemand, captchaSupplyStats, setCaptchaDemand } from './captcha-s
 import { SerialQueue } from './serial-queue.js'
 import { TtlCache } from './ttl-cache.js'
 import { generateDeviceMid, runZcodeLogin, type ZcodeLoginProvider } from './zcode-login.js'
+import { fetchCodingPlanApiKey } from './zcode-transport.js'
 import {
   claimZcodePlan,
   fetchZcodeBalance,
@@ -108,8 +116,6 @@ export interface ZcodeAuthOptions {
   serviceName?: string
   /** 注入的 fetch（测试用）。 */
   fetchImpl?: typeof fetch
-  /** 注入的凭据读取（测试用，避免碰真实磁盘）。 */
-  readCredential?: () => ZcodeCredential | undefined
   /**
    * 账号池（测试用）。
    *
@@ -144,11 +150,39 @@ export function internalCarrierEnabledFromEnv(env: NodeJS.ProcessEnv = process.e
   return raw === undefined || raw.trim().length === 0 ? true : raw.trim() !== '0'
 }
 
+/**
+ * 换取 coding-plan api-key 的**总超时**（毫秒）。
+ *
+ * ⚠ 它是 3 个只读 GET（`getCustomerInfo` → 列 `api_keys` → `copy`），
+ * 正常合计不到 1 秒。留 8 秒只为容忍慢网；**绝不能**因为它把「登录」
+ * 挂住 —— 登录完成后调用方还要接着轮询结果、发消息。
+ */
+const CODING_PLAN_KEY_TIMEOUT_MS = 8_000
+
+/**
+ * 给一个 promise 加超时（超时以异常形式抛出，交给调用方记录）。
+ *
+ * ⚠ `Promise.race` 会给**每一个**输入都挂上处理器，故原 promise 之后才
+ * reject 也不会变成 unhandled rejection —— 不需要额外的 `.catch()`。
+ */
+async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`超时（${String(ms)}ms）`)), ms)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 /** ZCode 认证服务。 */
 export class ZcodeAuth extends Service {
   private readonly product: ZcodeProduct
   private readonly fetchImpl: typeof fetch
-  private readonly readCredential: () => ZcodeCredential | undefined
   /** 注入的账号池（测试用；生产走 ctx.get）。 */
   private readonly injectedPool: AccountPool | undefined
   /**
@@ -275,7 +309,6 @@ export class ZcodeAuth extends Service {
     super(ctx, options.serviceName ?? `${product.id}Auth`)
     this.product = product
     this.fetchImpl = options.fetchImpl ?? fetch
-    this.readCredential = options.readCredential ?? (() => readZcodeCredential())
     this.injectedPool = options.accountPool
     this.captchaBackoff = new CaptchaBackoff({
       /**
@@ -308,29 +341,19 @@ export class ZcodeAuth extends Service {
   }
 
   /**
-   * 读取当前凭据。
+   * 读取当前凭据（**唯一来源：插件自己存的那份**）。
    *
-   * ## 两个来源，插件自存优先
+   * ## ⚠ 不再有第二个来源（2026-10-05 用户决策）
    *
-   * 1. **插件自存**（`ctx.credentials` 的 `ZCODE_CREDENTIAL`）——
-   *    用户在 Jet Hub 里走插件内登录拿到的，**不需要官方客户端**。
-   * 2. **回退**：解密官方客户端的 `~/.zcode/v2/credentials.json` ——
-   *    让「已经装了官方客户端并登录过」的用户零操作即可用。
-   *
-   * ⚠ **每次调用都重新读**，不缓存 —— 用户刚登录完或刚在官方客户端
-   * 重新登录后，无需重启 DSH 即可生效。
+   * 旧实现会回退去解密官方客户端的 `~/.zcode/v2/credentials.json`
+   * （「装了 ZCode 就零操作可用」）。该能力**已整体删除**，理由见
+   * `src/zcode.ts` 文件头。⇒ 现在没有 ZCode 账号就是没有，
+   * UI 必须引导用户走 Jet Hub 里的登录，**不要**再暗示「装了客户端就能用」。
    *
    * 返回 `undefined` 表示「没有可用的 ZCode 登录态」。
    */
   async current(): Promise<ZcodeCredential | undefined> {
-    const stored = await this.readStoredCredential()
-    if (stored !== undefined) return stored
-    try {
-      return this.readCredential()
-    } catch (error) {
-      this.lastError = error instanceof Error ? error.message : String(error)
-      return undefined
-    }
+    return await this.readStoredCredential()
   }
 
   /**
@@ -350,13 +373,10 @@ export class ZcodeAuth extends Service {
    * **全都读不到凭据**（它们都走本方法），表现为：
    * **能聊天（适配器读账号条目的 ref），但面板显示「未配置」、积分查不出**。
    *
-   * 这个缺口一度被「回退读官方凭据文件」掩盖 —— 装了官方客户端的机器上
-   * 现象会消失，只有**没装**的用户才会看到。
-   *
    * ⇒ 顺序：**账号池（用户的显式登录）> 单凭据 ref（回退）**。
    * 与适配器的解析顺序保持一致，避免「适配器能用而面板不能用」。
    *
-   * ⚠ 形状校验必须做：凭据存储里可能有**任何**字符串（用户手填、旧版本
+   * ⚠ **形状校验必须做**：凭据存储里可能有**任何**字符串（用户手填、旧版本
    * 残留）。`isUsableZcodeCredential` 保证后续代码拿到的是完整对象。
    */
   private async readStoredCredential(): Promise<ZcodeCredential | undefined> {
@@ -404,211 +424,6 @@ export class ZcodeAuth extends Service {
   }
 
   /**
-   * 该 ref 里**有没有存过任何东西**（不做形状校验）。
-   *
-   * ⚠ 与 {@link readCredentialFromRef} 的区别很关键：后者对「从未写入」和
-   * 「写进去了但 JSON 损坏 / 形状不全」**都返回 `undefined`**。若拿它当闸①
-   * 的判据，一个**已损坏但确实属于某个账号**的 ref 会被当成孤儿，被本机凭据
-   * 静默覆盖 —— 而那正是审查指出的「永久覆盖且无日志」缺陷。
-   *
-   * 这里用 `credentials.resolve` 的**存在性**（不看内容）区分两种情况，
-   * 让闸①对「有东西但坏了」**失败关闭**：调用方会 warn 让用户手动删除重登。
-   */
-  private async hasStoredCredential(ref: CredentialRef): Promise<boolean> {
-    try {
-      const resolved = await this.ctx.credentials.resolve(ref)
-      return resolved !== undefined && resolved !== null
-        && typeof resolved.value === 'string' && resolved.value.length > 0
-    } catch {
-      // resolve 抛错（存储损坏）⇒ 保守当作「有东西」，不覆盖。
-      return true
-    }
-  }
-
-  /**
-   * 读**本机官方客户端**那份凭据（纯磁盘读取，不经账号池）。
-   *
-   * 供 ⑯「添加账号先复用本机已有账号」使用 —— 与 `current()` 的区别：
-   * `current()` 会**先读池**，池里任意一个可用账号都会让它短路，拿不到「磁盘上
-   * 官方客户端当前登录的是谁」。这里要的正是后者。
-   *
-   * 返回 `undefined` = 本机没有可用的官方凭据（用户没装客户端，或没登录过）。
-   */
-  async localCredential(): Promise<ZcodeCredential | undefined> {
-    try {
-      const credential = this.readCredential()
-      return credential !== undefined && isUsableZcodeCredential(credential) ? credential : undefined
-    } catch (error) {
-      this.lastError = error instanceof Error ? error.message : String(error)
-      return undefined
-    }
-  }
-
-  /**
-   * 池里**缺凭据**的 zcode 账号中，挑第一个把本机官方凭据收编进去（最多一个）。
-   *
-   * ## 用途（⑯「点一次多一条」）
-   *
-   * `account.create` 在新建条目前先调它：若池里已经躺着一条**从未写入凭据**的
-   * 孤儿条目（用户上一次登录被进程重启打断的产物），就把本机凭据补进去复用，
-   * **而不是再加一条** —— 这正是用户报的「点了添加就多一个」。
-   *
-   * ## ⚠ 为什么只收编**一个**
-   *
-   * 孤儿条目可能有**多条**（每次被打断的登录留一条），但它们都**没有凭据**，
-   * 我们无从判断它们各自身份 —— 全填上同一份凭据会变成多条重复账号，各自
-   * 消耗同一份额度。只修第一条，其余交给用户用卡片上的「删除」按钮清理。
-   *
-   * 安全性由 {@link adoptOfficialCredential} 的**闸②**保证：若这份凭据的
-   * `user_id` 已被别的条目持有，则拒绝写入（防止跨账号覆盖）。
-   *
-   * @returns 被收编的账号 id；没有可收编的目标或闸②拦下则 `undefined`。
-   */
-  async adoptIntoOrphanAccount(pool: AccountPool): Promise<string | undefined> {
-    let candidates: readonly { id: string; credentialRef: string; nickname: string }[]
-    try {
-      candidates = pool.listAccountsByProvider(this.product.id)
-    } catch {
-      return undefined
-    }
-    for (const entry of candidates) {
-      // 只挑**真的**没有可用凭据的条目（能解析出凭据的条目绝不动）。
-      const own = await this.readCredentialFromRef(entry.credentialRef as CredentialRef)
-      if (own !== undefined) continue
-      const adopted = await this.adoptOfficialCredential(entry.credentialRef, pool)
-      if (adopted === undefined) continue
-      // 回填昵称，让卡片上显示账号名而不是 `zcode-xxxxxxxx`。
-      const label = adopted.account_name ?? adopted.account_label
-      if (typeof label === 'string' && label.trim().length > 0) {
-        await pool.updateAccount(entry.id, { nickname: `ZCode ${label.trim()}` }).catch(() => {})
-      }
-      return entry.id
-    }
-    return undefined
-  }
-
-  /**
-   * 把**本机官方客户端凭据**收编进指定账号的 ref（自愈 / 复用）。
-   *
-   * ## 解决的三个真实问题
-   *
-   * 1. **⑦「凭据未配置」**：用户点了「添加账号」，但后台登录 promise 被进程重启
-   *    打断 —— 条目已建、凭据从未写入（`startLogin` 的
-   *    `await this.ctx.credentials.set(...)` 没跑到）。此后该账号永远读不到凭据：
-   *    `refreshAll` 只探过期账号、适配器 `refresh` 又要求先能选到号，
-   *    互为前提、**无法自愈**。
-   * 2. **⑯ 点一次多一条**：本机明明已有一份可用凭据（官方客户端写的），
-   *    仍要新起一轮 OAuth、新建一条占位记录。
-   * 3. **`ide` 凭据无法去重**：见 `readZcodeCredential` 里补 `user_id` 的注释。
-   *
-   * ## ⚠⚠ 防「跨账号覆盖」的两道闸（这是本方法最重要的约束）
-   *
-   * `src/zcode-auth.ts` 记录过一个**真实的数据破坏缺陷**：旧 `refreshAll` 拿
-   * `current()`（= 池里第一个可用账号）去覆盖**每一个** ref，30 分钟一轮的定时器
-   * 会把账号 A 的凭据铺满整个池，抹掉其余账号。故本方法只在**两道闸都过**时才写：
-   *
-   * - 闸①：目标 ref **自己解析不出**凭据（`readCredentialFromRef` 为 `undefined`）。
-   *   能解析出就**原样返回**，绝不覆盖 —— 这是 `refreshAccountCredential` 的同款判据。
-   *   ⚠ **但「解析不出」必须再分成两种**（审查发现的缺陷）：真的从未写入 vs
-   *   写进去了但 JSON 损坏 / 形状不全。后者若被当成孤儿收编，就是**静默覆盖一份
-   *   可能还救得回来的凭据**。故这里用 `hasStoredCredential` 再判一次：
-   *   有内容但解析不出 ⇒ **失败关闭**（warn + 返回 `undefined`），让用户手动删除重登。
-   * - 闸②：本机凭据的 `user_id` **没有被池里其它账号持有**
-   *   （`findAccountIdByIdentityField` 查不到，或查到的就是目标自己）。
-   *   否则说明这份凭据是**别的账号**的，写进去就是重犯覆盖缺陷。
-   *   ⚠ `user_id` **缺失**时同样**失败关闭**：`findAccountIdByIdentityField` 会
-   *   跳过没有该字段的条目，去重判据直接失效，一次写入可能同时落进两个 ref。
-   *
-   * ## 为什么读 `readCredential()` 而不是 `current()`
-   *
-   * `current()` 会**先读池**（`readStoredCredential` → `readCredentialFromPool`）
-   * —— 那正是「A 的凭据」的来源。本方法要的是**磁盘上官方客户端那一份**，
-   * 只有 `readCredential()` 是纯磁盘读取（`readZcodeCredential`），故用它。
-   *
-   * @param refName - 目标账号的 credential ref 名。
-   * @param pool - 账号池（用于闸②的身份比对）。
-   * @returns 写入的凭据；任一闸不过则返回 `undefined`（调用方照旧走登录流程）。
-   */
-  async adoptOfficialCredential(
-    refName: string,
-    pool?: AccountPool,
-  ): Promise<ZcodeCredential | undefined> {
-    const ref = refName as CredentialRef
-    // 闸①：该 ref 自己已有可用凭据 ⇒ 什么都不做（绝不覆盖）。
-    const own = await this.readCredentialFromRef(ref)
-    if (own !== undefined) return undefined
-    // 闸①′（审查发现的缺陷）：ref 里**有东西**但解析不出来 ⇒ 那是**损坏的凭据**，
-    // 不是孤儿条目。收编它就等于静默覆盖一份可能还救得回来的数据，故失败关闭。
-    if (await this.hasStoredCredential(ref)) {
-      this.lastError = `\`${refName}\` 里存有凭据但已损坏 / 字段不全，`
-        + '已跳过（不会覆盖它）。请在 Jet Hub 里删除该账号后重新添加。'
-      this.ctx.logger?.warn?.(`[jet-hub] zcode ${this.lastError}`)
-      return undefined
-    }
-
-    // 读**磁盘上**的官方客户端凭据（不经账号池，见上面的说明）。
-    let official: ZcodeCredential | undefined
-    try {
-      official = this.readCredential()
-    } catch (error) {
-      this.lastError = error instanceof Error ? error.message : String(error)
-      return undefined
-    }
-    if (official === undefined || !isUsableZcodeCredential(official)) return undefined
-
-    // 闸②：这份凭据的账号没被别的条目占用。
-    const userId = official.user_id
-    if (pool !== undefined && typeof userId === 'string' && userId.length > 0) {
-      const holder = await pool.findAccountIdByIdentityField(this.product.id, 'user_id', userId)
-      if (holder.length > 0 && holder !== this.accountIdOf(refName, pool)) {
-        this.lastError = `本机官方凭据属于账号 ${holder}，不写入 ${refName}（防止跨账号覆盖）`
-        return undefined
-      }
-    } else if (pool !== undefined && this.hasOtherZcodeAccounts(refName, pool)) {
-      /**
-       * ⚠ **闸②必须失败关闭**（审查发现的缺陷）：`user_id` 缺失时旧代码**整个跳过**
-       * 去重 —— 而 `findAccountIdByIdentityField` 本来就跳过没有该字段的条目，
-       * 于是在「老 ide 凭据 + 池里已有别的账号」这个组合下，同一份凭据会被
-       * 写进多个 ref，正是要防的跨账号覆盖。
-       *
-       * 只在**池里确实存在**其它 zcode 账号时收紧：池里只有这一个目标账号时，
-       * 「覆盖别人」在物理上不可能，此时放行以免把 ⑦ 的自愈能力也一起砍掉。
-       */
-      this.lastError = '本机官方凭据缺少 user_id，无法确认它是否属于别的账号，'
-        + `故不写入 ${refName}（防止跨账号覆盖）`
-      this.ctx.logger?.warn?.(`[jet-hub] zcode ${this.lastError}`)
-      return undefined
-    }
-
-    await this.ctx.credentials.set(ref, JSON.stringify(official))
-    return official
-  }
-
-  /** 池里是否存在**除该 ref 所属账号以外**的其它 zcode 账号。 */
-  private hasOtherZcodeAccounts(refName: string, pool: AccountPool): boolean {
-    try {
-      const mine = this.accountIdOf(refName, pool)
-      return pool.listAccountsByProvider(this.product.id)
-        .some((entry) => entry.id !== mine || entry.credentialRef !== refName)
-    } catch {
-      // 池异常 ⇒ 保守当作「有别的账号」（更安全：拦住写入）。
-      return true
-    }
-  }
-
-  /** 由 ref 名反查它对应的账号 id（闸②用来放行「凭据就是自己的」这种情形）。 */
-  private accountIdOf(refName: string, pool: AccountPool): string | undefined {
-    try {
-      for (const entry of pool.listAccountsByProvider(this.product.id)) {
-        if (entry.credentialRef === refName) return entry.id
-      }
-    } catch {
-      // 池异常 ⇒ 当作查不到（更保守：闸② 会拦住写入）。
-    }
-    return undefined
-  }
-
-  /**
    * 取账号池。
    *
    * ⚠ 用 `ctx.get` 而非构造注入：本服务可能在**账号池注册之前**被构造
@@ -637,8 +452,8 @@ export class ZcodeAuth extends Service {
       return {
         available: false,
         reason:
-          '未找到可用的 ZCode 登录态。请在 Jet Hub 里点「添加账号」完成登录' +
-          '（若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的凭据）。',
+          '未找到可用的 ZCode 登录态。请在 Jet Hub 里点「添加账号」完成登录'
+          + '（本插件只用它自己的授权流程，不会读取本机 ZCode 客户端的登录态）。',
       }
     }
     try {
@@ -667,8 +482,9 @@ export class ZcodeAuth extends Service {
    *
    * ## 为什么这是「登录」而不是「读凭据」
    *
-   * 早期实现只是「确认磁盘上有一份官方客户端写的凭据」。那要求用户
-   * 先装并登录官方 ZCode 客户端 —— 与本插件「装完即用」的定位冲突。
+   * 早期实现**只有**「确认磁盘上有一份官方客户端写的凭据」这一条路，
+   * 那要求用户先装并登录官方 ZCode 客户端 —— 与本插件「装完即用」的
+   * 定位冲突。而现在**只剩**本方法这一条路（磁盘读取已于 2026-10-05 删除）。
    *
    * 实测确认官方 3.12.3+ 用的是**服务端中介的设备授权流**
    * （`/oauth/cli/init` → 浏览器授权 → `/oauth/cli/poll/{flow_id}`），
@@ -763,8 +579,32 @@ export class ZcodeAuth extends Service {
         app_version: options.appVersion ?? this.product.appVersionFallback,
         source: 'plugin',
       }
-      await this.ctx.credentials.set(ref, JSON.stringify(credential))
-      return { refName: ref, credential }
+      /**
+       * ★ 登录成功后**顺手换** coding-plan 的 api-key（付费订阅腿）。
+       *
+       * ⚠ 这是 `fetchCodingPlanApiKey` 的**唯一调用点** —— 它此前建好却没人调，
+       * 导致该腿对纯插件登录用户永久不可用（见 `resolveCodingPlanKey` 的说明）。
+       *
+       * ## 字段按「拿到哪个 OAuth token」落位
+       *
+       * `zai` 渠道登录 ⇒ `zai_access_token` ⇒ 写 `coding_plan_key_zai`；
+       * `bigmodel` 渠道 ⇒ `bigmodel_access_token` ⇒ 写 `coding_plan_key_bigmodel`。
+       * 与 `zcode-transport.ts` 里 `zai ?? bigmodel` 的取值优先级一致。
+       *
+       * ⚠ **换不到不报错**：没买订阅是常态，那时 `start-plan`（免费积分）
+       * 照常可用。`resolveCodingPlanKey` 已把失败都吞成 `undefined`。
+       */
+      const codingPlanKey = await this.resolveCodingPlanKey(credential)
+      const withPlanKey: ZcodeCredential = codingPlanKey === undefined
+        ? credential
+        : {
+          ...credential,
+          ...(credential.zai_access_token !== undefined
+            ? { coding_plan_key_zai: codingPlanKey }
+            : { coding_plan_key_bigmodel: codingPlanKey }),
+        }
+      await this.ctx.credentials.set(ref, JSON.stringify(withPlanKey))
+      return { refName: ref, credential: withPlanKey }
     })()
 
     /**
@@ -786,6 +626,58 @@ export class ZcodeAuth extends Service {
   }
 
   /**
+   * 换取 coding-plan（**付费订阅**）通道的 api-key。
+   *
+   * ## 为什么需要这一步（真实断链，2026-10-05 修）
+   *
+   * `coding_plan_key_*` **不是登录时下发的** —— 官方用登录拿到的 OAuth
+   * access_token **现换**（逆向 `AccountProviderApiKeyResolver`，
+   * 见 `zcode-transport.ts` 的 `fetchCodingPlanApiKey`）。
+   *
+   * ⚠ 此前这条链是**断的**：`fetchCodingPlanApiKey` 建好了却**没有任何调用方**，
+   * 而两个 key 字段的**唯一**写入点是「从本机 ZCode 客户端读凭据」——
+   * 那条路已于同日删除 ⇒ **纯插件登录用户的 coding-plan 通道一直不可用**
+   * （表现为 `glm-5.3` / `glm-5.3-flash` 在通道表里 unavailable）。
+   *
+   * ⇒ 本方法把缺的那一环接上。原料是齐的：登录结果里**必然**带
+   * `zai_access_token` 或 `bigmodel_access_token`（`startLogin` 刚写进去）。
+   *
+   * ## 失败绝不牵连登录
+   *
+   * 换不到 key 只意味着「用户没买 coding-plan，或云上没有那个 key」
+   * （`reason` 会区分）—— `start-plan`（免费积分）**照常可用**。
+   * 故这里**只记日志、返回 `undefined`**，绝不抛。
+   *
+   * @returns api-key；换不到（没 token / 没订阅 / 超时 / 网络错）时 `undefined`。
+   */
+  private async resolveCodingPlanKey(credential: ZcodeCredential): Promise<string | undefined> {
+    // 没有 OAuth token 就不必发请求（`fetchCodingPlanApiKey` 自己也会回
+    // `no-oauth-token`，但这里提前短路，省掉三个无意义的函数调用与日志噪声）。
+    if (credential.zai_access_token === undefined && credential.bigmodel_access_token === undefined) {
+      return undefined
+    }
+    try {
+      const result = await withTimeout(
+        fetchCodingPlanApiKey(credential, this.fetchImpl),
+        CODING_PLAN_KEY_TIMEOUT_MS,
+      )
+      if (result.key === undefined) {
+        this.ctx.logger?.warn?.(
+          `[jet-hub] zcode coding-plan key 未换到（${result.reason ?? 'unknown'}）；`
+          + 'start-plan 通道不受影响',
+        )
+        return undefined
+      }
+      return result.key
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] zcode coding-plan key 换取异常：${String(error)}；start-plan 通道不受影响`,
+      )
+      return undefined
+    }
+  }
+
+  /**
    * 阻塞式登录（等待用户在浏览器完成授权）。
    *
    * ⚠ 与 `startLogin` 的区别：这个会**等到授权完成**才返回。
@@ -801,10 +693,7 @@ export class ZcodeAuth extends Service {
   }
 
   /**
-   * 把**当前可用凭据**（插件自存或官方文件）写进 `ctx.credentials`。
-   *
-   * 用途：把「官方客户端已登录」的状态**固化**成插件自存凭据，
-   * 使其后即便官方客户端被卸载也能继续用。
+   * 把**当前可用凭据**（插件自存）写进 `ctx.credentials`。
    *
    * ⚠ 若已有插件自存凭据，本方法会**覆盖**它 —— 调用方需自行确认
    * （Jet Hub 的「添加账号」在已有账号时不会走到这里）。
@@ -816,8 +705,7 @@ export class ZcodeAuth extends Service {
     const credential = await this.current()
     if (credential === undefined) {
       throw new Error(
-        'ZCode 凭据不可用：请在 Jet Hub 里点「添加账号」完成登录' +
-        '（若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的凭据）。',
+        'ZCode 凭据不可用：请在 Jet Hub 里点「添加账号」完成登录。',
       )
     }
     const ref = (refName ?? this.product.defaultCredentialRef) as CredentialRef
@@ -1683,15 +1571,14 @@ export class ZcodeAuth extends Service {
     /**
      * 该 ref 自己解析不出凭据（未配置/损坏/被清空）。
      *
-     * ## ⚠ 这里**刻意不做**「用磁盘凭据补上」的兜底（虽是旧行为）
+     * ## ⚠ 这里**刻意不做**「用别的凭据补上」的兜底
      *
      * 旧实现拿 `current()` 写进来，**副作用**是「该账号凭据损坏时会被
-     * 别的账号填上」—— 那正是本次数据破坏的成因。而「用**官方客户端磁盘
-     * 凭据**补上」听起来像合理的兜底，实际**不可实施**：
+     * 别的账号填上」—— 那正是本次数据破坏的成因。
      *
-     * 磁盘 `~/.zcode/v2/credentials.json` 是**单账号**格式，而池是**多账号**的
-     * —— 我们**无法判断**那份磁盘凭据属于池里的**哪一个**账号。
-     * 拿它去补任意一个条目，等于重犯同一个错误（只是换成「单体覆盖」）。
+     * 曾经还有个「用**本机磁盘凭据**补上」的兜底，它同样不可实施：
+     * 单账号的磁盘凭据 vs 多账号的池，我们**无法判断**它属于哪一个。
+     * 而那条路本身也已随 2026-10-05 的决策整体删除。
      *
      * ⇒ 如实报错，让用户重新登录该账号。这是**唯一**不会造成数据破坏的选项。
      */
@@ -1716,8 +1603,8 @@ export class ZcodeAuth extends Service {
    * 于是 30 分钟一轮的定时器会把账号 A 的凭据**铺满整个池**，
    * 抹掉其余账号的真实凭据（详见 {@link refreshAccountCredential} 的实测证据）。
    *
-   * 旧注释的本意是「用户在官方客户端重新登录后，新凭据能铺开到所有条目」——
-   * 那个前提在**多账号池**下是**错的**：磁盘凭据只对应**一个**账号。
+   * 旧注释的本意是「一份新凭据能铺开到所有条目」——
+   * 那个前提在**多账号池**下是**错的**：一份凭据只对应**一个**账号。
    *
    * ## 正确做法：逐账号、各写各的
    *

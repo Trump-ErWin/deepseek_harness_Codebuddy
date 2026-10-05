@@ -13,10 +13,10 @@
  *   - 但 `probe()` / `fetchBalance()` / `status()` / `fetchCheckinStatus()`
  *     全走 `current()` → **全部读不到** → 界面「未配置」、积分查询失败
  *
- * ⚠ 这个缺口会被「回退读官方凭据文件」**掩盖**：装了官方客户端的机器上
- * 现象消失，只有**没装**的用户才看得到。故单测必须屏蔽官方文件
- * （`readCredential: () => undefined`）才能测出来 —— 我第一次的探针
- * 就是被它骗过（`status()` 显示的是真实官方账号的标签）。
+ * ⚠ 这个缺口**曾经**会被「回退读本机官方凭据文件」**掩盖**：装了官方
+ * 客户端的机器上现象消失，只有**没装**的用户才看得到。而那条回退路已随
+ * 2026-10-05 的决策（「不读本机 ZCode 数据」）整体删除 ⇒ 现在**每个**用户
+ * 都会看到，缺陷 1 的回归价值反而变高了。
  *
  * ### 缺陷 2：`fetchImpl` 是死参数
  *
@@ -87,7 +87,6 @@ describe('ZCode 凭据解析：必须认账号池里的 ref（缺陷 1）', () =
     const auth = new ZcodeAuth(ctx, {
       accountPool: pool,
       // ⚠ 必须屏蔽官方文件，否则会「回退读到真实凭据」而假通过。
-      readCredential: () => undefined,
     })
 
     const current = await auth.current()
@@ -117,7 +116,6 @@ describe('ZCode 凭据解析：必须认账号池里的 ref（缺陷 1）', () =
 
     const auth = new ZcodeAuth(ctx, {
       accountPool: pool,
-      readCredential: () => undefined,
       fetchImpl: fetcher,
     })
 
@@ -141,7 +139,7 @@ describe('ZCode 凭据解析：必须认账号池里的 ref（缺陷 1）', () =
       zcode_jwt: 'FALLBACK-JWT', device_mid: 'aaaa-bbbb',
     }))
 
-    const auth = new ZcodeAuth(ctx, { accountPool: pool, readCredential: () => undefined })
+    const auth = new ZcodeAuth(ctx, { accountPool: pool })
     // 账号池是用户的**显式**登录，应优先。
     expect((await auth.current())?.zcode_jwt).toBe('POOL-JWT')
   })
@@ -153,7 +151,7 @@ describe('ZCode 凭据解析：必须认账号池里的 ref（缺陷 1）', () =
       zcode_jwt: 'FALLBACK-JWT',
       device_mid: 'aaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
     }))
-    const auth = new ZcodeAuth(ctx, { accountPool: pool, readCredential: () => undefined })
+    const auth = new ZcodeAuth(ctx, { accountPool: pool })
     expect((await auth.current())?.zcode_jwt).toBe('FALLBACK-JWT')
   })
 
@@ -171,7 +169,7 @@ describe('ZCode 凭据解析：必须认账号池里的 ref（缺陷 1）', () =
     await credentials.set('ZCODE_ACCOUNT_BAD', 'not-json')
     await credentials.set('ZCODE_ACCOUNT_GOOD', CRED_JSON)
 
-    const auth = new ZcodeAuth(ctx, { accountPool: pool, readCredential: () => undefined })
+    const auth = new ZcodeAuth(ctx, { accountPool: pool })
     expect((await auth.current())?.zcode_jwt).toBe('POOL-JWT')
   })
 
@@ -183,7 +181,7 @@ describe('ZCode 凭据解析：必须认账号池里的 ref（缺陷 1）', () =
       credentialRef: 'ZCODE_ACCOUNT_DIS', refreshable: false, createdAt: 1,
     })
     await credentials.set('ZCODE_ACCOUNT_DIS', CRED_JSON)
-    const auth = new ZcodeAuth(ctx, { accountPool: pool, readCredential: () => undefined })
+    const auth = new ZcodeAuth(ctx, { accountPool: pool })
     // 与 AGENTS.md 的既有约定一致：停用只影响自动选号。
     expect((await auth.current())?.zcode_jwt).toBe('POOL-JWT')
   })
@@ -191,14 +189,15 @@ describe('ZCode 凭据解析：必须认账号池里的 ref（缺陷 1）', () =
   it('没有账号池时退回单凭据路径（不抛错）', async () => {
     const { ctx, credentials } = makeCtx()
     await credentials.set(ZCODE.defaultCredentialRef, CRED_JSON)
-    const auth = new ZcodeAuth(ctx, { readCredential: () => undefined })
+    const auth = new ZcodeAuth(ctx)
     expect((await auth.current())?.zcode_jwt).toBe('POOL-JWT')
   })
 })
 
 describe('ZCode fetch 注入：必须真的生效（缺陷 2）', () => {
   it('★ fetchZcodeBalance 走注入的 fetch（不是全局 fetch）', async () => {
-    const { ctx } = makeCtx()
+    const { ctx, credentials } = makeCtx()
+    await credentials.set(ZCODE.defaultCredentialRef, CRED_JSON)
     const calls: string[] = []
     const fetcher = vi.fn(async (url: string | URL | Request) => {
       calls.push(String(url))
@@ -208,7 +207,6 @@ describe('ZCode fetch 注入：必须真的生效（缺陷 2）', () => {
     }) as unknown as typeof fetch
     const auth = new ZcodeAuth(ctx, {
       fetchImpl: fetcher,
-      readCredential: () => ({ zcode_jwt: 'j', device_mid: '11111111-1111-1111-1111-111111111111' }),
     })
     await auth.fetchBalance()
     expect(fetcher).toHaveBeenCalled()
@@ -216,7 +214,8 @@ describe('ZCode fetch 注入：必须真的生效（缺陷 2）', () => {
   })
 
   it('★ fetchZcodeCaptchaConfig 也走注入的 fetch', async () => {
-    const { ctx } = makeCtx()
+    const { ctx, credentials } = makeCtx()
+    await credentials.set(ZCODE.defaultCredentialRef, CRED_JSON)
     const calls: string[] = []
     const fetcher = vi.fn(async (url: string | URL | Request) => {
       calls.push(String(url))
@@ -226,7 +225,6 @@ describe('ZCode fetch 注入：必须真的生效（缺陷 2）', () => {
     }) as unknown as typeof fetch
     const auth = new ZcodeAuth(ctx, {
       fetchImpl: fetcher,
-      readCredential: () => ({ zcode_jwt: 'j', device_mid: '11111111-1111-1111-1111-111111111111' }),
     })
     const config = await auth.fetchCaptchaConfig()
     expect(config).toEqual({ region: 'cn', prefix: 'p', sceneId: 's' })
@@ -236,7 +234,8 @@ describe('ZCode fetch 注入：必须真的生效（缺陷 2）', () => {
   })
 
   it('★ 签到链路（激活上报 + preview）也走注入的 fetch', async () => {
-    const { ctx } = makeCtx()
+    const { ctx, credentials } = makeCtx()
+    await credentials.set(ZCODE.defaultCredentialRef, CRED_JSON)
     const calls: string[] = []
     const fetcher = vi.fn(async (url: string | URL | Request) => {
       const u = String(url)
@@ -248,7 +247,6 @@ describe('ZCode fetch 注入：必须真的生效（缺陷 2）', () => {
     }) as unknown as typeof fetch
     const auth = new ZcodeAuth(ctx, {
       fetchImpl: fetcher,
-      readCredential: () => ({ zcode_jwt: 'j', device_mid: '11111111-1111-1111-1111-111111111111' }),
     })
     await auth.fetchCheckinStatus()
     // 两条激活上报 + 一次 preview。
@@ -257,13 +255,13 @@ describe('ZCode fetch 注入：必须真的生效（缺陷 2）', () => {
   })
 
   it('全部请求都由注入的 fetch 发出（没有任何真实网络调用）', async () => {
-    const { ctx } = makeCtx()
+    const { ctx, credentials } = makeCtx()
+    await credentials.set(ZCODE.defaultCredentialRef, CRED_JSON)
     const fetcher = vi.fn(async () => new Response(JSON.stringify({
       code: 0, data: { balances: [], plans: [] },
     }), { status: 200 })) as unknown as typeof fetch
     const auth = new ZcodeAuth(ctx, {
       fetchImpl: fetcher,
-      readCredential: () => ({ zcode_jwt: 'j', device_mid: '11111111-1111-1111-1111-111111111111' }),
     })
     await Promise.all([
       auth.fetchBalance(),

@@ -1267,9 +1267,9 @@ export function apply(ctx: Context): void {
 // ===== ZCode（智谱 z.ai 免费额度通道）=====
 //
 // 形态与前面所有 provider **相同**：读凭据 → 直发远端。
-// 用户只需在官方 ZCode 客户端登录一次 —— 凭据就落在
-// `~/.zcode/v2/credentials.json`（AES-256-GCM 加密，公开算法），
-// 本插件纯 Node 解密即可，**不需要任何实例常驻**。
+// 登录走**插件自己的**授权流（`zcode-login.ts`），凭据由插件写进
+// `ctx.credentials`，**不读取本机 ZCode 客户端的任何数据**（2026-10-05 决策，
+// 理由见 `zcode.ts` 文件头）。
 //
 // 与其余 provider 的三处差异（全部实测）：
 //   1. 协议是 **Anthropic Messages**（不是 OpenAI 兼容）——
@@ -1280,10 +1280,9 @@ export function apply(ctx: Context): void {
 //   3. 请求体必须带官方身份块与首轮日期块，否则上游回 `3012` ——
 //      见 `zcode-identity.ts`。
 //
-// ⚠ **可脱离官方客户端使用**：登录走官方 CLI 设备授权流
+// ⚠ **完全可脱离官方客户端使用**：登录走官方 CLI 设备授权流
 // （`/oauth/cli/init` → 浏览器授权 → `/oauth/cli/poll/{flow_id}`，
 // 纯 HTTP，见 `zcode-login.ts`），且 `device_mid` **由插件自己生成**。
-// 若机器上已装并登录过官方客户端，也会自动读取它的凭据作为回退。
 //
 // ⚠ **不可续期**：凭据是静态的（JWT 的 payload 里没有 `exp`）。
 // 失效时上游回 401/1002，适配器归为 AUTH 并提示用户重新登录。
@@ -1293,8 +1292,7 @@ export function apply(ctx: Context): void {
 //
 // ⚠ **必须把账号池传进去**：`ZcodeAuth.current()` 要从账号池里找用户在
 // Jet Hub 登录时创建的那个 ref（`ZCODE_ACCOUNT_XXXX`），而不是只认固定的
-// `ZCODE_CREDENTIAL`。不传的话「登录成功但面板显示未配置」——
-// 且该缺口会被「回退读官方凭据文件」掩盖，只有没装官方客户端的用户才看得到。
+// `ZCODE_CREDENTIAL`。不传的话「登录成功但面板显示未配置」。
 const zcode = new ZcodeAuth(ctx, {
   accountPool: pool,
   /**
@@ -1368,7 +1366,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     }
     /**
      * 账号池里没有条目时，落到 `ZcodeAuth.current()` ——
-     * 它已经实现了「插件自存优先 → 官方客户端凭据回退」。
+     * 它已经实现了「账号池 → 单凭据 ref」的解析顺序。
      * ⚠ 不要在这里重复实现那条优先级（重复必然漂移）。
      *
      * ⚠ 同时**清空**记录：没有账号条目可标记，留着旧 id 会误伤一个无辜账号。
@@ -1379,9 +1377,9 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   refresh: async () => {
     /**
      * ⚠ ZCode **没有** refresh 端点（与 Loomy 恒 false 同类，但原因不同）：
-     * 凭据是**静态**的（在官方客户端登录一次就固定下来）。
+     * 凭据是**静态**的（登录一次就固定下来，JWT 里没有 `exp`）。
      *
-     * 这里做的是「重读凭据并回写账号条目」，使官方客户端重新登录后不重启即可生效。
+     * 这里做的是「重读凭据并回写账号条目」，让用户重新登录后不重启即可生效。
      *
      * ⚠⚠ **绝不能用 `current()` + `getAvailableAccount()` 的组合**（审查发现的
      * 真实缺陷，与 `refreshAll` 里记录的那个数据破坏同类）：`current()` 会**先读池**
@@ -1476,7 +1474,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   fetchRemoteModels: () => zcode.fetchRemoteModelsOnly(),
   accountPool: pool,
   product: ZCODE,
-  // 就绪判据 = 有可用凭据（插件自存或官方客户端凭据）。
+  // 就绪判据 = 有可用凭据（插件自存的）。
   isReady: async () => (await zcode.current()) !== undefined,
   /**
    * 额度用尽 / 无权益时，适配器据此**标记失败的账号并切换**。
@@ -1584,8 +1582,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     // 与 raccoon 同款：只按 refreshable 过滤，不看 enabled。
     ['minimax', (p) => minimax.refreshAll(p)],
     // zcode **不可续期**（凭据是静态的）—— 但这个方法仍做实事：
-    // 把磁盘上最新的凭据回写到全部 zcode 账号，
-    // 使用户在官方客户端重新登录后无需重启 DSH。
+    // 把各账号 ref 下最新的凭据回写一遍，让用户重新登录后无需重启 DSH。
     // ⚠ 只按 `refreshable` 过滤、**不看 `enabled`**（AGENTS.md 既有约定）。
     ['zcode', (p) => zcode.refreshAll(p)],
     // ⚠️ Gemini **可续期**（Google OAuth 的 refresh_token，且会轮换）。

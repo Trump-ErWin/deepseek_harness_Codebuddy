@@ -2764,16 +2764,14 @@ pnpm test:e2e:minimax-chat   # ⚠️ 发推理（真实适配器；默认测 M2
 
 | 维度 | ZCode | 对照 |
 |---|---|---|
-| **凭据来源** | **解密磁盘** `~/.zcode/v2/credentials.json` | 浏览器登录拿 token |
+| **凭据来源** | **只有插件自己的 OAuth 流程**（⚠ 2026-10-05 起**不再**读取本机 ZCode 客户端数据，见下） | 浏览器登录拿 token |
 | **协议** | **Anthropic Messages**（非 OpenAI 兼容） | 其余多为 OpenAI 格式 |
 | **按需前置** | 推理路径**已不需要**（3.14.4 起上游关闭了模型请求的验证码校验，2026-10-01 实测 6/6 均 200）；`3007` 防御分支保留以防回滚。**领取路径仍每次**要一个一次性 captcha（稳态复用页面 **0.4–0.5 秒**：中位 426ms / 平均 546ms；含 chromium 冷启动那次实测 4.2 秒） | 无 |
 | **请求体准入** | 必须带**官方身份块**（否则 `3012`） | 无 |
 
-### 凭据：**可以完全脱离官方客户端**
+### 凭据：**只有一条来源**（插件自己的 OAuth 流程）
 
-两条路**并存**，插件自存优先：
-
-1. **插件内登录**（推荐，无需装任何东西）—— 走官方 CLI 设备授权流：
+1. **插件内登录** —— 走官方 CLI 设备授权流：
 
    ```
    ① POST /api/v1/oauth/cli/init        Bearer <自己生成的 32 字节 hex>
@@ -2789,19 +2787,52 @@ pnpm test:e2e:minimax-chat   # ⚠️ 发推理（真实适配器；默认测 M2
    走完（实测 ① 返回 200、③ 正常 `pending` 轮询）。它还**绕开了故障的**
    `POST /api/v1/oauth/token`（该端点自 2026-09-28 起稳定 500 / code 2007）。
 
-2. **回退：读官方客户端凭据** —— 解密 `~/.zcode/v2/credentials.json`
-   （`enc:v1:` + AES-256-GCM，密钥由官方公开算法派生：
-   `sha256(ZCODE_CREDENTIAL_SECRET ?? \`zcode-credential-fallback:${platform}:${homedir}:${username}\`)`）。
-   「已经装了官方客户端并登录过」的用户**零操作**即可用。
+⚠️⚠️ **本插件不读取本机 ZCode 客户端的任何数据**（2026-10-05 起）。
 
-⚠️ **`device_mid` 由插件自己生成**（UUID v4），不再读官方
-`telemetry-state.json` —— 这是「脱离 IDE」的关键。实测依据：同一 JWT 换
+早期版本有一条「回退：解密 `~/.zcode/v2/credentials.json`」的旁路，
+让「装了客户端并登录过」的用户零操作可用。**已整体删除**：
+
+- **安全**：那条路等价于「任何本地进程都能解密 ZCode 的登录凭据」——
+  官方用 `zcode-credential-fallback:<平台>:<家目录>:<用户名>` 过 `sha256`
+  派生 AES-256-GCM 密钥，算法是**公开可复现**的。把它复制进 DSH，意味着
+  DSH 具备读取用户**另一个应用**登录态的能力。
+- **正确性**：它只认 bigmodel 渠道的 `oauth:bigmodel:user_info`，
+  zai 渠道写的是 `oauth:zai:user_info` ⇒ 读出来 `user_id` 恒缺、账号名退化成
+  「设备xxxxxxxx」（Gitee issue IKJNPZ）。且两个渠道的 `user_info` **结构也不同**
+  （zai 的是 `{user_id, email, avatar, name}`，没有 `id`）——
+  **只放宽键名片段是修不好的**。
+- **一致性**：插件本来就有完整可用的 OAuth 流程，旧路径是条**功能更差的旁路**。
+
+⇒ 代价是：只装了 ZCode IDE 的用户需要**自己点一次「添加账号」**。
+防回退的回归锁在 `tests/unit/zcode-no-local-credential-read.spec.ts`
+（它**扫源码字面量**，不是断言函数不存在 —— 后者对新写的读取函数无效）。
+
+⚠️ **`device_mid` 由插件自己生成**（UUID v4），不读官方
+`telemetry-state.json`。实测依据：同一 JWT 换
 任意随机 UUID，`billing/balance` 都返回 200；而缺它才回
 `400 {"code":3001,"msg":"parameter error"}`。故它的**值**不被绑定校验，
 只需**稳定**（生成后持久化在凭据里，登录一次即固定）。
 
 ⚠️ 凭据形状校验必须做：凭据存储里可能有任何字符串（用户手填、旧版本残留），
 `isUsableZcodeCredential()` 保证后续代码拿到的是完整对象。
+
+### coding-plan（**付费订阅**）通道：登录时顺手换取
+
+除免费积分通道（`start-plan`）外，ZCode 还有一条走**订阅额度**的
+`coding-plan` 腿（承载 `glm-5.3` / `glm-5.3-flash`，端点 `api.z.ai`）。
+
+⚠️ 它的 api-key **不是登录时下发的** —— 要用登录拿到的 OAuth
+access_token **现换**（三个只读 GET，不在云上建 key）。本插件在
+`startLogin` 成功后**顺手换一次**并写回凭据（`ZcodeAuth.resolveCodingPlanKey`）：
+
+- 字段按「拿到哪个 token」落位：zai → `coding_plan_key_zai`，
+  bigmodel → `coding_plan_key_bigmodel`；
+- **换不到不报错**（没买订阅是常态）—— 只记日志，`start-plan` 照常可用；
+- 带 8 秒超时，慢网不会把登录挂住。
+
+⚠️ 这条链路此前是**断的**：那个换取函数建好了却没有任何调用方，而两个 key
+字段的唯一写入点是已删除的「读本机凭据」⇒ **纯插件登录用户的付费通道一直
+不可用**。本次一并接上。
 
 ### captcha：唯一还需要浏览器的地方
 
@@ -3127,7 +3158,7 @@ zcode: 上游风控拦截（3012 unusual activity）。⚠ 该错误有账号冷
 ### 实测（本机，2026-09-29）
 
 ```
-readZcodeCredential()   ✓  device_mid=72c145cd…  app_version=3.14.3
+（凭据来自插件内登录）✓  device_mid=72c145cd…  app_version=3.14.3
 fetchZcodeBalance()     ✓  GLM-5.3-Flash  remaining=99,999,344 / 100,000,000
 fetchZcodeCaptchaConfig ✓  {"region":"cn","prefix":"no8xfe","sceneId":"11xygtvd"}
 captcha mint            ✓  2339ms  len=280  securityToken=128

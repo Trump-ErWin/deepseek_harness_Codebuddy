@@ -2319,10 +2319,12 @@ function ProviderPanel({ provider, rpcCall }) {
       accountId = res.accountId;
       loginUrl = res.loginUrl;
       console.log('[jet-hub] account.create ok, provider =', provider, ', accountId =', accountId);
-      // ⚠ **`reused` 分支必判**（本条判据在已随 IKJLHQ 移除的官方卡片账号区里也写过）：本机已有可用凭据时
-      // 后端**不新建条目、不返回 loginUrl**（用户报障「点了添加就多一个」的修复），
-      // 返回的是 `{reused:true, loginUrl:''}`。若只看 `loginUrl` 为空就报
+      // ⚠ **`reused` 分支必判**：后端若声明「复用了池里已有条目、新建条目与登录 URL」，
+      // 它返回的是 `{reused:true, loginUrl:''}`。若只看 `loginUrl` 为空就报
       // 「后端未返回登录地址」，会把一次成功操作显示成失败。
+      // ⚠️ **2026-10-05 起 ZCode 不再产生它**（「不读本机 ZCode 数据」的决策删掉了
+      // 那条复用短路），但本分支**刻意保留**：它是**契约防御** —— 判据写成
+      // 「后端声明复用则空 URL 是正常的」，比反过来假设「空串必是错误」更稳。
       if (res.reused) {
         setLoginUrlForManual(null);
         await loadAccounts();
@@ -2363,9 +2365,9 @@ function ProviderPanel({ provider, rpcCall }) {
         // 轮询等待登录完成。
         // ⚠ 超时**不用**另起的 `setTimeout`，而是记 deadline 在轮询里判：这样全场只有
         //   一个句柄（pollRef），卸载清理与超时都不会漏掉第二个定时器。
-        // ⚠ `reused` 分支必判（同上，`account.create` 契约）：本机已有可用凭据时后端
+        // ⚠ `reused` 分支必判（同上，`account.create` 契约）：后端声明复用时
         //   **不新建条目、不返回 loginUrl**；只看 `loginUrl` 为空就报错会把一次
-        //   成功操作显示成失败（后端 `account.create` 返回 `{reused:true, loginUrl:''}`）。
+        //   成功操作显示成失败。ZCode 已不再产生该值，但判据保留作契约防御。
         const deadline = Date.now() + 300000;
         pollRef.current = setInterval(async () => {
           if (!mounted.current) { stopPoll(); return; }

@@ -6908,6 +6908,10 @@ ZCode **不可续期**（凭据是静态的、没有 refresh 端点），所以�
 这样用户在官方客户端重新登录后新凭据能铺开到所有条目」——
 那个前提在**多账号池**下**不成立**：磁盘凭据只对应一个账号。
 
+> 📌 **2026-10-05 更新**：上面这条「磁盘凭据」现在**根本不存在**了 ——
+> 读本机 ZCode 数据的整套能力已被删除（见下方 §9）。本节保留这段推理，
+> 因为它记录的仍是「为什么不能用**一份**凭据去填**多账号**池」的通用教训。
+
 #### 8.4 回归与**反向验证**
 
 `tests/unit/zcode-account-isolation.spec.ts`（6 条）：
@@ -7017,6 +7021,145 @@ ZCode **不可续期**（凭据是静态的、没有 refresh 端点），所以�
 `AccountPool` 经 `ctx.credentials` 取服务）；
 ③ **不要**用 `replaceAll`（那是 Jet Hub 的导入路径，语义不同；
 我第一版用它导致 3 条用例假失败）。
+
+### 十、⚠️⚠️ **不再读取本机 ZCode 客户端的数据**（用户决策 2026-10-05，Issue IKJNPZ）
+
+**用户决策**：「可否改成不读本机 ide 的数据，只用我们自己的 auth 流程」——
+**已整体执行**。凭据现在**只有一条来源**：插件自己的 OAuth 流程
+（`zcode-login.ts` → 写 `ctx.credentials`）。
+
+#### 10.1 起因：Issue IKJNPZ 暴露了那条路的**双重失效**
+
+用户报障（2026-10-04，issue IKJNPZ）：zai 渠道下读本机凭据得到的
+`account_label` 退化成「设备xxxxxxxx」、`user_id` 缺失。
+
+**本机实机复现**（`credentials.json` 实为 `oauth:zai:*` 一族，
+`oauth:active_provider = "zai"`）：
+
+```
+zcode_jwt     ✅ len=255      device_mid  ✅ len=36
+user_id       ❌ 缺失          account_label = 设备72c145cd
+bigmodel_access_token ❌ 缺失   zai_access_token ❌ 缺失
+```
+
+⚠⚠ **issue 建议的修法不足以解决它自己描述的连带影响** ——
+`KEY_FRAGMENTS.userInfo` 从 `'oauth:bigmodel:user_info'` 放宽成 `'user_info'`
+**只能修好 `account_label`**。因为**两个渠道的 user_info 形状根本不同**：
+
+| | 键名 | 实测形状 |
+|---|---|---|
+| bigmodel | `oauth:bigmodel:user_info` | `{id, username, displayName, rawProfile}` |
+| **zai** | `oauth:zai:user_info` | `{user_id, email, avatar, name}` ← **没有 `id`** |
+
+⇒ `readUserIdFromUserInfo()` 只认 `id` / `userId` / `rawProfile.user_id`，
+**不认顶层 `user_id`**；`identityFromUserInfo()` 只认 `displayName` /
+`username` / `rawProfile.name`，**不认 `name`** ⇒ 放宽片段后 `user_id` 与
+`account_name` **仍然缺失** ⇒ `adoptOfficialCredential` 的**闸②**
+（`user_id` 缺失 + 池里有其它账号 ⇒ 失败关闭）**照样拦下**。
+⚠ **教训**：报障者只看了一层（键名匹配），没看下一层（**结构**不兼容）。
+按建议改完仍会复现「连带影响」。
+
+⚠ **issue 也漏了第 4 处**：`readZcodeCredential` 只填
+`bigmodel_access_token`，**`zai_access_token` 是死字段**（全仓只有
+`zcode-auth.ts` 的登录路径会填它）⇒ zai 账号走该路时
+`fetchCodingPlanApiKey` 的 `zai ?? bigmodel` **两边都是 undefined**。
+
+#### 10.2 删除范围（`git diff` 实测：src 净减约 700 行）
+
+| 文件 | 删掉的东西 |
+|---|---|
+| `src/zcode.ts` | `readZcodeCredential` / `resolveZcodeCredential` / `readRawCredentials` / `credentialFileCandidates` / `resolveCredentialFilePath` / `decryptCredentialValue` / `deriveCredentialKey` / `pickCredential` / `KEY_FRAGMENTS` / `readDeviceMid` / `telemetryFileCandidates` / `detectZcodeAppVersion` / `labelFromUserInfo` / `identityFromUserInfo` / `readUserIdFromUserInfo` + 全部 `enc:v1:` 常量（597 → 178 行） |
+| `src/zcode-auth.ts` | `ZcodeAuthOptions.readCredential` 注入点、`localCredential()`、`adoptOfficialCredential()`、`adoptIntoOrphanAccount()`、`hasStoredCredential()`、`hasOtherZcodeAccounts()`、`accountIdOf()`（−255 行） |
+| `src/jet-hub-rpc.ts` | `account.create` 里的两段本机复用短路（孤儿收编 / 同 `user_id` 返回 `{reused:true}`） |
+
+**保留**：`phoneFromUserId`（登录路径在用）、`isUsableZcodeCredential`、
+`isZcodeExpired`、`ZCODE_APP_VERSION_FALLBACK`（`zcode-upstream.ts` 有 6 处用）、
+`ZcodeCredential` 的全部字段、`source` 字段（**存量凭据**里可能写着 `'ide'`）。
+
+#### 10.3 ⚠ 顺带修好 coding-plan：**一条早已断掉的链**
+
+删除过程中发现的**既有**断链（与本次删除无因果关系）：
+
+| | 状态 |
+|---|---|
+| `coding_plan_key_zai` / `_bigmodel` 的**唯一**写入点 | 上面被删的 `readZcodeCredential()` |
+| 唯一能补 key 的 `fetchCodingPlanApiKey()` | **零调用方**（建好却没人调） |
+| ⇒ 纯插件登录用户的 coding-plan（**付费**）通道 | **一直不可用** |
+
+用户选择「顺手接线」后已修：`ZcodeAuth.resolveCodingPlanKey()` 由
+`startLogin` 在组装凭据后调用，**best-effort + 8 秒超时 + 失败只记日志**
+（没买订阅是常态，**绝不能**因此把用户挡在门外；`start-plan` 照常可用）。
+⚠ **字段按「拿到哪个 OAuth token」落位**（zai → `_zai`，bigmodel → `_bigmodel`），
+与 `zcode-transport.ts` 里 `zai ?? bigmodel` 的优先级一致。
+
+⚠ **这次接线是删掉读本机凭据后**唯一**能让付费 plan 继续可用的路子** ——
+不接它，装了 IDE 的用户会失去该通道（`glm-5.3` / `glm-5.3-flash`）。
+
+#### 10.4 ⚠⚠ 防回退锁是**扫源码字面量**，不是「断言函数不存在」
+
+`tests/unit/zcode-no-local-credential-read.spec.ts`（4 条）。理由：
+删掉导出后，「有没有人重新加回读取逻辑」在运行时**无从断言** ——
+新写的 `readZcodeCredentialFromDisk()` 不会让任何既有用例变红。
+故改成扫 `src/*.ts`（先剥掉注释避免本文自身的说明文字误报），
+命中 `.zcode/v2` / `credentials.json` / `telemetry-state.json` /
+`zcode-install-manifest` / `zcode-credential-fallback` / `enc:v1:` /
+`aes-256-gcm` 即失败。
+
+⚠ **必须用词边界**：`zcode-auth.ts` 里仍有 `readStoredCredential` /
+`readCredentialFromRef` / `readCredentialFromPool` 三个**合法**方法
+（只读 `ctx.credentials`，不碰磁盘），裸 `/readCredential/` 会把它们一起误报 ——
+我第一版就写错了，改成 `/\breadCredential\b/` 才绿。
+
+⚠ **已做反向验证**：在 `zcode-transport.ts` 临时加回
+`join(homedir(), '.zcode', 'v2', 'credentials.json')` ⇒ **1 条变红**并指出文件名；
+还原后全绿。⇒ 不是同义反复。
+
+#### 10.5 ⚠ 用户可见文案**必须同步改**，否则把用户引向无效操作
+
+删的是能力，但**文案会留下来**。已改的三处（漏了任何一处都在误导人）：
+
+- `zcode-adapter.ts` 的 401/1002 文案原写「请重新在**官方 ZCode 客户端**登录」
+  ⇒ 现在去客户端登录**完全无效**（插件根本不读它），已改指 Jet Hub。
+- `zcode-auth.ts` 的 `probe()` / `persistCurrent()` 原因文案原写
+  「若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的凭据」。
+- `zcode-adapter.ts` 的 `MISSING_CREDENTIAL` 文案同款。
+
+⚠ `types.ts` 的 `reused` 字段**保留**（当前已无 provider 会返回 `true`），
+理由：它是**契约防御**（判据写成「后端声明复用则 `loginUrl` 为空是正常的」，
+比反过来假设「空串必是错误」更稳），不必为一次能力下线去改前端渲染分支。
+`forceNew` 则**已删**（前端 2026-10-02 起不再传、后端也不再读 = 无操作）。
+
+#### 10.6 踩过的两个坑
+
+1. ⚠ **反向验证脚本本身出错，比反向验证失败更危险**：第一次用
+   `PowerShell -replace` 时把拼接表达式写进了参数位（`-replace` 只接 3 个参数），
+   脚本在写入前抛错，`$mutated` 仍为空 ⇒ **把源文件清空了**，
+   测试报的却是 `ZcodeAuth is not a constructor`（看着像接线坏了，其实是文件没了）。
+   ⇒ 教训：**写回前必须校验**（`if ($mutated -eq $backup) { 还原; throw }`
+   外加字符数变化量守卫）。第二次加守卫后又因阈值过严（403 > 400）主动中止并还原 ——
+   守卫本身是对的。
+2. ⚠ **mock `runZcodeLogin` 必须回调 `onAuthorizeUrl`**：`startLogin` 是两步式，
+   它 `await` 一个**只由该回调 resolve** 的 `urlPromise` ⇒ 替身不回调就整条用例
+   5 秒超时，症状看起来像「接线失败」。且**别用逐条 `mockImplementation`**：
+   `() => fakeLogin(...)` 这个箭头函数**不接参数**，会把含 `onAuthorizeUrl` 的
+   `options` 整个吞掉 —— 同一个坑的第二个入口。正确做法是**可变状态** +
+   单一实现始终透传参数（`zcode-coding-plan-key.spec.ts` 即此写法）。
+
+#### 10.7 回归与反向验证
+
+- `zcode-no-local-credential-read.spec.ts`（4 条，防回退）——反向验证过（1 条变红）。
+- `zcode-coding-plan-key.spec.ts`（6 条，coding-plan 接线）——**反向验证过**：
+  摘掉 `startLogin` 里那 4 行接线 ⇒ **恰好 2 条**「换到 key」变红
+  （`expected undefined to be 'AK-1.SECRET'`），另 4 条「不牵连登录」仍绿
+  ⇒ 说明两类用例分别覆盖「接上了」与「失败不炸」两种失效。
+- 5 个受影响的既有 spec 改用**真实 `ctx.credentials` 路径**注入凭据
+  （不再用已删的 `readCredential` 注入点）—— 这反而是**更好的测试**：
+  它们现在覆盖的是生产环境真正走的路径。
+
+⚠ **子代理并发改测试时的竞态**：本次两个 agent 并行改测试，其中一个在跑全量时
+撞上我正在用脚本改写 `src/zcode-auth.ts`，`readFileSync` 读到空串报
+`expected '' to match /extends Service/`。**那不是缺陷，是写入竞态** ——
+**改完必须整体重跑全量**再下结论。
 
 ## ⚠️⚠️ `3012` 的 HTTP 状态码是 **405**（不是 403），且身份块**之外**的变量已全部排除（Issue IKJI0Y，2026-10-03）
 

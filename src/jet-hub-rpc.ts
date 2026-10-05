@@ -1210,7 +1210,7 @@ function registerJetHubEndpoints(
    *
    * ## 取值顺序：先信凭据里已存的，再现场派生
    *
-   * 新凭据由 `readZcodeCredential` / `startLogin` 直接写入 `account_name` /
+   * 新凭据由 `startLogin` 直接写入 `account_name` /
    * `phone`；**旧凭据**（本次改动之前登录的）没有这两个字段，故现场兜底：
    * 手机号从 `user_id` 派生、账号名回退到**不像占位串**的 `account_label`。
    */
@@ -1753,53 +1753,17 @@ function registerJetHubEndpoints(
            * 窗口内有效（`AGENTS.md` 记过 CodeArts 早期「主页面被跳转」的
            * 缺陷就是等授权完才返回 URL 导致的）。
            *
-           * ## 与「读官方客户端凭据」的关系
+           * ## ⚠ 本分支**不再读官方客户端的本机凭据**（2026-10-05 用户决策）
            *
-           * 早期实现是「确认磁盘上有一份官方客户端写的凭据」，
-           * 那要求用户先装并登录官方 ZCode —— 与「装完即用」冲突。
-           * 现在改为**插件自己走 OAuth**（实测 `/oauth/cli/init` →
-           * 浏览器授权 → `/oauth/cli/poll/{flow_id}` 完全跑通，
-           * 纯 HTTP、不经 `zcode://` 回调）。
+           * 早先有两道「先复用本机已有账号」的短路（孤儿条目收编 + 同 `user_id`
+           * 去重返回），它们依赖解密 `~/.zcode/v2/credentials.json` ——
+           * **已整体删除**（理由见 `src/zcode.ts` 文件头）。⇒ 现在点「添加账号」
+           * **一律**新起一轮 OAuth。
            *
-           * 若用户**已经**装并登录了官方客户端，则不必点这个按钮 ——
-           * `refreshAll` / 首次加载时会自动把官方凭据固化进来。
+           * ⚠ 「点一次多一条」仍由**登录成功后**的去重兜住（下方
+           * `loginResult` 分支里的 `findAccountIdByIdentityField`）——
+           * 判据是插件自己拿到的 `user_id`，不再依赖本机文件。
            */
-          /**
-           * ★★ **先复用本机已有账号，不要「点一次多一条」**（用户报障 ⑯）。
-           *
-           * ## 报障原文
-           *
-           * 「然后账号应该读取有效的本地账号凭证，而不是点了添加就多一个，
-           * 还没有删除账号的按钮」
-           *
-           * ## 两道复用（都**不新起** OAuth，故点下去不会多出条目）
-           *
-           * ① **孤儿条目修复**：池里有「条目在、凭据从未写入」的账号
-           *    （上一次登录被进程重启打断的产物）⇒ 把本机官方凭据补进去
-           *    并回填昵称，直接返回该条目。这同时治好了 ⑦「凭据未配置」。
-           * ② **同一账号已在池里**：本机官方凭据的 `user_id` 已属于某个条目
-           *    ⇒ 什么都不用做，如实告知「已存在」并返回它的 id —— 不建新条目、
-           *    不弹浏览器（否则用户会以为是新账号，实际会多出一条重复记录）。
-           *
-           * ⚠ 「本机有没有官方凭据」是**必要条件**：没装客户端、或没登录过时
-           * 两者都跳过，照旧走下面的 OAuth 流程（那是「装完即用」的保证）。
-           *
-             */
-          const orphanId = await zcode.adoptIntoOrphanAccount(pool).catch(() => undefined)
-          if (orphanId !== undefined) {
-            // `loginUrl` 用**空串**而不是 undefined：与 `loginMode: 'sms'` 的既有约定
-            // 一致（「没有可打开的 URL」），前端据 `reused` 分支处理。
-            return { ok: true, value: { accountId: orphanId, loginUrl: '', reused: true } }
-          }
-          const local = await zcode.localCredential()
-          if (local !== undefined && typeof local.user_id === 'string' && local.user_id.length > 0) {
-            const holder = await pool.findAccountIdByIdentityField(
-              ZCODE.id, 'user_id', local.user_id,
-            )
-            if (holder.length > 0) {
-              return { ok: true, value: { accountId: holder, loginUrl: '', reused: true } }
-            }
-          }
           const started = await zcode.startLogin({
             refName,
             // ⚠️ 缺省 `'bigmodel'`（既有行为不变）；`'zai'` 走 chat.z.ai 国际版。
@@ -2062,9 +2026,9 @@ function registerJetHubEndpoints(
               /**
                * zcode **没有 refresh 端点**（凭据是静态的，与 Loomy 同类）。
                *
-               * 但这个方法仍做实事：**重读磁盘凭据并回写** —— 使用户在
-               * 官方 ZCode 客户端重新登录后，点「刷新」即可生效而无需
-               * 重启 DSH。凭据不可用时如实抛错（让用户知道要去官方客户端登录）。
+               * 但这个方法仍做实事：**逐账号重读自己的 ref 并规范化回写** ——
+               * 用户重新登录后点「刷新」即可生效而无需重启 DSH。
+               * 凭据不可用时如实抛错（引导用户重新登录该账号）。
                */
               await zcode.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
