@@ -169,6 +169,121 @@ describe('createTokenLedgerStore（文件后端）', () => {
     }
   })
 
+  /**
+   * ★ 回归（审计发现的真实缺陷，上游首轮修复未覆盖）：**两个实例并存时，
+   * 后 flush 者不得抹掉先者的数据** —— `flush()` 必须是**增量合并写**。
+   *
+   * 场景来自 fiber 重启交错（旧 store 未 dispose、新 store 已 apply）。首轮修复
+   * 只做到「新实例构造时读盘」（解决**顺序**：新实例是旧数据的超集），但两个实例
+   * **并存**时各自内存视图独立，整体覆盖会互相抹掉。实测双向丢失：
+   *
+   * ```
+   * O 记 100（未 flush）        : 盘 = 0
+   * N 记 1 并 flush             : 盘 = 1
+   * O.flush()（旧 fiber dispose）: 盘 = 100   ← N 的 1 被抹掉
+   * N 再记 5 并 flush           : 盘 = 6     ← O 的 100 也丢（期望 106）
+   * ```
+   */
+  it('★ 两实例并存：后 flush 者不得抹掉先者的数据（增量合并写）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-clobber-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    try {
+      const file = join(home, 'jet-hub', 'token-ledger.json')
+      const key = 'direct|codearts||GLM-5.2'
+      const today = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+      const disk = (): number => {
+        const doc = JSON.parse(readFileSync(file, 'utf-8')) as { days?: Record<string, Record<string, { inputTokens: number }>> }
+        return doc.days?.[today]?.[key]?.inputTokens ?? 0
+      }
+
+      // 旧 fiber 的 store（O）与新 fiber 的 store（N）并存
+      const older = createTokenLedgerStore({ logger: undefined } as never)
+      older.append({ ts: Date.now(), ...makeEntry({ inputTokens: 100 }) }) // 尚未 flush
+
+      const newer = createTokenLedgerStore({ logger: undefined } as never)
+      newer.append({ ts: Date.now(), ...makeEntry({ inputTokens: 1 }) })
+      newer.flush()
+      expect(disk()).toBe(1)
+
+      // 旧 fiber 的 dispose：不得抹掉 N 刚写进去的 1
+      older.flush()
+      expect(disk(), '旧实例 flush 后不得抹掉新实例的数据').toBe(101)
+
+      // 新实例继续记账：两边的数据都要在（不是互相覆盖）
+      newer.append({ ts: Date.now(), ...makeEntry({ inputTokens: 5 }) })
+      newer.flush()
+      expect(disk(), '双向都不得丢').toBe(106)
+    } finally {
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
+  /**
+   * ★ 回归（审计发现）：**跨进程可见性** —— 另一实例在本次构造之后写盘的数据，
+   * 必须能被本次 flush 合并进去，而不是被自己的滞后视图覆盖。
+   *
+   * 这是同机多 profile 共享同一 home 的真实场景（`permanent-lock-store.ts` 开篇
+   * 与本文档模块头均已记载该共享关系）。
+   */
+  it('★ 别实例后写的数据不被本实例覆盖（跨实例可见性）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-visible-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    try {
+      const file = join(home, 'jet-hub', 'token-ledger.json')
+      const key = 'direct|codearts||GLM-5.2'
+      const today = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+      const disk = (): number => {
+        const doc = JSON.parse(readFileSync(file, 'utf-8')) as { days?: Record<string, Record<string, { inputTokens: number }>> }
+        return doc.days?.[today]?.[key]?.inputTokens ?? 0
+      }
+
+      const a = createTokenLedgerStore({ logger: undefined } as never)
+      a.append({ ts: Date.now(), ...makeEntry({ inputTokens: 100 }) })
+      a.flush()
+
+      const b = createTokenLedgerStore({ logger: undefined } as never) // B 构造时看到 100
+      a.append({ ts: Date.now(), ...makeEntry({ inputTokens: 50 }) })
+      a.flush() // 盘 = 150
+
+      // B 自己的内存视图滞后，但它 flush 时必须把 A 的 50 合并保留
+      b.append({ ts: Date.now(), ...makeEntry({ inputTokens: 7 }) })
+      b.flush()
+      expect(disk(), 'A 后写的 50 不得被 B 抹掉').toBe(157)
+    } finally {
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
+  /** 合并写不得重复计数：反复 flush 幂等（基线前移后增量应为 0）。 */
+  it('★ 反复 flush 不重复计数（增量基线正确前移）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-idem-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    try {
+      const file = join(home, 'jet-hub', 'token-ledger.json')
+      const key = 'direct|codearts||GLM-5.2'
+      const today = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+      const disk = (): number => {
+        const doc = JSON.parse(readFileSync(file, 'utf-8')) as { days?: Record<string, Record<string, { inputTokens: number }>> }
+        return doc.days?.[today]?.[key]?.inputTokens ?? 0
+      }
+      const store = createTokenLedgerStore({ logger: undefined } as never)
+      store.append({ ts: Date.now(), ...makeEntry({ inputTokens: 10 }) })
+      store.flush()
+      expect(disk()).toBe(10)
+      store.flush()
+      store.flush()
+      expect(disk(), '重复 flush 不得累加').toBe(10)
+    } finally {
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
   it('account 维度进入桶键（第 2 期）', () => {
     const home = mkdtempSync(join(tmpdir(), 'token-ledger-store-'))
     const prev = process.env.DSH_JET_HUB_STATE_DIR

@@ -237,25 +237,39 @@ export interface TokenLedgerBackend {
 let backend: TokenLedgerBackend | undefined
 
 /**
+ * 当前挂载的**唯一身份令牌**。
+ *
+ * ⚠️ 不能用 `backend === owned` 做判据（审计发现并已复现）：后端对象可能被
+ * **同一个对象重复挂载**，此时两个 disposer 的 `owned` 都等于 `backend`，
+ * 先调用的那个会把后一次挂载误摘掉。用每次挂载**新生成**的令牌做判据即可根治
+ * —— 令牌永不复用，且 `undefined` 之间也不会互相误判。
+ */
+let backendToken: object | undefined
+
+/**
  * 注入日聚合后端，返回**该次挂载专属的 disposer**。
  *
  * ⚠️ 返回的 disposer 只在「当前挂载的仍是我自己」时才清空 —— 这样 fiber 重启
  * 交错时，旧实例的 dispose 不会摘掉新实例的挂载（见 {@link backend} 的说明）。
  * disposer **幂等**：重复调用第二次是空操作。
  *
- * @param next - 后端实现；传 `undefined` = 无条件卸载（测试隔离用）。
+ * @param next - 后端实现；传 `undefined` = 卸载（测试隔离用）。
  */
 export function attachTokenLedgerStore(next: TokenLedgerBackend | undefined): () => void {
   backend = next
-  // 记录「本次挂载」的身份：用后端对象本身做判据（undefined 也自成一档）。
-  const owned = next
+  // 每次挂载都换一个新令牌（即使 next 是 undefined、或与上次是同一个对象）。
+  const token: object = {}
+  backendToken = token
   let disposed = false
   return () => {
     if (disposed) return
     disposed = true
-    // ⚠️ 所有权校验：只摘自己的。若期间已被别的实例接管，此次 dispose 必须让位
+    // ⚠️ 只摘自己的：令牌不匹配说明期间已被别的实例接管，此次 dispose 必须让位
     // —— 否则会把新一轮的挂载摘空（真实事故的传导路径）。
-    if (backend === owned) backend = undefined
+    if (backendToken === token) {
+      backend = undefined
+      backendToken = undefined
+    }
   }
 }
 
