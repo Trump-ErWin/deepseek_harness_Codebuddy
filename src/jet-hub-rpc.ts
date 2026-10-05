@@ -2081,11 +2081,50 @@ function registerJetHubEndpoints(
           }
           return { ok: true, value: { success: true } }
         } catch (error) {
+          /**
+           * ⚠⚠ **失败必须回 `ok: false`**，不得包成 `ok:true + value.success:false`
+           * （Gitee issue IKJOZA，真实缺陷）。
+           *
+           * ## 原来的行为与代价
+           * 本分支的 catch 曾把异常包进**成功**响应
+           * （`{ok:true, value:{success:false, error}}`）。而客户端的
+           * `unwrapRpcResult`（`plugin-src/management-rpc.mjs`）只判 `ok === true`
+           * 就返回 `value` —— 于是**只判 `ok` 的调用方会把续期失败读成成功**。
+           * 实测代价：报告方一个工具首版只判 `ok`，18 个「✅」里 **17 个实为失败**，
+           * 真实原因是 `codearts 400 STS5.1806 invalid refresh token:
+           * 'the refresh token has been used'` / `minimax refresh_token 已失效` /
+           * `raccoon 登录态已过期`。
+           *
+           * ## 为什么这里不能学那四处「catch 仍回 ok:true」
+           * 本文件确有四处 catch 后仍 `ok:true`，它们**都有额外的判别字段**，
+           * 调用方不判它就会误读，本端点没有 —— 逐条对照：
+           *
+           * | 位置 | 形态 | 为何安全 |
+           * |---|---|---|
+           * | `login.poll` | `{done:false}` | 「用户尚未授权完」是正常中间态 |
+           * | `login.submitSms` | `{done:false, error}` | 验证码输错可重试，前端必判 `done` |
+           * | `credits.permanentLock` | 广播失败仍 `ok:true` | 广播失败不影响已落盘 |
+           * | `credits.claimAll` | 单号失败进 `results[]` | 「单个失败不中断整体」是设计语义 |
+           *
+           * 本分支只有 `success` 一个布尔：**失败是业务终态，不是可自愈的中间态**，
+           * 与上述四者不同类。
+           *
+           * ## 为什么 `ok:false` 不会打破仓库内任何调用方
+           * `account.refresh` **全仓库零调用方**：面板 36 处 `rpcCall(` 里没有它
+           * （账号卡片的按钮是 测试/重测/重置/停用/代理/指纹/删除，**没有「刷新」**），
+           * `git log -S "rpcCall('account.refresh'"` 亦零命中 —— 它从来就是给
+           * 仓库外脚本/手工 RPC 用的端点。故这是**对外部调用方的破坏性契约变更**：
+           * 原先误判的调用方会从「静默错」变成 `unwrapRpcResult` 抛错，属预期的
+           * 「提前炸」。成功路径仍是 `ok:true + value.success:true`，未变。
+           *
+           * 回归用例在 `tests/unit/lobsterai-rpc-dispatch.spec.ts` 的
+           * 「issue IKJOZA」段（锁死「失败不得是 ok:true」+「失败必须带原因」）。
+           */
           return {
-            ok: true,
-            value: {
-              success: false,
-              error: error instanceof Error ? error.message : String(error),
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: error instanceof Error ? error.message : String(error),
             },
           }
         }

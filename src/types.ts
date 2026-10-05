@@ -258,8 +258,18 @@ export interface RpcRefreshAccountRequest {
   accountId: string
 }
 export interface RpcRefreshAccountResponse {
+  /**
+   * ⚠️ **只可能为 `true`**：续期失败**不回**本响应，而是回
+   * `{ok:false, error:{code:'bad-request', message}}`（Gitee issue IKJOZA）。
+   *
+   * 此前失败被包成 `{ok:true, value:{success:false}}`，而客户端
+   * `unwrapRpcResult` 只判 `ok` —— 只判 `ok` 的调用方会把失败读成成功
+   * （报告方一个工具因此把 17/18 次失败显示成「✅」）。
+   *
+   * ⇒ 判定失败**只有一个**判据：顶层 `ok === false`（或 catch 住 `unwrapRpcResult`
+   * 抛出的 `Error`，其 `message` 即 `error.message`）。
+   */
   success: boolean
-  error?: string
 }
 
 /**

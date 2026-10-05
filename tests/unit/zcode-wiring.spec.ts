@@ -540,7 +540,8 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     expect(source).toMatch(/else if \(provider === ZCODE\.id\) \{/)
   })
 
-  it('★ account.refresh 的 switch 有 zcode case（否则「刷新」按钮报 Unknown provider）', () => {
+  it('★ account.refresh 的 switch 有 zcode case（否则该端点报 Unknown provider）', () => {
+    // ⚠️ 该端点**没有面板入口**（issue IKJOZA 取证），别在测试名里写「刷新按钮」。
     expect(readRpc()).toMatch(/case ZCODE\.id:/)
   })
 
