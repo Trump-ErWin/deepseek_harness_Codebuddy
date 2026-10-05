@@ -437,16 +437,6 @@ export function clearDeadModels(provider: string, modelId?: string): number {
   return removed
 }
 
-/** 清空**全部** provider 的失效记录（排查 / 「全部重新显示」用）。 */
-export function clearAllDeadModels(): number {
-  const records = loadRecords()
-  let removed = 0
-  for (const entries of Object.values(records)) removed += Object.keys(entries).length
-  for (const key of Object.keys(records)) delete records[key]
-  if (removed > 0) persist()
-  return removed
-}
-
 /** 从列表里剔除此 provider 的已失效模型（非数组 / 无 id 的条目原样保留）。 */
 function filterList(providers: readonly string[], list: unknown): unknown {
   if (!Array.isArray(list) || list.length === 0) return list
@@ -463,11 +453,27 @@ function filterList(providers: readonly string[], list: unknown): unknown {
   return kept.length === list.length ? list : kept
 }
 
+/**
+ * 记录归属的 provider：`prepareCall(provider, …)` 与 `stream(options)` 都带 provider，
+ * 故**按本次请求实际的 provider 归属**。
+ *
+ * ⚠️ 不可退化成「取 ids[0]」（2026-10-06 复审修）：那会让一个注册多路由的实例把
+ * 所有失效都记到第一条路由上，而 {@link filterList} 却按**全部** ids 取并集过滤 ——
+ * 两处口径不一致 ⇒ **跨 provider 误过滤**（pA 的失效会连带隐藏 pB 的同名模型，
+ * 而不同 provider 确有同名模型，如 buddy 与 workbuddy 的模型池高度重合）。
+ *
+ * @param ids - 本适配器注册的 provider id 列表。
+ * @param candidate - 本次请求的 provider；不在 ids 内则回退到第一条路由。
+ */
+function ownerOf(ids: readonly string[], candidate: unknown): string {
+  return typeof candidate === 'string' && ids.includes(candidate) ? candidate : ids[0]!
+}
+
 /** 适配器里本模块需要包装的成员（其余原样透传）。 */
 interface PrunableAdapter {
   listModels?: (...args: unknown[]) => unknown
   listAllModels?: (...args: unknown[]) => unknown
-  stream?: (options: { model?: unknown }) => unknown
+  stream?: (options: { model?: unknown, provider?: unknown }) => unknown
   prepareCall?: (...args: unknown[]) => unknown
 }
 
@@ -551,8 +557,6 @@ export function withDeadModelPruning<T extends object>(
 
   const target = adapter as PrunableAdapter & object
   const bound = new Map<PropertyKey, unknown>()
-  /** 记录归属的 provider：一个实例注册多路由时取第一个（当前 14 处注册都是单元素）。 */
-  const owner = ids[0]!
   /** 懒建一次并缓存，保证每次访问返回同一个函数（下游按函数身份缓存时不会失配）。 */
   const wrapOnce = <K extends PropertyKey>(key: K, make: () => unknown): unknown => {
     if (!bound.has(key)) bound.set(key, make())
@@ -570,18 +574,31 @@ export function withDeadModelPruning<T extends object>(
           filterList(ids, target.listAllModels!.apply(obj, args)))
       }
       if (prop === 'stream' && typeof target.stream === 'function') {
-        return wrapOnce(prop, () => (options: { model?: unknown }): unknown =>
-          trackStream(owner, target.stream!.apply(obj, [options]) as AsyncIterable<unknown>, options?.model))
+        return wrapOnce(prop, () => (options: { model?: unknown, provider?: unknown }): unknown =>
+          trackStream(
+            ownerOf(ids, options?.provider),
+            target.stream!.apply(obj, [options]) as AsyncIterable<unknown>,
+            options?.model,
+          ))
       }
       if (prop === 'prepareCall' && typeof target.prepareCall === 'function') {
         return wrapOnce(prop, () => async (...args: unknown[]): Promise<unknown> => {
           const call = await target.prepareCall!.apply(obj, args) as PreparedAdapterCall
           if (call === null || typeof call !== 'object' || typeof call.stream !== 'function') return call
           // ⚠️ 关键：包装的是**返回的 call.stream**，不是 prepareCall 自身。
+          // `prepareCall(provider, model, signal)` 的第一个实参就是 provider ——
+          // 用它归属，跨 provider 误过滤才不会发生（当前 14 处注册都是单元素，
+          // 但 filterList 按全部 ids 取并集，两处口径必须一致）。
           return {
             ...call,
-            stream: (options: { model?: unknown }): AsyncIterable<unknown> =>
-              trackStream(owner, call.stream(options), options?.model),
+            stream: (options: { model?: unknown, provider?: unknown }): AsyncIterable<unknown> =>
+              trackStream(
+                // dispatch 时的 options.provider 更贴近真实路由（dsh-llm 会带上）；
+                // 没有或不在 ids 内才回退到 prepareCall 的实参，最后才回退 ids[0]。
+                ownerOf(ids, options?.provider ?? args[0]),
+                call.stream(options),
+                options?.model,
+              ),
           }
         })
       }

@@ -10,7 +10,6 @@ process.env.DSH_JET_HUB_STATE_DIR = STATE_DIR
 
 const {
   DEAD_MODELS_FILE,
-  clearAllDeadModels,
   clearDeadModels,
   configureDeadModelStore,
   deadModelIdsFor,
@@ -421,6 +420,40 @@ describe('withDeadModelPruning —— prepareCall 路径（!66 致命缺陷回�
     expect((wrapped as { prepareCall?: unknown }).prepareCall).toBeUndefined()
   })
 
+  /**
+   * ⚠️ 多路由归属回归（2026-10-06 复审）：一个实例注册 `[pA, pB]` 时，
+   * 记录**必须按本次请求的 provider 归属**，不能一律记到 `ids[0]` ——
+   * 否则 pA 的失效会连带隐藏 pB 的**同名**模型（buddy 与 workbuddy 的
+   * 模型池高度重合，这不是假想场景），且与 `filterList` 按全部 ids 取并集
+   * 的口径不自洽。
+   */
+  it('★ 多路由时按本次请求的 provider 归属记录（不记到 ids[0]）', async () => {
+    class Shared {
+      async listModels() { return [{ id: 'shared-id', name: 'Shared' }] }
+      listAllModels() { return [{ id: 'shared-id', name: 'Shared' }] }
+      async resolveModel(provider: string, model: string) { return { provider, id: model, name: model } }
+      async prepareCall(provider: string, model: string) {
+        return { model: await this.resolveModel(provider, model), stream: (o: { model: string }) => this.stream(o) }
+      }
+      async *stream(options: { model: string }) {
+        if (options.model === 'shared-id') {
+          throw Object.assign(new Error('model not found'), { code: 'HTTP_404' })
+        }
+        yield { ok: true }
+      }
+    }
+    clearDeadModels('multi-pB')
+    const wrapped = withDeadModelPruning(['multi-pA', 'multi-pB'], new Shared())
+
+    // 经 prepareCall('multi-pB') 触发 → 必须记到 pB，不能记到 pA。
+    const call = await wrapped.prepareCall('multi-pB', 'shared-id')
+    await expect(drain(call.stream({ model: 'shared-id' }))).rejects.toThrow()
+
+    expect([...deadModelIdsFor('multi-pB')], 'pB 应持有该记录').toEqual(['shared-id'])
+    expect(deadModelIdsFor('multi-pA').size, 'pA 不应被牵连').toBe(0)
+    clearDeadModels('multi-pB')
+  })
+
   it('prepareCall 返回非对象 / 无 stream 时原样透传（不构造坏结构）', async () => {
     const nonObject = withDeadModelPruning([PROVIDER], {
       async prepareCall() { return 42 },
@@ -502,11 +535,11 @@ describe('clearDeadModels —— 用户唯一的自愈路径', () => {
     expect((await wrapped.listModels()).some((m) => m.id === 'gone-1')).toBe(true)
   })
 
-  it('clearAllDeadModels 清空全部 provider', () => {
+  it('清空一个 provider 不会波及其它 provider（跨 provider 隔离）', () => {
     recordDeadModel('all-a', 'x', 'x')
     recordDeadModel('all-b', 'y', 'x')
-    expect(clearAllDeadModels()).toBeGreaterThanOrEqual(2)
+    expect(clearDeadModels('all-a')).toBe(1)
     expect(deadModelIdsFor('all-a').size).toBe(0)
-    expect(deadModelIdsFor('all-b').size).toBe(0)
+    expect([...deadModelIdsFor('all-b')]).toEqual(['y'])
   })
 })
