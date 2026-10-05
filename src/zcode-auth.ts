@@ -67,6 +67,15 @@ import { TtlCache } from './ttl-cache.js'
 import { generateDeviceMid, runZcodeLogin, type ZcodeLoginProvider } from './zcode-login.js'
 import { fetchCodingPlanApiKey } from './zcode-transport.js'
 import {
+  formatZcodeDiagnostic,
+  formatZcodeUnusualActivityMessage,
+  isZcodeUnusualActivityCode,
+  mentionsZcodeUnusualActivity,
+  noteZcodeRequestFailed,
+  noteZcodeRequestOk,
+  noteZcodeRequestSent,
+} from './zcode-diagnostics.js'
+import {
   claimZcodePlan,
   fetchZcodeBalance,
   fetchZcodeCaptchaConfig,
@@ -1388,61 +1397,33 @@ export class ZcodeAuth extends Service {
       this.captchaMintConfig = captchaConfig
       const region = captchaRegion ?? captchaConfig.region
 
+      /**
+       * ★★ 领取路径的诊断埋点与 `3012` 文案（Gitee issue IKJOQB）。
+       *
+       * 此前领取路径对 `3012` **既没有专门文案、也没有任何埋点** ——
+       * 用户看到裸上游串、看不到「请勿连续重试」（该错误有账号冷却惩罚）。
+       * 完整论证见 `toClaimOutcome` 的 `3012` 分支与
+       * {@link resolveClaimAccountId}；这里只记三件与**本方法**有关的事：
+       *
+       * ① 三笔账（sent/ok/failed）按账号记在**每一发**上（含 3007 换链的重发）；
+       * ② 账号标识取**池条目 id**，与推理路径合并同一份画像；
+       * ③ 命中 `3012` 必须**短路**（见下）。
+       */
+      const accountId = await this.resolveClaimAccountId(credential)
+
       const outcomes: ClaimOutcome[] = []
       for (const plan of plans) {
-        try {
-          // ⚠ 每个 plan 单独 mint（captcha 一次性）：内部载体优先，等不到即那条 chromium 链。
-          const minted = await this.mintClaimCaptcha(mintCaptcha, captchaConfig)
-          const outcome: ZcodeClaimOutcome = await claimZcodePlan(
-            credential, plan.planId, { param: minted.param, region }, this.fetchImpl,
-          )
-          /**
-           * ★ **评审 C4：claim 接上 3007 降级链**（此前只有推理路径有，领取这条**最需要**它的路径反而没有）。
-           *
-           * ## 为什么领取上尤其严重
-           * `/zcode-plan/billing/claim` **始终**索要 captcha，且校验**前置于** plan 校验
-           * （实测：带非法 captcha 与不带 captcha 都回 `400/3007`）⇒ 内部 param 在这里
-           * 被拒的概率比推理路径高得多。少了这段，用户看到的就是「一键领取直接失败」，
-           * 而失败原因只有一个干巴巴的 `3007`。
-           *
-           * ## 三条纪律
-           * 1. **只按 `minted.source === 'internal'` 归因**：chromium 的 param 被拒是
-           *    「时效 / 设备信誉」问题（`CaptchaBackoff` 管的那本账），不许记到载体头上；
-           *    而 `source === 'chromium'` 本身就说明**载体链本轮没参与**
-           *    （web 版 `supplied` 恒 0、或 env 关掉了），**没有第二条链可换** ——
-           *    「chromium 被拒也重试一次」只会白扣同设备每小时 150 次那份配额，
-           *    且换一个 chromium param 面对同一个服务端判定，期望收益极低
-           *    （Gitee issue IKJNPS 的附注质疑过这一点，结论是**维持现状**：
-           *    修好 region 之后，chromium 侧残留的 3007 都是时效/信誉性质，重试无益）；
-           * 2. **重发上限一次**：`retried` 标志在本 plan 循环内，重发后**无论成不成**都收工
-           *    —— 再撞 `3007` 就如实失败。再试下去只是白扣设备级配额（阿里云同设备 150 次/小时），
-           *    而且「已经换过 chromium 还是 3007」这件事**本身就是**给用户的诊断信息；
-           * 3. **禁用计数走既有语义**：记一次 `internalRejected`，到阈值由
-           *    `CaptchaCarrier` 判本次运行禁用（见 `noteInternalRejection`）。
-           *    「窗口结束时推进」与「当场推进」等价 —— 计数是**累计**的，窗口边界不影响它。
-           *
-           * ⚠ 重发用**注入链**（`mintCaptcha`，即 `jet-hub-rpc.ts` 注入的那条
-           *   `zcode.mintCaptcha`），不是 `carrier` 里那条腿 ——
-           *   claim 的 param 一贯由注入链产出，兜底也该走同一条，别在领取路径上偷换来源。
-           * ⚠ 重发**沿用同一份配置**（`captchaConfig`）：换 param 不换配置，
-           *   region 也就不变 —— 否则重发会亲手制造出「param 与 region 不同源」，
-           *   把一个偶发 `3007` 变成确定性失败。
-           */
-          if (outcome.code === 3007 && minted.source === 'internal') {
-            this.carrier.noteInternalRejection()
-            outcomes.push(await this.retryClaimWithInjectedChain(
-              credential, plan.planId, mintCaptcha, captchaConfig, region,
-            ))
-            continue
-          }
-          outcomes.push(toClaimOutcome(outcome, plan.planId, { plan }))
-        } catch (error) {
-          outcomes.push({
-            kind: 'failed',
-            code: -1,
-            message: `${plan.planId}: ${error instanceof Error ? error.message : String(error)}`,
-          })
-        }
+        /**
+         * ⚠ 单个 plan 的整段逻辑（mint → 首发 → 3007 换链重发 → 3012 短路判定）
+         * 抽在 {@link claimOnePlan} 里：它自带 `try/catch`、且**返回「是否要继续
+         * 下一个 plan」**。留在本方法里会让编排逻辑与单发逻辑混在一起，
+         * 使本方法超出「单一职责」并撞上源码切片护栏（实测 9246 > 8000）。
+         */
+        const step = await this.claimOnePlan({
+          plan, credential, accountId, mintCaptcha, captchaConfig, region,
+        })
+        outcomes.push(step.outcome)
+        if (!step.continueWithNextPlan) break
       }
       return outcomes
     } finally {
@@ -1471,6 +1452,158 @@ export class ZcodeAuth extends Service {
   }
 
   /**
+   * 领取**单个 plan** 的完整一步：mint → 首发 → 3007 换链重发 → 判定是否短路。
+   *
+   * ## 为什么抽成独立方法
+   *
+   * 它自带 `try/catch`，并**返回「是否继续下一个 plan」** —— 这两个都是
+   * 「单发」的概念，不属于编排层。留在 {@link claimDailyWith} 的循环里会让
+   * 那个方法同时承担编排与单发两种职责，并撞上源码切片护栏
+   * （`tests/unit/zcode-close-chromium.spec.ts` 断言其源码切片 < 8000 字符；
+   * 混写时实测 9246）。
+   *
+   * ## ★★ 3012 短路**只在这里判断一次**（真实缺陷，2026-10-05）
+   *
+   * 首发的 `3007` 会触发换链重发，而**短路检查曾位于该换链之前**，
+   * 于是重发那一发**绕过**了短路。桩测实测（两个 plan，首发 3007 ⇒ 重发 3012）：
+   *
+   * ```
+   * claims=3 outcomes=2   → 被风控的账号继续发了下一个 plan 并成功领取
+   * ```
+   *
+   * 即「一次点击连续触发多次风控」这条**恰在最需要它的场景下失效** ——
+   * 上游先因 captcha 拒、再因风控拒，正说明它已在盯这个账号。
+   * ⇒ 现在换链的结果**写回 `outcome`**，再由**唯一一处** `isClaimUnusualActivity`
+   * 判定短路，首发与重发天然共用，结构上不可能再漏。
+   *
+   * @returns `outcome` 本条结果；`continueWithNextPlan` 为 `false` 时调用方须 `break`
+   *   （即命中 `3012` 风控 —— **不要再发下一个 plan**，那会加重冷却惩罚）。
+   */
+  private async claimOnePlan(input: {
+    plan: ZcodeClaimablePlan
+    credential: ZcodeCredential
+    accountId: string | undefined
+    mintCaptcha: ZcodeClaimCaptchaMint | undefined
+    captchaConfig: ZcodeCaptchaConfig
+    region: string
+  }): Promise<{ outcome: ClaimOutcome; continueWithNextPlan: boolean }> {
+    const { plan, credential, accountId, mintCaptcha, captchaConfig, region } = input
+    try {
+      // ⚠ 每个 plan 单独 mint（captcha 一次性）：内部载体优先，等不到即那条 chromium 链。
+      const minted = await this.mintClaimCaptcha(mintCaptcha, captchaConfig)
+      /**
+       * ★ 「已发出」必须在 **mint 之后**记（真实缺陷，2026-10-05 自审发现）。
+       *
+       * `mintClaimCaptcha` 会**抛错**：注入链撞上退避冷却时会如实上抛
+       * （见 {@link retryClaimWithInjectedChain} 与 `mintCaptchaAfterRejection`）。
+       * 若把本行放在 mint **之前**，那次抛错就会留下**一次没有对应上游请求的
+       * `sent`**：① 失败计数少记（异常直接跳 `catch`）；②「距上条」的分母被一个
+       * **从未发出**的请求占用，下一次真实请求的间隔会算成「距那次失败」而不是
+       * 「距上一条真实请求」—— 正是 issue 要回答的「是否频率风控」被污染。
+       *
+       * ⚠ 与 {@link retryClaimWithInjectedChain} 的顺序**必须一致**（那里也是先
+       *   `await injected(...)` 再记 sent）—— 两处不一致就是同型缺陷写两遍。
+       * ⚠ `claimZcodePlan` 在**网络异常与读体异常**时**不抛**（内部都兜成
+       *   `ok:false` 的返回），故 `sent` 与 `ok`/`failed` 在此之后是**配平**的。
+       *   ⚠ 措辞别说成「自身绝不抛」：对抗性审计证伪过那个绝对断言 ——
+       *   若 `fetch` 返回**非 Response**（如 `null`），属性访问会同步抛
+       *   （真实 `fetch` 不会如此，生产影响≈0，且 `zcode-upstream.ts` 现已
+       *   把读体整段包住）。这里依赖的只是「网络/读体异常不抛」这条**较弱**前提。
+       */
+      const claimStartedAt = Date.now()
+      noteZcodeRequestSent(accountId, claimStartedAt)
+      let outcome: ZcodeClaimOutcome = await claimZcodePlan(
+        credential, plan.planId, { param: minted.param, region }, this.fetchImpl,
+      )
+      /** 本 plan 是否已走过「3007 换链重发」（只影响 3007 的文案措辞）。 */
+      let internalRetried = false
+      /**
+       * 渲染诊断用的「本次出发时刻」。
+       *
+       * ⚠⚠ 重发后**必须换成重发的时刻** —— 若仍用首发的 `claimStartedAt`，
+       * `previousSentAt`（= 首发时刻）与诊断的 `sentAt` 又会相等 ⇒
+       * 「距上条」**再一次**变成 `0ms`（该缺陷的第二个实例，实测抓到过）。
+       */
+      let diagnosticSentAt = claimStartedAt
+      if (outcome.ok) {
+        noteZcodeRequestOk(accountId, Date.now())
+      } else {
+        noteZcodeRequestFailed(accountId)
+      }
+      /**
+       * ★ **评审 C4：claim 接上 3007 降级链**（此前只有推理路径有，领取这条**最需要**它的路径反而没有）。
+       *
+       * ## 为什么领取上尤其严重
+       * `/zcode-plan/billing/claim` **始终**索要 captcha，且校验**前置于** plan 校验
+       * （实测：带非法 captcha 与不带 captcha 都回 `400/3007`）⇒ 内部 param 在这里
+       * 被拒的概率比推理路径高得多。少了这段，用户看到的就是「一键领取直接失败」，
+       * 而失败原因只有一个干巴巴的 `3007`。
+       *
+       * ## 三条纪律
+       * 1. **只按 `minted.source === 'internal'` 归因**：chromium 的 param 被拒是
+       *    「时效 / 设备信誉」问题（`CaptchaBackoff` 管的那本账），不许记到载体头上；
+       *    而 `source === 'chromium'` 本身就说明**载体链本轮没参与**
+       *    （web 版 `supplied` 恒 0、或 env 关掉了），**没有第二条链可换** ——
+       *    「chromium 被拒也重试一次」只会白扣同设备每小时 150 次那份配额，
+       *    且换一个 chromium param 面对同一个服务端判定，期望收益极低；
+       * 2. **重发上限一次**：本方法一个 plan 只走一遍，重发后**无论成不成**都收工
+       *    —— 再撞 `3007` 就如实失败。再试只是白扣设备级配额（阿里云同设备 150 次/小时），
+       *    且「已经换过 chromium 还是 3007」**本身就是**给用户的诊断信息；
+       * 3. **禁用计数走既有语义**：记一次 `internalRejected`，到阈值由
+       *    `CaptchaCarrier` 判本次运行禁用（见 `noteInternalRejection`）。
+       *
+       * ⚠ 重发用**注入链**（`mintCaptcha`），不是 `carrier` 里那条腿 ——
+       *   claim 的 param 一贯由注入链产出，兜底也该走同一条。
+       * ⚠ 重发**沿用同一份配置**（`captchaConfig`）：换 param 不换配置，region
+       *   也就不变 —— 否则重发会亲手制造出「param 与 region 不同源」。
+       */
+      if (outcome.code === 3007 && minted.source === 'internal') {
+        this.carrier.noteInternalRejection()
+        internalRetried = true
+        const retried = await this.retryClaimWithInjectedChain(
+          credential, plan.planId, mintCaptcha, captchaConfig, region, { accountId },
+        )
+        // ★ 写回（不是直接返回）⇒ 下面的短路判定天然覆盖重发这一发。
+        outcome = retried.outcome
+        diagnosticSentAt = retried.sentAt
+      }
+      const mapped = toClaimOutcome(outcome, plan.planId, {
+        plan, accountId, sentAt: diagnosticSentAt, status: outcome.httpStatus, internalRetried,
+      })
+      /**
+       * ★★ 命中 `3012`（风控）⇒ **终止本账号的领取，不再发后续 plan**。
+       *
+       * `3012` 是**账号级**风控且有**冷却惩罚**（30 分钟起步，反复触发升级到
+       * 24 小时乃至停用）。而 `preview` 通常下发多个 plan ⇒ 不短路就是
+       * 「一次点击连续触发 N 次风控」，亲手把 30 分钟推成 24 小时。
+       *
+       * ⚠ 判断的是**换链之后**的 `outcome`，故首发与重发两条路径都被覆盖。
+       * ⚠ 与 `3007` 方向**相反**，别合并：`3007` 换个新 param 就能过；
+       *   `3012` 再发一次只会更糟。
+       * ⚠ 只跳过**剩余 plan**，不影响其它账号（RPC 的「一键领取」是逐账号循环）
+       *   —— issue 的实测正是「5 个走通、只有 1 个被拦」。
+       */
+      if (isClaimUnusualActivity(outcome)) {
+        this.carrierLog?.(
+          `zcode: 账号 ${accountId ?? '-'} 被上游风控拦截（3012）⇒ 本账号停止领取 `
+          + `（重试会加重冷却惩罚：30 分钟 → 24 小时 → 停用）`,
+        )
+        return { outcome: mapped, continueWithNextPlan: false }
+      }
+      return { outcome: mapped, continueWithNextPlan: true }
+    } catch (error) {
+      return {
+        outcome: {
+          kind: 'failed',
+          code: -1,
+          message: `${plan.planId}: ${error instanceof Error ? error.message : String(error)}`,
+        },
+        continueWithNextPlan: true,
+      }
+    }
+  }
+
+  /**
    * ★ 评审 C4 的那一次重发：用**注入链**产一个新 param 重发同一个 plan（上限一次）。
    *
    * ## 为什么单独抽一个方法（而不是塞进循环里）
@@ -1489,6 +1622,23 @@ export class ZcodeAuth extends Service {
    * 换的是 param，不是 region。config 与 `captchaRegion` 都由调用方
    * （`claimDailyWith`）原样传进来 —— 保持「param 与 region 同源」这件事
    * **贯穿整个领取窗口**，包括这一次重发。
+   *
+   * @param diagnostics 诊断现场（Gitee issue IKJOQB）—— 重发这一发**同样是
+   *   一次真实的上游请求**，`sent` / `ok` / `failed` 三笔账都要记到同一个账号上，
+   *   否则 issue 要的「本进程 成功 N/失败 M」会漏掉这一类失败。
+   *
+   *   ⚠⚠ **只传 `accountId`，`sentAt` 由本方法自己取**（不是沿用首发的）。
+   *   `noteZcodeRequestSent(id, sentAt)` 的 `sentAt` 语义是「**本次**出发时刻」，
+   *   而 `previousSentAt` 是「上一条」的分母。若把**首发**的时刻当作重发的
+   *   出发时刻传进来，`previousSentAt` 会被写成首发时刻 == 本次 ⇒
+   *   `formatZcodeDiagnostic` 算出 `距上条 0ms`，「距上一条请求隔多久」
+   *   这一项**永久失去信息量**（实测复现过，见下）。
+   *
+   *   ⚠ 这不是理论风险：把 `sentAt` 写成首发的值后，探针实测诊断行是
+   *   `… · 距上条 0ms · HTTP 405`，而正确值应是「首发到上一条真实请求」的间隔。
+   *   本仓库在推理侧为同一个坑写过专门用例
+   *   （`tests/unit/zcode-diagnostics.spec.ts` 的「距上条算的是**上一条**请求」），
+   *   这里若传首发时刻就是**同型缺陷的第二次实例**。
    */
   private async retryClaimWithInjectedChain(
     credential: ZcodeCredential,
@@ -1496,24 +1646,94 @@ export class ZcodeAuth extends Service {
     injected: ZcodeClaimCaptchaMint | undefined,
     captchaConfig: ZcodeCaptchaConfig,
     captchaRegion: string,
-  ): Promise<ClaimOutcome> {
+    diagnostics: { accountId: string | undefined },
+  ): Promise<{ outcome: ZcodeClaimOutcome; sentAt: number }> {
     if (injected === undefined) {
       // 走到这里必然有注入链（`claimDailyWith` 开头就为 undefined 早退了）；
       // 仍写成显式分支：真出现时如实失败，别给一个 undefined param 发出去。
       return {
-        kind: 'failed',
-        code: 3007,
-        message: `captcha 被拒且没有可用的备用产出链（${planId}），请重试`,
+        outcome: {
+          planId,
+          ok: false,
+          code: 3007,
+          message: 'captcha 被拒且没有可用的备用产出链，请重试',
+        },
+        sentAt: Date.now(),
       }
     }
     this.carrierLog?.(
       'zcode: 领取时内部载体的 captcha 被拒（3007）⇒ 当次改用注入的浏览器链路重发一次',
     )
     const param = await injected(captchaConfig)
+    /**
+     * ⚠ 取**本发自己的**出发时刻（在真正发请求之前），理由见上面的 `@param`。
+     *   这也是它与首发之间真实间隔的来源 —— 注入链产 param 是秒级操作，
+     *   诊断里「距上条」因此会显示成首发到重发的真实间隔，而不是 0。
+     *
+     * ⚠⚠ 它**必须**回传给调用方拿去渲染诊断（返回值里的 `sentAt`）：
+     *   主循环若仍用**首发**的 `claimStartedAt` 做诊断，`previousSentAt`
+     *   （= 首发时刻）与诊断的 `sentAt` 又会相等 ⇒ 「距上条」**再一次**变成
+     *   `0ms`。这正是本缺陷的第二个实例，写用例时实测抓到了
+     *   （`expected '… 距上条 0ms …' not to contain '距上条 0ms'`）。
+     */
+    const retryStartedAt = Date.now()
+    noteZcodeRequestSent(diagnostics.accountId, retryStartedAt)
     const retried: ZcodeClaimOutcome = await claimZcodePlan(
       credential, planId, { param, region: captchaRegion }, this.fetchImpl,
     )
-    return toClaimOutcome(retried, planId, { internalRetried: true })
+    if (retried.ok) {
+      noteZcodeRequestOk(diagnostics.accountId, Date.now())
+    } else {
+      noteZcodeRequestFailed(diagnostics.accountId)
+    }
+    /**
+     * ## ★★ 返回**原始上游结果 + 本发时刻**，不在这里映射（2026-10-05 重构）
+     *
+     * 初版在这里就调 `toClaimOutcome` 把结果映射好并让调用方**直接 push**，于是
+     * 重发那一发**绕过了**主循环的 `3012` 短路检查（对抗性审计打出的真实缺陷：
+     * 首发 `3007` ⇒ 重发撞 `3012` ⇒ 仍继续发下一个 plan，实测 `claims=3`）。
+     *
+     * ⇒ 现在只回原始结果，由主循环**统一**做映射与短路判断 ——
+     * 首发与重发**汇流到同一个判断点**，结构上不可能再漏。
+     */
+    return { outcome: retried, sentAt: retryStartedAt }
+  }
+
+  /**
+   * 反查领取凭据对应的**账号池条目 id**（诊断画像的 key），供
+   * {@link claimDailyWith} 的 `noteZcodeRequest*` 埋点使用。
+   *
+   * ## 为什么必须与推理路径用同一个 key
+   *
+   * 推理侧用的是**池条目 id**（`index.ts` 的 `activeZcodeAccountId`）。
+   * 若领取侧另用 `user_id` / `credentialRef`，同一个账号会拿到两个序号，
+   * 诊断里的「本进程 成功 N/失败 M」被劈成两半 —— 而 issue 要回答的
+   * 「这个账号此前成功过几次 / 是否突然开始被拦」正靠这一项。
+   *
+   * ## ⚠ 用 `findAccountIdByIdentityField` 而**不是** `findAccountIdByCredential`
+   *
+   * 后者写死了「codearts 用 `access_key_id`、其余用 `access_token`」
+   * （见 `account-pool.ts` 的方法注释），而 zcode 凭据里**没有** `access_token`
+   * 字段（它用 `zcode_jwt` / `user_id`）⇒ 拿它查 zcode 恒回空串，
+   * 诊断会静默退化成「所有账号都是 #1」。
+   *
+   * ## 处处容错（非关键路径）
+   *
+   * 账号池可能未注册（headless / 单测）、`user_id` 可能缺失（老凭据）——
+   * 这些**都不该影响领取**，故整段吞异常并回 `undefined`：此时诊断退化成
+   * 「账号#1 + 只有领取路径的计数」，如实降级，绝不编造。
+   */
+  private async resolveClaimAccountId(credential: ZcodeCredential): Promise<string | undefined> {
+    const userId = credential.user_id
+    if (typeof userId !== 'string' || userId.length === 0) return undefined
+    const pool = this.accountPool()
+    if (pool === undefined) return undefined
+    try {
+      const id = await pool.findAccountIdByIdentityField(this.product.id, 'user_id', userId)
+      return id.length > 0 ? id : undefined
+    } catch {
+      return undefined
+    }
   }
 
   /**
@@ -1769,7 +1989,20 @@ export class ZcodeAuth extends Service {
 export function toClaimOutcome(
   outcome: ZcodeClaimOutcome,
   planId: string,
-  options: { internalRetried?: boolean; plan?: ZcodeClaimablePlan } = {},
+  options: {
+    internalRetried?: boolean
+    plan?: ZcodeClaimablePlan
+    /**
+     * 诊断现场（Gitee issue IKJOQB，**只为 `3012` 用**）。
+     *
+     * ⚠ 三者**必须成套给**：缺 `accountId`/`sentAt` 时诊断行仍会渲染，
+     * 但账号序号与「距上条」会退化成 `账号#1` / `—` —— 故调用方
+     * （`claimDailyWith`）一贯三个都给。
+     */
+    accountId?: string | undefined
+    sentAt?: number
+    status?: number
+  } = {},
 ): ClaimOutcome {
   if (outcome.ok) {
     if (outcome.alreadyClaimed === true) {
@@ -1806,6 +2039,75 @@ export function toClaimOutcome(
         : `captcha 校验失败（${planId}），请重试`,
     }
   }
+  /**
+   * ★★ `3012`（风控）必须单独成文案，**不能**落进下面的通用分支
+   * （Gitee issue IKJOQB 的**主诉**）。
+   *
+   * ## 修复前的用户可见形态（issue 原文，逐字）
+   *
+   * ```
+   * ZCode dbujns@chatai.dpdns.org：失败 — zcode-v3-start-plan-trust-1005:
+   * request has been blocked due to unusual activity.
+   * ```
+   *
+   * 这条文案有两个信息缺失，且**第二个有实际代价**：
+   * ① 看不出这是**风控**而非普通失败；
+   * ② **看不到冷却警告** —— 而「请勿连续重试」恰恰是用户最需要的一句
+   *   （issue 作者原话：「我就是不知道有冷却，看到裸文案后以为还有别的问题，
+   *   差点连续重试」）。
+   *
+   * ## 判据与文案都走**共用实现**
+   *
+   * 此前 `3012` 的文案在推理侧（`zcode-adapter.ts` 的 `describeUpstreamError`）
+   * 与领取侧（这里）**各写一份**，而只有前者带了冷却警告 —— 这就是漂移。
+   * ⇒ 判据（{@link isZcodeUnusualActivityCode} /
+   * {@link looksLikeZcodeUnusualActivity}）与文案
+   * （{@link formatZcodeUnusualActivityMessage}）现在都只在
+   * `zcode-diagnostics.ts` 里有一份，两处引用同一个。
+   *
+   * ⚠ **诊断附在这一条上**（issue 的第二个诉求）：`formatZcodeDiagnostic`
+   *   的三项（本次是池里第几个账号 / 该账号此前成功过几次 / 距上条请求隔多久）
+   *   正好回答「一直如此还是突然开始」「是否频率风控」。
+   *   ⚠ 诊断可为空（调用方没给 `accountId`）—— `formatZcodeDiagnostic` 本身
+   *   容忍 `undefined`，而 `formatZcodeUnusualActivityMessage` 在诊断为空时
+   *   **整段省略**，不会留下空壳「本机诊断：」。
+   */
+  if (isClaimUnusualActivity(outcome)) {
+    /**
+     * ⚠ **诊断只在调用方给了现场数据时才附**（判据取 `sentAt !== undefined`）。
+     *
+     * 为什么不无条件附：`toClaimOutcome` 是**公共纯映射函数**，既有若干
+     * 只传 `(outcome, planId)` 的调用点（单测、以及「只要文案不要现场」的场景）。
+     * 无条件附会凭空渲染出 `账号#1 · 距上条 —` —— 而那时我们**并不知道**
+     * 是哪个账号，`账号#1` 是**编造**的（`normalizeKey` 把所有未知账号归一成
+     * 同一个 `-` 桶），违反本模块「如实降级、不编造」的红线。
+     * ⇒ 用 `sentAt` 当「有现场」的标记：真实领取路径（`claimDailyWith`）**始终**传，
+     * 于是 issue 要的诊断一定在；纯映射调用点则保持干净。
+     */
+    const diagnostic = options.sentAt === undefined
+      ? undefined
+      : formatZcodeDiagnostic({
+        accountId: options.accountId,
+        sentAt: options.sentAt,
+        status: options.status ?? outcome.httpStatus ?? 405,
+        /**
+         * ⚠ **不传 `shape`**：领取请求体只有 `{ plan_id }`，没有 `system` /
+         * `messages`，照搬推理侧那套 `describeZcodeRequestShape` 会得到
+         * 「身份块 0 字符」，**把一条正常请求误报成身份块缺失**。
+         * ⇒ 只用与请求形态无关的那几项（见 `ZcodeDiagnosticInput.shape`）。
+         */
+        now: Date.now(),
+      })
+    return {
+      kind: 'failed',
+      code: 3012,
+      message: formatZcodeUnusualActivityMessage({
+        subject: planId,
+        diagnostic,
+        rawResponse: outcome.message,
+      }),
+    }
+  }
   return {
     kind: 'failed',
     // ⚠ `code` 是 `failed` 分支的**必填**字段；上游没给码时用 -1 表示
@@ -1813,6 +2115,58 @@ export function toClaimOutcome(
     code: outcome.code ?? -1,
     message: `${planId}: ${outcome.message ?? `HTTP ${outcome.httpStatus ?? '?'}`}`,
   }
+}
+
+/**
+ * 领取结果是否为**上游风控拦截**（`3012`）—— 领取路径的统一判据。
+ *
+ * ## ⚠⚠ 判据有**优先级**：`code` 明确时**只信 `code`**（真实缺陷，2026-10-05 自审发现）
+ *
+ * 初版写成「`code === 3012` **或** `message` 含 `3012`」—— 那个「或」是错的：
+ * 上游 `code` 一旦解析出来就是**权威**，此时再去扫 `message` 的自由文本只会引入误判。
+ * 实测被误判的三种真实形态：
+ *
+ * | `code` | `message` | 初版 | 现在 |
+ * |---|---|---|---|
+ * | `1005` 额度用尽 | `quota 3012 exceeded` | ❌ 报成风控 | ✅ 如实报额度 |
+ * | `1001` plan 不存在 | `plan plan-3012 not found` | ❌ 报成风控 | ✅ 如实报失败 |
+ * | `3007` captcha | `captcha verify failed` | ✅ | ✅ |
+ *
+ * ## 为什么误判的后果**很重**（不是文案问题）
+ *
+ * 领取路径据此**短路**（`claimDailyWith` 的 `break`）⇒ 一个「plan 名里恰好含
+ * `3012`」的普通失败会被当成风控，**跳过本账号本可领取的其余 plan**；
+ * 且真实业务码被改写成 `3012` —— 而 `1005`（等额度重置）与 `3012`
+ * （别重试，有冷却惩罚）的用户动作**完全相反**。
+ *
+ * ## 那什么时候才扫 `message`
+ *
+ * 只在 `code` **缺失**时。**而且要求风控语义共现**（真实缺陷，2026-10-05
+ * 对抗性审计打出）——
+ *
+ * | 形态（无码） | 仅词边界 `3012` | 现在（+语义共现） |
+ * |---|---|---|
+ * | `too many requests, retry after 3012 ms` | ❌ **误判成风控** | ✅ 不命中 |
+ * | `<h1>Error 3012</h1>upstream connect timeout` | ❌ **误判成风控** | ✅ 不命中 |
+ * | `request has been blocked due to unusual activity.` | 需配合码 | ✅ 命中 |
+ *
+ * ⚠ 误判的后果与「漏判」**同样重**，只是方向相反：`429 限流`是「稍后重试即可」，
+ * 被改写成「风控、**别重试**」—— 两者用户动作**完全相反**；且领取路径据此
+ * **短路**，跳过本可领取的 plan。审计实测该形态下 3 个 plan 只发了 1 发。
+ *
+ * ⚠ 故判据是 {@link mentionsZcodeUnusualActivity}（词边界 + 语义共现），
+ *   **不是**裸数字匹配。
+ *
+ * ⚠ 与推理侧的差异为何是合理的：`describeUpstreamError` 用
+ * 「先 3009、再 1005、再 3007、最后 3012」的**分支顺序**达成了同样的优先级；
+ * 而 `toClaimOutcome` 里 `3012` 特判在**通用分支之前**，没有那个顺序保护，
+ * 故必须靠这里显式的优先级。
+ */
+export function isClaimUnusualActivity(outcome: ZcodeClaimOutcome): boolean {
+  // ① `code` 明确 ⇒ 它是权威，不做任何文本猜测。
+  if (outcome.code !== undefined) return isZcodeUnusualActivityCode(outcome.code)
+  // ② 无码 ⇒ 只能看正文，且**必须**要求风控语义共现（见上）。
+  return typeof outcome.message === 'string' && mentionsZcodeUnusualActivity(outcome.message)
 }
 
 /** 构造一个「不可用」的 `CheckinStatus`（字段全部显式给，满足契约）。 */

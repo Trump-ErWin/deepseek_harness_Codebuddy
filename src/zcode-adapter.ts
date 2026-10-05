@@ -107,6 +107,8 @@ import type { CarrierOutcome } from './captcha-carrier.js'
 import {
   describeZcodeRequestShape,
   formatZcodeDiagnostic,
+  formatZcodeUnusualActivityMessage,
+  hasZcodeUnusualActivity,
   noteZcodeRequestFailed,
   noteZcodeRequestOk,
   noteZcodeRequestSent,
@@ -1756,9 +1758,6 @@ export function describeUpstreamError(
   body: string,
   diagnostic?: string,
 ): string {
-  const diag = typeof diagnostic === 'string' && diagnostic.length > 0
-    ? `本机诊断：${diagnostic}\n`
-    : ''
   const trimmed = body.trim()
   let code: unknown
   let message: unknown
@@ -1791,13 +1790,20 @@ export function describeUpstreamError(
   if (code === 3007 || trimmed.includes('3007')) {
     return `阿里云 captcha 校验失败（3007）。请重试；若持续失败，检查浏览器是否可用。`
   }
-  if (code === 3012 || trimmed.includes('3012')) {
-    return (
-      `上游风控拦截（3012 unusual activity）。` +
-      `⚠ 该错误有账号冷却惩罚（30 分钟，反复触发会升级到 24 小时乃至停用），` +
-      `请勿连续重试。\n${diag}` +
-      `原始响应：${suffix}`
-    )
+  if (hasZcodeUnusualActivity(trimmed)) {
+    /**
+     * ★ 文案走**共用实现**（Gitee issue IKJOQB）—— 判据与措辞都只在
+     * {@link formatZcodeUnusualActivityMessage} 里有一份。
+     *
+     * ⚠ 传的是**裸诊断**（`diagnostic`），不是 `本机诊断：…` 那种拼好的行 ——
+     * 前缀由共用函数自己加。
+     * ⚠ 不传 `subject` ⇒ 首句与历史输出**逐字一致**
+     * （`上游风控拦截（3012 unusual activity）。`），既有单测不受影响。
+     * ⚠ 判据用 `hasZcodeUnusualActivity`（**先信解析出的 `code`**，无码时才看
+     *   正文且要求风控语义共现）——原先的 `trimmed.includes('3012')` 会把
+     *   `13012` / `plan-3012-trust` 一并命中。
+     */
+    return formatZcodeUnusualActivityMessage({ diagnostic, rawResponse: suffix })
   }
   if (code === 1002 || status === 401) {
     // ⚠ 必须指向 Jet Hub 而不是官方客户端：凭据只有插件自己会写
@@ -1821,11 +1827,29 @@ export function describeUpstreamError(
  * | `1002`/401 | `AUTH` | 否 | 需用户重新登录 |
  * | `1113` 余额 | `QUOTA_EXCEEDED` | **否** | 确定性错误（要充值） |
  * | 其余 5xx | `SERVER` | 是 | 暂时性 |
+ *
+ * ## ⚠⚠ `3012` 的判据必须与文案侧**同一份**（真实缺陷，2026-10-05 审计打出）
+ *
+ * 此前本函数用裸 `trimmed.includes('3012')`，而同一个文件里
+ * {@link describeUpstreamError} 当时已改用收窄的 helper —— **只改了一半**。
+ * 后果：正文含 `13012` 的**瞬断 5xx** 被归成 `PERMISSION`，而
+ * `PERMISSION` **不在** harness 的 `DEFAULT_RETRYABLE_CODES` 里
+ * ⇒ 本该自愈的重试被**放弃**。实测：
+ *
+ * ```
+ * httpErrorCodeForZcode(500, 'upstream error 13012')      = PERMISSION  ← 错
+ * httpErrorCodeForZcode(503, 'backend 13012 unavailable') = PERMISSION  ← 错
+ * httpErrorCodeForZcode(503, 'backend unavailable')       = SERVER      ← 对
+ * ```
+ *
+ * ⇒ 改用 {@link hasZcodeUnusualActivity}：它**先信解析出的 `code`**
+ * （`{"code":3012}` 仍是 `PERMISSION`，故本函数的既有语义不变），
+ * 无码时才看正文且要求风控语义共现。
  */
 export function httpErrorCodeForZcode(status: number, body: string): string {
   const trimmed = body.trim()
   if (trimmed.includes('3007')) return 'RATE_LIMIT'
-  if (trimmed.includes('3012')) return 'PERMISSION'
+  if (hasZcodeUnusualActivity(trimmed)) return 'PERMISSION'
   if (trimmed.includes('1113') || trimmed.includes('余额不足')) return 'QUOTA_EXCEEDED'
   if (status === 401 || trimmed.includes('1002')) return 'AUTH'
   if (status === 429) return 'RATE_LIMIT'
