@@ -174,7 +174,14 @@ export function apply(ctx) {
       setAutoCheckin: (enabled) => rpcCall('usage.autoCheckin', { enabled }),
       // 关闭那行**常驻**的自动签到状态文字（只关当前这一轮，下一轮会重新出现）。
       dismissAutoCheckin: () => rpcCall('usage.autoCheckin', { dismiss: true }),
-      claimCredits: (provider) => rpcCall('credits.claimAll', { provider }),
+      // 一键领取：每日签到 + （buddy / workbuddy 的）成长中心任务。
+      //
+      // ⚠️ runTasks 缺省**必须为 false** —— 同一个方法也是「每日首次启动自动签到」
+      // 的执行体（宿主 auto-checkin 的 claim 回调）。成长一轮单账号 90～270s、
+      // 全串行，默认开启等于每次开机自动打几十个上游请求。
+      // budgetMs 缺省由宿主取 10 分钟；传 0 或负数表示不限时。
+      claimCredits: (provider, runTasks, budgetMs) =>
+        rpcCall('credits.claimAll', { provider, runTasks, budgetMs }),
     }),
   }, UsageBadge))
 }

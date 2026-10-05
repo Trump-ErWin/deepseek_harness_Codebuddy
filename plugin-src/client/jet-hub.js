@@ -374,6 +374,18 @@ export function providerLabel(id) {
  * CodeArts 是华为云账号体系，同样不参与。
  */
 
+/**
+ * 有成长中心任务可做的 provider。
+ *
+ * 与宿主 `src/jet-hub-rpc.ts` 的 `GROWTH_CAPABLE_PROVIDERS` 是**同一份清单**
+ * （两处都要改）—— 客户端决定是否传 `runTasks`，宿主决定是否受理；只改一处会
+ * 出现「传了但被挡回」或反之。
+ *
+ * 成长任务端点只在腾讯系产品上存在：buddy（中国区，成长中心为 web 域）
+ * 与 workbuddy（国际版）。
+ */
+const GROWTH_TASK_PROVIDERS = new Set(['buddy', 'workbuddy']);
+
 function ProviderLogo({ provider }) {
   const p = PROVIDERS.find(p => p.id === provider);
   if (!p) return null;
@@ -1966,6 +1978,9 @@ function ProviderPanel({ provider, rpcCall }) {
   const canLoadCredits = supportsCreditBalance(provider);
   // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
+  // 与服务端 GROWTH_CAPABLE_PROVIDERS 同一份清单（两处都要改），
+  // 避免按钮渲染了却被服务端挡回 bad-request。
+  const supportsGrowthTasks = GROWTH_TASK_PROVIDERS.has(provider);
   /**
    * 「订阅额度」按钮的渲染条件（当前只有 Cline）。
    *
@@ -2042,8 +2057,7 @@ function ProviderPanel({ provider, rpcCall }) {
 
   // 积分领取状态：claiming 用于禁用按钮，claimNotice 展示上一次领取的结果摘要。
   const [claiming, setClaiming] = React.useState(false);
-  const [claimNotice, setClaimNotice] = React.useState(null);
-  // 新手任务（一次性，仅 Loomy）：与每日签到**完全独立**的操作。
+  const [claimNotice, setClaimNotice] = React.useState(null);  // 新手任务（一次性，仅 Loomy）：与每日签到**完全独立**的操作。
   const [onboarding, setOnboarding] = React.useState(null);
   const [onboardingLoading, setOnboardingLoading] = React.useState(false);
   const [onboardingNotice, setOnboardingNotice] = React.useState(null);
@@ -2171,8 +2185,14 @@ function ProviderPanel({ provider, rpcCall }) {
     setClaiming(true);
     setClaimNotice(null);
     try {
-      const res = await rpcCall('credits.claimAll', { provider });
-      const { summary, results } = res;
+      // runTasks：只有**手点这个按钮**时才为true。
+      // 后端「每日首次启动自动签到」走同一个方法但不传该字段（缺省 false），
+      // 故成长任务绝不会被开机自动触发 —— 它一轮单账号 90～270s、全串行。
+      const res = await rpcCall('credits.claimAll', {
+        provider,
+        runTasks: supportsGrowthTasks,
+      });
+      const { summary, results, growth } = res;
       const parts = [];
       // ⚠ **不带 `totalCredit`**（2026-10-03）：
     //   `summary.totalCredit` 把不同 provider 的额度**直接相加** —— 而 ZCode 的
@@ -2209,8 +2229,66 @@ function ProviderPanel({ provider, rpcCall }) {
           details.push(`${item.nickname || item.accountId}：失败 — ${outcome.message || '未知原因'}`);
         }
       }
+      // 成长中心任务明细（仅 supportsGrowthTasks 时后端才返回 growth）。
+      //
+      // 渲染口径（按用户实测反馈定的）：
+      // - **零产出账号折叠成一行**。此前逐项列出，于是「一件都没做成」的账号也铺
+      //   满 7 行「需客户端」，看不出「这个号本轮没有任何可自动完成的项」与
+      //   「这个号失败了」的区别 —— 而两者处置完全不同。
+      // - **完成项排在需客户端之前**。需客户端是终态，不需要用户逐条读。
+      // - 仍**逐项列出**有产出或有失败的账号：那是「哪一项为什么没涨」的唯一线索。
+      let growthFailed = 0;
+      let growthTimedOut = false;
+      if (Array.isArray(growth) && growth.length > 0) {
+        let completed = 0;
+        let clientOnly = 0;
+        let claimedCount = 0;
+        let claimedCredit = 0;
+        for (const account of growth) {
+          const who = account.nickname || account.accountId;
+          completed += account.completed || 0;
+          clientOnly += account.clientOnly || 0;
+          growthFailed += account.failed || 0;
+          claimedCount += account.claimedCount || 0;
+          claimedCredit += account.claimedCredit || 0;
+          if (account.timedOut) growthTimedOut = true;
+          if (account.error) {
+            details.push(`${who}：${account.error}`);
+            continue;
+          }
+          const tasks = account.tasks || [];
+          const settled = tasks.filter((t) => t.ok && !t.clientOnly);
+          const broken = tasks.filter((t) => !t.ok);
+          const needClient = tasks.filter((t) => t.ok && t.clientOnly);
+          if (settled.length === 0 && broken.length === 0) {
+            // 本轮该账号没有任何可自动完成的项 ⇒ 一行说清，不铺陈列表。
+            const why = needClient.length > 0
+              ? `${needClient.length} 项判据只在客户端行为里记录，API 推不动`
+              : '本轮无 API 可达的任务';
+            details.push(`${who}：${why}（未领到积分）`);
+            continue;
+          }
+          const head = [
+            settled.length > 0 ? `完成 ${settled.length} 项` : null,
+            broken.length > 0 ? `失败 ${broken.length} 项` : null,
+            needClient.length > 0 ? `需客户端 ${needClient.length} 项` : null,
+          ].filter(Boolean).join('，');
+          details.push(`${who}：${head}`);
+          for (const task of settled.concat(broken)) {
+            const label = task.taskCode || '未知任务';
+            const reason = task.message || '';
+            if (!task.ok) details.push(`　· ${label}：失败 — ${reason}`);
+            else details.push(`　· ${label}：${reason}`);
+          }
+        }
+        if (completed > 0) parts.push(`成长完成 ${completed} 项`);
+        if (clientOnly > 0) parts.push(`成长需客户端 ${clientOnly} 项`);
+        if (growthFailed > 0) parts.push(`成长失败 ${growthFailed} 项`);
+        if (claimedCount > 0) parts.push(`自动领取 ${claimedCount} 项（+${claimedCredit} 积分）`);
+        if (growthTimedOut) parts.push('本轮时间预算用尽，剩余项未执行，再点一次即可继续');
+      }
       setClaimNotice({
-        tone: summary.failed > 0 ? 'warn' : 'ok',
+        tone: summary.failed > 0 || growthFailed > 0 ? 'warn' : 'ok',
         text: parts.length > 0 ? parts.join('，') : '没有可领取的账号',
         details,
       });
@@ -2719,10 +2797,19 @@ function ProviderPanel({ provider, rpcCall }) {
         supportsCredits
           ? React.createElement('button', {
               className: 'dim-jh-btn',
-              title: `领取全部 ${PROVIDERS.find(p => p.id === provider)?.label || provider} 账号（含已停用）的每日签到积分`,
+              title: supportsGrowthTasks
+                ? `领取全部 ${PROVIDERS.find(p => p.id === provider)?.label || provider} 账号（含已停用）的每日签到积分，**并完成成长中心任务**。`
+                  + '成长一轮单账号实测 90～270s 且全串行，账号多时可能需多点几次；'
+                  + '受客户端动作限制的项（微信、夜猫子窗口、判据推不动）会如实标为「需客户端」。'
+                : `领取全部 ${PROVIDERS.find(p => p.id === provider)?.label || provider} 账号（含已停用）的每日签到积分`,
               disabled: claiming || accounts.length === 0,
               onClick: () => void claimCredits(),
-            }, claiming ? '领取中…' : '一键领取积分')
+            }, claiming
+              ? '领取中…'
+              // ⚠️ 有成长任务的渠道必须**在点之前**告知这会做很多事：成长一轮单账号
+              // 实测 90～270s 且全串行，而「一键领取积分」这个文案原本只表示
+              // 毫秒级的每日签到。用户点之前不知道要等几分钟。
+              : (supportsGrowthTasks ? '一键领取积分 + 成长任务' : '一键领取积分'))
           : null,
         // 「重测 / 重置」只对**会返回限流错误**的 provider 有意义。
         // ⚠️ Loomy 不会限流（积分耗尽时静默降级为扣永久积分），故对它

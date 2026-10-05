@@ -86,6 +86,30 @@ export interface BuddyProduct {
    * 注意与 `endpoint` 分开：历史实现里该头传的是不带协议的域名。
    */
   apiDomain: string
+  /**
+   * 成长中心领奖端点的基址（含协议，无尾斜杠），成长任务 claim 与 web 域上报
+   * 以此为基址。
+   *
+   * 与 `endpoint` 分开的原因：API 域名与网页域名不是同一个站。buddy 中国版的
+   * `endpoint` 是 `copilot.tencent.com`，而成长中心领奖与 web 域遥测在另一个站。
+   *
+   * 证据状态：`www.workbuddy.cn` 是实测可达的中国区成长中心站（2026-10-05，
+   * 两个真实账号领奖成功）；它与登录站 `www.codebuddy.cn`（见 buddy.ts
+   * WEBSITE_HOME）的关系未经核实，两者都返回 HTTP 200，故此处填实测值而非推断值。
+   * 国际版未实测，暂按 `endpoint` 同域填写。
+   */
+  claimBase: string
+  /**
+   * web 域遥测上报的 Origin（含协议，无尾斜杠），资料库点击一类判据只认
+   * web 域事件，桌面域不计分。
+   *
+   * 与 `claimBase` 分开的原因：领奖走产品 API 站，web 遥测走网页站，两者
+   * 的 `Origin` / `Referer` 需要各自独立配置，不能共用一个回退值。
+   *
+   * 证据状态：与 `claimBase` 同为实测可达站点（2026-10-05，Library_read判据
+   * 在两个真实账号上领奖成功）。
+   */
+  webBase: string
   /** 设置页展示名 */
   displayName: string
   /** X-Product-Code 请求头值 */
@@ -270,6 +294,8 @@ export const CODEBUDDY: BuddyProduct = {
   platform: 'ide',
   endpoint: 'https://copilot.tencent.com',
   apiDomain: 'copilot.tencent.com',
+  claimBase: 'https://www.workbuddy.cn',
+  webBase: 'https://www.workbuddy.cn',
   displayName: 'CodeBuddy (腾讯)',
   productCode: 'codebuddy',
   userAgent: 'CodeBuddyIDE/1.106.1',
@@ -383,6 +409,8 @@ export const WORKBUDDY: BuddyProduct = {
   platform: 'workbuddy-ai',
   endpoint: 'https://www.workbuddy.ai',
   apiDomain: 'www.workbuddy.ai',
+  claimBase: 'https://www.workbuddy.ai',
+  webBase: 'https://www.workbuddy.ai',
   displayName: 'WorkBuddy (国际版)',
   productCode: 'workbuddy',
   // 默认档：国际版产品形态（无按模型命中时使用）。

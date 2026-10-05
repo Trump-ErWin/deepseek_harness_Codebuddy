@@ -179,7 +179,28 @@ describe('用量徽标：槽位接线', () => {
     expect(index).toContain("readBadge: (provider, options) => rpcCall('usage.badge'")
     expect(index).toContain("writePreference: (preference) => rpcCall('usage.badgePreference'")
     expect(index).toContain("setAutoCheckin: (enabled) => rpcCall('usage.autoCheckin'")
-    expect(index).toContain("claimCredits: (provider) => rpcCall('credits.claimAll'")
+    // 签名带 runTasks / budgetMs：`credits.claimAll` 同时是「每日首次启动自动签到」
+    // 的执行体，成长任务只能由手点按钮时显式开启。
+    expect(index).toContain("claimCredits: (provider, runTasks, budgetMs) =>")
+    expect(index).toContain("rpcCall('credits.claimAll', { provider, runTasks, budgetMs })")
+    // ⚠️ runTasks 绝不能有 `= true` 之类的缺省：那会让开机自动签到每轮都跑一遍
+    // 成长任务（单账号 90～270s、全串行）。
+    expect(index).not.toMatch(/claimCredits: \(provider, runTasks[^)]*=/)
+    expect(index).not.toMatch(/runTasks:\s*true/)
+    // ★ 按钮文案必须**按渠道条件化**：有成长任务的渠道要显示成长字样。
+    //
+    // 理由：成长一轮单账号实测 90～270s 且全串行，而「一键领取积分」这个文案
+    // 原本只表示毫秒级的每日签到。让用户点之前不知道要等几分钟，是拿可用性
+    // 换代码简洁。
+    const hub = read('plugin-src/client/jet-hub.js')
+    expect(hub).toMatch(
+      /supportsGrowthTasks\s*\?\s*\x27一键领取积分 \+ 成长任务\x27\s*:\s*\x27一键领取积分\x27/
+    )
+    // 无成长任务的渠道文案必须逐字不变，避免无关渠道被波及。
+    expect(hub).toContain('一键领取积分')
+    // 成长字样只许出现在这条按钮上，不得再有第二个独立按钮。
+    expect(hub).not.toContain('一键完成成长任务')
+    expect(hub).not.toContain('一键全部完成任务并领取积分')
   })
 
   it('渠道展示名复用 jet-hub.js 的 providerLabel（不另抄一份名字表）', () => {
