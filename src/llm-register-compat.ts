@@ -162,20 +162,64 @@ export interface StreamCapableAdapter {
  */
 export function wrapAdapterWithTokenLedger<T extends object>(providers: readonly string[], adapter: T): T {
   const provider = providers[0] ?? ''
+  /**
+   * 把一次流式调用包上记账（顶层 `stream` 与 `prepareCall` 返回的 `call.stream`
+   * 共用同一实现，口径才不会分叉）。
+   */
+  const accountingStream = (options: unknown, open: () => AsyncIterable<unknown>): AsyncIterable<unknown> => {
+    const channel = channelOfOptions(options)
+    const model = String((options as { model?: unknown })?.model ?? '').slice(0, 160)
+    return recordThroughStream(open, { channel, provider, model, startedAt: Date.now() })
+  }
+
   return new Proxy(adapter, {
-    get(target, prop, receiver) {
-      if (prop !== 'stream') return Reflect.get(target, prop, target)
-      // ⚠️ `this` 必须绑回**原适配器**（target 而不是 proxy）：真实适配器的
-      // 私有字段（`#field`）对 proxy 的 this 不可见，绑 proxy 会抛 TypeError。
-      return (options: never) => {
-        const channel = channelOfOptions(options)
-        const model = String((options as { model?: unknown })?.model ?? '').slice(0, 160)
-        const startedAt = Date.now()
-        return recordThroughStream(
+    get(target, prop) {
+      if (prop === 'stream') {
+        // ⚠️ `this` 必须绑回**原适配器**（target 而不是 proxy）：真实适配器的
+        // 私有字段（`#field`）对 proxy 的 this 不可见，绑 proxy 会抛 TypeError。
+        return (options: never) => accountingStream(
+          options,
           () => (target as unknown as StreamCapableAdapter).stream.call(target, options) as AsyncIterable<unknown>,
-          { channel, provider, model, startedAt },
         )
       }
+      /**
+       * ⚠️⚠️ **必须同时包装 `prepareCall` 返回的 `call.stream`**（真实缺陷，2026-10-06）。
+       *
+       * **生产路径只走这里**：dsh-llm 的 `adapterStream` 用
+       * `adapter.prepareCall(...)` 拿到的 `adapterCall.stream(options)` 派发
+       *（`node_modules/@deepseek-ai/dsh-llm/lib/index.js`：
+       * `dispatch = (options) => adapterCall.stream(options)`），
+       * **从不直接调用顶层 `adapter.stream`**。
+       *
+       * 早先只拦顶层 `stream` 时，记账之所以「碰巧」生效，全靠各适配器的
+       * `prepareCall` 恰好写成转发形式 `stream: (o) => this.stream(o)`，且调用方
+       * 经 Proxy 取 `prepareCall` 时 `this` 落在 Proxy 上 —— 这是一条**隐式依赖**：
+       * 任何适配器改成持有闭包引用（或在包装层用 `.bind(原对象)`）就会**静默失效**
+       * （请求照常、账本永远为空）。已实测：闭包式 prepareCall 下记账 = 0 条。
+       *
+       * ⇒ 显式包装返回的 `call.stream`，与顶层 `stream` **共用同一实现**（保证
+       * 口径一致），不再依赖 `this` 的绑定链。
+       * 同一根因的既有教训见 `src/dead-model-store.ts`（PR !66 复审）。
+       */
+      if (prop === 'prepareCall') {
+        const original = Reflect.get(target, prop, target) as unknown
+        if (typeof original !== 'function') return original
+        return async (...args: unknown[]): Promise<unknown> => {
+          const call = await (original as (...a: unknown[]) => Promise<unknown>).apply(target, args)
+          if (call === null || typeof call !== 'object') return call
+          const inner = (call as { stream?: unknown }).stream
+          if (typeof inner !== 'function') return call
+          return {
+            ...(call as object),
+            // ⚠️ 只包 `stream` 这一个字段，其余（modelInfo 等）原样透传。
+            stream: (options: unknown) => accountingStream(
+              options,
+              () => (inner as (o: unknown) => AsyncIterable<unknown>).call(target, options),
+            ),
+          }
+        }
+      }
+      return Reflect.get(target, prop, target)
     },
   })
 }
@@ -184,6 +228,7 @@ export function wrapAdapterWithTokenLedger<T extends object>(providers: readonly
  * 包住一次流式调用的**记账骨架**（与 {@link wrapAdapterWithTokenLedger} 配套）。
  *
  * 独立成函数是为了能用假适配器做行为单测（不必起真实 provider）。
+ *
  * 语义：
  * - 正常结束且没等到 usage ⇒ 记 `usageReported: false`（显示 `—` 不显示 0）；
  * - 流内出现过 usage（哪怕 0 token）⇒ 记 `usageReported: true`；
@@ -288,36 +333,32 @@ export async function* recordThroughStream(
  * ⚠ 包装失败**不阻断注册** —— 它只是显示层的收敛，回退到原适配器即可，
  * 不能因为它挂掉导致整个 provider 起不来。
  *
- * ## ⚠⚠️ 两层包装的嵌套顺序是语义性的，不可调换
+ * ## ⚠ 两层包装的顺序（曾一度是语义性的，现已不敏感）
  *
- * 顺序必须是 **记账在内、剔除在外**：
+ * 当前顺序是 **记账在内、剔除在外**：
  *
  * ```ts
  * withDeadModelPruning(providers, wrapAdapterWithTokenLedger(providers, adapter))
  * ```
  *
- * **依据**（dsh-llm 0.1.2-rc.1 实测）：`LlmRuntime.adapterStream` 走的是
+ * **历史**（值得记住，因为它是一类极易复发的缺陷）：`wrapAdapterWithTokenLedger`
+ * 早先**只拦顶层 `stream`**，而 dsh-llm 的 `adapterStream` 走的是
  * `adapter.prepareCall(...)` 返回的 `adapterCall.stream(options)`
- * （`dsh-llm/lib/index.js` 的 `dispatch = (options) => adapterCall.stream(options)`），
- * **不直接调用顶层 `adapter.stream`**。而本仓库**全部**适配器的 `prepareCall`
- * 都写成转发形式：
+ *（`dsh-llm/lib/index.js`：`dispatch = (options) => adapterCall.stream(options)`），
+ * **从不直接调用顶层 `adapter.stream`**。当时记账之所以生效，全靠各适配器的
+ * `prepareCall` 恰好写成 `stream: (o) => this.stream(o)`、且 `this` 落在 Proxy 上
+ * —— 一条**隐式依赖**：顺序写反（或任一适配器改成闭包引用）就**静默失效**。
  *
- * ```ts
- * stream: (options) => this.stream(options)
- * ```
+ * ⇒ 现已**显式包装 `prepareCall` 返回的 `call.stream`**（见
+ * `wrapAdapterWithTokenLedger` 的注释），因此**两种顺序都能记账**，不再依赖
+ * `this` 绑定链。顺序仍保持「记账在内」只是为了与既有注释/测试一致。
  *
- * ⇒ 记账是否生效，取决于 `prepareCall` 执行时 **`this` 指向谁**：
+ * ⚠️ 同根因的既有教训见 `src/dead-model-store.ts`：只包 `stream` 会让包装
+ * **在生产环境完全不生效**（单测却全绿，因为直接调了 `proxy.stream`）。
+ * **通用手法：别问「哪个成员被包了」，去 `node_modules` 读消费者的真实调用链。**
  *
- * - 记账在内（正确）：剔除 Proxy 的 `get` 陷阱用 `target.prepareCall.apply(obj, …)`
- *   调用，`obj` 是它包着的**记账 Proxy** ⇒ `this` = 记账 Proxy ⇒
- *   `this.stream` 命中记账的 get 陷阱 ⇒ **记账生效**；随后剔除层再包返回的
- *   `call.stream` ⇒ 两层都生效。
- * - 记账在外（错误）：`this` 落到**裸适配器** ⇒ `this.stream` 是原始方法、
- *   绕过记账 Proxy ⇒ **记账静默失效**（请求照常跑，账本永远是空的 ——
- *   这种"看起来正常"的失效最难发现）。
- *
- * 回归用例：`tests/unit/token-ledger-wiring.spec.ts` 的
- * 「两层包装的嵌套顺序」段（按 dsh-llm 的 `prepareCall → call.stream` 真实路径驱动）。
+ * 回归用例：`tests/unit/token-ledger-wiring.spec.ts` 的「两层包装的嵌套顺序」段
+ *（按 dsh-llm 的 `prepareCall → call.stream` 真实路径驱动，含闭包式适配器用例）。
  */
 export function registerAdapterIdempotent(
   llm: AdapterRegisterTarget,
