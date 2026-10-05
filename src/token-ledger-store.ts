@@ -18,6 +18,21 @@
  *   与 `permanent-lock-store.ts`）各自内存视图独立，整体覆盖会**互相抹掉**。
  *   详见 `FileLedgerStore.flush` 的注释。
  *
+ * ## ⚠️ 已知限制：跨进程并发仍非原子（审计实测，未修）
+ *
+ * `flush()` 是 `readFile → 合并 → writeFile(tmp) → rename`，**不是原子
+ * read-modify-write**：`rename` 本身原子，但「读」与「写」之间存在窗口，两个
+ * **真实进程**密集并发写时，后写者可能基于陈旧快照覆盖。
+ *
+ * 实测（4 进程 × 60 轮密集 append+flush，期望 240）：实得 209 / 220 / 232 / 224。
+ * ⚠️ 如实说明：该场景在**首轮的整体覆盖实现上同样丢**（同压测丢 8 条），故本轮
+ * 合并写**不是纯回归** —— 它另修好了一个首轮才有的「跨实例可见性」缺陷。但窗口
+ * 确实从「写」扩大到「读+写」。
+ *
+ * **影响面有限**：真实规模下日桶数受 provider × model 数量限制，且 DSH 通常
+ * 单进程使用同一 profile。**根治**需文件锁（advisory lock）或改追加日志形态
+ * ——超出本次范围，在此显式记录以免被当成"已解决"。
+ *
  * ## 日界
  *
  * UTC+8（各渠道每日额度的结算时区），见 `utc8DayKey`。**保留天数**
@@ -228,16 +243,24 @@ class FileLedgerStore implements TokenLedgerStore {
       // ① 盘上现况（含别的实例刚写的）
       const merged = this.readFile()
       // ② 把本实例的增量并进去
+      //
+      // ⚠️ **必须跳过「零增量」的桶**（真实缺陷，审计发现并原样复现：R1「幽灵日」）：
+      // 若盘上的某个日键被**外部删除**（手工编辑 / 另一工作区的旧版本整体覆盖 /
+      // 从备份恢复），而本实例内存里仍留着它，那么「全量遍历 + delta=0 也写入」
+      // 会把该日**重新建成一个全 0 桶** —— 内存里还是真值（被掩盖），**重启后
+      // 变成 0 且不可恢复**。故 `subtractBucket` 对零增量返回 `undefined`，这里跳过。
+      let hasDelta = false
       for (const [day, buckets] of this.days) {
-        let target = merged.get(day)
-        if (target === undefined) {
-          target = new Map()
-          merged.set(day, target)
-        }
         const base = this.written.get(day)
+        let target = merged.get(day)
         for (const [key, bucket] of buckets) {
-          const before = base?.get(key)
-          const delta = subtractBucket(bucket, before)
+          const delta = subtractBucket(bucket, base?.get(key))
+          if (delta === undefined) continue // 本次没有新增量 ⇒ 不碰盘上这一桶
+          hasDelta = true
+          if (target === undefined) {
+            target = new Map()
+            merged.set(day, target)
+          }
           const existing = target.get(key)
           if (existing === undefined) {
             target.set(key, delta)
@@ -246,6 +269,11 @@ class FileLedgerStore implements TokenLedgerStore {
           }
         }
       }
+      // ⚠️ 没有任何新增量 ⇒ **直接返回，不重写文件**。
+      // 与 `gemini-sigstore.ts` 的 `if (!this.dirty) return` 同款脏检查：避免
+      // 无谓的「全量读 + parse + stringify + 原子写」（实测 500 桶/天时该动作约
+      // 132ms 同步阻塞，且这段代码跑在 setTimeout 回调里 = 阻塞事件循环）。
+      if (!hasDelta) return
       // ③ 原子写（淘汰过老日键）
       const days: Record<string, Record<string, unknown>> = {}
       for (const [day, buckets] of pruneDays(merged)) {
@@ -298,14 +326,21 @@ function addBucket(
  *
  * ⚠️ 负数一律钳到 0：手工编辑过文档、或基线比当前大时（理论上不该发生），
  * 相减会得到负数，写进账本会**倒扣**用户的历史用量 —— 宁可少记也不能倒扣。
+ *
+ * ⚠️ **全字段为 0 时返回 `undefined`**（而不是零值对象）：调用方据此**跳过**
+ * 该桶，避免把「零增量」写回盘上 —— 否则外部删掉的日键会被**重建为全 0 桶**，
+ * 造成静默数据丢失（见 `flush` 的注释与「幽灵日」回归用例）。
  */
 function subtractBucket(
   current: TokenLedgerDayBucket,
   base: TokenLedgerDayBucket | undefined,
-): TokenLedgerDayBucket {
-  if (base === undefined) return { ...current }
+): TokenLedgerDayBucket | undefined {
+  if (base === undefined) {
+    // 基线里没有（本实例新建的桶）：整体就是增量，但若它本身全 0 也无意义。
+    return isZeroBucket(current) ? undefined : { ...current }
+  }
   const diff = (a: number, b: number): number => Math.max(0, a - b)
-  return {
+  const delta: TokenLedgerDayBucket = {
     requests: diff(current.requests, base.requests),
     reportedRequests: diff(current.reportedRequests, base.reportedRequests),
     inputTokens: diff(current.inputTokens, base.inputTokens),
@@ -319,6 +354,17 @@ function subtractBucket(
     tpsSum: diff(current.tpsSum, base.tpsSum),
     tpsCount: diff(current.tpsCount, base.tpsCount),
   }
+  return isZeroBucket(delta) ? undefined : delta
+}
+
+/** 桶的所有字段是否都为 0（= 没有任何增量）。 */
+function isZeroBucket(bucket: TokenLedgerDayBucket): boolean {
+  return bucket.requests === 0 && bucket.reportedRequests === 0
+    && bucket.inputTokens === 0 && bucket.outputTokens === 0
+    && bucket.cacheReadTokens === 0 && bucket.cacheWriteTokens === 0
+    && bucket.reasoningTokens === 0 && bucket.errors === 0
+    && bucket.ttftSumMs === 0 && bucket.ttftCount === 0
+    && bucket.tpsSum === 0 && bucket.tpsCount === 0
 }
 
 /**
