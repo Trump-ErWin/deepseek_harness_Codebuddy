@@ -496,7 +496,8 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     // ⚠️ 2026-09-30 合并后 minimax 排在 zcode 之前；2026-10-03 加 gemini 时
     // 按「新 provider 追加在末尾」的惯例排在 zcode 之后 —— 用 .* 容忍中间插队者。
     expect(source).toMatch(/registerJetHubRpc\(ctx, pool, service, .*raccoon,.*zcode,.*gemini, modelAdapters\)/)
-    expect(source).toMatch(/zcode: zcodeAdapter/)
+    // ⚠️ 2026-10-06 复审 !66：登记项经 `pruned(...)` 包装（致命缺陷修复之一）。
+    expect(source).toMatch(/zcode: pruned\([^)]*,\s*zcodeAdapter\)/)
   })
 
   it('★ index.ts 的清理块会 dispose captcha 浏览器（否则留孤儿 chromium）', () => {

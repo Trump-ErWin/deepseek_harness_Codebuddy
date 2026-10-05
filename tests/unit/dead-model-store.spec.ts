@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -10,7 +10,9 @@ process.env.DSH_JET_HUB_STATE_DIR = STATE_DIR
 
 const {
   DEAD_MODELS_FILE,
+  clearAllDeadModels,
   clearDeadModels,
+  configureDeadModelStore,
   deadModelIdsFor,
   isModelGoneError,
   recordDeadModel,
@@ -34,6 +36,21 @@ describe('isModelGoneError —— 应判为「模型已失效」', () => {
     ['中文：模型不存在', '模型 deepseek-x 不存在', 'HTTP_404'],
     ['中文：已下线', '该模型已下线', 'HTTP_400'],
     ['中文：长 id（窗口必须够宽）', '模型 deepseek-v4.1-flash-preview 不存在', 'HTTP_404'],
+    // ⚠️ 以下 6 条是 2026-10-06 复审 !66 补的回归：初版**全部漏判**。
+    // 根因：英文正则的窗口字符类 `[^.!?]` 把**点号**当句子结束符，而本仓库
+    // 几乎所有模型 id 都带小数点 ⇒ 英文路径对带点 id 全部失效。
+    ['★英文 + 带点 id（点号阻断回归）', 'model deepseek-v4.1-flash 不存在', 'HTTP_404'],
+    ['★英文 + 带点 id（已下线）', 'model deepseek-v4.1-flash 已下线', 'HTTP_404'],
+    ['★英文 + 带点 id（does not exist）', 'The model gpt-5.6-astra does not exist', 'HTTP_404'],
+    ['★英文 + 带点 id（反引号包裹）', 'The model `gpt-5.6-astra` does not exist', 'HTTP_404'],
+    ['★英文 + 带点 id（双引号包裹）', 'model "deepseek-v4.1-flash" does not exist', 'HTTP_404'],
+    ['★最长真实 id（37 字符）', 'model cline-free/muse-spark-1.3-contributor does not exist', 'HTTP_404'],
+    ['★最长真实 id（中文路径）', '模型 cline-free/muse-spark-1.3-contributor 不存在', 'HTTP_404'],
+    ['★OpenAI 标准 code 形态', 'model_not_found', 'HTTP_404'],
+    ['★下划线形态（大小写）', 'MODEL_NOT_FOUND', 'HTTP_404'],
+    ['★连字符形态', 'model-not-found', 'HTTP_404'],
+    // ⚠️ 排除词必须带词边界，否则误杀正常下架文案。
+    ['★模型名含 expired（边界回归）', 'model expired-v3 does not exist', 'HTTP_404'],
   ]
   for (const [label, message, code] of positives) {
     it(label, () => {
@@ -60,8 +77,25 @@ describe('isModelGoneError —— 必须**不**判为模型失效（误判会藏
     ['网络错误', 'transport error: socket hang up', 'TRANSPORT'],
     ['账号均不可用（含模型名）', 'cline: 模型 deepseek-x 的所有账号均不可用 —— 请稍后', 'QUOTA_EXCEEDED'],
     ['账号均不可用（无错误码兜底）', '模型 abc 的所有账号均不可用', undefined],
+    // ⚠️ 「不可用」绝不能当下架：账号类报错全这么说。初版刻意不收它，
+    // 这里加回归锁死该取舍（它是「宁可漏判不可误伤」的典型）。
+    ['★裸「不可用」不判下架', '模型 xxx 不可用', 'HTTP_403'],
+    ['★裸「所有账号均不可用」不判下架', '所有账号均不可用', 'HTTP_403'],
     ['参数错误（非下架）', 'invalid model parameters: temperature', 'INVALID_REQUEST'],
     ['模型名含 model 但是参数问题', 'unsupported model feature: tools', 'INVALID_REQUEST'],
+    // ⚠️⚠️ 以下 6 条是 2026-10-06 复审 !66 补的回归：初版**全部误判为下架**。
+    // 根因：GONE_PATTERNS 初版把 `available` / `supported` 与 `found`/`exist`
+    // 并列，于是「换套餐 / 换地域 / 换端点就能恢复」的问题被当成模型下架 ——
+    // 而误判后模型被藏 30 天且用户**无法自愈**，代价最高。
+    // ⚠️ 与文件头「`unsupported` 单独出现不算」的口径本来就不一致。
+    ['★套餐限制（换套餐可恢复）', 'cline: model not supported in this plan', 'INVALID_REQUEST'],
+    ['★工具能力限制', 'model not supported by tool use', 'INVALID_REQUEST'],
+    ['★地域限制（换区可恢复）', 'model not available in your region', 'INVALID_REQUEST'],
+    ['★思考档位不支持', 'the selected model is not available for reasoning', 'INVALID_REQUEST'],
+    ['★端点不支持', 'model not supported for this endpoint', 'INVALID_REQUEST'],
+    ['★能力开关', 'model not supported: thinking', 'INVALID_REQUEST'],
+    // ⚠️ 中文同理：「不支持」绝不能当下架。
+    ['★中文不支持', '模型 xxx 不支持该功能', 'INVALID_REQUEST'],
   ]
   for (const [label, message, code] of negatives) {
     it(label, () => {
@@ -262,8 +296,217 @@ describe('withDeadModelPruning —— 持久化', () => {
     expect(doc.providers['spec-provider-c']?.['gone-x']?.reason).toBe('test')
   })
 
-  it('落盘失败不影响调用方（不可写目录也只降级记日志）', () => {
-    // 用一个必然写不进去的路径：把文件名段做成目录占位
-    expect(() => recordDeadModel('spec-provider-d', 'gone-y', 'test')).not.toThrow()
+  it('落盘失败不影响调用方（不可写路径也只降级记日志）', () => {
+    // ⚠️ 初版这条测试是**同义反复**：注释声称「构造一个必然写不进去的路径」，
+    // 但代码里什么都没构造，跑的是正常写入分支（`mkdirSync(recursive)` 还会
+    // 把整条路径建出来）—— 任何不崩的实现都能过，断言强度为 0。
+    //
+    // 现在用**另一个**provider 的独立 state 目录，把 `jet-hub` 段**占成文件**：
+    // `FileDeadModelStore.save` 里的 `mkdirSync(join(path,'..'), {recursive:true})`
+    // 必然抛 ENOTDIR，而该异常被 `persist` 捕获只记日志。
+    const blockedDir = mkdtempSync(join(tmpdir(), 'dsh-dead-model-blocked-'))
+    const jetHubDir = join(blockedDir, 'jet-hub')
+    writeFileSync(jetHubDir, 'not-a-directory', 'utf-8')
+    const previous = process.env.DSH_JET_HUB_STATE_DIR
+    // ⚠️ store / cache 是模块级单例，必须让下一次解析重新读环境变量。
+    configureDeadModelStore({ logger: undefined } as never)
+    process.env.DSH_JET_HUB_STATE_DIR = blockedDir
+    configureDeadModelStore({ logger: undefined } as never)
+    try {
+      expect(() => recordDeadModel('spec-provider-d', 'gone-y', 'test')).not.toThrow()
+      // 记录仍进内存（下次读仍在），只是没落盘 —— 与永久积分锁的降级策略一致。
+      expect(deadModelIdsFor('spec-provider-d').has('gone-y')).toBe(true)
+    } finally {
+      process.env.DSH_JET_HUB_STATE_DIR = previous
+      configureDeadModelStore({ logger: undefined } as never)
+      rmSync(blockedDir, { recursive: true, force: true })
+      clearDeadModels('spec-provider-d')
+    }
+  })
+})
+
+// ── 5. 生产环境唯一真正走到的路径：prepareCall（致命缺陷回归）────────────
+
+/**
+ * ⚠️ 与本仓库全部 14 个适配器**同款形状**：`prepareCall` 返回的
+ * `stream: (o) => this.stream(o)` 里，`this` 是**原始对象** —— 只包 `stream`
+ * 的 Proxy 会被完全绕过。
+ *
+ * 依据：`node_modules/@deepseek-ai/dsh-llm/lib/index.js:1597` 与 `:1667`
+ * 两条运行时路径都只调 `prepareCall`，再用它返回的 `call.stream` 作 dispatch。
+ */
+class PrepareCallAdapter {
+  calls: string[] = []
+  async listModels(): Promise<Array<{ id: string; name: string }>> {
+    return [{ id: 'gone-1', name: 'Gone' }, { id: 'ok-1', name: 'Ok' }]
+  }
+  listAllModels(): Array<{ id: string; name: string }> {
+    return [{ id: 'gone-1', name: 'Gone' }, { id: 'ok-1', name: 'Ok' }]
+  }
+  async resolveModel(provider: string, model: string): Promise<{ provider: string; id: string; name: string }> {
+    return { provider, id: model, name: model }
+  }
+  async prepareCall(provider: string, model: string): Promise<{
+    model: unknown
+    stream: (options: { model: string }) => AsyncIterable<unknown>
+  }> {
+    return { model: await this.resolveModel(provider, model), stream: (o) => this.stream(o) }
+  }
+  async *stream(options: { model: string }): AsyncGenerator<unknown> {
+    this.calls.push(options.model)
+    if (options.model === 'gone-1') {
+      throw Object.assign(new Error('cline: model not found'), { code: 'HTTP_404' })
+    }
+    if (options.model === 'quota-1') {
+      throw Object.assign(new Error('模型额度已用尽'), { code: 'QUOTA_EXCEEDED' })
+    }
+    yield { text: `ok:${options.model}` }
+  }
+  normalMethod(): string {
+    return 'keep-me'
+  }
+}
+
+describe('withDeadModelPruning —— prepareCall 路径（!66 致命缺陷回归）', () => {
+  const PROVIDER = 'spec-preparecall'
+
+  beforeEach(() => {
+    clearDeadModels(PROVIDER)
+  })
+
+  it('★ 经 prepareCall 的错误**会被记录**（初版完全不记录，机制等于失效）', async () => {
+    const wrapped = withDeadModelPruning([PROVIDER], new PrepareCallAdapter())
+    const call = await wrapped.prepareCall(PROVIDER, 'gone-1')
+    await expect(drain(call.stream({ model: 'gone-1' }))).rejects.toThrow('model not found')
+    expect(deadModelIdsFor(PROVIDER).has('gone-1')).toBe(true)
+  })
+
+  it('★ 经 prepareCall 的错误**仍原样抛出**（不吞，harness 重试分类依赖原始码）', async () => {
+    const wrapped = withDeadModelPruning([PROVIDER], new PrepareCallAdapter())
+    const call = await wrapped.prepareCall(PROVIDER, 'gone-1')
+    await expect(drain(call.stream({ model: 'gone-1' }))).rejects.toThrow(/model not found/)
+  })
+
+  it('★ prepareCall 返回值其余字段原样保留（不能只回 { stream }）', async () => {
+    const wrapped = withDeadModelPruning([PROVIDER], new PrepareCallAdapter())
+    const call = await wrapped.prepareCall(PROVIDER, 'ok-1')
+    expect(call.model).toEqual({ provider: PROVIDER, id: 'ok-1', name: 'ok-1' })
+    expect(typeof call.stream).toBe('function')
+  })
+
+  it('经 prepareCall 的额度类错误**不**记录', async () => {
+    const wrapped = withDeadModelPruning([PROVIDER], new PrepareCallAdapter())
+    const call = await wrapped.prepareCall(PROVIDER, 'quota-1')
+    await expect(drain(call.stream({ model: 'quota-1' }))).rejects.toThrow()
+    expect(deadModelIdsFor(PROVIDER).has('quota-1')).toBe(false)
+  })
+
+  it('经 prepareCall 的正常模型正常产出且不误记', async () => {
+    const wrapped = withDeadModelPruning([PROVIDER], new PrepareCallAdapter())
+    const call = await wrapped.prepareCall(PROVIDER, 'ok-1')
+    await expect(drain(call.stream({ model: 'ok-1' }))).resolves.toEqual([{ text: 'ok:ok-1' }])
+    expect(deadModelIdsFor(PROVIDER).size).toBe(0)
+  })
+
+  it('prepareCall 的调用仍到达原适配器', async () => {
+    const raw = new PrepareCallAdapter()
+    const wrapped = withDeadModelPruning([PROVIDER], raw)
+    const call = await wrapped.prepareCall(PROVIDER, 'ok-1')
+    await drain(call.stream({ model: 'ok-1' }))
+    expect(raw.calls).toContain('ok-1')
+  })
+
+  it('缺 prepareCall 时不凭空造一个', () => {
+    const wrapped = withDeadModelPruning([PROVIDER], { async listModels() { return [] } })
+    expect((wrapped as { prepareCall?: unknown }).prepareCall).toBeUndefined()
+  })
+
+  it('prepareCall 返回非对象 / 无 stream 时原样透传（不构造坏结构）', async () => {
+    const nonObject = withDeadModelPruning([PROVIDER], {
+      async prepareCall() { return 42 },
+    })
+    expect(await nonObject.prepareCall()).toBe(42)
+    const noStream = withDeadModelPruning([PROVIDER], {
+      async prepareCall() { return { model: 'm' } },
+    })
+    expect(await noStream.prepareCall()).toEqual({ model: 'm' })
+  })
+})
+
+// ── 6. 函数身份稳定（初版只有透传分支做了缓存）─────────────────────────
+
+describe('withDeadModelPruning —— 函数身份稳定', () => {
+  it('★ listModels 身份稳定（初版每次访问新建闭包）', () => {
+    const wrapped = withDeadModelPruning(['spec-identity'], new PrepareCallAdapter())
+    expect(wrapped.listModels).toBe(wrapped.listModels)
+  })
+
+  it('★ listAllModels 身份稳定', () => {
+    const wrapped = withDeadModelPruning(['spec-identity'], new PrepareCallAdapter())
+    expect(wrapped.listAllModels).toBe(wrapped.listAllModels)
+  })
+
+  it('★ stream 身份稳定', () => {
+    const wrapped = withDeadModelPruning(['spec-identity'], new PrepareCallAdapter())
+    expect(wrapped.stream).toBe(wrapped.stream)
+  })
+
+  it('★ prepareCall 身份稳定', () => {
+    const wrapped = withDeadModelPruning(['spec-identity'], new PrepareCallAdapter())
+    expect(wrapped.prepareCall).toBe(wrapped.prepareCall)
+  })
+})
+
+// ── 7. 恢复入口：clearDeadModels ──────────────────────────────────────────
+
+describe('clearDeadModels —— 用户唯一的自愈路径', () => {
+  it('按单个模型移除，只删那一条', () => {
+    recordDeadModel('rec-p', 'a', 'x')
+    recordDeadModel('rec-p', 'b', 'x')
+    expect(clearDeadModels('rec-p', 'a')).toBe(1)
+    expect([...deadModelIdsFor('rec-p')]).toEqual(['b'])
+  })
+
+  it('省略 modelId 时清空该 provider 全部', () => {
+    recordDeadModel('rec-p2', 'a', 'x')
+    recordDeadModel('rec-p2', 'b', 'x')
+    expect(clearDeadModels('rec-p2')).toBe(2)
+    expect(deadModelIdsFor('rec-p2').size).toBe(0)
+  })
+
+  it('不影响其它 provider', () => {
+    recordDeadModel('rec-a', 'x', 'x')
+    recordDeadModel('rec-b', 'y', 'x')
+    clearDeadModels('rec-a')
+    expect([...deadModelIdsFor('rec-b')]).toEqual(['y'])
+  })
+
+  it('无记录时幂等返回 0', () => {
+    expect(clearDeadModels('rec-never')).toBe(0)
+    recordDeadModel('rec-idem', 'a', 'x')
+    expect(clearDeadModels('rec-idem', 'a')).toBe(1)
+    expect(clearDeadModels('rec-idem', 'a')).toBe(0)
+  })
+
+  it('空 provider 返回 0（不误清全表）', () => {
+    recordDeadModel('rec-safe', 'a', 'x')
+    expect(clearDeadModels('')).toBe(0)
+    expect([...deadModelIdsFor('rec-safe')]).toEqual(['a'])
+  })
+
+  it('恢复后模型重新可见', async () => {
+    recordDeadModel('rec-visible', 'gone-1', 'x')
+    const wrapped = withDeadModelPruning(['rec-visible'], new PrepareCallAdapter())
+    expect((await wrapped.listModels()).some((m) => m.id === 'gone-1')).toBe(false)
+    clearDeadModels('rec-visible', 'gone-1')
+    expect((await wrapped.listModels()).some((m) => m.id === 'gone-1')).toBe(true)
+  })
+
+  it('clearAllDeadModels 清空全部 provider', () => {
+    recordDeadModel('all-a', 'x', 'x')
+    recordDeadModel('all-b', 'y', 'x')
+    expect(clearAllDeadModels()).toBeGreaterThanOrEqual(2)
+    expect(deadModelIdsFor('all-a').size).toBe(0)
+    expect(deadModelIdsFor('all-b').size).toBe(0)
   })
 })
