@@ -71,6 +71,8 @@
  * `settings-compat.ts` 中（当前无调用方）。
  */
 
+import { withDeadModelPruning } from './dead-model-store.js'
+
 /** dsh-llm 对「configurable provider 已存在」抛的 code。**当前仅作防御**保留。 */
 const DUPLICATE_DIRECTORY = 'DUPLICATE_DIRECTORY'
 
@@ -117,6 +119,15 @@ export interface AdapterRegisterTarget {
  * ⚠ 重复场景下的行为：保留现有 adapter 路由（重启竞态，见模块头）。
  * ⚠ 返回 dsh-llm 的 handle（含 `.replace()`）——重复分支没有 handle 可还，
  * 返回 `undefined`；调用方若需要 replace 能力应保存成功路径的返回值。
+ *
+ * ## 顺带做「已失效模型」剔除包装
+ *
+ * 本函数是**全部适配器**的唯一注册入口，故在这里统一包装，避免十四个
+ * `registerXxxLlm` 各写一遍（见 `dead-model-store.ts` 模块头：为什么不能改用
+ * 「远端目录比对」，以及为什么判据必须是**阳性证据**）。
+ *
+ * ⚠ 包装失败**不阻断注册** —— 它只是显示层的收敛，回退到原适配器即可，
+ * 不能因为它挂掉导致整个 provider 起不来。
  */
 export function registerAdapterIdempotent(
   llm: AdapterRegisterTarget,
@@ -124,8 +135,17 @@ export function registerAdapterIdempotent(
   adapter: unknown,
   warn?: (message: string) => void,
 ): unknown {
+  let target = adapter
+  if (typeof adapter === 'object' && adapter !== null) {
+    try {
+      target = withDeadModelPruning(providers, adapter)
+    } catch (error) {
+      warn?.(`[llm-register] 已失效模型剔除包装失败，使用原适配器: ${String(error)}`)
+      target = adapter
+    }
+  }
   try {
-    return llm.registerAdapter(providers, adapter)
+    return llm.registerAdapter(providers, target)
   } catch (error) {
     if (!isDuplicateRegistrationError(error)) throw error
     warn?.(

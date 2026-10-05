@@ -798,6 +798,18 @@ export interface RpcModelListEntry {
    * 「未知」语义 —— 不编造 `false`（与全仓「未知不编造」的约定一致）。
    */
   isFree?: boolean
+  /**
+   * 该模型是否已被判定为**上游下架**（`dead-models.json` 命中）。
+   *
+   * ⚠️ 恒为布尔值、**不省略**：缺失即 false。客户端据此灰显并给出「重新显示」
+   * 入口（`model.clearDead`）。
+   *
+   * ⚠️ **必须显式列出失效模型而不能静默剔除**（2026-10-06 复审 !66 实测）：
+   * 适配器侧会把它们从目录里过滤掉，若这里不补回，用户在设置页**连开关都摸不着**
+   * —— 而失效模型用户**选不到 ⇒ 不可能再成功 ⇒ 记录永不自动清除**，等于永久失去
+   * 恢复路径。这是「误判代价不对称」的必然要求：能藏，但必须能找回。
+   */
+  dead: boolean
 }
 
 /** RPC: 列出某 provider 的模型响应 */
@@ -816,6 +828,33 @@ export interface RpcModelSetDisabledRequest {
 export interface RpcModelSetDisabledResponse {
   provider: string
   disabledModels: Record<string, boolean>
+}
+
+/**
+ * RPC: 把某个模型从「已失效」表里移除（让它重新出现在目录中）。
+ *
+ * ## 为什么必须有这个端点（2026-10-06 复审 !66 确认）
+ *
+ * 失效记录的**唯一**自愈路径是 TTL 过期（默认 30 天）—— 因为模型被剔除后
+ * 用户**选不到**，不可能靠「再成功一次」触发重记清除。于是**误判即永久损伤**
+ * （用户连手工编辑 `dead-models.json` 都不会）。
+ *
+ * ⚠️ 这与 Jet Hub 已有的模型开关**不对等**：用户能一键关模型，却不能一键
+ * 「复活」一个被误记的模型。故必须有显式恢复入口。
+ *
+ * ⚠️ `modelId` **可选**：省略则清空该 provider 的全部失效记录（「全部重新显示」）。
+ * 与 `disabled` 一样**没有默认值** —— 传 `""` 视为非法，避免「字段名写错 ⇒
+ * 静默清空全表」。
+ */
+export interface RpcModelClearDeadRequest {
+  provider: string
+  modelId?: string
+}
+
+/** RPC: 恢复失效模型的响应（回传该 provider 剩余的失效 id，便于前端刷新） */
+export interface RpcModelClearDeadResponse {
+  provider: string
+  deadModels: string[]
 }
 
 /**
