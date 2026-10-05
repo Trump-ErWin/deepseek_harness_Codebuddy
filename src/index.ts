@@ -28,7 +28,7 @@ import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
 import type { ZcodeCredential } from './zcode.js'
 import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
-import { RefreshScheduler } from './refresh-scheduler.js'
+import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
@@ -1651,7 +1651,11 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
 
   /**
-   * 十个 provider 实例的续期入口（`buddy` 与 `workbuddy` 是两个实例、同一个类）。
+   * 十三个 provider 实例的续期入口（`buddy` 与 `workbuddy` 是两个实例、同一个类；
+   * `qoder` 与 `qodercn` 同理）。
+   *
+   * ⚠️ 条数会随 provider 增长（早期写「十个」已过时）——注释里的数字**不是**契约，
+   * `tests/unit/refresh-bootstrap-wiring.spec.ts` 的清单才是。
    *
    * 收成一张表是为了让「失败必须留日志」这条规则**只写一遍** —— 原先这里是
    * 十个空 catch（注释写着「静默」），把 provider 内部的告警与异常一起吞掉，
@@ -1728,7 +1732,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 这一轮与 lead-time 过滤配合（`src/expiry-sync.ts` 的 `shouldRefreshNow`），
   // 只对「距过期不足 1 小时」的账号发续期请求，其余只做一次本地对账 ——
   // 既补上了首轮，又不会在启动时打出几十个无谓请求。
-  const refreshScheduler = new RefreshScheduler({
+  const refreshScheduler = new MultiAccountRefreshScheduler({
     refresh: refreshAllCredentials,
     intervalMs: REFRESH_INTERVAL_MS,
     isPoolEmpty: async () => (await pool.listAllAccounts()).length === 0,

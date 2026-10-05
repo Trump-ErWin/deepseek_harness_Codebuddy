@@ -30,9 +30,9 @@
  *
  * 1. **无条件武装**：空池也建定时器。空池是「等待首账号入库」的正常态，
  *    不是「不需要调度」；
- * 2. **入库即武装**（{@link RefreshScheduler.notifyAccountAdded}）：这是 issue
+ * 2. **入库即武装**（{@link MultiAccountRefreshScheduler.notifyAccountAdded}）：这是 issue
  *    里点名缺失的那条「重新武装的路径」；
- * 3. **空池下轮重试**：{@link RefreshScheduler.onTick} 里判空后仍保留定时器，
+ * 3. **空池下轮重试**：{@link MultiAccountRefreshScheduler.onTick} 里判空后仍保留定时器，
  *    所以即使通知因任何原因没送到，下一个周期也会自己恢复 —— 两条防线互补。
  *
  * ⚠️ **判据只有「池里有没有账号」**，**不看** `refreshable` / `enabled`
@@ -69,7 +69,7 @@ export interface RefreshSchedulerOptions {
  *
  * 生命周期与插件一致：`start()` 一次、`stop()` 一次（由 `ctx.effect` 回收）。
  */
-export class RefreshScheduler {
+export class MultiAccountRefreshScheduler {
   /** 当前定时器；`undefined` 表示未武装。 */
   private timer: ReturnType<typeof setInterval> | undefined
   /**

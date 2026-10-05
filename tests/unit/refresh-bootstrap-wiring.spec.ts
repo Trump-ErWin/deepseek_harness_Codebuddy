@@ -57,16 +57,18 @@ describe('续期调度器：启动必须先跑一轮', () => {
    * raccoon（3 小时）的凭据在宿主关闭期间早已到期，于是重启后
    * **最长 30 分钟**一直显示「已过期」、积分行一直 401。
    *
-   * ⚠️ issue IKJOZB 之后本条改判在 `RefreshScheduler.start()` 上：那段逻辑
+   * ⚠️ issue IKJOZB 之后本条改判在 `MultiAccountRefreshScheduler.start()` 上：那段逻辑
    * 已从 `src/index.ts` 抽成可单测的类（行为用例见
    * `tests/unit/refresh-scheduler.spec.ts`），本文件保留的是**接线**断言 ——
    * 「index.ts 确实用了那个类，且把首轮与定时器都交付给它」。
    */
-  it('index.ts 把续期交给 RefreshScheduler，而不是自己写 setInterval', () => {
-    expect(indexSource, 'index.ts 未使用 RefreshScheduler').toContain('new RefreshScheduler(')
+  it('index.ts 把续期交给 MultiAccountRefreshScheduler，而不是自己写 setInterval', () => {
+    expect(indexSource, 'index.ts 未使用 MultiAccountRefreshScheduler')
+      .toContain('new MultiAccountRefreshScheduler(')
     expect(indexSource, 'index.ts 仍在自己挂 setInterval（缺陷形态会随之回来）')
       .not.toMatch(/setInterval\(\s*\(\)\s*=>\s*void refreshAllCredentials/)
     // 首轮不再由 index.ts 手写：`start()` 内部保证「先跑一轮」。
+    // ⚠️ 这里是**变量名**（`const refreshScheduler = new …`），不是类名。
     expect(indexSource).toMatch(/refreshScheduler\.start\(\)/)
   })
 
@@ -81,7 +83,7 @@ describe('续期调度器：启动必须先跑一轮', () => {
     // 一起固化了下来 —— 而它正是 IKJOZB 的根因。现在空池判据只喂给
     // `isPoolEmpty`（仅影响日志措辞），武装本身与池内容**彻底解耦**。
     const gate = indexSource.slice(
-      indexSource.indexOf('new RefreshScheduler('),
+      indexSource.indexOf('new MultiAccountRefreshScheduler('),
       indexSource.indexOf('refreshScheduler.start()'),
     )
     expect(gate).not.toMatch(/\.refreshable/)
@@ -105,7 +107,7 @@ describe('续期调度器：启动必须先跑一轮', () => {
 
   it('listAllAccounts 的失败有兜底（否则存储异常会让调度器永不武装且无痕）', () => {
     // ⚠️ 改造后 `listAllAccounts()` **不再**处于武装路径上（它在 `isPoolEmpty`
-    // 里，异常由 `RefreshScheduler.probeEmpty` 吞掉并记 warn），故原先那条
+    // 里，异常由 `MultiAccountRefreshScheduler.probeEmpty` 吞掉并记 warn），故原先那条
     // 「.then() 链上必须有 .catch」的断言失去对象。现在要保证的是
     // `start()` 的 promise 有兜底 —— 否则未处理的 rejection 会让 DSH 侧
     // 报「插件加载失败」，而实际原因只是一次存储抖动。

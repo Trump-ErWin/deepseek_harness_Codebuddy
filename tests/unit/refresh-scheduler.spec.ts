@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { RefreshScheduler } from '../../src/refresh-scheduler.js'
+import { MultiAccountRefreshScheduler } from '../../src/refresh-scheduler.js'
 
 /**
  * 多账号续期调度的**武装时机**回归（Gitee issue IKJOZB）。
@@ -37,7 +37,7 @@ function makeRefreshLog(): { calls: number; refresh: () => Promise<void> } {
   return box
 }
 
-describe('RefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', () => {
+describe('MultiAccountRefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', () => {
   beforeEach(() => {
     vi.useFakeTimers()
   })
@@ -47,7 +47,7 @@ describe('RefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', 
 
   it('池为空时依然武装定时器（无限条件 return 这条路径）', async () => {
     const log = makeRefreshLog()
-    const scheduler = new RefreshScheduler({
+    const scheduler = new MultiAccountRefreshScheduler({
       refresh: log.refresh,
       intervalMs: 1000,
       isPoolEmpty: async () => true,
@@ -67,7 +67,7 @@ describe('RefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', 
 
   it('启动时立刻跑一轮，不等第一个周期（issue !IKIRTT 的既有约定）', async () => {
     const log = makeRefreshLog()
-    const scheduler = new RefreshScheduler({
+    const scheduler = new MultiAccountRefreshScheduler({
       refresh: log.refresh,
       intervalMs: 1000,
       isPoolEmpty: async () => false,
@@ -82,7 +82,7 @@ describe('RefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', 
   it('未武装时 notifyAccountAdded 会武装（冷启动后登录的账号因此能被续期）', async () => {
     const log = makeRefreshLog()
     let empty = true
-    const scheduler = new RefreshScheduler({
+    const scheduler = new MultiAccountRefreshScheduler({
       refresh: log.refresh,
       intervalMs: 1000,
       isPoolEmpty: async () => empty,
@@ -104,7 +104,7 @@ describe('RefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', 
 
   it('已武装时 notifyAccountAdded 不会重复武装（不叠加定时器）', async () => {
     const log = makeRefreshLog()
-    const scheduler = new RefreshScheduler({
+    const scheduler = new MultiAccountRefreshScheduler({
       refresh: log.refresh,
       intervalMs: 1000,
       isPoolEmpty: async () => false,
@@ -125,7 +125,7 @@ describe('RefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', 
 
   it('定时器内的空池检查不会阻止下一轮（不在空池时自毁）', async () => {
     const log = makeRefreshLog()
-    const scheduler = new RefreshScheduler({
+    const scheduler = new MultiAccountRefreshScheduler({
       refresh: log.refresh,
       intervalMs: 1000,
       isPoolEmpty: async () => true,
@@ -142,7 +142,7 @@ describe('RefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', 
 
   it('stop() 之后不再有任何续期调用，且可重新 start()', async () => {
     const log = makeRefreshLog()
-    const scheduler = new RefreshScheduler({
+    const scheduler = new MultiAccountRefreshScheduler({
       refresh: log.refresh,
       intervalMs: 1000,
       isPoolEmpty: async () => false,
@@ -163,7 +163,7 @@ describe('RefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', 
 
   it('refresh 抛错不会打死调度器（下一轮照常）', async () => {
     let calls = 0
-    const scheduler = new RefreshScheduler({
+    const scheduler = new MultiAccountRefreshScheduler({
       refresh: async () => { calls += 1; throw new Error('boom') },
       intervalMs: 1000,
       isPoolEmpty: async () => false,
@@ -180,7 +180,7 @@ describe('RefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', 
 
   it('isPoolEmpty 抛错也照常继续（不让一次存储异常终止续期）', async () => {
     const log = makeRefreshLog()
-    const scheduler = new RefreshScheduler({
+    const scheduler = new MultiAccountRefreshScheduler({
       refresh: log.refresh,
       intervalMs: 1000,
       isPoolEmpty: async () => { throw new Error('store down') },
@@ -195,7 +195,7 @@ describe('RefreshScheduler：冷启动空池也必须武装（issue IKJOZB）', 
   })
 })
 
-describe('RefreshScheduler：武装判据不依赖池内布尔（issue !IKIRTT 既有铁律）', () => {
+describe('MultiAccountRefreshScheduler：武装判据不依赖池内布尔（issue !IKIRTT 既有铁律）', () => {
   beforeEach(() => {
     vi.useFakeTimers()
   })
@@ -209,7 +209,7 @@ describe('RefreshScheduler：武装判据不依赖池内布尔（issue !IKIRTT �
     // 故这条用例锁的是「续期调用确实发生了」，而不是「实现里没有某个词」。
     const log = makeRefreshLog()
     let probeCalls = 0
-    const scheduler = new RefreshScheduler({
+    const scheduler = new MultiAccountRefreshScheduler({
       refresh: log.refresh,
       intervalMs: 1000,
       // 池里「有账号」但那些账号的 refreshable=false —— 也必须照常续期。
