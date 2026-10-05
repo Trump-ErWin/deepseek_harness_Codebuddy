@@ -119,6 +119,11 @@ class FileLedgerStore implements TokenLedgerStore {
                 cacheWriteTokens: Number(b.cacheWriteTokens) || 0,
                 reasoningTokens: Number(b.reasoningTokens) || 0,
                 errors: Number(b.errors) || 0,
+                // Σ/份数（第 3 期均值）：旧文档没这些键 → 0（等价于无样本）。
+                ttftSumMs: Number(b.ttftSumMs) || 0,
+                ttftCount: Number(b.ttftCount) || 0,
+                tpsSum: Number(b.tpsSum) || 0,
+                tpsCount: Number(b.tpsCount) || 0,
               })
             }
           }

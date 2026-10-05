@@ -66,6 +66,23 @@ export interface TokenLedgerEntry {
   cacheWriteTokens?: number
   /** 思考 token（缺失时省略；已含在 outputTokens 内）。 */
   reasoningTokens?: number
+  /**
+   * **首个内容块耗时**（毫秒）—— 用户口中的「首字用时」。
+   *
+   * 口径与 `cline-request-log.ttftMs` 一致：**收到任何一块**（含思考增量）
+   * 的时刻 − 请求发起。0 = 整个流没有产出任何块（失败 / 秒回空），展示层
+   * 按「不可测」处理（显示 `—`），不显示 0。
+   */
+  ttftMs?: number
+  /**
+   * 全程耗时里**扣除首块之后**的输出速率（tok/s）。
+   *
+   * 口径对齐官方（`tokens-per-second.js` 抄的 DeepSeek 口径）：分子是
+   * **全部输出 token（含思考）**，分母 = `durationMs − ttftMs`（首块之后
+   * → 结束）。任一前提缺失（无 usage / 无首块 / 分母 ≤ 0）时**省略字段** ——
+   * 不可测与 0 tok/s 是两回事。
+   */
+  tps?: number
   /** 全程耗时（毫秒）。 */
   durationMs: number
   /** 失败原因；成功行省略。 */
@@ -86,6 +103,18 @@ export interface TokenLedgerModelRow {
   reasoningTokens: number
   /** 失败请求数。 */
   errors: number
+  /**
+   * 平均首字用时（毫秒）—— **只对有实测值（ttftMs > 0）的请求取均值**。
+   * 失败/秒回空（ttftMs 缺省）的请求不摊薄均值；无任何可测请求时为
+   * `undefined`（显示 `—`，与「平均 0ms」严格区分）。
+   */
+  avgTtftMs?: number
+  /**
+   * 平均输出速率（tok/s）—— 对**有 tps 实测值**的请求取均值（不加权，
+   * 「每笔请求的速率」的算术平均，口径与用户直觉一致）。无可测请求时
+   * `undefined`。
+   */
+  avgTps?: number
 }
 
 /** 一个 provider 下、某个账号的聚合（模型行 + 自身小计）。 */
@@ -234,6 +263,15 @@ export function recordTokenUsage(entry: Omit<TokenLedgerEntry, 'ts'>): void {
     const reasoning = clampCount(entry.reasoningTokens)
     // 账号：空串/缺失统一省略字段（「未归属」与「空账号」不伪造）。
     const accountId = typeof entry.accountId === 'string' ? entry.accountId.slice(0, 64) : ''
+    const ttft = clampCount(entry.ttftMs)
+    const duration = clampCount(entry.durationMs)
+    const outputTokens = clampCount(entry.outputTokens)
+    // TPS（官方口径）：分子 = 全部输出 token（含思考），分母 = 首块之后 → 结束。
+    // 三个前提（有首块 / 分母 > 0 / usage 已报）缺一个都不可测 ⇒ 省略字段。
+    const decodeMs = duration - ttft
+    const tps = ttft > 0 && decodeMs > 0 && usageReported
+      ? Math.round((outputTokens / (decodeMs / 1000)) * 10) / 10
+      : undefined
     const record = Object.freeze({
       ts: Date.now(),
       // channel 只认两个合法值，垃圾值一律落回 `direct`（保守缺省）。
@@ -243,13 +281,16 @@ export function recordTokenUsage(entry: Omit<TokenLedgerEntry, 'ts'>): void {
       ...(accountId.length > 0 ? { accountId } : {}),
       usageReported,
       inputTokens: clampCount(entry.inputTokens),
-      outputTokens: clampCount(entry.outputTokens),
+      outputTokens,
       // ⚠️ 0 / 缺失一律**省略字段**而不是写 0：与接口注释一致，
       // 「没有缓存命中」与「命中 0 个」无从区分时，缺省是更诚实的表示。
       ...(cacheRead > 0 ? { cacheReadTokens: cacheRead } : {}),
       ...(cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {}),
       ...(reasoning > 0 ? { reasoningTokens: reasoning } : {}),
-      durationMs: clampCount(entry.durationMs),
+      // 首字用时：0 = 无任何块（失败/秒回空）⇒ 省略（不可测 ≠ 0ms）。
+      ...(ttft > 0 ? { ttftMs: ttft } : {}),
+      ...(tps !== undefined ? { tps } : {}),
+      durationMs: duration,
       ...(typeof entry.error === 'string' && entry.error.length > 0
         ? { error: entry.error.slice(0, 200) }
         : {}),
@@ -268,8 +309,8 @@ export function recordTokenUsage(entry: Omit<TokenLedgerEntry, 'ts'>): void {
   }
 }
 
-/** 空聚合行（防重复初始化代码）。 */
-function emptyTotals(): Omit<TokenLedgerModelRow, 'model'> {
+/** 空聚合行（防重复初始化代码）。返回**累加形态**，finalize 由读取层收尾。 */
+function emptyTotals(): AccumulatingTotals {
   return {
     requests: 0,
     reportedRequests: 0,
@@ -279,14 +320,46 @@ function emptyTotals(): Omit<TokenLedgerModelRow, 'model'> {
     cacheWriteTokens: 0,
     reasoningTokens: 0,
     errors: 0,
+    // 均值的**累加器**：先攒 Σ 与份数，读取收尾时才算除法（见 finalizeAverages）。
+    ttftSumMs: 0,
+    ttftCount: 0,
+    tpsSum: 0,
+    tpsCount: 0,
+  }
+}
+
+/** 聚合行的内部形态：均值以 Σ/份数 累加，最终快照前收尾成 `avgXxx`。 */
+export interface AccumulatingTotals extends Omit<TokenLedgerModelRow, 'model'> {
+  ttftSumMs: number
+  ttftCount: number
+  tpsSum: number
+  tpsCount: number
+}
+
+/** Σ/份数 → 均值（无样本时省略字段；均值取 1 位小数与 TPS 精度对齐）。 */
+function finalizeAverages(t: AccumulatingTotals): Omit<TokenLedgerModelRow, 'model'> {
+  return {
+    ...t,
+    ...(t.ttftCount > 0 ? { avgTtftMs: Math.round(t.ttftSumMs / t.ttftCount) } : {}),
+    ...(t.tpsCount > 0 ? { avgTps: Math.round((t.tpsSum / t.tpsCount) * 10) / 10 } : {}),
   }
 }
 
 /** 把一条记录累加进聚合行。 */
-function accumulate(totals: Omit<TokenLedgerModelRow, 'model'>, entry: TokenLedgerEntry): void {
+function accumulate(totals: AccumulatingTotals, entry: TokenLedgerEntry): void {
   totals.requests += 1
   if (entry.usageReported) totals.reportedRequests += 1
   if (entry.error !== undefined) totals.errors += 1
+  // 均值的样本采集：**只收有实测值**的请求。失败/秒回空（ttft 缺省）与
+  // 不可测 TPS 不参与 —— 它们没有测量值，混进去等于用「没测到」摊薄「测到的」。
+  if (entry.ttftMs !== undefined && entry.ttftMs > 0) {
+    totals.ttftSumMs += entry.ttftMs
+    totals.ttftCount += 1
+  }
+  if (entry.tps !== undefined && entry.tps > 0) {
+    totals.tpsSum += entry.tps
+    totals.tpsCount += 1
+  }
   // ⚠️ 只有 usageReported 的行才计入 token 汇总：失败行/未报行写 0 会把
   // 「没收到用量」混进「真的用了 0」，摊薄均值类读数。
   if (!entry.usageReported) return
@@ -314,9 +387,12 @@ export function readTokenLedger(options: { limit?: number } = {}): TokenLedgerSn
   const limit = Math.max(0, Math.min(options.limit ?? TOKEN_LEDGER_LIMIT, TOKEN_LEDGER_LIMIT))
 
   // ── 第一遍：逐条累加进四级聚合（全局小计顺路算出）──
+  // ⚠️ 各级小计都是 **AccumulatingTotals**（Σ/份数累加）—— 父级均值必须由
+  // 「全部样本的 Σ/份数」算出，若按「子级均值再平均」会在样本数不等时算错
+  //（3 笔 100ms 与 1 笔 200ms，先平均再平均得 150，正确值 125）。
   const totals = emptyTotals()
-  /** channel → provider → account → model → 聚合行 */
-  const channelMap = new Map<TokenLedgerEntry['channel'], Map<string, Map<string, Map<string, Omit<TokenLedgerModelRow, 'model'>>>>>()
+  /** channel → provider → account → model → 聚合行（累加形态） */
+  const channelMap = new Map<TokenLedgerEntry['channel'], Map<string, Map<string, Map<string, AccumulatingTotals>>>>()
   for (const entry of ledger) {
     accumulate(totals, entry)
     let providers = channelMap.get(entry.channel)
@@ -345,7 +421,9 @@ export function readTokenLedger(options: { limit?: number } = {}): TokenLedgerSn
     accumulate(row, entry)
   }
 
-  // ── 第二遍：把 Map 树落成数组并逐级求小计（父级 = 子级之和）──
+  // ── 第二遍：把 Map 树落成数组并逐级求小计（父级 = 子级之和，Σ/份数直加）──
+  // 收尾顺序：模型行 → 账号小计 → provider 小计 → 渠道小计 → 全局小计，
+  // 每级在「把 Σ/份数交给父级之后」才 finalize（finalize 只做除法不改 Σ）。
   const channels: TokenLedgerChannelRow[] = [...channelMap.entries()]
     .sort(([a], [b]) => (a === 'direct' ? -1 : 1) - (b === 'direct' ? -1 : 1))
     .map(([channel, providers]) => {
@@ -355,30 +433,30 @@ export function readTokenLedger(options: { limit?: number } = {}): TokenLedgerSn
         const accountRows: TokenLedgerAccountRow[] = [...accounts.entries()].map(([accountId, models]) => {
           const accountTotals = emptyTotals()
           const modelRows: TokenLedgerModelRow[] = [...models.entries()].map(([model, row]) => {
-            // 账号小计 = 其各模型行之和
+            // 账号小计 = 其各模型行之和（Σ/份数直加，均值收尾在后面）
             for (const key of Object.keys(row) as (keyof typeof row)[]) {
-              accountTotals[key] += row[key]
+              accountTotals[key] += row[key] ?? 0
             }
-            return { model, ...row }
+            return { model, ...finalizeAverages(row) }
           }).sort((a, b) => sumTokens(b) - sumTokens(a))
           // provider 小计 = 其各账号之和
           for (const key of Object.keys(accountTotals) as (keyof typeof accountTotals)[]) {
-            providerTotals[key] += accountTotals[key]
+            providerTotals[key] += accountTotals[key] ?? 0
           }
-          return { accountId, models: modelRows, totals: accountTotals }
+          return { accountId, models: modelRows, totals: finalizeAverages(accountTotals) }
         }).sort((a, b) => sumTokens(b.totals) - sumTokens(a.totals))
         // 渠道小计 = 其各 provider 之和
         for (const key of Object.keys(providerTotals) as (keyof typeof providerTotals)[]) {
-          channelTotals[key] += providerTotals[key]
+          channelTotals[key] += providerTotals[key] ?? 0
         }
-        return { provider, accounts: accountRows, totals: providerTotals }
+        return { provider, accounts: accountRows, totals: finalizeAverages(providerTotals) }
       }).sort((a, b) => sumTokens(b.totals) - sumTokens(a.totals))
-      return { channel, providers: providerRows, totals: channelTotals }
+      return { channel, providers: providerRows, totals: finalizeAverages(channelTotals) }
     })
 
   return {
     channels,
-    totals,
+    totals: finalizeAverages(totals),
     entries: ledger.slice(0, limit),
   }
 }
@@ -423,6 +501,12 @@ export interface TokenLedgerDayBucket {
   cacheWriteTokens: number
   reasoningTokens: number
   errors: number
+  /** Σ(首字用时) 与样本数 —— 均值由读取方计算（Σ/份数，避免存小数漂移）。 */
+  ttftSumMs: number
+  ttftCount: number
+  /** Σ(TPS) 与样本数（同上）。 */
+  tpsSum: number
+  tpsCount: number
 }
 
 /** 每日聚合表：`日键 → (桶键 → 桶)`。序列化形态由 store 负责。 */
@@ -461,12 +545,25 @@ export function mergeDayEntry(days: TokenLedgerDayMap, entry: TokenLedgerEntry):
       cacheWriteTokens: 0,
       reasoningTokens: 0,
       errors: 0,
+      ttftSumMs: 0,
+      ttftCount: 0,
+      tpsSum: 0,
+      tpsCount: 0,
     }
     buckets.set(key, bucket)
   }
   bucket.requests += 1
   if (entry.usageReported) bucket.reportedRequests += 1
   if (entry.error !== undefined) bucket.errors += 1
+  // 均值样本：与内存聚合同口径，只收有实测值的请求。
+  if (entry.ttftMs !== undefined && entry.ttftMs > 0) {
+    bucket.ttftSumMs += entry.ttftMs
+    bucket.ttftCount += 1
+  }
+  if (entry.tps !== undefined && entry.tps > 0) {
+    bucket.tpsSum += entry.tps
+    bucket.tpsCount += 1
+  }
   if (!entry.usageReported) return
   bucket.inputTokens += entry.inputTokens
   bucket.outputTokens += entry.outputTokens
