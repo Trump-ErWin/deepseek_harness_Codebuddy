@@ -25,7 +25,231 @@
  * 3. **进程级、不落盘**。与 {@link file://./captcha-requirement.ts} 同口径：
  *    `$DSH_HOME/jet-hub/state.json` 是同机多 profile 共享的 home 级文档，
  *    落盘会把一个 profile 的账号画像传染给另一个。
+ *
+ * ## ★ 本模块同时是 `3012` 判据与文案的**唯一出处**（Gitee issue IKJOQB）
+ *
+ * **真实缺陷**：`3012` 的文案曾在**两个地方各写一份** ——
+ * `zcode-adapter.ts` 的 `describeUpstreamError`（推理路径，带冷却警告）
+ * 与 `zcode-auth.ts` 的 `toClaimOutcome`（领取路径，**只有裸上游串**）。
+ * 于是领取路径的用户看到的是
+ * `zcode-v3-start-plan-trust-1005: request has been blocked due to unusual activity.`
+ * —— 既看不出这是**风控**，更看不到「请勿连续重试」这条**唯一正确的动作**
+ * （`3012` 有账号冷却惩罚，反复触发会 30 分钟 → 24 小时 → 停用）。
+ *
+ * ⇒ 判据（{@link isZcodeUnusualActivityCode} / {@link looksLikeZcodeUnusualActivity}）
+ * 与文案（{@link formatZcodeUnusualActivityMessage}）都收敛到本文件，
+ * 两条路径**引用同一份**。改文案只需改这里，不会再漂移。
  */
+
+/**
+ * 上游 `3012`（unusual activity）的**判据**之一：业务码精确命中。
+ *
+ * ⚠ 上游把码给成数字 `3012`，但**字符串 `"3012"` 也在线上出现过**
+ * （`{"code":"3012"}` 这类把数字写成字符串的响应），故两者都认。
+ * 与 `httpErrorCodeForZcode` 同口径（那边用的是 `body.includes('3012')`）。
+ */
+export function isZcodeUnusualActivityCode(code: unknown): boolean {
+  if (code === 3012) return true
+  if (typeof code !== 'string') return false
+  return code.trim() === '3012'
+}
+
+/**
+ * 把上游 `code` 归一成数字：认 `number`，**也认纯数字字符串**。
+ *
+ * ## ⚠⚠ 为什么必须认字符串（真实缺陷，2026-10-05 对抗性审计打出）
+ *
+ * `zcode-upstream.ts` 原先用 `num(parsed.code)` 解析业务码，而它**只认 number**：
+ * ```js
+ * function num(v){ return typeof v === 'number' && Number.isFinite(v) ? v : undefined }
+ * ```
+ * 于是上游回 `{"code":"3012","msg":"request has been blocked due to unusual activity."}`
+ * 时，`code` 被解析成 **`undefined`** ⇒ 风控码**整条丢失**，用户看到的正是
+ * issue 要修的那句裸上游串：
+ *
+ * ```
+ * zcode-v3-start-plan-trust-1005: request has been blocked due to unusual activity.
+ * ```
+ *
+ * ⇒ 本函数让 `3012` 的**字符串形态**不再在解析层被吃掉。
+ *
+ * ⚠ 这同时修掉了本文件 {@link isZcodeUnusualActivityCode} 那个字符串分支的
+ *   **死代码**状态：它有分支、但领取侧的调用方永远拿不到字符串输入
+ *   （上游更早的 `num()` 已经把它变成了 `undefined`）。
+ * ⚠ 只认**纯数字**字符串（`/^-?\d+$/`），不认 `"3012 "` 以外的怪值更不认
+ *   `"abc"` —— 避免把任意文本静默变成业务码。
+ */
+export function parseZcodeBusinessCode(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return /^-?\d+$/.test(trimmed) ? Number(trimmed) : undefined
+}
+
+/**
+ * 正文里是否**表达了上游风控** —— 这是「仅凭正文」判定风控的**唯一**入口。
+ *
+ * ## ⚠⚠ 为什么不能只看裸数字（真实缺陷，2026-10-05 对抗性审计打出）
+ *
+ * 词边界正则解决了 `13012` / `plan-3012` 这类**紧邻**形态，但拦不住
+ * **自然语言里恰好出现的独立数字**。审计实测被误判的形态：
+ *
+ * | 正文（`code` 缺失） | 仅词边界 | 本函数 |
+ * |---|---|---|
+ * | `too many requests, retry after 3012 ms` | ❌ **误判成风控** | ✅ 不命中 |
+ * | `<h1>Error 3012</h1>upstream connect timeout` | ❌ **误判成风控** | ✅ 不命中 |
+ * | `request has been blocked due to unusual activity.` | ❌ **漏判** | ✅ 命中 |
+ *
+ * 前者后果**不是文案问题**：`too many requests` 是**限流、稍后重试即可**，
+ * 被改写成「风控、**别重试**」—— 两者用户动作**完全相反**；且领取路径据此
+ * **短路**，跳过本可领取的 plan（审计实测 3 个 plan 只发 1 发）。
+ *
+ * ## ⚠⚠ 为什么也**不能**用「独立词 3012」当门禁
+ *
+ * 上游 `3012` 的 `msg` **原文就是** `request has been blocked due to unusual
+ * activity.` —— **它不含任何数字**（数字在 `code` 字段里）。以上游真实文案
+ * 做样本时，「必须有独立词 3012」这条门禁会**反过来把它漏掉**：
+ * 写用例时实测到该断言为 `false`。
+ * ⇒ 判据以**语义短语**为主，数字只作兜底（配合 `block` 字样）。
+ *
+ * ⚠ `code` 已解析出来时**不走本函数**（它只用于「仅凭正文」的兜底，
+ *   见 {@link hasZcodeUnusualActivity}）—— 有权威业务码时不该猜文本。
+ */
+export function mentionsZcodeUnusualActivity(body: string): boolean {
+  /**
+   * ★ 主判据：上游风控的**实测原文**语义。
+   * 覆盖 `request has been blocked due to unusual activity.` 及其变体。
+   */
+  if (/unusual activity|blocked due to/i.test(body)) return true
+  /**
+   * 兜底：独立词 `3012` 与 `block` 字样**紧邻**（≤10 字符），
+   * 如 `3012 blocked by waf`。
+   *
+   * ## ⚠⚠ 为什么必须「紧邻」，而不是全文任意共现
+   *
+   * 第一版写成「独立词 `3012` **且** 全文含 `block`」，仍会误判**限流**
+   * 正文（真实缺陷，2026-10-05 审计 N2）：
+   *
+   * | 正文（无码） | 40 字符窗口 | **10 字符紧邻**（本实现） |
+   * |---|---|---|
+   * | `rate limited: request blocked, retry after 3012 ms` | ❌ 仍误判（距 14） | ✅ 不命中 |
+   * | `temporarily blocked; see error 3012` | ❌ 仍误判（距 12） | ✅ 不命中 |
+   * | `3012 blocked by waf` | ✅ | ✅（距 1） |
+   *
+   * ⚠ 窗口不是随便取的：写第一版修复时用 40，**实测发现两个反例仍命中**
+   *   （`blocked` 与 `3012` 之间只隔 `, retry after ` / `; see error `），
+   *   故收紧到 10 —— 它仍容纳 `3012 block…` 这类紧邻，而把两个反例排除。
+   * ⚠ 限流是「稍后重试即可」、风控是「**别重试**」，动作相反，不能混。
+   * ⚠ 单靠数字**永远**不算（见上方的毫秒数反例）。
+   */
+  return looksLikeZcodeUnusualActivity(body)
+    && /3012[^]{0,10}?block|block[^]{0,10}?3012/i.test(body)
+}
+
+/** 从响应正文里读出业务码（认 `number` 与纯数字字符串）。 */
+export function readZcodeBusinessCodeFromBody(body: string): number | undefined {
+  try {
+    const parsed = JSON.parse(body.trim()) as { code?: unknown } | null
+    if (parsed === null || typeof parsed !== 'object') return undefined
+    return parseZcodeBusinessCode(parsed.code)
+  } catch {
+    // 非 JSON（网关 HTML / 纯文本）⇒ 无码可读，由调用方决定是否看正文。
+    return undefined
+  }
+}
+
+/**
+ * 响应正文里是否表达了**上游风控**（`3012`）—— 给「只有一段正文」的调用方用
+ * （`zcode-adapter.ts` 的 `httpErrorCodeForZcode` 与 `describeUpstreamError`）。
+ *
+ * 判据**有优先级**：
+ * ① 正文能解析出业务码 ⇒ **只信码**（`3012` 即风控，`13012` 不是）；
+ * ② 无码可读 ⇒ 才看正文，且要求**风控语义共现**（见
+ *    {@link mentionsZcodeUnusualActivity}）。
+ *
+ * ⚠ 这个优先级是必须的：`{"code":3012}` 这种正文**不含语义词**，
+ *   若直接走 ② 会漏判 ⇒ `httpErrorCodeForZcode` 返回 `SERVER`，
+ *   而 `SERVER` 在 harness 的 `DEFAULT_RETRYABLE_CODES` 里 ⇒
+ *   有冷却惩罚的风控错误被**白重试 5 次**（`qoder` 那边记过同型缺陷）。
+ */
+export function hasZcodeUnusualActivity(body: string): boolean {
+  const code = readZcodeBusinessCodeFromBody(body)
+  if (code !== undefined) return isZcodeUnusualActivityCode(code)
+  return mentionsZcodeUnusualActivity(body)
+}
+
+/**
+ * 上游 `3012` 的**判据**之二：正文里以**独立词**出现 `3012`。
+ *
+ * ⚠⚠ **必须是词边界匹配，不能是 `body.includes('3012')`**（真实缺陷，
+ * 2026-10-05 自审发现）。裸 `includes` 会把**其它码里的数字片段**一并命中：
+ *
+ * | 正文 | `includes('3012')` | 本函数（词边界） |
+ * |---|---|---|
+ * | `{"code":3012}` | ✅ | ✅ |
+ * | `{"code":13012}` | ❌ **误命中** | ✅ 不命中 |
+ * | `plan-3012-trust` | ❌ **误命中** | ✅ 不命中 |
+ * | `quota 3012 remaining` | ✅（且**可能**是真风控文案） | ✅ |
+ *
+ * 误判的后果**不是「文案不好看」**：领取路径据此**短路**（`break`）⇒
+ * 把一个「plan 名里恰好含 3012」的普通失败当成风控，**跳过本可领取的 plan**，
+ * 并把真实业务码（如 `1005` 额度用尽）改写成 `3012` ——
+ * 而这两者的用户动作**完全相反**（等额度重置 vs 别重试）。
+ *
+ * ## ⚠ 边界字符是「数字、字母**以及 `-` / `_`**」
+ *
+ * 初版只写 `(?<!\d)3012(?!\d)`，于是 `plan-3012-trust` **仍然命中** ——
+ * `3012` 前后是连字符，不是数字（写单测时实测到）。第二版补了字母，
+ * `plan-3012-trust` **还是**命中（连字符与下划线都不属于 `[0-9A-Za-z]`）。
+ * ⇒ 标识符形态（`plan-3012`、`trust_3012`、`x3012y`、`13012`）必须**全部**
+ * 排除，故边界集取 `[0-9A-Za-z_-]`。
+ *
+ * ⚠ `.` / `,` / `}` / `:` / 空格 / 行首行尾都**不**被排除，
+ * 上游真实形态 `{"code":3012,"msg":"…"}` 与自然语言 `error: 3012 blocked`
+ * 因此照常命中。
+ */
+export function looksLikeZcodeUnusualActivity(body: string): boolean {
+  return /(?<![0-9A-Za-z_-])3012(?![0-9A-Za-z_-])/.test(body)
+}
+
+/**
+ * `3012` 的**共用文案** —— 推理路径与领取路径引用同一份（Gitee issue IKJOQB）。
+ *
+ * ## 为什么必须共用
+ *
+ * 这两条路径是**同一个错误的两个入口**，而用户该做的事完全不同：
+ * `3012` 不是「重试就能过」（那是 `3007`/`3009`），而是**有账号冷却惩罚**：
+ * 30 分钟起步，反复触发升级到 24 小时乃至停用。
+ * ⇒「请勿连续重试」是这段文案里**最重要的一句**，绝不能只在其中一条路径上有。
+ *
+ * ## 参数语义
+ *
+ * @param options.subject 定位信息（领取路径传 `planId`），**非空时**并入首句。
+ *   推理路径不传 ⇒ 首句与历史输出**逐字一致**（单测钉住了这一点）。
+ * @param options.diagnostic {@link formatZcodeDiagnostic} 的产物。**为空则整段省略**
+ *   —— 与 `describeUpstreamError` 的历史行为一致（不写空壳「本机诊断：」）。
+ * @param options.rawResponse 原始响应（上游 `msg` 或截断后的正文）。
+ */
+export function formatZcodeUnusualActivityMessage(options: {
+  subject?: string
+  diagnostic?: string
+  rawResponse?: string
+} = {}): string {
+  const subject = typeof options.subject === 'string' && options.subject.length > 0
+    ? ` · ${options.subject}`
+    : ''
+  const diag = typeof options.diagnostic === 'string' && options.diagnostic.length > 0
+    ? `本机诊断：${options.diagnostic}\n`
+    : ''
+  const raw = typeof options.rawResponse === 'string' && options.rawResponse.length > 0
+    ? `原始响应：${options.rawResponse}`
+    : ''
+  return (
+    `上游风控拦截（3012 unusual activity）${subject}。` +
+    `⚠ 该错误有账号冷却惩罚（30 分钟，反复触发会升级到 24 小时乃至停用），` +
+    `请勿连续重试。\n${diag}${raw}`
+  )
+}
 
 /** 账号的进程级画像。key 与 {@link accountOrdinal} 用的是同一个。 */
 interface AccountProfile {
@@ -212,8 +436,20 @@ export interface ZcodeDiagnosticInput {
   sentAt: number
   /** 上游 HTTP 状态码。 */
   status: number
-  /** 实际发出的请求体形态。 */
-  shape: ZcodeRequestShape
+  /**
+   * 实际发出的请求体形态。
+   *
+   * ★ **可选**（Gitee issue IKJOQB）。推理请求体有 `system` / `messages`，
+   * 而**领取请求体只有 `{ plan_id }`** —— 两者结构完全不同，
+   * 不能照搬 `describeZcodeRequestShape(system, messages)`。
+   *
+   * ⚠ 缺省时**只省略**依赖它的两项（`身份块` / `日期块`），
+   * **其余五项照常输出** —— 账号序号、成功/失败计数、最近成功、距上条、HTTP
+   * 这五项与请求形态**无关**，恰恰是 `3012` 排查里最有价值的部分
+   * （「一直如此还是突然开始」「是否频率风控」全靠它们回答）。
+   * 为了缺一个 shape 就把整行丢掉是错的取舍。
+   */
+  shape?: ZcodeRequestShape
   /** 取当前时刻（可注入，便于单测）。 */
   now: number
 }
@@ -223,6 +459,10 @@ export interface ZcodeDiagnosticInput {
  *
  * ⚠ 字段顺序按 issue 的建议排：账号序号 → 计数 → 字符数 → 间隔 ——
  * 「最常被怀疑的」在前，「最容易被忽略的」在后。
+ *
+ * ⚠ `shape` 缺省时（领取路径，见 {@link ZcodeDiagnosticInput.shape}）
+ * **只**少掉 `身份块` / `日期块` 两项，其余照常 —— 不要因为缺 shape
+ * 就整行返回空串。
  */
 export function formatZcodeDiagnostic(input: ZcodeDiagnosticInput): string {
   const key = normalizeKey(input.accountId)
@@ -231,16 +471,27 @@ export function formatZcodeDiagnostic(input: ZcodeDiagnosticInput): string {
   const gap = profile?.previousSentAt === undefined
     ? '—'
     : formatGap(input.sentAt - profile.previousSentAt)
-  const blocks = input.shape.identityBlockChars.length > 0
-    ? input.shape.identityBlockChars.join('+')
-    : '无'
+  /**
+   * ★ 形态相关的两项单独成组，**缺 shape 时整组消失**。
+   * ⚠ 判定用 `!== undefined` 而不是真值判断：`shape` 是对象，恒为真；
+   *   真正的分支是「传了 / 没传」。
+   */
+  const shapeParts = input.shape === undefined
+    ? []
+    : [
+      `身份块 ${input.shape.identityChars} 字符(${
+        input.shape.identityBlockChars.length > 0
+          ? input.shape.identityBlockChars.join('+')
+          : '无'
+      })`,
+      `日期块 ${input.shape.hasDateBlock ? '有' : '无'}`,
+    ]
   return [
     `账号#${ordinal}`,
     `本进程 成功 ${profile?.ok ?? 0}/失败 ${profile?.failed ?? 0}`,
     `最近成功 ${formatSinceLastOk(profile?.lastOkAt, input.now)}`,
     `距上条 ${gap}`,
-    `身份块 ${input.shape.identityChars} 字符(${blocks})`,
-    `日期块 ${input.shape.hasDateBlock ? '有' : '无'}`,
+    ...shapeParts,
     `HTTP ${input.status}`,
   ].join(' · ')
 }
