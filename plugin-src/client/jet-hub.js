@@ -69,12 +69,15 @@ import {
 import { formatRowTokensPerSecond } from './tokens-per-second.js';
 import {
   accountLabel,
+  avgPerfText,
   channelCardTitle,
   channelLabel,
   channelOrder,
   entryTokenText,
   formatDuration,
   formatEntryTime,
+  formatTps,
+  formatTtft,
   hasAnyData,
   ledgerSubtitle,
   tokenSummaryText,
@@ -1927,6 +1930,8 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       React.createElement('span', { className: 'dim-jh-ledgerModelName', title: modelRow.model }, modelRow.model),
       React.createElement('span', { className: 'dim-jh-ledgerModelReq', title: '请求数（含失败）' },
         modelRow.requests + ' 次'),
+      React.createElement('span', { className: 'dim-jh-ledgerPerf', title: '均值：只对有实测值的请求平均' },
+        avgPerfText(modelRow)),
       React.createElement('span', { className: 'dim-jh-ledgerModelTokens' },
         tokenSummaryText(modelRow)));
 
@@ -1940,6 +1945,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
           React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
             React.createElement('span', { className: 'dim-jh-ledgerAccountName', title: accountRow.accountId },
               accountLabel(accountRow.accountId)),
+            React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(accountRow.totals)),
             React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
               tokenSummaryText(accountRow.totals))),
           accountRow.models.map((modelRow) =>
@@ -1958,6 +1964,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       },
         React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
           React.createElement('strong', null, channelCardTitle(channelRow)),
+          React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(channelRow.totals)),
           React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
             tokenSummaryText(channelRow.totals))),
         channelRow.providers.map((providerRow) => React.createElement('div', {
@@ -1965,6 +1972,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         },
           React.createElement('div', { className: 'dim-jh-ledgerProviderHead' },
             React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, providerRow.provider),
+            React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(providerRow.totals)),
             React.createElement('span', { className: 'dim-jh-ledgerProviderSum' },
               tokenSummaryText(providerRow.totals))),
           renderProviderBody(providerRow))))));
@@ -1976,7 +1984,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
     return React.createElement('table', { className: 'dim-jh-ledgerTable', key: 'entries' },
       React.createElement('thead', null,
         React.createElement('tr', null,
-          ['时间', '渠道', '模型', 'TOKEN', '耗时'].map((h) =>
+          ['时间', '渠道', '模型', 'TOKEN', '首字', '速率', '耗时'].map((h) =>
             React.createElement('th', { key: h }, h)))),
       React.createElement('tbody', null, entries.map((entry, index) => React.createElement('tr', {
         key: entry.ts + '-' + index,
@@ -1986,6 +1994,8 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         React.createElement('td', null, channelLabel(entry.channel)),
         React.createElement('td', { className: 'dim-jh-ledgerEntryModel' }, entry.model),
         React.createElement('td', null, entryTokenText(entry)),
+        React.createElement('td', null, formatTtft(entry)),
+        React.createElement('td', null, formatTps(entry)),
         React.createElement('td', null, formatDuration(entry.durationMs))))));
   };
 
@@ -2018,6 +2028,8 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       React.createElement('p', { className: 'dim-jh-modalHint' },
         '按渠道（直连 / 网关）、供应商、账号与模型统计本机发出的每笔模型请求。'
         + '↓输入 ↑输出 ⚡缓存 ✎缓存写入 🧠推理；— 表示该笔未收到用量（失败或中断）。'
+        + '明细含「首字用时」与「输出速率」（首块之后 → 结束，官方口径）；'
+        + '汇总行的「均值」只对有实测值的请求平均。'
         + '明细保留最近 500 笔（重启清空）；按日累计已存盘（token-ledger.json）。'),
       React.createElement('div', { className: 'dim-jh-modalBody' },
         renderSummary(),

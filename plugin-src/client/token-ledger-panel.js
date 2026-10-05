@@ -72,6 +72,38 @@ export function formatDuration(ms) {
   return trimZeros(n / 1000) + 's';
 }
 
+/**
+ * 首字用时（明细行）：`0.9s` / `850ms`；**缺失（字段省略）= 不可测** → `—`。
+ *
+ * ⚠️ 0 与「没测到」必须区分：失败/秒回空的请求 ttft 字段**省略**，
+ * 显示 `—`（0ms 会被读成「模型秒回」，是误导）。
+ */
+export function formatTtft(entry) {
+  const n = typeof entry?.ttftMs === 'number' && Number.isFinite(entry.ttftMs) && entry.ttftMs > 0
+    ? Math.round(entry.ttftMs)
+    : 0;
+  if (n === 0) return '—';
+  return formatDuration(n);
+}
+
+/**
+ * 输出速率（明细行）：`52.3 tok/s`；字段省略（不可测）→ `—`。
+ * 精度由记账层定（1 位小数），这里只做单位拼接。
+ */
+export function formatTps(entry) {
+  const v = entry?.tps;
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return '—';
+  return v + ' tok/s';
+}
+
+/** 均值格（汇总行）：`avg 0.9s · 48 tok/s`；两边都不可测 → `—`。 */
+export function avgPerfText(row) {
+  const ttft = typeof row?.avgTtftMs === 'number' && row.avgTtftMs > 0 ? formatDuration(row.avgTtftMs) : null;
+  const tps = typeof row?.avgTps === 'number' && row.avgTps > 0 ? row.avgTps + ' tok/s' : null;
+  if (ttft === null && tps === null) return '—';
+  return '首字 ' + (ttft ?? '—') + ' · ' + (tps ?? '—');
+}
+
 /** 时间格式化（HH:MM:SS）：明细表不需要日期（流水只覆盖最近 500 笔）。 */
 export function formatEntryTime(ts) {
   const d = typeof ts === 'number' && Number.isFinite(ts) ? new Date(ts) : null;

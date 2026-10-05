@@ -199,6 +199,13 @@ export async function* recordThroughStream(
   let cacheWriteTokens: number | undefined
   let reasoningTokens: number | undefined
   /**
+   * **首个内容块耗时**（第 3 期）：收到任何一块（含思考增量）的时刻 − 发起。
+   * 0 = 还没有任何块。口径与 `cline-request-log.ttftMs` 一致 —— 用户口中的
+   * 「首字用时」。**必须在收块时测量**：包装层是唯一同时知道「发起时刻」与
+   * 「每块到达时刻」的位置（各适配器内部没有统一的测量点）。
+   */
+  let ttftMs = 0
+  /**
    * 账号归属（第 2 期）：**usage 帧到达时**从回报表读取（彼时凭据必然已
    * 解析 —— `resolveCredential` / 池查询先于任何 SSE 帧）。流开始前读取
    * 会拿到「上一笔请求的账号」（生成器懒执行的时序陷阱），在 usage 帧
@@ -209,6 +216,9 @@ export async function* recordThroughStream(
   let failure: string | undefined
   try {
     for await (const chunk of openStream()) {
+      // 首块计时：任何 chunk（思考/正文/工具调用都算「模型开始说话」）。
+      // ⚠️ 必须在具体类型判断**之前**：漏块会让「只有思考增量的慢启动」被记成 0。
+      if (ttftMs === 0) ttftMs = Date.now() - meta.startedAt
       if (
         typeof chunk === 'object' && chunk !== null
         && (chunk as { type?: unknown }).type === 'usage'
@@ -247,6 +257,8 @@ export async function* recordThroughStream(
       ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
       ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
       ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+      // 首字用时（0 = 无任何块 → recordTokenUsage 内省略该字段）
+      ...(ttftMs > 0 ? { ttftMs } : {}),
       durationMs: Date.now() - meta.startedAt,
       ...(failure !== undefined ? { error: failure } : {}),
     })

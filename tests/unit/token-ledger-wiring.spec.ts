@@ -82,6 +82,31 @@ describe('recordThroughStream：记账骨架', () => {
     expect(row.durationMs).toBeGreaterThanOrEqual(500)
   })
 
+  /**
+   * 第 3 期：首字用时在包装层实测（收第一块时打点），TPS 由记账层按官方口径
+   * 算（输出 ÷ (全程 − 首块)）。注意生成器**懒执行**：首块的打点时刻是
+   * 「消费方真正开始拉流」之后，与发起时刻的差就是真实的首字延迟。
+   */
+  it('ttft/tps：包装层实测首块时刻，记账层算出速率', async () => {
+    resetTokenLedgerForTests()
+    // ⚠️ 生成器**内**跨 tick：首块之后 sleep 一小段再收 usage，让
+    // durationMs − ttftMs > 0（tps 的分母）。无间隔时 tps 不可测（省略），
+    // ttft 仍然 > 0 —— 那是正确行为，不是缺陷。
+    const startedAt = Date.now() - 50
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+    await collect(recordThroughStream(
+      async function* () {
+        yield { type: 'reasoning-delta', text: 'thinking...' }
+        await sleep(30)
+        yield usageChunk(10, 100)
+      },
+      { channel: 'direct', provider: 'p', model: 'm', startedAt },
+    ))
+    const row = readTokenLedger().entries[0]!
+    expect(row.ttftMs).toBeGreaterThan(0)
+    expect(row.tps).toBeGreaterThan(0)
+  })
+
   it('流结束但没等到 usage：usageReported=false（显示 — 而不是 0）', async () => {
     resetTokenLedgerForTests()
     await collect(recordThroughStream(

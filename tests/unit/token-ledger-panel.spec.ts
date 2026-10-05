@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import {
   accountLabel,
+  avgPerfText,
   channelCardTitle,
   channelLabel,
   channelOrder,
   entryTokenText,
   formatDuration,
   formatEntryTime,
+  formatTps,
+  formatTtft,
   formatTokenCount,
   filterChannelsBySelection,
   hasAnyData,
@@ -114,5 +117,30 @@ describe('账号维度（第 2 期）', () => {
     expect(accountLabel('')).toBe('未归属')
     expect(accountLabel(undefined)).toBe('未归属')
     expect(accountLabel('qoder-bb211a53')).toBe('qoder-bb211a53')
+  })
+})
+
+describe('首字用时与速率（第 3 期）', () => {
+  it('formatTtft：缺失/0 → —；有值按耗时格式化', () => {
+    expect(formatTtft(undefined)).toBe('—')
+    expect(formatTtft({})).toBe('—')
+    expect(formatTtft({ ttftMs: 0 })).toBe('—')
+    expect(formatTtft({ ttftMs: 850 })).toBe('850ms')
+    expect(formatTtft({ ttftMs: 2900 })).toBe('2.9s')
+  })
+
+  it('formatTps：缺失/非正 → —；有值带单位', () => {
+    expect(formatTps(undefined)).toBe('—')
+    expect(formatTps({ tps: 0 })).toBe('—')
+    expect(formatTps({ tps: 52.3 })).toBe('52.3 tok/s')
+    expect(formatTps({ tps: 100 })).toBe('100 tok/s')
+  })
+
+  it('avgPerfText：两边都无 → —；单边有值时另一边占位', () => {
+    expect(avgPerfText(undefined)).toBe('—')
+    expect(avgPerfText({})).toBe('—')
+    expect(avgPerfText({ avgTtftMs: 850 })).toBe('首字 850ms · —')
+    expect(avgPerfText({ avgTps: 48.2 })).toBe('首字 — · 48.2 tok/s')
+    expect(avgPerfText({ avgTtftMs: 1200, avgTps: 51.5 })).toBe('首字 1.2s · 51.5 tok/s')
   })
 })
