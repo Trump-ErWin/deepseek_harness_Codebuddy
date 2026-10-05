@@ -71,6 +71,38 @@ const CRED = {
   device_mid: '11111111-1111-1111-1111-111111111111',
 } as never
 
+/**
+ * 内存凭据存储。
+ *
+ * ⚠ 凭据**只有插件自存这一条来源**（`ctx.credentials`）：2026-10-05 起不再读本机
+ * 官方客户端文件，也**不再有** `ZcodeAuthOptions.readCredential` 测试注入点 ⇒
+ * 想给某个用例一份凭据，只能把它写进这个存储。
+ * 样板见 `tests/unit/zcode-credential-resolution.spec.ts`。
+ */
+class FakeCredentials {
+  readonly store = new Map<string, string>()
+  async resolve(ref: string) {
+    const value = this.store.get(ref)
+    return value === undefined ? undefined : { value, source: 'fake' }
+  }
+  async describe(ref: string) { return { configured: this.store.has(ref), writable: true } }
+  async set(ref: string, value: string) { this.store.set(ref, value) }
+  async unset(ref: string) { this.store.delete(ref) }
+}
+
+/**
+ * 造一个 ctx。
+ *
+ * ⚠ 返回的存储**初始为空** —— 「有凭据」与「无凭据」两条用例的差别就体现在
+ * 调用方有没有 `set` 那一步上（无凭据场景真的什么都不写）。
+ */
+function makeCtx(): { ctx: Context; credentials: FakeCredentials } {
+  const ctx = new Context()
+  const credentials = new FakeCredentials()
+  ctx.provide('credentials', credentials as never)
+  return { ctx, credentials }
+}
+
 describe('远端模型目录：必须真拉上游（不是照抄本地表）', () => {
   it('★ 从 builtinModels 解析出模型（且是对象形态）', async () => {
     const fetcher = vi.fn(async () => new Response(JSON.stringify(REAL_CONFIGS), { status: 200 }))
@@ -134,28 +166,26 @@ describe('远端模型目录：必须真拉上游（不是照抄本地表）', (
 
 describe('ZcodeAuth.fetchModels() 走远端', () => {
   it('★ 有凭据时向上游拉，而不是照抄本地表', async () => {
-    const ctx = new Context()
-    ctx.provide('credentials', { resolve: async () => undefined, describe: async () => ({ configured: false, writable: true }) } as never)
-    ctx.provide('settings', { register() { return { get: () => undefined, replace() {} } }, describe() { return [] } } as never)
+    const { ctx, credentials } = makeCtx()
+    // ⚠ 凭据只有插件自存一条来源 ⇒ 「有凭据」就是把值写进 `ctx.credentials`。
+    await credentials.set(ZCODE.defaultCredentialRef, JSON.stringify(CRED))
     const fetcher = vi.fn(async (url: string | URL | Request) => {
       // 只该请求 client/configs。
       expect(String(url)).toContain('/client/configs')
       return new Response(JSON.stringify(REAL_CONFIGS), { status: 200 })
     })
-    const auth = new ZcodeAuth(ctx, { fetchImpl: fetcher as never, readCredential: () => CRED as never })
+    const auth = new ZcodeAuth(ctx, { fetchImpl: fetcher as never })
     const models = await auth.fetchModels()
     expect(fetcher).toHaveBeenCalled()
     expect(models.find((m) => m.id === 'GLM-5.3-Flash')?.contextWindow).toBe(1_000_000)
   })
 
   it('无凭据时回退兜底表（不发网络请求，不抛错）', async () => {
-    const ctx = new Context()
-    ctx.provide('credentials', { resolve: async () => undefined, describe: async () => ({ configured: false, writable: true }) } as never)
-    ctx.provide('settings', { register() { return { get: () => undefined, replace() {} } }, describe() { return [] } } as never)
+    // ⚠ 这里**刻意一个字都不写**进存储：`current()` 读不到 ⇒ 才能走到兜底表那条路。
+    const { ctx } = makeCtx()
     const fetcher = vi.fn(async () => new Response('', { status: 500 }))
     const auth = new ZcodeAuth(ctx, {
       fetchImpl: fetcher as never,
-      readCredential: () => undefined,
     })
     const models = await auth.fetchModels()
     expect(models.length).toBeGreaterThan(0)

@@ -4,13 +4,13 @@
  * ## 与其它 provider 的共同点
  *
  * 「读凭据 → 直发远端」—— 这一点与 CodeArts / Buddy / Qoder 等**相同**。
- * 用户装好官方 ZCode 客户端并登录一次即可，不需要任何实例常驻。
+ * 用户在 Jet Hub 面板点「添加账号」走插件自己的授权流即可，**不需要安装任何客户端**。
  *
  * ## 与其它 provider 的差异（全部实测）
  *
  * | 维度 | ZCode | 对照 |
  * |---|---|---|
- * | 凭据来源 | 解密磁盘 `~/.zcode/v2/credentials.json`（AES-256-GCM） | 浏览器登录拿 token |
+ * | 凭据来源 | **只有插件自己的 OAuth 流程**（⚠ 2026-10-05 起**不再**读取本机 ZCode 客户端数据，见 `zcode.ts` 文件头） | 浏览器登录拿 token |
  * | 协议 | **Anthropic Messages**（非 OpenAI） | 其余多为 OpenAI 兼容 |
  * | 验证前置 | **按需**产出阿里云 captcha（索要时才产，稳态一次约 0.4–0.5 秒） | 无 |
  * | 请求体准入 | **必须带官方身份块**（否则 405 + `3012`） | 无 |
@@ -1285,8 +1285,8 @@ export class ZcodeAdapter extends LlmAdapter {
     }
     if (credential === undefined) {
       throw new LlmError(
-        'zcode: 没有可用的凭据 —— 请在 Jet Hub 的 ZCode 面板点「添加账号」完成登录' +
-        '（若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的凭据）',
+        'zcode: 没有可用的凭据 —— 请在 Jet Hub 的 ZCode 面板点「添加账号」完成登录'
+        + '（本插件只用它自己的授权流程，不会读取本机 ZCode 客户端的登录态）',
         'MISSING_CREDENTIAL',
       )
     }
@@ -1743,7 +1743,10 @@ export function describeUpstreamError(
     )
   }
   if (code === 1002 || status === 401) {
-    return `凭据失效（${status}）。请重新在官方 ZCode 客户端登录。${suffix}`
+    // ⚠ 必须指向 Jet Hub 而不是官方客户端：凭据只有插件自己会写
+    //   （`~/.zcode/v2/credentials.json` 那条回退路已于 2026-10-05 删除），
+    //   让用户「去官方客户端重新登录」会把他引到一个**完全无效**的操作上。
+    return `凭据失效（${status}）。请在 Jet Hub 的 ZCode 面板删除该账号后重新添加登录。${suffix}`
   }
   return `HTTP ${status}：${suffix}`
 }

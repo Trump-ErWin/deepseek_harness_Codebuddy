@@ -65,11 +65,12 @@ export interface ZcodeProduct {
   /** 远端模型列表不可用时的兜底目录。 */
   fallbackModels: readonly ZcodeFallbackModel[]
   /**
-   * 客户端版本的兜底值（用于 `X-ZCode-App-Version` 等头）。
+   * 客户端版本（用于 `X-ZCode-App-Version` 等头）。
    *
-   * 实际值优先由 `detectZcodeAppVersion()` 从已安装的官方客户端探测；
-   * 探测不到时用这个 —— **不让版本探测失败连带让 provider 不可用**
-   * （版本只是一个头）。
+   * ⚠ 它是**常量**，不再从已安装的官方客户端探测 ——
+   * 那是「读本机 ZCode 数据」的一部分，已于 2026-10-05 整体删除
+   * （见 `zcode.ts` 文件头）。版本只是一个头，不该成为硬依赖，
+   * 故探测的移除不会让 provider 不可用。
    */
   appVersionFallback: string
   /**
