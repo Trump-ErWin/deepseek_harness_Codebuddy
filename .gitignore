@@ -103,3 +103,6 @@ tests/fixtures/test.png
 # ����������npm/pnpm pack ���ɵ� tarball ����⣨2026-10-01��
 *.tgz
 
+
+# 账号池备份（dsh-codearts-auth 导出的加密备份件）：凭据备份一律不入库（含加密码，2026-10-05 核查实锤 51 账号 blob）
+_过程归档/
