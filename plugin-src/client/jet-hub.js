@@ -60,6 +60,7 @@ import {
   nextProviderOrderAfterDrop,
   providerSwitchRows,
   providerToggleSummary,
+  sortOpenProvidersByOrder,
   summarizeProviderToggle,
 } from './provider-toggle.js';
 import {
@@ -4664,6 +4665,35 @@ export function JetHubPage({ close, rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
   const [version, setVersion] = React.useState(0);
+  /**
+   * 打开 Jet Hub 时的默认选中卡片 = 自定义序第一位的供应商。
+   *
+   * 初值 `PROVIDERS[0].id` 是**声明序第一位**——providerOrder 是异步读的，
+   * useState 时刻它还是 null，没法一步到位。这里用「一次性纠偏」：
+   * providerOrder 首次到达后，若用户**尚未**手动点过任何卡片（touchedRef），
+   * 把 selected 切到自定义序的第一个**已打开**供应商；一旦用户点过，不再
+   * 接管（避免覆盖用户的选择）。
+   *
+   * 「已打开」过滤的原因：自定义序首位若已被关闭，把它选进来会渲染一个
+   * 无账号可管理的空面板——此刻跳到下一个 open 的才是用户想要的。
+   * providerStatuses 未读时保守回退 providerOrder[0]（宁多勿少，与分组
+   * 判据同取向）。
+   */
+  const providerTouchedRef = React.useRef(false);
+  React.useEffect(() => {
+    if (providerTouchedRef.current) return;
+    if (!Array.isArray(providerOrder) || providerOrder.length === 0) return;
+    const firstUsable =
+      providerOrder.find(id => providerStatuses === null || providerStatuses?.[id]?.closed !== true)
+      ?? providerOrder[0];
+    if (typeof firstUsable === 'string' && firstUsable !== selected
+      && PROVIDERS.some(p => p.id === firstUsable)) {
+      setSelected(firstUsable);
+      setVersion(v => v + 1);
+    }
+    // providerStatuses 一并依赖：它到达后「首位已关闭 → 跳下一个 open」的纠偏
+    // 才能算准。touchedRef 不进依赖（ref 读取无时序问题）。
+  }, [providerOrder, providerStatuses, selected]);
   // 一键签到：busy 防重复点击，notice 显示上一次结果摘要。
   const [checkinBusy, setCheckinBusy] = React.useState(false);
   const [checkinNotice, setCheckinNotice] = React.useState(null);
@@ -4886,6 +4916,8 @@ export function JetHubPage({ close, rpcCall }) {
   }, [rpcCall, loadProviderOrder]);
 
   const selectProvider = (id) => {
+    // 用户手动点过卡片 → 「打开 Jet Hub 默认选中自定义序首位」的纠偏不再生效。
+    providerTouchedRef.current = true;
     setSelected(id);
     setVersion(v => v + 1);
   };
@@ -5128,6 +5160,11 @@ export function JetHubPage({ close, rpcCall }) {
    *
    * 行上**没有开关**（已搬到页头的 `ProviderSwitchPanel`），故这里不再关心
    * 禁用态：那套判据（`models.total === 0` ⇒ 禁用并给出原因）现在只在弹窗里用。
+   *
+   * 「已打开」组按 `providerOrder`（弹窗拖拽保存的自定义顺序）排序——与弹窗
+   * 共用同一份顺序（宿主端持久化在 state.json 的 providerOrder 字段）；
+   * `providerOrder === null`（未自定义/读取失败）时 `sortOpenProvidersByOrder`
+   * 返回原数组 = 声明序兜底。「已关闭」组恒按声明顺序沉底（与弹窗同口径）。
    */
   const renderRail = () => {
     if (providerStatuses === null) {
@@ -5138,7 +5175,7 @@ export function JetHubPage({ close, rpcCall }) {
       React.createElement('div', { className: 'dim-jh-railGroupTitle' }, title),
       list.map(p => renderProviderRow(p)));
     return [
-      group(`已打开 (${open.length})`, open, 'open'),
+      group(`已打开 (${open.length})`, sortOpenProvidersByOrder(open, providerOrder), 'open'),
       group(`已关闭 (${closed.length})`, closed, 'closed'),
     ];
   };

@@ -679,4 +679,28 @@ describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () =>
       expect(codeOnly).toMatch(/保存排序失败[\s\S]{0,240}inModal:\s*true/)
     })
   })
+
+  // ⚠️ 2026-10-06 续作：主页 rail 跟随自定义排序 + 打开 Jet Hub 默认选中
+  // 自定义序第一位的供应商（用户需求，本机已验收）。
+  describe('自定义顺序的贯穿展示（主页 rail + 默认选中）', () => {
+    it('主页 rail 的已打开组按 providerOrder 排序（closed 组恒声明序沉底）', () => {
+      // ⚠️ renderRail 在 JetHubPage 里（ProviderSwitchPanel 之后），panelBody()
+      // 的结束锚切不到它 —— 用整份 source 断言。
+      expect(source).toContain('sortOpenProvidersByOrder(open, providerOrder)')
+      // 关闭组不参与自定义排序（用户口径：「这个逻辑不变」）。
+      expect(source).toContain("group(`已关闭 (${closed.length})`, closed, 'closed')")
+    })
+
+    it('默认选中卡片 = 自定义序第一位（providerTouchedRef 一次性纠偏）', () => {
+      // 三处关键代码齐全：ref 声明 + 纠偏 effect + selectProvider 置 touched。
+      expect(source).toContain('const providerTouchedRef = React.useRef(false);')
+      expect(source).toContain('providerTouchedRef.current = true;')
+      // 纠偏 effect 必须先查 touched，用户点过就不再接管。
+      expect(source).toMatch(/if \(providerTouchedRef\.current\) return;/)
+      // 「已打开」过滤：首位已关闭时跳到下一个 open（否则渲染出空面板）。
+      expect(source).toMatch(
+        /providerOrder\.find\(id => providerStatuses === null \|\| providerStatuses\?\.\[id\]\?\.closed !== true\)/,
+      )
+    })
+  })
 })
