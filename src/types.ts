@@ -1,5 +1,6 @@
 import type { DpopPrivateJwk } from './oauth.js'
 import type { BadgePreference } from './badge-preferences.js'
+import type { TokenLedgerSnapshot, TokenLedgerHistoryDay, TokenLedgerModelRow } from './token-ledger.js'
 
 /** snap-manager ticket 端点响应的传输格式。 */
 export interface CodeArtsCredentialResponse {
@@ -172,22 +173,6 @@ export interface RpcCreateAccountRequest {
    * 行为必须逐字节不变。
    */
   zcodeProvider?: 'bigmodel' | 'zai'
-  /**
-   * 强制新建账号（**仅 ZCode 需要**）。
-   *
-   * 后端默认会做两道复用检查（收编孤儿条目 / 本机凭据已在池里就复用），
-   * 目的是修「点一次添加就多一条」。但那两道检查**在渠道判断之前**，
-   * 于是也挡住了「同一个人想加第二个账号」—— 本机官方客户端登的账号
-   * 已在池里时，点「新建账号」直接返回 `reused`，浏览器都不开。
-   *
-   * `true` ⇒ 跳过这两道，直接走 OAuth。
-   *
-   * ⚠️ 跳过复用不等于能拿到第二个账号：授权页仍复用浏览器登录态，
-   * 用户需先在浏览器登出或用无痕窗口（实测 `bigmodel.cn` / `chat.z.ai`
-   * 都不认 `prompt=login` 之类参数）。
-   *
-   * ⚠️ 缺省 `false`，既有调用方行为逐字节不变。
-   */
 }
 export interface RpcCreateAccountResponse {
   accountId: string
@@ -211,14 +196,15 @@ export interface RpcCreateAccountResponse {
   /**
    * 本次「添加账号」**没有新建条目**，而是复用了池里已有的账号。
    *
-   * ## 为什么需要这个字段（用户报障 ⑯）
+   * ## 现状（2026-10-05 起 zcode 不再产生它）
    *
-   * 「账号应该读取有效的本地账号凭证，而不是点了添加就多一个」——
-   * 当本机已有可用凭据（官方客户端写的）时，`account.create` 不再新起 OAuth，
-   * 而是复用/修复已有条目。此时 `loginUrl` 为**空串**（没有可打开的页面）。
+   * 曾经 ZCode 会「复用本机官方客户端写的凭据」而返回该值；那条能力已随
+   * 「不读本机 IDE 数据」的决策整体删除 ⇒ **当前没有任何 provider 会返回
+   * `true`**。
    *
-   * ⚠ 前端**必须**先看这个字段再判空：只看 `loginUrl` 为空会把它当成
-   * 「后端没返回登录地址」而报错，把一次成功操作显示成失败。
+   * ⚠️ 字段与前端的 `res.reused` 分支**仍然保留**：那是**契约防御** ——
+   * 判据写成「后端若声明复用，则 `loginUrl` 为空串是正常的」，
+   * 比反过来假设「空串必是错误」更稳，且不必为一次能力下线去改前端渲染分支。
    */
   reused?: boolean
 }
@@ -425,6 +411,29 @@ export interface RpcCreditsClaimSummary {
    * 判据见 `src/credits.ts` 的 `ClaimOutcomeCommon.coversToday`。
    */
   coversToday: number
+  /**
+   * ★ **按单位分组**的领取合计（2026-10-04）。
+   *
+   * ## 为什么必须有它（真实缺陷，用户报障）
+   *
+   * 用户报障原文：
+   * > 插件的这个一键签到，Zcode 获得的是 token 数量，但是这里显示成获得积分。
+   * > 正文「…ZCode（智谱）+100000000（共 +100000100）」
+   * > 应当显示为「…ZCode（智谱）+100Mtoken（共 +100Mtoken, +100积分）」
+   *
+   * 根因是 {@link totalCredit} 这个标量**把不同量纲加在了一起**：ZCode 的额度
+   * 单位是 token、其余渠道是积分，1 亿 token + 100 积分 = `100000100`，
+   * 而下游拿到的只有一个数、只能标成「积分」。故单位必须在**汇总这一层**
+   * 就分开保留。
+   *
+   * ⚠️ 两个键**恒存在**（没有该单位的领取时为 `0`），不要写成可选 ——
+   * 消费方（`auto-checkin.ts` / 两个客户端面板）都要读它，可选字段会让
+   * 「宿主旧版本没这个字段」与「本次真的没有 token」混为一谈。
+   *
+   * ⚠️ {@link totalCredit} **保留**：它是既有字段，且对**单一单位**的渠道
+   * （其余 11 个）语义完全正确。消费方若只需一个数，应先确认本次只有一个单位。
+   */
+  totalByUnit: import('./credits.js').ClaimTotalsByUnit
 }
 /** RPC: 一键领取积分响应 */
 export interface RpcCreditsClaimAllResponse {
@@ -800,6 +809,18 @@ export interface RpcModelListEntry {
    * 「未知」语义 —— 不编造 `false`（与全仓「未知不编造」的约定一致）。
    */
   isFree?: boolean
+  /**
+   * 该模型是否已被判定为**上游下架**（`dead-models.json` 命中）。
+   *
+   * ⚠️ 恒为布尔值、**不省略**：缺失即 false。客户端据此灰显并给出「重新显示」
+   * 入口（`model.clearDead`）。
+   *
+   * ⚠️ **必须显式列出失效模型而不能静默剔除**（2026-10-06 复审 !66 实测）：
+   * 适配器侧会把它们从目录里过滤掉，若这里不补回，用户在设置页**连开关都摸不着**
+   * —— 而失效模型用户**选不到 ⇒ 不可能再成功 ⇒ 记录永不自动清除**，等于永久失去
+   * 恢复路径。这是「误判代价不对称」的必然要求：能藏，但必须能找回。
+   */
+  dead: boolean
 }
 
 /** RPC: 列出某 provider 的模型响应 */
@@ -818,6 +839,33 @@ export interface RpcModelSetDisabledRequest {
 export interface RpcModelSetDisabledResponse {
   provider: string
   disabledModels: Record<string, boolean>
+}
+
+/**
+ * RPC: 把某个模型从「已失效」表里移除（让它重新出现在目录中）。
+ *
+ * ## 为什么必须有这个端点（2026-10-06 复审 !66 确认）
+ *
+ * 失效记录的**唯一**自愈路径是 TTL 过期（默认 30 天）—— 因为模型被剔除后
+ * 用户**选不到**，不可能靠「再成功一次」触发重记清除。于是**误判即永久损伤**
+ * （用户连手工编辑 `dead-models.json` 都不会）。
+ *
+ * ⚠️ 这与 Jet Hub 已有的模型开关**不对等**：用户能一键关模型，却不能一键
+ * 「复活」一个被误记的模型。故必须有显式恢复入口。
+ *
+ * ⚠️ `modelId` **可选**：省略则清空该 provider 的全部失效记录（「全部重新显示」）。
+ * 与 `disabled` 一样**没有默认值** —— 传 `""` 视为非法，避免「字段名写错 ⇒
+ * 静默清空全表」。
+ */
+export interface RpcModelClearDeadRequest {
+  provider: string
+  modelId?: string
+}
+
+/** RPC: 恢复失效模型的响应（回传该 provider 剩余的失效 id，便于前端刷新） */
+export interface RpcModelClearDeadResponse {
+  provider: string
+  deadModels: string[]
 }
 
 /**
@@ -927,6 +975,28 @@ export interface RpcProviderSetEnabledResponse {
   models: number
   /** 实际被改变的账号数（已是目标状态的账号不计入）。 */
   accounts: number
+}
+
+/**
+ * RPC: 读取供应商自定义显示顺序（Jet Hub「供应商开关」弹窗的拖拽排序）。
+ *
+ * `order` 为空数组表示用户尚未自定义（或文档缺失该键），展示侧按 `PROVIDERS`
+ * 的声明顺序渲染（见 `plugin-src/client/provider-toggle.js` 的
+ * `sortOpenProvidersByOrder`）。
+ */
+export interface RpcGetProviderOrderResponse {
+  order: string[]
+}
+
+/**
+ * RPC: 写入供应商自定义显示顺序。
+ *
+ * 数组含**全部**供应商 id：拖拽提交时 = 拖后的「已打开」序列 + 已关闭的
+ * 按声明序缀尾。展示侧对数组中不认识 / 缺失的 id 都有稳定兜底，故插件
+ * 跨版本增删 provider 时不需要迁移（见 `sortOpenProvidersByOrder`）。
+ */
+export interface RpcSetProviderOrderRequest {
+  order: string[]
 }
 
 /**
@@ -1364,6 +1434,44 @@ export interface RpcUsageBadgePreferenceRequest {
 /** RPC: 用量徽标显示偏好响应（回显写入后的生效值）。 */
 export interface RpcUsageBadgePreferenceResponse {
   preference: BadgePreference
+}
+
+/**
+ * RPC: 读取 **Token 账本**快照（「Token 用量」面板的唯一数据源）。
+ *
+ * 数据来自进程内存的 `src/token-ledger.ts`：记账点在注册收敛层
+ * （`llm-register-compat.ts` 的包装适配器），渠道由网关侧打标区分。
+ * **重启即丢**（第 1 期不持久化），UI 需说明这一点而不是伪装成历史报表。
+ */
+export interface RpcUsageTokenLedgerRequest {
+  /** 明细最多多少条；省略 = 服务端上限（`TOKEN_LEDGER_LIMIT`）。 */
+  limit?: number
+}
+
+/** Token 账本快照响应（形状直透 `TokenLedgerSnapshot`，不另造一份平行类型）。 */
+export interface RpcUsageTokenLedgerResponse {
+  snapshot: TokenLedgerSnapshot
+}
+
+/**
+ * RPC: 读取 **历史日聚合**（第 4 期 · 「Token 用量」弹窗的历史视图）。
+ *
+ * 数据源是落盘的日聚合（重启保留），与内存明细是两份独立数据 ——
+ * 历史答「本周/本月用了多少」，明细答「每一笔长什么样」。
+ */
+export interface RpcUsageTokenLedgerHistoryRequest {
+  /**
+   * 只看最近 N 天（**含今天**，UTC+8 日界）；省略 = 全部历史
+   * （服务端钳到 `TOKEN_LEDGER_HISTORY_MAX_DAYS`）。
+   */
+  sinceDays?: number
+}
+
+/** 历史日聚合响应（形状直透，不另造平行类型）。 */
+export interface RpcUsageTokenLedgerHistoryResponse {
+  history: TokenLedgerHistoryDay[]
+  /** 所选窗口的合计（按日累加，均值按全部样本 Σ/份数计算）。 */
+  totals: Omit<TokenLedgerModelRow, 'model'>
 }
 
 /**

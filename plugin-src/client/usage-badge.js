@@ -30,6 +30,7 @@ import * as React from 'react';
 import { supportsCreditBalance, supportsDailyCheckin, checkinProviders } from './credits-capabilities.js';
 import {
   badgeView,
+  creditSectionLabel,
   describeBadgeError,
   formatUpdatedAt,
   orderCreditRows,
@@ -43,7 +44,7 @@ import {
   quotaPercentValue,
   formatQuotaPercent,
 } from './quota-format.js';
-import { formatUnits, formatQuotaLine, unitLabel, QUOTA_UNIT } from './credits-format.js';
+import { formatUnits, formatQuotaLine, formatClaimGains, unitLabel, QUOTA_UNIT } from './credits-format.js';
 import {
   formatExpirySplitLine,
   formatPoolSplitLine,
@@ -524,7 +525,11 @@ function UsageBadgeActive(props) {
     setClaimProgress({ done: 0, total: providers.length });
     const parts = [];
     const notes = [];
-    let totalCredit = 0;
+    // ★ 按单位分组的合计（2026-10-04，真实缺陷）：见下方累加处的说明。
+    // ⚠️ 刻意不设 `totalCredit` 标量（跨单位求和的数，展示路径不得使用）；
+    //   旧宿主兜底发生在逐渠道的 `summary.totalByUnit || {...}` 那一跳。详见
+    //   `jet-hub.js` 同处的说明（本 PR 首版那个三元分支永远走不到）。
+    const totalByUnit = { token: 0, credit: 0 };
     let failed = 0;
     for (let index = 0; index < providers.length; index += 1) {
       const id = providers[index];
@@ -533,8 +538,17 @@ function UsageBadgeActive(props) {
         const summary = result?.summary || {};
         const bits = [];
         if (summary.claimed > 0) {
-          totalCredit += Number(summary.totalCredit) || 0;
-          bits.push(`+${Math.round(Number(summary.totalCredit) || 0)}`);
+          // ★ 按单位分别累加（2026-10-04，真实缺陷）：`summary.totalCredit` 是
+          //   **跨单位求和**，会把 ZCode 的 1 亿 token 与积分加成一个数并标成
+          //   「积分」（用户报障原文：`（共 +100000100）`）。单位必须一路带着走。
+          const byUnit = summary.totalByUnit || { credit: summary.totalCredit, token: 0 };
+          totalByUnit.credit += Number(byUnit.credit) || 0;
+          totalByUnit.token += Number(byUnit.token) || 0;
+          // ⚠️ **不要在这里再拼 `+`**：`formatClaimGains` 的返回值**自带**每个单位
+          //   的 `+`（`+100.00MToken, +100积分`），再拼一次会渲染成 `++100.00MToken`。
+          //   与 `jet-hub.js` 同因（2026-10-05 复审实测），详见该处注释。
+          const amount = formatClaimGains(byUnit);
+          if (amount !== null) bits.push(amount);
         }
         if (summary.alreadyClaimed > 0) bits.push(`${summary.alreadyClaimed} 个今日已领`);
         if (summary.inactive > 0) bits.push(`${summary.inactive} 个暂无活动`);
@@ -559,10 +573,18 @@ function UsageBadgeActive(props) {
       }
       setClaimProgress({ done: index + 1, total: providers.length });
     }
+    // ★ 汇总行按单位分别报（2026-10-04，真实缺陷）：原先写 `（共 +${totalCredit} 积分）`，
+    //   而 `totalCredit` 是跨单位求和 —— 用户报障的 `（共 +100000100）` 就是它。
+    //
+    // ⚠️ **不能再拼 `+`**：`formatClaimGains` 已自带每个单位的 `+`，本行原写作
+    //   `（共 +${totalAmount}）` ⇒ 渲染出 `（共 ++100.00MToken, +100积分）`
+    //   （2026-10-05 复审实测，与 `jet-hub.js` 同因）。
+    // ⚠️ 兜底只在逐渠道累加处做一次，这里直接用 `totalByUnit`（见该处注释）。
+    const totalAmount = formatClaimGains(totalByUnit);
     setClaimNotice({
       tone: failed > 0 || notes.length > 0 ? 'warn' : 'ok',
       text: parts.length > 0
-        ? `全部渠道：${parts.join('；')}${totalCredit > 0 ? `（共 +${Math.round(totalCredit)} 积分）` : ''}`
+        ? `全部渠道：${parts.join('；')}${totalAmount === null ? '' : `（共 ${totalAmount}）`}`
         : '全部渠道：没有可领取的渠道',
       notes,
     });
@@ -828,7 +850,14 @@ function UsageBadgeActive(props) {
           React.createElement('div', { key: 'head', className: 'dim-jh-badgeRowHead' }, [
             React.createElement('span', { key: 'l', className: 'dim-jh-badgeRowName', title: group.name }, group.name),
             React.createElement('span', { key: 'v', className: 'dim-jh-badgeValue' },
-              `${formatUnits(group.remaining, group.unit) ?? '?'} / ${formatUnits(group.total, group.unit) ?? '?'} ${group.label}`),
+              // ⚠️ 数值与单位之间**不留空格**（`100.00M / 200.00MToken`）：
+              //   与本弹窗积分区（`usage-badge.js:894` / `badge-model.js:474`）、
+              //   设置页账号卡片是同一口径。本行原为 `... ?? '?'} ${group.label}`
+              //   （**带空格**）—— 它渲染的正是 `94.54M Token` 形态，与积分区的
+              //   `94.54MToken` 在同一弹窗里并列，像两种单位
+              //   （2026-10-05 复审补修；这是该批次最后一处空格漏网，见
+              //    `tests/unit/claim-unit-callsites.spec.ts` 的穷举断言）。
+              `${formatUnits(group.remaining, group.unit) ?? '?'} / ${formatUnits(group.total, group.unit) ?? '?'}${group.label}`),
           ]),
           React.createElement('div', { key: 'note', className: 'dim-jh-badgeRowNote' },
             [
@@ -879,13 +908,19 @@ function UsageBadgeActive(props) {
     return React.createElement('div', { key: 'credits', className: 'dim-jh-badgeSection' }, [
       // 合计放进节标题右侧，省掉一整行
       React.createElement('div', { key: 'title', className: 'dim-jh-badgeSectionTitle' }, [
-        // ⚠️ 节标题按单位走：配额窗口（Gemini）是「额度」不是「积分」——
-        // 说成积分就是撒谎（计划 §3.3：「不要假装成积分数字」）。
-        React.createElement('span', { key: 'l' },
-          quotaGroup === undefined ? '积分' : unitLabel(quotaGroup.unit)),
+        // ⚠️ 节标题的单位标签走**纯函数**（`creditSectionLabel`），不在这里写三元：
+        //   原写法是 `quotaGroup === undefined ? '积分' : unitLabel(...)` —— 那个
+        //   兜底分支把 **ZCode 的 token** 冒充成了积分（真实缺陷，2026-10-05 复审
+        //   PR !56 时发现），渲染成「积分 … 94.54MToken」自相矛盾的一屏。
+        //   判据收进 `badge-model.js` 是为了能被单测锁死（组件里没法测 —— 本仓库
+        //   node_modules 没有 react）。
+        React.createElement('span', { key: 'l' }, creditSectionLabel(view.groups)),
         accounts.length === 0 || sum === ''
           ? null
           : React.createElement('span', { key: 'sum', className: 'dim-jh-badgeSectionSum' },
+            // ⚠️ 「合计」二字只对**可累加的余额**成立。配额窗口是并行百分比，
+            //   没有「一共」的语义（上游也没给过那个数），故配额下只给逐窗口读数。
+            //   token / 积分都是余额口径，加「合计」无误。
             quotaGroup === undefined ? `合计 ${sum}` : sum),
       ]),
       ...(accounts.length === 0
@@ -1067,7 +1102,10 @@ function balanceLine(balance) {
   const quota = formatQuotaLine(packages, unit);
   if (quota !== null) return quota;
   const text = formatUnits(balance.total, unit) ?? '0';
-  return `${text} ${unitLabel(unit)}`;
+  // ⚠️ 数值与单位之间**不留空格**（`94.54MToken` / `441.78积分`）：与
+  //   `badge-model.js` 的折叠态读数、`formatClaimGains` 的领取文案统一
+  //   （2026-10-05 复审：本行原为 `${text} ${unitLabel(unit)}`，带空格）。
+  return `${text}${unitLabel(unit)}`;
 }
 
 /**
@@ -1119,7 +1157,17 @@ function summarizeClaim(result) {
   const summary = result?.summary;
   if (summary === undefined) return { tone: 'ok', text: '签到完成', notes: [] };
   const parts = [];
-  if (summary.claimed > 0) parts.push(`${summary.claimed} 个账号领取成功，共 +${Math.round(Number(summary.totalCredit) || 0)} 积分`);
+  if (summary.claimed > 0) {
+    // ★ 单位感知（2026-10-04，真实缺陷）：原先写 `共 +${summary.totalCredit} 积分`，
+    //   把 ZCode 的 token 标成了积分。`totalByUnit` 缺省时回落到「按积分」，
+    //   以兼容旧宿主响应（与 `coversToday` 的兜底同思路）。
+    const amount = formatClaimGains(
+      summary.totalByUnit || { credit: Number(summary.totalCredit) || 0, token: 0 },
+    );
+    parts.push(amount === null
+      ? `${summary.claimed} 个账号领取成功`
+      : `${summary.claimed} 个账号领取成功，共 ${amount}`);
+  }
   if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今天已领`);
   if (summary.inactive > 0) parts.push(`${summary.inactive} 个活动未开启`);
   if (summary.failed > 0) {

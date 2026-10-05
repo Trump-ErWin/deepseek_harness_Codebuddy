@@ -168,6 +168,57 @@ export function unitLabel(unit) {
 }
 
 /**
+ * 把**按单位分组的领取所得**拼成一段文案：`+100.00MToken, +100积分`。
+ *
+ * ## ⚠️ 为什么需要它（真实缺陷，用户报障 2026-10-04）
+ *
+ * 用户报障原文：
+ * > 插件的这个一键签到，Zcode 获得的是 token 数量，但是这里显示成获得积分。
+ * > 正文「…ZCode（智谱）+100000000（共 +100000100）」
+ * > 应当显示为「…ZCode（智谱）+100Mtoken（共 +100Mtoken, +100积分）」
+ *
+ * 根因是宿主 `summary.totalCredit` 把不同量纲**加成了一个标量**：ZCode 的
+ * 1 亿 token 与其余渠道的 100 积分相加得 `100000100`，客户端拿到时已经无从
+ * 分辨单位。修法是宿主新增 `totalByUnit`（见 `src/types.ts`），客户端改用它。
+ *
+ * ⚠️ **每个单位各带一个 `+`**（不是整段共用一个）：这是用户给出的期望文案的
+ * 形态（`+100Mtoken, +100积分`）。整段共用会渲染成 `+100Mtoken, 100积分`，
+ * 第二个单位看起来像「不是本次领到的」。
+ *
+ * ⚠️ 函数名带 **Gains**：`+` 是「本次获得」的语义，**不要**拿它渲染余额
+ *（余额没有 `+`）。把 `+` 放进本函数而不是留给调用方拼，是为了两处界面
+ * 不漂移 —— 本仓库已有多次「各拼各的」先例。
+ *
+ * ⚠️ **顺序固定 token → credit**（不是字母序）：用户给出的期望文案就是
+ * token 在前。顺序固定也让渲染稳定，不因对象键序变化而抖动。
+ *
+ * ⚠️ 只列**非零**单位：给「本次没有 token 领取」的渠道渲染 `+0Token` 是噪音。
+ * 全为零 / 无该字段时返回 `null`，调用方据此**整段不渲染**。
+ *
+ * ⚠️ **`totalByUnit` 缺失时的兜底不在这里**：那是调用方的事（旧宿主响应只有
+ * `totalCredit`，调用方按 `{ credit: totalCredit }` 补）。本函数只认它拿到的
+ * 结构，不做跨字段猜测 —— 猜错会把 token 报成积分，正是本次缺陷。
+ *
+ * ⚠️ 与宿主 `src/credits.ts` 的 `formatClaimGains` **必须逐字等价**：自动签到的
+ * 逐渠道文字由宿主产出并落盘，手动签到的文字由客户端现场拼 —— 同一件事在两个
+ * 界面里不能出现两种写法。一致性由 `tests/unit/claim-unit-parity.spec.ts` 锁死。
+ *
+ * @param totals - `{ token?, credit? }`（缺失的键按 0 处理）。
+ * @returns 形如 `+100.00MToken, +100积分`；全为零 / 入参非法时 `null`。
+ */
+export function formatClaimGains(totals) {
+  if (totals === null || typeof totals !== 'object') return null;
+  const parts = [];
+  // ⚠️ 固定顺序：token 在前（与用户给出的期望文案一致），不依赖对象键序。
+  for (const unit of ['token', 'credit']) {
+    const value = Number(totals[unit]);
+    if (!Number.isFinite(value) || value <= 0) continue;
+    parts.push(`+${formatUnits(value, unit)}${unitLabel(unit)}`);
+  }
+  return parts.length === 0 ? null : parts.join(', ');
+}
+
+/**
  * 把**配额窗口包**渲染成一行：「5 小时窗口 95% · 周窗口 99%」。
  *
  * 这是计划 §3.3 承诺的面板形状（「面板会显示『5 小时窗口 99% / 周窗口 99%』

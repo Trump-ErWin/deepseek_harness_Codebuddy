@@ -34,6 +34,7 @@
 
 import type { ZcodeCredential } from './zcode.js'
 import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js'
+import { hasZcodeUnusualActivity, parseZcodeBusinessCode } from './zcode-diagnostics.js'
 import type { ZcodeRemoteModelLike } from './zcode-product.js'
 
 /** ZCode 平台 origin（官方默认）。 */
@@ -196,7 +197,18 @@ export interface ZcodeClaimOutcome {
   message?: string
 }
 
-/** 从数字字段安全取值（上游可能给 `null`）。 */
+/**
+ * 从数字字段安全取值（上游可能给 `null`）。
+ *
+ * ⚠⚠ **只认 `number`，不认数字字符串** —— 对**业务码**来说那是个真实缺陷
+ * （`{"code":"3012"}` 会被吃成 `undefined`，见 `claimZcodePlan` 里的说明），
+ * 现已改用 {@link parseZcodeBusinessCode}。
+ *
+ * ⚠ 本函数仍用于**额度数值 / priority / 上下文窗口**这些字段：它们若以字符串
+ * 下发，会静默退化成 `undefined`（`priority` → 0、`grantUnits` → 不显示额度）。
+ * 这属于**既有行为、不在本次改动范围**（改它会牵动 plan 排序与额度展示，
+ * 需单独的实发验证），故此处**如实标注限制而不擅自扩大改动**。
+ */
 function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
@@ -491,16 +503,76 @@ export async function claimZcodePlan(
     }
   }
 
-  const text = await response.text().catch(() => '')
+  /**
+   * ★★ 读响应体与解析业务码（真实缺陷，2026-10-05 对抗性审计打出）。
+   *
+   * ## ① `code` 必须认**纯数字字符串**
+   *
+   * 原先用 `num(parsed.code)`，而 `num()` **只认 `number`** ⇒ 上游回
+   * `{"code":"3012","msg":"request has been blocked due to unusual activity."}`
+   * 时 `code` 变成 `undefined`，风控码**整条丢失** —— 用户看到的正是本 issue
+   * 要修的那句裸上游串（`…: request has been blocked due to unusual activity.`），
+   * 因为该 `msg` 里**不含数字**，连「扫正文」都救不回来。
+   * ⇒ 改用 `parseZcodeBusinessCode`（见 `zcode-diagnostics.ts`），
+   * 它是全仓库**唯一**的业务码解析口径。
+   *
+   * ## ② 读体必须被包住（`F4`：此前的「自身不抛」是错的）
+   *
+   * 原先写成 `await response.text().catch(() => '')` —— 若 `fetch` 返回了
+   * **非 Response**（如 `null`，自定义 fetch / 被包装过的实现可能出现），
+   * `response.text` 的**属性访问**就同步抛 `TypeError`，`.catch` 根本挂不上
+   * ⇒ 整条穿透给调用方。真实 `fetch` 不会回 `null`，故生产影响≈0，
+   * 但 `claimDailyWith` 依赖「这里不抛」来配平埋点计数，故仍把它兜住。
+   */
+  let text = ''
   let code: number | undefined
   let message: string | undefined
   try {
+    text = await response.text()
+  } catch {
+    // 体流中断 / 响应对象异常 ⇒ 按「读不到正文」处理，不让它穿透。
+    text = ''
+  }
+  try {
     const parsed = JSON.parse(text) as { code?: unknown; msg?: unknown; message?: unknown }
-    code = num(parsed.code)
+    code = parseZcodeBusinessCode(parsed.code)
     message = typeof parsed.msg === 'string' ? parsed.msg
       : typeof parsed.message === 'string' ? parsed.message : undefined
   } catch {
     message = text.slice(0, 200)
+  }
+  /**
+   * ★★ **正文里的风控必须在这里（能看到完整正文的地方）归一成 `code`**
+   * （真实缺陷，2026-10-05 审计 N1）。
+   *
+   * ## 缺陷
+   *
+   * 上面那条 `message = text.slice(0, 200)` 是为**展示**做的截断，但下游的
+   * 判据（`isClaimUnusualActivity`）读的**正是 `message`** ⇒ 当网关正文的
+   * 噪声超过 200 字符、而风控短语落在截断点**之后**时，判据看到的是被截掉的串：
+   *
+   * ```
+   * 完整 body 长度=230，hasZcodeUnusualActivity(全body)=true
+   * → code=undefined，message 长度=200，含风控短语=false
+   * → claimRecognized=false   ← 真风控被降级成通用失败
+   * ```
+   *
+   * 症状**正是本 issue 的原症状**（用户只看到一句看不懂的失败）。
+   *
+   * ## 修法
+   *
+   * 判据移到**本层**：这里持有完整 `text`，判得准。命中即把 `code` 归一成
+   * `3012`，让下游统一走「有码 ⇒ 只信码」的路径 —— 与
+   * `parseZcodeBusinessCode` 同一思路（**在信息最全的地方归一，而不是在
+   * 已经丢过信息的下游猜**）。
+   *
+   * ⚠ **只在 `code` 缺失时兜底**：上游给了权威业务码就绝不覆盖
+   *   （`{"code":1005,"msg":"quota 3012 exceeded"}` 必须仍是 1005）。
+   * ⚠ 判据是 `hasZcodeUnusualActivity`（**语义短语为主**）——
+   *   它本身已排除 `13012` / 限流里的毫秒数等误判形态。
+   */
+  if (code === undefined && hasZcodeUnusualActivity(text)) {
+    code = 3012
   }
 
   // 1003 = 已领取过 —— **幂等成功，不是错误**。

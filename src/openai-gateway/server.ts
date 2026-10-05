@@ -6,6 +6,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, LlmModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { loadOrCreateApiKey, type ApiKeySource } from './auth.js'
 import { resolveGatewayConfig, type OpenAiGatewayConfig } from './config.js'
+import { markGatewayChannel } from './channel.js'
 import { toGenerateOptions, OpenAiGatewayError, parseModelRoute, normalizeReasoningEffort, normalizeMaxTokens, type OpenAiChatRequest, type ReasoningEffortNotice } from './messages.js'
 import type { AttachmentBridge, ImageLimits } from './images.js'
 import { collectGatewayEffortViews, collectGatewayModelIds, collectGatewayModels, toGatewayModelIds, toOpenAiModels } from './models.js'
@@ -340,7 +341,7 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
         bridge: options.attachments,
         limits: options.imageLimits,
       })
-      const stream = options.llm.stream(generate)
+      const stream = options.llm.stream(markGatewayChannel(generate))
       const fullId = `${route.provider}/${route.model}`
       if (body.stream === true) {
         writeSseHead(response)
@@ -389,7 +390,7 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
           + ' 无法用 DSH 的 ToolSchema 表达，已从本次请求丢弃',
         )
       })
-      const stream = options.llm.stream(generate)
+      const stream = options.llm.stream(markGatewayChannel(generate))
       const fullId = `${route.provider}/${route.model}`
       // 响应 id 由网关生成：本网关**无状态**，这个 id 只用于客户端关联，
       // 不能拿它回来查（`GET /v1/responses/{id}` 一律 404）。

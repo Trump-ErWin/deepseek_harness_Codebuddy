@@ -64,6 +64,33 @@ const CN: ZcodeCaptchaConfig = { region: 'cn', prefix: 'pf-cn', sceneId: '11xygt
 
 const CREDENTIAL: ZcodeCredential = { zcode_jwt: 'a.b.c', device_mid: 'mid-A', source: 'plugin' }
 
+/**
+ * 内存凭据存储。
+ *
+ * ⚠ 凭据**只有插件自存这一条来源**（`ctx.credentials`）：2026-10-05 起不再读本机
+ * 官方客户端文件，也**不再有** `ZcodeAuthOptions.readCredential` 测试注入点 ⇒
+ * 想给某个用例一份凭据，只能把它写进这个存储。
+ * 样板见 `tests/unit/zcode-credential-resolution.spec.ts`。
+ */
+class FakeCredentials {
+  readonly store = new Map<string, string>()
+  async resolve(ref: string) {
+    const value = this.store.get(ref)
+    return value === undefined ? undefined : { value, source: 'fake' }
+  }
+  async describe(ref: string) { return { configured: this.store.has(ref), writable: true } }
+  async set(ref: string, value: string) { this.store.set(ref, value) }
+  async unset(ref: string) { this.store.delete(ref) }
+}
+
+/** 注册内存凭据存储并写入一份可用的凭据（`current()` 据此解析）。 */
+async function seedCredential(ctx: Context): Promise<FakeCredentials> {
+  const credentials = new FakeCredentials()
+  ctx.provide('credentials', credentials as never)
+  await credentials.set(ZCODE.defaultCredentialRef, JSON.stringify(CREDENTIAL))
+  return credentials
+}
+
 /** 过 `validateCaptchaParam` 的假 param（长度 ≥200 + 可解出 JSON + certifyId + 长 token）。 */
 function fakeParam(tag: string, sceneId = SGP.sceneId): string {
   const body = JSON.stringify({ certifyId: tag, sceneId, securityToken: `${tag}-${'t'.repeat(128)}` })
@@ -138,10 +165,11 @@ function makeFetch(options: {
 }
 
 /** 造一个只服务领取用例的 `ZcodeAuth`（零真实浏览器：注入回调自己产 param）。 */
-function makeAuth(fetchImpl: typeof fetch): ZcodeAuth {
+async function makeAuth(fetchImpl: typeof fetch): Promise<ZcodeAuth> {
   const ctx = new Context()
   ctx.logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as never
-  return new ZcodeAuth(ctx, { fetchImpl, readCredential: () => CREDENTIAL })
+  await seedCredential(ctx)
+  return new ZcodeAuth(ctx, { fetchImpl })
 }
 
 beforeEach(() => {
@@ -152,7 +180,7 @@ beforeEach(() => {
 describe('★ 领取路径：region 与 param 同源（issue IKJNPS）', () => {
   it('★ 服务端下发 `sgp` ⇒ 请求头写 `sgp`，且注入回调拿到的就是**同一份配置**', async () => {
     const net = makeFetch({ plans: ['zcode-v3-start-plan-trust-1004'], config: SGP })
-    const auth = makeAuth(net.fetchImpl)
+    const auth = await makeAuth(net.fetchImpl)
     const seen: ZcodeCaptchaConfig[] = []
     // ⚠ 与 `jet-hub-rpc.ts` 的注入**同形**：原样把 config 透传给 mintCaptcha。
     const outcomes = await auth.claimDaily(async (config) => {
@@ -175,7 +203,7 @@ describe('★ 领取路径：region 与 param 同源（issue IKJNPS）', () => {
 
   it('★★ 配置拉不到 ⇒ region 与 mint 配置**一起**退回兜底值（不得反向不一致）', async () => {
     const net = makeFetch({ plans: ['p1'], config: 'fail' })
-    const auth = makeAuth(net.fetchImpl)
+    const auth = await makeAuth(net.fetchImpl)
     const seen: ZcodeCaptchaConfig[] = []
 
     const outcomes = await auth.claimDaily(async (config) => {
@@ -192,7 +220,7 @@ describe('★ 领取路径：region 与 param 同源（issue IKJNPS）', () => {
 
   it('显式传 `captchaRegion` 时以传入为准（覆盖语义仍然可用，未被改死）', async () => {
     const net = makeFetch({ plans: ['p1'], config: CN })
-    const auth = makeAuth(net.fetchImpl)
+    const auth = await makeAuth(net.fetchImpl)
 
     const outcomes = await auth.claimDaily(async (config) => fakeParam('p', config.sceneId), 'sgp')
 
@@ -222,7 +250,7 @@ describe('★ 领取路径：region 与 param 同源（issue IKJNPS）', () => {
 
   it('★★ 3007 换链重发那一发**仍然同源**（换 param 不换 region）', async () => {
     const net = makeFetch({ plans: ['p1'], config: SGP, firstClaimRejected: true })
-    const auth = makeAuth(net.fetchImpl)
+    const auth = await makeAuth(net.fetchImpl)
     // 槽里放一个新鲜 param ⇒ `carrier.mint()` 命中它，`source='internal'`
     // ⇒ 第一次 claim 走的是内部载体那一腿，才有「换注入链重发」这条分支。
     expect(putSuppliedParam(fakeParam('internal'), Date.now())).toBe(true)

@@ -34,13 +34,11 @@
  * 自 2026-09-28 起稳定 500 / code 2007）—— token 由轮询直接返回，
  * 完全不经过它。
  *
- * ## 与「读官方客户端凭据」的关系
+ * ## 凭据的**唯一**来源
  *
- * 两条路**并存**，优先用插件自存：
- *   1. `ctx.credentials` 里的 `ZcodeCredential`（插件自己登录拿到的）
- *   2. 回退：解密官方客户端的 `~/.zcode/v2/credentials.json`
- *
- * 这样「装了官方客户端」的用户零操作即可用；「没装」的用户也能登录。
+ * 就是本文件这条授权流。此前还存在一条「回退：解密官方客户端的
+ * `~/.zcode/v2/credentials.json`」的旁路，它已于 2026-10-05 整体删除
+ * （理由见 `zcode.ts` 文件头）⇒ 现在**不读本机任何 ZCode 数据**。
  */
 
 import { randomBytes, randomUUID } from 'node:crypto'

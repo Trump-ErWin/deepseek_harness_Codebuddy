@@ -82,7 +82,10 @@ describe('Loomy 在 index.ts 的接线', () => {
   })
 
   it('modelAdapters 里登记了 loomy', () => {
-    expect(indexSource).toMatch(/const modelAdapters[\s\S]*?loomy: loomyAdapter/)
+    // ⚠️ 2026-10-06 复审 !66：登记项改为经 `pruned(...)` 包装（否则拿的是原始
+    // 实例，「已失效模型」剔除对 Jet Hub 设置页不生效）。断言的是**登记语义**，
+    // 故用正则容忍包装层，不要写死字面写法。
+    expect(indexSource).toMatch(/const modelAdapters[\s\S]*?loomy: pruned\([^)]*,\s*loomyAdapter\)/)
   })
 
   it('registerJetHubRpc 传入了 loomy', () => {

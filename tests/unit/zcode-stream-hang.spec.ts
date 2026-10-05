@@ -64,6 +64,51 @@ function textStream(text: string): ReadableStream<Uint8Array> {
   })
 }
 
+/**
+ * 持续吐 `thinking_delta` 帧、**从不静默**，持续 `totalMs` 后正常收尾。
+ *
+ * ★ 这是 IKJOVB 的核心形态（用户报障：「模型雷霆大思考三分钟，然后被截断」）：
+ * 上游**一直有数据**，只是总时长超过了当时的 180s 整轮墙钟。
+ * 旧的「整轮墙钟」实现必然在此抛 `TIMEOUT`；空闲超时实现必须完整读完。
+ *
+ * ⚠ 收尾三帧**不能省**：消费器靠 `message_delta.stop_reason` 落定，
+ * 只吐思考帧会被判「秒回空 → 无权益」而走换号分支（实测抛 `QUOTA_EXCEEDED`）。
+ */
+function thinkingStream(totalMs: number, frameEveryMs = 20): ReadableStream<Uint8Array> {
+  const enc = new TextEncoder()
+  let timer: ReturnType<typeof setInterval> | undefined
+  let elapsed = 0
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      const finish = (): void => {
+        if (timer !== undefined) clearInterval(timer)
+        controller.enqueue(enc.encode('event: content_block_stop\ndata: {"type":"content_block_stop"}\n\n'))
+        controller.enqueue(
+          enc.encode(
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
+          ),
+        )
+        controller.enqueue(enc.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'))
+        controller.close()
+      }
+      const tick = (): void => {
+        elapsed += frameEveryMs
+        controller.enqueue(
+          enc.encode(
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"嗯…"}}\n\n',
+          ),
+        )
+        if (elapsed >= totalMs) finish()
+      }
+      tick()
+      timer = setInterval(tick, frameEveryMs)
+    },
+    cancel() {
+      if (timer !== undefined) clearInterval(timer)
+    },
+  })
+}
+
 /** 把一个 promise 落定为结果或异常（便于断言「不许挂起」）。 */
 async function settle<T>(
   promise: Promise<T>,
@@ -83,6 +128,7 @@ function withHangGuard<T>(promise: Promise<T>, ms: number): Promise<T | 'hang'> 
 function makeAdapter(options: {
   fetchImpl: () => Promise<Response>
   requestTimeoutMs?: number
+  streamIdleTimeoutMs?: number
 }): ZcodeAdapter {
   return new ZcodeAdapter({
     credentialRef: 'R' as never,
@@ -90,7 +136,11 @@ function makeAdapter(options: {
     refresh: async () => {},
     mintCaptcha: async () => 'p',
     fetchImpl: options.fetchImpl as never,
-    product: { ...ZCODE, requestTimeoutMs: options.requestTimeoutMs ?? 150 },
+    product: {
+      ...ZCODE,
+      requestTimeoutMs: options.requestTimeoutMs ?? 150,
+      streamIdleTimeoutMs: options.streamIdleTimeoutMs ?? 0,
+    },
   })
 }
 
@@ -277,4 +327,128 @@ describe('ZCode captcha：等待必须有界、标志必须复位', () => {
     },
     5_000,
   )
+})
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════
+ * IKJOVB：长思考必然超时（180000ms 内未完成）
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * ## 用户报障（Gitee issue IKJOVB，2026-10-05）
+ *
+ * > 「用的 zcode provider，模型只要一开始雷霆大思考，就一定会出现这个错误，
+ * >   然后之前思考的东西全部中断，直接重试。」
+ *
+ * 报障者补充（排除误判）：「不是 captcha 的问题，我看着模型一直在思考，
+ * 思考了三分钟然后被截断了，接着重试一次，模型又开始雷霆大思考，
+ * 思考三分钟又被截断了。」
+ *
+ * ## 根因（已实证，见本文件末尾的反向验证）
+ *
+ * `requestTimeoutMs: 180_000` 是**整轮墙钟**：进 `stream()` 起表，
+ * **收到任何帧都不续期**。而当时 `iterateSseFrames` 走裸 `reader.read()`，
+ * 没有空闲超时 ⇒ 持续吐思考帧时，每一帧都在给墙钟「陪跑」，
+ * 到点必被 abort → `TIMEOUT` → 在 harness `DEFAULT_RETRYABLE_CODES` 内 → 重试
+ * → 又大思考 → 又撞满 ⇒ 死循环。
+ *
+ * ⚠ 那个 180_000 的来历：官方 `resources/glm/zcode.cjs` 默认配置里
+ * `modelStream.idleTimeoutMs = 6e5`（10 分钟）而 `network.timeout = 18e4`
+ * （普通 API 请求）。旧实现**误把后者的值当成了推理时限**。
+ *
+ * ## 修复
+ *
+ * ① `zcode-anthropic.ts` 的 `iterateSseFrames` 支持 `idleTimeoutMs`
+ *    （**每帧续期**，语义与官方 `readNextWithStreamIdleTimeout` 一致）；
+ * ② `requestTimeoutMs` 放宽到 15 分钟，**只**兜「真静默 / captcha 卡死」，
+ *    不再参与「思考多久算超时」的判定。
+ */
+describe('ZCode：长思考不得被整轮墙钟截断（Issue IKJOVB）', () => {
+  it(
+    '★ 上游持续吐思考帧、总时长远超空闲阈值 ⇒ 完整读完，不得抛 TIMEOUT',
+    async () => {
+      // ★ 帧间隔 20ms、空闲阈值 200ms、流总长 900ms：「连续 200ms 没数据」从未发生，
+      // 但总时长是空闲阈值的 4.5 倍 —— 修复前的整轮墙钟必在此砍断。
+      // ⚠ 墙钟给 60_000ms（≫ 流长）：它只兜「真静默」，不参与「思考多久算超时」。
+      const adapter = makeAdapter({
+        fetchImpl: async () => new Response(thinkingStream(900), { status: 200 }),
+        requestTimeoutMs: 60_000,
+        streamIdleTimeoutMs: 200,
+      })
+      const settled = await settle(drain(adapter.stream(streamOptions())))
+
+      /**
+       * 修复前：elapsed≈200ms 抛 `TIMEOUT`（本次 issue 的原始形态）。
+       * 修复后：流被完整消费，适配器正常收尾。
+       */
+      expect(settled.ok).toBe(true)
+      expect((settled as { ok: true; value: unknown[] }).value.length).toBeGreaterThan(0)
+    },
+    10_000,
+  )
+
+  it(
+    '★ 空闲超时仍然生效：整段静默 ⇒ 抛 TIMEOUT（不能退回「永久挂起」）',
+    async () => {
+      const adapter = makeAdapter({
+        fetchImpl: async () => new Response(hangingStream(), { status: 200 }),
+        // 墙钟给得很宽：结束**只能**由空闲超时引起。
+        requestTimeoutMs: 60_000,
+        streamIdleTimeoutMs: 120,
+      })
+      const settled = await settle(drain(adapter.stream(streamOptions())))
+
+      expect(settled.ok).toBe(false)
+      const error = (settled as { ok: false; error: unknown }).error
+      expect(error).toBeInstanceOf(LlmError)
+      expect((error as LlmError).code).toBe('TIMEOUT')
+    },
+    10_000,
+  )
+
+  it(
+    '★ 用户中断不得被翻译成 TIMEOUT（否则会白重试）',
+    async () => {
+      const controller = new AbortController()
+      const adapter = makeAdapter({
+        fetchImpl: async () => new Response(thinkingStream(5_000), { status: 200 }),
+        requestTimeoutMs: 60_000,
+        streamIdleTimeoutMs: 60_000,
+      })
+      const consuming = settle(drain(adapter.stream(streamOptions(controller.signal))))
+      await sleep(60)
+      controller.abort()
+
+      const settled = await withHangGuard(consuming, 2_000)
+      expect(settled).not.toBe('hang')
+      const result = settled as { ok: boolean; error?: unknown }
+      if (result.ok === false && result.error instanceof LlmError) {
+        expect(result.error.code).not.toBe('TIMEOUT')
+      }
+    },
+    10_000,
+  )
+
+  it('★ 整轮墙钟兜底仍在：captcha 卡死那种无输出挂起必须能被上限救回来', async () => {
+    // 静默但**不发任何字节**，且把空闲超时关掉（0）⇒ 只有整轮墙钟能救。
+    const adapter = makeAdapter({
+      fetchImpl: async () => new Response(hangingStream(), { status: 200 }),
+      requestTimeoutMs: 200,
+      streamIdleTimeoutMs: 0,
+    })
+    const settled = await settle(drain(adapter.stream(streamOptions())))
+    expect(settled.ok).toBe(false)
+    const error = (settled as { ok: false; error: unknown }).error
+    expect((error as LlmError).code).toBe('TIMEOUT')
+    expect((error as LlmError).message).toContain('请求超时')
+  }, 10_000)
+
+  it('★ 产品配置：空闲超时已对齐官方 600_000，墙钟不再取 180_000', () => {
+    // 逐字对齐官方 `modelStream.idleTimeoutMs = 6e5`（zcode.cjs 默认配置）。
+    expect(ZCODE.streamIdleTimeoutMs).toBe(600_000)
+    /**
+     * ⚠ 这条是**红线断言**：180_000 是官方 `network.timeout` 的值，
+     * 属另一个字段。改回去就等于把 issue 重新装回来。
+     */
+    expect(ZCODE.requestTimeoutMs).not.toBe(180_000)
+  })
 })
