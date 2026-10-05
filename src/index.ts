@@ -40,6 +40,7 @@ import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
+import { configureDeadModelStore } from './dead-model-store.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
@@ -283,6 +284,11 @@ export function apply(ctx: Context): void {
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
+
+  // 「已失效模型」剔除：注入 ctx 只为把日志接进 DSH logger 并复用同一份 home
+  // 解析。必须在任何 `registerXxxLlm` 之前调用 —— 各适配器经
+  // `registerAdapterIdempotent` 注册时就会包装上剔除逻辑（见该函数注释）。
+  configureDeadModelStore(ctx)
 
   // WorkBuddy provider 已从中国版（copilot.tencent.com）改造为国际版
   // （www.workbuddy.ai）。旧账号存的是中国版凭据，其 token.domain 指向旧端点，
