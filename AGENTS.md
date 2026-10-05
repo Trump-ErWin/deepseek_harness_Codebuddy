@@ -1124,9 +1124,71 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
 测试：`tests/unit/expiry-sync.spec.ts`（19 条：lead 边界含 `<=`、一致不写盘、
 1 秒容差、不传 refreshableOf、反查传凭据内容、回写失败不反噬、
 「有效期内仍须对账」、续期返回 undefined 时绝不落盘）+
-`tests/unit/refresh-bootstrap-wiring.spec.ts`（19 条：启动首轮排在定时器前、
+`tests/unit/refresh-scheduler.spec.ts`（9 条：武装时机/首轮/补武装/防叠加/防重入，
+见下条）+ `tests/unit/refresh-bootstrap-wiring.spec.ts`（21 条：index.ts 接线、
 十个 provider 都在表里、九个 auth 的 `refreshAccountCredential` 都带
 pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）。
+
+### ⚠️⚠️ 续期调度器**必须无条件武装**：冷启动空池不是「不需要调度」（Issue IKJOZB）
+
+**真实缺陷**（Gitee issue IKJOZB，用户报障，2026-10-05）：
+「冷启动时账号池为空（0 账号），之后再登录账号 ⇒ **该会话内不再有主动续期**
+（只剩请求内按需续期），且**日志无痕**。」
+
+原实现（`src/index.ts`，在役 0.1.5）：
+
+```ts
+pool.listAllAccounts().then(accounts => {
+  if (accounts.length === 0) return          // ← 根因
+  void refreshAllCredentials()
+  const refreshTimer = setInterval(...)
+})
+```
+
+冷启动空池是**正常态**（新用户、刚清过存储、刚删光账号），此时整个调度器
+**不被创建**；而 `addAccount`（登录成功那一步）**没有任何重新武装的路径**
+⇒ 该会话内登录的账号**永远不会被主动续期**。用户看到的是「面板显示可自动
+续期，但凭据悄悄过期、昨天还能用今天全挂」，且那条 `return` 一句话都不记。
+
+⚠️ **这是「用瞬时状态决定长期能力」的经典形态**：池在启动那一刻恰好为空，
+是一个**与「要不要续期」无关**的事实。凡是「启动时读一次快照 ⇒ 决定要不要
+注册长期机制」的写法都要怀疑。
+
+**修法 = 三道防线，缺一不可**（现在都在 `src/refresh-scheduler.ts`）：
+
+| 防线 | 做法 | 防的是什么 |
+|---|---|---|
+| ① 无条件武装 | `start()` 不再看池内容 | 根因：空池就不武装 |
+| ② 入库即武装 | `pool.onAccountAdded()` → `notifyAccountAdded()` | issue 点名缺失的「重新武装路径」；启动期存储异常也能救回 |
+| ③ 空池下轮重试 | `onTick` 判空后**绝不** `clearInterval` | 通知因任何原因没送到时的兜底 |
+
+⚠️ **已做反向验证**（两次都精确命中，不是同义反复）：把 `start()` 改回
+「空池 return」→ 3 条变红；去掉 `notifyAccountAdded` 的补武装 → 1 条变红；
+`addAccount` 的通知移出 `finally` → 1 条变红。
+
+⚠️ **两道防线是独立冗余的**（实测）：只禁 ① 时探针**仍通过** —— 因为
+② 补武装兜住了。所以「单独打破一条看不出问题」是**预期行为**，验证必须
+两道一起禁才能复现原缺陷。别据此以为防线是多余的。
+
+⚠️ **抽成类而非留在 `index.ts` 闭包里**：原先这段逻辑无法单测，导致
+issue !IKIRTT 的回归用例只能在**源码文本**上断言，而那条断言
+（`expect(gate).toMatch(/accounts\.length\s*===\s*0/)`）**顺带把错误形态
+一起固化了**（它本意只是锁「判据放宽」）。⚠️ **教训：源码文本断言会
+把实现细节变成契约 —— 用它锁「不许写 X」，不要用它锁「必须写 Y」。**
+
+两个实现约束：
+
+- ⚠️ **通知必须排在 `addAccount` 的 `finally` 里**，不能在落盘成功之后一行：
+  `writeAccounts` 先更新进程内副本再 `await` 落盘，故落盘抛错时账号**已经是
+  可用状态**（各 auth 的登录流程在调 `addAccount` 前就已 `credentials.set`）。
+  因一次磁盘失败吞掉通知 = 「账号能用、但本会话不续期」，同一形态。
+- ⚠️ **订阅点必须挂在 `AccountPool` 上**，不能逐个登录流程接线：全仓库十几处
+  `pool.addAccount(...)`（13 个 provider 的 auth、opencode 账号槽/匿名槽、
+  RPC 的导入/恢复分支），逐处接线必漏，而漏掉的那个 provider 会**静默**不续期。
+
+⚠️ **判据只有「池里有没有账号」**，仍**不看** `refreshable` / `enabled`
+（既有铁律，见上两条）。`RefreshScheduler` 刻意**不接收账号条目**，只收一个
+`isPoolEmpty` 布尔 —— 从类型上就杜绝了把被误标的布尔再接回门禁。
 
 ### ⚠️ 账号池的 `refreshable` 只是**凭据材料的镜像**，绝不能当续期门禁
 

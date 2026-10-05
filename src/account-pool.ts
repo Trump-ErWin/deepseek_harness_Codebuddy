@@ -144,6 +144,14 @@ export class AccountPool {
   private storeChain: Promise<void> = Promise.resolve()
   /** 锁定表的独立后端（权威落盘点）。 */
   private readonly lockStore: PermanentLockStore
+  /**
+   * 「账号入库」订阅者（Gitee issue IKJOZB）。
+   *
+   * ⚠️ 刻意**不落盘、不跨实例**：它的消费者是插件会话内的续期调度器，
+   * 而调度器按会话创建 —— 持久化订阅者既无意义，还会让「谁来订阅」变成
+   * 需要在启动时恢复的状态。
+   */
+  private readonly accountAddedListeners = new Set<(entry: ProviderAccountEntry) => void>()
 
   constructor(private readonly ctx: Context) {
     this.store = createJetHubStore(ctx)
@@ -643,7 +651,58 @@ export class AccountPool {
   /** 添加新账号（登录成功后调用） */
   async addAccount(entry: ProviderAccountEntry): Promise<void> {
     const accounts = [...this.readAccounts(), entry]
-    await this.writeAccounts(accounts)
+    try {
+      await this.writeAccounts(accounts)
+    } finally {
+      // ⚠️ **必须放在 `finally` 里**（不是落盘之后一行）：`writeAccounts` 会先
+      // 更新进程内权威副本 `this.cache`、再 `await` 落盘，故落盘抛错时账号
+      // **已经是可用状态**（何况各 auth 的登录流程在调用本方法前就
+      // `credentials.set` 了凭据）。通知的用途是让续期调度器认识这个账号 ——
+      // 因一次磁盘失败就吞掉它，会得到「账号能用、但本会话不续期」，
+      // 正是 issue IKJOZB 的同一形态。
+      this.notifyAccountAdded(entry)
+    }
+  }
+
+  /**
+   * 注册「账号入库」回调（Gitee issue IKJOZB）。
+   *
+   * ## 为什么需要这个出口
+   *
+   * 续期调度器原先只在**插件启动那一刻**按「池是否非空」决定是否武装，而
+   * 冷启动时池为空是正常态（新用户、刚清过存储）—— 此后登录的账号在本会话内
+   * **永远不会被主动续期**。修法之一是「账号入库时补武装」，于是需要有人告诉
+   * 调度器「池刚变了」。
+   *
+   * ⚠️ **收口点必须是这里**，不能逐个登录流程接线：`pool.addAccount` 在全仓库
+   * 有十几处调用点（12 个 provider 的 auth、opencode 的账号槽与匿名槽、RPC 的
+   * 导入/恢复分支）。逐处接线必然漏掉某一处，而漏掉的那一处会**静默**地不续期。
+   *
+   * @param listener 回调；**抛错会被吞掉并记 warn**（订阅者不得让登录失败）。
+   * @returns 取消订阅函数。
+   */
+  onAccountAdded(listener: (entry: ProviderAccountEntry) => void): () => void {
+    this.accountAddedListeners.add(listener)
+    return () => { this.accountAddedListeners.delete(listener) }
+  }
+
+  /**
+   * 逐个调用入库订阅者；**任何异常都只记日志**。
+   *
+   * ⚠️ 不能让订阅者的异常冒到 `addAccount` 的调用者：那条路径是「登录成功」，
+   * 一个写坏的订阅者不该让用户看到「登录失败」（凭据其实已经存好了）。
+   */
+  private notifyAccountAdded(entry: ProviderAccountEntry): void {
+    for (const listener of [...this.accountAddedListeners]) {
+      try {
+        listener(entry)
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          `[jet-hub] 账号入库通知的订阅者抛错（已忽略）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
   }
 
   /** 更新账号部分字段 */
