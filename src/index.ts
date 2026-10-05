@@ -616,6 +616,9 @@ export function apply(ctx: Context): void {
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
       const available = await pool.getAvailableAccount(LOBSTERAI.id, modelId ?? '')
       if (available) return available.credential as LobsteraiCredential
+      // 退到单凭据 ref 之前先证明失败原因（见 `throwIfAllAccountsRateLimited`
+      // 的说明）：全被模型限流时报明确的限流错误，而不是降级成「请先登录」。
+      throwIfAllAccountsRateLimited(LOBSTERAI, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(LOBSTERAI.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -690,6 +693,9 @@ export function apply(ctx: Context): void {
       }
       // 回退到单凭据路径：没有账号条目可标记，清空以免标记到过期的 id。
       activeQoderAccountId.set(QODER.id, undefined)
+      // 区分「全部限流」与「没登录」（见该助手的说明）—— 否则用户会去
+      // 重新登录，而凭据其实是好的（真实缺陷，Gitee IKJOZ9）。
+      throwIfAllAccountsRateLimited(QODER, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(QODER.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -746,6 +752,8 @@ export function apply(ctx: Context): void {
         return available.credential as QoderCredential
       }
       activeQoderAccountId.set(QODER_CN.id, undefined)
+      // 同国际版：区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(QODER_CN, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(QODER_CN.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -791,6 +799,8 @@ export function apply(ctx: Context): void {
       // 换号形同虚设（用户报障「没有切换」的根因之一）。
       const available = await pool.getAvailableAccount(TRAE.id, modelId ?? '')
       if (available) return available.credential as TraeCredential
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(TRAE, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(TRAE.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -988,6 +998,9 @@ export function apply(ctx: Context): void {
       }
 
       // 兜底：账号池为空/全部不可解析时，退回单凭据 ref。
+      // ⚠️ 先证明失败原因是不是限流（见该助手的说明，IKJOZ9）：唯一启用账号
+      // 被该模型限流时，候选在上面的 filter 里已被筛空 —— 那不是「没登录」。
+      throwIfAllAccountsRateLimited(LOOMY, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(LOOMY.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1060,6 +1073,8 @@ export function apply(ctx: Context): void {
       // 联合（历史遗留），与 `RaccoonCredential` 无充分重叠，故经 `unknown` 转换。
       // 运行时安全性由 provider 过滤保证：查询用 `RACCOON.id`，取到的必是 raccoon 凭据。
       if (available) return available.credential as unknown as RaccoonCredential
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(RACCOON, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(RACCOON.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1125,6 +1140,8 @@ export function apply(ctx: Context): void {
       // 联合（历史遗留），与 `MinimaxCredential` 无充分重叠，故经 `unknown` 转换。
       // 运行时安全性由 provider 过滤保证：查询用 `MINIMAX.id`，取到的必是 minimax 凭据。
       if (available) return available.credential as unknown as MinimaxCredential
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(MINIMAX, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(MINIMAX.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1209,6 +1226,8 @@ export function apply(ctx: Context): void {
       // `GeminiCredential` 无充分重叠，故经 `unknown` 转换；运行时安全性由
       // provider 过滤保证（查询用 `GEMINI.id`，取到的必是 gemini 凭据）。
       if (available) return available.credential as unknown as GeminiCredential
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(GEMINI, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(GEMINI.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1372,6 +1391,12 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
      * ⚠ 同时**清空**记录：没有账号条目可标记，留着旧 id 会误伤一个无辜账号。
      */
     activeZcodeAccountId.set(ZCODE.id, undefined)
+    // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+    // ⚠️ zcode 这条兜底与别家不同：`current()` 内部**也会读账号池**，且
+    // **不看模型级限流**（与它不看 `enabled` 同一条约定）—— 即全被限流时它
+    // 仍会返回那份凭据。于是这里的判定是**提前拦截**：原本照样发出去、
+    // 只会被服务端再拒一次；提前报「限流 + 解禁时刻」才是真原因。
+    throwIfAllAccountsRateLimited(ZCODE, modelId)
     return await zcode.current()
   },
   refresh: async () => {

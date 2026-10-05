@@ -291,4 +291,87 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       expect(signature).not.toContain('BuddyProduct')
     })
   })
+
+  /**
+   * **其余 9 个 provider 同型缺陷**（Gitee issue IKJOZ9，2026-10-05）。
+   *
+   * ## 症状
+   *
+   * 用户的 qoder 单账号撞上**当日额度用尽**，第一次请求报
+   * `Billing daily count exceeded`（正确），标记落下后**第二次请求**却报：
+   *
+   * ```
+   * qoder: no usable credential; log in first     ← 把用户指向「重新登录」
+   * ```
+   *
+   * 而凭据是好的、账号是登录着的 —— 真实原因是那个模型被**模型级限流**挡住。
+   * 用户据此重新登录，问题照旧（根因是限流），白跑一趟。
+   *
+   * ## 为什么这次是「九个一起漏」
+   *
+   * 判定助手 `throwIfAllAccountsRateLimited` 自 2026-10-03 起只接了
+   * buddy / workbuddy / cline 三家，新增的 provider **谁都没接**。这不是九个
+   * 独立缺陷，而是**同一条接线约定没有被强制**——所以下面的断言是
+   * **按 provider 逐个点名**，而不是「断言至少存在若干处调用」：
+   * 后者对新增 provider 恒成立，挡不住下一个同类回归。
+   *
+   * ⚠️ **codearts 刻意不在名单里**：它取号时传的是**空 modelId**
+   * （`getAvailableAccount('codearts', '')`），模型级限流**压根不参与筛选**，
+   * 因此既不会误报「限流」、也不会误报「未登录」。给它接判定属于改变
+   * 既有行为，超出本 issue 范围；此处的名单必须与事实一致，不能图省事全列上。
+   */
+  describe('接线（源码级）：其余 provider 同型缺陷（IKJOZ9）', () => {
+    /**
+     * 每个 provider 的「池取号调用 → 判定 → 单凭据兜底」三个锚点。
+     *
+     * ⚠️ 锚点必须**逐个 provider 写死**，不能只搜函数名：
+     * `getAvailableAccount(X.id, modelId ?? '')` 这个形出现在十处以上，
+     * 只搜形参会命中第一个（buddy），断言恒真。
+     */
+    const WIRING: Array<{ product: string; pool: string; fallback: string }> = [
+      { product: 'CODEBUDDY', pool: 'getAvailableAccount(CODEBUDDY.id', fallback: 'credentialRef(BUDDY_CREDENTIAL_REF)' },
+      { product: 'WORKBUDDY', pool: 'getAvailableAccount(WORKBUDDY.id', fallback: 'credentialRef(WORKBUDDY.defaultCredentialRef)' },
+      { product: 'LOBSTERAI', pool: 'getAvailableAccount(LOBSTERAI.id', fallback: 'credentialRef(LOBSTERAI.defaultCredentialRef)' },
+      { product: 'QODER', pool: 'getAvailableAccount(QODER.id', fallback: 'credentialRef(QODER.defaultCredentialRef)' },
+      { product: 'QODER_CN', pool: 'getAvailableAccount(QODER_CN.id', fallback: 'credentialRef(QODER_CN.defaultCredentialRef)' },
+      { product: 'TRAE', pool: 'getAvailableAccount(TRAE.id', fallback: 'credentialRef(TRAE.defaultCredentialRef)' },
+      { product: 'CLINE', pool: 'getAvailableAccount(CLINE.id', fallback: 'credentialRef(CLINE.defaultCredentialRef)' },
+      { product: 'LOOMY', pool: 'listAccountsByProvider(LOOMY.id)', fallback: 'credentialRef(LOOMY.defaultCredentialRef)' },
+      { product: 'RACCOON', pool: 'getAvailableAccount(RACCOON.id', fallback: 'credentialRef(RACCOON.defaultCredentialRef)' },
+      { product: 'MINIMAX', pool: 'getAvailableAccount(MINIMAX.id', fallback: 'credentialRef(MINIMAX.defaultCredentialRef)' },
+      { product: 'GEMINI', pool: 'getAvailableAccount(GEMINI.id', fallback: 'credentialRef(GEMINI.defaultCredentialRef)' },
+      { product: 'ZCODE', pool: 'getAvailableAccount(ZCODE.id', fallback: 'zcode.current()' },
+    ]
+
+    it.each(WIRING)('$product：判定已接线，且位于「取号之后、兜底之前」', ({ product, pool, fallback }) => {
+      // ⚠️ 三个锚点必须**在同一切片里**按先后比较，不能各自 indexOf 全文：
+      // `credentialRef(X.defaultCredentialRef)` 在 `registerXxxLlm` 的
+      // `credentialRef:` 注册行就出现过一次（**早于** resolveCredential），
+      // 全文搜索会命中那处、把「判定先于兜底」判反（写用例时实测到）。
+      // 正确做法：先定位取号点，再在**它之后**的切片里找判定与兜底。
+      const available = indexCode.indexOf(pool)
+      expect(available, `${product} 的取号锚点没找到`).toBeGreaterThan(-1)
+      const tail = indexCode.slice(available)
+      const check = tail.indexOf(`throwIfAllAccountsRateLimited(${product}, modelId)`)
+      const fallbackAt = tail.indexOf(fallback)
+      expect(check, `${product} 未接限流判定`).toBeGreaterThan(-1)
+      expect(fallbackAt, `${product} 的兜底锚点没找到`).toBeGreaterThan(-1)
+      // 顺序：先问池 → 池也没号 → 才判限流 → 最后才退单凭据。
+      // ⚠️ 判定放到取号之前，会让「池里明明还有号」也被报成限流。
+      expect(check).toBeLessThan(fallbackAt)
+    })
+
+    it('名单覆盖全部走 resolveCredential 取号的 provider（新增 provider 记得加进来）', () => {
+      // 判据：从 index.ts 里扫出所有「按 modelId 过滤模型级限流」的取号点，
+      // 断言它们的产品常量**全部**在上面的名单里。
+      // ⚠️ 排除 codearts：它传空 modelId，不做模型级过滤（见本段开头的说明）；
+      //    排除 `refresh:` 里那些**不带 modelId** 的取号（那是续期路径，
+      //    刻意用空串以便拿到被限流的账号去续期 —— 语义不同，不能判限流）。
+      const guarded = new Set(WIRING.map(w => w.product))
+      const missing = [...indexCode.matchAll(/getAvailableAccount\((\w+)\.id, modelId/g)]
+        .map(m => m[1]!)
+        .filter(product => !guarded.has(product))
+      expect(missing, '这些 provider 按模型过滤限流，却没接限流判定').toEqual([])
+    })
+  })
 })
