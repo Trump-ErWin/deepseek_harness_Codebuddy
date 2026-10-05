@@ -478,6 +478,16 @@ const STYLES = `
 .dim-jh-ledgerModelTokens { flex: none; font-size: 11.5px; line-height: 17px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-primary, #1f2329); white-space: nowrap; }
 /* 均值格（首字 · 速率）：三级汇总行（渠道/账号/模型）共用，等宽数字对齐。 */
 .dim-jh-ledgerPerf { flex: none; font-size: 11px; line-height: 16px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
+/* ── 历史视图（第 4 期）：趋势柱状图 + 展开的日聚合树 ──
+   柱状图用纯 div（不引图表库）：每根柱 = 一天，高度按相对最大值的百分比。 */
+.dim-jh-ledgerSection { margin-bottom: 14px; }
+.dim-jh-ledgerSectionTitle { font-size: 13px; line-height: 19px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); margin-bottom: 6px; }
+.dim-jh-ledgerTrend { display: flex; align-items: flex-end; gap: 3px; height: 64px; padding: 4px 2px 0; overflow-x: auto; }
+.dim-jh-ledgerTrendCol { flex: 1 0 14px; min-width: 14px; height: 100%; display: flex; align-items: flex-end; cursor: pointer; }
+.dim-jh-ledgerTrendBar { width: 100%; min-height: 2px; border-radius: 3px 3px 0 0; background: var(--dsw-alias-brand-primary, #1677ff); opacity: .45; transition: opacity .12s ease; }
+.dim-jh-ledgerTrendBar:hover { opacity: .75; }
+.dim-jh-ledgerTrendBar[data-today="true"] { opacity: .9; }
+.dim-jh-ledgerTrendBar[data-active="true"] { opacity: 1; outline: 1.5px solid var(--dsw-alias-brand-primary, #1677ff); }
 /* 明细表：紧凑小字；模型列允许换行（长 wire 名不能截断 —— 网关弹窗同一条教训）。 */
 .dim-jh-ledgerTable { width: 100%; margin-top: 10px; border-collapse: collapse; font-size: 11.5px; line-height: 17px; }
 .dim-jh-ledgerTable th { position: sticky; top: 0; z-index: 1; padding: 4px 6px; text-align: left; font-weight: 600; color: var(--dsw-alias-label-tertiary, #8f959e); background: var(--dsw-alias-bg-layer-1, #fff); border-bottom: .5px solid var(--dsw-alias-border-l3, #e5e5e5); }

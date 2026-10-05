@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   accountLabel,
   avgPerfText,
+  barHeightPercent,
   channelCardTitle,
   channelLabel,
   channelOrder,
@@ -13,8 +14,13 @@ import {
   formatTokenCount,
   filterChannelsBySelection,
   hasAnyData,
+  historyTitle,
+  HISTORY_RANGES,
   ledgerSubtitle,
+  rangeDaysOf,
   tokenSummaryText,
+  todayDayKey,
+  trendBars,
 } from '../../plugin-src/client/token-ledger-panel.js'
 
 describe('formatTokenCount', () => {
@@ -142,5 +148,48 @@ describe('首字用时与速率（第 3 期）', () => {
     expect(avgPerfText({ avgTtftMs: 850 })).toBe('首字 850ms · —')
     expect(avgPerfText({ avgTps: 48.2 })).toBe('首字 — · 48.2 tok/s')
     expect(avgPerfText({ avgTtftMs: 1200, avgTps: 51.5 })).toBe('首字 1.2s · 51.5 tok/s')
+  })
+})
+
+describe('历史视图（第 4 期）', () => {
+  it('HISTORY_RANGES / rangeDaysOf：窗口 key → 天数；未知 key 回退全部(0)', () => {
+    expect(HISTORY_RANGES.map((r) => r.key)).toEqual(['today', '7d', '30d', 'all'])
+    expect(rangeDaysOf('today')).toBe(1)
+    expect(rangeDaysOf('7d')).toBe(7)
+    expect(rangeDaysOf('30d')).toBe(30)
+    expect(rangeDaysOf('all')).toBe(0)
+    expect(rangeDaysOf('bogus')).toBe(0)
+  })
+
+  it('todayDayKey：与服务端 utc8DayKey 同形（YYYY-MM-DD）', () => {
+    expect(todayDayKey()).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+  })
+
+  it('trendBars：取前 N 根、标记今天、token 合计 = 输入+输出', () => {
+    const history = [
+      { day: todayDayKey(), totals: { requests: 3, inputTokens: 100, outputTokens: 50 } },
+      { day: '2026-10-04', totals: { requests: 1, inputTokens: 10, outputTokens: 5 } },
+      { day: '2026-10-03', totals: { requests: 0, inputTokens: 0, outputTokens: 0 } },
+    ]
+    const bars = trendBars(history)
+    expect(bars).toHaveLength(3)
+    expect(bars[0]!.isToday).toBe(true)
+    expect(bars[0]!.tokens).toBe(150)
+    expect(bars[2]!.tokens).toBe(0)
+    // maxBars 截断
+    expect(trendBars(history, 2)).toHaveLength(2)
+    expect(trendBars(undefined)).toEqual([])
+  })
+
+  it('barHeightPercent：按最大值等比；保底 4%；零值/无数据为 0', () => {
+    expect(barHeightPercent(150, 300)).toBe(50)
+    expect(barHeightPercent(3, 300)).toBe(4) // 保底可见
+    expect(barHeightPercent(0, 300)).toBe(0)
+    expect(barHeightPercent(150, 0)).toBe(0)
+  })
+
+  it('historyTitle：窗口 key → 标题；未知回退「全部」', () => {
+    expect(historyTitle('7d')).toBe('历史用量 · 近 7 天')
+    expect(historyTitle('bogus')).toBe('历史用量 · 全部')
   })
 })

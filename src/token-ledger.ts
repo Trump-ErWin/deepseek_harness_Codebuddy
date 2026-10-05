@@ -218,6 +218,26 @@ export function resetLedgerAccountsForTests(): void {
 let persistenceHook: ((day: string, entry: TokenLedgerEntry) => void) | undefined
 
 /**
+ * 历史视图（第 4 期）的**日聚合表读取器**挂载点。
+ *
+ * ⚠️ 与 {@link attachTokenLedgerPersistence} 同因：账本是模块级单例、没有
+ * ctx；而 RPC（`jet-hub-rpc.ts`）需要读**落盘的历史日聚合** —— 通过这个
+ * 挂载点拿（`index.ts` 启动时把 store 的 `load` 绑进来），而不是给
+ * `registerJetHubRpc` 再加一个形参（该函数已因位置传参错位复发过 6 次）。
+ */
+let historyReader: (() => TokenLedgerDayMap) | undefined
+
+/** 注入历史读取器（插件启动时调用一次；传 `undefined` = 卸载）。 */
+export function attachTokenLedgerHistoryReader(reader: (() => TokenLedgerDayMap) | undefined): void {
+  historyReader = reader
+}
+
+/** RPC 侧读取日聚合表；未挂载（headless 等）返回空表。 */
+export function readTokenLedgerDayMap(): TokenLedgerDayMap {
+  return historyReader?.() ?? new Map()
+}
+
+/**
  * 注入持久化回调（插件启动时调用一次）。
  *
  * @param hook - 收到 **UTC+8 日键**与该笔记录；实现方自行做日聚合与落盘节流。
@@ -571,3 +591,130 @@ export function mergeDayEntry(days: TokenLedgerDayMap, entry: TokenLedgerEntry):
   bucket.cacheWriteTokens += entry.cacheWriteTokens ?? 0
   bucket.reasoningTokens += entry.reasoningTokens ?? 0
 }
+
+// ───────────────────────── 历史视图（第 4 期）─────────────────────────
+
+/** 解析日聚合桶键（`channel|provider|account|model`）为结构化键。 */
+function parseDayBucketKey(key: string): TokenLedgerDayKey | undefined {
+  // dayBucketKeyOf 用 `|` 拼接且把值里的 `|` 转义成 `/`，故 split 恒得 4 段。
+  const parts = key.split('|')
+  if (parts.length !== 4) return undefined
+  const [channel, provider, accountId, model] = parts
+  if (channel !== 'direct' && channel !== 'gateway') return undefined
+  return { channel, provider, accountId: accountId ?? '', model: model ?? '' }
+}
+
+/** 一天的历史用量行（`readTokenLedgerHistory` 的返回元素）。 */
+export interface TokenLedgerHistoryDay {
+  /** UTC+8 日键（`YYYY-MM-DD`）。 */
+  day: string
+  channels: TokenLedgerChannelRow[]
+  totals: Omit<TokenLedgerModelRow, 'model'>
+}
+
+/**
+ * 从日聚合表读取**历史视图**（可按日期范围过滤）。
+ *
+ * ⚠️ 数据源是**落盘的日聚合**（重启保留），与内存明细（500 条、重启清空）
+ * 是**两份独立数据**：历史视图答「本周/本月用了多少」，明细答「每一笔
+ * 长什么样」。读取是纯计算（Map 树 → 数组），不碰磁盘。
+ *
+ * @param days - 日聚合表（store 的 `load()` 结果，含启动时从盘上加载的历史）。
+ * @param options.sinceDays - 只看最近 N 天（**含今天**，UTC+8 日界）；
+ *   省略 = 全部历史（上限 {@link TOKEN_LEDGER_HISTORY_MAX_DAYS}）。
+ */
+export function readTokenLedgerHistory(
+  days: TokenLedgerDayMap,
+  options: { sinceDays?: number } = {},
+): { days: TokenLedgerHistoryDay[]; totals: Omit<TokenLedgerModelRow, 'model'> } {
+  // 过滤窗口：today（UTC+8）往前推 sinceDays-1 天；0/负数按「仅今日」处理。
+  const sinceDaysRaw = options.sinceDays
+  const sinceDays = typeof sinceDaysRaw === 'number' && Number.isFinite(sinceDaysRaw) && sinceDaysRaw > 0
+    ? Math.floor(sinceDaysRaw)
+    : undefined
+  // ⚠️ `utc8DayKey` 内部已做 +8h 平移，这里必须传**原始**时刻：
+  // 先平移再传会让 cutoff 再多 8 小时（cutoff 落到「明天」，连今天都被裁掉）。
+  const todayKey = utc8DayKey(Date.now())
+  const cutoffKey = sinceDays === undefined
+    ? undefined
+    : utc8DayKey(Date.now() - (sinceDays - 1) * 24 * 60 * 60 * 1000)
+
+  const grandTotals = emptyTotals()
+  const historyDays: TokenLedgerHistoryDay[] = []
+  // 日键排序：新在前（字符串比较即时间序，YYYY-MM-DD 是字典序安全的）。
+  const dayKeys = [...days.keys()].sort((a, b) => b.localeCompare(a))
+  for (const day of dayKeys) {
+    if (day > todayKey) continue // 未来键（手工编辑）：不展示也不入合计
+    if (cutoffKey !== undefined && day < cutoffKey) continue // 窗口外
+    const buckets = days.get(day)
+    if (buckets === undefined || buckets.size === 0) continue
+    // ── 一天的桶 → 四级聚合树（复用与内存版相同的两级收尾模式）──
+    const dayTotals = emptyTotals()
+    const channelMap = new Map<'direct' | 'gateway', Map<string, Map<string, Map<string, TokenLedgerDayBucket>>>>()
+    for (const [key, bucket] of buckets) {
+      const parsed = parseDayBucketKey(key)
+      if (parsed === undefined) continue
+      let providers = channelMap.get(parsed.channel)
+      if (providers === undefined) {
+        providers = new Map()
+        channelMap.set(parsed.channel, providers)
+      }
+      const accountKey = parsed.accountId.length > 0 ? parsed.accountId : '-'
+      let accounts = providers.get(parsed.provider)
+      if (accounts === undefined) {
+        accounts = new Map()
+        providers.set(parsed.provider, accounts)
+      }
+      let models = accounts.get(accountKey)
+      if (models === undefined) {
+        models = new Map()
+        accounts.set(accountKey, models)
+      }
+      models.set(parsed.model, bucket)
+    }
+    const channels: TokenLedgerChannelRow[] = [...channelMap.entries()]
+      .sort(([a], [b]) => (a === 'direct' ? -1 : 1) - (b === 'direct' ? -1 : 1))
+      .map(([channel, providers]) => {
+        const channelTotals = emptyTotals()
+        const providerRows: TokenLedgerProviderRow[] = [...providers.entries()].map(([provider, accounts]) => {
+          const providerTotals = emptyTotals()
+          const accountRows: TokenLedgerAccountRow[] = [...accounts.entries()].map(([accountId, models]) => {
+            const accountTotals = emptyTotals()
+            const modelRows: TokenLedgerModelRow[] = [...models.entries()].map(([model, bucket]) => {
+              for (const k of Object.keys(bucket) as (keyof typeof bucket)[]) {
+                accountTotals[k] += bucket[k] ?? 0
+              }
+              return { model, ...finalizeAverages(bucket) }
+            }).sort((a, b) => sumTokens(b) - sumTokens(a))
+            for (const k of Object.keys(accountTotals) as (keyof typeof accountTotals)[]) {
+              providerTotals[k] += accountTotals[k] ?? 0
+            }
+            return { accountId, models: modelRows, totals: finalizeAverages(accountTotals) }
+          }).sort((a, b) => sumTokens(b.totals) - sumTokens(a.totals))
+          for (const k of Object.keys(providerTotals) as (keyof typeof providerTotals)[]) {
+            channelTotals[k] += providerTotals[k] ?? 0
+          }
+          return { provider, accounts: accountRows, totals: finalizeAverages(providerTotals) }
+        }).sort((a, b) => sumTokens(b.totals) - sumTokens(a.totals))
+        // 日小计 = 其各渠道之和
+        for (const k of Object.keys(channelTotals) as (keyof typeof channelTotals)[]) {
+          dayTotals[k] += channelTotals[k] ?? 0
+        }
+        return { channel, providers: providerRows, totals: finalizeAverages(channelTotals) }
+      })
+    // 全局合计按**日**累加（Σ/份数直加），不是日均值的均值。
+    accumulateBucket(grandTotals, dayTotals)
+    historyDays.push({ day, channels, totals: finalizeAverages(dayTotals) })
+  }
+  return { days: historyDays, totals: finalizeAverages(grandTotals) }
+}
+
+/** 把一个**日聚合桶的合计**累加进另一个累加器（历史全局合计用）。 */
+function accumulateBucket(target: AccumulatingTotals, source: AccumulatingTotals): void {
+  for (const key of Object.keys(source) as (keyof typeof source)[]) {
+    target[key] += source[key] ?? 0
+  }
+}
+
+/** 历史视图的最大回看天数（防一次下发过大；落盘本身已有 90 天淘汰）。 */
+export const TOKEN_LEDGER_HISTORY_MAX_DAYS = 90
