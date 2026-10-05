@@ -63,6 +63,7 @@ import { GEMINI } from './gemini.js'
 import type { GeminiCredential } from './gemini.js'
 import { createGeminiSigStore } from './gemini-sigstore.js'
 import { registerOpencodeLlm } from './opencode-adapter.js'
+import { registerAutoLlm } from './auto-adapter.js'
 // ⚠️ opencode 的 RPC 由 `jet-hub-rpc.ts` 的 handleMethod 统一分派
 // （它调 handleOpencodeRpc），本文件**不再**单独注册端点 —— 详见
 // `opencode-rpc.ts` 模块头「为什么是被主 switch 调用」。
@@ -1953,5 +1954,9 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // ⚠️ 它依赖 `agents` 服务，故内部用 `ctx.inject(['agents'], …)` 挂载：
   // 该服务缺席的 profile 里本功能整体不生效，不会让插件永久 pending。
   installLoopResume(ctx)
+  // Jet Hub「自动」：一个 `auto` 模型名用整池，按「积分最快作废」跨 provider 选型
+  // （见 `auto-adapter.ts` 模块头）。注册放在全部 provider 适配器之后：它经
+  // ctx.llm 公开路径委托目标适配器，目录/凭据此时均已就绪。
+  registerAutoLlm(ctx, { accountPool: pool })
   ctx.provide('accountPool', pool)
 }
