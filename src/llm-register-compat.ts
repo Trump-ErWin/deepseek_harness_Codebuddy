@@ -113,12 +113,146 @@ export interface AdapterRegisterTarget {
   registerAdapter(providers: readonly string[], adapter: unknown): unknown
 }
 
+import { recordTokenUsage } from './token-ledger.js'
+import { channelOfOptions } from './openai-gateway/channel.js'
+
+/**
+ * dsh-llm 对 adapter 的最小形状契约（本文件只包 `stream`，其余方法原样透传）。
+ */
+export interface StreamCapableAdapter {
+  stream(options: never): AsyncIterable<unknown>
+  [key: string]: unknown
+}
+
+/**
+ * 把适配器包上 **Token 记账**（issue「本地 Token 计数」第 1 期的单点接入）。
+ *
+ * ## 为什么要在这里包（而不是改 13 个适配器）
+ *
+ * 全部 provider 的注册都收敛到 {@link registerAdapterIdempotent} —— 在它内部
+ * 包一层，一处代码覆盖全仓库，且**完全不碰各适配器的推理路径**。包装只做三件事：
+ *
+ * 1. 透传 `stream()` 产出的**每一个** chunk（逐帧 `yield`，不改内容、不改顺序）；
+ * 2. 捕获 `type:'usage'` 的 chunk 写账本（usageReported = true）；
+ * 3. 捕获抛错写账本（usageReported = false + error），然后**原样再抛**——
+ *    记账绝不吞错、也绝不反噬推理（`recordTokenUsage` 自身也不抛）。
+ *
+ * ## 渠道判定
+ *
+ * `options` 上带网关的 `GATEWAY_CHANNEL_MARK`（`src/openai-gateway/channel.ts`
+ * 打标）→ `gateway`，否则 `direct`。打标丢失只会保守记成 direct，不会错账
+ * （见 channel.ts 模块头的退化分析）。
+ *
+ * ## provider / model 的取值
+ *
+ * - provider：注册时的 `providers[]`（路由名，与 UI 的 provider 一致）；
+ * - model：`options.model`（wire 口径）。
+ *
+ * ## ⚠️ 为什么用 Proxy 而不是 `{ ...adapter }` 展开（真实缺陷，写完即被测试抓住）
+ *
+ * 适配器是 **class 实例**，`providerInfo` / `listModels` / `resolveModel` 等
+ * 方法都在**原型**上。对象展开只拷贝自有可枚举属性 —— 实例字段会留下，
+ * 但全部原型方法会被丢掉，于是 `listModels()` 变成 "not a function"，
+ * Jet Hub 的模型目录整体失效。`Proxy` 的 get 陷阱把**一切属性访问**转给
+ * 原适配器（含原型链），只有 `stream` 被截获替换 —— 语义是「同一个适配器，
+ * 换了个带记账的 stream」，而不是「拷贝了一个看起来像的」。
+ *
+ * ⚠️ **重复注册分支不包**：重启竞态时保留的是**上一轮已包装的路由**（同一代码），
+ * 对它再包一层只会造成双记。`try` 分支（新注册）才包装。
+ */
+export function wrapAdapterWithTokenLedger<T extends object>(providers: readonly string[], adapter: T): T {
+  const provider = providers[0] ?? ''
+  return new Proxy(adapter, {
+    get(target, prop, receiver) {
+      if (prop !== 'stream') return Reflect.get(target, prop, target)
+      // ⚠️ `this` 必须绑回**原适配器**（target 而不是 proxy）：真实适配器的
+      // 私有字段（`#field`）对 proxy 的 this 不可见，绑 proxy 会抛 TypeError。
+      return (options: never) => {
+        const channel = channelOfOptions(options)
+        const model = String((options as { model?: unknown })?.model ?? '').slice(0, 160)
+        const startedAt = Date.now()
+        return recordThroughStream(
+          () => (target as unknown as StreamCapableAdapter).stream.call(target, options) as AsyncIterable<unknown>,
+          { channel, provider, model, startedAt },
+        )
+      }
+    },
+  })
+}
+
+/**
+ * 包住一次流式调用的**记账骨架**（与 {@link wrapAdapterWithTokenLedger} 配套）。
+ *
+ * 独立成函数是为了能用假适配器做行为单测（不必起真实 provider）。
+ * 语义：
+ * - 正常结束且没等到 usage ⇒ 记 `usageReported: false`（显示 `—` 不显示 0）；
+ * - 流内出现过 usage（哪怕 0 token）⇒ 记 `usageReported: true`；
+ * - 抛错 ⇒ 记失败行后**原样再抛**（记账不吞错）；
+ * - `finally` 兜底记 `durationMs`（cancel/提前 return 也算一笔）。
+ */
+export async function* recordThroughStream(
+  openStream: () => AsyncIterable<unknown>,
+  meta: { channel: 'direct' | 'gateway'; provider: string; model: string; startedAt: number },
+): AsyncIterable<unknown> {
+  let usageReported = false
+  let inputTokens = 0
+  let outputTokens = 0
+  let cacheReadTokens: number | undefined
+  let cacheWriteTokens: number | undefined
+  let reasoningTokens: number | undefined
+  let failure: string | undefined
+  try {
+    for await (const chunk of openStream()) {
+      if (
+        typeof chunk === 'object' && chunk !== null
+        && (chunk as { type?: unknown }).type === 'usage'
+      ) {
+        // dsh-llm 契约：usage chunk 的形状 { type:'usage', usage: TokenUsage }。
+        const usage = (chunk as { usage?: Record<string, unknown> }).usage
+        if (typeof usage === 'object' && usage !== null) {
+          usageReported = true
+          inputTokens = Number(usage.inputTokens)
+          outputTokens = Number(usage.outputTokens)
+          if (Number(usage.cacheReadTokens) > 0) cacheReadTokens = Number(usage.cacheReadTokens)
+          if (Number(usage.cacheWriteTokens) > 0) cacheWriteTokens = Number(usage.cacheWriteTokens)
+          if (Number(usage.reasoningTokens) > 0) reasoningTokens = Number(usage.reasoningTokens)
+        }
+      }
+      yield chunk
+    }
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error)
+    throw error
+  } finally {
+    // ⚠️ finally 里记账（而不是成功分支）：cancel / 提前 return / 抛错都必须落账。
+    // durationMs 用「现在 − 发起」：成功与失败同口径，就是请求全程耗时。
+    recordTokenUsage({
+      channel: meta.channel,
+      provider: meta.provider,
+      model: meta.model,
+      usageReported,
+      inputTokens,
+      outputTokens,
+      ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+      ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
+      ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+      durationMs: Date.now() - meta.startedAt,
+      ...(failure !== undefined ? { error: failure } : {}),
+    })
+  }
+}
+
 /**
  * 幂等版的 `ctx.llm.registerAdapter`。
  *
  * ⚠ 重复场景下的行为：保留现有 adapter 路由（重启竞态，见模块头）。
  * ⚠ 返回 dsh-llm 的 handle（含 `.replace()`）——重复分支没有 handle 可还，
  * 返回 `undefined`；调用方若需要 replace 能力应保存成功路径的返回值。
+ *
+ * ## 顺带做 Token 记账包装
+ *
+ * ⚠ 成功路径注册的是**记账包装**（`wrapAdapterWithTokenLedger`），重复分支
+ * **不再包一层**（上一轮已是包装后的路由，再包会双记）。
  *
  * ## 顺带做「已失效模型」剔除包装
  *
@@ -128,6 +262,37 @@ export interface AdapterRegisterTarget {
  *
  * ⚠ 包装失败**不阻断注册** —— 它只是显示层的收敛，回退到原适配器即可，
  * 不能因为它挂掉导致整个 provider 起不来。
+ *
+ * ## ⚠⚠️ 两层包装的嵌套顺序是语义性的，不可调换
+ *
+ * 顺序必须是 **记账在内、剔除在外**：
+ *
+ * ```ts
+ * withDeadModelPruning(providers, wrapAdapterWithTokenLedger(providers, adapter))
+ * ```
+ *
+ * **依据**（dsh-llm 0.1.2-rc.1 实测）：`LlmRuntime.adapterStream` 走的是
+ * `adapter.prepareCall(...)` 返回的 `adapterCall.stream(options)`
+ * （`dsh-llm/lib/index.js` 的 `dispatch = (options) => adapterCall.stream(options)`），
+ * **不直接调用顶层 `adapter.stream`**。而本仓库**全部**适配器的 `prepareCall`
+ * 都写成转发形式：
+ *
+ * ```ts
+ * stream: (options) => this.stream(options)
+ * ```
+ *
+ * ⇒ 记账是否生效，取决于 `prepareCall` 执行时 **`this` 指向谁**：
+ *
+ * - 记账在内（正确）：剔除 Proxy 的 `get` 陷阱用 `target.prepareCall.apply(obj, …)`
+ *   调用，`obj` 是它包着的**记账 Proxy** ⇒ `this` = 记账 Proxy ⇒
+ *   `this.stream` 命中记账的 get 陷阱 ⇒ **记账生效**；随后剔除层再包返回的
+ *   `call.stream` ⇒ 两层都生效。
+ * - 记账在外（错误）：`this` 落到**裸适配器** ⇒ `this.stream` 是原始方法、
+ *   绕过记账 Proxy ⇒ **记账静默失效**（请求照常跑，账本永远是空的 ——
+ *   这种"看起来正常"的失效最难发现）。
+ *
+ * 回归用例：`tests/unit/token-ledger-wiring.spec.ts` 的
+ * 「两层包装的嵌套顺序」段（按 dsh-llm 的 `prepareCall → call.stream` 真实路径驱动）。
  */
 export function registerAdapterIdempotent(
   llm: AdapterRegisterTarget,
@@ -135,13 +300,15 @@ export function registerAdapterIdempotent(
   adapter: unknown,
   warn?: (message: string) => void,
 ): unknown {
-  let target = adapter
+  // ⚠️ 顺序语义（见函数 doc）：**记账在内、剔除在外**。
+  //    剔除 Proxy 调用 prepareCall 时 this 绑到它包着的记账 Proxy，
+  //    于是 this.stream 命中记账陷阱；反过来则 this 落到裸适配器、记账被绕过。
+  let target = wrapAdapterWithTokenLedger(providers, adapter as object)
   if (typeof adapter === 'object' && adapter !== null) {
     try {
-      target = withDeadModelPruning(providers, adapter)
+      target = withDeadModelPruning(providers, target)
     } catch (error) {
       warn?.(`[llm-register] 已失效模型剔除包装失败，使用原适配器: ${String(error)}`)
-      target = adapter
     }
   }
   try {
