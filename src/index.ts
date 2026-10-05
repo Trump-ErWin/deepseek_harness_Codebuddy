@@ -35,6 +35,7 @@ import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { installLoopResume } from './loop-recovery.js'
 import {
+  attachTokenLedgerHistoryReader,
   attachTokenLedgerPersistence,
   reportLedgerAccount,
 } from './token-ledger.js'
@@ -306,11 +307,14 @@ export function apply(ctx: Context): void {
   // dispose 时 flush + 摘钩子：插件热重载后新实例会重新挂，避免旧 store 继续收账。
   const tokenLedgerStore = createTokenLedgerStore(ctx)
   attachTokenLedgerPersistence((day, entry) => tokenLedgerStore.append(entry))
+  // 历史视图（第 4 期）：RPC 的 usage.tokenLedgerHistory 读这份日聚合表。
+  attachTokenLedgerHistoryReader(() => tokenLedgerStore.load())
   ctx.effect(() => () => {
     try {
       tokenLedgerStore.flush()
     } finally {
       attachTokenLedgerPersistence(undefined)
+      attachTokenLedgerHistoryReader(undefined)
     }
   }, 'token-ledger-persistence')
 
