@@ -1084,9 +1084,12 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
     try {
       await rpcCall('model.clearDead', { provider, modelId });
       if (!mounted.current) return;
-      // 该模型重新进入目录：`dead` 清掉，展示名要等下一次 model.list 才能补全，
-      // 这里先沿用现有条目（id 至少可见），避免整表重载导致弹窗闪烁。
-      setModels(prev => (prev || []).map(m => (m.id === modelId ? { ...m, dead: false } : m)));
+      // ⚠️ **必须整表重载，不能只翻 `dead` 标志**（2026-10-06 复审实测）：
+      // 该模型重新进入目录后展示名要靠 `listAllModels()` 才能拿全 ——
+      // 而设置页里原先那条是端点用**裸 id** 补回的（`{ id, name: id }`，
+      // 见 `jet-hub-rpc.ts` 的 dead 回填路径）。只翻标志会让它继续显示裸 id，
+      // 用户要点「刷新」或重开面板才看得到真名。与 `restoreAllDead` 保持一致。
+      await load();
     } catch (caught) {
       console.error('[jet-hub] restore dead model failed:', caught);
       if (!mounted.current) return;

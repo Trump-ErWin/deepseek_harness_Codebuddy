@@ -139,8 +139,18 @@ const GONE_PATTERNS: readonly RegExp[] = [
   /model\s+not\s+found/i,
   /(?:unknown|no\s+such|nonexistent)\s+model/i,
   // ⚠️ OpenAI 标准的 `model_not_found` / `model-not-found` 形态。
-  // 安全性依据：它必然是**模型**主语 + **不存在**语义，不会误伤能力/套餐类文案。
-  /\bmodel[_\-]not[_\-]found\b/i,
+  //
+  // ⚠️⚠️ 必须要求它**独占一句话成分**（2026-10-06 复审实测）：只加 `\b` 词边界
+  // 不够 —— `model_not_found` 在**遥测/日志文案**里常作为**字段名**出现，后面
+  // 紧跟别的内容：
+  //   error_class=model_not_found, retry allowed      → 初版误判下架
+  //   the model_not_found metric was not exported     → 初版误判下架
+  //   model_not_found_reason=upstream                 → 初版误判下架
+  // 误判会把**可用模型藏 30 天**且用户需手动恢复。
+  //
+  // ⇒ 后面**只允许**：① 结束；② 句末标点（`.` `!` `?` `;`）；③ 收尾括号/引号；
+  // **不含逗号**（`…not_found, retry allowed` 里逗号后仍是另一个字段 ⇒ 不算阳性）。
+  /\bmodel[_\-]not[_\-]found\b(?=\s*(?:[.!;?)}\]'"]|$))/i,
 ]
 
 /**
@@ -392,21 +402,42 @@ function ensureStore(): DeadModelStore {
 export function configureDeadModelStore(ctx: Context): void {
   logger = ctx.logger
   injectedCtx = ctx
-  // home 取决于注入的 ctx，故丢弃既有后端与内存镜像，下次访问时按新 ctx 重建。
+  // ⚠️⚠️ **落盘成功才允许丢弃内存镜像**（2026-10-06 复审实测 + 反向验证）：
+  // 本函数在 HMR / fiber 重启时会被再调一次（`llm-register-compat.ts` 的模块头
+  // 记录了那个重启竞态）。若无条件 `cache = undefined`，**尚未落盘的记录**就
+  // 永久丢失 —— 在**降级路径**（home 定位失败 / 目录不可写，只存在于内存）下
+  // 是真实的数据丢失。
+  //
+  // ⚠️ **判据是「落盘成功」，不是「有记录」**：落盘失败时必须**保留 cache**
+  // （新 home 可能仍不可写，清掉就彻底没了）。探针实测：把 `persist()` 的成功
+  // 判据去掉后，本用例立刻红（`expected [] to deeply equal ['mem-only']`）。
+  if (cache !== undefined && Object.keys(cache).length > 0 && tryPersist()) {
+    store = undefined
+    cache = undefined
+    return
+  }
+  // home 取决于注入的 ctx，故丢弃既有后端，下次访问时按新 ctx 重建
+  //（`cache` 保留：它要么为空，要么是上面未能落盘的那份，绝不能丢）。
   store = undefined
-  cache = undefined
 }
 
-/** 写回（失败只记日志，不影响调用方）。 */
-function persist(prunedCount = 0): void {
+/** 写回并报告是否**真的落盘成功**（失败只记日志，不抛）。 */
+function tryPersist(prunedCount = 0): boolean {
   try {
     ensureStore().save(cache ?? {})
     if (prunedCount > 0) {
       logger?.warn(`[jet-hub] 已失效模型记录清理 ${prunedCount} 条（超过 TTL）`)
     }
+    return true
   } catch (error) {
     logger?.warn(`[jet-hub] 已失效模型记录写入失败: ${String(error)}`)
+    return false
   }
+}
+
+/** 写回（失败只记日志，不影响调用方）。 */
+function persist(prunedCount = 0): void {
+  tryPersist(prunedCount)
 }
 
 /** 读入并做 TTL 剪枝（结果缓存）。 */
