@@ -244,8 +244,18 @@ export interface RpcRefreshAccountRequest {
   accountId: string
 }
 export interface RpcRefreshAccountResponse {
+  /**
+   * ⚠️ **只可能为 `true`**：续期失败**不回**本响应，而是回
+   * `{ok:false, error:{code:'bad-request', message}}`（Gitee issue IKJOZA）。
+   *
+   * 此前失败被包成 `{ok:true, value:{success:false}}`，而客户端
+   * `unwrapRpcResult` 只判 `ok` —— 只判 `ok` 的调用方会把失败读成成功
+   * （报告方一个工具因此把 17/18 次失败显示成「✅」）。
+   *
+   * ⇒ 判定失败**只有一个**判据：顶层 `ok === false`（或 catch 住 `unwrapRpcResult`
+   * 抛出的 `Error`，其 `message` 即 `error.message`）。
+   */
   success: boolean
-  error?: string
 }
 
 /**
@@ -474,7 +484,7 @@ export interface RpcLoomyPermanentLockResponse {
  *
  * ⚠️ 判据不同但**开关语义相同**（「只消耗会近期作废的积分」），故共用一个端点
  * 与一张持久化表，而不是每个 provider 加一条 case —— 平行分支越多，漏接概率越高
- * （WorkBuddy 的「刷新」按钮就是这么一直坏着的）。
+ * （`account.refresh` 端点对 workbuddy 漏接 case 就是这么一直坏着的）。
  *
  * `locked` 省略表示**只读查询**；给出布尔值表示写入。
  */
