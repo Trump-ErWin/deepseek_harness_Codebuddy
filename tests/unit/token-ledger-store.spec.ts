@@ -353,6 +353,55 @@ describe('createTokenLedgerStore（文件后端）', () => {
     }
   })
 
+  /**
+   * ★ 回归（审计变异测试发现真缺口）：**纯失败请求必须落盘**。
+   *
+   * 一笔 `usageReported: false` 的失败请求，其 token 字段**全为 0**，但
+   * `requests` / `errors` 各为 1。若 `isZeroBucket` 的判据被收窄成「只看 token」
+   * 它就会被当成「零增量」跳过 ⇒ **失败次数永远不入盘**（UI 的失败行与错误计数
+   * 静默丢失）。
+   *
+   * ⚠️ 本用例守护的正是 `isZeroBucket` 的**全字段**判据：实测把该函数改成
+   * 「只查 inputTokens/outputTokens」后，其余 11 条用例**全部仍绿**，只有本条变红。
+   */
+  it('★ 纯失败请求（token 全 0 但 requests/errors 为 1）必须落盘', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-failed-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    try {
+      const file = join(home, 'jet-hub', 'token-ledger.json')
+      const key = 'direct|codearts||GLM-5.2'
+      const today = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+      type Bucket = { requests: number; errors: number; reportedRequests: number; inputTokens: number }
+      const bucket = (): Bucket | undefined => {
+        const doc = JSON.parse(readFileSync(file, 'utf-8')) as { days?: Record<string, Record<string, Bucket>> }
+        return doc.days?.[today]?.[key]
+      }
+      const failed = {
+        ...makeEntry({ inputTokens: 0, outputTokens: 0 }),
+        usageReported: false,
+        error: 'upstream 502',
+      }
+
+      const store = createTokenLedgerStore({ logger: undefined } as never)
+      store.append({ ts: Date.now(), ...failed })
+      store.flush()
+      expect(bucket()?.requests, '失败请求必须计入 requests').toBe(1)
+      expect(bucket()?.errors, '失败请求必须计入 errors').toBe(1)
+      expect(bucket()?.inputTokens).toBe(0)
+
+      // 第二笔纯失败：增量必须继续累加（不是被"看起来全 0"吞掉）
+      store.append({ ts: Date.now(), ...failed })
+      store.flush()
+      expect(bucket()?.requests).toBe(2)
+      expect(bucket()?.errors).toBe(2)
+      expect(bucket()?.reportedRequests, '未报 usage 的请求不计入 reportedRequests').toBe(0)
+    } finally {
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
   it('account 维度进入桶键（第 2 期）', () => {
     const home = mkdtempSync(join(tmpdir(), 'token-ledger-store-'))
     const prev = process.env.DSH_JET_HUB_STATE_DIR
