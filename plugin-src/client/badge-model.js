@@ -44,7 +44,7 @@
  * （真实报障，2026-10-03）。详见 `credits-format.js` 文件头。
  */
 
-import { formatUnits, formatQuotaLine, normalizeUnit, unitLabel, QUOTA_UNIT } from './credits-format.js';
+import { formatUnits, formatQuota, formatQuotaLine, normalizeUnit, unitLabel, QUOTA_UNIT } from './credits-format.js';
 import { quotaWindowsOf, quotaPercentValue, quotaTone } from './quota-format.js';
 
 /**
@@ -194,11 +194,25 @@ export function creditGroupsOf(accounts) {
       const line = formatQuotaLine(balance.packages, unit);
       group.quotaLines = group.quotaLines ?? [];
       group.quotaRemainings = group.quotaRemainings ?? [];
+      // ⚠️ `quotaWindows` 按**窗口名**聚合（键 = 包名，值 = 该窗口跨账号的**最小**
+      // 剩余百分比）。多账号时 `quotaLines` 会退化成「每个账号一行、全部拼起来」，
+      // 实测两个 Gemini 账号得到 4 段：
+      //   `5 小时窗口 82% · 周窗口 79% · 5 小时窗口 98% · 周窗口 98%`
+      // —— 胶囊里必然被省略号截断，且同一个窗口名重复出现、读者无法比对。
+      //
+      // 取 **min**（最紧张的那个账号）而不是均值：与 {@link toneOf} 的判据同源
+      //（它也用 `Math.min(...quotaRemainings)`）。若这里取均值，会出现
+      //「圆点已报警、数字看着还挺多」的自相矛盾。
+      group.quotaWindows = group.quotaWindows ?? new Map();
       if (line !== null) group.quotaLines.push(line);
       for (const pkg of Array.isArray(balance.packages) ? balance.packages : []) {
-        if (pkg && typeof pkg.remaining === 'number' && Number.isFinite(pkg.remaining)) {
-          group.quotaRemainings.push(pkg.remaining);
-        }
+        if (!pkg) continue;
+        const remaining = pkg.remaining;
+        if (typeof remaining !== 'number' || !Number.isFinite(remaining)) continue;
+        group.quotaRemainings.push(remaining);
+        const name = pkg.name || '未命名';
+        const prev = group.quotaWindows.get(name);
+        if (prev === undefined || remaining < prev) group.quotaWindows.set(name, remaining);
       }
     }
     byUnit.set(unit, group);
@@ -466,6 +480,26 @@ function readingOf({ mode, windows, planGroups, groups, accounts, failedCount })
      */
     const quotaGroup = groups.find((group) => group.unit === QUOTA_UNIT);
     if (quotaGroup !== undefined) {
+      /**
+       * ⚠️ 折叠态读数用**按窗口名聚合**的结果，不是逐账号行。
+       *
+       * 逐账号行（`quotaLines`）在多账号下会拼成一长串 —— 实测两个 Gemini 账号：
+       *   `5 小时窗口 82% · 周窗口 79% · 5 小时窗口 98% · 周窗口 98%`
+       * 胶囊里必然截断，而且同一个窗口名出现两次、读者反而没法判断「到底还剩多少」。
+       *
+       * 聚合后每个窗口只出现一次，取**跨账号最紧张**的那个值 —— 与圆点色调
+       *（{@link toneOf} 用 `Math.min(...quotaRemainings)`）同源，不会出现
+       *「点报警了但数字看着还挺多」。
+       *
+       * ⚠️ 单账号时结果与逐账号行**逐字相同**（聚合只有一个来源），故既有行为不变。
+       * 逐账号明细仍走弹窗（`quotaLines`），那里空间足够、也不该丢账号粒度。
+       */
+      const windows = quotaGroup.quotaWindows;
+      if (windows !== undefined && windows.size > 0) {
+        const parts = [...windows.entries()]
+          .map(([name, remaining]) => `${name} ${formatQuota(remaining) ?? '?'}`);
+        if (parts.length > 0) return { detail: '', reading: parts.join(' · ') };
+      }
       const lines = quotaGroup.quotaLines ?? [];
       if (lines.length === 0) return { detail: '', reading: '额度不可用' };
       return { detail: '', reading: lines.join(' · ') };
