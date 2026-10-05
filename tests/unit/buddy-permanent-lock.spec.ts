@@ -61,27 +61,47 @@ describe('index.ts 的接线', () => {
   })
 
   /**
-   * ⚠️ 两个 provider 必须各有一个 selector 实例。
+   * ⚠️ 每个 provider 必须各有**自己的** selector 实例。
    * 共用一份缓存会让 CodeBuddy 的余额结果被 WorkBuddy 读到（键是账号 id，
    * 两站账号 id 不同，看似不会撞 —— 但凭据解析与 endpoint 都跟着 product 走，
    * 共用实例等于把「两站同构」这一前提写死进运行时）。
+   *
+   * ⚠️ 2026-10-06 起 TRAE / LobsterAI 也接了同一套编排，故实例数由 2 变 4。
+   * 本用例改为「**每个支持锁定的 provider 各一个**」—— 数量随白名单走，
+   * 而不是写死 2（写死会让下次加 provider 时这条无关断言先红）。
    */
-  it('CodeBuddy 与 WorkBuddy 各建一个选号器', () => {
+  it('每个支持锁定的 provider 各建一个选号器', () => {
     expect(indexCode).toMatch(/const buddyBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: CODEBUDDY,/)
     expect(indexCode).toMatch(/const workbuddyBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: WORKBUDDY,/)
-    expect(indexCode.match(/new BuddyBalanceSelector\(/g)).toHaveLength(2)
+    expect(indexCode).toMatch(/const traeBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: TRAE,/)
+    expect(indexCode).toMatch(/const lobsteraiBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: LOBSTERAI,/)
+    expect(indexCode.match(/new BuddyBalanceSelector\(/g)).toHaveLength(4)
   })
 
   it('凭据解析函数两站共用一份（同协议，差别只在 endpoint）', () => {
     expect(indexCode).toContain('const resolveBuddyCredentialByRef =')
-    // 三处引用：两个 selector 的依赖 + 编排调用时的凭据解析器
-    expect(indexCode.match(/resolveCredential: resolveBuddyCredentialByRef/g)).toHaveLength(3)
+    // 三处引用：两个 selector 的依赖 + 编排的缺省解析器（泛化后带类型断言，故不匹配整行）
+    const refs = indexCode.match(/resolveBuddyCredentialByRef/g) ?? []
+    expect(refs.length).toBeGreaterThanOrEqual(4) // 1 处定义 + 3 处使用
+    expect(indexCode).toContain('options.resolveCredential')
   })
 
-  it('两个 provider 的 resolveCredential 都走选号编排', () => {
+  it('所有走选号编排的 provider 都调 pickBuddyCredential', () => {
     expect(indexCode).toMatch(/const picked = await pickBuddyCredential\(\{\s*\n\s*product: CODEBUDDY,/)
     expect(indexCode).toMatch(/const picked = await pickBuddyCredential\(\{\s*\n\s*product: WORKBUDDY,/)
-    expect(indexCode.match(/await pickBuddyCredential\(\{/g)).toHaveLength(2)
+    expect(indexCode).toMatch(/const picked = await pickBuddyCredential\(\{\s*\n\s*product: TRAE,/)
+    expect(indexCode).toMatch(/const picked = await pickBuddyCredential\(\{\s*\n\s*product: LOBSTERAI,/)
+    expect(indexCode.match(/await pickBuddyCredential\(\{/g)).toHaveLength(4)
+  })
+
+  /**
+   * ⚠️ 非 buddy 的 provider **必须**传自己的解析器：编排的缺省值是 buddy 系那一份，
+   * 而 TRAE / LobsterAI 的凭据结构不同（`TraeCredential` 有 uid/machine_id、
+   * `LobsteraiCredential` 另有字段）—— 用错解析器会静默产出错误形状的凭据。
+   */
+  it('★ TRAE / LobsterAI 显式传自己的凭据解析器（不得落到 buddy 缺省值）', () => {
+    expect(indexCode).toContain('resolveCredential: resolveTraeCredentialByRef,')
+    expect(indexCode).toContain('resolveCredential: resolveLobsteraiCredentialByRef,')
   })
 
   /**

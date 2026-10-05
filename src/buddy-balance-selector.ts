@@ -100,15 +100,28 @@ export type BuddySelectionResult
   = { ok: true; account: BuddyCandidateAccount; balance: BuddyAccountBalanceEntry }
   | { ok: false; reason: BuddyNoAccountReason }
 
-/** 选号依赖（便于单测注入）。 */
-export interface BuddySelectionDeps {
-  product: BuddyProduct
+/**
+ * 选号依赖（便于单测注入）。
+ *
+ * ⚠️ **泛型化**（2026-10-06）：分档判据只读通用的
+ * `packages[].{ active, remaining, deductionEndTime }`，与 provider 无关，
+ * 故 TRAE / LobsterAI 也复用本选择器。`TProduct` / `TCredential` 让调用方
+ * 保留自己的精确类型（缺省仍是 buddy，既有调用点无需改动）。
+ *
+ * ⚠️ 唯一要求：`fetchBalance` 返回的 `CreditBalance.packages[]` 必须带
+ * `deductionEndTime`（拿不到就归入永久桶，见 `splitBuddyCreditsByExpiry`）。
+ */
+export interface BuddySelectionDeps<
+  TProduct = BuddyProduct,
+  TCredential = BuddyCredential,
+> {
+  product: TProduct
   /** 解析某账号的凭据；返回 undefined 表示不可用。 */
-  resolveCredential: (credentialRef: string) => Promise<BuddyCredential | undefined>
+  resolveCredential: (credentialRef: string) => Promise<TCredential | undefined>
   /** 查询余额（默认真实的 `fetchCreditBalance`，单测注入桩）。 */
   fetchBalance?: (
-    credential: BuddyCredential,
-    product: BuddyProduct,
+    credential: TCredential,
+    product: TProduct,
   ) => Promise<CreditBalance | null>
   /** 注入的 fetch（测试用）。 */
   fetcher?: typeof fetch
@@ -142,13 +155,19 @@ interface CacheEntry {
 /**
  * 余额缓存 + 选号器。
  *
- * 生命周期与 provider 的适配器注册一致（**CodeBuddy 与 WorkBuddy 各一个实例**），
- * 故不存在两站缓存互相串味的可能。
+ * 生命周期与 provider 的适配器注册一致（**每个 provider 各一个实例**），
+ * 故不存在跨站缓存互相串味的可能。
+ *
+ * ⚠️ 泛型参数见 {@link BuddySelectionDeps}；缺省仍是 buddy 系，
+ * 既有调用点（CodeBuddy / WorkBuddy）无需改动。
  */
-export class BuddyBalanceSelector {
+export class BuddyBalanceSelector<
+  TProduct = BuddyProduct,
+  TCredential = BuddyCredential,
+> {
   private readonly cache = new Map<string, CacheEntry>()
 
-  constructor(private readonly deps: BuddySelectionDeps) {}
+  constructor(private readonly deps: BuddySelectionDeps<TProduct, TCredential>) {}
 
   /** 清空缓存（凭据变化、手动刷新余额、领取积分后调用）。 */
   invalidate(accountId?: string): void {
@@ -227,7 +246,7 @@ export class BuddyBalanceSelector {
 
   /** 发一次请求取原料（不做任何分类）。 */
   private async fetchSource(account: BuddyCandidateAccount): Promise<BalanceSource> {
-    let credential: BuddyCredential | undefined
+    let credential: TCredential | undefined
     try {
       credential = await this.deps.resolveCredential(account.credentialRef)
     } catch (error) {
@@ -239,8 +258,11 @@ export class BuddyBalanceSelector {
 
     let balance: CreditBalance | null
     try {
+      // ⚠️ 缺省实现只适用于 buddy 系（凭据结构相同）。其它 provider 必须显式传
+      // `fetchBalance` —— 否则会把异形凭据喂给 `fetchCreditBalance`。
       balance = await (this.deps.fetchBalance
-        ?? ((cred, product) => fetchCreditBalance(cred, product, this.deps.fetcher ?? fetch)))(
+        ?? ((cred: TCredential, product: TProduct) =>
+          fetchCreditBalance(cred as unknown as BuddyCredential, product as unknown as BuddyProduct, this.deps.fetcher ?? fetch)))(
         credential, this.deps.product,
       )
     } catch (error) {
@@ -334,8 +356,11 @@ function failedEntry(id: string, error: string): BuddyAccountBalanceEntry {
  * @param candidates - 已按 `enabled` + 模型限流过滤的候选。
  * @param options - 锁定标志与凭据解析器。
  */
-export async function pickBuddyAccount<TCredential = BuddyCredential>(
-  selector: BuddyBalanceSelector,
+export async function pickBuddyAccount<
+  TCredential = BuddyCredential,
+  TProduct = BuddyProduct,
+>(
+  selector: BuddyBalanceSelector<TProduct, TCredential>,
   candidates: readonly BuddyCandidateAccount[],
   options: {
     /** 是否允许消耗永久积分（= 未锁定）。 */
