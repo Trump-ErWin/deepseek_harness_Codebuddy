@@ -57,6 +57,7 @@ import {
 } from './model-filter.js';
 import {
   groupProviders,
+  nextProviderOrderAfterDrop,
   providerSwitchRows,
   providerToggleSummary,
   summarizeProviderToggle,
@@ -3464,15 +3465,20 @@ function providerRowSummary(row) {
  *   与模型列表里「已关闭的模型」同一语义）+ `dim-jh-modelInfo` / `dim-jh-modelName`
  *   / `dim-jh-modelId`（这里放影响面摘要）+ `dim-jh-switch`；
  * - 排序：已打开在前、已关闭在后（`providerSwitchRows`，与左侧分组同一判据）；
+ *   已打开组支持**拖拽自定义顺序**（`order` prop = 宿主持久化顺序，2026-10-06），
+ *   关闭组恒按声明顺序沉底（用户明确要求「这个逻辑不变」）；
  * - ESC 与点遮罩关闭。
  *
  * ⚠️ 行容器是 `<label>` 且**内部只能有这 1 个 checkbox** —— 与 `ModelToggle` 同一条
  * 约束（见其注释：插入第二个 checkbox 会让「点行内文字」激活错的那个控件）。
+ * 拖拽柄因此只能用 `<span>`，且必须 `preventDefault` 掐掉 label 的激活路径
+ * （见渲染处的注释）。
  *
- * 本组件**不持有数据**：状态、busy 集合与切换动作全部由 `JetHubPage` 传入。
- * 供应商状态是服务端推导出来的（模型黑名单），本地再存一份必然分叉。
+ * 本组件不持有**持久化**数据：状态、busy 集合、切换动作与顺序全部由 `JetHubPage`
+ * 传入；拖拽的视觉状态（正在拖哪行 / 落点在哪）是本组件的局部 UI 状态，drop 时
+ * 通过 `onCommitOrder` 把新顺序交给页面层持久化。
  */
-function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onToggle, onReload, onClose }) {
+function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onToggle, onReload, onClose, order, onCommitOrder, reordering, notice }) {
   // ESC 关闭：挂在 document 上而不是弹窗上 —— 焦点可能落在任意一个开关上，
   // 只监听弹窗自身的 keydown 会漏掉这些按键（与 ModelListPanel 同因）。
   React.useEffect(() => {
@@ -3481,11 +3487,79 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
 
-  const rows = providerSwitchRows(providers, statuses);
+  // 拖拽排序的三件套视觉状态（与 ProviderPanel 的账号拖拽同款）：
+  // 正在拖的行 id / 悬停的目标行 id / 落点方向。真正的顺序变更在 drop 时
+  // 才经 onCommitOrder 提交给页面层持久化。
+  const [draggingId, setDraggingId] = React.useState(null);
+  const [dropTargetId, setDropTargetId] = React.useState(null);
+  const [dropPosition, setDropPosition] = React.useState('before');
+
+  const rows = providerSwitchRows(providers, statuses, order);
   const summary = providerToggleSummary(providers, statuses);
   const countText = summary.known
     ? `共 ${summary.total} 个，已打开 ${summary.open}，已关闭 ${summary.closed}`
     : (statusFailed ? '状态读取失败' : '正在读取状态…');
+
+  // 已打开 ≥2 行才值得拖（与账号面板同款门槛）；任一开关提交中则整体冻结，
+  // 避免「拖到一半那行被停用」造成展示组与拖拽组错位。
+  // ⚠️ `reordering`（排序提交中）也必须计入：提交期间界面顺序未变（不做乐观
+  // 更新），再拖一次会基于旧顺序计算并把上一次移动静默覆盖（账号面板同款，
+  // 那边是 `reordering ? { enabled: false } : dragPropsFor(...)`）。
+  const dragEnabled = rows.filter(row => row.checked).length >= 2
+    && busyIds.size === 0
+    && !reordering;
+
+  /**
+   * 构造某一行的拖拽属性（关闭组或不允许拖时返回 enabled:false）。
+   *
+   * openIds / closedIds 取自 `rows` 而不是 providers+statuses 重算：rows 已经
+   * 是「分组 + 排序」后的最终展示形态，`checked === false` 恰好就是已关闭组
+   * （见 providerSwitchState：closed ⇔ checked=false），且保持声明顺序。
+   */
+  const dragPropsFor = (row) => {
+    if (!row.checked || !dragEnabled) return { enabled: false };
+    return {
+      enabled: true,
+      isDragging: draggingId === row.id,
+      isDropTarget: dropTargetId === row.id && draggingId !== null && draggingId !== row.id,
+      dropPosition,
+      onDragStart: (event) => {
+        setDraggingId(row.id);
+        // 必须设置 dataTransfer，否则 Firefox 不触发拖拽（与账号卡片同因）。
+        try { event.dataTransfer.setData('text/plain', row.id); } catch { /* 忽略 */ }
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+      },
+      onDragEnd: () => {
+        setDraggingId(null);
+        setDropTargetId(null);
+      },
+      onDragOver: (event) => {
+        if (draggingId === null || draggingId === row.id) return;
+        // 必须 preventDefault 才允许 drop。
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+        if (dropTargetId !== row.id) setDropTargetId(row.id);
+        // 按指针在行内的纵向位置决定插到前面还是后面。
+        const rect = event.currentTarget?.getBoundingClientRect?.();
+        const next = dropPositionFromPointer(event.clientY, rect);
+        if (next !== dropPosition) setDropPosition(next);
+      },
+      onDrop: (event) => {
+        event.preventDefault();
+        const sourceId = draggingId;
+        setDraggingId(null);
+        setDropTargetId(null);
+        if (sourceId === null || sourceId === row.id) return;
+        const openIds = rows.filter(r => r.checked).map(r => r.id);
+        const closedIds = rows.filter(r => !r.checked).map(r => r.id);
+        // ⚠️ 必须传当前的 `order`（旧顺序）：已关闭 id 的位置由「它在旧顺序里
+        // 的直接前驱」决定，漏传就退化成按展示序缀尾 —— 关闭期间拖过一次之后
+        // 重开就会掉到末尾（PR #63 初版的真实缺陷）。
+        const next = nextProviderOrderAfterDrop(openIds, closedIds, sourceId, row.id, dropPosition, order);
+        if (next !== null) void onCommitOrder(next);
+      },
+    };
+  };
 
   return React.createElement('div', {
     // `--top`：顶部锚定。行数固定但窗口高度会变，垂直居中会让弹窗上下跳动
@@ -3516,20 +3590,56 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
       }, '完成'))),
   React.createElement('p', { className: 'dim-jh-modalHint' },
     '关闭一个供应商 = 关闭它的全部模型（从对话框的模型选择里移除）并停用它的全部账号；'
-    + '打开则恢复。关闭前会再确认一次。没有可关闭模型的供应商会被禁用（服务端也会拒绝）。'),
+    + '打开则恢复。关闭前会再确认一次。没有可关闭模型的供应商会被禁用（服务端也会拒绝）。'
+    + '拖动已打开的行可自定义顺序（顺序只保存在本机）；已关闭的供应商仍按默认顺序显示在底部。'),
+  // ⚠️ 供应商相关的提示必须在**这里**（弹窗内）显示，不能只挂在页面层：
+  // 拖拽与开关切换都发生在弹窗打开期间，而弹窗遮罩是 fixed + z-index 3000，
+  // 页面层的 notice 会被它整个盖住 —— 用户只会看到「操作没生效，却什么提示都没有」。
+  // ⚠️ 弹窗开着时**显示全部** notice（含 toggleProvider 的结果/失败提示）——
+  // 它们此刻在页面层同样被遮住，只按 inModal 过滤会让切换结果一样消失。
+  // 弹窗关闭即不挂载、页面层那条照旧渲染，两边不会重复出现。
+  // 复用既有 `.dim-jh-probeNotice` + `.dim-jh-modal .dim-jh-probeNotice` 样式，不新增样式。
+  notice
+    ? React.createElement('div', {
+        className: 'dim-jh-probeNotice',
+        'data-tone': notice.tone,
+        role: notice.tone === 'error' ? 'alert' : 'status',
+      }, React.createElement('div', null, notice.text))
+    : null,
   React.createElement('div', { className: 'dim-jh-modalBody' },
     React.createElement('div', { className: 'dim-jh-modelList' },
       rows.map(row => {
         const busy = busyIds.has(row.id);
         const action = row.checked ? '关闭' : '打开';
+        const drag = dragPropsFor(row);
         return React.createElement('label', {
           key: row.id,
           className: 'dim-jh-modelRow',
           // 与模型列表同语义：`data-disabled` 表示**这一项已被关闭**（整行淡出），
           // 不是「这行点不动」—— 点不动由下面 input 的 disabled 表达。
           'data-disabled': row.checked ? 'false' : 'true',
+          // 拖拽排序（与账号卡片同款视觉语言）：源行淡出、落点行画插入线。
+          draggable: drag.enabled ? 'true' : undefined,
+          onDragStart: drag.onDragStart,
+          onDragEnd: drag.onDragEnd,
+          onDragOver: drag.onDragOver,
+          onDrop: drag.onDrop,
+          'data-dragging': drag.isDragging ? 'true' : undefined,
+          'data-dropBefore': drag.isDropTarget && drag.dropPosition !== 'after' ? 'true' : undefined,
+          'data-dropAfter': drag.isDropTarget && drag.dropPosition === 'after' ? 'true' : undefined,
           title: row.disabled ? row.reason : `${action}「${row.label}」：${action}它的全部模型并${row.checked ? '停用' : '启用'}全部账号`,
         },
+        drag.enabled
+          ? React.createElement('span', {
+              className: 'dim-jh-dragHandle',
+              title: '拖动以调整顺序（顺序只保存在本机）',
+              'aria-hidden': 'true',
+              // ⚠️ 行容器是 <label>：点柄的 click 会沿 label 激活开关。preventDefault
+              // 掐掉这条激活路径 —— 拖柄不是开关，点了不该有开关反应（拖拽本身
+              // 不经过 click，互不影响）。
+              onClick: (event) => { event.preventDefault(); event.stopPropagation(); },
+            }, '⠿')
+          : null,
         React.createElement('span', { className: 'dim-jh-modelInfo' },
           React.createElement('strong', { className: 'dim-jh-modelName' }, row.label),
           React.createElement('code', { className: 'dim-jh-modelId' }, providerRowSummary(row))),
@@ -4151,6 +4261,34 @@ export function JetHubPage({ close, rpcCall }) {
   /** 正在提交的供应商 id 集合：只禁用被点的那一个开关。 */
   const [providerBusy, setProviderBusy] = React.useState(() => new Set());
   /**
+   * 供应商自定义显示顺序（「供应商开关」弹窗的拖拽排序，宿主持久化）。
+   *
+   * `null` = 尚未读到 / 读取失败 / 用户从未自定义 —— 三种情况展示侧都按
+   * 声明顺序渲染，界面上无法也不必区分。降级思路与 providerStatuses 一致：
+   * 顺序是**纯展示偏好**，任何一次读取失败都不该打扰用户（区别于开关状态，
+   * 那个失败会显式提示）。
+   */
+  const [providerOrder, setProviderOrder] = React.useState(null);
+  /**
+   * 排序提交进行中（与账号面板的 `reordering` 同款）。
+   *
+   * ⚠️ 不做乐观更新 ⇒ RPC 返回前 `providerOrder` 仍是旧值，`rows` 也仍基于
+   * 旧值。若这段时间里用户再拖一次，第二次会**基于旧顺序**计算，于是第一次的
+   * 移动被静默覆盖（实测：拖 cline 到最前后紧接着拖 loomy，cline 被打回原位）。
+   * 账号面板早就有这把锁（`reordering ? { enabled: false } : dragPropsFor(...)`），
+   * 这里必须同样把「排序提交中」并入 `dragEnabled`。
+   */
+  const [providerReordering, setProviderReordering] = React.useState(false);
+  /**
+   * 排序提交的**同步**互斥锁（ref 而非 state）。
+   *
+   * ⚠️ 必须用 ref 而不是直接读 `providerReordering`：state 写入后要等下一次
+   * 渲染才可见，而两次 drop 可以发生在同一次渲染周期内 —— 读 state 会让锁
+   * 形同虚设（账号面板的 `reordering` 走 state，是因为它的入口是按钮、
+   * 有一次点击到渲染的自然间隔；拖拽 drop 没有这层间隔）。
+   */
+  const reorderLockRef = React.useRef(false);
+  /**
    * 供应商开关的结果提示（成功或失败）。
    *
    * 与 `checkinNotice` 分开：两者可能先后出现，共用一个状态会让后写的覆盖先写的，
@@ -4249,6 +4387,70 @@ export function JetHubPage({ close, rpcCall }) {
     mounted.current = true;
     void loadProviderStatuses();
   }, [loadProviderStatuses]);
+
+  /**
+   * 读取供应商自定义顺序。
+   *
+   * 失败**不提示**（只 console.error + 保持 null）：与 loadProviderStatuses
+   * 的降级口径不同 —— 状态读不到会影响「能不能关」的操作判断，值得一条提示；
+   * 顺序读不到只是回到默认排列，用户毫无感知损失，弹提示反而是噪音。
+   */
+  const loadProviderOrder = React.useCallback(async () => {
+    try {
+      const res = await rpcCall('provider.getOrder', {});
+      if (!mounted.current) return;
+      setProviderOrder(Array.isArray(res?.order) && res.order.length > 0 ? res.order : null);
+    } catch (caught) {
+      console.error('[jet-hub] load provider order failed:', caught);
+      if (!mounted.current) return;
+      setProviderOrder(null);
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => {
+    void loadProviderOrder();
+  }, [loadProviderOrder]);
+
+  /**
+   * 提交拖拽后的新顺序。
+   *
+   * ⚠️ **不做乐观更新**（与 toggleGateway 同一取舍）：服务端才是顺序的权威
+   * 存储，本地先改会在写入失败时出现「界面已变、重启又弹回」的错觉。成功后才
+   * 落 state。失败复用 providerNotice（弹窗内没有独立的 notice 区）提示，
+   * 并回读一次确保界面与服务端一致。
+   */
+  const commitProviderOrder = React.useCallback(async (next) => {
+    if (!Array.isArray(next)) return;
+    // ⚠️ 提交期间上锁：RPC 返回前界面顺序未变，再拖一次会基于旧顺序计算，
+    // 把本次的移动静默覆盖（账号面板的 `reordering` 同款，理由见 state 处注释）。
+    if (reorderLockRef.current) return;
+    reorderLockRef.current = true;
+    setProviderReordering(true);
+    // ⚠️ **只清排序自己的旧提示**（inModal 那条），不能无条件清空：
+    // 用户「切换某供应商（成功提示）→ 立刻拖一次」时，前一条 ok 提示不该被吞掉
+    // （`toggleProvider` 写的 notice 没有 inModal 标记，见 ProviderSwitchPanel）。
+    // 拖拽本身在弹窗内没有独立区域显示 toggle 的结果，故保留它。
+    setProviderNotice(prev => (prev && prev.inModal ? null : prev));
+    try {
+      await rpcCall('provider.setOrder', { order: next });
+      if (!mounted.current) return;
+      setProviderOrder(next);
+    } catch (caught) {
+      console.error('[jet-hub] commit provider order failed:', caught);
+      if (!mounted.current) return;
+      setProviderNotice({
+        tone: 'error',
+        text: '保存排序失败：' + (caught?.message || '未知错误') + '。界面顺序保持不变，可重试拖动。',
+        // ⚠️ 必须由**弹窗内**呈现：拖拽必然发生在弹窗打开期间，而弹窗遮罩是
+        // fixed + z-index 3000，页面层的 notice 会被它整个盖住（用户看不到失败）。
+        inModal: true,
+      });
+      await loadProviderOrder();
+    } finally {
+      reorderLockRef.current = false;
+      if (mounted.current) setProviderReordering(false);
+    }
+  }, [rpcCall, loadProviderOrder]);
 
   const selectProvider = (id) => {
     setSelected(id);
@@ -4593,7 +4795,9 @@ export function JetHubPage({ close, rpcCall }) {
                 React.createElement('li', { key: index }, note)))
           : null)
       : null,
-    providerNotice
+    // ⚠️ `inModal` 的提示交给弹窗自己渲染（见 ProviderSwitchPanel）—— 重复渲染
+    // 会让同一条错误在遮罩内外各出现一次。
+    providerNotice && !providerNotice.inModal
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
           'data-tone': providerNotice.tone,
@@ -4626,6 +4830,10 @@ export function JetHubPage({ close, rpcCall }) {
           onToggle: toggleProvider,
           onReload: loadProviderStatuses,
           onClose: () => setShowProviderSwitches(false),
+          order: providerOrder,
+          onCommitOrder: commitProviderOrder,
+          reordering: providerReordering,
+          notice: providerNotice,
         })
       : null,
     // 同款做法：网关开关也是覆盖层，且与「供应商开关」互斥 —— 两者都是
