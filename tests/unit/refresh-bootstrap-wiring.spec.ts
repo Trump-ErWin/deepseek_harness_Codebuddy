@@ -37,7 +37,7 @@ const AUTH_FILES = [
   // ⚠️ MiniMax 是第 9 个 auth 文件（buddy-auth 一份服务两个 provider）。
   // 加它之前本清单**漏了 minimax** —— 于是「续期必须带 pool/accountId 且调
   // `syncAccountExpiry`」这条契约对 minimax **不被强制**（Spec 盲区）。
-  // 该契约正是「账号卡片刷新按钮按下去没反应」那个缺陷的回归防线，
+  // 该契约正是「续期成功但界面没反应」那个缺陷的回归防线，
   // 新增 provider 时必须同步加进来。
   'src/minimax-auth.ts',
 ]
@@ -118,7 +118,7 @@ describe('续期调度器：启动必须先跑一轮', () => {
 describe('按需续期必须回写账号池的有效期', () => {
   /**
    * issue 第 5.3 条：`refreshAccountCredential` 过去只有 raccoon 回写，
-   * 其余七个只 `credentials.set` —— 于是账号卡片的「刷新」按钮**按下去没反应**
+   * 其余七个只 `credentials.set` —— 于是**续期成功但界面纹丝不动**
    * （凭据续好了，UI 读的池值纹丝不动）。
    */
   it.each(AUTH_FILES)('%s 的 refreshAccountCredential 接受 pool + accountId', (rel) => {
@@ -201,7 +201,7 @@ describe('按需续期必须回写账号池的有效期', () => {
 
   it('createPoolRefresh（CodeBuddy 系发消息途中的按需续期）也回写账号池', () => {
     // 这条路径由 `buddy-adapter.ts` 的 401/403 分支调用，触发频率远高于
-    // 账号卡片的「刷新」按钮；漏传 pool 就意味着 buddy/workbuddy 的
+    // RPC `account.refresh`；漏传 pool 就意味着 buddy/workbuddy 的
     // 「已过期」显示在实际续期成功后仍然挂着。
     const source = codeOnly(read('src/buddy-auth.ts'))
     const body = source.slice(source.indexOf('export function createPoolRefresh'))

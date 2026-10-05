@@ -882,10 +882,23 @@ data:{"error_code":"InferHub.4291.200","error_msg":"insufficient quota", …}
 - 旧 ticket 流程保留为显式回退：编程式调用
   `ctx.codeartsAuth.login({ flow: 'ticket' })`。ticket 凭据没有 `refresh_token`，
   其续期仍意味着重新运行浏览器登录流程。
-- **续期按账号**：`refreshAccountCredential(refName)`（账号卡片的「刷新」按钮）
-  与 `refreshAll(pool)`（定时调度器）。早期的 `refresh()` / `logout()` /
+- **续期按账号**：`refreshAccountCredential(refName, pool?, accountId?)` 与
+  `refreshAll(pool)`（定时调度器）。早期的 `refresh()` / `logout()` /
   `status()` / `scheduleRefresh()` / `scheduleModelRefresh()` 只服务于单凭据路径，
   已随该模式一并移除。
+  ⚠️ **账号卡片上并没有「刷新」按钮**（按钮是 测试/重测/重置/停用/代理/指纹/删除）。
+  `refreshAccountCredential` 的两个调用方是 ① RPC `account.refresh`
+  —— **仓库内零生产调用方**（`plugin-src/client/jet-hub.js` 的 42 处 `rpcCall(`
+  里没有它，另两处 `rpcCall(变量)` 的实参只有 `opencode.*` 四个方法；调用方是
+  仓库外的脚本/手工 RPC，issue IKJOZA 取证），与 ② 定时调度器。
+  ⚠️ 经 RPC 调用时**必须**传 `pool` + `entry.id`（`src/jet-hub-rpc.ts` 的
+  `account.refresh` switch 内每个 case 都这么传，`tests/unit/refresh-bootstrap-wiring.spec.ts`
+  逐 case 扫这条不变式），否则续期后的 `expiresAt` 不回写账号池 —— 凭据续好了而
+  UI 一直显示「已过期」（issue IKIRTT）。
+  ⚠️ **端点契约**（issue IKJOZA）：成功回 `{ok:true, value:{success:true}}`；失败回
+  `{ok:false, error:{code:'bad-request', message:<原异常文案>}}`。
+  此前失败被包成 `ok:true` + `value.success:false`，而客户端 `unwrapRpcResult` 只判 `ok`
+  —— 只判 `ok` 的调用方会把失败读成成功。**判失败只看顶层 `ok`。**
 - 运行时依赖新增 `jose`（用于 DPoP JWS 签发，与 CodeArts Agent 插件实现一致）。
 
 ### ⚠️ 停用的账号同样会被续期

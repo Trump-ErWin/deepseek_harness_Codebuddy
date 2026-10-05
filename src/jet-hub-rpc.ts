@@ -995,7 +995,7 @@ function registerJetHubEndpoints(
    * 为什么用注册表而不是给每个 provider 各加一条 `|| provider === X.id`：
    * 本文件里 Qoder 相关分支有**四处**（登录 / 单账号续期 / 余额 / 领取）。
    * 平行 case 的数量与「漏接一处」的概率同向增长 —— 本插件在 `workbuddy` 上
-   * 就真漏过一次（账号卡片的「刷新」按钮一直报 `Unknown provider`）。
+   * 就真漏过一次（`account.refresh` 端点对它一直报 `Unknown provider`）。
    * 注册表把「同族」这件事表达成数据结构，加第 N 个同族产品只改这一处。
    */
   interface QoderFamilyMember {
@@ -1988,15 +1988,20 @@ function registerJetHubEndpoints(
           // 续期入口 —— 三处都是修复既有缺陷的关键：
           //
           // 1. 原实现只处理 codearts / buddy，`workbuddy` 会落到 else 抛
-          //    `Unknown provider`，即 WorkBuddy 账号卡片的「刷新」按钮一直是坏的；
+          //    `Unknown provider` —— 即 `account.refresh` 端点**对 WorkBuddy 完全不可用**；
           // 2. 原实现调的是 `service.refresh()`，它读写的是该 provider 的
-          //    **默认单凭据 ref**（如 BUDDY_ACCESS_TOKEN），而账号卡片对应的是
-          //    BUDDY_ACCOUNT_XXX —— 于是「刷新这个账号」实际刷的是另一个凭据，
+          //    **默认单凭据 ref**（如 BUDDY_ACCESS_TOKEN），而要刷的是池内条目的
+          //    BUDDY_ACCOUNT_XXX —— 于是「刷这个账号」实际刷的是另一个凭据，
           //    结果要么报错要么静默改了错的对象。
           // 3. ⚠️ **每个分支都必须传 `pool` + `entry.id`**（issue !IKIRTT）：
           //    续期成功后要把新的 `expiresAt` 写回账号池，UI 才不再显示
-          //    「已过期」。早先只有 raccoon 分支传了，其余七个「刷新」下去
+          //    「已过期」。早先只有 raccoon 分支传了，其余七个分支漏传，
           //    凭据续好了、界面纹丝不动，用户没有任何自救手段。
+          //
+          // ⚠⚠ **本端点没有面板入口**（issue IKJOZA 取证）：账号卡片上并没有
+          // 「刷新」按钮（按钮是 测试/重测/重置/停用/代理/指纹/删除），
+          // 调用方是仓库外的脚本/手工 RPC。下面三处历史注释曾把它写成
+          // 「账号卡片的刷新按钮」——那是失实的，会把排障的人引到不存在的 UI。
           switch (entry.provider) {
             case 'codearts':
               await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id)
@@ -2015,7 +2020,7 @@ function registerJetHubEndpoints(
               // 同协议族：按 provider 找到对应实例。
               // ⚠️ 只刷传入的这个 ref，不碰默认单凭据 ref（历史缺陷同因）。
               // ⚠️ **不要**图省事写 `qoder.refreshAccountCredential(...)` ——
-              // 那会让中国版账号的「刷新」去续国际版的凭据（两站 token 不通用，
+              // 那会让中国版账号的续期去刷国际版的凭据（两站 token 不通用，
               // CN 永远续不动而国际版被无谓刷一次）。该串用由
               // `lobsterai-rpc-dispatch.spec.ts` 的行为级用例锁死（已做反向验证）。
               await requireQoderFamily(entry.provider).auth.refreshAccountCredential(entry.credentialRef, pool, entry.id)
@@ -2050,7 +2055,7 @@ function registerJetHubEndpoints(
                * zcode **没有 refresh 端点**（凭据是静态的，与 Loomy 同类）。
                *
                * 但这个方法仍做实事：**逐账号重读自己的 ref 并规范化回写** ——
-               * 用户重新登录后点「刷新」即可生效而无需重启 DSH。
+               * 用户重新登录后重新调用 `account.refresh` 即可生效而无需重启 DSH。
                * 凭据不可用时如实抛错（引导用户重新登录该账号）。
                */
               await zcode.refreshAccountCredential(entry.credentialRef, pool, entry.id)
@@ -2068,11 +2073,59 @@ function registerJetHubEndpoints(
           }
           return { ok: true, value: { success: true } }
         } catch (error) {
+          /**
+           * ⚠⚠ **失败必须回 `ok: false`**，不得包成 `ok:true + value.success:false`
+           * （Gitee issue IKJOZA，真实缺陷）。
+           *
+           * ## 原来的行为与代价
+           * 本分支的 catch 曾把异常包进**成功**响应
+           * （`{ok:true, value:{success:false, error}}`）。而客户端的
+           * `unwrapRpcResult`（`plugin-src/management-rpc.mjs`）只判 `ok === true`
+           * 就返回 `value` —— 于是**只判 `ok` 的调用方会把续期失败读成成功**。
+           * 实测代价：报告方一个工具首版只判 `ok`，18 个「✅」里 **17 个实为失败**，
+           * 真实原因是 `codearts 400 STS5.1806 invalid refresh token:
+           * 'the refresh token has been used'` / `minimax refresh_token 已失效` /
+           * `raccoon 登录态已过期`。
+           *
+           * ## 为什么这里不能学那四处「catch 仍回 ok:true」
+           * 本文件确有四处 catch 后仍 `ok:true`，它们**都有额外的判别字段**，
+           * 调用方不判它就会误读，本端点没有 —— 逐条对照：
+           *
+           * | 位置 | 形态 | 为何安全 |
+           * |---|---|---|
+           * | `login.poll` | `{done:false}` | 「用户尚未授权完」是正常中间态 |
+           * | `login.submitSms` | `{done:false, error}` | 验证码输错可重试，前端必判 `done` |
+           * | `credits.permanentLock` | 广播失败仍 `ok:true` | 广播失败不影响已落盘 |
+           * | `credits.claimAll` | 单号失败进 `results[]` | 「单个失败不中断整体」是设计语义 |
+           *
+           * 本分支只有 `success` 一个布尔：**失败是业务终态，不是可自愈的中间态**，
+           * 与上述四者不同类。
+           *
+           * ## 为什么 `ok:false` 不会打破仓库内任何调用方
+           * `account.refresh` **全仓库零调用方**：面板 `plugin-src/client/jet-hub.js`
+           * 的 42 处 `rpcCall(` 里没有它（账号卡片的按钮是 测试/重测/重置/停用/代理/
+           * 指纹/删除，**没有「刷新」**）；另两处 `rpcCall(变量)` 的实参经追溯只有
+           * `opencode.*` 四个方法。它从来就是给仓库外脚本/手工 RPC 用的端点。
+           * ⇒ 这是**对外部调用方的破坏性契约变更**：原先误判的调用方会从「静默错」
+           * 变成 `unwrapRpcResult` 抛错，属预期的「提前炸」。成功路径仍是
+           * `ok:true + value.success:true`，未变。
+           *
+           * ⚠⚠ **复现这条取证不要用 `git log -S "rpcCall('account.refresh'"`**：
+           * 本注释自身引用了该字面量，`-S` 会**自匹配修复提交本身**（返回 `68fb567`），
+           * 那正是 `AGENTS.md` 明令禁止的「注释与实测脱节」。在 `origin/master`
+           * （修复前）上该命令零命中，这本身是它曾有效的证据。稳定写法是只搜
+           * **不含注释**的客户端源码：
+           * `Select-String -Path plugin-src\client\*.js -Pattern "rpcCall\('account\."`
+           * （应零命中；`account.refreshable` 是另一个字段名，不是端点）。
+           *
+           * 回归用例在 `tests/unit/lobsterai-rpc-dispatch.spec.ts` 的
+           * 「issue IKJOZA」段（锁死「失败不得是 ok:true」+「失败必须带原因」）。
+           */
           return {
-            ok: true,
-            value: {
-              success: false,
-              error: error instanceof Error ? error.message : String(error),
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: error instanceof Error ? error.message : String(error),
             },
           }
         }
