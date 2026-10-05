@@ -394,6 +394,42 @@ describe('ZCode Jet Hub 登录接入', () => {
   })
 
   /**
+   * ★ 未知 provider **不得留下任何账号池条目**（Gitee issue IKJLK3 E1 的回归锁）。
+   *
+   * ## 为什么上面那条不够
+   *
+   * 上一条只断言「返回了 bad-request」，那**证明不了池没被写脏**。
+   * `account.create` 开头就拼了 `const id = \`${provider}-${shortId()}\``，
+   * 任何一处分支在兜底之前误 `addAccount`（或有人日后把兜底挪到写入之后），
+   * 上一条都会照样绿 —— 症状是账号池里出现一条 provider 为
+   * `definitely-not-a-provider`、永远不可用的**幽灵条目**。
+   *
+   * ## 判据为什么用 `listAllAccounts()` 而不是 `listAccounts(provider)`
+   *
+   * 幽灵条目的 provider 就是那个**乱写的**值，用它去查等于自证；
+   * 必须查**全池**（`listAllAccounts`）才能断言「一条都没多」。
+   *
+   * ## 为什么这条值得用单测锁，而不是在 `account.create` 入口加 provider 白名单
+   *
+   * 加白名单要多维护一份 provider 名单（客户端 `newAccountAsksChannel` 一份、
+   * 服务端再一份），漏改任一处的表现是「客户端能选但服务端拒绝」——
+   * 比现在「统一走 bad-request」更难排查。**链尾那道 `else` 兜底就是单一事实来源**
+   * （提单人在 review 里给出的同一结论）。用测试守住它，既不失守，又不在生产
+   * 路径上多一层判断。
+   */
+  it('★ 未知 provider 不写账号池（全池条目数不变，兜底不是「先写后拒」）', async () => {
+    const { call, pool } = makeRpc()
+    const before = await pool.listAllAccounts()
+    const bogus = await call('account.create', { provider: 'definitely-not-a-provider' })
+    expect(bogus.ok).toBe(false)
+    expect(bogus.error?.message).toMatch(/unknown provider/)
+    // ⚠ 用**全池**比对：幽灵条目的 provider 就是那个乱写的值，按它去查等于自证。
+    const after = await pool.listAllAccounts()
+    expect(after.map((a) => a.id)).toEqual(before.map((a) => a.id))
+    expect(after.some((a) => a.provider === 'definitely-not-a-provider')).toBe(false)
+  })
+
+  /**
    * ⚠ **`login.poll` 必须做形状校验**（审查发现）。
    *
    * 原判据只是「`ctx.credentials.resolve(ref)` 返回了非空字符串」。占位条目被
@@ -479,11 +515,14 @@ describe('ZCode Jet Hub 登录接入', () => {
     const call = /registerJetHubRpc\(([^)]*)\)/.exec(source)
     expect(call?.[1]).toBeDefined()
     const args = (call?.[1] ?? '').split(',').map((s) => s.trim())
-    // ctx, pool, 然后 12 个 provider（合并后 minimax 排在 zcode 前），最后 modelAdapters。
-    expect(args.length).toBe(15)
-    expect(args[args.length - 4]).toBe('raccoon')
-    expect(args[args.length - 3]).toBe('minimax')
-    expect(args[args.length - 2]).toBe('zcode')
+    // ctx, pool, 然后 13 个 provider（minimax → zcode → gemini），最后 modelAdapters。
+    // ⚠️ 新 provider 一律**追加在末尾**（gemini 排在 zcode 之后），既有调用点
+    // 才不用逐个补占位 —— 见 `registerJetHubRpc` 签名上方的注释。
+    expect(args.length).toBe(16)
+    expect(args[args.length - 5]).toBe('raccoon')
+    expect(args[args.length - 4]).toBe('minimax')
+    expect(args[args.length - 3]).toBe('zcode')
+    expect(args[args.length - 2]).toBe('gemini')
     expect(args[args.length - 1]).toBe('modelAdapters')
   })
 })

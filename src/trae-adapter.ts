@@ -23,6 +23,7 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { reasoningRankOf } from './reasoning-ladder.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import {
@@ -82,22 +83,10 @@ const TRAE_EFFORT_NAMES: Readonly<Record<string, string>> = {
  * ⚠️ **只用于挑「默认档」，不参与 wire 取值** —— wire 值就是远端
  * `reasoning_effort_config.options` 里的字符串本身，本表改了也不会影响下发。
  *
- * 覆盖 TRAE 实测出现过的全部档位；上游若新增档位，走
- * {@link strongestTraeEffort} 的第 3 条退化规则（取数组末项）。
+ * ⚠️ 表本体已收敛到 `src/reasoning-ladder.ts`（网关做「OpenAI 规范名 → 私有 id」
+ * 翻译时用的是**同一份**强度序）。两处各写一份必然漂移，而漂移的症状是
+ * 「同一个档位在挑默认档与在网关翻译时算出不同结果」。
  */
-const TRAE_EFFORT_RANK: Readonly<Record<string, number>> = {
-  off: 0,
-  none: 0,
-  minimal: 1,
-  light: 2,
-  low: 3,
-  medium: 4,
-  high: 5,
-  extra_high: 6,
-  xhigh: 7,
-  max: 8,
-}
-
 /**
  * 从 `options` 里挑**最强**的一档作默认值。
  *
@@ -115,9 +104,7 @@ function strongestTraeEffort(options: readonly string[]): string | undefined {
   let best: string | undefined
   let bestRank = -1
   for (const option of options) {
-    const rank = Object.prototype.hasOwnProperty.call(TRAE_EFFORT_RANK, option)
-      ? TRAE_EFFORT_RANK[option]
-      : undefined
+    const rank = reasoningRankOf(option)
     if (rank !== undefined && rank > bestRank) {
       best = option
       bestRank = rank
@@ -466,13 +453,33 @@ function serializeTraeMessages(
     )
     const text = contentToText(message.content)
     // 图片：仅当本请求带图（imageUrls 非 undefined）时升级为多模态 parts。
-    const parts = imageUrls === undefined ? undefined : userContentParts(content, imageUrls)
-    if (parts !== undefined) {
-      // 有图：正文与图片合并为一条多模态 user 消息（parts 里已含文本块）。
-      flushToolImages()
-      wire.push({ role: 'user', content: parts })
-    } else if (text.length > 0 || toolResults.length === 0) {
-      wire.push({ role: 'user', content: text })
+    //
+    // ⚠️ **只收本消息自己的图片**（`outerContent` 先剔掉工具结果块）：工具结果内嵌的
+    // 图片由下面 `pendingToolImages` 挂到 `role:'tool'` **之后**；在这里一并收进来会把
+    // 它们排到 tool 消息**之前**（成因见下 `deferred` 的注释与 4027 回归用例）。
+    const outerContent = content.filter(
+      (block) => !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'),
+    )
+    const parts = imageUrls === undefined ? undefined : userContentParts(outerContent, imageUrls)
+    // ⚠️⚠️ **带工具结果时这条 user 消息必须延后到 `role:'tool'` 之后**：上游要求
+    // tool 消息是「紧跟其 assistant `tool_calls` 的应答」，两者之间插任何消息
+    // （哪怕只是本消息的正文或图片）都会被拒。
+    //
+    // **真实缺陷**（2026-10-04 用户报障）：`read_image`（工具结果内嵌图片）之后，
+    // 整条会话在 trae 下**永久无法对话** —— 上游恒定回
+    // `code=4027 Messages with role 'tool' must be a response to a preceding message
+    // with 'tool_calls'`；坏报文已落进会话历史，每次请求原样重放，5 次重试与
+    // 「继续」全部无效，只有换 provider 才能恢复。
+    const deferred = toolResults.length > 0
+    if (!deferred) {
+      // 无工具结果：维持原语义立即发出（有图发多模态 parts，否则发纯文本）。
+      if (parts !== undefined) {
+        // 有图：正文与图片合并为一条多模态 user 消息（parts 里已含文本块）。
+        flushToolImages()
+        wire.push({ role: 'user', content: parts })
+      } else {
+        wire.push({ role: 'user', content: text })
+      }
     }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 tool_call 同样会被上游拒绝。
@@ -490,6 +497,11 @@ function serializeTraeMessages(
         tool_call_id: String(result.toolCallId),
         content: contentToText(result.content) || (innerParts !== undefined ? TOOL_RESULT_IMAGE_TEXT : '(no output)'),
       })
+    }
+    // 延后的正文/图片：排在 `role:'tool'` 之后（成因见上方 `deferred` 的注释）。
+    if (deferred && (parts !== undefined || text.length > 0)) {
+      flushToolImages()
+      wire.push({ role: 'user', content: parts ?? text })
     }
     flushToolImages()
   }
@@ -1021,9 +1033,11 @@ export class TraeAdapter extends LlmAdapter {
       ]
     }
 
-    // 历史裁剪：必须在序列化**之后**做（裁剪的是 wire 消息，不是 DSH 块）。
-    // 超限时从最早的非系统消息开始整轮丢弃，且不切断 tool_call/tool 配对。
-    openaiBody.messages = trimTraeHistory(openaiBody.messages as Array<Record<string, unknown>>)
+    // ⚠️ **这里刻意没有本地历史闸门**（2026-10-04 删除，此前是一道字符预算裁剪）。
+    // 唯一的限制是 **DSH 自己的压缩点**（`声明的窗口 × 0.8`）—— 与其余 13 个
+    // provider 同形。删掉的理由、被删代码的来历与「若有人想加回来必须先读什么」
+    // 都在下方 `TRAE 历史闸门（已删除）` 那段注释里；改动前务必先读它。
+    // 序列化之后不再对 `openaiBody.messages` 做任何长度相关的删改。
 
     // 一次性完成 OpenAI → SOLO 转换（含 messages 规范化、tools 序列化、
     // tool_choice 归一化、config_name 注入），并**按模型路由通道** ——
@@ -1746,91 +1760,78 @@ export class TraeAdapter extends LlmAdapter {
 }
 
 /**
- * 请求体历史字符上限。
+ * ⚠️ TRAE **没有**本地历史闸门（2026-10-04 删除）。改动本文件前请先读完这段。
  *
- * ## 为什么必须有（对齐 `Trae2api-cn` 的实测结论）
+ * 这里原先有一道「请求体字符预算」裁剪：超预算就从最早的非系统消息开始整轮丢弃
+ * （`trimTraeHistory` + `resolveMaxHistoryChars` + `TRAE_MAX_CHARS_PER_TOKEN`，
+ * 以及逃生舱 `DSH_TRAE_MAX_HISTORY_CHARS`）。它已被**整体删除**，理由三条：
  *
- * 上游在 query 超过约 **500K 字符**时会**静默结束事件流** —— 不报错、不返回
- * 错误码，流就那么断掉。这是最难排查的一类失败：日志里看到的是「模型没有
- * 回复」，而不是任何 4xx/5xx。CN 项目为此设了两道闸门：
- * `TRAE_REMOTE_MAX_HISTORY_CHARS=480000`（压缩阶段）与
- * `TRAE_REMOTE_QUERY_MAX_CHARS=480000`（扁平化 query 的硬上限）。
+ * 1. **它的依据是从别的项目抄来的，未在本仓库实测**。原文写的是「对齐
+ *    `Trae2api-cn` 的实测结论：上游在 query 超过约 500K 字符时会静默结束事件流」，
+ *    于是把那个项目的 `TRAE_REMOTE_MAX_HISTORY_CHARS=480000` 抄成本插件写死的
+ *    480,000。而 `480000 = 2.4 × 200000` —— 那是**声明窗口本身的量级**，
+ *    不是量出来的字符天花板。
+ * 2. **它守的是别人客户端的形态**。那两道闸门的另一道是
+ *    `TRAE_REMOTE_QUERY_MAX_CHARS`（**扁平化 query** 的硬上限），而本插件的 trae
+ *    链路里**根本没有 `query` 字段** —— 我们发的是 OpenAI 形状的 `messages[]`
+ *    （上游那句 `Messages with role 'tool' must be a response to a preceding
+ *    message with 'tool_calls'` 本身就证明它在逐条读 role）。
+ * 3. **它的前提被本仓库的探针推翻了**。2026-10-04 的实发探针（请求体抓下来打印确认
+ *    档位）在**常规档**（非 Max，`含 strategy=false context_window_size=false`）实测：
  *
- * 这里取其**下沿**并在裁剪后仍可能超限时兜底，避免请求打到那个静默阈值。
- * 可通过 `DSH_TRAE_MAX_HISTORY_CHARS` 覆盖。
- */
-function resolveMaxHistoryChars(): number {
-  const raw = Number.parseInt(process.env.DSH_TRAE_MAX_HISTORY_CHARS ?? '', 10)
-  if (Number.isFinite(raw) && raw > 0) return raw
-  return 480_000
-}
-
-/** 估算一条 wire 消息的字符体量（按 JSON 序列化长度）。 */
-function wireMessageSize(message: Record<string, unknown>): number {
-  try {
-    return JSON.stringify(message).length
-  } catch {
-    return 0
-  }
-}
-
-/**
- * 把 wire 消息裁剪到字符预算以内。
+ *    | 正文字符 | 服务端 `input_tokens` | 字符/token | 结果 |
+ *    |---|---|---|---|
+ *    | 40,398（标定） | 9,827 | 4.11 | 200 + 正中标记命中 |
+ *    | **700,404** | 173,712 | 4.03 | **200 + 正中标记命中** |
+ *    | **1,000,484** | 249,351 | 4.01 | **200 + 正中标记命中**（比 200K 窗口还多 24%） |
+ *    | 900,303（中文正文） | 422,672 | 2.13 | 200 + 正中标记命中 |
  *
- * ## 三条不可违反的约束
+ *    ⇒ 「约 500K 字符即静默断流」被**证伪到 2 倍**（100 万字符仍完整送达）；
+ *    ⚠️ 并**更正一处旧误标**：早先那次 900,303 字符的记录被写成「Max 档」，
+ *    但探针构造适配器时没有注入远端元数据，而 `maxModeFor()` 要求远端
+ *    `display_config.max_mode === true`（见本文件 `maxModeFor`）—— 它其实是**常规档**。
  *
- * 1. **从最早的非系统消息开始丢**，最近的历史（尤其本轮工具结果）必须保住 ——
- *    丢尾部会让模型丢失当前任务上下文，比丢开头更糟。
- * 2. **绝不切断 tool_call / tool 配对**：`tool` 消息必须紧跟其 `tool_calls`
- *    所在的那条 assistant 消息。丢一半会被上游以 400 拒绝整个请求，所以这里
- *    以「轮」为单位裁剪 —— 带 `tool_calls` 的 assistant 连同其后连续的
- *    `tool` 结果一起处理。
- * 3. **system 消息永不裁剪**（无论它出现在哪个位置），它是行为约束，
- *    丢了比丢历史更危险。
+ * ## 它造成的是**净损害**（这是删除的决定性理由）
  *
- * 已经是 OpenAI wire 形状的消息（本函数只接受 `serializeTraeMessages` 的产物）。
+ * 引入 Max 模式（声明 1M tokens）后，写死的 480,000 没跟着涨，与 DSH 的压缩点
+ * （`窗口 × 0.8`，1M → 800K tokens ≈ 170 万字符）**脱钩**：界面显示「才用了 8%」，
+ * 适配器却每轮静默丢掉约四分之三的历史（真实会话量：1,898,903 字符 = 旧预算的
+ * **396%**）。用户报障原文「trae 显示的上下文长度不对」——
+ * **那正是这道闸门造成的**，不是任何上游限制造成的。
  *
- * @param messages 已序列化的 wire 消息（system 已并入）
- * @param maxChars 字符预算（默认 480000）
- */
-function trimTraeHistory(
-  messages: Array<Record<string, unknown>>,
-  maxChars: number = resolveMaxHistoryChars(),
-): Array<Record<string, unknown>> {
-  let total = messages.reduce((sum, message) => sum + wireMessageSize(message), 0)
-  if (total <= maxChars) return messages
-
-  // ── 1. 先切成「可丢弃的轮次」与「不可丢弃的 system」──
-  //
-  // 不假设 system 都在开头：历史里可能夹着 system（如 developer 角色被归一化）。
-  // 用显式的 keep 标记逐条判断，而不是靠下标切片 —— 后者在 system 不连续时会
-  // 错位。
-  const drop = new Set<number>()
-  let index = 0
-  while (index < messages.length && total > maxChars) {
-    if (messages[index]!.role === 'system') {
-      index += 1
-      continue
-    }
-    // 收集本轮：本条 + 其后连续的 tool 结果。
-    const roundStart = index
-    let roundEnd = index + 1
-    if (Array.isArray(messages[index]!.tool_calls) && (messages[index]!.tool_calls as unknown[]).length > 0) {
-      while (roundEnd < messages.length && messages[roundEnd]!.role === 'tool') roundEnd++
-    }
-    for (let cursor = roundStart; cursor < roundEnd; cursor++) {
-      drop.add(cursor)
-      total -= wireMessageSize(messages[cursor]!)
-    }
-    index = roundEnd
-  }
-
-  // 裁剪后仍超限（例如单条 system 提示就超预算）：不再继续丢 —— 继续丢只会把
-  // 请求变成空内容，同样失败且更难诊断，交由上游定夺。
-  return messages.filter((_, position) => !drop.has(position))
-}
-
-/**
+ * 中间版本把它改成「声明窗口 × 系数」（系数 2 → 5），能让**实测内容**下不再误伤，
+ * 但仍有两个消不掉的问题：
+ *
+ * - **字符闸门在数学上不可能被证明「永不先于 DSH 的压缩点生效」**：DSH 的界是
+ *   token、闸门是字符，只要内容的字符/token 足够高（系数 5 ⇒ 6.25），任何**有限**
+ *   系数都会被绕过。系数 5 只是把触发条件推到实测值（中文 2.13、英文/代码 4.0）
+ *   之外，而不是消灭它。
+ * - 全仓库**只有 trae 有这条「静默丢历史」的路径**：其余 13 个 provider 把 DSH 的
+ *   压缩点当唯一真相；唯一的另一类体积防护（`src/image-budget.ts`，13 家共用）
+ *   作用在**单张图的编码字节**上，且压不下去时**抛 `UNSUPPORTED_CONTENT`**（可见），
+ *   而不是悄悄丢消息。
+ *
+ * ⇒ 因此删掉它：**静默丢历史这一类缺陷在结构上消失**，trae 与其余 13 家同形，
+ * 真正的限制只有一个 —— DSH 的压缩点。
+ *
+ * ## 如果将来要加回来
+ *
+ * 先做**实发探针**，不要抄常数、也不要按窗口折算：
+ *
+ * 1. 用真实链路量出「多大体积开始出问题」，以及出问题时是**可见错误**还是
+ *    **静默结束**。⚠️ 截至 2026-10-04：常规档已知 **100 万字符 / 24.9 万 tokens
+ *    仍正常返回**（正中标记命中），「约 50 万字符」那条传闻已被证伪到 2 倍；
+ *    真正的 **Max 档**（注入远端 `max_mode=true` 后的 1M 声明）与常规档 > 100 万
+ *    字符**都还没探** —— 但闸门已删，这两点只在「想加回来」时才需要补；
+ * 2. 若确实要设闸门，它**必须可观测**（记日志/上报），不能静默改语义；
+ * 3. 判据与全部取证见 `AGENTS.md` 的「TRAE 历史闸门（已删除）」段。
+ *
+ * 失败落点（**已知可见**，不是静默）：一个上游事件都没收到会抛 `TRANSPORT`
+ * （"upstream returned no events"，见本文件 `stream()` 的 `!sawAnyUpstreamEvent`
+ * 分支），并由 DSH 的常规重试接管（那次重试判据见 `isTransportError`）。
+ *
+ * ---
+ *
  * 在 `ctx.llm` 上注册 TRAE provider 路由与适配器。
  */
 export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): TraeAdapter {

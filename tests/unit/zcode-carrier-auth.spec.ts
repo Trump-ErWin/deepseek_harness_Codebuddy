@@ -19,6 +19,15 @@
  *    chromium 的 param 被拒是「时效/信誉」问题，与载体无关（见 `captcha-carrier.ts` 文件头）。
  * 5. **`DSH_ZCODE_INTERNAL_CARRIER=0`** ⇒ 既不等待也不取内部槽（等价一期行为）。
  *
+ * ## ⚠ 凭据来源只有一处（2026-10-05 起）
+ *
+ * 本文件的 `ZcodeAuth` 早期靠构造选项 `readCredential` 注入凭据，那条注入点的
+ * 语义是「回退去读本机官方 ZCode 客户端的凭据」，已随「不读本机 ZCode 数据」
+ * 的用户决策**整体删除**（连同 `adoptOfficialCredential` / `adoptIntoOrphanAccount`
+ * 那套「把本机凭据收编进账号池」的自愈链路）。⇒ 凭据改由**真实的
+ * `ctx.credentials`** 供给（`makeWired` 里的 `FakeCredentials`，见其注释），
+ * 防回退的锁在 `tests/unit/zcode-no-local-credential-read.spec.ts`。
+ *
  * ## 反向验证（2026-10-02 实跑，逐组记录见报告）
  * - 去掉 `DSH_ZCODE_INTERNAL_CARRIER=0` 的短路 ⇒ 见报告；
  * - 删掉 claim 入口 `finally` 里的清位 ⇒ 见报告；
@@ -61,6 +70,29 @@ const MODEL = 'GLM-5.3-Flash'
 const ACCOUNT = 'acct-A'
 const CONFIG = { region: 'cn', prefix: 'no8xfe', sceneId: '11xygtvd' }
 const CREDENTIAL: ZcodeCredential = { zcode_jwt: 'a.b.c', device_mid: 'mid-A', source: 'plugin' }
+
+/**
+ * 内存凭据存储（`ctx.credentials` 的等价桩）。
+ *
+ * ⚠ 2026-10-05 起凭据**只有一个来源**：插件自己写进 `ctx.credentials` 的那份
+ * （`ZcodeAuthOptions.readCredential` 那个「回退读本机官方客户端」的注入点已随
+ * 「不读本机 ZCode 数据」的决策整体删除）。`claimDaily` 等领取路径走
+ * `current()` 拿凭据 ⇒ 取不到就整条早退成 `failed` ⇒ 本文件所有 claim 用例
+ * 都必须先把一份**可用的**凭据放进这个 store（`zcode_jwt` 与 `device_mid`
+ * 都非空，`isUsableZcodeCredential` 的两条判据，见 `src/zcode.ts`）。
+ *
+ * 形态照抄 `tests/unit/zcode-credential-resolution.spec.ts` 的同名桩。
+ */
+class FakeCredentials {
+  readonly store = new Map<string, string>()
+  async resolve(ref: string) {
+    const value = this.store.get(ref)
+    return value === undefined ? undefined : { value, source: 'fake' }
+  }
+  async describe(ref: string) { return { configured: this.store.has(ref), writable: true } }
+  async set(ref: string, value: string) { this.store.set(ref, value) }
+  async unset(ref: string) { this.store.delete(ref) }
+}
 
 /**
  * 过 `validateCaptchaParam` 的假 param（长度 ≥200 + base64 解出 JSON +
@@ -196,6 +228,22 @@ function makeWired(options: {
   const ctx = new Context()
   ctx.logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as never
 
+  /**
+   * ⚠ 必须把 `credentials` 装到 ctx 上并**预置一份可用凭据**。
+   *
+   * `claimDaily` → `current()` 现在**只**读 `ctx.credentials`（账号池 → 单凭据
+   * ref），不再有「回退读本机官方客户端凭据文件」那条路（2026-10-05 删除）⇒
+   * 缺这一步时 `current()` 回 `undefined`，`claimDailyWith` 开头就早退，
+   * 本文件每条 claim 用例都会拿到 `failed`（实测：8 条全红）。
+   *
+   * ⚠ 这里**同步**写 `store`（`makeWired` 是同步工厂，30 来个调用点都直接
+   *   `const wired = makeWired(...)` 拿结果用，改成 async 要动所有调用点）。
+   *   写的是真实 ref（`ZCODE.defaultCredentialRef`），不是硬编码字符串。
+   */
+  const credentials = new FakeCredentials()
+  ctx.provide('credentials', credentials as never)
+  credentials.store.set(ZCODE.defaultCredentialRef, JSON.stringify(CREDENTIAL))
+
   // env 只在**构造期**生效（与 `captchaQueueEnabledFromEnv` 同一读取点），读过即还原，
   // 免得污染同一 worker 里的其它用例。
   const saved = new Map<string, string | undefined>()
@@ -212,7 +260,10 @@ function makeWired(options: {
           ...(options.firstClaimRejected === undefined ? {} : { firstClaimRejected: options.firstClaimRejected }),
           ...(options.alwaysRejectClaims === undefined ? {} : { alwaysRejectClaims: options.alwaysRejectClaims }),
         }),
-    readCredential: () => CREDENTIAL,
+    // ⚠ 这里**不再**有 `readCredential` 选项：它随「读本机 ZCode 数据」整条删除
+    //   （见 `tests/unit/zcode-no-local-credential-read.spec.ts` 的防回退锁）。
+    //   凭据改由上面的 `ctx.credentials` 供给，其余选项（`fetchImpl` / `carrierLog`）
+    //   一个都没少。
     ...(options.log === undefined ? {} : { carrierLog: options.log }),
   })
   for (const [key, value] of saved) {
@@ -916,8 +967,10 @@ describe('观测与接线', () => {
     // ② ★ `finally` 里清位（漏掉就是白烧设备级配额的最坏形态）
     expect(body).toMatch(/finally \{[\s\S]{0,200}?setCaptchaDemand\(false\)/)
     // ③ 逐 plan 的产出走「内部载体优先」那一层，而不是裸的注入回调
-    //    （评审 C4：返回值带 `source`，claim 才知道 3007 该不该记到载体头上）
-    expect(body).toMatch(/const minted = await this\.mintClaimCaptcha\(mintCaptcha\)/)
+    //    （评审 C4：返回值带 `source`，claim 才知道 3007 该不该记到载体头上）。
+    //    ⚠ 第二个实参 `captchaConfig` 是**同源约束**的一部分（issue IKJNPS）：
+    //    param 与 region 必须用同一份配置，少传/多拉一次都会让非 cn 区账号恒 `3007`。
+    expect(body).toMatch(/const minted = await this\.mintClaimCaptcha\(mintCaptcha, captchaConfig\)/)
   })
 
   it('★ 反向看守：`zcode-adapter.ts` 里**不得**再出现 `setCaptchaDemand(`', () => {

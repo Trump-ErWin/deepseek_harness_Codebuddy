@@ -159,6 +159,19 @@ export interface RpcCreateAccountRequest {
    * 不需要手机号；Loomy 走**短信验证码**登录，故须由前端先收集。
    */
   phone?: string
+  /**
+   * 登录渠道（**仅 ZCode 需要**）。
+   *
+   * ZCode 服务端支持两个 OAuth provider，凭据落点不同（见
+   * `zcode-login.ts` 的 `ZCODE_LOGIN_PROVIDER` 注释）：
+   *
+   * - `'bigmodel'`（缺省）：智谱开放平台（国内），授权页 `bigmodel.cn`
+   * - `'zai'`：z.ai 国际版，授权页 `chat.z.ai`
+   *
+   * ⚠️ **缺省必须视为 `'bigmodel'`**：既有调用方不传该字段，
+   * 行为必须逐字节不变。
+   */
+  zcodeProvider?: 'bigmodel' | 'zai'
 }
 export interface RpcCreateAccountResponse {
   accountId: string
@@ -182,14 +195,15 @@ export interface RpcCreateAccountResponse {
   /**
    * 本次「添加账号」**没有新建条目**，而是复用了池里已有的账号。
    *
-   * ## 为什么需要这个字段（用户报障 ⑯）
+   * ## 现状（2026-10-05 起 zcode 不再产生它）
    *
-   * 「账号应该读取有效的本地账号凭证，而不是点了添加就多一个」——
-   * 当本机已有可用凭据（官方客户端写的）时，`account.create` 不再新起 OAuth，
-   * 而是复用/修复已有条目。此时 `loginUrl` 为**空串**（没有可打开的页面）。
+   * 曾经 ZCode 会「复用本机官方客户端写的凭据」而返回该值；那条能力已随
+   * 「不读本机 IDE 数据」的决策整体删除 ⇒ **当前没有任何 provider 会返回
+   * `true`**。
    *
-   * ⚠ 前端**必须**先看这个字段再判空：只看 `loginUrl` 为空会把它当成
-   * 「后端没返回登录地址」而报错，把一次成功操作显示成失败。
+   * ⚠️ 字段与前端的 `res.reused` 分支**仍然保留**：那是**契约防御** ——
+   * 判据写成「后端若声明复用，则 `loginUrl` 为空串是正常的」，
+   * 比反过来假设「空串必是错误」更稳，且不必为一次能力下线去改前端渲染分支。
    */
   reused?: boolean
 }
@@ -286,6 +300,40 @@ export interface RpcRetestResponse {
   accounts: ProbeAccountResult[]
   /** 汇总：清除的限流标记总数。 */
   clearedCount: number
+}
+
+/**
+ * 「测试」单个账号：**无条件**真发一次请求（不依赖是否存在限流标记）。
+ *
+ * 与 {@link RpcRetestAccountRequest} 的区别是**触发条件**：重测只测那些已经有
+ * `modelRateLimits` 标记的模型（无标记即零请求），测试则不看标记、直接挑一个
+ * 模型发出去。它补齐的是「账号到底还能不能用」在没有历史 429 时**没有手动
+ * 探活入口**的缺口。
+ */
+export interface RpcTestAccountRequest {
+  accountId: string
+  /** 指定要测的模型 id；省略则由服务端推断（见 `testAccount` 的 `testModelFor`）。 */
+  modelId?: string
+}
+
+/**
+ * 「测试」结果。
+ *
+ * ⚠️ 它**不带** `cleared` / `tested` 字段，这是刻意的：测试不写任何存储
+ * （不清标记、不写回新的重置时刻），所以没有「清除了几条」可报。
+ * 结果里的 `resetTimeMs` 仅供展示。
+ */
+export interface RpcTestAccountResponse {
+  accountId: string
+  nickname?: string
+  /** 实际发出请求用的模型 id；推断失败时为空串。 */
+  modelId: string
+  /** 服务端接受并完成了这次请求。 */
+  ok: boolean
+  /** 失败时的可读原因（`仍受限：…` / `无法确认：…`）。 */
+  message?: string
+  /** 失败且上游给出重置时刻时带出（**不落盘**）。 */
+  resetTimeMs?: number
 }
 
 /** 重置单个账号的限流标记（不测试，直接清除）。 */
@@ -443,6 +491,31 @@ export interface RpcCreditsBalanceAccount {
   balance: import('./credits.js').CreditBalance | null
   /** 查询失败的原因，供 UI 提示（成功时为 undefined）。 */
   error?: string
+  /**
+   * 与余额**并列**的附加读数（不属于余额语义，故不塞进 `CreditBalance`）。
+   *
+   * 目前只有 Gemini 用：它的「账号规格」（Google AI Pro / Free）来自
+   * `loadCodeAssist`，与配额是两个端点，但搭同一次 `credits.balances` 回来。
+   * 缺省 = 该 provider 没有附加读数 / 这次没取到 ⇒ 面板不渲染对应行。
+   */
+  extra?: RpcCreditsBalanceExtra
+}
+
+/**
+ * 逐账号附加读数。
+ *
+ * ⚠️ 用**对象**而不是把字段平铺到 {@link RpcCreditsBalanceAccount} 上：
+ * 平铺会让 `usage-badge.ts` / 卡片里所有逐账号形状的断言都跟着膨胀，
+ * 而这类读数注定还会增加（每加一个 provider 就多一批字段）。
+ */
+export interface RpcCreditsBalanceExtra {
+  /**
+   * 账号规格短标签（`Pro` / `Free` / `Ultra`）。
+   *
+   * `title` 放上游原文（`Google AI Pro（g1-pro-tier）`），hover 才看得到
+   * —— 面板空间只够一个词。
+   */
+  accountTier?: { label: string; title: string }
 }
 
 /** RPC: 查询积分余额响应 */
@@ -885,6 +958,24 @@ export interface RpcGatewayStatusResponse {
 export interface RpcGatewayModel {
   /** 可直接填进 agent 配置的完整 ID（`provider/模型名`）。 */
   id: string
+  /**
+   * 该条目所属的 provider key（**采集侧给的权威拆分**，不是从 `id` 切出来的）。
+   *
+   * ⚠️ 存在的理由：设置页要按「一家供应商一张卡片」分组，而模型名里**允许带
+   * 斜杠**（实测 Cline 的 `cline/anthropic/claude-sonnet-5.5`）。前端按首个 `/`
+   * 反推 provider 在正常数据上恰好也对，但那是**巧合**而非契约 —— 一旦某家
+   * provider 的模型名以 `/` 开头、或 provider key 本身含 `/`，反推就错位，
+   * 表现为「模型被分到了不存在的那一家」。分组是用户的语义，故由采集侧给定。
+   */
+  provider: string
+  /**
+   * provider **内部**的模型名（不含 `<provider>/` 前缀）。
+   *
+   * 卡片头已经把供应商写清楚了，行内再重复一遍前缀只是噪声：实测
+   * `codearts/deepseek-v4.1-flash` 这类 id 会占满整行，窄面板下被截成
+   * `codearts/deepse…` —— 用户既看不出模型名，也读不到能复制的 ID。
+   */
+  model: string
   /** 模型展示名，仅供人辨认。 */
   name: string
   /**
@@ -895,6 +986,26 @@ export interface RpcGatewayModel {
    * 保守按 text 处理」一致）。
    */
   input: readonly string[]
+  /**
+   * 思考档位视图（与 `/v1/models` 的 `reasoning` 字段**同一份**）。
+   *
+   * 存在的理由与 `models` 相同，但更硬：各 provider 的档位 id 是**上游私有值**
+   * （TRAE 的 `light`/`extra_high`、LobsterAI 的 `xhigh`（界面上叫 Max）、
+   * Cline 的 `max`（界面上叫 Extra）），而 OpenAI 客户端只有固定 8 档词汇。
+   * 用户只能照 DSH 界面上的名字猜着填，猜错就是 400。
+   * `openai_efforts` 就是「该填哪几个」的机读答案。
+   *
+   * 缺省表示该模型**未声明**档位（网关不下发该参数、按模型默认走），
+   * 与「声明了但为空」不是一回事。
+   */
+  reasoning?: {
+    /** 模型真实接受的 id，以及它在客户端里该写成的规范名。 */
+    efforts: Array<{ id: string; name: string; canonical?: string }>
+    /** 适配器配置的默认档（省略表示交给上游默认）。 */
+    default?: string
+    /** 可直接填进客户端的规范名清单（与 `efforts` 一一对应，无翻译损失）。 */
+    openai_efforts: string[]
+  }
 }
 
 /** RPC: 本机 OpenAI 网关开关写入请求。 */

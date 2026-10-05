@@ -8,23 +8,43 @@
  * 把「该显示什么」全部搬到本模块后，三态偏好 × 三种数据形态的**每一种组合**
  * 都能被单测逐条锁死（见 `tests/unit/badge-model.spec.ts`）。
  *
- * ## 显示优先级（用户 2026-10-01 定：窗口 > 套餐包 > 积分）
+ * ## 显示优先级（用户 2026-10-03 改：**余额优先**）
  *
  * | 偏好 | 行为 |
  * |---|---|
- * | `auto`（默认） | 有订阅读数就显示订阅（窗口优先，其次套餐包），否则积分 |
- * | `subscription` | 同上，但**不会**因为「订阅读数为 0/空」就回落到积分吗？——会回落，见下 |
- * | `credits` | 始终显示积分（也是套餐判定误判时的兜底开关） |
+ * | `auto`（默认） | **余额优先**；没有余额读数才依次回落到窗口、套餐 |
+ * | `subscription` | 窗口优先，其次套餐，最后余额（想盯百分比的人用这个档） |
+ * | `credits` | 只看余额（也是套餐判定误判时的兜底开关） |
+ *
+ * ## ⚠️ 为什么 `auto` 从「订阅优先」改成「余额优先」（真实报障，2026-10-03）
+ *
+ * 用户报障：CodeBuddy 胶囊显示「个人体验版 500 / 500积分」，而设置页里明明写着
+ * **可用积分 2434.96**。两者都是真的，但**回答的不是同一个问题**：
+ *
+ * - 套餐读数是「某一份套餐包还剩多少 / 共有多少」——它只是余额里的一份，
+ *   服务端还会下发「体验版」这类样板包；拿它当读数会**少报**可用额度；
+ * - 余额读数是「这个渠道**一共**还能用多少」——这才是用户看胶囊要的答案。
+ *
+ * 旧口径（窗口 > 套餐 > 积分）在这种「既有套餐包又有余额」的渠道上必然少报，
+ * 且**看起来像数据错误**（用户原话：「图3里显示我能用的积分足足 2436.96 呢」）。
+ *
+ * ⚠️ 窗口与套餐读数**没有删掉**：它们仍在浮层里（逐账号明细 / 订阅额度区），
+ * 且 `subscription` 档位可以随时切回去。改的只是**折叠态默认显示哪一个**。
  *
  * ⚠️ 「订阅读数存在但内容为空」（例如账号 `ok:true` 却 `windows: []`）必须
- * **回落到积分**：否则徽标会显示成 `Cline · `（只有渠道名、没有数字），
+ * **回落**到下一个候选：否则徽标会显示成 `Cline · `（只有渠道名、没有数字），
  * 比显示余额更没用。
  *
- * ⚠️ 多单位**绝不跨单位求和**：ZCode 的额度是 token，其余是积分。同一渠道内
- * 单位一致，但代码里不做这个假设 —— 出现两种单位时按单位分组并列显示。
+ * ⚠️ 多单位**绝不跨量纲求和**：ZCode 的额度是 token，其余是积分，两者不可折算，
+ * 故按单位分组并列显示。
+ *
+ * ⚠️ 但**分组键必须先归一**（`normalizeUnit`）：同一个单位服务端会有多种拼法
+ * （实测 `credit` / `credits` / 空串），按原值分组会把同一渠道拆成两组、
+ * 渲染出 `341.78积分 · 100积分` 这种「两个一样的标签并排」的文案
+ * （真实报障，2026-10-03）。详见 `credits-format.js` 文件头。
  */
 
-import { formatUnits, unitLabel } from './credits-format.js';
+import { formatUnits, formatQuotaLine, normalizeUnit, unitLabel, QUOTA_UNIT } from './credits-format.js';
 import { quotaWindowsOf, quotaPercentValue, quotaTone } from './quota-format.js';
 
 /**
@@ -38,6 +58,16 @@ export const BADGE_PREFERENCES = Object.freeze(['auto', 'subscription', 'credits
 
 /** 默认偏好（宿主侧的默认值必须与它相同）。 */
 export const DEFAULT_BADGE_PREFERENCE = 'auto';
+
+/**
+ * 折叠态里**渠道名与读数之间**的分隔符（用户 2026-10-03 定：''供应商 • 剩余积分''）。
+ *
+ * ⚠️ 它是一个常量而不是各处手写的字符串：完整文案（{@link badgeView} 的 `text`，
+ * 供 title / aria-label 用）由 `名字 + BADGE_SEP + 读数` 拼出，而胶囊里那三段是
+ * **三个独立的 span**（名字可收缩、读数不可）。两边若各写一份字形，改一处就会
+ * 出现「悬浮提示写着 • 而胶囊里是 ·」这种不一致。
+ */
+export const BADGE_SEP = ' • ';
 
 /**
  * 「宿主进程跑的是旧代码」的用户提示（真实故障，2026-10-02 用户报障）。
@@ -76,11 +106,21 @@ export function describeBadgeError(error, fallback = '') {
   return message.length > 0 ? message : fallback;
 }
 
-/** 偏好的展示名（弹窗里的三态开关）。 */
+/**
+ * 偏好的展示名（弹窗里的三态开关）。
+ *
+ * ⚠️ 2026-10-03 语义反转后，`auto` 与 `credits` 的含义**不再对等**：
+ * - `auto` = **余额优先**（没有余额读数才回落到窗口/套餐）；
+ * - `subscription` = 只看订阅（窗口 > 套餐 > 余额）；
+ * - `credits` = **只看余额**（不回落到订阅 —— 它是套餐误判时的兜底开关）。
+ *
+ * 故 `auto` 的展示名保留「自动」（不写「优先积分」），否则三档里两档同义、
+ * 用户无法从名字看出差别。真正的区别写在 title 里（见 usage-badge.js）。
+ */
 export const BADGE_PREFERENCE_LABELS = Object.freeze({
   auto: '自动',
   subscription: '优先订阅',
-  credits: '优先积分',
+  credits: '只看积分',
 });
 
 /** 归一化偏好：未知值一律回落到默认（宿主若返回脏值，UI 不该崩）。 */
@@ -108,7 +148,23 @@ export function windowPreview(windows, limit = 2) {
  * - `failedCount` 单独给出，供 UI 说明「另有 N 个账号读取失败」——
  *   **不要把失败画成 0**（0 会被读成「额度用光了」）。
  *
- * @returns `{ groups: [{ unit, label, total, accountCount }], failedCount, okCount }`
+ * ⚠️ 分组键是 {@link normalizeUnit} 的结果，**不是**包上的原始 `unit` 字符串。
+ * 真实缺陷（2026-10-03）：WorkBuddy 国际版两个账号的包分别是 `unit: 'credit'` 与
+ * `unit: 'credits'`（服务端同义异拼），按原值分组会把它们拆成两组，胶囊于是渲染
+ * `341.78积分 · 100积分` —— 两个一模一样的「积分」标签并排，账号一多就成一长串。
+ * 归一到展示口径后，**任意账号数都只产生一个数字**（`441.78积分`）。
+ * 详见 `credits-format.js` 文件头。
+ *
+ * ⚠️ **配额单位（{@link QUOTA_UNIT}）不求和、也不显示均值**：窗口是并行的
+ * 百分比，`balance.total` 只是宿主侧把两个窗口剩余比例取的平均（94.5）——
+ * 上游根本没有这个数，累加更是无意义（两个账号各 50% 加起来是 100%？）。
+ * 这类单位改为**逐账号列出各自的窗口行**（`quotaLines`），由
+ * {@link readingOf} 原样展示。
+ *
+ * ⚠️ `quotaLines` / `quotaRemainings` 两个键**只在配额单位下存在**：其它单位
+ * 的分组形状与改动前逐字相同（有测试直接 `toEqual` 整个分组对象）。
+ *
+ * @returns `{ groups: [{ unit, label, total, accountCount, quotaLines?, quotaRemainings? }], failedCount, okCount }`
  */
 export function creditGroupsOf(accounts) {
   const rows = Array.isArray(accounts) ? accounts : [];
@@ -123,11 +179,28 @@ export function creditGroupsOf(accounts) {
     }
     okCount += 1;
     // 单位从**包**上取（ZCode 是 token，其余是积分）；一个包都没有时按空串走
-    // `unitLabel` 的默认（「积分」）——与账号卡片的口径一致。
-    const unit = firstUnitOf(balance.packages) ?? '';
+    // `normalizeUnit` 的默认（积分）——与账号卡片的口径一致。
+    // ⚠️ 取到原值后**必须**归一：同义异拼（credit / credits / ''）不能各成一组。
+    // ⚠️ 但**配额单位（{@link QUOTA_UNIT}）不参与归一**：`normalizeUnit` 只认
+    // `token` 一个特例，把 `'%'` 也塞进去会得到 `'credit'`，于是
+    // `unit === QUOTA_UNIT` 永远为假 —— `quotaLines` / `quotaRemainings` 两个键
+    // 再也挂不上，色调也退回「均值 > 0 即绿」的老缺陷（真实回归，2026-10-03 合并时踩到）。
+    const rawUnit = firstUnitOf(balance.packages) ?? '';
+    const unit = rawUnit === QUOTA_UNIT ? QUOTA_UNIT : normalizeUnit(rawUnit);
     const group = byUnit.get(unit) ?? { unit, label: unitLabel(unit), total: 0, accountCount: 0 };
     group.total += balance.total;
     group.accountCount += 1;
+    if (unit === QUOTA_UNIT) {
+      const line = formatQuotaLine(balance.packages, unit);
+      group.quotaLines = group.quotaLines ?? [];
+      group.quotaRemainings = group.quotaRemainings ?? [];
+      if (line !== null) group.quotaLines.push(line);
+      for (const pkg of Array.isArray(balance.packages) ? balance.packages : []) {
+        if (pkg && typeof pkg.remaining === 'number' && Number.isFinite(pkg.remaining)) {
+          group.quotaRemainings.push(pkg.remaining);
+        }
+      }
+    }
     byUnit.set(unit, group);
   }
   // 顺序固定：单位名排序（通常只有一个分组；多单位时顺序稳定，避免每次渲染抖动）
@@ -142,6 +215,10 @@ export function creditGroupsOf(accounts) {
  * 多账号下「按包名汇总」才回答得了那个问题（弹窗里再逐账号列出）。
  * 排序按剩余额度降序 ⇒ 折叠态取第一条即「最大的那份套餐」。
  *
+ * ⚠️ 分组键里的单位同样走 {@link normalizeUnit}：同一份套餐在不同账号上可能被
+ * 服务端拼成 `credit` / `credits`，用原值当键会把**同一个包**拆成两组，
+ * 于是「N 个账号合计」变成「每个账号一组」（与 `creditGroupsOf` 同款缺陷）。
+ *
  * @returns `[{ name, unit, label, remaining, total, accountCount, deductionEndTime }]`
  */
 export function planGroupsOf(rows) {
@@ -150,7 +227,7 @@ export function planGroupsOf(rows) {
   for (const row of list) {
     const plan = row?.plan;
     if (!plan) continue;
-    const unit = typeof plan.unit === 'string' ? plan.unit : '';
+    const unit = normalizeUnit(typeof plan.unit === 'string' ? plan.unit : '');
     const key = `${String(plan.name)}\u0000${unit}`;
     const group = byKey.get(key) ?? {
       name: String(plan.name),
@@ -189,9 +266,14 @@ export function planGroupsOf(rows) {
  *   用户会以为账号丢了（真实报障，2026-10-02）。
  * @param input.failed - **首次读数失败且无任何数据**（显示「用量不可用」而不是
  *   「未配置启用账号」）：两种情况用户要做的下一步完全不同。
- * @returns `{ mode, text, tone, groups, planGroups, windows, failedCount, okCount, failureReason }`
+ * @returns `{ mode, name, detail, reading, text, tone, groups, planGroups, windows, failedCount, okCount, failureReason, incompleteNote }`
  *   - `mode`：`'loading' | 'windows' | 'plan' | 'credits' | 'empty'`（**回落之后**的实际模式）；
- *   - `tone`：`'ok' | 'warn' | 'error' | 'muted'`（徽标圆点用）。
+ *   - `name` / `detail` / `reading`：三段内容，**分开**给渲染层（见 {@link readingOf} 的说明）；
+ *     恒有 `text === composeText(name, detail, reading)`；
+ *   - `text`：完整一行，用于 `title` / `aria-label`；
+ *   - `tone`：`'ok' | 'warn' | 'error' | 'muted'`（徽标圆点用）；
+ *   - `incompleteNote`：读数**不完整**时的说明（目前只有积分合计会缺账号），
+ *     空串表示完整 —— 渲染层据此决定要不要在胶囊上挂一个警示标记。
  */
 export function badgeView(input) {
   const providerLabel = String(input?.providerLabel ?? 'Jet Hub');
@@ -201,11 +283,20 @@ export function badgeView(input) {
   const loading = input?.loading === true;
   const failed = input?.failed === true;
 
-  /** 空/加载状态的统一返回（保持与成功路径同一组键，调用方不必做形状判断）。 */
-  const placeholder = (mode, text, tone) => ({
+  /**
+   * 空/加载状态的统一返回（保持与成功路径同一组键，调用方不必做形状判断）。
+   *
+   * ⚠️ 入参是**读数**而不是整句文案：渠道名在这里补上，于是 `name` / `reading` /
+   * `text` 三者**不可能**自洽不了（否则会出现「文案里有名字、`name` 是空的」
+   * 这种半改状态，而胶囊只渲染 `name` + `reading`）。
+   */
+  const placeholder = (mode, reading, tone) => ({
     mode,
     preference,
-    text,
+    name: providerLabel,
+    detail: '',
+    reading,
+    text: composeText(providerLabel, '', reading),
     tone,
     groups: [],
     planGroups: [],
@@ -213,12 +304,13 @@ export function badgeView(input) {
     failedCount: 0,
     okCount: 0,
     failureReason: '',
+    incompleteNote: '',
   });
 
   // 首屏：读数还没到 → 明确的「读取中…」，**不要**说成「未配置启用账号」。
-  if (loading) return placeholder('loading', `${providerLabel} · 读取中…`, 'muted');
+  if (loading) return placeholder('loading', '读取中…', 'muted');
   // 首次读数就失败（且没有任何有效数据）→ 「用量不可用」，与「没有账号」区分开。
-  if (failed && accounts.length === 0) return placeholder('empty', `${providerLabel} · 用量不可用`, 'error');
+  if (failed && accounts.length === 0) return placeholder('empty', '用量不可用', 'error');
 
   const { groups, failedCount, okCount } = creditGroupsOf(accounts);
   /**
@@ -234,23 +326,64 @@ export function badgeView(input) {
   const windowAccount = windowRows.find((row) => row?.ok === true) ?? windowRows[0];
   const windows = windowAccount === undefined ? [] : windowPreview(windowAccount.windows);
   const planGroups = subscription?.kind === 'plan' ? planGroupsOf(subscription.accounts) : [];
-  const wantsSubscription = preference !== 'credits';
 
   const failureReason = firstFailureReason(accounts);
 
-  /** 订阅形态缺失（或内容为空）时一律回落 —— 见文件头的 ⚠️。 */
-  const mode = wantsSubscription && windows.length > 0
-    ? 'windows'
-    : wantsSubscription && planGroups.length > 0
-      ? 'plan'
-      : groups.length > 0
-        ? 'credits'
-        : 'empty';
+  /**
+   * 模式 = 按**偏好排出的候选顺序**里第一个有内容的（见文件头的优先级表）。
+   *
+   * ⚠️ 用「有序候选表 + find」而不是嵌套三元：旧写法把「偏好」与「形态」两个维度
+   * 揉进一个条件表达式，加一档就要重排整棵嵌套，极易把某个组合写漏
+   * （旧代码里 `wantsSubscription` 一个布尔同时承担「是否看订阅」与
+   * 「是否允许回落」两义）。候选表让每种偏好**一眼可读**。
+   *
+   * ⚠️ 每个候选都必须判「**有内容**」而不是「存在」：账号 `ok:true` 但
+   * `windows: []` / 包全失效时，订阅对象是在的、内容却是空的 ——
+   * 直接选中它会显示成 `Cline · `（只有渠道名，没有数字）。
+   */
+  const candidates = preference === 'subscription'
+    ? ['windows', 'plan', 'credits']
+    : preference === 'credits'
+      ? ['credits']
+      : ['credits', 'windows', 'plan'];
+  const hasContent = {
+    credits: groups.length > 0,
+    windows: windows.length > 0,
+    plan: planGroups.length > 0,
+  };
+  const mode = candidates.find((candidate) => hasContent[candidate]) ?? 'empty';
+
+  const { detail, reading } = readingOf({ mode, windows, planGroups, groups, accounts, failedCount });
+
+  /**
+   * 「这个数字不完整」的提示（2026-10-03，用户要求：多账号时合计会**静默少报**）。
+   *
+   * ## 为什么只在 `credits` 模式给
+   *
+   * 只有积分模式读数是**跨账号的合计** —— 少读一个账号，合计就少一截，而胶囊上
+   * 完全看不出来（`tone` 仍是 `ok`，弹窗脚注又在弹窗里）。账号越多越容易撞上：
+   * 六个号里坏一个，用户会把「少了一截的合计」当成真实余额。
+   *
+   * 窗口模式按设计只显示**某一个账号**的窗口，套餐模式显示的是「最大的那份套餐」，
+   * 两者都不是合计，套用「未计入合计」这句话是不准确的 —— 宁可不标，也不说错。
+   *
+   * ⚠️ `okCount > 0` 是必要的：一个都没读到（`okCount === 0`）时模式会回落到
+   * `empty`，读数本身就是「用量不可用」，再加一句「未计入合计」纯属噪音。
+   *
+   * ⚠️ 文案必须说清**是什么没读到**（「余额读取失败」）而不是笼统的「有账号异常」：
+   * 用户据此判断的是「这个数能不能信」，指向不明就没法判断。
+   */
+  const incompleteNote = mode === 'credits' && okCount > 0 && failedCount > 0
+    ? `另有 ${failedCount} 个账号的余额读取失败，未计入合计`
+    : '';
 
   return {
     mode,
     preference,
-    text: textOf({ mode, providerLabel, windows, planGroups, groups, accounts, failedCount }),
+    name: providerLabel,
+    detail,
+    reading,
+    text: composeText(providerLabel, detail, reading),
     tone: toneOf({ mode, windows, planGroups, groups, accounts }),
     groups,
     planGroups,
@@ -258,27 +391,91 @@ export function badgeView(input) {
     failedCount,
     okCount,
     failureReason,
+    incompleteNote,
   };
 }
 
-/** 折叠态文案（各模式一行）。 */
-function textOf({ mode, providerLabel, windows, planGroups, groups, accounts, failedCount }) {
+/**
+ * 把折叠态拆成**三段**：渠道名 → 可选的中段说明 → 读数。
+ *
+ * 名字与读数由 {@link badgeView} 直接给出，本函数只负责拼出**整句文案**（`text`），
+ * 供 `title` / `aria-label` 与读屏使用。三者恒满足：
+ *
+ * ```
+ * text === name + BADGE_SEP + (detail === '' ? '' : detail + ' ') + reading
+ * ```
+ *
+ * ⚠️ 渲染层**不**用这个字符串，而是按同一组字段渲染成多个 span（见
+ * {@link readingOf} 的说明）—— 两条路径共用同一份字段，故不可能显示成两样。
+ */
+function composeText(name, detail, reading) {
+  const middle = detail === '' ? '' : `${detail} `;
+  return `${name}${BADGE_SEP}${middle}${reading}`;
+}
+
+/**
+ * 折叠态的**三段内容**（渠道名与两段读数）。
+ *
+ * ## 为什么把「名字」与「读数」拆开返回（真实报障，2026-10-03）
+ *
+ * 用户报障：胶囊显示成 `LobsterAI (有道) · 合计 …`，**后面的数字被截掉了**。
+ *
+ * 根因不在宽度，而在结构：原先整句是**一个** `overflow: hidden` 的 span，省略号
+ * 从右往左吃 —— 而被吃掉的那一段恰恰是用户唯一想看的东西（还剩多少）。渠道名
+ * 反而完整保留。故这里拆成独立字段，渲染层再给**不同的收缩权重**。
+ *
+ * ## 口径（用户 2026-10-03 定）
+ *
+ * ```
+ * WorkBuddy (国际版) • 200积分
+ * LobsterAI (有道) • 842.06积分
+ * ```
+ *
+ * - 分隔符是 {@link BADGE_SEP}（` • `），不是原来的 ` · `（那个仍用于**读数内部**
+ *   的多段分隔，如 `5 小时 6% · 本周 2%`）；
+ * - 积分模式下**去掉「合计」**：胶囊只有一行，那个词占位却不提供信息，多账号明细
+ *   与合计都在弹窗里逐条列出（节标题右侧的 `合计 ${sum}` 仍在）；
+ * - 数值与单位**之间不留空格**（`200积分` 而不是 `200 积分`）—— 与用户给的
+ *   样例逐字一致，也省下每个单位约 3px（胶囊按 px 计费）。
+ *
+ * @returns `{ detail, reading }`
+ *   - `detail`：中段说明（**只有套餐模式**有值 —— 包名如 `Free Plan Subscription`；
+ *     它在渲染层是**最先**被省略的那个，因为数字比包名重要）。其余模式为空串；
+ *   - `reading`：真正的读数，渲染层**最后**才动它。
+ */
+function readingOf({ mode, windows, planGroups, groups, accounts, failedCount }) {
   if (mode === 'windows') {
+    // 窗口读数分不出「说明」与「数值」：`5 小时 6%` 是一个整体，拆开会出现
+    // 「5 小时」被单独留下而百分号被截的荒唐结果。故整段进 reading。
     const parts = windows.map((win) => `${win.label} ${win.percent}%`);
-    return `${providerLabel} · ${parts.join(' · ')}`;
+    return { detail: '', reading: parts.join(' · ') };
   }
   if (mode === 'plan') {
     const best = planGroups[0];
     const range = `${formatUnits(best.remaining, best.unit) ?? '?'} / ${formatUnits(best.total, best.unit) ?? '?'}`;
-    return `${providerLabel} · ${best.name} ${range} ${best.label}`;
+    // ⚠️ 包名进 detail、`剩余 / 总量 + 单位` 进 reading：包名（多为
+    // `Free Plan Subscription` 这类样板字）比数字长得多且信息量低。
+    return { detail: best.name, reading: `${range}${best.label}` };
   }
   if (mode === 'credits') {
-    const parts = groups.map((group) => `${formatUnits(group.total, group.unit) ?? '?'} ${group.label}`);
-    return `${providerLabel} · 合计 ${parts.join(' · ')}`;
+    /**
+     * ⚠️ 配额单位（Gemini）**不显示「合计 94.50 额度」**：那 94.50 是宿主把
+     * 两个窗口剩余比例取的平均值，上游根本没有这个数，而「合计」这个词又暗示
+     * 可累加——配额窗口是并行百分比，没有「一共」的语义。
+     * 改为逐账号列出各自的窗口行（与设置页账号卡片同一个 `formatQuotaLine`）。
+     */
+    const quotaGroup = groups.find((group) => group.unit === QUOTA_UNIT);
+    if (quotaGroup !== undefined) {
+      const lines = quotaGroup.quotaLines ?? [];
+      if (lines.length === 0) return { detail: '', reading: '额度不可用' };
+      return { detail: '', reading: lines.join(' · ') };
+    }
+    // `group.label` 就是 unitLabel(unit)（'积分' / 'Token'），故直接贴紧数值。
+    const parts = groups.map((group) => `${formatUnits(group.total, group.unit) ?? '?'}${group.label}`);
+    return { detail: '', reading: parts.join(' · ') };
   }
   // empty：区分「没有启用账号」与「全部读取失败」——两者给用户的下一步完全不同。
-  if (accounts.length > 0 && failedCount > 0) return `${providerLabel} · 用量不可用`;
-  return `${providerLabel} · 未配置启用账号`;
+  return { detail: '', reading: accounts.length > 0 && failedCount > 0 ? '用量不可用' : '未配置启用账号' };
 }
 
 /** 徽标色调（圆点）。 */
@@ -289,6 +486,14 @@ function toneOf({ mode, windows, planGroups, groups, accounts }) {
   }
   if (mode === 'plan') return planGroups[0].remaining > 0 ? 'ok' : 'warn';
   if (mode === 'credits') {
+    // ⚠️ 配额单位用**最紧张的那个窗口**判色调（与 windows 模式同一套三档）：
+    // 用 `group.total > 0`（均值）会把「5 小时窗口已耗尽、周窗口还剩 90%」
+    // 的账号画成绿点 —— 那个 45% 的均值正好绕过告警线。
+    const quotaGroup = groups.find((group) => group.unit === QUOTA_UNIT);
+    if (quotaGroup !== undefined) {
+      const remainings = quotaGroup.quotaRemainings ?? [];
+      return remainings.length === 0 ? 'warn' : quotaTone(100 - Math.min(...remainings));
+    }
     return groups.some((group) => group.total > 0) ? 'ok' : 'warn';
   }
   return accounts.length > 0 ? 'error' : 'muted';
@@ -307,6 +512,48 @@ function firstUnitOf(packages) {
   if (!Array.isArray(packages)) return undefined;
   const hit = packages.find((pkg) => pkg && typeof pkg.unit === 'string' && pkg.unit.length > 0);
   return hit === undefined ? undefined : hit.unit;
+}
+
+/**
+ * 积分列表的排序键：**余额大的在前，读不到数的排最后**。
+ *
+ * ⚠️ 读不到数的行必须排最后，不能用 0 代替：`0` 会把它们插进「余额很小」的位置，
+ * 而它们那一格显示的是**错误文案** —— 夹在数字中间会被误读成一个很小的余额。
+ */
+function balanceOrder(row) {
+  const total = row?.balance?.total;
+  return typeof total === 'number' && Number.isFinite(total) ? total : Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * 弹窗里积分列表的**排序 + 折叠**（纯函数，2026-10-03 用户要求）。
+ *
+ * ## 两条规则
+ *
+ * 1. **按余额降序**：账号是「用完一个换下一个」的资源，用户要先看到的正是
+ *    「还有哪个号能用」。原来的顺序是账号池的插入顺序，与余额无关。
+ *    ⚠️ 读不到数的行排最后（见 {@link balanceOrder}）。
+ * 2. **超过 `limit` 个就折叠**：6 个号本来是**十二行**（每号两行：数值 + 分桶
+ *    说明），足够把弹窗撑得比窗口还高。折叠后固定 limit 行 + 一行「展开其余 N 个」。
+ *
+ * ⚠️ 折叠**不隐藏任何结论**：合计在节标题、读取失败数在脚注，两者都在折叠之外。
+ * 收起来的只是逐账号明细 —— 那本来就是「要核对时才看」的东西。
+ *
+ * ⚠️ 排序必须**稳定**（`Array.prototype.sort` 在现代 JS 里已保证）：两个余额相同的
+ * 账号每次渲染互换位置会让 DOM 抖动，用户会以为数字在变。
+ *
+ * @param rows - 逐账号余额行（`RpcCreditsBalanceAccount[]`，可能含 `balance: null`）。
+ * @param options.limit - 折叠前显示的条数（`CREDITS_COLLAPSED_LIMIT`）。
+ * @param options.expanded - 用户是否点了「展开」。
+ * @returns `{ shown, hidden }` —— `shown` 是要渲染的那些行，`hidden` 是被收起的条数
+ *   （0 表示没有可折叠的，渲染层据此决定要不要那个按钮）。
+ */
+export function orderCreditRows(rows, options = {}) {
+  const limit = Number.isFinite(options.limit) ? options.limit : 0;
+  const ordered = [...(Array.isArray(rows) ? rows : [])]
+    .sort((a, b) => balanceOrder(b) - balanceOrder(a));
+  const hidden = Math.max(0, ordered.length - limit);
+  return { shown: options.expanded === true ? ordered : ordered.slice(0, limit), hidden };
 }
 
 /**

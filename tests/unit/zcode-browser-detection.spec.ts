@@ -59,16 +59,41 @@ describe('ZCode 浏览器探测', () => {
     const dir = mkdtempSync(join(tmpdir(), 'zcode-browser-rel-'))
     const cwdSaved = process.cwd()
     try {
-      // 在当前工作目录下造一个同名文件 —— 相对路径会指向它。
+      /**
+       * ⚠ 诱饵文件放在**专属临时目录**并 `chdir` 进去，**不写 `process.cwd()`**
+       * （Gitee issue IKJMQ5，本机实测复现）。
+       *
+       * 相对路径是**相对 CWD** 解析的，所以「CWD 里有同名文件」这个前提不能省 ——
+       * 但把它实现成「往仓库根写一个**固定名**文件」会引入两个真问题：
+       *
+       * ① **并行跑必炸，且是假失败**：另一个 vitest 进程正持有同名文件的句柄时，
+       *    Windows 的删除直接 `EPERM`，而 `rmSync(..., { force: true })` 的
+       *    `force` **只吞 ENOENT、不吞 EPERM** ⇒ 异常从 `finally` 抛出，
+       *    用例变红。**被测代码行为完全正确**，红的是脚手架。
+       *    实测（本机，8 个 vitest 进程并发）：8 轮 80 次 → 2 次红；
+       *    4 并发 100 次 → 2 次红；2 并发 80 次 → 0 次红。
+       *    ⚠ 单次 `vitest run` **不会**触发（同一文件在一个进程里只跑一次），
+       *    所以这是「多进程共享同一工作区」才暴露 —— CI 并行 job、
+       *    本地同时跑两条测试、IDE 里 watch 与手动跑重叠都会撞上。
+       * ② **会往仓库根留垃圾**：进程被 kill / 超时时 `finally` 不执行，
+       *    `chrome-rel-test.exe` 就留在仓库根进 `git status`。
+       *
+       * ⇒ 修法：诱饵文件随 `mkdtempSync` **每个进程独占**，CWD 由 `chdir`
+       * 临时切进该目录，测完在 `finally` 里切回。
+       * ⚠ `process.chdir` 需要 worker 是**真进程**（vitest 默认 pool `forks`；
+       * 若哪天改成 `threads` 会抛 `ERR_WORKER_UNSUPPORTED_OPERATION`，
+       * 那时这条会**响亮地**失败，而不是静默失去覆盖）。
+       */
       const relative = 'chrome-rel-test.exe'
-      writeFileSync(join(cwdSaved, relative), '')
+      writeFileSync(join(dir, relative), '')
+      process.chdir(dir)
       setEnv('ZCODE_CHROME_PATH', relative)
       // ⚠ 相对路径不该被接受（否则会误把它当浏览器）。
       const found = findBrowserExecutable()
       expect(found).not.toBe(relative)
       if (found !== undefined) expect(isAbsolute(found)).toBe(true)
     } finally {
-      rmSync(join(cwdSaved, 'chrome-rel-test.exe'), { force: true })
+      process.chdir(cwdSaved)
       rmSync(dir, { recursive: true, force: true })
     }
   })

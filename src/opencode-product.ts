@@ -23,6 +23,10 @@
  * 指纹派生的作用是**防关联**与满足形状门禁，不是换配额桶。
  */
 
+// `retry-after` 的解析已收敛到 `src/retry-after.ts`（原先本文件与
+// `opencode-adapter.ts` 各有一份几乎逐字相同的私有实现）。
+import { retryAfterMsFromRecord } from './retry-after.js'
+
 export interface OpencodeProduct {
   readonly id: 'opencode'
   readonly displayName: string
@@ -169,20 +173,6 @@ export interface OpencodeErrorInfo {
   detail: string
 }
 
-/** 从响应头解析 `retry-after`（支持秒数与 HTTP 日期）。 */
-function parseRetryAfterMs(headers: Readonly<Record<string, string>> | undefined): number | undefined {
-  const raw = headers?.['retry-after'] ?? headers?.['Retry-After']
-  if (raw === undefined || raw === null || raw === '') return undefined
-  // ⚠️ 只放行纯数字：Date.parse('900') 会得到一个 1970 年的时刻，
-  // 算出巨大的负数差从而被 Math.max(0, …) 抹成 0（「立即解除」）——
-  // 那会让额度刚用尽的账号马上被重选，形成无限空转。
-  const seconds = Number(raw)
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000)
-  const at = Date.parse(raw)
-  if (Number.isFinite(at)) return Math.max(0, at - Date.now())
-  return undefined
-}
-
 /** 从错误体里抽出人可读片段（禁止把整坨 JSON 抛给用户）。 */
 function readableDetail(body: string): string {
   const text = body.trim()
@@ -213,7 +203,7 @@ export function classifyOpencodeError(
   body: string,
   headers?: Readonly<Record<string, string>>,
 ): OpencodeErrorInfo {
-  const retryAfterMs = parseRetryAfterMs(headers)
+  const retryAfterMs = retryAfterMsFromRecord(headers)
   const detail = readableDetail(body)
   const lower = body.toLowerCase()
 

@@ -3,23 +3,18 @@
  *
  * 覆盖**纯函数**与**序列化层**——那些「写错了不会报错、只会静默行为错」
  * 的部分（这正是 AGENTS.md 里 Qoder 三处缺陷的共同形态）。
+ *
+ * ⚠ 本文件**不再**测试「读本机官方客户端凭据」——那套能力已于 2026-10-05
+ * 整体删除（用户决策：只用插件自己的 auth 流程）。防回退的锁在
+ * `zcode-no-local-credential-read.spec.ts`。
  */
 import { describe, expect, it } from 'vitest'
-import { createCipheriv, createHash, randomBytes } from 'node:crypto'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { homedir, platform, tmpdir, userInfo } from 'node:os'
-import { join } from 'node:path'
 import {
-  CREDENTIAL_PREFIX,
-  credentialFileCandidates,
-  decryptCredentialValue,
-  deriveCredentialKey,
-  identityFromUserInfo,
-  labelFromUserInfo,
+  isUsableZcodeCredential,
+  isZcodeExpired,
   phoneFromUserId,
-  readRawCredentials,
-  readUserIdFromUserInfo,
-  readZcodeCredential,
+  ZCODE_APP_VERSION_FALLBACK,
+  ZCODE_REFRESHABLE,
 } from '../../src/zcode.js'
 import {
   validateCaptchaParam,
@@ -53,133 +48,9 @@ import {
 } from '../../src/zcode-adapter.js'
 import { toClaimOutcome, emptyCheckinStatus } from '../../src/zcode-auth.js'
 
-// ───────────────────────────── 凭据解密 ─────────────────────────────
-
-/** 按官方算法加密一个值（测试用反向实现）。 */
-function encrypt(value: string, secret?: string): string {
-  const key = secret !== undefined
-    ? createHash('sha256').update(secret).digest()
-    : deriveCredentialKey({})
-  const iv = randomBytes(12)
-  const cipher = createCipheriv('aes-256-gcm', key, iv)
-  const data = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()])
-  const tag = cipher.getAuthTag()
-  return `${CREDENTIAL_PREFIX}${iv.toString('base64url')}.${tag.toString('base64url')}.${data.toString('base64url')}`
-}
-
-describe('ZCode 凭据解密（AES-256-GCM）', () => {
-  it('能解出自己加密的值（往返一致）', () => {
-    const plain = 'zcode-jwt-value-测试'
-    expect(decryptCredentialValue(encrypt(plain), {})).toBe(plain)
-  })
-
-  it('无 enc:v1: 前缀的值原样返回（支持用户手工填明文）', () => {
-    expect(decryptCredentialValue('plain-token', {})).toBe('plain-token')
-  })
-
-  it('ZCODE_CREDENTIAL_SECRET 覆盖默认密钥', () => {
-    const secret = 'my-explicit-secret'
-    const cipher = encrypt('payload', secret)
-    // 用同一个显式 secret 能解开。
-    expect(decryptCredentialValue(cipher, { ZCODE_CREDENTIAL_SECRET: secret })).toBe('payload')
-    // 换回默认密钥必须**解不开**（证明 secret 真的参与了派生）。
-    expect(() => decryptCredentialValue(cipher, {})).toThrow(/解密失败/)
-  })
-
-  it('密钥派生对「用户名取不到」回落字面量 unknown（官方同款）', () => {
-    // 默认路径不抛错，且长度是 sha256 的 32 字节。
-    const key = deriveCredentialKey({})
-    expect(key.length).toBe(32)
-    // 显式 secret 走另一条分支：sha256(secret)。
-    const explicit = deriveCredentialKey({ ZCODE_CREDENTIAL_SECRET: 'abc' })
-    expect(explicit.equals(createHash('sha256').update('abc').digest())).toBe(true)
-  })
-
-  it('密文段数不对时抛错（而不是静默返回垃圾）', () => {
-    expect(() => decryptCredentialValue(`${CREDENTIAL_PREFIX}only-one-part`, {})).toThrow(/格式非法/)
-    expect(() => decryptCredentialValue(`${CREDENTIAL_PREFIX}a..c`, {})).toThrow(/格式非法/)
-  })
-
-  it('IV / AuthTag 长度不对时抛错（防篡改检测）', () => {
-    // IV 用 8 字节（应为 12）。
-    expect(() => decryptCredentialValue(
-      `${CREDENTIAL_PREFIX}${Buffer.alloc(8).toString('base64url')}.${Buffer.alloc(16).toString('base64url')}.${Buffer.from('x').toString('base64url')}`,
-      {},
-    )).toThrow(/IV 长度非法/)
-    // AuthTag 用 8 字节（应为 16）。
-    expect(() => decryptCredentialValue(
-      `${CREDENTIAL_PREFIX}${Buffer.alloc(12).toString('base64url')}.${Buffer.alloc(8).toString('base64url')}.${Buffer.from('x').toString('base64url')}`,
-      {},
-    )).toThrow(/AuthTag 长度非法/)
-  })
-
-  it('密文被篡改时 GCM 认证失败（不是静默解出错误内容）', () => {
-    const good = encrypt('original', 'sec')
-    const parts = good.slice(CREDENTIAL_PREFIX.length).split('.')
-    const tampered = Buffer.from(parts[2] ?? '', 'base64url')
-    tampered[0] = (tampered[0] ?? 0) ^ 0xff
-    const broken = `${CREDENTIAL_PREFIX}${parts[0]}.${parts[1]}.${tampered.toString('base64url')}`
-    expect(() => decryptCredentialValue(broken, { ZCODE_CREDENTIAL_SECRET: 'sec' })).toThrow(/解密失败/)
-  })
-
-  it('凭据文件候选表包含家目录（官方默认位置）', () => {
-    const candidates = credentialFileCandidates()
-    const home = join(homedir(), '.zcode', 'v2', 'credentials.json')
-    expect(candidates).toContain(home)
-  })
-
-  it('readRawCredentials 对不存在的文件返回 undefined（不抛错）', () => {
-    expect(readRawCredentials(join(tmpdir(), 'definitely-not-here-xyz.json'))).toBeUndefined()
-  })
-
-  it('readRawCredentials 丢弃非字符串值', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'zcode-test-'))
-    try {
-      const file = join(dir, 'credentials.json')
-      writeFileSync(file, JSON.stringify({ a: 'str', b: 123, c: null, d: { x: 1 } }))
-      expect(readRawCredentials(file)).toEqual({ a: 'str' })
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  })
-
-  it('labelFromUserInfo 对手机号做末 4 位脱敏', () => {
-    expect(labelFromUserInfo(JSON.stringify({ phone: '13800138000' }))).toBe('尾号8000')
-    expect(labelFromUserInfo(JSON.stringify({ name: 'Alice' }))).toBe('Alice')
-    expect(labelFromUserInfo(JSON.stringify({ id: 'abcdef123456' }))).toBe('id:123456')
-    expect(labelFromUserInfo(undefined)).toBeUndefined()
-    expect(labelFromUserInfo('not-json')).toBeUndefined()
-  })
-
-  it('readZcodeCredential 缺 zcodejwttoken 时返回 undefined（不抛错）', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'zcode-test-'))
-    try {
-      const file = join(dir, 'credentials.json')
-      writeFileSync(file, JSON.stringify({ 'oauth:other': encrypt('x') }))
-      expect(readZcodeCredential({}, file)).toBeUndefined()
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  })
-})
-
-// ─────────────────── 账号身份（账号名 / 手机号 / user_id） ───────────────────
+// ─────────────────── 账号身份（手机号派生） ───────────────────
 
 describe('ZCode 账号身份派生', () => {
-  /** 实测的本机 `user_info` 形状（17 位 id + displayName/username/rawProfile）。 */
-  const REAL_USER_INFO = JSON.stringify({
-    id: '15951790100986814',
-    username: 'mylzscy4',
-    displayName: 'mylzscy4',
-    rawProfile: {
-      user_id: '15951790100986814',
-      email: '',
-      avatar: '',
-      name: 'mylzscy4',
-      zcodeProfileSchemaVersion: 2,
-    },
-  })
-
   it('★ 手机号由 17 位 id 的前 11 位派生（上游不下发手机号字段）', () => {
     // 依据：扫遍 ~/.zcode/v2/*.json 后，唯一命中 11 位手机号形状的就是这个前缀。
     expect(phoneFromUserId('15951790100986814')).toBe('159****0100')
@@ -195,41 +66,37 @@ describe('ZCode 账号身份派生', () => {
     expect(phoneFromUserId(undefined)).toBeUndefined()
   })
 
-  it('★ 账号名取 displayName（不是 name —— 顶层没有 name 键）', () => {
-    // ⚠ 这正是不复用 labelFromUserInfo 的原因：它查 `name`/`nickname`，
-    //   而官方的键名叫 `displayName`，于是它会落到 `id:986814` 这种弱占位。
-    expect(identityFromUserInfo(REAL_USER_INFO)).toEqual({
-      accountName: 'mylzscy4',
-      phone: '159****0100',
-    })
-    expect(labelFromUserInfo(REAL_USER_INFO)).toBe('id:986814')
-  })
-
-  it('账号名依次回退 username → rawProfile.name', () => {
-    expect(identityFromUserInfo(JSON.stringify({ username: 'u-name' })).accountName)
-      .toBe('u-name')
-    expect(identityFromUserInfo(JSON.stringify({ rawProfile: { name: 'nested' } })).accountName)
-      .toBe('nested')
-  })
-
-  it('user_info 解不开 / 为空时不抛错，返回空对象', () => {
-    expect(identityFromUserInfo(undefined)).toEqual({})
-    expect(identityFromUserInfo('not-json')).toEqual({})
-    expect(identityFromUserInfo('{}')).toEqual({})
-  })
-
-  it('★ readUserIdFromUserInfo 取顶层 id，回退 rawProfile.user_id', () => {
-    expect(readUserIdFromUserInfo(REAL_USER_INFO)).toBe('15951790100986814')
-    expect(readUserIdFromUserInfo(JSON.stringify({ rawProfile: { user_id: 'nested-id' } })))
-      .toBe('nested-id')
-    expect(readUserIdFromUserInfo('not-json')).toBeUndefined()
-    expect(readUserIdFromUserInfo(undefined)).toBeUndefined()
-  })
-
   it('手机号脱敏成 前3 + **** + 后4（不泄露中间 4 位）', () => {
     const phone = phoneFromUserId('13800138000123456')
     expect(phone).toBe('138****8000')
     expect(phone).not.toContain('0138')
+  })
+})
+
+// ─────────────────── 凭据判据 ───────────────────
+
+describe('ZCode 凭据判据', () => {
+  it('只要 zcode_jwt + device_mid 就算够用（其余字段都可选）', () => {
+    expect(isUsableZcodeCredential({ zcode_jwt: 'j', device_mid: 'm' })).toBe(true)
+  })
+
+  it('缺任一必需字段即不可用，且不抛错', () => {
+    expect(isUsableZcodeCredential({ zcode_jwt: 'j' })).toBe(false)
+    expect(isUsableZcodeCredential({ device_mid: 'm' })).toBe(false)
+    expect(isUsableZcodeCredential({ zcode_jwt: '', device_mid: 'm' })).toBe(false)
+    expect(isUsableZcodeCredential(undefined)).toBe(false)
+    expect(isUsableZcodeCredential(null)).toBe(false)
+    expect(isUsableZcodeCredential('not-an-object')).toBe(false)
+  })
+
+  it('ZCode 凭据静态：不过期、不可续期', () => {
+    // JWT payload 里没有 exp ⇒ 不做本地过期猜测，失效由上游 401/1002 表达。
+    expect(isZcodeExpired({ zcode_jwt: 'j', device_mid: 'm' })).toBe(false)
+    expect(ZCODE_REFRESHABLE).toBe(false)
+  })
+
+  it('版本兜底常量非空（请求头 X-ZCode-App-Version 用）', () => {
+    expect(ZCODE_APP_VERSION_FALLBACK).toMatch(/^\d+\.\d+\.\d+$/)
   })
 })
 

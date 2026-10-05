@@ -7,10 +7,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import {
+  pickTestModel,
   resetAccount,
   resetAllAccounts,
   retestAccount,
   retestAllAccounts,
+  testAccount,
 } from '../../src/account-probe.js'
 import type { ProbePool } from '../../src/account-probe.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
@@ -270,5 +272,125 @@ describe('限流判定（isRateLimitFailure 经由默认探测暴露的行为）
       const error = new LlmError('频率限制', code)
       expect(error.code).toBe(code)
     }
+  })
+})
+
+/**
+ * 「测试」：**无条件**真发一次请求（用户 m03338 的需求）。
+ *
+ * 与 `retestAccount` 的硬性区别（这组用例存在的全部理由）：
+ * - 触发条件：重测只测 `Object.keys(entry.modelRateLimits)`，没有标记时
+ *   **零请求**提前返回；测试不看标记，直接发。
+ * - 存储副作用：重测会清标记、写回新的重置时刻；测试**一个字节都不写**。
+ */
+describe('testAccount', () => {
+  it('没有限流标记时依然真发一次请求（这正是重测做不到的事）', async () => {
+    const pool = makePool([makeEntry({ modelRateLimits: undefined })])
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({ modelId, ok: true }))
+
+    const res = await testAccount(pool, 'buddy-1', 'deepseek-v4.1-flash', { probe })
+
+    expect(probe).toHaveBeenCalledTimes(1)
+    expect(res.ok).toBe(true)
+    expect(res.modelId).toBe('deepseek-v4.1-flash')
+  })
+
+  it('不写任何存储：成功时不调 clearModelRateLimits', async () => {
+    const pool = makePool([makeEntry()])
+    const before = JSON.stringify(pool.get('buddy-1')?.modelRateLimits)
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({ modelId, ok: true }))
+
+    await testAccount(pool, 'buddy-1', 'deepseek-v4.1-flash', { probe })
+
+    // ⚠️ 这是与重测的**关键分野**：重测成功会清标记，测试必须原封不动。
+    expect(pool.cleared).toHaveLength(0)
+    expect(JSON.stringify(pool.get('buddy-1')?.modelRateLimits)).toBe(before)
+  })
+
+  it('仍受限时如实回报原因，且**不**写回新的重置时刻', async () => {
+    const pool = makePool([makeEntry()])
+    const before = pool.get('buddy-1')?.modelRateLimits?.['deepseek-v4.1-flash']
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({
+      modelId,
+      ok: false,
+      message: '仍受限：频率限制',
+      resetTimeMs: Date.now() + 7_200_000,
+    }))
+
+    const res = await testAccount(pool, 'buddy-1', 'deepseek-v4.1-flash', { probe })
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toContain('仍受限')
+    // 结果里带出上游时刻（供展示），但**不落盘**。
+    expect(res.resetTimeMs).toBeGreaterThan(Date.now())
+    expect(pool.updated).toHaveLength(0)
+    expect(pool.get('buddy-1')?.modelRateLimits?.['deepseek-v4.1-flash']).toBe(before)
+  })
+
+  it('账号不存在时返回错误而不抛异常', async () => {
+    const pool = makePool([])
+    const probe = vi.fn()
+    const res = await testAccount(pool, 'ghost', 'm', { probe })
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toContain('不存在')
+    expect(probe).not.toHaveBeenCalled()
+  })
+
+  it('探测函数抛错时收敛为可读原因，不冒泡', async () => {
+    const pool = makePool([makeEntry()])
+    const probe = vi.fn(async () => { throw new Error('凭据已失效') })
+
+    const res = await testAccount(pool, 'buddy-1', 'm', { probe })
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toBe('无法确认：凭据已失效')
+  })
+
+  it('回传昵称，便于多账号时区分是哪一个', async () => {
+    const pool = makePool([makeEntry({ nickname: '测试号' })])
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({ modelId, ok: true }))
+
+    const res = await testAccount(pool, 'buddy-1', 'm', { probe })
+
+    expect(res.nickname).toBe('测试号')
+  })
+})
+
+/**
+ * 「测试」要发哪个模型：`pickTestModel` 的优先级。
+ *
+ * 这是纯函数（无 IO），但它是整条测试链路里**唯一决定请求内容**的一步 ——
+ * 挑错了就会得到一个与账号无关的 404，把「账号不可用」和「模型名不对」
+ * 混成同一条报错，用户据此会去做完全错误的动作（重新登录）。
+ */
+describe('pickTestModel', () => {
+  it('显式指定优先于一切', () => {
+    const entry = makeEntry({ modelRateLimits: { 'marked-model': Date.now() + 1_000 } })
+    expect(pickTestModel(entry, ['catalog-a', 'catalog-b'], 'explicit')).toBe('explicit')
+  })
+
+  it('空串不算显式指定（回落到标记）', () => {
+    // ⚠️ `req.modelId` 来自客户端，可能是 `''`；若把空串当成「已指定」，
+    // 就会拿着空模型名发出去，得到一条与账号无关的 400。
+    const entry = makeEntry({ modelRateLimits: { 'marked-model': Date.now() + 1_000 } })
+    expect(pickTestModel(entry, ['catalog-a'], '')).toBe('marked-model')
+  })
+
+  it('标记优先于目录：用户最想看的正是被标记的那个模型', () => {
+    const entry = makeEntry({ modelRateLimits: { 'marked-model': Date.now() + 1_000 } })
+    expect(pickTestModel(entry, ['catalog-a', 'catalog-b'])).toBe('marked-model')
+  })
+
+  it('没有标记时取目录第一个', () => {
+    const entry = makeEntry({ modelRateLimits: undefined })
+    expect(pickTestModel(entry, ['catalog-a', 'catalog-b'])).toBe('catalog-a')
+  })
+
+  it('标记与目录都拿不到时返回空串，**不猜**一个模型名', () => {
+    // 调用方拿到空串必须如实报错（`account.test` 端点据此回 bad-request）。
+    // 猜一个名字发出去会得到 404，与「账号不可用」无法区分。
+    const entry = makeEntry({ modelRateLimits: undefined })
+    expect(pickTestModel(entry, [])).toBe('')
   })
 })

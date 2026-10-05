@@ -62,6 +62,9 @@ const STYLES = `
  * 故容器保持透明（加白底反而会出现一圈突兀的方块）。
  */
 .dim-jh-providerIcon.zcode { background: transparent; }
+/* Gemini Code Assist：内联 SVG 自带蓝紫渐变星形，白底容器中显示清晰。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
+.dim-jh-providerIcon.gemini { background: white; }
 
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }
@@ -150,6 +153,7 @@ const STYLES = `
 .dim-jh-btn[data-kind="danger"]:hover:not(:disabled) { color: #b3261e; border-color: #d93025; background: rgb(217 48 37 / 6%); }
 .dim-jh-btn:disabled { opacity: 0.5; cursor: default; }
 
+
 /* 纯图标按钮（如「领取新手任务」的礼物图标）。
    ⚠️ 存在的理由：.dim-jh-accountActions 是 flex-wrap: nowrap，
    行内已有 5 个文字按钮，再加一个「领取新手任务」会被挤出容器（用户报障）。
@@ -183,6 +187,11 @@ const STYLES = `
 .dim-jh-probeNotice[data-tone="error"] { border-color: color-mix(in srgb, #d93025 35%, var(--dsw-alias-border-l2, #eef0f3)); background: rgb(217 48 37 / 8%); color: #b3261e; }
 .dim-jh-probeDetails { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 2px; }
 .dim-jh-probeDetails li { font-size: 12px; line-height: 18px; }
+/* 授权链接 + 复制按钮同行。链接不设 min-width: 0 时，300+ 字符的 URL 会把按钮顶出可视区。 */
+.dim-jh-loginLinkRow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
+.dim-jh-loginLink { flex: 1 1 240px; min-width: 0; color: var(--dsw-alias-link); word-break: break-all; }
+/* 复制失败时把链接变成一次点击全选，用户能直接 Ctrl+C。 */
+.dim-jh-loginLinkRow[data-copy-state="failed"] .dim-jh-loginLink { user-select: all; }
 
 /* 登录弹窗 */
 .dim-jh-loginOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; z-index: 1000; }
@@ -262,6 +271,182 @@ const STYLES = `
    哪些模型能发图，不必靠撞一次 unsupported_content 才发现。
    flex: none 是必需的 —— 它是行尾的固定标签，参与收缩会被 id/name 挤没。 */
 .dim-jh-modelBadge { flex: none; padding: 1px 6px; border-radius: 5px; background: var(--dsw-alias-color-success-light, #e8ffea); color: var(--dsw-alias-color-success, #00875a); font-size: 11px; line-height: 16px; white-space: nowrap; }
+
+/* ── 思考档位对照表 ──
+   与模型清单的行**刻意不同**：那两行的 id/name 用 ellipsis 截断（清单要紧凑），
+   而对照表的内容本身就是用户要抄的东西 —— 截断等于让功能失效
+   （真实反馈：「你这对照表字符过长都被省略了」）。
+   故这里用 grid 竖排：第一行模型 id + 徽标，后两行整宽、可换行、可选中复制。
+   ⚠️ 绝不能加 text-overflow: ellipsis / white-space: nowrap。 */
+.dim-jh-effortRow { display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; min-width: 0; padding: 7px 8px; border-radius: 8px; }
+.dim-jh-effortRow:hover { background: var(--dsw-alias-bg-layer-2, #f7f8fa); }
+.dim-jh-effortHead { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* 模型 id 在这里允许换行（对照表不追求单行紧凑），但仍优先占满剩余宽度。 */
+.dim-jh-effortModel { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-effortLine { min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #4e5969); }
+.dim-jh-effortLabel { color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 搜索结果为空时的提示（与其它空状态同款观感）。 */
+.dim-jh-effortEmpty { padding: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 档位对照行里的模型名也**不得截断**（用户 2026-10-04：「所有胶囊内容都没有
+   完整显示」）。这里本就没写 ellipsis，但补一条**显式**声明把意图锁住：
+   下面「网关弹窗里的胶囊」那条 .dim-jh-modelId 规则不该被误用到它身上，
+   而将来若有人给 .dim-jh-effortModel 加上截断，这条会立刻在单测里变红。
+   ⚠️ 本文件整体是一个 JS 模板字符串，注释里**不能出现反引号** —— 会提前
+   终止字符串（见 .dim-jh-iconBtn 处的同款警告）。 */
+.dim-jh-gatewayModal .dim-jh-effortModel { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+
+/* ── 网关弹窗的排版收紧（用户 2026-10-04 要求：「这几段话之间的行间距小一点」）──
+   ⚠️ 必须加 .dim-jh-gatewayModal 前缀：.dim-jh-modalHint 是**共用**类，
+   另有 24 处调用点（账号面板、opencode 弹窗、备份弹窗…），本次只该动网关弹窗
+   —— 全局把 10px 改成 6px 会悄悄改掉那些页面的观感。
+   本弹窗有 8 处说明行，10px × 8 ≈ 80px 空隙，收成 6px 后观感明显紧凑。 */
+.dim-jh-gatewayModal .dim-jh-modalHint { margin-top: 6px; }
+/* 弹窗顶部那三行是**同一段话**（推荐 / 协议 / 地址），彼此再紧一档，
+   否则它们看起来像三个互不相干的段落。
+   ⚠️ 现在「思考档位对照表」那段的两句说明也用这个类（同样是一段话拆成两行，
+   为的是不让品牌名 CC Switch 在行尾被从中间切开）。 */
+.dim-jh-gatewayModal .dim-jh-gatewayLine { margin-top: 4px; }
+
+/* ── 三段功能区的**分隔**（用户 2026-10-04：「这三坨字全混在一起有点难看清」）──
+   用户把弹窗分成三块：① 开关 + 连接信息（推荐 / 协议 / 地址 / API KEY）
+   ② 模型 ID 清单 ③ 思考档位对照表。
+   此前三段之间只靠一个 16px 的 margin，而每段内部又各有若干行 12px 灰字，
+   视觉上连成一片 —— 用户找不到「下一块从哪开始」。
+
+   做法：段间用**一条上边框 + 更大的上间距**切开，段内保持原有的紧凑。
+   ⚠️ 用 border-top 而不是背景色块：弹窗会被截图，色块在深色主题下还要另配
+   一整套 token（本文件别处同理，见 .dim-jh-gatewayCards 的注释）。
+   ⚠️ 第一段**不要**上边框（它紧跟在弹窗标题下，加线会像多出一条分隔条）。 */
+.dim-jh-gatewaySection { display: block; }
+.dim-jh-gatewaySection + .dim-jh-gatewaySection {
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px solid var(--dsw-alias-border-l2, #eef0f3);
+}
+/* 段标题比正文说明重一档，作为「这块讲什么」的锚点。
+   ⚠️ 不能沿用 .dim-jh-modalHint 那套 12px 灰字 —— 段标题与段内说明同为灰色时，
+   分隔线的效果会被抵消（用户仍然分不清哪一行是标题）。 */
+.dim-jh-gatewaySectionTitle { margin: 0; font-size: 13px; line-height: 19px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
+/* 段内第一行紧跟段标题，不再叠那 6px。 */
+.dim-jh-gatewaySectionTitle + .dim-jh-modalHint { margin-top: 3px; }
+/* 弹窗末尾那条安全提示：与上面三段拉开，且**不属于任何一段**（它是整个弹窗的脚注）。 */
+.dim-jh-gatewayModal .dim-jh-gatewayFootnote { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--dsw-alias-border-l2, #eef0f3); }
+
+/* ── 密钥行：小号按钮，不让按钮把这一行撑高 ──
+   ⚠️ 用户 2026-10-04 报障：「复制密钥」「显示明文」大到把这行撑开。
+   根因是 .dim-jh-btn 是**通用**按钮（padding 4px 12px + line-height 18px
+   ⇒ 约 28px 高），而同行只有 18px 高的说明文字 —— 按钮比文字高 10px，
+   整行的高度就被它顶起来了。这里单独压到约 22px，与文字行接近。
+   ⚠️ 不能直接改 .dim-jh-btn（30+ 处调用点：页头、卡片头、对照表…）。
+   ⚠️ 用户随后又要求「下面的四个按钮也按复制密钥的大小来统一」，故把
+   清单/对照表那两个操作行（.dim-jh-gatewayActions）并进同一条规则 ——
+   两处必须是**同一条规则**，各写一份迟早一处改了另一处没改。 */
+.dim-jh-gatewayKeyRow { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.dim-jh-gatewayKeyRow .dim-jh-btn,
+.dim-jh-gatewayModal .dim-jh-gatewayActions .dim-jh-btn { padding: 2px 8px; font-size: 11px; line-height: 16px; border-radius: 6px; }
+/* 「API KEY：」标签：与按钮同基线、不可压缩（否则窄面板下会折成两行）。 */
+.dim-jh-gatewayKeyRow .dim-jh-gatewayKeyLabel { flex: none; margin: 0; }
+/* 下方两个操作行（模型清单 / 思考档位对照表）的间距也向密钥行看齐（8px → 6px）：
+   四个按钮既然压成小号，原来的 8px 间隔配小按钮会显得松散。
+   ⚠️ 另加 flex-wrap: wrap：.dim-jh-modelPanelActions 默认是 nowrap
+   （页头那两三个固定按钮用它没问题），而这两行的按钮文案带**动态计数**
+   （「复制全部 1234 个 ID」「复制对照表（1234 行）」），计数一长，nowrap
+   会把按钮推出容器、点不到。实测当前数据（15 个模型）在 364px 窄弹窗下不出问题，
+   但那是**当前数据**的结论 —— 换行让它对任意计数都成立。
+   ⚠️ 本文件整体是一个 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。
+   我在这条注释里用反引号括了一次类名，直接把文件从中间截断、构建产物语法错误 ——
+   写类名时**裸写**，要强调就用「」或**。 */
+.dim-jh-gatewayModal .dim-jh-gatewayActions { gap: 6px; flex-wrap: wrap; }
+
+/* ── 网关清单：**一个供应商一张卡片**（模型清单与档位对照表共用）──
+   用户 2026-10-03 报障：此前按「一个模型一行」平铺，同一家的
+   deepseek-account/deepseek-flash 与 deepseek-account/deepseek-v4-pro
+   看起来毫无关系；用户真正要对照的是「哪家有哪些模型」，故改成分组卡片。
+   分组判据在 openai-gateway-panel.js 的 groupGatewayEntries（纯函数，可单测）。
+   ⚠️ 本文件整体是 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。 */
+.dim-jh-gatewayCards { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+/* 卡片：细边框 + 圆角，与复用的分组头（.dim-jh-modelGroup）同一种规格语言。
+   ⚠️ min-width: 0 是**必需**的：卡片是 grid 项，默认 min-width: auto 会被
+   内部长 id 撑开，从而把整个弹窗顶出横向滚动条（模型列表踩过同一个坑）。 */
+.dim-jh-gatewayCard { min-width: 0; border: .5px solid var(--dsw-alias-border-l3, #e5e5e5); border-radius: 10px; overflow: hidden; }
+/* 卡片头：吸顶。清单很长时滚到底部仍要能看出「我在哪一家」。
+   背景用不透明层色，否则卡内行会从下面透出来。 */
+.dim-jh-gatewayCardHead { position: sticky; top: 0; z-index: 2; display: flex; align-items: flex-start; flex-wrap: wrap; gap: 4px 8px; min-width: 0; padding: 6px 8px; background: var(--dsw-alias-bg-layer-2, #f7f8fa); border-bottom: .5px solid var(--dsw-alias-border-l3, #e5e5e5); }
+/* 卡片标题（可点，折叠开关）：占满剩余宽度。
+   ⚠️ 用户 2026-10-04 报障「网关里的胶囊内容都没有完整显示」：此处原先是
+   ellipsis + nowrap，长供应商名（或展示名）被截成 deepseek-accou…，
+   而卡片标题正是用户**唯一**能确认「这一家是谁」的地方。
+   改为换行显示：整行放不下时 title 独占一行，计数与「复制本组」按钮落到第二行。
+   ⚠️ 绝不能加回 text-overflow: ellipsis / white-space: nowrap。 */
+.dim-jh-gatewayCardToggle { flex: 1 1 auto; min-width: 0; padding: 2px 0; border: 0; background: transparent; color: var(--dsw-alias-label-primary, #1f2329); font-size: 12.5px; line-height: 18px; font-weight: 600; text-align: left; overflow-wrap: anywhere; cursor: pointer; }
+.dim-jh-gatewayCardToggle:hover { color: var(--dsw-alias-brand-primary, #1677ff); }
+/* 计数与按钮：可以掉到第二行，但**不换行、不截断**（flex: none 保证不被挤没）。 */
+.dim-jh-gatewayCardCount { flex: 0 0 auto; margin-left: auto; font-size: 11px; line-height: 17px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--dsw-alias-label-tertiary, #8f959e); }
+.dim-jh-gatewayCardHead .dim-jh-gatewayCardBtn { flex: none; padding: 2px 8px; font-size: 11px; }
+.dim-jh-gatewayCardBody { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; padding: 3px 4px 5px; }
+/* 一行模型（**只读**，无开关）：短名字 + 展示名 + 能力标记。
+   ⚠️ 行内显示的是去掉供应商前缀的名字（见 gatewayModelKeyOf）—— 卡片头已经
+   写清了是哪一家，再重复一遍前缀只会把整行挤到只剩省略号。
+   ⚠️ 这里刻意**不用** .dim-jh-modelRow：那个类带 cursor: pointer 与 hover 底色，
+   是给「整行可点切换开关」的 label 用的，用在这里会被读成可点。 */
+.dim-jh-gatewayModelRow { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 5px 6px; border-radius: 6px; }
+.dim-jh-gatewayModelRow:hover { background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
+/* ⚠️ 这里曾有一条「.dim-jh-gatewayModelRow .dim-jh-modelId { max-width: 52% }」
+   （把模型列表那 46% 的上限放宽到 52%）。**已删除**，别再写回来：
+   它的优先级 (0,2,0) 与下面那条两级通配 (0,2,0) **完全相同**，
+   于是谁生效**只取决于源码先后** —— 一个纯粹靠「写在对的位置」维持的假象。
+   下面那条把 max-width 直接设成 none（且覆盖了开关行与 curl 代码块），
+   一行里本该完整显示的东西，不该还留一个 52% 的上限等着被谁「压过去」。
+   ⚠️ 本文件是 JS 模板字符串，注释里**绝不能出现反引号**（我在这条注释上
+   第四次踩到同一个坑）—— 类名与代码一律裸写。 */
+
+/* ── 网关弹窗里的「胶囊」一律完整显示（用户报障 2026-10-04）──
+   原话：「网关这里面的所有胶囊内容都没有完整显示，应当修正使其完整显示内容」。
+   胶囊 = 行内的 <code> ID 块（.dim-jh-modelId）、能力标记（.dim-jh-modelBadge）、
+   档位对照行里的模型名（.dim-jh-effortModel）。
+
+   ⚠️ 根因是那三个类**天生带截断**，而且是给**别处**设计的：
+   .dim-jh-modelId 是 max-width 46% + ellipsis + nowrap（模型列表要紧凑，
+   一行里还得塞下开关）；.dim-jh-modelBadge 是 nowrap；模型名同理。
+   而网关弹窗里这些内容**就是要被读/被抄的东西** —— 截断等于让功能失效。
+
+   ⚠️ 只能加 .dim-jh-gatewayModal 前缀：.dim-jh-modelId 在模型列表里
+   另有用途（那里的紧凑是刻意的，见 model-filter.js 的模块注释），
+   全局去掉 max-width 会把整个模型列表撑坏。
+
+   ⚠️⚠️ **选择器只能写「弹窗 + 类名」两级，绝不能夹中间祖先**（这里返工过一次）：
+   第一版写的是「弹窗 + gatewayModelRow + modelId」这类**带中间祖先**的三条规则，
+   结果**只覆盖到了卡片内的胶囊**。用户随即又截图框出三处仍在截断的地方，
+   它们的祖先链各不相同：
+     - 开关行：modalBody > modelRow > modelInfo > code
+     - 两处 curl 代码块：modalBody > code
+   三条祖先限定规则**一条都匹配不上** ⇒ 用户看到的还是「供 Pi / Cont…」与
+   「curl … -H "…"」被吃掉。
+   ⚠️ 当时的「机械审计」脚本也没抓到，因为它只检查**类名**有没有被某条网关规则
+   覆盖 —— modelId 在卡片那条规则里「有覆盖」，于是整体判通过。
+   **教训：判断一个元素会不会被截断，必须看它实际的祖先链，不能看类名是否出现过。**
+   现在改成两级通配，弹窗内任何位置的这个类都生效（含 API KEY 明文那块 code）。
+   ⚠️ 本文件整体是 JS 模板字符串，注释里**绝不能出现反引号** ——
+   我在上面这段注释里用反引号括类名，第三次踩到了同一个坑（构建直接失败）。
+   要强调就用「」或 ** 包住类名，永远裸写。 */
+.dim-jh-gatewayModal .dim-jh-modelId,
+.dim-jh-gatewayModal .dim-jh-modelName {
+  max-width: none; overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere;
+}
+/* 能力标记（「可发图片」「需对照」）：短标签，但 flex: none + nowrap 会在
+   窄面板下被挤出可视区 —— 允许换行远比被切掉好。 */
+.dim-jh-gatewayModal .dim-jh-modelBadge {
+  flex: 0 0 auto; white-space: normal; overflow-wrap: anywhere;
+}
+/* ⚠️ 顶部开关行的标题「启用本机网关」**不许被挤**（去掉 ID 胶囊的 max-width 后
+   新引入的问题）：胶囊不再有 46% 上限，于是它把整行宽度吃光，
+   而 .dim-jh-modelName 是 flex: 0 1 auto（可收缩）⇒ 标题被压成
+   「启用本机网」「关」两行。
+   判据：网关弹窗的开关行里，标题保持固有宽度（flex: none），
+   让**副标题**去换行 —— 副标题是补充说明，标题是动作主体。
+   ⚠️ 本文件是 JS 模板字符串，注释里**绝不能出现反引号**（又踩了一次，第五次）。 */
+.dim-jh-gatewayModal .dim-jh-modelInfo > .dim-jh-modelName { flex: none; }
+/* 搜索/空结果的容器：与对照表的 .dim-jh-effortEmpty 同款观感。 */
+.dim-jh-gatewayEmpty { padding: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* ── 模型列表的「计费/来源」分组（订阅 / 免费 / Cline Cloud / 按量计费）──
    分组由 model-groups.js 的纯函数决定（判据见其模块注释）；这里只管观感。
@@ -381,106 +566,51 @@ const STYLES = `
 .dim-jh-quotaTable td.dim-jh-quotaError { font-size: 11.5px; line-height: 1.5; white-space: normal; overflow: visible; text-overflow: clip; word-break: break-word; }
 
 /*
- * ── 官方「模型卡片 → 编辑」内的 ZCode 账号区（前缀 dim-jh-zc） ──
+ * ── ZCode 登录渠道弹窗（Jet Hub 设置页；dim-jh-zcDialog / dim-jh-zcSelect） ──
  *
- * ⚠ 本区**刻意不复用** .dim-jh-accountCard / .dim-jh-btn / .dim-jh-accountTop 等类：
- * 那些类同时被 Jet Hub 设置页使用（见 jet-hub.js 的 ProviderPanel），改它们会连带
- * 改掉设置页的观感。用户报障的是「编辑卡片里这块风格突兀」，故这里整套重画。
+ * 这套样式**只服务 Jet Hub 设置页**的「添加账号 → 登录渠道」弹窗
+ * （BigModel 国内 / z.ai 国际，见 jet-hub.js 的 zcodeProvider 下拉）。
  *
- * 重画依据是官方 dsh-client-ui-settings-models 的编辑卡片（实测计算样式）：
- *   分组    = 上细线 .5px var(--dsw-alias-border-l2) + padding-top 10px
- *             （官方 .zGbnIq_customized / .zGbnIq_modelCatalog 都是这个组合）
- *   折叠行  = 12px/500、secondary 色、padding 2px 4px、margin-left -4px、radius 6px、
- *             chevron 用 5x5 + 1.5px 右/下边框再旋转 45 度（官方 .zGbnIq_customizedSummary）
- *   按钮    = 高 28px、padding 0 10px、radius 14px、12px/400、边框 .5px border-l3
- *             （官方 .zGbnIq_secondaryButton / .zGbnIq_linkButton）
- *   主按钮  = 底色 button-primary-fill + 前景 label-primary-foreground（官方保存键同款）
+ * ⚠⚠️ 随 Gitee issue IKJLHQ 一并移除的还有一整套「官方「模型卡片 → 编辑」内的
+ * ZCode 账号区」样式（.dim-jh-zcSection / zcSummary / zcAccount / zcMeta / zcBtn
+ * / zcEmpty / zcNotice / zcLink，以及 [data-jet-hub-hidden]）。那套 UI 靠占用
+ * settings.models.provider-card 槽的 llm-pi-ai key 实现，而该 key 与第三方
+ * pi-ai 扩展**物理互斥**（机制见 index.js 文件头的长注释）—— ZCode 账号管理
+ * 现在只在 Jet Hub 页。**别把那套样式加回来。**
  *
- * 颜色一律走 --dsw-alias-* 令牌，**不再出现自定义蓝 #1677ff** —— 用户要求
- * 「颜色和官方默认颜色一样」，而官方这套里根本没有那个蓝。
- *
+ * 颜色一律走 --dsw-alias-* 令牌；变量取不到时用 CSS 系统色（Canvas / CanvasText）
+ * 兜底，跟随系统深浅色。
  * ⚠ 本文件整体是 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。
  */
-.dim-jh-zcSection { border-top: .5px solid var(--dsw-alias-border-l2); padding-top: 10px; }
-/*
- * 隐藏本 route 自己维护、用户改不得的官方字段（见 zcode-card.js 文件头 ⑦）。
- *
- * 为什么需要：官方 ProviderEditor 对 pi-ai 卡片**无条件**渲染「API 密钥」与「API 地址」，
- * 没有 props 能关掉。而 zcode-free 的 baseURL 指向插件每次启动自起的本地桥（端口每次都变）、
- * 密钥是占位串，二者都由 src/pi-ai-mirror.ts 重写 —— 用户在这里改只会把桥打断。
- *
- * ⚠ display:none 而不是 visibility:hidden：后者仍占位，会留下两块空白。
- * ⚠ 用属性选择器（标记由 zcode-card.js 打），不做文本匹配 —— CSS 没法按文本选元素。
- * ⚠ 本文件整体是 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。
- */
-[data-jet-hub-hidden] { display: none !important; }
-.dim-jh-zcSummary { display: flex; align-items: center; gap: 6px; box-sizing: border-box; width: 100%; margin-left: -4px; padding: 2px 4px; border-radius: 6px; font-size: 12px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-secondary); cursor: pointer; list-style: none; }
-.dim-jh-zcSummary::-webkit-details-marker { display: none; }
-/* 折叠箭头：右/下边框各 1.5px 的 5x5 方块旋转 -45 度即 ▸；展开态（details[open]）转 45 度即 ▾ */
-.dim-jh-zcSummary::before { content: ""; flex: none; width: 5px; height: 5px; border-bottom: 1.5px solid; border-right: 1.5px solid; transition: transform .12s; transform: rotate(-45deg) translate(-1px, -1px); }
-.dim-jh-zcSection[open] > .dim-jh-zcSummary::before { transform: rotate(45deg) translate(-1px, -1px); }
-.dim-jh-zcSummary:hover { color: var(--dsw-alias-label-primary); }
-.dim-jh-zcSummary:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dsw-alias-border-l3); }
-/* 折叠行右侧的次要说明：官方 .zGbnIq_modelCatalogMeta 就是这个规格（12px/400 tertiary） */
-.dim-jh-zcCount { flex: none; white-space: nowrap; font-size: 12px; line-height: 18px; font-weight: 400; color: var(--dsw-alias-label-tertiary); }
-.dim-jh-zcBody { display: flex; flex-direction: column; gap: 12px; padding-top: 12px; }
-
-/* 单账号：官方 .zGbnIq_modelEntry 的规格（border .5px border-l4 + radius 10px + padding 6px） */
-.dim-jh-zcAccount { display: flex; flex-direction: column; gap: 3px; padding: 6px 10px; border: .5px solid var(--dsw-alias-border-l4); border-radius: 10px; }
-.dim-jh-zcAccountTop { display: flex; align-items: center; gap: 8px; }
-/* 状态点：官方 rowHead 的绿点同款色（state-success-primary），停用取 state-idle-primary 灰 */
-.dim-jh-zcDot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-state-idle-primary); }
-.dim-jh-zcDot[data-on="true"] { background: var(--dsw-alias-state-success-primary); }
-.dim-jh-zcName { flex: 1 1 auto; min-width: 0; overflow: hidden; font-size: 12px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-primary); text-overflow: ellipsis; white-space: nowrap; }
-/* 状态标签：走官方「自定义」那种**中性灰**胶囊，不用绿色 —— 绿色是突兀感的主要来源 */
-.dim-jh-zcTag { flex: none; padding: 1px 8px; border-radius: 999px; font-size: 11px; line-height: 17px; font-weight: 400; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-interactive-bg-hover-solid); }
-
-.dim-jh-zcMeta { display: grid; gap: 2px; margin: 0; }
-.dim-jh-zcMetaRow { display: grid; grid-template-columns: 48px minmax(0, 1fr); align-items: baseline; gap: 8px; }
-.dim-jh-zcMetaRow dt { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
-.dim-jh-zcMetaRow dd { min-width: 0; margin: 0; overflow: hidden; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); text-overflow: ellipsis; white-space: nowrap; }
-.dim-jh-zcMetaRow dd[data-tone="warn"] { color: var(--dsw-alias-state-warn-label); }
-.dim-jh-zcMetaRow dd[data-tone="muted"] { color: var(--dsw-alias-label-tertiary); }
-/* 额度数值：覆盖 metaRow 的单行截断（要的是数值 + 次要说明并排） */
-.dim-jh-zcMetaRow dd.dim-jh-zcCreditValue { display: flex; flex-direction: row; align-items: baseline; gap: 6px; overflow: visible; }
-.dim-jh-zcCreditTotal { font-size: 12px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
-/* 折叠行右侧整组（账号数 + 号池总额度）：margin-left auto 把它推到最右。
- * ⚠ 需要 .dim-jh-zcSummary 从 fit-content 改为 100% 宽才有「右边」可言（见下）。 */
-.dim-jh-zcSummaryRight { display: flex; align-items: baseline; gap: 8px; margin-left: auto; }
-/* 号池两模型的总额度（折叠态可见，故用 secondary 而不是 tertiary —— tertiary 太淡） */
-.dim-jh-zcPoolTotals { font-size: 12px; line-height: 18px; font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; }
-/* 手机号：等宽数字，弱于账号名 */
-.dim-jh-zcPhone { flex: none; font-size: 11px; line-height: 17px; color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }
-/* 逐模型额度：dd 里放多行，故要覆盖 metaRow 的单行 nowrap（与 .dim-jh-zcCreditValue 同理） */
-.dim-jh-zcMetaRow dd.dim-jh-zcCreditList { display: flex; flex-direction: column; gap: 1px; overflow: visible; white-space: normal; }
-.dim-jh-zcCreditModel { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-.dim-jh-zcCreditModelName { min-width: 0; overflow: hidden; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); text-overflow: ellipsis; white-space: nowrap; }
-.dim-jh-zcCreditModelValue { flex: none; font-size: 12px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
-/* 未下发该模型额度时的占位（比 0 弱：0 是「已用光」，未下发是「查不到」） */
-.dim-jh-zcCreditModelValue[data-tone="muted"] { font-weight: 400; color: var(--dsw-alias-label-tertiary); }
-.dim-jh-zcCreditModelValue[data-tone="warn"] { font-weight: 400; color: var(--dsw-alias-state-warn-label); }
-/* 小号次按钮（账号行里的「删除」）—— 与 .dim-jh-zcBtn 同族，只是更矮更窄 */
-.dim-jh-zcBtn[data-size="sm"] { height: 22px; padding: 0 8px; border-radius: 11px; font-size: 11px; line-height: 16px; }
-/* 账号行内的操作条（目前只有「删除」）：右对齐，与额度行留一点间距 */
-.dim-jh-zcAccountActions { display: flex; justify-content: flex-end; gap: 6px; }
-
-.dim-jh-zcActions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
-.dim-jh-zcBtn { box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; gap: 4px; height: 28px; padding: 0 10px; border: .5px solid var(--dsw-alias-border-l3); border-radius: 14px; background: 0 0; color: var(--dsw-alias-label-primary); font-size: 12px; line-height: 18px; font-weight: 400; white-space: nowrap; cursor: pointer; transition: background .15s ease, border-color .15s ease; }
-.dim-jh-zcBtn:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover-solid); }
-.dim-jh-zcBtn[data-kind="primary"] { border-color: var(--dsw-alias-button-primary-fill); background: var(--dsw-alias-button-primary-fill); color: var(--dsw-alias-label-primary-foreground); }
-.dim-jh-zcBtn[data-kind="primary"]:hover:not(:disabled) { border-color: var(--dsw-alias-button-primary-hover); background: var(--dsw-alias-button-primary-hover); }
-.dim-jh-zcBtn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dsw-alias-border-l3); }
-.dim-jh-zcBtn:disabled { opacity: .4; cursor: default; }
-
-.dim-jh-zcEmpty { padding: 2px 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
-.dim-jh-zcEmpty p { margin: 0 0 4px; }
-/* 结果提示：**刻意留在折叠区外**（见 zcode-card.js），故自带下间距 */
-.dim-jh-zcNotice { margin-top: 10px; padding: 8px 10px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-2); font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
-.dim-jh-zcNotice[data-tone="ok"] { background: var(--dsw-alias-state-success-tertiary); }
-.dim-jh-zcNotice[data-tone="warn"] { color: var(--dsw-alias-state-warn-label); background: var(--dsw-alias-state-warn-tertiary); }
-.dim-jh-zcNotice[data-tone="error"] { color: var(--dsw-alias-state-error-primary); background: var(--dsw-alias-interactive-bg-hover-danger); }
-.dim-jh-zcNotice ul { margin: 4px 0 0; padding-left: 18px; }
-.dim-jh-zcLink { color: var(--dsw-alias-link); word-break: break-all; }
+/* 登录渠道选择（BigModel 国内 / z.ai 国际） */
+.dim-jh-zcProvider { display: inline-flex; align-items: center; gap: 6px; color: var(--dsw-alias-label-secondary, GrayText); font-size: 12px; line-height: 18px; }
+/* ⚠ background/color 的变量**必须带 fallback**（真实报障 2026-10-03：下拉里两项
+   全是白的，只有 hover 才看见内容）。
+   两个原因叠加：
+   ① 原写法 background 设为全透明（0 0）+ color 用了无 fallback 的变量
+      —— 变量在弹窗 scope 里取不到时 color 整条失效，退回继承。
+   ② ⚠ Windows/Electron 下 **option 的背景不继承 select 的 background**，
+      由系统主题决定；文字却**继承** color。
+   ⇒ 浅色系统上就是「白底 + 失效/白字」⇒ 看不见。
+   修法：① 变量都带 fallback，且 fallback 用 **CSS 系统色**（Canvas/CanvasText），
+   它跟随系统深浅色；② 给 option 单独声明背景与文字色。
+   ⚠⚠ 本注释里**绝不能出现反引号**（STYLES 是模板字符串，见 AGENTS.md）。 */
+.dim-jh-zcSelect { box-sizing: border-box; height: 28px; padding: 0 8px; border: .5px solid var(--dsw-alias-border-l3, #dee0e3); border-radius: 14px; background: var(--dsw-alias-bg-layer-3, Canvas); color: var(--dsw-alias-label-primary, CanvasText); font-size: 12px; line-height: 18px; cursor: pointer; }
+/* ⚠ 必须单独声明：option 的背景不继承 select（见上）。缺这条就是「下拉项全白」。 */
+.dim-jh-zcSelect option { color: var(--dsw-alias-label-primary, CanvasText); background-color: var(--dsw-alias-bg-layer-3, Canvas); }
+.dim-jh-zcSelect:disabled { opacity: .4; cursor: default; }
+.dim-jh-zcSelect:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dsw-alias-border-l3, #dee0e3); }
+.dim-jh-zcDialogMask { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .45); }
+.dim-jh-zcDialog { box-sizing: border-box; width: min(420px, calc(100vw - 32px)); padding: 18px 20px; border-radius: 10px; background: var(--dsw-alias-bg-layer-3, Canvas); box-shadow: 0 8px 32px rgba(0, 0, 0, .28); }
+/* ⚠ 背景**必须**用 bg-layer-3（真实报障 2026-10-03：深色主题下弹窗是白的）。
+   原先写的是 --dsw-alias-surface —— 那是**猜的变量名，DSH 里并不存在**，
+   于是 fallback 里的浅色生效 ⇒ 深色主题下白底 + 浅色字，几乎看不见。
+   本文件通篇用 bg-layer-1/2/3；fallback 用 CSS 系统色 Canvas（跟随系统深浅），
+   这样变量取不到时也不会退回浅色。 */
+.dim-jh-zcDialogTitle { margin: 0 0 6px; font-size: 15px; font-weight: 600; color: var(--dsw-alias-label-primary, CanvasText); }
+.dim-jh-zcDialogHint { margin: 0 0 12px; font-size: 12px; line-height: 17px; color: var(--dsw-alias-label-tertiary, GrayText); }
+.dim-jh-zcDialog .dim-jh-zcProvider { display: flex; align-items: center; gap: 8px; margin: 0 0 16px; font-size: 13px; }
+.dim-jh-zcDialogActions { display: flex; justify-content: flex-end; gap: 8px; }
 
 /* ── 用量徽标（会话输入区，模型选择器旁） ────────────────────────────────
    折叠态是一枚紧凑按钮，浮层用 position:absolute + bottom:calc(100% + 8px)
@@ -515,20 +645,106 @@ const STYLES = `
  *
  * ## 两级收敛（用户定：1+2）
  *
- * ① 基础宽度从 280px 收窄到 **150px**（文字超出走省略号，已有 min-width:0
- *    + ellipsis 支撑）—— 给模型选择器让出约 130px，够显示「图标+名字+▾」。
+ * ## 宽度：**内容自适应**，216px 只是上限（不是目标宽度）
+ *
+ * 胶囊本身是**内容自适应**的：宽度由实际文字撑开，短内容就短
+ * （Cline • 5积分 仅 93px），不会有固定留白。下面的 max-width 只在
+ * 内容**过长**时兜底，防止挤压右侧的模型选择器。
+ *
+ * ⚠️ 2026-10-03 上限从 150px 提到 **216px**（用户报障「供应商名字显示不完整」
+ * 之后又提了一次）。两次报障、同一条链路的两个不同成因：
+ * 1. **数字被截**（第一次）：整句塞进一个 overflow:hidden 的 span，省略号从右往左
+ *    吃掉了余额。修法是**结构**（拆成可独立收缩的 span，见 badge-model.js 的
+ *    readingOf 与 usage-badge.js 的三段式渲染）；
+ * 2. **渠道名被截**（第二次）：结构修好后，186px 仍不够长渠道名 + 长余额，
+ *    于是省略号落到**名字**上（用户截图：CodeArts (华为…）。216px 解决它。
+ *
+ * **216 是量出来的，不是拍的**：实测 13 个渠道展示名 × 10 种现实读数
+ * （含 123456.78积分 / 9499.84积分 / 94.54MToken / 0积分）共 130 组，
+ * 需要的最宽度是 **209.34px**（WorkBuddy (国际版) • 123456.78积分），
+ * 216px 全部装得下且留 6.7px 余量（字体回退时字宽会变）。
+ *
+ * ⚠️ **上限不能再往上放**：实测把上限放到「无上限」时，极窄 composer（220px）
+ * 下胶囊会**溢出容器 8.3px** —— 那正是 2026-10-02「模型选择器图标被挤没」
+ * 的形态。内容自适应 + 合理上限，两者缺一不可。
+ * 兜底退化顺序：超长时**渠道名**先出省略号，**余额一个字都不会少**
+ * （.dim-jh-badgeReading 是 flex: none）。
+ *
+ * ⚠️ button 元素**本来就是 border-box**（UA 默认样式表），故下面的 box-sizing
+ * 是**显式写出**（防止哪天元素换成 span/div 时语义悄悄变成内容盒），不是修复。
+ * ⚠️⚠️ 本段注释里**不能出现反引号**（本文件整体是 JS 模板字符串，会提前终止）。
  * ② 容器再窄时（< 720px，媒体查询挂在**全局宽度**上：composer 宽度受
  *    侧栏影响，用容器查询无法表达「右侧还剩多少」）**只留状态点**，
  *    文字与 chevron 全部隐藏 —— 此时代理器优先级让给模型选择器。 */
-.dim-jh-badge { position: relative; display: flex; align-items: center; flex: none; min-width: 0; }
-.dim-jh-badgeBtn { display: flex; align-items: center; gap: 5px; max-width: 150px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
+/* ⚠️ flex: 0 1 auto（而非 none）：胶囊自身也要能收缩。它是 flex: none 时
+   宽度只由 max-width 兜底，而 max-width 只在**内容超标**时生效 —— 容器更窄时
+   它会连同右侧模型选择器一起溢出。允许收缩后，空间不足时胶囊与选择器一起让位，
+   且胶囊内部退化是有序的（先名字出省略号，数字最后才动）。 */
+.dim-jh-badge { position: relative; display: flex; align-items: center; flex: 0 1 auto; min-width: 0; }
+/* ⚠️ box-sizing 是**显式写出**的，不是修复：button 的 UA 默认样式表本就是
+   border-box（实测 offsetWidth 与 max-width 相等）。写上它只为在元素类型被改
+   （span/div 默认是 content-box）时语义不悄悄漂移 —— 那种情况下 max-width 会从
+   「占位宽度」变成「内容宽度」，胶囊会突然变宽 19px 而这行代码看着毫无变化。 */
+.dim-jh-badgeBtn { box-sizing: border-box; display: flex; align-items: center; gap: 5px; max-width: 216px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
 .dim-jh-badgeBtn:hover { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeBtn[aria-expanded="true"] { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); }
+/* 三段式文本容器：渠道名 + 分隔符 + 读数。
+   ⚠️ 必须是 flex 容器，两个文本子项才能各自独立收缩（这正是「数字不被截」的前提）。 */
+.dim-jh-badgeText { display: flex; align-items: center; min-width: 0; }
+/* ⚠️ 让位顺序：中段说明(999) → 渠道名(99) → 读数(none，**不参与收缩**)。
+   收缩量按 flex-shrink × flex-basis 加权分配，999 与 99 相差一个数量级，
+   故「包名先走、渠道名其次」，读数一个字都不会少。
+   flex-grow 一律为 0：胶囊是内容自适应宽度，任何 grow 都只会让它在宽容器里虚胖。
+   min-width:0 是省略号生效的前提（flex 子项默认 min-width:auto，会撑破 max-width）。 */
+.dim-jh-badgeName { flex: 0 99 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 分隔符「•」：定宽不收缩，两侧间距由 margin 给。
+   ⚠️ 这里的 3px **不能**换成前后空格：flex 容器把 span 之间只含空白的文本节点
+   渲染成**零宽**（实测 gap=0，节点还在但看不见），空格会静默消失。
+   带空格的那份写法（BADGE_SEP = ' • '）只用于 title / aria-label 那句整文。 */
+.dim-jh-badgeSep { flex: none; margin: 0 3px; }
+/* 中段说明（只有套餐模式有值，如包名 Free Plan Subscription）。
+   ⚠️ 收缩权重**最大**（999）：它比渠道名更该让位 —— 包名多为样板字、且长，
+   而用户认得出自己选的渠道。
+   ⚠️ 它被压到 0 宽时（内容过长）该节点仍在，会留下一个「悬空的分隔符」；
+   这在胶囊这一行是可接受的（完整文案在 title 与弹窗里），故不额外做条件渲染。 */
+.dim-jh-badgeDetail { flex: 0 999 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ⚠️⚠️ 读数必须 flex: none（**完全不收缩**），不能写 flex: 0 1 auto。
+   这是第二处、也是更隐蔽的一处「数字被截」成因，**靠截图才发现**：
+
+   收缩量按 flex-shrink × flex-basis 加权分配，读数那一份虽小却**不为零** ——
+   实测读数被分到 0.77px 的收缩（getBoundingClientRect 宽 78.23 / 内容宽 79）。
+   而 text-overflow: ellipsis 的触发条件是 scrollWidth > clientWidth，
+   **亚像素级的收缩就足以命中** ⇒ 最后一个字被换成「…」，
+   视觉上和「整段被截」一样严重。
+
+   ⚠️ 更坑的是**量不出来**：clientWidth 取整，53.97 报成 54，
+   于是 scrollWidth > clientWidth 判为 false —— 我用它写的「数字是否完整」
+   断言一路全绿，而截图里明明白白写着「347.87积…」。
+   教训：判断省略号要看**截图**或用小数宽度（getBoundingClientRect），
+   不能用取整后的 clientWidth。
+
+   ⚠️ 类名刻意**不叫 .dim-jh-badgeValue**：那个名字已被弹窗读数占用，且那条规则
+   （font-weight:600）排在样式表更后面 —— 同名会让胶囊数字被静默加粗。
+
+   ⇒ 读数恒定完整；全部收缩由 .dim-jh-badgeDetail(999) 与 .dim-jh-badgeName(99)
+   承担，两者最坏缩到 0 也放得下（读数最宽约 97px + 分隔符与内边距 ≈ 131px
+   < 186px 上限）。 */
+.dim-jh-badgeReading { flex: none; min-width: 0; white-space: nowrap; }
+/* 「这个读数不完整」的标记（合计少算了账号时才出现），排在读数**之后**。
+   ⚠️ 必须与读数同级 flex: none：它是**补语**，被省略号吃掉就等于没标 —— 而它要
+   提醒的恰恰是「别把这个数字当真」，看不见比不标更糟。
+   ⚠️ 用 warn 而不是 error：账号读不到多半是临时的（凭据过期 / 网络抖动），
+   error 是留给「整个渠道都不可用」的（那会走 empty 模式）。
+   字号小一档并压紧行高，让它读起来像角标而不是读数的一部分。 */
+.dim-jh-badgeWarn { flex: none; font-size: 10px; line-height: 1; color: var(--dsw-alias-state-warn-primary); cursor: help; }
+
 /* ② 窄屏收敛：只留状态点，文字与 chevron 让位给模型选择器。
- * 阈值 720px 是实测桌面版在 100% 缩放下「徽标 150px + 模型选择器 ≥ 240px」的临界值。 */
+ * 阈值 720px 是实测桌面版在 100% 缩放下「徽标 216px + 模型选择器 ≥ 240px」的临界值。
+ * ⚠️⚠️ 本段的**位置**是功能性的，不要为了排版把它挪到 .dim-jh-badgeText 之前：
+ * 它与 ".dim-jh-badgeText { display: flex }" 特异性相同（都是单个类），
+ * 靠**源顺序**决定胜负 —— 一旦被排到前面，窄屏下 display:none 会被
+ * 后面的 display:flex 覆盖，文字重新出现并挤压模型选择器（静默回归）。 */
 @media (max-width: 720px) { .dim-jh-badgeText, .dim-jh-badgeBtn > svg, .dim-jh-badgeBtn > .dim-jh-badgeChevron { display: none; } .dim-jh-badgeBtn { max-width: none; padding: 2px 6px; } }
-/* min-width:0 是省略号生效的前提（flex 子项默认 min-width:auto，会撑破 max-width） */
-.dim-jh-badgeText { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .dim-jh-badgeDot { width: 5px; height: 5px; flex: none; border-radius: 999px; background: var(--dsw-alias-state-success-primary); }
 .dim-jh-badgeDot[data-tone="warn"] { background: var(--dsw-alias-state-warn-primary); }
 .dim-jh-badgeDot[data-tone="error"] { background: var(--dsw-alias-state-error-primary); }
@@ -622,6 +838,12 @@ const STYLES = `
 .dim-jh-badgeNotice[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); }
 .dim-jh-badgeFail { font-size: 10px; line-height: 14px; color: var(--dsw-alias-state-error-primary); }
 .dim-jh-badgeFoot { font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-tertiary); }
+/* 「展开其余 N 个账号」/「收起」：纯文字按钮，左对齐、不占满宽。
+   ⚠️ 刻意**不复用** .dim-jh-badgeAction：那条规则是 flex:1 的实心按钮（用于签到），
+   放在明细列表下面会抢走视觉焦点 —— 用户要的是「明细可以收起来」，不是一个主操作。
+   align-self: flex-start 是因为父容器 .dim-jh-badgePop 是 flex 列（默认 stretch）。 */
+.dim-jh-badgeMore { align-self: flex-start; margin-top: 3px; padding: 1px 0; border: 0; background: none; font: inherit; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-link); cursor: pointer; }
+.dim-jh-badgeMore:hover { color: var(--dsw-alias-brand-primary); text-decoration: underline; }
 
 `
 

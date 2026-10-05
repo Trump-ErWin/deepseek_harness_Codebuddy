@@ -4,25 +4,27 @@
  * ## 与其它 provider 的共同点
  *
  * 「读凭据 → 直发远端」—— 这一点与 CodeArts / Buddy / Qoder 等**相同**。
- * 用户装好官方 ZCode 客户端并登录一次即可，不需要任何实例常驻。
+ * 用户在 Jet Hub 面板点「添加账号」走插件自己的授权流即可，**不需要安装任何客户端**。
  *
  * ## 与其它 provider 的差异（全部实测）
  *
  * | 维度 | ZCode | 对照 |
  * |---|---|---|
- * | 凭据来源 | 解密磁盘 `~/.zcode/v2/credentials.json`（AES-256-GCM） | 浏览器登录拿 token |
+ * | 凭据来源 | **只有插件自己的 OAuth 流程**（⚠ 2026-10-05 起**不再**读取本机 ZCode 客户端数据，见 `zcode.ts` 文件头） | 浏览器登录拿 token |
  * | 协议 | **Anthropic Messages**（非 OpenAI） | 其余多为 OpenAI 兼容 |
  * | 验证前置 | **按需**产出阿里云 captcha（索要时才产，稳态一次约 0.4–0.5 秒） | 无 |
- * | 请求体准入 | **必须带官方身份块 + 首轮日期块**（否则 3012） | 无 |
+ * | 请求体准入 | **必须带官方身份块**（否则 405 + `3012`） | 无 |
  * | 续期 | 无（静态凭据） | 多数有 refresh_token |
  *
  * ## 三个必须真的做到的点
  *
  * 1. **`system` 必须带官方身份块** —— 缺了上游回 `3012 unusual activity`
- *    （实测矩阵见 `zcode-identity.ts`）。且这是**请求体内容**层面的判据，
- *    与 HTTP 头、运行时无关。
- * 2. **首轮 user 消息要带 `<system-reminder>` 日期块** —— 桥侧源码称之为
- *    「3012 的最后一个开关」。
+ *    （HTTP **405**；实测矩阵见 `zcode-identity.ts`）。且这是**请求体内容**层面的判据，
+ *    与 HTTP 头、运行时、请求频率、多轮历史、`tools` 都无关
+ *    （2026-10-03 逐项排除，见 README 的「3012」章节）。
+ * 2. **首轮 user 消息带 `<system-reminder>` 日期块** —— 官方如此，照发。
+ *    ⚠ **但它不是 3012 的判据**（去掉照样 200）；桥侧源码当年称它是
+ *    「3012 的最后一个开关」，2026-10-03 实测已推翻。
  * 3. **`tools` 必须真的下发**（转成 Anthropic 的扁平 `input_schema` 形态）——
  *    Qoder 与 TRAE 都因漏发而让模型在正文里臆造 XML 工具调用、harness
  *    认不出 → 任务终止。
@@ -68,9 +70,12 @@ import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import type { ZcodeCredential } from './zcode.js'
 import { ZCODE, type ZcodeFallbackModel, type ZcodeProduct, type ZcodeRemoteModelLike } from './zcode-product.js'
 import {
-  ZCODE_PLAN_MESSAGES_URL,
-  buildZcodeHeaders,
-} from './zcode-upstream.js'
+  buildChannelRequest,
+  describeChannels,
+  resolveChannelFor,
+  shouldFallbackToOtherChannel,
+  type ZcodeChannel,
+} from './zcode-transport.js'
 import {
   buildZcodeSystemBlocks,
   withContextPrefix,
@@ -99,6 +104,13 @@ import {
   noteProbeFirst,
 } from './captcha-requirement.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
+import {
+  describeZcodeRequestShape,
+  formatZcodeDiagnostic,
+  noteZcodeRequestFailed,
+  noteZcodeRequestOk,
+  noteZcodeRequestSent,
+} from './zcode-diagnostics.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
 export const PROVIDER = 'zcode'
@@ -698,8 +710,9 @@ export class ZcodeAdapter extends LlmAdapter {
      *
      * ⚠ 三个必须做对的点：
      *   - `system` 是顶层块数组，且第一块必须是官方 `cliPrefix`
-     *     （缺了回 3012）
-     *   - 首轮 user 消息要带 `<system-reminder>` 日期块
+     *     （**唯一**的 3012 判据；缺了回 405 + 3012）
+     *   - 首轮 user 消息带 `<system-reminder>` 日期块（官方如此，
+     *     但实测**不是** 3012 的判据 —— 见 `zcode-identity.ts` 头注释）
      *   - `tools` 是**扁平** `input_schema` 形态（不是 OpenAI 的嵌套 `function`）
      */
     const wire = serializeMessages(options.messages, imageUrls)
@@ -907,20 +920,58 @@ export class ZcodeAdapter extends LlmAdapter {
           mintMs = Date.now() - mintStartedAt
         }
 
-        const headers = buildZcodeHeaders(credential, {
-          authorization: `Bearer ${credential.zcode_jwt}`,
+        /**
+         * ★ **按通道组装请求**（2026-10-03，ZCode 双通道）。
+         *
+         * 原来这里恒用 `ZCODE_PLAN_MESSAGES_URL` + `zcode_jwt`，即只有积分通道。
+         * 现在按 {@link resolveChannelFor} 选腿：
+         * - `start-plan`（积分，**优先**）：`zcode.z.ai` + `zcode_jwt` —— 与原行为逐字一致
+         * - `coding-plan`（订阅）：`api.z.ai` + `coding_plan_key_*`
+         *
+         * ⚠ **captcha 头在 transport 之上叠加**：`buildChannelRequest` 只管端点与
+         * 凭据，而 captcha 是**两条通道共用**的可选头（param 一次性，每轮重产）。
+         * 这里保持"有 param 就带上"的既有语义。
+         */
+        const requestChannel = resolveChannelFor(credential, options.model)
+        const channelRequest = buildChannelRequest(credential, requestChannel, JSON.stringify(body))
+        const headers = {
+          ...channelRequest.headers,
           ...(captchaParam === undefined
             ? {}
             : {
-              captcha: {
-                param: captchaParam,
-                region: this.options.captchaRegion ?? 'cn',
-              },
+              'x-aliyun-captcha-verify-param': captchaParam,
+              /**
+               * ★ region 必须与**产 param 的那份配置**同源（同型缺陷，与 issue IKJNPS
+               * 的领取路径一模一样，这里是第二个实例）。
+               *
+               * `this.captchaConfig` 由 `index.ts` 的 `resolveZcodeCaptchaConfig()`
+               * 在 mint 回调里写入（`setCaptchaConfig`），而 mint **先于**组头发生
+               * （上面那两行）⇒ 这里读到的一定是本次 param 用的那份。
+               * ⚠ 别只留 `this.options.captchaRegion ?? 'cn'`：那个兜底常量只在
+               *   cn 区账号上碰巧正确，非 cn 区（服务端下发 `sgp`）会让每一次
+               *   3007 补产重发**必然**再撞一次同一个 `3007`（而重发只有一次机会）。
+               */
+              'x-aliyun-captcha-verify-region': this.captchaConfig?.region
+                ?? this.options.captchaRegion
+                ?? 'cn',
             }),
-        })
+        }
 
         const upstreamStartedAt = Date.now()
+        /**
+         * ★ 记「已发出」（Gitee issue IKJI0Y 的可观测诊断）。
+         *
+         * ⚠ 必须在 `sendUpstream` **之前**记，且用 `upstreamStartedAt`：
+         * 否则「距上一条 zcode 请求隔了多久」会把本次自己的排队/mint 等待
+         * 算进去，算出一个没有排查价值的大数。
+         *
+         * ⚠ `activeAccountId` 是**局部可变状态**（切号后会变），与
+         * `zcode-adapter.ts` 里额度切号那段是同一条纪律 —— 标记必须记在
+         * 真正发出这条请求的账号上，否则切到 B 之后失败会把账记到 A 头上。
+         */
+        noteZcodeRequestSent(activeAccountId, upstreamStartedAt)
         response = await this.sendUpstream({
+          url: channelRequest.url,
           headers,
           body,
           signal: controller.signal,
@@ -935,6 +986,7 @@ export class ZcodeAdapter extends LlmAdapter {
          */
         const headersMs = Date.now() - upstreamStartedAt
         if (response.ok) {
+          noteZcodeRequestOk(activeAccountId, Date.now())
           if (captchaParam === undefined) {
             // 不带也成功 ⇒ 上游当前不要验证，清掉记忆回到最省路径。
             clearCaptchaRequirement(requirementKey)
@@ -950,6 +1002,7 @@ export class ZcodeAdapter extends LlmAdapter {
         }
 
         const text = await response.text().catch(() => '')
+        noteZcodeRequestFailed(activeAccountId)
 
         // ① 额度用尽 / 无权益 → **换账号**（不是重试）
         if (isZcodeQuotaExhausted(response.status, text)) {
@@ -975,6 +1028,57 @@ export class ZcodeAdapter extends LlmAdapter {
             'QUOTA_EXCEEDED',
             { status: response.status },
           )
+        }
+
+        // ①′ ★ **额度/资源包用尽 ⇒ 换另一条通道重试一次**（2026-10-03）。
+        //
+        // 位置在①之后：① 已经**切过账号**或已耗尽切号轮次
+        // （`isZcodeQuotaExhausted` 覆盖的码比这里宽），这时换通道
+        // （换端点 + 换凭据）比直接报 QUOTA_EXCEEDED 更有价值 ——
+        // 积分通道的额度与订阅通道的额度是**两份独立的**。
+        //
+        // ⚠ 只认 429 + 1005/1113（见 `shouldFallbackToOtherChannel`）：
+        // 401/1002（凭据失效）与 3012（风控，重试会加重冷却惩罚）都不换。
+        // ⚠ 换腿前先确认**另一条通道真的可用**（`describeChannels`），
+        //   否则等于用一个没有凭据的端点再撞一次 401，把一次明确失败变成两次。
+        // ⚠ ⚠⚠ 换腿**不重产 captcha**：`captchaParam` 是**一次性**的，
+        //   上一发已被上游消费；重发必须**现产新的**。这里保守起见只在
+        //   `captchaParam === undefined`（上游当下不索要验证）时换腿 ——
+        //   带了 param 的那一发被拒属于另一类问题，走 ③ 的 3007 分支。
+        if (
+          shouldFallbackToOtherChannel(response.status, text)
+          && !switchedAccount
+          && captchaParam === undefined
+          && attempt < this.product.concurrencyRetryMax
+        ) {
+          const current: ZcodeChannel = requestChannel
+          const other: ZcodeChannel = current === 'start-plan' ? 'coding-plan' : 'start-plan'
+          const otherReady = describeChannels(credential).find((i) => i.channel === other)?.available === true
+          if (otherReady) {
+            this.options.log?.(
+              `zcode: ${current} 额度用尽（HTTP ${response.status}）⇒ 换 ${other} 重发一次`,
+            )
+            const otherRequest = buildChannelRequest(credential, other, JSON.stringify(body))
+            const otherResponse = await this.sendUpstream({
+              url: otherRequest.url,
+              headers: otherRequest.headers,
+              body,
+              signal: controller.signal,
+              userSignal: options.signal,
+              timeoutMs,
+              model: options.model,
+            })
+            if (otherResponse.ok) {
+              // 换腿成功 ⇒ 把它当作本轮的正式响应继续往下走（读流 / usage）
+              response = otherResponse
+              break
+            }
+            // 换腿也失败 ⇒ 落回原有错误处理（用**原**通道的 status/text，
+            //   免得把「换腿失败」报成用户看到的那个错误）
+            this.options.log?.(
+              `zcode: 换 ${other} 仍失败（HTTP ${otherResponse.status}）⇒ 回到 ${current} 的错误处理`,
+            )
+          }
         }
 
         // ② 并发限流 → 退避后再试（**不**换账号：换谁都一样撞）
@@ -1029,8 +1133,37 @@ export class ZcodeAdapter extends LlmAdapter {
         }
 
         // ④ 其余错误：按既有映射如实抛出（3012 等不可重试类不变）
+        /**
+         * ★ **只在 `3012` 上附诊断**（Gitee issue IKJI0Y）。
+         *
+         * ## 为什么只给 3012 加
+         *
+         * - `3012` 是**唯一一个用户既什么都做不了、又完全看不出原因**的错误：
+         *   冷却惩罚不可逆 ⇒ 不可重试；而既有文案只有固定句 + 原始响应，
+         *   连「是不是这个账号自身的问题」都无法回答。
+         * - 其它码（`3009`/`1005`/`3007`）的文案**本身就说明了原因**，
+         *   且都各自有单测钉住措辞 ⇒ 附加诊断只会让那些文案变脏。
+         *
+         * ## 形态取自「已构造好的 body」而不是常量
+         *
+         * `body.system` / `body.messages` 就是**即将发出去**的那份（重试与
+         * 切号都复用同一份），故诊断到的是**线上形态**。真出现「身份块没进去」
+         * 时它会显示 0 字符 —— 而不是显示常量里的 2898 把问题盖住。
+         *
+         * ⚠ 上面的 {@link noteZcodeRequestFailed} 已经把本次算作一次失败，
+         * 故这里诊断到的「失败 N」含本次，这是有意的（用户看到的就是当次）。
+         */
+        const diagnostic = text.includes('3012')
+          ? formatZcodeDiagnostic({
+            accountId: activeAccountId,
+            sentAt: upstreamStartedAt,
+            status: response.status,
+            shape: describeZcodeRequestShape(body.system, body.messages),
+            now: Date.now(),
+          })
+          : undefined
         throw new LlmError(
-          `zcode: ${describeUpstreamError(response.status, text)}`,
+          `zcode: ${describeUpstreamError(response.status, text, diagnostic)}`,
           httpErrorCodeForZcode(response.status, text),
           { status: response.status },
         )
@@ -1152,8 +1285,8 @@ export class ZcodeAdapter extends LlmAdapter {
     }
     if (credential === undefined) {
       throw new LlmError(
-        'zcode: 没有可用的凭据 —— 请在 Jet Hub 的 ZCode 面板点「添加账号」完成登录' +
-        '（若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的凭据）',
+        'zcode: 没有可用的凭据 —— 请在 Jet Hub 的 ZCode 面板点「添加账号」完成登录'
+        + '（本插件只用它自己的授权流程，不会读取本机 ZCode 客户端的登录态）',
         'MISSING_CREDENTIAL',
       )
     }
@@ -1176,6 +1309,7 @@ export class ZcodeAdapter extends LlmAdapter {
    * 暴涨到 2500-3100ms。
    */
   private async sendUpstream(input: {
+    url: string
     headers: Record<string, string>
     body: Record<string, unknown>
     signal: AbortSignal
@@ -1183,11 +1317,11 @@ export class ZcodeAdapter extends LlmAdapter {
     timeoutMs: number
     model: string
   }): Promise<Response> {
-    const { headers, body, signal, userSignal, timeoutMs, model } = input
+    const { url, headers, body, signal, userSignal, timeoutMs, model } = input
     try {
       return await this.gate.run(
         model,
-        async () => await this.fetchImpl(ZCODE_PLAN_MESSAGES_URL, {
+        async () => await this.fetchImpl(url, {
           method: 'POST',
           headers,
           body: JSON.stringify(body),
@@ -1544,11 +1678,30 @@ export function withToolCacheBreakpoint<T extends object>(
 /**
  * 把上游错误翻成人能看懂的一句话。
  *
- * ⚠ 两个业务码要单独说清，因为它们的**处理方式完全不同**：
+ * ## 两个业务码要单独说清，因为它们的**处理方式完全不同**：
  * - `3007` = captcha 校验失败（**可重试**：换个新 param 即可）
  * - `3012` = 风控拦截（**不要重试**：有账号冷却惩罚，重复触发会升级封禁）
+ *
+ * ## `3012` 会附带一行**可观测诊断**（Gitee issue IKJI0Y）
+ *
+ * 3012 是唯一一个「用户什么都做不了、又完全看不出原因」的错误：冷却惩罚
+ * 不可逆，而既有文案只有固定句 + 原始响应。issue 的原话是
+ * 「目前唯一能确认的是身份块字符数这一项，而它恰好是正常的」——
+ * 即诊断信息缺到连**排除法**都做不了。
+ *
+ * ⇒ `diagnostic` 由调用方（`stream()`）组装，内容见
+ * {@link formatZcodeDiagnostic}：**只含账号序号、进程内计数、间隔、
+ * 实测身份块字符数、日期块有无**，**不含任何凭据**。
+ * 未提供时行为与原来逐字一致（单测直接调用本函数的用例不受影响）。
  */
-export function describeUpstreamError(status: number, body: string): string {
+export function describeUpstreamError(
+  status: number,
+  body: string,
+  diagnostic?: string,
+): string {
+  const diag = typeof diagnostic === 'string' && diagnostic.length > 0
+    ? `本机诊断：${diagnostic}\n`
+    : ''
   const trimmed = body.trim()
   let code: unknown
   let message: unknown
@@ -1585,11 +1738,15 @@ export function describeUpstreamError(status: number, body: string): string {
     return (
       `上游风控拦截（3012 unusual activity）。` +
       `⚠ 该错误有账号冷却惩罚（30 分钟，反复触发会升级到 24 小时乃至停用），` +
-      `请勿连续重试。原始响应：${suffix}`
+      `请勿连续重试。\n${diag}` +
+      `原始响应：${suffix}`
     )
   }
   if (code === 1002 || status === 401) {
-    return `凭据失效（${status}）。请重新在官方 ZCode 客户端登录。${suffix}`
+    // ⚠ 必须指向 Jet Hub 而不是官方客户端：凭据只有插件自己会写
+    //   （`~/.zcode/v2/credentials.json` 那条回退路已于 2026-10-05 删除），
+    //   让用户「去官方客户端重新登录」会把他引到一个**完全无效**的操作上。
+    return `凭据失效（${status}）。请在 Jet Hub 的 ZCode 面板删除该账号后重新添加登录。${suffix}`
   }
   return `HTTP ${status}：${suffix}`
 }

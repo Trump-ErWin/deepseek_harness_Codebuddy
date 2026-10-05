@@ -43,13 +43,13 @@ describe('Cline 产品配置', () => {
     expect(CLINE.defaultCredentialRef).toBe('CLINE_ACCESS_TOKEN')
   })
 
-  it('兜底表含远端 free 数组的全部 5 个免费模型', () => {
-    // 远端 `recommended-models` 的 free 数组实测（2026-09-25）正是这 5 个，
-    // 也正好是用户截图里的清单。
+  it('兜底表含远端 free 数组的全部免费模型', () => {
+    // 远端 `recommended-models` 的 free 数组实测（2026-10-03 复测，共 **4** 个；
+    // 2026-09-25 时的第 5 个 `cline-free/gemini-3.8-flash` 已被 Cline 下线 ——
+    // 直连回 `404 model not found`，故兜底表也删掉它，两处保持一致）。
     const freeIds = CLINE.fallbackModels.filter((m) => m.isFree === true).map((m) => m.id)
     expect(freeIds.sort()).toEqual([
       'cline-free/deepseek-v4.1-flash',
-      'cline-free/gemini-3.8-flash',
       'cline-free/mimo-v2.6-flash',
       'cline-free/muse-spark-1.3-contributor',
       'stealth/space-bunny-alpha',

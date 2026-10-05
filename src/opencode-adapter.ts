@@ -52,6 +52,7 @@ import {
 import { buildProxyDispatcher } from './opencode-proxy.js'
 import { consumeOpenAiSse, collectImages, httpErrorCode, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
+import { retryAfterMsFromResponse } from './retry-after.js'
 
 /** 目录条目（远端与兜底共用的输出形状）。 */
 export interface OpencodeCatalogEntry extends OpencodeFallbackModel {}
@@ -545,6 +546,9 @@ export class OpencodeAdapter extends LlmAdapter {
       // 而 body 只能读一次 —— 读了不传下去，轮换层就只能按状态码猜，
       // 把「额度耗尽」误判成「key 失效」（HTTP 层的 httpErrorCode 就会这么干）。
       const text = await response.text().catch(() => '')
+      // ⚠️ 只解析一次：头值是 HTTP 日期时，两次调用会算出**毫秒级不同**的值。
+      // 解析实现收敛在 `src/retry-after.ts`（0 是合法值，判空必须用 `=== undefined`）。
+      const retryAfterMs = retryAfterMsFromResponse(response.headers)
       throw new LlmError(
         `opencode: HTTP ${response.status} — ${text.slice(0, 300)}`,
         httpErrorCode(response.status),
@@ -552,9 +556,9 @@ export class OpencodeAdapter extends LlmAdapter {
           status: response.status,
           // ⚠️ 走 dsh-llm 的**官方契约**字段（`LlmErrorOptions`）：
           // 上游给的等待时长不必自己发明字段名，harness 也认它。
-          ...parseRetryAfterHeader(response.headers) === undefined
+          ...retryAfterMs === undefined
             ? {}
-            : { providerRetryAfterMs: parseRetryAfterHeader(response.headers) },
+            : { providerRetryAfterMs: retryAfterMs },
         },
       )
     }
@@ -565,21 +569,6 @@ export class OpencodeAdapter extends LlmAdapter {
       ...options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {},
     })
   }
-}
-
-/**
- * 读 `retry-after` 响应头（秒数或 HTTP 日期）→ 毫秒。
- *
- * ⚠️ **0 是合法值**（「立即解除」），故调用方必须用 `=== undefined` 判空；
- * 任何 falsy 判据都会把 0 变成「未知」再退避一小时。
- */
-function parseRetryAfterHeader(headers: Headers): number | undefined {
-  const raw = headers.get('retry-after')
-  if (raw === null || raw === '') return undefined
-  const seconds = Number(raw)
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000)
-  const at = Date.parse(raw)
-  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined
 }
 
 /**

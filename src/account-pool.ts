@@ -31,6 +31,54 @@ declare module '@deepseek-ai/cordis' {
 const EMPTY_MODEL_SET: ReadonlySet<string> = new Set<string>()
 
 /**
+ * 判定「某 provider 的启用账号是否**全部**因目标模型处于限流期」。
+ *
+ * ## 为什么需要它
+ *
+ * 选号按 `modelRateLimits[modelId]` 过滤候选（见本类的 `getAvailableAccount`
+ * 与 `src/index.ts` 的 `pickBuddyCredential`）。当一个 provider 只有**一个**
+ * 启用账号、而它恰好被标记了该模型的限流时，候选集变成空集，调用链一路
+ * 返回 `undefined`，最终由适配器抛出「no usable credential; log in from the
+ * Jet Hub panel first」—— 而**凭据其实是好的、账号也是启用的**，用户被指去
+ * 重新登录，方向完全错。
+ *
+ * 本函数把这种情形**证明**出来：返回非 `undefined` 即表示「这批账号全都因
+ * 该模型受限」，调用方据此报带解禁时刻的明确错误。
+ *
+ * ⚠️ **判据必须窄**，两条边界都不能松：
+ * - 空 `modelId`（未知目标模型）直接返回 `undefined` —— 与选号侧约定一致
+ *   （空 modelId 不做限流过滤），否则会把「未登录」误报成「限流」。
+ *   这条**不是**冗余守卫：`updateModelRateLimit` 不校验 modelId，理论上可能
+ *   落下一个 `modelRateLimits['']` 脏键，没有它就会被当成真实限流上报；
+ * - 只要**任一**账号没有该模型的未过期标记，整体即不成立 —— 那种情况下
+ *   候选本就非空，轮不到本函数说话。
+ *
+ * ℹ️ 空 `accounts` 无需单独早退：循环不执行 → `earliest` 保持 `undefined`
+ * → 末尾守卫返回 `undefined`。（曾写过一条 `accounts.length === 0` 早退，
+ * 反向验证证明它**不可区分**、纯冗余，故删除。）
+ *
+ * @param accounts - 该 provider 的**启用**账号（调用方负责按 `enabled` 过滤）。
+ * @param modelId - 目标模型 id；空串表示不判定。
+ * @param now - 当前时刻（毫秒），供测试注入。
+ * @returns 最早的解禁时刻与账号数；不满足条件时为 `undefined`。
+ */
+export function allAccountsRateLimitedForModel(
+  accounts: readonly ProviderAccountEntry[],
+  modelId: string,
+  now: number = Date.now(),
+): { resetAtMs: number; accountCount: number } | undefined {
+  if (modelId.length === 0) return undefined
+  let earliest: number | undefined
+  for (const account of accounts) {
+    const resetAt = account.modelRateLimits?.[modelId]
+    // 与选号侧同一判据：缺标记 / 0 / 已过期都算「不受限」→ 整体不成立。
+    if (resetAt === undefined || resetAt === 0 || now >= resetAt) return undefined
+    earliest = earliest === undefined ? resetAt : Math.min(earliest, resetAt)
+  }
+  return earliest === undefined ? undefined : { resetAtMs: earliest, accountCount: accounts.length }
+}
+
+/**
  * AccountPool —— 多账号管理核心
  *
  * 职责：
@@ -968,6 +1016,20 @@ export class AccountPool {
    * settings scope 的 get() 返回的是服务内部快照，可能滞后于磁盘；
    * 但 replace() 是整体替换，因此这里每次都在最新快照上合并，
    * 避免"写 A 的限流 → 读旧快照 → 写 B 的限流"把 A 的记录抹掉。
+   *
+   * ⚠️ **只接受比现值更大的解禁时刻**（与
+   * {@link updateTraeCheckinDeviceGeneration} 同一约定）：
+   *
+   * 各 provider 的限流解析都有「解析不出时长 → 退回一个兜底值」的末端，而那个兜底
+   * 通常是**短**的（cline 是 1 小时，而真实等待可能是 19 小时 39 分）。于是同一个
+   * (账号, 模型) 上先写入的**真值**会被后写入的**兜底**覆盖 ——
+   * cline「倒计时结束了还是失败，显示又 60 分钟」正是这样无限循环的。
+   *
+   * 并发场景最容易踩：同一 provider 的两个请求，一个拿到可解析的报文（写 19h39m），
+   * 另一个拿到被 CDN 包成 HTML 的 429（写 1h），**后写的赢**。
+   *
+   * ⇒ 这里取「更长者」。真值被丢掉的风险不用担心：所有调用方写入的都是**未来**
+   * 时刻，而过期的标记由 {@link sweepExpiredRateLimits} 清理。
    */
   async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number): Promise<void> {
     const accounts = this.readAccounts()
@@ -978,8 +1040,28 @@ export class AccountPool {
       )
       return
     }
+    // ⚠️ 无效时刻（NaN / ±Infinity）必须**直接拒绝**，不能当「很短的解禁时刻」处理：
+    // 写进去之后所有比较都恒为 false（该模型被永久限流、sweep 也清不掉），
+    // 而 `new Date(NaN).toISOString()` 还会让下面那条日志直接抛 `Invalid time value`。
+    if (!Number.isFinite(resetAtMs)) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] updateModelRateLimit: 账号 ${accountId} 模型 ${modelId} 收到非有限的解禁时刻 `
+        + `${String(resetAtMs)}，已忽略（否则该模型会被永久限流）`,
+      )
+      return
+    }
+    const current = accounts[idx]!.modelRateLimits?.[modelId]
+    // ⚠️ 判据用 `>=`：相等时无需写盘（省一次 IO），语义上也无差别。
+    // 现值非有限（旧数据损坏）时**允许**被新值修掉 —— 那正是写它的机会。
+    if (Number.isFinite(current) && current! >= resetAtMs) {
+      this.ctx.logger?.info?.(
+        `[jet-hub] updateModelRateLimit: 账号 ${accountId} 模型 ${modelId} 已有更长的限流标记 `
+        + `(${new Date(current!).toISOString()} ≥ ${new Date(resetAtMs).toISOString()})，本次不覆盖`,
+      )
+      return
+    }
     const next = [...accounts]
-    const entry = { ...next[idx] }
+    const entry = { ...next[idx]! }
     entry.modelRateLimits = { ...entry.modelRateLimits, [modelId]: resetAtMs }
     next[idx] = entry
     await this.writeAccounts(next)

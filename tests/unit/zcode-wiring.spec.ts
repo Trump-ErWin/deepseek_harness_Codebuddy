@@ -12,6 +12,17 @@
  * | 能力矩阵未登记 | 不渲染余额 / 签到按钮 | 「能力矩阵已登记」 |
  * | 前端对空 loginUrl 报错 | 「添加账号」必然失败 | 「前端不再把空 loginUrl 当错误」 |
  * | 无单测 | 回归无防线 | 本文件 |
+ *
+ * ## ⚠ 2026-10-05 更新：凭据只有**一个**来源
+ *
+ * 「ZCode 插件读取本机官方客户端数据」的能力已整体删除，于是
+ * `ZcodeAuthOptions.readCredential` 这个测试注入点与 `adoptOfficialCredential` /
+ * `adoptIntoOrphanAccount` / `localCredential` 那套自愈链路**都不存在了**
+ * （本文件里引用它们的用例：注入点改为走真实的 `ctx.credentials`，
+ * 自愈链路那 7 条删除并在原位留注释）。
+ * ⇒ 凭据一律经 `ctx.credentials`（账号池 → `ZCODE.defaultCredentialRef`）供给；
+ * 「插件自存缺失时**不再**有任何本机回退」改写成一条反向用例。
+ * 防回退锁在 `tests/unit/zcode-no-local-credential-read.spec.ts`。
  */
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
@@ -112,15 +123,20 @@ describe('ZCode 服务注册（缺口 1：必须 extends Service）', () => {
 
 describe('ZCode 无实例依赖（核心架构声明）', () => {
   /**
-   * ⚠️ 这一组用例在「插件内登录」落地后**被重写过**。
+   * ⚠️ 这一组用例在「插件内登录」落地后**被重写过**，又在 2026-10-05
+   *    「不读本机 ZCode 数据」后**再改写一次**。
    *
    * 早期实现是「读官方客户端的凭据文件」，那时 zcode **没有 loginUrl**
-   * （没有浏览器授权步骤）。现在改为走官方 CLI 设备授权流
+   * （没有浏览器授权步骤）。随后改为走官方 CLI 设备授权流
    * （`/oauth/cli/init` → 浏览器授权 → `/oauth/cli/poll`），
    * 所以 `startLogin` 会返回**真实的授权 URL**。
    *
    * 断言随之改为「URL 是 https 且指向授权域」——
    * 这比原来的 `toBeUndefined()` 更有价值。
+   *
+   * ⚠ 最后一次改写：早期「两个来源（插件自存 > 官方客户端凭据文件）」与
+   * 「插件自存缺失时回退到官方客户端凭据文件」两条已**删除/反转** ——
+   * 凭据现在**只有插件自存这一个来源**，回退那条路不存在了。
    */
   it('★ startLogin 返回真实的官方授权 URL（两步式，立刻可弹窗）', async () => {
     const ctx = makeCtx()
@@ -200,40 +216,45 @@ describe('ZCode 无实例依赖（核心架构声明）', () => {
     expect(stored?.value).toBe(JSON.stringify(saved.credential))
   })
 
-  it('★ 两个来源：插件自存优先于官方客户端凭据文件', async () => {
+  it('★ 插件自存的凭据就是**唯一**来源（账号池 → 单凭据 ref）', async () => {
     const ctx = makeCtx()
-    // 预置一份「插件自存」凭据。
-    await ctx.credentials.set('ZCODE_CREDENTIAL' as never, JSON.stringify({
+    await ctx.credentials.set(ZCODE.defaultCredentialRef as never, JSON.stringify({
       zcode_jwt: 'from-plugin',
       device_mid: 'plugin-mid',
       source: 'plugin',
     }))
-    const auth = new ZcodeAuth(ctx, {
-      // 磁盘上有一份**不同**的官方凭据 —— 它不该被采用。
-      readCredential: () => ({ zcode_jwt: 'from-ide', device_mid: 'ide-mid', source: 'ide' }),
-    })
+    // ⚠ 刻意**不**再注入 `readCredential`：那个选项就是「回退去读本机官方 ZCode
+    //   客户端凭据文件」的测试注入点，已随 2026-10-05 的决策整体删除。
+    const auth = new ZcodeAuth(ctx)
     const current = await auth.current()
     expect(current?.zcode_jwt).toBe('from-plugin')
     expect(current?.device_mid).toBe('plugin-mid')
   })
 
-  it('插件自存缺失时回退到官方客户端凭据文件', async () => {
+  /**
+   * ★ **反向用例**（2026-10-05「不读本机 ZCode 数据」决策的直接后果）。
+   *
+   * 旧行为：插件自存缺失时**回退去读本机官方客户端的凭据文件**
+   *（`~/.zcode/v2/credentials.json`），于是「装了官方客户端并登录过」的机器
+   * 零操作可用 —— 现在这个入口**不存在**了。
+   *
+   * 守的性质：插件自存缺失 ⇒ `current()` 就是 `undefined`，
+   * **没有**任何本机回退。防止有人日后「顺手」把回退加回来。
+   * 静态层的防回退锁在 `tests/unit/zcode-no-local-credential-read.spec.ts`。
+   */
+  it('★ 插件自存缺失时 current() 返回 undefined（**不再**回退到任何本机数据）', async () => {
     const ctx = makeCtx()
-    const auth = new ZcodeAuth(ctx, {
-      readCredential: () => ({ zcode_jwt: 'from-ide', device_mid: 'ide-mid', source: 'ide' }),
-    })
-    const current = await auth.current()
-    expect(current?.zcode_jwt).toBe('from-ide')
+    // ctx.credentials 里**什么都没有**（没装本插件的任何登录态）。
+    const auth = new ZcodeAuth(ctx)
+    expect(await auth.current()).toBeUndefined()
   })
 
   it('★ 持久化里的残留垃圾不会被当凭据用（形状校验）', async () => {
     const ctx = makeCtx()
-    await ctx.credentials.set('ZCODE_CREDENTIAL' as never, 'not-json-at-all')
-    const auth = new ZcodeAuth(ctx, {
-      readCredential: () => ({ zcode_jwt: 'from-ide', device_mid: 'ide-mid' }),
-    })
-    // 坏 JSON → 视为「没有自存凭据」→ 回退官方文件。
-    expect((await auth.current())?.zcode_jwt).toBe('from-ide')
+    await ctx.credentials.set(ZCODE.defaultCredentialRef as never, 'not-json-at-all')
+    const auth = new ZcodeAuth(ctx)
+    // 坏 JSON → 视为「没有自存凭据」⇒ **不再**有任何回退来源 ⇒ undefined。
+    expect(await auth.current()).toBeUndefined()
   })
 
   it('model 目录是静态白名单（不发网络请求）—— 且含 GLM-5.3-Flash', async () => {
@@ -247,18 +268,23 @@ describe('ZCode 无实例依赖（核心架构声明）', () => {
 
   it('probe 在无凭据时返回 available:false，且原因**指向插件内登录**', async () => {
     const ctx = makeCtx()
-    const auth = new ZcodeAuth(ctx, { readCredential: () => undefined })
+    const auth = new ZcodeAuth(ctx)
     const result = await auth.probe()
     expect(result.available).toBe(false)
-    // ⚠️ 文案必须同时提到「插件内登录」与「官方客户端回退」——
-    // 因为现在两条路都通了，只提一条会让用户以为另一条不存在。
+    /**
+     * ⚠️ 文案必须同时提到「插件内登录」与「**不读本机**」——
+     * 旧文案说的是「若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的
+     * 凭据」，那句已随 2026-10-05 的决策从源码里删掉了。现在要引导用户的只有
+     * Jet Hub 里的登录，且必须**明确否定**「装了客户端就能用」这个已被删除的
+     * 预期（否则用户会去找根本不存在的路径）。
+     */
     expect(result.reason).toMatch(/添加账号/)
-    expect(result.reason).toMatch(/官方 ZCode 客户端/)
+    expect(result.reason).toMatch(/不会读取本机 ZCode 客户端的登录态/)
   })
 
   it('refreshAccountCredential 无凭据时如实抛错（不静默成功）', async () => {
     const ctx = makeCtx()
-    const auth = new ZcodeAuth(ctx, { readCredential: () => undefined })
+    const auth = new ZcodeAuth(ctx)
     /**
      * ⚠ 文案已随修复调整（2026-10-02）：现在报的是**该账号自己的凭据**不可用，
      * 而不是「请去官方客户端重新登录」——因为后者会诱导用户去做一件
@@ -286,14 +312,19 @@ describe('ZCode 无实例依赖（核心架构声明）', () => {
    *
    * ZCode **不可续期**，故 `refreshAll` 做的是**逐账号对账**：
    * 每个账号读**自己的** ref，能解出就写回自己，解不出就**跳过**。
-   * 它**绝不**使用磁盘凭据去填任意账号 —— 磁盘格式是单账号的，
-   * 无法判断它属于池里哪一个。
+   * 它**绝不**使用「别处的那份凭据」去填任意账号 —— 凭据存储里可能同时躺着
+   * 别的账号（甚至单凭据 ref）那份，它无法判断属于池里哪一个。
    */
-  it('★ refreshAll 逐账号各写各的：不把磁盘凭据铺进（也不会覆盖）任何账号', async () => {
+  it('★ refreshAll 逐账号各写各的：不把别的凭据铺进（也不会覆盖）任何账号', async () => {
     const ctx = makeCtx()
-    const credential = { zcode_jwt: 'a.b.c', device_mid: 'm' }
-    // 磁盘上有凭据（`readCredential` 是「官方客户端凭据」的读取入口）。
-    const auth = new ZcodeAuth(ctx, { readCredential: () => credential })
+    // ⚠ 存储里**确实**躺着另一份凭据（单凭据 ref），它不该被填进这两个空 ref。
+    //   早期这条用 `readCredential` 注入同一个形状的「本机凭据」；那个注入点已随
+    //   2026-10-05 的「不读本机 ZCode 数据」决策删除 ⇒ 改用**真实的凭据存储**
+    //   摆出同样的前提（判据不变：两个空 ref 必须保持空）。
+    await ctx.credentials.set(ZCODE.defaultCredentialRef as never, JSON.stringify({
+      zcode_jwt: 'a.b.c', device_mid: 'm',
+    }))
+    const auth = new ZcodeAuth(ctx)
     const pool = {
       listAccountsByProvider: () => [
         { id: 'z1', credentialRef: 'REF_1' },
@@ -305,7 +336,7 @@ describe('ZCode 无实例依赖（核心架构声明）', () => {
 
     /**
      * ★ 两个 ref 都是空的 ⇒ 都必须**保持空**（跳过），
-     * 绝不能被磁盘凭据填上（那是旧行为，也是数据破坏的来源）。
+     * 绝不能被存储里那份凭据填上（那是旧行为，也是数据破坏的来源）。
      */
     expect(await ctx.credentials.resolve('REF_1' as never)).toBeUndefined()
     expect(await ctx.credentials.resolve('REF_2' as never)).toBeUndefined()
@@ -317,9 +348,10 @@ describe('ZCode 无实例依赖（核心架构声明）', () => {
     const credB = { zcode_jwt: 'jwt-B', device_mid: 'mid-B', account_label: 'B' }
     await ctx.credentials.set('REF_A' as never, JSON.stringify(credA))
     await ctx.credentials.set('REF_B' as never, JSON.stringify(credB))
+    // ⚠ 刻意让「别处那份」是 A —— 旧实现会把它铺进 B。
+    await ctx.credentials.set(ZCODE.defaultCredentialRef as never, JSON.stringify(credA))
 
-    // ⚠ 刻意让「磁盘凭据」是 A —— 旧实现会把它写进 B。
-    const auth = new ZcodeAuth(ctx, { readCredential: () => credA as never })
+    const auth = new ZcodeAuth(ctx)
     const pool = {
       listAccountsByProvider: () => [
         { id: 'a', credentialRef: 'REF_A' },
@@ -338,123 +370,25 @@ describe('ZCode 无实例依赖（核心架构声明）', () => {
   })
 })
 
-/**
- * ★ **自愈链路的两道闸**（审查补的回归防线）。
+/*
+ * ⚠⚠ **原「ZCode 自愈链路的两道闸（★ 防跨账号覆盖）」整组 7 条用例已删除。**
  *
- * `adoptOfficialCredential` 是本插件里**唯一**会把「磁盘上官方客户端的凭据」
- * 写进某个账号 ref 的地方，故它也是唯一可能重演历史数据破坏缺陷的入口。
- * 历史缺陷：旧 `refreshAll` 拿池里第一个可用账号的凭据去覆盖**每一个** ref，
- * 30 分钟一轮把账号 A 的凭据铺满整池。
+ * 那组用例守的是 `ZcodeAuth.adoptOfficialCredential()` —— 本插件里**唯一**会把
+ * 「本机读到的官方客户端凭据」写进某个账号 ref 的入口，也是唯一可能重演
+ * 「凭据铺满整池」那类跨账号数据破坏的地方。**该方法连同 `adoptIntoOrphanAccount()`
+ * / `localCredential()` / `hasStoredCredential()` / `hasOtherZcodeAccounts()`
+ * 已随「不读本机 ZCode 数据」的用户决策（2026-10-05）整体删除** ——
+ * 凭据既然不再从本机读，「把本机凭据收编进账号池」这条自愈链路就没有存在
+ * 的前提了，调用它会直接 `TypeError`。
+ *
+ * ⇒ 「不读本机 ZCode 数据」的防回退锁在
+ *    **`tests/unit/zcode-no-local-credential-read.spec.ts`**（扫源码字面量：
+ *    `readCredential` 注入点、`adopt*` / `localCredential` 系列、本机路径与
+ *    派生密钥字面量，一处都不许重新出现）。
+ * ⇒ 「`current()` 在插件自存缺失时不再有任何本机回退」这条**行为**断言，
+ *    已改写成反向用例留在上一组（见「★ 插件自存缺失时 current() 返回
+ *    undefined」），**不是**随这 7 条一起删掉。
  */
-describe('ZCode 自愈链路的两道闸（★ 防跨账号覆盖）', () => {
-  const OFFICIAL = {
-    zcode_jwt: 'official-jwt',
-    device_mid: 'official-mid',
-    user_id: 'u-official',
-    account_label: '官方账号',
-  }
-
-  it('★ 闸①：目标 ref 已有可用凭据 ⇒ 绝不覆盖（原样返回 undefined）', async () => {
-    const ctx = makeCtx()
-    await ctx.credentials.set('TARGET' as never, JSON.stringify({
-      zcode_jwt: 'own-jwt', device_mid: 'own-mid', user_id: 'u-own',
-    }))
-    const auth = new ZcodeAuth(ctx, { readCredential: () => OFFICIAL as never })
-    expect(await auth.adoptOfficialCredential('TARGET')).toBeUndefined()
-    // 原凭据必须一字未动。
-    const got = JSON.parse((await ctx.credentials.resolve('TARGET' as never))?.value ?? '{}')
-    expect(got.zcode_jwt).toBe('own-jwt')
-  })
-
-  /**
-   * ⚠ **闸①′（审查发现的缺陷）**：`readCredentialFromRef` 对「从未写入」与
-   * 「写了但损坏」**都返回 `undefined`**。若只拿它当闸① 判据，一个已损坏、
-   * 但**确实属于某个账号**的 ref 会被当成孤儿，被本机凭据**静默覆盖**
-   * —— 那份损坏数据可能只是少一个字段、还能救回来。
-   */
-  it('★ 闸①′：ref 里有内容但已损坏 ⇒ 失败关闭（不覆盖，也不静默）', async () => {
-    const ctx = makeCtx()
-    // 合法的 JSON，但缺 device_mid ⇒ isUsableZcodeCredential 为 false。
-    await ctx.credentials.set('TARGET' as never, JSON.stringify({ zcode_jwt: 'half-a-credential' }))
-    const auth = new ZcodeAuth(ctx, { readCredential: () => OFFICIAL as never })
-    expect(await auth.adoptOfficialCredential('TARGET')).toBeUndefined()
-    // ★ 关键：损坏内容必须**原样保留**（用户还能自己看一眼 / 手动修）。
-    const got = JSON.parse((await ctx.credentials.resolve('TARGET' as never))?.value ?? '{}')
-    expect(got.zcode_jwt).toBe('half-a-credential')
-    expect(got.device_mid).toBeUndefined()
-  })
-
-  it('★ 闸①′：连 JSON 都不是时同样失败关闭（不覆盖）', async () => {
-    const ctx = makeCtx()
-    await ctx.credentials.set('TARGET' as never, 'not-json-at-all')
-    const auth = new ZcodeAuth(ctx, { readCredential: () => OFFICIAL as never })
-    expect(await auth.adoptOfficialCredential('TARGET')).toBeUndefined()
-    expect((await ctx.credentials.resolve('TARGET' as never))?.value).toBe('not-json-at-all')
-  })
-
-  it('★ 闸②：本机凭据的 user_id 已被别的账号持有 ⇒ 拒绝写入', async () => {
-    const ctx = makeCtx()
-    // 池里已有其它账号（id 为 'other'）持有 u-official。
-    const pool = {
-      listAccountsByProvider: () => [
-        { id: 'other', credentialRef: 'REF_OTHER' },
-        { id: 'target', credentialRef: 'TARGET' },
-      ],
-      findAccountIdByIdentityField: async () => 'other',
-    } as unknown as AccountPool
-    const auth = new ZcodeAuth(ctx, { readCredential: () => OFFICIAL as never })
-    expect(await auth.adoptOfficialCredential('TARGET', pool)).toBeUndefined()
-    expect(await ctx.credentials.resolve('TARGET' as never)).toBeUndefined()
-  })
-
-  /**
-   * ⚠ **闸②′（审查发现的缺陷）**：`user_id` 缺失时旧代码**整个跳过**去重 ——
-   * 而 `findAccountIdByIdentityField` 本来就跳过没有该字段的条目，
-   * 于是在「老 ide 凭据（无 user_id）+ 池里已有别的账号」这个组合下，
-   * 同一份凭据会被写进多个 ref，正是要防的跨账号覆盖。
-   */
-  it('★ 闸②′：本机凭据缺 user_id 且池里另有账号 ⇒ 失败关闭', async () => {
-    const ctx = makeCtx()
-    const noId = { zcode_jwt: 'official-jwt', device_mid: 'official-mid' }
-    const pool = {
-      listAccountsByProvider: () => [
-        { id: 'other', credentialRef: 'REF_OTHER' },
-        { id: 'target', credentialRef: 'TARGET' },
-      ],
-    } as unknown as AccountPool
-    const auth = new ZcodeAuth(ctx, { readCredential: () => noId as never })
-    expect(await auth.adoptOfficialCredential('TARGET', pool)).toBeUndefined()
-    expect(await ctx.credentials.resolve('TARGET' as never)).toBeUndefined()
-  })
-
-  /**
-   * ⚠ 反向：**池里只有这一个账号**时，「覆盖别人」在物理上不可能，
-   * 此时必须放行 —— 否则 ⑦「凭据未配置」的自愈能力会被一起砍掉。
-   */
-  it('★ 闸②′ 反向：池里只有目标账号时仍放行（保住 ⑦ 的自愈）', async () => {
-    const ctx = makeCtx()
-    const noId = { zcode_jwt: 'official-jwt', device_mid: 'official-mid' }
-    const pool = {
-      listAccountsByProvider: () => [{ id: 'target', credentialRef: 'TARGET' }],
-    } as unknown as AccountPool
-    const auth = new ZcodeAuth(ctx, { readCredential: () => noId as never })
-    const adopted = await auth.adoptOfficialCredential('TARGET', pool)
-    expect(adopted?.zcode_jwt).toBe('official-jwt')
-    expect((await ctx.credentials.resolve('TARGET' as never))?.value).toContain('official-jwt')
-  })
-
-  it('★ 两条闸都过时才写入（正常自愈路径）', async () => {
-    const ctx = makeCtx()
-    const pool = {
-      listAccountsByProvider: () => [{ id: 'target', credentialRef: 'TARGET' }],
-      findAccountIdByIdentityField: async () => '',
-    } as unknown as AccountPool
-    const auth = new ZcodeAuth(ctx, { readCredential: () => OFFICIAL as never })
-    const adopted = await auth.adoptOfficialCredential('TARGET', pool)
-    expect(adopted?.user_id).toBe('u-official')
-    expect((await ctx.credentials.resolve('TARGET' as never))?.value).toContain('official-jwt')
-  })
-})
 
 describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
   it('★ PROVIDERS 里已登记 zcode（否则 Jet Hub 根本没这个面板）', () => {
@@ -466,10 +400,10 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     expect(ids).toContain('codearts')
     expect(ids).toContain('raccoon')
     // ⚠️ 计数会随 provider 增删变化（2026-09-30 加 minimax：11 → 12；
-    // 2026-10-01 加 opencode：12 → 13）。
+    // 2026-10-01 加 opencode：12 → 13；2026-10-03 加 gemini：13 → 14）。
     // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
     // 上面的具体 id；若将来再加 provider，记得同步这里。
-    expect(ids).toHaveLength(13)
+    expect(ids).toHaveLength(14)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -518,6 +452,23 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
   const readRpc = (): string =>
     readFileSync(resolve(HERE, '../../src/jet-hub-rpc.ts'), 'utf8')
 
+  /** `registerJetHubRpc` 签名里的形参名，按声明顺序（去掉注释与 `?`）。 */
+  const registerJetHubRpcParams = (): string[] => {
+    const signature = /export function registerJetHubRpc\(([\s\S]*?)\n\): void/.exec(readRpc())
+    expect(signature?.[1], '应能取到 registerJetHubRpc 的签名').toBeDefined()
+    return (signature?.[1] ?? '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => /^\w+\??:/.test(line))
+      .map((line) => line.replace(/[?:].*$/, ''))
+  }
+
+  /** 客户端 `PROVIDERS` 表里的 provider id，按声明顺序。 */
+  const clientProviderIds = (): string[] => {
+    const block = /const PROVIDERS = Object\.freeze\(\[([\s\S]*?)\n\]\);/.exec(readClient('jet-hub.js'))
+    return [...(block?.[1] ?? '').matchAll(/id: '([^']+)'/g)].map((m) => m[1])
+  }
+
   it('★ account.create 有 zcode 分支（否则报 unknown provider）', () => {
     const source = readRpc()
     expect(source).toMatch(/else if \(provider === ZCODE\.id\) \{/)
@@ -542,8 +493,9 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
 
   it('index.ts 把 zcode 接进 registerJetHubRpc 与 modelAdapters', () => {
     const source = readFileSync(resolve(HERE, '../../src/index.ts'), 'utf8')
-    // ⚠️ 2026-09-30 合并后 minimax 排在 zcode 之前 —— 用 .* 容忍中间插队者。
-    expect(source).toMatch(/registerJetHubRpc\(ctx, pool, service, .*raccoon,.*zcode, modelAdapters\)/)
+    // ⚠️ 2026-09-30 合并后 minimax 排在 zcode 之前；2026-10-03 加 gemini 时
+    // 按「新 provider 追加在末尾」的惯例排在 zcode 之后 —— 用 .* 容忍中间插队者。
+    expect(source).toMatch(/registerJetHubRpc\(ctx, pool, service, .*raccoon,.*zcode,.*gemini, modelAdapters\)/)
     expect(source).toMatch(/zcode: zcodeAdapter/)
   })
 
@@ -557,6 +509,50 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
   it('index.ts 把 llm-zcode 加入 registerProviderSettings（老契约需要）', () => {
     const source = readFileSync(resolve(HERE, '../../src/index.ts'), 'utf8')
     expect(source).toMatch(/'llm-zcode'/)
+  })
+
+  /**
+   * ★ 派生式不变量：**客户端 PROVIDERS 的条数 == RPC 签名里的 provider 形参数**。
+   *
+   * ## 为什么要这条（已有的三处断言都不够）
+   *
+   * `zcode-rpc-login.spec.ts:521` 锁的是 `args.length === 16`、
+   * `minimax-rpc.spec.ts` / `gemini-rpc.spec.ts` 锁的是**末尾几个位置的名字** ——
+   * 全是**硬编码**。硬编码与硬编码会**一起漂移**：将来加了第 15 个 provider，
+   * 有人同步把 `16` 改成 `17`、把 `gemini` 后面补上名字，断言照样全绿，
+   * 但**中间**某个 provider 的位置已经错位（位置传参下错位 = 拿 A 的实例当 B 用）。
+   *
+   * 而本条把数字**从客户端 PROVIDERS 表派生**，于是「客户端多了一个面板、
+   * 服务端却没接线」这种真实故障无处可藏。
+   *
+   * ## 唯一的豁免：`opencode`
+   *
+   * 它的 RPC 由 `handleMethod` 统一分派到 `handleOpencodeRpc`，**不占形参位**
+   * （见 `src/index.ts` 的注册注释）。所以个数是 `N - 1`。
+   * ⚠️ 豁免本身必须被**验证**（见下面第二条断言），否则「少接了一个」与
+   * 「本来就该少一个」就分不开了。
+   */
+  it('★ RPC 形参个数由客户端 PROVIDERS 表派生（别用硬编码数字）', () => {
+    const params = registerJetHubRpcParams()
+    const clientIds = clientProviderIds()
+    expect(clientIds.length).toBe(14)
+    // 16 = ctx + pool + (14 - opencode) + modelAdapters
+    expect(params.length).toBe(clientIds.length + 2)
+    // 末两位必须是 gemini 与 modelAdapters（gemini 排在 provider 末尾位）。
+    expect(params.at(-1)).toBe('modelAdapters')
+    expect(params.at(-2)).toBe('gemini')
+  })
+
+  it('★ 唯一不占形参位的是 opencode（豁免被验证，不是被假设）', () => {
+    const params = registerJetHubRpcParams()
+    const clientIds = clientProviderIds()
+    // 客户端有它
+    expect(clientIds).toContain('opencode')
+    // 但 RPC 签名里没有它 —— 且**只有**它没有。
+    // ⚠️ 形参名 `qoderCn`（驼峰）对应客户端表里的 `qodercn`，故先过一遍别名表。
+    const alias: Readonly<Record<string, string>> = { qodercn: 'qoderCn' }
+    const withoutSlot = clientIds.filter((id) => !params.includes(alias[id] ?? id))
+    expect(withoutSlot).toEqual(['opencode'])
   })
 })
 

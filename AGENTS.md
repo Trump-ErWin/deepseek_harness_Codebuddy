@@ -752,6 +752,113 @@ allowBuilds 判定，不换 commit 会得到假的"成功"）：
    唯一跨版本可用的是 `dangerouslyAllowAllBuilds: true`（代价：放行该 profile 里所有依赖的
    构建脚本）。改完请照上表重跑一遍验证 —— 尤其**要换新 commit**，否则缓存会骗你。
 
+## ⚠⚠️ 客户端**不得**注册 `settings.models.provider-card` 槽（Issue IKJLHQ）
+
+**真实缺陷**（用户报障，Gitee issue IKJLHQ，2026-10-03）：本插件曾以
+`key: 'llm-pi-ai'` 向官方「设置 → 模型 → 模型卡片」注册 ZCode 账号卡片，与
+同样扩展 pi-ai 家族的 `@linxin666/dsh-client-ui-model-capabilities` **互斥**，
+后者被**静默顶掉** —— 所有第三方 provider 卡片上的推理档位编辑面板消失，无任何报错。
+
+**已修**（本分支）：整块移除 `plugin-src/client/zcode-card.js` 与该注册，
+ZCode 账号管理**只在 Jet Hub 设置页**。回归用例在
+`tests/unit/zcode-channel-dialog.spec.ts` 的「IKJLHQ」段（4 条 + 反向验证过）。
+
+### 机制（依据官方包 `@deepseek-ai/dsh-client-ui-slots` / `-renderer` 0.2.0-rc.2）
+
+| 事实 | 出处 |
+|---|---|
+| 该槽的 `key` 语义 = **那张卡片的 `settingsNs`** | 官方 `dsh-client-ui-settings-models/lib/client.js:2150`：`renderSlot('settings.models.provider-card', {...}, { entryKey: row.entry.settingsNs })` |
+| 渲染侧按 `entryKey` **精确 find**，只渲染**一个** winner | `-renderer/lib/client.js:1154`：`entriesOfSlot(slot).find(e => e.options.key === opts.entryKey)` |
+| `entriesOfSlot` 取 ledger 里每 cell 首个 live 条目；ledger 按 **`priority` 升序**（同 priority 才是注册顺序） | `-slots/lib/index.js:221` + `:285-290` |
+| 同 key + 同 priority 的第二个 `register` **直接抛** `keyed slot "…" already has an entry for key "…"` | `-slots/lib/index.js:177-178` |
+| `slots.inject` 的回调抛错 ⇒ `stop()` 掉整个 inject 并 `queueMicrotask(throw)` | `-renderer/lib/client.js:1375-1388` |
+
+⇒ **同一个 `settingsNs` 上的第三方扩展是物理互斥的**，「换 key」与「换 priority」都
+**不能**变成共存：
+
+- 换独立 key（`llm-pi-ai-zcode`）⇒ 官方 `find()` 落空 ⇒ **我们自己的卡片永不渲染**；
+- 换 priority ⇒ 两条都注册成功，但 winner 是 **`priority` 数值更小**的那条
+  （错误提示里的 `lowest renders` 是字面为真的）；仍然**只有一个** winner ⇒ 依旧不是共存。
+  即：想抢赢就得用更小的 `priority`，而那正是「挤掉对方」。
+
+⚠ **zcode 没有自己的适配器家族**：`dsh-llm-pi-ai/lib/index.js:2492/2535` 把
+**所有** route 目录行的 `settingsNs` 统一设成 `llm-pi-ai`，用户手工加的 `zcode`
+route 也一样 ⇒ 想「就近」把账号 UI 塞进官方卡片，就只能抢那个 key。
+⚠ 即使把 ZCode 恢复成独立家族也**治不了**：用户手工加的那条 `zcode` route
+仍然 settingsNs = `llm-pi-ai`，照样撞。
+⚠ 对照 `@mars-sea/dsh-commandcode-provider` 用 `llm-commandcode`「互不冲突」是**误解**：
+它 `const NS = "llm-commandcode"`（`lib/index.js:9936`）**本身就是独立适配器家族**，
+那个 key 恰是它卡片行的真实 `settingsNs`；不冲突只是因为整族都是自己的。
+caps 插件的注释已经把话说明了：`/** The official adapter family this plugin
+extends (the card slot's key). */ PI_AI_SETTINGS_NAMESPACE = 'llm-pi-ai'`。
+
+⚠ **只有 zcode 撞是因为本仓库只有这一处 keyed 注册**；其余 11 个 provider 的账号
+管理都在 Jet Hub 页，不碰官方卡片槽。任何新插件想给官方模型卡片加扩展，都会撞。
+
+## ⚠ 「通用面板」里的按钮与弹窗**必须按 provider 分支**（Issue IKJLK3）
+
+**真实缺陷**（Gitee issue IKJLK3，用户报障，2026-10-03）：Jet Hub 的
+`ProviderPanel`（`plugin-src/client/jet-hub.js`）按 `provider` prop 复用**同一个组件**，
+于是「+ 新建账号」按钮存在于**全部 13 个 provider 的面板**里，而 2026-10-03 刚搬进去的
+**登录渠道弹窗是 zCode 专用**的（标题硬编码「添加 ZCode 账号」+ 一个渠道 `<select>`）。
+二者没有分支，后果是**三个同源缺陷**：
+
+| 现象 | 根因 |
+|---|---|
+| 在 CodeArts / Qoder 等面板点「+ 新建账号」，弹出的是「添加 ZCode 账号」 | 按钮无条件 `setPendingLogin(false)` |
+| 弹窗里选 bigmodel / z.ai **没有落点** | 载荷构造 `provider === 'zcode' ? {provider, zcodeProvider} : {provider}`，非 zcode 那一支不传 |
+| opencode 要点**两层**弹窗 | 按钮先弹 ZCode 渠道窗，点「确定」才走到 `setKeyModal` 的 API key 表单 |
+
+⇒ 修法是**判据收进纯函数**，不写在组件里：
+`plugin-src/client/new-account.js` 的 `newAccountAsksChannel(provider)` 与
+`buildCreateAccountPayload(provider, zcodeProvider)`（与 `account-model-link.js` /
+`model-bulk.js` 同样做法：单测环境是 `node`、**react 不在依赖内**，
+组件渲染不了，判据必须抽出来才能**真跑**覆盖）。语义定为
+**「只有 zcode 先问渠道，其余 provider 点按钮即登录」**。
+
+⚠ **三条同源教训**（下次在通用面板加 provider 专属 UI 前先过一遍）：
+
+1. **判据方向要选失败安全的那边**：`newAccountAsksChannel` 写成**白名单**
+   （`provider === 'zcode'`）而不是「排除法」。将来新增 provider 忘了改这里，
+   后果是「少问一次」而非「弹错窗」—— 少一次确认是降级，弹错窗是破坏。
+2. **「通用组件里的 provider 专属 UI」是接线 bug，不只是漏一个 `if`**：
+   按钮 `onClick` 与弹窗渲染处**两处都要接**（渲染处那道是防御性的），
+   回归用例也分两条守 —— 只锁纯函数会被「判据还在但没人调用」绕过。
+3. ⚠ **既有测试会贴死写法**：`tests/unit/zcode-channel-dialog.spec.ts` 原本断言
+   `onClick: () => setPendingLogin(false)` 与 `pendingLogin === undefined ? null :`，
+   分支化后全部变红。⚠ 那**不是**要改实现去迁就测试 —— 要把断言改成锁**意图**
+   （「zCode 面板仍必须先弹窗」「条件仍挂在 `pendingLogin` 上」），
+   并在注释里写明为什么放宽，否则下一个改写法的人会照着把分支删回去。
+
+⚠ **同类问题还有服务端那一半**（E2）：`account.create` 的 `zcodeProvider`
+原先只有 `?? 'bigmodel'` 兜底、**无白名单** —— RPC 载荷是**客户端自报**的
+（入口无 schema 校验），`ZcodeLoginProvider` 只是 TS 联合类型，运行时任何字符串都能进来，
+未登记值会被原样送进 `startZcodeLogin` 打到不存在的授权端点（表现为「授权页打不开 /
+轮询超时」这类极难定位的失败）。现由 `normalizeZcodeLoginProvider()` 归一，
+**回落**（与既有缺省兜底同向，不报错，老客户端照常能登录）+ 非缺省时 `console.warn`。
+
+⚠ **提单人对 E1 的判断有误，别照抄**：「`account.create` 未校验 provider，会一路走到链尾」
+—— 链尾**本来就有**兜底 `else { return unknown provider }`，且 `id` 只在分支内使用，
+未知 provider **不会**被写进账号池。不必再加一道重复校验。
+
+⚠ **`dim-jh-zcDialog*` 类名已经不准**了：它是**通用弹窗样式**，只服务 Jet Hub 页
+的登录渠道弹窗。曾想改名，但样式表一起动、收益仅是可读性，故保留名字 —— 别再据类名
+判断「这段 UI 只属于 zCode」。
+⚠ 它原先还有第二个使用方（官方模型卡片里的 ZCode 账号区，`zcode-card.js`），那份已随
+Gitee issue IKJLHQ 整体移除（见上一节）。
+
+⚠ 另两条同 issue 的低频项：登录重入闸门 `if (pollRef.current !== 0) return`
+**不能静默 return**（弹窗确定按钮是「先关弹窗再调 createAccount」，
+早退时用户只看到「点了没反应」，要复用 `probeNotice` 给提示）；
+`console.log('account.create response =', res)` 会把**含 OAuth state 的 loginUrl**
+打进控制台（用户截图求助时外泄），只记 `provider` 与本地 `accountId`。
+
+回归用例 `tests/unit/new-account-dialog.spec.ts`（14 条，做过 8 个变异的反向验证）。
+⚠ 写这类源码级断言时**必须先定位再匹配**：`jet-hub.js` 里有 **3 处**
+`pollRef.current !== 0`（另两处在 `stopPoll` 的清理里），只按字面量找第一个
+会命中无关代码；且断言要对**剥掉注释**的文本做，否则文件头为记录旧实现写下的
+那行字就能喂绿（本轮修的正是「登录渠道选择」，注释里必然提到它）。
+
 ## 技术栈与约束
 
 - **Node.js**：`^22.19.0 || >=24.0.0`
@@ -1135,6 +1242,63 @@ oauth 用例变红。四条各自独立锁死，**别把它们当同义反复删
 - 账号条目以 `provider` 字段区分归属，`getAvailableAccount` / `listAccounts` 均按该字段过滤
 - 适配器必须以 `this.product.id` 作为 provider 实参查询账号池（写死 `'buddy'` 会让 WorkBuddy 永远匹配不到账号）
 - 限流后按池中「已启用且不在重置时间内」的下一个账号自动重试；全部耗尽才抛 `QUOTA_EXCEEDED`
+
+### ⚠️⚠️ 全部账号被**模型限流**时，必须报限流，不能报成「未登录」（真实缺陷，2026-10-03）
+
+**用户报障**：`/compact` 连续四次失败，UI 只显示通用文案
+「Compaction could not produce a useful summary」。解出会话日志后，`compaction/end`
+携带的真实错误是：
+
+```
+buddy: no usable credential; log in from the Jet Hub panel first
+```
+
+而当时 Jet Hub 里 buddy 账号**已登录、已启用、凭据完好** —— 真实原因是它被
+`deepseek-v4.1-flash` 的**模型级限流**挡住（解禁时刻就存在 `modelRateLimits` 里）。
+用户被指去「重新登录」，方向完全错。
+
+**链路**（四个环节都正确，合起来却报出假原因）：
+
+1. 唯一的启用账号带该模型的未过期限流标记 → `pickBuddyCredential`
+   （`src/index.ts`）的候选筛成**空集**；
+2. `select()`（`src/buddy-balance-selector.ts`）对空候选只能回一个笼统的
+   `{kind:'exhausted'}`，**未锁定时 `reason` 被丢弃**；
+3. 调用方退到**单凭据 ref** `BUDDY_ACCESS_TOKEN` —— 而 Jet Hub 登录只写
+   `BUDDY_ACCOUNT_XXX`，该 ref **从未存在过** → `resolveCredential` 返回 `undefined`；
+4. 适配器据此抛 `MISSING_CREDENTIAL`（`src/buddy-adapter.ts`）。
+
+⇒ 与 qoder 的 `110` 被误归 `SERVER`、`10605` 排队被漏判是**同一个病根**：
+**用默认归类代替了对业务语义的判断**。
+
+**修法**：新增纯判据 `allAccountsRateLimitedForModel()`（`src/account-pool.ts`），
+在「候选为空、即将退到单凭据 ref」这一刻**证明**失败原因。位置必须是
+`getAvailableAccount` **之后**、`ctx.credentials.resolve` **之前**：
+池里还有号时不该报限流，而退到单凭据之后就来不及了。
+
+- ⚠️ **只改错误语义，不改可用性**：没有账号可用就是没有，压缩该失败仍然失败；
+  修的是「用户看到的原因」。**绝不静默换模型**（那是替用户做决定），
+  **绝不绕过限流标记**（那会让标记形同虚设）。
+- ⚠️ **判据必须窄**，与选号侧严格同口径（缺标记 / `0` / `now >= resetAt` 都算不受限），
+  且空 `modelId` 直接不判定 —— 选号侧约定空 modelId 不做限流过滤
+  （`if (modelId.length === 0) return true`），不同口径会把「未登录」误报成「限流」。
+  ⚠️ 该空串守卫**不是**冗余：`updateModelRateLimit` **不校验** modelId，
+  理论上可落下 `modelRateLimits['']` 脏键，没有它就会被当成真实限流上报。
+- ⚠️ **只统计启用账号**（`.filter(a => a.enabled)`）：停用账号本就不参与自动选号，
+  把它们算进来会让「有一个号被停用」的普通情况被误报成「全部限流」。
+- ⚠️ **错误码取 `QUOTA_EXCEEDED`**（本仓库既有惯例，且**不在**
+  `DEFAULT_RETRYABLE_CODES` 里）；**不可取 `AUTH`** —— 那会把整条 message
+  换成「API 密钥无效」（判据见下文「安全策略拦截」那条的取证），
+  精心写的解禁时刻在 UI 上一个字都看不到。
+- ⚠️ **文案必须带解禁时刻与「无需重新登录」**：只说「限流」而不给时间，
+  用户仍会去重登或干等。
+- ⚠️ **两处都要接**（`CODEBUDDY` / `WORKBUDDY` 各一处），否则两个 provider 行为不一致。
+- 测试：`tests/unit/buddy-ratelimit-misreport.spec.ts`（19 条：行为级判据 + 源码级接线
+  + 回归保护）。⚠️ 已做**反向验证**：移除两处判定调用 → 3 条变红；
+  逐条破坏判据（去 `modelId` 空串守卫 → 1 条、去 `resetAt===undefined` → 2 条、
+  去 `now>=resetAt` → 2 条、去 `resetAt===0` → 1 条、最早解禁改最晚 → 1 条）。
+  ⚠️ 写用例时注意：断言「判定先于单凭据兜底」**不能只搜 ref 名** ——
+  `BUDDY_CREDENTIAL_REF` 在文件更早处（import 与注册）也出现，会命中错位置
+  （实测 `check=12308` 反而大于 `fallback=751`）；锚点要用**完整的兜底调用语句**。
 
 ### 账号顺序 = 选号优先级（Jet Hub 拖拽排序）
 
@@ -2669,9 +2833,12 @@ re-authenticate your Cline account."* —— 与真实原因**毫不相干**，�
 远端 `free` 集合 ∪ `:free` 后缀 ∪ `cline-free/` 前缀 ∪ 兜底表 `isFree`。
 与 CodeArts benefit 集合同一约定。
 
-⚠️ **兜底表不足以覆盖免费集合**：sidecar 内嵌目录缺
-`cline-free/gemini-3.8-flash`（远端 `free` 有），故 `cline-product.ts` 的兜底表
-手工补上了它 —— 否则离线时用户看不到截图里的那个模型。
+⚠️ **兜底表要与远端 `free` 数组同步**：sidecar 内嵌目录里**没有** `cline-free/*`
+与 `stealth/space-bunny-alpha`（只有远端 `free` 下发），故 `cline-product.ts` 的兜底表
+手工补上它们 —— 否则离线时用户看不到免费模型。
+⚠️ 2026-10-03 复测：`free` **只剩 4 条**，`cline-free/gemini-3.8-flash` 已被 Cline
+下线（直连回 `404 {"error":"model not found"}`），兜底表、单测与 e2e 清单已同步删除它。
+**别照抄旧版本的表把它加回来**。
 
 ⚠️ **`clinePass` 不是免费集合**：它是 Cline Pass 订阅制模型（`cline-pass/*`），
 按订阅额度计费。实测 14 个，误判为免费会误导用户。
@@ -2729,6 +2896,12 @@ IDE 的模型选择器旁有思考强度菜单（`None / Low / Medium / High / E
 设计文档：`docs/superpowers/specs/2026-09-25-cline-reasoning-effort-design.md`。
 
 ### ⚠️ 坑 5：Gemini 系有两个**独立**的 400，且各自只在部分 provider 上暴露
+
+⚠️ **2026-10-03 补记**：`cline-free/gemini-3.8-flash` 已被 Cline 下线（不在 `free`
+数组里、直连回 `404 model not found`），故兜底表里那条已删除。本节保留为**历史记录**，
+因为两个根因的教训与模型无关：**①表里的数值必须实测**（别照抄邻居的值）、
+**②`sanitizeClineToolParameters()` 是为所有模型服务的安全网**（任何严格校验工具
+`enum` 的上游都会踩到），二者都**不可因这条模型下线而回退**。
 
 用户报障（2026-09-25）：给 `cline-free/gemini-3.8-flash` 发消息即失败。错误体里
 一次请求有**两个 provider 尝试、两个不同的错误**：
@@ -3824,6 +3997,90 @@ raccoon / qoder）透传 `options.maxTokens`。
    （attempt **只在失败路径落盘**，本身就是「这步曾失败」的指纹）。
 
 
+#### ⚠️⚠️ 循环中止后**自动续跑**：把「用户手打继续」这一步自动化（2026-10-04）
+
+**真实报障**（用户要求，本机 DSH Desktop）：
+
+> 能不能让模型在病态重复后，让会话自己恢复？现在病态重复后要我打个「继续」才继续
+> 运行，加个自动中断病态重复和自动继续会话的功能吧。
+
+⚠️ **这不是新需求，而是上一节那条缺陷的收尾**：全库取证（219 会话）已经证明
+守卫命中的 **25/25 例**都要用户手动补一句（`11× 「继续」`、`9× 「继续上面未完成的
+任务」`），而守卫命中时额度**远没有用满**（单次只烧约 2000 字符）——
+**这 25 次停顿全是白停的**。「自动中断」早已由守卫完成，缺的只有中止后的那一步。
+
+##### 为什么必须用 `agent.followup()`，不能用别的通道
+
+| 方案 | 结论 |
+|---|---|
+| harness 的 `retryPolicy` | ❌ `REASONING_LOOP` **刻意不在** `DEFAULT_RETRYABLE_CODES`（同上下文会稳定复现），且**同一条请求原样重发只会再烧一轮** —— 跳出循环必须**改变输入** |
+| 适配器内部「重发 + 偷偷塞一条提示」 | ❌ 违反 harness 的「**模型可见 ⟺ 已落盘**」红线：注入体不进会话日志，UI 上也看不见，用户会以为模型自己能读心 |
+| `ctx.schedule`（定时提醒） | ❌ 那是**持久化**任务（最小秒级、走 Session 控制器重新激活会话），用来做「本轮刚失败、此刻续跑」既重又错 |
+| **`agent.followup(createUserMessage(...))`** | ✅ 公开 Agent 接口；harness 自己的目标续跑驱动器（`dsh-goal-round-driver`）就是用它投下一轮的，本实现与它**同构**；投出去的是**真 `user/message`**，落盘 / 显示 / 重放全走既有路径，**零格式变更** |
+
+##### 三条安全边界（都按「宁可少续跑，不可无限续跑」选）
+
+1. **只在 `agent/status === 'idle'` 时投递**。⚠️ 错误发生的那一刻驱动器还在跑，
+   此时 `followup()` 排进 `next-turn` 后**不会被唤醒**（`wakeDriver()` 对 running
+   相位不 latch，见 `agent-loop/src/agent.ts`）—— 消息会**烂在收件箱里**，
+   表现为「功能没反应」。故与目标驱动器一样等 idle。
+2. **连续上限**（默认 2）。**连续**的定义是「上一次真循环之后就一直是循环」：
+   任何**别人**投进收件箱的消息（用户手打的、目标驱动器的、子代理的）都清零
+   —— 语义正好等于「用户自己补了一句『继续』之后我们又有预算」。
+   ⚠️ 我们自己投的那条**不算**别人（按消息 id 过滤），否则一投就把预算清空，
+   上限形同虚设。
+3. **只在 `REASONING_LOOP` 上续跑**。该码只在「**只有思考**、无正文无工具调用」
+   时才报（各适配器的 `reasoningLoopIsSoleOutput` 门禁），故续跑不会重复已经
+   给用户看过的东西。其它错误码（`TRANSPORT` / `QUOTA_EXCEEDED` / `AUTH` …）
+   一律不续跑，且会把连续计数**清零** —— 续跑只对循环负责，别的错误续跑只会
+   掩盖真故障。
+
+##### 实现要点（`src/loop-recovery.ts`）
+
+- **挂载方式**：`ctx.inject(['agents'], …)`，**不写进静态 `inject`**。写了的话，
+  agent-loop 缺席的 profile（纯 `ctx.llm` 的脚本、部分 headless）里本插件会
+  **永久 pending**、整个 profile 启动失败 —— 与 `connection` 同一条已知坑
+  （见 `index.ts` 的 `inject` 注释）。缺席时本功能整体不生效，其余能力照常。
+- **判据不能只靠 `instanceof LlmError`**：`@deepseek-ai/dsh-llm` 在宿主与插件里
+  可能解析成**两份模块实例**，此时 `instanceof` 恒为 false，表现是「功能完全没
+  反应且没有任何报错」。故 `isReasoningLoopFailure()` 再按**码值**认一次
+  （`REASONING_LOOP` 是本插件自己的常量，误判风险为零）。
+- **投递走 `withoutInitiator()`**：这几行跑在别的 agent 的事件派发里，排队动作
+  不该继承「当时恰好是谁在运行」的发起者归属 —— 与 `goal-round-driver` 同手法。
+- **投的是「给模型的指令」**（`LOOP_RESUME_PROMPT`，约 65 字符）：说清①继续未
+  完成的任务、②上一轮为什么停（思考重复，**不是**任务做完）、③这次换思路。
+  ⚠️ **不写 harness 内部词汇**（「循环守卫」「去重率」），那是给用户看的诊断。
+  它每轮都进请求体，**长度也是成本**（与 cline 报错文案那次同一口径），用例锁了
+  `< 80` 字符。
+- **新增 devDependency `@deepseek-ai/dsh-agent`**：**仅类型用途**
+  （`import type {} from '@deepseek-ai/dsh-agent'` 加载 `Events` / `Context.agents`
+  的声明合并），运行时**不 import 它的任何值**，故**不进 peerDependencies** ——
+  不因为一个类型依赖去动消费者侧的 peer 范围。
+
+##### 开关与默认值
+
+| 变量 | 默认 | 语义 |
+|---|---|---|
+| `DSH_REASONING_LOOP_AUTO_RESUME` | 开启 | 复用守卫自己的 `resolveReasoningLoopGuardFlag`（显式假值才关），**不另写一份真假判定** |
+| `DSH_REASONING_LOOP_AUTO_RESUME_MAX` | `2` | `0` 是**合法值**（= 绝不自动续跑）；非法值**回默认值而不是回 0**（`=abc` 若静默变成「关闭」，用户会以为功能坏了却查不出原因——与仓库既有 `parseInt(…) \|\| 默认值` 的教训同型）；上限封顶 `10`（单次循环只烧约 2000 字符，真要无限跑该用 goal）|
+
+##### 回归与验证
+
+- 回归用例 `tests/unit/loop-recovery.spec.ts`（**33 条**）：策略解析（含 `0` 合法、
+  非法值回默认、封顶）、错误识别（实例 / 码值两种形态）、控制器行为（只投一次、
+  非 idle 不投、收件箱有人不抢、上限后告警停手、别人介入清零、自己投的不清零、
+  投递抛错降级、`forget`、多 agent 隔离）、安装与端到端派发（`agent/error` →
+  `agent/status(idle)` → 投递且走 `withoutInitiator`、开关关闭时**完全不注入**），
+  以及 `index.ts` 的**接线断言**（只在模块里写好函数、没人调用 = 功能不存在）。
+- ⚠️ **已做反向验证**（五处变异，共 **12 条**变红，证明非同义反复）：
+  ① 去掉上限（`+100`）→ 上限/多 agent 用例红；② 去掉 `pending` 归零 → 幂等用例红；
+  ③ 去掉「收件箱有人不抢」→ 该用例红；④ 去掉码值兜底 → 双模块实例用例红；
+  ⑤ `resolveLoopResumeMax` 改成 `Number(raw) || 默认` → `0` 合法性与「上限 0 不注入」
+  两条红；另加 ⑥ `index.ts` 里把调用改名 → 接线用例红。还原后 33 条全绿。
+- ⚠️ **本功能无法用 e2e 真机验证**（要模型真的陷入循环，不可控）：判据与状态机
+  全部由单测锁死，`installLoopResume` 只做接线；真机上的首次验证靠用户报障反馈。
+
+
 #### ⚠️ 思考标签泄漏与「引用 `</think>` 导致对话中断」
 
 **真实缺陷**（用户报障，2026-09-27，**在本会话实时复现**）：
@@ -4781,22 +5038,74 @@ res.writeHead(400, ...); res.end(...); return   // ← 没有 resolve 也没有 
 > `TRAE_CHECKIN_BUSY_CODE` 的轮换链路**保留但不再被调用**，仅为兼容既有账号条目；
 > 新语义下设备号由 `uid` 派生，无需持久化代次。
 
-### ⚠️ 历史超过约 500K 字符时上游会**静默断流**
+### ⚠️ TRAE 历史闸门（**已删除**）：抄来的常数，且会**静默丢历史**
 
-上游在请求体过大时会**不发错误码、直接结束事件流** —— 日志里看到的只是「模型
-没有回复」，不是任何 4xx/5xx。CN 项目为此设了两道闸门
-（`TRAE_REMOTE_MAX_HISTORY_CHARS=480000` 与 `TRAE_REMOTE_QUERY_MAX_CHARS=480000`）。
+**真实缺陷**（用户报障 2026-10-04：「trae 显示的上下文长度不对」）。根因是
+`src/trae-adapter.ts` 里那道**只有 trae 有的**本地历史字符闸门 —— 超预算就从最早的
+非系统消息开始整轮丢弃。它已被**整体删除**（PR #48）。现况：**唯一的限制是 DSH 的
+压缩点（`声明的窗口 × 0.8`）**，与其余 13 个 provider 同形。
 
-`trimTraeHistory`（`src/trae-adapter.ts`）取其下沿作默认预算
-（`DSH_TRAE_MAX_HISTORY_CHARS` 可覆盖），三条约束：
+**它的来历是「抄的」，不是「量的」**：注释原文写「对齐 `Trae2api-cn` 的实测结论：
+上游在 query 超过约 500K 字符时会静默结束事件流」，于是把那个项目的
+`TRAE_REMOTE_MAX_HISTORY_CHARS=480000` 抄成本插件写死的 `480_000`。
 
-1. **从最早的非系统消息开始丢**，最近历史（尤其本轮工具结果）必须保住；
-2. ⚠️ **以「轮」为单位裁剪，绝不切断 tool_call / tool 配对** —— 带 `tool_calls`
-   的 assistant 必须连同其后的 `role:'tool'` 结果一起丢，丢一半会被上游 400 拒绝；
-3. **system 消息永不裁剪**（不假设它都在开头，用逐条标记而非下标切片）。
+- ⚠️ `480000 = 2.4 × 200000` —— 那是**声明窗口本身的量级**，不是量出来的字符天花板。
+- ⚠️ 它守的另一道闸门（`TRAE_REMOTE_QUERY_MAX_CHARS`，**扁平化 query** 的硬上限）
+  在本插件里**根本没有对应物**：trae 链路里没有 `query` 字段，我们发的是 OpenAI 形状的
+  `messages[]`（上游那句 `Messages with role 'tool' …` 本身就证明它在逐条读 role）。
 
-⚠️ **裁剪必须在 `serializeTraeMessages` 之后**做 —— 裁的是 OpenAI wire 消息，
-不是 DSH 原生块。
+**它造成的是净损害**：引入 Max 模式（声明 1M）后，写死的 480,000 没跟着涨，与压缩点
+（800K tokens ≈ 170 万字符）**脱钩** ⇒ 界面显示「才用了 8%」，适配器却每轮静默丢掉约
+四分之三的历史（真实会话量：**1,898,903 字符 = 旧预算的 396%**）。
+
+**为什么「把系数调大」不够，必须删**：
+
+| 版本 | 预算 | 结果 |
+|---|---|---|
+| 写死 `480000` | Max 档恒定 ≈22% 窗口 | **静默丢历史**（本次缺陷的根因） |
+| `声明窗口 × 2` | 覆盖 `R < 2.5` | 中文会话修好，英文/代码为主的会话仍在窗口 40~60% 处**静默丢** |
+| `声明窗口 × 5` | 覆盖 `R ≤ 6.25` | 实测内容（`R`：中文 **2.13**、英文/代码 **4.0** —— 两者都已实测）不再误伤，**但**字符闸门在数学上**不可能**被证明「永不先于 DSH 的压缩点生效」：DSH 的界是 token、闸门是字符，任何**有限**系数都会被足够密的内容绕过 |
+| **已删除** | 无 | 「静默丢历史」这一类缺陷**结构上消失** |
+
+- **实测依据（本仓库探针，2026-10-04）**：
+
+  | 档位 | 正文字符 | 服务端 `input_tokens` | 字符/token | 结果 |
+  |---|---|---|---|---|
+  | 常规（非 Max） | 40,398（标定） | 9,827 | 4.11 | 200 + 正中标记命中 |
+  | 常规（非 Max） | **700,404** | 173,712 | 4.03 | **200 + 正中标记命中**（6.4 秒） |
+  | 常规（非 Max） | **1,000,484** | 249,351 | 4.01 | **200 + 正中标记命中**（7.0 秒） |
+  | 常规（非 Max） | 900,303（中文正文） | 422,672 | 2.13 | 200 + 正中标记命中 |
+
+  ⇒ 「query 超过约 **500K 字符**就静默断流」在**常规档已被证伪到 2 倍**：100 万字符 /
+  24.9 万 tokens，比该档声明的 200K 窗口**还超出约 24%**，仍然是 HTTP 200 且
+  **埋在正文正中间的标记被复述**（任何截断/丢中段都会让它消失）。
+- ⚠️ **2026-10-04 那次「Max 档 90 万字符」是**误标**档位**（本人记错）：探针构造适配器时
+  `fetchRemoteModels: async () => []`，而 `maxModeFor()` 要求远端
+  `display_config.max_mode === true`（`src/trae-adapter.ts:689`）—— 远端元数据为空时
+  **恒为 false**，故那次实发的其实是**常规档**。重跑时把请求体抓下来打印确认：
+  常规档请求体 `含 strategy=false context_window_size=false prompt_max_tokens=false`。
+  ⇒ **引用旧记录时别再写成「Max 档」**。
+- ⚠️ **仍未探的部分**：真正的 **Max 档**（注入远端 `max_mode=true` 后的 1M 声明）没跑过
+  大正文；常规档 > 100 万字符也没探。但闸门已删，这两点**不再影响任何决策** ——
+  只有「有人想把闸门加回来」时才需要补。
+- ⚠️ 顺带实测到的两点事实：① 该档声明 200K 窗口，但 **24.9 万 tokens 的请求照样 200**
+  （窗口并非硬校验）；② 探针**没有设任何逃生舱环境变量**就发出了 100 万字符 ——
+  这本身就是「闸门确实已被删除」的端到端证据（旧实现里不设
+  `DSH_TRAE_MAX_HISTORY_CHARS` 会把它裁到预算以内）。
+- ⚠️ **为什么其余 13 家不需要这种闸门**：它们把 DSH 的压缩点当唯一真相。唯一的另一类体积
+  防护（`src/image-budget.ts`，13 家共用）作用在**单张图的编码字节**上，数值来自**实测撞墙
+  点**（qoder 8 张过 / 15 张 `TRANSPORT`、lobsterai 12 / 13×`500`、cline 24 / 32
+  `TRANSPORT`），且压不下去时**抛 `UNSUPPORTED_CONTENT`**（可见报错），**不是**悄悄丢消息。
+  ⇒ **判据：本仓库的体积防护只允许「按实测定界 + 失败可见」**；「抄来的常数 + 静默删改
+  语义」是不允许的形态。
+- `DSH_TRAE_MAX_HISTORY_CHARS` 已随闸门删除（即使设置也**不再生效**）。
+- 回归用例在 `tests/unit/trae-adapter.spec.ts` 的「无本地历史闸门（本地裁剪已删除）」段
+  （4 条：Max 档 60 万字符 / 20K 窗口 30 万字符 / 1M 档 600 万字符 / 该环境变量已失效）。
+  ⚠️ **已做反向验证**：临时装回「写死 480000」→ 其中 **2 条**变红；临时装回
+  「声明窗口 × 5」→ **另 2 条**变红（两种旧形态各自被锁住，不是同义反复）。
+- ⚠️ **若将来要加回来**：先做实发探针量出真实边界**与失败形态**（可见错误？静默结束？），
+  且闸门**必须可观测**（记日志/上报），不得静默改语义；同时改本段与
+  `src/trae-adapter.ts` 的「TRAE 没有本地历史闸门」注释。
 
 ### ⚠️ 空响应（静默 EOF）只允许在**首个事件之前**重试一次
 
@@ -5646,6 +5955,79 @@ mode  = CFB, padding = NoPadding
 客户端下拉有 86/852/853/81。插件初版**只做 86（大陆）**，
 因为 `100002 params_invalid_error: param phone invalid` **无法区分**
 「号码格式错」与「该区号不支持」，不做未验证的猜测。
+
+### 11. ⚠️ `tags` 里的 `vision` **不是**图片能力契约（真实缺陷，用户 2026-10-03 报障）
+
+**症状**：给 `sn-deepseek-v4-1-flash`（DeepSeek-V4.1-Flash）发图，模型回
+「无法读取图片 / 不支持图片」。
+
+⚠️ **根因不是配置写错，而是「信息在源头就不存在」** —— 远端**从未下发**模态字段：
+
+穷举 `model_catalog` 9 个条目的**键并集**：顶层 14 个键、`params` **只有**
+`context_window` 与 `max_tokens`；用
+`/modal|vision|image|img|multimodal|media|type|capab|support|input|output/i`
+扫描，**命中 0 个**。⇒ 唯一的信号是 `tags`，而它被实测证伪。
+
+**根因链（每一步都是「静默」）：**
+
+1. `normalizeRemoteModel` 把「`tags` 含 `vision`」当成服务端能力声明；
+2. `sn-deepseek-v4-1-flash` 的 `tags` 是
+   `["general","code","html","analysis","reasoning","auto"]` —— **没有** `vision`
+   （`display_description` 也只写「通用对话、代码开发、复杂分析」，不提图像识别）；
+3. ⇒ `inputModalities` 播报 `['text']`；
+4. ⇒ ⚠️ **DSH 在 `LlmRuntime` 里把图片替换成文本占位符**
+   （`dsh-llm/lib/index.js` 的 `projectImagesForTextModel`，产出
+   `[image omitted because this model accepts text only; attachment sha256:…]`）
+   —— **图片根本没发出去**，请求体里压根没有图片；
+5. ⇒ 用户看到模型说「读不到图」，而端点其实完全正常。
+
+⚠️ **判据是「模型真的读得出来吗」，不是「远端怎么说」**（同 Qoder 那条
+「IDE 能否用同一模型」）。实测：同一张**随机 6 位数字**图（模型无法猜）打
+`POST /api/web/llm/v2/chat/completions`：
+
+| 模型 | 远端 tags 含 vision | 实测读图 |
+|---|---|---|
+| `sn-deepseek-v4-1-flash` | ❌ | ✅ **5/5**（208063/942977/999889/123015/478368） |
+| `sn-glm-5-3-flash` | ❌ | ✅ 1/1 |
+| `sn-sensenova-6-8-flash` | ✅ | ✅ 2/2 |
+| `sn-sensenova-6-8-flash-lite` | ✅ | ✅ 1/1 |
+| `sn-kimi-k3` | ✅ | ✅ 1/1 |
+| `sn-glm-5-3` | ✅ | ⚠️ **1/3**（provider 侧节点不一致，见下） |
+
+⇒ **6 个可见模型全部能读图**。`tags` 的真实用途是**客户端「Raccoon-Auto 选模」的
+偏好标签**（`TASK_TAG_PATTERNS` 给消息打 vision 标记后挑一个带 `vision` 的模型），
+它回答的是「该模型适不适合处理这类任务」，**不是**「能不能吃图」。
+
+**修法**（与 `buddy-adapter.ts` 的 `IMAGE_CAPABILITY_OVERRIDES` 同构）：
+`RACCOON_IMAGE_CAPABILITY_OVERRIDES` 白名单 + `raccoonSupportsImage(id, tags)`，
+**两条路径都要改** —— 远端解析（`raccoon-auth.ts`）与本地兜底表（`raccoon-product.ts`）。
+⚠️ 兜底表与远端判定是**两个真相源**，用单测「兜底表的图片能力与远端实测 tags 判定
+逐条一致」锁死，防它们悄悄分叉（同 Qoder「两处等待逻辑必须共用同一实现」的教训）。
+
+⚠️ **别改成「该家恒支持图片」**：白名单只覆盖**实测确认**的个案，将来上架纯文本
+模型时，恒 true 会把图放行、让上游回一个更难懂的 400 —— 错误更晚、更难排查。
+
+⚠️ **实测时的两个坑**（否则会得到假的「不支持」）：
+
+1. **必须关思考**，否则 `reasoning_tokens` 吃光 `max_tokens`、正文恒为空
+   （首轮 64 token 全被 `reasoning_tokens: 64` 吃掉 → 6 个模型全部「失败」）。
+   唯一有效通道是 `extra_body.thinking:{type:'disabled'}`（见本文档
+   `RACCOON_EFFORT_*` 段）；
+2. **`sn-glm-5-3-flash` 会 400 拒绝该参数**（「该模型始终思考，不支持关闭思考；
+   请使用 low、high 或 max」）—— 测它时**不能**发 `thinking`，需另跑一轮。
+
+⚠️ **`sn-glm-5-3` 节点不一致是 provider 侧缺陷，不归我们**：3 次只对 1 次，两次回
+「当前模型不支持图片或视频输入」/「未收到任何图片」。错误体暴露网关有 3 个
+fallback 组（`raccoon-4eb26a` / `raccoon-0c119c` / `raccoon-ecc5fd`），
+**部分节点是纯文本的**。它本来就带 `vision` 标签、我们一直在发图，
+**本次修复不改变它的行为** —— 遇到时换模型即可，别改我们的声明。
+
+排查脚本（只读、gitignored）：`scripts/probe-raccoon-vision.mjs`（打远端原始
+条目）、`scripts/probe-raccoon-vision-real.mjs`（真实发图，支持 `PROBE_MODELS`
+与 `NO_THINKING=1`）、`scripts/probe-raccoon-catalog-fields.mjs`（穷举键并集）。
+回归用例在 `tests/unit/raccoon-product.spec.ts` 的「图片能力判定（tags 不是能力
+契约）」段与 `tests/unit/raccoon-adapter.spec.ts` 的两条 ⚠️ 用例。
+⚠️ 已做**反向验证**：白名单清空 → 4 条变红；兜底表改回 `false` → 2 条变红。
 
 ### e2e 探针
 
@@ -6526,6 +6908,10 @@ ZCode **不可续期**（凭据是静态的、没有 refresh 端点），所以�
 这样用户在官方客户端重新登录后新凭据能铺开到所有条目」——
 那个前提在**多账号池**下**不成立**：磁盘凭据只对应一个账号。
 
+> 📌 **2026-10-05 更新**：上面这条「磁盘凭据」现在**根本不存在**了 ——
+> 读本机 ZCode 数据的整套能力已被删除（见下方 §9）。本节保留这段推理，
+> 因为它记录的仍是「为什么不能用**一份**凭据去填**多账号**池」的通用教训。
+
 #### 8.4 回归与**反向验证**
 
 `tests/unit/zcode-account-isolation.spec.ts`（6 条）：
@@ -6635,6 +7021,245 @@ ZCode **不可续期**（凭据是静态的、没有 refresh 端点），所以�
 `AccountPool` 经 `ctx.credentials` 取服务）；
 ③ **不要**用 `replaceAll`（那是 Jet Hub 的导入路径，语义不同；
 我第一版用它导致 3 条用例假失败）。
+
+### 十、⚠️⚠️ **不再读取本机 ZCode 客户端的数据**（用户决策 2026-10-05，Issue IKJNPZ）
+
+**用户决策**：「可否改成不读本机 ide 的数据，只用我们自己的 auth 流程」——
+**已整体执行**。凭据现在**只有一条来源**：插件自己的 OAuth 流程
+（`zcode-login.ts` → 写 `ctx.credentials`）。
+
+#### 10.1 起因：Issue IKJNPZ 暴露了那条路的**双重失效**
+
+用户报障（2026-10-04，issue IKJNPZ）：zai 渠道下读本机凭据得到的
+`account_label` 退化成「设备xxxxxxxx」、`user_id` 缺失。
+
+**本机实机复现**（`credentials.json` 实为 `oauth:zai:*` 一族，
+`oauth:active_provider = "zai"`）：
+
+```
+zcode_jwt     ✅ len=255      device_mid  ✅ len=36
+user_id       ❌ 缺失          account_label = 设备72c145cd
+bigmodel_access_token ❌ 缺失   zai_access_token ❌ 缺失
+```
+
+⚠⚠ **issue 建议的修法不足以解决它自己描述的连带影响** ——
+`KEY_FRAGMENTS.userInfo` 从 `'oauth:bigmodel:user_info'` 放宽成 `'user_info'`
+**只能修好 `account_label`**。因为**两个渠道的 user_info 形状根本不同**：
+
+| | 键名 | 实测形状 |
+|---|---|---|
+| bigmodel | `oauth:bigmodel:user_info` | `{id, username, displayName, rawProfile}` |
+| **zai** | `oauth:zai:user_info` | `{user_id, email, avatar, name}` ← **没有 `id`** |
+
+⇒ `readUserIdFromUserInfo()` 只认 `id` / `userId` / `rawProfile.user_id`，
+**不认顶层 `user_id`**；`identityFromUserInfo()` 只认 `displayName` /
+`username` / `rawProfile.name`，**不认 `name`** ⇒ 放宽片段后 `user_id` 与
+`account_name` **仍然缺失** ⇒ `adoptOfficialCredential` 的**闸②**
+（`user_id` 缺失 + 池里有其它账号 ⇒ 失败关闭）**照样拦下**。
+⚠ **教训**：报障者只看了一层（键名匹配），没看下一层（**结构**不兼容）。
+按建议改完仍会复现「连带影响」。
+
+⚠ **issue 也漏了第 4 处**：`readZcodeCredential` 只填
+`bigmodel_access_token`，**`zai_access_token` 是死字段**（全仓只有
+`zcode-auth.ts` 的登录路径会填它）⇒ zai 账号走该路时
+`fetchCodingPlanApiKey` 的 `zai ?? bigmodel` **两边都是 undefined**。
+
+#### 10.2 删除范围（`git diff` 实测：src 净减约 700 行）
+
+| 文件 | 删掉的东西 |
+|---|---|
+| `src/zcode.ts` | `readZcodeCredential` / `resolveZcodeCredential` / `readRawCredentials` / `credentialFileCandidates` / `resolveCredentialFilePath` / `decryptCredentialValue` / `deriveCredentialKey` / `pickCredential` / `KEY_FRAGMENTS` / `readDeviceMid` / `telemetryFileCandidates` / `detectZcodeAppVersion` / `labelFromUserInfo` / `identityFromUserInfo` / `readUserIdFromUserInfo` + 全部 `enc:v1:` 常量（597 → 178 行） |
+| `src/zcode-auth.ts` | `ZcodeAuthOptions.readCredential` 注入点、`localCredential()`、`adoptOfficialCredential()`、`adoptIntoOrphanAccount()`、`hasStoredCredential()`、`hasOtherZcodeAccounts()`、`accountIdOf()`（−255 行） |
+| `src/jet-hub-rpc.ts` | `account.create` 里的两段本机复用短路（孤儿收编 / 同 `user_id` 返回 `{reused:true}`） |
+
+**保留**：`phoneFromUserId`（登录路径在用）、`isUsableZcodeCredential`、
+`isZcodeExpired`、`ZCODE_APP_VERSION_FALLBACK`（`zcode-upstream.ts` 有 6 处用）、
+`ZcodeCredential` 的全部字段、`source` 字段（**存量凭据**里可能写着 `'ide'`）。
+
+#### 10.3 ⚠ 顺带修好 coding-plan：**一条早已断掉的链**
+
+删除过程中发现的**既有**断链（与本次删除无因果关系）：
+
+| | 状态 |
+|---|---|
+| `coding_plan_key_zai` / `_bigmodel` 的**唯一**写入点 | 上面被删的 `readZcodeCredential()` |
+| 唯一能补 key 的 `fetchCodingPlanApiKey()` | **零调用方**（建好却没人调） |
+| ⇒ 纯插件登录用户的 coding-plan（**付费**）通道 | **一直不可用** |
+
+用户选择「顺手接线」后已修：`ZcodeAuth.resolveCodingPlanKey()` 由
+`startLogin` 在组装凭据后调用，**best-effort + 8 秒超时 + 失败只记日志**
+（没买订阅是常态，**绝不能**因此把用户挡在门外；`start-plan` 照常可用）。
+⚠ **字段按「拿到哪个 OAuth token」落位**（zai → `_zai`，bigmodel → `_bigmodel`），
+与 `zcode-transport.ts` 里 `zai ?? bigmodel` 的优先级一致。
+
+⚠ **这次接线是删掉读本机凭据后**唯一**能让付费 plan 继续可用的路子** ——
+不接它，装了 IDE 的用户会失去该通道（`glm-5.3` / `glm-5.3-flash`）。
+
+#### 10.4 ⚠⚠ 防回退锁是**扫源码字面量**，不是「断言函数不存在」
+
+`tests/unit/zcode-no-local-credential-read.spec.ts`（4 条）。理由：
+删掉导出后，「有没有人重新加回读取逻辑」在运行时**无从断言** ——
+新写的 `readZcodeCredentialFromDisk()` 不会让任何既有用例变红。
+故改成扫 `src/*.ts`（先剥掉注释避免本文自身的说明文字误报），
+命中 `.zcode/v2` / `credentials.json` / `telemetry-state.json` /
+`zcode-install-manifest` / `zcode-credential-fallback` / `enc:v1:` /
+`aes-256-gcm` 即失败。
+
+⚠ **必须用词边界**：`zcode-auth.ts` 里仍有 `readStoredCredential` /
+`readCredentialFromRef` / `readCredentialFromPool` 三个**合法**方法
+（只读 `ctx.credentials`，不碰磁盘），裸 `/readCredential/` 会把它们一起误报 ——
+我第一版就写错了，改成 `/\breadCredential\b/` 才绿。
+
+⚠ **已做反向验证**：在 `zcode-transport.ts` 临时加回
+`join(homedir(), '.zcode', 'v2', 'credentials.json')` ⇒ **1 条变红**并指出文件名；
+还原后全绿。⇒ 不是同义反复。
+
+#### 10.5 ⚠ 用户可见文案**必须同步改**，否则把用户引向无效操作
+
+删的是能力，但**文案会留下来**。已改的三处（漏了任何一处都在误导人）：
+
+- `zcode-adapter.ts` 的 401/1002 文案原写「请重新在**官方 ZCode 客户端**登录」
+  ⇒ 现在去客户端登录**完全无效**（插件根本不读它），已改指 Jet Hub。
+- `zcode-auth.ts` 的 `probe()` / `persistCurrent()` 原因文案原写
+  「若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的凭据」。
+- `zcode-adapter.ts` 的 `MISSING_CREDENTIAL` 文案同款。
+
+⚠ `types.ts` 的 `reused` 字段**保留**（当前已无 provider 会返回 `true`），
+理由：它是**契约防御**（判据写成「后端声明复用则 `loginUrl` 为空是正常的」，
+比反过来假设「空串必是错误」更稳），不必为一次能力下线去改前端渲染分支。
+`forceNew` 则**已删**（前端 2026-10-02 起不再传、后端也不再读 = 无操作）。
+
+#### 10.6 踩过的两个坑
+
+1. ⚠ **反向验证脚本本身出错，比反向验证失败更危险**：第一次用
+   `PowerShell -replace` 时把拼接表达式写进了参数位（`-replace` 只接 3 个参数），
+   脚本在写入前抛错，`$mutated` 仍为空 ⇒ **把源文件清空了**，
+   测试报的却是 `ZcodeAuth is not a constructor`（看着像接线坏了，其实是文件没了）。
+   ⇒ 教训：**写回前必须校验**（`if ($mutated -eq $backup) { 还原; throw }`
+   外加字符数变化量守卫）。第二次加守卫后又因阈值过严（403 > 400）主动中止并还原 ——
+   守卫本身是对的。
+2. ⚠ **mock `runZcodeLogin` 必须回调 `onAuthorizeUrl`**：`startLogin` 是两步式，
+   它 `await` 一个**只由该回调 resolve** 的 `urlPromise` ⇒ 替身不回调就整条用例
+   5 秒超时，症状看起来像「接线失败」。且**别用逐条 `mockImplementation`**：
+   `() => fakeLogin(...)` 这个箭头函数**不接参数**，会把含 `onAuthorizeUrl` 的
+   `options` 整个吞掉 —— 同一个坑的第二个入口。正确做法是**可变状态** +
+   单一实现始终透传参数（`zcode-coding-plan-key.spec.ts` 即此写法）。
+
+#### 10.7 回归与反向验证
+
+- `zcode-no-local-credential-read.spec.ts`（4 条，防回退）——反向验证过（1 条变红）。
+- `zcode-coding-plan-key.spec.ts`（6 条，coding-plan 接线）——**反向验证过**：
+  摘掉 `startLogin` 里那 4 行接线 ⇒ **恰好 2 条**「换到 key」变红
+  （`expected undefined to be 'AK-1.SECRET'`），另 4 条「不牵连登录」仍绿
+  ⇒ 说明两类用例分别覆盖「接上了」与「失败不炸」两种失效。
+- 5 个受影响的既有 spec 改用**真实 `ctx.credentials` 路径**注入凭据
+  （不再用已删的 `readCredential` 注入点）—— 这反而是**更好的测试**：
+  它们现在覆盖的是生产环境真正走的路径。
+
+⚠ **子代理并发改测试时的竞态**：本次两个 agent 并行改测试，其中一个在跑全量时
+撞上我正在用脚本改写 `src/zcode-auth.ts`，`readFileSync` 读到空串报
+`expected '' to match /extends Service/`。**那不是缺陷，是写入竞态** ——
+**改完必须整体重跑全量**再下结论。
+
+## ⚠️⚠️ `3012` 的 HTTP 状态码是 **405**（不是 403），且身份块**之外**的变量已全部排除（Issue IKJI0Y，2026-10-03）
+
+**用户报障**（issue IKJI0Y）：免费通道调用模型返回
+`上游风控拦截（3012 unusual activity）`，但他**逐字核对了身份块**
+（`2898` 字符 vs 声明的 `2900`），怀疑还有别的触发因素。
+且他指出错误文案**没有任何可观测信息**，排查只能靠猜。
+
+### 一、复测结论：**唯一的判据仍然是身份块**
+
+本机**复现了 3012**（三个账号、17 次真实请求）。消融矩阵：
+
+| 消融 | 结果 |
+|---|---|
+| 裸请求（无身份块·无日期块·极简头） | ✗ **405 + 3012** |
+| 无身份块、其余官方头齐全 | ✗ **405 + 3012** |
+| **有**身份块 + **极简**头（无任何 `X-*`） | ✓ 200 |
+| 有身份块、**不带日期块** | ✓ 200 |
+| 有身份块、`app_version` 报 `3.14.4` / `4.0.0` | ✓ 200 |
+| 三个账号各一发完整形态 | ✓ 200 ×3 |
+| 多轮历史（`tool_use` / `tool_result`） | ✓ 200 |
+| 带 `tools`（DSH 每步 24 个） | ✓ 200 |
+| **单账号无间隔连发 6 发** | ✓ 200 ×6 |
+| 无 `Authorization`（阴性对照） | 401（鉴权与身份块相互独立） |
+
+⇒ **频率、并发、多轮历史、工具声明、版本头、账号池**均**非**判据。
+
+### 二、⚠️ 两条**必须修正**的旧说法（别再照旧口径排查）
+
+1. **HTTP 状态码是 `405`，不是 `403`**。按 403 排查会一路走到
+   「风控 = 鉴权/权限」的错误分支。响应体还带 **`logid`** ——
+   向用户索取现场时**优先要它**（上游侧排障凭据）。
+2. **日期块在这个窗口不是判据**（去掉照样 200）。它仍**照发**
+   （官方如此、零成本），但它与身份块是**必要非充分** ——
+   ❌ **不要再把「3012 的最后一个开关」当成唯一结论**（那句来自早期窗口）。
+
+⚠ 顺带纠正一处**文档数字打架**：`zcode-identity.ts` 头注释曾写
+「`cliPrefix + stable（前两块）= 2355`」与「完整四块 = 7599」，
+而实际 `stable` 是**三段**、合计 **2856**，前缀后共 **2898**；
+README 曾写 2900。⇒ 三处已统一为 **2898**，单测锁死 `42+2856`。
+（`tests/unit/zcode.spec.ts` 那条「>2300 且 <3000」的量级断言保留，
+但它**锁不住**逐段数字 —— 新增的诊断用例补上了逐段断言。）
+
+⚠ **因此「身份块达标仍 3012」目前没有已知解释**。若再遇到，
+唯一能区分「账号自身被标记」与「共用出口 IP 被标记」的办法是**看诊断行**。
+
+### 三、本次新增：`3012` 的错误文案带**可观测诊断行**
+
+新文件 **`src/zcode-diagnostics.ts`**（进程级，**不落盘** ——
+与 `captcha-requirement.ts` 同口径：`jet-hub/state.json` 是同机多 profile
+共享的 home 级文档，落盘会把一个 profile 的画像传染给另一个）。
+
+实测输出：
+
+```
+zcode: 上游风控拦截（3012 unusual activity）。⚠ …请勿连续重试。
+本机诊断：账号#1 · 本进程 成功 1/失败 2 · 最近成功 1分29秒前 · 距上条 2.4s ·
+身份块 2898 字符(42+2856) · 日期块 有 · HTTP 405
+原始响应：request has been blocked due to unusual activity.
+```
+
+⚠ **三条不能写错的设计**：
+
+1. **诊断行绝不含凭据**。账号只以**进程内自增序号**（`账号#N`）出现，
+   不含 accountId / JWT / device_mid 的任何片段。
+   用例用「**逐子串排除**」（连 `1a2b` 这种半截都排除）钉死这条 ——
+   防止将来有人「图方便」改成截前 8 位。
+2. **身份块字符数必须读「实际构造出来的 `system`」，不是常量**。
+   常量只能证明「源码里写了多少字」，证明不了「线上发出去多少字」。
+   真出现「身份块没进请求体」时会如实显示 `0 字符`，
+   而不会显示 2898 把问题盖住。⚠ 用例专门断言了这一条。
+3. **`距上条` 的分母是 `previousSentAt`，不是 `lastSentAt`**。
+   适配器的调用顺序是「先 `noteZcodeRequestSent` 记**本次**、再在失败时诊断」，
+   两者用同一个 `sentAt` ⇒ 若诊断读 `lastSentAt`，算出来**恒为 `0ms`**。
+   ⚠ 这个缺陷是**端到端脚本真的打印出 `距上条 0ms` 才暴露的** ——
+   首版单测按「记一条旧的、直接诊断一条新的」写，**全绿但是假绿**。
+
+⚠ **单测必须按适配器的真实调用顺序写**（先记本次、再诊断）。
+这是本条最容易重犯的地方：写反了用例照样绿。
+
+⚠ `formatGap` 的分钟/小时档要**逐档单独算**（初版写成
+`${Math.floor(seconds % 60)}分` ⇒ 90 秒渲染成「30分30秒」，
+同样是在**真实输出**里才发现的，纯函数单测当时没覆盖 ≥60 秒）。
+
+⚠ 只给 **3012** 附诊断：`3009` / `1005` / `3007` 的文案**本身已说明原因**，
+附加只会让它们变脏（且各有单测钉住措辞）。
+**不传诊断时行为与原来逐字一致**（旧调用点不受影响）。
+
+⚠ `noteZcodeRequestOk/Failed` 必须用**局部可变的** `activeAccountId`
+（切号后会变），与额度切号那段是同一条纪律：标记要记在真正发出这条请求的
+账号上，否则切到 B 之后失败会把账记到 A 头上。
+
+**回归**：`tests/unit/zcode-diagnostics.spec.ts`（17 条）。
+⚠ **已做四轮反向验证**：诊断改读常量 ⇒ 1 条红；诊断行塞 accountId ⇒ 2 条红；
+间隔退回读 `lastSentAt` ⇒ 3 条红；`formatGap` 退回旧 bug ⇒ 2 条红。
+
+取证脚本（**均只读、零额度**）：`scripts/probe-zcode-3012-issue.mjs`（身份块自检 +
+消融）、`scripts/probe-zcode-3012-matrix.mjs`（负向对照矩阵，**会真的触发 3012** ——
+⚠ 有冷却惩罚，跑前先想清楚）、`scripts/probe-zcode-3012-accounts.mjs`（账号/多轮/频率）、
+`scripts/verify-zcode-3012-diagnostic.mjs`（用实测响应体做端到端文案组装，**零网络**）。
 
 ## 供应商级一键开关（左侧 rail 分组 + 页头弹窗开关）
 
@@ -6945,3 +7570,1306 @@ client **每轮**问 `captcha.carrierUrl`（`null` ⇒ 记 `no-carrier-url` 并�
 ⚠ 这条降级链**领取路径也接上了**（`claimDailyWith` 内，评审 C4）：领取端点**始终**索要 captcha
 且校验前置于 plan 校验，是内部 param 最容易被拒的地方；重发**上限一次**，
 换 chromium 后仍被拒的文案要能让用户看出「这更像设备信誉问题」。
+
+### ⚠⚠⚠ captcha 的 **region 必须与产 param 的那份配置同源**（Issue IKJNPS，2026-10-05）
+
+**真实缺陷**（用户报障，Gitee issue IKJNPS）：z.ai 国际渠道账号点「一键领取」**恒失败**
+`captcha 校验失败（zcode-v3-start-plan-trust-1004）`，15/15 全部 `400 / code 3007`；
+同账号在 ZCode IDE 里正常。多账号 / web 版 / 桌面版 / 换浏览器链路都一样。
+
+**根因**：region 与 param 是**两份真相**。
+
+| | 修复前取自 | 值 |
+|---|---|---|
+| param（`mintCaptcha` 用的配置） | 调用方 `fetchCaptchaConfig()` → **服务端下发** | `sgp` |
+| 请求头 `x-aliyun-captcha-verify-region` | `claimDailyFor` 的**默认参数** `ZCODE_CAPTCHA_FALLBACK.region` | `cn` |
+
+阿里云验签把 param 与 region **成对**校验 ⇒ 不一致即 `3007`。
+⚠ **作者本人在 cn 区**（本仓库兜底常量与 README 实测记录都是 `cn`），所以本地永远复现不到；
+**非 cn 区账号 100% 复现**。⚠ 这类「本地默认值恰好等于服务端值」的缺陷具有**零本地症状**。
+
+**修法（采纳 issue 的第 2 条：配置成为唯一真相源）**：
+- `ZcodeAuth.claimDailyWith` 在 **plan 循环之前**解析**一次**配置
+  （`fetchCaptchaConfig().catch(() => undefined) ?? ZCODE_CAPTCHA_FALLBACK`），
+  同时落进 `this.captchaMintConfig`（`CaptchaCarrier` 那条 chromium 兜底腿读它），
+  `region = captchaRegion ?? captchaConfig.region`；
+- 注入回调的类型改成 `ZcodeClaimCaptchaMint = (config: ZcodeCaptchaConfig) => Promise<string>`，
+  **实参就是那份配置**；`jet-hub-rpc.ts` 里改为 `async (config) => zcode.mintCaptcha(config)`
+  （原来自己再拉一次 —— 那正是「两份真相」的来源）；
+- `claimDailyFor` / `claimDaily` 的 `captchaRegion` **取消 `cn` 默认值**（可选覆盖仍保留）；
+  `3007` 换链重发**沿用同一份配置**（换 param 不换 region）。
+
+⚠⚠ **同型第二个实例（推理路径，别只修领取）**：`zcode-adapter.ts` 组头时原来恒写
+`this.options.captchaRegion ?? 'cn'`，而 param 来自 `resolveZcodeCaptchaConfig()`（远端）。
+现为 `this.captchaConfig?.region ?? this.options.captchaRegion ?? 'cn'` ——
+`this.captchaConfig` 由 mint 回调里的 `setCaptchaConfig(remote)` 写入，且 **mint 先于组头**，
+所以读到的一定是**本次 param 用的那份**。`index.ts` 里那个字面量降级为「连配置都没有」的兜底。
+
+⚠ **`TtlCache` 连 `undefined` 也缓存**（`get()` 无条件 `write(value)`），
+而 `fetchZcodeCaptchaConfig` 自己吞掉全部异常返回 `undefined`
+⇒ **数「`/client/configs` 请求次数」判不出「配置是否被重复解析」**（实测把解析搬进
+for 循环，用例仍全绿）。「只解析一次」只能锁**源码结构**（解析在 `for` 之前）。
+
+回归用例 `tests/unit/zcode-captcha-region.spec.ts`（8 条：sgp 同源 / 失败一起退兜底 /
+显式覆盖 / 循环前解析 / `3007` 重发仍同源 / 推理路径同源 / 两条源码看守）。
+⚠ 已做**反向验证**：region 改回兜底常量 ⇒ 3 条红；适配器改回写死 `cn` ⇒ 推理那条红；
+解析搬进循环 ⇒ 结构那条红。
+
+⚠ **issue 附注的「web 版 3007 不重试」维持现状**（不是遗漏）：`source === 'chromium'`
+本身就说明**载体链本轮没参与**（web 版拿不到 `dshDesktop.browser` ⇒ `supplied` 恒 0，
+或 env 关了）⇒ **没有第二条链可换**；且重试只白扣同设备每小时 150 次配额，
+面对同一个服务端判定期望收益极低。修好 region 后 chromium 侧残留的 `3007` 都是时效/信誉性质。
+
+## ⚠️⚠️ 用量徽标折叠态：渠道名与读数**必须是两个元素**（真实报障，2026-10-03）
+
+**报障**：胶囊显示成 `LobsterAI (有道) · 合计 …` —— **数字被截掉**，而渠道名完整。
+
+**根因不在宽度，在结构**：原先整句是**一个** `overflow: hidden; text-overflow: ellipsis`
+的 span，省略号从右往左吃，被吃掉的恰好是用户唯一想看的东西（还剩多少）。
+⇒ 把 `badgeView()` 的返回拆成 `name` / `detail` / `reading` **三个字段**
+（`plugin-src/client/badge-model.js`），渲染层再给**不同的收缩权重**
+（`usage-badge.js` 的三段式 `collapsed` + `jet-hub-styles.js` 的三条规则）：
+
+| 段 | 类 | flex-shrink | 让位顺序 |
+|---|---|---|---|
+| 渠道名 | `.dim-jh-badgeName` | 99 | 第二 |
+| 包名（仅套餐模式） | `.dim-jh-badgeDetail` | 999 | 第一 |
+| 读数 | `.dim-jh-badgeReading` | **`flex: none`** | **不让位** |
+| `•` | `.dim-jh-badgeSep` | `flex: none` + `margin: 0 3px` | 不参与 |
+
+### ⚠️ 读数必须 `flex: none` —— 这是第二个、更隐蔽的成因
+
+给读数留 `flex-shrink: 1`（哪怕幅度极小）时，加权分配仍会分给它**不到 1px** 的收缩
+（实测 78.23 宽 / 内容 79），而 `text-overflow: ellipsis` 的触发条件是
+`scrollWidth > clientWidth` —— **亚像素级收缩就足以命中**，最后一个字被换成「…」，
+视觉上和整段被截一样严重。故读数的 `flex` 是 `none`，**不是** `0 1 auto`。
+
+### ⚠️⚠️ 这条缺陷**用 `clientWidth` 量不出来**（我因此假绿了一整轮）
+
+`clientWidth` 与 `scrollWidth` **都取整**：
+- `clientWidth` 把 53.97 报成 54 ⇒ `scrollWidth > clientWidth` 判为 **false**（漏判）；
+- `scrollWidth` **向上**取整，内容 39.79 报成 40 ⇒ `rect < scrollWidth` 恒成立（误判）。
+
+我第一次写的断言用 `scrollWidth > clientWidth` 判「数字是否完整」，**全部通过**，
+而**截图里明写着 `347.87积…`**。⇒ **判定省略号只能靠截图**，或量一个
+**同字体的自然宽度参照元素**再与元素实际宽度比（`tests` 里没做渲染测试，
+故这一条只能靠改样式时人工截图复核 —— 见下）。
+
+### 测量数据（Edge headless，宿主 UI 字体栈，dsf 1 与 1.5 都量过）
+
+| 用例 | 自然宽度 | 186px 下 |
+|---|---|---|
+| `WorkBuddy (国际版) • 200积分` | 179.3px | 完整 |
+| `LobsterAI (有道) • 842.06积分` | 172.3px | 完整 |
+| `WorkBuddy (国际版) • 347.87积分` | 193.6px | 名字省略，**数字完整** |
+| `CodeBuddy (腾讯) • Free Plan Subscription 300 / 500积分` | 309px | 包名+名字省略，**数字完整** |
+
+⚠️ 宽度上限取 **186px**（原 150px）：对最宽的那个报障样例留 6.7px 余量。
+⚠️ `<button>` **本来就是 `border-box`**（UA 默认样式表），故这次是**实打实多占 36px**，
+不要按「只是写明 box-sizing」理解；多占的空间由 `.dim-jh-badge` 的 `flex: 0 1 auto`
+（**不是 `none`**）兜底 —— 窄窗口下胶囊自己先让位，而不是把模型选择器挤出去
+（后者正是 2026-10-02 那次报障的形态）。
+
+### ⚠️ 两个静态陷阱（都有用例守着）
+
+1. **类名不能复用 `.dim-jh-badgeValue`** —— 那个名字已被**浮层**里的读数占用，
+   规则带 `font-weight: 600` 且排在样式表**更后面**（同特异性 ⇒ 后者胜），
+   沿用同名会让胶囊里的数字被静默**加粗**。故胶囊用 `.dim-jh-badgeReading`。
+2. **窄屏「只留状态点」的媒体查询必须排在 `.dim-jh-badgeText { display: flex }` 之后** ——
+   两者特异性相同，胜负由**源顺序**决定；排到前面会让 `display: none` 被
+   `display: flex` 覆盖，窄屏下文字重新出现并挤压模型选择器（宽窗口下完全看不出）。
+
+### ⚠️ 分隔符的间距只能用 CSS，不能用字符串里的空格
+
+`BADGE_SEP = ' • '`（带空格）**只用于 `title` / `aria-label` 那句整文**。
+渲染层里 `•` 是独立 span，间距靠 `margin` —— 因为 **flex 容器把 span 之间只含空白的
+文本节点渲染成零宽**（实测 gap=0：节点还在、看不见），空格会静默消失。
+
+### ⚠️ `jet-hub-styles.js` 的注释**不能出现反引号**（本次又踩一次）
+
+该文件的 `STYLES` 是模板字符串。我在标出「报障原文」时写了反引号，
+`node --check` 直接报 `Unexpected identifier`。已有一条用例扫徽标那一段的注释块。
+⚠️ 注意 `\``（转义）**也会**在产物里留下真反引号 —— 该用例照样会红。用「」代替。
+
+⚠️ 这条只对**模板字符串所在的文件**成立：`badge-model.js` / `usage-badge.js` 是普通
+JS，里面的 JSDoc 写反引号没问题 —— 但**从它们复制片段进 `jet-hub-styles.js` 就会炸**。
+动手前先确认目标文件是不是模板字符串。
+## ⚠️⚠️ 用量徽标折叠态：**余额优先**（口径反转，2026-10-03 用户要求）
+
+**报障**：CodeBuddy 胶囊显示「个人体验版 500 / 500积分」，而设置页里写着
+**可用积分 2434.96**。用户原话：「图3里显示我能用的积分足足 2436.96 呢」。
+
+### 口径（现在的默认）
+
+| 偏好 | 折叠态显示 |
+|---|---|
+| **auto**（默认） | **余额** → 窗口 → 套餐（三级回落） |
+| subscription | 窗口 → 套餐 → 余额 |
+| credits | **只**余额（不回落） |
+
+⚠️ **两个数都是真的，但回答的不是同一个问题**：套餐读数是「某一份包还剩多少」，
+服务端还会下发「体验版」这类样板包 —— 它只是余额里的一份；余额才是「一共还能用
+多少」。旧口径（窗口 > 套餐 > 余额）在这种渠道上**必然少报**，且看起来像数据错误。
+⚠️ **窗口/套餐读数没删**：仍在浮层里，`subscription` 档可切回去。别以为是回归。
+
+### 实现要点
+
+- 模式选择从「嵌套三元 + 一个 `wantsSubscription` 布尔」改成**有序候选表 +
+  `find`**：旧写法让一个布尔同时承担「是否看订阅」与「是否允许回落」两义，
+  加一档就要重排整棵嵌套，极易写漏组合。
+- ⚠️ **每个候选必须判「有内容」而不是「存在」**：账号 `ok:true` 但 `windows: []`
+  或包全失效时订阅对象是在的、内容是空的 —— 直接选中会显示成 `Cline · `
+  （只有渠道名、没有数字，比显示余额更没用）。
+- 展示名跟着改：`credits` 从「优先积分」改成「**只看积分**」。⚠️ 语义反转后
+  `auto` 与 `credits` **都显示余额**，差别只在「是否回落」—— 沿用「优先积分」
+  会让两档读起来是同义词。差别写在容器 title 里。
+
+## ⚠️ 徽标宽度：**内容自适应 + 216px 上限**（两次报障的两个不同成因）
+
+**同一条链路、两次报障，别把第二次当成第一次没修好**：
+
+| 报障 | 表象 | 根因 |
+|---|---|---|
+| 第一次 | 数字被截（`…合计 …`） | **结构**：整句一个 `overflow:hidden` 的 span，省略号从右往左吃掉余额 |
+| 第二次 | 名字被截（`CodeArts (华为…`） | **尺寸**：结构修好后 186px 仍不够长名字 + 长余额，省略号落到名字上 |
+
+**216px 是量出来的**：13 个渠道展示名 × 10 种现实读数（含 123456.78积分 /
+9499.84积分 / 94.54MToken / 0积分）共 130 组，最宽需求 **209.34px**
+（`WorkBuddy (国际版) • 123456.78积分`），留 6.7px 余量。
+
+⚠️⚠️ **上限不能再往上放，「无上限」是错的**：实测把 `max-width` 去掉后，
+极窄 composer（220px）下胶囊**溢出容器 8.3px** —— 那正是 2026-10-02
+「模型选择器图标被挤没」的形态。**内容自适应与上限兜底缺一不可**：
+宽度由内容撑开（`Cline • 5积分` 只有 93px），上限只防挤压右侧。
+
+⚠️ 写用例时**别把 `.dim-jh-badgeBtn` 的 `max-width` 当成「胶囊实际宽度」**：
+我第一版测量脚本忘了解掉类自带的上限，量到的永远是 186（被截断后的值），
+于是「所需宽度」全部失真。测量时必须 `style.maxWidth = 'none'`。
+
+
+## ⚠️ 多账号的胶囊：**分组键必须先归一单位**（2026-10-03 真实缺陷）
+
+用户报障（WorkBuddy 国际版**两个**账号）：
+`WorkBuddy (国际版) • 341.78积分 · 100积分` —— 读成「把所有号的积分都列出来了」，
+并担心「以后五六个号会显示很长一串」。
+
+**根因既不是账号数，也不是宽度，而是分组键**：服务端把**同一个单位**拼成两种
+写法。逐包实测（`probe-workbuddy-units.mjs`，只打印单位/包名/数值）：
+
+| 账号 | 包 | `unit` 原值 |
+|---|---|---|
+| `…01CC739A` | Bonus Pack 241.78 / Free Plan Subscription 100 | `credit` / `credits` |
+| `…297957E1` | Free Plan Subscription 100 | `credits` |
+
+折叠态按**原始字符串**分组（`credit` ≠ `credits`）⇒ 两个账号落进两个分组 ⇒
+渲染出两个**一模一样**的「积分」标签（用户看到的就是这个）。名字同时被
+216px 上限截成 `WorkBuddy (…`。
+
+**红线：分组键必须与展示名同源。** 凡是 `unitLabel` 会显示成「积分」的单位串，
+就必须落进**同一分组**；否则文案里必然出现 `A积分 · B积分` 这种把同一单位拆成
+两段的形态。故分组前一律走归一：
+
+- 客户端 `plugin-src/client/credits-format.js` 的 `normalizeUnit()`
+- 宿主 `src/credits.ts` 的 `normalizeCreditUnit()`
+- 两者都只返回 `'token'` / `'credit'`，**必须逐字等价**（宿主算套餐读数、客户端
+  算余额分组；不一致会让同一枚徽标里「套餐按一个单位、余额按另一个」自相矛盾）。
+  契约由 `tests/unit/usage-badge-client.spec.ts` 逐项比对锁死。
+- 消费点三处：`creditGroupsOf`、`planGroupsOf`（客户端）、`badge-subscription.ts`
+  的 `unitOf` / `badgePlanFor`（宿主）。
+
+⚠️ **`token` 与积分不合并**：ZCode 是 token、其余是积分，不可折算，仍分两组
+（`100积分 · 94.54MToken`）。归一化只收敛**同义拼法**，不跨量纲求和。
+
+⚠️ **不要改写 `CreditPackage.unit`**：那里要保留服务端原值（设置页逐包明细依赖
+它）。归一化只发生在「当分组键 / 当展示名」那一步。
+
+修复后同一份真实数据：`WorkBuddy (国际版) • 441.78积分`，宽度 **193.56px**
+（上限 216px 都没碰到）⇒ 名字也不再被截。六个号（单位拼法混着给）同样只有一个
+数字：`2066.84积分`。
+
+⚠️ **教训的普遍性**：这是本仓库第三次栽在「用外部下发的**字符串**当键」上
+（另两次：qoder 的 `110` 用错误码默认归类、`10605` 排队被漏判）。外部字段的
+**拼法不可假设**，当键用之前先归一到自己的语义等价类。
+
+## ⚠️ 徽标的两条「账号多了」规则（2026-10-03 用户要求）
+
+胶囊对**任意账号数**都只显示一个数字（前提是单位先归一，见上一节）。另两处随账号数
+放大的地方已按用户要求整理：
+
+| 位置 | 规则 | 理由 |
+|---|---|---|
+| 弹窗逐账号列表 | **按余额降序** | 账号是「用完一个换一个」的资源，先要看到「还有哪个号能用」；原顺序是池的插入顺序 |
+| 同上 | 读不到数的**排最后** | 那格显示的是错误文案，夹在数字中间会被误读成「余额很小」。⚠️ 不能用 0 代替（0 会插进小余额里） |
+| 同上 | 超过 **5 个**折叠 | 6 个号 = 12 行（每号两行），弹窗比窗口还高 |
+| 胶囊 | 合计不完整时挂 **⚠ 角标** | 账号读不到时合计会**静默少报**，数字本身看不出异常（色调仍是 ok） |
+
+⚠️ **排序与折叠是纯函数 `orderCreditRows`（`badge-model.js`）**，不是写在组件里：
+`usage-badge.js` 依赖宿主注入的 react（本仓库装不了），**组件里的逻辑测不到** ——
+凡是「错了用户也只会觉得别扭、不会报错」的规则，都必须住进能单测的模块。
+
+⚠️ **角标的四条硬约束**（每条都有对应用例）：
+1. 与读数同级 `flex: none` —— 它是补语，被省略号吃掉等于没标；
+2. 排在读数**之后** —— 不干扰「先看数字」的阅读顺序；
+3. **不进 `view.text`** —— 那是供 title / 读屏的纯读数，说明单独走 `incompleteNote`；
+4. 标记自身 `aria-hidden`，同一句话并进按钮 `aria-label`（否则读屏念两遍）。
+
+⚠️ **只在积分模式标**：只有它是跨账号的**合计**。窗口模式按设计只显示某一个账号的
+窗口、套餐模式显示「最大的那份套餐」——它们不是合计，套这句话就是错的。
+（判据 `mode === 'credits' && okCount > 0 && failedCount > 0`；`okCount > 0` 是必要的，
+一个都没读到时模式已回落到 `empty`，读数本身就是「用量不可用」。）
+
+⚠️ 弹窗脚注**复用同一句话**（`view.incompleteNote`），不另写一份措辞 ——
+否则会出现「胶囊说 A、弹窗说 B」。
+
+⚠️ 实测数值（无头浏览器，比较 `getBoundingClientRect` 的渲染宽度与自然宽度 ——
+不能用 clientWidth / scrollWidth，两者会四舍五入）：带角标后 193.56px → **202.19px**，
+名字与读数都不出省略号，仍在 216px 上限内。
+## ⚠️ 本机 OpenAI 网关：两个协议端点**同时可用**，不要做「格式开关」（2026-10-03）
+
+出口在 `src/openai-gateway/`，对外两个端点：
+
+```text
+POST /v1/chat/completions   ← OpenAI Chat Completions（`server.ts` + `messages.ts` + `stream.ts`）
+POST /v1/responses          ← OpenAI Responses API（`responses.ts`）
+GET  /v1/models             ← 两套协议共用同一份目录
+```
+
+⚠️ **用户 2026-10-03 的决定：加 Responses API，但明确否掉了「格式切换开关」** ——
+两个端点**始终都在**，客户端用哪套协议由它请求的 URL 决定。互斥开关只会让「另一个
+协议的客户端在切换后突然失效」，而网关侧面本来就没有互斥的理由。
+
+⚠️ **凡是两套协议共有的东西，只允许有一份实现**（各写一份必然漂移，且漂移的症状是
+「同一件事在 /v1/chat/completions 对、在 /v1/responses 错」这种极难归因的差异）：
+
+| 关注点 | 唯一实现 | 谁在用 |
+|---|---|---|
+| 图片入站（data URL → 附件 → `ImageBlock`） | `messages.ts` 的 `partsFromContent` | 两个端点（Responses 先经 `chatPartsFromResponses` 改写外壳） |
+| 纯文本提取 / 「工具结果不能带图」 | `messages.ts` 的 `textFromContent` | 同上 |
+| 工具 schema 校验 | `messages.ts` 的 `convertTools` | Responses 先经 `toChatTools` 把**扁平**工具写成 Chat 的嵌套形状 |
+| 输出预算校验 + 钳制 | `tokenValue` / `normalizeMaxTokens` | `max_tokens` 与 `max_output_tokens` 走同一判据 |
+| 思考档位归一化（三态） | `normalizeReasoningEffort` | `reasoning_effort` 与 `reasoning.effort` |
+| **用量口径**（DSH 互斥 → OpenAI 含缓存） | `usage.ts` 的 `toOpenAiUsage` | `stream.ts` 与 `responses.ts` 各自的 `usageJson` **只改字段名** |
+| 取消、错误翻译、CORS、SSE 头 | `server.ts` 的 `withRequest` / `writeSseHead` | 两个端点 |
+
+⚠️ 改这些共享件时**必须同时想两个端点**：`openai-gateway-server.spec.ts` 的
+「Responses API 出口」段里有几条**跨端点**用例（钳制、404 翻译、鉴权）专门锁这件事。
+
+### 两处与 Chat 端点**有意不同**（改 `responses.ts` 前先读文件头）
+
+1. **文本以 `block-end` 的组装块为权威**（`finalText`）。DSH 的正文死循环截断与泄漏
+   清洗**只在 `block-end` 上生效**（`openai-compat.ts` / `buddy-adapter.ts` 的注释、
+   `scripts/verify-blockend-override.ts`）。Chat 端点只累加 delta，触发死循环时会把重复
+   正文交给客户端；Responses 端点取 `block-end`。⚠️ **不要去「顺手统一」Chat 端点** ——
+   那会改动一个已被线上流量验证过的端点，属于本次任务之外的越界重构（与
+   `openai-compat.ts` 那条「只服务 qoder」的约定同因）。
+2. **失败事件的 `error.code` 只放官方枚举值**（`server_error` / `rate_limit_exceeded`）。
+   Responses 的 `Response.error.code` 在官方 SDK 里是 **Literal 枚举**，把 DSH 的内部码
+   （`SERVER` / `QUOTA_EXCEEDED` / `incomplete_stream`）塞进去，客户端会在**解析失败事件**
+   时抛校验错误 —— 用户看到「客户端崩了」，而真实原因是上游错误。
+   精确码放 `error.dsh_code`、本该返回的 HTTP 状态放 `error.status`（Chat 端点的 SSE 错误
+   帧里也有同名字段，口径一致）。
+
+### ⚠️⚠️ 用量口径：`input_tokens` / `prompt_tokens` **必须含缓存命中**（真实报障，2026-10-04）
+
+**用户报障**：接入 Codex 后，「raccoon 的上下文显示好像不太对 —— 搞半天就占了 5%，
+一换成 trae 就正常显示占了 300k 多」。
+
+**根因是两种「缓存算不算输入」的口径冲突**：
+
+| | DSH `TokenUsage` | OpenAI `usage` |
+|---|---|---|
+| 输入 | `inputTokens` **只含未命中缓存**；命中单列 `cacheReadTokens` | `prompt_tokens` / `input_tokens` 是**含缓存**的总输入 |
+| 明细 | 无 | `prompt_tokens_details.cached_tokens` 是上者的**子集**（不是并列项） |
+
+DSH 侧口径见 `src/types.ts` 的注释，以及各适配器统一在做的那一步减法
+（`openai-compat.ts:892`、`buddy-adapter.ts:1988`、`lobsterai-adapter.ts:1488`、
+`llm-adapter.ts:1797`、`gemini-messages.ts:455`）—— 它们把上游**含缓存**的
+`prompt_tokens` 减成 DSH 的互斥口径。**网关这一跳必须减回去**。
+
+旧实现原样发 DSH 口径，Codex 再按官方口径算 `input_tokens - cached_tokens`
+（`saturating_sub`）⇒ 夹到 **0** ⇒ 总数只剩 output。实测（rollout
+`…01a0fc83….jsonl` 的 `token_usage_record`，逐帧对得上）：
+
+| 时刻 | 真实上下文 | 修复前 | 修复后 |
+|---|---|---|---|
+| raccoon 会话中 | 56,225 | **5.56%** ← 用户看到的「5%」 | 5.99% |
+| raccoon 会话末 | 208,258 | **0.15%** | 21.99% |
+| trae 会话末 | 326,134 | 34.39% ← 用户看到的「300k多」 | 34.39% |
+
+⚠️ **trae 之所以「正常」不是它被修好了，而是它不报缓存** ——
+`trae-adapter.ts` 的 `token_usage` 只读 `prompt_tokens` / `completion_tokens`，
+从不算 `cacheReadTokens`，旧公式恰好等于完整上下文。
+⇒ **受影响的是所有开前缀缓存的 provider**，只有 trae 幸免。
+
+⚠️ **这不只是显示问题**：Codex 判断该不该自动压缩用的就是同一个数
+（`tokens_in_context_window()`）。计量恒定在 0.1%~5% ⇒
+`model_auto_compact_token_limit` **永远不会触发**，真实上下文会一路涨到撞上
+模型硬限直接报错，而不是优雅地压缩。
+
+**Codex 的权威判据**（`agcodex_protocol::protocol::TokenUsage`，与 openai/codex 同源）：
+```rust
+pub fn non_cached_input(&self) -> u64 {
+    self.input_tokens.saturating_sub(self.cached_input())   // ← 它要减，说明 input_tokens 含缓存
+}
+pub fn tokens_in_context_window(&self) -> u64 {
+    self.total_tokens.saturating_sub(self.reasoning_output_tokens.unwrap_or(0))
+}
+```
+
+**修法**：转换抽成**唯一一份** `src/openai-gateway/usage.ts` 的 `toOpenAiUsage()`，
+两端各自的 `usageJson` **只改字段名**（这正是「共享判断只留一份」那条规矩的又一次应用 ——
+本缺陷的成因就是两端各写一份且都写错）。三条实现要点：
+
+1. `inputTokens + cacheReadTokens + cacheWriteTokens` —— 缓存写入同样是这一轮真实发出的输入
+   （Anthropic 的 `cache_creation_input_tokens`），但**不是**「命中」，故不进 `cachedTokens`；
+2. `total` 取 `max(上游报的, 自己拼的)` —— 上游报的数若**不含缓存**（14 个 provider 无法穷举验证）
+   直接采信就会原样重现本缺陷。**只会多算、绝不漏算**，因为漏算的代价是自动压缩永不触发；
+3. Chat 端点补发官方的 `prompt_tokens_details.cached_tokens` /
+   `completion_tokens_details.reasoning_tokens`，**并保留** `prompt_cache_hit_tokens` /
+   顶层 `reasoning_tokens` 这两个私有字段（本仓库多个适配器在**读**它们，删掉会破坏既有消费者）。
+
+⚠️ 回归用例 `tests/unit/openai-gateway-usage.spec.ts`（12 条，含「两端对同一份用量给出
+相同数字」「cachedTokens 是 inputTokens 的子集而非并列项」「上游 total 不含缓存也不得采信」）。
+⚠️ 已做**反向验证**（`mutate-usage.mjs`，7 个变异 **7/7 全被杀死**）：还原缺陷行、
+把 cached 当并列项、漏掉 cacheWrite、直接采信上游 total、只改一个端点、漏发官方明细字段。
+
+⚠️ 这是 `6f352ca`（Chat 出口）与 `c19917a`（Responses 出口）就带着的既有缺陷，
+**不是**第 7、8 轮引入的；只是**接入 Codex 用 Responses 端点之后才暴露** ——
+在那之前没有消费者会这样解读这两个字段。
+
+### ⚠️⚠️ Codex 的 `namespace` / `custom` / `tool_search` 工具**不能报错**（真实报障，2026-10-03）
+
+**用户报障**：Codex App 接本网关后整轮对话直接失败，界面上只有一句
+`tool type namespace is not supported（网关只提供 function 工具）`
+（`toChatTools` 的第一版实现）。
+
+**根因**：Codex 0.142+ 用它私有的 Responses 扩展声明工具 ——
+`{type:'namespace', name:'mcp__files__', tools:[{type:'function', name:'read', …}]}`
+外加 `{type:'custom'}`（自由文法工具，如 `apply_patch`）与 `{type:'tool_search'}`。
+这一批形状在第三方网关上普遍翻车（ollama / llama.cpp / xAI 都有对应 issue）。
+而 **namespace 只是分组容器** —— 里面的 function 完全可以表达给模型。
+
+**修法与理由**（`responses.ts` 的「工具」一节有完整注释）：
+
+| 形状 | 处理 |
+|---|---|
+| `function`（顶层） | 原样转 `ToolSchema` |
+| `namespace` 里的 `function` 子工具 | **摊平成 `<namespace>__<child>`**（含 `defer_loading` 的） |
+| `custom` / `tool_search` / `web_search` / `mcp` … | **丢弃 + `onDrop` 上报**（server 侧记 warning） |
+
+⚠️ **判据是「代价与收益是否对等」**：报错的收益只是「让用户知道某个工具没被转发」，
+代价却是**整个会话不可用**。故「无法表达的工具」一律降级为丢弃 + 记日志，
+**绝不 400**。（这与本仓库「不静默丢弃用户显式设置」并不冲突：那条针对的是
+**语义会变**的标量字段 —— `previous_response_id` / `text.format` / 非 1 的 `top_p`，
+它们一旦被忽略，用户以为生效了的设置会给出**错的结果**。）
+
+⚠️ **必须「摊平 + 还原」成对做，且两侧算法同源**：
+- 摊平名只有一份实现 `flatNamespaceToolName()` = `<namespace>__<child>`，
+  超 64 字符截断 + 8 位 sha256 后缀（纯截断会让长名字碰撞）。
+  命名法与 Codex 自己（PR #29602）及 cc-switch / sub2api 一致。
+- **响应侧必须还原**成 `{name: <child>, namespace: <ns>}`（`output_item.added` /
+  `function_call_arguments.done` / `output_item.done` / `response.completed` 四处都要）：
+  Codex 的工具表按 `(namespace, name)` 索引，只回扁平名它会认为
+  「模型调用了一个不存在的工具」。
+- **历史里的 `function_call` 也要换回扁平名**：否则上游看到「工具以 `ns__child`
+  声明、历史却调了 `child`」，等于调了一个没声明过的工具。
+- `tool_choice: {type:'namespace'}` **降级为 `auto`**（DSH 只认 auto/none；降级后
+  模型仍能从已摊平的工具里挑）。
+- ⚠️ 还原表**不靠跨函数状态传递**：`responsesNamespaceToolMap(request)` 从请求体
+  独立重算（cc-switch 同款思路），比让 server 把 map 一路穿进来更不容易漏。
+
+回归用例（`openai-gateway-responses.spec.ts` 6 条 + server spec 1 条）：namespace 摊平、
+`custom`/`tool_search` 丢弃且上报、`tool_choice` 降级、扁平名确定性（含 80 字符长名
+不碰撞）、历史 `function_call` 换名、非流式与流式两处还原、HTTP 层回 200。
+
+### 明确**报 400** 的字段（不静默忽略）
+
+`previous_response_id`（网关无状态、不存响应，`GET /v1/responses/{id}` 一律 404）、
+`background`、`text.format`（DSH 没有结构化输出通道，**不假装**按 schema 约束）、
+非 1 的 `top_p`（`GenerateOptions` 没有 topP）、`item_reference`、
+`input_image.file_id`。
+**接受但忽略**：`store` / `include` / `prompt_cache_key` / `metadata` / `user` /
+`truncation` / `service_tier` / `safety_identifier` / `parallel_tool_calls`。
+⚠️ 判据是「**语义会不会变**」：会变的必须报错（否则用户以为设置生效了），
+不会变的（无状态转发下本就无处安放）接受即可。
+⚠️ **工具类型不属于这一类**（见上一节）：它要按「代价与收益」判，丢弃 + 记日志。
+
+### 其它必须记住的点
+
+- **连续的 assistant item 必须合并成一条消息**（`toMessages`）：Responses 把「助手说
+  一句话」与「助手发起工具调用」拆成两个 item，照 item 一一映射会让**每个用过工具的
+  会话**都给上游留下两条连续 assistant 消息 —— Anthropic 系适配器要求 user/assistant
+  交替，这类历史会被上游拒绝。
+- **`function_call` 的 item 延迟到第一帧 delta 才打开**：`call_id` / `name` 只出现在
+  delta 里，而 `output_item.added` 必须带上它们，否则客户端配不上 call_id。
+### ⚠️⚠️ 块**可以并行开启**，一个块也只能收尾一次（真实报障，2026-10-04）
+
+**用户报障**：在 Codex 里用本机网关接 CodeBuddy，第一轮就整轮失败：
+
+```
+stream disconnected before completion: buddy: 工具记录不完整，请新建任务
+tool calls and tool results do not match, please start a new conversation and retry
+```
+
+⚠️ 前半句是**网关上游**（buddy）的话，后半句才是 **Codex 自己的判据** —— 别把整句
+当上游错误去查上游；**判据是后半句**，它说的是「工具调用与工具结果对不上」。
+
+**根因不在适配器，在网关的响应侧**（`src/openai-gateway/responses.ts`）。
+早先的实现把 `block-start` 当成「块切换」的信号，收到它就 `closeAll()` 把**还开着的**
+项全部收尾（理由写的是「协议要求项按 `output_index` 顺序闭合」，那个前提是错的）。
+可各适配器的 `block-end` **全部集中在流末尾补发**（见 `buddy-adapter.ts` 的
+`toolOrder` 段：先发全部工具块、再发正文/思考块）。于是：
+
+1. `block-start[0] tool-call` → 开项；
+2. `block-start[1] tool-call` → **把 [0] 提前收尾并从 `open` 删除**（此时 [0] 的参数
+   只有 delta 累积的过程量，`block-end` 的权威覆盖**还没到**）；
+3. 流末尾 `block-end[0]` 到达 → `open` 里找不到它 → **又新建了一个同索引项**。
+
+⇒ 同一次工具调用发出**两个** `function_call`、**共用同一个 `call_id`**，客户端据此
+判定「调用与结果对不上」并终止整轮。会话日志里的铁证（`~/.codex/sessions/` 的 rollout
+jsonl，同一 `call_id` 两个不同 `id`）：
+
+| ordinal | type | id | call_id |
+|---|---|---|---|
+| 13 | function_call | `fc_0b93c794…` | `call_00_KBnaF3NJZEpUhky4QjDE8134` |
+| 14 | function_call | `fc_68918ef8…` | `call_00_KBnaF3NJZEpUhky4QjDE8134` ← **重复** |
+| 15 | function_call | `fc_5aa68279…` | `call_01_btOPnboew8O1tFdmA7st8674` |
+
+同一形态也复制了正文与 reasoning（ordinal 12/17、10/19 逐字相同）。
+⚠️ **不是边角**：只要**并行两个工具调用**就必然触发，而 Codex 默认就爱并行调用。
+
+**修法（两条是一对，缺一条就会重复）**：
+
+| 规则 | 做法 | 少了它会怎样 |
+|---|---|---|
+| 块**可以并行开启** | `block-start` **什么都不做**（不 `closeAll`），只有 `block-end` 收尾；流末尾仍未收尾的才由 `closeAll()` 兜底 | 提前收尾 ⇒ 丢 `block-end` 的权威参数、且真正的 `block-end` 会新建重复项 |
+| 一个块**只能收尾一次** | `closed: Set<number>` 闸门，挡在 `block-end` 与三个 delta 分支上 | 重复的 `block-end` / 已收尾后又来的散帧 ⇒ 又是重复项 |
+
+⚠️ **这两条正是 DSH 权威实现 `BlockAssembler` 的语义**（`packages/llm/llm/src/assembler.ts`）：
+`block-start` 只在**索引首次出现**时登记（`if (!this.partials.has(chunk.index))`），
+`block-end` 是「**first close wins**」（`if (partial.block) return`），
+已收尾块的散帧一律忽略。**改响应侧前先读它** —— 网关只是把这套语义搬到 HTTP 边界上，
+不要自己发明。
+
+⚠️ **`outputOf` 必须按 `outputIndex` 排序**：`output_index` 的语义就是「本项在
+`output` 数组里的下标」，而项落进数组的顺序取决于**收尾顺序**（工具块先收尾、正文块后
+收尾），与模型真实产出顺序相反。不排序时客户端会把助手这一轮读成「先调工具、后说话」。
+⚠️ 这也是**上面那个 bug 的另一半成因**：一开始只观察到「顺序不对」，若当时只加排序，
+重复项依然存在 —— 两者必须一起修。
+
+**反向验证**（`mutate-dup-callid.mjs`，7 个变异全击杀 / 0 存活）：
+
+| 变异 | 变红的用例 |
+|---|---|
+| `block-start` 恢复 `closeAll` | ★ 并行工具调用：每个调用只能有一个 function_call 项 |
+| 去掉流式 `block-end` 的 `closed` 闸门 | 畸形流：重复的 block-end（工具 / 正文两条） |
+| 去掉非流式 `block-end` 的 `closed` 闸门 | 畸形流（非流式）：重复的 block-end 不得变成两个项 |
+| 去掉流式 text/reasoning delta 的闸门 | 畸形流：block-end 之后的正文 delta 不得再开一个新项 |
+| 去掉流式 tool-call delta 的闸门 | 畸形流：block-end 之后又来的 delta 不得再开一个新项 |
+| 去掉非流式 delta 的闸门 | 畸形流（非流式）：block-end 之后的 delta 不得再开一个新项 |
+| 去掉 `outputOf` 的排序 | ★ 并行工具调用（同时锁顺序与唯一性） |
+
+⚠️ **写这套用例时踩到的坑，下次别重犯**：第一版只加了「并行工具调用」一条用例，
+反向验证直接暴露 **2 个存活变异**（`closedDeltaStream` / `closedDeltaNonStream`）——
+「block-end 之后又来的 delta」这类畸形流此前**没有任何用例覆盖**，那两处闸门等于**没被锁住**。
+**判据：每条防御性分支都要有一个专门打破它的变异**，否则「加了防御」只是观感。
+
+⚠️ **端到端证据必须包含阴性对照**：`verify-live-dup-callid.mjs` 对**部署前的网关**
+发一次真实的双工具并行请求，得到 **3 个** `function_call`、`call_00` 重复
+（与用户会话日志逐字同形）；部署修复后同一脚本得到 **2 个**、无重复。
+⚠️ 该脚本**要求真的拿到 ≥ 2 个调用**，只拿到 1 个时它报「本次证据无效」并退出码 2 ——
+因为单调用形态**根本不会触发**这个缺陷，拿它当证据是自证。
+
+- **`block-end` 的块必须能被单独收下**（无 delta 时也要建项）：Chat 端点会整段丢掉它，
+  Responses 端点按块内容补齐一个完整项（用例「只发 block-end 的块不会被丢掉」）。
+- **不发 `data: [DONE]`**：那是 Chat Completions 的收尾约定，Responses 以
+  `response.completed` / `response.failed` 结束。
+- 面板（`openai-gateway-panel.js` 的 `gatewayStatusLines`）在**运行中**时会说明
+  「协议支持：OpenAI Chat Completions 与 OpenAI Responses API」（⚠️ 措辞不得写成
+  「可切换」，两个端点同时都在、没有互斥开关，用例会红）。该段文案在 2026-10-04
+  按用户要求**精简过**（原三句「网关正在运行 / 把外部客户端的… / 地址：…」合并为
+  三行短句：推荐 CC Switch、协议支持、API 请求地址）—— 精简**不减信息**，
+  「两种协议都点名」与「地址带真实端口」两条仍有独立用例锁着。
+- 回归用例：`tests/unit/openai-gateway-responses.spec.ts`（转换 + 流式/非流式事件序列）
+  与 `tests/unit/openai-gateway-server.spec.ts` 的「Responses API 出口」段（HTTP 层）。
+
+### ⚠️⚠️ 工具结果**可以带图**：`textFromContent` 不能用在 tool 结果上（真实报障，2026-10-04）
+
+**用户报障**：在 Codex 里走本机网关接 **TRAE**，一让模型看图就整轮失败：
+
+```
+{"error":{"message":"tool 消息的内容不能包含图片","type":"unsupported_content","code":"unsupported_content"}}
+```
+
+用户当场就问「trae 是可以发送图片的啊？」—— **这个怀疑是对的**：TRAE 确实支持图片，
+而且它**支持工具结果内嵌的图片**（`read_image` 那类）。这句报错**不是 trae 说的**，
+是**本网关自己抛的**（`messages.ts` 的 `textFromContent`）。
+
+**根因**：工具结果（Chat 的 `role:'tool'` / Responses 的 `function_call_output`）
+原先都只走 `textFromContent`，而它对 `image_url` **一律抛错**。于是：
+
+- Codex 的 `view_image` 工具把读到的图**直接放进 `function_call_output.output`**
+  （`[{type:'input_image',image_url:'data:image/png;base64,…'}]`）；
+- 网关解析该 item 时立刻 400 ⇒ **整轮对话失败**；
+- ⚠️ 更糟的是**坏报文已落进会话历史**，之后每次请求原样重放 ——
+  用户连点两次「继续」都是同一个错（实测 ordinal 2748 与 2758 逐字相同）。
+
+**会话证据**（`~/.codex/sessions/2026/10/02/rollout-…-01a0fc83….jsonl`）：
+
+| ordinal | 内容 |
+|---|---|
+| 2736 | `function_call_output`，`call_id=call_7ec7d6b4…`，output = `[{type:'input_image'}]` |
+| 2738 | `function_call_output`，`call_id=call_e1a02c4f…`，output = `[{type:'input_image'}]` |
+| 2748 | `task_complete` ← **`tool 消息的内容不能包含图片`** |
+| 2758 | `task_complete` ← 同一错误（重放历史） |
+
+⚠️ **同一会话里 ordinal 920/921 也有带图的 `view_image` 结果却没失败** ——
+别被它误导。那两轮跑的是 `gpt-6.1-sol`（**没有 `provider/` 前缀**），
+根本没过本网关（`parseModelRoute` 对无前缀的 model 直接抛错，走的是另一条路径）。
+**判据：只有 `provider/model` 形态的请求才会到达本网关**，对照时先看模型名。
+
+**修法**（两条协议路径必须**同时**改，判据只有一份）：
+
+| 位置 | 修法 |
+|---|---|
+| `messages.ts` 的 `role:'tool'` | content 改走 **`partsFromContent`**（与 user 消息同一份图片入站实现） |
+| `responses.ts` 的 `function_call_output` | 新增 `outputParts()`，同样走 `partsFromContent` |
+
+⚠️ **`textFromContent` 的图片分支保留但改文案**：仍会走到它的只剩
+`assistant` / `system`（这两种角色的 content 本就**没有**图片通道，适配器只声明文本
+输出）。**必须继续明确报错**——静默压成空串会让用户以为图发出去了。
+
+⚠️ **适配器侧早已支持，缺陷只在网关**：`trae-adapter.ts` 的 `collectImages` /
+`userContentParts` 会**递归**消费 `tool-result` 的内层图片，并把它挂到 `role:'tool'`
+**之后**的独立 user 消息（`pendingToolImages`）—— 那是上游 `code=4027` 那条真实缺陷的
+修法（见 `tests/unit/trae-adapter.spec.ts` 的「工具结果内嵌图片不得插在 role:tool 之前」）。
+**所以这里不需要动适配器**，网关只要把图正确放进 `tool-result` 的内层即可。
+
+**判据不能只是「不报错」**：图片必须**真的落进 `tool-result` 的内层 content**。
+静默压成文本或丢掉同样是缺陷（用户以为模型看到了图，答案却是凭文本猜的）。
+
+**反向验证**（`mutate-tool-image.mjs`，5 个变异全击杀 / 0 存活）：
+
+| 变异 | 变红的用例 |
+|---|---|
+| Responses 退回 `textFromContent` | ★ 工具结果的 output 带图时…（两条） |
+| Chat 退回 `textFromContent` | ★ role=tool 的内容带图时… |
+| Responses **静默丢弃**图片 | ★ 工具结果的 output 带图时…（两条） |
+| Chat **静默丢弃**图片 | ★ role=tool 的内容带图时… |
+| assistant 带图改为静默丢弃 | assistant 带图仍明确报错 |
+
+⚠️ **「静默丢弃」那两个变异是本次最关键的一条**：只断言「不抛错」的用例会被它们
+放过，必须断言**内层块类型数组**（`['image']` / `['text','image']`）与
+**附件服务 `saveImage` 的调用次数**。
+
+## ⚠⚠️ 腾讯系内容级风控：system 里的客户端模板句会被**整轮拦死**（Issue IKJNA1）
+
+**用户报障**（Gitee issue IKJNA1，2026-10-04）：ZCode 经本机 OpenAI 网关调
+`workbuddy/deepseek-v4.1-flash` 稳定失败，ZCode 侧只显示
+`provider_code=INVALID_REQUEST reason=unknown`；网关侧原始报错是
+
+```text
+workbuddy: 请求被安全策略拦截，请稍后重试或联系支持。 Illegal API invocation from an unapproved channel
+```
+
+DSH 直连同一模型正常 ⇒ 差别只在**外部客户端往 system 里注了什么**。
+
+### 根因（本机 2026-10-05 实测复现，`www.workbuddy.ai` 与 `copilot.tencent.com` **两端点一致**）
+
+腾讯网关按**请求内容指纹**拦截，与账号、凭据、请求头、tools 全无关。最小充分
+触发串是 ZCode 内建的 gitStatus 模板句常量
+（`$Js="Main branch (you will usually use this for PRs)"`，拼在
+`Main branch … : <分支名>` 那一行，每个 git 仓库里的会话必然注入）。
+
+| 探针（`max_tokens=16`，被拦不耗额度） | 结果 |
+|---|---|
+| 中性 system | ✅ 200 |
+| `Main branch (you will usually use this for PRs): master` | ❌ 400 `code:11128` |
+| `Main branch: master`（只留标签） | ✅ 200 |
+| 换分支名（`dev`） | ❌ 400 ⇒ **分支值无关** |
+| 句中 / 段中被别的句子夹住 | ❌ 400 ⇒ **位置无关** |
+| **改写该句**为 `Main branch (PRs usually go here)` | ✅ 200 |
+| 同一句放进 **user** 消息 | ✅ 200 ⇒ **只拦 system** |
+| 同一句放进 **tool** 消息 | ✅ 200 ⇒ 同上 |
+| 指纹在**第二条** system（非 `messages[0]`） | ❌ 400 ⇒ **所有 system 都要改** |
+| 只差一个词（`normally` 替 `usually`） | ✅ 200 ⇒ **逐字符**匹配 |
+| 内层多一个空格 | ✅ 200 ⇒ 同上 |
+| **全小写 / 全大写** | ❌ 400 ⇒ **大小写不敏感** |
+
+⚠️ **本机客户端侧对不上号**：本地装的是 ZCode **3.14.3**，其 asar 里
+`Main branch` / `you will usually use this for PRs` **命中 0 次**（issue 报障用的是
+3.14.4）。取证脚本 `scripts/probe-zcode-gitstatus-fingerprint.mjs`（按字节流找，
+⚠️ **不能用 rg**：asar 是 297MB 单行二进制，rg 的行长上限会静默漏报 ——
+`-o ".{200}Current branch:.{300}"` 返回 0 而 `-c "Current branch"` 返回 1）。
+⇒ 「客户端一定注入这一句」这条来自 issue 报告者的 3.14.4，**服务端那一半已本机实测**。
+
+### 修法：网关出站方向的**表驱动**窄改写
+
+`src/openai-gateway/tencent-fingerprint.ts`，只对 `buddy` / `workbuddy`，
+只改 **system** 消息，三处接入点（**改一处漏两处 = 换一个端点又被拦**）：
+
+| 端点 | 接入点 |
+|---|---|
+| `/v1/chat/completions` | `messages.ts` 的 `convertMessage`（`role==='system'` 分支） |
+| `/v1/responses` | `responses.ts` 的 `toMessages`（input 里的 `system` / `developer`） |
+| `/v1/responses` | `responses.ts` 的 `toResponsesGenerateOptions`（**`instructions`** —— Responses 端唯一的 system 通道，客户端常把整份系统提示词放这里） |
+
+四条实现约束（每条都对应上表一行实测，改动时别把它们「简化」掉）：
+
+1. **只动 system**：`user` / `assistant` / `tool` 一概不碰（改它们没有收益，
+   却会篡改用户原话与工具输出）。
+2. **所有** system 消息都改，不只 `messages[0]`。
+3. **大小写不敏感的精确字面量**（`new RegExp(escapeRegExp(find), 'gi')`）：
+   `i` 是必需的（全小写 / 全大写都被拦），但**不能**泛化成正则/关键词黑名单
+   （只差一个词、多一个空格服务端都放行）。
+4. **不含指纹的文本逐字节不变**：腾讯侧按前缀缓存，无谓地重建字符串会让每轮
+   都算新前缀、白吃缓存命中 ⇒ 实现里有一次 `toLowerCase().includes()` 预检。
+
+⚠️ **表驱动而不是写死一处**：屏蔽名单服务端掌握、可能随时更新，任何客户端将来
+都可能撞上新指纹。新增一条 = 表里加一行 + 一条用例。
+
+### ⚠️⚠️ 千万不要把 `11128` 加进 `isContentRejection`
+
+`buddy-adapter.ts` 的 `isContentRejection`（11140 / `request illegal` /
+`安全审核|safety review`）**维持现状是正确的**。11128 是**内容级**拦截 ——
+同一账号换掉那一句就 200。认成账号级会走
+`markPolicyBlockedAccount` → **30 分钟账号冷却**（`policyBlockResetAtMs`），
+而池里每个账号都会在同一句上被拦 ⇒ 把「一句话被拦」放大成「整个账号池半小时
+不可用」。
+
+⚠️ **实测的 HTTP 400 形态根本走不到那个判据**（400 在适配器里是「非法请求」早退），
+所以这层保护真正生效的地方是**流内**那条通道（HTTP 200 + 无 `choices` 的错误帧，
+`buddy-adapter.ts:1855`）。回归用例按此设计：`buddy-adapter.spec.ts` 的
+「内容级风控（11128）」段，**流内那条才会红**（已做反向验证：把 `11128` 加进
+`isContentRejection` → 该用例红；400 那条不红，别拿它当判据）。
+
+### 端到端实发验证（已通过）
+
+`scripts/verify-workbuddy-gitstatus-e2e.ts`（`npx tsx`）走**插件真实链路**：
+ZCode 形状的 OpenAI 请求体 → `toGenerateOptions`（含改写）→ **真实** `BuddyAdapter`
+（真实 fetch / 凭据 / 产品配置）→ 腾讯线上。对照组是同一份请求体**绕过**网关转换。
+
+```text
+provider = workbuddy   model = deepseek-v4.1-flash
+① 修复前（绕过网关转换，system 原样）
+   ❌ INVALID_REQUEST  Illegal API invocation from an unapproved channel
+② 修复后（走网关转换）
+   ✅ 正文："1+1 等于 2。"  [block-start,reasoning-delta,text-delta,usage,block-end,finish]
+```
+
+`--cn` 换 CodeBuddy 中国版同样通过（`① ❌ / ② ✅`）。
+
+只读探针 `scripts/probe-workbuddy-gitstatus-fingerprint.mjs`（绕开适配器、逐账号发
+同一条对照请求；`--cn` 切 CodeBuddy）可随时重跑复核上表。
+
+回归用例在 `tests/unit/openai-gateway-tencent-fingerprint.spec.ts`（17 条）。
+⚠️ 已做**反向验证**：正则去掉 `i` → 大小写用例红；`instructions` 那处改回原样 →
+Responses 端用例红。
+
+## ⚠️ 思考档位有**两套词汇表**：网关必须翻译，客户端表达不出私有 id（真实报障，2026-10-03）
+
+**用户报障的形态**：在 CC Switch（给 Codex 生成模型目录的那一层）里按 DSH 界面显示的
+名字填「思考等级」，之后 Codex 每一轮都失败 ——
+`400 reasoning effort "max" is not supported by the selected DSH model`。
+用户从两端都看不出为什么，只能一档一档试。
+
+**根因**：各 provider 的档位 `id` 就是**上游 wire 值**，与客户端能表达的词汇不是一套：
+
+| provider | DSH 界面上显示（= adapter 的 `name`） | wire id（网关校验的） | 客户端照填 → 旧行为 |
+|---|---|---|---|
+| LobsterAI | 关闭 / 高 / **Max** | `off` / `high` / **`xhigh`** | `max` → 400 |
+| Cline | None / … / **Extra** | `none` / … / **`max`** | `xhigh` → 400 |
+| TRAE | **Light** / High / **Extra High** | **`light`** / `high` / **`extra_high`** | `low` / `xhigh` → 400 |
+| Raccoon | **开启 / 关闭** | **`on`** / `off` | 恰好能用 |
+
+⚠️ **`id` 与 `name` 不是同一个概念**，仓库里已有两处同款教训：
+`lobsterai-adapter.ts` 的 `reasoningFor`（Issue #IKHCZF：最强档显示成 XHigh，而产品侧
+叫 Max）、`cline-product.ts` 的 `CLINE_REASONING_EFFORTS`（`{id:'max', name:'Extra'}`）。
+DSH 的选择器渲染 `name`、发请求用 `id`；**网关校验的也是 `id`**。
+
+⚠️ **客户端侧是硬约束**：OpenAI 协议只有固定 8 档（`none minimal low medium high xhigh
+max ultra`）。CC Switch 把那 8 个（连英文描述）**硬编码在自己的产物里**
+（`cc-switch.exe` 里可抠出这张表，它写进 `cc-switch-model-catalog.json` 再交给 Codex 的
+`model_catalog_json`），它**表达不出** `light` / `extra_high` / `on` / `off`。
+⇒ 「让客户端来查我们对齐」这条路走不通，**只能网关翻译**。
+
+**实现（强度序的唯一权威：`src/reasoning-ladder.ts`）**：
+
+- `REASONING_EFFORT_RANK` 是强度序的**唯一副本**（`trae-adapter.ts` 挑默认档也读它，
+  不再自带一份表）；`CANONICAL_REASONING_EFFORTS` 就是客户端那 8 个。
+- `translateReasoningEffort` 三条规则：① **精确命中**声明的 id → 原样（私有 id 与
+  上游新冒出来的名字都靠这条通过）；② **登记过**的名字 → 同族就近，**同距取更强的一档**
+  （与 raccoon 那条「宁可多思考，不可静默关掉」同因）；③ 没有同族候选 →
+  `unexpressible`，完全不认识 → `unknown`。
+- `normalizeReasoningEffort`（`messages.ts`）：`unknown` **仍然 400**（拼错不该被静默
+  翻译，且报错里带上该模型可用档位）；`unexpressible` **不下发 + 记 warning**；
+  翻译成功记 **info** —— 这是加了翻译层之后的**正常路径**（CC Switch 给 TRAE 的 `low`
+  每一轮都会被翻译），用 warn 会把日志刷满、反而掩盖真正的异常。
+- ⚠️ **只在同族内翻译**：`off`/`none`（rank 0）与其余各档**互不翻译**。
+  把「少想一点」翻译成「完全不想」= 静默关掉功能，比 400 更糟。
+- ⚠️ **未登记强度的声明 id 不参与就近匹配**（不知道强度就不猜）。
+- `provider === 'codearts'` 的短路保留：该 provider 只有开/关两态，任何名字都等价。
+
+**可查询（三个出口，必须同源）**：
+
+| 出口 | 内容 |
+|---|---|
+| `GET /v1/models` 的 `reasoning` | `efforts`（带 `canonical`）+ `default` + `openai_efforts` |
+| `GET /v1/reasoning-efforts` | 逐模型 + 8 个规范名**逐一的结局**（exact / mapped / unexpressible / ignored） |
+| 设置页弹窗「思考档位对照表」 | 同一份数据（`gatewayEffortRows` 纯函数 + RPC 的 `models[].reasoning`） |
+
+⚠️ **`ignored`（模型没声明档位）与 `unexpressible`（声明了但没有这一族）必须分开报**：
+前者网关什么都没做（按模型默认走），后者是用户明确要的档位没生效。合并会让排查看不出差异。
+
+⚠️ **判据（与工具那条同源）**：拒绝的收益（让用户知道某档没生效）远小于代价
+（整轮不可用，且客户端**没有**能表达私有 id 的写法 ⇒ 用户无从修复）。
+
+⚠️ 反查 `canonicalReasoningEffortFor` **只在单个模型的声明集合内**保证往返自洽
+（`translate(canonicalFor(id), declared) === id`）；把几个渠道的档位混成一个集合再反查
+没有意义 —— 用例里按渠道分别验。
+
+⚠️⚠️ **面板对照表不复用模型清单的行样式**（用户反馈，2026-10-03：「你这对照表字符过长
+都被省略了」）：`dim-jh-modelId` / `dim-jh-modelName` 带 `max-width: 46%` +
+`text-overflow: ellipsis` + `white-space: nowrap`（模型清单要紧凑，那是刻意的），
+而对照表那两行**正是用户要抄走的内容** —— 截断等于让这个功能失效。
+故对照表用自己那套 `dim-jh-effortRow` / `dim-jh-effortHead` / `dim-jh-effortModel` /
+`dim-jh-effortLine`（`overflow-wrap: anywhere`，**不得**出现 `ellipsis` / `nowrap`）。
+`openai-gateway-panel.spec.ts` 的「排版（不截断）」段锁死了这两点（样式不得截断 +
+渲染处不得用 `dim-jh-modelName`）。
+
+### ⚠️ 两处清单都按**供应商折成卡片**（用户要求，2026-10-03）
+
+**用户报障**：「`deepseek-account/deepseek-flash` 和 `deepseek-account/deepseek-v4-pro`
+这是同一家供应商 `deepseek-account` 的，却分为了两个卡片」（当时是**一个模型一行**的平铺）；
+同一条反馈还要求「模型 ID 这里显示各模型名也很乱，希望能像对照表一样改进下」。
+⇒ **模型清单与思考档位对照表都改成一个供应商一张卡片**，卡内子项是它的模型。
+
+判据全在纯函数里（单测环境是 `node`、**react 不在依赖内**，组件渲染不了）：
+
+| 函数 | 作用 |
+|---|---|
+| `groupGatewayEntries(entries, countFold)` | 按 provider 折卡片（模型清单与对照表**共用**，口径不可能漂移） |
+| `groupGatewayModels(models)` | 上面那个的模型清单版本，`counts.fold` = 可发图片条数 |
+| `gatewayProviderOf(entry)` | 取供应商 key：**优先宿主的权威 `provider` 字段**，缺失才按首个 `/` 兜底 |
+| `gatewayModelKeyOf(entry)` | 卡内**短名字**（去掉 `<provider>/` 前缀）；拿不到就退回完整 id |
+| `gatewayCardExpanded(card, {toggled, searching})` | 折叠规则：点过 > 搜索中展开 > 超阈值折叠 |
+| `gatewayCardLabel(provider, labelOf)` | 卡片标题（走 `providerLabel`，查不到退回 key） |
+
+⚠️⚠️ **`provider` / `model` 必须由宿主侧给出，前端不得自己切 `id`**：模型名里**允许带
+斜杠**（实测 `cline/anthropic/claude-sonnet-5.5`），反推在正常数据上恰好也对，但那是**巧合**
+而非契约。故 `toGatewayModelIds` 回传权威拆分，RPC 类型 `RpcGatewayModel` 带上
+`provider` / `model` 两个字段；`openai-gateway-models.spec.ts` 锁死
+`provider + '/' + model === id`（逐字，三种形态）。
+
+⚠️ **卡片头两个数字都必须如实**：总数与第二类计数。对照表的第二类计数是「需对照」
+（`lossy`），模型清单的是「可发图片」—— 故 `GatewayCards` 用 `foldLabel` 参数区分，
+**不能**把「可发图片」写死在组件里（否则对照表会显示「8 个可选档位 · 2 个可发图片」）。
+
+⚠️ **对照表的分组必须发生在「筛出来的行」上**（`groupGatewayEntries(visibleEffortRows…)`），
+不是先分组再筛：否则搜索时卡片头会出现「写着 8 个、卡里只有 1 行」的自相矛盾读数。
+用例里有一条专门用 `expect(source).not.toContain('groupGatewayEntries(effortRows')` 把它锁住。
+
+⚠️ **行内显示短名字，复制出去的永远是完整 ID**：`formatModelIdList(card.entries)` 用的是
+`id` 字段。搞反的症状是「照着卡片复制了一个短名字进客户端 ⇒ 必然 404」。
+卡片头已写明供应商，行内再重复前缀只会把整行挤成省略号。
+
+⚠️ 已做**反向验证**（8 个变异，全部变红）：分组退化成「一个模型一张卡」（= 用户报障原形态）、
+行内改回完整 id、折叠忽略用户点击、搜索时不强制展开、宿主不回传权威拆分、
+对照表分组建在全量行上、复制本组改复制短名字、未知供应商标题给空串。
+
+⚠️ 供应商 key 拿不到时归入 `''` 那张卡（标题「（未标注供应商）」），**不丢行** ——
+少一个 ID 会让用户照着一份不完整的清单去配客户端。也**不去重**：同一 id 出现两次是上游的事，
+去重会掩盖上游缺陷。
+
+⚠️ **对照表的搜索比模型清单多匹配「档位名」**（`matchesEffortQuery` 复用
+`matchesModelQuery` 之后**再补**真实档位名与该填的规范名）：最常用的查法就是
+「哪个渠道有 `xhigh`」「界面上的 Max 到底是哪个 id」—— 后者正是用户踩过的坑。
+**别**为了「统一」把它换成只认 id/name（用例里有一条专门锁这个差异）。
+空搜索词 = 未搜索（原样返回、不复制）这条约定与模型清单共用 `model-filter.js` 的
+`isFilterActive`，不要各写一份。
+
+⚠️ 对照表**只含已开启的模型**（数据来自适配器 `listModels` 的黑名单过滤，
+与对话框模型选择器同源）。文案必须点明「已开启的 N 个模型里…」——
+否则用户看到「14 个」会以为网关只认得 14 个模型（他实际这么反馈过）。
+
+### ⚠️ 网关弹窗第四批：文案再精简 + 搜索移进展开区 + 胶囊不截断（用户要求，2026-10-04）
+
+四条要求**一次提出**（原话）：
+
+> ①「下面的四个按钮，也按 `复制密钥` `显示明文` 的大小来统一。」
+> ② 模型 ID 描述改为 `共开启 14 个可用模型，来自 12 个供应商，ID 区分大小写。`
+> ③ 思考档位对照表描述改为「已开启的 N 个模型里，有 N 个可选思考档位（N 个不同名，标「需对照」）。」
+> ＋「「客户端该填」为 CC Switch 需配置的映射档位，未登记的档位名称将被拒绝。」
+> ④「搜索功能应当在展开后才可用，而不是像现在这样放在外面，模型 ID 的展开清单里也应该加个搜索栏。」
+> ⑤「网关这里面的所有胶囊内容都没有完整显示，应当修正使其完整显示内容。」
+
+**① 按钮尺寸统一 —— 判据是「同一条 CSS 规则」而不是「两处都写了 2px 8px」**
+
+`.dim-jh-btn` 是通用按钮（`padding: 4px 12px` + `line-height: 18px` ⇒ 约 28px 高），
+30+ 处调用点（页头 / 模型面板 / 卡片头 / 对照表），**绝不能直接改它**。
+密钥行那套小号尺寸（`2px 8px` / 11px / 16px / 圆角 6px ⇒ 约 22px）抽成
+**一条合并规则**：
+
+```css
+.dim-jh-gatewayKeyRow .dim-jh-btn,
+.dim-jh-gatewayModal .dim-jh-gatewayActions .dim-jh-btn { padding: 2px 8px; font-size: 11px; line-height: 16px; border-radius: 6px; }
+```
+
+两处操作行挂同一个钩子类 `dim-jh-gatewayActions`（与 `dim-jh-modelPanelActions`
+并存）。⚠️ 用例必须同时锁**样式**与**接线**：只锁样式时「类名忘了挂」照样绿
+（变异「四个按钮的钩子少挂一个」就是为它准备的）；只锁接线时样式被改小/改大也看不出来。
+
+**②③ 文案精简到一句 / 两句 —— 但删掉的信息必须**换位置**，不能丢**
+
+| 删掉的句子 | 移到了哪里 |
+|---|---|
+| 「必须带供应商前缀」 | 卡片头 tooltip：`供应商 key：xxx（模型 ID 的前缀就是它）` |
+| 「行内显示短名，复制出去的始终是完整 ID」 | 复制按钮 tooltip：`每行一个完整 ID` + `disabled: visibleModels.length === 0` |
+| 「关掉的模型不在表里」 | 模型清单那句的「**已开启**」已表达同一约束 |
+
+⚠️ 故「精简」的回归用例**不能只断言「旧句子不在了」**，还要断言新位置仍在
+（`openai-gateway-panel.spec.ts` 里那条「前缀规则与短名差异必须仍在面板里能找到」）。
+否则下次有人「顺手再精简一轮」时，信息是真的消失了，而用例全绿。
+
+⚠️ **对照表说明里的举例（如 `turbo`）被删掉了，但边界照旧**：强度序只登记 12 个名字
+（8 规范名 + 上游私有的 off/light/on/extra_high），未登记的写法**真会 400**。
+用例锁的是「未登记的档位名称将被拒绝」这半句，**不要**因为旧用例里有 `toContain('turbo')`
+就把它加回去（长度预算已收到 85 字）。
+
+⚠️ 写这类「同一句话在正文与注释里各出现一次」的变异时，**锚点必须带行首的 `+ '`**：
+`String.replace` 只替换**第一处**，只写那句话会把**注释**改掉、真正的 UI 文案原样存活
+⇒ 变异假存活。本次实测踩到过（`mutate-gateway-text.mjs` 的「未登记…会被拒绝」那条）。
+
+**④ 搜索移进展开区 —— 两处都要，且收起时必须清空搜索词**
+
+- 两处搜索框都渲染在 `xxxOpen ? React.createElement(React.Fragment, null, …)` **之内**
+  （不是挂在外面常驻占位）；新增了模型清单的搜索（`modelsQuery` / `visibleModels` /
+  `gatewayModelsEmptyHint`），判据复用 `model-filter.js` 的 `filterModels`
+  —— ⚠️ **不能**换成对照表那套 `filterEffortRows`（它还会匹配档位名，「搜 max」
+  会命中一堆没这个功能的模型）。
+- ⚠️ **收起时必须清空搜索词**（`if (modelsOpen) setModelsQuery('')`）：搜索框一收起就
+  不可见，筛子却还在生效 —— 下次展开会莫名其妙少掉一半行，而用户完全无从察觉。
+- ⚠️ 用户说「按 `复制密钥` 的大小统一」时，「复制全部 N 个 ID」的 **N 必须同步改成
+  `visibleModels.length`**：按钮上写着 N、复制出的却是全量，用户会以为搜索没生效。
+  用例要连**插值**一起锁（只锁 `复制全部` 时把 N 改回全量会假绿，实测踩到）。
+- ⚠️ 两处搜索都要给卡片传 `searching`（`{ toggled, searching: … }`），否则命中的行
+  藏在默认折叠的大卡片里 ⇒ 用户以为「搜不到」。
+- ⚠️ 「搜索框在展开区之内」的回归用例必须**锚定展开分支本身**
+  （`/modelsOpen\s*(?:\/\/[^\n]*\n\s*)*\?\s*React\.createElement\(React\.Fragment/`）：
+  只取第一个 `modelsOpen` 是不够的 —— 操作行里的 `'aria-expanded': modelsOpen`
+  也在它前面，那样写会退化成「搜索框在操作行之后」这种弱判据。
+
+**⑤ 胶囊不截断 —— 必须加 `.dim-jh-gatewayModal` 前缀覆盖，且只覆盖该覆盖的**
+
+用户报障的「胶囊」= `.dim-jh-modelId`（行内 ID 块）/ `.dim-jh-modelBadge`
+（「可发图片」「需对照」）/ `.dim-jh-effortModel` / `.dim-jh-gatewayCardToggle`
+（卡片标题）。前三个**天生带截断**（`max-width: 46%` + `ellipsis` + `nowrap`），
+而那是给**模型列表**设计的（一行里还要塞下开关，紧凑是刻意的；见 `model-filter.js`
+的模块注释）。修法：
+
+```css
+.dim-jh-gatewayModal .dim-jh-gatewayModelRow .dim-jh-modelId,
+.dim-jh-gatewayModal .dim-jh-gatewayKeyRow .dim-jh-modelId,
+.dim-jh-gatewayModal .dim-jh-gatewayCardBody .dim-jh-modelId { max-width: none; overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+```
+
+⚠️ **两处例外，刻意保持截断**：
+- 弹窗顶部那行开关说明的胶囊（「打开（在 127.0.0.1 监听，供 Pi / Continue / Cline…）」）
+  —— 它是全弹窗最长的单行文本，不截断会独占两三行；完整信息在「API 请求地址」里已有；
+- 卡片标题**改为换行**而不是去掉截断了事：`.dim-jh-gatewayCardHead` 改成
+  `align-items: flex-start; flex-wrap: wrap`，标题 `overflow-wrap: anywhere`，
+  计数与「复制本组」`flex: 0 0 auto; margin-left: auto` 落到第二行。
+  长供应商名此前被吃成 `deepseek-accou…`，而标题正是用户**唯一**能确认「这一家是谁」的地方。
+
+⚠️⚠️ **不要靠「我把记得的几个类都覆盖了」来收工 —— 要用机械审计**
+（`audit-gateway-pills.mjs`，本地脚本、不入库）：**枚举**网关弹窗渲染区间里用到的
+全部 `dim-jh-*` 类，与样式表里**带截断属性**（`text-overflow: ellipsis` /
+`white-space: nowrap` / `max-width: N%`）的规则求**交集**，交集里每一项必须是
+「有 `.dim-jh-gatewayModal` 覆盖」或「在 EXPECTED 里写明保留理由」，否则退出码非 0。
+当前结果：**39 个类 / 28 个带截断 / 交集 5 个 / 未覆盖且未声明 0 个**。
+
+这次审计**真的抓出两个我漏掉的类**，别删这个脚本：
+- `.dim-jh-btn` —— 它的 `white-space: nowrap` 也在交集里。**它不是内容截断**
+  （防的是按钮内文字折行），但它在窄容器里的真实风险是「按钮被整体推出容器、点不到」，
+  而这两个操作行的文案带**动态计数**（「复制全部 1234 个 ID」）。故给
+  `.dim-jh-gatewayModal .dim-jh-gatewayActions` 加 `flex-wrap: wrap`。
+  ⚠️ 这条**不能**靠「我实测 364px 下没溢出」收工 —— 那是**当前数据（15 个模型）**的结论，
+  换成 1234 个模型就不成立。要按「任意计数都成立」来设计。
+- `.dim-jh-gatewayCardCount` —— 它的 `nowrap` 是**刻意保留**的：它是一行读数，
+  折成两行比占宽更难看；`overflow` 是 visible，真放不下时由卡片头的 `flex-wrap`
+  把它**整块**挪到第二行，而不是切掉文字。
+
+⚠️ **例外条目要在审计脚本里写明依据，且依据必须是实测而非印象**：脚本末尾的 NOTES
+记着三组数字 —— 560px 下 12 个受关注胶囊元素 `scrollWidth - clientWidth` 全为 0；
+320px 下弹窗无横向溢出、操作行子元素右边界均未越出容器；
+长 provider key 让卡片头子元素 top 由 `[367,367,367]` 变 `[367,393,393]`（整块换行）。
+
+### ⚠️⚠️ 上面那套「胶囊不截断」**第一次是没修好的** —— 选择器夹了中间祖先
+
+用户第二次截图框出**三处仍在截断**的地方（我在同一轮里报了「全部修好」，是错的）：
+
+| 位置 | 实际祖先链 | 我第一版的选择器 |
+|---|---|---|
+| 开关行胶囊 | modalBody > modelRow > modelInfo > code.modelId | 要求 .dim-jh-gatewayModelRow ❌ |
+| curl 代码块（模型目录） | modalBody > code.modelId | 要求上面三类之一 ❌ |
+| curl 代码块（档位对照表） | modalBody > code.modelId | 同上 ❌ |
+
+三条规则写成了「弹窗 + **中间祖先** + 类名」，**只覆盖到卡片内**那一处。
+症状与用户看到的一致：`供 Pi / Cont…`、`curl … -H "…"` 被吃掉。
+
+**修法**：覆盖规则只写**两级通配**（弹窗 + 类名），这样对弹窗内该类的**任何**祖先链都生效。
+
+⚠️⚠️ **两条比代码更值钱的教训**：
+
+1. **审计判据必须落到「元素」而不是「类名」**。第一版审计脚本枚举的是
+   「弹窗里用到的**类名**有没有被某条网关规则覆盖」—— modelId 在卡片那条规则里
+   「有覆盖」，于是**整体判通过**，而用户框出的三处一个都没被覆盖。
+   **同一个类名在弹窗里可以有多种祖先链**，「类名出现过」推不出「每个实例都被覆盖」。
+   ⇒ 现在的判据：**覆盖规则必须是两级通配**（"对任意祖先链都生效"的充分条件，
+   可纯静态判定）；「每个实例是否真的完整」交给真实 DOM 逐个量 `scrollWidth`。
+   ⚠️ 同理，**量测也必须逐个元素遍历**，不能按选择器挑着量 ——
+   `measure-gateway-v3.mjs` 第一版的 `watch` 列表里**根本没有 curl 那两条选择器**，
+   于是它一直报「0 个被截断」而用户看到的是被切掉的文本。
+   **改这里的量测时，遍历 `modal.querySelectorAll('.dim-jh-modelId')` 全量，别写白名单。**
+2. **用户说"还是没修好"时，先把"我上次的验证是否真的覆盖了症状"当成第一嫌疑**。
+   我上次的证据（DOM 量 12 个元素、0 截断）本身是**真的**，但它量的元素集合是
+   **我自己挑的** —— 挑漏了用户实际看的那三处。**证据为真 ≠ 覆盖了症状。**
+
+⚠️ **顺带删掉的一条会"骗人"的规则**：原有一条
+`.dim-jh-gatewayModelRow .dim-jh-modelId { max-width: 52% }`
+（把模型列表的 46% 放宽到 52%）。它与两级通配**优先级完全相同 (0,2,0)**，
+于是谁生效**只取决于源码先后**。已删除 —— 保留它就是留一个「靠写在对的位置才不出事」
+的地雷（有人把新规则贴到它后面，截断就回来了）。
+用例里有一条专门堵这个洞：**弹窗内不得再有第二条给 `.dim-jh-modelId` 设上限的规则**。
+
+⚠️ **修截断顺带引入过的第三次退化（渲染截图才发现，务必回归）**：
+去掉胶囊的 `max-width` 后它把开关行整行宽度吃光，而 `.dim-jh-modelName` 是
+`flex: 0 1 auto`（可收缩）⇒ 标题「启用本机网关」被压成「启用本机网」「关」两行。
+修法：`.dim-jh-gatewayModal .dim-jh-modelInfo > .dim-jh-modelName { flex: none; }`
+（**只**钉开关行的标题，用**直接子选择器** —— 卡片行里展示名的收缩是刻意的，
+写成通配会让长展示名横向溢出）。
+
+⚠️ **本仓库的 CSS 解析陷阱（写用例时踩到）**：`jet-hub-styles.js` 整个 CSS 在一条模板串里，
+想按规则遍历**不能**用 `/([^{}]+)\{([^}]*)\}/g` —— 它可以从任意位置起匹配，
+选择器组会跨过前一条规则的 `}` 吃掉前文，selector/body **角色互换**
+（实测解析出 `SEL="A { x: 1 }" BODY="A "`），判据永远不命中 ⇒ **变异假存活**。
+必须按花括号深度**扫描**（见 `openai-gateway-panel.spec.ts` 里的 `rulesOf`），
+并在解析后加一条「解析出的规则数 > 100」的反向自检 —— 否则「没找到违规」可能只是
+「什么都没解析出来」。
+
+⚠️ **反向验证已扩到 30 个变异（全红）**，本轮新增 4 个都是这次返工的直接回归点：
+覆盖规则退回带中间祖先、把 52% 写回通配之后、整条覆盖删掉、开关行标题退回可收缩。
+
+### ⚠️ 网关弹窗第四批（第二轮）：胶囊文案 / 按钮顺序 / 删 curl / **三段分隔**
+
+用户 2026-10-04 的第二轮四条要求（原话）：
+
+> ①「修改『启用本机网关』右边的那个胶囊为『在 127.0.0.1 监听，供客户端调用』。」
+> ②「思考档位对照表里的『展开对照表』与『复制对照表』两个按钮位置互换。」
+> ③「删掉这两段：命令行查看同一份目录/对照表 + 那两条 curl。」
+> ④「这三个红框框起来的不同的功能段，能明显的区分开来，现在的效果就是这三坨字全混在一起有点难看清。」
+
+**① 胶囊只留「在 127.0.0.1 监听，供客户端调用」**：原先列了 Pi / Continue / Cline /
+OpenCode 四个客户端名，窄面板下折成两行，还把「打开/关闭」那个动作词挤到很后面。
+客户端列举属于 README 的内容。⚠️ **动作词没丢** —— 它由开关的 `aria-label`
+（`action + '本机网关'`）承担；用例里有一条专门锁它没被一起删掉。
+
+**② 对照表两个按钮互换**（复制在前、展开在后）：与模型清单那段统一，三段里按钮位置
+可预期。⚠️ 用例锁的是**顺序**（`indexOf(copy) < indexOf(toggle)`），不只是「两个都在」。
+
+**③ 删掉两段 curl**：`gatewayModelsCurl` / `gatewayEffortsCurl` **两个纯函数保留**
+（有独立价值，README 与将来的 CLI 入口可能用），只是不再出现在面板上；
+`jet-hub.js` 里对应的三个 import（连同 `gatewayEndpoint`）一并移除。
+⚠️ 「地址栏直接打开会 401」这句是 curl 段标题的一半，也一并删了 ——
+**但那个事实不能丢**，它由 README 承担（用例里有一条断言 README 仍含 `401`）。
+
+**④ 三段分隔（这是本轮最容易做错的一条）**：
+做法是每段包一个 `.dim-jh-gatewaySection`，段间用
+`border-top` + 更大间距切开，并给后两段加 `.dim-jh-gatewaySectionTitle`（13px/600 深色）。
+
+⚠️⚠️ **三个必须记住的点**：
+
+1. **分隔规则必须写相邻兄弟选择器**（`.dim-jh-gatewaySection + .dim-jh-gatewaySection`）：
+   写成 `.dim-jh-gatewaySection { border-top }` 会给**第一段**也加上边框 ——
+   它紧贴弹窗标题，那条横线看起来像多出来的分隔条。
+2. **段标题不能沿用 `.dim-jh-modalHint` 那套 12px 灰字**：段标题与段内说明同为灰色时，
+   分隔线的效果会被抵消（用户仍然分不清哪一行是标题）。用 13px/600 深色。
+3. **脚注（安全提示）不属于任何一段**，单独一个 `.dim-jh-gatewayFootnote`。
+
+⚠️⚠️ **量测要量「分隔是否真的生效」，不能只看 CSS 里有 border-top**：
+选择器写错（例如 DOM 中间夹了别的兄弟节点）时规则**根本不生效**，而静态检查照样绿。
+`measure-sections.mjs` 在真实 DOM 里读每段的 `getComputedStyle().borderTopWidth`
+与几何位置，并断言「后两段里真的有可见上边框的 = 2/2」。当前实测：
+第 1 段 `border-top = 0px none`，第 2/3 段各 `1px solid` + `padding-top 10px` + 段间距 12px。
+
+⚠️ **mockup 自身会出错，而且会被误读成产品缺陷**（本轮实测踩到）：
+`measure-gateway-v3.html` 少了一个 `</div>`，第 3 段被**嵌进**第 2 段里，
+于是量测报「第 3 段 border-top = 0px」—— 看起来像 CSS 写错了，实际是 mockup 的问题。
+⇒ 加了 `check-mockup-balance.mjs`：按行统计 `<div>` 开闭，要求**最终深度 = 0 且过程中
+最小深度 = 0**，不配平就退出码非 0。**改 mockup 后先跑它，再跑量测。**
+
+⚠️ **改渲染代码后必须重跑变异测试**：本轮因为「整段包进 section（缩进 +2）+ 段分界
+注释改名 + 按钮调序」，一次性**失效了 7 条锚点**，而锚点失配在工具里的表现是
+**「存活」**（像锁失效了，其实是脚本没跟上源码）。已逐条按新缩进修正，
+并把「第 2/3 段」写进分界注释 —— ⚠️ **改动那两处分界注释就必须同步改单测里的锚点**
+（`openai-gateway-panel.spec.ts` 有两处 `indexOf('// ── 第 2 段：模型目录 ──')`）。
+本轮的**新变异**：胶囊退回客户端列举、按钮顺序换回「展开在前」、把 curl 段加回来、
+删掉段间分隔规则、段标题退回灰字。**现共 35 个变异，全红。**
+
+### ⚠️⚠️ 网关弹窗第四批（第三轮）：对照表说明**按行**给出（品牌名被行尾切开）
+
+用户原话：
+> 「『客户端该填』为 CC Switch 需配置的映射档位，未登记的档位名称将被拒绝。」
+> 这句话换行显示吧，现在这样接在上一句后面的话，CC Switch 这个单词会被截断。
+
+**根因不是字符串写错，而是「交给浏览器断行」**：两句原先拼成一整串放进**同一个 `<p>`**，
+浏览器在行尾按**空格**断行 —— `CC` 留在上一行、`Switch` 落到下一行。
+⚠️ 所以 `toContain('CC Switch')` 在**修复前后都成立**（文案字符串一直是完整的），
+**任何基于字符串的断言都测不出这个缺陷**。判据只能是**行结构**。
+
+**修法**（与本报文既有 `gatewayStatusLines` 完全同款，弹窗顶部那三行就是这么给的）：
+- 纯函数改为 `gatewayEffortsHintLines(models)` → **返回字符串数组**（空表时 1 行，正常 2 行）；
+- 渲染层 `gatewayEffortsHintLines(models).map(...)` → **一行一个 `<p>`**；
+- 保留 `gatewayEffortsHint(models)` = `lines.join('')`，只为不动既有断言/README 的一整串口径。
+  ⚠️ **面板渲染绝不能调它** —— 一调就退回「拼成一整段交给浏览器断行」，
+  正是本次缺陷的形态（用例里有 `source).toContain('gatewayEffortsHintLines(models)')`
+  与 `.map(` 两条同时守着这一点）。
+
+⚠️⚠️ **量测这种缺陷时踩到的两个坑（都会让检查「永远绿」）**：
+
+1. **探针选错了元素 → 自证通过**。第一版用
+   `querySelectorAll('.dim-jh-gatewaySection .dim-jh-modalHint').find(p => p.textContent.includes('CC Switch'))`
+   选目标，而**第 1 段顶部那句「推荐使用 CC Switch 进行网关配置。」也含 `CC Switch`** ——
+   `find` 命中的是它，量的是那句短文案（实测 `offsetWidth` 191、行矩形 1 个），
+   于是第 3 段无论怎么排都报「未断开」。⇒ 判据必须**同时**锁「第 3 段」与「客户端该填」。
+2. **块级元素的 `getClientRects()` 只返回外框一个矩形**，不是每行一个 ——
+   用 `p.getClientRects().length` 判「占几行」是错的，会得到恒为 1 的假象。
+   逐行矩形必须对 **Range** 取（`range.selectNodeContents(node)`）。
+
+⚠️ **证明「修好了」必须同时给出修复前后的对照**，且要找到**真的会断开**的形态：
+单点量测（560px）在**修复前后都不断开** —— 那样即使通过也证明不了任何事。
+`measure-brand2.mjs` 的负向对照（`measure-brand-wrap-old.html`，把两句拼回一段）当前实测：
+
+| | 含品牌名那行 | `CC`→`Switch` 的字符 top |
+|---|---|---|
+| 旧版（拼成一整段） | 高 **36px**（2 行） | **562 → 580（跨行）** |
+| 新版（一行一个 `<p>`） | 高 **18px**（1 行） | 584 → 584（同一行） |
+
+这正是用户截图里「CC Switch 被截断」的机制 —— 字符级证据比「看起来好了」可靠。
+
+⚠️ **改动返回值形态必须同步改变异锚点**：`gatewayEffortsHint` 由「拼接字符串」改为
+「行数组」后，`mutate-gateway-text.mjs` 里三条锚点（`+ '…';` → `'…',`）全部失配，
+而失配在工具里的表现是**「存活」**（像锁失效，实为脚本滞后）。已修正，并新增两条变异：
+「两句被拼回一整段」「渲染层把说明行 join 回一整段」。**现共 37 个变异，全红。**
+
+⚠️ 写这种「同一句话在正文与注释里各出现一次」的变异时，**锚点必须带行首引号与行尾逗号**：
+`String.replace` 只替换**第一处**，只写那句话会把**注释**改掉、真正的 UI 文案原样存活
+⇒ 变异假存活。
+
+⚠️ 另外两个本轮踩到的工具坑：
+- 源码是 **CRLF**，锚点按 `\n` 写会全部「未命中」。既不能直接拿 `\n` 锚点匹配，
+  也不能命中后整篇写成 LF（那会让**每一行**都变成「已修改」，diff 被污染成几千行）。
+  做法：把锚点自身转成 CRLF，在**原始文本**上替换，行尾一律不动。
+- 一次性反向验证脚本用完要 `--restore` 还原，并确认 `git diff --stat` 只有预期文件。
+
+⚠️ **回归用例**（`openai-gateway-panel.spec.ts`）锁的是**行结构**而不是关键词：
+`expect(lines).toHaveLength(2)`、`lines[1]` 含完整「「客户端该填」为 CC Switch 需配置的映射档位」、
+`lines.some(l => l.includes('CC Switch'))`、且 `lines` 里不得有单独成行的 `'CC'` 或
+以 `'Switch'` 开头的行。**反向验证过**：退回单行 → `toHaveLength(2)` 变红；
+渲染层 join 回一段 → `.map(` 那条变红。
+
+⚠️ 用例要**同时**锁「网关弹窗内不截断」与「模型列表那份紧凑样式没被顺手改坏」
+（`.dim-jh-modelId` 仍须有 `max-width: 46%` + `ellipsis`、`.dim-jh-modelBadge` 仍须 `flex: none`）
+—— 只锁前者的实现可以简单到「把全局那三条删掉」，那会把 478 条的模型列表撑坏。
+
+⚠️ **写取规则体的 `rule()` 辅助函数时两个坑**（本次都踩到）：
+1. 选择器里的 `.` 必须**全部**转义：`.dim-jh-modelId` 不转义会匹配 `Xdim-jh-modelId`；
+2. 选择器必须锚定**行首或逗号之后**（`(?:^|[,\n])[ \t]*<sel>[ \t]*(?=[,{])[^{}]*\{…\}`）——
+   `jet-hub-styles.js` 的注释里也会提到类名（如「`.dim-jh-modelId` 是 max-width 46%…」），
+   不锚定就会把**注释**当成规则、取到下面那条无关规则体而给出假绿。
+
+⚠️ **`jet-hub-styles.js` 整体是一个 JS 模板字符串，注释里不能出现反引号** ——
+本次差点因此构建失败（新写的 9 处注释里都用了反引号括类名，已全部改成裸写）。
+改完用 `Select-String -Pattern '\`'` 数一下：**全文只应有首尾那 2 个**。
+
+⚠️ 已做**反向验证**（25 个变异，全部变红，见 `mutate-gateway-text.mjs`）：
+两条文案各退旧版、丢「已开启」、丢「大小写」、丢边界句、删「需对照」图例、
+空结果不给提示、两处搜索框各挪出展开区、两处收起不清搜索词、按钮 N 退回全量、
+卡片建在全量模型上、少传一个 `searching`、少挂一个钩子类、胶囊退回截断、标题退回省略号。
+
+**回归用例**：`tests/unit/reasoning-ladder.spec.ts`（强度序 / 三条规则 / 同族约束 /
+反查往返）、`openai-gateway-messages.spec.ts`（翻译 + 通知 + 未知仍 400 + 不下发）、
+`openai-gateway-models.spec.ts`（档位视图 + 容错 + 两处同源）、
+`openai-gateway-server.spec.ts` 的「思考档位」段（HTTP 层实测那三条雷 + 对照表端点）、
+`openai-gateway-panel.spec.ts`（对照表行与文案 / 搜索判据 / 不截断排版 / 按钮尺寸 / 胶囊）。
+
+## ⚠️ Cline 限流：倒计时用**报文里的人类可读时长**，402 不许倒数（真实报障两次，2026-10-03）
+
+**用户报障 ①**：「倒计时结束了我再去连为什么还是失败了，显示要 60 分钟后？」
+**用户报障 ②**（当晚，第一次修完并重启后）：「还是 60 分钟，而且连余额也查询失败了」
+
+### 第二次报障推翻的结论（**这是本节最值钱的一条**）
+
+第一次修复时我**只按文档推断**，在注释里写下「Cline 在 429 上**会给出** `retry-after`
+（官方错误码表 + 它自己客户端的 long-retry-after 分支）」，于是只加了「读响应头」。
+**实测证伪** —— 直连取证（`probe-cline-live.mjs`，2026-10-03 23:10）：
+
+```
+POST https://api.cline.bot/api/v1/chat/completions   model=cline-free/deepseek-v4.1-flash
+→ HTTP 429
+  date: Sat, 03 Oct 2026 15:10:33 GMT
+  no-retry: true                       ← 没有任何 retry-after / x-ratelimit-reset
+  x-request-id: JvXBMYgDCJKhLXnaJOXdzCnouwNjqVlJ
+  {"error":{"code":"INFERENCE_CAP_ERROR",
+    "message":"Error 429: Daily free limit reached on model
+               deepseek/deepseek-v4.1-flash. Try again in 19h 39m"}}
+```
+
+⇒ 真实等待是 **19 小时 39 分**（当日免费额度），而代码读到的是「没有时间」→ 退回
+**1 小时的快照兜底**。用户等满 1 小时再试当然还是 429，而且每失败一次就从当下重算
+一小时 ⇒「永远 60 分钟」可以无限循环。
+
+⚠️ **两条可复用的教训**：
+
+1. **「报文里没有机器可读的时间」≠「报文里没有时间」**。Cline 把时长写在**英文句子**
+   里（`Try again in 19h 39m`）。同类句式还有 `Try again in 5m` / `1h 30m` / `45s`。
+   排查限流务必把**原始报文原文**打出来看，别只看响应头。
+2. **文档推断不能当实测**。上一版的结论来自官方错误码表，方向对（Cline 确实分
+   WAIT/STOP），但**协议细节是错的** —— 这与 qoder「某次实测没看到就推广成不存在」、
+   TRAE「带 code 的回调」是同一类错误。
+
+### 429 有**三种**语义，动作互不相同（都只能靠文案区分）
+
+| 形态 | 判据（报文原文） | 正确动作 | 处理 |
+|---|---|---|---|
+| **当日免费额度** | `Daily free limit reached` + `Try again in 19h 39m` | **等不到头**；改用同一账号的**另一个免费模型** | 标记 = 服务端给的时长；文案只说「按天结算、按模型单独计 + 预计 N 小时后重置 + 可先改用其它免费模型」 |
+| **短时限流** | `Rate limit exceeded` 一类 | 等一会儿 / 换账号 | 标记 = 报文时长 → 头 → 兜底 1 小时 |
+| **402 额度耗尽** | `Insufficient credits` | 去 app.cline.bot 充值 | **不写倒计时**（但仍换号） |
+
+⚠️ **免费额度是「按模型」单独计的**（同一时刻实测，同一个账号）：
+
+| 模型 | 结果 |
+|---|---|
+| `cline-free/deepseek-v4.1-flash` | 429 `Daily free limit reached … Try again in 19h 29m` |
+| `cline-free/mimo-v2.6-flash` | **200** |
+| `cline-free/muse-spark-1.3-contributor` | **200** |
+
+标记也只能落到那一个模型键上（`modelRateLimits[model]`）。
+
+⚠️⚠️ **`cline-pass/*` 不是「有余额就能用」的备用通道** —— 第一版建议写成
+「改用同一账号的 `cline-pass/*` 付费通道（走账号余额）」，**实测证伪**：
+
+```
+POST /api/v1/chat/completions  model=cline-pass/deepseek-v4.1-flash
+→ HTTP 403 {"error":{"code":"ENTITLEMENT_ERROR",
+             "message":"Error 403: the user is not subscribed to required model plan"}}
+```
+
+该账号**有余额**（`/balance` → `balance: 500000`）但**没有订阅计划**
+（`/users/me/plan/usage-limits` → `404 no plan history found for user`）。`cline-pass/*`
+是**订阅**通道 ⇒ 文案里**不许再提它**。教训与本节第 2 条同源：**推荐动作必须实测过**
+（我凭「有余额就走付费」的直觉写了一句话，用户照做只会再撞一次墙）。
+
+### 三处根因（第一次报障的 1~3 + 第二次报障的 4~5）
+
+1. **写死的 60 分钟，且没有 Cline 专属解析**：标记写的是 `Date.now() + 3_600_000`。
+   **证据**：`~/.dsh/jet-hub/state.json` 里 cline 那条是 `…:59.963Z` —— `.963`
+   毫秒正是 `Date.now()+3_600_000` 的指纹（同一文件里 buddy 的 `…:07.000Z`、
+   codearts 的 `16:00:00.000Z` 都是「整」值）。
+2. **402 也被记成倒计时**：官方语义是 `Insufficient credits`，**等多久都不会恢复**。
+3. **被自己的标记挡住时报「请先登录」**：池把被标记的账号筛掉（`account-pool.ts`
+   的 `Date.now() >= resetAt` 过滤）→ `resolveCredential` 回 `undefined` → 适配器抛
+   `cline: no usable credential; log in first`。凭据明明在、账号也登录着，用户却被
+   指去重新登录。这与 buddy 那次（`buddy-ratelimit-misreport.spec.ts` 记着）**同型**：
+   buddy / workbuddy 早已接上 `throwIfAllAccountsRateLimited`，**cline 漏了**。
+4. **只读响应头 ⇒ 实测报文下仍然退回 60 分钟**（见上「第二次报障」）。
+5. **⚠️ 换号预算用尽时，最后失败的那个账号从来没被标记**：原来的写法把标记放在
+   **下一轮的开头**（`for` 里第一件事就是标记「上一轮失败的那个账号」），于是当
+   `round` 用尽而退出循环时，**最后一个**账号永远不会被标记 —— 它下一次又被
+   `getAvailableAccount` 选中，立刻再撞一次同样的墙。本机 cline 只有**一个**账号，
+   这条尤其致命（`getAvailableAccount` 立刻返回 null 就退出，看似「标记了」）。
+   ⇒ 现在 `markLimited()` 在**每次失败后**调用（用 `markedAccountId` 防重复），
+   循环结束后再补一次。
+
+**修法（勿回退）**：
+
+| # | 改什么 | 位置 |
+|---|---|---|
+| 1 | 标记时长取值序：`retry-after` 头（秒数 / HTTP 日期，**0 是合法值**）→ **报文里的 `Try again in 19h 39m`** → 通用绝对时刻句式 → 兜底快照 | `src/cline-rate-limit.ts` 的 `clineRateLimitResetAt` |
+| 2 | `recordsClineRateLimit` **只认 429**（402 不写徽章，但仍换号 —— 「不写徽章 ≠ 不换号」） | 同上 |
+| 3 | cline 的 `resolveCredential` 接上 `throwIfAllAccountsRateLimited(CLINE, modelId)`，且**必须先于**单凭据 ref 兜底 | `src/index.ts` |
+| 4 | 全部账号失败时按「免费额度 / 短时限流 / 402」给**三种不同**建议；**识别出语义就不再复述上游原文**（只在没识别出时附上），文案保持简短 | `clineExhaustedAdvice` |
+| 5 | 每个失败账号（含最后一个）都写标记 | `cline-adapter.ts` 的 `markLimited` |
+
+⚠️ **这三件事收敛在 `src/cline-rate-limit.ts` 一处**（原先 `clineExhaustedAdvice` /
+`recordsClineRateLimit` 在适配器里、解析在别处，改一处必漏另一处）。
+
+⚠️ 时长 token 的正则**必须带尾部 `(?![a-z])`**：`minutes?` 与 `m` 两个分支都能匹配
+`2 minutes` 里的 `m`，少了它会把 2 分钟算成 4 分钟（时长直接翻倍）。
+⚠️ 共享的全局正则**每次用前重置 `lastIndex`**（`matchAll` 会复制 `lastIndex`），
+否则第二次调用的结果随调用次数漂移。
+
+### ⚠️ 报错**文案的长度**也是需求（真实报障第三次，2026-10-03）
+
+用户原话：「可以，cline 显示正常，不过这个报告和其它的供应商比起来是不是太长了？改简短点吧。」
+
+**病根不是话说错，而是同一件事说了两遍**：
+
+```
+cline: 模型 cline-free/deepseek-v4.1-flash 的所有账号均不可用（HTTP 429 Error 429: Daily free
+limit reached on model deepseek/deepseek-v4.1-flash. Try again in 19h 39m）。这是该模型的**当日
+免费额度**已用尽（HTTP 429 Daily free limit reached）—— 免费额度按天结算、且**按模型单独
+计算**，盯着它等不会提前恢复，服务端给出的解禁时刻是 2026/10/4 18:49:21（约 18.7 小时后）。
+要立刻继续，可改用**同一个账号的另一个免费（cline-free/*）模型**，或换其它 provider / 账号
+```
+
+`（…）` 里那段是**上游英文原文**，后面的中文又把它解释了一遍 —— 两者信息完全重叠，
+消息长度因此是其它 provider 的两三倍（对照：`lobsterai` 的
+`模型 X 所有账号均不可用（明细）` ≈ 60 字符、`codearts` 的额度文案 ≈ 100 字符）。
+
+⚠️ 第二个坑：**错误气泡不渲染 markdown**，`**加粗**` 会**原样显示星号**
+（用户截图里就是 `**当日免费额度**`）。错误消息只能写纯文本。
+
+**修法**（`clineExhaustedAdvice`）：
+
+| # | 规矩 | 判据 |
+|---|---|---|
+| 1 | **识别出语义就不再复述原文**（免费额度 / 402 两种都识别得出），只留「是什么 + 何时恢复 + 现在改用什么」 | 单测 `not.toContain('Daily free limit reached')` |
+| 2 | **没识别出语义时仍附原文**（那是唯一排障线索） | 单测 `toContain('Rate limit exceeded')` |
+| 3 | 纯文本，不用 `**` | 单测 `not.toContain('**')` |
+| 4 | 长度上限：单条建议 < 100 字符、最终 `error.message` < 150 字符 | 单测的长度断言（改文案别撑回去） |
+
+改后同一条消息：**135 字符**（原 ≈ 270）。
+
+```
+cline: 模型 cline-free/deepseek-v4.1-flash 的所有账号均不可用 —— 当日免费额度已用尽（HTTP 429），
+预计 19.7 小时后重置（2026/10/4 19:49:20）；额度按天结算、按模型单独计 —— 可先改用其它免费模型
+```
+
+⚠️ **代价**：这条路径的报文**不进请求记录**（`stream()` 在 `consumeWithLog` 之前就抛了），
+所以「原文」不再出现在任何面向用户的地方 —— 排障时按本文件上方那节的思路重跑一次直连探针即可
+（`parseClineRateLimitHint` 只认 `Daily free limit reached` 这个标记，得到的中文结论是可反推的）。
+
+### 余额查询「fetch failed」是**另一回事**（不是本次改动造成的）
+
+面板那次 `余额查询网络失败：fetch failed` 与限流无关，且**不可复现**：`probe-cline-stability.mjs`
+对 `GET /api/v1/users/{id}/balance` 连打 5 次全部 **HTTP 200**（`balance: 500000`）。
+它是插件宿主进程里的一次**瞬时传输失败**（`fetch failed` 是 undici 的连接层 TypeError）。
+⚠️ 关键**反证**：面板的积分/额度走 `ctx.credentials.resolve`，**不经过**
+`resolveCredential`，所以第 3 条那个限流前置检查**碰不到它** —— 别把它算到限流修复头上。
+排查时先直连同一端点看是否健康，再怀疑代码。
+
+⚠️ 顺带实测（同一探针）：`GET /api/v1/users/me/plan/usage-limits` 对该账号回
+**404 `no plan history found for user`** —— 这是「没有订阅计划」的**正常**形态（不是故障），
+「订阅额度」那一行据此显示原因即可。
+
+**回归用例**：`tests/unit/cline-rate-limit.spec.ts`（19 条：实测报文 → 19h39m + 认
+`Daily free limit` / 单位可省略 / 多段累加 / `2 minutes` 不翻倍 / `0s` 合法 / 句末无关数字
+不计数 / 非 JSON 与 `{error:"…"}` 外壳 / 取值优先级四条 / 三种建议话术）、
+`cline-adapter.spec.ts` 的「限流标记」段（8 条：429+头 → 用 600 秒 / 429 无头 → 1 小时快照 /
+HTTP 日期 / **★ 实测报文 → 19h39m，且文案**不含**原文、含「按天结算」「按模型单独计」、
+长度 < 150** / **★ 轮次用尽时最后一个账号也被标记** / 402 不写标记且文案含「充值」 /
+无池账号不写标记）、`tests/unit/retry-after.spec.ts`（10 条）、
+`buddy-ratelimit-misreport.spec.ts` 的「cline 同型缺陷」接线段（4 条）。
+⚠️ 已做**反向验证**：把「报文时长」那条分支短路 → 2 条变红；去掉循环后的补标记 → 2 条变红。
+

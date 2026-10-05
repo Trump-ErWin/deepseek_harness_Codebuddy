@@ -6,6 +6,7 @@ import {
   supportsDailyCheckin,
   supportsOnboardingTasks,
   supportsRateLimit,
+  supportsAccountTest,
   supportsPermanentLock,
   supportsSubscriptionQuota,
   permanentLockCopy,
@@ -25,6 +26,7 @@ import {
   allModelsDisabled,
   disablingLeavesNoEnabledAccount,
 } from './account-model-link.js';
+import { buildCreateAccountPayload, newAccountAsksChannel } from './new-account.js';
 import { bulkButtonState } from './model-bulk.js';
 import {
   copyToClipboard,
@@ -32,9 +34,18 @@ import {
   gatewayApiKeyHint,
   gatewayButtonLabel,
   gatewayButtonTitle,
-  gatewayEndpoint,
-  gatewayModelsCurl,
+  gatewayCardExpanded,
+  gatewayCardLabel,
+  gatewayEffortRows,
+  gatewayEffortsEmptyHint,
+  gatewayEffortsHintLines,
+  gatewayEffortsText,
+  gatewayModelKeyOf,
+  filterEffortRows,
+  gatewayModelsEmptyHint,
   gatewayModelsHint,
+  groupGatewayEntries,
+  groupGatewayModels,
   gatewayStatusLines,
   gatewaySwitchDisabled,
   gatewayToggleNotice,
@@ -61,6 +72,8 @@ import {
   formatCredits,
   formatTokens,
   formatUnits,
+  formatQuotaLine,
+  formatQuotaDetail,
   unitLabel,
 } from './credits-format.js';
 import {
@@ -251,6 +264,18 @@ const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAA
  */
 const OPENCODE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzEyMTYxZCIvPjxwYXRoIGQ9Ik02LjUgOC41IDEwLjUgMTJsLTQgMy41IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBkPSJNMTIuNSAxNmg1IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48L3N2Zz4=';
 
+/**
+ * Gemini Code Assist 面板图标（内联 SVG data URL，手绘）。
+ *
+ * ⚠️ 与 Qoder / LobsterAI / TRAE / OpenCode 同款做法：Gemini 的官方星形
+ * 标志没有可取的小尺寸位图资源，走内联 SVG（体积小、无色差、20×20 下清晰）。
+ * 图形：蓝紫渐变四角星 + 右上小星（官方品牌色的近似，非逐像素复刻）。
+ *
+ * ⚠️ 必须自带图形与底色 —— 容器按 `logoClass: 'gemini'` 给**白底**
+ *（见 `jet-hub-styles.js` 的 `.dim-jh-providerIcon.gemini`）。
+ */
+const GEMINI_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIxIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjNDI4NUY0Ii8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjOUI3MkNCIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDJjLjQgMy45IDIuMSA2LjYgNiA4LTMuOSAxLjQtNS42IDQuMS02IDgtLjQtMy45LTIuMS02LjYtNi04IDMuOS0xLjQgNS42LTQuMSA2LThaIiBmaWxsPSJ1cmwoI2cpIi8+PHBhdGggZD0iTTE5LjUgMTRjLjIgMS43LjkgMi45IDIuNiAzLjUtMS43LjYtMi40IDEuOC0yLjYgMy41LS4yLTEuNy0uOS0yLjktMi42LTMuNSAxLjctLjYgMi40LTEuOCAyLjYtMy41WiIgZmlsbD0idXJsKCNnKSIvPjwvc3ZnPg==';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -273,7 +298,11 @@ const PROVIDERS = Object.freeze([
   { id: 'raccoon', label: 'Raccoon (商汤)', icon: RACCOON_ICON, logoClass: 'raccoon' },
   { id: 'minimax', label: 'MiniMax Code', icon: MINIMAX_ICON, logoClass: 'minimax' },
   /**
-   * ZCode（智谱）—— 第十个 provider。
+   * ZCode（智谱）。
+   *
+   * ⚠️ 注释**刻意不写「第几个 provider」**（Gitee issue IKJLK3 F2）：这种序号型
+   *   注释在增删 provider 时必然失效 —— 原来这里写「第十个」、下面 opencode 那条
+   *   写「第 12 个」，两者都已与实际顺序对不上，却一直没人发现。改用不含序号的表述。
    *
    * ⚠️ 用『ZCode (智谱)』，与 `ZCODE.displayName` 保持一致；长度也刻意
    * 控制在不会触发换行/省略号的范围内（见上面 workbuddy 那条的算式）。
@@ -281,18 +310,37 @@ const PROVIDERS = Object.freeze([
    * ⚠️ 它走**标准两步式登录**（与 codearts / qoder / trae 同型）：
    * 后端立刻返回官方授权 URL（`https://bigmodel.cn/login?appId=zcode…`），
    * 前端弹窗、用户在浏览器授权，后端轮询到 `status: "ready"` 后拿到 token。
-   * 故它**不需要任何特殊分支** —— 与其余 provider 共用同一条
+   * 唯一的例外是**登录渠道要先问一句**（`bigmodel` / `zai`，见 `new-account.js`）——
+   * 这两个渠道的授权页与凭据落点都不同，必须由用户选。
+   * 除那一次选择外，它**不需要任何特殊分支** —— 与其余 provider 共用同一条
    * 「弹窗 + 登录轮询」路径。
    */
   { id: 'zcode', label: 'ZCode (智谱)', icon: ZCODE_ICON, logoClass: 'zcode' },
   /**
-   * OpenCode（第 12 个 provider）。
+   * OpenCode。
    *
    * ⚠️ label 必须与 `OPENCODE.displayName` **逐字一致**（'OpenCode'）：
    * rail 宽度算式与 `tests/unit/opencode-client-panel.spec.ts` 的跨文件
    * 一致性断言都依赖它（raccoon 那条同理，改一处会连锁失败）。
+   *
+   * ⚠️ 它是**唯一不跳浏览器**的 provider：登录走自绘的 API key 弹窗
+   * （`OpencodeKeyModal`），故 `createAccount` 在最前面就改道、**不会**走到
+   * 下面的「弹窗 + 轮询」路径 —— 也因此它**不**经过 zCode 的渠道选择弹窗。
    */
   { id: 'opencode', label: 'OpenCode', icon: OPENCODE_ICON, logoClass: 'opencode' },
+  /**
+   * Gemini Code Assist（Google Cloud Code 免费线，第 14 个 provider）。
+   *
+   * ⚠️ label 必须与 `GEMINI.displayName` **逐字一致**（`src/gemini.ts` 的
+   * `displayName: 'Gemini Code Assist'`）：rail 宽度算式（`.dim-jh-rail` 的
+   * 228px）与跨文件一致性断言都依赖它。这条是本表里**最长**的 label，
+   * 但它仍短于既有的「WorkBuddy (国际版)」（141px 实测），故不会撑破 rail。
+   *
+   * ⚠️ 登录走**浏览器回调式 OAuth**（本地 `127.0.0.1` 起回调服务），
+   * 后端在 `account.create` 里**立即返回 loginUrl** —— 前端与其余 provider
+   * 共用同一条「弹窗 + 登录轮询」路径，无需特殊分支。
+   */
+  { id: 'gemini', label: 'Gemini Code Assist', icon: GEMINI_ICON, logoClass: 'gemini' },
 ]);
 
 /**
@@ -355,6 +403,18 @@ const RESET_HELP = '直接清除本账号的全部「限额重置」标记，不
 const RESET_ALL_HELP = '直接清除本页全部账号（含已停用）的「限额重置」标记，不发送任何请求。';
 
 /**
+ * 「测试」按钮的说明。
+ *
+ * ⚠️ 措辞必须讲清「与重测的区别」：用户会本能地把两者混为一谈，然后以为
+ * 「测试」只是重测的别名。真正的区别是**触发条件**——重测只测已有标记的模型，
+ * 没有标记时一次请求都不发；测试无条件真发一次。
+ */
+const TEST_HELP = '无条件真实发送一条最小消息给这个账号（不依赖是否存在「限额重置」标记），'
+  + '用来确认账号当下到底还能不能用。与「重测」的区别：重测只测「已有标记」的模型，'
+  + '没有标记时一次请求都不发；测试不看标记，直接挑一个模型发出去。'
+  + '只回报结果，不修改任何限流标记。会消耗少量模型额度。';
+
+/**
  * 「显示列表」按钮的说明。
  *
  * 措辞必须讲清两点，否则用户会以为关掉开关就等于删除模型：
@@ -379,6 +439,20 @@ function summarizeProbe(kind, res) {
   if (still > 0) parts.push(`${still} 条仍受限`);
   if (parts.length === 0) parts.push('没有可重测的限流标记');
   return parts.join('，');
+}
+
+/**
+ * 把一次「测试」的响应汇总成一行可读文案。
+ *
+ * ⚠️ 必须与 `summarizeProbe` 分开写：测试的响应里**没有** `accounts` / `clearedCount`
+ * 字段（它不写存储、没有「清除了几条」可报），拿它去喂 `summarizeProbe` 会得到
+ * 「没有可重测的限流标记」——把「测试失败」说成「没什么可测的」，是彻底的误报。
+ */
+function summarizeTest(res) {
+  const model = res?.modelId || '未知模型';
+  if (res?.ok) return `测试通过：${model} 正常返回`;
+  const reason = res?.message || '仍受限';
+  return `测试未通过：${model} — ${reason}`;
 }
 
 /**
@@ -456,6 +530,18 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
   const total = formatUnits(balance.total, unit) ?? '0';
   const activeCount = all.filter(p => p.active).length;
   /**
+   * 配额窗口（Gemini）：主行显示**逐窗口百分比**，不显示均值。
+   *
+   * 用户报障原文：「95 积分；为什么显示的是积分不是额度，计划里应该说了会显示额度」。
+   * 两层错误叠在一起：标签走了 `unitLabel` 的「其余 ⇒ 积分」兜底分支，
+   * 数字走了 `formatCredits` 的两位小数（94.5 ⇒ `94.50`）。而 94.5 本身还是
+   * 两个窗口剩余比例的**平均**——一个上游根本不存在的数。逐窗口列出来
+   * 才是这份读数本来的形状（计划 §3.3：「5 小时窗口 99% / 周窗口 99%」）。
+   *
+   * ⚠️ 非配额单位时 `quotaText` 为 `null`，下面全部走老分支，**零影响**。
+   */
+  const quotaText = formatQuotaLine(all, unit);
+  /**
    * ⚠️ 分类在**渲染的这一刻**用当前时间现算，绝不存进 state、也不缓存到别处：
    * 「临时 / 永久」等于「距扣费截止是否满 N 天」，而宿主长期开着、时间只向前流 ——
    * 一笔距到期 15 天 30 秒的余额，用户什么都不做，半分钟后就越过线。
@@ -474,6 +560,13 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     all.length > 1 ? `共 ${all.length} 个资源包，${activeCount} 个有效` : null,
     ...all.map(pkg => formatPackageLine(pkg, windowDays, now)),
   ].filter(Boolean).join('\n');
+  /**
+   * 配额窗口的明细与主行**都换成百分比口径**。
+   *
+   * ⚠️ 明细绝不能沿用上面的 `formatPackageLine`（`95 / 100` 会被读成
+   * 「95 个积分，一共 100 个」）——见 `formatQuotaDetail` 的注释。
+   */
+  const quotaDetail = quotaText === null ? null : formatQuotaDetail(all);
   /**
    * Loomy / Raccoon 的「当日刷新池」必须**单独显示**（用户明确要求）。
    *
@@ -496,9 +589,11 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     React.createElement('dt', null, label),
     React.createElement('dd', {
       className: 'dim-jh-creditValue',
-      title: detail || undefined,
+      title: quotaDetail ?? (detail || undefined),
     },
-    React.createElement('strong', { className: 'dim-jh-creditTotal' }, total),
+    // ⚠️ 配额窗口显示**逐窗口百分比**而不是均值：均值（94.5）既不是上游给的数，
+    // 在「额度」这个标签下更会被读成 94.5 个积分。见 quotaText 的注释。
+    React.createElement('strong', { className: 'dim-jh-creditTotal' }, quotaText ?? total),
     // 当日池分桶（loomy / raccoon）：`formatPoolSplitLine` 已覆盖原先硬编码的
     // loomy 两池判据，且对 Raccoon 的「每日积分」同样成立（用户 2026-09-29 要求）。
     // ⚠ 数字按**包自身的单位**格式化（remote 的单位支持）：池可能来自
@@ -518,11 +613,18 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
             + '长期 = 其余积分（锁定永久积分后不参与消耗）。',
         }, expiryText)
       : null,
-    !poolSplitText && !expiryText && all.length > 1
+    // ⚠️ 配额单位（Gemini）下**不渲染**这句：它的两个「包」是 5 小时窗口与
+    // 周窗口，不是资源包 —— 说「2/2 个资源包有效」既没信息量又误导
+    // （用户报障原文：「不要渲染 / 2/2 个资源包有效」）。窗口自身的读数
+    // 已由上面的 `quotaText` 逐条列出，这里再补一句纯属噪音。
+    // ⚠️ 非配额单位（真正由多个资源包构成余额的 provider）行为**逐字不变**。
+    quotaText === null && !poolSplitText && !expiryText && all.length > 1
       ? React.createElement('span', { className: 'dim-jh-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
     // 失效额度单独提示：它们仍在服务端响应里，但不计入上面的数字
+    // ⚠️ 配额单位下恒不渲染（`expiredTotal` 就是 0），留着分支只为不改变
+    // 其它 provider 的行为。
     balance.expiredTotal > 0
       ? React.createElement('span', { className: 'dim-jh-creditExpired' },
           `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)
@@ -540,7 +642,7 @@ function isAnonymousAccountId(accountId) {
   return String(accountId || '').indexOf('opencode-anon-') === 0;
 }
 
-function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
+function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onTest, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
   // ⚠️ opencode 专属：传了才渲染「代理」「指纹」两个按钮（见按钮区注释）。
   // 前者额外需要 current 代理串，故签名与 onRetest 略有不同。
   onOpenProxy, onRotateFingerprint }) {
@@ -655,6 +757,18 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
           account.expiresAt
             ? `${formatTime(account.expiresAt) || '未知'}${account.refreshable ? ' · 自动续期' : ''}`
             : '未知')),
+      // 账号规格（目前只有 Gemini 有）：Pro / Free / Ultra。
+      //
+      // ⚠️ 判据是 `extra.accountTier` 有值才渲染 —— 取不到档位（上游改协议、
+      // 网络失败、非 Gemini 的 provider）时**整行不出现**，不显示「未知」也不
+      // 报错：它只是一栏附注信息，不该制造一条无法修复的提示。
+      // `title` 放上游原文（`Google AI Pro（g1-pro-tier）`），面板只放得下一个词。
+      credits?.extra?.accountTier
+        ? React.createElement('div', { className: 'dim-jh-metaRow' },
+            React.createElement('dt', null, '账号规格'),
+            React.createElement('dd', { title: credits.extra.accountTier.title },
+              credits.extra.accountTier.label))
+        : null,
       // 不支持积分余额的 provider 不渲染该行：留着它只能显示「查询失败」，
       // 而失败原因是「这个 provider 根本没有此接口」——与其展示一条无法修复
       // 的错误，不如不展示。
@@ -718,6 +832,25 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         : null,
       // 卡片级「重测 / 重置」同样只对会限流的 provider 有意义
       // （Loomy 不返回限流错误，故这两个按钮对它永远禁用 —— 直接不渲染）。
+      //
+      // ⚠️ 「测试」与上面两个**互不替代**，故用**独立**的 props 存在性开关
+      // （与 `onOpenProxy` 同款约定）：重测只测已有标记的模型、没有标记时零请求；
+      // 测试无条件真发一次。当前 Gemini 恰好只登记了测试、没登记重测 —— 若把
+      // 两者绑在同一个开关上，就会出现「要么都渲染（重测对它无意义）、要么
+      // 都不渲染（测试消失）」的二选一。
+      //
+      // ⚠️ 该行是 `flex-wrap: nowrap`，多一个按钮就可能溢出（见上方礼物图标
+      // 按钮的注释）。故「测试」放在最前，且**只有**在 provider 同时登记了
+      // 测试与重测时才会出现 6 个按钮 —— 当前没有任何 provider 两者皆登记。
+      onTest
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: TEST_HELP,
+            // 不依赖 hasAnyLimit：测试的意义正是「没有标记时也能探活」。
+            disabled: busy,
+            onClick: () => onTest(account.id),
+          }, '测试')
+        : null,
       showRateLimitActions
         ? React.createElement('button', {
             className: 'dim-jh-btn',
@@ -1705,6 +1838,27 @@ function ProviderPanel({ provider, rpcCall }) {
   const [phase, setPhase] = React.useState('loading');
   const [error, setError] = React.useState(null);
   const [creating, setCreating] = React.useState(false);
+  /**
+   * ZCode 登录渠道（仅 `provider === 'zcode'` 时用）。
+   *
+   * ZCode 服务端支持两个 OAuth provider，授权页与凭据落点都不同：
+   * `bigmodel`（智谱开放平台，国内）与 `zai`（z.ai 国际版）。
+   * 缺省 `bigmodel`，与后端 `req.zcodeProvider ?? 'bigmodel'` 对齐。
+   */
+  const [zcodeProvider, setZcodeProvider] = React.useState('bigmodel');
+  /**
+   * ★ 弹窗是否开着（`false` = 关着）。
+   *
+   * 渠道选择搬进弹窗后（用户 2026-10-03），`zcodeProvider` 只在**弹窗打开期间**
+   * 被改动 —— 发起登录那一刻它就是本轮要用的渠道，
+   * 避免了「授权页已开、渠道又被改掉」的不一致。
+   *
+   * ⚠ 这里**不再**承载 `forceNew` —— 「登录其他账号」已按用户 2026-10-02 的
+   *   要求撤销（见同批提交），它现在只回答「弹窗开没开」。
+   * ⚠ 弹窗**只服务 zcode**：本组件是通用面板，其余 provider 的「+ 新建账号」
+   *   直接发起登录（见按钮的 `provider === 'zcode'` 分流与弹窗条件的第二道门）。
+   */
+  const [pendingLogin, setPendingLogin] = React.useState(undefined);
   // 正在进行的限流操作：null | 'one' | 'all'。用于禁用按钮并显示进度。
   const [probeBusy, setProbeBusy] = React.useState(null);
   // 上一次重测/重置的结果文案（成功或失败）。
@@ -1731,6 +1885,8 @@ function ProviderPanel({ provider, rpcCall }) {
    * 没必要让整个登录流程作废。
    */
   const [loginUrlForManual, setLoginUrlForManual] = React.useState(null);
+  /** 兜底登录链接的复制结果：null=未复制，true=已复制，false=复制失败。 */
+  const [loginLinkCopied, setLoginLinkCopied] = React.useState(null);
   /**
    * 出口代理弹窗状态：{ accountId, current } 或 null。
    *
@@ -1769,7 +1925,7 @@ function ProviderPanel({ provider, rpcCall }) {
   /**
    * 登录轮询定时器句柄。
    *
-   * ⚠ **真实缺陷**（2026-10-01，与 `zcode-card.js` 同型）：原实现把句柄存成
+   * ⚠ **真实缺陷**（2026-10-01；同一缺陷也出现在已随 IKJLHQ 移除的官方卡片账号区里）：原实现把句柄存成
    * `createAccount` 的**局部变量**，于是
    * ① `setInterval` 只在「轮询成功」分支里 `clearInterval`，超时用的是另一个
    *    `setTimeout(() => clearInterval(pollTimer), 300000)` —— 组件在这 5 分钟内
@@ -1838,7 +1994,10 @@ function ProviderPanel({ provider, rpcCall }) {
       if (!mounted.current) return;
       const next = {};
       for (const item of res.accounts || []) {
-        next[item.accountId] = { balance: item.balance, error: item.error };
+        // `extra` 是逐账号的**附加读数**（目前只有 Gemini 的账号规格 Pro/Free/
+        // Ultra 走这里）。它跟 `balance`/`error` 并列，必须原样带上 —— 漏掉它
+        // 卡片就永远不显示那一行，而 RPC 那边看不出任何异常。
+        next[item.accountId] = { balance: item.balance, error: item.error, extra: item.extra };
       }
       setCredits(next);
       // 窗口天数随余额一起回来（buddy 系 + TRAE 带）——积分行据此分「临时 / 长期」。
@@ -2015,7 +2174,11 @@ function ProviderPanel({ provider, rpcCall }) {
       const res = await rpcCall('credits.claimAll', { provider });
       const { summary, results } = res;
       const parts = [];
-      if (summary.claimed > 0) parts.push(`${summary.claimed} 个账号领取成功（+${summary.totalCredit} 积分）`);
+      // ⚠ **不带 `totalCredit`**（2026-10-03）：
+    //   `summary.totalCredit` 把不同 provider 的额度**直接相加** —— 而 ZCode 的
+    //   单位是 token、其余是积分，1 亿 token 与 100 积分加成一个数字只会误导。
+    //   真实额度在下方逐账号明细里（已按单位渲染）。
+    if (summary.claimed > 0) parts.push(`${summary.claimed} 个账号领取成功`);
       if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今日已领取`);
       if (summary.inactive > 0) parts.push(`${summary.inactive} 个活动未开启`);
       if (summary.failed > 0) parts.push(`${summary.failed} 个失败`);
@@ -2030,7 +2193,14 @@ function ProviderPanel({ provider, rpcCall }) {
       for (const item of results || []) {
         const outcome = item.outcome || {};
         if (outcome.kind === 'claimed') {
-          details.push(`${item.nickname || item.accountId}：领取成功 +${outcome.credit} 积分`);
+          // ★ 单位感知（2026-10-03）：ZCode 的 credit 是 **token**，不是积分。
+    //   后端 `toClaimOutcome` 现在会带上 `unit: token` 与真实额度
+    //   （实测 100000000），这里用现成的 formatUnits/unitLabel 渲染。
+    const unit = outcome.unit === 'token' ? 'token' : 'credit'
+    details.push(
+      `${item.nickname || item.accountId}：领取成功 `
+      + `+${formatUnits(outcome.credit, unit)} ${unitLabel(unit)}`,
+    )
         } else if (outcome.kind === 'already-claimed') {
           details.push(`${item.nickname || item.accountId}：${outcome.message || '今天已领取'}`);
         } else if (outcome.kind === 'inactive') {
@@ -2060,7 +2230,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 停表 + 收尾：清掉轮询句柄，并在**组件仍挂载**时释放 busy。
    *
    * 所有结束路径（成功 / 超时 / 卸载）都必须走这里，否则 busy 会永久卡住或
-   * 句柄泄漏（与 `zcode-card.js` 的 `stopPoll` 同语义）。
+   * 句柄泄漏（这条规则对已随 IKJLHQ 移除的官方卡片账号区同样成立）。
    */
   const stopPoll = () => {
     if (pollRef.current !== 0) { clearInterval(pollRef.current); pollRef.current = 0; }
@@ -2113,10 +2283,19 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   const createAccount = async () => {
-    // ⚠ 已有一轮登录在跑时直接忽略（真实缺陷）：`creating` 在返回 loginUrl 后
+    // ⚠ 已有一轮登录在跑时**必须拦住**（真实缺陷）：`creating` 在返回 loginUrl 后
     // 会被 `finally` 无条件释放，按钮随即恢复可点，再点一次会叠加第二个轮询 +
     // 宿主再插一条占位账号。以轮询句柄作为重入闸门，比 UI 的 disabled 更可靠。
-    if (pollRef.current !== 0) return;
+    //
+    // ⚠⚠ 但拦住之后**不能静默 return**（Gitee issue IKJLK3 B）：弹窗的确定按钮是
+    //   「先关弹窗、再调 createAccount」，早退时用户看到的是「点了没反应」，
+    //   分不清「没反应」与「正在处理」—— 这正是 issue 里那条
+    //   「新建账号弹窗卡死、只能重启 dsh」报障的观感来源。
+    //   本面板没有独立的 create 提示位，复用 probeNotice 区块渲染。
+    if (pollRef.current !== 0) {
+      setProbeNotice({ tone: 'warn', text: '上一次登录仍在进行中，请先完成或等待它结束。', details: [] })
+      return
+    }
     // ⚠️ opencode 的登录**不跳浏览器**，而是开自绘弹窗粘贴 API key；
     // 走 `setKeyModal` 而不是下面的 `account.create` 流程。
     // 弹窗里另有两个入口：粘贴 key（submitOpencodeKey）与添加匿名通道（submitAnonymous）。
@@ -2129,15 +2308,23 @@ function ProviderPanel({ provider, rpcCall }) {
     let accountId = '';
     let loginUrl = '';
     try {
-      console.log('[jet-hub] account.create request, provider =', provider);
-      const res = await rpcCall('account.create', { provider });
-      console.log('[jet-hub] account.create response =', res);
+      // ⚠⚠ **不许打印完整响应**（信息泄露，Gitee issue IKJLK3 D）：
+      //   `res` 含 `loginUrl`，而它由服务端的 `fetchAuthState` 生成、**携带 OAuth state**。
+      //   用户在 DevTools 里截图 / 复制日志求助时会把它一起外泄，state 在登录窗口内
+      //   可被重放。⇒ 这里只记 provider 与本地生成的 `accountId`（不是凭据）。
+      //
+      // ⚠ `zcodeProvider` 只在 zcode 时下发（`buildCreateAccountPayload` 内部分支），
+      //   其余 provider 的载荷与接入渠道弹窗前**逐字节相同**。
+      const res = await rpcCall('account.create', buildCreateAccountPayload(provider, zcodeProvider));
       accountId = res.accountId;
       loginUrl = res.loginUrl;
-      // ⚠ **`reused` 分支必判**（与 `zcode-card.js` 一致）：本机已有可用凭据时
-      // 后端**不新建条目、不返回 loginUrl**（用户报障「点了添加就多一个」的修复），
-      // 返回的是 `{reused:true, loginUrl:''}`。若只看 `loginUrl` 为空就报
+      console.log('[jet-hub] account.create ok, provider =', provider, ', accountId =', accountId);
+      // ⚠ **`reused` 分支必判**：后端若声明「复用了池里已有条目、新建条目与登录 URL」，
+      // 它返回的是 `{reused:true, loginUrl:''}`。若只看 `loginUrl` 为空就报
       // 「后端未返回登录地址」，会把一次成功操作显示成失败。
+      // ⚠️ **2026-10-05 起 ZCode 不再产生它**（「不读本机 ZCode 数据」的决策删掉了
+      // 那条复用短路），但本分支**刻意保留**：它是**契约防御** —— 判据写成
+      // 「后端声明复用则空 URL 是正常的」，比反过来假设「空串必是错误」更稳。
       if (res.reused) {
         setLoginUrlForManual(null);
         await loadAccounts();
@@ -2173,13 +2360,14 @@ function ProviderPanel({ provider, rpcCall }) {
           // 这里**不**调 setError：本函数运行时 phase 是 'ready'，错误文案只在
           // 'error' 阶段渲染，设了也看不见；提示由下面的 loginUrlForManual 区块负责。
           setLoginUrlForManual(loginUrl);
+          setLoginLinkCopied(null);
         }
         // 轮询等待登录完成。
         // ⚠ 超时**不用**另起的 `setTimeout`，而是记 deadline 在轮询里判：这样全场只有
         //   一个句柄（pollRef），卸载清理与超时都不会漏掉第二个定时器。
-        // ⚠ `reused` 分支必判（与 `zcode-card.js` 一致）：本机已有可用凭据时后端
+        // ⚠ `reused` 分支必判（同上，`account.create` 契约）：后端声明复用时
         //   **不新建条目、不返回 loginUrl**；只看 `loginUrl` 为空就报错会把一次
-        //   成功操作显示成失败（后端 `account.create` 返回 `{reused:true, loginUrl:''}`）。
+        //   成功操作显示成失败。ZCode 已不再产生该值，但判据保留作契约防御。
         const deadline = Date.now() + 300000;
         pollRef.current = setInterval(async () => {
           if (!mounted.current) { stopPoll(); return; }
@@ -2463,6 +2651,40 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 「测试」：**无条件**真发一次请求（不依赖是否存在限流标记）。
+   *
+   * ⚠️ 刻意**不**复用 `runLimitAction`：那条路径的文案汇总（`summarizeProbe`）
+   * 读的是 `res.accounts` / `res.clearedCount`，而 `account.test` 返回的是
+   * 扁平的 `{ modelId, ok, message }` —— 复用会得到「没有可重测的限流标记」，
+   * 把「测试失败」误报成「没什么可测的」。
+   *
+   * 复用 `probeBusy` 状态（置 `'one'`）：它同时驱动卡片的 `busy` 与按钮禁用，
+   * 测试期间不该允许并发点其它按钮。
+   */
+  const runTestAction = async (accountId) => {
+    setProbeBusy('one');
+    setProbeNotice(null);
+    try {
+      const res = await rpcCall('account.test', { accountId });
+      if (!mounted.current) return;
+      const text = summarizeTest(res);
+      // 仍受限/无法确认时把原始原因也列出来，否则用户只看到「未通过」会以为按钮失灵。
+      const details = res && res.ok === false && res.message
+        ? [`${res.nickname || res.accountId} · ${res.modelId || '未知模型'}：${res.message}`]
+        : [];
+      setProbeNotice({ tone: res?.ok ? 'ok' : 'warn', text, details });
+      // 测试不写存储，故无需 loadAccounts() —— 但刷新一次无害且能顺带更新凭据有效期。
+      await loadAccounts();
+    } catch (caught) {
+      console.error('[jet-hub] account test failed:', caught);
+      if (!mounted.current) return;
+      setProbeNotice({ tone: 'error', text: `测试失败：${caught?.message || '未知错误'}`, details: [] });
+    } finally {
+      if (mounted.current) setProbeBusy(null);
+    }
+  };
+
   return React.createElement('section', { 'aria-label': `${provider} 账号管理` },
     // 标题与按钮分开成两块（而不是同一行的 space-between）：操作按钮多达 5 个，
     // 与面板标题挤在一行时既会被压缩又会溢出。标题独占一行、按钮组另起一行
@@ -2539,13 +2761,79 @@ function ProviderPanel({ provider, rpcCall }) {
               ? '处理中…'
               : (permanentLocked ? '解锁永久积分' : '锁定永久积分'))
           : null,
+        // ⚠️ 渠道弹窗**只服务 ZCode**：非 zcode 直接发起登录，与「搬进弹窗」
+        //   之前逐字等价。上游 15ccae5 把渠道选择搬进弹窗时丢了这层门控，
+        //   于是全部 14 个 provider 点「+ 新建账号」都弹出一个「添加 ZCode 账号」。
         React.createElement('button', {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
           title: '通过浏览器登录一个新的账号并加入账号池。',
-          onClick: () => void createAccount(),
+          // ⚠⚠ **必须按 provider 分支**（真实缺陷，Gitee issue IKJLK3 A1/A2/A3）：
+          //   这个按钮在**每一个** provider 的面板里都有，而下面的弹窗是
+          //   **zCode 专用**的（登录渠道下拉）。原先无条件 `setPendingLogin(false)`，
+          //   于是「在 CodeArts 面板点新建账号」弹出的也是「添加 ZCode 账号」，
+          //   里面的下拉还不会下发（载荷里没有 `zcodeProvider`），
+          //   opencode 则要用户先过一遍 ZCode 弹窗才看到自己的 API key 表单。
+          //   ⇒ 判据收在 `newAccountAsksChannel()`：只有 zcode 先问渠道，
+          //   其余 provider 点按钮即发起登录。**别把它改回无条件开弹窗。**
+          onClick: () => {
+            if (newAccountAsksChannel(provider)) setPendingLogin(false)
+            else void createAccount()
+          },
           disabled: creating,
-        }, creating ? '正在登录…' : '+ 新建账号'))),
+        }, creating ? '正在登录…' : '+ 新建账号'),
+        // ★ 渠道选择对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
+        //
+        // ⚠ `newAccountAsksChannel(provider)` 这道是**防御性**的：按钮已经分支过，
+        //   正常路径下非 zcode 永远不会把 `pendingLogin` 置为「开」。
+        //   但状态是活的（用户切 provider 时本面板会重新挂载，理论上仍可能
+        //   残留一帧），漏掉它就会退回 issue 里那个「非 zcode 弹出 ZCode 窗」的形态。
+        //
+        // ⚠ 类名 `dim-jh-zcDialog*` 名字里带 zc，但它**已是通用弹窗样式**
+        //   （见 `jet-hub-styles.js`），**不是** zCode 专用标记。
+        //   曾想改名，但样式表一起动、收益仅是可读性，故保留名字。
+        //
+        // ⚠ 本弹窗原先有**两个入口**（这里与官方模型卡片里的 ZCode 账号区）；后者
+        //   已随 Gitee issue IKJLHQ 整体移除（它占用的 provider-card 槽 key 与第三方
+        //   pi-ai 扩展互斥，机制见 index.js 文件头）—— 现在只剩本处一个入口。
+        pendingLogin === undefined || !newAccountAsksChannel(provider) ? null : React.createElement(
+          'div',
+            {
+              className: 'dim-jh-zcDialogMask',
+              onClick: () => setPendingLogin(undefined),
+            },
+            React.createElement('div', {
+              className: 'dim-jh-zcDialog',
+              onClick: (event) => event.stopPropagation(),
+            },
+              React.createElement('h3', { className: 'dim-jh-zcDialogTitle' },
+                '添加 ZCode 账号'),
+              React.createElement('p', { className: 'dim-jh-zcDialogHint' },
+                '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，',
+                '可用 z.ai（国际）登录另一个账号。'),
+              React.createElement('label', { className: 'dim-jh-zcProvider' },
+                '登录渠道',
+                React.createElement('select', {
+                  className: 'dim-jh-zcSelect',
+                  value: zcodeProvider,
+                  onChange: (event) => setZcodeProvider(event.target.value),
+                },
+                  React.createElement('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
+                  React.createElement('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）'))),
+              React.createElement('div', { className: 'dim-jh-zcDialogActions' },
+                React.createElement('button', {
+                  className: 'dim-jh-btn',
+                  onClick: () => setPendingLogin(undefined),
+                }, '取消'),
+                React.createElement('button', {
+                  className: 'dim-jh-btn',
+                  'data-kind': 'primary',
+                  onClick: () => {
+                    setPendingLogin(undefined)
+                    void createAccount()
+                  },
+                }, '确定并打开认证页'))),
+        )),
     probeNotice
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
@@ -2593,7 +2881,8 @@ function ProviderPanel({ provider, rpcCall }) {
                 React.createElement('li', { key: index }, line)))
           : null)
       : null,
-    // 弹窗被拦截：给出可点击的登录链接。不劫持当前页面（见 createAccount 的说明）。
+    // 弹窗被拦截：给出可点击的登录链接 + 复制按钮。不劫持当前页面（见 createAccount 的说明）。
+    // 链接 300+ 字符，用户此刻唯一动作就是复制到别处；手工框选漏一个字符会得到「授权失败」假象。
     loginUrlForManual
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
@@ -2601,12 +2890,24 @@ function ProviderPanel({ provider, rpcCall }) {
           role: 'alert',
         },
         React.createElement('div', null, '登录窗口被浏览器拦截，请手动打开下方链接完成登录：'),
-        React.createElement('a', {
-          className: 'dim-jh-loginLink',
-          href: loginUrlForManual,
-          target: '_blank',
-          rel: 'noopener noreferrer',
-        }, loginUrlForManual))
+        React.createElement('div', {
+          className: 'dim-jh-loginLinkRow',
+          'data-copy-state': loginLinkCopied === false ? 'failed' : 'idle',
+        },
+          React.createElement('a', {
+            className: 'dim-jh-loginLink',
+            href: loginUrlForManual,
+            target: '_blank',
+            rel: 'noopener noreferrer',
+          }, loginUrlForManual),
+          // type='button' 必须有：按钮若落在表单里，默认 submit 会连带提交表单。
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            type: 'button',
+            title: loginLinkCopied === false ? '复制失败：请手动选中链接后按 Ctrl+C' : '复制授权链接',
+            onClick: async () => setLoginLinkCopied(await copyToClipboard(loginUrlForManual)),
+          }, loginLinkCopied === true ? '已复制 ✓'
+            : loginLinkCopied === false ? '复制失败，请手动选中' : '复制链接')))
       : null,
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')
@@ -2635,7 +2936,7 @@ function ProviderPanel({ provider, rpcCall }) {
                 ? React.createElement('p', { className: 'dim-jh-hint' },
                     '免费模型在所有通道间自动轮换，收费模型仅「API key 账号」可用。'
                     + '匿名通道无需 key，可添加多条、各自配代理；'
-                    + '注意额度按**出口 IP** 计算 —— 多条通道共用一个出口不会增加额度，'
+                    + '注意额度按「出口 IP」计算 —— 多条通道共用一个出口不会增加额度，'
                     + '分别配不同代理才会各自获得独立额度。')
                 : null,
               // 排序提示：顺序会真实影响自动选号，必须让用户知道，否则
@@ -2676,6 +2977,13 @@ function ProviderPanel({ provider, rpcCall }) {
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),
                 onReset: (id) => void runLimitAction('reset', id),
+                // ⚠️ 「测试」用**独立**的能力位（`supportsAccountTest`）与独立的
+                // props 存在性开关，不能挂在 `showRateLimitActions` 上：Gemini
+                // 恰好只登记了测试、没登记重测（它的限流是配额窗口制，重测无意义），
+                // 绑一起就会二选一地消失一个按钮。
+                onTest: supportsAccountTest(provider)
+                  ? (id) => void runTestAction(id)
+                  : undefined,
                 // ⚠️ 仅 opencode：这两个回调只在该 provider 下传，
                 // AccountCard 靠「props 存在性」决定是否渲染按钮。
                 ...(provider === 'opencode'
@@ -2742,7 +3050,7 @@ function ProviderPanel({ provider, rpcCall }) {
           onSubmitAnonymous: () => void submitAnonymous(),
           onClose: () => setKeyModal(null),
         })
-      : null);
+      : null));
 }
 
 /**
@@ -3232,6 +3540,121 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
 }
 
 /**
+ * 网关清单里的一行模型（**只读**，没有开关）。
+ *
+ * ⚠️ 与模型列表的 `ModelToggle` 不同，这里**刻意不用 `<label>`**：网关弹窗只做
+ * 「把 ID 抄走」这一件事，行内没有任何控件；用 label 会让整行带上「可点」的错觉
+ * （模型列表那边踩过「双 checkbox 让点文字变成勾选」的同型坑，见 `model-filter.js`）。
+ *
+ * ⚠️ 行内只显示**去掉供应商前缀**的模型名（`gatewayModelKeyOf`），完整 ID 放在
+ * tooltip 与「复制」里。理由：实测 `codearts/deepseek-v4.1-flash` 这类 id 占满整行，
+ * 在 id 单元格 `max-width: 46%` 的夹取下跌成 `codearts/deepse…`，模型名反而读不出来；
+ * 而卡片标题已经把供应商写清楚了，前缀是纯重复。
+ */
+function GatewayModelRow({ model }) {
+  // 「可发图片」只标在支持的那个上 —— 用户据此挑模型，而不是靠撞一次
+  // unsupported_content 才知道。数据来自宿主，与 /v1/models 同源。
+  const badge = modelCapabilityBadge(model);
+  return React.createElement('div', {
+    className: 'dim-jh-gatewayModelRow',
+    // tooltip = 完整 ID（可直接选中复制）+ 展示名，截图/复制时信息不丢。
+    title: `${model.id}\n${model.name || ''}`.trim(),
+  },
+    React.createElement('code', { className: 'dim-jh-modelId' }, gatewayModelKeyOf(model)),
+    React.createElement('span', { className: 'dim-jh-modelName' }, model.name || model.id),
+    badge
+      ? React.createElement('span', { className: 'dim-jh-modelBadge', title: '该模型接受图片输入。' }, badge)
+      : null);
+}
+
+/**
+ * 思考档位对照表里的一行（**只读**）。
+ *
+ * ⚠️ 与模型清单的行分开写：这里要显示「真实档位 / 客户端该填」两列，
+ * 而正文允许换行（用户反馈过「字符过长被省略」，见下面的类注释），
+ * 与模型行「单行 + 省略号」的排版目标完全不同。
+ */
+function GatewayEffortRow({ row }) {
+  return React.createElement('div', {
+    className: 'dim-jh-effortRow',
+    title: `${row.id}\n真实档位：${row.declared}\n客户端该填：${row.fill}`,
+  },
+    React.createElement('div', { className: 'dim-jh-effortHead' },
+      // 卡片头已写明供应商，行内显示去掉前缀的名字；完整 id 在 tooltip 与复制里。
+      React.createElement('code', { className: 'dim-jh-effortModel' }, gatewayModelKeyOf(row)),
+      row.lossy
+        ? React.createElement('span', {
+          className: 'dim-jh-modelBadge',
+          title: '该模型的档位名与 OpenAI 客户端不同名：照 DSH 界面上的名字填，网关会按强度就近翻译。',
+        }, '需对照')
+        : null),
+    React.createElement('div', { className: 'dim-jh-effortLine' },
+      React.createElement('span', { className: 'dim-jh-effortLabel' }, '真实档位：'),
+      row.declared),
+    React.createElement('div', { className: 'dim-jh-effortLine' },
+      React.createElement('span', { className: 'dim-jh-effortLabel' }, '客户端该填：'),
+      row.fill));
+}
+
+/**
+ * 把一批条目按供应商渲染成**卡片**（模型清单与档位对照表共用）。
+ *
+ * ⚠️ **共用**是刻意的：两处的分组口径（`groupGatewayEntries`）、折叠规则
+ * （`gatewayCardExpanded`）、卡片头（标题 + 条数 + 「复制本组」）理应完全一致 ——
+ * 用户看到的是同一种「一家供应商一张卡」的形态，各写一套迟早一处改了另一处没改。
+ *
+ * @param {object} props
+ * @param {Array<object>} props.cards `groupGatewayEntries` 的产物
+ * @param {(row: object) => object} props.renderRow 行渲染函数
+ * @param {(provider: string) => boolean} props.isExpanded 该卡片此刻是否展开
+ * @param {(provider: string) => void} props.onToggle 折叠开关
+ * @param {(card: object) => void} props.onCopy 复制该卡片（部分）
+ * @param {(provider: string) => boolean} props.isCopied 该卡片是否刚复制成功
+ * @param {string} props.foldSuffix 条数单位，如「个模型」
+ * @param {string} props.foldLabel `counts.fold` 的含义，如「可发图片」「需对照」；
+ *   为空串表示这一批条目没有第二类计数（不显示那段）。
+ * @param {string} props.copyNoun 复制按钮 tooltip 里的量词，如「个完整模型 ID」
+ */
+function GatewayCards({ cards, renderRow, isExpanded, onToggle, onCopy, isCopied, foldSuffix, foldLabel, copyNoun }) {
+  return React.createElement('div', { className: 'dim-jh-gatewayCards', style: { marginTop: '6px' } },
+    cards.map(card => {
+      const expanded = isExpanded(card.provider);
+      const label = gatewayCardLabel(card.provider, providerLabel);
+      return React.createElement('div', {
+        // ⚠️ 供应商 key 拿不到时用 `__unknown__`：`key: ''` 会让 React 报警并可能丢行。
+        key: card.provider === '' ? '__unknown__' : card.provider,
+        className: 'dim-jh-gatewayCard',
+      },
+        React.createElement('div', { className: 'dim-jh-gatewayCardHead' },
+          React.createElement('button', {
+            className: 'dim-jh-gatewayCardToggle',
+            'aria-expanded': expanded ? 'true' : 'false',
+            // tooltip 里给出**原始 provider key**：卡片标题是展示名，
+            // 而用户要复制进配置的是 ID 里的那个 key，两者可能不同。
+            title: card.provider === ''
+              ? '这些条目没有回传供应商字段（上游数据异常），仍照实列出。'
+              : `供应商 key：${card.provider}（模型 ID 的前缀就是它）`,
+            onClick: () => onToggle(card.provider),
+          }, `${expanded ? '▾' : '▸'} ${label}`),
+          React.createElement('span', { className: 'dim-jh-gatewayCardCount' },
+            card.counts.fold > 0 && foldLabel !== ''
+              ? `${card.counts.total} ${foldSuffix} · ${card.counts.fold} 个${foldLabel}`
+              : `${card.counts.total} ${foldSuffix}`),
+          React.createElement('button', {
+            className: 'dim-jh-btn dim-jh-gatewayCardBtn',
+            title: `只复制「${label}」这一家的 ${card.counts.total} ${copyNoun}（每行一个完整 ID）。`,
+            onClick: () => onCopy(card),
+          }, isCopied(card.provider) ? '已复制 ✓' : '复制本组')),
+        expanded
+          ? React.createElement('div', { className: 'dim-jh-gatewayCardBody' },
+            card.entries.map((entry, index) => React.createElement(
+              // ⚠️ 同一 id 重复出现时 key 会撞（上游缺陷），补下标保证 React 不丢行。
+              React.Fragment, { key: `${card.provider}#${entry.id}#${index}` }, renderRow(entry))))
+          : null);
+    }));
+}
+
+/**
  * 「本机 OpenAI 网关」弹窗。
  *
  * 展示三件用户配外部客户端时真正需要的信息：**开关**、**对外地址**、**密钥在哪**。
@@ -3248,13 +3671,71 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
   const [copied, setCopied] = React.useState(false);
   const [revealed, setRevealed] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
+  const [effortsOpen, setEffortsOpen] = React.useState(false);
+  /**
+   * 两处清单各自的搜索词。
+   *
+   * ⚠️ 用户 2026-10-04 要求「搜索应当在展开后才可用」：搜索框渲染在**展开区之内**。
+   * 收起时按钮的 onClick 会把对应搜索词清空 —— 否则筛子不可见却仍在生效，
+   * 下次展开会莫名其妙少掉一半行。
+   */
+  const [modelsQuery, setModelsQuery] = React.useState('');
+  const [effortsQuery, setEffortsQuery] = React.useState('');
+  const [effortsCopied, setEffortsCopied] = React.useState(false);
   const [idsCopied, setIdsCopied] = React.useState(false);
+  /**
+   * 每张供应商卡片各自的展开态（`provider → 用户点过的布尔`）。
+   * 只在用户**点过**之后才有值，此前由 `gatewayCardExpanded` 按条数给默认值。
+   * 模型清单与对照表各一套：两者的条目数与折叠阈值都不同，共用一个对象会让
+   * 「展开 model 家的模型清单」连带动了「展开 model 家的档位表」。
+   */
+  const [modelCardToggles, setModelCardToggles] = React.useState({});
+  const [effortCardToggles, setEffortCardToggles] = React.useState({});
+  /** 刚复制成功的那张卡片（provider key），用于把按钮打成「已复制 ✓」。 */
+  const [copiedModelCard, setCopiedModelCard] = React.useState(null);
+  const [copiedEffortCard, setCopiedEffortCard] = React.useState(null);
   const apiKey = status?.apiKey ?? null;
   const models = status?.models ?? [];
+  /**
+   * 模型清单的搜索（与对照表的搜索**同一约定**：空搜索词 = 未搜索）。
+   *
+   * ⚠️ 判据复用 `model-filter.js` 的 `filterModels`（只匹配 id 与展示名）。
+   * **不要**顺手换成对照表那套 `filterEffortRows` —— 那个还会匹配档位名，
+   * 用在这里会让「搜 `max`」命中一堆没这个功能的模型（见 openai-gateway-panel.js
+   * 里 matchesEffortQuery 的说明）。
+   */
+  const modelsFiltering = isFilterActive({ query: modelsQuery });
+  const visibleModels = filterModels(models, { query: modelsQuery });
+  /**
+   * 按供应商折成卡片（用户 2026-10-03 要求：一家供应商一张卡，而不是一个模型一行）。
+   *
+   * ⚠️ 分组判据在纯函数 `groupGatewayModels` / `groupGatewayEntries` 里
+   * （单测环境没有 react，组件渲染不了 —— 判据必须抽出来才能真跑覆盖）。
+   *
+   * ⚠️ 在**筛出来的模型**上分组（不是先分组再筛），与对照表同一口径：
+   * 卡片头的条数必须与卡内实际行数一致。
+   */
+  const modelCards = groupGatewayModels(visibleModels);
+  const effortRows = gatewayEffortRows(models);
+  // ⚠️ 搜索在**渲染时**做，不改 effortRows 本身：清空搜索即恢复全量。
+  const visibleEffortRows = filterEffortRows(effortRows, effortsQuery);
+  const effortsFiltering = isFilterActive({ query: effortsQuery });
+  /**
+   * 对照表也折成**同一套供应商卡片**。
+   *
+   * ⚠️ 先在**筛出来的行**上分组（不是先分组再筛）：卡片头部的条数必须与卡内实际
+   * 行数一致，否则搜索时会出现「卡片写着 8 个、里面只有 1 行」的矛盾读数。
+   */
+  const effortCards = groupGatewayEntries(visibleEffortRows, (row) => row.lossy);
 
   // 每次重新打开/换密钥后复位：否则上一条「已复制」会挂在新密钥旁边误导用户。
   React.useEffect(() => { setCopied(false); setRevealed(false); }, [status?.apiKey?.value]);
-  React.useEffect(() => { setIdsCopied(false); }, [models.length]);
+  // ⚠️ 目录换了一批就复位「已复制」：否则旧卡片的勾会留在同名卡片上。
+  // ⚠️ 也要跟着搜索词复位：那句「已复制 ✓」讲的是**当时那批行**，换了筛子它还留着
+  // 就是误导（用户会以为刚复制的是现在屏幕上这批）。
+  React.useEffect(() => { setIdsCopied(false); setCopiedModelCard(null); }, [models.length, modelsQuery]);
+  // 换了搜索词还留着上一条「已复制 ✓」会误导（那条讲的是另一批行）。
+  React.useEffect(() => { setEffortsCopied(false); setCopiedEffortCard(null); }, [models.length, effortsQuery]);
 
   React.useEffect(() => {
     const onKeyDown = (event) => { if (event.key === 'Escape') onClose(); };
@@ -3278,27 +3759,73 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
   };
 
   /**
-   * 复制全部模型 ID（每行一个）。
+   * 复制模型 ID（每行一个）。
+   *
+   * ⚠️ 有搜索词时只复制**筛出来的模型**，与「复制对照表」同一口径：
+   * 按钮上写着 `复制全部 N 个 ID`，那个 N 就是筛出来的条数，复制全量会让用户
+   * 以为搜索没生效（拿到的 ID 数对不上按钮上的数字）。
    *
    * 失败时展开列表让用户手动选中 —— 与密钥同理，不能「点了没反应」。
    */
   const handleCopyModelIds = async () => {
-    const text = formatModelIdList(models);
+    const text = formatModelIdList(visibleModels);
     if (!text) return;
     const ok = await copyToClipboard(text);
     setIdsCopied(ok);
     if (!ok) setModelsOpen(true);
   };
 
+  /**
+   * 复制**一张卡片**的模型 ID（每行一个完整的 `provider/模型名`）。
+   *
+   * ⚠️ 复制的是**完整 ID**，不是行内显示的短名字：客户端配置要的是前者，
+   * 抄一个短名字进去必然 404。行内显示短名只是为了不被截断（见 `GatewayModelRow`）。
+   */
+  const handleCopyCardIds = async (card) => {
+    const text = formatModelIdList(card.entries);
+    if (!text) return;
+    const ok = await copyToClipboard(text);
+    setCopiedModelCard(ok ? card.provider : null);
+    if (!ok) setModelsOpen(true);
+  };
+
+  /**
+   * 复制思考档位对照表。有搜索词时只复制**筛出来的那些行** ——
+   * 用户搜完再复制，拿到的正是屏幕上看到的内容（复制全量会让人以为搜索没生效）。
+   *
+   * 失败时展开对照表让用户手动选中：与密钥、模型 ID 两处同理，
+   * 绝不能「点了没反应」。
+   */
+  const handleCopyEfforts = async () => {
+    const text = gatewayEffortsText(visibleEffortRows);
+    if (!text) return;
+    const ok = await copyToClipboard(text);
+    setEffortsCopied(ok);
+    if (!ok) setEffortsOpen(true);
+  };
+
+  /**
+   * 复制**一张卡片**的档位对照（只含该供应商的行）。
+   *
+   * 与「复制对照表」的区别只是范围：用户常只需一家（例如只在配 Codex 的
+   * `trae` 那一档），复制全量反而要自己再挑。
+   */
+  const handleCopyCardEfforts = async (card) => {
+    const text = gatewayEffortsText(card.entries);
+    if (!text) return;
+    const ok = await copyToClipboard(text);
+    setCopiedEffortCard(ok ? card.provider : null);
+    if (!ok) setEffortsOpen(true);
+  };
+
   const disabled = gatewaySwitchDisabled(status);
   const action = status?.enabled ? '关闭' : '打开';
-
   return React.createElement('div', {
     className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
   React.createElement('div', {
-    className: 'dim-jh-modal',
+    className: 'dim-jh-modal dim-jh-gatewayModal',
     role: 'dialog',
     'aria-modal': 'true',
     'aria-label': '本机 OpenAI 网关',
@@ -3318,91 +3845,261 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
         onClick: onClose,
       }, '完成'))),
   React.createElement('div', { className: 'dim-jh-modalBody' },
-    React.createElement('label', { className: 'dim-jh-modelRow' },
-      React.createElement('span', { className: 'dim-jh-modelInfo' },
-        React.createElement('strong', { className: 'dim-jh-modelName' }, '启用本机网关'),
-        React.createElement('code', { className: 'dim-jh-modelId' },
-          action + '（在 127.0.0.1 监听，供 Pi / Continue / Cline / OpenCode 等客户端调用）')),
-      React.createElement('input', {
-        type: 'checkbox',
-        className: 'dim-jh-switch',
-        role: 'switch',
-        checked: status?.enabled === true,
-        // 被 env 停用时禁用而非「点了没反应」：让用户做一次明知无效的操作更困惑。
-        disabled: disabled || busy,
-        'aria-label': action + '本机网关',
-        onChange: () => void onToggle(!(status?.enabled === true)),
-      })),
-    gatewayStatusLines(status).map((line, index) =>
-      React.createElement('p', { key: `status-${index}`, className: 'dim-jh-modalHint' }, line)),
-    // 凭据区：默认**不**渲染明文（设置页会被截图/录屏/投屏）。点「复制」直接
-    // 进剪贴板；复制失败（无 Clipboard API、非用户手势、权限被拒）则退回显示
-    // 明文供手动选中 —— 绝不能变成「点了没反应」。
-    React.createElement('p', { className: 'dim-jh-modalHint' },
-      '鉴权用 Authorization: Bearer <网关 API Key>。'),
-    apiKey
-      ? React.createElement('div', { className: 'dim-jh-modelPanelActions', style: { marginTop: '4px' } },
-        React.createElement('button', {
-          className: 'dim-jh-btn',
-          'data-kind': 'primary',
-          title: '把密钥复制到剪贴板。明文会进入剪贴板历史，注意别在不信任的机器上这么做。',
-          onClick: () => void handleCopy(),
-        }, copied ? '已复制 ✓' : '复制 API Key'),
-        revealed
-          ? React.createElement('code', {
-            className: 'dim-jh-modelId',
-            style: { userSelect: 'all' },
-          }, apiKey.value)
-          : React.createElement('button', {
+    // ── 第 1 段：开关与连接信息 ──
+    // ⚠️ 用户 2026-10-04 要求把三段用**可见的分段**区分开（原话：「这三坨字全混在
+    // 一起有点难看清」）。做法是每段包一个 .dim-jh-gatewaySection：
+    // 段与段之间用上边框 + 更大的间距分开，段内保持紧凑。
+    // ⚠️ 不要用「给每段加不同底色」：弹窗会被截图，色块在深色主题下还要另配一套 token。
+    React.createElement('div', { className: 'dim-jh-gatewaySection' },
+      React.createElement('label', { className: 'dim-jh-modelRow' },
+        React.createElement('span', { className: 'dim-jh-modelInfo' },
+          React.createElement('strong', { className: 'dim-jh-modelName' }, '启用本机网关'),
+          // ⚠️ 用户 2026-10-04 要求这句只留「在 127.0.0.1 监听，供客户端调用」——
+          // 原先列了 Pi / Continue / Cline / OpenCode 四个客户端名，在窄面板下折成两行
+          // 且把「打开/关闭」那个动作词挤到很后面。客户端列举属于 README 的内容。
+          React.createElement('code', { className: 'dim-jh-modelId' },
+            '在 127.0.0.1 监听，供客户端调用')),
+        React.createElement('input', {
+          type: 'checkbox',
+          className: 'dim-jh-switch',
+          role: 'switch',
+          checked: status?.enabled === true,
+          // 被 env 停用时禁用而非「点了没反应」：让用户做一次明知无效的操作更困惑。
+          disabled: disabled || busy,
+          'aria-label': action + '本机网关',
+          onChange: () => void onToggle(!(status?.enabled === true)),
+        })),
+      gatewayStatusLines(status).map((line, index) =>
+        // ⚠️ 顶部三行是同一段话，用更紧的 .dim-jh-gatewayLine（再叠上弹窗级的
+        // 6px 会显得像三段互不相干的内容）。
+        React.createElement('p', {
+          key: `status-${index}`,
+          className: 'dim-jh-modalHint dim-jh-gatewayLine',
+        }, line)),
+      // 凭据区：默认**不**渲染明文（设置页会被截图/录屏/投屏）。点「复制」直接
+      // 进剪贴板；复制失败（无 Clipboard API、非用户手势、权限被拒）则退回显示
+      // 明文供手动选中 —— 绝不能变成「点了没反应」。
+      //
+      // ⚠️ 用户 2026-10-04 要求精简：原先是一行「鉴权用 Authorization: Bearer
+      // <网关 API Key>。」+ 下面一排按钮，现改为「API KEY：」与两个按钮**同一行**。
+      // Bearer 那半句没丢 —— 它移到了 CC Switch 之外的客户端需要的信息里，见 README
+      // 的「鉴权使用」；面板上只留用户真正要抄的两个东西（地址、密钥）。
+      apiKey
+        ? React.createElement('div', { className: 'dim-jh-gatewayKeyRow', style: { marginTop: '6px' } },
+          React.createElement('span', { className: 'dim-jh-modalHint dim-jh-gatewayKeyLabel' }, 'API KEY：'),
+          React.createElement('button', {
             className: 'dim-jh-btn',
-            title: '自动复制不可用时用它显示明文，供手动选中。',
-            onClick: () => setRevealed(true),
-          }, '显示明文'))
-      : null,
-    React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayApiKeyHint(apiKey)),
+            'data-kind': 'primary',
+            title: '把密钥复制到剪贴板。明文会进入剪贴板历史，注意别在不信任的机器上这么做。',
+            onClick: () => void handleCopy(),
+          }, copied ? '已复制 ✓' : '复制密钥'),
+          revealed
+            ? React.createElement('code', {
+              className: 'dim-jh-modelId',
+              style: { userSelect: 'all' },
+            }, apiKey.value)
+            : React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: '自动复制不可用时用它显示明文，供手动选中。',
+              onClick: () => setRevealed(true),
+            }, '显示明文'))
+        : React.createElement('p', { className: 'dim-jh-modalHint' },
+          'API KEY：尚未生成（启用网关时会自动创建）。'),
+      // ⚠️ 只有拿到密钥时才补这一行来源说明：`apiKey` 为空时上面那句
+      // 「尚未生成（启用网关时会自动创建）」已经把事情说完，而
+      // `gatewayApiKeyHint(null)` 说的是同一件事 —— 两句并排就是冗余，
+      // 与本次「精简臃肿」的目标正好相反。
+      apiKey
+        ? React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayApiKeyHint(apiKey))
+        : null),
 
-    // ── 模型目录 ──
+    // ── 第 2 段：模型目录 ──
     // 存在的理由：有些 agent（ZCode 等）**不会**主动扫 `/v1/models`，要靠用户
     // 手工把 ID 填进配置。而该端点需要 Bearer 头，浏览器地址栏直接打开只会得到
     // 401 —— 所以清单必须出现在设置页里。
-    React.createElement('p', { className: 'dim-jh-modalHint', style: { marginTop: '16px' } },
-      React.createElement('strong', null, '模型 ID（可用的完整清单）')),
-    React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayModelsHint(models, status?.modelsSource)),
-    React.createElement('div', { className: 'dim-jh-modelPanelActions', style: { marginTop: '4px' } },
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        'data-kind': 'primary',
-        disabled: models.length === 0,
-        title: '把全部模型 ID 每行一个复制到剪贴板。',
-        onClick: () => void handleCopyModelIds(),
-      }, idsCopied ? '已复制 ✓' : `复制全部 ${models.length} 个 ID`),
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        'aria-expanded': modelsOpen ? 'true' : 'false',
-        onClick: () => setModelsOpen(open => !open),
-      }, modelsOpen ? '收起' : '展开清单')),
-    modelsOpen
-      ? React.createElement('div', { className: 'dim-jh-modelList', style: { marginTop: '6px' } },
-        models.map(model => {
-          // 「可发图片」只标在支持的那个上 —— 用户据此挑模型，而不是靠撞一次
-          // unsupported_content 才知道。数据来自宿主，与 /v1/models 同源。
-          const badge = modelCapabilityBadge(model);
-          return React.createElement('div', { key: model.id, className: 'dim-jh-modelRow' },
-            React.createElement('span', { className: 'dim-jh-modelInfo' },
-              React.createElement('code', { className: 'dim-jh-modelId' }, model.id),
-              React.createElement('span', { className: 'dim-jh-modelName' }, model.name),
-              badge
-                ? React.createElement('span', { className: 'dim-jh-modelBadge', title: '该模型接受图片输入。' }, badge)
-                : null));
-        }))
-      : null,
-    React.createElement('p', { className: 'dim-jh-modalHint' },
-      '也可以用命令行查看同一份目录（地址栏直接打开会返回 401，因为它需要 Bearer 头）：'),
-    React.createElement('code', {
-      className: 'dim-jh-modelId',
-      style: { display: 'block', marginTop: '4px', userSelect: 'all' },
-    }, gatewayModelsCurl(gatewayEndpoint(status))),
-    React.createElement('p', { className: 'dim-jh-modalHint' },
+    React.createElement('div', { className: 'dim-jh-gatewaySection' },
+      React.createElement('p', { className: 'dim-jh-gatewaySectionTitle' },
+        React.createElement('strong', null, '模型 ID（可用的完整清单）')),
+      React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayModelsHint(models, status?.modelsSource)),
+      // ⚠️ `dim-jh-gatewayActions` 是给「下方四个按钮压成与密钥行同款小号」用的钩子
+      // （见 jet-hub-styles.js 里与 .dim-jh-gatewayKeyRow 合并的那条规则）。
+      // 不能直接改 .dim-jh-modelPanelActions .dim-jh-btn —— 那个类在页头、模型面板、
+      // 卡片头等 8 处都在用，改它会把无关页面一起改小。
+      React.createElement('div', { className: 'dim-jh-modelPanelActions dim-jh-gatewayActions', style: { marginTop: '4px' } },
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          'data-kind': 'primary',
+          disabled: visibleModels.length === 0,
+          title: '把模型 ID 每行一个复制到剪贴板（每行一个完整 ID；有搜索词时只复制筛出来的那些）。',
+          onClick: () => void handleCopyModelIds(),
+        }, idsCopied ? '已复制 ✓' : `复制全部 ${visibleModels.length} 个 ID`),
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          'aria-expanded': modelsOpen ? 'true' : 'false',
+          onClick: () => {
+            // 收起时**清掉搜索词**：搜索栏挂在展开区里，收起来还留着筛子的话，
+            // 下次展开会莫名其妙少掉一半模型，而筛子此刻是不可见的。
+            if (modelsOpen) setModelsQuery('');
+            setModelsOpen(open => !open);
+          },
+        }, modelsOpen ? '收起清单' : '展开清单')),
+      modelsOpen
+        // 搜索栏与清单**同生共死**：用户 2026-10-04 要求「搜索应当在展开后才可用，
+        // 而不是像现在这样放在外面」。挂在外面的问题是常驻半屏宽的输入框，
+        // 而它只对下面那张清单有效 —— 收起时那个框既占位又无事可做。
+        ? React.createElement(React.Fragment, null,
+          React.createElement('div', { className: 'dim-jh-modelFilterBar' },
+            React.createElement('input', {
+              type: 'search',
+              className: 'dim-jh-input dim-jh-modelSearch',
+              placeholder: '搜索模型 ID 或展示名…',
+              value: modelsQuery,
+              'aria-label': '搜索模型 ID',
+              onChange: (event) => setModelsQuery(event.target.value),
+            }),
+            modelsFiltering
+              ? React.createElement('button', {
+                  className: 'dim-jh-btn',
+                  title: '清空搜索词，恢复完整清单。',
+                  onClick: () => setModelsQuery(''),
+                }, '清空搜索')
+              : null),
+          visibleModels.length === 0
+            // 空结果必须能自解释（与对照表同一约定）：否则用户会以为网关没有模型了。
+            ? React.createElement('div', { className: 'dim-jh-gatewayEmpty' }, gatewayModelsEmptyHint(modelsQuery))
+            // 按**供应商**分组渲染：一家一张卡片，卡片头写清是哪家、有几条、
+            // 几条能发图片，卡内才是它自己的模型。用户报障（2026-10-03）——
+            // 此前平铺成「一个模型一行」，同一家的 deepseek-account/deepseek-flash
+            // 与 deepseek-account/deepseek-v4-pro 看起来毫无关系，
+            // 而用户真正要对照的正是「一家供应商下有哪些模型」。
+            //
+            // ⚠️ 在**筛出来的模型**上分组（不是先分组再筛），与对照表同一口径：
+            // 卡片头的条数必须与卡内实际行数一致。
+            : React.createElement(GatewayCards, {
+              cards: modelCards,
+              renderRow: (model) => React.createElement(GatewayModelRow, { model }),
+              isExpanded: (provider) => gatewayCardExpanded(
+                modelCards.find(card => card.provider === provider),
+                // 有搜索词时一律展开：命中结果藏在折叠卡里，用户会以为「搜不到」。
+                { toggled: modelCardToggles[provider], searching: modelsFiltering },
+              ),
+              onToggle: (provider) => setModelCardToggles(prev => ({
+                ...prev,
+                [provider]: !gatewayCardExpanded(
+                  modelCards.find(card => card.provider === provider),
+                  { toggled: prev[provider], searching: modelsFiltering },
+                ),
+              })),
+              onCopy: (card) => void handleCopyCardIds(card),
+              isCopied: (provider) => copiedModelCard === provider,
+              foldSuffix: '个模型',
+              foldLabel: '可发图片',
+              copyNoun: '个完整模型 ID',
+            }))
+        : null),
+
+    // ── 第 3 段：思考档位对照表 ──
+    // 存在的理由：各 provider 的档位 id 是**上游私有值**（TRAE 的 light/extra_high、
+    // LobsterAI 的 xhigh（界面上叫 Max）、Cline 的 max（界面上叫 Extra）），而走
+    // OpenAI 协议的客户端只有固定 8 档词汇，表达不出这些私有值。用户照 DSH 界面上
+    // 的名字填进 CC Switch/Codex，撞 400 且两端都看不出原因。
+    // 网关现在按强度自动翻译（填错不再失败），但**精确对应**只有一列答案 —— 就是这里。
+    //
+    // ⚠️ 数据只含**已开启**的模型（来自适配器 listModels 的黑名单过滤），
+    // 故与对话框里的模型选择器同源。
+    React.createElement('div', { className: 'dim-jh-gatewaySection' },
+      React.createElement('p', { className: 'dim-jh-gatewaySectionTitle' },
+        React.createElement('strong', null, '思考档位对照表')),
+      // ⚠️ 说明**一行一个 p**（与弹窗顶部 gatewayStatusLines 同款做法）。
+      // 用户 2026-10-04 第三次报障：这两句原先拼成一整段交给浏览器断行，
+      // 于是品牌名被从中间切开 —— 前一行结尾是「CC」、下一行开头是「Switch」。
+      // 两句本就各说一件事，各占一行既不会断开品牌名，也更好读。
+      gatewayEffortsHintLines(models).map((line, index) =>
+        React.createElement('p', {
+          key: `efforts-hint-${index}`,
+          className: 'dim-jh-modalHint dim-jh-gatewayLine',
+        }, line)),
+      // ⚠️ 用户 2026-10-04 要求这两个按钮**互换位置**，与模型清单那段保持一致
+      //（那边是「复制全部 …」在前、「展开清单」在后）。顺序统一后，
+      // 三段里的按钮位置可预期，用户不必每段重新找。
+      React.createElement('div', { className: 'dim-jh-modelPanelActions dim-jh-gatewayActions', style: { marginTop: '4px' } },
+        // 复制的是**当前筛出来的那些行**：用户搜完再复制，拿到的正是屏幕上看到的内容。
+        effortRows.length > 0
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              'data-kind': 'primary',
+              title: '把对照表（含真实档位与该填的值）复制到剪贴板。有搜索词时只复制筛出来的行。',
+              onClick: () => void handleCopyEfforts(),
+            }, effortsCopied ? '已复制 ✓' : `复制对照表（${visibleEffortRows.length} 行）`)
+          : null,
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          'aria-expanded': effortsOpen ? 'true' : 'false',
+          // 没有模型声明档位时禁用而非「点了没反应」：展开一张空表毫无意义。
+          disabled: effortRows.length === 0,
+          onClick: () => {
+            // 与模型清单同理：收起时清掉搜索词，避免下次展开时筛子不可见却仍在生效。
+            if (effortsOpen) setEffortsQuery('');
+            setEffortsOpen(open => !open);
+          },
+        }, effortsOpen ? '收起对照表' : `展开对照表（${effortRows.length} 行）`)),
+      effortsOpen
+        ? React.createElement(React.Fragment, null,
+          // 搜索：对照表本身要能按**档位名**查（「哪些渠道有 xhigh？」「界面上的 Max 是哪个 id？」
+          // —— 后者是用户真踩过的坑）。故判据比模型清单的搜索多匹配档位名，
+          // 但「空搜索词 = 未搜索」的约定与它共用同一份实现（model-filter.js）。
+          //
+          // ⚠️ 用户 2026-10-04 要求它**展开后才可用**（原先挂在展开区之外，收起时也在占位）。
+          effortRows.length > 0
+            ? React.createElement('div', { className: 'dim-jh-modelFilterBar' },
+                React.createElement('input', {
+                  type: 'search',
+                  className: 'dim-jh-input dim-jh-modelSearch',
+                  placeholder: '搜索模型 id、展示名或档位名（如 xhigh / Max / Extra）…',
+                  value: effortsQuery,
+                  'aria-label': '搜索思考档位',
+                  onChange: (event) => setEffortsQuery(event.target.value),
+                }),
+                effortsFiltering
+                  ? React.createElement('button', {
+                      className: 'dim-jh-btn',
+                      title: '清空搜索词，恢复完整对照表。',
+                      onClick: () => setEffortsQuery(''),
+                    }, '清空搜索')
+                  : null)
+            : null,
+          visibleEffortRows.length === 0
+            // 空结果必须能自解释，否则用户会以为网关坏了（而不是被搜索词筛没了）。
+            ? React.createElement('div', { className: 'dim-jh-effortEmpty' }, gatewayEffortsEmptyHint(effortsQuery))
+            // ⚠️ 与模型清单**同一套卡片形态**（`GatewayCards`）：两处都是
+            // 「一家供应商一张卡」，用户不必学两种读法。
+            : React.createElement(GatewayCards, {
+              cards: effortCards,
+              renderRow: (row) => React.createElement(GatewayEffortRow, { row }),
+              isExpanded: (provider) => gatewayCardExpanded(
+                effortCards.find(card => card.provider === provider),
+                // ⚠️ 有搜索词时一律展开：命中结果藏在折叠卡里，用户会以为「搜不到」
+                // （与 `model-groups.js` 的同一取舍）。
+                { toggled: effortCardToggles[provider], searching: effortsFiltering },
+              ),
+              onToggle: (provider) => setEffortCardToggles(prev => ({
+                ...prev,
+                [provider]: !gatewayCardExpanded(
+                  effortCards.find(card => card.provider === provider),
+                  { toggled: prev[provider], searching: effortsFiltering },
+                ),
+              })),
+              onCopy: (card) => void handleCopyCardEfforts(card),
+              isCopied: (provider) => copiedEffortCard === provider,
+              foldSuffix: '个可选档位',
+              foldLabel: '需对照',
+              copyNoun: '个模型的档位对照',
+            }))
+        : null),
+    // ⚠️ 用户 2026-10-04 要求**删掉两段 curl 命令**（模型目录与对照表各一条）。
+    // 它们已被 README 的「拿到地址与密钥」/「思考档位」两节完整收录，
+    // 而弹窗里那两段是「命令行查看同一份…」的重复说明 —— 正是用户说的「三坨字混在一起」。
+    React.createElement('p', { className: 'dim-jh-modalHint dim-jh-gatewayFootnote' },
       '网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 —— 真正的隔离靠密钥，'
       + '不要把它配置进任何浏览器端工具或扩展。'),
     notice

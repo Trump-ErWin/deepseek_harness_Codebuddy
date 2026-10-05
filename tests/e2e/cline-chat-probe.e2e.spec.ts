@@ -53,11 +53,10 @@ const ALL_FREE = process.env.DSH_CLINE_CHAT_E2E_ALL_FREE === '1'
 /** 显式指定的模型（优先于默认值）。 */
 const EXPLICIT_MODEL = process.env.DSH_CLINE_MODEL
 
-/** 远端 free 集合里的其余 4 个（截图那批里除默认模型外的）。 */
+/** 远端 free 集合里的其余 3 个。 */
 const OTHER_FREE = [
   'stealth/space-bunny-alpha',
   'cline-free/mimo-v2.6-flash',
-  'cline-free/gemini-3.8-flash',
   'cline-free/muse-spark-1.3-contributor',
 ]
 

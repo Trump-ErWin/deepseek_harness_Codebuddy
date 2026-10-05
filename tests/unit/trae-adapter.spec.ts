@@ -1484,6 +1484,86 @@ describe('TRAE 适配器 · 消息序列化（真实缺陷回归）', () => {
     expect(JSON.stringify(toolMsg.content)).toContain('内容')
   })
 
+  /**
+   * ⚠️ **真实缺陷**（2026-10-04，用户报障）：`read_image` 之后，整个会话在 trae 下
+   * **永久无法对话** —— 上游恒定回
+   * `code=4027 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`，
+   * 5 次重试与「继续」全都无效（坏报文被持久化，每次请求原样重放）。
+   *
+   * 根因：工具结果内嵌图片被 `userContentParts` **递归**收进一条多模态 user 消息，
+   * 而这条 user 消息被排在 `role:'tool'` **之前** —— assistant(tool_calls) 与它的
+   * tool 结果之间插了一条 user 消息，违反上游配对约束。
+   * 图片必须照 `pendingToolImages` 的设计挂到 tool 消息**之后**。
+   */
+  it('⚠️ 工具结果内嵌图片不得插在 role:tool 之前（4027 真实缺陷回归）', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+      remoteModels: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', multimodal: true }],
+      readImage: async () => ({ data: new Uint8Array([137, 80, 78, 71]), mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
+      model: 'deepseek-v4.1-flash',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'call_img', name: 'read_image', arguments: '{}' }],
+        },
+        {
+          // DSH 0.1.7 的一等工具结果消息（真实会话里的形态）。
+          role: 'tool',
+          toolCallId: 'call_img',
+          content: [
+            { type: 'text', text: '<path>x.png</path>' },
+            { type: 'image', attachment: { attachmentId: 'att-1' } },
+          ],
+        },
+      ],
+    } as unknown as GenerateOptions)
+
+    const messages = sentBody(fetcher).messages as Array<Record<string, any>>
+    const assistantIndex = messages.findIndex((m) => m.role === 'assistant')
+    const toolIndex = messages.findIndex((m) => m.role === 'tool')
+    expect(toolIndex, '工具结果必须下发').toBeGreaterThan(-1)
+    // 紧邻：中间插任何消息（尤其带图的 user 消息）都会被上游 4027 拒收。
+    expect(toolIndex, 'role:tool 必须紧跟其 assistant tool_calls').toBe(assistantIndex + 1)
+    // 图片不能被这次重排弄丢，且必须排在 tool 之后。
+    const imageIndex = messages.findIndex((m) => JSON.stringify(m.content ?? '').includes('image_url'))
+    expect(imageIndex, '图片不得静默丢失').toBeGreaterThan(-1)
+    expect(imageIndex, '图片应挂在 tool 消息之后').toBeGreaterThan(toolIndex)
+  })
+
+  it('⚠️ 同一条 user 消息既带图片又带工具结果时，图片仍发出且排在 tool 之后', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+      remoteModels: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', multimodal: true }],
+      readImage: async () => ({ data: new Uint8Array([137, 80, 78, 71]), mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
+      model: 'deepseek-v4.1-flash',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'call_1', name: 'read', arguments: '{}' }],
+        },
+        {
+          // ≤0.1.6 的旧形态：工具结果与图片搭载在同一条 user 消息里。
+          role: 'user',
+          content: [
+            { type: 'image', attachment: { attachmentId: 'att-1' } },
+            { type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: '文件内容' }] },
+          ],
+        },
+      ],
+    } as unknown as GenerateOptions)
+
+    const messages = sentBody(fetcher).messages as Array<Record<string, any>>
+    const assistantIndex = messages.findIndex((m) => m.role === 'assistant')
+    const toolIndex = messages.findIndex((m) => m.role === 'tool')
+    expect(toolIndex).toBe(assistantIndex + 1)
+    const imageIndex = messages.findIndex((m) => JSON.stringify(m.content ?? '').includes('image_url'))
+    expect(imageIndex, '外侧图片不得被静默丢弃').toBeGreaterThan(toolIndex)
+  })
+
   it('孤儿 tool-call 被剔除（会话自愈，避免上游 400）', async () => {
     const { adapter, fetcher } = makeAdapter({
       responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
@@ -1604,93 +1684,119 @@ describe('TRAE 适配器 · 机器指纹轮换默认关闭', () => {
   })
 })
 
-describe('TRAE 适配器 · 历史裁剪（上游约 500K 字符会静默断流）', () => {
-  it('超限时从最早的非系统消息开始丢弃，保留最新历史', async () => {
+/**
+ * ⚠️ **真实缺陷回归 + 设计锁定**（用户报障 2026-10-04：「trae 显示的上下文长度不对」）。
+ *
+ * 这里原先有一道**本地历史字符闸门**（写死 480,000 字符，中间版本改成「声明窗口 × 系数」），
+ * 超预算就从最早的非系统消息开始整轮丢弃。它已被**整体删除**（来历与理由见
+ * `src/trae-adapter.ts` 的「TRAE 没有本地历史闸门」那段注释）——
+ * **唯一的限制是 DSH 自己的压缩点（`声明的窗口 × 0.8`）**，与其余 13 个 provider 同形。
+ *
+ * 下面几条锁的是「**什么都不许裁**」。它们对旧实现是**红的**：
+ * - 60 万字符那条：旧写死预算 480,000 ⇒ 最早那条被丢（**正是用户报障的形态**）；
+ * - 20K 窗口 30 万字符那条：中间版本「窗口 × 系数」的预算是 100,000 ⇒ 会被裁；
+ * - 1M 窗口 600 万字符那条：中间版本的预算是 5,000,000 ⇒ 会被裁。
+ *
+ * 即：**任何形式的本地闸门重新出现，这几条里至少一条会变红**。
+ */
+describe('TRAE 适配器 · 无本地历史闸门（本地裁剪已删除）', () => {
+  it('⚠️ Max 档 60 万字符的历史必须原样上 wire（旧写死 480K 会静默丢）', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      product: { ...TRAE, maxMode: true },
+      remoteModels: [{
+        id: 'max-1m', name: 'Max 1M',
+        contextWindow: 200_000, maxMode: true, maxContextWindow: 1_000_000,
+        maxOutputTokens: 32_000, maxModeOutputTokens: 64_000,
+      }],
+      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+    })
+    await collect(adapter, {
+      model: 'max-1m',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: `最早的旧消息${'X'.repeat(300_000)}` }] },
+        { role: 'user', content: [{ type: 'text', text: `中间消息${'X'.repeat(300_000)}` }] },
+        { role: 'user', content: [{ type: 'text', text: '最新的消息' }] },
+      ],
+    } as unknown as GenerateOptions)
+
+    const body = JSON.parse((fetcher.mock.calls[0] as [string, { body: string }])[1].body)
+    const joined = JSON.stringify(body.messages)
+    expect(joined, '1M 档不该在 60 万字符就丢历史').toContain('最早的旧消息')
+    expect(joined).toContain('中间消息')
+    expect(joined).toContain('最新的消息')
+  })
+
+  it('⚠️ 窗口 20K 档 30 万字符也不裁（不存在「按窗口折算」的预算）', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      remoteModels: [{ id: 'small-20k', name: '小窗口 20K', contextWindow: 20_000 }],
+      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+    })
+    await collect(adapter, {
+      model: 'small-20k',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: `最早的旧消息${'X'.repeat(150_000)}` }] },
+        { role: 'user', content: [{ type: 'text', text: `中间消息${'X'.repeat(150_000)}` }] },
+        { role: 'user', content: [{ type: 'text', text: '最新的消息' }] },
+      ],
+    } as unknown as GenerateOptions)
+
+    const body = JSON.parse((fetcher.mock.calls[0] as [string, { body: string }])[1].body)
+    const joined = JSON.stringify(body.messages)
+    // 30 万字符对 20K 窗口意味着「系数 15」才留得住 —— 旧实现的 100,000 会把它裁掉。
+    expect(joined, '本地不得按窗口折算字符预算').toContain('最早的旧消息')
+    expect(joined).toContain('最新的消息')
+  })
+
+  it('⚠️ 1M 档 600 万字符也不裁（连「病态体积刹车」也已删除）', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      product: { ...TRAE, maxMode: true },
+      remoteModels: [{
+        id: 'max-1m', name: 'Max 1M',
+        contextWindow: 200_000, maxMode: true, maxContextWindow: 1_000_000,
+      }],
+      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+    })
+    await collect(adapter, {
+      model: 'max-1m',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: `最早的旧消息${'X'.repeat(3_000_000)}` }] },
+        { role: 'user', content: [{ type: 'text', text: `中间消息${'X'.repeat(3_000_000)}` }] },
+        { role: 'user', content: [{ type: 'text', text: '最新的消息' }] },
+      ],
+    } as unknown as GenerateOptions)
+
+    const body = JSON.parse((fetcher.mock.calls[0] as [string, { body: string }])[1].body)
+    const joined = JSON.stringify(body.messages)
+    // 旧「窗口 × 5」= 5,000,000 字符，这条会红：删掉的是**闸门本身**，不是把系数调大。
+    expect(joined, '删掉的是闸门本身，不是把系数调大').toContain('最早的旧消息')
+    expect(joined).toContain('最新的消息')
+  })
+
+  it('⚠️ DSH_TRAE_MAX_HISTORY_CHARS 不再是逃生舱（该环境变量已随闸门删除）', async () => {
     const prev = process.env.DSH_TRAE_MAX_HISTORY_CHARS
-    // 把预算压到很小，强制触发裁剪（真实值 480000，用真实值会需要造超大历史）。
     process.env.DSH_TRAE_MAX_HISTORY_CHARS = '200'
     try {
       const { adapter, fetcher } = makeAdapter({
         responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
       })
-      const filler = 'X'.repeat(300)
       await collect(adapter, {
         model: 'glm-5.2',
         messages: [
-          { role: 'user', content: [{ type: 'text', text: `最早的旧消息${filler}` }] },
-          { role: 'user', content: [{ type: 'text', text: `中间消息${filler}` }] },
+          { role: 'user', content: [{ type: 'text', text: `最早的旧消息${'X'.repeat(300)}` }] },
           { role: 'user', content: [{ type: 'text', text: '最新的消息' }] },
         ],
       } as unknown as GenerateOptions)
 
       const body = JSON.parse((fetcher.mock.calls[0] as [string, { body: string }])[1].body)
       const joined = JSON.stringify(body.messages)
-      // 最新消息必须保住。
-      expect(joined).toContain('最新的消息')
-      // 最早的必须被丢掉。
-      expect(joined).not.toContain('最早的旧消息')
-    } finally {
-      if (prev === undefined) delete process.env.DSH_TRAE_MAX_HISTORY_CHARS
-      else process.env.DSH_TRAE_MAX_HISTORY_CHARS = prev
-    }
-  })
-
-  it('system 消息永不裁剪', async () => {
-    const prev = process.env.DSH_TRAE_MAX_HISTORY_CHARS
-    process.env.DSH_TRAE_MAX_HISTORY_CHARS = '150'
-    try {
-      const { adapter, fetcher } = makeAdapter({
-        responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
-      })
-      await collect(adapter, {
-        model: 'glm-5.2',
-        system: '重要行为约束',
-        messages: [
-          { role: 'user', content: [{ type: 'text', text: 'X'.repeat(400) }] },
-          { role: 'user', content: [{ type: 'text', text: '第二轮' }] },
-        ],
-      } as unknown as GenerateOptions)
-
-      const body = JSON.parse((fetcher.mock.calls[0] as [string, { body: string }])[1].body)
-      const system = body.messages.find((m: { role: string }) => m.role === 'system')
-      expect(system).toBeDefined()
-      expect(JSON.stringify(system)).toContain('重要行为约束')
-    } finally {
-      if (prev === undefined) delete process.env.DSH_TRAE_MAX_HISTORY_CHARS
-      else process.env.DSH_TRAE_MAX_HISTORY_CHARS = prev
-    }
-  })
-
-  it('裁剪不切断 tool_call / tool 配对（否则上游 400）', async () => {
-    const prev = process.env.DSH_TRAE_MAX_HISTORY_CHARS
-    process.env.DSH_TRAE_MAX_HISTORY_CHARS = '260'
-    try {
-      const { adapter, fetcher } = makeAdapter({
-        responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
-      })
-      await collect(adapter, {
-        model: 'glm-5.2',
-        messages: [
-          { role: 'user', content: [{ type: 'text', text: `早期${'X'.repeat(300)}` }] },
-          // 这一轮带工具调用 + 结果，裁剪时必须以「轮」为单位。
-          { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }] },
-          { role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'ok' }] }] },
-        ],
-      } as unknown as GenerateOptions)
-
-      const body = JSON.parse((fetcher.mock.calls[0] as [string, { body: string }])[1].body)
-      const roles = body.messages.map((m: { role: string }) => m.role)
-      // 若保留了 assistant(tool_calls) 就必须同时保留其后的 tool 结果。
-      const hasAssistant = roles.includes('assistant')
-      const hasTool = roles.includes('tool')
-      expect(hasAssistant).toBe(hasTool)
+      // 若这个环境变量还被认，最早那条就会被丢掉（防止有人把闸门偷偷加回来）。
+      expect(joined, '该环境变量已失效，不得再裁剪').toContain('最早的旧消息')
     } finally {
       if (prev === undefined) delete process.env.DSH_TRAE_MAX_HISTORY_CHARS
       else process.env.DSH_TRAE_MAX_HISTORY_CHARS = prev
     }
   })
 })
-
 describe('TRAE 适配器 · OpenAI chunk 常量导出', () => {
   it('OPENAI_DONE 用于非流式聚合场景', () => {
     expect(OPENAI_DONE).toBe('data: [DONE]\n\n')

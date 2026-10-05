@@ -6,7 +6,7 @@
  * 通道名 jet-hub → 路径 /api/jet-hub
  * 端点方法：account.list / account.create / account.update / account.delete /
  *           account.reorder / account.refresh / account.retest / account.retestAll /
- *           account.reset / account.resetAll / login.poll /
+ *           account.test / account.reset / account.resetAll / login.poll /
  *           credits.status / credits.claimAll / credits.balances /
  *           model.list / model.setDisabled /
  *           captcha.demand / captcha.carrierUrl / captcha.contribute（内部载体，
@@ -20,7 +20,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from './account-pool.js'
 import { isGatewayEnabled } from './openai-gateway/config.js'
-import { collectGatewayModelIds } from './openai-gateway/models.js'
+import { collectGatewayEffortViews, collectGatewayModels, toGatewayModelIds, type GatewayModelSource } from './openai-gateway/models.js'
 import {
   applyGatewayDesiredState,
   gatewayAddress,
@@ -46,6 +46,7 @@ import { ZCODE } from './zcode-product.js'
 import type { ZcodeCredential } from './zcode.js'
 import { phoneFromUserId, isUsableZcodeCredential } from './zcode.js'
 import type { ZcodeBalanceResult } from './zcode-upstream.js'
+import { ZCODE_LOGIN_PROVIDER, type ZcodeLoginProvider } from './zcode-login.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
 import { MINIMAX } from './minimax-product.js'
@@ -57,6 +58,10 @@ import {
   fetchMinimaxCreditBalance,
   fetchMinimaxSigninStatus,
 } from './minimax-credits.js'
+import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
+import type { GeminiCredential } from './gemini.js'
+import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
+import { fetchGeminiCreditBalance } from './gemini-credits.js'
 import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
@@ -118,10 +123,12 @@ import {
   fetchTraeCreditBalance,
 } from './trae-credits.js'
 import {
+  pickTestModel,
   resetAccount,
   resetAllAccounts,
   retestAccount,
   retestAllAccounts,
+  testAccount,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
@@ -145,6 +152,8 @@ import type {
   RpcRefreshAccountResponse,
   RpcRetestAccountRequest,
   RpcRetestAllRequest,
+  RpcTestAccountRequest,
+  RpcTestAccountResponse,
   RpcResetAccountRequest,
   RpcResetAllRequest,
   RpcCreditsStatusRequest,
@@ -153,6 +162,7 @@ import type {
   RpcCreditsClaimAllResponse,
   RpcCreditsClaimSummary,
   RpcCreditsBalancesRequest,
+  RpcCreditsBalanceExtra,
   RpcCreditsBalancesResponse,
   RpcClineQuotaRequest,
   RpcClineQuotaResponse,
@@ -225,6 +235,43 @@ function shortId(): string {
   const buf = new Uint8Array(4)
   crypto.getRandomValues(buf)
   return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * ZCode 登录渠道的白名单归一。
+ *
+ * ## 为什么要有这道
+ *
+ * `account.create` 的载荷来自**客户端自报**（RPC 入口没有 schema 校验），
+ * 而 `ZcodeLoginProvider` 只是个 TypeScript 联合类型 —— 运行时任何字符串都能进来。
+ * 原先只写 `req.zcodeProvider ?? 'bigmodel'`：缺省兜底是对的，但**没有校验**，
+ * 传入 `zhiPu` / `ZAI`（大小写不同）这类未登记值会被原样送进
+ * `startZcodeLogin` → 打到一个不存在的授权端点，表现为
+ * 「授权页打不开」或「轮询到超时」这类极难定位的失败。
+ *
+ * ## 为什么**回落**而不是报错
+ *
+ * 回落方向与既有的 `?? 'bigmodel'` 兜底一致：老客户端、新客户端、
+ * 手改过载荷的用户都还能登录（只是用缺省渠道）。且前端只会下发下拉框里的
+ * 两个值，正常路径永远走不到这条分支 —— 它是**兜底**不是**主路径**。
+ * 真正非法的输入会留一条 `console.warn`（与本文件其余告警同一惯例），
+ * 便于事后发现是哪个客户端在发怪值。
+ *
+ * @param raw 客户端自报的渠道（可能未登记）
+ * @returns 可安全交给 `zcode.startLogin` 的渠道
+ */
+export function normalizeZcodeLoginProvider(raw: string | undefined): ZcodeLoginProvider {
+  if (raw === 'zai') return 'zai'
+  if (raw !== ZCODE_LOGIN_PROVIDER) {
+    // ⚠ 只在**非缺省**时记 warn：`undefined` 是绝大多数调用方的形态（老客户端不传），
+    //   对它刷日志等于每建一个账号多一行噪音，会把真正的异常埋掉。
+    if (raw !== undefined) {
+      console.warn(
+        `[jet-hub] 未登记的 zcode 登录渠道 ${JSON.stringify(raw)}，已回落到 ${ZCODE_LOGIN_PROVIDER}`,
+      )
+    }
+  }
+  return ZCODE_LOGIN_PROVIDER
 }
 
 /** 解析 Buddy 凭据 JSON；解析失败返回 undefined。 */
@@ -447,7 +494,7 @@ export interface CreditsEndpointDeps<
   fetchBalanceDetailed?: (
     credential: TCredential,
     product: TProduct,
-  ) => Promise<{ balance: CreditBalance | null; error?: string }>
+  ) => Promise<{ balance: CreditBalance | null; error?: string; extra?: RpcCreditsBalanceExtra }>
   /** 单账号异常时的告警出口（不参与控制流）。 */
   warn?: (message: string) => void
   /**
@@ -643,6 +690,7 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
   for (const entry of accounts) {
     let balance: CreditBalance | null = null
     let error: string | undefined
+    let extra: RpcCreditsBalanceExtra | undefined
     try {
       const resolved = await deps.resolve(credentialRef(entry.credentialRef))
       if (resolved === undefined) {
@@ -654,6 +702,7 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
           const detailed = await fetchDetailed(credential, product)
           balance = detailed.balance
           error = detailed.error
+          extra = detailed.extra
           if (balance === null && error === undefined) error = '余额查询失败'
         } else {
           balance = await fetchBalance(credential, product)
@@ -671,6 +720,7 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
       nickname: entry.nickname,
       balance,
       ...error === undefined ? {} : { error },
+      ...extra === undefined ? {} : { extra },
     })
   }
   return results
@@ -681,6 +731,13 @@ type LlmServiceLike = {
   listProviders?(): readonly { id: string }[]
   listModels(provider: string): Promise<Array<{ id: string; name: string }>>
   listAllModels?(provider: string): readonly { id: string; name: string }[]
+  /**
+   * 可选：解析单个模型的精确元信息（**思考档位**只在这里）。
+   *
+   * ⚠️ 声明为可选：网关的档位对照表是附加能力，宿主没提供时目录照常返回，
+   * 只是每个模型不带档位字段。
+   */
+  resolveModelInfo?(provider: string, model: string, signal?: AbortSignal): Promise<unknown>
 }
 
 /**
@@ -705,6 +762,36 @@ function llmServiceOf(ctx: Context): LlmServiceLike | undefined {
   const direct = (ctx as unknown as { llm?: LlmServiceLike }).llm
   if (direct !== undefined && direct !== null) return direct
   return ctx.get('llm') as LlmServiceLike | undefined
+}
+
+/**
+ * 采集网关目录（**含思考档位视图**）。
+ *
+ * ⚠️ 两个 RPC 分支（`gateway.getEnabled` / `gateway.setEnabled`）必须共用本函数：
+ * 设置页看到的档位与 `/v1/reasoning-efforts` 返回的必须同源，各算一遍必然漂移，
+ * 而漂移的症状是「照着设置页填的对不上网关实际接受的」—— 本功能存在的全部理由
+ * 就是消灭这种对照错误，自己再造一个就毫无意义了。
+ *
+ * 档位要逐模型 `resolveModelInfo` 才拿得到（`listModels` 不带），成本是每个模型
+ * 一次**读缓存**的调用（远端目录刚被 `listModels` 拉过），与 DSH 自己
+ * `buildModelCatalog` 的形状一致。
+ */
+async function collectGatewayCatalog(
+  llm: LlmServiceLike | undefined,
+  providers: readonly { id: string }[],
+  onError: (provider: string, error: unknown) => void,
+): Promise<RpcGatewayModel[]> {
+  const source: GatewayModelSource = {
+    listProviders: () => providers,
+    listModels: (provider) => llm!.listModels(provider),
+  }
+  const resolve = llm?.resolveModelInfo
+  if (typeof resolve === 'function') {
+    source.resolveModelInfo = (provider, model) => resolve.call(llm, provider, model)
+  }
+  const groups = await collectGatewayModels(source, onError)
+  const views = await collectGatewayEffortViews(source, groups, onError)
+  return toGatewayModelIds(groups, views)
 }
 
 /**
@@ -755,6 +842,15 @@ export function registerJetHubRpc(
   minimax: MinimaxAuth,
   zcode: ZcodeAuth,
   /**
+   * Gemini（Google Cloud Code Assist 免费线）实例（本地回调 OAuth）。
+   *
+   * ⚠️ **必须排在最后一个 provider 形参位**（即 `zcode` 之后、`modelAdapters`
+   * 之前）：本仓库全部 `registerJetHubRpc` 调用点都是**位置传参**，历史上已因
+   * 少传/插队错位复发 6 次。新 provider 一律**追加**在末尾，既有的 14 个调用点
+   * 才不用逐个补占位。
+   */
+  gemini: GeminiAuth,
+  /**
    * provider → 适配器实例（可选）。
    *
    * 用于「显示列表」拿到**不受用户黑名单影响**的全量目录（`listAllModels`），
@@ -766,7 +862,7 @@ export function registerJetHubRpc(
   ctx.inject(['connection'], (connectionCtx) => {
     registerJetHubEndpoints(
       connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai,
-      qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters,
+      qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters,
     )
   })
 }
@@ -859,6 +955,7 @@ function registerJetHubEndpoints(
   raccoon: RaccoonAuth,
   minimax: MinimaxAuth,
   zcode: ZcodeAuth,
+  gemini: GeminiAuth,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1113,7 +1210,7 @@ function registerJetHubEndpoints(
    *
    * ## 取值顺序：先信凭据里已存的，再现场派生
    *
-   * 新凭据由 `readZcodeCredential` / `startLogin` 直接写入 `account_name` /
+   * 新凭据由 `startLogin` 直接写入 `account_name` /
    * `phone`；**旧凭据**（本次改动之前登录的）没有这两个字段，故现场兜底：
    * 手机号从 `user_id` 派生、账号名回退到**不像占位串**的 `account_label`。
    */
@@ -1656,53 +1753,27 @@ function registerJetHubEndpoints(
            * 窗口内有效（`AGENTS.md` 记过 CodeArts 早期「主页面被跳转」的
            * 缺陷就是等授权完才返回 URL 导致的）。
            *
-           * ## 与「读官方客户端凭据」的关系
+           * ## ⚠ 本分支**不再读官方客户端的本机凭据**（2026-10-05 用户决策）
            *
-           * 早期实现是「确认磁盘上有一份官方客户端写的凭据」，
-           * 那要求用户先装并登录官方 ZCode —— 与「装完即用」冲突。
-           * 现在改为**插件自己走 OAuth**（实测 `/oauth/cli/init` →
-           * 浏览器授权 → `/oauth/cli/poll/{flow_id}` 完全跑通，
-           * 纯 HTTP、不经 `zcode://` 回调）。
+           * 早先有两道「先复用本机已有账号」的短路（孤儿条目收编 + 同 `user_id`
+           * 去重返回），它们依赖解密 `~/.zcode/v2/credentials.json` ——
+           * **已整体删除**（理由见 `src/zcode.ts` 文件头）。⇒ 现在点「添加账号」
+           * **一律**新起一轮 OAuth。
            *
-           * 若用户**已经**装并登录了官方客户端，则不必点这个按钮 ——
-           * `refreshAll` / 首次加载时会自动把官方凭据固化进来。
+           * ⚠ 「点一次多一条」仍由**登录成功后**的去重兜住（下方
+           * `loginResult` 分支里的 `findAccountIdByIdentityField`）——
+           * 判据是插件自己拿到的 `user_id`，不再依赖本机文件。
            */
-          /**
-           * ★★ **先复用本机已有账号，不要「点一次多一条」**（用户报障 ⑯）。
-           *
-           * ## 报障原文
-           *
-           * 「然后账号应该读取有效的本地账号凭证，而不是点了添加就多一个，
-           * 还没有删除账号的按钮」
-           *
-           * ## 两道复用（都**不新起** OAuth，故点下去不会多出条目）
-           *
-           * ① **孤儿条目修复**：池里有「条目在、凭据从未写入」的账号
-           *    （上一次登录被进程重启打断的产物）⇒ 把本机官方凭据补进去
-           *    并回填昵称，直接返回该条目。这同时治好了 ⑦「凭据未配置」。
-           * ② **同一账号已在池里**：本机官方凭据的 `user_id` 已属于某个条目
-           *    ⇒ 什么都不用做，如实告知「已存在」并返回它的 id —— 不建新条目、
-           *    不弹浏览器（否则用户会以为是新账号，实际会多出一条重复记录）。
-           *
-           * ⚠ 「本机有没有官方凭据」是**必要条件**：没装客户端、或没登录过时
-           * 两者都跳过，照旧走下面的 OAuth 流程（那是「装完即用」的保证）。
-           */
-          const orphanId = await zcode.adoptIntoOrphanAccount(pool).catch(() => undefined)
-          if (orphanId !== undefined) {
-            // `loginUrl` 用**空串**而不是 undefined：与 `loginMode: 'sms'` 的既有约定
-            // 一致（「没有可打开的 URL」），前端据 `reused` 分支处理。
-            return { ok: true, value: { accountId: orphanId, loginUrl: '', reused: true } }
-          }
-          const local = await zcode.localCredential()
-          if (local !== undefined && typeof local.user_id === 'string' && local.user_id.length > 0) {
-            const holder = await pool.findAccountIdByIdentityField(
-              ZCODE.id, 'user_id', local.user_id,
-            )
-            if (holder.length > 0) {
-              return { ok: true, value: { accountId: holder, loginUrl: '', reused: true } }
-            }
-          }
-          const started = await zcode.startLogin({ refName })
+          const started = await zcode.startLogin({
+            refName,
+            // ⚠️ 缺省 `'bigmodel'`（既有行为不变）；`'zai'` 走 chat.z.ai 国际版。
+            // ⚠️ 必须过白名单（真实修复，Gitee issue IKJLK3 E2）：`req` 是**客户端
+            //   自报**的（RPC 载荷没有 schema 校验），原先只做 `?? 'bigmodel'` 兜底，
+            //   任何其它字符串都会被原样送进 `startZcodeLogin` → 打到一个不存在的
+            //   授权端点，表现为「授权页打不开 / 轮询到超时」这类难以定位的失败。
+            //   未登记值一律回落到缺省渠道并记日志（不报错，见下）。
+            provider: normalizeZcodeLoginProvider(req.zcodeProvider),
+          })
           // 先登记占位条目（无凭据），使前端 `login.poll` 能立即看到该账号；
           // 登录成功后再回填昵称。失败则删除占位条目。
           await pool.addAccount({
@@ -1780,6 +1851,66 @@ function registerJetHubEndpoints(
             void pool.removeAccount(id).catch(() => {})
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+        } else if (provider === GEMINI.id) {
+          /**
+           * Gemini（Cloud Code Assist）走**浏览器回调式 OAuth**（本地
+           * `createServer` 监听 `127.0.0.1` 的 `/oauth-callback`）。
+           *
+           * ⚠️ 与 zcode / codearts 同型：**必须先返回 URL 再等结果** ——
+           * `window.open` 只在用户手势窗口内有效，等授权完成才返回 URL
+           * 会让弹窗被浏览器拦截（AGENTS.md 记过 CodeArts 的同类缺陷）。
+           * `GeminiAuth.startLogin` 内部已保证「立即返回」，这里不得 `await result`。
+           *
+           * ⚠️ 先登记**占位条目**（无凭据），使前端 `login.poll` 能立即看到
+           * 该账号；登录成功后再回填昵称与 `expiresAt`。失败则删除占位条目，
+           * 不留幽灵账号（照 MINIMAX.id 分支的已验证形态）。
+           */
+          await pool.addAccount({
+            id,
+            provider: GEMINI.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let geminiStarted: StartedGeminiLoginFlow
+          try {
+            geminiStarted = await gemini.startLogin()
+          } catch (error) {
+            // 回调端口占用/网络失败：删掉占位条目，不留幽灵账号。
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 Gemini 登录（本地回调服务启动失败）：${reason}`)
+          }
+
+          geminiStarted.result.then(async (credential) => {
+            // ⚠️ 不接收 `persistLogin` 的返回值：它给的是 OIDC `sub`，只适合当稳定
+            // 标识。展示名一律走 `geminiAccountLabel`（见下）。
+            await gemini.persistLogin(credential, { refName })
+            await pool.updateAccount(id, {
+              // ⚠️ 用 `geminiAccountLabel`（邮箱优先）而非 `accountId.slice(0, 8)`：
+              // `sub` 是 21 位数字，截前 8 位得到 `Gemini 10500520` 这种**不可辨认**
+              // 的展示名（用户报障 2026-10-03）。`sub` 的价值是「稳定标识」，不是
+              // 「显示名」—— 展示要的是可辨识，邮箱正好。
+              // 取不到邮箱时该函数回退 `sub`，两者都无则退化为池 id。
+              nickname: geminiAccountLabel(credential) ?? id,
+              // ⚠️ **必须用 `geminiCredentialExpiresAtMs`**：它认 `expiry`
+              //（RFC3339）与 `expires_in`，取不到就返回 `undefined` ——
+              // 传 `undefined` 是「不知道」，不会被写成 0 而让 UI 显示「已过期」。
+              expiresAt: geminiCredentialExpiresAtMs(credential),
+              // ⚠️ Google OAuth 默认 `access_type=offline`，故 refresh_token
+              // 必定下发；这里仍按凭据本体如实判定，不写死 true。
+              refreshable: isGeminiRefreshable(credential),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${GEMINI.id} login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: geminiStarted.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -1895,11 +2026,19 @@ function registerJetHubEndpoints(
               /**
                * zcode **没有 refresh 端点**（凭据是静态的，与 Loomy 同类）。
                *
-               * 但这个方法仍做实事：**重读磁盘凭据并回写** —— 使用户在
-               * 官方 ZCode 客户端重新登录后，点「刷新」即可生效而无需
-               * 重启 DSH。凭据不可用时如实抛错（让用户知道要去官方客户端登录）。
+               * 但这个方法仍做实事：**逐账号重读自己的 ref 并规范化回写** ——
+               * 用户重新登录后点「刷新」即可生效而无需重启 DSH。
+               * 凭据不可用时如实抛错（引导用户重新登录该账号）。
                */
               await zcode.refreshAccountCredential(entry.credentialRef, pool, entry.id)
+              break
+            case GEMINI.id:
+              // Gemini **有** refresh 端点（`oauth2.googleapis.com/token` 的
+              // `refresh_token` grant），这里是真续期。
+              // ⚠️ 必须传 pool + entry.id —— 续期后要把新的 `expiresAt` 写回
+              // 账号池，否则 UI 一直显示「已过期」而实际能正常发消息。
+              // ⚠️ Google 会**轮换 refresh_token**，`GeminiAuth` 内部已回写新值。
+              await gemini.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
@@ -2230,6 +2369,58 @@ function registerJetHubEndpoints(
       case 'account.retestAll': {
         const req = payload as RpcRetestAllRequest
         const value = await retestAllAccounts(pool, req.provider)
+        return { ok: true, value }
+      }
+
+      // ── 限流标记：测试（**无条件**发一次真实请求）──
+      //
+      // ⚠️ 与 `account.retest` 的区别是**触发条件**，不是措辞：
+      // `retestAccount` 只测那些已经有 `modelRateLimits` 标记的模型，没有标记时
+      // 在 `modelIds.length === 0` 处提前返回、一次请求都不发。于是「这个账号
+      // 到底还能不能用」在**没有历史 429** 时没有手动探活入口 —— 用户点「重测」
+      // 看到瞬间返回，会以为按钮失灵（真实报障：「重测按钮你确认过会发请求吗，
+      // 为什么响应这么快？」）。`account.test` 补齐的就是这个缺口。
+      //
+      // ⚠️ 它**不写任何存储**：不清标记、不写回新的重置时刻。测出「仍受限」只
+      // 如实回报给用户看，不落盘 —— 落盘会把「一次手动探活」变成「改变选号
+      // 状态」，那是重测的语义。
+      case 'account.test': {
+        const req = payload as RpcTestAccountRequest
+        const accountId = req.accountId
+        if (typeof accountId !== 'string' || accountId === '') {
+          return { ok: false, error: { code: 'bad-request', message: '缺少 accountId' } }
+        }
+        const entry = pool.findAccount(accountId)
+        if (entry === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `账号 ${accountId} 不存在` } }
+        }
+
+        // 模型推断：显式指定 > 已有的限流标记（用户最可能想看的就是它）> 全量目录第一个。
+        // ⚠️ 只有前两者都拿不到时才去读目录 —— `fullCatalogIds` 在读不到时返回
+        // `{ error }`，若无条件先读它，一个「明明有标记可测」的账号会因为目录服务
+        // 暂时不可用而被拒，属于自造的失败。
+        //
+        // 目录也读不出来时如实报错，**不**猜一个模型名发出去（猜错会得到与账号
+        // 无关的 404，把「账号不可用」和「模型名不对」两件事混成一条报错）。
+        let modelId = pickTestModel(entry, [], req.modelId)
+        if (modelId === '') {
+          const catalog = await fullCatalogIds(ctx, modelAdapters, entry.provider)
+          if ('error' in catalog) {
+            return {
+              ok: false,
+              error: { code: 'bad-request', message: `无法确定要测试的模型：${catalog.error}` },
+            }
+          }
+          modelId = pickTestModel(entry, catalog.ids, req.modelId)
+        }
+        if (modelId === '') {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: `${entry.provider} 没有可测试的模型` },
+          }
+        }
+
+        const value: RpcTestAccountResponse = await testAccount(pool, accountId, modelId)
         return { ok: true, value }
       }
 
@@ -2567,9 +2758,16 @@ function registerJetHubEndpoints(
                  * captcha 回调：每次都现产一个新 param。
                  * 缺浏览器时抛错由 `claimDailyFor` 内部转成可读的
                  * failed outcome（不让整个端点失败）。
+                 *
+                 * ⚠⚠ **必须原样把 `config` 透传给 `mintCaptcha`**（真实缺陷，
+                 * Gitee issue IKJNPS）。region 与 param 必须是**同一份配置**签出来的：
+                 * 阿里云验签成对校验二者，不一致即 `400 / 3007`。此前这里**自己**去
+                 * 拉一份 captcha 配置（拿到的是服务端真实 region，如 `sgp`），
+                 * 而 `claimDailyFor` 的 region 走兜底常量 `cn` ⇒ 非 cn 区账号
+                 * 「一键领取」100% 失败（用户报障：15/15 全部 captcha 校验失败）。
+                 * 现在配置由 `claimDailyWith` 解析一次并传进来，两边天然同源。
                  */
-                accountOutcomes = await zcode.claimDailyFor(credential, async () => {
-                  const config = await zcode.fetchCaptchaConfig().catch(() => undefined)
+                accountOutcomes = await zcode.claimDailyFor(credential, async (config) => {
                   return await zcode.mintCaptcha(config)
                 })
               }
@@ -2785,6 +2983,44 @@ function registerJetHubEndpoints(
           const values = await collectCreditBalances<MinimaxCredential, undefined>(accounts, undefined, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalance: (credential) => fetchMinimaxCreditBalance(credential),
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === GEMINI.id) {
+          // 余额 = **配额窗口**（不是充值积分）：`POST
+          // /v1internal:retrieveUserQuotaSummary` 两个桶（`gemini-5h` /
+          // `gemini-weekly`）的剩余比例。
+          //
+          // ⚠️ 用 `fetchBalanceDetailed`（而非 `fetchBalance`）：Gemini 的
+          // 「未授权」与「查询失败」是**两回事** —— 前者要显示「尚未授权 Google
+          // 账号」、后者要显示具体原因（网络/HTTP/响应形状）。
+          // `collectCreditBalances` 会把 `{balance: null, error}` 原样透传给
+          // 卡片（helper 只在 `error` 缺失时才补「余额查询失败」），故这里
+          // **不需要**像 CLINE 分支那样手写 for 循环。
+          //
+          // ⚠️ 第二实参传 `GEMINI` 而不是 minimax 那样的 `undefined`：
+          // `fetchGeminiCreditBalance` 的第二形参就是 product（端点/超时来自
+          // 产品配置）。
+          //
+          // ⚠️ 账号规格（Pro / Free / Ultra）搭这趟车回来：`loadCodeAssist` 与
+          // 配额是同一函数里**并行**发的两个端点，档位挂在 `result.tier` 上。
+          // 这里把它翻译成面板要的 `extra.accountTier` —— `label` 是短标签
+          // （面板只放得下一个词），`title` 是上游原文（hover 才看得到）。
+          // 档位取不到时 `extra` 缺席，面板不渲染那一行（**不是错误**）。
+          const values = await collectCreditBalances<GeminiCredential, typeof GEMINI>(accounts, GEMINI, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchBalanceDetailed: async (credential) => {
+              const { balance, error, tier } = await fetchGeminiCreditBalance(credential, GEMINI)
+              const extra: RpcCreditsBalanceExtra | undefined = tier === undefined
+                ? undefined
+                : { accountTier: { label: tier.label, title: `${tier.name}（${tier.id}）` } }
+              return {
+                balance,
+                ...error === undefined ? {} : { error },
+                ...extra === undefined ? {} : { extra },
+              }
+            },
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
@@ -3478,12 +3714,9 @@ function registerJetHubEndpoints(
               ctx.logger.warn('[jet-hub] gateway.getEnabled：既取不到 llm.listProviders，也没有任何已注册适配器可作兜底，模型清单为空')
               return [] as RpcGatewayModel[]
             }
-            return collectGatewayModelIds(
-              { listProviders: () => providers, listModels: (provider) => llm!.listModels(provider) },
-              (provider, error) => {
-                ctx.logger.warn(`[jet-hub] ${provider} 模型目录读取失败，已从网关列表跳过：${String(error)}`)
-              },
-            )
+            return collectGatewayCatalog(llm, providers, (provider, error) => {
+              ctx.logger.warn(`[jet-hub] ${provider} 模型目录读取失败，已从网关列表跳过：${String(error)}`)
+            })
           }, [] as RpcGatewayModel[]),
           modelsSource,
         }
@@ -3518,9 +3751,8 @@ function registerJetHubEndpoints(
           : (llm?.listProviders !== undefined ? 'catalog' : (Object.keys(modelAdapters ?? {}).length > 0 ? 'adapters' : 'none'))
         const models = providers === undefined
           ? []
-          : await collectGatewayModelIds({
-            listProviders: () => providers,
-            listModels: (provider) => llm!.listModels(provider),
+          : await collectGatewayCatalog(llm, providers, (provider, error) => {
+            ctx.logger.warn(`[jet-hub] ${provider} 模型目录读取失败，已从网关列表跳过：${String(error)}`)
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] gateway.setEnabled 的模型目录刷新失败：${String(error)}`)
             return [] as RpcGatewayModel[]

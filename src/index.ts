@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { LlmError } from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
 import { registerCodeArtsLlm } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
@@ -26,12 +27,13 @@ import { ZCODE } from './zcode-product.js'
 import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
 import type { ZcodeCredential } from './zcode.js'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
+import { installLoopResume } from './loop-recovery.js'
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 import { BuddyBalanceSelector, pickBuddyAccount } from './buddy-balance-selector.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -49,6 +51,11 @@ import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
 import { MINIMAX } from './minimax-product.js'
 import type { MinimaxCredential } from './minimax.js'
+import { GeminiAuth } from './gemini-auth.js'
+import { registerGeminiLlm } from './gemini-adapter.js'
+import { GEMINI } from './gemini.js'
+import type { GeminiCredential } from './gemini.js'
+import { createGeminiSigStore } from './gemini-sigstore.js'
 import { registerOpencodeLlm } from './opencode-adapter.js'
 // ⚠️ opencode 的 RPC 由 `jet-hub-rpc.ts` 的 handleMethod 统一分派
 // （它调 handleOpencodeRpc），本文件**不再**单独注册端点 —— 详见
@@ -272,7 +279,7 @@ export function apply(ctx: Context): void {
   registerProviderSettings(
     ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
     'llm-qoder', 'llm-qodercn', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
-    'llm-minimax', 'llm-zcode',
+    'llm-minimax', 'llm-zcode', 'llm-gemini',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -449,6 +456,56 @@ export function apply(ctx: Context): void {
     return { tried }
   }
 
+  /**
+   * 在「候选为空、即将退到单凭据 ref」这一刻，先证明失败原因是不是**限流**。
+   *
+   * ## 它修的是什么（真实缺陷，2026-10-03）
+   *
+   * 用户报障：`/compact` 连续四次报
+   * 「Compaction could not produce a useful summary」，会话日志里 `compaction/end`
+   * 携带的真实错误却是 `buddy: no usable credential; log in from the Jet Hub
+   * panel first` —— 而当时 Jet Hub 里 buddy 账号**已登录、已启用**，只是它被
+   * `deepseek-v4.1-flash` 的模型级限流标记挡住（解禁时刻就在
+   * `modelRateLimits` 里）。
+   *
+   * 链路：唯一的启用账号被限流 → `pickBuddyCredential` 的候选筛成空集 →
+   * `select()` 只能回一个笼统的 `exhausted`（`reason` 在未锁定时被丢弃）→
+   * 退到单凭据 ref `BUDDY_ACCESS_TOKEN`，而 Jet Hub 登录只写
+   * `BUDDY_ACCOUNT_XXX`、该 ref **根本不存在** → 适配器抛 `MISSING_CREDENTIAL`。
+   *
+   * 即：**凭据问题被误报成「没登录」，而真实原因是限流**。用户据此去重新
+   * 登录，方向完全错。这与本仓库已记录的同类病根一致 —— 用默认归类代替了
+   * 对业务语义的判断（qoder 的 `110` 被误归 `SERVER`、`10605` 排队被漏判）。
+   *
+   * ⚠️ 这里**只改错误语义，不改可用性**：没有账号可用就是没有，压缩该失败
+   * 仍然失败；修的是「用户看到的原因」。绝不静默换模型、也绝不绕过限流标记。
+   *
+   * @param product - 目标 provider（用其 `id` 与 `displayName`）。**只要求这两个字段**：
+   *   除 buddy / workbuddy 外，cline 也接这条（它同样会因模型级限流被挡住，
+   *   而 `ClineProduct` 与 `BuddyProduct` 是两个类型）。
+   * @param modelId - 本次请求的模型；空串时不做判定（与选号侧约定一致）。
+   * @throws LlmError 带 `QUOTA_EXCEEDED` 码与解禁时刻，仅当**所有**启用账号
+   *   都在该模型上受限时；其余情形静默返回，交给原有的 `MISSING_CREDENTIAL`。
+   */
+  const throwIfAllAccountsRateLimited = (
+    product: { id: string; displayName: string },
+    modelId?: string,
+  ): void => {
+    const limited = allAccountsRateLimitedForModel(
+      // 只统计**启用**账号：停用账号本就不参与自动选号，把它们算进来会
+      // 让「有一个号被停用」的普通情况被误报成「全部限流」。
+      pool.listAccountsByProvider(product.id).filter(a => a.enabled),
+      modelId ?? '',
+    )
+    if (limited === undefined) return
+    throw new LlmError(
+      `${product.displayName}：模型 ${modelId} 的可用账号均在限流中，`
+      + `最近一个将于 ${new Date(limited.resetAtMs).toLocaleString('zh-CN')} 解禁。`
+      + `可改用其它 provider / 模型，或等待解禁后再试（无需重新登录）。`,
+      'QUOTA_EXCEEDED',
+    )
+  }
+
   const buddy = new BuddyAuth(ctx)
   const buddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
@@ -472,6 +529,9 @@ export function apply(ctx: Context): void {
       //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中。
       const available = await pool.getAvailableAccount(CODEBUDDY.id, modelId ?? '', picked.tried)
       if (available) return available.credential as BuddyCredential
+      // 退到单凭据 ref 之前先证明失败原因：全被模型限流时报明确的限流错误，
+      // 而不是让它降级成误导性的 MISSING_CREDENTIAL（见该助手的说明）。
+      throwIfAllAccountsRateLimited(CODEBUDDY, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))
       if (!resolved) return undefined
       try {
@@ -520,6 +580,8 @@ export function apply(ctx: Context): void {
       // provider 实参用 WORKBUDDY.id 而非字面量 'workbuddy'（同类坑见上）。
       const available = await pool.getAvailableAccount(WORKBUDDY.id, modelId ?? '', picked.tried)
       if (available) return available.credential as BuddyCredential
+      // 同 buddy：区分「全部限流」与「真的没登录」（见该助手的说明）。
+      throwIfAllAccountsRateLimited(WORKBUDDY, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(WORKBUDDY.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -782,6 +844,12 @@ export function apply(ctx: Context): void {
       // 记录实际选中的池账号（空串 = 回退到单凭据 ref 模式，见适配器注释）。
       activeClineAccountId = available?.entry.id ?? ''
       if (available) return available.credential as ClineCredential
+      // ⚠️ 与 buddy / workbuddy 同因（真实缺陷，2026-10-03 用户报障）：
+      // 唯一的 cline 账号被**模型级限流**标记挡住时，候选会筛成空集，最终降级成
+      // `cline: no usable credential; log in first` —— 凭据明明在、账号也登录着，
+      // 用户却被指去重新登录，方向完全错。故必须在退到单凭据 ref **之前**
+      // 先把「其实是限流，预计 X 后解禁」说清楚。
+      throwIfAllAccountsRateLimited(CLINE, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(CLINE.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1106,6 +1174,77 @@ export function apply(ctx: Context): void {
     product: MINIMAX,
   })
 
+  // ===== Gemini（Google Cloud Code Assist 免费线）=====
+  //
+  // ⚠️ **只做 OAuth**（用户拍板）：API key / AI Studio 两条线不做 —— 免费线
+  // 是 Cloud Code 项目制，凭据就是 Google OAuth 的 access_token + refresh_token。
+  //
+  // 与其余 provider 的四处**形态差异**（全部来自 `docs/GEMINI-PORT-PLAN.md`
+  // §2.2 的抓包实测，**不许"顺手统一"**）：
+  //   1. 请求走**双层信封**（`{model, project, request:{contents,…}}`），且
+  //      **必须逐层字母序序列化** —— 上游对字段顺序敏感，原版靠 Go 的 map
+  //      键自动排序实现；TS 的 `JSON.stringify` 按插入序，故走
+  //      `marshalAlphabetical`（见 `gemini.ts`）。
+  //   2. 五个身份头**逐字写死**（`geminiHeaders`），且流式请求**刻意不带
+  //      `Accept`**（与抓包一致）。
+  //   3. `thoughtSignature` 是**跨轮状态**：`functionCall` 上的签名要落盘、
+  //      下一轮按「工具名 + 规范化参数」回填，否则多轮工具调用必被上游拒。
+  //      故这里建一个独立的 `gemini-sigs.json` 缓存（**不放 state.json** ——
+  //      那是整体替换语义，会被别的写入覆盖掉）。
+  //   4. 模型暴露 1 个 `gemini-3.8-flash` + 4 档 efforts（低/中/高/自适应）；
+  //      **不**暴露带后缀的模型名，也**不**暴露 lite（上游恒 404，用户
+  //      2026-10-03 拍板移除）。
+  //
+  // 服务名由 GeminiAuth 依 product.id 派生，注册为 ctx.geminiAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的 Gemini 面板。
+  const gemini = new GeminiAuth(ctx)
+  const geminiSigStore = createGeminiSigStore(ctx)
+  const geminiAdapter = registerGeminiLlm(ctx, {
+    credentialRef: credentialRef(GEMINI.defaultCredentialRef),
+    resolveCredential: async (modelId?: string) => {
+      // ⚠️ provider 实参用 GEMINI.id 而非字面量（同 minimax 的既有约定：
+      // 写死字面量在改名/多产品场景下会静默查不到账号）。
+      const available = await pool.getAvailableAccount(GEMINI.id, modelId ?? '')
+      // `getAvailableAccount` 的凭据类型是历史遗留的联合类型，与
+      // `GeminiCredential` 无充分重叠，故经 `unknown` 转换；运行时安全性由
+      // provider 过滤保证（查询用 `GEMINI.id`，取到的必是 gemini 凭据）。
+      if (available) return available.credential as unknown as GeminiCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(GEMINI.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as GeminiCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // ⚠️ 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
+      // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
+      const available = await pool.getAvailableAccount(GEMINI.id, '')
+      if (available) {
+        // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
+        // 账号池，否则 UI 一直显示「已过期」而实际能正常发消息。
+        // ⚠️ `getAvailableAccount` 返回 **`{ entry, credential }`** 两层 ——
+        // 账号 id 与 credentialRef 在 **`available.entry`** 里，**不是**
+        // `available.id` / `available.credentialRef`（那是 `undefined`，
+        // 会让续期**静默写不回账号池**）。
+        await gemini.refreshAccountCredential(
+          available.entry.credentialRef, pool, available.entry.id,
+        )
+      } else {
+        await gemini.refresh()
+      }
+    },
+    // 模型表是**静态**的（用户拍板：不拉远端目录，Cloud Code 没有模型列表端点）。
+    // 故这里不传 `fetchRemoteModels`。
+    // 图片两跳：先按 640,000 px 预算取缩放版，拿不到才发原图。
+    readImage: makeReadImage(ctx),
+    readImageRequest: makeReadImageRequest(ctx),
+    sigStore: geminiSigStore,
+    accountPool: pool,
+    product: GEMINI,
+  })
+
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
   //
   // 早期实现把服务端的 `name` 直接当昵称用，而实测它是**自动生成的默认名**
@@ -1128,9 +1267,9 @@ export function apply(ctx: Context): void {
 // ===== ZCode（智谱 z.ai 免费额度通道）=====
 //
 // 形态与前面所有 provider **相同**：读凭据 → 直发远端。
-// 用户只需在官方 ZCode 客户端登录一次 —— 凭据就落在
-// `~/.zcode/v2/credentials.json`（AES-256-GCM 加密，公开算法），
-// 本插件纯 Node 解密即可，**不需要任何实例常驻**。
+// 登录走**插件自己的**授权流（`zcode-login.ts`），凭据由插件写进
+// `ctx.credentials`，**不读取本机 ZCode 客户端的任何数据**（2026-10-05 决策，
+// 理由见 `zcode.ts` 文件头）。
 //
 // 与其余 provider 的三处差异（全部实测）：
 //   1. 协议是 **Anthropic Messages**（不是 OpenAI 兼容）——
@@ -1141,10 +1280,9 @@ export function apply(ctx: Context): void {
 //   3. 请求体必须带官方身份块与首轮日期块，否则上游回 `3012` ——
 //      见 `zcode-identity.ts`。
 //
-// ⚠ **可脱离官方客户端使用**：登录走官方 CLI 设备授权流
+// ⚠ **完全可脱离官方客户端使用**：登录走官方 CLI 设备授权流
 // （`/oauth/cli/init` → 浏览器授权 → `/oauth/cli/poll/{flow_id}`，
 // 纯 HTTP，见 `zcode-login.ts`），且 `device_mid` **由插件自己生成**。
-// 若机器上已装并登录过官方客户端，也会自动读取它的凭据作为回退。
 //
 // ⚠ **不可续期**：凭据是静态的（JWT 的 payload 里没有 `exp`）。
 // 失效时上游回 401/1002，适配器归为 AUTH 并提示用户重新登录。
@@ -1154,8 +1292,7 @@ export function apply(ctx: Context): void {
 //
 // ⚠ **必须把账号池传进去**：`ZcodeAuth.current()` 要从账号池里找用户在
 // Jet Hub 登录时创建的那个 ref（`ZCODE_ACCOUNT_XXXX`），而不是只认固定的
-// `ZCODE_CREDENTIAL`。不传的话「登录成功但面板显示未配置」——
-// 且该缺口会被「回退读官方凭据文件」掩盖，只有没装官方客户端的用户才看得到。
+// `ZCODE_CREDENTIAL`。不传的话「登录成功但面板显示未配置」。
 const zcode = new ZcodeAuth(ctx, {
   accountPool: pool,
   /**
@@ -1229,7 +1366,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     }
     /**
      * 账号池里没有条目时，落到 `ZcodeAuth.current()` ——
-     * 它已经实现了「插件自存优先 → 官方客户端凭据回退」。
+     * 它已经实现了「账号池 → 单凭据 ref」的解析顺序。
      * ⚠ 不要在这里重复实现那条优先级（重复必然漂移）。
      *
      * ⚠ 同时**清空**记录：没有账号条目可标记，留着旧 id 会误伤一个无辜账号。
@@ -1240,9 +1377,9 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   refresh: async () => {
     /**
      * ⚠ ZCode **没有** refresh 端点（与 Loomy 恒 false 同类，但原因不同）：
-     * 凭据是**静态**的（在官方客户端登录一次就固定下来）。
+     * 凭据是**静态**的（登录一次就固定下来，JWT 里没有 `exp`）。
      *
-     * 这里做的是「重读凭据并回写账号条目」，使官方客户端重新登录后不重启即可生效。
+     * 这里做的是「重读凭据并回写账号条目」，让用户重新登录后不重启即可生效。
      *
      * ⚠⚠ **绝不能用 `current()` + `getAvailableAccount()` 的组合**（审查发现的
      * 真实缺陷，与 `refreshAll` 里记录的那个数据破坏同类）：`current()` 会**先读池**
@@ -1283,6 +1420,18 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     const config = await resolveZcodeCaptchaConfig()
     return await zcode.mintCaptchaAfterRejection(outcome, config, options)
   },
+  /**
+   * captcha 的 region —— **只是「连配置都没有」时的最后兜底**，正常路径不生效。
+   *
+   * ⚠ region 必须与产 param 的那份配置同源（真实缺陷，Gitee issue IKJNPS；
+   *   领取路径与推理路径各有一个实例）。上面三个 mint 回调都会走
+   *   `resolveZcodeCaptchaConfig()`，它把远端配置写进适配器
+   *   （`setCaptchaConfig`）⇒ 组头时适配器读的是 `captchaConfig.region`，
+   *   这里这个字面量只在自建浏览器那条腿（没有任何注入回调）且从未拉到配置时兜底。
+   *
+   * ⚠ 别把它写回「无条件生效」——服务端下发的 region 因账号/渠道而异
+   * （作者账号是 `cn`，z.ai 国际渠道实测 `sgp`），写死只会在 cn 区账号上碰巧正确。
+   */
   captchaRegion: ZCODE_CAPTCHA_FALLBACK.region,
   /**
    * 诊断日志：把「先探后取」的前置耗时与补产事件接到宿主 logger。
@@ -1325,7 +1474,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   fetchRemoteModels: () => zcode.fetchRemoteModelsOnly(),
   accountPool: pool,
   product: ZCODE,
-  // 就绪判据 = 有可用凭据（插件自存或官方客户端凭据）。
+  // 就绪判据 = 有可用凭据（插件自存的）。
   isReady: async () => (await zcode.current()) !== undefined,
   /**
    * 额度用尽 / 无权益时，适配器据此**标记失败的账号并切换**。
@@ -1389,6 +1538,22 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     ctx.logger.warn(`[jet-hub] 修正 LobsterAI 账号显示名失败：${String(error)}`)
   })
 
+  // 一次性修复**老 Gemini 账号**的展示名（同类，成因见 `gemini-auth.ts` 的
+  // `repairAccountNicknames`）：旧版本解析令牌响应时丢掉了 `id_token`，身份只剩
+  // userinfo 一次可静默失败的跨域请求，失败即让昵称退化成池 id（`gemini-6a53dbca`）。
+  // 光改代码只影响新登录的账号，故这里主动补一次。
+  //
+  // ⚠️ 幂等 + 失败不阻塞启动（`repairAccountNicknames` 内部逐账号 catch）。
+  void gemini.repairAccountNicknames(pool).then((repaired) => {
+    if (repaired.length > 0) {
+      ctx.logger.info(
+        `[jet-hub] 已修正 ${repaired.length} 个 Gemini 账号的显示名（改用 Google 账号邮箱）：${repaired.join(', ')}`,
+      )
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[jet-hub] 修正 Gemini 账号显示名失败：${String(error)}`)
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
@@ -1417,10 +1582,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     // 与 raccoon 同款：只按 refreshable 过滤，不看 enabled。
     ['minimax', (p) => minimax.refreshAll(p)],
     // zcode **不可续期**（凭据是静态的）—— 但这个方法仍做实事：
-    // 把磁盘上最新的凭据回写到全部 zcode 账号，
-    // 使用户在官方客户端重新登录后无需重启 DSH。
+    // 把各账号 ref 下最新的凭据回写一遍，让用户重新登录后无需重启 DSH。
     // ⚠ 只按 `refreshable` 过滤、**不看 `enabled`**（AGENTS.md 既有约定）。
     ['zcode', (p) => zcode.refreshAll(p)],
+    // ⚠️ Gemini **可续期**（Google OAuth 的 refresh_token，且会轮换）。
+    // ⚠️ 漏了这一行定时器不武装：凭据到期后**不会自动续期**，
+    // 用户会看到「每隔一小时就要重新登录」，且日志里一个字都没有。
+    ['gemini', (p) => gemini.refreshAll(p)],
   ]
 
   async function refreshAllCredentials(): Promise<void> {
@@ -1655,13 +1823,24 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     loomy: loomyAdapter,
     raccoon: raccoonAdapter,
     minimax: minimaxAdapter,
+    gemini: geminiAdapter,
     zcode: zcodeAdapter,
     opencode: opencodeAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters)
+  // 插件卸载前把签名缓存落盘：`stream()` 每次结束都 flush，但用户可能
+  // 直接关掉 DSH 而上一轮的 flush 还在排队 —— 落一次盘几乎零成本，
+  // 丢的却是「下一轮工具调用能不能带上签名」。
+  ctx.effect(() => () => { void geminiSigStore.flush().catch(() => {}) })
+
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters)
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
   // 自行降级为日志，绝不会让插件 apply() 失败。
   mountOpenAiGateway(ctx, pool)
+  // 思考死循环被中止后的**自动续跑**：把此前必须由用户手打「继续」的那一步
+  // 自动化（真实报障 2026-10-04，见 `loop-recovery.ts` 模块头）。
+  // ⚠️ 它依赖 `agents` 服务，故内部用 `ctx.inject(['agents'], …)` 挂载：
+  // 该服务缺席的 profile 里本功能整体不生效，不会让插件永久 pending。
+  installLoopResume(ctx)
   ctx.provide('accountPool', pool)
 }

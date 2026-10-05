@@ -13,9 +13,13 @@
  * `recommended-models` 下发 —— 这正是「只调 `/models` 会看不到任何免费模型」
  * 的原因，也是本模块必须同时打两个端点的理由。
  *
- * ⚠️ 内嵌兜底表**缺 `cline-free/gemini-3.8-flash`**（远端 `free` 有），
- * 反之 `/models` 有大量兜底表没有的付费模型。故正确做法是**合并**，
- * 而不是「远端失败就用兜底」的简单回退。
+ * ⚠️ **内嵌目录**（`BUILTIN_MODEL_CATALOG`）与远端 `free` 数组**不完全重合**：
+ * `stealth/space-bunny-alpha` 与 `cline-free/*` 不在内嵌目录里、只由远端 `free` 下发，
+ * 反之 `/models` 有大量内嵌目录没有的付费模型。
+ * ⚠️ 「内嵌目录」与 `cline-product.ts` 的**兜底表**（`CLINE_FALLBACK_MODELS`）是两个
+ * 东西：后者**已经含有** `cline-free/*` 条目，说的只是它不来自内嵌目录。
+ * 故正确做法是**合并**，而不是「远端失败就用兜底」的简单回退。
+ * （2026-10-03 复测：`free` 只剩 4 条，`cline-free/gemini-3.8-flash` 已被上游下线。）
  *
  * ## 免费判定（不硬编码模型名）
  *
@@ -224,7 +228,7 @@ export function mergeClineModels(
 
   // 1) 远端 `free` 数组（最权威的免费集合，且顺序有意义）。
   for (const id of remote.freeIds) push(id)
-  // 2) 兜底表（含内嵌目录补充的 gemini-3.8-flash，离线时也可见）。
+  // 2) 兜底表（内嵌目录之外的补充条目，离线时也可见）。
   for (const model of product.fallbackModels) push(model.id)
   // 3) `recommended` / `clinePass` 里出现但上面没覆盖的（保持可发现性）。
   for (const entry of remote.entries) push(entry.id)

@@ -33,7 +33,7 @@
  *
  * ⚠️ **本表只是兜底**：真实免费集合由远端
  * `GET /api/v1/ai/cline/recommended-models` 的 `free` 数组下发，
- * 且**内嵌目录缺 `cline-free/gemini-3.8-flash`**（远端有）。
+ * 且**内嵌目录缺 `stealth/space-bunny-alpha` 与 `cline-free/*`**（远端才有）。
  * 故本表不足以覆盖免费集合 —— 见 `src/cline-models.ts` 的合并逻辑。
  */
 export interface ClineFallbackModel {
@@ -140,12 +140,21 @@ export interface ClineProduct {
  * （实测 `Select-String 'cline-free/'` 零命中）—— 免费模型**只**由
  * `recommended-models` 下发。这是「只调 `/models` 会看不到任何免费模型」的原因。
  *
- * ⚠️ 内嵌目录**缺 `cline-free/gemini-3.8-flash`**（远端 `free` 有），
- * 故这里把它补进兜底表；否则离线时用户看不到截图里的那个模型。
+ * ⚠️ 内嵌目录（`cline-models.ts` 的 `BUILTIN_MODEL_CATALOG`）**缺
+ * `stealth/space-bunny-alpha` 与 `cline-free/*`**，它们只由 `recommended-models`
+ * 的 `free` 数组下发；故本兜底表把它们补上，否则离线 / 远端失败时用户看不到免费模型。
+ * ⚠️ **别把「内嵌目录」与「本兜底表」当成同一个东西**（早先的注释正是这么写的，
+ * 「内嵌目录缺 `cline-free/*`」紧跟着下面这张**含有 3 条 `cline-free/*`** 的表，
+ * 读起来自相矛盾）。内嵌目录缺的、由本表补的 —— 说的是**来源**，不是本表的内容。
+ *
+ * ⚠️ **这条表要与远端 `free` 数组同步**。2026-10-03 复测：`free` 只剩 **4 条**
+ * （`gemini-3.8-flash` 已被 Cline 下线 —— 直连该模型回
+ * `404 {"error":"model not found"}`，且已不在 `free` 数组里），故本表也删掉了它。
+ * **别照抄旧版本的表把它加回来**（旧版本里它带着 `maxTokens: 65_536` 那条实测值，
+ * 那是为解决当时的 400 而填的，见 AGENTS.md「Gemini 系模型的两个 400」）。
  */
 const CLINE_FALLBACK_MODELS: readonly ClineFallbackModel[] = [
-  // ── 免费模型（远端 `free` 数组实测 2026-09-25，共 5 个）──
-  // 这 5 个正是用户截图里的清单。
+  // ── 免费模型（远端 `free` 数组实测，2026-10-03 复测：共 4 个）──
   {
     id: 'stealth/space-bunny-alpha',
     name: 'Space Bunny Alpha',
@@ -172,23 +181,6 @@ const CLINE_FALLBACK_MODELS: readonly ClineFallbackModel[] = [
     supportsImage: true,
     isFree: true,
     description: 'Fast and efficient with 1M context window',
-  },
-  {
-    // ⚠️ 内嵌目录里**没有**这一条（只有远端 `free` 数组下发），元数据取自
-    // 远端 description + 同名 `google/gemini-3.8-flash` 的目录实测值。
-    //
-    // ⚠️ **输出上限是 65536，不要照抄其它免费模型的 131072**（真实缺陷，
-    // 用户报障 2026-09-25）：给该模型发 `max_tokens=131072` 会被上游的
-    // vertex provider 以 400 拒绝 —— "has a maxOutputTokens value of 131072
-    // but the supported range is from 1 (inclusive) to 65537 (exclusive)"，
-    // 即上限就是 65536，与内嵌目录一致。
-    id: 'cline-free/gemini-3.8-flash',
-    name: 'Gemini 3.8 Flash',
-    contextWindow: 1_048_576,
-    maxTokens: 65_536,
-    supportsImage: true,
-    isFree: true,
-    description: "Google's most intelligent Flash model",
   },
   {
     id: 'cline-free/muse-spark-1.3-contributor',

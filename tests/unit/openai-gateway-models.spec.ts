@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { collectGatewayModelIds, collectGatewayModels, toOpenAiModels } from '../../src/openai-gateway/models.js'
+import { collectGatewayEffortViews, collectGatewayModelIds, collectGatewayModels, toGatewayModelIds, toOpenAiModels } from '../../src/openai-gateway/models.js'
 
 /** 目录采集替身：`broken` provider 的 listModels 一律抛错。 */
 function makeSource() {
@@ -62,6 +62,40 @@ describe('collectGatewayModels（目录采集的容错口径）', () => {
       listModels: async () => [{ id: 'anthropic/claude-sonnet-5.5', name: 'Claude' }],
     }
     expect((await collectGatewayModelIds(source))[0].id).toBe('cline/anthropic/claude-sonnet-5.5')
+  })
+
+  /**
+   * ⚠️ 设置页按「一家供应商一张卡片」分组，靠的就是这两个字段。
+   *
+   * 前端**不能**自己按首个 `/` 反推：模型名里允许带斜杠（上一条），
+   * 反推出来的 `provider` 会变成 `cline` 而名字是 `anthropic/claude-sonnet-5.5` ——
+   * 在斜杠模型上恰好也对，但那是巧合；真正的契约是采集侧给的拆分。
+   * 这里锁的是「字段就是采集时的 provider/模型名，一个字符都没加工」。
+   */
+  it('★ 回传权威的 provider / model 拆分（前端据此分组，不靠切 id 反推）', async () => {
+    const source = {
+      listProviders: () => [{ id: 'cline' }],
+      listModels: async () => [{ id: 'anthropic/claude-sonnet-5.5', name: 'Claude' }],
+    }
+    const [entry] = await collectGatewayModelIds(source)
+    expect(entry.provider).toBe('cline')
+    // ⚠️ `model` 是**带斜杠的完整模型名**（`anthropic/...`），不是 `claude-sonnet-5.5`：
+    // 它就是 `listModels` 给的那个 id，网关路由也按它拼回完整 ID。
+    expect(entry.model).toBe('anthropic/claude-sonnet-5.5')
+    expect(`${entry.provider}/${entry.model}`).toBe(entry.id)
+  })
+
+  it('★ provider 与 model 拼回去必须逐字等于 id（分组与路由不会错位）', async () => {
+    // 覆盖三种形态：普通、模型名带斜杠、provider 名里带连字符。
+    const source = {
+      listProviders: () => [{ id: 'deepseek-account' }, { id: 'cline' }],
+      listModels: async (provider: string) => (provider === 'cline'
+        ? [{ id: 'anthropic/claude-sonnet-5.5', name: 'C' }]
+        : [{ id: 'deepseek-flash', name: 'D' }, { id: 'deepseek-v4-pro', name: 'P' }]),
+    }
+    for (const entry of await collectGatewayModelIds(source)) {
+      expect(`${entry.provider}/${entry.model}`, entry.id).toBe(entry.id)
+    }
   })
 
   // 以下三条是**实机报障**后复现出来的畸形输入（真实 DSH service 的形态与类型
@@ -140,5 +174,115 @@ describe('collectGatewayModels（目录采集的容错口径）', () => {
     }
     const groups = await collectGatewayModels(source)
     expect(toOpenAiModels(groups)[0].input).toEqual((await collectGatewayModelIds(source))[0].input)
+  })
+})
+
+/**
+ * 思考档位视图（`/v1/models` 的 `reasoning` 字段、`/v1/reasoning-efforts`
+ * 与设置页 RPC 共用同一份）。
+ *
+ * 背景（真实缺陷）：各 provider 的档位 id 是上游私有值（TRAE 的
+ * `light`/`extra_high`、LobsterAI 的 `xhigh`（界面上叫 Max）、Cline 的 `max`
+ * （界面上叫 Extra）、Raccoon 的 `on`/`off`），而走 OpenAI 协议的客户端只有
+ * 固定 8 档词汇 —— 用户只能照 DSH 界面上的名字猜着填，猜错就是 400。
+ */
+describe('collectGatewayEffortViews（思考档位视图）', () => {
+  const FLASH = { id: 'deepseek-v4.1-flash', name: 'Flash' }
+  const TRAE_REASONING = {
+    reasoning: {
+      efforts: [
+        { id: 'light', name: 'Light' },
+        { id: 'high', name: 'High' },
+        { id: 'extra_high', name: 'Extra High' },
+      ],
+      defaultEffort: 'high',
+    },
+  }
+  /** `resolveModelInfo` 传 undefined 模拟「宿主不提供该能力」。 */
+  const traeSource = (resolveModelInfo?: (provider: string, model: string) => Promise<unknown>) => ({
+    listProviders: () => [{ id: 'trae' }],
+    listModels: async () => [FLASH],
+    ...resolveModelInfo === undefined ? {} : { resolveModelInfo },
+  })
+
+  it('★ 把模型声明的私有档位翻译成「客户端该填」的规范名', async () => {
+    const source = traeSource(async () => ({ provider: 'trae', ...FLASH, ...TRAE_REASONING }))
+    const groups = await collectGatewayModels(source)
+    const view = (await collectGatewayEffortViews(source, groups)).get('trae/deepseek-v4.1-flash')
+    expect(view?.openai_efforts).toEqual(['low', 'high', 'xhigh'])
+    expect(view?.efforts).toEqual([
+      { id: 'light', name: 'Light', canonical: 'low' },
+      { id: 'high', name: 'High', canonical: 'high' },
+      { id: 'extra_high', name: 'Extra High', canonical: 'xhigh' },
+    ])
+    expect(view?.default).toBe('high')
+  })
+
+  it('Raccoon 的二元开关也如实投影（on → high、off → none）', async () => {
+    const source = traeSource(async () => ({
+      reasoning: { efforts: [{ id: 'on', name: '开启' }, { id: 'off', name: '关闭' }], defaultEffort: 'on' },
+    }))
+    const groups = await collectGatewayModels(source)
+    const view = (await collectGatewayEffortViews(source, groups)).get('trae/deepseek-v4.1-flash')
+    expect(view?.openai_efforts).toEqual(['high', 'none'])
+  })
+
+  it('/v1/models 与设置页 RPC 的档位必须同源（各算一遍必然漂移）', async () => {
+    const source = traeSource(async () => ({ ...TRAE_REASONING }))
+    const groups = await collectGatewayModels(source)
+    const views = await collectGatewayEffortViews(source, groups)
+    expect(toOpenAiModels(groups, views)[0].reasoning).toEqual(toGatewayModelIds(groups, views)[0].reasoning)
+  })
+
+  it('⚠️ 模型未声明档位时整个字段缺省（不是空数组：「不知道」≠「一个都没有」）', async () => {
+    const source = traeSource(async () => ({ provider: 'trae', ...FLASH }))
+    const groups = await collectGatewayModels(source)
+    const views = await collectGatewayEffortViews(source, groups)
+    expect(views.size).toBe(0)
+    expect('reasoning' in toOpenAiModels(groups, views)[0]).toBe(false)
+  })
+
+  it('⚠️ 宿主没有 resolveModelInfo 时静默返回空表（附加能力，不能让目录失败）', async () => {
+    const source = traeSource()
+    const groups = await collectGatewayModels(source)
+    await expect(collectGatewayEffortViews(source, groups)).resolves.toEqual(new Map())
+    expect((await collectGatewayModelIds(source)).map(m => m.id)).toEqual(['trae/deepseek-v4.1-flash'])
+  })
+
+  it('⚠️ 单个模型的档位解析失败只影响它自己，目录照常返回', async () => {
+    const source = {
+      listProviders: () => [{ id: 'trae' }],
+      listModels: async () => [FLASH, { id: 'ok', name: 'OK' }],
+      resolveModelInfo: async (_provider: string, model: string) => {
+        if (model === 'deepseek-v4.1-flash') throw new Error('boom')
+        return { reasoning: { efforts: [{ id: 'high', name: 'High' }] } }
+      },
+    }
+    const failures: string[] = []
+    const groups = await collectGatewayModels(source)
+    const views = await collectGatewayEffortViews(source, groups, (_provider, error) => failures.push(String(error)))
+    expect([...views.keys()]).toEqual(['trae/ok'])
+    expect(failures).toHaveLength(1)
+    // 报错里必须能看出是**哪一个模型**解析失败（否则日志里只有一句 boom）。
+    expect(failures[0]).toContain('deepseek-v4.1-flash')
+    expect(await collectGatewayModelIds(source)).toHaveLength(2)
+  })
+
+  it('default 必须是模型真声明过的 id（否则客户端照它填就会 400）', async () => {
+    const source = traeSource(async () => ({
+      reasoning: { efforts: [{ id: 'high', name: 'High' }], defaultEffort: 'max' },
+    }))
+    const groups = await collectGatewayModels(source)
+    expect((await collectGatewayEffortViews(source, groups)).get('trae/deepseek-v4.1-flash')?.default)
+      .toBeUndefined()
+  })
+
+  it('声明里混入脏数据时跳过它，而不是让整个视图崩掉', async () => {
+    const source = traeSource(async () => ({
+      reasoning: { efforts: [{ name: '无 id' }, { id: 'high', name: 'High' }, { id: 42 }] },
+    }))
+    const groups = await collectGatewayModels(source)
+    const view = (await collectGatewayEffortViews(source, groups)).get('trae/deepseek-v4.1-flash')
+    expect(view?.efforts).toEqual([{ id: 'high', name: 'High', canonical: 'high' }])
   })
 })

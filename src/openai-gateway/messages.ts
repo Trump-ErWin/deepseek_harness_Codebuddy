@@ -8,6 +8,8 @@ import {
   type AttachmentBridge,
   type ImageLimits,
 } from './images.js'
+import { isThinkingOffEffort, translateReasoningEffort } from '../reasoning-ladder.js'
+import { rewriteTencentContentFingerprints } from './tencent-fingerprint.js'
 
 export class OpenAiGatewayError extends Error {
   constructor(
@@ -32,6 +34,21 @@ export interface OpenAiChatMessage {
   content?: unknown
   tool_calls?: unknown
   tool_call_id?: unknown
+}
+
+/**
+ * 档位归一化时发生的一件**用户看不出来**的事，交给调用方记日志。
+ *
+ * ⚠️ 必须能被记下来：翻译是**有意**的降级（客户端表达不出模型的私有 id），
+ * 但没有日志的话，「用户选了 ultra、实际只跑 high」这件事事后无从解释。
+ */
+export interface ReasoningEffortNotice {
+  /** 客户端要的档位（原样）。 */
+  requested: string
+  /** `translated` = 就近落到模型声明的一档；`unexpressible` = 模型没有这一族 → 不下发。 */
+  outcome: 'translated' | 'unexpressible'
+  /** 实际下发的 id（`unexpressible` 时缺省）。 */
+  applied?: string
 }
 
 export interface OpenAiChatRequest {
@@ -69,8 +86,26 @@ export function normalizeMaxTokens(value: number | undefined, provider: string, 
  * 而「静默按模型默认走」至少不会让用户的整轮对话失败。
  * （与本仓库「不参与模型请求、不伪造 provider 行为」的既有约定一致。）
  *
- * ⚠️ 但**声明了档位却不含用户要的那一档**时必须抛 400：模型既然声明了档位，
- * 就说明它支持思考控制；静默丢弃会让用户以为设置生效了。
+ * ## 第二类失败：客户端只认识通用档位名，模型用的是私有 id
+ *
+ * 各 provider 的档位 id 是**上游 wire 值**：TRAE 是 `light`/`high`/`extra_high`、
+ * LobsterAI 是 `off`/`high`/`xhigh`（界面上叫 Max）、Cline 是 `…`/`max`（界面上叫
+ * Extra）、Raccoon 是 `on`/`off`。而走 OpenAI 协议的客户端**只有固定 8 档词汇**
+ * （Codex 与为它生成模型目录的 CC Switch 都是 `none…ultra`），它**表达不出**
+ * 那些私有值 —— 用户照着 DSH 界面上的名字填，`max` 撞 `xhigh`、`xhigh` 撞 `max`，
+ * 换来的是一句 400 和**整轮对话不可用**，而两端都看不出为什么。
+ *
+ * 这正是本仓库已经吃过一次的教训（工具类型不认识就让整轮失败，见 `responses.ts`
+ * 文件头）：**拒绝的收益（让用户知道某档没生效）远小于代价（整轮不可用，
+ * 且用户无从修复 —— 客户端根本没有能表达私有 id 的写法）**。
+ * 故改为**翻译**：见 {@link translateReasoningEffort}，按强度序就近落到模型声明的
+ * 同族档位上，并把这件事通过 `onNotice` 交给调用方记日志。
+ *
+ * ⚠️ 但**完全不认识的值仍然 400**（例如拼错的 `banana`）：那不是「名字不通用」，
+ * 是调用方写错了。静默翻译会让拼写错误变成「档位悄悄不生效」。
+ *
+ * ⚠️ **CodeArts 例外**：该 provider 只有开/关两态（适配器把档位阶梯拍平了，
+ * 见 `llm-adapter.ts`），任何档位名都等价，故一律二值化、永不报错。
  *
  * ## 返回值是**三态**，不可混用
  *
@@ -89,22 +124,34 @@ export function normalizeReasoningEffort(
   modelInfo: unknown,
   provider?: string,
   model?: string,
+  onNotice?: (notice: ReasoningEffortNotice) => void,
 ): string | null | undefined {
   if (requested === undefined) return undefined
   const value = String(requested)
   if (provider === 'codearts' && model !== undefined) {
-    return value === 'none' || value === 'off' ? 'off' : 'on'
+    return isThinkingOffEffort(value) ? 'off' : 'on'
   }
   const record = modelInfo as { reasoning?: { efforts?: readonly { id?: unknown }[] } } | undefined
-  const supported = new Set((record?.reasoning?.efforts ?? []).map(effort => String(effort.id)))
-  // 模型未声明档位（supported 为空）：明确**不下发**，而不是原样透传。
+  const declared = (record?.reasoning?.efforts ?? [])
+    .map((effort) => String((effort as { id?: unknown } | undefined)?.id))
+  // 模型未声明档位（declared 为空）：明确**不下发**，而不是原样透传。
   // modelInfo 为 undefined 也走这里 —— 那不是「没有限制」，是「不知道」。
-  if (supported.size === 0) return null
-  if (supported.has(value)) return value
-  if ((value === 'none' || value === 'off') && supported.has('off')) return 'off'
-  if (value !== 'none' && value !== 'off' && supported.has('on')) return 'on'
+  if (declared.length === 0) return null
+  const result = translateReasoningEffort(value, declared)
+  if (result.kind === 'exact') return result.effort
+  if (result.kind === 'mapped') {
+    onNotice?.({ requested: value, outcome: 'translated', applied: result.effort })
+    return result.effort
+  }
+  if (result.kind === 'unexpressible') {
+    onNotice?.({ requested: value, outcome: 'unexpressible' })
+    return null
+  }
+  // 既没被声明、也不在强度序里 —— 调用方写错了。报错要顺带把**可用档位**说清，
+  // 否则用户只能靠试。
   throw new OpenAiGatewayError(
-    `reasoning effort ${JSON.stringify(value)} is not supported by the selected DSH model`,
+    `reasoning effort ${JSON.stringify(value)} is not supported by the selected DSH model`
+    + `（该模型可用的档位：${declared.join(', ')}）`,
     400,
     'unsupported_parameter',
     'unsupported_reasoning_effort',
@@ -117,8 +164,12 @@ export function normalizeReasoningEffort(
  * ⚠️ 图片走 `image_url` → 附件 → `ImageBlock`（见 `./images.ts`），**异步**。
  * 附件服务缺失时（`bridge` 为 undefined）必须抛错而不是静默丢图：静默丢弃会让
  * 用户以为模型看到了图，而答案其实是基于文本生成的。
+ *
+ * ⚠️ 本函数同时被 `/v1/responses` 复用（`responses.ts` 把 Responses 的内容块
+ * 转成 Chat 形状后调它）—— **图片入站只有这一份实现**，两套协议各写一份必然
+ * 漂移成「Chat 端能收图、Responses 端报错」。
  */
-async function partsFromContent(
+export async function partsFromContent(
   content: unknown,
   bridge: AttachmentBridge | undefined,
   limits: ImageLimits,
@@ -170,8 +221,13 @@ async function partsFromContent(
   return blocks
 }
 
-/** 提取纯文本（仅用于需要字符串的场景；带图的 content 走 partsFromContent）。 */
-function textFromContent(content: unknown): string {
+/**
+ * 提取纯文本（仅用于需要字符串的场景；带图的 content 走 partsFromContent）。
+ *
+ * ⚠️ 同样被 `/v1/responses` 复用（`responses.ts` 的 `outputText`）—— 「工具结果
+ * 不能带图」这条判据必须两个端点一致。
+ */
+export function textFromContent(content: unknown): string {
   if (typeof content === 'string') return content
   if (content === null || content === undefined) return ''
   if (!Array.isArray(content)) {
@@ -183,16 +239,28 @@ function textFromContent(content: unknown): string {
     }
     const item = part as { type?: unknown; text?: unknown }
     if (item.type === 'text' && typeof item.text === 'string') return item.text
-    // ⚠️ 这里**不再**因为 image_url 抛错：图片由 partsFromContent 异步处理。
-    // 但纯文本路径（如 tool 消息）遇到图片仍然要拒绝 —— 它拿不到附件桥接。
+    // ⚠️ 图片由 `partsFromContent` 异步处理（user 消息与 **工具结果**都走它）。
+    // 仍会走到这里的只有 assistant / system —— 这两种角色的 content 本就**没有**
+    // 图片通道（适配器只声明文本输出），故明确拒绝而不是静默压成空串。
     if (item.type === 'image_url') {
-      throw new OpenAiGatewayError('tool 消息的内容不能包含图片', 400, 'unsupported_content', 'unsupported_content')
+      throw new OpenAiGatewayError(
+        'assistant / system 消息的内容不能包含图片（只有 user 消息与工具结果支持图片）',
+        400,
+        'unsupported_content',
+        'unsupported_content',
+      )
     }
     throw new OpenAiGatewayError('message.content contains an unsupported part')
   }).join('')
 }
 
-function newMessage(
+/**
+ * 造一条 DSH 消息。
+ *
+ * ⚠️ **导出**给 `responses.ts` 用：两个端点造出来的消息必须同形（同样的 id/source
+ * 构造），否则同一份历史在两个端点上的来源标记不同，排查时会误导。
+ */
+export function createGatewayMessage(
   role: Message['role'],
   content: Message['content'],
   source: Message['source'],
@@ -232,34 +300,53 @@ async function convertMessage(
   const value = raw as OpenAiChatMessage
   const role = value.role
   if (role === 'system') {
-    return newMessage('system', [{ type: 'text', text: textFromContent(value.content) }], {
+    // ⚠️ 腾讯系（`buddy` / `workbuddy`）后端有**内容级**风控：客户端自带的
+    // 模板句（如 ZCode 的 gitStatus 注入）会让整轮请求 400 + 11128。
+    // 改写只作用于 system、且只改腾讯系 —— 依据见 ./tencent-fingerprint.ts。
+    return createGatewayMessage('system', [{
+      type: 'text',
+      text: rewriteTencentContentFingerprints(textFromContent(value.content), provider),
+    }], {
       kind: 'plugin', plugin: 'dsh-openai-gateway',
     })
   }
   if (role === 'user') {
     // ⚠️ user 消息走 parts：图片在这里被真正接收（其它角色不接受图片）。
-    return newMessage('user', await partsFromContent(value.content, bridge, limits), { kind: 'user' })
+    return createGatewayMessage('user', await partsFromContent(value.content, bridge, limits), { kind: 'user' })
   }
   if (role === 'assistant') {
     const text = textFromContent(value.content)
     const content: Message['content'] = text.length > 0 ? [{ type: 'text', text }] : []
     if (value.tool_calls !== undefined) content.push(...convertToolCalls(value.tool_calls))
-    return newMessage('assistant', content, { kind: 'model', provider, model })
+    return createGatewayMessage('assistant', content, { kind: 'model', provider, model })
   }
   if (role === 'tool') {
     if (typeof value.tool_call_id !== 'string' || value.tool_call_id.length === 0) {
       throw new OpenAiGatewayError('tool messages require tool_call_id')
     }
-    return newMessage('user', [{
+    // ⚠️ 工具结果的 content **同样支持图片**（2026-10-04 修，真实报障）。
+    // 早先这里走 `textFromContent`，而它对 `image_url` 一律抛错 ⇒
+    // 「读图类工具」（Codex 的 `view_image`、DSH 的 `read_image`）的结果
+    // 让整轮对话 400（用户看到「tool 消息的内容不能包含图片」）。
+    // 图片走与 user 消息**同一份**入站实现（附件服务落盘），故这里复用
+    // `partsFromContent`；各适配器本就递归消费 `tool-result` 的内嵌图片
+    // （见 `trae-adapter.ts` 的 `collectImages` / `userContentParts`）。
+    return createGatewayMessage('user', [{
       type: 'tool-result',
       toolCallId: value.tool_call_id as never,
-      content: [{ type: 'text', text: textFromContent(value.content) }],
+      content: await partsFromContent(value.content, bridge, limits),
     }], { kind: 'tool', callId: value.tool_call_id as never })
   }
   throw new OpenAiGatewayError(`unsupported message role: ${String(role)}`)
 }
 
-function convertTools(raw: unknown): ToolSchema[] | undefined {
+/**
+ * Chat 形状的 tools → DSH 的 ToolSchema。
+ *
+ * ⚠️ 被 `/v1/responses` 复用：`responses.ts` 先把 Responses 的**扁平**工具定义
+ * 改写成 Chat 的嵌套形状，再交给这里做校验。工具 schema 的校验口径只有这一份。
+ */
+export function convertTools(raw: unknown): ToolSchema[] | undefined {
   if (raw === undefined) return undefined
   if (!Array.isArray(raw)) throw new OpenAiGatewayError('tools must be an array')
   return raw.map((value) => {
@@ -289,7 +376,13 @@ export function parseModelRoute(value: unknown): { provider: string; model: stri
   return { provider: value.slice(0, slash), model: value.slice(slash + 1) }
 }
 
-function tokenValue(value: unknown, name: string): number | undefined {
+/**
+ * 正整数字段的校验（`max_tokens` / `max_completion_tokens` / `max_output_tokens`）。
+ *
+ * ⚠️ 被 `/v1/responses` 复用（`responsesMaxOutputTokens`），三个字段的判据必须
+ * 完全一致，否则「同一个数字在 Chat 端合法、在 Responses 端报错」会被当成缺陷。
+ */
+export function tokenValue(value: unknown, name: string): number | undefined {
   if (value === undefined) return undefined
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
     throw new OpenAiGatewayError(`${name} must be a positive integer`)

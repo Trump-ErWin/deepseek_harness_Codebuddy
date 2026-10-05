@@ -146,7 +146,22 @@ export interface ClaimOutcomeCommon {
 }
 
 export type ClaimOutcome =
-  | (ClaimOutcomeCommon & { kind: 'claimed'; credit: number; streakDays: number; isStreakDay: boolean; delayedMessage?: string })
+  | (ClaimOutcomeCommon & {
+      kind: 'claimed'
+      credit: number
+      streakDays: number
+      isStreakDay: boolean
+      delayedMessage?: string
+      /**
+       * ★ `credit` 的单位（2026-10-03 新增）。
+       *
+       * ⚠ **缺省按「积分」处理** ⇒ 其余 provider 行为逐字不变。
+       *   ZCode 下发 `unit_type: "token"`（实测），1 亿 token 若按积分显示
+       *   就是错的 ⇒ 它显式传 `unit: token`。
+       *   展示侧用 `formatUnits(credit, unit)` / `unitLabel(unit)`。
+       */
+      unit?: 'token' | 'credit'
+    })
   | (ClaimOutcomeCommon & { kind: 'already-claimed'; message: string })
   | (ClaimOutcomeCommon & { kind: 'inactive'; message: string; actionRequired?: boolean })
   | (ClaimOutcomeCommon & { kind: 'failed'; code: number; message: string })
@@ -572,4 +587,34 @@ export async function fetchCreditBalance(
  */
 export function roundCredits(value: number): number {
   return Math.round(value * 100) / 100
+}
+
+/**
+ * 把单位串归一到**展示口径**，返回 `'token'` 或 `'credit'`。
+ *
+ * ## 为什么需要它（真实缺陷，2026-10-03）
+ *
+ * 用户报障：WorkBuddy 国际版有**两个账号**，用量徽标却显示
+ * `WorkBuddy (国际版) • 341.78积分 · 100积分`（两个数并排），账号再多就成一长串。
+ *
+ * 根因不在「多账号没法合计」，而在**服务端把同一个单位拼成两种写法**（实测逐包
+ * 原值）：账号 `…01CC739A` 的包是 `CapacityUnit: 'credit'`（Bonus Pack 241.78）
+ * 与 `'credits'`（Free Plan Subscription 100），账号 `…297957E1` 的是 `'credits'`。
+ * 客户端的折叠态按**原始字符串**分组 ⇒ `credit` 与 `credits` 各成一组 ⇒ 两个
+ * 账号落进两个分组，各自渲染一次「积分」标签。
+ *
+ * ⚠️ 口径：**分组键必须与展示名同源**。凡是展示层会显示成「积分」的单位串，就必须
+ * 落进同一个分组。故分组前一律走本函数，`token` 与积分**不互相折算**（分两组）。
+ *
+ * ⚠️ 与客户端 `plugin-src/client/credits-format.js` 的 `normalizeUnit`
+ * **必须逐字等价**：宿主算套餐读数、客户端算余额分组，两边不一致就会出现
+ * 「套餐按一个单位、余额按另一个单位」的自相矛盾。一致性由
+ * `tests/unit/usage-badge-client.spec.ts` 逐项比对锁死。
+ *
+ * ⚠️ **不要用它改写 `CreditPackage.unit`**：那里要保留服务端原值（设置页的逐包
+ * 明细、`badgePlanFor` 的包名匹配都依赖它）。归一化只发生在「当分组键/展示名用」
+ * 的那一步。
+ */
+export function normalizeCreditUnit(unit: string): 'token' | 'credit' {
+  return unit === 'token' ? 'token' : 'credit'
 }
