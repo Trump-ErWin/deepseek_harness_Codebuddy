@@ -893,14 +893,15 @@ function isPortFree(port: number): Promise<boolean> {
  * 后者是可选安装，不能假设存在。实测本机 5.1 存在且 Add-Type 可用。
  *
  * @param pid 目标浏览器主进程 pid。
- * @param exeName 浏览器可执行名（仅 macOS 的 pid 兜底用，见
- *   {@link buildMacosMiniaturizeFallbackArgs}）；缺省时 macOS 不做兜底。
+ * @param log 诊断回调（可选）。macOS 藏窗失败时用它告警一次，原因见
+ *   {@link hideWindowMacos}：失败被静默吞掉，用户报「窗口还是弹出来」时
+ *   没有这条日志就只能猜。
  */
-function hideWindowFromTaskbar(pid: number, exeName = ''): void {
+function hideWindowFromTaskbar(pid: number, log?: (message: string) => void): void {
   try {
     if (process.platform === 'win32') hideWindowWindows(pid)
     else if (process.platform === 'linux') hideWindowLinux(pid)
-    else if (process.platform === 'darwin') hideWindowMacos(pid, exeName)
+    else if (process.platform === 'darwin') hideWindowMacos(pid, log)
   } catch {
     // 静默：优化失败不影响 captcha。
   }
@@ -1095,9 +1096,10 @@ function hideWindowLinux(pid: number): void {
  *   `error`/非零退出都直接吞掉，最坏结果回到修复前的行为（窗口正常弹出），
  *   **绝不能让 captcha 因此不可用**。
  * - 与 Windows 侧一样用 `windowsHide: true` + `stdio: 'ignore'` 异步 fire-and-forget。
- * - **pid 兜底**：Chromium 启动后可能 re-exec 换 pid，此时 `unix id` 匹配落空、
- *   osascript 非零退出；此时按**可执行名**再试一次（`exeName` 由 `launch()` 传入，
- *   缺省则不兜底）。
+ * - **只按 pid 匹配**（`unix id`），刻意没有「按进程名兜底」—— 理由与代价见
+ *   {@link hideWindowMacos} 的函数头。
+ * - ⚠ 本函数是本文件**唯一**拼 AppleScript 的地方，且**只插值一个整数**：
+ *   没有字符串插值 ⇒ 没有引号/反斜杠转义问题（初版的进程名兜底栽在这里）。
  *
  * @param pid 目标浏览器主进程 pid。
  * @returns `osascript` 参数数组（`-e <script>`），纯函数便于单测锁死。
@@ -1112,41 +1114,63 @@ export function buildMacosMiniaturizeArgs(pid: number): string[] {
 }
 
 /**
- * 构造 pid 兜底用的最小化参数：按**进程名**匹配（pid 匹配落空后的第二次尝试）。
+ * 对 macOS 该 pid 的窗口执行最小化（异步、失败静默）。
  *
- * ⚠ 按名字匹配比按 pid 宽松，故只在 pid 匹配**已失败**时调用（见
- * {@link hideWindowMacos} 的 `close` 分支），正常路径永远走不到这里。
+ * ## ⚠⚠ 刻意**没有**「按进程名兜底」——那会最小化用户自己的浏览器
  *
- * @param exeName 浏览器可执行名（如 `Google Chrome`），不含路径。
- * @returns `osascript` 参数数组，纯函数便于单测锁死。
+ * 初版在 pid 匹配非零退出后，用 `first process whose name is "Google Chrome"`
+ * 再试一次。**已删除**，两个原因：
+ *
+ * ① **会误伤用户真实浏览器**：`whose name is` 匹配**任意**同名进程，不是「我们
+ *    那个」。用户在用 Chrome 时兜底一旦触发，其全部真实窗口被最小化。
+ *    ⚠ 而触发条件比想象中宽：本函数以「osascript 非零退出」触发兜底，
+ *    `stdio: 'ignore'` 又丢掉 stderr ⇒ **分不清「pid 落空」与「辅助功能未授权
+ *    （-1719）」**。后者才是更常见的失败原因（真机第一轮实测就撞到过）。
+ * ② **字符串插值未转义**：`"${exeName}"` 里若进程名含 `"`，字面量会被撑开
+ *    （实测 `evil".do shell script "id` → `… whose name is "evil".do shell
+ *    script "id") to true`）。删掉兜底后**本文件不再有任何字符串插值进
+ *    AppleScript**，注入面随之一并消失。
+ *
+ * ⇒ pid 落空就**什么都不做**：窗口短暂可见，正是**修复前**的行为。代价是
+ * Chrome re-exec 换 pid 时最小化失效 —— 那是「少一个优化」，不是功能回退。
+ * 拿「少隐藏一次」换「绝不最小化用户自己的浏览器」，这笔账划算。
+ *
+ * 契约锁在 `tests/unit/zcode-window-hide-macos-review.spec.ts`。
+ *
+ * 一次性告警闸门：同一进程里只提醒一次，避免每次 `launch()` 刷屏。
  */
-export function buildMacosMiniaturizeFallbackArgs(exeName: string): string[] {
-  const appleScript =
-    `tell application "System Events" to set miniaturized of every window of ` +
-    `(first process whose name is "${exeName}") to true`
-  return ['-e', appleScript]
+let macosHideWarned = false
+
+/**
+ * macOS 藏窗失败时告警一次。
+ *
+ * ⚠ 只说「可能的原因」而不下断言：`stdio: 'ignore'` 丢掉了 stderr，
+ * 区分不出「pid 落空」与「辅助功能未授权（-1719）」，而后者更常见。
+ */
+function warnMacosHideOnce(log: ((message: string) => void) | undefined, reason: string): void {
+  if (log === undefined || macosHideWarned)
+    return
+  macosHideWarned = true
+  log(
+    `[jet-hub] zcode macOS 藏窗未生效（${reason}）—— 窗口会照常弹出，但不影响 captcha。` +
+    '最常见原因是宿主未获 macOS「辅助功能」权限：系统设置 → 隐私与安全性 → 辅助功能 → 勾选宿主（通常需重启应用）。',
+  )
 }
 
 /**
- * 对 macOS 该 pid 的窗口执行最小化（异步、失败静默）。
- *
  * @param pid 目标浏览器主进程 pid。
- * @param exeName 浏览器可执行名；非空时在 pid 匹配失败后按进程名兜底一次。
+ * @param log 诊断回调（可选），见 {@link hideWindowFromTaskbar}。
  */
-function hideWindowMacos(pid: number, exeName = ''): void {
+function hideWindowMacos(pid: number, log?: (message: string) => void): void {
   const child = spawn('osascript', buildMacosMiniaturizeArgs(pid), {
     stdio: 'ignore',
     windowsHide: true,
   })
-  child.on('error', () => { /* 没装 osascript —— 静默跳过 */ })
-  // 同步抛错由 hideWindowFromTaskbar 的 try/catch 接住；异步失败走这里。
+  child.on('error', () => { warnMacosHideOnce(log, 'osascript 不可用') })
+  // 非零退出同样静默继续（不重试，见函数头 ①），但留一条告警。
   child.on('close', (code) => {
-    if (code === 0 || exeName === '') return
-    const fallback = spawn('osascript', buildMacosMiniaturizeFallbackArgs(exeName), {
-      stdio: 'ignore',
-      windowsHide: true,
-    })
-    fallback.on('error', () => { /* 兜底也失败 —— 静默 */ })
+    if (code !== 0)
+      warnMacosHideOnce(log, `osascript 退出码 ${code}`)
   })
 }
 
@@ -1540,7 +1564,7 @@ export class ZcodeCaptchaBrowser {
      * ⚠ **不 await**：这是装饰性优化，让它在后台跑（那个「约 1.2 秒」是这一步 PowerShell 自身的耗时，**与 mint 的 0.4–0.5 秒无关**），
      * 与后续导航重叠。失败静默，不影响 captcha。
      */
-    if (hide && this.child?.pid !== undefined) hideWindowFromTaskbar(this.child.pid, basename(executable))
+    if (hide && this.child?.pid !== undefined) hideWindowFromTaskbar(this.child.pid, this.log)
   }
 
   /**
