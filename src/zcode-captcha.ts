@@ -274,17 +274,64 @@ function macBrowserCandidates(home: string): string[] {
 }
 
 /**
+ * Linux 候选链。
+ *
+ * ## ⚠️ 签名里**刻意没有 `env`** —— 这是对报障人建议的一处**结构性**修正
+ *
+ * Gitee issue IKJKNT 的报障人在评论里给了实现建议，其中写了
+ * `const env = process.env` —— 那会让函数**忽略注入的 `env`**，
+ * linux 分支在 Windows CI 上就不可测、永远静默通过。
+ * 那正是 {@link macBrowserCandidates} 存在的同一条理由（只是它用 `posix.join` 躲掉了）。
+ * 这里**连参数都不给** ⇒ 结构上不可能误读进程环境。
+ *
+ * ⚠️ **`ZCODE_CHROME_PATH` 本函数不得处理**：{@link browserCandidates} 已统一
+ * `unshift`，平台分支再处理一次会出现重复候选。
+ *
+ * ## ⚠️ flatpak 只能用 `exports/bin/`，**不是 `appstream/`**
+ *
+ * 报障人建议里写的是 `…/flatpak/appstream/org.chromium.Chromium` —— 那是
+ * **AppStream 元数据目录**，不是可执行文件。而 {@link findBrowserExecutable}
+ * 的判据只有 `existsSync`（**不做「能不能执行」**），列了它就会
+ * 「探测成功 → spawn 时 EACCES」，**比不列更糟**。
+ * 反例锁在 `tests/unit/zcode-browser-linux.spec.ts`。
+ */
+function linuxBrowserCandidates(home: string): string[] {
+  return [
+    // ① Chrome（`google-chrome` 与 `google-chrome-stable` 是两个包名）。
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/opt/google/chrome/chrome',
+    // ② Chromium（Debian/Ubuntu 的 `chromium`、`chromium-browser`；snap 版）。
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/snap/bin/chromium',
+    // ③ Edge（微软的 Linux 包）。
+    '/usr/bin/microsoft-edge',
+    // ④ Brave（chromium 内核）。
+    '/usr/bin/brave-browser',
+    // ⑤ flatpak 导出的**可执行文件**（见函数头关于 appstream 的警告）。
+    posix.join(home, '.local', 'share', 'flatpak', 'exports', 'bin', 'org.chromium.Chromium'),
+  ]
+}
+
+/**
  * 浏览器可执行文件的**候选链**（按优先级，`ZCODE_CHROME_PATH` 恒排第一）。
  *
  * ## 为什么抽成**纯函数**
  *
- * 候选链按平台分叉后，**macOS 分支在本仓库的 Windows CI 上一次都执行不到** ——
- * 直接写在 `findBrowserExecutable()` 里，这条路径会永远「静默通过」，
- * 直到用户报障（issue IKJKNT 就是这么来的）。抽出来后 darwin 分支是
- * 纯字符串计算，可在任何平台断言。
+ * 候选链按平台分叉后，**macOS / Linux 分支在本仓库的 Windows CI 上一次都执行不到** ——
+ * 直接写在 `findBrowserExecutable()` 里，这些路径会永远「静默通过」，
+ * 直到用户报障（IKJKNT 就是 macOS 的 macOS 那条的先例）。
+ * 抽出来后它们是纯字符串计算，可在任何平台断言。
  *
  * 三个入参都可注入，正是为了这个：`platform` 定分支、`env` 造 scoop /
- * `ZCODE_CHROME_PATH`、`home` 造 `~/Applications`。
+ * `ZCODE_CHROME_PATH`、`home` 造 `~/Applications` 与 `~/.local/share/flatpak`。
+ *
+ * ## ⚠⚠ **`else` 分支是 Windows —— 别把它当「非 Win 也走这儿」
+ *
+ * 三个平台的分支必须**显式**列全。历史上 `linux` 落在 else 里拼出一套
+ * `PROGRAMFILES` / `msedge.exe`（Linux 上全不存在 ⇒ 恒找不到浏览器），
+ * 与 macOS 那条**完全同型**。**新增平台时务必在这里加一条显式分支。**
  *
  * ## ⚠ 两个必须防的坑（都实测踩过）
  *
@@ -313,9 +360,14 @@ export function browserCandidates(
   const platform = input.platform ?? process.platform
   const env = input.env ?? process.env
   const home = input.home ?? homedir()
-  const candidates = platform === 'darwin'
-    ? macBrowserCandidates(home)
-    : windowsBrowserCandidates(env, home)
+  let candidates: string[]
+  if (platform === 'darwin') {
+    candidates = macBrowserCandidates(home)
+  } else if (platform === 'linux') {
+    candidates = linuxBrowserCandidates(home)
+  } else {
+    candidates = windowsBrowserCandidates(env, home)
+  }
   const override = env.ZCODE_CHROME_PATH
   if (typeof override === 'string' && override.trim().length > 0) {
     candidates.unshift(override.trim())
@@ -360,6 +412,11 @@ export function browserNotFoundMessage(platform: NodeJS.Platform = process.platf
   if (platform === 'win32') {
     return '已尝试 scoop chromium / Chrome / Chromium / Edge；' +
       '可用 ZCODE_CHROME_PATH 显式指定 chrome.exe 路径。'
+  }
+  if (platform === 'linux') {
+    return '已尝试 /usr/bin 下的 google-chrome / chromium / microsoft-edge / brave-browser' +
+      '（含 /opt/google/chrome、/snap/bin 与 flatpak 导出位置）；' +
+      '可用 ZCODE_CHROME_PATH 显式指定可执行文件路径（如 /usr/bin/chromium）。'
   }
   return '已尝试 Chrome / Chromium / Edge 的常见安装位置；' +
     '可用 ZCODE_CHROME_PATH 显式指定可执行文件路径。'
