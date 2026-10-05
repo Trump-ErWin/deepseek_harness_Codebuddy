@@ -374,7 +374,6 @@ describe('readTokenLedgerHistory（第 4 期 · 历史视图）', () => {
   }
   const DAY1 = Date.UTC(2026, 9, 4, 2, 0, 0) // UTC+8 2026-10-04 10:00
   const DAY2 = Date.UTC(2026, 9, 5, 2, 0, 0) // UTC+8 2026-10-05 10:00
-  const DAY9 = Date.UTC(2026, 9, 12, 2, 0, 0) // UTC+8 2026-10-12 10:00
 
   it('日聚合 → 聚合树：结构与内存快照同形，各级小计 = 子级之和', () => {
     const days = makeDays([

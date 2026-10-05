@@ -13,6 +13,10 @@
  * - **节流落盘**（2 秒防抖）：记账在推理关键路径上，每笔都同步写盘会把
  *   「一次推理」变成「一次磁盘写」。防抖窗口内崩溃最多丢最近 2 秒的计数 ——
  *   对统计型数据是可接受的精度损失（换取零阻塞）。
+ * - **落盘是「增量合并写」，不是整体覆盖**（真实缺陷，审计发现并原样复现）：
+ *   两个实例并存时（fiber 重启交错；或同机多 profile 共享同一 home——见上条
+ *   与 `permanent-lock-store.ts`）各自内存视图独立，整体覆盖会**互相抹掉**。
+ *   详见 `FileLedgerStore.flush` 的注释。
  *
  * ## 日界
  *
@@ -25,7 +29,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { resolveJetHubHome } from './jet-hub-store.js'
-import { mergeDayEntry, type TokenLedgerDayMap } from './token-ledger.js'
+import { mergeDayEntry, type TokenLedgerDayBucket, type TokenLedgerDayMap } from './token-ledger.js'
 
 /** 独立文档的文件名（与 state.json 同目录）。 */
 export const TOKEN_LEDGER_FILE = 'token-ledger.json'
@@ -88,6 +92,13 @@ class MemoryLedgerStore implements TokenLedgerStore {
 /** 文件后端：`$DSH_HOME/jet-hub/token-ledger.json`（原子写 + 节流）。 */
 class FileLedgerStore implements TokenLedgerStore {
   private days: TokenLedgerDayMap = new Map()
+  /**
+   * **已落盘基线**：上次成功写盘时各桶的快照。
+   *
+   * `flush()` 只把「相对本基线新增的增量」合并进**盘上当前内容**（见 flush 的
+   * 注释）。基线在每次成功写盘后前移。
+   */
+  private written: TokenLedgerDayMap = new Map()
   /** 防抖计时器（Node 返回值带 unref，浏览器/测试环境可能没有）。 */
   private timer: ReturnType<typeof setTimeout> | undefined
   /** 节流窗口内又发生了写入时，flush 后需要再排一次。 */
@@ -97,59 +108,60 @@ class FileLedgerStore implements TokenLedgerStore {
     private readonly path: string,
     private readonly logger: { warn(message: string): void } | undefined,
   ) {
-    // ⚠️ **构造时读一次盘**，且这是**唯一**的读盘时机。
+    // ⚠️ **构造时读一次盘**（`days` 与 `written` 同时初始化）。
     //
-    // 两个缺陷都由「没在这里读」引发（复审实测）：
-    // ① 之前从不读盘 ⇒ 新进程的 `days` 是空表，首次 `flush()` 用**空表整体覆盖**
-    //    文档 ⇒ 每次重启 DSH 历史日聚合归零（与 README 的「重启保留 90 天」相反）；
-    // ② 之前是「每次 `load()` 都读盘」⇒ 频繁读侧会把未落盘的计数打回旧值。
-    // 构造时读一次同时解决两者：内存恒为盘上数据的**超集**，整体覆盖才安全。
-    this.hydrate()
+    // 缺陷（复审实测）：原先从不读盘 ⇒ 新进程的 `days` 是空表，首次 `flush()`
+    // 用**空表整体覆盖**文档 ⇒ 每次重启 DSH 历史日聚合归零（与 README 的
+    // 「重启保留 90 天」相反）。构造时读盘让内存成为盘上数据的**超集**。
+    //
+    // ⚠️ 但**光靠这一点不够**（审计发现，已原样复现）：内存是超集只在**单实例**
+    // 下成立。两个实例并存时（fiber 重启交错、或同机多 profile 共享 home），
+    // 各自的内存视图独立，整体覆盖会互相抹掉。故 `flush()` 必须是**增量合并写**。
+    this.days = this.readFile()
+    this.written = cloneDays(this.days)
   }
 
-  /** 从磁盘载入日聚合（**只在构造时调用一次**，见构造函数注释）。 */
-  private hydrate(): void {
+  /** 从磁盘读日聚合（构造时用；返回**空表**表示无盘/损坏）。 */
+  private readFile(): TokenLedgerDayMap {
+    const out: TokenLedgerDayMap = new Map()
     try {
-      if (!existsSync(this.path)) return
+      if (!existsSync(this.path)) return out
       const parsed = JSON.parse(readFileSync(this.path, 'utf-8')) as unknown
-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-        const record = parsed as { days?: unknown }
-        if (typeof record.days === 'object' && record.days !== null && !Array.isArray(record.days)) {
-          for (const [day, rawBuckets] of Object.entries(record.days as Record<string, unknown>)) {
-            if (typeof rawBuckets !== 'object' || rawBuckets === null || Array.isArray(rawBuckets)) continue
-            const bucketList = rawBuckets as Record<string, unknown>
-            let target = this.days.get(day)
-            if (target === undefined) {
-              target = new Map()
-              this.days.set(day, target)
-            }
-            for (const [key, rawBucket] of Object.entries(bucketList)) {
-              if (typeof rawBucket !== 'object' || rawBucket === null) continue
-              const b = rawBucket as Record<string, unknown>
-              // 数值字段全部钳制（手工编辑/旧版本的脏数据不致命，但也不能 NaN）。
-              target.set(key, {
-                requests: Number(b.requests) || 0,
-                reportedRequests: Number(b.reportedRequests) || 0,
-                inputTokens: Number(b.inputTokens) || 0,
-                outputTokens: Number(b.outputTokens) || 0,
-                cacheReadTokens: Number(b.cacheReadTokens) || 0,
-                cacheWriteTokens: Number(b.cacheWriteTokens) || 0,
-                reasoningTokens: Number(b.reasoningTokens) || 0,
-                errors: Number(b.errors) || 0,
-                // Σ/份数（第 3 期均值）：旧文档没这些键 → 0（等价于无样本）。
-                ttftSumMs: Number(b.ttftSumMs) || 0,
-                ttftCount: Number(b.ttftCount) || 0,
-                tpsSum: Number(b.tpsSum) || 0,
-                tpsCount: Number(b.tpsCount) || 0,
-              })
-            }
-          }
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return out
+      const record = parsed as { days?: unknown }
+      if (typeof record.days !== 'object' || record.days === null || Array.isArray(record.days)) return out
+      for (const [day, rawBuckets] of Object.entries(record.days as Record<string, unknown>)) {
+        if (typeof rawBuckets !== 'object' || rawBuckets === null || Array.isArray(rawBuckets)) continue
+        const bucketList = rawBuckets as Record<string, unknown>
+        const target = new Map<string, TokenLedgerDayBucket>()
+        for (const [key, rawBucket] of Object.entries(bucketList)) {
+          if (typeof rawBucket !== 'object' || rawBucket === null) continue
+          const b = rawBucket as Record<string, unknown>
+          // 数值字段全部钳制（手工编辑/旧版本的脏数据不致命，但也不能 NaN）。
+          target.set(key, {
+            requests: Number(b.requests) || 0,
+            reportedRequests: Number(b.reportedRequests) || 0,
+            inputTokens: Number(b.inputTokens) || 0,
+            outputTokens: Number(b.outputTokens) || 0,
+            cacheReadTokens: Number(b.cacheReadTokens) || 0,
+            cacheWriteTokens: Number(b.cacheWriteTokens) || 0,
+            reasoningTokens: Number(b.reasoningTokens) || 0,
+            errors: Number(b.errors) || 0,
+            // Σ/份数（第 3 期均值）：旧文档没这些键 → 0（等价于无样本）。
+            ttftSumMs: Number(b.ttftSumMs) || 0,
+            ttftCount: Number(b.ttftCount) || 0,
+            tpsSum: Number(b.tpsSum) || 0,
+            tpsCount: Number(b.tpsCount) || 0,
+          })
         }
+        out.set(day, target)
       }
     } catch (error) {
       // 损坏按空表处理（统计型数据不值得阻断启动）。
       this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，历史用量按空表处理: ${String(error)}`)
+      return new Map()
     }
+    return out
   }
 
   /** 纯内存读（不碰磁盘）—— 见接口注释。 */
@@ -183,20 +195,129 @@ class FileLedgerStore implements TokenLedgerStore {
     this.timer.unref?.()
   }
 
+  /**
+   * **增量合并写**（不是整体覆盖）。
+   *
+   * ## 为什么必须合并（真实缺陷，审计发现并已复现）
+   *
+   * 整体覆盖只在**单实例**下安全。两个实例并存时（fiber 重启交错期间新旧两个
+   * store 都在；或同机多 profile 共享同一个 home —— `permanent-lock-store.ts`
+   * 开篇与本文档模块头都明载这一点），各自的内存视图独立，**谁后写谁抹掉对方**：
+   *
+   * ```
+   * O 记 100（未 flush）        : 盘 = 0
+   * N（新实例）记 1 并 flush    : 盘 = 1
+   * O.flush()（旧 fiber dispose）: 盘 = 100   ← N 的 1 被抹掉
+   * N 再记 5 并 flush           : 盘 = 6     ← O 的 100 也丢了（双向丢失，期望 106）
+   * ```
+   *
+   * ⚠️ 修「构造时读盘」只解决**顺序**场景（新实例读到旧数据），解决不了**并存**
+   * 场景 —— 后者必须靠合并。
+   *
+   * ## 算法
+   *
+   * 1. 重读盘上**当前**内容（别的实例可能刚写过）；
+   * 2. 只把「相对本实例上次写盘基线 {@link written} 的**增量**」逐桶累加上去；
+   * 3. 原子写（tmp + rename），成功后基线前移。
+   *
+   * 增量 = 当前内存值 − 上次落盘时的值（逐字段相减，负数钳到 0 防手工编辑倒挂）。
+   */
   flush(): void {
     try {
       mkdirSync(join(this.path, '..'), { recursive: true })
+      // ① 盘上现况（含别的实例刚写的）
+      const merged = this.readFile()
+      // ② 把本实例的增量并进去
+      for (const [day, buckets] of this.days) {
+        let target = merged.get(day)
+        if (target === undefined) {
+          target = new Map()
+          merged.set(day, target)
+        }
+        const base = this.written.get(day)
+        for (const [key, bucket] of buckets) {
+          const before = base?.get(key)
+          const delta = subtractBucket(bucket, before)
+          const existing = target.get(key)
+          if (existing === undefined) {
+            target.set(key, delta)
+          } else {
+            target.set(key, addBucket(existing, delta))
+          }
+        }
+      }
+      // ③ 原子写（淘汰过老日键）
       const days: Record<string, Record<string, unknown>> = {}
-      for (const [day, buckets] of pruneDays(this.days)) {
+      for (const [day, buckets] of pruneDays(merged)) {
         days[day] = Object.fromEntries(buckets)
       }
       const tmp = `${this.path}.tmp`
       writeFileSync(tmp, JSON.stringify({ schema: SCHEMA, days }, null, 2), 'utf-8')
       renameSync(tmp, this.path)
+      // ④ 基线前移（只在写盘成功后）
+      this.written = cloneDays(this.days)
     } catch (error) {
       // 落盘失败只记日志：账本还有内存兜底，不能反噬推理。
       this.logger?.warn(`[jet-hub] 写入 ${this.path} 失败（本次统计不入盘）: ${String(error)}`)
     }
+  }
+}
+
+/** 深拷贝日聚合表（桶对象也复制，避免与基线共享引用）。 */
+function cloneDays(days: TokenLedgerDayMap): TokenLedgerDayMap {
+  const out: TokenLedgerDayMap = new Map()
+  for (const [day, buckets] of days) {
+    out.set(day, new Map([...buckets].map(([key, bucket]) => [key, { ...bucket }])))
+  }
+  return out
+}
+
+/** 逐字段相加（两个桶合并）。 */
+function addBucket(
+  a: TokenLedgerDayBucket,
+  b: TokenLedgerDayBucket,
+): TokenLedgerDayBucket {
+  return {
+    requests: a.requests + b.requests,
+    reportedRequests: a.reportedRequests + b.reportedRequests,
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+    reasoningTokens: a.reasoningTokens + b.reasoningTokens,
+    errors: a.errors + b.errors,
+    ttftSumMs: a.ttftSumMs + b.ttftSumMs,
+    ttftCount: a.ttftCount + b.ttftCount,
+    tpsSum: a.tpsSum + b.tpsSum,
+    tpsCount: a.tpsCount + b.tpsCount,
+  }
+}
+
+/**
+ * 增量 = 当前桶 − 基线桶（逐字段）。
+ *
+ * ⚠️ 负数一律钳到 0：手工编辑过文档、或基线比当前大时（理论上不该发生），
+ * 相减会得到负数，写进账本会**倒扣**用户的历史用量 —— 宁可少记也不能倒扣。
+ */
+function subtractBucket(
+  current: TokenLedgerDayBucket,
+  base: TokenLedgerDayBucket | undefined,
+): TokenLedgerDayBucket {
+  if (base === undefined) return { ...current }
+  const diff = (a: number, b: number): number => Math.max(0, a - b)
+  return {
+    requests: diff(current.requests, base.requests),
+    reportedRequests: diff(current.reportedRequests, base.reportedRequests),
+    inputTokens: diff(current.inputTokens, base.inputTokens),
+    outputTokens: diff(current.outputTokens, base.outputTokens),
+    cacheReadTokens: diff(current.cacheReadTokens, base.cacheReadTokens),
+    cacheWriteTokens: diff(current.cacheWriteTokens, base.cacheWriteTokens),
+    reasoningTokens: diff(current.reasoningTokens, base.reasoningTokens),
+    errors: diff(current.errors, base.errors),
+    ttftSumMs: diff(current.ttftSumMs, base.ttftSumMs),
+    ttftCount: diff(current.ttftCount, base.ttftCount),
+    tpsSum: diff(current.tpsSum, base.tpsSum),
+    tpsCount: diff(current.tpsCount, base.tpsCount),
   }
 }
 

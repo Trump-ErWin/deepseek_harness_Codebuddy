@@ -368,4 +368,35 @@ describe('★ attachTokenLedgerStore：成对挂载与所有权校验（fiber �
     recordTokenUsage(usage())
     expect(second.appended).toEqual(['2'])
   })
+
+  /**
+   * ★ 回归（审计发现：原用例锁的其实是**所有权校验**，幂等守卫并未被覆盖
+   * —— 删掉 `if (disposed) return` 后 61 条用例全绿）。
+   *
+   * 唯一能观测到幂等守卫的时序是「dispose 后**重新挂载同一个对象**，再重入调用
+   * 旧 disposer」。此时所有权令牌已换代，只有幂等守卫能挡住第二次摘除。
+   *
+   * ⚠️ 且判据**必须用每次挂载新生成的令牌**，不能用 `backend === owned`：
+   * 同一对象重复挂载时对象相等无法区分两次挂载（审计已复现该误摘）。
+   */
+  it('★ 同一后端重复挂载：旧 disposer 不得摘掉后一次挂载（令牌判据）', () => {
+    const shared = fakeStore('SHARED')
+    const disposeFirst = attachTokenLedgerStore(shared as never)
+    // 重新挂载**同一个对象**（对象相等，旧判据在此失效）
+    attachTokenLedgerStore(shared as never)
+    disposeFirst() // 旧 disposer 追上来
+    recordTokenUsage(usage())
+    expect(shared.appended, '重新挂载的后端必须仍在收账').toEqual(['SHARED'])
+    expect(readTokenLedgerDayMap()).toBe(shared.load())
+  })
+
+  it('★ 幂等守卫：卸载后重新挂载，重入旧 disposer 不得摘掉新挂载', () => {
+    const store = fakeStore('S')
+    const dispose = attachTokenLedgerStore(store as never)
+    dispose()
+    attachTokenLedgerStore(store as never) // 重新挂同一个对象
+    dispose() // 重入：令牌已换代 ⇒ 必须让位
+    recordTokenUsage(usage())
+    expect(store.appended).toEqual(['S'])
+  })
 })
