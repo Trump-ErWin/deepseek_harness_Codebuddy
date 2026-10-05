@@ -18,6 +18,7 @@ import type { CodeArtsCredential } from './types.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
+import { reportLedgerAccount } from './token-ledger.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
 export const PROVIDER = 'codearts'
@@ -1042,6 +1043,8 @@ export class CodeArtsAdapter extends LlmAdapter {
       } catch (error) {
         console.warn('[codearts] 账号匹配失败（不影响本次请求）:', error)
       }
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+      if (currentAccountId) reportLedgerAccount(PROVIDER, currentAccountId)
     }
 
     const messages = serializeMessages(options.messages)
