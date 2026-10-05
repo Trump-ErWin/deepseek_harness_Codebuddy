@@ -487,8 +487,13 @@ class FileStore implements JetHubStore {
  *
  * 优先级：`DSH_JET_HUB_STATE_DIR`（单测隔离用）→ `profileContext.home`
  * → `$DSH_HOME` → `~/.dsh`。与 `dsh-home-paths` 的 `resolveDshHome` 同序。
+ *
+ * ⚠️ `ctx` 可选：前三个来源都不依赖它（`readService` 本身接受 `unknown`），
+ * 故**没有 ctx 也能解析**（退化为环境变量 / `~/.dsh`）。这样那些「拿不到 ctx
+ * 的懒加载路径」不必为了定位 home 而被迫要求注入 ctx（见
+ * `dead-model-store.ts` 的 `ensureStore`）。
  */
-export function resolveJetHubHome(ctx: Context): string | undefined {
+export function resolveJetHubHome(ctx?: Context): string | undefined {
   const override = process.env.DSH_JET_HUB_STATE_DIR
   if (override !== undefined && override.trim().length > 0) return override.trim()
   const profileHome = (readService(ctx, 'profileContext') as { home?: unknown } | undefined)?.home
