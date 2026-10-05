@@ -90,6 +90,85 @@ describe('createTokenLedgerStore（文件后端）', () => {
     }
   })
 
+  /**
+   * ★ 回归（复审发现的真实缺陷）：**重启后第一次落盘不得抹掉盘上的历史日**。
+   *
+   * 原实现 `createTokenLedgerStore` 建实例时**从不读盘**，`index.ts` 也没先读，
+   * 于是新进程的 `this.days` 是空表，`flush()` 用空表**整体覆盖**文档 ⇒ 每次重启
+   * DSH 历史日聚合归零，与 README 承诺的「重启保留 90 天」正好相反。
+   *
+   * ⚠️ 这条必须**两个实例**才照得出来：原有用例每条只建一个 store，永远不会
+   * 出现「空表覆盖盘上数据」的窗口。
+   */
+  it('★ 重启：新实例首次落盘不得抹掉盘上历史日（构造时必须先读盘）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-restart-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    try {
+      const file = join(home, 'jet-hub', 'token-ledger.json')
+      const readDays = (): Record<string, Record<string, { inputTokens: number }>> =>
+        (JSON.parse(readFileSync(file, 'utf-8')) as { days?: Record<string, Record<string, { inputTokens: number }>> }).days ?? {}
+
+      // ── 会话 1：历史日 10-01 记一笔并落盘 ──
+      const first = createTokenLedgerStore({ logger: undefined } as never)
+      first.append({ ts: Date.UTC(2026, 9, 1, 2, 0, 0), ...makeEntry() })
+      first.flush()
+      const key = 'direct|codearts||GLM-5.2'
+      expect(readDays()['2026-10-01']![key]!.inputTokens).toBe(10)
+
+      // ── 模拟进程重启：全新实例（**不手工读盘**，复现 index.ts 的真实路径）──
+      const second = createTokenLedgerStore({ logger: undefined } as never)
+      second.append({ ts: Date.UTC(2026, 9, 5, 2, 0, 0), ...makeEntry({ inputTokens: 7 }) })
+      second.flush()
+
+      // 历史日必须仍在（修复前这里整个日键消失）
+      expect(Object.keys(readDays())).toContain('2026-10-01')
+      expect(readDays()['2026-10-01']![key]!.inputTokens).toBe(10)
+      // 新写入的日也在
+      expect(readDays()['2026-10-05']![key]!.inputTokens).toBe(7)
+    } finally {
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
+  /**
+   * ★ 回归（复审发现的真实缺陷）：**运行中读取日聚合不得覆盖尚未落盘的计数**。
+   *
+   * RPC 的历史视图每次打开弹窗 / 切窗口都会取一次日聚合表。原实现把它接成
+   * 「每次重新读盘」，而读盘对**桶**是整体替换（`target.set(key, {…})`）⇒ 防抖
+   * 窗口（2 秒）内累加过的桶被打回盘上的旧值，并被随后的自动 flush **固化到磁盘**。
+   *
+   * 契约：读盘**只在构造时发生一次**；此后 `load()` 是纯内存读。
+   */
+  it('★ 运行中读取不得覆盖未落盘的计数（读盘只在构造时一次）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-read-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    try {
+      const store = createTokenLedgerStore({ logger: undefined } as never)
+      const key = 'direct|codearts||GLM-5.2'
+      const today = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+      const mem = (): number => store.load().get(today)?.get(key)?.inputTokens ?? 0
+
+      // 3 笔 → 落盘
+      for (let i = 0; i < 3; i++) store.append({ ts: Date.now(), ...makeEntry() })
+      store.flush()
+      expect(mem()).toBe(30)
+
+      // 再记 3 笔（防抖窗口内，尚未落盘）
+      for (let i = 0; i < 3; i++) store.append({ ts: Date.now(), ...makeEntry() })
+      expect(mem()).toBe(60)
+
+      // 读侧再取一次（模拟打开历史视图）—— 修复前这里被盘上旧值打回 30
+      expect(mem()).toBe(60)
+      expect(store.load().get(today)?.get(key)?.requests).toBe(6)
+    } finally {
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
   it('account 维度进入桶键（第 2 期）', () => {
     const home = mkdtempSync(join(tmpdir(), 'token-ledger-store-'))
     const prev = process.env.DSH_JET_HUB_STATE_DIR

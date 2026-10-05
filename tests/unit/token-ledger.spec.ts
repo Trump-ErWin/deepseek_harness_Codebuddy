@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   TOKEN_LEDGER_LIMIT,
-  attachTokenLedgerPersistence,
+  attachTokenLedgerStore,
   mergeDayEntry,
   peekLedgerAccount,
   readTokenLedger,
@@ -334,28 +334,32 @@ describe('utc8DayKey / mergeDayEntry（第 2 期 · 日聚合）', () => {
     expect(days.get('2026-10-06')!.size).toBe(1)
   })
 
-  it('persist 钩子：recordTokenUsage 触发回调（含正确日键），失败不反噬', () => {
-    const seen: Array<[string, string]> = []
-    attachTokenLedgerPersistence((day, entry) => { seen.push([day, entry.provider]) })
+  it('persist 后端：recordTokenUsage 把记录交给 append（含正确日键由后端自算），失败不反噬', () => {
+    const seen: string[] = []
+    const detach = attachTokenLedgerStore({
+      append: (entry) => { seen.push(entry.provider) },
+      load: () => new Map(),
+    })
     try {
       seed([OK])
-      expect(seen).toHaveLength(1)
-      expect(seen[0]![0]).toBe(utc8DayKey(new Date().getTime()))
-      expect(seen[0]![1]).toBe('codearts')
+      expect(seen).toEqual(['codearts'])
     } finally {
-      attachTokenLedgerPersistence(undefined)
+      detach()
     }
     // 摘钩子后不再触发
     seed([{ ...OK }])
-    expect(seen).toHaveLength(1)
+    expect(seen).toEqual(['codearts'])
   })
 
-  it('persist 钩子抛错时 recordTokenUsage 仍不抛（推理路径零反噬）', () => {
-    attachTokenLedgerPersistence(() => { throw new Error('disk full') })
+  it('persist 后端抛错时 recordTokenUsage 仍不抛（推理路径零反噬）', () => {
+    const detach = attachTokenLedgerStore({
+      append: () => { throw new Error('disk full') },
+      load: () => new Map(),
+    })
     try {
       expect(() => recordTokenUsage(OK)).not.toThrow()
     } finally {
-      attachTokenLedgerPersistence(undefined)
+      detach()
     }
     expect(tokenLedgerSize()).toBeGreaterThanOrEqual(1)
   })
@@ -400,21 +404,38 @@ describe('readTokenLedgerHistory（第 4 期 · 历史视图）', () => {
     expect(totals.avgTtftMs).toBe(200)
   })
 
+  /**
+   * ⚠️ **不得写死日期**（真实缺陷，复审发现）：原用例把「今天」硬编码成
+   * `2026-10-05`，一旦真实时间越过该日（UTC+8 日界），`sinceDays: 1` 的期望
+   * 就与实际不符 —— 用例会在**没人改代码的情况下**自行变红（时间炸弹）。
+   * 故一律按「相对今天」构造时刻。
+   */
+  const dayStartAgo = (daysAgo: number): number => {
+    // 取 UTC+8 的今天零点，再往前推 N 天（用算术，不依赖本机时区）。
+    const nowShifted = new Date(Date.now() + 8 * 60 * 60 * 1000)
+    const todayUtcMidnight = Date.UTC(
+      nowShifted.getUTCFullYear(), nowShifted.getUTCMonth(), nowShifted.getUTCDate(),
+    )
+    return todayUtcMidnight - 8 * 60 * 60 * 1000 - daysAgo * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000
+  }
+  const todayKey = utc8DayKey(Date.now())
+  const yesterdayKey = utc8DayKey(dayStartAgo(1))
+
   it('sinceDays 窗口：只含最近 N 天（含今天）；未来日键恒被裁掉', () => {
     const days = makeDays([
-      { ...OK, ts: DAY9 }, // UTC+8 2026-10-12 —— 相对今天（2026-10-05）在未来
-      { ...OK, ts: DAY1 }, // UTC+8 2026-10-04 —— 昨天
-      { ...OK, ts: DAY2 }, // UTC+8 2026-10-05 —— 今天
+      { ...OK, ts: dayStartAgo(-7) }, // 未来（7 天后）
+      { ...OK, ts: dayStartAgo(1) }, // 昨天
+      { ...OK, ts: dayStartAgo(0) }, // 今天
     ])
-    // 全部历史：未来键被裁 ⇒ 只剩 10-04 与 10-05
+    // 全部历史：未来键被裁 ⇒ 只剩昨天与今天（新在前）
     const all = readTokenLedgerHistory(days)
-    expect(all.days.map((d) => d.day)).toEqual(['2026-10-05', '2026-10-04'])
-    // 近 7 天：10-04 / 10-05 都在窗口内
+    expect(all.days.map((d) => d.day)).toEqual([todayKey, yesterdayKey])
+    // 近 7 天：两天都在窗口内
     const week = readTokenLedgerHistory(days, { sinceDays: 7 })
-    expect(week.days.map((d) => d.day)).toEqual(['2026-10-05', '2026-10-04'])
-    // 窗口裁掉旧日：近 1 天（仅今日）只剩 10-05
+    expect(week.days.map((d) => d.day)).toEqual([todayKey, yesterdayKey])
+    // 窗口裁掉旧日：近 1 天（仅今日）只剩今天
     const today = readTokenLedgerHistory(days, { sinceDays: 1 })
-    expect(today.days.map((d) => d.day)).toEqual(['2026-10-05'])
+    expect(today.days.map((d) => d.day)).toEqual([todayKey])
     expect(today.totals.requests).toBe(1)
   })
 
@@ -433,5 +454,46 @@ describe('readTokenLedgerHistory（第 4 期 · 历史视图）', () => {
     expect(readTokenLedgerHistory(new Map()).days).toEqual([])
     const days: TokenLedgerDayMap = new Map([['2026-10-04', new Map()]])
     expect(readTokenLedgerHistory(days).days).toEqual([])
+  })
+
+  /**
+   * ★ 回归（复审发现的真实缺陷）：**聚合行不得夹带内部累加器字段**。
+   *
+   * 类型签名是 `Omit<TokenLedgerModelRow,'model'>`，但 `finalizeAverages` 用
+   * `{...t}` 展开 `AccumulatingTotals` ⇒ `ttftSumMs / ttftCount / tpsSum /
+   * tpsCount` 这四个内部字段会**实际下发到 RPC 载荷**。类型没声明、UI 也不读，
+   * 属「类型撒谎 + 载荷虚胖」——将来若有人误用 `ttftSumMs` 会得到 Σ 而非均值。
+   */
+  it('★ 聚合行不下发内部累加器字段（类型与实际返回必须一致）', () => {
+    // 显式给 ttft 与 tps，让两边都有可测样本（否则均值字段本就该省略）。
+    const days = makeDays([
+      { ...OK, ts: dayStartAgo(0), ttftMs: 100, tps: 42, durationMs: 1100, outputTokens: 100 },
+    ])
+    const { days: history, totals } = readTokenLedgerHistory(days)
+    // 内部累加器字段一律不得出现（各层都要查）
+    const internal = ['ttftSumMs', 'ttftCount', 'tpsSum', 'tpsCount']
+    for (const field of internal) {
+      expect(totals, `totals.${field}`).not.toHaveProperty(field)
+      expect(history[0]!.totals, `day.totals.${field}`).not.toHaveProperty(field)
+      expect(history[0]!.channels[0]!.totals, `channel.totals.${field}`).not.toHaveProperty(field)
+      expect(history[0]!.channels[0]!.providers[0]!.totals, `provider.totals.${field}`).not.toHaveProperty(field)
+      expect(history[0]!.channels[0]!.providers[0]!.accounts[0]!.totals, `account.totals.${field}`).not.toHaveProperty(field)
+      expect(history[0]!.channels[0]!.providers[0]!.accounts[0]!.models[0]!, `model.${field}`).not.toHaveProperty(field)
+    }
+    // 该有的均值仍然给（且是按 Σ/份数算出的均值，不是 Σ 本身）
+    expect(totals.avgTtftMs).toBe(100)
+    expect(totals.avgTps).toBe(42)
+  })
+
+  /** 内存快照的聚合树同样不得夹带内部字段（第 1 期路径，与历史路径同源）。 */
+  it('★ 内存快照的聚合行同样不下发内部累加器字段', () => {
+    seed([{ ...OK, ttftMs: 100, durationMs: 1100, outputTokens: 100 }])
+    const snap = readTokenLedger()
+    const row = snap.channels[0]!.providers[0]!.accounts[0]!.models[0]!
+    for (const field of ['ttftSumMs', 'ttftCount', 'tpsSum', 'tpsCount']) {
+      expect(row, `model.${field}`).not.toHaveProperty(field)
+      expect(snap.totals, `totals.${field}`).not.toHaveProperty(field)
+    }
+    expect(row.avgTtftMs).toBe(100)
   })
 })

@@ -40,7 +40,14 @@ const SCHEMA = 'dsh-codearts-auth/token-ledger/v1'
 
 /** 日聚合的持久化后端接口（同步读、节流异步写）。 */
 export interface TokenLedgerStore {
-  /** 启动时载入历史日聚合（文档不存在 = 空表）。 */
+  /**
+   * 读取日聚合表 —— **纯内存读，不碰磁盘**。
+   *
+   * ⚠️ 磁盘**只在构造时读一次**（见 {@link FileLedgerStore} 的 `hydrate`）。
+   * RPC 的历史视图会**频繁**调用本方法（每次打开弹窗、每次切窗口）。若在这里
+   * 重新读盘，会把防抖窗口内**尚未落盘**的计数打回盘上的旧值，并被随后的自动
+   * flush **固化到磁盘**（实测：内存 60 → 读一次 → 30 → 落盘 30）。
+   */
   load(): TokenLedgerDayMap
   /** 把一笔请求并入日聚合（内存即时、落盘节流）。 */
   append(entry: import('./token-ledger.js').TokenLedgerEntry): void
@@ -89,11 +96,21 @@ class FileLedgerStore implements TokenLedgerStore {
   constructor(
     private readonly path: string,
     private readonly logger: { warn(message: string): void } | undefined,
-  ) {}
+  ) {
+    // ⚠️ **构造时读一次盘**，且这是**唯一**的读盘时机。
+    //
+    // 两个缺陷都由「没在这里读」引发（复审实测）：
+    // ① 之前从不读盘 ⇒ 新进程的 `days` 是空表，首次 `flush()` 用**空表整体覆盖**
+    //    文档 ⇒ 每次重启 DSH 历史日聚合归零（与 README 的「重启保留 90 天」相反）；
+    // ② 之前是「每次 `load()` 都读盘」⇒ 频繁读侧会把未落盘的计数打回旧值。
+    // 构造时读一次同时解决两者：内存恒为盘上数据的**超集**，整体覆盖才安全。
+    this.hydrate()
+  }
 
-  load(): TokenLedgerDayMap {
+  /** 从磁盘载入日聚合（**只在构造时调用一次**，见构造函数注释）。 */
+  private hydrate(): void {
     try {
-      if (!existsSync(this.path)) return this.days
+      if (!existsSync(this.path)) return
       const parsed = JSON.parse(readFileSync(this.path, 'utf-8')) as unknown
       if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
         const record = parsed as { days?: unknown }
@@ -133,6 +150,10 @@ class FileLedgerStore implements TokenLedgerStore {
       // 损坏按空表处理（统计型数据不值得阻断启动）。
       this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，历史用量按空表处理: ${String(error)}`)
     }
+  }
+
+  /** 纯内存读（不碰磁盘）—— 见接口注释。 */
+  load(): TokenLedgerDayMap {
     return this.days
   }
 

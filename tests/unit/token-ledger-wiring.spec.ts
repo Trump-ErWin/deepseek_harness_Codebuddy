@@ -6,12 +6,16 @@ import {
 } from '../../src/openai-gateway/channel.js'
 import { recordThroughStream, wrapAdapterWithTokenLedger } from '../../src/llm-register-compat.js'
 import {
+  attachTokenLedgerStore,
   peekLedgerAccount,
   readTokenLedger,
+  readTokenLedgerDayMap,
+  recordTokenUsage,
   reportLedgerAccount,
   resetLedgerAccountsForTests,
   resetTokenLedgerForTests,
 } from '../../src/token-ledger.js'
+import type { TokenLedgerDayMap, TokenLedgerEntry } from '../../src/token-ledger.js'
 
 /** 假适配器产出的 usage chunk（dsh-llm 契约形状）。 */
 function usageChunk(input: number, output: number, extra: Record<string, number> = {}) {
@@ -280,5 +284,88 @@ describe('wrapAdapterWithTokenLedger：包装注册', () => {
     const row = readTokenLedger().entries[0]!
     expect(row.inputTokens).toBe(41)
     expect(row.usageReported).toBe(true)
+  })
+})
+
+/**
+ * ★ 回归（复审发现的真实风险）：**插件 fiber 重启交错时，旧实例的 dispose
+ * 不得摘掉新实例挂上的钩子**。
+ *
+ * `llm-register-compat.ts` 模块头已记载本仓库的真实事故：cordis 重启插件 fiber
+ * 时，新 fiber 的同步 apply 与旧 fiber 的**异步 dispose 交错执行**（旧 dispose
+ * 会追上来）。而 `index.ts` 原先在 dispose 里**无条件**摘钩子 ⇒ 一旦交错命中，
+ * 新一轮挂的钩子立刻被旧一轮摘掉 → **落盘彻底停摆 + 历史视图恒为空**。
+ *
+ * ⚠️ 这条用**真实的 `attachTokenLedgerStore`**（而不是把接线抄一份进测试）：
+ * 抄写式的断言只能证明副本自洽，改动真实接线时不会失败（与 `buddy-wiring.spec.ts`
+ * 同款纪律）。
+ */
+describe('★ attachTokenLedgerStore：成对挂载与所有权校验（fiber 重启交错）', () => {
+  /** 假 store：只记录收到哪些 entry，读侧返回固定表。 */
+  function fakeStore(label: string) {
+    const appended: string[] = []
+    const days: TokenLedgerDayMap = new Map()
+    return {
+      label,
+      appended,
+      /** 与真实 `FileLedgerStore` 同形：append(entry) / load()。 */
+      append: (entry: TokenLedgerEntry) => { appended.push(label) },
+      load: () => days,
+    }
+  }
+  const usage = () => ({
+    channel: 'direct' as const, provider: 'codearts', model: 'GLM-5.2',
+    usageReported: true, inputTokens: 1, outputTokens: 1, durationMs: 1,
+  })
+
+  afterEach(() => {
+    // 每条用例后清干净，避免钩子泄漏到后续用例（模块级单例）。
+    attachTokenLedgerStore(undefined)
+  })
+
+  it('正常挂载：记账落盘回调与历史读取器都生效', () => {
+    const store = fakeStore('A')
+    attachTokenLedgerStore(store as never)
+    recordTokenUsage(usage())
+    expect(store.appended).toEqual(['A'])
+    expect(readTokenLedgerDayMap()).toBe(store.load())
+  })
+
+  it('★ 旧实例 dispose 不得摘掉新实例的钩子（交错时序）', () => {
+    // ── fiber 第 1 轮 ──
+    const old = fakeStore('old')
+    const disposeOld = attachTokenLedgerStore(old as never)
+    // ── fiber 第 2 轮：新 apply 先跑完 ──
+    const fresh = fakeStore('new')
+    const disposeNew = attachTokenLedgerStore(fresh as never)
+    // ── 旧 fiber 的异步 dispose 追上来（真实事故的时序）──
+    disposeOld()
+    // 修复前：钩子被清空 ⇒ 落盘停摆、历史视图恒空
+    recordTokenUsage(usage())
+    expect(fresh.appended, '新实例必须仍在收账').toEqual(['new'])
+    expect(old.appended, '旧实例不得再收账').toEqual([])
+    expect(readTokenLedgerDayMap()).toBe(fresh.load())
+    void disposeNew
+  })
+
+  it('★ 卸载语义：当前实例自己 dispose 后钩子才真的清空', () => {
+    const store = fakeStore('only')
+    const dispose = attachTokenLedgerStore(store as never)
+    dispose()
+    recordTokenUsage(usage())
+    expect(store.appended).toEqual([])
+    expect(readTokenLedgerDayMap().size).toBe(0)
+  })
+
+  it('★ dispose 幂等且不乱摘：重复调用第二次不得影响后续实例', () => {
+    const first = fakeStore('1')
+    const disposeFirst = attachTokenLedgerStore(first as never)
+    disposeFirst()
+    const second = fakeStore('2')
+    attachTokenLedgerStore(second as never)
+    // 旧 disposer 再被调用一次（cordis 重入）：不得摘掉 second
+    disposeFirst()
+    recordTokenUsage(usage())
+    expect(second.appended).toEqual(['2'])
   })
 })

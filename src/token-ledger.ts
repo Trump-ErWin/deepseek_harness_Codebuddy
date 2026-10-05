@@ -209,44 +209,59 @@ export function resetLedgerAccountsForTests(): void {
 }
 
 /**
- * 每日聚合的**持久化挂载点**（第 2 期 · 落盘）。
+ * 日聚合存储后端的**最小契约**（`token-ledger-store.ts` 的实现满足它）。
  *
- * 由 `index.ts` 在插件启动时 `attachTokenLedgerPersistence(...)` 注入；
- * 记账路径只调这个回调，不关心它存到哪 —— 与 `record()` 绝不抛错同款约束，
- * 持久化失败绝不能反噬推理。
+ * 只声明记账侧真正用到的两个方法 —— 账本模块刻意不 import store 的实现，
+ * 以免把 `node:fs` 拖进纯逻辑模块（该模块要能在无盘环境被单测）。
  */
-let persistenceHook: ((day: string, entry: TokenLedgerEntry) => void) | undefined
+export interface TokenLedgerBackend {
+  /** 把一笔请求并入日聚合（内存即时、落盘节流）。 */
+  append(entry: TokenLedgerEntry): void
+  /** 读取日聚合表（**纯内存读**，不碰磁盘 —— 见 store 的注释）。 */
+  load(): TokenLedgerDayMap
+}
 
 /**
- * 历史视图（第 4 期）的**日聚合表读取器**挂载点。
+ * 日聚合后端的**挂载点**（第 2 期 · 落盘 / 第 4 期 · 历史视图共用）。
  *
- * ⚠️ 与 {@link attachTokenLedgerPersistence} 同因：账本是模块级单例、没有
- * ctx；而 RPC（`jet-hub-rpc.ts`）需要读**落盘的历史日聚合** —— 通过这个
- * 挂载点拿（`index.ts` 启动时把 store 的 `load` 绑进来），而不是给
- * `registerJetHubRpc` 再加一个形参（该函数已因位置传参错位复发过 6 次）。
+ * 由 `index.ts` 在插件启动时 {@link attachTokenLedgerStore} 注入；记账路径只调
+ * `append`，RPC 只调 `load` —— 与 `record()` 绝不抛错同款约束，持久化失败绝不能
+ * 反噬推理。
+ *
+ * ⚠️ 原先拆成「持久化钩子」与「历史读取器」**两个**独立的挂载点，由 `index.ts`
+ * 分别挂、分别摘。那带来了一个真实风险：插件 fiber 重启时新 apply 与旧 fiber 的
+ * 异步 dispose **交错执行**（本仓库已确证的事故，见 `llm-register-compat.ts`
+ * 模块头），旧实例的 dispose 会把**新实例刚挂上**的钩子一并摘空 ⇒ 落盘彻底停摆
+ * 且历史视图恒为空。现在合并为**一个**挂载点，并在 dispose 时做**所有权校验**。
  */
-let historyReader: (() => TokenLedgerDayMap) | undefined
+let backend: TokenLedgerBackend | undefined
 
-/** 注入历史读取器（插件启动时调用一次；传 `undefined` = 卸载）。 */
-export function attachTokenLedgerHistoryReader(reader: (() => TokenLedgerDayMap) | undefined): void {
-  historyReader = reader
+/**
+ * 注入日聚合后端，返回**该次挂载专属的 disposer**。
+ *
+ * ⚠️ 返回的 disposer 只在「当前挂载的仍是我自己」时才清空 —— 这样 fiber 重启
+ * 交错时，旧实例的 dispose 不会摘掉新实例的挂载（见 {@link backend} 的说明）。
+ * disposer **幂等**：重复调用第二次是空操作。
+ *
+ * @param next - 后端实现；传 `undefined` = 无条件卸载（测试隔离用）。
+ */
+export function attachTokenLedgerStore(next: TokenLedgerBackend | undefined): () => void {
+  backend = next
+  // 记录「本次挂载」的身份：用后端对象本身做判据（undefined 也自成一档）。
+  const owned = next
+  let disposed = false
+  return () => {
+    if (disposed) return
+    disposed = true
+    // ⚠️ 所有权校验：只摘自己的。若期间已被别的实例接管，此次 dispose 必须让位
+    // —— 否则会把新一轮的挂载摘空（真实事故的传导路径）。
+    if (backend === owned) backend = undefined
+  }
 }
 
 /** RPC 侧读取日聚合表；未挂载（headless 等）返回空表。 */
 export function readTokenLedgerDayMap(): TokenLedgerDayMap {
-  return historyReader?.() ?? new Map()
-}
-
-/**
- * 注入持久化回调（插件启动时调用一次）。
- *
- * @param hook - 收到 **UTC+8 日键**与该笔记录；实现方自行做日聚合与落盘节流。
- *   传 `undefined` = 卸载（测试隔离用）。
- */
-export function attachTokenLedgerPersistence(
-  hook: ((day: string, entry: TokenLedgerEntry) => void) | undefined,
-): void {
-  persistenceHook = hook
+  return backend?.load() ?? new Map()
 }
 
 /**
@@ -317,12 +332,12 @@ export function recordTokenUsage(entry: Omit<TokenLedgerEntry, 'ts'>): void {
     }) as TokenLedgerEntry
     ledger.unshift(record)
     if (ledger.length > TOKEN_LEDGER_LIMIT) ledger.length = TOKEN_LEDGER_LIMIT
-    // 每日聚合落盘（第 2 期）：回调内部自己节流与兜错，这里不再包 try ——
-    // 挂载点契约要求 hook 绝不抛错（见 attachTokenLedgerPersistence 的说明）。
+    // 每日聚合落盘（第 2 期）：后端内部自己节流与兜错，这里不再包 try ——
+    // 挂载契约要求 append 绝不抛错（见 attachTokenLedgerStore 的说明）。
     try {
-      persistenceHook?.(utc8DayKey(record.ts), record)
+      backend?.append(record)
     } catch {
-      // 持久化失败绝不反噬推理（双重防御：hook 违约也不炸）。
+      // 持久化失败绝不反噬推理（双重防御：后端违约也不炸）。
     }
   } catch {
     // 记账失败绝不反噬推理（见函数注释）。
@@ -356,10 +371,26 @@ export interface AccumulatingTotals extends Omit<TokenLedgerModelRow, 'model'> {
   tpsCount: number
 }
 
-/** Σ/份数 → 均值（无样本时省略字段；均值取 1 位小数与 TPS 精度对齐）。 */
+/**
+ * Σ/份数 → 均值（无样本时省略字段；均值取 1 位小数与 TPS 精度对齐）。
+ *
+ * ⚠️ **逐字段显式挑选，不得写成 `{...t}` 展开**：`AccumulatingTotals` 比
+ * `TokenLedgerModelRow` 多四个**内部累加器**（`ttftSumMs` / `ttftCount` /
+ * `tpsSum` / `tpsCount`）。展开会把它们一并带进返回值 —— 类型签名声明的是
+ * `Omit<TokenLedgerModelRow,'model'>`，于是「类型与实际不符」：这四个字段会真的
+ * 下发到 RPC 载荷（UI 不读 = 纯虚胖），更危险的是调用方若误用 `ttftSumMs`
+ * 会拿到 **Σ 而不是均值**（名字只差一个 `avg`）。
+ */
 function finalizeAverages(t: AccumulatingTotals): Omit<TokenLedgerModelRow, 'model'> {
   return {
-    ...t,
+    requests: t.requests,
+    reportedRequests: t.reportedRequests,
+    inputTokens: t.inputTokens,
+    outputTokens: t.outputTokens,
+    cacheReadTokens: t.cacheReadTokens,
+    cacheWriteTokens: t.cacheWriteTokens,
+    reasoningTokens: t.reasoningTokens,
+    errors: t.errors,
     ...(t.ttftCount > 0 ? { avgTtftMs: Math.round(t.ttftSumMs / t.ttftCount) } : {}),
     ...(t.tpsCount > 0 ? { avgTps: Math.round((t.tpsSum / t.tpsCount) * 10) / 10 } : {}),
   }
