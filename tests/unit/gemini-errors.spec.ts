@@ -21,7 +21,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { GeminiAdapter, isGeminiSignatureError } from '../../src/gemini-adapter.js'
-import { GEMINI, type GeminiCredential } from '../../src/gemini.js'
+import { GEMINI, GEMINI_DEFAULT_PROJECT, type GeminiCredential } from '../../src/gemini.js'
 
 function options(): GenerateOptions {
   return {
@@ -41,6 +41,9 @@ function adapter(): GeminiAdapter {
     credentialRef: credentialRef('GEMINI_ACCOUNT_TEST'),
     resolveCredential: async () => credential,
     refresh: async () => {},
+    // ⚠️ 显式钉 project：不钉会走自动探测，先打一次 `loadCodeAssist` 并吃掉
+    // stub 的第一个响应 —— 本文件测的是**失败归类**，多一次请求会让断言错位。
+    project: GEMINI_DEFAULT_PROJECT,
     product: GEMINI,
   })
 }
