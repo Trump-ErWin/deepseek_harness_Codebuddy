@@ -484,16 +484,59 @@ describe('★★ 两层包装的嵌套顺序（记账在内 / 剔除在外）', 
     expect(entries[0]!.outputTokens).toBe(5)
   })
 
-  it('★★ 顺序写反（记账在外）时记账会静默失效 —— 锁定这个反例防被改回去', async () => {
+  /**
+   * ★★ 回归（真实缺陷，2026-10-06）：**`prepareCall` 不透传 `this.stream` 时也必须记账**。
+   *
+   * 记账包装早先**只拦顶层 `stream`**，它之所以生效全靠各适配器的 `prepareCall`
+   * 恰好写成 `stream: (o) => this.stream(o)`（再加上调用方经 Proxy 取 `prepareCall`
+   * 时 `this` 落在 Proxy 上）。这是一条**隐式依赖**：一旦某适配器改为持有闭包引用，
+   * 记账就**静默失效**（请求照常、账本永远为空）。
+   *
+   * ⇒ 现已在包装层显式包 `prepareCall` 返回的 `call.stream`。本用例守护这一点：
+   * 用**不经 `this.stream`** 的适配器，记账仍必须生效。
+   *
+   * ⚠️ 同根因的既有教训见 `src/dead-model-store.ts`（PR !66 复审：只包 `stream`
+   * 导致生产环境完全不生效）。
+   */
+  it('★★ prepareCall 不经 this.stream（闭包式）时记账仍必须生效', async () => {
     resetTokenLedgerForTests()
-    // 故意用**错误顺序**：记账在外、剔除在内
-    const wrong = wrapAdapterWithTokenLedger(
+    const own = async function* () { yield { type: 'usage', usage: { inputTokens: 21, outputTokens: 9 } } }
+    const closureAdapter = {
+      providerInfo: () => ({ id: 'codearts', name: 'CodeArts' }),
+      providerRetryPolicy: () => undefined,
+      // ⚠️ 关键：直接引用闭包，**不**走 this.stream
+      async prepareCall() {
+        return { model: { provider: 'codearts', id: 'm', name: 'M' }, stream: (o: unknown) => own(o) }
+      },
+      stream: own,
+    }
+    const wrapped = wrapAdapterWithTokenLedger(['codearts'], closureAdapter as never)
+    await driveByPrepareCall(wrapped)
+
+    const entries = readTokenLedger().entries
+    expect(entries, '闭包式 prepareCall 下记账不得被绕过').toHaveLength(1)
+    expect(entries[0]!.inputTokens).toBe(21)
+    expect(entries[0]!.outputTokens).toBe(9)
+  })
+
+  it('★★ 两层包装两种顺序都必须记账（不再依赖 this 绑定链）', async () => {
+    // 记账在内 / 剔除在外
+    resetTokenLedgerForTests()
+    const inner = withDeadModelPruning(
+      ['codearts'],
+      wrapAdapterWithTokenLedger(['codearts'], new PrepareCallAdapter() as never) as never,
+    )
+    await driveByPrepareCall(inner)
+    expect(readTokenLedger().entries, '记账在内').toHaveLength(1)
+
+    // 记账在外 / 剔除在内 —— 显式包 prepareCall 后**同样生效**
+    resetTokenLedgerForTests()
+    const outer = wrapAdapterWithTokenLedger(
       ['codearts'],
       withDeadModelPruning(['codearts'], new PrepareCallAdapter() as never) as never,
     )
-    await driveByPrepareCall(wrong)
-    // 这是"错误顺序"的可观测后果：账本为空（不是抛错，所以极难发现）
-    expect(readTokenLedger().entries, '错误顺序下记账失效（本断言是反例，不是期望行为）').toHaveLength(0)
+    await driveByPrepareCall(outer)
+    expect(readTokenLedger().entries, '记账在外也不得失效（不依赖 this 绑定链）').toHaveLength(1)
   })
 
   it('★★ 正确顺序下两层都在位：记账生效且 listModels 仍可用', async () => {
