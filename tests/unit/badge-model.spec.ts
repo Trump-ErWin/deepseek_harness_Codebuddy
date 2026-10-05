@@ -708,12 +708,52 @@ describe('配额窗口（Gemini）：逐窗口百分比，不显示均值也不�
     expect(view.tone).toBe('ok')
   })
 
-  it('多账号：逐账号各自的窗口行并列，不跨账号求和', () => {
+  it('★ 多账号：同一窗口**聚合**为一个值（取最紧张），不再逐账号并列', () => {
+    // 用户 2026-10-05 报障：两个 Gemini 账号时胶囊读数是
+    //   `5 小时窗口 82% · 周窗口 79% · 5 小时窗口 98% · 周窗口 98%`
+    // —— 四段必然被省略号截断，且同一个窗口名出现两次、读者无法比对。
+    // 聚合后每个窗口只出现一次，取跨账号**最紧张**的那个值。
     const view = badgeView({
       providerLabel: 'Gemini',
       accounts: [quotaRow('a', [quotaPkg('周窗口', 90)]), quotaRow('b', [quotaPkg('周窗口', 30)])],
     })
-    expect(view.text).toBe('Gemini • 周窗口 90% · 周窗口 30%')
+    expect(view.text).toBe('Gemini • 周窗口 30%')
+
+    // 多窗口 × 多账号：仍只按窗口名出两条
+    const both = badgeView({
+      providerLabel: 'Gemini',
+      accounts: [
+        quotaRow('a', [quotaPkg('5 小时窗口', 82), quotaPkg('周窗口', 79)]),
+        quotaRow('b', [quotaPkg('5 小时窗口', 98), quotaPkg('周窗口', 98)]),
+      ],
+    })
+    // 聚合取 min：5 小时窗口 min(82,98)=82；周窗口 min(79,98)=79
+    expect(both.text).toBe('Gemini • 5 小时窗口 82% · 周窗口 79%')
+
+    // ⚠️ 聚合口径必须与圆点色调**同源**（toneOf 也用 min）——
+    // 否则会出现「点已报警、数字看着还挺多」的自相矛盾。
+    expect(both.tone).toBe('ok')
+    const tight = badgeView({
+      providerLabel: 'Gemini',
+      accounts: [
+        quotaRow('a', [quotaPkg('5 小时窗口', 95)]),
+        quotaRow('b', [quotaPkg('5 小时窗口', 5)]),
+      ],
+    })
+    // 最紧张的那个账号（5%）决定读数与色调，两者一致
+    expect(tight.text).toBe('Gemini • 5 小时窗口 5%')
+    expect(tight.tone).not.toBe('ok')
+  })
+
+  it('单账号：聚合结果与逐账号行**逐字相同**（既有行为不变）', () => {
+    const view = badgeView({
+      providerLabel: 'Gemini',
+      accounts: [quotaRow('a', [quotaPkg('5 小时窗口', 0), quotaPkg('周窗口', 90)])],
+    })
+    expect(view.text).toBe('Gemini • 5 小时窗口 0% · 周窗口 90%')
+    // 逐账号明细仍留在 quotaLines 里（弹窗空间足够，不该丢账号粒度）
+    const groups = creditGroupsOf([quotaRow('a', [quotaPkg('5 小时窗口', 0), quotaPkg('周窗口', 90)])])
+    expect(groups.groups[0].quotaLines).toEqual(['5 小时窗口 0% · 周窗口 90%'])
   })
 
   it('包上没有可用数字时给出「额度不可用」，不画成 0', () => {
