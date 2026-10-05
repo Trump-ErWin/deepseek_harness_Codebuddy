@@ -172,7 +172,7 @@ describe('raccoon 续期后必须把新过期时间写回账号池', () => {
     ).toBe(true)
   })
 
-  it('refreshAccountCredential（账号卡片「刷新」按钮）也更新账号池', async () => {
+  it('refreshAccountCredential（RPC account.refresh）也更新账号池', async () => {
     const { ctx, credentials } = makeCtx()
     credentials.store.set('RACCOON_ACCOUNT_ABD05EAC', EXPIRED_CREDENTIAL)
     const { pool, patches } = makePool([accountOf()])

@@ -15,7 +15,7 @@ import type { AccountPool, ProviderAccountStatus } from '../../src/account-pool.
  *
  * 1. **lead-time 判据**（`shouldRefreshNow`）：多账号续期调度器从「每 30 分钟
  *    无脑全量刷」恢复成单凭据时代的「距过期不足 1 小时才刷」。
- * 2. **有效期回写**（`syncAccountExpiry`）：按需续期（账号卡片「刷新」按钮）
+ * 2. **有效期回写**（`syncAccountExpiry`）：按需续期（RPC `account.refresh`）
  *    过去七个 provider 都只更新凭据、不回写账号池，于是凭据续好了、UI 仍挂
  *    「已过期」，而「重测」按钮的 refresh 是刻意的 no-op —— 用户没有任何自救手段。
  *

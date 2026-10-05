@@ -793,7 +793,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 ⚠️ Qoder 国际版与中国版**共用同一组领取实现**（`src/qoder-credits.ts` 的函数一律
 接收 `product` 参数），RPC 侧通过 `jet-hub-rpc.ts` 的 `qoderFamily` 注册表分派。
 新增同族产品**不要**在四处分支各加一条平行 case —— 平行 case 越多，漏接概率越高
-（`workbuddy` 的「刷新」按钮就是这么一直坏着的）。
+（`account.refresh` 端点对 `workbuddy` 漏接 case 就是这么一直坏着的）。
 
 - **包名**：`dsh-codearts-auth`
 - **入口**：`lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）
@@ -986,13 +986,13 @@ Gitee issue IKJLHQ 整体移除（见上一节）。
 **根因在客户端**：`plugin-src/management-rpc.mjs` 的 `unwrapRpcResult` 只判
 `result.ok === true` 就返回 `value` ⇒ `ok:true` 就等于「成功」。
 
-⚠ **全文件唯一的一处**：把 `jet-hub-rpc.ts` 里 37 个 `catch` 逐个核对过，
-另有 4 处 catch 后仍 `ok:true`，但它们**都带额外的判别字段**，调用方不判就会误读
-—— 本端点没有：
+⚠ **全文件唯一的一处**：把 `jet-hub-rpc.ts` 里 37 个 `catch` 逐个核对过，另有 4 处
+catch 后仍 `ok:true`，但它们**都带额外的判别字段**（或干脆不在 catch 里），
+调用方不判就会误读 —— 本端点没有：
 
 | 位置 | 形态 | 为何安全 |
 |---|---|---|
-| `login.poll` | `{done:false}` | 「用户尚未授权完」是正常中间态 |
+| `login.poll` | `{done:false}` | 「用户尚未授权完」是正常中间态（catch 只包 `JSON.parse`，其余是 early-return） |
 | `login.submitSms` | `{done:false, error}` | 验证码输错可重试，前端必判 `done` |
 | `credits.permanentLock` | 广播失败仍 `ok:true` | 广播失败不影响已落盘 |
 | `credits.claimAll` | 单号失败进 `results[]` | 「单个失败不中断整体」是设计语义 |
@@ -1001,26 +1001,48 @@ Gitee issue IKJLHQ 整体移除（见上一节）。
 `ok:false + error:{code, message}`（本仓库约定 `code:'bad-request'`）。
 ⚠ `reply()`（`jet-hub-rpc.ts` 末尾）只对 `ok:false` 补 `error.details: {}`。
 
-⚠⚠ **`account.refresh` 是全仓库零调用方的端点**（取证：面板 36 处 `rpcCall(` 里没有它；
-`git log -S "rpcCall('account.refresh'"` 零命中；账号卡片按钮只有
+⚠⚠ **`account.refresh` 是全仓库零调用方的端点**（取证：面板
+`plugin-src/client/jet-hub.js` 的 42 处 `rpcCall(` 里没有它，另两处 `rpcCall(变量)`
+的实参经追溯只有 `opencode.*` 四个方法；账号卡片按钮只有
 测试/重测/重置/停用/代理/指纹/删除，**没有「刷新」**）。⇒ 改成 `ok:false` 是
 **对仓库外调用方的破坏性契约变更**，仓库内零影响；原先误判的调用方会从「静默错」
 变成 `unwrapRpcResult` **抛错**（`error.message` 即原异常文案），属预期的「提前炸」。
 成功路径**未变**（仍是 `ok:true + value.success:true`），故不会误伤成功侧。
 ⇒ `RpcRefreshAccountResponse` 里的 `error?: string` 已**删掉**（失败不再有 value）。
+⚠ **该类型目前仍是死类型**（`jet-hub-rpc.ts` import 了却没用，成功路径返回的是
+无标注字面量，`tsconfig` 又没开 `noUnusedLocals`）⇒ 删字段**没有编译期保障**，
+将来谁写回 `value.error` 也不会被 tsc 拦。收紧方式见 P4 的最小修法。
+
+⚠⚠⚠ **本节写下的取证命令，在本节落地后即失效**：`git log -S "rpcCall('account.refresh'"`
+会**自匹配修复提交本身**（本节与 `jet-hub-rpc.ts` 的注释都引用了该字面量），
+实测返回 `68fb567`。这正是本文件反复强调的「判据里的注释必须与实测一致」的违反。
+⇒ 复核该结论请用**只搜客户端源码**的形式：
+`Select-String -Path plugin-src\client\*.js -Pattern "rpcCall\('account\."`（应零命中；
+`account.refreshable` 是另一个字段名，不是端点）。在 `origin/master`（修复前）上
+`-S` 零命中，这本身是它曾有效的证据。
 
 ⚠⚠ **既有测试为什么没抓住**：旧用例断言的是 `value.success === false` ——
 **修复前的行为照样绿**。因为它锁的是「value 里能看到失败」，而缺陷的实质是
 「失败被包装成了成功」。⇒ **新增失败路径用例必须断言顶层 `ok`，并额外断言
 「失败时 `value` 根本不存在」**，否则又写出一条同义反复的用例。
 回归用例在 `tests/unit/lobsterai-rpc-dispatch.spec.ts` 的「issue IKJOZA」段
-（8 条：三条报告里出现的真实错误各锁 `ok:false` + `error.message` 原文、
-`error.code` 约定、成功路径不受影响）。
-⚠ 已做**反向验证**：把 catch 改回 `{ok:true, value:{success:false}}` → 9 条变红。
+（22 条：三条报告里出现的真实错误各锁 `ok:false` + `error.message` 原文、
+**全部 13 个 provider 逐个覆盖**、`error.code` 约定、成功路径不受影响）。
+⚠ 已做**反向验证**：把 catch 改回 `{ok:true, value:{success:false}}` → **22 条变红**。
+⚠⚠ **provider 与文案必须对位**：初版把 raccoon 的报错挂在 `trae` 上，因为
+`makeThrowingStub` 当时只造了 7 个桩 —— 挂错 provider 就等于**该分支根本没被走到**，
+零覆盖。`registerJetHubRpc` 有 **13 个必填 provider 形参**（位置传参，历史上因
+少传/插队错位复发 6 次），替身**必须传满**，否则 `undefined` 会被真调用。
 
-⚠ **同一轮顺带订正了四处失实注释**（`AGENTS.md` / `src/service.ts` ×3）里的
-「Jet Hub 账号卡片的『刷新』按钮」—— **该按钮从来不存在**。这类注释会把排障
-的人引到不存在的 UI 上，故一并改掉。
+⚠⚠ **「账号卡片刷新按钮」这个失实说法散布在约 25 处**（`README.md`、
+`AGENTS.md`、11 个 `*-auth.ts` 的签名注释、`expiry-sync.ts`、`types.ts`、
+`docs/adding-a-new-provider.md`、6 处测试注释）—— 该按钮**从来不存在**。
+首轮只订正了 4 处就被审计打回（其中 3 处就在被改的 handler 内部、与新写的
+「没有刷新按钮」上下打架）。⇒ **这类订正要一次做完**：先
+`Select-String -Path src,tests,docs -Pattern "账号卡片.{0,6}刷新|用户点[「『]刷新"`
+全量枚举再逐条改，别只改搜到的头几处。⚠ `docs/superpowers/plans/` 下的是历史
+设计快照（记录当时的过程），**不必**订正；`plugin-src/` 里的「点刷新」多指
+模型列表/额度/徽标的**真实**刷新按钮，**不要**误改。
 
 ## 技术栈与约束
 
@@ -1172,7 +1194,7 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
 
 - `login(options?)` — 执行浏览器登录流程
 - `startLogin(options?)` — 两步式登录（先返回 loginUrl，Jet Hub 据此弹窗）
-- `refreshAccountCredential(refName, pool?, accountId?)` — 按凭据 ref 续期**指定账号**（账号卡片「刷新」按钮）。⚠️ 后两个参数**必须传**：只有拿到池与账号 id，续期后的新 `expiresAt` 才能回写账号池（见下）
+- `refreshAccountCredential(refName, pool?, accountId?)` — 按凭据 ref 续期**指定账号**（由 RPC `account.refresh` 调用；⚠ 该端点**没有面板入口**，账号卡片上并没有「刷新」按钮，见 IKJOZA 那一节）。⚠️ 后两个参数**必须传**：只有拿到池与账号 id，续期后的新 `expiresAt` 才能回写账号池（见下）
 - `refreshAll(pool)` — 批量续期全部账号（定时调度器）
 
 ⚠️ **不注册任何斜杠命令**：十个 provider 的登录/状态/续期**全部**在 Jet Hub 设置页完成。
@@ -1347,7 +1369,7 @@ pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）�
 ② 推理路径的按需续期（`llm-adapter.ts` 的「过期预判」与「401 兜底」，
    而 DSH 本身会**并发**发多条请求：主回复 + 标题生成 + 上下文压缩）；
 ③ RPC `account.refresh`（⚠️ **没有面板入口** —— 账号卡片上并没有「刷新」按钮，
-   调用方是仓库外的脚本/手工 RPC；`plugin-src/client/jet-hub.js` 的 36 处
+   调用方是仓库外的脚本/手工 RPC；`plugin-src/client/jet-hub.js` 的 42 处
    `rpcCall(` 里没有它，`git log -S "rpcCall('account.refresh'"` 零命中）。
 华为 STS 在签发新凭据时**旧的那一份 refresh_token 即失效**，
 并发下必然「1 个成功、其余 `invalid_grant`」，而失败方把它读成「账号不能续期」。
@@ -1774,7 +1796,7 @@ qoder ≈57 MiB、cline ≈122 MiB）。两种约束**只有缩放图片这一�
 `tests/unit/cline-auth.spec.ts > ClineAuth refreshAll`：
 
 - 「只按 refreshable 过滤，**不看 enabled**」
-- 「按需续期（账号卡片「刷新」）成功后把新 expiresAt 写回账号池」
+- 「按需续期（RPC account.refresh）成功后把新 expiresAt 写回账号池」
 
 **当时的现场**：同一轮我正在并发跑真机图片 e2e（长跑、重负载）。
 **之后的验证**：单独跑该文件 26 条全过；全量连跑 3 次均 2833 全过；

@@ -1737,7 +1737,7 @@ export class ZcodeAuth extends Service {
   }
 
   /**
-   * 账号卡片「刷新」按钮。
+   * RPC `account.refresh`。
    *
    * ## ⚠⚠ 这里曾经有一个**数据破坏缺陷**（真实缺陷，2026-10-02）
    *
