@@ -28,6 +28,7 @@ import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
 import type { ZcodeCredential } from './zcode.js'
 import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
+import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
@@ -1650,7 +1651,11 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
 
   /**
-   * 十个 provider 实例的续期入口（`buddy` 与 `workbuddy` 是两个实例、同一个类）。
+   * 十三个 provider 实例的续期入口（`buddy` 与 `workbuddy` 是两个实例、同一个类；
+   * `qoder` 与 `qodercn` 同理）。
+   *
+   * ⚠️ 条数会随 provider 增长（早期写「十个」已过时）——注释里的数字**不是**契约，
+   * `tests/unit/refresh-bootstrap-wiring.spec.ts` 的清单才是。
    *
    * 收成一张表是为了让「失败必须留日志」这条规则**只写一遍** —— 原先这里是
    * 十个空 catch（注释写着「静默」），把 provider 内部的告警与异常一起吞掉，
@@ -1696,58 +1701,78 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     }
   }
 
-  // 启动时只要账号池非空，就安排首轮续期 + 定期续期。
+  // 启动时**无条件**武装续期调度器，并在账号入库时补一次武装。
   //
-  // ⚠️ 判据是「**池里有账号**」，不是「有 `refreshable` 的账号」（2026-10-02 修订）。
-  // 原先写成 `accounts.some(a => a.refreshable)`，于是这个定时器**是否武装**
-  // 取决于那批可能已经被误标成 false 的布尔 —— 而它存在的意义恰恰是去修正误标。
-  // 本次事故实测：36 条账号只剩 3 条 `true`（raccoon / minimax / cline 各一），
-  // 只要那三条被删或被同样误标，**codearts 的自愈与启动首轮会一起消失**，
-  // 且日志里一个字都不会有。各家 `refreshAll` 内部本来就按凭据材料 / 是否过期
-  // 过滤（`loomy` 只探已过期的、其余看 `refreshableOf(credential)`），
-  // 所以放宽这里的判据最多多一次本地遍历，不会白发请求。
+  // ⚠️ 空池判据（`isPoolEmpty`）**只用于日志措辞**，不再参与「是否武装」的决策。
+  // 它的历史形态是「按 `accounts.some(a => a.refreshable)` 决定武装」——
+  // 那让这个定时器**是否武装**取决于一批可能已被误标成 false 的布尔，而它存在
+  // 的意义恰恰是去修正误标。本次事故实测：36 条账号只剩 3 条 `true`
+  // （raccoon / minimax / cline 各一），只要那三条被删或被同样误标，
+  // **codearts 的自愈与启动首轮会一起消失**，且日志里一个字都不会有。
+  // 各家 `refreshAll` 内部本来就按凭据材料 / 是否过期过滤（`loomy` 只探已过期的、
+  // 其余看 `refreshableOf(credential)`），故放宽判据最多多一次本地遍历。
   //
   // ⚠️ 仍然**不看 `enabled`**（AGENTS.md 既有铁律）：停用只影响自动选号，
   // 不该让凭据停止续期。早期写成 `a.refreshable && a.enabled`，于是
   // 「所有账号都被停用」时续期定时器根本不启动，凭据一路烂到 refresh_token 失效。
   //
-  // ⚠️ **必须立刻先跑一轮**（issue !IKIRTT 的主缺陷）：早先这里只有
-  // `setInterval`，第一次处理要等满一个周期。短寿命 provider（cline 1 小时、
-  // codearts 约 2 小时、raccoon 3 小时）的凭据在宿主关闭期间早就到期了，
-  // 于是重启后**最长 30 分钟**一直显示「已过期」、积分行一直 401。
-  // 现在这一轮与 lead-time 过滤配合（`src/expiry-sync.ts` 的 `shouldRefreshNow`），
+  // ⚠️⚠️ **更不能因为「启动瞬间池为空」就不武装**（issue IKJOZB 的真实缺陷）：
+  // 冷启动空池是正常态（新用户、刚清过存储），而原先的 `if (accounts.length === 0)
+  // return` 让整个调度器**不被创建**、之后又没有重新武装的路径 ⇒ 该会话内登录的
+  // 账号**永远不会被主动续期**（只剩请求内按需续期），凭据悄悄过期而面板仍显示
+  // 「可自动续期」，且日志里一个字都没有。
+  // 现在武装与池内容彻底解耦（见 `src/refresh-scheduler.ts`）：
+  // ① 无条件武装；② 定时器内空池只记日志、下轮继续；③ `pool.onAccountAdded`
+  // 提供「入库即补武装」这条 issue 点名缺失的路径。
+  //
+  // ⚠️ **必须立刻先跑一轮**（issue !IKIRTT 的主缺陷，已内建在 `start()` 里）：
+  // 早先这里只有 `setInterval`，第一次处理要等满一个周期。短寿命 provider
+  // （cline 1 小时、codearts 约 2 小时、raccoon 3 小时）的凭据在宿主关闭期间
+  // 早就到期了，于是重启后**最长 30 分钟**一直显示「已过期」、积分行一直 401。
+  // 这一轮与 lead-time 过滤配合（`src/expiry-sync.ts` 的 `shouldRefreshNow`），
   // 只对「距过期不足 1 小时」的账号发续期请求，其余只做一次本地对账 ——
   // 既补上了首轮，又不会在启动时打出几十个无谓请求。
-  pool.listAllAccounts().then(accounts => {
-    if (accounts.length === 0) return
-    void refreshAllCredentials()
-    const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
-    refreshTimer.unref?.()
-    ctx.effect(() => () => {
-      clearInterval(refreshTimer)
-      service.stop()
-      buddy.stop()
-      workbuddy.stop()
-      lobsterai.stop()
-      qoder.stop()
-      qoderCn.stop()
-      trae.stop()
-      cline.stop()
-      loomy.stop()
-      zcode.stop()
-      // ⚠ 必须 dispose captcha 浏览器 —— 否则会留下孤儿 chromium
-      //（约 200-400MB，且用户没有界面能关掉它）。
-      zcodeAdapter.stop()
-    }, 'jet-hub: multi-account refresh scheduler')
-  }).catch((error: unknown) => {
-    // ⚠️ 原来这个 `.then()` **没有** `.catch()`：`listAllAccounts()` 一旦 reject
-    // （存储层异常），续期定时器就**永远不武装**，且日志里一个字都没有 ——
-    // 那时上面的「最长 30 分钟」会恶化成「永不自愈」。
+  const refreshScheduler = new MultiAccountRefreshScheduler({
+    refresh: refreshAllCredentials,
+    intervalMs: REFRESH_INTERVAL_MS,
+    isPoolEmpty: async () => (await pool.listAllAccounts()).length === 0,
+    // ⚠️ 可选链：`logger` 在极简 profile 下可能缺席，而日志不该成为续期的
+    // 单点故障（与仓库既有的 `ctx.logger?.warn?.()` 一致）。
+    info: (message) => ctx.logger?.info?.(message),
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // ⚠️ 不 await：`apply()` 是同步函数，而 `start()` 内含首轮续期（会发网络请求，
+  // 可达数十秒）。阻塞在这里会让插件启动卡住（与 opencode 能力预热同款约定）。
+  void refreshScheduler.start().catch((error: unknown) => {
+    // 走到这里说明 `refresh()` 或订阅通知本身出了意料之外的异常；`onTick`
+    // 内部已消化常规失败，故这条只是最后一道可观测性兜底。
     ctx.logger?.warn?.(
       `[jet-hub] 多账号续期调度器启动失败（本次会话不会自动续期）：`
       + `${error instanceof Error ? error.message : String(error)}`,
     )
   })
+  // issue IKJOZB 点名缺失的那条「重新武装的路径」：账号入库（登录成功、导入、
+  // 恢复备份）时若调度器未武装则补上。⚠️ 订阅点必须挂在 `AccountPool` 上，
+  // 不能逐个登录流程接线 —— 全仓库十几处 `pool.addAccount` 调用点，漏一处
+  // 就意味着那个 provider 静默地永不续期。
+  const unsubscribeAccountAdded = pool.onAccountAdded(() => { refreshScheduler.notifyAccountAdded() })
+  ctx.effect(() => () => {
+    unsubscribeAccountAdded()
+    refreshScheduler.stop()
+    service.stop()
+    buddy.stop()
+    workbuddy.stop()
+    lobsterai.stop()
+    qoder.stop()
+    qoderCn.stop()
+    trae.stop()
+    cline.stop()
+    loomy.stop()
+    zcode.stop()
+    // ⚠ 必须 dispose captcha 浏览器 —— 否则会留下孤儿 chromium
+    //（约 200-400 MB，且用户没有界面能关掉它）。
+    zcodeAdapter.stop()
+  }, 'jet-hub: multi-account refresh scheduler')
 
   // 保留旧的 stop scheduler（兼容旧命令）
   ctx.effect(() => () => {

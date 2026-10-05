@@ -1309,9 +1309,141 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
 测试：`tests/unit/expiry-sync.spec.ts`（19 条：lead 边界含 `<=`、一致不写盘、
 1 秒容差、不传 refreshableOf、反查传凭据内容、回写失败不反噬、
 「有效期内仍须对账」、续期返回 undefined 时绝不落盘）+
-`tests/unit/refresh-bootstrap-wiring.spec.ts`（19 条：启动首轮排在定时器前、
+`tests/unit/refresh-scheduler.spec.ts`（9 条：武装时机/首轮/补武装/防叠加/防重入，
+见下条）+ `tests/unit/refresh-bootstrap-wiring.spec.ts`（21 条：index.ts 接线、
 十个 provider 都在表里、九个 auth 的 `refreshAccountCredential` 都带
 pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）。
+
+### ⚠️⚠️ 续期调度器**必须无条件武装**：冷启动空池不是「不需要调度」（Issue IKJOZB）
+
+**真实缺陷**（Gitee issue IKJOZB，用户报障，2026-10-05）：
+「冷启动时账号池为空（0 账号），之后再登录账号 ⇒ **该会话内不再有主动续期**
+（只剩请求内按需续期），且**日志无痕**。」
+
+原实现（`src/index.ts`，在役 0.1.5）：
+
+```ts
+pool.listAllAccounts().then(accounts => {
+  if (accounts.length === 0) return          // ← 根因
+  void refreshAllCredentials()
+  const refreshTimer = setInterval(...)
+})
+```
+
+冷启动空池是**正常态**（新用户、刚清过存储、刚删光账号），此时整个调度器
+**不被创建**；而 `addAccount`（登录成功那一步）**没有任何重新武装的路径**
+⇒ 该会话内登录的账号**永远不会被主动续期**。用户看到的是「面板显示可自动
+续期，但凭据悄悄过期、昨天还能用今天全挂」，且那条 `return` 一句话都不记。
+
+⚠️ **这是「用瞬时状态决定长期能力」的经典形态**：池在启动那一刻恰好为空，
+是一个**与「要不要续期」无关**的事实。凡是「启动时读一次快照 ⇒ 决定要不要
+注册长期机制」的写法都要怀疑。
+
+**修法 = 三道防线，缺一不可**（现在都在 `src/refresh-scheduler.ts`）：
+
+| 防线 | 做法 | 防的是什么 |
+|---|---|---|
+| ① 无条件武装 | `start()` 不再看池内容 | 根因：空池就不武装 |
+| ② 入库即武装 | `pool.onAccountAdded()` → `notifyAccountAdded()` | issue 点名缺失的「重新武装路径」；启动期存储异常也能救回 |
+| ③ 空池下轮重试 | `onTick` 判空后**绝不** `clearInterval` | 通知因任何原因没送到时的兜底 |
+
+⚠️ **已做反向验证**（两次都精确命中，不是同义反复）：把 `start()` 改回
+「空池 return」→ 3 条变红；去掉 `notifyAccountAdded` 的补武装 → 1 条变红；
+`addAccount` 的通知移出 `finally` → 1 条变红。
+
+⚠️ **两道防线是独立冗余的**（实测）：只禁 ① 时探针**仍通过** —— 因为
+② 补武装兜住了。所以「单独打破一条看不出问题」是**预期行为**，验证必须
+两道一起禁才能复现原缺陷。别据此以为防线是多余的。
+
+⚠️ **抽成类而非留在 `index.ts` 闭包里**：原先这段逻辑无法单测，导致
+issue !IKIRTT 的回归用例只能在**源码文本**上断言，而那条断言
+（`expect(gate).toMatch(/accounts\.length\s*===\s*0/)`）**顺带把错误形态
+一起固化了**（它本意只是锁「判据放宽」）。⚠️ **教训：源码文本断言会
+把实现细节变成契约 —— 用它锁「不许写 X」，不要用它锁「必须写 Y」。**
+
+两个实现约束：
+
+- ⚠️ **通知必须排在 `addAccount` 的 `finally` 里**，不能在落盘成功之后一行：
+  `writeAccounts` 先更新进程内副本再 `await` 落盘，故落盘抛错时账号**已经是
+  可用状态**（各 auth 的登录流程在调 `addAccount` 前就已 `credentials.set`）。
+  因一次磁盘失败吞掉通知 = 「账号能用、但本会话不续期」，同一形态。
+- ⚠️ **订阅点必须挂在 `AccountPool` 上**，不能逐个登录流程接线：全仓库十几处
+  `pool.addAccount(...)`（13 个 provider 的 auth、opencode 账号槽/匿名槽、
+  RPC 的导入/恢复分支），逐处接线必漏，而漏掉的那个 provider 会**静默**不续期。
+
+⚠️ **判据只有「池里有没有账号」**，仍**不看** `refreshable` / `enabled`
+（既有铁律，见上两条）。`MultiAccountRefreshScheduler` 刻意**不接收账号条目**，
+只收一个 `isPoolEmpty` 布尔 —— 从类型上就杜绝了把被误标的布尔再接回门禁。
+
+#### 影响面：`refreshTargets` 的 **13 条全部**受影响（实测）
+
+这个缺陷在**表这一层**，不在任何单个 provider 上 ⇒ 表里每个条目一起失去主动续期。
+但**症状可见度**由凭据寿命决定：
+
+| 可见度 | provider | 凭据寿命 |
+|---|---|---|
+| 🔴 最先撞上 | `codearts`(约 2h) / `cline`(1h) / `raccoon`(约 3h) / `gemini`(1h) | 短 |
+| 🟠 明显 | `qoder` / `qodercn` / `trae` / `minimax` | 短（且会轮换 refresh_token） |
+| 🟡 几乎看不出 | `lobsterai`(30 天) / `buddy` / `workbuddy` | 长 |
+| ⚪ 本来就不续期 | `loomy`（只探已过期）/ `zcode`（只回写凭据） | — |
+
+⚠️ **`opencode` 不在表内**（Zen key 不过期、无 refresh_token 概念）⇒ **不受影响**。
+⚠️ **长期没被发现正是因为那 6 个长寿命 provider 掩盖了症状** ——
+issue 报告者观察到的 `gemini` 1 小时寿命正是最先暴露的那一个。
+
+#### ⚠️ 验证这类缺陷的正确姿势：真 `apply()`（两个坑必须避开）
+
+`tests/unit/refresh-scheduler.spec.ts` 测的是**抽出来的类**，抓不住
+「类写对了但 `index.ts` 没接上」。真正能抓接线的是
+**`tests/unit/refresh-scheduler-apply.spec.ts`**（真 `apply()` + 真 `AccountPool`，
+只把 13 个 `refreshAll` 换成记录器以免打上游）。
+
+⚠️ **写这类用例时踩过两个坑，两个都导致假阴性**（第一版探针因此误报「缺陷仍在」）：
+
+1. **`vi.spyOn(ctx.logger, 'info')` 抓不到调度器日志** —— cordis 的 Logger 是
+   **原型方法 + 自有 exporter**，`spyOn` 无效，日志看似「没打」。必须**直接替换**
+   `ctx.logger.info = …`（见该 spec 的 `makeCtxWithLogs()`）。
+   ⚠️ 这个坑很危险：它会让你以为「调度器没跑」，而实际上跑得好好的。
+2. **`settle()` 里绝不能再 `await new Promise(r => setTimeout(r, 0))`** ——
+   `vi.useFakeTimers()` 把它一起 mock 了 ⇒ **永不 resolve** ⇒
+   fire-and-forget 的异步链推不动、断言看到的是旧状态。
+   改用 `await vi.advanceTimersByTimeAsync(0)`（会连微任务一起冲干净）。
+3. 顺带：`settings.register()` 的替身**必须返回带 `replace` 的 scope**，
+   否则 `AccountPool.addAccount` 会在 `scope.replace` 上抛
+   `Cannot read properties of undefined`。
+
+⚠️ **已做反向验证**（真 `apply()` 级，3 条全红）：把
+`start()` 的「空池就 return」与 `notifyAccountAdded` 的补武装**两道一起禁** ⇒
+该 spec 3 条全变红；只禁 ① 时**仍全绿**（② 兜住了，见上）。
+接线断言单独验过：摘掉 `pool.onAccountAdded` 订阅 ⇒
+`refresh-bootstrap-wiring.spec.ts` 精确红 1 条。
+
+**真机影响面实证**（198 行只读脚本，零额度；`scripts/probe-ikjozb-real.mjs`，
+⚠️ 按仓库约定不入库）：把本机真实 `state.json`（39 账号 / 13 provider）
+**复制到临时目录**后跑真 `apply()`，并拦截全部 `fetch`：
+
+```
+真实账号池：39 个账号
+首轮 refreshAll 被驱动：["buddy","cline","codearts","gemini","lobsterai",
+                        "loomy","minimax","qoder","raccoon","trae","zcode"]
+refreshTargets 里但未被驱动：[]          ← 13 条全部驱动（11 个类，两组共用）
+网络请求尝试次数：0（全部被拦截 ⇒ 零额度）
+```
+
+⚠️ 脚本要点：**绝不写真实 `state.json`**（复制到临时目录 + `DSH_JET_HUB_STATE_DIR`）；
+拦 `fetch` 一举两得 —— 既证明零额度，又让续期请求立刻失败（失败本身不影响
+「是否被驱动」这个判据）。
+
+### ⚠️ 类名 `RefreshScheduler` 有**两个**，别改混
+
+| 类 | 文件 | 职责 |
+|---|---|---|
+| `RefreshScheduler` | `src/refresh.ts` | **单凭据**时代的静默续期器（buddy/cline/qoder/trae/lobsterai 各持一个实例，`arm(expiresAt)`） |
+| `MultiAccountRefreshScheduler` | `src/refresh-scheduler.ts` | **多账号池**调度（本 issue 新建；无条件武装 + 入库补武装 + 空池下轮重试） |
+
+⚠️ 两者**职责不同、都不可删**。本 issue 新建的类**刻意**叫
+`MultiAccountRefreshScheduler`（初版叫 `RefreshScheduler`，与既有的撞名 ⇒
+`grep RefreshScheduler` 会同时命中两套语义，已改名）。
 
 ### ⚠️ 账号池的 `refreshable` 只是**凭据材料的镜像**，绝不能当续期门禁
 
