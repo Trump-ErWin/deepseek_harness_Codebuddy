@@ -20,7 +20,12 @@ import {
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
-import { RATE_LIMIT_FALLBACK_MS, isRateLimited, parseRateLimitError } from './llm-adapter.js'
+import {
+  RATE_LIMIT_FALLBACK_MS,
+  isModelSaturationError,
+  isRateLimited,
+  parseRateLimitError,
+} from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
@@ -688,6 +693,52 @@ function resolveFirstTokenTimeoutMs(): number {
 }
 function resolveChunkTimeoutMs(): number {
   return Number.parseInt(process.env.DSH_BUDDY_SSE_CHUNK_TIMEOUT_MS ?? '', 10) || 120_000
+}
+
+/**
+ * 模型饱和（`14003`）的**内部重试**次数。
+ *
+ * ## 为什么饱和要自己重试，而额度限流（6004）不重试
+ *
+ * 两者的时间尺度完全不同：
+ * - **额度限流 6004**：确定性 —— 「这个账号今天/这小时用完了」，重试**必然**再撞，
+ *   只能等解禁或换账号；
+ * - **模型饱和 14003**：**瞬时**过载，服务端原话就是「模型繁忙，请稍后重试」，
+ *   且报文的 `actions` 里自带 `RETRY`。
+ *
+ * ⚠️ **重试必须留在本账号上**（不换号）：饱和是**模型级**的，池里 4 个独立账号
+ * 会撞同一堵墙 —— 实测 4 个不同腾讯 uid 在 20 秒内全部被同一个 14003 拒绝。
+ * 换号只会白烧掉「还有额度」的账号，正是本次要修的缺陷。
+ */
+const BUDDY_SATURATION_MAX_RETRIES = 2
+
+/**
+ * 饱和重试的基准间隔（毫秒），按次数**线性**递增（2s → 4s）。
+ *
+ * ⚠️ 刻意取短：14003 那次失败**自身**就要跑 46~111 秒才返回，
+ * 退避再叠长间隔会让 UI 长时间停在「运行中」而无法区分「排队」与「卡死」。
+ * 这与 Qoder 排队那条「≥10 秒封顶」的取舍同因。
+ */
+const BUDDY_SATURATION_BASE_DELAY_MS = 2_000
+
+/**
+ * 饱和重试的等待时长（毫秒）。
+ *
+ * ⚠️ 环境变量**不能**写成 `parseInt(…) || 默认值`：`0` 是合法值
+ * （表示「不等」，单测靠它把用例压到毫秒级），而 `0` 是 falsy 会被 `||`
+ * 静默换成 2000 —— 与 `QODER_QUEUE_MAX_DELAY_MS` 那次踩过的坑同型。
+ */
+function buddySaturationDelayMs(attempt: number): number {
+  const raw = process.env.DSH_BUDDY_SATURATION_DELAY_MS
+  const base = raw === undefined || raw === '' ? BUDDY_SATURATION_BASE_DELAY_MS : Number(raw)
+  const resolved = Number.isFinite(base) && base >= 0 ? base : BUDDY_SATURATION_BASE_DELAY_MS
+  return resolved * (attempt + 1)
+}
+
+/** 等待指定毫秒数（可被单测用 `DSH_BUDDY_SATURATION_DELAY_MS=0` 短路）。 */
+function sleepMs(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve()
+  return new Promise((resolve) => { setTimeout(resolve, ms) })
 }
 
 /** 判断是否为传输级错误。 */
@@ -1511,6 +1562,63 @@ export class BuddyAdapter extends LlmAdapter {
     }
     if (!response.ok) {
       let errorText = await response.text().catch(() => '')
+      // ⚠️⚠️ **模型饱和必须**先于**限流分支判定**（真实缺陷，2026-10-05）
+      //
+      // `14003 model busy` **也是 HTTP 429**，而 `isRateLimited` 对 429
+      // **无条件返回 true** —— 若先走下面的限流分支，就会给每个账号写一条
+      // **1 小时**限流标记（报文里没有「将在…重置」，故取 `RATE_LIMIT_FALLBACK_MS`
+      // 兜底），把**整池**锁死。
+      //
+      // 用户报障正是这个：第一次用 `buddy/space-bunny` 就报
+      // 「模型 space-bunny 所有账号均受限」。
+      //
+      // 实测四条证据（`scripts/probe-buddy-*.mjs`，2026-10-05）：
+      // | 观测 | 结果 |
+      // |---|---|
+      // | 4 个**不同腾讯 uid** 的账号 | 20 秒内**全部**被写 `space-bunny` 标记 |
+      // | 标记解禁时刻 | 全 = 「写入 + 整 1 小时」= **兜底值**，非服务端给的 |
+      // | 4 MB 输入 | 稳定逼出 `429/14003`，报文自称「模型繁忙，请换模型」 |
+      // | 小请求 30 发 | 全 200，但耗时 841ms ~ 216s（上游**时变**背压） |
+      //
+      // 4 个互不相干的账号同时中招，账号级限流**无法解释** ⇒ 只能是模型级。
+      // 服务端报文自己就写着 `actions:["SWITCH_MODEL",…]`（**没有**换号选项）。
+      //
+      // ⚠️ 故正确动作是：**留在本账号退避重试**，绝不换号、绝不写标记 ——
+      // 与 zcode `3009` 并发限流的处置同型（那边注释：换账号也一样撞，
+      // 白白标记掉一个可用账号）。
+      if (isModelSaturationError(response.status, errorText)) {
+        for (let attempt = 0; attempt < BUDDY_SATURATION_MAX_RETRIES; attempt += 1) {
+          const waitMs = buddySaturationDelayMs(attempt)
+          console.warn(
+            `[${this.product.id}] 模型 ${options.model} 请求量饱和（上游 14003 model busy），`
+            + `${waitMs}ms 后**在本账号**重试（第 ${attempt + 1}/${BUDDY_SATURATION_MAX_RETRIES} 次）`
+            + `—— 不换号、不写限流标记：饱和是模型级，池里其它账号会撞同一堵墙`,
+          )
+          await sleepMs(waitMs)
+          response = await this.send(credential, body, options)
+          if (response.ok) {
+            yield* this.consumeSse(response, options, currentAccountId)
+            return
+          }
+          errorText = await response.text().catch(() => '')
+          // 重试后若已**不是**饱和（如变成额度限流 / 认证失败），
+          // 立刻停手交给下面的既有分类逻辑 —— 那些语义各有各的正确动作。
+          if (!isModelSaturationError(response.status, errorText)) break
+        }
+        // 退避重试用尽仍是饱和：如实报「模型繁忙」并给**唯一有效**的动作
+        // （换模型），而不是伪造成「账号额度受限」（那会让用户白等 1 小时）。
+        if (isModelSaturationError(response.status, errorText)) {
+          throw new LlmError(
+            `${this.product.id}: 模型 ${options.model} 当前请求量饱和`
+            + `（上游 14003 model busy，报文原文：「模型繁忙，请换模型或稍后重试」），`
+            + `已重试 ${BUDDY_SATURATION_MAX_RETRIES} 次仍未通过。`
+            + `此为该**模型**整体繁忙，并非账号额度问题 —— 换账号无效，`
+            + `请改用其它模型，或稍后重试（无需重新登录）。`,
+            'RATE_LIMIT',
+            { status: response.status },
+          )
+        }
+      }
       // 限流处理：把当前账号在该模型上的重置时间记录下来，然后逐个尝试
       // 其余可用账号。每个失败账号都会被记录，只有真正试完全部候选才报
       // "所有账号均受限"——避免只试一个就下结论（那会让 UI 显示的限流
