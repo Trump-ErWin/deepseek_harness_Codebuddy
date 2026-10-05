@@ -1065,14 +1065,6 @@ export class AccountPool {
     entry.modelRateLimits = { ...entry.modelRateLimits, [modelId]: resetAtMs }
     next[idx] = entry
     await this.writeAccounts(next)
-    // 🔴 限流账号自动挪位 —— **方案改定：读时视图，不写回顺序**（2026-10-02 修订，
-    //    工单 08）。首版在写入数组上重排（写时挪位），被上游行为契约测试抓出 4 条红：
-    //    "手动顺序=用户拖拽意图，限流只做 filter（跳过）、**永不改用户序**"是该池的
-    //    成文契约。写时挪位会让面板顺序与用户拖拽分叉。
-    //    ⇒ 改为 **listAccounts 视图排序**：返回给面板/统计的账号列表把「目标模型限流中」
-    //      的沉到最后（稳定序），磁盘序与选号 filter 语义完全不变；
-    //      限流解除 ⇒ 视图自动回原位（"自动回位"白送，无状态机）。
-
 
     this.ctx.logger?.info?.(
       `[jet-hub] 已记录限流: 账号 ${accountId} 模型 ${modelId} 重置于 ${new Date(resetAtMs).toISOString()}`,

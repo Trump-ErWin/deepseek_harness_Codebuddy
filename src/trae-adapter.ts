@@ -1172,10 +1172,13 @@ export class TraeAdapter extends LlmAdapter {
           // soft-rate 1h。旧实现一律 1h 兜底，额度耗尽的账号 1 小时后被
           // 选回、又 4008（同款缺陷的流内第二实例，见抛出点注释）。
           if (currentAccountId.length > 0) {
-            const cause = (error as { cause?: unknown }).cause
-            const streamCode = cause instanceof TraeStreamErrorCause ? cause.code : undefined
-            const kind = streamCode !== undefined
-              ? classifyTraeError(0, JSON.stringify({ code: streamCode, message: cause?.message }))
+            // ⚠️ instanceof 收窄一次、两个字段都从收窄后的引用取（PR #64 审查 1）：
+            // 对 `unknown` 的行内可选链不做窄化，`cause?.message` 会报 TS2339 挡构建。
+            const streamErr = (error as { cause?: unknown }).cause instanceof TraeStreamErrorCause
+              ? (error as { cause?: TraeStreamErrorCause }).cause
+              : undefined
+            const kind = streamErr !== undefined
+              ? classifyTraeError(0, JSON.stringify({ code: streamErr.code, message: streamErr.message }))
               : undefined
             const cooldownMs = kind !== undefined ? traeCooldownFor(kind) : TRAE_RATE_LIMIT_FALLBACK_MS
             await this.options.accountPool.updateModelRateLimit(
