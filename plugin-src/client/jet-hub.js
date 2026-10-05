@@ -3471,7 +3471,7 @@ function providerRowSummary(row) {
  * 传入；拖拽的视觉状态（正在拖哪行 / 落点在哪）是本组件的局部 UI 状态，drop 时
  * 通过 `onCommitOrder` 把新顺序交给页面层持久化。
  */
-function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onToggle, onReload, onClose, order, onCommitOrder }) {
+function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onToggle, onReload, onClose, order, onCommitOrder, reordering, notice }) {
   // ESC 关闭：挂在 document 上而不是弹窗上 —— 焦点可能落在任意一个开关上，
   // 只监听弹窗自身的 keydown 会漏掉这些按键（与 ModelListPanel 同因）。
   React.useEffect(() => {
@@ -3495,7 +3495,12 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
 
   // 已打开 ≥2 行才值得拖（与账号面板同款门槛）；任一开关提交中则整体冻结，
   // 避免「拖到一半那行被停用」造成展示组与拖拽组错位。
-  const dragEnabled = rows.filter(row => row.checked).length >= 2 && busyIds.size === 0;
+  // ⚠️ `reordering`（排序提交中）也必须计入：提交期间界面顺序未变（不做乐观
+  // 更新），再拖一次会基于旧顺序计算并把上一次移动静默覆盖（账号面板同款，
+  // 那边是 `reordering ? { enabled: false } : dragPropsFor(...)`）。
+  const dragEnabled = rows.filter(row => row.checked).length >= 2
+    && busyIds.size === 0
+    && !reordering;
 
   /**
    * 构造某一行的拖拽属性（关闭组或不允许拖时返回 enabled:false）。
@@ -3540,7 +3545,10 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
         if (sourceId === null || sourceId === row.id) return;
         const openIds = rows.filter(r => r.checked).map(r => r.id);
         const closedIds = rows.filter(r => !r.checked).map(r => r.id);
-        const next = nextProviderOrderAfterDrop(openIds, closedIds, sourceId, row.id, dropPosition);
+        // ⚠️ 必须传当前的 `order`（旧顺序）：已关闭 id 的位置由「它在旧顺序里
+        // 的直接前驱」决定，漏传就退化成按展示序缀尾 —— 关闭期间拖过一次之后
+        // 重开就会掉到末尾（PR #63 初版的真实缺陷）。
+        const next = nextProviderOrderAfterDrop(openIds, closedIds, sourceId, row.id, dropPosition, order);
         if (next !== null) void onCommitOrder(next);
       },
     };
@@ -3577,6 +3585,20 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
     '关闭一个供应商 = 关闭它的全部模型（从对话框的模型选择里移除）并停用它的全部账号；'
     + '打开则恢复。关闭前会再确认一次。没有可关闭模型的供应商会被禁用（服务端也会拒绝）。'
     + '拖动已打开的行可自定义顺序（顺序只保存在本机）；已关闭的供应商仍按默认顺序显示在底部。'),
+  // ⚠️ 供应商相关的提示必须在**这里**（弹窗内）显示，不能只挂在页面层：
+  // 拖拽与开关切换都发生在弹窗打开期间，而弹窗遮罩是 fixed + z-index 3000，
+  // 页面层的 notice 会被它整个盖住 —— 用户只会看到「操作没生效，却什么提示都没有」。
+  // ⚠️ 弹窗开着时**显示全部** notice（含 toggleProvider 的结果/失败提示）——
+  // 它们此刻在页面层同样被遮住，只按 inModal 过滤会让切换结果一样消失。
+  // 弹窗关闭即不挂载、页面层那条照旧渲染，两边不会重复出现。
+  // 复用既有 `.dim-jh-probeNotice` + `.dim-jh-modal .dim-jh-probeNotice` 样式，不新增样式。
+  notice
+    ? React.createElement('div', {
+        className: 'dim-jh-probeNotice',
+        'data-tone': notice.tone,
+        role: notice.tone === 'error' ? 'alert' : 'status',
+      }, React.createElement('div', null, notice.text))
+    : null,
   React.createElement('div', { className: 'dim-jh-modalBody' },
     React.createElement('div', { className: 'dim-jh-modelList' },
       rows.map(row => {
@@ -4241,6 +4263,25 @@ export function JetHubPage({ close, rpcCall }) {
    */
   const [providerOrder, setProviderOrder] = React.useState(null);
   /**
+   * 排序提交进行中（与账号面板的 `reordering` 同款）。
+   *
+   * ⚠️ 不做乐观更新 ⇒ RPC 返回前 `providerOrder` 仍是旧值，`rows` 也仍基于
+   * 旧值。若这段时间里用户再拖一次，第二次会**基于旧顺序**计算，于是第一次的
+   * 移动被静默覆盖（实测：拖 cline 到最前后紧接着拖 loomy，cline 被打回原位）。
+   * 账号面板早就有这把锁（`reordering ? { enabled: false } : dragPropsFor(...)`），
+   * 这里必须同样把「排序提交中」并入 `dragEnabled`。
+   */
+  const [providerReordering, setProviderReordering] = React.useState(false);
+  /**
+   * 排序提交的**同步**互斥锁（ref 而非 state）。
+   *
+   * ⚠️ 必须用 ref 而不是直接读 `providerReordering`：state 写入后要等下一次
+   * 渲染才可见，而两次 drop 可以发生在同一次渲染周期内 —— 读 state 会让锁
+   * 形同虚设（账号面板的 `reordering` 走 state，是因为它的入口是按钮、
+   * 有一次点击到渲染的自然间隔；拖拽 drop 没有这层间隔）。
+   */
+  const reorderLockRef = React.useRef(false);
+  /**
    * 供应商开关的结果提示（成功或失败）。
    *
    * 与 `checkinNotice` 分开：两者可能先后出现，共用一个状态会让后写的覆盖先写的，
@@ -4373,7 +4414,16 @@ export function JetHubPage({ close, rpcCall }) {
    */
   const commitProviderOrder = React.useCallback(async (next) => {
     if (!Array.isArray(next)) return;
-    setProviderNotice(null);
+    // ⚠️ 提交期间上锁：RPC 返回前界面顺序未变，再拖一次会基于旧顺序计算，
+    // 把本次的移动静默覆盖（账号面板的 `reordering` 同款，理由见 state 处注释）。
+    if (reorderLockRef.current) return;
+    reorderLockRef.current = true;
+    setProviderReordering(true);
+    // ⚠️ **只清排序自己的旧提示**（inModal 那条），不能无条件清空：
+    // 用户「切换某供应商（成功提示）→ 立刻拖一次」时，前一条 ok 提示不该被吞掉
+    // （`toggleProvider` 写的 notice 没有 inModal 标记，见 ProviderSwitchPanel）。
+    // 拖拽本身在弹窗内没有独立区域显示 toggle 的结果，故保留它。
+    setProviderNotice(prev => (prev && prev.inModal ? null : prev));
     try {
       await rpcCall('provider.setOrder', { order: next });
       if (!mounted.current) return;
@@ -4384,8 +4434,14 @@ export function JetHubPage({ close, rpcCall }) {
       setProviderNotice({
         tone: 'error',
         text: '保存排序失败：' + (caught?.message || '未知错误') + '。界面顺序保持不变，可重试拖动。',
+        // ⚠️ 必须由**弹窗内**呈现：拖拽必然发生在弹窗打开期间，而弹窗遮罩是
+        // fixed + z-index 3000，页面层的 notice 会被它整个盖住（用户看不到失败）。
+        inModal: true,
       });
       await loadProviderOrder();
+    } finally {
+      reorderLockRef.current = false;
+      if (mounted.current) setProviderReordering(false);
     }
   }, [rpcCall, loadProviderOrder]);
 
@@ -4697,7 +4753,9 @@ export function JetHubPage({ close, rpcCall }) {
                 React.createElement('li', { key: index }, note)))
           : null)
       : null,
-    providerNotice
+    // ⚠️ `inModal` 的提示交给弹窗自己渲染（见 ProviderSwitchPanel）—— 重复渲染
+    // 会让同一条错误在遮罩内外各出现一次。
+    providerNotice && !providerNotice.inModal
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
           'data-tone': providerNotice.tone,
@@ -4732,6 +4790,8 @@ export function JetHubPage({ close, rpcCall }) {
           onClose: () => setShowProviderSwitches(false),
           order: providerOrder,
           onCommitOrder: commitProviderOrder,
+          reordering: providerReordering,
+          notice: providerNotice,
         })
       : null,
     // 同款做法：网关开关也是覆盖层，且与「供应商开关」互斥 —— 两者都是
