@@ -148,6 +148,8 @@ import type {
   RpcUpdateAccountRequest,
   RpcDeleteAccountRequest,
   RpcReorderAccountsRequest,
+  RpcGetProviderOrderResponse,
+  RpcSetProviderOrderRequest,
   RpcRefreshAccountRequest,
   RpcRefreshAccountResponse,
   RpcRetestAccountRequest,
@@ -3657,6 +3659,29 @@ function registerJetHubEndpoints(
           accounts: accountCount,
         }
         return { ok: true, value }
+      }
+
+      // ── 供应商自定义显示顺序（「供应商开关」弹窗的拖拽排序）──
+      case 'provider.getOrder': {
+        // 与 provider.status 同级的轻量读取：池内进程内存副本，无任何 IO。
+        const value: RpcGetProviderOrderResponse = { order: pool.providerOrder() }
+        return { ok: true, value }
+      }
+      case 'provider.setOrder': {
+        const req = payload as RpcSetProviderOrderRequest
+        if (!Array.isArray(req?.order) || req.order.some(id => typeof id !== 'string')) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'order 必须是字符串数组' },
+          }
+        }
+        // ⚠️ 与 account.reorder 不同：这里**不校验**「必须恰好等于当前供应商
+        // 清单」——展示侧（provider-toggle.js 的 sortOpenProvidersByOrder）对
+        // 数组中不认识 / 缺失的 id 都有稳定兜底，并发下列表过期也不需要让用户
+        // 重试，接受最后一次拖拽的结果即可。
+        await pool.setProviderOrder(req.order)
+        ctx.logger.info(`[jet-hub] 已更新供应商自定义显示顺序（${req.order.length} 项）`)
+        return { ok: true, value: undefined }
       }
 
       // ── 本机 OpenAI 网关（`src/openai-gateway/`）──

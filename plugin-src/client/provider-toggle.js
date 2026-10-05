@@ -22,6 +22,8 @@
  * （没有模型可关，就不该说它被关闭了）。
  */
 
+import { orderAfterDrop } from './account-order.js';
+
 /**
  * 按「已打开 / 已关闭」把供应商分成两组。
  *
@@ -115,6 +117,69 @@ export function summarizeProviderToggle(enabled, res) {
 }
 
 /**
+ * 把「已打开」组按用户拖拽得到的自定义顺序排（纯函数）。
+ *
+ * ## 口径（2026-10-06，用户需求「供应商开关支持拖动排序」）
+ *
+ * - `order` = 宿主持久化的最近一次拖拽提交顺序（数组含全部供应商 id）；
+ *   `null` / 空数组 / 缺失 = 未自定义 → **完全保持传入顺序**，与不传一致；
+ * - 已打开组：`order` 中出现且已打开的排前（按数组序），未出现的按传入
+ *   （声明）顺序稳定补后 —— 数组里残留的已关闭 id 与未知 id 天然被跳过；
+ * - 已关闭组**不经过本函数**：它恒按声明顺序沉底（见 {@link providerSwitchRows}），
+ *   自定义排序不覆盖关闭组。
+ *
+ * ⚠️ 排序必须**稳定**：`Array.prototype.sort` 自 ES2019 起规范保证稳定，
+ * 两个都未定位的条目保持声明相对顺序 —— 依赖该保证，勿换成非稳定排序。
+ *
+ * @param {Array<{ id: string }>} openProviders 已打开组的供应商（传入顺序即声明顺序）
+ * @param {string[] | null | undefined} order 宿主持久化的自定义顺序
+ * @returns {Array<object>} 排序后的新数组（不修改入参）
+ */
+export function sortOpenProvidersByOrder(openProviders, order) {
+  const list = Array.isArray(openProviders) ? openProviders : [];
+  const seq = Array.isArray(order) ? order : [];
+  if (seq.length === 0) return list;
+  const rank = new Map();
+  for (let index = 0; index < seq.length; index++) {
+    const id = seq[index];
+    if (typeof id === 'string' && id.length > 0 && !rank.has(id)) rank.set(id, index);
+  }
+  if (rank.size === 0) return list;
+  return [...list].sort((a, b) => {
+    const ra = rank.get(a?.id);
+    const rb = rank.get(b?.id);
+    if (ra !== undefined && rb !== undefined) return ra - rb;
+    if (ra !== undefined) return -1;
+    if (rb !== undefined) return 1;
+    return 0;
+  });
+}
+
+/**
+ * 拖拽落点之后的**完整**顺序（纯函数）：已打开组内移动，已关闭组按声明序缀尾。
+ *
+ * ## 为什么已关闭的要缀尾而不是原样保留旧位置
+ *
+ * `order` 数组的语义是「已打开组的目标顺序 + 关闭组占位」。展示侧只读它的
+ * **已打开**部分（关闭组恒按声明顺序渲染），所以尾段内容不影响渲染 —— 但必须
+ * 把关闭的 id 写回去：否则「拖拽 → 关闭某供应商 → 再打开」后它会掉到未定位
+ * 段，失去用户给它排过的位置。缀尾用**声明顺序**（而非旧数组里的相对顺序）：
+ * 确定性更强，且与「关闭组按声明顺序沉底」的展示口径一致。
+ *
+ * @param {string[]} openIds 当前展示中已打开的供应商 id（展示顺序）
+ * @param {string[]} closedIds 已关闭的供应商 id（声明顺序）
+ * @param {string} sourceId 被拖动的 id
+ * @param {string} targetId 落点 id
+ * @param {'before' | 'after'} position 插到落点之前还是之后
+ * @returns {string[] | null} 新顺序；无需变更时返回 null（同 {@link orderAfterDrop}）
+ */
+export function nextProviderOrderAfterDrop(openIds, closedIds, sourceId, targetId, position) {
+  const moved = orderAfterDrop(openIds, sourceId, targetId, position);
+  if (moved === null) return null;
+  return [...moved, ...closedIds];
+}
+
+/**
  * 「供应商开关」弹窗的行数据：已打开在前、已关闭在后，每行自带开关呈现状态。
  *
  * ## 为什么单独抽出来
@@ -125,8 +190,12 @@ export function summarizeProviderToggle(enabled, res) {
  *
  * ## 三条必须保住的口径
  *
- * - **顺序与分组直接复用 {@link groupProviders}**：与左侧 rail 用的是同一份
+ * - **分组直接复用 {@link groupProviders}**：与左侧 rail 用的是同一份
  *   判据，两处不可能出现「左侧说它关了、弹窗里它还是开的」。
+ *   ⚠️ 组内顺序有例外：传入 `order`（宿主持久化的自定义顺序）时，**已打开**
+ *   组按 {@link sortOpenProvidersByOrder} 重排，**已关闭**组仍按声明顺序
+ *   沉底 —— 这是 2026-10-06 用户明确的需求口径：「关闭的供应商仍按默认排序
+ *   显示在最下面，这个逻辑不变」。
  * - **勾选态与禁用态直接复用 {@link providerSwitchState}**：包括那条容易漏的
  *   「`models.total === 0` ⇒ 禁用并给出原因」—— 没有模型可关时服务端会拒绝
  *   关闭动作，让用户点得动只会得到一句错误提示。
@@ -134,14 +203,17 @@ export function summarizeProviderToggle(enabled, res) {
  *   拿不到状态时给 `null` 而不是 `{total:0}` —— 二者含义不同：
  *   「不知道」与「确实是 0 个」在界面上必须区别对待（前者显示 `—`）。
  *
- * @param {Array<{ id: string, label?: string }>} providers 供应商定义（顺序即组内顺序）
+ * @param {Array<{ id: string, label?: string }>} providers 供应商定义（顺序即默认顺序）
  * @param {Record<string, object> | null} statuses provider id → `provider.status` 条目
+ * @param {string[] | null | undefined} [order] 宿主持久化的自定义顺序（未自定义传空/不传）
  * @returns {Array<{ id: string, label: string, checked: boolean, disabled: boolean,
  *   reason: string | null, models: {total?: number, disabled?: number} | null,
  *   accounts: {total?: number, enabled?: number} | null }>}
  */
-export function providerSwitchRows(providers, statuses) {
+export function providerSwitchRows(providers, statuses, order) {
   const { open, closed } = groupProviders(providers, statuses);
+  // 已打开组支持自定义排序；已关闭组恒按声明顺序（见 sortOpenProvidersByOrder 注释）。
+  const orderedOpen = sortOpenProvidersByOrder(open, order);
   /** @param {{ id: string, label?: string }} provider */
   const toRow = (provider) => {
     const id = provider?.id;
@@ -158,7 +230,8 @@ export function providerSwitchRows(providers, statuses) {
     };
   };
   // 已打开在前：与 rail 的分组顺序一致，用户在两处看到的是同一个排列。
-  return [...open.map(toRow), ...closed.map(toRow)];
+  // 有自定义顺序时已打开组按其重排（关闭组不受影响，恒按声明顺序沉底）。
+  return [...orderedOpen.map(toRow), ...closed.map(toRow)];
 }
 
 /**
