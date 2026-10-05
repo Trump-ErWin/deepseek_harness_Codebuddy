@@ -165,6 +165,39 @@ function positiveMaxTokens(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
 }
 
+/**
+ * 每次重试的空闲超时**增量**（毫秒）—— 逐字对齐官方 `zcode.cjs` 的 `RRs = 3e4`。
+ *
+ * 官方算法：`gzr({ baseTimeoutMs, retryNumber }) => baseTimeoutMs + retryNumber * RRs`。
+ * 它治的正是 IKJOVB 那个死循环的**后半段**：上游偶发变慢时，重试若仍用同一
+ * 阈值，会「次次都被同一道线打死」；逐次放宽给上游喘息空间。
+ */
+const ZCODE_STREAM_IDLE_RETRY_STEP_MS = 30_000
+
+/**
+ * 解析「流式读取空闲超时」，可用 `DSH_ZCODE_SSE_IDLE_TIMEOUT_MS` 覆盖。
+ *
+ * ⚠ **每次 `stream()` 调用时读取**（与 buddy/cline/trae/qoder 同一约定），
+ * 单测靠它注入短超时。
+ *
+ * ⚠ 不能写成 `parseInt(…) || 默认值`：`0` 是合法值（显式关闭空闲超时），
+ * 而 `0` 是 falsy 会被 `||` 静默换回 10 分钟。故用 `??` + 显式比较。
+ */
+function resolveStreamIdleTimeoutMs(product: ZcodeProduct, retryNumber = 0): number {
+  const raw = Number(process.env.DSH_ZCODE_SSE_IDLE_TIMEOUT_MS)
+  const base = Number.isFinite(raw)
+    ? raw
+    : product.streamIdleTimeoutMs
+  if (base <= 0) return base
+  return base + Math.max(0, Math.floor(retryNumber)) * ZCODE_STREAM_IDLE_RETRY_STEP_MS
+}
+
+/** 解析「整轮墙钟上限」，可用 `DSH_ZCODE_REQUEST_TIMEOUT_MS` 覆盖。 */
+function resolveRequestTimeoutMs(product: ZcodeProduct): number {
+  const raw = Number(process.env.DSH_ZCODE_REQUEST_TIMEOUT_MS)
+  return Number.isFinite(raw) ? raw : product.requestTimeoutMs
+}
+
 /** `ZcodeAdapter` 的构造选项。 */
 export interface ZcodeAdapterOptions {
   /** 单凭据回退 ref（无账号池时）。 */
@@ -566,10 +599,22 @@ export class ZcodeAdapter extends LlmAdapter {
    * `step/start` **同一毫秒** —— 那是 `dsh-session` 的 `openTurnClosers()`
    * 在 repair 时**合成**的（它「复用最后一个真实事件的时间戳」），
    * 真相是这个 turn **从未结束**。排查时别被它误导。
+   *
+   * ## ⚠⚠️ 但它**不是**推理时限（真实缺陷 IKJOVB）
+   *
+   * 本方法起的是**整轮墙钟**，只兜「captcha 卡死 / 上游彻底静默」。
+   * 「模型长时间大思考」**必须**由**空闲超时**（`streamIdleTimeoutMs`，
+   * 每帧续期）来判，否则会出现用户报障的死循环：
+   * 思考满 180s → abort → `TIMEOUT`（在 harness 可重试集合内）→ 重试
+   * → 又大思考 → 又撞满 ⇒ 永远出不来。
+   *
+   * ⚠ 官方 ZCode 的对应事实：`resources/glm/zcode.cjs` 默认配置里
+   * `modelStream.idleTimeoutMs = 600_000` 而 `network.timeout = 180_000`
+   * —— **180s 是普通 API 请求的值，不是推理链路的**。旧实现误抄了后者。
    */
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const controller = new AbortController()
-    const timeoutMs = this.product.requestTimeoutMs
+    const timeoutMs = resolveRequestTimeoutMs(this.product)
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     timer.unref?.()
     // 把调用方的 signal（harness 的用户中断）串进来，作用于**整轮**。
@@ -1215,6 +1260,17 @@ export class ZcodeAdapter extends LlmAdapter {
        * ── SSE 消费 ──────────────────────────────────────────────────────
        *
        * ⚠ signal 必须传进 SSE 消费：它是「读挂起」时唯一能唤醒读取的东西。
+       *
+       * ⚠⚠️ `idleTimeoutMs` **每帧续期**（真实缺陷 IKJOVB）：它管的是「静默多久
+       * 算死」，**不是**整轮时长 —— 官方 ZCode 正是这么做的
+       * （`zcode.cjs`：`modelStream.idleTimeoutMs = 6e5`，`Promise.race([it.next(), …])`）。
+       * 不传它就会退回「整轮墙钟卡思考」的老形态。
+       *
+       * ⚠ `quotaRound` 即官方公式里的 `retryNumber`：每轮重发逐次放宽 30s
+       * （`baseTimeoutMs + retryNumber * 3e4`），避免上游偶发变慢时被同一阈值
+       * 反复打死。
+       * ⚠ 这里**不能**用内层的 `attempt` —— SSE 消费点在外层循环作用域内，
+       * `attempt` 不在作用域中（写错了会直接 `ReferenceError`）。
        */
       let emitted = false
       const consumeStartedAt = Date.now()
@@ -1223,6 +1279,7 @@ export class ZcodeAdapter extends LlmAdapter {
           label: 'zcode',
           model: options.model,
           signal: controller.signal,
+          idleTimeoutMs: resolveStreamIdleTimeoutMs(this.product, quotaRound),
         })) {
           emitted = true
           yield chunk
