@@ -34,6 +34,12 @@ import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { installLoopResume } from './loop-recovery.js'
+import {
+  attachTokenLedgerHistoryReader,
+  attachTokenLedgerPersistence,
+  reportLedgerAccount,
+} from './token-ledger.js'
+import { createTokenLedgerStore } from './token-ledger-store.js'
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 import { BuddyBalanceSelector, pickBuddyAccount } from './buddy-balance-selector.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -284,6 +290,28 @@ export function apply(ctx: Context): void {
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
 
+  // ===== Token 账本持久化（第 2 期 · 日聚合落盘）=====
+  //
+  // ⚠️ 账本本体是模块级单例（`token-ledger.ts`），没有 ctx 可拿 —— 故在启动时
+  // 把「怎么落盘」挂进去（`attachTokenLedgerPersistence`）。挂载发生在**任何
+  // 适配器注册之前**：启动早期就有模型请求（标题生成等）时，落盘已在位。
+  //
+  // ⚠️ hook 契约是**绝不抛错**（`recordTokenUsage` 的调用点在推理关键路径上，
+  // 见其函数注释），`FileLedgerStore.append` 内部已按此实现。
+  // dispose 时 flush + 摘钩子：插件热重载后新实例会重新挂，避免旧 store 继续收账。
+  const tokenLedgerStore = createTokenLedgerStore(ctx)
+  attachTokenLedgerPersistence((day, entry) => tokenLedgerStore.append(entry))
+  // 历史视图（第 4 期）：RPC 的 usage.tokenLedgerHistory 读这份日聚合表。
+  attachTokenLedgerHistoryReader(() => tokenLedgerStore.load())
+  ctx.effect(() => () => {
+    try {
+      tokenLedgerStore.flush()
+    } finally {
+      attachTokenLedgerPersistence(undefined)
+      attachTokenLedgerHistoryReader(undefined)
+    }
+  }, 'token-ledger-persistence')
+
   // WorkBuddy provider 已从中国版（copilot.tencent.com）改造为国际版
   // （www.workbuddy.ai）。旧账号存的是中国版凭据，其 token.domain 指向旧端点，
   // 用新 endpoint 发请求必然失败且会一直续期失败，故启动时清理掉。
@@ -528,7 +556,11 @@ export function apply(ctx: Context): void {
       // 传空串会让 `getAvailableAccount` 的限流过滤整体短路
       //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中。
       const available = await pool.getAvailableAccount(CODEBUDDY.id, modelId ?? '', picked.tried)
-      if (available) return available.credential as BuddyCredential
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      if (available) {
+        reportLedgerAccount(CODEBUDDY.id, available.entry.id)
+        return available.credential as BuddyCredential
+      }
       // 退到单凭据 ref 之前先证明失败原因：全被模型限流时报明确的限流错误，
       // 而不是让它降级成误导性的 MISSING_CREDENTIAL（见该助手的说明）。
       throwIfAllAccountsRateLimited(CODEBUDDY, modelId)
@@ -579,7 +611,11 @@ export function apply(ctx: Context): void {
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
       // provider 实参用 WORKBUDDY.id 而非字面量 'workbuddy'（同类坑见上）。
       const available = await pool.getAvailableAccount(WORKBUDDY.id, modelId ?? '', picked.tried)
-      if (available) return available.credential as BuddyCredential
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      if (available) {
+        reportLedgerAccount(WORKBUDDY.id, available.entry.id)
+        return available.credential as BuddyCredential
+      }
       // 同 buddy：区分「全部限流」与「真的没登录」（见该助手的说明）。
       throwIfAllAccountsRateLimited(WORKBUDDY, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(WORKBUDDY.defaultCredentialRef))
@@ -615,7 +651,11 @@ export function apply(ctx: Context): void {
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
       const available = await pool.getAvailableAccount(LOBSTERAI.id, modelId ?? '')
-      if (available) return available.credential as LobsteraiCredential
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      if (available) {
+        reportLedgerAccount(LOBSTERAI.id, available.entry.id)
+        return available.credential as LobsteraiCredential
+      }
       const resolved = await ctx.credentials.resolve(credentialRef(LOBSTERAI.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -686,6 +726,8 @@ export function apply(ctx: Context): void {
       const available = await pool.getAvailableAccount(QODER.id, modelId ?? '')
       if (available) {
         activeQoderAccountId.set(QODER.id, available.entry.id)
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        reportLedgerAccount(QODER.id, available.entry.id)
         return available.credential as QoderCredential
       }
       // 回退到单凭据路径：没有账号条目可标记，清空以免标记到过期的 id。
@@ -743,6 +785,8 @@ export function apply(ctx: Context): void {
       const available = await pool.getAvailableAccount(QODER_CN.id, modelId ?? '')
       if (available) {
         activeQoderAccountId.set(QODER_CN.id, available.entry.id)
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        reportLedgerAccount(QODER_CN.id, available.entry.id)
         return available.credential as QoderCredential
       }
       activeQoderAccountId.set(QODER_CN.id, undefined)
@@ -790,7 +834,11 @@ export function apply(ctx: Context): void {
       //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中，
       // 换号形同虚设（用户报障「没有切换」的根因之一）。
       const available = await pool.getAvailableAccount(TRAE.id, modelId ?? '')
-      if (available) return available.credential as TraeCredential
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      if (available) {
+        reportLedgerAccount(TRAE.id, available.entry.id)
+        return available.credential as TraeCredential
+      }
       const resolved = await ctx.credentials.resolve(credentialRef(TRAE.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -843,6 +891,8 @@ export function apply(ctx: Context): void {
       const available = await pool.getAvailableAccount(CLINE.id, modelId ?? '')
       // 记录实际选中的池账号（空串 = 回退到单凭据 ref 模式，见适配器注释）。
       activeClineAccountId = available?.entry.id ?? ''
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+      if (activeClineAccountId.length > 0) reportLedgerAccount(CLINE.id, activeClineAccountId)
       if (available) return available.credential as ClineCredential
       // ⚠️ 与 buddy / workbuddy 同因（真实缺陷，2026-10-03 用户报障）：
       // 唯一的 cline 账号被**模型级限流**标记挡住时，候选会筛成空集，最终降级成
@@ -963,7 +1013,11 @@ export function apply(ctx: Context): void {
         const picked = await loomyBalanceSelector.select(candidates, { allowPermanent })
         if (picked.ok) {
           const credential = await resolveLoomyCredentialByRef(picked.account.credentialRef)
-          if (credential !== undefined) return credential
+          // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+          if (credential !== undefined) {
+            reportLedgerAccount(LOOMY.id, picked.account.id)
+            return credential
+          }
         } else if (!allowPermanent) {
           // ⚠️ **锁定时绝不可落到下面的单凭据兜底** —— 那会绕过锁定、
           // 照样消耗永久积分，锁定形同虚设。这里直接抛明确错误（用户要求）。
@@ -1059,7 +1113,11 @@ export function apply(ctx: Context): void {
       // `getAvailableAccount` 的凭据类型是 `CodeArtsCredential | BuddyCredential`
       // 联合（历史遗留），与 `RaccoonCredential` 无充分重叠，故经 `unknown` 转换。
       // 运行时安全性由 provider 过滤保证：查询用 `RACCOON.id`，取到的必是 raccoon 凭据。
-      if (available) return available.credential as unknown as RaccoonCredential
+      if (available) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        reportLedgerAccount(RACCOON.id, available.entry.id)
+        return available.credential as unknown as RaccoonCredential
+      }
       const resolved = await ctx.credentials.resolve(credentialRef(RACCOON.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1124,7 +1182,11 @@ export function apply(ctx: Context): void {
       // `getAvailableAccount` 的凭据类型是 `CodeArtsCredential | BuddyCredential`
       // 联合（历史遗留），与 `MinimaxCredential` 无充分重叠，故经 `unknown` 转换。
       // 运行时安全性由 provider 过滤保证：查询用 `MINIMAX.id`，取到的必是 minimax 凭据。
-      if (available) return available.credential as unknown as MinimaxCredential
+      if (available) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        reportLedgerAccount(MINIMAX.id, available.entry.id)
+        return available.credential as unknown as MinimaxCredential
+      }
       const resolved = await ctx.credentials.resolve(credentialRef(MINIMAX.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1208,7 +1270,11 @@ export function apply(ctx: Context): void {
       // `getAvailableAccount` 的凭据类型是历史遗留的联合类型，与
       // `GeminiCredential` 无充分重叠，故经 `unknown` 转换；运行时安全性由
       // provider 过滤保证（查询用 `GEMINI.id`，取到的必是 gemini 凭据）。
-      if (available) return available.credential as unknown as GeminiCredential
+      if (available) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        reportLedgerAccount(GEMINI.id, available.entry.id)
+        return available.credential as unknown as GeminiCredential
+      }
       const resolved = await ctx.credentials.resolve(credentialRef(GEMINI.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1362,6 +1428,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     if (available) {
       // 记下**实际返回的**账号：额度受限时适配器要标记的是它。
       activeZcodeAccountId.set(ZCODE.id, available.entry.id)
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      reportLedgerAccount(ZCODE.id, available.entry.id)
       return available.credential as unknown as ZcodeCredential
     }
     /**

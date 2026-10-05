@@ -86,6 +86,7 @@ import type { TraeCredential } from './trae.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
 import { fetchClineUsageLimits } from './cline-quota.js'
 import { clineUpstreamOf, readClineRequestHistory } from './cline-request-log.js'
+import { readTokenLedger, readTokenLedgerDayMap, readTokenLedgerHistory, TOKEN_LEDGER_HISTORY_MAX_DAYS } from './token-ledger.js'
 import {
   clineCredentialExpiresAtMs,
   isClineRefreshable,
@@ -206,6 +207,10 @@ import type {
   RpcUsageBadgeResponse,
   RpcUsageBadgePreferenceRequest,
   RpcUsageBadgePreferenceResponse,
+  RpcUsageTokenLedgerRequest,
+  RpcUsageTokenLedgerResponse,
+  RpcUsageTokenLedgerHistoryRequest,
+  RpcUsageTokenLedgerHistoryResponse,
   RpcUsageAutoCheckinRequest,
   RpcUsageAutoCheckinResponse,
   ProviderStatus,
@@ -3967,6 +3972,49 @@ function registerJetHubEndpoints(
         const value = await usageBadge.read(provider, req.force === true ? { force: true } : {})
         // `read()` 返回的就是本端点的响应信封（`{ ok, value|error }`），直接透传。
         return value
+      }
+
+      /**
+       * **Token 账本**快照（「Token 用量」面板）。
+       *
+       * 纯内存读（`readTokenLedger`），不打上游、不做任何 I/O —— 面板可以
+       * 随意刷新。数据在重启后为空是**既定行为**（第 1 期不持久化），UI 负责
+       * 把「进程内存账本」这一事实讲清楚。
+       *
+       * ⚠️ 这里**不**做渠道/provider 过滤：账本条数上限 500，全量下发即可，
+       * 过滤维度（渠道、provider、模型）都由 UI 在聚合树上展开，避免为每个
+       * 维度各造一个 RPC 端点。
+       */
+      case 'usage.tokenLedger': {
+        const req = payload as RpcUsageTokenLedgerRequest
+        const snapshot = readTokenLedger(
+          typeof req?.limit === 'number' && Number.isFinite(req.limit) && req.limit > 0
+            ? { limit: Math.trunc(req.limit) }
+            : {},
+        )
+        const value: RpcUsageTokenLedgerResponse = { snapshot }
+        return { ok: true, value }
+      }
+
+      /**
+       * **历史日聚合**（第 4 期 · 「Token 用量」弹窗的历史视图）。
+       *
+       * 数据源是落盘的日聚合表（`token-ledger.json`，重启保留）—— 纯内存
+       * 计算（Map 树 → 数组），不打上游、不做额外 I/O。
+       *
+       * ⚠️ `sinceDays` 钳制在 `[1, TOKEN_LEDGER_HISTORY_MAX_DAYS]`：0/负数
+       * 按「仅今日」处理（省略 = 全部历史），超过上限裁到上限 —— 落盘本身
+       * 只保留 90 天，更大的窗口只会白算。
+       */
+      case 'usage.tokenLedgerHistory': {
+        const req = payload as RpcUsageTokenLedgerHistoryRequest
+        const raw = req?.sinceDays
+        const sinceDays = typeof raw === 'number' && Number.isFinite(raw)
+          ? Math.min(Math.max(Math.trunc(raw), 1), TOKEN_LEDGER_HISTORY_MAX_DAYS)
+          : undefined
+        const result = readTokenLedgerHistory(readTokenLedgerDayMap(), { sinceDays })
+        const value: RpcUsageTokenLedgerHistoryResponse = { history: result.days, totals: result.totals }
+        return { ok: true, value }
       }
 
       /**

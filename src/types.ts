@@ -1,5 +1,6 @@
 import type { DpopPrivateJwk } from './oauth.js'
 import type { BadgePreference } from './badge-preferences.js'
+import type { TokenLedgerSnapshot, TokenLedgerHistoryDay, TokenLedgerModelRow } from './token-ledger.js'
 
 /** snap-manager ticket 端点响应的传输格式。 */
 export interface CodeArtsCredentialResponse {
@@ -1384,6 +1385,44 @@ export interface RpcUsageBadgePreferenceRequest {
 /** RPC: 用量徽标显示偏好响应（回显写入后的生效值）。 */
 export interface RpcUsageBadgePreferenceResponse {
   preference: BadgePreference
+}
+
+/**
+ * RPC: 读取 **Token 账本**快照（「Token 用量」面板的唯一数据源）。
+ *
+ * 数据来自进程内存的 `src/token-ledger.ts`：记账点在注册收敛层
+ * （`llm-register-compat.ts` 的包装适配器），渠道由网关侧打标区分。
+ * **重启即丢**（第 1 期不持久化），UI 需说明这一点而不是伪装成历史报表。
+ */
+export interface RpcUsageTokenLedgerRequest {
+  /** 明细最多多少条；省略 = 服务端上限（`TOKEN_LEDGER_LIMIT`）。 */
+  limit?: number
+}
+
+/** Token 账本快照响应（形状直透 `TokenLedgerSnapshot`，不另造一份平行类型）。 */
+export interface RpcUsageTokenLedgerResponse {
+  snapshot: TokenLedgerSnapshot
+}
+
+/**
+ * RPC: 读取 **历史日聚合**（第 4 期 · 「Token 用量」弹窗的历史视图）。
+ *
+ * 数据源是落盘的日聚合（重启保留），与内存明细是两份独立数据 ——
+ * 历史答「本周/本月用了多少」，明细答「每一笔长什么样」。
+ */
+export interface RpcUsageTokenLedgerHistoryRequest {
+  /**
+   * 只看最近 N 天（**含今天**，UTC+8 日界）；省略 = 全部历史
+   * （服务端钳到 `TOKEN_LEDGER_HISTORY_MAX_DAYS`）。
+   */
+  sinceDays?: number
+}
+
+/** 历史日聚合响应（形状直透，不另造平行类型）。 */
+export interface RpcUsageTokenLedgerHistoryResponse {
+  history: TokenLedgerHistoryDay[]
+  /** 所选窗口的合计（按日累加，均值按全部样本 Σ/份数计算）。 */
+  totals: Omit<TokenLedgerModelRow, 'model'>
 }
 
 /**

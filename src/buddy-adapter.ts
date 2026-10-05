@@ -43,6 +43,7 @@ import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableT
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
+import { reportLedgerAccount } from './token-ledger.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -1274,6 +1275,8 @@ export class BuddyAdapter extends LlmAdapter {
           // 此时限流无法归属到具体账号，也就无法在 UI 上显示标记。
           console.warn(`[${this.product.id}] 当前凭据未匹配到账号池条目，限流记录将被跳过`)
         }
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+        if (currentAccountId !== '') reportLedgerAccount(this.product.id, currentAccountId)
       } catch (error) {
         console.warn(`[${this.product.id}] 账号匹配失败（不影响本次请求）:`, error)
       }

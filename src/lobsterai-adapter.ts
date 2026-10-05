@@ -58,6 +58,7 @@ import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableT
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
+import { reportLedgerAccount } from './token-ledger.js'
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai'
@@ -988,6 +989,8 @@ export class LobsteraiAdapter extends LlmAdapter {
           // 此时限流无法归属到具体账号，UI 上也显示不出标记。
           console.warn('[lobsterai] 当前凭据未匹配到账号池条目，限流记录将被跳过')
         }
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+        if (currentAccountId !== '') reportLedgerAccount(this.product.id, currentAccountId)
       } catch (error) {
         console.warn('[lobsterai] 账号匹配失败（不影响本次请求）:', error)
       }
