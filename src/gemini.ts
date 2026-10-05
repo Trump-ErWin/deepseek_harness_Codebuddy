@@ -21,6 +21,23 @@
  *    `encoding/json` 对 `map` 键自动字母序排，而 TS 的 `JSON.stringify`
  *    按 V8 插入序 —— 不排序就与上游看到的字节不同。
  *
+ * ## ⚠️ 2026-10-05 更正：`sessionId` 不是常量
+ *
+ * 早前按历次抓包把推理/冒烟各钉一个常量（`3124275334370613369` /
+ * `-6686302828062879362`）。真机对照实验推翻了它：
+ *
+ *     sessionId = f(project, contents[0].text, lane)
+ *
+ * 换 project 会变；换 model / maxOutputTokens / systemInstruction / 对话轮数
+ * 都不变。那两个"常量"只是**特定输入的输出**被反复抓到。
+ *
+ * 写死的后果是**所有用户、所有对话共用一个会话** —— 而原版的会话归并与
+ * `thoughtSignature` 回填都挂在这个字段上。现在走
+ * {@link deriveGeminiSessionId} 确定性派生（同对话稳定、跨对话隔离）。
+ *
+ * 注意：原版哈希本体尚未反推出来（已否证 50+ 种），故**取值不与原版逐字相同**，
+ * 对齐的是依赖维度与"同输入同输出"。`GEMINI_SESSION_ID_*` 仅作覆盖示例保留。
+ *
  * ## 实测确认的三条事实（计划 §七）
  *
  * - **模型名是准入钥匙**：发裸 `gemini-3.8-flash` 上游 404，必须带档位后缀
@@ -104,12 +121,86 @@ export const GEMINI_UPSTREAM_USER_AGENT = 'antigravity'
 // 项目与会话常量
 // ---------------------------------------------------------------------------
 
-/** 上游项目号。恒为此值（env `CMDC_PAK_UPSTREAM_PROJECT=detect` 才探测）。 */
+/**
+ * 上游项目号（`loadCodeAssist` 探测为空/失败时的**兜底**）。
+ *
+ * ⚠️ 2026-10-05 更正：这不是"恒为此值"。真机对照实验证明原版读
+ * `loadCodeAssist` 的 `cloudaicompanionProject`（假上游返回 `CCP-TWO`，
+ * 信封里就是 `CCP-TWO`）。免费档账号的 LCA 返回空 project，才回落到这个串
+ * —— 这也是历次抓包都看到 `aicode-consumers` 的原因。
+ */
 export const GEMINI_DEFAULT_PROJECT = 'aicode-consumers'
-/** 推理用 sessionId（预置常量，非随机）。 */
+
+/**
+ * 两条会话派生路径的标签。
+ *
+ * ⚠️ 2026-10-05 更正：早前以为这两条路径各自对应一个**预置常量**
+ * （推理 `3124275334370613369` / 冒烟 `-6686302828062879362`）。真机对照实验
+ * 推翻了它：`sessionId = f(project, contents[0].text, lane)`，那两个"常量"
+ * 只是特定输入的输出被反复抓包，被误当成了身份常量。
+ *
+ * 因此标签不再参与**取值**，只用于区分两条派生路径（lane 进哈希）。
+ */
+export const GEMINI_SESSION_LANE_INFER = 'infer'
+export const GEMINI_SESSION_LANE_SMOKE = 'smoke'
+
+/**
+ * 推理用 sessionId 的**历史常量**（仅作覆盖示例 / 文档留证，不再是默认值）。
+ *
+ * @deprecated 默认走 {@link deriveGeminiSessionId} 派生。要复刻历史抓包时用
+ * `sessionId` 选项显式钉住。
+ */
 export const GEMINI_SESSION_ID_INFER = '3124275334370613369'
-/** 冒烟/探测用 sessionId（**负数**，同样是预置常量）。 */
+/** 冒烟/探测用 sessionId 的**历史常量**。@deprecated 同 {@link GEMINI_SESSION_ID_INFER}。 */
 export const GEMINI_SESSION_ID_SMOKE = '-6686302828062879362'
+
+/**
+ * 按 `(project, 首条 user 文本, lane)` **确定性派生** sessionId。
+ *
+ * ⚠️ 取"首条 user 文本"的规则见 `gemini-messages.ts` 的 `geminiFirstUserText`
+ * （只有 `contents[0]` 参与、且只看其中的文本 part）。
+ *
+ * 与原版的依赖维度对齐（2026-10-05 真机对照实验）：
+ *
+ * - **吃**：`project`、`contents[0]` 的文本、lane（推理 / 冒烟）
+ * - **不吃**：model、maxOutputTokens、systemInstruction、对话轮数、后续文本、机器特征
+ *
+ * ⚠️ **取值不与原版逐字相同**。原版的哈希函数本体尚未反推出来（已否证
+ * FNV-1a/1、murmur64A、MD5/SHA 系列等 50+ 种），这里用 FNV-1a 复刻的是
+ * **依赖维度与"同输入同输出"**，不是数值。想要数值一致得先做动态断点。
+ *
+ * 输出形态对齐原版：有符号 int64 的十进制串（原版取到的值正负都有）。
+ *
+ * ## `generation`（会话升代自愈）
+ *
+ * 上游按 `sessionId` 在**服务端**累计对话输入；长工具循环会把累计推过 1M，
+ * 此后该 sessionId 的**每个**请求都 400
+ * `The input token count exceeds the maximum number of tokens allowed 1048576`，
+ * 直到该服务端会话过期。升一代 = 换一个全新 sessionId = 上游开新会话，
+ * 对话无感恢复（`Antigravity-Manager` 的 `[FIX session-1M]` 与 wb 的
+ * `SessionOverflowBump` 是两个独立佐证）。
+ *
+ * ⚠️ `generation === 0` 时**不把代数拼进输入** —— 必须与升代前逐字同值，
+ * 否则升级这个功能本身就会让所有进行中的对话换一次 sessionId（丢 prompt cache）。
+ */
+export function deriveGeminiSessionId(
+  project: string,
+  firstUserText: string,
+  lane: string,
+  generation: number = 0,
+): string {
+  let hash = 0xcbf29ce484222325n
+  const prime = 0x100000001b3n
+  const mask = 0xffffffffffffffffn
+  const base = `${project}\u0000${lane}\u0000${firstUserText}`
+  const input = generation > 0 ? `${base}\u0000${generation}` : base
+  for (const byte of Buffer.from(input, 'utf8')) {
+    hash = (hash ^ BigInt(byte)) & mask
+    hash = (hash * prime) & mask
+  }
+  // 按**有符号** 64 位解释（原版取值有正有负）。
+  return BigInt.asIntN(64, hash).toString()
+}
 
 // ---------------------------------------------------------------------------
 // 超时与缓存

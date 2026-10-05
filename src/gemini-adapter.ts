@@ -38,7 +38,7 @@ import {
   GEMINI_ENDPOINTS,
   GEMINI_IDLE_TIMEOUT_MS,
   GEMINI_MAX_IMAGE_BYTES_INLINE,
-  GEMINI_SESSION_ID_INFER,
+  GEMINI_SESSION_LANE_INFER,
   GEMINI_STREAM_PATH,
   GEMINI_UPSTREAM_FLASH,
   geminiCanonicalModelId,
@@ -55,6 +55,7 @@ import {
   type GeminiProduct,
 } from './gemini.js'
 import { consumeGeminiSse, translateGeminiRequest } from './gemini-messages.js'
+import { persistGeminiProject, resolveGeminiProject } from './gemini-project.js'
 import type { GeminiSigStore } from './gemini-sigstore.js'
 
 /** 最多换几个账号（含起始账号）。 */
@@ -91,6 +92,38 @@ function isGeminiQuotaText(text: string): boolean {
     .some((word) => lower.includes(word))
 }
 
+/**
+ * 判定「上游的**服务端会话**累计输入超过 1M」。
+ *
+ * ## 为什么单独成一类
+ *
+ * 上游按 `sessionId` 在服务端累计对话输入；长工具循环会把累计推过 1M，
+ * 此后该 sessionId 的**每个**请求都 400
+ * `The input token count exceeds the maximum number of tokens allowed 1048576`，
+ * 直到该服务端会话过期。**削本地历史没用**（累计在服务端、按 sessionId 计），
+ * 原地重试/换端点也没用 —— 唯一出路是**升代换一个全新 sessionId**。
+ *
+ * ⚠️ 判据逐字抄自 `Antigravity-Manager` 的 `[FIX session-1M]`
+ * （`proxy/handlers/gemini.rs:983`）：`status == 400 && 正文含
+ * "exceeds the maximum number of tokens"`。这是三家唯一给出**具体触发条件**的
+ * 实现，且 wb 独立撞上同一现象（`SessionOverflowBump`）。
+ *
+ * ⚠️ 必须**先于** {@link isGeminiQuotaText} 判定：该文案里的 "exceeds" 不含
+ * `isGeminiQuotaText` 的关键词 `"exceeded"`，但真出现 `exceeded` 变体时不能被
+ * 误判成「配额耗尽」而触发换号 —— 换号解决不了服务端会话累计。
+ */
+export function isGeminiSessionOverflow(text: string): boolean {
+  return text.toLowerCase().includes('exceeds the maximum number of tokens')
+}
+
+/**
+ * 一次请求内最多升几代。
+ *
+ * ⚠️ 必须有界：若上游对**新** sessionId 也回同一条 400（例如真被按账号限死），
+ * 无界升代会变成死循环。一代失败后如实透传错误，让用户看到上游原文。
+ */
+const GEMINI_MAX_SESSION_BUMPS = 1
+
 /** {@link GeminiAdapter} 的构造选项。 */
 export interface GeminiAdapterOptions {
   /** 单凭据回退 ref（无账号池时）。 */
@@ -120,8 +153,42 @@ export interface GeminiAdapterOptions {
   ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** `thoughtSignature` 缓存（未提供则每轮都不带签名）。 */
   sigStore?: GeminiSigStore
-  /** 上行会话 id；缺省 {@link GEMINI_SESSION_ID_INFER}。 */
+  /**
+   * 覆盖上行会话 id。
+   *
+   * ⚠️ 缺省**不传**（走内容派生：`project` + 首条 user 文本 + `sessionLane`）。
+   * 只有复刻历史抓包/联调才钉固定值 —— 恒定值会让所有对话共用一个会话。
+   */
   sessionId?: string
+  /**
+   * 会话派生标签。推理路径用 {@link GEMINI_SESSION_LANE_INFER}（缺省），
+   * 冒烟/探测路径用 {@link GEMINI_SESSION_LANE_SMOKE}。
+   */
+  sessionLane?: string
+  /**
+   * 覆盖信封里的 `project`（缺省**自动探测**，见 `gemini-project.ts`）。
+   *
+   * ⚠️ 缺省不是「恒为 `aicode-consumers`」—— 那是探测为空时的兜底。
+   * 只有联调/复刻历史抓包才显式钉值。
+   */
+  project?: string
+  /**
+   * 项目号探测结果缓存（键 = 凭据身份）。
+   *
+   * ⚠️ 由接线侧**长期持有并复用**（不要每次调用现造）—— 现造等于没有跨请求缓存，
+   * 每轮推理都会多打一次 `loadCodeAssist`。不传则退化为单次请求内缓存。
+   */
+  projectCache?: Map<string, string>
+  /** 探测用的 fetch（测试注入；缺省全局 `fetch`）。 */
+  projectFetcher?: typeof fetch
+  /**
+   * 把探测到的项目号回写凭据（跨启动缓存，best-effort）。
+   *
+   * ⚠️ 只回写**探测到的真值**，不回写兜底串 —— 理由见 `persistGeminiProject`。
+   */
+  persistProject?: (value: string) => Promise<void>
+  /** 回写失败时的告警出口（可选）。 */
+  logger?: { warn(message: string): void }
   /** 产品配置；默认 {@link GEMINI}。 */
   product?: GeminiProduct
 }
@@ -368,7 +435,7 @@ export class GeminiAdapter extends LlmAdapter {
 
     const images = await this.collectInlineImages(options.messages, entry, options.model)
 
-    const sessionId = this.options.sessionId ?? GEMINI_SESSION_ID_INFER
+    const sessionLane = this.options.sessionLane ?? GEMINI_SESSION_LANE_INFER
     const sigStore = this.options.sigStore
     const pool = this.options.accountPool
 
@@ -383,17 +450,73 @@ export class GeminiAdapter extends LlmAdapter {
     const tried = new Set<string>()
     if (currentAccountId !== '') tried.add(currentAccountId)
 
+    // 项目号缓存：**跨账号共用一份 Map**（键是凭据身份），故放在循环外。
+    // 见 `gemini-project.ts` 的三级缓存。
+    const projectCache = this.options.projectCache ?? new Map<string, string>()
+
     let endpointIdx = 0
     let endpointSwitched = false
     let droppedSignatures = false
     let refreshedOnce = false
     let rotations = 0
     let lastFailure: { status: number; text: string } | undefined
+    // 会话升代：按 **base sessionId**（不含代数）计数，只在本请求内有效。
+    // 见 `deriveGeminiSessionId` 的 `generation` 段与 `isGeminiSessionOverflow`。
+    //
+    // ⚠️ base 由信封层算出后**经回调传进来**，这里不自己重算 —— 重算就是
+    // 把派生逻辑复制成两份，两处一旦漂移，升代会换错 key（表现为升代无效）。
+    const sessionBumps = new Map<string, number>()
+    let lastBaseSessionId = ''
+    const sessionGeneration = (base: string): number => {
+      lastBaseSessionId = base
+      return sessionBumps.get(base) ?? 0
+    }
 
     try {
       while (true) {
+        // 解析本轮的 project（三级缓存：内存 → 凭据字段 → 现探）。
+        //
+        // ⚠️ 必须在**循环内**按当前 `credential` 解析：换账号后凭据变了，
+        // project 是**按账号**的，用上一个账号的会发错项目号。
+        //
+        // ⚠️ 探测**失败**（非「探测到空」）⇒ 不发推理。原版实测行为：
+        // 注入 500 后原版只在端点间重试 LCA + quota，**不发**
+        // `streamGenerateContent`（见 `gemini-project.ts` 的模块注释）。
+        let project = this.options.project
+        if (project === undefined) {
+          const probe = await resolveGeminiProject({
+            credential,
+            cache: projectCache,
+            ...this.options.projectFetcher === undefined
+              ? {}
+              : { fetcher: this.options.projectFetcher },
+            // ⚠️ 透传调用方信号：否则探测自带的 30s 超时会把更短的调用方超时拖长。
+            ...options.signal === undefined ? {} : { signal: options.signal },
+          })
+          if (probe.error !== undefined) {
+            throw new LlmError(
+              `gemini: 项目号探测失败，未发推理（与原版一致）— ${probe.error}`,
+              'SERVER',
+            )
+          }
+          project = probe.project
+          // 现探到**非兜底**的真值才回写凭据（best-effort，失败不影响推理）。
+          // 兜底串不回写：把 `aicode-consumers` 钉进凭据会让该账号将来拿到真实
+          // project 时被这个陈旧值挡住（见 `persistGeminiProject`）。
+          if (probe.probed === true && this.options.persistProject !== undefined) {
+            await persistGeminiProject({
+              credential,
+              project,
+              write: this.options.persistProject,
+              ...this.options.logger === undefined ? {} : { logger: this.options.logger },
+            })
+          }
+        }
+
         // ⚠️ 每轮重新构造信封：`requestId` 每请求随机（原版口径），
         // 且去签重试时 `lookupSignature` 必须换成「返回 undefined」。
+        // `sessionId` 由 (project, 首条 user 文本, lane) 确定性派生 —— 同一
+        // 对话内稳定（保住上游 prompt cache 命中），不同对话隔离。
         const envelope = translateGeminiRequest({
           modelId: options.model,
           spec,
@@ -402,7 +525,10 @@ export class GeminiAdapter extends LlmAdapter {
           ...options.tools === undefined ? {} : { tools: options.tools },
           ...options.temperature === undefined ? {} : { temperature: options.temperature },
           ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
-          sessionId,
+          ...this.options.sessionId === undefined ? {} : { sessionId: this.options.sessionId },
+          sessionLane,
+          sessionGeneration,
+          project,
           requestId: newGeminiRequestId(),
           ...images === undefined ? {} : { images },
           ...droppedSignatures || sigStore === undefined
@@ -458,6 +584,23 @@ export class GeminiAdapter extends LlmAdapter {
         if (isGeminiSignatureError(text) && !droppedSignatures) {
           droppedSignatures = true
           continue
+        }
+
+        // 2. 服务端会话累计超 1M → **升代**换全新 sessionId 重发。
+        //
+        // ⚠️ 必须排在配额/端点判定**之前**：这条 400 的处置与它们都不同 ——
+        // 削本地历史无效（累计在服务端、按 sessionId 计），换端点/换号也无效。
+        // 排在后面会被 `endpointFirst`（400 + quota 类文案）先吃掉，白换一次端点。
+        //
+        // 只在未显式钉 sessionId 时升代：显式钉值意味着调用方要复刻特定会话，
+        // 擅自换掉会让它失去意义。
+        if (status === 400 && isGeminiSessionOverflow(text) && this.options.sessionId === undefined) {
+          const bumped = sessionBumps.get(lastBaseSessionId) ?? 0
+          if (bumped < GEMINI_MAX_SESSION_BUMPS) {
+            sessionBumps.set(lastBaseSessionId, bumped + 1)
+            continue
+          }
+          // 升过代仍报同一条：不再兜圈子，如实透传（见 GEMINI_MAX_SESSION_BUMPS）。
         }
 
         const endpointFirst = status === 403

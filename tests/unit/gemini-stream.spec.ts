@@ -25,8 +25,10 @@ import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { GeminiAdapter } from '../../src/gemini-adapter.js'
 import {
   GEMINI,
+  GEMINI_DEFAULT_PROJECT,
   GEMINI_ENDPOINT_DAILY,
   GEMINI_ENDPOINT_SANDBOX,
+  GEMINI_SESSION_ID_INFER,
   GEMINI_STREAM_PATH,
   type GeminiCredential,
 } from '../../src/gemini.js'
@@ -110,6 +112,12 @@ function makeAdapter(config: {
   pool?: AccountPool
   sigStore?: GeminiSigStore
   sessionId?: string
+  sessionLane?: string
+  project?: string
+  /** true = 走**自动探测**路径（缺省则显式钉兜底串，让既有用例行为不变）。 */
+  autoProject?: boolean
+  projectFetcher?: typeof fetch
+  persistProject?: (value: string) => Promise<void>
 }): GeminiAdapter {
   let current = config.credential
   return new GeminiAdapter({
@@ -122,6 +130,12 @@ function makeAdapter(config: {
     ...config.pool === undefined ? {} : { accountPool: config.pool },
     ...config.sigStore === undefined ? {} : { sigStore: config.sigStore },
     ...config.sessionId === undefined ? {} : { sessionId: config.sessionId },
+    ...config.sessionLane === undefined ? {} : { sessionLane: config.sessionLane },
+    // ⚠️ 缺省**显式钉**兜底串：不钉就会走自动探测，多打一次 `loadCodeAssist`
+    // 并吃掉 stub 的第一个响应 —— 既有用例会集体错位。
+    ...config.autoProject === true ? {} : { project: config.project ?? GEMINI_DEFAULT_PROJECT },
+    ...config.projectFetcher === undefined ? {} : { projectFetcher: config.projectFetcher },
+    ...config.persistProject === undefined ? {} : { persistProject: config.persistProject },
     product: GEMINI,
   })
 }
@@ -426,11 +440,251 @@ describe('gemini stream · 档位', () => {
     // 未知 id 不再静默落回 3.8 —— 那正是本次修复的行为，见「凭据与请求形状」段。
   })
 
-  it('sessionId 可被覆盖（缺省用 GEMINI_SESSION_ID_INFER）', async () => {
+  it('sessionId 可被覆盖（用于复刻历史抓包 / 联调）', async () => {
     const { calls } = recordingFetch([() => okStream()])
     await drain(makeAdapter({ credential: cred('AT'), sessionId: 'S-1' }), options())
     const body = JSON.parse(String(calls[0]!.init.body)) as { request: { sessionId: string } }
     expect(body.request.sessionId).toBe('S-1')
+  })
+})
+
+/**
+ * sessionId 的**内容派生**（2026-10-05 指纹修复）。
+ *
+ * ## 为什么不能是常量
+ *
+ * 早前把推理/冒烟各钉一个常量（`3124275334370613369` / `-6686302828062879362`），
+ * 依据是历次抓包逐字恒定。真机对照实验推翻了它：那两个值只是**特定输入的
+ * 输出**被反复抓到 —— `sessionId = f(project, contents[0].text, lane)`。
+ *
+ * 常量化的后果：所有用户、所有对话共用一个会话。上游的会话归并与
+ * `thoughtSignature` 回填都挂在这个字段上，共用会让它们全部错乱。
+ *
+ * ⚠️ 断言的是**依赖维度**（哪些输入进哈希），不是具体数值 —— 原版哈希函数
+ * 本体尚未反推出来，逐字对齐做不到（见 `deriveGeminiSessionId` 注释）。
+ */
+describe('gemini sessionId 内容派生', () => {
+  /** 取一次请求体里的 sessionId。 */
+  async function sessionIdOf(
+    config: Parameters<typeof makeAdapter>[0],
+    text: string,
+    extra: Partial<GenerateOptions> = {},
+  ): Promise<string> {
+    const { calls } = recordingFetch([() => okStream()])
+    await drain(
+      makeAdapter(config),
+      options({
+        messages: [createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })],
+        ...extra,
+      }),
+    )
+    const body = JSON.parse(String(calls[0]!.init.body)) as { request: { sessionId: string } }
+    return body.request.sessionId
+  }
+
+  it('★ 缺省不再用历史常量，且同一输入跨调用稳定', async () => {
+    const first = await sessionIdOf({ credential: cred('AT') }, 'AAA')
+    const second = await sessionIdOf({ credential: cred('AT') }, 'AAA')
+    expect(first).toBe(second)
+    // 必须是**有符号 int64 十进制串**（上游信封里就是这个形态，取值正负都有）。
+    expect(first).toMatch(/^-?\d+$/)
+    expect(BigInt(first) >= -(2n ** 63n) && BigInt(first) < 2n ** 63n).toBe(true)
+    // 回归锁：缺省值绝不能退化回那个历史常量。
+    expect(first).not.toBe(GEMINI_SESSION_ID_INFER)
+  })
+
+  it('★ 换首条 user 文本 ⇒ sessionId 变', async () => {
+    const a = await sessionIdOf({ credential: cred('AT') }, 'AAA')
+    const b = await sessionIdOf({ credential: cred('AT') }, 'BBB')
+    expect(a).not.toBe(b)
+  })
+
+  it('★ 换 project ⇒ sessionId 变', async () => {
+    const a = await sessionIdOf({ credential: cred('AT'), project: 'proj-one' }, 'AAA')
+    const b = await sessionIdOf({ credential: cred('AT'), project: 'proj-two' }, 'AAA')
+    expect(a).not.toBe(b)
+  })
+
+  it('★ 换 lane ⇒ sessionId 变（推理与冒烟不能共用会话）', async () => {
+    const infer = await sessionIdOf({ credential: cred('AT'), sessionLane: 'infer' }, 'AAA')
+    const smoke = await sessionIdOf({ credential: cred('AT'), sessionLane: 'smoke' }, 'AAA')
+    expect(infer).not.toBe(smoke)
+  })
+
+  it('★ 换 model / maxOutputTokens 都不影响 sessionId', async () => {
+    // 实测口径：只有 (project, contents[0].text, lane) 进哈希。
+    const base = await sessionIdOf({ credential: cred('AT') }, 'AAA')
+    const otherModel = await sessionIdOf({ credential: cred('AT') }, 'AAA', {
+      model: 'gemini-3.8-flash-high',
+      maxTokens: 123,
+    })
+    expect(otherModel).toBe(base)
+  })
+})
+
+/**
+ * 会话升代自愈（`[FIX session-1M]`）。
+ *
+ * ## 现象
+ *
+ * 上游按 `sessionId` 在**服务端**累计对话输入；长工具循环会把累计推过 1M，
+ * 此后该 sessionId 的**每个**请求都 400
+ * `The input token count exceeds the maximum number of tokens allowed 1048576`，
+ * 直到该服务端会话过期 —— 即**对话永久卡死**。
+ *
+ * ## 为什么不能靠「削本地历史」
+ *
+ * 累计发生在**服务端、按 sessionId 计**，削本地历史改变不了服务端的计数。
+ * 唯一出路是**升代换一个全新 sessionId**，让上游开新会话。
+ *
+ * 判据逐字抄自 `Antigravity-Manager`（`proxy/handlers/gemini.rs:983`）：
+ * `status == 400 && 正文含 "exceeds the maximum number of tokens"`。
+ */
+describe('gemini 会话升代自愈（1M 累计超限）', () => {
+  const OVERFLOW_BODY =
+    '{"error":{"code":400,"message":"The input token count exceeds the maximum number of tokens allowed 1048576.","status":"INVALID_ARGUMENT"}}'
+
+  /** 一次 400 overflow，之后成功。 */
+  function overflowThenOk(): Array<() => Response> {
+    return [
+      () => new Response(OVERFLOW_BODY, { status: 400, headers: { 'content-type': 'application/json' } }),
+      () => okStream(),
+    ]
+  }
+
+  /** 始终 400 overflow。 */
+  function alwaysOverflow(): Array<() => Response> {
+    return [
+      () => new Response(OVERFLOW_BODY, { status: 400, headers: { 'content-type': 'application/json' } }),
+    ]
+  }
+
+  it('★ 400 overflow ⇒ 升代换新 sessionId 重发，并成功', async () => {
+    const { calls } = recordingFetch(overflowThenOk())
+    const chunks = await drain(makeAdapter({ credential: cred('AT') }), options())
+
+    // 恰好两次请求：第一次 400 → 升代 → 第二次成功。
+    expect(calls).toHaveLength(2)
+    const first = JSON.parse(String(calls[0]!.init.body)) as { request: { sessionId: string } }
+    const second = JSON.parse(String(calls[1]!.init.body)) as { request: { sessionId: string } }
+    // 升代必须真的换了 sessionId（否则等于原地重试，毫无意义）。
+    expect(second.request.sessionId).not.toBe(first.request.sessionId)
+    // 两次都必须是合法 int64 串。
+    expect(first.request.sessionId).toMatch(/^-?\d+$/)
+    expect(second.request.sessionId).toMatch(/^-?\d+$/)
+    // 重试成功，正常产出内容块。
+    expect(chunks.length).toBeGreaterThan(0)
+  })
+
+  it('★ 升代后仍 400 ⇒ 有界停止，不无限升代', async () => {
+    const { calls } = recordingFetch(alwaysOverflow())
+    const failure = await capture(makeAdapter({ credential: cred('AT') }), options())
+
+    // 一次原请求 + 最多 GEMINI_MAX_SESSION_BUMPS 次升代重试。
+    // 若实现成无界循环，这里会跑到 fetch 被调爆（测试超时/内存）而不是 2 次。
+    expect(calls).toHaveLength(2)
+    // 如实透传上游错误，不吞掉、也不误判成 QUOTA_EXCEEDED。
+    expect(failure).toBeDefined()
+    expect(failure?.failure?.status).toBe(400)
+  })
+
+  it('★ 显式钉住 sessionId 时不升代（调用方要复刻特定会话）', async () => {
+    const { calls } = recordingFetch(alwaysOverflow())
+    await capture(makeAdapter({ credential: cred('AT'), sessionId: 'PINNED' }), options())
+
+    // 只发一次：显式钉值意味着不许擅自换掉它。
+    expect(calls).toHaveLength(1)
+    const body = JSON.parse(String(calls[0]!.init.body)) as { request: { sessionId: string } }
+    expect(body.request.sessionId).toBe('PINNED')
+  })
+
+  it('★ 普通的 400 不触发升代（不误判）', async () => {
+    const { calls } = recordingFetch([
+      () => new Response('{"error":{"code":400,"message":"Invalid JSON payload received."}}', {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ])
+    await capture(makeAdapter({ credential: cred('AT') }), options())
+    expect(calls).toHaveLength(1)
+  })
+})
+
+/**
+ * `project` 的**自动探测**在适配器层的集成（单测见 `gemini-project.spec.ts`）。
+ *
+ * 这一层要证明的是：探测结果**真的进了信封**，且探测**失败时一个推理请求都不发**。
+ */
+describe('gemini project 自动探测（适配器集成）', () => {
+  /** 假 LCA 端点，记录调用。 */
+  function lcaFetch(response: () => Response): { fetcher: typeof fetch; calls: string[] } {
+    const calls: string[] = []
+    const fetcher = (async (input: RequestInfo | URL) => {
+      calls.push(String(input))
+      return response()
+    }) as unknown as typeof fetch
+    return { fetcher, calls }
+  }
+
+  const lcaOk = (project: string): (() => Response) =>
+    () => new Response(`{"cloudaicompanionProject":"${project}"}`, {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+
+  it('★ 信封 project 用探测值（不再是兜底串）', async () => {
+    const { calls } = recordingFetch([() => okStream()])
+    const lca = lcaFetch(lcaOk('CCP-FROM-LCA'))
+    await drain(
+      makeAdapter({ credential: cred('AT'), autoProject: true, projectFetcher: lca.fetcher }),
+      options(),
+    )
+    const body = JSON.parse(String(calls[0]!.init.body)) as { project: string }
+    expect(body.project).toBe('CCP-FROM-LCA')
+    expect(lca.calls).toHaveLength(1)
+  })
+
+  it('★ 探测失败 ⇒ **一个推理请求都不发**（与原版一致）', async () => {
+    const { calls } = recordingFetch([() => okStream()])
+    const lca = lcaFetch(() => new Response('{"error":{"code":500}}', { status: 500 }))
+    const failure = await capture(
+      makeAdapter({ credential: cred('AT'), autoProject: true, projectFetcher: lca.fetcher }),
+      options(),
+    )
+    // 关键断言：推理端点一次都没被碰过。
+    expect(calls).toHaveLength(0)
+    expect(failure?.message).toContain('项目号探测失败')
+    // 探测本身在两个端点上各试了一次。
+    expect(lca.calls).toHaveLength(2)
+  })
+
+  it('★ 探测到真值 ⇒ 回写凭据；兜底串不回写', async () => {
+    const persisted: string[] = []
+    recordingFetch([() => okStream()])
+    const lca = lcaFetch(lcaOk('CCP-REAL'))
+    await drain(makeAdapter({
+      credential: cred('AT'),
+      autoProject: true,
+      projectFetcher: lca.fetcher,
+      persistProject: async (value) => { persisted.push(value) },
+    }), options())
+    expect(persisted).toHaveLength(1)
+    expect(JSON.parse(persisted[0]!).cloudaicompanionProject).toBe('CCP-REAL')
+
+    // 免费档（project 为空）⇒ 兜底串，**不**回写。
+    const freeTierPersisted: string[] = []
+    recordingFetch([() => okStream()])
+    const freeTier = lcaFetch(() => new Response('{"currentTier":{"id":"free-tier"}}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }))
+    await drain(makeAdapter({
+      credential: cred('AT'),
+      autoProject: true,
+      projectFetcher: freeTier.fetcher,
+      persistProject: async (value) => { freeTierPersisted.push(value) },
+    }), options())
+    expect(freeTierPersisted).toHaveLength(0)
   })
 })
 

@@ -41,8 +41,10 @@ import { normalizeHarnessMessages } from './message-shape.js'
 import { readWithIdleTimeout, resolveToolPairing } from './sse.js'
 import type { GeminiInlineImage, GeminiModelSpec } from './gemini.js'
 import {
+  deriveGeminiSessionId,
   GEMINI_DEFAULT_PROJECT,
   GEMINI_IDLE_TIMEOUT_MS,
+  GEMINI_SESSION_LANE_INFER,
   sanitizeGeminiSchema,
   sortedStringify,
 } from './gemini.js'
@@ -142,13 +144,45 @@ export interface TranslateGeminiRequestOptions {
   toolChoice?: unknown
   temperature?: number
   maxTokens?: number
-  sessionId: string
+  /**
+   * 覆盖信封里的 `sessionId`。
+   *
+   * ⚠️ 缺省时走**内容派生**（`project` + 首条 user 文本 + `sessionLane`），
+   * 不是常量 —— 见 `deriveGeminiSessionId`。要复刻历史抓包才显式钉住。
+   */
+  sessionId?: string
+  /** 会话派生标签（推理 / 冒烟），缺省 {@link GEMINI_SESSION_LANE_INFER}。 */
+  sessionLane?: string
+  /**
+   * 取该**基础 sessionId 的当前代数**（会话升代自愈用）。
+   *
+   * ⚠️ 只有未显式传 `sessionId` 时才参与。返回值 ≤ 0 表示不升代。
+   * 见 `deriveGeminiSessionId` 的 `generation` 段。
+   */
+  sessionGeneration?: (baseSessionId: string) => number
   project?: string
   requestId: string
   /** 已内联的图片（attachmentId → base64）。缺失时遇图**抛错**。 */
   images?: ReadonlyMap<string, GeminiInlineImage>
   /** 签名查表（回填 functionCall 的 `thoughtSignature`）。 */
   lookupSignature?: GeminiSignatureLookup
+}
+
+/**
+ * 取信封里**第一条 user 消息的首个文本 part**（sessionId 派生的输入之一）。
+ *
+ * ⚠️ 实测口径（2026-10-05 对照实验，6 个样本全部自洽）：只有 `contents[0]`
+ * 参与，且只看其中的文本 part —— `["AAA"]` 与 `["AAA","ZZZ"]` 同值、
+ * `["ZZZ","AAA"]` 与 `["ZZZ"]` 同值（后续文本不进哈希）。
+ */
+export function geminiFirstUserText(contents: readonly GeminiContent[]): string {
+  for (const content of contents) {
+    if (content.role !== '' && content.role !== 'user') continue
+    for (const part of content.parts) {
+      if (typeof part.text === 'string' && part.text !== '') return part.text
+    }
+  }
+  return ''
 }
 
 /**
@@ -249,10 +283,35 @@ export function translateGeminiRequest(options: TranslateGeminiRequestOptions): 
   // 完全无关，排查成本极高。
   if (contents.length === 0) throw new Error('gemini: messages 里没有可用内容')
 
+  const project = options.project ?? GEMINI_DEFAULT_PROJECT
+  // ⚠️ sessionId **不是常量**：缺省按 (project, 首条 user 文本, lane) 派生。
+  // 写成固定值会让所有用户、所有对话共用一个会话 —— 上游的会话归并与
+  // thoughtSignature 回填都挂在它上面（见 `deriveGeminiSessionId` 注释）。
+  //
+  // 两段式：先算 **base**（不含代数），再把 base 交给回调取当前代数。这样
+  // 「升代」只需在回调侧计数，信封层保持纯函数。
+  let sessionId = options.sessionId
+  if (sessionId === undefined) {
+    const base = deriveGeminiSessionId(
+      project,
+      geminiFirstUserText(contents),
+      options.sessionLane ?? GEMINI_SESSION_LANE_INFER,
+    )
+    const generation = options.sessionGeneration?.(base) ?? 0
+    sessionId = generation > 0
+      ? deriveGeminiSessionId(
+        project,
+        geminiFirstUserText(contents),
+        options.sessionLane ?? GEMINI_SESSION_LANE_INFER,
+        generation,
+      )
+      : base
+  }
+
   const request: GeminiEnvelope['request'] = {
     contents,
     generationConfig: buildGenerationConfig(options.spec, options.maxTokens, options.temperature),
-    sessionId: options.sessionId,
+    sessionId,
   }
 
   if (options.system !== undefined && options.system !== '') {
