@@ -1044,6 +1044,85 @@ Hy3 · x0.05 X                      (hy3-x)
 用公共前缀而不是硬编码 `-sg`，是因为撞车组会随服务端上新变化（本次实测三组
 里只有一组带 `-sg`）。LobsterAI 实测无同名（28 个模型 0 组重名），故不做消歧。
 
+### 成长中心任务（buddy / workbuddy）
+
+`src/buddy-growth.ts` 提供成长中心任务的**纯 API 自动化**：接取任务 → 上报判据
+事件 → 逐项领奖。原作只有每日签到，成长任务（22 项）完全没有实现。
+
+入口是 Jet Hub 设置页的「一键领取积分」按钮（buddy / workbuddy 下显示为
+「一键领取积分 + 成长任务」）。**成长任务只在手点该按钮时执行** ——
+`credits.claimAll` 同时是「每日首次启动自动签到」的执行体，而成长一轮单账号实测
+90～270s 且全串行，默认开启等于每次开机自动打几十个上游请求。这条不变量由
+`tests/unit/usage-badge-client.spec.ts` 的断言锁住。
+
+覆盖 22 项任务映射（对话类走六连事件链；`create_canvas` 走
+`wbx_design_canvas_*` 遥测且**不**新建真实画布；`Library_read` 走 web 域
+`web_element_click`；`Hp_Appearance` 走 `appearance/set` + 皮肤生效事件；
+`skill_1` / `first_chat` 走真实 `fast-model` SSE 会话）。
+
+三个容易踩空的判据细节（来自实测，改动前请先跑真实账号确认仍成立）：
+
+- `requestModelId` 与 `requestModelName` **必须分离** —— `Model_chat_GLM5.2` 的
+  判据是 `glm-5.2` / `GLM-5.2`（大小写不同）且只上报**单条** `chat_request_send`、
+  `requestId` 回落 `conversationId`。按「事件链 JOIN 真实会话」的思路实现会长期 0/1。
+- `Expert_team_use_3` 服务端按 `expert_id` **按天去重** ⇒ 必须跨**不同**专家轮换，
+  固定 1 轮会永远卡在 2/3。
+- 两个任务端点是**不同 schema，必须合并读**：`/v2/activity/growth/tasks`
+  （`task_code` + `accept_status` + `progress`）与 `/activity/growth/tasks`
+  （`code` + `status`，**无** progress）。只读前者 ⇒ 后者那 5 项永远进不了待办。
+
+#### 全新账号需要点两次（服务端解锁，不是缺陷）
+
+成长任务受新手任务解锁 gating。**全新账号第一轮只能领到极少数已开放项**
+（实测白号 `18582895338` 第一轮仅 `RichMeow_Chat` 一项到账 +100 积分），
+第二轮才开始出现成长任务并批量到账（实测同号第二轮 `Expert_team_use_3` 3/3、
+`template_5` 5/5、`automation_1` 1/1、`skill_1` 1/1、`expert_5` 5/5）。
+
+这不是本模块能修的：解锁条件在服务端，客户端只能把已开放的任务做完。
+**看到第一轮只完成一两项属正常，再点一次即可继续。** 无产出账号的提示会折叠成
+一行（`昵称：N 项判据只在客户端行为里记录，API 推不动（未领到积分）`），不铺陈列表。
+
+#### 结构性不可达的任务（如实标 `clientOnly`，不谎报）
+
+「养虾等级」任务族来自第二个端点，服务端只返回 `status`（`available` = 未达成）
+而**不返回 progress**。事件上报不改变 `status` —— 实测 2 轮 × 3 个账号共 6 次，
+`first_chat` / `template_used` / `expert_summoned` / `skill_installed` 的 `status`
+始终 `available`。故这 4 项在本模块里是**结构性不可达**的，会跳过「真实会话 +
+真 requestId」重试（那次重试要发一条真实对话并等 4s 结算，而结果已确定不会变），
+合成事件仍照发一次以保留判据万一改版的可能。
+
+`wechat_linked` 与 `wb_wechat_oa_subscribe_task` 是纯客户端动作（微信内完成），
+直接归 `clientOnly`。
+
+这不是「做不到」的断言，而是「当前服务端口径下事件不计数」。若日后 `status`
+也接受事件驱动，`LEVEL_UNREACHABLE_TASK_CODES` 的短路应同步撤掉。
+
+#### 时间预算：两个独立闸门
+
+| 闸门 | 缺省 | 作用域 | 作用 |
+|---|---|---|---|
+| `budgetMs` | 10 分钟 | **每账号** | 单账号卡住时不拖住整轮 |
+| `roundBudgetMs` | 30 分钟 | **整轮全部账号** | 账号很多时不撞宿主 RPC 超时 |
+
+两者耗尽即**如实停住**并标出哪些项 / 哪些账号没执行，提示写「再点一次即可继续」——
+而不是卡死到超时。宿主 RPC 的超时上界由 dsh 侧决定，本插件不可见也不可控，
+故整轮预算是必要的兜底。非有限值（`NaN` / `Infinity`）归「不限时」并 `console.warn`
+留痕：未显式区分时 `NaN > 0` 为 false 会静默变成不限时，恰是本预算要防的情况。
+
+僵尸账号（凭据被外部删除 ⇒ 上游 401/403）归 `inactive` 语义、**不计 failed** ——
+它的处置是「重新登录」，与「任务推不动」完全不同。签到侧与成长侧必须同时这样归类，
+否则同一个僵尸条目在两处会给出互相矛盾的判定。
+
+#### 平台适配
+
+上报指纹的平台三元组（`os` / `arch` / `osVersion`）由**单一来源**同时喂给桌面域
+与 web 域，各自按本域习惯命名 `os`（`win32` / `Win32`、`darwin` / `MacIntel`），
+而 `arch` 与 `osVersion` 保持一致 —— 同一台机器在两个域报出不同的 OS 足以让整批事件
+不计数。`arch` 取 `process.arch` 而非写死 `x64`（arm64 宿主上写死即撒谎），
+`osVersion` 按平台取值（`win32` → `10.0.x`、`darwin` → `15.0`、`linux` → `6.8.0`），
+不再出现 Linux 宿主配 Windows 版本号这类自相矛盾。
+
+
 ## WorkBuddy provider（国际版）
 
 独立路由 `workbuddy`（腾讯 **WorkBuddy 国际版 / WorkBuddy AI**），与

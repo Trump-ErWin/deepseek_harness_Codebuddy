@@ -392,6 +392,22 @@ export interface RpcCreditsStatusResponse {
 /** RPC: 一键领取积分请求 */
 export interface RpcCreditsClaimAllRequest {
   provider: string
+  /**
+   * 是否同时执行成长中心任务（buddy / workbuddy 专有）。
+   *
+   * ⚠️ **缺省为 `false`，且必须保持这样**：`credits.claimAll` 同时是「每日首次
+   * 启动自动签到」的执行体（见 `src/auto-checkin.ts` 的 `claim` 回调），而成长
+   * 一轮单账号实测 90～270s、全串行、任务间 1.5s 节流。若默认开启，每次启动都会
+   * 自动打几十个上游请求 —— 那不是签到。
+   *
+   * 只有用户手点「一键领取积分」时才传 `true`。
+   */
+  runTasks?: boolean
+  /**
+   * 成长任务单账号时间预算（毫秒），透传给 `runGrowthTaskCompletions`。
+   * 缺省由实现取 10 分钟；传 0 或负数表示不限时（本地排障用）。
+   */
+  budgetMs?: number
 }
 /** 单个账号的领取结果 */
 export interface RpcCreditsClaimAccountResult {
@@ -420,6 +436,62 @@ export interface RpcCreditsClaimSummary {
 export interface RpcCreditsClaimAllResponse {
   results: RpcCreditsClaimAccountResult[]
   summary: RpcCreditsClaimSummary
+  /**
+   * 逐账号的成长任务明细，**仅在请求方传了 `runTasks: true` 且该 provider
+   * 有成长中心时**给出。
+   *
+   * ⚠️ 它与 `results` 并列而非塞进 `outcome.message`：成长有 22 项任务、每项
+   * 的处置不同（完成 / 需客户端 / 失败），折进一句文案就丢掉了逐项判据 ——
+   * 而那正是排查「为什么这项没涨」的唯一线索。
+   */
+  growth?: RpcBuddyGrowthAccountResult[]
+}
+
+/** RPC: 成长中心任务一键全自动化请求 */
+export interface RpcBuddyGrowthTasksRequest {
+  provider: string
+  /**
+   * 单账号时间预算（毫秒）。缺省由实现取 10 分钟；传 0 或负数表示不限时。
+   * 该值会**原样**透传给 `runGrowthTaskCompletions` 的 `budgetMs`。
+   */
+  budgetMs?: number
+}
+/** 单个成长任务的完成结果 */
+export interface RpcBuddyGrowthTaskResult {
+  taskCode: string
+  ok: boolean
+  message: string
+  /** 判据在服务端推不动、如实归为「需客户端」而非「失败」。 */
+  clientOnly?: boolean
+}
+/** 单个账号的成长任务执行结果 */
+export interface RpcBuddyGrowthAccountResult {
+  accountId: string
+  nickname: string
+  /**
+   * 执行是否成功完成整轮。
+   *
+   * `ok:false` 表示有任务失败或时间预算用尽 —— 逐项明细看 `tasks`。
+   */
+  ok: boolean
+  completed: number
+  /** 需客户端动作的项数（微信动作、夜窗未到、判据推不动）。 */
+  clientOnly: number
+  failed: number
+  /** 扫尾自动领到的任务数。 */
+  claimedCount: number
+  /** 扫尾自动领到的积分。 */
+  claimedCredit: number
+  /** 时间预算用尽、本轮提前收住。 */
+  timedOut: boolean
+  /** 逐项明细（含事件数 / progress / 失败原因）。 */
+  tasks: RpcBuddyGrowthTaskResult[]
+  /** 执行失败原因（凭据失效、任务列表查询失败等）。 */
+  error?: string
+}
+/** RPC: 成长中心任务一键全自动化响应 */
+export interface RpcBuddyGrowthTasksResponse {
+  results: RpcBuddyGrowthAccountResult[]
 }
 
 /**
