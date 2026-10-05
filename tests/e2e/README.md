@@ -12,7 +12,7 @@
 | `buddy-pool-probe.e2e.spec.ts` | `DSH_BUDDY_POOL_E2E=1` + `DSH_BUDDY_POOL_E2E_CONFIRM=yes` | 用账号池凭据走完整 LLM 链路 |
 | `buddy-ratelimit-probe.e2e.spec.ts` | `DSH_BUDDY_RATELIMIT_E2E=1` + `DSH_BUDDY_RATELIMIT_E2E_CONFIRM=yes` | 对记录「限额重置」的账号实发一次请求，**判定是否真限流** |
 | `trae-channels-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` | 拉真实多通道目录，并用**真实适配器**对 `glm-5.1`（agent 通道）与 `glm-5-turbo`（work 通道）各发一条最短消息 —— **验证「模型只在列出它的通道里可调用」**。消耗 2 次极小额度 |
-| `cline-chat-probe.e2e.spec.ts` | `DSH_CLINE_CHAT_E2E=1` + `DSH_CLINE_CHAT_E2E_CONFIRM=yes` | **默认只请求 `cline-free/deepseek-v4.1-flash`**（用户指定的日常验证模型）。其余 4 个免费模型需 `DSH_CLINE_CHAT_E2E_ALL_FREE=1` 才遍历。**付费模型一律拒绝请求**（见下「Cline 探针的付费保护」） |
+| `cline-chat-probe.e2e.spec.ts` | `DSH_CLINE_CHAT_E2E=1` + `DSH_CLINE_CHAT_E2E_CONFIRM=yes` | **默认只请求 `cline-free/mimo-v2.6-flash`**（用户指定的日常验证模型）。其余免费模型需 `DSH_CLINE_CHAT_E2E_ALL_FREE=1` 才遍历。**付费模型一律拒绝请求**（见下「Cline 探针的付费保护」） |
 | `image-burst-cross-provider.e2e.spec.ts`（`pnpm test:e2e:image-burst`） | `DSH_IMAGE_BURST_E2E=1` + `DSH_IMAGE_BURST_E2E_CONFIRM=yes` | **issue !IKITT9 的图片压力探测**（跨 provider）。腾讯两站各一组：原图 15 张必须报 `prompt is too long` 且归成 `CONTEXT_WINDOW_EXCEEDED`、缩放后同张数必须过、且**缩到 1011×632 后模型仍读得出截图地址栏**（这条是预算档位的正当性来源）。另含 qoder / cline / lobsterai / raccoon / trae / loomy 各一组。⚠️ 单次请求带十几张图，**消耗明显**（全跑约 8 分钟）；缺 fixture 时整体跳过（见下） |
 
 ## ⚠️ 图片探针的 fixture 不入库
@@ -166,7 +166,7 @@ pnpm test:e2e:trae-channels
 # 安全：Cline 只读探针（凭据/前缀证据/余额/免费集合，不发模型请求、不续期）
 pnpm test:e2e:cline
 
-# ⚠️ 发一次 Cline 推理请求（**默认只发 cline-free/deepseek-v4.1-flash**，免费模型）
+# ⚠️ 发一次 Cline 推理请求（**默认只发 cline-free/mimo-v2.6-flash**，免费模型）
 pnpm test:e2e:cline-chat
 
 # 安全：MiniMax 只读探针（模型目录/签到状态/余额，**绝不领取**）
@@ -188,10 +188,14 @@ Cline 的免费资格是**服务端动态下发的营销状态**（`GET /api/v1/
 ```
 DSH_CLINE_CHAT_E2E=1                必需
 DSH_CLINE_CHAT_E2E_CONFIRM=yes      必需（防误跑）
-DSH_CLINE_CHAT_E2E_ALL_FREE=1       可选：才遍历其余 4 个免费模型
+DSH_CLINE_CHAT_E2E_ALL_FREE=1       可选：才遍历其余免费模型
 ```
 
-默认行为：**只请求 `cline-free/deepseek-v4.1-flash`**（用户指定的日常验证模型）。
+默认行为：**只请求 `cline-free/mimo-v2.6-flash`**（用户指定的日常验证模型）。
+
+⚠️ 默认模型换过一次：原为 `cline-free/deepseek-v4.1-flash`，2026-10-05 被上游下架
+（移出远端 `free` 数组、直连回 `404 {"error":"model not found"}`）故改用现模型。
+判定「某个免费模型是否已被下架」的探针是 `pnpm test:e2e:cline`（只读，零额度）。
 
 另有 `assertFreeModel()` 作为**安全边界**：任何 `isFree === false` 的模型
 （无论来自 `DSH_CLINE_MODEL` 环境变量还是远端列表）都会**直接抛错、不发请求**。

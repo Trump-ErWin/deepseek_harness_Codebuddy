@@ -133,6 +133,14 @@ export class AccountPool {
    * 的唯一后果是回到默认启用，用户再关一次即可。
    */
   private gatewayEnabledCache = true
+  /**
+   * 供应商自定义显示顺序（「供应商开关」弹窗拖拽排序）的进程内副本。
+   *
+   * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
+   * 唯一后果是顺序回到声明顺序，用户重新拖一次即可（纯展示偏好，可逆）。
+   * 数组语义见 `jet-hub-store.ts` 的 `JetHubState.providerOrder`。
+   */
+  private providerOrderCache: string[] = []
   /** 是否已完成首次载入。 */
   private loaded = false
   /**
@@ -173,6 +181,8 @@ export class AccountPool {
       this.modelCache = state.disabledModels
       // 网关开关同理：老文档没有该键 → 保持默认启用。
       this.gatewayEnabledCache = state.gatewayEnabled !== false
+      // 供应商顺序同理：老文档没有该键 → 空数组（未自定义）。
+      this.providerOrderCache = state.providerOrder ?? []
     }
     this.loadLocks(state)
   }
@@ -255,6 +265,7 @@ export class AccountPool {
         // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
         // 分两次快照会让同一份文档里的字段互相矛盾。
         gatewayEnabled: this.gatewayEnabledCache,
+        providerOrder: this.providerOrderCache,
       })
     })
     this.storeChain = next.catch(() => {})
@@ -328,6 +339,38 @@ export class AccountPool {
     this.loaded = true
     if (this.store.kind === 'memory') {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，网关开关仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
+  }
+
+  /**
+   * 读取供应商自定义显示顺序（进程内权威副本）。
+   *
+   * 空数组 = 用户尚未自定义（或老文档没有该键），展示侧按声明顺序渲染。
+   */
+  providerOrder(): string[] {
+    this.ensureLoaded()
+    return this.providerOrderCache
+  }
+
+  /**
+   * 写入供应商自定义显示顺序并落盘。
+   *
+   * ⚠️ 入参**原样保存**、不在池里做 provider 合法性过滤：合法集合随插件版本
+   * 变化，在此过滤会让「新版本加入 provider → 被旧版本代码重写文档」场景下
+   * 的顺序无法保留。脏值防护由两层承担：RPC 层校验 `string[]`，
+   * store 层 `sanitizeProviderOrder` 去重/剔除非字符串。
+   */
+  async setProviderOrder(order: string[]): Promise<void> {
+    this.ensureLoaded()
+    const next = Array.isArray(order) ? [...order] : []
+    if (this.providerOrderCache.length === next.length
+      && this.providerOrderCache.every((id, index) => id === next[index])) return
+    this.providerOrderCache = next
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，供应商顺序仅本次会话有效')
       return
     }
     await this.queueStoreSave()

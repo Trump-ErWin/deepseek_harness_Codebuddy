@@ -86,6 +86,9 @@
     每请求随机——不要"为了更像真实客户端"生成随机值,固定常量才是原项目实测能跑的值
     (依据:`F:\project\cmdc-pak\internal\upstream\gemini\client.go:39-54` 常量区 +
     `pojie/analyze/mitm_2026-10-01/capture*.jsonl` 跨会话恒定 + wb 副本 client.go:229 证据链注释)。
+    ⚠️ **2026-10-05 更正**:这条对 `sessionId` 与 `project` 的判断已被真机对照实验推翻 ——
+    两者**都不是常量**(sessionId 内容派生、project 探测自 LCA)。**五个身份头仍然不变**,
+    那条结论对头成立、对信封字段不成立。详见 README 与 §2.2 第 4 条。
 
 ---
 
@@ -125,9 +128,13 @@
   - schema 白名单清洗 `SanitizeGeminiSchema`(多余关键字整请求 400;enum 含非字符串整删;
     `type:["string","null"]` 收敛为单 type+`nullable:true`)。
   - 签名缓存(`sigstore.go` 160 行)与 `IsSignatureError` → 去签重试兜底(`service.go`)。
-- **可砍项**(第一期不带):`apikey.go`(用户已定)、`quota.go`、`stats.go`、`project.go`
-  (默认路径 project 用常量,探测结果不进信封)、`accounts.go` 多账号索引(插件有自己的 AccountPool)、
+- **可砍项**(第一期不带):`apikey.go`(用户已定)、`quota.go`、`stats.go`、
+  `accounts.go` 多账号索引(插件有自己的 AccountPool)、
   cryptostore(插件走宿主 `ctx.credentials`)。
+  ⚠️ **2026-10-05 更正**:`project.go` 原列在此处,注为「默认路径 project 用常量,
+  探测结果不进信封」。真机对照实验证明该前提是**错的** —— 原版确实读
+  `loadCodeAssist` 的 `cloudaicompanionProject`。现已补 `src/gemini-project.ts`
+  (三级缓存 + 「探测失败不发推理」门控),故**不再是可砍项**。
 
 ### 2.2 必须保留的上游对齐细节(丢一条就会被拒/行为漂移)
 
@@ -150,16 +157,21 @@
    **实现路径**:手动按字母序构造对象字面量(依赖 V8 对字符串键保持插入序),
    或写一个 `sortedStringify` 先递归排序键。**子代理拿到这个任务大概率先 `JSON.stringify`,
    测试红了再懵——必须在在这点明**;
-4. 信封里 `project` 恒为常量 `"aicode-consumers"`、`sessionId` **预置常量、禁止随机化**:
-   推理 `"3124275334370613369"`,冒烟(面板连通测试)`"-6686302828062879362"`(**负数**;
-   两串不同、不能混用,真实推理与冒烟分开免得测试流量污染会话归并);
-   `requestId = agent/<unix_ms>/<8hex>` 则相反,**每请求随机**;`userAgent:"antigravity"`。
-   ⚠️ sessionId 为什么必须写死:原项目 client.go:229 注释给出证据链——0.8.6.1 **跨进程两轮
-   MITM 抓包 sessionId 恒定**、0.8.8 oracle 61 探针实跑同值(抓包体里 sessionId 共出现 5 次,
-   四个档位全同串);它是**预置常量,不是派生值**——原版 exe 全量字符串加密搜不到这两个串,
-   不能反过来当成"由哈希派生"的证据(此前的 FNV-1a 推导已撤回)。原版的会话归并、额度统计
-   都挂在这两个串上,改成随机会让服务端认不出是同一会话,**thoughtSignature 回填会断**
-   (多实例联调才用环境变量钉别的固定值,默认永远是常量,不退化到派生);
+4. 信封里 `project` **默认** `"aicode-consumers"`（它是 `loadCodeAssist` 探测为空时的
+   **兜底**，不是恒值 —— 原版读 `cloudaicompanionProject`）；`sessionId` 由
+   `(project, contents[0].text, lane)` **确定性派生**，不是常量、也不是随机
+   （`deriveGeminiSessionId`）。`requestId = agent/<unix_ms>/<8hex>` 每请求随机；
+   `userAgent:"antigravity"`。
+   ⚠️ 2026-10-05 更正：本节此前写"`sessionId` 是预置常量、禁止随机化"（推理
+   `"3124275334370613369"` / 冒烟 `"-6686302828062879362"`）。真机对照实验推翻了它——
+   那两个值只是**特定输入的输出**被反复抓包：同一 prompt 换 project 会变、换
+   model / maxOutputTokens / 系统提示 / 对话轮数都不变。**常量化的后果是所有用户、
+   所有对话共用一个会话**，而原版的会话归并与 `thoughtSignature` 回填都挂在这个字段上。
+   实验同时确认 lane 进哈希（同 prompt 同预算下推理与冒烟取值不同），故两条路径
+   必须用不同标签（`GEMINI_SESSION_LANE_INFER` / `_SMOKE`）。
+   ⚠️ 原版哈希函数本体尚未反推出来（已否证 FNV-1a/1、murmur64A、MD5/SHA 系列等 50+ 种），
+   故**取值不与原版逐字相同**，对齐的是"同输入同输出 + 依赖维度一致"。
+   要复刻历史抓包/联调可用 `sessionId` 选项钉固定值。
 5. SSE 解析:先试 `{"response":{…}}` 信封壳、再吃裸 Response;只有 usageMetadata 的收尾帧记用量;
    usage 取"见过的最大 totalTokenCount";`data:[DONE]` 结束;
 6. token 交换必须带 client_secret,token 端点不伪装 UA。

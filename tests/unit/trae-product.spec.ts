@@ -158,6 +158,45 @@ describe('TRAE 兜底模型目录', () => {
     expect(TRAE.channels).toContain('solo_agent_remote')
   })
 
+  it('⚠️ channels 是**可调用通道白名单**，不得含实测被拒的三个通道（Issue IKJOZ7）', () => {
+    // 逐通道实测（2026-10-04，scripts/probe-trae-channel-callable.mjs）：
+    //   chat        → 4023 the model is unknown
+    //   builder     → 4001 param is invalid
+    //   inline_chat → 3003 model service is unavailable
+    // 它们进了白名单就等于放行「能选中、一发必失败」的条目。
+    for (const bad of ['chat', 'builder', 'inline_chat']) {
+      expect(TRAE.channels, bad).not.toContain(bad)
+    }
+    // 目录恒空的通道放进来也无意义（避免有人"补全 22 个"）。
+    for (const empty of ['ui_builder_v2', 'solo_builder', 'custom_agent_generation', 'utils']) {
+      expect(TRAE.channels, empty).not.toContain(empty)
+    }
+  })
+
+  it('⚠️ 实测可调用的通道必须都在白名单内（漏一个 = 独有模型从目录消失）', () => {
+    // 反向保护：这 15 个是逐通道实发验证过 OK 的集合（`solo_coder` 首测超时、
+    // 换 4 个模型复测全 OK，故计入）。少任何一条都意味着某个模型
+    // （如 multimodal_image_kimi-k2.5 → multimodal；deepseek-V3 → git_ai）
+    // 会因「非白名单」被剔除，而它本来是能用的。
+    expect([...TRAE.channels].sort()).toEqual([
+      'builder_v3',
+      'chat_v3',
+      'code_review_summary',
+      'code_reviewer',
+      'git_ai',
+      'multimodal',
+      'solo_agent',
+      'solo_agent_lite',
+      'solo_agent_remote',
+      'solo_coder',
+      'solo_design_lite',
+      'solo_design_remote',
+      'solo_work_lite',
+      'solo_work_remote',
+      'system_diagnosis',
+    ])
+  })
+
   it('产品级兜底输出上限取实测主流值 32000（不是旧的 128000）', () => {
     expect(TRAE.fallbackMaxOutputTokens).toBe(32_000)
   })

@@ -467,7 +467,7 @@ describe('Gemini 接线点（源码断言）', () => {
     expect(indexSource).toContain('registerGeminiLlm(ctx, {')
     // ⚠️ 漏了这一条 ⇒ 续期定时器**永不武装**（不是「刷得慢」，是压根不刷）。
     expect(indexSource).toContain("['gemini', (p) => gemini.refreshAll(p)]")
-    expect(indexSource).toContain('gemini: geminiAdapter')
+    expect(indexSource).toMatch(/gemini: pruned\([^)]*,\s*geminiAdapter\)/)
     expect(indexSource).toMatch(/loomy, raccoon, minimax, zcode, gemini, modelAdapters/)
     // 丢的是下一轮能不能带签名。
     expect(indexSource).toContain('geminiSigStore.flush()')

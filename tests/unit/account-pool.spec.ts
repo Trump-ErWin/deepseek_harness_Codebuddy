@@ -2019,4 +2019,48 @@ describe('AccountPool · setAccountsEnabled（供应商级批量启停）', () =
       expect(seen).toEqual(['a', 'b'])
     })
   })
+
+  /**
+   * 供应商自定义显示顺序（「供应商开关」弹窗拖拽排序，2026-10-06）。
+   *
+   * 与网关开关同级的「可逆展示偏好」：丢键 = 回到声明顺序，用户重拖一次即恢复，
+   * 故住 state.json 即可、无需独立文档。⚠️ 与 gatewayEnabled 同一红线：
+   * 写顺序不得抹掉同一文档里的账号与黑名单（整体写入语义）。
+   */
+  describe('供应商自定义显示顺序', () => {
+    it('默认空数组（未自定义 = 按声明顺序渲染）', () => {
+      expect(new AccountPool(createMockContext() as never).providerOrder()).toEqual([])
+    })
+
+    it('写入后可读回，且跨实例落盘', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      await writer.setProviderOrder(['zcode', 'buddy', 'codearts'])
+      expect(writer.providerOrder()).toEqual(['zcode', 'buddy', 'codearts'])
+
+      // 新实例从同一后端载入 —— 证明不是只改了内存副本。
+      expect(new AccountPool(seeded as never).providerOrder()).toEqual(['zcode', 'buddy', 'codearts'])
+    })
+
+    it('相同顺序重复写入不触发落盘', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const pool = new AccountPool(seeded as never)
+      await pool.setProviderOrder(['buddy', 'zcode'])
+      const writes = seeded.replacePayloads.length
+      await pool.setProviderOrder(['buddy', 'zcode'])
+      expect(seeded.replacePayloads.length).toBe(writes)
+    })
+
+    it('⚠️ 写顺序不得抹掉同一文档里的账号与黑名单', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const pool = new AccountPool(seeded as never)
+      await pool.setProviderOrder(['buddy', 'zcode'])
+
+      const raw = seeded.replacePayloads.at(-1) as
+        { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, unknown>; providerOrder?: string[] }
+      expect(raw.accounts).toHaveLength(1)
+      expect(raw.disabledModels).toBeDefined()
+      expect(raw.providerOrder).toEqual(['buddy', 'zcode'])
+    })
+  })
 })

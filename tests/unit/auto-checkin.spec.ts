@@ -135,7 +135,7 @@ describe('自动签到：日界与配置', () => {
       lastAt: 1234,
       dismissedRunAt: 1234,
       channels: [
-        { provider: 'buddy', text: '2 个 +800' },
+        { provider: 'buddy', text: '2 个 +800积分' },
         { provider: '', text: 'x' }, // 无 provider → 丢弃
         { provider: 'qoder' }, // 无 text → 丢弃
         'not-an-object',
@@ -143,7 +143,7 @@ describe('自动签到：日界与配置', () => {
       ],
     })
     expect(doc.channels).toEqual([
-      { provider: 'buddy', text: '2 个 +800' },
+      { provider: 'buddy', text: '2 个 +800积分' },
       { provider: 'cline', text: 'y'.repeat(120) },
     ])
     expect(doc.dismissedRunAt).toBe(1234)
@@ -349,7 +349,7 @@ describe('自动签到：常驻状态文字与手动关闭', () => {
     await runner.runIfDue()
     const state = runner.state()
     expect(state.channels).toEqual([
-      { provider: 'buddy', text: '2 个 +800' },
+      { provider: 'buddy', text: '2 个 +800积分' },
       { provider: 'cline', text: '无签到接口' },
       { provider: 'qoder', text: '1 个今天已领' },
     ])
@@ -382,13 +382,43 @@ describe('自动签到：常驻状态文字与手动关闭', () => {
   })
 
   it('describeChannel 逐渠道短文案（不含渠道名，展示层补）', () => {
-    expect(describeChannel({ claimed: 2, totalCredit: 800, alreadyClaimed: 0, inactive: 0, failed: 0 })).toBe('2 个 +800')
+    // ★ 单位感知（2026-10-04）：积分渠道现在也带上单位名（`+800积分`）。
+    //   改动前是裸数字 `+800` —— 那让 ZCode 的 `+100000000` 完全看不出单位，
+    //   正是用户报障的核心。带上单位后两个渠道的形态一致、可互相区分。
+    expect(describeChannel({ claimed: 2, totalCredit: 800, alreadyClaimed: 0, inactive: 0, failed: 0 })).toBe('2 个 +800积分')
     expect(describeChannel({ claimed: 0, totalCredit: 0, alreadyClaimed: 3, inactive: 0, failed: 0 })).toBe('3 个今天已领')
     // ⚠️「领到但 +0 分」不能说成「已领」：会和 alreadyClaimed 撞词，看不出这次有没有动作
     expect(describeChannel({ claimed: 1, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 1 }))
       .toBe('1 个领取成功，1 个今天已领，1 个失败')
     expect(describeChannel({ claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 2, failed: 0 })).toBe('2 个未开启')
     expect(describeChannel({ claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0 })).toBe('无可领')
+  })
+
+  /**
+   * ★ 用户报障（2026-10-04）：「Zcode 获得的是 token 数量，但是这里显示成获得积分」。
+   *
+   * 报障原文给的期望文案是 `+100Mtoken`（逐渠道）/ `+100Mtoken, +100积分`（汇总）。
+   * 这两条锁死那个形态 —— 它是本缺陷的**验收判据**，不是描述。
+   */
+  it('★ ZCode 的 token 按 token 报，不冒充积分（用户报障的核心）', () => {
+    const zcode = { claimed: 1, totalCredit: 100_000_000, alreadyClaimed: 0, inactive: 0, failed: 0 }
+    // ① 逐渠道：1 亿 token 必须压成 `100.00M` 并标 Token
+    expect(describeChannel({ ...zcode, totalByUnit: { token: 100_000_000, credit: 0 } }))
+      .toBe('1 个 +100.00MToken')
+    // ② 汇总：token 与积分**分列**，不做跨单位求和
+    expect(describeRun({
+      providers: 2, claimed: 2, totalCredit: 100_000_100, totalByUnit: { token: 100_000_000, credit: 100 },
+      alreadyClaimed: 0, inactive: 0, failed: 0, skipped: 0, errors: 0, coversToday: 2,
+    })).toBe('2 个渠道：2 个账号领取成功（+100.00MToken, +100积分）')  })
+
+  it('★ 缺 totalByUnit 的旧响应回落到「按积分」（不误伤旧宿主）', () => {
+    // 旧宿主只回 totalCredit ⇒ 行为与改动前一致，只是多了单位名。
+    expect(describeChannel({ claimed: 1, totalCredit: 300, alreadyClaimed: 0, inactive: 0, failed: 0 }))
+      .toBe('1 个 +300积分')
+    expect(describeRun({
+      providers: 1, claimed: 1, totalCredit: 300, alreadyClaimed: 0,
+      inactive: 0, failed: 0, skipped: 0, errors: 0, coversToday: 1,
+    })).toBe('1 个渠道：1 个账号领取成功（+300积分）')
   })
 })
 
@@ -404,7 +434,7 @@ describe('自动签到：摘要与判据的纯函数', () => {
   it('describeRun 汇总各计数；无内容时给可读文案', () => {
     expect(describeRun({
       providers: 3, claimed: 2, totalCredit: 300, alreadyClaimed: 1, inactive: 0, failed: 0, skipped: 1, errors: 0, coversToday: 3,
-    })).toBe('3 个渠道：2 个账号领取成功（+300 积分），1 个今天已领，1 个渠道不支持签到')
+    })).toBe('3 个渠道：2 个账号领取成功（+300积分），1 个今天已领，1 个渠道不支持签到')
     expect(describeRun({
       providers: 2, claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, skipped: 0, errors: 0, coversToday: 0,
     })).toBe('2 个渠道：没有需要领取的账号')
