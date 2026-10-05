@@ -220,7 +220,15 @@ suite('跨 provider 图片 token 上限探测（原图直发）', () => {
     expect(scaled.at(-1)!.count).toBeGreaterThanOrEqual(24)
   }, 900_000)
 
-  it('cline / cline-free/deepseek-v4.1-flash（免费）', async (ctx) => {
+  /**
+   * ⚠️ 模型原为 `cline-free/deepseek-v4.1-flash`，2026-10-05 被上游下架
+   * （移出远端 `free` 数组、直连回 `404 {"error":"model not found"}`），
+   * 沿用会让本用例暖目录后拿到「模型不在目录中」而失败。
+   * 改用仍在册的 `cline-free/mimo-v2.6-flash`（实测支持图片、HTTP 200）。
+   */
+  const CLINE_IMAGE_MODEL = 'cline-free/mimo-v2.6-flash'
+
+  it('cline / cline-free/mimo-v2.6-flash（免费）', async (ctx) => {
     const entry = readClineCredentialsFromDshStore()[0]
     expect(entry, '账号池里没有 cline 凭据').toBeDefined()
     const credential = entry!.credential
@@ -236,7 +244,7 @@ suite('跨 provider 图片 token 上限探测（原图直发）', () => {
     })
     // ⚠️ 必须先暖目录：ClineAdapter.stream() 不调 ensureRemoteModels()，
     // 而图片能力只查 remoteModels —— 不暖就会被误判成「模型不支持图片」。
-    await adapter.resolveModel('cline', 'cline-free/deepseek-v4.1-flash')
+    await adapter.resolveModel('cline', CLINE_IMAGE_MODEL)
     // 上一轮实测**原图**：24 张（≈159K 图片 token）全过、32 张（≈122 MiB）才
     // `TRANSPORT` —— 该家没有腾讯那道图片 token 预算，卡的是请求体体积。
     // 缩放后测到 32 张仍过即证明修复有效（且顺带确认原图的 32 张失败是体积）。
@@ -248,13 +256,13 @@ suite('跨 provider 图片 token 上限探测（原图直发）', () => {
     const baseline = await probeImageBurst({
       label: 'cline 基线(无图)',
       counts: [0],
-      stream: streamOf(adapter, 'cline', 'cline-free/deepseek-v4.1-flash'),
+      stream: streamOf(adapter, 'cline', CLINE_IMAGE_MODEL),
     })
     if (!assertBaselineUsable(baseline[0], ctx, 'cline')) return
     const scaled = await probeImageBurst({
       label: 'cline 缩放后',
       counts: [1, 32],
-      stream: streamOf(adapter, 'cline', 'cline-free/deepseek-v4.1-flash'),
+      stream: streamOf(adapter, 'cline', CLINE_IMAGE_MODEL),
     })
     expect(scaled.find((r) => r.verdict !== 'ok'), '缩放后仍被拒').toBeUndefined()
   }, 900_000)

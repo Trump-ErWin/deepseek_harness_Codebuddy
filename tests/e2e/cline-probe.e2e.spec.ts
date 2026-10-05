@@ -126,17 +126,22 @@ suite('Cline 只读探针（不发模型请求、不续期）', () => {
     console.log(`  ${parsed.clinePass.length} 个：${parsed.clinePass.slice(0, 4).map((e) => e.id).join(', ')}…`)
 
     expect(parsed.free.length, '远端应至少下发一个免费模型').toBeGreaterThan(0)
-    // 兜底表里的 4 个应当都在（若某个被下线，本断言会失败并提示需同步兜底表）。
-    // ⚠️ 2026-10-03：第 5 个 `cline-free/gemini-3.8-flash` 已被 Cline 下线
-    // （直连回 `404 model not found`），故从本清单与兜底表里一并移除。
+    // ⚠️ **与兜底表联动断言，不再硬编码清单**。
+    //
+    // 本用例的职责是**发现兜底表落后于远端**（兜底表里的免费条目被上游下架）。
+    // 硬编码清单会让「上游下架 → 同步兜底表」这一个动作同时弄红**两处**
+    // （清单本身 + 下面的目录断言），排查时无法区分「探针该更新了」与
+    // 「实现坏了」。故清单来源单一化：只认 `CLINE.fallbackModels`。
+    //
+    // 已发生两次：`gemini-3.8-flash`（2026-10-03）、`deepseek-v4.1-flash`
+    // （2026-10-05，直连回 `404 {"error":"model not found"}`）。
     const freeIds = new Set(parsed.free.map((entry) => entry.id))
-    for (const id of [
-      'stealth/space-bunny-alpha',
-      'cline-free/mimo-v2.6-flash',
-      'cline-free/deepseek-v4.1-flash',
-      'cline-free/muse-spark-1.3-contributor',
-    ]) {
-      expect(freeIds.has(id), `免费模型 ${id} 已不在远端 free 数组中（需更新兜底表与文档）`).toBe(true)
+    for (const model of CLINE.fallbackModels.filter((entry) => entry.isFree === true)) {
+      expect(
+        freeIds.has(model.id),
+        `兜底表里的免费模型 ${model.id} 已不在远端 free 数组中`
+        + '（上游已下架，需同步兜底表与文档）',
+      ).toBe(true)
     }
     // `clinePass` 不得被误判为免费
     for (const entry of parsed.clinePass) {
@@ -179,13 +184,43 @@ suite('Cline 只读探针（不发模型请求、不续期）', () => {
     expect(models.length).toBeGreaterThan(0)
     expect(free.length).toBeGreaterThan(0)
 
-    // 核心不变式：`cline-free/deepseek-v4.1-flash`（免费）与
-    // `deepseek/deepseek-v4.1-flash`（按量计费）是两个不同实体，绝不可混判。
+    // 核心不变式：`cline-free/*`（免费）与同名不带前缀的（按量计费）是
+    // **两个不同实体**，绝不可混判。
+    //
+    // ⚠️ 免费侧改用仍在册的 `cline-free/mimo-v2.6-flash`：原先用的
+    // `cline-free/deepseek-v4.1-flash` 已于 2026-10-05 被上游下架
+    // （直连回 `404 {"error":"model not found"}`）并从兜底表删除，而
+    // `mergeClineModels` 现在会丢弃「远端已不认识」的兜底条目 ⇒ 取不到它。
     const byId = new Map(models.map((model) => [model.id, model]))
-    expect(byId.get('cline-free/deepseek-v4.1-flash')?.isFree).toBe(true)
+    expect(byId.get('cline-free/mimo-v2.6-flash')?.isFree).toBe(true)
     if (byId.has('deepseek/deepseek-v4.1-flash')) {
       expect(byId.get('deepseek/deepseek-v4.1-flash')?.isFree, '付费同名模型被误标为免费').toBe(false)
     }
+  })
+
+  /**
+   * ⚠️ **现场回归**：已下架模型不得被兜底表「复活」。
+   *
+   * 真实报障（2026-10-05）：`cline-free/deepseek-v4.1-flash` 被移出远端 `free`
+   * 数组后，仍以「免费」出现在模型列表里，用户选中即回 `404 model not found`。
+   *
+   * 本条用**真实远端响应**验证修复（单测用的是构造输入，这里补现场证据）。
+   */
+  it('已下架模型不再被兜底表复活（真实远端目录）', async () => {
+    const { credential } = entries[0]!
+    const { models } = await loadClineModels(CLINE, { credential })
+    const byId = new Map(models.map((model) => [model.id, model]))
+
+    const removed = 'cline-free/deepseek-v4.1-flash'
+    console.log('\n===== 已下架模型检查 =====')
+    console.log(`  ${removed} → ${byId.has(removed) ? '❌ 仍在列表中' : '✅ 不在列表中'}`)
+    console.log(`  isClineFreeModel 仍认它（前缀分支）= ${isClineFreeModel(removed)}`)
+    console.log(`  兜底表是否仍含它 = ${CLINE.fallbackModels.some((m) => m.id === removed)}`)
+
+    expect(
+      byId.has(removed),
+      `已下架模型 ${removed} 仍在目录中（兜底表复活了它，用户选中会回 404）`,
+    ).toBe(false)
   })
 
   it('余额响应解析对 401 保留服务端原因（而非「缺少 data 字段」）', () => {
