@@ -476,3 +476,26 @@ UI 上完全看不到错误。
 - `lobsterai` 用独立的 `LobsteraiAdapter`（协议不同源，见项目概述）；它的产品配置是 `src/lobsterai-product.ts` 的 `LobsteraiProduct`，与 `BuddyProduct` **平行而非继承**
 - `qoder` 用独立的 `QoderAdapter`（协议不同源，见项目概述）；产品配置是 `src/qoder-product.ts` 的 `QoderProduct`，同样**平行而非继承**。它的 OpenAI 协议层逻辑复用 `src/openai-compat.ts`
 - `trae` 用独立的 `TraeAdapter`（协议不同源）；它的产品配置是 `src/trae-product.ts` 的 `TraeProduct`，同样**平行而非继承**。与其它三个 provider 最根本的差异是**载荷与响应都要转换**：请求体经 `transformToSOLOBody` 转成 SOLO 格式，响应经 `parseTraeSSELine` 从 SOLO 自定义 SSE 转成 OpenAI chunk
+
+## ⚠️ 移植既有实现的轮换/重试语义：先抄「类别→动作」表，不是抄循环骨架
+
+**真实事故**（2026-10-06，本仓 PR #64 的 raccoon/loomy 轮换）：照 `buddy-adapter.ts`
+的**循环骨架**（tried 集合 + getAvailableAccount(exclude) + 换号重发）给两家补了
+请求级轮换，但**漏抄了 buddy 的分支语义表**——buddy 只在**限流类**失败写冷却标记，
+认证类（401/403）只 `continue` 换号**不写标记**。初版写成「凡可换号就写冷却，
+时长 `status===429 ? 1h : 24h`」⇒ 上游网关对全池回 401（authorization_verify_error）时，
+**一个请求内 6 个号各被封 24h，整个 provider 死一天**（症状
+`no usable credential; log in first`）。
+
+**审查侧规则**（给 code-review 与自审）：看到「对齐/移植/参照既有实现」的 PR，先要
+那张**类别→动作**表，再逐格对照源实现——骨架长得像不代表语义抄全了：
+
+| 问 | 为什么 |
+|---|---|
+| 源实现把失败分几类？判据是什么？ | 分类是语义的载体（quota/rate/auth/other 各自动作不同） |
+| 每类**换不换**下一个候选？ | 换号无益的类别（400 参数错）不该换 |
+| 每类**写不写**状态标记（冷却/黑名单）？ | 认证类写冷却＝把网关故障放大成全池不可用（本次事故格） |
+| 每类**抛什么错误码**？ | 401 报成 QUOTA_EXCEEDED 会误导排障与重试策略 |
+| 候选耗尽时报什么？带不带最后一次的真实原因？ | 笼统报错丢服务端原文（buddy 上同款教训） |
+
+新实现必须配**逐格回归测试**（每格一条，先红后绿）；漏抄的那格就是将来的事故。
