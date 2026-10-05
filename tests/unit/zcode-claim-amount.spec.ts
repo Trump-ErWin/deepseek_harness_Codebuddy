@@ -25,7 +25,20 @@ import type { ZcodeClaimablePlan } from '../../src/zcode-upstream.js'
 
 const dir = dirname(fileURLToPath(import.meta.url))
 const creditsSrc = readFileSync(resolve(dir, '../../src/credits.ts'), 'utf8')
+/**
+ * ⚠️ 读 `jet-hub.js` 时**剥掉整行注释**（2026-10-05 复审补）。
+ *
+ * 该文件的注释里会**逐字引用**曾经的错误写法（如汇总行那条注释就写着
+ * `原先写 （共 +${totalCredit} 积分）`）—— 不剥注释的话，下面的反向断言会被
+ * **注释自己**命中，于是「修好了」与「没修」都会红，断言失去意义。
+ */
 const panelSrc = readFileSync(resolve(dir, '../../plugin-src/client/jet-hub.js'), 'utf8')
+  .split(/\r?\n/)
+  .filter((line) => {
+    const trimmed = line.trim()
+    return !(trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*'))
+  })
+  .join('\n')
 
 const CRED = { zcode_jwt: 'jwt', device_mid: 'mid' } as ZcodeCredential
 
@@ -151,6 +164,23 @@ describe('★ 类型与前端契约（源码级，反向验证必需）', () => 
   })
 
   it('★ 汇总行不再做跨单位求和（1 亿 token 与 100 积分相加会误导）', () => {
-    expect(panelSrc).not.toMatch(/个账号领取成功（\+\$\{summary\.totalCredit\}/)
+    /**
+     * ⚠️ **本条断言曾长期恒真**（2026-10-05 复审发现并修正）。
+     *
+     * 原锚点是 `/个账号领取成功（\+\$\{summary\.totalCredit\}/`，但 `jet-hub.js`
+     * 里**从来没有过**这种形态 —— 当时的真实代码是
+     * `` `一键签到：${...}（共 +${totalCredit} 积分）` ``（**没有**「个账号领取成功」
+     * 这个前缀）。⇒ 该正则在修复前后**都命中 0 次**，`not.toMatch` 恒成立，
+     * 等于空转 —— 而它正是「防止跨单位求和回归」的那道闸。
+     *
+     * 现在的判据换成**真实存在过的两种形态**（都以正向锚点兜底，防再次恒真）。
+     */
+    // ① `totalCredit` 标量不得再出现在**展示**拼装里（只允许作为兜底输入存在）
+    expect(panelSrc).not.toMatch(/（共 \+\$\{totalCredit\} 积分）/)
+    // ② 逐渠道也不得再直接吐 `totalCredit` 的裸数字
+    expect(panelSrc).not.toMatch(/bits\.push\(`\+\$\{s\.totalCredit\}`\)/)
+    // ③ 正向锚点：修复后的形态必须真的存在（否则上面两条又变成恒真）
+    expect(panelSrc).toMatch(/（共 \$\{totalAmount\}）/)
+    expect(panelSrc).toMatch(/bits\.push\(amount\)/)
   })
 })

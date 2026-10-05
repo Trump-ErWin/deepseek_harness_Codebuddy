@@ -66,6 +66,7 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { QODER_BILLING_UTC_OFFSET_MS } from './model-queue.js'
 import { resolveJetHubHome } from './jet-hub-store.js'
+import { formatClaimGains } from './credits.js'
 import { ZCODE } from './zcode-product.js'
 import type { BadgeRpcResult } from './usage-badge.js'
 import type { RpcCreditsClaimAllResponse, RpcUsageAutoCheckinState } from './types.js'
@@ -275,6 +276,14 @@ interface RunTotals {
   providers: number
   claimed: number
   totalCredit: number
+  /**
+   * ★ **按单位分组**的合计（2026-10-04）。
+   *
+   * ⚠️ 展示路径**必须**用它而不是 {@link totalCredit}：后者跨单位求和，
+   * 会把 ZCode 的 token 与其余渠道的积分加成一个数（真实缺陷，见
+   * `RpcCreditsClaimSummary.totalByUnit`）。
+   */
+  totalByUnit: Record<'token' | 'credit', number>
   alreadyClaimed: number
   inactive: number
   failed: number
@@ -294,7 +303,7 @@ interface RunTotals {
 }
 
 function emptyTotals(): RunTotals {
-  return { providers: 0, claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 }
+  return { providers: 0, claimed: 0, totalCredit: 0, totalByUnit: { token: 0, credit: 0 }, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 }
 }
 
 /**
@@ -344,7 +353,12 @@ export function isAutoCheckinExcluded(provider: string): boolean {
 export function describeRun(totals: RunTotals): string {
   const parts: string[] = []
   if (totals.claimed > 0) {
-    parts.push(`${totals.claimed} 个账号领取成功${totals.totalCredit > 0 ? `（+${totals.totalCredit} 积分）` : ''}`)
+    // ★ 按单位分别报（2026-10-04，真实缺陷）：原先写 `+${totals.totalCredit} 积分`，
+    //   而 `totalCredit` 是**跨单位求和** —— ZCode 的 1 亿 token 与 100 积分会被
+    //   加成 `100000100` 并标成「积分」。用户报障原文给的期望形态就是
+    //   `+100Mtoken, +100积分`（见 `credits.ts` 的 `formatClaimGains`）。
+    const amounts = formatClaimGains(totals.totalByUnit ?? { credit: totals.totalCredit })
+    parts.push(`${totals.claimed} 个账号领取成功${amounts === null ? '' : `（${amounts}）`}`)
   }
   if (totals.alreadyClaimed > 0) parts.push(`${totals.alreadyClaimed} 个今天已领`)
   if (totals.failed > 0) parts.push(`${totals.failed} 个失败`)
@@ -394,12 +408,22 @@ export function describeChannel(summary: {
   failed: number
   /** 见 `RpcCreditsClaimSummary.coversToday`；缺省按 `claimed+alreadyClaimed` 兜底。 */
   coversToday?: number
+  /**
+   * ★ 按单位分组的合计（2026-10-04）。**缺省回落到「全部按积分」**，
+   * 以兼容尚未上报该字段的旧响应（与 `coversToday` 的兜底同思路）。
+   */
+  totalByUnit?: Partial<Record<'token' | 'credit', number>>
 }): string {
   const parts: string[] = []
   if (summary.claimed > 0) {
     // ⚠️ 「领到了但 +0 分」与「今天已领」必须能分辨：前者写成「已领」会和
     // alreadyClaimed 撞词，用户无法判断这次到底有没有动作。
-    parts.push(summary.totalCredit > 0 ? `${summary.claimed} 个 +${summary.totalCredit}` : `${summary.claimed} 个领取成功`)
+    //
+    // ★ 单位感知（2026-10-04）：原先写裸数字 `+${summary.totalCredit}`，
+    //   于是 ZCode 那行显示 `1 个 +100000000` —— 既看不出单位，量级也读不出来。
+    //   用户给的期望形态是 `+100Mtoken`（见 `credits.ts` 的 `formatClaimGains`）。
+    const amounts = formatClaimGains(summary.totalByUnit ?? { credit: summary.totalCredit })
+    parts.push(amounts === null ? `${summary.claimed} 个领取成功` : `${summary.claimed} 个 ${amounts}`)
   }
   if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今天已领`)
   if (summary.failed > 0) parts.push(`${summary.failed} 个失败`)
@@ -533,6 +557,11 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       }
       totals.claimed += summary.claimed
       totals.totalCredit += summary.totalCredit
+      // ★ 按单位累加（2026-10-04）：`totalByUnit` 缺省时回落到「全部按积分」，
+      //   兼容尚未上报该字段的旧宿主响应 —— 与 `coversToday` 的兜底同思路。
+      const byUnit = summary.totalByUnit ?? { credit: summary.totalCredit, token: 0 }
+      totals.totalByUnit.credit += Number(byUnit.credit) || 0
+      totals.totalByUnit.token += Number(byUnit.token) || 0
       totals.alreadyClaimed += summary.alreadyClaimed
       totals.inactive += summary.inactive
       totals.failed += summary.failed
