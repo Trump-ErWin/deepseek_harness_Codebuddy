@@ -2045,6 +2045,187 @@ describe('BuddyAdapter 账号池限流切换', () => {
     expect(sentTokens).toEqual(['AT1', 'AT2', 'AT3'])
     expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
   })
+
+  /**
+   * 模型饱和（14003）—— **不换号、不标记、留在本账号退避重试**
+   * （真实缺陷，用户报障 2026-10-05）
+   *
+   * ## 为什么这一组是「行为级」而非「纯函数级」
+   *
+   * `isModelSaturationError` 的纯函数用例（`buddy-model-saturation.spec.ts`）
+   * 只证明判据本身对。但**缺陷的成因是判据顺序**：
+   * `14003` **也是 HTTP 429**，而 `isRateLimited` 对 429 无条件为 true ——
+   * 只要饱和判定晚于限流分支一步，整池就会被写上 1 小时标记。
+   * 所以必须在**真实 `stream()` 调用流**里断言
+   * 「`updateModelRateLimit` 一次都没被调用」+「`getAvailableAccount` 没被调用」。
+   *
+   * 用户症状：第一次用 `buddy/space-bunny` 就报「所有账号均受限」，
+   * 而 4 个账号凭据全部有效、服务端实测完全可用。
+   */
+  describe('模型饱和（14003）不换号、不标记', () => {
+    /** 实测原文（4 MB 输入逼出，`scripts/probe-buddy-error-catalog.mjs`）。 */
+    function saturationBody(): string {
+      return JSON.stringify({
+        code: 14003,
+        msg: 'too many requests',
+        requestId: 'ac2ff1af-6d6b-49b4-8614-14981aed34d8',
+        displayMsg: { en: 'Model busy. Please switch models or retry later', zh: '模型繁忙，请换模型或稍后重试' },
+        displayTips: {
+          en: 'This model is currently saturated. It is not a network issue.',
+          zh: '这个模型当前请求量饱和，与你的网络无关。请换个模型，或稍等一会儿再重试。',
+        },
+        actions: ['SWITCH_MODEL', 'SUBMIT_FEEDBACK', 'RETRY'],
+      })
+    }
+
+    /**
+     * 记录「换号 / 标记」两类副作用的轻量池替身。
+     *
+     * ⚠️ 与上面 `makePool` 的差别：这里两个副作用各自计数，因为本组用例的
+     * **核心断言就是「两者都必须为 0」** —— 只记录标记会漏掉「白换号」
+     * （那也是缺陷的一面：换号会让 4 个可用账号被逐个浪费）。
+     */
+    function makeCountingPool(current: { id: string; token: string }, candidates: Array<{ id: string; token: string }>) {
+      const known = [current, ...candidates]
+      const queue = [...candidates]
+      return {
+        marked: [] as Array<{ accountId: string; modelId: string; resetAtMs: number }>,
+        rotations: 0,
+        async findAccountIdByCredential(_provider: string, identity: string) {
+          return known.find((a) => a.token === identity)?.id ?? ''
+        },
+        async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number) {
+          this.marked.push({ accountId, modelId, resetAtMs })
+        },
+        async getAvailableAccount() {
+          this.rotations += 1
+          const next = queue.shift()
+          if (next === undefined) return null
+          return { entry: { id: next.id }, credential: makeCredential({ access_token: next.token }) }
+        },
+      }
+    }
+
+    it('⚠️ 饱和重试用尽后：**不写限流标记**，且**不切换账号**（缺陷本体）', async () => {
+      // 退避压到 0 毫秒，让用例毫秒级完成（0 是合法值，见 buddySaturationDelayMs）。
+      process.env.DSH_BUDDY_SATURATION_DELAY_MS = '0'
+      try {
+        const pool = makeCountingPool(
+          { id: 'acct-1', token: 'AT1' },
+          [{ id: 'acct-2', token: 'AT2' }, { id: 'acct-3', token: 'AT3' }],
+        )
+        const sentTokens: string[] = []
+        const adapter = new BuddyAdapter({
+          credentialRef: CREDENTIAL_REF,
+          resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+          refresh: async () => {},
+          accountPool: pool as never,
+          fetchImpl: async (_url, init) => {
+            const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+            sentTokens.push(auth.replace('Bearer ', ''))
+            // 始终饱和 —— 复刻「所有账号撞同一堵墙」的真实形态。
+            return new Response(saturationBody(), { status: 429 })
+          },
+        })
+
+        let thrown: unknown
+        try {
+          await collectChunks(adapter, {
+            model: 'space-bunny',
+            messages: [{ role: 'user', content: 'hi' }] as never,
+            signal: new AbortController().signal,
+          } as never)
+        } catch (error) { thrown = error }
+
+        // ① 关键断言：**一次标记都没写**（写一条就锁 1 小时，写 N 条就锁整池）
+        expect(pool.marked, '饱和绝不能写限流标记 —— 那会把整池锁 1 小时').toEqual([])
+        // ② 关键断言：**没有换号**（饱和是模型级，换号无益，只会白烧可用账号）
+        expect(pool.rotations, '饱和绝不能换号 —— 池里账号会撞同一堵墙').toBe(0)
+        // ③ 只在本账号重试：1 次首发 + 2 次退避重试，token 始终是 AT1
+        expect(sentTokens).toEqual(['AT1', 'AT1', 'AT1'])
+        // ④ 报错必须指向「换模型」这个唯一有效动作，且**不许**说成账号额度受限
+        const message = String((thrown as Error | undefined)?.message ?? '')
+        expect(message).toContain('请求量饱和')
+        expect(message).toContain('换')          // 「请改用其它模型」
+        expect(message).toContain('无需重新登录')
+        expect(message).not.toContain('所有账号均受限')
+        // ⑤ 错误码用 RATE_LIMIT（可重试），不是 QUOTA_EXCEEDED（= 账号额度用尽，确定性）
+        expect((thrown as { code?: string } | undefined)?.code).toBe('RATE_LIMIT')
+      } finally {
+        delete process.env.DSH_BUDDY_SATURATION_DELAY_MS
+      }
+    })
+
+    it('饱和后**恢复**：重试期间转好则正常产出内容（不换号、不标记）', async () => {
+      process.env.DSH_BUDDY_SATURATION_DELAY_MS = '0'
+      try {
+        const pool = makeCountingPool({ id: 'acct-1', token: 'AT1' }, [{ id: 'acct-2', token: 'AT2' }])
+        let attempt = 0
+        const adapter = new BuddyAdapter({
+          credentialRef: CREDENTIAL_REF,
+          resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+          refresh: async () => {},
+          accountPool: pool as never,
+          fetchImpl: async () => {
+            attempt += 1
+            // 第 1 发饱和，第 2 发（退避后）已恢复 —— 与真实「瞬时背压」一致。
+            if (attempt === 1) return new Response(saturationBody(), { status: 429 })
+            return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+          },
+        })
+
+        const chunks = await collectChunks(adapter, {
+          model: 'space-bunny',
+          messages: [{ role: 'user', content: 'hi' }] as never,
+          signal: new AbortController().signal,
+        } as never)
+
+        expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+        expect(pool.marked).toEqual([])
+        expect(pool.rotations).toBe(0)
+        expect(attempt).toBe(2)
+      } finally {
+        delete process.env.DSH_BUDDY_SATURATION_DELAY_MS
+      }
+    })
+
+    it('⚠️ 额度限流 6004 的既有行为**不许**被本修复改回退（换号 + 标记仍然生效）', async () => {
+      // 反向保护：饱和判定若写得太宽，会把这个用例吃掉 —— 那意味着
+      // 「账号额度用完」不再换号，用户永远等不到其它可用账号。
+      const pool = makeCountingPool(
+        { id: 'acct-1', token: 'AT1' },
+        [{ id: 'acct-2', token: 'AT2' }],
+      )
+      const sentTokens: string[] = []
+      const adapter = new BuddyAdapter({
+        credentialRef: CREDENTIAL_REF,
+        resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool as never,
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          const token = auth.replace('Bearer ', '')
+          sentTokens.push(token)
+          if (token === 'AT2') {
+            return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+          }
+          return new Response(rateLimitBody(), { status: 429 })
+        },
+      })
+
+      const chunks = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never)
+
+      // 6004 必须仍然换号，并为失败账号留下标记
+      expect(sentTokens).toEqual(['AT1', 'AT2'])
+      expect(pool.marked.length).toBeGreaterThan(0)
+      expect(pool.marked[0]?.accountId).toBe('acct-1')
+      expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    })
+  })
 })
 
 /** 端点常量供测试断言引用（避免硬编码字符串漂移）。 */

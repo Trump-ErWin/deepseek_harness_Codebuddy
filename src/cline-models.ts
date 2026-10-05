@@ -190,6 +190,10 @@ export function parseClineRemoteModelIds(value: unknown): string[] {
  * 3. 远端 `/models` 的其余 id（**放最后**，它们只有裸 id、无元数据，
  *    且数量达 460 个 —— 放前面会把免费模型挤到看不见）。
  *
+ * ⚠️ **兜底表不是无条件并入的**：远端成功下发目录时，兜底表里「远端已不认识」
+ * 的条目会被丢弃（那是上游下架的模型），只在远端不可用时才整表保底。
+ * 判据与理由见下面第 2 步的注释。
+ *
  * 元数据优先级：兜底表（有 `contextWindow` / `maxTokens` / `capabilities`）
  * > 远端 `free`/`recommended` 的 `description`/`name` > 由 id 派生的名字。
  */
@@ -229,7 +233,28 @@ export function mergeClineModels(
   // 1) 远端 `free` 数组（最权威的免费集合，且顺序有意义）。
   for (const id of remote.freeIds) push(id)
   // 2) 兜底表（内嵌目录之外的补充条目，离线时也可见）。
-  for (const model of product.fallbackModels) push(model.id)
+  //
+  // ⚠️ **远端已给出权威目录时，兜底表只用于给远端仍认识的条目补元数据**，
+  // 不再新增远端不认识的条目 —— 后者意味着该模型已被上游下架，并回列表会让
+  // 用户看到一个标着「免费」的模型、选中却回 `404 {"error":"model not found"}`
+  // （真实报障：`cline-free/deepseek-v4.1-flash` 于 2026-10-05 从 `free` 数组
+  // 移除后，仍在模型列表里以「免费」出现，且**重启也不会消失** —— 合并发生在
+  // 每次全新加载时）。
+  //
+  // 判据用 `entries` 非空，**不是** `freeIds` 非空：`entries` 由
+  // `recommended-models` 的 free/recommended/clinePass 三者拼成（该端点失败时
+  // 三者皆空），而 `freeIds` 在上游把免费模型**全部**下架时也合法为空 ——
+  // 只看它会把「全撤」误判成「端点挂掉」，反而保留整张兜底表。
+  //
+  // 远端不可用时（离线 / 两个端点全挂）保持原样：此时兜底表仍是免费模型的
+  // **唯一**来源，过滤掉它就等于让用户看不到任何免费模型。
+  const remoteKnownIds = remote.entries.length > 0
+    ? new Set([...remote.freeIds, ...remote.entries.map((entry) => entry.id), ...remote.remoteIds])
+    : undefined
+  for (const model of product.fallbackModels) {
+    if (remoteKnownIds !== undefined && !remoteKnownIds.has(model.id)) continue
+    push(model.id)
+  }
   // 3) `recommended` / `clinePass` 里出现但上面没覆盖的（保持可发现性）。
   for (const entry of remote.entries) push(entry.id)
   // 4) 远端 `/models` 的其余 id（数量大，放最后）。

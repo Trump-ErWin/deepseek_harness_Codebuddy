@@ -259,6 +259,24 @@ const STYLES = `
 .dim-jh-modelRow:hover { background: var(--dsw-alias-bg-layer-2, #f7f8fa); }
 /* 已关闭的模型整体降透明度：一眼能看出哪些被隐藏了 */
 .dim-jh-modelRow[data-disabled="true"] .dim-jh-modelInfo { opacity: 0.5; }
+
+/* 「供应商开关」弹窗的行拖拽（2026-10-06）。
+   视觉语言与账号卡片（.dim-jh-accountCard[data-dragging] 系）完全一致：
+   源行淡出虚线、落点行画插入线。
+   ⚠️ 这几行**必须带 .dim-jh-modal 作用域前缀**：.dim-jh-modelRow 是共享类名，
+   ModelToggle（模型列表弹窗）与 GatewayPanel 也在用它们。那些行不设
+   data-dropBefore/After，伪元素无 content 故不渲染，但给它们挂 position:relative
+   仍是作用域过宽 —— 将来任一处加 absolute 子元素都会莫名受影响。
+   与既有的 .dim-jh-modal .dim-jh-probeNotice 同一收窄惯例。
+   ⚠️⚠️ 本文件整体是一个 JS **模板字符串**：注释里**禁止**出现反引号，
+   否则会提前终止字符串、把后面的 CSS 当成代码解析（实测报 TS2304）。 */
+.dim-jh-modal .dim-jh-modelRow { position: relative; }
+.dim-jh-modal .dim-jh-modelRow[data-dragging="true"] { opacity: 0.4; border-style: dashed; }
+.dim-jh-modal .dim-jh-modelRow[data-dropBefore="true"]::before { content: ''; position: absolute; left: 0; right: 0; top: -5px; height: 3px; border-radius: 2px; background: #1677ff; }
+.dim-jh-modal .dim-jh-modelRow[data-dropAfter="true"]::after { content: ''; position: absolute; left: 0; right: 0; bottom: -5px; height: 3px; border-radius: 2px; background: #1677ff; }
+/* 拖拽柄在弹窗行里略收窄：行高比账号卡片矮（padding 7px vs 14px），
+   16px 宽的柄会顶着模型名，缩到 14px 并把 gap 让出来。 */
+.dim-jh-modal .dim-jh-modelRow .dim-jh-dragHandle { width: 14px; }
 .dim-jh-modelInfo { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
 /* 名称与 id 都必须能收缩（min-width: 0 + 可收缩的 flex-basis），否则长内容会
    顶宽整行。展示名优先保留，故 id 另加 max-width 上限。
@@ -271,6 +289,58 @@ const STYLES = `
    哪些模型能发图，不必靠撞一次 unsupported_content 才发现。
    flex: none 是必需的 —— 它是行尾的固定标签，参与收缩会被 id/name 挤没。 */
 .dim-jh-modelBadge { flex: none; padding: 1px 6px; border-radius: 5px; background: var(--dsw-alias-color-success-light, #e8ffea); color: var(--dsw-alias-color-success, #00875a); font-size: 11px; line-height: 16px; white-space: nowrap; }
+
+/* ── 已下架（失效）模型（2026-10-06 复审 !66）──
+   ⚠️ **必须放在上面 .dim-jh-modelName / .dim-jh-modelId 基础规则之后**：
+   tests/unit/model-filter.spec.ts 的 ruleOf() 按**源码顺序**取第一条匹配规则，
+   把带 [data-dead] 的规则写在前面会让它误取到本块、跳过基础规则。
+   ⚠️⚠️ **本块内禁止出现反引号**（AGENTS.md 红线：样式是模板字符串，注释里的
+   反引号会提前闭合模板；tests/unit/zcode-channel-dialog.spec.ts 有专门用例守着）。
+   与「已关闭」**必须视觉可区分**：一个是用户的主动选择（开关可拨回），
+   一个是系统判定上游已移除（只能点「重新显示」恢复）。若长得一样，用户会去拨
+   那个根本不存在的开关，于是以为「模型被吞了、插件有 bug」。
+   ⇒ 用左侧警示竖条 + 琥珀色角标，与「已关闭」的纯淡出区分开。 */
+.dim-jh-modelRow[data-dead="true"] { box-shadow: inset 3px 0 0 var(--dsw-alias-warning, #d48806); }
+.dim-jh-modelRow[data-dead="true"] .dim-jh-modelInfo { opacity: 1; }
+.dim-jh-modelRow[data-dead="true"] .dim-jh-modelName { color: var(--dsw-alias-warning, #d48806); }
+.dim-jh-modelDead {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-warning, #d48806);
+  background: color-mix(in srgb, var(--dsw-alias-warning, #d48806) 12%, transparent);
+}
+.dim-jh-modelRestore {
+  flex: none;
+  padding: 2px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--dsw-alias-text-secondary, #4e5969);
+  background: var(--dsw-alias-bg-layer-2, #f7f8fa);
+  border: 1px solid var(--dsw-alias-border-l2, #dfe1e5);
+  cursor: pointer;
+}
+.dim-jh-modelRestore:hover:not(:disabled) {
+  color: #1677ff;
+  border-color: color-mix(in srgb, #1677ff 40%, var(--dsw-alias-border-l2, #dfe1e5));
+}
+.dim-jh-modelRestore:disabled { opacity: 0.5; cursor: default; }
+/* 顶部批量恢复条 */
+.dim-jh-modelDeadBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 6px 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--dsw-alias-text-secondary, #4e5969);
+  background: color-mix(in srgb, var(--dsw-alias-warning, #d48806) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-warning, #d48806) 26%, transparent);
+}
 
 /* ── 思考档位对照表 ──
    与模型清单的行**刻意不同**：那两行的 id/name 用 ellipsis 截断（清单要紧凑），
@@ -447,6 +517,52 @@ const STYLES = `
 .dim-jh-gatewayModal .dim-jh-modelInfo > .dim-jh-modelName { flex: none; }
 /* 搜索/空结果的容器：与对照表的 .dim-jh-effortEmpty 同款观感。 */
 .dim-jh-gatewayEmpty { padding: 8px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+
+/* ── 「Token 用量」弹窗（渠道 × provider × 模型 三级汇总 + 最近明细）──
+   数据来自本机内存账本（usage.tokenLedger），记账点在注册收敛层。
+   卡片结构与网关弹窗的供应商卡片同一规格语言（细边框 + 圆角 + 吸顶头），
+   但不吸顶：本弹窗层级只有两级，吸顶收益小于复杂度。
+   ⚠️ 本文件整体是 JS 模板字符串，注释里绝不能出现反引号 —— 类名一律裸写。 */
+.dim-jh-ledgerFilters { display: flex; gap: 6px; margin-bottom: 8px; }
+.dim-jh-ledgerFilterBtn { padding: 2px 10px; font-size: 11.5px; line-height: 17px; border-radius: 999px; opacity: .72; }
+.dim-jh-ledgerFilterBtn[data-active="true"] { opacity: 1; font-weight: 600; }
+.dim-jh-ledgerCard { min-width: 0; border: .5px solid var(--dsw-alias-border-l3, #e5e5e5); border-radius: 10px; overflow: hidden; }
+.dim-jh-ledgerCardHead { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; padding: 7px 10px; background: var(--dsw-alias-bg-layer-2, #f7f8fa); border-bottom: .5px solid var(--dsw-alias-border-l3, #e5e5e5); }
+.dim-jh-ledgerCardHead strong { font-size: 12.5px; line-height: 18px; color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-ledgerCardSum { margin-left: auto; font-size: 11.5px; line-height: 17px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary, #4e5969); white-space: nowrap; }
+.dim-jh-ledgerProvider { padding: 4px 10px 6px; }
+.dim-jh-ledgerProvider + .dim-jh-ledgerProvider { border-top: .5px solid var(--dsw-alias-border-l3, #eef0f3); }
+/* 账号层（第 2 期）：只在多账号（或含「未归属」）时渲染，缩进一层；
+   单账号 provider 不展开 —— 一比一的中间层是纯噪音。 */
+.dim-jh-ledgerAccount { min-width: 0; }
+.dim-jh-ledgerAccount + .dim-jh-ledgerAccount { border-top: .5px dashed var(--dsw-alias-border-l3, #eef0f3); }
+.dim-jh-ledgerAccountHead { display: flex; align-items: baseline; gap: 8px; padding: 3px 0 1px 8px; }
+.dim-jh-ledgerAccountName { min-width: 0; font-size: 11.5px; line-height: 17px; font-weight: 600; color: var(--dsw-alias-label-secondary, #4e5969); overflow-wrap: anywhere; }
+.dim-jh-ledgerAccountSum { margin-left: auto; flex: none; font-size: 11px; line-height: 16px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
+.dim-jh-ledgerProviderHead { display: flex; align-items: baseline; gap: 8px; padding: 4px 0 2px; }
+.dim-jh-ledgerProviderName { min-width: 0; font-size: 12px; line-height: 18px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); overflow-wrap: anywhere; }
+.dim-jh-ledgerProviderSum { margin-left: auto; flex: none; font-size: 11px; line-height: 16px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
+.dim-jh-ledgerModel { display: flex; align-items: baseline; gap: 8px; min-width: 0; padding: 2px 0 2px 10px; }
+.dim-jh-ledgerModelName { flex: 1 1 auto; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 17px; color: var(--dsw-alias-label-secondary, #4e5969); overflow-wrap: anywhere; }
+.dim-jh-ledgerModelReq { flex: none; font-size: 11px; line-height: 16px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
+.dim-jh-ledgerModelTokens { flex: none; font-size: 11.5px; line-height: 17px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-primary, #1f2329); white-space: nowrap; }
+/* 均值格（首字 · 速率）：三级汇总行（渠道/账号/模型）共用，等宽数字对齐。 */
+.dim-jh-ledgerPerf { flex: none; font-size: 11px; line-height: 16px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
+/* ── 历史视图（第 4 期）：趋势柱状图 + 展开的日聚合树 ──
+   柱状图用纯 div（不引图表库）：每根柱 = 一天，高度按相对最大值的百分比。 */
+.dim-jh-ledgerSection { margin-bottom: 14px; }
+.dim-jh-ledgerSectionTitle { font-size: 13px; line-height: 19px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); margin-bottom: 6px; }
+.dim-jh-ledgerTrend { display: flex; align-items: flex-end; gap: 3px; height: 64px; padding: 4px 2px 0; overflow-x: auto; }
+.dim-jh-ledgerTrendCol { flex: 1 0 14px; min-width: 14px; height: 100%; display: flex; align-items: flex-end; cursor: pointer; }
+.dim-jh-ledgerTrendBar { width: 100%; min-height: 2px; border-radius: 3px 3px 0 0; background: var(--dsw-alias-brand-primary, #1677ff); opacity: .45; transition: opacity .12s ease; }
+.dim-jh-ledgerTrendBar:hover { opacity: .75; }
+.dim-jh-ledgerTrendBar[data-today="true"] { opacity: .9; }
+.dim-jh-ledgerTrendBar[data-active="true"] { opacity: 1; outline: 1.5px solid var(--dsw-alias-brand-primary, #1677ff); }
+/* 明细表：紧凑小字；模型列允许换行（长 wire 名不能截断 —— 网关弹窗同一条教训）。 */
+.dim-jh-ledgerTable { width: 100%; margin-top: 10px; border-collapse: collapse; font-size: 11.5px; line-height: 17px; }
+.dim-jh-ledgerTable th { position: sticky; top: 0; z-index: 1; padding: 4px 6px; text-align: left; font-weight: 600; color: var(--dsw-alias-label-tertiary, #8f959e); background: var(--dsw-alias-bg-layer-1, #fff); border-bottom: .5px solid var(--dsw-alias-border-l3, #e5e5e5); }
+.dim-jh-ledgerTable td { padding: 3px 6px; border-bottom: .5px solid var(--dsw-alias-border-l3, #f0f1f3); font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary, #4e5969); vertical-align: baseline; }
+.dim-jh-ledgerTable .dim-jh-ledgerEntryModel { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dsw-alias-label-primary, #1f2329); overflow-wrap: anywhere; }
 
 /* ── 模型列表的「计费/来源」分组（订阅 / 免费 / Cline Cloud / 按量计费）──
    分组由 model-groups.js 的纯函数决定（判据见其模块注释）；这里只管观感。

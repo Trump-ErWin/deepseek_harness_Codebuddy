@@ -52,6 +52,7 @@ import {
 import { buildProxyDispatcher } from './opencode-proxy.js'
 import { consumeOpenAiSse, collectImages, httpErrorCode, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
+import { reportLedgerAccount } from './token-ledger.js'
 import { retryAfterMsFromResponse } from './retry-after.js'
 
 /** 目录条目（远端与兜底共用的输出形状）。 */
@@ -398,6 +399,8 @@ export class OpencodeAdapter extends LlmAdapter {
         )
       }
       tried.add(slot.id)
+      // Token 账本（第 2 期）：回报「本笔请求实际使用的槽」（匿名槽 = 'anonymous'）。
+      reportLedgerAccount(OPENCODE.id, slot.id)
 
       let delivered = false
       try {

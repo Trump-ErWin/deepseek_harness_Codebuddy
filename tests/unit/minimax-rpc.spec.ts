@@ -51,7 +51,7 @@ describe('接线点完整性（源码断言）', () => {
     // 4. refreshTargets 表
     expect(indexSource).toContain("['minimax', (p) => minimax.refreshAll(p)]")
     // 5. modelAdapters 登记
-    expect(indexSource).toContain('minimax: minimaxAdapter')
+    expect(indexSource).toMatch(/minimax: pruned\([^)]*,\s*minimaxAdapter\)/)
     // 6. registerJetHubRpc 实参（⚠️ 2026-09-30 合并后 zcode 排在 minimax 之后；
     //    2026-10-03 加 gemini 时按「新 provider 追加在末尾」的惯例排在 zcode 之后）
     expect(indexSource).toMatch(/loomy, raccoon, minimax, zcode, gemini, modelAdapters/)

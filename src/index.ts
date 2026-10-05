@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
-import { registerCodeArtsLlm } from './llm-adapter.js'
+import { registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
 import { registerLobsteraiLlm } from './lobsterai-adapter.js'
 import { registerQoderLlm } from './qoder-adapter.js'
@@ -34,12 +34,18 @@ import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { installLoopResume } from './loop-recovery.js'
+import {
+  attachTokenLedgerStore,
+  reportLedgerAccount,
+} from './token-ledger.js'
+import { createTokenLedgerStore } from './token-ledger-store.js'
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 import { BuddyBalanceSelector, pickBuddyAccount } from './buddy-balance-selector.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
+import { configureDeadModelStore, withDeadModelPruning } from './dead-model-store.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
@@ -283,6 +289,35 @@ export function apply(ctx: Context): void {
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
+
+  // 「已失效模型」剔除：注入 ctx 只为把日志接进 DSH logger 并复用同一份 home
+  // 解析。必须在任何 `registerXxxLlm` 之前调用 —— 各适配器经
+  // `registerAdapterIdempotent` 注册时就会包装上剔除逻辑（见该函数注释）。
+  configureDeadModelStore(ctx)
+
+  // ===== Token 账本持久化（第 2 期 · 日聚合落盘）=====
+  //
+  // ⚠️ 账本本体是模块级单例（`token-ledger.ts`），没有 ctx 可拿 —— 故在启动时
+  // 把后端挂进去（`attachTokenLedgerStore`）。挂载发生在**任何适配器注册之前**：
+  // 启动早期就有模型请求（标题生成等）时，落盘已在位。
+  //
+  // ⚠️ 后端契约是**绝不抛错**（`recordTokenUsage` 的调用点在推理关键路径上，
+  // 见其函数注释），`FileLedgerStore` 内部已按此实现。
+  //
+  // ⚠️ dispose **必须用返回的 disposer**（不能无条件 `attach(undefined)`）：
+  // 插件 fiber 重启时新 apply 与旧 fiber 的异步 dispose **交错执行**
+  //（本仓库已确证的事故，见 `llm-register-compat.ts` 模块头），无条件摘会把
+  // **新实例刚挂上**的后端摘空 ⇒ 落盘停摆且历史视图恒为空。disposer 自带所有权
+  // 校验（只摘自己的），并顺带 `flush` 当前这份数据。
+  const tokenLedgerStore = createTokenLedgerStore(ctx)
+  const detachTokenLedger = attachTokenLedgerStore(tokenLedgerStore)
+  ctx.effect(() => () => {
+    try {
+      tokenLedgerStore.flush()
+    } finally {
+      detachTokenLedger()
+    }
+  }, 'token-ledger-persistence')
 
   // WorkBuddy provider 已从中国版（copilot.tencent.com）改造为国际版
   // （www.workbuddy.ai）。旧账号存的是中国版凭据，其 token.domain 指向旧端点，
@@ -528,7 +563,11 @@ export function apply(ctx: Context): void {
       // 传空串会让 `getAvailableAccount` 的限流过滤整体短路
       //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中。
       const available = await pool.getAvailableAccount(CODEBUDDY.id, modelId ?? '', picked.tried)
-      if (available) return available.credential as BuddyCredential
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      if (available) {
+        reportLedgerAccount(CODEBUDDY.id, available.entry.id)
+        return available.credential as BuddyCredential
+      }
       // 退到单凭据 ref 之前先证明失败原因：全被模型限流时报明确的限流错误，
       // 而不是让它降级成误导性的 MISSING_CREDENTIAL（见该助手的说明）。
       throwIfAllAccountsRateLimited(CODEBUDDY, modelId)
@@ -579,7 +618,11 @@ export function apply(ctx: Context): void {
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
       // provider 实参用 WORKBUDDY.id 而非字面量 'workbuddy'（同类坑见上）。
       const available = await pool.getAvailableAccount(WORKBUDDY.id, modelId ?? '', picked.tried)
-      if (available) return available.credential as BuddyCredential
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      if (available) {
+        reportLedgerAccount(WORKBUDDY.id, available.entry.id)
+        return available.credential as BuddyCredential
+      }
       // 同 buddy：区分「全部限流」与「真的没登录」（见该助手的说明）。
       throwIfAllAccountsRateLimited(WORKBUDDY, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(WORKBUDDY.defaultCredentialRef))
@@ -615,7 +658,11 @@ export function apply(ctx: Context): void {
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
       const available = await pool.getAvailableAccount(LOBSTERAI.id, modelId ?? '')
-      if (available) return available.credential as LobsteraiCredential
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      if (available) {
+        reportLedgerAccount(LOBSTERAI.id, available.entry.id)
+        return available.credential as LobsteraiCredential
+      }
       const resolved = await ctx.credentials.resolve(credentialRef(LOBSTERAI.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -686,6 +733,8 @@ export function apply(ctx: Context): void {
       const available = await pool.getAvailableAccount(QODER.id, modelId ?? '')
       if (available) {
         activeQoderAccountId.set(QODER.id, available.entry.id)
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        reportLedgerAccount(QODER.id, available.entry.id)
         return available.credential as QoderCredential
       }
       // 回退到单凭据路径：没有账号条目可标记，清空以免标记到过期的 id。
@@ -743,6 +792,8 @@ export function apply(ctx: Context): void {
       const available = await pool.getAvailableAccount(QODER_CN.id, modelId ?? '')
       if (available) {
         activeQoderAccountId.set(QODER_CN.id, available.entry.id)
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        reportLedgerAccount(QODER_CN.id, available.entry.id)
         return available.credential as QoderCredential
       }
       activeQoderAccountId.set(QODER_CN.id, undefined)
@@ -790,7 +841,11 @@ export function apply(ctx: Context): void {
       //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中，
       // 换号形同虚设（用户报障「没有切换」的根因之一）。
       const available = await pool.getAvailableAccount(TRAE.id, modelId ?? '')
-      if (available) return available.credential as TraeCredential
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      if (available) {
+        reportLedgerAccount(TRAE.id, available.entry.id)
+        return available.credential as TraeCredential
+      }
       const resolved = await ctx.credentials.resolve(credentialRef(TRAE.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -843,6 +898,8 @@ export function apply(ctx: Context): void {
       const available = await pool.getAvailableAccount(CLINE.id, modelId ?? '')
       // 记录实际选中的池账号（空串 = 回退到单凭据 ref 模式，见适配器注释）。
       activeClineAccountId = available?.entry.id ?? ''
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+      if (activeClineAccountId.length > 0) reportLedgerAccount(CLINE.id, activeClineAccountId)
       if (available) return available.credential as ClineCredential
       // ⚠️ 与 buddy / workbuddy 同因（真实缺陷，2026-10-03 用户报障）：
       // 唯一的 cline 账号被**模型级限流**标记挡住时，候选会筛成空集，最终降级成
@@ -963,7 +1020,11 @@ export function apply(ctx: Context): void {
         const picked = await loomyBalanceSelector.select(candidates, { allowPermanent })
         if (picked.ok) {
           const credential = await resolveLoomyCredentialByRef(picked.account.credentialRef)
-          if (credential !== undefined) return credential
+          // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+          if (credential !== undefined) {
+            reportLedgerAccount(LOOMY.id, picked.account.id)
+            return credential
+          }
         } else if (!allowPermanent) {
           // ⚠️ **锁定时绝不可落到下面的单凭据兜底** —— 那会绕过锁定、
           // 照样消耗永久积分，锁定形同虚设。这里直接抛明确错误（用户要求）。
@@ -1059,7 +1120,11 @@ export function apply(ctx: Context): void {
       // `getAvailableAccount` 的凭据类型是 `CodeArtsCredential | BuddyCredential`
       // 联合（历史遗留），与 `RaccoonCredential` 无充分重叠，故经 `unknown` 转换。
       // 运行时安全性由 provider 过滤保证：查询用 `RACCOON.id`，取到的必是 raccoon 凭据。
-      if (available) return available.credential as unknown as RaccoonCredential
+      if (available) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        reportLedgerAccount(RACCOON.id, available.entry.id)
+        return available.credential as unknown as RaccoonCredential
+      }
       const resolved = await ctx.credentials.resolve(credentialRef(RACCOON.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1124,7 +1189,11 @@ export function apply(ctx: Context): void {
       // `getAvailableAccount` 的凭据类型是 `CodeArtsCredential | BuddyCredential`
       // 联合（历史遗留），与 `MinimaxCredential` 无充分重叠，故经 `unknown` 转换。
       // 运行时安全性由 provider 过滤保证：查询用 `MINIMAX.id`，取到的必是 minimax 凭据。
-      if (available) return available.credential as unknown as MinimaxCredential
+      if (available) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        reportLedgerAccount(MINIMAX.id, available.entry.id)
+        return available.credential as unknown as MinimaxCredential
+      }
       const resolved = await ctx.credentials.resolve(credentialRef(MINIMAX.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1199,6 +1268,9 @@ export function apply(ctx: Context): void {
   // 不注册斜杠命令：入口在 Jet Hub 的 Gemini 面板。
   const gemini = new GeminiAuth(ctx)
   const geminiSigStore = createGeminiSigStore(ctx)
+  // ⚠️ 项目号探测缓存必须**在这里建一次、长期复用** —— 每次 `stream()` 现造
+  // 等于没有跨请求缓存，每轮推理都会多打一次 `loadCodeAssist`。
+  const geminiProjectCache = new Map<string, string>()
   const geminiAdapter = registerGeminiLlm(ctx, {
     credentialRef: credentialRef(GEMINI.defaultCredentialRef),
     resolveCredential: async (modelId?: string) => {
@@ -1208,7 +1280,11 @@ export function apply(ctx: Context): void {
       // `getAvailableAccount` 的凭据类型是历史遗留的联合类型，与
       // `GeminiCredential` 无充分重叠，故经 `unknown` 转换；运行时安全性由
       // provider 过滤保证（查询用 `GEMINI.id`，取到的必是 gemini 凭据）。
-      if (available) return available.credential as unknown as GeminiCredential
+      if (available) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        reportLedgerAccount(GEMINI.id, available.entry.id)
+        return available.credential as unknown as GeminiCredential
+      }
       const resolved = await ctx.credentials.resolve(credentialRef(GEMINI.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1243,6 +1319,19 @@ export function apply(ctx: Context): void {
     sigStore: geminiSigStore,
     accountPool: pool,
     product: GEMINI,
+    // 项目号：缺省**自动探测**（`loadCodeAssist` 的 `cloudaicompanionProject`），
+    // 不是恒为 `aicode-consumers`（那只是探测为空时的兜底）。
+    projectCache: geminiProjectCache,
+    persistProject: async (value: string) => {
+      // ⚠️ 回写到**解析凭据时所用的那个账号**，不是默认单凭据 ref ——
+      // 写错对象会让另一个账号的凭据被污染。
+      const available = await pool.getAvailableAccount(GEMINI.id, '')
+      const ref = available
+        ? available.entry.credentialRef
+        : credentialRef(GEMINI.defaultCredentialRef)
+      await ctx.credentials.set(credentialRef(ref), value)
+    },
+    ...ctx.logger === undefined ? {} : { logger: ctx.logger },
   })
 
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
@@ -1267,9 +1356,9 @@ export function apply(ctx: Context): void {
 // ===== ZCode（智谱 z.ai 免费额度通道）=====
 //
 // 形态与前面所有 provider **相同**：读凭据 → 直发远端。
-// 用户只需在官方 ZCode 客户端登录一次 —— 凭据就落在
-// `~/.zcode/v2/credentials.json`（AES-256-GCM 加密，公开算法），
-// 本插件纯 Node 解密即可，**不需要任何实例常驻**。
+// 登录走**插件自己的**授权流（`zcode-login.ts`），凭据由插件写进
+// `ctx.credentials`，**不读取本机 ZCode 客户端的任何数据**（2026-10-05 决策，
+// 理由见 `zcode.ts` 文件头）。
 //
 // 与其余 provider 的三处差异（全部实测）：
 //   1. 协议是 **Anthropic Messages**（不是 OpenAI 兼容）——
@@ -1280,10 +1369,9 @@ export function apply(ctx: Context): void {
 //   3. 请求体必须带官方身份块与首轮日期块，否则上游回 `3012` ——
 //      见 `zcode-identity.ts`。
 //
-// ⚠ **可脱离官方客户端使用**：登录走官方 CLI 设备授权流
+// ⚠ **完全可脱离官方客户端使用**：登录走官方 CLI 设备授权流
 // （`/oauth/cli/init` → 浏览器授权 → `/oauth/cli/poll/{flow_id}`，
 // 纯 HTTP，见 `zcode-login.ts`），且 `device_mid` **由插件自己生成**。
-// 若机器上已装并登录过官方客户端，也会自动读取它的凭据作为回退。
 //
 // ⚠ **不可续期**：凭据是静态的（JWT 的 payload 里没有 `exp`）。
 // 失效时上游回 401/1002，适配器归为 AUTH 并提示用户重新登录。
@@ -1293,8 +1381,7 @@ export function apply(ctx: Context): void {
 //
 // ⚠ **必须把账号池传进去**：`ZcodeAuth.current()` 要从账号池里找用户在
 // Jet Hub 登录时创建的那个 ref（`ZCODE_ACCOUNT_XXXX`），而不是只认固定的
-// `ZCODE_CREDENTIAL`。不传的话「登录成功但面板显示未配置」——
-// 且该缺口会被「回退读官方凭据文件」掩盖，只有没装官方客户端的用户才看得到。
+// `ZCODE_CREDENTIAL`。不传的话「登录成功但面板显示未配置」。
 const zcode = new ZcodeAuth(ctx, {
   accountPool: pool,
   /**
@@ -1364,11 +1451,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     if (available) {
       // 记下**实际返回的**账号：额度受限时适配器要标记的是它。
       activeZcodeAccountId.set(ZCODE.id, available.entry.id)
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      reportLedgerAccount(ZCODE.id, available.entry.id)
       return available.credential as unknown as ZcodeCredential
     }
     /**
      * 账号池里没有条目时，落到 `ZcodeAuth.current()` ——
-     * 它已经实现了「插件自存优先 → 官方客户端凭据回退」。
+     * 它已经实现了「账号池 → 单凭据 ref」的解析顺序。
      * ⚠ 不要在这里重复实现那条优先级（重复必然漂移）。
      *
      * ⚠ 同时**清空**记录：没有账号条目可标记，留着旧 id 会误伤一个无辜账号。
@@ -1379,9 +1468,9 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   refresh: async () => {
     /**
      * ⚠ ZCode **没有** refresh 端点（与 Loomy 恒 false 同类，但原因不同）：
-     * 凭据是**静态**的（在官方客户端登录一次就固定下来）。
+     * 凭据是**静态**的（登录一次就固定下来，JWT 里没有 `exp`）。
      *
-     * 这里做的是「重读凭据并回写账号条目」，使官方客户端重新登录后不重启即可生效。
+     * 这里做的是「重读凭据并回写账号条目」，让用户重新登录后不重启即可生效。
      *
      * ⚠⚠ **绝不能用 `current()` + `getAvailableAccount()` 的组合**（审查发现的
      * 真实缺陷，与 `refreshAll` 里记录的那个数据破坏同类）：`current()` 会**先读池**
@@ -1476,7 +1565,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   fetchRemoteModels: () => zcode.fetchRemoteModelsOnly(),
   accountPool: pool,
   product: ZCODE,
-  // 就绪判据 = 有可用凭据（插件自存或官方客户端凭据）。
+  // 就绪判据 = 有可用凭据（插件自存的）。
   isReady: async () => (await zcode.current()) !== undefined,
   /**
    * 额度用尽 / 无权益时，适配器据此**标记失败的账号并切换**。
@@ -1584,8 +1673,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     // 与 raccoon 同款：只按 refreshable 过滤，不看 enabled。
     ['minimax', (p) => minimax.refreshAll(p)],
     // zcode **不可续期**（凭据是静态的）—— 但这个方法仍做实事：
-    // 把磁盘上最新的凭据回写到全部 zcode 账号，
-    // 使用户在官方客户端重新登录后无需重启 DSH。
+    // 把各账号 ref 下最新的凭据回写一遍，让用户重新登录后无需重启 DSH。
     // ⚠ 只按 `refreshable` 过滤、**不看 `enabled`**（AGENTS.md 既有约定）。
     ['zcode', (p) => zcode.refreshAll(p)],
     // ⚠️ Gemini **可续期**（Google OAuth 的 refresh_token，且会轮换）。
@@ -1812,23 +1900,43 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // provider → 适配器实例：Jet Hub「显示列表」需要 `listAllModels()`（不受用户
   // 黑名单影响的全量目录，带最终展示名/倍率）。DSH 的 `ctx.llm` 只保证
   // `listModels`，不透传自定义方法，故这里显式把实例传下去。
+  //
+  // ⚠️⚠️ **必须走 `withDeadModelPruning`，不能直接用 `registerXxxLlm` 的返回值**
+  // （致命缺陷，2026-10-06 复审 !66 实测）：那些函数返回的是 `new XxxAdapter(...)`
+  // —— **原始实例**，而 `registerAdapterIdempotent` 只把**代理**注册进了 `ctx.llm`。
+  // 于是 `jet-hub-rpc` 的 `model.list` 先 `await llm.listModels()`（走代理，已剔除），
+  // 紧接着又用本表的 `listAllModels()` **覆盖**成全量目录（走原始，**未剔除**）⇒
+  // 已失效模型被加回设置页，PR 想修的「用户仍看到下架模型」原问题**完全没修到**。
+  //
+  // 这里复用与注册**同一个**包装函数，确保两条路径的可见性一致。
+  // ⚠️ `codearts` 不在 `modelAdapters` 的常规形态里，但它同样需要该包装。
+  //
+  // ⚠️ 包装失败**不阻断启动**：回退到原始实例即可（它只是显示层的收敛）。
+  const pruned = <T extends object>(provider: string, adapter: T): T => {
+    try {
+      return withDeadModelPruning([provider], adapter)
+    } catch (error) {
+      ctx.logger.warn(`[jet-hub] ${provider} 的失效模型剔除包装失败，使用原适配器: ${String(error)}`)
+      return adapter
+    }
+  }
   const modelAdapters: Record<string, { listAllModels(): readonly { id: string; name: string }[] }> = {
     // `codearts` 是 registerCodeArtsLlm 返回的**适配器实例**（与 CodeArtsAuth
     // 服务实例 `service` 不同名，故这里可以简写）。
-    codearts,
-    buddy: buddyAdapter,
-    workbuddy: workbuddyAdapter,
-    lobsterai: lobsteraiAdapter,
-    qoder: qoderAdapter,
-    qodercn: qoderCnAdapter,
-    trae: traeAdapter,
-    cline: clineAdapter,
-    loomy: loomyAdapter,
-    raccoon: raccoonAdapter,
-    minimax: minimaxAdapter,
-    gemini: geminiAdapter,
-    zcode: zcodeAdapter,
-    opencode: opencodeAdapter,
+    codearts: pruned(CODEARTS_PROVIDER, codearts),
+    buddy: pruned('buddy', buddyAdapter),
+    workbuddy: pruned('workbuddy', workbuddyAdapter),
+    lobsterai: pruned(LOBSTERAI.id, lobsteraiAdapter),
+    qoder: pruned(QODER.id, qoderAdapter),
+    qodercn: pruned(QODER_CN.id, qoderCnAdapter),
+    trae: pruned(TRAE.id, traeAdapter),
+    cline: pruned(CLINE.id, clineAdapter),
+    loomy: pruned(LOOMY.id, loomyAdapter),
+    raccoon: pruned(RACCOON.id, raccoonAdapter),
+    minimax: pruned(MINIMAX.id, minimaxAdapter),
+    gemini: pruned(GEMINI.id, geminiAdapter),
+    zcode: pruned(ZCODE.id, zcodeAdapter),
+    opencode: pruned(OPENCODE.id, opencodeAdapter),
   }
 
   // 插件卸载前把签名缓存落盘：`stream()` 每次结束都 flush，但用户可能

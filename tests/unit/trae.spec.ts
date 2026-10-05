@@ -513,23 +513,66 @@ describe('多通道批量解析（batch_get_detail_param）', () => {
       expect(models[0]!.reasoningConfig?.options).toEqual(['light', 'high', 'extra_high'])
     })
 
-    it('优先级表可用第二参数覆盖', () => {
+    it('优先级表可用第二参数覆盖（⚠️ 覆盖的是**整张白名单**，不只是顺序）', () => {
       const body = batch([
         ['solo_agent', [effortEntry('glm-5.2', ['high'])]],
         ['solo_work_lite', [effortEntry('glm-5.2', ['high', 'extra_high'])]],
       ])
       expect(parseTraeBatchModelList(body)[0]!.function).toBe('solo_agent')
-      // 显式把 solo_work_lite 提到首位 → 选中它。
+      // 显式把 solo_work_lite 提为首位 → 选中它。
       expect(parseTraeBatchModelList(body, ['solo_work_lite'])[0]!.function).toBe('solo_work_lite')
+      // ⚠️ Issue IKJOZ7：该参数**同时是准入白名单**，故传只含一个通道的表会让
+      // 另一个通道的条目**整组消失**（不再是「仅降为最低优先级」）。
+      expect(parseTraeBatchModelList(body, ['solo_work_lite'])).toHaveLength(1)
     })
 
-    it('已选条目不在优先级表内时，有档位者仍胜出（档位优先于顺序）', () => {
+    it('⚠️ 通道优先级表同时是白名单：非白名单通道的条目无论内容多全都不得进目录', () => {
+      // Issue IKJOZ7。`chat` 实测在本插件的推理端点下**不可调用**
+      // （`code=4023 the model is unknown`），故即便它声明了档位也不得进目录 ——
+      // 进去就意味着「能选中、一发就失败」，而错误文案指向模型本身。
+      //
+      // ⚠️ 反向验证：把 `parseTraeBatchModelList` 里的白名单准入去掉（恢复
+      // 「channelPriority 只用于排序」的旧行为），本用例会变红（`chat` 的条目
+      // 会带着 `function: 'chat'` 出现在结果里）。
       const models = parseTraeBatchModelList(batch([
-        ['chat', [effortEntry('x', ['high'])]],
-        ['solo_agent', [effortEntry('x', ['light', 'high', 'extra_high'])]],
+        ['chat', [effortEntry('x', ['light', 'high', 'extra_high'])]],
+        ['solo_agent', [effortEntry('x', ['high'])]],
       ]))
+      expect(models).toHaveLength(1)
       expect(models[0]!.function).toBe('solo_agent')
-      expect(models[0]!.reasoningConfig?.options).toEqual(['light', 'high', 'extra_high'])
+      expect(models[0]!.reasoningConfig?.options).toEqual(['high'])
+    })
+
+    it('仅见于不可调用通道的模型被整个剔除（不留下一发就失败的条目）', () => {
+      // `kimi-k2` 实测只出现在 `inline_chat`（该通道回 `3003 model service is
+      // unavailable`）；`doubao_1_8` 只出现在 `chat`。二者都必须消失。
+      const models = parseTraeBatchModelList(batch([
+        ['inline_chat', [entry('kimi-k2')]],
+        ['chat', [entry('doubao_1_8')]],
+        ['solo_agent', [entry('glm-5.2')]],
+      ]))
+      expect(models.map((m) => m.id)).toEqual(['glm-5.2'])
+    })
+
+    it('同时出现在可调用与不可调用通道的模型被保留，且通道纠正为可调用的那个', () => {
+      // `glm-5.1` / `DeepSeek-V4-Flash` 等实测既在 `chat`（不可调用）也在
+      // `solo_coder`（可调用）。剔除不可调用通道后它**不该消失**，而应改走
+      // 可调用通道 —— 这正是「严格白名单」与「一刀切删模型」的区别。
+      const models = parseTraeBatchModelList(batch([
+        ['chat', [entry('glm-5.1')]],
+        ['solo_coder', [entry('glm-5.1')]],
+      ]))
+      expect(models.map((m) => [m.id, m.function])).toEqual([['glm-5.1', 'solo_coder']])
+    })
+
+    it('未声明 function 的组被跳过（无通道可路由 ⇒ 不该进目录）', () => {
+      const models = parseTraeBatchModelList({
+        function_configs: [
+          { config_info_list: [entry('orphan')] },
+          { function: 'solo_agent', config_info_list: [entry('ok')] },
+        ],
+      })
+      expect(models.map((m) => m.id)).toEqual(['ok'])
     })
 
     it('support_thinking:false 的条目不算「能声明档位」（与适配器判据一致）', () => {

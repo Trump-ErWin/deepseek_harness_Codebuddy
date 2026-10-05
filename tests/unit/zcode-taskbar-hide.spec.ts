@@ -140,19 +140,58 @@ describe('Linux：buildLinuxSkipTaskbarArgs', () => {
   })
 })
 
-describe('平台分派：三个平台各走哪条路', () => {
-  it('★ win32 → Windows 实现；linux → Linux 实现；darwin → 不做', () => {
+describe('平台分派：各平台走哪条路', () => {
+  it('★ win32 → Windows 实现；linux → Linux 实现；darwin → macOS 实现（osascript 最小化）', () => {
     const src = fnSource('hideWindowFromTaskbar')
     expect(src).toMatch(/platform === 'win32'[\s\S]{0,60}hideWindowWindows\(pid\)/)
     expect(src).toMatch(/platform === 'linux'[\s\S]{0,60}hideWindowLinux\(pid\)/)
-    // macOS 明确不做（并在注释里写明理由）——不应误落到某条 Linux/Windows 分支
-    expect(src).toContain('macOS')
+    // macOS 走自己的实现，且不得误落到 Windows/Linux 那两条分支上。
+    // ⚠ 只传 pid：按进程名兜底会最小化用户自己正在用的浏览器，已删除。
+    // 第二参只能是 log 回调，不可能是任何字符串 —— 故 AppleScript 里零字符串插值。
+    expect(src).toMatch(/platform === 'darwin'[\s\S]{0,60}hideWindowMacos\(pid, log\)/)
     expect(src).not.toMatch(/darwin'\s*\)\s*hideWindowWindows/)
+    expect(src).not.toMatch(/darwin'\s*\)\s*hideWindowLinux/)
+    expect(src).not.toMatch(/exeName/)
+    expect(src).not.toMatch(/hideWindowMacos\(pid, ['"]/)
   })
 
   it('★ 整个分派被 try 包住（任何平台失败都不能影响 captcha）', () => {
     const src = fnSource('hideWindowFromTaskbar')
     expect(src).toMatch(/try \{[\s\S]*hideWindowWindows[\s\S]*catch \{/)
+  })
+
+  it('★ macOS 藏窗失败必须告警（变异验证：删掉告警调用会红）', () => {
+    // ⚠ 这条守的是「失败静默」与「静默到用户无线索」之间的边界：
+    // 静默的是**对 captcha 的影响**（不能因此不可用），不是**对用户的可见性**。
+    const mac = fnSource('hideWindowMacos')
+    expect(mac).toContain("child.on('error'")
+    expect(mac).toContain("child.on('close'")
+    expect(mac).toMatch(/code !== 0[\s\S]{0,80}warnMacosHideOnce/)
+    expect(mac).toMatch(/child\.on\('error'[\s\S]{0,80}warnMacosHideOnce/)
+  })
+
+  it('★ 告警只发一次（同一进程里反复 launch 不刷屏）', () => {
+    // 一次性闸门是模块级状态，AST 取不到，故断言闸门本身被读写。
+    expect(SRC).toMatch(/let macosHideWarned = false/)
+    const warn = fnSource('warnMacosHideOnce')
+    expect(warn).toMatch(/macosHideWarned\s*\)/) // 读：已告警则跳过
+    expect(warn).toMatch(/macosHideWarned = true/) // 写：首次置位
+  })
+
+  it('★ 告警文案必须点明「辅助功能权限」与「不影响 captcha」', () => {
+    // 用户报「窗口还是弹出来」时，这条文案就是唯一线索 —— 缺任一半都答不上来。
+    const warn = fnSource('warnMacosHideOnce')
+    expect(warn).toContain('辅助功能')
+    expect(warn).toContain('不影响 captcha')
+  })
+
+  it('★ 调用点必须受 `hide` 门控（hideWindow:false 的语义是「别动我的窗口」）', () => {
+    const src = fnSource('launch')
+    expect(src).toMatch(/if \(hide && this\.child\?\.pid !== undefined\)/)
+    // ⚠ 不得再把 `basename(executable)` 传进来：那是已删除的进程名兜底用的。
+    expect(src).toMatch(/hideWindowFromTaskbar\(this\.child\.pid, this\.log\)/)
+    // ⚠ 不得再把 `basename(executable)` 传进来：那是已删除的进程名兜底用的。
+    expect(src).not.toMatch(/hideWindowFromTaskbar\(this\.child\.pid, basename/)
   })
 })
 

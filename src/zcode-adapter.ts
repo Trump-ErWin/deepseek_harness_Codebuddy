@@ -4,13 +4,13 @@
  * ## 与其它 provider 的共同点
  *
  * 「读凭据 → 直发远端」—— 这一点与 CodeArts / Buddy / Qoder 等**相同**。
- * 用户装好官方 ZCode 客户端并登录一次即可，不需要任何实例常驻。
+ * 用户在 Jet Hub 面板点「添加账号」走插件自己的授权流即可，**不需要安装任何客户端**。
  *
  * ## 与其它 provider 的差异（全部实测）
  *
  * | 维度 | ZCode | 对照 |
  * |---|---|---|
- * | 凭据来源 | 解密磁盘 `~/.zcode/v2/credentials.json`（AES-256-GCM） | 浏览器登录拿 token |
+ * | 凭据来源 | **只有插件自己的 OAuth 流程**（⚠ 2026-10-05 起**不再**读取本机 ZCode 客户端数据，见 `zcode.ts` 文件头） | 浏览器登录拿 token |
  * | 协议 | **Anthropic Messages**（非 OpenAI） | 其余多为 OpenAI 兼容 |
  * | 验证前置 | **按需**产出阿里云 captcha（索要时才产，稳态一次约 0.4–0.5 秒） | 无 |
  * | 请求体准入 | **必须带官方身份块**（否则 405 + `3012`） | 无 |
@@ -107,6 +107,8 @@ import type { CarrierOutcome } from './captcha-carrier.js'
 import {
   describeZcodeRequestShape,
   formatZcodeDiagnostic,
+  formatZcodeUnusualActivityMessage,
+  hasZcodeUnusualActivity,
   noteZcodeRequestFailed,
   noteZcodeRequestOk,
   noteZcodeRequestSent,
@@ -163,6 +165,39 @@ function fallbackToRemote(model: ZcodeFallbackModel): ZcodeRemoteModel {
  */
 function positiveMaxTokens(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
+/**
+ * 每次重试的空闲超时**增量**（毫秒）—— 逐字对齐官方 `zcode.cjs` 的 `RRs = 3e4`。
+ *
+ * 官方算法：`gzr({ baseTimeoutMs, retryNumber }) => baseTimeoutMs + retryNumber * RRs`。
+ * 它治的正是 IKJOVB 那个死循环的**后半段**：上游偶发变慢时，重试若仍用同一
+ * 阈值，会「次次都被同一道线打死」；逐次放宽给上游喘息空间。
+ */
+const ZCODE_STREAM_IDLE_RETRY_STEP_MS = 30_000
+
+/**
+ * 解析「流式读取空闲超时」，可用 `DSH_ZCODE_SSE_IDLE_TIMEOUT_MS` 覆盖。
+ *
+ * ⚠ **每次 `stream()` 调用时读取**（与 buddy/cline/trae/qoder 同一约定），
+ * 单测靠它注入短超时。
+ *
+ * ⚠ 不能写成 `parseInt(…) || 默认值`：`0` 是合法值（显式关闭空闲超时），
+ * 而 `0` 是 falsy 会被 `||` 静默换回 10 分钟。故用 `??` + 显式比较。
+ */
+function resolveStreamIdleTimeoutMs(product: ZcodeProduct, retryNumber = 0): number {
+  const raw = Number(process.env.DSH_ZCODE_SSE_IDLE_TIMEOUT_MS)
+  const base = Number.isFinite(raw)
+    ? raw
+    : product.streamIdleTimeoutMs
+  if (base <= 0) return base
+  return base + Math.max(0, Math.floor(retryNumber)) * ZCODE_STREAM_IDLE_RETRY_STEP_MS
+}
+
+/** 解析「整轮墙钟上限」，可用 `DSH_ZCODE_REQUEST_TIMEOUT_MS` 覆盖。 */
+function resolveRequestTimeoutMs(product: ZcodeProduct): number {
+  const raw = Number(process.env.DSH_ZCODE_REQUEST_TIMEOUT_MS)
+  return Number.isFinite(raw) ? raw : product.requestTimeoutMs
 }
 
 /** `ZcodeAdapter` 的构造选项。 */
@@ -566,10 +601,22 @@ export class ZcodeAdapter extends LlmAdapter {
    * `step/start` **同一毫秒** —— 那是 `dsh-session` 的 `openTurnClosers()`
    * 在 repair 时**合成**的（它「复用最后一个真实事件的时间戳」），
    * 真相是这个 turn **从未结束**。排查时别被它误导。
+   *
+   * ## ⚠⚠️ 但它**不是**推理时限（真实缺陷 IKJOVB）
+   *
+   * 本方法起的是**整轮墙钟**，只兜「captcha 卡死 / 上游彻底静默」。
+   * 「模型长时间大思考」**必须**由**空闲超时**（`streamIdleTimeoutMs`，
+   * 每帧续期）来判，否则会出现用户报障的死循环：
+   * 思考满 180s → abort → `TIMEOUT`（在 harness 可重试集合内）→ 重试
+   * → 又大思考 → 又撞满 ⇒ 永远出不来。
+   *
+   * ⚠ 官方 ZCode 的对应事实：`resources/glm/zcode.cjs` 默认配置里
+   * `modelStream.idleTimeoutMs = 600_000` 而 `network.timeout = 180_000`
+   * —— **180s 是普通 API 请求的值，不是推理链路的**。旧实现误抄了后者。
    */
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const controller = new AbortController()
-    const timeoutMs = this.product.requestTimeoutMs
+    const timeoutMs = resolveRequestTimeoutMs(this.product)
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     timer.unref?.()
     // 把调用方的 signal（harness 的用户中断）串进来，作用于**整轮**。
@@ -1215,6 +1262,17 @@ export class ZcodeAdapter extends LlmAdapter {
        * ── SSE 消费 ──────────────────────────────────────────────────────
        *
        * ⚠ signal 必须传进 SSE 消费：它是「读挂起」时唯一能唤醒读取的东西。
+       *
+       * ⚠⚠️ `idleTimeoutMs` **每帧续期**（真实缺陷 IKJOVB）：它管的是「静默多久
+       * 算死」，**不是**整轮时长 —— 官方 ZCode 正是这么做的
+       * （`zcode.cjs`：`modelStream.idleTimeoutMs = 6e5`，`Promise.race([it.next(), …])`）。
+       * 不传它就会退回「整轮墙钟卡思考」的老形态。
+       *
+       * ⚠ `quotaRound` 即官方公式里的 `retryNumber`：每轮重发逐次放宽 30s
+       * （`baseTimeoutMs + retryNumber * 3e4`），避免上游偶发变慢时被同一阈值
+       * 反复打死。
+       * ⚠ 这里**不能**用内层的 `attempt` —— SSE 消费点在外层循环作用域内，
+       * `attempt` 不在作用域中（写错了会直接 `ReferenceError`）。
        */
       let emitted = false
       const consumeStartedAt = Date.now()
@@ -1223,6 +1281,7 @@ export class ZcodeAdapter extends LlmAdapter {
           label: 'zcode',
           model: options.model,
           signal: controller.signal,
+          idleTimeoutMs: resolveStreamIdleTimeoutMs(this.product, quotaRound),
         })) {
           emitted = true
           yield chunk
@@ -1285,8 +1344,8 @@ export class ZcodeAdapter extends LlmAdapter {
     }
     if (credential === undefined) {
       throw new LlmError(
-        'zcode: 没有可用的凭据 —— 请在 Jet Hub 的 ZCode 面板点「添加账号」完成登录' +
-        '（若已装官方 ZCode 客户端并登录过，本插件也会自动读取它的凭据）',
+        'zcode: 没有可用的凭据 —— 请在 Jet Hub 的 ZCode 面板点「添加账号」完成登录'
+        + '（本插件只用它自己的授权流程，不会读取本机 ZCode 客户端的登录态）',
         'MISSING_CREDENTIAL',
       )
     }
@@ -1699,9 +1758,6 @@ export function describeUpstreamError(
   body: string,
   diagnostic?: string,
 ): string {
-  const diag = typeof diagnostic === 'string' && diagnostic.length > 0
-    ? `本机诊断：${diagnostic}\n`
-    : ''
   const trimmed = body.trim()
   let code: unknown
   let message: unknown
@@ -1734,16 +1790,26 @@ export function describeUpstreamError(
   if (code === 3007 || trimmed.includes('3007')) {
     return `阿里云 captcha 校验失败（3007）。请重试；若持续失败，检查浏览器是否可用。`
   }
-  if (code === 3012 || trimmed.includes('3012')) {
-    return (
-      `上游风控拦截（3012 unusual activity）。` +
-      `⚠ 该错误有账号冷却惩罚（30 分钟，反复触发会升级到 24 小时乃至停用），` +
-      `请勿连续重试。\n${diag}` +
-      `原始响应：${suffix}`
-    )
+  if (hasZcodeUnusualActivity(trimmed)) {
+    /**
+     * ★ 文案走**共用实现**（Gitee issue IKJOQB）—— 判据与措辞都只在
+     * {@link formatZcodeUnusualActivityMessage} 里有一份。
+     *
+     * ⚠ 传的是**裸诊断**（`diagnostic`），不是 `本机诊断：…` 那种拼好的行 ——
+     * 前缀由共用函数自己加。
+     * ⚠ 不传 `subject` ⇒ 首句与历史输出**逐字一致**
+     * （`上游风控拦截（3012 unusual activity）。`），既有单测不受影响。
+     * ⚠ 判据用 `hasZcodeUnusualActivity`（**先信解析出的 `code`**，无码时才看
+     *   正文且要求风控语义共现）——原先的 `trimmed.includes('3012')` 会把
+     *   `13012` / `plan-3012-trust` 一并命中。
+     */
+    return formatZcodeUnusualActivityMessage({ diagnostic, rawResponse: suffix })
   }
   if (code === 1002 || status === 401) {
-    return `凭据失效（${status}）。请重新在官方 ZCode 客户端登录。${suffix}`
+    // ⚠ 必须指向 Jet Hub 而不是官方客户端：凭据只有插件自己会写
+    //   （`~/.zcode/v2/credentials.json` 那条回退路已于 2026-10-05 删除），
+    //   让用户「去官方客户端重新登录」会把他引到一个**完全无效**的操作上。
+    return `凭据失效（${status}）。请在 Jet Hub 的 ZCode 面板删除该账号后重新添加登录。${suffix}`
   }
   return `HTTP ${status}：${suffix}`
 }
@@ -1761,11 +1827,29 @@ export function describeUpstreamError(
  * | `1002`/401 | `AUTH` | 否 | 需用户重新登录 |
  * | `1113` 余额 | `QUOTA_EXCEEDED` | **否** | 确定性错误（要充值） |
  * | 其余 5xx | `SERVER` | 是 | 暂时性 |
+ *
+ * ## ⚠⚠ `3012` 的判据必须与文案侧**同一份**（真实缺陷，2026-10-05 审计打出）
+ *
+ * 此前本函数用裸 `trimmed.includes('3012')`，而同一个文件里
+ * {@link describeUpstreamError} 当时已改用收窄的 helper —— **只改了一半**。
+ * 后果：正文含 `13012` 的**瞬断 5xx** 被归成 `PERMISSION`，而
+ * `PERMISSION` **不在** harness 的 `DEFAULT_RETRYABLE_CODES` 里
+ * ⇒ 本该自愈的重试被**放弃**。实测：
+ *
+ * ```
+ * httpErrorCodeForZcode(500, 'upstream error 13012')      = PERMISSION  ← 错
+ * httpErrorCodeForZcode(503, 'backend 13012 unavailable') = PERMISSION  ← 错
+ * httpErrorCodeForZcode(503, 'backend unavailable')       = SERVER      ← 对
+ * ```
+ *
+ * ⇒ 改用 {@link hasZcodeUnusualActivity}：它**先信解析出的 `code`**
+ * （`{"code":3012}` 仍是 `PERMISSION`，故本函数的既有语义不变），
+ * 无码时才看正文且要求风控语义共现。
  */
 export function httpErrorCodeForZcode(status: number, body: string): string {
   const trimmed = body.trim()
   if (trimmed.includes('3007')) return 'RATE_LIMIT'
-  if (trimmed.includes('3012')) return 'PERMISSION'
+  if (hasZcodeUnusualActivity(trimmed)) return 'PERMISSION'
   if (trimmed.includes('1113') || trimmed.includes('余额不足')) return 'QUOTA_EXCEEDED'
   if (status === 401 || trimmed.includes('1002')) return 'AUTH'
   if (status === 429) return 'RATE_LIMIT'
