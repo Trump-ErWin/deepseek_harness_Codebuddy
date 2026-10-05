@@ -4640,6 +4640,7 @@ POST {agentHost}/api/ide/v1/batch_get_detail_param
 | `config_switch === false` | 上游已停用 | **必须剔除** |
 | `is_invisible_to_user` | **官方 picker 不展示** | **必须剔除**（硬性，使目录与官方 Auto Mode 一致） |
 | `usage !== 'chat_completion'` | 非对话用途（summary / fast_apply / multimodal…） | **必须剔除** |
+| **`function` 不在 `TRAE_CHANNELS` 内** | **该通道在本插件的推理端点下不可调用** | **整组剔除**（见下「通道白名单」） |
 
 > **历史修正**：早期实现把 `is_invisible_to_user` 当作「两个独立维度」而默认保留
 > （理由是实测 `glm-5.1` 被官方隐藏却**可调用**）。后来用户要求目录与官方
@@ -4649,6 +4650,90 @@ POST {agentHost}/api/ide/v1/batch_get_detail_param
 > 被过滤的模型若已被持久化为会话模型，`resolveModel` 仍能解析。
 > 需要临时放宽时改 `parseTraeBatchModelList` 的过滤条件，不要动
 > `isTraeModelCallable`（那里管的是「必然调不通」）。
+
+#### ⚠️ 通道白名单：`TRAE_CHANNELS` 不只是排序表，更是**准入白名单**（Issue IKJOZ7）
+
+**真实缺陷**（用户报障 2026-10-04）：模型列表里 `function=chat`（及 `builder` /
+`inline_chat`）的模型**能选中**，一发请求就被上游拒绝；换 `solo_agent` 通道同样的
+模型可以正常用。用户侧表现为「模型在设置页能开、能被选中，调用却稳定失败」，而
+报错文案（`the model is unknown` / `param is invalid`）**指向模型本身** ⇒ 极易误判
+成「这个模型坏了」，实际是**发错了通道**。
+
+**根因**：`channelPriority`（= `TRAE_CHANNELS`）此前**只用于排序**（规则 2 的档位
+择优），不参与准入；`channelFor()` 又原样返回目录里的 `function` 当通道用
+⇒「目录声明了什么通道，就照着发什么通道」。而真实目录里 **38 条中有 19 条（50%）**
+带着不可调用的 `function`。
+
+**修法**：`parseTraeBatchModelList` 的循环开头加白名单准入 ——
+`if (channel.length === 0 || rankOf(channel) < 0) continue`（整组跳过）。
+准入**只在解析器一处**执行（单一真相源）；不要再去 `channelFor()` 里加第二层
+校验，否则用户用 `DSH_TRAE_CHANNELS` 自定义白名单时会与兜底表路径判据不一致。
+
+**逐通道实测**（2026-10-04，真实凭据；脚本 `scripts/probe-trae-channel-callable.mjs`
+逐个 function 发一次最小请求，每站可复现）：
+
+| 结果 | function |
+|---|---|
+| ✅ 可调用（**白名单内容，15 个**） | `solo_agent` / `solo_work_lite` / `solo_agent_remote` / `solo_work_remote` / `solo_agent_lite` / `solo_design_lite` / `solo_design_remote` / `solo_coder` / `chat_v3` / `builder_v3` / `git_ai` / `code_reviewer` / `code_review_summary` / `multimodal` / `system_diagnosis` |
+| ❌ **稳定被拒**（**不得**放入） | `chat` → `code=4023 the model is unknown`；`builder` → `4001 param is invalid`；`inline_chat` → `3003 model service is unavailable` |
+| ⚪️ 目录恒空（放进来无意义） | `ui_builder_v2` / `solo_builder` / `custom_agent_generation` / `utils` |
+
+⚠️⚠️ **两处与 issue 原文不符，以实测为准**（别照抄 issue 的推测去"补全"）：
+
+- **`chat_v3` 是可调用的**（实测正常返回 3.8KB 正文），issue 把它与 `chat` 并列
+  怀疑是**错的**。若照 issue 把它一起剔除，会连带删掉一批只有它才有的模型。
+- **`solo_coder` 首测超时、换 4 个模型复测 4/4 成功** ⇒ 计入可调用。
+  ⚠️ **超时 ≠ 不可调用**：单次超时可能只是上游抖动，判据必须是**复测**。
+  它的独有模型（`minimax-m2.7` / `glm-5v-turbo` 等）因此得以保留。
+
+**修复前后对账**（同一次真实目录，`scripts/diff-trae-whitelist.mjs`）：
+
+```
+修复前 38 条 → 修复后 36 条
+被剔除（仅见于不可调用通道）：doubao_1_8(was=chat)、kimi-k2(was=inline_chat)
+通道迁移（保留但纠正通道）：24 条，如 glm-5.1: chat → solo_coder
+                          glm-5.2: chat_v3 → solo_agent
+新增（不该有）：无
+```
+
+⚠️ **关键区别：剔除 vs 纠正通道**。`glm-5.1` / `DeepSeek-V4-Flash` / `qwen-3.5` 等
+**同时也在可调用通道里**（`solo_coder` 等），故它们**不消失**，只是通道被纠正 ⇒
+从「必然失败」变成「可用」。**只有**「仅见于不可调用通道」的条目才会被剔除
+（实测就那 2 条）—— 那正是必然失败的那批。**不要**把这条修法理解成「按通道一刀切
+删模型」。
+
+⚠️ **`glm-5.1` 的通道变了，别按旧结论断言**：它在 `solo_agent*` 里全是
+`is_invisible_to_user: true`（被既有硬过滤剔除），故现在落到 `solo_coder`。
+历史文档里「`glm-5.1` 走 `solo_agent_remote`」的说法**已过期**
+（`tests/e2e/trae-channels-probe.e2e.spec.ts:49` 仍是旧断言，跑该 e2e 前需先更新）。
+
+⚠️ **兜底表路径不受影响**：远端目录不可用时走 `fallbackModels`，那里本就没有通道
+信息，`channelFor()` 回退 `product.function`（`solo_work_lite`，已在白名单内）。
+
+⚠️ **`DSH_TRAE_CHANNELS` 覆盖的是整张白名单**，写错即过滤掉全部模型
+（有意的：宁可空目录，也不要再让不可调用的通道流出去）。
+
+**排查脚本**（均只读；前两个零额度）：
+- `scripts/probe-trae-channel-whitelist.mjs` —— 打印 22 个通道的条目数 +
+  解析结果的通道分布 + 白名单外条目明细（**修复前跑会列出 19 条 offenders**）；
+- `scripts/diff-trae-whitelist.mjs` —— 修复前后目录对账（剔除 / 迁移 / 新增）；
+- `scripts/probe-trae-channel-callable.mjs` —— **消耗额度**，逐通道实发判定可调用性；
+- `scripts/verify-trae-channel-fix.mjs` —— **消耗额度**，用修复后的适配器对
+  10 个「修复前必然失败」的模型实发对话（实测 10/10 通过）。
+  ⚠️ **必须传 `fetchRemoteModels`**，否则适配器 `remoteMeta` 为空、
+  `channelFor` 回退 `solo_work_lite`，验的就不是本次修复了（我第一版就这么白跑了一遍）。
+
+**回归用例**：`tests/unit/trae.spec.ts` 的「通道优先级表同时是白名单」等 4 条
+（非白名单通道整组剔除 / 仅见于不可调用通道者被剔除 / 可调用+不可调用都出现时保留
+并纠正通道 / 未声明 `function` 的组跳过），以及 `tests/unit/trae-product.spec.ts`
+的 2 条（白名单不得含被拒的 3 个通道、15 个可调用通道必须齐全）。
+⚠️ 已做**反向验证**：去掉白名单准入（恢复「只用于排序」）→ **3 条变红**；还原后全绿。
+
+⚠️ **同时修掉了两处「语义漂移」的既有用例**（它们会因「条目被丢弃」而**假通过**）：原
+「已选条目不在优先级表内时，有档位者仍胜出」用例用的是 `chat` 通道 —— 修复后该条目
+根本进不了目录，用例变成**同义反复**（不再验证「档位优先于顺序」）。已改写为明确
+断言白名单语义，并另加 3 条覆盖剔除/纠正两种路径。**改动解析器时请复查既有用例是否
+仍在验证它声称的那件事** —— 「测试全绿」不等于「测试还有意义」。
 
 #### 远端参数必须消费（这一条曾被整段漏掉）
 

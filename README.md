@@ -1947,10 +1947,27 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
   的用法），**一次拉取多个「通道」（`function`）各自一套模型目录**；失败时回退
   `src/trae-product.ts` 的 32 个内置模型。
 - ⚠️ **模型只在列出它的通道里可调用**。实测：`glm-5.1` 在 `solo_agent_remote`
-  正常、在 `solo_work_lite` 回流内 `4001`；`glm-5-turbo` / `sagitta` 恰好相反。
-  因此插件会**按每个模型所属通道分别下发 `function`** —— 旧实现把 `function`
-  写死 `solo_work_lite`，agent 专有模型一用就报
-  `trae: We're sorry, the param is invalid. (code=4001)`。
+  正常、在 `solo_work_lite` 回流内 `4001`。因此插件会**按每个模型所属通道分别
+  下发 `function`** —— 旧实现把 `function` 写死 `solo_work_lite`，agent 专有模型
+  一用就报 `trae: We're sorry, the param is invalid. (code=4001)`。
+- ⚠️ **通道表同时是「可调用白名单」，不只是排序表**（Issue IKJOZ7）。上游下发的
+  22 个 `function` 里**只有一部分**在本插件的推理端点下真正可用 —— 实测
+  `chat` 回 `4023 the model is unknown`、`builder` 回 `4001 param is invalid`、
+  `inline_chat` 回 `3003 model service is unavailable`。此前实现「目录声明了什么
+  通道就照着发什么通道」，于是 38 条目录里 **19 条（50%）** 带着不可调用的通道，
+  用户一选中就失败，而报错文案指向**模型**、极易误判成「这个模型坏了」。
+  现在非白名单通道的条目在解析时**整组剔除**。逐通道实测可调用的 15 个：
+  `solo_agent` / `solo_work_lite` / `solo_agent_remote` / `solo_work_remote` /
+  `solo_agent_lite` / `solo_design_lite` / `solo_design_remote` / `solo_coder` /
+  `chat_v3` / `builder_v3` / `git_ai` / `code_reviewer` / `code_review_summary` /
+  `multimodal` / `system_diagnosis`（可用 `DSH_TRAE_CHANNELS` 覆盖，⚠️ 覆盖的是
+  整张白名单）。
+  ⚠️ **剔除 vs 纠正通道要分清**：`glm-5.1` / `DeepSeek-V4-Flash` / `qwen-3.5` 等
+  同时也在可调用通道里，故它们**不消失**，只是通道被纠正（如 `glm-5.1`：
+  `chat` → `solo_coder`）⇒ 从「必然失败」变成「可用」；**只有**「仅见于不可调用
+  通道」的条目才会被剔除（实测 38 → 36 条，被剔除的是 `doubao_1_8` / `kimi-k2`）。
+  ⚠️ **`glm-5.1` 现在走 `solo_coder`**，旧文档里「走 `solo_agent_remote`」已过期
+  （它在 `solo_agent*` 里全是 `is_invisible_to_user: true`，被既有硬过滤挡掉）。
 - ⚠️ **两种「不可用」要分开看**：
   - `display_config.is_custom_model === true`（需在 IDE 内自行绑定供应商）
     → **必然 4001，插件剔除**。实测 2026-09-19 该账号有 5 个，但**该名单已过期**
@@ -1958,6 +1975,7 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
     —— 判据是**标志的值**而非模型名，别把某一刻的快照写成规则。
   - `is_invisible_to_user === true`（**官方 picker 不展示**）→ **硬性剔除**，
     使目录与官方 Auto Mode 选择器一致（代价是看不到 `glm-5.1` 等可调用模型）。
+  - `function` 不在可调用白名单内（见上）→ **整组剔除**。
   - 若仍选中了不可调用的模型（如会话里持久化的旧 id），报错文案会直接点明
     「模型不被上游接受」，而不是让人去查参数格式。
 - **远端参数会被消费**：`context_window_tokens.dev` → 上下文窗口
