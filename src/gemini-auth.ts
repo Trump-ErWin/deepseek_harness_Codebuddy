@@ -100,7 +100,7 @@ export class GeminiAuth extends Service {
   /**
    * per-ref 续期互斥队列。
    *
-   * ⚠️ 没有它时，「定时续期」与「用户点账号卡片刷新」可能并发消费**同一份**
+   * ⚠️ 没有它时，「定时续期」与「按需续期」可能并发消费**同一份**
    * `refresh_token`：Google 对 refresh_token 有重放检测，交错请求会让其中一次
    * 拿到 `invalid_grant`，进而被误判成「终态失效」把好账号标死。
    */
@@ -202,7 +202,7 @@ export class GeminiAuth extends Service {
   }
 
   /**
-   * 续期**指定 ref**（账号卡片「刷新」按钮 / 定时器）。
+   * 续期**指定 ref**（RPC `account.refresh` / 定时器）。
    *
    * ⚠️ 只读写传入的 ref，**不碰**默认单凭据 ref。
    * ⚠️ **走共享实现 `refreshAccountWithReconcile`** —— 它保证「凭据仍有效」时

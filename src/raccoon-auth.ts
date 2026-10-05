@@ -330,7 +330,7 @@ export class RaccoonAuth extends Service {
   }
 
   /**
-   * 续期**指定 ref**（账号卡片「刷新」按钮 / 定时器）。
+   * 续期**指定 ref**（RPC `account.refresh` / 定时器）。
    *
    * ⚠️ 只读写传入的 ref，**不碰**默认单凭据 ref —— 账号池里的是
    * `RACCOON_ACCOUNT_XXX`，用 `refresh()` 会刷错凭据。
