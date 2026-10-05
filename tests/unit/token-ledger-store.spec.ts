@@ -5,7 +5,7 @@
  * 而不是 mock 掉 fs —— 落盘格式（`{schema, days}`）与载入钳制才是本文件
  * 要锁的契约。
  */
-import { mkdtempSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -278,6 +278,75 @@ describe('createTokenLedgerStore（文件后端）', () => {
       store.flush()
       store.flush()
       expect(disk(), '重复 flush 不得累加').toBe(10)
+    } finally {
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
+  /**
+   * ★ 回归（审计发现并原样复现：R1「幽灵日」）：**外部删除的日键不得被重建为全 0 桶**。
+   *
+   * 场景：盘上某日键被外部删除（手工编辑 / 另一工作区的**旧版本整体覆盖** /
+   * 从备份恢复 —— 后者在 `permanent-lock-store.ts` 开篇有同类记载），而本实例
+   * 内存里仍留着它。若 flush 全量遍历、delta=0 也写入，该日会被**重建为全 0 桶**：
+   * 内存里还是真值（被掩盖），**重启后变成 0 且不可恢复**。
+   *
+   * 判据：零增量的桶必须**完全不碰**盘上那一格。
+   */
+  it('★ 幽灵日：外部删除的日键不得被零增量重建（否则重启后真值变 0）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-ghost-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    try {
+      const file = join(home, 'jet-hub', 'token-ledger.json')
+      const key = 'direct|codearts||GLM-5.2'
+      const shifted = new Date(Date.now() + 8 * 60 * 60 * 1000)
+      const today = shifted.toISOString().slice(0, 10)
+      const yesterday = new Date(shifted.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+      type Doc = { schema?: string; days?: Record<string, Record<string, Record<string, unknown>>> }
+      const readDoc = (): Doc => JSON.parse(readFileSync(file, 'utf-8')) as Doc
+
+      const store = createTokenLedgerStore({ logger: undefined } as never)
+      store.append({ ts: Date.now() - 24 * 60 * 60 * 1000, ...makeEntry({ inputTokens: 20 }) })
+      store.append({ ts: Date.now(), ...makeEntry({ inputTokens: 30 }) })
+      store.flush()
+      expect(readDoc().days![yesterday]).toBeDefined()
+
+      // 外部删掉「昨天」日键
+      const doc = readDoc()
+      delete doc.days![yesterday]
+      writeFileSync(file, JSON.stringify(doc, null, 2), 'utf-8')
+
+      // 本实例再记一笔（内存里昨天仍是 20）并 flush
+      store.append({ ts: Date.now(), ...makeEntry({ inputTokens: 1 }) })
+      store.flush()
+
+      expect(readDoc().days![yesterday], '被外部删除的日键不得被重建').toBeUndefined()
+      // 今天的数据照常累加（不能因跳过零增量而漏记）
+      expect(readDoc().days![today]![key]!.inputTokens).toBe(31)
+    } finally {
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
+  /** 零增量时不得重写文件（内容与 mtime 都不该变）—— 幽灵日的另一面。 */
+  it('★ 无增量时 flush 不重写文件', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-noop-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    try {
+      const file = join(home, 'jet-hub', 'token-ledger.json')
+      const store = createTokenLedgerStore({ logger: undefined } as never)
+      store.append({ ts: Date.now(), ...makeEntry({ inputTokens: 5 }) })
+      store.flush()
+      const before = readFileSync(file, 'utf-8')
+      const mtimeBefore = statSync(file).mtimeMs
+      // 不再 append，直接再 flush：应无增量可写
+      store.flush()
+      expect(readFileSync(file, 'utf-8'), '内容不该变').toBe(before)
+      expect(statSync(file).mtimeMs, '不该重写文件').toBe(mtimeBefore)
     } finally {
       if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
       else process.env.DSH_JET_HUB_STATE_DIR = prev

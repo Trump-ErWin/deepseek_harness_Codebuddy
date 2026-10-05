@@ -251,7 +251,13 @@ let backendToken: object | undefined
  *
  * ⚠️ 返回的 disposer 只在「当前挂载的仍是我自己」时才清空 —— 这样 fiber 重启
  * 交错时，旧实例的 dispose 不会摘掉新实例的挂载（见 {@link backend} 的说明）。
- * disposer **幂等**：重复调用第二次是空操作。
+ *
+ * ⚠️ **幂等性由令牌判据单独提供，不再另设 `disposed` 标志**（审计发现）：
+ * 曾经有一个 `if (disposed) return` 守卫，但它是**不可观测的冗余** —— 令牌每次
+ * 挂载都新生成且永不复用，故 disposes 重入时 `backendToken === token` 必然为假、
+ * 必然让位；删掉守卫行为完全相同（变异测试：删掉后 24 条用例仍全绿，证明它
+ * 无法被任何时序观测到）。与其保留一段无用例覆盖、只在注释里声称"幂等"的代码，
+ * 不如把它删掉，让"幂等来自令牌判据"成为**唯一**且可被用例锁定的事实。
  *
  * @param next - 后端实现；传 `undefined` = 卸载（测试隔离用）。
  */
@@ -260,12 +266,9 @@ export function attachTokenLedgerStore(next: TokenLedgerBackend | undefined): ()
   // 每次挂载都换一个新令牌（即使 next 是 undefined、或与上次是同一个对象）。
   const token: object = {}
   backendToken = token
-  let disposed = false
   return () => {
-    if (disposed) return
-    disposed = true
-    // ⚠️ 只摘自己的：令牌不匹配说明期间已被别的实例接管，此次 dispose 必须让位
-    // —— 否则会把新一轮的挂载摘空（真实事故的传导路径）。
+    // ⚠️ 只摘自己的：令牌不匹配说明期间已被别的实例接管（或本 disposer 已被调用
+    // 过一次 —— 那时 backendToken 已换代或清空，故重入天然是空操作）。
     if (backendToken === token) {
       backend = undefined
       backendToken = undefined
