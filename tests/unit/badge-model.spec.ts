@@ -7,6 +7,7 @@ import {
   HOST_STALE_HINT,
   badgeView,
   creditGroupsOf,
+  creditSectionLabel,
   describeBadgeError,
   formatUpdatedAt,
   normalizeBadgePreference,
@@ -728,5 +729,57 @@ describe('配额窗口（Gemini）：逐窗口百分比，不显示均值也不�
     expect(credits.tone).toBe('ok')
     const tokens = badgeView({ providerLabel: 'ZCode', accounts: [row('a', [pkg('GLM-5.2', 94_539_275, 'token')])] })
     expect(tokens.text).toBe('ZCode • 94.54MToken')
+  })
+})
+
+/**
+ * ★ 「积分区」**节标题**的单位标签（真实缺陷，2026-10-05 复审 PR !56 时发现）。
+ *
+ * 节标题原写作 `quotaGroup === undefined ? '积分' : unitLabel(...)` —— 兜底分支
+ * 假定「所有非配额渠道都是积分」，而 **ZCode 的额度单位是 token**。于是浮层里
+ * 出现**自相矛盾的一屏**：标题写「积分」、下面每个数值写「94.54MToken」。
+ *
+ * ⚠️ 这是「展示路径写死『积分』」这类缺陷的**第三个实例**
+ * （前两个：逐账号明细行 `+100.00M Token`、领取汇总行 `++100.00MToken`），
+ * 它至今没被发现是因为**只在「该渠道只发 token」时显形**，而 12 个渠道里
+ * 只有 ZCode 是这种形状。
+ */
+describe('★ 积分区节标题：单位标签必须按数据走，不写死「积分」', () => {
+  it('★★ ZCode（只发 token）⇒ 标题是「Token」，不是「积分」（报障形态）', () => {
+    const groups = creditGroupsOf([row('a', [pkg('ZCode 免费额度', 94_539_275, 'token')])]).groups
+    expect(groups[0].unit).toBe('token')
+    // 修复前这里是「积分」—— 与同屏的 `94.54MToken` 自相矛盾
+    expect(creditSectionLabel(groups)).toBe('Token')
+  })
+
+  it('普通积分渠道 ⇒ 仍是「积分」（行为逐字不变）', () => {
+    const groups = creditGroupsOf([row('a', [pkg('Bonus Pack', 100)])]).groups
+    expect(creditSectionLabel(groups)).toBe('积分')
+  })
+
+  it('配额窗口（Gemini）⇒ 「额度」，不是「积分」也不是「%」', () => {
+    const quotaPkg = { name: '周窗口', unit: QUOTA_UNIT, remaining: 90, total: 100, used: 10, active: true }
+    const groups = creditGroupsOf([{ accountId: 'a', nickname: 'a', balance: { total: 90, packages: [quotaPkg], expiredTotal: 0 } }]).groups
+    expect(creditSectionLabel(groups)).toBe('额度')
+  })
+
+  it('无分组 ⇒ 回落到「积分」（空态不抛错、也不显示空串）', () => {
+    expect(creditSectionLabel([])).toBe('积分')
+    expect(creditSectionLabel(undefined)).toBe('积分')
+    expect(creditSectionLabel(null)).toBe('积分')
+  })
+
+  it('多单位并列 ⇒ 取第一个（与分组排序一致，结果确定）', () => {
+    // `creditGroupsOf` 末尾按 unit 排序，故「第一个」不依赖对象键序
+    const groups = creditGroupsOf([
+      row('a', [pkg('普通包', 100)]),
+      row('b', [pkg('ZCode 免费额度', 94_539_275, 'token')]),
+    ]).groups
+    expect(groups.map((g) => g.unit)).toEqual(['credit', 'token'])
+    expect(creditSectionLabel(groups)).toBe('积分')
+  })
+
+  it('脏数据（缺 unit / 非对象项）不抛错', () => {
+    expect(creditSectionLabel([null, undefined, {}, { unit: 123 }])).toBe('积分')
   })
 })
