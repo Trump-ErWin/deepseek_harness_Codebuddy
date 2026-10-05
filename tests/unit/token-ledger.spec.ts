@@ -101,6 +101,63 @@ describe('recordTokenUsage / readTokenLedger：明细', () => {
     Object.defineProperty(hostile, 'provider', { get() { throw new Error('boom') } })
     expect(() => recordTokenUsage(hostile as never)).not.toThrow()
   })
+
+  /** ⚠️ 第 3 期：首字用时 + TPS（官方口径）的计算与「不可测省略」约定。 */
+  it('ttft/tps：正常请求记录两者，tps = 输出 ÷ (全程 − 首块)', () => {
+    seed([{ ...OK, ttftMs: 2000, durationMs: 7000, outputTokens: 500 }])
+    const row = readTokenLedger().entries[0]!
+    expect(row.ttftMs).toBe(2000)
+    // 500 tok / 5s = 100 tok/s
+    expect(row.tps).toBe(100)
+  })
+
+  it('ttft/tps：前提缺失（无首块 / 分母 ≤ 0 / 无 usage）省略字段（不可测 ≠ 0）', () => {
+    // 无首块（失败 / 秒回空）
+    seed([{ ...OK, ttftMs: 0 }])
+    let row = readTokenLedger().entries[0]!
+    expect(row.ttftMs).toBeUndefined()
+    expect(row.tps).toBeUndefined()
+    // 首块之后没有时间（一次性返回）
+    seed([{ ...OK, ttftMs: 1000, durationMs: 1000, outputTokens: 500 }])
+    row = readTokenLedger().entries[0]!
+    expect(row.tps).toBeUndefined()
+    // 无 usage（输出 token 不可信）
+    seed([{ ...OK, ttftMs: 1000, durationMs: 3000, usageReported: false }])
+    row = readTokenLedger().entries[0]!
+    expect(row.tps).toBeUndefined()
+  })
+
+  it('聚合均值：只对有实测值的请求平均；父级 = 全部样本的 Σ/份数（不是均值的均值）', () => {
+    // model fast：4 笔 100ms / model slow：1 笔 500ms —— 同 provider
+    seed([
+      { ...OK, model: 'fast', ttftMs: 100, durationMs: 1100, outputTokens: 100 },
+      { ...OK, model: 'fast', ttftMs: 100, durationMs: 1100, outputTokens: 100 },
+      { ...OK, model: 'fast', ttftMs: 100, durationMs: 1100, outputTokens: 100 },
+      { ...OK, model: 'fast', ttftMs: 100, durationMs: 1100, outputTokens: 100 },
+      { ...OK, model: 'slow', ttftMs: 500, durationMs: 1500, outputTokens: 500 },
+    ])
+    const direct = readTokenLedger().channels[0]!
+    const totals = direct.providers[0]!.totals
+    // 全局/渠道/provider 小计的均值必须按 **5 笔样本**算：(4×100+500)/5 = 180，
+    // 若按「子级均值再平均」会得 (100+500)/2 = 300 —— 那是错的。
+    expect(totals.avgTtftMs).toBe(180)
+    // tps：fast 4 笔各 100 tok/1s = 100 tok/s；slow 1 笔 500 tok/1s = 500 tok/s
+    // ⇒ (4×100+500)/5 = 180
+    expect(totals.avgTps).toBe(180)
+    const fast = direct.providers[0]!.accounts[0]!.models.find((m) => m.model === 'fast')!
+    expect(fast.avgTtftMs).toBe(100)
+    expect(fast.avgTps).toBe(100)
+    const slow = direct.providers[0]!.accounts[0]!.models.find((m) => m.model === 'slow')!
+    expect(slow.avgTtftMs).toBe(500)
+    expect(slow.avgTps).toBe(500)
+  })
+
+  it('聚合均值：全部不可测时省略字段（不显示 0）', () => {
+    seed([{ ...OK, ttftMs: 0, usageReported: false, error: 'boom' }])
+    const totals = readTokenLedger().channels[0]!.providers[0]!.totals
+    expect(totals.avgTtftMs).toBeUndefined()
+    expect(totals.avgTps).toBeUndefined()
+  })
 })
 
 describe('readTokenLedger：三维聚合树', () => {
