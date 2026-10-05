@@ -4,9 +4,11 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   groupProviders,
+  nextProviderOrderAfterDrop,
   providerSwitchRows,
   providerSwitchState,
   providerToggleSummary,
+  sortOpenProvidersByOrder,
   summarizeProviderToggle,
 } from '../../plugin-src/client/provider-toggle.js'
 
@@ -393,5 +395,110 @@ describe('供应商开关的样式约束（源码级回归）', () => {
     expect(styles).toMatch(/\.dim-jh-headerActions \{[^}]*flex: none/)
     // 极窄窗口的兜底仍在：换行好过溢出到窗口外点不到。
     expect(styles).toMatch(/\.dim-jh-headerActions \{[^}]*flex-wrap: wrap/)
+  })
+})
+
+describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () => {
+  describe('sortOpenProvidersByOrder（已打开组重排）', () => {
+    it('order 内的按数组序排前，未列出的按声明顺序稳定补后', () => {
+      const open = [P('a'), P('b'), P('c'), P('d')]
+      expect(sortOpenProvidersByOrder(open, ['c', 'a']).map(p => p.id))
+        .toEqual(['c', 'a', 'b', 'd'])
+      expect(sortOpenProvidersByOrder(open, ['d', 'c', 'b', 'a']).map(p => p.id))
+        .toEqual(['d', 'c', 'b', 'a'])
+    })
+
+    it('order 为 null / 空 / 未定义 → 完全保持声明顺序（未自定义的语义）', () => {
+      const open = [P('z'), P('a'), P('m')]
+      expect(sortOpenProvidersByOrder(open, null).map(p => p.id)).toEqual(['z', 'a', 'm'])
+      expect(sortOpenProvidersByOrder(open, []).map(p => p.id)).toEqual(['z', 'a', 'm'])
+      expect(sortOpenProvidersByOrder(open, undefined).map(p => p.id)).toEqual(['z', 'a', 'm'])
+    })
+
+    it('order 里的已关闭 / 未知 id 被跳过（不产生空洞，也不抛错）', () => {
+      // 'x' 不在已打开组里（可能已关闭或来自旧版本），跳过即可。
+      expect(sortOpenProvidersByOrder([P('a'), P('b'), P('c')], ['x', 'b', 'a']).map(p => p.id))
+        .toEqual(['b', 'a', 'c'])
+      expect(sortOpenProvidersByOrder([P('a'), P('b')], ['x', 'y']).map(p => p.id))
+        .toEqual(['a', 'b'])
+    })
+
+    it('不修改入参数组（组件层依赖纯函数语义）', () => {
+      const open = [P('a'), P('b'), P('c')]
+      sortOpenProvidersByOrder(open, ['c', 'a'])
+      expect(open.map(p => p.id)).toEqual(['a', 'b', 'c'])
+    })
+  })
+
+  describe('nextProviderOrderAfterDrop（拖拽落点 → 完整顺序）', () => {
+    it('before / after 两个方向都生效（由指针落点决定，与账号拖拽一致）', () => {
+      // 把 a 拖到 b 之后：b 的位置放 a
+      expect(nextProviderOrderAfterDrop(['a', 'b', 'c'], ['d'], 'a', 'b', 'after'))
+        .toEqual(['b', 'a', 'c', 'd'])
+      // 把 c 拖到 a 之前
+      expect(nextProviderOrderAfterDrop(['a', 'b', 'c'], ['d'], 'c', 'a', 'before'))
+        .toEqual(['c', 'a', 'b', 'd'])
+    })
+
+    it('已关闭组按声明顺序缀尾（展示侧只读 open 段，尾段是 reopen 定位的占位）', () => {
+      expect(nextProviderOrderAfterDrop(['a', 'c'], ['b', 'e', 'd'], 'c', 'a', 'after'))
+        .toEqual(['a', 'c', 'b', 'e', 'd'])
+    })
+
+    it('源与目标相同 → null（无需变更，调用方不提交）', () => {
+      expect(nextProviderOrderAfterDrop(['a', 'b'], ['c'], 'a', 'a', 'before')).toBeNull()
+    })
+  })
+
+  describe('providerSwitchRows 的 order 参数（弹窗行数据）', () => {
+    const providers = [P('a'), P('b'), P('c'), P('d')]
+    // ⚠️ closed 供应商必须带 models.total：providerSwitchState 先判
+    // 「没有可关闭的模型 → 禁用且 checked=true」，走不到 closed 判定
+    // （真实 provider.status 恒带模型计数，测试数据必须同形）。
+    const statuses = { c: { closed: true, models: { total: 3 }, accounts: { total: 1 } } }
+
+    it('已打开组按 order 重排，已关闭组恒按声明顺序沉底（用户口径：逻辑不变）', () => {
+      const rows = providerSwitchRows(providers, statuses, ['d', 'a'])
+      expect(rows.map(r => r.id)).toEqual(['d', 'a', 'b', 'c'])
+      // 关闭组的位置在最后，且开关呈现仍是「已关闭」
+      expect(rows[3]!.checked).toBe(false)
+    })
+
+    it('order 未指定时与既有行为完全一致（向后兼容，rail 同源）', () => {
+      expect(providerSwitchRows(providers, statuses).map(r => r.id))
+        .toEqual(['a', 'b', 'd', 'c'])
+      expect(providerSwitchRows(providers, statuses, null).map(r => r.id))
+        .toEqual(providerSwitchRows(providers, statuses).map(r => r.id))
+    })
+  })
+
+  describe('弹窗拖拽的接线（源码级回归）', () => {
+    it('面板消费 order / onCommitOrder，并经 nextProviderOrderAfterDrop 提交', () => {
+      const body = panelBody()
+      expect(body).toContain('providerSwitchRows(providers, statuses, order)')
+      expect(body).toContain('nextProviderOrderAfterDrop(')
+      expect(body).toContain('onCommitOrder(next)')
+      // ⚠️ 已关闭的行不得可拖：它恒按默认顺序沉底，能拖而不能落只会误导。
+      expect(body).toContain('if (!row.checked || !dragEnabled) return { enabled: false };')
+    })
+
+    it('页面层走 provider.getOrder / provider.setOrder（宿主持久化）', () => {
+      expect(source).toContain("rpcCall('provider.getOrder', {})")
+      expect(source).toContain("rpcCall('provider.setOrder', { order: next })")
+      // 顺序状态必须住宿主侧：客户端没有也不该有 localStorage（与既有架构一致）。
+      expect(source).not.toContain('localStorage')
+    })
+
+    it('拖拽提交失败时不做乐观更新（回读保持与服务端一致）', () => {
+      expect(source).toContain('await loadProviderOrder();')
+    })
+
+    it('行拖拽的视觉状态与账号卡片同款（淡出 + 插入线）', () => {
+      expect(styles).toContain('.dim-jh-modelRow[data-dragging="true"]')
+      expect(styles).toContain('.dim-jh-modelRow[data-dropBefore="true"]::before')
+      expect(styles).toContain('.dim-jh-modelRow[data-dropAfter="true"]::after')
+      // 插入线是 absolute 定位，行必须有 relative 锚点。
+      expect(styles).toMatch(/\.dim-jh-modelRow \{ position: relative; \}/)
+    })
   })
 })
