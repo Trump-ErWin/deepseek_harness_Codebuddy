@@ -578,18 +578,18 @@ export class AutoAdapter extends LlmAdapter {
    * `Space-Bunny` 正在限时折扣（x0.03）。大任务跑了前者，等于同样的活多花约十倍
    * 积分。auto 既然定位是「省钱烧临期」，同 provider 内当然该挑最便宜的。
    *
-   * ⚠️ 必须跳过「彻底关闭」的模型（`blockedModels`，与「隐藏」不同 —— 隐藏的
-   * 模型 auto 仍可选，这是用户明确要的语义）。跳过**不是静默降级**：记 warn 日志。
+   * ⚠️ 必须跳过被关闭的模型（`disabledModelsFor`）—— 关闭即「不可调用」，
+   * auto 不能把请求路由过去。跳过**不是静默降级**：记 warn 日志。
    */
   private async firstModelOf(provider: string): Promise<string> {
-    const blocked = this.options.accountPool.blockedModelsFor(provider)
+    const disabled = this.options.accountPool.disabledModelsFor(provider)
     let skipped = 0
     let best: { id: string; price: number } | undefined
     try {
       const models = await this.ctx.llm.listModels(provider)
       for (const model of models) {
         if (typeof model.id !== 'string' || model.id.length === 0) continue
-        if (blocked.has(model.id)) { skipped++; continue }
+        if (disabled.has(model.id)) { skipped++; continue }
         const price = priceFactorFromName(model.name ?? model.id)
         if (best === undefined || price < best.price) best = { id: model.id, price }
       }
@@ -599,14 +599,14 @@ export class AutoAdapter extends LlmAdapter {
     }
     if (skipped > 0) {
       this.ctx.logger?.warn?.(
-        `[jet-hub-auto] ${provider} 目录中的 ${skipped} 个模型已被彻底关闭，已跳过`,
+        `[jet-hub-auto] ${provider} 目录中的 ${skipped} 个模型已被关闭，已跳过`,
       )
     }
     // 兜底只在目录为空/全被关闭时触发；取各 provider 一个已知可用的模型 id。
     const fallback = AUTO_FALLBACK_MODELS[provider] ?? AUTO_MODEL
-    // 兜底恰好也被关闭时不能硬发（必然被 AccountPool 拒绝），改用模型名本身 ——
-    // 那会让上游 404，但**错误真实**；总好过发一个被本地拒绝的请求。
-    return blocked.has(fallback) ? AUTO_MODEL : fallback
+    // 兜底恰好也被关闭时不能硬发，改用模型名本身 —— 那会让上游 404，
+    // 但**错误真实**；总好过发一个被本地拒绝的请求。
+    return disabled.has(fallback) ? AUTO_MODEL : fallback
   }
 }
 
