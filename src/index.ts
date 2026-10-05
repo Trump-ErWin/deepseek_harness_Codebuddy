@@ -35,8 +35,7 @@ import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { installLoopResume } from './loop-recovery.js'
 import {
-  attachTokenLedgerHistoryReader,
-  attachTokenLedgerPersistence,
+  attachTokenLedgerStore,
   reportLedgerAccount,
 } from './token-ledger.js'
 import { createTokenLedgerStore } from './token-ledger-store.js'
@@ -299,22 +298,24 @@ export function apply(ctx: Context): void {
   // ===== Token 账本持久化（第 2 期 · 日聚合落盘）=====
   //
   // ⚠️ 账本本体是模块级单例（`token-ledger.ts`），没有 ctx 可拿 —— 故在启动时
-  // 把「怎么落盘」挂进去（`attachTokenLedgerPersistence`）。挂载发生在**任何
-  // 适配器注册之前**：启动早期就有模型请求（标题生成等）时，落盘已在位。
+  // 把后端挂进去（`attachTokenLedgerStore`）。挂载发生在**任何适配器注册之前**：
+  // 启动早期就有模型请求（标题生成等）时，落盘已在位。
   //
-  // ⚠️ hook 契约是**绝不抛错**（`recordTokenUsage` 的调用点在推理关键路径上，
-  // 见其函数注释），`FileLedgerStore.append` 内部已按此实现。
-  // dispose 时 flush + 摘钩子：插件热重载后新实例会重新挂，避免旧 store 继续收账。
+  // ⚠️ 后端契约是**绝不抛错**（`recordTokenUsage` 的调用点在推理关键路径上，
+  // 见其函数注释），`FileLedgerStore` 内部已按此实现。
+  //
+  // ⚠️ dispose **必须用返回的 disposer**（不能无条件 `attach(undefined)`）：
+  // 插件 fiber 重启时新 apply 与旧 fiber 的异步 dispose **交错执行**
+  //（本仓库已确证的事故，见 `llm-register-compat.ts` 模块头），无条件摘会把
+  // **新实例刚挂上**的后端摘空 ⇒ 落盘停摆且历史视图恒为空。disposer 自带所有权
+  // 校验（只摘自己的），并顺带 `flush` 当前这份数据。
   const tokenLedgerStore = createTokenLedgerStore(ctx)
-  attachTokenLedgerPersistence((day, entry) => tokenLedgerStore.append(entry))
-  // 历史视图（第 4 期）：RPC 的 usage.tokenLedgerHistory 读这份日聚合表。
-  attachTokenLedgerHistoryReader(() => tokenLedgerStore.load())
+  const detachTokenLedger = attachTokenLedgerStore(tokenLedgerStore)
   ctx.effect(() => () => {
     try {
       tokenLedgerStore.flush()
     } finally {
-      attachTokenLedgerPersistence(undefined)
-      attachTokenLedgerHistoryReader(undefined)
+      detachTokenLedger()
     }
   }, 'token-ledger-persistence')
 
