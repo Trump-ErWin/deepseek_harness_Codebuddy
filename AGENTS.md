@@ -7427,6 +7427,56 @@ client **每轮**问 `captcha.carrierUrl`（`null` ⇒ 记 `no-carrier-url` 并�
 ⚠ 这条降级链**领取路径也接上了**（`claimDailyWith` 内，评审 C4）：领取端点**始终**索要 captcha
 且校验前置于 plan 校验，是内部 param 最容易被拒的地方；重发**上限一次**，
 换 chromium 后仍被拒的文案要能让用户看出「这更像设备信誉问题」。
+
+### ⚠⚠⚠ captcha 的 **region 必须与产 param 的那份配置同源**（Issue IKJNPS，2026-10-05）
+
+**真实缺陷**（用户报障，Gitee issue IKJNPS）：z.ai 国际渠道账号点「一键领取」**恒失败**
+`captcha 校验失败（zcode-v3-start-plan-trust-1004）`，15/15 全部 `400 / code 3007`；
+同账号在 ZCode IDE 里正常。多账号 / web 版 / 桌面版 / 换浏览器链路都一样。
+
+**根因**：region 与 param 是**两份真相**。
+
+| | 修复前取自 | 值 |
+|---|---|---|
+| param（`mintCaptcha` 用的配置） | 调用方 `fetchCaptchaConfig()` → **服务端下发** | `sgp` |
+| 请求头 `x-aliyun-captcha-verify-region` | `claimDailyFor` 的**默认参数** `ZCODE_CAPTCHA_FALLBACK.region` | `cn` |
+
+阿里云验签把 param 与 region **成对**校验 ⇒ 不一致即 `3007`。
+⚠ **作者本人在 cn 区**（本仓库兜底常量与 README 实测记录都是 `cn`），所以本地永远复现不到；
+**非 cn 区账号 100% 复现**。⚠ 这类「本地默认值恰好等于服务端值」的缺陷具有**零本地症状**。
+
+**修法（采纳 issue 的第 2 条：配置成为唯一真相源）**：
+- `ZcodeAuth.claimDailyWith` 在 **plan 循环之前**解析**一次**配置
+  （`fetchCaptchaConfig().catch(() => undefined) ?? ZCODE_CAPTCHA_FALLBACK`），
+  同时落进 `this.captchaMintConfig`（`CaptchaCarrier` 那条 chromium 兜底腿读它），
+  `region = captchaRegion ?? captchaConfig.region`；
+- 注入回调的类型改成 `ZcodeClaimCaptchaMint = (config: ZcodeCaptchaConfig) => Promise<string>`，
+  **实参就是那份配置**；`jet-hub-rpc.ts` 里改为 `async (config) => zcode.mintCaptcha(config)`
+  （原来自己再拉一次 —— 那正是「两份真相」的来源）；
+- `claimDailyFor` / `claimDaily` 的 `captchaRegion` **取消 `cn` 默认值**（可选覆盖仍保留）；
+  `3007` 换链重发**沿用同一份配置**（换 param 不换 region）。
+
+⚠⚠ **同型第二个实例（推理路径，别只修领取）**：`zcode-adapter.ts` 组头时原来恒写
+`this.options.captchaRegion ?? 'cn'`，而 param 来自 `resolveZcodeCaptchaConfig()`（远端）。
+现为 `this.captchaConfig?.region ?? this.options.captchaRegion ?? 'cn'` ——
+`this.captchaConfig` 由 mint 回调里的 `setCaptchaConfig(remote)` 写入，且 **mint 先于组头**，
+所以读到的一定是**本次 param 用的那份**。`index.ts` 里那个字面量降级为「连配置都没有」的兜底。
+
+⚠ **`TtlCache` 连 `undefined` 也缓存**（`get()` 无条件 `write(value)`），
+而 `fetchZcodeCaptchaConfig` 自己吞掉全部异常返回 `undefined`
+⇒ **数「`/client/configs` 请求次数」判不出「配置是否被重复解析」**（实测把解析搬进
+for 循环，用例仍全绿）。「只解析一次」只能锁**源码结构**（解析在 `for` 之前）。
+
+回归用例 `tests/unit/zcode-captcha-region.spec.ts`（8 条：sgp 同源 / 失败一起退兜底 /
+显式覆盖 / 循环前解析 / `3007` 重发仍同源 / 推理路径同源 / 两条源码看守）。
+⚠ 已做**反向验证**：region 改回兜底常量 ⇒ 3 条红；适配器改回写死 `cn` ⇒ 推理那条红；
+解析搬进循环 ⇒ 结构那条红。
+
+⚠ **issue 附注的「web 版 3007 不重试」维持现状**（不是遗漏）：`source === 'chromium'`
+本身就说明**载体链本轮没参与**（web 版拿不到 `dshDesktop.browser` ⇒ `supplied` 恒 0，
+或 env 关了）⇒ **没有第二条链可换**；且重试只白扣同设备每小时 150 次配额，
+面对同一个服务端判定期望收益极低。修好 region 后 chromium 侧残留的 `3007` 都是时效/信誉性质。
+
 ## ⚠️⚠️ 用量徽标折叠态：渠道名与读数**必须是两个元素**（真实报障，2026-10-03）
 
 **报障**：胶囊显示成 `LobsterAI (有道) · 合计 …` —— **数字被截掉**，而渠道名完整。

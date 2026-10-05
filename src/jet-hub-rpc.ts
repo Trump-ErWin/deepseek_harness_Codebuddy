@@ -2794,9 +2794,16 @@ function registerJetHubEndpoints(
                  * captcha 回调：每次都现产一个新 param。
                  * 缺浏览器时抛错由 `claimDailyFor` 内部转成可读的
                  * failed outcome（不让整个端点失败）。
+                 *
+                 * ⚠⚠ **必须原样把 `config` 透传给 `mintCaptcha`**（真实缺陷，
+                 * Gitee issue IKJNPS）。region 与 param 必须是**同一份配置**签出来的：
+                 * 阿里云验签成对校验二者，不一致即 `400 / 3007`。此前这里**自己**去
+                 * 拉一份 captcha 配置（拿到的是服务端真实 region，如 `sgp`），
+                 * 而 `claimDailyFor` 的 region 走兜底常量 `cn` ⇒ 非 cn 区账号
+                 * 「一键领取」100% 失败（用户报障：15/15 全部 captcha 校验失败）。
+                 * 现在配置由 `claimDailyWith` 解析一次并传进来，两边天然同源。
                  */
-                accountOutcomes = await zcode.claimDailyFor(credential, async () => {
-                  const config = await zcode.fetchCaptchaConfig().catch(() => undefined)
+                accountOutcomes = await zcode.claimDailyFor(credential, async (config) => {
                   return await zcode.mintCaptcha(config)
                 })
               }

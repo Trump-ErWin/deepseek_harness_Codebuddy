@@ -42,7 +42,12 @@ import {
 } from './zcode.js'
 import { ZCODE, type ZcodeProduct, type ZcodeRemoteModelLike } from './zcode-product.js'
 import type { ZcodeClaimablePlan } from './zcode-upstream.js'
-import { ZcodeCaptchaBrowser, ZCODE_CAPTCHA_FALLBACK, validateCaptchaParam } from './zcode-captcha.js'
+import {
+  ZcodeCaptchaBrowser,
+  ZCODE_CAPTCHA_FALLBACK,
+  validateCaptchaParam,
+  type ZcodeCaptchaConfig,
+} from './zcode-captcha.js'
 import { CaptchaPool, captchaPoolConfigFromEnv } from './captcha-pool.js'
 import { captchaRequirementObservability } from './captcha-requirement.js'
 import { CaptchaBackoff, captchaBackoffConfigFromEnv, captchaQueueEnabledFromEnv, CAPTCHA_CONFIG_TTL_MS } from './captcha-backoff.js'
@@ -75,6 +80,25 @@ export interface ZcodeProbeResult {
   /** 不可用时的原因（人类可读）。 */
   reason?: string
 }
+
+/**
+ * 领取路径注入的 param 产出回调。
+ *
+ * ## ⚠ 实参是「**本次领取用的那份** captcha 配置」，不是可选装饰
+ *
+ * 阿里云验签时会把 param 与请求头 `x-aliyun-captcha-verify-region` **成对**校验，
+ * 两边不是同一个 region 就必然 `400 / 3007`（captcha 校验失败）。
+ *
+ * ⚠ 真实缺陷（Gitee issue IKJNPS，用户报障，非 cn 区账号 100% 复现）：
+ * 「一键领取」此前由调用方自己去 `fetchCaptchaConfig()` 拿配置产 param，
+ * 而 region 走 `claimDailyFor` 的**兜底常量** `ZCODE_CAPTCHA_FALLBACK.region`
+ * （`cn`）。于是 z.ai 国际渠道（服务端下发 `region: "sgp"`）这类账号
+ * 会稳定发出「sgp 签的 param + cn 的 region 头」⇒ 恒 `3007`，一个都领不到。
+ *
+ * ⇒ 由 {@link ZcodeAuth.claimDailyWith} 解析**一次**配置，并把同一份传进来，
+ * 让「param 的来源」与「region 的来源」**在类型上就是同一份**。
+ */
+export type ZcodeClaimCaptchaMint = (config: ZcodeCaptchaConfig) => Promise<string>
 
 /** `ZcodeAuth` 的构造选项。 */
 export interface ZcodeAuthOptions {
@@ -1018,6 +1042,14 @@ export class ZcodeAuth extends Service {
    * ⚠ 载体链**禁用**（内部 param 被上游拒到阈值）时同样落注入的链 —— 归因纪律见
    *   `src/captcha-carrier.ts` 文件头。
    *
+   * ## ⚠ `config` 必须**原样透传**给注入链（真实缺陷，Gitee issue IKJNPS）
+   *
+   * 注入链（`zcode.mintCaptcha`）拿到的 config 决定 param 由**哪个 region** 签发，
+   * 而请求头里的 region 取自**同一份**（`claimDailyWith` 解析的那次）。
+   * 这里若「顺手再拉一次配置」或干脆不传，两跳之间（60 秒 TTL 里服务端换 region
+   * 也可能）就会漂成两份真相，稳定复现成 `3007` —— 而 param 与 region 不同源
+   * 时**重试多少次都没用**，它不是概率问题。
+   *
    * ## ★ 返回值带 `source`（评审 C4）
    * 领取端点 `/zcode-plan/billing/claim` **始终索要** captcha（实测：带非法与不带都
    * `400/3007`，且校验**前置于** plan 校验）⇒ 内部 param 在这条路径上被拒的概率
@@ -1025,13 +1057,14 @@ export class ZcodeAuth extends Service {
    * 「记一次 internalRejected + 当次换注入链重发一次」（见那里）。
    */
   private async mintClaimCaptcha(
-    injected: (() => Promise<string>) | undefined,
+    injected: ZcodeClaimCaptchaMint | undefined,
+    config: ZcodeCaptchaConfig,
   ): Promise<CarrierOutcome> {
     if (injected === undefined) {
-      return { param: await this.mintWithChromium(), source: 'chromium' }
+      return { param: await this.mintWithChromium(config), source: 'chromium' }
     }
     if (!this.internalCarrierAvailable() || !captchaDemand()) {
-      return { param: await injected(), source: 'chromium' }
+      return { param: await injected(config), source: 'chromium' }
     }
     return await this.carrier.mint()
   }
@@ -1221,11 +1254,15 @@ export class ZcodeAuth extends Service {
    * 用**给定凭据**领取每日额度（Jet Hub 逐账号领取时用）。
    *
    * 与 {@link claimDaily} 的区别同 {@link fetchBalanceFor}。
+   *
+   * ⚠ `captchaRegion` **不要传**：省略即跟随「本次 mint 用的那份配置」
+   * （真实缺陷，Gitee issue IKJNPS —— 传兜底常量 `cn` 会让非 cn 区账号恒 `3007`）。
+   * 保留它只是为了在特殊场景显式覆盖，正常入口一律省略。
    */
   async claimDailyFor(
     credential: ZcodeCredential,
-    mintCaptcha: (() => Promise<string>) | undefined,
-    captchaRegion = ZCODE_CAPTCHA_FALLBACK.region,
+    mintCaptcha: ZcodeClaimCaptchaMint | undefined,
+    captchaRegion?: string,
   ): Promise<ClaimOutcome[]> {
     return await this.claimDailyWith(credential, mintCaptcha, captchaRegion)
   }
@@ -1362,10 +1399,13 @@ export class ZcodeAuth extends Service {
    *
    * 服务端对「已领取过」回 `code:1003`。把它当失败会让定时任务
    * 反复误报 —— 这与 Buddy / Qoder 的幂等语义一致。
+   *
+   * ⚠ `captchaRegion` 与 {@link claimDailyFor} 同款：**省略即跟随配置**，别传兜底常量
+   * （真实缺陷，Gitee issue IKJNPS）。
    */
   async claimDaily(
-    mintCaptcha: (() => Promise<string>) | undefined,
-    captchaRegion = ZCODE_CAPTCHA_FALLBACK.region,
+    mintCaptcha: ZcodeClaimCaptchaMint | undefined,
+    captchaRegion?: string,
   ): Promise<ClaimOutcome[]> {
     const credential = await this.current()
     if (credential === undefined) {
@@ -1399,11 +1439,26 @@ export class ZcodeAuth extends Service {
    * ⚠ 需求位是**进程级**的位，`finally` 漏写就是「client 无限定地产 param」的最坏形态
    *   （阿里云同设备每小时 150 次，见 `src/captcha-backoff.ts`）
    *   —— 故由 `tests/unit/zcode-carrier-auth.spec.ts` 的源码用例 + 行为用例双向锁死。
+   *
+   * ## ★★ region 与 param **必须来自同一份配置**（真实缺陷，Gitee issue IKJNPS）
+   *
+   * 阿里云验签把 param 与 `x-aliyun-captcha-verify-region` **成对**校验，
+   * 不一致即 `400 / 3007`。而 region 由**服务端**下发（`client/configs`，
+   * 本仓库作者所在账号是 `cn`，z.ai 国际渠道实测是 **`sgp`**），
+   * 把它写成本地兜底常量只会在 cn 区账号上「碰巧正确」。
+   *
+   * 修复前的形态是**两份真相**：`jet-hub-rpc.ts` 的注入回调自己
+   * `fetchCaptchaConfig()` 拿配置产 param，而 region 走本方法的**默认参数**
+   * `ZCODE_CAPTCHA_FALLBACK.region` ⇒ 非 cn 区账号 100% 领不到
+   * （用户报障：15/15 全部 3007；同账号改用配置里的 region 后立即成功 +100M）。
+   *
+   * ⇒ 这里解析**一次**配置，region 从它取、并把它传给注入回调：
+   * 「产 param 的那份」与「写 region 的那份」从此是**同一个对象**。
    */
   private async claimDailyWith(
     credential: ZcodeCredential,
-    mintCaptcha: (() => Promise<string>) | undefined,
-    captchaRegion: string,
+    mintCaptcha: ZcodeClaimCaptchaMint | undefined,
+    captchaRegion: string | undefined,
   ): Promise<ClaimOutcome[]> {
     try {
       /**
@@ -1428,13 +1483,30 @@ export class ZcodeAuth extends Service {
         return [{ kind: 'already-claimed', message: '今日暂无可领额度（服务端按日刷新）' }]
       }
 
+      /**
+       * ★ 本次领取用的 captcha 配置 —— **param 与 region 的唯一真相源**。
+       *
+       * ⚠ 放在「没有可领 plan」判断**之后**：那条路不需要 param，
+       *   多发一次 `client/configs`（它有 60 秒 TTL，但首次仍是实打实一跳）
+       *   去换一份用不上的配置没有意义。
+       * ⚠ `fetchCaptchaConfig()` 会把网络异常**抛出来**（`TtlCache` 的语义是
+       *   「失败不缓存、向上抛」），这里必须兜住：配置只是「region/prefix/sceneId」，
+       *   拉不到就用兜底值继续，绝不该把整个领取变成一条看不懂的失败。
+       * ⚠ 同时落进 `captchaMintConfig`：`CaptchaCarrier` 那条 chromium 兜底腿
+       *   （`carrier` 字段注释）是读这个字段的 ⇒ 载体链产出的 param 与这里的
+       *   region 也同源，不必让它自己再拉一次。
+       */
+      const captchaConfig = await this.fetchCaptchaConfig().catch(() => undefined) ?? ZCODE_CAPTCHA_FALLBACK
+      this.captchaMintConfig = captchaConfig
+      const region = captchaRegion ?? captchaConfig.region
+
       const outcomes: ClaimOutcome[] = []
       for (const plan of plans) {
         try {
           // ⚠ 每个 plan 单独 mint（captcha 一次性）：内部载体优先，等不到即那条 chromium 链。
-          const minted = await this.mintClaimCaptcha(mintCaptcha)
+          const minted = await this.mintClaimCaptcha(mintCaptcha, captchaConfig)
           const outcome: ZcodeClaimOutcome = await claimZcodePlan(
-            credential, plan.planId, { param: minted.param, region: captchaRegion }, this.fetchImpl,
+            credential, plan.planId, { param: minted.param, region }, this.fetchImpl,
           )
           /**
            * ★ **评审 C4：claim 接上 3007 降级链**（此前只有推理路径有，领取这条**最需要**它的路径反而没有）。
@@ -1448,6 +1520,12 @@ export class ZcodeAuth extends Service {
            * ## 三条纪律
            * 1. **只按 `minted.source === 'internal'` 归因**：chromium 的 param 被拒是
            *    「时效 / 设备信誉」问题（`CaptchaBackoff` 管的那本账），不许记到载体头上；
+           *    而 `source === 'chromium'` 本身就说明**载体链本轮没参与**
+           *    （web 版 `supplied` 恒 0、或 env 关掉了），**没有第二条链可换** ——
+           *    「chromium 被拒也重试一次」只会白扣同设备每小时 150 次那份配额，
+           *    且换一个 chromium param 面对同一个服务端判定，期望收益极低
+           *    （Gitee issue IKJNPS 的附注质疑过这一点，结论是**维持现状**：
+           *    修好 region 之后，chromium 侧残留的 3007 都是时效/信誉性质，重试无益）；
            * 2. **重发上限一次**：`retried` 标志在本 plan 循环内，重发后**无论成不成**都收工
            *    —— 再撞 `3007` 就如实失败。再试下去只是白扣设备级配额（阿里云同设备 150 次/小时），
            *    而且「已经换过 chromium 还是 3007」这件事**本身就是**给用户的诊断信息；
@@ -1455,14 +1533,17 @@ export class ZcodeAuth extends Service {
            *    `CaptchaCarrier` 判本次运行禁用（见 `noteInternalRejection`）。
            *    「窗口结束时推进」与「当场推进」等价 —— 计数是**累计**的，窗口边界不影响它。
            *
-           * ⚠ 重发用**注入链**（`mintCaptcha`，即 `jet-hub-rpc.ts` 注入的那条：
-           *   现取 captcha 配置 → `zcode.mintCaptcha`），不是 `carrier` 里那条腿 ——
+           * ⚠ 重发用**注入链**（`mintCaptcha`，即 `jet-hub-rpc.ts` 注入的那条
+           *   `zcode.mintCaptcha`），不是 `carrier` 里那条腿 ——
            *   claim 的 param 一贯由注入链产出，兜底也该走同一条，别在领取路径上偷换来源。
+           * ⚠ 重发**沿用同一份配置**（`captchaConfig`）：换 param 不换配置，
+           *   region 也就不变 —— 否则重发会亲手制造出「param 与 region 不同源」，
+           *   把一个偶发 `3007` 变成确定性失败。
            */
           if (outcome.code === 3007 && minted.source === 'internal') {
             this.carrier.noteInternalRejection()
             outcomes.push(await this.retryClaimWithInjectedChain(
-              credential, plan.planId, mintCaptcha, captchaRegion,
+              credential, plan.planId, mintCaptcha, captchaConfig, region,
             ))
             continue
           }
@@ -1515,11 +1596,17 @@ export class ZcodeAuth extends Service {
    * 前者意味着**这台机器的设备信誉有问题**（上游把无感验证降级了），
    * 继续点只会更糟；后者可能只是这一发赶上了什么。`toClaimOutcome` 的
    * `internalRetried` 开关就是干这个的。
+   *
+   * ## ⚠ 重发**不重新取配置**（issue IKJNPS 的同一条纪律）
+   * 换的是 param，不是 region。config 与 `captchaRegion` 都由调用方
+   * （`claimDailyWith`）原样传进来 —— 保持「param 与 region 同源」这件事
+   * **贯穿整个领取窗口**，包括这一次重发。
    */
   private async retryClaimWithInjectedChain(
     credential: ZcodeCredential,
     planId: string,
-    injected: (() => Promise<string>) | undefined,
+    injected: ZcodeClaimCaptchaMint | undefined,
+    captchaConfig: ZcodeCaptchaConfig,
     captchaRegion: string,
   ): Promise<ClaimOutcome> {
     if (injected === undefined) {
@@ -1534,7 +1621,7 @@ export class ZcodeAuth extends Service {
     this.carrierLog?.(
       'zcode: 领取时内部载体的 captcha 被拒（3007）⇒ 当次改用注入的浏览器链路重发一次',
     )
-    const param = await injected()
+    const param = await injected(captchaConfig)
     const retried: ZcodeClaimOutcome = await claimZcodePlan(
       credential, planId, { param, region: captchaRegion }, this.fetchImpl,
     )
