@@ -156,27 +156,98 @@ export function sortOpenProvidersByOrder(openProviders, order) {
 }
 
 /**
- * 拖拽落点之后的**完整**顺序（纯函数）：已打开组内移动，已关闭组按声明序缀尾。
+ * 拖拽落点之后的**完整**顺序（纯函数）。
  *
- * ## 为什么已关闭的要缀尾而不是原样保留旧位置
+ * ## 数组语义
  *
- * `order` 数组的语义是「已打开组的目标顺序 + 关闭组占位」。展示侧只读它的
- * **已打开**部分（关闭组恒按声明顺序渲染），所以尾段内容不影响渲染 —— 但必须
- * 把关闭的 id 写回去：否则「拖拽 → 关闭某供应商 → 再打开」后它会掉到未定位
- * 段，失去用户给它排过的位置。缀尾用**声明顺序**（而非旧数组里的相对顺序）：
- * 确定性更强，且与「关闭组按声明顺序沉底」的展示口径一致。
+ * 结果数组 = 「已打开组的目标顺序 + 已关闭组的**位置占位**」。展示侧只读
+ * 它的**已打开**部分（关闭组恒按声明顺序渲染），尾段内容不影响渲染，
+ * 但**必须**把已关闭的 id 写回去 —— 它们是「重开时回到哪一位」的唯一依据。
+ *
+ * ## ⚠️ 已关闭 id 的位置由「它在旧顺序里的直接前驱」决定
+ *
+ * 真实缺陷（PR #63 初版）：已关闭 id 被**无条件缀尾**，于是只要在它关闭
+ * 期间又拖了一次，它在旧数组里的位置就永久丢失 —— 重开后掉到未定位段，
+ * 与「重新打开曾排序过的供应商 → 回到它原来的位置」这条承诺直接矛盾。
+ *
+ * ```
+ * order = [a, b, d, c]   （用户把 d 拖到了 b 之后）
+ * 关闭 d，再拖一次 c → 若按缀尾写回 = [a, c, b, d]
+ * 重开 d → 落在末尾 ❌（承诺是回到 b 旁边）
+ * ```
+ *
+ * 位置本身不必精确记录一个下标 —— 记住它在旧顺序里的**直接前驱**（这里是
+ * `b`）即可，重开时插到 `b` 之后；open 段被整体重排也不影响这个相对位置。
+ * ⚠️ 刻意**不用**「前面有几个已打开项」：那种计数会随他人被拖动而漂移，
+ * 而用户的心智是「我把它排在那行**旁边**」。
+ *
+ * ## 为什么保留旧相对位置、而不是每次都按声明序缀尾
+ *
+ * 声明序兜底只在「从未自定义过顺序」（无 `oldOrder`）时成立；一旦用户拖过，
+ * 声明序就不再是他心里的位置。反过来，**无已关闭 id** 时结果与旧实现逐字
+ * 相同（只有 open 段），既有行为完全不受影响。
  *
  * @param {string[]} openIds 当前展示中已打开的供应商 id（展示顺序）
- * @param {string[]} closedIds 已关闭的供应商 id（声明顺序）
+ * @param {string[]} closedIds 已关闭的供应商 id（展示顺序，恒为声明序）
  * @param {string} sourceId 被拖动的 id
  * @param {string} targetId 落点 id
  * @param {'before' | 'after'} position 插到落点之前还是之后
+ * @param {string[] | null | undefined} [oldOrder] 上一次提交的完整顺序（用于
+ *   还原已关闭 id 的位置）；缺省时退化为按展示顺序缀尾
  * @returns {string[] | null} 新顺序；无需变更时返回 null（同 {@link orderAfterDrop}）
  */
-export function nextProviderOrderAfterDrop(openIds, closedIds, sourceId, targetId, position) {
+export function nextProviderOrderAfterDrop(openIds, closedIds, sourceId, targetId, position, oldOrder) {
   const moved = orderAfterDrop(openIds, sourceId, targetId, position);
   if (moved === null) return null;
-  return [...moved, ...closedIds];
+  if (!Array.isArray(closedIds) || closedIds.length === 0) return moved;
+  // 无旧顺序可依据（从未自定义过）→ 退化为按展示顺序缀尾。
+  if (!Array.isArray(oldOrder) || oldOrder.length === 0) return [...moved, ...closedIds];
+
+  // 记录每个已关闭 id 在旧顺序里的**直接前驱**（前一个已打开项）。
+  // ⚠️ 必须用 **openIds**（当前已打开集合）判断「哪些算已打开」——旧顺序里
+  // 可能混有已删除的 provider id（跨版本增删），它们既不是 open 也不是 closed。
+  // 用「前驱」而非「前面有几个 open」：用户的心智是「我把它排在那行旁边」，
+  // 贴着前驱才能在别人被拖动后仍然跟住（按计数则会跟着下标漂移）。
+  const openSet = new Set(openIds);
+  const closedSet = new Set(closedIds);
+  /** @type {Map<string, string | null>} closedId → 旧顺序里的直接 open 前驱（null = 排最前） */
+  const predecessor = new Map();
+  let lastOpen = null;
+  for (const id of oldOrder) {
+    if (openSet.has(id)) { lastOpen = id; continue; }
+    if (closedSet.has(id) && !predecessor.has(id)) predecessor.set(id, lastOpen);
+  }
+
+  // 逐个插回：前驱已在新 open 序列里 → 紧跟其后；跟不住的（孤儿）最后统一沉尾。
+  const result = [...moved];
+  // ⚠️ 孤儿（`oldOrder` 里查不到、或其前驱不在新 open 段内）只能沉尾：
+  // 查不到前驱 ⇒ 无从判断它「排在哪一行旁边」，沉尾是最保守且可预期的选择
+  // （实测：前驱缺失 / 前驱是已删除 id，两种都落到末位）。
+  const orphans = [];
+  // ⚠️ 必须**按旧顺序分组整块插入**，不能逐个 splice 到前驱之后：
+  // 多个已关闭 id 可能共享同一前驱（old=[a,b,d,e,c]，d 与 e 的前驱都是 b），
+  // 逐个插会让后一个挤到前一个**前面**（实测得到 b,e,d，与旧序相反）。
+  /** @type {Map<string, string[]>} 前驱 → 挂在它后面的已关闭 id（保持旧序） */
+  const groups = new Map();
+  for (const id of oldOrder) {
+    if (!closedSet.has(id) || !predecessor.has(id)) continue;
+    const pred = predecessor.get(id);
+    // `pred === null` 表示它在旧顺序里排最前（前面没有任何已打开项）→ 跟不住，沉尾。
+    if (pred === null) { orphans.push(id); continue; }
+    if (!groups.has(pred)) groups.set(pred, []);
+    // ⚠️ 不要写 `groups.get(pred)!.push(id)`：本文件是 .js（非 TS），
+    // 非空断言 `!` 会被构建链的解析器拒收（实测 build/test 直接报 Parse failure）。
+    groups.get(pred).push(id);
+  }
+  for (const [pred, ids] of groups) {
+    const at = result.indexOf(pred);
+    if (at === -1) { orphans.push(...ids); continue; }   // 前驱不在新 open 段里
+    result.splice(at + 1, 0, ...ids);
+  }
+  // `closedIds` 里连旧顺序都没出现过的（跨版本新增）→ 同样沉尾，保证不丢 id。
+  for (const id of closedIds) if (!result.includes(id)) orphans.push(id);
+  for (const id of orphans) result.push(id);
+  return result;
 }
 
 /**

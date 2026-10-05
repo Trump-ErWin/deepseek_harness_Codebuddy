@@ -440,13 +440,126 @@ describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () =>
         .toEqual(['c', 'a', 'b', 'd'])
     })
 
-    it('已关闭组按声明顺序缀尾（展示侧只读 open 段，尾段是 reopen 定位的占位）', () => {
+    it('无已关闭 id 时只返回 open 段（与 orderAfterDrop 逐字相同）', () => {
+      expect(nextProviderOrderAfterDrop(['a', 'b', 'c'], [], 'a', 'c', 'after'))
+        .toEqual(['b', 'c', 'a'])
+    })
+
+    it('已关闭组按声明顺序缀尾（未自定义顺序时的既有口径）', () => {
       expect(nextProviderOrderAfterDrop(['a', 'c'], ['b', 'e', 'd'], 'c', 'a', 'after'))
         .toEqual(['a', 'c', 'b', 'e', 'd'])
     })
 
     it('源与目标相同 → null（无需变更，调用方不提交）', () => {
       expect(nextProviderOrderAfterDrop(['a', 'b'], ['c'], 'a', 'a', 'before')).toBeNull()
+    })
+  })
+
+  // ⚠️ 回归：PR #63 初版把已关闭 id 无条件缀尾，导致「关闭期间又拖一次」
+  // 后旧位置永久丢失，重开时回不到用户排过的地方（PR 描述承诺「回到原位」）。
+  describe('已关闭 id 在拖拽后保留原位（回归：关闭期间再拖一次）', () => {
+    const IDS = ['a', 'b', 'c', 'd', 'e']
+
+    /** 按面板真实路径走一遍：渲染 → 取 open/closed 段 → 拖拽 → 提交。 */
+    const dropThrough = (order: string[] | null, closed: string[], s: string, t: string, p: 'before' | 'after') => {
+      const providers = IDS.map(id => ({ id, label: id }))
+      const statuses = Object.fromEntries(IDS.map(id => [
+        id, { closed: closed.includes(id), models: { total: 3 } },
+      ]))
+      const rows = providerSwitchRows(providers, statuses, order)
+      return nextProviderOrderAfterDrop(
+        rows.filter(r => r.checked).map(r => r.id),
+        rows.filter(r => !r.checked).map(r => r.id),
+        s, t, p,
+        // ⚠️ 必须把当前 order 传进去：已关闭 id 的位置由「它在**旧** order 里
+        // 前面有几个已打开项」确定，漏传就退化成「按展示序缀尾」= 修复前行为。
+        order,
+      )
+    }
+    const renderIds = (order: string[] | null, closed: string[]) => {
+      const providers = IDS.map(id => ({ id, label: id }))
+      const statuses = Object.fromEntries(IDS.map(id => [
+        id, { closed: closed.includes(id), models: { total: 3 } },
+      ]))
+      return providerSwitchRows(providers, statuses, order).map(r => r.id)
+    }
+
+    it('关闭某供应商后再次拖拽，该供应商重开时仍回到用户排过的位置', () => {
+      // ① 用户把 d 拖到 b 之后 → a b d c e
+      const first = dropThrough(null, [], 'd', 'b', 'after')
+      expect(first).toEqual(['a', 'b', 'd', 'c', 'e'])
+      // ② 关闭 d，在剩下 4 个里再拖一次（e 拖到 a 之后）→ a e b d c
+      const second = dropThrough(first, ['d'], 'e', 'a', 'after')
+      // ③ 重开 d：d 的锚点仍是「前面有 2 个已打开项」→ 跟在 b 之后，
+      //    即它相对 a/e/b 的位置没变。❌ 修复前 d 会被甩到数组末尾。
+      expect(renderIds(second, [])).toEqual(['a', 'e', 'b', 'd', 'c'])
+      expect(second!.indexOf('d')).toBeLessThan(second!.indexOf('c'))
+    })
+
+    it('多个已关闭 id 各自保留原位，且不丢失、不重复', () => {
+      let order = dropThrough(null, [], 'd', 'b', 'after')      // → a b d c e
+      order = dropThrough(order, ['d', 'e'], 'c', 'a', 'after')  // 关闭 d/e，c 拖到 a 之后
+      const all = renderIds(order, [])
+      expect(all).toHaveLength(IDS.length)
+      expect(new Set(all).size).toBe(IDS.length)
+      // 语义是「贴着**旧顺序里的直接前驱**」：d 的前驱是 b → d 紧跟 b；
+      // e 的前驱是 c（它在旧顺序里排最末）→ e 紧跟 c。
+      // ⚠️ 断言必须落在前驱 id 上（不是「第 N 个 open」）—— 计数会漂移，前驱不会。
+      expect(all.indexOf('d')).toBe(all.indexOf('b') + 1)
+      expect(all.indexOf('e')).toBe(all.indexOf('c') + 1)
+    })
+
+    it('关闭组仍按声明顺序沉底（自定义顺序不覆盖关闭组的展示）', () => {
+      let order = dropThrough(null, [], 'd', 'b', 'after')
+      order = dropThrough(order, ['d', 'e'], 'c', 'a', 'after')
+      // 展示侧只读 open 段并按声明序排关闭组：d、e 恒在末尾且 d 在 e 之前
+      expect(renderIds(order, ['d', 'e'])).toEqual(['a', 'c', 'b', 'd', 'e'])
+    })
+
+    it('旧顺序缺失（未自定义）时退化为缀尾，不抛错', () => {
+      // 无 oldOrder 可依据：已关闭 id 只能按展示顺序缀尾。
+      expect(nextProviderOrderAfterDrop(['a', 'b'], ['c'], 'a', 'b', 'after'))
+        .toEqual(['b', 'a', 'c'])
+    })
+
+    it('旧顺序里的未知/已删除 id 不产生空洞（跨版本增删 provider）', () => {
+      // open=['a','b','c']；closed=['z']；旧顺序 x a b c 里混有已删除的 'x'。
+      // 期望：'x' 既非 open 也非 closed → 被忽略；z 的前驱是 b → 插到 b 之后。
+      const next = nextProviderOrderAfterDrop(
+        ['a', 'b', 'c'], ['z'], 'c', 'a', 'after', ['x', 'a', 'b', 'c'],
+      )
+      expect(next).toEqual(['a', 'c', 'b', 'z'])
+      // 关键不变量：没有重复、没有把已删除的 'x' 带回来
+      expect(new Set(next).size).toBe(next!.length)
+      expect(next).not.toContain('x')
+    })
+
+    it('前驱被拖到别处后，已关闭 id 仍跟住它（而非按计数漂移）', () => {
+      // 旧顺序 a b d c e：d 的前驱是 b。
+      // 这次把 b 拖到最前 → open 段 b a c，d 必须紧跟 b。
+      const next = nextProviderOrderAfterDrop(
+        ['a', 'b', 'c'], ['d'], 'b', 'a', 'before', ['a', 'b', 'd', 'c', 'e'],
+      )
+      expect(next).toEqual(['b', 'd', 'a', 'c'])
+    })
+
+    it('连续多个已关闭 id 共享同一前驱时，保持它们在旧顺序里的相对次序', () => {
+      // ⚠️ 回归：逐个 splice 到前驱之后会让后一个挤到前一个**前面**
+      // （b,d,e 变成 b,e,d，与旧序相反）—— 必须按前驱分组整块插入。
+      const next = nextProviderOrderAfterDrop(
+        ['a', 'b', 'c'], ['d', 'e'], 'c', 'a', 'after', ['a', 'b', 'd', 'e', 'c'],
+      )
+      // d 与 e 的前驱都是 b → 整块插在 b 之后，且保持 d 在 e 之前
+      expect(next).toEqual(['a', 'c', 'b', 'd', 'e'])
+    })
+
+    it('跟不住的已关闭 id 沉尾（前驱缺失或为已删除的 id）', () => {
+      // 前驱在旧顺序里不存在（跨版本新增的 provider）
+      expect(nextProviderOrderAfterDrop(['a', 'b'], ['x'], 'a', 'b', 'after', ['a', 'b']))
+        .toEqual(['b', 'a', 'x'])
+      // 前驱是个已被删除的 id
+      expect(nextProviderOrderAfterDrop(['a', 'b'], ['x'], 'a', 'b', 'after', ['zz', 'a', 'b']))
+        .toEqual(['b', 'a', 'x'])
     })
   })
 
@@ -494,11 +607,76 @@ describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () =>
     })
 
     it('行拖拽的视觉状态与账号卡片同款（淡出 + 插入线）', () => {
-      expect(styles).toContain('.dim-jh-modelRow[data-dragging="true"]')
-      expect(styles).toContain('.dim-jh-modelRow[data-dropBefore="true"]::before')
-      expect(styles).toContain('.dim-jh-modelRow[data-dropAfter="true"]::after')
+      // ⚠️ 必须带 `.dim-jh-modal` 作用域：`.dim-jh-modelRow` 是共享类名
+      // （ModelToggle / GatewayPanel 也在用），挂 position:relative 作用域过宽。
+      expect(styles).toContain('.dim-jh-modal .dim-jh-modelRow[data-dragging="true"]')
+      expect(styles).toContain('.dim-jh-modal .dim-jh-modelRow[data-dropBefore="true"]::before')
+      expect(styles).toContain('.dim-jh-modal .dim-jh-modelRow[data-dropAfter="true"]::after')
       // 插入线是 absolute 定位，行必须有 relative 锚点。
-      expect(styles).toMatch(/\.dim-jh-modelRow \{ position: relative; \}/)
+      expect(styles).toMatch(/\.dim-jh-modal \.dim-jh-modelRow \{ position: relative; \}/)
+      // 反向断言：不得留下无作用域的全局规则
+      expect(styles).not.toMatch(/^\.dim-jh-modelRow \[data-dragging/m)
+    })
+
+    // ⚠️ 回归（PR #63 复审发现）：初版 onDrop 漏传 oldOrder，已关闭 id 的位置
+    // 在「关闭期间又拖一次」后永久丢失 —— 这条断言锁住调用点的实参个数。
+    it('⚠️ onDrop 必须把当前 order 作为 oldOrder 传给 nextProviderOrderAfterDrop', () => {
+      const body = panelBody()
+      expect(body).toMatch(
+        /nextProviderOrderAfterDrop\(openIds, closedIds, sourceId, row\.id, dropPosition, order\)/,
+      )
+    })
+  })
+
+  // ⚠️ 回归（PR #63 复审发现）：初版没有排序提交锁。不做乐观更新 ⇒ RPC 返回前
+  // 界面顺序未变，再拖一次会基于旧顺序计算并把上一次的移动静默覆盖。
+  describe('排序提交的互斥（防止连续拖拽互相覆盖）', () => {
+    it('提交期间整体冻结拖拽（reordering 并入 dragEnabled）', () => {
+      const body = panelBody()
+      expect(body).toMatch(/busyIds\.size === 0[\s\S]{0,80}!reordering;/)
+    })
+
+    it('互斥用 ref 而非 state（两次 drop 可落在同一渲染周期内）', () => {
+      // ⚠️ 局限（已知）：这是**存在性**断言，锁住「ref 声明 + 早退 + finally 释放」
+      // 三处关键代码都在。它防不住「把锁挪进永不调用的死函数」这类伪装 ——
+      // 单测环境没有 react，无法渲染组件做行为验证，这是架构性缺口。
+      // 真正的行为保障是「拖拽提交期间整体冻结」那条（本组第 1 条）。
+      expect(source).toContain('const reorderLockRef = React.useRef(false);')
+      expect(source).toContain('if (reorderLockRef.current) return;')
+      // 释放路径必须在 finally：失败时也要解锁，否则一次失败后拖拽永久失效。
+      expect(source).toMatch(/finally \{[\s\S]{0,200}reorderLockRef\.current = false;/)
+    })
+  })
+
+  // ⚠️ 回归（PR #63 复审发现）：失败提示原本只渲染在页面层，而弹窗遮罩是
+  // fixed + z-index 3000，拖拽时完全看不到 —— 等于静默失败。
+  describe('排序保存失败的提示必须可见', () => {
+    it('弹窗内渲染 notice（复用既有样式，不新增 CSS）', () => {
+      const body = panelBody()
+      // ⚠️ 断言「无条件渲染」而非 `notice && notice.inModal`：弹窗开着时
+      // toggleProvider 的结果提示在页面层同样被遮罩盖住，按 inModal 过滤会
+      // 让「切换供应商」也变成静默无反馈。
+      expect(body).toMatch(/^\s*notice\s*$/m)
+      expect(body).not.toMatch(/notice\s*&&\s*notice\.inModal/)
+      expect(body).toContain("className: 'dim-jh-probeNotice'")
+    })
+
+    it('页面层在弹窗打开时跳过渲染（避免遮罩内外重复出现两条）', () => {
+      // 弹窗是 fixed + z-index 3000 的覆盖层，页面层那条必然被盖住 ⇒ 只在
+      // 弹窗关闭时（不挂载）才由页面层渲染。
+      expect(source).toMatch(/showProviderSwitches\s*\?[\s\S]{0,600}notice: providerNotice/)
+      // 弹窗关闭时页面层仍要能显示（非 inModal 的那些，如切换结果）
+      expect(source).toContain('providerNotice && !providerNotice.inModal')
+    })
+
+    it('失败分支标记 inModal（供页面层在弹窗关闭后决定是否延后展示）', () => {
+      // ⚠️ 必须**剥掉注释**再匹配：这段代码附近有一整段说明「为什么要 inModal」
+      // 的注释，直接对原文做宽窗口匹配可能被注释里的字面量喂饱。
+      const codeOnly = source
+        .split(/\r?\n/)
+        .filter(line => !line.trim().startsWith('//'))
+        .join('\n');
+      expect(codeOnly).toMatch(/保存排序失败[\s\S]{0,240}inModal:\s*true/)
     })
   })
 })
