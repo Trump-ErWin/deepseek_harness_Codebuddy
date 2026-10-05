@@ -19,7 +19,13 @@
  *    故不传；`translateGeminiRequest` 内部默认走 `AUTO`。
  */
 
-import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import {
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  isContextWindowExceededError,
+  LlmAdapter,
+  LlmError,
+  ReasoningEffortId,
+} from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -38,6 +44,7 @@ import {
   GEMINI_ENDPOINTS,
   GEMINI_IDLE_TIMEOUT_MS,
   GEMINI_MAX_IMAGE_BYTES_INLINE,
+  GEMINI_MAX_REQUEST_BODY_BYTES,
   GEMINI_SESSION_LANE_INFER,
   GEMINI_STREAM_PATH,
   GEMINI_UPSTREAM_FLASH,
@@ -123,6 +130,62 @@ export function isGeminiSessionOverflow(text: string): boolean {
  * 无界升代会变成死循环。一代失败后如实透传错误，让用户看到上游原文。
  */
 const GEMINI_MAX_SESSION_BUMPS = 1
+
+/**
+ * Gemini 的上下文超限措辞。
+ *
+ * 实测报文：
+ * ```
+ * {"error":{"code":400,"message":"The input token count (1200000) exceeds
+ *  the maximum number of tokens allowed (1048576).","status":"INVALID_ARGUMENT"}}
+ * ```
+ *
+ * ⚠️ **harness 的 `isContextWindowExceededError` 认不出这句话** —— 实测其五个
+ * 分支里最接近的 `EXCEEDS_MODEL_CONTEXT` 要求 `exceed...` 与 `context` 同时
+ * 出现（`\b(?:input|prompt|request)\b.{0,40}\bexceed\b.{0,40}\bcontext\b`），
+ * 而这句话里**一个 `context` 都没有**。这与 `buddy-adapter.ts` 当年漏判
+ * 「prompt is too long: N tokens > M maximum」是**同一类缺陷**，修法也相同：
+ * 本仓库补一条专属判据。
+ *
+ * ⚠️ 判据要求「token count」+「exceeds the maximum」两个特征同时出现，
+ * 避免把别的内容类 400 误判成溢出（宽泛措辞会误判，代价见上）。
+ */
+const GEMINI_TOKEN_COUNT_OVERFLOW =
+  /\btoken\s+count\b[\s\S]{0,60}?\bexceeds?\s+the\s+maximum\b/i
+
+/**
+ * 判定 400 是否表示**上下文超限**（应归 `CONTEXT_WINDOW_EXCEEDED`）。
+ *
+ * ## 为什么必须单独判（与 {@link isGeminiSessionOverflow} 是**两条不同的路**）
+ *
+ * | 情形 | 病因 | 处置 |
+ * |---|---|---|
+ * | 服务端**按 sessionId 累计**超 1M | 上游会话记账 | **升代**换新 sessionId |
+ * | 本地历史把**单次请求**撑过窗口 | 本请求太大 | **压缩上下文**后重发 |
+ *
+ * 前者升代就够（新会话记账归零）；后者升代**没用** —— 请求体本身还是那么大。
+ * 所以两条判据不能互相替代。
+ *
+ * ⚠️ 上游对这两种情形回的是**同一句话**（都是「input token count exceeds …
+ * 1048576」），无法从报文区分。因此实际处置是**升级式**的：
+ * 先升代（便宜），升过仍失败就归 `CONTEXT_WINDOW_EXCEEDED` 交给 harness 压缩
+ * （贵但能根治）。见 `gemini-adapter.ts` 里两个判据的**先后顺序**。
+ *
+ * ## 归错码的代价是**不对称**的
+ *
+ * `dsh-compaction-basic` 的 request-error listener 第一行是
+ * `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()` —— 归成
+ * `INVALID_REQUEST`（`httpErrorCode` 的 400 兜底）就**连一次压缩的机会都没有**，
+ * 长会话越过窗口后每轮都报废、用户只能开新会话。
+ * 归成溢出的最坏结果只是一次无效的压缩尝试。方向取「宁可多判一次溢出」。
+ *
+ * 判定口径与 `buddy-adapter.ts` / `llm-adapter.ts` 的 `httpErrorCode` 一致：
+ * 用**完整报文**（不先用 `errorDetail` 归一化 —— 那会丢掉 `extError` /
+ * `displayMsg` 等结构化字段，实测会漏判）。
+ */
+function isGeminiContextOverflow(text: string): boolean {
+  return isContextWindowExceededError(text) || GEMINI_TOKEN_COUNT_OVERFLOW.test(text)
+}
 
 /** {@link GeminiAdapter} 的构造选项。 */
 export interface GeminiAdapterOptions {
@@ -533,17 +596,35 @@ export class GeminiAdapter extends LlmAdapter {
           ...images === undefined ? {} : { images },
           ...droppedSignatures || sigStore === undefined
             ? {}
-            : { lookupSignature: (name: string, argsJson: string) => sigStore.get(name, argsJson) },
+            : {
+              lookupSignature: (name: string, argsJson: string) => {
+                // 精确键（工具名 + 逐字参数）优先；miss 时回退到「该工具名最近一次
+                // 签名」。参数漂移（路径/时间戳变化）在长任务里是必然事件，没有
+                // 这层回退就只能走去签重试，而那条路会把整条思考链丢掉。
+                return sigStore.get(name, argsJson) ?? sigStore.latestForTool(name)
+              },
+            },
         })
 
         const url = `${GEMINI_ENDPOINTS[endpointIdx] ?? GEMINI_ENDPOINTS[0]}${GEMINI_STREAM_PATH}`
+        // ⚠️ 请求体上限必须**发送前**检查：超限时上游要么回一个措辞不稳定的 400，
+        // 要么直接断连，两种都比本地判定难查。归类走 `CONTEXT_WINDOW_EXCEEDED`
+        // 让 harness 去压缩上下文重试（而不是抛 `INVALID_REQUEST` 这条死路）。
+        const wire = marshalAlphabetical(envelope)
+        const wireBytes = Buffer.byteLength(wire, 'utf8')
+        if (wireBytes > GEMINI_MAX_REQUEST_BODY_BYTES) {
+          throw new LlmError(
+            `gemini: 请求体 ${wireBytes} 字节超过上限 ${GEMINI_MAX_REQUEST_BODY_BYTES} 字节`,
+            CONTEXT_WINDOW_EXCEEDED_CODE,
+          )
+        }
         let response: Response
         try {
           response = await fetch(url, {
             method: 'POST',
             // ⚠️ 流式**刻意不带 `Accept`**（抓包一致，见 `geminiHeaders`）。
             headers: geminiHeaders(credential),
-            body: marshalAlphabetical(envelope),
+            body: wire,
             signal: options.signal,
           })
         } catch (error) {
@@ -607,6 +688,17 @@ export class GeminiAdapter extends LlmAdapter {
           || status === 404
           || (status === 400 && isGeminiSwitchableText(text))
         const quotaLike = status === 429 || (status === 400 && isGeminiQuotaText(text))
+
+        // 2.5 上下文超限：**不换端点、不换账号**，直接归 `CONTEXT_WINDOW_EXCEEDED`
+        // 交给 harness 压缩。
+        //
+        // ⚠️ 必须挡在换端点/换号**之前**：请求体本身太大，换端点或换账号都
+        // 减小不了它，白跑两轮。而且超限措辞里若出现 `exceeded`（`exceeds` 的
+        // 变体），会被 `quotaLike` 吃掉去换号 —— 那是完全无效的动作。
+        // 归 `CONTEXT_WINDOW_EXCEEDED` 才能触发 `dsh-compaction-basic` 压缩重试。
+        if (status === 400 && isGeminiContextOverflow(text)) {
+          throw this.classifyFailure(status, text)
+        }
 
         // 2. 先换端点（廉价兜底，一次）。
         if ((endpointFirst || status === 429) && !endpointSwitched) {
@@ -679,6 +771,13 @@ export class GeminiAdapter extends LlmAdapter {
   private classifyFailure(status: number, text: string): LlmError {
     const detail = text === '' ? '' : ` — ${text.slice(0, 500)}`
     const message = `gemini: HTTP ${status}${detail}`
+    // ⚠️ 上下文超限必须**最先**判：`isGeminiQuotaText` 的关键词表里有
+    // `exceeded` / `exceeded` 一类的措辞，超限报文很容易被它先吃掉归成
+    // `QUOTA_EXCEEDED` —— 而那个码**不触发 compaction**，长会话就此报废。
+    // 见 `isGeminiContextOverflow` 的注释（归错码的代价不对称）。
+    if (status === 400 && isGeminiContextOverflow(text)) {
+      return new LlmError(message, CONTEXT_WINDOW_EXCEEDED_CODE, { status })
+    }
     if (status === 400 && isGeminiQuotaText(text)) {
       return new LlmError(message, 'QUOTA_EXCEEDED', { status })
     }

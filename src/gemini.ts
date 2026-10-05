@@ -693,7 +693,14 @@ export interface GeminiInlineImage {
 
 /** 上游单张内联图片的体积上限（超出则整请求被拒）。 */
 export const GEMINI_MAX_IMAGE_BYTES_INLINE = 10 * 1024 * 1024
-/** 请求体上限。 */
+/**
+ * 请求体上限（发送前**真实检查**，见 `gemini-adapter.ts` 的发送点）。
+ *
+ * ⚠️ 2026-10-05：这个常量此前**定义了但全仓零引用** —— 看着有防护，实际没有。
+ * 现已接上。超限归类走 `CONTEXT_WINDOW_EXCEEDED`（触发 harness 压缩重试）
+ * 而不是 `INVALID_REQUEST`（死路）——理由与 `isGeminiContextOverflow` 同：
+ * 归错码的代价不对称。
+ */
 export const GEMINI_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 
 /**

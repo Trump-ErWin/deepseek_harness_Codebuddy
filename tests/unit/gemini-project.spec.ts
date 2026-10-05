@@ -59,7 +59,7 @@ const lcaOk = (body: string): (() => Response) =>
   () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } })
 
 describe('gemini project 解析', () => {
-  it('顶层 cloudaicompanionProject 优先；currentTier 里的是兜底', () => {
+  it('project 取值顺序：顶层优先、currentTier 兜底、都缺则空串', () => {
     expect(parseGeminiProject({ cloudaicompanionProject: 'CCP-TOP' })).toBe('CCP-TOP')
     expect(parseGeminiProject({ currentTier: { cloudaicompanionProject: 'CCP-TIER' } })).toBe('CCP-TIER')
     // 顶层优先（逐字对齐 `project.go:129-132` 的取值顺序）
@@ -82,78 +82,75 @@ describe('gemini project 解析', () => {
 })
 
 describe('gemini project 三级缓存', () => {
-  it('★ 一级：进程内缓存命中 ⇒ 不打 LCA', async () => {
-    const cache = new Map<string, string>([['user@example.com', 'CACHED']])
-    const { fetcher, calls } = fakeFetch([lcaOk('{"cloudaicompanionProject":"SHOULD-NOT-BE-USED"}')])
-    const probe = await resolveGeminiProject({ credential: cred(), cache, fetcher })
-    expect(probe.project).toBe('CACHED')
-    expect(probe.probed).toBeFalsy()
-    expect(calls).toHaveLength(0)
-  })
+  it('★ 一级 / 二级命中 ⇒ 都不打 LCA', async () => {
+    // 一级：进程内缓存
+    const cached = new Map<string, string>([['user@example.com', 'CACHED']])
+    const l1 = fakeFetch([lcaOk('{"cloudaicompanionProject":"SHOULD-NOT-BE-USED"}')])
+    const p1 = await resolveGeminiProject({ credential: cred(), cache: cached, fetcher: l1.fetcher })
+    expect(p1.project).toBe('CACHED')
+    expect(p1.probed).toBeFalsy()
+    expect(l1.calls).toHaveLength(0)
 
-  it('★ 二级：凭据字段命中 ⇒ 不打 LCA，并回填内存缓存', async () => {
-    const cache = new Map<string, string>()
-    const { fetcher, calls } = fakeFetch([lcaOk('{"cloudaicompanionProject":"SHOULD-NOT-BE-USED"}')])
-    const probe = await resolveGeminiProject({
+    // 二级：凭据字段（并回填一级）
+    const empty = new Map<string, string>()
+    const l2 = fakeFetch([lcaOk('{"cloudaicompanionProject":"SHOULD-NOT-BE-USED"}')])
+    const p2 = await resolveGeminiProject({
       credential: cred({ cloudaicompanionProject: 'FROM-CRED' }),
-      cache,
-      fetcher,
+      cache: empty,
+      fetcher: l2.fetcher,
     })
-    expect(probe.project).toBe('FROM-CRED')
-    expect(calls).toHaveLength(0)
-    expect(cache.get('user@example.com')).toBe('FROM-CRED')
+    expect(p2.project).toBe('FROM-CRED')
+    expect(l2.calls).toHaveLength(0)
+    expect(empty.get('user@example.com')).toBe('FROM-CRED')
   })
 
-  it('★ 三级：都没有才现探，且 sandbox 优先（原版把 LCA 固定路由到 sandbox）', async () => {
+  it('★ 三级：现探走 sandbox 优先；第一个端点失败回退 daily；探到真值进缓存', async () => {
     const cache = new Map<string, string>()
-    const { fetcher, calls } = fakeFetch([lcaOk('{"cloudaicompanionProject":"CCP-PROBED"}')])
-    const probe = await resolveGeminiProject({ credential: cred(), cache, fetcher })
+    const first = fakeFetch([lcaOk('{"cloudaicompanionProject":"CCP-PROBED"}')])
+    const probe = await resolveGeminiProject({ credential: cred(), cache, fetcher: first.fetcher })
     expect(probe.project).toBe('CCP-PROBED')
     expect(probe.probed).toBe(true)
-    expect(calls).toHaveLength(1)
-    expect(calls[0]).toBe(`${GEMINI_ENDPOINT_SANDBOX}${GEMINI_LOAD_CODE_ASSIST_PATH}`)
-    // 探到的真值进内存缓存
+    expect(first.calls).toHaveLength(1)
+    expect(first.calls[0]).toBe(`${GEMINI_ENDPOINT_SANDBOX}${GEMINI_LOAD_CODE_ASSIST_PATH}`)
     expect(cache.get('user@example.com')).toBe('CCP-PROBED')
-  })
 
-  it('★ 探测成功但 project 为空 ⇒ 兜底串 + probed，**不是** error', async () => {
-    const { fetcher } = fakeFetch([lcaOk('{"currentTier":{"id":"free-tier","name":"Antigravity"}}')])
-    const probe = await resolveGeminiProject({ credential: cred(), fetcher })
-    expect(probe.project).toBe(GEMINI_DEFAULT_PROJECT)
-    expect(probe.error).toBeUndefined()
-    expect(probe.probed).toBe(true)
-  })
-
-  it('★ 探测失败 ⇒ 返回 error（调用方据此不发推理）', async () => {
-    const { fetcher } = fakeFetch([
-      () => new Response('{"error":{"code":500}}', { status: 500 }),
-      () => new Response('{"error":{"code":500}}', { status: 500 }),
-    ])
-    const probe = await resolveGeminiProject({ credential: cred(), fetcher })
-    expect(probe.project).toBe('')
-    expect(probe.error).toBeTruthy()
-  })
-
-  it('★ 第一个端点失败 ⇒ 回退到 daily', async () => {
-    const { fetcher, calls } = fakeFetch([
+    // sandbox 挂了 ⇒ 回退 daily（不放弃探测）
+    const fallback = fakeFetch([
       () => new Response('boom', { status: 503 }),
       lcaOk('{"cloudaicompanionProject":"FROM-DAILY"}'),
     ])
-    const probe = await resolveGeminiProject({ credential: cred(), fetcher })
-    expect(probe.project).toBe('FROM-DAILY')
-    expect(calls).toHaveLength(2)
-    expect(calls[1]).toBe(`${GEMINI_ENDPOINT_DAILY}${GEMINI_LOAD_CODE_ASSIST_PATH}`)
+    const retried = await resolveGeminiProject({ credential: cred(), fetcher: fallback.fetcher })
+    expect(retried.project).toBe('FROM-DAILY')
+    expect(fallback.calls).toHaveLength(2)
+    expect(fallback.calls[1]).toBe(`${GEMINI_ENDPOINT_DAILY}${GEMINI_LOAD_CODE_ASSIST_PATH}`)
   })
 
-  it('★ 网络异常也算失败（不是「空」）', async () => {
-    const fetcher = (async () => { throw new Error('fetch failed') }) as unknown as typeof fetch
-    const probe = await resolveGeminiProject({ credential: cred(), fetcher })
-    expect(probe.error).toContain('fetch failed')
+  it('★ 「探测成功但为空」⇒ 兜底串且无 error；「探测失败」⇒ error', async () => {
+    // 空 project 是免费档**常态**，不是失败 —— 必须照常发推理
+    const empty = fakeFetch([lcaOk('{"currentTier":{"id":"free-tier","name":"Antigravity"}}')])
+    const ok = await resolveGeminiProject({ credential: cred(), fetcher: empty.fetcher })
+    expect(ok.project).toBe(GEMINI_DEFAULT_PROJECT)
+    expect(ok.error).toBeUndefined()
+    expect(ok.probed).toBe(true)
+
+    // 非 2xx / 网络异常 = 真失败 —— 调用方据此**不发推理**
+    const down = fakeFetch([
+      () => new Response('{"error":{"code":500}}', { status: 500 }),
+      () => new Response('{"error":{"code":500}}', { status: 500 }),
+    ])
+    const failed = await resolveGeminiProject({ credential: cred(), fetcher: down.fetcher })
+    expect(failed.project).toBe('')
+    expect(failed.error).toBeTruthy()
+
+    const thrown = (async () => { throw new Error('fetch failed') }) as unknown as typeof fetch
+    const thrownProbe = await resolveGeminiProject({ credential: cred(), fetcher: thrown })
+    expect(thrownProbe.error).toContain('fetch failed')
   })
 })
 
 describe('gemini project 回写凭据', () => {
-  it('★ 回写探测到的真值', async () => {
+  it('★ 只回写真值（保留原有字段）；兜底串、「值没变」、写失败都不影响推理', async () => {
+    // 真值 ⇒ 整份 JSON 回写，原有字段保留
     const written: string[] = []
     await persistGeminiProject({
       credential: cred(),
@@ -162,31 +159,20 @@ describe('gemini project 回写凭据', () => {
     })
     expect(written).toHaveLength(1)
     expect(JSON.parse(written[0]!).cloudaicompanionProject).toBe('CCP-REAL')
-    // 原有字段必须保留（整份 JSON 回写）
     expect(JSON.parse(written[0]!).access_token).toBe('AT')
-  })
 
-  it('★ **不**回写兜底串 —— 否则该账号将来拿到真实 project 会被陈旧值挡住', async () => {
     const write = vi.fn(async () => {})
-    await persistGeminiProject({
-      credential: cred(),
-      project: GEMINI_DEFAULT_PROJECT,
-      write,
-    })
-    expect(write).not.toHaveBeenCalled()
-  })
-
-  it('★ 值没变就不重复写（避免每轮整体落盘）', async () => {
-    const write = vi.fn(async () => {})
+    // 兜底串不写 —— 否则该账号将来拿到真实 project 会被陈旧值挡住
+    await persistGeminiProject({ credential: cred(), project: GEMINI_DEFAULT_PROJECT, write })
+    // 值没变也不写 —— 避免每轮整体落盘
     await persistGeminiProject({
       credential: cred({ cloudaicompanionProject: 'SAME' }),
       project: 'SAME',
       write,
     })
     expect(write).not.toHaveBeenCalled()
-  })
 
-  it('★ 写失败只告警，不抛（纯缓存，不该影响推理）', async () => {
+    // 写失败只告警，不抛（纯缓存，不该影响推理）
     const warn = vi.fn()
     await expect(persistGeminiProject({
       credential: cred(),

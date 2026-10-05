@@ -3264,7 +3264,23 @@ ZCode 免费通道**只认 Anthropic Messages**（实测 `zcode-plan` 下的
    `generation` 入参）。判据与语义抄自 `Antigravity-Manager` 的 `[FIX session-1M]`，
    wb 独立实现同一机制（`SessionOverflowBump`）。**升代有界**（一次请求最多一代），
    显式钉住 `sessionId` 时不升代。
-6. **模型名是准入键** —— 裸 `gemini-3.8-flash` 直接 404，**档位后缀必需**
+6. **上下文超限归 `CONTEXT_WINDOW_EXCEEDED`（触发自动压缩）** —— 上游回
+   `The input token count (N) exceeds the maximum number of tokens allowed (M)` 时，
+   ⚠️ **harness 的 `isContextWindowExceededError` 认不出这句话**（它要求出现
+   `context` 字样，而这句一个都没有 —— 与 `buddy-adapter.ts` 当年漏判
+   「prompt is too long」是同一类缺陷），故本仓库补了一条专属判据。
+   归成 `INVALID_REQUEST` 的后果**不对称**：`dsh-compaction-basic` 的 listener
+   第一行就是 `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()`
+   ⇒ 连一次压缩的机会都没有，长会话越过窗口后每轮报废。
+   处置是**升级式**的：先升代（便宜），升过仍失败才归溢出交 harness 压缩。
+7. **请求体上限发送前真检查** —— `GEMINI_MAX_REQUEST_BODY_BYTES`（64MB）此前
+   **定义了但全仓零引用**（看着有防护，实际没有），现已接上，超限同样归
+   `CONTEXT_WINDOW_EXCEEDED` 而不是死路 `INVALID_REQUEST`。
+8. **签名 miss 按工具名兜底** —— 精确键吃逐字参数，长任务里参数漂移（路径/
+   时间戳变化）是必然事件。miss 时回退取**该工具名最近一次**签名，避免走去签
+   重试丢掉整条思考链。工具名随条目一起持久化（键是 sha256 不可逆，不存名字
+   无法重建索引）。
+9. **模型名是准入键** —— 裸 `gemini-3.8-flash` 直接 404，**档位后缀必需**
    （`-low` / `-medium` / `-high` / `-tiered`）。`modelId` 走**严格校验**：
    不在静态表里就抛错（此前写错模型名会**静默跑 3.8**）。
 
