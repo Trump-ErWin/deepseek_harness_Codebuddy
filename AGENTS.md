@@ -859,6 +859,53 @@ Gitee issue IKJLHQ 整体移除（见上一节）。
 会命中无关代码；且断言要对**剥掉注释**的文本做，否则文件头为记录旧实现写下的
 那行字就能喂绿（本轮修的正是「登录渠道选择」，注释里必然提到它）。
 
+## ⚠⚠ RPC 的 `catch` **不得**把失败包成 `ok:true`（Issue IKJOZA）
+
+**真实缺陷**（Gitee issue IKJOZA，外部用户报障 2026-10-05）：RPC `account.refresh`
+续期失败时**不抛 RPC 错误**，而是回 `ok:true` + `value.success:false`。只判 `ok`
+的调用方会把失败读成成功。报告方一个工具首版因此报出 **18 个「✅」而 17 个实为失败**，
+真实错误是 `codearts 400 STS5.1806 invalid refresh token: 'the refresh token has been used'` /
+`minimax refresh_token 已失效` / `raccoon 登录态已过期`。
+
+**根因在客户端**：`plugin-src/management-rpc.mjs` 的 `unwrapRpcResult` 只判
+`result.ok === true` 就返回 `value` ⇒ `ok:true` 就等于「成功」。
+
+⚠ **全文件唯一的一处**：把 `jet-hub-rpc.ts` 里 37 个 `catch` 逐个核对过，
+另有 4 处 catch 后仍 `ok:true`，但它们**都带额外的判别字段**，调用方不判就会误读
+—— 本端点没有：
+
+| 位置 | 形态 | 为何安全 |
+|---|---|---|
+| `login.poll` | `{done:false}` | 「用户尚未授权完」是正常中间态 |
+| `login.submitSms` | `{done:false, error}` | 验证码输错可重试，前端必判 `done` |
+| `credits.permanentLock` | 广播失败仍 `ok:true` | 广播失败不影响已落盘 |
+| `credits.claimAll` | 单号失败进 `results[]` | 「单个失败不中断整体」是设计语义 |
+
+⇒ **判据**：`catch` 里的失败**若没有**额外的状态/结果字段，就是业务终态，必须回
+`ok:false + error:{code, message}`（本仓库约定 `code:'bad-request'`）。
+⚠ `reply()`（`jet-hub-rpc.ts` 末尾）只对 `ok:false` 补 `error.details: {}`。
+
+⚠⚠ **`account.refresh` 是全仓库零调用方的端点**（取证：面板 36 处 `rpcCall(` 里没有它；
+`git log -S "rpcCall('account.refresh'"` 零命中；账号卡片按钮只有
+测试/重测/重置/停用/代理/指纹/删除，**没有「刷新」**）。⇒ 改成 `ok:false` 是
+**对仓库外调用方的破坏性契约变更**，仓库内零影响；原先误判的调用方会从「静默错」
+变成 `unwrapRpcResult` **抛错**（`error.message` 即原异常文案），属预期的「提前炸」。
+成功路径**未变**（仍是 `ok:true + value.success:true`），故不会误伤成功侧。
+⇒ `RpcRefreshAccountResponse` 里的 `error?: string` 已**删掉**（失败不再有 value）。
+
+⚠⚠ **既有测试为什么没抓住**：旧用例断言的是 `value.success === false` ——
+**修复前的行为照样绿**。因为它锁的是「value 里能看到失败」，而缺陷的实质是
+「失败被包装成了成功」。⇒ **新增失败路径用例必须断言顶层 `ok`，并额外断言
+「失败时 `value` 根本不存在」**，否则又写出一条同义反复的用例。
+回归用例在 `tests/unit/lobsterai-rpc-dispatch.spec.ts` 的「issue IKJOZA」段
+（8 条：三条报告里出现的真实错误各锁 `ok:false` + `error.message` 原文、
+`error.code` 约定、成功路径不受影响）。
+⚠ 已做**反向验证**：把 catch 改回 `{ok:true, value:{success:false}}` → 9 条变红。
+
+⚠ **同一轮顺带订正了四处失实注释**（`AGENTS.md` / `src/service.ts` ×3）里的
+「Jet Hub 账号卡片的『刷新』按钮」—— **该按钮从来不存在**。这类注释会把排障
+的人引到不存在的 UI 上，故一并改掉。
+
 ## 技术栈与约束
 
 - **Node.js**：`^22.19.0 || >=24.0.0`
@@ -1183,7 +1230,9 @@ pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）�
 ① `src/index.ts` 每 30 分钟（含启动首轮）的 `refreshAll`；
 ② 推理路径的按需续期（`llm-adapter.ts` 的「过期预判」与「401 兜底」，
    而 DSH 本身会**并发**发多条请求：主回复 + 标题生成 + 上下文压缩）；
-③ Jet Hub 账号卡片的「刷新」按钮（`account.refresh`）。
+③ RPC `account.refresh`（⚠️ **没有面板入口** —— 账号卡片上并没有「刷新」按钮，
+   调用方是仓库外的脚本/手工 RPC；`plugin-src/client/jet-hub.js` 的 36 处
+   `rpcCall(` 里没有它，`git log -S "rpcCall('account.refresh'"` 零命中）。
 华为 STS 在签发新凭据时**旧的那一份 refresh_token 即失效**，
 并发下必然「1 个成功、其余 `invalid_grant`」，而失败方把它读成「账号不能续期」。
 

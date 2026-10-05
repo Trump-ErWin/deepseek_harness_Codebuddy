@@ -76,11 +76,18 @@ function makePool(accounts: ProviderAccountEntry[]) {
 
 /**
  * 调用 `account.refresh` 并返回 RPC 结果载荷。
+ *
+ * ⚠️ 返回**整个 `result`** 而不是 `result.value`：issue IKJOZA 修复后，失败走
+ * `ok:false + error`，`value` 不存在 —— 此前只把 `value` 交出去，用例便永远
+ * 看不到失败形态（`value.success === false`），这正是缺陷本身。
  */
 async function callRefresh(
   accounts: ProviderAccountEntry[],
   accountId: string,
-): Promise<{ calls: RefreshCall[]; value: { success: boolean; error?: string } }> {
+): Promise<{
+  calls: RefreshCall[]
+  result: { ok: boolean; value?: { success: boolean }; error?: { code?: string; message?: string } }
+}> {
   const calls: RefreshCall[] = []
   const { ctx, getHandler } = makeCtx(accounts)
   registerJetHubRpc(
@@ -105,9 +112,15 @@ async function callRefresh(
     }),
   }))
   const body = await response.json() as {
-    result: { ok: boolean; value?: { success: boolean; error?: string } }
+    result: { ok: boolean; value?: { success: boolean }; error?: { code?: string; message?: string } }
   }
-  return { calls, value: body.result.value! }
+  return { calls, result: body.result }
+}
+
+/** 取成功路径的 `value`（供既有用例断言 `success === true`）。 */
+function okValue(result: { ok: boolean; value?: { success: boolean } }): { success: boolean } {
+  expect(result.ok, `期望成功，实际 error=${JSON.stringify((result as { error?: unknown }).error)}`).toBe(true)
+  return result.value!
 }
 
 function entry(provider: string, credentialRef: string): ProviderAccountEntry {
@@ -126,10 +139,10 @@ describe('account.refresh 分派（T7 回归）', () => {
   it('buddy 账号刷新**自己的** credentialRef，而不是默认单凭据 ref', async () => {
     // 缺陷 2 的回归：原实现调 buddy.refresh()（读 BUDDY_ACCESS_TOKEN），
     // 刷的是另一个凭据。
-    const { calls, value } = await callRefresh(
+    const { calls, result } = await callRefresh(
       [entry('buddy', 'BUDDY_ACCOUNT_AAAA1111')], 'buddy-1',
     )
-    expect(value.success).toBe(true)
+    expect(okValue(result).success).toBe(true)
     expect(calls).toEqual([{ service: 'buddy', credentialRef: 'BUDDY_ACCOUNT_AAAA1111' }])
     // 绝不能退化成「刷默认凭据」。
     expect(calls.some((c) => c.service.includes('refresh(default)'))).toBe(false)
@@ -137,36 +150,37 @@ describe('account.refresh 分派（T7 回归）', () => {
 
   it('workbuddy 账号可刷新且不再抛 Unknown provider（缺陷 1 的回归）', async () => {
     // 原实现只判 codearts / buddy，workbuddy 落到 else 抛
-    // `Unknown provider: workbuddy`，value.success 为 false。
-    const { calls, value } = await callRefresh(
+    // `Unknown provider: workbuddy`。
+    const { calls, result } = await callRefresh(
       [entry('workbuddy', 'WORKBUDDY_ACCOUNT_BBBB2222')], 'workbuddy-1',
     )
-    expect(value.success).toBe(true)
-    expect(value.error).toBeUndefined()
+    expect(okValue(result).success).toBe(true)
+    // 成功路径不得带 `error`（issue IKJOZA 后失败走 `ok:false`，成功必须干净）。
+    expect((result as { error?: unknown }).error).toBeUndefined()
     expect(calls).toEqual([{ service: 'workbuddy', credentialRef: 'WORKBUDDY_ACCOUNT_BBBB2222' }])
   })
 
   it('lobsterai 账号刷新自己的 credentialRef（新增 provider 不得重蹈覆辙）', async () => {
-    const { calls, value } = await callRefresh(
+    const { calls, result } = await callRefresh(
       [entry('lobsterai', 'LOBSTERAI_ACCOUNT_CCCC3333')], 'lobsterai-1',
     )
-    expect(value.success).toBe(true)
+    expect(okValue(result).success).toBe(true)
     expect(calls).toEqual([{ service: 'lobsterai', credentialRef: 'LOBSTERAI_ACCOUNT_CCCC3333' }])
   })
 
   it('trae 账号刷新自己的 credentialRef（新增 provider 不得重蹈覆辙）', async () => {
-    const { calls, value } = await callRefresh(
+    const { calls, result } = await callRefresh(
       [entry('trae', 'TRAE_ACCOUNT_EEEE5555')], 'trae-1',
     )
-    expect(value.success).toBe(true)
+    expect(okValue(result).success).toBe(true)
     expect(calls).toEqual([{ service: 'trae', credentialRef: 'TRAE_ACCOUNT_EEEE5555' }])
   })
 
   it('qoder 账号刷新自己的 credentialRef（新增 provider 不得重蹈覆辙）', async () => {
-    const { calls, value } = await callRefresh(
+    const { calls, result } = await callRefresh(
       [entry('qoder', 'QODER_ACCOUNT_FFFF6666')], 'qoder-1',
     )
-    expect(value.success).toBe(true)
+    expect(okValue(result).success).toBe(true)
     expect(calls).toEqual([{ service: 'qoder', credentialRef: 'QODER_ACCOUNT_FFFF6666' }])
   })
 
@@ -177,11 +191,11 @@ describe('account.refresh 分派（T7 回归）', () => {
     // 症状是「中国版账号点刷新，实际续期了国际版的凭据」—— 两站 token
     // 不通用，于是 CN 续期永远失败而国际版被无谓地刷了一次。
     // 这条用例用**行为**（哪个 stub 被调用）而非字符串锁住这件事。
-    const { calls, value } = await callRefresh(
+    const { calls, result } = await callRefresh(
       [entry('qodercn', 'QODERCN_ACCOUNT_GGGG7777')], 'qodercn-1',
     )
-    expect(value.success).toBe(true)
-    expect(value.error).toBeUndefined()
+    expect(okValue(result).success).toBe(true)
+    expect((result as { error?: unknown }).error).toBeUndefined()
     expect(calls).toEqual([{ service: 'qodercn', credentialRef: 'QODERCN_ACCOUNT_GGGG7777' }])
     // 关键：国际版实例必须**没有**被碰过。
     expect(calls.some((c) => c.service === 'qoder'), '中国版账号串到了国际版实例').toBe(false)
@@ -199,10 +213,10 @@ describe('account.refresh 分派（T7 回归）', () => {
   })
 
   it('codearts 账号刷新自己的 credentialRef', async () => {
-    const { calls, value } = await callRefresh(
+    const { calls, result } = await callRefresh(
       [entry('codearts', 'CODEARTS_ACCOUNT_DDDD4444')], 'codearts-1',
     )
-    expect(value.success).toBe(true)
+    expect(okValue(result).success).toBe(true)
     expect(calls).toEqual([{ service: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_DDDD4444' }])
   })
 
@@ -217,23 +231,127 @@ describe('account.refresh 分派（T7 回归）', () => {
       entry('trae', 'TRAE_ACCOUNT_1'),
     ]
     for (const target of accounts) {
-      const { calls, value } = await callRefresh(accounts, target.id.replace(`${target.provider}-1`, `${target.provider}-1`))
-      expect(value.success, target.provider).toBe(true)
+      const { calls, result } = await callRefresh(accounts, target.id)
+      expect(okValue(result).success, target.provider).toBe(true)
       expect(calls, target.provider).toEqual([
         { service: target.provider, credentialRef: target.credentialRef },
       ])
     }
   })
 
-  it('未知 provider 仍然报错（不静默成功）', async () => {
-    const { value } = await callRefresh([entry('mystery', 'MYSTERY_ACCOUNT_1')], 'mystery-1')
-    expect(value.success).toBe(false)
-    expect(value.error).toMatch(/Unknown provider/)
+  it('未知 provider 报错（不静默成功）', async () => {
+    const { result } = await callRefresh([entry('mystery', 'MYSTERY_ACCOUNT_1')], 'mystery-1')
+    expect(result.ok).toBe(false)
+    expect(result.error?.message).toMatch(/Unknown provider/)
   })
 
   it('账号不存在时报错', async () => {
-    const { value } = await callRefresh([], 'nope-1')
-    expect(value.success).toBe(false)
-    expect(value.error).toMatch(/not found/)
+    const { result } = await callRefresh([], 'nope-1')
+    expect(result.ok).toBe(false)
+    expect(result.error?.message).toMatch(/not found/)
+  })
+})
+
+/**
+ * Gitee issue IKJOZA：续期失败**不得**回 `ok:true`。
+ *
+ * ## 缺陷
+ * 本 RPC 的 catch 曾把异常包进成功响应（`{ok:true, value:{success:false}}`）。
+ * 客户端 `unwrapRpcResult`（`plugin-src/management-rpc.mjs`）只判 `ok === true`
+ * 就返回 `value` ⇒ **只判 `ok` 的调用方会把失败读成成功**。报告方一个工具首版
+ * 因此把 18 次里的 17 次失败显示成「✅」。
+ *
+ * ## 这组用例守的正是「失败形态」本身
+ * ⚠️ 上面那条「账号不存在时报错」**曾经**断言的是 `value.success === false` ——
+ * 也就是说**修复前的行为照样绿**。这正是本缺陷能长期存在的原因：既有断言锁的是
+ * 「value 里能看到失败」，而缺陷的实质是「失败被包装成了成功」。
+ * 故这里必须额外锁死顶层 `ok`，并断言**失败时 value 根本不存在**。
+ */
+describe('account.refresh 失败语义（issue IKJOZA）', () => {
+  /** 让指定 provider 的续期**抛错**，其余照常。 */
+  function makeThrowingStub(throwing: string, message: string) {
+    const stub = (name: string) => ({
+      refreshAccountCredential: async () => {
+        if (name === throwing) throw new Error(message)
+      },
+      refresh: async () => {},
+    })
+    return {
+      codearts: stub('codearts'),
+      buddy: stub('buddy'),
+      workbuddy: stub('workbuddy'),
+      lobsterai: stub('lobsterai'),
+      qoder: stub('qoder'),
+      qodercn: stub('qodercn'),
+      trae: stub('trae'),
+    }
+  }
+
+  async function callRefreshFailing(accounts: ProviderAccountEntry[], accountId: string, throwing: string, message: string) {
+    const { ctx, getHandler } = makeCtx(accounts)
+    const services = makeThrowingStub(throwing, message)
+    registerJetHubRpc(
+      ctx as never,
+      makePool(accounts) as never,
+      services.codearts as never,
+      services.buddy as never,
+      services.workbuddy as never,
+      services.lobsterai as never,
+      services.qoder as never,
+      services.qodercn as never,
+      services.trae as never,
+    )
+    const response = await getHandler()(new Request('http://127.0.0.1/api/jet-hub', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: 'r1',
+        method: 'jet-hub',
+        payload: { method: 'account.refresh', payload: { accountId } },
+      }),
+    }))
+    const body = await response.json() as {
+      result: { ok: boolean; value?: { success: boolean }; error?: { code?: string; message?: string } }
+    }
+    return body.result
+  }
+
+  // issue 报告里出现过的三条真实错误，逐条锁定「失败仍回 ok:true 就得红」。
+  const REPORTED = [
+    { provider: 'codearts', message: "CodeArts token request failed: 400 {errorCode: 'STS5.1806', errorMsg: \"invalid refresh token: 'the refresh token has been used'\"}" },
+    { provider: 'buddy', message: '[buddy] 账号 buddy-1 的 refresh_token 已失效，请重新登录' },
+    { provider: 'trae', message: 'raccoon 登录态已过期' },
+  ] as const
+
+  for (const { provider, message } of REPORTED) {
+    it(`★ ${provider} 续期失败必须回 ok:false，而不是 ok:true + value.success:false`, async () => {
+      const accounts = [entry(provider, `${provider.toUpperCase()}_ACCOUNT_F`)]
+      const result = await callRefreshFailing(accounts, `${provider}-1`, provider, message)
+
+      // 核心断言：顶层 ok 必须为 false。修复前这里是 true ⇒ 本用例变红。
+      expect(result.ok, `${provider} 续期失败却回 ok:true，调用方会把它读成成功`).toBe(false)
+      // 失败时**不得**再出现 value —— 那正是被包装成成功的形态。
+      expect(result.value, `${provider} 失败时仍带 value（success:false）`).toBeUndefined()
+    })
+
+    it(`${provider} 失败必须把服务端原文带进 error.message（否则用户看到「未知故障」）`, async () => {
+      const accounts = [entry(provider, `${provider.toUpperCase()}_ACCOUNT_F`)]
+      const result = await callRefreshFailing(accounts, `${provider}-1`, provider, message)
+      expect(result.error?.message).toBe(message)
+    })
+  }
+
+  it('失败也带 error.code，与本文件其它分支（bad-request）保持同一约定', async () => {
+    const accounts = [entry('codearts', 'CODEARTS_ACCOUNT_F')]
+    const result = await callRefreshFailing(accounts, 'codearts-1', 'codearts', 'boom')
+    expect(result.error?.code).toBe('bad-request')
+  })
+
+  it('成功路径不受影响：仍是 ok:true + value.success:true', async () => {
+    // 防止「为了让失败变红」把成功也一起改成 ok:false。
+    const { result } = await callRefresh([entry('buddy', 'BUDDY_ACCOUNT_1')], 'buddy-1')
+    expect(result.ok).toBe(true)
+    expect(result.value?.success).toBe(true)
   })
 })
