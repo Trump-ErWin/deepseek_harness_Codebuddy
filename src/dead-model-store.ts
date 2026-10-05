@@ -120,24 +120,87 @@ type DeadModelRecords = Record<string, Record<string, DeadModelRecord>>
  *
  * 误判代价极高（被藏 30 天且用户无法自愈），故**只认 `found` / `exist`** ——
  * 这与本文件头「`unsupported` 单独出现不算」的既有口径一致。
+ *
+ * ## ⚠️⚠️ 为什么改成「先抽 id、再判语义」而不是加长窗口（2026-10-06 复审实测）
+ *
+ * 加长窗口（`[^.!?]{0,24}` → `[^!?\n]{0,64}`）虽然修好了点号阻断，却**引入了跨句误判** ——
+ * 因为 `.` 既是 id 内部的小数点**又是**句末标点，无法在字符类里区分。实测：
+ *
+ * ```
+ * model x is fine. the container image does not exist   → 误判为「模型已下架」
+ * the config file model list is fine; however this build does not exist → 误判
+ * ```
+ *
+ * ⇒ 改为**两步**：先按 {@link goneCandidates} 从文案里抽出**候选模型 id**
+ * （允许内部含小数点/斜杠/连字符），再要求「**紧邻该 id** 出现不存在语义」。
+ * 这样与标点无关、也不依赖窗口长度。
  */
 const GONE_PATTERNS: readonly RegExp[] = [
   /model\s+not\s+found/i,
-  // ⚠️ 窗口只排除 `!?` 与换行：**点号必须留在窗口内**（模型 id 普遍带小数点）。
-  /model\b[^!?\n]{0,64}?\bnot\s+(?:found|exist)/i,
   /(?:unknown|no\s+such|nonexistent)\s+model/i,
-  /model[^!?\n]{0,64}?(?:does\s*not|doesn'?t)\s+exist/i,
   // ⚠️ OpenAI 标准的 `model_not_found` / `model-not-found` 形态。
   // 安全性依据：它必然是**模型**主语 + **不存在**语义，不会误伤能力/套餐类文案。
   /\bmodel[_\-]not[_\-]found\b/i,
-  // ⚠️ 窗口要够宽：`模型 deepseek-v4.1-flash-x 不存在` 里，「模型」与「不存在」
-  // 之间隔着一整个 id（实测 12+ 字符）。同理中文 id 也可能含英文标点，
-  // 故这里只排除中文句读与换行，**保留 `.`。
-  // ⚠️ **不收 `不可用`**：账号/额度类报错也这么说（「所有账号均不可用」），
-  // 收它会把账号问题误记成模型下架。同理不收 `不支持` / `不支持的工具`。
-  /模型[^，。！？!?\n]{0,64}(?:不存在|未找到|未上线|已下线|已下架)/,
-  /model[^!?\n]{0,64}(?:不存在|未找到|已下线|已下架)/,
 ]
+
+/**
+ * 「不存在」的语义片段（要求**紧邻**候选 id 出现，见 {@link matchesGonePhrase}）。
+ *
+ * ⚠️ **只认 `found` / `exist`**：`available` / `supported` 会把
+ * 「换套餐 / 换地域就能恢复」的问题误判成下架（见文件头）。
+ *
+ * ⚠️⚠️ 外层**必须有非捕获分组** `(?: … )`（2026-10-06 复审实测）：本片段要被
+ * 拼进带 `^` 锚点的正则里，若不分组，`|` 的**顶层交替**会让除第一个以外的所有分支
+ * **脱离锚定**、在全串任意位置匹配 —— 于是
+ * `model x is fine. the container image does not exist` 会被误判成「模型已下架」
+ * （`does not exist` 那一支恰好就是被锚定的那一支，掩盖了问题；漏掉的是
+ * `\bnot (found|exist)` 与全部中文分支）。
+ */
+const GONE_TAIL = /(?:(?:does\s*not|doesn'?t)\s+(?:exist|found)|\bnot\s+(?:found|exist)|不存在|未找到|未上线|已下线|已下架)/
+
+/**
+ * 一个「模型 id 样式」的词元。
+ *
+ * 字符集刻意**允许小数点、斜杠、连字符、下划线**（本仓库真实 id：
+ * `deepseek-v4.1-flash` / `cline-free/muse-spark-1.3-contributor` / `gpt-5.6-astra`），
+ * 但**不允许空格** —— 于是 `model x is fine. the container image` 里的
+ * `x` 虽然也是词元，它的「紧邻后文」是 ` is`，不含不存在语义 ⇒ 判 false。
+ *
+ * ⚠️ **允许中文**（`qmodel` 之类无中文，但文案里会出现 `模型 已下线` 这类
+ * 「主语 + 中文语义」而中间没有 id 的形态）；中文分支不参与 id 抽取，
+ * 由 {@link GONE_TAIL} 直接匹配。
+ */
+const TOKEN = String.raw`[A-Za-z0-9][A-Za-z0-9._/-]{0,63}`
+
+/**
+ * 判定「文案里提到了某个模型，且**紧邻它**说了它不存在」。
+ *
+ * ⚠️ **必须锚定**（`^`）—— 不可用 `GONE_TAIL.test(tail)` 那种「往后随便搜」：
+ * 那会跨句命中（`model x is fine. the container image does not exist`
+ * 里，`x` 之后的整段尾巴都会被扫到），正是本函数要消除的误判。
+ *
+ * @param message - 错误文案。
+ * @returns true 表示存在这样一组「id + 紧邻不存在」的相邻搭配。
+ */
+function matchesGonePhrase(message: string): boolean {
+  // 主语后**没有** id，直接跟中文语义（`该模型已下线`）也算阳性。
+  for (const subject of message.matchAll(new RegExp(String.raw`(?:model|模型)["'\x60]?[\s,]*`, 'gi'))) {    const tail = message.slice((subject.index ?? 0) + subject[0].length)
+    // 紧邻形式 A：`模型 已下线` / `model "gpt-5.6-astra" does not exist`
+    // 中间只允许**引号/逗号/空格**等收尾符号，不允许隔一整个子句。
+    if (new RegExp(String.raw`^["'\x60]?[\s,]*${GONE_TAIL.source}`, 'i').test(tail)) return true
+  }
+  // 主语 + 显式 id：必须「id 后紧邻不存在语义」。
+  // ⚠️ 主语与 id 之间允许「引号 + 空格」的**任意组合**（实测这几种都真实存在）：
+  // `The model gpt-5.6-astra does not exist`（无引号）/
+  // `model "x" does not exist`（双引号紧贴）/
+  // `` The model `x` does not exist ``（反引号**两侧都有空格**）。
+  // 写成 `["'\x60]?\s+` 会漏掉最后一种 —— `?` 可选导致 `\s+` 必须紧邻单词字符。
+  for (const subject of message.matchAll(new RegExp(String.raw`(?:model|模型)[\s"'\x60]*(${TOKEN})`, 'gi'))) {
+    const tail = message.slice((subject.index ?? 0) + subject[0].length)
+    if (new RegExp(String.raw`^["'\x60]?[\s,]*${GONE_TAIL.source}`, 'i').test(tail)) return true
+  }
+  return false
+}
 
 /**
  * 「与模型无关」的排除词：命中则**不记**。
@@ -190,7 +253,9 @@ export function isModelGoneError(error: unknown): boolean {
   const message = (error as { message?: unknown }).message
   if (typeof message !== 'string' || message.length === 0) return false
   if (NOT_GONE_PATTERNS.some((pattern) => pattern.test(message))) return false
-  return GONE_PATTERNS.some((pattern) => pattern.test(message))
+  if (GONE_PATTERNS.some((pattern) => pattern.test(message))) return true
+  // 「id + 紧邻的不存在语义」（抗跨句误判的那一条，见 matchesGonePhrase 注释）。
+  return matchesGonePhrase(message)
 }
 
 /** TTL（毫秒）；0 表示不过期。 */

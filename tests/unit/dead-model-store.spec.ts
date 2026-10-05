@@ -50,6 +50,10 @@ describe('isModelGoneError —— 应判为「模型已失效」', () => {
     ['★连字符形态', 'model-not-found', 'HTTP_404'],
     // ⚠️ 排除词必须带词边界，否则误杀正常下架文案。
     ['★模型名含 expired（边界回归）', 'model expired-v3 does not exist', 'HTTP_404'],
+    // ⚠️ 「id 后紧邻不存在语义」的反向形态：主语与 id 之间可以是
+    // 「无引号 / 双引号紧贴 / 反引号两侧带空格」三种，都必须命中。
+    ['★反引号两侧带空格', 'The model `gpt-5.6-astra` does not exist', 'HTTP_404'],
+    ['★双引号紧贴', 'model "deepseek-v4.1-flash" does not exist', 'HTTP_404'],
   ]
   for (const [label, message, code] of positives) {
     it(label, () => {
@@ -95,6 +99,13 @@ describe('isModelGoneError —— 必须**不**判为模型失效（误判会藏
     ['★能力开关', 'model not supported: thinking', 'INVALID_REQUEST'],
     // ⚠️ 中文同理：「不支持」绝不能当下架。
     ['★中文不支持', '模型 xxx 不支持该功能', 'INVALID_REQUEST'],
+    // ⚠️⚠️ 跨句误判回归（2026-10-06 复审实测）：把判据窗口从 `[^.!?]{0,24}`
+    // 放宽到 64 以容纳带小数点的 id 时，**引入了这三类误判** ——
+    // `model` 出现在前半句、「does not exist」说的是**别的**东西。
+    // 修法是改为「先抽 id、再要求**紧邻**」，而不是继续加长窗口。
+    ['★跨句：后半句说的是镜像不是模型', 'model x is fine. the container image does not exist', 'SERVER'],
+    ['★跨句：分号后的从句', 'the config file model list is fine; however this build does not exist on the server', 'SERVER'],
+    ['★跨句：配置项列表 vs 不存在的构建', 'model list ok. the bundle does not exist', 'SERVER'],
   ]
   for (const [label, message, code] of negatives) {
     it(label, () => {
