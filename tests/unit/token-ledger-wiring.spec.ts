@@ -5,7 +5,13 @@ import {
   GATEWAY_CHANNEL_MARK,
 } from '../../src/openai-gateway/channel.js'
 import { recordThroughStream, wrapAdapterWithTokenLedger } from '../../src/llm-register-compat.js'
-import { readTokenLedger, resetTokenLedgerForTests } from '../../src/token-ledger.js'
+import {
+  peekLedgerAccount,
+  readTokenLedger,
+  reportLedgerAccount,
+  resetLedgerAccountsForTests,
+  resetTokenLedgerForTests,
+} from '../../src/token-ledger.js'
 
 /** 假适配器产出的 usage chunk（dsh-llm 契约形状）。 */
 function usageChunk(input: number, output: number, extra: Record<string, number> = {}) {
@@ -23,7 +29,10 @@ async function collect(it: AsyncIterable<unknown>): Promise<unknown[]> {
   return out
 }
 
-afterEach(() => resetTokenLedgerForTests())
+afterEach(() => {
+  resetTokenLedgerForTests()
+  resetLedgerAccountsForTests()
+})
 
 describe('channelOfOptions / markGatewayChannel', () => {
   it('打过标 = gateway；未打标对象 / 非对象 = direct', () => {
@@ -107,6 +116,61 @@ describe('recordThroughStream：记账骨架', () => {
       break
     }
     expect(readTokenLedger().entries).toHaveLength(1)
+  })
+
+  /**
+   * 第 2 期（账号维度）：包装层在 **usage 帧到达时** 读回报表 —— 此时
+   * `resolveCredential` 早已跑完（凭据先于任何 SSE 帧），时序才正确。
+   * ⚠️ 若在 stream 开始前读，会拿到「上一笔请求」的账号（生成器懒执行）。
+   */
+  it('账号归属（第 2 期）：usage 帧时读取回报表，落到账本 accountId', async () => {
+    resetTokenLedgerForTests()
+    resetLedgerAccountsForTests()
+    // 适配器「尚未解析凭据」：openStream 内部先跑了一段才回报（模拟真实时序）
+    const chunks = await collect(recordThroughStream(
+      async function* () {
+        reportLedgerAccount('codearts', 'acct-live')
+        yield { type: 'text' }
+        yield usageChunk(50, 5)
+      },
+      { channel: 'direct', provider: 'codearts', model: 'GLM-5.2', startedAt: Date.now() },
+    ))
+    expect(chunks).toHaveLength(2)
+    const row = readTokenLedger().entries[0]!
+    expect(row.accountId).toBe('acct-live')
+  })
+
+  it('账号归属：失败行（没等到 usage）用 finally 兜底读回报表', async () => {
+    resetTokenLedgerForTests()
+    resetLedgerAccountsForTests()
+    reportLedgerAccount('qoder', 'acct-stale')
+    await expect(collect(recordThroughStream(
+      async function* () { throw new Error('502') },
+      { channel: 'direct', provider: 'qoder', model: 'm', startedAt: Date.now() },
+    ))).rejects.toBeDefined()
+    const row = readTokenLedger().entries[0]!
+    expect(row.error).toBe('502')
+    // 失败行归属退回「最后解析出的账号」：排查「哪个号挂了」需要它。
+    expect(row.accountId).toBe('acct-stale')
+  })
+
+  it('账号归属：无人回报时空缺（accountId 缺省，不伪造）', async () => {
+    resetTokenLedgerForTests()
+    resetLedgerAccountsForTests()
+    await collect(recordThroughStream(
+      async function* () { yield usageChunk(1, 1) },
+      { channel: 'direct', provider: 'lonely', model: 'm', startedAt: Date.now() },
+    ))
+    expect(readTokenLedger().entries[0]!.accountId).toBeUndefined()
+  })
+
+  it('report/peek 回报表基础语义（供 index.ts 的 resolveCredential 调用）', () => {
+    resetLedgerAccountsForTests()
+    reportLedgerAccount('qoder', 'a1')
+    expect(peekLedgerAccount('qoder')).toBe('a1')
+    reportLedgerAccount('qoder', 'a2')
+    expect(peekLedgerAccount('qoder')).toBe('a2')
+    expect(peekLedgerAccount('nope')).toBe('')
   })
 })
 

@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest'
 import {
   TOKEN_LEDGER_LIMIT,
+  attachTokenLedgerPersistence,
+  mergeDayEntry,
+  peekLedgerAccount,
   readTokenLedger,
   recordTokenUsage,
+  reportLedgerAccount,
+  resetLedgerAccountsForTests,
   resetTokenLedgerForTests,
   tokenLedgerSize,
+  utc8DayKey,
+  type TokenLedgerDayMap,
 } from '../../src/token-ledger.js'
 
 /** 每条用例前清空：模块级可变状态会在用例间泄漏（cline-request-log 同款）。 */
@@ -97,10 +104,7 @@ describe('recordTokenUsage / readTokenLedger：明细', () => {
 })
 
 describe('readTokenLedger：三维聚合树', () => {
-  it('渠道 → provider → 模型 逐级分桶，各级小计 = 子级之和', () => {
-    // ⚠️ codearts 的两条用**不同模型名**：同 provider 下同名模型会合并成一行，
-    // 覆盖后只留最后一条（600 = 100+500），故给 qoder 那条换 provider 后
-    // codearts 只该有 2 个模型、2 条记录。
+  it('渠道 → provider → 账号 → 模型 逐级分桶，各级小计 = 子级之和', () => {
     seed([
       { ...OK, model: 'GLM-5.2', inputTokens: 100, outputTokens: 10 },
       { ...OK, model: 'deepseek-v4.1-flash', inputTokens: 200, outputTokens: 20 },
@@ -114,7 +118,10 @@ describe('readTokenLedger：三维聚合树', () => {
     expect(direct.channel).toBe('direct')
     expect(direct.providers).toHaveLength(2)
     const codearts = direct.providers.find((p) => p.provider === 'codearts')!
-    expect(codearts.models).toHaveLength(2)
+    // 未回报账号的记录落「未归属」桶（accountId '-'），该桶下 2 个模型
+    expect(codearts.accounts).toHaveLength(1)
+    expect(codearts.accounts[0]!.accountId).toBe('-')
+    expect(codearts.accounts[0]!.models).toHaveLength(2)
     expect(codearts.totals.inputTokens).toBe(300)
     expect(codearts.totals.outputTokens).toBe(30)
     // direct 渠道小计 = codearts(300) + qoder 直连那条(300) = 600
@@ -126,6 +133,25 @@ describe('readTokenLedger：三维聚合树', () => {
     // 全局小计 = 两条渠道之和（direct 600 + gateway 400 = 1000）
     expect(snap.totals.inputTokens).toBe(1000)
     expect(snap.totals.outputTokens).toBe(100)
+  })
+
+  it('账号维度（第 2 期）：accountId 落各自账号桶，空/缺失归「未归属」', () => {
+    seed([
+      { ...OK, accountId: 'acct-A', model: 'GLM-5.2', inputTokens: 100, outputTokens: 10 },
+      { ...OK, accountId: 'acct-A', model: 'GLM-5.2', inputTokens: 100, outputTokens: 10 },
+      { ...OK, accountId: 'acct-B', model: 'GLM-5.2', inputTokens: 500, outputTokens: 50 },
+      { ...OK, model: 'GLM-5.2', inputTokens: 7, outputTokens: 7 },
+    ])
+    const codearts = readTokenLedger().channels[0]!.providers[0]!
+    // acct-A / acct-B / 未归属 三桶
+    expect(codearts.accounts.map((a) => a.accountId)).toEqual(['acct-B', 'acct-A', '-'])
+    const a = codearts.accounts.find((x) => x.accountId === 'acct-A')!
+    expect(a.totals.inputTokens).toBe(200)
+    expect(a.totals.requests).toBe(2)
+    const orphan = codearts.accounts.find((x) => x.accountId === '-')!
+    expect(orphan.totals.inputTokens).toBe(7)
+    // provider 小计 = 三桶之和
+    expect(codearts.totals.inputTokens).toBe(707)
   })
 
   it('排序：provider 与模型都按 token 合计降序（谁烧得多谁在前）', () => {
@@ -142,7 +168,9 @@ describe('readTokenLedger：三维聚合树', () => {
     // aaa=11 / bbb=902 / ccc=503 / codearts=778（m-big）+2（m-small）
     expect(direct.providers.map((p) => p.provider)).toEqual(['bbb', 'codearts', 'ccc', 'aaa'])
     const codearts = direct.providers.find((p) => p.provider === 'codearts')!
-    expect(codearts.models.map((m) => m.model)).toEqual(['m-big', 'm-small'])
+    // 单账号（都未归属）→ 全落「未归属」桶，模型行在里面
+    expect(codearts.accounts).toHaveLength(1)
+    expect(codearts.accounts[0]!.models.map((m) => m.model)).toEqual(['m-big', 'm-small'])
   })
 
   it('失败行/未报行计入请求数与 errors，但不污染 token 汇总', () => {
@@ -184,5 +212,93 @@ describe('readTokenLedger：三维聚合树', () => {
     expect(snap.entries).toHaveLength(1)
     expect(snap.totals.requests).toBe(3)
     expect(snap.channels[0]!.totals.requests).toBe(3)
+  })
+})
+
+describe('reportLedgerAccount / peekLedgerAccount（第 2 期 · 账号回报侧信道）', () => {
+  it('回报后可读取；最后回报者胜（「最近一次解析」口径）', () => {
+    resetLedgerAccountsForTests()
+    reportLedgerAccount('qoder', 'acct-A')
+    expect(peekLedgerAccount('qoder')).toBe('acct-A')
+    reportLedgerAccount('qoder', 'acct-B')
+    expect(peekLedgerAccount('qoder')).toBe('acct-B')
+    // 不同 provider 互不影响
+    reportLedgerAccount('cline', 'acct-C')
+    expect(peekLedgerAccount('cline')).toBe('acct-C')
+    expect(peekLedgerAccount('qoder')).toBe('acct-B')
+  })
+
+  it('垃圾入参不抛错、不覆盖旧值', () => {
+    resetLedgerAccountsForTests()
+    reportLedgerAccount('p', 'keep-me')
+    expect(() => reportLedgerAccount('', 'x')).not.toThrow()
+    expect(() => reportLedgerAccount('p', '')).not.toThrow()
+    expect(() => reportLedgerAccount(undefined as never, 'x')).not.toThrow()
+    expect(peekLedgerAccount('p')).toBe('keep-me')
+    expect(peekLedgerAccount('')).toBe('')
+    expect(peekLedgerAccount('never-reported')).toBe('')
+  })
+})
+
+describe('utc8DayKey / mergeDayEntry（第 2 期 · 日聚合）', () => {
+  it('UTC+8 日界：跨日时刻归入正确的日键', () => {
+    // UTC 2026-10-05 16:30 = UTC+8 2026-10-06 00:30 ⇒ 归 10-06
+    expect(utc8DayKey(Date.UTC(2026, 9, 5, 16, 30, 0))).toBe('2026-10-06')
+    // UTC 2026-10-05 15:59 = UTC+8 2026-10-05 23:59 ⇒ 归 10-05
+    expect(utc8DayKey(Date.UTC(2026, 9, 5, 15, 59, 0))).toBe('2026-10-05')
+  })
+
+  it('mergeDayEntry：同桶累加，未报行不进 token 数', () => {
+    const days: TokenLedgerDayMap = new Map()
+    const base = { ts: Date.UTC(2026, 9, 5, 2, 0, 0), channel: 'direct' as const, provider: 'p', model: 'm', usageReported: true, inputTokens: 10, outputTokens: 5, durationMs: 100 }
+    mergeDayEntry(days, base)
+    mergeDayEntry(days, { ...base, inputTokens: 20 })
+    mergeDayEntry(days, { ...base, usageReported: false, error: 'boom' })
+    const buckets = days.get('2026-10-05')!
+    expect(buckets.size).toBe(1)
+    const bucket = buckets.get('direct|p||m')!
+    expect(bucket.requests).toBe(3)
+    expect(bucket.reportedRequests).toBe(2)
+    expect(bucket.errors).toBe(1)
+    expect(bucket.inputTokens).toBe(30)
+    expect(bucket.outputTokens).toBe(10)
+  })
+
+  it('mergeDayEntry：不同账号/渠道/日各自成桶', () => {
+    const days: TokenLedgerDayMap = new Map()
+    const base = { ts: Date.UTC(2026, 9, 5, 2, 0, 0), channel: 'direct' as const, provider: 'p', model: 'm', usageReported: true, inputTokens: 1, outputTokens: 1, durationMs: 100 }
+    mergeDayEntry(days, base)
+    mergeDayEntry(days, { ...base, accountId: 'a1' })
+    mergeDayEntry(days, { ...base, accountId: 'a2' })
+    mergeDayEntry(days, { ...base, channel: 'gateway' })
+    mergeDayEntry(days, { ...base, ts: Date.UTC(2026, 9, 6, 2, 0, 0) })
+    expect(days.get('2026-10-05')!.size).toBe(4)
+    expect(days.get('2026-10-06')!.size).toBe(1)
+  })
+
+  it('persist 钩子：recordTokenUsage 触发回调（含正确日键），失败不反噬', () => {
+    const seen: Array<[string, string]> = []
+    attachTokenLedgerPersistence((day, entry) => { seen.push([day, entry.provider]) })
+    try {
+      seed([OK])
+      expect(seen).toHaveLength(1)
+      expect(seen[0]![0]).toBe(utc8DayKey(new Date().getTime()))
+      expect(seen[0]![1]).toBe('codearts')
+    } finally {
+      attachTokenLedgerPersistence(undefined)
+    }
+    // 摘钩子后不再触发
+    seed([{ ...OK }])
+    expect(seen).toHaveLength(1)
+  })
+
+  it('persist 钩子抛错时 recordTokenUsage 仍不抛（推理路径零反噬）', () => {
+    attachTokenLedgerPersistence(() => { throw new Error('disk full') })
+    try {
+      expect(() => recordTokenUsage(OK)).not.toThrow()
+    } finally {
+      attachTokenLedgerPersistence(undefined)
+    }
+    expect(tokenLedgerSize()).toBeGreaterThanOrEqual(1)
   })
 })

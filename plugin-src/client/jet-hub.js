@@ -69,6 +69,7 @@ import {
 } from './model-groups.js';
 import { formatRowTokensPerSecond } from './tokens-per-second.js';
 import {
+  accountLabel,
   channelCardTitle,
   channelLabel,
   channelOrder,
@@ -2020,9 +2021,39 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
             onClick: () => setSelected(key),
           }, key === null ? '全部' : channelLabel(key))))
       : null;
+    /** 一行模型的三个格子（供账号分层与平铺两条路径复用，避免括号地狱）。 */
+    const renderModelRow = (modelRow, key) => React.createElement('div', {
+      key, className: 'dim-jh-ledgerModel',
+    },
+      React.createElement('span', { className: 'dim-jh-ledgerModelName', title: modelRow.model }, modelRow.model),
+      React.createElement('span', { className: 'dim-jh-ledgerModelReq', title: '请求数（含失败）' },
+        modelRow.requests + ' 次'),
+      React.createElement('span', { className: 'dim-jh-ledgerModelTokens' },
+        tokenSummaryText(modelRow)));
+
+    /** 一个 provider 的内部：多账号分层 / 单账号平铺（一比一的中间层是纯噪音）。 */
+    const renderProviderBody = (providerRow) => {
+      const accounts = providerRow.accounts ?? [];
+      if (accounts.length > 1) {
+        return accounts.map((accountRow) => React.createElement('div', {
+          key: providerRow.provider + '#' + accountRow.accountId, className: 'dim-jh-ledgerAccount',
+        },
+          React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
+            React.createElement('span', { className: 'dim-jh-ledgerAccountName', title: accountRow.accountId },
+              accountLabel(accountRow.accountId)),
+            React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
+              tokenSummaryText(accountRow.totals))),
+          accountRow.models.map((modelRow) =>
+            renderModelRow(modelRow, modelRow.model))));
+      }
+      return accounts.flatMap((accountRow) => accountRow.models.map((modelRow) =>
+        renderModelRow(modelRow, providerRow.provider + '#' + modelRow.model)));
+    };
+
     return React.createElement(React.Fragment, null,
       filterRow,
-      // 汇总卡：渠道 → provider → 模型。provider 行带自身小计（与模型行同列对齐）。
+      // 汇总卡：渠道 → provider → 账号 → 模型（第 2 期加了账号层）。
+      // provider / 账号行带自身小计（与模型行同列对齐）。
       channels.map((channelRow) => React.createElement('div', {
         key: channelRow.channel, className: 'dim-jh-ledgerCard',
       },
@@ -2037,14 +2068,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
             React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, providerRow.provider),
             React.createElement('span', { className: 'dim-jh-ledgerProviderSum' },
               tokenSummaryText(providerRow.totals))),
-          providerRow.models.map((modelRow) => React.createElement('div', {
-            key: modelRow.model, className: 'dim-jh-ledgerModel',
-          },
-            React.createElement('span', { className: 'dim-jh-ledgerModelName', title: modelRow.model }, modelRow.model),
-            React.createElement('span', { className: 'dim-jh-ledgerModelReq', title: '请求数（含失败）' },
-              modelRow.requests + ' 次'),
-            React.createElement('span', { className: 'dim-jh-ledgerModelTokens' },
-              tokenSummaryText(modelRow)))))))));
+          renderProviderBody(providerRow))))));
   };
 
   const entries = Array.isArray(snapshot?.entries) ? snapshot.entries : [];
@@ -2093,9 +2117,9 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
             onClick: onClose,
           }, '完成'))),
       React.createElement('p', { className: 'dim-jh-modalHint' },
-        '按渠道（直连 / 网关）、供应商与模型统计本机发出的每笔模型请求。'
+        '按渠道（直连 / 网关）、供应商、账号与模型统计本机发出的每笔模型请求。'
         + '↓输入 ↑输出 ⚡缓存 ✎缓存写入 🧠推理；— 表示该笔未收到用量（失败或中断）。'
-        + '数据只保留最近 ' + entries.length + ' 笔中的可见部分，重启后清空。'),
+        + '明细保留最近 500 笔（重启清空）；按日累计已存盘（token-ledger.json）。'),
       React.createElement('div', { className: 'dim-jh-modalBody' },
         renderSummary(),
         renderEntries())));

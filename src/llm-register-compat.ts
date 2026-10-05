@@ -113,7 +113,7 @@ export interface AdapterRegisterTarget {
   registerAdapter(providers: readonly string[], adapter: unknown): unknown
 }
 
-import { recordTokenUsage } from './token-ledger.js'
+import { recordTokenUsage, peekLedgerAccount } from './token-ledger.js'
 import { channelOfOptions } from './openai-gateway/channel.js'
 
 /**
@@ -200,6 +200,14 @@ export async function* recordThroughStream(
   let cacheReadTokens: number | undefined
   let cacheWriteTokens: number | undefined
   let reasoningTokens: number | undefined
+  /**
+   * 账号归属（第 2 期）：**usage 帧到达时**从回报表读取（彼时凭据必然已
+   * 解析 —— `resolveCredential` / 池查询先于任何 SSE 帧）。流开始前读取
+   * 会拿到「上一笔请求的账号」（生成器懒执行的时序陷阱），在 usage 帧
+   * 时读才是「本笔请求已解析出凭据」的时刻。精度边界见
+   * `token-ledger.ts` 的 `reportedAccounts` 注释。
+   */
+  let accountId = ''
   let failure: string | undefined
   try {
     for await (const chunk of openStream()) {
@@ -216,6 +224,7 @@ export async function* recordThroughStream(
           if (Number(usage.cacheReadTokens) > 0) cacheReadTokens = Number(usage.cacheReadTokens)
           if (Number(usage.cacheWriteTokens) > 0) cacheWriteTokens = Number(usage.cacheWriteTokens)
           if (Number(usage.reasoningTokens) > 0) reasoningTokens = Number(usage.reasoningTokens)
+          if (accountId === '') accountId = peekLedgerAccount(meta.provider)
         }
       }
       yield chunk
@@ -226,10 +235,14 @@ export async function* recordThroughStream(
   } finally {
     // ⚠️ finally 里记账（而不是成功分支）：cancel / 提前 return / 抛错都必须落账。
     // durationMs 用「现在 − 发起」：成功与失败同口径，就是请求全程耗时。
+    // 账号兜底：失败请求可能没等到 usage 帧（彼时才读账号）——失败行的
+    // 归属退回「最后一次解析出的账号」，比留空有用（排查「哪个号挂了」）。
+    if (accountId === '') accountId = peekLedgerAccount(meta.provider)
     recordTokenUsage({
       channel: meta.channel,
       provider: meta.provider,
       model: meta.model,
+      ...(accountId.length > 0 ? { accountId } : {}),
       usageReported,
       inputTokens,
       outputTokens,

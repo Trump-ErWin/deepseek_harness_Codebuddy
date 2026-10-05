@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  accountLabel,
   channelCardTitle,
   channelLabel,
   channelOrder,
@@ -97,11 +98,21 @@ describe('渠道维度', () => {
 })
 
 describe('空状态', () => {
-  it('hasAnyData：有明细才 true；ledgerSubtitle 说明重启清空', () => {
+  it('hasAnyData：有明细才 true；ledgerSubtitle 说明明细与存盘的差别', () => {
     expect(hasAnyData({ entries: [{ ts: 1 }] })).toBe(true)
     expect(hasAnyData({ entries: [] })).toBe(false)
     expect(hasAnyData(null)).toBe(false)
     const subtitle = ledgerSubtitle()
+    // 第 2 期：明细重启清空，但日累计已落盘 —— 两者都要说清。
     expect(subtitle).toContain('重启')
+    expect(subtitle).toContain('存盘')
+  })
+})
+
+describe('账号维度（第 2 期）', () => {
+  it('accountLabel：空串给「未归属」，其余原样', () => {
+    expect(accountLabel('')).toBe('未归属')
+    expect(accountLabel(undefined)).toBe('未归属')
+    expect(accountLabel('qoder-bb211a53')).toBe('qoder-bb211a53')
   })
 })
