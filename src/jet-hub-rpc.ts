@@ -96,6 +96,7 @@ import { credentialExpiresAtMs } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
 import {
   claimDailyCheckin,
+  claimUnitOf,
   fetchCheckinStatus,
   fetchCreditBalance,
   type CheckinStatus,
@@ -415,16 +416,28 @@ export const PERMANENT_LOCK_PROVIDERS: ReadonlySet<string> = new Set([
  * 汇总一次批量领取的结果。
  * 纯函数，便于单测；inactive（无资格/活动结束）与 failed 分开计数，
  * 因为前者是正常的业务状态、后者才是需要用户关注的问题。
+ *
+ * ★ **按单位分开累加**（2026-10-04，真实缺陷）：`totalCredit` 这个标量会把
+ * 不同量纲加在一起（ZCode 的 1 亿 token + 100 积分 = `100000100`），单位信息
+ * 一旦在这一层丢掉，下游无论怎么写文案都只能标一个「积分」。故同时产出
+ * `totalByUnit`，消费方一律用它（见 `RpcCreditsClaimSummary.totalByUnit`）。
+ *
+ * ⚠️ `totalCredit` **保留原语义**（跨单位求和），只为不破坏既有契约；
+ * **不要**在展示路径上用它 —— 那正是本缺陷的成因。
  */
 export function computeClaimSummary(outcomes: readonly ClaimOutcome[]): RpcCreditsClaimSummary {
   const summary: RpcCreditsClaimSummary = {
     claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
+    totalByUnit: { token: 0, credit: 0 },
   }
   for (const outcome of outcomes) {
     switch (outcome.kind) {
       case 'claimed':
         summary.claimed += 1
         summary.totalCredit += outcome.credit
+        // ⚠️ 单位缺省按 `credit`（与 `ClaimOutcome.unit` 的声明一致）——
+        // 只有 ZCode 显式传 `'token'`，其余 11 个渠道逐字不变。
+        summary.totalByUnit[claimUnitOf(outcome.unit)] += outcome.credit
         // ⚠️ 只有**覆盖今天**的领取才算「今天已处理」。`coversToday:false` 是
         // 渠道自己标的（当前是 Qoder 刷新前那一轮），见 `credits.ts` 的字段说明。
         if (outcome.coversToday !== false) summary.coversToday += 1

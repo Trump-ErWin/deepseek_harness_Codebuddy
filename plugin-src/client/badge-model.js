@@ -557,6 +557,48 @@ export function orderCreditRows(rows, options = {}) {
 }
 
 /**
+ * 「积分区」**节标题**的单位标签（纯函数，便于单测锁死）。
+ *
+ * ## ⚠️ 为什么必须有它（真实缺陷，2026-10-05 复审 PR !56 时发现）
+ *
+ * 弹窗的「积分区」节标题原写作 `quotaGroup === undefined ? '积分' : unitLabel(...)`
+ * —— 硬编码 `'积分'` 的兜底分支**假定所有非配额渠道都是积分**，但 **ZCode 的
+ * 额度单位是 token**（`src/jet-hub-rpc.ts` 的 zcode 分支如实标 `unit: 'token'`）。
+ * 于是 ZCode 的浮层渲染成：
+ *
+ * ```
+ * 积分                  ← 节标题（写死）
+ *   ZCode 旅行者6665   94.54MToken   ← 同一屏里的数值（按单位走）
+ * ```
+ *
+ * **同一屏里标题说「积分」、数值说「Token」** —— 这正是本次要修的那类
+ * 「展示路径写死「积分」」缺陷的**第三个实例**（前两个：逐账号明细行、
+ * 领取汇总行），也是它至今没被发现的原因：**它只在「该渠道只发 token」时显形**，
+ * 而 12 个渠道里只有 ZCode 是这种形状。
+ *
+ * ⚠️ 判据与 `creditGroupsOf` 的**分组口径同源**（都用 `normalizeUnit` 归一后的
+ * `group.unit` / `group.label`），**不要**另立一套判断：
+ *  - 有配额组 → 用配额组的标签（`'额度'`，不是积分，见 §3.3）；
+ *  - 否则取**第一个**单位的标签（ZCode 全是 token ⇒ `'Token'`；其余 ⇒ `'积分'`）。
+ *
+ * ⚠️ **取第一个而不是「所有单位都必须相同」**：混合单位的渠道在现实里不存在
+ * （同一渠道的包单位语义一致，见 `badge-subscription.ts` 的注释），
+ * 而 `groups` 已按 `unit` 排序（`creditGroupsOf` 末尾的 sort），
+ * 故「第一个」是**确定**的，不依赖对象键序。
+ *
+ * @param groups - `creditGroupsOf()` 的 `groups`（已按单位归一 + 排序）。
+ * @returns 节标题文字：`'额度'` / `'Token'` / `'积分'`。
+ */
+export function creditSectionLabel(groups) {
+  const list = Array.isArray(groups) ? groups.filter((g) => g && typeof g.unit === 'string') : [];
+  const quotaGroup = list.find((g) => g.unit === QUOTA_UNIT);
+  if (quotaGroup !== undefined) return unitLabel(quotaGroup.unit);
+  // ⚠️ 没有配额组时也**不能**硬编码「积分」—— 见上面的 ZCode 反例。
+  if (list.length === 0) return unitLabel(undefined);
+  return unitLabel(list[0].unit);
+}
+
+/**
  * 「更新于 2026/10/1 16:39:32」的时间戳。
  *
  * 时间戳**含日期**：宿主是长生命周期进程，只给时钟会让「昨天读的」

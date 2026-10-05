@@ -74,6 +74,7 @@ import {
   formatUnits,
   formatQuotaLine,
   formatQuotaDetail,
+  formatClaimGains,
   unitLabel,
 } from './credits-format.js';
 import {
@@ -2197,9 +2198,15 @@ function ProviderPanel({ provider, rpcCall }) {
     //   后端 `toClaimOutcome` 现在会带上 `unit: token` 与真实额度
     //   （实测 100000000），这里用现成的 formatUnits/unitLabel 渲染。
     const unit = outcome.unit === 'token' ? 'token' : 'credit'
+    // ⚠️ 数值与单位之间**不留空格**（`+100.00MToken`）：这是本仓库的统一口径
+    //   （用量徽标 `badge-model.js` 的 `94.54MToken`、汇总行 `formatClaimGains`
+    //   的 `+100.00MToken`，以及用户报障时给出的期望文案 `+100Mtoken` 同形）。
+    //   本行原写作 `+${...} ${unitLabel(unit)}`（**带空格**）—— 后果是**同一次
+    //   签到**的逐账号明细显示 `+100.00M Token`、而汇总行显示 `+100.00MToken`，
+    //   两行并列却像两种单位（2026-10-05 复审修正）。
     details.push(
       `${item.nickname || item.accountId}：领取成功 `
-      + `+${formatUnits(outcome.credit, unit)} ${unitLabel(unit)}`,
+      + `+${formatUnits(outcome.credit, unit)}${unitLabel(unit)}`,
     )
         } else if (outcome.kind === 'already-claimed') {
           details.push(`${item.nickname || item.accountId}：${outcome.message || '今天已领取'}`);
@@ -4331,7 +4338,14 @@ export function JetHubPage({ close, rpcCall }) {
     // 需要用户操作的提示（如「该账号尚未开通，请先用官方客户端登录一次」）。
     // 单独收集、单独渲染：混进计数行会被读漏，而这类提示的价值就在于被看到。
     const notes = [];
-    let totalCredit = 0;
+    // ★ 按单位分组的合计（2026-10-04，真实缺陷）：见下方累加处的说明。
+    //
+    // ⚠️ 这里**刻意不设 `totalCredit` 标量**：它是跨单位求和的数，展示路径本就
+    //   一律不得使用。本 PR 首版留着它并配了「兜底旧宿主」的三元分支，但那个
+    //   分支**永远走不到**（只要有 `claimed`，`totalByUnit` 必非零）—— 旧宿主
+    //   的兜底实际发生在下面逐渠道的 `s.totalByUnit || {...}` 那一跳。
+    //   留一个恒为 0 的变量 + 一句会骗人的注释，比删掉它危险得多。
+    const totalByUnit = { token: 0, credit: 0 };
     let failed = 0;
     for (const provider of checkinProviders()) {
       const label = PROVIDERS.find(p => p.id === provider)?.label || provider;
@@ -4349,8 +4363,23 @@ export function JetHubPage({ close, rpcCall }) {
         // 用 else-if 短路，否则后者的信息被前者的分支吞掉。
         const bits = [];
         if (s.claimed > 0) {
-          totalCredit += s.totalCredit;
-          bits.push(`+${s.totalCredit}`);
+          // ★ 按单位分别累加（2026-10-04，真实缺陷）：`s.totalCredit` 是**跨单位
+          //   求和** —— ZCode 的 1 亿 token 与其余渠道的积分会被加成一个数，并
+          //   在汇总行标成「积分」（用户报障原文：`ZCode（智谱）+100000000
+          //   （共 +100000100）`）。单位必须一路带着走，故这里读 `totalByUnit`。
+          const byUnit = s.totalByUnit || { credit: s.totalCredit, token: 0 };
+          totalByUnit.credit += Number(byUnit.credit) || 0;
+          totalByUnit.token += Number(byUnit.token) || 0;
+          // ⚠️ 逐渠道那行也按单位渲染：原先写裸数字（`+100000000`），既看不出
+          //   单位、量级也读不出来。缺 `totalByUnit` 的旧宿主回落到「按积分」。
+          // ⚠️ **不要在这里再拼 `+`**：`formatClaimGains` 的返回值**自带**每个单位
+          //   的 `+`（`+100.00MToken, +100积分`），再拼一次会渲染成 `++100.00MToken`。
+          //   真实缺陷（2026-10-05 复审本 PR 时实测）：本行原写作 `+${amount}`，
+          //   而汇总行又写 `（共 +${totalAmount}）` —— 两个界面同时出现双加号，
+          //   且**全量单测 5448 条全绿也抓不到**（没有任何用例断言调用点的拼装形态）。
+          //   回归由 `tests/unit/claim-unit-callsites.spec.ts` 的源码级断言锁死。
+          const amount = formatClaimGains(byUnit);
+          if (amount !== null) bits.push(amount);
         }
         if (s.alreadyClaimed > 0) bits.push(`${s.alreadyClaimed} 个今日已领`);
         if (s.inactive > 0) bits.push(`${s.inactive} 个暂无活动`);
@@ -4390,11 +4419,24 @@ export function JetHubPage({ close, rpcCall }) {
       if (!mounted.current) return;
     }
     if (!mounted.current) return;
+    // ★ 汇总行按单位分别报（2026-10-04，真实缺陷）：原先写 `（共 +${totalCredit} 积分）`，
+    //   而 `totalCredit` 是跨单位求和 —— 用户报障的 `（共 +100000100）` 就是它。
+    //   期望形态是 `（共 +100.00MToken, +100积分）`（见 `formatClaimGains`）。
+    //
+    // ⚠️ **不能再拼 `+`**：`formatClaimGains` 的返回值自带每个单位的 `+`
+    //   （`+100.00MToken, +100积分`）—— 本行原写作 `（共 +${totalAmount}）`，
+    //   渲染出 `（共 ++100.00MToken, +100积分）`（2026-10-05 复审实测）。
+    //
+    // ⚠️ **兜底只在累加处做一次**：旧宿主（无 `totalByUnit`）的值已在上面
+    //   逐渠道时回落进 `totalByUnit`，故这里直接用它。原先还写了一个
+    //   `... : { credit: totalCredit }` 的三元兜底，而 `totalCredit` 早已不再累加
+    //   （恒为 0）⇒ 该分支既走不到、又让人以为旧宿主靠它兜底。已删除。
+    const totalAmount = formatClaimGains(totalByUnit);
     setCheckinNotice({
       // 有待用户处理的提示时用 warn 色调，让那条提示更显眼
       tone: failed > 0 || notes.length > 0 ? 'warn' : 'ok',
       text: parts.length > 0
-        ? `一键签到：${parts.join('，')}${totalCredit > 0 ? `（共 +${totalCredit} 积分）` : ''}`
+        ? `一键签到：${parts.join('，')}${totalAmount === null ? '' : `（共 ${totalAmount}）`}`
         : '一键签到：没有可领取的渠道',
       notes,
     });
