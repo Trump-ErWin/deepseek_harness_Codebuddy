@@ -25,7 +25,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
-import { findBrowserExecutable } from '../../src/zcode-captcha.js'
+import { browserCandidates, findBrowserExecutable } from '../../src/zcode-captcha.js'
 
 /** 临时环境变量的设置/还原。 */
 const saved: Record<string, string | undefined> = {}
@@ -154,6 +154,31 @@ describe('ZCode 浏览器探测', () => {
   })
 
   it('★ SCOOP 显式声明的根目录**优先于**默认 ~/scoop', () => {
+    /**
+     * ⚠⚠ **必须显式传 `platform: 'win32'`** —— 判据是**候选顺序**，不是
+     * 「本机能不能找到那个 exe」。
+     *
+     * ## 这条用例踩过的坑（2026-10-06，Gitee issue IKJPBJ 评论里由 @Ghandi 暴露）
+     *
+     * 它原先调 `findBrowserExecutable()`，而那个函数内部读**宿主** `process.platform`：
+     *
+     * - 在 macOS 补 darwin 分支**之前**，macOS 落进 win32 分支 ⇒ `SCOOP` 生效 ⇒
+     *   临时造的 exe 排第一 ⇒ 用例通过（**靠巧合**）；
+     * - 补了 darwin 分支**之后**，macOS 走 `/Applications/…` 那条链，`SCOOP`
+     *   **被完全忽略** ⇒ 返回真实 Chrome（或 `undefined`）⇒ **必然失败**。
+     *
+     * 实测证据（`browserCandidates` 注入同一个 `SCOOP`）：
+     * ```
+     * win32  → 首条 C:\tmp\fake-scoop\apps\chromium\current\chrome.exe
+     * darwin → 含任何 scoop 路径: false；首条 /Applications/Google Chrome.app/...
+     * ```
+     *
+     * ⇒ 这不是「macOS 环境没配好」，是**用例本身只在 Windows 成立**。
+     * 改调纯函数 {@link browserCandidates} 并把平台钉死，任意宿主上都跑同一份。
+     *
+     * ⚠ `SCOOP` 只在 win32 分支被读：它是 scoop（Windows 包管理器）的概念，
+     * darwin / linux 分支里**根本没有**这一档 —— 下面第 2 条断言把这条契约锁死。
+     */
     const dir = mkdtempSync(join(tmpdir(), 'zcode-browser-scoop-'))
     try {
       // 造一个符合 scoop 布局的路径：<root>/apps/chromium/current/chrome.exe
@@ -162,17 +187,37 @@ describe('ZCode 浏览器探测', () => {
       const exe = join(appsDir, 'chrome.exe')
       writeFileSync(exe, '')
 
-      setEnv('ZCODE_CHROME_PATH', undefined)
-      setEnv('SCOOP', dir)
+      const candidates = browserCandidates({
+        platform: 'win32',
+        env: { ZCODE_CHROME_PATH: undefined, SCOOP: dir },
+        home: homedir(),
+      })
       /**
-       * ⚠ 断言「等于自定义那个」而不是「包含它」—— `SCOOP` 是 scoop 自己
-       * 的权威声明，用户设了就说明默认路径不对。若实现把它排在
-       * `~/scoop` 之后，本机会先命中真实的 `~/scoop/.../chrome.exe`
-       * （实测第一版就是这么错的）。
+       * ⚠ 断言「第一条就是自定义那个」而不是「包含它」—— `SCOOP` 是 scoop 自己
+       * 的权威声明，用户设了就说明默认路径不对。若实现把它排在 `~/scoop`
+       * 之后，会先命中真实的 `~/scoop/.../chrome.exe`（实测第一版就是这么错的）。
+       *
+       * ⚠ 判据落在**候选链**而不是 `findBrowserExecutable()`：后者要过
+       * `existsSync`，在本机会被真实安装的 Chrome 抢走第一名。
        */
-      expect(findBrowserExecutable()).toBe(exe)
+      expect(candidates[0]).toBe(exe)
     } finally {
       rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * 上面那条的**配套契约锁**：`SCOOP` 是 Windows 概念，darwin 分支里不得出现。
+   * ⚠ 这条同时是上面那条的**反向验证**——若有人把 darwin 分支去掉、或让 SCOOP
+   * 跨平台生效，它会立刻变红。
+   */
+  it('★ SCOOP / SCOOP_GLOBAL 只在 win32 分支被读（darwin · linux 一律忽略）', () => {
+    const injected = { SCOOP: 'D:\\scoop', SCOOP_GLOBAL: 'E:\\gscoop' }
+    expect(browserCandidates({ platform: 'win32', env: injected, home: 'C:\\u' })
+      .some((c) => c.includes('scoop'))).toBe(true)
+    for (const platform of ['darwin', 'linux'] as const) {
+      expect(browserCandidates({ platform, env: injected, home: '/home/u' })
+        .some((c) => c.includes('scoop'))).toBe(false)
     }
   })
 })
