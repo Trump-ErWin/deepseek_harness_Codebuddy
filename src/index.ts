@@ -544,6 +544,12 @@ export function apply(ctx: Context): void {
    * ⚠️ 这里**只改错误语义，不改可用性**：没有账号可用就是没有，压缩该失败
    * 仍然失败；修的是「用户看到的原因」。绝不静默换模型、也绝不绕过限流标记。
    *
+   * ⚠️ **但「不改可用性」对 zcode 不成立** —— 正因如此，zcode **刻意不接**这条：
+   * 其余各家的兜底读的是 Jet Hub 登录路径下**从不被写入**的 `*_ACCESS_TOKEN`，
+   * 判定抛错时那条路本就取不到东西；而 zcode 的兜底 `zcode.current()` 会**再读
+   * 一次账号池**且不看 `enabled`、仍能返回凭据 —— 加判定会把本来能跑通的一发
+   * 变成硬失败。完整实测见 zcode 注册处那条注释。
+   *
    * @param product - 目标 provider（用其 `id` 与 `displayName`）。**只要求这两个字段**：
    *   除 buddy / workbuddy 外，cline 也接这条（它同样会因模型级限流被挡住，
    *   而 `ClineProduct` 与 `BuddyProduct` 是两个类型）。
@@ -751,11 +757,14 @@ export function apply(ctx: Context): void {
       // 回退到账号池的既有选择（凭据损坏的账号已被 tried 排除）。
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
       const available = await pool.getAvailableAccount(LOBSTERAI.id, modelId ?? '', picked.tried)
-      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
       if (available) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
         reportLedgerAccount(LOBSTERAI.id, available.entry.id)
         return available.credential as LobsteraiCredential
       }
+      // 退到单凭据 ref 之前先证明失败原因（见 `throwIfAllAccountsRateLimited`
+      // 的说明）：全被模型限流时报明确的限流错误，而不是降级成「请先登录」。
+      throwIfAllAccountsRateLimited(LOBSTERAI, modelId)
       // ⚠️ 复用上面的解析器而不是再写一遍 JSON.parse：两处各写一遍时，
       // 形状校验的强度会分叉（这正是 TRAE 那份注释记的坑）。
       return resolveLobsteraiCredentialByRef(LOBSTERAI.defaultCredentialRef)
@@ -828,6 +837,9 @@ export function apply(ctx: Context): void {
       }
       // 回退到单凭据路径：没有账号条目可标记，清空以免标记到过期的 id。
       activeQoderAccountId.set(QODER.id, undefined)
+      // 区分「全部限流」与「没登录」（见该助手的说明）—— 否则用户会去
+      // 重新登录，而凭据其实是好的（真实缺陷，Gitee IKJOZ9）。
+      throwIfAllAccountsRateLimited(QODER, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(QODER.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -886,6 +898,8 @@ export function apply(ctx: Context): void {
         return available.credential as QoderCredential
       }
       activeQoderAccountId.set(QODER_CN.id, undefined)
+      // 同国际版：区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(QODER_CN, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(QODER_CN.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -993,11 +1007,13 @@ export function apply(ctx: Context): void {
       //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中，
       // 换号形同虚设（用户报障「没有切换」的根因之一）。
       const available = await pool.getAvailableAccount(TRAE.id, modelId ?? '', picked.tried)
-      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
       if (available) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
         reportLedgerAccount(TRAE.id, available.entry.id)
         return available.credential as TraeCredential
       }
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(TRAE, modelId)
       // ⚠️ 复用上面的解析器而不是再写一遍 JSON.parse（同 LobsterAI 那处的理由）。
       return resolveTraeCredentialByRef(TRAE.defaultCredentialRef)
     },
@@ -1196,6 +1212,9 @@ export function apply(ctx: Context): void {
       }
 
       // 兜底：账号池为空/全部不可解析时，退回单凭据 ref。
+      // ⚠️ 先证明失败原因是不是限流（见该助手的说明，IKJOZ9）：唯一启用账号
+      // 被该模型限流时，候选在上面的 filter 里已被筛空 —— 那不是「没登录」。
+      throwIfAllAccountsRateLimited(LOOMY, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(LOOMY.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1272,6 +1291,8 @@ export function apply(ctx: Context): void {
         reportLedgerAccount(RACCOON.id, available.entry.id)
         return available.credential as unknown as RaccoonCredential
       }
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(RACCOON, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(RACCOON.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1341,6 +1362,8 @@ export function apply(ctx: Context): void {
         reportLedgerAccount(MINIMAX.id, available.entry.id)
         return available.credential as unknown as MinimaxCredential
       }
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(MINIMAX, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(MINIMAX.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1432,6 +1455,8 @@ export function apply(ctx: Context): void {
         reportLedgerAccount(GEMINI.id, available.entry.id)
         return available.credential as unknown as GeminiCredential
       }
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(GEMINI, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(GEMINI.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1610,6 +1635,24 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
      * ⚠ 同时**清空**记录：没有账号条目可标记，留着旧 id 会误伤一个无辜账号。
      */
     activeZcodeAccountId.set(ZCODE.id, undefined)
+    // ⚠️⚠️ **刻意不接 `throwIfAllAccountsRateLimited`** —— 与 IKJOZ9 修好的那 8 家相反。
+    //
+    // 其余各家的兜底是读一个在 Jet Hub 登录路径下**从不被写入**的 `*_ACCESS_TOKEN`，
+    // 于是「池被限流筛空」必然一路退化成 `undefined` → 适配器误报「请先登录」
+    // —— 那才是 IKJOZ9 的症状。
+    //
+    // zcode 的兜底 `zcode.current()` 却会**再读一次账号池**
+    // （`zcode-auth.ts` 的 `readStoredCredential` → `readCredentialFromPool`），
+    // 且既不看 `enabled`、也不看 `modelRateLimits` ⇒ 池被筛空时它**照样返回凭据**。
+    //
+    // 实测（2026-10-06，真实 `apply()` + 真账号池，临时探针）：
+    //   · 唯一启用账号被限流、凭据合法 → **返回该凭据**，不抛「未登录」；
+    //   · 池里还有一个「停用但健康」的账号且**排在前面**（`readCredentialFromPool`
+    //     取数组序第一个能解析的）→ **返回那个停用账号的凭据**，请求能跑通。
+    //
+    // ⇒ ① zcode 没有 IKJOZ9 的症状，不该被"顺手修"；② 在第二种组合下，
+    // 加判定反而会把本来能跑通的一发变成硬失败。故保持原样。
+    // 回归断言见 `buddy-ratelimit-misreport.spec.ts` 的「zcode 同型缺陷判定」段。
     return await zcode.current()
   },
   refresh: async () => {
