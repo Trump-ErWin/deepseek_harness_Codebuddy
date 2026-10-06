@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL, policyBlockResetAtMs, registerBuddyLlm,
 } from '../../src/buddy-adapter.js'
@@ -465,6 +465,158 @@ describe('BuddyAdapter', () => {
         fetchRemoteModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'DS' }],
       })
       expect((await adapter.resolveModel('buddy', 'deepseek-v4.1-flash')).inputModalities).toEqual(['text', 'image'])
+    })
+
+    // ── issue IKJQ3M ──
+    //
+    // 「远端下发了完整能力元数据、但模型不在编译期兜底表里」这一档，
+    // 修复前会被 reconcileWithFallback 的白名单式重建整个丢弃（连同它
+    // 自带的 supportsImages: true），于是 inputModalitiesFor 三级 ?? 全落空
+    // ⇒ 贴图报 `does not accept image input`，而真实网关完全支持图片。
+    //
+    // ⚠️ 这**不是**瞬时状态：远端目录即使拉取成功也照样误判（issue 里
+    // 「重启即自愈」的结论只在模型恰好被 agent 引用时成立）。
+    it('远端下发能力元数据、模型不在兜底表时仍保留该模型并声明 image', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{
+          id: 'space-bunny', name: 'Space-Bunny', supportsImages: true, contextWindow: 1_000_000,
+        }],
+      })
+      const models = await adapter.listModels('buddy')
+      const spaceBunny = models.find((m) => m.id === 'space-bunny')
+      expect(spaceBunny, '远端声明了能力的模型不该被白名单丢弃').toBeDefined()
+      expect(spaceBunny?.inputModalities).toEqual(['text', 'image'])
+      expect((await adapter.resolveModel('buddy', 'space-bunny')).inputModalities).toEqual(['text', 'image'])
+    })
+
+    // ⚠️ 放宽白名单**不得**放宽到「什么都能进」：远端既没下发能力元数据、
+    // 也没说它可选（无 agentReferenced）的内部别名仍必须被丢弃
+    // （既有 `hy4-preview-f` 回归用例守住 agentReferenced 这一条，这里守另一半）。
+    it('远端未声明能力也未被 agent 引用的模型仍被白名单丢弃', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'internal-alias-probe', name: 'Internal' }],
+      })
+      expect((await adapter.listModels('buddy')).map((m) => m.id))
+        .not.toContain('internal-alias-probe')
+    })
+  })
+
+  // ── 「能力未知」不等于「不支持」：贴图门禁的三态语义（issue IKJQ3M）──
+  //
+  // 修复前 `inputModalitiesFor` 把「远端没拉到」与「远端说不支持」压成同一个
+  // 结果（都是 ['text']），于是：远端拉取失败 ⇒ 实际支持图片的模型被误杀，
+  // 且错误文案误导（说「模型不支持图片」，实际是「暂时不知道」）。
+  //
+  // 三态契约（本次修复的权威定义）：
+  //   - 明确支持 → ['text','image']
+  //   - 明确不支持（远端显式 supportsImages=false）→ ['text']
+  //   - **未知**（远端没拉到 / 目录未就绪）→ **不声明** inputModalities
+  //
+  // ⚠️ 未知必须**省略字段**而不是报 ['text']：宿主 DSH 见到 ['text'] 会按
+  // 「确认是纯文本模型」把图片静默投影成占位文本（dsh-llm `lib/index.js`
+  // 的 projectImagesForTextModel），用户既看不到图也拿不到原因。
+  describe('贴图门禁：能力未知时的行为（issue IKJQ3M）', () => {
+    /** 构造一个「远端目录永远拿不到」的适配器，并统计拉取次数。 */
+    function makeUnreadyAdapter(options: {
+      fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
+      now?: () => number
+    } = {}): { adapter: BuddyAdapter; calls: () => number } {
+      let calls = 0
+      const adapter = makeAdapter({
+        readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+        fetchRemoteModels: options.fetchRemoteModels ?? (async () => {
+          calls++
+          throw new Error('catalog endpoint is down')
+        }),
+        fetchImpl: async () => sseResponse('data: [DONE]\n\n'),
+      })
+      return { adapter, calls: () => calls }
+    }
+
+    const UNKNOWN_MODEL = 'space-bunny'
+
+    it('远端目录未就绪时贴图不再谎报「模型不支持图片」', async () => {
+      // 修复前抛 `UNSUPPORTED_CONTENT: model "..." does not accept image input`，
+      // 把「暂时不知道」说成「确认不支持」。
+      const { adapter } = makeUnreadyAdapter()
+      const error = await collectChunks(adapter, {
+        model: UNKNOWN_MODEL,
+        messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a' } }] }],
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(LlmError)
+      // 仍拒绝（不能把未知当成支持），但**错误码与文案必须可区分**。
+      expect((error as LlmError).code).not.toBe('UNSUPPORTED_CONTENT')
+      expect(String((error as LlmError).message)).not.toContain('does not accept image input')
+      expect(String((error as LlmError).message)).toContain(UNKNOWN_MODEL)
+    })
+
+    it('远端目录未就绪时 resolveModel 不声明 inputModalities（宿主因此不投影图片）', async () => {
+      const { adapter } = makeUnreadyAdapter()
+      const resolved = await adapter.resolveModel('buddy', UNKNOWN_MODEL)
+      // ⚠️ 关键：必须是 undefined（宿主才不把图片投影成占位文本），
+      // 报 ['text'] 等于告诉宿主「这是纯文本模型」。
+      expect(resolved.inputModalities).toBeUndefined()
+    })
+
+    it('远端目录未就绪时 listModels 里该模型也不声明 inputModalities', async () => {
+      const { adapter } = makeUnreadyAdapter()
+      const models = await adapter.listModels('buddy')
+      // 兜底表里的模型已知支持图片，仍应正常声明。
+      expect(models.find((m) => m.id === 'deepseek-v4.1-flash')?.inputModalities).toEqual(['text', 'image'])
+      // 未被任何表覆盖的模型：能力未知 ⇒ 不声明。
+      expect((await adapter.resolveModel('buddy', UNKNOWN_MODEL)).inputModalities).toBeUndefined()
+    })
+
+    it('远端目录恢复后能力判定随之恢复（重新拉取并声明 image）', async () => {
+      vi.useFakeTimers()
+      let calls = 0
+      const { adapter } = makeUnreadyAdapter({
+        fetchRemoteModels: async () => {
+          calls++
+          if (calls === 1) throw new Error('catalog endpoint is down')
+          return [{ id: UNKNOWN_MODEL, name: 'Space-Bunny', supportsImages: true }]
+        },
+      })
+      // 第一次：未知
+      expect((await adapter.resolveModel('buddy', UNKNOWN_MODEL)).inputModalities).toBeUndefined()
+
+      // ⚠️ 用户定的重试规则（issue IKJQ3M）：**距上次失败不足 10 秒不重拉**。
+      // 目录端点超时上限 60s（src/buddy.ts 的 REQUEST_TIMEOUT_MS），无节流的
+      // 「贴图就重拉」会把每个模型的每次请求都放大成一次远端拉取
+      // —— 那正是 RemoteCatalogGate 当初要挡的放大。
+      await adapter.refreshCatalog()
+      expect(calls, '10 秒内不得重复拉取').toBe(1)
+      expect((await adapter.resolveModel('buddy', UNKNOWN_MODEL)).inputModalities).toBeUndefined()
+
+      // ⚠️ 反向验证的另一半：过够时间后**必须真的重拉并重新判能力**，
+      // 否则用户永远停留在「未知」，问题只是被推迟而不是被修复。
+      vi.setSystemTime(Date.now() + 11_000)
+      try {
+        await adapter.refreshCatalog()
+        expect(calls, '超过 10 秒后应重新拉取目录').toBe(2)
+        expect((await adapter.resolveModel('buddy', UNKNOWN_MODEL)).inputModalities).toEqual(['text', 'image'])
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('远端显式声明 supportsImages=false 时仍照旧拒绝（不得放宽真失败）', async () => {
+      // 白名单放宽 + 「未知不谎报」都不能把「远端说不支持」也放行。
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+        fetchRemoteModels: async () => [{ id: 'text-only-probe', name: 'P', supportsImages: false }],
+        fetchImpl: async () => sseResponse('data: [DONE]\n\n'),
+      })
+      const error = await collectChunks(adapter, {
+        model: 'text-only-probe',
+        messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a' } }] }],
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+      expect((error as LlmError).code).toBe('UNSUPPORTED_CONTENT')
+      expect(String((error as LlmError).message)).toContain('does not accept image input')
     })
   })
 
