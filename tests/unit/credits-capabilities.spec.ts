@@ -22,6 +22,8 @@ import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
 import { BUDDY_EXPIRING_WINDOW_DAYS } from '../../src/buddy-balance-rank.js'
 import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
 import { LOOMY } from '../../src/loomy-product.js'
+import { TRAE } from '../../src/trae-product.js'
+import { LOBSTERAI } from '../../src/lobsterai-product.js'
 
 /**
  * 积分能力矩阵的回归测试。
@@ -408,17 +410,23 @@ describe('客户端积分请求门控（源码级回归）', () => {
 })
 
 /**
- * ⚠️ **「锁定永久积分」能力面**（用户需求：Loomy 已有，CodeBuddy / WorkBuddy 各加一个）。
+ * ⚠️ **「锁定永久积分」能力面**。
  *
  * 这里最重要的是**前后端一致**：前端决定按钮是否出现、请求是否发出，
  * 后端决定写入是否被接受。两边不一致就是「按钮出现了但点了报 bad-request」
  * 或「功能存在却点不出来」—— 两种都比"没这个功能"更难解释。
  */
 describe('永久积分锁定能力', () => {
-  /** 三个支持锁定永久积分的 provider（与后端白名单同一份事实）。 */
-  const SUPPORTED = [LOOMY.id, CODEBUDDY.id, WORKBUDDY.id]
+  /**
+   * 支持锁定永久积分的 provider（与后端白名单同一份事实）。
+   *
+   * ⚠️ 2026-10-06 新增 TRAE（字节）与 LobsterAI（有道）：它们的余额响应带逐包
+   * 到期时间（TRAE 的条目级 `expire_time`、LobsterAI 的 `expiresAt`），
+   * 归一化到 `deductionEndTime` 后即可用同一个 `splitBuddyCreditsByExpiry` 分桶。
+   */
+  const SUPPORTED = [LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id]
   const UNSUPPORTED = [
-    'codearts', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'raccoon',
+    'codearts', 'qoder', 'qodercn', 'cline', 'raccoon',
   ]
 
   it('前后端的支持面完全一致（逐个 provider 对账）', () => {

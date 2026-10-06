@@ -49,6 +49,11 @@ import { CLINE } from './cline-product.js'
 import { configureDeadModelStore, withDeadModelPruning } from './dead-model-store.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
+// 「锁定永久积分」的余额分档需要各家的余额查询函数：分档判据
+// （`splitBuddyCreditsByExpiry`）只读通用的 `packages[].{active, remaining,
+// deductionEndTime}`，故把各家的 fetch 指给同一个选择器即可（见各自接线处）。
+import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
+import { fetchTraeCreditBalance } from './trae-credits.js'
 import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
 import type { ClineCredential } from './cline.js'
@@ -405,18 +410,32 @@ export function apply(ctx: Context): void {
   })
 
   /**
-   * buddy 系的选号编排：按「enabled + 模型未受限」筛候选 → 按余额分档选号 → 取凭据。
+   * 按到期分档的选号编排：按「enabled + 模型未受限」筛候选 → 按余额分档选号 → 取凭据。
    *
    * ⚠️ 余额分档**只在这批候选内部进行** —— 即与 Loomy 同一约定：策略建立在
    * 「模型没有受限且账号没有被停用」的基础上，不能因为某个号积分多就绕开限流标记。
    *
-   * @returns 选中账号的凭据；`credential` 为空时 `tried` 是「档位最优但凭据坏了」
-   * 的账号集合，调用方要把它作为排除集合传给 `getAvailableAccount` 继续兜底。
+   * ⚠️ **本函数与 provider 无关**（2026-10-06 泛化）：分档判据只读通用的
+   * `packages[].{ active, remaining, deductionEndTime }`，故 buddy 系、TRAE、
+   * LobsterAI 共用同一套编排 —— 差异全部由 `product` / `selector` /
+   * `resolveCredential` 三个入参承载。加新 provider 时**不要**复制本函数。
+   *
+   * @returns 选中账号的凭据与**账号 id**（后者供 Token 账本归属）；
+   *   `credential` 为空时 `tried` 是「档位最优但凭据坏了」的账号集合，
+   *   调用方要把它作为排除集合传给 `getAvailableAccount` 继续兜底。
    *   锁定且无可用账号时**抛错**（绝不回落，否则锁定形同虚设）。
    */
-  const pickBuddyCredential = async (options: {
-    product: BuddyProduct
-    selector: BuddyBalanceSelector
+  const pickBuddyCredential = async <TCredential = BuddyCredential, TProduct = BuddyProduct>(options: {
+    /**
+     * 目标 provider。**只要求 `id`**：本编排只用它查账号池与读锁定状态，
+     * 其余字段（endpoint / 积分口径等）全部由 `selector` 自己持有。
+     *
+     * ⚠️ 早期写的是 `BuddyProduct`，泛化时收窄成最小接口 —— 否则 TRAE /
+     * LobsterAI 的产品类型（结构完全不同）会被类型系统拒绝，
+     * 迫使调用方做无意义的断言。
+     */
+    product: { readonly id: string }
+    selector: BuddyBalanceSelector<TProduct, TCredential>
     /** 报错文案里的产品名（用户要知道去哪个面板解锁）。 */
     displayName: string
     modelId?: string
@@ -428,7 +447,16 @@ export function apply(ctx: Context): void {
      * 误判成免费会让付费模型绕开锁定、真烧掉永久积分。故调用方只在确定时传 true。
      */
     isFreeModel?: boolean
-  }): Promise<{ credential?: BuddyCredential; tried: Set<string> }> => {
+    /**
+     * 按凭据 ref 解析凭据。缺省用 buddy 系那一个（两站同构）。
+     *
+     * ⚠️ 非 buddy 的 provider **必须显式传入**自己的解析器 —— 缺省值只做
+     * 「按 ref 解析 JSON」，对凭据结构不同的 provider 会解析出错误形状。
+     */
+    resolveCredential?: (refName: string) => Promise<TCredential | undefined>
+  }): Promise<{ credential?: TCredential; accountId?: string; tried: Set<string> }> => {
+    const resolveCredential = options.resolveCredential
+      ?? (resolveBuddyCredentialByRef as unknown as (refName: string) => Promise<TCredential | undefined>)
     const tried = new Set<string>()
     const candidates = pool
       .listAccountsByProvider(options.product.id)
@@ -452,8 +480,8 @@ export function apply(ctx: Context): void {
     // 限流过滤仍然生效（上面的 filter），不会因免费而绕开模型级限流标记。
     if (options.isFreeModel === true) {
       for (const candidate of candidates) {
-        const credential = await resolveBuddyCredentialByRef(candidate.credentialRef)
-        if (credential !== undefined) return { credential, tried }
+        const credential = await resolveCredential(candidate.credentialRef)
+        if (credential !== undefined) return { credential, accountId: candidate.id, tried }
         tried.add(candidate.id)
       }
       // 免费模型下若凭据全坏，仍落到下面的常规路径，以复用既有的错误语义
@@ -464,10 +492,10 @@ export function apply(ctx: Context): void {
 
     const picked = await pickBuddyAccount(options.selector, candidates, {
       allowPermanent,
-      resolveCredential: resolveBuddyCredentialByRef,
+      resolveCredential,
     })
     if (picked.kind === 'account') {
-      return { credential: picked.credential, tried: new Set(picked.tried) }
+      return { credential: picked.credential, accountId: picked.account.id, tried: new Set(picked.tried) }
     }
     for (const id of picked.tried) tried.add(id)
     if (picked.kind === 'locked') {
@@ -650,6 +678,42 @@ export function apply(ctx: Context): void {
   // 服务名由 LobsteraiAuth 依 product.id 派生，注册为 ctx.lobsteraiAuth。
   // 与其他 provider 一样不注册斜杠命令：入口在 Jet Hub 的 LobsterAI 面板。
   const lobsterai = new LobsteraiAuth(ctx)
+  /**
+   * 按凭据 ref 解析 LobsterAI 凭据（供选号器查余额与最终取凭据共用）。
+   *
+   * 抽成局部函数而非内联两遍：选号器需要它查余额，而解析最终凭据又要用它 ——
+   * 两处若各写一遍 JSON 解析，格式一变就会只改一处（与 Loomy 那条同因）。
+   */
+  const resolveLobsteraiCredentialByRef = async (refName: string): Promise<LobsteraiCredential | undefined> => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      return JSON.parse(resolved.value) as LobsteraiCredential
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * LobsterAI 的**按余额优先选号器**（为「锁定永久积分」提供分档依据）。
+   *
+   * ⚠️ 复用 `BuddyBalanceSelector` 而不是新写一个：分档判据
+   * （`splitBuddyCreditsByExpiry`）只读通用的
+   * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
+   * LobsterAI 的 `fetchLobsteraiCreditBalance` 把 `expiresAt`（ISO 8601）归一化到
+   * `deductionEndTime`，故结构一致。
+   *
+   * ⚠️ **缓存不能跨站共用**（选择器内含按账号 id 的缓存），故每家一个实例。
+   *
+   * ⚠️ 到期时间缺失的包归入**永久桶**（`splitBuddyCreditsByExpiry` 的保守方向）：
+   * LobsterAI 实测所有包都带 `expiresAt`，故这条只在响应异常时生效 ——
+   * 那时宁可把它当「不会马上作废」（锁定时少用一个号），
+   * 也不要把长期积分误当快到期烧掉。
+   */
+  const lobsteraiBalanceSelector = new BuddyBalanceSelector({
+    product: LOBSTERAI,
+    resolveCredential: resolveLobsteraiCredentialByRef,
+    fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
+  })
   const lobsteraiAdapter = registerLobsteraiLlm(ctx, {
     credentialRef: credentialRef(LOBSTERAI.defaultCredentialRef),
     resolveCredential: async (modelId?: string) => {
@@ -657,8 +721,27 @@ export function apply(ctx: Context): void {
       // 保证不会串用 CodeBuddy / WorkBuddy / CodeArts 的凭据。
       // provider 实参用 LOBSTERAI.id 而非字面量 'lobsterai'：写死字面量在
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      //
+      // 优先按「快到期积分」分档选号（锁定永久积分时只挑有快到期积分的号）。
+      // 与 buddy 系同一套编排：候选先按「enabled + 模型未受限」筛，
+      // 分档只在这批候选内部进行 —— 不能因为某个号积分多就绕开限流标记。
+      const picked = await pickBuddyCredential({
+        product: LOBSTERAI,
+        selector: lobsteraiBalanceSelector,
+        displayName: 'LobsterAI',
+        modelId,
+        // ⚠️ 必须传 LobsterAI 自己的解析器：缺省值是 buddy 系的，
+        // 两者凭据结构不同（见各自 credential 类型）。
+        resolveCredential: resolveLobsteraiCredentialByRef,
+      })
+      if (picked.credential) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        if (picked.accountId !== undefined) reportLedgerAccount(LOBSTERAI.id, picked.accountId)
+        return picked.credential as LobsteraiCredential
+      }
+      // 回退到账号池的既有选择（凭据损坏的账号已被 tried 排除）。
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
-      const available = await pool.getAvailableAccount(LOBSTERAI.id, modelId ?? '')
+      const available = await pool.getAvailableAccount(LOBSTERAI.id, modelId ?? '', picked.tried)
       // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
       if (available) {
         reportLedgerAccount(LOBSTERAI.id, available.entry.id)
@@ -834,14 +917,59 @@ export function apply(ctx: Context): void {
   // 服务名由 TraeAuth 依 product.id 派生，注册为 ctx.traeAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 TRAE 面板。
   const trae = new TraeAuth(ctx)
+  /**
+   * 按凭据 ref 解析 TRAE 凭据（供选号器查余额与最终取凭据共用）。
+   * 抽成局部函数而非内联两遍的理由同 buddy / Loomy。
+   */
+  const resolveTraeCredentialByRef = async (refName: string): Promise<TraeCredential | undefined> => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      return JSON.parse(resolved.value) as TraeCredential
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * TRAE 的**按余额优先选号器**（为「锁定永久积分」提供分档依据）。
+   *
+   * ⚠️ 同 LobsterAI：复用 `BuddyBalanceSelector`，因为分档判据只读通用的
+   * `packages[].{ active, remaining, deductionEndTime }`。TRAE 的
+   * `fetchTraeCreditBalance` 把条目级 `expire_time`（秒级 Unix）归一化到
+   * `deductionEndTime`，故结构一致。
+   *
+   * ⚠️ **缓存不能跨站共用**（选择器内含按账号 id 的缓存），故每家一个实例。
+   */
+  const traeBalanceSelector = new BuddyBalanceSelector({
+    product: TRAE,
+    resolveCredential: resolveTraeCredentialByRef,
+    fetchBalance: (credential, product) => fetchTraeCreditBalance(credential, product),
+  })
   const traeAdapter = registerTraeLlm(ctx, {
     credentialRef: credentialRef(TRAE.defaultCredentialRef),
     resolveCredential: async (modelId?: string) => {
+      // 优先按「快到期积分」分档选号（锁定永久积分时只挑有快到期积分的号）。
+      // 与 buddy 系同一套编排：候选先按「enabled + 模型未受限」筛，
+      // 分档只在这批候选内部进行 —— 不能因为某个号积分多就绕开限流标记。
+      const picked = await pickBuddyCredential({
+        product: TRAE,
+        selector: traeBalanceSelector,
+        displayName: 'TRAE',
+        modelId,
+        // ⚠️ 必须传 TRAE 自己的解析器（缺省值是 buddy 系的）。
+        resolveCredential: resolveTraeCredentialByRef,
+      })
+      if (picked.credential) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        if (picked.accountId !== undefined) reportLedgerAccount(TRAE.id, picked.accountId)
+        return picked.credential as TraeCredential
+      }
+      // 回退到账号池的既有选择（凭据损坏的账号已被 tried 排除）。
       // ⚠️ `modelId` 必须透传：限流是**按模型**记的（`modelRateLimits[model]`），
       // 传空串会让 `getAvailableAccount` 的限流过滤整体短路
       //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中，
       // 换号形同虚设（用户报障「没有切换」的根因之一）。
-      const available = await pool.getAvailableAccount(TRAE.id, modelId ?? '')
+      const available = await pool.getAvailableAccount(TRAE.id, modelId ?? '', picked.tried)
       // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
       if (available) {
         reportLedgerAccount(TRAE.id, available.entry.id)
