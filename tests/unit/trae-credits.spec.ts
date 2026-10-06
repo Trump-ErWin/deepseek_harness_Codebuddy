@@ -19,6 +19,7 @@ import {
   classifyTraeCheckinError,
 } from '../../src/trae-credits.js'
 import { TRAE } from '../../src/trae-product.js'
+import { BuddyBalanceSelector, pickBuddyAccount } from '../../src/buddy-balance-selector.js'
 import type { TraeCredential } from '../../src/trae.js'
 
 function makeCredential(overrides: Partial<TraeCredential> = {}): TraeCredential {
@@ -173,9 +174,45 @@ describe('fetchTraeCheckinStatus / fetchTraeCreditBalance', () => {
     expect(balance?.total).toBe(480)
   })
 
-  it('无资源包时返回 null（区分「查不到」与「余额为 0」）', async () => {
+  it('无资源包时返回 0 余额（不是 null）—— 区分「真没钱」与「查不到」', async () => {
+    // ⚠️ 2026-10-06 PR !68 审计修正：本 provider **没有独立的总额字段**，
+    // `total` 完全由 `packList` 累加而来 ⇒ 空列表**确凿等于 0 余额**。
+    // 早先把空列表也 `return null`，于是「锁定永久积分 + 账号真没钱」会落到
+    // 选号器的「查询失败」分支，报成「无法确认是否有可用账号…请检查凭据是否失效」
+    // —— 用户明明是没钱，却被引导去查凭据（与 qoder 110 / 排队 10605 同型误报）。
     const { fetcher } = stubFetcher([{ user_entitlement_pack_list: [] }])
-    expect(await fetchTraeCreditBalance(makeCredential(), TRAE, fetcher)).toBeNull()
+    const balance = await fetchTraeCreditBalance(makeCredential(), TRAE, fetcher)
+    expect(balance).not.toBeNull()
+    expect(balance?.total).toBe(0)
+    expect(balance?.packages).toEqual([])
+  })
+
+  it('★ 字段缺失 / 不是数组时仍返回 null（结构异常 = 真的查不到）', async () => {
+    // 这一侧**必须**与「空列表」分开：拿不到列表就无法确认余额是 0 还是查询失败。
+    const missing = stubFetcher([{}])
+    expect(await fetchTraeCreditBalance(makeCredential(), TRAE, missing.fetcher)).toBeNull()
+    const notArray = stubFetcher([{ user_entitlement_pack_list: 'oops' }])
+    expect(await fetchTraeCreditBalance(makeCredential(), TRAE, notArray.fetcher)).toBeNull()
+  })
+
+  it('★ 空列表在锁定时必须报「已用尽」而不是「查不到」（真实链路回归）', async () => {
+    // 走选择器 → 编排的**真实链路**，断言用户可见的文案分叉。
+    const selector = new BuddyBalanceSelector({
+      product: TRAE,
+      resolveCredential: async () => makeCredential(),
+      fetchBalance: async () => {
+        const { fetcher } = stubFetcher([{ user_entitlement_pack_list: [] }])
+        return fetchTraeCreditBalance(makeCredential(), TRAE, fetcher)
+      },
+    })
+    const picked = await pickBuddyAccount(
+      selector,
+      [{ id: 'a1', credentialRef: 'a1' }],
+      { allowPermanent: false, resolveCredential: async () => makeCredential() },
+    )
+    expect(picked.kind).toBe('locked')
+    // 'exhausted' ⇒ 报「积分都已用尽」；'unknown' ⇒ 报「无法确认…检查凭据」（误报）
+    expect(picked.kind === 'account' ? 'account' : picked.reason?.kind).toBe('exhausted')
   })
 
   /**
