@@ -743,9 +743,47 @@ export class ZcodeAdapter extends LlmAdapter {
      * 见 {@link ZcodeAdapter.switchAccountOnQuota}。
      */
     const tried = new Set<string>()
+    /**
+     * ⚠⚠ **取凭据必须排在读 `currentAccountId()` 之前**（2026-10-06 真实故障）。
+     *
+     * `currentAccountId()` 读的是 `index.ts` 里 `activeZcodeAccountId` 那个 Map，
+     * 而它**只在 `resolveCredential` 内部被写入**。原先这里顺序是反的：
+     *
+     * ```ts
+     * let activeAccountId = this.options.currentAccountId?.()   // ← 先读（此刻是空的）
+     * let credential = await this.resolveCredentialOrThrow(options)  // ← 后写
+     * ```
+     *
+     * 冷启动（进程刚起 / 该 provider 首次被调用）时 Map 是空的 ⇒
+     * `activeAccountId === undefined` ⇒ {@link ZcodeAdapter.switchAccountOnQuota}
+     * 里那个守卫整段跳过：**既不标记失败账号、也不把它放进 `tried`** ⇒
+     * 池按用户手动顺序返回的第一个候选**正是刚失败的那个** ⇒
+     * 这次「切号」切回同一账号、同一份凭据，**白发一发**。
+     *
+     * ⚠ **代价不是「慢一发」，而是「池里最后一个账号永远取不到」**
+     * （2026-10-06 复审实测；三账号池 A/B 额度用尽、C 可用）：
+     *
+     * | 池 | 修复前 | 修复后 |
+     * |---|---|---|
+     * | 2 账号（A 用尽、B 可用） | `[A, A, B]` 成功 | `[A, B]` 成功 |
+     * | **3 账号（A、B 用尽、C 可用）** | **`[A, A, B]` ⇒ 抛 `QUOTA_EXCEEDED`，C 从未被尝试** | `[A, B, C]` 成功 |
+     *
+     * 受 `quotaSwitchMax === 2` 限制，一次请求最多 3 发；空转那一发把切号预算
+     * 吃掉一格，池里**最后一个账号就再也够不着** —— 用户看到的是
+     * 「用完余额一个号就卡死了，不会切下一个号」。⇒ 这是**硬失败**，不是性能问题，
+     * 用户报障的措辞是准确的。
+     *
+     * ⚠ 既有用例全部传常量 `currentAccountId: () => 'acct-A'` ⇒ 天然绕过该缺陷
+     * （这正是它此前没被抓到的原因）。回归见
+     * `tests/unit/zcode-rotation-coldstart.spec.ts`：忠实复刻 `index.ts` 接线，
+     * 含 **3 账号池**（锁「最后一个账号必须被尝试到」）与 **接线契约** 两条 ——
+     * 后者是必需的：排除刚失败的账号有**三重冗余**（本行 + `switchAccountOnQuota`
+     * 里那次 add + 写进池的 `modelRateLimits`），**单点删除任一处行为断言仍全绿**，
+     * 故必须直接断言「首次切号时 `tried` 含失败账号、且标记已写下」。
+     */
+    let credential = await this.resolveCredentialOrThrow(options)
     let activeAccountId = this.options.currentAccountId?.()
     if (activeAccountId !== undefined && activeAccountId.length > 0) tried.add(activeAccountId)
-    let credential = await this.resolveCredentialOrThrow(options)
 
     /**
      * 2. 构造请求体（**Anthropic Messages 格式**）。
