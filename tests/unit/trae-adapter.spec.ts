@@ -334,6 +334,42 @@ describe('TRAE 适配器 · listModels', () => {
       expect(models[0]!.name).toBe('X · x0.5')
     })
 
+    /**
+     * ⚠️ 免费模型要跳过「锁定永久积分」那道门（PR !68 审计补齐）。
+     *
+     * 不跳过的话：用户锁定永久积分 + 账号只剩永久积分 + 选中 `rate: 0` 的免费模型
+     * ⇒ 落 `none` 档 ⇒ 抛「积分都已用尽」，而免费模型**根本不扣积分**，报错误导。
+     * 这正是 buddy 系踩过的真实报障（见 `index.ts` 的 `isFreeModel` 参数注释）。
+     */
+    it('★ isFreeModel：creditsRate 恰为 0（免费）时返回 true', async () => {
+      const { adapter } = makeAdapter({
+        remoteModels: [
+          { id: 'free', name: 'Free Model', creditsRate: 0 },
+          { id: 'paid', name: 'Paid Model', creditsRate: 0.08 },
+        ],
+      })
+      expect(await adapter.isFreeModel('free')).toBe(true)
+    })
+
+    it('isFreeModel：付费模型返回 false', async () => {
+      const { adapter } = makeAdapter({
+        remoteModels: [
+          { id: 'free', name: 'Free Model', creditsRate: 0 },
+          { id: 'paid', name: 'Paid Model', creditsRate: 0.08 },
+        ],
+      })
+      expect(await adapter.isFreeModel('paid')).toBe(false)
+    })
+
+    it('★ isFreeModel：查不到目录 / 无倍率 / 空 modelId 一律 false（保守方向）', async () => {
+      // 误判成免费会绕开锁定、真烧掉永久积分且不可撤回 —— 故只在确定时才 true。
+      const unknown = makeAdapter({ remoteModels: [{ id: 'x', name: 'X' }] })
+      expect(await unknown.adapter.isFreeModel('x')).toBe(false)
+      expect(await unknown.adapter.isFreeModel('nope')).toBe(false)
+      expect(await unknown.adapter.isFreeModel(undefined)).toBe(false)
+      expect(await unknown.adapter.isFreeModel('')).toBe(false)
+    })
+
     it('兜底表路径不带倍率（兜底表无该字段，不猜价格）', async () => {
       const { adapter } = makeAdapter()
       const models = await adapter.listModels('trae')

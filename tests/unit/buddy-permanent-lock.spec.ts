@@ -49,6 +49,25 @@ function pickHelperBody(): string {
   return indexCode.slice(start, end)
 }
 
+/**
+ * 取某个 provider 的 `pickBuddyCredential({ … })` **调用块**原文。
+ *
+ * 起点是紧邻 `product: <PROVIDER>` 之前的那次调用，终点是其闭合的 `})`。
+ * 之所以要定位到「调用块」而不是整文件：接线类断言若只做全文件子串匹配，
+ * 同一标识符在别处（选择器定义、文档注释）出现一次就会让断言恒真 ——
+ * 已实测过这种同义反复（见下方 ★ 用例的注释）。
+ *
+ * @param productVar - `indexCode` 里 `product:` 后面那个变量名（TRAE / LOBSTERAI）。
+ */
+function pickCallBlock(productVar: string): string {
+  const anchor = `const picked = await pickBuddyCredential({\n        product: ${productVar},`
+  const start = indexCode.indexOf(anchor)
+  expect(start, `index.ts 里找不到 ${productVar} 的 pickBuddyCredential 调用`).toBeGreaterThan(-1)
+  const end = indexCode.indexOf('\n      })', start)
+  expect(end, `${productVar} 的调用块没有闭合（接线形状变了要同步改本用例）`).toBeGreaterThan(start)
+  return indexCode.slice(start, end)
+}
+
 describe('index.ts 的接线', () => {
   it('导入选号器与编排函数（漏 import 就等于没接）', () => {
     expect(indexCode).toContain("from './buddy-balance-selector.js'")
@@ -61,27 +80,178 @@ describe('index.ts 的接线', () => {
   })
 
   /**
-   * ⚠️ 两个 provider 必须各有一个 selector 实例。
+   * ⚠️ 每个 provider 必须各有**自己的** selector 实例。
    * 共用一份缓存会让 CodeBuddy 的余额结果被 WorkBuddy 读到（键是账号 id，
    * 两站账号 id 不同，看似不会撞 —— 但凭据解析与 endpoint 都跟着 product 走，
    * 共用实例等于把「两站同构」这一前提写死进运行时）。
+   *
+   * ⚠️ 2026-10-06 起 TRAE / LobsterAI 也接了同一套编排，故实例数由 2 变 4。
+   * 本用例改为「**每个支持锁定的 provider 各一个**」—— 数量随白名单走，
+   * 而不是写死 2（写死会让下次加 provider 时这条无关断言先红）。
    */
-  it('CodeBuddy 与 WorkBuddy 各建一个选号器', () => {
+  it('每个支持锁定的 provider 各建一个选号器', () => {
     expect(indexCode).toMatch(/const buddyBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: CODEBUDDY,/)
     expect(indexCode).toMatch(/const workbuddyBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: WORKBUDDY,/)
-    expect(indexCode.match(/new BuddyBalanceSelector\(/g)).toHaveLength(2)
+    expect(indexCode).toMatch(/const traeBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: TRAE,/)
+    expect(indexCode).toMatch(/const lobsteraiBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: LOBSTERAI,/)
+    expect(indexCode.match(/new BuddyBalanceSelector\(/g)).toHaveLength(4)
   })
 
   it('凭据解析函数两站共用一份（同协议，差别只在 endpoint）', () => {
     expect(indexCode).toContain('const resolveBuddyCredentialByRef =')
-    // 三处引用：两个 selector 的依赖 + 编排调用时的凭据解析器
-    expect(indexCode.match(/resolveCredential: resolveBuddyCredentialByRef/g)).toHaveLength(3)
+    // ⚠️ **不能用「标识符出现次数」来断言**（PR !68 初版就是这么写的，已实测是
+    // 同义反复）：把两个 selector 里的 `resolveCredential: resolveBuddyCredentialByRef`
+    // 改成 `(r) => resolveBuddyCredentialByRef(r)` 后，标识符**仍然是 4 次**，
+    // 计数断言照样绿 —— 而「两个 selector 确实用了 buddy 那份解析器」已不存在。
+    // 改成**逐个选择器定义块**内做精确匹配。
+    for (const name of ['buddyBalanceSelector', 'workbuddyBalanceSelector']) {
+      const start = indexCode.indexOf(`const ${name} = new BuddyBalanceSelector(`)
+      expect(start, `index.ts 里找不到 ${name}`).toBeGreaterThan(-1)
+      const block = indexCode.slice(start, indexCode.indexOf('})', start))
+      expect(block, `${name} 必须直接用 resolveBuddyCredentialByRef`).toMatch(
+        /resolveCredential:\s*resolveBuddyCredentialByRef\b/,
+      )
+    }
+    // 编排的**入参**必须真的被传下去（只断言 `options.resolveCredential` 出现在
+    // 源码里是不够的 —— 它只有定义处一处命中，观测不到调用点）。
+    const body = pickHelperBody()
+    expect(body, '编排必须把 resolveCredential 传给 pickBuddyAccount').toMatch(
+      /pickBuddyAccount\([\s\S]*?resolveCredential,/,
+    )
   })
 
-  it('两个 provider 的 resolveCredential 都走选号编排', () => {
+  it('所有走选号编排的 provider 都调 pickBuddyCredential', () => {
     expect(indexCode).toMatch(/const picked = await pickBuddyCredential\(\{\s*\n\s*product: CODEBUDDY,/)
     expect(indexCode).toMatch(/const picked = await pickBuddyCredential\(\{\s*\n\s*product: WORKBUDDY,/)
-    expect(indexCode.match(/await pickBuddyCredential\(\{/g)).toHaveLength(2)
+    expect(indexCode).toMatch(/const picked = await pickBuddyCredential\(\{\s*\n\s*product: TRAE,/)
+    expect(indexCode).toMatch(/const picked = await pickBuddyCredential\(\{\s*\n\s*product: LOBSTERAI,/)
+    expect(indexCode.match(/await pickBuddyCredential\(\{/g)).toHaveLength(4)
+  })
+
+  /**
+   * ⚠️ 非 buddy 的 provider **必须**传自己的解析器：编排的缺省值是 buddy 系那一份，
+   * 而 TRAE / LobsterAI 的凭据结构不同（`TraeCredential` 有 uid/machine_id、
+   * `LobsteraiCredential` 另有字段）—— 用错解析器会静默产出错误形状的凭据。
+   */
+  it('★ TRAE / LobsterAI 显式传自己的凭据解析器（不得落到 buddy 缺省值）', () => {
+    // ⚠️ **必须在「编排调用块」范围内匹配**，不能全文件 `toContain`：
+    // 那两个标识符在选择器定义处（`new BuddyBalanceSelector({ resolveCredential: … }）`）
+    // 本来就各出现一次，于是哪怕把 `pickBuddyCredential` 调用里的那一行删掉、
+    // 让编排静默退回 buddy 缺省值，用例照样绿 —— 已实测复现（反向验证）。
+    // 任何崩不了的实现都能过的用例比没有更危险，故这里取「调用点到闭合」这一段。
+    const traeCall = pickCallBlock('TRAE')
+    expect(traeCall, 'TRAE 的 pickBuddyCredential 调用块').toContain('resolveCredential: resolveTraeCredentialByRef,')
+    const lobsteraiCall = pickCallBlock('LOBSTERAI')
+    expect(lobsteraiCall, 'LobsterAI 的 pickBuddyCredential 调用块').toContain('resolveCredential: resolveLobsteraiCredentialByRef,')
+  })
+
+  /**
+   * ⚠️ **TRAE 必须传 `isFreeModel`**（PR !68 审计补齐，buddy 系早已接上）。
+   *
+   * TRAE 确有 `rate: 0` 的**合法免费模型**（`trae.ts` 的 `readConsumptionRate`
+   * 注释 + `traeDisplayName` 把 0 显示成「免费」）。不跳过余额分档的话，
+   * 「锁定 + 账号只剩永久积分 + 选中免费模型」会抛「积分都已用尽」——
+   * 而免费模型根本不扣积分，错误信息把用户引向完全错误的排查方向。
+   */
+  it('★ TRAE 接线传 isFreeModel（免费模型不被锁定误拦）', () => {
+    expect(pickCallBlock('TRAE')).toContain('isFreeModel: await traeAdapter.isFreeModel(modelId)')
+  })
+
+  /**
+   * ⚠️ 两家的凭据解析器必须**做形状校验**，且与各自 auth 的 `parseCredential` 对齐。
+   *
+   * 裸 `JSON.parse` 会把 `{"foo":1}` 这种损坏凭据当成有效凭据返回，随后适配器的
+   * `credential.access_token.length` 抛 **TypeError**（不是可诊断的
+   * `MISSING_CREDENTIAL`），且发生在选号之后、不在余额查询的 try/catch 覆盖内。
+   *
+   * 判据取 `typeof parsed.access_token === 'string'`，与 `trae-auth.ts` /
+   * `lobsterai-auth.ts` 的 `parseCredential` 逐字一致。
+   */
+  it('★ 两家凭据解析器做形状校验（与各自 auth 的 parseCredential 对齐）', () => {
+    for (const fn of ['resolveTraeCredentialByRef', 'resolveLobsteraiCredentialByRef']) {
+      const start = indexCode.indexOf(`const ${fn} = async`)
+      expect(start, `index.ts 里找不到 ${fn}`).toBeGreaterThan(-1)
+      const body = indexCode.slice(start, indexCode.indexOf('\n  }', start))
+      expect(body, `${fn} 必须校验 access_token 是字符串`).toContain("typeof parsed.access_token === 'string'")
+    }
+  })
+
+  /**
+   * ⚠️ 两家的**选号器**必须注入自己的 `fetchBalance`。
+   *
+   * 漏传时不会用 buddy 的缺省实现去发请求（那样只是查不到），而是把
+   * `TraeProduct` 喂给 `fetchCreditBalance` —— 它读 `product.endpoint`，而
+   * `TraeProduct` **根本没有这个字段** ⇒ 拼出 `undefined/v2/billing/...` 的
+   * 畸形 URL。后果：余额恒查不到 ⇒ 未锁定时换号优化静默失效、锁定时永远报
+   * 「无法确认是否有可用账号」，而积分一分没花。
+   *
+   * ⚠️ 该漏洞**已由 `BuddySelectionDeps` 的条件类型在编译期关闭**
+   * （非 buddy provider 的 `fetchBalance` 必填，实测漏传报 TS2345）；
+   * 这里再钉一道源码级断言作双保险 —— 万日后退化成可选类型，本用例仍能红。
+   */
+  it('★ 两家选号器注入自己的 fetchBalance（不用 buddy 缺省实现）', () => {
+    for (const [name, product, fn] of [
+      ['TRAE', 'TRAE', 'fetchTraeCreditBalance'],
+      ['LobsterAI', 'LOBSTERAI', 'fetchLobsteraiCreditBalance'],
+    ] as const) {
+      const re = new RegExp(
+        `const ${name.toLowerCase()}BalanceSelector = new BuddyBalanceSelector\\(\\{\\s*\\n\\s*product: ${product},[\\s\\S]*?fetchBalance:`,
+      )
+      expect(indexCode, `${name} 的选择器必须注入 fetchBalance`).toMatch(re)
+      expect(indexCode, `${name} 应调用 ${fn}`).toContain(fn)
+    }
+  })
+
+  /**
+   * ⚠️ **兜底必须带上 `picked.tried`**（PR !68 新增，此前是漏的）。
+   *
+   * 不带的话，档位最优但**凭据损坏**的账号会被 `getAvailableAccount` 立刻选回
+   * （池按手动顺序取第一个）⇒ 兜底**原地打转**，换号形同虚设。
+   * 这与 AGENTS.md 反复强调的「切号必须传 tried」是同一类缺陷。
+   *
+   * ⚠️ 已实测：删掉第三个参数后**全量单测照样全绿** —— 必须钉住。
+   */
+  it('★ 两家兜底调 getAvailableAccount 必须透传 picked.tried', () => {
+    for (const id of ['TRAE.id', 'LOBSTERAI.id']) {
+      const re = new RegExp(
+        `getAvailableAccount\\(${id}, modelId \\?\\? '', picked\\.tried\\)`,
+      )
+      expect(indexCode, `${id} 的兜底必须传 tried 排除集`).toMatch(re)
+    }
+  })
+
+  /**
+   * ⚠️ **Token 账本归属不能丢**：`reportLedgerAccount(<ID>.id, picked.accountId)`。
+   *
+   * `pickBuddyCredential` 的返回值新增 `accountId` 就是为了这个（PR 说明里专门写了
+   * 「重构时**保持不丢**」）。实测把这两行删掉、或把 provider 报成 `'buddy'`，
+   * **全量单测全绿** —— token 账本会把这笔消耗记到错误的 provider 上。
+   */
+  it('★ 两家回报 token 账本时用自己选中的账号（不得丢失或报错 provider）', () => {
+    for (const id of ['TRAE', 'LOBSTERAI']) {
+      const re = new RegExp(
+        `reportLedgerAccount\\(${id}\\.id, picked\\.accountId\\)`,
+      )
+      expect(indexCode, `${id} 必须回报 picked.accountId`).toMatch(re)
+    }
+  })
+
+  /**
+   * ⚠️ **`modelId` 必须透传给编排与兜底**。
+   *
+   * 漏传给编排 ⇒ 候选的模型级限流过滤整体短路（`if (key.length === 0) return true`）
+   * ⇒ 被标记限流的号仍被选中；漏传给兜底 ⇒ 同理短路。
+   * buddy 侧 `trae-model-id-selection.spec.ts` 防的是「传空串」，**防不了整行不传**。
+   */
+  it('★ 两家把 modelId 透传给编排与兜底（限流过滤不得短路）', () => {
+    for (const block of [pickCallBlock('TRAE'), pickCallBlock('LOBSTERAI')]) {
+      expect(block, '编排调用必须带 modelId').toMatch(/modelId,/)
+    }
+    for (const id of ['TRAE.id', 'LOBSTERAI.id']) {
+      expect(indexCode, `${id} 的兜底必须透传 modelId`).toMatch(
+        new RegExp(`getAvailableAccount\\(${id}, modelId \\?\\? ''`),
+      )
+    }
   })
 
   /**

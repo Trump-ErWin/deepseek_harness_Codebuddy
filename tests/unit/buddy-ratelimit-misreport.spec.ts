@@ -331,10 +331,14 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
     const WIRING: Array<{ product: string; pool: string; fallback: string }> = [
       { product: 'CODEBUDDY', pool: 'getAvailableAccount(CODEBUDDY.id', fallback: 'credentialRef(BUDDY_CREDENTIAL_REF)' },
       { product: 'WORKBUDDY', pool: 'getAvailableAccount(WORKBUDDY.id', fallback: 'credentialRef(WORKBUDDY.defaultCredentialRef)' },
-      { product: 'LOBSTERAI', pool: 'getAvailableAccount(LOBSTERAI.id', fallback: 'credentialRef(LOBSTERAI.defaultCredentialRef)' },
+      // ⚠️ lobsterai / trae 的兜底锚点是 `resolveXxxCredentialByRef(...)` 而不是
+      // `ctx.credentials.resolve(credentialRef(...))`：master 把那两处内联的
+      // `JSON.parse` 收敛成了复用解析器（理由见 index.ts 里那处的注释）。
+      // 本断言的价值正在于此 —— master 一改兜底写法，它立刻报红而不是悄悄失配。
+      { product: 'LOBSTERAI', pool: 'getAvailableAccount(LOBSTERAI.id', fallback: 'resolveLobsteraiCredentialByRef(LOBSTERAI.defaultCredentialRef)' },
       { product: 'QODER', pool: 'getAvailableAccount(QODER.id', fallback: 'credentialRef(QODER.defaultCredentialRef)' },
       { product: 'QODER_CN', pool: 'getAvailableAccount(QODER_CN.id', fallback: 'credentialRef(QODER_CN.defaultCredentialRef)' },
-      { product: 'TRAE', pool: 'getAvailableAccount(TRAE.id', fallback: 'credentialRef(TRAE.defaultCredentialRef)' },
+      { product: 'TRAE', pool: 'getAvailableAccount(TRAE.id', fallback: 'resolveTraeCredentialByRef(TRAE.defaultCredentialRef)' },
       { product: 'CLINE', pool: 'getAvailableAccount(CLINE.id', fallback: 'credentialRef(CLINE.defaultCredentialRef)' },
       { product: 'LOOMY', pool: 'listAccountsByProvider(LOOMY.id)', fallback: 'credentialRef(LOOMY.defaultCredentialRef)' },
       { product: 'RACCOON', pool: 'getAvailableAccount(RACCOON.id', fallback: 'credentialRef(RACCOON.defaultCredentialRef)' },

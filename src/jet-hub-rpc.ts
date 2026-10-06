@@ -405,21 +405,37 @@ export function buildRaccoonNickname(
 /**
  * 支持「锁定永久积分」的 provider 白名单。
  *
- * ⚠️ **必须与前端 `credits-capabilities.js` 的 `supportsPermanentLock` 一致**：
+ * ⚠️ **必须与前端 `plugin-src/client/jet-hub.js` 的 `supportsPermanentLock` 一致**：
  * 前端拿它决定要不要渲染按钮、要不要发读取请求；后端拿它拒绝越权写入。
  * 两边不一致的后果是「按钮出现但点了报错」或「功能存在却点不出来」。
  *
- * 只有这三家有两个可分的积分池：
- * - Loomy：服务端直接给 `dailyBalance`（当日到期）与 `balance`（永久）；
- * - CodeBuddy / WorkBuddy：要从资源包列表按**扣费截止距今是否满 15 天**现算
- *   （判据见 `buddy-balance-rank.ts`，实测两站形状不同但都成立）。
- * 其余渠道（CodeArts / LobsterAI / Qoder / TRAE / Cline / Raccoon）的积分
- * 模型里没有「会不会作废」这一层区分，登记进来只会多一个无效开关。
+ * 登记条件：**余额响应里能拿到逐包的到期时间**（归一化到 `deductionEndTime`），
+ * 从而分出「快到期」与「不会马上作废」两桶。判据见
+ * `buddy-balance-rank.ts` 的 `splitBuddyCreditsByExpiry` —— 它只读通用的
+ * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
+ *
+ * | provider | 分桶依据 |
+ * |---|---|
+ * | Loomy | 服务端直接给 `dailyBalance`（当日到期）与 `balance`（永久）两个命名池 |
+ * | CodeBuddy / WorkBuddy | 资源包列表的 `DeductionEndTime` 距今是否满窗口天数 |
+ * | TRAE（字节） | 资源包列表的**条目级** `expire_time`（秒级 Unix 时间戳） |
+ * | LobsterAI（有道） | 资源包列表的 `expiresAt`（ISO 8601） |
+ *
+ * ⚠️ TRAE / LobsterAI **不区分「每日额度」与「永久积分」两个命名池**，但同样能按
+ * 到期时间分桶 —— 对锁定功能而言，判据只需「会不会马上作废」，与池的名字无关。
+ * 拿不到到期时间的包归入**永久桶**（保守方向：宁可锁定时少用一个号，
+ * 也不要把长期积分误当快到期烧掉，见 `splitBuddyCreditsByExpiry` 注释）。
+ *
+ * 仍未登记的渠道（CodeArts / Qoder / Cline / Raccoon / Minimax / ZCode / Gemini /
+ * OpenCode）：余额响应里没有逐包到期时间，或根本没有资源包列表 ——
+ * 分不出两桶，登记进来只会多一个无效开关。
  */
 export const PERMANENT_LOCK_PROVIDERS: ReadonlySet<string> = new Set([
   LOOMY.id,
   CODEBUDDY.id,
   WORKBUDDY.id,
+  LOBSTERAI.id,
+  TRAE.id,
 ])
 
 /**
@@ -2326,17 +2342,23 @@ function registerJetHubEndpoints(
         /**
          * 组装响应。
          *
-         * ⚠️ 两个 buddy 必须**回传当前生效的窗口天数**：窗口可被
+         * ⚠️ **按到期时间分桶的 provider 必须回传当前生效的窗口天数**：窗口可被
          * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，前端文案若继续写死 15 就会
          * 与真实判据不一致（用户看到「只烧 15 天内的」而实际按 31 天筛号）。
-         * Loomy 没有窗口概念 → 不带该字段。
+         *
+         * ⚠️ 判据是「**是否按到期时间分桶**」，不是「是不是 buddy」：TRAE 与
+         * LobsterAI 走同一套 `splitBuddyCreditsByExpiry`，同样受该窗口影响
+         * （它们的余额面板早已用同一个窗口分「长期 / 临时」，见 `credits.balances`
+         * 分支的注释），故必须一并回传。
+         *
+         * Loomy 没有窗口概念（服务端直接给两个命名池）→ 不带该字段。
          */
+        const usesExpiryWindow = provider === CODEBUDDY.id || provider === WORKBUDDY.id
+          || provider === TRAE.id || provider === LOBSTERAI.id
         const lockResponse = (): RpcPermanentLockResponse => ({
           provider,
           locked: pool.permanentLocked(provider),
-          ...(provider === CODEBUDDY.id || provider === WORKBUDDY.id
-            ? { windowDays: buddyExpiringWindowDays() }
-            : {}),
+          ...(usesExpiryWindow ? { windowDays: buddyExpiringWindowDays() } : {}),
         })
         if (req.locked === undefined) {
           return { ok: true, value: lockResponse() }
