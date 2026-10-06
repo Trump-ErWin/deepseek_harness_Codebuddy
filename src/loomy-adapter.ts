@@ -622,23 +622,38 @@ export class LoomyAdapter extends LlmAdapter {
        *   池的手动顺序就是最合理的次序。
        */
       let failureClass = classifyLoomyFailure(errorText, status)
-      if (this.options.accountPool && failureClass !== 'other') {
+      const accountPool = this.options.accountPool
+      if (accountPool && failureClass !== 'other') {
         const tried = new Set<string>()
         if (activeAccountId) tried.add(activeAccountId)
-        const maxRotate = LOOMY_MAX_ROTATE - 1
-        for (let round = 0; round < maxRotate; round++) {
+        /**
+         * 给**当前**账号记冷却（配额 24h / 限流 1h），认证类不记。
+         *
+         * ⚠️ 必须**每次失败后立刻调用**（含第一次、也在轮换预算用尽之前），
+         * 不能挪到 `for` 循环开头：那样最后一个失败账号永远等不到下一次迭代，
+         * 就此漏记。实测（8 账号全耗尽）：挪在循环开头只记 7/8，末号漏记。
+         * 漏记的后果是下次请求又选中它 —— 正是本段要修的「卡死在一个号上」。
+         *
+         * ⚠️ 闭包读的是**实时**的 `activeAccountId` / `failureClass`（二者都在
+         * 循环内更新），不是创建时的快照 ⇒ 每次记的都是刚失败的那个号。
+         * 同款「用回调取当前账号会标错号」的坑见 AGENTS.md 的 Qoder 第 9 条。
+         */
+        const markCurrentAccount = async (): Promise<void> => {
           // ⚠️ auth 类**不写标记**：认证失败是账号态而非模型冷却，写了会把
           //    网关侧授权故障放大成「全池封 24h」（2026-10-06 事故）。
-          if (activeAccountId && recordsLoomyRateLimit(failureClass)) {
-            await this.options.accountPool.updateModelRateLimit(
-              activeAccountId,
-              options.model,
-              Date.now() + (failureClass === 'rate'
-                ? LOOMY_RATE_LIMIT_COOLDOWN_MS
-                : LOOMY_QUOTA_COOLDOWN_MS),
-            )
-          }
-          const next = await this.options.accountPool.getAvailableAccount(
+          if (!activeAccountId || !recordsLoomyRateLimit(failureClass)) return
+          await accountPool.updateModelRateLimit(
+            activeAccountId,
+            options.model,
+            Date.now() + (failureClass === 'rate'
+              ? LOOMY_RATE_LIMIT_COOLDOWN_MS
+              : LOOMY_QUOTA_COOLDOWN_MS),
+          )
+        }
+        await markCurrentAccount()
+        const maxRotate = LOOMY_MAX_ROTATE - 1
+        for (let round = 0; round < maxRotate; round++) {
+          const next = await accountPool.getAvailableAccount(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
@@ -661,6 +676,7 @@ export class LoomyAdapter extends LlmAdapter {
           errorText = await response.text().catch(() => '')
           status = response.status
           failureClass = classifyLoomyFailure(errorText, status)
+          await markCurrentAccount()
           if (failureClass === 'other') {
             throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
           }
