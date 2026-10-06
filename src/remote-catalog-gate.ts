@@ -49,10 +49,38 @@ export class RemoteCatalogGate {
   private retryAt: number | undefined
   private readonly cooldownMs: number
   private readonly now: () => number
+  /**
+   * 距**最近一次尝试**（不论成败）过去了多久，最小值为 0。
+   *
+   * ⚠️ 与 {@link retryAt} 是**两个不同的闸门**，别合并：
+   * - `retryAt` 只在**失败/空结果**后置位，管「别立刻重试」；
+   * - 本字段在**每次尝试后**都推进（包括成功），用来回答「上一次尝试距今
+   *   多久了」—— 贴图门禁据此决定「值不值得为了重新判定能力而再拉一次」
+   *   （issue IKJQ3M：能力未知时不放行图片，但要在合理间隔后重看一次目录）。
+   *
+   * 用**同一个 `now` 来源**取两次时间戳，才能与 {@link cooling} 保持一致，
+   * 不出现「冷却判定用真实时间、这个判定用假时间」的分叉。
+   */
+  private lastAttemptAt: number | undefined
 
   constructor(options: RemoteCatalogGateOptions = {}) {
     this.cooldownMs = options.cooldownMs ?? REMOTE_CATALOG_COOLDOWN_MS
     this.now = options.now ?? Date.now
+  }
+
+  /**
+   * 距上一次尝试的毫秒数；从未尝试过时为 `undefined`。
+   *
+   * ⚠️ 与 {@link cooling} 共用**同一个** `now` 来源，故调用方若替换了时钟，
+   * 两者必然一致 —— 不会出现「冷却判定用真实时间、这个判定用假时间」的分叉。
+   *
+   * ⚠️ 墙钟被回拨时差值可能为负（`cooling()` 有同样的隐患，此处取同样的口径）：
+   * 负数会让「已过 10 秒」的判据误判成「还没到」，把重试永久推迟。
+   * ⇒ 一律夹到 0，宁可早重试也不卡死。
+   */
+  sinceLastAttemptMs(): number | undefined {
+    if (this.lastAttemptAt === undefined) return undefined
+    return Math.max(0, this.now() - this.lastAttemptAt)
   }
 
   /**
@@ -99,6 +127,7 @@ export class RemoteCatalogGate {
       }
     })()
     this.inFlight = task
+    this.lastAttemptAt = this.now()
     try {
       const got = await task
       this.retryAt = got ? undefined : this.now() + this.cooldownMs
