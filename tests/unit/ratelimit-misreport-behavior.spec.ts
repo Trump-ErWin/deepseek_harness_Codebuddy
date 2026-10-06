@@ -154,15 +154,21 @@ async function addAccount(
     refreshable: true,
     ...options.modelRateLimits === undefined ? {} : { modelRateLimits: options.modelRateLimits },
   })
-  await ctx.credentials.set(credentialRef(ref), options.credential ?? JSON.stringify({ access_token: 'tok', expires_at: Date.now() + HOUR }))
+  await ctx.credentials.set(
+    credentialRef(ref),
+    options.credential ?? JSON.stringify({ access_token: `tok-${id}`, expires_at: Date.now() + HOUR }),
+  )
   return id
 }
 
 /**
- * 走「按模型限流的取号」的全部 provider。
+ * 走「按模型限流的取号」且**兜底读不到东西**的全部 provider。
  *
- * ⚠️ **不含 codearts**：它取号时传**空 modelId**，模型级限流压根不参与筛选
- * （见下方「已知例外」一节）。把它列进来会让「全部限流」这个前提不成立。
+ * ⚠️ **不含两个例外**（各自的原因见对应小节）：
+ * - `codearts`：取号时传**空 modelId**，模型级限流压根不参与筛选；
+ * - `zcode`：兜底 `zcode.current()` 会**再读一次账号池**（且不看 `enabled` /
+ *   限流），所以池被筛空时它仍返回凭据 —— 它本就不会误报「未登录」。
+ *   把它们列进来会让「全部限流 ⇒ 必须抛限流错」这个前提不成立。
  *
  * ⚠️ 每个账号 id 都唯一：单测的状态目录是**按文件**隔离的，同一文件里
  * 多次 `addAccount` 会累加到**同一份** state.json；id 重复会让
@@ -170,7 +176,7 @@ async function addAccount(
  */
 const PAIRED_PROVIDERS = [
   'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae',
-  'cline', 'loomy', 'raccoon', 'minimax', 'gemini', 'zcode',
+  'cline', 'loomy', 'raccoon', 'minimax', 'gemini',
 ] as const
 
 describe('模型级限流被误报成「未登录」（IKJOZ9）', () => {
@@ -179,8 +185,6 @@ describe('模型级限流被误报成「未登录」（IKJOZ9）', () => {
       const ctx = boot()
       // 先证明前提成立：池层面确实因为这个标记把账号筛掉了。
       await addAccount(ctx, provider, { modelRateLimits: { [MODEL]: Date.now() + HOUR } })
-      expect(await ctx.accountPool.findAccount(`不存在的-id`), '仅用于确认接口可用').toBeUndefined()
-
       const pooled = await (ctx.accountPool as unknown as {
         getAvailableAccount(p: string, m: string): Promise<unknown>
       }).getAvailableAccount(provider, MODEL)
@@ -216,14 +220,16 @@ describe('模型级限流被误报成「未登录」（IKJOZ9）', () => {
 
     it('两个账号、只有一个被限流 → 取到**没被限流**的那个（候选非空就不该报限流）', async () => {
       const ctx = boot()
-      await addAccount(ctx, 'qoder', { modelRateLimits: { [MODEL]: Date.now() + HOUR } })
+      const limited = await addAccount(ctx, 'qoder', { modelRateLimits: { [MODEL]: Date.now() + HOUR } })
       const free = await addAccount(ctx, 'qoder')
       const credential = await resolveOf(ctx, 'qoder')(MODEL) as { access_token?: string }
       expect(credential, '应取到可用的那个账号').toBeDefined()
-      // 断言拿到的是**没被限流**那条：按 `getAvailableAccount` 的顺序（池内数组序）
-      // 第一条被限流、第二条可用，取到的必须是第二条。
-      expect(credential.access_token).toBe('tok')
-      expect(free).not.toBe('')
+      // ⚠️ 断言必须**逐账号区分**（2026-10-06 对抗性审计发现本条曾是假绿）：
+      // `addAccount` 给每个账号的 token 是 `tok-<id>`，所以能分辨拿到的是哪一条。
+      // 旧写法给两个账号写**同一个** `'tok'`，于是即使限流过滤被改坏、返回了
+      // **被限流**的那条，本条照样绿 —— 与它自己的注释直接矛盾。
+      expect(credential.access_token, '取到的应是没被限流的那个账号').toBe(`tok-${free}`)
+      expect(credential.access_token, '不该是被限流的那个账号').not.toBe(`tok-${limited}`)
     })
 
     it('账号被**停用**（enabled:false）→ 仍走「未登录」，不得报成限流', async () => {
@@ -315,6 +321,55 @@ describe('模型级限流被误报成「未登录」（IKJOZ9）', () => {
       const ctx = boot()
       await addAccount(ctx, 'codearts', { modelRateLimits: { [MODEL]: Date.now() + HOUR } })
       await expect(resolveOf(ctx, 'codearts')(MODEL)).resolves.toBeDefined()
+    })
+  })
+
+  /**
+   * **zcode 同理，但它更特殊：兜底会「再读一次池」**（2026-10-06 对抗性审计推翻了我最初的接线）。
+   *
+   * 我最初把 zcode 也接上了限流判定，理由是「池取不到号就该判限流」。审计指出
+   * 那样会收窄可用性，我用临时探针实测确认**审计是对的**：
+   *
+   * | 账号池状态 | `zcode.current()`（兜底）返回 |
+   * |---|---|
+   * | 唯一启用账号被该模型限流、凭据合法 | **那份凭据** ⇒ 不会误报「未登录」 |
+   * | 池里另有「停用但健康」账号且**排在前面** | **那个停用账号的凭据** ⇒ 请求能跑通 |
+   *
+   * ⇒ zcode 没有 IKJOZ9 的症状（不报「未登录」），而上表第二行那种组合在加判定后
+   * 会从「能跑通」变成「硬失败」。故 zcode 刻意不接 —— 下面两条把该结论钉死。
+   *
+   * ⚠️ 凭据形状必须是 `zcode_jwt` + `device_mid`（`zcode.ts` 的
+   * `isUsableZcodeCredential`）：写少了 `current()` 会因形状校验返回 undefined，
+   * 于是本组用例会**假绿**（第一版探针就是这样白跑了一轮）。
+   */
+  describe('已知例外：zcode 的兜底会再读一次池', () => {
+    const zcodeCredential = (token: string) => JSON.stringify({
+      access_token: token, zcode_jwt: `jwt-${token}`, device_mid: `mid-${token}`, plan_key: 'k',
+    })
+
+    it('唯一启用账号被限流 → 仍返回凭据，不误报「未登录」', async () => {
+      const ctx = boot()
+      await addAccount(ctx, 'zcode', {
+        modelRateLimits: { [MODEL]: Date.now() + HOUR },
+        credential: zcodeCredential('A'),
+      })
+      const credential = await resolveOf(ctx, 'zcode')(MODEL) as { access_token?: string }
+      expect(credential, 'zcode 的兜底 current() 会再读池 ⇒ 不该返回 undefined').toBeDefined()
+      expect(credential.access_token).toBe('A')
+    })
+
+    it('池里另有「停用但健康」且排在前面 → 仍返回那个停用账号（加判定会毁掉这一发）', async () => {
+      // ⚠️ 这条是**反对给 zcode 接线**的直接证据：先加的 B 在池数组序前面，
+      // `readCredentialFromPool` 取「第一个能解析的」且不看 enabled ⇒ 选中 B。
+      // 修复前请求能发出去；若在 `current()` 之前加限流判定，这里会变成硬失败。
+      const ctx = boot()
+      await addAccount(ctx, 'zcode', { enabled: false, credential: zcodeCredential('B') })
+      await addAccount(ctx, 'zcode', {
+        modelRateLimits: { [MODEL]: Date.now() + HOUR },
+        credential: zcodeCredential('A'),
+      })
+      const credential = await resolveOf(ctx, 'zcode')(MODEL) as { access_token?: string }
+      expect(credential?.access_token, '应选中池里靠前那个停用但健康的账号').toBe('B')
     })
   })
 })

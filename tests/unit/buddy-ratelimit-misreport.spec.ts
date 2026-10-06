@@ -340,7 +340,8 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       { product: 'RACCOON', pool: 'getAvailableAccount(RACCOON.id', fallback: 'credentialRef(RACCOON.defaultCredentialRef)' },
       { product: 'MINIMAX', pool: 'getAvailableAccount(MINIMAX.id', fallback: 'credentialRef(MINIMAX.defaultCredentialRef)' },
       { product: 'GEMINI', pool: 'getAvailableAccount(GEMINI.id', fallback: 'credentialRef(GEMINI.defaultCredentialRef)' },
-      { product: 'ZCODE', pool: 'getAvailableAccount(ZCODE.id', fallback: 'zcode.current()' },
+      // ⚠️ **刻意不含 ZCODE** —— 它的兜底形态与其余各家不同，见下方
+      // 「zcode 同型缺陷判定」段（那是唯一一条「不接也算对」的断言）。
     ]
 
     it.each(WIRING)('$product：判定已接线，且位于「取号之后、兜底之前」', ({ product, pool, fallback }) => {
@@ -362,16 +363,94 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
     })
 
     it('名单覆盖全部走 resolveCredential 取号的 provider（新增 provider 记得加进来）', () => {
-      // 判据：从 index.ts 里扫出所有「按 modelId 过滤模型级限流」的取号点，
-      // 断言它们的产品常量**全部**在上面的名单里。
-      // ⚠️ 排除 codearts：它传空 modelId，不做模型级过滤（见本段开头的说明）；
-      //    排除 `refresh:` 里那些**不带 modelId** 的取号（那是续期路径，
-      //    刻意用空串以便拿到被限流的账号去续期 —— 语义不同，不能判限流）。
+      // ⚠️ **必须同时认两种取号形态**（2026-10-06 审计发现原判据有盲区）：
+      // ① `getAvailableAccount(X.id, modelId …)` —— 绝大多数 provider；
+      // ② `listAccountsByProvider(X.id)` + **自己内联**一份 `modelRateLimits` filter
+      //    —— 本仓库已有 2 处先例（buddy 的 `pickBuddyCredential`、loomy 的
+      //    `resolveCredential`）。只认 ① 的话，将来第 13 个 provider 照抄 ② 的写法
+      //    就会**静默漏接且断言恒绿**。
+      //
+      // ⚠️ 排除 `refresh:` 里那些**不带 modelId** 的取号（那是续期路径，刻意用
+      // 空串以便拿到被限流的账号去续期 —— 语义不同，不能判限流）；故 ① 的正则
+      // 必须带 `, modelId`。
       const guarded = new Set(WIRING.map(w => w.product))
-      const missing = [...indexCode.matchAll(/getAvailableAccount\((\w+)\.id, modelId/g)]
-        .map(m => m[1]!)
-        .filter(product => !guarded.has(product))
-      expect(missing, '这些 provider 按模型过滤限流，却没接限流判定').toEqual([])
+      const EXEMPT = new Set([
+        // 助手内部对「任意 provider」的通用统计，参数是形参 `product.id`，
+        // 不是某个具体产品常量。
+        'product',
+        // opencode 是**槽制**，没有 resolveCredential：`listIdentitySlots` 只按
+        // `enabled` 过滤，`PoolEntrySnapshot` 压根不携带 `modelRateLimits`
+        // ⇒ opencode 侧模型级标记**只写不读**（只供面板徽章与「重测」恢复）。
+        // 它槽位耗尽时报的是自己的 `QUOTA_EXCEEDED`，不会误报「未登录」。
+        'OPENCODE',
+        // zcode 是**唯一「不接判定也算对」**的一家：它的兜底 `zcode.current()`
+        // 会再读一次账号池且不看 `enabled`/限流 ⇒ 池被筛空时仍返回凭据，
+        // 根本不会误报「未登录」（IKJOZ9 的症状在它身上不存在）。
+        // 加判定反而会收窄可用性 —— 见下一段「zcode 同型缺陷判定」。
+        'ZCODE',
+      ])
+      const seen = [
+        ...[...indexCode.matchAll(/getAvailableAccount\((\w+)\.id, modelId/g)].map(m => m[1]!),
+        ...[...indexCode.matchAll(/listAccountsByProvider\((\w+)\.id\)/g)].map(m => m[1]!),
+      ]
+      const missing = [...new Set(seen)].filter(p => !guarded.has(p) && !EXEMPT.has(p))
+      expect(missing, '这些 provider 从池取号（可能内联限流 filter），却没接限流判定').toEqual([])
+      // 反向自检：判据本身不能是空转的 —— 上面必须真的扫到了名单里的成员。
+      expect(seen.filter(p => guarded.has(p)).length, '判据没扫到任何已知 provider，说明正则已失效').toBeGreaterThan(0)
+    })
+
+    /**
+     * **锁死「opencode 不需要接线」这个结论**（2026-10-06 审计建议）。
+     *
+     * 之前它只是「不在名单里」—— 一个**否定性事实**，没有任何断言守着。将来若有人
+     * 给 `PoolEntrySnapshot` 加上 `modelRateLimits` 并让 `listIdentitySlots` 据此
+     * 过滤槽位，opencode 就会**静默**变成第 13 个受害者：候选筛空 → 报「未登录」，
+     * 而没有任何一条用例会红。
+     */
+    it('opencode 仍是槽制：没有 resolveCredential，且槽位快照不携带 modelRateLimits', () => {
+      const opencodeAuthSource = readFileSync(resolve(here, '../../src/opencode-auth.ts'), 'utf8')
+        .replace(/\r\n/g, '\n')
+      // ① 注册项里没有 resolveCredential（opencode 走 identitySlots 槽制）
+      const registration = indexCode.slice(indexCode.indexOf('const opencodeAdapter = registerOpencodeLlm('))
+      const registrationEnd = registration.indexOf('\n  })')
+      const block = registration.slice(0, registrationEnd)
+      expect(block, 'opencode 注册项出现了 resolveCredential —— 它不再是槽制，需重新评估').not.toContain('resolveCredential')
+      // ② 槽位快照的类型定义里不携带模型级限流。
+      // ⚠️ 锚点必须用 `export interface PoolEntrySnapshot`（定义处），不能
+      // 只搜类型名 —— 名字在 import / 注释里更早出现，按名字切会落到无关代码上
+      // （写用例时实测到：切出来是 `nextFingerprintGeneration`）。
+      const snapshotStart = opencodeAuthSource.indexOf('export interface PoolEntrySnapshot')
+      expect(snapshotStart, 'PoolEntrySnapshot 的定义没找到，检查类型是否被移动或改名').toBeGreaterThan(-1)
+      const snapshotType = opencodeAuthSource.slice(snapshotStart, opencodeAuthSource.indexOf('\n}', snapshotStart))
+      expect(snapshotType, 'PoolEntrySnapshot 携带了 modelRateLimits —— opencode 已进入本 issue 的形态').not.toContain('modelRateLimits')
+      // ③ 槽位列举只按 enabled 过滤，不看模型级限流
+      const listSlots = opencodeAuthSource.slice(opencodeAuthSource.indexOf('function listIdentitySlots'))
+      expect(listSlots, 'listIdentitySlots 开始处没找到').not.toContain('modelRateLimits')
+    })
+
+    /**
+     * **zcode 是唯一「不接判定也算对」的一家**（2026-10-06 对抗性审计推翻了我最初的接线）。
+     *
+     * 我最初把 zcode 也接上了，理由是「池取不到号就该判限流」。审计指出这会收窄
+     * 可用性，我用临时探针（真实 `apply()` + 真账号池）实测确认**审计是对的**：
+     * `zcode.current()` 的兜底会**再读一次账号池**（`readStoredCredential` →
+     * `readCredentialFromPool`），且既不看 `enabled`、也不看 `modelRateLimits`：
+     *
+     * | 场景（账号池状态） | `zcode.current()` 返回 |
+     * |---|---|
+     * | 唯一启用账号被该模型限流、凭据合法 | **那份凭据** ⇒ 不会误报「未登录」 |
+     * | 池里另有「停用但健康」账号且排在前面 | **那个停用账号的凭据** ⇒ 请求能跑通 |
+     *
+     * ⇒ ① IKJOZ9 的症状在 zcode 身上**不存在**（它不报「未登录」）；② 加判定会把
+     * 上表第二行那发**能跑通的请求变成硬失败**。故 zcode 刻意不接 —— 这条断言
+     * 防止后来者「看到别人都接了，顺手也给 zcode 补上」。
+     */
+    it('zcode 刻意不接限流判定：它的兜底会再读池，本就不会误报「未登录」', () => {
+      const at = indexCode.indexOf('throwIfAllAccountsRateLimited(ZCODE, modelId)')
+      expect(at, 'zcode 又被接上判定了 —— 它的兜底 current() 会再读池，加判定会收窄可用性（见本用例注释）').toBe(-1)
+      // 且必须确认 zcode 的取号点仍在（否则这条会因为「整段被删」而假绿）。
+      expect(indexCode, 'zcode 的取号点不见了，兜底 current() 也应一并复核').toContain('getAvailableAccount(ZCODE.id, modelId')
+      expect(indexCode, 'zcode 的兜底应仍是 zcode.current()').toContain('await zcode.current()')
     })
   })
 })
