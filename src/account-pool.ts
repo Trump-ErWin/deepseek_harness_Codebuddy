@@ -632,7 +632,14 @@ export class AccountPool {
     return Object.keys(this.permanentLockCache).filter(p => this.permanentLockCache[p] === true)
   }
 
-  /** 列出某个 provider 的所有账号（含状态信息） */
+  /** 列出某个 provider 的所有账号（含状态信息）。
+   *
+   * 🔴 **视图排序（工单 08，2026-10-02）**：「任一模型限流中」的账号**沉到最后**
+   * （稳定序：未限流者保持手动拖拽序不变）。**只排序这个返回视图，不改磁盘顺序** ——
+   * 面板列表即时反映真实命中序（限流者沉底、解除后自动回原位），而"手动顺序=用户
+   * 拖拽意图"的成文契约不受影响。写时挪位（首版方案）因破坏该契约被废弃——
+   * 曾被上游行为契约测试抓出 4 条红，教训：改"展示顺序"别动"存储顺序"。
+   */
   async listAccounts(provider: string): Promise<ProviderAccountStatus[]> {
     const filtered = this.readAccounts().filter(a => a.provider === provider)
     const results: ProviderAccountStatus[] = []
@@ -646,7 +653,11 @@ export class AccountPool {
       }
       results.push(status)
     }
-    return results
+    // 稳定视图排序：可用在前、限流中沉底（Array.prototype.sort 在现代引擎是稳定的）。
+    const now = Date.now()
+    const isLimited = (a: ProviderAccountStatus) =>
+      Object.values(a.modelRateLimits ?? {}).some(resetAtMs => resetAtMs > now)
+    return results.sort((a, b) => Number(isLimited(a)) - Number(isLimited(b)))
   }
 
   /** 列出所有 provider 的账号 */
@@ -1156,6 +1167,7 @@ export class AccountPool {
     entry.modelRateLimits = { ...entry.modelRateLimits, [modelId]: resetAtMs }
     next[idx] = entry
     await this.writeAccounts(next)
+
     this.ctx.logger?.info?.(
       `[jet-hub] 已记录限流: 账号 ${accountId} 模型 ${modelId} 重置于 ${new Date(resetAtMs).toISOString()}`,
     )
