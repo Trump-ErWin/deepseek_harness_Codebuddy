@@ -820,24 +820,26 @@ function userContentParts(
 }
 
 /**
- * 远端条目是否下发了**能力元数据**（而非仅有一个 id + 展示名）。
+ * 远端条目是否**明确表态**接受图片输入。
  *
  * 用途：`reconcileWithFallback` 的白名单式重建会丢弃「不在编译期兜底表里」
  * 的模型，而兜底表是快照、会随服务端上新而漂移。凡是远端**已经讲清楚了
- * 能力**的条目（图片能力 / 上下文窗口 / 输出上限 / 思考档位），丢弃它就是
- * 把「服务端权威数据」让位给「本地可能过期的快照」。
+ * 图片能力**的条目，丢弃它就等于让「本地可能过期的快照」压过「服务端权威
+ * 数据」（issue IKJQ3M：`space-bunny` 即属此类）。
  *
- * ⚠️ **不能**把判据放宽成「远端返回的一律收下」：`parseModelsFromConfig`
- * 会把内部别名（`default` 等）与未开放模型一并解析出来，那些进了选择器
- * 只会在用户选中后报错（这正是白名单当初要解决的问题，见该函数注释）。
- * 「有 id + 名字」不算能力元数据，「有其中任一能力字段」才算。
+ * ⚠️⚠️ **判据只能认 `supportsImages`，不能收「任一能力元数据」**（初版写宽了，
+ * 由自查与回归用例抓出）：实测「11102 service info not found」的模型
+ * （glm-4.6/4.7/5.0、minimax-m2.5、kimi-k2.5/k2.8-preview、hunyuan-* …）
+ * **同样带 `contextWindow` 与 `maxOutputTokens`**（见 `src/product.ts` 的
+ * `CODEBUDDY_FALLBACK_MODELS` 注释，正是因为它们不可调用才被排除）。
+ * 按「任一能力字段」放行会把它们请回模型选择器，用户选中后才报错 ——
+ * **那是比原 issue 更糟的新缺陷**。
+ *
+ * ⚠️ 也不能放宽成「远端返回的一律收下」：`parseModelsFromConfig` 会把内部别名
+ * （`default` 等）与未开放模型一并解析出来。
  */
-function hasRemoteCapabilityMeta(model: BuddyRemoteModel): boolean {
+function hasRemoteImageCapability(model: BuddyRemoteModel): boolean {
   return model.supportsImages !== undefined
-    || model.contextWindow !== undefined
-    || model.maxOutputTokens !== undefined
-    || (model.reasoningEfforts !== undefined && model.reasoningEfforts.length > 0)
-    || model.defaultReasoningEffort !== undefined
 }
 
 /** 收集 user 消息中的图片附件引用（含工具结果内嵌图片），按 attachmentId 去重。 */
@@ -1070,7 +1072,7 @@ export class BuddyAdapter extends LlmAdapter {
    * 后缀规则不统一（`-f` / `-x` / `-sg` / `-ioa` 含义各异），猜错会放进
    * 不可用的模型。未标记的内部别名（如 `default`）不会被误留。
    *
-   * ⚠️⚠️ **第二条例外：远端下发了能力元数据（issue IKJQ3M）**。
+   * ⚠️⚠️ **第二条例外：远端明确表态接受图片（issue IKJQ3M）**。
    *
    * 只按 `agentReferenced` 判据仍然丢模型：实测 `space-bunny` 由 scoped 端点
    * 下发并带**完整元数据**（`supportsImages: true` / `maxInputTokens: 1000000`
@@ -1080,8 +1082,8 @@ export class BuddyAdapter extends LlmAdapter {
    * （而真实网关 5/5 实测能看图）。**这不是瞬时状态**：远端目录即使拉取成功
    * 也照样误判，issue 里「重启即自愈」的结论只在恰好被 agent 引用时成立。
    *
-   * ⇒ 「不在编译期快照里」与「服务端未声明可选」是**两回事**：远端既然下发
-   * 了能力元数据，丢弃它才是缺陷本身。两条例外的判据不同、互不覆盖。
+   * ⇒ 「不在编译期快照里」与「服务端未声明可选」是**两回事**：远端既然已经
+   * 明确表态了图片能力，丢弃它才是缺陷本身。两条例外的判据不同、互不覆盖。
    */
   private reconcileWithFallback(models: readonly BuddyRemoteModel[]): BuddyRemoteModel[] {
     const fallback = this.product.fallbackModels
@@ -1126,16 +1128,17 @@ export class BuddyAdapter extends LlmAdapter {
     //
     // ⚠️ 两条追加判据是**并集**（issue IKJQ3M）：
     //   ① `agentReferenced === true`：服务端说「对话里可选」；
-    //   ② 下发了**任何一项能力元数据**（supportsImages / contextWindow /
-    //      maxOutputTokens / reasoningEfforts）：服务端已把它的能力讲清楚了。
-    // ② 是必要的：`space-bunny` 走 ① 之外仍会被丢掉（未被任何 agent 引用），
-    // 而它的能力字段是完整可信的。
+    //   ② 远端**明确表态**接受图片（`supportsImages !== undefined`）：
+    //      该模型正是本 issue 要解决的那类，丢弃它就会把「能看图的模型」
+    //      误杀（`space-bunny` 走 ① 之外仍会被丢掉 —— 它未被任何 agent 引用）。
+    // ⚠️ ② 刻意**只认 `supportsImages`**：加上 `contextWindow` / `maxOutputTokens`
+    // 会把实测「11102 不可调用」的模型一并放回选择器（见 hasRemoteImageCapability）。
     // 两条都**不**放宽到「远端返回的一律收下」——那会让内部别名与未开放模型
     // 重新出现在选择器里（正是当初引入白名单的原因）。
     const known = new Set(reconciled.map((model) => model.id))
     for (const model of models) {
       if (known.has(model.id)) continue
-      if (model.agentReferenced !== true && !hasRemoteCapabilityMeta(model)) continue
+      if (model.agentReferenced !== true && !hasRemoteImageCapability(model)) continue
       known.add(model.id)
       reconciled.push({ ...model })
     }
