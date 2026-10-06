@@ -895,3 +895,108 @@ describe('web 域基址缺配置时的健壮性', () => {
     expect(item?.ok ?? false).toBe(false)
   })
 })
+
+/**
+ * `claimBase` 与 `webBase` 是**两个独立字段**，且各自必须真的被用上。
+ *
+ * ⚠️ 本组补的是一个真实测试缺口：原有用例只覆盖「`webBase` 缺失时回退
+ * `claimBase`」，**没有任何一条能证明 `webBase` 配了值时真被读取** ——
+ * 把 `webBaseOf` 改成恒用 `claimBase`（即该字段**死配置复发**）时，
+ * 原有 41 条用例**全绿**，无一条报警。这与「判据看似覆盖、实则同义反复」
+ * 是同一类问题，故用**两站不同域**的桩把它锁死。
+ */
+describe('claimBase 与 webBase 各自生效（防止死配置复发）', () => {
+  /** 刻意让两站不同域：只要有一处读错字段，URL 就会露馅。 */
+  const TWO_SITES = {
+    endpoint: 'https://copilot.tencent.com',
+    apiDomain: 'copilot.tencent.com',
+    claimBase: 'https://claim.example.cn',
+    webBase: 'https://web.example.cn',
+    userAgent: 'X',
+  } as unknown as BuddyProduct
+
+  it('领奖走 claimBase（不是 webBase、也不是 endpoint）', async () => {
+    const urls: string[] = []
+    const fetcher = (async (url: string) => {
+      urls.push(String(url))
+      return {
+        ok: true, status: 200,
+        json: async () => ({ code: 0, data: { credit: 1 } }),
+        text: async () => JSON.stringify({ code: 0, data: { credit: 1 } }),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+    await claimGrowthTaskReward(CRED, TWO_SITES, fetcher, 'chat_5')
+    const claim = urls.find((u) => u.includes('/claim'))
+    expect(claim).toBeDefined()
+    expect(claim).toContain('claim.example.cn')
+    expect(claim).not.toContain('web.example.cn')
+    expect(claim).not.toContain('copilot.tencent.com')
+  })
+
+  it('web 遥测走 webBase（不是 claimBase）—— 两站不同域时必须打对站', async () => {
+    const urls: string[] = []
+    const list = {
+      code: 0,
+      data: {
+        tasks: [
+          { task_code: 'Library_read', accept_status: 'not_accepted', progress: { current: 0, target: 1 } },
+        ],
+      },
+    }
+    const fetcher = (async (url: string) => {
+      urls.push(String(url))
+      return {
+        ok: true, status: 200,
+        json: async () => list, text: async () => JSON.stringify(list),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+    vi.useFakeTimers()
+    const work = runGrowthTaskCompletions(CRED, TWO_SITES, fetcher, { budgetMs: 600_000 })
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.runAllTimersAsync()
+    await work
+    vi.useRealTimers()
+    // Library_read 的 web 上报必须打 webBase 那个域（该函数是本字段的唯一读取点）。
+    const webReports = urls.filter(
+      (u) => u.includes('/v2/report') && u.includes('web.example.cn'),
+    )
+    expect(webReports.length).toBeGreaterThan(0)
+    // 且不得误打到领奖站。
+    expect(urls.some((u) => u.includes('claim.example.cn') && u.includes('/v2/report'))).toBe(false)
+  })
+
+  it('webBase 为空串时回退 claimBase（不改既有行为）', async () => {
+    const emptyWeb = {
+      endpoint: 'https://copilot.tencent.com',
+      apiDomain: 'copilot.tencent.com',
+      claimBase: 'https://claim.example.cn',
+      webBase: '',
+      userAgent: 'X',
+    } as unknown as BuddyProduct
+    const urls: string[] = []
+    const list = {
+      code: 0,
+      data: {
+        tasks: [
+          { task_code: 'Library_read', accept_status: 'not_accepted', progress: { current: 0, target: 1 } },
+        ],
+      },
+    }
+    const fetcher = (async (url: string) => {
+      urls.push(String(url))
+      return {
+        ok: true, status: 200,
+        json: async () => list, text: async () => JSON.stringify(list),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+    vi.useFakeTimers()
+    const work = runGrowthTaskCompletions(CRED, emptyWeb, fetcher, { budgetMs: 600_000 })
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.runAllTimersAsync()
+    await work
+    vi.useRealTimers()
+    expect(
+      urls.some((u) => u.includes('/v2/report') && u.includes('claim.example.cn')),
+    ).toBe(true)
+  })
+})
