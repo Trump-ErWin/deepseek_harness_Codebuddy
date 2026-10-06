@@ -534,14 +534,22 @@ describe('RaccoonAdapter 目录缓存语义（★ 兜底表不进缓存）', () 
  * 「已产出正文后绝不重发」（防重复计费），与 trae 的既有哨兵同款。
  */
 describe('RaccoonAdapter 请求级账号轮换（余额耗尽无感切号）', () => {
-  /** 两个账号的池桩：按 exclude 排除已试过的号，记录标记调用。 */
-  function makePoolStub() {
+  /** 池桩：按 exclude 排除已试过的号，记录标记调用。 */
+  function makePoolStub(count = 2) {
     const marks: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
     const picks: Array<ReadonlySet<string> | undefined> = []
-    const accounts = [
-      { id: 'raccoon-A', token: 'tok-A' },
-      { id: 'raccoon-B', token: 'tok-B' },
-    ]
+    // ⚠️ `count` 可调是为了让「轮换预算恰好用尽」的边界场景可测：账号数
+    // 少于 2 时末号漏记被掩盖（同义反复），等于 RACCOON_MAX_ROTATE 时暴露。
+    // ⚠️ 前两个号沿用既有的 `raccoon-A` / `raccoon-B` 与 `tok-A` / `tok-B`
+    // （既有用例按这两个 id 与 token 断言，不改名以免把无关改动混进来），
+    // 第 3 个起才按序号命名。
+    const accounts = Array.from({ length: count }, (_, i) => {
+      const legacy = [
+        { id: 'raccoon-A', token: 'tok-A' },
+        { id: 'raccoon-B', token: 'tok-B' },
+      ][i]
+      return legacy ?? { id: `raccoon-${i + 1}`, token: `tok-${i + 1}` }
+    })
     const pool = {
       updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
         marks.push({ accountId, modelId, resetAtMs })
@@ -616,6 +624,123 @@ describe('RaccoonAdapter 请求级账号轮换（余额耗尽无感切号）', (
     expect((error as Error).message).toContain('所有账号')
     expect((error as Error).message).toContain('B') // 最后一次的真实原因，不是笼统的"均受限"
     expect(marks.map((mark) => mark.accountId)).toEqual(['raccoon-A', 'raccoon-B'])
+  })
+
+  /**
+   * ★★ 「**最后一个**失败账号必须被标记」—— 本 PR 修复的是这个缺陷。
+   *
+   * ## 缺陷
+   *
+   * 旧实现把写标记放在 `for` 循环**开头**。于是**迭代次数 = 标记次数**，
+   * 而最后一次失败发生在循环体**末尾**、不会再有下一次迭代 ⇒ **末号漏记**。
+   * 漏记 ⇒ 下次请求又选中它 ⇒ 正是本段要修的「卡死在一个号上」。
+   *
+   * ## ⚠️ 两条账号的用例**测不到**这个缺陷（同义反复，PR 初版就栽在这里）
+   *
+   * 循环跑 2 次、写 2 个标记，`toEqual(['A','B'])` 在修复前后**输出一模一样**。
+   * 缺陷只在**轮换预算恰好用尽**（池里账号数 ≥ `RACCOON_MAX_ROTATE`）或
+   * **末号之后池已空**时暴露 —— 下面两条用例才是真正锁住修复的回归。
+   */
+  it('★★ 8 账号全耗尽（轮换预算恰好用尽）→ 8 个号全部被标记，末号不漏', async () => {
+    const { pool, marks } = makePoolStub(8)
+    const fetcher = vi.fn(async () => new Response(
+      JSON.stringify({ error: { message: '14018 Credits exhausted' } }), { status: 402 },
+    ))
+    const adapter = makeAdapter({
+      pool: pool as unknown as AccountPool,
+      fetcher: fetcher as unknown as typeof fetch,
+      // ⚠️ 必须是池里**第一个号**的 token（`tok-A`），否则 `findAccountIdByCredential`
+      // 反查不到 → `activeAccountId` 为空 → 一个标记都不写（测不到本缺陷）。
+      credential: { access_token: 'tok-A', refresh_token: 'r' },
+    })
+    await collect(adapter, {}).catch(() => undefined)
+
+    // 反向验证：把 `await markCurrentAccount()`（循环前那次）删掉，
+    // 这里会得到 7 个标记、末号 `raccoon-8` 漏记 ⇒ 用例变红。
+    expect(marks.map((m) => m.accountId)).toEqual([
+      'raccoon-A', 'raccoon-B', 'raccoon-3', 'raccoon-4',
+      'raccoon-5', 'raccoon-6', 'raccoon-7', 'raccoon-8',
+    ])
+  })
+
+  /** ★ 末号失败后池已空（`getAvailableAccount` 返回 null）→ 末号同样必须被标记。 */
+  it('★★ 末号失败后池已空 → 末号仍被标记（不因「没有下一个号」而漏记）', async () => {
+    const marks: Array<{ accountId: string }> = []
+    const pool = {
+      updateModelRateLimit: async (accountId: string) => { marks.push({ accountId }) },
+      getAvailableAccount: async () => null,
+      findAccountIdByCredential: async () => 'raccoon-A',
+    }
+    const fetcher = vi.fn(async () => new Response(
+      JSON.stringify({ error: { message: '14018 Credits exhausted' } }), { status: 402 },
+    ))
+    const adapter = makeAdapter({
+      pool: pool as unknown as AccountPool,
+      fetcher: fetcher as unknown as typeof fetch,
+      credential: { access_token: 'tok-A', refresh_token: 'r' },
+    })
+    await collect(adapter, {}).catch(() => undefined)
+
+    expect(marks.map((m) => m.accountId)).toEqual(['raccoon-A'])
+  })
+
+  /**
+   * ★★ 401 续期后**必须重新反查账号 id**（PR !71 审计发现的真实缺陷）。
+   *
+   * `resolveCredential` 是「池优先」的（`src/index.ts` 的 raccoon 分支先
+   * `getAvailableAccount` 再回退单凭据 ref），而 `refresh()` 续期的是
+   * **默认单凭据 ref**。⇒ 续期后取回的凭据**可能属于另一个账号**。
+   *
+   * 旧实现不更新 `activeAccountId` ⇒ 冷却标记**记在没发这次请求的号头上**：
+   * 没耗尽的号被封 24h，而真该封的号下次仍被选中（缺陷照旧）。
+   * 这与 AGENTS.md 记的 Qoder「标记用了会变的回调导致标错账号」同型。
+   */
+  it('★★ 401 续期后凭据换成了别的账号 → 标记记在**真正耗尽的那个号**上', async () => {
+    const marks: Array<{ accountId: string }> = []
+    // ⚠️ 桩必须自洽：id ↔ token 一一对应，否则 `findAccountIdByCredential`
+    // 与 `getAvailableAccount` 会互相认错号（我第一版就踩了这个：
+    // 取号发的是 `tok-raccoon-B`、而续期后是 `tok-B`，反查得到另一个 id）。
+    const byToken: Record<string, string> = { 'tok-A': 'raccoon-A', 'tok-B': 'raccoon-B' }
+    const pool = {
+      updateModelRateLimit: async (accountId: string) => { marks.push({ accountId }) },
+      getAvailableAccount: async (_p: string, _m: string, exclude?: ReadonlySet<string>) => {
+        for (const token of ['tok-A', 'tok-B']) {
+          const id = byToken[token]!
+          if (exclude?.has(id)) continue
+          return { entry: { id }, credential: { access_token: token, refresh_token: 'r' } }
+        }
+        return null
+      },
+      findAccountIdByCredential: async (_p: string, identity: string) => byToken[identity] ?? '',
+    }
+    // 第 1 次解析 = A 的凭据；续期后 = B 的凭据（生产语义：refresh 续的是
+    // 默认单凭据 ref，随后 resolveCredential 又从池里取第一个可用号）。
+    let resolves = 0
+    const adapter = new RaccoonAdapter({
+      credentialRef: 'RACCOON_ACCESS_TOKEN' as never,
+      resolveCredential: async () => (++resolves === 1
+        ? { access_token: 'tok-A', refresh_token: 'r' }
+        : { access_token: 'tok-B', refresh_token: 'r2' }),
+      refresh: async () => {},
+      accountPool: pool as unknown as AccountPool,
+      fetchRemoteModels: async () => RACCOON.fallbackModels.map((m) => ({
+        id: m.id, name: m.name, contextWindow: m.contextWindow,
+        maxTokens: m.maxTokens, supportsImage: m.supportsImage,
+      })),
+      // A 返回 401（触发续期）；此后无论哪个号都额度耗尽。
+      fetchImpl: (async (_u: string, init: RequestInit) => {
+        const auth = String(new Headers(init.headers).get('Authorization') ?? '')
+        if (auth.includes('tok-A')) return new Response('{"code":200003}', { status: 401 })
+        return new Response(
+          JSON.stringify({ error: { message: '14018 Credits exhausted' } }), { status: 402 },
+        )
+      }) as unknown as typeof fetch,
+    })
+    const chunks = await collect(adapter, {}).catch(() => [])
+
+    expect(chunks).toEqual([])                       // 全池耗尽，如实抛错
+    // 真正耗尽的是 B —— A 只返回了 401（认证类，本就不该写标记）。
+    expect(marks.map((m) => m.accountId)).toEqual(['raccoon-B'])
   })
 
   it('非额度类错误（400 参数错）不换号 —— 换号无益，按原错误抛', async () => {

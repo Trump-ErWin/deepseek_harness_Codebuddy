@@ -1132,24 +1132,37 @@ export class TraeAdapter extends LlmAdapter {
       if (this.options.accountPool && shouldRotateTraeAccount(lastKind)) {
         const tried = new Set<string>()
         if (currentAccountId) tried.add(currentAccountId)
+        // ⚠️ 必须先取出局部变量：闭包里 TS 不会保留 `this.options.accountPool`
+        // 的非空窄化（`if` 判据只作用于本块），直接用会报 TS2532。
+        const pool = this.options.accountPool
+
+        /**
+         * 给**当前**账号记冷却。认证类不记（见 `recordsTraeRateLimit`）。
+         *
+         * ⚠️ 必须**每次失败后立刻调用**，不能挪到 `for` 循环开头：挪在开头时
+         * 最后一个失败账号等不到下一次迭代就被循环结束跳过，就此漏记 ——
+         * 下次请求又选中它。用户报障形态与 loomy/raccoon 同款（PR !71 审计）。
+         */
+        const markCurrentAccount = async (): Promise<void> => {
+          if (currentAccountId === '' || !recordsTraeRateLimit(lastKind)) return
+          // 冷却时长按**类别**取（2026-09-26 修）：原实现一律用 1 小时兜底 ⇒
+          // quota-exceeded（4008 = ide_credits **月度**耗尽）也只冷却 1 小时，
+          // 1 小时后耗尽的账号被再次选中，又是 4008 —— 用户看到的就是
+          // 「轮换好像不行，每次都我手动切」。月度级耗尽必须长冷却（7 天，
+          // 覆盖到下次配额重置）；上游若给出明确重置时间应以那个为准，
+          // 但 4008 响应里没有可靠的重置字段，故改的是兜底值本身。
+          const cooldownMs = traeCooldownFor(lastKind)
+          await pool.updateModelRateLimit(
+            currentAccountId,
+            options.model,
+            Date.now() + cooldownMs,
+          )
+        }
+        await markCurrentAccount()
 
         const maxRotate = TRAE_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
-          if (currentAccountId && recordsTraeRateLimit(lastKind)) {
-            // 冷却时长按**类别**取（2026-09-26 修）：原实现一律用 1 小时兜底 ⇒
-            // quota-exceeded（4008 = ide_credits **月度**耗尽）也只冷却 1 小时，
-            // 1 小时后耗尽的账号被再次选中，又是 4008 —— 用户看到的就是
-            // 「轮换好像不行，每次都我手动切」。月度级耗尽必须长冷却（7 天，
-            // 覆盖到下次配额重置）；上游若给出明确重置时间应以那个为准，
-            // 但 4008 响应里没有可靠的重置字段，故改的是兜底值本身。
-            const cooldownMs = traeCooldownFor(lastKind)
-            await this.options.accountPool.updateModelRateLimit(
-              currentAccountId,
-              options.model,
-              Date.now() + cooldownMs,
-            )
-          }
-          const next = await this.options.accountPool.getAvailableAccount(
+          const next = await pool.getAvailableAccount(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
@@ -1164,6 +1177,7 @@ export class TraeAdapter extends LlmAdapter {
           errorText = await response.text().catch(() => '')
           lastStatus = response.status
           lastKind = classifyTraeError(response.status, errorText)
+          await markCurrentAccount()
           if (!shouldRotateTraeAccount(lastKind)) break
         }
         throw new LlmError(

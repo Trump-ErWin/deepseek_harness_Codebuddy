@@ -552,6 +552,22 @@ export class RaccoonAdapter extends LlmAdapter {
         throw new LlmError('raccoon: credential expired and refresh failed', 'AUTH', { status: response.status })
       }
       credential = refreshed
+      // ⚠️ **必须跟着重新反查账号 id**（PR !71 审计发现）：`resolveCredential`
+      // 是「池优先」的（`src/index.ts` 的 raccoon 分支先 `getAvailableAccount`
+      // 再回退单凭据 ref），而 `refresh()` 续期的是**默认单凭据 ref**。
+      // ⇒ 续期后取回的凭据**可能属于另一个账号**，但 `activeAccountId` 还停在
+      // 刷新前的那个号上。
+      // 后果（实测可复现）：A 的 token 过期 → 刷新后拿到 B 的凭据 → B 随后
+      // 返回额度耗尽，而冷却标记却**记在 A 头上** ⇒ 没耗尽的 A 被封 24h，
+      // 真该封的 B 下次仍被选中（本段要修的「卡死在一个号上」照旧）。
+      // 这与 AGENTS.md 记的 Qoder「标记用了会变的回调导致标错账号」同型。
+      if (this.options.accountPool) {
+        try {
+          activeAccountId = await this.options.accountPool.findAccountIdByCredential(
+            this.product.id, refreshed.access_token,
+          ) ?? ''
+        } catch { /* 反查失败不阻断主路径：轮换退化为「不标记」 */ }
+      }
       response = await send()
     }
 
