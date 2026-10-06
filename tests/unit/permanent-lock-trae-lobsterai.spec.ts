@@ -3,6 +3,12 @@ import { BuddyBalanceSelector, pickBuddyAccount } from '../../src/buddy-balance-
 import { BUDDY_BALANCE_TIER, splitBuddyCreditsByExpiry, buddyBalanceTier } from '../../src/buddy-balance-rank.js'
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
 import { supportsPermanentLock, permanentLockCopy } from '../../plugin-src/client/credits-capabilities.js'
+import { fetchTraeCreditBalance } from '../../src/trae-credits.js'
+import { fetchLobsteraiCreditBalance } from '../../src/lobsterai-credits.js'
+import { TRAE } from '../../src/trae-product.js'
+import { LOBSTERAI } from '../../src/lobsterai-product.js'
+import type { TraeCredential } from '../../src/trae.js'
+import type { LobsteraiCredential } from '../../src/lobsterai.js'
 import type { CreditBalance } from '../../src/credits.js'
 
 /**
@@ -95,6 +101,13 @@ describe('窗口天数对两家的影响（共用 DSH_BUDDY_EXPIRING_WINDOW_DAYS
 })
 
 describe('选号器泛型化后对两家的实际行为', () => {
+  /**
+   * ⚠️ 下面这个 `for` 循环**不是** provider 特定的：两家用的是同一个假 product
+   * `{ id: label }` 与同一种假凭据，测的只是「泛型后的编排对任意 provider 成立」
+   * （把同一段逻辑跑两遍、换了标题）。它对 TRAE 与 LobsterAI 的**差异零覆盖** ——
+   * 真正的差异在「各自的 fetchBalance 把真实响应形状归一化成什么」，
+   * 由本 describe 末尾的 `真实 fetchBalance 链路` 一节覆盖。
+   */
   /** 造一个选择器：余额由固定表给出，凭据解析恒成功。 */
   function makeSelector<TProduct, TCredential extends { token: string }>(
     product: TProduct,
@@ -191,3 +204,96 @@ describe('前后端能力声明一致（trae / lobsterai）', () => {
     expect(copy.lockTitle).not.toContain('7 天内到期')
   })
 })
+
+/**
+ * ⚠️ **provider 特定的**那一段：各自真实的 `fetchBalance` 能否把**真实响应形状**
+ * 归一化成可分桶的余额。
+ *
+ * 上一节的 `for` 循环用的是同一个假 product / 同一种假凭据，测不到任何差异；
+ * 而整个功能成立的前提恰恰是「两家的响应形状不同，但归一化后结构一致」
+ * （TRAE 的条目级 `expire_time` 秒级 Unix vs LobsterAI 的 `expiresAt` ISO 8601）。
+ * 少了这一节，改坏任一家的归一化都不会有任何用例变红。
+ */
+describe('真实 fetchBalance 链路：各家响应形状 → 同一套分桶', () => {
+  /** 造一个只回固定响应的 fetcher。 */
+  function stubFetch(payload: unknown): typeof fetch {
+    return (async () => new Response(JSON.stringify(payload), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch
+  }
+
+  it('★ TRAE：条目级 expire_time（秒）归一化后可分桶', async () => {
+    const nowSec = Math.floor(Date.now() / 1000)
+    // ⚠️ 响应**没有** code/data 包裹 —— `postJson` 已解包（对照 trae-credits.spec.ts
+    // 的既有用例：顶层直接是 `user_entitlement_pack_list`）。
+    const balance = await fetchTraeCreditBalance(traeCredential(), TRAE, stubFetch({
+      user_entitlement_pack_list: [{
+        expire_time: nowSec + 3 * 86400,
+        entitlement_base_info: {
+          display_desc: '签到奖励',
+          quota: { credits_limit: 150 },
+        },
+        usage: { credits_amount: 0 },
+      }],
+    }))
+    expect(balance, 'TRAE 余额应可解析').not.toBeNull()
+    const split = splitBuddyCreditsByExpiry(balance!, Date.now(), 15 * DAY)
+    // 3 天内到期 ⇒ 必须落「快到期」桶，否则锁定时永远选不中它
+    expect(split).toEqual({ expiring: 150, permanent: 0 })
+  })
+
+  it('★ LobsterAI：expiresAt（ISO 8601）归一化后可分桶', async () => {
+    // ⚠️ 用完整的 ISO 8601 带 Z：`Date.parse` 直接认，而实现里那个
+    // `replace(' ', 'T')` 只针对「空格分隔」的旧格式。
+    const soon = new Date(Date.now() + 4 * 86400000).toISOString()
+    const balance = await fetchLobsteraiCreditBalance(lobsteraiCredential(), LOBSTERAI, stubFetch({
+      code: 0,
+      data: {
+        totalCreditsRemaining: 100,
+        creditItems: [{ type: 'campaign', label: '每日登录奖励', creditsRemaining: 100, expiresAt: soon }],
+      },
+    }))
+    expect(balance, 'LobsterAI 余额应可解析').not.toBeNull()
+    const split = splitBuddyCreditsByExpiry(balance!, Date.now(), 15 * DAY)
+    expect(split).toEqual({ expiring: 100, permanent: 0 })
+  })
+
+  it('★ 两家归一化后都带 deductionEndTime（分桶判据才拿得到到期时间）', () => {
+    // 这是「能复用同一个分桶函数」的前提；哪一家不再设这个字段，功能就静默退化成
+    // 「全部落永久桶」⇒ 锁定后永远选不中任何账号。
+    const mk = (name: string, deductionEndTime?: number) => ({
+      name, unit: 'credit', remaining: 100, total: 100, used: 0, active: true,
+      cycleStartTime: '', cycleEndTime: '', expiredTime: '',
+      ...(deductionEndTime === undefined ? {} : { deductionEndTime }),
+    })
+    const withEnd = traeBalance([mk('a', Date.now() + DAY)])
+    expect(withEnd.packages[0]!.deductionEndTime, '包上必须带 deductionEndTime').toBeGreaterThan(0)
+    // 拿不到时**不设**该字段（而非设 0）—— 设 0 会被当作「1970 年到期」
+    expect(traeBalance([mk('b')]).packages[0]).not.toHaveProperty('deductionEndTime')
+  })
+})
+
+/** 构造一条最小 TRAE 凭据。 */
+function traeCredential(): TraeCredential {
+  return {
+    access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7200000),
+    uid: 'uid-1', nickname: 'n', machine_id: 'a'.repeat(32), device_id: 'b'.repeat(32),
+  }
+}
+
+/**
+ * 构造一条最小 LobsterAI 凭据。
+ *
+ * ⚠️ 字段**不能省**：`requestJson` 会拼 `uid` / `user_id` / `uuid` 等身份头，
+ * 缺字段时请求在到达响应解析之前就失败了 —— 那会让本节用例因为「造数据不全」
+ * 而红，掩盖真正要测的归一化逻辑（踩过一次：空对象强转导致 LobsterAI 那条红）。
+ * 字段集对齐 `lobsterai-credits.spec.ts` 的 `makeCredential`。
+ */
+function lobsteraiCredential(): LobsteraiCredential {
+  return {
+    access_token: 'AT', refresh_token: 'RT',
+    expires_at: String(Date.now() + 3_600_000),
+    uid: 'uid-1', user_id: 'yid-1', nickname: '测试',
+    uuid: 'uuid-1', first_keyfrom: '1700000000000', latest_keyfrom: '1700000000000',
+  }
+}
