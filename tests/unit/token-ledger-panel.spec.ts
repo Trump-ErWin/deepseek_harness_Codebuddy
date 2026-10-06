@@ -336,7 +336,16 @@ describe('趋势柱状图 · 渲染接线与样式契约', () => {
 
   it('⚠️ 样式文件仍是合法的单段模板字符串（STYLES 内不得出现反引号）', () => {
     // 该文件用模板字符串承载 CSS：注释里写一个反引号就会提前闭合、esbuild 报错。
+    // ⚠️ 只查**配对**不够（2026-10-07 两次事故的反例）：像 space-between 这样
+    // 「一对反引号包一个词」在 JS 语法上完全合法、backtick 计数仍是偶数，
+    // 却是 esbuild 真正报错的那一种。故再断言 STYLES 的 CSS 段里**一个反引号
+    // 都没有**（整文件只允许首尾各一个）。
     const backticks = (styles.match(/`/g) ?? []).length
     expect(backticks % 2).toBe(0)
+    // STYLES = ` ... ` 的内容段（首个与末个反引号之间）不得含任何反引号。
+    const start = styles.indexOf('`')
+    const end = styles.lastIndexOf('`')
+    const css = styles.slice(start + 1, end)
+    expect(css).not.toMatch(/`/)
   })
 })

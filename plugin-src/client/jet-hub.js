@@ -5333,13 +5333,15 @@ export function JetHubPage({ close, rpcCall }) {
   const providerSummary = providerToggleSummary(PROVIDERS, providerStatuses);
 
   return React.createElement('section', { className: 'dim-jh-page', 'aria-label': 'Jet Hub Provider 设置' },
+    // ⚠️ 页头左侧的「Jet Hub」标题块已**整块删除**（用户 2026-10-07 要求：
+    // 标题只占宽度、不带任何操作，空间全给按钮行）。这里先后删过两样东西，
+    // 都**不要**加回来：
+    // ① 副标题「提供商凭据与多账号管理」（.dim-jh-brandDesc）—— 2026-10-06，
+    //    因为按钮太多，副标题既显示不全又挤占页头高度；
+    // ② 标题本体「Jet Hub」（.dim-jh-brand / .dim-jh-brandName）—— 2026-10-07，
+    //    页头一排已有 7 个按钮，标题纯属占位。设置页的语义由本节点的
+    //    aria-label 与宿主左侧「Jet Hub」导航项承担，不丢。
     React.createElement('header', { className: 'dim-jh-header' },
-      React.createElement('div', { className: 'dim-jh-brand' },
-        // ⚠️ 这里曾有一行副标题「提供商凭据与多账号管理」（.dim-jh-brandDesc），
-        // 用户 2026-10-06 要求去掉：页头按钮已排到一排，副标题又占一行高度、
-        // 宽窄窗口下还会被截成省略号（既读不全、又把按钮往下挤）。
-        // 「Jet Hub」标题本身已足够标识该设置页，语义不丢。
-        React.createElement('strong', { className: 'dim-jh-brandName' }, 'Jet Hub')),
       React.createElement('div', { className: 'dim-jh-headerActions' },
         // 「供应商开关」在页头，而不是左侧每个供应商行尾（!25 的原形态）：
         // 它是破坏性批量操作，与「选择看哪个供应商」这个高频无害动作分开摆放，
