@@ -552,6 +552,22 @@ export class RaccoonAdapter extends LlmAdapter {
         throw new LlmError('raccoon: credential expired and refresh failed', 'AUTH', { status: response.status })
       }
       credential = refreshed
+      // ⚠️ **必须跟着重新反查账号 id**（PR !71 审计发现）：`resolveCredential`
+      // 是「池优先」的（`src/index.ts` 的 raccoon 分支先 `getAvailableAccount`
+      // 再回退单凭据 ref），而 `refresh()` 续期的是**默认单凭据 ref**。
+      // ⇒ 续期后取回的凭据**可能属于另一个账号**，但 `activeAccountId` 还停在
+      // 刷新前的那个号上。
+      // 后果（实测可复现）：A 的 token 过期 → 刷新后拿到 B 的凭据 → B 随后
+      // 返回额度耗尽，而冷却标记却**记在 A 头上** ⇒ 没耗尽的 A 被封 24h，
+      // 真该封的 B 下次仍被选中（本段要修的「卡死在一个号上」照旧）。
+      // 这与 AGENTS.md 记的 Qoder「标记用了会变的回调导致标错账号」同型。
+      if (this.options.accountPool) {
+        try {
+          activeAccountId = await this.options.accountPool.findAccountIdByCredential(
+            this.product.id, refreshed.access_token,
+          ) ?? ''
+        } catch { /* 反查失败不阻断主路径：轮换退化为「不标记」 */ }
+      }
       response = await send()
     }
 
@@ -586,24 +602,26 @@ export class RaccoonAdapter extends LlmAdapter {
        *   与 trae 4008 同形）、`rate` 记 1 小时。
        */
       let failureClass = classifyRaccoonFailure(errorText, status)
-      if (this.options.accountPool && failureClass !== 'other') {
+      const accountPool = this.options.accountPool
+      if (accountPool && failureClass !== 'other') {
         const tried = new Set<string>()
         if (activeAccountId) tried.add(activeAccountId)
+        const markCurrentAccount = async (): Promise<void> => {
+          // 每次失败后立即记账，包括轮换预算用尽的最后一个账号。
+          // 认证错误只换号，不写模型冷却。
+          if (!activeAccountId || !recordsRaccoonRateLimit(failureClass)) return
+          await accountPool.updateModelRateLimit(
+            activeAccountId,
+            options.model,
+            Date.now() + (failureClass === 'rate'
+              ? RACCOON_RATE_LIMIT_COOLDOWN_MS
+              : RACCOON_QUOTA_COOLDOWN_MS),
+          )
+        }
+        await markCurrentAccount()
         const maxRotate = RACCOON_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
-          // 只在 quota / rate 类写标记（UI 徽章 + 下次选号跳过的依据）。
-          // ⚠️ auth 类**不写**：认证失败是账号态而非模型冷却，写了会把
-          //    网关侧授权故障放大成「全池封 24h」（2026-10-06 事故）。
-          if (activeAccountId && recordsRaccoonRateLimit(failureClass)) {
-            await this.options.accountPool.updateModelRateLimit(
-              activeAccountId,
-              options.model,
-              Date.now() + (failureClass === 'rate'
-                ? RACCOON_RATE_LIMIT_COOLDOWN_MS
-                : RACCOON_QUOTA_COOLDOWN_MS),
-            )
-          }
-          const next = await this.options.accountPool.getAvailableAccount(
+          const next = await accountPool.getAvailableAccount(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
@@ -624,6 +642,7 @@ export class RaccoonAdapter extends LlmAdapter {
           errorText = await response.text().catch(() => '')
           status = response.status
           failureClass = classifyRaccoonFailure(errorText, status)
+          await markCurrentAccount()
           if (failureClass === 'other') {
             // 新账号失败但不是可换号类别：按原错误分类抛出（buddy 同款）。
             throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(status), { status })

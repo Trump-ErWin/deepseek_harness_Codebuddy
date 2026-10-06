@@ -588,4 +588,76 @@ describe('LoomyAdapter 请求级账号轮换（余额耗尽无感切号）', () 
     expect(error).toBeInstanceOf(Error)
     expect(marks).toEqual([])
   })
+
+  /**
+   * ★★ 「**最后一个**失败账号必须被标记」（PR !71 审计发现的真实缺陷）。
+   *
+   * ## 缺陷与为什么两条账号的用例测不到
+   *
+   * 旧实现把写标记放在 `for` 循环**开头**。于是**迭代次数 = 标记次数**，
+   * 而最后一次失败发生在循环体的**末尾**、不会再有下一次迭代 ⇒ **末号漏记**。
+   *
+   * ⚠️ 这正是同族 PR !71 在 raccoon 上修的同一个缺陷（loomy 未同步修）。
+   * ⚠️ **两条账号的用例是同义反复、测不到它**：循环跑 2 次、写 2 个标记，
+   * 修复前后输出完全一样。缺陷只在**轮换预算恰好用尽**（池里账号数 ≥
+   * `LOOMY_MAX_ROTATE`）或**末号之后 `getAvailableAccount` 返回 null** 时暴露。
+   */
+  it('★★ 8 账号全耗尽（轮换预算恰好用尽）→ 8 个号全部被标记，末号不漏', async () => {
+    const marks: Array<{ accountId: string }> = []
+    const ids = Array.from({ length: 8 }, (_, i) => `loomy-${i + 1}`)
+    const pool = {
+      updateModelRateLimit: async (accountId: string) => { marks.push({ accountId }) },
+      getAvailableAccount: async (_p: string, _m: string, exclude?: ReadonlySet<string>) => {
+        for (const id of ids) {
+          if (exclude?.has(id)) continue
+          return { entry: { id }, credential: { ...CRED_A, access_token: `tok-${id}` } }
+        }
+        return null
+      },
+      findAccountIdByCredential: async (_p: string, identity: string) =>
+        ids.find((id) => `tok-${id}` === identity) ?? '',
+    }
+    const fetcher = (async () => new Response(
+      JSON.stringify({ error: { message: '14018 Credits exhausted' } }), { status: 402 },
+    )) as unknown as typeof fetch
+
+    const adapter = makeAdapter({
+      resolveCredential: async () => ({ ...CRED_A, access_token: 'tok-loomy-1' }),
+      accountPool: pool as never,
+      fetchImpl: fetcher,
+    })
+    await adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    } as never).next().then(() => null).catch(() => null)
+
+    // 8 个号每个都必须留下冷却标记（修复前只有 7 个，末号漏记 ⇒ 下次又被选中）。
+    expect(marks.map((m) => m.accountId)).toEqual(ids)
+  })
+
+  /** ★ 末号之后池已空（`getAvailableAccount` 返回 null）→ 末号同样必须被标记。 */
+  it('★★ 末号失败后池已空 → 末号仍被标记（不因「没有下一个号」而漏记）', async () => {
+    const marks: Array<{ accountId: string }> = []
+    const pool = {
+      updateModelRateLimit: async (accountId: string) => { marks.push({ accountId }) },
+      // 单账号池：首号失败后没有下一个候选
+      getAvailableAccount: async () => null,
+      findAccountIdByCredential: async () => 'loomy-A',
+    }
+    const fetcher = (async () => new Response(
+      JSON.stringify({ error: { message: '14018 Credits exhausted' } }), { status: 402 },
+    )) as unknown as typeof fetch
+
+    const adapter = makeAdapter({
+      resolveCredential: async () => CRED_A,
+      accountPool: pool as never,
+      fetchImpl: fetcher,
+    })
+    await adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    } as never).next().then(() => null).catch(() => null)
+
+    expect(marks.map((m) => m.accountId)).toEqual(['loomy-A'])
+  })
 })
