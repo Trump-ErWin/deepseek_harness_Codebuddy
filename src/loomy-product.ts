@@ -76,10 +76,14 @@ export interface LoomyProduct {
  * 顺序**照抄远端返回顺序**，不重排 —— 重排会让「与远端对比」这类排查失去可比性。
  *
  * ⚠️ `name` 已按 `loomyDisplayName` 规范化（远端原值是三种括号风格混用）。
- * ⚠️ `contextWindow` 用远端 `context_length`。`spark-x` 是**已知分歧**：
+ * ⚠️ `contextWindow` 用远端 `context_length`。`spark-x` 曾是**已知分歧**：
  * 远端声明 1048576，而 Loomy 客户端用本地表
  * `MODEL_CONTEXT_OVERRIDES = { 'spark-x': 262144 }` 强制降到 262144。
- * 本表**先采信远端**；若实测长上下文被拒，改为 262144（见设计文档 §11）。
+ * 本表当初**先采信远端**、约定「实测长上下文被拒后改 262144」——
+ * 该触发条件已于 2026-10-07 满足：真实会话 4 次 0 输出，输入总量全部精确停在
+ * 262,138（= 262,144−6；auto 借道 spark-x，宿主按声明 1M 打包所致）。
+ * 已与远端解析路径（`loomy-adapter.ts` 的 `LOOMY_CONTEXT_OVERRIDES`）**同步**改为
+ * 262144，两条目录来源不再分叉。
  */
 /**
  * 实测的思考档位（8 个 chat 模型**完全一致**，2026-09-28 用真实凭据采集）。
@@ -108,7 +112,7 @@ const LOOMY_FALLBACK_MODELS: readonly LoomyFallbackModel[] = [
   { id: 'qwen-3.8-max', name: 'Qwen 3.8 Max · x12.0', contextWindow: 1_000_000, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
   { id: 'GLM-5.3-Flash', name: 'GLM 5.3 Flash · x0.8', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
   { id: 'qwen3.8-flash', name: 'qwen 3.8 flash · x0.8', contextWindow: 1_000_000, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
-  { id: 'spark-x', name: 'Spark X2.5 · x0.1', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
+  { id: 'spark-x', name: 'Spark X2.5 · x0.1', contextWindow: 262_144, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
   { id: 'mimo-v2.5', name: 'MiMo V2.5 · x3.3', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
 ]
 
