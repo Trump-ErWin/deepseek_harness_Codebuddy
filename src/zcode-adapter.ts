@@ -1791,6 +1791,31 @@ export function withToolCacheBreakpoint<T extends object>(
  * 实测身份块字符数、日期块有无**，**不含任何凭据**。
  * 未提供时行为与原来逐字一致（单测直接调用本函数的用例不受影响）。
  */
+/**
+ * 非 JSON 且形如 HTML 时，给出「上游/网络层」口径的提示（而非把页面截给用户）。
+ *
+ * 分两类已知形态（都能给出可行动的判断）：
+ * - **阿里云 ESA**（`data-spm` 特征 + `<title>405</title>`）：边缘 CDN 的错误页，
+ *   说明请求**没到达业务层**⇒ 换账号无效，重试也大概率无效；
+ * - **通用 HTML 错误页**（含 `<html`）：可能是网关、SPA 兜底或代理拦截页。
+ *
+ * ⚠ 刻意**不承诺根因**（如「上游改规则了」）—— 边缘页能证明的是
+ *「响应不是业务层JSON」，具体原因页面本身通常不写。
+ */
+function detectEdgePageHint(body: string, status: number): string {
+  const title = body.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.trim()
+  const isAliyunEsa = /data-spm/i.test(body) || /aliyuncs\.com/i.test(body)
+  const shown = title ? `（页面标题：${title}）` : ''
+  if (isAliyunEsa) {
+    return `上游返回的是边缘CDN 的 HTML 错误页${shown}，不是业务层JSON —— `
+      + '请求未到达 ZCode 服务端（通常是访问链路被拦截或上游临时故障）。'
+      + '此类问题**更换账号无效**，建议稍后重试；若持续出现，请向 ZCode 官方确认服务状态。'
+  }
+  return `上游返回的是 HTML 页面${shown}而不是业务层 JSON（HTTP ${status}），`
+    + '说明响应可能来自网关或中间层，未到达 ZCode 服务端。'
+    + '建议稍后重试；持续出现时请向 ZCode 官方确认服务状态。'
+}
+
 export function describeUpstreamError(
   status: number,
   body: string,
@@ -1806,7 +1831,37 @@ export function describeUpstreamError(
   } catch {
     // 非 JSON：原样截断。
   }
-  const suffix = typeof message === 'string' && message.length > 0 ? message : trimmed.slice(0, 200)
+
+  /**
+   * ⚠ **非 JSON 且形如 HTML ⇒ 是边缘/CDN 页，不是业务错误**（2026-10-06 实测）。
+   *
+   * 背景：实测拿到 405 + `text/html`，正文是阿里云 ESA 的错误页
+   * （`<!doctypehtml>…<title>405</title>…`，含 `data-spm` 特征）。
+   * 原实现走 `trimmed.slice(0, 200)`兜底 ⇒ **把 CSS 选择器当错误文案倒给用户**：
+   *
+   *   HTTP 405：<!doctypehtml><html lang="zh-cn">…<style>a,body,div,h2,html,p{m
+   *
+   * 与会话日志里的报错**逐字一致**（`session-de28317b`，2026-10-07 00:10）。
+   *
+   * 为什么必须单独判：
+   * 1. HTML 页里没有任何业务信息，`slice(0,200)` 截出来的是 CSS/标签噪声，
+   *    用户读完不知道发生了什么；
+   * 2. 边缘拦截是**上游侧故障**（或路径被规则拦），与「额度」「凭据」
+   *    完全不同 —— 归错方向会让用户去充值/重新登录，白跑一趟；
+   * 3. 边缘页会随 CDN 配置变化，把前200 字符原样展示等于把**不稳定的内容**
+   *    写进错误文案，将来无法复现。
+   *
+   * ⇒ 单独识别并给出「上游/网络层」口径的提示；同时保留一个短前缀便于排查。
+   */
+  const looksLikeHtmlPage = /^\s*<(?:!doctype|html|head|body)\b/i.test(trimmed)
+    || /^\s*<\?xml/i.test(trimmed)
+    || (trimmed.startsWith('<') && trimmed.includes('<html'))
+
+  const suffix = typeof message === 'string' && message.length > 0
+    ? message
+    : looksLikeHtmlPage
+      ? detectEdgePageHint(trimmed, status)
+      : trimmed.slice(0, 200)
 
   /**
    * ⚠ 两个**限流/额度**码要单独说清，因为用户该做的事完全不同：

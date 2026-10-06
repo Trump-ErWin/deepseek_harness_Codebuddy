@@ -1073,3 +1073,90 @@ describe('IKJOQB 延伸：命中 3012 必须短路，不再加重冷却惩罚', 
       .resolves.toMatchObject({ ok: false })
   })
 })
+
+/**
+ * ★★ 边缘 CDN 的 HTML 错误页不得泄漏到用户可见文案里（Gitee issue IKJRM4 相关）。
+ *
+ * ## 缺陷本体（2026-10-07 实测，与会话日志逐字一致）
+ *
+ * 走边缘拦截时上游返回的是**阿里云 ESA 的 HTML 错误页**（`text/html`），
+ * 而 `describeUpstreamError` 的非 JSON 兜底是 `trimmed.slice(0, 200)`
+ * ⇒ 前 200 字符是 `<!doctypehtml>…<style>a,body,div,h2,html,p{m`，
+ * **CSS 选择器被当错误文案倒给用户**：
+ *
+ * ```
+ * zcode: HTTP 405：<!doctypehtml><html lang="zh-cn">…<title>405</title>…
+ * ```
+ *
+ * 三条代价：
+ * 1. HTML 里没有业务信息，用户读完不知道发生了什么；
+ * 2. 归因方向错 —— 边缘拦截属上游/网络层，与「额度」「凭据」无关，
+ *    按额度/凭据指引会让用户去充值或重新登录，白跑一趟；
+ * 3. 边缘页内容随 CDN 配置变化，把它的片段写进错误文案 ⇒ 将来无法复现。
+ *
+ * ## 与既有 3012 用例的分工
+ *
+ * 上面那些用例守的是「**业务层 JSON** 的 3012 要按风控报」；
+ * 本段守的是「**非 JSON 的 HTML 页**不能当业务错误报」。
+ * 两者互不覆盖：同一个 `405` + 不同的 `content-type` 必须给出不同结论。
+ */
+describe('边缘 CDN 的 HTML 错误页：不得当业务错误报（2026-10-07 实测）', () => {
+  /** 实测拿到的阿里云 ESA 错误页（截取前段，形态与真响应一致）。 */
+  const ESA_HTML =
+    '<!doctypehtml><html lang="zh-cn"><meta charset="utf-8">'
+    + '<meta http-equiv="X-UA-Compatible"content="IE=edge,chrome=1">'
+    + '<meta name="data-spm"content="a3c0e"><title>405</title>'
+    + '<style>a,body,div,h2,html,p{margin:0;padding:0}a{text-decoration:none;color:#3b6ea3}</style>'
+
+  it('ESA 页：文案不含任何 HTML 标签或 CSS 噪声', () => {
+    const msg = describeUpstreamError(405, ESA_HTML)
+    expect(msg).not.toMatch(/<!doctype|<html|<style|doctypehtml|<head|<body/i)
+    // 反向验证护栏：判据本身要真能命中（否则上面那条会「因为什么都没查到」而恒绿）
+    expect(msg).toContain('HTML')
+  })
+
+  it('ESA 页：说清「未到达服务端」且指明换账号无效', () => {
+    const msg = describeUpstreamError(405, ESA_HTML)
+    expect(msg).toContain('未到达')
+    // 方向性断言：换账号 / 重新登录对边缘拦截无效，必须写出来
+    expect(msg).toContain('更换账号无效')
+    // 反向断言：不得把边缘拦截说成额度或凭据问题
+    expect(msg).not.toContain('额度')
+    expect(msg).not.toContain('凭据失效')
+  })
+
+  it('各状态码一视同仁（400/403/404/429/5xx 都不该泄漏 HTML）', () => {
+    for (const status of [400, 403, 404, 405, 429, 500, 502, 503]) {
+      expect(describeUpstreamError(status, ESA_HTML), `status=${status}`)
+        .not.toMatch(/<!doctype|<html|<style/i)
+    }
+  })
+
+  it('通用 HTML 错误页（非 ESA）同样不被当业务错误', () => {
+    // 无 data-spm 特征，但确实是 HTML 页
+    const generic = '<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body>…</body></html>'
+    const msg = describeUpstreamError(502, generic)
+    expect(msg).not.toMatch(/<!doctype|<html|<head|<body/i)
+    expect(msg).toContain('HTML')
+  })
+
+  it('★ 业务层 JSON 的既有行为逐字未变（回归护栏）', () => {
+    // 3012：仍按风控报，且带冷却警告
+    const r3012 = describeUpstreamError(405, '{"code":3012,"msg":"request has been blocked due to unusual activity."}')
+    expect(r3012).toContain('3012')
+    expect(r3012).toContain('冷却')
+    expect(r3012).not.toMatch(/<!doctype|<html/i)
+
+    // 1005：仍按额度用尽报
+    const r1005 = describeUpstreamError(429, '{"code":1005,"msg":"daily limit exceeded"}')
+    expect(r1005).toContain('额度')
+    expect(r1005).not.toMatch(/<!doctype|<html/i)
+
+    // 401：仍指向 Jet Hub 面板
+    expect(describeUpstreamError(401, '{"code":1001,"msg":"unauthorized"}')).toContain('Jet Hub')
+  })
+
+  it('短的非 JSON 文本仍按原样截断（不回归既有兜底）', () => {
+    expect(describeUpstreamError(401, 'not json but short')).toContain('not json but short')
+  })
+})
