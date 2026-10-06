@@ -499,6 +499,40 @@ describe('BuddyAdapter', () => {
       expect((await adapter.listModels('buddy')).map((m) => m.id))
         .not.toContain('internal-alias-probe')
     })
+
+    // ⚠️⚠️ **反向护栏：放宽不得把「实测不可调用」的模型放回选择器**。
+    //
+    // 上一版把追加判据写成「有任一能力元数据就保留」，其中包含
+    // `maxOutputTokens` / `contextWindow` —— 而实测「11102 service info not
+    // found」的模型（glm-4.6/4.7/5.0、minimax-m2.5、kimi-k2.5、hunyuan-* …）
+    // **恰好也带这两个字段**（src/product.ts 的 CODEBUDDY_FALLBACK_MODELS
+    // 注释明确记录了它们被排除的理由）。⇒ 放宽会把它们放回模型选择器，
+    // 用户选中后才报错 —— **这是修复引入的新缺陷，比原缺陷更糟**。
+    //
+    // ✅ 判据必须是「**图片能力**这一项」，即该模型正是本 issue 要解决的那类。
+    it('实测不可调用的模型（带窗口/输出上限但无图片能力）不得被放回选择器', async () => {
+      const unusable = ['glm-4.6', 'glm-4.7', 'glm-5.0', 'minimax-m2.5', 'kimi-k2.5', 'hunyuan-chat']
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => unusable.map((id) => ({
+          id, name: id, contextWindow: 256_000, maxOutputTokens: 24_000,
+        })),
+      })
+      const ids = (await adapter.listModels('buddy')).map((m) => m.id)
+      for (const id of unusable) {
+        expect(ids, `${id} 实测 11102 不可调用，不该进模型选择器`).not.toContain(id)
+      }
+    })
+
+    // ⚠️ 反向验证的另一半：**带图片能力的模型仍然要被保留**（别把上面的
+    // 收窄做过头 —— 那会把 issue 的正题重新修坏）。
+    it('带图片能力的模型被保留（确认上一条不是「一律丢弃」）', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [
+          { id: 'usable-vision', name: 'Vision', supportsImages: true, maxOutputTokens: 24_000 },
+        ],
+      })
+      expect((await adapter.listModels('buddy')).map((m) => m.id)).toContain('usable-vision')
+    })
   })
 
   // ── 「能力未知」不等于「不支持」：贴图门禁的三态语义（issue IKJQ3M）──
