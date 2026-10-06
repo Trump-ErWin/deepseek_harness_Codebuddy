@@ -1,7 +1,7 @@
 {
   "name": "dsh-codearts-auth",
   "version": "0.1.0",
-  "description": "deepseek-harness plugin: CodeArts (Huawei Cloud) browser login, storing the temporary credential via ctx.credentials",
+  "description": "deepseek-harness plugin: sign in and manage accounts across multiple AI coding providers, with multi-account pools and silent credential refresh",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
