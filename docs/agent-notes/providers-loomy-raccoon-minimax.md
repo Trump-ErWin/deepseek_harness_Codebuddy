@@ -627,6 +627,62 @@ pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：**tools 是否被接受**（�
 - `400 100002 params_invalid_error` —— 手机号格式或验证码错。
 - `400 100003 params_encryted_error` —— 手机号**未加密**或加密格式不对。
 
+### ⚠️ 失败分类：loomy 与 raccoon 的判据是**同一张表**（2026-10-06 同型复发）
+
+`classifyLoomyFailure`（`src/loomy-adapter.ts`）与 `classifyRaccoonFailure`
+（`src/raccoon-adapter.ts`）**逐格同构**：接口形态同族（额度错误没有专用 HTTP
+状态码，文案是主通道）、四个类别同义（`quota` / `rate` / `auth` / `other`）、
+冷却时长同档（`quota` 24h、`rate` 1h）。
+
+**真实缺陷（同型复发）**：raccoon 在 `7b524ff` 把判据收窄了两处，loomy **未同步**，
+于是同一报文在两个 provider 上被判成**不同类别**，危险方向恒定朝 loomy
+（它多写冷却 ⇒ 封可用账号 24h）。本机实测（临时探针，已删）：
+
+| 报文 | loomy（未同步时） | raccoon（已修） |
+|---|---|---|
+| `403 + insufficient permissions to access this resource` | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
+| `403 + 积分不足` | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
+| `401 + 余额不足` | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
+| `401 + 14018 Credits exhausted`（网关故障常带余额提示） | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
+| `400 + the context window is insufficient for this model` | `quota` ⇒ **写 24h** | `other` ⇒ 不换号 |
+
+前四行正是 AGENTS.md 记的 **2026-10-06「全池被封」事故形态**（那次触发词是
+`authorization_verify_error`，这次是 `insufficient permissions` / 「不足」类文案）：
+**认证类是账号态、不是模型冷却**，写标记会把网关侧授权故障放大成
+「整个 provider 被封 24h」。
+
+**两条不变式**（改任一侧都必须同步另一侧）：
+
+1. **401/403 先判**，恒归 `auth`。状态码与额度文案并存时（网关侧故障常在报文里
+   捎带余额提示）**以状态码为准** —— 这正是「先按某字段判门禁、再解析」类写法的
+   反面（同 AGENTS.md 记的 Qoder 嵌套深度坑）。
+2. `insufficient` **单独出现过宽**，必须与邻近的「钱」义词
+   （`point` / `credit` / `balance` / `quota` / `token`）**共现**才算额度。
+   中文三词（积分 / 额度 / 余额）**不要**收紧 —— 它们的方向是「宁可漏判不可误伤」。
+   漏判只是不换号，误判会封可用账号 24h。
+
+**防复发的真正闸门是「对拍」而不是各写一份用例**：单方面把一侧「改严」时，
+两侧各自的用例**都能过**（本次的 loomy 侧就是这样漏掉的）。
+`tests/unit/loomy-adapter.spec.ts` 的「与 raccoon 对拍」段把**同一批真实报文
+喂两个分类器、断言逐条同结论**，分叉即红。
+⚠️ 已做**反向验证**：把 loomy 的顺序与 `insufficient` 判据改回修复前 →
+3 条变红（含对拍那条）；恢复后 44/44 绿。
+
+### ⚠️ 401 续期后必须**重新反查账号 id**（loomy 与 raccoon 同款，2026-10-06）
+
+`options.resolveCredential` 是**池优先**的（loomy 还叠加余额分档：
+`src/index.ts` 先 `loomyBalanceSelector.select()` 再解析该号的 ref），
+而 `refresh()` 续期/探测的是**池当前默认账号** —— 二者可能不是同一个号。
+⇒ **续期后取回的凭据可能属于另一个账号**，若 `activeAccountId` 不跟着更新，
+冷却标记就记在**没发这次请求的号**头上：没耗尽的号被封 24h，而真该封的号
+下次仍被选中（「卡死在一个号上」照旧）。
+
+raccoon 在 `51ded6a` 修了这处，**loomy 当时未同步**（同一次审计里已发现
+`markCurrentAccount` 的末号漏记，却漏了这一处）。现两家都在续期后按
+`refreshed.access_token` 调 `findAccountIdByCredential` 重新反查。
+⚠️ 与 AGENTS.md 记的 Qoder「标记用了会变的回调导致标错账号」同型。
+⚠️ 已做**反向验证**：去掉 loomy 的反查块 → 对应用例变红；恢复后全绿。
+
 ---
 
 ## ⚠️ MiniMax Code（中国版）provider：不能凭直觉改的点

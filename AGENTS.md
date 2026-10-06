@@ -476,3 +476,52 @@ UI 上完全看不到错误。
 - `lobsterai` 用独立的 `LobsteraiAdapter`（协议不同源，见项目概述）；它的产品配置是 `src/lobsterai-product.ts` 的 `LobsteraiProduct`，与 `BuddyProduct` **平行而非继承**
 - `qoder` 用独立的 `QoderAdapter`（协议不同源，见项目概述）；产品配置是 `src/qoder-product.ts` 的 `QoderProduct`，同样**平行而非继承**。它的 OpenAI 协议层逻辑复用 `src/openai-compat.ts`
 - `trae` 用独立的 `TraeAdapter`（协议不同源）；它的产品配置是 `src/trae-product.ts` 的 `TraeProduct`，同样**平行而非继承**。与其它三个 provider 最根本的差异是**载荷与响应都要转换**：请求体经 `transformToSOLOBody` 转成 SOLO 格式，响应经 `parseTraeSSELine` 从 SOLO 自定义 SSE 转成 OpenAI chunk
+
+## ⚠️ 移植既有实现的轮换/重试语义：先抄「类别→动作」表，不是抄循环骨架
+
+**真实事故**（2026-10-06，PR #64 的 raccoon/loomy 轮换）：照 `buddy-adapter.ts`
+的**循环骨架**（tried 集合 + `getAvailableAccount(exclude)` + 换号重发）给两家补了
+请求级轮换，但**漏抄了 buddy 的分支语义表** —— buddy 只在**限流类**失败写冷却标记，
+认证类（401/403）只 `continue` 换号**不写标记**。初版写成「凡可换号就写冷却，
+时长 `status===429 ? 1h : 24h`」⇒ 上游网关对全池回 401（`authorization_verify_error`）时，
+**一个请求内 6 个号各被封 24h，整个 provider 死一天**（症状
+`no usable credential; log in first`）。
+
+**审查侧规则**（给 code-review 与自审）：看到「对齐/移植/参照既有实现」的 PR，先要
+那张**类别→动作**表，再逐格对照源实现 —— 骨架长得像不代表语义抄全了：
+
+| 问 | 为什么 |
+|---|---|
+| 源实现把失败分几类？判据是什么？ | 分类是语义的载体（quota/rate/auth/other 各自动作不同） |
+| 每类**换不换**下一个候选？ | 换号无益的类别（400 参数错）不该换 |
+| 每类**写不写**状态标记（冷却/黑名单）？ | 认证类写冷却＝把网关故障放大成全池不可用（本次事故格） |
+| 每类**抛什么错误码**？ | 401 报成 `QUOTA_EXCEEDED` 会误导排障与重试策略 |
+| 候选耗尽时报什么？带不带最后一次的真实原因？ | 笼统报错丢服务端原文（buddy 上同款教训） |
+
+新实现必须配**逐格回归测试**（每格一条，先红后绿）；漏抄的那格就是将来的事故。
+
+### ⚠️ 同族判据必须**逐格同构**，改一侧就要改另一侧（2026-10-06 同型复发）
+
+`classifyRaccoonFailure` 与 `classifyLoomyFailure` 是**同一张判据表的两个实现**。
+raccoon 在 `7b524ff` 收窄后 loomy **未同步**，于是同一报文在两个 provider 上被判成
+**不同类别**，且危险方向恒定朝 loomy（多写冷却）—— 实测四例：
+
+| 报文 | loomy（未同步时） | raccoon（已修） |
+|---|---|---|
+| `403 + insufficient permissions to access this resource` | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
+| `403 + 积分不足` | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
+| `401 + 余额不足` | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
+| `400 + context window is insufficient for this model` | `quota` ⇒ **写 24h** | `other` ⇒ 不换号 |
+
+前两行与上面的「全池被封」是**同一事故形态**，只换了触发词。两条不变式：
+
+1. **401/403 先判**，恒归认证类 —— 状态码与额度文案并存时（网关侧故障常在报文里
+   捎带余额提示）**以状态码为准**；
+2. `insufficient` 单独出现**过宽**，必须与邻近的「钱」义词
+   （`point` / `credit` / `balance` / `quota` / `token`）**共现**才算额度。
+   方向是**宁可漏判不可误伤**：漏判只是不换号，误判会封可用账号 24h。
+
+⚠️ **两侧各写一份用例挡不住复发**（单方面"改严"时两边各自的用例都能过）。
+`tests/unit/loomy-adapter.spec.ts` 的「与 raccoon 对拍」段把**同一批真实报文
+喂两个分类器、断言逐条同结论**，分叉即红 —— 这是防复发的真正闸门。
+
