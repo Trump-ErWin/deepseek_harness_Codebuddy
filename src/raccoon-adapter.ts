@@ -230,19 +230,39 @@ const RACCOON_RATE_LIMIT_COOLDOWN_MS = 3_600_000
  */
 export type RaccoonFailureClass = 'quota' | 'rate' | 'auth' | 'other'
 
-/** 判定失败类别（文案 + 状态码双通道，与 `isRateLimited` 同构）。 */
+/**
+ * 判定失败类别（文案 + 状态码双通道，与 `isRateLimited` 同构）。
+ *
+ * ## ⚠️ 401/403 **必须先判**（PR !71 审计）
+ *
+ * 早期实现把文案判定放在状态码之前，于是 `403 + "insufficient permissions to
+ * access this resource"` 被判成 `quota` ⇒ **给一个只是没权限的账号写 24 小时
+ * 冷却**。这与 {@link RaccoonFailureClass} 记的 2026-10-06「全池被封」事故
+ * **同型**（那次触发词是 `authorization_verify_error`，这次是
+ * `insufficient permissions`）：认证类只换号、绝不写标记，是那次事故换来的
+ * 不变式，不能被文案判据绕过。
+ *
+ * ⚠️ 顺序不能调换回去：把「先按文案判门禁、再解析」当通则会静默误伤 ——
+ * 401/403 与额度文案并存时（网关侧故障常在报文里带余额提示）必须以状态码为准。
+ */
 export function classifyRaccoonFailure(errorText: string, status: number): RaccoonFailureClass {
+  // 认证类先判：403 可能只是权限/授权问题，绝不能落到 quota 而被写 24h 冷却。
+  if (status === 401 || status === 403) return 'auth'
   const lower = errorText.toLowerCase()
   const quotaText = lower.includes('14018')
     || lower.includes('credits exhausted')
-    || lower.includes('insufficient')
+    // ⚠️ `insufficient` 单独出现**过宽**（PR !71 审计实测误伤 5 类），必须与
+    // 邻近的「钱」义词共现才算额度：上下文窗口超长（"context window is
+    // insufficient for this model"）、数据不足等都与额度无关。
+    // 方向仍是「宁可漏判不可误伤」—— 漏判只是不换号，误判会封可用账号 24h。
+    || (lower.includes('insufficient')
+      && ['point', 'credit', 'balance', 'quota', 'token'].some((w) => lower.includes(w)))
     || (lower.includes('积分') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('额度') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('余额') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('quota') && (lower.includes('exceeded') || lower.includes('exhausted')))
   if (quotaText || status === 402) return 'quota'
   if (status === 429) return 'rate'
-  if (status === 401 || status === 403) return 'auth'
   return 'other'
 }
 

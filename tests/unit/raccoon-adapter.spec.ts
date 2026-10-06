@@ -2,7 +2,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { RACCOON, raccoonSupportsImage } from '../../src/raccoon-product.js'
-import { RaccoonAdapter, registerRaccoonLlm } from '../../src/raccoon-adapter.js'
+import { RaccoonAdapter, classifyRaccoonFailure, registerRaccoonLlm } from '../../src/raccoon-adapter.js'
 import type { RaccoonRemoteModel } from '../../src/raccoon-adapter.js'
 import type { RaccoonCredential } from '../../src/raccoon.js'
 import { raccoonDisplayName } from '../../src/raccoon.js'
@@ -105,6 +105,47 @@ async function collect(adapter: RaccoonAdapter, options: Partial<GenerateOptions
   for await (const c of adapter.stream(full)) chunks.push(c)
   return chunks
 }
+
+describe('classifyRaccoonFailure 判据（PR !71 审计：防止误封可用账号）', () => {
+  it('★ 真实额度形态仍归 quota（PR 报障的 400 + insufficient_points）', () => {
+    // 本机实测：低余额账号回 HTTP 400 + insufficient_points。
+    expect(classifyRaccoonFailure('{"code":"insufficient_points"}', 400)).toBe('quota')
+    expect(classifyRaccoonFailure('insufficient_points', 402)).toBe('quota')
+    expect(classifyRaccoonFailure('14018 Credits exhausted', 400)).toBe('quota')
+    expect(classifyRaccoonFailure('积分不足', 400)).toBe('quota')
+  })
+
+  /**
+   * ★★ `insufficient` 单独出现**不得**判成 quota（PR !71 审计实测误伤 5 类）。
+   *
+   * 误判成 `quota` 的后果是**给一个只是没权限/上下文超长的账号写 24 小时
+   * 冷却** —— 与 2026-10-06「全池被封」事故同型，只是范围更小。
+   */
+  it('★★ 上下文/数据类 insufficient 不判 quota（不写 24h 冷却）', () => {
+    expect(classifyRaccoonFailure('the context window is insufficient for this model', 400)).toBe('other')
+    expect(classifyRaccoonFailure('input length is insufficient', 400)).toBe('other')
+    expect(classifyRaccoonFailure('insufficient data to complete the request', 400)).toBe('other')
+  })
+
+  /**
+   * ★★★ 403 + `insufficient permissions` 必须归 **auth**（不是 quota）。
+   *
+   * 认证类是 2026-10-06 事故换来的不变式：**只换号、绝不写标记**。
+   * 若被判成 `quota`，一个只是没权限的账号会被封 24h。
+   */
+  it('★★★ 403 + insufficient permissions 归 auth（不是 quota）', () => {
+    expect(classifyRaccoonFailure('insufficient permissions to access this resource', 403)).toBe('auth')
+    expect(classifyRaccoonFailure('{"code":200003,"message":"authorization_verify_error"}', 401)).toBe('auth')
+    // 状态码与额度文案并存时，仍以状态码为准（网关侧故障常在报文里带余额提示）。
+    expect(classifyRaccoonFailure('14018 Credits exhausted', 401)).toBe('auth')
+  })
+
+  it('429 与 402 按状态码归类', () => {
+    expect(classifyRaccoonFailure('', 429)).toBe('rate')
+    expect(classifyRaccoonFailure('', 402)).toBe('quota')
+    expect(classifyRaccoonFailure('param is invalid', 400)).toBe('other')
+  })
+})
 
 describe('providerInfo', () => {
   it('返回 id 与显示名', () => {
