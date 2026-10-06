@@ -18,7 +18,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
-import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { RemoteCatalogGate, REMOTE_CATALOG_COOLDOWN_MS } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import {
   RATE_LIMIT_FALLBACK_MS,
@@ -236,6 +236,17 @@ export interface BuddyAdapterOptions {
    * 差异全部由本配置承载。
    */
   product?: BuddyProduct
+  /**
+   * 远端目录闸门的时钟来源，默认 `Date.now`。
+   *
+   * 存在的理由：`refreshCatalog` 的「距上次拉取 ≥10 秒才重试」是一条
+   * **基于时间**的契约（见 `BUDDY_IMAGE_CAPABILITY_RETRY_MS`），而闸门的
+   * 冷却与间隔判定都走这个时钟。注入它可零副作用地验证该契约 ——
+   * 改全局时钟（`vi.setSystemTime`）会污染同进程其余用例。
+   */
+  now?: () => number
+  /** 目录闸门的失败冷却时长，默认 {@link REMOTE_CATALOG_COOLDOWN_MS}。 */
+  catalogCooldownMs?: number
 }
 
 /** 将消息内容载荷展平为纯文本字符串。 */
@@ -871,7 +882,7 @@ export class BuddyAdapter extends LlmAdapter {
    * 目录加载闸门：并发去重 + 失败/空结果冷却。
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
-  private readonly catalogGate = new RemoteCatalogGate()
+  private readonly catalogGate: RemoteCatalogGate
   /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
   private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
   /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
@@ -890,6 +901,13 @@ export class BuddyAdapter extends LlmAdapter {
     this.product = options.product ?? CODEBUDDY
     this.fetchImpl = options.fetchImpl ?? fetch
     this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, '')
+    // ⚠️ 闸门时钟可注入（**不是**测试专用开关）：`refreshCatalog` 的「距上次
+    // 拉取 ≥10 秒才重试」是一条**基于时间**的契约，而闸门的 `now` 默认取墙钟。
+    // 单测用 `vi.setSystemTime` 改全局时间会污染同文件其余用例（真实计时器
+    // 用例被挂起，实测变成时序敏感），而注入时钟可零副作用地验证该契约。
+    this.catalogGate = new RemoteCatalogGate(
+      options.now === undefined ? {} : { now: options.now, cooldownMs: options.catalogCooldownMs ?? undefined },
+    )
     const fallback = this.product.fallbackModels ?? []
     this.productFallbackIndex = new Map(fallback.map((model) => [model.id, model]))
     this.productFallbackContextWindows = new Map(
@@ -1211,9 +1229,17 @@ export class BuddyAdapter extends LlmAdapter {
   /**
    * 该模型的图片能力是否**已被某个来源明确表态**（而不只是「没查到」）。
    *
-   * ⚠️ 与 {@link inputModalitiesFor} 的取值链**必须逐级同源**：本函数判
-   * 「有没有表态」，那条链判「表态成什么」。两处若口径不一致，同一文件就会
-   * 出现「一处说有、一处说无」的两套判据 —— 那正是本仓库反复出静默缺陷的形态。
+   * ⚠️ 与 {@link inputModalitiesFor} 的**四个图片来源**必须逐级同源
+   * （`IMAGE_CAPABILITY_OVERRIDES` → `remoteMeta.supportsImages` →
+   * `productFallbackMeta.supportsImages` → `IMAGE_MODELS`）：
+   * 本函数判「有没有表态」，那条链判「表态成什么」。两处口径不一致时，
+   * 同一文件就会存在「一处说有、一处说无」的两套判据 —— 那正是本仓库反复
+   * 出静默缺陷的形态。
+   *
+   * ⚠️ **刻意不含 `reasoningEfforts` / `defaultReasoningEffort`**：那不是图片
+   * 能力。而目录准入侧的 `hasRemoteImageCapability` 也**只认 `supportsImages`** ——
+   * 三处都是「只认图片能力」，互不交叉，**不会**出现「只带思考档位的远端模型
+   * 被收进目录却判为图片未知」这类分叉（它的处置是保守的：不放行图片）。
    */
   private imageCapabilityKnown(model: string): boolean {
     if (BuddyAdapter.IMAGE_CAPABILITY_OVERRIDES.has(model)) return true
