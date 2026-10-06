@@ -2046,7 +2046,7 @@ export function toClaimOutcome(
    * ## 修复前的用户可见形态（issue 原文，逐字）
    *
    * ```
-   * ZCode dbujns@chatai.dpdns.org：失败 — zcode-v3-start-plan-trust-1005:
+   * ZCode <账号已脱敏>：失败 — zcode-v3-start-plan-trust-1005:
    * request has been blocked due to unusual activity.
    * ```
    *
