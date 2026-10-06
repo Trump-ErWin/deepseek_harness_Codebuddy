@@ -1198,16 +1198,26 @@ Hy3 · x0.05 X                      (hy3-x)
 用公共前缀而不是硬编码 `-sg`，是因为撞车组会随服务端上新变化（本次实测三组
 里只有一组带 `-sg`）。LobsterAI 实测无同名（28 个模型 0 组重名），故不做消歧。
 
-### 成长中心任务（buddy / workbuddy）
+### 成长中心任务（仅 buddy / CodeBuddy 中国版）
 
 `src/buddy-growth.ts` 提供成长中心任务的**纯 API 自动化**：接取任务 → 上报判据
 事件 → 逐项领奖。原作只有每日签到，成长任务（22 项）完全没有实现。
 
-入口是 Jet Hub 设置页的「一键领取积分」按钮（buddy / workbuddy 下显示为
+⚠️ **只有 buddy（CodeBuddy 中国版）有成长中心**。`workbuddy`（国际版）后端
+**根本没有该功能**（实测无任务列表、无 claim 端点），故不在
+`GROWTH_CAPABLE_PROVIDERS`（宿主）与 `GROWTH_TASK_PROVIDERS`（客户端）里
+—— 两处是**同一份清单，必须同时改**。
+
+入口是 Jet Hub 设置页的「一键领取积分」按钮（buddy 下显示为
 「一键领取积分 + 成长任务」）。**成长任务只在手点该按钮时执行** ——
 `credits.claimAll` 同时是「每日首次启动自动签到」的执行体，而成长一轮单账号实测
 90～270s 且全串行，默认开启等于每次开机自动打几十个上游请求。这条不变量由
 `tests/unit/usage-badge-client.spec.ts` 的断言锁住。
+
+⚠️ **重入闸门**（`claimInFlightRef`）：按钮的 `disabled: claiming` 依赖**异步**
+state，同一 tick 内连点两次会穿透并起两轮并发（对同一账号同一批任务并发上报与
+claim）。故用 `useRef` 做**同步**闸门，且拦住后必须给出提示（不能静默 return）、
+闸门必须**无条件释放**（跟着 `mounted` 判会让它永久卡死）。
 
 覆盖 22 项任务映射（对话类走六连事件链；`create_canvas` 走
 `wbx_design_canvas_*` 遥测且**不**新建真实画布；`Library_read` 走 web 域

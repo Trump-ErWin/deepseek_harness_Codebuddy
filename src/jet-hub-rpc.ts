@@ -108,27 +108,23 @@ import { CODEBUDDY, WORKBUDDY, productById, type BuddyProduct } from './product.
 import { runGrowthTaskCompletions } from './buddy-growth.js'
 
 /**
- * 有成长中心任务可做的 provider。
+ * 有成长中心任务可做的 provider —— **只有 CodeBuddy 中国版**。
  *
- * 成长任务端点只在腾讯系产品上存在（`buddy` / `workbuddy`）。列成显式白名单而不是
- * 「凡 BuddyProduct 都行」，是为了让 `buddy.growthTasks` 对 zcode 之类**不读
- * BuddyProduct** 的渠道也不成立 —— 否则直接调用会对每个账号白发一轮串行请求。
- * 客户端的能力表（`credits-capabilities.js`）是是否渲染按钮的权威，本表是服务端
- * 的第二道守卫。
+ * 列成显式白名单而不是「凡 BuddyProduct 都行」，是为了让 `buddy.growthTasks` 对
+ * zcode 之类**不读 BuddyProduct** 的渠道也不成立 —— 否则直接调用会对每个账号白发
+ * 一轮串行请求。客户端的能力表（`credits-capabilities.js`）是是否渲染按钮的权威，
+ * 本表是服务端的第二道守卫。
  *
- * ⚠️ `WORKBUDDY.id` 在本表里目前是**不可达的**（dead capability），不是「已验证」：
- * 成长任务的唯一入口是「一键领取积分」按钮，而该按钮由
- * `supportsCredits = supportsDailyCheckin(provider)` 门控，`workbuddy` 在能力表里
- * 登记为 `dailyCheckin: false`（国际版后端无签到接口）⇒ 按钮不渲染 ⇒
- * `runTasks: true` 永远传不到这里。
+ * ⚠️ **`workbuddy`（国际版）不在此表**：contributor 在 !62 复审中实测确认
+ * `www.workbuddy.ai` 后端**根本没有成长中心**（无任务列表、无 claim 端点）——
+ * 不是「未实测」，是**该产品没有这个功能**。故 `WORKBUDDY` 上的 `claimBase` /
+ * `webBase` 也只是为共享 `BuddyProduct` 类型而填的占位，不会被本模块读取。
  *
- * 保留它而非现在删掉，是因为它与 `buddy` 同源（共用 CLI 内核与认证协议），
- * 将来若给 workbuddy 开放签到入口，此处不该再漏 —— 那正是本仓库
- * 「平行分支越多、漏接概率越高」那条教训的反面用法（此表是**单一登记点**）。
- * 但放开前必须先实测 `www.workbuddy.ai` 的成长端点（见 `product.ts` 的 `WORKBUDDY`
- * 注释：`claimBase` / `webBase` 是推断值）。
+ * ⚠️ 此表与客户端的 `GROWTH_TASK_PROVIDERS`（`plugin-src/client/jet-hub.js`）
+ * 必须**同时**改：客户端决定是否传 `runTasks`，本表决定是否受理，只改一处会
+ * 让另一处静默失效（多传不会被受理 / 少传则永远不触发）。
  */
-const GROWTH_CAPABLE_PROVIDERS: ReadonlySet<string> = new Set([CODEBUDDY.id, WORKBUDDY.id])
+const GROWTH_CAPABLE_PROVIDERS: ReadonlySet<string> = new Set([CODEBUDDY.id])
 
 /**
  * 整轮成长任务的时间预算缺省值（毫秒）。

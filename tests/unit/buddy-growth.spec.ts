@@ -821,3 +821,77 @@ describe('web 域 os 名与 arch 自洽', () => {
     }
   })
 })
+
+/**
+ * 缺 `claimBase` / `webBase` 配置时必须**报可读错误**，不能拼出 `undefined/...`（复审补）。
+ *
+ * ⚠️ 这条来自 contributor 在对 !62 的复审里提的警告：原实现写
+ * `String(product.claimBase)`，而 `String(undefined)` 得到的是**字符串 `"undefined"`**
+ * 而非抛错 ⇒ URL 拼成 `undefined/activity/growth/tasks/<code>/claim`，
+ * 请求真的发出去，失败现象看起来像服务端问题，真因（本插件缺配置）毫无线索。
+ * 这类「不崩但静默错」比崩溃更难查。
+ */
+describe('web 域基址缺配置时的健壮性', () => {
+  const NO_BASE = {
+    endpoint: 'https://copilot.tencent.com',
+    apiDomain: 'copilot.tencent.com',
+    userAgent: 'X',
+  } as unknown as BuddyProduct
+
+  it('缺 claimBase 时返回可读错误，且不得发出指向 undefined 的请求', async () => {
+    const urls: string[] = []
+    const fetcher = (async (url: string) => {
+      urls.push(String(url))
+      return {
+        ok: true, status: 200,
+        json: async () => ({ code: 0, data: { credit: 1 } }),
+        text: async () => JSON.stringify({ code: 0, data: { credit: 1 } }),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+    const r = await claimGrowthTaskReward(CRED, NO_BASE, fetcher, 'chat_5')
+    expect(r.ok).toBe(false)
+    expect(r.claimed).toBe(false)
+    expect(r.message).toContain('claimBase')
+    // 关键断言：一个请求都不该发出去（否则就是「能发但指向 undefined」）。
+    expect(urls).toEqual([])
+  })
+
+  it('webBase 缺失时回退 claimBase；两者都缺则报错且不发请求', async () => {
+    const urls: string[] = []
+    const fetcher = (async (url: string) => {
+      urls.push(String(url))
+      const list = { code: 0, data: { tasks: [] } }
+      return {
+        ok: true, status: 200,
+        json: async () => list, text: async () => JSON.stringify(list),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+    // 二者都缺 ⇒ Library_read 上报必须报错而非拼出 undefined。
+    vi.useFakeTimers()
+    const list = {
+      code: 0,
+      data: {
+        tasks: [
+          { task_code: 'Library_read', accept_status: 'not_accepted', progress: { current: 0, target: 1 } },
+        ],
+      },
+    }
+    const f2 = (async (url: string) => {
+      urls.push(String(url))
+      return {
+        ok: true, status: 200,
+        json: async () => list, text: async () => JSON.stringify(list),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+    const work = runGrowthTaskCompletions(CRED, NO_BASE, f2, { budgetMs: 600_000 })
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.runAllTimersAsync()
+    const r = await work
+    vi.useRealTimers()
+    // 不得出现指向 undefined 的 URL。
+    expect(urls.some((u) => u.includes('undefined'))).toBe(false)
+    // 该项应被标记为未完成/需客户端，而不是假装成功。
+    const item = r.results.find((x) => x.taskCode === 'Library_read')
+    expect(item?.ok ?? false).toBe(false)
+  })
+})

@@ -398,23 +398,36 @@ function baseOf(product: BuddyProduct): string {
   return String(product.endpoint).replace(/\/+$/, '')
 }
 
-/** web 域**领奖**基址，取 `product.claimBase`。 */
+/**
+ * web 域**领奖**基址，取 `product.claimBase`。缺字段时返回 `''`（调用方须判空）。
+ *
+ * ⚠️ **不能直接 `String(product.claimBase)`**：`String(undefined)` 得到的是
+ * **字符串 `"undefined"`** 而非抛错 —— URL 会拼成
+ * `undefined/activity/growth/tasks/<code>/claim`，请求真的发出去，失败现象看起来
+ * 像服务端问题，真因（本插件缺配置）却毫无线索。这类「不崩但静默错」比崩溃更难查。
+ * （感谢 contributor 在 !62 复审中指出，原文见该 PR 讨论。）
+ */
 function claimBaseOf(product: BuddyProduct): string {
-  return String(product.claimBase).replace(/\/+$/, '')
+  const raw = typeof product.claimBase === 'string' ? product.claimBase.trim() : ''
+  return raw.replace(/\/+$/, '')
 }
 
 /**
- * web 域**遥测上报**基址，取 `product.webBase`。
+ * web 域**遥测上报**基址，取 `product.webBase`；未配置时退到 `claimBase`。
  *
  * ⚠️ 与 `claimBaseOf` **刻意分开**（见 `BuddyProduct.webBase` 的注释：领奖走
  * 产品 API 站、web 遥测走网页站，`Origin` / `Referer` 需各自独立配置）。
  * `webBase` 曾只定义不读取（死配置），此处是唯一读取点 —— 删字段前先确认这里。
  *
- * 回退：`webBase` 缺失时退到 `claimBase`（两站通常同域，且旧产品配置可能没有该字段）。
+ * 回退顺序：`webBase` → `claimBase` → `''`（两站当前同主机，但取不到时宁可返回空
+ * 让调用方报可读错误，也不要拼出 `undefined/...` 这种能发出去却指向本地缺配置的 URL）。
  */
 function webBaseOf(product: BuddyProduct): string {
   const explicit = typeof product.webBase === 'string' ? product.webBase.trim() : ''
-  return (explicit.length > 0 ? explicit : String(product.claimBase)).replace(/\/+$/, '')
+  if (explicit.length > 0) {
+    return explicit.replace(/\/+$/, '')
+  }
+  return claimBaseOf(product)
 }
 
 /** SHA-256 十六进制摘要。桌面/网页指纹的 machineId 与 sessionId 由此派生。 */
@@ -1813,7 +1826,17 @@ export async function claimGrowthTaskReward(
   fetcher: typeof fetch = fetch,
   taskCode: string,
 ): Promise<ClaimResult> {
+  // ⚠️ 必须在发请求前判空：空基址会拼出 `undefined/...` 或 `/activity/...`（相对路径），
+  // 两者都能「发出去」，失败现象却指向服务端 —— 真因是本插件缺配置。
   const claimBase = claimBaseOf(product)
+  if (claimBase.length === 0) {
+    return {
+      ok: false,
+      claimed: false,
+      credit: 0,
+      message: '领取失败：产品配置缺少 claimBase（成长中心领奖站点），请检查 product.ts',
+    }
+  }
   try {
     const response = await fetcher(
       `${claimBase}/activity/growth/tasks/${encodeURIComponent(taskCode)}/claim`,
@@ -1927,6 +1950,9 @@ async function reportWebEvent(
   // ⚠️ 用 `webBaseOf` 而非 `claimBaseOf`：本函数是 **web 遥测**（`/v2/report` +
   // 带 `Origin`/`Referer`），与领奖端点分属两站，配置项也不同。
   const webOrigin = webBaseOf(product)
+  if (webOrigin.length === 0) {
+    return { ok: false, message: 'web 事件上报失败：产品配置缺少 webBase / claimBase' }
+  }
   const now = Date.now()
   const pageUrl = `${webOrigin}/space/d/${LIBRARY_SPACE_DOC_ID}`
   const body = [{
