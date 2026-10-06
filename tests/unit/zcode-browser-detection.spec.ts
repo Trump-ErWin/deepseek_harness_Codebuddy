@@ -20,12 +20,55 @@
  * （沙箱、CI、异常环境），原本可用的 scoop chromium 就找不到了 ——
  * 实测：把 `USERPROFILE` 指到临时目录后，`findBrowserExecutable()`
  * 返回 undefined，而 `ZCODE_CHROME_PATH` 一设就好。
+ *
+ * ⚠⚠ 这条**只靠行为判据守不住**（本机实测，Windows）：`os.homedir()` 在
+ * Windows 上本身就取自 `USERPROFILE`，把实现改成读死 env 后新旧行为**逐字相同**。
+ * ⇒ 末尾的「默认家目录不回落到 `process.env.USERPROFILE`」用**源码结构判据**守。
  */
 import { afterEach, describe, expect, it } from 'vitest'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { browserCandidates, findBrowserExecutable } from '../../src/zcode-captcha.js'
+
+/** 被扫描的源码文件（本文件针对的正是它）。 */
+const sourcePath = join(
+  dirname(fileURLToPath(import.meta.url)),
+  '..',
+  '..',
+  'src',
+  'zcode-captcha.ts',
+)
+
+/**
+ * 剥掉注释，只留可执行代码。
+ *
+ * ⚠ 必须剥：本文件多处注释正是在解释「**为什么不用** `USERPROFILE`」，
+ * 不剥会把这些说明当成违规（反之，实现里新加的中文注释也一样）。
+ * 范式取自 `raccoon-client-independence.spec.ts`。
+ */
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+}
+
+/** 取某个具名函数的**函数体**（按配对大括号切，不靠正则猜边界）。 */
+function fnBody(code: string, name: string): string {
+  const start = code.indexOf(`function ${name}(`)
+  expect(start, `源码里应能找到 ${name}`).toBeGreaterThan(-1)
+  const open = code.indexOf('{', start)
+  let depth = 0
+  for (let i = open; i < code.length; i++) {
+    if (code[i] === '{') depth++
+    else if (code[i] === '}') {
+      depth--
+      if (depth === 0) return code.slice(open, i + 1)
+    }
+  }
+  throw new Error(`${name} 的函数体括号不配对`)
+}
 
 /** 临时环境变量的设置/还原。 */
 const saved: Record<string, string | undefined> = {}
@@ -234,5 +277,73 @@ describe('ZCode 浏览器探测', () => {
       expect(browserCandidates({ platform, env: injected, home: '/home/u' })
         .some((c) => c.includes('scoop'))).toBe(false)
     }
+  })
+
+  /**
+   * ★★ 默认家目录**只**来自 `homedir()`，不得读 `USERPROFILE`（PR #75 补齐）。
+   *
+   * ## 为什么必须另立一条，而不是靠上面那条
+   *
+   * 上面那条（`home` 注入口优先）只证明「**注入口**被尊重」，
+   * 证明不了「**没给注入口时**回落到 `homedir()`」——而后者才是本文件
+   * 文件头「### 2. `USERPROFILE` 不等于家目录」那条**真正要守**的性质。
+   *
+   * ## ⚠⚠ 判据为什么不能靠「改 `USERPROFILE` 再看结论」
+   *
+   * 本机（Windows）实测复刻了旧用例并对读死 env 的变异做过对照：
+   * ```
+   * 未变异：homedir() = C:\Users\Jet\AppData\Local\Temp\zcode-browser-home-KGiOeH
+   *         found = undefined（临时目录里本就没有 scoop）
+   * 变异后：homedir() = C:\Users\Jet\AppData\Local\Temp\zcode-browser-home-RP5R3e
+   *         found = undefined            ← 与未变异**逐字相同** ⇒ 用例照样全绿
+   * ```
+   * 根因：**Windows 上 `os.homedir()` 本身就取自 `USERPROFILE`** ——
+   * 两种实现算出的家目录是**同一个值**，任何基于「结论是否变化」的判据
+   * 都不可能区分它们。旧用例正是栽在这里。
+   * ⇒ 唯一可失败的做法是**结构判据**：直接扫源码，看默认表达式里有没有 `USERPROFILE`。
+   * 范式取自 `raccoon-client-independence.spec.ts` 的「不读取任何环境变量」。
+   */
+  it('★ 默认家目录不回落到 process.env.USERPROFILE（源码结构判据）', () => {
+    const source = readFileSync(sourcePath, 'utf8')
+    // 剥掉注释：文档里大量解释「为什么**不**用 USERPROFILE」，不能算成违规。
+    const code = stripComments(source)
+
+    // ⚠ 必须扫**整个**候选链构造路径，而不只是 browserCandidates 那一个赋值点：
+    // windows / mac / linux 三个分支函数都吃 `home` 参数，若某分支改成自己读
+    // `process.env.USERPROFILE`，上面那条注入口用例**照样全绿**。
+    for (const fn of ['windowsBrowserCandidates', 'macBrowserCandidates', 'linuxBrowserCandidates']) {
+      const body = fnBody(code, fn)
+      expect(body, `${fn} 不得自行读取 process.env.USERPROFILE`).not.toContain('USERPROFILE')
+      expect(body, `${fn} 不得自行读取 process.env.HOME`).not.toContain('process.env.HOME')
+    }
+
+    // 默认回落必须仍是 homedir()：注入口缺省时用它。
+    expect(code).toMatch(/const\s+home\s*=\s*input\.home\s*\?\?\s*homedir\(\)/)
+    // ⚠ 兜住「有人把 USERPROFILE 又加回 ?? 链」这种改法
+    //   （上面那条正则锚定的是完整表达式，加在后面就匹配不上而变红）。
+    expect(code, 'home 默认值不得混入 USERPROFILE').not.toMatch(
+      /const\s+home\s*=[^\n]*USERPROFILE/,
+    )
+  })
+
+  /**
+   * 上面那条的**扫描健壮性护栏**：判据依赖「扫到的是真源码」。
+   *
+   * ⚠ 同 `raccoon-client-independence.spec.ts` 的做法 —— 扫描类断言必须先证明
+   * 扫到了东西，否则「一个文件都没扫到」会让整条判据静默恒真。
+   */
+  it('★ 结构判据确实扫到了候选链实现（防止扫描失效而恒真）', () => {
+    const code = stripComments(readFileSync(sourcePath, 'utf8'))
+    // 三条分支函数 + 出口函数，缺一即说明扫描路径变了。
+    for (const fn of [
+      'windowsBrowserCandidates',
+      'macBrowserCandidates',
+      'linuxBrowserCandidates',
+      'browserCandidates',
+    ]) {
+      expect(code).toContain(`function ${fn}(`)
+    }
+    // 确认剥注释后正文仍在（否则说明 stripComments 过度，把代码也吃掉了）。
+    expect(code).toContain('join(')
   })
 })
