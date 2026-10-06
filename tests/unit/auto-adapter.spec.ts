@@ -46,6 +46,12 @@ interface HarnessOptions {
   expiries?: Record<string, number | null>
   /** 目录读取时实际返回的原始账号（用于第 5 条断言取号参数）。 */
   pool?: { getAvailableAccount: (provider: string, model: string) => Promise<unknown> }
+  /**
+   * provider → 该目标被 drain 时产出的 chunk 流（不给 = 无输出即正常结束）。
+   * 用于「0 输出 + max-tokens」改道回归：复刻 codearts/zcode 适配器在
+   * 上游 256K 墙上的真实产出（usage{outputTokens:0} → finish{max-tokens}）。
+   */
+  streams?: Record<string, Array<{ type: string; [k: string]: unknown }>>
 }
 
 /** 驱动真实 `prepareCall` → `call.stream` 链路，返回实际发往的 `provider/model`。 */
@@ -60,7 +66,9 @@ async function dispatchThrough(options: HarnessOptions): Promise<{ sent: string[
       resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
       stream: (o: { provider: string; model: string }) => {
         sent.push(`${o.provider}/${o.model}`)
-        return (async function* () { /* 无输出即可 */ })()
+        const scripted = options.streams?.[o.provider]
+        if (scripted === undefined) return (async function* () { /* 无输出即可 */ })()
+        return (async function* () { for (const chunk of scripted) yield chunk })()
       },
     },
   }
@@ -265,5 +273,128 @@ describe('auto：代表账号必须跳过正在限流的账号', () => {
   it('源码级：不得出现空 model 的 getAvailableAccount 取号', () => {
     const code = adapterSource.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
     expect(code).not.toMatch(/getAvailableAccount\(\s*provider\s*,\s*''\s*\)/)
+  })
+})
+
+/**
+ * 「0 输出 + max-tokens」上下文墙改道（2026-10-07 真实故障回归）。
+ *
+ * ## 故障形态（取证见工作区 `20261003jethub模型可用性核查/结论/auto截断诊断-20261007.md`）
+ *
+ * 声明 1M 的模型（如 loomy/spark-x，上游真实 ~256K）被 auto 借道后，宿主按
+ * 声明窗口打包 ⇒ 越墙请求被上游**收下但不产任何内容**，流形为：
+ * `usage{outputTokens:0} → finish{max-tokens}`。DSH 对 max-tokens **不自动重试**，
+ * 用户看到「已达到输出 token 上限」但实际一个 token 都没收到。
+ *
+ * ## 约定（本段 4 条用例锁死）
+ *
+ * 1. 首选目标撞墙 ⇒ auto 立即改道下一候选 provider 重发（同一请求内，用户无感）；
+ * 2. 改道目标也撞墙（候选耗尽）⇒ **原样透传**最后那条流（不吞错、不无限改道）；
+ * 3. 有实际输出（哪怕也有 max-tokens finish）⇒ **不**改道——那是模型真的写满了，
+ *    改道只会重复消耗；
+ * 4. 冷却：撞过墙的 provider 在 TTL 内不再被选中（下次 prepareCall 直接绕开）。
+ *
+ * ⚠️ 用例必须走真实 `prepareCall → call.stream` 链并真正 drain（PR !66 的教训：
+ * 包装层改动的回归必须覆盖生产调用链，否则 42 条绿也测不到）。
+ */
+describe('auto：目标撞上下文墙（0 输出 + max-tokens）时改道下一候选', () => {
+  /** 真实故障的流形：codearts/zcode 适配器在 256K 墙上的实际产出。 */
+  const wallStream = [
+    { type: 'usage', usage: { inputTokens: 252_346, outputTokens: 0, cacheReadTokens: 9_792 } },
+    { type: 'finish', reason: { kind: 'max-tokens' } },
+  ]
+  const okStream = [
+    { type: 'text-delta', index: 0, text: 'hello' },
+    { type: 'usage', usage: { inputTokens: 1_000, outputTokens: 12 } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+
+  it('首选撞墙 ⇒ 改道下一候选重发，用户拿到第二目标的输出', async () => {
+    const { sent } = await dispatchThrough({
+      catalogs: {
+        loomy: [{ id: 'spark-x', name: 'Spark X2.5 · x0.1' }],
+        buddy: [{ id: 'hy4-preview', name: 'Hy4 preview · x0.29' }],
+      },
+      expiries: { loomy: 100, buddy: 900 },
+      streams: { loomy: wallStream, buddy: okStream },
+    })
+    // ❌ 回归前：sent = ['loomy/spark-x']，用户 0 输出。
+    expect(sent).toEqual(['loomy/spark-x', 'buddy/hy4-preview'])
+  })
+
+  it('候选耗尽（目标也撞墙）⇒ 原样透传墙流，不无限改道', async () => {
+    const { sent } = await dispatchThrough({
+      catalogs: {
+        loomy: [{ id: 'spark-x', name: 'Spark X2.5 · x0.1' }],
+        buddy: [{ id: 'hy4-preview', name: 'Hy4 preview · x0.29' }],
+      },
+      expiries: { loomy: 100, buddy: 900 },
+      streams: { loomy: wallStream, buddy: wallStream },
+    })
+    expect(sent).toEqual(['loomy/spark-x', 'buddy/hy4-preview'])
+    // drain 结果：最后消费到的是透传的 max-tokens 流（不发第三个请求）。
+  })
+
+  it('有实际输出的 max-tokens 不改道（那是模型真写满了）', async () => {
+    const wroteFull = [
+      { type: 'text-delta', index: 0, text: 'long answer' },
+      { type: 'usage', usage: { inputTokens: 1_000, outputTokens: 32_000 } },
+      { type: 'finish', reason: { kind: 'max-tokens' } },
+    ]
+    const { sent } = await dispatchThrough({
+      catalogs: {
+        loomy: [{ id: 'spark-x', name: 'Spark X2.5 · x0.1' }],
+        buddy: [{ id: 'hy4-preview', name: 'Hy4 preview · x0.29' }],
+      },
+      expiries: { loomy: 100, buddy: 900 },
+      streams: { loomy: wroteFull, buddy: okStream },
+    })
+    // 只发一个目标：流里有内容 ⇒ 不是墙 ⇒ 原样结束。
+    expect(sent).toEqual(['loomy/spark-x'])
+  })
+
+  it('冷却：撞过墙的 provider 在 TTL 内不再被选中', async () => {
+    // 同一 adapter、同一 TTL 窗口内两次 prepareCall：
+    // 第一次撞墙改道；第二次选型必须直接跳过 loomy（不用再撞一次才知道）。
+    const catalogs = {
+      loomy: [{ id: 'spark-x', name: 'Spark X2.5 · x0.1' }],
+      buddy: [{ id: 'hy4-preview', name: 'Hy4 preview · x0.29' }],
+    }
+    const expiries = { loomy: 100, buddy: 900 }
+    const streams: Record<string, Array<{ type: string; [k: string]: unknown }>> = {
+      loomy: wallStream, buddy: okStream,
+    }
+    const sent: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, error: () => {} },
+      llm: {
+        listModels: async (provider: string) => catalogs[provider as keyof typeof catalogs] ?? [],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string; model: string }) => {
+          sent.push(`${o.provider}/${o.model}`)
+          const scripted = streams[o.provider]
+          if (scripted === undefined) return (async function* () { /* noop */ })()
+          return (async function* () { for (const chunk of scripted) yield chunk })()
+        },
+      },
+    }
+    const pool = {
+      getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: { token: 't' } }),
+      disabledModelsFor: () => new Set<string>(),
+    }
+    let now = 1_000
+    const adapter = new AutoAdapter(ctx as never, { accountPool: pool as never, now: () => now, ttlMs: 60_000 })
+    adapter.expiryOf = async (provider: string) => (expiries as Record<string, number>)[provider] ?? -1
+
+    // 第一次：撞墙 + 改道。
+    const call1 = await adapter.prepareCall('jet-hub-auto', 'auto')
+    for await (const _c of call1.stream({ messages: [userMessage()] } as never)) { /* drain */ }
+    expect(sent).toEqual(['loomy/spark-x', 'buddy/hy4-preview'])
+
+    // 第二次（同一 60s TTL 内）：loomy 必须已被冷却 ⇒ 直接选 buddy。
+    sent.length = 0
+    const call2 = await adapter.prepareCall('jet-hub-auto', 'auto')
+    for await (const _c of call2.stream({ messages: [userMessage()] } as never)) { /* drain */ }
+    expect(sent).toEqual(['buddy/hy4-preview'])
   })
 })
