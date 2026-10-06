@@ -6,7 +6,7 @@
  * 一次「一键领取」6 个账号，5 个走通、只有 1 个被上游风控拦截：
  *
  * ```
- * ZCode dbujns@chatai.dpdns.org：失败 — zcode-v3-start-plan-trust-1005:
+ * ZCode <账号已脱敏>：失败 — zcode-v3-start-plan-trust-1005:
  * request has been blocked due to unusual activity.
  * ```
  *

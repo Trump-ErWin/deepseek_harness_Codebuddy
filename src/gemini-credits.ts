@@ -10,8 +10,8 @@
  *
  * ## ⚠️ 请求体**必须带 `project`**（2026-10-03 修正）
  *
- * 原版（`quota.go:25`）发的是空对象 `{}`，那是**单账号**抓包的结论。实测第二个
- * Google 账号（`yinghaolin521@gmail.com`）用 `{}` 会被拒：
+ * 原版（`quota.go:25`）发的是空对象 `{}`，那是**单账号**抓包的结论。实测**另一个**
+ * Google 账号（账号已脱敏）用 `{}` 会被拒：
  *
  * ```
  * 403 PERMISSION_DENIED  SUBSCRIPTION_REQUIRED (#3501)
