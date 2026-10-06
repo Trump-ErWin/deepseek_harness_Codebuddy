@@ -601,7 +601,7 @@ describe('RaccoonAdapter 请求级账号轮换（余额耗尽无感切号）', (
   })
 
   it('★ 两号都耗尽 → 报「所有账号均不可用」并带最后一次的真实原因', async () => {
-    const { pool } = makePoolStub()
+    const { pool, marks } = makePoolStub()
     const fetcher = vi.fn(async (_url: string, init: RequestInit) => {
       const auth = String(new Headers(init.headers).get('Authorization') ?? '')
       return new Response(
@@ -615,6 +615,7 @@ describe('RaccoonAdapter 请求级账号轮换（余额耗尽无感切号）', (
     expect(error).toBeInstanceOf(Error)
     expect((error as Error).message).toContain('所有账号')
     expect((error as Error).message).toContain('B') // 最后一次的真实原因，不是笼统的"均受限"
+    expect(marks.map((mark) => mark.accountId)).toEqual(['raccoon-A', 'raccoon-B'])
   })
 
   it('非额度类错误（400 参数错）不换号 —— 换号无益，按原错误抛', async () => {
