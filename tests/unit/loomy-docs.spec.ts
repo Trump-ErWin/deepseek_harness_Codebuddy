@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
@@ -26,6 +26,20 @@ const hasLocalNotes = existsSync(LOCAL_NOTES)
 describe('Loomy 文档覆盖', () => {
   const readme = read('../../README.md')
   const agents = read('../../AGENTS.md')
+  /**
+   * 文档面 = 主 AGENTS.md + docs/agent-notes/*.md 的**合并视图**（2026-10-06 拆分）。
+   *
+   * AGENTS.md 因注入预算（65,536 B，超出部分每轮被截断永不可见）已把逐 provider
+   * 的事故史搬到 `docs/agent-notes/`——内容逐字节原样，只是换了落点。文档回归
+   * 测试要守护的是「这些约定**在某处成文**」，故断言打在合并视图上；否则拆分
+   * 会让 6 条守约用例变红，而那不是文档缺约定，是测试追着旧落点打。
+   */
+  const agentsFull = [
+    agents,
+    ...readdirSync(resolve(here, '../../docs/agent-notes'))
+      .filter((f) => f.endsWith('.md'))
+      .map((f) => read(`../../docs/agent-notes/${f}`)),
+  ].join('\n')
 
   it('README 提到 Loomy provider', () => {
     expect(readme).toMatch(/[Ll]oomy/)
@@ -91,9 +105,13 @@ describe('Loomy 文档覆盖', () => {
       return next?.index === undefined ? rest : rest.slice(0, next.index)
     }
     const readmeLoomy = loomySectionOf(readme)
-    const agentsLoomy = loomySectionOf(agents)
+    // ⚠️ 拆分后 Loomy 的章节整体在 agent-notes（providers-loomy-raccoon-minimax.md），
+    //    主 AGENTS.md 只剩指针——所以禁用词扫描打在**该笔记文件的 Loomy 章节**上
+    //    （不能打 agentsFull 合并视图：其它笔记合法提到 app.asar 会误报）。
+    const loomyNotes = read('../../docs/agent-notes/providers-loomy-raccoon-minimax.md')
+    const agentsLoomy = loomySectionOf(loomyNotes)
     expect(readmeLoomy.length, 'README 未找到 Loomy 章节').toBeGreaterThan(0)
-    expect(agentsLoomy.length, 'AGENTS.md 未找到 Loomy 章节').toBeGreaterThan(0)
+    expect(agentsLoomy.length, 'agent-notes 未找到 Loomy 章节').toBeGreaterThan(0)
 
     const forbidden: [string, RegExp][] = [
       ['脚本清单', /scripts\/loomy/],
@@ -126,21 +144,21 @@ describe('Loomy 文档覆盖', () => {
   })
 
   it('AGENTS.md 记录 Loomy 的协议要点', () => {
-    expect(agents).toMatch(/[Ll]oomy/)
+    expect(agentsFull).toMatch(/[Ll]oomy/)
     // 新手任务是纯 API 直领（与 workbuddy 的模拟真实行为相反）
-    expect(agents).toMatch(/新手任务/)
+    expect(agentsFull).toMatch(/新手任务/)
   })
 
   it('AGENTS.md 写明两套头与不可续期', () => {
-    expect(agents).toMatch(/两套认证头|两套头/)
+    expect(agentsFull).toMatch(/两套认证头|两套头/)
     // 措辞可能微调，只要求「isLoomyRefreshable」与「false」同段出现
-    expect(agents).toMatch(/isLoomyRefreshable[\s\S]{0,80}?false/)
-    expect(agents).toMatch(/没有 refresh 端点/)
+    expect(agentsFull).toMatch(/isLoomyRefreshable[\s\S]{0,80}?false/)
+    expect(agentsFull).toMatch(/没有 refresh 端点/)
   })
 
   it('AGENTS.md 记录位置参数陷阱（避免下次再加 provider 时重犯）', () => {
-    expect(agents).toMatch(/位置参数/)
-    expect(agents).toContain('registerJetHubRpc')
+    expect(agentsFull).toMatch(/位置参数/)
+    expect(agentsFull).toContain('registerJetHubRpc')
   })
 
   it('AGENTS.md 概述行的 provider 数量与它自己列出的 id 一致', () => {
@@ -149,7 +167,7 @@ describe('Loomy 文档覆盖', () => {
     // 改成自校验：数出概述行里反引号包裹的 provider id 个数，与句中声称的
     // 中文数量词比对。这样它既能抓住「改了列表忘了改数字」，也能抓住
     // 「改了数字忘了改列表」，且新增 provider 时**无需修改本用例**。
-    const line = agents.split('\n').find((l) => l.includes('LLM provider 路由'))
+    const line = agentsFull.split('\n').find((l) => l.includes('LLM provider 路由'))
     expect(line, '找不到 AGENTS.md 的 provider 概述行').toBeDefined()
     const ids = [...line!.matchAll(/`([a-z]+)`（/g)].map((m) => m[1])
     expect(ids.length, '概述行列出的 provider id 数量异常').toBeGreaterThan(0)
@@ -183,13 +201,13 @@ describe('Loomy 文档覆盖', () => {
   })
 
   it('AGENTS.md 写明「Loomy 不会因积分耗尽报错」与三条不可改的约定', () => {
-    expect(agents).toMatch(/静默降级/)
-    expect(agents).toMatch(/getAvailableAccount/)
+    expect(agentsFull).toMatch(/静默降级/)
+    expect(agentsFull).toMatch(/getAvailableAccount/)
     // 档内保序 / 查询失败归最后一档 / 先过滤再分档
-    expect(agents).toMatch(/档内保持手动拖拽顺序/)
-    expect(agents).toMatch(/查询失败归最后一档/)
-    expect(agents).toMatch(/未停用 \+ 该模型未受限/)
+    expect(agentsFull).toMatch(/档内保持手动拖拽顺序/)
+    expect(agentsFull).toMatch(/查询失败归最后一档/)
+    expect(agentsFull).toMatch(/未停用 \+ 该模型未受限/)
     // modelId 必须透传（原实现疏漏）
-    expect(agents).toMatch(/modelId/)
+    expect(agentsFull).toMatch(/modelId/)
   })
 })
