@@ -1022,4 +1022,89 @@ for 循环，用例仍全绿）。「只解析一次」只能锁**源码结构**
 ⚠ **issue 附注的「web 版 3007 不重试」维持现状**（不是遗漏）：`source === 'chromium'`
 本身就说明**载体链本轮没参与**（web 版拿不到 `dshDesktop.browser` ⇒ `supplied` 恒 0，
 或 env 关了）⇒ **没有第二条链可换**；且重试只白扣同设备每小时 150 次配额，
-面对同一个服务端判定期望收益极低。修好 region 后 chromium 侧残留的 `3007` 都是时效/信誉性质。
+面对同一个服务端判定期限期望收益极低。修好 region 后 chromium 侧残留的 `3007` 都是时效/信誉性质。
+
+## ⚠️⚠️ 冷启动切号空转：代价是**硬失败**（不是「慢一发」），且 `tried` 有**三重冗余**（2026-10-06）
+
+**用户报障**：「用完余额一个号就自动卡死了，不会切下一个号。」
+
+### 一、根因与修法（`src/zcode-adapter.ts` 的 `streamScoped`）
+
+`currentAccountId()` 读的是 `index.ts` 的 `activeZcodeAccountId` 那个 Map，
+而它**只在 `resolveCredential` 内部被写入**。原先顺序是反的：
+
+```ts
+let activeAccountId = this.options.currentAccountId?.()      // ← 先读（冷启动时是空的）
+let credential = await this.resolveCredentialOrThrow(options) // ← 后写
+```
+
+⇒ `activeAccountId === undefined` ⇒ `switchAccountOnQuota()` 的守卫整段跳过
+（**既不标记、也不放进 `tried`**）⇒ 池按手动顺序返回的第一个候选正是刚失败的那个
+⇒ 这次「切号」切回同一账号、同一份凭据，白发一发。
+**修法：取凭据移到读 id 之前**，让两者指向同一账号。
+
+### 二、⚠ 代价是**硬失败**，别再说成「空转一发」（复审实测，2026-10-06）
+
+受 `quotaSwitchMax === 2` 限制，一次请求最多 3 发。「空转」那一发把切号预算吃掉一格：
+
+| 池 | 修复前 | 修复后 |
+|---|---|---|
+| 2 账号（A 用尽、B 可用） | `[A, A, B]` **成功** | `[A, B]` 成功 |
+| **3 账号（A、B 用尽、C 可用）** | **`[A, A, B]` ⇒ 抛 `QUOTA_EXCEEDED`，C 从未被尝试** | `[A, B, C]` 成功 |
+
+⇒ **池里最后一个账号永远够不着**，用户看到「所有号都用完了」而那个号还有额度。
+报障措辞「卡死」是**准确的** —— 把它降级描述成「慢一发」会让人低估修复价值。
+
+⚠ **回归必须用 ≥3 账号池**：2 账号池下缺陷版也能成功（`[A,A,B]`），
+**复现不出用户症状**。`tests/unit/zcode-rotation-coldstart.spec.ts` 第 1 条就是它，别改成 2 账号池。
+
+### 三、⚠ `tried` 与限流标记是**三重冗余**，行为测试锁不住「谁负责排除」
+
+排除刚失败的账号有三道防线：① `streamScoped` 顶部的 `tried.add`；
+② `switchAccountOnQuota` 内部同一个 add；③ 写进池的 `modelRateLimits`
+（`getAvailableAccount` 自己会过滤）。
+
+⇒ **单点删除任一处，行为断言仍然全绿**（2026-10-06 复审实测：删 ① 绿、删 ② 绿、
+删两处才红）。这不是缺陷而是 defense-in-depth，但它意味着**行为测试对接线零区分能力**。
+故该 spec 第 4 条直接断言**契约**：首次切号传给池的 `tried` 必须含失败账号
+（删两处 ⇒ 变空）、且必须写下该模型的限流标记（删写入 ⇒ `marks` 为空）。
+⚠ 实测口径：删**两处** `tried.add` 时第 4 条变红而第 1~3 条仍绿；
+删标记写入时第 4 条同样变红。
+
+### 四、⚠ 兜底路径（`zcode.current()`）**不是**缺陷 —— 别「顺手修」
+
+池被筛空时落 `index.ts` 的 `zcode.current()` 兜底（它不看 `enabled`/限流，照样返回凭据），
+此时 `activeAccountId === undefined` ⇒ 守卫跳过 ⇒ **不标记任何账号**。
+
+复审用 5 条独立探针实测后判定：**这是对的，不是漏修**。
+`getAvailableAccount` 本身就按 `enabled` + `modelRateLimits` 过滤，
+**能走到兜底就意味着已无「enabled 且未限流」的账号可切** —— 标记谁都不会让它被选中，
+只会写一条永远不起作用的记录。正确行为是「只发 1 发、不写无效标记、如实报 `QUOTA_EXCEEDED`」，
+spec 第 5 条把它钉住（防止将来有人「顺手补上标记」）。
+
+### 五、⚠⚠ 教训：**「未经证实的修复」不得随同真修复夹带合入**
+
+同批还有一个「边缘拦截页归不可重试」的改动，声称「48 小时实测 127 次」。
+复审解压全部 577 个会话日志复核：**405+HTML 命中 100% 来自该 PR 自己的 diff 与测试代码**，
+排除后真实会话里为 **0 处**；注释声称「与 `probe-jethub-models.mjs` 同口径」，
+而该文件**在整个 git 历史中不存在**。
+
+而它引入的是**真实可用性回归**（master vs 该改动）：
+
+| 响应 | master | 该改动 |
+|---|---|---|
+| 502 nginx 页 `<html>…502 Bad Gateway…` | `SERVER`（可重试） | **`PERMISSION`** |
+| **504 阿里云 ALB 页（2026-09-29 真实 zcode 响应）** | `SERVER` | **`PERMISSION`** |
+| 429 被 CDN 包成 HTML（本仓库 `account-pool.ts` 自己记过的形态） | `RATE_LIMIT` | **`PERMISSION`** |
+
+`PERMISSION` **不在** `DEFAULT_RETRYABLE_CODES`（`[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`）
+⇒ 标准可重试的瞬态网关错误被降为不可重试。且该 PR 的描述**明确承诺「只含冷启动修复」**，
+diff 里却带着这一整段 ⇒ 维护者按描述复审会放行一段未复审的改动。**已整体剔除。**
+
+两条可复用的审查规则：
+1. **「N 次实测」必须能定位到一手响应**；若统计口径命中的是**判据自己的字面量**
+   （如 `data-spm` 出现在 diff/测试文本里），那是自我指涉的循环论证，不构成证据。
+2. **凡新增「不可重试」判据，必须逐个验证既有可重试形态不被吞掉** ——
+   只拿纯文本样本断言「普通 5xx 仍可重试」（`'service unavailable'`）会**恰好绕开 HTML 形态**，
+   给出假保证。要拿 nginx/ALB 的**真实 HTML 页**当样本。
+
