@@ -26,13 +26,17 @@
  * 2. **错误码不可重试**：边缘页归 `PERMISSION`（与 `3012` 同档），
  *    **不能**落到 `SERVER` —— 后者在 harness 的可重试集合里 ⇒
  *    用户白等 5 轮退避（约 15.5 秒）而边缘规则不会因退避改变。
+ * 3. **人话文案**：`describeUpstreamError` 对边缘页给出可行动的三句话
+ *    （边缘层拦截 / 不是账号问题 / 换模型或等上游），**不倒整页 HTML**，
+ *    证据窗截 80 字符；业务码与凭据文案仍优先于形态判据。
  *
  * ⚠ 反向验证：删掉 `httpErrorCodeForZcode` 里那行 `isZcodeEdgeBlockedPage` 判定 ⇒
- * 第 2 条变红（405 HTML 落回 `SERVER`）。
+ * 第 2 条变红（405 HTML 落回 `SERVER`）；删掉 `describeUpstreamError` 里的
+ * 人话文案块 ⇒ 第 3 条变红（落到 `HTTP ${status}：…` 兜底行）。
  */
 import { describe, expect, it } from 'vitest'
 
-import { httpErrorCodeForZcode, isZcodeEdgeBlockedPage } from '../../src/zcode-adapter.js'
+import { describeUpstreamError, httpErrorCodeForZcode, isZcodeEdgeBlockedPage } from '../../src/zcode-adapter.js'
 
 /** 实测样本（阿里云 ESA 405 页，截取自真实响应）。 */
 const REAL_EDGE_405 =
@@ -87,5 +91,30 @@ describe('ZCode 边缘拦截页判据', () => {
     expect(httpErrorCodeForZcode(503, 'service unavailable')).toBe('SERVER')
     expect(httpErrorCodeForZcode(400, 'bad request')).toBe('INVALID_REQUEST')
     expect(httpErrorCodeForZcode(429, 'slow down')).toBe('RATE_LIMIT')
+  })
+})
+
+describe('describeUpstreamError 对边缘页给可读文案', () => {
+  it('★ 真实 ESA 405 页必须翻成人话，不得倒原始 HTML（用户报障现场，2026-10-06）', () => {
+    const text = describeUpstreamError(405, REAL_EDGE_405)
+    // 说清三件事：是边缘层、不是账号/额度问题、该做什么。
+    expect(text).toContain('边缘')
+    expect(text).toContain('405')
+    expect(text).toMatch(/没有到达业务层|未到达业务层/)
+    expect(text).toMatch(/不是账号|无关/)
+    // 🔴 修复前这里返回 `HTTP 405：<!doctypehtml>…` 整页 HTML —— 用户看到的乱码。
+    // 证据窗只截 80 字符 ⇒ 页面深处的 `<style>` / `data-spm`（>80 字符处）不得出现。
+    expect(text).not.toContain('<style')
+    expect(text).not.toContain('data-spm')
+    // 仍保留一小段原始响应作证据（可复核），但必须截断。
+    expect(text).toContain('原始响应')
+    expect(text.length).toBeLessThan(400)
+  })
+
+  it('★ 业务码仍优先于边缘文案（码与形态同现时按码报，与映射函数同序）', () => {
+    expect(describeUpstreamError(405, '{"code":3012,"msg":"blocked"}')).toContain('风控')
+    expect(describeUpstreamError(405, '{"code":1005,"msg":"exceed quota limit"}')).toContain('额度用尽')
+    // 非 JSON 的普通错误体（不是边缘页）不受影响。
+    expect(describeUpstreamError(500, 'upstream exploded')).toContain('500')
   })
 })
