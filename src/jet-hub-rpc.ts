@@ -105,6 +105,85 @@ import {
   type CreditBalance,
 } from './credits.js'
 import { CODEBUDDY, WORKBUDDY, productById, type BuddyProduct } from './product.js'
+import { runGrowthTaskCompletions } from './buddy-growth.js'
+
+/**
+ * 有成长中心任务可做的 provider。
+ *
+ * 成长任务端点只在腾讯系产品上存在（`buddy` / `workbuddy`）。列成显式白名单而不是
+ * 「凡 BuddyProduct 都行」，是为了让 `buddy.growthTasks` 对 zcode 之类**不读
+ * BuddyProduct** 的渠道也不成立 —— 否则直接调用会对每个账号白发一轮串行请求。
+ * 客户端的能力表（`credits-capabilities.js`）是是否渲染按钮的权威，本表是服务端
+ * 的第二道守卫。
+ */
+const GROWTH_CAPABLE_PROVIDERS: ReadonlySet<string> = new Set([CODEBUDDY.id, WORKBUDDY.id])
+
+/**
+ * 整轮成长任务的时间预算缺省值（毫秒）。
+ *
+ * 上界由**账号数 × 逐账号预算**决定（后者缺省 10 分钟），账号多时线性增长。
+ * 30 分钟约覆盖 3 个账号从容跑完；超出即如实停住并报出未跑的账号，而不是撞上
+ * 宿主 RPC 的超时（该上界由 dsh 侧决定，本插件不可见也不可控）。
+ */
+const DEFAULT_ROUND_BUDGET_MS = 30 * 60 * 1000
+/**
+ * 单账号的成长中心任务执行，转成 RPC 明细。
+ *
+ * 僵尸账号（凭据被外部删除 ⇒ 上游回 401/403）归 `error` 提示但**不计入 failed**：
+ * 它的处置是「重新登录」，与「任务真的推不动」完全不同。签到侧已把这类账号归
+ * `inactive`（`collectClaimResults` 的 `凭据未配置` 分支同义），成长侧须一致 ——
+ * 否则同一个僵尸条目在两处会给出互相矛盾的判定。
+ *
+ * @param budgetMs 透传给 `runGrowthTaskCompletions`；`undefined` 由其取缺省 10 分钟。
+ */
+export async function collectBuddyGrowth(
+  credential: BuddyCredential,
+  product: BuddyProduct,
+  entry: ProviderAccountEntry,
+  budgetMs: number | undefined,
+  roundDeadlineAt: number | undefined,
+): Promise<RpcBuddyGrowthAccountResult> {
+  // 整轮预算已耗尽 ⇒ 该账号**不再发起任何成长请求**。
+  //
+  // ⚠️ 签到侧已经跑完（afterClaim 在 claim 之后调用），所以这里返回的只是成长
+  // 明细，不影响该账号的签到判定。逐项标 `failed` 会让整条提示染黄，而这不是
+  // 任何账号的过错 —— 故用 `ok:true` + `error` 说明「本轮没轮到它」。
+  if (roundDeadlineAt !== undefined && Date.now() >= roundDeadlineAt) {
+    return {
+      accountId: entry.id, nickname: entry.nickname,
+      ok: true, completed: 0, clientOnly: 0, failed: 0,
+      claimedCount: 0, claimedCredit: 0, timedOut: true, tasks: [],
+      error: '本轮时间预算已用尽，未执行成长任务（再点一次即可继续）',
+    }
+  }
+  let report: Awaited<ReturnType<typeof runGrowthTaskCompletions>>
+  try {
+    report = await runGrowthTaskCompletions(credential, product, fetch, { budgetMs })
+  } catch (error) {
+    return {
+      accountId: entry.id, nickname: entry.nickname,
+      ok: false, completed: 0, clientOnly: 0, failed: 0,
+      claimedCount: 0, claimedCredit: 0, timedOut: false, tasks: [],
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+  // 凭据失效的判据：逐项 message 里出现「凭据已失效」。它与「任务失败」是
+  // 两回事 —— 前者要重新登录，后者是判据推不动。
+  const expired = report.results.some((r) => /凭据已失效/.test(r.message))
+  return {
+    accountId: entry.id, nickname: entry.nickname,
+    // 僵尸账号视作「无需再管」，不把整条提示染成失败。
+    ok: report.ok || expired,
+    completed: report.completed,
+    clientOnly: report.clientOnly,
+    failed: expired ? 0 : report.failed,
+    claimedCount: report.claimedCount,
+    claimedCredit: report.claimedCredit,
+    timedOut: report.timedOut,
+    tasks: report.results,
+    ...(expired ? { error: '凭据已失效，请在 Jet Hub 重新登录该账号' } : {}),
+  }
+}
 import {
   captchaDemand,
   putSuppliedParam,
@@ -165,6 +244,9 @@ import type {
   RpcCreditsStatusResponse,
   RpcCreditsClaimAllRequest,
   RpcCreditsClaimAllResponse,
+  RpcBuddyGrowthTasksRequest,
+  RpcBuddyGrowthAccountResult,
+  RpcBuddyGrowthTasksResponse,
   RpcCreditsClaimSummary,
   RpcCreditsBalancesRequest,
   RpcCreditsBalanceExtra,
@@ -519,6 +601,32 @@ export interface CreditsEndpointDeps<
   fetchStatus?: (credential: TCredential, product: TProduct) => Promise<CheckinStatus | null>
   /** 执行签到领取；默认使用真实的 claimDailyCheckin。 */
   claim?: (credential: TCredential, product: TProduct, entry: ProviderAccountEntry) => Promise<ClaimOutcome>
+  /**
+   * 领取之后的下钻钩子，返回值原样带进 {@link RpcCreditsClaimAllResponse} 的
+   * `growth` 字段。
+   *
+   * 存在的理由：成长中心任务与签到**共用同一趟逐账号循环**才能避免把凭据解析
+   * 做两遍（凭据可能被外部删除，解析两次会得到两次不同的失败路径）。而它又
+   * **不能**混进 `claim` 本身 —— `claim` 的返回类型是 `ClaimOutcome`，装不下
+   * 22 项任务的逐项判据。
+   *
+   * 只有 buddy / workbuddy 注入；其余 provider 不传，行为逐字不变。
+   */
+  afterClaim?: (
+    credential: TCredential,
+    product: TProduct,
+    entry: ProviderAccountEntry,
+    outcome: ClaimOutcome,
+    /**
+     * 整轮共享的截止时刻（`Date.now()` 口径），或 `undefined` 表示不限时。
+     *
+     * ⚠️ 逐账号预算是**每账号**上限，N 个账号会线性累加；宿主 RPC 的超时上界
+     * 由 dsh 侧决定，本插件不可见也不可控。故另给一个整轮预算，让「账号很多」
+     * 时也能**如实停住并报出哪些账号没跑**，而不是撞上宿主超时后前端只看到一个
+     * 无来由的失败。
+     */
+    roundDeadlineAt: number | undefined,
+  ) => Promise<RpcBuddyGrowthAccountResult | undefined>
   /** 查询积分余额；默认使用真实的 fetchCreditBalance。 */
   fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
   /**
@@ -534,6 +642,13 @@ export interface CreditsEndpointDeps<
     credential: TCredential,
     product: TProduct,
   ) => Promise<{ balance: CreditBalance | null; error?: string; extra?: RpcCreditsBalanceExtra }>
+  /**
+   * 整轮（全部账号）的时间预算（毫秒）。缺省 30 分钟。
+   *
+   * 与逐账号的 `budgetMs`（`afterClaim` 内透传）是**两个独立闸门**：前者管
+   * 「账号很多」，后者管「单个账号卡住」。传0 或负数表示不限时。
+   */
+  roundBudgetMs?: number
   /** 单账号异常时的告警出口（不参与控制流）。 */
   warn?: (message: string) => void
   /**
@@ -658,6 +773,14 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
   const precheck = deps.precheckStatus !== false
   const results: RpcCreditsClaimAllResponse['results'] = []
   const outcomes: ClaimOutcome[] = []
+  /** 仅在 deps.afterClaim 存在时非空；见该钩子的说明。 */
+  const growth: RpcBuddyGrowthAccountResult[] = []
+  // 整轮共享截止时刻。0 / 负数 / 非有限值一律视为不限时（本地排障用）。
+  const rawRound = deps.roundBudgetMs === undefined
+    ? DEFAULT_ROUND_BUDGET_MS
+    : Number(deps.roundBudgetMs)
+  const roundBudgetMs = Number.isFinite(rawRound) ? rawRound : 0
+  const roundDeadlineAt = roundBudgetMs > 0 ? Date.now() + roundBudgetMs : undefined
   for (const entry of accounts) {
     let outcome: ClaimOutcome
     try {
@@ -692,8 +815,30 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
     }
     outcomes.push(outcome)
     results.push({ accountId: entry.id, nickname: entry.nickname, outcome })
+    // 成长中心等「领取之后」的下钻：与签到共用这一趟循环，避免把凭据解析做两遍。
+    // 它的异常只让该项自己失败，不影响已定稿的签到 outcome。
+    if (deps.afterClaim !== undefined) {
+      try {
+        const resolvedForGrowth = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolvedForGrowth !== undefined) {
+          const credentialForGrowth = JSON.parse(resolvedForGrowth.value) as TCredential
+          const extra = await deps.afterClaim(
+            credentialForGrowth, product, entry, outcome, roundDeadlineAt,
+          )
+          if (extra !== undefined) {
+            growth.push(extra)
+          }
+        }
+      } catch (error) {
+        deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 成长任务失败: ${String(error)}`)
+      }
+    }
   }
-  return { results, summary: computeClaimSummary(outcomes) }
+  return {
+    results,
+    summary: computeClaimSummary(outcomes),
+    ...(growth.length > 0 ? { growth } : {}),
+  }
 }
 
 /**
@@ -2886,9 +3031,24 @@ function registerJetHubEndpoints(
         if (product === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
+        // 成长中心任务：与签到**共用这一趟逐账号循环**（见 CreditsEndpointDeps
+        // .afterClaim），故凭据只解析一遍。
+        //
+        // ⚠️ `runTasks` 缺省为 false：这条路径同时是「每日首次启动自动签到」的
+        // 执行体（见上方 createAutoCheckin 的 claim 回调），而成长一轮单账号实测
+        // 90～270s、全串行、任务间 1.5s 节流。默认开启等于每次启动自动打几十个
+        // 上游请求。只有用户手点「一键领取积分」时才传 true。
         const value = await collectClaimResults(accounts, product, {
           resolve: (ref) => ctx.credentials.resolve(ref),
           warn: (msg) => ctx.logger?.warn?.(msg),
+          ...(req.runTasks === true && GROWTH_CAPABLE_PROVIDERS.has(req.provider)
+            ? {
+                afterClaim: (credential, growthProduct, entry, _outcome, roundDeadlineAt) =>
+                  collectBuddyGrowth(
+                    credential, growthProduct, entry, req.budgetMs, roundDeadlineAt,
+                  ),
+              }
+            : {}),
         })
         return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
       }
