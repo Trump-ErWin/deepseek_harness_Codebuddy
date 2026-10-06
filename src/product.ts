@@ -404,22 +404,28 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
  * 该产品**没有**每日签到积分接口（内核中只有 `/v2/billing/meter/get-dosage-notify`），
  * 因此 Jet Hub 不为其渲染「一键领取积分」按钮；积分领取在 CodeBuddy 侧完成。
  *
- * ⚠️ 上面那句「不渲染按钮」直接决定了下面的 `claimBase` / `webBase` **当前不可达**：
- * 成长任务入口是同一个按钮（客户端 `supportsCredits = supportsDailyCheckin(provider)`
- * 为门控，`workbuddy` 在能力表里 `dailyCheckin: false`），按钮不渲染 ⇒
- * `credits.claimAll({ runTasks: true })` 永远传不进来。故这两个字段填的是
- * 「同一产品线的网页站」推断值，**国际版未实测**（中国版 `www.workbuddy.cn` 已实测可达）。
- * 若将来给 workbuddy 开放签到按钮，必须先用真实账号验证 `www.workbuddy.ai` 上
- * `/activity/growth/tasks/<code>/claim` 与 `/v2/report` 的行为，再放开。
+ * ⚠️ 下面的 `claimBase` / `webBase` 是**占位值**（为满足 `BuddyProduct` 的必填形状），
+ * 本产品**没有任何代码路径会读取它们** —— 原因有两层：
+ *
+ * 1. 成长任务的唯一入口是「一键领取积分」按钮，而该按钮由
+ *    `supportsCredits = supportsDailyCheckin(provider)` 门控，`workbuddy` 在能力表里
+ *    登记为 `dailyCheckin: false` ⇒ 按钮不渲染 ⇒ `runTasks: true` 传不进来；
+ * 2. **更根本的是**：contributor 在 !62 复审中实测确认 `www.workbuddy.ai` 后端
+ *    **根本没有成长中心**（无任务列表、无 claim 端点）。故这不是「等将来开放」，
+ *    而是「该产品没有这个功能」。`GROWTH_CAPABLE_PROVIDERS` 与客户端的
+ *    `GROWTH_TASK_PROVIDERS` 都已据此**移除** `workbuddy`。
+ *
+ * 两个字段保留是因为 `BuddyProduct` 把它们声明为必填；若将来类型放宽为可选，
+ * 这里可以删掉（`claimBaseOf` / `webBaseOf` 已能正确处理空值并给出可读错误）。
  */
 export const WORKBUDDY: BuddyProduct = {
   id: 'workbuddy',
   platform: 'workbuddy-ai',
   endpoint: 'https://www.workbuddy.ai',
   apiDomain: 'www.workbuddy.ai',
-  /** ⚠️ 未实测：见上方注释（该路径当前不可达）。 */
+  /** ⚠️ 占位值：本产品无成长中心，无任何读取点（见上方注释）。 */
   claimBase: 'https://www.workbuddy.ai',
-  /** ⚠️ 未实测：见上方注释（该路径当前不可达）。 */
+  /** ⚠️ 占位值：本产品无成长中心，无任何读取点（见上方注释）。 */
   webBase: 'https://www.workbuddy.ai',
   displayName: 'WorkBuddy (国际版)',
   productCode: 'workbuddy',

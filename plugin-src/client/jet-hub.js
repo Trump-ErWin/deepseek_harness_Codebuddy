@@ -401,16 +401,18 @@ export function providerLabel(id) {
  */
 
 /**
- * 有成长中心任务可做的 provider。
+ * 有成长中心任务可做的 provider —— **只有 buddy（CodeBuddy 中国版）**。
  *
  * 与宿主 `src/jet-hub-rpc.ts` 的 `GROWTH_CAPABLE_PROVIDERS` 是**同一份清单**
  * （两处都要改）—— 客户端决定是否传 `runTasks`，宿主决定是否受理；只改一处会
  * 出现「传了但被挡回」或反之。
  *
- * 成长任务端点只在腾讯系产品上存在：buddy（中国区，成长中心为 web 域）
- * 与 workbuddy（国际版）。
+ * ⚠️ `workbuddy`（国际版）**不在**清单里：contributor 在 !62 复审中实测确认
+ * `www.workbuddy.ai` 后端**根本没有成长中心**（无任务列表、无 claim 端点）。
+ * 原先按「同源产品、将来可能开放」保留，但既然该产品没有这个功能，
+ * 留着就是等一个不会到来的能力。
  */
-const GROWTH_TASK_PROVIDERS = new Set(['buddy', 'workbuddy']);
+const GROWTH_TASK_PROVIDERS = new Set(['buddy']);
 
 function ProviderLogo({ provider }) {
   const p = PROVIDERS.find(p => p.id === provider);
