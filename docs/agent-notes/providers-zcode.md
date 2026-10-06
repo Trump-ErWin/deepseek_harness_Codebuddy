@@ -1108,3 +1108,50 @@ diff 里却带着这一整段 ⇒ 维护者按描述复审会放行一段未复�
    只拿纯文本样本断言「普通 5xx 仍可重试」（`'service unavailable'`）会**恰好绕开 HTML 形态**，
    给出假保证。要拿 nginx/ALB 的**真实 HTML 页**当样本。
 
+### 六、⚠⚠ 浏览器候选链：Windows 上 `homedir()` **恒等于** `USERPROFILE` ⇒ 行为判据不可用（PR #75，2026-10-06）
+
+第三方（@Ghandi）提交 PR #75，指出「探测跟随 `os.homedir()`」那条用例
+（`tests/unit/zcode-browser-detection.spec.ts`）**恒真**。本机复核后**结论要分两半**：
+
+**✅ 成立的一半**：原用例**确实守不住目标**，但**根因与 PR 作者所述不同**，
+且在 **Windows 上同样恒真**（他只验了 macOS）。原用例靠
+`setEnv('USERPROFILE', dir)` 造家目录变化，而本机实测：
+
+```
+未变异：homedir() = C:\Users\Jet\AppData\Local\Temp\zcode-browser-home-KGiOeH  found = undefined
+变异后：homedir() = C:\Users\Jet\AppData\Local\Temp\zcode-browser-home-RP5R3e  found = undefined
+                                          ← 逐字相同 ⇒ 用例照样全绿
+```
+
+根因：**Windows 上 `os.homedir()` 本身就取自 `USERPROFILE`** ——
+「读 `homedir()`」与「读死 `USERPROFILE`」算出**同一个值**，
+任何基于「结论是否变化」的判据都**不可能**区分二者。
+⇒ **别再用「改 env 看结论」判这一条**，跨平台都不可行。
+
+**⚠️ 不成立的一半**：PR #75 把该用例改判「`home` 注入口被尊重」
+（纯函数 + 钉平台 + `realHomeScoop()` 反向判据）。那条**本身是有效的**
+（变异 `const home = homedir()` 确实变红，已复核），但它守的是
+**另一个更弱的性质** —— 「注入口被尊重」**推不出**「没给注入口时回落到 `homedir()`」。
+⇒ **PR 合入后，那条本文件头声称要守的性质一度完全无人看守**：
+实测把实现改成 `input.home ?? process.env.USERPROFILE ?? homedir()`，
+`zcode-browser-*.spec.ts` **43 条全绿**、全量 **6060 条全绿**。
+
+**⇒ 已补结构判据**（同文件末尾两条）：剥注释后扫源码，
+断言三个分支函数体内无 `USERPROFILE`、且 `home` 默认值仍为 `input.home ?? homedir()`。
+范式取自 `raccoon-client-independence.spec.ts`（「不读取任何环境变量」）。
+**三种绕过实测全部变红**：① 默认链加 `?? process.env.USERPROFILE`；
+② 在 `windowsBrowserCandidates` 里偷读 `process.env.USERPROFILE`；
+③ 拆成 `process.env['USER' + 'PROFILE']`。
+⚠ 另加一条「扫描健壮性」护栏（证明真扫到了四个函数 + 代码正文），
+否则「一个文件都没扫到」会让整条判据**静默恒真** —— 同 `raccoon` 那条的教训。
+
+**三条可复用规则**：
+
+1. **改断注入口的测试前，先问「被守的性质是否等价」** —— 新判据可失败 ≠ 原性质被守住。
+   守「注入口被尊重」与守「默认值来自 `homedir()`」是**两条不同的断言**。
+2. **`homedir()` 与 `USERPROFILE` 在 Windows 上不可区分** ⇒ 这类契约只能**结构判据**守，
+   任何行为判据（改 env、看结论、比对路径）在 Windows 上都会恒真。
+3. **扫描类断言必须自带「扫到了东西」的护栏**，否则空扫描 = 全绿。
+
+⚠ 同批关联：IKJMQ5（CWD 竞态）与 IKJPBJ（墙钟定时器）由 PR #75 一并关联关闭。
+
