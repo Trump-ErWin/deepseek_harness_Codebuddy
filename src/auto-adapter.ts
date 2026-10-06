@@ -106,8 +106,16 @@ interface DispatchTarget extends AutoChoice {
  * 规则：剔除 `UNUSABLE`；其余按失效时刻**升序**（越早越先烧）；时刻相同按传入顺序
  * （即 {@link AUTO_PROVIDERS} 的次序）。全部不可用时返回 `undefined`。
  *
+ * ⚠️ `NEVER`（无到期概念的永久/长期积分）**必须参与排序**并能当选：它表示
+ * 「可用、只是没有临期可烧」，而不是「不可用」。⚠️ 真实缺陷（PR !69 审计实测）：
+ * 初版用 `bestExpiry` 的初值 `Infinity` 作「还没选中任何 provider」的哨兵，于是
+ * **全部条目都是 `NEVER` 时循环一次都不赋值** ⇒ 返回 `undefined` ⇒ 用户看到
+ * 「没有任何已登录且可用的 provider 账号，请先登录」—— 而账号全都正常，只是积分
+ * 都是永久的。这是「账号都在」被误报成「没登录」。
+ * ⇒ 改用独立的 `best === undefined` 判定，两种语义彻底分开。
+ *
  * @param entries - `[provider, expiryMs]`，顺序即并列时的优先级。
- * @returns 胜出的 provider；无可用者时 `undefined`。
+ * @returns 胜出的 provider；**全部 `UNUSABLE`** 时才返回 `undefined`。
  */
 export function pickSoonestProvider(entries: readonly (readonly [string, number])[]): string | undefined {
   let best: string | undefined
@@ -115,7 +123,7 @@ export function pickSoonestProvider(entries: readonly (readonly [string, number]
   for (const [provider, expiry] of entries) {
     if (expiry === UNUSABLE) continue
     // 严格小于：并列时保留先出现的（AUTO_PROVIDERS 次序），不重排。
-    if (expiry < bestExpiry) {
+    if (best === undefined || expiry < bestExpiry) {
       bestExpiry = expiry
       best = provider
     }
@@ -251,14 +259,17 @@ export class AutoAdapter extends LlmAdapter {
       for (const provider of AUTO_PROVIDERS) {
         if (provider === choice.provider) continue
         if (!(await this.providerSupportsImages(provider))) continue
-        entries.push([provider, await this.expiryOf(provider, signal)])
+        let expiry = await this.expiryOf(provider, signal)
+        // 目录空/模型全关 ⇒ 该 provider 不可调用，不能当改道目标（PR !69 审计实测）。
+        if ((await this.firstModelOf(provider)) === undefined) expiry = UNUSABLE
+        entries.push([provider, expiry])
       }
       const picked = pickSoonestProvider(entries)
       if (picked !== undefined) {
-        imageTarget = await this.dispatchTargetOf(
-          { provider: picked, model: await this.firstModelOf(picked) },
-          signal,
-        )
+        const model = await this.firstModelOf(picked)
+        if (model !== undefined) {
+          imageTarget = await this.dispatchTargetOf({ provider: picked, model }, signal)
+        }
       }
     }
 
@@ -428,16 +439,22 @@ export class AutoAdapter extends LlmAdapter {
     signal?: AbortSignal,
   ): Promise<{ choice: AutoChoice; info?: LlmResolvedModelInfo } | undefined> {
     const now = this.options.now?.() ?? Date.now()
+    // ⚠️ abort 必须**立刻**以 AbortError 结束，绝不能被降级（PR !69 审计实测）。
+    // 初版把 `expiryOf` 里的 `signal?.aborted` 折算成 `UNUSABLE`，于是所有 provider
+    // 都被剔除 ⇒ 返回 undefined ⇒ 抛 MISSING_CREDENTIAL ⇒ 用户取消请求后看到的
+    // 是「请先在 Jet Hub 面板登录至少一个」。而缓存命中分支根本不查 signal，
+    // 同一个取消事件在 60 秒窗口的不同位置会产出两种完全不同的错误，极难复现。
+    signal?.throwIfAborted()
     if (this.cached !== undefined && now - this.cached.at < (this.options.ttlMs ?? AUTO_CHOICE_TTL_MS)) {
       return { choice: this.cached.choice, info: this.cachedInfo }
     }
-    const picked = await this.selectProvider(signal)
-    if (picked === undefined) {
+    const picked = await this.selectProvider(signal, choice => this.firstModelOf(choice))
+    if (picked?.model === undefined) {
       this.cached = undefined
       this.cachedInfo = undefined
       return undefined
     }
-    const choice: AutoChoice = { provider: picked, model: await this.firstModelOf(picked) }
+    const choice: AutoChoice = { provider: picked.provider, model: picked.model }
     // 借用目标真实能力；失败不致命（resolveModel 会退回保守元数据）。
     let info: LlmResolvedModelInfo | undefined
     try {
@@ -450,35 +467,69 @@ export class AutoAdapter extends LlmAdapter {
     return { choice, info }
   }
 
-  /** 探测各 provider 的最早失效时刻并选出胜者。 */
-  private async selectProvider(signal?: AbortSignal): Promise<string | undefined> {
+  /**
+   * 探测各 provider 的最早失效时刻并选出胜者。
+   *
+   * ⚠️ `modelOf` 是「该 provider 能否**实际被调用**」的判据（PR !69 审计实测）：
+   * 一个 provider 余额充足、但目录为空或模型被用户全关时，仍**不能**当选 ——
+   * 初版会让它拿到请求再发出一个必然 404 的模型 id。故排序时就把这类 provider
+   * 当作 `UNUSABLE` 剔除，顺位让给下一个候选（而不是整体放弃 auto）。
+   */
+  async selectProvider(
+    signal?: AbortSignal,
+    modelOf?: (provider: string) => Promise<string | undefined>,
+  ): Promise<AutoChoice | undefined> {
     const entries: Array<readonly [string, number]> = []
     for (const provider of AUTO_PROVIDERS) {
-      entries.push([provider, await this.expiryOf(provider, signal)])
+      let expiry = await this.expiryOf(provider, signal)
+      if (expiry !== UNUSABLE && modelOf !== undefined) {
+        // 目录空/全关 ⇒ 退出候选（不可调用），与「不可用」同等对待。
+        if ((await modelOf(provider)) === undefined) expiry = UNUSABLE
+      }
+      entries.push([provider, expiry])
     }
-    return pickSoonestProvider(entries)
+    const winner = pickSoonestProvider(entries)
+    if (winner === undefined) return undefined
+    const model = modelOf !== undefined ? await modelOf(winner) : undefined
+    if (modelOf !== undefined && model === undefined) return undefined
+    return { provider: winner, model: model ?? '' }
   }
 
   /**
    * 某 provider「一个代表账号」的最早失效时刻（毫秒）。
    *
-   * 用 `getAvailableAccount(provider, '')` 取一个启用账号做代表：它同时确认了「这个
-   * provider 现在有没有可用账号」（取不到即 UNUSABLE）。⚠️ 探测的是代表账号的余额，
-   * provider 内部换号由各适配器每次请求现做，不依赖这里。
+   * 取一个启用账号做代表：它同时确认了「这个 provider 现在有没有可用账号」
+   * （取不到即 UNUSABLE）。⚠️ 探测的是代表账号的余额，provider 内部换号由各适配器
+   * 每次请求现做，不依赖这里。
    *
-   * ⚠️ 非 private（`pickCurrentAutoProvider` 复用同一判据做徽标归因）——但**只**
-   * 允许那条路径调用：它构造独立的探测实例，不与选型缓存互相踩。
+   * ⚠️⚠️ **必须带真实 modelId 取号，不能传空串**（真实缺陷，PR !69 审计实测）：
+   * `getAvailableAccount` 对空 modelId 直接 `return true` 跳过限流过滤
+   * （`account-pool.ts:1049-1055`），而候选顺序就是**用户的手动顺序**
+   * （`:1057`）⇒ 空串取回的是「手动序第一个启用账号」，**哪怕它此刻正在限流**。
+   * 本仓库在 `index.ts:598-600` 已为同一坑留下过成文警告，这里是同一个缺陷的第二实例。
+   *
+   * 后果是多账号池的真实场景：手动序第一个号额度已烧完（折算 `NEVER`）、第二个号还有
+   * 9 天后作废的额度 ⇒ auto 只看到第一个号 ⇒ 该 provider 被判成「无临期」而排到最后，
+   * **临期额度被完全忽略**，与「临期优先」的价值主张相反。
+   *
+   * ⇒ 取号前先从目录拿一个真实 modelId，让限流过滤真正生效。
    */
   async expiryOf(provider: string, signal?: AbortSignal): Promise<number> {
     const pool = this.options.accountPool
     let available
     try {
-      available = await pool.getAvailableAccount(provider, '')
+      // ⚠️ 先解析一个真实模型 id：空串会让限流过滤整体短路（见上）。
+      // 目录不可读时退回空串 —— 此时「有没有账号」这个判据仍然成立，
+      // 只是限流维度退化为不参与（宁可少筛，不可把整池判成不可用）。
+      const probeModel = await this.firstModelOf(provider) ?? ''
+      available = await pool.getAvailableAccount(provider, probeModel)
     } catch {
       return UNUSABLE
     }
     if (available === null || available === undefined) return UNUSABLE
-    if (signal?.aborted === true) return UNUSABLE
+    // ⚠️ abort 不是「这个 provider 不可用」，而是「这次调用不该继续」（PR !69 审计
+    // 实测）：折算成 UNUSABLE 会让取消请求的用户看到误导性的「请先登录」。
+    signal?.throwIfAborted()
     const credential = available.credential as unknown
     switch (provider) {
       case 'buddy':
@@ -572,6 +623,17 @@ export class AutoAdapter extends LlmAdapter {
    * 各 provider 的目录名都带；带「免费」按 0 算）。没有倍率标注的模型视为
    * `Infinity`，排在任何有标注的之后。
    *
+   * ## 返回 `undefined` 的含义（真实缺陷修复，PR !69 审计实测）
+   *
+   * `undefined` = **该 provider 目录里没有可调用的模型**（目录为空 / 读取失败 /
+   * 用户把模型全关了）。调用方必须把该 provider **退出候选**，绝不能发请求。
+   *
+   * ⚠️ 初版在这里回落到硬编码 `AUTO_FALLBACK_MODELS[provider]`，而触发回落的前提
+   * 恰恰是「目录为空或**全被关闭**」—— 此时那个 id 正是用户明确关掉的模型。
+   * 实测（真实链路探针）：用户关掉 zcode 全部模型后，auto 仍选中 zcode 并发出
+   * **`zcode/auto`**（字符串 `'auto'` 被当成 zcode 的模型名）⇒ 必然 404，且请求
+   * 打到了一个用户已禁用的 provider。这违反本文件自己的注释「关闭即不可调用」。
+   *
    * ## 为什么按倍率选（真实缺陷，用户报障 2026-10-05）
    *
    * 原实现取目录第一个 —— CodeBuddy 目录首个是 `hy4-preview`（x0.29），而同池的
@@ -579,9 +641,9 @@ export class AutoAdapter extends LlmAdapter {
    * 积分。auto 既然定位是「省钱烧临期」，同 provider 内当然该挑最便宜的。
    *
    * ⚠️ 必须跳过被关闭的模型（`disabledModelsFor`）—— 关闭即「不可调用」，
-   * auto 不能把请求路由过去。跳过**不是静默降级**：记 warn 日志。
+   * auto 不能把请求路由过去。
    */
-  private async firstModelOf(provider: string): Promise<string> {
+  async firstModelOf(provider: string): Promise<string | undefined> {
     const disabled = this.options.accountPool.disabledModelsFor(provider)
     let skipped = 0
     let best: { id: string; price: number } | undefined
@@ -593,52 +655,75 @@ export class AutoAdapter extends LlmAdapter {
         const price = priceFactorFromName(model.name ?? model.id)
         if (best === undefined || price < best.price) best = { id: model.id, price }
       }
-      if (best !== undefined) return best.id
-    } catch {
-      /* 目录读取失败：落到兜底 */
+      if (best !== undefined) {
+        // ⚠️ 这里必须**先**记 warn 再返回：初版把 `return` 写在 warn 之前，那条日志
+        // 在正常路径上永远不执行，注释「跳过不是静默降级」因此完全失真。
+        if (skipped > 0) {
+          this.ctx.logger?.warn?.(
+            `[jet-hub-auto] ${provider} 目录中的 ${skipped} 个模型已被关闭，已跳过`,
+          )
+        }
+        return best.id
+      }
+    } catch (error) {
+      this.ctx.logger?.warn?.(`[jet-hub-auto] ${provider} 读取模型目录失败：${String(error)}`)
+      return undefined
     }
     if (skipped > 0) {
       this.ctx.logger?.warn?.(
-        `[jet-hub-auto] ${provider} 目录中的 ${skipped} 个模型已被关闭，已跳过`,
+        `[jet-hub-auto] ${provider} 的 ${skipped} 个模型全部被关闭，已退出候选`,
       )
     }
-    // 兜底只在目录为空/全被关闭时触发；取各 provider 一个已知可用的模型 id。
-    const fallback = AUTO_FALLBACK_MODELS[provider] ?? AUTO_MODEL
-    // 兜底恰好也被关闭时不能硬发，改用模型名本身 —— 那会让上游 404，
-    // 但**错误真实**；总好过发一个被本地拒绝的请求。
-    return disabled.has(fallback) ? AUTO_MODEL : fallback
+    // 目录为空 / 全被关闭：如实返回「无可用模型」，由调用方把该 provider 剔除。
+    // ⚠️ 绝不能回落到硬编码 id —— 那正是用户关掉的模型（见方法注释）。
+    return undefined
   }
 }
 
 /**
- * 从目录展示名解析倍率（`… · x0.03` / `… ×0.29`）；带「免费」按 0；解析不出按
- * `Infinity`（排在任何有标注的之后）。**只做展示层解析**：各 provider 的倍率
- * 权威来源不同（qoder 在目录 `priceFactor`、buddy 在远端 config 拼进名字），
- * 逐家接字段是个大工程，而目录名是所有 provider 统一展示的地方 —— 先用这一层。
+ * 从目录展示名解析倍率；带「免费」按 0；解析不出按 `Infinity`（排在任何有标注的之后）。
  *
- * # ponytail: 名字解析在 provider 改显示格式时会失效；届时把各家 `priceFactor`
- * 提升到 `listAllModels` 的公共字段再替换。
+ * # 为什么必须要求「倍率分隔符」（真实缺陷，PR !69 审计实测）
+ *
+ * 初版正则 `/[×x]\s*(\d+(?:\.\d+)?)\s*$/i` 只要求「`x` + 数字 + 行尾」，**不要求分隔符**
+ * ⇒ 模型名里的 `x` 被当成倍率标记。实测（拿本仓库真实展示名逐条跑）：
+ *
+ * | 展示名 | 初版解析 | 应为 |
+ * |---|---|---|
+ * | `Spark X2.5`（**无**倍率标注） | **2.5 倍** ❌ | 无标注 ⇒ `Infinity` |
+ * | `GPT-X5` | **5 倍** ❌ | 无标注 |
+ * | `Grok x4` | **4 倍** ❌ | 无标注 |
+ * | `DeepSeek V4 Flash 0731 · x3.0` | 3.0 ✅ | 3.0 |
+ *
+ * `Spark X2.5` 这条路径**真实可达**：loomy 的 `splitLoomyRate` 在远端下发**不带倍率**的
+ * 名称时原样返回原名（`loomy.ts:136/147`），而 `loomyDisplayName` 不追加分隔符，
+ * 该原名会被 `loomy-adapter.ts:163` 直接写进目录名 ⇒ `firstModelOf` 就会把它当 2.5 倍，
+ * 于是「挑最便宜」反而**挑到了最贵的**（同池里 `· x0.8` 的模型排到了它后面）。
+ *
+ * ✅ 修法：要求倍率前有**分隔符**（`·` / `×` / `·x`），并按真实形态支持促销箭头
+ * `x0.17→x0.50`（`formatCreditsRate`，`buddy.ts:701`）—— 取**促销后的**那个值，
+ * 那才是实际计费倍率。
+ *
+ * ⚠️ 只做展示层解析：各 provider 的倍率权威来源不同（qoder 在目录 `priceFactor`、
+ * buddy 在远端 config 拼进名字），逐家接字段是个大工程，而目录名是所有 provider
+ * 统一展示的地方 —— 先用这一层。
  */
-function priceFactorFromName(name: string): number {
+export function priceFactorFromName(name: string): number {
   if (name.includes('免费')) return 0
-  const m = /[×x]\s*(\d+(?:\.\d+)?)\s*$/i.exec(name.trim())
+  // ⚠️ 倍率标注的**真实形态**只有两种（`formatCreditsRate`，buddy.ts:701；
+  // `loomyDisplayName`，loomy.ts:157）：`… · x{n}` 与 `… ×{n}` —— 分隔符是
+  // **间隔号 U+00B7** 或乘号。促销期为 `· x0.17→x0.50`，取箭头右侧（实际计费倍率）。
+  //
+  // ⚠️⚠️ 不能用「`[×x]` 后接数字」这种宽松形态（真实缺陷，PR !69 审计实测）：
+  //   `Spark X2.5`（**无**倍率标注）会被解析成 **2.5 倍**，`GPT-X5` → 5 倍，
+  //   `Grok x4` → 4 倍。于是同池里 `· x0.8` 的模型排在这个「2.5 倍」的后面 ——
+  //   auto 号称「挑最便宜」，反而挑了最贵的。
+  const m = /·\s*[×x]?\s*(\d+(?:\.\d+)?)(?:\s*[→>]\s*[×x]?\s*(\d+(?:\.\d+)?))?\s*$/i
+    .exec(name.trim())
   if (m === null) return Number.POSITIVE_INFINITY
-  const value = Number(m[1])
+  const raw = m[2] ?? m[1]
+  const value = Number(raw)
   return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY
-}
-
-/**
- * 目录为空时的兜底模型 id（每个 provider 一个实测可用的）。
- *
- * ⚠️ 正常路径走不到这里（有账号即有目录）；它只保证「目录恰好空」时 auto 仍能发出
- * 一个真实存在的模型，而不是把字符串 `auto` 发给上游（那必然 404）。
- */
-const AUTO_FALLBACK_MODELS: Readonly<Record<string, string>> = {
-  codearts: 'glm-5.3-flash',
-  buddy: 'deepseek-v4-flash',
-  workbuddy: 'deepseek-v4-flash',
-  loomy: 'deepseek-v4-flash-0731',
-  zcode: 'GLM-5.3-Flash',
 }
 
 /** 在 ctx.llm 上注册 auto 路由（幂等，见 `llm-register-compat.ts`）。 */
@@ -661,9 +746,8 @@ export async function pickCurrentAutoProvider(
   options: AutoAdapterOptions,
 ): Promise<string | undefined> {
   const probe = new AutoAdapter(ctx, options)
-  const entries: Array<readonly [string, number]> = []
-  for (const provider of AUTO_PROVIDERS) {
-    entries.push([provider, await probe.expiryOf(provider)])
-  }
-  return pickSoonestProvider(entries)
+  // ⚠️ 必须带 `modelOf`：**模型全被关闭的 provider 不能算进徽标**（PR !69 审计实测），
+  // 否则徽标会显示一个 auto 实际根本不会选中的 provider。
+  const picked = await probe.selectProvider(undefined, p => probe.firstModelOf(p))
+  return picked?.provider
 }
