@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest'
 import {
   accountLabel,
   avgPerfText,
+  avgPerfTooltip,
   barDayLabel,
   barHeightPercent,
   BAR_HEIGHT_MAX_PERCENT,
@@ -32,6 +33,11 @@ import {
 
 /** 源码契约测试用：定位仓库根下的 src/ 与 plugin-src/。 */
 const here = dirname(fileURLToPath(import.meta.url))
+/**
+ * 面板源码全文（**模块级**：多个 describe 都要读它 —— 放进单个 describe 里
+ * 会让后面的用例拿到 undefined 却不报错，只在 `client.slice` 处才炸）。
+ */
+const client = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
 
 describe('formatTokenCount', () => {
   it('千分位：<10K 精确显示', () => {
@@ -133,6 +139,53 @@ describe('账号维度（第 2 期）', () => {
     expect(accountLabel('')).toBe('未归属')
     expect(accountLabel(undefined)).toBe('未归属')
     expect(accountLabel('qoder-bb211a53')).toBe('qoder-bb211a53')
+  })
+})
+
+/**
+ * ⚠️ 均值口径必须**显式说明**（真实缺陷，用户 2026-10-07 报障「982.5 tok/s」）。
+ *
+ * 症状：lobsterai 的速率显示 982.5 tok/s，远超该模型的合理区间。根因是
+ * `decodeMs` 塌缩到个位数毫秒（服务端已修），但**均值口径**本身仍需交代：
+ * 算术平均对离群样本敏感，不给口径用户无从判断某天的高值是真快还是被拉高。
+ */
+describe('均值口径说明', () => {
+  it('avgPerfTooltip 说明了解码时长门槛与「均值对离群样本敏感」', () => {
+    const tip = avgPerfTooltip()
+    // 门槛数值必须写出来（用户要能核对服务端判据）。
+    expect(tip).toContain('100ms')
+    // 「算术平均」与「敏感」两句都在：缺任一句都无法解释异常值。
+    expect(tip).toContain('算术')
+    expect(tip).toContain('敏感')
+    // 口径要指明分子分母，不能只说「速率」。
+    expect(tip).toContain('输出 token')
+    expect(tip).toContain('首块')
+  })
+
+  it('★ 全部均值格必须挂口径 tooltip（7 处调用点不得漏）', () => {
+    // 收敛到 perfCell 一个 helper：逐个调用点各写一份 title 时必然会漏。
+    expect(client).toMatch(/const perfCell = \(row\) =>/s)
+    expect(client).toMatch(/className: 'dim-jh-ledgerPerf',\s*title: avgPerfTooltip\(\)/)
+    // 不得再有裸的 avgPerfText 调用（那是没有 tooltip 的漏网渲染）。
+    const rawCalls = client.match(/className: 'dim-jh-ledgerPerf' \}, avgPerfText\(/g) ?? []
+    expect(rawCalls).toEqual([])
+    // 7 个均值渲染点全部经由 perfCell（明细模型行 + 汇总 4 处 + 历史日树 3 处）。
+    expect((client.match(/perfCell\(/g) ?? []).length).toBe(7)
+    // ⚠️ 余下那处 ledgerPerf 是历史区的「合计」格（无均值、无需口径说明）——
+    // 刻意不要求它挂 tooltip，故不能断言 ledgerPerf 全文只出现一次。
+    expect(client).toContain('合计 ↓')
+  })
+
+  it('弹窗说明里也点明「算术平均」与离群敏感（tooltip 之外的第二处口径来源）', () => {
+    // 提示段落：用户不一定会去悬停均值格。
+    // ⚠️ 判据必须锚在「Token 用量」那处弹窗：全文件有 13 处 modalHint
+    // （多个弹窗复用），按位置切片会切到别的弹窗上去。
+    const modalIdx = client.indexOf("'aria-label': 'Token 用量'")
+    expect(modalIdx).toBeGreaterThan(-1)
+    const hint = client.slice(modalIdx, client.indexOf('dim-jh-modalBody', modalIdx))
+    expect(hint).toContain('100ms')
+    expect(hint).toContain('算术平均')
+    expect(hint).toContain('离群')
   })
 })
 
@@ -277,8 +330,6 @@ describe('历史视图（第 4 期）', () => {
  * 改格式、换引号、加注释都不该假失败，但字段名改错必须变红。
  */
 describe('历史视图 · RPC 响应体字段名契约', () => {
-  const client = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
-
   it('客户端读的是 `history.history`（RPC 的真实字段名），不是 `history.days`', () => {
     expect(client).toMatch(/Array\.isArray\(history\?\.history\)/)
     // ⚠️ 旧读法必须**显式禁死**：它是本缺陷的写法，留着就会二次复发。
@@ -312,7 +363,6 @@ describe('历史视图 · RPC 响应体字段名契约', () => {
  * flex 拉满整行）。这两层只有断言源码才够得着。
  */
 describe('趋势柱状图 · 渲染接线与样式契约', () => {
-  const client = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
   const styles = readFileSync(resolve(here, '../../plugin-src/client/jet-hub-styles.js'), 'utf8')
 
   it('渲染必须把柱子根数传给 barHeightPercent（否则孤柱退回 100%）', () => {

@@ -72,6 +72,7 @@ import { formatRowTokensPerSecond } from './tokens-per-second.js';
 import {
   accountLabel,
   avgPerfText,
+  avgPerfTooltip,
   barDayLabel,
   barHeightPercent,
   channelCardTitle,
@@ -2053,14 +2054,24 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
   }, [snapshot, selected]);
 
   /** 一行模型的三个格子（实时汇总与历史日树共用，避免括号地狱）。 */
+  /**
+   * 均值单元格：`首字 2.11s · 982.5 tok/s` + **口径说明 tooltip**。
+   *
+   * ⚠️ 口径说明不是锦上添花（用户 2026-10-07 报障）：看到「982.5 tok/s」时
+   * 合理怀疑算错了，而不给口径就无从判断它是真快还是被离群样本拉出来的。
+   * 统一走这里，避免 7 个调用点各写一份 title 而漏掉某一处。
+   */
+  const perfCell = (row) => React.createElement('span', {
+    className: 'dim-jh-ledgerPerf', title: avgPerfTooltip(),
+  }, avgPerfText(row));
+
   const renderModelRow = (modelRow, key) => React.createElement('div', {
     key, className: 'dim-jh-ledgerModel',
   },
     React.createElement('span', { className: 'dim-jh-ledgerModelName', title: modelRow.model }, modelRow.model),
     React.createElement('span', { className: 'dim-jh-ledgerModelReq', title: '请求数（含失败）' },
       modelRow.requests + ' 次'),
-    React.createElement('span', { className: 'dim-jh-ledgerPerf', title: '均值：只对有实测值的请求平均' },
-      avgPerfText(modelRow)),
+    perfCell(modelRow),
     React.createElement('span', { className: 'dim-jh-ledgerModelTokens' },
       tokenSummaryText(modelRow)));
 
@@ -2101,7 +2112,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
           React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
             React.createElement('span', { className: 'dim-jh-ledgerAccountName', title: accountRow.accountId },
               accountLabel(accountRow.accountId)),
-            React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(accountRow.totals)),
+            perfCell(accountRow.totals),
             React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
               tokenSummaryText(accountRow.totals))),
           accountRow.models.map((modelRow) =>
@@ -2120,7 +2131,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       },
         React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
           React.createElement('strong', null, channelCardTitle(channelRow)),
-          React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(channelRow.totals)),
+          perfCell(channelRow.totals),
           React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
             tokenSummaryText(channelRow.totals))),
         channelRow.providers.map((providerRow) => React.createElement('div', {
@@ -2128,7 +2139,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         },
           React.createElement('div', { className: 'dim-jh-ledgerProviderHead' },
             React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, providerRow.provider),
-            React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(providerRow.totals)),
+            perfCell(providerRow.totals),
             React.createElement('span', { className: 'dim-jh-ledgerProviderSum' },
               tokenSummaryText(providerRow.totals))),
           renderProviderBody(providerRow))))));
@@ -2220,13 +2231,13 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
   const renderDayTree = (dayRow) => React.createElement('div', { key: 'day-' + dayRow.day, className: 'dim-jh-ledgerCard' },
     React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
       React.createElement('strong', null, dayRow.day + ' · ' + (dayRow.totals?.requests ?? 0) + ' 次请求'),
-      React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(dayRow.totals)),
+      perfCell(dayRow.totals),
       React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
         tokenSummaryText(dayRow.totals))),
     dayRow.channels.map((channelRow) => React.createElement('div', { key: channelRow.channel, className: 'dim-jh-ledgerProvider' },
       React.createElement('div', { className: 'dim-jh-ledgerProviderHead' },
         React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, channelLabel(channelRow.channel)),
-        React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(channelRow.totals)),
+        perfCell(channelRow.totals),
         React.createElement('span', { className: 'dim-jh-ledgerProviderSum' },
           tokenSummaryText(channelRow.totals))),
       channelRow.providers.map((providerRow) => React.createElement('div', {
@@ -2234,7 +2245,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       },
         React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
           React.createElement('span', { className: 'dim-jh-ledgerAccountName' }, providerRow.provider),
-          React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(providerRow.totals)),
+          perfCell(providerRow.totals),
           React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
             tokenSummaryText(providerRow.totals))),
         (providerRow.accounts ?? []).length > 1
@@ -2282,7 +2293,9 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         '按渠道（直连 / 网关）、供应商、账号与模型统计本机发出的每笔模型请求。'
         + '↓输入 ↑输出 ⚡缓存 ✎缓存写入 🧠推理；— 表示该笔未收到用量（失败或中断）。'
         + '明细含「首字用时」与「输出速率」（首块之后 → 结束，官方口径）；'
-        + '汇总行的「均值」只对有实测值的请求平均。'
+        + '汇总行的「均值」只对有实测值的请求平均'
+        + '（速率要求解码时长 ≥ 100ms，过短视为不可测；'
+        + '且为算术平均，个别极快/极慢的离群请求会明显拉高或拉低该值 —— 悬停均值格看口径）。'
         + '明细保留最近 500 笔（重启清空）；按日累计已存盘（token-ledger.json）。'),
       React.createElement('div', { className: 'dim-jh-modalBody' },
         renderHistory(),
@@ -5488,3 +5501,4 @@ export function JetHubPage({ close, rpcCall }) {
         })
       : null);
 }
+

@@ -113,6 +113,14 @@ export interface TokenLedgerModelRow {
    * 平均输出速率（tok/s）—— 对**有 tps 实测值**的请求取均值（不加权，
    * 「每笔请求的速率」的算术平均，口径与用户直觉一致）。无可测请求时
    * `undefined`。
+   *
+   * ⚠️ **是算术均值，对离群样本敏感**（用户 2026-10-07 报障）：虽然源头已
+   * 丢弃 `decodeMs` 过短的样本（见 {@link MIN_DECODE_MS_FOR_TPS}），但「一笔
+   * 极快 + 大量极慢」的混合分布下算术均值仍缺乏代表性。要改用中位数需新增
+   * 分位数存储字段并迁移 `token-ledger.json`，风险更高，另行处理。
+   *
+   * ⚠️ 已落盘的 `tpsSum/tpsCount` 是**修复前**的累加值（含离群样本），
+   * 重启后读到的历史视图仍会显示被污染的均值 —— 见 flush/迁移说明。
    */
   avgTps?: number
 }
@@ -149,6 +157,19 @@ export interface TokenLedgerSnapshot {
 
 /** 流水上限。500 条足够回溯近期活动，内存占用可忽略。 */
 export const TOKEN_LEDGER_LIMIT = 500
+
+/**
+ * TPS 计算的**最小解码时长**（毫秒）：短于此值 ⇒ 该笔不可测，不计入均值。
+ *
+ * ⚠️ 为什么是 100 而不是 0（用户 2026-10-07 报障「982.5 tok/s」）：`decodeMs`
+ * 是「首块之后 → 结束」，当这两个时刻几乎贴在一起时它会塌缩到个位数毫秒，
+ * 除出来的速率高达数十万 tok/s。100ms 的门槛覆盖了「至少出了一小段正文」的
+ * 情形 —— 单流文本生成的正常首段就远超 100ms，故此门槛**不会**误伤真实样本。
+ *
+ * ⚠️ 该门槛只影响**新增**记账；已落盘的 `tpsSum/tpsCount` 仍是污染值
+ * （见 `flush`/迁移说明）。
+ */
+export const MIN_DECODE_MS_FOR_TPS = 100
 
 /** 内存中的流水（最新在前）。 */
 let ledger: TokenLedgerEntry[] = []
@@ -319,9 +340,19 @@ export function recordTokenUsage(entry: Omit<TokenLedgerEntry, 'ts'>): void {
     const duration = clampCount(entry.durationMs)
     const outputTokens = clampCount(entry.outputTokens)
     // TPS（官方口径）：分子 = 全部输出 token（含思考），分母 = 首块之后 → 结束。
-    // 三个前提（有首块 / 分母 > 0 / usage 已报）缺一个都不可测 ⇒ 省略字段。
+    //
+    // ⚠️ **分母必须设下限**（真实缺陷，用户 2026-10-07 报障）：原判据只有
+    // `decodeMs > 0`，于是「首块与结束几乎同时发生」的样本（空回复 / 纯 usage 帧 /
+    // 上游秒回 200 但正文为空 / 被 cancel）算出 1269 ÷ 0.001s = **126 万 tok/s**。
+    // 单笔这样的样本就能把该渠道的均值从 ~180 拉到 **60 万**（实测复现）——
+    // 用户界面显示 lobsterai「982.5 tok/s」，而真实值在 50~200 量级。
+    //
+    // ⚠️ 为什么不用「钳制分母」而要**整体丢弃该样本**：把 decodeMs 抬到
+    // MIN_DECODE 只是把那笔的离谱值换成另一个离谱值（仍是假数据，且看起来
+    // 「有值」无从分辨）。不测量的东西应当不出现，而不是被修正成一个看似
+    // 合理的数 —— 与 ttft「0 = 无任何块 ⇒ 省略」同一条纪律。
     const decodeMs = duration - ttft
-    const tps = ttft > 0 && decodeMs > 0 && usageReported
+    const tps = ttft > 0 && decodeMs >= MIN_DECODE_MS_FOR_TPS && usageReported
       ? Math.round((outputTokens / (decodeMs / 1000)) * 10) / 10
       : undefined
     const record = Object.freeze({
