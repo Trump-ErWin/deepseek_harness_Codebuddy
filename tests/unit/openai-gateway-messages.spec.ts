@@ -225,6 +225,49 @@ describe('OpenAI gateway request conversion', () => {  it('parses a namespaced m
     },
   )
 
+  /**
+   * ⚠️ 判据**必须忽略大小写**，这是实测出来的真实缺陷（PR !70 审计）。
+   *
+   * codearts 目录本身大小写混用（`GLM-5.2` 大写与 `glm-5.3-flash` 小写并存），
+   * 而 `parseModelRoute` 是纯字符串切片、**不做任何归一化**。用户照着真实存在
+   * 的 `GLM-5.2` 拼出 `GLM-5.3-Flash` 完全现实。
+   *
+   * 更关键：`CodeArtsAdapter.resolveModel` 对目录外模型是
+   * `remoteModel?.name ?? model` —— **原样放行、从不拒绝**（dsh-llm 的
+   * `normalizeModelInfo` 只校验字段类型，注释明写 catalog membership is
+   * advisory）⇒ 网关**不会提前 404**，绕过的值会真的发往上游。
+   * 判据不归一化 ⇒ 这条路径上没有任何防线。
+   *
+   * ⇒ 必须**双向**覆盖：大写 `GLM-5.2` 的小写变体同样要命中（那是修复前就
+   * 存在的缺口），不能只测新加的两个模型。
+   */
+  it.each([
+    ['GLM-5.3-Flash', '照 GLM-5.2 的大写习惯拼出的 glm-5.3-flash'],
+    ['GLM-5.3-FLASH', '全大写变体'],
+    ['Deepseek-V4.1-Flash', '首字母大写变体'],
+    ['DEEPSEEK-V4.1-FLASH', '全大写变体'],
+    ['glm-5.2', '既有 GLM-5.2 的小写变体（双向缺口）'],
+    ['Deepseek-V4-Flash', '既有 deepseek-v4-flash 的大写变体'],
+  ])('大小写变体 %s 同样被钳制（%s）', (model) => {
+    expect(normalizeMaxTokens(128000, 'codearts', model)).toBe(65536)
+    expect(normalizeMaxTokens(32000, 'codearts', model)).toBe(32000)
+  })
+
+  it('大小写归一化不得误伤：真实 id 与非 CodeArts provider 保持原行为', () => {
+    // 目录里的真实形态必须仍然命中（防止归一化改坏既有行为）
+    expect(normalizeMaxTokens(128000, 'codearts', 'GLM-5.2')).toBe(65536)
+    expect(normalizeMaxTokens(128000, 'codearts', 'glm-5.3-flash')).toBe(65536)
+    expect(normalizeMaxTokens(128000, 'codearts', 'deepseek-v4.1-flash')).toBe(65536)
+    expect(normalizeMaxTokens(128000, 'codearts', 'deepseek-v4-flash')).toBe(65536)
+    // 别的 provider 同名模型不受影响
+    expect(normalizeMaxTokens(128000, 'buddy', 'glm-5.3-flash')).toBe(128000)
+    // **白名单**语义：相近但不同的 id 不得被误伤
+    expect(normalizeMaxTokens(128000, 'codearts', 'deepseek-v4.1')).toBe(128000)
+    expect(normalizeMaxTokens(128000, 'codearts', 'glm-5.3')).toBe(128000)
+    // 钳制只压到白名单模型，带日期后缀的形态仍不在范围内（既有行为）
+    expect(normalizeMaxTokens(128000, 'codearts', 'deepseek-v4-flash-0731')).toBe(128000)
+  })
+
   it('maps CodeArts generic levels even when legacy runtime omits reasoning metadata', () => {
     expect(normalizeReasoningEffort('high', undefined, 'codearts', 'deepseek-v4-flash')).toBe('on')
     expect(normalizeReasoningEffort('max', undefined, 'codearts', 'deepseek-v4-flash')).toBe('on')
