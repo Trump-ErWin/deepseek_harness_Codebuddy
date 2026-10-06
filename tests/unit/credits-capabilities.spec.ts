@@ -359,7 +359,12 @@ describe('客户端积分请求门控（源码级回归）', () => {
   it('claimCredits 在发起 credits.claimAll 之前先判能力', () => {
     const start = source.indexOf('const claimCredits')
     expect(start).toBeGreaterThan(-1)
-    const body = source.slice(start, start + 600)
+    // ⚠️ 窗口不能太窄：函数头部现在依次有「能力守卫 → 重入闸门（claimInFlightRef）
+    // → 提示文案」三段（复审 !62 加的重入闸门），把 claimAll 调用推到了 700 字符
+    // 之外。原窗口 600 因此假失败 —— 判据本身（守卫在调用之前）仍成立，
+    // 只是插入的守卫把距离撑大了（与下方 AccountCard 那条「窗口不能只取 4000」
+    // 是同款维护问题）。
+    const body = source.slice(start, start + 1200)
     const guardIndex = body.indexOf('if (!supportsCredits) return;')
     const callIndex = body.indexOf("rpcCall('credits.claimAll'")
     expect(guardIndex, 'claimCredits 缺少能力守卫').toBeGreaterThan(-1)

@@ -86,6 +86,30 @@ export interface BuddyProduct {
    * 注意与 `endpoint` 分开：历史实现里该头传的是不带协议的域名。
    */
   apiDomain: string
+  /**
+   * 成长中心领奖端点的基址（含协议，无尾斜杠），成长任务 claim 与 web 域上报
+   * 以此为基址。
+   *
+   * 与 `endpoint` 分开的原因：API 域名与网页域名不是同一个站。buddy 中国版的
+   * `endpoint` 是 `copilot.tencent.com`，而成长中心领奖与 web 域遥测在另一个站。
+   *
+   * 证据状态：`www.workbuddy.cn` 是实测可达的中国区成长中心站（2026-10-05，
+   * 两个真实账号领奖成功）；它与登录站 `www.codebuddy.cn`（见 buddy.ts
+   * WEBSITE_HOME）的关系未经核实，两者都返回 HTTP 200，故此处填实测值而非推断值。
+   * 国际版未实测，暂按 `endpoint` 同域填写。
+   */
+  claimBase: string
+  /**
+   * web 域遥测上报的 Origin（含协议，无尾斜杠），资料库点击一类判据只认
+   * web 域事件，桌面域不计分。
+   *
+   * 与 `claimBase` 分开的原因：领奖走产品 API 站，web 遥测走网页站，两者
+   * 的 `Origin` / `Referer` 需要各自独立配置，不能共用一个回退值。
+   *
+   * 证据状态：与 `claimBase` 同为实测可达站点（2026-10-05，Library_read判据
+   * 在两个真实账号上领奖成功）。
+   */
+  webBase: string
   /** 设置页展示名 */
   displayName: string
   /** X-Product-Code 请求头值 */
@@ -270,6 +294,8 @@ export const CODEBUDDY: BuddyProduct = {
   platform: 'ide',
   endpoint: 'https://copilot.tencent.com',
   apiDomain: 'copilot.tencent.com',
+  claimBase: 'https://www.workbuddy.cn',
+  webBase: 'https://www.workbuddy.cn',
   displayName: 'CodeBuddy (腾讯)',
   productCode: 'codebuddy',
   userAgent: 'CodeBuddyIDE/1.106.1',
@@ -377,12 +403,24 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
  *
  * 该产品**没有**每日签到积分接口（内核中只有 `/v2/billing/meter/get-dosage-notify`），
  * 因此 Jet Hub 不为其渲染「一键领取积分」按钮；积分领取在 CodeBuddy 侧完成。
+ *
+ * ⚠️ 上面那句「不渲染按钮」直接决定了下面的 `claimBase` / `webBase` **当前不可达**：
+ * 成长任务入口是同一个按钮（客户端 `supportsCredits = supportsDailyCheckin(provider)`
+ * 为门控，`workbuddy` 在能力表里 `dailyCheckin: false`），按钮不渲染 ⇒
+ * `credits.claimAll({ runTasks: true })` 永远传不进来。故这两个字段填的是
+ * 「同一产品线的网页站」推断值，**国际版未实测**（中国版 `www.workbuddy.cn` 已实测可达）。
+ * 若将来给 workbuddy 开放签到按钮，必须先用真实账号验证 `www.workbuddy.ai` 上
+ * `/activity/growth/tasks/<code>/claim` 与 `/v2/report` 的行为，再放开。
  */
 export const WORKBUDDY: BuddyProduct = {
   id: 'workbuddy',
   platform: 'workbuddy-ai',
   endpoint: 'https://www.workbuddy.ai',
   apiDomain: 'www.workbuddy.ai',
+  /** ⚠️ 未实测：见上方注释（该路径当前不可达）。 */
+  claimBase: 'https://www.workbuddy.ai',
+  /** ⚠️ 未实测：见上方注释（该路径当前不可达）。 */
+  webBase: 'https://www.workbuddy.ai',
   displayName: 'WorkBuddy (国际版)',
   productCode: 'workbuddy',
   // 默认档：国际版产品形态（无按模型命中时使用）。
