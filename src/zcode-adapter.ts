@@ -743,9 +743,33 @@ export class ZcodeAdapter extends LlmAdapter {
      * 见 {@link ZcodeAdapter.switchAccountOnQuota}。
      */
     const tried = new Set<string>()
+    /**
+     * ⚠⚠ **取凭据必须在读 `currentAccountId()` 之前**（2026-10-06 真实故障）。
+     *
+     * `currentAccountId()` 读的是 `index.ts` 里 `activeZcodeAccountId` 那个 Map，
+     * 而它**只在 `resolveCredential` 内部被写入**。原先这里顺序反了：
+     *
+     * ```ts
+     * let activeAccountId = this.options.currentAccountId?.()   // ← 先读（此刻是空的）
+     * let credential = await this.resolveCredentialOrThrow(options)  // ← 后写
+     * ```
+     *
+     * 冷启动（进程刚起 / 该 provider 首次被调用）时 Map 是空的 ⇒
+     * `activeAccountId === undefined` ⇒ {@link ZcodeAdapter.switchAccountOnQuota}
+     * 里那个守卫整段跳过：**既不标记失败账号、也不把它放进 `tried`** ⇒
+     * 池按用户手动顺序返回的第一个候选**正是刚失败的那个** ⇒
+     * 这次「切号」切回同一个账号、同一份凭据，**白发一发**。
+     *
+     * 症状就是用户报的「用完余额一个号就自动卡死了，不会切下一个号」：
+     * 受 `quotaSwitchMax === 2` 限制，一次请求最多 3 发，其中第一发纯属空转，
+     * 真正换到新账号要等第二轮 —— 看起来就是「卡了一下才切」甚至「卡死」。
+     *
+     * 既有用例全部传常量 `currentAccountId: () => 'acct-A'` ⇒ 天然绕过该缺陷；
+     * 回归见 `tests/unit/zcode-rotation-coldstart.spec.ts`（用忠实复刻接线的桩）。
+     */
+    let credential = await this.resolveCredentialOrThrow(options)
     let activeAccountId = this.options.currentAccountId?.()
     if (activeAccountId !== undefined && activeAccountId.length > 0) tried.add(activeAccountId)
-    let credential = await this.resolveCredentialOrThrow(options)
 
     /**
      * 2. 构造请求体（**Anthropic Messages 格式**）。
@@ -1817,6 +1841,30 @@ export function describeUpstreamError(
     //   让用户「去官方客户端重新登录」会把他引到一个**完全无效**的操作上。
     return `凭据失效（${status}）。请在 Jet Hub 的 ZCode 面板删除该账号后重新添加登录。${suffix}`
   }
+  /**
+   * ★ **边缘/网关拦截页必须翻成人话**（2026-10-06 用户报障现场）。
+   *
+   * 修复前这里落到最后一行 `HTTP ${status}：${suffix}`，而边缘页的 body 是
+   * 整张 HTML 文档 ⇒ 用户看到 `HTTP 405：<!doctypehtml><html lang=…` 一坨乱码，
+   * 里面**没有任何可行动的信息**（实测该形态 48 小时出现 127 次）。
+   *
+   * 与 {@link httpErrorCodeForZcode} **同序**：业务码分支在前（码可能被网关
+   * 用 HTML 之外的形态包裹，处置各不相同），形态判据收尾兜底。边缘页不是
+   * JSON ⇒ 走不到业务码分支，只会落到这里。
+   *
+   * 文案要回答用户真正关心的三件事：① 这是**边缘层**拦截（请求没到业务层）；
+   * ② **不是账号/额度/凭据问题**（否则用户会去重登录、换号、白折腾）；
+   * ③ 该做什么（换模型/provider 或等上游恢复，**勿反复重试**）。
+   * 原始响应仍保留一小段作证据，但**截断**（80 字符），不再倒整页。
+   */
+  if (isZcodeEdgeBlockedPage(trimmed)) {
+    return (
+      `上游边缘/网关拦截页（HTTP ${status} + HTML 文档，如阿里云 ESA）—— ` +
+      `请求没有到达业务层：这不是账号、额度或凭据问题（同刻其它端点正常），` +
+      `是上游边缘规则拦了推理路径，本机无法修复，反复重试也无益。` +
+      `请改用其它模型/provider，或等上游恢复。原始响应（截断）：${trimmed.slice(0, 80)}`
+    )
+  }
   return `HTTP ${status}：${suffix}`
 }
 
@@ -1831,6 +1879,7 @@ export function describeUpstreamError(
  * | `3007` captcha | `RATE_LIMIT` | **是** | 换新 param 就能过，值得重试 |
  * | **并发文案**（装在任意码里） | `RATE_LIMIT` | **是** | 等一下就能过（2026-10-06 事故） |
  * | `3012` 风控 | `PERMISSION` | **否** | 有账号冷却惩罚，重试会加重 |
+ * | **边缘拦截页**（HTML/`data-spm`） | `PERMISSION` | **否** | 请求没到业务层，退避重试打不动边缘规则（2026-10-06） |
  * | `1002`/401 | `AUTH` | 否 | 需用户重新登录 |
  * | `1113` 余额 / `1005` 额度 | `QUOTA_EXCEEDED` | **否** | 确定性错误（等重置/充值） |
  * | 其余 5xx | `SERVER` | 是 | 暂时性 |
@@ -1865,10 +1914,60 @@ export function httpErrorCodeForZcode(status: number, body: string): string {
     return 'QUOTA_EXCEEDED'
   }
   if (status === 401 || trimmed.includes('1002')) return 'AUTH'
+  /**
+   * ★ **边缘拦截页必须归不可重试**（2026-10-06 真实故障）。
+   *
+   * 阿里云 ESA 在推理路径上回 `405` + HTML 文档（`data-spm` / `<title>405</title>`）。
+   * 原先它落到最后那行 `return 'SERVER'` —— 而 `SERVER` **在 harness 的可重试集合里**
+   * ⇒ 用户白等 5 轮退避（约 15.5 秒），且每轮都必然再撞同一张边缘页
+   * （边缘规则不会因为退避而改变）。实测该形态在 48 小时内出现 127 次，
+   * 每次都白退避 —— 这正是「卡死」观感的另一半。
+   *
+   * 归 `PERMISSION` 的理由与 `3012` 相同：**确定性、且重试有害无益**
+   * （对边缘层反复打只会加深风控画像）。用户该做的是换 provider 或等上游修。
+   *
+   * ⚠ 判据放在 `1005`/`3007`/`3012` 之后：那些是**业务码**，必须优先命中
+   * （业务码可能被网关用 HTML 之外的形态包裹，且它们的处置各不相同）。
+   * ⚠ 判据用**响应形态**（HTML 文档 / 网关特征）而非状态码：后端原生 404 是
+   * 纯文本 `404 page not found`，与边缘的 HTML 405 形态截然不同（实测对照）。
+   */
+  if (isZcodeEdgeBlockedPage(trimmed)) return 'PERMISSION'
   if (status === 429) return 'RATE_LIMIT'
   if (status >= 500) return 'SERVER'
   if (status === 400) return 'INVALID_REQUEST'
   return 'SERVER'
+}
+
+/**
+ * 判断响应体是否是**边缘/网关拦截页**（而不是上游业务响应）。
+ *
+ * ## 为什么需要这条（2026-10-06）
+ *
+ * zcode 的推理端点 `POST /api/v1/zcode-plan/anthropic/v1/messages` 被阿里云 ESA
+ * 回 `405` + HTML 文档；而**同前缀、同凭据**的 `GET billing/balance` 回 `200`。
+ * 后端原生 404 则是纯文本 `404 page not found` —— 两种形态截然不同。
+ *
+ * ⇒ 判据是「**响应形态**」而不是状态码：拿状态码判会把「后端 405」与
+ * 「边缘 405」混为一谈，而两者的处置完全不同（前者可能是我们的请求形态错了，
+ * 后者我们什么都做不了）。
+ *
+ * 已识别特征：
+ * - HTML 文档起始（`<!doctype html>` / `<html …>`，允许 `error: ` 之类前缀）
+ * - 阿里云错误页标记 `data-spm`
+ * - `<title>4xx</title>`
+ *
+ * ⚠ **关键词必须窄**：模型正文里恰好讨论 HTML 的内容不能被误伤 ——
+ * 故要求 HTML **文档起始**（而不是出现任意 `<html>` 字样），
+ * 与 `probe-jethub-models.mjs` 的 `classify()` 同口径（两处判据必须一致，
+ * 否则探针判 `EDGE_BLOCKED` 而适配器判 `SERVER`，用户看到的行为就对不上了）。
+ */
+export function isZcodeEdgeBlockedPage(body: string): boolean {
+  const both = body.trim()
+  if (both.length === 0) return false
+  // 文档起始形态（允许 `error: ` / `HTTP 405：` 之类前缀，也允许紧跟在 JSON 转义之后）。
+  const looksLikeHtmlDoc = /(^|[:：]\s*|<)\s*<(!doctype\s*html|html(\s+[a-z-]+=|>))/i.test(both)
+  const looksLikeEdgePage = /data-spm|<title>\s*4\d\d\s*<\/title>/i.test(both)
+  return looksLikeHtmlDoc || looksLikeEdgePage
 }
 
 /**
