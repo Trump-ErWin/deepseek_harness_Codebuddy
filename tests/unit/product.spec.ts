@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { CODEBUDDY, WORKBUDDY, productById } from '../../src/product.js'
+import { isKnownReasoningEffort } from '../../src/reasoning-ladder.js'
 
 describe('产品配置', () => {
   it('CodeBuddy 使用 ide platform、codebuddy 产品码与中国区端点', () => {
@@ -133,6 +134,52 @@ describe('产品配置', () => {
         }
       }
     }
+  })
+
+  // ── issue IKJQSH：兜底表是这两个模型的唯一档位来源 ──
+  //
+  // 实测（2026-10-06，真实登录态直打）：国际版 `/v3/config` 对这两个模型
+  // **不下发 supportedEfforts**，只给单值 `reasoning: {effort:"high"}`；
+  // 而 `parseModelMeta`（src/buddy.ts:905）不认 `effort`，故远端表态被静默忽略，
+  // 最终落到本表 ⇒ 表里写什么，用户就有什么可用。
+  //
+  // ⚠️ 为什么 CodeBuddy 那条不改：实测中国版远端**确实下发**
+  // `supportedEfforts: ["low","high","max"]`，兜底表与之一致，无需改动。
+  // 两条路径不可混为一谈 —— 远端表达与否，因端点而异。
+  it('workbuddy 的 deepseek-v4.1-flash 系列声明实测可用的五档（远端不下发列表，本表是唯一来源）', () => {
+    for (const id of ['deepseek-v4.1-flash', 'deepseek-v4.1-flash-sg']) {
+      const entry = WORKBUDDY.fallbackModels!.find((m) => m.id === id)
+      expect(entry, `workbuddy 应收录 ${id}`).toBeDefined()
+      expect(entry!.reasoningEfforts, id).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+      // 默认档必须落在声明档内，否则 resolveModel 静默丢弃、UI 无预选。
+      expect(entry!.reasoningEfforts).toContain(entry!.defaultReasoningEffort)
+    }
+  })
+
+  it('⚠️ 兜底表里凡声明了 5 档的条目，其档位集合必须是同表 GPT 系的子集（不得臆造）', () => {
+    // 防「凭空加档位」：本仓库多处教训是「不要臆造模型未声明的档位」。
+    // 5 档的合法来源只有实测记录（见 src/product.ts 对应条目的注释），
+    // 且必须能被 reasoning-ladder 的强度序识别（否则网关翻译会失准）。
+    const FIVE = ['low', 'medium', 'high', 'xhigh', 'max']
+    const five = WORKBUDDY.fallbackModels!.filter(
+      (m) => m.reasoningEfforts?.length === FIVE.length,
+    )
+    expect(five.length, '应至少有 workbuddy 的两个 deepseek-v4.1-flash 系列').toBeGreaterThan(0)
+    for (const model of five) {
+      expect([...FIVE].sort(), model.id).toEqual([...model.reasoningEfforts!].sort())
+      for (const effort of model.reasoningEfforts!) {
+        expect(isKnownReasoningEffort(effort), `${model.id}/${effort} 必须已登记强度序`).toBe(true)
+      }
+    }
+  })
+
+  it('CodeBuddy 的 deepseek-v4.1-flash 维持三档（实测中国版远端下发 ["low","high","max"]）', () => {
+    // 与 workbuddy 刻意不同：两站远端表达不同，不能互相套用。
+    const entry = CODEBUDDY.fallbackModels!.find((m) => m.id === 'deepseek-v4.1-flash')!
+    expect(entry.reasoningEfforts).toEqual(['low', 'high', 'max'])
+    // 中国版端点不存在 -sg 变体（实测 code:11102 service info not found），
+    // 故兜底表不该收录它 —— 收录会让选择器出现一个必然报错的模型。
+    expect(CODEBUDDY.fallbackModels!.some((m) => m.id === 'deepseek-v4.1-flash-sg')).toBe(false)
   })
 
   it('productById 能按 id 查到配置', () => {

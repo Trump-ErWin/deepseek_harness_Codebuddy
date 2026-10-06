@@ -828,6 +828,53 @@ describe('BuddyAdapter', () => {
       const resolved = await adapter.resolveModel('buddy', 'glm-5.1')
       expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['medium'])
     })
+
+    // ── issue IKJQSH 回归 ──
+    //
+    // 实测（2026-10-06）：国际版 `/v3/config` 对 deepseek-v4.1-flash / -sg
+    // **不下发 supportedEfforts**，只给单值 `reasoning: {effort:"high"}`，
+    // 而 `parseModelMeta` 不认 `effort` ⇒ 远端表态被静默忽略。
+    //
+    // ⚠️ 这意味着兜底表**不是**「远端不可用时的备胎」，而是这两个模型的
+    // **唯一**档位来源 —— 远端正常时也一样。所以这条用例必须锁死「远端下发
+    // 不带档位的条目」这个**正常**形态，而不是只测远端失败（那测不到真实现状）。
+    it('远端下发条目但不带 supportedEfforts 时，兜底表是对外唯一声明（workbuddy）', async () => {
+      const adapter = makeAdapter({
+        product: WORKBUDDY,
+        // ⚠️ 复刻实测的远端形态：有 id/name/maxOutputTokens，**无** reasoningEfforts。
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', maxOutputTokens: 128_000 },
+          { id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', maxOutputTokens: 128_000 },
+        ],
+      })
+      for (const id of ['deepseek-v4.1-flash', 'deepseek-v4.1-flash-sg']) {
+        const resolved = await adapter.resolveModel('workbuddy', id)
+        // 用户界面上能选到的档位 = 兜底表声明的那一组。
+        expect(resolved.reasoning?.efforts.map((e) => e.id), id)
+          .toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+        // max 必须真的进得来，否则 UI 选 max 会被 dsh-llm 抛 UNSUPPORTED_REASONING_EFFORT。
+        expect(resolved.reasoning?.efforts.some((e) => e.id === 'max'), `${id} 缺 max`).toBe(true)
+        expect(resolved.reasoning?.defaultEffort, id).toBe('high')
+      }
+    })
+
+    it('⚠️ 兜底表缩水会直接削掉用户的可选档位（反向验证：改回 ["high"] 用例必红）', async () => {
+      // 锁住「兜底表即唯一来源」这个因果：把产品配置换成单档后，max 必须消失。
+      // 只断言「声明了什么」是同义反复 —— 任何实现都能过。
+      const adapter = makeAdapter({
+        product: {
+          ...WORKBUDDY,
+          fallbackModels: WORKBUDDY.fallbackModels!.map((m) =>
+            m.id === 'deepseek-v4.1-flash'
+              ? { ...m, reasoningEfforts: ['high'] as const, defaultReasoningEffort: 'high' }
+              : m),
+        } as never,
+        fetchRemoteModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'DS' }],
+      })
+      const resolved = await adapter.resolveModel('workbuddy', 'deepseek-v4.1-flash')
+      expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['high'])
+      expect(resolved.reasoning?.efforts.some((e) => e.id === 'max')).toBe(false)
+    })
   })
 
   // 回归：dsh-llm 0.1.1-rc.2 的 LlmRuntime.prepareCall() 会直接调用
