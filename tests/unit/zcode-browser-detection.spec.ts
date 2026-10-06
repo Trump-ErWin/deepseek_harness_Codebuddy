@@ -109,49 +109,64 @@ describe('ZCode 浏览器探测', () => {
     if (found !== undefined) expect(isAbsolute(found)).toBe(true)
   })
 
-  it('★ 探测跟随 os.homedir()（家目录变化时结论跟着变，而不是读死的 env）', () => {
+  it('★ 探测跟随 os.homedir()：home 注入口优先于进程真实家目录', () => {
+    /**
+     * ★ 这条断言的方向改过三次，记下来免得后人又写错。
+     *
+     * 1. 最初断言「改 `USERPROFILE` 后仍能找到 `~/scoop` 的浏览器」——
+     *    要求 `homedir()` 不变，而独立 node 进程里它首次调用后就缓存（121）。
+     * 2. 改成「探测结论与 `homedir()` 一致」——方向对了，但仍**测不到目标**：
+     *    它靠 `setEnv('USERPROFILE', dir)` 让家目录变化，而 `USERPROFILE` 是
+     *    **Windows 专属变量**。darwin / linux 上它是空操作，实测：
+     *        homedir() 改前 = /Users/gandhi
+     *        homedir() 改后 = /Users/gandhi   ← 完全没变
+     *        临时目录含 AppData\Local\Temp = false（POSIX 形态）
+     *    于是走 `else` 分支，而该分支唯一的判据断言检查的是 **Windows 形态
+     *    子串** `AppData\Local\Temp\zcode-browser-home-`，在本机永远不可能出现
+     *    ⇒ **恒真断言等于没有断言**。
+     *
+     * 反向验证（决定性）：把实现改成读死 env，该用例在 macOS 上**照样全绿**：
+     *        - const home = input.home ?? homedir()
+     *        + const home = input.home ?? process.env.USERPROFILE ?? homedir()
+     *        → ✓ 探测跟随 os.homedir()  0ms
+     *
+     * ⇒ 现在照 `SCOOP 优先于默认 ~/scoop` 的范式：走纯函数
+     * {@link browserCandidates}、把平台钉死、让 `home` 注入口与「进程真实家目录」
+     * 取**不同的值**，于是「实现是否真的采用注入口」成为可失败判据。
+     */
     const dir = mkdtempSync(join(tmpdir(), 'zcode-browser-home-'))
     try {
-      setEnv('ZCODE_CHROME_PATH', undefined)
-      setEnv('USERPROFILE', dir)
-      /**
-       * ⚠ 这条用例的**断言方向**改过两次，记下来免得后人又写错。
-       *
-       * 实测到的两个事实：
-       * 1. **独立 node 进程**里 `os.homedir()` 首次调用后**缓存** ——
-       *    之后再改 `USERPROFILE` 不生效。（`.tmp-zcode/run-no-ide-verify.ps1`
-       *    就是靠「另起进程」才让沙箱生效的。）
-       * 2. **vitest worker** 里 `homedir()` **会**跟着 `USERPROFILE` 变
-       *    （实测：改成临时目录后 `homedir()` 立刻返回该目录）。
-       *
-       * ⇒ 正确断言不是「改 env 后仍能找到 ~/scoop 的浏览器」
-       * （那要求 `homedir()` 不变，在 vitest 下不成立），
-       * 而是「**探测结论与 `homedir()` 一致**」—— 这才真正验证了
-       * 「实现用 `homedir()` 而不是读某个写死的环境变量」。
-       */
-      const home = homedir()
-      const expectedScoop = join(home, 'scoop', 'apps', 'chromium', 'current', 'chrome.exe')
-      const found = findBrowserExecutable()
+      const appsDir = join(dir, 'scoop', 'apps', 'chromium', 'current')
+      mkdirSync(appsDir, { recursive: true })
+      const exe = join(appsDir, 'chrome.exe')
+      writeFileSync(exe, '')
 
-      if (existsSync(expectedScoop)) {
-        expect(found).toBe(expectedScoop)
-      } else {
-        /**
-         * 家目录下没有 scoop chromium（本用例把 `USERPROFILE` 指到了空目录，
-         * 通常就是这种情形）⇒ 结果必须**不含**任何来自旧家目录的路径，
-         * 也不该凭空返回一个不存在的东西。
-         */
-        if (found !== undefined) {
-          expect(isAbsolute(found)).toBe(true)
-          expect(existsSync(found)).toBe(true)
-        }
-        // 关键：不能返回「旧家目录」下的 scoop（那说明读的是缓存/env 而非 homedir()）。
-        expect(found ?? '').not.toContain('AppData\\Local\\Temp\\zcode-browser-home-')
-      }
+      const candidates = browserCandidates({
+        platform: 'win32',
+        env: { ZCODE_CHROME_PATH: undefined },
+        // ⚠ 刻意给一个**不同于真实家目录**的值：判据成立的唯一前提就是这个差异。
+        home: dir,
+      })
+
+      // 判据 1：注入的家目录被采用 —— 默认 `~/scoop` 路径的第一条即命中它。
+      expect(candidates[0]).toBe(exe)
+      // 判据 2：若实现忽略注入口、改读 `homedir()`，首条就**不会**是它 ⇒ 变红。
+      expect(candidates[0]).not.toContain(realHomeScoop())
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  /**
+   * 真实家目录下的默认 scoop 路径（用于「实现是否读了真实 `homedir()`」的反向判据）。
+   *
+   * ⚠ 单独抽成函数而不是内联 `homedir()`：内联的话，`home: dir` 与判据 2 用的是
+   * 同一个值，判据 2 会退化成「`exe` 不含它自己」的恒真断言 —— 与它要防的
+   * 恒真问题同型。这里刻意让两者取不同的来源。
+   */
+  function realHomeScoop(): string {
+    return join(homedir(), 'scoop', 'apps', 'chromium', 'current', 'chrome.exe')
+  }
 
   it('★ SCOOP 显式声明的根目录**优先于**默认 ~/scoop', () => {
     /**
