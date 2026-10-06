@@ -1070,6 +1070,40 @@ Hy3 · x0.05 X                      (hy3-x)
 - 两个任务端点是**不同 schema，必须合并读**：`/v2/activity/growth/tasks`
   （`task_code` + `accept_status` + `progress`）与 `/activity/growth/tasks`
   （`code` + `status`，**无** progress）。只读前者 ⇒ 后者那 5 项永远进不了待办。
+  ⚠️ **两族的码字段名也不同**（`task_code` / `code`），且**扫尾补领也有同样要求**
+  —— `listAllGrowthTaskCodes` 与 `fetchGrowthTaskCodes` 必须同时满足
+  「合并两端点」+「双字段读取」，任一处漏掉都会让任务**静默漏领**（不报错）。
+
+#### 扫尾补领与逐项完成是**两条独立路径**（改动前必读）
+
+「扫尾」补领的是**已达标未领取**的奖励，而这类任务按定义已是 `completed`、
+**不在** `actionable` 里（后者只含 `not_accepted` / `in_progress`）。因此：
+
+- `actionable` 为空**不能**提前 return —— 那会让扫尾永不执行，账号里所有
+  已达标未领的奖励一个都领不到（实测修复前 claim 次数为 0）；
+- 接取（accept）失败也**不能**短路扫尾 —— 接取只影响本轮新接的任务；
+- 时间预算必须在**扫尾之前**算好，否则 `actionable` 为空时扫尾会绕过 deadline
+  对全量任务逐个 POST。
+
+这三条都由 `tests/unit/buddy-growth.spec.ts` 的「扫尾补领的覆盖面」段锁住。
+
+#### `code 400` 必须**同时看 `msg`**（否则会把真失败谎报成「已领奖」）
+
+成长端点用同一个 `code 400` 表达两种语义：
+
+| msg | 语义 | 归类 |
+|---|---|---|
+| `no unclaimed travel` / `insufficient energy` / `please accept buddy adoption agreement first` | **没有可领对象** | `no-object` → `already-claimed`（幂等终态） |
+| `task not completed` / 其它 | **真失败** | `failed` |
+
+只认 `code` 会把 `task not completed` 一并归成「已领到积分」（用户看到成功、
+实际一分没有）。白名单外的文案一律判失败 —— **宁可漏判不可误伤**：漏判只让正常
+终态显示成失败（用户多点一次，无害），误伤会把真失败谎报成成功。
+
+同理，**claim 端点的成功判据是显式 `code === 0`**，不能写
+`code !== undefined && code !== 0` —— 那样「响应里没有 `code`」会被当成成功，
+网关错误体（`{msg:'Unauthorized'}` 这类）就被谎报成「已领取奖励（+0 积分）」
+并计入 `claimedCount`。
 
 #### 全新账号需要点两次（服务端解锁，不是缺陷）
 

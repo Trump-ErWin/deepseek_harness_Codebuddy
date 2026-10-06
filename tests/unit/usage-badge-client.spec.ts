@@ -209,6 +209,81 @@ describe('用量徽标：槽位接线', () => {
   })
 })
 
+/**
+ * 「一键领取积分」的**重入闸门**（复审 !62 补）。
+ *
+ * 背景：成长任务一轮单账号实测 90～270s（数十个上游请求），而按钮的
+ * `disabled: claiming` 依赖**异步** state（`setClaiming(true)` 要等 re-render
+ * 才生效）。同一 tick 内连点两次时，第二次读到的 `claiming` 仍是 `false`
+ * ⇒ 两轮全量领取并发跑，对同一账号同一批任务并发 `POST /v2/report` 与 claim，
+ * 幂等全押在服务端，并放大风控面。
+ *
+ * ⇒ 必须用 `useRef` 做**同步**闸门（写 ref 不经 React 调度），
+ * 与同文件既有的 `pollRef`（登录重入）同款做法。
+ *
+ * ⚠️ 与 `usage-badge-client.spec.ts` 的其余用例同理：这里只能做**源码级断言**
+ * （`plugin-src/client/jet-hub.js` 依赖宿主注入的 react，vitest 里渲染不了）。
+ */
+describe('一键领取的重入闸门（成长任务一轮可达数分钟）', () => {
+  const hub = read('plugin-src/client/jet-hub.js')
+  const hubCode = codeOf(hub)
+
+  it('用 useRef 做同步闸门，而不是拿 claiming（state）当判据', () => {
+    expect(hub).toContain('claimInFlightRef = React.useRef(false)')
+    // 闸门必须是 claimCredits 的**首个**守卫（在任何 await 之前）：
+    // 断言 `if (claimInFlightRef.current)` 出现在函数体内、且早于 setClaiming。
+    const fnStart = hubCode.indexOf('const claimCredits = async () =>')
+    expect(fnStart).toBeGreaterThan(-1)
+    const guard = hubCode.indexOf('if (claimInFlightRef.current)', fnStart)
+    const setClaiming = hubCode.indexOf('setClaiming(true)', fnStart)
+    expect(guard).toBeGreaterThan(fnStart)
+    expect(setClaiming).toBeGreaterThan(guard)
+  })
+
+  it('拦住后必须给出提示，不得静默 return（IKJLK3 B 的同款教训）', () => {
+    // 用户看到「点了没反应」分不清「没反应」与「正在处理」——成长任务
+    // 一轮数分钟，必须明确告知还在跑。
+    expect(hub).toContain('上一次领取仍在进行中')
+  })
+
+  it('闸门必须无条件释放，不能跟着 mounted 一起判', () => {
+    // 若写成 `if (mounted.current) claimInFlightRef.current = false`（或包在
+    // `if (mounted.current) { … }` 块里），卸载后闸门永久停在 true
+    // ⇒ 切回面板再点永远收到「上一次仍在进行中」——闸门卡死。
+    //
+    // ⚠️ 判据必须**直接检查该语句所在的行**，不能只用「回看若干字符」的正则：
+    // 把闸门与 `if (mounted.current)` 写在**同一行**时，任何向前回看的窗口都
+    // 匹配不到（反向验证时实测到了这个漏洞，改坏了却不变红）。
+    const guardLines = hubCode
+      .split('\n')
+      .filter((line) => line.includes('claimInFlightRef.current = false'))
+    expect(guardLines.length).toBeGreaterThanOrEqual(1)
+    for (const line of guardLines) {
+      // 允许「同一行里先有 mounted 判定」以外的任何写法；只禁两种常见误写：
+      // ① 与该赋值同行出现 `if (mounted.current)`
+      // ② 该赋值被 `if (mounted.current) {` 之后紧邻（同块首句）
+      expect(line).not.toMatch(/if \(mounted\.current\)/)
+    }
+    // 卸载清理那一处（与 pollRef 同块）本就**应该**在 `mounted.current = false`
+    // 之后执行 —— 它清闸门是刻意的，故上面只禁「同行带 mounted 判定」，
+    // 不禁「位于清理函数内」。
+  })
+
+  it('卸载 / 切 provider 时清闸门（否则新面板首次点击被误拦）', () => {
+    // 该清理 effect 依赖 provider：切渠道会重跑（mounted 复位为 true）。
+    // 闸门若残留 true，新 provider 面板的首次点击会被误判成「仍在进行中」。
+    // 断言「清理函数里也把闸门置回 false」——即该赋值出现**两次以上**
+    // （finally 一次 + 卸载清理一次）。
+    const assignments = hubCode.split('claimInFlightRef.current = false').length - 1
+    expect(assignments).toBeGreaterThanOrEqual(2)
+    // 且其中一次必须与 pollRef 的清理同处一个清理函数内。
+    const cleanupIdx = hubCode.indexOf('clearInterval(pollRef.current); pollRef.current = 0;')
+    expect(cleanupIdx).toBeGreaterThan(-1)
+    const afterCleanup = hubCode.slice(cleanupIdx, cleanupIdx + 400)
+    expect(afterCleanup).toContain('claimInFlightRef.current = false')
+  })
+})
+
 describe('用量徽标：渲染门控与轮询', () => {
   const badge = read('plugin-src/client/usage-badge.js')
   const badgeCode = codeOf(badge)

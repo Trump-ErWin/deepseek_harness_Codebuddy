@@ -403,13 +403,23 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
  *
  * 该产品**没有**每日签到积分接口（内核中只有 `/v2/billing/meter/get-dosage-notify`），
  * 因此 Jet Hub 不为其渲染「一键领取积分」按钮；积分领取在 CodeBuddy 侧完成。
+ *
+ * ⚠️ 上面那句「不渲染按钮」直接决定了下面的 `claimBase` / `webBase` **当前不可达**：
+ * 成长任务入口是同一个按钮（客户端 `supportsCredits = supportsDailyCheckin(provider)`
+ * 为门控，`workbuddy` 在能力表里 `dailyCheckin: false`），按钮不渲染 ⇒
+ * `credits.claimAll({ runTasks: true })` 永远传不进来。故这两个字段填的是
+ * 「同一产品线的网页站」推断值，**国际版未实测**（中国版 `www.workbuddy.cn` 已实测可达）。
+ * 若将来给 workbuddy 开放签到按钮，必须先用真实账号验证 `www.workbuddy.ai` 上
+ * `/activity/growth/tasks/<code>/claim` 与 `/v2/report` 的行为，再放开。
  */
 export const WORKBUDDY: BuddyProduct = {
   id: 'workbuddy',
   platform: 'workbuddy-ai',
   endpoint: 'https://www.workbuddy.ai',
   apiDomain: 'www.workbuddy.ai',
+  /** ⚠️ 未实测：见上方注释（该路径当前不可达）。 */
   claimBase: 'https://www.workbuddy.ai',
+  /** ⚠️ 未实测：见上方注释（该路径当前不可达）。 */
   webBase: 'https://www.workbuddy.ai',
   displayName: 'WorkBuddy (国际版)',
   productCode: 'workbuddy',
