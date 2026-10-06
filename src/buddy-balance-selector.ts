@@ -101,6 +101,27 @@ export type BuddySelectionResult
   | { ok: false; reason: BuddyNoAccountReason }
 
 /**
+ * `fetchBalance` 的**条件必填**规则（2026-10-06 PR !68 审计）。
+ *
+ * 只有 buddy 系能省略它（凭据结构相同，缺省实现直接调 `fetchCreditBalance`）。
+ * **其它 provider 必须显式传入** —— 否则编译器无从发现「忘了传」。
+ *
+ * ⚠️ 这不是洁癖：已实测漏传时 `tsc` **零报错**，而 `fetchCreditBalance` 会拿
+ * 异形的 `product` 拼 URL（`TraeProduct` 根本没有 `endpoint` 字段）⇒ 发出
+ * `undefined/...` 的畸形请求 → 余额恒查不到 → 未锁定时换号优化静默失效、
+ * 锁定时永远报「无法确认是否有可用账号」。这条漏洞比烧积分更难归因。
+ */
+type FetchBalanceRule<TProduct, TCredential> = TProduct extends BuddyProduct
+  ? {
+    /** 余额查询（缺省走真实的 `fetchCreditBalance`）。 */
+    fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
+  }
+  : {
+    /** ⚠️ 非 buddy provider **必填** —— 缺省会拼出畸形 URL 并静默失效。 */
+    fetchBalance: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
+  }
+
+/**
  * 选号依赖（便于单测注入）。
  *
  * ⚠️ **泛型化**（2026-10-06）：分档判据只读通用的
@@ -111,18 +132,13 @@ export type BuddySelectionResult
  * ⚠️ 唯一要求：`fetchBalance` 返回的 `CreditBalance.packages[]` 必须带
  * `deductionEndTime`（拿不到就归入永久桶，见 `splitBuddyCreditsByExpiry`）。
  */
-export interface BuddySelectionDeps<
+export type BuddySelectionDeps<
   TProduct = BuddyProduct,
   TCredential = BuddyCredential,
-> {
+> = {
   product: TProduct
   /** 解析某账号的凭据；返回 undefined 表示不可用。 */
   resolveCredential: (credentialRef: string) => Promise<TCredential | undefined>
-  /** 查询余额（默认真实的 `fetchCreditBalance`，单测注入桩）。 */
-  fetchBalance?: (
-    credential: TCredential,
-    product: TProduct,
-  ) => Promise<CreditBalance | null>
   /** 注入的 fetch（测试用）。 */
   fetcher?: typeof fetch
   /** 当前时间（测试用）。 */
@@ -133,7 +149,7 @@ export interface BuddySelectionDeps<
   errorTtlMs?: number
   /** 「临时积分」窗口覆盖（测试用）。 */
   windowMs?: number
-}
+} & FetchBalanceRule<TProduct, TCredential>
 
 /**
  * 一次余额查询的**原料**（缓存这个，而不是缓存分类结果）。
@@ -258,9 +274,19 @@ export class BuddyBalanceSelector<
 
     let balance: CreditBalance | null
     try {
-      // ⚠️ 缺省实现只适用于 buddy 系（凭据结构相同）。其它 provider 必须显式传
-      // `fetchBalance` —— 否则会把异形凭据喂给 `fetchCreditBalance`。
-      balance = await (this.deps.fetchBalance
+      // ⚠️ 缺省实现只适用于 buddy 系（凭据结构相同）。其它 provider 的
+      // `fetchBalance` 由 {@link FetchBalanceRule} 在**编译期**强制必填；
+      // 这里再加一道运行时防御 —— 万一有人用 `as` 绕过了类型，
+      // 宁可立刻抛一条能指认到原因的错，也不要发出 `undefined/...` 的畸形请求
+      // 让它变成一句无法归因的「余额查询失败」。
+      const injected = this.deps.fetchBalance
+      if (injected === undefined && typeof (this.deps.product as { endpoint?: unknown }).endpoint !== 'string') {
+        throw new Error(
+          `${(this.deps.product as { id?: string }).id ?? 'provider'} 未注入 fetchBalance，`
+          + '且产品配置没有 endpoint —— 选号器无法查询该 provider 的余额',
+        )
+      }
+      balance = await (injected
         ?? ((cred: TCredential, product: TProduct) =>
           fetchCreditBalance(cred as unknown as BuddyCredential, product as unknown as BuddyProduct, this.deps.fetcher ?? fetch)))(
         credential, this.deps.product,

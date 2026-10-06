@@ -682,12 +682,19 @@ export function apply(ctx: Context): void {
    *
    * 抽成局部函数而非内联两遍：选号器需要它查余额，而解析最终凭据又要用它 ——
    * 两处若各写一遍 JSON 解析，格式一变就会只改一处（与 Loomy 那条同因）。
+   *
+   * ⚠️ **形状校验必须与 `LobsteraiAuth` 的 `parseCredential` 对齐**（理由同
+   * TRAE 那份注释：裸 parse 会让损坏凭据一路流到适配器的
+   * `credential.access_token.length`，抛不可诊断的 TypeError）。
    */
   const resolveLobsteraiCredentialByRef = async (refName: string): Promise<LobsteraiCredential | undefined> => {
     const resolved = await ctx.credentials.resolve(credentialRef(refName))
     if (!resolved) return undefined
     try {
-      return JSON.parse(resolved.value) as LobsteraiCredential
+      const parsed = JSON.parse(resolved.value) as LobsteraiCredential
+      return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+        ? parsed
+        : undefined
     } catch {
       return undefined
     }
@@ -736,7 +743,9 @@ export function apply(ctx: Context): void {
       if (picked.credential) {
         // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
         if (picked.accountId !== undefined) reportLedgerAccount(LOBSTERAI.id, picked.accountId)
-        return picked.credential as LobsteraiCredential
+        // ⚠️ 不加 `as LobsteraiCredential`：泛型已正确推导，且 TS 的 `as` 只要
+        // 任一方向可赋值就放行（误断言成 `TraeCredential` 也能过），留着等于漏洞。
+        return picked.credential
       }
       // 回退到账号池的既有选择（凭据损坏的账号已被 tried 排除）。
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
@@ -746,13 +755,9 @@ export function apply(ctx: Context): void {
         reportLedgerAccount(LOBSTERAI.id, available.entry.id)
         return available.credential as LobsteraiCredential
       }
-      const resolved = await ctx.credentials.resolve(credentialRef(LOBSTERAI.defaultCredentialRef))
-      if (!resolved) return undefined
-      try {
-        return JSON.parse(resolved.value) as LobsteraiCredential
-      } catch {
-        return undefined
-      }
+      // ⚠️ 复用上面的解析器而不是再写一遍 JSON.parse：两处各写一遍时，
+      // 形状校验的强度会分叉（这正是 TRAE 那份注释记的坑）。
+      return resolveLobsteraiCredentialByRef(LOBSTERAI.defaultCredentialRef)
     },
     refresh: async () => {
       // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
@@ -919,12 +924,21 @@ export function apply(ctx: Context): void {
   /**
    * 按凭据 ref 解析 TRAE 凭据（供选号器查余额与最终取凭据共用）。
    * 抽成局部函数而非内联两遍的理由同 buddy / Loomy。
+   *
+   * ⚠️ **形状校验必须与 `TraeAuth` 的 `parseCredential` 对齐**（不可只 `JSON.parse`）：
+   * 裸 parse 会把 `{"foo":1}` 这种损坏凭据**当成有效凭据**返回，随后适配器的
+   * `credential.access_token.length` 抛 **TypeError**（而非可诊断的
+   * MISSING_CREDENTIAL），且发生在选号之后、不在余额查询的 try/catch 覆盖范围内。
+   * 写两遍、强度还不一致 = 改一处漏一处，故此处与 `trae-auth.ts` 保持同一判据。
    */
   const resolveTraeCredentialByRef = async (refName: string): Promise<TraeCredential | undefined> => {
     const resolved = await ctx.credentials.resolve(credentialRef(refName))
     if (!resolved) return undefined
     try {
-      return JSON.parse(resolved.value) as TraeCredential
+      const parsed = JSON.parse(resolved.value) as TraeCredential
+      return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+        ? parsed
+        : undefined
     } catch {
       return undefined
     }
@@ -955,13 +969,22 @@ export function apply(ctx: Context): void {
         selector: traeBalanceSelector,
         displayName: 'TRAE',
         modelId,
+        // 免费模型跳过「锁定 + 临期积分」这道门（判据见 TraeAdapter.isFreeModel）。
+        // ⚠️ TRAE 确有 `rate: 0` 的合法免费模型（见 `trae.ts` 的 readConsumptionRate
+        // 注释与 `traeDisplayName` 把 0 显示成「免费」），不跳过就会在锁定时被
+        // 余额门拦下并报「积分都已用尽」—— 而免费模型根本不扣积分，报错完全误导。
+        // `traeAdapter` 在此处是自引用：闭包只在注册完成后才执行，故无 TDZ 问题。
+        isFreeModel: await traeAdapter.isFreeModel(modelId),
         // ⚠️ 必须传 TRAE 自己的解析器（缺省值是 buddy 系的）。
         resolveCredential: resolveTraeCredentialByRef,
       })
       if (picked.credential) {
         // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
         if (picked.accountId !== undefined) reportLedgerAccount(TRAE.id, picked.accountId)
-        return picked.credential as TraeCredential
+        // ⚠️ 不要加 `as TraeCredential`：泛型已正确推导出该类型，而 TS 的 `as`
+        // 只要**任一方向**可赋值就放行 —— 实测把这里的凭据**误断言成
+        // `LobsteraiCredential`** 也能通过，等于留了个静默的类型漏洞。
+        return picked.credential
       }
       // 回退到账号池的既有选择（凭据损坏的账号已被 tried 排除）。
       // ⚠️ `modelId` 必须透传：限流是**按模型**记的（`modelRateLimits[model]`），
@@ -974,13 +997,8 @@ export function apply(ctx: Context): void {
         reportLedgerAccount(TRAE.id, available.entry.id)
         return available.credential as TraeCredential
       }
-      const resolved = await ctx.credentials.resolve(credentialRef(TRAE.defaultCredentialRef))
-      if (!resolved) return undefined
-      try {
-        return JSON.parse(resolved.value) as TraeCredential
-      } catch {
-        return undefined
-      }
+      // ⚠️ 复用上面的解析器而不是再写一遍 JSON.parse（同 LobsterAI 那处的理由）。
+      return resolveTraeCredentialByRef(TRAE.defaultCredentialRef)
     },
     refresh: async () => {
       const available = await pool.getAvailableAccount(TRAE.id, '')
