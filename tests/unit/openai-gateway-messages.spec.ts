@@ -216,6 +216,14 @@ describe('OpenAI gateway request conversion', () => {  it('parses a namespaced m
     expect(normalizeMaxTokens(32000, 'codearts', 'GLM-5.2')).toBe(32000)
     expect(normalizeMaxTokens(128000, 'qoder', 'qfmodel')).toBe(128000)
   })
+  it.each(['glm-5.3-flash', 'deepseek-v4.1-flash'])(
+    'clamps the CodeArts %s output budget', (model) => {
+      expect(normalizeMaxTokens(128000, 'codearts', model)).toBe(65536)
+      expect(normalizeMaxTokens(32000, 'codearts', model)).toBe(32000)
+      expect(normalizeMaxTokens(undefined, 'codearts', model)).toBeUndefined()
+      expect(normalizeMaxTokens(128000, 'buddy', model)).toBe(128000)
+    },
+  )
 
   it('maps CodeArts generic levels even when legacy runtime omits reasoning metadata', () => {
     expect(normalizeReasoningEffort('high', undefined, 'codearts', 'deepseek-v4-flash')).toBe('on')
