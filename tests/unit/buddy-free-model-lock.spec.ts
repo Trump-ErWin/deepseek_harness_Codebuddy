@@ -142,7 +142,11 @@ describe('免费模型跳过永久积分锁定', () => {
       const end = freeBranch.indexOf('const allowPermanent')
       const block = freeBranch.slice(0, end)
       expect(block).toContain('for (const candidate of candidates)')
-      expect(block).toContain('resolveBuddyCredentialByRef')
+      // ⚠️ 2026-10-06 泛化后这里调的是局部 `resolveCredential`（= 入参或 buddy 缺省值），
+      // 不再是直接引用 `resolveBuddyCredentialByRef` —— 后者只作为**缺省值**出现在
+      // 函数头部。断言改为检查实际调用点，语义不变（免费路径必须解析凭据）。
+      expect(block).toContain('await resolveCredential(candidate.credentialRef)')
+      expect(fnBody).toContain('options.resolveCredential')
     })
 
     it('免费路径不调用余额分档（免费模型无需选包）', () => {

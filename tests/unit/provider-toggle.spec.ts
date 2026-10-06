@@ -387,14 +387,30 @@ describe('供应商开关的样式约束（源码级回归）', () => {
 
   /**
    * ⚠️ 页头按钮必须排成一排（用户报障：加了开关入口之后「关闭」掉到第二行）。
-   * 三处配合缺一不可：brand 让出宽度、副标题单行省略、按钮组不参与收缩。
+   * 两处配合缺一不可：brand 让出宽度、按钮组不参与收缩。
    */
-  it('页头按钮排成一排：brand 可收缩 + 副标题单行省略 + 按钮组不收缩', () => {
+  it('页头按钮排成一排：brand 可收缩 + 按钮组不收缩', () => {
     expect(styles).toMatch(/\.dim-jh-brand \{[^}]*min-width: 0/)
-    expect(styles).toMatch(/\.dim-jh-brandDesc \{[^}]*white-space: nowrap[^}]*text-overflow: ellipsis/)
     expect(styles).toMatch(/\.dim-jh-headerActions \{[^}]*flex: none/)
     // 极窄窗口的兜底仍在：换行好过溢出到窗口外点不到。
     expect(styles).toMatch(/\.dim-jh-headerActions \{[^}]*flex-wrap: wrap/)
+  })
+
+  /**
+   * ⚠️ 页头副标题必须**保持删除**（用户 2026-10-06 要求：按钮太多，
+   * 「Jet Hub」下面那行「提供商凭据与多账号管理」既显示不全又挤占页头高度）。
+   *
+   * 这条是**反向断言**：初版删掉了 DOM 节点但没删 CSS、也没改这条用例，
+   * 于是「样式已无引用」这种残留不会被任何测试发现 —— 加回来就重新占位。
+   */
+  it('页头副标题已移除：DOM 无 brandDesc、样式表也不得再有该规则', () => {
+    // ⚠️ 只匹配**代码用法**（className 字面量 / CSS 规则），不匹配注释 ——
+    // 上面的注释故意保留「曾有副标题」这段历史，读到就红会逼后人删掉它。
+    expect(source).not.toMatch(/className: 'dim-jh-brandDesc'/)
+    expect(styles).not.toMatch(/\.dim-jh-brandDesc\s*\{/)
+    // 标题本体必须还在（不能连「Jet Hub」一起删掉）。
+    expect(source).toContain("'Jet Hub'")
+    expect(styles).toMatch(/\.dim-jh-brandName \{/)
   })
 })
 
@@ -677,6 +693,30 @@ describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () =>
         .filter(line => !line.trim().startsWith('//'))
         .join('\n');
       expect(codeOnly).toMatch(/保存排序失败[\s\S]{0,240}inModal:\s*true/)
+    })
+  })
+
+  // ⚠️ 2026-10-06 续作：主页 rail 跟随自定义排序 + 打开 Jet Hub 默认选中
+  // 自定义序第一位的供应商（用户需求，本机已验收）。
+  describe('自定义顺序的贯穿展示（主页 rail + 默认选中）', () => {
+    it('主页 rail 的已打开组按 providerOrder 排序（closed 组恒声明序沉底）', () => {
+      // ⚠️ renderRail 在 JetHubPage 里（ProviderSwitchPanel 之后），panelBody()
+      // 的结束锚切不到它 —— 用整份 source 断言。
+      expect(source).toContain('sortOpenProvidersByOrder(open, providerOrder)')
+      // 关闭组不参与自定义排序（用户口径：「这个逻辑不变」）。
+      expect(source).toContain("group(`已关闭 (${closed.length})`, closed, 'closed')")
+    })
+
+    it('默认选中卡片 = 自定义序第一位（providerTouchedRef 一次性纠偏）', () => {
+      // 三处关键代码齐全：ref 声明 + 纠偏 effect + selectProvider 置 touched。
+      expect(source).toContain('const providerTouchedRef = React.useRef(false);')
+      expect(source).toContain('providerTouchedRef.current = true;')
+      // 纠偏 effect 必须先查 touched，用户点过就不再接管。
+      expect(source).toMatch(/if \(providerTouchedRef\.current\) return;/)
+      // 「已打开」过滤：首位已关闭时跳到下一个 open（否则渲染出空面板）。
+      expect(source).toMatch(
+        /providerOrder\.find\(id => providerStatuses === null \|\| providerStatuses\?\.\[id\]\?\.closed !== true\)/,
+      )
     })
   })
 })

@@ -28,6 +28,7 @@ import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
 import type { ZcodeCredential } from './zcode.js'
 import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
+import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
@@ -48,6 +49,11 @@ import { CLINE } from './cline-product.js'
 import { configureDeadModelStore, withDeadModelPruning } from './dead-model-store.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
+// 「锁定永久积分」的余额分档需要各家的余额查询函数：分档判据
+// （`splitBuddyCreditsByExpiry`）只读通用的 `packages[].{active, remaining,
+// deductionEndTime}`，故把各家的 fetch 指给同一个选择器即可（见各自接线处）。
+import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
+import { fetchTraeCreditBalance } from './trae-credits.js'
 import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
 import type { ClineCredential } from './cline.js'
@@ -405,18 +411,32 @@ export function apply(ctx: Context): void {
   })
 
   /**
-   * buddy 系的选号编排：按「enabled + 模型未受限」筛候选 → 按余额分档选号 → 取凭据。
+   * 按到期分档的选号编排：按「enabled + 模型未受限」筛候选 → 按余额分档选号 → 取凭据。
    *
    * ⚠️ 余额分档**只在这批候选内部进行** —— 即与 Loomy 同一约定：策略建立在
    * 「模型没有受限且账号没有被停用」的基础上，不能因为某个号积分多就绕开限流标记。
    *
-   * @returns 选中账号的凭据；`credential` 为空时 `tried` 是「档位最优但凭据坏了」
-   * 的账号集合，调用方要把它作为排除集合传给 `getAvailableAccount` 继续兜底。
+   * ⚠️ **本函数与 provider 无关**（2026-10-06 泛化）：分档判据只读通用的
+   * `packages[].{ active, remaining, deductionEndTime }`，故 buddy 系、TRAE、
+   * LobsterAI 共用同一套编排 —— 差异全部由 `product` / `selector` /
+   * `resolveCredential` 三个入参承载。加新 provider 时**不要**复制本函数。
+   *
+   * @returns 选中账号的凭据与**账号 id**（后者供 Token 账本归属）；
+   *   `credential` 为空时 `tried` 是「档位最优但凭据坏了」的账号集合，
+   *   调用方要把它作为排除集合传给 `getAvailableAccount` 继续兜底。
    *   锁定且无可用账号时**抛错**（绝不回落，否则锁定形同虚设）。
    */
-  const pickBuddyCredential = async (options: {
-    product: BuddyProduct
-    selector: BuddyBalanceSelector
+  const pickBuddyCredential = async <TCredential = BuddyCredential, TProduct = BuddyProduct>(options: {
+    /**
+     * 目标 provider。**只要求 `id`**：本编排只用它查账号池与读锁定状态，
+     * 其余字段（endpoint / 积分口径等）全部由 `selector` 自己持有。
+     *
+     * ⚠️ 早期写的是 `BuddyProduct`，泛化时收窄成最小接口 —— 否则 TRAE /
+     * LobsterAI 的产品类型（结构完全不同）会被类型系统拒绝，
+     * 迫使调用方做无意义的断言。
+     */
+    product: { readonly id: string }
+    selector: BuddyBalanceSelector<TProduct, TCredential>
     /** 报错文案里的产品名（用户要知道去哪个面板解锁）。 */
     displayName: string
     modelId?: string
@@ -428,7 +448,16 @@ export function apply(ctx: Context): void {
      * 误判成免费会让付费模型绕开锁定、真烧掉永久积分。故调用方只在确定时传 true。
      */
     isFreeModel?: boolean
-  }): Promise<{ credential?: BuddyCredential; tried: Set<string> }> => {
+    /**
+     * 按凭据 ref 解析凭据。缺省用 buddy 系那一个（两站同构）。
+     *
+     * ⚠️ 非 buddy 的 provider **必须显式传入**自己的解析器 —— 缺省值只做
+     * 「按 ref 解析 JSON」，对凭据结构不同的 provider 会解析出错误形状。
+     */
+    resolveCredential?: (refName: string) => Promise<TCredential | undefined>
+  }): Promise<{ credential?: TCredential; accountId?: string; tried: Set<string> }> => {
+    const resolveCredential = options.resolveCredential
+      ?? (resolveBuddyCredentialByRef as unknown as (refName: string) => Promise<TCredential | undefined>)
     const tried = new Set<string>()
     const candidates = pool
       .listAccountsByProvider(options.product.id)
@@ -452,8 +481,8 @@ export function apply(ctx: Context): void {
     // 限流过滤仍然生效（上面的 filter），不会因免费而绕开模型级限流标记。
     if (options.isFreeModel === true) {
       for (const candidate of candidates) {
-        const credential = await resolveBuddyCredentialByRef(candidate.credentialRef)
-        if (credential !== undefined) return { credential, tried }
+        const credential = await resolveCredential(candidate.credentialRef)
+        if (credential !== undefined) return { credential, accountId: candidate.id, tried }
         tried.add(candidate.id)
       }
       // 免费模型下若凭据全坏，仍落到下面的常规路径，以复用既有的错误语义
@@ -464,10 +493,10 @@ export function apply(ctx: Context): void {
 
     const picked = await pickBuddyAccount(options.selector, candidates, {
       allowPermanent,
-      resolveCredential: resolveBuddyCredentialByRef,
+      resolveCredential,
     })
     if (picked.kind === 'account') {
-      return { credential: picked.credential, tried: new Set(picked.tried) }
+      return { credential: picked.credential, accountId: picked.account.id, tried: new Set(picked.tried) }
     }
     for (const id of picked.tried) tried.add(id)
     if (picked.kind === 'locked') {
@@ -515,6 +544,12 @@ export function apply(ctx: Context): void {
    *
    * ⚠️ 这里**只改错误语义，不改可用性**：没有账号可用就是没有，压缩该失败
    * 仍然失败；修的是「用户看到的原因」。绝不静默换模型、也绝不绕过限流标记。
+   *
+   * ⚠️ **但「不改可用性」对 zcode 不成立** —— 正因如此，zcode **刻意不接**这条：
+   * 其余各家的兜底读的是 Jet Hub 登录路径下**从不被写入**的 `*_ACCESS_TOKEN`，
+   * 判定抛错时那条路本就取不到东西；而 zcode 的兜底 `zcode.current()` 会**再读
+   * 一次账号池**且不看 `enabled`、仍能返回凭据 —— 加判定会把本来能跑通的一发
+   * 变成硬失败。完整实测见 zcode 注册处那条注释。
    *
    * @param product - 目标 provider（用其 `id` 与 `displayName`）。**只要求这两个字段**：
    *   除 buddy / workbuddy 外，cline 也接这条（它同样会因模型级限流被挡住，
@@ -650,6 +685,49 @@ export function apply(ctx: Context): void {
   // 服务名由 LobsteraiAuth 依 product.id 派生，注册为 ctx.lobsteraiAuth。
   // 与其他 provider 一样不注册斜杠命令：入口在 Jet Hub 的 LobsterAI 面板。
   const lobsterai = new LobsteraiAuth(ctx)
+  /**
+   * 按凭据 ref 解析 LobsterAI 凭据（供选号器查余额与最终取凭据共用）。
+   *
+   * 抽成局部函数而非内联两遍：选号器需要它查余额，而解析最终凭据又要用它 ——
+   * 两处若各写一遍 JSON 解析，格式一变就会只改一处（与 Loomy 那条同因）。
+   *
+   * ⚠️ **形状校验必须与 `LobsteraiAuth` 的 `parseCredential` 对齐**（理由同
+   * TRAE 那份注释：裸 parse 会让损坏凭据一路流到适配器的
+   * `credential.access_token.length`，抛不可诊断的 TypeError）。
+   */
+  const resolveLobsteraiCredentialByRef = async (refName: string): Promise<LobsteraiCredential | undefined> => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      const parsed = JSON.parse(resolved.value) as LobsteraiCredential
+      return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+        ? parsed
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * LobsterAI 的**按余额优先选号器**（为「锁定永久积分」提供分档依据）。
+   *
+   * ⚠️ 复用 `BuddyBalanceSelector` 而不是新写一个：分档判据
+   * （`splitBuddyCreditsByExpiry`）只读通用的
+   * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
+   * LobsterAI 的 `fetchLobsteraiCreditBalance` 把 `expiresAt`（ISO 8601）归一化到
+   * `deductionEndTime`，故结构一致。
+   *
+   * ⚠️ **缓存不能跨站共用**（选择器内含按账号 id 的缓存），故每家一个实例。
+   *
+   * ⚠️ 到期时间缺失的包归入**永久桶**（`splitBuddyCreditsByExpiry` 的保守方向）：
+   * LobsterAI 实测所有包都带 `expiresAt`，故这条只在响应异常时生效 ——
+   * 那时宁可把它当「不会马上作废」（锁定时少用一个号），
+   * 也不要把长期积分误当快到期烧掉。
+   */
+  const lobsteraiBalanceSelector = new BuddyBalanceSelector({
+    product: LOBSTERAI,
+    resolveCredential: resolveLobsteraiCredentialByRef,
+    fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
+  })
   const lobsteraiAdapter = registerLobsteraiLlm(ctx, {
     credentialRef: credentialRef(LOBSTERAI.defaultCredentialRef),
     resolveCredential: async (modelId?: string) => {
@@ -657,20 +735,40 @@ export function apply(ctx: Context): void {
       // 保证不会串用 CodeBuddy / WorkBuddy / CodeArts 的凭据。
       // provider 实参用 LOBSTERAI.id 而非字面量 'lobsterai'：写死字面量在
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      //
+      // 优先按「快到期积分」分档选号（锁定永久积分时只挑有快到期积分的号）。
+      // 与 buddy 系同一套编排：候选先按「enabled + 模型未受限」筛，
+      // 分档只在这批候选内部进行 —— 不能因为某个号积分多就绕开限流标记。
+      const picked = await pickBuddyCredential({
+        product: LOBSTERAI,
+        selector: lobsteraiBalanceSelector,
+        displayName: 'LobsterAI',
+        modelId,
+        // ⚠️ 必须传 LobsterAI 自己的解析器：缺省值是 buddy 系的，
+        // 两者凭据结构不同（见各自 credential 类型）。
+        resolveCredential: resolveLobsteraiCredentialByRef,
+      })
+      if (picked.credential) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        if (picked.accountId !== undefined) reportLedgerAccount(LOBSTERAI.id, picked.accountId)
+        // ⚠️ 不加 `as LobsteraiCredential`：泛型已正确推导，且 TS 的 `as` 只要
+        // 任一方向可赋值就放行（误断言成 `TraeCredential` 也能过），留着等于漏洞。
+        return picked.credential
+      }
+      // 回退到账号池的既有选择（凭据损坏的账号已被 tried 排除）。
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
-      const available = await pool.getAvailableAccount(LOBSTERAI.id, modelId ?? '')
-      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      const available = await pool.getAvailableAccount(LOBSTERAI.id, modelId ?? '', picked.tried)
       if (available) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
         reportLedgerAccount(LOBSTERAI.id, available.entry.id)
         return available.credential as LobsteraiCredential
       }
-      const resolved = await ctx.credentials.resolve(credentialRef(LOBSTERAI.defaultCredentialRef))
-      if (!resolved) return undefined
-      try {
-        return JSON.parse(resolved.value) as LobsteraiCredential
-      } catch {
-        return undefined
-      }
+      // 退到单凭据 ref 之前先证明失败原因（见 `throwIfAllAccountsRateLimited`
+      // 的说明）：全被模型限流时报明确的限流错误，而不是降级成「请先登录」。
+      throwIfAllAccountsRateLimited(LOBSTERAI, modelId)
+      // ⚠️ 复用上面的解析器而不是再写一遍 JSON.parse：两处各写一遍时，
+      // 形状校验的强度会分叉（这正是 TRAE 那份注释记的坑）。
+      return resolveLobsteraiCredentialByRef(LOBSTERAI.defaultCredentialRef)
     },
     refresh: async () => {
       // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
@@ -740,6 +838,9 @@ export function apply(ctx: Context): void {
       }
       // 回退到单凭据路径：没有账号条目可标记，清空以免标记到过期的 id。
       activeQoderAccountId.set(QODER.id, undefined)
+      // 区分「全部限流」与「没登录」（见该助手的说明）—— 否则用户会去
+      // 重新登录，而凭据其实是好的（真实缺陷，Gitee IKJOZ9）。
+      throwIfAllAccountsRateLimited(QODER, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(QODER.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -798,6 +899,8 @@ export function apply(ctx: Context): void {
         return available.credential as QoderCredential
       }
       activeQoderAccountId.set(QODER_CN.id, undefined)
+      // 同国际版：区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(QODER_CN, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(QODER_CN.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -834,26 +937,86 @@ export function apply(ctx: Context): void {
   // 服务名由 TraeAuth 依 product.id 派生，注册为 ctx.traeAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 TRAE 面板。
   const trae = new TraeAuth(ctx)
+  /**
+   * 按凭据 ref 解析 TRAE 凭据（供选号器查余额与最终取凭据共用）。
+   * 抽成局部函数而非内联两遍的理由同 buddy / Loomy。
+   *
+   * ⚠️ **形状校验必须与 `TraeAuth` 的 `parseCredential` 对齐**（不可只 `JSON.parse`）：
+   * 裸 parse 会把 `{"foo":1}` 这种损坏凭据**当成有效凭据**返回，随后适配器的
+   * `credential.access_token.length` 抛 **TypeError**（而非可诊断的
+   * MISSING_CREDENTIAL），且发生在选号之后、不在余额查询的 try/catch 覆盖范围内。
+   * 写两遍、强度还不一致 = 改一处漏一处，故此处与 `trae-auth.ts` 保持同一判据。
+   */
+  const resolveTraeCredentialByRef = async (refName: string): Promise<TraeCredential | undefined> => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      const parsed = JSON.parse(resolved.value) as TraeCredential
+      return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+        ? parsed
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * TRAE 的**按余额优先选号器**（为「锁定永久积分」提供分档依据）。
+   *
+   * ⚠️ 同 LobsterAI：复用 `BuddyBalanceSelector`，因为分档判据只读通用的
+   * `packages[].{ active, remaining, deductionEndTime }`。TRAE 的
+   * `fetchTraeCreditBalance` 把条目级 `expire_time`（秒级 Unix）归一化到
+   * `deductionEndTime`，故结构一致。
+   *
+   * ⚠️ **缓存不能跨站共用**（选择器内含按账号 id 的缓存），故每家一个实例。
+   */
+  const traeBalanceSelector = new BuddyBalanceSelector({
+    product: TRAE,
+    resolveCredential: resolveTraeCredentialByRef,
+    fetchBalance: (credential, product) => fetchTraeCreditBalance(credential, product),
+  })
   const traeAdapter = registerTraeLlm(ctx, {
     credentialRef: credentialRef(TRAE.defaultCredentialRef),
     resolveCredential: async (modelId?: string) => {
+      // 优先按「快到期积分」分档选号（锁定永久积分时只挑有快到期积分的号）。
+      // 与 buddy 系同一套编排：候选先按「enabled + 模型未受限」筛，
+      // 分档只在这批候选内部进行 —— 不能因为某个号积分多就绕开限流标记。
+      const picked = await pickBuddyCredential({
+        product: TRAE,
+        selector: traeBalanceSelector,
+        displayName: 'TRAE',
+        modelId,
+        // 免费模型跳过「锁定 + 临期积分」这道门（判据见 TraeAdapter.isFreeModel）。
+        // ⚠️ TRAE 确有 `rate: 0` 的合法免费模型（见 `trae.ts` 的 readConsumptionRate
+        // 注释与 `traeDisplayName` 把 0 显示成「免费」），不跳过就会在锁定时被
+        // 余额门拦下并报「积分都已用尽」—— 而免费模型根本不扣积分，报错完全误导。
+        // `traeAdapter` 在此处是自引用：闭包只在注册完成后才执行，故无 TDZ 问题。
+        isFreeModel: await traeAdapter.isFreeModel(modelId),
+        // ⚠️ 必须传 TRAE 自己的解析器（缺省值是 buddy 系的）。
+        resolveCredential: resolveTraeCredentialByRef,
+      })
+      if (picked.credential) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+        if (picked.accountId !== undefined) reportLedgerAccount(TRAE.id, picked.accountId)
+        // ⚠️ 不要加 `as TraeCredential`：泛型已正确推导出该类型，而 TS 的 `as`
+        // 只要**任一方向**可赋值就放行 —— 实测把这里的凭据**误断言成
+        // `LobsteraiCredential`** 也能通过，等于留了个静默的类型漏洞。
+        return picked.credential
+      }
+      // 回退到账号池的既有选择（凭据损坏的账号已被 tried 排除）。
       // ⚠️ `modelId` 必须透传：限流是**按模型**记的（`modelRateLimits[model]`），
       // 传空串会让 `getAvailableAccount` 的限流过滤整体短路
       //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中，
       // 换号形同虚设（用户报障「没有切换」的根因之一）。
-      const available = await pool.getAvailableAccount(TRAE.id, modelId ?? '')
-      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
+      const available = await pool.getAvailableAccount(TRAE.id, modelId ?? '', picked.tried)
       if (available) {
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」。
         reportLedgerAccount(TRAE.id, available.entry.id)
         return available.credential as TraeCredential
       }
-      const resolved = await ctx.credentials.resolve(credentialRef(TRAE.defaultCredentialRef))
-      if (!resolved) return undefined
-      try {
-        return JSON.parse(resolved.value) as TraeCredential
-      } catch {
-        return undefined
-      }
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(TRAE, modelId)
+      // ⚠️ 复用上面的解析器而不是再写一遍 JSON.parse（同 LobsterAI 那处的理由）。
+      return resolveTraeCredentialByRef(TRAE.defaultCredentialRef)
     },
     refresh: async () => {
       const available = await pool.getAvailableAccount(TRAE.id, '')
@@ -1050,6 +1213,9 @@ export function apply(ctx: Context): void {
       }
 
       // 兜底：账号池为空/全部不可解析时，退回单凭据 ref。
+      // ⚠️ 先证明失败原因是不是限流（见该助手的说明，IKJOZ9）：唯一启用账号
+      // 被该模型限流时，候选在上面的 filter 里已被筛空 —— 那不是「没登录」。
+      throwIfAllAccountsRateLimited(LOOMY, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(LOOMY.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1126,6 +1292,8 @@ export function apply(ctx: Context): void {
         reportLedgerAccount(RACCOON.id, available.entry.id)
         return available.credential as unknown as RaccoonCredential
       }
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(RACCOON, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(RACCOON.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1195,6 +1363,8 @@ export function apply(ctx: Context): void {
         reportLedgerAccount(MINIMAX.id, available.entry.id)
         return available.credential as unknown as MinimaxCredential
       }
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(MINIMAX, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(MINIMAX.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1286,6 +1456,8 @@ export function apply(ctx: Context): void {
         reportLedgerAccount(GEMINI.id, available.entry.id)
         return available.credential as unknown as GeminiCredential
       }
+      // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
+      throwIfAllAccountsRateLimited(GEMINI, modelId)
       const resolved = await ctx.credentials.resolve(credentialRef(GEMINI.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -1464,6 +1636,24 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
      * ⚠ 同时**清空**记录：没有账号条目可标记，留着旧 id 会误伤一个无辜账号。
      */
     activeZcodeAccountId.set(ZCODE.id, undefined)
+    // ⚠️⚠️ **刻意不接 `throwIfAllAccountsRateLimited`** —— 与 IKJOZ9 修好的那 8 家相反。
+    //
+    // 其余各家的兜底是读一个在 Jet Hub 登录路径下**从不被写入**的 `*_ACCESS_TOKEN`，
+    // 于是「池被限流筛空」必然一路退化成 `undefined` → 适配器误报「请先登录」
+    // —— 那才是 IKJOZ9 的症状。
+    //
+    // zcode 的兜底 `zcode.current()` 却会**再读一次账号池**
+    // （`zcode-auth.ts` 的 `readStoredCredential` → `readCredentialFromPool`），
+    // 且既不看 `enabled`、也不看 `modelRateLimits` ⇒ 池被筛空时它**照样返回凭据**。
+    //
+    // 实测（2026-10-06，真实 `apply()` + 真账号池，临时探针）：
+    //   · 唯一启用账号被限流、凭据合法 → **返回该凭据**，不抛「未登录」；
+    //   · 池里还有一个「停用但健康」的账号且**排在前面**（`readCredentialFromPool`
+    //     取数组序第一个能解析的）→ **返回那个停用账号的凭据**，请求能跑通。
+    //
+    // ⇒ ① zcode 没有 IKJOZ9 的症状，不该被"顺手修"；② 在第二种组合下，
+    // 加判定反而会把本来能跑通的一发变成硬失败。故保持原样。
+    // 回归断言见 `buddy-ratelimit-misreport.spec.ts` 的「zcode 同型缺陷判定」段。
     return await zcode.current()
   },
   refresh: async () => {
@@ -1651,7 +1841,11 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
 
   /**
-   * 十个 provider 实例的续期入口（`buddy` 与 `workbuddy` 是两个实例、同一个类）。
+   * 十三个 provider 实例的续期入口（`buddy` 与 `workbuddy` 是两个实例、同一个类；
+   * `qoder` 与 `qodercn` 同理）。
+   *
+   * ⚠️ 条数会随 provider 增长（早期写「十个」已过时）——注释里的数字**不是**契约，
+   * `tests/unit/refresh-bootstrap-wiring.spec.ts` 的清单才是。
    *
    * 收成一张表是为了让「失败必须留日志」这条规则**只写一遍** —— 原先这里是
    * 十个空 catch（注释写着「静默」），把 provider 内部的告警与异常一起吞掉，
@@ -1697,58 +1891,78 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     }
   }
 
-  // 启动时只要账号池非空，就安排首轮续期 + 定期续期。
+  // 启动时**无条件**武装续期调度器，并在账号入库时补一次武装。
   //
-  // ⚠️ 判据是「**池里有账号**」，不是「有 `refreshable` 的账号」（2026-10-02 修订）。
-  // 原先写成 `accounts.some(a => a.refreshable)`，于是这个定时器**是否武装**
-  // 取决于那批可能已经被误标成 false 的布尔 —— 而它存在的意义恰恰是去修正误标。
-  // 本次事故实测：36 条账号只剩 3 条 `true`（raccoon / minimax / cline 各一），
-  // 只要那三条被删或被同样误标，**codearts 的自愈与启动首轮会一起消失**，
-  // 且日志里一个字都不会有。各家 `refreshAll` 内部本来就按凭据材料 / 是否过期
-  // 过滤（`loomy` 只探已过期的、其余看 `refreshableOf(credential)`），
-  // 所以放宽这里的判据最多多一次本地遍历，不会白发请求。
+  // ⚠️ 空池判据（`isPoolEmpty`）**只用于日志措辞**，不再参与「是否武装」的决策。
+  // 它的历史形态是「按 `accounts.some(a => a.refreshable)` 决定武装」——
+  // 那让这个定时器**是否武装**取决于一批可能已被误标成 false 的布尔，而它存在
+  // 的意义恰恰是去修正误标。本次事故实测：36 条账号只剩 3 条 `true`
+  // （raccoon / minimax / cline 各一），只要那三条被删或被同样误标，
+  // **codearts 的自愈与启动首轮会一起消失**，且日志里一个字都不会有。
+  // 各家 `refreshAll` 内部本来就按凭据材料 / 是否过期过滤（`loomy` 只探已过期的、
+  // 其余看 `refreshableOf(credential)`），故放宽判据最多多一次本地遍历。
   //
   // ⚠️ 仍然**不看 `enabled`**（AGENTS.md 既有铁律）：停用只影响自动选号，
   // 不该让凭据停止续期。早期写成 `a.refreshable && a.enabled`，于是
   // 「所有账号都被停用」时续期定时器根本不启动，凭据一路烂到 refresh_token 失效。
   //
-  // ⚠️ **必须立刻先跑一轮**（issue !IKIRTT 的主缺陷）：早先这里只有
-  // `setInterval`，第一次处理要等满一个周期。短寿命 provider（cline 1 小时、
-  // codearts 约 2 小时、raccoon 3 小时）的凭据在宿主关闭期间早就到期了，
-  // 于是重启后**最长 30 分钟**一直显示「已过期」、积分行一直 401。
-  // 现在这一轮与 lead-time 过滤配合（`src/expiry-sync.ts` 的 `shouldRefreshNow`），
+  // ⚠️⚠️ **更不能因为「启动瞬间池为空」就不武装**（issue IKJOZB 的真实缺陷）：
+  // 冷启动空池是正常态（新用户、刚清过存储），而原先的 `if (accounts.length === 0)
+  // return` 让整个调度器**不被创建**、之后又没有重新武装的路径 ⇒ 该会话内登录的
+  // 账号**永远不会被主动续期**（只剩请求内按需续期），凭据悄悄过期而面板仍显示
+  // 「可自动续期」，且日志里一个字都没有。
+  // 现在武装与池内容彻底解耦（见 `src/refresh-scheduler.ts`）：
+  // ① 无条件武装；② 定时器内空池只记日志、下轮继续；③ `pool.onAccountAdded`
+  // 提供「入库即补武装」这条 issue 点名缺失的路径。
+  //
+  // ⚠️ **必须立刻先跑一轮**（issue !IKIRTT 的主缺陷，已内建在 `start()` 里）：
+  // 早先这里只有 `setInterval`，第一次处理要等满一个周期。短寿命 provider
+  // （cline 1 小时、codearts 约 2 小时、raccoon 3 小时）的凭据在宿主关闭期间
+  // 早就到期了，于是重启后**最长 30 分钟**一直显示「已过期」、积分行一直 401。
+  // 这一轮与 lead-time 过滤配合（`src/expiry-sync.ts` 的 `shouldRefreshNow`），
   // 只对「距过期不足 1 小时」的账号发续期请求，其余只做一次本地对账 ——
   // 既补上了首轮，又不会在启动时打出几十个无谓请求。
-  pool.listAllAccounts().then(accounts => {
-    if (accounts.length === 0) return
-    void refreshAllCredentials()
-    const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
-    refreshTimer.unref?.()
-    ctx.effect(() => () => {
-      clearInterval(refreshTimer)
-      service.stop()
-      buddy.stop()
-      workbuddy.stop()
-      lobsterai.stop()
-      qoder.stop()
-      qoderCn.stop()
-      trae.stop()
-      cline.stop()
-      loomy.stop()
-      zcode.stop()
-      // ⚠ 必须 dispose captcha 浏览器 —— 否则会留下孤儿 chromium
-      //（约 200-400MB，且用户没有界面能关掉它）。
-      zcodeAdapter.stop()
-    }, 'jet-hub: multi-account refresh scheduler')
-  }).catch((error: unknown) => {
-    // ⚠️ 原来这个 `.then()` **没有** `.catch()`：`listAllAccounts()` 一旦 reject
-    // （存储层异常），续期定时器就**永远不武装**，且日志里一个字都没有 ——
-    // 那时上面的「最长 30 分钟」会恶化成「永不自愈」。
+  const refreshScheduler = new MultiAccountRefreshScheduler({
+    refresh: refreshAllCredentials,
+    intervalMs: REFRESH_INTERVAL_MS,
+    isPoolEmpty: async () => (await pool.listAllAccounts()).length === 0,
+    // ⚠️ 可选链：`logger` 在极简 profile 下可能缺席，而日志不该成为续期的
+    // 单点故障（与仓库既有的 `ctx.logger?.warn?.()` 一致）。
+    info: (message) => ctx.logger?.info?.(message),
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // ⚠️ 不 await：`apply()` 是同步函数，而 `start()` 内含首轮续期（会发网络请求，
+  // 可达数十秒）。阻塞在这里会让插件启动卡住（与 opencode 能力预热同款约定）。
+  void refreshScheduler.start().catch((error: unknown) => {
+    // 走到这里说明 `refresh()` 或订阅通知本身出了意料之外的异常；`onTick`
+    // 内部已消化常规失败，故这条只是最后一道可观测性兜底。
     ctx.logger?.warn?.(
       `[jet-hub] 多账号续期调度器启动失败（本次会话不会自动续期）：`
       + `${error instanceof Error ? error.message : String(error)}`,
     )
   })
+  // issue IKJOZB 点名缺失的那条「重新武装的路径」：账号入库（登录成功、导入、
+  // 恢复备份）时若调度器未武装则补上。⚠️ 订阅点必须挂在 `AccountPool` 上，
+  // 不能逐个登录流程接线 —— 全仓库十几处 `pool.addAccount` 调用点，漏一处
+  // 就意味着那个 provider 静默地永不续期。
+  const unsubscribeAccountAdded = pool.onAccountAdded(() => { refreshScheduler.notifyAccountAdded() })
+  ctx.effect(() => () => {
+    unsubscribeAccountAdded()
+    refreshScheduler.stop()
+    service.stop()
+    buddy.stop()
+    workbuddy.stop()
+    lobsterai.stop()
+    qoder.stop()
+    qoderCn.stop()
+    trae.stop()
+    cline.stop()
+    loomy.stop()
+    zcode.stop()
+    // ⚠ 必须 dispose captcha 浏览器 —— 否则会留下孤儿 chromium
+    //（约 200-400 MB，且用户没有界面能关掉它）。
+    zcodeAdapter.stop()
+  }, 'jet-hub: multi-account refresh scheduler')
 
   // 保留旧的 stop scheduler（兼容旧命令）
   ctx.effect(() => () => {

@@ -11,9 +11,9 @@ const STYLES = `
    让 brand 可收缩，空间优先留给操作按钮。 */
 .dim-jh-brand { display: flex; flex-direction: column; min-width: 0; }
 .dim-jh-brandName { font-size: 18px; font-weight: 600; color: var(--dsw-alias-label-primary, #1a1a1a); }
-/* 副标题改单行省略号：它只是说明文字，让位给操作按钮比保全整句重要
-   （原先它会被折成两行，反而把页头撑高）。 */
-.dim-jh-brandDesc { font-size: 13px; color: var(--dsw-alias-label-secondary, #555); margin: 2px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* ⚠️ 副标题「提供商凭据与多账号管理」（.dim-jh-brandDesc）已删除
+   （用户 2026-10-06：按钮太多，副标题既被截断又挤占页头高度）。本页头只剩
+   「Jet Hub」标题一行，语义仍完整。**不要**把它加回来。 */
 
 /* 布局：对齐 dsh-im 的两栏 */
 .dim-jh-layout { display: flex; flex: 1; overflow: hidden; }
