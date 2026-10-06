@@ -1354,6 +1354,15 @@ describe('TRAE 适配器 · 流内错误换号（真实缺陷回归）', () => {
     expect(fetcher).toHaveBeenCalledTimes(2)
     expect(pool.getAvailableAccount).toHaveBeenCalled()
     expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    // ★ 冷却按类别（2026-10-05 修）：流内 4008 = quota-exceeded ⇒ **24h**，
+    //   不是旧的 1h 兜底。坏号 1 小时后被选回又 4008，正是「轮换好像不行」的
+    //   流内变体——此断言就是该缺陷的回归锁（反向验证：把实现改回 FALLBACK
+    //   常量时此断言变红）。
+    const markCall = vi.mocked(pool.updateModelRateLimit).mock.calls[0]
+    expect(markCall[0]).toBe('trae-1')
+    const cooldown = markCall[2] - Date.now()
+    expect(cooldown).toBeGreaterThan(23 * 3_600_000)
+    expect(cooldown).toBeLessThanOrEqual(24 * 3_600_000)
   })
 
   it('流内 event:error 1005 同样换号（plan 权益不足）', async () => {

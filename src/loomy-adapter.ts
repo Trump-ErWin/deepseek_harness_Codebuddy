@@ -224,6 +224,64 @@ export interface LoomyAdapterOptions {
   fetchImpl?: typeof fetch
 }
 
+// ── 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）────────
+
+/** 单次用户请求最多尝试的账号数（含首号）。与 buddy/raccoon 同语义，设上限只为防病态池。 */
+const LOOMY_MAX_ROTATE = 8
+/** 额度耗尽的冷却兜底：Loomy 的日额度（每日 5000）无可靠重置字段，按日配额记 24h。 */
+const LOOMY_QUOTA_COOLDOWN_MS = 24 * 3_600_000
+/** 429 限流冷却：1 小时（与 trae soft-rate 同档）。 */
+const LOOMY_RATE_LIMIT_COOLDOWN_MS = 3_600_000
+
+/**
+ * Loomy 的失败类别。**「要不要换号」与「要不要写冷却」是两件事**——
+ * 认证类（401/403）只换号、**绝不写冷却**。
+ *
+ * ⚠️ 真实事故（2026-10-06 凌晨，raccoon 同型实现上暴露）：上游网关对**全池**
+ * 回 `401 + authorization_verify_error`（网关侧授权校验故障）。当时把 401 也算
+ * 「可换号」且在换号前写冷却、时长取 `status === 429 ? 1h : 24h` ⇒ 一个请求内
+ * 连试 6 个号、每个写 24h ⇒ 池内候选筛空 ⇒ **整个 provider 被封一天**
+ * （下一次请求报 `no usable credential; log in first`）。
+ * buddy 的既有实现是分开的：只有限流类写标记，认证类只 `continue`。
+ */
+export type LoomyFailureClass = 'quota' | 'rate' | 'auth' | 'other'
+
+/**
+ * 判定失败类别（与 {@link RaccoonFailureClass} 同构——raccoon 与 loomy 的额度
+ * 错误形态同族：`14018 Credits exhausted`，HTTP 层无专用状态码，文案是主通道；
+ * 词表限「积分/额度/余额 + 不足/耗尽」的确定性组合，避免误伤正文里恰好讨论
+ * 「余额」的 4xx）。
+ */
+export function classifyLoomyFailure(errorText: string, status: number): LoomyFailureClass {
+  const lower = errorText.toLowerCase()
+  const quotaText = lower.includes('14018')
+    || lower.includes('credits exhausted')
+    || lower.includes('insufficient')
+    || (lower.includes('积分') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('额度') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('余额') && (lower.includes('不足') || lower.includes('耗尽')))
+    || (lower.includes('quota') && (lower.includes('exceeded') || lower.includes('exhausted')))
+  if (quotaText || status === 402) return 'quota'
+  if (status === 429) return 'rate'
+  if (status === 401 || status === 403) return 'auth'
+  return 'other'
+}
+
+/**
+ * 该失败是否值得「换下一个账号」重试。
+ *
+ * 导出仅供单测锁定判据本身——只靠调用点顺序兜不住边界（`isRateLimited`
+ * 的 429 边界那次已验证过）。
+ */
+export function shouldRotateLoomyAccount(errorText: string, status: number): boolean {
+  return classifyLoomyFailure(errorText, status) !== 'other'
+}
+
+/** 该类别是否要写冷却标记（`auth` 不在其中，见 {@link LoomyFailureClass}）。 */
+export function recordsLoomyRateLimit(cls: LoomyFailureClass): boolean {
+  return cls === 'quota' || cls === 'rate'
+}
+
 /** Loomy 模型适配器。chat 端点用 Bearer，业务端点用 token。 */
 export class LoomyAdapter extends LlmAdapter {
   private readonly product: LoomyProduct
@@ -428,6 +486,19 @@ export class LoomyAdapter extends LlmAdapter {
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('loomy: no usable credential; log in first', 'MISSING_CREDENTIAL')
     }
+    /**
+     * 当前请求实际使用的账号 id（请求级轮换的记账键）。语义与 raccoon 同款：
+     * 按 access_token 反查池内条目；单凭据兜底时保持空串（无池即无「下一个号」，
+     * 轮换自然失效，不误标）。
+     */
+    let activeAccountId = ''
+    if (this.options.accountPool) {
+      try {
+        activeAccountId = await this.options.accountPool.findAccountIdByCredential(
+          this.product.id, credential.access_token,
+        ) ?? ''
+      } catch { /* 反查失败不阻断主路径 */ }
+    }
 
     const messages = serializeMessages(options.messages, imageUrls)
 
@@ -521,11 +592,88 @@ export class LoomyAdapter extends LlmAdapter {
         throw new LlmError('loomy: credential expired and refresh failed', 'AUTH', { status: response.status })
       }
       response = await send(refreshed.access_token)
+      if (response.ok) credential = refreshed
     }
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+      let errorText = await response.text().catch(() => '')
+      let status = response.status
+      /**
+       * 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）。
+       *
+       * ## 为什么余额选号器救不了这个场景
+       *
+       * `loomy-balance-selector` 只在**取号时**按余额分档——余额查询与
+       * 实际扣费是两个时刻：查询时有钱、推理请求打过去时上游判额度耗尽
+       * （`14018 Credits exhausted`，日额度按次计费）。错误抛给 harness 后，
+       * 下次取号余额查询仍返回同样的排序，**同一个号被再次选中** ⇒
+       * 「卡死在一个号上」，直到它的余额 API 也刷新为止。
+       *
+       * ## 语义对齐 buddy
+       *
+       * - **可换**：额度耗尽（14018 / Credits / 积分不足等）、429、认证（401/403）；
+       *   **不可换**：其余 4xx（换号无益，按原错误抛）。
+       * - **每个账号只试一次**（`tried` 传池）。
+       * - **只有配额 / 限流类才写冷却**（24h / 1h）；**认证类只换号、绝不写标记**
+       *   —— 详见 {@link LoomyFailureClass} 记的 2026-10-06 全池被封事故。
+       * - **全部试完才报错**，带最后一次的真实原因。
+       * - ⚠️ 换到的号**绕过余额选号器**（直接用池的候选凭据）——选号器的
+       *   排序在「有余额的号」内部才有意义，此处候选已明确是坏号链，
+       *   池的手动顺序就是最合理的次序。
+       */
+      let failureClass = classifyLoomyFailure(errorText, status)
+      if (this.options.accountPool && failureClass !== 'other') {
+        const tried = new Set<string>()
+        if (activeAccountId) tried.add(activeAccountId)
+        const maxRotate = LOOMY_MAX_ROTATE - 1
+        for (let round = 0; round < maxRotate; round++) {
+          // ⚠️ auth 类**不写标记**：认证失败是账号态而非模型冷却，写了会把
+          //    网关侧授权故障放大成「全池封 24h」（2026-10-06 事故）。
+          if (activeAccountId && recordsLoomyRateLimit(failureClass)) {
+            await this.options.accountPool.updateModelRateLimit(
+              activeAccountId,
+              options.model,
+              Date.now() + (failureClass === 'rate'
+                ? LOOMY_RATE_LIMIT_COOLDOWN_MS
+                : LOOMY_QUOTA_COOLDOWN_MS),
+            )
+          }
+          const next = await this.options.accountPool.getAvailableAccount(
+            this.product.id, options.model, tried,
+          )
+          if (!next || tried.has(next.entry.id)) break
+          tried.add(next.entry.id)
+          const nextCred = next.credential as unknown as LoomyCredential
+          if (nextCred === undefined || nextCred.access_token.length === 0) break
+          activeAccountId = next.entry.id
+          response = await send(nextCred.access_token)
+          if (response.ok) {
+            credential = nextCred
+            // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回（既有说明见下）。
+            yield* consumeOpenAiSse(response, { signal: options.signal }, {
+              label: 'loomy',
+              firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
+              chunkTimeoutMs: resolveChunkTimeoutMs(),
+              ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+            })
+            return
+          }
+          errorText = await response.text().catch(() => '')
+          status = response.status
+          failureClass = classifyLoomyFailure(errorText, status)
+          if (failureClass === 'other') {
+            throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
+          }
+        }
+        throw new LlmError(
+          `loomy: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
+          failureClass === 'rate' ? 'RATE_LIMIT'
+            : failureClass === 'auth' ? 'AUTH'
+              : 'QUOTA_EXCEEDED',
+          { status },
+        )
+      }
+      throw new LlmError(`loomy: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
     }
 
     // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回，由 consumeOpenAiSse 处理。
