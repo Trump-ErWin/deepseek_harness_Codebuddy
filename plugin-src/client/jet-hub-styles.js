@@ -5,15 +5,14 @@
 const STYLES = `
 .dim-jh-page { display: flex; flex-direction: column; height: 100%; }
 .dim-jh-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 24px; border-bottom: 1px solid var(--dsw-alias-border-default, #e5e5e5); }
-/* ⚠️ min-width: 0 是「按钮排成一排」的关键：brand 是 flex 列，默认
-   min-width: auto 意味着它**不肯让出固有宽度** —— 页头按钮从 3 个增到 4 个
-   （新增「供应商」开关入口）之后，右侧按钮组被挤到换行，「关闭」掉到第二行。
-   让 brand 可收缩，空间优先留给操作按钮。 */
-.dim-jh-brand { display: flex; flex-direction: column; min-width: 0; }
-.dim-jh-brandName { font-size: 18px; font-weight: 600; color: var(--dsw-alias-label-primary, #1a1a1a); }
-/* ⚠️ 副标题「提供商凭据与多账号管理」（.dim-jh-brandDesc）已删除
-   （用户 2026-10-06：按钮太多，副标题既被截断又挤占页头高度）。本页头只剩
-   「Jet Hub」标题一行，语义仍完整。**不要**把它加回来。 */
+/* ⚠️ 页头左侧的标题块**已整块删除**（2026-10-07）：
+   ① 「Jet Hub」标题本体（.dim-jh-brand / .dim-jh-brandName）—— 页头一排已有
+      7 个按钮，标题只占宽度、不带任何操作。CSS 一并删除（留在样式表里的
+      「无引用规则」没有任何价值，只会在下次重构时被误当成生效样式）。
+   ② 副标题「提供商凭据与多账号管理」（.dim-jh-brandDesc）—— 2026-10-06，
+      按钮太多，副标题既显示不全又挤占页头高度。
+   ⚠️ **两者都不要加回来**：设置页语义由 .dim-jh-page 的 aria-label
+   「Jet Hub Provider 设置」与宿主左侧「Jet Hub」导航项承担，不丢。 */
 
 /* 布局：对齐 dsh-im 的两栏 */
 .dim-jh-layout { display: flex; flex: 1; overflow: hidden; }
@@ -175,10 +174,14 @@ const STYLES = `
 /* 面板标题下方的操作按钮组（显示列表 / 刷新积分 / 一键领取积分 / 重测所有 / 重置所有 / 新建账号）。
    允许换行：按钮数量随 provider 变化（CodeBuddy 有「一键领取积分」，其他没有），
    固定单行在窄面板下必然放不下。 */
-/* flex: none：按钮组不参与收缩 —— 配合 brand 的 min-width: 0，页头空间先给操作按钮。
-   ⚠️ 仍**保留** flex-wrap: wrap：窗口极窄到 brand 已经缩到底时，
-   让按钮换行远好过溢出到窗口外点不到。正常宽度下这一组必然排成一排。 */
-.dim-jh-headerActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex: none; }
+/* ⚠️ 本文件 CSS 装在**模板字符串**里 —— 注释内绝不能出现反引号，否则提前
+   闭合、esbuild 报 "Expected ; but found ..." 并把指针指到注释行（2026-10-07
+   在同一天内踩了两次，故把这条写进最常改的页头段落）。
+   ⚠️ 页头左侧标题块（.dim-jh-brand / .dim-jh-brandName）已删除（2026-10-07），
+   故按钮组改为**独占整行**（flex: 1 而非 none）：原先 space-between 靠左侧
+   标题把按钮推到右边，标题一删按钮会贴左，改用 flex: 1 + 左对齐保持原观感。
+   ⚠️ 仍**保留** flex-wrap: wrap：窗口极窄时让按钮换行远好过溢出到窗口外点不到。 */
+.dim-jh-headerActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
 
 /* 上一次「重测 / 重置」的结果提示 */
 .dim-jh-probeNotice { margin-bottom: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); background: var(--dsw-alias-bg-layer-2, #f7f8fa); font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); }

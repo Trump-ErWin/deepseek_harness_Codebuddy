@@ -389,28 +389,41 @@ describe('供应商开关的样式约束（源码级回归）', () => {
    * ⚠️ 页头按钮必须排成一排（用户报障：加了开关入口之后「关闭」掉到第二行）。
    * 两处配合缺一不可：brand 让出宽度、按钮组不参与收缩。
    */
-  it('页头按钮排成一排：brand 可收缩 + 按钮组不收缩', () => {
-    expect(styles).toMatch(/\.dim-jh-brand \{[^}]*min-width: 0/)
-    expect(styles).toMatch(/\.dim-jh-headerActions \{[^}]*flex: none/)
+  it('页头按钮排成一排：按钮组独占整行 + 极窄窗口仍换行', () => {
+    // ⚠️ 左侧标题块（.dim-jh-brand）已于 2026-10-07 删除，按钮组改为 flex: 1
+    // 独占整行（原先靠 brand 让出宽度 + flex: none 不收缩）。
+    expect(styles).toMatch(/\.dim-jh-headerActions \{[^}]*flex: 1 1 auto/)
     // 极窄窗口的兜底仍在：换行好过溢出到窗口外点不到。
     expect(styles).toMatch(/\.dim-jh-headerActions \{[^}]*flex-wrap: wrap/)
   })
 
   /**
-   * ⚠️ 页头副标题必须**保持删除**（用户 2026-10-06 要求：按钮太多，
-   * 「Jet Hub」下面那行「提供商凭据与多账号管理」既显示不全又挤占页头高度）。
+   * ⚠️ 页头左侧标题必须**保持删除**（两次删除，都不要加回来）：
+   *
+   * ① 副标题「提供商凭据与多账号管理」（.dim-jh-brandDesc）—— 2026-10-06：
+   *    页头按钮太多，副标题既显示不全又挤占页头高度。
+   * ② 标题本体「Jet Hub」（.dim-jh-brand / .dim-jh-brandName）—— 2026-10-07：
+   *    页头一排已有 7 个按钮，标题只占宽度、不带任何操作。用户报障截图里
+   *    「Jet Hub」还被折成两行（缺 white-space: nowrap），纯占地方。
    *
    * 这条是**反向断言**：初版删掉了 DOM 节点但没删 CSS、也没改这条用例，
    * 于是「样式已无引用」这种残留不会被任何测试发现 —— 加回来就重新占位。
+   *
+   * ⚠️ 语义不丢：`aria-label="Jet Hub Provider 设置"` 仍在 .dim-jh-page 上，
+   * 宿主左侧导航也有「Jet Hub」项 —— 刻意用 `not.toMatch` 禁死 DOM 用法。
    */
-  it('页头副标题已移除：DOM 无 brandDesc、样式表也不得再有该规则', () => {
+  it('页头左侧标题块已整块移除：DOM 与样式表都不得再有', () => {
     // ⚠️ 只匹配**代码用法**（className 字面量 / CSS 规则），不匹配注释 ——
-    // 上面的注释故意保留「曾有副标题」这段历史，读到就红会逼后人删掉它。
+    // 上面注释故意保留「曾有标题」这段历史，读到就红会逼后人删掉它。
     expect(source).not.toMatch(/className: 'dim-jh-brandDesc'/)
     expect(styles).not.toMatch(/\.dim-jh-brandDesc\s*\{/)
-    // 标题本体必须还在（不能连「Jet Hub」一起删掉）。
-    expect(source).toContain("'Jet Hub'")
-    expect(styles).toMatch(/\.dim-jh-brandName \{/)
+    // 标题本体同样已删除：DOM 用法与 CSS 规则都要一并清掉。
+    expect(source).not.toMatch(/className: 'dim-jh-brand'/)
+    expect(source).not.toMatch(/className: 'dim-jh-brandName'/)
+    expect(styles).not.toMatch(/\.dim-jh-brand\s*\{/)
+    expect(styles).not.toMatch(/\.dim-jh-brandName\s*\{/)
+    // 语义兜底必须还在：删了标题不能把可访问名一起删掉。
+    expect(source).toContain("'aria-label': 'Jet Hub Provider 设置'")
   })
 })
 
