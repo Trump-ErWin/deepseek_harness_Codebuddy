@@ -120,10 +120,29 @@ interface PageScript {
   evaluateThrows?: boolean
 }
 
+/**
+ * 可控时钟：`value` 是当前假时刻（ms），`advance()` 单调推进。
+ *
+ * ★ 为什么需要它：`elapsedMs` 由「到达时刻 − 本轮开始产」两个**墙钟**读数推算，
+ * 而假guest 用 `setTimeout(…, 5)` 模拟导航耗时 —— 那个定时器会略微提前触发，
+ * 于是两个墙钟之差偶尔落到 5 以下，断言假红（Windows 因定时器粒度 ~15.6ms
+ * 反倒恒过，是平台不对称而非随机）。故让假 guest 在**同一个时钟源**上把导航
+ * 那 5ms 补上：判据从「墙钟差值够大」换成「同一时钟源上的先后顺序」，
+ * 与时间分辨率无关，且不会变弱 —— 锚点若被挪到导航之后，推进的 5ms 会落到
+ * `mintStartedAt` 之前，`elapsedMs` 变0 → 变红。
+ */
+class FakeClock {
+  value: number
+  constructor (start = 1_700_000_000_000) { this.value = start }
+  advance (ms: number): void { this.value += ms }
+  now = (): number => this.value
+}
+
 class FakeGuest {
   readonly attributes = new Map<string, string>()
   readonly style: Record<string, string> = {}
   readonly page: PageScript
+  readonly clock: FakeClock
   readonly listeners = new Map<string, Array<(event: any) => void>>()
   url = ''
   loads = 0
@@ -132,8 +151,9 @@ class FakeGuest {
   removed = false
   private stageIndex = 0
 
-  constructor (page: PageScript) {
+  constructor (page: PageScript, clock: FakeClock) {
     this.page = page
+    this.clock = clock
   }
 
   setAttribute (name: string, value: string): void { this.attributes.set(name, value) }
@@ -163,6 +183,9 @@ class FakeGuest {
     this.url = url
     return new Promise((resolveLoad) => {
       setTimeout(() => {
+        // 假时钟补上「导航耗时」：真机上这段是墙钟，此处由同一个时钟源记账，
+        // 于是 elapsedMs 不再依赖 setTimeout 的调度抖动。
+        this.clock.advance(NAVIGATE_FAKE_MS)
         if (this.page.failLoad !== undefined) {
           this.emit('did-fail-load', {
             isMainFrame: true,
@@ -218,7 +241,7 @@ class FakeGuest {
   }
 }
 
-function makeDoc (page: PageScript) {
+function makeDoc (page: PageScript, clock: FakeClock) {
   const doc: any = {
     URL: `${GUI_ORIGIN}/settings`,
     location: { href: `${GUI_ORIGIN}/settings`, origin: GUI_ORIGIN },
@@ -236,7 +259,7 @@ function makeDoc (page: PageScript) {
       },
     },
     createElement (tag: string): FakeGuest {
-      const guest = new FakeGuest(page)
+      const guest = new FakeGuest(page, clock)
       ;(guest as any).tag = tag
       doc.created.push(guest)
       return guest
@@ -281,6 +304,9 @@ function makeRpc (routes: Record<string, (payload: any) => any>) {
  * 「导航 1 跳 + 轮询 3 次」实测就要 ~50ms，预算给小了会让「先 pending 后 success」
  * 那类用例**永远等不到终态**（我第一版就被这个坑了一次，表现是假红）。
  */
+/** 假 guest 模拟「导航耗时」的毫秒数；与 `loadURL` 里那个 `setTimeout` 同值。 */
+const NAVIGATE_FAKE_MS = 5
+
 const FAST_TIMING = {
   demandPollMs: 1,
   mintPollMs: 1,
@@ -304,9 +330,23 @@ function setup (options: {
   carrierUrl?: string | null
   /** 覆盖 `acquire` 的返回形状（造「租约形状异常」那一支，评审 I6）。 */
   reservation?: unknown
+  /**
+   * 覆盖 `now`（生产代码早有此注入点：`zcode-carrier.js` 的
+   * `typeof options.now === 'function' ? options.now : () => Date.now()`）。
+   * 缺省仍是真墙钟，故其余用例行为逐字不变。
+   */
+  now?: () => number
+  /**
+   * 传入即启用**可控时钟**：假 guest 在导航事件处推进它，且 `now` 改从它取值。
+   *
+   * ⚠ 缺省**不传**：此时 `now` 仍走真墙钟，其余用例的行为与断言语义逐字不变
+   * ——这条修复只对显式 opt-in 的用例生效。
+   */
+  clock?: FakeClock
 }) {
   const logs: Array<{ level: string, message: string }> = []
-  const doc = makeDoc(options.page)
+  const clock = options.clock ?? new FakeClock()
+  const doc = makeDoc(options.page, clock)
   const bridge = makeBridge(options.reservation === undefined ? {} : { reservation: options.reservation })
   const demands = Array.isArray(options.demand) ? options.demand : [options.demand ?? false]
   let demandIndex = 0
@@ -334,9 +374,12 @@ function setup (options: {
     desktop: 'desktop' in options ? options.desktop : { protocolVersion: 1, browser: bridge.browser },
     doc,
     timing: FAST_TIMING,
+    // ⚠ 只在调用方**显式**传入 clock 时才切到假时钟；缺省走真墙钟，
+    // 故这条修复不影响本文件其余用例（它们依赖墙钟预算，不该被换掉）。
+    now: options.now ?? (options.clock === undefined ? () => Date.now() : clock.now),
     log: (level: string, message: string) => { logs.push({ level, message }) },
   })
-  return { stop, logs, doc, bridge, calls, rpcCall }
+  return { stop, logs, doc, bridge, calls, rpcCall, clock }
 }
 
 afterEach(() => {
@@ -478,14 +521,24 @@ describe('C. 一轮贡献的形状（导航 → 读回 → 回传）', () => {
   })
 
   it('★ elapsedMs 锚在「本轮开始产」= 导航之前（含导航 + SDK + 等待的全部时间）', async () => {
-    // 假 guest 的导航要 5ms 才回事件 ⇒ 锚点若被挪到导航之后，elapsedMs 会掉到 0～2ms。
-    const { stop, calls } = setup({ page: { stages: ['success'], param: 'P-2' }, demand: [true, false] })
+    // ★ 显式 opt-in 可控时钟：假 guest 在导航事件处把**同一个**时钟源推进 5ms，
+    //   而 `mintStartedAt`（锚点）与 `elapsedMs`（到达）都取它。判据于是从
+    //   「两个墙钟读数之差 ≥ 5ms」换成「同一时钟源上锚点在导航之前」——
+    //   与 setTimeout 调度延迟／平台定时器粒度无关（Windows 15.6ms / macOS 更精准）。
+    const clock = new FakeClock()
+    const { stop, calls } = setup({
+      page: { stages: ['success'], param: 'P-2' },
+      demand: [true, false],
+      clock,
+    })
     await vi.waitFor(() => {
       expect(calls.some((call) => call.endpoint === 'captcha.contribute')).toBe(true)
     }, WAIT_FOR)
     const payload = calls.find((call) => call.endpoint === 'captcha.contribute')?.payload
     expect(Number.isSafeInteger(payload.elapsedMs)).toBe(true)
-    expect(payload.elapsedMs).toBeGreaterThanOrEqual(5)
+    // 精确等于 5：假 guest 在导航事件处把**同一个**假时钟推进了 5ms，
+    // 于是这是「锚点在导航之前」的确定性证明，不受setTimeout 抖动影响。
+    expect(payload.elapsedMs).toBe(NAVIGATE_FAKE_MS)
     stop()
   })
 
