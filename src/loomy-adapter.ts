@@ -251,19 +251,53 @@ export type LoomyFailureClass = 'quota' | 'rate' | 'auth' | 'other'
  * 错误形态同族：`14018 Credits exhausted`，HTTP 层无专用状态码，文案是主通道；
  * 词表限「积分/额度/余额 + 不足/耗尽」的确定性组合，避免误伤正文里恰好讨论
  * 「余额」的 4xx）。
+ *
+ * ## ⚠️ 401/403 **必须先判**（同型复发，2026-10-06）
+ *
+ * 本函数初版与 raccoon 的**修复前**版本逐字同形：文案先判、且 `insufficient`
+ * **单独出现**即算额度。raccoon 已在 `7b524ff` 收窄，loomy 未同步 ⇒ 同一报文
+ * 在两个 provider 上被判成**不同类别**，且危险方向恒定朝 loomy（多写冷却）：
+ *
+ * | 报文（实测，见 tests 的「与 raccoon 对拍」段） | loomy 修复前 | raccoon 已修 |
+ * |---|---|---|
+ * | `403 + insufficient permissions to access this resource` | `quota` ⇒ 写 24h | `auth` ⇒ 只换号 |
+ * | `403 + 积分不足` | `quota` ⇒ 写 24h | `auth` ⇒ 只换号 |
+ * | `401 + 余额不足` | `quota` ⇒ 写 24h | `auth` ⇒ 只换号 |
+ * | `401 + 14018 Credits exhausted`（网关故障通常带余额提示） | `quota` ⇒ 写 24h | `auth` ⇒ 只换号 |
+ * | `400 + the context window is insufficient for this model` | `quota` ⇒ 写 24h | `other` ⇒ 不换号 |
+ *
+ * 前四行正是 {@link LoomyFailureClass} 记的 2026-10-06「全池被封」事故形态
+ * （那次触发词是 `authorization_verify_error`，这次是 `insufficient permissions`
+ * / 「不足」类文案）：**认证类是账号态、不是模型冷却**，写标记会把网关侧的
+ * 授权故障放大成「整个 provider 被封 24h」。
+ *
+ * 两处修法（与 raccoon 逐字一致，方向都是「宁可漏判不可误伤」）：
+ * 1. **401/403 优先**按认证类处理 —— 状态码与额度文案并存时以状态码为准；
+ * 2. `insufficient` 须与邻近的「钱」义词（point/credit/balance/quota/token）
+ *    **共现**才算额度；上下文超长 / 数据不足等与额度无关。
+ *
+ * ⚠️ 两家的判据必须**逐格同构**：`classifyLoomyFailure` 与
+ * `classifyRaccoonFailure` 是同一张表的两个实现，任一侧单方面改动都会造成
+ * 本文件记的这起「同型复发」。回归用例用同一批真实报文喂两个分类器对拍。
  */
 export function classifyLoomyFailure(errorText: string, status: number): LoomyFailureClass {
+  // 认证类先判：403 可能只是权限/授权问题，绝不能落到 quota 而被写 24h 冷却。
+  if (status === 401 || status === 403) return 'auth'
   const lower = errorText.toLowerCase()
   const quotaText = lower.includes('14018')
     || lower.includes('credits exhausted')
-    || lower.includes('insufficient')
+    // ⚠️ `insufficient` 单独出现**过宽**（raccoon 侧 PR !71 审计实测误伤 5 类），
+    // 必须与邻近的「钱」义词共现才算额度：上下文窗口超长（"context window is
+    // insufficient for this model"）、数据不足等都与额度无关。
+    // 方向仍是「宁可漏判不可误伤」—— 漏判只是不换号，误判会封可用账号 24h。
+    || (lower.includes('insufficient')
+      && ['point', 'credit', 'balance', 'quota', 'token'].some((w) => lower.includes(w)))
     || (lower.includes('积分') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('额度') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('余额') && (lower.includes('不足') || lower.includes('耗尽')))
     || (lower.includes('quota') && (lower.includes('exceeded') || lower.includes('exhausted')))
   if (quotaText || status === 402) return 'quota'
   if (status === 429) return 'rate'
-  if (status === 401 || status === 403) return 'auth'
   return 'other'
 }
 
@@ -590,6 +624,28 @@ export class LoomyAdapter extends LlmAdapter {
       const refreshed = await this.options.resolveCredential(options.model)
       if (refreshed === undefined || refreshed.access_token.length === 0) {
         throw new LlmError('loomy: credential expired and refresh failed', 'AUTH', { status: response.status })
+      }
+      /**
+       * ⚠️ **必须跟着重新反查账号 id**（与 raccoon 的 `51ded6a` 同款缺陷）。
+       *
+       * `options.resolveCredential` 是**池优先 + 余额分档**的（见 `src/index.ts`
+       * 的 loomy 分支：先 `loomyBalanceSelector.select()` 再解析该号的 ref），
+       * 而 `refresh()` 探测/续期的是**池当前默认账号**
+       * （`pool.getAvailableAccount(LOOMY.id, '')`）—— 二者可能不是同一个号。
+       * ⇒ 续期后取回的凭据**可能属于另一个账号**，但 `activeAccountId` 还停在
+       * 刷新前的那个号上。
+       *
+       * 后果（与 raccoon 实测到的完全一致）：A 的 token 失效 → 刷新后拿到 B 的
+       * 凭据 → B 随后返回额度耗尽，而 24h 冷却标记**记在 A 头上** ⇒ 没耗尽的 A
+       * 被封、真该封的 B 下次仍被选中（本段要修的「卡死在一个号上」照旧）。
+       * 这与 AGENTS.md 记的 Qoder「标记用了会变的回调导致标错账号」同型。
+       */
+      if (this.options.accountPool) {
+        try {
+          activeAccountId = await this.options.accountPool.findAccountIdByCredential(
+            this.product.id, refreshed.access_token,
+          ) ?? ''
+        } catch { /* 反查失败不阻断主路径：轮换退化为「不标记」 */ }
       }
       response = await send(refreshed.access_token)
       if (response.ok) credential = refreshed

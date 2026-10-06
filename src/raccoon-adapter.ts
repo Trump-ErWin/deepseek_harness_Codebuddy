@@ -244,6 +244,14 @@ export type RaccoonFailureClass = 'quota' | 'rate' | 'auth' | 'other'
  *
  * ⚠️ 顺序不能调换回去：把「先按文案判门禁、再解析」当通则会静默误伤 ——
  * 401/403 与额度文案并存时（网关侧故障常在报文里带余额提示）必须以状态码为准。
+ *
+ * ⚠️ **本函数与 `classifyLoomyFailure`（`src/loomy-adapter.ts`）是同一张判据表的
+ * 两个实现，必须逐格同构**。真实教训（2026-10-06，**同型复发**）：本函数在
+ * `7b524ff` 收窄后 loomy 那份**未同步**，于是同一报文
+ * （`403 + insufficient permissions` / `403 + 积分不足` / `401 + 余额不足`）
+ * 在 loomy 上仍判 `quota` ⇒ **给无辜账号写 24h 冷却**，在 raccoon 上判 `auth`。
+ * 改动任一侧都必须同步另一侧，并跑 `tests/unit/loomy-adapter.spec.ts` 的
+ * 「与 raccoon 对拍」段（同一批真实报文喂两个分类器，分叉即红）。
  */
 export function classifyRaccoonFailure(errorText: string, status: number): RaccoonFailureClass {
   // 认证类先判：403 可能只是权限/授权问题，绝不能落到 quota 而被写 24h 冷却。

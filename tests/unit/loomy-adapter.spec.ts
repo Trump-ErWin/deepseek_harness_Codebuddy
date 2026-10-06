@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { LoomyAdapter, parseLoomyRemoteModels } from '../../src/loomy-adapter.js'
+import {
+  LoomyAdapter, classifyLoomyFailure, parseLoomyRemoteModels, recordsLoomyRateLimit,
+} from '../../src/loomy-adapter.js'
+import { classifyRaccoonFailure } from '../../src/raccoon-adapter.js'
 import type { LoomyCredential } from '../../src/loomy.js'
 
 const CRED: LoomyCredential = {
@@ -424,6 +427,105 @@ describe('LoomyAdapter.providerInfo', () => {
 })
 
 /**
+ * `classifyLoomyFailure` 判据（loomy ↔ raccoon **同型复发**，2026-10-06）。
+ *
+ * ## 缺陷形态
+ *
+ * loomy 的分类器初版与 raccoon 的**修复前**版本逐字同形（文案先判 +
+ * `insufficient` 单独出现即算额度）。raccoon 已在 `7b524ff` 收窄，loomy 未同步
+ * ⇒ 同一报文在两个 provider 上被判成**不同类别**，且危险方向恒定朝 loomy：
+ * `quota` 会走 `recordsLoomyRateLimit` ⇒ **给账号写 24h 模型冷却**。
+ *
+ * 实测（临时探针，已删）三例 —— 403 + `insufficient permissions`、
+ * 403 + 积分不足、401 + 余额不足：loomy 判 quota 并写冷却，raccoon 判 auth 不写。
+ * 前两例与 2026-10-06「全池被封」事故同型（那次触发词是
+ * `authorization_verify_error`），只是触发词换成了文案判据。
+ */
+describe('classifyLoomyFailure 判据（与 raccoon 逐格同构）', () => {
+  it('★ 真实额度形态仍归 quota（含 PR 报障的 400 + insufficient_points）', () => {
+    expect(classifyLoomyFailure('{"code":"insufficient_points"}', 400)).toBe('quota')
+    expect(classifyLoomyFailure('insufficient_points', 402)).toBe('quota')
+    expect(classifyLoomyFailure('14018 Credits exhausted', 400)).toBe('quota')
+    expect(classifyLoomyFailure('积分不足', 400)).toBe('quota')
+    expect(classifyLoomyFailure('余额不足', 400)).toBe('quota')
+  })
+
+  /**
+   * ★★ `insufficient` 单独出现**不得**判成 quota（raccoon 侧 PR !71 审计实测
+   * 误伤 5 类）。误判后果同样是**封一个只是上下文超长的账号 24h**。
+   */
+  it('★★ 上下文/数据类 insufficient 不判 quota（不写 24h 冷却）', () => {
+    expect(classifyLoomyFailure('the context window is insufficient for this model', 400)).toBe('other')
+    expect(classifyLoomyFailure('input length is insufficient', 400)).toBe('other')
+    expect(classifyLoomyFailure('insufficient data to complete the request', 400)).toBe('other')
+  })
+
+  /**
+   * ★★★ 401/403 必须归 **auth**（不是 quota）—— 即使报文里带额度文案。
+   *
+   * 认证类是 2026-10-06 事故换来的不变式：**只换号、绝不写冷却标记**。
+   * 上游网关对全池回 401 时常在报文里捎带余额提示，若按文案判 quota，
+   * 一个请求内每个号各被封 24h ⇒ 整个 provider 死一天。
+   */
+  it('★★★ 401/403 恒归 auth（含 insufficient permissions / 积分不足 / 余额不足）', () => {
+    expect(classifyLoomyFailure('insufficient permissions to access this resource', 403)).toBe('auth')
+    expect(classifyLoomyFailure('积分不足，请充值', 403)).toBe('auth')
+    expect(classifyLoomyFailure('余额不足', 401)).toBe('auth')
+    expect(classifyLoomyFailure('{"code":200003,"message":"authorization_verify_error"}', 401)).toBe('auth')
+    // 状态码与额度文案并存时，仍以状态码为准。
+    expect(classifyLoomyFailure('14018 Credits exhausted', 401)).toBe('auth')
+    // 且必须**不写冷却**（这才是事故的真正触发点）。
+    expect(recordsLoomyRateLimit(classifyLoomyFailure('余额不足', 401))).toBe(false)
+  })
+
+  it('429 与 402 按状态码归类', () => {
+    expect(classifyLoomyFailure('', 429)).toBe('rate')
+    expect(classifyLoomyFailure('', 402)).toBe('quota')
+    expect(classifyLoomyFailure('param is invalid', 400)).toBe('other')
+  })
+
+  /**
+   * ★★★ **对拍**：同一批真实报文喂 loomy 与 raccoon 两个分类器，逐条必须同结论。
+   *
+   * 这是本缺陷的**同型复发**防线 —— 单看 loomy 自己的用例，未来任何一次
+   * 单方面改动（哪怕方向是"更严"）都会让两侧再次分叉，而两侧各自的用例
+   * 都能过。对拍用例把「必须逐格一致」这件事本身锁进测试。
+   *
+   * ⚠️ 报文集刻意混合「两家共有的额度形态」与「只在一边被误判的文案」，
+   * 且**含状态码维度**（403/401 的优先级只有靠状态码才能验证）。
+   */
+  it('★★★ 与 raccoon 对拍：同一报文集逐条同结论（同型复发防线）', () => {
+    const corpus: Array<[string, number]> = [
+      ['insufficient permissions to access this resource', 403],
+      ['积分不足，请充值', 403],
+      ['余额不足', 401],
+      ['额度已耗尽', 402],
+      ['14018 Credits exhausted', 401],
+      ['the context window is insufficient for this model', 400],
+      ['insufficient data to complete the request', 400],
+      ['{"code":"insufficient_points"}', 400],
+      ['14018 Credits exhausted', 402],
+      ['积分不足', 400],
+      ['quota exceeded', 400],
+      ['', 429],
+      ['param is invalid', 400],
+    ]
+    const diverged = corpus
+      .map(([text, status]) => ({
+        text,
+        status,
+        loomy: classifyLoomyFailure(text, status),
+        raccoon: classifyRaccoonFailure(text, status),
+      }))
+      .filter((row) => row.loomy !== row.raccoon)
+    expect(
+      diverged,
+      `loomy 与 raccoon 的分类结论出现分叉（同型复发）：${JSON.stringify(diverged)}`,
+    ).toEqual([])
+  })
+})
+
+/**
  * 请求级账号轮换（★ 2026-10-05，用户报障「余额用完一个号就卡死」）。
  *
  * ## 为什么余额选号器救不了
@@ -659,5 +761,64 @@ describe('LoomyAdapter 请求级账号轮换（余额耗尽无感切号）', () 
     } as never).next().then(() => null).catch(() => null)
 
     expect(marks.map((m) => m.accountId)).toEqual(['loomy-A'])
+  })
+
+  /**
+   * ★★ 401 续期后**必须重新反查账号 id**（与 raccoon 的 `51ded6a` 同款缺陷，
+   * loomy 当时未同步修）。
+   *
+   * `options.resolveCredential` 是**池优先 + 余额分档**的（`src/index.ts` 的
+   * loomy 分支先 `loomyBalanceSelector.select()` 再解析该号的 ref），而
+   * `refresh()` 续期/探测的是**池当前默认账号**。⇒ 续期后取回的凭据
+   * **可能属于另一个账号**，而 `activeAccountId` 仍停在刷新前的那个号上。
+   *
+   * 旧实现不更新它 ⇒ 冷却标记**记在没发这次请求的号头上**：没耗尽的号被封 24h，
+   * 而真该封的号下次仍被选中（本段要修的「卡死在一个号上」照旧）。
+   * 与 AGENTS.md 记的 Qoder「标记用了会变的回调导致标错账号」同型。
+   */
+  it('★★ 401 续期后凭据换成了别的账号 → 标记记在**真正耗尽的那个号**上', async () => {
+    const marks: Array<{ accountId: string }> = []
+    // ⚠️ 桩必须自洽：id ↔ token 一一对应，否则 `findAccountIdByCredential`
+    // 与 `getAvailableAccount` 会互相认错号（raccoon 侧写这条时踩过：
+    // 取号发的是 `tok-raccoon-B`、而续期后是 `tok-B`，反查得到另一个 id）。
+    const byToken: Record<string, string> = { 'tok-A': 'loomy-A', 'tok-B': 'loomy-B' }
+    const pool = {
+      updateModelRateLimit: async (accountId: string) => { marks.push({ accountId }) },
+      getAvailableAccount: async (_p: string, _m: string, exclude?: ReadonlySet<string>) => {
+        for (const token of ['tok-A', 'tok-B']) {
+          const id = byToken[token]!
+          if (exclude?.has(id)) continue
+          return { entry: { id }, credential: { access_token: token, userid: id, phone: '13800000000' } }
+        }
+        return null
+      },
+      findAccountIdByCredential: async (_p: string, identity: string) => byToken[identity] ?? '',
+    }
+    // 第 1 次解析 = A 的凭据；续期后 = B 的凭据（生产语义：refresh 探测的是
+    // 池当前默认账号，随后 resolveCredential 又按余额分档取号）。
+    let resolves = 0
+    const adapter = makeAdapter({
+      resolveCredential: async () => (++resolves === 1
+        ? { access_token: 'tok-A', userid: 'loomy-A', phone: '13800000001' }
+        : { access_token: 'tok-B', userid: 'loomy-B', phone: '13800000002' }),
+      accountPool: pool as never,
+      // A 返回 401（触发续期）；此后无论哪个号都额度耗尽。
+      fetchImpl: (async (_u: string, init: RequestInit) => {
+        const auth = String(new Headers(init.headers).get('Authorization') ?? '')
+        if (auth.includes('tok-A')) {
+          return new Response('{"code":200003}', { status: 401 })
+        }
+        return new Response(
+          JSON.stringify({ error: { message: '14018 Credits exhausted' } }), { status: 402 },
+        )
+      }) as unknown as typeof fetch,
+    })
+    await adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    } as never).next().then(() => null).catch(() => null)
+
+    // 真正耗尽的是 B —— A 只返回了 401（认证类，本就不该写标记）。
+    expect(marks.map((m) => m.accountId)).toEqual(['loomy-B'])
   })
 })
