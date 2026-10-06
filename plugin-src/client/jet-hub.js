@@ -72,6 +72,7 @@ import { formatRowTokensPerSecond } from './tokens-per-second.js';
 import {
   accountLabel,
   avgPerfText,
+  barDayLabel,
   barHeightPercent,
   channelCardTitle,
   channelLabel,
@@ -2155,7 +2156,11 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
   };
 
   // ── 历史视图（第 4 期）：数据源是落盘日聚合，重启保留 ──
-  const historyDays = Array.isArray(history?.days) ? history.days : [];
+  // ⚠️ 响应体的天数数组在 `history` 键上（`RpcUsageTokenLedgerHistoryResponse`），
+  // 与同级的 `totals` 平级 —— 读成 `days` 会恒得 undefined，界面表现为
+  // 「合计有数、却没有柱子」（空状态文案还反过来说「今天发起的请求明天才能看到」，
+  // 而当天数据其实就在响应里）。
+  const historyDays = Array.isArray(history?.history) ? history.history : [];
   const bars = trendBars(historyDays);
   const maxTokens = bars.reduce((max, b) => Math.max(max, b.tokens), 0);
   const renderHistory = () => {
@@ -2182,6 +2187,8 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
               '还没有历史用量。每笔请求都会按日累计入盘 —— 今天发起的请求明天就能在这里看到。')
           : React.createElement(React.Fragment, { key: 'histBody' },
               // 趋势柱状图：每根柱 = 一天，点击下钻该日聚合树（再点收起）。
+              // ⚠️ 柱高必须传 `bars.length`：单日窗口下不传根数时最大柱恒 100%，
+              // 撑满容器成「白块」（见 barHeightPercent 的缺陷注释）。
               React.createElement('div', { className: 'dim-jh-ledgerTrend' },
                 bars.map((b) => React.createElement('div', {
                   key: b.day,
@@ -2193,8 +2200,10 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
                     className: 'dim-jh-ledgerTrendBar',
                     'data-today': b.isToday ? 'true' : 'false',
                     'data-active': expandedDay === b.day ? 'true' : 'false',
-                    style: { height: barHeightPercent(b.tokens, maxTokens) + '%' },
-                  }))),
+                    style: { height: barHeightPercent(b.tokens, maxTokens, bars.length) + '%' },
+                  }),
+                  // 日期短标签常驻显示：光靠色块无法区分哪天（tooltip 要 hover）。
+                  React.createElement('div', { className: 'dim-jh-ledgerTrendLabel' }, barDayLabel(b.day)))),
               // 展开的那天：完整聚合树（渠道 → provider → 账号 → 模型）。
               ...(expandedDay !== null
                 ? historyDays.filter((d) => d?.day === expandedDay).map((dayRow) =>

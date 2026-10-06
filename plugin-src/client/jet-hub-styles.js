@@ -549,15 +549,27 @@ const STYLES = `
 /* 均值格（首字 · 速率）：三级汇总行（渠道/账号/模型）共用，等宽数字对齐。 */
 .dim-jh-ledgerPerf { flex: none; font-size: 11px; line-height: 16px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
 /* ── 历史视图（第 4 期）：趋势柱状图 + 展开的日聚合树 ──
-   柱状图用纯 div（不引图表库）：每根柱 = 一天，高度按相对最大值的百分比。 */
+   柱状图用纯 div（不引图表库）：每根柱 = 一天，高度按相对最大值的百分比。
+   ⚠️ 容器 height 由 barHeightPercent 的**百分比**决定上限（88%），故这里留出
+   足够净高；柱宽**不能**靠 flex 拉伸填满 —— 单日窗口只有一根柱时
+   flex: 1 0 14px 会把它横向拉满整行，呈现为「一整条白块」。
+   故给单柱/少柱窗口一个 max-width，让它保持柱子的形状。 */
 .dim-jh-ledgerSection { margin-bottom: 14px; }
 .dim-jh-ledgerSectionTitle { font-size: 13px; line-height: 19px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); margin-bottom: 6px; }
 .dim-jh-ledgerTrend { display: flex; align-items: flex-end; gap: 3px; height: 64px; padding: 4px 2px 0; overflow-x: auto; }
-.dim-jh-ledgerTrendCol { flex: 1 0 14px; min-width: 14px; height: 100%; display: flex; align-items: flex-end; cursor: pointer; }
-.dim-jh-ledgerTrendBar { width: 100%; min-height: 2px; border-radius: 3px 3px 0 0; background: var(--dsw-alias-brand-primary, #1677ff); opacity: .45; transition: opacity .12s ease; }
-.dim-jh-ledgerTrendBar:hover { opacity: .75; }
-.dim-jh-ledgerTrendBar[data-today="true"] { opacity: .9; }
+/* 柱子列：横向可滚、但单柱不吃满宽（见上方注释）。 */
+.dim-jh-ledgerTrendCol { flex: 1 0 14px; min-width: 14px; max-width: 56px; height: 100%; display: flex; align-items: flex-end; cursor: pointer; }
+/* ⚠️ 颜色必须**自带可见性**：品牌变量 --dsw-alias-brand-primary 只在变量
+   *缺失* 时才走 #1677ff 兜底；一旦宿主主题把它定义成接近底色的浅色，再叠
+   opacity 就会退化成一块与背景同色的「白块」（真实缺陷 2026-10-07，深色主题
+   实测）。故：① opacity 从 .45 提到 .55（仍是「未选中」的弱化语义），
+   ② 补 box-shadow 描边 —— 即使底色与背景同色也留有边界，不会「消失」。 */
+.dim-jh-ledgerTrendBar { width: 100%; min-height: 2px; border-radius: 3px 3px 0 0; background: var(--dsw-alias-brand-primary, #1677ff); box-shadow: inset 0 0 0 1px rgba(127,127,127,.45); opacity: .55; transition: opacity .12s ease; }
+.dim-jh-ledgerTrendBar:hover { opacity: .8; }
+.dim-jh-ledgerTrendBar[data-today="true"] { opacity: .95; }
 .dim-jh-ledgerTrendBar[data-active="true"] { opacity: 1; outline: 1.5px solid var(--dsw-alias-brand-primary, #1677ff); }
+/* 日期短标签：常驻显示 MM-DD，根治「不知道哪根柱是哪天」。 */
+.dim-jh-ledgerTrendLabel { font-size: 10px; line-height: 12px; text-align: center; color: var(--dsw-alias-label-tertiary, #8f959e); font-variant-numeric: tabular-nums; }
 /* 明细表：紧凑小字；模型列允许换行（长 wire 名不能截断 —— 网关弹窗同一条教训）。 */
 .dim-jh-ledgerTable { width: 100%; margin-top: 10px; border-collapse: collapse; font-size: 11.5px; line-height: 17px; }
 .dim-jh-ledgerTable th { position: sticky; top: 0; z-index: 1; padding: 4px 6px; text-align: left; font-weight: 600; color: var(--dsw-alias-label-tertiary, #8f959e); background: var(--dsw-alias-bg-layer-1, #fff); border-bottom: .5px solid var(--dsw-alias-border-l3, #e5e5e5); }
