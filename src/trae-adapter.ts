@@ -53,6 +53,7 @@ import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableT
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
+import { reportLedgerAccount } from './token-ledger.js'
 
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae'
@@ -679,6 +680,15 @@ export class TraeAdapter extends LlmAdapter {
    * `code=4001 param is invalid`（实测 `glm-5.1` 在 `solo_work_lite` 报错、
    * 在 `solo_agent_remote` 正常；`glm-5-turbo` 恰好相反）。
    * 远端目录里每条模型都带自己的 `function`；查不到时回退默认通道。
+   *
+   * ⚠️ **这里拿到的一定是白名单内的通道**（Issue IKJOZ7）：非白名单通道的条目
+   * 已在 `parseTraeBatchModelList` 里被整组剔除，故 `remoteMeta` 里不可能存在
+   * 「通道不可调用」的模型。兜底路径（远端目录不可用 → 兜底表）本就没有通道
+   * 信息，只能回退 `product.function`（`solo_work_lite`，已在白名单内）。
+   *
+   * ⚠️ 若在此处**再加**一层白名单校验，会让「用户用 `DSH_TRAE_CHANNELS` 自定义
+   * 白名单 + 模型来自兜底表」的组合出现两条判据不一致；故准入只在解析器一处
+   * 执行（单一真相源）。
    */
   private channelFor(model: string): string {
     const channel = this.remoteMeta.get(model)?.function
@@ -914,6 +924,8 @@ export class TraeAdapter extends LlmAdapter {
           this.product.id,
           credential.access_token,
         )
+        // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+        if (currentAccountId !== '') reportLedgerAccount(this.product.id, currentAccountId)
       } catch {
         // 账号不匹配不影响请求
       }

@@ -57,8 +57,10 @@ import {
 } from './model-filter.js';
 import {
   groupProviders,
+  nextProviderOrderAfterDrop,
   providerSwitchRows,
   providerToggleSummary,
+  sortOpenProvidersByOrder,
   summarizeProviderToggle,
 } from './provider-toggle.js';
 import {
@@ -67,6 +69,29 @@ import {
   groupModelsForDisplay,
 } from './model-groups.js';
 import { formatRowTokensPerSecond } from './tokens-per-second.js';
+import {
+  accountLabel,
+  avgPerfText,
+  barHeightPercent,
+  channelCardTitle,
+  channelLabel,
+  channelOrder,
+  entryTokenText,
+  formatDuration,
+  formatEntryTime,
+  formatTps,
+  formatTtft,
+  hasAnyData,
+  historyTitle,
+  HISTORY_RANGES,
+  ledgerSubtitle,
+  rangeDaysOf,
+  tokenSummaryText,
+  trendBars,
+} from './token-ledger-panel.js';
+// ⚠️ `formatTokenCount` 用 jet-hub.js 自己的本地实现（有界渲染，见其注释）；
+// 面板模块的同名导出只供趋势图 tooltip 等**弹窗内部**使用，不在这里导入 ——
+// 两个同名符号会被 esbuild 判成重复声明（第 1 期就踩过一次）。
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
 import {
   formatCredits,
@@ -74,6 +99,7 @@ import {
   formatUnits,
   formatQuotaLine,
   formatQuotaDetail,
+  formatClaimGains,
   unitLabel,
 } from './credits-format.js';
 import {
@@ -915,25 +941,46 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
  * 一旦再插入第二个 checkbox（如曾经加过的多选勾选框），浏览器会把点击激活到
  * **第一个**可标记控件，「点模型名」就变成切换那个新控件、可见性开关纹丝不动
  * （实测确认的行为倒退）。若将来确需多选，必须先把行容器改成 `<div>`。
+ *
+ * ⚠️⚠️ 「重新显示」按钮**必须 `e.stopPropagation()` + `e.preventDefault()`**
+ * （2026-10-06 复审 !66）：失效模型被上游下架后，用户若不点这个按钮就**永远无法**
+ * 恢复 —— 因为记录的唯一自愈路径是 30 天 TTL 过期（模型选不到 ⇒ 不可能再成功
+ * ⇒ 记录永不自动清除）。按钮虽然 `type="button"`，它仍嵌在 `<label>` 内，
+ * 点击会冒泡到 label 并**顺带切换可见性开关** —— 必须拦下。
+ *
+ * @param {{ model: {id: string, name?: string, disabled?: boolean, dead?: boolean},
+ *           busy: boolean, onToggle: Function, onRestore: Function }} props
  */
-function ModelToggle({ model, busy, onToggle }) {
+function ModelToggle({ model, busy, onToggle, onRestore }) {
+  const dead = model.dead === true;
   return React.createElement('label', {
     className: 'dim-jh-modelRow',
     'data-disabled': model.disabled ? 'true' : 'false',
-    title: model.id,
+    'data-dead': dead ? 'true' : 'false',
+    title: dead ? `${model.id}（上游已下架，点击「重新显示」可恢复）` : model.id,
   },
     React.createElement('span', { className: 'dim-jh-modelInfo' },
       React.createElement('strong', { className: 'dim-jh-modelName' }, model.name || model.id),
+      dead ? React.createElement('span', { className: 'dim-jh-modelDead' }, '已下架') : null,
       React.createElement('code', { className: 'dim-jh-modelId' }, model.id)),
-    React.createElement('input', {
-      type: 'checkbox',
-      className: 'dim-jh-switch',
-      role: 'switch',
-      checked: !model.disabled,
-      disabled: busy,
-      'aria-label': `${model.name || model.id} 是否在模型选择中显示`,
-      onChange: () => onToggle(model.id, !model.disabled),
-    }));
+    dead
+      // ⚠️ 失效模型**不渲染可见性开关**：它已被剔除出目录，开关没有意义；
+      //    只给一个「重新显示」按钮（= 清掉失效记录）。
+      ? React.createElement('button', {
+        type: 'button',
+        className: 'dim-jh-modelRestore',
+        disabled: busy,
+        onClick: (event) => { event.preventDefault(); event.stopPropagation(); onRestore(model.id); },
+      }, '重新显示')
+      : React.createElement('input', {
+        type: 'checkbox',
+        className: 'dim-jh-switch',
+        role: 'switch',
+        checked: !model.disabled,
+        disabled: busy,
+        'aria-label': `${model.name || model.id} 是否在模型选择中显示`,
+        onChange: () => onToggle(model.id, !model.disabled),
+      }));
 }
 
 /**
@@ -955,6 +1002,8 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const [toggleError, setToggleError] = React.useState(null);
   // 正在提交的模型 id 集合：只禁用被点的那一行，避免整表锁死。
   const [busyIds, setBusyIds] = React.useState(() => new Set());
+  /** 「全部重新显示」是否在提交（批量恢复失效记录）。 */
+  const [deadRestoreBusy, setDeadRestoreBusy] = React.useState(false);
   /**
    * 批量开关（打开全部 / 关闭全部）是否正在提交。
    *
@@ -1044,8 +1093,70 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
     }
   };
 
+  /**
+   * 「重新显示」某个被判定为失效的模型（清掉它的失效记录）。
+   *
+   * ⚠️ **这是用户唯一的自愈路径**（2026-10-06 复审 !66 确认）：失效记录不会被
+   * 「再成功一次」清掉（模型已被剔除出目录 ⇒ 用户选不到 ⇒ 不可能再成功），
+   * 只能靠 30 天 TTL 过期或点这个按钮。没有它，一次误判就等于该模型被永久隐藏。
+   *
+   * ⚠️ **不动黑名单**：服务端只删失效记录（`disabled` 保持原值），避免顺带
+   * 把用户特意关着的模型打开。
+   */
+  const restoreModel = async (modelId) => {
+    setBusyIds((prev) => new Set(prev).add(modelId));
+    try {
+      await rpcCall('model.clearDead', { provider, modelId });
+      if (!mounted.current) return;
+      // ⚠️ **必须整表重载，不能只翻 `dead` 标志**（2026-10-06 复审实测）：
+      // 该模型重新进入目录后展示名要靠 `listAllModels()` 才能拿全 ——
+      // 而设置页里原先那条是端点用**裸 id** 补回的（`{ id, name: id }`，
+      // 见 `jet-hub-rpc.ts` 的 dead 回填路径）。只翻标志会让它继续显示裸 id，
+      // 用户要点「刷新」或重开面板才看得到真名。与 `restoreAllDead` 保持一致。
+      await load();
+    } catch (caught) {
+      console.error('[jet-hub] restore dead model failed:', caught);
+      if (!mounted.current) return;
+      setToggleError(caught?.message || '恢复模型失败');
+    } finally {
+      if (mounted.current) {
+        setBusyIds((prev) => {
+          const next = new Set(prev);
+          next.delete(modelId);
+          return next;
+        });
+      }
+    }
+  };
+
   const all = models || [];
   const hiddenCount = all.filter(m => m.disabled).length;
+  /** 被判定为已下架的条数（用于顶部提示「已隐藏 N 个下架模型」）。 */
+  const deadCount = all.filter(m => m.dead === true).length;
+
+  /**
+   * 批量恢复该 provider 的全部失效模型（`model.clearDead` 省略 `modelId`）。
+   *
+   * ⚠️ 走**单次请求**而不是循环逐个调：误判往往同时命中多个模型，逐个点既慢
+   * 又容易漏。服务端只清失效记录，不动黑名单。
+   */
+  const restoreAllDead = async () => {
+    if (deadCount === 0) return;
+    if (!confirm(`确认把 ${deadCount} 个「已下架」模型重新显示？若它们确实已被上游移除，使用时会再次失败并被重新隐藏。`)) return;
+    setDeadRestoreBusy(true);
+    try {
+      await rpcCall('model.clearDead', { provider });
+      if (!mounted.current) return;
+      // 全量重载：恢复后的条目要拿回展示名/免费标记（补回的裸 id 只有 id）。
+      await load();
+    } catch (caught) {
+      console.error('[jet-hub] restore all dead models failed:', caught);
+      if (!mounted.current) return;
+      setToggleError(caught?.message || '恢复模型失败');
+    } finally {
+      if (mounted.current) setDeadRestoreBusy(false);
+    }
+  };
   const providerLabel = PROVIDERS.find(p => p.id === provider)?.label || provider;
   // 「已经是目标状态」时对应按钮必须禁用，否则点了看不到任何变化、像是坏了。
   const bulk = bulkButtonState(models, bulkBusy);
@@ -1193,6 +1304,19 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
           }, '完成'))),
       React.createElement('p', { className: 'dim-jh-modalHint' },
         '关闭开关后该模型不再出现在对话框的模型选择里；其余模型（含服务端新增的）默认显示。'),
+      // ⚠️ 失效模型提示条：它们已被上游下架并从目录剔除，故单独说明「为什么看不见」
+      // 并给出**批量**恢复入口（逐个点很麻烦，而误判往往不止一个）。
+      phase === 'ready' && deadCount > 0
+        ? React.createElement('div', { className: 'dim-jh-modelDeadBar' },
+            React.createElement('span', null,
+              `有 ${deadCount} 个模型被上游下架，已自动从列表隐藏。`),
+            React.createElement('button', {
+              className: 'dim-jh-btn',
+              disabled: deadRestoreBusy,
+              title: '清空该供应商的失效模型记录，让它们重新出现在列表里。',
+              onClick: () => void restoreAllDead(),
+            }, deadRestoreBusy ? '恢复中…' : '全部重新显示'))
+        : null,
       // 搜索 + 状态筛选：Cline 的目录实测近 500 条，没有它就只能一页页翻。
       // 只在列表可用时渲染（载入中/出错时没有可筛的内容）。
       phase === 'ready' && all.length > 0
@@ -1309,6 +1433,7 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
                                 // 分组批量也算「批量」，故一并计入。
                                 busy: busyIds.has(model.id) || bulkBusy || groupBusy !== null,
                                 onToggle: (id, disabled) => void toggleModel(id, disabled),
+                                onRestore: (id) => void restoreModel(id),
                               })))
                           : null);
                     })))));
@@ -1833,6 +1958,315 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
         renderLog())));
 }
 
+/**
+ * 「Token 用量」弹窗（全 provider 的本地记账视图）。
+ *
+ * 数据来自 RPC `usage.tokenLedger`（进程内存账本，记账点在注册收敛层，
+ * 渠道由网关打标区分 —— 见 `src/token-ledger.ts` 模块头）。三层视图：
+ *
+ * 1. **汇总卡**：每个渠道一张（直连 / 网关），头部是渠道名 + 请求计数，
+ *    卡内按 provider 分组、模型成行（token 汇总）；
+ * 2. **明细表**：最近请求流水（时间 | 渠道 | 模型 | TOKEN | 耗时）；
+ * 3. **空状态**：没有任何数据时说明「记了什么、什么时候开始有」。
+ *
+ * ⚠️ 判据全部在 `token-ledger-panel.js`（纯函数）：本组件只画形状，
+ * 不做数值换算 —— 与 Cline 请求表 / 网关弹窗同款分工。
+ */
+function TokenLedgerPanel({ rpcCall, onClose }) {
+  const mounted = React.useRef(true);
+  React.useEffect(() => () => { mounted.current = false; }, []);
+
+  const [snapshot, setSnapshot] = React.useState(null);
+  const [phase, setPhase] = React.useState('loading');
+  const [error, setError] = React.useState('');
+  /** 当前展开的渠道（`null` = 全部）。账本最多两个渠道，不做更深层的筛选。 */
+  const [selected, setSelected] = React.useState(null);
+  /**
+   * 历史视图（第 4 期）：窗口 key（HISTORY_RANGES 的 key）+ 数据 + 加载态。
+   *
+   * ⚠️ 历史与明细是**两份独立数据**（落盘日聚合 vs 内存流水），各自加载、
+   * 各自的刷新按钮——历史来自盘上（重启保留），明细来自内存。
+   */
+  const [historyRange, setHistoryRange] = React.useState('7d');
+  const [history, setHistory] = React.useState(null);
+  const [historyPhase, setHistoryPhase] = React.useState('idle');
+  /** 展开的那个历史日（`null` = 全收起）。天与天的聚合树同弹窗内切换。 */
+  const [expandedDay, setExpandedDay] = React.useState(null);
+
+  const load = React.useCallback(async () => {
+    setPhase('loading');
+    setError('');
+    try {
+      const res = await rpcCall('usage.tokenLedger', {});
+      if (!mounted.current) return;
+      setSnapshot(res?.snapshot ?? null);
+      setPhase('ready');
+    } catch (caught) {
+      if (!mounted.current) return;
+      console.error('[jet-hub] load token ledger failed:', caught);
+      setError(caught?.message || 'Token 用量读取失败');
+      setPhase('error');
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => { void load(); }, [load]);
+
+  /** 读取历史日聚合（窗口切换时重拉；days=0 即「全部」，服务端钳到 90）。 */
+  const loadHistory = React.useCallback(async (rangeKey) => {
+    setHistoryPhase('loading');
+    try {
+      const days = rangeDaysOf(rangeKey);
+      const res = await rpcCall('usage.tokenLedgerHistory', days > 0 ? { sinceDays: days } : {});
+      if (!mounted.current) return;
+      setHistory(res ?? null);
+      setHistoryPhase('ready');
+    } catch (caught) {
+      if (!mounted.current) return;
+      console.error('[jet-hub] load token ledger history failed:', caught);
+      // 历史读取失败不顶掉明细视图：历史区自己显示错误行。
+      setHistory(null);
+      setHistoryPhase('error');
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => { void loadHistory(historyRange); }, [historyRange, loadHistory]);
+
+  const channels = React.useMemo(() => {
+    const list = Array.isArray(snapshot?.channels) ? [...snapshot.channels] : [];
+    list.sort((a, b) => channelOrder(a?.channel, b?.channel));
+    return selected === null ? list : list.filter((c) => c?.channel === selected);
+  }, [snapshot, selected]);
+
+  /** 一行模型的三个格子（实时汇总与历史日树共用，避免括号地狱）。 */
+  const renderModelRow = (modelRow, key) => React.createElement('div', {
+    key, className: 'dim-jh-ledgerModel',
+  },
+    React.createElement('span', { className: 'dim-jh-ledgerModelName', title: modelRow.model }, modelRow.model),
+    React.createElement('span', { className: 'dim-jh-ledgerModelReq', title: '请求数（含失败）' },
+      modelRow.requests + ' 次'),
+    React.createElement('span', { className: 'dim-jh-ledgerPerf', title: '均值：只对有实测值的请求平均' },
+      avgPerfText(modelRow)),
+    React.createElement('span', { className: 'dim-jh-ledgerModelTokens' },
+      tokenSummaryText(modelRow)));
+
+  const renderSummary = () => {
+    if (phase === 'loading' && snapshot === null) {
+      return React.createElement('div', { className: 'dim-jh-empty' }, '正在读取 Token 用量…');
+    }
+    if (phase === 'error') {
+      return React.createElement('div', { className: 'dim-jh-empty', role: 'alert' },
+        React.createElement('p', null, error),
+        React.createElement('button', { className: 'dim-jh-btn', onClick: () => void load() }, '重试'));
+    }
+    if (!hasAnyData(snapshot)) {
+      return React.createElement('div', { className: 'dim-jh-empty' },
+        React.createElement('p', null, '还没有任何请求记录。'),
+        React.createElement('p', null,
+          '本插件在每次模型请求结束时记录 token 用量（含直连与网关两条通道），重启 DSH 后清空。'));
+    }
+    // 渠道筛选行：全部 / 直连 / 网关。只渲染聚合树里实际存在的渠道
+    //（没开网关的用户不该看到一个恒空的「网关」按钮）。
+    const present = Array.from(new Set((snapshot?.channels ?? []).map((c) => c?.channel)));
+    const filterRow = present.length > 1
+      ? React.createElement('div', { className: 'dim-jh-ledgerFilters', key: 'filters' },
+          [null, ...present].map((key) => React.createElement('button', {
+            key: key === null ? 'all' : key,
+            className: 'dim-jh-btn dim-jh-ledgerFilterBtn',
+            'data-active': selected === key ? 'true' : 'false',
+            onClick: () => setSelected(key),
+          }, key === null ? '全部' : channelLabel(key))))
+      : null;
+    /** 一个 provider 的内部：多账号分层 / 单账号平铺（一比一的中间层是纯噪音）。 */
+    const renderProviderBody = (providerRow) => {
+      const accounts = providerRow.accounts ?? [];
+      if (accounts.length > 1) {
+        return accounts.map((accountRow) => React.createElement('div', {
+          key: providerRow.provider + '#' + accountRow.accountId, className: 'dim-jh-ledgerAccount',
+        },
+          React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
+            React.createElement('span', { className: 'dim-jh-ledgerAccountName', title: accountRow.accountId },
+              accountLabel(accountRow.accountId)),
+            React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(accountRow.totals)),
+            React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
+              tokenSummaryText(accountRow.totals))),
+          accountRow.models.map((modelRow) =>
+            renderModelRow(modelRow, modelRow.model))));
+      }
+      return accounts.flatMap((accountRow) => accountRow.models.map((modelRow) =>
+        renderModelRow(modelRow, providerRow.provider + '#' + modelRow.model)));
+    };
+
+    return React.createElement(React.Fragment, null,
+      filterRow,
+      // 汇总卡：渠道 → provider → 账号 → 模型（第 2 期加了账号层）。
+      // provider / 账号行带自身小计（与模型行同列对齐）。
+      channels.map((channelRow) => React.createElement('div', {
+        key: channelRow.channel, className: 'dim-jh-ledgerCard',
+      },
+        React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
+          React.createElement('strong', null, channelCardTitle(channelRow)),
+          React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(channelRow.totals)),
+          React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
+            tokenSummaryText(channelRow.totals))),
+        channelRow.providers.map((providerRow) => React.createElement('div', {
+          key: providerRow.provider, className: 'dim-jh-ledgerProvider',
+        },
+          React.createElement('div', { className: 'dim-jh-ledgerProviderHead' },
+            React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, providerRow.provider),
+            React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(providerRow.totals)),
+            React.createElement('span', { className: 'dim-jh-ledgerProviderSum' },
+              tokenSummaryText(providerRow.totals))),
+          renderProviderBody(providerRow))))));
+  };
+
+  const entries = Array.isArray(snapshot?.entries) ? snapshot.entries : [];
+  const renderEntries = () => {
+    if (entries.length === 0) return null;
+    return React.createElement('table', { className: 'dim-jh-ledgerTable', key: 'entries' },
+      React.createElement('thead', null,
+        React.createElement('tr', null,
+          ['时间', '渠道', '模型', 'TOKEN', '首字', '速率', '耗时'].map((h) =>
+            React.createElement('th', { key: h }, h)))),
+      React.createElement('tbody', null, entries.map((entry, index) => React.createElement('tr', {
+        key: entry.ts + '-' + index,
+        title: entry.error !== undefined ? '失败：' + entry.error : undefined,
+      },
+        React.createElement('td', null, formatEntryTime(entry.ts)),
+        React.createElement('td', null, channelLabel(entry.channel)),
+        React.createElement('td', { className: 'dim-jh-ledgerEntryModel' }, entry.model),
+        React.createElement('td', null, entryTokenText(entry)),
+        React.createElement('td', null, formatTtft(entry)),
+        React.createElement('td', null, formatTps(entry)),
+        React.createElement('td', null, formatDuration(entry.durationMs))))));
+  };
+
+  // ── 历史视图（第 4 期）：数据源是落盘日聚合，重启保留 ──
+  const historyDays = Array.isArray(history?.days) ? history.days : [];
+  const bars = trendBars(historyDays);
+  const maxTokens = bars.reduce((max, b) => Math.max(max, b.tokens), 0);
+  const renderHistory = () => {
+    // 窗口切换条：与渠道筛选同一观感（胶囊按钮组）。
+    const rangeRow = React.createElement('div', { className: 'dim-jh-ledgerFilters', key: 'historyRanges' },
+      HISTORY_RANGES.map((r) => React.createElement('button', {
+        key: r.key,
+        className: 'dim-jh-btn dim-jh-ledgerFilterBtn',
+        'data-active': historyRange === r.key ? 'true' : 'false',
+        onClick: () => { setHistoryRange(r.key); setExpandedDay(null); },
+      }, r.label)),
+      React.createElement('span', { className: 'dim-jh-ledgerPerf', style: { marginLeft: 'auto' } },
+        history !== null && history.totals !== undefined
+          ? '合计 ↓' + formatTokenCount(history.totals.inputTokens)
+            + ' ↑' + formatTokenCount(history.totals.outputTokens)
+            + ' · ' + (history.totals.requests ?? 0) + ' 次请求'
+          : ''));
+    const body = historyPhase === 'loading'
+      ? React.createElement('div', { className: 'dim-jh-empty', key: 'histLoading' }, '正在读取历史用量…')
+      : historyPhase === 'error'
+        ? React.createElement('div', { className: 'dim-jh-empty', key: 'histError' }, '历史用量读取失败（不影响明细）。')
+        : bars.length === 0
+          ? React.createElement('div', { className: 'dim-jh-empty', key: 'histEmpty' },
+              '还没有历史用量。每笔请求都会按日累计入盘 —— 今天发起的请求明天就能在这里看到。')
+          : React.createElement(React.Fragment, { key: 'histBody' },
+              // 趋势柱状图：每根柱 = 一天，点击下钻该日聚合树（再点收起）。
+              React.createElement('div', { className: 'dim-jh-ledgerTrend' },
+                bars.map((b) => React.createElement('div', {
+                  key: b.day,
+                  className: 'dim-jh-ledgerTrendCol',
+                  title: b.day + '：↓↑ ' + formatTokenCount(b.tokens) + ' · ' + b.requests + ' 次',
+                  onClick: () => setExpandedDay((prev) => (prev === b.day ? null : b.day)),
+                },
+                  React.createElement('div', {
+                    className: 'dim-jh-ledgerTrendBar',
+                    'data-today': b.isToday ? 'true' : 'false',
+                    'data-active': expandedDay === b.day ? 'true' : 'false',
+                    style: { height: barHeightPercent(b.tokens, maxTokens) + '%' },
+                  }))),
+              // 展开的那天：完整聚合树（渠道 → provider → 账号 → 模型）。
+              ...(expandedDay !== null
+                ? historyDays.filter((d) => d?.day === expandedDay).map((dayRow) =>
+                    renderDayTree(dayRow))
+                : [])));
+    return React.createElement('div', { className: 'dim-jh-ledgerSection', key: 'history' },
+      React.createElement('div', { className: 'dim-jh-ledgerSectionTitle' },
+        historyTitle(historyRange)),
+      rangeRow,
+      body);
+  };
+
+  /** 一天的历史聚合树：结构与实时汇总卡一致（复用 tokenSummaryText 等口径）。 */
+  const renderDayTree = (dayRow) => React.createElement('div', { key: 'day-' + dayRow.day, className: 'dim-jh-ledgerCard' },
+    React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
+      React.createElement('strong', null, dayRow.day + ' · ' + (dayRow.totals?.requests ?? 0) + ' 次请求'),
+      React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(dayRow.totals)),
+      React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
+        tokenSummaryText(dayRow.totals))),
+    dayRow.channels.map((channelRow) => React.createElement('div', { key: channelRow.channel, className: 'dim-jh-ledgerProvider' },
+      React.createElement('div', { className: 'dim-jh-ledgerProviderHead' },
+        React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, channelLabel(channelRow.channel)),
+        React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(channelRow.totals)),
+        React.createElement('span', { className: 'dim-jh-ledgerProviderSum' },
+          tokenSummaryText(channelRow.totals))),
+      channelRow.providers.map((providerRow) => React.createElement('div', {
+        key: providerRow.provider, className: 'dim-jh-ledgerAccount',
+      },
+        React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
+          React.createElement('span', { className: 'dim-jh-ledgerAccountName' }, providerRow.provider),
+          React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(providerRow.totals)),
+          React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
+            tokenSummaryText(providerRow.totals))),
+        (providerRow.accounts ?? []).length > 1
+          ? providerRow.accounts.map((accountRow) => React.createElement('div', {
+              key: providerRow.provider + '#' + accountRow.accountId, className: 'dim-jh-ledgerAccount',
+              style: { padding: '0 0 0 8px' },
+            },
+              React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
+                React.createElement('span', { className: 'dim-jh-ledgerAccountName' },
+                  accountLabel(accountRow.accountId)),
+                React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
+                  tokenSummaryText(accountRow.totals))),
+              accountRow.models.map((modelRow) =>
+                renderModelRow(modelRow, accountRow.accountId + '#' + modelRow.model))))
+          : (providerRow.accounts ?? []).flatMap((accountRow) => accountRow.models.map((modelRow) =>
+              renderModelRow(modelRow, providerRow.provider + '#' + modelRow.model))))))));
+
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
+  },
+    React.createElement('div', {
+      className: 'dim-jh-modal',
+      role: 'dialog',
+      'aria-modal': 'true',
+      'aria-label': 'Token 用量',
+    },
+      React.createElement('div', { className: 'dim-jh-modalHead' },
+        React.createElement('div', { className: 'dim-jh-modalTitle' },
+          React.createElement('strong', null, 'Token 用量'),
+          React.createElement('span', { className: 'dim-jh-modalSubtitle' }, ledgerSubtitle())),
+        React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            disabled: phase === 'loading',
+            title: '重新读取本机 Token 账本。',
+            onClick: () => void load(),
+          }, phase === 'loading' ? '读取中…' : '刷新'),
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            'data-kind': 'primary',
+            onClick: onClose,
+          }, '完成'))),
+      React.createElement('p', { className: 'dim-jh-modalHint' },
+        '按渠道（直连 / 网关）、供应商、账号与模型统计本机发出的每笔模型请求。'
+        + '↓输入 ↑输出 ⚡缓存 ✎缓存写入 🧠推理；— 表示该笔未收到用量（失败或中断）。'
+        + '明细含「首字用时」与「输出速率」（首块之后 → 结束，官方口径）；'
+        + '汇总行的「均值」只对有实测值的请求平均。'
+        + '明细保留最近 500 笔（重启清空）；按日累计已存盘（token-ledger.json）。'),
+      React.createElement('div', { className: 'dim-jh-modalBody' },
+        renderHistory(),
+        renderSummary(),
+        renderEntries())));
+}
+
 function ProviderPanel({ provider, rpcCall }) {
   const [accounts, setAccounts] = React.useState([]);
   const [phase, setPhase] = React.useState('loading');
@@ -2197,9 +2631,15 @@ function ProviderPanel({ provider, rpcCall }) {
     //   后端 `toClaimOutcome` 现在会带上 `unit: token` 与真实额度
     //   （实测 100000000），这里用现成的 formatUnits/unitLabel 渲染。
     const unit = outcome.unit === 'token' ? 'token' : 'credit'
+    // ⚠️ 数值与单位之间**不留空格**（`+100.00MToken`）：这是本仓库的统一口径
+    //   （用量徽标 `badge-model.js` 的 `94.54MToken`、汇总行 `formatClaimGains`
+    //   的 `+100.00MToken`，以及用户报障时给出的期望文案 `+100Mtoken` 同形）。
+    //   本行原写作 `+${...} ${unitLabel(unit)}`（**带空格**）—— 后果是**同一次
+    //   签到**的逐账号明细显示 `+100.00M Token`、而汇总行显示 `+100.00MToken`，
+    //   两行并列却像两种单位（2026-10-05 复审修正）。
     details.push(
       `${item.nickname || item.accountId}：领取成功 `
-      + `+${formatUnits(outcome.credit, unit)} ${unitLabel(unit)}`,
+      + `+${formatUnits(outcome.credit, unit)}${unitLabel(unit)}`,
     )
         } else if (outcome.kind === 'already-claimed') {
           details.push(`${item.nickname || item.accountId}：${outcome.message || '今天已领取'}`);
@@ -3457,15 +3897,20 @@ function providerRowSummary(row) {
  *   与模型列表里「已关闭的模型」同一语义）+ `dim-jh-modelInfo` / `dim-jh-modelName`
  *   / `dim-jh-modelId`（这里放影响面摘要）+ `dim-jh-switch`；
  * - 排序：已打开在前、已关闭在后（`providerSwitchRows`，与左侧分组同一判据）；
+ *   已打开组支持**拖拽自定义顺序**（`order` prop = 宿主持久化顺序，2026-10-06），
+ *   关闭组恒按声明顺序沉底（用户明确要求「这个逻辑不变」）；
  * - ESC 与点遮罩关闭。
  *
  * ⚠️ 行容器是 `<label>` 且**内部只能有这 1 个 checkbox** —— 与 `ModelToggle` 同一条
  * 约束（见其注释：插入第二个 checkbox 会让「点行内文字」激活错的那个控件）。
+ * 拖拽柄因此只能用 `<span>`，且必须 `preventDefault` 掐掉 label 的激活路径
+ * （见渲染处的注释）。
  *
- * 本组件**不持有数据**：状态、busy 集合与切换动作全部由 `JetHubPage` 传入。
- * 供应商状态是服务端推导出来的（模型黑名单），本地再存一份必然分叉。
+ * 本组件不持有**持久化**数据：状态、busy 集合、切换动作与顺序全部由 `JetHubPage`
+ * 传入；拖拽的视觉状态（正在拖哪行 / 落点在哪）是本组件的局部 UI 状态，drop 时
+ * 通过 `onCommitOrder` 把新顺序交给页面层持久化。
  */
-function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onToggle, onReload, onClose }) {
+function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onToggle, onReload, onClose, order, onCommitOrder, reordering, notice }) {
   // ESC 关闭：挂在 document 上而不是弹窗上 —— 焦点可能落在任意一个开关上，
   // 只监听弹窗自身的 keydown 会漏掉这些按键（与 ModelListPanel 同因）。
   React.useEffect(() => {
@@ -3474,11 +3919,79 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
 
-  const rows = providerSwitchRows(providers, statuses);
+  // 拖拽排序的三件套视觉状态（与 ProviderPanel 的账号拖拽同款）：
+  // 正在拖的行 id / 悬停的目标行 id / 落点方向。真正的顺序变更在 drop 时
+  // 才经 onCommitOrder 提交给页面层持久化。
+  const [draggingId, setDraggingId] = React.useState(null);
+  const [dropTargetId, setDropTargetId] = React.useState(null);
+  const [dropPosition, setDropPosition] = React.useState('before');
+
+  const rows = providerSwitchRows(providers, statuses, order);
   const summary = providerToggleSummary(providers, statuses);
   const countText = summary.known
     ? `共 ${summary.total} 个，已打开 ${summary.open}，已关闭 ${summary.closed}`
     : (statusFailed ? '状态读取失败' : '正在读取状态…');
+
+  // 已打开 ≥2 行才值得拖（与账号面板同款门槛）；任一开关提交中则整体冻结，
+  // 避免「拖到一半那行被停用」造成展示组与拖拽组错位。
+  // ⚠️ `reordering`（排序提交中）也必须计入：提交期间界面顺序未变（不做乐观
+  // 更新），再拖一次会基于旧顺序计算并把上一次移动静默覆盖（账号面板同款，
+  // 那边是 `reordering ? { enabled: false } : dragPropsFor(...)`）。
+  const dragEnabled = rows.filter(row => row.checked).length >= 2
+    && busyIds.size === 0
+    && !reordering;
+
+  /**
+   * 构造某一行的拖拽属性（关闭组或不允许拖时返回 enabled:false）。
+   *
+   * openIds / closedIds 取自 `rows` 而不是 providers+statuses 重算：rows 已经
+   * 是「分组 + 排序」后的最终展示形态，`checked === false` 恰好就是已关闭组
+   * （见 providerSwitchState：closed ⇔ checked=false），且保持声明顺序。
+   */
+  const dragPropsFor = (row) => {
+    if (!row.checked || !dragEnabled) return { enabled: false };
+    return {
+      enabled: true,
+      isDragging: draggingId === row.id,
+      isDropTarget: dropTargetId === row.id && draggingId !== null && draggingId !== row.id,
+      dropPosition,
+      onDragStart: (event) => {
+        setDraggingId(row.id);
+        // 必须设置 dataTransfer，否则 Firefox 不触发拖拽（与账号卡片同因）。
+        try { event.dataTransfer.setData('text/plain', row.id); } catch { /* 忽略 */ }
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+      },
+      onDragEnd: () => {
+        setDraggingId(null);
+        setDropTargetId(null);
+      },
+      onDragOver: (event) => {
+        if (draggingId === null || draggingId === row.id) return;
+        // 必须 preventDefault 才允许 drop。
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+        if (dropTargetId !== row.id) setDropTargetId(row.id);
+        // 按指针在行内的纵向位置决定插到前面还是后面。
+        const rect = event.currentTarget?.getBoundingClientRect?.();
+        const next = dropPositionFromPointer(event.clientY, rect);
+        if (next !== dropPosition) setDropPosition(next);
+      },
+      onDrop: (event) => {
+        event.preventDefault();
+        const sourceId = draggingId;
+        setDraggingId(null);
+        setDropTargetId(null);
+        if (sourceId === null || sourceId === row.id) return;
+        const openIds = rows.filter(r => r.checked).map(r => r.id);
+        const closedIds = rows.filter(r => !r.checked).map(r => r.id);
+        // ⚠️ 必须传当前的 `order`（旧顺序）：已关闭 id 的位置由「它在旧顺序里
+        // 的直接前驱」决定，漏传就退化成按展示序缀尾 —— 关闭期间拖过一次之后
+        // 重开就会掉到末尾（PR #63 初版的真实缺陷）。
+        const next = nextProviderOrderAfterDrop(openIds, closedIds, sourceId, row.id, dropPosition, order);
+        if (next !== null) void onCommitOrder(next);
+      },
+    };
+  };
 
   return React.createElement('div', {
     // `--top`：顶部锚定。行数固定但窗口高度会变，垂直居中会让弹窗上下跳动
@@ -3509,20 +4022,56 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
       }, '完成'))),
   React.createElement('p', { className: 'dim-jh-modalHint' },
     '关闭一个供应商 = 关闭它的全部模型（从对话框的模型选择里移除）并停用它的全部账号；'
-    + '打开则恢复。关闭前会再确认一次。没有可关闭模型的供应商会被禁用（服务端也会拒绝）。'),
+    + '打开则恢复。关闭前会再确认一次。没有可关闭模型的供应商会被禁用（服务端也会拒绝）。'
+    + '拖动已打开的行可自定义顺序（顺序只保存在本机）；已关闭的供应商仍按默认顺序显示在底部。'),
+  // ⚠️ 供应商相关的提示必须在**这里**（弹窗内）显示，不能只挂在页面层：
+  // 拖拽与开关切换都发生在弹窗打开期间，而弹窗遮罩是 fixed + z-index 3000，
+  // 页面层的 notice 会被它整个盖住 —— 用户只会看到「操作没生效，却什么提示都没有」。
+  // ⚠️ 弹窗开着时**显示全部** notice（含 toggleProvider 的结果/失败提示）——
+  // 它们此刻在页面层同样被遮住，只按 inModal 过滤会让切换结果一样消失。
+  // 弹窗关闭即不挂载、页面层那条照旧渲染，两边不会重复出现。
+  // 复用既有 `.dim-jh-probeNotice` + `.dim-jh-modal .dim-jh-probeNotice` 样式，不新增样式。
+  notice
+    ? React.createElement('div', {
+        className: 'dim-jh-probeNotice',
+        'data-tone': notice.tone,
+        role: notice.tone === 'error' ? 'alert' : 'status',
+      }, React.createElement('div', null, notice.text))
+    : null,
   React.createElement('div', { className: 'dim-jh-modalBody' },
     React.createElement('div', { className: 'dim-jh-modelList' },
       rows.map(row => {
         const busy = busyIds.has(row.id);
         const action = row.checked ? '关闭' : '打开';
+        const drag = dragPropsFor(row);
         return React.createElement('label', {
           key: row.id,
           className: 'dim-jh-modelRow',
           // 与模型列表同语义：`data-disabled` 表示**这一项已被关闭**（整行淡出），
           // 不是「这行点不动」—— 点不动由下面 input 的 disabled 表达。
           'data-disabled': row.checked ? 'false' : 'true',
+          // 拖拽排序（与账号卡片同款视觉语言）：源行淡出、落点行画插入线。
+          draggable: drag.enabled ? 'true' : undefined,
+          onDragStart: drag.onDragStart,
+          onDragEnd: drag.onDragEnd,
+          onDragOver: drag.onDragOver,
+          onDrop: drag.onDrop,
+          'data-dragging': drag.isDragging ? 'true' : undefined,
+          'data-dropBefore': drag.isDropTarget && drag.dropPosition !== 'after' ? 'true' : undefined,
+          'data-dropAfter': drag.isDropTarget && drag.dropPosition === 'after' ? 'true' : undefined,
           title: row.disabled ? row.reason : `${action}「${row.label}」：${action}它的全部模型并${row.checked ? '停用' : '启用'}全部账号`,
         },
+        drag.enabled
+          ? React.createElement('span', {
+              className: 'dim-jh-dragHandle',
+              title: '拖动以调整顺序（顺序只保存在本机）',
+              'aria-hidden': 'true',
+              // ⚠️ 行容器是 <label>：点柄的 click 会沿 label 激活开关。preventDefault
+              // 掐掉这条激活路径 —— 拖柄不是开关，点了不该有开关反应（拖拽本身
+              // 不经过 click，互不影响）。
+              onClick: (event) => { event.preventDefault(); event.stopPropagation(); },
+            }, '⠿')
+          : null,
         React.createElement('span', { className: 'dim-jh-modelInfo' },
           React.createElement('strong', { className: 'dim-jh-modelName' }, row.label),
           React.createElement('code', { className: 'dim-jh-modelId' }, providerRowSummary(row))),
@@ -4144,6 +4693,34 @@ export function JetHubPage({ close, rpcCall }) {
   /** 正在提交的供应商 id 集合：只禁用被点的那一个开关。 */
   const [providerBusy, setProviderBusy] = React.useState(() => new Set());
   /**
+   * 供应商自定义显示顺序（「供应商开关」弹窗的拖拽排序，宿主持久化）。
+   *
+   * `null` = 尚未读到 / 读取失败 / 用户从未自定义 —— 三种情况展示侧都按
+   * 声明顺序渲染，界面上无法也不必区分。降级思路与 providerStatuses 一致：
+   * 顺序是**纯展示偏好**，任何一次读取失败都不该打扰用户（区别于开关状态，
+   * 那个失败会显式提示）。
+   */
+  const [providerOrder, setProviderOrder] = React.useState(null);
+  /**
+   * 排序提交进行中（与账号面板的 `reordering` 同款）。
+   *
+   * ⚠️ 不做乐观更新 ⇒ RPC 返回前 `providerOrder` 仍是旧值，`rows` 也仍基于
+   * 旧值。若这段时间里用户再拖一次，第二次会**基于旧顺序**计算，于是第一次的
+   * 移动被静默覆盖（实测：拖 cline 到最前后紧接着拖 loomy，cline 被打回原位）。
+   * 账号面板早就有这把锁（`reordering ? { enabled: false } : dragPropsFor(...)`），
+   * 这里必须同样把「排序提交中」并入 `dragEnabled`。
+   */
+  const [providerReordering, setProviderReordering] = React.useState(false);
+  /**
+   * 排序提交的**同步**互斥锁（ref 而非 state）。
+   *
+   * ⚠️ 必须用 ref 而不是直接读 `providerReordering`：state 写入后要等下一次
+   * 渲染才可见，而两次 drop 可以发生在同一次渲染周期内 —— 读 state 会让锁
+   * 形同虚设（账号面板的 `reordering` 走 state，是因为它的入口是按钮、
+   * 有一次点击到渲染的自然间隔；拖拽 drop 没有这层间隔）。
+   */
+  const reorderLockRef = React.useRef(false);
+  /**
    * 供应商开关的结果提示（成功或失败）。
    *
    * 与 `checkinNotice` 分开：两者可能先后出现，共用一个状态会让后写的覆盖先写的，
@@ -4161,6 +4738,8 @@ export function JetHubPage({ close, rpcCall }) {
   const [gatewayStatus, setGatewayStatus] = React.useState(null);
   const [gatewayBusy, setGatewayBusy] = React.useState(false);
   const [gatewayNotice, setGatewayNotice] = React.useState(null);
+  /** 「Token 用量」弹窗（覆盖层，与供应商开关/网关弹窗互斥打开）。 */
+  const [showTokenLedger, setShowTokenLedger] = React.useState(false);
   const mounted = React.useRef(true);
   React.useEffect(() => () => { mounted.current = false; }, []);
 
@@ -4243,7 +4822,110 @@ export function JetHubPage({ close, rpcCall }) {
     void loadProviderStatuses();
   }, [loadProviderStatuses]);
 
+  /**
+   * 读取供应商自定义顺序。
+   *
+   * 失败**不提示**（只 console.error + 保持 null）：与 loadProviderStatuses
+   * 的降级口径不同 —— 状态读不到会影响「能不能关」的操作判断，值得一条提示；
+   * 顺序读不到只是回到默认排列，用户毫无感知损失，弹提示反而是噪音。
+   */
+  const loadProviderOrder = React.useCallback(async () => {
+    try {
+      const res = await rpcCall('provider.getOrder', {});
+      if (!mounted.current) return;
+      setProviderOrder(Array.isArray(res?.order) && res.order.length > 0 ? res.order : null);
+    } catch (caught) {
+      console.error('[jet-hub] load provider order failed:', caught);
+      if (!mounted.current) return;
+      setProviderOrder(null);
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => {
+    void loadProviderOrder();
+  }, [loadProviderOrder]);
+
+  /**
+   * 打开 Jet Hub 时的默认选中卡片 = 自定义序第一位的供应商。
+   *
+   * 初值 `PROVIDERS[0].id` 是**声明序第一位**——providerOrder 是异步读的，
+   * useState 时刻它还是 null，没法一步到位。这里用「一次性纠偏」：
+   * providerOrder 首次到达后，若用户**尚未**手动点过任何卡片（touchedRef），
+   * 把 selected 切到自定义序的第一个**已打开**供应商；一旦用户点过，不再
+   * 接管（避免覆盖用户的选择）。
+   *
+   * ⚠️ 本 effect 的依赖（providerOrder / providerStatuses）**必须**声明在本
+   * effect 之后：`useEffect(fn, deps)` 的 deps 数组由 JS 引擎在进入调用前
+   * 就急切求值，若依赖的 `const` 还在 TDZ（声明之前），**首次渲染就会抛
+   * ReferenceError: Cannot access 'providerOrder' before initialization**，
+   * 整个 Jet Hub 页直接打不开。初版把它放在两个 useState 之前，症状是
+   * 「构建/单测全绿、点开 Jet Hub 白屏」—— 纯源码断言的用例测不到它。
+   *
+   * 「已打开」过滤的原因：自定义序首位若已被关闭，把它选进来会渲染一个
+   * 无账号可管理的空面板——此刻跳到下一个 open 的才是用户想要的。
+   * providerStatuses 未读时保守回退 providerOrder[0]（宁多勿少，与分组
+   * 判据同取向）。
+   */
+  const providerTouchedRef = React.useRef(false);
+  React.useEffect(() => {
+    if (providerTouchedRef.current) return;
+    if (!Array.isArray(providerOrder) || providerOrder.length === 0) return;
+    const firstUsable =
+      providerOrder.find(id => providerStatuses === null || providerStatuses?.[id]?.closed !== true)
+      ?? providerOrder[0];
+    if (typeof firstUsable === 'string' && firstUsable !== selected
+      && PROVIDERS.some(p => p.id === firstUsable)) {
+      setSelected(firstUsable);
+      setVersion(v => v + 1);
+    }
+    // providerStatuses 一并依赖：它到达后「首位已关闭 → 跳下一个 open」的纠偏
+    // 才能算准。touchedRef 不进依赖（ref 读取无时序问题）。
+  }, [providerOrder, providerStatuses, selected]);
+
+  /**
+   * 提交拖拽后的新顺序。
+   *
+   * ⚠️ **不做乐观更新**（与 toggleGateway 同一取舍）：服务端才是顺序的权威
+   * 存储，本地先改会在写入失败时出现「界面已变、重启又弹回」的错觉。成功后才
+   * 落 state。失败复用 providerNotice（弹窗内没有独立的 notice 区）提示，
+   * 并回读一次确保界面与服务端一致。
+   */
+  const commitProviderOrder = React.useCallback(async (next) => {
+    if (!Array.isArray(next)) return;
+    // ⚠️ 提交期间上锁：RPC 返回前界面顺序未变，再拖一次会基于旧顺序计算，
+    // 把本次的移动静默覆盖（账号面板的 `reordering` 同款，理由见 state 处注释）。
+    if (reorderLockRef.current) return;
+    reorderLockRef.current = true;
+    setProviderReordering(true);
+    // ⚠️ **只清排序自己的旧提示**（inModal 那条），不能无条件清空：
+    // 用户「切换某供应商（成功提示）→ 立刻拖一次」时，前一条 ok 提示不该被吞掉
+    // （`toggleProvider` 写的 notice 没有 inModal 标记，见 ProviderSwitchPanel）。
+    // 拖拽本身在弹窗内没有独立区域显示 toggle 的结果，故保留它。
+    setProviderNotice(prev => (prev && prev.inModal ? null : prev));
+    try {
+      await rpcCall('provider.setOrder', { order: next });
+      if (!mounted.current) return;
+      setProviderOrder(next);
+    } catch (caught) {
+      console.error('[jet-hub] commit provider order failed:', caught);
+      if (!mounted.current) return;
+      setProviderNotice({
+        tone: 'error',
+        text: '保存排序失败：' + (caught?.message || '未知错误') + '。界面顺序保持不变，可重试拖动。',
+        // ⚠️ 必须由**弹窗内**呈现：拖拽必然发生在弹窗打开期间，而弹窗遮罩是
+        // fixed + z-index 3000，页面层的 notice 会被它整个盖住（用户看不到失败）。
+        inModal: true,
+      });
+      await loadProviderOrder();
+    } finally {
+      reorderLockRef.current = false;
+      if (mounted.current) setProviderReordering(false);
+    }
+  }, [rpcCall, loadProviderOrder]);
+
   const selectProvider = (id) => {
+    // 用户手动点过卡片 → 「打开 Jet Hub 默认选中自定义序首位」的纠偏不再生效。
+    providerTouchedRef.current = true;
     setSelected(id);
     setVersion(v => v + 1);
   };
@@ -4331,7 +5013,14 @@ export function JetHubPage({ close, rpcCall }) {
     // 需要用户操作的提示（如「该账号尚未开通，请先用官方客户端登录一次」）。
     // 单独收集、单独渲染：混进计数行会被读漏，而这类提示的价值就在于被看到。
     const notes = [];
-    let totalCredit = 0;
+    // ★ 按单位分组的合计（2026-10-04，真实缺陷）：见下方累加处的说明。
+    //
+    // ⚠️ 这里**刻意不设 `totalCredit` 标量**：它是跨单位求和的数，展示路径本就
+    //   一律不得使用。本 PR 首版留着它并配了「兜底旧宿主」的三元分支，但那个
+    //   分支**永远走不到**（只要有 `claimed`，`totalByUnit` 必非零）—— 旧宿主
+    //   的兜底实际发生在下面逐渠道的 `s.totalByUnit || {...}` 那一跳。
+    //   留一个恒为 0 的变量 + 一句会骗人的注释，比删掉它危险得多。
+    const totalByUnit = { token: 0, credit: 0 };
     let failed = 0;
     for (const provider of checkinProviders()) {
       const label = PROVIDERS.find(p => p.id === provider)?.label || provider;
@@ -4349,8 +5038,23 @@ export function JetHubPage({ close, rpcCall }) {
         // 用 else-if 短路，否则后者的信息被前者的分支吞掉。
         const bits = [];
         if (s.claimed > 0) {
-          totalCredit += s.totalCredit;
-          bits.push(`+${s.totalCredit}`);
+          // ★ 按单位分别累加（2026-10-04，真实缺陷）：`s.totalCredit` 是**跨单位
+          //   求和** —— ZCode 的 1 亿 token 与其余渠道的积分会被加成一个数，并
+          //   在汇总行标成「积分」（用户报障原文：`ZCode（智谱）+100000000
+          //   （共 +100000100）`）。单位必须一路带着走，故这里读 `totalByUnit`。
+          const byUnit = s.totalByUnit || { credit: s.totalCredit, token: 0 };
+          totalByUnit.credit += Number(byUnit.credit) || 0;
+          totalByUnit.token += Number(byUnit.token) || 0;
+          // ⚠️ 逐渠道那行也按单位渲染：原先写裸数字（`+100000000`），既看不出
+          //   单位、量级也读不出来。缺 `totalByUnit` 的旧宿主回落到「按积分」。
+          // ⚠️ **不要在这里再拼 `+`**：`formatClaimGains` 的返回值**自带**每个单位
+          //   的 `+`（`+100.00MToken, +100积分`），再拼一次会渲染成 `++100.00MToken`。
+          //   真实缺陷（2026-10-05 复审本 PR 时实测）：本行原写作 `+${amount}`，
+          //   而汇总行又写 `（共 +${totalAmount}）` —— 两个界面同时出现双加号，
+          //   且**全量单测 5448 条全绿也抓不到**（没有任何用例断言调用点的拼装形态）。
+          //   回归由 `tests/unit/claim-unit-callsites.spec.ts` 的源码级断言锁死。
+          const amount = formatClaimGains(byUnit);
+          if (amount !== null) bits.push(amount);
         }
         if (s.alreadyClaimed > 0) bits.push(`${s.alreadyClaimed} 个今日已领`);
         if (s.inactive > 0) bits.push(`${s.inactive} 个暂无活动`);
@@ -4390,11 +5094,24 @@ export function JetHubPage({ close, rpcCall }) {
       if (!mounted.current) return;
     }
     if (!mounted.current) return;
+    // ★ 汇总行按单位分别报（2026-10-04，真实缺陷）：原先写 `（共 +${totalCredit} 积分）`，
+    //   而 `totalCredit` 是跨单位求和 —— 用户报障的 `（共 +100000100）` 就是它。
+    //   期望形态是 `（共 +100.00MToken, +100积分）`（见 `formatClaimGains`）。
+    //
+    // ⚠️ **不能再拼 `+`**：`formatClaimGains` 的返回值自带每个单位的 `+`
+    //   （`+100.00MToken, +100积分`）—— 本行原写作 `（共 +${totalAmount}）`，
+    //   渲染出 `（共 ++100.00MToken, +100积分）`（2026-10-05 复审实测）。
+    //
+    // ⚠️ **兜底只在累加处做一次**：旧宿主（无 `totalByUnit`）的值已在上面
+    //   逐渠道时回落进 `totalByUnit`，故这里直接用它。原先还写了一个
+    //   `... : { credit: totalCredit }` 的三元兜底，而 `totalCredit` 早已不再累加
+    //   （恒为 0）⇒ 该分支既走不到、又让人以为旧宿主靠它兜底。已删除。
+    const totalAmount = formatClaimGains(totalByUnit);
     setCheckinNotice({
       // 有待用户处理的提示时用 warn 色调，让那条提示更显眼
       tone: failed > 0 || notes.length > 0 ? 'warn' : 'ok',
       text: parts.length > 0
-        ? `一键签到：${parts.join('，')}${totalCredit > 0 ? `（共 +${totalCredit} 积分）` : ''}`
+        ? `一键签到：${parts.join('，')}${totalAmount === null ? '' : `（共 ${totalAmount}）`}`
         : '一键签到：没有可领取的渠道',
       notes,
     });
@@ -4451,6 +5168,11 @@ export function JetHubPage({ close, rpcCall }) {
    *
    * 行上**没有开关**（已搬到页头的 `ProviderSwitchPanel`），故这里不再关心
    * 禁用态：那套判据（`models.total === 0` ⇒ 禁用并给出原因）现在只在弹窗里用。
+   *
+   * 「已打开」组按 `providerOrder`（弹窗拖拽保存的自定义顺序）排序——与弹窗
+   * 共用同一份顺序（宿主端持久化在 state.json 的 providerOrder 字段）；
+   * `providerOrder === null`（未自定义/读取失败）时 `sortOpenProvidersByOrder`
+   * 返回原数组 = 声明序兜底。「已关闭」组恒按声明顺序沉底（与弹窗同口径）。
    */
   const renderRail = () => {
     if (providerStatuses === null) {
@@ -4461,7 +5183,7 @@ export function JetHubPage({ close, rpcCall }) {
       React.createElement('div', { className: 'dim-jh-railGroupTitle' }, title),
       list.map(p => renderProviderRow(p)));
     return [
-      group(`已打开 (${open.length})`, open, 'open'),
+      group(`已打开 (${open.length})`, sortOpenProvidersByOrder(open, providerOrder), 'open'),
       group(`已关闭 (${closed.length})`, closed, 'closed'),
     ];
   };
@@ -4477,8 +5199,11 @@ export function JetHubPage({ close, rpcCall }) {
   return React.createElement('section', { className: 'dim-jh-page', 'aria-label': 'Jet Hub Provider 设置' },
     React.createElement('header', { className: 'dim-jh-header' },
       React.createElement('div', { className: 'dim-jh-brand' },
-        React.createElement('strong', { className: 'dim-jh-brandName' }, 'Jet Hub'),
-        React.createElement('p', { className: 'dim-jh-brandDesc' }, '提供商凭据与多账号管理')),
+        // ⚠️ 这里曾有一行副标题「提供商凭据与多账号管理」（.dim-jh-brandDesc），
+        // 用户 2026-10-06 要求去掉：页头按钮已排到一排，副标题又占一行高度、
+        // 宽窄窗口下还会被截成省略号（既读不全、又把按钮往下挤）。
+        // 「Jet Hub」标题本身已足够标识该设置页，语义不丢。
+        React.createElement('strong', { className: 'dim-jh-brandName' }, 'Jet Hub')),
       React.createElement('div', { className: 'dim-jh-headerActions' },
         // 「供应商开关」在页头，而不是左侧每个供应商行尾（!25 的原形态）：
         // 它是破坏性批量操作，与「选择看哪个供应商」这个高频无害动作分开摆放，
@@ -4528,6 +5253,18 @@ export function JetHubPage({ close, rpcCall }) {
             void loadGatewayStatus();
           },
         }, gatewayButtonLabel(gatewayStatus)),
+        // 「Token 用量」入口：全 provider 的本地记账（直连/网关分开统计）。
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          title: 'Token 用量：按渠道（直连/网关）、供应商与模型统计本机请求的 token 消耗。',
+          'aria-haspopup': 'dialog',
+          'aria-expanded': showTokenLedger ? 'true' : 'false',
+          onClick: () => {
+            setShowProviderSwitches(false);
+            setShowGateway(false);
+            setShowTokenLedger(true);
+          },
+        }, 'Token 用量'),
         close ? React.createElement('button', {
           className: 'dim-jh-btn',
           onClick: close,
@@ -4551,7 +5288,9 @@ export function JetHubPage({ close, rpcCall }) {
                 React.createElement('li', { key: index }, note)))
           : null)
       : null,
-    providerNotice
+    // ⚠️ `inModal` 的提示交给弹窗自己渲染（见 ProviderSwitchPanel）—— 重复渲染
+    // 会让同一条错误在遮罩内外各出现一次。
+    providerNotice && !providerNotice.inModal
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
           'data-tone': providerNotice.tone,
@@ -4584,6 +5323,10 @@ export function JetHubPage({ close, rpcCall }) {
           onToggle: toggleProvider,
           onReload: loadProviderStatuses,
           onClose: () => setShowProviderSwitches(false),
+          order: providerOrder,
+          onCommitOrder: commitProviderOrder,
+          reordering: providerReordering,
+          notice: providerNotice,
         })
       : null,
     // 同款做法：网关开关也是覆盖层，且与「供应商开关」互斥 —— 两者都是
@@ -4596,6 +5339,14 @@ export function JetHubPage({ close, rpcCall }) {
           onToggle: toggleGateway,
           onReload: loadGatewayStatus,
           onClose: () => setShowGateway(false),
+        })
+      : null,
+    // 「Token 用量」弹窗：同样是覆盖层（createElement 形式 —— 与其它弹窗
+    // 同一理由，见 OpencodeProxyModal 上方的 hook 计数事故注释）。
+    showTokenLedger
+      ? React.createElement(TokenLedgerPanel, {
+          rpcCall,
+          onClose: () => setShowTokenLedger(false),
         })
       : null);
 }

@@ -1958,4 +1958,109 @@ describe('AccountPool · setAccountsEnabled（供应商级批量启停）', () =
       expect(raw.disabledModels).toBeDefined()
     })
   })
+
+  /**
+   * 账号入库的**观察点**（Gitee issue IKJOZB）。
+   *
+   * 该 issue 的根因是「冷启动空池 ⇒ 续期调度器不武装 ⇒ 之后登录的账号永不续期」。
+   * 修法之一是「账号入库时补武装」，因此 `addAccount` 必须**有一个通知出口**。
+   *
+   * ⚠️ **为什么钩子挂在 `addAccount` 而不是逐个登录流程**：全仓库有十几处
+   * `pool.addAccount(...)` 调用点（每个 provider 的 auth、opencode、RPC 的
+   * 导入/恢复分支），逐处接线必然漏 —— 而漏掉的那个 provider 会**静默**地
+   * 不被续期，正是本 issue 的形态。`addAccount` 是唯一的入库收口点。
+   */
+  describe('账号入库通知（issue IKJOZB：登录后必须能重新武装续期调度）', () => {
+    it('注册后每次 addAccount 都回调一次，且带上新增的条目', async () => {
+      const seeded = createMockContext()
+      const pool = new AccountPool(seeded as never)
+      const added: ProviderAccountEntry[] = []
+      pool.onAccountAdded((entry) => added.push(entry))
+
+      await pool.addAccount(makeMockAccount())
+      await pool.addAccount(makeMockAccount({ id: 'buddy-002' }))
+
+      expect(added).toHaveLength(2)
+      expect(added[0]?.id).toBe('buddy-001')
+      expect(added[1]?.id).toBe('buddy-002')
+    })
+
+    it('未注册回调时 addAccount 照常工作（不因缺少订阅者而失败）', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      await expect(pool.addAccount(makeMockAccount())).resolves.toBeUndefined()
+      expect(await pool.listAllAccounts()).toHaveLength(1)
+    })
+
+    it('⚠️ 落盘失败时通知仍要发出（凭据已存在于凭据存储，调度不该被磁盘问题连坐）', async () => {
+      const seeded = createMockContext([], { failReplaceOf: () => true })
+      const pool = new AccountPool(seeded as never)
+      let notified = 0
+      pool.onAccountAdded(() => { notified += 1 })
+
+      await expect(pool.addAccount(makeMockAccount())).rejects.toThrow('disk full')
+      expect(notified).toBe(1)
+    })
+
+    it('⚠️ 回调抛错不得让 addAccount 失败（登录不能因为订阅者写坏了而报错）', async () => {
+      const seeded = createMockContext()
+      const pool = new AccountPool(seeded as never)
+      pool.onAccountAdded(() => { throw new Error('subscriber boom') })
+
+      await expect(pool.addAccount(makeMockAccount())).resolves.toBeUndefined()
+      expect(await pool.listAllAccounts()).toHaveLength(1)
+    })
+
+    it('多个订阅者都被调用（池与调度器可各自订阅）', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      const seen: string[] = []
+      pool.onAccountAdded(() => seen.push('a'))
+      pool.onAccountAdded(() => seen.push('b'))
+      await pool.addAccount(makeMockAccount())
+      expect(seen).toEqual(['a', 'b'])
+    })
+  })
+
+  /**
+   * 供应商自定义显示顺序（「供应商开关」弹窗拖拽排序，2026-10-06）。
+   *
+   * 与网关开关同级的「可逆展示偏好」：丢键 = 回到声明顺序，用户重拖一次即恢复，
+   * 故住 state.json 即可、无需独立文档。⚠️ 与 gatewayEnabled 同一红线：
+   * 写顺序不得抹掉同一文档里的账号与黑名单（整体写入语义）。
+   */
+  describe('供应商自定义显示顺序', () => {
+    it('默认空数组（未自定义 = 按声明顺序渲染）', () => {
+      expect(new AccountPool(createMockContext() as never).providerOrder()).toEqual([])
+    })
+
+    it('写入后可读回，且跨实例落盘', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      await writer.setProviderOrder(['zcode', 'buddy', 'codearts'])
+      expect(writer.providerOrder()).toEqual(['zcode', 'buddy', 'codearts'])
+
+      // 新实例从同一后端载入 —— 证明不是只改了内存副本。
+      expect(new AccountPool(seeded as never).providerOrder()).toEqual(['zcode', 'buddy', 'codearts'])
+    })
+
+    it('相同顺序重复写入不触发落盘', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const pool = new AccountPool(seeded as never)
+      await pool.setProviderOrder(['buddy', 'zcode'])
+      const writes = seeded.replacePayloads.length
+      await pool.setProviderOrder(['buddy', 'zcode'])
+      expect(seeded.replacePayloads.length).toBe(writes)
+    })
+
+    it('⚠️ 写顺序不得抹掉同一文档里的账号与黑名单', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const pool = new AccountPool(seeded as never)
+      await pool.setProviderOrder(['buddy', 'zcode'])
+
+      const raw = seeded.replacePayloads.at(-1) as
+        { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, unknown>; providerOrder?: string[] }
+      expect(raw.accounts).toHaveLength(1)
+      expect(raw.disabledModels).toBeDefined()
+      expect(raw.providerOrder).toEqual(['buddy', 'zcode'])
+    })
+  })
 })

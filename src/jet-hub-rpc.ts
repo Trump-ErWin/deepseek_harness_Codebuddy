@@ -86,6 +86,7 @@ import type { TraeCredential } from './trae.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
 import { fetchClineUsageLimits } from './cline-quota.js'
 import { clineUpstreamOf, readClineRequestHistory } from './cline-request-log.js'
+import { readTokenLedger, readTokenLedgerDayMap, readTokenLedgerHistory, TOKEN_LEDGER_HISTORY_MAX_DAYS } from './token-ledger.js'
 import {
   clineCredentialExpiresAtMs,
   isClineRefreshable,
@@ -96,6 +97,7 @@ import { credentialExpiresAtMs } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
 import {
   claimDailyCheckin,
+  claimUnitOf,
   fetchCheckinStatus,
   fetchCreditBalance,
   type CheckinStatus,
@@ -132,6 +134,7 @@ import {
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
+import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
 import type {
   ProviderAccountEntry,
@@ -148,6 +151,8 @@ import type {
   RpcUpdateAccountRequest,
   RpcDeleteAccountRequest,
   RpcReorderAccountsRequest,
+  RpcGetProviderOrderResponse,
+  RpcSetProviderOrderRequest,
   RpcRefreshAccountRequest,
   RpcRefreshAccountResponse,
   RpcRetestAccountRequest,
@@ -188,6 +193,8 @@ import type {
   RpcModelSetAllDisabledResponse,
   RpcModelSetDisabledManyRequest,
   RpcModelSetDisabledManyResponse,
+  RpcModelClearDeadRequest,
+  RpcModelClearDeadResponse,
   RpcProviderStatusRequest,
   RpcProviderStatusResponse,
   RpcProviderSetEnabledRequest,
@@ -203,6 +210,10 @@ import type {
   RpcUsageBadgeResponse,
   RpcUsageBadgePreferenceRequest,
   RpcUsageBadgePreferenceResponse,
+  RpcUsageTokenLedgerRequest,
+  RpcUsageTokenLedgerResponse,
+  RpcUsageTokenLedgerHistoryRequest,
+  RpcUsageTokenLedgerHistoryResponse,
   RpcUsageAutoCheckinRequest,
   RpcUsageAutoCheckinResponse,
   ProviderStatus,
@@ -415,16 +426,28 @@ export const PERMANENT_LOCK_PROVIDERS: ReadonlySet<string> = new Set([
  * 汇总一次批量领取的结果。
  * 纯函数，便于单测；inactive（无资格/活动结束）与 failed 分开计数，
  * 因为前者是正常的业务状态、后者才是需要用户关注的问题。
+ *
+ * ★ **按单位分开累加**（2026-10-04，真实缺陷）：`totalCredit` 这个标量会把
+ * 不同量纲加在一起（ZCode 的 1 亿 token + 100 积分 = `100000100`），单位信息
+ * 一旦在这一层丢掉，下游无论怎么写文案都只能标一个「积分」。故同时产出
+ * `totalByUnit`，消费方一律用它（见 `RpcCreditsClaimSummary.totalByUnit`）。
+ *
+ * ⚠️ `totalCredit` **保留原语义**（跨单位求和），只为不破坏既有契约；
+ * **不要**在展示路径上用它 —— 那正是本缺陷的成因。
  */
 export function computeClaimSummary(outcomes: readonly ClaimOutcome[]): RpcCreditsClaimSummary {
   const summary: RpcCreditsClaimSummary = {
     claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
+    totalByUnit: { token: 0, credit: 0 },
   }
   for (const outcome of outcomes) {
     switch (outcome.kind) {
       case 'claimed':
         summary.claimed += 1
         summary.totalCredit += outcome.credit
+        // ⚠️ 单位缺省按 `credit`（与 `ClaimOutcome.unit` 的声明一致）——
+        // 只有 ZCode 显式传 `'token'`，其余 11 个渠道逐字不变。
+        summary.totalByUnit[claimUnitOf(outcome.unit)] += outcome.credit
         // ⚠️ 只有**覆盖今天**的领取才算「今天已处理」。`coversToday:false` 是
         // 渠道自己标的（当前是 Qoder 刷新前那一轮），见 `credits.ts` 的字段说明。
         if (outcome.coversToday !== false) summary.coversToday += 1
@@ -972,7 +995,7 @@ function registerJetHubEndpoints(
    * 为什么用注册表而不是给每个 provider 各加一条 `|| provider === X.id`：
    * 本文件里 Qoder 相关分支有**四处**（登录 / 单账号续期 / 余额 / 领取）。
    * 平行 case 的数量与「漏接一处」的概率同向增长 —— 本插件在 `workbuddy` 上
-   * 就真漏过一次（账号卡片的「刷新」按钮一直报 `Unknown provider`）。
+   * 就真漏过一次（`account.refresh` 端点对它一直报 `Unknown provider`）。
    * 注册表把「同族」这件事表达成数据结构，加第 N 个同族产品只改这一处。
    */
   interface QoderFamilyMember {
@@ -1965,15 +1988,20 @@ function registerJetHubEndpoints(
           // 续期入口 —— 三处都是修复既有缺陷的关键：
           //
           // 1. 原实现只处理 codearts / buddy，`workbuddy` 会落到 else 抛
-          //    `Unknown provider`，即 WorkBuddy 账号卡片的「刷新」按钮一直是坏的；
+          //    `Unknown provider` —— 即 `account.refresh` 端点**对 WorkBuddy 完全不可用**；
           // 2. 原实现调的是 `service.refresh()`，它读写的是该 provider 的
-          //    **默认单凭据 ref**（如 BUDDY_ACCESS_TOKEN），而账号卡片对应的是
-          //    BUDDY_ACCOUNT_XXX —— 于是「刷新这个账号」实际刷的是另一个凭据，
+          //    **默认单凭据 ref**（如 BUDDY_ACCESS_TOKEN），而要刷的是池内条目的
+          //    BUDDY_ACCOUNT_XXX —— 于是「刷这个账号」实际刷的是另一个凭据，
           //    结果要么报错要么静默改了错的对象。
           // 3. ⚠️ **每个分支都必须传 `pool` + `entry.id`**（issue !IKIRTT）：
           //    续期成功后要把新的 `expiresAt` 写回账号池，UI 才不再显示
-          //    「已过期」。早先只有 raccoon 分支传了，其余七个「刷新」下去
+          //    「已过期」。早先只有 raccoon 分支传了，其余七个分支漏传，
           //    凭据续好了、界面纹丝不动，用户没有任何自救手段。
+          //
+          // ⚠⚠ **本端点没有面板入口**（issue IKJOZA 取证）：账号卡片上并没有
+          // 「刷新」按钮（按钮是 测试/重测/重置/停用/代理/指纹/删除），
+          // 调用方是仓库外的脚本/手工 RPC。下面三处历史注释曾把它写成
+          // 「账号卡片的刷新按钮」——那是失实的，会把排障的人引到不存在的 UI。
           switch (entry.provider) {
             case 'codearts':
               await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id)
@@ -1992,7 +2020,7 @@ function registerJetHubEndpoints(
               // 同协议族：按 provider 找到对应实例。
               // ⚠️ 只刷传入的这个 ref，不碰默认单凭据 ref（历史缺陷同因）。
               // ⚠️ **不要**图省事写 `qoder.refreshAccountCredential(...)` ——
-              // 那会让中国版账号的「刷新」去续国际版的凭据（两站 token 不通用，
+              // 那会让中国版账号的续期去刷国际版的凭据（两站 token 不通用，
               // CN 永远续不动而国际版被无谓刷一次）。该串用由
               // `lobsterai-rpc-dispatch.spec.ts` 的行为级用例锁死（已做反向验证）。
               await requireQoderFamily(entry.provider).auth.refreshAccountCredential(entry.credentialRef, pool, entry.id)
@@ -2027,7 +2055,7 @@ function registerJetHubEndpoints(
                * zcode **没有 refresh 端点**（凭据是静态的，与 Loomy 同类）。
                *
                * 但这个方法仍做实事：**逐账号重读自己的 ref 并规范化回写** ——
-               * 用户重新登录后点「刷新」即可生效而无需重启 DSH。
+               * 用户重新登录后重新调用 `account.refresh` 即可生效而无需重启 DSH。
                * 凭据不可用时如实抛错（引导用户重新登录该账号）。
                */
               await zcode.refreshAccountCredential(entry.credentialRef, pool, entry.id)
@@ -2045,11 +2073,59 @@ function registerJetHubEndpoints(
           }
           return { ok: true, value: { success: true } }
         } catch (error) {
+          /**
+           * ⚠⚠ **失败必须回 `ok: false`**，不得包成 `ok:true + value.success:false`
+           * （Gitee issue IKJOZA，真实缺陷）。
+           *
+           * ## 原来的行为与代价
+           * 本分支的 catch 曾把异常包进**成功**响应
+           * （`{ok:true, value:{success:false, error}}`）。而客户端的
+           * `unwrapRpcResult`（`plugin-src/management-rpc.mjs`）只判 `ok === true`
+           * 就返回 `value` —— 于是**只判 `ok` 的调用方会把续期失败读成成功**。
+           * 实测代价：报告方一个工具首版只判 `ok`，18 个「✅」里 **17 个实为失败**，
+           * 真实原因是 `codearts 400 STS5.1806 invalid refresh token:
+           * 'the refresh token has been used'` / `minimax refresh_token 已失效` /
+           * `raccoon 登录态已过期`。
+           *
+           * ## 为什么这里不能学那四处「catch 仍回 ok:true」
+           * 本文件确有四处 catch 后仍 `ok:true`，它们**都有额外的判别字段**，
+           * 调用方不判它就会误读，本端点没有 —— 逐条对照：
+           *
+           * | 位置 | 形态 | 为何安全 |
+           * |---|---|---|
+           * | `login.poll` | `{done:false}` | 「用户尚未授权完」是正常中间态 |
+           * | `login.submitSms` | `{done:false, error}` | 验证码输错可重试，前端必判 `done` |
+           * | `credits.permanentLock` | 广播失败仍 `ok:true` | 广播失败不影响已落盘 |
+           * | `credits.claimAll` | 单号失败进 `results[]` | 「单个失败不中断整体」是设计语义 |
+           *
+           * 本分支只有 `success` 一个布尔：**失败是业务终态，不是可自愈的中间态**，
+           * 与上述四者不同类。
+           *
+           * ## 为什么 `ok:false` 不会打破仓库内任何调用方
+           * `account.refresh` **全仓库零调用方**：面板 `plugin-src/client/jet-hub.js`
+           * 的 42 处 `rpcCall(` 里没有它（账号卡片的按钮是 测试/重测/重置/停用/代理/
+           * 指纹/删除，**没有「刷新」**）；另两处 `rpcCall(变量)` 的实参经追溯只有
+           * `opencode.*` 四个方法。它从来就是给仓库外脚本/手工 RPC 用的端点。
+           * ⇒ 这是**对外部调用方的破坏性契约变更**：原先误判的调用方会从「静默错」
+           * 变成 `unwrapRpcResult` 抛错，属预期的「提前炸」。成功路径仍是
+           * `ok:true + value.success:true`，未变。
+           *
+           * ⚠⚠ **复现这条取证不要用 `git log -S "rpcCall('account.refresh'"`**：
+           * 本注释自身引用了该字面量，`-S` 会**自匹配修复提交本身**（返回 `68fb567`），
+           * 那正是 `AGENTS.md` 明令禁止的「注释与实测脱节」。在 `origin/master`
+           * （修复前）上该命令零命中，这本身是它曾有效的证据。稳定写法是只搜
+           * **不含注释**的客户端源码：
+           * `Select-String -Path plugin-src\client\*.js -Pattern "rpcCall\('account\."`
+           * （应零命中；`account.refreshable` 是另一个字段名，不是端点）。
+           *
+           * 回归用例在 `tests/unit/lobsterai-rpc-dispatch.spec.ts` 的
+           * 「issue IKJOZA」段（锁死「失败不得是 ok:true」+「失败必须带原因」）。
+           */
           return {
-            ok: true,
-            value: {
-              success: false,
-              error: error instanceof Error ? error.message : String(error),
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: error instanceof Error ? error.message : String(error),
             },
           }
         }
@@ -3390,11 +3466,32 @@ function registerJetHubEndpoints(
             ...filteredOut.map((id) => ({ id, name: id })),
           ]
         }
+        // ⚠️⚠️ 「已失效模型」必须**显式列出且可恢复**（2026-10-06 复审 !66 实测）。
+        //
+        // 背景：`withDeadModelPruning` 会把已失效模型从 `listModels` / `listAllModels`
+        // 两侧剔除，于是它既不在 `all` 里、也不在 `disabledMap` 里 —— 上面的两条
+        // 补回路径都救不回它。结果是**模型从设置页彻底消失，连开关都摸不着**，
+        // 用户永远无法自行恢复（这正是本段注释在 `:3370-3375` 列为必须避免的根因：
+        // 「用户再也无法重新打开」）。
+        //
+        // ⇒ 这里把 dead 表里的 id 补回目录，并带上 `dead: true` 让客户端灰显 +
+        // 提供「重新显示」入口（`model.clearDead`）。**方向必须与黑名单相反**：
+        // 失效模型**永远**列出（哪怕被用户关着），否则用户没有恢复路径。
+        const dead = deadModelIdsFor(req.provider)
+        if (dead.size > 0) {
+          const known = new Set(catalog.map((model) => model.id))
+          for (const id of dead) {
+            if (!known.has(id)) catalog.push({ id, name: id })
+          }
+        }
         const value: RpcModelListResponse = {
           models: catalog.map((model) => ({
             id: model.id,
             name: model.name,
             disabled: disabledMap[model.id] === true,
+            // ⚠️ **照实透传**：缺失即 false，**不推导**（黑名单命中也算用户主动关的，
+            // 不是失效）。客户端据它灰显并显示「重新显示」按钮。
+            dead: dead.has(model.id),
             // ⚠️ 免费标记**照原样透传，缺失就不写**（不编造 `false`）：Jet Hub 的
             // 模型列表按「计费/来源」分组，把「适配器没报」当成「按量计费」是
             // 保守归组，但字段本身仍保持「未知」语义（与全仓约定一致）。
@@ -3425,6 +3522,48 @@ function registerJetHubEndpoints(
         const value: RpcModelSetDisabledResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 把模型从「已失效」表里移除，让它重新出现在目录中。
+       *
+       * ## 为什么必须有这个端点（2026-10-06 复审 !66 确认）
+       *
+       * 失效记录的唯一自愈路径是 TTL 过期（默认 30 天）—— 因为模型被剔除后用户
+       * **选不到**，不可能靠「再成功一次」触发清除。所以**误判一次 = 该模型被
+       * 藏 30 天且用户毫无办法**，这与 Jet Hub 已有的模型开关完全不对等
+       * （用户能一键关，却不能一键复活）。
+       *
+       * ⚠️ **不动黑名单**：`disabledModels` 是用户主动选择，失效表是系统推断，
+       * 两者必须分开清除 —— 否则「重新显示」会顺带打开用户特意关着的模型。
+       *
+       * ⚠️ `modelId` **没有默认值**：传 `""`/非字符串一律拒绝（避免字段名写错
+       * 导致「静默清空全表」）。省略该字段才是「清空该 provider 全部」。
+       */
+      case 'model.clearDead': {
+        const req = payload as RpcModelClearDeadRequest
+        if (typeof req.provider !== 'string' || req.provider.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 必填' } }
+        }
+        if (req.modelId !== undefined && (typeof req.modelId !== 'string' || req.modelId.length === 0)) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'modelId 必须是非空字符串，或省略以恢复全部' },
+          }
+        }
+        const removed = clearDeadModels(req.provider, req.modelId)
+        // 必须广播：与三个开关端点同约定，否则客户端目录（`llm/adapters-updated`
+        // 三个触发源之一）不复位，用户点了「重新显示」界面却不动。
+        broadcastCatalogChanged(ctx)
+        ctx.logger.info(
+          `[jet-hub] 恢复 ${removed} 个失效模型：${req.provider}`
+          + `${req.modelId === undefined ? '' : `/${req.modelId}`}`,
+        )
+        const value: RpcModelClearDeadResponse = {
+          provider: req.provider,
+          deadModels: [...deadModelIdsFor(req.provider)],
         }
         return { ok: true, value }
       }
@@ -3657,6 +3796,29 @@ function registerJetHubEndpoints(
           accounts: accountCount,
         }
         return { ok: true, value }
+      }
+
+      // ── 供应商自定义显示顺序（「供应商开关」弹窗的拖拽排序）──
+      case 'provider.getOrder': {
+        // 与 provider.status 同级的轻量读取：池内进程内存副本，无任何 IO。
+        const value: RpcGetProviderOrderResponse = { order: pool.providerOrder() }
+        return { ok: true, value }
+      }
+      case 'provider.setOrder': {
+        const req = payload as RpcSetProviderOrderRequest
+        if (!Array.isArray(req?.order) || req.order.some(id => typeof id !== 'string')) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'order 必须是字符串数组' },
+          }
+        }
+        // ⚠️ 与 account.reorder 不同：这里**不校验**「必须恰好等于当前供应商
+        // 清单」——展示侧（provider-toggle.js 的 sortOpenProvidersByOrder）对
+        // 数组中不认识 / 缺失的 id 都有稳定兜底，并发下列表过期也不需要让用户
+        // 重试，接受最后一次拖拽的结果即可。
+        await pool.setProviderOrder(req.order)
+        ctx.logger.info(`[jet-hub] 已更新供应商自定义显示顺序（${req.order.length} 项）`)
+        return { ok: true, value: undefined }
       }
 
       // ── 本机 OpenAI 网关（`src/openai-gateway/`）──
@@ -3929,6 +4091,49 @@ function registerJetHubEndpoints(
         const value = await usageBadge.read(provider, req.force === true ? { force: true } : {})
         // `read()` 返回的就是本端点的响应信封（`{ ok, value|error }`），直接透传。
         return value
+      }
+
+      /**
+       * **Token 账本**快照（「Token 用量」面板）。
+       *
+       * 纯内存读（`readTokenLedger`），不打上游、不做任何 I/O —— 面板可以
+       * 随意刷新。数据在重启后为空是**既定行为**（第 1 期不持久化），UI 负责
+       * 把「进程内存账本」这一事实讲清楚。
+       *
+       * ⚠️ 这里**不**做渠道/provider 过滤：账本条数上限 500，全量下发即可，
+       * 过滤维度（渠道、provider、模型）都由 UI 在聚合树上展开，避免为每个
+       * 维度各造一个 RPC 端点。
+       */
+      case 'usage.tokenLedger': {
+        const req = payload as RpcUsageTokenLedgerRequest
+        const snapshot = readTokenLedger(
+          typeof req?.limit === 'number' && Number.isFinite(req.limit) && req.limit > 0
+            ? { limit: Math.trunc(req.limit) }
+            : {},
+        )
+        const value: RpcUsageTokenLedgerResponse = { snapshot }
+        return { ok: true, value }
+      }
+
+      /**
+       * **历史日聚合**（第 4 期 · 「Token 用量」弹窗的历史视图）。
+       *
+       * 数据源是落盘的日聚合表（`token-ledger.json`，重启保留）—— 纯内存
+       * 计算（Map 树 → 数组），不打上游、不做额外 I/O。
+       *
+       * ⚠️ `sinceDays` 钳制在 `[1, TOKEN_LEDGER_HISTORY_MAX_DAYS]`：0/负数
+       * 按「仅今日」处理（省略 = 全部历史），超过上限裁到上限 —— 落盘本身
+       * 只保留 90 天，更大的窗口只会白算。
+       */
+      case 'usage.tokenLedgerHistory': {
+        const req = payload as RpcUsageTokenLedgerHistoryRequest
+        const raw = req?.sinceDays
+        const sinceDays = typeof raw === 'number' && Number.isFinite(raw)
+          ? Math.min(Math.max(Math.trunc(raw), 1), TOKEN_LEDGER_HISTORY_MAX_DAYS)
+          : undefined
+        const result = readTokenLedgerHistory(readTokenLedgerDayMap(), { sinceDays })
+        const value: RpcUsageTokenLedgerHistoryResponse = { history: result.days, totals: result.totals }
+        return { ok: true, value }
       }
 
       /**

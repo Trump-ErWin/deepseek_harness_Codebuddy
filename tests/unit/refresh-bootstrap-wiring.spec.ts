@@ -37,7 +37,7 @@ const AUTH_FILES = [
   // ⚠️ MiniMax 是第 9 个 auth 文件（buddy-auth 一份服务两个 provider）。
   // 加它之前本清单**漏了 minimax** —— 于是「续期必须带 pool/accountId 且调
   // `syncAccountExpiry`」这条契约对 minimax **不被强制**（Spec 盲区）。
-  // 该契约正是「账号卡片刷新按钮按下去没反应」那个缺陷的回归防线，
+  // 该契约正是「续期成功但界面没反应」那个缺陷的回归防线，
   // 新增 provider 时必须同步加进来。
   'src/minimax-auth.ts',
 ]
@@ -52,38 +52,68 @@ function methodBody(source: string, signature: string): string {
 
 describe('续期调度器：启动必须先跑一轮', () => {
   /**
-   * ⚠️ 主缺陷（issue 第三节）：早先这里**只有** `setInterval`，
+   * ⚠️ 主缺陷（issue !IKIRTT 第三节）：早先这里**只有** `setInterval`，
    * 第一次处理要等满一个周期。cline（1 小时）/ codearts（约 2 小时）/
    * raccoon（3 小时）的凭据在宿主关闭期间早已到期，于是重启后
    * **最长 30 分钟**一直显示「已过期」、积分行一直 401。
+   *
+   * ⚠️ issue IKJOZB 之后本条改判在 `MultiAccountRefreshScheduler.start()` 上：那段逻辑
+   * 已从 `src/index.ts` 抽成可单测的类（行为用例见
+   * `tests/unit/refresh-scheduler.spec.ts`），本文件保留的是**接线**断言 ——
+   * 「index.ts 确实用了那个类，且把首轮与定时器都交付给它」。
    */
-  it('setInterval 之前存在一次直接的 refreshAllCredentials() 调用', () => {
-    const bootstrap = indexSource.indexOf('void refreshAllCredentials()')
-    const timer = indexSource.indexOf('setInterval(() => void refreshAllCredentials()')
-    expect(bootstrap, '启动时没有任何一轮续期 → 短寿命账号会挂「已过期」最长 30 分钟').toBeGreaterThan(-1)
-    expect(timer).toBeGreaterThan(-1)
-    expect(bootstrap, '启动首轮必须排在武装定时器之前').toBeLessThan(timer)
+  it('index.ts 把续期交给 MultiAccountRefreshScheduler，而不是自己写 setInterval', () => {
+    expect(indexSource, 'index.ts 未使用 MultiAccountRefreshScheduler')
+      .toContain('new MultiAccountRefreshScheduler(')
+    expect(indexSource, 'index.ts 仍在自己挂 setInterval（缺陷形态会随之回来）')
+      .not.toMatch(/setInterval\(\s*\(\)\s*=>\s*void refreshAllCredentials/)
+    // 首轮不再由 index.ts 手写：`start()` 内部保证「先跑一轮」。
+    // ⚠️ 这里是**变量名**（`const refreshScheduler = new …`），不是类名。
+    expect(indexSource).toMatch(/refreshScheduler\.start\(\)/)
   })
 
   it('启动判据既不看 `enabled`，也不看 `refreshable`（被误标的布尔不能决定调度器是否武装）', () => {
-    // `indexSource` 已经过 `codeOnly` 处理（见文件头），注释里的字面量不参与断言。
-    const gate = indexSource.slice(
-      indexSource.indexOf('listAllAccounts()'),
-      indexSource.indexOf('setInterval(() => void refreshAllCredentials()'),
-    )
     // 2026-10-02 修订：原先这里是 `accounts.some(a => a.refreshable)`。
     // 本次事故实测 36 条账号只剩 3 条 `true`（raccoon / minimax / cline 各一）——
     // 再少三条，整个续期调度器（含 codearts 的自愈与启动首轮）就**永不武装**，
     // 而且日志里一个字都不会有。「用可能被误标的字段决定要不要修误标」是循环依赖。
+    //
+    // ⚠️ issue IKJOZB 修订：这里**不再断言** `accounts.length === 0`。
+    // 那条断言当初是为了锁住「判据放宽」，顺带把「空池就 return」这个**错误形态**
+    // 一起固化了下来 —— 而它正是 IKJOZB 的根因。现在空池判据只喂给
+    // `isPoolEmpty`（仅影响日志措辞），武装本身与池内容**彻底解耦**。
+    const gate = indexSource.slice(
+      indexSource.indexOf('new MultiAccountRefreshScheduler('),
+      indexSource.indexOf('refreshScheduler.start()'),
+    )
     expect(gate).not.toMatch(/\.refreshable/)
     expect(gate).not.toMatch(/enabled/)
-    expect(gate).toMatch(/accounts\.length\s*===\s*0/)
+    expect(gate, '武装不得再依赖「启动瞬间池为空」这个条件').not.toMatch(
+      /if\s*\(\s*accounts\.length\s*===\s*0\s*\)/,
+    )
+    expect(gate, 'isPoolEmpty 必须仍然接上（空池要有可观测日志）').toContain('isPoolEmpty')
   })
 
-  it('listAllAccounts 的链上有 .catch（否则存储异常会让定时器永不武装且无痕）', () => {
-    const start = indexSource.indexOf('pool.listAllAccounts()')
+  it('账号入库时补武装（issue IKJOZB 点名缺失的那条路径）', () => {
+    // 冷启动空池 → 之后登录 ⇒ 原先没有任何重新武装的路径。
+    expect(indexSource, '未订阅账号入库通知，登录后不会补武装')
+      .toMatch(/pool\.onAccountAdded\(/)
+    expect(indexSource, '订阅了通知但没接到调度器上').toMatch(
+      /onAccountAdded\([^)]*\)\s*=>\s*\{?\s*refreshScheduler\.notifyAccountAdded\(\)/,
+    )
+    // ⚠️ 订阅必须被回收：插件卸载后还留着回调会逮住旧调度器。
+    expect(indexSource, '未回收账号入库订阅').toMatch(/unsubscribeAccountAdded\(\)/)
+  })
+
+  it('listAllAccounts 的失败有兜底（否则存储异常会让调度器永不武装且无痕）', () => {
+    // ⚠️ 改造后 `listAllAccounts()` **不再**处于武装路径上（它在 `isPoolEmpty`
+    // 里，异常由 `MultiAccountRefreshScheduler.probeEmpty` 吞掉并记 warn），故原先那条
+    // 「.then() 链上必须有 .catch」的断言失去对象。现在要保证的是
+    // `start()` 的 promise 有兜底 —— 否则未处理的 rejection 会让 DSH 侧
+    // 报「插件加载失败」，而实际原因只是一次存储抖动。
+    const start = indexSource.indexOf('refreshScheduler.start()')
     expect(start).toBeGreaterThan(-1)
-    expect(indexSource.slice(start, start + 1200)).toContain('.catch(')
+    expect(indexSource.slice(start, start + 400), 'start() 的失败没有兜底').toContain('.catch(')
   })
 
   it('十个 provider 实例都在批量续期清单里（新增 provider 不得漏接）', () => {
@@ -118,7 +148,7 @@ describe('续期调度器：启动必须先跑一轮', () => {
 describe('按需续期必须回写账号池的有效期', () => {
   /**
    * issue 第 5.3 条：`refreshAccountCredential` 过去只有 raccoon 回写，
-   * 其余七个只 `credentials.set` —— 于是账号卡片的「刷新」按钮**按下去没反应**
+   * 其余七个只 `credentials.set` —— 于是**续期成功但界面纹丝不动**
    * （凭据续好了，UI 读的池值纹丝不动）。
    */
   it.each(AUTH_FILES)('%s 的 refreshAccountCredential 接受 pool + accountId', (rel) => {
@@ -201,7 +231,7 @@ describe('按需续期必须回写账号池的有效期', () => {
 
   it('createPoolRefresh（CodeBuddy 系发消息途中的按需续期）也回写账号池', () => {
     // 这条路径由 `buddy-adapter.ts` 的 401/403 分支调用，触发频率远高于
-    // 账号卡片的「刷新」按钮；漏传 pool 就意味着 buddy/workbuddy 的
+    // RPC `account.refresh`；漏传 pool 就意味着 buddy/workbuddy 的
     // 「已过期」显示在实际续期成功后仍然挂着。
     const source = codeOnly(read('src/buddy-auth.ts'))
     const body = source.slice(source.indexOf('export function createPoolRefresh'))

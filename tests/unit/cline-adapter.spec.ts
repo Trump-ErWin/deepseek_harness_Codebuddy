@@ -36,11 +36,23 @@ const cred: ClineCredential = {
   nickname: 'ijetlee@163.com',
 }
 
-/** 固定目录（离线；含免费与付费条目）。 */
+/**
+ * 固定目录（离线；含免费与付费条目）。
+ *
+ * ⚠️ 远端列表**必须覆盖兜底表的全部 id**：`mergeClineModels` 会丢弃「远端已不认识」
+ * 的兜底条目（修「已下架模型被复活」，见 `src/cline-models.ts` 第 2 步）——
+ * 若这里只列历史条目，兜底表其余条目会被过滤掉，下游用例就拿不到它们的元数据。
+ * 真实远端本来就覆盖兜底表（兜底表正是按远端实测同步的），故这样写也更贴近生产。
+ */
 const MODELS: ClineModel[] = mergeClineModels(CLINE, {
-  freeIds: ['cline-free/deepseek-v4.1-flash', 'cline-free/gemini-3.8-flash'],
+  freeIds: [
+    ...CLINE.fallbackModels.map((m) => m.id),
+    'cline-free/deepseek-v4.1-flash',
+    'cline-free/gemini-3.8-flash',
+  ],
   remoteIds: ['deepseek/deepseek-v4.1-flash', 'openai/gpt-6-luna'],
   entries: [
+    ...CLINE.fallbackModels.map((m) => ({ id: m.id })),
     { id: 'cline-free/deepseek-v4.1-flash', name: 'Deepseek-v4.1-Flash' },
     { id: 'cline-free/gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
   ],
@@ -109,10 +121,14 @@ describe('ClineAdapter 模型目录', () => {
     const adapter = makeAdapter()
     const models = await adapter.listModels('cline')
     const byId = new Map(models.map((m) => [m.id, m]))
-    // 展示名优先取**兜底表**（内嵌目录的正式名，与 Cline IDE 显示一致，
-    // 即用户截图里的 "DeepSeek V4.1 Flash (free)"），而非远端 slug
-    //（"Deepseek-v4.1-Flash"）。标记统一由 clineDisplayName 拼。
-    expect(byId.get('cline-free/deepseek-v4.1-flash')?.name).toBe('DeepSeek V4.1 Flash · 免费')
+    // 展示名优先取**兜底表**（内嵌目录的正式名，与 Cline IDE 显示一致），
+    // 而非由 id 派生的 slug（`MiMo-V2.6-Flash` vs `Mimo V2.6 Flash`）。
+    // 标记统一由 clineDisplayName 拼。
+    //
+    // ⚠️ 原先这里用 `cline-free/deepseek-v4.1-flash`；它已于 2026-10-05 被 Cline
+    // 下架、随之从兜底表删除，故改用仍在册的免费条目（否则断言的是远端 slug，
+    // 测不到「兜底表名优先」这条规则）。
+    expect(byId.get('cline-free/mimo-v2.6-flash')?.name).toBe('MiMo-V2.6-Flash · 免费')
     expect(byId.get('cline-free/gemini-3.8-flash')?.name).toBe('Gemini 3.8 Flash · 免费')
   })
 
@@ -137,16 +153,20 @@ describe('ClineAdapter 模型目录', () => {
   it('listAllModels 也带免费标记（设置页能看到正确展示名）', () => {
     const adapter = makeAdapter()
     const models = adapter.listAllModels()
-    const entry = models.find((m) => m.id === 'cline-free/deepseek-v4.1-flash')
-    expect(entry?.name).toBe('DeepSeek V4.1 Flash · 免费')
+    // ⚠️ 这条走的是**同步兜底表**路径（没有前置 await，`remoteModels` 尚未落地），
+    // 故只能用**兜底表里存在**的条目断言。`cline-free/deepseek-v4.1-flash` 已于
+    // 2026-10-05 被 Cline 下架、随之从兜底表删除。
+    const entry = models.find((m) => m.id === 'cline-free/mimo-v2.6-flash')
+    expect(entry?.name).toBe('MiMo-V2.6-Flash · 免费')
   })
 
-  it('未加载完成时 listAllModels 回退兜底表（仍含 4 个免费模型）', () => {
+  it('未加载完成时 listAllModels 回退兜底表（含全部兜底免费模型）', () => {
     const adapter = makeAdapter({ loadModels: async () => { throw new Error('offline') } })
     const models = adapter.listAllModels()
     expect(models.length).toBe(CLINE.fallbackModels.length)
-    // 4 = 远端 `free` 数组的当前条数（2026-10-03 复测；gemini-3.8-flash 已下线）。
-    expect(models.filter((m) => m.name.includes('免费'))).toHaveLength(4)
+    // 与表联动断言，不写死数字：上游每次撤免费模型都要同步这张表，
+    // 写死会让「同步表」这个动作连带弄红一个无关用例（本文件此前正是 4）。
+    expect(models.filter((m) => m.name.includes('免费'))).toHaveLength(CLINE.fallbackModels.length)
   })
 
   it('远端目录两个端点都失败时仍返回兜底表', async () => {
@@ -155,7 +175,7 @@ describe('ClineAdapter 模型目录', () => {
     })
     const models = await adapter.listModels('cline')
     expect(models.length).toBe(CLINE.fallbackModels.length)
-    expect(models.filter((m) => m.name.includes('免费'))).toHaveLength(4)
+    expect(models.filter((m) => m.name.includes('免费'))).toHaveLength(CLINE.fallbackModels.length)
   })
 
   it('黑名单过滤只作用于 listModels，不影响 listAllModels', async () => {
@@ -189,22 +209,28 @@ describe('ClineAdapter 模型目录', () => {
 })
 
 describe('ClineAdapter resolveModel', () => {
+  // ⚠️ 本组原先统一用 `cline-free/deepseek-v4.1-flash` 作「有完整元数据的模型」，
+  // 它已于 2026-10-05 被 Cline 下架、随之从兜底表删除 ⇒ 元数据不再来自兜底表。
+  // 改用仍在册的免费条目 `cline-free/mimo-v2.6-flash`（兜底表里的
+  // contextWindow / maxTokens / supportsImage 与原条目取值相同，断言不变）。
+  const METADATA_MODEL = 'cline-free/mimo-v2.6-flash'
+
   it('name 不带免费标记（标记只属于选择列表语境）', async () => {
     const adapter = makeAdapter()
-    const resolved = await adapter.resolveModel('cline', 'cline-free/deepseek-v4.1-flash')
-    expect(resolved.name).toBe('DeepSeek V4.1 Flash')
+    const resolved = await adapter.resolveModel('cline', METADATA_MODEL)
+    expect(resolved.name).toBe('MiMo-V2.6-Flash')
     expect(resolved.name).not.toContain('免费')
   })
 
   it('声明 defaultMaxTokens（否则上限永久退回网关默认值）', async () => {
     const adapter = makeAdapter()
-    const resolved = await adapter.resolveModel('cline', 'cline-free/deepseek-v4.1-flash')
+    const resolved = await adapter.resolveModel('cline', METADATA_MODEL)
     expect(resolved.defaultMaxTokens).toBe(131_072)
   })
 
   it('声明 context（内嵌目录的 contextWindow）', async () => {
     const adapter = makeAdapter()
-    const resolved = await adapter.resolveModel('cline', 'cline-free/deepseek-v4.1-flash')
+    const resolved = await adapter.resolveModel('cline', METADATA_MODEL)
     expect(resolved.context?.contextWindow).toBe(1_048_576)
   })
 
@@ -218,7 +244,7 @@ describe('ClineAdapter resolveModel', () => {
 
   it('inputModalities 按模型判定（图片能力）', async () => {
     const adapter = makeAdapter()
-    const withImage = await adapter.resolveModel('cline', 'cline-free/deepseek-v4.1-flash')
+    const withImage = await adapter.resolveModel('cline', METADATA_MODEL)
     expect(withImage.inputModalities).toContain('image')
     const unknown = await adapter.resolveModel('cline', 'unknown/model-x')
     expect(unknown.inputModalities).toEqual(['text'])
@@ -778,7 +804,7 @@ describe('Cline 接线（源码级回归）', () => {
     expect(source).toMatch(/cline\.refreshAll\((?:pool|p)\)/)
     expect(source).toContain('cline.stop()')
     // Jet Hub「显示列表」需要适配器实例
-    expect(source).toContain('cline: clineAdapter')
+    expect(source).toMatch(/cline: pruned\([^)]*,\s*clineAdapter\)/)
     // ⚠️ 形参是**位置参数**，新增 provider 会插在 cline 与 modelAdapters 之间。
     // 只断言「cline 在 modelAdapters 之前」，**不要**写死整串前缀
     // —— 那会让每加一个 provider 都假失败（加 Loomy、Raccoon、QoderCN 时各踩一次）。
@@ -1109,6 +1135,11 @@ describe('Cline 接线（源码级回归）', () => {
  * 故 `if (models.length === 0) return false` 永远不命中 ⇒ 冷却永不触发，
  * 兜底表被当成远端结果永久缓存（`if (this.remoteModels !== undefined) return` 短路），
  * 网络恢复后也不会重拉，只能重启 DSH。
+ *
+ * ⚠️ 补：兜底表并入已改为**有条件**（远端下发目录时丢弃「远端已不认识」的条目，
+ * 修「已下架模型被复活」，见 `cline-models.ts` 第 2 步）——但**本组的判据不变**：
+ * 两个端点全挂时 `remote.entries` 为空 ⇒ 兜底表整表保留 ⇒ `models.length` 仍非零，
+ * 依旧**不能**用它判「有没有拿到远端目录」。
  */
 describe('ClineAdapter 目录失败判据（★ 不能看 models.length）', () => {
   it('★ 真接线：两个端点全挂 ⇒ models 里仍有兜底表（非空）但绝不落缓存', async () => {

@@ -326,9 +326,9 @@ describe('ClineAuth refreshAll', () => {
     expect(readCred(credentials, 'CLINE_ACCOUNT_1').access_token).toBe('workos:tok-1')
   })
 
-  it('⚠️ 按需续期（账号卡片「刷新」）成功后把新 expiresAt 写回账号池', async () => {
+  it('⚠️ 按需续期（RPC account.refresh）成功后把新 expiresAt 写回账号池', async () => {
     // issue !IKIRTT 的连带缺陷：UI 读的正是账号池的 `expiresAt`。
-    // 早先 cline 只 `credentials.set`，于是用户点了「刷新」、凭据也续好了，
+    // 早先 cline 只 `credentials.set`，于是续期成功、凭据也换新了，
     // 卡片却**一直显示「已过期」**，且「重测」按钮不救急 —— 没有任何自救手段。
     const { ctx, credentials, pool } = makePoolCtx()
     await credentials.set('CLINE_ACCOUNT_ABC', dueCredJson)

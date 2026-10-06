@@ -6,6 +6,122 @@
 - **正文输出**（正文回复、代码注释说明、总结、文档）一律使用中文。
 - 代码标识符、关键字、类型名称、变量名等保持英文不变。
 
+## ⚠️ 包装适配器时必须包 `prepareCall`，不是 `stream`（PR !66 复审，2026-10-06）
+
+**真实缺陷**：`src/dead-model-store.ts` 的 `withDeadModelPruning` 用 Proxy 包装
+适配器，初版只拦 `listModels` / `listAllModels` / `stream` ⇒ **在生产环境完全不生效**
+（42 条单测全绿，因为测试直接调 `proxy.stream`，绕过了真实路径）。
+
+### 1. 生产路径**只走 `prepareCall`**，不直接调 `adapter.stream`
+
+本仓库全部 14 个适配器都实现了：
+
+```ts
+async prepareCall(provider, model, signal) {
+  return { model: await this.resolveModel(...), stream: (options) => this.stream(options) }
+}
+```
+
+`prepareCall` 被 `value.bind(obj)` 绑到**原始对象**，故 `this` 是原对象，
+`this.stream` 拿到的是**原始 stream** ⇒ **完全绕过 Proxy**。
+而 dsh-llm 的两条运行时路径只调它：
+
+- `node_modules/@deepseek-ai/dsh-llm/lib/index.js:1597` → `adapterCall.stream(options)`
+- 同文件 `:1667` → `dispatch = (options) => adapterCall.stream(options)`
+
+⇒ **只包 `stream` 是不够的**；而且只包 `prepareCall` 本身**也不够** ——
+真实错误发生在 `call.stream(options)` 的**迭代过程中**
+（`:1691` `iterator = dispatch(...)[Symbol.asyncIterator]()`，`:1701` `iterator.next()`），
+必须包装 **`prepareCall` 返回的那个 `call.stream`**。
+
+⚠️ 排查这类问题的通用手法：**别问「哪个成员被包了」，去 `node_modules` 里读
+消费者的真实调用链**。本仓库已有先例（`prepareCall` shim 的注释记录了
+`registration.adapter.prepareCall is not a function` 的报障）。
+
+### 2. `registerXxxLlm` 返回的是**原始实例**，不是 Proxy
+
+各 `registerXxxLlm` 里 `return adapter`（`new XxxAdapter(...)`），
+只有 `registerAdapterIdempotent` 把**代理**注册进 `ctx.llm`。
+于是 `src/index.ts` 的 `modelAdapters` 拿到的是 raw 实例 ⇒
+Jet Hub 设置页的 `listAllModels` 完全看不到剔除效果。
+
+⚠️ 更隐蔽的是 `jet-hub-rpc.ts` 的 `model.list` **两条路径**：
+先 `await llm.listModels()`（走代理，已剔除），紧接着用
+`modelAdapters[provider].listAllModels()`（走 raw，**未剔除**）**覆盖**回去。
+⇒ `index.ts` 里两处必须**用同一个包装函数**，否则前功尽弃。
+
+### 3. 剔除的东西**必须能恢复** —— 与 `disabledModels` 的既有约定对齐
+
+失效模型被剔除后用户**选不到** ⇒ 不可能靠「再成功一次」自愈 ⇒ 记录永不自动清除
+（只能等 30 天 TTL）。若设置页也不显示它，用户就**连开关都摸不着**，
+一次误判 = 该模型被永久隐藏。
+
+这正是 `jet-hub-rpc.ts` 里既有的、必须避免的根因（「用户再也无法重新打开」）。
+⇒ `model.list` 必须把 dead 模型**补回目录**并带 `dead: true`，
+客户端给「重新显示」按钮，走 `model.clearDead` 端点。
+**能藏，但必须能找回。**
+
+### 4. 判据的正则窗口**不能排除点号**
+
+初版用 `[^.!?]{0,N}` 做窗口，而**本仓库几乎所有模型 id 都带小数点**
+（`deepseek-v4.1-flash` / `gpt-5.6-astra` / 最长的
+`cline-free/muse-spark-1.3-contributor` 37 字符）⇒ 英文路径对带点 id **全部漏判**。
+
+⚠️ 初版那条注释「窗口要够宽」只对**中文分支**成立，英文分支**从未验证**。
+⇒ 英文窗口只排除**句子终止符**（`!?` 与换行），**保留 `.`**，并放宽到 64。
+⚠️ 判据里的注释**必须与实测一致**：拿一个样例验了中文路径就以为整体成立，
+是这类缺陷的典型成因。
+
+### 5. `not supported` / `not available` **不是**下架证据
+
+初版把 `available` / `supported` 与 `found`/`exist` 并列，于是这 6 条
+**换个套餐 / 换个地域就能恢复**的文案被当成下架：
+
+```
+cline: model not supported in this plan    ← 换套餐就好
+model not available in your region         ← 换区就好
+```
+
+而误判后模型被藏 30 天且**用户无法自愈**。这与文件头「`unsupported` 单独出现不算」
+的口径本来就矛盾 ⇒ **只认 `found` / `exist`**。
+
+⚠️ 本仓库多处错误文案带 `model` 字样（`model "x" does not accept image input.`），
+都靠 `IGNORED_CODES`（`UNSUPPORTED_CONTENT` 等）与排除词挡住 ——
+**改判据时必须把这些真实文案一起重跑**，不能只看自己造的样例。
+
+### 6. 排除词要带词边界
+
+`expired` 无修饰会命中 `model expired-v3 does not exist`（模型名里含 expired）；
+`quota` / `insufficient` 同理。中文排除词（额度 / 积分 / 余额）**不要**收紧 ——
+它们的方向是「宁可漏判不可误伤」，符合本仓库总原则。
+
+### 7. `resolveJetHubHome` 的 `ctx` **必须必传**
+
+它是**所有**插件状态文档（`state.json` / `permanent-locks.json` /
+`badge-preferences` / `auto-checkin` / `gemini-sigstore` / `dead-models`）的
+**唯一** home 解析入口。PR !66 曾把它放宽成可选并传 `undefined` ——
+那会**跳过优先级更高的 `profileContext.home`**，在 profile home 与 `$DSH_HOME`
+不相等时把文档写到**另一个目录**，造成「账号池在 A、失效表在 B」的分裂，
+正是 `permanent-lock-store.ts` 明确警告过必须避免的情况。
+
+### 8. 单测要覆盖**真实调用链**，不是被包装的那一层
+
+初版 42 条用例全绿却完全测不到生产路径。⇒ 包装类改动的回归用例必须：
+① 造一个与真实适配器**同款形状**的替身（`prepareCall` 里 `this.stream`）；
+② 经 `prepareCall` 走一遍；③ 做**反向验证**（把修复回退，用例必须变红）。
+⚠️ 初版还有一条**同义反复**用例（注释声称构造了失败路径、实际什么都没构造），
+任何不崩的实现都能过 —— 这种用例比没有更危险。
+
+### 9. 客户端 CSS 的两条红线（都已有专门用例守着）
+
+- **注释里禁止出现反引号**（样式是模板字符串，会提前闭合）——
+  `zcode-channel-dialog.spec.ts` 守着。
+- ⚠️ 新增带 `[data-dead]` 这类**属性选择器**的规则时，必须放在基础规则**之后**：
+  `model-filter.spec.ts` 的 `ruleOf()` 按**源码顺序**取第一条匹配规则，
+  写在前面会让它误取到新块、跳过基础规则（表现为「可收缩」断言假失败）。
+
+---
+
 ## 项目概述
 
 本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）、`raccoon`（商汤 **Raccoon Work** / 小浣熊）与 `minimax`（**MiniMax Code 中国版**，首个 **Anthropic Messages** 协议族）十个 LLM provider 路由。
@@ -677,7 +793,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 ⚠️ Qoder 国际版与中国版**共用同一组领取实现**（`src/qoder-credits.ts` 的函数一律
 接收 `product` 参数），RPC 侧通过 `jet-hub-rpc.ts` 的 `qoderFamily` 注册表分派。
 新增同族产品**不要**在四处分支各加一条平行 case —— 平行 case 越多，漏接概率越高
-（`workbuddy` 的「刷新」按钮就是这么一直坏着的）。
+（`account.refresh` 端点对 `workbuddy` 漏接 case 就是这么一直坏着的）。
 
 - **包名**：`dsh-codearts-auth`
 - **入口**：`lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）
@@ -859,6 +975,75 @@ Gitee issue IKJLHQ 整体移除（见上一节）。
 会命中无关代码；且断言要对**剥掉注释**的文本做，否则文件头为记录旧实现写下的
 那行字就能喂绿（本轮修的正是「登录渠道选择」，注释里必然提到它）。
 
+## ⚠⚠ RPC 的 `catch` **不得**把失败包成 `ok:true`（Issue IKJOZA）
+
+**真实缺陷**（Gitee issue IKJOZA，外部用户报障 2026-10-05）：RPC `account.refresh`
+续期失败时**不抛 RPC 错误**，而是回 `ok:true` + `value.success:false`。只判 `ok`
+的调用方会把失败读成成功。报告方一个工具首版因此报出 **18 个「✅」而 17 个实为失败**，
+真实错误是 `codearts 400 STS5.1806 invalid refresh token: 'the refresh token has been used'` /
+`minimax refresh_token 已失效` / `raccoon 登录态已过期`。
+
+**根因在客户端**：`plugin-src/management-rpc.mjs` 的 `unwrapRpcResult` 只判
+`result.ok === true` 就返回 `value` ⇒ `ok:true` 就等于「成功」。
+
+⚠ **全文件唯一的一处**：把 `jet-hub-rpc.ts` 里 37 个 `catch` 逐个核对过，另有 4 处
+catch 后仍 `ok:true`，但它们**都带额外的判别字段**（或干脆不在 catch 里），
+调用方不判就会误读 —— 本端点没有：
+
+| 位置 | 形态 | 为何安全 |
+|---|---|---|
+| `login.poll` | `{done:false}` | 「用户尚未授权完」是正常中间态（catch 只包 `JSON.parse`，其余是 early-return） |
+| `login.submitSms` | `{done:false, error}` | 验证码输错可重试，前端必判 `done` |
+| `credits.permanentLock` | 广播失败仍 `ok:true` | 广播失败不影响已落盘 |
+| `credits.claimAll` | 单号失败进 `results[]` | 「单个失败不中断整体」是设计语义 |
+
+⇒ **判据**：`catch` 里的失败**若没有**额外的状态/结果字段，就是业务终态，必须回
+`ok:false + error:{code, message}`（本仓库约定 `code:'bad-request'`）。
+⚠ `reply()`（`jet-hub-rpc.ts` 末尾）只对 `ok:false` 补 `error.details: {}`。
+
+⚠⚠ **`account.refresh` 是全仓库零调用方的端点**（取证：面板
+`plugin-src/client/jet-hub.js` 的 42 处 `rpcCall(` 里没有它，另两处 `rpcCall(变量)`
+的实参经追溯只有 `opencode.*` 四个方法；账号卡片按钮只有
+测试/重测/重置/停用/代理/指纹/删除，**没有「刷新」**）。⇒ 改成 `ok:false` 是
+**对仓库外调用方的破坏性契约变更**，仓库内零影响；原先误判的调用方会从「静默错」
+变成 `unwrapRpcResult` **抛错**（`error.message` 即原异常文案），属预期的「提前炸」。
+成功路径**未变**（仍是 `ok:true + value.success:true`），故不会误伤成功侧。
+⇒ `RpcRefreshAccountResponse` 里的 `error?: string` 已**删掉**（失败不再有 value）。
+⚠ **该类型目前仍是死类型**（`jet-hub-rpc.ts` import 了却没用，成功路径返回的是
+无标注字面量，`tsconfig` 又没开 `noUnusedLocals`）⇒ 删字段**没有编译期保障**，
+将来谁写回 `value.error` 也不会被 tsc 拦。收紧方式见 P4 的最小修法。
+
+⚠⚠⚠ **本节写下的取证命令，在本节落地后即失效**：`git log -S "rpcCall('account.refresh'"`
+会**自匹配修复提交本身**（本节与 `jet-hub-rpc.ts` 的注释都引用了该字面量），
+实测返回 `68fb567`。这正是本文件反复强调的「判据里的注释必须与实测一致」的违反。
+⇒ 复核该结论请用**只搜客户端源码**的形式：
+`Select-String -Path plugin-src\client\*.js -Pattern "rpcCall\('account\."`（应零命中；
+`account.refreshable` 是另一个字段名，不是端点）。在 `origin/master`（修复前）上
+`-S` 零命中，这本身是它曾有效的证据。
+
+⚠⚠ **既有测试为什么没抓住**：旧用例断言的是 `value.success === false` ——
+**修复前的行为照样绿**。因为它锁的是「value 里能看到失败」，而缺陷的实质是
+「失败被包装成了成功」。⇒ **新增失败路径用例必须断言顶层 `ok`，并额外断言
+「失败时 `value` 根本不存在」**，否则又写出一条同义反复的用例。
+回归用例在 `tests/unit/lobsterai-rpc-dispatch.spec.ts` 的「issue IKJOZA」段
+（22 条：三条报告里出现的真实错误各锁 `ok:false` + `error.message` 原文、
+**全部 13 个 provider 逐个覆盖**、`error.code` 约定、成功路径不受影响）。
+⚠ 已做**反向验证**：把 catch 改回 `{ok:true, value:{success:false}}` → **22 条变红**。
+⚠⚠ **provider 与文案必须对位**：初版把 raccoon 的报错挂在 `trae` 上，因为
+`makeThrowingStub` 当时只造了 7 个桩 —— 挂错 provider 就等于**该分支根本没被走到**，
+零覆盖。`registerJetHubRpc` 有 **13 个必填 provider 形参**（位置传参，历史上因
+少传/插队错位复发 6 次），替身**必须传满**，否则 `undefined` 会被真调用。
+
+⚠⚠ **「账号卡片刷新按钮」这个失实说法散布在约 25 处**（`README.md`、
+`AGENTS.md`、11 个 `*-auth.ts` 的签名注释、`expiry-sync.ts`、`types.ts`、
+`docs/adding-a-new-provider.md`、6 处测试注释）—— 该按钮**从来不存在**。
+首轮只订正了 4 处就被审计打回（其中 3 处就在被改的 handler 内部、与新写的
+「没有刷新按钮」上下打架）。⇒ **这类订正要一次做完**：先
+`Select-String -Path src,tests,docs -Pattern "账号卡片.{0,6}刷新|用户点[「『]刷新"`
+全量枚举再逐条改，别只改搜到的头几处。⚠ `docs/superpowers/plans/` 下的是历史
+设计快照（记录当时的过程），**不必**订正；`plugin-src/` 里的「点刷新」多指
+模型列表/额度/徽标的**真实**刷新按钮，**不要**误改。
+
 ## 技术栈与约束
 
 - **Node.js**：`^22.19.0 || >=24.0.0`
@@ -1009,7 +1194,7 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
 
 - `login(options?)` — 执行浏览器登录流程
 - `startLogin(options?)` — 两步式登录（先返回 loginUrl，Jet Hub 据此弹窗）
-- `refreshAccountCredential(refName, pool?, accountId?)` — 按凭据 ref 续期**指定账号**（账号卡片「刷新」按钮）。⚠️ 后两个参数**必须传**：只有拿到池与账号 id，续期后的新 `expiresAt` 才能回写账号池（见下）
+- `refreshAccountCredential(refName, pool?, accountId?)` — 按凭据 ref 续期**指定账号**（由 RPC `account.refresh` 调用；⚠ 该端点**没有面板入口**，账号卡片上并没有「刷新」按钮，见 IKJOZA 那一节）。⚠️ 后两个参数**必须传**：只有拿到池与账号 id，续期后的新 `expiresAt` 才能回写账号池（见下）
 - `refreshAll(pool)` — 批量续期全部账号（定时调度器）
 
 ⚠️ **不注册任何斜杠命令**：十个 provider 的登录/状态/续期**全部**在 Jet Hub 设置页完成。
@@ -1124,9 +1309,141 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
 测试：`tests/unit/expiry-sync.spec.ts`（19 条：lead 边界含 `<=`、一致不写盘、
 1 秒容差、不传 refreshableOf、反查传凭据内容、回写失败不反噬、
 「有效期内仍须对账」、续期返回 undefined 时绝不落盘）+
-`tests/unit/refresh-bootstrap-wiring.spec.ts`（19 条：启动首轮排在定时器前、
+`tests/unit/refresh-scheduler.spec.ts`（9 条：武装时机/首轮/补武装/防叠加/防重入，
+见下条）+ `tests/unit/refresh-bootstrap-wiring.spec.ts`（21 条：index.ts 接线、
 十个 provider 都在表里、九个 auth 的 `refreshAccountCredential` 都带
 pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）。
+
+### ⚠️⚠️ 续期调度器**必须无条件武装**：冷启动空池不是「不需要调度」（Issue IKJOZB）
+
+**真实缺陷**（Gitee issue IKJOZB，用户报障，2026-10-05）：
+「冷启动时账号池为空（0 账号），之后再登录账号 ⇒ **该会话内不再有主动续期**
+（只剩请求内按需续期），且**日志无痕**。」
+
+原实现（`src/index.ts`，在役 0.1.5）：
+
+```ts
+pool.listAllAccounts().then(accounts => {
+  if (accounts.length === 0) return          // ← 根因
+  void refreshAllCredentials()
+  const refreshTimer = setInterval(...)
+})
+```
+
+冷启动空池是**正常态**（新用户、刚清过存储、刚删光账号），此时整个调度器
+**不被创建**；而 `addAccount`（登录成功那一步）**没有任何重新武装的路径**
+⇒ 该会话内登录的账号**永远不会被主动续期**。用户看到的是「面板显示可自动
+续期，但凭据悄悄过期、昨天还能用今天全挂」，且那条 `return` 一句话都不记。
+
+⚠️ **这是「用瞬时状态决定长期能力」的经典形态**：池在启动那一刻恰好为空，
+是一个**与「要不要续期」无关**的事实。凡是「启动时读一次快照 ⇒ 决定要不要
+注册长期机制」的写法都要怀疑。
+
+**修法 = 三道防线，缺一不可**（现在都在 `src/refresh-scheduler.ts`）：
+
+| 防线 | 做法 | 防的是什么 |
+|---|---|---|
+| ① 无条件武装 | `start()` 不再看池内容 | 根因：空池就不武装 |
+| ② 入库即武装 | `pool.onAccountAdded()` → `notifyAccountAdded()` | issue 点名缺失的「重新武装路径」；启动期存储异常也能救回 |
+| ③ 空池下轮重试 | `onTick` 判空后**绝不** `clearInterval` | 通知因任何原因没送到时的兜底 |
+
+⚠️ **已做反向验证**（两次都精确命中，不是同义反复）：把 `start()` 改回
+「空池 return」→ 3 条变红；去掉 `notifyAccountAdded` 的补武装 → 1 条变红；
+`addAccount` 的通知移出 `finally` → 1 条变红。
+
+⚠️ **两道防线是独立冗余的**（实测）：只禁 ① 时探针**仍通过** —— 因为
+② 补武装兜住了。所以「单独打破一条看不出问题」是**预期行为**，验证必须
+两道一起禁才能复现原缺陷。别据此以为防线是多余的。
+
+⚠️ **抽成类而非留在 `index.ts` 闭包里**：原先这段逻辑无法单测，导致
+issue !IKIRTT 的回归用例只能在**源码文本**上断言，而那条断言
+（`expect(gate).toMatch(/accounts\.length\s*===\s*0/)`）**顺带把错误形态
+一起固化了**（它本意只是锁「判据放宽」）。⚠️ **教训：源码文本断言会
+把实现细节变成契约 —— 用它锁「不许写 X」，不要用它锁「必须写 Y」。**
+
+两个实现约束：
+
+- ⚠️ **通知必须排在 `addAccount` 的 `finally` 里**，不能在落盘成功之后一行：
+  `writeAccounts` 先更新进程内副本再 `await` 落盘，故落盘抛错时账号**已经是
+  可用状态**（各 auth 的登录流程在调 `addAccount` 前就已 `credentials.set`）。
+  因一次磁盘失败吞掉通知 = 「账号能用、但本会话不续期」，同一形态。
+- ⚠️ **订阅点必须挂在 `AccountPool` 上**，不能逐个登录流程接线：全仓库十几处
+  `pool.addAccount(...)`（13 个 provider 的 auth、opencode 账号槽/匿名槽、
+  RPC 的导入/恢复分支），逐处接线必漏，而漏掉的那个 provider 会**静默**不续期。
+
+⚠️ **判据只有「池里有没有账号」**，仍**不看** `refreshable` / `enabled`
+（既有铁律，见上两条）。`MultiAccountRefreshScheduler` 刻意**不接收账号条目**，
+只收一个 `isPoolEmpty` 布尔 —— 从类型上就杜绝了把被误标的布尔再接回门禁。
+
+#### 影响面：`refreshTargets` 的 **13 条全部**受影响（实测）
+
+这个缺陷在**表这一层**，不在任何单个 provider 上 ⇒ 表里每个条目一起失去主动续期。
+但**症状可见度**由凭据寿命决定：
+
+| 可见度 | provider | 凭据寿命 |
+|---|---|---|
+| 🔴 最先撞上 | `codearts`(约 2h) / `cline`(1h) / `raccoon`(约 3h) / `gemini`(1h) | 短 |
+| 🟠 明显 | `qoder` / `qodercn` / `trae` / `minimax` | 短（且会轮换 refresh_token） |
+| 🟡 几乎看不出 | `lobsterai`(30 天) / `buddy` / `workbuddy` | 长 |
+| ⚪ 本来就不续期 | `loomy`（只探已过期）/ `zcode`（只回写凭据） | — |
+
+⚠️ **`opencode` 不在表内**（Zen key 不过期、无 refresh_token 概念）⇒ **不受影响**。
+⚠️ **长期没被发现正是因为那 6 个长寿命 provider 掩盖了症状** ——
+issue 报告者观察到的 `gemini` 1 小时寿命正是最先暴露的那一个。
+
+#### ⚠️ 验证这类缺陷的正确姿势：真 `apply()`（两个坑必须避开）
+
+`tests/unit/refresh-scheduler.spec.ts` 测的是**抽出来的类**，抓不住
+「类写对了但 `index.ts` 没接上」。真正能抓接线的是
+**`tests/unit/refresh-scheduler-apply.spec.ts`**（真 `apply()` + 真 `AccountPool`，
+只把 13 个 `refreshAll` 换成记录器以免打上游）。
+
+⚠️ **写这类用例时踩过两个坑，两个都导致假阴性**（第一版探针因此误报「缺陷仍在」）：
+
+1. **`vi.spyOn(ctx.logger, 'info')` 抓不到调度器日志** —— cordis 的 Logger 是
+   **原型方法 + 自有 exporter**，`spyOn` 无效，日志看似「没打」。必须**直接替换**
+   `ctx.logger.info = …`（见该 spec 的 `makeCtxWithLogs()`）。
+   ⚠️ 这个坑很危险：它会让你以为「调度器没跑」，而实际上跑得好好的。
+2. **`settle()` 里绝不能再 `await new Promise(r => setTimeout(r, 0))`** ——
+   `vi.useFakeTimers()` 把它一起 mock 了 ⇒ **永不 resolve** ⇒
+   fire-and-forget 的异步链推不动、断言看到的是旧状态。
+   改用 `await vi.advanceTimersByTimeAsync(0)`（会连微任务一起冲干净）。
+3. 顺带：`settings.register()` 的替身**必须返回带 `replace` 的 scope**，
+   否则 `AccountPool.addAccount` 会在 `scope.replace` 上抛
+   `Cannot read properties of undefined`。
+
+⚠️ **已做反向验证**（真 `apply()` 级，3 条全红）：把
+`start()` 的「空池就 return」与 `notifyAccountAdded` 的补武装**两道一起禁** ⇒
+该 spec 3 条全变红；只禁 ① 时**仍全绿**（② 兜住了，见上）。
+接线断言单独验过：摘掉 `pool.onAccountAdded` 订阅 ⇒
+`refresh-bootstrap-wiring.spec.ts` 精确红 1 条。
+
+**真机影响面实证**（198 行只读脚本，零额度；`scripts/probe-ikjozb-real.mjs`，
+⚠️ 按仓库约定不入库）：把本机真实 `state.json`（39 账号 / 13 provider）
+**复制到临时目录**后跑真 `apply()`，并拦截全部 `fetch`：
+
+```
+真实账号池：39 个账号
+首轮 refreshAll 被驱动：["buddy","cline","codearts","gemini","lobsterai",
+                        "loomy","minimax","qoder","raccoon","trae","zcode"]
+refreshTargets 里但未被驱动：[]          ← 13 条全部驱动（11 个类，两组共用）
+网络请求尝试次数：0（全部被拦截 ⇒ 零额度）
+```
+
+⚠️ 脚本要点：**绝不写真实 `state.json`**（复制到临时目录 + `DSH_JET_HUB_STATE_DIR`）；
+拦 `fetch` 一举两得 —— 既证明零额度，又让续期请求立刻失败（失败本身不影响
+「是否被驱动」这个判据）。
+
+### ⚠️ 类名 `RefreshScheduler` 有**两个**，别改混
+
+| 类 | 文件 | 职责 |
+|---|---|---|
+| `RefreshScheduler` | `src/refresh.ts` | **单凭据**时代的静默续期器（buddy/cline/qoder/trae/lobsterai 各持一个实例，`arm(expiresAt)`） |
+| `MultiAccountRefreshScheduler` | `src/refresh-scheduler.ts` | **多账号池**调度（本 issue 新建；无条件武装 + 入库补武装 + 空池下轮重试） |
+
+⚠️ 两者**职责不同、都不可删**。本 issue 新建的类**刻意**叫
+`MultiAccountRefreshScheduler`（初版叫 `RefreshScheduler`，与既有的撞名 ⇒
+`grep RefreshScheduler` 会同时命中两套语义，已改名）。
 
 ### ⚠️ 账号池的 `refreshable` 只是**凭据材料的镜像**，绝不能当续期门禁
 
@@ -1183,7 +1500,9 @@ pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）�
 ① `src/index.ts` 每 30 分钟（含启动首轮）的 `refreshAll`；
 ② 推理路径的按需续期（`llm-adapter.ts` 的「过期预判」与「401 兜底」，
    而 DSH 本身会**并发**发多条请求：主回复 + 标题生成 + 上下文压缩）；
-③ Jet Hub 账号卡片的「刷新」按钮（`account.refresh`）。
+③ RPC `account.refresh`（⚠️ **没有面板入口** —— 账号卡片上并没有「刷新」按钮，
+   调用方是仓库外的脚本/手工 RPC；`plugin-src/client/jet-hub.js` 的 42 处
+   `rpcCall(` 里没有它，`git log -S "rpcCall('account.refresh'"` 零命中）。
 华为 STS 在签发新凭据时**旧的那一份 refresh_token 即失效**，
 并发下必然「1 个成功、其余 `invalid_grant`」，而失败方把它读成「账号不能续期」。
 
@@ -1380,6 +1699,89 @@ buddy: no usable credential; log in from the Jet Hub panel first
   ⚠️ 已做**反向验证**：错误码退回 `AUTH` → **7 条**变红；禁用冷却标记 → **5 条**变红
   （含认证 / 限流 / 流内三条通道各自那条）；禁用流内识别 → **2 条**变红。
 
+### ⚠️⚠️ 模型饱和（`14003`）**不是**账号额度限流：不许换号、不许标记（真实报障，2026-10-05）
+
+**用户报障**：第一次用 `buddy/space-bunny`（`reasoningEffort=max` / `maxTokens=128000`）就收到
+
+```
+本轮运行失败 buddy: 模型 space-bunny 所有账号均受限，请稍后再试
+QUOTA_EXCEEDED
+```
+
+**而 4 个账号凭据全部有效、服务端对 `space-bunny` 实测完全可用**（4 个账号 × 小请求全 200；
+长生成 417 秒 / 972 帧正常 `stop`；maxTokens/effort/system 65KB/41 个 tools 各种形状全 200）。
+
+#### 根因：`14003` **也是 HTTP 429**，而 `isRateLimited` 对 429 **无条件**为 true
+
+于是它落进了限流分支 → 给**每个**账号写一条 **1 小时**标记（报文里没有「将在…重置」，
+故取 `RATE_LIMIT_FALLBACK_MS` 兜底）→ 整池被锁 → 用户看到「所有账号均受限」。
+
+服务端原话（`scripts/probe-buddy-error-catalog.mjs`，4 MB 输入逼出）：
+
+```json
+{"code":14003,"msg":"too many requests",
+ "displayMsg":{"zh":"模型繁忙，请换模型或稍后重试"},
+ "displayTips":{"zh":"这个模型当前请求量饱和，与你的网络无关。请换个模型，或稍等一会儿再重试。"},
+ "actions":["SWITCH_MODEL","SUBMIT_FEEDBACK","RETRY"]}
+```
+
+⚠️ **报文自己就说明了这不是账号问题**：`actions` 里只有 `SWITCH_MODEL`，**没有**换号选项。
+
+#### 四条实测证据（互相印证，缺一都不能定案）
+
+| 观测 | 结果 |
+|---|---|
+| 账号池 4 条 | 是 **4 个不同腾讯 uid**（`612f07cc…` / `2f7d1c08…` / `c974deb7…` / `d694eca7…`） |
+| 4 条标记的写入时刻 | 20 秒内**全部**被写 `space-bunny` |
+| 4 条标记的解禁时刻 | 全 = 「写入 + **整 1 小时**」= 兜底值，**非**服务端给的时刻 |
+| 小请求 30 发 | 全 200，但耗时 **841ms ~ 216s** ⇒ 上游是**时变**背压 |
+
+⇒ 「4 个互不相干的账号同时中招」在**账号级**限流下无法解释，**只能**是**模型级**。
+
+⚠️ **`space-bunny` 还有一个特殊性**（其余 buddy 模型都没有）：目录元数据是
+`"onlyReasoning": true` + `defaultEffort: "max"` + `maxOutputTokens: 128000`
+—— 它把额度**全部花在思考上**，是唯一会被压满的路径（长生成实测思考 70353 字才出正文）。
+排查时别只盯「账号额度」。
+
+#### 修复口径：与 zcode `3009` 同型（**留在本账号退避重试**）
+
+| | 额度限流 `6004` | **模型饱和 `14003`** |
+|---|---|---|
+| 语义 | 该**账号**在该模型上额度用完 | 该**模型**此刻整体饱和 |
+| 换号 | **有效**（各账号额度独立） | **无益**（所有账号撞同一堵墙） |
+| 写限流标记 | **必须**（否则每轮重撞） | **绝对不许**（会锁整池 1 小时） |
+| 建议 | 等解禁 / 换账号 | **换模型** / 稍后重试 |
+
+- 判据：`src/llm-adapter.ts` 的 `isModelSaturationError(status, body)`
+  （业务码 `14003` **或**窄文案 `模型繁忙|请求量饱和|model busy|currently saturated`）；
+- 接线：`src/buddy-adapter.ts` 的 `stream()` 里，**必须插在 `isRateLimited` 分支之前**
+  —— 顺序就是修复本体（`14003` 满足 `isRateLimited`，晚一步就整池被锁）；
+- 动作：`BUDDY_SATURATION_MAX_RETRIES`（2 次）线性退避，**始终用同一个 `credential`**；
+- 用尽仍饱和 → 抛 **`RATE_LIMIT`**（可重试），文案指向「换模型」，
+  ⚠️ **不许**说成「账号额度受限」（那会让用户白等 1 小时、且期间连别的模型都受影响）。
+
+⚠️ **判据必须窄**：泛词「繁忙」**不算** —— 模型正文里正常讨论「服务器繁忙时应当重试」
+就会被误判。故 `status < 400` 时一律不认文案。
+⚠️ 退避间隔取**短**（2s → 4s）：该错误**自身**就要跑 46~111 秒才返回，
+再叠长退避会让 UI 长期停在「运行中」而无法区分「排队」与「卡死」（与 Qoder 排队 ≥10s 封顶同因）。
+⚠️ 环境变量**不许**写 `parseInt(…) || 默认值`：`0` 是合法值（单测靠它把用例压到毫秒级），
+会被 `||` 静默换成 2 秒 —— 与 `QODER_QUEUE_MAX_DELAY_MS` 那次同型。
+
+回归用例：
+- `tests/unit/buddy-model-saturation.spec.ts`（8 条：真实报文 / 6004 不误判 /
+  **14003 同时满足 isRateLimited**（缺陷成因）/ 两种码值编码 / 裸文案 /
+  正常正文不误伤 / 不误伤 11140 / 常量一致）；
+- `tests/unit/buddy-adapter.spec.ts` 的「模型饱和（14003）不换号、不标记」段
+  （3 条**行为级**：两处副作用必须为 0 + 恢复即产出 + 6004 既有换号行为不许回退）。
+
+⚠️ **已做反向验证**：把饱和判定强制为 `false`（= 修复前行为）→ **2 条行为用例变红**，
+且失败输出里**确凿地打印出** `{"accountId":"acct-1","modelId":"space-bunny"}` ——
+即修复前真的会写那条标记，**不是同义反复**。
+
+⚠️ 本缺陷与 Cline 那条（下面「429 有**三种**语义」）、qoder `10605`/`110`、
+zcode `3009`/`1005` 是**同一个病根**：**用状态码的默认归类代替了对业务语义的判断**。
+接新的 429/限流分支时，先把「这个码的正确动作是什么」问清楚再写。
+
 ## ⚠️ 图片必须按像素预算发**请求版本**，不能恒发原图（Issue !IKITT9）
 
 **真实缺陷**（用户报障）：带截图的会话攒到 **36 张**后**每轮都失败且不可恢复**，
@@ -1526,7 +1928,7 @@ qoder ≈57 MiB、cline ≈122 MiB）。两种约束**只有缩放图片这一�
 `tests/unit/cline-auth.spec.ts > ClineAuth refreshAll`：
 
 - 「只按 refreshable 过滤，**不看 enabled**」
-- 「按需续期（账号卡片「刷新」）成功后把新 expiresAt 写回账号池」
+- 「按需续期（RPC account.refresh）成功后把新 expiresAt 写回账号池」
 
 **当时的现场**：同一轮我正在并发跑真机图片 e2e（长跑、重负载）。
 **之后的验证**：单独跑该文件 26 条全过；全量连跑 3 次均 2833 全过；
@@ -2813,8 +3215,8 @@ re-authenticate your Cline account."* —— 与真实原因**毫不相干**，�
 
 ### ⚠️ 坑 2：免费模型是**独立 id**，且只由 `recommended-models` 下发
 
-`cline-free/deepseek-v4.1-flash`（免费）与 `deepseek/deepseek-v4.1-flash`
-（按量计费）是**两个不同条目**。绝不可用「名字含 deepseek」之类模糊匹配判免费 ——
+`cline-free/mimo-v2.6-flash`（免费）与 `xiaomi/mimo-v2.6-flash`
+（按量计费）是**两个不同条目**。绝不可用「名字含 mimo」之类模糊匹配判免费 ——
 那会让用户按免费预期使用却被计费。
 
 两个端点**必须都打**，理由各有实测依据：
@@ -2836,9 +3238,31 @@ re-authenticate your Cline account."* —— 与真实原因**毫不相干**，�
 ⚠️ **兜底表要与远端 `free` 数组同步**：sidecar 内嵌目录里**没有** `cline-free/*`
 与 `stealth/space-bunny-alpha`（只有远端 `free` 下发），故 `cline-product.ts` 的兜底表
 手工补上它们 —— 否则离线时用户看不到免费模型。
-⚠️ 2026-10-03 复测：`free` **只剩 4 条**，`cline-free/gemini-3.8-flash` 已被 Cline
-下线（直连回 `404 {"error":"model not found"}`），兜底表、单测与 e2e 清单已同步删除它。
-**别照抄旧版本的表把它加回来**。
+
+⚠️⚠️ **兜底表是编译期快照，会落后 —— 且陈旧条目曾让用户「选中即 404」**
+（真实报障 2026-10-05）：`cline-free/deepseek-v4.1-flash` 被移出远端 `free` 数组
+（**3 条**）后，仍以「免费」出现在模型列表里，用户选中即回
+`404 {"error":"model not found"}`。**重启不会消失** —— 合并发生在每次全新加载时。
+
+根因：`mergeClineModels` **无条件**把整张兜底表并回结果，且
+`isClineFreeModel` 对 `cline-free/` 前缀恒判免费。
+**已修**（本分支）：兜底表改为**有条件并入** —— 远端成功下发目录时丢弃
+「远端已不认识」的条目，只在远端不可用时整表兜底。
+判据用 `remote.entries.length > 0` 而**非** `freeIds.length > 0`：后者在
+「上游把免费模型**全部**撤掉」时也合法为空，只看它会把「全撤」误判成
+「端点挂掉」，反而保留整张已失效的表。
+
+⚠️ **已发生两次，同步清单**（**别照抄旧版本的表把它们加回来**）：
+`gemini-3.8-flash`（2026-10-03）、`deepseek-v4.1-flash`（2026-10-05）。
+判定「某个兜底免费模型是否已被下架」用 **`pnpm test:e2e:cline`**（只读、零额度）。
+
+⚠️ **审计过全部 13 张兜底表，不能一刀切**（2026-10-05）：只有 cline 是「**并入型**」
+（`mergeClineModels` 无条件并回）故有此缺陷；buddy / codebuddy / workbuddy 是
+「**白名单型**」（`reconcileWithFallback` **以兜底表为准**，做目录比对反而会删掉
+「你权用、只是 CLI token 看不到」的可用模型 —— 见 `product.ts` 里 `hy4-preview`
+的补录注释）；lobsterai / loomy / minimax / raccoon / trae / zcode / gemini /
+opencode 是「**仅回退型**」（`remoteModels ?? fallback`，远端整体替换，无双源合并）；
+qoder / qoder-cn 端点是 WASM 签名、兜底表是唯一来源，无数据可比对。
 
 ⚠️ **`clinePass` 不是免费集合**：它是 Cline Pass 订阅制模型（`cline-pass/*`），
 按订阅额度计费。实测 14 个，误判为免费会误导用户。
@@ -4640,6 +5064,7 @@ POST {agentHost}/api/ide/v1/batch_get_detail_param
 | `config_switch === false` | 上游已停用 | **必须剔除** |
 | `is_invisible_to_user` | **官方 picker 不展示** | **必须剔除**（硬性，使目录与官方 Auto Mode 一致） |
 | `usage !== 'chat_completion'` | 非对话用途（summary / fast_apply / multimodal…） | **必须剔除** |
+| **`function` 不在 `TRAE_CHANNELS` 内** | **该通道在本插件的推理端点下不可调用** | **整组剔除**（见下「通道白名单」） |
 
 > **历史修正**：早期实现把 `is_invisible_to_user` 当作「两个独立维度」而默认保留
 > （理由是实测 `glm-5.1` 被官方隐藏却**可调用**）。后来用户要求目录与官方
@@ -4649,6 +5074,90 @@ POST {agentHost}/api/ide/v1/batch_get_detail_param
 > 被过滤的模型若已被持久化为会话模型，`resolveModel` 仍能解析。
 > 需要临时放宽时改 `parseTraeBatchModelList` 的过滤条件，不要动
 > `isTraeModelCallable`（那里管的是「必然调不通」）。
+
+#### ⚠️ 通道白名单：`TRAE_CHANNELS` 不只是排序表，更是**准入白名单**（Issue IKJOZ7）
+
+**真实缺陷**（用户报障 2026-10-04）：模型列表里 `function=chat`（及 `builder` /
+`inline_chat`）的模型**能选中**，一发请求就被上游拒绝；换 `solo_agent` 通道同样的
+模型可以正常用。用户侧表现为「模型在设置页能开、能被选中，调用却稳定失败」，而
+报错文案（`the model is unknown` / `param is invalid`）**指向模型本身** ⇒ 极易误判
+成「这个模型坏了」，实际是**发错了通道**。
+
+**根因**：`channelPriority`（= `TRAE_CHANNELS`）此前**只用于排序**（规则 2 的档位
+择优），不参与准入；`channelFor()` 又原样返回目录里的 `function` 当通道用
+⇒「目录声明了什么通道，就照着发什么通道」。而真实目录里 **38 条中有 19 条（50%）**
+带着不可调用的 `function`。
+
+**修法**：`parseTraeBatchModelList` 的循环开头加白名单准入 ——
+`if (channel.length === 0 || rankOf(channel) < 0) continue`（整组跳过）。
+准入**只在解析器一处**执行（单一真相源）；不要再去 `channelFor()` 里加第二层
+校验，否则用户用 `DSH_TRAE_CHANNELS` 自定义白名单时会与兜底表路径判据不一致。
+
+**逐通道实测**（2026-10-04，真实凭据；脚本 `scripts/probe-trae-channel-callable.mjs`
+逐个 function 发一次最小请求，每站可复现）：
+
+| 结果 | function |
+|---|---|
+| ✅ 可调用（**白名单内容，15 个**） | `solo_agent` / `solo_work_lite` / `solo_agent_remote` / `solo_work_remote` / `solo_agent_lite` / `solo_design_lite` / `solo_design_remote` / `solo_coder` / `chat_v3` / `builder_v3` / `git_ai` / `code_reviewer` / `code_review_summary` / `multimodal` / `system_diagnosis` |
+| ❌ **稳定被拒**（**不得**放入） | `chat` → `code=4023 the model is unknown`；`builder` → `4001 param is invalid`；`inline_chat` → `3003 model service is unavailable` |
+| ⚪️ 目录恒空（放进来无意义） | `ui_builder_v2` / `solo_builder` / `custom_agent_generation` / `utils` |
+
+⚠️⚠️ **两处与 issue 原文不符，以实测为准**（别照抄 issue 的推测去"补全"）：
+
+- **`chat_v3` 是可调用的**（实测正常返回 3.8KB 正文），issue 把它与 `chat` 并列
+  怀疑是**错的**。若照 issue 把它一起剔除，会连带删掉一批只有它才有的模型。
+- **`solo_coder` 首测超时、换 4 个模型复测 4/4 成功** ⇒ 计入可调用。
+  ⚠️ **超时 ≠ 不可调用**：单次超时可能只是上游抖动，判据必须是**复测**。
+  它的独有模型（`minimax-m2.7` / `glm-5v-turbo` 等）因此得以保留。
+
+**修复前后对账**（同一次真实目录，`scripts/diff-trae-whitelist.mjs`）：
+
+```
+修复前 38 条 → 修复后 36 条
+被剔除（仅见于不可调用通道）：doubao_1_8(was=chat)、kimi-k2(was=inline_chat)
+通道迁移（保留但纠正通道）：24 条，如 glm-5.1: chat → solo_coder
+                          glm-5.2: chat_v3 → solo_agent
+新增（不该有）：无
+```
+
+⚠️ **关键区别：剔除 vs 纠正通道**。`glm-5.1` / `DeepSeek-V4-Flash` / `qwen-3.5` 等
+**同时也在可调用通道里**（`solo_coder` 等），故它们**不消失**，只是通道被纠正 ⇒
+从「必然失败」变成「可用」。**只有**「仅见于不可调用通道」的条目才会被剔除
+（实测就那 2 条）—— 那正是必然失败的那批。**不要**把这条修法理解成「按通道一刀切
+删模型」。
+
+⚠️ **`glm-5.1` 的通道变了，别按旧结论断言**：它在 `solo_agent*` 里全是
+`is_invisible_to_user: true`（被既有硬过滤剔除），故现在落到 `solo_coder`。
+历史文档里「`glm-5.1` 走 `solo_agent_remote`」的说法**已过期**
+（`tests/e2e/trae-channels-probe.e2e.spec.ts:49` 仍是旧断言，跑该 e2e 前需先更新）。
+
+⚠️ **兜底表路径不受影响**：远端目录不可用时走 `fallbackModels`，那里本就没有通道
+信息，`channelFor()` 回退 `product.function`（`solo_work_lite`，已在白名单内）。
+
+⚠️ **`DSH_TRAE_CHANNELS` 覆盖的是整张白名单**，写错即过滤掉全部模型
+（有意的：宁可空目录，也不要再让不可调用的通道流出去）。
+
+**排查脚本**（均只读；前两个零额度）：
+- `scripts/probe-trae-channel-whitelist.mjs` —— 打印 22 个通道的条目数 +
+  解析结果的通道分布 + 白名单外条目明细（**修复前跑会列出 19 条 offenders**）；
+- `scripts/diff-trae-whitelist.mjs` —— 修复前后目录对账（剔除 / 迁移 / 新增）；
+- `scripts/probe-trae-channel-callable.mjs` —— **消耗额度**，逐通道实发判定可调用性；
+- `scripts/verify-trae-channel-fix.mjs` —— **消耗额度**，用修复后的适配器对
+  10 个「修复前必然失败」的模型实发对话（实测 10/10 通过）。
+  ⚠️ **必须传 `fetchRemoteModels`**，否则适配器 `remoteMeta` 为空、
+  `channelFor` 回退 `solo_work_lite`，验的就不是本次修复了（我第一版就这么白跑了一遍）。
+
+**回归用例**：`tests/unit/trae.spec.ts` 的「通道优先级表同时是白名单」等 4 条
+（非白名单通道整组剔除 / 仅见于不可调用通道者被剔除 / 可调用+不可调用都出现时保留
+并纠正通道 / 未声明 `function` 的组跳过），以及 `tests/unit/trae-product.spec.ts`
+的 2 条（白名单不得含被拒的 3 个通道、15 个可调用通道必须齐全）。
+⚠️ 已做**反向验证**：去掉白名单准入（恢复「只用于排序」）→ **3 条变红**；还原后全绿。
+
+⚠️ **同时修掉了两处「语义漂移」的既有用例**（它们会因「条目被丢弃」而**假通过**）：原
+「已选条目不在优先级表内时，有档位者仍胜出」用例用的是 `chat` 通道 —— 修复后该条目
+根本进不了目录，用例变成**同义反复**（不再验证「档位优先于顺序」）。已改写为明确
+断言白名单语义，并另加 3 条覆盖剔除/纠正两种路径。**改动解析器时请复查既有用例是否
+仍在验证它声称的那件事** —— 「测试全绿」不等于「测试还有意义」。
 
 #### 远端参数必须消费（这一条曾被整段漏掉）
 
@@ -7790,6 +8299,212 @@ JS，里面的 JSDoc 写反引号没问题 —— 但**从它们复制片段进 
 ⚠️ **教训的普遍性**：这是本仓库第三次栽在「用外部下发的**字符串**当键」上
 （另两次：qoder 的 `110` 用错误码默认归类、`10605` 排队被漏判）。外部字段的
 **拼法不可假设**，当键用之前先归一到自己的语义等价类。
+
+## ⚠️⚠️ 一键签到的汇总**必须按单位分列**，不得跨单位求和（2026-10-04 真实报障）
+
+用户报障原文：
+> 插件的这个一键签到，Zcode 获得的是 token 数量，但是这里显示成获得积分。
+> 正文「…ZCode（智谱）+100000000（共 +100000100）」
+> 应当显示为「…ZCode（智谱）+100Mtoken（共 +100Mtoken, +100积分）」
+
+**根因不在文案，而在数据模型**：`computeClaimSummary` 的 `totalCredit` 是
+**跨单位求和的标量** —— ZCode 的 1 亿 token 与其余渠道的 100 积分加在一起得
+`100000100`。单位信息**在汇总这一层就丢了**，下游无论怎么写文案都只能标一个
+「积分」。故修法是**让单位一路传到渲染层**，而不是在文案里猜。
+
+| 层 | 改动 |
+|---|---|
+| 宿主汇总 | `RpcCreditsClaimSummary.totalByUnit: Record<'token'\|'credit', number>`（**两键恒存在**） |
+| 宿主累加 | `computeClaimSummary` 用 `claimUnitOf(outcome.unit)` 分桶；`RunTotals` 同步加 `totalByUnit` |
+| 格式化 | 宿主 `src/credits.ts` 的 `formatClaimGains`；客户端 `credits-format.js` 的同名函数 |
+| 消费点 | `auto-checkin.ts` 的 `describeChannel`/`describeRun`；`jet-hub.js` 的 `checkinAll`；`usage-badge.js` 的 `onClaimAll`/`summarizeClaim` |
+
+**四条红线**：
+
+1. **`totalCredit` 保留原语义（跨单位求和），但展示路径一律不得用它** ——
+   它只对**单一单位**的渠道（其余 11 个）正确。改它才是破坏性改动，故新增字段而非替换。
+2. **宿主与客户端的两份格式化必须逐字等价**。客户端 bundle 不能 import 宿主代码
+   （esbuild 的客户端产物没有 Node 依赖），只能各写一份 —— 契约由
+   `tests/unit/claim-unit-parity.spec.ts` 逐项比对锁死。不锁的话，**同一轮签到**
+   在 Jet Hub 设置页（宿主产出并落盘的文字）与用量徽标（客户端现场拼）会显示成两种写法。
+3. **每个单位各带一个 `+`**，不是整段共用一个。用户给出的期望文案就是
+   `+100Mtoken, +100积分`；整段共用会渲染成 `+100Mtoken, 100积分`，第二个单位
+   看起来像「不是本次领到的」。故 `+` 放在 `formatClaimGains` **内部**，
+   而不是留给调用方拼（一旦各拼各的，两处界面必然漂移）。
+4. **顺序固定 `token` → `credit`**，不依赖对象键序（用户期望文案就是 token 在前）。
+
+⚠️ **积分不压缩、token 才压缩**：积分余额的现实量级是 `123456.78`（IDE 顶部就是这个
+精度），压成 `123.46K` 会让用户无法与官方界面核对；而 token 动辄上亿，不压缩读不出量级。
+`formatCreditAmount` / `formatTokenAmount` 与客户端的 `formatCredits` / `formatTokens` 同口径。
+
+⚠️ **数值与单位之间不留空格**（`100.00MToken` / `800积分`）：这是本仓库既有的展示惯例
+（用量徽标里 ZCode 余额就渲染成 `94.54MToken`），也与用户给出的期望文案同形。
+
+⚠️ **旧响应兼容**：`totalByUnit` 缺失时回落到 `{ credit: totalCredit }`（行为与改动前
+一致，只是多了单位名）。判据与 `coversToday` 的兜底同思路 —— 缺字段 ≠ 0。
+⚠️ **但兜底只做一次，且做在「逐渠道累加」那一跳**：`jet-hub.js` / `usage-badge.js`
+首版在 `let totalCredit = 0` 上留了一个标量，汇总行写
+`totalByUnit.token > 0 || totalByUnit.credit > 0 ? totalByUnit : { credit: totalCredit }`
+—— 而那个 `totalCredit` **再无任何累加**（全文只有声明行，恒为 0）⇒ 该三元分支
+**永远走不到**，旧宿主的兜底实际发生在 `s.totalByUnit || { credit: s.totalCredit }`。
+现已删掉该变量与那个分支（一个恒为 0 的变量配一句「保留只为兜底旧宿主」的注释，
+比删掉它危险得多）。**新增同类兜底时先自问：这个分支有哪条真实路径能走到？**
+
+### ⚠️⚠️ 承上：**`+` 在函数内部 ⇒ 调用点绝不能再拼**（2026-10-05 复审 PR !56 补记）
+
+**真实缺陷**（本 PR 首版自身引入，用户可见）：`formatClaimGains` 的返回值**自带**
+每个单位的 `+`（`+100.00MToken, +100积分`，这是它名字里 `Gains` 的含义，也是上面
+红线 3 的结果），而客户端的 **4 个调用点**「顺手」又拼了一次 ⇒ 渲染出**双加号**：
+
+```
+jet-hub.js     bits.push(`+${amount}`)          →  "++100.00MToken"
+jet-hub.js     `（共 +${totalAmount}）`          →  "（共 ++100.00MToken, +100积分）"
+usage-badge.js bits.push(`+${amount}`)          →  "++800积分"
+usage-badge.js `（共 +${totalAmount}）`          →  "（共 ++100.00MToken, +100积分）"
+```
+
+⚠️ **宿主侧 `auto-checkin.ts` 那两处反而是对的**（`（${amounts}）` / `个 ${amounts}`）
+—— 恰好**只有两个客户端界面**是坏的，而它们正是用户报障盯着的界面。
+⇒ 同一件事在 6 个调用点里出现两种写法，是「手写拼装」的必然结果。
+
+⚠️⚠️ **比缺陷本身更值得记的是：全量 5448 条用例全绿也没抓到它。** 三个原因叠加：
+
+1. 新增的 `claim-unit-parity.spec.ts` 把 `formatClaimGains` **这个纯函数**锁得很死，
+   却**只 import 纯函数、从不看调用点** —— 纯函数层面的用例**结构上不可能**发现
+   「函数被用错」（它测的是输出，bug 在使用上）；
+2. 宿主侧有 `auto-checkin.spec.ts` 逐字断言，客户端侧**没有对等用例**；
+3. 既有的源码级守卫 `zcode-claim-amount.spec.ts` 那条 `not.toMatch`
+   （`/个账号领取成功（\+\$\{summary\.totalCredit\}/`）是**恒真**的 ——
+   `jet-hub.js` 里从来没有过这个形态（真实代码当时是
+   `` （共 +${totalCredit} 积分） ``，**没有**「个账号领取成功」这个前缀）。
+   ⇒ 它修复前后**都命中 0 次**，等于空转，而它正是「防跨单位求和回归」的那道闸。
+
+✅ **修法与新增的不变量**（`tests/unit/claim-unit-callsites.spec.ts`，16 条）：
+
+- **正常锚点 + 反向断言成对写**：每条 `not.toMatch` 都必须配一条 `toMatch`，
+  否则「锚点形态根本不存在」⇒ 反向断言**恒真**（上面第 3 条就是这么空转了几个月）。
+- **断言必须剥注释**：本仓库源码注释里大量**逐字引用**曾经的错误写法，不剥注释
+  则反向断言会被注释自己命中（写这个文件时首版实测红了 4 条，全因注释）。
+- **断言一律单行**：CRLF + 跨行锚点会命中 0 次被静默跳过（见下文那条 CRLF 教训）。
+- 覆盖 6 个调用点（4 客户端 + 2 宿主）+ 2 处**空格口径**，并含**元测试**
+  （把错误形态喂给同一个正则，必须命中）证明断言非恒真。
+- 反向验证 `scripts/mutate-claim-unit-callsites.mjs`：**9/9 全部杀死、0 跳过**
+  （含 2 条空格变异），且断言每条锚点**命中次数恰为 1**。
+
+⚠️ **顺手修掉的两处空格口径不一致**（同一轮签到不能像两种单位）：`jet-hub.js`
+逐账号明细与 `usage-badge.js` 余额行原写作 `+100.00M Token`（**带空格**），
+而汇总行是 `+100.00MToken` —— 两行并列显示成两种单位。本仓库口径是**不留空格**
+（`badge-model.js` 的 `94.54MToken`、用户期望文案 `+100Mtoken` 同形）。
+
+⚠️ **教训的普遍性**：**「同一个格式化函数有多个手写调用点」本身就是缺陷温床**。
+函数内部已经保证的东西（`+`、单位名、空格），调用点每多一处就多一次重犯机会。
+⇒ 要么让调用点**只贴函数返回值**（不在外面包任何修饰），要么再加一层
+「拼好一整句」的函数；**不要**让 N 个调用点各自拼一半。
+
+### ⚠️⚠️ 承上之二：**「展示路径写死『积分』」共有三处**（2026-10-05 同批复审）
+
+同一批审计里又找出**第三处**同型缺陷 —— 它在**用量徽标浮层的「积分区」节标题**：
+
+```js
+// 修复前（usage-badge.js）
+quotaGroup === undefined ? '积分' : unitLabel(quotaGroup.unit)
+//                        ^^^^^^ 兜底分支假定「非配额渠道都是积分」
+```
+
+**ZCode 的额度单位是 token**（`src/jet-hub-rpc.ts` 的 zcode 分支如实标
+`unit: 'token'`），于是浮层渲染成**自相矛盾的一屏**：
+
+```
+积分                                  ← 节标题（写死）
+  ZCode 旅行者6665   94.54MToken       ← 同一屏的数值（按单位走）
+```
+
+⚠️ **它此前没被发现，是因为只在「该渠道只发 token」时才显形** ——
+12 个渠道里只有 ZCode 是这种形状。这与「某次实测没看到 ≠ 不存在」是同一类陷阱。
+
+⚠️ **判据必须与分组口径同源**：修法是抽成纯函数 `creditSectionLabel(groups)`
+（`plugin-src/client/badge-model.js`），有配额组用其标签（`'额度'`）、
+否则用**第一个**单位的标签。⚠️ 取「第一个」是安全的，因为 `creditGroupsOf`
+末尾按 `unit` 排序 ⇒ 结果确定、不依赖对象键序。
+
+⚠️⚠️ **第三处还带出一个更重要的方法论教训：纯函数级用例测不出「组件不调用它」。**
+`badge-model.spec.ts` 为 `creditSectionLabel` 加了 6 条用例，但它们**全部只 import
+纯函数** —— 若有人把组件改回内联三元，那 6 条**依然全绿**（实测确认）。
+故调用点契约文件里**额外**加了两条源码级断言：① 组件**必须**调用
+`creditSectionLabel(`；② **不得**再出现 `=== undefined ? '积分' : unitLabel(` 形态。
+
+⇒ **反向验证 11/11 全部杀死**（`scripts/mutate-claim-unit-callsites.mjs`），
+其中两条**成对**存在、缺一不可：
+
+| 变异 | 由谁杀死 | 说明 |
+|---|---|---|
+| `creditSectionLabel` 内部写死「积分」 | `badge-model.spec.ts`（1 红） | 纯函数自身有问题 |
+| 组件回退到内联三元（不调用纯函数） | `claim-unit-callsites.spec.ts`（2 红） | **纯函数全绿**，只有调用点断言能抓 |
+
+⚠️ **写变异脚本时还要注意「验证范围」**：该脚本首版只跑
+`claim-unit-callsites.spec.ts`，于是第一条变异被判**幸存** —— 而它其实是被
+`badge-model.spec.ts` 杀死的。**「范围没覆盖到」与「用例没抓住」在输出里长得一样**，
+与本文件反复出现的那条 CRLF 教训同源。现在 `SPEC` 同时覆盖两个文件。
+
+⚠️ **顺带**：验证脚本 `verify-claim-unit-callsites.mjs` 也踩了**同一个注释坑** ——
+它检查错误形态时命中了自己注释里逐字引用的旧写法，对**已修好的产物**报假阳性
+（9 通过 / 1 失败，那 1 项命中的全是注释）。**凡是对源码做形态断言的脚本，
+都要剥注释再匹配。**
+
+### ⚠️⚠️ 承上之三：空格口径要**穷举断言**，逐点断言挡不住新调用点
+
+**真实教训（2026-10-05，复审收尾时的覆盖度自查）**：前两轮修复里，
+空格口径只逐点钉住了**当时发现的那两处**（逐账号明细行、徽标余额行）。
+收尾时用宽搜复查（列出全部含 `formatUnits(` 的可执行行），又抓到**第三处漏网**：
+
+```js
+// plugin-src/client/usage-badge.js 的**订阅套餐行**（修复前）
+`${formatUnits(group.remaining, group.unit) ?? '?'} / ${formatUnits(group.total, group.unit) ?? '?'} ${group.label}`
+//                                                                                                     ↑ 多一个空格
+```
+
+它渲染的正是 `100.00M / 200.00MToken`，而**同一个弹窗**的积分区是**无空格**的
+⇒ 两处并列像两种单位。
+
+⇒ **修法升级**：把「数值与单位之间不留空格」改成**穷举断言**
+（遍历三个客户端文件，凡「`formatUnits(...)` 的数值后跟空白再紧跟单位标签变量」
+即判红），并配正向锚点防恒真。
+
+⚠️ **判据必须只认单位标签变量名**（`unitLabel(...)` / `group.label` / `best.label`），
+**不要**泛化成「所有 `${}` 前不得有空格」—— 那会误伤 `jet-hub.js` 的
+**模型分组标题** `` `${expanded ? '▾' : '▸'} ${group.label}` ``（那里的
+`group.label` 是「GLM 系列」这类**分组名**，本就该有空格）。
+
+⚠️ **教训的普遍性**：**逐点断言的覆盖是「已知位置」，而缺陷可能出现在任何新调用点**。
+凡是「N 个位置都该遵守同一条口径」的事，判据就应当是**穷举**的
+（扫全部调用点 / 断言集合为空），而不是逐个列举。
+
+⚠️⚠️ **还有一条元教训：自查脚本/断言自己也会写歪**。本次覆盖度脚本首版有**两处自伤**，
+都导致「对**已修好**的代码报未覆盖」的**假阴性**：
+① 用 `includes('…大量反斜杠…')` 判断旧锚点是否移除，**转义写歪** ⇒ 反复误报；
+② 空格穷举只匹配两种后缀形态，漏掉标签是别的变量名的写法。
+⇒ **凡断言，先确认它「在该红时真红」** —— 这与 `not.toMatch` 恒真、
+变异脚本「跳过 vs 杀死」是同一类错误，本仓库已栽过三次。
+
+
+**反向验证**（`mutate-claim-unit.mjs`，8 条变异**全部杀死**）：汇总不分桶 3 红、
+格式化不按单位选压缩 6 红、单位标签恒为「积分」6 红、只列一个单位 6 红、
+`describeRun` 回到裸标量 5 红、`describeChannel` 回到裸数字 5 红、
+客户端少一个 `+` 3 红、客户端标签恒「积分」2 红。
+
+⚠️ **写变异脚本时必须处理 CRLF**：本仓库源码是 CRLF（实测 `src/credits.ts`
+CRLF=725 / LoneLF=0），而脚本里的锚点是用 `\n` 写的。不做归一化的话**多行锚点会
+命中 0 次而被静默跳过** —— 第一版就这么漏掉了 3 条最关键的变异（全是多行的）。
+故脚本统一把锚点转成目标文件实际的行尾，并**断言命中次数恰为 1**。
+⚠️ 这**不是一次性教训**：2026-10-05 复审时新写的
+`scripts/mutate-claim-unit-callsites.mjs` 依然按这条做（归一化 + 断言命中恰为 1），
+结果是 `9/9 杀死、0 跳过`。**「跳过」与「杀死」在输出里长得像** —— 不打印
+跳过数、不断言命中次数，就会把「锚点没匹配上」当成「验证通过」。
+
+⚠️ **教训的普遍性**：这是本仓库第二次栽在「**跨量纲求和**」上（第一次是胶囊把
+`credit`/`credits` 拆成两组，见上一节）。凡是把**带单位的量**累加成**裸数字**，
+单位就一定会在那一层丢掉；正确做法是让单位**跟着数字一起走**（分桶 / 分组），
+把「怎么显示」推迟到最后一层。
 
 ## ⚠️ 徽标的两条「账号多了」规则（2026-10-03 用户要求）
 

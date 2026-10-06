@@ -23,6 +23,20 @@ import { AccountPool } from '../../src/account-pool.js'
 import type { ClaimOutcome, CheckinStatus, CreditBalance } from '../../src/credits.js'
 import { WORKBUDDY } from '../../src/product.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
+// ⚠️⚠️ 「已失效模型」表的直接操作（2026-10-06 复审 !66 的 model.clearDead 端点用例）。
+//
+// ⚠️⚠️ **必须在任何静态 import 之前设好隔离目录**：该模块的 store / cache 是
+// **进程级单例**，首次解析 home 时读 `DSH_JET_HUB_STATE_DIR`（`resolveJetHubHome`
+// 的第一优先级）。不隔离会**写真实的用户目录** `~/.dsh/jet-hub/dead-models.json`。
+// 静态 import 会被提升，故这里用顶层 await 动态导入。
+{
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join: joinPath } = await import('node:path')
+  process.env.DSH_JET_HUB_STATE_DIR = mkdtempSync(joinPath(tmpdir(), 'dsh-jet-hub-rpc-dead-'))
+}
+const { clearDeadModels, deadModelIdsFor, recordDeadModel } =
+  await import('../../src/dead-model-store.js')
 
 describe('积分领取结果汇总', () => {
   it('统计成功数量与累计积分', () => {
@@ -34,7 +48,47 @@ describe('积分领取结果汇总', () => {
     ]
     expect(computeClaimSummary(outcomes)).toEqual({
       claimed: 2, totalCredit: 150, alreadyClaimed: 1, inactive: 0, failed: 1, coversToday: 3,
+      totalByUnit: { token: 0, credit: 150 },
     })
+  })
+
+  /**
+   * ★ **根因所在**（真实缺陷，用户报障 2026-10-04）：
+   * > Zcode 获得的是 token 数量，但是这里显示成获得积分。
+   * > 正文「…ZCode（智谱）+100000000（共 +100000100）」
+   * > 应当显示为「…ZCode（智谱）+100Mtoken（共 +100Mtoken, +100积分）」
+   *
+   * `totalCredit` 是**跨单位求和**的标量 —— 1 亿 token 与 100 积分加在一起后，
+   * 下游拿到的是一个数、无从分辨单位，只能标成「积分」。故单位必须在**汇总
+   * 这一层**就分开保留（`totalByUnit`），而不是在文案层猜。
+   *
+   * ⚠️ 这条用例同时锁死「`totalCredit` 保留原语义」：它是既有契约，
+   * 且对**单一单位**的渠道（其余 11 个）完全正确。改它才是破坏性改动。
+   */
+  it('★★ token 与积分**分列**，不跨单位相加（用户报障的根因）', () => {
+    const outcomes: ClaimOutcome[] = [
+      { kind: 'claimed', credit: 100_000_000, streakDays: 0, isStreakDay: false, unit: 'token' },
+      { kind: 'claimed', credit: 100, streakDays: 0, isStreakDay: false },
+    ]
+    const summary = computeClaimSummary(outcomes)
+    // 单位分开保留 —— 这是修复的核心
+    expect(summary.totalByUnit).toEqual({ token: 100_000_000, credit: 100 })
+    // 标量仍在，但**不得**再用于展示（它是跨单位求和的产物）
+    expect(summary.totalCredit).toBe(100_000_100)
+  })
+
+  it('★ 未声明 unit 的领取按积分计（其余 11 个渠道逐字不变）', () => {
+    const summary = computeClaimSummary([
+      { kind: 'claimed', credit: 800, streakDays: 1, isStreakDay: false },
+    ])
+    expect(summary.totalByUnit).toEqual({ token: 0, credit: 800 })
+  })
+
+  it('★ unit 为未知值时按积分兜底（脏数据不制造出第三种单位）', () => {
+    const summary = computeClaimSummary([
+      { kind: 'claimed', credit: 50, streakDays: 0, isStreakDay: false, unit: 'credits' } as ClaimOutcome,
+    ])
+    expect(summary.totalByUnit).toEqual({ token: 0, credit: 50 })
   })
 
   /**
@@ -51,6 +105,7 @@ describe('积分领取结果汇总', () => {
     ]
     expect(computeClaimSummary(outcomes)).toEqual({
       claimed: 1, totalCredit: 100, alreadyClaimed: 1, inactive: 0, failed: 0, coversToday: 0,
+      totalByUnit: { token: 0, credit: 100 },
     })
   })
 
@@ -81,6 +136,7 @@ describe('积分领取结果汇总', () => {
   it('空数组返回全 0', () => {
     expect(computeClaimSummary([])).toEqual({
       claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
+      totalByUnit: { token: 0, credit: 0 },
     })
   })
 
@@ -256,6 +312,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     expect(response.results.every(r => r.outcome.kind === 'claimed')).toBe(true)
     expect(response.summary).toEqual({
       claimed: 3, totalCredit: 300, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 3,
+      totalByUnit: { token: 0, credit: 300 },
     })
   })
 
@@ -284,6 +341,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     expect(claimed).toHaveLength(2)
     expect(response.summary).toEqual({
       claimed: 2, totalCredit: 200, alreadyClaimed: 0, inactive: 0, failed: 1, coversToday: 2,
+      totalByUnit: { token: 0, credit: 200 },
     })
   })
 
@@ -903,6 +961,17 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
 })
 
 describe('model.list / model.setDisabled 端点', () => {
+  /**
+   * ⚠️ 「已失效模型」表是**进程级单例**（`dead-model-store` 的 store / cache 在
+   * 模块作用域），本组用例会写记录。必须在每例之后清干净，否则**残留记录会让
+   * 后续用例的 model.list 多出条目**（表现为「莫名其妙多一个模型」的假失败）。
+   */
+  afterEach(() => {
+    clearDeadModels('buddy')
+    clearDeadModels('cline')
+    clearDeadModels('trae')
+  })
+
   /** 从 connection.fetch.register 捕获到的处理器。 */
   type Handler = (request: Request) => Promise<Response>
 
@@ -1072,11 +1141,12 @@ describe('model.list / model.setDisabled 端点', () => {
     expect(result.ok).toBe(true)
     // 未提供 modelAdapters 时退化为历史行为：hy3 已被适配器过滤掉（桩复刻了
     // 真实过滤），由端点补回列表；补回的条目拿不到原始 name，回退为 id。
+    // ⚠️ `dead` 恒存在（缺失即 false，客户端据它渲染「重新显示」入口）。
     expect(result.value).toEqual({
       models: [
-        { id: 'glm-5.2', name: 'GLM-5.2', disabled: false },
-        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', disabled: false },
-        { id: 'hy3', name: 'hy3', disabled: true },
+        { id: 'glm-5.2', name: 'GLM-5.2', disabled: false, dead: false },
+        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', disabled: false, dead: false },
+        { id: 'hy3', name: 'hy3', disabled: true, dead: false },
       ],
     })
   })
@@ -1149,6 +1219,84 @@ describe('model.list / model.setDisabled 端点', () => {
     const reopenedModels = (reopened.value as { models: Array<{ id: string; disabled: boolean }> }).models
     expect(reopenedModels.map(m => m.id)).toEqual(['glm-5.2', 'deepseek-v4-flash', 'hy3'])
     expect(reopenedModels.every(m => !m.disabled)).toBe(true)
+  })
+
+  // ── 「已失效模型」的可见性与恢复（2026-10-06 复审 !66）──────────────────
+
+  /**
+   * ⚠️⚠️ 致命回归（复审 !66 实测确认）：适配器把已失效模型从目录里剔除后，
+   * 它既不在 `listAllModels` 的结果里、也不在 `disabledMap` 里 ⇒ 上面两条
+   * 补回路径都救不回它 ⇒ **模型从设置页彻底消失，连开关都摸不着**。
+   *
+   * 而失效记录**不会**被「再成功一次」清掉（模型选不到 ⇒ 不可能再成功），
+   * 唯一自愈路径是 30 天 TTL 或用户手动恢复 ⇒ 一次误判 = 该模型被永久隐藏。
+   *
+   * ⇒ 断言：失效模型必须**仍出现在 `model.list` 里**且带 `dead: true`。
+   */
+  it('★ 已失效模型仍出现在 model.list 且带 dead: true（否则用户无法恢复）', async () => {
+    const catalog = [{ id: 'ok-model', name: 'OK' }]
+    const { call } = registerEndpoints({
+      // 适配器侧已把失效模型剔除（这正是 withDeadModelPruning 的行为）
+      models: catalog,
+      modelAdapters: { cline: { listAllModels: () => catalog } },
+    })
+    recordDeadModel('cline', 'gone-model', 'cline: model not found')
+
+    const result = await call('model.list', { provider: 'cline' })
+    expect(result.ok).toBe(true)
+    const models = (result.value as { models: Array<{ id: string; name: string; dead: boolean }> }).models
+    const gone = models.find(m => m.id === 'gone-model')
+    expect(gone, '失效模型必须仍出现在设置页，否则用户无法恢复').toBeDefined()
+    expect(gone!.dead).toBe(true)
+    // 正常模型不受影响，且 dead 为 false（恒存在，不省略）。
+    expect(models.find(m => m.id === 'ok-model')?.dead).toBe(false)
+  })
+
+  it('model.clearDead 移除指定模型后 dead 标记消失', async () => {
+    const catalog = [{ id: 'ok-model', name: 'OK' }]
+    const { call } = registerEndpoints({
+      models: catalog,
+      modelAdapters: { cline: { listAllModels: () => catalog } },
+    })
+    recordDeadModel('cline', 'gone-model', 'cline: model not found')
+
+    const restored = await call('model.clearDead', { provider: 'cline', modelId: 'gone-model' })
+    expect(restored.ok).toBe(true)
+    expect((restored.value as { deadModels: string[] }).deadModels).toEqual([])
+    expect(deadModelIdsFor('cline').has('gone-model')).toBe(false)
+  })
+
+  it('model.clearDead 省略 modelId 时清空该 provider 全部（批量恢复）', async () => {
+    const { call } = registerEndpoints({ models: MODELS })
+    recordDeadModel('buddy', 'a-gone', 'x')
+    recordDeadModel('buddy', 'b-gone', 'x')
+
+    const result = await call('model.clearDead', { provider: 'buddy' })
+    expect(result.ok).toBe(true)
+    expect(deadModelIdsFor('buddy').size).toBe(0)
+  })
+
+  it('model.clearDead 不动黑名单（失效记录与用户开关必须分开清）', async () => {
+    const { call } = registerEndpoints({ models: MODELS, disabledModels: { buddy: { 'glm-5.2': true } } })
+    recordDeadModel('buddy', 'a-gone', 'x')
+
+    await call('model.clearDead', { provider: 'buddy', modelId: 'a-gone' })
+    // 用户自己关的 glm-5.2 必须仍然是关的 —— 「恢复」不等于「打开」。
+    const after = await call('model.list', { provider: 'buddy' })
+    const models = (after.value as { models: Array<{ id: string; disabled: boolean }> }).models
+    expect(models.find(m => m.id === 'glm-5.2')?.disabled).toBe(true)
+  })
+
+  it('model.clearDead 参数非法一律 bad-request（modelId 空串不得清空全表）', async () => {
+    const { call } = registerEndpoints({ models: MODELS })
+    recordDeadModel('buddy', 'keep-me', 'x')
+
+    for (const payload of [{}, { provider: '' }, { provider: 'buddy', modelId: '' }, { provider: 'buddy', modelId: 42 }]) {
+      const result = await call('model.clearDead', payload)
+      expect(result.ok, JSON.stringify(payload)).toBe(false)
+    }
+    // 非法调用**不得**误清记录。
+    expect(deadModelIdsFor('buddy').has('keep-me')).toBe(true)
   })
 
   /**
@@ -1812,6 +1960,7 @@ describe('积分端点的 provider 能力边界', () => {
     expect(result.ok).toBe(true)
     expect((result.value as { summary: unknown }).summary).toEqual({
       claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
+      totalByUnit: { token: 0, credit: 0 },
     })
   })
 

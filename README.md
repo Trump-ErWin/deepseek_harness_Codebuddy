@@ -71,6 +71,8 @@ Authorization: Bearer <网关 API Key>
 
 设置页里的开关状态存在 `$DSH_HOME/jet-hub/state.json` 的 `gatewayEnabled` 字段（缺省为启用）。它**不进**账号备份/恢复 —— 恢复一份旧备份不会顺手改变你本机的网关开关。
 
+「供应商开关」弹窗里**拖动行**排出来的显示顺序存在同一文档的 `providerOrder` 字段（缺省为 `[]`，即按声明顺序）。同样是纯展示偏好：插件更新只替换包目录、不触碰该文档，顺序不会丢；把它删掉也只是回到默认顺序，重拖一次即可。已关闭的供应商恒按默认顺序沉在底部，**不参与**拖拽 —— 重新打开某个曾排序过的供应商，它会回到你当时给它排的位置。
+
 ### 拿到地址与密钥
 
 两者都在 **Jet Hub 设置页 → 页头「网关」按钮**里：
@@ -554,6 +556,38 @@ Tokens 福利）。
 ⚠️ 自动续跑依赖宿主的 agent 服务（`ctx.agents`）。在**没有 agent 循环**的 profile
 （纯 `ctx.llm` 的脚本）里这一功能整体不生效，其余能力不受影响。
 
+## Token 用量（Jet Hub 页头「Token 用量」按钮）
+
+本插件在**每次模型请求结束时**记录 token 用量（记账点在注册收敛层，一处覆盖全部
+provider；渠道由网关打标区分）。数据分**两份**，答的是不同的问题：
+
+| 数据 | 来源 | 回答的问题 | 重启后 |
+|---|---|---|---|
+| **实时明细 + 汇总树** | 进程内存（上限 500 条） | 「每一笔长什么样、这次会话花了多少」 | 清空 |
+| **历史日聚合** | `~/.dsh/jet-hub/token-ledger.json` | 「本周/本月用了多少」 | **保留**（按 UTC+8 日界，保留 90 天） |
+
+弹窗自上而下三块：
+
+1. **历史用量**：今日 / 近 7 天 / 近 30 天 / 全部 切换 + 每日柱状趋势图
+   （点击某天下钻到该日的 渠道 → 供应商 → 账号 → 模型 聚合树）；
+2. **实时汇总**：渠道（直连 / 网关）→ 供应商 → 账号 → 模型 四级树，各级带合计；
+   账号层只在多账号（或含「未归属」）时展开；
+3. **明细表**：时间 | 渠道 | 模型 | TOKEN | 首字 | 速率 | 耗时。
+
+### 记账口径
+
+- **计数是 wire 口径**：上游 usage 报什么记什么，不做本地 tokenizer 估算。
+- **维度**：渠道（`direct` = DSH 宿主对话 / `gateway` = OpenAI 兼容网关）、
+  供应商、账号、模型。账号归属以「凭据解析的起点账号」为准 —— 单账号精确，
+  多账号流内换号为近似（详见 `src/token-ledger.ts` 的 `reportedAccounts` 注释）。
+- **`—` 与 0 严格区分**：没收到 usage（失败 / 中断 / 秒回空）显示 `—`，
+  给 0 会被读成「瞬间完成、没花 token」。
+- **首字用时（TTFT）**：收到任何一块（含思考增量）的时刻 − 请求发起；
+- **输出速率（tok/s）**：官方口径 —— 分子 = 全部输出 token（含思考），
+  分母 = 全程 − 首块；不可测时省略。
+- **均值**：只对有实测值的请求平均；父级小计按**全部样本**的 Σ/份数计算，
+  不是「子级均值的均值」（3×100ms + 1×500ms = 180ms，先平均再平均会错成 300ms）。
+
 ## 用量徽标（模型选择器旁那枚胶囊）
 
 会话输入区右侧、模型选择器左边有一枚薄胶囊，显示**当前渠道一共有多少可用额度**；
@@ -625,6 +659,113 @@ Cline • 5积分
 >
 > ⚠️ **不要改写 `CreditPackage.unit` 本身**：那里要保留服务端原值（设置页逐包明细
 > 依赖它）。归一化只发生在「当分组键 / 当展示名」的那一步。
+
+### 一键签到：**按单位分列**，不跨量纲求和
+
+签到结果的汇总**不把不同单位的额度加成一个数**。ZCode 的额度单位是 **token**、
+其余渠道是**积分**，两者不可折算，故分列显示：
+
+```
+一键签到：ZCode（智谱） +100.00MToken，CodeArts（华为云） +100积分（共 +100.00MToken, +100积分）
+```
+
+> ⚠️ **2026-10-04 的真实报障**：用户看到的是
+> `ZCode（智谱）+100000000（共 +100000100）` —— 1 亿 token 被显示成 1 亿**积分**，
+> 而且与另一渠道的 100 积分**加在了一起**。
+>
+> **根因不在文案，而在数据模型**：宿主汇总的 `totalCredit` 是**跨单位求和的标量**，
+> 单位信息在汇总那一层就丢了。下游拿到的是一个裸数字，无论怎么写文案都只能标一个
+> 「积分」。故修法是**让单位跟着数字一起走**（新增 `totalByUnit` 分桶），
+> 把「怎么显示」推迟到渲染层。
+>
+> **四条口径**：
+>
+> | 规则 | 为什么 |
+> |---|---|
+> | `totalCredit` 保留但**展示路径不得使用** | 它是既有契约，且对**单一单位**的渠道（其余 11 个）完全正确 |
+> | 宿主与客户端两份格式化**必须逐字等价** | 客户端 bundle 不能 import 宿主代码，只能各写一份；不锁死会让同一轮签到在两个界面显示成两种写法 |
+> | 每个单位**各带一个 `+`** | 整段共用会渲染成 `+100MToken, 100积分`，第二个单位看起来像「不是本次领到的」 |
+> | 顺序固定 `token` → `credit` | 不依赖对象键序，渲染稳定 |
+>
+> ⚠️ **积分不压缩、token 才压缩**：积分余额的现实量级是 `123456.78`（IDE 顶部就是
+> 这个精度），压成 `123.46K` 会让用户无法与官方界面核对；而 token 动辄上亿，
+> 不压缩读不出量级。数值与单位之间**不留空格**（`100.00MToken`），与本仓库既有的
+> 徽标展示惯例一致。
+>
+> ⚠️ **旧响应兼容**：`totalByUnit` 缺失时回落到「全部按积分」，行为与改动前一致
+>（兜底发生在**逐渠道累加**那一跳，不是汇总行）。
+>
+> 回归用例 `tests/unit/claim-unit-parity.spec.ts`（含「用户给出的期望文案逐字成立」
+> 与「宿主/客户端逐项等价」）；反向验证 8 条变异全部杀死。
+
+#### ⚠️ `+` 在函数内部 ⇒ **调用点不得再拼**（2026-10-05 复审补）
+
+`formatClaimGains` 的返回值**自带**每个单位的 `+`（`+100.00MToken, +100积分`），
+而客户端 4 个调用点首版又各拼了一次，渲染出**双加号**：
+
+```
+++100.00MToken                       ← 逐渠道行
+（共 ++100.00MToken, +100积分）       ← 汇总行
+```
+
+⚠️ **全量 5448 条单测全绿也没抓到它**：纯函数级用例测的是「函数的输出」，
+而 bug 在「函数的**使用**」上 —— `claim-unit-parity.spec.ts` 只 import 纯函数、
+从不看调用点，结构上不可能发现。
+
+⇒ 故新增 `tests/unit/claim-unit-callsites.spec.ts`（16 条）守**调用点契约**：
+
+| 不变量 | 说明 |
+|---|---|
+| 正向锚点 + 反向断言**成对写** | 每条 `not.toMatch` 都配 `toMatch`，否则锚点形态不存在时反向断言**恒真** |
+| 断言前**剥掉整行注释** | 注释里会逐字引用曾经的错误写法，不剥则断言被注释自己命中 |
+| 断言一律**单行** | 本仓库源码是 CRLF，跨行锚点会命中 0 次被静默跳过 |
+| 覆盖 6 个调用点 + 2 处空格口径 | 含**元测试**证明断言非恒真（把错误形态喂给同一正则必须命中） |
+
+反向验证 `scripts/mutate-claim-unit-callsites.mjs`：**9/9 全部杀死、0 跳过**。
+
+⚠️ **同时统一了空格口径**：逐账号明细与徽标余额行原写作 `+100.00M Token`（带空格），
+与汇总行的 `+100.00MToken` 并列时像两种单位 —— 现一律**不留空格**。
+
+#### ⚠️ 第三处同型缺陷：徽标浮层的「积分区」节标题
+
+同一批审计还找出第三处「展示路径写死『积分』」—— 它在**用量徽标浮层的节标题**：
+
+```js
+// 修复前（usage-badge.js）
+quotaGroup === undefined ? '积分' : unitLabel(quotaGroup.unit)
+//                        ^^^^^^ 兜底分支假定「非配额渠道都是积分」
+```
+
+**ZCode 的额度单位是 token**（`src/jet-hub-rpc.ts` 的 zcode 分支如实标
+`unit: 'token'`），于是浮层渲染成自相矛盾的一屏：
+
+```
+积分                             ← 节标题（写死）
+  ZCode 旅行者6665  94.54MToken   ← 同一屏的数值（按单位走）
+```
+
+⚠️ 它此前没被发现，是因为**只在「该渠道只发 token」时才显形** ——
+12 个渠道里只有 ZCode 是这种形状。
+
+修法：判据抽成纯函数 `creditSectionLabel(groups)`（`plugin-src/client/badge-model.js`），
+有配额组用其标签（`'额度'`），否则用**第一个**单位的标签
+（`creditGroupsOf` 已按 `unit` 排序 ⇒ 结果确定，不依赖对象键序）。
+
+⚠️⚠️ **这处还带出一个方法论教训：纯函数级用例测不出「组件不调用它」。**
+`badge-model.spec.ts` 为它加了 6 条用例，但都**只 import 纯函数** ——
+若有人把组件改回内联三元，那 6 条**依然全绿**（实测确认）。故调用点契约文件里
+**额外**加了两条源码级断言：组件**必须**调用 `creditSectionLabel(`、
+**不得**再出现 `=== undefined ? '积分' : unitLabel(` 形态。
+
+⚠️ **顺带修掉一条长期空转的断言**：`zcode-claim-amount.spec.ts` 里
+`not.toMatch(/个账号领取成功（\+\$\{summary\.totalCredit\}/)` 的锚点
+在 `jet-hub.js` 里**从未存在过**（真实代码是 `（共 +${totalCredit} 积分）`，
+没有那个前缀）⇒ 修复前后都命中 0 次，等于空转。现已换成真实存在过的两种形态，
+并配正向锚点。
+
+⚠️ **教训**：同一个格式化函数有 **N 个手写调用点**，就是 N 次重犯机会 ——
+函数内部已保证的东西（`+`、单位名、空格）不要让调用点各自拼一半；
+**展示路径上一律不得写死「积分」**。
 
 ### 账号多了以后：胶囊不变量 + 浮层收纳
 
@@ -741,10 +882,23 @@ data:{"error_code":"InferHub.4291.200","error_msg":"insufficient quota", …}
 - 旧 ticket 流程保留为显式回退：编程式调用
   `ctx.codeartsAuth.login({ flow: 'ticket' })`。ticket 凭据没有 `refresh_token`，
   其续期仍意味着重新运行浏览器登录流程。
-- **续期按账号**：`refreshAccountCredential(refName)`（账号卡片的「刷新」按钮）
-  与 `refreshAll(pool)`（定时调度器）。早期的 `refresh()` / `logout()` /
+- **续期按账号**：`refreshAccountCredential(refName, pool?, accountId?)` 与
+  `refreshAll(pool)`（定时调度器）。早期的 `refresh()` / `logout()` /
   `status()` / `scheduleRefresh()` / `scheduleModelRefresh()` 只服务于单凭据路径，
   已随该模式一并移除。
+  ⚠️ **账号卡片上并没有「刷新」按钮**（按钮是 测试/重测/重置/停用/代理/指纹/删除）。
+  `refreshAccountCredential` 的两个调用方是 ① RPC `account.refresh`
+  —— **仓库内零生产调用方**（`plugin-src/client/jet-hub.js` 的 42 处 `rpcCall(`
+  里没有它，另两处 `rpcCall(变量)` 的实参只有 `opencode.*` 四个方法；调用方是
+  仓库外的脚本/手工 RPC，issue IKJOZA 取证），与 ② 定时调度器。
+  ⚠️ 经 RPC 调用时**必须**传 `pool` + `entry.id`（`src/jet-hub-rpc.ts` 的
+  `account.refresh` switch 内每个 case 都这么传，`tests/unit/refresh-bootstrap-wiring.spec.ts`
+  逐 case 扫这条不变式），否则续期后的 `expiresAt` 不回写账号池 —— 凭据续好了而
+  UI 一直显示「已过期」（issue IKIRTT）。
+  ⚠️ **端点契约**（issue IKJOZA）：成功回 `{ok:true, value:{success:true}}`；失败回
+  `{ok:false, error:{code:'bad-request', message:<原异常文案>}}`。
+  此前失败被包成 `ok:true` + `value.success:false`，而客户端 `unwrapRpcResult` 只判 `ok`
+  —— 只判 `ok` 的调用方会把失败读成成功。**判失败只看顶层 `ok`。**
 - 运行时依赖新增 `jose`（用于 DPoP JWS 签发，与 CodeArts Agent 插件实现一致）。
 
 ### ⚠️ 停用的账号同样会被续期
@@ -1947,10 +2101,27 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
   的用法），**一次拉取多个「通道」（`function`）各自一套模型目录**；失败时回退
   `src/trae-product.ts` 的 32 个内置模型。
 - ⚠️ **模型只在列出它的通道里可调用**。实测：`glm-5.1` 在 `solo_agent_remote`
-  正常、在 `solo_work_lite` 回流内 `4001`；`glm-5-turbo` / `sagitta` 恰好相反。
-  因此插件会**按每个模型所属通道分别下发 `function`** —— 旧实现把 `function`
-  写死 `solo_work_lite`，agent 专有模型一用就报
-  `trae: We're sorry, the param is invalid. (code=4001)`。
+  正常、在 `solo_work_lite` 回流内 `4001`。因此插件会**按每个模型所属通道分别
+  下发 `function`** —— 旧实现把 `function` 写死 `solo_work_lite`，agent 专有模型
+  一用就报 `trae: We're sorry, the param is invalid. (code=4001)`。
+- ⚠️ **通道表同时是「可调用白名单」，不只是排序表**（Issue IKJOZ7）。上游下发的
+  22 个 `function` 里**只有一部分**在本插件的推理端点下真正可用 —— 实测
+  `chat` 回 `4023 the model is unknown`、`builder` 回 `4001 param is invalid`、
+  `inline_chat` 回 `3003 model service is unavailable`。此前实现「目录声明了什么
+  通道就照着发什么通道」，于是 38 条目录里 **19 条（50%）** 带着不可调用的通道，
+  用户一选中就失败，而报错文案指向**模型**、极易误判成「这个模型坏了」。
+  现在非白名单通道的条目在解析时**整组剔除**。逐通道实测可调用的 15 个：
+  `solo_agent` / `solo_work_lite` / `solo_agent_remote` / `solo_work_remote` /
+  `solo_agent_lite` / `solo_design_lite` / `solo_design_remote` / `solo_coder` /
+  `chat_v3` / `builder_v3` / `git_ai` / `code_reviewer` / `code_review_summary` /
+  `multimodal` / `system_diagnosis`（可用 `DSH_TRAE_CHANNELS` 覆盖，⚠️ 覆盖的是
+  整张白名单）。
+  ⚠️ **剔除 vs 纠正通道要分清**：`glm-5.1` / `DeepSeek-V4-Flash` / `qwen-3.5` 等
+  同时也在可调用通道里，故它们**不消失**，只是通道被纠正（如 `glm-5.1`：
+  `chat` → `solo_coder`）⇒ 从「必然失败」变成「可用」；**只有**「仅见于不可调用
+  通道」的条目才会被剔除（实测 38 → 36 条，被剔除的是 `doubao_1_8` / `kimi-k2`）。
+  ⚠️ **`glm-5.1` 现在走 `solo_coder`**，旧文档里「走 `solo_agent_remote`」已过期
+  （它在 `solo_agent*` 里全是 `is_invisible_to_user: true`，被既有硬过滤挡掉）。
 - ⚠️ **两种「不可用」要分开看**：
   - `display_config.is_custom_model === true`（需在 IDE 内自行绑定供应商）
     → **必然 4001，插件剔除**。实测 2026-09-19 该账号有 5 个，但**该名单已过期**
@@ -1958,6 +2129,7 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
     —— 判据是**标志的值**而非模型名，别把某一刻的快照写成规则。
   - `is_invisible_to_user === true`（**官方 picker 不展示**）→ **硬性剔除**，
     使目录与官方 Auto Mode 选择器一致（代价是看不到 `glm-5.1` 等可调用模型）。
+  - `function` 不在可调用白名单内（见上）→ **整组剔除**。
   - 若仍选中了不可调用的模型（如会话里持久化的旧 id），报错文案会直接点明
     「模型不被上游接受」，而不是让人去查参数格式。
 - **远端参数会被消费**：`context_window_tokens.dev` → 上下文窗口
@@ -2040,16 +2212,23 @@ Cline 的免费模型由远端 `GET /api/v1/ai/cline/recommended-models` 的 **`
 ```
 Space Bunny Alpha · 免费
 MiMo-V2.6-Flash · 免费
-DeepSeek V4.1 Flash · 免费
-Gemini 3.8 Flash · 免费
 Muse Spark 1.3 Contributor · 免费
 ```
+
+⚠️ **兜底表是编译期快照，上游撤掉某个免费模型时它不会自己跟着变** ——
+而陈旧条目会让用户看到一个标着「免费」的模型、选中却回
+`404 {"error":"model not found"}`。已经发生过两次：`gemini-3.8-flash`
+（2026-10-03）、`deepseek-v4.1-flash`（2026-10-05）。
+
+为此 `mergeClineModels` **只在远端不可用时**整表兜底；远端成功下发目录时，
+它会丢弃「远端已不认识」的兜底条目（**在线状态下不会把下架模型复活**）。
+判定「某个兜底免费模型是否已被上游下架」用 `pnpm test:e2e:cline`（只读、零额度）。
 
 ⚠️ **免费与付费是两组不同的模型 id**，不是同一模型的两种档位：
 
 | 免费（`free` 数组下发） | 按量计费（同名前缀不同） |
 |---|---|
-| `cline-free/deepseek-v4.1-flash` | `deepseek/deepseek-v4.1-flash` |
+| `cline-free/mimo-v2.6-flash` | `xiaomi/mimo-v2.6-flash` |
 
 插件的判定基于**完整 id**（远端 `free` 集合 ∪ `:free` 后缀 ∪ `cline-free/`
 前缀 ∪ 静态兜底），**不做名字模糊匹配** —— 否则会把付费条目误标为免费，
@@ -2228,7 +2407,7 @@ pnpm build:client                                      # 改完必须重建
 
 ```
 pnpm test:e2e:cline        # 只读：凭据/前缀证据/余额/免费集合，零 token 消耗
-pnpm test:e2e:cline-chat   # ⚠️ 发一次推理：默认只发 cline-free/deepseek-v4.1-flash
+pnpm test:e2e:cline-chat   # ⚠️ 发一次推理：默认只发 cline-free/mimo-v2.6-flash
 ```
 
 ⚠️ 推理探针**默认只请求一个免费模型**。其余免费模型需显式设置
@@ -3241,13 +3420,46 @@ ZCode 免费通道**只认 Anthropic Messages**（实测 `zcode-plan` 下的
    下一轮按「工具名 + 规范化参数」回填，否则多轮工具调用必被上游拒。落盘位置是
    `$DSH_HOME/jet-hub/gemini-sigs.json`（**独立文件**，不放 `state.json` —— 那是整体
    替换语义，会被别的写入覆盖掉）。签名被拒时做**一次去签重试**兜底。
-4. **`project` 与 `sessionId` 是预置常量、禁止随机化** —— `project` 恒为
-   `"aicode-consumers"`；真实推理的 `sessionId` 恒为 `3124275334370613369`，
-   冒烟（面板连通测试）恒为 `-6686302828062879362`（**负数**，两串不同不能混用）。
-   只有 `requestId = agent/<unix_ms>/<8hex>` 是每请求随机的。
-   ⚠️ 上游的会话归并与额度统计挂在这两个串上，改成随机会让服务端认不出是同一会话，
-   **`thoughtSignature` 回填会断**。
-5. **模型名是准入键** —— 裸 `gemini-3.8-flash` 直接 404，**档位后缀必需**
+4. **`project` 自动探测、`sessionId` 内容派生 + 升代自愈** —— `project` **不是恒值**：
+   启动时探 `loadCodeAssist` 的 `cloudaicompanionProject`，`aicode-consumers` 只是
+   探测**为空**时的兜底（免费档常态）。三级缓存：进程内 → 凭据字段 → 现探。
+   ⚠️ **探测失败 ≠ 探测到空**：失败（网络/非 2xx）时**不发推理**，与原版一致
+   （注入 500 实测：原版只在端点间重试 LCA + quota）。详见 `src/gemini-project.ts`。
+   `sessionId` 由 `(project, 首条 user 文本, lane)` **确定性派生**
+   （`deriveGeminiSessionId`）：同一对话内稳定（保住上游 prompt cache 命中），
+   不同对话隔离；推理与冒烟用不同 lane。只有 `requestId = agent/<unix_ms>/<8hex>`
+   是每请求随机的。
+   ⚠️ 2026-10-05 更正：此处此前写"`project` 与 `sessionId` 都是预置常量"。
+   真机对照实验证明 sessionId 的两个"常量"只是**特定输入的输出**。把它写死会让
+   所有用户、所有对话共用一个会话，而原版的会话归并与 **`thoughtSignature` 回填**
+   都挂在这个字段上 —— 共用的后果是它们全部错乱。
+   注意：原版哈希本体未反推出来，故 sessionId 取值**不与原版逐字相同**，
+   对齐的是依赖维度。
+5. **会话升代自愈（1M 累计超限）** —— 上游按 `sessionId` 在**服务端**累计对话输入；
+   长工具循环会把累计推过 1M，此后该 sessionId 的**每个**请求都 400
+   `The input token count exceeds the maximum number of tokens allowed 1048576`，
+   直到该服务端会话过期 —— 即**对话永久卡死**。削本地历史没用（累计在服务端、按
+   sessionId 计），唯一出路是**升代换一个全新 sessionId**（`deriveGeminiSessionId` 的
+   `generation` 入参）。判据与语义抄自 `Antigravity-Manager` 的 `[FIX session-1M]`，
+   wb 独立实现同一机制（`SessionOverflowBump`）。**升代有界**（一次请求最多一代），
+   显式钉住 `sessionId` 时不升代。
+6. **上下文超限归 `CONTEXT_WINDOW_EXCEEDED`（触发自动压缩）** —— 上游回
+   `The input token count (N) exceeds the maximum number of tokens allowed (M)` 时，
+   ⚠️ **harness 的 `isContextWindowExceededError` 认不出这句话**（它要求出现
+   `context` 字样，而这句一个都没有 —— 与 `buddy-adapter.ts` 当年漏判
+   「prompt is too long」是同一类缺陷），故本仓库补了一条专属判据。
+   归成 `INVALID_REQUEST` 的后果**不对称**：`dsh-compaction-basic` 的 listener
+   第一行就是 `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()`
+   ⇒ 连一次压缩的机会都没有，长会话越过窗口后每轮报废。
+   处置是**升级式**的：先升代（便宜），升过仍失败才归溢出交 harness 压缩。
+7. **请求体上限发送前真检查** —— `GEMINI_MAX_REQUEST_BODY_BYTES`（64MB）此前
+   **定义了但全仓零引用**（看着有防护，实际没有），现已接上，超限同样归
+   `CONTEXT_WINDOW_EXCEEDED` 而不是死路 `INVALID_REQUEST`。
+8. **签名 miss 按工具名兜底** —— 精确键吃逐字参数，长任务里参数漂移（路径/
+   时间戳变化）是必然事件。miss 时回退取**该工具名最近一次**签名，避免走去签
+   重试丢掉整条思考链。工具名随条目一起持久化（键是 sha256 不可逆，不存名字
+   无法重建索引）。
+9. **模型名是准入键** —— 裸 `gemini-3.8-flash` 直接 404，**档位后缀必需**
    （`-low` / `-medium` / `-high` / `-tiered`）。`modelId` 走**严格校验**：
    不在静态表里就抛错（此前写错模型名会**静默跑 3.8**）。
 

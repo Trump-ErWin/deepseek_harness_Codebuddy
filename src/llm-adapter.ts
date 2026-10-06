@@ -18,6 +18,7 @@ import type { CodeArtsCredential } from './types.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
+import { reportLedgerAccount } from './token-ledger.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
 export const PROVIDER = 'codearts'
@@ -1042,6 +1043,8 @@ export class CodeArtsAdapter extends LlmAdapter {
       } catch (error) {
         console.warn('[codearts] 账号匹配失败（不影响本次请求）:', error)
       }
+      // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+      if (currentAccountId) reportLedgerAccount(PROVIDER, currentAccountId)
     }
 
     const messages = serializeMessages(options.messages)
@@ -2106,6 +2109,94 @@ const RATE_LIMIT_BUSINESS_CODE = 6004
  */
 const RATE_LIMIT_PATTERN =
   /频率限制|频率超出|使用量已超出|重置|rate.?limit|frequency limit|usage exceeds|too many requests/i
+
+/**
+ * 腾讯网关「**模型饱和**」业务码（HTTP 429）。
+ *
+ * ## 它必须与额度限流（6004）分开（真实报障，2026-10-05）
+ *
+ * 用户第一次用 `buddy/space-bunny` 就报「模型 space-bunny 所有账号均受限」。
+ * 直连实测（`scripts/probe-buddy-error-catalog.mjs`）逼出了服务端原话：
+ * ```json
+ * {"code":14003,"msg":"too many requests",
+ *  "displayMsg":{"zh":"模型繁忙，请换模型或稍后重试"},
+ *  "displayTips":{"zh":"这个模型当前请求量饱和，与你的网络无关。请换个模型，或稍等一会儿再重试。"},
+ *  "actions":["SWITCH_MODEL","SUBMIT_FEEDBACK","RETRY"]}
+ * ```
+ *
+ * ⚠️ **它自己就说明了「这不是账号问题」**（注意 `actions` 里根本没有换号的选项，
+ * 只有 `SWITCH_MODEL`）。但 `isRateLimited` 对 **429 无条件返回 true** ⇒
+ * 适配器把每个账号都写上「1 小时限流」标记（报文无「将在…重置」，
+ * 故取 `RATE_LIMIT_FALLBACK_MS` 兜底）⇒ 4 个独立账号在 20 秒内**全部**被锁
+ * ⇒ 用户等到 1 小时也不能用，且**期间连别的模型都受影响**（同一个账号池）。
+ *
+ * 实测证据（同型缺陷的判据来源）：
+ * | 观测 | 结果 |
+ * |---|---|
+ * | 4 个不同腾讯 uid 的账号 | 20 秒内**全部**被标记 `space-bunny` |
+ * | 标记解禁时刻 | 全部等于「写入 + 整 1 小时」= 兜底值，**非**服务端给的时刻 |
+ * | 4 MB 输入 | 稳定逼出 `429 / 14003`（46~111 秒才返回） |
+ * | 小请求 30 发 | 全 200，但耗时 841ms ~ 216s —— 上游是**时变**背压 |
+ *
+ * ⇒ 「4 个互不相干的账号同时中招」在账号级限流下无法解释，**只能**是模型级。
+ * 与 zcode `3009 model concurrency limit exceeded` 同型（那边结论同样是
+ * 「退避重试，**不换号、不标记**」）。
+ *
+ * ⚠️ **不许把 14003 并进 `RATE_LIMIT_BUSINESS_CODE`**：两者的正确动作相反 ——
+ * 6004 是「这个账号在这模型上的额度用完了」（换号有效、必须标记）；
+ * 14003 是「这个模型此刻整体饱和」（换号**无益**、**不许**标记）。
+ */
+export const MODEL_SATURATION_BUSINESS_CODE = 14003
+
+/**
+ * 「模型饱和」的**自然语言兜底**判据。
+ *
+ * 与额度限流同理：码值由服务端下发，本地产物里没有硬编码
+ * （实测搜 `14003` 在本仓库源码中零命中才敢新增），上游可能改用别的码值表达
+ * 同一语义，故需要文案兜底。
+ *
+ * ⚠️ **关键词必须窄**：`busy` / `saturated` 这种泛词若不加限定，
+ * 模型正文里恰好讨论「服务器繁忙」就会被误判。这里只认腾讯原话里的组合，
+ * 且判据本身**要求 HTTP 状态码 ≥ 400**（见 {@link isModelSaturationError}）。
+ */
+const MODEL_SATURATION_PATTERN = /模型繁忙|请求量饱和|model\s+busy|currently\s+saturated/i
+
+/**
+ * 判断一次失败是否为**模型饱和**（上游背压），而非账号级额度限流。
+ *
+ * ## 为什么这个区分是**行为分叉**而不是措辞问题
+ *
+ * | | 额度限流 `6004` | 模型饱和 `14003` |
+ * |---|---|---|
+ * | 语义 | 该**账号**在该模型上额度用完 | 该**模型**此刻整体饱和 |
+ * | 换号 | **有效**（别的账号有独立额度） | **无益**（所有账号撞同一堵墙） |
+ * | 写限流标记 | **必须**（否则每轮重撞） | **绝对不许**（会把整池锁 1 小时） |
+ * | 建议 | 等解禁 / 换账号 | **换模型** / 稍后重试 |
+ *
+ * 实测 `actions` 字段本身就写着 `SWITCH_MODEL` 而**没有**换号选项 ——
+ * 服务端与我们的结论一致。
+ *
+ * ⚠️ **必须先于 `status === 429` 的无条件判定**：14003 恰恰是 429，
+ * 若先判状态码就永远走不到这里（这正是缺陷的成因，见常量注释）。
+ *
+ * @param status - HTTP 状态码。为 `undefined`（只有文案可判）时仍检查业务码；
+ *   但**文案分支要求状态码 ≥ 400** —— 否则一段正常正文里出现「模型繁忙」
+ *   就会被判成错误。
+ * @param body - 响应体（可能为空串）。
+ */
+export function isModelSaturationError(status: number | undefined, body: string): boolean {
+  // 状态码已知且 < 400 ⇒ 这是正常响应，正文里的字样不算错误。
+  if (typeof status === 'number' && status < 400) return false
+  if (body.length === 0) return false
+  try {
+    const code = (JSON.parse(body) as Record<string, unknown>).code
+    if (code === MODEL_SATURATION_BUSINESS_CODE
+      || code === String(MODEL_SATURATION_BUSINESS_CODE)) return true
+  } catch {
+    // 非 JSON：交给文案兜底。
+  }
+  return MODEL_SATURATION_PATTERN.test(body)
+}
 
 /**
  * 结构化判定：响应体是可解析 JSON 且 `code` 为该业务码。
