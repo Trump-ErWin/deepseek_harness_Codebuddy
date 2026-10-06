@@ -105,8 +105,11 @@ describe('选号器泛型化后对两家的实际行为', () => {
    * ⚠️ 下面这个 `for` 循环**不是** provider 特定的：两家用的是同一个假 product
    * `{ id: label }` 与同一种假凭据，测的只是「泛型后的编排对任意 provider 成立」
    * （把同一段逻辑跑两遍、换了标题）。它对 TRAE 与 LobsterAI 的**差异零覆盖** ——
-   * 真正的差异在「各自的 fetchBalance 把真实响应形状归一化成什么」，
-   * 由本 describe 末尾的 `真实 fetchBalance 链路` 一节覆盖。
+   * 已实测：删掉两家的 `getAvailableAccount(..., picked.tried)`、删掉
+   * `reportLedgerAccount`、不传 `modelId`、串用 `fetchBalance` ……
+   * 这 6 条用例**一条都不会红**。真正的差异由本文件末尾的
+   * `真实 fetchBalance 链路` 一节覆盖，接线正确性由 `buddy-permanent-lock.spec.ts`
+   * 的 `pickCallBlock` 守卫覆盖。
    */
   /** 造一个选择器：余额由固定表给出，凭据解析恒成功。 */
   function makeSelector<TProduct, TCredential extends { token: string }>(
@@ -117,6 +120,11 @@ describe('选号器泛型化后对两家的实际行为', () => {
       product,
       resolveCredential: async (ref) => ({ token: `cred-${ref}` }) as TCredential,
       fetchBalance: async (credential) => balanceById[credential.token.replace('cred-', '')] ?? null,
+      // ⚠️ **必须钉住窗口**（实测：不钉则读真实环境变量，设
+      // `DSH_BUDDY_EXPIRING_WINDOW_DAYS=0` —— 一个*合法*值，见
+      // `buddy-balance-rank.ts` 对 0 的支持 —— 会让这 2 条用例假红）。
+      // 本节 BALANCES 用「3 天 vs 30 天」构造，窗口取 15 天才与断言一致。
+      windowMs: 15 * DAY,
     })
   }
 
