@@ -49,6 +49,25 @@ function pickHelperBody(): string {
   return indexCode.slice(start, end)
 }
 
+/**
+ * 取某个 provider 的 `pickBuddyCredential({ … })` **调用块**原文。
+ *
+ * 起点是紧邻 `product: <PROVIDER>` 之前的那次调用，终点是其闭合的 `})`。
+ * 之所以要定位到「调用块」而不是整文件：接线类断言若只做全文件子串匹配，
+ * 同一标识符在别处（选择器定义、文档注释）出现一次就会让断言恒真 ——
+ * 已实测过这种同义反复（见下方 ★ 用例的注释）。
+ *
+ * @param productVar - `indexCode` 里 `product:` 后面那个变量名（TRAE / LOBSTERAI）。
+ */
+function pickCallBlock(productVar: string): string {
+  const anchor = `const picked = await pickBuddyCredential({\n        product: ${productVar},`
+  const start = indexCode.indexOf(anchor)
+  expect(start, `index.ts 里找不到 ${productVar} 的 pickBuddyCredential 调用`).toBeGreaterThan(-1)
+  const end = indexCode.indexOf('\n      })', start)
+  expect(end, `${productVar} 的调用块没有闭合（接线形状变了要同步改本用例）`).toBeGreaterThan(start)
+  return indexCode.slice(start, end)
+}
+
 describe('index.ts 的接线', () => {
   it('导入选号器与编排函数（漏 import 就等于没接）', () => {
     expect(indexCode).toContain("from './buddy-balance-selector.js'")
@@ -100,8 +119,15 @@ describe('index.ts 的接线', () => {
    * `LobsteraiCredential` 另有字段）—— 用错解析器会静默产出错误形状的凭据。
    */
   it('★ TRAE / LobsterAI 显式传自己的凭据解析器（不得落到 buddy 缺省值）', () => {
-    expect(indexCode).toContain('resolveCredential: resolveTraeCredentialByRef,')
-    expect(indexCode).toContain('resolveCredential: resolveLobsteraiCredentialByRef,')
+    // ⚠️ **必须在「编排调用块」范围内匹配**，不能全文件 `toContain`：
+    // 那两个标识符在选择器定义处（`new BuddyBalanceSelector({ resolveCredential: … }）`）
+    // 本来就各出现一次，于是哪怕把 `pickBuddyCredential` 调用里的那一行删掉、
+    // 让编排静默退回 buddy 缺省值，用例照样绿 —— 已实测复现（反向验证）。
+    // 任何崩不了的实现都能过的用例比没有更危险，故这里取「调用点到闭合」这一段。
+    const traeCall = pickCallBlock('TRAE')
+    expect(traeCall, 'TRAE 的 pickBuddyCredential 调用块').toContain('resolveCredential: resolveTraeCredentialByRef,')
+    const lobsteraiCall = pickCallBlock('LOBSTERAI')
+    expect(lobsteraiCall, 'LobsterAI 的 pickBuddyCredential 调用块').toContain('resolveCredential: resolveLobsteraiCredentialByRef,')
   })
 
   /**
