@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
@@ -516,6 +516,27 @@ describe('BuddyAdapter', () => {
   // 「确认是纯文本模型」把图片静默投影成占位文本（dsh-llm `lib/index.js`
   // 的 projectImagesForTextModel），用户既看不到图也拿不到原因。
   describe('贴图门禁：能力未知时的行为（issue IKJQ3M）', () => {
+    /**
+     * harness 的默认可重试错误码集合，**从 dsh-llm 源码原文里读出来**。
+     *
+     * ⚠️ 不能把字面量写死进断言 —— 那就变成「断言我们自己写下的字符串」，
+     * 属 AGENTS.md 列的同义反复：该常量在 `lib/types/*.d.ts` 里**未导出**，
+     * 只能读源码。宿主若改了集合，这条用例会自动跟随（这才是我们要的）。
+     */
+    const DEFAULT_RETRYABLE_CODES: readonly string[] = (() => {
+      const src = readFileSync(
+        resolve(dirname(fileURLToPath(import.meta.url)), '../../node_modules/@deepseek-ai/dsh-llm/lib/index.js'),
+        'utf8',
+      )
+      const body = /const DEFAULT_RETRYABLE_CODES = Object\.freeze\(\[([\s\S]*?)\]\)/.exec(src)?.[1]
+      if (body === undefined) throw new Error('dsh-llm 未声明 DEFAULT_RETRYABLE_CODES，断言口径失效')
+      // 去掉 `EMPTY_RESPONSE_CODE` 这类引用名，统一取字符串字面量。
+      const codes = [...body.matchAll(/["']([A-Z_]+)["']/g)].map((m) => m[1]!)
+      // `EMPTY_RESPONSE` 由同文件里另一个常量名给出，补上它以免漏判。
+      if (!codes.includes('EMPTY_RESPONSE')) codes.push('EMPTY_RESPONSE')
+      return codes
+    })()
+
     /** 构造一个「远端目录永远拿不到」的适配器，并统计拉取次数。 */
     function makeUnreadyAdapter(options: {
       fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
@@ -550,6 +571,17 @@ describe('BuddyAdapter', () => {
       expect((error as LlmError).code).not.toBe('UNSUPPORTED_CONTENT')
       expect(String((error as LlmError).message)).not.toContain('does not accept image input')
       expect(String((error as LlmError).message)).toContain(UNKNOWN_MODEL)
+
+      // ⚠️⚠️ **错误码绝不能是 `TRANSPORT`**（反向验证时踩过）：
+      // harness 的 `DEFAULT_RETRYABLE_CODES` 是
+      // `['EMPTY_RESPONSE','RATE_LIMIT','SERVER','TIMEOUT','TRANSPORT']`
+      // —— `TRANSPORT` **在里面**（dsh-llm `lib/index.js` 实测），
+      // 于是这条「请稍后重试」会被 harness 白重试 5 次
+      // （500/1000/2000/4000/8000 ms），而每次重试都重走一遍
+      // `stream()` → `refreshCatalog()`，把一次用户报错放大成 6 次目录拉取
+      // ＋6 次凭据解析。方向取反：用**明确不可重试**的码，让用户自己决定
+      // 何时重试（那时目录通常已恢复）。
+      expect(DEFAULT_RETRYABLE_CODES).not.toContain((error as LlmError).code)
     })
 
     it('远端目录未就绪时 resolveModel 不声明 inputModalities（宿主因此不投影图片）', async () => {

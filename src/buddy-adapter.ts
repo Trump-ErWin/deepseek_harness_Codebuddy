@@ -1450,12 +1450,21 @@ export class BuddyAdapter extends LlmAdapter {
         // 图片」，用户会去换模型、查文档，而真正的解法只是等目录就绪。
         // 故用可区分的错误码与文案，别把「不知道」说成「不支持」。
         //
-        // 错误码选 `TRANSPORT`（**不在** harness 的可重试集合里，见
-        // `DEFAULT_RETRYABLE_CODES`），故不会像 `SERVER` 那样白重试 5 次；
-        // 用户重试一轮后目录通常已就绪，能力判定随之恢复。
+        // ⚠️⚠️ **不能用 `TRANSPORT`**（初版误选，被自己的回归用例抓出）：
+        // `DEFAULT_RETRYABLE_CODES` 实测是
+        // `['EMPTY_RESPONSE','RATE_LIMIT','SERVER','TIMEOUT','TRANSPORT']`
+        // —— `TRANSPORT` **就在里面**（dsh-llm `lib/index.js`）。于是这条
+        // 「请稍后重试」会被 harness 白重试 5 次（500/1000/2000/4000/8000 ms），
+        // 每次都重走一遍 `stream()` → `refreshCatalog()`，把一次用户报错放大成
+        // 6 次目录拉取 + 6 次凭据解析（目录端点超时上限 60s，用户还会看到 6 次闪动）。
+        //
+        // ⇒ 方向取反：这类「等一会儿就好」的错误**不该由 harness 自动重试**。
+        // `INVALID_REQUEST` 是仓库既有惯例（见本文件 `classifyHttpStatus`），
+        // 且不在可重试集合里；用户在目录恢复后自己重试即可 ——
+        // 那时 `refreshCatalog` 的 10 秒窗口通常已过，能直接发图。
         throw new LlmError(
           `${this.product.id}: 模型 "${options.model}" 的能力列表尚未加载完成，暂时无法判断是否支持图片；请稍后重试。`,
-          'TRANSPORT',
+          'INVALID_REQUEST',
         )
       }
       if (!modalities.includes('image')) {
