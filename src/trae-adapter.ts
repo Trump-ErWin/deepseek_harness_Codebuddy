@@ -894,6 +894,41 @@ export class TraeAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * 该模型是否**消耗 0 积分**（免费），用于跳过「锁定永久积分」那道门。
+   *
+   * ## 为什么需要它
+   *
+   * 选号编排里 `isFreeModel: true` 会**完全跳过余额分档**：免费模型既不扣临时
+   * 积分也不扣永久积分，与「别把永久积分烧掉」这个保护目标无关。若不跳过，
+   * 用户锁定了永久积分、账号只剩永久积分时，选号会落 `none` 档并抛出
+   * 「积分都已用尽」—— 而他用的模型**根本不扣积分**，报错完全误导
+   * （buddy 系已因此产生过真实报障，见 `index.ts` 的 `isFreeModel` 参数注释）。
+   *
+   * ## 判据
+   *
+   * 远端目录的 `creditsRate`（`readConsumptionRate()` 解析 `display_contact_config`
+   * 里的 `consumption_rate.data.rate`）**等于 0** 即免费。
+   *
+   * ⚠️ **`rate: 0` 是合法值**，不能与「解析不出来」混为一谈（`readConsumptionRate`
+   * 的注释已记这条坑）。展示层同样把它显示为「免费」（见 `traeDisplayName`）。
+   *
+   * ⚠️ **只在确定免费时返回 true**：查不到目录 / 解析失败一律 false ——
+   * 方向保守（宁可多走一次余额门），与 `BuddyAdapter.isFreeModel` 同一约定。
+   *
+   * ⚠️ 远端目录是懒加载的，必须先 `await ensureRemoteModels()`，否则「直接进会话」
+   * 等路径查不到目录，会**静默退回被拦截的行为**。
+   *
+   * @param modelId - 模型 id。
+   * @returns true 仅当能确认该模型消耗 0 积分。
+   */
+  async isFreeModel(modelId: string | undefined): Promise<boolean> {
+    if (typeof modelId !== 'string' || modelId.length === 0) return false
+    await this.ensureRemoteModels()
+    const meta = this.remoteMeta.get(modelId)
+    return meta?.creditsRate === 0
+  }
+
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     // 0. 确保远端目录已加载 —— 发送时要用它决定该模型走哪个通道
     //    （`channelFor`）。`prepareCall` 通常已通过 `resolveModel` 触发过，

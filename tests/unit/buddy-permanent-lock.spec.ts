@@ -131,6 +131,63 @@ describe('index.ts 的接线', () => {
   })
 
   /**
+   * ⚠️ **TRAE 必须传 `isFreeModel`**（PR !68 审计补齐，buddy 系早已接上）。
+   *
+   * TRAE 确有 `rate: 0` 的**合法免费模型**（`trae.ts` 的 `readConsumptionRate`
+   * 注释 + `traeDisplayName` 把 0 显示成「免费」）。不跳过余额分档的话，
+   * 「锁定 + 账号只剩永久积分 + 选中免费模型」会抛「积分都已用尽」——
+   * 而免费模型根本不扣积分，错误信息把用户引向完全错误的排查方向。
+   */
+  it('★ TRAE 接线传 isFreeModel（免费模型不被锁定误拦）', () => {
+    expect(pickCallBlock('TRAE')).toContain('isFreeModel: await traeAdapter.isFreeModel(modelId)')
+  })
+
+  /**
+   * ⚠️ 两家的凭据解析器必须**做形状校验**，且与各自 auth 的 `parseCredential` 对齐。
+   *
+   * 裸 `JSON.parse` 会把 `{"foo":1}` 这种损坏凭据当成有效凭据返回，随后适配器的
+   * `credential.access_token.length` 抛 **TypeError**（不是可诊断的
+   * `MISSING_CREDENTIAL`），且发生在选号之后、不在余额查询的 try/catch 覆盖内。
+   *
+   * 判据取 `typeof parsed.access_token === 'string'`，与 `trae-auth.ts` /
+   * `lobsterai-auth.ts` 的 `parseCredential` 逐字一致。
+   */
+  it('★ 两家凭据解析器做形状校验（与各自 auth 的 parseCredential 对齐）', () => {
+    for (const fn of ['resolveTraeCredentialByRef', 'resolveLobsteraiCredentialByRef']) {
+      const start = indexCode.indexOf(`const ${fn} = async`)
+      expect(start, `index.ts 里找不到 ${fn}`).toBeGreaterThan(-1)
+      const body = indexCode.slice(start, indexCode.indexOf('\n  }', start))
+      expect(body, `${fn} 必须校验 access_token 是字符串`).toContain("typeof parsed.access_token === 'string'")
+    }
+  })
+
+  /**
+   * ⚠️ 两家的**选号器**必须注入自己的 `fetchBalance`。
+   *
+   * 漏传时不会用 buddy 的缺省实现去发请求（那样只是查不到），而是把
+   * `TraeProduct` 喂给 `fetchCreditBalance` —— 它读 `product.endpoint`，而
+   * `TraeProduct` **根本没有这个字段** ⇒ 拼出 `undefined/v2/billing/...` 的
+   * 畸形 URL。后果：余额恒查不到 ⇒ 未锁定时换号优化静默失效、锁定时永远报
+   * 「无法确认是否有可用账号」，而积分一分没花。
+   *
+   * ⚠️ 该漏洞**已由 `BuddySelectionDeps` 的条件类型在编译期关闭**
+   * （非 buddy provider 的 `fetchBalance` 必填，实测漏传报 TS2345）；
+   * 这里再钉一道源码级断言作双保险 —— 万日后退化成可选类型，本用例仍能红。
+   */
+  it('★ 两家选号器注入自己的 fetchBalance（不用 buddy 缺省实现）', () => {
+    for (const [name, product, fn] of [
+      ['TRAE', 'TRAE', 'fetchTraeCreditBalance'],
+      ['LobsterAI', 'LOBSTERAI', 'fetchLobsteraiCreditBalance'],
+    ] as const) {
+      const re = new RegExp(
+        `const ${name.toLowerCase()}BalanceSelector = new BuddyBalanceSelector\\(\\{\\s*\\n\\s*product: ${product},[\\s\\S]*?fetchBalance:`,
+      )
+      expect(indexCode, `${name} 的选择器必须注入 fetchBalance`).toMatch(re)
+      expect(indexCode, `${name} 应调用 ${fn}`).toContain(fn)
+    }
+  })
+
+  /**
    * ⚠️ 候选必须**先**按 enabled + 模型限流过滤，余额分档只在候选内进行 ——
    * 与 Loomy 同一约定（用户要求「策略建立在模型没有受限且账户没有被停用的基础上」）。
    * 顺序反了就会出现「被限流的号因为积分多而被选中」。
