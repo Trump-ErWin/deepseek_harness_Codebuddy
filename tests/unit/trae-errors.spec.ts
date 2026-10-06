@@ -13,6 +13,7 @@ import {
   recordsTraeRateLimit,
   shouldRotateTraeAccount,
 } from '../../src/trae-errors.js'
+import { traeCooldownFor } from '../../src/trae-cooldown-table.js'
 
 describe('TRAE 错误分类', () => {
   it('body 含 1005 + plan 判为 hard-plan（权益不足）', () => {
@@ -101,5 +102,34 @@ describe('TRAE 换号策略', () => {
     for (const kind of ['hard-plan', 'soft-rate', 'quota-exceeded', 'not-found', 'server', 'client', 'none'] as const) {
       expect(isTraeTerminalError(kind), kind).toBe(false)
     }
+  })
+
+  /**
+   * ★ 冷却表**精确值断言**（PR #64 复审「剩余 1」，2026-10-06）。
+   *
+   * 维护者反向验证发现：`soft-rate` 60s→7天、`hard-plan` 12h→30天 时
+   * **没有任何用例变红**（当时唯一的冷却断言只覆盖 4008 的 24h 区间）——
+   * 上一版 `soft-rate` 误设 1h（比正确值大 60 倍）正是这样溜进来的。
+   * 表是 `export const` ⇒ 直接精确断言，把三个争议值全部钉死；
+   * 未知类别回落 1 小时兜底也一并锁定。
+   */
+  describe('traeCooldownFor 冷却表精确值（PR #64 复审锁定）', () => {
+    it('三个争议类别的精确值', () => {
+      // quota-exceeded（4008）：日配额（签到积分，余额 API 实测）⇒ 24h
+      expect(traeCooldownFor('quota-exceeded')).toBe(24 * 3_600_000)
+      // hard-plan（1005）：trae-errors.ts 既有权威定义 ⇒ 12h
+      expect(traeCooldownFor('hard-plan')).toBe(12 * 3_600_000)
+      // soft-rate（4011）：频率超限分钟级恢复 ⇒ 60s
+      expect(traeCooldownFor('soft-rate')).toBe(60_000)
+    })
+    it('非争议类别与未知类别兜底', () => {
+      expect(traeCooldownFor('not-found')).toBe(3_600_000)
+      expect(traeCooldownFor('server')).toBe(3_600_000)
+      expect(traeCooldownFor('client')).toBe(3_600_000)
+      expect(traeCooldownFor('session-dead')).toBe(0)
+      expect(traeCooldownFor('none')).toBe(0)
+      // 未知类别回落 1 小时兜底
+      expect(traeCooldownFor('unheard-of')).toBe(3_600_000)
+    })
   })
 })
