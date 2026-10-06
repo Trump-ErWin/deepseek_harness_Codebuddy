@@ -64,11 +64,42 @@ export interface OpenAiChatRequest {
   tool_choice?: unknown
 }
 
+/**
+ * CodeArts 单次输出的安全上限。
+ *
+ * ⚠️ 依据是 `llm-adapter.ts` 的实测（参考实现 e2e：65536 可用，
+ * **131072** 反而触发空流被后端拒绝），**不是**「拒绝 128000」——
+ * 后者在 CodeArts 语境下没有任何实测记录（README 那张 128000/131072 表
+ * 属于 buddy/workbuddy；`deepseek-v4.1-flash` 两个 provider 都有该 id，
+ * 别张冠李戴）。
+ */
+export const CODEARTS_MAX_OUTPUT_TOKENS = 65_536
+
+/**
+ * 受该上限约束的 CodeArts 模型（小写形态）。
+ *
+ * ⚠️ **判据必须忽略大小写**：codearts 目录本身大小写混用（`GLM-5.2` 大写
+ * 与 `glm-5.3-flash` 小写并存），而 `parseModelRoute` 是纯字符串切片、
+ * **不做任何归一化**。用户照着真实存在的 `GLM-5.2` 拼出 `GLM-5.3-Flash`
+ * 完全现实；更关键的是 `CodeArtsAdapter.resolveModel` 对目录外模型走
+ * `remoteModel?.name ?? model` —— **原样放行、从不拒绝**（dsh-llm 的
+ * `normalizeModelInfo` 同样只校验字段类型，注释明写 catalog membership
+ * is advisory），故网关不会提前 404，绕过判据的值会真的发往上游。
+ * 判据不归一化 ⇒ 这条路径上没有任何防线。
+ *
+ * ⚠️ 保持**白名单**式列举，不要改成前缀/模糊匹配：钳制是把用户要的输出
+ * 预算**往下压**，误伤一个本可输出长文的模型比漏压更糟
+ * （同 `clampClineMaxTokens` 的取��原则）。
+ */
+const CODEARTS_OUTPUT_CAPPED_MODELS: ReadonlySet<string> = new Set([
+  'deepseek-v4-flash', 'deepseek-v4-pro',
+  'glm-5.2', 'glm-5.3-flash', 'deepseek-v4.1-flash',
+])
+
 export function normalizeMaxTokens(value: number | undefined, provider: string, model: string): number | undefined {
   if (value === undefined) return undefined
-  // GLM-5.2 与 DeepSeek V4 实测均会拒绝 128000，65536 可正常推理。
-  if (provider === 'codearts' && (/^deepseek-v4-(flash|pro)$/.test(model) || model === 'GLM-5.2')) {
-    return Math.min(value, 65536)
+  if (provider === 'codearts' && CODEARTS_OUTPUT_CAPPED_MODELS.has(model.toLowerCase())) {
+    return Math.min(value, CODEARTS_MAX_OUTPUT_TOKENS)
   }
   return value
 }
