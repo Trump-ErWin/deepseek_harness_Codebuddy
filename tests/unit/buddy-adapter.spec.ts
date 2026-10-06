@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL, policyBlockResetAtMs, registerBuddyLlm,
 } from '../../src/buddy-adapter.js'
@@ -85,6 +85,8 @@ function makeAdapter(overrides: {
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；不传时由 BuddyAdapter 回退到 CodeBuddy。 */
   product?: BuddyProduct
+  /** 目录闸门时钟（验证「距上次拉取 ≥10 秒」这条基于时间的契约）。 */
+  now?: () => number
   /** 多账号池替身；本文件只用到模型黑名单（listModels 的过滤输入）。 */
   accountPool?: unknown
 } = {}) {
@@ -102,6 +104,7 @@ function makeAdapter(overrides: {
     ...overrides.fetchRemoteModels !== undefined ? { fetchRemoteModels: overrides.fetchRemoteModels } : {},
     ...overrides.readImage !== undefined ? { readImage: overrides.readImage } : {},
     ...overrides.product !== undefined ? { product: overrides.product } : {},
+    ...overrides.now !== undefined ? { now: overrides.now } : {},
     ...overrides.accountPool !== undefined ? { accountPool: overrides.accountPool as never } : {},
   })
 }
@@ -465,6 +468,318 @@ describe('BuddyAdapter', () => {
         fetchRemoteModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'DS' }],
       })
       expect((await adapter.resolveModel('buddy', 'deepseek-v4.1-flash')).inputModalities).toEqual(['text', 'image'])
+    })
+
+    // ── issue IKJQ3M ──
+    //
+    // 「远端下发了完整能力元数据、但模型不在编译期兜底表里」这一档，
+    // 修复前会被 reconcileWithFallback 的白名单式重建整个丢弃（连同它
+    // 自带的 supportsImages: true），于是 inputModalitiesFor 三级 ?? 全落空
+    // ⇒ 贴图报 `does not accept image input`，而真实网关完全支持图片。
+    //
+    // ⚠️ 这**不是**瞬时状态：远端目录即使拉取成功也照样误判（issue 里
+    // 「重启即自愈」的结论只在模型恰好被 agent 引用时成立）。
+    it('远端下发能力元数据、模型不在兜底表时仍保留该模型并声明 image', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{
+          id: 'space-bunny', name: 'Space-Bunny', supportsImages: true, contextWindow: 1_000_000,
+        }],
+      })
+      const models = await adapter.listModels('buddy')
+      const spaceBunny = models.find((m) => m.id === 'space-bunny')
+      expect(spaceBunny, '远端声明了能力的模型不该被白名单丢弃').toBeDefined()
+      expect(spaceBunny?.inputModalities).toEqual(['text', 'image'])
+      expect((await adapter.resolveModel('buddy', 'space-bunny')).inputModalities).toEqual(['text', 'image'])
+    })
+
+    // ⚠️ 放宽白名单**不得**放宽到「什么都能进」：远端既没下发能力元数据、
+    // 也没说它可选（无 agentReferenced）的内部别名仍必须被丢弃
+    // （既有 `hy4-preview-f` 回归用例守住 agentReferenced 这一条，这里守另一半）。
+    it('远端未声明能力也未被 agent 引用的模型仍被白名单丢弃', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'internal-alias-probe', name: 'Internal' }],
+      })
+      expect((await adapter.listModels('buddy')).map((m) => m.id))
+        .not.toContain('internal-alias-probe')
+    })
+
+    // ⚠️⚠️ **反向护栏：放宽不得把「实测不可调用」的模型放回选择器**。
+    //
+    // 上一版把追加判据写成「有任一能力元数据就保留」，其中包含
+    // `maxOutputTokens` / `contextWindow` —— 而实测「11102 service info not
+    // found」的模型（glm-4.6/4.7/5.0、minimax-m2.5、kimi-k2.5、hunyuan-* …）
+    // **恰好也带这两个字段**（src/product.ts 的 CODEBUDDY_FALLBACK_MODELS
+    // 注释明确记录了它们被排除的理由）。⇒ 放宽会把它们放回模型选择器，
+    // 用户选中后才报错 —— **这是修复引入的新缺陷，比原缺陷更糟**。
+    //
+    // ✅ 判据必须是「**图片能力**这一项」，即该模型正是本 issue 要解决的那类。
+    it('实测不可调用的模型（带窗口/输出上限但无图片能力）不得被放回选择器', async () => {
+      const unusable = ['glm-4.6', 'glm-4.7', 'glm-5.0', 'minimax-m2.5', 'kimi-k2.5', 'hunyuan-chat']
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => unusable.map((id) => ({
+          id, name: id, contextWindow: 256_000, maxOutputTokens: 24_000,
+        })),
+      })
+      const ids = (await adapter.listModels('buddy')).map((m) => m.id)
+      for (const id of unusable) {
+        expect(ids, `${id} 实测 11102 不可调用，不该进模型选择器`).not.toContain(id)
+      }
+    })
+
+    // ⚠️ 反向验证的另一半：**带图片能力的模型仍然要被保留**（别把上面的
+    // 收窄做过头 —— 那会把 issue 的正题重新修坏）。
+    it('带图片能力的模型被保留（确认上一条不是「一律丢弃」）', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [
+          { id: 'usable-vision', name: 'Vision', supportsImages: true, maxOutputTokens: 24_000 },
+        ],
+      })
+      expect((await adapter.listModels('buddy')).map((m) => m.id)).toContain('usable-vision')
+    })
+
+    // ⚠️ **两站都要覆盖**（复审 M4）：`BuddyAdapter` 一个类同时服务
+    // `buddy`（CodeBuddy 中国版）与 `workbuddy`（国际版），两站的兜底表
+    // 差异很大（19 条、含 GPT 系 vs 16 条、含 hy4-preview-f），
+    // 「白名单放宽」在任一站失效都不会被上面的 CODEBUDDY 用例发现。
+    it('workbuddy 国际版同样适用（白名单放宽 + 不可调用模型仍被挡）', async () => {
+      const adapter = makeAdapter({
+        product: WORKBUDDY,
+        fetchRemoteModels: async () => [
+          { id: 'space-bunny', name: 'Space-Bunny', supportsImages: true, maxOutputTokens: 128_000 },
+          // 国际版同样实测有 11102 不可调用条目（见 product.ts 的注释）
+          { id: 'glm-4.6', name: 'GLM-4.6', contextWindow: 256_000, maxOutputTokens: 24_000 },
+        ],
+      })
+      const listed = await adapter.listModels('workbuddy')
+      const ids = listed.map((m) => m.id)
+      expect(ids).toContain('space-bunny')
+      expect(ids).not.toContain('glm-4.6')
+      expect(listed.find((m) => m.id === 'space-bunny')?.inputModalities).toEqual(['text', 'image'])
+    })
+  })
+
+  // ── 「能力未知」不等于「不支持」：贴图门禁的三态语义（issue IKJQ3M）──
+  //
+  // 修复前 `inputModalitiesFor` 把「远端没拉到」与「远端说不支持」压成同一个
+  // 结果（都是 ['text']），于是：远端拉取失败 ⇒ 实际支持图片的模型被误杀，
+  // 且错误文案误导（说「模型不支持图片」，实际是「暂时不知道」）。
+  //
+  // 三态契约（本次修复的权威定义）：
+  //   - 明确支持 → ['text','image']
+  //   - 明确不支持（远端显式 supportsImages=false）→ ['text']
+  //   - **未知**（远端没拉到 / 目录未就绪）→ **不声明** inputModalities
+  //
+  // ⚠️ 未知必须**省略字段**而不是报 ['text']：宿主 DSH 见到 ['text'] 会按
+  // 「确认是纯文本模型」把图片静默投影成占位文本（dsh-llm `lib/index.js`
+  // 的 projectImagesForTextModel），用户既看不到图也拿不到原因。
+  describe('贴图门禁：能力未知时的行为（issue IKJQ3M）', () => {
+    /**
+     * harness 的默认可重试错误码集合，**从 dsh-llm 源码原文里读出来**。
+     *
+     * ⚠️ 该常量在 `lib/types/*.d.ts` 里**未导出**，只能读源码。
+     *
+     * ⚠️⚠️ **为什么读源码而不是写死字面量**（初版的推理是反的，复审指出）：
+     * 两条路的保护方向**相反**，各有各的失效模式：
+     * - **写死字面量**：宿主若把某个码加进可重试集合，这条用例**不会变红**
+     *   —— 我们对「哪个码可重试」的认知已与宿主脱钩，而错误码的选取正是
+     *   为了利用宿主的重试语义，认知脱钩＝修复静默失效。
+     * - **读源码**：宿主改集合时断言自动跟随，看起来「不会报警」，但那正是
+     *   它要表达的**事实**（此码此刻确实可重试 ⇒ 我们选它就是错的）。
+     *
+     * ✅ 真正需要防的「同义反复」是**另一种**：把判据原样抄进断言
+     * （断言复述实现，而不是独立事实）。本例断言的是**宿主的事实**，
+     * 与被测代码无引用关系 —— 不是同义反复。
+     *
+     * ⚠️ 初版（09fe2eb）选 `TRANSPORT` 时，本条**实测变红**
+     * （`expected [...] to not include 'TRANSPORT'`）—— 保护机制已实证有效。
+     */
+    const DEFAULT_RETRYABLE_CODES: readonly string[] = (() => {
+      const src = readFileSync(
+        resolve(dirname(fileURLToPath(import.meta.url)), '../../node_modules/@deepseek-ai/dsh-llm/lib/index.js'),
+        'utf8',
+      )
+      const body = /const DEFAULT_RETRYABLE_CODES = Object\.freeze\(\[([\s\S]*?)\]\)/.exec(src)?.[1]
+      if (body === undefined) throw new Error('dsh-llm 未声明 DEFAULT_RETRYABLE_CODES，断言口径失效')
+      // 去掉 `EMPTY_RESPONSE_CODE` 这类引用名，统一取字符串字面量。
+      const codes = [...body.matchAll(/["']([A-Z_]+)["']/g)].map((m) => m[1]!)
+      // `EMPTY_RESPONSE` 由同文件里另一个常量名给出，补上它以免漏判。
+      if (!codes.includes('EMPTY_RESPONSE')) codes.push('EMPTY_RESPONSE')
+      return codes
+    })()
+
+    /** 构造一个「远端目录永远拿不到」的适配器，并统计拉取次数。 */
+    function makeUnreadyAdapter(options: {
+      fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
+      now?: () => number
+    } = {}): { adapter: BuddyAdapter; calls: () => number } {
+      let calls = 0
+      const adapter = makeAdapter({
+        readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+        fetchRemoteModels: options.fetchRemoteModels ?? (async () => {
+          calls++
+          throw new Error('catalog endpoint is down')
+        }),
+        fetchImpl: async () => sseResponse('data: [DONE]\n\n'),
+      })
+      return { adapter, calls: () => calls }
+    }
+
+    const UNKNOWN_MODEL = 'space-bunny'
+
+    it('远端目录未就绪时贴图不再谎报「模型不支持图片」', async () => {
+      // 修复前抛 `UNSUPPORTED_CONTENT: model "..." does not accept image input`，
+      // 把「暂时不知道」说成「确认不支持」。
+      const { adapter } = makeUnreadyAdapter()
+      const error = await collectChunks(adapter, {
+        model: UNKNOWN_MODEL,
+        messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a' } }] }],
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(LlmError)
+      // 仍拒绝（不能把未知当成支持），但**错误码与文案必须可区分**。
+      expect((error as LlmError).code).not.toBe('UNSUPPORTED_CONTENT')
+      expect(String((error as LlmError).message)).not.toContain('does not accept image input')
+      expect(String((error as LlmError).message)).toContain(UNKNOWN_MODEL)
+
+      // ⚠️⚠️ **错误码绝不能是 `TRANSPORT`**（反向验证时踩过）：
+      // harness 的 `DEFAULT_RETRYABLE_CODES` 是
+      // `['EMPTY_RESPONSE','RATE_LIMIT','SERVER','TIMEOUT','TRANSPORT']`
+      // —— `TRANSPORT` **在里面**（dsh-llm `lib/index.js` 实测），
+      // 于是这条「请稍后重试」会被 harness 白重试 5 次
+      // （500/1000/2000/4000/8000 ms），而每次重试都重走一遍
+      // `stream()` → `refreshCatalog()`，把一次用户报错放大成 6 次目录拉取
+      // ＋6 次凭据解析。方向取反：用**明确不可重试**的码，让用户自己决定
+      // 何时重试（那时目录通常已恢复）。
+      expect(DEFAULT_RETRYABLE_CODES).not.toContain((error as LlmError).code)
+    })
+
+    it('远端目录未就绪时 resolveModel 不声明 inputModalities（宿主因此不投影图片）', async () => {
+      const { adapter } = makeUnreadyAdapter()
+      const resolved = await adapter.resolveModel('buddy', UNKNOWN_MODEL)
+      // ⚠️ 关键：必须是 undefined（宿主才不把图片投影成占位文本），
+      // 报 ['text'] 等于告诉宿主「这是纯文本模型」。
+      expect(resolved.inputModalities).toBeUndefined()
+    })
+
+    it('远端目录未就绪时 listModels 里该模型也不声明 inputModalities', async () => {
+      const { adapter } = makeUnreadyAdapter()
+      const models = await adapter.listModels('buddy')
+      // 兜底表里的模型已知支持图片，仍应正常声明。
+      expect(models.find((m) => m.id === 'deepseek-v4.1-flash')?.inputModalities).toEqual(['text', 'image'])
+      // 未被任何表覆盖的模型：能力未知 ⇒ 不声明。
+      expect((await adapter.resolveModel('buddy', UNKNOWN_MODEL)).inputModalities).toBeUndefined()
+    })
+
+    it('远端目录恢复后能力判定随之恢复（重新拉取并声明 image）', async () => {
+      // ⚠️ 刻意**不用** `vi.useFakeTimers()`/`vi.setSystemTime`：它们会污染
+      // 同文件其余用例（真实计时器用例被挂起，实测 `fails fast with a retryable
+      // TIMEOUT` 变成时序敏感、单独跑却绿）。这里改为**注入一个可控时钟**
+      // —— 闸门的 `now` 本就是构造参数（`RemoteCatalogGateOptions.now`），
+      // 用它既无全局副作用，又让「10 秒」这条契约直接可观测。
+      let clock = 1_000_000
+      let calls = 0
+      const adapter = makeAdapter({
+        readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+        // 让适配器的闸门与测试共用同一个时钟。
+        now: () => clock,
+        fetchRemoteModels: async () => {
+          calls++
+          if (calls === 1) throw new Error('catalog endpoint is down')
+          return [{ id: UNKNOWN_MODEL, name: 'Space-Bunny', supportsImages: true }]
+        },
+        fetchImpl: async () => sseResponse('data: [DONE]\n\n'),
+      })
+      // 第一次：未知
+      expect((await adapter.resolveModel('buddy', UNKNOWN_MODEL)).inputModalities).toBeUndefined()
+
+      // ⚠️ 用户定的重试规则（issue IKJQ3M）：**距上次失败不足 10 秒不重拉**。
+      // 目录端点超时上限 60s（src/buddy.ts 的 REQUEST_TIMEOUT_MS），无节流的
+      // 「贴图就重拉」会把每个模型的每次请求都放大成一次远端拉取
+      // —— 那正是 RemoteCatalogGate 当初要挡的放大。
+      await adapter.refreshCatalog()
+      expect(calls, '10 秒内不得重复拉取').toBe(1)
+      expect((await adapter.resolveModel('buddy', UNKNOWN_MODEL)).inputModalities).toBeUndefined()
+
+      // ⚠️ 反向验证的另一半：过够时间后**必须真的重拉并重新判能力**，
+      // 否则用户永远停留在「未知」，问题只是被推迟而不是被修复。
+      clock += 11_000
+      await adapter.refreshCatalog()
+      expect(calls, '超过 10 秒后应重新拉取目录').toBe(2)
+      expect((await adapter.resolveModel('buddy', UNKNOWN_MODEL)).inputModalities).toEqual(['text', 'image'])
+    })
+
+    it('远端显式声明 supportsImages=false 时仍照旧拒绝（不得放宽真失败）', async () => {
+      // 白名单放宽 + 「未知不谎报」都不能把「远端说不支持」也放行。
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+        fetchRemoteModels: async () => [{ id: 'text-only-probe', name: 'P', supportsImages: false }],
+        fetchImpl: async () => sseResponse('data: [DONE]\n\n'),
+      })
+      const error = await collectChunks(adapter, {
+        model: 'text-only-probe',
+        messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a' } }] }],
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+      expect((error as LlmError).code).toBe('UNSUPPORTED_CONTENT')
+      expect(String((error as LlmError).message)).toContain('does not accept image input')
+    })
+
+    // ⚠️⚠️ **本修复的核心承诺：贴图时先重看一次目录，恢复了就当没事发生**
+    // （对抗审计 MUT5 实测：把 `stream()` 里那段 `refreshCatalog()` 整块删掉，
+    //  当时 144 条用例**全绿** ⇒ 核心行为零覆盖。这条把它锁住。）
+    //
+    // 场景：能力未知的**那一刻**目录没拉到，但只要「距上次拉取 ≥10 秒」，
+    // 用户贴的**这一轮**就应重新拉一次；目录此时已恢复 ⇒ 图片正常发出，
+    // 用户根本看不到那句「请稍后重试」。
+    it('贴图这一轮会自动重看目录；目录已恢复则图片正常发出（不报错）', async () => {
+      let clock = 1_000_000
+      let catalogCalls = 0
+      let sentBody: Record<string, unknown> | undefined
+      const adapter = makeAdapter({
+        now: () => clock,
+        readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+        fetchRemoteModels: async () => {
+          catalogCalls++
+          // 第一次失败（此刻能力未知）；此后成功并声明支持图片。
+          if (catalogCalls === 1) throw new Error('catalog endpoint is down')
+          return [{ id: UNKNOWN_MODEL, name: 'Space-Bunny', supportsImages: true }]
+        },
+        fetchImpl: async (_url, init) => {
+          sentBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: [DONE]\n\n')
+        },
+      })
+      // 先让能力进入「未知」态。
+      expect((await adapter.resolveModel('buddy', UNKNOWN_MODEL)).inputModalities).toBeUndefined()
+
+      // 越过 10 秒节流窗口（用户定的规则）。
+      clock += 11_000
+
+      // ⚠️ 关键：这一次 stream() 内部必须自己重看目录，而不是报错。
+      await collectChunks(adapter, {
+        model: UNKNOWN_MODEL,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: '这是什么颜色？' },
+            { type: 'image', attachment: { attachmentId: 'a' } },
+          ],
+        }],
+        signal: new AbortController().signal,
+      } as never)
+
+      // 不抛错（这就是与「报错让用户重试」的本质差别）。
+      expect(catalogCalls, '贴图这一轮必须自动重看目录').toBe(2)
+      // ⚠️ 且图片**真的进了请求体** —— 只断言「不抛错」是同义反复：
+      // 一条把图片静默丢掉的实现同样不抛错（TRAE/lobsterai 都踩过这个坑）。
+      const user = (sentBody?.messages as Array<Record<string, unknown>> | undefined)
+        ?.find((m) => m.role === 'user')
+      expect(user?.content).toEqual([
+        { type: 'text', text: '这是什么颜色？' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+      ])
     })
   })
 

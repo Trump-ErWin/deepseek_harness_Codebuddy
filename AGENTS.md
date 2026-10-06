@@ -5422,6 +5422,61 @@ POST {agentHost}/api/ide/v1/batch_get_detail_param
 > `channels` 默认已改为 `['solo_agent', 'solo_work_lite', 'solo_agent_remote']`，
 > 首位 `solo_agent` 对应截图 Auto Mode 的模型列表。
 
+#### ⚠️⚠️ 图片能力必须**三态**：「未知」既不能当不支持，也不能报 `['text']`（Issue IKJQ3M）
+
+**真实缺陷**（用户报障「buddy/space-bunny 贴图报 does not accept image input」）：
+`inputModalitiesFor` 恒返回数组，把两种**语义相反**的状态压成同一个 `['text']` ——
+「远端明确说不支持」与「远端目录还没拉到」。
+
+⚠️ **第二处根因在白名单，且它不是瞬时问题**：issue 原文以为「重启即自愈」，
+实测**不成立**。`reconcileWithFallback` 是白名单式重建，不在产品兜底表里的模型
+被整个丢弃（**连同它自带的 `supportsImages: true`**），而兜底表是编译期快照、
+必然滞后于服务端上新。实测 `space-bunny` 由 scoped 端点下发且带完整能力元数据，
+但**未被任何 agent 引用** ⇒ 远端目录**即使拉取成功**也照样误判。
+⇒ 「不在编译期快照里」与「服务端未声明可选」是**两回事**。
+
+**三条判据（buddy/workbuddy 两站共用同一个 `BuddyAdapter`）**：
+
+| 能力状态 | `inputModalitiesFor` | 后果 |
+|---|---|---|
+| 已知支持 | `['text','image']` | 放行 |
+| 已知不支持（远端显式 `false`） | `['text']` | 拒绝，报 `UNSUPPORTED_CONTENT` |
+| **未知** | **`undefined`（省略字段）** | 拒绝，报**可区分**的错误码 |
+
+⚠️⚠️ **未知必须省略字段，绝不能报 `['text']`**：宿主契约明写
+「absent means unknown」（dsh-llm `types.d.ts` 的 `inputModalities`），而 DSH
+见到「不含 image」的声明会按「**确认是纯文本模型**」把图片
+**静默投影成占位文本**（`lib/index.js` 的 `projectImagesForTextModel`）
+⇒ 图既没进请求体、用户也拿不到任何原因。比报错更隐蔽。
+
+⚠️ **未知时的错误码不能取 `TRANSPORT`**（本轮实测踩过）：harness 的
+`DEFAULT_RETRYABLE_CODES` 是 `['EMPTY_RESPONSE','RATE_LIMIT','SERVER',
+'TIMEOUT','TRANSPORT']` —— `TRANSPORT` **就在里面** ⇒ 一次用户报错被白重试
+5 次（500/1000/2000/4000/8000 ms），每次重走一遍 `stream()`。用**明确不可重试**
+的码（`INVALID_REQUEST`），让用户在目录恢复后自己重试。
+⚠️ 该常量在 `lib/types/*.d.ts` 里**未导出**，单测要断言「不在可重试集合里」
+只能**从 `lib/index.js` 源码原文读出来**再比 —— 写死字面量属同义反复。
+
+⚠️ **白名单放宽只能认 `supportsImages`**（本轮自查抓到的自伤）：初版写「有任一
+能力元数据就保留」，结果把实测 `11102 service info not found` 的模型
+（glm-4.6/4.7/5.0、minimax-m2.5、kimi-k2.5、hunyuan-* …）请回了模型选择器 ——
+**它们同样带 `contextWindow` 与 `maxOutputTokens`**（见 `product.ts` 的
+`CODEBUDDY_FALLBACK_MODELS` 注释，正是因不可调用才排除）。用户选中后才报错，
+**比原 issue 更糟**。
+
+⚠️ **「等目录就绪」的重试必须自己设间隔**（用户 2026-10-06 定：**≥10 秒**）：
+`RemoteCatalogGate` 默认冷却 **30 秒**，照用会让「请稍后重试」迟迟不兑现；
+而无节流的「贴图就重拉」会把每个模型的每次带图请求放大成一次远端拉取
+（目录端点超时上限 **60 秒**，那正是首屏「加载模型巨长」的成因）。
+实现：`RemoteCatalogGate.sinceLastAttemptMs()` + `BuddyAdapter.refreshCatalog()`。
+⚠️ `sinceLastAttemptMs()` **只在 `run()` 主路径更新**（`inFlight` 去重分支不更新），
+故实测并发 20 个带图请求、串行 5 次、以及一次 5 秒长拉取期间并发 6 次 ——
+**目录端点均只被调用 1 次**（`inFlight` 去重已足够挡住并发放大）。
+
+⚠️ **其余 provider 大多仍报 `['text']`**（trae/lobsterai/cline/qoder/opencode…）。
+那是**各自刻意**的「未声明按不支持」取舍，本轮**未动**：改一个先看它的目录是否
+真的有「未知态」（有的家目录永不失败，恒可用 ⇒ 不存在未知态）。
+
 #### 真实 CN IDE 的其它情报（Reqable 抓包，`Trae CN.exe 3.3.94`）
 
 - 头：`x-ide-version: 3.3.94` / `20260820`、`x-app-version: default`、

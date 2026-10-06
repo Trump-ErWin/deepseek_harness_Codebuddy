@@ -18,7 +18,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
-import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { RemoteCatalogGate, REMOTE_CATALOG_COOLDOWN_MS } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import {
   RATE_LIMIT_FALLBACK_MS,
@@ -92,6 +92,15 @@ const DEFAULT_MODELS: readonly string[] = [
   'kimi-k2.6',
   'minimax-m3',
 ]
+
+/**
+ * 图片能力判定为「未知」时，距上次目录拉取至少要过这么久才值得重试。
+ *
+ * 用户 2026-10-06 定：失败后**至少 10 秒**才重新看一次模型列表。
+ * 上界取 30s（`REMOTE_CATALOG_COOLDOWN_MS`）—— 即比默认冷却短，
+ * 使「请稍后重试」这句话在十秒后真的兑现，而不是让用户等到 30 秒。
+ */
+const BUDDY_IMAGE_CAPABILITY_RETRY_MS = 10_000
 
 /** 默认模型（deepseek-v4-flash，对齐 IDE 默认）。 */
 export const DEFAULT_MODEL = 'deepseek-v4-flash'
@@ -227,6 +236,17 @@ export interface BuddyAdapterOptions {
    * 差异全部由本配置承载。
    */
   product?: BuddyProduct
+  /**
+   * 远端目录闸门的时钟来源，默认 `Date.now`。
+   *
+   * 存在的理由：`refreshCatalog` 的「距上次拉取 ≥10 秒才重试」是一条
+   * **基于时间**的契约（见 `BUDDY_IMAGE_CAPABILITY_RETRY_MS`），而闸门的
+   * 冷却与间隔判定都走这个时钟。注入它可零副作用地验证该契约 ——
+   * 改全局时钟（`vi.setSystemTime`）会污染同进程其余用例。
+   */
+  now?: () => number
+  /** 目录闸门的失败冷却时长，默认 {@link REMOTE_CATALOG_COOLDOWN_MS}。 */
+  catalogCooldownMs?: number
 }
 
 /** 将消息内容载荷展平为纯文本字符串。 */
@@ -810,6 +830,29 @@ function userContentParts(
   return hasImage && parts.length > 0 ? parts : undefined
 }
 
+/**
+ * 远端条目是否**明确表态**接受图片输入。
+ *
+ * 用途：`reconcileWithFallback` 的白名单式重建会丢弃「不在编译期兜底表里」
+ * 的模型，而兜底表是快照、会随服务端上新而漂移。凡是远端**已经讲清楚了
+ * 图片能力**的条目，丢弃它就等于让「本地可能过期的快照」压过「服务端权威
+ * 数据」（issue IKJQ3M：`space-bunny` 即属此类）。
+ *
+ * ⚠️⚠️ **判据只能认 `supportsImages`，不能收「任一能力元数据」**（初版写宽了，
+ * 由自查与回归用例抓出）：实测「11102 service info not found」的模型
+ * （glm-4.6/4.7/5.0、minimax-m2.5、kimi-k2.5/k2.8-preview、hunyuan-* …）
+ * **同样带 `contextWindow` 与 `maxOutputTokens`**（见 `src/product.ts` 的
+ * `CODEBUDDY_FALLBACK_MODELS` 注释，正是因为它们不可调用才被排除）。
+ * 按「任一能力字段」放行会把它们请回模型选择器，用户选中后才报错 ——
+ * **那是比原 issue 更糟的新缺陷**。
+ *
+ * ⚠️ 也不能放宽成「远端返回的一律收下」：`parseModelsFromConfig` 会把内部别名
+ * （`default` 等）与未开放模型一并解析出来。
+ */
+function hasRemoteImageCapability(model: BuddyRemoteModel): boolean {
+  return model.supportsImages !== undefined
+}
+
 /** 收集 user 消息中的图片附件引用（含工具结果内嵌图片），按 attachmentId 去重。 */
 function collectImages(content: readonly unknown[], refs: Map<string, unknown>): void {
   for (const raw of content) {
@@ -839,7 +882,7 @@ export class BuddyAdapter extends LlmAdapter {
    * 目录加载闸门：并发去重 + 失败/空结果冷却。
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
-  private readonly catalogGate = new RemoteCatalogGate()
+  private readonly catalogGate: RemoteCatalogGate
   /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
   private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
   /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
@@ -858,6 +901,13 @@ export class BuddyAdapter extends LlmAdapter {
     this.product = options.product ?? CODEBUDDY
     this.fetchImpl = options.fetchImpl ?? fetch
     this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, '')
+    // ⚠️ 闸门时钟可注入（**不是**测试专用开关）：`refreshCatalog` 的「距上次
+    // 拉取 ≥10 秒才重试」是一条**基于时间**的契约，而闸门的 `now` 默认取墙钟。
+    // 单测用 `vi.setSystemTime` 改全局时间会污染同文件其余用例（真实计时器
+    // 用例被挂起，实测变成时序敏感），而注入时钟可零副作用地验证该契约。
+    this.catalogGate = new RemoteCatalogGate(
+      options.now === undefined ? {} : { now: options.now, cooldownMs: options.catalogCooldownMs ?? undefined },
+    )
     const fallback = this.product.fallbackModels ?? []
     this.productFallbackIndex = new Map(fallback.map((model) => [model.id, model]))
     this.productFallbackContextWindows = new Map(
@@ -983,6 +1033,40 @@ export class BuddyAdapter extends LlmAdapter {
   }
 
   /**
+   * 图片能力判定为「未知」时，把闸门冷却按**用户定的重试间隔**重新评估一次。
+   *
+   * ## 为什么需要它（issue IKJQ3M）
+   *
+   * 能力未知时贴图既不放行、也不谎报「不支持」（见 {@link inputModalitiesFor}），
+   * 用户看到的是「请稍后重试」。若目录的冷却期是 `RemoteCatalogGate` 默认的
+   * 30 秒，而用户 10 秒后就重试，他拿到的仍是「未知」—— 于是必须有一个
+   * **明确的、较短的**重试窗口，否则这条修复只是把误报换成了更慢的误报。
+   *
+   * ## 规则（用户 2026-10-06 定，**不要擅自改**）
+   *
+   * 距上次拉取**不足 10 秒** → 不重拉（本次直接返回）。
+   * 理由：目录端点超时上限 **60 秒**（`src/buddy.ts` 的 `REQUEST_TIMEOUT_MS`），
+   * 无节流的「贴图就重拉」会把每个模型的每次带图请求都放大成一次远端拉取
+   * —— 那正是 `RemoteCatalogGate` 当初要挡的放大，也是首屏「加载模型巨长」
+   * 的成因（见该文件头的实测记录）。
+   *
+   * ⚠️ **只放宽冷却、不清 `remoteModels`**：目录已成功时 `ensureRemoteModels`
+   * 本就直接返回，无需也不能重拉（重拉会把成功结果丢掉）。
+   *
+   * ⚠️ 冷却期整体仍以 `cooldownMs`（30s）为准 —— 放宽的是**图片门禁这一次**
+   * 的评估，不是把闸门的冷却期改短，故其他调用方仍受 30 秒保护。
+   */
+  async refreshCatalog(): Promise<void> {
+    if (this.options.fetchRemoteModels === undefined) return
+    if (this.remoteModels !== undefined) return
+    const since = this.catalogGate.sinceLastAttemptMs()
+    if (since !== undefined && since < BUDDY_IMAGE_CAPABILITY_RETRY_MS) return
+    // 放宽本次冷却，让 ensureRemoteModels 里的 run() 真正发起一次拉取。
+    this.catalogGate.reset()
+    await this.ensureRemoteModels()
+  }
+
+  /**
    * 用产品兜底表校正远端结果。
    *
    * 为什么需要校正：服务端按**认证上下文**决定返回哪些模型，插件的 CLI
@@ -1005,6 +1089,19 @@ export class BuddyAdapter extends LlmAdapter {
    * 判据用 `agentReferenced`（服务端自己的「可选」信号）而非猜测 id 后缀 ——
    * 后缀规则不统一（`-f` / `-x` / `-sg` / `-ioa` 含义各异），猜错会放进
    * 不可用的模型。未标记的内部别名（如 `default`）不会被误留。
+   *
+   * ⚠️⚠️ **第二条例外：远端明确表态接受图片（issue IKJQ3M）**。
+   *
+   * 只按 `agentReferenced` 判据仍然丢模型：实测 `space-bunny` 由 scoped 端点
+   * 下发并带**完整元数据**（`supportsImages: true` / `maxInputTokens: 1000000`
+   * / `maxOutputTokens: 128000` / `reasoning.supportedEfforts`），但**没有被任何
+   * agent 引用** ⇒ 白名单式重建把它连同能力声明一起丢掉 ⇒
+   * `inputModalitiesFor` 三级查找全落空 ⇒ 贴图误报 `does not accept image input`
+   * （而真实网关 5/5 实测能看图）。**这不是瞬时状态**：远端目录即使拉取成功
+   * 也照样误判，issue 里「重启即自愈」的结论只在恰好被 agent 引用时成立。
+   *
+   * ⇒ 「不在编译期快照里」与「服务端未声明可选」是**两回事**：远端既然已经
+   * 明确表态了图片能力，丢弃它才是缺陷本身。两条例外的判据不同、互不覆盖。
    */
   private reconcileWithFallback(models: readonly BuddyRemoteModel[]): BuddyRemoteModel[] {
     const fallback = this.product.fallbackModels
@@ -1046,9 +1143,20 @@ export class BuddyAdapter extends LlmAdapter {
     //
     // 放在**末尾**：兜底表里的模型保持原有顺序与权威性，补充的变体排在后面，
     // 不打乱用户已熟悉的列表顺序。
+    //
+    // ⚠️ 两条追加判据是**并集**（issue IKJQ3M）：
+    //   ① `agentReferenced === true`：服务端说「对话里可选」；
+    //   ② 远端**明确表态**接受图片（`supportsImages !== undefined`）：
+    //      该模型正是本 issue 要解决的那类，丢弃它就会把「能看图的模型」
+    //      误杀（`space-bunny` 走 ① 之外仍会被丢掉 —— 它未被任何 agent 引用）。
+    // ⚠️ ② 刻意**只认 `supportsImages`**：加上 `contextWindow` / `maxOutputTokens`
+    // 会把实测「11102 不可调用」的模型一并放回选择器（见 hasRemoteImageCapability）。
+    // 两条都**不**放宽到「远端返回的一律收下」——那会让内部别名与未开放模型
+    // 重新出现在选择器里（正是当初引入白名单的原因）。
     const known = new Set(reconciled.map((model) => model.id))
     for (const model of models) {
-      if (model.agentReferenced !== true || known.has(model.id)) continue
+      if (known.has(model.id)) continue
+      if (model.agentReferenced !== true && !hasRemoteImageCapability(model)) continue
       known.add(model.id)
       reconciled.push({ ...model })
     }
@@ -1079,15 +1187,66 @@ export class BuddyAdapter extends LlmAdapter {
   ])
 
   /**
-   * 模型接受的输入模态：远端 supportsImages 优先，静态表兜底；
-   * {@link IMAGE_CAPABILITY_OVERRIDES} 中的模型强制为支持图片。
+   * 模型接受的输入模态，或 `undefined` = **能力未知**。
+   *
+   * ## 为什么要有第三态（issue IKJQ3M）
+   *
+   * 原实现恒返回 `readonly ('text'|'image')[]`，把两种**语义相反**的状态
+   * 压成同一个结果：
+   * - 远端明确说 `supportsImages: false`（**确认不支持**）；
+   * - 远端目录还没拉到 / 拉取失败（**暂时不知道**）。
+   *
+   * 两者都返回 `['text']`，后果有二，第二个更隐蔽：
+   * 1. 贴图被拒且文案写「model "x" does not accept image input」——
+   *    把「不知道」说成「不支持」，用户会去换模型、查文档，而真正的解法
+   *    只是等目录就绪（真实报障：`buddy/space-bunny` 贴图报不支持，
+   *    而真实网关 5/5 全对，纯红图答「红色」、双色图左右分别答对）。
+   * 2. `listModels` / `resolveModel` 把这个 `['text']` 报给宿主 DSH，
+   *    而 DSH 见到「不含 image」的声明会**静默把图片投影成占位文本**
+   *    （dsh-llm `lib/index.js` 的 `projectImagesForTextModel`）
+   *    ⇒ 图片既没进请求体、用户也拿不到任何原因。
+   *
+   * ✅ 因此「未知」必须**省略 `inputModalities` 字段**（宿主对 `undefined`
+   * 不做任何投影，见同文件 `detachedModalities`），而不是报 `['text']`。
+   *
+   * ⚠️ 方向是**宁可漏判不可误伤**：未知仍不放行图片（见 `stream` 的门禁），
+   * 只是不再谎报「不支持」。
    */
-  private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
+  private inputModalitiesFor(model: string): readonly ('text' | 'image')[] | undefined {
+    // ⚠️ **判据必须逐级记录来源**：下面这条 `??` 链会把「远端明确 false」
+    // 与「全都没查到」压成同一个 `false`（两者都非真值），而这两种状态的
+    // 处理**恰好相反**（前者拒绝、后者只报「未知」）。故先用
+    // `imageCapabilityKnown` 把两者分开，再走同一条取值链。
+    const known = this.imageCapabilityKnown(model)
     const supportsImages = BuddyAdapter.IMAGE_CAPABILITY_OVERRIDES.has(model)
       || (this.remoteMeta.get(model)?.supportsImages
         ?? this.productFallbackMeta.get(model)?.supportsImages
         ?? IMAGE_MODELS.has(model))
-    return supportsImages ? ['text', 'image'] : ['text']
+    if (supportsImages) return ['text', 'image']
+    return known ? ['text'] : undefined
+  }
+
+  /**
+   * 该模型的图片能力是否**已被某个来源明确表态**（而不只是「没查到」）。
+   *
+   * ⚠️ 与 {@link inputModalitiesFor} 的**四个图片来源**必须逐级同源
+   * （`IMAGE_CAPABILITY_OVERRIDES` → `remoteMeta.supportsImages` →
+   * `productFallbackMeta.supportsImages` → `IMAGE_MODELS`）：
+   * 本函数判「有没有表态」，那条链判「表态成什么」。两处口径不一致时，
+   * 同一文件就会存在「一处说有、一处说无」的两套判据 —— 那正是本仓库反复
+   * 出静默缺陷的形态。
+   *
+   * ⚠️ **刻意不含 `reasoningEfforts` / `defaultReasoningEffort`**：那不是图片
+   * 能力。而目录准入侧的 `hasRemoteImageCapability` 也**只认 `supportsImages`** ——
+   * 三处都是「只认图片能力」，互不交叉，**不会**出现「只带思考档位的远端模型
+   * 被收进目录却判为图片未知」这类分叉（它的处置是保守的：不放行图片）。
+   */
+  private imageCapabilityKnown(model: string): boolean {
+    if (BuddyAdapter.IMAGE_CAPABILITY_OVERRIDES.has(model)) return true
+    // 远端显式 false 同样是「表态」，必须算已知。
+    if (this.remoteMeta.get(model)?.supportsImages !== undefined) return true
+    return this.productFallbackMeta.get(model)?.supportsImages !== undefined
+      || IMAGE_MODELS.has(model)
   }
 
   /** 模型可选的思考等级：远端 supportedEfforts 优先，产品兜底表次之，通用静态表最后。 */
@@ -1154,8 +1313,20 @@ export class BuddyAdapter extends LlmAdapter {
       provider: this.product.id,
       id: model.id,
       name: displayNameFor(model, listed),
-      inputModalities: this.inputModalitiesFor(model.id),
+      ...this.imageModalitiesField(model.id),
     }))
+  }
+
+  /**
+   * 把 {@link inputModalitiesFor} 的结果摊成 `LlmModelInfo` 的可选字段。
+   *
+   * ⚠️ 必须**省略**而不是报 `['text']`：宿主契约明写
+   * 「absent means unknown」（dsh-llm `types.d.ts`），而 DSH 见到
+   * 「不含 image」的声明会按「确认是纯文本模型」把图片静默投影成占位文本。
+   */
+  private imageModalitiesField(model: string): { inputModalities?: readonly ('text' | 'image')[] } {
+    const modalities = this.inputModalitiesFor(model)
+    return modalities === undefined ? {} : { inputModalities: modalities }
   }
 
   /**
@@ -1184,7 +1355,7 @@ export class BuddyAdapter extends LlmAdapter {
       provider,
       id: model,
       name: this.remoteMeta.get(model)?.name ?? this.productFallbackIndex.get(model)?.name ?? model,
-      inputModalities: this.inputModalitiesFor(model),
+      ...this.imageModalitiesField(model),
     }
     if (contextWindow !== undefined) resolved.context = { contextWindow }
     // 单次输出上限：远端 maxOutputTokens（实测 deepseek-v4.1-flash = 128000）
@@ -1296,7 +1467,36 @@ export class BuddyAdapter extends LlmAdapter {
     }
     let imageUrls: Map<string, string> | undefined
     if (imageRefs.size > 0) {
-      if (!this.inputModalitiesFor(options.model).includes('image')) {
+      // 能力未知时先给「重看一次目录」一次机会（受 10 秒间隔约束，
+      // 见 refreshCatalog）：目录若已恢复，这一轮就能正常发图，
+      // 用户根本看不到下面那句「请稍后重试」。
+      if (this.inputModalitiesFor(options.model) === undefined) {
+        await this.refreshCatalog()
+      }
+      const modalities = this.inputModalitiesFor(options.model)
+      if (modalities === undefined) {
+        // ⚠️ **能力未知 ≠ 不支持**（issue IKJQ3M）：目录没拉到就说「模型不支持
+        // 图片」，用户会去换模型、查文档，而真正的解法只是等目录就绪。
+        // 故用可区分的错误码与文案，别把「不知道」说成「不支持」。
+        //
+        // ⚠️⚠️ **不能用 `TRANSPORT`**（初版误选，被自己的回归用例抓出）：
+        // `DEFAULT_RETRYABLE_CODES` 实测是
+        // `['EMPTY_RESPONSE','RATE_LIMIT','SERVER','TIMEOUT','TRANSPORT']`
+        // —— `TRANSPORT` **就在里面**（dsh-llm `lib/index.js`）。于是这条
+        // 「请稍后重试」会被 harness 白重试 5 次（500/1000/2000/4000/8000 ms），
+        // 每次都重走一遍 `stream()` → `refreshCatalog()`，把一次用户报错放大成
+        // 6 次目录拉取 + 6 次凭据解析（目录端点超时上限 60s，用户还会看到 6 次闪动）。
+        //
+        // ⇒ 方向取反：这类「等一会儿就好」的错误**不该由 harness 自动重试**。
+        // `INVALID_REQUEST` 是仓库既有惯例（见本文件 `classifyHttpStatus`），
+        // 且不在可重试集合里；用户在目录恢复后自己重试即可 ——
+        // 那时 `refreshCatalog` 的 10 秒窗口通常已过，能直接发图。
+        throw new LlmError(
+          `${this.product.id}: 模型 "${options.model}" 的能力列表尚未加载完成，暂时无法判断是否支持图片；请稍后重试。`,
+          'INVALID_REQUEST',
+        )
+      }
+      if (!modalities.includes('image')) {
         throw new LlmError(`${this.product.id}: model "${options.model}" does not accept image input.`, 'UNSUPPORTED_CONTENT')
       }
       if (this.options.readImage === undefined) {
