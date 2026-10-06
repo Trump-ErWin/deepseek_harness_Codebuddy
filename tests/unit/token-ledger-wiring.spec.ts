@@ -7,6 +7,7 @@ import {
 import { registerAdapterIdempotent, recordThroughStream, wrapAdapterWithTokenLedger } from '../../src/llm-register-compat.js'
 import { withDeadModelPruning } from '../../src/dead-model-store.js'
 import {
+  MIN_DECODE_MS_FOR_TPS,
   attachTokenLedgerStore,
   peekLedgerAccount,
   readTokenLedger,
@@ -94,15 +95,19 @@ describe('recordThroughStream：记账骨架', () => {
    */
   it('ttft/tps：包装层实测首块时刻，记账层算出速率', async () => {
     resetTokenLedgerForTests()
-    // ⚠️ 生成器**内**跨 tick：首块之后 sleep 一小段再收 usage，让
-    // durationMs − ttftMs > 0（tps 的分母）。无间隔时 tps 不可测（省略），
-    // ttft 仍然 > 0 —— 那是正确行为，不是缺陷。
+    // ⚠️ 生成器**内**跨 tick：首块之后 sleep 再收 usage，让
+    // durationMs − ttftMs 达到 {@link MIN_DECODE_MS_FOR_TPS} 门槛（tps 的分母下限）。
+    //
+    // ⚠️ 间隔必须 ≥ 100ms 而非「> 0」：decodeMs 塌缩到个位数毫秒会算出
+    // 几十万 tok/s 的假值（真实缺陷 2026-10-07：单笔 1ms 样本把均值从 184
+    // 拉到 634592）。旧写法 sleep(30) 恰好落在门槛之下，修复后 tps 正确地
+    // 变为「不可测」—— 那是预期行为，不是缺陷。
     const startedAt = Date.now() - 50
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
     await collect(recordThroughStream(
       async function* () {
         yield { type: 'reasoning-delta', text: 'thinking...' }
-        await sleep(30)
+        await sleep(MIN_DECODE_MS_FOR_TPS + 30)
         yield usageChunk(10, 100)
       },
       { channel: 'direct', provider: 'p', model: 'm', startedAt },
@@ -110,6 +115,26 @@ describe('recordThroughStream：记账骨架', () => {
     const row = readTokenLedger().entries[0]!
     expect(row.ttftMs).toBeGreaterThan(0)
     expect(row.tps).toBeGreaterThan(0)
+  })
+
+  it('⚠️ 首块后间隔过短（< 100ms）⇒ tps 不可测，但 ttft 照常保留', async () => {
+    resetTokenLedgerForTests()
+    // 守卫方向：不能只测「够长时可测」，还得测「不够长时确实不测」——
+    // 否则有人把门槛调到 0，本条仍绿，而 982.5 tok/s 的缺陷会复活。
+    const startedAt = Date.now() - 50
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+    await collect(recordThroughStream(
+      async function* () {
+        yield { type: 'reasoning-delta', text: 'thinking...' }
+        await sleep(MIN_DECODE_MS_FOR_TPS - 70) // 落在门槛之下
+        yield usageChunk(10, 100)
+      },
+      { channel: 'direct', provider: 'p', model: 'm', startedAt },
+    ))
+    const row = readTokenLedger().entries[0]!
+    // 首字用时不受该门槛影响（它测的是「第一个 chunk 何时到」）。
+    expect(row.ttftMs).toBeGreaterThan(0)
+    expect(row.tps).toBeUndefined()
   })
 
   it('流结束但没等到 usage：usageReported=false（显示 — 而不是 0）', async () => {

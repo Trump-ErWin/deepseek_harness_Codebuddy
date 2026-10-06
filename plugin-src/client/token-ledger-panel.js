@@ -96,12 +96,35 @@ export function formatTps(entry) {
   return v + ' tok/s';
 }
 
-/** 均值格（汇总行）：`avg 0.9s · 48 tok/s`；两边都不可测 → `—`。 */
+/**
+ * 均值格（汇总行）：`avg 0.9s · 48 tok/s`；两边都不可测 → `—`。
+ *
+ * ⚠️ 速率是**算术均值**，对离群样本敏感（用户 2026-10-07 报障「982.5 tok/s」）。
+ * 服务端已丢弃 `decodeMs` 过短（分母塌缩）的样本，但混合分布下均值仍可能
+ * 偏高/偏低；正式口径说明见 {@link avgPerfTooltip}。
+ */
 export function avgPerfText(row) {
   const ttft = typeof row?.avgTtftMs === 'number' && row.avgTtftMs > 0 ? formatDuration(row.avgTtftMs) : null;
   const tps = typeof row?.avgTps === 'number' && row.avgTps > 0 ? row.avgTps + ' tok/s' : null;
   if (ttft === null && tps === null) return '—';
   return '首字 ' + (ttft ?? '—') + ' · ' + (tps ?? '—');
+}
+
+/**
+ * 均值格的**口径说明**（tooltip）。
+ *
+ * ⚠️ 必须显式说明「均值对离群样本敏感」：用户看到 lobsterai「982.5 tok/s」
+ * 时合理怀疑是算错了，而不给口径说明就无从判断。分成两条：
+ * 首字用时可测条件较宽；速率额外要求「解码时长 ≥ 100ms」——
+ * 否则首块与结束贴在一起时分母塌缩，会算出几十万 tok/s 的假值
+ * （已实测：单笔 decode=1ms 的样本能把均值从 184 拉到 634592）。
+ */
+export function avgPerfTooltip() {
+  return '均值口径：对有实测值的请求取算术平均。'
+    + '「首字」= 首个 chunk 到达前的耗时；'
+    + '「速率」= 全部输出 token ÷（首块之后 → 结束）的时长，'
+    + '要求解码时长 ≥ 100ms（过短视为不可测、不计入）。'
+    + '算术均值对离群样本敏感：个别极快/极慢的请求会明显拉高或拉低该值。';
 }
 
 // ───────────────────── 历史视图（第 4 期）─────────────────────
