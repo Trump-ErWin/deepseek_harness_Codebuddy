@@ -387,14 +387,30 @@ describe('供应商开关的样式约束（源码级回归）', () => {
 
   /**
    * ⚠️ 页头按钮必须排成一排（用户报障：加了开关入口之后「关闭」掉到第二行）。
-   * 三处配合缺一不可：brand 让出宽度、副标题单行省略、按钮组不参与收缩。
+   * 两处配合缺一不可：brand 让出宽度、按钮组不参与收缩。
    */
-  it('页头按钮排成一排：brand 可收缩 + 副标题单行省略 + 按钮组不收缩', () => {
+  it('页头按钮排成一排：brand 可收缩 + 按钮组不收缩', () => {
     expect(styles).toMatch(/\.dim-jh-brand \{[^}]*min-width: 0/)
-    expect(styles).toMatch(/\.dim-jh-brandDesc \{[^}]*white-space: nowrap[^}]*text-overflow: ellipsis/)
     expect(styles).toMatch(/\.dim-jh-headerActions \{[^}]*flex: none/)
     // 极窄窗口的兜底仍在：换行好过溢出到窗口外点不到。
     expect(styles).toMatch(/\.dim-jh-headerActions \{[^}]*flex-wrap: wrap/)
+  })
+
+  /**
+   * ⚠️ 页头副标题必须**保持删除**（用户 2026-10-06 要求：按钮太多，
+   * 「Jet Hub」下面那行「提供商凭据与多账号管理」既显示不全又挤占页头高度）。
+   *
+   * 这条是**反向断言**：初版删掉了 DOM 节点但没删 CSS、也没改这条用例，
+   * 于是「样式已无引用」这种残留不会被任何测试发现 —— 加回来就重新占位。
+   */
+  it('页头副标题已移除：DOM 无 brandDesc、样式表也不得再有该规则', () => {
+    // ⚠️ 只匹配**代码用法**（className 字面量 / CSS 规则），不匹配注释 ——
+    // 上面的注释故意保留「曾有副标题」这段历史，读到就红会逼后人删掉它。
+    expect(source).not.toMatch(/className: 'dim-jh-brandDesc'/)
+    expect(styles).not.toMatch(/\.dim-jh-brandDesc\s*\{/)
+    // 标题本体必须还在（不能连「Jet Hub」一起删掉）。
+    expect(source).toContain("'Jet Hub'")
+    expect(styles).toMatch(/\.dim-jh-brandName \{/)
   })
 })
 
