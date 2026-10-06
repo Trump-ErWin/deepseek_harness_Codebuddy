@@ -66,8 +66,13 @@ export interface OpenAiChatRequest {
 
 export function normalizeMaxTokens(value: number | undefined, provider: string, model: string): number | undefined {
   if (value === undefined) return undefined
-  // GLM-5.2 与 DeepSeek V4 实测均会拒绝 128000，65536 可正常推理。
-  if (provider === 'codearts' && (/^deepseek-v4-(flash|pro)$/.test(model) || model === 'GLM-5.2')) {
+  // CodeArts 的这些模型会拒绝 128000；网关对它们统一限制输出上限。
+  if (provider === 'codearts' && (
+    /^deepseek-v4-(flash|pro)$/.test(model)
+    || model === 'GLM-5.2'
+    || model === 'glm-5.3-flash'
+    || model === 'deepseek-v4.1-flash'
+  )) {
     return Math.min(value, 65536)
   }
   return value
