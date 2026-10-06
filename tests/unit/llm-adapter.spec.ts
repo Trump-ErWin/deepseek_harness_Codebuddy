@@ -206,6 +206,66 @@ describe('CodeArtsAdapter', () => {
     expect(unset.thinking).toBeUndefined()
   })
 
+  /**
+   * ⚠️ 输出上限必须在**出站 body** 上锁死，不能只测网关层的归一化函数。
+   *
+   * 真实缺陷（PR !70 审计发现）：钳制原先只做在
+   * `openai-gateway/messages.ts` 的 `normalizeMaxTokens`，而
+   * `maxTokens` 是 agent 的一等构造参数（`dsh-agent-loop` 只校验
+   * 「正安全整数」、**无上限校验**）⇒ **不经过网关的直连路径完全绕过那道判据**，
+   * 128000 会原样发往华为云（上游回 `The request param is invalid`）。
+   * 这与 TRAE 的 `clampTraeMaxTokens`、Cline 的 `clampClineMaxTokens` 同因。
+   *
+   * ⇒ 回归用例必须经 `stream()` 的真实链路、断言**实际发出去的** `max_tokens`；
+   * 直接调纯函数会像本仓库既往教训（AGENTS.md「包装适配器」）那样全绿而测不到生产路径。
+   */
+  describe('输出上限钳制（最后一道防线）', () => {
+    /** 跑一次真实 stream()，返回出站请求体。 */
+    const sentBody = async (maxTokens: unknown, model = 'deepseek-v4-flash') => {
+      const seen: Array<Record<string, unknown>> = []
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+        return new Response(
+          'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        )
+      })
+      const adapter = makeAdapter({ fetchImpl })
+      const opts = {
+        provider: 'codearts', model, messages: [], maxTokens,
+        signal: new AbortController().signal,
+      } as never
+      for await (const _ of adapter.stream(opts)) { /* drain */ }
+      return seen.at(-1)!
+    }
+
+    it('显式传入超大 maxTokens 时收敛到 65536（修复前是原样透传 128000）', async () => {
+      expect((await sentBody(128_000)).max_tokens).toBe(65_536)
+      expect((await sentBody(131_072)).max_tokens).toBe(65_536)
+      expect((await sentBody(999_999)).max_tokens).toBe(65_536)
+    })
+
+    it('较小的请求值原样保留（钳制只往下压，不往上抬）', async () => {
+      expect((await sentBody(32_000)).max_tokens).toBe(32_000)
+      expect((await sentBody(64)).max_tokens).toBe(64)
+      expect((await sentBody(65_536)).max_tokens).toBe(65_536)
+    })
+
+    it('未传 / 非法值回落到默认 65536（不编造别的数值）', async () => {
+      expect((await sentBody(undefined)).max_tokens).toBe(65_536)
+      expect((await sentBody(0)).max_tokens).toBe(65_536)
+      expect((await sentBody(-1)).max_tokens).toBe(65_536)
+      expect((await sentBody(Number.NaN)).max_tokens).toBe(65_536)
+      expect((await sentBody(Number.POSITIVE_INFINITY)).max_tokens).toBe(65_536)
+    })
+
+    it('对**每一个** CodeArts 模型都生效 —— 适配器层是统一边界，不逐模型开洞', async () => {
+      for (const model of ['GLM-5.2', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'openpangu-2.0-pro']) {
+        expect((await sentBody(128_000, model)).max_tokens, model).toBe(65_536)
+      }
+    })
+  })
+
   it('streams text deltas from an OpenAI-compatible SSE response', async () => {
     const fetchImpl = vi.fn(async () => new Response(
       'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
