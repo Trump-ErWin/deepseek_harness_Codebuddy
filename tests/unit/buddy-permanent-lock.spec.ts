@@ -99,10 +99,25 @@ describe('index.ts 的接线', () => {
 
   it('凭据解析函数两站共用一份（同协议，差别只在 endpoint）', () => {
     expect(indexCode).toContain('const resolveBuddyCredentialByRef =')
-    // 三处引用：两个 selector 的依赖 + 编排的缺省解析器（泛化后带类型断言，故不匹配整行）
-    const refs = indexCode.match(/resolveBuddyCredentialByRef/g) ?? []
-    expect(refs.length).toBeGreaterThanOrEqual(4) // 1 处定义 + 3 处使用
-    expect(indexCode).toContain('options.resolveCredential')
+    // ⚠️ **不能用「标识符出现次数」来断言**（PR !68 初版就是这么写的，已实测是
+    // 同义反复）：把两个 selector 里的 `resolveCredential: resolveBuddyCredentialByRef`
+    // 改成 `(r) => resolveBuddyCredentialByRef(r)` 后，标识符**仍然是 4 次**，
+    // 计数断言照样绿 —— 而「两个 selector 确实用了 buddy 那份解析器」已不存在。
+    // 改成**逐个选择器定义块**内做精确匹配。
+    for (const name of ['buddyBalanceSelector', 'workbuddyBalanceSelector']) {
+      const start = indexCode.indexOf(`const ${name} = new BuddyBalanceSelector(`)
+      expect(start, `index.ts 里找不到 ${name}`).toBeGreaterThan(-1)
+      const block = indexCode.slice(start, indexCode.indexOf('})', start))
+      expect(block, `${name} 必须直接用 resolveBuddyCredentialByRef`).toMatch(
+        /resolveCredential:\s*resolveBuddyCredentialByRef\b/,
+      )
+    }
+    // 编排的**入参**必须真的被传下去（只断言 `options.resolveCredential` 出现在
+    // 源码里是不够的 —— 它只有定义处一处命中，观测不到调用点）。
+    const body = pickHelperBody()
+    expect(body, '编排必须把 resolveCredential 传给 pickBuddyAccount').toMatch(
+      /pickBuddyAccount\([\s\S]*?resolveCredential,/,
+    )
   })
 
   it('所有走选号编排的 provider 都调 pickBuddyCredential', () => {
@@ -184,6 +199,58 @@ describe('index.ts 的接线', () => {
       )
       expect(indexCode, `${name} 的选择器必须注入 fetchBalance`).toMatch(re)
       expect(indexCode, `${name} 应调用 ${fn}`).toContain(fn)
+    }
+  })
+
+  /**
+   * ⚠️ **兜底必须带上 `picked.tried`**（PR !68 新增，此前是漏的）。
+   *
+   * 不带的话，档位最优但**凭据损坏**的账号会被 `getAvailableAccount` 立刻选回
+   * （池按手动顺序取第一个）⇒ 兜底**原地打转**，换号形同虚设。
+   * 这与 AGENTS.md 反复强调的「切号必须传 tried」是同一类缺陷。
+   *
+   * ⚠️ 已实测：删掉第三个参数后**全量单测照样全绿** —— 必须钉住。
+   */
+  it('★ 两家兜底调 getAvailableAccount 必须透传 picked.tried', () => {
+    for (const id of ['TRAE.id', 'LOBSTERAI.id']) {
+      const re = new RegExp(
+        `getAvailableAccount\\(${id}, modelId \\?\\? '', picked\\.tried\\)`,
+      )
+      expect(indexCode, `${id} 的兜底必须传 tried 排除集`).toMatch(re)
+    }
+  })
+
+  /**
+   * ⚠️ **Token 账本归属不能丢**：`reportLedgerAccount(<ID>.id, picked.accountId)`。
+   *
+   * `pickBuddyCredential` 的返回值新增 `accountId` 就是为了这个（PR 说明里专门写了
+   * 「重构时**保持不丢**」）。实测把这两行删掉、或把 provider 报成 `'buddy'`，
+   * **全量单测全绿** —— token 账本会把这笔消耗记到错误的 provider 上。
+   */
+  it('★ 两家回报 token 账本时用自己选中的账号（不得丢失或报错 provider）', () => {
+    for (const id of ['TRAE', 'LOBSTERAI']) {
+      const re = new RegExp(
+        `reportLedgerAccount\\(${id}\\.id, picked\\.accountId\\)`,
+      )
+      expect(indexCode, `${id} 必须回报 picked.accountId`).toMatch(re)
+    }
+  })
+
+  /**
+   * ⚠️ **`modelId` 必须透传给编排与兜底**。
+   *
+   * 漏传给编排 ⇒ 候选的模型级限流过滤整体短路（`if (key.length === 0) return true`）
+   * ⇒ 被标记限流的号仍被选中；漏传给兜底 ⇒ 同理短路。
+   * buddy 侧 `trae-model-id-selection.spec.ts` 防的是「传空串」，**防不了整行不传**。
+   */
+  it('★ 两家把 modelId 透传给编排与兜底（限流过滤不得短路）', () => {
+    for (const block of [pickCallBlock('TRAE'), pickCallBlock('LOBSTERAI')]) {
+      expect(block, '编排调用必须带 modelId').toMatch(/modelId,/)
+    }
+    for (const id of ['TRAE.id', 'LOBSTERAI.id']) {
+      expect(indexCode, `${id} 的兜底必须透传 modelId`).toMatch(
+        new RegExp(`getAvailableAccount\\(${id}, modelId \\?\\? ''`),
+      )
     }
   })
 

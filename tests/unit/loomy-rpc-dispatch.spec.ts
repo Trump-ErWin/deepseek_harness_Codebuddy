@@ -110,6 +110,28 @@ describe('Loomy RPC 分派', () => {
     expect(typesSource).toMatch(/interface RpcPermanentLockResponse \{[\s\S]*?windowDays\?: number/)
   })
 
+  /**
+   * ⚠️ **TRAE / LobsterAI 也必须回传窗口天数**（2026-10-06 PR !68 审计补齐）。
+   *
+   * 判据已从「是不是 buddy」改成「**是否按到期时间分桶**」，而这两家走的是同一个
+   * `splitBuddyCreditsByExpiry`、同样受 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 影响。
+   *
+   * ⚠️ 上面那条用例的正则只覆盖 buddy 那一半：把 `|| provider === TRAE.id
+   * || provider === LOBSTERAI.id` 整段删掉，全量单测**照样全绿** —— 而后果是
+   * 用户把窗口改成 7 天时，面板仍按默认 15 天渲染文案，与真实判据不一致
+   * （提示说只烧 15 天内的、实际按 7 天筛号）。
+   */
+  it('★ TRAE / LobsterAI 的响应同样回传窗口天数（判据是「按到期时间分桶」）', () => {
+    // 取 `usesExpiryWindow` 那一行起算，避免被别处同名字符串匹配到。
+    const start = rpcSource.indexOf('const usesExpiryWindow =')
+    expect(start, 'jet-hub-rpc.ts 里找不到 usesExpiryWindow').toBeGreaterThan(-1)
+    const decl = rpcSource.slice(start, start + 300)
+    expect(decl, 'usesExpiryWindow 必须含 TRAE').toContain('provider === TRAE.id')
+    expect(decl, 'usesExpiryWindow 必须含 LOBSTERAI').toContain('provider === LOBSTERAI.id')
+    // 判据**不是**「是不是 buddy」—— 保留断言防止有人改回旧写法。
+    expect(decl).not.toMatch(/isBuddy|=== 'buddy'/)
+  })
+
   it('后端有 provider 白名单，且与 Loomy/Buddy 的支持面一致', () => {
     expect(rpcSource).toMatch(/PERMANENT_LOCK_PROVIDERS[\s\S]{0,200}LOOMY\.id/)
     expect(rpcSource).toContain('CODEBUDDY.id')
