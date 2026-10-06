@@ -70,6 +70,38 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['deepseek-v4.1-flash', 1_000_000],
 ])
 
+/**
+ * 单次请求输出上限的安全边界。
+ *
+ * ⚠️ 取值依据是**本文件下方出站处的实测**（参考实现 deveco-code-rust e2e：
+ * 65536 可用，131072 反而触发空流被后端拒绝）。**不是**「拒绝 128000」——
+ * CodeArts 语境下仓库里没有任何 128000 的实测记录（README 那张
+ * 128000/131072 表属于 buddy/workbuddy；`deepseek-v4.1-flash` 两个 provider
+ * 都有该 id，极易张冠李戴）。
+ *
+ * ⚠️ 这是**全 provider 统一**的边界，不是逐模型表：本适配器的出站点只有一个，
+ * 而 `CONTEXT_WINDOWS` 之上方已注明「其余模型未公开上下文容量」——
+ * 拿不到实测就不该臆造更小的值。故凡走本适配器的模型一律收敛到此上限。
+ */
+const CODEARTS_MAX_OUTPUT_TOKENS = 65_536
+
+/**
+ * 收敛输出上限到安全区间；非法值返回 undefined（不编造，交由调用方取默认）。
+ *
+ * ⚠️ 存在的理由与 TRAE 的 `clampTraeMaxTokens`、Cline 的 `clampClineMaxTokens`
+ * 完全同因：上游网关对超大 `max_tokens` 会直接 4xx，而 DSH 可能注入一个来自
+ * 其它 provider 的大值（`maxTokens` 是 agent 的一等构造参数，只校验
+ * 「正安全整数」、**无上限校验**）。网关层的 `normalizeMaxTokens` 只覆盖
+ * 走 `/v1/chat/completions` 与 `/v1/responses` 的请求，**直连路径完全绕过它**
+ * ⇒ 本函数是最后一道防线。
+ */
+function clampCodeArtsMaxTokens(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value)) return undefined
+  const integer = Math.floor(value)
+  if (integer <= 0) return undefined
+  return Math.min(integer, CODEARTS_MAX_OUTPUT_TOKENS)
+}
+
 export interface CodeArtsAdapterOptions {
   credentialRef: CredentialRef
   resolveCredential: () => Promise<CodeArtsCredential | undefined>
@@ -1109,9 +1141,17 @@ export class CodeArtsAdapter extends LlmAdapter {
       // 大文件 write 工具参数（如 1000-2000+ 行文档）需要数万 token 的生成空间，
       // 若沿用后端默认输出上限，参数 JSON 会在中途被截断成非法 JSON，harness
       // 工具校验报 `invalid arguments: "arguments" must be an object`。
-      // 参考实现 e2e 实测：65536 可用，131072 反而触发空流被后端拒绝；
-      // 显式传入的 options.maxTokens 优先，未设置时默认 65536。
-      max_tokens: options.maxTokens ?? 65536,
+      // 参考实现 e2e 实测：65536 可用，131072 反而触发空流被后端拒绝。
+      //
+      // ⚠️ **必须钳制，不能只兜底**（与 TRAE 的 `clampTraeMaxTokens`、
+      // Cline 的 `clampClineMaxTokens` 同因）：`options.maxTokens` 原样透传时，
+      // 上游对超大 `max_tokens` 会直接 4xx（`The request param is invalid`），
+      // 而 **DSH 可能注入一个来自其它 provider 的大值** —— `maxTokens` 是 agent
+      // 的一等构造参数（`dsh-agent-loop` 只校验「正安全整数」，**无上限校验**），
+      // 走网关的路径由 `openai-gateway/messages.ts` 的 `normalizeMaxTokens`
+      // 预先收敛，但**不经过网关的直连路径完全绕过那道判据**。
+      // ⇒ 这里是最后一道防线，必须自己收敛，不能依赖上游调用方守规矩。
+      max_tokens: clampCodeArtsMaxTokens(options.maxTokens) ?? CODEARTS_MAX_OUTPUT_TOKENS,
       ...wireTools !== undefined && wireTools.length > 0 ? { tools: wireTools } : {},
     })
     const url = `${CHAT_API_BASE}/chat/completions`
