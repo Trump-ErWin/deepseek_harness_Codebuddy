@@ -134,11 +134,37 @@ const PLATFORM_OS_VERSIONS: Readonly<Record<string, string>> = {
  *
  * 两个域对同一个操作系统的**命名不同**（桌面域说 `win32`、web 域说 `Win32`），
  * 但描述的是同一台机器，故各自按本域习惯命名、而 `arch` 与 `osVersion` 保持一致。
+ *
+ * ⚠️ 这些值是**基线**：`arch` 明确时由 {@link webOsName} 按架构细化。
+ * 原先 linux 恒写 `'Linux x86_64'`，于是 arm64 宿主上报
+ * `os: 'Linux x86_64'` 配 `arch: 'arm64'` —— 同一对象里自相矛盾
+ * （与「非 darwin 一律写 Windows 版本号」是同一类缺陷）。
  */
 const WEB_OS_NAMES: Readonly<Record<string, string>> = {
   darwin: 'MacIntel',
   win32: 'Win32',
   linux: 'Linux x86_64',
+}
+
+/** `process.arch` → `navigator.platform` 里的架构后缀（仅 linux 需要区分）。 */
+const WEB_ARCH_SUFFIXES: Readonly<Record<string, string>> = {
+  x64: 'x86_64',
+  arm64: 'aarch64',
+  ia32: 'i686',
+}
+
+/**
+ * web 域的 `navigator.platform` 取值。
+ *
+ * linux 下按真实架构拼后缀，避免 `os` 与 `arch` 在一个对象里互相矛盾
+ * （浏览器在 linux 上就是报 `Linux x86_64` / `Linux aarch64` 这种形态）。
+ */
+function webOsName(os: string, arch: string): string {
+  if (os === 'linux') {
+    const suffix = WEB_ARCH_SUFFIXES[arch]
+    return suffix === undefined ? WEB_OS_NAMES['linux']! : `Linux ${suffix}`
+  }
+  return WEB_OS_NAMES[os] ?? os
 }
 
 /** 桌面域平台身份。`os` 用 Node 原值，`arch` 用 `process.arch`（不写死 x64）。 */
@@ -154,7 +180,9 @@ function platformIdentity(): PlatformIdentity {
 /** web 域平台身份：同一台机器，按浏览器习惯重命名 `os`。 */
 function webPlatformIdentity(): PlatformIdentity {
   const identity = platformIdentity()
-  return { ...identity, os: WEB_OS_NAMES[identity.os] ?? identity.os }
+  // `os` 按架构细化（linux 的 x86_64/aarch64），`arch` 与 `osVersion` 原样保留 ——
+  // 同一台机器在两个域只能命名不同，不能描述不同。
+  return { ...identity, os: webOsName(identity.os, identity.arch) }
 }
 
 /** 单账号时间预算缺省值（毫秒）。实测单账号 90～270s，10 分钟够 3～4 项从容跑完。 */
@@ -215,6 +243,14 @@ export interface GrowthTaskQuery {
   codes: string[]
   /** 返回的任务总数。 */
   total: number
+  /**
+   * `ok:false` 时的失败原因。
+   *
+   * ⚠️ 必须带上（不能只说「查询失败」）：下游 `collectBuddyGrowth` 靠
+   * **消息文本**判定僵尸账号（401/403 → 「凭据已失效」），原因丢失会让
+   * 「请重新登录」被显示成「没有可做任务」。
+   */
+  message?: string
   /** 仅 `includeInProgress` 时给出：仍需 accept 的 task_code。 */
   toAccept?: Set<string>
   /** 仅 `includeInProgress` 时给出：每个任务码的进度。 */
@@ -362,9 +398,23 @@ function baseOf(product: BuddyProduct): string {
   return String(product.endpoint).replace(/\/+$/, '')
 }
 
-/** web 域（领奖与 web 遥测）基址，取 `product.claimBase`。 */
+/** web 域**领奖**基址，取 `product.claimBase`。 */
 function claimBaseOf(product: BuddyProduct): string {
   return String(product.claimBase).replace(/\/+$/, '')
+}
+
+/**
+ * web 域**遥测上报**基址，取 `product.webBase`。
+ *
+ * ⚠️ 与 `claimBaseOf` **刻意分开**（见 `BuddyProduct.webBase` 的注释：领奖走
+ * 产品 API 站、web 遥测走网页站，`Origin` / `Referer` 需各自独立配置）。
+ * `webBase` 曾只定义不读取（死配置），此处是唯一读取点 —— 删字段前先确认这里。
+ *
+ * 回退：`webBase` 缺失时退到 `claimBase`（两站通常同域，且旧产品配置可能没有该字段）。
+ */
+function webBaseOf(product: BuddyProduct): string {
+  const explicit = typeof product.webBase === 'string' ? product.webBase.trim() : ''
+  return (explicit.length > 0 ? explicit : String(product.claimBase)).replace(/\/+$/, '')
 }
 
 /** SHA-256 十六进制摘要。桌面/网页指纹的 machineId 与 sessionId 由此派生。 */
@@ -470,11 +520,40 @@ function describeNonJsonResponse(status: number, text: string): string {
 }
 
 /**
+ * 「无对象」文案白名单（大小写不敏感的子串匹配）。
+ *
+ * ⚠️ **必须窄**：`code 400` 是成长端点表达多种语义的通用码 —— 它既表示
+ * 「没有可领对象」（正常幂等终态），也表示 `task not completed`（任务真没做完）、
+ * 参数错误等**真失败**。只认 code 会把后者一并归成「已领奖」，用户看到
+ * 「已领到积分」而实际一分没有。
+ *
+ * 实测文案（2026-10-03）：
+ * - `no unclaimed travel` —— 没有未领的旅行奖励
+ * - `insufficient energy` —— 能量不足（盲盒/抽奖类）
+ * - `please accept buddy adoption agreement first` —— 未签 Buddy 采纳协议
+ *
+ * ⚠️ 反向要求：白名单命中即**不再算失败**（归 `no-object` → `already-claimed`），
+ * 故**宁可漏判不可误伤** —— 少了词条只会让某条正常终态被显示成失败（用户多点一次，
+ * 无损害）；多了词条会把真失败谎报成成功（用户以为领到了）。这与本仓库
+ * 「方向取保守」的总原则一致。
+ */
+const GROWTH_NO_OBJECT_MESSAGE_PATTERNS: readonly RegExp[] = [
+  /no unclaimed travel/i,
+  /insufficient energy/i,
+  /accept buddy adoption agreement/i,
+]
+
+/** 该 msg 是否表示「没有可领对象」这一正常终态。 */
+function isNoObjectMessage(message: string): boolean {
+  return GROWTH_NO_OBJECT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message))
+}
+
+/**
  * 把一次成长写请求的响应归类为三类之一：
  * - `success`：code 0，返回 data（可能为空对象）。
- * - `no-object`：code 400 + msg 命中「无对象」文案（无未领旅行/能量不足/未签协议）
+ * - `no-object`：code 400 **且 msg 命中「无对象」文案**（无未领旅行/能量不足/未签协议）
  *   —— 这是**正常的幂等终态**，不是失败。
- * - `failed`：其余。
+ * - `failed`：其余（含 code 400 但 msg 是 `task not completed` 这类真失败）。
  */
 function classifyGrowthWrite(result: GrowthCallResult): GrowthWriteResult {
   if (!result.ok) {
@@ -490,8 +569,10 @@ function classifyGrowthWrite(result: GrowthCallResult): GrowthWriteResult {
         : {}
     return { state: 'success', data }
   }
-  if (code === GROWTH_NO_OBJECT_CODE) {
-    return { state: 'no-object', message: message.length > 0 ? message : '暂无可领取对象' }
+  // ⚠️ code 400 必须**同时**看 msg：见上面白名单的注释（此处曾把任何 code 400
+  // 都当幂等终态，于是 `task not completed` 被谎报成「已领奖」）。
+  if (code === GROWTH_NO_OBJECT_CODE && isNoObjectMessage(message)) {
+    return { state: 'no-object', message }
   }
   return { state: 'failed', code, message: message.length > 0 ? message : '领取失败' }
 }
@@ -539,9 +620,17 @@ export async function fetchGrowthTaskCodes(
   const toAccept = new Set<string>()
   let total = 0
   let anyOk = false
+  /** 首个失败原因（供下游区分「凭据失效」与「没有任务」，见 GrowthTaskQuery.message）。 */
+  let failureMessage = ''
   for (const path of GROWTH_TASKS_PATHS) {
     const result = await getGrowthJson(path, credential, product, fetcher)
     if (!result.ok || result.body.code !== 0) {
+      // 只留首个原因：两个端点通常同因失败，后者多为级联。
+      if (failureMessage.length === 0) {
+        failureMessage = result.ok
+          ? `任务列表返回 code ${String(result.body.code)}`
+          : result.message
+      }
       continue
     }
     anyOk = true
@@ -590,7 +679,10 @@ export async function fetchGrowthTaskCodes(
     }
   }
   if (!anyOk) {
-    return { ok: false, codes: [], total: 0 }
+    return {
+      ok: false, codes: [], total: 0,
+      message: failureMessage.length > 0 ? failureMessage : '任务列表查询失败',
+    }
   }
   const base = { ok: true, codes: [...new Set(pending)], total }
   return includeInProgress ? { ...base, toAccept, progressByCode } : base
@@ -1672,26 +1764,37 @@ export async function fetchMarketExpertList(
 /**
  * 读**全量**成长任务 code（含 not_accepted / in_progress / accepted / completed），
  * 供扫尾补领覆盖所有「已完成未领取」的任务（而非只 not_accepted 子集）。
- * 任一可用端点取到列表即返回；全失败返回空数组。
+ * 全失败返回空数组。
+ *
+ * ⚠️ 与 {@link fetchGrowthTaskCodes} 同款的两个要求，**改这里时必须一起改**，
+ * 否则扫尾会静默漏项（两处一旦分叉，只有这里漏，且不报错）：
+ *
+ * 1. **必须合并两个端点**，不能命中第一个就返回。`/v2/activity/growth/tasks`
+ *    （成长族）非空时若直接返回，第二端点（等级族）的任务永远进不了扫尾。
+ *    这与 `fetchGrowthTaskCodes` 的注释是同一个坑，此处曾复发。
+ * 2. **码字段名两族不同**：成长族是 `task_code`，等级族是 `code`。
+ *    只读 `task_code` 会让等级族全部被 `.filter(code.length > 0)` 静默丢掉。
  */
 async function listAllGrowthTaskCodes(
   credential: BuddyCredential,
   product: BuddyProduct,
   fetcher: typeof fetch,
 ): Promise<string[]> {
+  const codes = new Set<string>()
   for (const path of GROWTH_TASKS_PATHS) {
     const result = await getGrowthJson(path, credential, product, fetcher)
     if (!result.ok || result.body.code !== 0) {
       continue
     }
-    const codes = tasksOf(result)
-      .map((task) => readString(task, 'task_code'))
-      .filter((code) => code.length > 0)
-    if (codes.length > 0) {
-      return codes
+    for (const task of tasksOf(result)) {
+      // 两族的码字段不同：`task_code`（成长）/ `code`（等级）—— 同 fetchGrowthTaskCodes。
+      const code = readString(task, 'task_code') || readString(task, 'code')
+      if (code.length > 0) {
+        codes.add(code)
+      }
     }
   }
-  return []
+  return [...codes]
 }
 
 /**
@@ -1757,12 +1860,22 @@ export async function claimGrowthTaskReward(
         message: `领取 ${taskCode} 响应无法解析`,
       }
     }
-    if (payload.code !== undefined && payload.code !== 0) {
+    // ⚠️ 写端点的成功判据必须是**显式的 `code === 0`**，不能写成
+    // `code !== undefined && code !== 0` —— 那样「响应里根本没有 code」会被
+    // 当成成功，于是网关错误体（如 `{msg:'Unauthorized', status:401}` 这类
+    // 非 0 但无 code 的形状）被谎报成「已领取奖励（+0 积分）」并计入
+    // `claimedCount`。这与本文件 `classifyGrowthWrite`（写端点的权威分类器，
+    // 缺 code 时归 -1 → failed）判据相反，是同一文件内的分叉。
+    const code = typeof payload.code === 'number' ? payload.code : undefined
+    if (code !== 0) {
+      const reason = readString(payload, 'msg')
       return {
         ok: false,
         claimed: false,
         credit: 0,
-        message: `领取 ${taskCode} 失败：${readString(payload, 'msg')}`,
+        message: `领取 ${taskCode} 失败：${
+          reason.length > 0 ? reason : code === undefined ? '响应缺少 code 字段' : `code ${code}`
+        }`,
       }
     }
     const data =
@@ -1811,7 +1924,9 @@ async function reportWebEvent(
   elementId: string,
   elementName: string,
 ): Promise<{ ok: boolean; message: string }> {
-  const webOrigin = claimBaseOf(product)
+  // ⚠️ 用 `webBaseOf` 而非 `claimBaseOf`：本函数是 **web 遥测**（`/v2/report` +
+  // 带 `Origin`/`Referer`），与领奖端点分属两站，配置项也不同。
+  const webOrigin = webBaseOf(product)
   const now = Date.now()
   const pageUrl = `${webOrigin}/space/d/${LIBRARY_SPACE_DOC_ID}`
   const body = [{
@@ -2057,6 +2172,24 @@ export async function runGrowthTaskCompletions(
   fetcher: typeof fetch = fetch,
   options: GrowthCompletionOptions = {},
 ): Promise<GrowthCompletionReport> {
+  /**
+   * ⚠️ 缺 `user_id` 必须**显式留痕**，不能静默跑完。
+   *
+   * 判据事件里的 `userId` / `machineId` 全部由 `credential.user_id` 派生
+   * （见 `desktopFingerprint` / `reportWebEvent`）：uid 为空时 `userId` 上报空串、
+   * `machineId` 退化成 `sha256('machine:')` —— 按用户维度计数的判据**必然不计数**，
+   * 而代码不报错、接口不报错，表现为「跑完一圈 0 项完成」，用户完全无从排查。
+   *
+   * 不直接返回失败：仍有不依赖 uid 的服务端逻辑（接取、部分任务），
+   * 直接放弃会连那些也丢掉。故只把原因写进 message 让用户看见。
+   */
+  const missingUserId = !credential.user_id
+  if (missingUserId) {
+    console.warn(
+      '[buddy-growth] 凭据缺少 user_id：判据事件里的 userId/machineId 将退化，'
+      + '任务大概率不被服务端计数。请重新登录该账号。',
+    )
+  }
   // 取「白名单可达 ∩ 未完成（not_accepted + in_progress）」的 task_code。
   // 接取（accept）把任务从 not_accepted 置 in_progress，完成动作必须在
   // in_progress 上再触发一次才判完成并发积分 —— 不能只看 not_accepted。
@@ -2064,46 +2197,36 @@ export async function runGrowthTaskCompletions(
     includeInProgress: true,
   })
   if (!unfinished.ok) {
+    /**
+     * ⚠️ 必须把失败原因**也放进 `results`**（用 `unfinished.message`，其中
+     * 401/403 会说「凭据已失效」），不能只写在 `message` 里。
+     *
+     * 下游 `collectBuddyGrowth`（`jet-hub-rpc.ts`）判僵尸账号的依据是
+     * **逐项** `results.some(r => /凭据已失效/.test(r.message))`。此处若返回空
+     * `results`，凭据失效就判不出来 ⇒ `expired=false` ⇒ 既不计 failed 也不写
+     * error ⇒ 前端显示「本轮无 API 可达的任务（未领到积分）」，
+     * **把「请重新登录」说成「没有任务」**，用户完全无从排查。
+     */
+    const reason = unfinished.message ?? '任务列表查询失败'
     return {
-      ok: false, results: [], completed: 0, clientOnly: 0, failed: 0,
+      ok: false, results: [{ taskCode: '', ok: false, message: reason }],
+      completed: 0, clientOnly: 0, failed: 0,
       claimedCount: 0, claimedCredit: 0, timedOut: false,
-      message: '任务列表查询失败',
+      message: reason,
     }
   }
   const actionable = unfinished.codes.filter((code) => GROWTH_TASK_COMPLETION[code] !== undefined)
   const results: GrowthTaskResult[] = []
-  if (actionable.length === 0) {
-    return {
-      ok: true, results: [], completed: 0, clientOnly: 0, failed: 0,
-      claimedCount: 0, claimedCredit: 0, timedOut: false,
-      message: '无 API 可达的待完成任务',
-    }
-  }
-  // 接取这批里仍 not_accepted 的（in_progress 的跳过 accept，幂等）
-  const toAccept = unfinished.toAccept
-    ? actionable.filter((code) => unfinished.toAccept?.has(code))
-    : actionable
-  const acceptResult = toAccept.length
-    ? await postGrowthJson(
-        GROWTH_TASK_ACCEPT_PATH, credential, product, { task_codes: toAccept }, fetcher,
-      )
-    : ({ ok: true, status: 200, body: { code: 0 } } satisfies GrowthCallResult)
-  const accept = classifyGrowthWrite(acceptResult)
-  if (accept.state === 'failed') {
-    for (const code of actionable) {
-      results.push({ taskCode: code, ok: false, message: `接取失败：${accept.message}` })
-    }
-    return {
-      ok: false, results, completed: 0, clientOnly: 0, failed: actionable.length,
-      claimedCount: 0, claimedCredit: 0, timedOut: false, message: accept.message,
-    }
-  }
+  /** `actionable` 为空时仍须走扫尾（见下方块尾注释），此处只用于最终文案。 */
+  const noActionableTasks = actionable.length === 0
 
   let completed = 0
   let failed = 0
   let clientOnly = 0
   const progressByCode = unfinished.progressByCode ?? {}
 
+  // 预算**必须在此处**算好：扫尾补领受同一 deadline 约束，若等到逐项完成阶段
+  // 才计算，则 `actionable` 为空时扫尾会绕过预算直接对全量任务逐个 POST。
   // 非有限值（NaN / Infinity）归为「不限」并留痕：Number('abc') 得 NaN，而
   // NaN > 0 为 false，若不显式区分会静默变成不限时，恰是本预算要防的情况。
   const rawBudget = options.budgetMs === undefined ? DEFAULT_BUDGET_MS : Number(options.budgetMs)
@@ -2114,6 +2237,30 @@ export async function runGrowthTaskCompletions(
     console.warn(`[buddy-growth] budgetMs=${String(options.budgetMs)} 非有限值，本轮不限时`)
   }
   let timedOut = false
+
+  // 接取这批里仍 not_accepted 的（in_progress 的跳过 accept，幂等）
+  const toAccept = unfinished.toAccept
+    ? actionable.filter((code) => unfinished.toAccept?.has(code))
+    : actionable
+  const acceptResult = toAccept.length
+    ? await postGrowthJson(
+        GROWTH_TASK_ACCEPT_PATH, credential, product, { task_codes: toAccept }, fetcher,
+      )
+    : ({ ok: true, status: 200, body: { code: 0 } } satisfies GrowthCallResult)
+  const accept = classifyGrowthWrite(acceptResult)
+  // 接取失败：逐项记为失败，但**仍继续走扫尾** —— 接取失败只影响「本轮新接的
+  // 任务」，账号里已达标未领取的奖励与接取无关，不该被它连带跳过。
+  // （早期实现此处直接 return，于是接取一失败就整轮不领奖。）
+  const acceptFailed = accept.state === 'failed'
+  if (acceptFailed) {
+    for (const code of actionable) {
+      results.push({ taskCode: code, ok: false, message: `接取失败：${accept.message}` })
+    }
+    failed += actionable.length
+  }
+  // 接取失败 ⇒ 任务未进入 in_progress，完成动作无从生效，故跳过逐项阶段。
+  // `actionable` 为空时它自然也是空数组（上面的 accept 分支已用三元兜住不发请求）。
+  const completable = acceptFailed ? [] : actionable
 
   // 专家类先拉市场真实专家列表（编造 id 不计数；服务端按 expert_id 去重，
   // 同 id 同天只计一次，故 expert_5 需 5 个**不同**专家各用一次，故拉整份列表轮换）。
@@ -2132,7 +2279,7 @@ export async function runGrowthTaskCompletions(
   }
 
   // 串行逐项完成（单账号，防风控）
-  for (const code of actionable) {
+  for (const code of completable) {
     const spec = GROWTH_TASK_COMPLETION[code]
     let ok = false
     let clientOnlyFlag = false
@@ -2533,7 +2680,10 @@ export async function runGrowthTaskCompletions(
         results.push({
           taskCode: code,
           ok: false,
-          message: `扫尾补领触及时间预算，本轮还有 ${remaining} 项未尝试领取；再点一次即可继续`,
+          // ⚠️ 文案必须与逐项阶段的「未执行」用**同一个词**：这条断言
+          // （`message` 含「未执行」）是回归用例判据，两处一旦分叉，
+          // 扫尾分支就没有测试覆盖了。
+          message: `扫尾补领触及时间预算，本轮还有 ${remaining} 项未执行；再点一次即可继续`,
         })
         failed += 1
         break
@@ -2548,6 +2698,10 @@ export async function runGrowthTaskCompletions(
   }
 
   const hasActivity = completed > 0 || failed > 0 || clientOnly > 0 || claimedCount > 0
+  /** 缺 uid 的提示（拼在末尾，无论有无活动都要出现 —— 否则正是「静默」）。 */
+  const uidHint = missingUserId
+    ? '；⚠️ 凭据缺少 user_id，判据事件可能不被服务端计数，请重新登录该账号'
+    : ''
   return {
     ok: failed === 0,
     results,
@@ -2559,8 +2713,12 @@ export async function runGrowthTaskCompletions(
     timedOut,
     ...(hasActivity
       ? {
-          message: `完成 ${completed} 项，需客户端 ${clientOnly} 项，失败 ${failed} 项，自动领取 ${claimedCount} 项（+${claimedCredit} 积分）${timedOut ? '；本轮时间预算用尽，剩余项未执行，再点一次即可继续' : ''}`,
+          message: `完成 ${completed} 项，需客户端 ${clientOnly} 项，失败 ${failed} 项，自动领取 ${claimedCount} 项（+${claimedCredit} 积分）${timedOut ? '；本轮时间预算用尽，剩余项未执行，再点一次即可继续' : ''}${uidHint}`,
         }
-      : {}),
+      : // 无活动：区分「本来就没有可完成任务」与「扫尾领到了但逐项阶段没做」
+        // —— 后者说明账号里只有已达标未领的奖励，是正常终态。
+        noActionableTasks
+        ? { message: `无 API 可达的待完成任务${uidHint}` }
+        : { ...(uidHint.length > 0 ? { message: uidHint.replace(/^；/, '') } : {}) }),
   }
 }

@@ -113,6 +113,18 @@ import { runGrowthTaskCompletions } from './buddy-growth.js'
  * BuddyProduct** 的渠道也不成立 —— 否则直接调用会对每个账号白发一轮串行请求。
  * 客户端的能力表（`credits-capabilities.js`）是是否渲染按钮的权威，本表是服务端
  * 的第二道守卫。
+ *
+ * ⚠️ `WORKBUDDY.id` 在本表里目前是**不可达的**（dead capability），不是「已验证」：
+ * 成长任务的唯一入口是「一键领取积分」按钮，而该按钮由
+ * `supportsCredits = supportsDailyCheckin(provider)` 门控，`workbuddy` 在能力表里
+ * 登记为 `dailyCheckin: false`（国际版后端无签到接口）⇒ 按钮不渲染 ⇒
+ * `runTasks: true` 永远传不到这里。
+ *
+ * 保留它而非现在删掉，是因为它与 `buddy` 同源（共用 CLI 内核与认证协议），
+ * 将来若给 workbuddy 开放签到入口，此处不该再漏 —— 那正是本仓库
+ * 「平行分支越多、漏接概率越高」那条教训的反面用法（此表是**单一登记点**）。
+ * 但放开前必须先实测 `www.workbuddy.ai` 的成长端点（见 `product.ts` 的 `WORKBUDDY`
+ * 注释：`claimBase` / `webBase` 是推断值）。
  */
 const GROWTH_CAPABLE_PROVIDERS: ReadonlySet<string> = new Set([CODEBUDDY.id, WORKBUDDY.id])
 

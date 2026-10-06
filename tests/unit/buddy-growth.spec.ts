@@ -6,12 +6,12 @@ import {
   AUTOMATABLE_TASK_CODES,
   GROWTH_TASK_COMPLETION,
   GROWTH_TASKS_PATHS,
+  claimAllGrowth,
   claimGrowthTaskReward,
   fetchGrowthTaskCodes,
   fetchMarketExpertList,
   runGrowthTaskCompletions,
 } from '../../src/buddy-growth.js'
-
 /**
  * buddy 成长中心任务自动化的判据回归。
  *
@@ -225,17 +225,10 @@ describe('任务映射表的自洽性', () => {
 })
 
 describe('时间预算耗尽的分支', () => {
-  // 该分支必须用 fake timers：真实时钟下会跑满反风控 sleep（任务间1000ms、
-  // 复查前 2000/4000ms），单测无法承受。
-  /**
-   * 该分支依赖**真实时钟**：`deadlineAt` 由入口处 `Date.now()` 算出，而 fake timers
-   * 会冻结时钟，使 `Date.now()` 与定时器推进脱节，测不到真实的越过行为；改用真实时钟
-   * 则要跑满反风控 sleep（任务间 1000ms、复查前 2000/4000ms），超出 5s 单测上限。
-   *
-   * 行为已对线上 API 核实：`budgetMs=1` 返回 `timedOut: true`，且扫尾补领在预算处
-   * 停止并如实报出「剩余 1 项未执行」——即新增的扫尾 deadline 检查确实生效。
-   */
-  it.skip('预算耗尽后如实标记 timedOut，不谎报完成', async () => {
+  // ⚠️ 该分支用 fake timers + `vi.setSystemTime` 驱动（见用例内注释）：
+  // 真实时钟下会跑满反风控 sleep（任务间 1000ms、复查前 2000/4000ms），
+  // 单测无法承受。
+  it('预算耗尽后如实标记 timedOut，不谎报完成', async () => {
     // 所有响应都给任务列表：兜底 {} 会让真实对话拿不到 requestId，任务在三次
     // 请求内快速失败并早于预算判定点结束，测不到 timedOut 分支。
     vi.useFakeTimers()
@@ -312,22 +305,56 @@ describe('runGrowthTaskCompletions 的上报判据', () => {
     })
   })
 
-  it('cred 缺失 spec 的码不会让整轮崩溃', () => {
-    // AUTOMATABLE_TASK_CODES 里有码而 spec 漏写时，spec 为 undefined，
-    // 实现必须兜住而不是抛 TypeError。
-    const { fetcher } = recordingFetcher([
-      {
-        body: {
-          code: 0,
-          data: { tasks: [{ task_code: 'chat_5', accept_status: 'not_accepted', progress: { current: 0, target: 1 } }] },
+  it('spec 漏写时该项被跳过且不影响同轮其它项（两表不一致的兜底）', async () => {
+    /**
+     * ⚠️ 先说清事实：`runGrowthTaskCompletions` 里那句
+     * `if (spec === undefined) { … '无完成动作实现' … }`（源码搜该文案）
+     * **在正常运行下不可达** —— 上游已用
+     * `actionable = codes.filter(c => GROWTH_TASK_COMPLETION[c] !== undefined)`
+     * 把没有 spec 的码过滤掉了，所以循环体根本不会拿到 undefined。
+     * 实测：把 `chat_5` 的 spec 删掉后，`results` 里**没有**它的条目。
+     *
+     * 故本用例锁的不是那个分支，而是**两表不一致时的真实可观测行为**：
+     * 该项被静默跳过、整轮不崩、**同轮其它项照常完成**。
+     * 这条不变量本身有意义：`AUTOMATABLE_TASK_CODES` 与
+     * `GROWTH_TASK_COMPLETION` 是两张手工维护的表，前者有码而后者漏写时，
+     * 最坏后果必须是「少做一项」，不能是「整轮失败」。
+     *
+     * ⚠️ 原版用例构造的是有 spec 的 `chat_5`，分支从未进入、唯一断言是
+     * `expect(r).toBeDefined()` —— 任何不崩的实现都能过，属本仓库明令禁止的
+     * **同义反复**用例。
+     */
+    const table = GROWTH_TASK_COMPLETION as unknown as Record<string, unknown>
+    const saved = table['chat_5']
+    delete table['chat_5']
+    try {
+      const { fetcher } = recordingFetcher([
+        {
+          body: {
+            code: 0,
+            data: {
+              tasks: [
+                // 无 spec 的项（会被跳过）
+                { task_code: 'chat_5', accept_status: 'in_progress', progress: { current: 0, target: 1 } },
+                // 同轮的正常项：必须照常完成，证明跳过是局部的
+                { task_code: 'Library_read', accept_status: 'in_progress', progress: { current: 0, target: 1 } },
+              ],
+            },
+          },
         },
-      },
-    ])
-    return runWithClock(
-      runGrowthTaskCompletions(CRED, PRODUCT, fetcher, { budgetMs: 600_000 }),
-    ).then((r: unknown) => {
-      expect(r).toBeDefined()
-    })
+      ])
+      const r = await runWithClock(
+        runGrowthTaskCompletions(CRED, PRODUCT, fetcher, { budgetMs: 600_000 }),
+      )
+      // 无 spec 的项被跳过（不出现在 results 里），而不是让整轮抛错。
+      expect(r.results.some((x) => x.taskCode === 'chat_5')).toBe(false)
+      // 同轮其它项不受影响 —— 这才是「不影响整轮」的实证。
+      expect(r.results.some((x) => x.taskCode === 'Library_read')).toBe(true)
+      // 整轮没有把这一项算成 failed（它是被跳过，不是失败）。
+      expect(r.ok).toBe(true)
+    } finally {
+      table['chat_5'] = saved
+    }
   })
 })
 
@@ -471,6 +498,326 @@ describe('整轮时间预算（账号很多时的上界）', () => {
       expect(calls).toEqual([])
     } finally {
       clock.mockRestore()
+    }
+  })
+})
+
+/**
+ * 扫尾补领的覆盖面（本组是复审补的 —— 原实现有两处**静默漏领**）。
+ *
+ * 「扫尾」要补领的是**已达标未领取**的奖励，而这类任务按定义不在 `actionable`
+ * 里（它们已是 `completed`，不进 `not_accepted`/`in_progress` 的 pending）。
+ * 故它与「逐项完成」是两条**独立**路径，后者为空不能短路前者。
+ */
+describe('扫尾补领的覆盖面', () => {
+  /** 所有请求都返回同一份任务列表；记录 URL 以便断言 claim 是否发出。 */
+  function constantFetcher(list: unknown) {
+    const calls: string[] = []
+    const fetcher = (async (url: string) => {
+      calls.push(String(url))
+      return {
+        ok: true,
+        status: 200,
+        json: async () => list,
+        text: async () => JSON.stringify(list),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+    return { fetcher, calls }
+  }
+
+  it('只有「已达标未领」的任务时仍执行扫尾补领', async () => {
+    // accept_status: 'completed' 不进 pending ⇒ actionable 为空。
+    // 原实现在此直接 return「无 API 可达的待完成任务」，扫尾永不执行，
+    // 账号里所有已达标未领的奖励一个都领不到。
+    const { fetcher, calls } = constantFetcher({
+      code: 0,
+      data: {
+        tasks: [
+          { task_code: 'chat_5', accept_status: 'completed', progress: { current: 5, target: 5 } },
+        ],
+      },
+    })
+    const r = await runGrowthTaskCompletions(CRED, PRODUCT, fetcher, { budgetMs: 600_000 })
+    expect(calls.filter((c) => c.includes('/claim')).length).toBe(1)
+    expect(r.claimedCount).toBe(1)
+  })
+
+  it('扫尾覆盖「等级族」（码字段是 code 而非 task_code）', async () => {
+    // 等级族的条目用 `code` 字段。原扫尾只读 `task_code`，于是等级族全部被
+    // filter 丢掉 —— 与 fetchGrowthTaskCodes 的双字段读取分叉，且静默无报错。
+    const { fetcher, calls } = constantFetcher({
+      code: 0,
+      data: { tasks: [{ code: 'first_chat', status: 'completed' }] },
+    })
+    const r = await runGrowthTaskCompletions(CRED, PRODUCT, fetcher, { budgetMs: 600_000 })
+    expect(calls.filter((c) => c.includes('/claim')).length).toBe(1)
+    expect(r.claimedCount).toBe(1)
+  })
+
+  it('扫尾合并两族端点，命中第一族后不丢弃第二族', async () => {
+    // 按 URL 分派而非按请求序轮换：轮换会被前序请求（列表查询 / accept / report）
+    // 消耗掉，测不到想要的形状。
+    // 成长族端点返回 chat_5；等级族端点返回 first_chat。两者都必须被扫尾领到。
+    const growthList = {
+      code: 0,
+      data: { tasks: [{ task_code: 'chat_5', accept_status: 'completed' }] },
+    }
+    const levelList = {
+      code: 0,
+      data: { tasks: [{ code: 'first_chat', status: 'completed' }] },
+    }
+    const claimUrls: string[] = []
+    const fetcher = (async (url: string) => {
+      const u = String(url)
+      if (u.includes('/claim')) {
+        claimUrls.push(u)
+        return {
+          ok: true, status: 200,
+          json: async () => ({ code: 0, data: { credit: 0 } }),
+          text: async () => JSON.stringify({ code: 0, data: { credit: 0 } }),
+        } as unknown as Response
+      }
+      // 等级族端点是**无 /v2 前缀**的那个。⚠️ 判据必须锚定 `/v2/`，
+      // 否则 `/v2/activity/growth/tasks` 也以 `/activity/growth/tasks` 结尾，
+      // 会被误判成等级族（写这条用例时真踩了）。
+      const isGrowthTier = /\/v2\/activity\/growth\/tasks$/.test(u)
+      const list = isGrowthTier ? growthList : levelList
+      return {
+        ok: true, status: 200,
+        json: async () => list,
+        text: async () => JSON.stringify(list),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+    const r = await runGrowthTaskCompletions(CRED, PRODUCT, fetcher, { budgetMs: 600_000 })
+    // 两个不同任务码各领一次 —— 只命中第一族的话这里只会是 1。
+    const claimedCodes = claimUrls.map((u) => decodeURIComponent(u.split('/tasks/')[1]?.split('/')[0] ?? ''))
+    expect(claimedCodes).toContain('chat_5')
+    expect(claimedCodes).toContain('first_chat')
+    expect(r.claimedCount).toBe(2)
+  })
+})
+
+/**
+ * 写端点的成功判据必须是**显式 `code === 0`**。
+ *
+ * 反例是 `code !== undefined && code !== 0`：那样「响应里没有 code」被当成成功，
+ * 于是网关错误体（非 0 但无 code 的形状）会被谎报成「已领取奖励（+0 积分）」并
+ * 计入 `claimedCount` —— 用户看到「自动领取 N 项」，实际一分没到账。
+ * 本文件 `classifyGrowthWrite`（写端点权威分类器）缺 code 时归 -1 → failed，
+ * claim 曾与它判据相反。
+ */
+describe('claim 的成功判据', () => {
+  function claimFetcher(body: unknown) {
+    return (async () => ({
+      ok: true,
+      status: 200,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    })) as unknown as typeof fetch
+  }
+
+  it('响应缺少 code 字段时不得谎报为已领取', async () => {
+    const r = await claimGrowthTaskReward(CRED, PRODUCT, claimFetcher({ msg: 'Unauthorized' }), 'chat_5')
+    expect(r.ok).toBe(false)
+    expect(r.claimed).toBe(false)
+    // 有 msg 时优先回显 msg（便于排障）；关键是**不得**判成 claimed:true。
+    expect(r.message).toContain('Unauthorized')
+  })
+
+  it('既无 code 又无 msg 时如实报「缺少 code 字段」', async () => {
+    const r = await claimGrowthTaskReward(CRED, PRODUCT, claimFetcher({ data: {} }), 'chat_5')
+    expect(r.ok).toBe(false)
+    expect(r.claimed).toBe(false)
+    expect(r.message).toContain('缺少 code')
+  })
+
+  it('空对象响应不得谎报为已领取', async () => {
+    const r = await claimGrowthTaskReward(CRED, PRODUCT, claimFetcher({}), 'chat_5')
+    expect(r.claimed).toBe(false)
+    expect(r.ok).toBe(false)
+  })
+
+  it('code:0 + already_claimed 仍判幂等成功（不回归）', async () => {
+    const r = await claimGrowthTaskReward(
+      CRED, PRODUCT, claimFetcher({ code: 0, data: { already_claimed: true } }), 'chat_5',
+    )
+    expect(r.ok).toBe(true)
+    expect(r.claimed).toBe(false)
+  })
+
+  it('code:0 + credit 正常计为已领取（不回归）', async () => {
+    const r = await claimGrowthTaskReward(
+      CRED, PRODUCT, claimFetcher({ code: 0, data: { credit: 100 } }), 'chat_5',
+    )
+    expect(r.ok).toBe(true)
+    expect(r.claimed).toBe(true)
+    expect(r.credit).toBe(100)
+  })
+})
+
+/**
+ * `code 400` 必须**同时看 msg**（复审补）。
+ *
+ * 成长端点用同一个 `code 400` 表达多种语义：既表示「没有可领对象」（正常幂等
+ * 终态），也表示 `task not completed`（任务真没做完）等**真失败**。
+ * 原实现 `if (code === 400) return no-object` 把两者一并归成「已领奖」——
+ * 与函数头注释「code 400 + msg 命中无对象文案」直接矛盾，用户会看到
+ * 「已领到积分」而实际一分没有。
+ */
+describe('写入端点 code 400 的 msg 分流', () => {
+  /** 任务列表给一个 in_progress 任务（使循环跑到旅行领奖那步）。 */
+  const LIST = {
+    code: 0,
+    data: { tasks: [{ task_code: 'chat_5', accept_status: 'in_progress', progress: { current: 0, target: 1 } }] },
+  }
+  function claimAllFetcher(travel: unknown) {
+    return (async (url: string) => {
+      const u = String(url)
+      const body = u.includes('/travel/claim') ? travel : u.includes('/accept') ? { code: 0, data: {} } : LIST
+      return {
+        ok: true, status: 200,
+        json: async () => body,
+        text: async () => JSON.stringify(body),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+  }
+
+  it.each([
+    ['no unclaimed travel', 'already-claimed'],
+    ['insufficient energy', 'already-claimed'],
+    ['please accept buddy adoption agreement first', 'already-claimed'],
+  ])('无对象文案 %s 归 already-claimed', async (msg, expectedKind) => {
+    const r = await claimAllGrowth(CRED, PRODUCT, claimAllFetcher({ code: 400, msg }), {})
+    expect(r.kind).toBe(expectedKind)
+  })
+
+  it('code 400 + task not completed 必须判失败，不得谎报已领奖', async () => {
+    const r = await claimAllGrowth(
+      CRED, PRODUCT, claimAllFetcher({ code: 400, msg: 'task not completed' }), {},
+    )
+    expect(r.kind).toBe('failed')
+    expect(r.message ?? '').toContain('task not completed')
+  })
+
+  it('code 400 + 未知文案保守判失败（宁可漏判不可误伤）', async () => {
+    // 白名单外的文案一律算失败：少了词条只会让正常终态显示成失败（无害），
+    // 多了词条会把真失败谎报成成功（有害）。
+    const r = await claimAllGrowth(
+      CRED, PRODUCT, claimAllFetcher({ code: 400, msg: 'brand new server message' }), {},
+    )
+    expect(r.kind).toBe('failed')
+  })
+})
+
+/**
+ * 列表查询阶段的失败原因必须**带进 `results`**（复审补）。
+ *
+ * 下游 `collectBuddyGrowth`（`jet-hub-rpc.ts`）判僵尸账号的依据是**逐项**
+ * `results.some(r => /凭据已失效/.test(r.message))`。原实现在列表查询失败时
+ * 返回空 `results`，凭据失效就判不出来 ⇒ 前端把「请重新登录」显示成
+ * 「本轮无 API 可达的任务」。
+ */
+describe('列表查询失败的原因传递', () => {
+  it('401 时 results 必须带「凭据已失效」以便下游识别僵尸账号', async () => {
+    const fetcher = (async () => ({
+      ok: false, status: 401,
+      json: async () => ({}),
+      text: async () => '<html>unauthorized</html>',
+    })) as unknown as typeof fetch
+    const r = await runGrowthTaskCompletions(CRED, PRODUCT, fetcher)
+    expect(r.ok).toBe(false)
+    expect(r.results.length).toBeGreaterThan(0)
+    expect(r.results.some((x) => x.message.includes('凭据已失效'))).toBe(true)
+  })
+
+  it('解析失败时 results 也要有可读原因（不得只剩空数组）', async () => {
+    const fetcher = (async () => ({
+      ok: true, status: 200,
+      json: async () => ({}),
+      text: async () => 'not json at all',
+    })) as unknown as typeof fetch
+    const r = await runGrowthTaskCompletions(CRED, PRODUCT, fetcher)
+    expect(r.ok).toBe(false)
+    expect(r.results.length).toBeGreaterThan(0)
+  })
+})
+
+/**
+ * 凭据缺 `user_id` 必须**显式留痕**（复审补）。
+ *
+ * 判据事件里的 `userId` / `machineId` 全由 `credential.user_id` 派生：
+ * uid 为空时会静默上报 `userId: ''`、`machineId = sha256('machine:')` ——
+ * 按用户维度计数的判据必然不计数，但不报错，表现为「跑完一圈 0 项完成」。
+ */
+describe('凭据缺 user_id 的显式提示', () => {
+  function emptyListFetcher() {
+    const list = { code: 0, data: { tasks: [] } }
+    return (async () => ({
+      ok: true, status: 200,
+      json: async () => list,
+      text: async () => JSON.stringify(list),
+    })) as unknown as typeof fetch
+  }
+
+  it('缺 user_id 时 message 必须提示重新登录（不能静默）', async () => {
+    const noUid: BuddyCredential = { access_token: 't', refresh_token: 'r' }
+    const r = await runGrowthTaskCompletions(noUid, PRODUCT, emptyListFetcher())
+    expect(r.message ?? '').toContain('user_id')
+  })
+
+  it('有 user_id 时不得出现该提示（防误报）', async () => {
+    const r = await runGrowthTaskCompletions(CRED, PRODUCT, emptyListFetcher())
+    expect(r.message ?? '').not.toContain('user_id')
+  })
+})
+
+/**
+ * web 域的 `os` 必须与 `arch` 自洽（复审补）。
+ *
+ * 原先 linux 恒写 `'Linux x86_64'`，arm64 宿主会报
+ * `os: 'Linux x86_64'` 配 `arch: 'arm64'` —— 同一对象里自相矛盾，
+ * 与「非 darwin 一律写 Windows 版本号」是同一类缺陷。
+ */
+describe('web 域 os 名与 arch 自洽', () => {
+  it('linux + arm64 时 os 名必须含 aarch64 而非固定 x86_64', async () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux')
+    const arch = vi.spyOn(process, 'arch', 'get').mockReturnValue('arm64')
+    try {
+      const web: Record<string, unknown>[] = []
+      const list = {
+        code: 0,
+        data: {
+          tasks: [
+            { task_code: 'Library_read', accept_status: 'not_accepted', progress: { current: 0, target: 1 } },
+          ],
+        },
+      }
+      const fetcher = (async (url: string, init?: RequestInit) => {
+        const body = typeof init?.body === 'string'
+          ? (JSON.parse(init.body) as Record<string, unknown>[])
+          : []
+        // web 域的 body 带 pageURL。
+        if (String(url).endsWith('/v2/report') && body[0]?.['pageURL'] !== undefined) {
+          web.push(body[0])
+        }
+        return {
+          ok: true, status: 200,
+          json: async () => list, text: async () => JSON.stringify(list),
+        } as unknown as Response
+      }) as unknown as typeof fetch
+      vi.useFakeTimers()
+      const work = runGrowthTaskCompletions(CRED, PRODUCT, fetcher, { budgetMs: 600_000 })
+      await vi.advanceTimersByTimeAsync(1)
+      await vi.runAllTimersAsync()
+      await work
+      vi.useRealTimers()
+      expect(web.length).toBeGreaterThan(0)
+      expect(String(web[0]?.['os'])).toContain('aarch64')
+      expect(String(web[0]?.['arch'])).toBe('arm64')
+    } finally {
+      platform.mockRestore()
+      arch.mockRestore()
+      vi.useRealTimers()
     }
   })
 })

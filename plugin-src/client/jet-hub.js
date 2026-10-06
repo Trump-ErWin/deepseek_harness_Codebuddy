@@ -1947,6 +1947,19 @@ function ProviderPanel({ provider, rpcCall }) {
    * 存进 ref 后可在卸载清理里一并清掉，并用它做重入闸门。
    */
   const pollRef = React.useRef(0);
+  /**
+   * 「一键领取积分」的重入闸门。
+   *
+   * ⚠️ **不能用 `claiming`（useState）当守卫**：`setClaiming(true)` 是异步的，
+   * 同一 tick 内连点两次时第二次读到的仍是 `false`，而按钮的
+   * `disabled: claiming` 也要等 re-render 才生效 —— 于是两轮全量领取并发跑，
+   * 对同一账号同一批任务并发 `POST /v2/report` 与 claim，幂等全押在服务端。
+   * 成熟成长任务一轮实测 90～270s（数十个上游请求），并发两轮还会放大风控面。
+   *
+   * 与上面的 `pollRef` 同款做法：**用 ref 做同步闸门**（写是同步的，
+   * 不经过 React 调度）。守卫必须在第一个 `await` 之前生效。
+   */
+  const claimInFlightRef = React.useRef(false);
 
   const loadAccounts = React.useCallback(async () => {
     setPhase('loading');
@@ -2049,6 +2062,11 @@ function ProviderPanel({ provider, rpcCall }) {
       mounted.current = false;
       // 卸载时必须掐掉未结束的登录轮询（否则它会在 5 分钟里持续打 RPC）
       if (pollRef.current !== 0) { clearInterval(pollRef.current); pollRef.current = 0; }
+      // ⚠️ 领取闸门也要清：本 effect 依赖 `provider`，切 provider 会重跑
+      // （清理后重新 `mounted.current = true`）。若闸门残留 true，新 provider
+      // 面板上的首次点击会被误判成「上一次仍在进行中」而永远点不动。
+      // 在途的那一轮仍会跑完（无法取消 RPC），其结果由 mounted 判定是否上屏。
+      claimInFlightRef.current = false;
     };
     // loadCredits 依赖 accounts，但这里只想在挂载/provider 变化时各跑一次；
     // 账号刷新后由操作方显式再调 loadCredits（见 claimCredits）。
@@ -2179,9 +2197,25 @@ function ProviderPanel({ provider, rpcCall }) {
    * **不支持的 provider 直接返回**：守卫与按钮渲染同源（`supportsCredits`），
    * 放在函数内是为了将来若从别处调用（如快捷键、批量入口）也不会打到
    * `unsupported provider` 上——按钮不渲染只是 UI 便利，不是安全边界。
+   *
+   * ⚠️ **重入闸门必须在第一个 `await` 之前**（`claimInFlightRef`）：按钮的
+   * `disabled: claiming` 依赖异步 state，同一 tick 内连点两次会穿透并起两轮。
    */
   const claimCredits = async () => {
     if (!supportsCredits) return;
+    // 同步闸门：写 ref 不经 React 调度，故同一 tick 内的第二次点击也能拦住。
+    if (claimInFlightRef.current) {
+      // ⚠ 拦住后**不能静默 return**（与上面登录闸门同款教训，IKJLK3 B）：
+      // 用户看到的是「点了没反应」，分不清「没反应」与「正在处理」。
+      // 成长任务一轮可达数分钟，必须明确告知「还在跑」。
+      setClaimNotice({
+        tone: 'warn',
+        text: '上一次领取仍在进行中（成长任务一轮可能数分钟），请等它结束。',
+        details: [],
+      });
+      return;
+    }
+    claimInFlightRef.current = true;
     setClaiming(true);
     setClaimNotice(null);
     try {
@@ -2300,6 +2334,10 @@ function ProviderPanel({ provider, rpcCall }) {
       if (!mounted.current) return;
       setClaimNotice({ tone: 'error', text: caught?.message || '领取积分失败' });
     } finally {
+      // ⚠️ 闸门**必须无条件释放**（不能 `if (mounted.current)`）：它是个普通 ref，
+      // 与组件挂载状态无关。若跟着 `mounted` 一起判，卸载后闸门永久停在 true，
+      // 用户切回该面板再点就永远收到「上一次仍在进行中」——闸门卡死。
+      claimInFlightRef.current = false;
       if (mounted.current) setClaiming(false);
     }
   };
