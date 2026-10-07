@@ -28,6 +28,7 @@
 import * as React from 'react';
 
 import { supportsCreditBalance, supportsDailyCheckin, checkinProviders } from './credits-capabilities.js';
+import { AGGREGATE_PROVIDER_ID, resolveBadgeProvider } from './badge-model.js';
 import {
   badgeView,
   creditSectionLabel,
@@ -60,6 +61,26 @@ import {
  * 隐藏的标签页会被跳过（见下面的 `visibilityState` 判定）。
  */
 export const BADGE_POLL_MS = 60_000;
+
+/**
+ * 「聚合上次选中的渠道」的查询节奏（**独立于** {@link BADGE_POLL_MS}）。
+ *
+ * ## ⚠️ 为什么必须比 60 秒快得多
+ *
+ * 那个查询是**纯内存读**（宿主 `aggregate.activeProvider` 不碰网络、不查余额），
+ * 成本可忽略；而它决定的是「徽标显不显示、显示哪个渠道」——
+ *
+ * - **首次**：聚合下第一次转发成功之前没有历史 ⇒ 徽标不渲染。若沿用 60 秒，
+ *   用户发完消息后**最多要等 60 秒**才看到徽标出现，观感就是「徽标坏了」。
+ * - **切换**：聚合层换了候选之后，渠道要跟着变。规格 §6.4 正是**因为
+ *   「最长 60 秒才更新，观感是『徽标不跟着变』」而否决了「只靠轮询」那个方案**
+ *   —— 所以这里不能沿用 60 秒。
+ *
+ * ⚠️ **不要**把这个值合并进 `BADGE_POLL_MS`：那个常量管的是**余额读数**
+ * （要经宿主打上游，宿主 TTL 120s），缩短它会让上游请求变密；
+ * 本常量管的只是**一次内存读**。两者成本差几个数量级，节奏理应不同。
+ */
+export const ACTIVE_PROVIDER_POLL_MS = 5_000;
 
 /**
  * 签到结果摘要的**自动消失**时长。
@@ -221,7 +242,103 @@ export function UsageBadge(props) {
     safe((d) => d.getSnapshot()),
     safe((d) => d.getSnapshot()),
   );
-  const provider = state?.current?.provider;
+  // ⚠️ `let` 而非 `const`：聚合重定向会把 `aggregate` **就地替换**成真实渠道
+  //    （见下），而下面那两行门控是**既有断言逐字钉住的**，必须继续用 `provider`
+  //    这个名字 —— 换名（如 `resolved`）会让 `usage-badge-client.spec.ts` 的正则
+  //    `typeof provider !== 'string' || provider.length === 0` 失配而变红（实测撞过）。
+  let provider = state?.current?.provider;
+  /**
+   * 聚合 provider 的**重定向**（P3）：把 `aggregate` 解析成它上次**实际**转发成功的渠道。
+   *
+   * ## ⚠️⚠️ 为什么必须在门控**之前**
+   *
+   * 下面那行 `if (!supportsCreditBalance(provider)) return null;` 是**既有断言逐字
+   * 钉住的**（`tests/unit/usage-badge-client.spec.ts`），不得修改。而 `aggregate`
+   * 在能力表里**如实**登记为 `balance:false`（它确实没有自己的账号与余额）⇒
+   * 若直接把它交给门控，徽标**永不渲染**。
+   * ⇒ 正确做法是**先**把 `aggregate` 解析成真实渠道，门控看到的就是真实渠道，
+   *   那行一个字都不用动（规格 §6.3 的 P2）。
+   *
+   * ## ⚠️ 异步取数 vs 同步渲染
+   *
+   * 宿主端点 `aggregate.activeProvider` 是**纯内存读**（零网络零余额查询），
+   * 但它仍是 async（走 RPC 通道）。而渲染是同步的 ⇒ 首帧拿不到值。
+   * 处理方式与既有的「目录惰性解析」**同一模式**：首帧按「无历史」处理
+   * （`active` 为 null ⇒ 重定向得 null ⇒ 走下面既有的空 provider 门控 ⇒ 不渲染），
+   * effect 取到后再 setState 触发重渲染。
+   * ⚠️ **不阻塞渲染**：RPC 失败也只是不渲染徽标（徽标是可选装饰），
+   * 与既有目录解析失败的取向一致。
+   *
+   * ## ⚠️ 语义是**真实历史**，不是预测
+   *
+   * 用宿主记录的「上次实际转发成功的渠道」；无历史 ⇒ 不渲染（规格 §6.3 的 P4）。
+   * **不做预测**，也不用 `pickCurrentAutoProvider`（预测语义 + 有网络成本）。
+   */
+  const readActiveProvider = props.readActiveProvider;
+  const [activeProvider, setActiveProvider] = React.useState(null);
+  const isAggregate = provider === AGGREGATE_PROVIDER_ID;
+  /**
+   * 取「上次实际选中的渠道」，并**周期性重试**。
+   *
+   * ## ⚠️⚠️ 为什么必须重试（真实缺陷，用户报障 2026-10-07）
+   *
+   * 用户：「用聚合模型发送信息前后都没有流量徽标显示」。
+   *
+   * 我第一版的依赖数组是 `[isAggregate, readActiveProvider]` —— 这两个值在
+   * 「**无历史**」时都**稳定不变**（`isAggregate` 由 `provider === 'aggregate'`
+   * 决定，而 `provider` 正是**等着这次取数才能变**的那一个）⇒ effect **只跑一次**，
+   * 取到 `null` 之后**永不重取** ⇒ 即使随后转发成功、宿主已记录渠道，
+   * 徽标也永远不显示。
+   *
+   * ⚠️ 这是一个**循环依赖**：规格 §6.4 的 X1 说「渠道变化 ⇒ `provider` 变 ⇒
+   * `UsageBadgeActive` 的 `useEffect([provider])` 重挂载」。但 X1 只在
+   * **已经有过历史之后**成立；**首次**拿到渠道之前，`provider` 恒为 `aggregate`、
+   * 永远不会变。我照抄 X1 而没有验证它在这个环节成立。
+   *
+   * ⇒ 修法：取数**周期性重试**，节奏用 {@link ACTIVE_PROVIDER_POLL_MS}
+   *（**不是** `BADGE_POLL_MS` —— 那个是余额轮询、要打网络；本查询是纯内存读，
+   * 必须快得多，否则用户发完消息要等一分钟才看到徽标出现）。
+   *
+   * ## ⚠️ 必须**一直**轮询，不能「取到值就停」
+   *
+   * 我一度想在取到渠道后 `clearInterval`（想省一个空转的定时器）—— **那是错的**：
+   * 「随切换更新」这条需求正需要它。聚合层换了候选之后，宿主记录变了，
+   * 而**外层只有重新取数才会拿到新的 `provider`**；停了定时器，
+   * 渠道就永远停在第一次那个值上（用户看到的会是「徽标不跟着变」）。
+   * ⇒ 定时器**常驻**（与 `UsageBadgeActive` 自己的 60 秒轮询同节奏、同生命周期）。
+   */
+  React.useEffect(() => {
+    if (!isAggregate || typeof readActiveProvider !== 'function') return undefined;
+    let alive = true;
+    let timer = null;
+    const refresh = () => {
+      Promise.resolve()
+        .then(() => readActiveProvider())
+        .then((value) => {
+          if (!alive) return;
+          setActiveProvider(value?.provider ?? null);
+        })
+        .catch(() => {
+          // ⚠️ 安静降级：读不到「上次渠道」只是不渲染徽标，不影响会话输入区。
+          //    保留重试（可能只是宿主那一次读失败）。
+          if (alive) setActiveProvider(null);
+        });
+    };
+    refresh();
+    timer = setInterval(refresh, ACTIVE_PROVIDER_POLL_MS);
+    return () => {
+      alive = false;
+      if (timer !== null) clearInterval(timer);
+    };
+    // ⚠️ 依赖 `isAggregate`：非聚合时不该发这个请求（其余 15 家的行为逐字不变）。
+  }, [isAggregate, readActiveProvider]);
+
+  // ⚠️ 重定向结果可能是 `null`（聚合且无历史）⇒ 下面**既有的**空 provider 门控
+  //    天然拦掉它 —— 复用同一形态，不另造判据（规格 §6.6）。
+  // ⚠️ 就地赋回 `provider`（不新造变量名）：那两行门控必须逐字不变，见上方 `let` 的注释。
+  if (isAggregate) {
+    provider = resolveBadgeProvider(provider, activeProvider === null ? null : { provider: activeProvider });
+  }
   // 没有选中模型（新会话尚未选择 / 已寻址的 subagent 会话）→ 不渲染。
   if (typeof provider !== 'string' || provider.length === 0) return null;
   // 不是本插件的渠道 → 不渲染，且**不会**发任何请求。

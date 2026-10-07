@@ -169,6 +169,20 @@ export function apply(ctx) {
       },
       providerLabel,
       readBadge: (provider, options) => rpcCall('usage.badge', { provider, ...options }),
+      /**
+       * 聚合 provider「上次**实际**转发成功的渠道」（P3）。
+       *
+       * ⚠️ 宿主侧该端点是**纯内存读**（零网络零余额查询）—— 徽标在**门控阶段**
+       * 就要用它把 `aggregate` 重定向成真实渠道，而门控是同步渲染路径。
+       * ⚠️ 返回 `{ provider: null }` 表示无历史 ⇒ 徽标**不渲染**。
+       */
+      readActiveProvider: (canonicalId) =>
+        rpcCall('aggregate.activeProvider', canonicalId === undefined ? {} : { canonicalId }),
+      // ⚠️ **这里曾有一个 `readExpiryOrder` prop，已删除**（真实死代码，审计实测指出）：
+      //    它在 `c12b3ab` 上就已**零消费者** —— `AggregatePanel` 自己直接
+      //    `rpcCall('aggregate.expiryOrder', {})`（`jet-hub.js`），从不经过本 prop。
+      //    本仓库把死代码视为缺陷（会让人以为「面板是通过 prop 取数的」而找错地方）。
+      //    ⚠️ 端点本身仍在（`aggregate.expiryOrder`）—— 删的只是这个没人用的转发 prop。
       writePreference: (preference) => rpcCall('usage.badgePreference', { preference }),
       // 自动签到开关（全局一个，不分渠道）：宿主在「打开」时会立刻跑一轮。
       setAutoCheckin: (enabled) => rpcCall('usage.autoCheckin', { enabled }),

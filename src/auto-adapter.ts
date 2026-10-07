@@ -18,10 +18,18 @@
  *
  * | provider | 有可用余额时的失效时刻 |
  * |---|---|
- * | codearts | 当日额度，UTC+8 当日 24:00（`nextUtc8DayStartMs`） |
+ * | codearts | **`Infinity`（长期）** —— 接口不下发到期时间，见下 |
  * | loomy | 有今日赠送 → 当日 24:00；只剩永久 → Infinity |
  * | zcode | 各桶 `expiresAt` 的最小值；无桶但有可领 → 当日 24:00 |
  * | buddy / workbuddy | 有效资源包 `deductionEndTime` 的最小值 |
+ *
+ * ⚠️⚠️ **codearts 一栏已从「当日额度，UTC+8 当日 24:00」改为「长期（Infinity）」**
+ * （2026-10-07，用户报障）。旧口径是**臆造**：实测 `statistics/plugin` 对资源包的
+ * `cycleStartTime` / `cycleEndTime` / `expiredTime` **三个字段全为空**
+ *（`codearts-credits.ts` 的注释也写明「不下发……不臆造一个到期时间」），
+ * 而官方文档说的是签到积分「自发放起 30 天内有效」—— 两者都不是「今天 24:00」。
+ * 后果是 codearts 在排序里**永远排最前**，抢走真正临期的额度。
+ * 详见 `aggregate-expiry.ts` 的 `codeArtsExpiry` 注释。
  *
  * 只有永久/长期积分的 provider 折算成 `Infinity`（排最后，但不剔除 —— 没有临期号时
  * 仍要用它）。查询失败 / 无启用账号的 provider 折算成 `-1`（**剔除**，不参与排序）。
@@ -47,18 +55,16 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { AccountPool } from './account-pool.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
-import { CODEBUDDY, WORKBUDDY } from './product.js'
-import type { BuddyCredential } from './buddy.js'
-import { fetchCreditBalance } from './credits.js'
-import { LOOMY } from './loomy-product.js'
-import type { LoomyCredential } from './loomy.js'
-import { fetchLoomyCreditDetail } from './loomy-credits.js'
-import { fetchCodeArtsAccountInfoDetailed } from './codearts-credits.js'
-import type { CodeArtsCredential } from './types.js'
-import type { ZcodeCredential } from './zcode.js'
-import { fetchZcodeBalance } from './zcode-upstream.js'
-import { nextUtc8DayStartMs } from './model-queue.js'
 import { translateReasoningEffort } from './reasoning-ladder.js'
+// ⚠️ 选型口径的**唯一权威**是 `aggregate-core.ts`（哨兵语义 / 排序 / 倍率解析）；
+// 本文件与 `aggregate-adapter.ts` 都只是它的调用方 —— 抽出原因（本仓库对「同一
+// 语义两套实现」的红线）与全部真实缺陷记录见该文件模块头。**不要**在本文件另写一份。
+import { UNUSABLE, pickSoonestProvider, priceFactorFromName } from './aggregate-core.js'
+export { pickSoonestProvider, priceFactorFromName } from './aggregate-core.js'
+// ⚠️ 临期折算的**唯一权威**是 `aggregate-expiry.ts`：本文件的 `expiryOf` 只是它的
+// **薄委托**（只提供 auto 的取号方式）。四个 `*Expiry` 折算函数 Task 7 已**搬移**到
+// 那里（不是复制）—— 两份同义实现必然漂移（AGENTS.md 首条判据的静默失效）。
+import { createExpiryProbe } from './aggregate-expiry.js'
 
 /** 注册到 ctx.llm 的 provider 路由，也是 providerInfo().id（DSH 校验二者相等）。 */
 export const AUTO_PROVIDER = 'jet-hub-auto'
@@ -76,11 +82,6 @@ export const AUTO_CHOICE_TTL_MS = 60_000
  * 的到期余额探测端点，接进来只能算成 Infinity 永远垫底，不如先不放。
  */
 export const AUTO_PROVIDERS = ['codearts', 'loomy', 'zcode', 'buddy', 'workbuddy'] as const
-
-/** 无到期概念（只有永久/长期积分）时的失效时刻。 */
-const NEVER = Number.POSITIVE_INFINITY
-/** 该 provider 本次不可用（无启用账号 / 探测失败）的哨兵值。 */
-const UNUSABLE = -1
 
 /** 一次选型的结果：目标 provider + 目标模型 id。 */
 interface AutoChoice {
@@ -100,37 +101,6 @@ interface DispatchTarget extends AutoChoice {
   efforts: readonly string[]
 }
 
-/**
- * 从「provider → 最早失效时刻」里挑出胜者（**纯函数**，便于单测）。
- *
- * 规则：剔除 `UNUSABLE`；其余按失效时刻**升序**（越早越先烧）；时刻相同按传入顺序
- * （即 {@link AUTO_PROVIDERS} 的次序）。全部不可用时返回 `undefined`。
- *
- * ⚠️ `NEVER`（无到期概念的永久/长期积分）**必须参与排序**并能当选：它表示
- * 「可用、只是没有临期可烧」，而不是「不可用」。⚠️ 真实缺陷（PR !69 审计实测）：
- * 初版用 `bestExpiry` 的初值 `Infinity` 作「还没选中任何 provider」的哨兵，于是
- * **全部条目都是 `NEVER` 时循环一次都不赋值** ⇒ 返回 `undefined` ⇒ 用户看到
- * 「没有任何已登录且可用的 provider 账号，请先登录」—— 而账号全都正常，只是积分
- * 都是永久的。这是「账号都在」被误报成「没登录」。
- * ⇒ 改用独立的 `best === undefined` 判定，两种语义彻底分开。
- *
- * @param entries - `[provider, expiryMs]`，顺序即并列时的优先级。
- * @returns 胜出的 provider；**全部 `UNUSABLE`** 时才返回 `undefined`。
- */
-export function pickSoonestProvider(entries: readonly (readonly [string, number])[]): string | undefined {
-  let best: string | undefined
-  let bestExpiry = Number.POSITIVE_INFINITY
-  for (const [provider, expiry] of entries) {
-    if (expiry === UNUSABLE) continue
-    // 严格小于：并列时保留先出现的（AUTO_PROVIDERS 次序），不重排。
-    if (best === undefined || expiry < bestExpiry) {
-      bestExpiry = expiry
-      best = provider
-    }
-  }
-  return best
-}
-
 /** auto 适配器对外只挂一个模型；真实能力在选型后从目标 provider 借用。 */
 const AUTO_MODEL_INFO: LlmModelInfo = {
   provider: AUTO_PROVIDER,
@@ -146,6 +116,26 @@ export interface AutoAdapterOptions {
   now?: () => number
   /** 选型缓存时长（测试用）。 */
   ttlMs?: number
+  /**
+   * 临期折算的缓存时长（测试用）。
+   *
+   * ⚠️ 既有单测依赖「每次调用都真探」的语义（它们断言 `getAvailableAccount` 的
+   * 调用次数），故那里传 `0` 关掉缓存。**生产不传** ⇒ 用默认
+   * `EXPIRY_CACHE_TTL_MS`（60 秒）。
+   */
+  expiryTtlMs?: number
+  /**
+   * **共享**的临期探针（装配层建一个，aggregate 与 auto 共用）。
+   *
+   * ## ⚠️ 为什么需要它（真实缺陷，对抗审计实测证伪）
+   *
+   * 初版 `AutoAdapter` 内部**自己建一个** probe，而 `index.ts` 又为 aggregate
+   * 建了**另一个** ⇒ 两份独立缓存：① 同一渠道被折算两次（白打两次上游）；
+   * ② 缓存失效要清两次，漏一次就让「刚登录的账号最长 60 秒对路由不可见」。
+   *
+   * ⚠️ 不传时仍自建（保持既有单测/独立使用可用）。
+   */
+  expiryProbe?: ReturnType<typeof createExpiryProbe>
 }
 
 /** Jet Hub 自动适配器。 */
@@ -154,6 +144,12 @@ export class AutoAdapter extends LlmAdapter {
   private cached: { at: number; choice: AutoChoice } | undefined
   /** 缓存的「auto 借用目标能力」的元数据（与 choice 同生命周期）。 */
   private cachedInfo: LlmResolvedModelInfo | undefined
+  /**
+   * 惰性建的临期探针（**复用同一实例** ⇒ 折算缓存跨调用生效）。
+   *
+   * ⚠️ 旧实现在 `expiryOf` 里每次新建 ⇒ 缓存永不命中 ⇒ 每次请求都重打上游。
+   */
+  private expiryProbeInstance: ReturnType<typeof createExpiryProbe> | undefined
 
   constructor(private readonly ctx: Context, private readonly options: AutoAdapterOptions) {
     super()
@@ -498,6 +494,10 @@ export class AutoAdapter extends LlmAdapter {
   /**
    * 某 provider「一个代表账号」的最早失效时刻（毫秒）。
    *
+   * ⚠️ 本方法现在**委托** `createExpiryProbe`（`aggregate-expiry.ts`）—— 折算口径
+   * 的**唯一权威**在那里，本处只提供 auto 的取号方式（`firstModelOf`）。
+   * 早期这里是独立实现，与聚合层的探针构成两份同义逻辑；Task 7 已合并。
+   *
    * 取一个启用账号做代表：它同时确认了「这个 provider 现在有没有可用账号」
    * （取不到即 UNUSABLE）。⚠️ 探测的是代表账号的余额，provider 内部换号由各适配器
    * 每次请求现做，不依赖这里。
@@ -512,109 +512,27 @@ export class AutoAdapter extends LlmAdapter {
    * 9 天后作废的额度 ⇒ auto 只看到第一个号 ⇒ 该 provider 被判成「无临期」而排到最后，
    * **临期额度被完全忽略**，与「临期优先」的价值主张相反。
    *
-   * ⇒ 取号前先从目录拿一个真实 modelId，让限流过滤真正生效。
+   * ⇒ 委托时把 `firstModelOf` 传进去（它内部先从目录拿一个真实 modelId），
+   * 让限流过滤真正生效。
    */
   async expiryOf(provider: string, signal?: AbortSignal): Promise<number> {
-    const pool = this.options.accountPool
-    let available
-    try {
-      // ⚠️ 先解析一个真实模型 id：空串会让限流过滤整体短路（见上）。
-      // 目录不可读时退回空串 —— 此时「有没有账号」这个判据仍然成立，
-      // 只是限流维度退化为不参与（宁可少筛，不可把整池判成不可用）。
-      const probeModel = await this.firstModelOf(provider) ?? ''
-      available = await pool.getAvailableAccount(provider, probeModel)
-    } catch {
-      return UNUSABLE
-    }
-    if (available === null || available === undefined) return UNUSABLE
-    // ⚠️ abort 不是「这个 provider 不可用」，而是「这次调用不该继续」（PR !69 审计
-    // 实测）：折算成 UNUSABLE 会让取消请求的用户看到误导性的「请先登录」。
-    signal?.throwIfAborted()
-    const credential = available.credential as unknown
-    switch (provider) {
-      case 'buddy':
-        return this.buddyExpiry(CODEBUDDY, credential as BuddyCredential)
-      case 'workbuddy':
-        return this.buddyExpiry(WORKBUDDY, credential as BuddyCredential)
-      case 'loomy':
-        return this.loomyExpiry(credential as LoomyCredential)
-      case 'codearts':
-        return this.codeArtsExpiry(credential as CodeArtsCredential)
-      case 'zcode':
-        return this.zcodeExpiry(credential as ZcodeCredential)
-      default:
-        return UNUSABLE
-    }
-  }
-
-  /** buddy 系：有效资源包 `deductionEndTime` 的最小值；无有效包 → Infinity（只有永久）。 */
-  private async buddyExpiry(product: typeof CODEBUDDY, credential: BuddyCredential): Promise<number> {
-    let balance
-    try {
-      balance = await fetchCreditBalance(credential, product)
-    } catch {
-      return UNUSABLE
-    }
-    if (balance === null) return UNUSABLE
-    let earliest = NEVER
-    for (const pkg of balance.packages) {
-      if (pkg.active !== true) continue
-      if (!(typeof pkg.remaining === 'number' && pkg.remaining > 0)) continue
-      const end = pkg.deductionEndTime
-      if (typeof end === 'number' && Number.isFinite(end) && end > 0 && end < earliest) earliest = end
-    }
-    return earliest
-  }
-
-  /** loomy：有今日赠送 → 当日 24:00；只剩永久 → Infinity。 */
-  private async loomyExpiry(credential: LoomyCredential): Promise<number> {
-    let detail
-    try {
-      detail = await fetchLoomyCreditDetail(credential, LOOMY)
-    } catch {
-      return UNUSABLE
-    }
-    if (detail === null) return UNUSABLE
-    if (detail.daily > 0) return nextUtc8DayStartMs()
-    return detail.permanent > 0 ? NEVER : UNUSABLE
-  }
-
-  /** codearts：积分账户有余额即按当日额度处理（UTC+8 当日 24:00 重置）。 */
-  private async codeArtsExpiry(credential: CodeArtsCredential): Promise<number> {
-    let result
-    try {
-      result = await fetchCodeArtsAccountInfoDetailed(credential)
-    } catch {
-      return UNUSABLE
-    }
-    if (!result.ok) return UNUSABLE
-    const total = result.info.credit?.total ?? 0
-    return total > 0 ? nextUtc8DayStartMs() : NEVER
-  }
-
-  /** zcode：各桶 `expiresAt`（秒）最小值；无桶但有可领活动 → 当日 24:00。 */
-  private async zcodeExpiry(credential: ZcodeCredential): Promise<number> {
-    let balance
-    try {
-      balance = await fetchZcodeBalance(credential)
-    } catch {
-      return UNUSABLE
-    }
-    if (balance === undefined) return UNUSABLE
-    let earliest = NEVER
-    for (const bucket of balance.buckets) {
-      const remaining = bucket.availableUnits ?? bucket.remainingUnits ?? 0
-      if (!(remaining > 0)) continue
-      const exp = bucket.expiresAt
-      if (typeof exp === 'number' && Number.isFinite(exp) && exp > 0) {
-        const ms = exp * 1000
-        if (ms < earliest) earliest = ms
-      }
-    }
-    if (earliest !== NEVER) return earliest
-    // 桶里没有带到期时间的余额：若还有可领的每日活动，按当日额度算（先烧它）。
-    if (balance.remaining > 0 || (balance.claimablePlans?.length ?? 0) > 0) return nextUtc8DayStartMs()
-    return NEVER
+    // ⚠️⚠️ **必须复用同一个 probe 实例**（用户要求「排序读缓存，不每次打服务器」）。
+    //
+    // 旧写法 `return createExpiryProbe(pool, …)(provider, signal)` —— **每次调用都
+    // 新建一个 probe** ⇒ 折算结果缓存（`EXPIRY_CACHE_TTL_MS`）**永远不会命中**，
+    // 于是每次请求都对每个候选渠道重打上游余额接口。
+    //
+    // ⚠️ 惰性建一次（`??=`）而不是在构造器里建：构造期 `this.firstModelOf` 可能
+    // 还没就绪（它是实例方法，绑定没问题，但构造期建会让「未使用 auto」的场景也
+    // 持有缓存）。惰性建的语义与构造期建**等价**（同一个实例、同一份缓存），
+    // 且与 `choiceCache` 的既有惰性风格一致。
+    this.expiryProbeInstance ??= this.options.expiryProbe ?? createExpiryProbe(
+      this.options.accountPool,
+      p => this.firstModelOf(p),
+      // ⚠️ 单测可用 `ttlMs: 0` 关掉缓存（既有用例依赖「每次真探」的语义）。
+      this.options.expiryTtlMs === undefined ? {} : { ttlMs: this.options.expiryTtlMs },
+    )
+    return this.expiryProbeInstance(provider, signal)
   }
 
   /**
@@ -680,52 +598,6 @@ export class AutoAdapter extends LlmAdapter {
   }
 }
 
-/**
- * 从目录展示名解析倍率；带「免费」按 0；解析不出按 `Infinity`（排在任何有标注的之后）。
- *
- * # 为什么必须要求「倍率分隔符」（真实缺陷，PR !69 审计实测）
- *
- * 初版正则 `/[×x]\s*(\d+(?:\.\d+)?)\s*$/i` 只要求「`x` + 数字 + 行尾」，**不要求分隔符**
- * ⇒ 模型名里的 `x` 被当成倍率标记。实测（拿本仓库真实展示名逐条跑）：
- *
- * | 展示名 | 初版解析 | 应为 |
- * |---|---|---|
- * | `Spark X2.5`（**无**倍率标注） | **2.5 倍** ❌ | 无标注 ⇒ `Infinity` |
- * | `GPT-X5` | **5 倍** ❌ | 无标注 |
- * | `Grok x4` | **4 倍** ❌ | 无标注 |
- * | `DeepSeek V4 Flash 0731 · x3.0` | 3.0 ✅ | 3.0 |
- *
- * `Spark X2.5` 这条路径**真实可达**：loomy 的 `splitLoomyRate` 在远端下发**不带倍率**的
- * 名称时原样返回原名（`loomy.ts:136/147`），而 `loomyDisplayName` 不追加分隔符，
- * 该原名会被 `loomy-adapter.ts:163` 直接写进目录名 ⇒ `firstModelOf` 就会把它当 2.5 倍，
- * 于是「挑最便宜」反而**挑到了最贵的**（同池里 `· x0.8` 的模型排到了它后面）。
- *
- * ✅ 修法：要求倍率前有**分隔符**（`·` / `×` / `·x`），并按真实形态支持促销箭头
- * `x0.17→x0.50`（`formatCreditsRate`，`buddy.ts:701`）—— 取**促销后的**那个值，
- * 那才是实际计费倍率。
- *
- * ⚠️ 只做展示层解析：各 provider 的倍率权威来源不同（qoder 在目录 `priceFactor`、
- * buddy 在远端 config 拼进名字），逐家接字段是个大工程，而目录名是所有 provider
- * 统一展示的地方 —— 先用这一层。
- */
-export function priceFactorFromName(name: string): number {
-  if (name.includes('免费')) return 0
-  // ⚠️ 倍率标注的**真实形态**只有两种（`formatCreditsRate`，buddy.ts:701；
-  // `loomyDisplayName`，loomy.ts:157）：`… · x{n}` 与 `… ×{n}` —— 分隔符是
-  // **间隔号 U+00B7** 或乘号。促销期为 `· x0.17→x0.50`，取箭头右侧（实际计费倍率）。
-  //
-  // ⚠️⚠️ 不能用「`[×x]` 后接数字」这种宽松形态（真实缺陷，PR !69 审计实测）：
-  //   `Spark X2.5`（**无**倍率标注）会被解析成 **2.5 倍**，`GPT-X5` → 5 倍，
-  //   `Grok x4` → 4 倍。于是同池里 `· x0.8` 的模型排在这个「2.5 倍」的后面 ——
-  //   auto 号称「挑最便宜」，反而挑了最贵的。
-  const m = /·\s*[×x]?\s*(\d+(?:\.\d+)?)(?:\s*[→>]\s*[×x]?\s*(\d+(?:\.\d+)?))?\s*$/i
-    .exec(name.trim())
-  if (m === null) return Number.POSITIVE_INFINITY
-  const raw = m[2] ?? m[1]
-  const value = Number(raw)
-  return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY
-}
-
 /** 在 ctx.llm 上注册 auto 路由（幂等，见 `llm-register-compat.ts`）。 */
 export function registerAutoLlm(ctx: Context, options: AutoAdapterOptions): AutoAdapter {
   const adapter = new AutoAdapter(ctx, options)
@@ -740,6 +612,18 @@ export function registerAutoLlm(ctx: Context, options: AutoAdapterOptions): Auto
  * `getAvailableAccount` 确认可用性 + 各家余额端点折算最早失效时刻），但走的是
  * **独立实例**：徽标轮询不该与选型缓存互相踩（选型有 60 秒缓存且随请求刷新，
  * 徽标是 60 秒轮询、隐藏页跳过 —— 两者的节奏本来就该解耦）。
+ *
+ * ## ⚠️⚠️ 聚合 provider 的用量徽标**不用本函数**（2026-10-07 定，规格 §6.5）
+ *
+ * 本函数是**预测**语义（预检余额、算临期胜者），且**有自己的网络成本**。
+ * 而聚合徽标取的是**真实历史** —— `AggregateAdapter` 在**实际转发成功时**记下的
+ * 渠道（`activeProvider()`，纯内存读）。两者在以下情况会**不一致**：
+ * 预测的胜者可能因上游失败而被切换掉，于是「预测的渠道」与「实际用的渠道」不同。
+ * 用户明确选择了真实历史（显示一个错的渠道比不显示更误导）。
+ *
+ * ⇒ 全仓**零调用方**是本函数的现状，**保留它是有意的**（不删，避免越界改动
+ * PR !69 的成果）。若要给聚合徽标接线，用 `aggregate.activeProvider`，
+ * **不要**改成调本函数。
  */
 export async function pickCurrentAutoProvider(
   ctx: Context,

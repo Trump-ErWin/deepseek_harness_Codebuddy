@@ -597,3 +597,84 @@ describe('clearDeadModels —— 用户唯一的自愈路径', () => {
     expect([...deadModelIdsFor('all-b')]).toEqual(['y'])
   })
 })
+
+describe('★ C2：聚合必须豁免「失效模型记录」（全分支终审）', () => {
+  const AGG = 'spec-aggregate'
+
+  beforeEach(() => {
+    clearDeadModels(AGG)
+  })
+
+  it('enabled:false 时，上游「模型不存在」**不得**被记成失效模型', async () => {
+    // ⚠️ 真实缺陷：聚合层的目录是**动态推导**的（上游下架后下次推导自然消失），
+    //    不需要「编译期快照跟不上上游」那套记录。而记录会造成：
+    //    ① 外层观察到的是 `aggregate` + **虚拟键** ⇒ 「某一个渠道没有该 realId」
+    //       被记成「**整个规范模型**失效」，而它在其余渠道上完全可用；
+    //    ② 恢复入口 model.clearDead 的 UI 在设置页 provider 面板里，而客户端
+    //       PROVIDERS **没有 aggregate** ⇒ 没有任何 UI 能恢复。
+    const wrapped = withDeadModelPruning([AGG], makeAdapter(), { enabled: false })
+    await expect(drain(wrapped.stream({ model: 'gone-1' }) as AsyncIterable<unknown>))
+      .rejects.toThrow('model not found')
+    // ⚠️ 关键断言：**没有**被记录
+    expect(deadModelIdsFor(AGG).has('gone-1')).toBe(false)
+  })
+
+  it('对照：默认（enabled 省略）时**照旧记录**（不能把其余 14 家的行为改掉）', async () => {
+    const wrapped = withDeadModelPruning([AGG], makeAdapter())
+    await expect(drain(wrapped.stream({ model: 'gone-1' }) as AsyncIterable<unknown>))
+      .rejects.toThrow('model not found')
+    expect(deadModelIdsFor(AGG).has('gone-1')).toBe(true)
+  })
+
+  it('★ enabled:false 时**也不过滤** —— 历史遗留的 dead 记录不得再隐藏模型（审计轮次二）', async () => {
+    // ⚠️⚠️ 这是**被证伪的那条假设**（初版只跳过记录、仍保留过滤，留下一处真实残留面）：
+    //    若表里**已有**旧版本写下的 `aggregate` 记录（C2 修复前跑过一次聚合就会有），
+    //    虚拟模型**仍被隐藏**，而恢复入口在设置页 provider 面板里、客户端 `PROVIDERS`
+    //    没有 `aggregate` ⇒ **没有任何 UI 能恢复**（只能手改 json 或等 30 天）。
+    //    聚合层的目录是**动态推导**的 ⇒ 过滤它没有任何正确用途（能推导出来就说明有渠道
+    //    正在广告它；推导不出来它压根不在目录里）。故 `enabled:false` 必须**彻底**不参与。
+    recordDeadModel(AGG, 'gone-1', 'legacy record written before the C2 fix')
+    const wrapped = withDeadModelPruning([AGG], makeAdapter(), { enabled: false })
+    const list = await wrapped.listModels()
+    // ⚠️ 关键断言：**不再**被过滤（与初版行为相反）
+    expect(list.some((m) => m.id === 'gone-1')).toBe(true)
+    expect(list.some((m) => m.id === 'good-1')).toBe(true)
+    // listAllModels 同样不受影响
+    const all = wrapped.listAllModels() as Array<{ id: string }>
+    expect([...all].some((m) => m.id === 'gone-1')).toBe(true)
+  })
+
+  it('对照：默认（enabled 省略）时**仍照旧过滤**遗留记录', async () => {
+    recordDeadModel(AGG, 'gone-1', 'pre-existing')
+    const wrapped = withDeadModelPruning([AGG], makeAdapter())
+    const list = await wrapped.listModels()
+    expect(list.some((m) => m.id === 'gone-1')).toBe(false)
+  })
+
+  it('enabled:false 经 prepareCall 路径同样生效（生产唯一路径）', async () => {
+    // ⚠️ 必须走 prepareCall → call.stream，因为 dsh-llm 只走这条路径
+    //    （`dsh-llm/lib/index.js:1597` / `:1667`）；只测顶层 stream 会绕过真实链路
+    //    （AGENTS.md 记过这个坑：42 条用例全绿却完全测不到生产路径）。
+    // ⚠️ 形状必须与真实适配器一致：`prepareCall` 返回的 `stream` 里 `this` 是原对象。
+    const adapter = {
+      listModels: async () => [{ id: 'gone-1', name: 'Gone 1' }],
+      listAllModels: () => [{ id: 'gone-1', name: 'Gone 1' }],
+      async prepareCall(_provider: string, model: string) {
+        return {
+          model: { provider: AGG, id: model, name: model },
+          stream: (options: { model: string }) => this.stream(options),
+        }
+      },
+      async *stream(options: { model: string }): AsyncGenerator<{ text: string }> {
+        if (options.model === 'gone-1') {
+          throw Object.assign(new Error('cline: model not found'), { code: 'HTTP_404' })
+        }
+        yield { text: 'ok' }
+      },
+    }
+    const wrapped = withDeadModelPruning([AGG], adapter as never, { enabled: false }) as typeof adapter
+    const call = await wrapped.prepareCall(AGG, 'gone-1')
+    await expect(drain(call.stream({ model: 'gone-1' }))).rejects.toThrow('model not found')
+    expect(deadModelIdsFor(AGG).has('gone-1')).toBe(false)
+  })
+})
