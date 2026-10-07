@@ -178,13 +178,11 @@ export function apply(ctx) {
        */
       readActiveProvider: (canonicalId) =>
         rpcCall('aggregate.activeProvider', canonicalId === undefined ? {} : { canonicalId }),
-      /**
-       * 「按临期排序」用的到期时刻（面板可选按钮，用户 2026-10-07 选定）。
-       *
-       * ⚠️ 这是**唯一会做余额探测**的面板调用（每个已接入渠道一次上游 GET）
-       * ⇒ 只在用户显式点「按临期排序」时才发（面板默认不探测，规格 §8.3）。
-       */
-      readExpiryOrder: () => rpcCall('aggregate.expiryOrder', {}),
+      // ⚠️ **这里曾有一个 `readExpiryOrder` prop，已删除**（真实死代码，审计实测指出）：
+      //    它在 `c12b3ab` 上就已**零消费者** —— `AggregatePanel` 自己直接
+      //    `rpcCall('aggregate.expiryOrder', {})`（`jet-hub.js`），从不经过本 prop。
+      //    本仓库把死代码视为缺陷（会让人以为「面板是通过 prop 取数的」而找错地方）。
+      //    ⚠️ 端点本身仍在（`aggregate.expiryOrder`）—— 删的只是这个没人用的转发 prop。
       writePreference: (preference) => rpcCall('usage.badgePreference', { preference }),
       // 自动签到开关（全局一个，不分渠道）：宿主在「打开」时会立刻跑一轮。
       setAutoCheckin: (enabled) => rpcCall('usage.autoCheckin', { enabled }),

@@ -504,10 +504,90 @@ export class AggregateAdapter extends LlmAdapter {
     //
     // ⚠️ `auto` **不参与**该过滤（它由 `listModels` / `listAllModels` 单独合成，
     //    不在 `this.catalog` 里）—— 它的池跨全部渠道，任一已接入渠道有账号就能路由。
+    // ⚠️ 先记下**上一次**推导出的全量目录（下面的判据要用它判断「用户关的是整个 provider」）。
+    const previousIds = [AGGREGATE_AUTO_MODEL, ...this.catalog.map((m) => m.key)]
     this.catalog = buildVirtualModels(catalogs)
       .filter((virtual) => virtual.candidates.some((c) => WIRED_EXPIRY_PROVIDERS.includes(c.provider)))
     this.catalogAt = now
+    // ⚠️⚠️ **维持「整个 provider 已关闭」的语义**（真实缺陷，实测复现）。
+    //
+    // ## 机制（本适配器的**动态目录**与宿主「一键关闭」的**快照**假设相撞）
+    //
+    // 宿主的「供应商一键关闭」（`jet-hub-rpc.ts` 的 `provider.setEnabled`）把**当时的**
+    // 全量目录 id 写进黑名单；而 `provider.status` 的判据是
+    // `closed = total > 0 && disabled === total`，`total` 取自 `listAllModels()`。
+    //
+    // ⚠️ 对**其余 14 家**，目录是**固定**的 ⇒ 「写一次快照」永远成立；
+    //    而本适配器的目录是**动态推导**的（登录新渠道就长出新的虚拟模型）
+    //    ⇒ 旧黑名单**盖不住**新模型 ⇒ `disabled < total` ⇒
+    //    **开关自动翻回「已打开」**，且新模型**可被选中**（用户明明关了聚合）。
+    //
+    // 实测（探针，修前）：
+    // ```
+    // ① 关闭 ⇒ 黑名单 [auto, deepseek-v4-1-flash]，status {total:2,disabled:2,closed:true}
+    // ② 登录 codearts ⇒ 目录 [auto, deepseek-v4-1-flash, glm-5-3]
+    //    status {total:3,disabled:2,closed:false} ⇒ 开关显示「已打开」   ← 缺陷
+    // ③ aggregate.listModels() 播报 ["glm-5-3"]                       ← 泄漏
+    // ```
+    //
+    // ## 判据（只在「整个 provider 已关闭」时补写）
+    //
+    // 「整个 provider 已关闭」= 黑名单非空，**且**它覆盖了**上一次**推导出的全量目录
+    //（`previousIds` 里每个 id 都被标记为关闭）。那说明用户关的是**整个 provider**。
+    //
+    // ⚠️ **不得无条件补写**：
+    //   - 用户从未关闭过（黑名单为空）⇒ 凭空补写会**静默关闭整个 provider**（灾难且难察觉）；
+    //   - 用户只是**逐个**关了某几个模型（黑名单没覆盖上快照）⇒ 不该被升级成整 provider 关闭。
+    // ⚠️ 补写是**异步落盘**，不阻塞本次目录返回；失败只记 warn（下次推导会再试）。
+    this.maintainProviderClosedState(previousIds)
     return this.catalog
+  }
+
+  /**
+   * 若聚合 provider 处于「整个已关闭」态，则把**新增的**虚拟模型补进黑名单。
+   *
+   * ⚠️ 详见 {@link refreshCatalog} 末尾的长注释：这是为了弥补宿主
+   * 「一键关闭写快照」与「聚合目录动态推导」之间的语义缺口。
+   *
+   * @param previousIds - **上一次**推导出的全量目录（含 `auto`）——
+   *   用它判断「用户关的是整个 provider」而不是逐个关了某几个模型。
+   */
+  private maintainProviderClosedState(previousIds: readonly string[]): void {
+    // ⚠️ **防御性取值**：`listDisabledModels` 是 `AccountPool` 的方法，而单测的池桩
+    //    往往只实现被测到的那几个（`disabledModelsFor` / `getAvailableAccount`…）。
+    //    这里缺方法时**直接跳过**（而不是抛）—— 否则本方法会把 67 条既有用例全打红
+    //    （实测：`TypeError: this.options.accountPool.listDisabledModels is not a function`）。
+    //    ⚠️ 语义上也正确：拿不到黑名单就无从判断「是否整 provider 关闭」，
+    //    保守地什么都不做（不写任何状态）。
+    const readDisabled = (this.options.accountPool as {
+      listDisabledModels?: (provider: string) => Record<string, boolean>
+    }).listDisabledModels
+    if (typeof readDisabled !== 'function') return
+    const disabled = readDisabled.call(this.options.accountPool, AGGREGATE_PROVIDER)
+    // 从未关闭过 ⇒ 什么都不做（凭空补写会静默关闭整个 provider）。
+    const hasAnyDisabled = Object.values(disabled).some((flag) => flag === true)
+    if (!hasAnyDisabled) return
+    // ⚠️ 关键判据：上一次的全量目录**是否全被标记为关闭**。
+    //    是 ⇒ 用户关的是**整个 provider** ⇒ 新长出来的模型也要补上。
+    //    否 ⇒ 用户只是逐个关了某几个模型 ⇒ 不碰（不该升级成整 provider 关闭）。
+    const closedWholeProvider = previousIds.length > 0
+      && previousIds.every((id) => disabled[id] === true)
+    if (!closedWholeProvider) return
+    // 本次**新增**的（尚未被标记的）模型。
+    const missing = [AGGREGATE_AUTO_MODEL, ...this.catalog.map((m) => m.key)]
+      .filter((id) => disabled[id] !== true)
+    if (missing.length === 0) return
+    // ⚠️ 同理防御：写方法也来自池，缺了就跳过。
+    const writeDisabled = (this.options.accountPool as {
+      setModelsDisabled?: (provider: string, ids: readonly string[]) => Promise<void>
+    }).setModelsDisabled
+    if (typeof writeDisabled !== 'function') return
+    void writeDisabled.call(this.options.accountPool, AGGREGATE_PROVIDER, missing)
+      .catch((error: unknown) => {
+        this.ctx.logger?.warn?.(
+          `[aggregate] 补写「整个 provider 已关闭」的黑名单失败（下次目录推导会再试）：${String(error)}`,
+        )
+      })
   }
 
   /**

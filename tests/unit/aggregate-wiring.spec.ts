@@ -24,6 +24,7 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { AggregateAdapter } from '../../src/aggregate-adapter.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const index = readFileSync(join(here, '../../src/index.ts'), 'utf8')
@@ -116,5 +117,118 @@ describe('index.ts 接线：聚合 provider', () => {
     expect(registered).toBeGreaterThan(-1)
     expect(table).toBeGreaterThan(registered)
     expect(rpc).toBeGreaterThan(table)
+  })
+})
+
+/**
+ * ★★ 聚合 provider 关闭后**不得**被「动态目录长大」静默重新打开（真实缺陷，实测复现）。
+ *
+ * ## 机制（两侧判据的真实冲突）
+ *
+ * - master 的「供应商一键关闭」（`jet-hub-rpc.ts:4017`）把**当时的**全量目录 id 写进
+ *   黑名单：`pool.setModelsDisabled(provider, catalog.ids)`；
+ * - `provider.status`（`:3952`）的判据是 `closed = total > 0 && disabled === total`，
+ *   而 `total` 取自 **`listAllModels()`**（`fullCatalogIds` 优先用它）；
+ * - 对**其余 14 家**，目录是**固定**的 ⇒ 「写一次快照」永远成立；
+ * - ⚠️ 但聚合的目录是**动态推导**的（`refreshCatalog`：登录新渠道就长出新的虚拟模型）
+ *   ⇒ 快照长大之后，旧黑名单**盖不住**新模型 ⇒ `disabled < total` ⇒
+ *   **开关自动翻回「已打开」**，且新模型**可被选中**。
+ *
+ * ## 实测（探针，修前）
+ * ```
+ * ① 关闭 ⇒ 黑名单 [auto, deepseek-v4-1-flash]，status {total:2,disabled:2,closed:true}，播报 []
+ * ② 登录 codearts ⇒ 目录 [auto, deepseek-v4-1-flash, glm-5-3]
+ *    status {total:3,disabled:2,closed:false} ⇒ 开关显示「已打开」   ← 缺陷
+ * ③ aggregate.listModels() 播报 ["glm-5-3"]                       ← 泄漏
+ * ```
+ *
+ * ## 判据
+ * 若该 provider **处于已关闭态**（黑名单非空 **且** 覆盖了上一次的全量目录），
+ * 则重推目录后**必须把新增的模型补进黑名单**（维持「整个 provider 关闭」的语义）。
+ * ⚠️ 不能无条件写：用户**从未关闭**过它时（黑名单为空）不得凭空写入。
+ */
+describe('★★ 聚合关闭后不得被动态目录长大重新打开', () => {
+  const makeWorld = () => {
+    const disabled = {}
+    let extraChannel = false
+    const pool = {
+      disabledModelsFor: (p: string) => new Set(Object.keys(disabled[p] ?? {})),
+      listDisabledModels: (p: string) => ({ ...(disabled[p] ?? {}) }),
+      async setModelsDisabled(p: string, ids: readonly string[]) {
+        for (const id of ids) disabled[p] = { ...(disabled[p] ?? {}), [id]: true }
+      },
+      async clearDisabledModels(p: string) {
+        delete disabled[p]
+      },
+      listAvailableCredentials: async () => [
+        { entry: { id: 'a1' }, credential: { access_token: 't' } },
+      ],
+      getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: { access_token: 't' } }),
+      listAggregateRejections: () => ({}),
+    }
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => (extraChannel
+          ? [{ id: 'buddy' }, { id: 'codearts' }]
+          : [{ id: 'buddy' }]),
+        listModels: async (provider: string) => (provider === 'buddy'
+          ? [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }]
+          : [{ id: 'glm-5.3', name: 'GLM-5.3' }]),
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => (async function* () { /* noop */ })(),
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: pool as never, expiryProbe: async () => 100, rejections: () => ({}),
+    })
+    return {
+      adapter, pool, disabled,
+      loginExtraChannel: () => { extraChannel = true },
+    }
+  }
+
+  it('★★ 关闭后目录长大 ⇒ 必须把新模型补进黑名单（不得泄漏、开关不得翻回）', async () => {
+    const { adapter, pool, loginExtraChannel } = makeWorld()
+    // ① 初始目录只含 buddy
+    await adapter.listModels('aggregate')
+    const firstIds = adapter.listAllModels().map((m) => m.id)
+    expect(firstIds).toEqual(['auto', 'deepseek-v4-1-flash'])
+    // ② 模拟 master 的「一键关闭」：写入当时的全量快照
+    await pool.setModelsDisabled('aggregate', firstIds)
+    // ③ 登录新渠道 ⇒ 目录长大（force 重推，模拟 TTL 过期后的下一次推导）
+    loginExtraChannel()
+    await adapter.describeCatalog(true)
+    await adapter.listModels('aggregate')
+    // ★ 新增的模型必须**也**被关闭（否则整个 provider 就算「没关」）
+    const after = adapter.listAllModels().map((m) => m.id)
+    expect(after, '目录确实长大了').toContain('glm-5-3')
+    const dmap = pool.listDisabledModels('aggregate')
+    expect(dmap['glm-5-3'], '★ 新增模型必须补进黑名单（不得泄漏）').toBe(true)
+    // ★ 且 listModels 不得播出它
+    const broadcast = (await adapter.listModels('aggregate')).map((m) => m.id)
+    expect(broadcast, '关闭态下不得播出任何模型').toEqual([])
+  })
+
+  it('★ 对照：**从未关闭**过聚合 ⇒ 不得凭空写黑名单', async () => {
+    const { adapter, pool } = makeWorld()
+    await adapter.describeCatalog(true)
+    await adapter.listModels('aggregate')
+    expect(pool.listDisabledModels('aggregate'), '没关闭过就不该有黑名单').toEqual({})
+    // 且模型可正常选出
+    const broadcast = (await adapter.listModels('aggregate')).map((m) => m.id)
+    expect(broadcast.length, '未关闭时应能选出模型').toBeGreaterThan(0)
+  })
+
+  it('★ 对照：**用户手动打开**（黑名单清空）后目录再长大 ⇒ 不得再补写', async () => {
+    const { adapter, pool, loginExtraChannel } = makeWorld()
+    await adapter.listModels('aggregate')
+    await pool.setModelsDisabled('aggregate', adapter.listAllModels().map((m) => m.id))
+    // 用户重新打开
+    await pool.clearDisabledModels('aggregate')
+    loginExtraChannel()
+    await adapter.describeCatalog(true)
+    await adapter.listModels('aggregate')
+    expect(pool.listDisabledModels('aggregate'), '已打开 ⇒ 不得再补写').toEqual({})
   })
 })
