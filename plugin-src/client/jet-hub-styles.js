@@ -823,6 +823,14 @@ const STYLES = `
 .dim-jh-badgeBtn { box-sizing: border-box; display: flex; align-items: center; gap: 5px; max-width: 216px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
 .dim-jh-badgeBtn:hover { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeBtn[aria-expanded="true"] { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); }
+/* 聚合「待首次请求」占位胶囊（用户报障 2026-10-08：「也没胶囊了？」）。
+   ⚠️ 刻意与 .dim-jh-badgeBtn **外观一致但不共用类名**：那个类名带 cursor:pointer
+   与 :hover 反馈，而这里没有任何可点的东西（无历史 ⇒ 没有余额可展开）。
+   给一个点了没反应的按钮比没有按钮更糟。
+   ⚠️ 宽度口径与 .dim-jh-badgeBtn 同步（gap 5px / padding 2px 9px / 字号 11px）：
+   两者会在同一位置交替出现（首次请求成功后换成真胶囊），尺寸不一致会看到跳动。 */
+.dim-jh-badgePending { display: inline-flex; align-items: center; gap: 5px; max-width: 216px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 1.5; white-space: nowrap; }
+.dim-jh-badgePending > span:last-child { overflow: hidden; text-overflow: ellipsis; }
 /* 三段式文本容器：渠道名 + 分隔符 + 读数。
    ⚠️ 必须是 flex 容器，两个文本子项才能各自独立收缩（这正是「数字不被截」的前提）。 */
 .dim-jh-badgeText { display: flex; align-items: center; min-width: 0; }
@@ -880,8 +888,7 @@ const STYLES = `
  * 靠**源顺序**决定胜负 —— 一旦被排到前面，窄屏下 display:none 会被
  * 后面的 display:flex 覆盖，文字重新出现并挤压模型选择器（静默回归）。 */
 @media (max-width: 720px) { .dim-jh-badgeText, .dim-jh-badgeBtn > svg, .dim-jh-badgeBtn > .dim-jh-badgeChevron { display: none; } .dim-jh-badgeBtn { max-width: none; padding: 2px 6px; } }
-.dim-jh-badgeDot { width: 5px; height: 5px; flex: none; border-radius: 999px; background: var(--dsw-alias-state-success-primary); }
-.dim-jh-badgeDot[data-tone="warn"] { background: var(--dsw-alias-state-warn-primary); }
+.dim-jh-badgeDot { width: 5px; height: 5px; flex: none; border-radius: 999px; background: var(--dsw-alias-state-success-primary); }.dim-jh-badgeDot[data-tone="warn"] { background: var(--dsw-alias-state-warn-primary); }
 .dim-jh-badgeDot[data-tone="error"] { background: var(--dsw-alias-state-error-primary); }
 .dim-jh-badgeDot[data-tone="muted"] { background: var(--dsw-alias-label-tertiary); }
 .dim-jh-badgePop { position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 40; width: 280px; max-width: min(280px, 86vw); max-height: 58vh; overflow-y: auto; display: flex; flex-direction: column; padding: 9px 10px 10px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 11px; background: var(--dsw-alias-bg-layer-1); box-shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 8px 24px rgba(0, 0, 0, .14); text-align: left; white-space: normal; }

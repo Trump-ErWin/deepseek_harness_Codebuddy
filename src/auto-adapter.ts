@@ -59,7 +59,7 @@ import { translateReasoningEffort } from './reasoning-ladder.js'
 // ⚠️ 选型口径的**唯一权威**是 `aggregate-core.ts`（哨兵语义 / 排序 / 倍率解析）；
 // 本文件与 `aggregate-adapter.ts` 都只是它的调用方 —— 抽出原因（本仓库对「同一
 // 语义两套实现」的红线）与全部真实缺陷记录见该文件模块头。**不要**在本文件另写一份。
-import { UNUSABLE, pickSoonestProvider, priceFactorFromName } from './aggregate-core.js'
+import { NEVER, UNUSABLE, pickSoonestProvider, priceFactorFromName } from './aggregate-core.js'
 export { pickSoonestProvider, priceFactorFromName } from './aggregate-core.js'
 // ⚠️ 临期折算的**唯一权威**是 `aggregate-expiry.ts`：本文件的 `expiryOf` 只是它的
 // **薄委托**（只提供 auto 的取号方式）。四个 `*Expiry` 折算函数 Task 7 已**搬移**到
@@ -159,9 +159,129 @@ export class AutoAdapter extends LlmAdapter {
     return { id: provider, name: 'Jet Hub 自动（临期优先）' }
   }
 
+  /**
+   * 最近一次**实际发出**的目标（含带图改道）；未发过任何请求时为 `undefined`。
+   *
+   * ⚠️ 上游 `ba10f4f` 重写 aggregate 时把本字段与 {@link lastExpiryAt} 一并删掉了，
+   * 于是 `usage.badge` 对 `jet-hub-auto` 的改写逻辑（宿主端）失去数据来源、
+   * 整块被删 ⇒ **旧 auto 的用量徽标彻底消失**（用户报障 2026-10-08：「也没胶囊了？」）。
+   * 这里补回来。消费方是 `jet-hub-rpc.ts` 的 `usage.badge`（经 `autoAdapter` 注入）。
+   */
+  private lastDispatch: {
+    provider: string
+    model: string
+    at: number
+    viaImageFallback: boolean
+    expiryAt?: number
+  } | undefined
+
+  /** 最近一次选型胜者的失效时刻（毫秒）—— 徽标的临期倒计时用。 */
+  private lastExpiryAt: number | undefined
+
+  /**
+   * 「渠道 + 模型 → 倍率」的临时表 —— 由 {@link firstModelOf} 在**已经算过**倍率的
+   * 那一轮目录循环里顺带写入（零额外请求）。
+   *
+   * ## ⚠️ 为什么要有它（用户报障 2026-10-08「没倍率显示？」）
+   *
+   * auto 是**跨渠道**的单一模型名，它自己没有倍率：倍率取决于**本次选中谁**。
+   * 而模型选择器显示的是 `listModels` 的**静态**名字（对所有请求都一样），
+   * 往那里写死一个倍率就是**编造**（`buddy.ts:494` 的既有判据：编造倍率比不显示更糟）。
+   * ⇒ 倍率只能显示在**胶囊**里（那里显示的正是「这次实际用了谁」），
+   *   而胶囊的数据来自 `lastDispatch`，故倍率必须在分发时可得。
+   *
+   * ## 为什么用表而不是在分发时重查目录
+   *
+   * `firstModelOf` 已经为了「挑最便宜的模型」把整个目录读了一遍并算出了倍率
+   *（`priceFactorFromName`）；重查一次等于**再打一轮上游目录接口**，纯粹浪费。
+   *
+   * ⚠️ 只做缓存用途，**不参与任何选型判据**（选型只看 `price` 的排序结果，
+   *   见 `firstModelOf` 的 `best`）。表项无上限问题：键是「渠道 + 模型」，
+   *   而渠道数与模型数都是目录级的小常量。
+   */
+  private readonly priceByModel = new Map<string, number>()
+
+  /** 记下某渠道某模型的倍率（键含渠道，避免同名模型跨渠道串价）。 */
+  private rememberPrice(provider: string, model: string, price: number): void {
+    this.priceByModel.set(`${provider}\u0000${model}`, price)
+  }
+
+  /**
+   * 查已记下的倍率；查不到回 `undefined`（**不猜、不重查**）。
+   *
+   * ⚠️ 查不到是**正常**情形：宿主刚重启、还没走过选型时表是空的。
+   *    调用方（`usage.badge`）必须能接受「没有倍率」而不是显示一个编造的值。
+   */
+  priceOf(provider: string, model: string): number | undefined {
+    return this.priceByModel.get(`${provider}\u0000${model}`)
+  }
+
+  /**
+   * 交给 RPC 层的**自包含状态入口**（`usage.badge` 对 `jet-hub-auto` 的改写用）。
+   *
+   * ## ⚠️ 为什么是一个聚合方法，而不是把三个成员直接暴露出去
+   *
+   * `jet-hub-rpc.ts` 只需经 `modelAdapters['jet-hub-auto']` 拿到一个**结构化**接口
+   * （它不该 import 具体适配器类，见 `ModelCatalogSource` 的注释）。这里把
+   * 「真实历史 / 预测 / 倍率」三件事收成一个方法，好处是：
+   *
+   * 1. **位置参数不动**：`registerJetHubRpc` 是位置传参且有一条派生式不变量
+   *    （「客户端 `PROVIDERS` 条数 + 1 == 形参个数」）—— 加第 17 个位置参数会打破它
+   *    （实测 10 条接线断言同时变红）。走 `modelAdapters` 表则只加一个键。
+   * 2. **不会误用新建实例**：`selectProvider` 是**绑定在 this 上**的箭头闭包，
+   *    调用方拿不到「new 一个适配器」的机会 —— 而那正是本仓库记录过的真实缺陷
+   *    （两份探针缓存 ⇒ 同一渠道被折算两次）。
+   *
+   * ⚠️ `selectProvider` 刻意**不接受参数**：`modelOf` 必须固定为 `firstModelOf`
+   *   （那才是「该 provider 能否实际被调用」的判据，见 `selectProvider` 的注释），
+   *   暴露给调用方只会让它传错。
+   */
+  autoState(): {
+    lastDecision: { provider: string; model: string; viaImageFallback: boolean; expiryAt?: number } | null
+    lastWinnerExpiryAt?: number
+    selectProvider(): Promise<{ provider: string; model: string } | undefined>
+    priceOf(provider: string, model: string): number | undefined
+  } {
+    return {
+      lastDecision: this.lastDecision ?? null,
+      lastWinnerExpiryAt: this.lastWinnerExpiryAt,
+      selectProvider: () => this.selectProvider(undefined, p => this.firstModelOf(p)),
+      priceOf: (provider, model) => this.priceOf(provider, model),
+    }
+  }
+
+  /** 最近一次真实发出的目标（未发过任何请求时为 `undefined`）。 */
+  get lastDecision(): {
+    provider: string
+    model: string
+    at: number
+    viaImageFallback: boolean
+    expiryAt?: number
+  } | undefined {
+    return this.lastDispatch
+  }
+
+  /** 最近一次选型胜者的失效时刻（徽标倒计时用；未选过型时为 `undefined`）。 */
+  get lastWinnerExpiryAt(): number | undefined {
+    return this.lastExpiryAt
+  }
+
   /** 目录里永远只有一个 auto（真实模型由选型决定，不在此暴露）。 */
   async listModels(): Promise<readonly LlmModelInfo[]> {
     return [AUTO_MODEL_INFO]
+  }
+
+  /**
+   * **不套黑名单**的全量目录 —— 与其余适配器的同名方法同约定。
+   *
+   * ⚠️ auto 只有**一个**模型且它不参与用户黑名单（黑名单针对的是各渠道的真实
+   * 模型，auto 的目标由选型决定），故两个方法的返回值**相同**。
+   * 存在的理由是**契约**：`jet-hub-rpc.ts` 的 `ModelCatalogSource` 要求本方法，
+   * 而 auto 现在要经 `modelAdapters` 表把 `autoState()` 交给 RPC 层
+   * （见 `ModelCatalogSource.autoState` 的注释：不能加位置参数）。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    return [{ id: AUTO_MODEL_INFO.id, name: AUTO_MODEL_INFO.name }]
   }
 
   /**
@@ -302,7 +422,7 @@ export class AutoAdapter extends LlmAdapter {
           this.ctx.logger?.warn?.(
             `[jet-hub-auto] 带图请求：临期胜者 ${choice.provider}（${choice.model}）不支持图片，已改道到 ${imageTarget.provider}（${imageTarget.model}）`,
           )
-          return this.dispatch(imageTarget, options)
+          return this.dispatch(imageTarget, options, true)
         }
         return this.dispatch(mainTarget, options)
       },
@@ -358,7 +478,21 @@ export class AutoAdapter extends LlmAdapter {
   private dispatch(
     target: DispatchTarget,
     options: GenerateOptions,
+    viaImageFallback = false,
   ): AsyncIterable<StreamChunk> {
+    // 记录**实际**发出的目标（含带图改道）—— 徽标据此显示「现在在用谁」。
+    //
+    // ⚠️ 必须在**任何** return 之前记，否则带图改道那条路径会漏记（那正是最需要
+    //    徽标准的时刻：用户以为在用 A，实际烧的是 B）。
+    // ⚠️ 与选型缓存 `cached` 的区别：`cached` 存的是**主**目标，带图改道后它仍是
+    //    旧值 ⇒ 徽标若读 `cached` 就会显示错人。故只在这里（真的发出去时）更新。
+    this.lastDispatch = {
+      provider: target.provider,
+      model: target.model,
+      at: this.options.now?.() ?? Date.now(),
+      viaImageFallback,
+      expiryAt: this.lastExpiryAt,
+    }
     const requested = options.reasoningEffort
     if (requested === undefined) {
       return this.ctx.llm.stream({ ...options, provider: target.provider, model: target.model })
@@ -486,6 +620,10 @@ export class AutoAdapter extends LlmAdapter {
     }
     const winner = pickSoonestProvider(entries)
     if (winner === undefined) return undefined
+    // 胜者的失效时刻是本次选型**顺带算出的**（零额外请求）—— 留给徽标显示临期倒计时。
+    // ⚠️ 必须在 `return undefined` 之后、返回 choice 之前写：提前写会让「无可用候选」
+    //    时留下上一次的陈旧时刻，徽标就会显示一个早已失效的倒计时。
+    this.lastExpiryAt = entries.find(([p]) => p === winner)?.[1]
     const model = modelOf !== undefined ? await modelOf(winner) : undefined
     if (modelOf !== undefined && model === undefined) return undefined
     return { provider: winner, model: model ?? '' }
@@ -581,6 +719,9 @@ export class AutoAdapter extends LlmAdapter {
             `[jet-hub-auto] ${provider} 目录中的 ${skipped} 个模型已被关闭，已跳过`,
           )
         }
+        // 顺带记下倍率（**零额外开销**：上面那轮循环已经算出来了）。
+        // ⚠️ 必须在这里记，不能等调用方再查一次目录 —— 那是重复的上游请求。
+        this.rememberPrice(provider, best.id, best.price)
         return best.id
       }
     } catch (error) {
@@ -605,6 +746,14 @@ export function registerAutoLlm(ctx: Context, options: AutoAdapterOptions): Auto
   return adapter
 }
 
+/** 「auto 现在会选谁」的预测结果（供用量徽标在**尚无真实历史**时兜底显示）。 */
+export interface CurrentAutoWinner {
+  provider: string
+  model: string
+  /** 胜者额度的失效时刻（`Infinity` = 只有长期积分）。 */
+  expiryAt: number
+}
+
 /**
  * 「auto 现在会选谁」——按临期判据算出当前胜者（供用量徽标等外部消费）。
  *
@@ -613,25 +762,32 @@ export function registerAutoLlm(ctx: Context, options: AutoAdapterOptions): Auto
  * **独立实例**：徽标轮询不该与选型缓存互相踩（选型有 60 秒缓存且随请求刷新，
  * 徽标是 60 秒轮询、隐藏页跳过 —— 两者的节奏本来就该解耦）。
  *
+ * ## ⚠️ 用途：**只在「还没有真实历史」时**兜底
+ *
+ * 本函数是**预测**语义，且**有自己的网络成本**（会对每个候选渠道打一次余额接口）。
+ * ⇒ `usage.badge` 的调用序必须是：**先**读 `AutoAdapter.lastDecision`（真实历史，
+ * 零成本、零误差），只有它 `undefined`（插件刚重启、还没发过任何请求）时才回退到这里。
+ *
+ * ⚠️ 绝不可以在有历史时也用它：预测的胜者可能因上游失败/带图改道而被换掉，
+ * 于是「预测的渠道」与「实际用的渠道」不同 —— 徽标是止损工具，显示错人比
+ * 不显示更危险（用户原话「以为在用 A，实际在烧 B」）。
+ *
  * ## ⚠️⚠️ 聚合 provider 的用量徽标**不用本函数**（2026-10-07 定，规格 §6.5）
  *
- * 本函数是**预测**语义（预检余额、算临期胜者），且**有自己的网络成本**。
- * 而聚合徽标取的是**真实历史** —— `AggregateAdapter` 在**实际转发成功时**记下的
- * 渠道（`activeProvider()`，纯内存读）。两者在以下情况会**不一致**：
- * 预测的胜者可能因上游失败而被切换掉，于是「预测的渠道」与「实际用的渠道」不同。
- * 用户明确选择了真实历史（显示一个错的渠道比不显示更误导）。
- *
- * ⇒ 全仓**零调用方**是本函数的现状，**保留它是有意的**（不删，避免越界改动
- * PR !69 的成果）。若要给聚合徽标接线，用 `aggregate.activeProvider`，
- * **不要**改成调本函数。
+ * 聚合徽标取的是**真实历史** —— `AggregateAdapter` 在**实际转发成功时**记下的
+ * 渠道（`activeProvider()`，纯内存读）。若要给聚合徽标接线，用
+ * `aggregate.activeProvider`，**不要**改成调本函数。
  */
 export async function pickCurrentAutoProvider(
   ctx: Context,
   options: AutoAdapterOptions,
-): Promise<string | undefined> {
+): Promise<CurrentAutoWinner | undefined> {
   const probe = new AutoAdapter(ctx, options)
   // ⚠️ 必须带 `modelOf`：**模型全被关闭的 provider 不能算进徽标**（PR !69 审计实测），
   // 否则徽标会显示一个 auto 实际根本不会选中的 provider。
   const picked = await probe.selectProvider(undefined, p => probe.firstModelOf(p))
-  return picked?.provider
+  if (picked === undefined) return undefined
+  // ⚠️ `lastWinnerExpiryAt` 由 `selectProvider` 顺带写入（零额外请求）——
+  //    不能在这里再算一次（那是重复的上游余额查询）。
+  return { provider: picked.provider, model: picked.model, expiryAt: probe.lastWinnerExpiryAt ?? NEVER }
 }

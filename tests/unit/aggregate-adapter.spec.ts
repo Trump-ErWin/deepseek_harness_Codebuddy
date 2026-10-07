@@ -47,6 +47,87 @@ describe('AggregateAdapter：目录播报', () => {
     expect(new Set(models.map((m) => m.id)).size).toBe(models.length)
   })
 
+  /**
+   * ★ 模型选择器里的虚拟模型名**必须带倍率**（用户报障 2026-10-08：「没倍率显示？」）。
+   *
+   * 根因：`nameOf` 只回规范名，而倍率其实早就算好了（`CandidateEntry.price`），
+   * 只是从没被展示层用过 ⇒ 用户在聚合下看不到价格，无法判断「挑的是不是便宜的」。
+   */
+  it('★ 选择器名带倍率后缀（取最便宜的候选）', async () => {
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · x0.15')
+  })
+
+  it('★ 多个候选时取**最便宜**的那个倍率（轮换的第二判据就是倍率升序）', async () => {
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.29' }],
+      codearts: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.03' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    // 最便宜的是 codearts 的 x0.03 —— 那才是最可能被路由到的那个价。
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · x0.03')
+  })
+
+  it('★ 全部候选都无倍率标注 ⇒ 不加后缀（不得渲染出 xInfinity）', async () => {
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash')
+    expect(entry!.name).not.toContain('Infinity')
+  })
+
+  it('★ 倍率为 0 显示「免费」（本仓库既有口径）', async () => {
+    // ⚠️ 必须用一个**已接入临期折算**的渠道（buddy）：未接入的候选会被
+    //    `pickerNameOf` 的价格过滤剔掉（见下一条用例），拿不到「免费」。
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · 免费' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · 免费')
+  })
+
+  it('★ 倍率只加在选择器路径上：resolveModel 仍是规范名（三处既有断言钉住）', async () => {
+    // ⚠️ `resolveModel` / `describeCatalog` 的名字被逐字钉住（本文件 :88、
+    //    aggregate-rejections.spec.ts:251、aggregate-catalog.spec.ts:21），
+    //    且 `describeCatalog` 的候选子列表**逐条**显示倍率 —— 模型名上再叠一次
+    //    会出现「两个倍率」的重复展示。
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
+    }), { accountPool: makePool() })
+    const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    expect(info.name).toBe('DeepSeek V4.1 Flash')
+  })
+
+  it('★ 未接入临期折算的候选不参与报价（它永远不会被路由到）', async () => {
+    // ⚠️ `cline` 在 `AGGREGATE_CHANNELS` 里，但**不在** `WIRED_EXPIRY_PROVIDERS` 里
+    //   （`expiryProbe` 对它返回 UNUSABLE ⇒ 永不路由）。把它的价格显示出来等于
+    //    替一个用不上的候选报价（规格 §9.2.1：只广告可路由的东西）。
+    //
+    // ⚠️ 必须同时给一个**已接入**的候选（buddy），否则整条虚拟模型会被
+    //    `refreshCatalog` 的模型层过滤掉（「至少有一个已接入候选」），
+    //    用例就变成在测「模型不存在」而不是在测价格过滤 —— 那是一条**恒真**的假用例
+    //   （第一版就是这么写错的：只用 cline，`entry` 直接是 undefined）。
+    //
+    // cline 报 x0.01（最便宜）：若过滤失效就会显示它。
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
+      cline: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.01' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    // 前置断言：模型确实在（否则下面那条断言会因 undefined 而**假通过**的变体）。
+    expect(entry, '虚拟模型必须存在（buddy 是已接入候选）').toBeDefined()
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · x0.15')
+  })
+
   it('被用户关闭的虚拟模型不播报（套 disabledModelsFor 黑名单）', async () => {
     const pool = {
       disabledModelsFor: () => new Set(['deepseek-v4-1-flash']),

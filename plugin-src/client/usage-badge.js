@@ -28,13 +28,14 @@
 import * as React from 'react';
 
 import { supportsCreditBalance, supportsDailyCheckin, checkinProviders } from './credits-capabilities.js';
-import { AGGREGATE_PROVIDER_ID, resolveBadgeProvider } from './badge-model.js';
+import { AGGREGATE_PROVIDER_ID, AUTO_PROVIDER_ID, resolveBadgeProvider } from './badge-model.js';
 import {
   badgeView,
   creditSectionLabel,
   describeBadgeError,
   formatUpdatedAt,
   orderCreditRows,
+  autoBadgeName,
   BADGE_PREFERENCES,
   BADGE_PREFERENCE_LABELS,
 } from './badge-model.js';
@@ -339,14 +340,81 @@ export function UsageBadge(props) {
   if (isAggregate) {
     provider = resolveBadgeProvider(provider, activeProvider === null ? null : { provider: activeProvider });
   }
+  /**
+   * 聚合 provider **尚无转发历史** ⇒ 显示「待首次请求」占位胶囊，而不是整个消失。
+   *
+   * ## 为什么必须有个占位（用户报障 2026-10-08）
+   *
+   * 用户原话：「也没胶囊了？」—— 切到聚合后徽标**整个不见了**，而同屏的普通渠道
+   * 有徽标。上游原设计（规格 §6.3 的 P4）是「无历史 ⇒ 不渲染」，理由是
+   * 「显示一个错的渠道比不显示更误导」。那个理由对**渠道**成立，但对
+   * 「**有没有徽标**」不成立：徽标在本插件里的定位是**止损工具** ——
+   * 用户原话「必须要徽标，不然会导致不知道当前在用什么模型，就会出现之前
+   * 一小会儿花我大量积分，显示的话还来得及暂停」。整个消失恰好破坏了这一点：
+   * 用户分不清「聚合没在用」与「徽标坏了」。
+   *
+   * ⚠️ 所以这里**不预测渠道**（P4 的核心约束仍然遵守）：文案只说「待首次请求」，
+   * 不编造任何渠道名。预测仍被禁止（`pickCurrentAutoProvider` 不得出现在本文件，
+   * 有用例钉住）。
+   *
+   * ## 位置：必须在重定向**之后**、空 provider 门控**之前**
+   *
+   * 重定向之后才能区分「无历史」（`provider === null` 且是聚合）与
+   * 「非聚合的正常空值」（新会话尚未选模型）。后者**必须继续不渲染** ——
+   * 那是既有的正确行为，与聚合无关。
+   *
+   * ⚠️ 下面那两行门控**逐字未动**（`aggregate-badge.spec.ts` 与
+   * `usage-badge-client.spec.ts` 双重钉住）：本分支在它们之前就 return，
+   * 故那两行的语义对**非聚合**路径完全不变。
+   */
+  if (isAggregate && provider === null) {
+    return React.createElement('span', {
+      className: 'dim-jh-badgePending',
+      role: 'status',
+      title: '聚合（跨渠道）：尚未发出过请求，还不知道会走哪个渠道。发送一条消息后这里会显示实际使用的渠道与积分。',
+    }, [
+      React.createElement('span', { key: 'dot', className: 'dim-jh-badgeDot', 'data-tone': 'muted' }),
+      React.createElement('span', { key: 'text' }, '聚合 · 待首次请求'),
+    ]);
+  }
   // 没有选中模型（新会话尚未选择 / 已寻址的 subagent 会话）→ 不渲染。
   if (typeof provider !== 'string' || provider.length === 0) return null;
+  /**
+   * `jet-hub-auto` 走**专用分支**：它自己没有账号也没有余额，宿主端会把徽标请求
+   * 改写成「临期胜者」的余额再去查（见 `jet-hub-rpc.ts` 的 `usage.badge`），
+   * 所以这里放行并原样传递。
+   *
+   * ## ⚠️ 为什么不能靠能力表放行
+   *
+   * `supportsCreditBalance` 是「这个渠道**自己有没有**余额可查」的判据，而 auto
+   * **如实**属于「没有」⇒ 交给下面那道门控会 `return null`，徽标永不渲染。
+   * 这与 `aggregate` 的处境同型，但解法不同：聚合是**重定向**到真实渠道
+   *（`resolveBadgeProvider`），auto 是**宿主端改写**（客户端拿不到「临期胜者」，
+   * 那要打全池余额接口）。
+   *
+   * ⚠️ 上游 `ba10f4f` 重写 aggregate 时把本分支删掉了 ⇒ 旧 auto 的徽标彻底消失
+   *（用户报障 2026-10-08：「也没胶囊了？」）。这里补回来。
+   *
+   * ⚠️ 常量用 `AUTO_PROVIDER_ID` 而不是裸字面量：宿主 `auto-adapter.ts` 的
+   * `AUTO_PROVIDER` 是唯一权威，两处写死必然漂移（改一处忘另一处 ⇒ 徽标静默消失）。
+   */
+  if (provider === AUTO_PROVIDER_ID) {
+    return React.createElement(UsageBadgeActive, { ...props, provider });
+  }
   // 不是本插件的渠道 → 不渲染，且**不会**发任何请求。
   if (!supportsCreditBalance(provider)) return null;
   return React.createElement(UsageBadgeActive, { ...props, provider });
 }
 
-/** 展开态的完整实现（数据、轮询、弹窗）。 */
+/**
+ * 展开态的完整实现（数据、轮询、弹窗）。
+ *
+ * ⚠️ 折叠胶囊名的拼装（auto 三要素）已抽到 `badge-model.js` 的 `autoBadgeName`
+ *    —— 那是**纯函数**，可被单测直接 import 并做**行为断言**。本文件 import 了
+ *    `react`，单测环境无法 import 它，故原先内联在这里的逻辑只能用字符串断言，
+ *    而字符串断言对「短路禁用」（`if (false && …)` / `undefined && …`）天然免疫
+ *    —— 实测那是一条**恒真的假用例**（把功能改成永不执行，用例照样全绿）。
+ */
 function UsageBadgeActive(props) {
   const { provider, providerLabel, readBadge, writePreference, setAutoCheckin, dismissAutoCheckin, claimCredits } = props;
   const label = providerLabel(provider);
@@ -498,8 +566,28 @@ function UsageBadgeActive(props) {
    *（用户报障，2026-10-02）。`snapshot === null` 才代表没有任何数据，
    * 有数据时刷新失败要保留旧数字（不降级成空态）。
    */
+  /**
+   * 折叠文案三要素（用户 2026-10-06 定）：**在用谁（provider + 模型）**、
+   * **倍率**、**临期倒计时**、积分（reading 由 `badgeView` 拼装）。
+   *
+   * ⚠️ 判定逻辑在 `badge-model.js` 的 `autoBadgeName`（**纯函数**）—— 本文件
+   *    import 了 `react`，单测环境无法 import，故这里只做取数。
+   *    上游 `ba10f4f` 把这段整块删掉了（`autoActual` / `autoExpiryAt` 在宿主端
+   *    也一并消失）⇒ 旧 auto 的胶囊既没有渠道也没有倒计时（用户报障 2026-10-08
+   *    「也没胶囊了？」）。这里按原实现补回来。
+   *
+   * auto 元数据缺席时（读数未到、或非 auto 渠道）退回普通渠道名 —— 那是
+   * 其余 15 家的既有行为，逐字不变。
+   */
+  const badgeName = autoBadgeName({
+    fallback: label,
+    autoActual: value?.autoActual,
+    price: value?.autoPrice,
+    expiryAt: value?.autoExpiryAt,
+    providerLabel,
+  });
   const view = badgeView({
-    providerLabel: label,
+    providerLabel: badgeName,
     preference: effectivePreference,
     subscription: value?.subscription,
     accounts: value?.accounts ?? [],

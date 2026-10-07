@@ -656,7 +656,7 @@ export class AggregateAdapter extends LlmAdapter {
     if (!disabled.has(AGGREGATE_AUTO_MODEL)) entries.push(this.autoModelInfo())
     for (const model of models) {
       if (disabled.has(model.key)) continue
-      entries.push({ provider, id: model.key, name: this.nameOf(model), inputModalities: ['text', 'image'] })
+      entries.push({ provider, id: model.key, name: this.pickerNameOf(model), inputModalities: ['text', 'image'] })
     }
     return entries
   }
@@ -673,7 +673,7 @@ export class AggregateAdapter extends LlmAdapter {
   listAllModels(): readonly { id: string; name: string }[] {
     return [
       { id: AGGREGATE_AUTO_MODEL, name: this.autoModelInfo().name },
-      ...this.catalog.map((model) => ({ id: model.key, name: this.nameOf(model) })),
+      ...this.catalog.map((model) => ({ id: model.key, name: this.pickerNameOf(model) })),
     ]
   }
 
@@ -688,7 +688,7 @@ export class AggregateAdapter extends LlmAdapter {
     }
   }
 
-  /** 虚拟模型的展示名。
+  /** 虚拟模型的展示名 —— **设置页与解析路径用**（不带倍率，见 {@link pickerNameOf}）。
    *
    * ⚠️ **不加「（单渠道）」之类的后缀**（与 brief 初版的 `nameOf` 不同）：
    * 设计文档 §12.1（`2026-10-06-aggregate-provider-design.md:669-673`）把新 provider
@@ -698,9 +698,63 @@ export class AggregateAdapter extends LlmAdapter {
    * 且 `prepareCall` 会拼出 `…（单渠道） · buddy` 这类双重后缀。
    * 「有没有冗余渠道」是**设置页**的信息（§7.3：按厂商分组、组内按候选渠道数降序、
    * 展开看逐条候选），不该混进模型展示名。
+   *
+   * ⚠️ 本方法**保持无倍率**：`resolveModel` 与 `describeCatalog` 的返回值被三处
+   * 既有断言逐字钉住（`aggregate-adapter.spec.ts:88`、`aggregate-rejections.spec.ts:251`、
+   * `aggregate-catalog.spec.ts:21` 全是 `'DeepSeek V4.1 Flash'`），且 `describeCatalog`
+   * 的候选子列表**逐条**显示倍率（`candidateRowLabel`）—— 在模型名上再叠一次
+   * 会出现「两个倍率」的重复展示。倍率只加在**模型选择器**那一条路径上，
+   * 即 {@link pickerNameOf}。
    */
   private nameOf(model: VirtualModel): string {
     return model.name
+  }
+
+  /**
+   * **模型选择器**里的展示名 = 规范名 + 倍率后缀（如 `GLM-5.3-Flash · x0.06`）。
+   *
+   * ## 为什么需要它（用户报障 2026-10-08）
+   *
+   * 用户原话：「没倍率显示？」—— 切到聚合后，选择器里每条虚拟模型**都没有倍率**，
+   * 而同屏的普通渠道（`GLM-5.3-Flash · x0.06`）有。用户据此无法判断「聚合给我
+   * 挑的是不是便宜的那个」，而本功能的全部卖点正是「省钱烧临期」。
+   *
+   * 根因：`nameOf` 只回规范名，而倍率其实**早就算好了** ——
+   * `aggregate-catalog.ts` 的 `CandidateEntry.price` 就是 `priceFactorFromName(realName)`
+   * 的结果，只是从没被展示层用过。
+   *
+   * ## 取哪个候选的倍率
+   *
+   * 取**最便宜**那个（`price` 最小，`Infinity` 视为「无标注」排最后）—— 因为
+   * 轮换的第二判据就是「同临期档内倍率升序」（`rankCandidates`），故最便宜的
+   * 候选是**最可能被选中**的那个，它的倍率才是用户该看到的那个数。
+   *
+   * ⚠️ **不显示「区间」**（如 `x0.03–x0.29`）：那会变成最长行，而选择器是窄菜单
+   *（与 `buddy-adapter.ts:2537` 的「不写 `（促销 …）`」同一取舍）。
+   *
+   * ## 三条不显示倍率的规则（都是既有约定）
+   *
+   * 1. **全部候选都无标注**（`Infinity`）⇒ 不加后缀。直接拼会渲染出
+   *    `xInfinity`，那是明显的渲染缺陷（`aggregate-panel-logic.js:205` 同款判据）。
+   * 2. **`0` 显示「免费」**（本仓库既有口径，见 `candidateRowLabel`）。
+   * 3. **解析不出就不猜**：宁可没有倍率，也不编一个（`buddy.ts:494` 同款理由：
+   *    编造倍率比不显示更糟）。
+   *
+   * ⚠️ 只用于 `listModels` / `listAllModels`（选择器与设置页「显示列表」）。
+   * **不得**用于 `resolveModel` / `describeCatalog` —— 见 {@link nameOf} 的注释。
+   */
+  private pickerNameOf(model: VirtualModel): string {
+    const prices = model.candidates
+      // ⚠️ 只取**已接入临期折算**的候选（与 `describeCatalog` 的过滤同一口径）：
+      //    未接入的渠道经 `expiryProbe` 得 `UNUSABLE`、**永远不会被路由到**，
+      //    把它的价格显示出来等于替一个用不上的候选报价（规格 §9.2.1：
+      //    只广告可路由的东西）。
+      .filter((candidate) => WIRED_EXPIRY_PROVIDERS.includes(candidate.provider))
+      .map((candidate) => candidate.price)
+      .filter((price) => Number.isFinite(price))
+    if (prices.length === 0) return model.name
+    const best = Math.min(...prices)
+    return `${model.name} · ${best === 0 ? '免费' : `x${best}`}`
   }
 
   /**
