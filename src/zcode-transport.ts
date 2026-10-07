@@ -25,6 +25,7 @@
  */
 
 import type { ZcodeCredential } from './zcode.js'
+import { looksLikeZcodeHtmlPage } from './zcode-diagnostics.js'
 import { buildZcodeHeaders, zcodeMessagesUrl } from './zcode-upstream.js'
 
 /** ZCode 的两条上游通道。 */
@@ -307,8 +308,14 @@ export async function fetchCodingPlanApiKey(
  * - `401` / `1002`（凭据失效）—— 换通道也是**同一份凭据**，救不了；
  * - `3012`（风控）—— 重试会**加重账号冷却惩罚**：30 分钟 → 24 小时 → 停用；
  * - `3009`（并发限流）—— 走既有退避即可，换腿治不了并发。
+ *
+ * ⚠⚠ **也不认边缘/CDN 的 HTML 错误页**（2026-10-07 实测）：本函数同样是
+ * `body.includes('1005')` 裸子串，而边缘页里出现 `1005` 完全正常
+ * （`<title>1005</title>`、`width:1005px`）。换腿对边缘拦截**必然也失败**
+ * （两条通道走同一个边缘节点），代价是白烧一次请求并把错误归因到额度。
  */
 export function shouldFallbackToOtherChannel(status: number, body: string): boolean {
   if (status !== 429) return false
+  if (looksLikeZcodeHtmlPage(body)) return false
   return body.includes('1005') || body.includes('1113')
 }

@@ -34,7 +34,12 @@
 
 import type { ZcodeCredential } from './zcode.js'
 import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js'
-import { hasZcodeUnusualActivity, parseZcodeBusinessCode } from './zcode-diagnostics.js'
+import {
+  formatZcodeEdgePageHint,
+  hasZcodeUnusualActivity,
+  looksLikeZcodeHtmlPage,
+  parseZcodeBusinessCode,
+} from './zcode-diagnostics.js'
 import type { ZcodeRemoteModelLike } from './zcode-product.js'
 
 /** ZCode 平台 origin（官方默认）。 */
@@ -539,7 +544,18 @@ export async function claimZcodePlan(
     message = typeof parsed.msg === 'string' ? parsed.msg
       : typeof parsed.message === 'string' ? parsed.message : undefined
   } catch {
-    message = text.slice(0, 200)
+    /**
+     * ⚠⚠ **边缘/CDN 的 HTML 错误页不得当文案倒给用户**（2026-10-07 审计打出）：
+     * 原先这里是 `text.slice(0, 200)`，于是用户看到的「领取失败原因」是
+     * `<!doctypehtml><html lang="zh-cn">…<style>a,body,div,h2,html,p{m` ——
+     * 一坨 CSS 噪声，且随 CDN 配置变化，将来无法据此复盘。
+     *
+     * ⇒ 与推理侧 `describeUpstreamError` **共用同一份**判据与文案
+     * （`zcode-diagnostics.ts` 是唯一出处，两侧不得各写一份）。
+     */
+    message = looksLikeZcodeHtmlPage(text)
+      ? formatZcodeEdgePageHint(text, response.status)
+      : text.slice(0, 200)
   }
   /**
    * ★★ **正文里的风控必须在这里（能看到完整正文的地方）归一成 `code`**
@@ -570,8 +586,18 @@ export async function claimZcodePlan(
    *   （`{"code":1005,"msg":"quota 3012 exceeded"}` 必须仍是 1005）。
    * ⚠ 判据是 `hasZcodeUnusualActivity`（**语义短语为主**）——
    *   它本身已排除 `13012` / 限流里的毫秒数等误判形态。
+   *
+   * ⚠⚠⚠ **边缘/CDN 的 HTML 错误页必须豁免**（2026-10-07 审计打出，
+   * 与推理侧 `zcode-adapter.ts` 修掉的是**同一个缺陷的领取侧**）：
+   * 实测 `<html><body>request has been blocked due to unusual activity.</body></html>`
+   * 既 `looksLikeZcodeHtmlPage` 为真、`hasZcodeUnusualActivity` 也为真 ⇒
+   * `code` 被归一成 `3012` ⇒ `zcode-auth.ts` 的 `isClaimUnusualActivity` 命中
+   * ⇒ **短路本账号剩余 plan**，文案写「冷却惩罚 30 分钟→24 小时→停用」。
+   *
+   * ⇒ 一次**边缘拦截**被报成「账号风控、别重试」，还跳过了本可领取的 plan ——
+   * 与「稍后重试」的用户动作**完全相反**。
    */
-  if (code === undefined && hasZcodeUnusualActivity(text)) {
+  if (code === undefined && !looksLikeZcodeHtmlPage(text) && hasZcodeUnusualActivity(text)) {
     code = 3012
   }
 

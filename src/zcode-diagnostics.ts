@@ -171,11 +171,165 @@ export function readZcodeBusinessCodeFromBody(body: string): number | undefined 
  *   若直接走 ② 会漏判 ⇒ `httpErrorCodeForZcode` 返回 `SERVER`，
  *   而 `SERVER` 在 harness 的 `DEFAULT_RETRYABLE_CODES` 里 ⇒
  *   有冷却惩罚的风控错误被**白重试 5 次**（`qoder` 那边记过同型缺陷）。
+ *
+ * ⚠⚠ **这里刻意没有「剥标签再判一遍」的兜底**（2026-10-07 实测后删掉）：
+ * 审计曾提议对 `<h1>Error 3012</h1> request has been blocked…` 这类
+ * 「标签包裹的风控」剥标签重判。实测 8 种形态后确认那是**多余的**：
+ * 它们本来就靠主判据（`unusual activity` / `blocked due to`）命中，
+ * 剥不剥标签**结果完全一样**。
+ *
+ * ⇒ 而它有真实代价：`stripHtmlTags` 把相邻文本**粘在一起**
+ * （`blocked</b><i>3012` → `blocked3012`），会让 `looksLikeZcodeUnusualActivity`
+ * 的**词边界**失效（`3012` 紧跟字母 ⇒ 不算独立词）——
+ * 即「制造出新的漏判」。为一条用不上的兜底加这个风险，不划算。
+ *
+ * ⚠ 真正需要优先级判断的地方是 `describeUpstreamError` /
+ * `httpErrorCodeForZcode` 的 HTML 短路，见那两处的注释。
  */
 export function hasZcodeUnusualActivity(body: string): boolean {
   const code = readZcodeBusinessCodeFromBody(body)
   if (code !== undefined) return isZcodeUnusualActivityCode(code)
   return mentionsZcodeUnusualActivity(body)
+}
+
+/**
+ * 正文是否是**边缘/CDN 的 HTML 或 XML 错误页**（而不是业务层响应）。
+ *
+ * ## 为什么要它（Gitee issue IKJRM4，2026-10-07 实测 405 + 阿里云 ESA 页）
+ *
+ * 实测拿到的是 `text/html`，正文是边缘页：
+ *
+ * ```
+ * <!doctypehtml><html lang="zh-cn">…<title>405</title><style>a,body,div{…}
+ * ```
+ *
+ * 它会同时打穿**两处**：
+ * ① 文案侧 —— 非 JSON 兜底 `slice(0,200)` 把 CSS 选择器当错误文案倒给用户；
+ * ② **判据侧（本条的主因，更严重）** —— 各处 `body.includes('1005')` 是**裸子串**，
+ * 而边缘页里出现 `1005` 是完全正常的（`<title>1005</title>`、`width:1005px`）。
+ * 实测 3 账号池：边缘页含 `1005` ⇒ 连换两个号，并把两个**完全可用**的账号
+ * 标记成「该模型当日额度用尽」直到次日 0 点，而同一条文案正写着「更换账号无效」。
+ *
+ * ⇒ 判据必须**在分类之前**短路，且**四处判据共用这一份**
+ * （`isZcodeQuotaExhausted` / `isZcodeConcurrencyLimited` / `isZcodeCaptchaRejected` /
+ * `shouldFallbackToOtherChannel` / `httpErrorCodeForZcode` / `describeUpstreamError`）——
+ * 少改一处就是又一次「只改了一半」（同 {@link httpErrorCodeForZcode} 头部记的 3012 事故）。
+ *
+ * ## 判据三条（任一成立即算）
+ *
+ * 1. **文档级前缀**：`<!doctype` / `<?xml` / `<!--`（BOM 与前导空白已剥）；
+ * 2. **文档骨架标签开头**：`<html` / `<head` / `<body` / `<title` / `<pre` / `<script` …
+ *    —— 见 {@link ZCODE_HTML_DOCUMENT_TAGS}；
+ * 3. **整篇都是标签**（兜住自定义错误页）：把正文按空白切开，
+ *    **每一段**都像标签（`<x…>` / `</x>` / 自闭合 `<x/>` / `<!…>`）才算。
+ *
+ * ## ⚠⚠ 判据只回答「形态」，**不回答「该怎么办」**（2026-10-07 审计定稿）
+ *
+ * 上游会把**业务码包在零散标签里**下发，而那种形态**不是**边缘页：
+ *
+ * ```
+ * <h1>Error 3012</h1>upstream connect timeout
+ * <h1>Error 3012</h1> request has been blocked due to unusual activity.
+ * ```
+ *
+ * 但**反过来也有真实页面只有一个标题标签**：
+ *
+ * ```
+ * <h1>Gateway Timeout</h1>
+ * ```
+ *
+ * ⇒ 二者**在形态上无法区分**（都含 `</h1>`、都带裸文本）。任何单看形态的
+ * 阈值都会在一端出错：收得太松 ⇒ 业务报文被当成页面；收得太紧 ⇒
+ * 极简错误页漏判（实测 `<h1>Gateway Timeout</h1>` 会被判成非页面，
+ * 于是 `429` 下走进「并发限流」分支）。
+ *
+ * ⇒ **本函数只做「像不像一页 HTML」，不做「是不是业务错误」**。
+ * 后者由消费层按优先级决定（见 `describeUpstreamError` /
+ * `httpErrorCodeForZcode`：**有权威码 ⇒ 只信码；无码但有业务语义 ⇒ 也不是页面**）。
+ * 试图在形态判据里编码优先级，正是本条判据被反复推翻的原因。
+ *
+ * ⚠ **`JSON.parse` 能过的正文恒不命中**（JSON 值不能以 `<` 开头），
+ * 故本函数为真 ⟹ `message` 必为 `undefined`，调用方无需再判一次。
+ *
+ * ⚠ 判据 ③ 刻意**只认闭合标签 `</x>`**、不认自闭合 `<x/>`：
+ * 后者（`<custom-widget/>`、`<hgroup/>`）在真实错误页里罕见，
+ * 而收紧这一条能少一类误判。
+ */
+export function looksLikeZcodeHtmlPage(body: string): boolean {
+  // ⚠ BOM 必须**显式剥**：它不是空白字符，`trimStart()` 拿它没办法，
+  // 而带 BOM 的 HTML 页在真实文件/流里并不罕见。
+  const text = body.replace(/^﻿/, '').trimStart()
+  if (!text.startsWith('<')) return false
+  // ① 文档级前缀
+  if (/^<(!doctype|\?xml|!--)/i.test(text)) return true
+  // ② 文档骨架标签开头（大小写不敏感：`<Error>` 与 `<error>` 都见过）
+  const name = /^<([a-z][a-z0-9-]*)/i.exec(text)?.[1]?.toLowerCase()
+  if (name !== undefined && ZCODE_HTML_DOCUMENT_TAGS.has(name)) return true
+  // ③ 存在闭合标签（含极简错误页 `<h1>Gateway Timeout</h1>`；
+  //    自闭合 `<x/>` **不**算，见上方注释）
+  return /<\/[\w-]+\s*>/.test(text)
+}
+
+/**
+ * **文档骨架标签**白名单 —— 见 {@link looksLikeZcodeHtmlPage} 的判据 ②。
+ *
+ * ⚠⚠ **刻意不含正文小节标签**（`h1`/`h2`/`p`/`span`/`b`/`code`/…）：
+ * 上游会把业务码包在它们里下发（`<h1>Error 3012</h1>upstream connect timeout`），
+ * 收进来就把**业务报文**误判成边缘页 ⇒ 把「别重试」说成「稍后重试」。
+ *
+ * ⚠ 收录标准：**真实错误页在正文最开头就会出现的**结构性标签。
+ * 纯文本形态（`<service unavailable, retry later>`）不会命中任何一条 ——
+ * 它没有闭合标签、也不在白名单里。
+ */
+const ZCODE_HTML_DOCUMENT_TAGS = new Set([
+  // HTML 文档骨架
+  'html', 'head', 'body', 'title', 'meta', 'link', 'base',
+  // 轻量错误页 / SPA 兜底 / 网关页的根
+  'div', 'pre', 'script', 'style', 'iframe', 'noscript', 'template', 'svg',
+  // XML 错误文档的根（S3 / OSS / Azure 形态：`<Error><Code>…</Code></Error>`）
+  'error', 'fault', 'response', 'result',
+])
+
+/**
+ * 边缘/CDN 错误页的**文案** —— 与 {@link looksLikeZcodeHtmlPage} 同源同批维护。
+ *
+ * ## 三条写作要求（都是被真实事故逼出来的）
+ *
+ * 1. **必须写明「更换账号无效」**：这是边缘拦截与「额度/凭据」最要命的区别。
+ *    归错方向会让用户去充值或重新登录，白跑一趟（issue IKJRM4 的原始诉求）。
+ * 2. **刻意不承诺根因**（如「上游改规则了」）—— 边缘页能证明的只是
+ *    「响应不是业务层 JSON」，具体原因页面本身通常不写。
+ * 3. **不得出现「额度」「凭据失效」等业务词**：本函数只用在**已确认是 HTML 页**的
+ *    场景，出现业务词等于给用户一个互相矛盾的指令（见 `describeUpstreamError`
+ *    的 401 分支事故）。判据全在这一个函数里，便于逐条审。
+ *
+ * ⚠ 文案里的 `**` 是**刻意**的：与本仓库既有用户可见文案同惯例
+ * （`index.ts` 的「这些账号**可能仍有**」等），不是 Markdown 泄漏。
+ *
+ * @param body - 原始响应体（只用于取页面标题与识别边缘厂商）。
+ * @param status - HTTP 状态码（通用分支会写进文案，便于排查对照）。
+ */
+export function formatZcodeEdgePageHint(body: string, status: number): string {
+  const title = body.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim()
+  // ⚠ 标题同样可能很长（甚至由攻击面控制）⇒ 截断，别把它变成新的泄漏面。
+  // ⚠ **截断必须带省略号**：否则 40 与 41 字符的标题输出**完全一样**，
+  //   用户无从判断标题被截过。
+  // ⚠ 只截**长度**不筛**内容**（标题里的业务词仍会回显）是**刻意取舍**：
+  //   标题是排查时最有价值的一手信息，过滤它反而丢线索；而它由远端控制，
+  //   已经过长度上限约束，不会变成注入面。
+  const shown = title !== undefined && title !== ''
+    ? `（页面标题：${title.slice(0, 40)}${title.length > 40 ? '…' : ''}）`
+    : ''
+  // 阿里云 ESA 的特征（`data-spm` 是它的埋点属性名，`aliyuncs.com` 是资源域名）。
+  const isAliyunEsa = /data-spm/i.test(body) || /aliyuncs\.com/i.test(body)
+  if (isAliyunEsa) {
+    return `上游返回的是边缘CDN 的 HTML 错误页${shown}，不是业务层JSON —— `
+      + '请求未到达 ZCode 服务端（通常是访问链路被拦截或上游临时故障）。'
+      + '此类问题**更换账号无效**，建议稍后重试；若持续出现，请向 ZCode 官方确认服务状态。'
+  }
+  return `上游返回的是 HTML 页面${shown}而不是业务层 JSON（HTTP ${status}），`
+    + '说明响应可能来自网关或中间层，未到达 ZCode 服务端。'
+    + '此类问题**更换账号无效**，建议稍后重试；持续出现时请向 ZCode 官方确认服务状态。'
 }
 
 /**
