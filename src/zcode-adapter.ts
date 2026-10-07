@@ -107,11 +107,14 @@ import type { CarrierOutcome } from './captcha-carrier.js'
 import {
   describeZcodeRequestShape,
   formatZcodeDiagnostic,
+  formatZcodeEdgePageHint,
   formatZcodeUnusualActivityMessage,
   hasZcodeUnusualActivity,
+  looksLikeZcodeHtmlPage,
   noteZcodeRequestFailed,
   noteZcodeRequestOk,
   noteZcodeRequestSent,
+  readZcodeBusinessCodeFromBody,
 } from './zcode-diagnostics.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
@@ -1237,8 +1240,14 @@ export class ZcodeAdapter extends LlmAdapter {
          *
          * ⚠ 上面的 {@link noteZcodeRequestFailed} 已经把本次算作一次失败，
          * 故这里诊断到的「失败 N」含本次，这是有意的（用户看到的就是当次）。
+         *
+         * ⚠⚠ 判据必须用 {@link hasZcodeUnusualActivity}（**全仓唯一口径**），
+         * **不能**用裸 `text.includes('3012')` —— 那是本仓库记录过的第三份
+         * 未收窄的 3012 判据（`13012` / 边缘页里的 `<title>3012</title>` 都会命中）。
+         * 危害虽仅止于「白跑一次诊断」（文案侧已短路，诊断被丢弃），
+         * 但它违反「3012 判据必须走词边界 + 语义共现」这条铁律。
          */
-        const diagnostic = text.includes('3012')
+        const diagnostic = hasZcodeUnusualActivity(text)
           ? formatZcodeDiagnostic({
             accountId: activeAccountId,
             sentAt: upstreamStartedAt,
@@ -1670,6 +1679,7 @@ export const ZCODE_FAST_EMPTY_MS = 3_000
  * 且**不切账号**（换账号也一样撞，白白标记掉一个可用账号）。
  */
 export function isZcodeConcurrencyLimited(status: number, body: string): boolean {
+  if (looksLikeZcodeHtmlPage(body)) return false
   if (status !== 429) {
     // 少数情况下上游用 200/403 包裹限流体，故正文命中同样认。
     if (!body.includes(ZCODE_CONCURRENCY_CODE)) return false
@@ -1687,8 +1697,17 @@ export function isZcodeConcurrencyLimited(status: number, body: string): boolean
  * ⚠ **必须排除 `3009`**：并发限流同样返回 429，但它「等一下就能过」，
  * 若被归到这里就会把账号错标成「当日用尽」（误伤一个完全可用的账号，
  * 与 `qoder` 那次「把 rate_limit 当成 billing」是同一类错误）。
+ *
+ * ⚠⚠⚠ **必须排除边缘/CDN 的 HTML 错误页**（真实缺陷，2026-10-07 实测）：
+ * 本函数下游会 `switchAccountOnQuota()` ⇒ **写 `modelRateLimits` 到次日 0 点**。
+ * 而 `body.includes('1005')` 是**裸子串**匹配，边缘页里出现 `1005` 完全正常
+ * （`<title>1005</title>`、`width:1005px`、某个 hash 值）——
+ * 实测 3 账号池边缘故障：连换两个号，两个**完全可用**的账号被封到次日，
+ * 而用户只是遇到了一次网络抖动。这比文案难看严重得多：**误封可用账号**。
+ * ⇒ HTML 判据必须在**分类之前**短路（判据见 {@link looksLikeZcodeHtmlPage}）。
  */
 export function isZcodeQuotaExhausted(status: number, body: string): boolean {
+  if (looksLikeZcodeHtmlPage(body)) return false
   if (isZcodeConcurrencyLimited(status, body)) return false
   if (body.includes('1113') || body.includes('余额不足')) return true
   if (body.includes('1005')) return true
@@ -1712,6 +1731,11 @@ export function isZcodeQuotaExhausted(status: number, body: string): boolean {
  */
 export function isZcodeCaptchaRejected(status: number, body: string): boolean {
   void status
+  // ⚠ HTML 边缘页必须豁免：否则边缘页里一个 `3007` 数字就会让适配器去
+  // **补产 captcha 并重发**（`stream()` 的分支 ③），而边缘拦截下重发必然
+  // 还是边缘页 —— 白烧一次浏览器验证（阿里云「同设备每小时 150 次」的
+  // 设备级配额），且把一次明确的网络故障变成一次慢吞吞的内部重试。
+  if (looksLikeZcodeHtmlPage(body)) return false
   return body.includes('3007') || /captcha\s+verify\s+failed/i.test(body)
 }
 
@@ -1790,32 +1814,19 @@ export function withToolCacheBreakpoint<T extends object>(
  * {@link formatZcodeDiagnostic}：**只含账号序号、进程内计数、间隔、
  * 实测身份块字符数、日期块有无**，**不含任何凭据**。
  * 未提供时行为与原来逐字一致（单测直接调用本函数的用例不受影响）。
- */
-/**
- * 非 JSON 且形如 HTML 时，给出「上游/网络层」口径的提示（而非把页面截给用户）。
  *
- * 分两类已知形态（都能给出可行动的判断）：
- * - **阿里云 ESA**（`data-spm` 特征 + `<title>405</title>`）：边缘 CDN 的错误页，
- *   说明请求**没到达业务层**⇒ 换账号无效，重试也大概率无效；
- * - **通用 HTML 错误页**（含 `<html`）：可能是网关、SPA 兜底或代理拦截页。
+ * ## ⚠ 非 JSON 且形如 HTML 时（边缘 CDN 错误页）
  *
- * ⚠ 刻意**不承诺根因**（如「上游改规则了」）—— 边缘页能证明的是
- *「响应不是业务层JSON」，具体原因页面本身通常不写。
+ * 实测拿到的是 `text/html`，正文是阿里云 ESA 的错误页（issue IKJRM4），
+ * 原先走 `trimmed.slice(0, 200)` ⇒ 把 CSS 选择器当错误文案倒给用户。
+ * 现由 {@link looksLikeZcodeHtmlPage}（形态）+ {@link formatZcodeEdgePageHint}（文案）
+ * 处理，两者都在 `zcode-diagnostics.ts` —— 与领取侧 `zcode-upstream.ts`
+ * **共用同一份**，任何一侧改判据都必须同步另一侧。
+ *
+ * ⚠⚠ **判据侧与文案侧必须同时改**（PR #78 的教训）：该 PR 只换了文案侧的
+ * `suffix`，而下游 `isZcodeQuotaExhausted` / `httpErrorCodeForZcode` 一行没动 ——
+ * 边缘页里一个 `1005` 就会换号并把账号封到次日，而文案正写着「更换账号无效」。
  */
-function detectEdgePageHint(body: string, status: number): string {
-  const title = body.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.trim()
-  const isAliyunEsa = /data-spm/i.test(body) || /aliyuncs\.com/i.test(body)
-  const shown = title ? `（页面标题：${title}）` : ''
-  if (isAliyunEsa) {
-    return `上游返回的是边缘CDN 的 HTML 错误页${shown}，不是业务层JSON —— `
-      + '请求未到达 ZCode 服务端（通常是访问链路被拦截或上游临时故障）。'
-      + '此类问题**更换账号无效**，建议稍后重试；若持续出现，请向 ZCode 官方确认服务状态。'
-  }
-  return `上游返回的是 HTML 页面${shown}而不是业务层 JSON（HTTP ${status}），`
-    + '说明响应可能来自网关或中间层，未到达 ZCode 服务端。'
-    + '建议稍后重试；持续出现时请向 ZCode 官方确认服务状态。'
-}
-
 export function describeUpstreamError(
   status: number,
   body: string,
@@ -1852,16 +1863,47 @@ export function describeUpstreamError(
    *    写进错误文案，将来无法复现。
    *
    * ⇒ 单独识别并给出「上游/网络层」口径的提示；同时保留一个短前缀便于排查。
+   *
+   * ⚠⚠⚠ **判据复用 {@link looksLikeZcodeHtmlPage}**，且**必须在所有业务分支
+   * 之前短路**（PR #78 的教训，初版只换 suffix 造成两个真缺陷）：
+   *
+   * ① **401 自相矛盾**：`code === 1002 || status === 401` 分支会把 suffix 拼到
+   *    「凭据失效…删除该账号后重新添加登录」之后，于是同一条消息既让用户
+   *    删号重登、又说「更换账号无效」—— **互斥指令**。实测该分支
+   *    `calls=1, marks=[]`：删号纯属白跑，用户会真去删掉一个健康凭据。
+   * ② **业务码被页面里的数字劫持**：HTML 页里出现 `1005` / `3009` / `3007` /
+   *    `3012`（CSS 值、`<title>`、hash）时，下面每一条 `trimmed.includes(...)`
+   *    都会命中 ⇒ 报成「额度用尽 / 并发限流 / captcha 失败 / 风控」，
+   *    **与「更换账号无效」正面对撞**，且会把账号封到次日。
+   *
+   * ⇒ 边缘页**不是业务层错误**，它不该进入任何业务分支的前缀。
+   *
+   * ⚠⚠⚠ **但正文里的业务码/风控语义绝不短路**（2026-10-07 两轮实测打出的回归）：
+   * 上游确有**以标签开头、却不是边缘页**的报文：
+   *
+   * ```
+   * {"code":3012,...}                                        ← 合法 JSON，有权威码
+   * <h1>Error 3012</h1>upstream connect timeout              ← 非法 JSON，但正文带 3012
+   * <h1>Error 3012</h1> request has been blocked due to unusual activity.
+   * ```
+   *
+   * 无条件短路会把它们从「**别重试**」（有冷却惩罚）降级成「**稍后重试**」——
+   * 两个用户动作**完全相反**，且反复重试会把 30 分钟冷却推成 24 小时。
+   *
+   * ⇒ 判据必须与 {@link hasZcodeUnusualActivity} 的**优先级约定同轴**：
+   * **有权威业务码 ⇒ 只信码；无码但有风控语义 ⇒ 也不是页面**。
    */
-  const looksLikeHtmlPage = /^\s*<(?:!doctype|html|head|body)\b/i.test(trimmed)
-    || /^\s*<\?xml/i.test(trimmed)
-    || (trimmed.startsWith('<') && trimmed.includes('<html'))
+  if (
+    code === undefined
+    && !hasZcodeUnusualActivity(trimmed)
+    && looksLikeZcodeHtmlPage(trimmed)
+  ) {
+    return `HTTP ${status}：${formatZcodeEdgePageHint(trimmed, status)}`
+  }
 
   const suffix = typeof message === 'string' && message.length > 0
     ? message
-    : looksLikeHtmlPage
-      ? detectEdgePageHint(trimmed, status)
-      : trimmed.slice(0, 200)
+    : trimmed.slice(0, 200)
 
   /**
    * ⚠ 两个**限流/额度**码要单独说清，因为用户该做的事完全不同：
@@ -1948,6 +1990,40 @@ export function describeUpstreamError(
  */
 export function httpErrorCodeForZcode(status: number, body: string): string {
   const trimmed = body.trim()
+  /**
+   * ⚠⚠⚠ **HTML 边缘页必须最先短路**（2026-10-07 实测，本函数是「只改了一半」
+   * 的**第二次复发** —— 上一轮是 3012，详见本函数头部注释）。
+   *
+   * 下面是**一串裸子串判据**（`3007` / `1113` / `余额不足` / `1005`），而边缘页里
+   * 出现这些数字是**完全正常**的（`<title>1005</title>`、`width:1005px`）。
+   * 实测危害：
+   *
+   * | 输入 | 未短路时 | 正确 |
+   * |---|---|---|
+   * | `500` + 含 `1005` 的边缘页 | `QUOTA_EXCEEDED`（**不可重试**） | `SERVER`（可退避重试 5 次）|
+   * | `429` + 含 `1005` 的边缘页 | `QUOTA_EXCEEDED`（不可重试） | `SERVER` |
+   * | `429` + 含 `3007` 的边缘页 | `RATE_LIMIT`（触发补产 captcha 重发）| `SERVER` |
+   *
+   * 第一行最严重：一个**本该被自动退避重试 5 次的瞬断 5xx**，因为错误页里有个
+   * `1005` 就被标成不可重试 ⇒ 用户只看到一次失败，故障期变成全面不可用。
+   *
+   * ⚠ 取 `SERVER` 的理由：它**在** harness 的 `DEFAULT_RETRYABLE_CODES` 里，
+   * 与文案「建议稍后重试」一致；而边缘故障本质是**暂时性**的。
+   *
+   * ⚠⚠ **但正文里的业务码/风控语义绝不短路**（2026-10-07 两轮实测打出的回归）：
+   * 本函数原先无条件短路，会把带业务码的报文（**不是**边缘页）
+   * 从 `PERMISSION`（**别重试**，有冷却惩罚）降级成 `SERVER`（**稍后重试**）
+   * ⇒ 反复重试会把 30 分钟冷却推成 24 小时。
+   *
+   * ⇒ 与 {@link describeUpstreamError} 的短路条件**保持同一句**（同源同批维护）：
+   * 「有权威码 ⇒ 只信码；无码但有风控语义 ⇒ 也不是页面」。
+   * ⚠ 这两处条件必须一致 —— 分叉就是又一次「只改了一半」。
+   */
+  if (
+    readZcodeBusinessCodeFromBody(trimmed) === undefined
+    && !hasZcodeUnusualActivity(trimmed)
+    && looksLikeZcodeHtmlPage(trimmed)
+  ) return 'SERVER'
   // 🔴 并发文案**先于**额度码判定：上游曾把并发限流装进 1005 码下发
   // （429 + {"code":1005,"msg":"user concurrency limit exceeded"}，2026-10-06），
   // 按码先判会让一个「等一下就能过」的瞬态错误被报成不可重试的「额度用尽」。
