@@ -588,8 +588,18 @@ export class AutoAdapter extends LlmAdapter {
       return UNUSABLE
     }
     if (!result.ok) return UNUSABLE
+    // ⚠️ **额度已尽 = 当前不可用**（真实缺陷，用户报障 2026-10-07）。
+    //
+    // `credit.total` 是**剩余额度**（`codearts-credits.ts` 读的是
+    // `package_credit_remain`，见 issue IKJQ3M 的核验记录），**不是**套餐总量。
+    // 原先 `total > 0 ? 当日 : NEVER` 把「余额 0」折算成 `NEVER`（= 永久，排最后
+    // 但**不被剔除**）⇒ 一个**额度已尽**的 codearts 仍会被 auto 选成胜者，请求
+    // 随即以 `QUOTA_EXCEEDED` 失败。
+    //
+    // 与 loomy 的 `permanent > 0 ? NEVER : UNUSABLE`（:579）同一口径：没有余额
+    // 就是当前不可用。用户签到/续期后余额恢复，下一轮探测自然重新纳入候选。
     const total = result.info.credit?.total ?? 0
-    return total > 0 ? nextUtc8DayStartMs() : NEVER
+    return total > 0 ? nextUtc8DayStartMs() : UNUSABLE
   }
 
   /** zcode：各桶 `expiresAt`（秒）最小值；无桶但有可领活动 → 当日 24:00。 */
@@ -612,9 +622,16 @@ export class AutoAdapter extends LlmAdapter {
       }
     }
     if (earliest !== NEVER) return earliest
-    // 桶里没有带到期时间的余额：若还有可领的每日活动，按当日额度算（先烧它）。
-    if (balance.remaining > 0 || (balance.claimablePlans?.length ?? 0) > 0) return nextUtc8DayStartMs()
-    return NEVER
+    // ⚠️ **额度已尽 = 当前不可用**（真实缺陷，用户报障 2026-10-07）：本函数原先在
+    // 「桶里没有有效余额」时返回 `nextUtc8DayStartMs()`（= 当日，**排最前**）或
+    // `NEVER`（= 永久，排最后但**不被剔除**）—— 两种折算都会让 auto 把一个额度
+    // 已尽的 zcode 选成胜者，请求随即以
+    // `QUOTA_EXCEEDED: 账号在模型 "GLM-5.3" 上的额度已用尽或没有可用权益` 失败。
+    //
+    // `claimablePlans`（每日活动可领）**不改变**这一点：额度要先领才存在，没领
+    // 就是当前不可用 —— 这正是 zcode「需手动签到」的形态。判据统一交给调用方剔除
+    // （`UNUSABLE`）；用户去面板签到后余额恢复，下一轮探测会重新纳入候选。
+    return UNUSABLE
   }
 
   /**
