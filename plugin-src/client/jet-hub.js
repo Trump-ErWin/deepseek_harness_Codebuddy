@@ -55,6 +55,17 @@ import {
   filterModels,
   isFilterActive,
 } from './model-filter.js';
+// 聚合面板的判定与文案（单测环境没有 react ⇒ 必须抽成纯函数才能覆盖）。
+import {
+  candidateRowLabel,
+  expiryLabel,
+  isAllCandidatesRejected,
+  isRejected,
+  rejectionsFromCatalog,
+  sortCandidatesByExpiry,
+  sortModelsForPanel,
+  toggleRejection,
+} from './aggregate-panel-logic.js';
 import {
   groupProviders,
   nextProviderOrderAfterDrop,
@@ -304,6 +315,9 @@ const OPENCODE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy5
  */
 const GEMINI_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJnIiB4MT0iMCIgeTE9IjAiIHgyPSIxIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjNDI4NUY0Ii8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjOUI3MkNCIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggZD0iTTEyIDJjLjQgMy45IDIuMSA2LjYgNiA4LTMuOSAxLjQtNS42IDQuMS02IDgtLjQtMy45LTIuMS02LjYtNi04IDMuOS0xLjQgNS42LTQuMSA2LThaIiBmaWxsPSJ1cmwoI2cpIi8+PHBhdGggZD0iTTE5LjUgMTRjLjIgMS43LjkgMi45IDIuNiAzLjUtMS43LjYtMi40IDEuOC0yLjYgMy41LS4yLTEuNy0uOS0yLjktMi42LTMuNSAxLjctLjYgMi40LTEuOCAyLjYtMy41WiIgZmlsbD0idXJsKCNnKSIvPjwvc3ZnPg==';
 
+/** 聚合 provider 的图标（三个候选渠道汇聚到一个中心）。 */
+const AGGREGATE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGNpcmNsZSBjeD0iNSIgY3k9IjUiIHI9IjIuNiIgZmlsbD0iIzRGOERGNyIvPjxjaXJjbGUgY3g9IjUiIGN5PSIxOSIgcj0iMi42IiBmaWxsPSIjOUI3MkNCIi8+PGNpcmNsZSBjeD0iMTkiIGN5PSIxMiIgcj0iMi42IiBmaWxsPSIjNEY4REY3Ii8+PHBhdGggZD0iTTcgNi4yIDE2LjQgMTFNNyAxNy44IDE2LjQgMTMiIHN0cm9rZT0iIzlCNzJDQiIgc3Ryb2tlLXdpZHRoPSIxLjciIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgZmlsbD0ibm9uZSIvPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTIiIHI9IjEuNSIgZmlsbD0iIzlCNzJDQiIvPjwvc3ZnPg==';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -369,6 +383,20 @@ const PROVIDERS = Object.freeze([
    * 共用同一条「弹窗 + 登录轮询」路径，无需特殊分支。
    */
   { id: 'gemini', label: 'Gemini Code Assist', icon: GEMINI_ICON, logoClass: 'gemini' },
+  /**
+   * 聚合 provider（跨渠道临期优先）。
+   *
+   * ⚠️ 它**不是**一个普通渠道：没有账号、没有凭据、没有积分、没有登录按钮。
+   * 面板是独立组件 `AggregatePanel`（见 `renderRail` 与面板分流处的注释）。
+   *
+   * ⚠️ 加它会让**四处**从 `PROVIDERS` 正则派生 id 的既有断言需要同步
+   *（`zcode-wiring.spec.ts` 两处、`credits-capabilities.spec.ts`、
+   *`jet-hub-store.spec.ts`）—— 那四处已在 P2 Task 6 一并处理。
+   *
+   * ⚠️ id 必须**纯小写字母**（不带连字符）：上面那四处里**三处**用的字符类是
+   * `[a-z]+` / `[a-z0-9]+`，连字符会让它们**静默漏算**一个 id（保险失效比变红更糟）。
+   */
+  { id: 'aggregate', label: '聚合 (跨渠道)', icon: AGGREGATE_ICON, logoClass: 'aggregate' },
 ]);
 
 /**
@@ -4810,6 +4838,293 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
       : null)));
 }
 
+/**
+ * 聚合 provider 的设置面板。
+ *
+ * ## ⚠️ 为什么是**独立组件**（不塞进 `ProviderPanel`）
+ *
+ * `aggregate` 与其余 14 家有一个根本差异：**它不持有账号、凭据与积分**
+ *（它复用各渠道的账号）。塞进 `ProviderPanel` 会得到一个「点进去没有登录按钮、
+ * 没有账号列表」的空面板，而 `ProviderPanel` 的整条状态机都是围绕账号设计的。
+ *
+ * 先例：`GatewayPanel`（旁路功能用独立组件，且组件定义在本文件内 —— 独立文件
+ * `openai-gateway-panel.js` 只放**纯逻辑**，因为单测环境没有 react）。
+ * 同理，本面板的判定与文案在 `aggregate-panel-logic.js` 里（27 条用例覆盖）。
+ *
+ * ## 数据来源：`aggregate.catalog`（只读、零余额查询）
+ *
+ * ⚠️ 该端点**不做**余额探测（规格 §8.3）—— 否则打开面板就会对每个渠道打一次上游
+ * 请求。实时余额仍由各渠道自己的面板负责。
+ */
+function AggregatePanel({ rpcCall }) {
+  const [models, setModels] = React.useState(null);
+  const [rejections, setRejections] = React.useState({});
+  const [busy, setBusy] = React.useState(false);
+  const [notice, setNotice] = React.useState(null);
+  /** 每个虚拟模型的展开态（`canonicalId → 用户点过的布尔`）。 */
+  const [expanded, setExpanded] = React.useState({});
+
+  /**
+   * 拉取目录。
+   *
+   * ⚠️ 失败时**保留**旧数据、只把错误放进 notice（不要清空成 null）——
+   * 清空会让面板闪成空白，用户以为「聚合坏了」，而真实原因只是一次读取失败。
+   *
+   * @param {boolean} force - **绕过宿主侧的目录 TTL 缓存**（60 秒）。
+   *   ⚠️ 真实缺陷（对抗审计实测证伪）：初版**恒不传 force** ⇒ 「刷新」按钮实际是
+   *   「读缓存」，用户在渠道侧新增/关闭模型后点刷新**看不到任何变化**，会以为
+   *   聚合坏了。⇒ 挂载时走缓存（`false`），**用户显式点刷新**时传 `true`。
+   */
+  const load = React.useCallback(async (force = false) => {
+    setBusy(true);
+    try {
+      // ⚠️⚠️ **必须传对象而非省略 payload**（真实缺陷，用户报障
+      //    「读取聚合目录失败：Error: Invalid Jet Hub management request.」）：
+      //    `callManagementRpc` 把 payload 序列化进请求体，而**后端校验要求
+      //    payload 键存在**（`jet-hub-rpc.ts` 的
+      //    `hasOwnProperty.call(call, 'payload')`）；传 undefined 会被 JSON
+      //    序列化**丢弃** ⇒ 后端判为非法请求并回 `Invalid Jet Hub management request.`。
+      //    本文件 `backup.export` 处早有同款注释（同一个坑的第二实例）。
+      const res = await rpcCall('aggregate.catalog', { force });
+      // ⚠️⚠️ **`rpcCall` 成功时返回的是「解包后的值」，不是 `{ok, value}`**
+      //    （真实缺陷，第二次报障）：`index.js` 的 rpcCall =
+      //    `unwrapRpcResult(callManagementRpc(...))`，而
+      //    `unwrapRpcResult` 在 `ok === true` 时返回 `result.value`、
+      //    在 `ok === false` 时**抛错**（`throw new Error(error.message)`）。
+      //    ⇒ 写 `res.ok === true` 判断**永远为假**（res 是解包后的对象，没有 ok 字段）
+      //      ⇒ 界面显示兜底文案「读取聚合目录失败」且**丢掉真实原因**（因为
+      //      `res.error.message` 也是 undefined）。这正是用户第二次看到的现象。
+      //    ⇒ 正确写法：直接用 `res.models`，错误一律走 `catch` 的 `caught.message`。
+      //    既有调用点都是这个形状（如 `model.list` 用 `res.models`、
+      //    `backup.export` 用 `res.payload`）。
+      const models = res?.models ?? [];
+      setModels(models);
+      // ⚠️⚠️ **必须把宿主返回的 `rejected` 回填进本地拒绝表**（真实缺陷，
+      //    对抗审计探针实测证伪）：宿主在每个候选上返回 `rejected: boolean`
+      //   （`src/aggregate-adapter.ts` 的 `describeCatalog`），而初版**从不读它** ——
+      //    组件读的是本地 `rejections` 状态，其初值是 `{}` 且 `load()` 从不回填。
+      //    ⇒ **刷新页面后每条开关都显示「参与轮换」**（即使该候选已被拒绝）：
+      //      用户无法通过界面判断自己拒绝过什么；而一点击就会发出一个与宿主
+      //      真实状态相反的语义 ⇒ **静默改变轮换行为**。
+      //    ⇒ 摊平逻辑在纯函数 `rejectionsFromCatalog` 里（单测环境没有 react），
+      //      其三层结构与 `isRejected` 逐层一致（否则回填静默失效）。
+      setRejections(rejectionsFromCatalog(models));
+      setNotice(null);
+    } catch (caught) {
+      // ⚠️ `caught.message` 才是服务端给的**真实原因**（如
+      //    「聚合 provider 未注册或未提供目录」）—— 不要吞掉它只显示兜底文案。
+      setNotice(`读取聚合目录失败：${caught?.message ?? String(caught)}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => { void load(); }, [load]);
+
+  /** 切换某条候选的「参与轮换」开关。 */
+  const onToggleRejected = React.useCallback(async (canonicalId, provider, realId) => {
+    const next = !isRejected(rejections, canonicalId, provider, realId);
+    // ⚠️ 乐观更新：先用纯函数算出新表并立刻渲染，再发 RPC。失败时用服务端回传的
+    //    表纠正（见下）—— 否则开关会「点了不动」，用户以为坏了。
+    setRejections((prev) => toggleRejection(prev, canonicalId, provider, realId, next));
+    try {
+      const res = await rpcCall('aggregate.setRejected', {
+        canonicalId, provider, realId, rejected: next,
+      });
+      // ⚠️⚠️ **不要用 `res.aggregateRejections` 直接覆盖本地表**（真实缺陷，对抗审计实测证伪）。
+      //
+      // `aggregate.setRejected` 返回的是 `pool.listAggregateRejections()` —— 那是
+      // **原始存储表**（只含用户逐条写入的 realId），而**轮换实际用的是 `rejectedFor`**：
+      // 它还会把「漂移的旧 id」**降级展开**成渠道级拒绝（D4，见 `aggregate-adapter.ts`）。
+      //
+      // ⇒ 用原始表覆盖会让**开关显示与宿主行为分叉**：降级态下
+      //   `isRejected(原始表, 当前 realId) === false` ⇒ 开关显示「参与轮换」，
+      //   而宿主**实际仍拒绝**该候选 ⇒ 用户看不出原因也无法自救。
+      //
+      // ⇒ 改为**重新拉目录**（`aggregate.catalog` 的每个候选都带经 `rejectedFor`
+      //   展开后的 `rejected` 布尔），显示与轮换判据**同源**。
+      //   ⚠️ `load()` 内部已含 `setRejections(rejectionsFromCatalog(models))`，
+      //   故不必在这里再摊平一次。
+      void res;
+      // ⚠️ 必须 orce = true：load() 默认走宿主侧目录 TTL 缓存（60 秒），
+      //    那样拿到的仍是**写之前**的候选表 ⇒ 开关会「点了不动」。
+      await load(true);
+      setNotice(null);
+    } catch (caught) {
+      // ⚠️ 失败时用服务端状态**纠正**乐观更新（否则界面显示已改、实际没改）。
+      setNotice(`保存失败：${caught?.message ?? String(caught)}`);
+      await load();
+    }
+  }, [rejections, rpcCall, load]);
+
+  // ⚠️ 用户 2026-10-07 要求**去掉厂商分组标题**（「8 个聚合模型下面不需要再显示
+  //    渠道了，因为渠道在每个模型的展开展示参与轮换的子列表中显示了」）⇒ 模型平铺，
+  //    全局按候选渠道数降序。厂商信息仍可在展开后的子列表里逐条看到。
+  const sortedModels = sortModelsForPanel(models ?? []);
+
+  /**
+   * 「按临期排序」的探测结果（`provider → expiry`）；null = 还没点过。
+   *
+   * ⚠️ 默认**不探测**：临期顺序要逐渠道打一次上游余额请求，而面板一打开就探测
+   * 是不可接受的（规格 §8.3 要求 `aggregate.catalog` 零余额查询）。
+   * ⇒ 只有用户显式点按钮才发 `aggregate.expiryOrder`。
+   */
+  const [expiryOrder, setExpiryOrder] = React.useState(null);
+  const [expiryBusy, setExpiryBusy] = React.useState(false);
+  const onSortByExpiry = React.useCallback(async () => {
+    setExpiryBusy(true);
+    try {
+      // ⚠️ 与 `load` 同款：`rpcCall` 成功返回**解包后的值**（`{ order }`），失败抛错。
+      //    不写 `res.ok` 判断（它永远为假，会丢掉真实原因）。
+      const res = await rpcCall('aggregate.expiryOrder', {});
+      setExpiryOrder(res?.order ?? {});
+      setNotice(null);
+    } catch (caught) {
+      // ⚠️ 探测失败**不清空**已有顺序，只提示（与 `load` 的失败处理同取向）。
+      setNotice(`读取临期顺序失败：${caught?.message ?? String(caught)}`);
+    } finally {
+      setExpiryBusy(false);
+    }
+  }, [rpcCall]);
+
+  const renderCandidate = (canonicalId, candidate) => {
+    const rejected = isRejected(rejections, canonicalId, candidate.provider, candidate.realId);
+    // ⚠️ 临期顺序**只在探测过之后**才有值；未探测时按原顺序（渠道名字母序）。
+    const expiry = expiryOrder === null ? undefined : expiryOrder[candidate.provider];
+    return React.createElement('div', {
+      className: 'dim-jh-aggCandidate' + (rejected ? ' dim-jh-aggCandidateRejected' : ''),
+      key: `${candidate.provider}\u0000${candidate.realId}`,
+    },
+    React.createElement('span', { className: 'dim-jh-aggCandidateLabel' },
+      candidateRowLabel(candidate)),
+    // ⚠️ 只有探测过才显示到期提示 —— 否则显示「到期未知」会让用户以为查过了。
+    expiry === undefined
+      ? null
+      : React.createElement('span', {
+          className: 'dim-jh-aggCandidateExpiry',
+          title: '按临期排序时算出的到期时刻',
+        }, expiryLabel(expiry)),
+    React.createElement('button', {
+      type: 'button',
+      className: 'dim-jh-aggToggle' + (rejected ? ' dim-jh-aggToggleOff' : ''),
+      // ⚠️ 语义是「**参与**轮换」的正向开关，与用户直觉一致：
+      //    打开 = 允许用这个渠道；关闭 = 不同意参与轮换（规格 §7.1 的原话）。
+      'aria-pressed': String(!rejected),
+      title: rejected ? '已拒绝：该渠道不参与这个模型的轮换' : '参与轮换',
+      onClick: () => { void onToggleRejected(canonicalId, candidate.provider, candidate.realId); },
+    }, rejected ? '已拒绝' : '参与轮换'));
+  };
+
+  const renderModel = (model) => {
+    const open = expanded[model.canonicalId] === true;
+    // ⚠️ 候选列表的顺序：探测过就**真的**按临期升序，否则保持目录给的字母序。
+    //    这样「临期优先」这个说法与实际顺序**一致**（原先两者矛盾，用户报障）。
+    const candidates = expiryOrder === null
+      ? model.candidates
+      : sortCandidatesByExpiry(model.candidates.map((c) => ({
+          ...c, expiry: expiryOrder[c.provider],
+        })));
+    return React.createElement('div', { className: 'dim-jh-aggModel', key: model.canonicalId },
+      React.createElement('button', {
+        type: 'button',
+        className: 'dim-jh-aggModelHead',
+        'aria-expanded': String(open),
+        onClick: () => setExpanded((prev) => ({ ...prev, [model.canonicalId]: !open })),
+      },
+      React.createElement('span', { className: 'dim-jh-aggModelName' },
+        model.name || model.canonicalId),
+      React.createElement('span', { className: 'dim-jh-aggModelMeta' },
+        // ⚠️ 措辞必须与**实际**顺序一致：探测过才说「按临期」，
+        //    否则说「按渠道名」（原先恒写「临期优先」而实际是字母序 —— 面板没说真话）。
+        `${model.candidates.length} 个渠道 · ${expiryOrder === null ? '按渠道名' : '按临期'}`),
+      // ⚠️ **候选全部被拒 ⇒ 必须显式提示**（规格 §5.2 末段的成文要求）：
+      //    「把某虚拟模型的候选**全部**拒绝（L3）**不等于**关闭该虚拟模型 ——
+      //      前者仍然出现在目录里（只是无候选可用，请求时如实报错），后者从目录消失。
+      //      **面板需对「候选全部被拒」给出显式提示，避免用户以为模型坏了。**」
+      //    ⚠️ 没有它时，用户选了该模型拿到的报错是「没有任何可用候选（渠道被关闭、
+      //    模型被关、或所有渠道都无可用账号）」—— **不会**提到「是你自己全部拒绝的」，
+      //    于是用户以为模型坏了或以为没登录。
+      isAllCandidatesRejected(model, rejections)
+        ? React.createElement('span', {
+            className: 'dim-jh-aggAllRejected',
+            title: '你把该模型的全部候选都关了「参与轮换」——请求会如实报「没有任何可用候选」。'
+              + '若想恢复，展开后在子列表里重新打开至少一条。',
+          }, '⚠️ 全部被拒')
+        : null,
+      React.createElement('span', { className: 'dim-jh-aggChevron' }, open ? '▾' : '▸')),
+      open
+        ? React.createElement('div', { className: 'dim-jh-aggCandidates' },
+            candidates.map((candidate) => renderCandidate(model.canonicalId, candidate)))
+        : null);
+  };
+
+  // ⚠️ 根元素用 `div` 而非 `main`（真实缺陷，对抗审计指出）：
+  //    父级 `JetHubPage` 已经是 `<main className="dim-jh-panel" role="tabpanel">`
+  //    （见本文件的渲染分流处），内层再写 `<main>` 会产生**嵌套 main** ——
+  //    无障碍语义错误（一个文档只应有一个 main landmark）。
+  //    ⚠️ 同理不再重复声明 `role="tabpanel"`（那是父级的角色）。
+  //    ⚠️ 也不再重复 `.dim-jh-panel` 类（父级已有；重复会让两条规则的 padding/overflow
+  //    互相覆盖，样式归属分叉）。
+  return React.createElement('div', {
+    className: 'dim-jh-aggPanel',
+  },
+  // ── 说明区 ──
+  React.createElement('section', { className: 'dim-jh-aggIntro' },
+    React.createElement('h2', { className: 'dim-jh-aggTitle' }, '聚合'),
+    React.createElement('p', { className: 'dim-jh-aggIntroLine' },
+      '把同一个模型在各渠道的条目聚合成一个名字，请求时按「积分最快作废」自动选渠道。'),
+    React.createElement('p', { className: 'dim-jh-aggIntroLine' },
+      '三层拒绝互不影响：关渠道（各渠道自己的面板）、关模型（模型选择器）、'
+      + '以及本页子列表里逐条拒绝某个候选参与轮换（只影响这一个模型）。'),
+    React.createElement('p', { className: 'dim-jh-aggIntroWarn' },
+      '本 provider 无需登录、没有账号池；积分与限流由各渠道自己管理。'),
+    React.createElement('p', { className: 'dim-jh-aggIntroLine' },
+      '未接入临期折算的渠道不参与轮换（它们仍可在模型选择器里直连使用）。')),
+  // ── 工具行 ──
+  React.createElement('div', { className: 'dim-jh-aggToolbar' },
+    React.createElement('span', { className: 'dim-jh-aggCount' },
+      models === null ? '读取中…' : `${models.length} 个聚合模型`),
+    React.createElement('button', {
+      type: 'button',
+      className: 'dim-jh-aggRefresh',
+      disabled: busy,
+      // ⚠️ **显式刷新必须传 `true`**（绕过宿主侧 60 秒目录缓存）——
+      //    否则按钮实际是「读缓存」，用户改了渠道模型后点刷新看不到变化。
+      onClick: () => { void load(true); },
+    }, busy ? '刷新中…' : '刷新'),
+    // ⚠️ 「按临期排序」**只在用户点击时**才探测余额（每个已接入渠道一次上游 GET）。
+    //    默认不探测：面板一打开就打十几次请求是不可接受的（规格 §8.3）。
+    React.createElement('button', {
+      type: 'button',
+      className: 'dim-jh-aggRefresh',
+      disabled: expiryBusy,
+      title: '逐个渠道查询积分到期时间并据此重排（会打上游请求，故默认不查）',
+      onClick: () => { void onSortByExpiry(); },
+    }, expiryBusy ? '查询中…' : '按临期排序')),
+  notice !== null
+    ? React.createElement('div', { className: 'dim-jh-aggNotice' }, notice)
+    : null,
+  // ── 空态 ──
+  models !== null && models.length === 0
+    ? React.createElement('div', { className: 'dim-jh-aggEmpty' },
+        '当前没有可聚合的模型：请先在至少一个已接入临期折算的渠道'
+        + '（buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae）登录账号。')
+    : null,
+  // ── 模型列表（**平铺**，全局按候选渠道数降序；不再有厂商分组标题）──
+  // ⚠️ 用户 2026-10-07 明确要求去掉分组标题：渠道维度的信息在**展开后的子列表**里
+  //    逐条显示，分组标题是冗余的（且分组标题里的「(2)/(5)」是**模型个数**，
+  //    容易被误读成渠道个数）。
+  sortedModels.map((model) => renderModel(model)),
+  // ── 页脚说明 ──
+  React.createElement('footer', { className: 'dim-jh-aggFooter' },
+    React.createElement('p', null,
+      '为什么没有签到 / 重置 / 新建账号按钮：本 provider 不持有账号与积分。'),
+    React.createElement('p', null,
+      '候选如何得出：字面推导（id / name 双通道）+ 显式映射补丁。'),
+    React.createElement('p', null,
+      '如何核查：展开任一模型，逐条看渠道与真实 modelId；不同意就关掉那一行。')));
+}
+
 export function JetHubPage({ close, rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
@@ -5457,11 +5772,16 @@ export function JetHubPage({ close, rpcCall }) {
         role: 'tabpanel',
       },
       PROVIDERS.map(p => p.id === selected
-        ? React.createElement(ProviderPanel, {
-            key: p.id + '-' + version,
-            provider: p.id,
-            rpcCall,
-          })
+        // ⚠️ 聚合走**独立组件**（见 `AggregatePanel` 的注释）：它没有账号/凭据/积分，
+        //    塞进 `ProviderPanel` 会得到一个「没有登录按钮、没有账号列表」的空面板。
+        //    先例：网关也是旁路功能用独立组件（`GatewayPanel`，以覆盖层渲染）。
+        ? (p.id === 'aggregate'
+            ? React.createElement(AggregatePanel, { key: p.id + '-' + version, rpcCall })
+            : React.createElement(ProviderPanel, {
+                key: p.id + '-' + version,
+                provider: p.id,
+                rpcCall,
+              }))
         : null))),
     // 「供应商开关」以 modal 渲染：它是覆盖层，放在布局之后只是组件树的书写顺序
     // （与账号面板里的模型列表同款做法）。关闭即不挂载，避免常驻一份开关列表。

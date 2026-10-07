@@ -606,6 +606,44 @@ function trackStream(
   })()
 }
 
+/** {@link withDeadModelPruning} 的可选行为。 */
+export interface DeadModelPruningOptions {
+  /**
+   * 该 provider 是否**参与**失效模型机制（记录 + 过滤），默认 `true`。
+   *
+   * ⚠️ **聚合 provider 必须传 `false`**（真实缺陷，全分支终审 C2 + 审计轮次二补修）。
+   *
+   * ## 为什么聚合不该参与
+   *
+   * 本机制解决的是「各 provider 的**编译期兜底快照**跟不上上游下架」—— 快照不会
+   * 自己变，故需要记下「这个 id 已失效」并在列表里剔除它。
+   *
+   * 但**聚合层的目录是动态推导的**：每个虚拟模型都来自各渠道**当前**的
+   * `listModels()`，上游下架后下次推导自然消失。
+   * ⇒ 它既**不需要记录**，也**不该被过滤** —— 过滤一个动态推导出来的目录没有任何
+   * 正确用途（若某个虚拟键能推导出来，就说明有渠道当前正在广告它；若推导不出来，
+   * 它压根不在目录里，过滤与否都一样）。
+   *
+   * ## ⚠️ 为什么必须是「完全不参与」而不是「只不记录」（本轮补修的残留面）
+   *
+   * 初版只跳过**记录**、仍保留**过滤**，留下一个真实缺口（审计轮次二实测证伪）：
+   *
+   * | 场景 | 后果 |
+   * |---|---|
+   * | **旧版本**（C2 修复前）跑过一次聚合，往表里写了 `aggregate` 维度的记录 | 该虚拟模型**仍被隐藏** |
+   * | 恢复途径 | `model.clearDead` 的 UI 在设置页 provider 面板里，而客户端 `PROVIDERS` **没有 `aggregate`** ⇒ **本分支内没有任何 UI 能恢复**，只能手改 `dead-models.json` 或等 30 天 TTL |
+   *
+   * 实测（探针）：`dead-models.json` 里预置 `aggregate/m1` 后，经真实装配
+   * （`withDeadModelPruning(['aggregate'], adapter, { enabled: false })`）
+   * 的 `listModels` 返回 `['auto','m2']` —— `m1` 被隐藏。
+   *
+   * ⇒ 传 `false` 时本函数**直接返回原适配器**（不记录、也不过滤）。
+   * 表里若已有历史遗留的 `aggregate` 记录，它们会被**忽略**（正是我们要的：
+   * 那些记录语义上无意义，且无法在 UI 里清除）。
+   */
+  enabled?: boolean
+}
+
 /**
  * 用「已失效模型」剔除包装一个适配器。
  *
@@ -647,7 +685,13 @@ function trackStream(
 export function withDeadModelPruning<T extends object>(
   providers: readonly string[],
   adapter: T,
+  options?: DeadModelPruningOptions,
 ): T {
+  // ⚠️ **完全不参与**（`enabled: false`）时直接返回原适配器 —— 不记录、**也不过滤**。
+  // 聚合 provider 走这条（理由见 `DeadModelPruningOptions.enabled` 的长注释：
+  // 只跳过记录会留下「旧版本写下的记录仍隐藏模型、且无 UI 可恢复」的残留面）。
+  if (options?.enabled === false) return adapter
+
   const ids = providers.filter((id) => typeof id === 'string' && id.length > 0)
   if (ids.length === 0) return adapter
 

@@ -400,10 +400,11 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     expect(ids).toContain('codearts')
     expect(ids).toContain('raccoon')
     // ⚠️ 计数会随 provider 增删变化（2026-09-30 加 minimax：11 → 12；
-    // 2026-10-01 加 opencode：12 → 13；2026-10-03 加 gemini：13 → 14）。
+    // 2026-10-01 加 opencode：12 → 13；2026-10-03 加 gemini：13 → 14；
+    // 2026-10-07 加 aggregate：14 → 15）。
     // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
     // 上面的具体 id；若将来再加 provider，记得同步这里。
-    expect(ids).toHaveLength(14)
+    expect(ids).toHaveLength(15)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -527,34 +528,49 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
    * 而本条把数字**从客户端 PROVIDERS 表派生**，于是「客户端多了一个面板、
    * 服务端却没接线」这种真实故障无处可藏。
    *
-   * ## 唯一的豁免：`opencode`
+   * ## 唯一的豁免：`opencode` 与 `aggregate`（两者理由**不同**）
    *
-   * 它的 RPC 由 `handleMethod` 统一分派到 `handleOpencodeRpc`，**不占形参位**
-   * （见 `src/index.ts` 的注册注释）。所以个数是 `N - 1`。
+   * - `opencode`：RPC 由 `handleMethod` 统一分派到 `handleOpencodeRpc`，**不占形参位**
+   *   （见 `src/index.ts` 的注册注释）；
+   * - `aggregate`：**没有 auth 服务**（无账号 / 无凭据 / 无续期）⇒ 它不该占一个
+   *   `XxxAuth` 形参位，否则会逼 15 个调用点补 `undefined` 占位（而
+   *   `registerJetHubRpc` 是位置传参，其形参列表有成文警告「历史上已因少传/插队
+   *   错位复发 6 次」）。它的 RPC 走 `modelAdapters['aggregate']`（P2）。
+   *
+   * 所以个数是 `N - 2`。
    * ⚠️ 豁免本身必须被**验证**（见下面第二条断言），否则「少接了一个」与
    * 「本来就该少一个」就分不开了。
    */
   it('★ RPC 形参个数由客户端 PROVIDERS 表派生（别用硬编码数字）', () => {
     const params = registerJetHubRpcParams()
     const clientIds = clientProviderIds()
-    expect(clientIds.length).toBe(14)
-    // 16 = ctx + pool + (14 - opencode) + modelAdapters
-    expect(params.length).toBe(clientIds.length + 2)
+    expect(clientIds.length).toBe(15)
+    // 实测（探针）：params = [ctx, pool, codearts…gemini(13 个), modelAdapters] ⇒ 16。
+    // 15 个客户端 id 里 **opencode 与 aggregate 两个不占形参位** ⇒ 13 个 provider 形参。
+    // ⇒ 形参个数 = clientIds.length - 2 + 3 = clientIds.length + 1
+    //   （3 = ctx + pool + modelAdapters）。
+    // ⚠️ 刻意写成**派生式**而非硬编码 16：写死就退化成「和硬编码数字比」，
+    //    而这正是本用例要防的（见用例标题）。
+    expect(params.length).toBe(clientIds.length + 1)
     // 末两位必须是 gemini 与 modelAdapters（gemini 排在 provider 末尾位）。
     expect(params.at(-1)).toBe('modelAdapters')
     expect(params.at(-2)).toBe('gemini')
   })
 
-  it('★ 唯一不占形参位的是 opencode（豁免被验证，不是被假设）', () => {
+  it('★ 不占形参位的是 opencode 与 aggregate（豁免被验证，不是被假设）', () => {
     const params = registerJetHubRpcParams()
     const clientIds = clientProviderIds()
-    // 客户端有它
+    // 客户端有它们
     expect(clientIds).toContain('opencode')
-    // 但 RPC 签名里没有它 —— 且**只有**它没有。
+    expect(clientIds).toContain('aggregate')
+    // 但 RPC 签名里没有它们 —— 且**只有**它们没有。
     // ⚠️ 形参名 `qoderCn`（驼峰）对应客户端表里的 `qodercn`，故先过一遍别名表。
     const alias: Readonly<Record<string, string>> = { qodercn: 'qoderCn' }
     const withoutSlot = clientIds.filter((id) => !params.includes(alias[id] ?? id))
-    expect(withoutSlot).toEqual(['opencode'])
+    // ⚠️ 两者豁免理由**不同**（见上一条用例的注释）：opencode 是「RPC 走
+    //    handleOpencodeRpc」、aggregate 是「没有 auth 服务」。断言写成数组
+    //    （而非 `toHaveLength(2)`）是为了在**将来多出第三个豁免**时立刻可见是哪两个。
+    expect([...withoutSlot].sort()).toEqual(['aggregate', 'opencode'])
   })
 })
 
