@@ -80,15 +80,38 @@ describe('★ P3：usage-badge.js 的重定向必须在门控**之前**', () => 
     expect(redirectAt).toBeLessThan(gateAt)
   })
 
-  it('★ 无历史时整体不渲染（复用既有的空 provider 形态，不另造判据）', () => {
-    // ⚠️ 规格 §6.6：徽标的「无历史 ⇒ 不渲染」应**复用** `typeof provider !== 'string'
-    //    || provider.length === 0` 那一形态。重定向返回 null 后，`provider` 变成
-    //    null ⇒ 该既有门控天然拦掉它 ⇒ **不需要**新增一条判据。
-    // ⚠️ 实现是**就地赋回 `provider`**（不是新造 `const resolved = ...`）——
+  it('★ 无历史时改为渲染「待首次请求」占位胶囊（2026-10-08 用户报障后改口径）', () => {
+    // ⚠️ 原口径是「无历史 ⇒ 整体不渲染」（规格 §6.6：复用既有的空 provider 形态）。
+    //    用户报障「也没胶囊了？」后改成本条 —— 理由见 `usage-badge.js` 里那段注释：
+    //    徽标在本插件里是**止损工具**，整个消失会让用户分不清「聚合没在用」
+    //    与「徽标坏了」。
+    //
+    // ⚠️ 但「**不预测渠道**」这条约束**仍然成立**（规格 §6.3 的 P4 核心）：占位文案
+    //    只说「待首次请求」，不编造任何渠道名。下面同时断言两件事。
+    expect(badgeCode).toMatch(/if \(isAggregate && provider === null\) \{/)
+    // ⚠️ 实现必须仍是**就地赋回 `provider`**（不是新造 `const resolved = ...`）——
     //    因为那两行门控是既有断言**逐字钉住**的，换变量名会让
     //    `usage-badge-client.spec.ts` 的正则失配（实测撞过一次）。
     expect(badgeCode).toMatch(/provider = resolveBadgeProvider\(/)
-    expect(badgeCode).toContain('typeof provider !== \'string\' || provider.length === 0')
+    // 占位分支必须**在**空 provider 门控之前（否则 `provider === null` 会先被它 return null）。
+    const pendingAt = badgeCode.indexOf('if (isAggregate && provider === null) {')
+    const emptyGateAt = badgeCode.indexOf("typeof provider !== 'string' || provider.length === 0")
+    expect(pendingAt).toBeGreaterThan(0)
+    expect(emptyGateAt).toBeGreaterThan(0)
+    expect(pendingAt).toBeLessThan(emptyGateAt)
+    // 占位文案不得出现任何具体渠道名（那是「预测」）。
+    const pendingBlock = badgeCode.slice(pendingAt, emptyGateAt)
+    for (const p of ['buddy', 'codearts', 'zcode', 'loomy', 'workbuddy']) {
+      expect(pendingBlock, `占位胶囊不得预测渠道「${p}」`).not.toContain(p)
+    }
+  })
+
+  it('★ 非聚合的空 provider 仍然整体不渲染（既有正确行为不得被占位分支带跑）', () => {
+    // ⚠️ 占位分支的判据是 `isAggregate && provider === null` —— 非聚合时
+    //    `isAggregate` 为假 ⇒ 继续走下面的空 provider 门控 ⇒ 不渲染。
+    //    「新会话尚未选模型」那条路径的行为**逐字不变**。
+    expect(badgeCode).toMatch(/typeof provider !== 'string' \|\| provider\.length === 0/)
+    expect(badgeCode).toContain('if (!supportsCreditBalance(provider)) return null;')
   })
 
   it('★ 重定向后的真实渠道传给 UsageBadgeActive（X1：靠既有 useEffect([provider]) 重挂载）', () => {
