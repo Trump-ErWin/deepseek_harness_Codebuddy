@@ -70,6 +70,10 @@ import type { GeminiCredential } from './gemini.js'
 import { createGeminiSigStore } from './gemini-sigstore.js'
 import { registerOpencodeLlm } from './opencode-adapter.js'
 import { registerAutoLlm } from './auto-adapter.js'
+import { AGGREGATE_PROVIDER, registerAggregateLlm } from './aggregate-adapter.js'
+// ⚠️ `createExpiryProbe` 从**底座**导入，不是从 `aggregate-adapter.js`
+//（它定义在 `aggregate-expiry.ts`，理由见该文件与 Task 7 的 Files 说明）。
+import { createExpiryProbe } from './aggregate-expiry.js'
 // ⚠️ opencode 的 RPC 由 `jet-hub-rpc.ts` 的 handleMethod 统一分派
 // （它调 handleOpencodeRpc），本文件**不再**单独注册端点 —— 详见
 // `opencode-rpc.ts` 模块头「为什么是被主 switch 调用」。
@@ -1945,7 +1949,35 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 恢复备份）时若调度器未武装则补上。⚠️ 订阅点必须挂在 `AccountPool` 上，
   // 不能逐个登录流程接线 —— 全仓库十几处 `pool.addAccount` 调用点，漏一处
   // 就意味着那个 provider 静默地永不续期。
-  const unsubscribeAccountAdded = pool.onAccountAdded(() => { refreshScheduler.notifyAccountAdded() })
+  //
+  // ⚠️ **同时清空临期折算缓存**（真实缺陷，对抗审计实测证伪）：缓存原先**没有
+  // 任何失效通道** ⇒ 刚登录（或限流刚解禁）的账号在**最长 60 秒内对路由不可见**，
+  // 用户拿到误导性的 `MISSING_CREDENTIAL | …没有任何可用候选`（明明刚登录成功）。
+  // ⚠️ 用**可变引用**（`let sharedExpiryProbeRef`）而不是直接捕获 `const` ——
+  // 探针定义在**本订阅之后**（那里才够 `ctx.llm` 注册完 provider），
+  // 闭包直接引用会命中 TDZ。
+  let sharedExpiryProbeRef: { clear: () => void } | undefined
+  // ⚠️⚠️ **候选序缓存也必须清**（真实缺陷，独立审计实测证伪：我原先只清了一半）。
+  //
+  // 两个缓存**不是**同一个东西：
+  //   - 折算缓存：`provider → 最早失效时刻`（决定**排序**）；
+  //   - 候选序缓存（`AggregateAdapter.choiceCache`）：`${model}\0${拒绝表指纹} →
+  //     DispatchTarget[]`（决定**用哪几个候选**），TTL 同样 60 秒。
+  //
+  // 后果（审计实测）：buddy **未登录**时被剔除（只剩 codearts）⇒ 那个**非空**结果
+  // 被缓存 ⇒ 用户随后**登录 buddy** ⇒ 折算缓存被清（排序值对了），但
+  // **候选序仍是「只有 codearts」的旧数组** ⇒ 60 秒内 buddy 仍不被使用。
+  // ⇒ 「刚登录的账号对路由不可见」只解决了一半。
+  //
+  // ⚠️ 候选序缓存的键含**拒绝表**指纹但**不含账号状态**，故账号变化必须**显式**清它。
+  // ⚠️ 同样用可变引用（`aggregateAdapter` 定义在本订阅之后）。
+  let sharedChoiceCacheRef: { clearChoiceCache: () => void } | undefined
+  const unsubscribeAccountAdded = pool.onAccountAdded(() => {
+    refreshScheduler.notifyAccountAdded()
+    // ⚠️ 未定义时什么都不做（订阅可能在它们建好前就触发 —— 那是正常时序）。
+    sharedExpiryProbeRef?.clear()
+    sharedChoiceCacheRef?.clearChoiceCache()
+  })
   ctx.effect(() => () => {
     unsubscribeAccountAdded()
     refreshScheduler.stop()
@@ -2111,6 +2143,62 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 里**没有** `dispose` 事件（`ctx.on('dispose', …)` 直接类型报错）。
   ctx.effect(() => () => { void closeAllProxyDispatchers() })
 
+  // 聚合 provider：一个规范模型名挂多渠道候选表，按临期积分自动选渠道、失败自动切换
+  //（见 `aggregate-adapter.ts` 模块头）。注册放在全部 provider 适配器之后：
+  // 它经 ctx.llm 公开路径委托目标适配器，且目录推导要读各渠道的 listModels。
+  // ⚠️ 必须传 expiryProbe：不传则所有渠道都折算成 UNUSABLE ⇒ 聚合目录虽在，
+  //    但任何请求都会报「没有任何可用候选」。
+  //
+  // ⚠️ 聚合 provider 必须**早于** `modelAdapters` 定义注册：那张表要引用本调用返回的
+  //    适配器实例（`pruned(AGGREGATE_PROVIDER, aggregateAdapter)`）。而 `modelAdapters`
+  //     又必须早于 `registerJetHubRpc`（后者要拿它做设置页目录）。故聚合的注册位置
+  //     比 auto 更靠前 —— 这不是笔误。
+  /**
+   * **共享**的临期探针（aggregate 与 auto 用同一个实例）。
+   *
+   * ## ⚠️ 为什么必须共享（真实缺陷，对抗审计实测证伪）
+   *
+   * 初版这里**直接内联** `createExpiryProbe(...)`，而 `AutoAdapter` 内部**又建一个**
+   * （它自己的 `expiryProbeInstance`）⇒ **两份独立的缓存实例**，后果：
+   * ① 同一渠道被折算两次（白打两次上游余额接口）；
+   * ② **缓存失效必须清两次** —— 而 `clear()` 若只清到一份，另一份仍会让
+   *    「刚登录的账号最长 60 秒对路由不可见」（用户拿到误导性的
+   *    「没有任何可用候选」，而它其实刚登录成功）。
+   *
+   * ⇒ 在装配层建**一个**，两个适配器都用它；`clear()` 一次即全部生效。
+   *
+   * ⚠️ **共享带来的一个语义松弛（已核实无害，但必须写明）**：
+   *    `AutoAdapter` 自己那份 `firstModelOf` 是「跳过被禁用 + 按倍率**挑最便宜**」，
+   *    而这里共享的这个是「取目录**第一个**」。共享后**两个消费者都用后者**。
+   *
+   *    ⚠️ **为何无害**：`firstModelIdOf` 的返回值只被当作
+   *    `probeModel = (await firstModelIdOf(provider)) ?? ''` 传给账号池的取号器
+   *    （用于「限流过滤」这一用途，见 `aggregate-expiry.ts:226`），
+   *    **不参与折算结果的任何计算** —— 两者都只是「拿该渠道的某个真实 modelId」，
+   *    对「最早失效时刻」这个返回值没有影响。
+   *
+   *    ⚠️ 反过来说：若**将来**有人让折算逻辑依赖 `probeModel`
+   *    （如「按最便宜的模型查额度」），这个松弛就会变成真缺陷 —— 那时必须
+   *    让两个消费者各自传自己的实现，或把该语义抽进探针参数。
+   */
+  const sharedExpiryProbe = createExpiryProbe(pool, async (provider) => {
+    const models = await ctx.llm.listModels(provider)
+    return models[0]?.id
+  })
+  // ⚠️ 赋给上面的可变引用 ⇒ 账号入库时清空折算缓存（见那里的注释）。
+  sharedExpiryProbeRef = sharedExpiryProbe
+
+  const aggregateAdapter = registerAggregateLlm(ctx, {
+    accountPool: pool,
+    expiryProbe: sharedExpiryProbe,
+    // ⚠️ **函数**而非快照（P2）：设置面板改了拒绝表后，**下一次请求**就要生效。
+    //    传快照会让用户以为开关坏了（要重启插件才生效）。
+    //    `pool.listAggregateRejections()` 返回进程内权威副本（与 state.json 同步）。
+    rejections: () => pool.listAggregateRejections(),
+  })
+  // ⚠️ 赋给上面的可变引用 ⇒ 账号入库时**也**清候选序缓存（见那里的长注释：
+  //    两个缓存不同，只清折算缓存会让「刚登录的账号」在 60 秒内仍不进候选序）。
+  sharedChoiceCacheRef = aggregateAdapter
   // ===== Jet Hub RPC 注册 =====
   // provider → 适配器实例：Jet Hub「显示列表」需要 `listAllModels()`（不受用户
   // 黑名单影响的全量目录，带最终展示名/倍率）。DSH 的 `ctx.llm` 只保证
@@ -2127,9 +2215,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // ⚠️ `codearts` 不在 `modelAdapters` 的常规形态里，但它同样需要该包装。
   //
   // ⚠️ 包装失败**不阻断启动**：回退到原始实例即可（它只是显示层的收敛）。
-  const pruned = <T extends object>(provider: string, adapter: T): T => {
+  const pruned = <T extends object>(
+    provider: string,
+    adapter: T,
+    options?: { enabled?: boolean },
+  ): T => {
     try {
-      return withDeadModelPruning([provider], adapter)
+      return withDeadModelPruning([provider], adapter, options)
     } catch (error) {
       ctx.logger.warn(`[jet-hub] ${provider} 的失效模型剔除包装失败，使用原适配器: ${String(error)}`)
       return adapter
@@ -2152,6 +2244,27 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     gemini: pruned(GEMINI.id, geminiAdapter),
     zcode: pruned(ZCODE.id, zcodeAdapter),
     opencode: pruned(OPENCODE.id, opencodeAdapter),
+    // ⚠️ 聚合 provider 也必须进这张表（设计文档 §5.2 的必改点）：`jet-hub-rpc.ts` 的
+    // `fullCatalogIds` **优先**用本表的 `listAllModels()`（不套黑名单的全量目录），
+    // 缺失时才退化到 `llm.listModels(provider)` —— 后者已被适配器按黑名单过滤。
+    // 于是「关闭整个聚合 provider」时只拿到**未被关闭的** id ⇒ 已关闭的模型漏写黑名单，
+    // 而 `provider.status` 的判据是 `closed = total > 0 && disabled === total`
+    // ⇒ 出现「provider 显示已关闭、模型却仍可选用」的矛盾态。
+    // `pruned(...)` 会包上失效模型剔除；聚合已提供**同步** `listAllModels()`，满足契约。
+    // ⚠️ 但聚合必须传 `enabled: false`（**完全不参与**该机制：不记录、**也不过滤**）
+    //    —— 真实缺陷（全分支终审 C2 + 审计轮次二补修的残留面）。本机制是为
+    //    「**编译期兜底快照**跟不上上游下架」设计的，而聚合层的目录是**动态推导**的
+    //    （上游下架后下次推导自然消失）⇒ 既不需要记录，也不该被过滤。
+    //    ① **记录**的危害：外层包装观察到的是 `aggregate` + **虚拟键**（实测），于是
+    //       「某一个渠道没有该 realId」被记成「**整个规范模型**失效」，而它在其余渠道
+    //       上完全可用；且恢复入口 `model.clearDead` 的 UI 在设置页 provider 面板里，
+    //       而客户端 `PROVIDERS` **没有 `aggregate`** ⇒ **没有任何 UI 能恢复**。
+    //    ② **过滤**的危害（补修的那半）：初版只跳过记录、仍保留过滤 ⇒ 若表里**已有**
+    //       旧版本写下的 `aggregate` 记录（C2 修复前跑过一次就会有），虚拟模型**仍被
+    //       隐藏**，且同样无 UI 可恢复 —— 实测探针确认（预置 `aggregate/m1` 后
+    //       `listModels` 只返回 `['auto','m2']`）。
+    //    ⇒ 传 `enabled: false` 让本函数**直接返回原适配器**，历史遗留记录被忽略。
+    aggregate: pruned(AGGREGATE_PROVIDER, aggregateAdapter, { enabled: false }),
   }
 
   // 插件卸载前把签名缓存落盘：`stream()` 每次结束都 flush，但用户可能
@@ -2171,6 +2284,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // Jet Hub「自动」：一个 `auto` 模型名用整池，按「积分最快作废」跨 provider 选型
   // （见 `auto-adapter.ts` 模块头）。注册放在全部 provider 适配器之后：它经
   // ctx.llm 公开路径委托目标适配器，目录/凭据此时均已就绪。
-  registerAutoLlm(ctx, { accountPool: pool })
+  registerAutoLlm(ctx, {
+    accountPool: pool,
+    // ⚠️ **与 aggregate 共用同一个探针**（真实缺陷，对抗审计实测证伪）：
+    //    不传时 `AutoAdapter` 会**自建一份**，于是有两份独立缓存 ⇒
+    //    ① 同一渠道被折算两次（白打两次上游余额接口）；
+    //    ② 缓存失效要清两次，漏一次就让「刚登录的账号最长 60 秒对路由不可见」。
+    expiryProbe: sharedExpiryProbe,
+  })
   ctx.provide('accountPool', pool)
 }

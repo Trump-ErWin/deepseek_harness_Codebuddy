@@ -914,6 +914,78 @@ export interface RpcModelSetDisabledResponse {
 }
 
 /**
+ * 聚合设置面板的一条候选（`aggregate.catalog` 的条目）。
+ *
+ * ⚠️ **不含余额**（规格 §8.3）：本端点只回答「有哪些候选、哪些被拒」，
+ * 余额仍由各渠道自己的面板负责 —— 否则打开面板就会对每个渠道打一次上游请求。
+ */
+export interface RpcAggregateCandidate {
+  provider: string
+  /** 该渠道的**真实** modelId（面板要让用户看到它以便人工核查）。 */
+  realId: string
+  /** 该渠道的展示名（含倍率等运行时信息）。 */
+  realName: string
+  /** 倍率（`Infinity` = 无标注）。 */
+  price: number
+  /** 是否靠**显式补丁**归一（面板标 `⚠️补丁` 供人工核查）。 */
+  viaPatch: boolean
+  /** 是否被用户拒绝参与该模型的轮换。 */
+  rejected: boolean
+}
+
+/** 聚合设置面板的一个虚拟模型（`aggregate.catalog` 的条目）。 */
+export interface RpcAggregateModel {
+  canonicalId: string
+  name: string
+  candidates: RpcAggregateCandidate[]
+}
+
+/** RPC: 列出聚合目录（虚拟模型 + 各自候选 + 拒绝状态）响应 */
+export interface RpcAggregateCatalogResponse {
+  models: RpcAggregateModel[]
+}
+
+/** RPC: 设置某条候选是否拒绝参与轮换请求 */
+export interface RpcAggregateSetRejectedRequest {
+  canonicalId: string
+  provider: string
+  realId: string
+  rejected: boolean
+}
+
+/** RPC: 清空拒绝表请求（`canonicalId` / `provider` 都可省略；都省略 = 清空全部） */
+export interface RpcAggregateClearRejectedRequest {
+  canonicalId?: string
+  provider?: string
+}
+
+/** RPC: 拒绝表变更后的统一响应（回传写入后的完整拒绝表，便于前端校验） */
+export interface RpcAggregateRejectionsResponse {
+  aggregateRejections: Record<string, Record<string, Record<string, boolean>>>
+}
+
+/**
+ * RPC: 聚合 provider「上次实际转发成功的渠道」响应（P3，供用量徽标）。
+ *
+ * ⚠️ `provider` 为 `null` 表示**无历史**（尚未发过任何请求 / 插件重启后内存清空）
+ * ⇒ 客户端**不渲染**徽标（规格 §6.3 的 P4）。**不做预测**。
+ */
+export interface RpcAggregateActiveProviderResponse {
+  provider: string | null
+}
+
+/**
+ * RPC: 「按临期排序」用的候选到期时刻（面板可选按钮，用户 2026-10-07 选定）。
+ *
+ * `order` 是 `{ <provider>: expiry }`（毫秒时间戳；`-1` = 查不到、`Infinity` = 长期）。
+ * ⚠️ 该端点**会做余额探测**（每个已接入渠道一次上游 GET），
+ * 故只在用户显式点「按临期排序」时调用 —— 面板默认不探测（规格 §8.3）。
+ */
+export interface RpcAggregateExpiryOrderResponse {
+  order: Record<string, number>
+}
+
+/**
  * RPC: 把某个模型从「已失效」表里移除（让它重新出现在目录中）。
  *
  * ## 为什么必须有这个端点（2026-10-06 复审 !66 确认）

@@ -281,6 +281,12 @@ import type {
   RpcModelListResponse,
   RpcModelSetDisabledRequest,
   RpcModelSetDisabledResponse,
+  RpcAggregateCatalogResponse,
+  RpcAggregateSetRejectedRequest,
+  RpcAggregateClearRejectedRequest,
+  RpcAggregateRejectionsResponse,
+  RpcAggregateActiveProviderResponse,
+  RpcAggregateExpiryOrderResponse,
   RpcModelSetAllDisabledRequest,
   RpcModelSetAllDisabledResponse,
   RpcModelSetDisabledManyRequest,
@@ -1068,6 +1074,49 @@ export function registerJetHubRpc(
  */
 export interface ModelCatalogSource {
   listAllModels(): readonly { id: string; name: string; isFree?: boolean }[]
+  /**
+   * 聚合目录（**可选** —— 只有聚合适配器实现它）。
+   *
+   * ⚠️ 必须是**只读且零余额查询**的（规格 §8.3）：面板挂载时会调它。
+   * 其余 14 家不实现本方法，故这里声明为可选（结构化类型，不影响它们）。
+   */
+  describeCatalog?(force?: boolean, signal?: AbortSignal): Promise<Array<{
+    canonicalId: string
+    name: string
+    candidates: Array<{
+      provider: string
+      realId: string
+      realName: string
+      price: number
+      viaPatch: boolean
+      rejected: boolean
+    }>
+  }>>
+  /**
+   * 清空选型缓存（**可选** —— 只有聚合适配器实现它）。
+   *
+   * ⚠️ 改了拒绝表之后调它可立即释放内存。但**正确性不依赖它**：
+   * 聚合适配器的缓存键含拒绝表指纹，故改了表就自动不命中旧条目
+   *（见 `AggregateAdapter.rejectionFingerprint`）。
+   */
+  clearChoiceCache?(): void
+  /**
+   * 「上次**实际**转发成功的渠道」（**可选** —— 只有聚合适配器实现它）。
+   *
+   * ⚠️ 必须是**纯内存读、零网络零余额查询**（规格 §6.3 的 P2）：用量徽标在
+   * **门控阶段**就要拿到它（重定向必须发生在 `supportsCreditBalance` 门控之前），
+   * 查网络会让外层渲染抖动。
+   *
+   * @param canonicalId - 省略时返回「最近一次任意虚拟模型的转发渠道」。
+   */
+  activeProvider?(canonicalId?: string): string | null
+  /**
+   * 「按临期排序」用的候选到期时刻（**可选** —— 只有聚合适配器实现它）。
+   *
+   * ⚠️ 这是**唯一**会做余额探测的面板方法，**只在用户显式点「按临期排序」时**调用
+   *（`describeCatalog` 的零查询契约不受影响，见那里的注释）。
+   */
+  describeExpiryOrder?(signal?: AbortSignal): Promise<Record<string, number>>
 }
 
 /**
@@ -4011,6 +4060,127 @@ function registerJetHubEndpoints(
         await pool.setProviderOrder(req.order)
         ctx.logger.info(`[jet-hub] 已更新供应商自定义显示顺序（${req.order.length} 项）`)
         return { ok: true, value: undefined }
+      }
+
+      // ── 聚合 provider 的设置面板（`src/aggregate-adapter.ts`）──
+      //
+      // ⚠️ 接线复用 `modelAdapters` 形参，**不新增形参**：`registerJetHubRpc` 是
+      //    位置传参，其形参列表有成文警告「历史上已因少传/插队错位复发 6 次」，
+      //    而 `aggregate` **没有 auth 服务**（无账号/无凭据/无续期）⇒ 它不该占一个
+      //    `XxxAuth` 形参位（那会逼 15 个调用点补 `undefined` 占位）。
+      //    聚合适配器实例本来就在 `modelAdapters[AGGREGATE_PROVIDER]` 里。
+      case 'aggregate.catalog': {
+        const source = modelAdapters?.['aggregate']
+        if (source?.describeCatalog === undefined) {
+          return {
+            ok: false,
+            error: { code: 'unavailable', message: '聚合 provider 未注册或未提供目录' },
+          }
+        }
+        // ⚠️ 只读 + 零余额查询（规格 §8.3）：describeCatalog 内部不碰 expiryProbe。
+        // ⚠️ `force`（可选，默认 false）：面板的「刷新」按钮传 true 以**绕过目录 TTL
+        //    缓存**（真实缺陷，对抗审计实测证伪：不传 force 时「刷新」实际是「读 60 秒
+        //    缓存」，用户在渠道侧改了模型后点刷新看不到变化）。
+        //    只有显式刷新才绕缓存；其余调用方（含 `listModels`）继续走缓存。
+        const force = (payload as { force?: unknown } | undefined)?.force === true
+        const models = await source.describeCatalog(force, _signal)
+        const value: RpcAggregateCatalogResponse = { models }
+        return { ok: true, value }
+      }
+
+      case 'aggregate.setRejected': {
+        const req = payload as RpcAggregateSetRejectedRequest
+        if (typeof req?.canonicalId !== 'string' || req.canonicalId.length === 0
+          || typeof req.provider !== 'string' || req.provider.length === 0
+          || typeof req.realId !== 'string' || req.realId.length === 0) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'canonicalId / provider / realId 必填' },
+          }
+        }
+        await pool.setAggregateRejected(req.canonicalId, req.provider, req.realId, req.rejected === true)
+        ctx.logger.info(
+          `[jet-hub] 聚合：${req.rejected === true ? '拒绝' : '恢复'} `
+          + `${req.canonicalId} 的候选 ${req.provider}/${req.realId}`,
+        )
+        // ⚠️ 清选型缓存：让改动**立刻**生效（虽然缓存键含拒绝表指纹、正确性不依赖
+        //    它，但清掉可立即释放内存，并让语义更直白）。
+        modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        const value: RpcAggregateRejectionsResponse = {
+          aggregateRejections: pool.listAggregateRejections(),
+        }
+        return { ok: true, value }
+      }
+
+      // ⚠️ **本端点当前没有客户端调用者**（对抗审计指出）—— 但**不要删**：
+      //    规格 §8.4 明确要求它（「清空（支持按模型或按渠道清）」），是**先定的契约**。
+      //    面板目前只提供「逐条开关」（`aggregate.setRejected`），批量清空留作后续
+      //    UI（如「全部恢复」按钮）与排障用途。判据：**规格要求 ≠ 死代码**
+      //   （与 `vendorOf` 那类零调用者的自造辅助函数不同）。
+      case 'aggregate.clearRejected': {
+        const req = payload as RpcAggregateClearRejectedRequest
+        // ⚠️ 省略字段才是「清空该维度」；传了非字符串一律拒绝（避免字段名写错导致
+        //    「静默清空全表」—— 与 `model.clearDead` 的 modelId 判据同款）。
+        if ((req?.canonicalId !== undefined && typeof req.canonicalId !== 'string')
+          || (req?.provider !== undefined && typeof req.provider !== 'string')) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'canonicalId / provider 必须是字符串或省略' },
+          }
+        }
+        await pool.clearAggregateRejected(req?.canonicalId, req?.provider)
+        ctx.logger.info('[jet-hub] 聚合：已清空拒绝表（按传入的维度）')
+        modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        const value: RpcAggregateRejectionsResponse = {
+          aggregateRejections: pool.listAggregateRejections(),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 聚合 provider **上次实际转发成功的渠道**（P3，供用量徽标）。
+       *
+       * ⚠️⚠️ **必须是纯内存读、零网络零余额查询**（规格 §6.3 的 P2）：
+       * 徽标在**门控阶段**就要拿到它 —— 重定向必须发生在
+       * `supportsCreditBalance` 门控**之前**（那行是既有断言逐字钉住的，不得修改），
+       * 而门控阶段是**同步渲染路径**，查网络会让外层渲染抖动（渠道变一次、
+       * 徽标闪一次）。
+       *
+       * ⚠️ 语义是**真实历史**（已发生的转发），**不是预测** —— 不用
+       * `pickCurrentAutoProvider`（预测语义 + 有网络成本）。
+       *
+       * ⚠️ 无历史 ⇒ `{ provider: null }` ⇒ 客户端**不渲染**徽标（规格 §6.3 的 P4）。
+       */
+      case 'aggregate.activeProvider': {
+        const source = modelAdapters?.['aggregate']
+        // ⚠️ 未注册时回 `{ provider: null }` 而**不是**报错：徽标是**可选装饰**，
+        //    为它报错会让会话输入区出现无意义的错误（本仓库对「非关键路径失败」
+        //    的既有取向是安静降级，见 `usage-badge.js` 的目录解析注释）。
+        const canonicalId = (payload as { canonicalId?: unknown } | undefined)?.canonicalId
+        const provider = typeof canonicalId === 'string' && canonicalId.length > 0
+          ? (source?.activeProvider?.(canonicalId) ?? null)
+          : (source?.activeProvider?.() ?? null)
+        const value: RpcAggregateActiveProviderResponse = { provider }
+        return { ok: true, value }
+      }
+
+      /**
+       * 「按临期排序」用的候选到期时刻（面板的可选按钮，用户 2026-10-07 选定）。
+       *
+       * ⚠️⚠️ **这是唯一会做余额探测的面板端点** —— `describeCatalog` 的契约是
+       * **零余额查询**（规格 §8.3，有专门用例断言），而「按临期排序」必须探测
+       * 才知道顺序。⇒ 分开：面板默认零探测，用户点按钮才走这里。
+       *
+       * ⚠️ 未注册时回**空表**而不是报错：面板据此保持字母序并提示，
+       * 不影响其余功能（与 `aggregate.activeProvider` 的安静降级同取向）。
+       */
+      case 'aggregate.expiryOrder': {
+        const source = modelAdapters?.['aggregate']
+        const order = source?.describeExpiryOrder === undefined
+          ? {}
+          : await source.describeExpiryOrder(_signal)
+        const value: RpcAggregateExpiryOrderResponse = { order }
+        return { ok: true, value }
       }
 
       // ── 本机 OpenAI 网关（`src/openai-gateway/`）──

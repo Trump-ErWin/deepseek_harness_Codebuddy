@@ -365,6 +365,7 @@ export function registerAdapterIdempotent(
   providers: readonly string[],
   adapter: unknown,
   warn?: (message: string) => void,
+  pruning?: { enabled?: boolean },
 ): unknown {
   // ⚠️ 顺序语义（见函数 doc）：**记账在内、剔除在外**。
   //    剔除 Proxy 调用 prepareCall 时 this 绑到它包着的记账 Proxy，
@@ -372,7 +373,11 @@ export function registerAdapterIdempotent(
   let target = wrapAdapterWithTokenLedger(providers, adapter as object)
   if (typeof adapter === 'object' && adapter !== null) {
     try {
-      target = withDeadModelPruning(providers, target)
+      // ⚠️ `pruning.enabled === false` 时**完全不参与**失效模型机制
+      //（不记录、**也不过滤**）—— 聚合 provider 必须这样。理由见
+      // `dead-model-store.ts` 的 `DeadModelPruningOptions.enabled` 长注释：
+      // 只跳过记录会留下「旧版本写下的记录仍隐藏模型、且无 UI 可恢复」的残留面。
+      target = withDeadModelPruning(providers, target, pruning)
     } catch (error) {
       warn?.(`[llm-register] 已失效模型剔除包装失败，使用原适配器: ${String(error)}`)
     }

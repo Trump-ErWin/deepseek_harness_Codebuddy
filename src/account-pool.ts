@@ -2,8 +2,8 @@ import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
-import { createJetHubStore, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeDisabledModels, sanitizePermanentLocks } from './jet-hub-store.js'
-import type { JetHubStore, JetHubState, ModelDisableMap, PermanentLockMap } from './jet-hub-store.js'
+import { createJetHubStore, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizePermanentLocks } from './jet-hub-store.js'
+import type { AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PermanentLockMap } from './jet-hub-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
 import type { PermanentLockStore } from './permanent-lock-store.js'
 import type {
@@ -201,6 +201,14 @@ export class AccountPool {
    */
   private modelCache: ModelDisableMap = {}
   /**
+   * 聚合「拒绝轮换」表的**权威进程内副本**（与 {@link cache} / {@link modelCache} 同理）。
+   *
+   * ⚠️ 与 {@link modelCache} **语义不同、不可合并**：黑名单是「关闭这个模型」（它从
+   * 模型选择器消失），本表是「这一条候选不参与该虚拟模型的轮换」（模型仍在目录里）。
+   * 详见 `AggregateRejectionMap` 的注释。
+   */
+  private aggregateRejectionCache: AggregateRejectionMap = {}
+  /**
    * 「锁定永久积分」开关表的**权威进程内副本**（与 {@link cache} 同理）。
    *
    * ⚠️ 每个 provider 一项（Loomy / CodeBuddy / WorkBuddy 各自独立），
@@ -269,6 +277,8 @@ export class AccountPool {
       // 黑名单是后来才加入的字段：老文档里没有它，缺失时保持空表
       // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
       this.modelCache = state.disabledModels
+      // 聚合拒绝表同理：老文档没有该键 → 保持空表（没有任何拒绝）。
+      this.aggregateRejectionCache = state.aggregateRejections ?? {}
       // 网关开关同理：老文档没有该键 → 保持默认启用。
       this.gatewayEnabledCache = state.gatewayEnabled !== false
       // 供应商顺序同理：老文档没有该键 → 空数组（未自定义）。
@@ -351,6 +361,8 @@ export class AccountPool {
       await this.store.save({
         accounts: this.cache,
         disabledModels: this.modelCache,
+        // 与上面两份同源快照（见本方法注释：分两次快照会让同一份文档里的字段互相矛盾）。
+        aggregateRejections: this.aggregateRejectionCache,
         ...this.lockFields(),
         // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
         // 分两次快照会让同一份文档里的字段互相矛盾。
@@ -401,6 +413,126 @@ export class AccountPool {
   listDisabledModels(provider: string): Record<string, boolean> {
     this.ensureLoaded()
     return { ...(this.modelCache[provider] ?? {}) }
+  }
+
+  /**
+   * 聚合「拒绝轮换」表的**只读快照**（供适配器与设置面板读取）。
+   *
+   * ⚠️ 返回**浅拷贝的顶层**（避免调用方改到内部缓存），但内层仍共享引用 ——
+   * 调用方**只读**即可；写入一律走 {@link setAggregateRejected}。
+   */
+  listAggregateRejections(): AggregateRejectionMap {
+    this.ensureLoaded()
+    return this.aggregateRejectionCache
+  }
+
+  /**
+   * 设置某条候选是否被拒绝参与该虚拟模型的轮换。
+   *
+   * 语义（与 {@link setModelDisabled} 对称）：
+   * - `rejected === true` → 写入；
+   * - `rejected === false` → **删除**该键（不留 `false` 噪音，与 sanitize 同口径）；
+   * - 空层逐级清理（realId 层空 → 删 provider 层；provider 层空 → 删虚拟模型层）。
+   */
+  async setAggregateRejected(
+    canonicalId: string,
+    provider: string,
+    realId: string,
+    rejected: boolean,
+  ): Promise<void> {
+    this.ensureLoaded()
+    const next: AggregateRejectionMap = { ...this.aggregateRejectionCache }
+    const perProvider = { ...(next[canonicalId] ?? {}) }
+    const perRealId = { ...(perProvider[provider] ?? {}) }
+    if (rejected) perRealId[realId] = true
+    else {
+      delete perRealId[realId]
+      // ⚠️⚠️ **「重新打开」必须一并清掉该渠道的「漂移兄弟键」**（真实缺陷，
+      //    独立审计实测证伪 —— D4 的降级会让拒绝**不可恢复**）。
+      //
+      // ## 为什么
+      // D4 规定：`(虚拟模型, 渠道)` 下有 `true` 记录、但那些 `realId` **都不在**
+      // 当前候选中（id 漂移）⇒ **降级为渠道级拒绝**（该渠道全部候选都被拒）。
+      // 而漂移的**旧键会一直留在表里** ⇒ 用户按降级 warn 的指引来面板
+      // 「重新打开」**当前**候选时，上面那行 `delete perRealId[realId]` 删的是
+      // **当前**键，**旧键仍在** ⇒ 降级判据依然成立 ⇒ **降级继续生效**：
+      //   - 面板用 `isRejected(表, 当前 realId)` 判断显示 ⇒ 显示「参与轮换」；
+      //   - 宿主实际**仍拒绝** ⇒ **显示与行为分叉**；
+      //   - 于是 warn 指引的那条恢复路径**走不通**（用户怎么点都没用）。
+      //
+      // ## 修法与判据
+      // 用户在面板上「重新打开」某条候选，其**意图**是「让这个渠道在这个模型下
+      // 重新参与轮换」。而 D4 的降级语义本就是**渠道级**的（要么整渠道拒、
+      // 要么整渠道参与）⇒ 故「打开一条」在该渠道处于降级态时，唯一自洽的结果
+      // 就是**整渠道恢复**。保留漂移旧键会让拒绝永远无法撤销，那不是规格要的
+      //（§5.2 与 `jet-hub-store.ts`：「拒绝 ≠ 关闭，可重新打开」）。
+      //
+      // ⚠️ 与 `clearAggregateRejected(canonicalId, provider)` 的区别：本分支只在
+      //    用户**显式打开某一条**时触发（且只清本渠道，不碰其它渠道）；
+      //    那个方法支持按虚拟模型/按渠道批量清（含从未拒绝过的）。语义不同故并存。
+      //
+      // ⚠️ 方向取「清整渠道层」而不是「只删漂移的那几个键」：后者要求这里知道
+      //    **当前候选表**（本层拿不到，它属于适配器），且「用户的意图是让整渠道
+      //    恢复」这一语义判断与删几个键无关 —— 见上方判据。
+      //
+      // ⚠️⚠️ **必须直接 `return`，不能让下面的写回把 `perRealId` 又挂回去**
+      //   （我自己第一版正是如此：`delete perProvider[provider]` 之后紧跟
+      //    `perProvider[provider] = perRealId` ⇒ **删除被自己覆盖**，
+      //    于是旧键仍在、降级不解除 —— 独立审计用真实池实测证伪了这一点）。
+      delete perProvider[provider]
+      if (Object.keys(perProvider).length === 0) delete next[canonicalId]
+      else next[canonicalId] = perProvider
+      await this.writeAggregateRejections(next)
+      return
+    }
+    if (Object.keys(perRealId).length === 0) delete perProvider[provider]
+    else perProvider[provider] = perRealId
+    if (Object.keys(perProvider).length === 0) delete next[canonicalId]
+    else next[canonicalId] = perProvider
+    await this.writeAggregateRejections(next)
+  }
+
+  /**
+   * 清空拒绝表（支持按虚拟模型或按渠道清）。
+   *
+   * - 都不传 ⇒ 清空**全部**；
+   * - 只传 `canonicalId` ⇒ 清空该虚拟模型的全部候选拒绝；
+   * - 只传 `provider` ⇒ 清空**所有**虚拟模型里该渠道的拒绝；
+   * - 两个都传 ⇒ 清空该虚拟模型里该渠道的拒绝。
+   *
+   * ⚠️ 与 {@link setAggregateRejected} 的 `false` 方向**不等价**：后者是「打开某一条」，
+   * 本方法是「清空一批」（即便某条从未被拒绝也无所谓）。
+   */
+  async clearAggregateRejected(canonicalId?: string, provider?: string): Promise<void> {
+    this.ensureLoaded()
+    if (canonicalId === undefined && provider === undefined) {
+      await this.writeAggregateRejections({})
+      return
+    }
+    const next: AggregateRejectionMap = {}
+    for (const [key, byProvider] of Object.entries(this.aggregateRejectionCache)) {
+      if (canonicalId !== undefined && key !== canonicalId) {
+        next[key] = byProvider
+        continue
+      }
+      const kept: Record<string, Record<string, boolean>> = {}
+      for (const [p, byRealId] of Object.entries(byProvider)) {
+        if (provider !== undefined && p !== provider) kept[p] = byRealId
+      }
+      if (Object.keys(kept).length > 0) next[key] = kept
+    }
+    await this.writeAggregateRejections(next)
+  }
+
+  /** 落盘拒绝表（与 {@link writeModels} 对称）。 */
+  private async writeAggregateRejections(rejections: AggregateRejectionMap): Promise<void> {
+    this.aggregateRejectionCache = rejections
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，聚合拒绝表变更未落盘')
+      return
+    }
+    await this.queueStoreSave()
   }
 
   /**
@@ -1228,6 +1360,65 @@ export class AccountPool {
       )
     }
     return null
+  }
+
+  /**
+   * 取某 provider **全部启用账号**的凭据（按手动顺序）。
+   *
+   * ## ⚠️ 为什么需要它（真实缺陷，用户报障 2026-10-07）
+   *
+   * 用户质疑：「workbuddy 中一个号是 1 天到期，为什么我们统计是 2000 多天，
+   * **只用了第一个账号吗**？」—— **他猜对了**。
+   *
+   * 聚合的临期折算原先走 {@link getAvailableAccount}，那个方法只返回**一个**
+   * 账号（手动序第一个可用的）。于是「渠道最早什么时候作废」只反映了那**一个**
+   * 账号 —— 而用户把「1 天到期」的号拖到后面时，它的临期额度在**排序**里被完全忽略，
+   * 结果是「按临期排序」把这个渠道排到后面，尽管它有一个快作废的号。
+   *
+   * ⚠️ 与 {@link getAvailableAccount} 的**分工**：那个方法服务于「实际发请求用哪个
+   * 账号」（手动顺序优先，渠道内部换号由适配器负责）；本方法只服务于**观测**
+   *（「这个渠道整体的临期额度大概什么时候作废」），**不改变选号行为**。
+   *
+   * ⚠️ 与 `getAvailableAccount` 一致：**跳过凭据损坏的账号**（记日志、继续），
+   * 而不是整批失败 —— 一个坏账号不该让整个渠道被判成不可用。
+   *
+   * @param provider - 渠道 id
+   * @param modelId - 真实模型 id（用于限流过滤；空串则跳过限流维度）
+   * @returns 凭据数组（可能为空 = 没有可用账号）
+   */
+  async listAvailableCredentials(
+    provider: string,
+    modelId: string,
+  ): Promise<Array<{ entry: ProviderAccountEntry; credential: unknown }>> {
+    const candidates = this.readAccounts()
+      .filter(a => a.provider === provider && a.enabled)
+      .filter(a => {
+        // 与 `getAvailableAccount` 同一判据：空 modelId 跳过限流过滤。
+        if (modelId.length === 0) return true
+        if (!a.modelRateLimits) return true
+        const resetAt = a.modelRateLimits[modelId]
+        return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
+      })
+    const out: Array<{ entry: ProviderAccountEntry; credential: unknown }> = []
+    for (const entry of candidates) {
+      try {
+        const resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef))
+        // ⚠️ 与 `getAvailableAccount` 同判据：`resolve` 可能返回 undefined（凭据未配置）。
+        if (!resolved) {
+          this.ctx.logger?.warn?.(`[jet-hub] ${provider} 账号 ${entry.id} 凭据未配置（跳过）`)
+          continue
+        }
+        out.push({ entry, credential: JSON.parse(resolved.value) as unknown })
+      } catch (error) {
+        // ⚠️ 单个账号的凭据坏掉只跳过它（与 `getAvailableAccount` 同取向）——
+        //    否则一个坏账号会让整个渠道的临期折算失败、被判成「查不到」。
+        this.ctx.logger?.warn?.(
+          `[jet-hub] ${provider} 账号 ${entry.id} 的凭据不可用（临期折算跳过它）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+    return out
   }
 
   /**
