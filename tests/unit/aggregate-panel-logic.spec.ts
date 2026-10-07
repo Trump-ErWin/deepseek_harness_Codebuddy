@@ -411,7 +411,22 @@ describe('★ 面板接线：默认零探测，点了才探测（防「面板没
   it('★ 空态提示的渠道清单必须含 lobsterai / trae（已接入）', () => {
     // ⚠️ 白名单扩大后清单也要跟 —— 否则提示会漏掉两个真的可用的渠道。
     const at = panelCode.indexOf('当前没有可聚合的模型')
-    const snippet = panelCode.slice(at, at + 300)
+    expect(at, '必须存在该空态提示').toBeGreaterThan(0)
+    // ⚠️ **不要用魔数窗口**（真实脆弱点，审计实测指出）：原实现是
+    //    `panelCode.slice(at, at + 300)`，而 `lobsterai` 落在偏移 90、`trae` 在 102
+    //    ⇒ 文案一变长（余量 <60 字符）就会**假失败**。
+    //
+    // ⚠️ 我第一版改成「到下一个 `React.createElement` 或 `</p>`」——**仍然过宽**：
+    //    该文案是**跨两行的字符串拼接**（`'…渠道'` + `'（…）登录账号。'`），而
+    //    `React.createElement` 在它**之前** ⇒ 边界取负、窗口退化成 1200 字符，
+    //    于是「去掉提示里的 trae」这个变异**不会变红**（`trae` 在文件里出现 22 次，
+    //    窗口外的命中把断言喂饱了）——反向验证实测发现了这一点。
+    // ⇒ 改为**精确到该文案的结尾**（`登录账号。` 那句），窗口正好覆盖整段清单。
+    const rest = panelCode.slice(at)
+    const end = rest.indexOf('登录账号。')
+    const snippet = end > 0 ? rest.slice(0, end + '登录账号。'.length) : rest.slice(0, 400)
+    expect(snippet, '窗口必须精确覆盖该提示（否则断言会被窗口外的文本喂饱）')
+      .toContain('当前没有可聚合的模型')
     expect(snippet).toContain('lobsterai')
     expect(snippet).toContain('trae')
   })

@@ -210,7 +210,7 @@ export const CREDITS_CAPABILITIES = Object.freeze({
    * 聚合 provider（跨渠道临期优先）。
    *
    * ⚠️ **如实登记为 `false`**：它**没有自己的账号与余额** —— 它复用各渠道的账号，
-   * 积分与限流由各渠道自己管理（见 `aggregate-panel.js` 的说明区）。
+   * 积分与限流由各渠道自己管理（见 `aggregate-panel-logic.js` + `jet-hub.js` 的 `AggregatePanel` 的说明区）。
    *
    * ⚠️ 这一项**不影响**用量徽标能否工作：徽标对聚合的处理是「重定向到实际选中的
    * 渠道」（P3），重定向发生在 `supportsCreditBalance` 门控**之前**，门控看到的
