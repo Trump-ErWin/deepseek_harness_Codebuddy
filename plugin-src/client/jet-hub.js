@@ -72,6 +72,8 @@ import { formatRowTokensPerSecond } from './tokens-per-second.js';
 import {
   accountLabel,
   avgPerfText,
+  avgPerfTooltip,
+  barDayLabel,
   barHeightPercent,
   channelCardTitle,
   channelLabel,
@@ -2052,14 +2054,24 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
   }, [snapshot, selected]);
 
   /** 一行模型的三个格子（实时汇总与历史日树共用，避免括号地狱）。 */
+  /**
+   * 均值单元格：`首字 2.11s · 982.5 tok/s` + **口径说明 tooltip**。
+   *
+   * ⚠️ 口径说明不是锦上添花（用户 2026-10-07 报障）：看到「982.5 tok/s」时
+   * 合理怀疑算错了，而不给口径就无从判断它是真快还是被离群样本拉出来的。
+   * 统一走这里，避免 7 个调用点各写一份 title 而漏掉某一处。
+   */
+  const perfCell = (row) => React.createElement('span', {
+    className: 'dim-jh-ledgerPerf', title: avgPerfTooltip(),
+  }, avgPerfText(row));
+
   const renderModelRow = (modelRow, key) => React.createElement('div', {
     key, className: 'dim-jh-ledgerModel',
   },
     React.createElement('span', { className: 'dim-jh-ledgerModelName', title: modelRow.model }, modelRow.model),
     React.createElement('span', { className: 'dim-jh-ledgerModelReq', title: '请求数（含失败）' },
       modelRow.requests + ' 次'),
-    React.createElement('span', { className: 'dim-jh-ledgerPerf', title: '均值：只对有实测值的请求平均' },
-      avgPerfText(modelRow)),
+    perfCell(modelRow),
     React.createElement('span', { className: 'dim-jh-ledgerModelTokens' },
       tokenSummaryText(modelRow)));
 
@@ -2100,7 +2112,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
           React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
             React.createElement('span', { className: 'dim-jh-ledgerAccountName', title: accountRow.accountId },
               accountLabel(accountRow.accountId)),
-            React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(accountRow.totals)),
+            perfCell(accountRow.totals),
             React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
               tokenSummaryText(accountRow.totals))),
           accountRow.models.map((modelRow) =>
@@ -2119,7 +2131,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       },
         React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
           React.createElement('strong', null, channelCardTitle(channelRow)),
-          React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(channelRow.totals)),
+          perfCell(channelRow.totals),
           React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
             tokenSummaryText(channelRow.totals))),
         channelRow.providers.map((providerRow) => React.createElement('div', {
@@ -2127,7 +2139,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         },
           React.createElement('div', { className: 'dim-jh-ledgerProviderHead' },
             React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, providerRow.provider),
-            React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(providerRow.totals)),
+            perfCell(providerRow.totals),
             React.createElement('span', { className: 'dim-jh-ledgerProviderSum' },
               tokenSummaryText(providerRow.totals))),
           renderProviderBody(providerRow))))));
@@ -2155,7 +2167,11 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
   };
 
   // ── 历史视图（第 4 期）：数据源是落盘日聚合，重启保留 ──
-  const historyDays = Array.isArray(history?.days) ? history.days : [];
+  // ⚠️ 响应体的天数数组在 `history` 键上（`RpcUsageTokenLedgerHistoryResponse`），
+  // 与同级的 `totals` 平级 —— 读成 `days` 会恒得 undefined，界面表现为
+  // 「合计有数、却没有柱子」（空状态文案还反过来说「今天发起的请求明天才能看到」，
+  // 而当天数据其实就在响应里）。
+  const historyDays = Array.isArray(history?.history) ? history.history : [];
   const bars = trendBars(historyDays);
   const maxTokens = bars.reduce((max, b) => Math.max(max, b.tokens), 0);
   const renderHistory = () => {
@@ -2182,6 +2198,8 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
               '还没有历史用量。每笔请求都会按日累计入盘 —— 今天发起的请求明天就能在这里看到。')
           : React.createElement(React.Fragment, { key: 'histBody' },
               // 趋势柱状图：每根柱 = 一天，点击下钻该日聚合树（再点收起）。
+              // ⚠️ 柱高必须传 `bars.length`：单日窗口下不传根数时最大柱恒 100%，
+              // 撑满容器成「白块」（见 barHeightPercent 的缺陷注释）。
               React.createElement('div', { className: 'dim-jh-ledgerTrend' },
                 bars.map((b) => React.createElement('div', {
                   key: b.day,
@@ -2193,8 +2211,10 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
                     className: 'dim-jh-ledgerTrendBar',
                     'data-today': b.isToday ? 'true' : 'false',
                     'data-active': expandedDay === b.day ? 'true' : 'false',
-                    style: { height: barHeightPercent(b.tokens, maxTokens) + '%' },
-                  }))),
+                    style: { height: barHeightPercent(b.tokens, maxTokens, bars.length) + '%' },
+                  }),
+                  // 日期短标签常驻显示：光靠色块无法区分哪天（tooltip 要 hover）。
+                  React.createElement('div', { className: 'dim-jh-ledgerTrendLabel' }, barDayLabel(b.day)))),
               // 展开的那天：完整聚合树（渠道 → provider → 账号 → 模型）。
               ...(expandedDay !== null
                 ? historyDays.filter((d) => d?.day === expandedDay).map((dayRow) =>
@@ -2211,13 +2231,13 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
   const renderDayTree = (dayRow) => React.createElement('div', { key: 'day-' + dayRow.day, className: 'dim-jh-ledgerCard' },
     React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
       React.createElement('strong', null, dayRow.day + ' · ' + (dayRow.totals?.requests ?? 0) + ' 次请求'),
-      React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(dayRow.totals)),
+      perfCell(dayRow.totals),
       React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
         tokenSummaryText(dayRow.totals))),
     dayRow.channels.map((channelRow) => React.createElement('div', { key: channelRow.channel, className: 'dim-jh-ledgerProvider' },
       React.createElement('div', { className: 'dim-jh-ledgerProviderHead' },
         React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, channelLabel(channelRow.channel)),
-        React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(channelRow.totals)),
+        perfCell(channelRow.totals),
         React.createElement('span', { className: 'dim-jh-ledgerProviderSum' },
           tokenSummaryText(channelRow.totals))),
       channelRow.providers.map((providerRow) => React.createElement('div', {
@@ -2225,7 +2245,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       },
         React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
           React.createElement('span', { className: 'dim-jh-ledgerAccountName' }, providerRow.provider),
-          React.createElement('span', { className: 'dim-jh-ledgerPerf' }, avgPerfText(providerRow.totals)),
+          perfCell(providerRow.totals),
           React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
             tokenSummaryText(providerRow.totals))),
         (providerRow.accounts ?? []).length > 1
@@ -2273,7 +2293,9 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         '按渠道（直连 / 网关）、供应商、账号与模型统计本机发出的每笔模型请求。'
         + '↓输入 ↑输出 ⚡缓存 ✎缓存写入 🧠推理；— 表示该笔未收到用量（失败或中断）。'
         + '明细含「首字用时」与「输出速率」（首块之后 → 结束，官方口径）；'
-        + '汇总行的「均值」只对有实测值的请求平均。'
+        + '汇总行的「均值」只对有实测值的请求平均'
+        + '（速率要求解码时长 ≥ 100ms，过短视为不可测；'
+        + '且为算术平均，个别极快/极慢的离群请求会明显拉高或拉低该值 —— 悬停均值格看口径）。'
         + '明细保留最近 500 笔（重启清空）；按日累计已存盘（token-ledger.json）。'),
       React.createElement('div', { className: 'dim-jh-modalBody' },
         renderHistory(),
@@ -5324,13 +5346,15 @@ export function JetHubPage({ close, rpcCall }) {
   const providerSummary = providerToggleSummary(PROVIDERS, providerStatuses);
 
   return React.createElement('section', { className: 'dim-jh-page', 'aria-label': 'Jet Hub Provider 设置' },
+    // ⚠️ 页头左侧的「Jet Hub」标题块已**整块删除**（用户 2026-10-07 要求：
+    // 标题只占宽度、不带任何操作，空间全给按钮行）。这里先后删过两样东西，
+    // 都**不要**加回来：
+    // ① 副标题「提供商凭据与多账号管理」（.dim-jh-brandDesc）—— 2026-10-06，
+    //    因为按钮太多，副标题既显示不全又挤占页头高度；
+    // ② 标题本体「Jet Hub」（.dim-jh-brand / .dim-jh-brandName）—— 2026-10-07，
+    //    页头一排已有 7 个按钮，标题纯属占位。设置页的语义由本节点的
+    //    aria-label 与宿主左侧「Jet Hub」导航项承担，不丢。
     React.createElement('header', { className: 'dim-jh-header' },
-      React.createElement('div', { className: 'dim-jh-brand' },
-        // ⚠️ 这里曾有一行副标题「提供商凭据与多账号管理」（.dim-jh-brandDesc），
-        // 用户 2026-10-06 要求去掉：页头按钮已排到一排，副标题又占一行高度、
-        // 宽窄窗口下还会被截成省略号（既读不全、又把按钮往下挤）。
-        // 「Jet Hub」标题本身已足够标识该设置页，语义不丢。
-        React.createElement('strong', { className: 'dim-jh-brandName' }, 'Jet Hub')),
       React.createElement('div', { className: 'dim-jh-headerActions' },
         // 「供应商开关」在页头，而不是左侧每个供应商行尾（!25 的原形态）：
         // 它是破坏性批量操作，与「选择看哪个供应商」这个高频无害动作分开摆放，
@@ -5477,3 +5501,4 @@ export function JetHubPage({ close, rpcCall }) {
         })
       : null);
 }
+
