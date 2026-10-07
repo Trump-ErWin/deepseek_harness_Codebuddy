@@ -780,6 +780,16 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         // 同账号名：hover 出资源包列表（两处都挂，用户 hover 哪个都能看见）。
         title: accountTitle,
       }, account.enabled ? '已启用' : '已停用'),
+      // 受限标记：这张卡片被自动沉到了列表末尾，标出来才说得清「为什么它在下面」。
+      // 判据与下方「限额重置」行同源（都是未到期的 modelRateLimits）。
+      rateLimits.length > 0
+        ? React.createElement('span', {
+            className: 'dim-jh-accountTag',
+            'data-tone': 'warn',
+            title: '当前处于模型限额中。该账号不会参与自动选号，并已被沉到列表末尾；'
+              + '限额解除后仍留在末尾，避免它再次霸占首位而让其它账号的额度白白过期。',
+          }, '限额中')
+        : null,
       // ⚠️ 匿名通道标记：它不需要 key、只用于免费模型，额度按**出口 IP** 计。
       // 标注出来是为了让用户知道「这几条不是登录账号」，
       // 以及为什么给它们配不同代理才会各自获得独立额度。
@@ -3534,7 +3544,8 @@ function ProviderPanel({ provider, rpcCall }) {
               // 「拖了有什么用」无从得知。仅两个以上账号时才显示。
               accounts.length > 1
                 ? React.createElement('p', { className: 'dim-jh-orderHint' },
-                    '拖动卡片可调整顺序（也可直接拖整张卡片）。顺序即自动选号与限流换号的优先级，排在前面的账号优先使用。')
+                    '拖动卡片可调整顺序（也可直接拖整张卡片）。顺序即自动选号与限流换号的优先级，排在前面的账号优先使用。'
+                    + '命中限额的账号会自动沉到末尾，恢复后仍留在末尾 —— 这样额度不会因为某个号一直霸占首位而白白过期。')
                 : null,
               reorderError
                 ? React.createElement('div', {
