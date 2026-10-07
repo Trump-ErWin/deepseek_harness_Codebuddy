@@ -51,6 +51,22 @@ export const JET_HUB_NS = 'jet-hub'
  */
 export type ModelDisableMap = Record<string, Record<string, boolean>>
 
+/**
+ * 聚合 provider 的「拒绝轮换」表：虚拟模型 id → provider → 被拒绝的 realId → true。
+ *
+ * ## 与相邻两张表的关系（三者语义互不相同，不要合并）
+ *
+ * | 表 | 语义 | 粒度 |
+ * |---|---|---|
+ * | `disabledModels[provider][modelId]` | **关闭这个模型**（它从模型选择器里消失） | provider + 模型 |
+ * | `provider.setEnabled` | **关闭整个 provider**（等于关掉它全部模型） | provider |
+ * | `aggregateRejections[虚拟模型][provider][realId]` | **这一条候选不参与该模型的轮换** | 候选 |
+ *
+ * ⚠️ 把某虚拟模型的候选**全部**拒绝 ≠ 关闭该虚拟模型：前者它仍在目录里
+ *（只是无候选可用，请求时如实报错），后者从目录消失。
+ */
+export type AggregateRejectionMap = Record<string, Record<string, Record<string, boolean>>>
+
 /** 各 provider 的「锁定永久积分」开关：provider id → 已锁定。 */
 export type PermanentLockMap = Record<string, boolean>
 
@@ -58,6 +74,17 @@ export type PermanentLockMap = Record<string, boolean>
 export interface JetHubState {
   accounts: ProviderAccountEntry[]
   disabledModels: ModelDisableMap
+  /**
+   * 聚合 provider 的「拒绝轮换」表（见 {@link AggregateRejectionMap}）。
+   *
+   * ⚠️ 住 `state.json` 是**有意**的：本文件是**整体替换**语义，旧版本代码重写时
+   * 会抹掉它不认识的键。判定标准是**丢失后果是否可逆**：
+   * 拒绝表丢了 = 某个候选重新参与轮换 = **回到默认行为**，用户再关一次即可
+   *（对比 `loomyPermanentLocked`：丢了会真烧掉永久积分，故它住独立文档）。
+   *
+   * 老文档没有这个键 → 空表（没有任何拒绝），与升级前行为一致。
+   */
+  aggregateRejections?: AggregateRejectionMap
   /**
    * Loomy「锁定永久积分」开关 —— **镜像字段，不是权威**。
    *
@@ -226,6 +253,41 @@ export function sanitizeDisabledModels(raw: unknown): ModelDisableMap {
 }
 
 /**
+ * 归一化聚合 provider 的「拒绝轮换」表（见 {@link AggregateRejectionMap}）。
+ *
+ * 判据（照 {@link sanitizeDisabledModels} 的形态）：
+ *
+ * - 只有**显式 `true`** 算拒绝（`false` / `1` / `'true'` / `null` 都不算）——
+ *   宽松接受 truthy 会让 `'false'`（非空字符串）被当成拒绝，用户莫名其妙丢一个渠道；
+ * - **空层不保留**：不留 `{ m: {} }` / `{ m: { buddy: {} } }` 这类无意义噪音；
+ * - 任何畸形输入（含**数组** —— `typeof [] === 'object'`，只判 object 会让它通过）
+ *   退化为空表。
+ *
+ * ⚠️ 用 `Object.entries` 遍历**自有**键 ⇒ 原型链键（`constructor` 等）天然不会被
+ * 误当条目（与 `canonical-models.ts` 的 M9 是同一类风险；那里需要显式 `Object.hasOwn`，
+ * 这里由 `entries` 天然保证 —— 故**不要**改成 `for (const k in raw)`）。
+ */
+export function sanitizeAggregateRejections(raw: unknown): AggregateRejectionMap {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const result: AggregateRejectionMap = {}
+  for (const [canonicalId, byProvider] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof byProvider !== 'object' || byProvider === null || Array.isArray(byProvider)) continue
+    const perProvider: Record<string, Record<string, boolean>> = {}
+    for (const [provider, byRealId] of Object.entries(byProvider as Record<string, unknown>)) {
+      if (typeof byRealId !== 'object' || byRealId === null || Array.isArray(byRealId)) continue
+      const perRealId: Record<string, boolean> = {}
+      for (const [realId, flag] of Object.entries(byRealId as Record<string, unknown>)) {
+        if (flag === true) perRealId[realId] = true
+      }
+      // 空层不保留（与上面同因）。
+      if (Object.keys(perRealId).length > 0) perProvider[provider] = perRealId
+    }
+    if (Object.keys(perProvider).length > 0) result[canonicalId] = perProvider
+  }
+  return result
+}
+
+/**
  * 归一化账号条目数组。
  *
  * 判据刻意保守：只保留同时具备 `id` / `provider` / `credentialRef` 三个非空
@@ -263,6 +325,7 @@ class SettingsStore implements JetHubStore {
       | {
         accounts?: unknown
         disabledModels?: unknown
+        aggregateRejections?: unknown
         loomyPermanentLocked?: unknown
         gatewayEnabled?: unknown
         providerOrder?: unknown
@@ -272,6 +335,8 @@ class SettingsStore implements JetHubStore {
     return {
       accounts: sanitizeAccounts(value.accounts),
       disabledModels: sanitizeDisabledModels(value.disabledModels),
+      // 老文档没这个键 → 空表（没有任何拒绝），与升级前行为一致。
+      aggregateRejections: sanitizeAggregateRejections(value.aggregateRejections),
       // 只是**镜像**（权威表在 permanent-locks.json）；老文档没这个键 → false。
       loomyPermanentLocked: value.loomyPermanentLocked === true,
       // 老文档没这个键 → 启用，与升级前行为一致。
@@ -285,6 +350,16 @@ class SettingsStore implements JetHubStore {
     await this.scope.replace({
       accounts: state.accounts,
       disabledModels: state.disabledModels,
+      // ⚠️⚠️ **必须带上拒绝表**（真实缺陷，对抗审计实测证伪）：
+      //    `replace` 是**整体替换**语义 —— 漏掉本键会让拒绝表**永不落盘**，
+      //    且**任何**账号/黑名单/网关/顺序写入都会顺带把它抹掉。
+      //    后果：用户明确拒绝的渠道在重启后**静默重新参与轮换**（用户无从察觉）。
+      //    探针实测（老契约后端）：落盘 section 键只有
+      //    `accounts,disabledModels,gatewayEnabled,loomyPermanentLocked,providerOrder`，
+      //    `aggregateRejections` 为 undefined，重启后读回 `{}`。
+      //    ⚠️ 与下面三个「接受丢失」的键**不同**：那三个丢失后果**可逆且用户可见**
+      //    （网关回默认、顺序回声明序），而拒绝表丢失是**静默误路由**。
+      aggregateRejections: state.aggregateRejections ?? {},
       // 镜像字段由 AccountPool 与独立文档**同源写出**：同机上只认这个字段的
       // 旧版本代码（其它 profile）读它、也会原样写回它，故两边不会脱节。
       loomyPermanentLocked: state.loomyPermanentLocked === true,
@@ -450,6 +525,7 @@ class FileStore implements JetHubStore {
       const value = parsed as {
         accounts?: unknown
         disabledModels?: unknown
+        aggregateRejections?: unknown
         loomyPermanentLocked?: unknown
         gatewayEnabled?: unknown
         providerOrder?: unknown
@@ -457,6 +533,8 @@ class FileStore implements JetHubStore {
       return {
         accounts: sanitizeAccounts(value.accounts),
         disabledModels: sanitizeDisabledModels(value.disabledModels),
+        // 老文档没这个键 → 空表（没有任何拒绝），与升级前行为一致。
+        aggregateRejections: sanitizeAggregateRejections(value.aggregateRejections),
         // 只是镜像（权威表在 permanent-locks.json）；老文档没这个键 → false。
         loomyPermanentLocked: value.loomyPermanentLocked === true,
         // 老文档没这个键 → 启用，与升级前行为一致。
@@ -504,6 +582,8 @@ class FileStore implements JetHubStore {
       const state: JetHubState = {
         accounts,
         disabledModels: {},
+        // 凭据文件里没有任何拒绝信息 → 空表（与全新安装一致）。
+        aggregateRejections: {},
         // 凭据文件里没有任何锁定信息 → 镜像写 false（权威表另有其文档）。
         loomyPermanentLocked: false,
         // 恢复出的文档本来就不含任何开关信息 → 启用（与全新安装一致）。

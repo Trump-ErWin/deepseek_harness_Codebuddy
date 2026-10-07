@@ -169,6 +169,22 @@ export function apply(ctx) {
       },
       providerLabel,
       readBadge: (provider, options) => rpcCall('usage.badge', { provider, ...options }),
+      /**
+       * 聚合 provider「上次**实际**转发成功的渠道」（P3）。
+       *
+       * ⚠️ 宿主侧该端点是**纯内存读**（零网络零余额查询）—— 徽标在**门控阶段**
+       * 就要用它把 `aggregate` 重定向成真实渠道，而门控是同步渲染路径。
+       * ⚠️ 返回 `{ provider: null }` 表示无历史 ⇒ 徽标**不渲染**。
+       */
+      readActiveProvider: (canonicalId) =>
+        rpcCall('aggregate.activeProvider', canonicalId === undefined ? {} : { canonicalId }),
+      /**
+       * 「按临期排序」用的到期时刻（面板可选按钮，用户 2026-10-07 选定）。
+       *
+       * ⚠️ 这是**唯一会做余额探测**的面板调用（每个已接入渠道一次上游 GET）
+       * ⇒ 只在用户显式点「按临期排序」时才发（面板默认不探测，规格 §8.3）。
+       */
+      readExpiryOrder: () => rpcCall('aggregate.expiryOrder', {}),
       writePreference: (preference) => rpcCall('usage.badgePreference', { preference }),
       // 自动签到开关（全局一个，不分渠道）：宿主在「打开」时会立刻跑一轮。
       setAutoCheckin: (enabled) => rpcCall('usage.autoCheckin', { enabled }),
