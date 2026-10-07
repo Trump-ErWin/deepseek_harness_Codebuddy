@@ -105,6 +105,8 @@ describe('老契约后端（SettingsStore）', () => {
     expect(store.load()).toEqual({
       accounts: [ACCOUNT],
       disabledModels: { buddy: { 'glm-5.2': true } },
+      // save 未携带拒绝表 → 写出空表，读回同值（老文档没这个键时的默认）。
+      aggregateRejections: {},
       loomyPermanentLocked: false,
       gatewayEnabled: true,
       // save 未携带顺序 → 写出空数组（未自定义），读回同值。
@@ -133,6 +135,45 @@ describe('老契约后端（SettingsStore）', () => {
     expect(saved?.loomyPermanentLocked).toBe(true)
     expect('permanentLocks' in saved!).toBe(false)
     expect(store.load()?.loomyPermanentLocked).toBe(true)
+  })
+
+  /**
+   * ⚠️⚠️ **老契约后端必须真正落盘拒绝表**（真实缺陷，对抗审计实测证伪）。
+   *
+   * `SettingsStore.save()` 的 `replace` 是**整体替换**语义 ⇒ 载荷漏掉某个键
+   * 就等于「永不落盘」，且**任何**账号/黑名单/网关/顺序写入都会顺带把它抹掉。
+   * 后果：用户明确拒绝的渠道在重启后**静默重新参与轮换**（用户无从察觉）。
+   *
+   * ⚠️ 上面那条「整体写入同时携带账号与黑名单」用例的注释曾写
+   * 「save 未携带拒绝表 → 写出空表，读回同值」，把这个缺陷**合理化**了 ——
+   * 它只断言「不传时读回空表」，**从未**断言「传了要落盘」。
+   * 本用例补的正是那一半：**传了必须落盘且能读回**。
+   */
+  it('★ 拒绝表在 settings 后端可落盘并读回（不能只断言「不传时为空」）', async () => {
+    let saved: Record<string, unknown> | undefined
+    const scope = {
+      get: () => saved,
+      replace: async (section: object) => { saved = section as Record<string, unknown> },
+    }
+    const store = createJetHubStore(makeCtx({ register: () => scope, describe: () => [] }))
+    const rejections = { 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }
+    await store.save({ accounts: [], disabledModels: {}, aggregateRejections: rejections })
+
+    // ① 载荷里**必须**带上它（这是 replace 语义下的唯一保证）
+    expect(saved?.aggregateRejections).toEqual(rejections)
+    // ② 且能读回（不是只写进载荷、读时又丢掉）
+    expect(store.load()?.aggregateRejections).toEqual(rejections)
+  })
+
+  it('★ 拒绝表缺省时写出空表（老文档没有该键的兼容路径）', async () => {
+    let saved: Record<string, unknown> | undefined
+    const scope = {
+      get: () => saved,
+      replace: async (section: object) => { saved = section as Record<string, unknown> },
+    }
+    const store = createJetHubStore(makeCtx({ register: () => scope, describe: () => [] }))
+    await store.save({ accounts: [], disabledModels: {} })
+    expect(saved?.aggregateRejections).toEqual({})
   })
 
   /**
@@ -173,6 +214,8 @@ describe('文件后端（FileStore）', () => {
     expect(reader.load()).toEqual({
       accounts: [ACCOUNT],
       disabledModels: { buddy: { 'glm-5.2': true } },
+      // 拒绝表缺省空表（没有任何拒绝）—— 与升级前行为一致
+      aggregateRejections: {},
       // 镜像字段缺省 false（解锁）—— 与既有行为一致
       loomyPermanentLocked: false,
       // 网关开关缺省启用 —— 与升级前行为一致
@@ -355,9 +398,22 @@ describe('文件后端（FileStore）', () => {
     // ⚠️ 用 `import.meta.url` 直接拼 URL（不引 `fileURLToPath` / `dirname`）：
     // 本文件的 import 区最容易被上游改动，少一处依赖就少一处合并冲突面。
     const source = readFileSync(new URL('../../plugin-src/client/jet-hub.js', import.meta.url), 'utf8')
-    const providerIds = [...source.matchAll(/\{\s*id:\s*'([a-z]+)',\s*label:/g)].map((m) => m[1]!)
+    const allIds = [...source.matchAll(/\{\s*id:\s*'([a-z]+)',\s*label:/g)].map((m) => m[1]!)
     // 防「正则该更新了却静默取到 0 项」这类假绿。
-    expect(providerIds.length).toBeGreaterThan(0)
+    expect(allIds.length).toBeGreaterThan(0)
+
+    /**
+     * ⚠️ **无凭据的 provider 必须显式豁免**（规格 §8.3）：
+     * `aggregate` 是聚合路由，**不持有账号与凭据**（它复用各渠道的账号）⇒
+     * 它不可能出现在 `.credentials.yaml` 里，恢复表也不该为它造账号。
+     * ⚠️ 豁免本身必须被**验证**（下面的 `expect(...).toContain(...)`），否则
+     * 「忘了登记」与「本来就该豁免」就分不开了 —— 那正是本断言存在的意义。
+     */
+    const NO_CREDENTIAL_PROVIDERS = ['aggregate']
+    for (const id of NO_CREDENTIAL_PROVIDERS) {
+      expect(allIds, `豁免项 ${id} 必须真的在客户端 PROVIDERS 里`).toContain(id)
+    }
+    const providerIds = allIds.filter((id) => !NO_CREDENTIAL_PROVIDERS.includes(id))
 
     const refs = providerIds.map(
       (id, index) => `${id.toUpperCase()}_ACCOUNT_${(index + 1).toString(16).toUpperCase().padStart(6, '0')}`,
@@ -372,6 +428,11 @@ describe('文件后端（FileStore）', () => {
     expect(recovered.map(a => [a.provider, a.credentialRef])).toEqual(
       providerIds.map((id, index) => [id, refs[index]!]),
     )
+    // ⚠️ 反向确认：恢复出的账号里**不得**出现被豁免的 provider
+    //（否则说明 `REF_PREFIX_TO_PROVIDER` 里被误加了一项）。
+    for (const id of NO_CREDENTIAL_PROVIDERS) {
+      expect(recovered.some(a => a.provider === id)).toBe(false)
+    }
   })
 
   /**
@@ -407,6 +468,8 @@ describe('文件后端（FileStore）', () => {
     expect(createJetHubStore(makeCtx(undefined)).load()).toEqual({
       accounts: [],
       disabledModels: {},
+      // 拒绝表缺省空表（没有任何拒绝）：读回同值。
+      aggregateRejections: {},
       loomyPermanentLocked: false,
       // 写盘时缺省即启用：读回应如实带回这个默认值。
       gatewayEnabled: true,

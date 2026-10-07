@@ -60,6 +60,64 @@ export const BADGE_PREFERENCES = Object.freeze(['auto', 'subscription', 'credits
 export const DEFAULT_BADGE_PREFERENCE = 'auto';
 
 /**
+ * 聚合 provider 的路由 id（必须与宿主 `src/aggregate-adapter.ts` 的
+ * `AGGREGATE_PROVIDER` 逐字一致）。
+ */
+export const AGGREGATE_PROVIDER_ID = 'aggregate';
+
+/**
+ * 把徽标的 `provider` 解析成**实际要读哪个渠道的余额**。
+ *
+ * ## 为什么需要它（P3）
+ *
+ * `aggregate` 是**跨渠道**路由：它自己不持有账号与余额（能力表里如实登记为
+ * `balance:false`）。若直接把 `aggregate` 交给徽标，门控会因它无余额能力而
+ * **永不渲染**。用户要求「显示当前正在使用的 provider，和正常使用一个 provider
+ * 模型一样，但是会随着聚合选中的 provider 切换」。
+ *
+ * ⇒ 把 `aggregate` **重定向到它上一次实际转发到的真实渠道**，再以那个渠道走
+ * **原样的**读数链路（`readBadge('buddy')`）⇒ 显示的余额 / 百分比 / 倒计时 / 签到
+ * 与单渠道完全一致。
+ *
+ * ## ⚠️ 语义是**真实历史**，不是预测
+ *
+ * 取宿主记录的「上次**实际**转发成功的渠道」。**不做预测**（用户明确选择）：
+ * 预测的胜者可能因失败切换而实际未被使用，显示一个错的渠道比不显示更误导。
+ * 故也**不用** `src/auto-adapter.ts` 的 `pickCurrentAutoProvider`
+ *（它是预测语义，且要预检余额、有网络成本）。
+ *
+ * ## ⚠️ 无历史 ⇒ 返回 `null`（不渲染）
+ *
+ * 尚未发过任何请求 / 插件重启后内存清空 ⇒ 返回 `null`。调用方把它当作
+ * 「没有选中模型」处理（`typeof provider !== 'string'`），**复用既有的空 provider
+ * 门控形态**，不另造判据（规格 §6.6）。
+ *
+ * ## ⚠️ 必须在门控**之前**调用
+ *
+ * `usage-badge.js` 的门控逐字是 `if (!supportsCreditBalance(provider)) return null;`
+ *（既有断言钉住，不得修改）。重定向必须在它**之前**完成 —— 这样门控看到的
+ * `provider` 已是真实渠道，`aggregate` 就可以**诚实**登记 `balance:false`
+ * 而不需要为它谎报能力。
+ *
+ * @param {string} provider - 徽标当前的 provider（可能来自 `state.current.provider`）
+ * @param {{ provider?: string | null } | null | undefined} active
+ *   宿主 `aggregate.activeProvider` 的返回值（`{ provider }` 或 null）
+ * @returns {string | null} 真实渠道 id；无法解析时 `null`（= 不渲染）
+ */
+export function resolveBadgeProvider(provider, active) {
+  if (typeof provider !== 'string' || provider.length === 0) return null;
+  // 非聚合：原样返回（其余 15 家的行为**逐字不变**）。
+  if (provider !== AGGREGATE_PROVIDER_ID) return provider;
+  // 聚合：取上次实际转发到的渠道。
+  const resolved = (typeof active === 'object' && active !== null) ? active.provider : null;
+  if (typeof resolved !== 'string' || resolved.length === 0) return null;
+  // ⚠️ 拒绝自指：若宿主误把 aggregate 记成真实渠道，重定向会得到它自己
+  //    ⇒ 又走一遍重定向、或直接进门控被判无余额能力而消失。显式拒绝更可诊断。
+  if (resolved === AGGREGATE_PROVIDER_ID) return null;
+  return resolved;
+}
+
+/**
  * 折叠态里**渠道名与读数之间**的分隔符（用户 2026-10-03 定：''供应商 • 剩余积分''）。
  *
  * ⚠️ 它是一个常量而不是各处手写的字符串：完整文案（{@link badgeView} 的 `text`，

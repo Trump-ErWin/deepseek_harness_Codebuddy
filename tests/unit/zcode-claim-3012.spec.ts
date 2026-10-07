@@ -40,16 +40,26 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 
 import { ZcodeAuth, isClaimUnusualActivity, toClaimOutcome } from '../../src/zcode-auth.js'
-import { describeUpstreamError, httpErrorCodeForZcode } from '../../src/zcode-adapter.js'
+import {
+  describeUpstreamError,
+  httpErrorCodeForZcode,
+  isZcodeCaptchaRejected,
+  isZcodeConcurrencyLimited,
+  isZcodeQuotaExhausted,
+} from '../../src/zcode-adapter.js'
+import { shouldFallbackToOtherChannel } from '../../src/zcode-transport.js'
 import {
   formatZcodeDiagnostic,
   formatZcodeUnusualActivityMessage,
   hasZcodeUnusualActivity,
   isZcodeUnusualActivityCode,
+  looksLikeZcodeHtmlPage,
   looksLikeZcodeUnusualActivity,
+  mentionsZcodeUnusualActivity,
   noteZcodeRequestOk,
   noteZcodeRequestSent,
   parseZcodeBusinessCode,
+  readZcodeBusinessCodeFromBody,
   resetZcodeDiagnostics,
 } from '../../src/zcode-diagnostics.js'
 import {
@@ -1071,5 +1081,519 @@ describe('IKJOQB 延伸：命中 3012 必须短路，不再加重冷却惩罚', 
     )) as unknown as typeof fetch
     await expect(claimZcodePlan(cred, 'p1', { param: 'x', region: 'cn' }, streamErr))
       .resolves.toMatchObject({ ok: false })
+  })
+})
+
+/**
+ * ★★ 边缘 CDN 的 HTML 错误页不得泄漏到用户可见文案里（Gitee issue IKJRM4 相关）。
+ *
+ * ## 缺陷本体（2026-10-07 实测，与会话日志逐字一致）
+ *
+ * 走边缘拦截时上游返回的是**阿里云 ESA 的 HTML 错误页**（`text/html`），
+ * 而 `describeUpstreamError` 的非 JSON 兜底是 `trimmed.slice(0, 200)`
+ * ⇒ 前 200 字符是 `<!doctypehtml>…<style>a,body,div,h2,html,p{m`，
+ * **CSS 选择器被当错误文案倒给用户**：
+ *
+ * ```
+ * zcode: HTTP 405：<!doctypehtml><html lang="zh-cn">…<title>405</title>…
+ * ```
+ *
+ * 三条代价：
+ * 1. HTML 里没有业务信息，用户读完不知道发生了什么；
+ * 2. 归因方向错 —— 边缘拦截属上游/网络层，与「额度」「凭据」无关，
+ *    按额度/凭据指引会让用户去充值或重新登录，白跑一趟；
+ * 3. 边缘页内容随 CDN 配置变化，把它的片段写进错误文案 ⇒ 将来无法复现。
+ *
+ * ## 与既有 3012 用例的分工
+ *
+ * 上面那些用例守的是「**业务层 JSON** 的 3012 要按风控报」；
+ * 本段守的是「**非 JSON 的 HTML 页**不能当业务错误报」。
+ * 两者互不覆盖：同一个 `405` + 不同的 `content-type` 必须给出不同结论。
+ */
+describe('边缘 CDN 的 HTML 错误页：不得当业务错误报（2026-10-07 实测）', () => {
+  /** 实测拿到的阿里云 ESA 错误页（截取前段，形态与真响应一致）。 */
+  const ESA_HTML =
+    '<!doctypehtml><html lang="zh-cn"><meta charset="utf-8">'
+    + '<meta http-equiv="X-UA-Compatible"content="IE=edge,chrome=1">'
+    + '<meta name="data-spm"content="a3c0e"><title>405</title>'
+    + '<style>a,body,div,h2,html,p{margin:0;padding:0}a{text-decoration:none;color:#3b6ea3}</style>'
+
+  it('ESA 页：文案不含任何 HTML 标签或 CSS 噪声', () => {
+    const msg = describeUpstreamError(405, ESA_HTML)
+    expect(msg).not.toMatch(/<!doctype|<html|<style|doctypehtml|<head|<body/i)
+    // 反向验证护栏：判据本身要真能命中（否则上面那条会「因为什么都没查到」而恒绿）
+    expect(msg).toContain('HTML')
+  })
+
+  it('ESA 页：说清「未到达服务端」且指明换账号无效', () => {
+    const msg = describeUpstreamError(405, ESA_HTML)
+    expect(msg).toContain('未到达')
+    // 方向性断言：换账号 / 重新登录对边缘拦截无效，必须写出来
+    expect(msg).toContain('更换账号无效')
+    // 反向断言：不得把边缘拦截说成额度或凭据问题
+    expect(msg).not.toContain('额度')
+    expect(msg).not.toContain('凭据失效')
+  })
+
+  it('各状态码一视同仁（400/403/404/429/5xx 都不该泄漏 HTML）', () => {
+    for (const status of [400, 403, 404, 405, 429, 500, 502, 503]) {
+      expect(describeUpstreamError(status, ESA_HTML), `status=${status}`)
+        .not.toMatch(/<!doctype|<html|<style/i)
+    }
+  })
+
+  it('通用 HTML 错误页（非 ESA）同样不被当业务错误', () => {
+    // 无 data-spm 特征，但确实是 HTML 页
+    const generic = '<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body>…</body></html>'
+    const msg = describeUpstreamError(502, generic)
+    expect(msg).not.toMatch(/<!doctype|<html|<head|<body/i)
+    expect(msg).toContain('HTML')
+  })
+
+  it('★ 业务层 JSON 的既有行为逐字未变（回归护栏）', () => {
+    // 3012：仍按风控报，且带冷却警告
+    const r3012 = describeUpstreamError(405, '{"code":3012,"msg":"request has been blocked due to unusual activity."}')
+    expect(r3012).toContain('3012')
+    expect(r3012).toContain('冷却')
+    expect(r3012).not.toMatch(/<!doctype|<html/i)
+
+    // 1005：仍按额度用尽报
+    const r1005 = describeUpstreamError(429, '{"code":1005,"msg":"daily limit exceeded"}')
+    expect(r1005).toContain('额度')
+    expect(r1005).not.toMatch(/<!doctype|<html/i)
+
+    // 401：仍指向 Jet Hub 面板
+    expect(describeUpstreamError(401, '{"code":1001,"msg":"unauthorized"}')).toContain('Jet Hub')
+  })
+
+  it('短的非 JSON 文本仍按原样截断（不回归既有兜底）', () => {
+    expect(describeUpstreamError(401, 'not json but short')).toContain('not json but short')
+  })
+})
+
+/**
+ * ★★★ 审计补漏：上面那组用例只覆盖了**文案侧**，且其中两条是恒真的同义反复
+ * （业务 JSON 走 `message` 分支时 `looksLikeHtmlPage` 根本不参与；
+ *  `'not json but short'` 不以 `<` 开头 ⇒ 恒走旧分支）。
+ *
+ * ## 本组锁的是真正的危害：边缘页会**误伤账号**（2026-10-07 端到端实测）
+ *
+ * 上面那组「文案不含 HTML」全绿时，**下面这些仍然成立**（修复前的真实行为）：
+ *
+ * ```
+ * status=429, body=<!doctypehtml>…<title>1005</title><style>a{width:1005px}</style>
+ *   stream() → isZcodeQuotaExhausted = true   （body.includes('1005') 裸子串）
+ *            → switchAccountOnQuota() 连换两个号
+ *            → pool.updateModelRateLimit(id, model, 次日 0 点)  ← 两个可用账号被封到次日
+ *   文案 = 「额度用尽…请更换账号。…：**更换账号无效**」  ← 自相矛盾
+ * ```
+ *
+ * ⇒ 判据侧（{@link isZcodeQuotaExhausted} / {@link shouldFallbackToOtherChannel} /
+ * {@link httpErrorCodeForZcode}）与文案侧**必须共用同一份** HTML 判据，
+ * 且 HTML 页必须在**分类之前**短路。
+ *
+ * ⚠ 判据与文案的**唯一出处**是 `zcode-diagnostics.ts` 的
+ * {@link looksLikeZcodeHtmlPage} / {@link formatZcodeEdgePageHint} ——
+ * 改那一处时这里必须跟着复核（少改一处就是又一次「只改了一半」）。
+ */
+describe('边缘 HTML 页：判据侧必须一并豁免（2026-10-07 端到端实测）', () => {
+  const ESA = '<!doctypehtml><html lang="zh-cn"><meta name="data-spm"content="a3c0e">'
+    + '<title>405</title><style>a,body,div{margin:0}</style></html>'
+  /** 边缘页里**恰好含 `1005`** —— CSS 值 / `<title>` / hash 都很容易撞上。 */
+  const ESA_1005 = `${ESA.replace('<title>405</title>', '<title>1005</title>')}<style>a{width:1005px}</style>`
+
+  describe('判据侧：HTML 页不得被当成任何业务码', () => {
+    it('★ `1005` 边缘页不得被判成额度用尽（否则换号 + 封账号到次日）', () => {
+      // ⚠ 这条是**封号**的根因：`isZcodeQuotaExhausted` 为真 ⇒ `switchAccountOnQuota()`
+      // ⇒ `updateModelRateLimit(id, model, nextUtc8DayStartMs())`。
+      // 拿掉这条 HTML 短路，下面 `describeUpstreamError` 的用例仍会全绿。
+      expect(isZcodeQuotaExhausted(429, ESA_1005)).toBe(false)
+      // ⚠ 同一个裸子串在换腿判据里也有一份
+      expect(shouldFallbackToOtherChannel(429, ESA_1005)).toBe(false)
+    })
+
+    it('`3007` 边缘页不得触发「补产 captcha 并重发」（白烧设备级验证配额）', () => {
+      const with3007 = `${ESA}<style>b{height:3007px}</style>`
+      expect(isZcodeCaptchaRejected(400, with3007)).toBe(false)
+      expect(isZcodeConcurrencyLimited(429, with3007)).toBe(false)
+    })
+
+    it('★ 错误码映射：HTML 页一律 `SERVER`（可退避重试，契合「稍后重试」）', () => {
+      /**
+       * ⚠ 最严重的一格是 `500`：修复前 `httpErrorCodeForZcode(500, 含1005的页)`
+       * 返回 `QUOTA_EXCEEDED`（**不在** `DEFAULT_RETRYABLE_CODES` 里），
+       * 于是一个本该自动退避重试 5 次的**瞬断 5xx** 只报一次错。
+       */
+      for (const status of [400, 401, 403, 404, 405, 429, 500, 502, 503]) {
+        expect(httpErrorCodeForZcode(status, ESA_1005), `status=${status}`).toBe('SERVER')
+      }
+
+      /**
+       * ⚠⚠ 加固（2026-10-07 变异审计 A4 打出的缺口）：上面那条在
+       * **去掉 HTML 短路后仍然全绿** —— 因为 `status >= 500` 的兜底也返回
+       * `SERVER`，把断言「喂饱」了 ⇒ 它**没有真正锁住**那处短路。
+       *
+       * ⇒ 这里额外锁住**兜底到不了**的档位，并顺带证明「页面里的业务码数字
+       * 不会把映射带偏」：
+       * - `405`：去掉短路后会走末尾 `return 'SERVER'`……仍相同 ⇒ 改用
+       *   **能被业务码劫持**的断言（见下），才能真正区分。
+       */
+      // ① 去掉短路后 `400` 会变成 `INVALID_REQUEST`（末尾兜底给的是它，不是 SERVER）
+      expect(httpErrorCodeForZcode(400, ESA_1005)).toBe('SERVER')
+      // ② `401`：去掉短路后会变 `AUTH`（业务分支先命中）
+      expect(httpErrorCodeForZcode(401, ESA_1005)).toBe('SERVER')
+      // ③ `429`：去掉短路后会变 `QUOTA_EXCEEDED`（`includes('1005')` 先命中，
+      //    因为 ESA_1005 里带 `1005`）—— 这是最尖锐的一格
+      expect(httpErrorCodeForZcode(429, ESA_1005)).toBe('SERVER')
+      // ④ `200` + 含 `3007` 的页：去掉短路后会变 `RATE_LIMIT`（captcha 分支）
+      expect(httpErrorCodeForZcode(200, `${ESA}<style>b{height:3007px}</style>`)).toBe('SERVER')
+    })
+  })
+
+  describe('文案侧：HTML 页不得进入任何业务分支的前缀', () => {
+    it('★ 401 边缘页：不得输出「凭据失效 / 重新添加登录」', () => {
+      /**
+       * ⚠ 修复前实测输出（**互斥指令**）：
+       * ```
+       * 凭据失效（401）。请在 Jet Hub 的 ZCode 面板删除该账号后重新添加登录。
+       * 上游返回的是边缘CDN 的 HTML 错误页…**更换账号无效**，建议稍后重试…
+       * ```
+       * 且该分支实测 `calls=1, marks=[]` ⇒ 删号纯属白跑，
+       * 用户会真去删掉一个完全健康的凭据。
+       */
+      const msg = describeUpstreamError(401, ESA)
+      expect(msg).not.toContain('凭据失效')
+      expect(msg).not.toContain('重新添加登录')
+      expect(msg).toContain('更换账号无效')
+    })
+
+    it('★ 页面里的 `1005` 不得把文案劫持成「额度用尽 / 请更换账号」', () => {
+      // 方向性断言：与「更换账号无效」**相反**的指令一律不得出现。
+      for (const status of [400, 401, 403, 404, 405, 429, 500, 502, 503]) {
+        const msg = describeUpstreamError(status, ESA_1005)
+        expect(msg, `status=${status}`).not.toContain('额度用尽')
+        expect(msg, `status=${status}`).not.toContain('余额不足')
+        expect(msg, `status=${status}`).not.toContain('凭据失效')
+      }
+    })
+
+    it('★ 状态码必须出现在文案里（逐档可对照，便于排查）', () => {
+      // ⚠ 通用分支把 `status` 写进了文案 —— 这条锁住它不被后续重构弄丢。
+      expect(describeUpstreamError(502, '<title>x</title><html><body>502</body></html>')).toContain('HTTP 502')
+      expect(describeUpstreamError(504, '<title>x</title><html><body>504</body></html>')).toContain('HTTP 504')
+    })
+
+    it('ESA 分支与通用分支必须可区分（防 ESA 分类退化成通用分支）', () => {
+      // 只断言 `toContain('HTML')` 是**恒真**的：两条分支文案都含「HTML」。
+      // 这里锁 ESA 专属措辞。
+      expect(describeUpstreamError(405, ESA)).toContain('边缘CDN')
+      expect(describeUpstreamError(405, '<html><body>502</body></html>')).not.toContain('边缘CDN')
+    })
+
+    it('页面标题过长时必须截断（标题由远端控制，别把它变成新的泄漏面）', () => {
+      const longTitle = 'x'.repeat(500)
+      const msg = describeUpstreamError(500, `<html><head><title>${longTitle}</title></head></html>`)
+      expect(msg).not.toContain(longTitle)
+      expect(msg.length).toBeLessThan(300)
+    })
+  })
+
+  describe('判据覆盖面：不能只认 <!doctype> 与 <html>', () => {
+    /**
+     * ⚠ 这六个形态在真实 CDN / 网关错误页里都常见。修复前的判据
+     * （三条枚举：`<!doctype|html|head|body` 前缀 / `<?xml` / `contains('<html')`）
+     * **全部漏判**它们 ⇒ 标签噪声原样倒给用户，且完全绕过新提示。
+     */
+    it.each([
+      ['<title> 开头', '<title>405 Not Allowed</title>'],
+      ['<meta> 开头', '<meta charset="utf-8">'],
+      ['<div> 开头', '<div class="err">504</div>'],
+      ['XML Error 文档（AWS/S3 形态）', '<Error><Code>AccessDenied</Code></Error>'],
+      ['JSON 包在 <pre> 里', '<pre>{"code":1005,"msg":"quota"}</pre>'],
+      ['<script> 开头', '<script>window.x=1</script><html><body>err</body></html>'],
+    ])('%s 不得泄漏标签', (_name, body) => {
+      const msg = describeUpstreamError(500, body)
+      expect(msg).not.toMatch(/<!doctype|<html|<head|<body|<title|<meta|<div|<Error|<pre|<script/i)
+      expect(msg).toContain('更换账号无效')
+    })
+
+    it.each([
+      ['BOM 前缀', '﻿<!doctype html><html><title>502</title></html>'],
+      ['注释开头', '<!-- cached --><!doctype html><html>'],
+      ['前导换行空白', '\n\n  <html>\n<head><title>502</title>'],
+      ['XML 声明', '<?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>'],
+    ])('%s 必须被识别为页面', (_name, body) => {
+      expect(describeUpstreamError(500, body)).toContain('更换账号无效')
+    })
+
+    it('★ 方向不得反：带尖括号的**纯文本**不是页面', () => {
+      /**
+       * ⚠ 判据放宽容易走到另一个极端：用 `^<[a-z]+` 通配会把
+       * `<service unavailable, retry later>` 这种**带尖括号的服务端文本**
+       * 误判成页面 ⇒ 用户看不到上游的真实原因。
+       */
+      const msg = describeUpstreamError(503, '<service unavailable, retry later>')
+      expect(msg).toContain('<service unavailable, retry later>')
+      expect(msg).not.toContain('更换账号无效')
+    })
+
+    it('★ 业务层 JSON 恒不被当成页面（JSON 不能以 `<` 开头）', () => {
+      // 含 `<` 的 JSON 字符串也必须照常走业务分支。
+      const msg = describeUpstreamError(405, '{"code":3012,"msg":"blocked <script>"}')
+      expect(msg).toContain('3012')
+      expect(msg).toContain('冷却')
+    })
+
+    /**
+     * ⚠⚠ **优先级护栏：可解析出业务码时绝不按页面处理**（2026-10-07 复核实测）。
+     *
+     * 实测踩到的坑：短路写在业务码解析**之前**，于是
+     * `<Error><Code>Blocked</Code>…` 这类「既像页面又带权威码」的报文
+     * 被降级成 `SERVER`（**稍后重试**），而它本该是 `PERMISSION`（**别重试**，
+     * 有冷却惩罚）—— 两个用户动作**完全相反**，反复重试会把 30 分钟推成 24 小时。
+     *
+     * ⇒ 判据必须与 {@link hasZcodeUnusualActivity} 的「**有码 ⇒ 只信码**」一致。
+     */
+    it('★ 有权威业务码时报文不得被降级成「稍后重试」', () => {
+      for (const [body, expected] of [
+        ['{"code":3012,"msg":"request has been blocked due to unusual activity."}', 'PERMISSION'],
+        ['{"code":"3012","msg":"blocked"}', 'PERMISSION'],
+        ['{"code":1005,"msg":"exceed quota limit"}', 'QUOTA_EXCEEDED'],
+      ] as const) {
+        expect(readZcodeBusinessCodeFromBody(body), body).toBeDefined()
+        expect(httpErrorCodeForZcode(405, body), body).toBe(expected)
+      }
+      // 3012 必须仍带「别重试」的冷却警告
+      expect(describeUpstreamError(405, '{"code":3012,"msg":"request has been blocked due to unusual activity."}'))
+        .toContain('冷却')
+    })
+
+    it('无权威码、无风控语义的标签形态才按页面处理（三条判据的分工）', () => {
+      /**
+       * ⚠ 这条与上面「标签包裹的风控报文」是一**对**：
+       * 前者带 `unusual activity` ⇒ 业务语义优先；本条**不带** ⇒ 页面优先。
+       * 两者必须同时成立，否则就是「一律按页面」或「一律按业务」——
+       * 那两种极端都会在真实流量上出错。
+       *
+       * ⚠ 举例刻意**避开** `<Error><Code>Blocked</Code><Message>unusual activity…`
+       * ——它带风控语义，归业务分支（见上面那条）。
+       */
+      const page = '<Error><Code>AccessDenied</Code><Message>Forbidden</Message></Error>'
+      expect(readZcodeBusinessCodeFromBody(page)).toBeUndefined()
+      expect(looksLikeZcodeHtmlPage(page)).toBe(true)
+      expect(httpErrorCodeForZcode(405, page)).toBe('SERVER')
+    })
+
+    /**
+     * ⚠⚠ **标签包裹的业务报文：不得被降级成「稍后重试」**（2026-10-07 变异审计打出）。
+     *
+     * 上游会把业务码包在零散标签里下发：
+     *
+     * ```
+     * <h1>Error 3012</h1> request has been blocked due to unusual activity.
+     * ```
+     *
+     * 它含 `</h1>` ⇒ {@link looksLikeZcodeHtmlPage} 判它**是**页面；
+     * 而若 HTML 短路不看业务语义，它就被降级成 `SERVER`（**稍后重试**），
+     * 但这形态本该是 `PERMISSION`（**别重试**，有冷却惩罚）。
+     *
+     * ⇒ 判据层只答「像不像页面」，**优先级必须由消费层决定**：
+     * 「有码 ⇒ 只信码；无码但有业务语义 ⇒ 也不是页面」。
+     */
+    it.each([
+      ['<h1>Error 3012</h1> request has been blocked due to unusual activity.'],
+      ['<h1>Error 3012</h1>upstream connect timeout and unusual activity detected'],
+      ['<Error><Code>Blocked</Code><Message>unusual activity</Message></Error>'],
+    ])('标签包裹的风控报文必须仍是 PERMISSION：%s', (body) => {
+      expect(looksLikeZcodeHtmlPage(body)).toBe(true)
+      expect(readZcodeBusinessCodeFromBody(body)).toBeUndefined()
+      expect(httpErrorCodeForZcode(405, body)).toBe('PERMISSION')
+      expect(describeUpstreamError(405, body)).toContain('冷却')
+    })
+
+    it('剥标签不得破坏既有的反例保护', () => {
+      // ⚠ 这条锁的是**不引入**剥标签兜底后的边界：限流不得被误判成风控
+      // （两个用户动作相反，见 mentionsZcodeUnusualActivity 的反例表）。
+      expect(hasZcodeUnusualActivity('too many requests, retry after 3012 ms')).toBe(false)
+      expect(hasZcodeUnusualActivity('<h1>429</h1> too many requests, retry after 3012 ms')).toBe(false)
+      // 带尖括号的纯文本恒不命中
+      expect(hasZcodeUnusualActivity('<service unavailable, retry later>')).toBe(false)
+    })
+
+    it('★ 标签包裹的风控：靠主判据命中，不靠剥标签', () => {
+      /**
+       * ⚠ 实测记录（2026-10-07）：曾给 {@link hasZcodeUnusualActivity} 加一条
+       * 「剥掉标签再判一遍」的兜底，**实测证明是多余的** ——
+       * 8 种标签形态全都靠主判据（`unusual activity` / `blocked due to`）命中，
+       * 剥不剥标签结果完全一样；而剥标签会把相邻文本粘在一起
+       * （`blocked</b><i>3012` → `blocked3012`）从而**破坏词边界**，
+       * 即「为一条用不上的兜底制造新的漏判」。故已删除那段代码。
+       *
+       * ⇒ 本用例锁住「不靠剥标签也判得对」这个事实，
+       * 免得后人再把那段冗余兜底加回来。
+       */
+      for (const body of [
+        '<h1>Error 3012</h1> request has been blocked due to unusual activity.',
+        '<Error><Code>Blocked</Code><Message>unusual activity</Message></Error>',
+      ]) {
+        // 主判据直接命中，未剥标签
+        expect(mentionsZcodeUnusualActivity(body), body).toBe(true)
+        expect(hasZcodeUnusualActivity(body), body).toBe(true)
+      }
+      // 而**不带**风控语义的同类形态不该命中（否则会把普通网关页判成风控）
+      expect(hasZcodeUnusualActivity('<h1>Error 3012</h1>upstream connect timeout')).toBe(false)
+    })
+
+    it('★ 极简错误页只有一个标题标签时也必须识别为页面', () => {
+      /**
+       * ⚠ 这条是**收窄判据时的实测退步**：`chunks.every(...)`（要求整篇都是标签）
+       * 会把 `<h1>Gateway Timeout</h1>` 判成非页面 ⇒ `429` 下走进
+       * 「并发限流」分支。真实 CDN/网关的极简错误页正是这个形态。
+       */
+      for (const page of ['<h1>Gateway Timeout</h1>', '<h1> 502 Bad Gateway </h1>', '<hgroup>content</hgroup>']) {
+        expect(looksLikeZcodeHtmlPage(page), page).toBe(true)
+        expect(describeUpstreamError(429, page)).toContain('更换账号无效')
+      }
+    })
+  })
+
+  describe('共享判据本身（判据与文案同源，两侧都必须改）', () => {
+    it('判据与调用方同口径：`describeUpstreamError` 认的，它必须也认', () => {
+      /**
+       * ⚠ 这条是**防漂移**的闸门：判据住在 `zcode-diagnostics.ts`，调用方在
+       * `zcode-adapter.ts` / `zcode-transport.ts`。两边一旦各自写一份判据，
+       * 就会重演 `3012` 那次「文案侧收窄了、映射侧没跟上」（同型第三次）。
+       */
+      const bodies = [ESA, ESA_1005, '<title>405</title>', '<Error><Code>X</Code></Error>']
+      for (const body of bodies) {
+        expect(looksLikeZcodeHtmlPage(body)).toBe(true)
+        expect(describeUpstreamError(500, body)).toContain('更换账号无效')
+      }
+    })
+
+    it('判据对「带尖括号纯文本」恒为 false（不得反向误伤）', () => {
+      expect(looksLikeZcodeHtmlPage('<service unavailable, retry later>')).toBe(false)
+      expect(looksLikeZcodeHtmlPage('not json at all')).toBe(false)
+      expect(looksLikeZcodeHtmlPage('{"code":1005}')).toBe(false)
+      expect(looksLikeZcodeHtmlPage('')).toBe(false)
+    })
+
+    it('★ 判据③：非白名单根标签、但有闭合标签 ⇒ 必须被兜住', () => {
+      /**
+       * ⚠ 判据③ 的**唯一存在理由**就是兜住白名单没收的根标签。
+       * 实测删掉判据③ 后**全部既有用例仍绿**（白名单把常见形态都盖住了），
+       * ⇒ 这条用例就是为「有人删掉判据③」而加的锁。
+       */
+      expect(looksLikeZcodeHtmlPage('<Blocked><Reason>WAF</Reason></Blocked>')).toBe(true)
+      expect(looksLikeZcodeHtmlPage('<x-custom-thing>denied</x-custom-thing>')).toBe(true)
+    })
+
+    it('★ `startsWith('<')` 守卫：不以 `<` 开头即便含闭合标签也不得判成页面', () => {
+      /**
+       * ⚠ 这条守的是**误判方向**：上游纯文本里偶尔带 `</h1>` 这类残留片段，
+       * 去掉守卫它就会被当成页面 ⇒ 用户看不到上游的真实原因。
+       * 实测删掉守卫后既有用例同样全绿，故必须显式锁定。
+       */
+      expect(looksLikeZcodeHtmlPage('upstream connect timeout</h1>')).toBe(false)
+      expect(looksLikeZcodeHtmlPage('blocked</Error>')).toBe(false)
+    })
+
+    it('标题截断必须带省略号（否则 40 与 41 字符输出完全一样）', () => {
+      const msg40 = describeUpstreamError(500, `<html><head><title>${'B'.repeat(40)}</title></head></html>`)
+      const msg41 = describeUpstreamError(500, `<html><head><title>${'B'.repeat(41)}</title></head></html>`)
+      expect(msg40).not.toContain('…')
+      expect(msg41).toContain('…')
+    })
+
+    it('★ 白名单的**唯一不可替代**职责：无闭合标签的页面形态', () => {
+      /**
+       * ⚠ 实测（变异验证）：清空整个白名单后，`<title>405</title>` / `<div>…</div>` /
+       *   `<script>` / `<pre>` / `<Error>` 这些用例**仍然全绿** —— 它们全靠
+       *   判据③的「存在闭合标签」兜住。
+       * ⇒ 白名单真正被锁住的只有**没有闭合标签**的形态（判据③对它们无效）。
+       *
+       * ⚠ 若哪天有人删掉白名单，下面的用例会红；不补的话就是**静默降级**
+       * （边缘页漏判 ⇒ 账号被封到次日，正是本次修的那个缺陷）。
+       */
+      for (const page of [
+        '<meta charset="utf-8">',
+        '<link rel="stylesheet" href="/x.css">',
+        '<base href="/">',
+      ]) {
+        expect(looksLikeZcodeHtmlPage(page), page).toBe(true)
+        // 不止判据为真，消费侧也必须真的走页面分支
+        expect(describeUpstreamError(500, page), page).toContain('更换账号无效')
+      }
+    })
+  })
+
+  /**
+   * ★★★ **领取路径**必须与推理侧同口径（2026-10-07 审计打出的同型漏网）。
+   *
+   * `zcode-upstream.ts` 的 `claimZcodePlan` 里有一份**同形**的判据与文案兜底，
+   * 它此前既没豁免 HTML、又把 `slice(0,200)` 的 HTML 噪声当文案。
+   *
+   * 危害实测（比文案难看严重得多）：
+   * `<html><body>request has been blocked due to unusual activity.</body></html>`
+   * ⇒ `hasZcodeUnusualActivity` 为真 ⇒ `code` 被归一成 `3012`
+   * ⇒ `zcode-auth.ts` 的 `isClaimUnusualActivity` 命中 ⇒ **短路本账号剩余 plan**，
+   *   文案写「冷却惩罚 30 分钟→24 小时→停用」。
+   *
+   * ⇒ 一次**边缘拦截**被报成「账号风控、别重试」，还跳过了本可领取的 plan。
+   */
+  describe('领取路径：与推理侧共用同一份判据与文案', () => {
+    const ESA =
+      '<!doctypehtml><html lang="zh-cn"><meta name="data-spm"content="a3c0e">'
+      + '<title>405</title><style>a{color:red}</style></html>'
+
+    it('★ 边缘页不得被归一成 3012 风控', async () => {
+      const outcome = await claimZcodePlan(
+        { zcode_jwt: 'jwt', device_mid: 'mid' } as never,
+        'plan-1',
+        { param: 'p', region: 'cn' },
+        (async () => new Response(ESA, { status: 405, headers: { 'content-type': 'text/html' } })) as never,
+      )
+      expect(outcome.code).toBeUndefined()
+      expect(isClaimUnusualActivity(outcome)).toBe(false)
+    })
+
+    it('★ 含风控语义短语的边缘页同样不得归一成 3012（剥标签会命中语义，必须先豁免）', async () => {
+      const body = '<html><body>request has been blocked due to unusual activity.</body></html>'
+      // ⚠ 先证明「剥标签后语义判据确实会命中」—— 否则本用例是恒真的
+      expect(hasZcodeUnusualActivity(body.replace(/<[^>]*>/g, ''))).toBe(true)
+      const outcome = await claimZcodePlan(
+        { zcode_jwt: 'jwt', device_mid: 'mid' } as never,
+        'plan-1',
+        { param: 'p', region: 'cn' },
+        (async () => new Response(body, { status: 405, headers: { 'content-type': 'text/html' } })) as never,
+      )
+      expect(outcome.code).toBeUndefined()
+      expect(isClaimUnusualActivity(outcome)).toBe(false)
+    })
+
+    it('★ 展示侧不得再泄漏 HTML 噪声', async () => {
+      const outcome = await claimZcodePlan(
+        { zcode_jwt: 'jwt', device_mid: 'mid' } as never,
+        'plan-1',
+        { param: 'p', region: 'cn' },
+        (async () => new Response(ESA, { status: 405, headers: { 'content-type': 'text/html' } })) as never,
+      )
+      expect(outcome.message).not.toMatch(/<!doctype|<html|<style/i)
+      expect(outcome.message).toContain('更换账号无效')
+    })
+
+    it('业务 JSON 路径逐字未变（回归护栏）', async () => {
+      const outcome = await claimZcodePlan(
+        { zcode_jwt: 'jwt', device_mid: 'mid' } as never,
+        'plan-1',
+        { param: 'p', region: 'cn' },
+        (async () => new Response(
+          '{"code":3012,"msg":"request has been blocked due to unusual activity."}',
+          { status: 405, headers: { 'content-type': 'application/json' } },
+        )) as never,
+      )
+      expect(outcome.code).toBe(3012)
+      expect(isClaimUnusualActivity(outcome)).toBe(true)
+    })
   })
 })

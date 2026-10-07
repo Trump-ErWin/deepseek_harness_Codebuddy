@@ -20,12 +20,35 @@ const LOCAL_NOTES = resolve(here, '../../docs/loomy-protocol-notes.md')
 const hasLocalNotes = existsSync(LOCAL_NOTES)
 
 /**
- * 文档回归：Loomy 的**特有差异**必须写进 README/AGENTS.md，
+ * 文档回归：Loomy 的**特有差异**必须写进文档，
  * 否则后来者会按其余 7 个 provider 的直觉改坏它。
+ *
+ * ⚠️ **2026-10-06 落点变更**：README 改为**只写「怎么用」**，全部实现细节
+ * （协议、端点、登录流程、实测数据、事故史）搬到 **不入库**的
+ * `docs/implementation-notes.md`。
+ *
+ * 故这里引入 {@link implNotes} 作为「实现细节的文档面」，凡是断言
+ * **实现性事实**的用例（生产域名、`dailyBalance > 0`、`纯 API 直领`、
+ * `60 秒`缓存、负载均衡档位等）都改打在这个合并视图上 ——
+ * 文档回归要守护的是「这些约定**在某处成文**」，而不是「必须长在 README 里」；
+ * 否则每次调整文档分层都会让用例变红，而那不是文档缺约定，是测试追着旧落点打。
+ *
+ * ⚠️ **`docs/implementation-notes.md` 不入库**（`.gitignore`）。干净克隆与 CI
+ * 里它**不存在** ⇒ 读取时必须**容错回落到空串**，否则整份套件会因 ENOENT
+ * 变成 Failed Suite（同 `cline-icon.spec.ts` / `loomy-protocol-notes` 的手法）。
+ * 这是**测试自身对本地私有产物的依赖**，不是产品缺陷。
  */
+const implNotesPath = resolve(here, '../../docs/implementation-notes.md')
+
 describe('Loomy 文档覆盖', () => {
   const readme = read('../../README.md')
   const agents = read('../../AGENTS.md')
+  /** 实现细节的文档面（不入库；缺失时为空串，见文件头）。 */
+  const implNotes = existsSync(implNotesPath) ? readFileSync(implNotesPath, 'utf8') : ''
+  /**
+   * 「面向用户的用法面 + 实现细节面」的合并视图 —— 实现性断言打在这里。
+   */
+  const docsFull = `${readme}\n${implNotes}`
   /**
    * 文档面 = 主 AGENTS.md + docs/agent-notes/*.md 的**合并视图**（2026-10-06 拆分）。
    *
@@ -49,41 +72,47 @@ describe('Loomy 文档覆盖', () => {
     expect(readme).toMatch(/Loomy[\s\S]{0,4000}?(不能|无法|没有).{0,12}续期/)
   })
 
-  it('README 写明两套认证头（chat 用 Bearer、业务用 token）', () => {
-    expect(readme).toMatch(/Bearer[\s\S]{0,600}?token/)
+  it('文档写明两套认证头（chat 用 Bearer、业务用 token）', () => {
+    expect(docsFull).toMatch(/Bearer[\s\S]{0,600}?token/)
   })
 
   it('README 写明新手任务 10000 积分与「纯 API 直领」', () => {
-    expect(readme).toMatch(/10000/)
-    expect(readme).toMatch(/纯 API 直领/)
+    expect(docsFull).toMatch(/10000/)
+    expect(docsFull).toMatch(/纯 API 直领/)
   })
 
   it('README 写明积分两池（永久 + 每日）', () => {
-    expect(readme).toMatch(/永久积分/)
-    expect(readme).toMatch(/每日赠送/)
+    expect(docsFull).toMatch(/永久积分/)
+    expect(docsFull).toMatch(/每日赠送/)
   })
 
   it('README 写明生产域名（不再解释测试域名的来历）', () => {
-    expect(readme).toContain('loomyad.xunfei.cn')
-    expect(readme).toContain('account.xfinfr.com')
+    expect(docsFull).toContain('loomyad.xunfei.cn')
+    expect(docsFull).toContain('account.xfinfr.com')
   })
 
   it('README 记录 e2e 探针命令', () => {
-    expect(readme).toContain('pnpm test:e2e:loomy')
-    expect(readme).toContain('pnpm test:e2e:loomy-chat')
+    expect(docsFull).toContain('pnpm test:e2e:loomy')
+    expect(docsFull).toContain('pnpm test:e2e:loomy-chat')
   })
 
   /**
-   * ⚠️ **用户要求**：以下四类内容**不得**出现在 README / AGENTS.md 的
-   * **Loomy 章节**，只能放在**不入库**的 `docs/loomy-protocol-notes.md`：
+   * ⚠️ **用户要求**：以下四类内容**不得**出现在公开文档的 **Loomy 章节**，
+   * 只能放在**不入库**的 `docs/loomy-protocol-notes.md`：
    *
    * ① 排查脚本清单（`scripts/loomy-*`）
    * ② AccessKey 说明（具体值 / `accessKeyId` / `accessKeySecret`）
    * ③ 加密细节（`.env.prod`、解密口令、`env-file-crypto`、AES）
    * ④ `app.asar` 提取方式
    *
-   * ⚠️ **必须限定在 Loomy 章节内**：AGENTS.md 的 **Qoder 章节**也提到
-   * `app.asar`（既有内容，不在本次要求范围）。全文匹配会误伤它。
+   * ⚠️ **2026-10-06 落点变更**：README 已改为只写「怎么用」，Loomy 的实现细节
+   * 整体搬进 `docs/implementation-notes.md`（同样**不入库**）。故扫描面从
+   * 「README 的 Loomy 章节」改成「README 全文 + implementation-notes 的 Loomy 章节」
+   * —— 两处都是**公开或半公开**的文档面，禁用词在哪儿都不该出现。
+   *
+   * ⚠️ **implementation-notes 章节必须以「下一个二级标题」为界**：它由整份
+   * README 迁出，含全部 provider 章节，截到末尾会把 Raccoon 的正文
+   * （合法提到 `app.asar`）一并纳入禁用词扫描，造成**误报**。
    */
   it('Loomy 章节不含脚本清单 / AccessKey / 加密细节（用户要求）', () => {
     // 截取 Loomy 章节（从标题到**下一个二级标题**为止）。
@@ -110,7 +139,10 @@ describe('Loomy 文档覆盖', () => {
     //    （不能打 agentsFull 合并视图：其它笔记合法提到 app.asar 会误报）。
     const loomyNotes = read('../../docs/agent-notes/providers-loomy-raccoon-minimax.md')
     const agentsLoomy = loomySectionOf(loomyNotes)
-    expect(readmeLoomy.length, 'README 未找到 Loomy 章节').toBeGreaterThan(0)
+    // ⚠️ 迁出后的实现细节文档（不入库；缺失时为空串 ⇒ 该条退化为只扫 README/agent-notes）。
+    const implLoomy = loomySectionOf(implNotes)
+    expect(readmeLoomy.length + implLoomy.length, 'README 与 implementation-notes 均未找到 Loomy 章节')
+      .toBeGreaterThan(0)
     expect(agentsLoomy.length, 'agent-notes 未找到 Loomy 章节').toBeGreaterThan(0)
 
     const forbidden: [string, RegExp][] = [
@@ -124,6 +156,7 @@ describe('Loomy 文档覆盖', () => {
     ]
     for (const [label, pattern] of forbidden) {
       expect(readmeLoomy, `README 的 Loomy 章节不应含「${label}」`).not.toMatch(pattern)
+      expect(implLoomy, `implementation-notes 的 Loomy 章节不应含「${label}」`).not.toMatch(pattern)
       expect(agentsLoomy, `AGENTS.md 的 Loomy 章节不应含「${label}」`).not.toMatch(pattern)
     }
   })
@@ -191,13 +224,13 @@ describe('Loomy 文档覆盖', () => {
    * 真实缺陷：Loomy **不会因积分耗尽而报错**（静默降级为扣永久积分），
    * 故既有「限流 → 换号」对它无效，会一直烧同一个号。
    */
-  it('README 写明按余额优先选号的负载均衡策略', () => {
-    expect(readme).toMatch(/负载均衡/)
-    expect(readme).toMatch(/dailyBalance > 0/)
-    expect(readme).toMatch(/permanentBalance > 0/)
+  it('文档写明按余额优先选号的负载均衡策略', () => {
+    expect(docsFull).toMatch(/负载均衡/)
+    expect(docsFull).toMatch(/dailyBalance > 0/)
+    expect(docsFull).toMatch(/permanentBalance > 0/)
     // 三个关键约定
-    expect(readme).toMatch(/手动顺序/)
-    expect(readme).toMatch(/60 秒/)
+    expect(docsFull).toMatch(/手动顺序/)
+    expect(docsFull).toMatch(/60 秒/)
   })
 
   it('AGENTS.md 写明「Loomy 不会因积分耗尽报错」与三条不可改的约定', () => {
