@@ -759,6 +759,35 @@ export class AccountPool {
     }
   }
 
+  /**
+   * **只追加**账号（合并导入用）：已有的 id 一律跳过，返回**实际新增**的 id。
+   *
+   * ⚠️ 与 {@link replaceAll} 的差别是本质的，不要互相替换：
+   * - 只调用 `writeAccounts`（账号 + 黑名单整体写回，但黑名单取**当前**值），
+   *   因此**不改**模型黑名单，也**不触碰**锁定表（它住在独立文档里）；
+   * - 绝不删除或覆盖任何现有账号 —— 判重按 `id`，这是账号的唯一键；
+   * - 入参同样经 `sanitizeAccounts` 归一化：数据来自用户提供的文件，
+   *   坏条目丢弃而不是写进池里反复触发选号失败。
+   *
+   * ⚠️ **文件内部重复的 id 也要去重**（同一批次里两次同 id 只新增一次）：
+   * 备份文件可能被手工编辑过，重复条目会在池里留下两条同 id 的账号，
+   * 之后 `updateAccount` / `removeAccount` 按 id 查找只会命中第一条，
+   * 出现「删不掉、改不动」的幽灵账号。
+   */
+  async mergeAccounts(accounts: readonly ProviderAccountEntry[]): Promise<string[]> {
+    const current = this.readAccounts()
+    const existing = new Set(current.map(entry => entry.id))
+    const added: ProviderAccountEntry[] = []
+    for (const entry of sanitizeAccounts(accounts)) {
+      if (existing.has(entry.id)) continue
+      existing.add(entry.id)
+      added.push(entry)
+    }
+    if (added.length === 0) return []
+    await this.writeAccounts([...current, ...added])
+    return added.map(entry => entry.id)
+  }
+
   /** 更新账号部分字段 */
   async updateAccount(
     id: string,
