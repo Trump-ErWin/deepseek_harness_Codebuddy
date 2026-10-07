@@ -814,6 +814,67 @@ describe('AccountPool', () => {
       const list = await pool.listAllAccounts()
       expect(list.map(a => a.id)).toEqual(['buddy-001'])
     })
+
+    /**
+     * ⚠️ `mergeAccounts` 是「单独导入一个账号」的落地点，
+     * 它必须与 `replaceAll` 的**覆盖**语义严格相反。
+     */
+    it('mergeAccounts 只追加，不删不覆盖现有账号', async () => {
+      await pool.addAccount(makeMockAccount())
+      const added = await pool.mergeAccounts([
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_002' }),
+      ])
+      expect(added).toEqual(['buddy-002'])
+      // ⚠️ 现有账号必须还在：这是「只增加」与「整体替换」的分水岭。
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['buddy-001', 'buddy-002'])
+    })
+
+    it('mergeAccounts 跳过同 id 的现有账号（不覆盖其条目）', async () => {
+      await pool.addAccount(makeMockAccount({ nickname: '原名' }))
+      const added = await pool.mergeAccounts([
+        makeMockAccount({ nickname: '备份里的名字' }),
+      ])
+      expect(added).toEqual([])
+      const list = await pool.listAllAccounts()
+      expect(list).toHaveLength(1)
+      // 昵称仍是本机那个 —— 跳过意味着**一点都不改**。
+      expect(list[0]!.nickname).toBe('原名')
+    })
+
+    it('mergeAccounts 不改模型黑名单与永久积分锁定', async () => {
+      await pool.setModelDisabled('buddy', 'glm-5.2', true)
+      await pool.setPermanentLocked('buddy', true)
+      await pool.mergeAccounts([
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_002' }),
+      ])
+      expect(pool.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
+      expect(pool.permanentLocked('buddy')).toBe(true)
+    })
+
+    it('mergeAccounts 归一化坏条目并丢弃（与 replaceAll 同口径）', async () => {
+      const added = await pool.mergeAccounts([
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_002' }),
+        { id: 'broken', provider: 'buddy' } as ProviderAccountEntry,
+      ])
+      expect(added).toEqual(['buddy-002'])
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['buddy-002'])
+    })
+
+    it('mergeAccounts 文件内重复 id 只新增一次', async () => {
+      const added = await pool.mergeAccounts([
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_002' }),
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_002' }),
+      ])
+      expect(added).toEqual(['buddy-002'])
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['buddy-002'])
+    })
+
+    it('mergeAccounts 全部已存在时不落盘（避免无意义的写与广播）', async () => {
+      await pool.addAccount(makeMockAccount())
+      const added = await pool.mergeAccounts([makeMockAccount()])
+      expect(added).toEqual([])
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['buddy-001'])
+    })
   })
 })
 

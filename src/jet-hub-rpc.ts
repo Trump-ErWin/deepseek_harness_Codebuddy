@@ -225,6 +225,8 @@ import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
 import type {
   ProviderAccountEntry,
+  BackupImportMode,
+  RpcBackupExportRequest,
   RpcBackupExportResponse,
   RpcBackupImportRequest,
   RpcBackupImportResponse,
@@ -4207,14 +4209,21 @@ function registerJetHubEndpoints(
 
       // ── 账号备份（导出 / 导入）──
       //
-      // 目的：更换 DSH 版本时迁移账号凭据。备份文件是**自包含**的 JSON
-      // （账号索引 + 凭据原文 + 模型黑名单，见 src/backup.ts），与 DSH 版本
-      // 无关 —— 导入时按**当前版本**的存储契约重建，天然跨版本。
+      // 目的：更换 DSH 版本时迁移账号凭据，以及**单独**把某个账号搬到另一台
+      // 机器。备份文件是**自包含**的 JSON（账号索引 + 凭据原文 + 模型黑名单，
+      // 见 src/backup.ts），与 DSH 版本无关 —— 导入时按**当前版本**的存储契约
+      // 重建，天然跨版本。
       //
       // 安全约定：加密在浏览器侧完成（PBKDF2 + AES-GCM），RPC 只接收/返回
       // 明文载荷；明文 JSON 不经过本层持久化与日志。
       case 'backup.export': {
-        const result = await exportBackup(pool, ctx.credentials)
+        const req = (payload ?? {}) as RpcBackupExportRequest
+        // accountIds 只作用于 accounts / credentials 两个字段；黑名单与锁定表
+        // 仍是全量，故产物始终是一份可整体还原的自包含快照。
+        const accountIds = Array.isArray(req.accountIds)
+          ? req.accountIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+          : undefined
+        const result = await exportBackup(pool, ctx.credentials, { accountIds })
         const value: RpcBackupExportResponse = {
           payload: result.payload,
           warnings: result.warnings,
@@ -4222,18 +4231,30 @@ function registerJetHubEndpoints(
         return { ok: true, value }
       }
 
-      // 导入 = 整体替换（还原快照，不是合并）。写入顺序刻意「先凭据、后账号池」：
-      // 账号池整体替换成功后，门控（hasLoggedInAccount）与黑名单立即反映新状态；
-      // 若凭据写入中途失败（非法 ref 等），只跳过该条、不中断整体。
+      // 导入有两种模式：
+      // - `replace`（缺省）= 整体替换（还原快照，不是合并）；
+      // - `merge` = 只追加，按 id 跳过已存在的账号，不碰黑名单与锁定表。
+      // 写入顺序刻意「先凭据、后账号池」：账号池写入成功后，门控
+      // （hasLoggedInAccount）与黑名单立即反映新状态；若凭据写入中途失败
+      // （非法 ref 等），只跳过该条、不中断整体。
+      //
+      // ⚠️ 模式必须显式取白名单，不能把请求里的任意字符串透传下去：未知值
+      // 会被 importBackup 的 `?? 'replace'` 静默当成整体替换 —— 那时用户以为
+      // 只是「加一个账号」，实际账号池被清空，属于不可逆的数据损失。
       case 'backup.import': {
         const req = payload as RpcBackupImportRequest
-        const result = await importBackup(ctx.credentials, pool, req.payload)
+        const mode: BackupImportMode = req?.mode === 'merge' ? 'merge' : 'replace'
+        const result = await importBackup(ctx.credentials, pool, req.payload, { mode })
         // 导入会改变账号集合（门控依赖 hasLoggedInAccount）与模型黑名单，
         // 必须广播目录变更，否则界面仍显示旧目录。
         broadcastCatalogChanged(ctx)
+        if (mode === 'merge') {
+          ctx.logger.info(`[jet-hub] 合并导入：新增 ${result.accountsImported} 个账号，跳过 ${result.accountsSkipped.length} 个已存在`)
+        }
         const value: RpcBackupImportResponse = {
           credentialsImported: result.credentialsImported,
           accountsImported: result.accountsImported,
+          accountsSkipped: result.accountsSkipped,
           skipped: result.skipped,
           expiredAccounts: result.expiredAccounts,
           missingCredentials: result.missingCredentials,
@@ -4241,14 +4262,22 @@ function registerJetHubEndpoints(
         return { ok: true, value }
       }
 
-      // 账号池统计（导入前的覆盖提示用）：缺 expiresAt 的条目疑似 DSH 版本
-      // 切换后自动恢复的产物（反推不读凭据值，故无有效期）。前端据此在
-      // 确认导入前提示用户「有 N 个自动恢复的账号将被整体覆盖」。
+      // 账号池统计（导入前的覆盖提示用，也供导出弹窗勾选账号）：缺 expiresAt
+      // 的条目疑似 DSH 版本切换后自动恢复的产物（反推不读凭据值，故无有效期）。
+      // 前端据此在确认导入前提示用户「有 N 个自动恢复的账号将被整体覆盖」，
+      // 并在导出时列出可勾选的账号。
       case 'backup.status': {
         const state = pool.getStateSnapshot()
         const value: RpcBackupStatusResponse = {
           accounts: state.accounts.length,
           withoutExpiry: state.accounts.filter((entry) => entry.expiresAt === undefined).length,
+          // 只给展示字段：凭据内容绝不进这条响应。
+          accountList: state.accounts.map((entry) => ({
+            id: entry.id,
+            provider: entry.provider,
+            nickname: entry.nickname,
+            enabled: entry.enabled,
+          })),
         }
         return { ok: true, value }
       }

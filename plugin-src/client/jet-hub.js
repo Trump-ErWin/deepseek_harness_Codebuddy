@@ -112,6 +112,8 @@ import {
   quotaPercentValue,
   formatQuotaPercent,
 } from './quota-format.js';
+import { trimBackupPayload, describeBackupAccounts } from './backup-payload.js';
+import { convertForeignAccounts, looksLikeForeignAccountList } from './backup-convert.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -3673,6 +3675,26 @@ function BackupPanel({ rpcCall, onImported }) {
   const [busy, setBusy] = React.useState(false);
   // 弹窗内提示（成功 / 失败 / 口令不一致等）
   const [notice, setNotice] = React.useState(null);
+  /**
+   * 导出时选中的账号 id（null = 全部）。
+   *
+   * 「单独导出某个账号」= 勾掉其余账号。只影响 accounts / credentials 两个
+   * 字段，黑名单与锁定表仍是全量，故产物依然是可整体还原的自包含快照。
+   */
+  const [exportIds, setExportIds] = React.useState(null);
+  /**
+   * 导入模式：'replace' 整体还原（覆盖全部）| 'merge' 仅追加（只增加，不覆盖）。
+   *
+   * 默认 replace = 保持既有「恢复」按钮的行为不变（老用户点进来还是还原）。
+   */
+  const [importMode, setImportMode] = React.useState('replace');
+  /**
+   * 导入时选中的账号 id（null = 备份里的全部账号）。
+   *
+   * 配合 `importMode === 'merge'` 即「单独导入一个账号」：从别人的整份备份里
+   * 只挑一个加进自己的账号池。
+   */
+  const [importIds, setImportIds] = React.useState(null);
   const fileRef = React.useRef(null);
   const mounted = React.useRef(true);
 
@@ -3694,9 +3716,26 @@ function BackupPanel({ rpcCall, onImported }) {
     setBackupStatus(null);
     setConfirmStep(false);
     setDecryptedPayload(null);
+    setExportIds(null);
+    setImportMode('replace');
+    setImportIds(null);
   };
 
   const safeNotice = (next) => { if (mounted.current) setNotice(next); };
+
+  /** 打开导出弹窗：拉取账号列表供勾选（拉不到就退化成「导出全部」）。 */
+  const openExportDialog = async () => {
+    setDialog('export');
+    setNotice(null);
+    setExportIds(null);
+    try {
+      const status = await rpcCall('backup.status', {});
+      if (mounted.current) setBackupStatus(status || null);
+    } catch (caught) {
+      // 账号列表只是勾选辅助：拿不到不影响「导出全部」这条主路径。
+      console.warn('[jet-hub] backup.status failed:', caught);
+    }
+  };
 
   /** 导出：RPC 取载荷 → （可选）加密 → 浏览器下载。 */
   const doExport = async () => {
@@ -3708,21 +3747,35 @@ function BackupPanel({ rpcCall, onImported }) {
       safeNotice({ tone: 'warn', text: '两次输入的口令不一致' });
       return;
     }
+    // 勾了账号但一个都没选：明确报错而不是静默导出全部 —— 后者会让用户拿到
+    // 一份含全部账号的文件，与他「只导一个」的意图相反（泄漏面变大）。
+    //
+    // ⚠️ 变量名刻意避开 model-filter 那条全局字符串守卫的禁用标识符：
+    // `tests/unit/model-filter.spec.ts` 有一道源码级回归墙（防止 ModelListPanel
+    // 的多选勾选被重新引入），它不区分文件里的位置，用同名会被误判为回归。
+    // 那个守卫本身是对的，不该为这里放宽。
+    const exportIdList = exportIds === null ? null : Array.from(exportIds);
+    if (exportIdList !== null && exportIdList.length === 0) {
+      safeNotice({ tone: 'warn', text: '请至少勾选一个账号，或选择「导出全部」' });
+      return;
+    }
     setBusy(true);
     setNotice(null);
     try {
       // 必须传空对象而非省略 payload：callManagementRpc 会把 payload 序列化进
       // 请求体，后端校验要求 payload 键存在；传 undefined 会被 JSON 序列化丢弃，
       // 导致后端报 "Invalid Jet Hub management request."
-      const res = await rpcCall('backup.export', {});
+      const res = await rpcCall('backup.export', exportIdList === null ? {} : { accountIds: exportIdList });
       const payload = res.payload;
       const warnings = res.warnings || [];
       const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      // 文件名带账号数，避免「只导了一个」的文件被误当成整份备份收着
+      const single = payload.accounts.length === 1 ? `-${payload.accounts[0].id}` : '';
       let data = payload;
-      let filename = `dsh-codearts-backup-${stamp}.json`;
+      let filename = `dsh-codearts-backup${single}-${stamp}.json`;
       if (encrypt) {
         data = await encryptBackup(payload, pass1);
-        filename = `dsh-codearts-backup-${stamp}.enc.json`;
+        filename = `dsh-codearts-backup${single}-${stamp}.enc.json`;
       }
       downloadJson(filename, data);
       const extra = warnings.length > 0 ? `，${warnings.length} 个账号凭据缺失（已跳过）` : '';
@@ -3736,7 +3789,7 @@ function BackupPanel({ rpcCall, onImported }) {
     }
   };
 
-  /** 选择文件：读取并解析；加密容器留在弹窗里等口令。 */
+  /** 选择文件：读取并解析；加密容器留在弹窗里等口令，第三方账号列表自动转换。 */
   const onFileSelected = async (event) => {
     const file = event.target.files?.[0];
     event.target.value = '';
@@ -3752,9 +3805,48 @@ function BackupPanel({ rpcCall, onImported }) {
         return;
       }
       if (!mounted.current) return;
+
+      /**
+       * 第三方账号列表（别的工具导出的裸数组）→ 本地转换成插件备份载荷。
+       *
+       * ⚠️ 转换发生在**前端**，且只改结构不改令牌；转换结果显示在弹窗里供核对。
+       * 走这条路径时**不**询问口令（它不是加密容器），也**不**拉 backup.status
+       * （第三方文件里没有本机账号信息，覆盖提示无意义）。
+       */
+      if (looksLikeForeignAccountList(parsed)) {
+        const converted = convertForeignAccounts(parsed);
+        if (converted === null) {
+          safeNotice({ tone: 'error', text: `${file.name} 无法识别为账号列表` });
+          return;
+        }
+        setImportFile({
+          name: file.name,
+          encrypted: false,
+          parsed: converted.payload,
+          converted: {
+            count: converted.accounts.length,
+            warnings: converted.warnings,
+            providers: converted.providers,
+          },
+        });
+        setDialog('import');
+        setImportPass('');
+        // ⚠️ 必须同时填 `decryptedPayload`：确认页读的是它（不是 importFile.parsed）。
+        // 漏了这一步会走进确认页却显示「没有账号」，正是本次要修的那个症状。
+        setDecryptedPayload(converted.payload);
+        // 转换来的账号是「别人的新号」，默认落到**只追加**模式，避免误覆盖本机账号。
+        setImportMode('merge');
+        setImportIds(null);
+        setConfirmStep(true);
+        return;
+      }
+
       setImportFile({ name: file.name, encrypted: isEncryptedBackup(parsed), parsed });
       setDialog('import');
       setImportPass('');
+      // 换文件时清掉上一个文件的勾选与模式，避免把「上一个文件的勾选」带到这个文件。
+      setImportMode('replace');
+      setImportIds(null);
       // 拉取当前账号池统计：确认导入前提示「有 N 个自动恢复账号将被覆盖」。
       // 失败不阻断导入——提示只是辅助信息，拿不到就静默跳过。
       try {
@@ -3798,15 +3890,48 @@ function BackupPanel({ rpcCall, onImported }) {
     setNotice(null);
   };
 
-  /** 导入第二步：确认后执行导入 RPC。 */
+  /**
+   * 导入第二步：确认后执行导入 RPC。
+   *
+   * 两种模式共用一个端点（`backup.import` 的 `mode` 字段）：
+   * - `replace`：整体还原，载荷原样发出；
+   * - `merge`：只追加。载荷一律先**裁剪**成只含选中账号及其凭据 ——
+   *   不裁剪的话，后端虽然只按选中账号判重，却仍会把备份里那些「不在选中
+   *   范围」的凭据写进凭据存储（它们可能已被本机现有账号占用，写进去等于
+   *   覆盖现有凭据），与「只增加不覆盖」的承诺相反。
+   *
+   * ⚠️ 「全部账号」也要裁剪（而不是直接把原始载荷发出去）：原始载荷里的
+   * `credentials` 还含账号池之外的独立凭据 ref（各 provider 的默认单凭据），
+   * 那些 ref 在合并语义下同样不该被回写。
+   */
   const confirmImport = async () => {
     const payload = decryptedPayload;
     if (!payload) return;
     setBusy(true);
     setNotice(null);
     try {
-      const res = await rpcCall('backup.import', { payload });
-      const parts = [`已导入 ${res.accountsImported} 个账号`, `${res.credentialsImported} 条凭据`];
+      const allBackupIds = describeBackupAccounts(payload).map((entry) => entry.id);
+      const targetIds = importIds === null ? allBackupIds : Array.from(importIds);
+      if (importMode === 'merge' && targetIds.length === 0) {
+        safeNotice({ tone: 'warn', text: '请至少勾选一个要导入的账号' });
+        setBusy(false);
+        return;
+      }
+      const outgoing = importMode === 'merge'
+        ? trimBackupPayload(payload, targetIds)
+        : payload;
+      const res = await rpcCall('backup.import', importMode === 'merge'
+        ? { payload: outgoing, mode: 'merge' }
+        : { payload: outgoing });
+      const parts = importMode === 'merge'
+        ? [`新增 ${res.accountsImported ?? 0} 个账号`]
+        : [`已导入 ${res.accountsImported} 个账号`];
+      parts.push(`${res.credentialsImported} 条凭据`);
+      // 合并模式下「已存在」是正常结果，必须显式告知 —— 否则用户看到「新增 0 个」
+      // 会以为导入失败，而实际是刻意跳过（不覆盖现有账号）。
+      if (importMode === 'merge' && Array.isArray(res.accountsSkipped) && res.accountsSkipped.length > 0) {
+        parts.push(`${res.accountsSkipped.length} 个账号已存在（已跳过，未覆盖）`);
+      }
       if (res.skipped.length > 0) parts.push(`${res.skipped.length} 条凭据跳过`);
       // 已过期的账号：refresh_token 仍有效时会自动静默续期；若也已失效则需重新登录
       if (res.expiredAccounts > 0) {
@@ -3816,7 +3941,7 @@ function BackupPanel({ rpcCall, onImported }) {
       if (res.missingCredentials > 0) {
         parts.push(`${res.missingCredentials} 个账号凭据缺失（需重新登录）`);
       }
-      // 账号已整体替换：通知 JetHubPage 重新挂载 ProviderPanel 刷新列表；
+      // 账号集合已变化：通知 JetHubPage 重新挂载 ProviderPanel 刷新列表；
       // 不自动关闭弹窗，让用户看到导入结果。
       onImported?.();
       safeNotice({ tone: 'ok', text: parts.join('，') });
@@ -3828,21 +3953,64 @@ function BackupPanel({ rpcCall, onImported }) {
     }
   };
 
+  // 账号勾选列表（导出/导入共用）。`ids === null` 表示「全部」，此时不勾选任何
+  // 单条、并把「全部」那行标记为选中态 —— 与用户的直觉一致。
+  const renderAccountPicker = (entries, ids, setIds, emptyHint) => {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return React.createElement('p', { className: 'dim-jh-modalHint' }, emptyHint);
+    }
+    const allSelected = ids === null;
+    const toggleOne = (id) => {
+      // 从「全部」进入逐条模式时，以全部为基础再取消这一条（保留其余）。
+      const base = new Set(ids === null ? entries.map((entry) => entry.id) : ids);
+      if (base.has(id)) base.delete(id); else base.add(id);
+      setIds(base);
+    };
+    return React.createElement('div', { className: 'dim-jh-accountPick' },
+      React.createElement('label', { className: 'dim-jh-checkRow' },
+        React.createElement('input', {
+          type: 'checkbox',
+          checked: allSelected,
+          onChange: (event) => setIds(event.target.checked ? null : new Set()),
+        }),
+        `全部账号（${entries.length} 个）`),
+      React.createElement('div', { className: 'dim-jh-accountPickList' },
+        entries.map((entry) => React.createElement('label', {
+          key: entry.id,
+          className: 'dim-jh-checkRow dim-jh-accountPickRow',
+        },
+          React.createElement('input', {
+            type: 'checkbox',
+            // 「全部」态下每条都显示为选中，用户一取消某条就自动落到逐条模式。
+            checked: allSelected || ids.has(entry.id),
+            onChange: () => toggleOne(entry.id),
+          }),
+          React.createElement('span', { className: 'dim-jh-accountPickName' },
+            entry.nickname || entry.id,
+            React.createElement('span', { className: 'dim-jh-accountPickMeta' },
+              `${entry.provider}${entry.enabled === false ? ' · 已停用' : ''}`))))));
+  };
+
   // 弹窗通用结构：遮罩 + 对话框。点击遮罩关闭（与 ModelListPanel 同款）。
   const renderDialog = () => {
     const isExport = dialog === 'export';
     const title = isExport ? '导出备份' : '导入备份';
     const subtitle = isExport
-      ? '全部 provider 的账号密钥与凭据'
+      ? '全部或选中的账号密钥与凭据'
       : importFile?.name || '';
     const body = isExport ? (
       React.createElement(React.Fragment, null,
         React.createElement('p', { className: 'dim-jh-modalHint' },
-          '备份文件包含全部账号的密钥与 refresh_token，请',
+          '备份文件包含账号的密钥与 refresh_token，请',
           React.createElement('strong', { className: 'dim-jh-emph-warn' }, '妥善保管'),
           '。'),
         React.createElement('p', { className: 'dim-jh-modalHint' },
           '备份是导出时刻的凭据快照：refresh_token 会随续期轮换或过期，建议导出后尽快迁移，导入后失效的账号需重新登录。'),
+        renderAccountPicker(
+          backupStatus?.accountList,
+          exportIds,
+          setExportIds,
+          '读取账号列表失败，将导出全部账号。'),
         React.createElement('label', { className: 'dim-jh-checkRow' },
           React.createElement('input', {
             type: 'checkbox',
@@ -3868,24 +4036,76 @@ function BackupPanel({ rpcCall, onImported }) {
               }))
           : null)
     ) : !isExport && confirmStep ? (
-      // 导入确认页（应用内二次确认）：展示覆盖警告与提示
+      // 导入确认页（应用内二次确认）：模式选择 + 覆盖警告 / 追加说明
       React.createElement(React.Fragment, null,
-        React.createElement('p', { className: 'dim-jh-modalHint' },
-          '导入将',
-          React.createElement('strong', { className: 'dim-jh-emph-danger' }, '覆盖'),
-          '当前全部账号与模型开关（共 ',
-          React.createElement('strong', { className: 'dim-jh-emph-warn' }, `${decryptedPayload?.accounts?.length ?? 0}`),
-          ' 个账号），且',
-          React.createElement('strong', { className: 'dim-jh-emph-danger' }, '不可撤销'),
-          '。'),
-        backupStatus?.withoutExpiry > 0
-          ? React.createElement('p', { className: 'dim-jh-modalHint' },
-              '当前有 ',
-              React.createElement('strong', { className: 'dim-jh-emph-warn' }, `${backupStatus.withoutExpiry}`),
-              ' 个账号缺少有效期信息（可能是版本切换后自动恢复的），导入将',
-              React.createElement('strong', { className: 'dim-jh-emph-warn' }, '整体覆盖'),
-              '它们。')
-          : null)
+        // 第三方账号列表的转换摘要：让用户先确认「识别到了几条、都是谁」，
+        // 再决定导入。没有这段提示时，用户会怀疑文件没被读进去。
+        importFile?.converted
+          ? React.createElement(React.Fragment, null,
+              React.createElement('p', { className: 'dim-jh-modalHint' },
+                '已自动识别为',
+                React.createElement('strong', { className: 'dim-jh-emph-warn' }, '第三方账号列表'),
+                '并转换为插件格式：共 ',
+                React.createElement('strong', { className: 'dim-jh-emph-warn' }, `${importFile.converted.count}`),
+                ' 个账号',
+                importFile.converted.providers?.length > 0
+                  ? `（${importFile.converted.providers.join('、')}）`
+                  : '',
+                '。'),
+              importFile.converted.warnings?.length > 0
+                ? React.createElement('p', { className: 'dim-jh-modalHint' },
+                    `${importFile.converted.warnings.length} 条记录被跳过：`,
+                    importFile.converted.warnings.slice(0, 3).join('；'),
+                    importFile.converted.warnings.length > 3 ? ' …' : '')
+                : null)
+          : null,
+        React.createElement('div', { className: 'dim-jh-modePick' },
+          React.createElement('label', { className: 'dim-jh-checkRow' },
+            React.createElement('input', {
+              type: 'radio',
+              name: 'dim-jh-import-mode',
+              checked: importMode === 'replace',
+              onChange: () => setImportMode('replace'),
+            }),
+            '整体还原（覆盖当前全部账号）'),
+          React.createElement('label', { className: 'dim-jh-checkRow' },
+            React.createElement('input', {
+              type: 'radio',
+              name: 'dim-jh-import-mode',
+              checked: importMode === 'merge',
+              onChange: () => setImportMode('merge'),
+            }),
+            '单独导入（只增加账号，不覆盖现有账号）')),
+        importMode === 'replace'
+          ? React.createElement(React.Fragment, null,
+              React.createElement('p', { className: 'dim-jh-modalHint' },
+                '导入将',
+                React.createElement('strong', { className: 'dim-jh-emph-danger' }, '覆盖'),
+                '当前全部账号与模型开关（共 ',
+                React.createElement('strong', { className: 'dim-jh-emph-warn' }, `${decryptedPayload?.accounts?.length ?? 0}`),
+                ' 个账号），且',
+                React.createElement('strong', { className: 'dim-jh-emph-danger' }, '不可撤销'),
+                '。'),
+              backupStatus?.withoutExpiry > 0
+                ? React.createElement('p', { className: 'dim-jh-modalHint' },
+                    '当前有 ',
+                    React.createElement('strong', { className: 'dim-jh-emph-warn' }, `${backupStatus.withoutExpiry}`),
+                    ' 个账号缺少有效期信息（可能是版本切换后自动恢复的），导入将',
+                    React.createElement('strong', { className: 'dim-jh-emph-warn' }, '整体覆盖'),
+                    '它们。')
+                : null)
+          : React.createElement(React.Fragment, null,
+              React.createElement('p', { className: 'dim-jh-modalHint' },
+                '只把选中的账号',
+                React.createElement('strong', { className: 'dim-jh-emph-warn' }, '追加'),
+                '到当前账号池：同 id 的账号',
+                React.createElement('strong', { className: 'dim-jh-emph-warn' }, '自动跳过、不会被覆盖'),
+                '，现有账号、模型开关与锁定状态都不受影响。'),
+              renderAccountPicker(
+                describeBackupAccounts(decryptedPayload),
+                importIds,
+                setImportIds,
+                '该备份文件里没有账号。')))
     ) : importFile?.encrypted ? (
       React.createElement(React.Fragment, null,
         React.createElement('p', { className: 'dim-jh-modalHint' },
@@ -3899,7 +4119,7 @@ function BackupPanel({ rpcCall, onImported }) {
         }))
     ) : (
       React.createElement('p', { className: 'dim-jh-modalHint' },
-        '该备份为明文文件，导入将覆盖当前全部账号与模型开关。')
+        '该备份为明文文件，点「下一步」后选择导入方式（整体还原或单独导入）。')
     );
 
     return React.createElement('div', {
@@ -3964,15 +4184,12 @@ function BackupPanel({ rpcCall, onImported }) {
   return React.createElement(React.Fragment, null,
     React.createElement('button', {
       className: 'dim-jh-btn',
-      title: '导出全部账号的密钥与凭据，便于更换 DSH 版本后导入恢复。',
-      onClick: () => {
-        setDialog('export');
-        setNotice(null);
-      },
+      title: '导出账号的密钥与凭据（全部或勾选其中几个），便于迁移或单独搬一个账号。',
+      onClick: () => void openExportDialog(),
     }, '备份'),
     React.createElement('button', {
       className: 'dim-jh-btn',
-      title: '从备份文件恢复账号与凭据（会覆盖当前全部账号）。',
+      title: '从备份文件导入账号：可选「整体还原（会覆盖当前全部账号）」或「单独导入（只增加账号，不覆盖）」。',
       onClick: () => fileRef.current?.click(),
     }, '恢复'),
     React.createElement('input', {
