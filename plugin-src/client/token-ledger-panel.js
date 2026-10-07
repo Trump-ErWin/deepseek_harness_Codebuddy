@@ -96,12 +96,35 @@ export function formatTps(entry) {
   return v + ' tok/s';
 }
 
-/** 均值格（汇总行）：`avg 0.9s · 48 tok/s`；两边都不可测 → `—`。 */
+/**
+ * 均值格（汇总行）：`avg 0.9s · 48 tok/s`；两边都不可测 → `—`。
+ *
+ * ⚠️ 速率是**算术均值**，对离群样本敏感（用户 2026-10-07 报障「982.5 tok/s」）。
+ * 服务端已丢弃 `decodeMs` 过短（分母塌缩）的样本，但混合分布下均值仍可能
+ * 偏高/偏低；正式口径说明见 {@link avgPerfTooltip}。
+ */
 export function avgPerfText(row) {
   const ttft = typeof row?.avgTtftMs === 'number' && row.avgTtftMs > 0 ? formatDuration(row.avgTtftMs) : null;
   const tps = typeof row?.avgTps === 'number' && row.avgTps > 0 ? row.avgTps + ' tok/s' : null;
   if (ttft === null && tps === null) return '—';
   return '首字 ' + (ttft ?? '—') + ' · ' + (tps ?? '—');
+}
+
+/**
+ * 均值格的**口径说明**（tooltip）。
+ *
+ * ⚠️ 必须显式说明「均值对离群样本敏感」：用户看到 lobsterai「982.5 tok/s」
+ * 时合理怀疑是算错了，而不给口径说明就无从判断。分成两条：
+ * 首字用时可测条件较宽；速率额外要求「解码时长 ≥ 100ms」——
+ * 否则首块与结束贴在一起时分母塌缩，会算出几十万 tok/s 的假值
+ * （已实测：单笔 decode=1ms 的样本能把均值从 184 拉到 634592）。
+ */
+export function avgPerfTooltip() {
+  return '均值口径：对有实测值的请求取算术平均。'
+    + '「首字」= 首个 chunk 到达前的耗时；'
+    + '「速率」= 全部输出 token ÷（首块之后 → 结束）的时长，'
+    + '要求解码时长 ≥ 100ms（过短视为不可测、不计入）。'
+    + '算术均值对离群样本敏感：个别极快/极慢的请求会明显拉高或拉低该值。';
 }
 
 // ───────────────────── 历史视图（第 4 期）─────────────────────
@@ -144,13 +167,50 @@ export function trendBars(historyDays, maxBars = 30) {
   }));
 }
 
-/** 柱高百分比（相对最大值；最大值为 0 时全部给最小可见高度）。 */
-export function barHeightPercent(tokens, maxTokens) {
+/** 柱高下限：极小值也能看见柱子（否则只在最大值那根可见）。 */
+export const BAR_HEIGHT_MIN_PERCENT = 4;
+/** 柱高上限：留出顶部空白，描边与圆角才不会被容器裁掉。 */
+export const BAR_HEIGHT_MAX_PERCENT = 88;
+/** 相对区间宽度：非最大柱能落在 [MIN, MIN+SPAN] 内，最大柱封顶 MAX。 */
+export const BAR_HEIGHT_SPAN_PERCENT = 84;
+/** 孤柱高度：单日窗口下唯一那根（相对比较无意义，给固定值更像「一根柱子」）。 */
+export const BAR_HEIGHT_SINGLE_PERCENT = 72;
+
+/**
+ * 柱高百分比（相对窗口内最大值）。
+ *
+ * ⚠️ **必须有上限**（真实缺陷，用户 2026-10-07 报障）：单日窗口（`today`）下
+ * 「今日」既是最大值又是它自己，比值恒为 `t/max = 1` ⇒ 高度 100% ⇒ 唯一那根柱
+ * 撑满 64px 容器；`flex: 1 0 14px` 又把它横向拉满整行，于是**一柱独占成
+ * 一整条白块**，点开展开后又被卡片挤成竖条 —— 看着像「点击后尺寸突变」，
+ * 实则是同一根柱在两种容器宽度下的两种表现。
+ *
+ * 上限的另一层用意：全等高时不许「一根顶天、其余贴地」的观感。最大值那根
+ * 给 {@link BAR_HEIGHT_MAX_PERCENT}（留白让描边与圆角可见），其余按比例缩放
+ * 到 {@link BAR_HEIGHT_SPAN_PERCENT} 的区间里 —— 保持相对关系不失真。
+ *
+ * @param tokens - 该柱的 token 合计。
+ * @param maxTokens - 窗口内最大 token 合计（0/垃圾值按 0 处理）。
+ * @param barCount - 窗口内的柱子**根数**；只有一根时用固定孤柱高（避免孤柱独占）。
+ */
+export function barHeightPercent(tokens, maxTokens, barCount = 0) {
   const max = typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 0;
   const t = typeof tokens === 'number' && tokens > 0 ? tokens : 0;
   if (max === 0 || t === 0) return 0;
-  // 保底 4%：极小值也能看见柱子（否则只在最大值那根可见）。
-  return Math.max(4, Math.round((t / max) * 100));
+  const ratio = t / max;
+  // ⚠️ 孤柱（单日窗口）不参与满量程比较：恒 100% 的那根就是「白块」本体。
+  if (barCount <= 1) return BAR_HEIGHT_SINGLE_PERCENT;
+  // 最大值那根给满量程上限，其余按比例压进 [保底, 满量程上限] 区间。
+  const scaled = BAR_HEIGHT_MIN_PERCENT + ratio * BAR_HEIGHT_SPAN_PERCENT;
+  return Math.round(Math.min(BAR_HEIGHT_MAX_PERCENT, Math.max(BAR_HEIGHT_MIN_PERCENT, scaled)));
+}
+
+/** 柱子的日期短标签（`MM-DD`；非法日键 → 空串，由调用方降级为不渲染）。 */
+export function barDayLabel(day) {
+  if (typeof day !== 'string' || day.length < 10) return '';
+  const m = day.slice(5, 7);
+  const d = day.slice(8, 10);
+  return /^\d{2}-\d{2}$/.test(m + '-' + d) ? m + '-' + d : '';
 }
 
 /** 历史窗口标题（弹窗内小节标题）。 */

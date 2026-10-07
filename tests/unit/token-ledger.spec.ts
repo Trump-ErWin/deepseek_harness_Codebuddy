@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  MIN_DECODE_MS_FOR_TPS,
   TOKEN_LEDGER_LIMIT,
   attachTokenLedgerStore,
   mergeDayEntry,
@@ -126,6 +127,58 @@ describe('recordTokenUsage / readTokenLedger：明细', () => {
     seed([{ ...OK, ttftMs: 1000, durationMs: 3000, usageReported: false }])
     row = readTokenLedger().entries[0]!
     expect(row.tps).toBeUndefined()
+  })
+
+  /**
+   * ⚠️ **分母塌缩**必须挡在源头（真实缺陷，用户 2026-10-07 报障「982.5 tok/s」）。
+   *
+   * 症状：lobsterai 的 `avgTps` 显示 982.5，而真实值在 50~200 量级。
+   * 根因：原判据只要求 `decodeMs > 0`，于是「首块与结束几乎贴在一起」的样本
+   * （空回复 / 纯 usage 帧 / 上游秒回 200 但正文为空 / 被 cancel）算出
+   * 1269 ÷ 0.001s = **126 万 tok/s**；单笔这样的样本就能把该渠道均值从
+   * ~180 拉到 **634592**（本套件外已实测复现）。
+   *
+   * ⚠️ 修法是**丢弃该样本**而不是钳制分母：把 decodeMs 抬到下限只是把离谱值
+   * 换成另一个离谱值（仍是假数据，且看起来「有值」无从分辨）。
+   */
+  describe('⚠️ TPS 分母塌缩的防御（decodeMs 下限）', () => {
+    it('decodeMs 为个位数毫秒时不可测（省略 tps），不产出几十万 tok/s 的假值', () => {
+      // 首块后仅 1ms 就结束：1269 ÷ 0.001s = 1,269,000 tok/s —— 荒谬。
+      seed([{ ...OK, ttftMs: 2109, durationMs: 2110, outputTokens: 1269 }])
+      const row = readTokenLedger().entries[0]!
+      expect(row.tps).toBeUndefined()
+      // ⚠️ ttft **仍要保留**：它不受此门槛影响（首字用时是可测的）。
+      expect(row.ttftMs).toBe(2109)
+    })
+
+    it('★ 单笔塌缩样本不得拉爆均值（实测 634592 → 183.9）', () => {
+      seed([
+        // 塌缩样本：应被丢弃
+        { ...OK, ttftMs: 2109, durationMs: 2110, outputTokens: 1269 },
+        // 正常样本：1269 ÷ 6.9s = 183.9
+        { ...OK, ttftMs: 2100, durationMs: 9000, outputTokens: 1269 },
+      ])
+      const totals = readTokenLedger().channels[0]!.providers[0]!.totals
+      expect(totals.avgTps).toBe(183.9)
+      // ⚠️ 门槛是**只挡 tps**：ttft 两笔都参与（(2109+2100)/2 = 2105 向上取整）。
+      expect(totals.avgTtftMs).toBe(2105)
+    })
+
+    it('门槛边界：恰好达到 MIN_DECODE_MS_FOR_TPS 可测，差 1ms 不可测', () => {
+      // duration - ttft = 100（门槛）⇒ 可测：500 ÷ 0.1s = 5000 tok/s
+      seed([{ ...OK, ttftMs: 1000, durationMs: 1000 + MIN_DECODE_MS_FOR_TPS, outputTokens: 500 }])
+      expect(readTokenLedger().entries[0]!.tps).toBe(5000)
+      // 差 1ms（99ms）⇒ 不可测
+      seed([{ ...OK, ttftMs: 1000, durationMs: 1000 + MIN_DECODE_MS_FOR_TPS - 1, outputTokens: 500 }])
+      expect(readTokenLedger().entries[0]!.tps).toBeUndefined()
+    })
+
+    it('门槛不会误伤真实样本：100~100ms 解码的正常慢流仍可测', () => {
+      // 门槛取 100ms 而非更大值，是为了只挡「首块与结束贴在一起」的塌缩，
+      // 而**不是**排除一切短输出。100ms 解码 100 token = 1000 tok/s。
+      seed([{ ...OK, ttftMs: 500, durationMs: 600, outputTokens: 100 }])
+      expect(readTokenLedger().entries[0]!.tps).toBe(1000)
+    })
   })
 
   it('聚合均值：只对有实测值的请求平均；父级 = 全部样本的 Σ/份数（不是均值的均值）', () => {
