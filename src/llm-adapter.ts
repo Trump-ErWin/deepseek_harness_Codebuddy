@@ -8,6 +8,7 @@ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelIn
 import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
 import { isCodeArtsBenefitModel } from './models.js'
@@ -108,11 +109,38 @@ export interface CodeArtsAdapterOptions {
   refresh: () => Promise<void>
   /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
   fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  /**
+   * 最近一次目录拉取的**各来源成败**（issue IKJVTF，审计 I3）。
+   *
+   * CodeArts 的目录来自**两个独立端点**（`opengw gateway/config` 给 benefit 模型、
+   * `snap-access /v1/model/builtin` 给常规模型），而失败路径都**静默**返回
+   * `undefined` ⇒ 「一个成功、一个失败」时 `models.length > 0`，旧判据会把它
+   * 当成「已拿到目录」⇒ **永久缓存**（短路）⇒ 残缺目录固化，只能重启 DSH。
+   *
+   * ⚠️ 用**回调**而非直接读 `service` 的内部状态：适配器不该依赖 `CodeArtsAuth`
+   * 的字段形状（它由 `index.ts` 接线，且单测用替身）。接线层把它桥接成
+   * 「读 `service.lastCatalogOutcome`」，见 `src/index.ts`。
+   *
+   * 返回 `undefined` 时按「无法判定」处理 —— 与 `normalizeLoadResult` 的
+   * 向后兼容口径一致（`complete = got`）。
+   */
+  catalogComplete?: () => boolean | undefined
   fetchImpl?: typeof fetch
   chatId?: string
   sessionId?: string
   /** 多账号池（用于限流时切换账号） */
   accountPool?: AccountPool
+  /**
+   * 远端目录**落地后**的通知回调（issue IKJVTF）。
+   *
+   * 由 `registerCodeArtsLlm` 注入为 `broadcastCatalogChanged(ctx)`。适配器本身
+   * 拿不到 `ctx`，故必须由接线层桥接（与 `readImage` 等回调同一模式）。
+   *
+   * ⚠️ 必要性：客户端 `ModelCatalogDirectory` 在 `status === 'ready'` 时**短路
+   * 返回缓存**，只在宿主事件上 `refresh()`。没有本回调时，冷启动首拉失败
+   * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
+   */
+  onCatalogLoaded?: () => void
 }
 
 /**
@@ -930,6 +958,10 @@ export class CodeArtsAdapter extends LlmAdapter {
     this.fetchImpl = options.fetchImpl ?? fetch
     this.chatId = options.chatId ?? crypto.randomUUID().replace(/-/g, '')
     this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, '')
+    // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
+    this.catalogGate = new RemoteCatalogGate(
+      options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
   }
 
   /**
@@ -949,6 +981,14 @@ export class CodeArtsAdapter extends LlmAdapter {
   private remoteModels: Array<{ id: string; name: string }> | undefined
 
   /**
+   * 已落缓存的目录是否**所有来源都取全**（issue IKJVTF，审计 I3）。
+   *
+   * ⚠️ **这是短路判据的第二半**：CodeArts 有两个目录端点，残缺目录也落
+   * `remoteModels`，故只判「已定义」会让残缺永久固化（见 `ensureRemoteModels`）。
+   */
+  private remoteComplete = false
+
+  /**
    * 目录加载闸门：并发去重 + 失败冷却。
    *
    * ⚠ **不能省**：DSH 的 `buildModelCatalog` 对每个 provider `await listModels()`
@@ -956,7 +996,7 @@ export class CodeArtsAdapter extends LlmAdapter {
    * 直接返回（不落缓存）⇒ 一次网络故障被放大成「每模型重试一次」，每次顶着
    * 10s 超时（`src/models.ts:55 FETCH_TIMEOUT_MS`），首屏因此长时间空转。
    */
-  private readonly catalogGate = new RemoteCatalogGate()
+  private readonly catalogGate: RemoteCatalogGate
 
   /**
    * 懒加载远端模型目录。resolveModel 可能先于 listModels 被调用
@@ -964,14 +1004,26 @@ export class CodeArtsAdapter extends LlmAdapter {
    */
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
-    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    if (fetchRemote === undefined) return
+    // ⚠️⚠️ **短路判据是「已完整」，不是「已定义」**（issue IKJVTF 复审，审计 I3）。
+    //
+    // CodeArts 有两个独立目录端点，残缺目录**也**要落 `remoteModels`
+    //（展示需要 —— 目录服务抖动时用户的模型列表不该整个消失），但那时**不能**
+    // 短路：`RemoteCatalogGate` 的冷却（`retryAt` / `cooling()`）在生产里只有
+    // 闸门自己那一处调用点，而它排在短路**之后** ⇒ 残缺目录一旦落缓存，
+    // 冷却永远读不到、残缺永远补不齐（与 Cline 的缺陷② 完全同构）。
+    if (this.remoteComplete) return
     await this.catalogGate.run(async () => {
       const models = await fetchRemote()
       // 空目录同样算「没拿到」：既不应落缓存（否则再也拉不回来），
       // 也不应立刻重试（否则每个模型都打一次空请求）。
       if (models.length === 0) return false
       this.remoteModels = models
-      return true
+      // ⚠️ 完整性由接线层桥接的数据源上报（两来源各自的成败）。
+      // 拿不到判定时退回 `got`（= 旧行为），避免把「判不出」当成「残缺」
+      // 而让每个 provider 都反复重拉。
+      this.remoteComplete = this.options.catalogComplete?.() ?? true
+      return { got: true, complete: this.remoteComplete }
     })
   }
 
@@ -2116,7 +2168,12 @@ export class CodeArtsAdapter extends LlmAdapter {
 
 /** 在 ctx.llm 上注册 codearts 提供商路由和适配器。 */
 export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOptions): CodeArtsAdapter {
-  const adapter = new CodeArtsAdapter(options)
+  const adapter = new CodeArtsAdapter({
+    ...options,
+    // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+    // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+    onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+  })
   registerAdapterIdempotent(ctx.llm, [PROVIDER], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
