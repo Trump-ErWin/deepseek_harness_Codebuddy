@@ -488,7 +488,49 @@ export class AutoAdapter extends LlmAdapter {
     if (winner === undefined) return undefined
     const model = modelOf !== undefined ? await modelOf(winner) : undefined
     if (modelOf !== undefined && model === undefined) return undefined
+    // ⚠️ zcode 的额度**按模型绑定**（用户实测 2026-10-07）：渠道有余额 ≠ 任意模型
+    //    可用 —— 余额只挂在 `GLM-5.3-Flash` 的桶上时，请求其它模型是 `QUOTA_EXCEEDED`。
+    //    这里在**选定模型之后**校验：模型不在「余额能买」的集合里 ⇒ 该渠道退出候选，
+    //    顺位让给下一个临期渠道（而不是把那个必然失败的请求发出去）。
+    //    ⚠️ 集合不可知（`undefined`，查询失败 / 探针未实现）⇒ **不校验**（宁可少筛，
+    //    不可误剔）。
+    if (winner === 'zcode' && model !== undefined) {
+      const quota = await this.zcodeQuotaModelIds(signal)
+      if (quota !== undefined && !quota.includes(model)) {
+        this.ctx.logger?.warn?.(
+          `[jet-hub-auto] zcode 余额不覆盖模型 ${model}（仅 ${quota.join(' / ')}），该渠道退出候选`,
+        )
+        // 顺位让给下一个**可用**的临期渠道（zcode 自己已排除）。
+        const remaining = entries.filter(([provider, expiry]) =>
+          provider !== winner && provider !== 'zcode' && expiry !== UNUSABLE)
+        const next = pickSoonestProvider(remaining)
+        if (next === undefined) return undefined
+        if (modelOf === undefined) return undefined
+        const nextModel = await modelOf(next)
+        if (nextModel === undefined) return undefined
+        return { provider: next, model: nextModel }
+      }
+    }
     return { provider: winner, model: model ?? '' }
+  }
+
+  /**
+   * zcode「余额能买哪些模型」的通道（按形状探测探针上的 `quotaModels`）。
+   *
+   * ⚠️ 只在这里**读一次**并传给调用方，不在 `firstModelOf` 里查 —— 那会与探针的
+   * `firstModelIdOf`（= `firstModelOf` 自身）形成**无限递归**（实测：既有用例直接超时）。
+   */
+  private async zcodeQuotaModelIds(
+    signal?: AbortSignal,
+  ): Promise<readonly string[] | undefined> {
+    this.expiryProbeInstance ??= this.options.expiryProbe ?? createExpiryProbe(
+      this.options.accountPool,
+      p => this.firstModelOf(p),
+      this.options.expiryTtlMs === undefined ? {} : { ttlMs: this.options.expiryTtlMs },
+    )
+    const withQuota = this.expiryProbeInstance as Partial<ReturnType<typeof createExpiryProbe>>
+    if (typeof withQuota.quotaModels !== 'function') return undefined
+    return withQuota.quotaModels(signal)
   }
 
   /**

@@ -58,9 +58,12 @@ import {
 } from './aggregate-core.js'
 import { CANONICAL_REASONING_EFFORTS, translateReasoningEffort } from './reasoning-ladder.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
-// ⚠️ 只导入**常量**（不导入 `createExpiryProbe`）⇒ 依赖方向仍是
+// ⚠️ 只导入**常量与类型**（不导入 `createExpiryProbe`）⇒ 依赖方向仍是
 // `aggregate-adapter → aggregate-expiry → aggregate-core`，无环。
-import { WIRED_EXPIRY_PROVIDERS } from './aggregate-expiry.js'
+// ⚠️ `ExpiryProbeWithCache` 是**纯类型**导入（`import type`），故不引入运行时依赖：
+// 它让本文件能按形状探测探针上的 `quotaModels`（zcode 额度按模型绑定的通道），
+// 而不必改 `aggregate-core.ts` 的底座类型（那会让所有替身被迫实现新方法）。
+import { WIRED_EXPIRY_PROVIDERS, type ExpiryProbeWithCache } from './aggregate-expiry.js'
 
 /** 注册到 `ctx.llm` 的路由，也是 `providerInfo().id`（DSH 校验二者相等）。 */
 export const AGGREGATE_PROVIDER = 'aggregate'
@@ -783,6 +786,23 @@ export class AggregateAdapter extends LlmAdapter {
   }
 
   /**
+   * zcode「余额 → 模型集合」通道：注入的探针**实现了** `quotaModels`（真实装配
+   * 是 `createExpiryProbe` 的返回值，即 `ExpiryProbeWithCache`）就走它；否则返回
+   * `undefined`（= 不知道 ⇒ 调用方不收窄候选，宁可少筛，不可误剔）。
+   *
+   * ⚠️ 为什么按形状探测而不是改 `expiryProbe()` 的返回类型：保守兜底分支
+   *（`?? () => Promise.resolve(UNUSABLE)`）没有该方法，类型上无法统一；且
+   * `expiryProbe` 是**可选注入**（测试桩常不传）—— 能力探测比改签名更诚实。
+   */
+  private async zcodeQuotaModels(): Promise<readonly string[] | undefined> {
+    const probe = this.options.expiryProbe
+    if (probe === undefined) return undefined
+    const withQuota = probe as Partial<ExpiryProbeWithCache>
+    if (typeof withQuota.quotaModels !== 'function') return undefined
+    return withQuota.quotaModels()
+  }
+
+  /**
    * 绑定「本次候选序」到一次分发。
    *
    * ⚠️ 候选序必须在**这里**算好（`prepareCall` 是异步的）：返回的 `stream` 闭包
@@ -924,7 +944,25 @@ export class AggregateAdapter extends LlmAdapter {
 
     // 逐候选折算临期（同一渠道只探一次）。
     const seen = new Map<string, number>()
+    // ⚠️ zcode 的额度**按模型绑定**（用户实测 2026-10-07）：渠道有余额 ≠ 任意
+    //    模型可用 —— 余额只挂在 `GLM-5.3-Flash` 的桶上时，请求其它模型是
+    //    `QUOTA_EXCEEDED`。这里先取一次「余额能买哪些模型」，把 zcode 候选里
+    //    **没额度覆盖的 realId 剔出池**（与拒绝轮换同层：建池期剔除）。
+    //    ⚠️ `undefined`（查不到 / 探针未实现）= 不知道 ⇒ **不收窄**
+    //    （宁可少筛，不可误剔 —— 见 `zcodeQuotaModels` 的注释）。
+    const zcodeQuota = await this.zcodeQuotaModels()
+    const zcodeAllowed = zcodeQuota === undefined ? undefined : new Set(zcodeQuota)
+    // ⚠️ 日志文案提前算好：`zcodeQuota` 在下面的循环闭包里会被 TS 判为可能
+    //    undefined（控制流分析不穿过闭包收窄），故这里取一份非空副本。
+    const zcodeAllowedText = zcodeQuota === undefined ? '' : zcodeQuota.join(' / ')
     for (const candidate of pool) {
+      if (candidate.provider === 'zcode' && zcodeAllowed !== undefined
+        && !zcodeAllowed.has(candidate.realId)) {
+        this.ctx.logger?.warn?.(
+          `[jet-hub-auto] zcode 余额不覆盖模型 ${candidate.realId}（仅 ${zcodeAllowedText}），已从候选剔除`,
+        )
+        continue
+      }
       let expiry = seen.get(candidate.provider)
       if (expiry === undefined) {
         try {

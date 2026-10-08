@@ -1,22 +1,22 @@
-/**
- * 「渠道余额 → 最早失效时刻」的**唯一口径**。
+﻿/**
+ * 銆屾笭閬撲綑棰?鈫?鏈€鏃╁け鏁堟椂鍒汇€嶇殑**鍞竴鍙ｅ緞**銆?
  *
- * ## 为什么单独一个文件（而不是并进 `aggregate-core.ts` / `aggregate-adapter.ts`）
+ * ## 涓轰粈涔堝崟鐙竴涓枃浠讹紙鑰屼笉鏄苟杩?`aggregate-core.ts` / `aggregate-adapter.ts`锛?
  *
- * | 候选位置 | 为什么不行 |
+ * | 鍊欓€変綅缃?| 涓轰粈涔堜笉琛?|
  * |---|---|
- * | `aggregate-adapter.ts` | `auto-adapter.ts` 的 `expiryOf` 要复用它 ⇒ 依赖方向变成 `auto-adapter → aggregate-adapter`（**层次颠倒**，聚合适配器是更上层的东西） |
- * | `aggregate-core.ts` | 该文件定位是**纯逻辑**（哨兵 / 排序 / 倍率解析，模块头明写、零 import），而本模块要发网络请求 ⇒ 把 IO 混进纯函数模块，且 `aggregate-core.spec.ts` 这个纯函数单测会**被迫加载网络模块** |
- * | ✅ 本文件 | 单一职责；两个适配器都依赖它，方向正确 |
+ * | `aggregate-adapter.ts` | `auto-adapter.ts` 鐨?`expiryOf` 瑕佸鐢ㄥ畠 鈬?渚濊禆鏂瑰悜鍙樻垚 `auto-adapter 鈫?aggregate-adapter`锛?*灞傛棰犲€?*锛岃仛鍚堥€傞厤鍣ㄦ槸鏇翠笂灞傜殑涓滆タ锛?|
+ * | `aggregate-core.ts` | 璇ユ枃浠跺畾浣嶆槸**绾€昏緫**锛堝摠鍏?/ 鎺掑簭 / 鍊嶇巼瑙ｆ瀽锛屾ā鍧楀ご鏄庡啓銆侀浂 import锛夛紝鑰屾湰妯″潡瑕佸彂缃戠粶璇锋眰 鈬?鎶?IO 娣疯繘绾嚱鏁版ā鍧楋紝涓?`aggregate-core.spec.ts` 杩欎釜绾嚱鏁板崟娴嬩細**琚揩鍔犺浇缃戠粶妯″潡** |
+ * | 鉁?鏈枃浠?| 鍗曚竴鑱岃矗锛涗袱涓€傞厤鍣ㄩ兘渚濊禆瀹冿紝鏂瑰悜姝ｇ‘ |
  *
- * ## ⚠️ 四个 `*Expiry` 是**搬移**进来的，不是复制
+ * ## 鈿狅笍 鍥涗釜 `*Expiry` 鏄?*鎼Щ**杩涙潵鐨勶紝涓嶆槸澶嶅埗
  *
- * 它们原先私有在 `auto-adapter.ts` 里（`private async buddyExpiry` 等）。Task 7
- * 把 `expiryOf` 改成委托本模块的 {@link createExpiryProbe} 后，若原处再留一份，
- * 就成了**同一语义两套实现**——本仓库对此有明确的红线记录（AGENTS.md 首条判据：
- * `buddy-growth.ts` 因两处对同一字段给出相反判据而产生**静默失效**：不报错、
- * 不崩溃、单测能过，只是把「没做到」说成「做到了」）。
- * Task 3 已用同样手法处理过 `pickSoonestProvider` / `priceFactorFromName`。
+ * 瀹冧滑鍘熷厛绉佹湁鍦?`auto-adapter.ts` 閲岋紙`private async buddyExpiry` 绛夛級銆俆ask 7
+ * 鎶?`expiryOf` 鏀规垚濮旀墭鏈ā鍧楃殑 {@link createExpiryProbe} 鍚庯紝鑻ュ師澶勫啀鐣欎竴浠斤紝
+ * 灏辨垚浜?*鍚屼竴璇箟涓ゅ瀹炵幇**鈥斺€旀湰浠撳簱瀵规鏈夋槑纭殑绾㈢嚎璁板綍锛圓GENTS.md 棣栨潯鍒ゆ嵁锛?
+ * `buddy-growth.ts` 鍥犱袱澶勫鍚屼竴瀛楁缁欏嚭鐩稿弽鍒ゆ嵁鑰屼骇鐢?*闈欓粯澶辨晥**锛氫笉鎶ラ敊銆?
+ * 涓嶅穿婧冦€佸崟娴嬭兘杩囷紝鍙槸鎶娿€屾病鍋氬埌銆嶈鎴愩€屽仛鍒颁簡銆嶏級銆?
+ * Task 3 宸茬敤鍚屾牱鎵嬫硶澶勭悊杩?`pickSoonestProvider` / `priceFactorFromName`銆?
  *
  * @module src/aggregate-expiry.ts
  */
@@ -43,64 +43,64 @@ import type { TraeCredential } from './trae.js'
 import { fetchTraeCreditBalance } from './trae-credits.js'
 
 /**
- * 真实临期探针：**每个渠道折算成一个「最早失效时刻」**。
+ * 鐪熷疄涓存湡鎺㈤拡锛?*姣忎釜娓犻亾鎶樼畻鎴愪竴涓€屾渶鏃╁け鏁堟椂鍒汇€?*銆?
  *
- * ## 逐渠道判据（口径与 `jet-hub-auto` 完全一致，故复用同一套端点）
+ * ## 閫愭笭閬撳垽鎹紙鍙ｅ緞涓?`jet-hub-auto` 瀹屽叏涓€鑷达紝鏁呭鐢ㄥ悓涓€濂楃鐐癸級
  *
- * | provider | 判据 | 依据 |
+ * | provider | 鍒ゆ嵁 | 渚濇嵁 |
  * |---|---|---|
- * | buddy / workbuddy / **lobsterai** / **trae** | 有效资源包 `deductionEndTime` 的最小值（**共享** `sharedPackageExpiry`） | `credits.ts` / `lobsterai-credits.ts` / `trae-credits.ts` |
- * | loomy | `daily > 0` → 当日 24:00；否则 `permanent > 0 ? NEVER : UNUSABLE` | 命名池，无时间戳 |
- * | codearts | **`NEVER`（长期）** | ⚠️ **报文无任何时间字段**（实测三字段全空）⇒ 不臆造 |
- * | zcode | 各桶 `expiresAt`（秒）最小值；无带期余额时按当日 | `zcode-upstream.ts` |
- * | 其余（qoder / qodercn / cline / raccoon / minimax / gemini / opencode） | **本插件未接入** → `UNUSABLE` | 见设计文档 §9.1 |
+ * | buddy / workbuddy / **lobsterai** / **trae** | 鏈夋晥璧勬簮鍖?`deductionEndTime` 鐨勬渶灏忓€硷紙**鍏变韩** `sharedPackageExpiry`锛?| `credits.ts` / `lobsterai-credits.ts` / `trae-credits.ts` |
+ * | loomy | `daily > 0` 鈫?褰撴棩 24:00锛涘惁鍒?`permanent > 0 ? NEVER : UNUSABLE` | 鍛藉悕姹狅紝鏃犳椂闂存埑 |
+ * | codearts | **`NEVER`锛堥暱鏈燂級** | 鈿狅笍 **鎶ユ枃鏃犱换浣曟椂闂村瓧娈?*锛堝疄娴嬩笁瀛楁鍏ㄧ┖锛夆噿 涓嶈噯閫?|
+ * | zcode | 鍚勬《 `expiresAt`锛堢锛夋渶灏忓€硷紱鏃犲甫鏈熶綑棰濇椂鎸夊綋鏃?| `zcode-upstream.ts` |
+ * | 鍏朵綑锛坬oder / qodercn / cline / raccoon / minimax / gemini / opencode锛?| **鏈彃浠舵湭鎺ュ叆** 鈫?`UNUSABLE` | 瑙佽璁℃枃妗?搂9.1 |
  *
- * ## ⚠️ 未接入的渠道必须返回 `UNUSABLE`，**不能**返回 `NEVER`
+ * ## 鈿狅笍 鏈帴鍏ョ殑娓犻亾蹇呴』杩斿洖 `UNUSABLE`锛?*涓嶈兘**杩斿洖 `NEVER`
  *
- * `NEVER` 的语义是「可用、只是无临期额度」，它**参与排序且可当选**。若把一个
- * 尚未实现的渠道折算成 `NEVER`，它会以「永久积分」的身份参与轮换 —— 而我们对
- * 它的余额**一无所知**（可能早就用尽了），结果是请求被发到一个没额度的渠道。
- * ⇒ 未接入 = `UNUSABLE` = 剔除。**宁可少一个候选，不可把未知当可用。**
+ * `NEVER` 鐨勮涔夋槸銆屽彲鐢ㄣ€佸彧鏄棤涓存湡棰濆害銆嶏紝瀹?*鍙備笌鎺掑簭涓斿彲褰撻€?*銆傝嫢鎶婁竴涓?
+ * 灏氭湭瀹炵幇鐨勬笭閬撴姌绠楁垚 `NEVER`锛屽畠浼氫互銆屾案涔呯Н鍒嗐€嶇殑韬唤鍙備笌杞崲 鈥斺€?鑰屾垜浠
+ * 瀹冪殑浣欓**涓€鏃犳墍鐭?*锛堝彲鑳芥棭灏辩敤灏戒簡锛夛紝缁撴灉鏄姹傝鍙戝埌涓€涓病棰濆害鐨勬笭閬撱€?
+ * 鈬?鏈帴鍏?= `UNUSABLE` = 鍓旈櫎銆?*瀹佸彲灏戜竴涓€欓€夛紝涓嶅彲鎶婃湭鐭ュ綋鍙敤銆?*
  *
- * ## 为什么只探「一个代表账号」
+ * ## 涓轰粈涔堝彧鎺€屼竴涓唬琛ㄨ处鍙枫€?
  *
- * 渠道**内部**的换号由各适配器每次请求现做（buddy/loomy 走余额选号器，其余走
- * `getAvailableAccount` + 429 换号）。本层只回答「这个渠道现在能不能用、它的
- * 临期额度大概什么时候作废」，不替它们选账号。
+ * 娓犻亾**鍐呴儴**鐨勬崲鍙风敱鍚勯€傞厤鍣ㄦ瘡娆¤姹傜幇鍋氾紙buddy/loomy 璧颁綑棰濋€夊彿鍣紝鍏朵綑璧?
+ * `getAvailableAccount` + 429 鎹㈠彿锛夈€傛湰灞傚彧鍥炵瓟銆岃繖涓笭閬撶幇鍦ㄨ兘涓嶈兘鐢ㄣ€佸畠鐨?
+ * 涓存湡棰濆害澶ф浠€涔堟椂鍊欎綔搴熴€嶏紝涓嶆浛瀹冧滑閫夎处鍙枫€?
  *
- * ## ⚠️ 取代表账号时必须带**真实 modelId**
+ * ## 鈿狅笍 鍙栦唬琛ㄨ处鍙锋椂蹇呴』甯?*鐪熷疄 modelId**
  *
- * `getAvailableAccount` 对空 `modelId` 会**跳过限流过滤**（`account-pool.ts`），
- * 于是取回的是「手动序第一个启用账号」——**哪怕它此刻正在限流**。后果是多账号
- * 池里临期额度被完全忽略。故这里先取一个真实模型 id 再取号。
+ * `getAvailableAccount` 瀵圭┖ `modelId` 浼?*璺宠繃闄愭祦杩囨护**锛坄account-pool.ts`锛夛紝
+ * 浜庢槸鍙栧洖鐨勬槸銆屾墜鍔ㄥ簭绗竴涓惎鐢ㄨ处鍙枫€嶁€斺€?*鍝€曞畠姝ゅ埢姝ｅ湪闄愭祦**銆傚悗鏋滄槸澶氳处鍙?
+ * 姹犻噷涓存湡棰濆害琚畬鍏ㄥ拷鐣ャ€傛晠杩欓噷鍏堝彇涓€涓湡瀹炴ā鍨?id 鍐嶅彇鍙枫€?
  *
- * ⚠️ `AbortError` **不得**折算成 `UNUSABLE`：用户取消请求时看到「请先登录」
- * 是误导（真实缺陷，PR !69 审计实测）。
+ * 鈿狅笍 `AbortError` **涓嶅緱**鎶樼畻鎴?`UNUSABLE`锛氱敤鎴峰彇娑堣姹傛椂鐪嬪埌銆岃鍏堢櫥褰曘€?
+ * 鏄瀵硷紙鐪熷疄缂洪櫡锛孭R !69 瀹¤瀹炴祴锛夈€?
  */
 
 /**
- * **已接入临期折算**的渠道 id（`createExpiryProbe` 的 `switch` 覆盖的那几家）。
+ * **宸叉帴鍏ヤ复鏈熸姌绠?*鐨勬笭閬?id锛坄createExpiryProbe` 鐨?`switch` 瑕嗙洊鐨勯偅鍑犲锛夈€?
  *
- * ## ⚠️ 为什么必须导出（审计轮次二实测证伪的缺陷）
+ * ## 鈿狅笍 涓轰粈涔堝繀椤诲鍑猴紙瀹¤杞浜屽疄娴嬭瘉浼殑缂洪櫡锛?
  *
- * 聚合层的目录会**广告**出所有能推导出规范名的虚拟模型 —— 包括**候选全来自
- * 未接入渠道**的那些。但那些候选一律被折算成 `UNUSABLE`（正确，见上方注释），
- * 于是用户选中它拿到的是：
+ * 鑱氬悎灞傜殑鐩綍浼?*骞垮憡**鍑烘墍鏈夎兘鎺ㄥ鍑鸿鑼冨悕鐨勮櫄鎷熸ā鍨?鈥斺€?鍖呮嫭**鍊欓€夊叏鏉ヨ嚜
+ * 鏈帴鍏ユ笭閬?*鐨勯偅浜涖€備絾閭ｄ簺鍊欓€変竴寰嬭鎶樼畻鎴?`UNUSABLE`锛堟纭紝瑙佷笂鏂规敞閲婏級锛?
+ * 浜庢槸鐢ㄦ埛閫変腑瀹冩嬁鍒扮殑鏄細
  *
  * ```
- * MISSING_CREDENTIAL | 「xxx」当前没有任何可用候选（渠道被关闭、模型被关、
- *                      或所有渠道都无可用账号）
+ * MISSING_CREDENTIAL | 銆寈xx銆嶅綋鍓嶆病鏈変换浣曞彲鐢ㄥ€欓€夛紙娓犻亾琚叧闂€佹ā鍨嬭鍏炽€?
+ *                      鎴栨墍鏈夋笭閬撻兘鏃犲彲鐢ㄨ处鍙凤級
  * ```
  *
- * ⇒ 把「**该渠道的临期折算尚未实现**」谎报成「**你没登录 / 渠道被关**」——
- * 正是本仓库反复修的那类误导性报错。实测（探针）：只接 `cline`（未接入）时
- * `listModels('aggregate')` 仍返回 `['auto','deepseek-v4-1-flash','muse-spark-1-3']`。
+ * 鈬?鎶娿€?*璇ユ笭閬撶殑涓存湡鎶樼畻灏氭湭瀹炵幇**銆嶈皫鎶ユ垚銆?*浣犳病鐧诲綍 / 娓犻亾琚叧**銆嶁€斺€?
+ * 姝ｆ槸鏈粨搴撳弽澶嶄慨鐨勯偅绫昏瀵兼€ф姤閿欍€傚疄娴嬶紙鎺㈤拡锛夛細鍙帴 `cline`锛堟湭鎺ュ叆锛夋椂
+ * `listModels('aggregate')` 浠嶈繑鍥?`['auto','deepseek-v4-1-flash','muse-spark-1-3']`銆?
  *
- * ⇒ 聚合目录只播报「**至少有一个已接入候选**」的虚拟模型；`auto` 不受影响
- *（它的池跨全部渠道，任一已接入渠道有账号就能路由）。
+ * 鈬?鑱氬悎鐩綍鍙挱鎶ャ€?*鑷冲皯鏈変竴涓凡鎺ュ叆鍊欓€?*銆嶇殑铏氭嫙妯″瀷锛沗auto` 涓嶅彈褰卞搷
+ *锛堝畠鐨勬睜璺ㄥ叏閮ㄦ笭閬擄紝浠讳竴宸叉帴鍏ユ笭閬撴湁璐﹀彿灏辫兘璺敱锛夈€?
  *
- * ⚠️ **本清单必须与下方 `switch` 的分支保持一致** —— 有专门用例锁它们相等
- *（`aggregate-expiry.spec.ts` 的「清单与 switch 一致」条），新增渠道时两处都要改。
+ * 鈿狅笍 **鏈竻鍗曞繀椤讳笌涓嬫柟 `switch` 鐨勫垎鏀繚鎸佷竴鑷?* 鈥斺€?鏈変笓闂ㄧ敤渚嬮攣瀹冧滑鐩哥瓑
+ *锛坄aggregate-expiry.spec.ts` 鐨勩€屾竻鍗曚笌 switch 涓€鑷淬€嶆潯锛夛紝鏂板娓犻亾鏃朵袱澶勯兘瑕佹敼銆?
  */
 export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   'buddy',
@@ -108,43 +108,50 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   'loomy',
   'codearts',
   'zcode',
-  // ⚠️ 用户 2026-10-07 质疑后核实加入（此前被 `auto-adapter.ts` 一句**不成立**的
-  //    理由排除：「其余 provider 没有跨账号的到期余额探测端点」）：
-  //    实测这两家的 `CreditPackage` 与 buddy **同形**，都有 `deductionEndTime`。
+  // 鈿狅笍 鐢ㄦ埛 2026-10-07 璐ㄧ枒鍚庢牳瀹炲姞鍏ワ紙姝ゅ墠琚?`auto-adapter.ts` 涓€鍙?*涓嶆垚绔?*鐨?
+  //    鐞嗙敱鎺掗櫎锛氥€屽叾浣?provider 娌℃湁璺ㄨ处鍙风殑鍒版湡浣欓鎺㈡祴绔偣銆嶏級锛?
+  //    瀹炴祴杩欎袱瀹剁殑 `CreditPackage` 涓?buddy **鍚屽舰**锛岄兘鏈?`deductionEndTime`銆?
   'lobsterai',
   'trae',
 ])
 /**
- * 临期折算结果的**缓存时长**（毫秒）。用户 2026-10-07 要求加缓存，TTL 由用户在
- * 60 / 90 / 120 中选定 —— **取 60**。
+ * 涓存湡鎶樼畻缁撴灉鐨?*缂撳瓨鏃堕暱**锛堟绉掞級銆傜敤鎴?2026-10-07 瑕佹眰鍔犵紦瀛橈紝TTL 鐢辩敤鎴峰湪
+ * 60 / 90 / 120 涓€夊畾 鈥斺€?**鍙?60**銆?
  *
- * ## 为什么是 60
+ * ## 涓轰粈涔堟槸 60
  *
- * - 与既有的 {@link BUDDY_BALANCE_CACHE_TTL_MS}（余额选号器，`60_000`）**同值** ——
- *   两处节奏一致，不会出现「选号用 30 秒前的数据、排序用 90 秒前的」这种分叉；
- * - 临期判据的最小粒度是**天**（资源包到期以天计）⇒ 60 秒滞后在语义上无害；
- * - 最短 ⇒ 用户改完渠道侧配置后最坏等待最短。90/120 只省极少量请求
- *  （面板与排序都不是高频路径），却让「刚登录的账号不出现在排序里」的窗口更长。
+ * - 涓庢棦鏈夌殑 {@link BUDDY_BALANCE_CACHE_TTL_MS}锛堜綑棰濋€夊彿鍣紝`60_000`锛?*鍚屽€?* 鈥斺€?
+ *   涓ゅ鑺傚涓€鑷达紝涓嶄細鍑虹幇銆岄€夊彿鐢?30 绉掑墠鐨勬暟鎹€佹帓搴忕敤 90 绉掑墠鐨勩€嶈繖绉嶅垎鍙夛紱
+ * - 涓存湡鍒ゆ嵁鐨勬渶灏忕矑搴︽槸**澶?*锛堣祫婧愬寘鍒版湡浠ュぉ璁★級鈬?60 绉掓粸鍚庡湪璇箟涓婃棤瀹筹紱
+ * - 鏈€鐭?鈬?鐢ㄦ埛鏀瑰畬娓犻亾渚ч厤缃悗鏈€鍧忕瓑寰呮渶鐭€?0/120 鍙渷鏋佸皯閲忚姹?
+ *  锛堥潰鏉夸笌鎺掑簭閮戒笉鏄珮棰戣矾寰勶級锛屽嵈璁┿€屽垰鐧诲綍鐨勮处鍙蜂笉鍑虹幇鍦ㄦ帓搴忛噷銆嶇殑绐楀彛鏇撮暱銆?
  */
 export const EXPIRY_CACHE_TTL_MS = 60_000
 
 /**
- * `createExpiryProbe` 的返回类型：临期探针 **+ 缓存失效入口**。
+ * `createExpiryProbe` 鐨勮繑鍥炵被鍨嬶細涓存湡鎺㈤拡 **+ 缂撳瓨澶辨晥鍏ュ彛**銆?
  *
- * ⚠️ 为什么是**交叉类型**而不是改 `ExpiryProbe` 本身：那个类型定义在
- * `aggregate-core.ts`（必须是**零 import** 的纯逻辑底座），而它只描述「给定渠道
- * 返回最早失效时刻」这一件事。缓存是**实现细节**，不该渗进底座类型。
+ * 鈿狅笍 涓轰粈涔堟槸**浜ゅ弶绫诲瀷**鑰屼笉鏄敼 `ExpiryProbe` 鏈韩锛氶偅涓被鍨嬪畾涔夊湪
+ * `aggregate-core.ts`锛堝繀椤绘槸**闆?import** 鐨勭函閫昏緫搴曞骇锛夛紝鑰屽畠鍙弿杩般€岀粰瀹氭笭閬?
+ * 杩斿洖鏈€鏃╁け鏁堟椂鍒汇€嶈繖涓€浠朵簨銆傜紦瀛樻槸**瀹炵幇缁嗚妭**锛屼笉璇ユ笚杩涘簳搴х被鍨嬨€?
  *
- * ⚠️ 为什么要暴露 `clear`：见 `createExpiryProbe` 返回处与 `src/index.ts`
- * 装配处的长注释 —— 缓存原先**没有任何失效通道**，导致刚登录的账号
- * 最长 60 秒对路由不可见（用户拿到误导性的「没有任何可用候选」）。
+ * 鈿狅笍 涓轰粈涔堣鏆撮湶 `clear`锛氳 `createExpiryProbe` 杩斿洖澶勪笌 `src/index.ts`
+ * 瑁呴厤澶勭殑闀挎敞閲?鈥斺€?缂撳瓨鍘熷厛**娌℃湁浠讳綍澶辨晥閫氶亾**锛屽鑷村垰鐧诲綍鐨勮处鍙?
+ * 鏈€闀?60 绉掑璺敱涓嶅彲瑙侊紙鐢ㄦ埛鎷垮埌璇鎬х殑銆屾病鏈変换浣曞彲鐢ㄥ€欓€夈€嶏級銆?
  */
-export type ExpiryProbeWithCache = ExpiryProbe & { clear: () => void }
+export type ExpiryProbeWithCache = ExpiryProbe & {
+  clear: () => void
+  /**
+   * zcode 涓撳睘锛氥€岃娓犻亾浣欓鑳戒拱鍝簺妯″瀷銆嶇殑鍏ㄨ处鍙峰苟闆嗭紙鍏跺畠娓犻亾鎭?`undefined`
+   * = 鏃犳ā鍨嬬粦瀹氱害鏉燂級銆傛煡璇㈠け璐ヤ篃杩斿洖 `undefined`锛堣皟鐢ㄦ柟涓嶆敹绐勫€欓€夛級銆?
+   */
+  quotaModels: (signal?: AbortSignal) => Promise<readonly string[] | undefined>
+}
 
-/** `createExpiryProbe` 的可选依赖（单测注入时钟用）。 */export interface ExpiryProbeOptions {
-  /** 当前时刻（毫秒）；默认 `Date.now`。 */
+/** `createExpiryProbe` 鐨勫彲閫変緷璧栵紙鍗曟祴娉ㄥ叆鏃堕挓鐢級銆?*/export interface ExpiryProbeOptions {
+  /** 褰撳墠鏃跺埢锛堟绉掞級锛涢粯璁?`Date.now`銆?*/
   now?: () => number
-  /** 缓存时长（毫秒）；默认 {@link EXPIRY_CACHE_TTL_MS}。 */
+  /** 缂撳瓨鏃堕暱锛堟绉掞級锛涢粯璁?{@link EXPIRY_CACHE_TTL_MS}銆?*/
   ttlMs?: number
 }
 
@@ -154,169 +161,221 @@ export function createExpiryProbe(
   options: ExpiryProbeOptions = {},
 ): ExpiryProbeWithCache {
   /**
-   * 按渠道缓存折算结果（用户要求：排序读缓存，不每次打服务器）。
+   * 鎸夋笭閬撶紦瀛樻姌绠楃粨鏋滐紙鐢ㄦ埛瑕佹眰锛氭帓搴忚缂撳瓨锛屼笉姣忔鎵撴湇鍔″櫒锛夈€?
    *
-   * ## ⚠️ 为什么缓存必须在**这个工厂内部**（而不是各调用方自己加）
+   * ## 鈿狅笍 涓轰粈涔堢紦瀛樺繀椤诲湪**杩欎釜宸ュ巶鍐呴儴**锛堣€屼笉鏄悇璋冪敤鏂硅嚜宸卞姞锛?
    *
-   * `auto-adapter.ts` 的 `expiryOf` **每次调用都新建一个 probe**
-   *（`createExpiryProbe(pool, …)`），聚合层也用同一个工厂 ⇒ 若缓存放在调用方，
-   * `auto` 与聚合会**各查一遍**，且 `auto` 那条路径每次都从零开始（等于没缓存）。
-   * 放在工厂内部后，**同一装配期内的所有调用共享一份** ——
-   * `src/index.ts` 里两个适配器用的是**同一个** probe 实例（见那里的装配注释）。
+   * `auto-adapter.ts` 鐨?`expiryOf` **姣忔璋冪敤閮芥柊寤轰竴涓?probe**
+   *锛坄createExpiryProbe(pool, 鈥?`锛夛紝鑱氬悎灞備篃鐢ㄥ悓涓€涓伐鍘?鈬?鑻ョ紦瀛樻斁鍦ㄨ皟鐢ㄦ柟锛?
+   * `auto` 涓庤仛鍚堜細**鍚勬煡涓€閬?*锛屼笖 `auto` 閭ｆ潯璺緞姣忔閮戒粠闆跺紑濮嬶紙绛変簬娌＄紦瀛橈級銆?
+   * 鏀惧湪宸ュ巶鍐呴儴鍚庯紝**鍚屼竴瑁呴厤鏈熷唴鐨勬墍鏈夎皟鐢ㄥ叡浜竴浠?* 鈥斺€?
+   * `src/index.ts` 閲屼袱涓€傞厤鍣ㄧ敤鐨勬槸**鍚屼竴涓?* probe 瀹炰緥锛堣閭ｉ噷鐨勮閰嶆敞閲婏級銆?
    *
-   * ⚠️ 缓存键是**渠道 id**（不是模型）：临期额度是账号级的，与模型无关
-   *（`buddyExpiry` 等只读账号的资源包）。不同渠道必须各自缓存。
+   * 鈿狅笍 缂撳瓨閿槸**娓犻亾 id**锛堜笉鏄ā鍨嬶級锛氫复鏈熼搴︽槸璐﹀彿绾х殑锛屼笌妯″瀷鏃犲叧
+   *锛坄buddyExpiry` 绛夊彧璇昏处鍙风殑璧勬簮鍖咃級銆備笉鍚屾笭閬撳繀椤诲悇鑷紦瀛樸€?
    *
-   * ⚠️ **中止不写缓存**（见下方 `catch`）：一次取消若留下条目，后续请求会误命中
-   * 一个「上次被取消」的结果。
+   * 鈿狅笍 **涓涓嶅啓缂撳瓨**锛堣涓嬫柟 `catch`锛夛細涓€娆″彇娑堣嫢鐣欎笅鏉＄洰锛屽悗缁姹備細璇懡涓?
+   * 涓€涓€屼笂娆¤鍙栨秷銆嶇殑缁撴灉銆?
    */
   const cache = new Map<string, { at: number; value: number }>()
+  /** zcode銆屼綑棰?鈫?妯″瀷闆嗗悎銆嶇殑缂撳瓨锛堥敭鎭掍负 `'zcode'`锛涗笌鎶樼畻缂撳瓨鍚?TTL銆佸悓浠ｉ檯锛夈€?*/
+  const quotaCache = new Map<string, { at: number; value: readonly string[] }>()
   const now = () => options.now?.() ?? Date.now()
   const ttl = options.ttlMs ?? EXPIRY_CACHE_TTL_MS
   /**
-   * 写缓存并返回该值。
+   * 鍐欑紦瀛樺苟杩斿洖璇ュ€笺€?
    *
-   * ⚠️ **`UNUSABLE` 也缓存**（不是只缓存成功值）：一个渠道「现在没有可用账号」
-   * 在 60 秒内不会变，不缓存会让面板与排序在每次刷新时都为它白跑一遍
-   *（取号 + 目录读取）。与 `buddy-balance-selector` 的失败短 TTL 取舍**不同** ——
-   * 那里失败会被判「额度用尽」（有误导性后果）故用 5 秒；这里 `UNUSABLE` 只是
-   * 「本轮剔除该候选」，60 秒的滞后无害。
+   * 鈿狅笍 **`UNUSABLE` 涔熺紦瀛?*锛堜笉鏄彧缂撳瓨鎴愬姛鍊硷級锛氫竴涓笭閬撱€岀幇鍦ㄦ病鏈夊彲鐢ㄨ处鍙枫€?
+   * 鍦?60 绉掑唴涓嶄細鍙橈紝涓嶇紦瀛樹細璁╅潰鏉夸笌鎺掑簭鍦ㄦ瘡娆″埛鏂版椂閮戒负瀹冪櫧璺戜竴閬?
+   *锛堝彇鍙?+ 鐩綍璇诲彇锛夈€備笌 `buddy-balance-selector` 鐨勫け璐ョ煭 TTL 鍙栬垗**涓嶅悓** 鈥斺€?
+   * 閭ｉ噷澶辫触浼氳鍒ゃ€岄搴︾敤灏姐€嶏紙鏈夎瀵兼€у悗鏋滐級鏁呯敤 5 绉掞紱杩欓噷 `UNUSABLE` 鍙槸
+   * 銆屾湰杞墧闄よ鍊欓€夈€嶏紝60 绉掔殑婊炲悗鏃犲銆?
    *
-   * ⚠️ 但**中止不写缓存** —— 那由调用点保证（`AbortError` 会 throw，走不到这里）。
+   * 鈿狅笍 浣?*涓涓嶅啓缂撳瓨** 鈥斺€?閭ｇ敱璋冪敤鐐逛繚璇侊紙`AbortError` 浼?throw锛岃蛋涓嶅埌杩欓噷锛夈€?
    */
   /**
-   * 缓存**代际**：`clear()` 递增它。
+   * 缂撳瓨**浠ｉ檯**锛歚clear()` 閫掑瀹冦€?
    *
-   * ## ⚠️ 为什么需要（真实缺陷，对抗审计实测证伪）
+   * ## 鈿狅笍 涓轰粈涔堥渶瑕侊紙鐪熷疄缂洪櫡锛屽鎶楀璁″疄娴嬭瘉浼級
    *
-   * `cacheAndReturn` 在探测**结束时**写缓存。若一个探测**早在 `clear()` 之前**
-   * 就已开始（正卡在某个 `await` 上），它的写回发生在 `clear()` **之后**
-   * ⇒ **陈旧值活过整个 TTL** —— 用户「清缓存」的努力被一个在途请求作废。
+   * `cacheAndReturn` 鍦ㄦ帰娴?*缁撴潫鏃?*鍐欑紦瀛樸€傝嫢涓€涓帰娴?*鏃╁湪 `clear()` 涔嬪墠**
+   * 灏卞凡寮€濮嬶紙姝ｅ崱鍦ㄦ煇涓?`await` 涓婏級锛屽畠鐨勫啓鍥炲彂鐢熷湪 `clear()` **涔嬪悗**
+   * 鈬?**闄堟棫鍊兼椿杩囨暣涓?TTL** 鈥斺€?鐢ㄦ埛銆屾竻缂撳瓨銆嶇殑鍔姏琚竴涓湪閫旇姹備綔搴熴€?
    *
-   * 实测：`clear() 期间在途探测 ⇒ -1 ｜ clear 后再探 ⇒ -1 ｜ 取号次数 = 1`
-   * ⇒ 登录后清缓存，但那个「登录前开始、登录后才结束」的探测把 `-1`（不可用）
-   * 又写了回去，用户仍要再等 60 秒（正是本修复要消灭的那个现象）。
+   * 瀹炴祴锛歚clear() 鏈熼棿鍦ㄩ€旀帰娴?鈬?-1 锝?clear 鍚庡啀鎺?鈬?-1 锝?鍙栧彿娆℃暟 = 1`
+   * 鈬?鐧诲綍鍚庢竻缂撳瓨锛屼絾閭ｄ釜銆岀櫥褰曞墠寮€濮嬨€佺櫥褰曞悗鎵嶇粨鏉熴€嶇殑鎺㈡祴鎶?`-1`锛堜笉鍙敤锛?
+   * 鍙堝啓浜嗗洖鍘伙紝鐢ㄦ埛浠嶈鍐嶇瓑 60 绉掞紙姝ｆ槸鏈慨澶嶈娑堢伃鐨勯偅涓幇璞★級銆?
    *
-   * ⇒ 探测在**开始时**记下代际，写回时代际不符就**丢弃**（不写缓存）。
+   * 鈬?鎺㈡祴鍦?*寮€濮嬫椂**璁颁笅浠ｉ檯锛屽啓鍥炴椂浠ｉ檯涓嶇灏?*涓㈠純**锛堜笉鍐欑紦瀛橈級銆?
    */
   let generation = 0
   /**
-   * 写缓存并返回。
+   * 鍐欑紦瀛樺苟杩斿洖銆?
    *
-   * ⚠️ **中止不写缓存** —— 那由调用点保证（`AbortError` 会 throw，走不到这里）。
+   * 鈿狅笍 **涓涓嶅啓缂撳瓨** 鈥斺€?閭ｇ敱璋冪敤鐐逛繚璇侊紙`AbortError` 浼?throw锛岃蛋涓嶅埌杩欓噷锛夈€?
    *
-   * @param startedAt - 本次探测**开始时**的代际（`clear()` 会让它过期）
+   * @param startedAt - 鏈鎺㈡祴**寮€濮嬫椂**鐨勪唬闄咃紙`clear()` 浼氳瀹冭繃鏈燂級
    */
   const cacheAndReturn = (forProvider: string, value: number, startedAt: number): number => {
-    // ⚠️ 代际不符 ⇒ 这是一次「跨越了 clear() 的在途探测」⇒ **丢弃**，不写缓存
-    //   （否则陈旧值会活过整个 TTL，让 clear() 形同虚设）。
+    // 鈿狅笍 浠ｉ檯涓嶇 鈬?杩欐槸涓€娆°€岃法瓒婁簡 clear() 鐨勫湪閫旀帰娴嬨€嶁噿 **涓㈠純**锛屼笉鍐欑紦瀛?
+    //   锛堝惁鍒欓檲鏃у€间細娲昏繃鏁翠釜 TTL锛岃 clear() 褰㈠悓铏氳锛夈€?
     if (startedAt === generation) cache.set(forProvider, { at: now(), value })
+    return value
+  }
+  /**
+   * zcode 涓撳睘锛?*璇ユ笭閬撶殑浣欓鑳戒拱鍝簺妯″瀷**锛坄zcodeQuotaModelIds` 鐨勫叏璐﹀彿
+   * 骞堕泦锛屽甫涓庢姌绠楀悓娆剧殑 60 绉掔紦瀛樹笌浠ｉ檯澶辨晥锛夈€傚叾瀹冩笭閬撹繑鍥?`undefined`
+   *锛? 鏃犳ā鍨嬬粦瀹氱害鏉燂紝璋冪敤鏂逛笉鏀剁獎鍊欓€夛級銆?
+   *
+   * 鈿狅笍 涓轰粈涔堟斁鍦ㄦ帰閽堜笂鑰屼笉鏄璋冪敤鏂硅嚜宸辨煡锛氫綑棰濇煡璇㈡槸**缃戠粶璇锋眰**锛岃仛鍚堝眰
+   * 姣忔 `candidatesFor` 閮戒細缁忚繃杩欓噷 鈥斺€?涓嶅叡浜紦瀛樺氨浼氭瘡娆￠噸鎵撲笂娓革紙涓庢姌绠?
+   * 缂撳瓨鏀惧伐鍘傚唴閮ㄧ殑鍚屼竴鐞嗙敱锛夈€?
+   */
+  const quotaModels = async (signal?: AbortSignal): Promise<readonly string[] | undefined> => {
+    signal?.throwIfAborted()
+    const cached = quotaCache.get('zcode')
+    if (cached !== undefined && now() - cached.at < ttl) return cached.value
+    const startedAt = generation
+    let credentials: unknown[]
+    try {
+      const probeModel = await firstModelIdOf('zcode') ?? ''
+      credentials = typeof pool.listAvailableCredentials === 'function'
+        ? (await pool.listAvailableCredentials('zcode', probeModel)).map((item) => item.credential)
+        : await legacySingleCredential(pool, 'zcode', probeModel)
+    } catch (error) {
+      signal?.throwIfAborted()
+      if (isAbortError(error)) throw error
+      return undefined
+    }
+    if (credentials.length === 0) return undefined
+    signal?.throwIfAborted()
+    // 澶氳处鍙峰彇骞堕泦锛氫换涓€璐﹀彿鐨勪綑棰濊兘涔扮殑妯″瀷閮界畻鏁帮紙涓庛€屾帰鍏ㄩ儴璐﹀彿銆佸彇鏈€鏃┿€?
+    // 鐨勬姌绠楀彛寰勫悓鍚?鈥斺€?璐﹀彿绾у樊寮備笉璇ヨ鍊欓€夎璇墧锛夈€?
+    const union = new Set<string>()
+    for (const credential of credentials) {
+      signal?.throwIfAborted()
+      let ids
+      try {
+        ids = await zcodeQuotaModelIds(credential as ZcodeCredential)
+      } catch (error) {
+        signal?.throwIfAborted()
+        if (isAbortError(error)) throw error
+        continue
+      }
+      // 鈿狅笍 浠讳竴璐﹀彿銆屾煡涓嶅埌銆嶏紙undefined锛夆噿 鏁翠綋鎸夈€屼笉鐭ラ亾銆嶅鐞嗭細杩斿洖 undefined
+      //   涓?*涓嶅啓缂撳瓨** 鈥斺€?璋冪敤鏂逛笉鏀剁獎锛堝畞鍙皯绛涳紝涓嶅彲璇墧锛夈€?
+      if (ids === undefined) return undefined
+      for (const id of ids) union.add(id)
+    }
+    if (union.size === 0) return undefined
+    const value: readonly string[] = Object.freeze([...union])
+    if (startedAt === generation) quotaCache.set('zcode', { at: now(), value })
     return value
   }
   return Object.assign(
     async (provider: string, signal?: AbortSignal) => {
-    // ⚠️ **缓存命中也要先查 signal**：中止必须立刻以 `AbortError` 结束，
-    //    不能因为「反正有缓存」就把取消吞掉（与下方短路同一口径）。
+    // 鈿狅笍 **缂撳瓨鍛戒腑涔熻鍏堟煡 signal**锛氫腑姝㈠繀椤荤珛鍒讳互 `AbortError` 缁撴潫锛?
+    //    涓嶈兘鍥犱负銆屽弽姝ｆ湁缂撳瓨銆嶅氨鎶婂彇娑堝悶鎺夛紙涓庝笅鏂圭煭璺悓涓€鍙ｅ緞锛夈€?
     signal?.throwIfAborted()
     const cached = cache.get(provider)
     if (cached !== undefined && now() - cached.at < ttl) return cached.value
 
-    // ⚠️ **未接入的渠道直接返回 `UNUSABLE`，不取号、不读目录**（第 3 轮审计实测）。
+    // 鈿狅笍 **鏈帴鍏ョ殑娓犻亾鐩存帴杩斿洖 `UNUSABLE`锛屼笉鍙栧彿銆佷笉璇荤洰褰?*锛堢 3 杞璁″疄娴嬶級銆?
     //
-    // 为什么要在最前面短路：本函数对**未接入**渠道最终也返回 `UNUSABLE`（走下方
-    // `switch` 的 `default`），但那时**已经**做了两件无意义的事：
-    //   ① `await firstModelIdOf(provider)` —— 一次渠道目录读取；
-    //   ② `await pool.getAvailableAccount(...)` —— 一次账号池查询。
-    // 而 `candidatesFor` 的池包含**全部**渠道的候选 ⇒ 每次 `auto` 请求都会为**每个**
-    // 未接入渠道白做这两件事（实测探针：`getAvailableAccount` 被以 `cline/m1` 调用）。
+    // 涓轰粈涔堣鍦ㄦ渶鍓嶉潰鐭矾锛氭湰鍑芥暟瀵?*鏈帴鍏?*娓犻亾鏈€缁堜篃杩斿洖 `UNUSABLE`锛堣蛋涓嬫柟
+    // `switch` 鐨?`default`锛夛紝浣嗛偅鏃?*宸茬粡**鍋氫簡涓や欢鏃犳剰涔夌殑浜嬶細
+    //   鈶?`await firstModelIdOf(provider)` 鈥斺€?涓€娆℃笭閬撶洰褰曡鍙栵紱
+    //   鈶?`await pool.getAvailableAccount(...)` 鈥斺€?涓€娆¤处鍙锋睜鏌ヨ銆?
+    // 鑰?`candidatesFor` 鐨勬睜鍖呭惈**鍏ㄩ儴**娓犻亾鐨勫€欓€?鈬?姣忔 `auto` 璇锋眰閮戒細涓?*姣忎釜**
+    // 鏈帴鍏ユ笭閬撶櫧鍋氳繖涓や欢浜嬶紙瀹炴祴鎺㈤拡锛歚getAvailableAccount` 琚互 `cline/m1` 璋冪敤锛夈€?
     //
-    // ⚠️ 两件都**不是网络请求**（`getAvailableAccount` 是纯本地内存过滤），故这属
-    // **性能浪费**而非功能缺陷；但短路是零成本的，且让语义更准确 ——
-    // 「未接入」与「有账号但折算不了」是两件事，不该走同一条路径。
+    // 鈿狅笍 涓や欢閮?*涓嶆槸缃戠粶璇锋眰**锛坄getAvailableAccount` 鏄函鏈湴鍐呭瓨杩囨护锛夛紝鏁呰繖灞?
+    // **鎬ц兘娴垂**鑰岄潪鍔熻兘缂洪櫡锛涗絾鐭矾鏄浂鎴愭湰鐨勶紝涓旇璇箟鏇村噯纭?鈥斺€?
+    // 銆屾湭鎺ュ叆銆嶄笌銆屾湁璐﹀彿浣嗘姌绠椾笉浜嗐€嶆槸涓や欢浜嬶紝涓嶈璧板悓涓€鏉¤矾寰勩€?
     //
-    // ⚠️ `signal` 仍要先查：中止必须**立刻**以 `AbortError` 结束（全局约束），
-    //    不能因为「这个渠道反正未接入」就把中止吞掉。
+    // 鈿狅笍 `signal` 浠嶈鍏堟煡锛氫腑姝㈠繀椤?*绔嬪埢**浠?`AbortError` 缁撴潫锛堝叏灞€绾︽潫锛夛紝
+    //    涓嶈兘鍥犱负銆岃繖涓笭閬撳弽姝ｆ湭鎺ュ叆銆嶅氨鎶婁腑姝㈠悶鎺夈€?
     signal?.throwIfAborted()
     if (!WIRED_EXPIRY_PROVIDERS.includes(provider)) return UNUSABLE
-    // ⚠️ 记下**本次探测开始时**的代际：若中途有 `clear()`（用户刚登录），
-    //    写回时会被丢弃（否则陈旧值活过整个 TTL —— 见 `cacheAndReturn` 的长注释）。
+    // 鈿狅笍 璁颁笅**鏈鎺㈡祴寮€濮嬫椂**鐨勪唬闄咃細鑻ヤ腑閫旀湁 `clear()`锛堢敤鎴峰垰鐧诲綍锛夛紝
+    //    鍐欏洖鏃朵細琚涪寮冿紙鍚﹀垯闄堟棫鍊兼椿杩囨暣涓?TTL 鈥斺€?瑙?`cacheAndReturn` 鐨勯暱娉ㄩ噴锛夈€?
     const startedAt = generation
 
-    // ⚠️ 类型是 `unknown[]`（各渠道凭据形状不同，由 `credentialExpiry` 分派时收窄）。
+    // 鈿狅笍 绫诲瀷鏄?`unknown[]`锛堝悇娓犻亾鍑嵁褰㈢姸涓嶅悓锛岀敱 `credentialExpiry` 鍒嗘淳鏃舵敹绐勶級銆?
     let credentials: unknown[]
     try {
-      // ⚠️ `?? ''` 是**有意的**降级（注释随搬移丢失，Task 7 复审 M3 指出，现补回）：
-      // 目录不可读 / 无可用模型时退回空串 —— 此时「有没有账号」这个判据**仍然成立**，
-      // 只是**限流维度退化为不参与**（`getAvailableAccount` 对空 modelId 跳过限流
-      // 过滤）。取舍方向：宁可少筛一层，也不可把整池判成不可用。
-      // ⚠️ 反之**不要**在这里因为拿不到 modelId 就 return UNUSABLE —— 那会让
-      // 「目录暂时读不到」被误报成「这个渠道没账号」。
+      // 鈿狅笍 `?? ''` 鏄?*鏈夋剰鐨?*闄嶇骇锛堟敞閲婇殢鎼Щ涓㈠け锛孴ask 7 澶嶅 M3 鎸囧嚭锛岀幇琛ュ洖锛夛細
+      // 鐩綍涓嶅彲璇?/ 鏃犲彲鐢ㄦā鍨嬫椂閫€鍥炵┖涓?鈥斺€?姝ゆ椂銆屾湁娌℃湁璐﹀彿銆嶈繖涓垽鎹?*浠嶇劧鎴愮珛**锛?
+      // 鍙槸**闄愭祦缁村害閫€鍖栦负涓嶅弬涓?*锛坄getAvailableAccount` 瀵圭┖ modelId 璺宠繃闄愭祦
+      // 杩囨护锛夈€傚彇鑸嶆柟鍚戯細瀹佸彲灏戠瓫涓€灞傦紝涔熶笉鍙妸鏁存睜鍒ゆ垚涓嶅彲鐢ㄣ€?
+      // 鈿狅笍 鍙嶄箣**涓嶈**鍦ㄨ繖閲屽洜涓烘嬁涓嶅埌 modelId 灏?return UNUSABLE 鈥斺€?閭ｄ細璁?
+      // 銆岀洰褰曟殏鏃惰涓嶅埌銆嶈璇姤鎴愩€岃繖涓笭閬撴病璐﹀彿銆嶃€?
       const probeModel = await firstModelIdOf(provider) ?? ''
-      // ⚠️⚠️ **取全部启用账号，而不是一个代表账号**（真实缺陷，用户报障 2026-10-07）。
+      // 鈿狅笍鈿狅笍 **鍙栧叏閮ㄥ惎鐢ㄨ处鍙凤紝鑰屼笉鏄竴涓唬琛ㄨ处鍙?*锛堢湡瀹炵己闄凤紝鐢ㄦ埛鎶ラ殰 2026-10-07锛夈€?
       //
-      // 用户质疑：「workbuddy 中一个号是 1 天到期，为什么我们统计是 2000 多天，
-      // **只用了第一个账号吗**？」—— 他猜对了。旧实现走 `getAvailableAccount`，
-      // 那个方法只返回**手动序第一个**可用账号 ⇒ 用户把「1 天到期」的号拖到后面时，
-      // 它的临期额度在**排序**里被完全忽略：这个渠道明明有一个快作废的号，
-      // 却被按「2000 多天后才作废」排到最后。
+      // 鐢ㄦ埛璐ㄧ枒锛氥€寃orkbuddy 涓竴涓彿鏄?1 澶╁埌鏈燂紝涓轰粈涔堟垜浠粺璁℃槸 2000 澶氬ぉ锛?
+      // **鍙敤浜嗙涓€涓处鍙峰悧**锛熴€嶁€斺€?浠栫寽瀵逛簡銆傛棫瀹炵幇璧?`getAvailableAccount`锛?
+      // 閭ｄ釜鏂规硶鍙繑鍥?*鎵嬪姩搴忕涓€涓?*鍙敤璐﹀彿 鈬?鐢ㄦ埛鎶娿€? 澶╁埌鏈熴€嶇殑鍙锋嫋鍒板悗闈㈡椂锛?
+      // 瀹冪殑涓存湡棰濆害鍦?*鎺掑簭**閲岃瀹屽叏蹇界暐锛氳繖涓笭閬撴槑鏄庢湁涓€涓揩浣滃簾鐨勫彿锛?
+      // 鍗磋鎸夈€?000 澶氬ぉ鍚庢墠浣滃簾銆嶆帓鍒版渶鍚庛€?
       //
-      // ⇒ 改为取**全部**账号，逐个折算，取**最早**的那个（见下方 `earliest`）。
-      //   ⚠️ 这不改变「实际发请求用哪个账号」（那仍由适配器按手动顺序选），
-      //   只改变「这个渠道整体的临期额度何时作废」这个**观测**口径。
+      // 鈬?鏀逛负鍙?*鍏ㄩ儴**璐﹀彿锛岄€愪釜鎶樼畻锛屽彇**鏈€鏃?*鐨勯偅涓紙瑙佷笅鏂?`earliest`锛夈€?
+      //   鈿狅笍 杩欎笉鏀瑰彉銆屽疄闄呭彂璇锋眰鐢ㄥ摢涓处鍙枫€嶏紙閭ｄ粛鐢遍€傞厤鍣ㄦ寜鎵嬪姩椤哄簭閫夛級锛?
+      //   鍙敼鍙樸€岃繖涓笭閬撴暣浣撶殑涓存湡棰濆害浣曟椂浣滃簾銆嶈繖涓?*瑙傛祴**鍙ｅ緞銆?
       //
-      // ⚠️ **`listAvailableCredentials` 是可选方法**（结构化类型）：它不存在时回退到
-      //    `getAvailableAccount`（只探一个代表账号）。回退不是为了兼容老装配 ——
-      //    真实装配（`src/index.ts`）永远传完整的 `AccountPool`；回退是为了让
-      //    **既有测试桩**（只实现 `getAvailableAccount`）仍然可用，尤其是
-      //    `auto-adapter.spec.ts` —— 那份 spec 是**硬约束：必须零改动且全绿**
-      //   （它是两处「搬移而非复制」重构的安全网）。
-      //    ⚠️ 回退路径的语义是**降级**（少看几个账号），不是错误。
+      // 鈿狅笍 **`listAvailableCredentials` 鏄彲閫夋柟娉?*锛堢粨鏋勫寲绫诲瀷锛夛細瀹冧笉瀛樺湪鏃跺洖閫€鍒?
+      //    `getAvailableAccount`锛堝彧鎺竴涓唬琛ㄨ处鍙凤級銆傚洖閫€涓嶆槸涓轰簡鍏煎鑰佽閰?鈥斺€?
+      //    鐪熷疄瑁呴厤锛坄src/index.ts`锛夋案杩滀紶瀹屾暣鐨?`AccountPool`锛涘洖閫€鏄负浜嗚
+      //    **鏃㈡湁娴嬭瘯妗?*锛堝彧瀹炵幇 `getAvailableAccount`锛変粛鐒跺彲鐢紝灏ゅ叾鏄?
+      //    `auto-adapter.spec.ts` 鈥斺€?閭ｄ唤 spec 鏄?*纭害鏉燂細蹇呴』闆舵敼鍔ㄤ笖鍏ㄧ豢**
+      //   锛堝畠鏄袱澶勩€屾惉绉昏€岄潪澶嶅埗銆嶉噸鏋勭殑瀹夊叏缃戯級銆?
+      //    鈿狅笍 鍥為€€璺緞鐨勮涔夋槸**闄嶇骇**锛堝皯鐪嬪嚑涓处鍙凤級锛屼笉鏄敊璇€?
       credentials = typeof pool.listAvailableCredentials === 'function'
         ? (await pool.listAvailableCredentials(provider, probeModel)).map((item) => item.credential)
         : await legacySingleCredential(pool, provider, probeModel)
     } catch (error) {
-      // ⚠️⚠️ **中止不得被吞成 `UNUSABLE`**（Global Constraints 的硬要求）。
+      // 鈿狅笍鈿狅笍 **涓涓嶅緱琚悶鎴?`UNUSABLE`**锛圙lobal Constraints 鐨勭‖瑕佹眰锛夈€?
       //
-      // 为什么需要这两行：本 `try` 里有两个可能抛错的调用 —— `firstModelIdOf`
-      // （装配层注入，会读渠道目录）与账号池查询。任一在**探测途中被取消**时抛出的
-      // `AbortError` 若被直接折算成 `UNUSABLE`，用户取消请求后看到的是
-      // 「没有任何可用候选」而不是中止（误导性报错），且与「真的没登录」无法区分。
-      // 与本仓库既有口径相反：`aggregate-core.ts` 的哨兵注释
-      //「abort **立刻抛 `AbortError`**，绝不折算成 `UNUSABLE`」。
+      // 涓轰粈涔堥渶瑕佽繖涓よ锛氭湰 `try` 閲屾湁涓や釜鍙兘鎶涢敊鐨勮皟鐢?鈥斺€?`firstModelIdOf`
+      // 锛堣閰嶅眰娉ㄥ叆锛屼細璇绘笭閬撶洰褰曪級涓庤处鍙锋睜鏌ヨ銆備换涓€鍦?*鎺㈡祴閫斾腑琚彇娑?*鏃舵姏鍑虹殑
+      // `AbortError` 鑻ヨ鐩存帴鎶樼畻鎴?`UNUSABLE`锛岀敤鎴峰彇娑堣姹傚悗鐪嬪埌鐨勬槸
+      // 銆屾病鏈変换浣曞彲鐢ㄥ€欓€夈€嶈€屼笉鏄腑姝紙璇鎬ф姤閿欙級锛屼笖涓庛€岀湡鐨勬病鐧诲綍銆嶆棤娉曞尯鍒嗐€?
+      // 涓庢湰浠撳簱鏃㈡湁鍙ｅ緞鐩稿弽锛歚aggregate-core.ts` 鐨勫摠鍏垫敞閲?
+      //銆宎bort **绔嬪埢鎶?`AbortError`**锛岀粷涓嶆姌绠楁垚 `UNUSABLE`銆嶃€?
       //
-      // ⚠️ 两行都要，覆盖两种情形（Task 7 复审 M1/M2 订正）：
-      // - `throwIfAborted()` 覆盖「signal **已被标记**」——**这是当前生产装配下
-      //   实际生效的那条**；
-      // - `isAbortError(error)` 覆盖「signal 未必标记、但抛出的就是 AbortError」。
-      //   ⚠️ 实测（Task 7 复审 M2）：当前装配的 `firstModelIdOf` 是
-      //   `ctx.llm.listModels(provider)`，而 **`LlmRuntime.listModels` 只接受
-      //   provider 一个参数、没有 signal 通道**（`dsh-llm/lib/index.js:1471`）
-      //   ⇒ 这一条在当前装配下不可达，是**防御性**的（装配层若改成会响应 signal
-      //   的取号方式，它就生效）。
+      // 鈿狅笍 涓よ閮借锛岃鐩栦袱绉嶆儏褰紙Task 7 澶嶅 M1/M2 璁㈡锛夛細
+      // - `throwIfAborted()` 瑕嗙洊銆宻ignal **宸茶鏍囪**銆嶁€斺€?*杩欐槸褰撳墠鐢熶骇瑁呴厤涓?
+      //   瀹為檯鐢熸晥鐨勯偅鏉?*锛?
+      // - `isAbortError(error)` 瑕嗙洊銆宻ignal 鏈繀鏍囪銆佷絾鎶涘嚭鐨勫氨鏄?AbortError銆嶃€?
+      //   鈿狅笍 瀹炴祴锛圱ask 7 澶嶅 M2锛夛細褰撳墠瑁呴厤鐨?`firstModelIdOf` 鏄?
+      //   `ctx.llm.listModels(provider)`锛岃€?**`LlmRuntime.listModels` 鍙帴鍙?
+      //   provider 涓€涓弬鏁般€佹病鏈?signal 閫氶亾**锛坄dsh-llm/lib/index.js:1471`锛?
+      //   鈬?杩欎竴鏉″湪褰撳墠瑁呴厤涓嬩笉鍙揪锛屾槸**闃插尽鎬?*鐨勶紙瑁呴厤灞傝嫢鏀规垚浼氬搷搴?signal
+      //   鐨勫彇鍙锋柟寮忥紝瀹冨氨鐢熸晥锛夈€?
       signal?.throwIfAborted()
       if (isAbortError(error)) throw error
       return UNUSABLE
     }
-    // ⚠️ 一个可用账号都没有 ⇒ UNUSABLE（「这个渠道现在不能用」）。
-    //    注意与「账号可用但读不到到期时间」严格区分 —— 后者由各 `*Expiry` 返回
-    //    `NEVER`（可用、只是不临期），绝不能在这里一并判成不可用。
+    // 鈿狅笍 涓€涓彲鐢ㄨ处鍙烽兘娌℃湁 鈬?UNUSABLE锛堛€岃繖涓笭閬撶幇鍦ㄤ笉鑳界敤銆嶏級銆?
+    //    娉ㄦ剰涓庛€岃处鍙峰彲鐢ㄤ絾璇讳笉鍒板埌鏈熸椂闂淬€嶄弗鏍煎尯鍒?鈥斺€?鍚庤€呯敱鍚?`*Expiry` 杩斿洖
+    //    `NEVER`锛堝彲鐢ㄣ€佸彧鏄笉涓存湡锛夛紝缁濅笉鑳藉湪杩欓噷涓€骞跺垽鎴愪笉鍙敤銆?
     if (credentials.length === 0) return cacheAndReturn(provider, UNUSABLE, startedAt)
-    // ⚠️ 逐个账号折算，取**最早**的到期时刻（用户选定：探全部账号、取最早）。
-    //    任一个账号折算失败不影响其余（跳过它）—— 一个坏账号不该让整个渠道被剔除。
+    // 鈿狅笍 閫愪釜璐﹀彿鎶樼畻锛屽彇**鏈€鏃?*鐨勫埌鏈熸椂鍒伙紙鐢ㄦ埛閫夊畾锛氭帰鍏ㄩ儴璐﹀彿銆佸彇鏈€鏃╋級銆?
+    //    浠讳竴涓处鍙锋姌绠楀け璐ヤ笉褰卞搷鍏朵綑锛堣烦杩囧畠锛夆€斺€?涓€涓潖璐﹀彿涓嶈璁╂暣涓笭閬撹鍓旈櫎銆?
     let earliest = NEVER
-    // ⚠️⚠️ **必须记录「是否有任何一个账号折算成功」**（真实缺陷，独立审计实测证伪）。
+    // 鈿狅笍鈿狅笍 **蹇呴』璁板綍銆屾槸鍚︽湁浠讳綍涓€涓处鍙锋姌绠楁垚鍔熴€?*锛堢湡瀹炵己闄凤紝鐙珛瀹¤瀹炴祴璇佷吉锛夈€?
     //
-    // 旧实现只看 `earliest` 的终值：若**所有**账号都折算失败（每个都 `continue`），
-    // `earliest` 仍是初值 `NEVER` ⇒ 该渠道被判「**可用**、只是不临期」⇒ **进入排序
-    // 且可当选**（`rankCandidates` 只剔除 `UNUSABLE`）。
+    // 鏃у疄鐜板彧鐪?`earliest` 鐨勭粓鍊硷細鑻?*鎵€鏈?*璐﹀彿閮芥姌绠楀け璐ワ紙姣忎釜閮?`continue`锛夛紝
+    // `earliest` 浠嶆槸鍒濆€?`NEVER` 鈬?璇ユ笭閬撹鍒ゃ€?*鍙敤**銆佸彧鏄笉涓存湡銆嶁噿 **杩涘叆鎺掑簭
+    // 涓斿彲褰撻€?*锛坄rankCandidates` 鍙墧闄?`UNUSABLE`锛夈€?
     //
-    // 而「所有账号都查不到额度」= 我们对这个渠道**一无所知** ⇒ 必须 `UNUSABLE`（剔除）。
-    // 这与本模块头的铁律**直接矛盾**：「未接入 = `UNUSABLE` = 剔除。**宁可少一个候选，
-    // 不可把未知当可用。**」
+    // 鑰屻€屾墍鏈夎处鍙烽兘鏌ヤ笉鍒伴搴︺€? 鎴戜滑瀵硅繖涓笭閬?*涓€鏃犳墍鐭?* 鈬?蹇呴』 `UNUSABLE`锛堝墧闄わ級銆?
+    // 杩欎笌鏈ā鍧楀ご鐨勯搧寰?*鐩存帴鐭涚浘**锛氥€屾湭鎺ュ叆 = `UNUSABLE` = 鍓旈櫎銆?*瀹佸彲灏戜竴涓€欓€夛紝
+    // 涓嶅彲鎶婃湭鐭ュ綋鍙敤銆?*銆?
     //
-    // 实测场景：buddy 有两个已登录账号、上游余额接口 5xx（或 token 全过期）⇒
-    // 旧实现让该渠道进入排序，请求被发到一个额度未知（可能已用尽）的渠道。
-    // 且该错误值还会被缓存 60 秒。
+    // 瀹炴祴鍦烘櫙锛歜uddy 鏈変袱涓凡鐧诲綍璐﹀彿銆佷笂娓镐綑棰濇帴鍙?5xx锛堟垨 token 鍏ㄨ繃鏈燂級鈬?
+    // 鏃у疄鐜拌璇ユ笭閬撹繘鍏ユ帓搴忥紝璇锋眰琚彂鍒颁竴涓搴︽湭鐭ワ紙鍙兘宸茬敤灏斤級鐨勬笭閬撱€?
+    // 涓旇閿欒鍊艰繕浼氳缂撳瓨 60 绉掋€?
     let anyConverted = false
     for (const credential of credentials) {
       signal?.throwIfAborted()
@@ -324,46 +383,35 @@ export function createExpiryProbe(
       try {
         value = await credentialExpiry(provider, credential)
       } catch (error) {
-        // 中止仍必须逃逸（与上面的 `try` 同一口径）。
+        // 涓浠嶅繀椤婚€冮€革紙涓庝笂闈㈢殑 `try` 鍚屼竴鍙ｅ緞锛夈€?
         signal?.throwIfAborted()
         if (isAbortError(error)) throw error
         continue
       }
       if (value === UNUSABLE) continue
-      // ⚠️ 走到这里 = 该账号**折算成功**（拿到一个真实到期时刻或 `NEVER`）。
-      //    两者都算「成功」：`NEVER` 的语义是「可用、但无临期额度」（如 codearts
-      //    的长期积分），它是**已知事实**，与「查不到」严格不同。
+      // 鈿狅笍 璧板埌杩欓噷 = 璇ヨ处鍙?*鎶樼畻鎴愬姛**锛堟嬁鍒颁竴涓湡瀹炲埌鏈熸椂鍒绘垨 `NEVER`锛夈€?
+      //    涓よ€呴兘绠椼€屾垚鍔熴€嶏細`NEVER` 鐨勮涔夋槸銆屽彲鐢ㄣ€佷絾鏃犱复鏈熼搴︺€嶏紙濡?codearts
+      //    鐨勯暱鏈熺Н鍒嗭級锛屽畠鏄?*宸茬煡浜嬪疄**锛屼笌銆屾煡涓嶅埌銆嶄弗鏍间笉鍚屻€?
       anyConverted = true
       if (value < earliest) earliest = value
     }
-    // ⚠️ 一个都没成功 ⇒ 未知 ⇒ 剔除（不是 NEVER）。
+    // 鈿狅笍 涓€涓兘娌℃垚鍔?鈬?鏈煡 鈬?鍓旈櫎锛堜笉鏄?NEVER锛夈€?
     if (!anyConverted) return cacheAndReturn(provider, UNUSABLE, startedAt)
     return cacheAndReturn(provider, earliest, startedAt)
     },
     /**
-     * 清空折算缓存（**账号变化时调用**，见 `src/index.ts` 的装配）。
-     *
-     * ## ⚠️⚠️ 为什么必须提供它（真实缺陷，对抗审计实测证伪）
-     *
-     * 缓存**原先没有任何失效通道**（`account-pool` 不碰它、也没暴露清理入口）
-     * ⇒ 「**刚登录**（或限流刚解禁）」的账号在**最长 60 秒内对路由不可见**。
-     * 用户此时请求拿到的是：
-     *   `MISSING_CREDENTIAL | 「xxx」当前没有任何可用候选（渠道被关闭、模型被关、
-     *    或所有渠道都无可用账号）`
-     * —— 正是设计文档 §9.2.1 明确要避免的误导性报错（用户明明刚登录成功）。
-     *
-     * ⚠️ `UNUSABLE` **也被缓存**（一个渠道「现在没账号」60 秒内不会变；不缓存会让
-     * 面板与排序每次白跑一遍取号 + 目录读取），所以刚登录后的那一格**必须显式清掉**。
+     * zcode銆屼綑棰?鈫?妯″瀷闆嗗悎銆嶉€氶亾锛堝疄鐜拌涓婃柟 `quotaModels`锛夈€傛寕鍦ㄥ悓涓€涓?
+     * `Object.assign` 涓婏紝涓庢姌绠椾富鍑芥暟銆乣clear` 鍏变韩鍚屼竴浠界紦瀛樹笌浠ｉ檯銆?
      */
-    { clear: (): void => { cache.clear(); generation += 1 } },
+    { quotaModels, clear: (): void => { cache.clear(); quotaCache.clear(); generation += 1 } },
   )
 }
 
 /**
- * 单账号回退：`listAvailableCredentials` 不存在时只取一个代表账号。
+ * 鍗曡处鍙峰洖閫€锛歚listAvailableCredentials` 涓嶅瓨鍦ㄦ椂鍙彇涓€涓唬琛ㄨ处鍙枫€?
  *
- * ⚠️ 这是**降级路径**（少看几个账号），只为让既有测试桩可用 —— 见调用点的长注释。
- * 真实装配（`AccountPool`）永远有 `listAvailableCredentials`。
+ * 鈿狅笍 杩欐槸**闄嶇骇璺緞**锛堝皯鐪嬪嚑涓处鍙凤級锛屽彧涓鸿鏃㈡湁娴嬭瘯妗╁彲鐢?鈥斺€?瑙佽皟鐢ㄧ偣鐨勯暱娉ㄩ噴銆?
+ * 鐪熷疄瑁呴厤锛坄AccountPool`锛夋案杩滄湁 `listAvailableCredentials`銆?
  */
 async function legacySingleCredential(
   pool: AccountPool,
@@ -376,12 +424,12 @@ async function legacySingleCredential(
 }
 
 /**
- * 单个账号的临期折算（按渠道分派）。
+ * 鍗曚釜璐﹀彿鐨勪复鏈熸姌绠楋紙鎸夋笭閬撳垎娲撅級銆?
  *
- * ⚠️ 从 `createExpiryProbe` 里抽出来，是为了让「探全部账号」的循环保持简单，
- * 且**判据仍然只有一处**（不复制 switch）。
+ * 鈿狅笍 浠?`createExpiryProbe` 閲屾娊鍑烘潵锛屾槸涓轰簡璁┿€屾帰鍏ㄩ儴璐﹀彿銆嶇殑寰幆淇濇寔绠€鍗曪紝
+ * 涓?*鍒ゆ嵁浠嶇劧鍙湁涓€澶?*锛堜笉澶嶅埗 switch锛夈€?
  *
- * @returns 毫秒时间戳（越小越早作废）／`NEVER`（长期）／`UNUSABLE`（查不到）
+ * @returns 姣鏃堕棿鎴筹紙瓒婂皬瓒婃棭浣滃簾锛夛紡`NEVER`锛堥暱鏈燂級锛廯UNUSABLE`锛堟煡涓嶅埌锛?
  */
 async function credentialExpiry(provider: string, credential: unknown): Promise<number> {
   switch (provider) {
@@ -395,7 +443,7 @@ async function credentialExpiry(provider: string, credential: unknown): Promise<
       return codeArtsExpiry(credential as CodeArtsCredential)
     case 'zcode':
       return zcodeExpiry(credential as ZcodeCredential)
-    // ⚠️ 这两家的包与 buddy 同形 ⇒ 走共享折算（判据只写一份，避免同族分叉）。
+    // 鈿狅笍 杩欎袱瀹剁殑鍖呬笌 buddy 鍚屽舰 鈬?璧板叡浜姌绠楋紙鍒ゆ嵁鍙啓涓€浠斤紝閬垮厤鍚屾棌鍒嗗弶锛夈€?
     case 'lobsterai':
       return lobsteraiExpiry(credential as LobsteraiCredential, LOBSTERAI)
     case 'trae':
@@ -406,19 +454,19 @@ async function credentialExpiry(provider: string, credential: unknown): Promise<
 }
 
 /**
- * 该错误是否是「调用方中止」类。
+ * 璇ラ敊璇槸鍚︽槸銆岃皟鐢ㄦ柟涓銆嶇被銆?
  *
- * ⚠️ **就地实现，不从 `aggregate-adapter.ts` 导入**：那会让本模块反向依赖上层的
- * 聚合适配器，正是本任务要避免的层次颠倒（见模块头）。判据与 `aggregate-adapter.ts`
- * 的 `isAbortLike` 一致，只取「错误自身携带 AbortError 标记」这一条 ——
- * `signal` 侧的情形由调用点的 `signal?.throwIfAborted()` 覆盖。
+ * 鈿狅笍 **灏卞湴瀹炵幇锛屼笉浠?`aggregate-adapter.ts` 瀵煎叆**锛氶偅浼氳鏈ā鍧楀弽鍚戜緷璧栦笂灞傜殑
+ * 鑱氬悎閫傞厤鍣紝姝ｆ槸鏈换鍔¤閬垮厤鐨勫眰娆￠鍊掞紙瑙佹ā鍧楀ご锛夈€傚垽鎹笌 `aggregate-adapter.ts`
+ * 鐨?`isAbortLike` 涓€鑷达紝鍙彇銆岄敊璇嚜韬惡甯?AbortError 鏍囪銆嶈繖涓€鏉?鈥斺€?
+ * `signal` 渚х殑鎯呭舰鐢辫皟鐢ㄧ偣鐨?`signal?.throwIfAborted()` 瑕嗙洊銆?
  */
 function isAbortError(error: unknown): boolean {
   if (error === null || typeof error !== 'object') return false
   return (error as { name?: unknown }).name === 'AbortError'
 }
 
-/** buddy 系：有效资源包 `deductionEndTime` 的最小值；无有效包 → NEVER。 */
+/** buddy 绯伙細鏈夋晥璧勬簮鍖?`deductionEndTime` 鐨勬渶灏忓€硷紱鏃犳湁鏁堝寘 鈫?NEVER銆?*/
 export async function buddyExpiry(
   product: typeof CODEBUDDY,
   credential: BuddyCredential,
@@ -427,29 +475,29 @@ export async function buddyExpiry(
 }
 
 /**
- * **共享的「有效资源包最早到期」折算**（buddy / workbuddy / lobsterai / trae 同形）。
+ * **鍏变韩鐨勩€屾湁鏁堣祫婧愬寘鏈€鏃╁埌鏈熴€嶆姌绠?*锛坆uddy / workbuddy / lobsterai / trae 鍚屽舰锛夈€?
  *
- * ## ⚠️ 为什么必须共享而不是各写一份（AGENTS.md 的「同族判据必须逐格同构」）
+ * ## 鈿狅笍 涓轰粈涔堝繀椤诲叡浜€屼笉鏄悇鍐欎竴浠斤紙AGENTS.md 鐨勩€屽悓鏃忓垽鎹繀椤婚€愭牸鍚屾瀯銆嶏級
  *
- * 这四家的 `CreditPackage` **结构相同**（都有 `active` / `remaining` /
- * `deductionEndTime`），差别只在**怎么取到那个 `CreditBalance`**（各自的端点与凭据）。
- * 各写一份的话，任何一侧收窄（如「只算 `active` 且 `remaining > 0` 的包」）都会
- * 在另一侧**静默分叉** —— 本仓库已因这类分叉发生过真实事故
- *（`classifyRaccoonFailure` 与 `classifyLoomyFailure` 四格判据不一致，
- * 危险方向恒定朝一侧：多写 24h 冷却 ⇒ 整池被封一天）。
+ * 杩欏洓瀹剁殑 `CreditPackage` **缁撴瀯鐩稿悓**锛堥兘鏈?`active` / `remaining` /
+ * `deductionEndTime`锛夛紝宸埆鍙湪**鎬庝箞鍙栧埌閭ｄ釜 `CreditBalance`**锛堝悇鑷殑绔偣涓庡嚟鎹級銆?
+ * 鍚勫啓涓€浠界殑璇濓紝浠讳綍涓€渚ф敹绐勶紙濡傘€屽彧绠?`active` 涓?`remaining > 0` 鐨勫寘銆嶏級閮戒細
+ * 鍦ㄥ彟涓€渚?*闈欓粯鍒嗗弶** 鈥斺€?鏈粨搴撳凡鍥犺繖绫诲垎鍙夊彂鐢熻繃鐪熷疄浜嬫晠
+ *锛坄classifyRaccoonFailure` 涓?`classifyLoomyFailure` 鍥涙牸鍒ゆ嵁涓嶄竴鑷达紝
+ * 鍗遍櫓鏂瑰悜鎭掑畾鏈濅竴渚э細澶氬啓 24h 鍐峰嵈 鈬?鏁存睜琚皝涓€澶╋級銆?
  *
- * ⇒ 判据只写在这里一份，各渠道只提供「怎么取余额」。
+ * 鈬?鍒ゆ嵁鍙啓鍦ㄨ繖閲屼竴浠斤紝鍚勬笭閬撳彧鎻愪緵銆屾€庝箞鍙栦綑棰濄€嶃€?
  *
- * ## 判据
+ * ## 鍒ゆ嵁
  *
- * 取 `active === true` 且 `remaining > 0` 的包里 `deductionEndTime` 的**最小值**；
- * 一个都没有 ⇒ `NEVER`（长期：排最后但不剔除）。
+ * 鍙?`active === true` 涓?`remaining > 0` 鐨勫寘閲?`deductionEndTime` 鐨?*鏈€灏忓€?*锛?
+ * 涓€涓兘娌℃湁 鈬?`NEVER`锛堥暱鏈燂細鎺掓渶鍚庝絾涓嶅墧闄わ級銆?
  *
- * ⚠️ **无到期时间 ⇒ `NEVER`，不是 `UNUSABLE`**：包是有效的，只是不下发到期时间
- *（实测 lobsterai 的 `expiresAt` 可为空串）⇒ 剔除它会丢掉一个可用渠道。
- * 与 `codeArtsExpiry` 的「读不到就不猜」同一条原则。
+ * 鈿狅笍 **鏃犲埌鏈熸椂闂?鈬?`NEVER`锛屼笉鏄?`UNUSABLE`**锛氬寘鏄湁鏁堢殑锛屽彧鏄笉涓嬪彂鍒版湡鏃堕棿
+ *锛堝疄娴?lobsterai 鐨?`expiresAt` 鍙负绌轰覆锛夆噿 鍓旈櫎瀹冧細涓㈡帀涓€涓彲鐢ㄦ笭閬撱€?
+ * 涓?`codeArtsExpiry` 鐨勩€岃涓嶅埌灏变笉鐚溿€嶅悓涓€鏉″師鍒欍€?
  *
- * @param fetchBalance - 取余额的函数；返回 `null` 表示查询失败 ⇒ `UNUSABLE`。
+ * @param fetchBalance - 鍙栦綑棰濈殑鍑芥暟锛涜繑鍥?`null` 琛ㄧず鏌ヨ澶辫触 鈬?`UNUSABLE`銆?
  */
 async function sharedPackageExpiry(
   fetchBalance: () => Promise<CreditBalance | null>,
@@ -472,12 +520,12 @@ async function sharedPackageExpiry(
 }
 
 /**
- * lobsterai：与 buddy **同形**（`CreditPackage.deductionEndTime` 由
- * `lobsterai-credits.ts` 从 ISO 8601 的 `expiresAt` 归一化而来）。
+ * lobsterai锛氫笌 buddy **鍚屽舰**锛坄CreditPackage.deductionEndTime` 鐢?
+ * `lobsterai-credits.ts` 浠?ISO 8601 鐨?`expiresAt` 褰掍竴鍖栬€屾潵锛夈€?
  *
- * ⚠️ 本渠道此前**不在** `WIRED_EXPIRY_PROVIDERS` 里，理由是
- * `auto-adapter.ts` 那句「其余 provider 没有跨账号的到期余额探测端点」——
- * **该理由对 lobsterai 不成立**（用户 2026-10-07 质疑后核实）。
+ * 鈿狅笍 鏈笭閬撴鍓?*涓嶅湪** `WIRED_EXPIRY_PROVIDERS` 閲岋紝鐞嗙敱鏄?
+ * `auto-adapter.ts` 閭ｅ彞銆屽叾浣?provider 娌℃湁璺ㄨ处鍙风殑鍒版湡浣欓鎺㈡祴绔偣銆嶁€斺€?
+ * **璇ョ悊鐢卞 lobsterai 涓嶆垚绔?*锛堢敤鎴?2026-10-07 璐ㄧ枒鍚庢牳瀹烇級銆?
  */
 export async function lobsteraiExpiry(
   credential: LobsteraiCredential,
@@ -487,10 +535,10 @@ export async function lobsteraiExpiry(
 }
 
 /**
- * trae：与 buddy **同形**（`CreditPackage.deductionEndTime` 由
- * `trae-credits.ts` 从条目级秒级 `expire_time` 换算而来）。
+ * trae锛氫笌 buddy **鍚屽舰**锛坄CreditPackage.deductionEndTime` 鐢?
+ * `trae-credits.ts` 浠庢潯鐩骇绉掔骇 `expire_time` 鎹㈢畻鑰屾潵锛夈€?
  *
- * ⚠️ 同 lobsterai：此前被那句（不成立的）理由排除在白名单外。
+ * 鈿狅笍 鍚?lobsterai锛氭鍓嶈閭ｅ彞锛堜笉鎴愮珛鐨勶級鐞嗙敱鎺掗櫎鍦ㄧ櫧鍚嶅崟澶栥€?
  */
 export async function traeExpiry(
   credential: TraeCredential,
@@ -499,7 +547,7 @@ export async function traeExpiry(
   return sharedPackageExpiry(() => fetchTraeCreditBalance(credential, product))
 }
 
-/** loomy：有今日赠送 → 当日 24:00；只剩永久 → NEVER。 */
+/** loomy锛氭湁浠婃棩璧犻€?鈫?褰撴棩 24:00锛涘彧鍓╂案涔?鈫?NEVER銆?*/
 export async function loomyExpiry(credential: LoomyCredential): Promise<number> {
   let detail
   try {
@@ -513,42 +561,42 @@ export async function loomyExpiry(credential: LoomyCredential): Promise<number> 
 }
 
 /**
- * codearts：**积分账户的到期时间不可知 ⇒ 一律 `NEVER`（长期）**。
+ * codearts锛?*绉垎璐︽埛鐨勫埌鏈熸椂闂翠笉鍙煡 鈬?涓€寰?`NEVER`锛堥暱鏈燂級**銆?
  *
- * ## ⚠️⚠️ 为什么不再算「当日 24:00」（真实缺陷，用户报障 2026-10-07）
+ * ## 鈿狅笍鈿狅笍 涓轰粈涔堜笉鍐嶇畻銆屽綋鏃?24:00銆嶏紙鐪熷疄缂洪櫡锛岀敤鎴锋姤闅?2026-10-07锛?
  *
- * 用户看到聚合面板把 codearts 列为候选，问「codearts 中也没显示积分临期」。
+ * 鐢ㄦ埛鐪嬪埌鑱氬悎闈㈡澘鎶?codearts 鍒椾负鍊欓€夛紝闂€宑odearts 涓篃娌℃樉绀虹Н鍒嗕复鏈熴€嶃€?
  *
- * **实测探针**（本机两个真实账号，只读 GET `statistics/plugin`）：
+ * **瀹炴祴鎺㈤拡**锛堟湰鏈轰袱涓湡瀹炶处鍙凤紝鍙 GET `statistics/plugin`锛夛細
  *
- * | 账号 | 类型 | `credit` |
+ * | 璐﹀彿 | 绫诲瀷 | `credit` |
  * |---|---|---|
- * | `A3E53911` | `isTokenPackage: true`（Token 计费） | `undefined`（无积分口径） |
- * | `82AD9D6E` | `isCreditPackage: true` | `22088.16`（**赠送**积分包） |
+ * | `A3E53911` | `isTokenPackage: true`锛圱oken 璁¤垂锛?| `undefined`锛堟棤绉垎鍙ｅ緞锛?|
+ * | `82AD9D6E` | `isCreditPackage: true` | `22088.16`锛?*璧犻€?*绉垎鍖咃級 |
  *
- * 且 `packages[].cycleStartTime` / `cycleEndTime` / `expiredTime` **三个字段实测全空**
- * —— 与 `codearts-credits.ts` 的既有注释一致：「`statistics/plugin` **不下发**
- * 资源包的有效性/周期字段……如实置为有效、周期留空，**而不是臆造一个到期时间**」。
+ * 涓?`packages[].cycleStartTime` / `cycleEndTime` / `expiredTime` **涓変釜瀛楁瀹炴祴鍏ㄧ┖**
+ * 鈥斺€?涓?`codearts-credits.ts` 鐨勬棦鏈夋敞閲婁竴鑷达細銆宍statistics/plugin` **涓嶄笅鍙?*
+ * 璧勬簮鍖呯殑鏈夋晥鎬?鍛ㄦ湡瀛楁鈥︹€﹀瀹炵疆涓烘湁鏁堛€佸懆鏈熺暀绌猴紝**鑰屼笉鏄噯閫犱竴涓埌鏈熸椂闂?*銆嶃€?
  *
- * ⇒ 旧实现（继承自 PR !69 的 `auto-adapter.ts` 折算表）写的是
- * 「有积分 ⇒ `nextUtc8DayStartMs()`（今日 24:00 作废）」—— 那**正是臆造**：
- * 接口没给过期时间，官方文档（README 引用）说的是签到积分「**自发放起 30 天内有效**」，
- * 两者都不是「今天 24:00」。
+ * 鈬?鏃у疄鐜帮紙缁ф壙鑷?PR !69 鐨?`auto-adapter.ts` 鎶樼畻琛級鍐欑殑鏄?
+ * 銆屾湁绉垎 鈬?`nextUtc8DayStartMs()`锛堜粖鏃?24:00 浣滃簾锛夈€嶁€斺€?閭?*姝ｆ槸鑷嗛€?*锛?
+ * 鎺ュ彛娌＄粰杩囨湡鏃堕棿锛屽畼鏂规枃妗ｏ紙README 寮曠敤锛夎鐨勬槸绛惧埌绉垎銆?*鑷彂鏀捐捣 30 澶╁唴鏈夋晥**銆嶏紝
+ * 涓よ€呴兘涓嶆槸銆屼粖澶?24:00銆嶃€?
  *
- * **后果**：codearts 的失效时刻被算成「今天」⇒ 在「临期优先」排序里**永远排最前**，
- * 抢走了本该先用掉的**真正临期**额度（buddy 的资源包 / loomy 的当日赠送）。
+ * **鍚庢灉**锛歝odearts 鐨勫け鏁堟椂鍒昏绠楁垚銆屼粖澶┿€嶁噿 鍦ㄣ€屼复鏈熶紭鍏堛€嶆帓搴忛噷**姘歌繙鎺掓渶鍓?*锛?
+ * 鎶㈣蛋浜嗘湰璇ュ厛鐢ㄦ帀鐨?*鐪熸涓存湡**棰濆害锛坆uddy 鐨勮祫婧愬寘 / loomy 鐨勫綋鏃ヨ禒閫侊級銆?
  *
- * ⇒ 改为 `NEVER`（长期积分：排最后，但**不剔除** —— 没有临期额度时仍要用它）。
- * 与本仓库既有原则一致：**读不到就不猜**（`zcodeExpiry` 对「查不到」返回
- * `UNUSABLE` 而非 `NEVER`，也是同一条原则）。
+ * 鈬?鏀逛负 `NEVER`锛堥暱鏈熺Н鍒嗭細鎺掓渶鍚庯紝浣?*涓嶅墧闄?* 鈥斺€?娌℃湁涓存湡棰濆害鏃朵粛瑕佺敤瀹冿級銆?
+ * 涓庢湰浠撳簱鏃㈡湁鍘熷垯涓€鑷达細**璇讳笉鍒板氨涓嶇寽**锛坄zcodeExpiry` 瀵广€屾煡涓嶅埌銆嶈繑鍥?
+ * `UNUSABLE` 鑰岄潪 `NEVER`锛屼篃鏄悓涓€鏉″師鍒欙級銆?
  *
- * ⚠️ 两种「无到期信息」的情形在本函数里**合并处理**（都返回 `NEVER`）：
- * 有积分（到期未知）与无积分（Token 计费账户 / 余额为 0）。两者在排序上同为
- * 「不临期」，且**都不该被剔除** —— 账号本身是可用的。
- * 这与 `buddyExpiry` 的「无有效包 → NEVER」是同一口径。
+ * 鈿狅笍 涓ょ銆屾棤鍒版湡淇℃伅銆嶇殑鎯呭舰鍦ㄦ湰鍑芥暟閲?*鍚堝苟澶勭悊**锛堥兘杩斿洖 `NEVER`锛夛細
+ * 鏈夌Н鍒嗭紙鍒版湡鏈煡锛変笌鏃犵Н鍒嗭紙Token 璁¤垂璐︽埛 / 浣欓涓?0锛夈€備袱鑰呭湪鎺掑簭涓婂悓涓?
+ * 銆屼笉涓存湡銆嶏紝涓?*閮戒笉璇ヨ鍓旈櫎** 鈥斺€?璐﹀彿鏈韩鏄彲鐢ㄧ殑銆?
+ * 杩欎笌 `buddyExpiry` 鐨勩€屾棤鏈夋晥鍖?鈫?NEVER銆嶆槸鍚屼竴鍙ｅ緞銆?
  *
- * ⚠️ 若将来接口开始下发周期字段，应改为读真实值（`packages[].expiredTime` 等），
- * **不要**恢复成某个固定估算。
+ * 鈿狅笍 鑻ュ皢鏉ユ帴鍙ｅ紑濮嬩笅鍙戝懆鏈熷瓧娈碉紝搴旀敼涓鸿鐪熷疄鍊硷紙`packages[].expiredTime` 绛夛級锛?
+ * **涓嶈**鎭㈠鎴愭煇涓浐瀹氫及绠椼€?
  */
 export async function codeArtsExpiry(credential: CodeArtsCredential): Promise<number> {
   let result
@@ -557,12 +605,12 @@ export async function codeArtsExpiry(credential: CodeArtsCredential): Promise<nu
   } catch {
     return UNUSABLE
   }
-  // 查不到 / 结构异常 ⇒ UNUSABLE（剔除），与「查到了但没有到期概念」严格区分。
+  // 鏌ヤ笉鍒?/ 缁撴瀯寮傚父 鈬?UNUSABLE锛堝墧闄わ級锛屼笌銆屾煡鍒颁簡浣嗘病鏈夊埌鏈熸蹇点€嶄弗鏍煎尯鍒嗐€?
   if (!result.ok) return UNUSABLE
   return NEVER
 }
 
-/** zcode：各桶 `expiresAt`（秒）最小值；无桶但有可领活动 → 当日 24:00。 */
+/** zcode锛氬悇妗?`expiresAt`锛堢锛夋渶灏忓€硷紱鏃犳《浣嗘湁鍙娲诲姩 鈫?褰撴棩 24:00銆?*/
 export async function zcodeExpiry(credential: ZcodeCredential): Promise<number> {
   let balance
   try {
@@ -570,8 +618,8 @@ export async function zcodeExpiry(credential: ZcodeCredential): Promise<number> 
   } catch {
     return UNUSABLE
   }
-  // ⚠️ `undefined` 表示「这次查不到」，不是「没有余额」—— 折算成 `NEVER` 会让
-  //    一个查不到余额的渠道以「永久积分」身份参与轮换。
+  // 鈿狅笍 `undefined` 琛ㄧず銆岃繖娆℃煡涓嶅埌銆嶏紝涓嶆槸銆屾病鏈変綑棰濄€嶁€斺€?鎶樼畻鎴?`NEVER` 浼氳
+  //    涓€涓煡涓嶅埌浣欓鐨勬笭閬撲互銆屾案涔呯Н鍒嗐€嶈韩浠藉弬涓庤疆鎹€?
   if (balance === undefined) return UNUSABLE
   let earliest = NEVER
   for (const bucket of balance.buckets) {
@@ -584,7 +632,40 @@ export async function zcodeExpiry(credential: ZcodeCredential): Promise<number> 
     }
   }
   if (earliest !== NEVER) return earliest
-  // 桶里没有带到期时间的余额：若还有可领的每日活动，按当日额度算（先烧它）。
+  // 妗堕噷娌℃湁甯﹀埌鏈熸椂闂寸殑浣欓锛氳嫢杩樻湁鍙鐨勬瘡鏃ユ椿鍔紝鎸夊綋鏃ラ搴︾畻锛堝厛鐑у畠锛夈€?
   if (balance.remaining > 0 || (balance.claimablePlans?.length ?? 0) > 0) return nextUtc8DayStartMs()
   return NEVER
+}
+
+/**
+ * zcode 鐨勯搴︽《鏄?*鎸夋ā鍨嬬粦瀹?*鐨勶紙鐢ㄦ埛瀹炴祴 2026-10-07锛夛細璐﹀彿鏈変綑棰?鈮?浠绘剰
+ * 妯″瀷鍙敤 鈥斺€?渚嬪浣欓鍙寕鍦?`GLM-5.3-Flash` 涓婃椂锛岃姹傚叾瀹冩ā鍨嬶紙鍚仛鍚堢洰褰?
+ * 娲剧敓鐨勫彉浣撳悕锛変細涓婃父杩斿洖 200 绌烘祦 +銆岄搴﹀凡鐢ㄥ敖銆嶏紙`QUOTA_EXCEEDED`锛夈€?
+ *
+ * 鏈嚱鏁板洖绛斻€?*杩欎釜璐﹀彿鐨勪綑棰濊兘涔板摢浜涙ā鍨?*銆嶏細鏀堕泦**鏈変綑棰濈殑妗?*鐨?
+ * `showName`锛堜笂娓告敞閲婃槑鍐欍€屽疄娴嬩负妯″瀷鍚嶏紝濡?`GLM-5.3-Flash`銆嶏級锛屼緵閫夊瀷灞傛妸
+ * zcode 鐨勫€欓€?*绾︽潫**鍒拌繖浜涙ā鍨嬩笂銆?
+ *
+ * 鈿狅笍 涓?{@link zcodeExpiry} 鍚屾簮涓嶅悓闂細閭ｄ釜鍥炵瓟銆屼粈涔堟椂鍊欎綔搴熴€嶏紙娓犻亾绾ф帓搴忥級锛?
+ * 鏈嚱鏁板洖绛斻€岄挶鑳借姳鍦ㄥ摢涓ā鍨嬩笂銆嶏紙鍊欓€夎繃婊わ級銆傛煡璇㈠け璐ヨ繑鍥?`undefined`
+ * 锛? 涓嶇煡閬擄紝璋冪敤鏂?*涓嶅緱**鎹鏀剁獎 鈥斺€?涓庛€屽畞鍙皯绛涳紝涓嶅彲璇墧銆嶅悓涓€鍙栬垗锛夈€?
+ */
+export async function zcodeQuotaModelIds(
+  credential: ZcodeCredential,
+): Promise<readonly string[] | undefined> {
+  let balance
+  try {
+    balance = await fetchZcodeBalance(credential)
+  } catch {
+    return undefined
+  }
+  if (balance === undefined) return undefined
+  const ids: string[] = []
+  for (const bucket of balance.buckets) {
+    const remaining = bucket.availableUnits ?? bucket.remainingUnits ?? 0
+    if (!(remaining > 0)) continue
+    const name = bucket.showName
+    if (typeof name === 'string' && name.trim().length > 0) ids.push(name.trim())
+  }
+  return ids
 }
