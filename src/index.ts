@@ -32,7 +32,7 @@ import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
-import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
+import { ALL_PRODUCTS, CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { installLoopResume } from './loop-recovery.js'
 import {
@@ -333,10 +333,19 @@ export function apply(ctx: Context): void {
   // WorkBuddy provider 已从中国版（copilot.tencent.com）改造为国际版
   // （www.workbuddy.ai）。旧账号存的是中国版凭据，其 token.domain 指向旧端点，
   // 用新 endpoint 发请求必然失败且会一直续期失败，故启动时清理掉。
-  // 判据是「凭据 domain ≠ 产品 apiDomain」，只清真正失配的条目。
-  void pool.pruneAccountsWithForeignDomain(WORKBUDDY).then((removed) => {
+  //
+  // ⚠️⚠️ 判据**不是**「凭据 domain ≠ 产品 apiDomain」（那会误删合法账号，见
+  // `pruneAccountsWithForeignDomain` 的注释），而是「domain 确证属于**其它**产品」：
+  // 故这里必须把**别的产品的已知域**传进去，否则函数无从判断「失配」。
+  // 未知域一律保留 —— 跨机导入的账号 / 上游新增 realm 主机都不该被静默删除。
+  const foreignBuddyDomains = ALL_PRODUCTS
+    .filter(product => product.id !== WORKBUDDY.id)
+    .flatMap(product => [...(product.knownDomains ?? [])])
+  void pool.pruneAccountsWithForeignDomain(WORKBUDDY, foreignBuddyDomains).then((removed) => {
     if (removed.length > 0) {
-      ctx.logger.info(
+      // ⚠️ 用 `warn` 而不是 `info`：这是**删除用户数据**的动作。原先记 `info`，
+      // 与「账号自己没了、日志里什么都没有」的报障形态同型（对抗审计指出）。
+      ctx.logger.warn(
         `[jet-hub] 已清理 ${removed.length} 个 WorkBuddy 旧版（中国版）账号，请重新登录：${removed.join(', ')}`,
       )
     }

@@ -1,5 +1,5 @@
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { sanitizeAccounts, sanitizePermanentLocks } from './jet-hub-store.js'
+import { providerOfAccountRef, sanitizeAccounts, sanitizePermanentLocks } from './jet-hub-store.js'
 import type { JetHubState, ModelDisableMap, PermanentLockMap } from './jet-hub-store.js'
 import { OPENCODE } from './opencode-product.js'
 import type { ProviderAccountEntry } from './types.js'
@@ -120,11 +120,21 @@ export interface BackupImportOptions {
  * | `uid` | `qoder` / `qodercn` / `trae` | 同上 |
  * | `userid` | `loomy`（讯飞用户 id，18 位数字串） | `LoomyCredential.userid` |
  * | `account_id` | `cline`（`usr-…`）/ `minimax` | 两个 `*Credential` 接口 |
+ * | `access_key_id` | `codearts`（AK/SK + security_token，**没有** `access_token`） | `CodeArtsCredential.access_key_id` |
  * | `sub` | `gemini`（OIDC `sub`，21 位数字串） | `GeminiCredential.sub` |
  *
  * ⚠️ **只收「一账号一值」的稳定标识**：`access_token` / `refresh_token` 会轮换，
  * 拿它们判重会让同一个账号在续期后被判成新账号（凭据泄漏面也会变大）。
  * ⚠️ `expires_at` / `nickname` 之类更是与身份无关，不要顺手加。
+ *
+ * ⚠️ **`codearts` 必须用 `access_key_id`**（真实缺陷，独立审计实测证伪）：
+ * 本机实测真实凭据的顶层字段是 `access_key_id` / `secret_access_key` /
+ * `security_token` / `expires_at` / `refresh_token` / `code_verifier` /
+ * `dpop_private_key_jwk` —— **上表其余字段一个都没有**。漏掉这一格时身份判重
+ * 恒判不出，于是「同一个 codearts 号我已手登过」**必然**多出一条重复账号
+ * （实测：`access_key_id` 相同的两条被判成不同账号、`accountsImported=1`）。
+ * ⚠️ 字段名与 `src/service.ts` 的 `CODEARTS_EXPIRY_ACCESSORS.identityOf`
+ * **同源**（那里也取 `access_key_id`）—— 改一处必须改另一处。
  *
  * ⚠️ **gemini 只收 `sub`、不收 `email`**（两者都在 `GeminiCredential` 里）：
  * `sub` 是 OIDC 的稳定主体标识（换邮箱、改昵称都不变），上游就是拿它当账号 id
@@ -140,9 +150,26 @@ export interface BackupImportOptions {
  * 第三方转换器给的又是确定性哈希 —— 同一个账号因此有两套 id。漏掉一个 provider
  * 的字段，就等于那个 provider 的「同一个号我已手登过」场景**必然**多出一条重复账号。
  *
+ * ## ⚠️ 已知**无法判重**的 provider：`minimax`
+ *
+ * `minimax` 的凭据里**没有任何可用的账号级稳定标识**，故它的身份判重**必然失效**
+ * （静默退化为纯 `id` 比对 ⇒ 「同一个 minimax 号我已手登过」会多出一条重复账号）。
+ * 这是**已知限制**，不是遗漏 —— 登记在此以免将来有人以为「表里漏了一格」：
+ *
+ * - `account_id`：**表里有它，但对 minimax 恒判不出**。它由
+ *   `minimax-oauth.ts` 的 `decodeJwtSub(accessToken)` 派生，而真实 `access_token`
+ *   是 `mmoat_` 前缀、60 字符、**0 个点**（`src/minimax.ts` 的 `decodeJwtExpMs`
+ *   注释明文记载）⇒ `decodeJwtSub` **恒返回 `undefined`** ⇒ `account_id` 恒缺。
+ *   保留该字段只为兼容上游将来改发 JWT。
+ * - 其余字段（`user_id` / `uid` / `userid` / `access_key_id` / `sub`）都不在
+ *   `MinimaxCredential` 里；`scope` / `nickname` 都不是账号级唯一值。
+ *
+ * 若要真正支持 minimax 判重，需**另调一次服务端 userinfo 端点**取稳定标识
+ * （属功能增强，不在本模块职责内）。
+ *
  * ⚠️ **绝不基于它做安全判定**，它只是判重键。
  */
-const IDENTITY_FIELDS = ['user_id', 'uid', 'userid', 'account_id', 'sub'] as const
+const IDENTITY_FIELDS = ['user_id', 'uid', 'userid', 'account_id', 'access_key_id', 'sub'] as const
 
 /**
  * 从凭据 JSON 原文里取出**账号身份**，取不到返回 undefined。
@@ -299,6 +326,27 @@ export function assertBackupPayload(value: unknown): asserts value is BackupPayl
   if (!Array.isArray(record.accounts)) {
     throw new BackupFormatError('备份 accounts 字段无效')
   }
+  // ⚠️ **元素校验只收「真正会抛错」的那两类**（真实缺陷，独立审计实测证伪）。
+  //
+  // 修复这个缺陷时我第一版写的是「任何非对象元素都硬拒」，但实测只有 **`null`**
+  // 会在统计环节抛 `TypeError: Cannot read properties of null`：
+  // `(1).expiresAt` / `('str').expiresAt` / `(true).expiresAt` 都**不抛**
+  // （原始值取属性返回 `undefined`），`[]` 同理。
+  //
+  // 而「拒绝范围过宽」有真实代价：它**破坏** `sanitizeAccounts` 的文档化降级行为
+  // （「坏条目丢弃而不是写进池里」）—— 一份混了一个 `1` 的旧备份，修复前能导入
+  // 其余全部好账号，过宽校验下**一个都导不进来**。
+  //
+  // ⇒ 判据只拒 `null` 与数组（数组会被 `sanitizeAccounts` 丢弃，且它的
+  // `expiresAt` 访问虽不抛、但语义上根本不是账号条目）。
+  // 其余原始值放行，交给 `sanitizeAccounts` 按既有语义丢弃。
+  //
+  // ⚠️ 另一条更稳的修法是在统计环节用 `entry?.expiresAt` 容错 —— 那能兼容**任何**
+  // 元素类型。这里选「收窄校验范围」是因为它同时保住了「校验在前、零副作用」的
+  // 性质（`null` 若走到写入之后才抛，会出现「数据已落地却报失败」）。
+  if (record.accounts.some((entry) => entry === null || Array.isArray(entry))) {
+    throw new BackupFormatError('备份 accounts 含非法条目（不能是 null 或数组）')
+  }
   if (typeof record.disabledModels !== 'object' || record.disabledModels === null || Array.isArray(record.disabledModels)) {
     throw new BackupFormatError('备份 disabledModels 字段无效')
   }
@@ -372,10 +420,11 @@ export async function importBackup(
   const mode: BackupImportMode = options.mode ?? 'replace'
 
   // 决定「本次真正要落地的账号」与「跳过的账号」。
-  // merge 的三层判重：① 池里已有的 **id**；② 池里已有的**身份**（凭据里的
-  // `user_id` / `uid` / `userid` / `account_id`，opencode 另有 `api_key`，
-  // 见 {@link IDENTITY_FIELDS}）；③ 备份文件内部重复的 id（同一份文件手工
-  // 编辑后可能出现两条同 id，只应新增一次，否则池里出现重复条目）。
+  // merge 的四层判重：① 池里已有的 **id**；② 池里已有的**身份**（凭据里的
+  // `user_id` / `uid` / `userid` / `account_id` / `access_key_id`，opencode 另有
+  // `api_key`，见 {@link IDENTITY_FIELDS}）；③ 备份文件内部重复的 id（由
+  // `sanitizeAccounts` 统一去重）；④ **`credentialRef` 已被本机别的账号占用**
+  // （见下，这是唯一一条「写凭据」方向的守卫）。
   let importedAccounts: readonly ProviderAccountEntry[] = payload.accounts
   const accountsSkipped: string[] = []
   if (mode === 'merge') {
@@ -387,21 +436,148 @@ export async function importBackup(
     // 账号」时，最常见的情形恰恰是「这个号我已经手登过了」。
     // 故再按凭据里的身份字段判重（它才是账号的真实身份）。
     const existingIdentities = await collectAccountIdentities(state.accounts, credentials)
+    /**
+     * ⚠️⚠️ **`credentialRef` → 占用它的本机账号 id**（真实缺陷，对抗审计实测证伪）。
+     *
+     * 前三层判重都只决定「**账号条目**要不要追加」，而凭据写入用的是**另一套键**
+     * （`credentialRef`）—— 这一维原先**无人检查**。后果：备份里一条全新 id、
+     * 全新身份的账号，只要它的 `credentialRef` 恰好等于本机**另一个**账号正在用的
+     * ref，写入就会**静默覆盖本机那个账号的凭据**，与「只增加不覆盖」的承诺相反，
+     * 也与 UI 文案（「同 id 的账号自动跳过、不会被覆盖」「现有账号…都不受影响」）不符。
+     *
+     * ⚠️ **客户端 `trimBackupPayload` 挡不住这条**：撞车的 ref 就在用户勾选的
+     * 范围内，裁剪只解决「范围**外**」的 ref。故这道守卫必须在**写凭据之前**、
+     * 在**宿主侧**做。
+     *
+     * 判据是「该 ref 是否被本机某个账号占用」，命中即**拒绝采纳该账号**（连账号
+     * 条目一起跳过，而不是只跳过凭据）—— 否则会落下一个**没有凭据**的账号条目，
+     * 它会让 provider 目录被门控隐藏、并让用户以为导入成功。
+     */
+    const refOwners = new Map<string, string>()
+    for (const entry of state.accounts) {
+      // 同一 ref 被本机多条账号引用时保留**第一条**（与 `updateAccount` 等按 id
+      // 查找只命中第一条的既有语义一致；正常池里不会出现这种数据）。
+      if (!refOwners.has(entry.credentialRef)) refOwners.set(entry.credentialRef, entry.id)
+    }
     const accepted: ProviderAccountEntry[] = []
-    for (const entry of sanitizeAccounts(payload.accounts)) {
+    /**
+     * ⚠️⚠️ **候选序列必须用「不去重」的归一化**（真实缺陷，最终审计实测证伪）。
+     *
+     * `sanitizeAccounts` 会按 id 去重（保留**第一条**）。若在采纳循环**之前**就调它，
+     * 会出现「同 id 的第二条因第一条被拒而永远没机会」的静默丢号：
+     *
+     * - 载荷 `[dup→refA, dup→refB]`，`refA` 被本机占用（第④层拒）、`refB` 空闲且
+     *   身份全新（**本应被采纳**）；
+     * - 入口去重只留第一条 ⇒ 第二条**根本进不了循环** ⇒ `accepted = []`；
+     * - 而 `accountsSkipped` 的差集判据（`!acceptedIds.has(id)`）把 `dup` 报成
+     *   「已跳过」，UI 渲染成「1 个账号已存在（已跳过，未覆盖）」—— **该账号从未
+     *   存在过**（它不在池里）。
+     *
+     * ⇒ 去重语义必须是「同 id 只采纳**第一条可采纳**的条目」，而不是「同 id 只保留
+     * 第一条候选」。故这里改用**只做字段清洗、不去重**的归一化，把「同 id」交给
+     * 下面的循环用 `existingIds` / `acceptedIds` 判（那才是「是否已存在」的权威判据）。
+     *
+     * ⚠️ 归一化的其余职责（丢弃坏条目、过滤脏限流值）**必须保留** —— 这里仍调
+     * `sanitizeAccounts` 的**单条**版本语义：用 `sanitizeAccounts([entry])[0]` 逐条清洗。
+     * 不用「整批调一次」是因为那会连带去重。
+     */
+    const candidateIds = new Set<string>()
+    for (const rawEntry of payload.accounts) {
+      // 逐条清洗：借 `sanitizeAccounts` 的字段校验与脏值过滤（传单元素数组即不去重）。
+      const cleaned = sanitizeAccounts([rawEntry])
+      const entry = cleaned[0]
+      if (entry === undefined) continue
       if (existingIds.has(entry.id)) {
-        accountsSkipped.push(entry.id)
+        /**
+         * ⚠️ **分两种情形，不能都报「已跳过」**（真实缺陷，最终审计实测证伪）：
+         *
+         * - 该 id **已在本批次被采纳**（`candidateIds` 命中）⇒ 本条只是文件内的
+         *   重复条目，**不是「账号已存在」**。若报进 `accountsSkipped`，同一个 id
+         *   会既出现在「新增」里又出现在「已跳过」里，UI 文案自相矛盾
+         *   （`jet-hub.js` 用 `accountsSkipped.length` 渲染「N 个账号已存在」）。
+         * - 该 id **真的在池里**（或在更早的轮次被拒）⇒ 才报「已跳过」。
+         */
+        if (!candidateIds.has(entry.id) && !accountsSkipped.includes(entry.id)) {
+          accountsSkipped.push(entry.id)
+        }
         continue
       }
       const identity = identityKey(entry.provider, payload.credentials[entry.credentialRef])
       if (identity !== undefined && existingIdentities.has(identity)) {
-        accountsSkipped.push(entry.id)
+        if (!accountsSkipped.includes(entry.id)) accountsSkipped.push(entry.id)
         continue
       }
+      // ⚠️ 第 ④ 层：ref 已被本机别的账号占用 → 拒绝（写它会覆盖对方凭据）。
+      // 注意这里比的是「占用者的 id 是否就是本条自己」——本条 id 已在第 ① 层
+      // 被排除（它不在池里），故只要命中占用就必然**是别人**，直接跳过即可。
+      // ⚠️ **本条被拒不影响同 id 的后续候选**（去重交给下面的登记，见上方注释）。
+      const owner = refOwners.get(entry.credentialRef)
+      if (owner !== undefined) {
+        if (!accountsSkipped.includes(entry.id)) accountsSkipped.push(entry.id)
+        continue
+      }
+      /**
+       * ⚠️ 第 ⑤ 层：**ref 的 provider 前缀必须与本条 `provider` 一致**。
+       *
+       * 账号 ref 的形态是 `{PREFIX}_ACCOUNT_{HEX}`，前缀与 provider 一一对应
+       * （单一真相源在 `src/jet-hub-store.ts`）。若备份里一条 `provider: 'buddy'`
+       * 的账号引用 `CODEARTS_ACCOUNT_XXX`，导入后 buddy 的适配器会去解析一份
+       * **AK/SK 形状**的凭据（buddy 读 `access_token`，而 codearts 凭据里没有它）
+       * ⇒ 该账号必然请求失败，且排障时会看到「凭据里没有 access_token」这种
+       * 与 provider 对不上的怪现象。
+       *
+       * 判据用 `providerOfAccountRef`（与 `accountFromCredentialRef` 同源的正则 +
+       * 同一张表），**不自己再写一份前缀映射**。
+       *
+       * ⚠️ 单凭据回退 ref（`BUDDY_ACCESS_TOKEN` 等）返回 `undefined` —— 它们不是
+       * 账号 ref，此处**放行**（`merge` 只写被采纳账号引用的 ref，而账号引用单凭据
+       * ref 是历史数据里真实存在的形态，不该因噎废食地拒绝整个账号）。
+       */
+      const refProvider = providerOfAccountRef(entry.credentialRef)
+      if (refProvider !== undefined && refProvider !== entry.provider) {
+        if (!accountsSkipped.includes(entry.id)) accountsSkipped.push(entry.id)
+        continue
+      }
+      // ⚠️ 登记「已采纳」：**这里是同 id 去重的唯一判据** —— 同 id 的后续候选会在
+      // 下一轮第 ① 层被 `existingIds` 拦下（这就是「同 id 只采纳第一条**可采纳**
+      // 的条目」的语义）。不要再依赖入口的 `sanitizeAccounts` 去重（那会静默丢号）。
       existingIds.add(entry.id)
       if (identity !== undefined) existingIdentities.add(identity)
+      // 同批次内两条账号引用同一 ref 时，第二条也必须拒绝：否则它们会共用一份
+      // 凭据（后写的赢），成为两个 id 指向同一份令牌的隐形别名。
+      refOwners.set(entry.credentialRef, entry.id)
       accepted.push(entry)
+      candidateIds.add(entry.id)
+      /**
+       * ⚠️ **采纳成功后必须回撤该 id 的「已跳过」记录**（真实缺陷，最终审计实测证伪）。
+       *
+       * 同 id 的**第一条**可能因 ref 撞车等原因被拒（那时已报进 `accountsSkipped`），
+       * 而**第二条**随后被采纳。若不回撤，同一个 id 会**既出现在「新增」里、
+       * 又出现在「已跳过」里** —— UI 用 `accountsSkipped.length` 渲染
+       * 「N 个账号已存在（已跳过，未覆盖）」，而该账号其实刚被成功导入。
+       *
+       * 语义澄清：`accountsSkipped` 回答的是「哪些**账号**（按 id）没被采纳」，
+       * 而一个 id 最终**被采纳了**就不再是「跳过」—— 文件里的重复条目本身
+       * 不构成「已存在」，只是同一份数据被写了两遍。
+       */
+      const skippedIndex = accountsSkipped.indexOf(entry.id)
+      if (skippedIndex !== -1) accountsSkipped.splice(skippedIndex, 1)
     }
+
+    /**
+     * ⚠️ **文件内部重复 id 的「报告」**（真实缺陷，独立审计实测证伪）。
+     *
+     * 采纳循环已按「同 id 只采纳第一条**可采纳**的条目」处理，故 `accountsSkipped`
+     * 里可能**只有**第一条被拒的 id，而文件里还有同 id 的后续候选（它们同样未被采纳）
+     * —— 但 `accountsSkipped` 的语义是「哪些**账号**被跳过了」，同一个 id 只该出现
+     * 一次，故这里**不再补报**（用 `Set` 收敛已在循环内用 `includes` 完成）。
+     *
+     * ⚠️ 保留这段只为**兜底**一种情形：文件里同 id 的条目**全部**是坏条目
+     * （被逐条清洗丢弃，从未进过循环）⇒ 循环里没报过 ⇒ 这里也不该报
+     * （它们不是「账号」，只是垃圾数据）。故本段**刻意什么都不做**，
+     * 仅保留 `candidateIds` 供调试与将来的提示字段使用。
+     */
+    void candidateIds
     importedAccounts = accepted
   }
 

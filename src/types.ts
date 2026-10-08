@@ -54,11 +54,36 @@ export interface ProviderAccountEntry {
   credentialRef: string
   /** 创建时间（毫秒时间戳） */
   createdAt: number
-  /** 凭据过期时间（毫秒时间戳），用于展示 */
+  /**
+   * 凭据过期时间（毫秒时间戳），用于展示。
+   *
+   * ⚠️ **不保证是 `Date` 可表示的值**（最终审计登记的「同族未加固格」）：
+   * 本字段来自**用户可编辑的备份文件**，而 `sanitizeAccounts` **不过滤它**
+   * （与 `modelRateLimits` 不同 —— 那个已由 `isValidResetAtMs` 加固，见
+   * `src/jet-hub-store.ts`）。故池里可能存在 `1e308` 这类超出 `Date` 范围的值。
+   *
+   * 当前**无崩溃可达**（已核实）：唯一对它调 `new Date()` 的是
+   * `src/raccoon-auth.ts` 的 `refreshAll`，而那条分支被 `isRaccoonExpired(credential)`
+   * 门控 —— 那个判据从**凭据**算过期、不读池值 ⇒ 池里坏值不可达；
+   * 客户端 `jet-hub.js` 的判据是 `typeof === 'number' && > 0 && <= Date.now()`，
+   * 对 `1e308` 恒 false，也安全。
+   *
+   * ⚠️ **但这是「补了 A 格、漏了同族 B 格」的形态**：将来若有人把某处判据改成读
+   * 池值，或在 UI 里加 `new Date(account.expiresAt)` 的格式化，就会与
+   * `modelRateLimits` 那个 `RangeError` 缺陷**完全同型**地炸。
+   * ⇒ 新增读取点前先确认值域，或**在此处统一加固**（加过滤）。
+   */
   expiresAt?: number
   /** 是否可静默续期 */
   refreshable: boolean
-  /** 每个模型的重置时间，key=模型ID（毫秒时间戳） */
+  /**
+   * 每个模型的重置时间，key=模型ID（毫秒时间戳）。
+   *
+   * ⚠️ 值域由 `isValidResetAtMs`（`src/jet-hub-store.ts`）保证：**有限、正、
+   * 且在 `Date` 范围内**（上界 8.64e15）。任何写入/读取点都必须走该谓词，
+   * 不要内联 `Number.isFinite(v) && v > 0` —— 那会漏掉「超出 Date 范围」这一格，
+   * 导致 `new Date(v).toISOString()` 抛 `RangeError`（真实缺陷，见该谓词注释）。
+   */
   modelRateLimits?: Record<string, number>
   /**
    * TRAE 签到设备轮换代次（仅 `trae` provider 使用）。

@@ -322,6 +322,17 @@ export function convertForeignAccounts(value) {
       exportedAt: new Date().toISOString(),
       credentials,
       accounts,
+      // ⚠️ **空表是「如实表达」而非「中性值」**（原注释写的是「避免这份载荷被当成
+      // 整体还原时改动模型设置」—— 那是**错的**）：第三方文件里确实不含模型开关
+      // 信息，故这里没有更好的值可写；而 `replaceAll` 收到空表会执行
+      // `modelCache = sanitizeDisabledModels({})` = `{}`，即**整体清空黑名单**。
+      //
+      // 风险由**两条**防线承担，不靠篡改这个字段：
+      // ① UI 走第三方路径时**默认切到 `merge`**（`jet-hub.js` 的
+      //    `setImportMode('merge')`），而 merge 分支**根本不读** `disabledModels`
+      //    （`src/backup.ts` 的 `credentialsToWrite` + `pool.mergeAccounts`）；
+      // ② 若用户手动改成「整体还原」，清空开关正是 `replace` 的**声明语义**
+      //    （用户明确选择了「覆盖当前全部账号与模型开关」，UI 上有红字警告）。
       disabledModels: {},
     },
     warnings,
