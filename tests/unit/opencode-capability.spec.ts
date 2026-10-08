@@ -79,7 +79,11 @@ describe('⚠️⚠️ 渲染路径上不得 await 网络（真机事故：模�
     // 不广播的话 DSH 会一直按「纯文本」渲染，图片能力补不上
     expect(indexSrc).toMatch(/primeOpencodeCapabilities\(\)/)
     expect(indexSrc).toMatch(/refreshOpencodeCapabilities\(/)
-    expect(indexSrc).toMatch(/llm\/adapters-updated/)
+    // ⚠️ 2026-10-08（issue IKJVTF 复审）：广播已收口到**唯一**实现
+    //（`src/catalog-broadcast.ts`），故断言的是「调了那个函数」+「真的导入」，
+    // 而不再要求内联 `ctx.emit`（那是旧形态，且用无可选链的 `ctx.logger.warn`）。
+    expect(indexSrc).toMatch(/refreshOpencodeCapabilities\(\(\)\s*=>\s*\{\s*broadcastCatalogChanged\(ctx\)\s*\}\)/)
+    expect(indexSrc).toContain("from './catalog-broadcast.js'")
   })
 })
 

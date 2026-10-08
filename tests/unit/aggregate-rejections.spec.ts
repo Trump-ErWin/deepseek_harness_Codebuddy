@@ -162,6 +162,164 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
       .rejects.toMatchObject({ code: 'MISSING_CREDENTIAL' })
   })
 
+  /**
+   * ★★ 候选必须按**自己的 `realId`** 复核账号可用性（真实缺陷，2026-10-07）。
+   *
+   * ## 缺陷机制
+   *
+   * 「额度耗尽」在账号池里是**按 modelId 记账**的
+   * （`entry.modelRateLimits[modelId]`，codearts 的 benefit 耗尽就写在那里，
+   * `llm-adapter.ts:1290`）。而临期折算取号时用的模型键是**渠道目录的第一个模型**
+   * （`src/index.ts` 的 `firstModelIdOf`：`models[0]?.id`），**不是**候选要派发的
+   * `realId` ⇒ 那个按 modelId 的过滤对聚合路径**整体失效**：
+   *
+   * | 路径 | 探测键 | 实际派发 | 过滤 |
+   * |---|---|---|---|
+   * | auto | `firstModelOf`（= 派发） | 同一个 | ✓ |
+   * | **aggregate** | `models[0]` | **候选 `realId`** | ✗ **失效** |
+   *
+   * ⇒ 账号在「要派发的那个模型」上额度已尽，聚合仍把它当可用候选发出去，
+   * 请求以 `InferHub.4291.200 insufficient quota`（benefit 额度）失败。
+   */
+  describe('★★ 候选可用性必须按 realId 复核（额度耗尽按模型记账）', () => {
+    /** 建一个「按 provider+modelId 判可用性」的池 + 两个渠道（buddy 更临期）。 */
+    const makeGated = (blockedProvider: string, blockedModel: string, failing?: string) => {
+      const sent: string[] = []
+      const ctx = {
+        logger: { warn: () => {}, info: () => {}, error: () => {} },
+        llm: {
+          listProviders: () => [{ id: 'buddy' }, { id: 'codearts' }],
+          listModels: async (p: string) => (p === 'buddy'
+            ? [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }]
+            : [{ id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash' }]),
+          resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+          stream: (o: { provider: string }) => {
+            sent.push(o.provider)
+            // `failing` 指定的渠道返回**终止 error chunk**（与 dsh-llm 的归一化一致）
+            // ⇒ 触发聚合层的「失败切换」逻辑，从而暴露「候选序里还有谁」。
+            if (failing !== undefined && o.provider === failing) {
+              return (async function* () {
+                yield { type: 'finish', reason: { kind: 'error', failure: { message: 'boom', code: 'SERVER' } } }
+              })()
+            }
+            return (async function* () { yield { type: 'text', text: 'ok' } })()
+          },
+        },
+      } as never
+      const pool = {
+        disabledModelsFor: () => new Set<string>(),
+        // 复刻真实判据：只在该 provider 的该模型被标记时返回 null。
+        getAvailableAccount: async (p: string, modelId: string) =>
+          (p === blockedProvider && modelId === blockedModel
+            ? null
+            : { entry: { id: 'a1' }, credential: {} }),
+      } as never
+      const adapter = new AggregateAdapter(ctx, {
+        accountPool: pool,
+        expiryProbe: async (p: string) => (p === 'buddy' ? 100 : 900),
+        rejections: () => ({}),
+      })
+      return { adapter, sent }
+    }
+
+    it('★★ 更临期的渠道在**目标模型**上额度已尽 ⇒ 必须让位给下一个候选', async () => {
+      // buddy 临期更早（100 < 900），但它在 `deepseek-v4.1-flash` 上被标记额度耗尽
+      // ⇒ 必须跳过它、发往 codearts。修复前：`expiryProbe` 只报临期值（100），
+      //    按 modelId 的可用性过滤对聚合路径失效 ⇒ 请求发往 buddy 必然失败
+      //    （codearts 的 benefit 额度耗尽就是这种形态，`InferHub.4291.200`）。
+      const { adapter, sent } = makeGated('buddy', 'deepseek-v4.1-flash')
+      await run(adapter, 'deepseek-v4-1-flash')
+      expect(sent, '额度已尽的渠道必须让位').toEqual(['codearts'])
+    })
+
+    it('★★★ 被剔除的候选**不得**作为失败回落的兜底（真实缺陷，对抗审计实测证伪）', async () => {
+      // ⚠️⚠️ **本条锁的是一个比「排序」更深的缺陷**（我上一版修复只改了一半）：
+      //
+      // 建池时每个候选的 `expiry` 初值是 `NEVER`，而 `rankCandidates`
+      // （`aggregate-core.ts:145`）**只剔除 `UNUSABLE`** —— `NEVER` 是合法排序值
+      // （「可用、只是不临期」）。故「只把候选从折算循环里拿掉」时，它的 `expiry`
+      // 仍是 `NEVER` ⇒ **照样进入候选序**、只是排最后；而 `targets` 是**逐个尝试**
+      // 的 ⇒ 前面的候选一失败，就**回落到那个额度已尽的候选**。
+      //
+      // 实测（对抗审计探针）：buddy 可用 + codearts 额度已尽 ⇒ 候选序
+      // `[buddy, codearts]`；buddy 失败后请求**发往 codearts** —— 缺陷只是被
+      // **推迟**而非消除。修法：被剔除的候选必须显式 `expiry = UNUSABLE`。
+      //
+      // ⚠️ 我上一版的两条用例（让位 + 对照）都**抓不到**它 —— 因为那里第一个
+      //    候选就成功了，从不触发回落。**必须让前面的候选失败**才能暴露。
+      const { adapter, sent } = makeGated('codearts', 'deepseek-v4.1-flash', 'buddy')
+      // ⚠️ 全部候选都失败时聚合会**如实抛出**最后一个错误 —— 这是正确行为
+      //    （不是静默成功），故这里吞掉它、只断言「发往了谁」。
+      try {
+        await run(adapter, 'deepseek-v4-1-flash')
+      } catch { /* 预期：buddy 是唯一候选且它失败了 */ }
+      expect(sent, 'buddy 失败后不得回落到额度已尽的 codearts').toEqual(['buddy'])
+    })
+
+    it('★ 对照：不设额度标记时，临期更早的 buddy 正常当选', async () => {
+      const { adapter, sent } = makeGated('__none__', '__none__')
+      await run(adapter, 'deepseek-v4-1-flash')
+      expect(sent).toEqual(['buddy'])
+    })
+
+    it('★ 只标记**别的**模型 ⇒ 不影响本模型（过滤按 realId 精确匹配）', async () => {
+      const { adapter, sent } = makeGated('buddy', 'some-other-model')
+      await run(adapter, 'deepseek-v4-1-flash')
+      expect(sent).toEqual(['buddy'])
+    })
+
+    it('★ 池未实现 `getAvailableAccount` ⇒ 跳过过滤（宁可少筛，不可误剔除整池）', async () => {
+      // ⚠️ 大量既有单测桩只实现 `disabledModelsFor`。缺失该方法时必须**跳过过滤**，
+      //    而不是把候选判成不可用 —— 否则所有桩用例都会「零候选」。
+      const sent: string[] = []
+      const ctx = {
+        logger: { warn: () => {}, info: () => {}, error: () => {} },
+        llm: {
+          listProviders: () => [{ id: 'buddy' }],
+          listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+          resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+          stream: (o: { provider: string }) => {
+            sent.push(o.provider)
+            return (async function* () { yield { type: 'text', text: 'ok' } })()
+          },
+        },
+      } as never
+      const adapter = new AggregateAdapter(ctx, {
+        accountPool: { disabledModelsFor: () => new Set<string>() } as never,
+        expiryProbe: async () => 100,
+        rejections: () => ({}),
+      })
+      await run(adapter, 'deepseek-v4-1-flash')
+      expect(sent).toEqual(['buddy'])
+    })
+
+    it('★ 池查询抛错 ⇒ 保留候选（一次查询异常不得让渠道整体消失）', async () => {
+      const sent: string[] = []
+      const ctx = {
+        logger: { warn: () => {}, info: () => {}, error: () => {} },
+        llm: {
+          listProviders: () => [{ id: 'buddy' }],
+          listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+          resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+          stream: (o: { provider: string }) => {
+            sent.push(o.provider)
+            return (async function* () { yield { type: 'text', text: 'ok' } })()
+          },
+        },
+      } as never
+      const adapter = new AggregateAdapter(ctx, {
+        accountPool: {
+          disabledModelsFor: () => new Set<string>(),
+          getAvailableAccount: async () => { throw new Error('池异常') },
+        } as never,
+        expiryProbe: async () => 100,
+        rejections: () => ({}),
+      })
+      await run(adapter, 'deepseek-v4-1-flash')
+      expect(sent, '查询异常 ⇒ 保留候选').toEqual(['buddy'])
+    })
+  })
+
   it('★ 拒绝表是**函数**：改过之后下一次请求立刻生效（不能读快照）', async () => {
     // ⚠️ 若传的是**快照对象**，用户在面板上关掉一个候选后必须等插件重启才生效 ——
     //    那是真实缺陷（用户会以为开关坏了）。

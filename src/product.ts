@@ -166,6 +166,32 @@ export interface BuddyProduct {
   /** 追加到登录 URL 的版本号（appendSessionParams 为 true 时使用） */
   pluginVersion?: string
   /**
+   * 该产品**合法的凭据 `domain` 值集合**（凭据里 `domain` 的语义是「登录站点」，
+   * 即 token 的 `iss` 主机，**不是**请求端点域名）。
+   *
+   * ## 为什么需要它（真实缺陷，独立审计实测证伪）
+   *
+   * `pruneAccountsWithForeignDomain` 原先的判据是「`domain !== product.apiDomain`
+   * 就删账号」。该判据**语义不成立**：
+   *
+   * - `domain` 记录的是**登录站**（`src/buddy-adapter.ts` 明文写着这一点），
+   *   且 `X-Domain` 实际以 `this.product.apiDomain || credential.domain` 取值 ——
+   *   凭据里的 `domain` 只是**兜底**，故 `domain ≠ apiDomain` **不蕴含**
+   *   「凭据发不到当前端点」。本机实测 buddy 的 20 个真实账号里，`domain`
+   *   合法地存在 `www.codebuddy.cn`（登录站）与 `copilot.tencent.com`（API 域）
+   *   两种值，而那 12 个 `www.codebuddy.cn` 的账号**一直是正常可用的**。
+   * - 该判据之所以在 buddy 上没出事，**只是因为上游恰好没对 `CODEBUDDY` 调用
+   *   这个函数**（唯一调用点是 `WORKBUDDY`）。一旦推广到 buddy，会一次性删掉
+   *   那 12 个账号。
+   *
+   * ⇒ 判据改为「domain **属于该产品的已知域集合**就保留，只有**确证属于其它
+   * 产品**（即命中别的产品的集合）才删」。本字段就是这个集合。
+   *
+   * ⚠️ 空数组表示「没有已知域信息」⇒ 调用方应**保守保留**（无法判定不等于失配）。
+   * ⚠️ 新增同源产品时必须登记它的登录站，否则跨产品导入的账号会被误判。
+   */
+  knownDomains?: readonly string[]
+  /**
    * 单张请求图片的像素预算（issue !IKITT9）。
    *
    * 适配器据此把附件派生成**缩放后的请求版本**再内联，而不是直接发原图。
@@ -314,6 +340,27 @@ export const CODEBUDDY: BuddyProduct = {
   cliVersion: '2.137.1',
   defaultCredentialRef: 'BUDDY_ACCESS_TOKEN',
   appendSessionParams: false,
+  // 合法登录站 / API 域：中国版登录站在 www.codebuddy.cn（`buddy.ts` 的
+  // WEBSITE_HOME），API 域是 copilot.tencent.com。两者都在本机真实凭据里出现过
+  // （12 条 `www.codebuddy.cn` + 8 条 `copilot.tencent.com`）。
+  //
+  // ⚠️⚠️ **`www.workbuddy.cn` 刻意不在这里**（虽然它是本产品的 `claimBase`）：
+  // 本字段的语义是「凭据里 `domain` 的合法值集合」，而 `domain` = token 的 `iss`
+  // 主机 = **登录站 / 认证 realm**。`www.workbuddy.cn` 是**成长中心网页站**
+  // （`claimBase` / `webBase`），**不签发 token**，因此永远不会作为 `iss` 出现在
+  // 凭据里 —— 把它登记进来属于**语义错位**。
+  //
+  // ⚠️ 更关键：`providerFromIssuer`（`plugin-src/client/backup-convert.js`）按
+  // 「host 含子串 `workbuddy`」分派，会把该域分派给 **workbuddy**；若这里也登记它，
+  // 两套判据对同一域给出**矛盾归属**（域表说 buddy、分派说 workbuddy）。
+  // 实测核对：登记它会让「knownDomains 归属 vs providerFromIssuer 归属」出现 1 处矛盾。
+  // ⇒ 两套判据必须同构：**只登记真正的 realm 主机**。
+  //
+  // ⚠️ 那「中国区旧 workbuddy 账号清不掉」怎么办？见 `knownDomains` 的注释：
+  // 未知域**保守保留**是刻意取舍（误留的代价远小于误删），且该域作为 realm
+  // **无任何实证**（本机 5 条 workbuddy 凭据的 `iss` 全是 `www.workbuddy.ai`）。
+  // 若将来拿到实证，正确修法是**同时**改分派判据与域表，不要只改一处。
+  knownDomains: ['copilot.tencent.com', 'www.codebuddy.cn', 'codebuddy.cn'],
   fallbackModels: CODEBUDDY_FALLBACK_MODELS,
 }
 
@@ -486,6 +533,15 @@ export const WORKBUDDY: BuddyProduct = {
   defaultCredentialRef: 'WORKBUDDY_ACCESS_TOKEN',
   appendSessionParams: true,
   pluginVersion: '5.5.2',
+  // 国际版登录站与 API 域都是 www.workbuddy.ai（本机 5 条真实凭据的 iss 全是此值，
+  // 且本产品的 `apiDomain` 自引入起就从未是 `.cn`）。
+  // ⚠️ 这里列的是 `.ai` 的各 realm 主机形态。**没有 `.cn` 条目**：本机与 git 历史
+  // 均无 `.cn` 作为 WorkBuddy realm 的实证（`www.workbuddy.cn` 是中国区**成长中心**
+  // 站，见 `claimBase`，不是登录站）。
+  // ⚠️ 宁可多列本产品的合法域：`pruneAccountsWithForeignDomain` 只在**命中别的产品
+  // 的集合**时才删账号（见 `knownDomains` 的注释），故漏列会让跨机导入的账号被静默
+  // 删除；反之多列只会让一个本该清理的旧账号多留一会儿（它至多续期失败并在日志可见）。
+  knownDomains: ['www.workbuddy.ai', 'workbuddy.ai', 'auth.workbuddy.ai', 'api.workbuddy.ai'],
   fallbackModels: WORKBUDDY_FALLBACK_MODELS,
 }
 

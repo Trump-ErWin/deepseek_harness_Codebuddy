@@ -4,6 +4,7 @@ import {
   LoomyAdapter, classifyLoomyFailure, parseLoomyRemoteModels, recordsLoomyRateLimit,
 } from '../../src/loomy-adapter.js'
 import { classifyRaccoonFailure } from '../../src/raccoon-adapter.js'
+import { LOOMY, loomyContextWindow } from '../../src/loomy-product.js'
 import type { LoomyCredential } from '../../src/loomy.js'
 
 const CRED: LoomyCredential = {
@@ -189,13 +190,87 @@ describe('LoomyAdapter.resolveModel', () => {
     const adapter = makeAdapter()
     const resolved = await adapter.resolveModel('loomy', 'spark-x')
     expect(resolved.name).toBe('Spark X2.5')
-    expect(resolved.context?.contextWindow).toBe(1_048_576)
+    // ⚠️ 兜底表路径的 `spark-x` 也必须是 262144（真实墙），不是远端的 1048576。
+    // ❌ 修复前这里写死 1_048_576 —— 那是把缺陷当契约（issue IKJW31）。
+    expect(resolved.context?.contextWindow).toBe(262_144)
   })
 
   it('未知模型不编造 context', async () => {
     const adapter = makeAdapter()
     const resolved = await adapter.resolveModel('loomy', 'nope')
     expect(resolved.context).toBeUndefined()
+  })
+})
+
+/**
+ * ★★ 上下文窗口的逐模型覆盖（Gitee issue IKJW31）。
+ *
+ * ## 缺陷
+ *
+ * 远端 `GET /models` 对 `spark-x` 声明 `context_length: 1048576`，**真实墙在
+ * 262144**。宿主按 1M 打包 ⇒ 输入越过 256K 后上游收下请求但 **0 输出** +
+ * `finish_reason=length` ⇒ 插件报 `max-tokens`，而 DSH 对它**不自动重试**
+ * ⇒ 长会话「有时候 token 截断」（4 次失败的 prompt 总量逐 token 相同：
+ * `262,138 = 262,144 − 6`）。
+ *
+ * ## 为什么这一组必须分**两条路径**测
+ *
+ * 远端可用时走远端值、远端失败时走兜底表。**只改兜底表等于没改** ——
+ * 这是本 issue 最容易踩空的点（作者第一版就漏了远端路径）。
+ * 两条路径各一条用例，任何一条退化都会立刻变红。
+ */
+describe('LoomyAdapter 上下文窗口覆盖（issue IKJW31）', () => {
+  it('覆盖表把 spark-x 降到真实的 262144，且判据不依赖调用方的值', () => {
+    expect(loomyContextWindow('spark-x', 1_048_576)).toBe(262_144)
+    // 无覆盖的模型原样透传（**防误伤**：不能把整表一刀切成某个值）
+    expect(loomyContextWindow('MiniMax-M3', 1_048_576)).toBe(1_048_576)
+    expect(loomyContextWindow('Kimi-k2.6', 262_144)).toBe(262_144)
+  })
+
+  it('★ 远端路径：远端声明 1M，解析结果必须是 262144', () => {
+    // 判据直接打在 `parseLoomyRemoteModels` 上（真实远端形状：context_length=1048576）
+    const models = parseLoomyRemoteModels({
+      data: [remoteEntry({ id: 'spark-x', name: 'Spark X2.5（x0.1）' })],
+    })
+    // ⛔ 回归前：这里是 1_048_576 —— 宿主于是按 1M 打包。
+    expect(models[0]!.contextWindow).toBe(262_144)
+  })
+
+  it('★ 远端路径：resolveModel 同样拿到 262144（这是宿主真正读的那个值）', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => parseLoomyRemoteModels({
+        data: [remoteEntry({ id: 'spark-x', name: 'Spark X2.5（x0.1）' })],
+      }),
+    })
+    const resolved = await adapter.resolveModel('loomy', 'spark-x')
+    expect(resolved.context?.contextWindow).toBe(262_144)
+  })
+
+  it('★ 兜底表路径：条目本身已写真实值（不是靠覆盖表兜的）', () => {
+    const entry = LOOMY.fallbackModels.find((m) => m.id === 'spark-x')
+    // 兜底表是「未联网时的真相源」，它自己就该是真实的 —— 若只靠覆盖表，
+    // 将来有人抄这张表去别处就会把 1M 一起抄走。
+    expect(entry?.contextWindow).toBe(262_144)
+  })
+
+  it('⚠️ 其余模型不受影响（远端与兜底两条路径都不许被误改）', () => {
+    const models = parseLoomyRemoteModels({
+      data: [
+        remoteEntry({ id: 'MiniMax-M3' }),
+        remoteEntry({ id: 'Kimi-k2.6', context_length: 262_144 }),
+      ],
+    })
+    expect(models.find((m) => m.id === 'MiniMax-M3')?.contextWindow).toBe(1_048_576)
+    expect(models.find((m) => m.id === 'Kimi-k2.6')?.contextWindow).toBe(262_144)
+  })
+
+  it('⚠️ 远端未给窗口（0）时不得被覆盖表凭空变成 262144', () => {
+    // 判据顺序是「先判有效再覆盖」：`spark-x` 若某天远端不再下发 context_length，
+    // 结果应是 0（不声明）而不是覆盖值 —— 否则会谎报一个我们并未验证的窗口。
+    const models = parseLoomyRemoteModels({
+      data: [remoteEntry({ id: 'spark-x', context_length: undefined })],
+    })
+    expect(models[0]!.contextWindow).toBe(0)
   })
 })
 

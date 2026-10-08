@@ -75,17 +75,35 @@ describe('★ 旧 auto 的徽标链路：宿主侧（上游 ba10f4f 回归的恢
   it('★ 记录必须发生在 dispatch 的**所有** return 之前（带图改道也要记）', () => {
     // ⚠️ 若写在某个 return 之后，带图改道那条路径会漏记 —— 而那正是最需要
     //    徽标止损的时刻（用户以为在用 A，实际烧 B）。
-    const start = ADAPTER.indexOf('private dispatch(')
-    expect(start).toBeGreaterThan(0)
+    // ⚠️ 不能写死 `private dispatch(`：上游为「零输出改道」把它改成了
+    //    **`async *` 生成器**（`private async *dispatch(`）—— 写死会让
+    //    `start = -1`，用例以「找不到」的形式失败，看起来像实现坏了、
+    //    实际只是签名变了（本轮合并上游 1d8210c 后实测撞到）。
+    const start = ADAPTER.search(/private (async \*\s*)?dispatch\(/)
+    expect(start, '必须能定位到 dispatch 的定义（签名可能是 async * 生成器）').toBeGreaterThan(-1)
     const end = ADAPTER.indexOf('\n  }', start)
-    // ⚠️ **必须先去注释**：本仓库注释里就写着「必须在任何 return 之前记」，
-    //    对全文 `indexOf('return ')` 会命中那句注释（实测撞过，第一次就是它红的）。
     const body = codeOf(ADAPTER.slice(start, end))
     const writeAt = body.indexOf('this.lastDispatch = {')
-    const firstReturn = body.indexOf('return ')
-    expect(writeAt).toBeGreaterThan(0)
-    expect(firstReturn).toBeGreaterThan(0)
-    expect(writeAt, 'lastDispatch 必须在第一个 return 之前写入').toBeLessThan(firstReturn)
+    expect(writeAt, 'dispatch 必须写入 lastDispatch').toBeGreaterThan(0)
+    // ⚠️ 断言「在第一个 return 之前」这个写法**已过时**：上游为「零输出改道」
+    //    把 `dispatch` 改成了 `async *` 生成器，函数体内**根本没有** return 语句
+    //    （改道走 `yield*`），于是 `indexOf('return ')` 只会命中注释里那句
+    //    「必须在任何 return 之前记」 ⇒ 用例红得莫名其妙（本轮合并 1d8210c 实测）。
+    //
+    // ⇒ 改成断言真正的不变量：**写入必须是函数体的第一条语句**。
+    //    这比「在 return 之前」更强，且不依赖 return 的存在 ——
+    //    只要它是第一条，任何提前退出（return / yield / throw）都必然已记过。
+    // ⚠️ 找函数体起点不能用 `indexOf(') {')` —— 上游改成生成器后，签名里
+    //    `= new Set(),` 之后、函数体之前还夹着 `AsyncIterable<StreamChunk> {`，
+    //    而更早的匹配会命中函数体内层的 `if (...) {`（实测 bodyStart 落在
+    //    `probe = noteChunk(...)` 之后，断言因此误红）。
+    //    ⇒ 从签名开始**按括号配平**扫到第一个深度归零的 `{`，那才是函数体。
+    const sigEnd = body.indexOf('AsyncIterable<StreamChunk>')
+    expect(sigEnd, '应能定位到 dispatch 的返回类型标注').toBeGreaterThan(-1)
+    const bodyStart = body.indexOf('{', sigEnd)
+    expect(bodyStart).toBeGreaterThan(-1)
+    const after = body.slice(bodyStart + 1).trim()
+    expect(after.startsWith('this.lastDispatch = {'), 'lastDispatch 必须是 dispatch 函数体的第一条语句').toBe(true)
   })
 
   it('★ 记录临期失效时刻（折叠胶囊倒计时的数据来源）', () => {
