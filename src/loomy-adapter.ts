@@ -23,6 +23,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import {
   isLoomyChatModel,
@@ -222,6 +223,17 @@ export interface LoomyAdapterOptions {
   product?: LoomyProduct
   /** 注入的 fetch（测试用）。 */
   fetchImpl?: typeof fetch
+  /**
+   * 远端目录**落地后**的通知回调（issue IKJVTF）。
+   *
+   * 由 `registerLoomyLlm` 注入为 `broadcastCatalogChanged(ctx)`。适配器本身
+   * 拿不到 `ctx`，故必须由接线层桥接（与 `readImage` 等回调同一模式）。
+   *
+   * ⚠️ 必要性：客户端 `ModelCatalogDirectory` 在 `status === 'ready'` 时**短路
+   * 返回缓存**，只在宿主事件上 `refresh()`。没有本回调时，冷启动首拉失败
+   * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
+   */
+  onCatalogLoaded?: () => void
 }
 
 // ── 请求级账号轮换（2026-10-05，用户报障「余额用完一个号就卡死」）────────
@@ -325,13 +337,17 @@ export class LoomyAdapter extends LlmAdapter {
   /** 远端模型缓存（含展示名与能力）；未拉取时为 undefined。 */
   private remoteModels: LoomyRemoteModel[] | undefined
   /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
-  private readonly catalogGate = new RemoteCatalogGate()
+  private readonly catalogGate: RemoteCatalogGate
 
   constructor(private readonly options: LoomyAdapterOptions) {
     super()
     this.product = options.product ?? LOOMY
     this.fetchImpl = options.fetchImpl ?? fetch
     this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]))
+    // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
+    this.catalogGate = new RemoteCatalogGate(
+      options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
   }
 
   /**
@@ -779,7 +795,12 @@ function resolveChunkTimeoutMs(): number {
  */
 export function registerLoomyLlm(ctx: Context, options: LoomyAdapterOptions): LoomyAdapter {
   const product = options.product ?? LOOMY
-  const adapter = new LoomyAdapter(options)
+  const adapter = new LoomyAdapter({
+    ...options,
+    // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+    // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+    onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+  })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }
