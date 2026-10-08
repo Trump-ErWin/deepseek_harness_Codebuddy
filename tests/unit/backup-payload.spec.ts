@@ -49,9 +49,21 @@ describe('trimBackupPayload（合并导入前裁剪）', () => {
     expect(Object.keys(out.credentials)).toEqual(['BUDDY_ACCOUNT_B1', 'BUDDY_ACCOUNT_B2'])
   })
 
-  it('黑名单清空：这份载荷无论被当成哪种模式都不会改动模型开关', () => {
+  it('黑名单**原样保留**：空表会谎称「没有任何模型被关闭」，被当成 replace 时清空用户开关', () => {
+    // ⚠️ 反向验证（对抗审计实测证伪）：把实现改回 `disabledModels: {}` → 本用例变红。
+    //
+    // 空表**不是**中性值：`replaceAll` 收到空表会执行
+    // `modelCache = sanitizeDisabledModels({})` = `{}`，即**整体清空黑名单**，
+    // 而原先的注释却声称这样「无论被当成哪种模式都不会改动模型开关」，与实现相反。
+    // `accountIds` 的语义本就只作用于 `accounts` / `credentials` 两个字段。
     const out = trimBackupPayload(payload(), ['buddy-b1'])
-    expect(out.disabledModels).toEqual({})
+    expect(out.disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+  })
+
+  it('黑名单字段缺失/非法时退化为空表（不抛错，也不伪造内容）', () => {
+    expect(trimBackupPayload({ ...payload(), disabledModels: null }, ['buddy-b1']).disabledModels).toEqual({})
+    expect(trimBackupPayload({ ...payload(), disabledModels: [] }, ['buddy-b1']).disabledModels).toEqual({})
+    expect(trimBackupPayload({ ...payload(), disabledModels: 'x' }, ['buddy-b1']).disabledModels).toEqual({})
   })
 
   it('保留 format / version / exportedAt 等元字段（后端要校验格式）', () => {

@@ -293,25 +293,164 @@ export function sanitizeAggregateRejections(raw: unknown): AggregateRejectionMap
  * 判据刻意保守：只保留同时具备 `id` / `provider` / `credentialRef` 三个非空
  * 字符串的条目 —— 缺任何一个都无法解析凭据，留着只会在选号时反复失败。
  * 其余字段按原样透传（`enabled` / `modelRateLimits` 等由下游各自判空）。
+ *
+ * ## ⚠️⚠️ 必须按 `id` 去重（真实缺陷，对抗审计实测证伪）
+ *
+ * `id` 是账号的**唯一键**：`updateAccount` / `removeAccount` / `reorderAccounts`
+ * 全都 `findIndex(a => a.id === id)`，只命中**第一条**。池里出现两条同 id 时，
+ * 第二条**永远改不动、删不掉**（幽灵账号）。
+ *
+ * 原先只有 `mergeAccounts` 内部去重，而 `replaceAll`（备份导入的**默认模式**）
+ * 不去重 ⇒ 一份手工编辑过的备份即可把两条同 id 写进池里。后果实测**远不止**
+ * 幽灵账号：沉底函数按 id 匹配会写出 `undefined` 空洞，使该 provider 的
+ * `getAvailableAccount` / `listAccounts` 全部抛错（整条推理链崩），且空洞经
+ * `JSON.stringify` 变 `null`、重启后被本函数丢弃 ⇒ **账号永久丢失**。
+ *
+ * ⚠️⚠️ **去重有「两层」，缺一不可**（第二层是独立审计实测证伪后补的）：
+ *
+ * 1. **本函数（归一化层）**：清洗**入口**数据 —— 后端载入、`replaceAll`、
+ *    `mergeAccounts` 都经它。
+ * 2. **`AccountPool.writeAccounts`（唯一写入收口点）**：`addAccount` 等路径
+ *    **不经过本函数**（它直接 `writeAccounts([...readAccounts(), entry])`），
+ *    而 `addAccount` 有 20+ 个调用点（各 `*-auth.ts` 登录落库、`account.create`、
+ *    `opencode-rpc`、`ensureDefaultAnonymousSlot`）⇒ 只靠本层，「池里两条同 id」
+ *    **仍可达**。
+ *
+ * ⚠️ 本层**不能**声称「写盘时自愈」：`updateAccount` / `setAccountsEnabled` /
+ * `clearModelRateLimits` / `updateModelRateLimit` / `setOpencodeProxy` 等
+ * 8 条写路径都**不调本函数**。真正让「历史遗留重复条目」自愈的是**载入路径**
+ * （两种后端的 `load()` 都经本函数），以及 `writeAccounts` 的收口去重。
+ *
+ * 保留**首次出现**的条目（与「先到先得」的直觉一致；重复条目的字段差异
+ * 不合并 —— 无法判断哪份更新，合并反而会造出谁都没写过的混合体）。
  */
 export function sanitizeAccounts(raw: unknown): ProviderAccountEntry[] {
   if (!Array.isArray(raw)) return []
   const accounts: ProviderAccountEntry[] = []
+  // 已见过的 id：重复条目直接丢弃（见上方注释）。
+  const seenIds = new Set<string>()
   for (const entry of raw) {
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
     const candidate = entry as Partial<ProviderAccountEntry>
     if (typeof candidate.id !== 'string' || candidate.id.length === 0) continue
     if (typeof candidate.provider !== 'string' || candidate.provider.length === 0) continue
     if (typeof candidate.credentialRef !== 'string' || candidate.credentialRef.length === 0) continue
+    if (seenIds.has(candidate.id)) continue
+    seenIds.add(candidate.id)
+    /**
+     * ⚠️ **限流标记必须先过滤再落定，且必须放在 `...candidate` 之后**
+     * （真实缺陷，对抗审计实测证伪）。
+     *
+     * 备份文件是用户可编辑的输入，而 `modelRateLimits` 原先**原样透传**。
+     * 非数字脏值（`'not-a-number'` / `null` / 负数）会让 UI 与宿主**判据分叉**：
+     *   - UI（`jet-hub.js`）：`v > Date.now()` ⇒ 对 `'not-a-number'` 为 `false`
+     *     ⇒ **不显示**「限额中」；
+     *   - 宿主（`getAvailableAccount`）：`now >= resetAt` 亦为 `false`
+     *     ⇒ 判为**受限**、选号时**排除**该账号。
+     * ⇒ 用户看到「这个号完全正常」，而宿主永远不用它 —— 正是本项目反复出现的
+     * 「显示与行为分叉」缺陷形态。
+     *
+     * 判据与 `updateModelRateLimit` 的写入守卫一致（只接受有限正数毫秒时间戳）。
+     *
+     * ⚠️ **展开顺序是这条修复的关键**：`{ ...candidate, modelRateLimits: <过滤后> }`
+     * —— 若写成 `{ ...candidate, ...sanitizeModelRateLimits(...) }` 且**放在
+     * `...candidate` 之前**，`candidate` 里的原始（脏的）`modelRateLimits` 会把
+     * 过滤结果**整个覆盖回去**，修复静默失效（本文件第一版正是如此，被新写的
+     * 用例当场抓红）。故这里显式写键名并置于展开之后。
+     */
+    const limits = sanitizeModelRateLimits(candidate.modelRateLimits)
     accounts.push({
       ...candidate,
       enabled: candidate.enabled !== false,
       refreshable: candidate.refreshable !== false,
       nickname: typeof candidate.nickname === 'string' ? candidate.nickname : candidate.id,
       createdAt: typeof candidate.createdAt === 'number' ? candidate.createdAt : Date.now(),
+      // 无有效项时写 `undefined`：`JSON.stringify` 会整个丢弃该键，
+      // 故落盘/传输形态与「从未有过标记」完全一致（不留 `{}` 噪音）。
+      modelRateLimits: limits,
     } as ProviderAccountEntry)
   }
   return accounts
+}
+
+/**
+ * 判定一个「限流解禁时刻」是否为**可用的毫秒时间戳**。
+ *
+ * ## ⚠️⚠️ 这是读写两侧**共用的唯一谓词**（真实缺陷，独立审计实测证伪）
+ *
+ * 原先读取侧（{@link sanitizeAccounts} 的 `sanitizeModelRateLimits`）判据是
+ * 「有限正数」，而写入侧（`AccountPool.updateModelRateLimit`）只拒 `!Number.isFinite`
+ * —— 两处**并不同源**，且读取侧的上界**不够严**：
+ *
+ * `1e308` 是「有限正数」，能穿过过滤落进池；而它**超出 `Date` 的合法范围**
+ * （上界 ±8.64e15）。后果是下次该 (账号, 模型) 真撞限流时，
+ * `updateModelRateLimit` 里 `new Date(current).toISOString()` 抛
+ * **`RangeError: Invalid time value`** —— 而 17 个 `updateModelRateLimit` 调用点里
+ * **16 个没有 try**（llm-adapter ×3、各 adapter、account-probe ×3），异常直接冒到
+ * 推理路径与「重测」路径。
+ *
+ * 可达输入是**手工编辑过的备份文件**（正是本模块要防的那类输入）：
+ * `modelRateLimits: {"glm-5.2": 1e308}`。
+ *
+ * ⇒ 判据收敛到本函数一处，读写两侧都调它。**不要再各写一份**。
+ *
+ * 上界取 `8.64e15`（`Date` 的最大毫秒值，`8640000000000000`）：
+ * 超过它的值 `new Date(v).getTime()` 为 `NaN`，任何 `toISOString()` 都会抛。
+ *
+ * @param value 待判定的值（任意类型，非数字一律 false）。
+ * @returns 是否是「可安全交给 `new Date()` 的毫秒时间戳」。
+ */
+export function isValidResetAtMs(value: unknown): value is number {
+  // 只认有限数字：`NaN` / `Infinity` / 字符串 / `null` 一律 false。
+  if (typeof value !== 'number' || !Number.isFinite(value)) return false
+  // ⚠️ 必须 > 0：`0` 与负数在选号判据里等价于「不受限」（见 sanitizeModelRateLimits
+  // 的注释），且 UI 的 `hasAnyLimit` 只看键是否存在 —— 详见 D2 的取舍说明。
+  if (value <= 0) return false
+  // ⚠️ 上界：超出 Date 范围的有限数会让 `new Date(v).toISOString()` 抛 RangeError。
+  return value <= MAX_DATE_MS
+}
+
+/** `Date` 可表示的最大毫秒值（±8.64e15）。 */
+export const MAX_DATE_MS = 8_640_000_000_000_000
+
+/**
+ * 过滤 `modelRateLimits` 的脏值；无有效项时返回 `undefined`。
+ *
+ * 只保留 {@link isValidResetAtMs} 认可的条目（有限、正、且在 `Date` 范围内）。
+ *
+ * ⚠️ **不过滤已过期的时间戳**：过期标记由 `sweepExpiredRateLimits` 清理，
+ * 且 UI 需要看到它们（`hasAnyLimit` 靠它渲染「重置」按钮）。
+ *
+ * ## ⚠️ 为什么 `0` 也被丢弃（以及这条取舍的代价）
+ *
+ * **选号侧**：`getAvailableAccount` / `allAccountsRateLimitedForModel` /
+ * `listAvailableCredentials` 的判据都是
+ * `resetAt === undefined || resetAt === 0 || now >= resetAt` ⇒ `0` 与负数都等价于
+ * 「不受限」，故丢弃它们**不改变选号行为**。
+ *
+ * ⚠️ **但 UI 侧还有第二套判据**（`plugin-src/client/jet-hub.js` 的 `hasAnyLimit`
+ * = `Object.keys(modelRateLimits).length > 0`）—— 它**只看键是否存在**，用来决定
+ * 「重置 / 重测」按钮是否可点。若池里原本只有 `{m: 0}`，本函数把整个键写 `undefined`
+ * ⇒ `hasAnyLimit` 从 `true` 翻成 `false` ⇒ **用户无法再手动解禁**。
+ *
+ * 可达性：`0` 只可能来自**手工编辑的备份**（正常运行写入的都是
+ * `Date.now() + cooldown` 或 `nextUtc8DayStartMs()`，恒为正）。
+ * 取舍：保留 `0` 会让选号侧多一个「等价于不受限」的噪音键，但能保住 UI 的自救入口；
+ * 丢弃它则相反。**当前选择丢弃**（与「只留真实有效的标记」一致），
+ * 若将来收到「重置按钮变灰」的报障，改这里（`value >= 0`）**并同时**改 UI 判据，
+ * 不要只改一侧 —— 那是本项目「一文件两套同义判据」的事故形态。
+ */
+function sanitizeModelRateLimits(raw: unknown): Record<string, number> | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+  const limits: Record<string, number> = {}
+  for (const [modelId, value] of Object.entries(raw as Record<string, unknown>)) {
+    // 模型 id 必须非空字符串（与选号侧 `modelId.length === 0` 跳过限流的约定一致）。
+    if (modelId.length === 0) continue
+    // ⚠️ 判据走共享谓词（读写同源），不要再内联 `isFinite && > 0`。
+    if (!isValidResetAtMs(value)) continue
+    limits[modelId] = value
+  }
+  return Object.keys(limits).length > 0 ? limits : undefined
 }
 
 /** 老契约后端：数据仍在 settings 文档里（与 ≤0.1.6 完全一致）。 */
@@ -457,6 +596,26 @@ const ACCOUNT_REF_RE = new RegExp(
     .sort((a, b) => b.length - a.length)
     .join('|')})_ACCOUNT_([0-9A-Fa-f]{6,})$`,
 )
+
+/**
+ * 由账号凭据 ref 反推 provider；不是账号 ref 形态时返回 `undefined`。
+ *
+ * 用途是**合并导入的「ref 占用」检查**（`src/backup.ts`）：备份里被采纳账号引用的
+ * ref 若已被本机**另一个**账号占用，回写它会静默覆盖本机凭据。调用方需要知道
+ * 该 ref 归属哪个 provider 才能判断「占用它的那条账号是不是同一个号」。
+ *
+ * ⚠️ 判据与 {@link accountFromCredentialRef} **同源**（同一个正则、同一张表）——
+ * 不要再写第二份「前缀 → provider」映射，本项目已有「一文件两套同义判据」的事故史。
+ * ⚠️ 单凭据回退 ref（`CODEARTS_ACCESS_TOKEN` / `BUDDY_ACCESS_TOKEN` 等）不含
+ * `_ACCOUNT_`，故返回 `undefined` —— 它们不是账号 ref，调用方应自行决定如何处理。
+ */
+export function providerOfAccountRef(ref: string): string | undefined {
+  const match = ACCOUNT_REF_RE.exec(ref)
+  if (match === null) return undefined
+  const prefix = match[1]
+  if (prefix === undefined) return undefined
+  return REF_PREFIX_TO_PROVIDER.find(([candidate]) => candidate === prefix)?.[1]
+}
 
 /**
  * 从 `.credentials.yaml` 的 `refs:` 段提取 ref 名（**只取键名，不读值**）。

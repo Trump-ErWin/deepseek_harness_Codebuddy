@@ -9,8 +9,26 @@ import {
   type BackupPool,
 } from '../../src/backup.js'
 import { BACKUP_FORMAT, BACKUP_VERSION } from '../../src/types.js'
+import { AccountPool } from '../../src/account-pool.js'
 import type { JetHubState } from '../../src/jet-hub-store.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
+
+/**
+ * 给真实 `AccountPool` 用的最小 Cordis 上下文。
+ *
+ * 只在本文件用于验证 `replaceAll` 的**归一化**行为（去重），故用内存后端即可 ——
+ * 不碰真实磁盘。`settings.get()` 返回 `undefined` ⇒ `AccountPool` 走 memory 后端。
+ */
+function minimalPoolContext(): unknown {
+  return {
+    credentials: {
+      resolve: async () => undefined,
+      set: async () => {},
+    },
+    logger: { info() {}, warn() {}, error() {} },
+    settings: { get: () => undefined, replace: async () => {} },
+  }
+}
 
 /** 构造一份最小账号条目。 */
 function account(partial: Partial<ProviderAccountEntry> & { id: string; provider: string; credentialRef: string }): ProviderAccountEntry {
@@ -667,8 +685,291 @@ describe('合并导入（mode: merge）', () => {
       ],
     }), { mode: 'merge' })
 
+    // ⚠️ 去重由 `sanitizeAccounts` 承担（所有写入路径的公共归一化点）。
     expect(result.accountsImported).toBe(1)
-    expect(result.accountsSkipped).toEqual(['buddy-dup'])
+    // ⚠️ **该 id 的第一条是被采纳的** ⇒ 不得出现在「已跳过」里（否则同一个 id
+    // 既报「新增」又报「已跳过」，UI 文案自相矛盾）。文件里有重复条目这件事
+    // 由日志与账号数体现，不靠 `accountsSkipped` 表达。
+    expect(result.accountsSkipped).toEqual([])
+    expect(pool.merged.flat().map(a => a.id)).toEqual(['buddy-dup'])
+  })
+
+  /**
+   * ★ 真实缺陷（Critical，对抗审计实测证伪）：
+   *
+   * `sinkAccountToProviderEnd` 原先按 **id** 匹配（而非对象引用），池里两条同 id
+   * 时会写出 `undefined` 空洞 ⇒ 该 provider 的 `getAvailableAccount` /
+   * `listAccounts` 全部抛错（整条推理链崩），且空洞经 `JSON.stringify` 变 `null`、
+   * 重启后被 `sanitizeAccounts` 丢弃 ⇒ **账号永久丢失**。
+   *
+   * 故 `sanitizeAccounts` 必须去重 —— 它是 `replaceAll`（**默认导入模式**）与
+   * 一切写入路径的共同入口，原先只有 `mergeAccounts` 内部去重。
+   *
+   * 反向验证：去掉 `sanitizeAccounts` 里的 `seenIds` 去重 → 本用例变红。
+   */
+  it('★ replace 模式（默认）也必须去重文件内的重复 id（否则池里出现同 id）', async () => {
+    const pool = createPool({ accounts: [], disabledModels: {} })
+
+    const result = await importBackup(createCredentials(), pool, payloadOf({
+      accounts: [
+        account({ id: 'buddy-dup', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_D1' }),
+        account({ id: 'buddy-dup', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_D2' }),
+      ],
+    }), { mode: 'replace' })
+
+    // 池里只应留下一条同 id（去重发生在 replaceAll 内部的 sanitizeAccounts）。
+    // ⚠️ 注意 `pool.replaced` 记录的是**入参**，真实 AccountPool 的 `replaceAll`
+    // 才做归一化 —— 故这里断言真实实现，而非这个内存桩。
+    expect(result.accountsImported).toBe(2)   // replace 保留既有口径（载荷条目数）
+    const realPool = new AccountPool(minimalPoolContext() as never)
+    await realPool.replaceAll([
+      account({ id: 'buddy-dup', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_D1' }),
+      account({ id: 'buddy-dup', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_D2' }),
+    ] as never, {})
+    expect((await realPool.listAllAccounts()).filter(a => a.id === 'buddy-dup')).toHaveLength(1)
+  })
+
+  /**
+   * ★ 真实缺陷（High，对抗审计实测证伪）：「只增加不覆盖」被 `credentialRef`
+   * 撞车打穿。
+   *
+   * merge 的前三层判重都只决定「**账号条目**要不要追加」，而凭据写入用的是
+   * **另一套键**（`credentialRef`）—— 这一维原先无人检查。后果：备份里一条
+   * 全新 id、全新身份的账号，只要它的 ref 恰好等于本机**另一个**账号正在用的
+   * ref，写入就会静默覆盖本机那个账号的凭据。
+   *
+   * 反向验证：去掉 `refOwners` 检查 → 本用例变红（本机凭据被备份值覆盖）。
+   */
+  it('★ merge 时 ref 已被本机别的账号占用 → 拒绝采纳（不覆盖本机凭据）', async () => {
+    const credentials = createCredentials()
+    const SHARED = credentialRef('BUDDY_ACCOUNT_SHARED01')
+    await credentials.set(SHARED, '{"access_token":"LOCAL-ORIGINAL","user_id":"u-local"}')
+    const pool = createPool({
+      accounts: [account({ id: 'buddy-local', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_SHARED01' })],
+      disabledModels: {},
+    })
+
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: {
+        BUDDY_ACCOUNT_SHARED01: '{"access_token":"FROM-BACKUP","user_id":"u-other"}',
+      },
+      accounts: [account({ id: 'buddy-newcomer', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_SHARED01' })],
+    }), { mode: 'merge' })
+
+    // 账号被拒绝（连条目一起跳过 —— 否则会落下一个没有凭据的账号）。
+    expect(result.accountsImported).toBe(0)
+    expect(result.accountsSkipped).toEqual(['buddy-newcomer'])
+    // ★ 本机凭据**逐字节未变**。
+    expect((await credentials.resolve(SHARED))!.value).toBe('{"access_token":"LOCAL-ORIGINAL","user_id":"u-local"}')
+    // 池侧：`mergeAccounts` 被调用但**没有可追加的条目**（全部被拒），
+    // 故它至多收到一个空数组 —— 关键是不含 newcomer。
+    expect(pool.merged.flat().map(a => a.id)).toEqual([])
+  })
+
+  /**
+   * ⚠️ **本用例的凭据刻意不带任何身份字段**（真实缺陷，独立审计实测证伪）：
+   *
+   * 初版这里写的是 `{"access_token":"T","user_id":"u1"}` —— 两条账号引用同一 ref，
+   * 于是它们读到的**身份也相同**，第二条会被**第②层身份判重**拦下并 `continue`，
+   * **永远走不到第④层**。结果：把第④层的 `refOwners.set(...)` 删掉，全套
+   * `backup.spec.ts` **0 变红** —— 该断言是恒真同义反复，而它声称锁的守卫是
+   * **承重**的（去掉后 `imported` 从 1 变成 2，两个 id 指向同一份令牌）。
+   *
+   * ⇒ 判据：凭据里**没有** `user_id`/`uid`/`account_id`/`access_key_id`/`sub`，
+   * 身份判重恒不命中，才真正压到第④层。
+   */
+  it('★ merge 同批次内两条账号引用同一 ref → 第二条被第④层拒绝（不产生共享凭据的别名）', async () => {
+    const credentials = createCredentials()
+    const pool = createPool({ accounts: [], disabledModels: {} })
+
+    const result = await importBackup(credentials, pool, payloadOf({
+      // ⚠️ 无身份字段（见上方注释）—— 否则本用例锁的是第②层而非第④层。
+      credentials: { BUDDY_ACCOUNT_SHARED02: '{"access_token":"T"}' },
+      accounts: [
+        account({ id: 'buddy-alice', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_SHARED02' }),
+        account({ id: 'buddy-bob', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_SHARED02' }),
+      ],
+    }), { mode: 'merge' })
+
+    expect(result.accountsImported).toBe(1)
+    expect(result.accountsSkipped).toEqual(['buddy-bob'])
+  })
+
+  /**
+   * ★ 第 ⑤ 层：ref 的 provider 前缀必须与本条 `provider` 一致
+   * （独立审计指出 `providerOfAccountRef` 曾是死代码，本用例让它有判别力）。
+   *
+   * `provider: 'buddy'` 却引用 `CODEARTS_ACCOUNT_XXX` —— 导入后 buddy 适配器会去
+   * 解析一份 AK/SK 形状的凭据（buddy 读 `access_token`，codearts 凭据里没有它）
+   * ⇒ 必然请求失败。反向验证：去掉第⑤层 → 本用例变红（账号被采纳）。
+   */
+  it('★ merge 拒绝「provider 与 ref 前缀不符」的账号（跨 provider 误用）', async () => {
+    const credentials = createCredentials()
+    const pool = createPool({ accounts: [], disabledModels: {} })
+
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: {
+        // ⚠️ 后缀必须是 6 位以上 **hex**（`ACCOUNT_REF_RE` 的真实约束），
+        // 用 `X1` 这类非 hex 串会匹配失败 ⇒ 第⑤层恒不命中（初版测试就踩了这个）。
+        CODEARTS_ACCOUNT_ABCDEF: '{"access_key_id":"AK","secret_access_key":"SK","security_token":"ST","expires_at":"2030-01-01T00:00:00Z"}',
+      },
+      accounts: [account({ id: 'buddy-wrongref', provider: 'buddy', credentialRef: 'CODEARTS_ACCOUNT_ABCDEF' })],
+    }), { mode: 'merge' })
+
+    expect(result.accountsImported).toBe(0)
+    expect(result.accountsSkipped).toEqual(['buddy-wrongref'])
+  })
+
+  it('第⑤层不误伤：provider 与 ref 前缀一致时正常采纳', async () => {
+    const credentials = createCredentials()
+    const pool = createPool({ accounts: [], disabledModels: {} })
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: { CODEARTS_ACCOUNT_ABCDEF: '{"access_key_id":"AK","secret_access_key":"SK","security_token":"ST","expires_at":"2030-01-01T00:00:00Z"}' },
+      accounts: [account({ id: 'codearts-ok', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_ABCDEF' })],
+    }), { mode: 'merge' })
+    expect(result.accountsImported).toBe(1)
+    expect(result.accountsSkipped).toEqual([])
+  })
+
+  it('第⑤层放行单凭据回退 ref（不是账号 ref 形态，不判 provider）', async () => {
+    const credentials = createCredentials()
+    const pool = createPool({ accounts: [], disabledModels: {} })
+    // 历史数据里账号引用单凭据 ref 是真实存在的形态，不该被第⑤层拒绝。
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: { BUDDY_ACCESS_TOKEN: '{"access_token":"T","refresh_token":"R"}' },
+      accounts: [account({ id: 'buddy-legacy', provider: 'buddy', credentialRef: 'BUDDY_ACCESS_TOKEN' })],
+    }), { mode: 'merge' })
+    expect(result.accountsImported).toBe(1)
+    expect(result.accountsSkipped).toEqual([])
+  })
+
+  /**
+   * ★ `accountsSkipped` 与 `accountsImported` 不得自相矛盾
+   * （真实缺陷，独立审计实测证伪）。
+   *
+   * 文件 `[A, A, B]` 且 A、B 都是新账号：A 的第一条**被采纳**，故 A 不该出现在
+   * 「已跳过」里 —— 否则同一个 id 既报「新增」又报「已跳过」，
+   * UI 文案（`jet-hub.js` 用 `accountsSkipped.length`）自相矛盾。
+   *
+   * 反向验证：把重复统计改回「无条件上报」→ 本用例变红。
+   */
+  it('★ 文件内重复 id：被采纳的账号不得同时出现在 accountsSkipped 里', async () => {
+    const credentials = createCredentials()
+    const pool = createPool({ accounts: [], disabledModels: {} })
+
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: { BUDDY_ACCOUNT_R1: '{"access_token":"T1"}', BUDDY_ACCOUNT_R2: '{"access_token":"T2"}' },
+      accounts: [
+        account({ id: 'buddy-a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_R1' }),
+        account({ id: 'buddy-a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_R1' }),
+        account({ id: 'buddy-b', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_R2' }),
+      ],
+    }), { mode: 'merge' })
+
+    expect(result.accountsImported).toBe(2)
+    // ★ 关键：a 与 b 都新增了 ⇒ 两个都不该出现在 skipped 里。
+    expect(result.accountsSkipped).toEqual([])
+    expect(pool.merged.flat().map(x => x.id)).toEqual(['buddy-a', 'buddy-b'])
+  })
+
+  it('★ 文件内重复 id 且该 id 整体未采纳时，只上报一次（不重复计数）', async () => {
+    const credentials = createCredentials()
+    // 池里已有 buddy-a（按 id 命中第①层）
+    const pool = createPool({
+      accounts: [account({ id: 'buddy-a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_EXIST' })],
+      disabledModels: {},
+    })
+
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: { BUDDY_ACCOUNT_R3: '{"access_token":"T"}' },
+      accounts: [
+        account({ id: 'buddy-a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_R3' }),
+        account({ id: 'buddy-a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_R3' }),
+      ],
+    }), { mode: 'merge' })
+
+    expect(result.accountsImported).toBe(0)
+    // 同一个 id 只该出现一次（否则 UI 显示「2 个已存在」而实际只有 1 个）。
+    expect(result.accountsSkipped).toEqual(['buddy-a'])
+  })
+
+  /**
+   * ★★ **Medium 回归用例**（真实缺陷，最终审计实测证伪）：
+   *
+   * 载荷 `[dup→refA, dup→refB]`，其中 **refA 被本机占用**（第④层拒）、
+   * **refB 空闲且身份全新**（本应被采纳）。
+   *
+   * 初版实现在采纳循环**之前**先调 `sanitizeAccounts(payload.accounts)`，
+   * 而它会按 id 去重（保留**第一条**）⇒ 第二条**根本进不了循环** ⇒
+   * `accepted = []` ⇒ 同 id 的**可采纳候选被静默丢弃**，且 `accountsSkipped`
+   * 把它报成「已存在（已跳过）」—— 而那个账号**从未存在过**。
+   *
+   * 修法：去重语义改为「同 id 只采纳**第一条可采纳**的条目」——
+   * 候选序列用**逐条清洗**（`sanitizeAccounts([entry])`，不去重），
+   * 同 id 由循环内的 `existingIds` 判。
+   *
+   * 反向验证：把候选序列改回整批 `sanitizeAccounts(payload.accounts)` → 本用例变红。
+   */
+  it('★ 同 id 的第一条被拒时，第二条可采纳的候选不得被静默丢弃', async () => {
+    const credentials = createCredentials()
+    // 本机已有账号占用 refA。
+    await credentials.set(credentialRef('BUDDY_ACCOUNT_REF_A'), '{"access_token":"LOCAL"}')
+    const pool = createPool({
+      accounts: [account({ id: 'buddy-local', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_REF_A' })],
+      disabledModels: {},
+    })
+
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: {
+        BUDDY_ACCOUNT_REF_A: '{"access_token":"FROM-BACKUP"}',   // refA 被占 ⇒ 第④层拒
+        BUDDY_ACCOUNT_REF_B: '{"access_token":"T-B"}',           // refB 空闲 ⇒ 应采纳
+      },
+      accounts: [
+        // 两条同 id，第一条引用的 ref 已被占用。
+        account({ id: 'buddy-dup', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_REF_A' }),
+        account({ id: 'buddy-dup', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_REF_B' }),
+      ],
+    }), { mode: 'merge' })
+
+    // ★ 第二条被采纳（修复前这里是 0 —— 静默丢号）。
+    expect(result.accountsImported).toBe(1)
+    expect(pool.merged.flat().map(a => a.id)).toEqual(['buddy-dup'])
+    // ★ 不得谎报「已存在」（修复前 accountsSkipped 含 buddy-dup，而它从未存在过）。
+    expect(result.accountsSkipped).toEqual([])
+    // ★ 本机凭据未被覆盖。
+    expect((await credentials.resolve(credentialRef('BUDDY_ACCOUNT_REF_A')))!.value).toBe('{"access_token":"LOCAL"}')
+  })
+
+  it('★ 同 id 全部候选都不可采纳时，只报一次「已跳过」', async () => {
+    const credentials = createCredentials()
+    // 两条同 id 都引用**同一个被占用**的 ref ⇒ 都不可采纳。
+    await credentials.set(credentialRef('BUDDY_ACCOUNT_OCC'), '{"access_token":"LOCAL"}')
+    const pool = createPool({
+      accounts: [account({ id: 'buddy-local2', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_OCC' })],
+      disabledModels: {},
+    })
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: { BUDDY_ACCOUNT_OCC: '{"access_token":"X"}' },
+      accounts: [
+        account({ id: 'buddy-dup2', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_OCC' }),
+        account({ id: 'buddy-dup2', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_OCC' }),
+      ],
+    }), { mode: 'merge' })
+
+    expect(result.accountsImported).toBe(0)
+    // 只报一次（不是 ['buddy-dup2','buddy-dup2']）。
+    expect(result.accountsSkipped).toEqual(['buddy-dup2'])
+  })
+
+  it('merge 时 ref 未被占用 → 正常采纳（守卫不误伤正常路径）', async () => {
+    const credentials = createCredentials()
+    const pool = createPool({ accounts: [], disabledModels: {} })
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: { BUDDY_ACCOUNT_FRESH01: '{"access_token":"T","user_id":"u1"}' },
+      accounts: [account({ id: 'buddy-fresh', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_FRESH01' })],
+    }), { mode: 'merge' })
+    expect(result.accountsImported).toBe(1)
+    expect(result.accountsSkipped).toEqual([])
   })
 
   it('replace 模式下 accountsSkipped 恒为空', async () => {
@@ -861,6 +1162,145 @@ describe('合并导入（mode: merge）', () => {
     // email 相同但判不出身份 ⇒ 按 id 追加（不是被误判成同一账号）。
     expect(result.accountsImported).toBe(1)
     expect(result.accountsSkipped).toEqual([])
+  })
+
+  /**
+   * ★ 真实缺陷（Medium，独立审计实测证伪）：`codearts` 的身份字段是
+   * **`access_key_id`**，原先不在 `IDENTITY_FIELDS` 里。
+   *
+   * 本机实测真实 codearts 凭据的顶层字段是 `access_key_id` / `secret_access_key` /
+   * `security_token` / `expires_at` / `refresh_token` / `code_verifier` /
+   * `dpop_private_key_jwk` —— 表里其余字段（`user_id` / `uid` / `userid` /
+   * `account_id` / `sub`）**一个都没有**。漏掉这一格时身份判重恒判不出，于是
+   * 「同一个 codearts 号我已手登过」**必然**多出一条重复账号。
+   *
+   * 反向验证：从 `IDENTITY_FIELDS` 移除 `access_key_id` → 本用例变红。
+   */
+  it('★ codearts 用 access_key_id 判重（其凭据没有 user_id/uid/account_id/sub）', async () => {
+    const realCodeArtsShape = (ak: string) => JSON.stringify({
+      access_key_id: ak,
+      secret_access_key: 'SK',
+      security_token: 'ST',
+      expires_at: '2026-10-07T17:51:47.898Z',
+      refresh_token: 'eyJ0eXAiOiJKV1Qi',
+      code_verifier: 'cv',
+      dpop_private_key_jwk: { kty: 'EC', crv: 'P-256', x: 'a', y: 'b', d: 'c' },
+    })
+    const credentials = createCredentials()
+    // 本机已有：AK = AK-1
+    await credentials.set(credentialRef('CODEARTS_ACCOUNT_E1'), realCodeArtsShape('AK-1'))
+    const pool = createPool({
+      accounts: [account({ id: 'codearts-existing', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_E1' })],
+      disabledModels: {},
+    })
+
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: {
+        // 同一个服务端账号（AK 相同），但 id 不同、ref 不同、security_token 已轮换。
+        CODEARTS_ACCOUNT_N1: realCodeArtsShape('AK-1'),
+      },
+      accounts: [account({ id: 'codearts-newcomer', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_N1' })],
+    }), { mode: 'merge' })
+
+    expect(result.accountsImported).toBe(0)
+    expect(result.accountsSkipped).toEqual(['codearts-newcomer'])
+  })
+
+  it('codearts 的 AK 不同 → 判成不同账号，正常追加（守卫不误伤）', async () => {
+    const shape = (ak: string) => JSON.stringify({
+      access_key_id: ak, secret_access_key: 'SK', security_token: 'ST',
+      expires_at: '2026-10-07T17:51:47.898Z', refresh_token: 'rt',
+    })
+    const credentials = createCredentials()
+    await credentials.set(credentialRef('CODEARTS_ACCOUNT_E2'), shape('AK-A'))
+    const pool = createPool({
+      accounts: [account({ id: 'codearts-existing-2', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_E2' })],
+      disabledModels: {},
+    })
+    const result = await importBackup(credentials, pool, payloadOf({
+      credentials: { CODEARTS_ACCOUNT_N2: shape('AK-B') },
+      accounts: [account({ id: 'codearts-other', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_N2' })],
+    }), { mode: 'merge' })
+    expect(result.accountsImported).toBe(1)
+    expect(result.accountsSkipped).toEqual([])
+  })
+
+  /**
+   * ★ 真实缺陷（Medium，独立审计实测证伪）：`accounts` 含 `null` 时
+   * 原实现抛 `TypeError`，且**抛点在「凭据已写、账号池已替换」之后** ——
+   * 数据已全部落地，调用方却收到失败（用户以为导入没成功而重试）。
+   *
+   * 修法：`assertBackupPayload` 在**校验阶段**拒绝 `null` 与数组（校验在前、
+   * 写入在后，故抛错时零副作用）。
+   *
+   * ⚠️ **拒绝范围刻意收窄到「真正会抛错的那两类」**（对抗审计实测证伪了更宽的版本）：
+   * 只有 `null` 会在统计环节抛（`(1).expiresAt` / `('str').expiresAt` 都不抛）。
+   * 若把 `1`/`'str'`/`true` 也硬拒，会**破坏** `sanitizeAccounts` 的文档化降级行为
+   * —— 一份混了一个 `1` 的旧备份，原本能导入其余全部好账号，过宽校验下**一个都导不进来**。
+   */
+  it('★ accounts 含 null / 数组 → 校验阶段拒绝（BackupFormatError，零副作用）', async () => {
+    const credentials = createCredentials()
+    const pool = createPool({ accounts: [], disabledModels: {} })
+    for (const bad of [[null], [[]]]) {
+      const before = pool.replaced
+      await expect(
+        importBackup(credentials, pool, payloadOf({ accounts: bad as never }), { mode: 'replace' }),
+      ).rejects.toBeInstanceOf(BackupFormatError)
+      // 校验失败 ⇒ 池完全没被碰过（这正是「校验在前」的价值）。
+      expect(pool.replaced).toBe(before)
+    }
+  })
+
+  /**
+   * ★ 标量元素**放行**（宽容降级），不得因它们而整份备份导不进来。
+   *
+   * 反向验证：把校验改宽成「任何非对象都拒」→ 本用例变红。
+   */
+  it('★ accounts 含标量（1 / "str" / true）→ 放行并由 sanitizeAccounts 丢弃（不整份失败）', async () => {
+    const credentials = createCredentials()
+    const pool = createPool({ accounts: [], disabledModels: {} })
+    const result = await importBackup(credentials, pool, payloadOf({
+      accounts: [
+        account({ id: 'ok', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_OK' }),
+        1 as never,
+        'str' as never,
+        true as never,
+      ],
+    }), { mode: 'replace' })
+
+    // 不抛错，且好账号照常导入（这就是「宽容降级」的价值）。
+    const realPool = new AccountPool(minimalPoolContext() as never)
+    await realPool.replaceAll([
+      account({ id: 'ok', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_OK' }),
+      1 as never,
+      'str' as never,
+      true as never,
+    ] as never, {})
+    expect((await realPool.listAllAccounts()).map(a => a.id)).toEqual(['ok'])
+    expect(result.accountsImported).toBe(4)   // replace 保留既有口径（载荷条目数）
+  })
+
+  it('accounts 里的坏对象（缺 id 等）仍按既有宽容语义丢弃，不抛错', async () => {
+    const credentials = createCredentials()
+    const pool = createPool({ accounts: [], disabledModels: {} })
+    const result = await importBackup(credentials, pool, payloadOf({
+      accounts: [
+        account({ id: 'ok', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_OK' }),
+        { provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_NOID' } as never,
+      ],
+    }), { mode: 'replace' })
+    // 不抛错（宽容降级是文档化行为）；报告口径保留既有语义（载荷条目数）。
+    expect(result.accountsImported).toBe(2)
+    // ⚠️ 这个内存桩的 `replaceAll` **不做归一化**（它只记录入参），故这里断言
+    // 入参原样；真实去重由 `AccountPool.replaceAll` → `sanitizeAccounts` 承担，
+    // 已由 `jet-hub-store.spec.ts` 的去重用例与下面这条真实池用例覆盖。
+    expect(pool.replaced!.accounts).toHaveLength(2)
+    const realPool = new AccountPool(minimalPoolContext() as never)
+    await realPool.replaceAll([
+      account({ id: 'ok', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_OK' }),
+      { provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_NOID' } as never,
+    ] as never, {})
+    expect((await realPool.listAllAccounts()).map(a => a.id)).toEqual(['ok'])
   })
 
   it('opencode 账号槽按 api_key 判重（该 provider 的凭据只有 api_key）', async () => {
