@@ -477,3 +477,225 @@ describe('★★ auto：带图改道路径也必须按派发模型复核可用�
     expect(sent).toEqual(['codearts/vision-model'])
   })
 })
+
+/**
+ * ★★ B 方案：目标「收下请求却零输出」时顺位改道下一个 provider（issue IKJW31）。
+ *
+ * ## 缺陷机制
+ *
+ * 上游声明的窗口比真实墙大（loomy 的 `spark-x` 虚报 1M、真实 256K）⇒ 宿主按
+ * 虚高窗口打包 ⇒ 越墙后上游**收下请求但 0 输出** + `finish_reason=length` ⇒
+ * 插件报 `max-tokens`，而 DSH 对它**不自动重试** ⇒ 整轮静默失败。
+ *
+ * A 方案修了已知的那一处虚报；**本组守住与「哪一家虚报」无关的运行时兜底**。
+ *
+ * ## ⚠️ 两条方向相反的边界（本组必须同时守住）
+ *
+ * 1. `max-tokens` + **零输出** ⇒ 改道（否则静默失败，即本 issue）；
+ * 2. `max-tokens` + **有输出** ⇒ **绝不改道**（否则丢掉已产出的正文 —— 而那才是
+ *    `max-tokens` 更常见的含义：「正常答到半截撞了输出上限」）。
+ *
+ * 第 2 条是本次改动的最大风险点，故它与第 1 条同等重要。两处都用**真实调用链**
+ * （`prepareCall` → `call.stream`）驱动，不打桩内部私有方法。
+ */
+describe('★★ auto：零输出撞墙时改道下一个 provider（B 方案）', () => {
+  /** 让 `loomy` 最先当选（临期最早），`zcode` 次之。 */
+  const CATALOGS = {
+    loomy: [{ id: 'spark-x', name: 'Spark X2.5 · x0.1' }],
+    zcode: [{ id: 'glm-5.3-flash', name: 'GLM-5.3-Flash · x0.8' }],
+  }
+
+  /**
+   * 造一个世界：`loomy` 的流按 `loomyChunks` 产出，`zcode` 正常出正文。
+   *
+   * ⚠️ `now` 是**可变**的（返回对象上的 `setNow`），用来验证冷却「到期自动恢复」
+   * 与「冷却期内跳过」两种状态 —— 用固定时钟无法区分它们。
+   */
+  function makeWorld(loomyChunks: Array<{ type: string; reason?: { kind?: string } }>) {
+    const sent: string[] = []
+    let now = 1_000_000
+    const ctx = {
+      logger: { warn: () => {}, error: () => {} },
+      llm: {
+        listModels: async (provider: string) => CATALOGS[provider as keyof typeof CATALOGS] ?? [],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string; model: string }) => {
+          sent.push(`${o.provider}/${o.model}`)
+          const chunks = o.provider === 'loomy'
+            ? loomyChunks
+            : [
+                { type: 'block-start', index: 0, blockType: 'text' },
+                { type: 'text-delta', index: 0, text: 'ok' },
+                { type: 'finish', reason: { kind: 'stop' } },
+              ]
+          return (async function* () { for (const c of chunks) yield c })()
+        },
+      },
+    }
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: { token: 't' } }),
+    }
+    const adapter = new AutoAdapter(ctx as never, {
+      accountPool: pool as never,
+      now: () => now,
+      ttlMs: 0,
+    })
+    // loomy 临期更早 ⇒ 它当选；其余 provider 无候选（-1 = UNUSABLE）。
+    adapter.expiryOf = async (provider: string) => (provider === 'loomy' ? 100 : provider === 'zcode' ? 200 : -1)
+    return { adapter, sent, setNow: (v: number) => { now = v } }
+  }
+
+  /** 驱动真实链路并收集**最终看到的** chunk 序列。 */
+  async function run(adapter: AutoAdapter): Promise<Array<{ type: string; reason?: { kind?: string } }>> {
+    const seen: Array<{ type: string; reason?: { kind?: string } }> = []
+    const call = await adapter.prepareCall('jet-hub-auto', 'auto')
+    for await (const chunk of call.stream({ messages: [userMessage()] } as never)) {
+      seen.push(chunk as { type: string; reason?: { kind?: string } })
+    }
+    return seen
+  }
+
+  /** 上游越墙的真实 chunk 形态：一个 usage + `max-tokens` 终止帧，**零内容**。 */
+  const WALL_HIT = [
+    { type: 'usage' },
+    { type: 'finish', reason: { kind: 'max-tokens' } },
+  ]
+
+  it('★★ 零输出撞墙 ⇒ 改道下一个 provider 重发（不再静默失败）', async () => {
+    const { adapter, sent } = makeWorld(WALL_HIT)
+    const seen = await run(adapter)
+    // 先打 loomy 撞墙，再改道 zcode 成功。
+    expect(sent).toEqual(['loomy/spark-x', 'zcode/glm-5.3-flash'])
+    // ⚠️ 关键：**不得**把 loomy 那个 max-tokens 终止帧透给 harness ——
+    //    透出去 harness 就认为本轮结束了（它不重试 max-tokens），改道白做。
+    expect(seen.filter((c) => c.type === 'finish').map((c) => c.reason?.kind)).toEqual(['stop'])
+    // 用户看到的是 zcode 的正文。
+    expect(seen.some((c) => c.type === 'text-delta')).toBe(true)
+  })
+
+  it('★★ 反向：`max-tokens` 但**有输出** ⇒ 绝不改道（否则丢正文）', async () => {
+    // 这是 `max-tokens` 更常见的含义：模型答到半截撞了**输出上限**，应当原地续写。
+    const { adapter, sent } = makeWorld([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: '半截回答' },
+      { type: 'finish', reason: { kind: 'max-tokens' } },
+    ])
+    const seen = await run(adapter)
+    // ⛔ 若判据漏了「零输出」这一条，sent 会变成两个（正文被丢弃后重发）。
+    expect(sent, '有输出时不得改道').toEqual(['loomy/spark-x'])
+    expect(seen.some((c) => c.type === 'text-delta')).toBe(true)
+    expect(seen.filter((c) => c.type === 'finish').map((c) => c.reason?.kind)).toEqual(['max-tokens'])
+  })
+
+  it('★ 正常 stop ⇒ 不改道（不得为「没有撞墙」的情形多发请求）', async () => {
+    const { adapter, sent } = makeWorld([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: 'ok' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ])
+    const seen = await run(adapter)
+    expect(sent).toEqual(['loomy/spark-x'])
+    expect(seen.filter((c) => c.type === 'finish').map((c) => c.reason?.kind)).toEqual(['stop'])
+  })
+
+  it('★ 改道后**下一个请求**跳过该目标（跨请求冷却，防 60 秒选型缓存三连撞）', async () => {
+    const { adapter, sent } = makeWorld(WALL_HIT)
+    await run(adapter)
+    expect(sent).toEqual(['loomy/spark-x', 'zcode/glm-5.3-flash'])
+
+    // ⚠️ 第 2 个请求：`ttlMs: 0` ⇒ 每次都重新选型。loomy 已进冷却 ⇒ 不得再撞。
+    //    （报障实测 t14/t15/t16 在 46 秒内三连撞同一堵墙，正是缺了这一层。）
+    sent.length = 0
+    await run(adapter)
+    expect(sent, 'loomy 在冷却期内不得再被选中').toEqual(['zcode/glm-5.3-flash'])
+  })
+
+  it('★ 冷却到期后自动恢复（不得把一次误判永久固化）', async () => {
+    const { adapter, sent, setNow } = makeWorld(WALL_HIT)
+    await run(adapter)
+    sent.length = 0
+    // 越过 10 分钟冷却窗口 ⇒ loomy 重新参与候选（临期更早，故它又当选）。
+    setNow(1_000_000 + 10 * 60 * 1000 + 1)
+    await run(adapter)
+    expect(sent, '冷却到期后应重新尝试 loomy').toEqual(['loomy/spark-x', 'zcode/glm-5.3-flash'])
+  })
+
+  it('★ 池内无其他候选 ⇒ 如实透出 max-tokens，不吞掉失败', async () => {
+    // 只有 loomy 可用 ⇒ 无从改道 ⇒ 必须如实上报（不得静默成功、不得伪装 stop）。
+    const { adapter, sent } = makeWorld(WALL_HIT)
+    adapter.expiryOf = async (provider: string) => (provider === 'loomy' ? 100 : -1)
+    const seen = await run(adapter)
+    expect(sent).toEqual(['loomy/spark-x'])
+    expect(seen.filter((c) => c.type === 'finish').map((c) => c.reason?.kind)).toEqual(['max-tokens'])
+  })
+
+  it('★ 不会改道回自己（否则会立刻再撞一次同一堵墙）', async () => {
+    const { adapter, sent } = makeWorld(WALL_HIT)
+    // zcode 也判 UNUSABLE ⇒ 唯一候选就是 loomy，而它已被排除 ⇒ 不得重发。
+    adapter.expiryOf = async (provider: string) => (provider === 'loomy' ? 100 : -1)
+    await run(adapter)
+    // ⛔ 若 `replaceAfterZeroOutput` 没排除当前目标，sent 会是两个 loomy。
+    expect(sent.filter((s) => s === 'loomy/spark-x')).toHaveLength(1)
+  })
+
+  /**
+   * ★★ 冷却必须**穿透 60 秒选型缓存**（否则本方案形同虚设）。
+   *
+   * ⚠️ 上面那组用例都用 `ttlMs: 0`（每次真选型），**测不出这个缺陷**——
+   * 而生产用的是 `AUTO_CHOICE_TTL_MS`（60 秒）。缺了这一层时，每个请求都会先按
+   * 缓存**撞一次同一堵墙**（撞完才改道），「别再撞同一堵墙」的价值全部落空。
+   * 报障实测 t14/t15/t16 在 46 秒内三连撞，正是这个形态。
+   *
+   * ⚠️ 故本条刻意**不传 `ttlMs`**（用生产默认值），这是它与上面几条的关键区别。
+   */
+  it('★★ 冷却必须穿透 60 秒选型缓存（生产 TTL 下不得再撞一次）', async () => {
+    const sent: string[] = []
+    let now = 1_000_000
+    const catalogs: Record<string, Array<{ id: string; name: string }>> = {
+      loomy: [{ id: 'spark-x', name: 'Spark X2.5 · x0.1' }],
+      zcode: [{ id: 'glm-5.3-flash', name: 'GLM-5.3-Flash · x0.8' }],
+    }
+    const ctx = {
+      logger: { warn: () => {}, error: () => {} },
+      llm: {
+        listModels: async (provider: string) => catalogs[provider] ?? [],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string; model: string }) => {
+          sent.push(`${o.provider}/${o.model}`)
+          const chunks = o.provider === 'loomy'
+            ? WALL_HIT
+            : [
+                { type: 'block-start', index: 0, blockType: 'text' },
+                { type: 'text-delta', index: 0, text: 'ok' },
+                { type: 'finish', reason: { kind: 'stop' } },
+              ]
+          return (async function* () { for (const c of chunks) yield c })()
+        },
+      },
+    }
+    const adapter = new AutoAdapter(ctx as never, {
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: { token: 't' } }),
+      } as never,
+      now: () => now,
+      // ⚠️ **刻意不传 ttlMs** ⇒ 用生产默认 60 秒缓存（本条的考点）。
+    })
+    adapter.expiryOf = async (p: string) => (p === 'loomy' ? 100 : p === 'zcode' ? 200 : -1)
+
+    const run = async () => {
+      const call = await adapter.prepareCall('jet-hub-auto', 'auto')
+      for await (const _ of call.stream({ messages: [userMessage()] } as never)) { /* drain */ }
+    }
+
+    await run()
+    expect(sent).toEqual(['loomy/spark-x', 'zcode/glm-5.3-flash'])
+
+    // 第 2 个请求：仍在 60 秒缓存窗口内（now 未动）。
+    // ⛔ 若 `ensureChoice` 不查冷却，这里会**又撞一次 loomy**（缓存命中）。
+    sent.length = 0
+    await run()
+    expect(sent, '缓存窗口内也不得再撞冷却中的目标').toEqual(['zcode/glm-5.3-flash'])
+  })
+})
