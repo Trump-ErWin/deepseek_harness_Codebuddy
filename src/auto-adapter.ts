@@ -257,7 +257,23 @@ export class AutoAdapter extends LlmAdapter {
         if (!(await this.providerSupportsImages(provider))) continue
         let expiry = await this.expiryOf(provider, signal)
         // 目录空/模型全关 ⇒ 该 provider 不可调用，不能当改道目标（PR !69 审计实测）。
-        if ((await this.firstModelOf(provider)) === undefined) expiry = UNUSABLE
+        const model = await this.firstModelOf(provider)
+        if (model === undefined) {
+          expiry = UNUSABLE
+        } else if (!await this.hasUsableAccountFor(provider, model, signal)) {
+          // ⚠️⚠️ **改道路径同样要按将要派发的模型复核可用性**（真实缺陷，2026-10-07
+          //    独立审计实测证伪 —— 同型缺陷的**第三处实例**）。
+          //
+          // 主选型路径（`selectProvider`）已补该复核，但**改道路径原先漏了**：
+          // 一个「支持图片但额度已尽」的渠道仍会被选成 imageTarget ⇒ 带图请求
+          // 发出去必然失败。可达性真实：buddy 既声明 `['text','image']`
+          //（`buddy-adapter.ts:1272`）**又**会写 `modelRateLimits`（`:1922`）。
+          //
+          // ⚠️ 同一缺陷在本文件已修过主路径、在 `aggregate-adapter.ts` 修过建池路径
+          //    —— 这是第三处。**修同型缺陷时必须把同一文件里的所有实例一起找出来**，
+          //    否则就会留下这种「修了一处、漏了另一处」。
+          expiry = UNUSABLE
+        }
         entries.push([provider, expiry])
       }
       const picked = pickSoonestProvider(entries)
@@ -470,6 +486,28 @@ export class AutoAdapter extends LlmAdapter {
    * 一个 provider 余额充足、但目录为空或模型被用户全关时，仍**不能**当选 ——
    * 初版会让它拿到请求再发出一个必然 404 的模型 id。故排序时就把这类 provider
    * 当作 `UNUSABLE` 剔除，顺位让给下一个候选（而不是整体放弃 auto）。
+   *
+   * ## ⚠️⚠️ 还必须按 `modelOf` 返回的**真实模型**复核账号可用性（真实缺陷，2026-10-07）
+   *
+   * 「额度耗尽」在账号池里是**按 modelId 记账**的
+   *（`entry.modelRateLimits[modelId]`；codearts 的 benefit 免费额度耗尽就写在那里，
+   * `llm-adapter.ts:1290`），而折算取号用的模型键**未必等于**这里要派发的模型：
+   *
+   * | 消费者 | 折算取号用的键 | 实际派发 |
+   * |---|---|---|
+   * | `AutoAdapter` 自建探针（单测/未注入时） | `firstModelOf`（按倍率挑最便宜） | 同一个 ✓ |
+   * | **生产装配**（`index.ts` 注入 `sharedExpiryProbe`） | **`models[0]?.id`** | **`firstModelOf`** ✗ |
+   *
+   * ⚠️ 生产装配下两者**不同**：共享探针的 `firstModelIdOf` 是「取目录第一个」
+   *（见 `index.ts` 那段「共享带来的语义松弛」注释），而 `firstModelOf` 是
+   * 「按倍率挑最便宜」。实测（探针，2026-10-07）：目录为
+   * `[glm-5.3-flash, Deepseek-V4.1-Flash · x0.1]`、账号在 `deepseek-v4.1-flash`
+   * 上额度已尽时，auto 仍选中 `codearts/deepseek-v4.1-flash` —— 因为折算问的是
+   * `glm-5.3-flash`（未被标记），按 modelId 的过滤**整体失效**。
+   *
+   * ⚠️ 这**推翻**了 `index.ts:2210-2222` 那句「共享的松弛已核实无害」：该注释
+   * 假设「`probeModel` 不参与折算结果、故与派发无关」，但它**参与账号池的
+   * 限流过滤** —— 而那正是「这个模型还能不能用」的判据。故这里必须显式复核。
    */
   async selectProvider(
     signal?: AbortSignal,
@@ -480,7 +518,14 @@ export class AutoAdapter extends LlmAdapter {
       let expiry = await this.expiryOf(provider, signal)
       if (expiry !== UNUSABLE && modelOf !== undefined) {
         // 目录空/全关 ⇒ 退出候选（不可调用），与「不可用」同等对待。
-        if ((await modelOf(provider)) === undefined) expiry = UNUSABLE
+        const model = await modelOf(provider)
+        if (model === undefined) {
+          expiry = UNUSABLE
+        } else if (!await this.hasUsableAccountFor(provider, model, signal)) {
+          // ⚠️ 该 provider 在**将要派发的那个模型**上没有可用账号（额度已尽/限流中）
+          //    ⇒ 剔除，顺位让给下一个候选。否则请求发出去必然失败。
+          expiry = UNUSABLE
+        }
       }
       entries.push([provider, expiry])
     }
@@ -489,6 +534,52 @@ export class AutoAdapter extends LlmAdapter {
     const model = modelOf !== undefined ? await modelOf(winner) : undefined
     if (modelOf !== undefined && model === undefined) return undefined
     return { provider: winner, model: model ?? '' }
+  }
+
+  /**
+   * 该 provider 在**指定模型**上是否还有可用账号（额度未耗尽 / 未在限流中）。
+   *
+   * ⚠️ 判据交给账号池（`getAvailableAccount` 按 `modelRateLimits[modelId]` 过滤）
+   * —— 不在这里另写一份「额度是否耗尽」的判据（那会是同一语义两套实现，
+   * 本仓库对此有明确红线）。
+   *
+   * ⚠️ 三条边界（与 `aggregate-adapter.ts` 的 `filterByModelAvailability` **逐格同构**）：
+   * - 池未实现该方法 ⇒ **视为可用**（跳过过滤）：大量既有单测桩只实现
+   *   `disabledModelsFor`，判成不可用会让所有桩用例「零候选」。宁可少筛一层，
+   *   不可把整池误剔除。
+   * - 查询抛错 ⇒ **视为可用**：一次池查询异常不该让渠道整体消失。
+   * - ⚠️ **中止必须原样逃逸**：判据取**三条**（与 `aggregate-adapter.ts` 的
+   *   `isAbortLike` 同构）—— `signal.aborted` / `name === 'AbortError'` /
+   *   `code === 'ABORTED'`。
+   *
+   *   ⚠️⚠️ **不要只判 `name`**（我上一版正是这么写的，注释还声称「同口径」，
+   *   被对抗审计实测证伪）：`aggregate-adapter.ts` 的 `abortError()` 会**同时**
+   *   设 `name` 与 `code`，但别的调用方可能只设 `code` —— 那时只判 `name` 会把
+   *   中止**吞成「视为可用」并继续发请求**，正是本仓库反复记录的那类缺陷。
+   *   （当前生产装配下该形态不可达，但「同族判据必须逐格同构」是硬要求。）
+   */
+  private async hasUsableAccountFor(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const pool = this.options.accountPool as unknown as {
+      getAvailableAccount?: (provider: string, modelId: string) => Promise<unknown>
+    }
+    if (typeof pool.getAvailableAccount !== 'function') return true
+    signal?.throwIfAborted()
+    try {
+      const available = await pool.getAvailableAccount(provider, model)
+      return available !== null && available !== undefined
+    } catch (error) {
+      signal?.throwIfAborted()
+      // ⚠️ 三条判据，与 `aggregate-adapter.ts:1684-1689` 的 `isAbortLike` 逐字同构。
+      if (error !== null && typeof error === 'object') {
+        const candidate = error as { name?: unknown; code?: unknown }
+        if (candidate.name === 'AbortError' || candidate.code === 'ABORTED') throw error
+      }
+      return true
+    }
   }
 
   /**

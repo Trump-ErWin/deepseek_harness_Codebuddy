@@ -1102,6 +1102,31 @@ export interface ModelCatalogSource {
    */
   clearChoiceCache?(): void
   /**
+   * 清空**临期折算缓存**（**可选** —— 只有聚合适配器实现它）。
+   *
+   * ## ⚠️⚠️ 为什么领取（claim）之后必须调它（真实缺陷，对抗审计实测证伪，2026-10-07）
+   *
+   * `createExpiryProbe` 的折算缓存（TTL 60 秒）**也缓存 `UNUSABLE`** —— 这是刻意的
+   * （见 `aggregate-expiry.ts` 的 `cacheAndReturn`：一个渠道「现在没账号」60 秒内不会变）。
+   *
+   * 但 `UNUSABLE` 现在**新增了一个来源**：`zcodeExpiry` 把「余额为 0」判成 `UNUSABLE`
+   *（修掉「额度已尽仍被 auto 选中」的真实缺陷）。而 zcode 的每日赠送额度**要先领取
+   * 才进 `balances` 桶** ⇒ 于是出现这个时序：
+   *
+   * 1. 用户请求 → 余额 0 → 写入 `UNUSABLE`（缓存 60 秒）；
+   * 2. 用户去面板点「一键领取」→ **领取成功、余额进桶**；
+   * 3. 用户立刻用 auto → **仍命中第 1 步的 `UNUSABLE`** ⇒ 报「没有任何可用候选」。
+   *
+   * ⇒ 用户会以为「签到没用」或「auto 坏了」，而账号其实已经好了。
+   *
+   * ⚠️ 旧实现不会暴露这个问题：它那时在「余额 0 但有可领活动」时返回**当日**
+   *（可当选），根本不写 `UNUSABLE`。是本次收窄**引入了**这个时序。
+   *
+   * ⚠️ 已有的两个清理入口（`pool.onAccountAdded` 与拒绝表变更）**都不覆盖领取** ——
+   * 领取既不新增账号、也不改拒绝表。故必须在领取成功后**显式**清一次。
+   */
+  clearExpiryCache?(): void
+  /**
    * 「上次**实际**转发成功的渠道」（**可选** —— 只有聚合适配器实现它）。
    *
    * ⚠️ 必须是**纯内存读、零网络零余额查询**（规格 §6.3 的 P2）：用量徽标在
@@ -1279,7 +1304,13 @@ function registerJetHubEndpoints(
       return [...new Set(accounts.map((entry) => entry.provider))].sort()
     },
     claim: (provider) =>
-      handleMethod('credits.claimAll', { provider }) as Promise<BadgeRpcResult<RpcCreditsClaimAllResponse>>,
+      handleMethod('credits.claimAll', { provider }).then((result) => {
+        // ⚠️ 自动签到路径**绕过**了 RPC 请求入口那处清理（它直接调 `handleMethod`）
+        //    ⇒ 必须在这里也清一次，否则「启动时自动签到成功 → 用户马上用 auto」
+        //    仍会撞上缓存里的 `UNUSABLE`（见 `ModelCatalogSource.clearExpiryCache`）。
+        modelAdapters?.['aggregate']?.clearExpiryCache?.()
+        return result as BadgeRpcResult<RpcCreditsClaimAllResponse>
+      }),
     warn: (message) => ctx.logger?.warn?.(message),
   })
   // 启动时排定一轮（延迟 30s；内部自己判开关与「今天是否已跑」）。
@@ -1350,6 +1381,13 @@ function registerJetHubEndpoints(
 
       try {
         const result = await handleMethod(call.method as string, call.payload, request.signal)
+        // ⚠️ 领取成功后清**临期折算缓存**（见 `ModelCatalogSource.clearExpiryCache`
+        //    的长注释）：zcode 的每日额度要先领取才进 `balances` 桶，而「余额为 0」
+        //    现在会被折算成 `UNUSABLE` 并被缓存 60 秒 ⇒ 不清就会让用户「签到成功了，
+        //    但 60 秒内 auto 仍说没有可用候选」。
+        if (call.method === 'credits.claimAll') {
+          modelAdapters?.['aggregate']?.clearExpiryCache?.()
+        }
         return reply(rpcId, result)
       } catch (error) {
         // 必须返回规范的 RPC 错误响应（而不是裸 500 文本），

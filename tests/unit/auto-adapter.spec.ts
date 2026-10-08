@@ -267,3 +267,213 @@ describe('auto：代表账号必须跳过正在限流的账号', () => {
     expect(code).not.toMatch(/getAvailableAccount\(\s*provider\s*,\s*''\s*\)/)
   })
 })
+
+/**
+ * ★★ 胜者必须在**将要派发的那个模型**上还有可用账号（真实缺陷，2026-10-07）。
+ *
+ * ## 缺陷机制
+ *
+ * 「额度耗尽」在账号池里**按 modelId 记账**（`entry.modelRateLimits[modelId]`；
+ * codearts 的 benefit 免费额度耗尽就写在那里，`llm-adapter.ts:1290`）。而
+ * **生产装配**注入的 `sharedExpiryProbe` 取号用的是「目录第一个模型」
+ *（`index.ts` 的 `firstModelIdOf`：`models[0]?.id`），**不是** `firstModelOf`
+ * 挑出来的那个（按倍率最便宜）⇒ 两者不同时，按 modelId 的过滤**整体失效**。
+ *
+ * ⚠️ 这**推翻**了 `index.ts` 那段「共享带来的语义松弛**已核实无害**」的注释：
+ * 它假设 `probeModel` 不参与折算结果、故与派发无关 —— 但它**参与账号池的
+ * 限流过滤**，而那正是「这个模型还能不能用」的判据。
+ */
+describe('★★ auto：胜者必须在将要派发的模型上仍有可用账号', () => {
+  /** 目录：第一个 `glm-5.3-flash`（无倍率），第二个更便宜（x0.1）⇒ firstModelOf 选后者。 */
+  const CATALOG = [
+    { id: 'glm-5.3-flash', name: 'glm-5.3-flash' },
+    { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.1' },
+  ]
+
+  /** 池：账号在 `blocked` 这个模型上额度已尽（= 真实 `modelRateLimits` 判据）。 */
+  const gatedPool = (blocked: string) => ({
+    disabledModelsFor: () => new Set<string>(),
+    getAvailableAccount: async (_p: string, modelId: string) => (
+      modelId === blocked ? null : { entry: { id: 'A' }, credential: { token: 't' } }
+    ),
+  })
+
+  const makeAuto = (pool: unknown) => {
+    const sent: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, error: () => {} },
+      llm: {
+        listModels: async () => CATALOG,
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string; model: string }) => {
+          sent.push(`${o.provider}/${o.model}`)
+          return (async function* () { /* noop */ })()
+        },
+      },
+    }
+    const adapter = new AutoAdapter(ctx as never, {
+      accountPool: pool as never,
+      now: () => 1_000,
+      ttlMs: 0,
+    })
+    // 余额折算隔离：只桩「最早失效时刻」，取号/可用性判据仍走真实逻辑。
+    adapter.expiryOf = async (provider: string) => (provider === 'codearts' ? 100 : -1)
+    return { adapter, sent }
+  }
+
+  const run = async (adapter: AutoAdapter): Promise<{ code?: string } | undefined> => {
+    try {
+      const call = await adapter.prepareCall('jet-hub-auto', 'auto')
+      for await (const _ of call.stream({ messages: [userMessage()] } as never)) { /* drain */ }
+      return undefined
+    } catch (error) {
+      return error as { code?: string }
+    }
+  }
+
+  it('★★ 最便宜的模型上额度已尽 ⇒ 不得选中该 provider（退出候选，不静默成功）', async () => {
+    // ⛔ 回归前：`expiryOf` 只报临期值（100）⇒ codearts 当选 ⇒ 请求发往
+    //    `deepseek-v4.1-flash`，而该模型上账号额度已尽 ⇒ 上游必然失败。
+    //    修后：该 provider 退出候选 ⇒ 无候选 ⇒ 如实报错（而不是发一个必然失败的请求）。
+    const { adapter, sent } = makeAuto(gatedPool('deepseek-v4.1-flash'))
+    const error = await run(adapter)
+    expect(sent, '该模型上无可用账号 ⇒ 不得发请求').toEqual([])
+    // ⚠️ 报错码沿用「无可用候选」的既有语义（与 zcode 余额 0 被剔除时同一条路径）。
+    expect(error?.code).toBe('MISSING_CREDENTIAL')
+  })
+
+  it('★ 对照：不设额度标记 ⇒ 正常选中（证明差异来自可用性，不是别的）', async () => {
+    const { adapter, sent } = makeAuto(gatedPool('__none__'))
+    await run(adapter)
+    expect(sent).toEqual(['codearts/deepseek-v4.1-flash'])
+  })
+
+  it('★ 只标记**别的**模型 ⇒ 不影响（判据按将要派发的模型精确匹配）', async () => {
+    const { adapter, sent } = makeAuto(gatedPool('glm-5.3-flash'))
+    await run(adapter)
+    // 被标记的是 `glm-5.3-flash`，而实际要派发 `deepseek-v4.1-flash` ⇒ 仍可选中。
+    expect(sent).toEqual(['codearts/deepseek-v4.1-flash'])
+  })
+
+  it('★ 池未实现 `getAvailableAccount` ⇒ 跳过过滤（不可把整池误剔除）', async () => {
+    const { adapter, sent } = makeAuto({ disabledModelsFor: () => new Set<string>() })
+    await run(adapter)
+    expect(sent).toEqual(['codearts/deepseek-v4.1-flash'])
+  })
+
+  it('★ 池查询抛错 ⇒ 视为可用（一次异常不得让渠道整体消失）', async () => {
+    const { adapter, sent } = makeAuto({
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => { throw new Error('池异常') },
+    })
+    await run(adapter)
+    expect(sent).toEqual(['codearts/deepseek-v4.1-flash'])
+  })
+
+  it('★★ 中止必须逃逸：池抛 `{ code: "ABORTED" }`（**无 `name`**）也要中止', async () => {
+    // ⚠️⚠️ 真实缺陷（对抗审计实测证伪，2026-10-07）：我上一版只判 `name === 'AbortError'`，
+    //    注释还声称「与 `filterByModelAvailability` 同口径」—— 而后者用共享
+    //    `isAbortLike`，判**三条**（`signal.aborted` / `name` / **`code === 'ABORTED'`**）。
+    //    只判 `name` 时，`code` 形态的中止会被**吞成「视为可用」并继续发请求** ——
+    //    正是本仓库反复记录的那类缺陷（「同族判据必须逐格同构」）。
+    const { adapter, sent } = makeAuto({
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => { throw Object.assign(new Error('cancelled'), { code: 'ABORTED' }) },
+    })
+    const error = await run(adapter)
+    expect(sent, '中止不得继续发请求').toEqual([])
+    expect(error?.code, '应原样上抛该错误（而不是吞掉）').toBe('ABORTED')
+  })
+
+  it('★ 中止必须逃逸：池抛 `AbortError`（`name` 形态）', async () => {
+    const { adapter, sent } = makeAuto({
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => {
+        const err = new Error('aborted')
+        err.name = 'AbortError'
+        throw err
+      },
+    })
+    const error = await run(adapter)
+    expect(sent, '中止不得继续发请求').toEqual([])
+    expect(error?.name).toBe('AbortError')
+  })
+})
+
+/**
+ * ★★ 带图**改道**路径也必须按将要派发的模型复核可用性（真实缺陷，2026-10-07）。
+ *
+ * ⚠️ 这是同一缺陷的**第三处实例**（独立审计实测证伪）：主选型路径
+ *（`selectProvider`）与聚合建池路径（`filterByModelAvailability`）都已补复核，
+ * 但 `prepareCall` 里选 `imageTarget` 的那个循环**漏了** ⇒ 一个「支持图片但额度
+ * 已尽」的渠道仍会被选成改道目标，带图请求发出去必然失败。
+ *
+ * 可达性真实：buddy 既声明 `['text','image']`（`buddy-adapter.ts:1272`）
+ * **又**会写 `modelRateLimits`（`:1922`）。
+ */
+describe('★★ auto：带图改道路径也必须按派发模型复核可用性', () => {
+  /** buddy 不支持图片（当胜者）、codearts 支持图片但额度已尽。 */
+  const makeImageWorld = (codeartsBlocked: boolean) => {
+    const sent: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, error: () => {} },
+      llm: {
+        // ⚠️ `providerSupportsImages` 读的是 **`listModels` 返回的 `inputModalities`**
+        //（`auto-adapter.ts:429-433`），**不是** `resolveModelInfo` —— 我第一版桩错了位置，
+        // 导致「全池都不支持图片」而对照组也失败。
+        listModels: async (p: string) => (p === 'codearts'
+          ? [{ id: 'vision-model', name: 'Vision', inputModalities: ['text', 'image'] }]
+          : [{ id: 'text-model', name: 'Text', inputModalities: ['text'] }]),
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string; model: string }) => {
+          sent.push(`${o.provider}/${o.model}`)
+          return (async function* () { /* noop */ })()
+        },
+      },
+    }
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async (p: string, modelId: string) => (
+        codeartsBlocked && p === 'codearts' && modelId === 'vision-model'
+          ? null
+          : { entry: { id: 'a1' }, credential: { token: 't' } }
+      ),
+    }
+    const adapter = new AutoAdapter(ctx as never, {
+      accountPool: pool as never,
+      now: () => 1_000,
+      ttlMs: 0,
+    })
+    // buddy 临期更早 ⇒ 它当选（但它不支持图片）；codearts 是唯一能收图的候选。
+    adapter.expiryOf = async (provider: string) => (provider === 'buddy' ? 100 : 900)
+    return { adapter, sent }
+  }
+
+  /** ⚠️ 必须用 `makeImageWorld` 闭包里的 `sent`（我第一版在这里新建了一个，导致断言恒空）。 */
+  const runWithImage = async (adapter: AutoAdapter): Promise<void> => {
+    const call = await adapter.prepareCall('jet-hub-auto', 'auto')
+    // 带图消息 ⇒ 触发 stream 闭包里的改道逻辑。
+    for await (const _ of call.stream({
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'hi' },
+          { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AA==' } },
+        ],
+      }],
+    } as never)) { /* drain */ }
+  }
+
+  it('★★ 唯一能收图的渠道额度已尽 ⇒ 不得改道过去（不得发必然失败的请求）', async () => {
+    const { adapter, sent } = makeImageWorld(true)
+    // ⚠️ 额度已尽的 codearts 被剔除 ⇒ 无改道目标 ⇒ 如实报错（而不是发一个必然失败的请求）。
+    await expect(runWithImage(adapter)).rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+    expect(sent, 'codearts 在 vision-model 上无可用账号 ⇒ 不得改道过去').toEqual([])
+  })
+
+  it('★ 对照：不设额度标记 ⇒ 正常改道到支持图片的 codearts', async () => {
+    const { adapter, sent } = makeImageWorld(false)
+    await runWithImage(adapter)
+    expect(sent).toEqual(['codearts/vision-model'])
+  })
+})

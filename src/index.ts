@@ -2207,19 +2207,30 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
    *
    * ⇒ 在装配层建**一个**，两个适配器都用它；`clear()` 一次即全部生效。
    *
-   * ⚠️ **共享带来的一个语义松弛（已核实无害，但必须写明）**：
+   * ⚠️ **共享带来的一个语义松弛 —— 它**曾经**被判定为「无害」，那个判定是错的**
+   *（真实缺陷，2026-10-07 探针实测证伪）：
    *    `AutoAdapter` 自己那份 `firstModelOf` 是「跳过被禁用 + 按倍率**挑最便宜**」，
    *    而这里共享的这个是「取目录**第一个**」。共享后**两个消费者都用后者**。
    *
-   *    ⚠️ **为何无害**：`firstModelIdOf` 的返回值只被当作
-   *    `probeModel = (await firstModelIdOf(provider)) ?? ''` 传给账号池的取号器
-   *    （用于「限流过滤」这一用途，见 `aggregate-expiry.ts:226`），
-   *    **不参与折算结果的任何计算** —— 两者都只是「拿该渠道的某个真实 modelId」，
-   *    对「最早失效时刻」这个返回值没有影响。
+   *    ⚠️ 旧注释的理由是「`firstModelIdOf` 的返回值只被当作 `probeModel` 传给取号器，
+   *    **不参与折算结果的任何计算**」—— 前半句对，**结论错**：`probeModel` 确实不参与
+   *    「最早失效时刻」这个数值，但它**参与账号池的限流过滤**
+   *   （`getAvailableAccount` 按 `entry.modelRateLimits[modelId]` 过滤），
+   *    而那正是「这个模型现在还能不能用」的判据。
    *
-   *    ⚠️ 反过来说：若**将来**有人让折算逻辑依赖 `probeModel`
-   *    （如「按最便宜的模型查额度」），这个松弛就会变成真缺陷 —— 那时必须
-   *    让两个消费者各自传自己的实现，或把该语义抽进探针参数。
+   *    ⇒ 实测（探针）：目录为 `[glm-5.3-flash, Deepseek-V4.1-Flash · x0.1]`、
+   *    账号在 `deepseek-v4.1-flash` 上额度已尽时，auto **仍选中**
+   *    `codearts/deepseek-v4.1-flash` —— 因为折算问的是 `glm-5.3-flash`
+   *   （未被标记），按 modelId 的过滤整体失效，请求发出去必然
+   *    `InferHub.4291.200 insufficient quota`。
+   *
+   *    ⚠️ **已修**：两个消费者现在都**显式按将要派发的真实模型**复核账号可用性
+   *   （`auto-adapter.ts` 的 `hasUsableAccountFor`、`aggregate-adapter.ts` 的
+   *    `filterByModelAvailability`）—— 判据仍只有一份（账号池的 `modelRateLimits`），
+   *    这两个方法只是「问对模型」。
+   *
+   *    ⚠️ 若将来有人让折算逻辑**依赖** `probeModel` 的**具体取值**
+   *   （如「按最便宜的模型查额度」），仍需让两个消费者各自传自己的实现。
    */
   const sharedExpiryProbe = createExpiryProbe(pool, async (provider) => {
     const models = await ctx.llm.listModels(provider)
