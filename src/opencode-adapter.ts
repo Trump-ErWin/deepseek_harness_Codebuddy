@@ -49,7 +49,7 @@ import {
   getOpencodeCapabilitiesSync, opencodeEffortName, supportsOpencodeImage,
   type OpencodeModelCapability,
 } from './opencode-capability.js'
-import { buildProxyDispatcher } from './opencode-proxy.js'
+import { proxyFetch } from './opencode-proxy.js'
 import { consumeOpenAiSse, collectImages, httpErrorCode, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
 import { reportLedgerAccount } from './token-ledger.js'
@@ -539,11 +539,12 @@ export class OpencodeAdapter extends LlmAdapter {
       headers,
       body: JSON.stringify(payload),
       ...options.signal !== undefined ? { signal: options.signal } : {},
-      // ⚠️ per-request dispatcher：只让本 provider 的这次请求走该账号的出口，
-      // **不动全局**（两个插件抢全局槽位会互相短路整个路由层）。
-      ...slot.proxy === undefined ? {} : { dispatcher: buildProxyDispatcher(slot.proxy) as never },
     }
-    const response = await fetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, init)
+    // ⚠️ 走 `proxyFetch` 而不是裸 `fetch`：有代理时它会把请求交给**与
+    // dispatcher 同源**的 undici fetch。用全局 fetch 会造成跨实例 handler
+    // 契约冲突（Node 22/24 上恒失败），详见 `opencode-proxy.ts` 的 `proxyFetch`。
+    // 它内部处理「无代理时退回全局 fetch」，故这里不再自行分支。
+    const response = await proxyFetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, init, slot.proxy)
     if (!response.ok) {
       // ⚠️ **必须先读体**：Zen 的限流语义（`GoUsageLimitError`）在响应体里，
       // 而 body 只能读一次 —— 读了不传下去，轮换层就只能按状态码猜，
