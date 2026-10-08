@@ -24,6 +24,7 @@ import {
   type AutoAdapter,
 } from './auto-adapter.js'
 import { resolveAutoBadgeRewrite, type AutoBadgeState } from './auto-badge.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { isGatewayEnabled } from './openai-gateway/config.js'
 import { collectGatewayEffortViews, collectGatewayModels, toGatewayModelIds, type GatewayModelSource } from './openai-gateway/models.js'
 import {
@@ -230,6 +231,8 @@ import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
 import type {
   ProviderAccountEntry,
+  BackupImportMode,
+  RpcBackupExportRequest,
   RpcBackupExportResponse,
   RpcBackupImportRequest,
   RpcBackupImportResponse,
@@ -1104,6 +1107,31 @@ export interface ModelCatalogSource {
    */
   clearChoiceCache?(): void
   /**
+   * 清空**临期折算缓存**（**可选** —— 只有聚合适配器实现它）。
+   *
+   * ## ⚠️⚠️ 为什么领取（claim）之后必须调它（真实缺陷，对抗审计实测证伪，2026-10-07）
+   *
+   * `createExpiryProbe` 的折算缓存（TTL 60 秒）**也缓存 `UNUSABLE`** —— 这是刻意的
+   * （见 `aggregate-expiry.ts` 的 `cacheAndReturn`：一个渠道「现在没账号」60 秒内不会变）。
+   *
+   * 但 `UNUSABLE` 现在**新增了一个来源**：`zcodeExpiry` 把「余额为 0」判成 `UNUSABLE`
+   *（修掉「额度已尽仍被 auto 选中」的真实缺陷）。而 zcode 的每日赠送额度**要先领取
+   * 才进 `balances` 桶** ⇒ 于是出现这个时序：
+   *
+   * 1. 用户请求 → 余额 0 → 写入 `UNUSABLE`（缓存 60 秒）；
+   * 2. 用户去面板点「一键领取」→ **领取成功、余额进桶**；
+   * 3. 用户立刻用 auto → **仍命中第 1 步的 `UNUSABLE`** ⇒ 报「没有任何可用候选」。
+   *
+   * ⇒ 用户会以为「签到没用」或「auto 坏了」，而账号其实已经好了。
+   *
+   * ⚠️ 旧实现不会暴露这个问题：它那时在「余额 0 但有可领活动」时返回**当日**
+   *（可当选），根本不写 `UNUSABLE`。是本次收窄**引入了**这个时序。
+   *
+   * ⚠️ 已有的两个清理入口（`pool.onAccountAdded` 与拒绝表变更）**都不覆盖领取** ——
+   * 领取既不新增账号、也不改拒绝表。故必须在领取成功后**显式**清一次。
+   */
+  clearExpiryCache?(): void
+  /**
    * 「上次**实际**转发成功的渠道」（**可选** —— 只有聚合适配器实现它）。
    *
    * ⚠️ 必须是**纯内存读、零网络零余额查询**（规格 §6.3 的 P2）：用量徽标在
@@ -1143,33 +1171,34 @@ export interface ModelCatalogSource {
 /**
  * 广播「模型目录可能已变化」。
  *
- * ⚠️ **改黑名单后必须调用**，否则「关闭后选择器里仍能看到该模型，重启后才消失」
- * （真实缺陷，用户报障）。根因在客户端而非适配器：
- * `dsh-client-ui-model-selection` 的 `ModelCatalogDirectory` 把 `modelCatalog`
- * 响应存进一个 `status === 'ready'` 即**短路返回缓存**的 store，只在三个转发的
- * 宿主事件上 `refresh()`：`llm/adapters-updated` / `settings/document-updated`
- * / `credentials/reference-updated`。
+ * ⚠️ 实现已抽到 `src/catalog-broadcast.ts`（issue IKJVTF）：那里是**唯一**的
+ * 广播实现，十个适配器的「远端目录落地」也走它。此前本文件另有一份
+ * `try { ctx.emit(...) } catch`，与适配器侧完全独立 —— 两份实现必然漂移，
+ * 故现改为同名导入。
+ *
+ * ## 为什么改黑名单后必须广播
+ *
+ * 否则「关闭后选择器里仍能看到该模型，重启后才消失」（真实缺陷，用户报障）。
+ * 根因在客户端而非适配器：`dsh-client-ui-model-selection` 的
+ * `ModelCatalogDirectory` 把 `modelCatalog` 响应存进一个 `status === 'ready'`
+ * 即**短路返回缓存**的 store，只在四个转发的宿主事件上 `refresh()`：
+ * `llm/adapters-updated` / `settings/document-updated` /
+ * `credentials/record-updated` / `credentials/reference-updated`。
  *
  * 0.1.7 起黑名单落在插件自有文档 `$DSH_HOME/jet-hub/state.json`（不再经 settings
  * 文档，见 jet-hub-store.ts），因此写开关**不会**触发上述任何一个事件 → 客户端
  * 一直复用旧目录，直到重启（`connection/reset` → `resetGeneration()`）才重拉。
  *
- * 三者中 `llm/adapters-updated` 最贴合：按契约它是**无载荷**的「目录可能变了，
+ * 四者中 `llm/adapters-updated` 最贴合：按契约它是**无载荷**的「目录可能变了，
  * 请重新读 listModels」通知（dsh-llm README：*consumers re-read the registries*），
  * 正是这里要表达的语义。它也在 `API_REMOTE_FORWARDED_EVENTS` 白名单里，故会真的
  * 送达浏览器。不改变拓扑，故 dsh-llm 的 invariant 监听（对每个 provider 读一次
  * `retryPolicy`）必然通过，不会误报 INVARIANT。
  *
  * ⚠️ **通知失败不能反噬已经落盘的开关**：否则用户看到「切换失败」而实际已生效，
- * 再点一次又因幂等而看似「无效」，比不提示更难排查。故这里自行吞掉异常只记日志。
+ * 再点一次又因幂等而看似「无效」，比不提示更难排查。故 `catalog-broadcast.ts`
+ * 自行吞掉异常只记日志。
  */
-function broadcastCatalogChanged(ctx: Context): void {
-  try {
-    ctx.emit('llm/adapters-updated')
-  } catch (error) {
-    ctx.logger.warn(`[jet-hub] 广播模型目录变更事件失败：${String(error)}`)
-  }
-}
 
 /**
  * 取某 provider 的**全量模型 id**（不套黑名单），供「关闭全部」与「关闭供应商」共用。
@@ -1298,7 +1327,13 @@ function registerJetHubEndpoints(
       return [...new Set(accounts.map((entry) => entry.provider))].sort()
     },
     claim: (provider) =>
-      handleMethod('credits.claimAll', { provider }) as Promise<BadgeRpcResult<RpcCreditsClaimAllResponse>>,
+      handleMethod('credits.claimAll', { provider }).then((result) => {
+        // ⚠️ 自动签到路径**绕过**了 RPC 请求入口那处清理（它直接调 `handleMethod`）
+        //    ⇒ 必须在这里也清一次，否则「启动时自动签到成功 → 用户马上用 auto」
+        //    仍会撞上缓存里的 `UNUSABLE`（见 `ModelCatalogSource.clearExpiryCache`）。
+        modelAdapters?.['aggregate']?.clearExpiryCache?.()
+        return result as BadgeRpcResult<RpcCreditsClaimAllResponse>
+      }),
     warn: (message) => ctx.logger?.warn?.(message),
   })
   // 启动时排定一轮（延迟 30s；内部自己判开关与「今天是否已跑」）。
@@ -1369,6 +1404,13 @@ function registerJetHubEndpoints(
 
       try {
         const result = await handleMethod(call.method as string, call.payload, request.signal)
+        // ⚠️ 领取成功后清**临期折算缓存**（见 `ModelCatalogSource.clearExpiryCache`
+        //    的长注释）：zcode 的每日额度要先领取才进 `balances` 桶，而「余额为 0」
+        //    现在会被折算成 `UNUSABLE` 并被缓存 60 秒 ⇒ 不清就会让用户「签到成功了，
+        //    但 60 秒内 auto 仍说没有可用候选」。
+        if (call.method === 'credits.claimAll') {
+          modelAdapters?.['aggregate']?.clearExpiryCache?.()
+        }
         return reply(rpcId, result)
       } catch (error) {
         // 必须返回规范的 RPC 错误响应（而不是裸 500 文本），
@@ -2594,12 +2636,10 @@ function registerJetHubEndpoints(
         await pool.setPermanentLocked(provider, req.locked)
         // ⚠️ 与 `model.setDisabled` 同理：本次写入会改变**选号结果**
         // （进而改变哪些账号会被使用），故广播一次让界面重新读取状态。
-        // 包 try/catch：通知失败不能反噬已经落盘的开关。
-        try {
-          ctx.emit('llm/adapters-updated')
-        } catch (error) {
-          ctx.logger?.warn?.(`[jet-hub] 广播 llm/adapters-updated 失败（不影响已保存的开关）: ${String(error)}`)
-        }
+        // ⚠️ 走**唯一**的广播实现（`src/catalog-broadcast.ts`）：它自带
+        // 「失败只记日志、不反噬已落盘的开关」与两级可选链 logger（审计指出
+        // 此处曾是内联实现，`ctx.logger.warn` 在 logger 缺席时会抛、仅被 catch 吞）。
+        broadcastCatalogChanged(ctx)
         return { ok: true, value: lockResponse() }
       }
 
@@ -4400,14 +4440,21 @@ function registerJetHubEndpoints(
 
       // ── 账号备份（导出 / 导入）──
       //
-      // 目的：更换 DSH 版本时迁移账号凭据。备份文件是**自包含**的 JSON
-      // （账号索引 + 凭据原文 + 模型黑名单，见 src/backup.ts），与 DSH 版本
-      // 无关 —— 导入时按**当前版本**的存储契约重建，天然跨版本。
+      // 目的：更换 DSH 版本时迁移账号凭据，以及**单独**把某个账号搬到另一台
+      // 机器。备份文件是**自包含**的 JSON（账号索引 + 凭据原文 + 模型黑名单，
+      // 见 src/backup.ts），与 DSH 版本无关 —— 导入时按**当前版本**的存储契约
+      // 重建，天然跨版本。
       //
       // 安全约定：加密在浏览器侧完成（PBKDF2 + AES-GCM），RPC 只接收/返回
       // 明文载荷；明文 JSON 不经过本层持久化与日志。
       case 'backup.export': {
-        const result = await exportBackup(pool, ctx.credentials)
+        const req = (payload ?? {}) as RpcBackupExportRequest
+        // accountIds 只作用于 accounts / credentials 两个字段；黑名单与锁定表
+        // 仍是全量，故产物始终是一份可整体还原的自包含快照。
+        const accountIds = Array.isArray(req.accountIds)
+          ? req.accountIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+          : undefined
+        const result = await exportBackup(pool, ctx.credentials, { accountIds })
         const value: RpcBackupExportResponse = {
           payload: result.payload,
           warnings: result.warnings,
@@ -4415,18 +4462,30 @@ function registerJetHubEndpoints(
         return { ok: true, value }
       }
 
-      // 导入 = 整体替换（还原快照，不是合并）。写入顺序刻意「先凭据、后账号池」：
-      // 账号池整体替换成功后，门控（hasLoggedInAccount）与黑名单立即反映新状态；
-      // 若凭据写入中途失败（非法 ref 等），只跳过该条、不中断整体。
+      // 导入有两种模式：
+      // - `replace`（缺省）= 整体替换（还原快照，不是合并）；
+      // - `merge` = 只追加，按 id 跳过已存在的账号，不碰黑名单与锁定表。
+      // 写入顺序刻意「先凭据、后账号池」：账号池写入成功后，门控
+      // （hasLoggedInAccount）与黑名单立即反映新状态；若凭据写入中途失败
+      // （非法 ref 等），只跳过该条、不中断整体。
+      //
+      // ⚠️ 模式必须显式取白名单，不能把请求里的任意字符串透传下去：未知值
+      // 会被 importBackup 的 `?? 'replace'` 静默当成整体替换 —— 那时用户以为
+      // 只是「加一个账号」，实际账号池被清空，属于不可逆的数据损失。
       case 'backup.import': {
         const req = payload as RpcBackupImportRequest
-        const result = await importBackup(ctx.credentials, pool, req.payload)
+        const mode: BackupImportMode = req?.mode === 'merge' ? 'merge' : 'replace'
+        const result = await importBackup(ctx.credentials, pool, req.payload, { mode })
         // 导入会改变账号集合（门控依赖 hasLoggedInAccount）与模型黑名单，
         // 必须广播目录变更，否则界面仍显示旧目录。
         broadcastCatalogChanged(ctx)
+        if (mode === 'merge') {
+          ctx.logger.info(`[jet-hub] 合并导入：新增 ${result.accountsImported} 个账号，跳过 ${result.accountsSkipped.length} 个已存在`)
+        }
         const value: RpcBackupImportResponse = {
           credentialsImported: result.credentialsImported,
           accountsImported: result.accountsImported,
+          accountsSkipped: result.accountsSkipped,
           skipped: result.skipped,
           expiredAccounts: result.expiredAccounts,
           missingCredentials: result.missingCredentials,
@@ -4434,14 +4493,22 @@ function registerJetHubEndpoints(
         return { ok: true, value }
       }
 
-      // 账号池统计（导入前的覆盖提示用）：缺 expiresAt 的条目疑似 DSH 版本
-      // 切换后自动恢复的产物（反推不读凭据值，故无有效期）。前端据此在
-      // 确认导入前提示用户「有 N 个自动恢复的账号将被整体覆盖」。
+      // 账号池统计（导入前的覆盖提示用，也供导出弹窗勾选账号）：缺 expiresAt
+      // 的条目疑似 DSH 版本切换后自动恢复的产物（反推不读凭据值，故无有效期）。
+      // 前端据此在确认导入前提示用户「有 N 个自动恢复的账号将被整体覆盖」，
+      // 并在导出时列出可勾选的账号。
       case 'backup.status': {
         const state = pool.getStateSnapshot()
         const value: RpcBackupStatusResponse = {
           accounts: state.accounts.length,
           withoutExpiry: state.accounts.filter((entry) => entry.expiresAt === undefined).length,
+          // 只给展示字段：凭据内容绝不进这条响应。
+          accountList: state.accounts.map((entry) => ({
+            id: entry.id,
+            provider: entry.provider,
+            nickname: entry.nickname,
+            enabled: entry.enabled,
+          })),
         }
         return { ok: true, value }
       }

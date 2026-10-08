@@ -56,6 +56,7 @@ import {
   fetchCodeArtsRemoteModels,
   saveModelsCache,
   setMemoryCache,
+  type RemoteCatalogOutcome,
 } from './models.js'
 
 /**
@@ -531,14 +532,31 @@ export class CodeArtsAuth extends Service {
   async refreshModels(pool: AccountPool): Promise<Array<{ id: string; name: string }>> {
     if (!this.active) return []
     const credential = await this.firstUsableCredential(pool)
-    if (credential === undefined) return []
-    const models = await fetchCodeArtsRemoteModels(credential, this.fetchImpl)
+    if (credential === undefined) {
+      // 无凭据 ⇒ 两个来源都没取到 ⇒ 不能判成「完整」（否则残缺目录永久固化）。
+      if (this.lastCatalogOutcome !== undefined) {
+        this.lastCatalogOutcome.gatewayOk = false
+        this.lastCatalogOutcome.builtinOk = false
+      }
+      return []
+    }
+    const models = await fetchCodeArtsRemoteModels(credential, this.fetchImpl, this.lastCatalogOutcome)
     if (models.length > 0) {
       setMemoryCache(models)
       saveModelsCache(models)
     }
     return models
   }
+
+  /**
+   * 最近一次 {@link refreshModels} 的各来源成败（issue IKJVTF，审计 I3）。
+   *
+   * ⚠️ 由 `src/index.ts` 在**构造时**注入一个空对象，此后 `refreshModels`
+   * 每轮原地写入 —— 适配器在 `fetchRemoteModels()` 返回后读它，即可判
+   * 「这次目录完不完整」。用「出参对象」而不是改 `refreshModels` 的返回类型：
+   * 该签名被既有调用方与单测按「返回数组」使用，改形状会波及它们。
+   */
+  lastCatalogOutcome: RemoteCatalogOutcome | undefined
 
   /**
    * 取账号池里第一个**凭据可解析且含 AK/SK** 的账号凭据。

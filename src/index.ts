@@ -3,6 +3,8 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
 import { registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
+import { startCatalogPrewarm } from './catalog-prewarm.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
 import { registerLobsteraiLlm } from './lobsterai-adapter.js'
 import { registerQoderLlm } from './qoder-adapter.js'
@@ -11,6 +13,8 @@ import { registerClineLlm } from './cline-adapter.js'
 import { registerLoomyLlm, parseLoomyRemoteModels } from './loomy-adapter.js'
 import { registerRaccoonLlm } from './raccoon-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
+import { isRemoteCatalogComplete } from './models.js'
+import { isBuddyCatalogComplete } from './buddy-oauth.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth, createPoolRefresh } from './buddy-auth.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
 import { QoderAuth } from './qoder-auth.js'
@@ -32,7 +36,7 @@ import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
-import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
+import { ALL_PRODUCTS, CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { installLoopResume } from './loop-recovery.js'
 import {
@@ -301,6 +305,11 @@ export function apply(ctx: Context): void {
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
 
+  // CodeArts 目录的**各来源成败**出参（issue IKJVTF 复审，审计 I3）：
+  // `service.refreshModels` 每轮原地写入，适配器的 `catalogComplete` 读它。
+  // 初值两个 false —— 在首轮真正拉取之前，**没有**任何来源可算「取到」。
+  service.lastCatalogOutcome = { gatewayOk: false, builtinOk: false }
+
   // 「已失效模型」剔除：注入 ctx 只为把日志接进 DSH logger 并复用同一份 home
   // 解析。必须在任何 `registerXxxLlm` 之前调用 —— 各适配器经
   // `registerAdapterIdempotent` 注册时就会包装上剔除逻辑（见该函数注释）。
@@ -333,10 +342,19 @@ export function apply(ctx: Context): void {
   // WorkBuddy provider 已从中国版（copilot.tencent.com）改造为国际版
   // （www.workbuddy.ai）。旧账号存的是中国版凭据，其 token.domain 指向旧端点，
   // 用新 endpoint 发请求必然失败且会一直续期失败，故启动时清理掉。
-  // 判据是「凭据 domain ≠ 产品 apiDomain」，只清真正失配的条目。
-  void pool.pruneAccountsWithForeignDomain(WORKBUDDY).then((removed) => {
+  //
+  // ⚠️⚠️ 判据**不是**「凭据 domain ≠ 产品 apiDomain」（那会误删合法账号，见
+  // `pruneAccountsWithForeignDomain` 的注释），而是「domain 确证属于**其它**产品」：
+  // 故这里必须把**别的产品的已知域**传进去，否则函数无从判断「失配」。
+  // 未知域一律保留 —— 跨机导入的账号 / 上游新增 realm 主机都不该被静默删除。
+  const foreignBuddyDomains = ALL_PRODUCTS
+    .filter(product => product.id !== WORKBUDDY.id)
+    .flatMap(product => [...(product.knownDomains ?? [])])
+  void pool.pruneAccountsWithForeignDomain(WORKBUDDY, foreignBuddyDomains).then((removed) => {
     if (removed.length > 0) {
-      ctx.logger.info(
+      // ⚠️ 用 `warn` 而不是 `info`：这是**删除用户数据**的动作。原先记 `info`，
+      // 与「账号自己没了、日志里什么都没有」的报障形态同型（对抗审计指出）。
+      ctx.logger.warn(
         `[jet-hub] 已清理 ${removed.length} 个 WorkBuddy 旧版（中国版）账号，请重新登录：${removed.join(', ')}`,
       )
     }
@@ -370,6 +388,14 @@ export function apply(ctx: Context): void {
       if (available) await service.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
     },
     fetchRemoteModels: () => service.refreshModels(pool),
+    // ⚠️ 完整性桥接（issue IKJVTF 复审，审计 I3）：CodeArts 的目录来自**两个**
+    // 独立端点（gateway/config + snap builtin），`refreshModels` 会把各来源成败
+    // 原地写进 `service.lastCatalogOutcome`。适配器据此判「这次目录完不完整」
+    // —— 残缺时只展示、不永久缓存，冷却到期后可补齐。
+    catalogComplete: () => {
+      const outcome = service.lastCatalogOutcome
+      return outcome === undefined ? undefined : isRemoteCatalogComplete(outcome)
+    },
     accountPool: pool,
   })
 
@@ -582,6 +608,10 @@ export function apply(ctx: Context): void {
   }
 
   const buddy = new BuddyAuth(ctx)
+  // buddy 目录的**各来源成败**出参（issue IKJVTF 复审，审计 I3）：
+  // `buddy.fetchModels` 每轮原地写入，适配器的 `catalogComplete` 读它。
+  // 初值两个 false —— 首轮真正拉取之前没有任何来源可算「取到」。
+  buddy.lastCatalogOutcome = { scopedOk: false, configOk: false }
   const buddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
     resolveCredential: async (modelId?: string) => {
@@ -624,6 +654,12 @@ export function apply(ctx: Context): void {
     // 并自锁。详见 createPoolRefresh 的注释。
     refresh: createPoolRefresh(pool, 'buddy', buddy),
     fetchRemoteModels: () => buddy.fetchModels(pool),
+    // ⚠️ 完整性桥接（issue IKJVTF 复审，审计 I3）：buddy 的目录是 scoped +
+    // `/v3/config` 的**并集**，两来源 id 集合不同 ⇒ 残缺时只展示、不永久缓存。
+    catalogComplete: () => {
+      const outcome = buddy.lastCatalogOutcome
+      return outcome === undefined ? undefined : isBuddyCatalogComplete(outcome)
+    },
     readImage: makeReadImage(ctx),
     // 图片请求版本（缩放）桥接：issue !IKITT9。不可用时适配器自动回退原图。
     readImageRequest: makeReadImageRequest(ctx),
@@ -637,6 +673,7 @@ export function apply(ctx: Context): void {
   // ctx.buddyAuth / ctx.workbuddyAuth，互不覆盖。
   // 同样不注册斜杠命令：入口在 Jet Hub 的 WorkBuddy 面板。
   const workbuddy = new BuddyAuth(ctx, { product: WORKBUDDY })
+  workbuddy.lastCatalogOutcome = { scopedOk: false, configOk: false }
   const workbuddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(WORKBUDDY.defaultCredentialRef),
     resolveCredential: async (modelId?: string) => {
@@ -677,6 +714,11 @@ export function apply(ctx: Context): void {
     // 这条正是「workbuddy + deepseek-v4.1-flash 一直报未配置凭据」的根因。
     refresh: createPoolRefresh(pool, 'workbuddy', workbuddy),
     fetchRemoteModels: () => workbuddy.fetchModels(pool),
+    // ⚠️ 完整性桥接（同 buddy，见上）。
+    catalogComplete: () => {
+      const outcome = workbuddy.lastCatalogOutcome
+      return outcome === undefined ? undefined : isBuddyCatalogComplete(outcome)
+    },
     readImage: makeReadImage(ctx),
     readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
@@ -2129,13 +2171,11 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 首次运行磁盘没缓存时，本次刷新可能晚于首帧几十秒；那段时间能力按纯文本
   // 保守处理（见 opencode-capability.ts 的模块头）。
   primeOpencodeCapabilities()
-  refreshOpencodeCapabilities(() => {
-    try {
-      ctx.emit('llm/adapters-updated')
-    } catch (error) {
-      ctx.logger.warn(`[codearts-auth] 广播 OpenCode 能力更新失败：${String(error)}`)
-    }
-  })
+  // ⚠️ 走**唯一**的广播实现（`src/catalog-broadcast.ts`）：能力表是能力判定的
+  // 来源，它一变就必须让客户端重读目录 —— 与十个适配器的「目录落地」同一语义，
+  // 不该各写一份 emit（审计指出此处曾是内联实现，且 `ctx.logger.warn` 缺两级
+  // 可选链：logger 缺席时会抛、仅被 catch 吞）。
+  refreshOpencodeCapabilities(() => { broadcastCatalogChanged(ctx) })
   // ⚠️ 这里**不再**调 `registerOpencodeRpc`：opencode 的端点已并入
   // `registerJetHubRpc` 内部的 handleMethod（见 `opencode-rpc.ts` 模块头）。
   // 代理 dispatcher 是常驻连接池：插件卸载必须回收，否则进程退出会挂住。
@@ -2167,19 +2207,30 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
    *
    * ⇒ 在装配层建**一个**，两个适配器都用它；`clear()` 一次即全部生效。
    *
-   * ⚠️ **共享带来的一个语义松弛（已核实无害，但必须写明）**：
+   * ⚠️ **共享带来的一个语义松弛 —— 它**曾经**被判定为「无害」，那个判定是错的**
+   *（真实缺陷，2026-10-07 探针实测证伪）：
    *    `AutoAdapter` 自己那份 `firstModelOf` 是「跳过被禁用 + 按倍率**挑最便宜**」，
    *    而这里共享的这个是「取目录**第一个**」。共享后**两个消费者都用后者**。
    *
-   *    ⚠️ **为何无害**：`firstModelIdOf` 的返回值只被当作
-   *    `probeModel = (await firstModelIdOf(provider)) ?? ''` 传给账号池的取号器
-   *    （用于「限流过滤」这一用途，见 `aggregate-expiry.ts:226`），
-   *    **不参与折算结果的任何计算** —— 两者都只是「拿该渠道的某个真实 modelId」，
-   *    对「最早失效时刻」这个返回值没有影响。
+   *    ⚠️ 旧注释的理由是「`firstModelIdOf` 的返回值只被当作 `probeModel` 传给取号器，
+   *    **不参与折算结果的任何计算**」—— 前半句对，**结论错**：`probeModel` 确实不参与
+   *    「最早失效时刻」这个数值，但它**参与账号池的限流过滤**
+   *   （`getAvailableAccount` 按 `entry.modelRateLimits[modelId]` 过滤），
+   *    而那正是「这个模型现在还能不能用」的判据。
    *
-   *    ⚠️ 反过来说：若**将来**有人让折算逻辑依赖 `probeModel`
-   *    （如「按最便宜的模型查额度」），这个松弛就会变成真缺陷 —— 那时必须
-   *    让两个消费者各自传自己的实现，或把该语义抽进探针参数。
+   *    ⇒ 实测（探针）：目录为 `[glm-5.3-flash, Deepseek-V4.1-Flash · x0.1]`、
+   *    账号在 `deepseek-v4.1-flash` 上额度已尽时，auto **仍选中**
+   *    `codearts/deepseek-v4.1-flash` —— 因为折算问的是 `glm-5.3-flash`
+   *   （未被标记），按 modelId 的过滤整体失效，请求发出去必然
+   *    `InferHub.4291.200 insufficient quota`。
+   *
+   *    ⚠️ **已修**：两个消费者现在都**显式按将要派发的真实模型**复核账号可用性
+   *   （`auto-adapter.ts` 的 `hasUsableAccountFor`、`aggregate-adapter.ts` 的
+   *    `filterByModelAvailability`）—— 判据仍只有一份（账号池的 `modelRateLimits`），
+   *    这两个方法只是「问对模型」。
+   *
+   *    ⚠️ 若将来有人让折算逻辑**依赖** `probeModel` 的**具体取值**
+   *   （如「按最便宜的模型查额度」），仍需让两个消费者各自传自己的实现。
    */
   const sharedExpiryProbe = createExpiryProbe(pool, async (provider) => {
     const models = await ctx.llm.listModels(provider)
@@ -2295,6 +2346,29 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 直接关掉 DSH 而上一轮的 flush 还在排队 —— 落一次盘几乎零成本，
   // 丢的却是「下一轮工具调用能不能带上签名」。
   ctx.effect(() => () => { void geminiSigStore.flush().catch(() => {}) })
+
+  // 冷启动的**有界目录预热**（issue IKJVTF 的冷启动自愈半条）。
+  //
+  // 为什么必须有：首拉失败后适配器回落到**静态兜底表**，客户端把这份兜底目录
+  // 缓存成 `status: 'ready'`（它只认宿主事件），而**没有任何东西会在冷却到期后
+  // 再问一次** —— 只有用户主动打开设置页/切模型才可能触发下一次 `listModels`。
+  // 于是「远端目录其实早已可达，只是没人再问」会一直持续到用户碰巧触发重读。
+  //
+  // ⚠️ **间隔必须大于 `RemoteCatalogGate` 的 30 秒失败冷却**，否则重试被闸门
+  // 原样挡回、什么也不做（等于没预热）。该约束由 `catalog-prewarm.ts` 的
+  // `CATALOG_PREWARM_DELAYS_MS` 与 `tests/unit/catalog-prewarm.spec.ts` 共同守着。
+  //
+  // ⚠️ 走 `ctx.llm.listModels` 而不是适配器私有方法：它会走完整路径
+  // （账号门控 → `ensureRemoteModels` → 闸门），目录已就绪时是**零网络**的，
+  // 且对 `withDeadModelPruning` 包装透明（直接拿原始实例会绕过那层收敛）。
+  //
+  // ⚠️ **不 await**：`apply()` 是同步函数，预热会发网络请求（与既有的
+  // opencode 能力预热同款约定）。停止函数挂 `ctx.effect`，插件释放后停手。
+  ctx.effect(() => startCatalogPrewarm({
+    providers: Object.keys(modelAdapters),
+    warm: (provider) => ctx.llm.listModels(provider),
+    logger: { warn: (message) => ctx.logger?.warn?.(message) },
+  }))
 
   // ⚠️ `registerJetHubRpc` 仍在**原位置**调用（下面 mountOpenAiGateway 之前）——
   //    auto 适配器经 `modelAdapters` 表按 id 传入，**不占位置参数**。

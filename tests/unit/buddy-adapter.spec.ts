@@ -89,6 +89,8 @@ function makeAdapter(overrides: {
   now?: () => number
   /** 多账号池替身；本文件只用到模型黑名单（listModels 的过滤输入）。 */
   accountPool?: unknown
+  /** 各来源成败回调（issue IKJVTF，审计 I3）；接线层桥接数据源的上报。 */
+  catalogComplete?: () => boolean | undefined
 } = {}) {
   let credential = 'credential' in overrides ? overrides.credential : makeCredential()
   const refresh = overrides.refresh ?? (async () => {})
@@ -105,6 +107,7 @@ function makeAdapter(overrides: {
     ...overrides.readImage !== undefined ? { readImage: overrides.readImage } : {},
     ...overrides.product !== undefined ? { product: overrides.product } : {},
     ...overrides.now !== undefined ? { now: overrides.now } : {},
+    ...overrides.catalogComplete !== undefined ? { catalogComplete: overrides.catalogComplete } : {},
     ...overrides.accountPool !== undefined ? { accountPool: overrides.accountPool as never } : {},
   })
 }
@@ -3510,5 +3513,110 @@ describe('内容级风控（11128）：不得当成账号级拦截换号/冷却'
     expect(unapprovedChannelBody).not.toContain('request illegal')
     // 措辞确实与 11140 高度相似 —— 这正是判据必须按 code 而非按文案收窄的原因。
     expect(unapprovedChannelBody).toMatch(/security policy/i)
+  })
+})
+
+/**
+ * ★★ **残缺目录必须能补齐**（issue IKJVTF 复审，审计 I3）。
+ *
+ * buddy 是**双端点** provider：`/console/enterprises/{scope}/models`（scoped）
+ * 与 `/v3/config`，两者 id 集合**不同**、必须取并集（`hy4-preview-f` 只在后者，
+ * 而「限时免费」促销挂在那一个 id 上）。故「一个成功、一个失败」是**常态**。
+ *
+ * 失败路径静默返回空 ⇒ 旧判据 `models.length > 0` 把它当完整 ⇒ 永久缓存
+ * ⇒ 只在另一个端点下发的变体及其促销倍率（`creditsRate`）再也回不来
+ *（用户报障原话：「hy4 preview 现在 ide 是免费我们还是 0.29」）。
+ *
+ * ⚠️ 断言必须是**行为**（清冷却后真的重拉并补齐），不能只断言 `gate.cooling()`
+ * —— 后者在生产路径上读不到，是**假绿**。
+ */
+describe('BuddyAdapter 残缺目录自愈（★ IKJVTF I3）', () => {
+  it('★ 残缺（complete=false）⇒ 展示但**不**永久缓存，冷却后重拉补齐', async () => {
+    let calls = 0
+    let complete = false
+    // ⚠️ 观测点必须是**只由远端下发**的字段（`creditsRate` = 促销倍率）：
+    // `reconcileWithFallback` 是白名单重建，兜底表里的 id 残缺时**仍在**列表里，
+    // 故「id 是否出现」判不出补齐。而 `creditsRate` 只在远端下发
+    //（兜底表是编译期快照，价格会变，不写死）—— 这正是 issue 里用户看到的
+    // 「hy4 preview 现在 ide 是免费我们还是 0.29」。
+    //
+    // ⚠️ `hy4-preview-f` **不在** CODEBUDDY 兜底表里（实测兜底表 16 个 id 不含它），
+    // 它靠 `reconcileWithFallback` 的**例外**保留：`agentReferenced === true`
+    // （服务端声明「对话里可选」，正是真实形态）或远端声明 `supportsImages`。
+    // 不给这两个信号时它会被白名单重建丢掉 —— 那是既有设计，与本用例无关。
+    const firstBatch = [
+      { id: 'hy4-preview', name: 'Hy4 Preview' },
+    ] as never
+    const fullBatch = [
+      { id: 'hy4-preview', name: 'Hy4 Preview' },
+      { id: 'hy4-preview-f', name: 'Hy4 Preview F', creditsRate: '0', agentReferenced: true },
+    ] as never
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => {
+        calls += 1
+        return complete ? fullBatch : firstBatch
+      },
+      catalogComplete: () => complete,
+    })
+
+    const first = await adapter.listModels('buddy')
+    // ① 残缺目录照常展示
+    expect(first.map((m) => m.id)).toContain('hy4-preview')
+    // ② 落进了缓存
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeDefined()
+    // ③ 但没被标成完整 —— 这是短路的判据
+    expect((adapter as unknown as { remoteComplete: boolean }).remoteComplete).toBe(false)
+
+    // ④ 冷却窗口内不重复打请求
+    const afterFirst = calls
+    await adapter.listModels('buddy')
+    expect(calls).toBe(afterFirst)
+
+    // ⑤ ★ 核心：清冷却（等价「冷却到期」）+ 上游已完整 ⇒ **真的重拉补齐**
+    complete = true
+    ;(adapter as unknown as { catalogGate: { reset(): void } }).catalogGate.reset()
+    await adapter.listModels('buddy')
+    expect(calls).toBeGreaterThan(afterFirst)
+    // 补齐的判据是**远端独有的促销倍率**回来了
+    expect((adapter as unknown as { remoteMeta: Map<string, { creditsRate?: string }> }).remoteMeta
+      .get('hy4-preview-f')?.creditsRate).toBe('0')
+    // ⑥ 补齐后转为完整 ⇒ 不再重拉
+    expect((adapter as unknown as { remoteComplete: boolean }).remoteComplete).toBe(true)
+    const afterSecond = calls
+    await adapter.listModels('buddy')
+    expect(calls).toBe(afterSecond)
+  })
+
+  it('★ 完整（complete=true）⇒ 清冷却，后续零请求', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => {
+        calls += 1
+        return [{ id: 'hy4-preview', name: 'Hy4 Preview' }] as never
+      },
+      catalogComplete: () => true,
+    })
+
+    await adapter.listModels('buddy')
+    expect((adapter as unknown as { remoteComplete: boolean }).remoteComplete).toBe(true)
+    const afterFirst = calls
+    await adapter.listModels('buddy')
+    expect(calls).toBe(afterFirst)
+  })
+
+  it('★ 未注入 catalogComplete（旧替身）⇒ 退回旧行为（complete = got）', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => {
+        calls += 1
+        return [{ id: 'hy4-preview', name: 'Hy4 Preview' }] as never
+      },
+    })
+
+    await adapter.listModels('buddy')
+    expect((adapter as unknown as { remoteComplete: boolean }).remoteComplete).toBe(true)
+    const afterFirst = calls
+    await adapter.listModels('buddy')
+    expect(calls).toBe(afterFirst)
   })
 })

@@ -280,6 +280,29 @@ export class AggregateAdapter extends LlmAdapter {
   }
 
   /**
+   * 清空**临期折算缓存**（领取成功后由 RPC 调用）。
+   *
+   * ## ⚠️⚠️ 为什么领取之后必须清（真实缺陷，对抗审计实测证伪，2026-10-07）
+   *
+   * 折算缓存**也缓存 `UNUSABLE`**，而 `zcodeExpiry` 现在把「余额为 0」判成
+   * `UNUSABLE`（修掉「额度已尽仍被 auto 选中」的真实缺陷）。zcode 的每日赠送额度
+   * **要先领取才进 `balances` 桶** ⇒ 「先撞额度尽（写 `UNUSABLE`）→ 去签到 → 立刻用
+   * auto」时，**最长 60 秒内 auto 仍说没有候选**，用户会以为签到没用。
+   *
+   * ⚠️ 已有的两个清理入口（`pool.onAccountAdded` / 拒绝表变更）**都不覆盖领取**。
+   *
+   * ⚠️ 必须清**共享的**那一份探针（装配层 `src/index.ts` 把同一个实例同时给
+   * aggregate 与 auto）—— 只清一份会让 auto 仍看到旧的 `UNUSABLE`。
+   * 故这里清的是注入进来的 `options.expiryProbe`（与 auto 同一个对象）。
+   */
+  clearExpiryCache(): void {
+    // ⚠️ 类型是 `ExpiryProbe`（不含 `clear`），故按结构化判据探测 ——
+    //    单测注入的替身通常没有 `clear`，那时静默跳过（不报错）。
+    const probe = this.options.expiryProbe as { clear?: () => void } | undefined
+    probe?.clear?.()
+  }
+
+  /**
    * 「上次**实际**转发成功的渠道」（P3，供用量徽标）。
    *
    * ⚠️ **纯内存读、零网络零余额查询** —— 徽标在**门控阶段**就要拿到它
@@ -976,9 +999,35 @@ export class AggregateAdapter extends LlmAdapter {
       }
     }
 
+    // ⚠️⚠️ **先按候选自己的 `realId` 复核账号可用性，再折算临期**（真实缺陷，2026-10-07）。
+    //    顺序是刻意的：本地过滤先于上游余额探测 —— 被剔除的候选不必再打一次余额接口
+    //    （与上方「拒绝轮换在建池时就排除」同一取舍）。
+    //
+    // ⚠️⚠️ **被剔除的候选必须显式置 `expiry = UNUSABLE`，不能只把它从折算循环里拿掉**
+    //（真实缺陷，对抗审计实测证伪，2026-10-07 —— 我自己上一版正是这么错的）。
+    //
+    // 机制：建池时每个候选的 `expiry` 初值是 `NEVER`（见上方 `pool.push({…, expiry: NEVER})`），
+    // 而 `rankCandidates`（`aggregate-core.ts:145`）**只剔除 `UNUSABLE`** ——
+    // `NEVER` 是合法排序值（语义是「可用、只是不临期」）。于是「只把候选从
+    // `usable` 里拿掉」时，它的 `expiry` 仍是 `NEVER` ⇒ **照样进入候选序**，
+    // 只是排在最后 ⇒ 当前面的候选失败时**回落到它**（`targets` 是逐个尝试的）。
+    //
+    // 实测（探针）：buddy 可用、codearts 在该模型上额度已尽 ⇒ 候选序
+    // `[buddy, codearts]`；buddy 失败后请求**发往 codearts**，即那个额度已尽的
+    // 渠道仍被尝试 —— 缺陷只是被**推迟**而非消除。
+    //
+    // ⇒ 判据必须落到 `expiry` 上（那才是 `rankCandidates` 读的字段）。
+    const available = await this.availableByModel(pool, signal)
+    const usable = pool.filter((candidate) => {
+      if (available.get(candidate) !== false) return true
+      // ⚠️ 关键一行：显式标记为不可用，否则它会以 `NEVER` 的身份留在候选序里。
+      candidate.expiry = UNUSABLE
+      return false
+    })
+
     // 逐候选折算临期（同一渠道只探一次）。
     const seen = new Map<string, number>()
-    for (const candidate of pool) {
+    for (const candidate of usable) {
       let expiry = seen.get(candidate.provider)
       if (expiry === undefined) {
         try {
@@ -1035,6 +1084,81 @@ export class AggregateAdapter extends LlmAdapter {
     // 也仍报「没有任何可用候选」。
     if (targets.length > 0) this.choiceCache.set(cacheKey, { at: now, targets })
     return targets
+  }
+
+  /**
+   * 逐个候选问账号池「该候选**自己的模型**上还有可用账号吗」。
+   *
+   * ## ⚠️⚠️ 为什么返回**映射**而不是「过滤后的数组」（真实缺陷，对抗审计实测证伪）
+   *
+   * 我上一版返回「过滤后的数组」，调用方拿它去折算临期 —— 但**建池时每个候选的
+   * `expiry` 初值是 `NEVER`**，而 `rankCandidates`（`aggregate-core.ts:145`）
+   * **只剔除 `UNUSABLE`**（`NEVER` 是合法排序值：「可用、只是不临期」）。
+   * ⇒ 被过滤掉的候选 `expiry` 仍是 `NEVER`，**照样进入候选序**、只是排最后；
+   * 当前面的候选失败时**回落到它**（`targets` 逐个尝试）。
+   *
+   * 实测：buddy 可用 + codearts 在该模型上额度已尽 ⇒ 候选序 `[buddy, codearts]`，
+   * buddy 失败后请求**发往 codearts** —— 缺陷只是被推迟而非消除。
+   *
+   * ⇒ 必须让调用方**显式把 `expiry` 置 `UNUSABLE`**（那才是 `rankCandidates` 读的字段）。
+   * 返回映射就是为了让「谁不可用」这个事实能落到调用方的赋值上。
+   *
+   * ## ⚠️⚠️ 为什么必须按 `realId` 复核，不能只靠临期折算
+   *
+   * 各 provider 的「额度耗尽」是按 **modelId** 记账的：
+   * `AccountPool.getAvailableAccount` / `listAvailableCredentials` 都按
+   * `entry.modelRateLimits[modelId]` 过滤候选（`account-pool.ts:1463-1469` /
+   * `:1546-1552`），而 codearts 的 benefit（免费额度）耗尽正是写进那里的
+   * （`llm-adapter.ts` 的三处 `updateModelRateLimit` 调用）。
+   *
+   * 但 `createExpiryProbe` 取号时用的模型键是**该渠道目录的第一个模型**
+   * （`src/index.ts` 的 `firstModelIdOf`：`models[0]?.id`），而**聚合层要派发的是
+   * 候选自己的 `realId`** —— 两者常常不是同一个模型（一个虚拟模型会挂多渠道多模型的
+   * 候选表）。于是：
+   *
+   * | 场景 | 探测用的键 | 实际派发 | `modelRateLimits` 过滤 | 结果 |
+   * |---|---|---|---|---|
+   * | auto | `firstModelOf`（= 实际派发） | 同一个 | ✓ 生效 | 已覆盖 |
+   * | **aggregate** | `models[0]` | **候选 `realId`** | ✗ **失效** | **缺口可达** |
+   *
+   * ## 返回值
+   *
+   * `Map<候选, 是否有可用账号>`：`false` = 明确查到「该模型上无可用账号」；
+   * `true` = 有可用账号 / 池未实现该方法 / 查询异常（后两者是**保留**的取舍）。
+   * ⚠️ 用 `Map` 而非 `Set` 是为了让「查过且为真」与「没查」在类型上可区分 ——
+   * 虽然调用方按 `=== false` 判据处理，两者等价。
+   *
+   * ## 取舍
+   *
+   * - ⚠️ **只在池实现了 `getAvailableAccount` 时过滤**：它是既有 API，但大量单测桩
+   *   只实现了 `disabledModelsFor`（见 `:580` 的注释）。缺失时**跳过过滤**而不是
+   *   判成不可用 —— 宁可少筛一层，不可把整池误剔除（与 `aggregate-expiry.ts` 对
+   *   `listAvailableCredentials` 缺失时的降级同一取向）。
+   * - ⚠️ 查询失败（抛错）时**保留该候选**：一次池查询异常不该让渠道整体消失。
+   * - ⚠️ **中止必须原样逃逸**（与 `candidatesFor` / `capabilityOf` 同一口径，
+   *   本仓库已在该缺陷上复发三次）。
+   */
+  private async availableByModel(
+    pool: readonly RankedCandidate[],
+    signal?: AbortSignal,
+  ): Promise<Map<RankedCandidate, boolean>> {
+    const out = new Map<RankedCandidate, boolean>()
+    const accountPool = this.options.accountPool as unknown as {
+      getAvailableAccount?: (provider: string, modelId: string) => Promise<unknown>
+    }
+    if (typeof accountPool.getAvailableAccount !== 'function') return out
+    for (const candidate of pool) {
+      signal?.throwIfAborted()
+      try {
+        const available = await accountPool.getAvailableAccount(candidate.provider, candidate.realId)
+        out.set(candidate, available !== null && available !== undefined)
+      } catch (error) {
+        if (isAbortLike(error, signal)) throw error
+        // 查询异常 ⇒ 保留该候选（见方法注释的取舍）。
+        out.set(candidate, true)
+      }
+    }
+    return out
   }
 
   /**

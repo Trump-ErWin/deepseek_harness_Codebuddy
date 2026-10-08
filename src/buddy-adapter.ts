@@ -19,6 +19,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { RemoteCatalogGate, REMOTE_CATALOG_COOLDOWN_MS } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import {
   RATE_LIMIT_FALLBACK_MS,
@@ -197,6 +198,19 @@ export interface BuddyAdapterOptions {
   /** 动态拉取远端模型列表（含上下文窗口与能力，若远端下发）；失败时调用方回退到静态列表。 */
   fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
   /**
+   * 最近一次目录拉取的**各来源成败**（issue IKJVTF，审计 I3）。
+   *
+   * buddy 的目录来自**两个**端点（`/console/enterprises/{scope}/models` +
+   * `/v3/config`），两者 id 集合不同、必须取并集 ⇒「一个成功、一个失败」是常态。
+   * 失败路径**静默**返回空 ⇒ 旧判据 `models.length > 0` 会把它当成完整并永久缓存
+   * ⇒ 只在另一个端点下发的变体（如 `hy4-preview-f`）及其促销倍率再也回不来。
+   *
+   * ⚠️ 用**回调**而非直接读 `BuddyAuth` 的内部状态：适配器不该依赖 auth 服务的
+   * 字段形状（它由 `index.ts` 接线，单测用替身）。返回 `undefined` 时按
+   * 「无法判定」处理（`complete = got`，与 `normalizeLoadResult` 同口径）。
+   */
+  catalogComplete?: () => boolean | undefined
+  /**
    * 读取一张图片的原始字节（图片输入必需）。
    *
    * 由调用方桥接 `ctx.attachments.readImage(ref)`。**失败必须抛错**：
@@ -247,6 +261,17 @@ export interface BuddyAdapterOptions {
   now?: () => number
   /** 目录闸门的失败冷却时长，默认 {@link REMOTE_CATALOG_COOLDOWN_MS}。 */
   catalogCooldownMs?: number
+  /**
+   * 远端目录**落地后**的通知回调（issue IKJVTF）。
+   *
+   * 由 `registerBuddyLlm` 注入为 `broadcastCatalogChanged(ctx)`。适配器本身
+   * 拿不到 `ctx`，故必须由接线层桥接（与 `readImage` 等回调同一模式）。
+   *
+   * ⚠️ 必要性：客户端 `ModelCatalogDirectory` 在 `status === 'ready'` 时**短路
+   * 返回缓存**，只在宿主事件上 `refresh()`。没有本回调时，冷启动首拉失败
+   * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
+   */
+  onCatalogLoaded?: () => void
 }
 
 /** 将消息内容载荷展平为纯文本字符串。 */
@@ -879,6 +904,13 @@ export class BuddyAdapter extends LlmAdapter {
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: BuddyRemoteModel[] | undefined
   /**
+   * 已落缓存的目录是否**所有来源都取全**（issue IKJVTF，审计 I3）。
+   *
+   * ⚠️ **这是短路判据的第二半**：buddy 有两个目录端点，残缺目录也落
+   * `remoteModels`，故只判「已定义」会让残缺永久固化（见 `ensureRemoteModels`）。
+   */
+  private remoteComplete = false
+  /**
    * 目录加载闸门：并发去重 + 失败/空结果冷却。
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
@@ -905,9 +937,13 @@ export class BuddyAdapter extends LlmAdapter {
     // 拉取 ≥10 秒才重试」是一条**基于时间**的契约，而闸门的 `now` 默认取墙钟。
     // 单测用 `vi.setSystemTime` 改全局时间会污染同文件其余用例（真实计时器
     // 用例被挂起，实测变成时序敏感），而注入时钟可零副作用地验证该契约。
-    this.catalogGate = new RemoteCatalogGate(
-      options.now === undefined ? {} : { now: options.now, cooldownMs: options.catalogCooldownMs ?? undefined },
-    )
+    // ⚠️ `onLoaded` 与时钟/冷却**同处构造**：目录落地后通知客户端重读
+    // （issue IKJVTF 的缺陷①），回调由接线层桥接。
+    this.catalogGate = new RemoteCatalogGate({
+      ...options.now === undefined ? {} : { now: options.now },
+      ...options.catalogCooldownMs === undefined ? {} : { cooldownMs: options.catalogCooldownMs },
+      ...options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    })
     const fallback = this.product.fallbackModels ?? []
     this.productFallbackIndex = new Map(fallback.map((model) => [model.id, model]))
     this.productFallbackContextWindows = new Map(
@@ -1010,7 +1046,14 @@ export class BuddyAdapter extends LlmAdapter {
 
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
-    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    if (fetchRemote === undefined) return
+    // ⚠️⚠️ **短路判据是「已完整」，不是「已定义」**（issue IKJVTF 复审，审计 I3）。
+    //
+    // buddy 是**双端点** provider（scoped + `/v3/config`，id 集合不同、必须取并集），
+    // 残缺目录**也**要落 `remoteModels`（展示需要），但那时**不能**短路 ——
+    // `RemoteCatalogGate` 的冷却在生产里只有闸门自己那一处调用点，而它排在
+    // 短路**之后** ⇒ 残缺一旦落缓存，冷却永远读不到、残缺永远补不齐。
+    if (this.remoteComplete) return
     // 闸门：并发去重 + 失败/空结果冷却（详见 src/remote-catalog-gate.ts 的
     // 实测依据）。Buddy 的目录端点超时上限 60s，失败不冷却会让首屏在
     // 「每个模型重试一次」的放大下长时间空转。
@@ -1028,7 +1071,11 @@ export class BuddyAdapter extends LlmAdapter {
           .filter((model) => model.contextWindow !== undefined)
           .map((model) => [model.id, model.contextWindow as number]),
       )
-      return true
+      // ⚠️ 完整性由接线层桥接的数据源上报（两来源各自的成败）。
+      // 拿不到判定时退回「完整」（= 旧行为），避免把「判不出」当成残缺
+      // 而让 provider 反复重拉。
+      this.remoteComplete = this.options.catalogComplete?.() ?? true
+      return { got: true, complete: this.remoteComplete }
     })
   }
 
@@ -2609,7 +2656,12 @@ function positiveMaxTokens(value: number | undefined): number | undefined {
  */
 export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): BuddyAdapter {
   const product = options.product ?? CODEBUDDY
-  const adapter = new BuddyAdapter(options)
+  const adapter = new BuddyAdapter({
+    ...options,
+    // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+    // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+    onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+  })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。

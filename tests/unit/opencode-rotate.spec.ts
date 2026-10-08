@@ -5,8 +5,24 @@ import {
 import { listIdentitySlots, newAccountFingerprint, type IdentitySlot } from '../../src/opencode-auth.js'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 
+/**
+ * ⚠️ **有代理**的请求走外部 undici 自带的 fetch（与 dispatcher 同源，见 IKK4BY），
+ * 全局 `vi.stubGlobal('fetch')` **拦不到**。这里只替换 `fetch`，
+ * 其余（`ProxyAgent` / `Pool`）保持真实，否则 `buildProxyDispatcher` 会失效。
+ */
+const undiciFetchSpy = vi.hoisted(() => vi.fn())
+vi.mock('undici', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('undici')>()),
+  fetch: undiciFetchSpy,
+}))
+
 beforeEach(() => clearOpencodeCatalogCache())
-afterEach(() => vi.unstubAllGlobals())
+// ⚠️ `undiciFetchSpy.mockReset()` 也放在 `afterEach`（而不是各用例内手写）：
+// 手写版一旦某条断言中途抛错就会被跳过，被污染的替身**泄漏到下一条用例**。
+afterEach(() => {
+  undiciFetchSpy.mockReset()
+  vi.unstubAllGlobals()
+})
 
 /**
  * 构造一个账号槽。
@@ -355,10 +371,12 @@ describe('请求指纹', () => {
 describe('代理出口', () => {
   it('配了代理的账号走 per-request dispatcher（不动全局）', async () => {
     let seen: Record<string, unknown> = {}
-    vi.stubGlobal('fetch', async (_u: string, init: RequestInit) => {
+    // ⚠️ 有代理时生产走的是**外部 undici 自带的 fetch**（与 dispatcher 同源，
+    // 见 issue IKK4BY），全局 fetch 拦不到它 —— 故必须替换 undici 的 fetch。
+    undiciFetchSpy.mockImplementation((async (_u: string, init: RequestInit) => {
       seen = init as Record<string, unknown>
       return sseOk()
-    })
+    }) as never)
     const withProxy: IdentitySlot = { ...account('p', 'sk-p'), proxy: { kind: 'http', url: 'http://127.0.0.1:7897', label: '' } }
     const a = new OpencodeAdapter({ identitySlots: async () => [withProxy] })
     await run(a)
@@ -367,6 +385,7 @@ describe('代理出口', () => {
 
   it('无代理的账号不带 dispatcher（走默认直连）', async () => {
     let seen: Record<string, unknown> = {}
+    // ⚠️ **无代理**时生产刻意保留全局 fetch（不改变既有直连行为），故这条用全局 stub。
     vi.stubGlobal('fetch', async (_u: string, init: RequestInit) => {
       seen = init as Record<string, unknown>
       return sseOk()
