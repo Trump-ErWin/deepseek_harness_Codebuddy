@@ -2190,3 +2190,269 @@ describe('★★ 收到 block-end 后失败 ⇒ 不得切换（由 `emitted` 拦
     expect(sent, 'block-end 算可见内容 ⇒ emitted 拦住切换').toEqual(['buddy'])
   })
 })
+
+describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：曾写死 200_000）', () => {
+  /**
+   * 造一个可控的 ctx：每个 (provider, realId) 声明自己的窗口。
+   *
+   * ⚠️ 计数 `infoCalls` 是**必需的**（不是顺手加的）：本组有一条用例锁
+   * 「`buildModelCatalog` 式的逐模型调用不得扇出重复解析」—— 那是这次改动
+   * 引入的真实风险（`resolveModel` 从纯同步变成要读候选能力）。
+   */
+  function makeWindowCtx(
+    catalogs: Record<string, Array<{ id: string; name?: string }>>,
+    windows: Record<string, number | undefined>,
+    infoCalls: { count: number },
+  ) {
+    return {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => Object.keys(catalogs).map((id) => ({ id, name: id })),
+        listModels: async (provider: string) => catalogs[provider] ?? [],
+        resolveModelInfo: async (provider: string, id: string) => {
+          infoCalls.count += 1
+          const window = windows[`${provider}/${id}`]
+          return {
+            provider,
+            id,
+            ...window === undefined ? {} : { context: { contextWindow: window } },
+          }
+        },
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+  }
+
+  it('★ 取候选里**最大**的窗口（不是最小值、不是写死的 200K）', async () => {
+    // ⚠️ 真实缺陷（用户报障 2026-10-07）：「聚合 provider 中的 deepseek v4.1 flash
+    //    模型只有 200k 上下文」。根因是 `resolveModel` 把 `contextWindow: 200_000`
+    //    **硬编码**给所有虚拟模型，而同一个模型直连 buddy / codearts 声明的都是 1M
+    //    （`product.ts` 的兜底表、`llm-adapter.ts` 的 `CONTEXT_WINDOWS`）。
+    //
+    // 候选故意放三条、窗口**彼此不同**（含一条未声明窗口的），这样「取大」「取小」
+    // 「取交集」「取第一条」四种实现会给出**四种不同结果**：
+    //   取大 = 1_000_000 ｜ 取小 = 131_072 ｜ 取第一条 = 262_144 ｜ 写死 = 200_000
+    const infoCalls = { count: 0 }
+    const adapter = new AggregateAdapter(makeWindowCtx(
+      {
+        buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        codearts: [{ id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash' }],
+        lobsterai: [{ id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash' }],
+      },
+      {
+        'buddy/deepseek-v4.1-flash': 1_000_000,
+        'codearts/deepseek-v4.1-flash': 262_144,
+        'lobsterai/deepseek-flash': undefined,
+      },
+      infoCalls,
+    ), { accountPool: makePool() })
+
+    const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    expect(info.context?.contextWindow).toBe(1_000_000)
+    // 对照：候选确实有三条（否则上面那条断言可能只是「只有一个候选」的巧合）。
+    const candidates = (adapter as unknown as {
+      catalog: Array<{ key: string; candidates: unknown[] }>
+    }).catalog.find((m) => m.key === 'deepseek-v4-1-flash')!.candidates
+    expect(candidates).toHaveLength(3)
+  })
+
+  it('★ 一个候选的窗口都取不到 ⇒ 用兜底值（不得返回 undefined，否则 DSH 抛 TargetPressureConfigError）', async () => {
+    // ⚠️ `dsh-compaction-basic/lib/index.js` 在 `info.context === undefined` 时**抛**
+    //    `TargetPressureConfigError: no context capacity for …; configure contextWindow
+    //    on that adapter model`。即兜底值不是可选的美化，是**契约**。
+    const infoCalls = { count: 0 }
+    const adapter = new AggregateAdapter(makeWindowCtx(
+      { buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }] },
+      { 'buddy/deepseek-v4.1-flash': undefined },
+      infoCalls,
+    ), { accountPool: makePool() })
+
+    const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    expect(info.context?.contextWindow).toBe(200_000)
+    // 必须是**正整数**（DSH 的 `normalizeModelInfo` 逐字校验，非法即 INVALID_MODEL_CONTEXT）。
+    expect(Number.isInteger(info.context!.contextWindow)).toBe(true)
+    expect(info.context!.contextWindow).toBeGreaterThan(0)
+  })
+
+  it('★ `auto` 也按整池取大（不得因走特殊分支而漏掉/写死）', async () => {
+    const infoCalls = { count: 0 }
+    const adapter = new AggregateAdapter(makeWindowCtx(
+      {
+        buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        codearts: [{ id: 'glm-5.3', name: 'GLM-5.3' }],
+      },
+      {
+        'buddy/deepseek-v4.1-flash': 1_000_000,
+        'codearts/glm-5.3': 202_752,
+      },
+      infoCalls,
+    ), { accountPool: makePool() })
+
+    const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'auto')
+    expect(info.context?.contextWindow).toBe(1_000_000)
+  })
+
+  it('★ 能力解析不重复扇出：逐模型调 resolveModel 时每个候选只解析一次', async () => {
+    // ⚠️ 这是本次改动**引入的**风险，不是既有行为：`resolveModel` 从纯同步变成
+    //    要读候选能力，而 DSH 的 `buildModelCatalog` 会对目录里**每个模型**各调一次
+    //    （`dsh-api-session-controller/lib/index.js:506`）⇒ 没有缓存时「打开一次模型
+    //    选择器」会对同一批候选反复解析。
+    const infoCalls = { count: 0 }
+    const adapter = new AggregateAdapter(makeWindowCtx(
+      {
+        buddy: [
+          { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' },
+          { id: 'glm-5.3', name: 'GLM-5.3' },
+        ],
+        codearts: [{ id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash' }],
+      },
+      {
+        'buddy/deepseek-v4.1-flash': 1_000_000,
+        'buddy/glm-5.3': 202_752,
+        'codearts/deepseek-v4.1-flash': 262_144,
+      },
+      infoCalls,
+    ), { accountPool: makePool() })
+
+    // 模拟 `buildModelCatalog`：先 listModels，再对每个模型 resolveModel。
+    const listed = await adapter.listModels(AGGREGATE_PROVIDER)
+    for (const model of listed) await adapter.resolveModel(AGGREGATE_PROVIDER, model.id)
+
+    // 3 个唯一候选（buddy×2 + codearts×1）⇒ 恰好 3 次解析。
+    // ⚠️ 断言上界而非等号会漏掉「重复解析」这类缺陷的方向，但用等号又太脆
+    //    （将来加候选会假失败）⇒ 用**唯一候选数**这个稳定上界，并同时断言
+    //    「第二次全量遍历不再新增调用」（那才是缓存是否生效的判据）。
+    expect(infoCalls.count).toBe(3)
+    for (const model of listed) await adapter.resolveModel(AGGREGATE_PROVIDER, model.id)
+    expect(infoCalls.count, '第二次遍历必须全部命中缓存').toBe(3)
+  })
+
+  it('★ 目录重建后窗口缓存必须失效（候选集变了 ⇒ 最大值可能变）', async () => {
+    // ⚠️ 若缓存不随目录失效，用户登录一个窗口更大的渠道后，聚合仍会按**旧候选集**
+    //    声明的窗口运行 —— 界面与压缩阈值长期错误（正是本次修的缺陷形态）。
+    const infoCalls = { count: 0 }
+    const catalogs: Record<string, Array<{ id: string; name?: string }>> = {
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+    }
+    const windows: Record<string, number | undefined> = { 'buddy/deepseek-v4.1-flash': 200_000 }
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => Object.keys(catalogs).map((id) => ({ id, name: id })),
+        listModels: async (provider: string) => catalogs[provider] ?? [],
+        resolveModelInfo: async (provider: string, id: string) => {
+          infoCalls.count += 1
+          const window = windows[`${provider}/${id}`]
+          return {
+            provider,
+            id,
+            ...window === undefined ? {} : { context: { contextWindow: window } },
+          }
+        },
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+
+    // ① 只有 buddy（200K）⇒ 声明 200K。
+    expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+      .toBe(200_000)
+
+    // ② 用户新登录 codearts（1M）⇒ 强制重推目录（`force = true`，与面板刷新同路径）。
+    catalogs.codearts = [{ id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash' }]
+    windows['codearts/deepseek-v4.1-flash'] = 1_000_000
+    await adapter.refreshCatalog(true)
+
+    // ③ 窗口必须跟着变成 1M（缓存失效的判据）。
+    expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+      .toBe(1_000_000)
+  })
+
+  it('★ 解析失败不得被缓存成「无窗口」（否则一次瞬时故障会固化 60 秒）', async () => {
+    // ⚠️ 与 `AGENTS.md` 的「`refreshable` 单向门」同一形态：把**这一次**没问出来
+    //    的结果缓存住，会让瞬时故障变成持续错误。方向必须是「失败不写缓存」。
+    let fail = true
+    let calls = 0
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async (provider: string, id: string) => {
+          calls += 1
+          if (fail) throw new Error('目录服务抖动')
+          return { provider, id, context: { contextWindow: 1_000_000 } }
+        },
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+
+    // ① 抖动期间 ⇒ 兜底值。
+    expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+      .toBe(200_000)
+
+    // ② 上游恢复。⚠️ 这里**不能**靠 `refreshCatalog` 清缓存（那会掩盖缺陷）——
+    //    必须证明「同一份目录下，下一次解析就能拿到真值」。
+    fail = false
+    expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+      .toBe(1_000_000)
+    expect(calls).toBeGreaterThanOrEqual(2)
+  })
+
+  it('★ 候选窗口能取到时，不因**另一个**候选解析失败而记忆化兜底值', async () => {
+    // ⚠️ 与上一条同型但更隐蔽的第二面：窗口缓存的键是**虚拟模型**，与「哪个候选
+    //    失败了」无关 ⇒ 若失败也写缓存，**一个**候选的瞬时故障会污染整个虚拟模型
+    //    的声明值。这里让 codearts 一直失败、buddy 正常（1M）：
+    //    第一次就该给出 1M（可用候选的窗口），且**必须**在下一轮重新尝试 codearts
+    //    （上游恢复后它可能带来更大的窗口）。
+    let codeartsFails = true
+    const windows: Record<string, number | undefined> = {
+      'buddy/deepseek-v4.1-flash': 1_000_000,
+      'codearts/deepseek-v4.1-flash': 2_000_000,
+    }
+    let calls = 0
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }, { id: 'codearts', name: 'c' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async (provider: string, id: string) => {
+          calls += 1
+          if (provider === 'codearts' && codeartsFails) throw new Error('目录服务抖动')
+          const window = windows[`${provider}/${id}`]
+          return {
+            provider,
+            id,
+            ...window === undefined ? {} : { context: { contextWindow: window } },
+          }
+        },
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+
+    // ① codearts 抖动 ⇒ 用可用候选里的最大值（buddy 的 1M），不是兜底的 200K。
+    expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+      .toBe(1_000_000)
+
+    // ② codearts 恢复 ⇒ 必须重试并采信它更大的窗口（证明上一步没被记忆化）。
+    codeartsFails = false
+    const before = calls
+    expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+      .toBe(2_000_000)
+    expect(calls, '必须重新解析候选，而不是复用「失败时算出的」结果').toBeGreaterThan(before)
+  })
+
+  it('★ 源码守卫：聚合适配器里不得再出现写死的 200_000 窗口', async () => {
+    // ⚠️ 这条防的是「把兜底常量直接塞回 resolveModel」这类回退。允许的形式只有
+    //    `AGGREGATE_FALLBACK_CONTEXT_WINDOW` 这一个**具名常量**。
+    const raw = await import('node:fs/promises').then((fs) => fs.readFile(
+      new URL('../../src/aggregate-adapter.ts', import.meta.url), 'utf8',
+    ))
+    const code = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    // 常量定义那一处是合法的；其余任何 `contextWindow: 200_000` / `200_000` 都不许。
+    expect(code).not.toMatch(/contextWindow:\s*200_000/)
+    expect(code).not.toMatch(/contextWindow:\s*AGGREGATE_FALLBACK_CONTEXT_WINDOW/)
+  })
+})
