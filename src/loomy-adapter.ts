@@ -33,7 +33,7 @@ import {
   splitLoomyRate,
   type LoomyCredential,
 } from './loomy.js'
-import { LOOMY, type LoomyFallbackModel, type LoomyProduct } from './loomy-product.js'
+import { LOOMY, loomyContextWindow, type LoomyFallbackModel, type LoomyProduct } from './loomy-product.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
@@ -162,7 +162,12 @@ export function parseLoomyRemoteModels(payload: unknown): LoomyRemoteModel[] {
     models.push({
       id,
       name: loomyDisplayName(rawName),
-      contextWindow: Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 0,
+      // ⚠️⚠️ **必须过 `loomyContextWindow`**（issue IKJW31）：远端对 `spark-x`
+      // 虚报 1048576，真实墙在 262144。只改兜底表是**无效**的 —— 远端可用时
+      // 走的就是这里。判据与证据见 `loomy-product.ts` 的覆盖表注释。
+      contextWindow: Number.isFinite(contextWindow) && contextWindow > 0
+        ? loomyContextWindow(id, contextWindow)
+        : 0,
       supportsImage: readInputModalities(entry).includes('image'),
       supportsThinking: capabilities.reasoning === true,
       // ⚠️ 档位缺失时**不写这两个键**（而不是写空数组）：下游据此区分
@@ -181,7 +186,9 @@ function fallbackToRemote(model: LoomyFallbackModel): LoomyRemoteModel {
   return {
     id: model.id,
     name: model.name,
-    contextWindow: model.contextWindow,
+    // ⚠️ 兜底表的值同样过一遍覆盖表（两条路径**同一判据**，别让它们分叉 ——
+    // 覆盖表本身就是对「照抄声明值」的纠正，与值来自哪条路径无关）。
+    contextWindow: loomyContextWindow(model.id, model.contextWindow),
     // 兜底表不声明图片能力：宁可少报（用户改用文本描述），
     // 也不要报一个服务端可能不认的模态。
     supportsImage: false,

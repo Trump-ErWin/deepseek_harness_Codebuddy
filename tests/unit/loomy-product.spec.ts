@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { ALL_LOOMY_PRODUCTS, LOOMY, loomyProductById } from '../../src/loomy-product.js'
+import {
+  ALL_LOOMY_PRODUCTS, LOOMY, LOOMY_CONTEXT_WINDOW_OVERRIDES, loomyContextWindow, loomyProductById,
+} from '../../src/loomy-product.js'
 
 describe('Loomy 产品配置', () => {
   it('provider id 与展示名', () => {
@@ -54,5 +56,34 @@ describe('Loomy 产品配置', () => {
 
   it('ALL_LOOMY_PRODUCTS 含且仅含 LOOMY', () => {
     expect(ALL_LOOMY_PRODUCTS).toEqual([LOOMY])
+  })
+
+  /**
+   * ★ 上下文窗口覆盖表（Gitee issue IKJW31）。
+   *
+   * 远端对 `spark-x` 虚报 1048576，真实墙 262144 ⇒ 长会话被截断。
+   * 这一组锁死三条：覆盖生效、判据不被调用方的值左右、未验证条目不进表。
+   */
+  it('★ 覆盖表把 spark-x 钉在真实的 262144（远端声明的是 1048576）', () => {
+    expect(LOOMY_CONTEXT_WINDOW_OVERRIDES['spark-x']).toBe(262_144)
+    expect(loomyContextWindow('spark-x', 1_048_576)).toBe(262_144)
+  })
+
+  it('覆盖表只含**有证据**的条目，且值都是安全正整数', () => {
+    // ⚠️ 别为了「看起来统一」把整表填进来：每条都必须有独立证据
+    //（上游墙位 / 官方客户端本地表），否则就是拿猜测覆盖远端事实。
+    expect(Object.keys(LOOMY_CONTEXT_WINDOW_OVERRIDES)).toEqual(['spark-x'])
+    for (const [id, value] of Object.entries(LOOMY_CONTEXT_WINDOW_OVERRIDES)) {
+      expect(Number.isSafeInteger(value), id).toBe(true)
+      expect(value, id).toBeGreaterThan(0)
+    }
+  })
+
+  it('⚠️ 兜底表的值与覆盖表一致（两条路径不得分叉）', () => {
+    for (const model of LOOMY.fallbackModels) {
+      const override = LOOMY_CONTEXT_WINDOW_OVERRIDES[model.id]
+      if (override === undefined) continue
+      expect(model.contextWindow, `${model.id} 兜底表未按覆盖表修正`).toBe(override)
+    }
   })
 })
