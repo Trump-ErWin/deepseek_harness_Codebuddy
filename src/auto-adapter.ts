@@ -76,6 +76,16 @@ export const AUTO_MODEL = 'auto'
 export const AUTO_CHOICE_TTL_MS = 60_000
 
 /**
+ * provider 撞上下文墙后的冷却时长（毫秒）。
+ *
+ * 「撞墙」＝上游收下请求但 0 输出、`finish=max-tokens`（声明窗口虚高所致，
+ * 2026-10-07 loomy/spark-x 实证，4 次全停在 262,138 = 262,144−6）。冷却值与
+ * 选型缓存同量级：跨过缓存窗口后会重新探测/重试，若上游是临时抖动可自愈；
+ * 若是 spark-x 这类确定性墙位，改道目标的第一次成功已把用户请求救回。
+ */
+export const AUTO_WALL_COOLDOWN_MS = 60_000
+
+/**
  * v1 接入的 provider（顺序即「并列最早失效时」的兜底优先级）。
  *
  * 其余 provider（qoder / trae / cline / …）结构上留好接口但不接入：它们没有跨账号
@@ -144,6 +154,8 @@ export class AutoAdapter extends LlmAdapter {
   private cached: { at: number; choice: AutoChoice } | undefined
   /** 缓存的「auto 借用目标能力」的元数据（与 choice 同生命周期）。 */
   private cachedInfo: LlmResolvedModelInfo | undefined
+  /** provider → 撞墙时刻（毫秒）。见 {@link wallCooldownMs} 与 stream 闭包里的改道。 */
+  private readonly wallCooldowns = new Map<string, number>()
   /**
    * 惰性建的临期探针（**复用同一实例** ⇒ 折算缓存跨调用生效）。
    *
@@ -246,17 +258,40 @@ export class AutoAdapter extends LlmAdapter {
 
     // ⚠️ 预解析**两个**转发目标（prepareCall 是异步的，闭包必须保持同步签名 ——
     // `PreparedAdapterCall.stream` 的契约是「同步返回 AsyncIterable」）：
-    // ① 临期胜者（正常路径）；② 胜者不能收图时的「支持图片且临期最早」目标。
-    // 两者的思考档位也在这里一并解析（见 {@link DispatchTarget.efforts}）。
+    // ① 临期胜者（正常路径）；② 胜者不能收图时的「支持图片且临期最早」目标；
+    // ③ 胜者撞上下文墙（0 输出 + max-tokens）时的改道目标 —— 该目标**与图片无关**，
+    //    无图路径也要备好（见 {@link dispatchWithWallFallback}），故单独解析：
+    //    「支持图片」过滤可能把它筛掉，而墙不在乎模型看不看得到图。
+    // 三者的思考档位也在这里一并解析（见 {@link DispatchTarget.efforts}）。
     const mainTarget = await this.dispatchTargetOf(choice, signal)
     let imageTarget: DispatchTarget | null = null
-    if (!imageCapable) {
+    let wallFallbackTarget: DispatchTarget | null = null
+    const pickAlternate = async (filter: (provider: string) => Promise<boolean>): Promise<DispatchTarget | null> => {
       const entries: Array<readonly [string, number]> = []
       for (const provider of AUTO_PROVIDERS) {
         if (provider === choice.provider) continue
-        if (!(await this.providerSupportsImages(provider))) continue
+        if (!(await filter(provider))) continue
         let expiry = await this.expiryOf(provider, signal)
         // 目录空/模型全关 ⇒ 该 provider 不可调用，不能当改道目标（PR !69 审计实测）。
+        if ((await this.firstModelOf(provider)) === undefined) expiry = UNUSABLE
+        entries.push([provider, expiry])
+      }
+      const picked = pickSoonestProvider(entries)
+      if (picked === undefined) return null
+      const model = await this.firstModelOf(picked)
+      if (model === undefined) return null
+      return this.dispatchTargetOf({ provider: picked, model }, signal)
+    }
+    if (!imageCapable) {
+      imageTarget = await pickAlternate(this.providerSupportsImages.bind(this))
+    }
+    // 墙改道目标：任何 provider 皆可（只比谁临期最早）。⚠️ 胜者本尊绝不充当
+    // 自己的 fallback（改道回自己 = 无限循环）。
+    {
+      const entries: Array<readonly [string, number]> = []
+      for (const provider of AUTO_PROVIDERS) {
+        if (provider === choice.provider) continue
+        let expiry = await this.expiryOf(provider, signal)
         if ((await this.firstModelOf(provider)) === undefined) expiry = UNUSABLE
         entries.push([provider, expiry])
       }
@@ -264,7 +299,7 @@ export class AutoAdapter extends LlmAdapter {
       if (picked !== undefined) {
         const model = await this.firstModelOf(picked)
         if (model !== undefined) {
-          imageTarget = await this.dispatchTargetOf({ provider: picked, model }, signal)
+          wallFallbackTarget = await this.dispatchTargetOf({ provider: picked, model }, signal)
         }
       }
     }
@@ -302,11 +337,63 @@ export class AutoAdapter extends LlmAdapter {
           this.ctx.logger?.warn?.(
             `[jet-hub-auto] 带图请求：临期胜者 ${choice.provider}（${choice.model}）不支持图片，已改道到 ${imageTarget.provider}（${imageTarget.model}）`,
           )
-          return this.dispatch(imageTarget, options)
+          return this.dispatchWithWallFallback(imageTarget, wallFallbackTarget, options)
         }
-        return this.dispatch(mainTarget, options)
+        return this.dispatchWithWallFallback(mainTarget, wallFallbackTarget, options)
       },
     }
+  }
+
+  /**
+   * 分发一个目标，并检测「上下文墙」失败形态：**0 输出 + `finish=max-tokens`**。
+   *
+   * ## 真实故障（2026-10-07，取证见工作区《auto截断诊断》）
+   *
+   * 个别上游模型（首例 loomy/`spark-x`）的真实上下文远小于目录声明 —— 越墙请求
+   * 被上游**收下但不产任何内容**（0 输出），流形 `usage{outputTokens:0} →
+   * finish{max-tokens}`。DSH 对 max-tokens 不自动重试 ⇒ 用户看到「已达到输出
+   * token 上限」，实际一个 token 都没收到。
+   *
+   * ## 语义边界（为什么 outputTokens 必须为 0 才改道）
+   *
+   * - **0 输出 + max-tokens**：内容一个字没有 ⇒ 必然不是「模型写完了」，是墙；
+   *   改道下一候选重发，用户无感救回。
+   * - **有输出 + max-tokens**：模型真的写满了输出预算 ⇒ 改道只是换个模型把同一
+   *   份预算再烧一遍，不改道（原样透传，由宿主/用户决定续写）。
+   * - **候选耗尽**（fallback 也撞墙或无 fallback）：原样透传最后那条流 ——
+   *   绝不吞错，也绝不无限改道。
+   *
+   * 撞墙记录 {@link wallCooldowns}：冷却期内该 provider 不再参与选型（见
+   * {@link ensureChoice}），同一堵墙不重复撞。
+   */
+  private dispatchWithWallFallback(
+    target: DispatchTarget,
+    fallback: DispatchTarget | null,
+    options: GenerateOptions,
+  ): AsyncIterable<StreamChunk> {
+    const self = this
+    const upstream = this.dispatch(target, options)
+    return (async function* () {
+      let wall = false
+      let outputTokens: number | undefined
+      for await (const chunk of upstream) {
+        if (chunk.type === 'usage') outputTokens = chunk.usage.outputTokens
+        if (chunk.type === 'finish' && chunk.reason.kind === 'max-tokens') wall = true
+        yield chunk
+      }
+      if (!wall || (outputTokens ?? 0) > 0) return
+      // 墙确认：冷却该 provider，尝试改道。
+      const now = self.options.now?.() ?? Date.now()
+      self.wallCooldowns.set(target.provider, now)
+      if (fallback === null) return
+      self.ctx.logger?.warn?.(
+        `[jet-hub-auto] ${target.provider}（${target.model}）返回 0 输出（上下文墙），已改道到 `
+        + `${fallback.provider}（${fallback.model}）重发；原目标冷却 ${Math.round(AUTO_WALL_COOLDOWN_MS / 1000)}s`,
+      )
+      for await (const chunk of self.dispatchWithWallFallback(fallback, null, options)) {
+        yield chunk
+      }
+    })()
   }
 
   /**
@@ -441,10 +528,26 @@ export class AutoAdapter extends LlmAdapter {
     // 是「请先在 Jet Hub 面板登录至少一个」。而缓存命中分支根本不查 signal，
     // 同一个取消事件在 60 秒窗口的不同位置会产出两种完全不同的错误，极难复现。
     signal?.throwIfAborted()
-    if (this.cached !== undefined && now - this.cached.at < (this.options.ttlMs ?? AUTO_CHOICE_TTL_MS)) {
-      return { choice: this.cached.choice, info: this.cachedInfo }
+    // ⚠️ 冷却中的 provider 退出候选（改道后同一堵墙不重复撞）。
+    // 用局部包装实现，不动 selectProvider 的公共签名。
+    const isCooling = (provider: string): boolean => {
+      const at = this.wallCooldowns.get(provider)
+      return at !== undefined && now - at < AUTO_WALL_COOLDOWN_MS
     }
-    const picked = await this.selectProvider(signal, choice => this.firstModelOf(choice))
+    // ⚠️ 缓存命中分支也必须查冷却：墙是**请求中**才发现的，能把缓存里的旧选择
+    // 打成「不该再用」—— 只查选型时的状态会漏掉它。
+    if (this.cached !== undefined && now - this.cached.at < (this.options.ttlMs ?? AUTO_CHOICE_TTL_MS)) {
+      if (!isCooling(this.cached.choice.provider)) {
+        return { choice: this.cached.choice, info: this.cachedInfo }
+      }
+      this.cached = undefined
+      this.cachedInfo = undefined
+      // 落到下方重新选型（冷却者退出候选）。
+    }
+    const picked = await this.selectProvider(signal, async (provider) => {
+      if (isCooling(provider)) return undefined
+      return this.firstModelOf(provider)
+    })
     if (picked?.model === undefined) {
       this.cached = undefined
       this.cachedInfo = undefined

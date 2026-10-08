@@ -134,11 +134,29 @@ function readInputModalities(entry: Record<string, unknown>): string[] {
 }
 
 /**
+ * 上下文窗口的**服务端真实墙位**修正表。
+ *
+ * 远端 `/models` 的 `context_length` 并不总等于服务端真实约束——个别模型
+ * 上游按更小的窗口收口（收下请求、0 输出、`finish_reason=length`）。
+ * 权威来源是 **Loomy 官方客户端自己的本地表**（其 `MODEL_CONTEXT_OVERRIDES`）：
+ * 客户端不会为一个不生效的值专门写覆盖。
+ *
+ * | id | 远端声明 | 真实墙位 | 证据 |
+ * |---|---|---|---|
+ * | `spark-x` | 1,048,576 | **262,144** | Loomy 客户端覆盖表 + 2026-10-07 真实会话 4 次 0 输出全部精确停在 262,138（= 262,144−6；auto 借道 spark-x、宿主按声明 1M 打包所致） |
+ */
+const LOOMY_CONTEXT_OVERRIDES: ReadonlyMap<string, number> = new Map([
+  ['spark-x', 262_144],
+])
+
+/**
  * 解析远端 `GET /models` 响应，只保留 `type === 'chat'` 的条目。
  *
  * ⚠️ 过滤判据是 `type`，**不能**看 `input_modalities` —— 实测 5 个 chat
  * 模型的输入模态含 `image`（能看图），那不是生图模型。
  * ⚠️ 展示名经 `loomyDisplayName` 规范化（远端原值是三种括号风格混用）。
+ * ⚠️ `context_length` 经 {@link LOOMY_CONTEXT_OVERRIDES} 修正：远端声明可能
+ * 大于服务端真实约束，采信声明会让宿主按虚高窗口打包请求 → 上游 0 输出。
  */
 export function parseLoomyRemoteModels(payload: unknown): LoomyRemoteModel[] {
   const list = Array.isArray(payload)
@@ -153,7 +171,16 @@ export function parseLoomyRemoteModels(payload: unknown): LoomyRemoteModel[] {
     const entry = item as Record<string, unknown>
     const id = String(entry.id)
     const rawName = typeof entry.name === 'string' && entry.name.length > 0 ? entry.name : id
-    const contextWindow = Number(entry.context_length)
+    // ⚠️ 声明值与覆盖值取 **min**：覆盖只压不抬（上游将来把声明改小，以更小为准；
+    // 声明无效而覆盖存在时，覆盖即权威墙位）。
+    const declared = Number(entry.context_length)
+    const declaredValid = Number.isFinite(declared) && declared > 0
+    const override = LOOMY_CONTEXT_OVERRIDES.get(id)
+    const effective = Math.min(
+      declaredValid ? declared : Number.POSITIVE_INFINITY,
+      override ?? Number.POSITIVE_INFINITY,
+    )
+    const contextWindow = Number.isFinite(effective) ? effective : 0
     const capabilities = typeof entry.capabilities === 'object' && entry.capabilities !== null
       ? entry.capabilities as Record<string, unknown>
       : {}

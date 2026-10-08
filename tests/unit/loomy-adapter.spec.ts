@@ -4,6 +4,7 @@ import {
   LoomyAdapter, classifyLoomyFailure, parseLoomyRemoteModels, recordsLoomyRateLimit,
 } from '../../src/loomy-adapter.js'
 import { classifyRaccoonFailure } from '../../src/raccoon-adapter.js'
+import { LOOMY } from '../../src/loomy-product.js'
 import type { LoomyCredential } from '../../src/loomy.js'
 
 const CRED: LoomyCredential = {
@@ -189,7 +190,9 @@ describe('LoomyAdapter.resolveModel', () => {
     const adapter = makeAdapter()
     const resolved = await adapter.resolveModel('loomy', 'spark-x')
     expect(resolved.name).toBe('Spark X2.5')
-    expect(resolved.context?.contextWindow).toBe(1_048_576)
+    // 262144 = Loomy 客户端 MODEL_CONTEXT_OVERRIDES 权威值（远端声明 1M 是虚高的，
+    // 上游真实按 ~256K 收口；2026-10-07 真实会话 4 次 0 输出实证，见 parseLoomyRemoteModels 段）。
+    expect(resolved.context?.contextWindow).toBe(262_144)
   })
 
   it('未知模型不编造 context', async () => {
@@ -820,5 +823,35 @@ describe('LoomyAdapter 请求级账号轮换（余额耗尽无感切号）', () 
 
     // 真正耗尽的是 B —— A 只返回了 401（认证类，本就不该写标记）。
     expect(marks.map((m) => m.accountId)).toEqual(['loomy-B'])
+  })
+})
+
+describe('loomy：spark-x 的上下文窗口必须压到 Loomy 客户端权威值 262144', () => {
+  // ⚠️ 依据（2026-10-07 真实会话取证，4 次失败全部精确停在 262,138 = 262,144−6）：
+  // 远端 /models 给 spark-x 下发 context_length=1048576，但 Loomy 官方客户端
+  // 用本地表 MODEL_CONTEXT_OVERRIDES = { 'spark-x': 262144 } 强制降窗 ——
+  // 上游服务端真实按 ~256K 收口：收下请求、0 输出、finish_reason=length。
+  // auto 借道（倍率最低 x0.1 必被选中）+ 目录声明 1M ⇒ 宿主按 1M 打包 ⇒ 撞墙。
+  // 见 `20261003jethub模型可用性核查/结论/auto截断诊断-20261007.md`（工作区）。
+  const SPARK_WALL = 262_144
+
+  it('远端目录：context_length=1048576 的 spark-x 必须被压到 262144', () => {
+    // ❌ 回归前：采信远端 1_048_576 ⇒ 宿主按 1M 打包 ⇒ 越过 256K 后 0 输出。
+    const models = parseLoomyRemoteModels({
+      data: [remoteEntry({ id: 'spark-x', name: 'Spark X2.5 （x0.1）' })],
+    })
+    expect(models).toHaveLength(1)
+    expect(models[0]!.contextWindow).toBe(SPARK_WALL)
+  })
+
+  it('远端下发的其它模型窗口不受影响（只压已实证的 spark-x）', () => {
+    const models = parseLoomyRemoteModels({ data: [remoteEntry()] })
+    expect(models[0]!.contextWindow).toBe(1_048_576)
+  })
+
+  it('兜底表：spark-x 条目与远端路径同值（两条目录来源不能分叉）', () => {
+    const fallback = LOOMY.fallbackModels.find((m) => m.id === 'spark-x')
+    expect(fallback).toBeDefined()
+    expect(fallback!.contextWindow).toBe(SPARK_WALL)
   })
 })
