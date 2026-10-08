@@ -142,16 +142,22 @@ describe('Loomy RPC 分派', () => {
   /**
    * ⚠️ 写锁定会改变**选号结果**，故必须广播 `llm/adapters-updated`
    * （与 `model.setDisabled` 同理，见 AGENTS.md 的对应章节）。
+   *
+   * ⚠️ 2026-10-08（issue IKJVTF 复审）：实现已收口到**唯一**的
+   * `src/catalog-broadcast.ts`（它自带「失败只记日志、不反噬已落盘的开关」
+   * 与两级可选链 logger）。故这里断言的是「**调了那个函数**」，
+   * 而不再要求内联 `ctx.emit` + `try/catch` —— 后者是旧形态，
+   * 且它用 `ctx.logger.warn`（无可选链，logger 缺席时会抛、仅被 catch 吞）。
    */
-  it('写锁定后广播 llm/adapters-updated，且包 try/catch', () => {
+  it('写锁定后广播 llm/adapters-updated（走唯一实现）', () => {
     const start = rpcSource.indexOf("case 'loomy.permanentLock'")
     expect(start).toBeGreaterThan(-1)
     const end = rpcSource.indexOf("case 'onboarding.claim'", start)
     expect(end).toBeGreaterThan(start)
     const body = rpcSource.slice(start, end)
-    expect(body).toContain("ctx.emit('llm/adapters-updated')")
-    // 通知失败不能反噬已落盘的开关
-    expect(body).toMatch(/try \{[\s\S]{0,200}ctx\.emit\([\s\S]{0,300}catch/)
+    expect(body).toContain('broadcastCatalogChanged(ctx)')
+    // 唯一实现必须真的导入（否则是未定义符号）。
+    expect(rpcSource).toContain("from './catalog-broadcast.js'")
   })
 
   it('未登记的 provider 调 onboarding.* 时返回可读错误（不是泛化文案）', () => {
