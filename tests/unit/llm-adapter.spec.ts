@@ -36,6 +36,8 @@ function makeAdapter(overrides: {
   fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
   /** 多账号池替身；本文件只用到模型黑名单（listModels 的过滤输入）。 */
   accountPool?: unknown
+  /** 各来源成败回调（issue IKJVTF，审计 I3）；接线层桥接数据源的上报。 */
+  catalogComplete?: () => boolean | undefined
 } = {}) {
   let credential = 'credential' in overrides ? overrides.credential : validCredential
   const refresh = overrides.refresh ?? (async () => {})
@@ -46,6 +48,7 @@ function makeAdapter(overrides: {
     refresh: async () => { await refresh(); credential = validCredential },
     fetchImpl,
     fetchRemoteModels: overrides.fetchRemoteModels,
+    ...overrides.catalogComplete !== undefined ? { catalogComplete: overrides.catalogComplete } : {},
     ...overrides.accountPool !== undefined ? { accountPool: overrides.accountPool as never } : {},
   })
   return adapter
@@ -2311,5 +2314,102 @@ describe('CodeArtsAdapter', () => {
       expect(msg).toContain('2026-10-02T16:00:00.000Z') // UTC+8 次日 00:00
       expect(msg).toContain('Jet Hub')
     })
+  })
+})
+
+/**
+ * ★★ **残缺目录必须能补齐**（issue IKJVTF 复审，审计 I3）。
+ *
+ * CodeArts 的目录来自**两个**独立端点（gateway/config + snap builtin），
+ * 失败路径都**静默**返回 undefined ⇒ 「一个成功、一个失败」时
+ * `models.length > 0`，而旧短路判据是 `remoteModels !== undefined`
+ * ⇒ 残缺目录一旦落缓存就**永久固化**（闸门冷却在生产里只有闸门自己那一处
+ * 调用点，而它排在短路之后）⇒ 只有重启 DSH 才能恢复。
+ *
+ * ⚠️ 断言必须是**行为**（清掉冷却后真的重拉并补齐），不能只断言
+ * `gate.cooling()` —— 后者在生产路径上读不到，是**假绿**（Cline 那边
+ * 初版就栽在这上面，见 `cline-adapter.spec.ts` 的对应注释）。
+ */
+describe('CodeArtsAdapter 残缺目录自愈（★ IKJVTF I3）', () => {
+  it('★ 残缺（complete=false）⇒ 展示但**不**永久缓存，冷却后重拉补齐', async () => {
+    let calls = 0
+    // 上游先残缺后完整：第一次只拿到一部分，之后两个来源都通。
+    let complete = false
+    const firstBatch = [
+      { id: 'glm-5.3-flash', name: 'glm-5.3-flash' },
+    ]
+    const fullBatch = [
+      ...firstBatch,
+      { id: 'GLM-5.2', name: 'GLM-5.2' },
+    ]
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => {
+        calls += 1
+        return complete ? fullBatch : firstBatch
+      },
+      catalogComplete: () => complete,
+    })
+
+    const first = await adapter.listModels('codearts')
+    // ① 残缺目录**照常展示**
+    expect(first.map((m) => m.id)).toContain('glm-5.3-flash')
+    // ② 它落进了缓存（否则每次 listModels 都重拉）
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeDefined()
+    // ③ 但**没有**被标成完整 —— 这是短路的判据
+    expect((adapter as unknown as { remoteComplete: boolean }).remoteComplete).toBe(false)
+
+    // ④ 冷却窗口内不重复打请求
+    const afterFirst = calls
+    await adapter.listModels('codearts')
+    expect(calls).toBe(afterFirst)
+
+    // ⑤ ★ 核心：清掉冷却（等价「冷却到期」）+ 上游已完整 ⇒ **必须真的重拉补齐**
+    //    修复前这里是「零请求」：短路判据是 `remoteModels !== undefined`，
+    //    而残缺目录也赋值了它 ⇒ 闸门冷却永远读不到。
+    complete = true
+    ;(adapter as unknown as { catalogGate: { reset(): void } }).catalogGate.reset()
+    const second = await adapter.listModels('codearts')
+    expect(calls).toBeGreaterThan(afterFirst)
+    expect(second.map((m) => m.id)).toContain('GLM-5.2')
+    // ⑥ 补齐后转为完整 ⇒ 此后不再重拉
+    expect((adapter as unknown as { remoteComplete: boolean }).remoteComplete).toBe(true)
+    const afterSecond = calls
+    await adapter.listModels('codearts')
+    expect(calls).toBe(afterSecond)
+  })
+
+  it('★ 完整（complete=true）⇒ 清冷却，后续调用零请求', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => {
+        calls += 1
+        return [{ id: 'GLM-5.2', name: 'GLM-5.2' }]
+      },
+      catalogComplete: () => true,
+    })
+
+    await adapter.listModels('codearts')
+    const afterFirst = calls
+    await adapter.listModels('codearts')
+    expect(calls).toBe(afterFirst)
+    expect((adapter as unknown as { remoteComplete: boolean }).remoteComplete).toBe(true)
+  })
+
+  it('★ 未注入 catalogComplete（旧替身）⇒ 退回旧行为（complete = got）', async () => {
+    // ⚠️ 向后兼容：不传回调时按「完整」处理，避免把「判不出」当成残缺
+    // 而让 provider 反复重拉（那会把冷却机制架空）。
+    let calls = 0
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => {
+        calls += 1
+        return [{ id: 'GLM-5.2', name: 'GLM-5.2' }]
+      },
+    })
+
+    await adapter.listModels('codearts')
+    expect((adapter as unknown as { remoteComplete: boolean }).remoteComplete).toBe(true)
+    const afterFirst = calls
+    await adapter.listModels('codearts')
+    expect(calls).toBe(afterFirst)
   })
 })

@@ -268,6 +268,242 @@ ctx.remote.$on('credentials/reference-updated', () => this.catalog.refresh())
 不广播、广播抛错仍算成功（替身必须真的实现 `ctx.emit`，否则生产代码的广播会以
 `ctx.emit is not a function` 被 try/catch 静默吞掉，用例形同虚设）。
 
+### ⚠️⚠️ 远端目录**落地时**也必须广播 —— 十个适配器原先 0 处广播（Issue IKJVTF）
+
+**真实缺陷**（用户报障，2026-10-07）：Jet Hub 模型设置页显示 **5 个**模型
+（含 2 个 `cline-pass/*`），**对话框模型选择器只剩 2 个**（两个 `cline-free/*`）
+—— 重启 DSH 后「模型消失」。
+
+**根因是两个独立缺陷**（master 上复核仍存在，见该 issue 的评论）：
+
+**① 远端目录落地后从不广播。** 两条链路读的**不是同一份数据**：
+
+| 入口 | 取数 |
+|---|---|
+| 设置页 | 插件 RPC `model.list` → 适配器 `listAllModels()`（**每次实时**） |
+| 对话框 | DSH `buildModelCatalog` → `ctx.llm.listModels()` → `remoteModels ?? fallbackCatalog()` |
+
+客户端在 `status === 'ready'` 时短路返回缓存，只在四个宿主事件上 `refresh()`。
+**首拉失败**（凭据解析不出 / 目录端点那次请求超时）→ 客户端把**兜底表**缓存成
+ready；此后远端目录真的落地也**没有任何事件**通知它重读 ⇒ 永久分叉。
+修复前十个适配器的 `ensureRemoteModels` 全是 **0 处广播**。
+
+⚠️ **窗口的准确边界**（对抗审计复核后订正）：四个事件里的
+`credentials/record-updated` / `credentials/reference-updated` **只由凭据
+「写入 / 重载」触发**（`dsh-credentials/lib/index.js` 的 `notifyRecordUpdated`
+仅被 `set` / `delete` / `reload` 三处调用）。**冷启动时凭据早已在磁盘上、
+没有写入动作** ⇒ 它们**不会**触发。所以「凭据未就绪」那半**也**在这个窗口内，
+不是只覆盖「凭据稍后就绪」。⇒ 本修复是必需的，不是锦上添花。
+
+⚠️ **但有一个它解决不了的边界**：客户端在 `ModelDirectory` **构造时**就
+`catalog.load()`，而广播是 `queueMicrotask` 派发的 ⇒ **冷启动首次打开对话框
+仍会先看到兜底表**，要等目录落地 + 广播之后（最长约 35s，即首个预热轮）
+才自愈。别向用户承诺「重启后立刻就对」。
+
+**② 残缺目录被永久缓存。** `hasClineRemoteModels` 只要**任一来源非空**就判
+「已拿到」。实测 `recommended-models` 成功、`/api/v1/models` 失败时
+（宿主日志 `[cline] 模型目录来源失败：models fetch failed`），这份残缺目录被
+`if (this.remoteModels !== undefined) return` **永久短路** ⇒ 只有 `/api/v1/models`
+才有的 466 条按量计费模型（含 `apodex/apodex-1.1-mini:free`）**再也拉不回来**，
+连预热重试都在短路处直接返回。
+
+⚠️⚠️ **这条有个极隐蔽的第二层**（对抗审计实测证伪，初版修复**完全没修好**）：
+`RemoteCatalogGate` 的冷却（`retryAt` / `cooling()`）在生产里**只有闸门自己
+那一处调用点**，而它排在适配器的短路**之后**。所以只把「`complete` 传对」
+是**没用的** —— 残缺目录**也**赋值了 `remoteModels`，短路照样命中，
+`cooling()` 永远读不到。**短路判据本身必须从「已定义」改成「已完整」**：
+
+```ts
+// ❌ 初版（= 没修）：残缺目录也赋值了 remoteModels ⇒ 永久短路
+if (this.remoteModels !== undefined) return
+// ✅ 现在：残缺时放行到闸门，由 30s 冷却控制重试节奏
+if (this.remoteComplete) return
+```
+
+⚠️ **反向验证**：把这一行改回 `remoteModels !== undefined` ⇒ **3 条**行为用例
+变红；把 `remoteComplete` 恒置 `true` ⇒ **3 条**变红。
+初版用例只断言 `gate.cooling() === true` 是**假绿**（守着生产读不到的字段）——
+现改为断言「清掉冷却后**真的重拉**并把 `apodex/*` 补回来」。
+
+⚠️ **`complete` 判据不能用 `warnings.length === 0` 反推**（第三条入口）：
+「**主动跳过**一个来源」与「**取到了**一个来源」在 warnings 上不可区分。两条实测：
+- **无凭据**时 `/api/v1/models` **不发请求**（`fetchClineRemoteModels` 直接
+  `return []`）⇒ 若不计 warning 就被判成完整。该路径**真实可达**：
+  `providerCatalogVisible` 只查「有没有已登录账号」、**不过滤 `enabled`**，
+  而 `getAvailableAccount` 过滤 ⇒「有账号但全部停用」时门控通过、凭据却 undefined。
+- **HTTP 200 + 形状异常**（网关降级返回 `{}` / HTML）：解析器静默返回空表、
+  零 warning ⇒ 判成完整并永久缓存。
+
+⇒ 现在由 `fetchClineRemoteModels` **显式**给出 `complete`（两个来源各自的
+「请求成功 + 形状可识别」），跳过与形状异常**都记 warning**。
+
+**修法（四条一起，缺任何一条都还会看到症状）**：
+
+1. **`src/catalog-broadcast.ts` 是「模型目录变更」这类广播的唯一实现**。
+   `jet-hub-rpc.ts` 原先自带的那份 `try { ctx.emit(...) } catch` 已改为同名导入
+   —— 两份实现必然漂移（本 issue 的缺陷① 就是「十处全漏」）。它同时做
+   **同 tick 按 ctx 合并**（`WeakSet` + `queueMicrotask`），因为一次目录落地
+   会牵动多个 provider。
+   ⚠️ 仍有**两处内联 `ctx.emit('llm/adapters-updated')` 未收口**（审计指出，
+   有意留待后续）：`index.ts` 的 opencode 能力预热、`jet-hub-rpc.ts` 的永久积分
+   锁定端点。后者用 `ctx.logger.warn`（**无两级可选链**，logger 缺席时会抛、
+   仅被 catch 吞），与 `catalog-broadcast.ts` 的 `ctx.logger?.warn?.` 不一致。
+   ⚠️ **合并标记必须在 `emit` 之后清**：`llm/adapters-updated` 的监听器会再次走
+   `buildModelCatalog` → `listModels` → 可能又触发目录落地；标记若提前清，
+   每次派发都翻一倍 ⇒ **广播风暴**。
+2. **通知放在 `RemoteCatalogGate`**（十个适配器的**单点收口**）的成功分支，
+   且必须在 `await task` **之后** —— 那时适配器才刚把目录赋给 `remoteModels`，
+   客户端重读才拿得到新数据（早于它广播等于白广播）。
+   适配器拿不到 `ctx`，故由各 `registerXxxLlm` 注入
+   `onCatalogLoaded: () => broadcastCatalogChanged(ctx)`。
+3. **`run` 返回值扩展为 `{ got, complete }`** —— 两个判据**不能合并**：
+
+   | 字段 | 语义 | 决定 |
+   |---|---|---|
+   | `got` | 拿到**非空**目录（**残缺也算**） | **显示** + **广播** |
+   | `complete` | **所有来源**都拿全了 | **永久缓存** + **清冷却** |
+
+   只看「非空」⇒ 残缺目录被永久缓存（缺陷②）；只看「完整」⇒ 残缺时整个目录
+   都不展示，用户的模型列表凭空消失。**向后兼容**：返回裸布尔时
+   `complete = got`，既有八个单来源适配器的返回值**一行都不用改**。
+   ⚠️ 别把这两处「为统一」改成同一个变量 —— 反向验证各自独立锁死。
+   ⚠️⚠️ **光传对 `complete` 是不够的** —— 短路判据必须同步改成
+   `if (this.remoteComplete) return`，否则冷却永远读不到（见缺陷② 的第二层）。
+4. **`complete` 由数据源显式给出，不由 `warnings` 反推**：`ClineRemoteModels.complete`
+   来自两个来源各自的「请求成功 + 形状可识别」；跳过（无凭据）与形状异常
+   （HTTP 200 + `{}` / HTML）**都记 warning**。
+
+**冷启动自愈**：`src/catalog-prewarm.ts` 做**有界**预热（立即起、此后每 35s 一轮，
+共三轮）。⚠️ **间隔必须大于闸门的 30s 失败冷却**，否则重试被**原样挡回**、
+什么也不做（症状是「静默无效」，没有报错，只是目录一直补不回来）。
+
+⚠️⚠️ **光有「间隔 > 冷却」还不够**（对抗审计实测证伪，初版按绝对时刻一次性排程）：
+闸门的 `retryAt` 是「**失败那一刻** + 30s」，而固定排程是「**启动那一刻** + 35s / 75s」——
+首拉耗时 `d ∈ (5s, 35s]` 时 35s 轮被挡回，`d ∈ (45s, 75s]` 时 75s 轮也被挡回
+（`d=60s` 实测 `retryAt=90s`，75s 轮时仍在冷却；cline 超时 20s、buddy/loomy/raccoon 60s
+都落在这两个区间）。⇒ 改为**链式**：`上一轮结束 + 间隔` 才排下一轮。
+⚠️ 反向验证：改回「一次性按绝对时刻排」⇒ **2 条**变红。
+
+该约束由 `tests/unit/catalog-prewarm.spec.ts` 的用例守着（`isPrewarmSpacingValid()`
+**目前只有单测调用**，接线层没断言 —— 别把它当成运行期闸门）。
+预热走 `ctx.llm.listModels`（对 `withDeadModelPruning` 包装透明；`aggregate`
+走它自己的 60s 目录 TTL 缓存，边际成本≈0），停止函数挂 `ctx.effect`；
+`setTimeout` 必须 `unref`（否则命令行 `dsh` 会被它挂住不退）。
+各 provider 的账号门控都在远端拉取**之前**，故未登录的 provider 是零请求。
+
+**测试**：`tests/unit/catalog-broadcast.spec.ts`（18 条：异步派发、同 tick 合并、
+**emit 期间的重入不形成风暴**、不同 ctx 独立、logger 缺席不抛错、`got`/`complete`
+逐格判据、残缺后冷却到期可重试、冷却中跳过不广播、`onLoaded` 抛错不反噬）+
+`tests/unit/catalog-prewarm.spec.ts`（23 条：立即轮不阻塞、逐 provider 预热、
+单点失败不影响其余、停止即停手、**链式排程**、间隔 > 冷却）+
+`tests/unit/cline-adapter.spec.ts` 的「残缺目录自愈」**真接线**用例
+（不注入 `loadModels`，走真实 `loadClineModels` + 真实 `fetchImpl`
+—— 注入式加载器可以省略 `remote`，从而掩盖完整性判据）。
+
+⚠️ **这些用例必须是行为断言，不能只断言 `cooling()`**：初版那条
+「残缺后仍会重试」断言的是 `gate.cooling() === true`，而该字段在生产路径上
+**读不到**（见缺陷② 第二层）⇒ **假绿**（把 `complete` 改成恒 `true`，它照样通过）。
+现在断言的是「清掉冷却后**真的重拉**、`apodex/*` 被补回来、之后转为完整不再重拉」。
+
+⚠️ **接线类的 `expect(source).toMatch(...)` 是源码文本断言，挡不住真实回退**
+（审计实测：把 buddy 的 `onCatalogLoaded` 注入整行注释掉 ⇒ 171 条全绿 0 红）。
+故另补了一条**真装配**行为用例（`registerBuddyLlm(ctx, …)` + `ctx.emit` 替身
++ 真实 `listModels`，断言目录落地后真的 emit 一次）—— 该变异现在会让**1 条变红**。
+
+⚠️ **已做反向验证**（每条独立，别当同义反复删掉）：
+
+| 变异 | 变红 |
+|---|---|
+| 短路改回 `remoteModels !== undefined` | **3 条** |
+| `remoteComplete` 恒置 `true` | **3 条** |
+| `fetchClineRemoteModels` 的 `complete` 恒 `true` | **3 条** |
+| 真正原形态（`warnings` 反推 + 删掉两条新 warning） | **2 条** |
+| 预热改回「一次性按绝对时刻排」 | **2 条** |
+| 闸门不广播 | **5 条** |
+| 冷却按 `got` 而非 `complete` | **3 条** |
+| 广播改同步 emit + 标记提前清 | **3 条** |
+
+**顺带清掉的死代码**：`cline-adapter.ts` 曾有两行重复的 `return true`
+（`git log -L` 显示由合并提交 `4ce4a6e` 引入，`0ca8256` 在其后加了
+`if (!gotRemote) return false` 使其成为不可达代码）。
+
+### ⚠️⚠️ buddy / codearts 的**多端点残缺**：同一形态的第三个入口（审计 I3）
+
+⚠️ 这一条是**同一缺陷在另两个 provider 上的复发**，且它们都是插件**主力**
+provider —— 只修 Cline 是不够的。两家的目录都来自**两个**独立端点，
+而「一个成功、另一个失败」是**常态**而非异常：
+
+| provider | 两个端点 | 只在一个端点里出现的东西 |
+|---|---|---|
+| **buddy / workbuddy** | `/console/enterprises/{scope}/models` + `/v3/config` | `hy4-preview-f`（**限时免费**变体，促销 `modelIds` 只写着它） |
+| **codearts** | `opengw gateway/config` + `snap-access /v1/model/builtin` | benefit 模型（`glm-5.3-flash` 等）与常规模型各占一半 |
+
+⚠️ 两处的失败路径都**静默**：`fetchSignedGet` 返回 `undefined`、
+`requestConfig` 返回空快照。于是单端点成功时 `models.length > 0`，
+而旧短路判据是 `remoteModels !== undefined` ⇒ **残缺目录永久固化**
+（冷却读不到，与 Cline 的缺陷② 逐格同构）。
+buddy 那格的用户可见症状正是 issue 里报过的原话
+**「hy4 preview 现在 ide 是免费我们还是 0.29」** —— 促销倍率只由
+`/v3/config` 下发，而它是失败的那一个。
+
+**修法（与 Cline 同一套语义，但数据源层要各自上报）**：
+
+- 数据源加**出参**（不改返回值形状，既有调用方与 10+ 条单测零改动）：
+  `fetchCodeArtsRemoteModels(cred, fetch, outcome?)` 上报
+  `{ gatewayOk, builtinOk }`；`buddy-oauth.fetchModels(cred, fetch, signal, product, outcome?)`
+  上报 `{ scopedOk, configOk }`。
+  ⚠️ **成功判据是「请求成功 + 形状可识别」，不是「解析出非空列表」**：
+  上游把某个来源的模型**全部下架**时，`result.models: []` 是**合法**状态，
+  把它当失败会让冷却永不清理。buddy 侧的 `requestConfig` 因此新增 `ok` 字段
+  —— **不能**靠「`promotions` 是否为空」反推（上游真的没有促销时它也是空的）。
+- 服务层用 `lastCatalogOutcome` 出参对象原地写入（`CodeArtsAuth` /
+  `BuddyAuth` 各一份，由 `index.ts` 构造时注入初值两个 `false`）。
+- 适配器短路判据改成 `if (this.remoteComplete) return`，完整性由接线层桥接的
+  `catalogComplete: () => …` 回调给出（与 `onCatalogLoaded` 同一模式）。
+  ⚠️ **回调缺席时退回「完整」**（`?? true`）—— 那是既有单测替身的形态，
+  把「判不出」当残缺会让 provider 反复重拉、架空冷却。
+
+⚠️ **反向验证**（逐条独立，别当同义反复删掉）：
+
+| 变异 | 变红 |
+|---|---|
+| codearts 短路改回 `remoteModels !== undefined` | **1 条** |
+| buddy 短路改回 `remoteModels !== undefined` | **1 条** |
+| codearts `remoteComplete` 恒 `true` | **1 条** |
+| buddy `remoteComplete` 恒 `true` | **1 条** |
+| codearts 形状判据放宽（形状不可识别也算取到） | **1 条** |
+| buddy `configOk` 恒 `true` | **2 条** |
+| codearts 无凭据早退时默认成 `true` | **1 条** |
+
+⚠️ 最后两条是**补漏**：初版用例只覆盖了适配器层，把数据源的
+`configOk` 恒置 `true` 时**全绿 0 红**（198 条）。补上
+`tests/unit/buddy-oauth.spec.ts` 的「各来源成败」7 条后才有 2 条变红。
+
+**测试**：`tests/unit/models.spec.ts`（新增 8 条：两来源各自的成败格、
+形状可识别但合法为空、形状不可识别、无 AK/SK 早退、不传 outcome 的兼容性）+
+`tests/unit/buddy-oauth.spec.ts`（新增 7 条，同构）+
+`tests/unit/llm-adapter.spec.ts` / `buddy-adapter.spec.ts` 各 3 条
+**行为**用例（残缺 → 展示但不永久缓存 → 清冷却后**真的重拉补齐** → 转为完整
+不再重拉；完整 → 清冷却；未注入回调 → 退回旧行为）。
+
+⚠️ buddy 那条的观测点必须选**只由远端下发**的字段（`creditsRate`）：
+`reconcileWithFallback` 是**白名单重建**，兜底表里的 id 残缺时**仍在**列表里，
+故「id 是否出现」判不出补齐；而 `hy4-preview-f` **不在**兜底表里，
+要靠 `agentReferenced: true` 这条例外才保留（真实形态：服务端声明可选）。
+
+### 其余六个 provider：确认**无需**处理
+
+lobsterai / loomy / minimax / raccoon / trae / zcode 都是**单来源**目录
+（`models.length === 0 → return false`），**没有「部分成功」形态**
+⇒ `complete` 恒等于 `got`，短路判据无需改动。
+⚠️ buddy 的 `reconcileWithFallback` 是**白名单重建**（本地合成），不是残缺 ——
+但它上游的 `fetchModels` **是**多端点，见上一节。
+
+**仍未处理**（与本 PR 正交，建议单独立项）：
+- issue 末尾那条「Node 原生 `fetch` 不读系统代理、目前只有 opencode 通道支持
+  per-account 代理」与本 PR 的两个根因**正交**，但它会**加剧**缺陷①
+  （代理不可达 ⇒ 首拉必失败），建议单独立项。
+
 ### ⚠️ 设置页目录必须走 `listAllModels`，不能复用 `listModels`
 
 **真实缺陷**（用户报障「打开的显示了倍率，关闭的就没有显示倍率」）：
