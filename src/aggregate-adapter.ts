@@ -93,6 +93,73 @@ export const AGGREGATE_TTL_MS = 60_000
  */
 export const AGGREGATE_CATALOG_TTL_MS = 60_000
 
+/**
+ * 取不到任何候选窗口时的**兜底**声明值。
+ *
+ * ## ⚠️⚠️ 这不是「聚合模型的窗口」，只是「我们不知道」时的占位
+ *
+ * 真实缺陷（用户报障 2026-10-07）：本适配器的 `resolveModel` 把这个值当成
+ * **所有**虚拟模型的窗口硬编码下发（`context: { contextWindow: 200_000 }`，
+ * `auto` 与具名虚拟模型两处），于是 `aggregate/deepseek-v4-1-flash` 在界面上
+ * 只显示 `~x / 200k` —— 而同一个模型**直连** buddy / codearts 时声明的都是
+ * **1M**（`product.ts` 的兜底表 1_000_000、`llm-adapter.ts` 的
+ * `CONTEXT_WINDOWS` 1_000_000）。
+ *
+ * 设计文档 §4.1 写的口径是「ctx / 图片 / 档位取**候选集的能力并集**」，
+ * 档位与图片都按该口径落地了（见 {@link aggregateReasoningInfo} 与
+ * `capabilityOf`），**只有 ctx 这一项**留在了 P1 的写死占位值上。
+ *
+ * ## 两个真实消费者（所以它不只是展示问题）
+ *
+ * | 消费者 | 位置 | 后果 |
+ * |---|---|---|
+ * | 自动压缩阈值 | `dsh-compaction-basic/lib/index.js` 读 `info.context.contextWindow` 算 `thresholdTokens` | 上下文涨到 `200k × ratio` 就触发压缩，**永远吃不到 1M** |
+ * | 上下文占用指示器 | `dsh-client-ui-conversation` 读 `pressure.contextWindow` | 界面显示 `~x / 200k` |
+ *
+ * ## ⚠️ 为什么不能「不声明」
+ *
+ * `dsh-compaction-basic` 在 `info.context === undefined` 时**抛**
+ * `TargetPressureConfigError: no context capacity for …; configure contextWindow
+ * on that adapter model`。即 DSH 要求每个可路由的模型都声明一个**正整数**窗口
+ * ⇒ 兜底值必须存在且为正，这不是可选的美化。
+ *
+ * ⇒ 正确口径见 {@link AggregateAdapter.contextWindowFor}：**取候选集的最大值**；
+ * 本常量只在「一个候选的窗口都取不到」时使用（如候选渠道全部未登录、
+ * 或该渠道的 `resolveModel` 不声明窗口 —— zcode 之外的多数渠道都有可能）。
+ */
+export const AGGREGATE_FALLBACK_CONTEXT_WINDOW = 200_000
+
+/**
+ * 一条候选（provider + realId）的**能力缓存**：窗口 / 档位 / 图片。
+ *
+ * ⚠️ 三项**共用同一次 `resolveModelInfo` 调用** —— 这是把窗口推导做成
+ * 「顺带取回」而不是「另查一遍」的原因（见 {@link AggregateAdapter.capabilityOf}）。
+ */
+interface CandidateCapability {
+  /** 该候选声明的上下文窗口；远端/静态表都没给时为 `undefined`。 */
+  contextWindow?: number
+  /** 该候选声明的思考档位 id（供逐候选翻译用，见 `dispatch`）。 */
+  efforts: readonly string[]
+  /**
+   * 该候选是否声明支持图片输入。
+   *
+   * ⚠️ **解析失败时必须是 `false`**（保守方向）：把「不知道」当成「支持」会让带图
+   * 请求被发到一个可能收不了图的渠道，而失败现象是**上游报错**（用户看不出真因）；
+   * 当成「不支持」最多是**少用一个候选**（带图时换一个已声明支持的），代价小得多。
+   * 与全仓「未知不编造」一致。
+   */
+  imageCapable: boolean
+  /**
+   * 本次能力是**真的解析成功**了，还是失败后的保守回落。
+   *
+   * ⚠️ 存在的唯一理由是让调用方能区分「这个候选没声明窗口」与「这次没问出来」——
+   * 前者可以记忆化，**后者绝不能**（见 {@link AggregateAdapter.contextWindowFor}：
+   * 把瞬时故障记忆化会把它固化成持续错误，正是本仓库反复修过的单向门形态）。
+   * ⚠️ 它**不进** {@link DispatchTarget} 的语义面，只是随缓存对象一起流动的内部标记。
+   */
+  resolved: boolean
+}
+
 export interface AggregateAdapterOptions {
   accountPool: AccountPool
   /** 注入的当前时刻（测试用）。 */
@@ -159,6 +226,42 @@ export class AggregateAdapter extends LlmAdapter {
    * 本表记录的是**实际结果**（已发生）——两者不可互相推导。
    */
   private readonly activeProviderByModel = new Map<string, string>()
+
+  /**
+   * 每个候选（`provider\0realId`）的**能力**缓存：窗口 / 档位 / 图片。
+   *
+   * ## 为什么需要它
+   *
+   * 窗口推导（{@link contextWindowFor}）与派发前的能力解析（{@link capabilityOf}）
+   * 问的是**同一件事**，而两者都会被高频调用：
+   * - DSH 的 `buildModelCatalog` 对**目录里每个模型**都调一次 `resolveModelInfo`
+   *   （`dsh-api-session-controller/lib/index.js:506`）⇒ 窗口推导会在用户每次打开
+   *   模型选择器时对全部虚拟模型的全部候选各问一次；
+   * - `prepareCall` 每次请求都会对本次候选逐个解析能力。
+   *
+   * 没有缓存时同一份元数据会被反复解析（对**远端目录**类适配器是本地查表，
+   * 但对目录尚未拉全的适配器会重试拉取）。缓存让两者共用一次结果。
+   *
+   * ## ⚠️ 只缓存**成功**的结果，绝不缓存失败
+   *
+   * 失败时 `capabilityOf` 返回保守默认值（无档位 / 不支持图片 / 无窗口）。
+   * 把「这一次没问出来」缓存 60 秒会把**瞬时**故障固化成单向门 —— 那正是
+   * 本仓库反复修过的缺陷形态（见 `AGENTS.md` 的「`refreshable` 单向门」）。
+   * ⇒ 失败不写缓存，下一次调用照常重试；上游恢复后自动生效。
+   *
+   * ⚠️ 与目录同生命周期：{@link refreshCatalog} 重建目录时清空 —— 目录变了，
+   *    「哪些候选存在」就变了，缓存必须跟着失效。
+   */
+  private readonly capabilityCache = new Map<string, CandidateCapability>()
+
+  /**
+   * 每个虚拟模型（含 `auto`）的**窗口声明值**缓存。
+   *
+   * ⚠️ 判决结果是「候选集的最大值」，是个**纯函数**（同一份目录 + 同一份能力缓存
+   * 必然得到同一个值）⇒ 记忆化不改变语义，只是避免每次 `resolveModel` 都重算。
+   * ⚠️ 同样在 {@link refreshCatalog} 里清空（目录变了 ⇒ 候选集变了 ⇒ 最大值可能变）。
+   */
+  private readonly contextWindowCache = new Map<string, number>()
 
   constructor(private readonly ctx: Context, private readonly options: AggregateAdapterOptions) {
     super()
@@ -532,6 +635,19 @@ export class AggregateAdapter extends LlmAdapter {
     this.catalog = buildVirtualModels(catalogs)
       .filter((virtual) => virtual.candidates.some((c) => WIRED_EXPIRY_PROVIDERS.includes(c.provider)))
     this.catalogAt = now
+    // ⚠️⚠️ **目录变了 ⇒ 能力缓存与窗口缓存必须一起失效**（与目录同生命周期）。
+    //
+    // 为什么不能留着：
+    // - 窗口缓存的键是虚拟模型 id，而**候选集会变**（登录/登出渠道、用户黑名单、
+    //   上游下架模型都会改候选表）⇒ 留着旧值会让 `aggregate/deepseek-v4-1-flash`
+    //   一直按「当时那批候选的最大值」声明，即使后来只挂了一个窗口更小的候选；
+    // - 能力缓存的键是 `provider\0realId`，**跨目录也仍然指向同一个真实模型**，
+    //   但它记录的是「上一次解析时远端下发的能力」。上游改窗口（或某次解析赶在
+    //   远端目录就绪之前、拿到了较旧的值）同样需要重取一次。
+    // 两者都是「几十到几百条小对象」，整表清空的开销可以忽略，而漏清的代价是
+    // 用户看到的窗口与压缩阈值**长期错误**（本适配器刚修的就是这类缺陷）。
+    this.capabilityCache.clear()
+    this.contextWindowCache.clear()
     // ⚠️⚠️ **维持「整个 provider 已关闭」的语义**（真实缺陷，实测复现）。
     //
     // ## 机制（本适配器的**动态目录**与宿主「一键关闭」的**快照**假设相撞）
@@ -735,6 +851,8 @@ export class AggregateAdapter extends LlmAdapter {
    * 「这次选中的渠道收不收得了图」由分发阶段改道保证。
    * ⚠️ **档位声明规范化档位的并集**（不是候选集交集）—— 理由见下方
    * {@link aggregateReasoningInfo} 的注释。
+   * ⚠️ **窗口声明候选集的<u>最大值</u>**（不是写死、也不是取小）——
+   * 理由与失效形态见 {@link AggregateAdapter.contextWindowFor}。
    */
   /**
    * 解析一个虚拟模型。
@@ -751,13 +869,16 @@ export class AggregateAdapter extends LlmAdapter {
   ): Promise<LlmResolvedModelInfo> {
     if (model === AGGREGATE_AUTO_MODEL) {
       const info = this.autoModelInfo()
+      await this.ensureCatalog(signal)
       return {
         provider,
         id: model,
         name: info.name,
         ...(info.description === undefined ? {} : { description: info.description }),
         inputModalities: ['text', 'image'],
-        context: { contextWindow: 200_000 },
+        // `auto` 的候选池 = **所有渠道的所有模型**（与 `candidatesFor` 的池同语义）
+        // ⇒ 它的窗口是整池的最大值（通常就是池里最大的那个 1M）。
+        context: { contextWindow: await this.contextWindowFor(model, this.autoCandidates(), signal) },
         reasoning: aggregateReasoningInfo(),
       }
     }
@@ -781,9 +902,32 @@ export class AggregateAdapter extends LlmAdapter {
       id: model,
       name: this.nameOf(virtual),
       inputModalities: ['text', 'image'],
-      context: { contextWindow: 200_000 },
+      context: { contextWindow: await this.contextWindowFor(model, virtual.candidates, signal) },
       reasoning: aggregateReasoningInfo(),
     }
+  }
+
+  /**
+   * `auto` 的候选池：所有虚拟模型的候选**并集**（按 `provider\0realId` 去重）。
+   *
+   * ⚠️ 与 `candidatesFor` 的 `auto` 分支同语义（那边还要叠加拒绝表过滤；本方法
+   *    **不过滤拒绝** —— 窗口声明是「这个池里最大能到多少」，被拒的候选仍在池的
+   *    物理能力范围内，且拒绝表随时可能被改回来）。
+   * ⚠️ 去重是必要的：同一候选可能归属多个虚拟模型（如同一 realId 同时归入两个
+   *    规范名），重复解析虽被 `capabilityCache` 吸收，但会让循环做无用功。
+   */
+  private autoCandidates(): Array<{ provider: string; realId: string }> {
+    const seen = new Set<string>()
+    const out: Array<{ provider: string; realId: string }> = []
+    for (const virtual of this.catalog) {
+      for (const candidate of virtual.candidates) {
+        const key = `${candidate.provider}\u0000${candidate.realId}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push({ provider: candidate.provider, realId: candidate.realId })
+      }
+    }
+    return out
   }
 
   /**
@@ -1023,7 +1167,10 @@ export class AggregateAdapter extends LlmAdapter {
     const targets: DispatchTarget[] = []
     for (const candidate of ranked.slice(0, limit)) {
       const capability = await this.capabilityOf(candidate.provider, candidate.realId, signal)
-      targets.push({ ...candidate, ...capability })
+      // ⚠️ 只取 `DispatchTarget` 需要的两项：`capability` 上的 `contextWindow` /
+      //    `resolved` 是本适配器内部的推导中间量，摊进目标对象只会在日志与
+      //    序列化里留下无意义的字段（`resolved` 尤其容易被误读成「这次请求成功了」）。
+      targets.push({ ...candidate, efforts: capability.efforts, imageCapable: capability.imageCapable })
     }
     // ⚠️ 只在**非空**时写缓存：空候选通常意味着「所有渠道都不可用」——那是**瞬时**
     // 状态（如额度刚好用尽、账号正在限流），缓存 60 秒会让用户在这期间即使恢复了
@@ -1108,26 +1255,43 @@ export class AggregateAdapter extends LlmAdapter {
   }
 
   /**
-   * 取目标模型的两项能力：**思考档位 id** 与**是否收得了图片**。
+   * 取目标模型的**三项**能力：**上下文窗口**、**思考档位 id**、**是否收得了图片**。
    *
-   * ⚠️ 两项**共用同一次 `resolveModelInfo` 调用** —— 不额外发请求。这是把图片
-   * 能力做成「顺带取回」而不是「另查一遍」的原因（选型路径上每次请求都会走这里，
+   * ⚠️ 三项**共用同一次 `resolveModelInfo` 调用** —— 不额外发请求。这是把窗口与
+   * 图片能力做成「顺带取回」而不是「另查一遍」的原因（选型路径上每次请求都会走这里，
    * 多一次解析就是多一次上游交互）。
    *
-   * ⚠️ 失败时按**保守**方向回落：档位为空（不下发该字段）、图片为 `false`
-   * （不把它当带图候选）。理由见 {@link DispatchTarget.imageCapable}。
+   * ⚠️ 失败时按**保守**方向回落：窗口 `undefined`（不编造，由调用方兜底）、
+   * 档位为空（不下发该字段）、图片为 `false`（不把它当带图候选）。
+   * 理由见 {@link DispatchTarget.imageCapable} 与 {@link AGGREGATE_FALLBACK_CONTEXT_WINDOW}。
+   *
+   * ⚠️ **成功的解析结果进 {@link capabilityCache}**（见那里的长注释：失败**不**缓存）。
    */
   private async capabilityOf(
     provider: string,
     realId: string,
     signal?: AbortSignal,
-  ): Promise<{ efforts: readonly string[]; imageCapable: boolean }> {
+  ): Promise<CandidateCapability> {
+    const key = `${provider}\u0000${realId}`
+    const cached = this.capabilityCache.get(key)
+    if (cached !== undefined) return cached
     try {
       const info = await this.ctx.llm.resolveModelInfo(provider, realId, signal)
       const efforts = (info.reasoning?.efforts ?? [])
         .map((effort) => String(effort.id))
         .filter((id) => id.length > 0)
-      return { efforts, imageCapable: info.inputModalities?.includes('image') === true }
+      // ⚠️ DSH 已校验过 `context.contextWindow` 是**正整数**
+      //（`dsh-llm/lib/index.js` 的 `normalizeModelInfo`：非整数或 ≤0 抛
+      // `INVALID_MODEL_CONTEXT`），故这里不必重复校验；但仍按「不编造」口径
+      // 只在**有值**时记录，缺省保持 `undefined`。
+      const capability: CandidateCapability = {
+        efforts,
+        imageCapable: info.inputModalities?.includes('image') === true,
+        resolved: true,
+        ...info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
+      }
+      this.capabilityCache.set(key, capability)
+      return capability
     } catch (error) {
       // ⚠️⚠️ **中止不得被折算成「无档位 / 不支持图片」**（真实缺陷，全分支终审 I3：
       // 这是同一缺陷的**第三处** —— `aggregate-expiry.ts` 与 `candidatesFor` 各修过一处）。
@@ -1141,8 +1305,76 @@ export class AggregateAdapter extends LlmAdapter {
       signal?.throwIfAborted()
       if (error !== null && typeof error === 'object'
         && (error as { name?: unknown }).name === 'AbortError') throw error
-      return { efforts: [], imageCapable: false }
+      // ⚠️ 走这里的结果**不入缓存**（见 `capabilityCache` 的注释）——否则一次瞬时
+      //    失败会让该候选在整段 TTL 内恒被当成「无档位 / 不支持图片 / 无窗口」。
+      return { efforts: [], imageCapable: false, resolved: false }
     }
+  }
+
+  /**
+   * 该虚拟模型的**上下文窗口声明值**：**候选集的最大值**。
+   *
+   * ## 口径（设计文档 §4.1「ctx / 图片 / 档位取候选集的能力并集」）
+   *
+   * 取**最大值**而不是最小值/交集，理由与档位取并集同源：
+   *
+   * - 声明的窗口是给**宿主**看的（压缩阈值 + 占用指示器），而一次请求实际发往
+   *   哪个候选**在声明时还没定**（`prepareCall` 是发起请求之前就返回元数据的）。
+   *   取最小值意味着「池里有一条 262144 的候选，就把整池按 262144 声明」——
+   *   用户明明在用 1M 的渠道，界面与压缩却按最小的那条算，与本条报障同类；
+   * - 取最大值后，若某次真的切到了窗口更小的候选，**由既有的失败切换兜住**
+   *   （上游报超长 → 换下一个候选重试）。代价是可能白跑一轮，而最小值口径的
+   *   代价是**每一次**请求都被按最小窗口过早压缩 —— 后者持续存在，前者只在
+   *   恰好选中小窗口候选时发生。
+   *
+   * ⚠️ **一个候选的窗口都取不到时**（渠道全部未登录 / 该渠道的 `resolveModel`
+   * 不声明窗口）回落到 {@link AGGREGATE_FALLBACK_CONTEXT_WINDOW} —— 不能返回
+   * `undefined`，`dsh-compaction-basic` 会抛 `TargetPressureConfigError`。
+   *
+   * ⚠️ 本方法**不做任何余额探测**（`resolveModel` 会被 `buildModelCatalog` 对
+   * 目录里每个模型各调一次），只是读/填能力缓存。
+   *
+   * ⚠️ **取不到窗口的候选也进入循环**：它不拉低结果，但要为它解析一次能力 ——
+   * 解析结果会进缓存，供同一候选在派发路径上复用。
+   *
+   * ## ⚠️⚠️ 只有当**每一个候选都解析成功**时才记忆化结果
+   *
+   * 这是本条实现里最容易写错的一处（本用例第一版就写错了，被自己写的用例抓住）。
+   * 若把「某候选解析失败 ⇒ 用兜底值」的结果也写进 `contextWindowCache`，那么：
+   *
+   * 1. 目录服务抖动一次 ⇒ 该虚拟模型在 60 秒（目录 TTL）内恒声明兜底值，
+   *    **即使上游早已恢复**；
+   * 2. 更糟的是失效时机也错位 —— 缓存键是虚拟模型，与「哪个候选失败了」无关，
+   *    于是**一个**候选的瞬时故障会污染整个虚拟模型的声明值。
+   *
+   * 这正是 `AGENTS.md` 记录的「`refreshable` 单向门」同型缺陷：把一次瞬时失败
+   * 固化成持续状态。⇒ 失败时**返回值照给**（调用方需要立即拿到一个可用值），
+   * 但**不写缓存**，下一次调用会重新尝试解析。
+   *
+   * @param modelKey - 虚拟模型 id（含 `auto`），仅用于记忆化。
+   * @param candidates - 该虚拟模型的候选表（`auto` 传全池候选）。
+   */
+  private async contextWindowFor(
+    modelKey: string,
+    candidates: readonly { provider: string; realId: string }[],
+    signal?: AbortSignal,
+  ): Promise<number> {
+    const remembered = this.contextWindowCache.get(modelKey)
+    if (remembered !== undefined) return remembered
+    let widest: number | undefined
+    let allResolved = true
+    for (const candidate of candidates) {
+      const capability = await this.capabilityOf(candidate.provider, candidate.realId, signal)
+      if (!capability.resolved) allResolved = false
+      const window = capability.contextWindow
+      // ⚠️ 只用**已声明**的窗口参与取大：把 `undefined` 当成 0 参与比较是错的
+      //    （那会让「没声明」拉低结果），当成 `Infinity` 更错（那是凭猜测放大窗口）。
+      if (window !== undefined && (widest === undefined || window > widest)) widest = window
+    }
+    const resolved = widest ?? AGGREGATE_FALLBACK_CONTEXT_WINDOW
+    // ⚠️ 有任一候选没解析成功 ⇒ **不记忆化**（见上方长注释）。
+    if (allResolved) this.contextWindowCache.set(modelKey, resolved)
+    return resolved
   }
 
   /**
@@ -1510,6 +1742,7 @@ export class AggregateAdapter extends LlmAdapter {
 
 /** 一个转发目标：候选 + 该模型声明的档位 id + 它收不收得了图片。 */
 interface DispatchTarget extends RankedCandidate {
+  /** 该候选声明的思考档位 id（供逐候选翻译用，见 `dispatch`）。 */
   efforts: readonly string[]
   /**
    * 该候选是否声明支持图片输入。
