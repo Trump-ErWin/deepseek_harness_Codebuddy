@@ -276,6 +276,24 @@ describe('★ codeArtsExpiry：读不到到期时间就不猜（一律 NEVER）'
     expect(await codeArtsExpiry(cred)).toBe(NEVER)
   })
 
+  it('★★ 积分余额为 0 ⇒ NEVER（**不是** UNUSABLE —— 「余额 0」不等于「渠道不可用」）', async () => {
+    // ⚠️ 本条的**真实价值**是挡住一个具体提议（PR #81 审计，2026-10-07）：
+    //    把折算改成 `credit.total > 0 ? 当日 : UNUSABLE`，理由是「额度已尽仍被
+    //    auto 选中」。该推理对本渠道不成立 —— codearts 有 benefit（免费额度）模型
+    //    （`isCodeArtsBenefitModel`），积分余额 0 的账号**仍能推理**；且账号可用性
+    //    的权威判据是**探测是否成功**（`!result.ok`），不是余额数值。
+    //    写成 UNUSABLE 会把一个可用账号从 auto 候选里**永久剔除**。
+    stubFetch({
+      package: { is_credit_package: true, is_token_package: false, spec_code: 'x', package_name: '体验版', status: 'normal' },
+      metrics: [
+        { name: 'usageTotalPackageCredit', package_credit_amount: 24000, package_credit_used: 24000, package_credit_remain: 0 },
+      ],
+    })
+    const value = await codeArtsExpiry(cred)
+    expect(value).toBe(NEVER)
+    expect(value).not.toBe(UNUSABLE)
+  })
+
   it('★ 查询失败 ⇒ UNUSABLE（剔除），与「没有到期概念」严格区分', async () => {
     vi.stubGlobal('fetch', (async () => new Response('boom', { status: 500 })) as unknown as typeof fetch)
     expect(await codeArtsExpiry(cred)).toBe(UNUSABLE)
@@ -350,10 +368,46 @@ describe('★ lobsterai / trae：与 buddy 同形的「有效包最早到期」�
     expect(value, '应取最早到期那个包（2 小时后）').toBe(Math.floor(soonMs / 1000) * 1000)
   })
 
-  it('★ lobsterai：无有效包 ⇒ NEVER（不剔除）', async () => {
+  it('★★ lobsterai：有效包但**余额为 0** ⇒ UNUSABLE（退出 auto 候选）', async () => {
+    // ⚠️⚠️ 本条原为「★ lobsterai：无有效包 ⇒ NEVER（不剔除）」—— **名字与 fixture
+    //    不符**（fixture 是 `creditsRemaining: 0`，即**有效包、余额为 0**，不是「无有效包」），
+    //    而那个期望值本身就是缺陷（真实缺陷，对抗审计实测证伪，2026-10-07）：
+    //    `creditsRemaining` 是**剩余额度**（`lobsterai-credits.ts:328` 读它填
+    //    `CreditPackage.remaining`）⇒ 余额 0 表示**这个渠道现在没有可烧的额度**，
+    //    返回 `NEVER`（= 可当选）会让 auto 选中它、请求随即 `QUOTA_EXCEEDED` 失败 ——
+    //    **与 PR #81 报障完全同型**。
+    //
+    //    ⚠️ 与 `buddy-balance-rank.ts` 的判据对齐：`buddyBalanceTier`（:195-203）
+    //    在余额全为 0 时返回 `none`，而 `buddyTierUsable`（:210-212）明写
+    //    **`none` 档不可用**。折算层现在与选号器**同构**。
     vi.stubGlobal('fetch', (async () => new Response(JSON.stringify({
       code: 0,
       data: { creditItems: [{ label: 'x', type: 'gift', creditsRemaining: 0, expiresAt: '' }] },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch)
+    const value = await lobsteraiExpiry(cred, LOBSTERAI)
+    expect(value).toBe(UNUSABLE)
+    // 方向对照：`NEVER` 是「可用、只是不临期」，它**参与排序且可当选** ——
+    // 正是本缺陷的成因，故绝不能用它表示「余额已尽」。
+    expect(value).not.toBe(NEVER)
+  })
+
+  it('★★ lobsterai：**只有失效包** ⇒ UNUSABLE（不是 NEVER）', async () => {
+    // 失效包（`active: false`）不计入任何桶 —— 若账号只有失效包，同样「没有可烧的额度」。
+    const past = new Date(Date.now() - 86_400_000).toISOString().slice(0, 19) + '+08:00'
+    vi.stubGlobal('fetch', (async () => new Response(JSON.stringify({
+      code: 0,
+      data: { creditItems: [{ label: 'x', type: 'gift', creditsRemaining: 100, expiresAt: past }] },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch)
+    expect(await lobsteraiExpiry(cred, LOBSTERAI)).toBe(UNUSABLE)
+  })
+
+  it('★ 对照：lobsterai 有效包**有余额但无到期时间** ⇒ NEVER（不得误剔除可用渠道）', async () => {
+    // ⚠️ 这一格是**防误伤**：`expiresAt` 为空串是实测形态，此时账号**确实有额度**，
+    //    剔除它会丢掉一个可用渠道。判据必须是「有没有 `active && remaining > 0` 的包」，
+    //    而不是「有没有带到期时间的包」。
+    vi.stubGlobal('fetch', (async () => new Response(JSON.stringify({
+      code: 0,
+      data: { creditItems: [{ label: 'x', type: 'gift', creditsRemaining: 500, expiresAt: '' }] },
     }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch)
     expect(await lobsteraiExpiry(cred, LOBSTERAI)).toBe(NEVER)
   })

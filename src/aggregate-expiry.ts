@@ -49,10 +49,10 @@ import { fetchTraeCreditBalance } from './trae-credits.js'
  *
  * | provider | 判据 | 依据 |
  * |---|---|---|
- * | buddy / workbuddy / **lobsterai** / **trae** | 有效资源包 `deductionEndTime` 的最小值（**共享** `sharedPackageExpiry`） | `credits.ts` / `lobsterai-credits.ts` / `trae-credits.ts` |
+ * | buddy / workbuddy / **lobsterai** / **trae** | 有效资源包 `deductionEndTime` 的最小值（**共享** `sharedPackageExpiry`）；**无 `remaining > 0` 的有效包 ⇒ `UNUSABLE`** | `credits.ts` / `lobsterai-credits.ts` / `trae-credits.ts` |
  * | loomy | `daily > 0` → 当日 24:00；否则 `permanent > 0 ? NEVER : UNUSABLE` | 命名池，无时间戳 |
  * | codearts | **`NEVER`（长期）** | ⚠️ **报文无任何时间字段**（实测三字段全空）⇒ 不臆造 |
- * | zcode | 各桶 `expiresAt`（秒）最小值；无带期余额时按当日 | `zcode-upstream.ts` |
+ * | zcode | 各桶 `expiresAt`（秒）最小值；**有余额但无到期时间 → 当日**；余额为 0 → `UNUSABLE`；**企业版（`enterprise`）→ `NEVER`** | `zcode-upstream.ts` |
  * | 其余（qoder / qodercn / cline / raccoon / minimax / gemini / opencode） | **本插件未接入** → `UNUSABLE` | 见设计文档 §9.1 |
  *
  * ## ⚠️ 未接入的渠道必须返回 `UNUSABLE`，**不能**返回 `NEVER`
@@ -449,6 +449,43 @@ export async function buddyExpiry(
  *（实测 lobsterai 的 `expiresAt` 可为空串）⇒ 剔除它会丢掉一个可用渠道。
  * 与 `codeArtsExpiry` 的「读不到就不猜」同一条原则。
  *
+ * ## ⚠️⚠️ 「余额为 0」与「无有效包」必须一并剔除（真实缺陷，已修 2026-10-07）
+ *
+ * `earliest` 的初值是 `NEVER`，而只有 `remaining > 0` 才可能更新它 —— 若遍历完
+ * 直接 `return earliest`，下面几种形态**都**返回 `NEVER`（= 可当选）：
+ *
+ * | 形态 | 旧返回 | 现在 |
+ * |---|---|---|
+ * | 有效包 `remaining > 0`、有 `deductionEndTime` | 该时刻 | 该时刻（不变） |
+ * | 有效包 `remaining > 0`、**无**到期时间（永久积分） | `NEVER` | `NEVER`（**保留**：确实有额度） |
+ * | **有效包但 `remaining = 0`（余额已尽）** | `NEVER` ❌ | **`UNUSABLE`** |
+ * | **只有失效包 / `Accounts: []`** | `NEVER` ❌ | **`UNUSABLE`** |
+ *
+ * ⇒ 旧实现下，一个**余额已耗尽**的 buddy / workbuddy / lobsterai / trae 仍会被
+ * auto 选中，请求随即以 `QUOTA_EXCEEDED` 失败 —— **与 PR #81 报障完全同型**，
+ * 且 buddy / workbuddy 都在 `AUTO_PROVIDERS`（`auto-adapter.ts:84`）里。
+ *
+ * ⚠️ 本仓库对「余额为 0」早有明确判据，旧实现与它**矛盾**：
+ * `buddy-balance-rank.ts` 的 `buddyBalanceTier`（:195-203）在余额全为 0 时返回
+ * `BUDDY_BALANCE_TIER.none`，而 `buddyTierUsable`（:210-212）明写
+ * **`none` 档不可用**。选号器判「不可用」、折算层判「可当选」= 同一语义两套判据
+ *（AGENTS.md 首条红线）⇒ 现在两侧**同构**。
+ *
+ * ## ⚠️ 为什么「有余额但无到期时间」仍必须是 `NEVER`（别一刀切成 UNUSABLE）
+ *
+ * 实测 lobsterai 的 `expiresAt` 可为**空串**、buddy 的永久积分包也可能不下发
+ * `DeductionEndTime`。这类包**确实有额度**（`remaining > 0`），剔除它会丢掉一个
+ * 可用渠道。故判据是「**有没有任何一个 `active && remaining > 0` 的包**」，
+ * 而不是「有没有带到期时间的包」。
+ *
+ * ⚠️ 与 `zcodeExpiry` 的收窄是**同一手法**（「已拥有的余额 > 0」才可用；
+ * 否则 `UNUSABLE`），两处口径一致 —— 别再让一家修好、另一家漏掉。
+ *
+ * ⚠️ 与 `buddy-balance-selector.ts:313-314` 那句「解锁时所有候选余额都是 0 仍返回
+ * 第一个候选，让上游去报真正的失败原因」**不矛盾**：那句讲的是 **provider 内部**
+ * 的选号（用户已指定该渠道，此时换号才有意义），本函数讲的是**跨渠道选型**
+ * （余额 0 就该让给别的渠道，而不是把请求发过去必然失败）。
+ *
  * @param fetchBalance - 取余额的函数；返回 `null` 表示查询失败 ⇒ `UNUSABLE`。
  */
 async function sharedPackageExpiry(
@@ -462,13 +499,22 @@ async function sharedPackageExpiry(
   }
   if (balance === null) return UNUSABLE
   let earliest = NEVER
+  // ⚠️ 必须单独记「有没有任何可用余额」：`earliest` 的初值 `NEVER` 无法区分
+  //    「一个有效包都没有」（⇒ 剔除）与「有余额但不下发到期时间」（⇒ 长期）。
+  let hasAnyCredit = false
   for (const pkg of balance.packages) {
     if (pkg.active !== true) continue
     if (!(typeof pkg.remaining === 'number' && pkg.remaining > 0)) continue
+    hasAnyCredit = true
     const end = pkg.deductionEndTime
     if (typeof end === 'number' && Number.isFinite(end) && end > 0 && end < earliest) earliest = end
   }
-  return earliest
+  // 有余额但都没给到期时间 ⇒ 长期（排最后，不剔除）。
+  if (hasAnyCredit) return earliest
+  // ⚠️ 一个 `remaining > 0` 的有效包都没有 ⇒ 余额已尽 ⇒ **剔除**。
+  //    「只有失效包」「`Accounts: []`」也走这里 —— 那同样是「这个渠道现在没有
+  //    可烧的额度」，不该被 auto 选中（旧实现把它们一并返回 `NEVER`）。
+  return UNUSABLE
 }
 
 /**
@@ -549,6 +595,35 @@ export async function loomyExpiry(credential: LoomyCredential): Promise<number> 
  *
  * ⚠️ 若将来接口开始下发周期字段，应改为读真实值（`packages[].expiredTime` 等），
  * **不要**恢复成某个固定估算。
+ *
+ * ## ⚠️⚠️ 也**不要**因为「余额为 0」就改成 `UNUSABLE`（PR #81 审计实测，2026-10-07）
+ *
+ * 同一次用户报障里有人提议：把「余额 0」也算成当前不可用
+ * （`credit.total > 0 ? 当日 : UNUSABLE`），理由是「额度已尽却仍被 auto 选中」。
+ * **对本渠道该推理不成立**，实测三格反例。
+ *
+ * ⚠️ 下表第 2 列是**那个被拒的提议**会产生的后果（不是本函数现状 —— 本函数恒返回
+ * `NEVER`，没有「当日」分支；「当日」是更早的旧实现，见上文 `:533-539` 的记载）：
+ *
+ * | 账户形态 | `credit` | 被拒提议的后果 | 本函数（现状） |
+ * |---|---|---|---|
+ * | 积分账户有余额 | `{ total: 22088.16 }` | 当日 24:00 ⇒ **抢走真正临期的额度** | `NEVER` |
+ * | 积分账户余额 0 | `{ total: 0 }` | `UNUSABLE` | `NEVER`（账号仍可用） |
+ * | **Token 计费账户** | **`undefined`** | `?? 0` ⇒ `UNUSABLE` ⇒ **可用账号被永久剔除** | `NEVER` |
+ *
+ * ⚠️ 第三格是**实打实的回归**：`isTokenPackage` 账户**没有积分口径**
+ * （`codearts-credits.ts` 的 `CodeArtsAccountInfo.credit` 注释明写「`undefined`
+ * 表示这个账户没有积分口径」，与 `{ total: 0 }` 严格区分），而这类账号**能正常
+ * 推理**；且 codearts 有 benefit（免费额度）模型走 `maas_type: benefit`
+ * （`isCodeArtsBenefitModel` 动态判定）——**积分余额 0 ≠ codearts 不可用**。
+ *
+ * ⚠️ 与 `loomyExpiry` 的 `permanent > 0 ? NEVER : UNUSABLE` **不是**同一口径：
+ * 那里的 `permanent` 是 loomy **自己的永久积分余额**（0 就是真的没有额度）；
+ * 这里的 `credit.total` 在 Token 账户下根本**不存在**，把它当 0 是**臆造**。
+ * 「读不到就不猜」是本函数的立身之本，别用一个 `?? 0` 把它推翻。
+ *
+ * 真正该守的边界是**探测失败**（`!result.ok` ⇒ `UNUSABLE`，已有用例守住），
+ * 而不是「探测成功但余额为 0」。
  */
 export async function codeArtsExpiry(credential: CodeArtsCredential): Promise<number> {
   let result
@@ -562,7 +637,81 @@ export async function codeArtsExpiry(credential: CodeArtsCredential): Promise<nu
   return NEVER
 }
 
-/** zcode：各桶 `expiresAt`（秒）最小值；无桶但有可领活动 → 当日 24:00。 */
+/**
+ * ⚠️⚠️ **本函数读不到 benefit（免费额度）口径** —— 但缺口**不在本函数**（已修，2026-10-07）。
+ *
+ * ## 缺口是什么
+ *
+ * codearts 有**两套完全不同的额度口径**，而上面只读了其中一套：
+ *
+ * | 口径 | 来源 | `codeArtsExpiry` 读得到吗 |
+ * |---|---|---|
+ * | 签到积分（长期） | `statistics/plugin` 的 `credit.total` | ✓ 只有它 |
+ * | **benefit 免费额度** | `InferHub` 报文（每日 1000 万 tokens，**按自然日**结算） | ✗ **读不到** |
+ *
+ * ## ⚠️ 但它**不需要**在本函数里补（这是本注释存在的唯一理由）
+ *
+ * benefit 耗尽**已经被记账**：`llm-adapter.ts:1290` 命中 `InferHub.4291.200` 时调
+ * `accountPool.updateModelRateLimit(currentAccountId, options.model, 次日 00:00)`，
+ * 而账号池按 `entry.modelRateLimits[modelId]` 过滤候选
+ *（`getAvailableAccount` / `listAvailableCredentials`）。
+ *
+ * ⇒ **正确的判据在选型层，不在折算层**：选型时必须按**候选自己将要派发的
+ * `realId`** 去问账号池「这个模型上还有可用账号吗」。
+ * `AggregateAdapter.filterByModelAvailability` 就是这一层（已实现）。
+ *
+ * ⚠️ **为什么必须单独做这一步**：折算取号用的模型键是**渠道目录第一个模型**
+ *（`src/index.ts` 的 `firstModelIdOf`：`models[0]?.id`），而聚合层派发的是
+ * **候选自己的 `realId`** —— 两者常常不是同一个模型 ⇒ 那个按 modelId 的过滤
+ * 对聚合路径**整体失效**（实测探针确认）。auto 路径不存在这个问题：它的
+ * `firstModelOf` 返回值就是实际派发的模型。
+ *
+ * ## ⚠️ 不要因此照 PR #81 的 `credit.total > 0 ? 当日 : UNUSABLE` 去改
+ *
+ * 那个修法**方向错**（见上方长注释：会剔除 Token 计费账号与「余额 0 但可用」的账号）。
+ * 本函数的 `NEVER` 是「按签到积分口径查到的信息说它可用」，与 benefit 无关 ——
+ * 两件事在**不同的层**解决，别把它们混在一处。
+ *
+ * ⚠️ 保留本注释的原因：读到这里的人会问「benefit 读不到怎么办」，答案在
+ * `filterByModelAvailability`。别在这里再补一份折算（那会变成同一语义两套判据）。
+ */
+
+/**
+ * zcode：各桶 `expiresAt`（秒）最小值；有余额但上游未给到期时间 → 当日 24:00。
+ *
+ * ## ⚠️⚠️ 余额为 0 ⇒ `UNUSABLE`（真实缺陷，用户报障 2026-10-07）
+ *
+ * **用户报障原文**：auto 选中了额度已尽的 zcode，请求直接失败：
+ * `zcode: 账号在模型 "GLM-5.3" 上的额度已用尽或没有可用权益。QUOTA_EXCEEDED`
+ *
+ * 而 auto 的价值主张恰恰是「挑有额度、且快作废的那个」—— 折算错了就挑中一个
+ * **根本不能用**的渠道，比不做 auto 更糟（用户看到的是「auto 坏了」，且每次
+ * 重试都撞同一个渠道）。
+ *
+ * 旧实现最后一行是 `if (balance.remaining > 0 || claimablePlans.length > 0)
+ * return nextUtc8DayStartMs()`，**`return NEVER`** 收尾。两个分支都会让一个
+ * 余额为 0 的 zcode 被选中：
+ *
+ * | 形态 | 旧折算 | 后果 |
+ * |---|---|---|
+ * | 无桶 + 有可领活动（`claimablePlans`） | 当日 24:00 | **排最前**，优先选中 |
+ * | 无桶 / 桶余额为 0，无可领 | `NEVER` | 排最后，但**不被剔除**（池里只剩它时必被选中） |
+ *
+ * ## 判据：**「可领」不等于「已拥有」**
+ *
+ * `claimablePlans`（`billing/preview` 的可领活动）表示**还能领**，不表示**已经有**。
+ * zcode 的每日赠送额度**要先 claim 才进 `balances` 桶**（见 `zcode-upstream.ts`
+ * 的「签到为什么要补激活上报」），没领就是**当前不可用** —— 这正是 zcode
+ * 「需手动签到」的形态。用户去面板签到后余额进桶，下一轮探测自然重新纳入候选。
+ *
+ * ⚠️ **但有余额、只是上游没给 `expires_at` 时仍按当日折算**（保留旧行为）：
+ * `zcode-upstream.ts` 的 `expiresAt: num(record.expires_at)` 在字段缺失时就是
+ * `undefined`，而 `remaining_units` 齐全。此时账号**确实有额度**，把它判成
+ * `UNUSABLE` 会丢掉一个可用渠道 —— 与本仓库「读不到就不猜，但也不误剔除」
+ * 的既有口径一致（对照 `codeArtsExpiry` 对「查不到」与「查到但无到期概念」
+ * 的严格区分）。故判据是 **`balance.remaining > 0`**（有余额）而不是
+ * 「有任何一个桶带有效到期时间」。
+ */
 export async function zcodeExpiry(credential: ZcodeCredential): Promise<number> {
   let balance
   try {
@@ -573,6 +722,23 @@ export async function zcodeExpiry(credential: ZcodeCredential): Promise<number> 
   // ⚠️ `undefined` 表示「这次查不到」，不是「没有余额」—— 折算成 `NEVER` 会让
   //    一个查不到余额的渠道以「永久积分」身份参与轮换。
   if (balance === undefined) return UNUSABLE
+  // ⚠️⚠️ **企业版必须判 `NEVER`（长期），绝不能落到下面的 `UNUSABLE`**
+  // （真实缺陷，对抗审计实测证伪，2026-10-07 —— 我自己上一版正是这么错的）。
+  //
+  // 企业版（`displayMode: 'enterprise'`）返回的是 `{ enterprise: true, buckets: [],
+  // remaining: 0, total: 0, claimablePlans: [] }` —— 它与「额度已用光」在**数值上
+  // 完全同形**（都是 0 个桶 + `remaining: 0`），故按下面的判据会被算成 `UNUSABLE`
+  // ⇒ **一个能正常推理的企业版账号被永久排除出 auto 候选**。
+  //
+  // ⚠️ 上游在 `zcode-upstream.ts:257-259` 已就此**明文警告**：
+  //    「企业版不下发额度数字、只给外部链接 —— 此时返回 `{enterprise:true,buckets:[]}`，
+  //      **不要**显示成 0（**0 是「已用光」的语义**）」
+  // 本函数违反的正是这句：把「不下发额度数字」当成了「余额为 0」。
+  //
+  // ⇒ 判据必须**先**看 `enterprise` 标记（那是「不知道额度」的诚实标记），
+  //   再谈余额。语义是「可用、但无临期额度可算」= `NEVER`（排最后但不剔除）——
+  //   与 `codeArtsExpiry` 对「查到了但没有到期概念」的处理同一条原则。
+  if (balance.enterprise === true) return NEVER
   let earliest = NEVER
   for (const bucket of balance.buckets) {
     const remaining = bucket.availableUnits ?? bucket.remainingUnits ?? 0
@@ -584,7 +750,9 @@ export async function zcodeExpiry(credential: ZcodeCredential): Promise<number> 
     }
   }
   if (earliest !== NEVER) return earliest
-  // 桶里没有带到期时间的余额：若还有可领的每日活动，按当日额度算（先烧它）。
-  if (balance.remaining > 0 || (balance.claimablePlans?.length ?? 0) > 0) return nextUtc8DayStartMs()
-  return NEVER
+  // 有余额但桶里没有可用的到期时间 ⇒ 按当日额度保守估算（先烧它）。
+  // ⚠️ 判据是 `remaining`（**已拥有**的余额），**不含** `claimablePlans`。
+  if (balance.remaining > 0) return nextUtc8DayStartMs()
+  // 余额为 0 ⇒ 当前不可用（剔除），**不因「有可领活动」而入选**。
+  return UNUSABLE
 }
