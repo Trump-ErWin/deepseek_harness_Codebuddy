@@ -562,4 +562,133 @@ describe('归一化', () => {
     expect(sanitizeProviderOrder('buddy')).toEqual([])
     expect(sanitizeProviderOrder({ 0: 'buddy' })).toEqual([])
   })
+
+  /**
+   * ★ 真实缺陷（Critical，对抗审计实测证伪）：`sanitizeAccounts` 必须按 id 去重。
+   *
+   * `id` 是账号的**唯一键**（`updateAccount` / `removeAccount` / `reorderAccounts`
+   * 全按它 `findIndex`），池里两条同 id 时第二条永远改不动、删不掉。原先只有
+   * `mergeAccounts` 内部去重，而 `replaceAll`（备份导入的**默认模式**）不去重。
+   *
+   * 后果**远不止**幽灵账号：`sinkAccountToProviderEnd` 按 id 匹配会写出
+   * `undefined` 空洞 ⇒ 该 provider 的 `getAvailableAccount` / `listAccounts`
+   * 全部抛错（整条推理链崩），且空洞经 `JSON.stringify` 变 `null`、重启后被本
+   * 函数丢弃 ⇒ **账号永久丢失**。
+   *
+   * 反向验证：去掉实现里的 `seenIds` 判断 → 本用例变红。
+   */
+  it('★ 按 id 去重：同 id 只保留首次出现的条目（池里绝不允许两条同 id）', () => {
+    const accounts = sanitizeAccounts([
+      { id: 'dup', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_D1', nickname: 'first' },
+      { id: 'dup', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_D2', nickname: 'second' },
+      { id: 'unique', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_D3' },
+    ])
+    expect(accounts.map(a => a.id)).toEqual(['dup', 'unique'])
+    // 保留的是**首次**出现的那条（不合并字段 —— 无法判断哪份更新）。
+    expect(accounts[0]!.nickname).toBe('first')
+    expect(accounts[0]!.credentialRef).toBe('BUDDY_ACCOUNT_D1')
+  })
+
+  it('★ 去重不受「同 id 但 provider 不同」影响（id 是全局唯一键，跨 provider 也去重）', () => {
+    // 账号存在**一个全局数组**里（各 provider 混排），故 id 冲突跨 provider 同样危险。
+    const accounts = sanitizeAccounts([
+      { id: 'x', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_X1' },
+      { id: 'x', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_X2' },
+    ])
+    expect(accounts).toHaveLength(1)
+    expect(accounts[0]!.provider).toBe('buddy')
+  })
+
+  /**
+   * ★ 真实缺陷（High，对抗审计实测证伪）：`modelRateLimits` 必须过滤脏值。
+   *
+   * 备份文件是用户可编辑的输入，原先该字段**原样透传**。非数字脏值会让 UI 与
+   * 宿主**判据分叉**：UI 用 `v > Date.now()` ⇒ 对 `'not-a-number'` 为 `false`
+   * ⇒ **不显示**「限额中」；宿主用 `now >= resetAt` 亦为 `false` ⇒ 判为**受限**、
+   * 选号时排除。用户看到「这个号完全正常」，而宿主永远不用它。
+   *
+   * 反向验证：去掉 `sanitizeModelRateLimits` → 本用例变红。
+   */
+  it('★ modelRateLimits 过滤脏值：只留有限正数（与 updateModelRateLimit 写入守卫同源）', () => {
+    const accounts = sanitizeAccounts([{
+      id: 'a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_A',
+      modelRateLimits: {
+        'glm-5.2': 1_800_000_000_000,   // 合法：有限正数
+        'garbage': 'not-a-number',      // 字符串
+        'nan': Number.NaN,
+        'inf': Number.POSITIVE_INFINITY,
+        'neg': -1,
+        'zero': 0,
+        'null': null,
+        '': 1_800_000_000_000,          // 空 modelId
+      },
+    }])
+    expect(accounts[0]!.modelRateLimits).toEqual({ 'glm-5.2': 1_800_000_000_000 })
+  })
+
+  it('★ modelRateLimits 全为脏值时不写出该键（不留 {} 噪音）', () => {
+    const accounts = sanitizeAccounts([{
+      id: 'a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_A',
+      modelRateLimits: { x: 'bad', y: null },
+    }])
+    expect(accounts[0]!.modelRateLimits).toBeUndefined()
+    // ⚠️ 值为 `undefined`（而非缺键）：`JSON.stringify` 会整个丢弃它，
+    // 故落盘/传输形态与「从未有过标记」完全一致。故这里**不能**断言 `in` 为 false
+    // —— 那是对内存对象形状的过度约束，与真正关心的「落盘形态」无关。
+    expect(JSON.parse(JSON.stringify(accounts[0]))).not.toHaveProperty('modelRateLimits')
+  })
+
+  it('modelRateLimits 非对象（数组/字符串/null）一律视为无标记', () => {
+    for (const raw of [[], 'x', null, 42]) {
+      const accounts = sanitizeAccounts([{
+        id: 'a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_A', modelRateLimits: raw,
+      }])
+      expect(accounts[0]!.modelRateLimits).toBeUndefined()
+    }
+  })
+
+  it('已过期的限流标记**保留**（UI 靠它渲染「重置」按钮，清理由 sweep 负责）', () => {
+    const past = Date.now() - 60_000
+    const accounts = sanitizeAccounts([{
+      id: 'a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_A',
+      modelRateLimits: { 'glm-5.2': past },
+    }])
+    expect(accounts[0]!.modelRateLimits).toEqual({ 'glm-5.2': past })
+  })
+
+  /**
+   * ★★ **High 回归用例**（真实缺陷，对抗审计实测证伪）：
+   * `1e308` 是「有限正数」但**超出 `Date` 范围**（上界 8.64e15），
+   * 原先的 `isFinite(v) && v > 0` 会放过它 ⇒ 落池后下次撞限流时
+   * `updateModelRateLimit` 里的 `new Date(current).toISOString()` 抛
+   * **`RangeError: Invalid time value`**，而 17 个调用点里 16 个没有 try。
+   *
+   * 反向验证：把判据改回 `Number.isFinite(v) && v > 0` → 本用例变红。
+   */
+  it('★ 超出 Date 范围的有限数必须被过滤（否则 updateModelRateLimit 抛 RangeError）', () => {
+    const accounts = sanitizeAccounts([{
+      id: 'a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_A',
+      modelRateLimits: {
+        'too-big': 1e308,
+        'just-over': 8_640_000_000_000_001,
+        'ok': 8_640_000_000_000_000,      // 恰好等于 Date 上界 → 保留
+      },
+    }])
+    expect(accounts[0]!.modelRateLimits).toEqual({ ok: 8_640_000_000_000_000 })
+  })
+
+  it('★ isValidResetAtMs 是读写两侧共用的谓词（不再各写一份判据）', async () => {
+    const { isValidResetAtMs, MAX_DATE_MS } = await import('../../src/jet-hub-store.js')
+    expect(isValidResetAtMs(1)).toBe(true)
+    expect(isValidResetAtMs(MAX_DATE_MS)).toBe(true)
+    expect(isValidResetAtMs(MAX_DATE_MS + 1)).toBe(false)
+    expect(isValidResetAtMs(1e308)).toBe(false)
+    expect(isValidResetAtMs(0)).toBe(false)
+    expect(isValidResetAtMs(-1)).toBe(false)
+    expect(isValidResetAtMs(Number.NaN)).toBe(false)
+    expect(isValidResetAtMs(Number.POSITIVE_INFINITY)).toBe(false)
+    expect(isValidResetAtMs('123')).toBe(false)
+    expect(isValidResetAtMs(null)).toBe(false)
+    expect(isValidResetAtMs(undefined)).toBe(false)
+  })
 })
