@@ -1,9 +1,13 @@
-import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { AccountPool } from '../../src/account-pool.js'
+import {
+  AccountPool,
+  rateLimitSinkEnabled,
+  sinkAccountToProviderEnd,
+} from '../../src/account-pool.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
 /**
@@ -375,6 +379,275 @@ describe('AccountPool', () => {
       expect(a1.modelRateLimits?.['deepseek-v4-pro']).toBe(t + 1000)
       expect(a1.modelRateLimits?.['deepseek-v4-flash']).toBe(t)
       expect(a2.modelRateLimits?.['deepseek-v4-flash']).toBe(t + 2000)
+    })
+  })
+
+  /**
+   * **限额账号自动沉底**（用户 2026-10 报障）。
+   *
+   * ## 为什么需要它
+   *
+   * 取号永远是「服务端顺序里第一个可用账号」，没有轮转。于是 1 号账号只要
+   * 没撞限额就吃掉全部流量；它撞了才轮到 2 号；而它解禁后**又排在最前被立刻
+   * 捡回去**，2 号重新闲置。用户的资源包有使用期限，轮不到就白白过期 ——
+   * 原话：「每次都轮不完，等限额号好了因为排在前面又开始用刚好的限额号了，
+   * 后面的号的额度就白白过期了」。
+   *
+   * ⇒ 故「沉底」的价值**不在受限期间**（受限账号本来就被选号过滤），而在
+   * **解禁之后**：它留在末尾，不再抢占首位。
+   */
+  describe('限额账号自动沉底', () => {
+    const LIMIT_MODEL = 'deepseek-v4-flash'
+
+    /**
+     * 建账号并**备好凭据** —— 需要验证取号结果的用例必须用它，
+     * 否则 `getAvailableAccount` 会因解析不到凭据而返回 `null`（与本文件
+     * `reorderAccounts` 那组的 `seedThree` 同款）。
+     */
+    async function seed(ids: string[]): Promise<void> {
+      for (const id of ids) {
+        const ref = `BUDDY_ACCOUNT_${id.toUpperCase()}`
+        await ctx.credentials.set(credentialRef(ref), JSON.stringify({ access_token: id }))
+        await pool.addAccount(makeMockAccount({ id, credentialRef: ref }))
+      }
+    }
+
+    it('★ 命中限额的账号被移到本 provider 末尾', async () => {
+      await seed(['a', 'b', 'c'])
+      await pool.updateModelRateLimit('a', LIMIT_MODEL, Date.now() + 3600_000)
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['b', 'c', 'a'])
+    })
+
+    /**
+     * ★ 本组最核心的用例：**解禁之后不回弹**。
+     *
+     * 这正是用户报障的原话。沉底若只是"受限期间排后面"就毫无意义 ——
+     * 必须写进持久化的服务端顺序，解禁后仍留在末尾，后面的号才轮得到。
+     *
+     * ⚠️ 必须用 `clearModelRateLimits` 把标记**真正清掉**（彻底恢复可用）之后
+     * 再断言 —— 否则 `a` 仍被选号的限流过滤挡着，取到 `b` 是理所当然的，
+     * 那样这条用例就成了同义反复，证明不了「解禁后不抢回首位」。
+     */
+    it('★ 解禁之后仍留在末尾（不回弹，后续账号才轮得到）', async () => {
+      await seed(['a', 'b'])
+
+      await pool.updateModelRateLimit('a', LIMIT_MODEL, Date.now() + 3600_000)
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['b', 'a'])
+
+      // 到点解禁：标记被清掉，`a` 重新完全可用。
+      await pool.clearModelRateLimits('a')
+      const list = await pool.listAccounts('buddy')
+      expect(list.find(x => x.id === 'a')!.modelRateLimits).toBeUndefined()
+
+      // ★ 顺序没回弹 —— 这是本用例的核心断言。
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['b', 'a'])
+
+      // ★ 真正决定「会不会再霸占首位」的是取号：a 已完全可用，但首位的 b 仍先被用。
+      const picked = await pool.getAvailableAccount('buddy', LIMIT_MODEL)
+      expect(picked?.entry.id).toBe('b')
+    })
+
+    /** 多个账号连续限额 → 依次排到末尾，形成轮转。 */
+    it('★ 连续限额形成轮转：a 受限沉底、接着 b 受限，a 才有机会被用', async () => {
+      await seed(['a', 'b'])
+
+      // 首位 a 撞限额 → 沉底，b 顶上。
+      await pool.updateModelRateLimit('a', LIMIT_MODEL, Date.now() + 3600_000)
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['b', 'a'])
+      expect((await pool.getAvailableAccount('buddy', LIMIT_MODEL))?.entry.id).toBe('b')
+
+      // 接着 b 也撞限额 → 沉底到 a 之后（保持稳定，不打乱已有末尾顺序）。
+      await pool.updateModelRateLimit('b', LIMIT_MODEL, Date.now() + 3600_000)
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['a', 'b'])
+
+      // 两个都受限 → 选号确实拿不到号（此时不涉及"谁优先"）。
+      expect(await pool.getAvailableAccount('buddy', LIMIT_MODEL)).toBeNull()
+
+      // a 解禁 → 因为它在首位，重新可用；而 b 留在末尾继续受限。
+      await pool.clearModelRateLimits('a')
+      expect((await pool.getAvailableAccount('buddy', LIMIT_MODEL))?.entry.id).toBe('a')
+    })
+
+    /** 只动本 provider 的**槽位**，其它 provider 的账号绝对位置完全不变。 */
+    it('不波及其它 provider 的账号位置（槽位语义）', async () => {
+      await pool.addAccount(makeMockAccount({ id: 'b1', credentialRef: 'BUDDY_ACCOUNT_B1' }))
+      await pool.addAccount(makeMockAccount({ id: 'c1', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_C1' }))
+      await pool.addAccount(makeMockAccount({ id: 'b2', credentialRef: 'BUDDY_ACCOUNT_B2' }))
+      await pool.addAccount(makeMockAccount({ id: 'c2', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_C2' }))
+
+      await pool.updateModelRateLimit('b1', LIMIT_MODEL, Date.now() + 3600_000)
+      // buddy 占用的下标是 0 与 2 → 组内 b1 沉到 b2 之后，回填这**两个**槽位；
+      // 两个 codearts 账号（下标 1、3）纹丝不动。
+      expect((await pool.listAllAccounts()).map(x => x.id)).toEqual(['b2', 'c1', 'b1', 'c2'])
+    })
+
+    /**
+     * 「已在末位 + 标记无变化」是**完全不写盘**的路径。
+     *
+     * 限流是热路径（每次撞限额都调一次），此处省掉一次「整体重写 + 目录广播」
+     * 是有意义的；同时它也守着一个易错点：不能因为「沉底没做」就顺手把标记
+     * 也写了（或反过来多写一次顺序）。
+     */
+    it('已在末位且标记无变化时完全不写盘', async () => {
+      await seed(['a', 'b'])
+      const at = Date.now() + 3600_000
+      await pool.updateModelRateLimit('b', LIMIT_MODEL, at)
+      const callsAfterFirst = ctx.replaceCalls.length
+
+      // 同一个时刻再报一次：标记不变、b 也已在末位 → 两件事都无事可做。
+      await pool.updateModelRateLimit('b', LIMIT_MODEL, at)
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['a', 'b'])
+      expect(ctx.replaceCalls.length).toBe(callsAfterFirst)
+    })
+
+    /** 已有更长的标记（早退分支）时**仍然要沉底** —— 账号此刻确实受限。 */
+    it('★ 已有更长标记时标记不覆盖，但仍然沉底', async () => {
+      await seed(['a', 'b'])
+      const real = Date.now() + 19 * 3600_000
+      // 先写一个长标记（此时 a 沉底）
+      await pool.updateModelRateLimit('a', LIMIT_MODEL, real)
+
+      // 把 a 手动拖回首位，模拟用户操作
+      await pool.reorderAccounts('buddy', ['a', 'b'])
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['a', 'b'])
+
+      // 再报一个更短的时限：标记不覆盖，但 a 仍在限额中 → 必须再次沉底
+      await pool.updateModelRateLimit('a', LIMIT_MODEL, Date.now() + 60_000)
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['b', 'a'])
+      const list = await pool.listAccounts('buddy')
+      expect(list.find(x => x.id === 'a')!.modelRateLimits?.[LIMIT_MODEL]).toBe(real)
+    })
+
+    /**
+     * ⚠️ **写入一个「已经过去」的解禁时刻时不得沉底** —— 那种情况下账号此刻
+     * 其实是**可用**的（选号也会正常选它），把它沉底会让顺序与可用性互相矛盾。
+     *
+     * 这个场景是真实存在的：`trae-model-id-selection.spec.ts` 就用
+     * `Date.now() - 1000` 构造「标记已过期」，另有 provider 的解析兜底值可能
+     * 直接落在过去。实现里若只看「有没有被调用」而不看「生效后是否真受限」，
+     * 就会把一个完好的号莫名挪到末尾。
+     */
+    it('★ 解禁时刻已在过去时不沉底（该账号此刻其实是可用的）', async () => {
+      await seed(['a', 'b'])
+      await pool.updateModelRateLimit('a', LIMIT_MODEL, Date.now() - 1000)
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['a', 'b'])
+    })
+
+    /** 现值仍更长（且未过期）时，即便新值已过期，也不该让它浮上来。 */
+    it('★ 现值更长且仍有效时，传入过期新值不得解除沉底', async () => {
+      await seed(['a', 'b'])
+      const real = Date.now() + 19 * 3600_000
+      await pool.updateModelRateLimit('a', LIMIT_MODEL, real)
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['b', 'a'])
+
+      // 先把它拖回首位，再报一个已过期的短值：现值更长会被保留 → 仍受限 → 仍沉底
+      await pool.reorderAccounts('buddy', ['a', 'b'])
+      await pool.updateModelRateLimit('a', LIMIT_MODEL, Date.now() - 1000)
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['b', 'a'])
+    })
+
+    /** 开关可退回旧行为（`DSH_RATE_LIMIT_SINK=0`）。 */    it('DSH_RATE_LIMIT_SINK=0 时退回纯手动顺序', async () => {
+      await seed(['a', 'b'])
+      vi.stubEnv('DSH_RATE_LIMIT_SINK', '0')
+      try {
+        await pool.updateModelRateLimit('a', LIMIT_MODEL, Date.now() + 3600_000)
+        expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['a', 'b'])
+      } finally {
+        vi.unstubAllEnvs()
+      }
+    })
+
+    /**
+     * ⚠️ 默认值必须是**开启**：`DSH_RATE_LIMIT_SINK` 未设置时不能退回旧行为。
+     *
+     * 这条守的是「默认开启」这个契约 —— 若哪天有人把判据写成 `Boolean(env[...])`，
+     * 未设置（undefined）会被当成关闭，本用例立刻变红。
+     */
+    it('★ 未设置环境变量时默认开启（不是默认关闭）', async () => {
+      await seed(['a', 'b'])
+      delete process.env.DSH_RATE_LIMIT_SINK
+      await pool.updateModelRateLimit('a', LIMIT_MODEL, Date.now() + 3600_000)
+      expect(pool.listAccountsByProvider('buddy').map(x => x.id)).toEqual(['b', 'a'])
+    })
+  })
+
+  /**
+   * 沉底的**纯函数**（不改盘、不依赖 ctx）—— 边界与槽位语义在这里锁死。
+   *
+   * 与 `allAccountsRateLimitedForModel` 同样是「从类里导出、单独可测」的写法。
+   */
+  describe('sinkAccountToProviderEnd（限定 provider 内沉底）', () => {
+    const e = (id: string, provider = 'buddy'): ProviderAccountEntry => ({
+      id,
+      provider,
+      nickname: id,
+      enabled: true,
+      credentialRef: `REF_${id}`,
+      createdAt: 1,
+      refreshable: true,
+    })
+
+    it('首位账号沉到本 provider 末尾', () => {
+      expect(sinkAccountToProviderEnd([e('a'), e('b'), e('c')], 'a')!.map(x => x.id))
+        .toEqual(['b', 'c', 'a'])
+    })
+
+    /**
+     * ★ 槽位语义：跨 provider 混排时，**其它 provider 的绝对下标不变**。
+     *
+     * 与 `reorderAccounts` 的隔离约定一致 —— 不让 buddy 的沉底顺带挪动
+     * CodeArts 账号的位置（那是跨面板的意外副作用）。
+     */
+    it('★ 不波及其它 provider 的绝对位置（槽位回填）', () => {
+      const list = [e('b1'), e('c1', 'codearts'), e('b2'), e('c2', 'codearts')]
+      expect(sinkAccountToProviderEnd(list, 'b1')!.map(x => x.id))
+        .toEqual(['b2', 'c1', 'b1', 'c2'])
+    })
+
+    it('组内其余账号保持相对顺序（稳定）', () => {
+      expect(sinkAccountToProviderEnd([e('a'), e('b'), e('c'), e('d')], 'b')!.map(x => x.id))
+        .toEqual(['a', 'c', 'd', 'b'])
+    })
+
+    it('已在末位 → null（调用方据此省掉写盘）', () => {
+      expect(sinkAccountToProviderEnd([e('a'), e('b')], 'b')).toBeNull()
+    })
+
+    it('只有一个账号 → null', () => {
+      expect(sinkAccountToProviderEnd([e('a')], 'a')).toBeNull()
+    })
+
+    it('账号不存在 → null', () => {
+      expect(sinkAccountToProviderEnd([e('a')], 'zzz')).toBeNull()
+    })
+
+    it('空列表 → null', () => {
+      expect(sinkAccountToProviderEnd([], 'a')).toBeNull()
+    })
+
+    /** 不修改入参（本仓库的纯函数约定）。 */
+    it('不修改入参数组', () => {
+      const list = [e('a'), e('b')]
+      sinkAccountToProviderEnd(list, 'a')
+      expect(list.map(x => x.id)).toEqual(['a', 'b'])
+    })
+  })
+
+  describe('rateLimitSinkEnabled（默认开启的开关）', () => {
+    it('未设置 → 开启（默认值）', () => {
+      expect(rateLimitSinkEnabled({})).toBe(true)
+    })
+
+    it('显式关闭的几种写法都认', () => {
+      for (const v of ['0', 'false', 'off', 'no', 'FALSE', 'Off', ' 0 ']) {
+        expect(rateLimitSinkEnabled({ DSH_RATE_LIMIT_SINK: v })).toBe(false)
+      }
+    })
+
+    it('空串 / 其它值 → 视为默认开启（不因无法识别而关掉功能）', () => {
+      for (const v of ['', '   ', '1', 'true', 'yes', 'random']) {
+        expect(rateLimitSinkEnabled({ DSH_RATE_LIMIT_SINK: v })).toBe(true)
+      }
     })
   })
 
@@ -813,6 +1086,67 @@ describe('AccountPool', () => {
       await pool.replaceAll(incoming, {})
       const list = await pool.listAllAccounts()
       expect(list.map(a => a.id)).toEqual(['buddy-001'])
+    })
+
+    /**
+     * ⚠️ `mergeAccounts` 是「单独导入一个账号」的落地点，
+     * 它必须与 `replaceAll` 的**覆盖**语义严格相反。
+     */
+    it('mergeAccounts 只追加，不删不覆盖现有账号', async () => {
+      await pool.addAccount(makeMockAccount())
+      const added = await pool.mergeAccounts([
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_002' }),
+      ])
+      expect(added).toEqual(['buddy-002'])
+      // ⚠️ 现有账号必须还在：这是「只增加」与「整体替换」的分水岭。
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['buddy-001', 'buddy-002'])
+    })
+
+    it('mergeAccounts 跳过同 id 的现有账号（不覆盖其条目）', async () => {
+      await pool.addAccount(makeMockAccount({ nickname: '原名' }))
+      const added = await pool.mergeAccounts([
+        makeMockAccount({ nickname: '备份里的名字' }),
+      ])
+      expect(added).toEqual([])
+      const list = await pool.listAllAccounts()
+      expect(list).toHaveLength(1)
+      // 昵称仍是本机那个 —— 跳过意味着**一点都不改**。
+      expect(list[0]!.nickname).toBe('原名')
+    })
+
+    it('mergeAccounts 不改模型黑名单与永久积分锁定', async () => {
+      await pool.setModelDisabled('buddy', 'glm-5.2', true)
+      await pool.setPermanentLocked('buddy', true)
+      await pool.mergeAccounts([
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_002' }),
+      ])
+      expect(pool.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
+      expect(pool.permanentLocked('buddy')).toBe(true)
+    })
+
+    it('mergeAccounts 归一化坏条目并丢弃（与 replaceAll 同口径）', async () => {
+      const added = await pool.mergeAccounts([
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_002' }),
+        { id: 'broken', provider: 'buddy' } as ProviderAccountEntry,
+      ])
+      expect(added).toEqual(['buddy-002'])
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['buddy-002'])
+    })
+
+    it('mergeAccounts 文件内重复 id 只新增一次', async () => {
+      const added = await pool.mergeAccounts([
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_002' }),
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_002' }),
+      ])
+      expect(added).toEqual(['buddy-002'])
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['buddy-002'])
+    })
+
+    it('mergeAccounts 全部已存在时不落盘（避免无意义的写与广播）', async () => {
+      await pool.addAccount(makeMockAccount())
+      const added = await pool.mergeAccounts([makeMockAccount()])
+      expect(added).toEqual([])
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['buddy-001'])
     })
   })
 })

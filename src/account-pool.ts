@@ -35,6 +35,7 @@ const EMPTY_MODEL_SET: ReadonlySet<string> = new Set<string>()
  *
  * ## 为什么需要它
  *
+ *
  * 选号按 `modelRateLimits[modelId]` 过滤候选（见本类的 `getAvailableAccount`
  * 与 `src/index.ts` 的 `pickBuddyCredential`）。当一个 provider 只有**一个**
  * 启用账号、而它恰好被标记了该模型的限流时，候选集变成空集，调用链一路
@@ -76,6 +77,95 @@ export function allAccountsRateLimitedForModel(
     earliest = earliest === undefined ? resetAt : Math.min(earliest, resetAt)
   }
   return earliest === undefined ? undefined : { resetAtMs: earliest, accountCount: accounts.length }
+}
+
+/**
+ * 「限额账号自动沉底」的开关环境变量。
+ *
+ * 默认**开启**（用户 2026-10 的明确要求）。留这道逃生门是因为它改变了
+ * 账号顺序的语义：用户手拖出来的顺序会被系统改写。若有人依赖「首位账号
+ * 永远优先」的旧行为（例如想让某个额度充足的号一直扛），把它设为 `0` 即可
+ * 退回纯手动顺序。
+ */
+export const DSH_RATE_LIMIT_SINK = 'DSH_RATE_LIMIT_SINK'
+
+/**
+ * 当前是否启用「限额沉底」。
+ *
+ * ⚠️ **不能写成 `Boolean(env[...])` 之类的 falsy 判据**：本开关的**默认值是
+ * 开启**，而「未设置」与「显式关闭」必须区分开 —— `Boolean(undefined)` 与
+ * `Boolean('0')` 都为 false，会把默认开启变成默认关闭（与 Qoder 排队超时、
+ * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 那几个坑同型）。
+ *
+ * 判据取「显式写了 `0` / `false` / `off` / `no` 才算关」，其余（含未设置、
+ * 空串、无法识别的值）一律按默认开启。
+ */
+export function rateLimitSinkEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[DSH_RATE_LIMIT_SINK]
+  if (typeof raw !== 'string') return true
+  const value = raw.trim().toLowerCase()
+  if (value.length === 0) return true
+  return !(value === '0' || value === 'false' || value === 'off' || value === 'no')
+}
+
+/**
+ * 把「目标账号」移动到本 provider 的**最末尾**（限额沉底）。
+ *
+ * ## 为什么需要它（用户报障的根因）
+ *
+ * 取号永远是「服务端顺序里**第一个**可用账号」（见 `getAvailableAccount`）。
+ * 于是只要 1 号账号没撞限额，**全部流量都压在它身上**；等它撞了限额，2 号才
+ * 顶上；而等 1 号解禁，它又**排在最前面被立刻捡回去**，2 号重新闲置。
+ *
+ * 后果正是用户报障的原话：*「每次都轮不完，等限额号好了因为排在前面又开始
+ * 用刚好的限额号了，后面的号的额度就白白过期了」* —— 每个账号的额度都有
+ * 使用期限（资源包的 `DeductionEndTime`），轮不到就真的作废。
+ *
+ * 故「限额即沉底」的真正价值**不在受限期间**（受限账号本来就被选号过滤掉），
+ * 而在**解禁之后**：它留在末尾，不会再抢回首位，后面的号因此轮到使用。
+ *
+ * ## 为什么必须持久化（不能只在内存里排）
+ *
+ * 沉底若不写盘，重启/刷新后顺序回到原位，解禁账号又会插回最前 —— 等于没做。
+ * 因此它写在**权威的服务端顺序**里（与用户拖拽的 `reorderAccounts` 同一份）。
+ *
+ * ## 槽位约定（与 `reorderAccounts` 完全一致）
+ *
+ * 账号存在**一个全局数组**里（各 provider 混排，靠 `provider` 字段区分）。
+ * 这里取「该 provider 原本占用的那些下标」，把新顺序（其余账号保持原相对
+ * 顺序、目标账号排到最后）填回这些下标 —— **其它 provider 的账号绝对位置
+ * 完全不变**。不这么做（例如整体挪到数组尾部）会让拖拽 buddy 顺带改变
+ * CodeArts 账号的位置，属于跨面板的意外副作用。
+ *
+ * @param accounts - 当前账号列表（服务端顺序）。
+ * @param accountId - 要沉底的账号 id。
+ * @returns 新数组；无需变更（账号不存在 / 已在本 provider 末位）时返回 `null`。
+ */
+export function sinkAccountToProviderEnd(
+  accounts: readonly ProviderAccountEntry[],
+  accountId: string,
+): ProviderAccountEntry[] | null {
+  const index = accounts.findIndex(a => a.id === accountId)
+  if (index === -1) return null
+  const entry = accounts[index]!
+
+  // 该 provider 占用的下标（原序）与该 provider 内的当前顺序。
+  const slots: number[] = []
+  const group: ProviderAccountEntry[] = []
+  accounts.forEach((a, i) => {
+    if (a.provider === entry.provider) { slots.push(i); group.push(a) }
+  })
+  const positionInGroup = group.findIndex(a => a.id === accountId)
+  // 已在末位 → 无需变更，调用方据此省掉一次写盘。
+  if (positionInGroup === group.length - 1) return null
+
+  // 组内新顺序：其余账号保持相对顺序，目标账号排到最后。
+  const nextGroup = group.filter(a => a.id !== accountId)
+  nextGroup.push(entry)
+
+  const next = [...accounts]
+  slots.forEach((slot, i) => { next[slot] = nextGroup[i]! })
+  return next
 }
 
 /**
@@ -891,6 +981,35 @@ export class AccountPool {
     }
   }
 
+  /**
+   * **只追加**账号（合并导入用）：已有的 id 一律跳过，返回**实际新增**的 id。
+   *
+   * ⚠️ 与 {@link replaceAll} 的差别是本质的，不要互相替换：
+   * - 只调用 `writeAccounts`（账号 + 黑名单整体写回，但黑名单取**当前**值），
+   *   因此**不改**模型黑名单，也**不触碰**锁定表（它住在独立文档里）；
+   * - 绝不删除或覆盖任何现有账号 —— 判重按 `id`，这是账号的唯一键；
+   * - 入参同样经 `sanitizeAccounts` 归一化：数据来自用户提供的文件，
+   *   坏条目丢弃而不是写进池里反复触发选号失败。
+   *
+   * ⚠️ **文件内部重复的 id 也要去重**（同一批次里两次同 id 只新增一次）：
+   * 备份文件可能被手工编辑过，重复条目会在池里留下两条同 id 的账号，
+   * 之后 `updateAccount` / `removeAccount` 按 id 查找只会命中第一条，
+   * 出现「删不掉、改不动」的幽灵账号。
+   */
+  async mergeAccounts(accounts: readonly ProviderAccountEntry[]): Promise<string[]> {
+    const current = this.readAccounts()
+    const existing = new Set(current.map(entry => entry.id))
+    const added: ProviderAccountEntry[] = []
+    for (const entry of sanitizeAccounts(accounts)) {
+      if (existing.has(entry.id)) continue
+      existing.add(entry.id)
+      added.push(entry)
+    }
+    if (added.length === 0) return []
+    await this.writeAccounts([...current, ...added])
+    return added.map(entry => entry.id)
+  }
+
   /** 更新账号部分字段 */
   async updateAccount(
     id: string,
@@ -1346,21 +1465,58 @@ export class AccountPool {
     const current = accounts[idx]!.modelRateLimits?.[modelId]
     // ⚠️ 判据用 `>=`：相等时无需写盘（省一次 IO），语义上也无差别。
     // 现值非有限（旧数据损坏）时**允许**被新值修掉 —— 那正是写它的机会。
-    if (Number.isFinite(current) && current! >= resetAtMs) {
+    const markerUnchanged = Number.isFinite(current) && current! >= resetAtMs
+    if (markerUnchanged) {
       this.ctx.logger?.info?.(
         `[jet-hub] updateModelRateLimit: 账号 ${accountId} 模型 ${modelId} 已有更长的限流标记 `
         + `(${new Date(current!).toISOString()} ≥ ${new Date(resetAtMs).toISOString()})，本次不覆盖`,
       )
-      return
     }
-    const next = [...accounts]
-    const entry = { ...next[idx]! }
-    entry.modelRateLimits = { ...entry.modelRateLimits, [modelId]: resetAtMs }
-    next[idx] = entry
+
+    // 限流标记与「沉底」在同一次写盘里完成（两者都是「这个号撞限额了」的后果）。
+    let next = [...accounts]
+    if (!markerUnchanged) {
+      const entry = { ...next[idx]! }
+      entry.modelRateLimits = { ...entry.modelRateLimits, [modelId]: resetAtMs }
+      next[idx] = entry
+    }
+
+    /**
+     * ⚠️ **沉底必须与「本次是否覆盖标记」无关**：走到这一段就说明该账号此刻
+     * 确实在限额中（否则调用方不会来报限流）。已有更长标记时标记不用改，但
+     * 账号仍然受限、仍然该沉底 —— 若只在覆盖分支里沉底，同一账号第二次撞限流
+     * 就不会沉底，行为变得难以解释。
+     *
+     * ⚠️⚠️ **但必须确认「写完之后它真的处于受限态」**：调用方可能传来一个
+     * **已经过去**的解禁时刻（实测存在：`trae-model-id-selection.spec.ts` 就用
+     * `Date.now() - 1000` 构造「标记已过期」的场景，另有 provider 的兜底值可能
+     * 落在过去）。那种情况下账号此刻是**可用**的，把它沉底就是错的 ——
+     * 用户会看到一个完全正常的号莫名掉到末尾，且 `getAvailableAccount`
+     * （已判它可用）与顺序（判它受限）互相矛盾。
+     *
+     * 判据取**生效后的标记**（现值与新值中的较长者）是否仍在未来。取较长者是因为
+     * 上面刚决定「保留更长的现值」—— 生效的就是那个值。
+     */
+    const effectiveResetAt = Number.isFinite(current) && current! > resetAtMs ? current! : resetAtMs
+    const stillLimited = effectiveResetAt > Date.now()
+
+    let sank = false
+    if (rateLimitSinkEnabled() && stillLimited) {
+      const reordered = sinkAccountToProviderEnd(next, accountId)
+      if (reordered !== null) {
+        next = reordered
+        sank = true
+      }
+    }
+
+    // 两件事都没变化时不写盘（避免每次限流都产生一次无意义的整体重写）。
+    if (markerUnchanged && !sank) return
+
     await this.writeAccounts(next)
 
     this.ctx.logger?.info?.(
-      `[jet-hub] 已记录限流: 账号 ${accountId} 模型 ${modelId} 重置于 ${new Date(resetAtMs).toISOString()}`,
+      `[jet-hub] 已记录限流: 账号 ${accountId} 模型 ${modelId} 重置于 ${new Date(resetAtMs).toISOString()}`
+      + (sank ? '（已沉到本 provider 末尾，解禁后不再抢占首位）' : ''),
     )
   }
 

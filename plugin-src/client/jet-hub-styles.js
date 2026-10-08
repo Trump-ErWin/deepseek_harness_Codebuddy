@@ -120,6 +120,8 @@ const STYLES = `
 .dim-jh-accountTag { flex: none; padding: 1px 8px; border-radius: 999px; font-size: 11px; line-height: 17px; font-weight: 500; }
 .dim-jh-accountTag[data-tone="on"] { color: #15803d; background: rgb(34 197 94 / 12%); }
 .dim-jh-accountTag[data-tone="off"] { color: var(--dsw-alias-label-tertiary, #8f959e); background: rgb(143 149 158 / 12%); }
+/* 「限额中」标记：与 metaRow 的 warn 同色系，让「沉到底部的原因」一眼可辨。 */
+.dim-jh-accountTag[data-tone="warn"] { color: #b45309; background: rgb(227 116 0 / 12%); }
 
 /* 元信息：键值对齐的网格 */
 .dim-jh-accountMeta { display: grid; gap: 3px; margin: 8px 0 0; }
@@ -622,6 +624,19 @@ const STYLES = `
 .dim-jh-checkRow input[type="checkbox"] { margin: 0; accent-color: #1677ff; }
 /* 两次口令输入：纵向堆叠 */
 .dim-jh-formRows { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 4px; }
+/* ── 账号勾选（导出选账号 / 导入选账号）── */
+/* 「全部」那行与逐条列表同宽，列表可滚动：账号多时不把弹窗撑爆 */
+.dim-jh-accountPick { display: flex; flex-direction: column; margin: 6px 0 2px; }
+.dim-jh-accountPickList { display: flex; flex-direction: column; max-height: 200px; overflow-y: auto; padding-right: 4px; }
+/* 逐条行：缩进一级，视觉上从属于上面的「全部账号」 */
+.dim-jh-accountPickRow { margin: 2px 0; padding-left: 14px; font-weight: 400; }
+.dim-jh-accountPickName { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+/* 昵称过长时省略，而不是把 provider 标记挤出可视区 */
+.dim-jh-accountPickName > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dim-jh-accountPickMeta { flex: none; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* ── 导入方式单选（整体还原 / 单独导入）── */
+.dim-jh-modePick { display: flex; flex-direction: column; margin: 4px 0 8px; }
+.dim-jh-modePick input[type="radio"] { margin: 0; accent-color: #1677ff; }
 /* 弹窗底部动作区：右对齐（生成/确认按钮） */
 .dim-jh-modalActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 

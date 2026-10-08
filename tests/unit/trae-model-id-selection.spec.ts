@@ -26,7 +26,7 @@
  * 用真实实现 + 桩 ctx（不发网络）。
  */
 
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AccountPool } from '../../src/account-pool.js'
 
 /** 桩 ctx：提供 credentials 与 logger；账号数据由 `replaceAll` 灌入。 */
@@ -63,6 +63,25 @@ const CREDS = {
  * 若哪天有人把 `AccountPool` 的空串短路改掉，这条会失败并提醒重新评估 —— 这正是我们想要的。
  */
 describe('H2 · AccountPool 选号按模型过滤限流账号（行为契约）', () => {
+  /**
+   * ⚠️ **本文件必须关掉「限额沉底」**（`DSH_RATE_LIMIT_SINK=0`）。
+   *
+   * 沉底会改写账号顺序，而下面两条用例正是靠「acct-A 排在首位」来区分
+   * 「传空串 = 忽略限流标记」与「传模型 = 过滤限流账号」的：
+   *
+   * - 传空串时期望选回 **acct-A**（首位）→ 证明**没有**按模型过滤；
+   * - 传模型时期望选到 acct-B → 证明过滤生效。
+   *
+   * 一旦沉底把被标记的 acct-A 挪到末尾，**两条都会选到 acct-B**，于是
+   * 「忽略了标记」与「过滤了标记」变得无法区分 —— 用例退化成同义反复，
+   * 而它偏偏是守「空串短路」这个真实缺陷的唯一断言。
+   *
+   * 沉底本身与**模型过滤**是正交的两件事，已由 `account-pool.spec.ts` 的
+   * 「限额账号自动沉底」一组单独覆盖，故这里隔离掉它，让本契约保持判别力。
+   */
+  beforeEach(() => { vi.stubEnv('DSH_RATE_LIMIT_SINK', '0') })
+  afterEach(() => { vi.unstubAllEnvs() })
+
   /** 建一个池，acct-A 已标记 modelId 限流。 */
   async function setup(modelId: string, resetAtMs: number) {
     const pool = new AccountPool(makeCtx(CREDS))
