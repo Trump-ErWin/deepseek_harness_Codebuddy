@@ -19,6 +19,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from './account-pool.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { isGatewayEnabled } from './openai-gateway/config.js'
 import { collectGatewayEffortViews, collectGatewayModels, toGatewayModelIds, type GatewayModelSource } from './openai-gateway/models.js'
 import {
@@ -1120,33 +1121,34 @@ export interface ModelCatalogSource {
 /**
  * 广播「模型目录可能已变化」。
  *
- * ⚠️ **改黑名单后必须调用**，否则「关闭后选择器里仍能看到该模型，重启后才消失」
- * （真实缺陷，用户报障）。根因在客户端而非适配器：
- * `dsh-client-ui-model-selection` 的 `ModelCatalogDirectory` 把 `modelCatalog`
- * 响应存进一个 `status === 'ready'` 即**短路返回缓存**的 store，只在三个转发的
- * 宿主事件上 `refresh()`：`llm/adapters-updated` / `settings/document-updated`
- * / `credentials/reference-updated`。
+ * ⚠️ 实现已抽到 `src/catalog-broadcast.ts`（issue IKJVTF）：那里是**唯一**的
+ * 广播实现，十个适配器的「远端目录落地」也走它。此前本文件另有一份
+ * `try { ctx.emit(...) } catch`，与适配器侧完全独立 —— 两份实现必然漂移，
+ * 故现改为同名导入。
+ *
+ * ## 为什么改黑名单后必须广播
+ *
+ * 否则「关闭后选择器里仍能看到该模型，重启后才消失」（真实缺陷，用户报障）。
+ * 根因在客户端而非适配器：`dsh-client-ui-model-selection` 的
+ * `ModelCatalogDirectory` 把 `modelCatalog` 响应存进一个 `status === 'ready'`
+ * 即**短路返回缓存**的 store，只在四个转发的宿主事件上 `refresh()`：
+ * `llm/adapters-updated` / `settings/document-updated` /
+ * `credentials/record-updated` / `credentials/reference-updated`。
  *
  * 0.1.7 起黑名单落在插件自有文档 `$DSH_HOME/jet-hub/state.json`（不再经 settings
  * 文档，见 jet-hub-store.ts），因此写开关**不会**触发上述任何一个事件 → 客户端
  * 一直复用旧目录，直到重启（`connection/reset` → `resetGeneration()`）才重拉。
  *
- * 三者中 `llm/adapters-updated` 最贴合：按契约它是**无载荷**的「目录可能变了，
+ * 四者中 `llm/adapters-updated` 最贴合：按契约它是**无载荷**的「目录可能变了，
  * 请重新读 listModels」通知（dsh-llm README：*consumers re-read the registries*），
  * 正是这里要表达的语义。它也在 `API_REMOTE_FORWARDED_EVENTS` 白名单里，故会真的
  * 送达浏览器。不改变拓扑，故 dsh-llm 的 invariant 监听（对每个 provider 读一次
  * `retryPolicy`）必然通过，不会误报 INVARIANT。
  *
  * ⚠️ **通知失败不能反噬已经落盘的开关**：否则用户看到「切换失败」而实际已生效，
- * 再点一次又因幂等而看似「无效」，比不提示更难排查。故这里自行吞掉异常只记日志。
+ * 再点一次又因幂等而看似「无效」，比不提示更难排查。故 `catalog-broadcast.ts`
+ * 自行吞掉异常只记日志。
  */
-function broadcastCatalogChanged(ctx: Context): void {
-  try {
-    ctx.emit('llm/adapters-updated')
-  } catch (error) {
-    ctx.logger.warn(`[jet-hub] 广播模型目录变更事件失败：${String(error)}`)
-  }
-}
 
 /**
  * 取某 provider 的**全量模型 id**（不套黑名单），供「关闭全部」与「关闭供应商」共用。
@@ -2571,12 +2573,10 @@ function registerJetHubEndpoints(
         await pool.setPermanentLocked(provider, req.locked)
         // ⚠️ 与 `model.setDisabled` 同理：本次写入会改变**选号结果**
         // （进而改变哪些账号会被使用），故广播一次让界面重新读取状态。
-        // 包 try/catch：通知失败不能反噬已经落盘的开关。
-        try {
-          ctx.emit('llm/adapters-updated')
-        } catch (error) {
-          ctx.logger?.warn?.(`[jet-hub] 广播 llm/adapters-updated 失败（不影响已保存的开关）: ${String(error)}`)
-        }
+        // ⚠️ 走**唯一**的广播实现（`src/catalog-broadcast.ts`）：它自带
+        // 「失败只记日志、不反噬已落盘的开关」与两级可选链 logger（审计指出
+        // 此处曾是内联实现，`ctx.logger.warn` 在 logger 缺席时会抛、仅被 catch 吞）。
+        broadcastCatalogChanged(ctx)
         return { ok: true, value: lockResponse() }
       }
 

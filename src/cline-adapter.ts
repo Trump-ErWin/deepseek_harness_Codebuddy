@@ -39,6 +39,7 @@ import {
   recordsClineRateLimit,
 } from './cline-rate-limit.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { isClineExpired, clineHeaders, type ClineCredential } from './cline.js'
 import {
@@ -227,6 +228,18 @@ export interface ClineAdapterOptions {
    * ⚠️ 注入后单测可完全离线 —— 与 `loadModels` 同款理由。
    */
   loadModelsDev?: () => Promise<Map<string, ClineModelsDevEntry>>
+  /**
+   * 远端目录**落地后**的通知回调（issue IKJVTF）。
+   *
+   * 由 `registerClineLlm` 注入为 `broadcastCatalogChanged(ctx)`。适配器本身
+   * 拿不到 `ctx`（它只被注册进 `ctx.llm`），故必须由接线层桥接 —— 这与
+   * `readImage` 等回调同一模式。
+   *
+   * ⚠️ 必要性：客户端 `ModelCatalogDirectory` 在 `status === 'ready'` 时**短路
+   * 返回缓存**，只在宿主事件上 `refresh()`。没有本回调时，冷启动首拉失败
+   * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
+   */
+  onCatalogLoaded?: () => void
 }
 
 /**
@@ -239,6 +252,20 @@ export class ClineAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   /** 远端模型目录缓存（首次成功后填充）。 */
   private remoteModels: ClineModel[] | undefined
+  /**
+   * 已落缓存的目录是否**两个来源都取全**（issue IKJVTF）。
+   *
+   * ⚠️ **这是短路判据的第二半，绝不能省**：残缺目录**也**要落 `remoteModels`
+   * （展示需要 —— 目录服务抖动时用户的模型列表不该整个消失），但那时**不能**
+   * 短路，否则永远补不齐。修复前只判 `remoteModels !== undefined`，而残缺目录
+   * 同样赋值 ⇒ `RemoteCatalogGate` 的冷却（`retryAt`）**永远读不到**
+   * （`cooling()` 在生产里只有闸门自己那一处调用点，而它排在短路之后）
+   * ⇒ 那 466 条按量计费模型再也拉不回来，只能重启 DSH。
+   *
+   * 判据用「已完整」而非「已定义」：残缺时放行到闸门，由冷却控制重试节奏
+   * （30 秒一轮，不会打风暴）。
+   */
+  private remoteComplete = false
   /** 正在进行中的目录加载（避免并发重复请求）。 */
   private loading: Promise<void> | undefined
   /**
@@ -261,13 +288,18 @@ export class ClineAdapter extends LlmAdapter {
    * `buildModelCatalog` 的「每模型一次 resolveModel」会把一次失败放大成 N 次。
    * 详见 `src/remote-catalog-gate.ts` 的实测依据。
    */
-  private readonly catalogGate = new RemoteCatalogGate()
+  private readonly catalogGate: RemoteCatalogGate
 
   constructor(private readonly options: ClineAdapterOptions) {
     super()
     this.product = options.product ?? CLINE
     this.fetchImpl = options.fetchImpl ?? fetch
     this.loadModelsDev = options.loadModelsDev ?? makeClineModelsDevLoader({ fetcher: this.fetchImpl })
+    // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。回调由接线层桥接
+    // （适配器拿不到 ctx），见 `ClineAdapterOptions.onCatalogLoaded`。
+    this.catalogGate = new RemoteCatalogGate(
+      options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
   }
 
   /**
@@ -315,7 +347,13 @@ export class ClineAdapter extends LlmAdapter {
    * 不去重会打出多份重复的远端请求（两个端点各一次，乘以并发数）。
    */
   private async ensureRemoteModels(): Promise<void> {
-    if (this.remoteModels !== undefined) return
+    // ⚠️⚠️ **短路判据是「已完整」，不是「已定义」**（issue IKJVTF 的核心修复点）。
+    //
+    // 残缺目录**也**落 `remoteModels`（展示需要），若这里只判 `!== undefined`
+    // 就再也不进闸门 ⇒ 闸门的冷却（`retryAt` / `cooling()`）**永远读不到**
+    // ⇒ 残缺目录永久固化，那 466 条按量计费模型只能靠重启 DSH 才能回来。
+    // 放行到闸门后，由闸门的 30 秒冷却控制重试节奏（不会打风暴）。
+    if (this.remoteComplete) return
     await this.catalogGate.run(async () => {
       try {
         // 目录加载路径**没有**目标模型（它要一次列出全部模型），故不传 modelId：
@@ -332,9 +370,36 @@ export class ClineAdapter extends LlmAdapter {
         // ⚠ **不能**用 `models.length === 0` 判断「没拿到目录」：`mergeClineModels`
         // 会无条件把兜底表并进 `models`（展示需要），实测两个端点全挂时它仍是 5 条
         // ⇒ 旧判据是死代码，冷却永不触发、兜底被永久当成远端结果缓存。
-        const gotRemote = remote !== undefined
+        //
+        // ⚠⚠ **`got` 与 `complete` 必须分开**（issue IKJVTF）：Cline 有**两个**
+        // 独立来源（`recommended-models` 给 free 集合、`/api/v1/models` 给 466 条
+        // 按量计费 id）。实测 `recommended-models` 成功、`/api/v1/models` 失败时：
+        // - 只看「任一来源非空」（旧实现）⇒ 残缺目录被当成「已加载」**永久缓存**；
+        // - 只看「两个都成功」⇒ 残缺时整个目录都不展示，用户的模型列表凭空消失。
+        // ⇒ 残缺**也展示、也广播**（`got`），但**不永久缓存、要留冷却重试**（`complete`）。
+        const got = remote !== undefined
           ? hasClineRemoteModels(remote)
           : models.length > 0
+        // ⚠️ **完整与否由 `fetchClineRemoteModels` 显式给出**，不能拿
+        // `warnings.length === 0` 反推 —— 「主动跳过」（无凭据时的 `/models`）
+        // 与「取到了」在 warnings 上不可区分，那正是残缺被判成完整的另一条路径。
+        // 注入式加载器（单测）不传 `remote` 时退回 `complete = got`
+        //（那种形态下判不出残缺，与 `normalizeLoadResult` 的向后兼容口径一致）。
+        //
+        // ⚠️ 用 `=== true` 而非直接取值：万一有调用方（旧注入式替身）省了该字段，
+        // 保守按**不完整**处理 —— 方向是「宁可多试一次」。
+        // 反过来（把缺失当完整）会让残缺目录永久固化，那正是本 issue 的缺陷②。
+        const complete = remote === undefined ? got : remote.complete === true
+        // ⚠️ **warnings 循环必须在 `if (!got)` 之前**（真实回退，审计发现）：
+        // 基线里它排在 `if (!gotRemote) return false` **之前**，而基线那两个端点
+        // 全挂时正是靠这两行日志给出现场证据（`[cline] 模型目录来源失败：models
+        // fetch failed`，issue IKJVTF 就引用了它）。放到后面会让「全挂」这一
+        // **最需要诊断**的场景变成静默。
+        for (const warning of warnings) {
+          // eslint-disable-next-line no-console
+          console.warn(`[cline] 模型目录来源失败：${warning}`)
+        }
+        if (!got) return { got: false, complete: false }
         let merged = models
         if (models.length > 0) {
           // ⚠️ **models.dev 是目录的第三个来源**（补缺的模型 + 可读名 + 上下文
@@ -343,21 +408,16 @@ export class ClineAdapter extends LlmAdapter {
           // 它失败不影响目录本身（只记日志）。
           merged = applyModelsDevCatalog(models, await this.ensureModelsDev())
         }
-        // 目录部分失败时留下日志：静默降级会让用户看到「少了模型」却无从排查
-        // （两个端点独立容错，故这里只记 warning 不抛错）。
-        for (const warning of warnings) {
-          // eslint-disable-next-line no-console
-          console.warn(`[cline] 模型目录来源失败：${warning}`)
-        }
-        if (!gotRemote) return false
+        // ⚠️ 残缺目录也落缓存（否则每次 `listModels` 都重拉两个端点），
+        // 但 `remoteComplete` 保持 false ⇒ 下次仍进闸门，由冷却控制重试。
         this.remoteModels = merged
-        return true
-        return true
+        this.remoteComplete = complete
+        return { got: true, complete }
       } catch (error) {
         // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态兜底表。
         // eslint-disable-next-line no-console
         console.warn(`[cline] 模型目录拉取失败：${error instanceof Error ? error.message : String(error)}`)
-        return false
+        return { got: false, complete: false }
       }
     })
   }
@@ -986,7 +1046,12 @@ const CLINE_REGION_FORBIDDEN_MARKERS: readonly string[] = [
  */
 export function registerClineLlm(ctx: Context, options: ClineAdapterOptions): ClineAdapter {
   const product = options.product ?? CLINE
-  const adapter = new ClineAdapter(options)
+  const adapter = new ClineAdapter({
+    ...options,
+    // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+    // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+    onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+  })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。

@@ -31,6 +31,7 @@ import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { parseRateLimitError } from './llm-adapter.js'
 import {
@@ -352,6 +353,17 @@ export interface LobsteraiAdapterOptions {
   ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；默认 {@link LOBSTERAI}。 */
   product?: LobsteraiProduct
+  /**
+   * 远端目录**落地后**的通知回调（issue IKJVTF）。
+   *
+   * 由 `registerLobsteraiLlm` 注入为 `broadcastCatalogChanged(ctx)`。适配器本身
+   * 拿不到 `ctx`，故必须由接线层桥接（与 `readImage` 等回调同一模式）。
+   *
+   * ⚠️ 必要性：客户端 `ModelCatalogDirectory` 在 `status === 'ready'` 时**短路
+   * 返回缓存**，只在宿主事件上 `refresh()`。没有本回调时，冷启动首拉失败
+   * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
+   */
+  onCatalogLoaded?: () => void
 }
 
 /** 将消息内容载荷展平为纯文本字符串。 */
@@ -712,7 +724,7 @@ export class LobsteraiAdapter extends LlmAdapter {
    * 目录加载闸门：并发去重 + 失败/空结果冷却。
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
-  private readonly catalogGate = new RemoteCatalogGate()
+  private readonly catalogGate: RemoteCatalogGate
   /** 远端下发的模型元数据（id → 条目），listModels/resolveModel 共用。 */
   private remoteMeta: ReadonlyMap<string, LobsteraiRemoteModel> = new Map()
   /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
@@ -722,6 +734,10 @@ export class LobsteraiAdapter extends LlmAdapter {
     super()
     this.product = options.product ?? LOBSTERAI
     this.fetchImpl = options.fetchImpl ?? fetch
+    // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
+    this.catalogGate = new RemoteCatalogGate(
+      options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
     this.fallbackIndex = new Map(
       (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
     )
@@ -1716,7 +1732,12 @@ function displayNameFor(model: LobsteraiRemoteModel): string {
  */
 export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOptions): LobsteraiAdapter {
   const product = options.product ?? LOBSTERAI
-  const adapter = new LobsteraiAdapter(options)
+  const adapter = new LobsteraiAdapter({
+    ...options,
+    // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
+    // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
+    onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+  })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
