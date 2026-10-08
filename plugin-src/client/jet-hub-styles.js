@@ -1042,15 +1042,65 @@ const STYLES = `
 
 `
 
-let injected = false
+/**
+ * 本插件的**包 id** —— 必须与 plugin-src/client/build.mjs 的 loaderId 逐字一致。
+ *
+ * ⚠️ 它同时是宿主 claimStyles / removeOwnedStyles 用的 ownerId
+ * （dsh-client-modules 的 stripClientSuffix(registration.id)），
+ * 也就是样式标签 data-plugin 的**正确取值**。改名必须两边一起改。
+ */
+const PLUGIN_ID = 'dsh-codearts-auth'
+
+/** 样式标签的资源标识（宿主 data-plugin-css 的语义，见下）。 */
+const STYLE_TAG_ID = PLUGIN_ID + '/jet-hub.css'
+
+/** 幂等判据用的选择器：按**资源标识**查自己的那张标签。 */
+const STYLE_SELECTOR = 'style[data-plugin-css=' + JSON.stringify(STYLE_TAG_ID) + ']'
+
+/**
+ * 注入 Jet Hub 的整张样式表。
+ *
+ * ## ⚠️⚠️ 为什么必须写 data-plugin（Gitee issue IKK764）
+ *
+ * 宿主（@deepseek-ai/dsh-client-modules 的 lib/client.js）对 style 标签有归属机制：
+ *
+ * - claimStyles(id)：把自己物化期间出现的**无主**标签
+ *   （选择器 style:not([data-plugin])）**全部**认领给当前插件；
+ * - removeOwnedStyles(id)：按 data-plugin 精确匹配删除，触发路径有四条 ——
+ *   该插件行 revision 变化（updateManifest）、对应行被 prune、factory 抛错、
+ *   条目被替换（replace）。
+ *
+ * 而 installJetHubStyles 是在 ctx.effect(...)（插件 apply 阶段）里注入的，
+ * **必然晚于自己那次 claimStyles**。所以旧实现（无署名 + 模块级 injected 布尔）
+ * 有双重缺陷：
+ *
+ * 1. 标签**始终无主** ⇒ 之后任何一个插件物化都会把它认领走；那个插件一热重载 /
+ *    被禁用 / 被卸载，宿主就把「它名下」的样式连根删掉 ⇒ **Jet Hub 整套 UI 掉样式**
+ *    （.dim-jh-* 全量，不是局部）；
+ * 2. injected 布尔让标签被外部删除后**永不再补注** ⇒ 只有整页刷新（模块重新求值）
+ *    才恢复，用户看起来就像「这个插件坏了」。
+ *
+ * 故这里：① 注入时**署名**（别的插件认领不到它、也不会替它删）；
+ * ② 幂等改为**按 DOM 存在性判断**（标签被删掉后能自愈）。
+ *
+ * ⚠️ data-plugin-css 只是资源标识（宿主 claimStyles 回读它做 inventory），
+ * 用「包 id + 文件名」的形式，便于将来多张样式表各自幂等。
+ *
+ * ⚠️⚠️ 本文件的样式整体装在模板字符串里，**整份文件只允许 STYLES 首尾那两个
+ * 反引号**：注释里写字面反引号会提前闭合模板（AGENTS.md 红线，已有三条护栏用例
+ * 分别计数）。故上面所有标识符一律裸写，本函数内也不得再引入模板字符串 ——
+ * STYLE_TAG_ID / STYLE_SELECTOR 因此刻意用字符串拼接。
+ */
 export function installJetHubStyles() {
-  if (injected) return () => {}
-  injected = true
+  // 幂等按 DOM 存在性判断（**不是**模块级布尔）：标签被宿主/别的插件删掉后能自愈。
+  if (document.querySelector(STYLE_SELECTOR) !== null) return () => {}
   const style = document.createElement('style')
+  // ⚠️ 署名是**关键**：claimStyles 只认领无主标签，removeOwnedStyles 只删自己名下的标签。
+  style.dataset.plugin = PLUGIN_ID
+  style.dataset.pluginCss = STYLE_TAG_ID
   style.textContent = STYLES
   document.head.appendChild(style)
   return () => {
-    style.remove()
-    injected = false
+    document.querySelector(STYLE_SELECTOR)?.remove()
   }
 }
