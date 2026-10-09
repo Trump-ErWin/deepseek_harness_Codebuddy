@@ -195,7 +195,7 @@ describe('recordThroughStream：记账骨架', () => {
     expect(row.accountId).toBe('acct-live')
   })
 
-  it('账号归属：失败行（没等到 usage）用 finally 兜底读回报表', async () => {
+  it('账号归属：失败行不借用共享回报表里的旧账号', async () => {
     resetTokenLedgerForTests()
     resetLedgerAccountsForTests()
     reportLedgerAccount('qoder', 'acct-stale')
@@ -205,8 +205,8 @@ describe('recordThroughStream：记账骨架', () => {
     ))).rejects.toBeDefined()
     const row = readTokenLedger().entries[0]!
     expect(row.error).toBe('502')
-    // 失败行归属退回「最后解析出的账号」：排查「哪个号挂了」需要它。
-    expect(row.accountId).toBe('acct-stale')
+    // 没有本请求上下文时必须留空，不能把另一个请求残留的账号标到这笔失败记录。
+    expect(row.accountId).toBeUndefined()
   })
 
   it('账号归属：无人回报时空缺（accountId 缺省，不伪造）', async () => {

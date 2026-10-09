@@ -282,13 +282,17 @@ class FileLedgerStore implements TokenLedgerStore {
         // owner 文件缺失/损坏时只按过期目录处理。
       }
       const pid = Number(owner.pid)
-      if (Number.isInteger(pid) && pid > 0 && Date.now() - stat.mtimeMs < LEDGER_LOCK_ABANDON_MS) {
+      const lockAgeMs = Date.now() - stat.mtimeMs
+      if (Number.isInteger(pid) && pid > 0) {
         try {
           process.kill(pid, 0)
           return false
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return false
         }
+      } else if (lockAgeMs < LEDGER_LOCK_ABANDON_MS) {
+        // owner 文件尚未写完/已损坏时，留更长宽限期，避免夺走刚创建的锁。
+        return false
       }
       const stalePath = `${lockPath}.stale-${randomUUID()}`
       renameSync(lockPath, stalePath)

@@ -5,7 +5,7 @@
  * 而不是 mock 掉 fs —— 落盘格式（`{schema, days}`）与载入钳制才是本文件
  * 要锁的契约。
  */
-import { mkdtempSync, existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -26,6 +26,29 @@ function makeEntry(over: Partial<Omit<TokenLedgerEntry, 'ts'>> = {}): Omit<Token
 }
 
 describe('createTokenLedgerStore（文件后端）', () => {
+  it('超过 5 分钟但持有进程仍存活时不得回收写锁', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-live-lock-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    const lockPath = join(home, 'jet-hub', 'token-ledger.json.lock')
+    try {
+      mkdirSync(lockPath, { recursive: true })
+      writeFileSync(join(lockPath, 'owner.json'), JSON.stringify({ pid: process.pid, nonce: 'live-owner' }))
+      const old = new Date(Date.now() - 10 * 60 * 1000)
+      utimesSync(lockPath, old, old)
+
+      const store = createTokenLedgerStore({ logger: undefined } as never)
+      store.flush()
+
+      expect(existsSync(join(lockPath, 'owner.json'))).toBe(true)
+      expect(existsSync(join(home, 'jet-hub', 'token-ledger.json'))).toBe(false)
+    } finally {
+      rmSync(lockPath, { recursive: true, force: true })
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
   it('append 后 flush 落盘；新实例 load 读回一致', () => {
     const home = mkdtempSync(join(tmpdir(), 'token-ledger-store-'))
     const store = createTokenLedgerStore({ logger: undefined, get: () => undefined } as never)

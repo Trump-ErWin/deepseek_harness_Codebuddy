@@ -102,6 +102,7 @@ import {
   tokenSummaryText,
   tokenSummaryTooltip,
   todayDayKey,
+  totalTokensOf,
   trendBars,
 } from './token-ledger-panel.js';
 // ⚠️ `formatTokenCount` 用 jet-hub.js 自己的本地实现（有界渲染，见其注释）；
@@ -2255,7 +2256,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       if (query && !String(entry.model ?? '').toLowerCase().includes(query)) return false;
       return true;
     });
-    const tokenValue = (entry) => Number(entry.inputTokens ?? 0) + Number(entry.cacheReadTokens ?? 0) + Number(entry.outputTokens ?? 0);
+    const tokenValue = totalTokensOf;
     filtered.sort((a, b) => {
       if (entrySort === 'tokens') return tokenValue(b) - tokenValue(a) || b.ts - a.ts;
       if (entrySort === 'duration') return (b.durationMs ?? 0) - (a.durationMs ?? 0) || b.ts - a.ts;
@@ -2274,7 +2275,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
     visibleEntries.map((entry) => [
       Number.isFinite(entry.ts) ? new Date(entry.ts).toISOString() : '', channelLabel(entry.channel), entry.model,
       entry.error === undefined ? '成功' : '失败',
-      Number(entry.inputTokens ?? 0) + Number(entry.cacheReadTokens ?? 0) + Number(entry.outputTokens ?? 0),
+      totalTokensOf(entry),
       entry.inputTokens ?? 0, entry.outputTokens ?? 0, entry.cacheReadTokens ?? 0,
       entry.cacheWriteTokens ?? 0, entry.reasoningTokens ?? 0, entry.ttftMs ?? '',
       entry.tps ?? '', entry.durationMs ?? '', entry.error ?? '',
@@ -2424,7 +2425,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         ? React.createElement('div', { className: 'dim-jh-empty', key: 'histError' }, '历史用量读取失败（不影响明细）。')
         : bars.length === 0
           ? React.createElement('div', { className: 'dim-jh-empty', key: 'histEmpty' },
-              '还没有历史用量。每笔请求都会按日累计入盘 —— 今天发起的请求明天就能在这里看到。')
+              '还没有历史用量。请求完成后会立即按 UTC+8 日期累计，历史最多保留 90 天。')
           : React.createElement(React.Fragment, { key: 'histBody' },
               // 趋势柱状图：每根柱 = 一天，点击下钻该日聚合树（再点收起）。
               // ⚠️ 柱高必须传 `bars.length`：单日窗口下不传根数时最大柱恒 100%，
