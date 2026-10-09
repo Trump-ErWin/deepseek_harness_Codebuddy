@@ -46,8 +46,19 @@ export function channelOrder(a, b) {
  */
 export function tokenSummaryText(row) {
   if (!row || typeof row !== 'object') return '—';
-  const total = row.totalTokens ?? (Number(row.inputTokens ?? 0) + Number(row.cacheReadTokens ?? 0) + Number(row.outputTokens ?? 0));
-  return '总处理 ' + formatTokenCount(total);
+  return '总处理 ' + formatTokenCount(totalTokensOf(row));
+}
+
+/** 统一客户端 fallback 口径：缓存命中输入计入处理量，缓存写入不重复计入。 */
+export function totalTokensOf(row) {
+  if (!row || typeof row !== 'object') return 0;
+  const total = Number(row.totalTokens);
+  if (Number.isFinite(total) && total >= 0) return total;
+  const count = (value) => {
+    const n = Number(value ?? 0);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+  return count(row.inputTokens) + count(row.cacheReadTokens) + count(row.outputTokens);
 }
 
 /** 汇总格的悬浮详情：紧凑行保留总量，悬浮窗给出完整输入/输出拆分。 */
@@ -185,7 +196,7 @@ export function trendBars(historyDays, maxBars = 30) {
     day: d?.day ?? '',
     isToday: d?.day === today,
     requests: d?.totals?.requests ?? 0,
-    tokens: d?.totals?.totalTokens ?? ((d?.totals?.inputTokens ?? 0) + (d?.totals?.cacheReadTokens ?? 0) + (d?.totals?.outputTokens ?? 0)),
+    tokens: totalTokensOf(d?.totals),
   }));
 }
 
