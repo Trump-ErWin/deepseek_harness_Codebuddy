@@ -47,11 +47,22 @@ export function channelOrder(a, b) {
 export function tokenSummaryText(row) {
   if (!row || typeof row !== 'object') return '—';
   const total = row.totalTokens ?? (Number(row.inputTokens ?? 0) + Number(row.cacheReadTokens ?? 0) + Number(row.outputTokens ?? 0));
-  const parts = ['总处理 ' + formatTokenCount(total), '↓' + formatTokenCount(row.inputTokens ?? 0), '↑' + formatTokenCount(row.outputTokens ?? 0)];
-  if ((row.cacheReadTokens ?? 0) > 0) parts.push('⚡' + formatTokenCount(row.cacheReadTokens));
-  if ((row.cacheWriteTokens ?? 0) > 0) parts.push('✎' + formatTokenCount(row.cacheWriteTokens));
-  if ((row.reasoningTokens ?? 0) > 0) parts.push('🧠' + formatTokenCount(row.reasoningTokens));
-  return parts.join(' ');
+  return '总处理 ' + formatTokenCount(total);
+}
+
+/** 汇总格的悬浮详情：紧凑行保留总量，悬浮窗给出完整输入/输出拆分。 */
+export function tokenSummaryTooltip(row) {
+  if (!row || typeof row !== 'object') return '暂无 Token 用量';
+  const lines = [
+    tokenSummaryText(row),
+    '↓ 输入 ' + formatTokenCount(row.inputTokens ?? 0),
+    '↑ 输出 ' + formatTokenCount(row.outputTokens ?? 0),
+  ];
+  if ((row.cacheReadTokens ?? 0) > 0) lines.push('⚡ 缓存命中 ' + formatTokenCount(row.cacheReadTokens));
+  if ((row.cacheWriteTokens ?? 0) > 0) lines.push('✎ 缓存写入 ' + formatTokenCount(row.cacheWriteTokens) + '（不重复计入总处理量）');
+  if ((row.reasoningTokens ?? 0) > 0) lines.push('🧠 推理 ' + formatTokenCount(row.reasoningTokens) + '（已包含在输出中）');
+  lines.push('总处理量 = 输入 + 输出；缓存写入不重复计入');
+  return lines.join('\n');
 }
 
 /**
@@ -106,12 +117,11 @@ export function formatTps(entry) {
  */
 export function avgPerfText(row) {
   const ttft = typeof row?.avgTtftMs === 'number' && row.avgTtftMs > 0 ? formatDuration(row.avgTtftMs) : null;
-  const speeds = [];
-  if (typeof row?.avgTps === 'number' && row.avgTps > 0) speeds.push('均值 ' + row.avgTps);
-  if (typeof row?.p50Tps === 'number' && row.p50Tps > 0) speeds.push('P50 ' + row.p50Tps);
-  if (typeof row?.p90Tps === 'number' && row.p90Tps > 0) speeds.push('P90 ' + row.p90Tps);
-  if (ttft === null && speeds.length === 0) return '—';
-  return '首字 ' + (ttft ?? '—') + (speeds.length > 0 ? ' · ' + speeds.join(' / ') + ' tok/s' : '');
+  const speed = typeof row?.p50Tps === 'number' && row.p50Tps > 0
+    ? 'P50 ' + row.p50Tps
+    : typeof row?.avgTps === 'number' && row.avgTps > 0 ? '均值 ' + row.avgTps : null;
+  if (ttft === null && speed === null) return '—';
+  return (ttft === null ? '' : '首字 ' + ttft) + (speed === null ? '' : (ttft === null ? '' : ' · ') + speed + ' tok/s');
 }
 
 /**
@@ -124,11 +134,19 @@ export function avgPerfText(row) {
  * （已实测：单笔 decode=1ms 的样本能把均值从 184 拉到 634592）。
  */
 export function avgPerfTooltip() {
-  return '均值口径：对有实测值的请求取算术平均；P50/P90 为完整样本的对数直方图估算，桶宽约 9%。'
+  return '性能统计：首字时间取可测请求的算术平均；输出速率均值对离群样本敏感。'
+    + '完整样本的 P50/P90 使用对数直方图估算，桶宽约 9%。'
     + '「首字」= 首个内容 chunk 到达前的耗时；'
     + '「速率」= 全部输出 token ÷（首块之后 → 结束）的时长，'
     + '要求解码时长 ≥ 100ms（过短视为不可测、不计入）。'
     + '算术均值对离群样本敏感；旧版日账本没有分布数据，完成升级后新累计的完整日期才显示 P50/P90。';
+}
+
+/** 汇总性能悬浮详情：把均值和 P90 等次要读数收进鼠标提示。 */
+export function avgPerfDetailTooltip(row) {
+  return avgPerfTooltip() + '\n均值 ' + (row?.avgTps ?? '—') + ' tok/s'
+    + ' · P50 ' + (row?.p50Tps ?? '—') + ' tok/s'
+    + ' · P90 ' + (row?.p90Tps ?? '—') + ' tok/s';
 }
 
 // ───────────────────── 历史视图（第 4 期）─────────────────────

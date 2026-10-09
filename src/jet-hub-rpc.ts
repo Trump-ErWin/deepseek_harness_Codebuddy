@@ -4557,9 +4557,8 @@ function registerJetHubEndpoints(
        * 数据源是落盘的日聚合表（`token-ledger.json`，重启保留）—— 纯内存
        * 计算（Map 树 → 数组），不打上游、不做额外 I/O。
        *
-       * ⚠️ `sinceDays` 钳制在 `[1, TOKEN_LEDGER_HISTORY_MAX_DAYS]`：0/负数
-       * 按「仅今日」处理（省略 = 全部历史），超过上限裁到上限 —— 落盘本身
-       * 只保留 90 天，更大的窗口只会白算。
+       * `sinceDays` 钳制在 `[1, TOKEN_LEDGER_HISTORY_MAX_DAYS]`；也支持 fromDay / toDay
+       * 按 UTC+8 日键做闭区间查询。落盘本身只保留 90 天。
        */
       case 'usage.tokenLedgerHistory': {
         const req = payload as RpcUsageTokenLedgerHistoryRequest
@@ -4567,7 +4566,9 @@ function registerJetHubEndpoints(
         const sinceDays = typeof raw === 'number' && Number.isFinite(raw)
           ? Math.min(Math.max(Math.trunc(raw), 1), TOKEN_LEDGER_HISTORY_MAX_DAYS)
           : undefined
-        const result = readTokenLedgerHistory(readTokenLedgerDayMap(), { sinceDays })
+        const fromDay = isValidTokenLedgerDayKey(req?.fromDay) ? req.fromDay : undefined
+        const toDay = isValidTokenLedgerDayKey(req?.toDay) ? req.toDay : undefined
+        const result = readTokenLedgerHistory(readTokenLedgerDayMap(), { sinceDays, fromDay, toDay })
         const value: RpcUsageTokenLedgerHistoryResponse = { history: result.days, totals: result.totals }
         return { ok: true, value }
       }

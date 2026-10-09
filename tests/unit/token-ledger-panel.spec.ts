@@ -62,20 +62,20 @@ describe('formatTokenCount', () => {
 })
 
 describe('tokenSummaryText / entryTokenText', () => {
-  it('汇总：↓↑ 恒显，缓存/推理 >0 才显示', () => {
-    expect(tokenSummaryText({ inputTokens: 1200, outputTokens: 340 })).toBe('总处理 1,540 ↓1,200 ↑340')
+  it('汇总：默认只显示总处理量，拆分放在悬浮详情', () => {
+    expect(tokenSummaryText({ inputTokens: 1200, outputTokens: 340 })).toBe('总处理 1,540')
     expect(tokenSummaryText({ inputTokens: 1200, outputTokens: 340, cacheReadTokens: 800, reasoningTokens: 56 }))
-      .toBe('总处理 2,340 ↓1,200 ↑340 ⚡800 🧠56')
+      .toBe('总处理 2,340')
     expect(tokenSummaryText({ inputTokens: 1200, outputTokens: 340, cacheWriteTokens: 9 }))
-      .toBe('总处理 1,540 ↓1,200 ↑340 ✎9')
+      .toBe('总处理 1,540')
     // 0 值段省略（不渲染恒 0 的装饰数字）
     expect(tokenSummaryText({ inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, reasoningTokens: 0 }))
-      .toBe('总处理 3 ↓1 ↑2')
+      .toBe('总处理 3')
   })
 
   it('明细行：未收到 usage 显示 —，与「用了 0」严格区分', () => {
     expect(entryTokenText({ usageReported: false, inputTokens: 0, outputTokens: 0 })).toBe('—')
-    expect(entryTokenText({ usageReported: true, inputTokens: 0, outputTokens: 0 })).toBe('总处理 0 ↓0 ↑0')
+    expect(entryTokenText({ usageReported: true, inputTokens: 0, outputTokens: 0 })).toBe('总处理 0')
     expect(entryTokenText(null)).toBe('—')
     expect(entryTokenText(undefined)).toBe('—')
   })
@@ -165,7 +165,7 @@ describe('均值口径说明', () => {
   it('★ 全部均值格必须挂口径 tooltip（7 处调用点不得漏）', () => {
     // 收敛到 perfCell 一个 helper：逐个调用点各写一份 title 时必然会漏。
     expect(client).toMatch(/const perfCell = \(row\) =>/s)
-    expect(client).toMatch(/className: 'dim-jh-ledgerPerf',\s*title: avgPerfTooltip\(\)/)
+    expect(client).toMatch(/className: 'dim-jh-ledgerPerf',\s*title: avgPerfDetailTooltip\(row\)/)
     // 不得再有裸的 avgPerfText 调用（那是没有 tooltip 的漏网渲染）。
     const rawCalls = client.match(/className: 'dim-jh-ledgerPerf' \}, avgPerfText\(/g) ?? []
     expect(rawCalls).toEqual([])
@@ -173,19 +173,16 @@ describe('均值口径说明', () => {
     expect((client.match(/perfCell\(/g) ?? []).length).toBe(7)
     // ⚠️ 余下那处 ledgerPerf 是历史区的「合计」格（无均值、无需口径说明）——
     // 刻意不要求它挂 tooltip，故不能断言 ledgerPerf 全文只出现一次。
-    expect(client).toContain('合计 ↓')
+    expect(client).toContain('总处理 ')
   })
 
-  it('弹窗说明里也点明「算术平均」与离群敏感（tooltip 之外的第二处口径来源）', () => {
-    // 提示段落：用户不一定会去悬停均值格。
+  it('弹窗提示用户可悬停查看完整口径', () => {
     // ⚠️ 判据必须锚在「Token 用量」那处弹窗：全文件有 13 处 modalHint
     // （多个弹窗复用），按位置切片会切到别的弹窗上去。
     const modalIdx = client.indexOf("'aria-label': 'Token 用量'")
     expect(modalIdx).toBeGreaterThan(-1)
     const hint = client.slice(modalIdx, client.indexOf('dim-jh-modalBody', modalIdx))
-    expect(hint).toContain('100ms')
-    expect(hint).toContain('算术平均')
-    expect(hint).toContain('离群')
+    expect(hint).toContain('悬停数字查看 Token 拆分与性能口径')
   })
 })
 
@@ -209,7 +206,7 @@ describe('首字用时与速率（第 3 期）', () => {
     expect(avgPerfText(undefined)).toBe('—')
     expect(avgPerfText({})).toBe('—')
     expect(avgPerfText({ avgTtftMs: 850 })).toBe('首字 850ms')
-    expect(avgPerfText({ avgTps: 48.2 })).toBe('首字 — · 均值 48.2 tok/s')
+    expect(avgPerfText({ avgTps: 48.2 })).toBe('均值 48.2 tok/s')
     expect(avgPerfText({ avgTtftMs: 1200, avgTps: 51.5 })).toBe('首字 1.2s · 均值 51.5 tok/s')
   })
 })
