@@ -63,7 +63,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { resolveJetHubHome } from './jet-hub-store.js'
-import { mergeDayEntry, type TokenLedgerDayBucket, type TokenLedgerDayMap } from './token-ledger.js'
+import { isValidTokenLedgerDayKey, mergeDayEntry, type TokenLedgerDayBucket, type TokenLedgerDayMap } from './token-ledger.js'
 
 /** 独立文档的文件名（与 state.json 同目录）。 */
 export const TOKEN_LEDGER_FILE = 'token-ledger.json'
@@ -75,6 +75,21 @@ export const TOKEN_LEDGER_DAYS = 90
 export const TOKEN_LEDGER_FLUSH_MS = 2_000
 
 const SCHEMA = 'dsh-codearts-auth/token-ledger/v1'
+
+/** 从本地文件读数时拒绝负数、NaN 和无穷值；计数类字段再截为整数。 */
+function storedNumber(value: unknown, integer = true): number {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number < 0) return 0
+  return integer ? Math.trunc(number) : number
+}
+
+function isValidBucketKey(key: string): boolean {
+  const parts = key.split('|')
+  return parts.length === 4
+    && (parts[0] === 'direct' || parts[0] === 'gateway')
+    && parts[1].length > 0
+    && parts[3].length > 0
+}
 
 /** 日聚合的持久化后端接口（同步读、节流异步写）。 */
 export interface TokenLedgerStore {
@@ -167,38 +182,51 @@ class FileLedgerStore implements TokenLedgerStore {
     try {
       if (!existsSync(this.path)) return out
       const parsed = JSON.parse(readFileSync(this.path, 'utf-8')) as unknown
-      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return out
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        throw new Error('账本根节点不是对象')
+      }
       const record = parsed as { days?: unknown }
-      if (typeof record.days !== 'object' || record.days === null || Array.isArray(record.days)) return out
+      if (typeof record.days !== 'object' || record.days === null || Array.isArray(record.days)) {
+        throw new Error('账本缺少有效的 days 对象')
+      }
       for (const [day, rawBuckets] of Object.entries(record.days as Record<string, unknown>)) {
+        if (!isValidTokenLedgerDayKey(day)) continue
         if (typeof rawBuckets !== 'object' || rawBuckets === null || Array.isArray(rawBuckets)) continue
         const bucketList = rawBuckets as Record<string, unknown>
         const target = new Map<string, TokenLedgerDayBucket>()
         for (const [key, rawBucket] of Object.entries(bucketList)) {
-          if (typeof rawBucket !== 'object' || rawBucket === null) continue
+          if (!isValidBucketKey(key) || typeof rawBucket !== 'object' || rawBucket === null || Array.isArray(rawBucket)) continue
           const b = rawBucket as Record<string, unknown>
-          // 数值字段全部钳制（手工编辑/旧版本的脏数据不致命，但也不能 NaN）。
+          // 数值字段统一校验（手工编辑/旧版本的脏数据不致命，也不能让负值污染汇总）。
           target.set(key, {
-            requests: Number(b.requests) || 0,
-            reportedRequests: Number(b.reportedRequests) || 0,
-            inputTokens: Number(b.inputTokens) || 0,
-            outputTokens: Number(b.outputTokens) || 0,
-            cacheReadTokens: Number(b.cacheReadTokens) || 0,
-            cacheWriteTokens: Number(b.cacheWriteTokens) || 0,
-            reasoningTokens: Number(b.reasoningTokens) || 0,
-            errors: Number(b.errors) || 0,
+            requests: storedNumber(b.requests),
+            reportedRequests: storedNumber(b.reportedRequests),
+            inputTokens: storedNumber(b.inputTokens),
+            outputTokens: storedNumber(b.outputTokens),
+            cacheReadTokens: storedNumber(b.cacheReadTokens),
+            cacheWriteTokens: storedNumber(b.cacheWriteTokens),
+            reasoningTokens: storedNumber(b.reasoningTokens),
+            errors: storedNumber(b.errors),
             // Σ/份数（第 3 期均值）：旧文档没这些键 → 0（等价于无样本）。
-            ttftSumMs: Number(b.ttftSumMs) || 0,
-            ttftCount: Number(b.ttftCount) || 0,
-            tpsSum: Number(b.tpsSum) || 0,
-            tpsCount: Number(b.tpsCount) || 0,
+            ttftSumMs: storedNumber(b.ttftSumMs),
+            ttftCount: storedNumber(b.ttftCount),
+            tpsSum: storedNumber(b.tpsSum, false),
+            tpsCount: storedNumber(b.tpsCount),
           })
         }
         out.set(day, target)
       }
     } catch (error) {
-      // 损坏按空表处理（统计型数据不值得阻断启动）。
-      this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，历史用量按空表处理: ${String(error)}`)
+      // 保留损坏原件，避免后续正常 flush 用空表覆盖，统计问题不阻断启动。
+      const backupStamp = Date.now()
+      let backupPath = `${this.path}.corrupt-${backupStamp}`
+      for (let suffix = 1; existsSync(backupPath); suffix++) backupPath = `${this.path}.corrupt-${backupStamp}-${suffix}`
+      try {
+        if (existsSync(this.path)) renameSync(this.path, backupPath)
+      } catch (backupError) {
+        this.logger?.warn(`[jet-hub] 账本损坏且备份失败 ${this.path}: ${String(backupError)}`)
+      }
+      this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，已尝试保留损坏文件 ${backupPath}: ${String(error)}`)
       return new Map()
     }
     return out

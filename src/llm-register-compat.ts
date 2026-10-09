@@ -113,7 +113,7 @@ export interface AdapterRegisterTarget {
   registerAdapter(providers: readonly string[], adapter: unknown): unknown
 }
 
-import { recordTokenUsage, peekLedgerAccount } from './token-ledger.js'
+import { recordTokenUsage, withTokenLedgerAccountContext } from './token-ledger.js'
 import { channelOfOptions } from './openai-gateway/channel.js'
 
 /**
@@ -253,16 +253,14 @@ export async function* recordThroughStream(
    */
   let ttftMs = 0
   /**
-   * 账号归属（第 2 期）：**usage 帧到达时**从回报表读取（彼时凭据必然已
-   * 解析 —— `resolveCredential` / 池查询先于任何 SSE 帧）。流开始前读取
-   * 会拿到「上一笔请求的账号」（生成器懒执行的时序陷阱），在 usage 帧
-   * 时读才是「本笔请求已解析出凭据」的时刻。精度边界见
-   * `token-ledger.ts` 的 `reportedAccounts` 注释。
+   * 账号归属存于本次流独立上下文。流开始前读取 provider 全局值可能拿到
+   * 并发请求的账号，因此只接受适配器推进当前流时回报的账号。
    */
   let accountId = ''
+  const accountContext = { accountId: '' }
   let failure: string | undefined
   try {
-    for await (const chunk of openStream()) {
+    for await (const chunk of withTokenLedgerAccountContext(openStream(), accountContext)) {
       // 首块计时：任何 chunk（思考/正文/工具调用都算「模型开始说话」）。
       // ⚠️ 必须在具体类型判断**之前**：漏块会让「只有思考增量的慢启动」被记成 0。
       if (ttftMs === 0) ttftMs = Date.now() - meta.startedAt
@@ -273,13 +271,24 @@ export async function* recordThroughStream(
         // dsh-llm 契约：usage chunk 的形状 { type:'usage', usage: TokenUsage }。
         const usage = (chunk as { usage?: Record<string, unknown> }).usage
         if (typeof usage === 'object' && usage !== null) {
+          // usage 帧是整笔请求的累计快照；后到帧覆盖前帧。坏值/缺字段不覆盖
+          // 已收到的有效快照，避免上游不完整帧把已有 token 统计清零或变成 NaN。
           usageReported = true
-          inputTokens = Number(usage.inputTokens)
-          outputTokens = Number(usage.outputTokens)
-          if (Number(usage.cacheReadTokens) > 0) cacheReadTokens = Number(usage.cacheReadTokens)
-          if (Number(usage.cacheWriteTokens) > 0) cacheWriteTokens = Number(usage.cacheWriteTokens)
-          if (Number(usage.reasoningTokens) > 0) reasoningTokens = Number(usage.reasoningTokens)
-          if (accountId === '') accountId = peekLedgerAccount(meta.provider)
+          const readCount = (value: unknown): number | undefined => {
+            const count = Number(value)
+            return Number.isFinite(count) && count >= 0 ? Math.trunc(count) : undefined
+          }
+          const input = readCount(usage.inputTokens)
+          const output = readCount(usage.outputTokens)
+          const cacheRead = readCount(usage.cacheReadTokens)
+          const cacheWrite = readCount(usage.cacheWriteTokens)
+          const reasoning = readCount(usage.reasoningTokens)
+          if (input !== undefined) inputTokens = input
+          if (output !== undefined) outputTokens = output
+          if (cacheRead !== undefined) cacheReadTokens = cacheRead > 0 ? cacheRead : undefined
+          if (cacheWrite !== undefined) cacheWriteTokens = cacheWrite > 0 ? cacheWrite : undefined
+          if (reasoning !== undefined) reasoningTokens = reasoning > 0 ? reasoning : undefined
+          if (accountId === '') accountId = accountContext.accountId
         }
       }
       yield chunk
@@ -290,9 +299,9 @@ export async function* recordThroughStream(
   } finally {
     // ⚠️ finally 里记账（而不是成功分支）：cancel / 提前 return / 抛错都必须落账。
     // durationMs 用「现在 − 发起」：成功与失败同口径，就是请求全程耗时。
-    // 账号兜底：失败请求可能没等到 usage 帧（彼时才读账号）——失败行的
-    // 归属退回「最后一次解析出的账号」，比留空有用（排查「哪个号挂了」）。
-    if (accountId === '') accountId = peekLedgerAccount(meta.provider)
+    // 失败请求使用本流已回报的账号；若凭据解析前就失败则保持未归属，
+    // 不借用其他并发请求的账号。
+    if (accountId === '') accountId = accountContext.accountId
     recordTokenUsage({
       channel: meta.channel,
       provider: meta.provider,
