@@ -176,7 +176,7 @@ export function rangeDaysOf(key) {
   return hit === undefined ? 0 : hit.days;
 }
 
-/** 今日的 UTC+8 日键（与服务端 utc8DayKey 同算法；用于高亮柱状图当前日）。 */
+/** 今日的 UTC+8 日键（与服务端 utc8DayKey 同算法；用于高亮热力图当前日）。 */
 export function todayDayKey() {
   const shifted = new Date(Date.now() + 8 * 60 * 60 * 1000);
   const pad = (x) => String(x).padStart(2, '0');
@@ -215,69 +215,6 @@ export function historyHeatmapCells(historyDays, days = 30, endDay = todayDayKey
     }
   }
   return rows;
-}
-
-/**
- * 趋势图数据：每日一行（日键 + token 合计 + 请求数），新在前，最多 maxBars 根。
- *
- * ⚠️ 缺数据的天**不补零**（历史里没有键就是没用过）—— 补零需要造日历序列，
- * 会让「最近 30 天」在数据稀疏时出现一长排空柱，观感差且信息量为零。
- */
-export function trendBars(historyDays, maxBars = 30) {
-  const list = Array.isArray(historyDays) ? historyDays : [];
-  const today = todayDayKey();
-  return list.slice(0, maxBars).map((d) => ({
-    day: d?.day ?? '',
-    isToday: d?.day === today,
-    requests: d?.totals?.requests ?? 0,
-    tokens: totalTokensOf(d?.totals),
-  }));
-}
-
-/** 柱高下限：极小值也能看见柱子（否则只在最大值那根可见）。 */
-export const BAR_HEIGHT_MIN_PERCENT = 4;
-/** 柱高上限：留出顶部空白，描边与圆角才不会被容器裁掉。 */
-export const BAR_HEIGHT_MAX_PERCENT = 88;
-/** 相对区间宽度：非最大柱能落在 [MIN, MIN+SPAN] 内，最大柱封顶 MAX。 */
-export const BAR_HEIGHT_SPAN_PERCENT = 84;
-/** 孤柱高度：单日窗口下唯一那根（相对比较无意义，给固定值更像「一根柱子」）。 */
-export const BAR_HEIGHT_SINGLE_PERCENT = 72;
-
-/**
- * 柱高百分比（相对窗口内最大值）。
- *
- * ⚠️ **必须有上限**（真实缺陷，用户 2026-10-07 报障）：单日窗口（`today`）下
- * 「今日」既是最大值又是它自己，比值恒为 `t/max = 1` ⇒ 高度 100% ⇒ 唯一那根柱
- * 撑满 64px 容器；`flex: 1 0 14px` 又把它横向拉满整行，于是**一柱独占成
- * 一整条白块**，点开展开后又被卡片挤成竖条 —— 看着像「点击后尺寸突变」，
- * 实则是同一根柱在两种容器宽度下的两种表现。
- *
- * 上限的另一层用意：全等高时不许「一根顶天、其余贴地」的观感。最大值那根
- * 给 {@link BAR_HEIGHT_MAX_PERCENT}（留白让描边与圆角可见），其余按比例缩放
- * 到 {@link BAR_HEIGHT_SPAN_PERCENT} 的区间里 —— 保持相对关系不失真。
- *
- * @param tokens - 该柱的 token 合计。
- * @param maxTokens - 窗口内最大 token 合计（0/垃圾值按 0 处理）。
- * @param barCount - 窗口内的柱子**根数**；只有一根时用固定孤柱高（避免孤柱独占）。
- */
-export function barHeightPercent(tokens, maxTokens, barCount = 0) {
-  const max = typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 0;
-  const t = typeof tokens === 'number' && tokens > 0 ? tokens : 0;
-  if (max === 0 || t === 0) return 0;
-  const ratio = t / max;
-  // ⚠️ 孤柱（单日窗口）不参与满量程比较：恒 100% 的那根就是「白块」本体。
-  if (barCount <= 1) return BAR_HEIGHT_SINGLE_PERCENT;
-  // 最大值那根给满量程上限，其余按比例压进 [保底, 满量程上限] 区间。
-  const scaled = BAR_HEIGHT_MIN_PERCENT + ratio * BAR_HEIGHT_SPAN_PERCENT;
-  return Math.round(Math.min(BAR_HEIGHT_MAX_PERCENT, Math.max(BAR_HEIGHT_MIN_PERCENT, scaled)));
-}
-
-/** 柱子的日期短标签（`MM-DD`；非法日键 → 空串，由调用方降级为不渲染）。 */
-export function barDayLabel(day) {
-  if (typeof day !== 'string' || day.length < 10) return '';
-  const m = day.slice(5, 7);
-  const d = day.slice(8, 10);
-  return /^\d{2}-\d{2}$/.test(m + '-' + d) ? m + '-' + d : '';
 }
 
 /** 历史窗口标题（弹窗内小节标题）。 */
