@@ -39,14 +39,15 @@ export function channelOrder(a, b) {
 }
 
 /**
- * 一行 token 汇总的**紧凑文本**（`↓1.2K ↑340 ⚡800 🧠56`）。
+ * 一行 token 汇总的紧凑文本，明确给出处理量及输入/输出/缓存拆分。
  *
  * ⚠️ 与 Cline 请求表同款约定：只渲染**有值**的段 —— 缓存/推理为 0 时整段
  * 省略，避免一排恒 0 的装饰性数字稀释真正有用的读数。
  */
 export function tokenSummaryText(row) {
   if (!row || typeof row !== 'object') return '—';
-  const parts = ['↓' + formatTokenCount(row.inputTokens ?? 0), '↑' + formatTokenCount(row.outputTokens ?? 0)];
+  const total = row.totalTokens ?? (Number(row.inputTokens ?? 0) + Number(row.cacheReadTokens ?? 0) + Number(row.outputTokens ?? 0));
+  const parts = ['总处理 ' + formatTokenCount(total), '↓' + formatTokenCount(row.inputTokens ?? 0), '↑' + formatTokenCount(row.outputTokens ?? 0)];
   if ((row.cacheReadTokens ?? 0) > 0) parts.push('⚡' + formatTokenCount(row.cacheReadTokens));
   if ((row.cacheWriteTokens ?? 0) > 0) parts.push('✎' + formatTokenCount(row.cacheWriteTokens));
   if ((row.reasoningTokens ?? 0) > 0) parts.push('🧠' + formatTokenCount(row.reasoningTokens));
@@ -97,7 +98,7 @@ export function formatTps(entry) {
 }
 
 /**
- * 均值格（汇总行）：`avg 0.9s · 48 tok/s`；两边都不可测 → `—`。
+ * 性能格显示均值与稳健分位数；没有完整分布样本时只显示均值。
  *
  * ⚠️ 速率是**算术均值**，对离群样本敏感（用户 2026-10-07 报障「982.5 tok/s」）。
  * 服务端已丢弃 `decodeMs` 过短（分母塌缩）的样本，但混合分布下均值仍可能
@@ -105,9 +106,12 @@ export function formatTps(entry) {
  */
 export function avgPerfText(row) {
   const ttft = typeof row?.avgTtftMs === 'number' && row.avgTtftMs > 0 ? formatDuration(row.avgTtftMs) : null;
-  const tps = typeof row?.avgTps === 'number' && row.avgTps > 0 ? row.avgTps + ' tok/s' : null;
-  if (ttft === null && tps === null) return '—';
-  return '首字 ' + (ttft ?? '—') + ' · ' + (tps ?? '—');
+  const speeds = [];
+  if (typeof row?.avgTps === 'number' && row.avgTps > 0) speeds.push('均值 ' + row.avgTps);
+  if (typeof row?.p50Tps === 'number' && row.p50Tps > 0) speeds.push('P50 ' + row.p50Tps);
+  if (typeof row?.p90Tps === 'number' && row.p90Tps > 0) speeds.push('P90 ' + row.p90Tps);
+  if (ttft === null && speeds.length === 0) return '—';
+  return '首字 ' + (ttft ?? '—') + (speeds.length > 0 ? ' · ' + speeds.join(' / ') + ' tok/s' : '');
 }
 
 /**
@@ -120,11 +124,11 @@ export function avgPerfText(row) {
  * （已实测：单笔 decode=1ms 的样本能把均值从 184 拉到 634592）。
  */
 export function avgPerfTooltip() {
-  return '均值口径：对有实测值的请求取算术平均。'
-    + '「首字」= 首个 chunk 到达前的耗时；'
+  return '均值口径：对有实测值的请求取算术平均；P50/P90 为完整样本的对数直方图估算，桶宽约 9%。'
+    + '「首字」= 首个内容 chunk 到达前的耗时；'
     + '「速率」= 全部输出 token ÷（首块之后 → 结束）的时长，'
     + '要求解码时长 ≥ 100ms（过短视为不可测、不计入）。'
-    + '算术均值对离群样本敏感：个别极快/极慢的请求会明显拉高或拉低该值。';
+    + '算术均值对离群样本敏感；旧版日账本没有分布数据，完成升级后新累计的完整日期才显示 P50/P90。';
 }
 
 // ───────────────────── 历史视图（第 4 期）─────────────────────
@@ -163,7 +167,7 @@ export function trendBars(historyDays, maxBars = 30) {
     day: d?.day ?? '',
     isToday: d?.day === today,
     requests: d?.totals?.requests ?? 0,
-    tokens: (d?.totals?.inputTokens ?? 0) + (d?.totals?.outputTokens ?? 0),
+    tokens: d?.totals?.totalTokens ?? ((d?.totals?.inputTokens ?? 0) + (d?.totals?.cacheReadTokens ?? 0) + (d?.totals?.outputTokens ?? 0)),
   }));
 }
 

@@ -63,19 +63,19 @@ describe('formatTokenCount', () => {
 
 describe('tokenSummaryText / entryTokenText', () => {
   it('汇总：↓↑ 恒显，缓存/推理 >0 才显示', () => {
-    expect(tokenSummaryText({ inputTokens: 1200, outputTokens: 340 })).toBe('↓1,200 ↑340')
+    expect(tokenSummaryText({ inputTokens: 1200, outputTokens: 340 })).toBe('总处理 1,540 ↓1,200 ↑340')
     expect(tokenSummaryText({ inputTokens: 1200, outputTokens: 340, cacheReadTokens: 800, reasoningTokens: 56 }))
-      .toBe('↓1,200 ↑340 ⚡800 🧠56')
+      .toBe('总处理 2,340 ↓1,200 ↑340 ⚡800 🧠56')
     expect(tokenSummaryText({ inputTokens: 1200, outputTokens: 340, cacheWriteTokens: 9 }))
-      .toBe('↓1,200 ↑340 ✎9')
+      .toBe('总处理 1,540 ↓1,200 ↑340 ✎9')
     // 0 值段省略（不渲染恒 0 的装饰数字）
     expect(tokenSummaryText({ inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, reasoningTokens: 0 }))
-      .toBe('↓1 ↑2')
+      .toBe('总处理 3 ↓1 ↑2')
   })
 
   it('明细行：未收到 usage 显示 —，与「用了 0」严格区分', () => {
     expect(entryTokenText({ usageReported: false, inputTokens: 0, outputTokens: 0 })).toBe('—')
-    expect(entryTokenText({ usageReported: true, inputTokens: 0, outputTokens: 0 })).toBe('↓0 ↑0')
+    expect(entryTokenText({ usageReported: true, inputTokens: 0, outputTokens: 0 })).toBe('总处理 0 ↓0 ↑0')
     expect(entryTokenText(null)).toBe('—')
     expect(entryTokenText(undefined)).toBe('—')
   })
@@ -208,9 +208,9 @@ describe('首字用时与速率（第 3 期）', () => {
   it('avgPerfText：两边都无 → —；单边有值时另一边占位', () => {
     expect(avgPerfText(undefined)).toBe('—')
     expect(avgPerfText({})).toBe('—')
-    expect(avgPerfText({ avgTtftMs: 850 })).toBe('首字 850ms · —')
-    expect(avgPerfText({ avgTps: 48.2 })).toBe('首字 — · 48.2 tok/s')
-    expect(avgPerfText({ avgTtftMs: 1200, avgTps: 51.5 })).toBe('首字 1.2s · 51.5 tok/s')
+    expect(avgPerfText({ avgTtftMs: 850 })).toBe('首字 850ms')
+    expect(avgPerfText({ avgTps: 48.2 })).toBe('首字 — · 均值 48.2 tok/s')
+    expect(avgPerfText({ avgTtftMs: 1200, avgTps: 51.5 })).toBe('首字 1.2s · 均值 51.5 tok/s')
   })
 })
 
@@ -228,7 +228,7 @@ describe('历史视图（第 4 期）', () => {
     expect(todayDayKey()).toMatch(/^\d{4}-\d{2}-\d{2}$/)
   })
 
-  it('trendBars：取前 N 根、标记今天、token 合计 = 输入+输出', () => {
+  it('trendBars：取前 N 根、标记今天、总处理量含缓存命中输入', () => {
     const history = [
       { day: todayDayKey(), totals: { requests: 3, inputTokens: 100, outputTokens: 50 } },
       { day: '2026-10-04', totals: { requests: 1, inputTokens: 10, outputTokens: 5 } },
