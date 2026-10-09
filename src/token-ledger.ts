@@ -194,6 +194,19 @@ let ledger: TokenLedgerEntry[] = []
 const reportedAccounts = new Map<string, string>()
 const requestAccount = new AsyncLocalStorage<{ accountId: string }>()
 
+/** 为一次调用创建可跨 prepareCall 与 stream 传递的账号上下文。 */
+export function createTokenLedgerAccountContext(): { accountId: string } {
+  return { accountId: '' }
+}
+
+/** 在指定调用上下文中执行同步或异步工作。 */
+export function runWithTokenLedgerAccountContext<T>(
+  context: { accountId: string },
+  action: () => T,
+): T {
+  return requestAccount.run(context, action)
+}
+
 /**
  * 回报本请求解析出的账号（凭据解析点调用）。
  *
