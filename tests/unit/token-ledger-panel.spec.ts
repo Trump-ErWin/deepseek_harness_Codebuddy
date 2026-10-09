@@ -6,11 +6,6 @@ import {
   accountLabel,
   avgPerfText,
   avgPerfTooltip,
-  barDayLabel,
-  barHeightPercent,
-  BAR_HEIGHT_MAX_PERCENT,
-  BAR_HEIGHT_MIN_PERCENT,
-  BAR_HEIGHT_SINGLE_PERCENT,
   channelCardTitle,
   channelLabel,
   channelOrder,
@@ -22,13 +17,13 @@ import {
   formatTokenCount,
   filterChannelsBySelection,
   hasAnyData,
+  historyHeatmapCells,
   historyTitle,
   HISTORY_RANGES,
   ledgerSubtitle,
   rangeDaysOf,
   tokenSummaryText,
   todayDayKey,
-  trendBars,
 } from '../../plugin-src/client/token-ledger-panel.js'
 
 /** 源码契约测试用：定位仓库根下的 src/ 与 plugin-src/。 */
@@ -232,79 +227,19 @@ describe('历史视图（第 4 期）', () => {
     expect(todayDayKey()).toMatch(/^\d{4}-\d{2}-\d{2}$/)
   })
 
-  it('trendBars：取前 N 根、标记今天、总处理量含缓存命中输入', () => {
+  it('historyHeatmapCells：补齐缺失日期、按用量分档并标记真实今天', () => {
     const history = [
-      { day: todayDayKey(), totals: { requests: 3, inputTokens: 100, outputTokens: 50 } },
-      { day: '2026-10-04', totals: { requests: 1, inputTokens: 10, outputTokens: 5 } },
-      { day: '2026-10-03', totals: { requests: 0, inputTokens: 0, outputTokens: 0 } },
+      { day: '2026-10-07', totals: { requests: 1, inputTokens: 25, outputTokens: 25 } },
+      { day: '2026-10-09', totals: { requests: 3, inputTokens: 100 } },
     ]
-    const bars = trendBars(history)
-    expect(bars).toHaveLength(3)
-    expect(bars[0]!.isToday).toBe(true)
-    expect(bars[0]!.tokens).toBe(150)
-    expect(bars[2]!.tokens).toBe(0)
-    // maxBars 截断
-    expect(trendBars(history, 2)).toHaveLength(2)
-    expect(trendBars(undefined)).toEqual([])
-  })
-
-  it('barHeightPercent：相对关系保真、封顶不撑满；零值/无数据为 0', () => {
-    // ⚠️ 语义（2026-10-07 缺陷修复后）：非最大柱落在
-    // [MIN, MIN+SPAN] = [4, 88]，不再用「占满 100%」当最大值 ——
-    // 单日窗口下 t/max 恒为 1，那正是「一柱撑满成白块」的根因。
-    const mx = 300
-    // 相对值 50% → 4 + 0.5*84 = 46（不再是被 100% 量程拉满的 50）
-    expect(barHeightPercent(150, mx, 7)).toBe(46)
-    // ⚠️ 下限 4% 在 `ratio > 0` 时**几乎取不到**（4 + 0*84 = 4，但 ratio
-    // 最小也要 4.84 → 5）。它真正兜的是 `ratio → 0` 的极小值不被压成 0。
-    expect(barHeightPercent(3, mx, 7)).toBe(5)
-    // 下限不变式：任何非零 token 都不得低于 MIN（否则小日子「看不见」）。
-    expect(barHeightPercent(1, mx, 7)).toBeGreaterThanOrEqual(BAR_HEIGHT_MIN_PERCENT)
-    expect(barHeightPercent(1, mx, 7)).toBeGreaterThan(0)
-    expect(barHeightPercent(0, mx, 7)).toBe(0)
-    expect(barHeightPercent(150, 0, 7)).toBe(0)
-    // 垃圾输入不抛错。
-    expect(barHeightPercent(Number.NaN, mx, 7)).toBe(0)
-  })
-
-  it('★ 柱高**绝不为 100%**（单日窗口不再撑满成「白块」）', () => {
-    // 单日窗口只有一根柱：它既是最大值又是自己，t/max 恒为 1。
-    // 修复前恒返回 100 → 撑满 64px 容器 → 「整条白块」。
-    const only = 604700 + 1439500
-    expect(barHeightPercent(only, only, 1)).toBe(BAR_HEIGHT_SINGLE_PERCENT)
-    expect(barHeightPercent(only, only, 1)).toBeLessThan(100)
-    // 未传根数（默认 0）同样按孤柱处理，不能退回 100%。
-    expect(barHeightPercent(only, only)).toBeLessThan(100)
-    // 任意 token 值 × 任意根数，都不得出现 100。
-    for (const count of [0, 1, 2, 7, 30]) {
-      expect(barHeightPercent(999, 999, count)).toBeLessThan(100)
-      expect(barHeightPercent(999, 1000, count)).toBeLessThan(100)
-    }
-  })
-
-  it('柱高：最大值封顶且单调不增、每根都可见（相对关系不失真）', () => {
-    const vals = [1000, 900, 500, 250, 100, 50, 20]
-    const heights = vals.map((v) => barHeightPercent(v, vals[0]!, vals.length))
-    // 最大柱封顶（留顶部空白，描边与圆角不被裁）。
-    expect(heights[0]).toBe(BAR_HEIGHT_MAX_PERCENT)
-    expect(heights.every((h) => h <= BAR_HEIGHT_MAX_PERCENT)).toBe(true)
-    // 相对关系保真：token 降序 ⇒ 柱高不增。
-    expect(heights.every((h, i) => i === 0 || h <= heights[i - 1]!)).toBe(true)
-    // 每根非空柱都可见（不能只有最大值那根可见）。
-    expect(heights.every((h) => h > 0)).toBe(true)
-    // 全等高不应「一根顶天」：封顶后三根同高。
-    expect([10, 10, 10].map((v) => barHeightPercent(v, 10, 3))).toEqual([88, 88, 88])
-  })
-
-  it('barDayLabel：YYYY-MM-DD → MM-DD；非法输入空串（调用方降级不渲染）', () => {
-    expect(barDayLabel('2026-10-07')).toBe('10-07')
-    expect(barDayLabel('2026-01-01')).toBe('01-01')
-    // 补零必须保留（'2026-1-7' 的 slice 仍是 '1-7' 形态，不该被当合法）。
-    expect(barDayLabel('xx')).toBe('')
-    expect(barDayLabel('')).toBe('')
-    expect(barDayLabel(null)).toBe('')
-    expect(barDayLabel(undefined)).toBe('')
-    expect(barDayLabel('2026-10-07T00:00:00Z')).toBe('10-07')
+    const cells = historyHeatmapCells(history, 5, '2026-10-09')
+    expect(cells.map((cell) => cell.day)).toEqual([
+      '2026-10-05', '2026-10-06', '2026-10-07', '2026-10-08', '2026-10-09',
+    ])
+    expect(cells.map((cell) => cell.tokens)).toEqual([0, 0, 50, 0, 100])
+    expect(cells.map((cell) => cell.level)).toEqual([0, 0, 2, 0, 4])
+    expect(historyHeatmapCells(undefined, 1, todayDayKey())[0]?.isToday).toBe(true)
+    expect(historyHeatmapCells(undefined, 5, '2026-01-05').every((cell) => !cell.isToday)).toBe(true)
   })
 
   it('historyTitle：窗口 key → 标题；未知回退「全部」', () => {
@@ -327,7 +262,7 @@ describe('历史视图（第 4 期）', () => {
  *
  * 为什么两侧单测都拦不住：`token-ledger.spec.ts` 只测服务端函数返回
  * `{ days, totals }`（服务端内部形状，对 RPC 字段名无约束），
- * `token-ledger-panel.spec.ts` 只测纯函数 `trendBars`（喂数组，不碰响应体）。
+ * `token-ledger-panel.spec.ts` 只测纯函数热力图数据（喂数组，不碰响应体）。
  * 跨进程的那一层**两侧都够不着** —— 只能断言源码字面量。
  *
  * 判据用**字段名的存在性**（`history.history` / `history.days`）而非整段字面量：
@@ -368,39 +303,23 @@ describe('历史用量删除 · 范围隔离契约', () => {
   })
 })
 
-/**
- * ⚠️ 趋势柱状图的**渲染接线 + 样式**契约（真实缺陷 2026-10-07 的第二道闸门）。
- *
- * 症状：字段名修好后柱状图**第一次被真正渲染**，于是暴露出一个此前
- * 从未被看见的样式缺陷 —— 「今日」窗口只有一根柱，它既是最大值又是自己，
- * 高度恒 100% 撑满 64px 容器；`.dim-jh-ledgerTrendCol` 又是 `flex: 1 0 14px`
- * 把它横向拉满整行 ⇒ **一整条白块**；点开展开后被卡片挤成竖条 ⇒ 看着像
- * 「点击后尺寸突变」。
- *
- * 纯函数层已经锁死「柱高不为 100%」，但**渲染接线**仍可能不传根数（那会让
- * 孤柱重回 100%），**样式层**仍可能没有宽度上限（即便柱高对了，单柱仍会被
- * flex 拉满整行）。这两层只有断言源码才够得着。
- */
-describe('趋势柱状图 · 渲染接线与样式契约', () => {
+/** 热力图渲染接线契约：数据分档、四行样式与用户指定的简洁布局。 */
+describe('用量热力图 · 渲染接线与样式契约', () => {
   const styles = readFileSync(resolve(here, '../../plugin-src/client/jet-hub-styles.js'), 'utf8')
 
-  it('渲染必须把柱子根数传给 barHeightPercent（否则孤柱退回 100%）', () => {
-    expect(client).toMatch(/barHeightPercent\(\s*b\.tokens\s*,\s*maxTokens\s*,\s*bars\.length\s*\)/)
+  it('渲染热力图数据，并将档位交给色阶样式', () => {
+    expect(client).toMatch(/historyHeatmapCells\(historyDays,\s*heatmapDays,\s*heatmapEndDay\)/)
+    expect(client).toMatch(/'data-level': String\(cell\.level\)/)
   })
 
-  it('渲染必须渲染日期短标签（光靠色块无法区分哪天）', () => {
-    expect(client).toMatch(/barDayLabel\(b\.day\)/)
-    expect(client).toMatch(/dim-jh-ledgerTrendLabel/)
+  it('固定四行，且不渲染星期标签或少/多图例', () => {
+    expect(styles).toMatch(/\.dim-jh-ledgerHeatmap\s*\{[^}]*grid-template-rows:\s*repeat\(4,/s)
+    expect(client).not.toContain('dim-jh-ledgerHeatmapWeekdays')
+    expect(client).not.toContain('dim-jh-ledgerHeatmapLegend')
   })
 
-  it('柱列必须限宽：单根柱不能被 flex 拉满整行（白块的另一半根因）', () => {
-    const col = styles.slice(styles.indexOf('.dim-jh-ledgerTrendCol {'))
-    expect(col.slice(0, col.indexOf('}'))).toMatch(/max-width:\s*\d+px/)
-  })
-
-  it('柱子必须有可见描边：品牌变量与底色同色时不至于退化成白块', () => {
-    const bar = styles.slice(styles.indexOf('.dim-jh-ledgerTrendBar {'))
-    expect(bar.slice(0, bar.indexOf('}'))).toMatch(/box-shadow:/)
+  it('用量档位提高时颜色变深并增强青色发光', () => {
+    expect(styles).toMatch(/\.dim-jh-ledgerHeatmapCell\[data-level="4"\]\s*\{[^}]*background:\s*#0e7490[^}]*box-shadow:/s)
   })
 
   it('⚠️ 样式文件仍是合法的单段模板字符串（STYLES 内不得出现反引号）', () => {
