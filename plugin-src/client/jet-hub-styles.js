@@ -1055,7 +1055,52 @@ const PLUGIN_ID = 'dsh-codearts-auth'
 const STYLE_TAG_ID = PLUGIN_ID + '/jet-hub.css'
 
 /** 幂等判据用的选择器：按**资源标识**查自己的那张标签。 */
+/** 幂等判据用的选择器：按**资源标识**查自己那张标签。 */
 const STYLE_SELECTOR = 'style[data-plugin-css=' + JSON.stringify(STYLE_TAG_ID) + ']'
+
+/**
+ * 引用计数的挂载键。
+ *
+ * ⚠️⚠️ 计数必须挂在**元素**（dataset）上，不能挂在模块级变量上
+ * （真机实测 2026-10-09，issue IKKGYN）：
+ *
+ * 模块级变量只在**同一个模块实例**内有效，而宿主 replace 会先
+ * tearDownEntryFiber（它会 await 旧 fiber 的 inertia）再重新 import ——
+ * 新 factory 若跑在旧 dispose **之前**，就出现
+ * 「两个实例先后注入、disposer 交错执行」的交错。计数挂在 DOM 上则跨实例共享
+ * 同一份真相。
+ *
+ * ⚠️ 挂载后是 data-jet-hub-refs，是本插件**私有**属性名；
+ * 宿主 claimStyles / removeOwnedStyles 只认 data-plugin，不会碰它。
+ */
+const REFS_KEY = 'jetHubRefs'
+
+/** 当前挂在文档里的样式元素（不在就返回 null）。 */
+function styleElement() {
+  // ⚠️ 用字符串拼接而**不是**模板字符串：本文件的反引号数被单测钉死为 2
+  // （STYLES 的定界符），多一对就会命中「模板字符串被提前闭合」那条闸门。
+  return document.head.querySelector(STYLE_SELECTOR)
+}
+
+/** 插入一份样式表；已存在则**复用**（绝不新建第二份）。 */
+function mountStyles() {
+  const existing = styleElement()
+  if (existing !== null) return existing
+  const style = document.createElement('style')
+  // ⚠️ 署名是**关键**（issue IKK764）：claimStyles 只认领无主标签，
+  // removeOwnedStyles 只删自己名下的标签。
+  style.dataset.plugin = PLUGIN_ID
+  style.dataset.pluginCss = STYLE_TAG_ID
+  style.textContent = STYLES
+  document.head.appendChild(style)
+  return style
+}
+
+/** 把引用计数读成整数（缺失 / 非法一律当 0）。 */
+function refsOf(style) {
+  const n = Number(style.dataset[REFS_KEY])
+  return Number.isFinite(n) ? n : 0
+}
 
 /**
  * 注入 Jet Hub 的整张样式表。
@@ -1071,17 +1116,26 @@ const STYLE_SELECTOR = 'style[data-plugin-css=' + JSON.stringify(STYLE_TAG_ID) +
  *   条目被替换（replace）。
  *
  * 而 installJetHubStyles 是在 ctx.effect(...)（插件 apply 阶段）里注入的，
- * **必然晚于自己那次 claimStyles**。所以旧实现（无署名 + 模块级 injected 布尔）
- * 有双重缺陷：
+ * **必然晚于自己那次 claimStyles**。所以无署名版本有双重缺陷：
  *
  * 1. 标签**始终无主** ⇒ 之后任何一个插件物化都会把它认领走；那个插件一热重载 /
  *    被禁用 / 被卸载，宿主就把「它名下」的样式连根删掉 ⇒ **Jet Hub 整套 UI 掉样式**
  *    （.dim-jh-* 全量，不是局部）；
- * 2. injected 布尔让标签被外部删除后**永不再补注** ⇒ 只有整页刷新（模块重新求值）
- *    才恢复，用户看起来就像「这个插件坏了」。
+ * 2. 幂等按模块级布尔 ⇒ 标签被外部删除后**永不再补注**。
  *
- * 故这里：① 注入时**署名**（别的插件认领不到它、也不会替它删）；
- * ② 幂等改为**按 DOM 存在性判断**（标签被删掉后能自愈）。
+ * 故这里：① 注入时**署名**；② 幂等按**DOM 存在性**判断。
+ *
+ * ## ⚠️⚠️ 为什么 disposer 改用「闭包持有元素 + 元素上引用计数」（IKKGYN）
+ *
+ * 旧 disposer 是 document.querySelector(STYLE_SELECTOR)?.remove() ——
+ * 它删的是**「当前那张」**，不是「自己注入的那张」。只要出现
+ * 「新实例先注入、旧 disposer 后执行」的交错（宿主 replace 的
+ * tearDownEntryFiber 会 await 旧 fiber 的 inertia，故 dispose 天然晚于新的 apply），
+ * 旧 disposer 就会把**新注入的那张**删掉，且此后无人补注 ⇒ IKK764 的故障面重新打开。
+ * 本机 CDP 实测该时序确实成立（新表 1 份 → 旧 disposer 跑完 → 0 份）。
+ *
+ * 现在：disposer **闭包持有自己那张元素**，只减自己的计数 —— 后来注入的那张
+ * （另一个元素）既不会被旧 disposer 减到，也就不会被误删。
  *
  * ⚠️ data-plugin-css 只是资源标识（宿主 claimStyles 回读它做 inventory），
  * 用「包 id + 文件名」的形式，便于将来多张样式表各自幂等。
@@ -1092,15 +1146,37 @@ const STYLE_SELECTOR = 'style[data-plugin-css=' + JSON.stringify(STYLE_TAG_ID) +
  * STYLE_TAG_ID / STYLE_SELECTOR 因此刻意用字符串拼接。
  */
 export function installJetHubStyles() {
-  // 幂等按 DOM 存在性判断（**不是**模块级布尔）：标签被宿主/别的插件删掉后能自愈。
-  if (document.querySelector(STYLE_SELECTOR) !== null) return () => {}
-  const style = document.createElement('style')
-  // ⚠️ 署名是**关键**：claimStyles 只认领无主标签，removeOwnedStyles 只删自己名下的标签。
-  style.dataset.plugin = PLUGIN_ID
-  style.dataset.pluginCss = STYLE_TAG_ID
-  style.textContent = STYLES
-  document.head.appendChild(style)
+  const style = mountStyles()
+  style.dataset[REFS_KEY] = String(refsOf(style) + 1)
+  let released = false
   return () => {
-    document.querySelector(STYLE_SELECTOR)?.remove()
+    // 幂等守卫：cordis 允许同一 disposer 被调用两次，重入不得二次减计数。
+    if (released) return
+    released = true
+    // ⚠️ 只动**自己闭包里那张**元素：已被外部删掉就别再计数（元素不在文档里）。
+    if (style.parentNode === null) return
+    const left = refsOf(style) - 1
+    if (left > 0) {
+      style.dataset[REFS_KEY] = String(left)
+      return
+    }
+    style.remove()
   }
+}
+
+/**
+ * 渲染期自愈：样式表被外力摘掉（宿主回收、热更新、误删）时补回。
+ *
+ * ⚠️ 为什么记账还不够：「组件还在、样式没了」正是这样发生的 —— 记账只保证
+ * 「有人持有就不删」，管不住「已经被删掉之后」。而 installJetHubStyles 只挂在
+ * apply 阶段（ctx.effect），**渲染路径上不会重跑**，故必须另开一个渲染期入口，
+ * 否则样式表一丢就只能 F5 整页刷新才恢复。
+ *
+ * @returns 是否真的补了一次（补过就打一条 warn，便于直接定位而不是靠截图取证）
+ */
+export function ensureJetHubStyles() {
+  if (styleElement() !== null) return false
+  mountStyles()
+  console.warn('[jet-hub] 样式表缺失（被卸载或热更新摘除），已重新注入')
+  return true
 }
