@@ -349,6 +349,21 @@ describe('历史视图 · RPC 响应体字段名契约', () => {
   })
 })
 
+describe('历史用量删除 · 范围隔离契约', () => {
+  it('客户端二次确认后只调用单日历史删除 RPC，并在确认文案中声明保留明细与其他日期', () => {
+    expect(client).toMatch(/usage\.tokenLedgerDeleteDay',\s*\{\s*day\s*\}/)
+    expect(client).toMatch(/只清除这一天的日累计，不会清除实时明细、其他日期或账号设置/)
+    expect(client).toMatch(/删除此日/)
+  })
+
+  it('服务端只接受有效日期键，并委托给历史账本删除入口', () => {
+    const rpc = readFileSync(resolve(here, '../../src/jet-hub-rpc.ts'), 'utf8')
+    expect(rpc).toMatch(/case 'usage\.tokenLedgerDeleteDay'/)
+    expect(rpc).toMatch(/isValidTokenLedgerDayKey\(req\?\.day\)/)
+    expect(rpc).toMatch(/deleteTokenLedgerDay\(req\.day\)/)
+  })
+})
+
 /**
  * ⚠️ 趋势柱状图的**渲染接线 + 样式**契约（真实缺陷 2026-10-07 的第二道闸门）。
  *

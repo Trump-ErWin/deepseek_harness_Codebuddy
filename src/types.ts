@@ -1687,6 +1687,16 @@ export interface RpcUsageTokenLedgerHistoryResponse {
   totals: Omit<TokenLedgerModelRow, 'model'>
 }
 
+/** RPC: 删除某一天的历史日累计；不影响进程内 Token 明细。 */
+export interface RpcUsageTokenLedgerDeleteDayRequest {
+  day: string
+}
+
+export interface RpcUsageTokenLedgerDeleteDayResponse {
+  day: string
+  deleted: true
+}
+
 /**
  * 「每日首次启动自动签到」的实时状态。
  *

@@ -87,7 +87,14 @@ import type { TraeCredential } from './trae.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
 import { fetchClineUsageLimits } from './cline-quota.js'
 import { clineUpstreamOf, readClineRequestHistory } from './cline-request-log.js'
-import { readTokenLedger, readTokenLedgerDayMap, readTokenLedgerHistory, TOKEN_LEDGER_HISTORY_MAX_DAYS } from './token-ledger.js'
+import {
+  deleteTokenLedgerDay,
+  isValidTokenLedgerDayKey,
+  readTokenLedger,
+  readTokenLedgerDayMap,
+  readTokenLedgerHistory,
+  TOKEN_LEDGER_HISTORY_MAX_DAYS,
+} from './token-ledger.js'
 import {
   clineCredentialExpiresAtMs,
   isClineRefreshable,
@@ -313,6 +320,8 @@ import type {
   RpcUsageTokenLedgerResponse,
   RpcUsageTokenLedgerHistoryRequest,
   RpcUsageTokenLedgerHistoryResponse,
+  RpcUsageTokenLedgerDeleteDayRequest,
+  RpcUsageTokenLedgerDeleteDayResponse,
   RpcUsageAutoCheckinRequest,
   RpcUsageAutoCheckinResponse,
   ProviderStatus,
@@ -4560,6 +4569,19 @@ function registerJetHubEndpoints(
           : undefined
         const result = readTokenLedgerHistory(readTokenLedgerDayMap(), { sinceDays })
         const value: RpcUsageTokenLedgerHistoryResponse = { history: result.days, totals: result.totals }
+        return { ok: true, value }
+      }
+
+      /** 只删除一个 UTC+8 日期的持久化历史累计，不触碰实时明细与其他设置。 */
+      case 'usage.tokenLedgerDeleteDay': {
+        const req = payload as Partial<RpcUsageTokenLedgerDeleteDayRequest>
+        if (!isValidTokenLedgerDayKey(req?.day)) {
+          return { ok: false, error: { code: 'bad-request', message: 'day 必须是有效的 YYYY-MM-DD 日期' } }
+        }
+        if (!deleteTokenLedgerDay(req.day)) {
+          return { ok: false, error: { code: 'not-found', message: `没有可删除的 ${req.day} 历史用量` } }
+        }
+        const value: RpcUsageTokenLedgerDeleteDayResponse = { day: req.day, deleted: true }
         return { ok: true, value }
       }
 

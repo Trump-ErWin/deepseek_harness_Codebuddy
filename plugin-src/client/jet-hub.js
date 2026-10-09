@@ -2046,6 +2046,8 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
   const [historyRange, setHistoryRange] = React.useState('7d');
   const [history, setHistory] = React.useState(null);
   const [historyPhase, setHistoryPhase] = React.useState('idle');
+  const [deletingHistoryDay, setDeletingHistoryDay] = React.useState(null);
+  const [historyDeleteError, setHistoryDeleteError] = React.useState('');
   /** 展开的那个历史日（`null` = 全收起）。天与天的聚合树同弹窗内切换。 */
   const [expandedDay, setExpandedDay] = React.useState(null);
 
@@ -2084,6 +2086,27 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       setHistoryPhase('error');
     }
   }, [rpcCall]);
+
+  /** 删除图表中选中的单日累计；确认文案明确限定为历史文件里的这个日期。 */
+  const deleteHistoryDay = React.useCallback(async (day) => {
+    if (typeof day !== 'string' || !confirm(
+      `确认删除 ${day} 的历史用量？只清除这一天的日累计，不会清除实时明细、其他日期或账号设置。`,
+    )) return;
+    setDeletingHistoryDay(day);
+    setHistoryDeleteError('');
+    try {
+      await rpcCall('usage.tokenLedgerDeleteDay', { day });
+      if (!mounted.current) return;
+      setExpandedDay(null);
+      await loadHistory(historyRange);
+    } catch (caught) {
+      if (!mounted.current) return;
+      console.error('[jet-hub] delete token ledger history failed:', caught);
+      setHistoryDeleteError(caught?.message || `${day} 历史用量删除失败`);
+    } finally {
+      if (mounted.current) setDeletingHistoryDay(null);
+    }
+  }, [historyRange, loadHistory, rpcCall]);
 
   React.useEffect(() => { void loadHistory(historyRange); }, [historyRange, loadHistory]);
 
@@ -2269,11 +2292,21 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
 
   /** 一天的历史聚合树：结构与实时汇总卡一致（复用 tokenSummaryText 等口径）。 */
   const renderDayTree = (dayRow) => React.createElement('div', { key: 'day-' + dayRow.day, className: 'dim-jh-ledgerCard' },
-    React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
-      React.createElement('strong', null, dayRow.day + ' · ' + (dayRow.totals?.requests ?? 0) + ' 次请求'),
-      perfCell(dayRow.totals),
-      React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
-        tokenSummaryText(dayRow.totals))),
+      React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
+        React.createElement('strong', null, dayRow.day + ' · ' + (dayRow.totals?.requests ?? 0) + ' 次请求'),
+        perfCell(dayRow.totals),
+        React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
+          tokenSummaryText(dayRow.totals)),
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          'data-kind': 'danger',
+          disabled: deletingHistoryDay === dayRow.day,
+          title: '只删除此日期的历史累计',
+          onClick: () => { void deleteHistoryDay(dayRow.day); },
+        }, deletingHistoryDay === dayRow.day ? '删除中…' : '删除此日')),
+    historyDeleteError
+      ? React.createElement('div', { className: 'dim-jh-empty', role: 'alert' }, historyDeleteError)
+      : null,
     dayRow.channels.map((channelRow) => React.createElement('div', { key: channelRow.channel, className: 'dim-jh-ledgerProvider' },
       React.createElement('div', { className: 'dim-jh-ledgerProviderHead' },
         React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, channelLabel(channelRow.channel)),
