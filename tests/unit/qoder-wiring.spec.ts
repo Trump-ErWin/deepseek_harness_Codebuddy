@@ -85,12 +85,16 @@ describe('Qoder Jet Hub RPC 分支（src/jet-hub-rpc.ts）', () => {
   })
 
   it('account.refresh 分派包含 qoder', () => {
-    // 重构后走同族注册表：实例由 `requireQoderFamily(entry.provider).auth` 取得，
+    // 重构后走同族注册表：实例由 `requireQoderFamily(provider).auth` 取得，
     // 两个 provider id 共用同一个 case（见下面的注册表 describe）。
-    // `[^)]*` 容忍签名扩展：现在还要传 `pool` + `entry.id`，
-    // 续期成功后才能把新 `expiresAt` 回写账号池（issue !IKIRTT）。
+    //
+    // ⚠️ 2026-10-09（issue IKKHL5）：分派抽成共享的 `refreshAccountByProvider`
+    // 后第一形参从 `entry.provider` 变成 `provider`（端点入参，不再直接读
+    // entry）。原断言把**形参名**当契约锁死而红 —— 与本文件「不要写死整串」
+    // 的既有教训同型。改为锁真正的不变式：按 provider 动态取同族实例，
+    // 且调用带 `pool` 与账号 id（issue !IKIRTT 的回写铁律）。
     expect(codeOnly(rpc)).toMatch(
-      /requireQoderFamily\(entry\.provider\)\.auth\.refreshAccountCredential\(entry\.credentialRef[^)]*\)/,
+      /requireQoderFamily\([^)]*\)\.auth\.refreshAccountCredential\([^)]*\bpool\b[^)]*\baccountId\b[^)]*\)/,
     )
   })
 
@@ -235,11 +239,20 @@ describe('Qoder 同族 RPC 注册表（src/jet-hub-rpc.ts）', () => {
   })
 
   it('单账号续期分派覆盖两个 provider id', () => {
-    const refreshStart = code.indexOf('switch (entry.provider)')
+    // ⚠️ 2026-10-09（issue IKKHL5）：`switch (entry.provider)` 已抽成共享的
+    // `switch (provider)`（由 account.refresh 端点与「积分查询前自愈」共用）。
+    // 锚点因此改成分派器的**定义**，而不变式一条没少：两个 provider id
+    // **共用一个 case**（不允许退化成只认国际版），且实例按 provider 动态取。
+    const refreshStart = code.indexOf('const refreshAccountByProvider = async (')
+    expect(refreshStart, '未找到共享的 refreshAccountByProvider 分派表').toBeGreaterThan(-1)
     const refreshBlock = code.slice(refreshStart, refreshStart + 2400)
     expect(refreshBlock).toContain('case QODER.id:')
     expect(refreshBlock).toContain('case QODER_CN.id:')
-    expect(refreshBlock).toContain('requireQoderFamily(entry.provider).auth')
+    expect(refreshBlock).toContain('requireQoderFamily(provider).auth')
+    // ⚠️ 不可退化成写死 `qoder` —— 两站 token 不通用，那样会让 CN 永远
+    // 续不动而国际版被无谓刷一次。行为级对拍见
+    // `lobsterai-rpc-dispatch.spec.ts` 的 T7 回归段（已做反向验证）。
+    expect(refreshBlock).not.toMatch(/\bqoder\.refreshAccountCredential\b/)
   })
 
   it('领取分支仍传 precheckStatus: false（流程自带活动查询）', () => {

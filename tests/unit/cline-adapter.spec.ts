@@ -822,7 +822,22 @@ describe('Cline 接线（源码级回归）', () => {
     expect(source).toContain('cline.startLogin({ refName })')
     // `[^)]*` 容忍签名扩展：续期成功后要把新 `expiresAt` 写回账号池，
     // 故调用点带着 `pool, entry.id`（issue !IKIRTT）—— 写死整串会一改签名就假失败。
-    expect(source).toMatch(/cline\.refreshAccountCredential\(entry\.credentialRef[^)]*\)/)
+    //
+    // ⚠️ 2026-10-09（issue IKKHL5）：分派表被抽成共享的 `refreshAccountByProvider`
+    // 后，第一形参名从 `entry.credentialRef` 变成 `credentialRefName`
+    // （端点入参，不再直接读 entry）。原断言把**形参名**当契约锁死而红。
+    //
+    // ⚠️⚠️ **不能只断言「带了 pool 与 accountId」**（对抗审计实测的防线削弱）：
+    // 那样 `cline.refreshAccountCredential('CLINE_ACCESS_TOKEN', pool, accountId)`
+    // —— 即**传默认单凭据 ref** 这个退化形态 —— 也会通过，而它正是 issue
+    // !IKIRTT 缺陷 2（「刷这个账号」实际刷的是另一个凭据）。且 cline **没有**
+    // 行为级兜底（`lobsterai-rpc-dispatch.spec.ts` 的 account.refresh 行为用例
+    // 不覆盖 cline），这条文本断言是唯一防线。故必须同时锁「第一实参是
+    // **传入的** ref 名」这一不变式。
+    expect(source).not.toMatch(/cline\.refreshAccountCredential\(\s*'/)
+    expect(source).toMatch(
+      /cline\.refreshAccountCredential\(\s*credentialRefName\b[^)]*\bpool\b[^)]*\baccountId\b[^)]*\)/,
+    )
     expect(source).toContain('fetchClineCreditBalance(credential, CLINE)')
     // 签到必须显式拒绝（而不是落到 unsupported provider 的泛化文案）
     expect(source).toContain('Cline 不支持每日签到')

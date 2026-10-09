@@ -28,6 +28,7 @@ import {
 import { SerialQueue } from './serial-queue.js'
 import {
   GEMINI,
+  GEMINI_OAUTH_TIMEOUT_MS,
   geminiAccountLabel,
   geminiCredentialExpiresAtMs,
   isGeminiRefreshable,
@@ -384,7 +385,16 @@ export class GeminiAuth extends Service {
         // 缺身份时补一次 userinfo（只读 GET）。注意此处**不写日志失败**——
         // 老账号的 access_token 可能早已过期，拿不到是常态，不值得刷告警。
         if (geminiAccountLabel(credential) === undefined) {
-          const info = await fetchGeminiUserInfo(credential.access_token, { fetcher: this.fetchImpl })
+          // ⚠️ **必须传 `signal`**（与 `refreshCredential` 同族的缺陷）：
+          // `fetchGeminiUserInfo` 只在 `options.signal !== undefined` 时才设置
+          //（`src/gemini-oauth.ts` 的 `if (options.signal !== undefined) init.signal = options.signal`），
+          // 不传则这次 GET **完全没有超时**，卡住时只能等 undici 默认
+          // `headersTimeout`（实测 305 秒）。本方法是启动期的账号修复循环，
+          // 一个挂住的账号会把后面所有账号的修复一起拖住。
+          const info = await fetchGeminiUserInfo(credential.access_token, {
+            fetcher: this.fetchImpl,
+            signal: AbortSignal.timeout(GEMINI_OAUTH_TIMEOUT_MS),
+          })
           if (info.sub === undefined && info.email === undefined) continue
           credential = { ...credential }
           if (info.sub !== undefined) credential.sub = info.sub
@@ -444,7 +454,21 @@ export class GeminiAuth extends Service {
       throw new GeminiRefreshTokenExpiredError('凭据缺少 refresh_token，请重新登录')
     }
     try {
-      const grant = await refreshGeminiCredential(refreshToken, { fetcher: this.fetchImpl })
+      // ⚠️ **必须传 `signal`**（真实缺陷，对抗审计实测）：`refreshGeminiCredential`
+      // 只在 `options.signal !== undefined` 时才把它交给 `postGeminiForm`
+      //（`src/gemini-oauth.ts` 的 `if (signal !== undefined) init.signal = signal`），
+      // 不传则这次 `fetch` **完全没有超时**，只能等 undici 默认的
+      // `headersTimeout`（实测 **305 秒**）。
+      //
+      // 为什么这在本改动下变得关键：自愈把「续期」搬到了**用户点一下就等**的
+      // 积分查询主路径，且逐账号 `await` —— 一个卡住的 gemini 续期会让整条
+      // 积分行（乃至账号卡片）最长 5 分钟无响应；而其余九家都带 30~60s 超时。
+      // 顺带修好了既有缺陷：`GEMINI_OAUTH_TIMEOUT_MS` 此前**零引用**（只有定义），
+      // 现由本处用上。
+      const grant = await refreshGeminiCredential(refreshToken, {
+        fetcher: this.fetchImpl,
+        signal: AbortSignal.timeout(GEMINI_OAUTH_TIMEOUT_MS),
+      })
       // `credentialFromGeminiGrant` 保留 sub/email/cloudaicompanionProject，
       // 并在 Google 轮换 refresh_token 时回写新值。
       return credentialFromGeminiGrant(grant, credential)
