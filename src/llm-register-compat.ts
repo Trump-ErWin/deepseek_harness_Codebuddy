@@ -113,7 +113,12 @@ export interface AdapterRegisterTarget {
   registerAdapter(providers: readonly string[], adapter: unknown): unknown
 }
 
-import { recordTokenUsage, withTokenLedgerAccountContext } from './token-ledger.js'
+import {
+  createTokenLedgerAccountContext,
+  recordTokenUsage,
+  runWithTokenLedgerAccountContext,
+  withTokenLedgerAccountContext,
+} from './token-ledger.js'
 import { channelOfOptions } from './openai-gateway/channel.js'
 
 /**
@@ -166,10 +171,14 @@ export function wrapAdapterWithTokenLedger<T extends object>(providers: readonly
    * 把一次流式调用包上记账（顶层 `stream` 与 `prepareCall` 返回的 `call.stream`
    * 共用同一实现，口径才不会分叉）。
    */
-  const accountingStream = (options: unknown, open: () => AsyncIterable<unknown>): AsyncIterable<unknown> => {
+  const accountingStream = (
+    options: unknown,
+    open: () => AsyncIterable<unknown>,
+    accountContext = createTokenLedgerAccountContext(),
+  ): AsyncIterable<unknown> => {
     const channel = channelOfOptions(options)
     const model = String((options as { model?: unknown })?.model ?? '').slice(0, 160)
-    return recordThroughStream(open, { channel, provider, model, startedAt: Date.now() })
+    return recordThroughStream(open, { channel, provider, model, startedAt: Date.now() }, accountContext)
   }
 
   return new Proxy(adapter, {
@@ -205,7 +214,11 @@ export function wrapAdapterWithTokenLedger<T extends object>(providers: readonly
         const original = Reflect.get(target, prop, target) as unknown
         if (typeof original !== 'function') return original
         return async (...args: unknown[]): Promise<unknown> => {
-          const call = await (original as (...a: unknown[]) => Promise<unknown>).apply(target, args)
+          const accountContext = createTokenLedgerAccountContext()
+          const call = await runWithTokenLedgerAccountContext(
+            accountContext,
+            () => (original as (...a: unknown[]) => Promise<unknown>).apply(target, args),
+          )
           if (call === null || typeof call !== 'object') return call
           const inner = (call as { stream?: unknown }).stream
           if (typeof inner !== 'function') return call
@@ -215,6 +228,7 @@ export function wrapAdapterWithTokenLedger<T extends object>(providers: readonly
             stream: (options: unknown) => accountingStream(
               options,
               () => (inner as (o: unknown) => AsyncIterable<unknown>).call(target, options),
+              accountContext,
             ),
           }
         }
@@ -238,6 +252,7 @@ export function wrapAdapterWithTokenLedger<T extends object>(providers: readonly
 export async function* recordThroughStream(
   openStream: () => AsyncIterable<unknown>,
   meta: { channel: 'direct' | 'gateway'; provider: string; model: string; startedAt: number },
+  accountContext = createTokenLedgerAccountContext(),
 ): AsyncIterable<unknown> {
   let usageReported = false
   let inputTokens = 0
@@ -257,7 +272,6 @@ export async function* recordThroughStream(
    * 并发请求的账号，因此只接受适配器推进当前流时回报的账号。
    */
   let accountId = ''
-  const accountContext = { accountId: '' }
   let failure: string | undefined
   try {
     for await (const chunk of withTokenLedgerAccountContext(openStream(), accountContext)) {
