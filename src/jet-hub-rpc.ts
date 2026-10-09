@@ -1270,6 +1270,242 @@ function registerJetHubEndpoints(
   }
 
   /**
+   * 按 provider 找「单账号续期」入口，供积分查询前的自愈分派
+   * （Gitee issue IKKHL5 建议 C「面板自愈」）。
+   *
+   * ## 为什么必须复用 `account.refresh` 那张分派表、而不是另写一份
+   *
+   * 仓库里已有一份「provider → auth 实例」的权威映射（`account.refresh` 的
+   * switch，十一处分支）。**平行再写一份 switch 的漏接概率与分支数同向增长**
+   * —— 本插件在 `workbuddy` 上就真漏过一次（`account.refresh` 端点对它一直
+   * 报 `Unknown provider`，见上面那段注释）。故这里让两条路径共用同一批
+   * 分支函数，而不是复制代码。
+   *
+   * ⚠️ **只有真有 refresh 端点的 provider 才进这张表**：loomy 与 zcode 的
+   * `refreshAccountCredential` 做的是**有效性探测**（前者无 refresh 端点，
+   * 后者凭据静态），拿它们当「续期」用会让每次积分查询白发两次网络请求，
+   * 还会把「探测失败」误报成「续期失败」。故这里显式排除。
+   *
+   * ⚠️ **不含 `enabled` 判据**（AGENTS.md 铁律）：停用只影响自动选号。
+   */
+  /**
+   * **真正支持按需续期**的 provider 集合（有 refresh 端点的）。
+   *
+   * ⚠️ 这是「跳过」与「报错」的分界线，两者的区别是**本质的**：
+   * - **不在**本集合里（loomy / zcode / opencode）＝ 该渠道**设计上**没有续期能力，
+   *   自愈应当**静默跳过**（不发请求、不记日志）—— 它不是失败，是「无需处理」。
+   * - 在集合里但 `refreshAccountByProvider` 抛错 ＝ 真失败，必须记 warn。
+   *
+   * ⚠️ **不能用 `throw` 来表达「不支持」**（对抗审计实测到的真实缺陷）：
+   * heal 的 catch 会把异常记成 `自愈续期失败：loomy 不支持在积分查询前自动续期`
+   * —— 一条**每次刷新面板都会重复**的误导性告警（loomy 的池内 `expiresAt` 是
+   * 本地按 14 天推算的固定值、14 天后必然过期 ⇒ 确定可达），
+   * 而它其实什么都没失败。AGENTS.md 已记「重复同一行会把有用信息埋掉」。
+   *
+   * - loomy / zcode：没有 refresh 端点，其 `refreshAccountCredential` 做的是
+   *   **有效性探测**，拿来当续期用只会白发请求；
+   * - opencode：匿名通道，无凭据可续。
+   */
+  const SELF_HEAL_REFRESHABLE_PROVIDERS: ReadonlySet<string> = new Set([
+    'codearts',
+    'buddy',
+    'workbuddy',
+    LOBSTERAI.id,
+    QODER.id,
+    QODER_CN.id,
+    TRAE.id,
+    CLINE.id,
+    RACCOON.id,
+    MINIMAX.id,
+    GEMINI.id,
+  ])
+
+  /**
+   * 自愈的**在飞去重**表（key = 账号 id）—— 同一账号的并发自愈共享同一次续期。
+   *
+   * ⚠️ **必须有**（对抗审计实测证实的真实缺陷）：本端点是**用户可反复触发**的
+   * （客户端 `plugin-src/client/jet-hub.js` 的 `loadCredits` 有四个调用点：
+   * 面板挂载、签到成功后、领取成功后、「刷新积分」按钮，且**没有重入闸门** ——
+   * 对比 `claimCredits` 的 `claimInFlightRef`；按钮的 `disabled: creditsLoading`
+   * 是异步 state，连点两次即并发）。宿主还有第二条独立入口：用量徽标每 60 秒
+   * 轮询 `usageBadge.read` → 同一个 `handleMethod('credits.balances')`。
+   *
+   * 而**续期会轮换 refresh_token**（`AGENTS.md` 记过 codearts 那次「三条续期入口
+   * 并发消费同一份 refresh_token，1 个成功、其余 invalid_grant」的事故），
+   * 并发自愈存在「后写的把先写的新 token 覆盖成已失效旧 token」的风险。
+   *
+   * ⚠️ 本表只防**进程内、本入口**的并发。跨入口（定时器 `refreshAll`、按需续期）
+   * 与跨进程的互斥由各家自己兜（codearts / gemini 有 per-ref `SerialQueue`，
+   * 其余七家是既有状态，非本次引入）。
+   */
+  const balanceHealInFlight = new Map<string, Promise<void>>()
+
+  /** 上表的可执行版本；`account.refresh` 端点与积分自愈共用它。 */
+  const refreshAccountByProvider = async (
+    provider: string,
+    credentialRefName: string,
+    accountId: string,
+  ): Promise<void> => {
+    switch (provider) {
+      case 'codearts':
+        await codearts.refreshAccountCredential(credentialRefName, pool, accountId)
+        return
+      case 'buddy':
+        await buddy.refreshAccountCredential(credentialRefName, pool, accountId)
+        return
+      case 'workbuddy':
+        await workbuddy.refreshAccountCredential(credentialRefName, pool, accountId)
+        return
+      case LOBSTERAI.id:
+        await lobsterai.refreshAccountCredential(credentialRefName, pool, accountId)
+        return
+      case QODER.id:
+      case QODER_CN.id:
+        // 同协议族：按 provider 找实例（⚠️ 不可写死 qoder，否则 CN 刷国际版的凭据）。
+        await requireQoderFamily(provider).auth.refreshAccountCredential(credentialRefName, pool, accountId)
+        return
+      case TRAE.id:
+        await trae.refreshAccountCredential(credentialRefName, pool, accountId)
+        return
+      case CLINE.id:
+        await cline.refreshAccountCredential(credentialRefName, pool, accountId)
+        return
+      case RACCOON.id:
+        await raccoon.refreshAccountCredential(credentialRefName, pool, accountId)
+        return
+      case MINIMAX.id:
+        await minimax.refreshAccountCredential(credentialRefName, pool, accountId)
+        return
+      case GEMINI.id:
+        await gemini.refreshAccountCredential(credentialRefName, pool, accountId)
+        return
+      default:
+        // ⚠️ 这里**只**兜「没有续期能力 / 不存在」的 provider，且**必须**抛出
+        // `Unknown provider: X` —— 这是 `account.refresh` 的既有对外契约
+        // （`tests/unit/lobsterai-rpc-dispatch.spec.ts` 的「未知 provider 报错」
+        // 用例锁着它）。
+        //
+        // ⚠️⚠️ **不要**在这里写「X 不支持在积分查询前自动续期」（对抗审计实测到的
+        // 真实缺陷）：本表是 `account.refresh` 与积分自愈**共用**的，
+        // 而 `account.refresh` 根本没有「积分查询前」这个上下文 ——
+        // 实测给 opencode 报出的是那句语义错位的文案（重构前是
+        // `Unknown provider: opencode`）。「不支持自愈」由调用方用
+        // {@link SELF_HEAL_REFRESHABLE_PROVIDERS} **跳过**表达，不靠异常。
+        throw new Error(`Unknown provider: ${provider}`)
+    }
+  }
+
+  /**
+   * 积分查询前的**按需自愈**（Gitee issue IKKHL5 建议 C）。
+   *
+   * ## 缺陷
+   *
+   * 系统睡眠/挂起数小时后恢复，**宿主进程全程没退出**，于是
+   * `state.json` 里的 `expiresAt`（= 上次续期时刻 + 令牌寿命）落在过去，
+   * 而客户端判据只有一次本地比较（`plugin-src/client/jet-hub.js` 的
+   * `account.expiresAt <= Date.now()`）⇒ 卡片显示红色「已过期 · 自动续期」；
+   * `credits.balances` 又只 resolve 凭据后直连上游、**全程不续期**
+   * ⇒ 积分行报「账户信息查询失败：HTTP 401」。该窗口内**没有任何手动
+   * 自救手段**（「重测」的 refresh 是刻意 no-op）。
+   *
+   * ## 为什么这一层是对症的（而不是 issue 建议的 A：墙钟跳变检测）
+   *
+   * 实测（`NtSuspendProcess` 真实挂起 8 秒 = 等比 4 小时）：libuv 定时器基于
+   * **单调时钟**，睡眠时长 > interval 时**恢复瞬间就补触发**一轮；所以
+   * 「睡几小时」并不需要墙钟检测来抢救。真正的缺口是**恢复后的第一轮要等
+   * 最多一个 interval**，而短寿命 provider（minimax 1h / codearts 2h /
+   * raccoon 3h）在这个窗口里必然显示「已过期」。
+   *
+   * 本函数让**积分查询这个用户主动发起的动作**自带续期：不必等定时器，
+   * 一次刷新面板就同时消灭「已过期」显示与 401。
+   */
+  const healExpiredAccountBeforeBalance = async (entry: ProviderAccountEntry): Promise<void> => {
+    // ⚠️ 判据与客户端**逐字一致**（同一个表达式），否则会出现「面板说没过期、
+    // 这里却发续期请求」或反之的无谓请求。
+    //
+    // ⚠️ **`typeof` 检查不是冗余**（对抗审计实测的测试盲区）：`expiresAt` 可从
+    // **用户可编辑的备份文件**导入，而 `sanitizeAccounts` **不过滤**该字段。
+    // 池里若是数字字符串 `'1791559805000'`：保留 `typeof` → 不续期
+    // （与客户端判据一致）；删掉 `typeof` 则被 JS 强制转换判为过期 →
+    // 宿主与 UI **行为分叉**。
+    const expired = typeof entry.expiresAt === 'number'
+      && entry.expiresAt > 0
+      && entry.expiresAt <= Date.now()
+    // ⚠️ **不判 `entry.refreshable`**（issue IKKHL5 建议 C 的原文写的是
+    // 「已过期且 refreshable」）：那个布尔是**凭据材料的镜像**、可能被误标，
+    // 而本插件已有一条铁律——误标过一次就永不自愈（见 AGENTS.md「账号池的
+    // refreshable 只是凭据材料的镜像」）。各家 `refreshAccountCredential`
+    // 内部自己按凭据材料判断能否续期（缺 refresh_token 时抛「请重新登录」），
+    // 由它给出真终态；这里不预判。
+    if (!expired) return
+    // ⚠️ **设计上没有续期能力的渠道静默跳过**（不抛错、不记日志）：
+    // 用异常表达「跳过」会让每次刷新面板都留下一条误导性告警（loomy 的池内
+    // `expiresAt` 是本地按 14 天推算的固定值，14 天后必然过期 ⇒ 确定可达）。
+    // 详见 {@link SELF_HEAL_REFRESHABLE_PROVIDERS}。
+    if (!SELF_HEAL_REFRESHABLE_PROVIDERS.has(entry.provider)) return
+
+    // ⚠️ **在飞去重**：同一账号的并发自愈共享同一次续期请求。
+    // 积分端点与领取端点都会被用户反复触发（连点「刷新积分」/「一键领取」、
+    // 徽标每 60 秒轮询走同一条 `handleMethod`），而续期**会轮换 refresh_token**，
+    // 并发会让「后写的把先写的新 token 覆盖成已失效的旧 token」。
+    // 详见 {@link balanceHealInFlight}。
+    const existing = balanceHealInFlight.get(entry.id)
+    if (existing !== undefined) {
+      await existing
+      return
+    }
+
+    const task = (async (): Promise<void> => {
+      try {
+        await refreshAccountByProvider(entry.provider, entry.credentialRef, entry.id)
+      } catch (error) {
+        // ⚠️ **绝不上抛**：续期失败不是「余额/领取失败」——凭据本来就已过期，
+        // 直连上游必然 401，让整条积分行报「续期失败：…」反而比原来的
+        // 「账户信息查询失败：HTTP 401」更难懂。照常往下走、由上游给出真原因。
+        // ⚠️ 文案**刻意不写「余额」**：本函数已同时服务 `credits.balances`
+        // 与 `credits.claimAll` 两个端点，「照常查余额」在领取路径上是错的。
+        ctx.logger?.warn?.(
+          `[jet-hub] 积分操作前的自愈续期失败（账号 ${entry.id}，照常继续）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    })()
+
+    balanceHealInFlight.set(entry.id, task)
+    try {
+      // ⚠️ **必须 `await`**：本函数的存在意义就是「**先续期、再查余额**」——
+      // 不 await 就等于没修（对抗审计实测：改成 `void task` 后 12 条测试全绿，
+      // 说明该顺序语义原先没有任何守护；现已由
+      // `credits-balance-self-heal.spec.ts` 的「顺序」用例锁住）。
+      await task
+    } finally {
+      // ⚠️ 必须在 `finally` 里删除：续期失败时也要放行下一次自愈，
+      // 否则一次失败会把该账号的自愈**永久焊死**（与 `SerialQueue` 的
+      // 「失败也必须放行下一个」同一条教训）。
+      // ⚠️ 只删自己这一条：并发时后来者读到的是同一个 task，删掉的也应是它
+      //（用值比较而不是无条件 delete，避免把「后来者刚建的新 task」误删）。
+      if (balanceHealInFlight.get(entry.id) === task) {
+        balanceHealInFlight.delete(entry.id)
+      }
+    }
+  }
+
+  /**
+   * 逐账号**顺序**执行自愈（供 `credits.balances` 与 `credits.claimAll` 共用）。
+   *
+   * ⚠️ **必须串行、不得改 `Promise.all`**（对抗审计实测的测试盲区：改成并行后
+   * 测试全绿，而「顺序执行避免并发触发风控」是本端点的既有约定，见
+   * `collectCreditBalances` 的注释；并发续期还有轮换 token 的覆盖风险）。
+   * 由 `credits-balance-self-heal.spec.ts` 的**双账号**顺序用例锁住
+   *（单账号时串行与并行不可区分 —— 那正是它当初漏掉的原因）。
+   */
+  const healExpiredAccounts = async (accounts: readonly ProviderAccountEntry[]): Promise<void> => {
+    for (const entry of accounts) {
+      await healExpiredAccountBeforeBalance(entry)
+    }
+  }
+
+  /**
    * Loomy 短信登录的中间状态（账号 id → { phone, msgid }）。
    *
    * 为什么放内存而不是凭据存储：msgid 是**一次性的中间态**（5 分钟有效），
@@ -2262,53 +2498,16 @@ function registerJetHubEndpoints(
           // 「刷新」按钮（按钮是 测试/重测/重置/停用/代理/指纹/删除），
           // 调用方是仓库外的脚本/手工 RPC。下面三处历史注释曾把它写成
           // 「账号卡片的刷新按钮」——那是失实的，会把排障的人引到不存在的 UI。
+          //
+          // ⚠️ 分派表已抽成 {@link refreshAccountByProvider}（issue IKKHL5），
+          // 由本端点与「积分查询前自愈」**共用** —— 见该函数「为什么必须复用」。
+          // 那张表里**故意没有** loomy 与 zcode（都没有 refresh 端点，见那里
+          // 的说明），故本端点为这两家保留独立的 case，维持既有对外行为。
           switch (entry.provider) {
-            case 'codearts':
-              await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case 'buddy':
-              await buddy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case 'workbuddy':
-              await workbuddy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case LOBSTERAI.id:
-              await lobsterai.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case QODER.id:
-            case QODER_CN.id:
-              // 同协议族：按 provider 找到对应实例。
-              // ⚠️ 只刷传入的这个 ref，不碰默认单凭据 ref（历史缺陷同因）。
-              // ⚠️ **不要**图省事写 `qoder.refreshAccountCredential(...)` ——
-              // 那会让中国版账号的续期去刷国际版的凭据（两站 token 不通用，
-              // CN 永远续不动而国际版被无谓刷一次）。该串用由
-              // `lobsterai-rpc-dispatch.spec.ts` 的行为级用例锁死（已做反向验证）。
-              await requireQoderFamily(entry.provider).auth.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case TRAE.id:
-              await trae.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case CLINE.id:
-              await cline.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
             case LOOMY.id:
               // ⚠️ Loomy **没有 refresh 端点**：这里只能做**有效性探测**，
               // 失效时抛「请重新登录」。见 LoomyAuth.refreshAccountCredential。
               await loomy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case RACCOON.id:
-              // raccoon **有** refresh 端点（refresh_token 轮换），这里是真续期。
-              // ⚠️ 只读写传入的 ref，不碰默认单凭据 ref。
-              // ⚠️ **必须传 pool + entry.id**：续期后要把新的 `expiresAt` 写回
-              // 账号池，否则 UI 一直显示「已过期」（真实缺陷：JWT 已续到 15:09、
-              // 账号池仍是 12:02，相差 3.1 小时，但功能完全正常）。
-              await raccoon.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case MINIMAX.id:
-              // MiniMax **有** refresh 端点（`/oauth2/token` 的 refresh_token 授权），
-              // 这里是真续期。⚠️ 必须传 pool + entry.id —— 续期后要把新的
-              // `expiresAt` 写回账号池，否则 UI 一直显示「已过期」。
-              await minimax.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             case ZCODE.id:
               /**
@@ -2320,16 +2519,9 @@ function registerJetHubEndpoints(
                */
               await zcode.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
-            case GEMINI.id:
-              // Gemini **有** refresh 端点（`oauth2.googleapis.com/token` 的
-              // `refresh_token` grant），这里是真续期。
-              // ⚠️ 必须传 pool + entry.id —— 续期后要把新的 `expiresAt` 写回
-              // 账号池，否则 UI 一直显示「已过期」而实际能正常发消息。
-              // ⚠️ Google 会**轮换 refresh_token**，`GeminiAuth` 内部已回写新值。
-              await gemini.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
             default:
-              throw new Error(`Unknown provider: ${entry.provider}`)
+              await refreshAccountByProvider(entry.provider, entry.credentialRef, entry.id)
+              break
           }
           return { ok: true, value: { success: true } }
         } catch (error) {
@@ -2891,6 +3083,19 @@ function registerJetHubEndpoints(
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
         const accounts = await pool.listAccounts(req.provider)
+        // ⚠⚠ **领取前也要按需自愈**（issue IKKHL5，与 `credits.balances` 同一层）。
+        //
+        // 用户报障的场景里，「积分行报 HTTP 401」旁边**就挂着「一键领取积分」
+        // 按钮** —— 睡眠/挂起恢复后点它，撞的是**同一个** 401：凭据已过期，
+        // 而领取流程同样只 resolve 凭据后直连上游、全程不续期。
+        // 若只修余额查询，「用户点刷新能看到余额了、点领取却还是 401」，
+        // 症状会变得自相矛盾、更难排查。
+        //
+        // ⚠️ 放在**端点入口**（与余额端点同因）：本 case 下有十几家 provider
+        // 分支（qoder/codearts/lobsterai/trae/cline/workbuddy/raccoon/minimax/
+        // zcode/gemini/buddy 系…），逐分支加必漏。
+        // ⚠️ 顺序执行、失败不上抛，见 {@link healExpiredAccounts}。
+        await healExpiredAccounts(accounts)
         if (isQoderFamily(req.provider)) {
           const { product } = requireQoderFamily(req.provider)
           // Qoder 的领取流程**自带活动列表查询**（loadCampaigns → 逐个 claim），
@@ -3158,6 +3363,22 @@ function registerJetHubEndpoints(
       case 'credits.balances': {
         const req = payload as RpcCreditsBalancesRequest
         const accounts = await pool.listAccounts(req.provider)
+        // ⚠⚠ **先按需自愈、再查余额**（Gitee issue IKKHL5 建议 C）。
+        //
+        // 缺陷：系统睡眠/挂起数小时后恢复，**宿主进程全程没退出** ⇒
+        // `state.json` 的 `expiresAt`（上次续期时刻 + 令牌寿命）落在过去，
+        // 卡片显示红色「已过期 · 自动续期」，而本端点 resolve 凭据后
+        // **直连上游、全程不续期** ⇒ 积分行报「HTTP 401」。该窗口内没有任何
+        // 手动自救手段（「重测」的 refresh 是刻意 no-op）。
+        //
+        // 为什么放在**端点入口**而不是每个 provider 分支里：本端点下有
+        // 七种 provider（helper 六家 + qoder/cline 手写循环 + opencode
+        // 纯本地），逐分支加就会漏 —— 仓库在 `workbuddy` 上漏过一次
+        // （`account.refresh` 端点对它一直报 `Unknown provider`）。
+        //
+        // ⚠️ **顺序执行**且失败不上抛（见该函数）：积分查询是逐账号顺序
+        // 查询（避免并发触发风控），这里保持同一形状。
+        await healExpiredAccounts(accounts)
         if (req.provider === 'codearts') {
           // 余额来自 `statistics/plugin`（与账户类型检测同一个响应），
           // 故用带原因的钩子：非积分账户要显示「Token 计费账户」而不是

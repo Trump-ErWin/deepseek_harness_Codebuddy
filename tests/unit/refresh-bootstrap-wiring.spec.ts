@@ -206,16 +206,57 @@ describe('按需续期必须回写账号池的有效期', () => {
     expect(source).not.toMatch(/refreshableOf/)
   })
 
-  it('account.refresh 的每个 provider 分支都把 pool 与 entry.id 传下去', () => {
-    const switchStart = rpcSource.indexOf('switch (entry.provider)')
-    const switchBody = rpcSource.slice(switchStart, rpcSource.indexOf('default:', switchStart))
-    const branches = switchBody.match(/case /g) ?? []
-    expect(branches.length).toBeGreaterThanOrEqual(10)
-    // qoder 与 qodercn **共用一个 case**（同族注册表），故调用数比分支数少一。
-    const calls = switchBody.match(/refreshAccountCredential\([^)]*\)/g) ?? []
-    expect(calls.length).toBeGreaterThanOrEqual(branches.length - 1)
+  it('单账号续期的每个 provider 分支都把 pool 与账号 id 传下去', () => {
+    // ⚠️ 2026-10-09（issue IKKHL5）：分派已抽成共享的 `refreshAccountByProvider`
+    // （`account.refresh` 端点与「积分查询前自愈」共用），原断言去 `switch`
+    // 里数分支会因抽取而落空。**不变式没变**：每一个续期调用都必须带
+    // `pool` 与账号 id —— 漏掉任一个就是 issue !IKIRTT 那个
+    // 「续期成功但界面纹丝不动」的缺陷。
+    //
+    // ⚠️⚠️ **不能只断言「调用数 >= 某个魔数」**（对抗审计实测的防线削弱）：
+    // 原写法 `calls.length >= 11` 在**删掉任一分支后仍成立**（12 → 11），
+    // 即「漏接一个 provider」这个正是本文件要防的缺陷**不会被抓到**。
+    // 故改为对**显式清单**逐个断言：每个应有的 provider 都必须出现
+    // case 标签**且**调用带 pool + 账号 id。删掉任何一个分支立刻变红。
+    const dispatcherStart = rpcSource.indexOf('const refreshAccountByProvider = async (')
+    expect(dispatcherStart, '未找到共享的 refreshAccountByProvider 分派表').toBeGreaterThan(-1)
+    const dispatcherEnd = rpcSource.indexOf('healExpiredAccountBeforeBalance', dispatcherStart)
+    const dispatcher = rpcSource.slice(dispatcherStart, dispatcherEnd)
+
+    // 十一个必须被分派的 provider（qoder / qodercn 同族共用一个分支体）。
+    const expected: ReadonlyArray<readonly [string, string]> = [
+      ['codearts', "case 'codearts':"],
+      ['buddy', "case 'buddy':"],
+      ['workbuddy', "case 'workbuddy':"],
+      ['lobsterai', 'case LOBSTERAI.id:'],
+      ['qoder', 'case QODER.id:'],
+      ['qodercn', 'case QODER_CN.id:'],
+      ['trae', 'case TRAE.id:'],
+      ['cline', 'case CLINE.id:'],
+      ['raccoon', 'case RACCOON.id:'],
+      ['minimax', 'case MINIMAX.id:'],
+      ['gemini', 'case GEMINI.id:'],
+    ]
+    for (const [name, label] of expected) {
+      expect(dispatcher, `${name} 的 case 分支缺失（漏接即意味着该渠道永不续期）`)
+        .toContain(label)
+    }
+    // qoder 同族两个 id 共用一个分支体 ⇒ 调用数比 case 标签数少一。
+    const labels = dispatcher.match(/case /g) ?? []
+    const calls = dispatcher.match(/refreshAccountCredential\([^)]*\)/g) ?? []
+    expect(calls.length, 'qoder/qodercn 共用分支体').toBe(labels.length - 1)
     for (const call of calls) {
-      expect(call, `RPC 分支漏传 pool/entry.id：${call}`).toMatch(/pool,\s*entry\.id/)
+      expect(call, `分派表漏传 pool/账号 id：${call}`).toMatch(/pool,\s*accountId\b/)
+    }
+
+    // ⚠️ 端点里 loomy / zcode 保留独立 case（无 refresh 端点，见那里的说明），
+    // 它们的调用仍读 `entry.credentialRef` / `entry.id`。
+    // ⚠️ 变量名是小写的 auth 实例（`loomy` / `zcode`），不是 provider 常量
+    //（`LOOMY` / `ZCODE`）—— 写成后者会恒不匹配（本条断言曾经因此假失败）。
+    for (const instance of ['loomy', 'zcode']) {
+      expect(rpcSource).toMatch(
+        new RegExp(`${instance}\\.refreshAccountCredential\\(entry\\.credentialRef[^)]*pool[^)]*entry\\.id[^)]*\\)`),
+      )
     }
   })
 

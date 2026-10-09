@@ -394,6 +394,56 @@ describe('Gemini account.refresh 分派', () => {
 })
 
 /**
+ * ★ Gemini 续期的**超时**（真实缺陷，对抗审计实测）。
+ *
+ * 缺陷：`GeminiAuth.refreshCredential` 原先调 `refreshGeminiCredential` 时
+ * **不传 `signal`**，而 `gemini-oauth.ts` 的 `postGeminiForm` 只在
+ * `signal !== undefined` 时才设置 `init.signal` ⇒ 这次 fetch **完全没有超时**，
+ * 卡住时只能等 undici 默认 `headersTimeout`（实测 **305 秒**）。
+ * `GEMINI_OAUTH_TIMEOUT_MS` 当时**零引用**（只有定义）。
+ *
+ * 为什么这条在本插件里重要：自愈把续期搬到了**用户点一下就等**的积分查询
+ * 主路径，且逐账号 `await` —— 一个卡住的 gemini 续期会让整条积分行
+ * （乃至账号卡片）最长 5 分钟无响应；而其余九家都带 30~60s 超时。
+ *
+ * ⚠️ 断言选「signal 存在**且真的会中断**」，而不是「signal instanceof AbortSignal」
+ * 之类的形状断言 —— 后者对「传了个永不触发的 signal」也会通过。
+ */
+describe('Gemini 续期必须带超时', () => {
+  it('★ 续期请求带 signal（否则完全没有超时，卡住要等 undici 默认 300+ 秒）', async () => {
+    const { ctx, credentials } = makeCtx()
+    let seen: AbortSignal | undefined
+    const auth = new GeminiAuth(ctx, {
+      fetchImpl: (async (_input: string | URL | Request, init?: RequestInit) => {
+        seen = init?.signal ?? undefined
+        return new Response(JSON.stringify({
+          access_token: 'AT-NEW', refresh_token: 'RT-NEW', expires_in: 3600,
+        }), { status: 200 })
+      }) as unknown as typeof fetch,
+    })
+
+    // ⚠️ `refreshCredential` 是**私有**方法，故走公开的按账号续期入口
+    // （`account.refresh` 端点与积分自愈用的就是它）。
+    await credentials.set('GEMINI_ACCOUNT_SPEC', JSON.stringify({
+      access_token: 'AT-OLD', refresh_token: 'RT-OLD', expiry: new Date(0).toISOString(),
+    }))
+    await auth.refreshAccountCredential('GEMINI_ACCOUNT_SPEC')
+
+    expect(seen, 'gemini 续期必须带 signal（否则完全没有超时）').toBeInstanceOf(AbortSignal)
+  })
+
+  it('★ `GEMINI_OAUTH_TIMEOUT_MS` 真的被引用（此前零引用、只有定义）', () => {
+    // 防止有人把 signal 删掉、退回「靠 undici 默认超时」的状态。
+    const here = dirname(fileURLToPath(import.meta.url))
+    const source = readFileSync(resolve(here, '../../src/gemini-auth.ts'), 'utf8')
+    expect(source).toContain('AbortSignal.timeout(GEMINI_OAUTH_TIMEOUT_MS)')
+    // 两处：续期 + 启动期昵称修复的 userinfo（同族缺陷一并修）。
+    const uses = source.match(/AbortSignal\.timeout\(GEMINI_OAUTH_TIMEOUT_MS\)/g) ?? []
+    expect(uses.length, '续期与 userinfo 两处都要带超时').toBeGreaterThanOrEqual(2)
+  })
+})
+
+/**
  * `credits.balances` 的 gemini 分支（行为级）。
  *
  * 与其它 provider 的**关键差异**：Gemini 的「未授权」与「查询失败」是两回事，
