@@ -184,6 +184,13 @@ describe('均值口径说明', () => {
     const hint = client.slice(modalIdx, client.indexOf('dim-jh-modalBody', modalIdx))
     expect(hint).toContain('悬停数字查看 Token 拆分与性能口径')
   })
+
+  it('弹窗说明 tooltip 必须作为 props 传入，不能作为 React 子节点', () => {
+    const modalIdx = client.indexOf("'aria-label': 'Token 用量'")
+    const modal = client.slice(modalIdx, client.indexOf('dim-jh-modalBody', modalIdx))
+    // React 不允许把普通对象渲染为子节点；放错 createElement 参数会令整个页面崩溃。
+    expect(modal).toMatch(/React\.createElement\('p',\s*\{\s*className: 'dim-jh-modalHint',\s*title:/)
+  })
 })
 
 describe('首字用时与速率（第 3 期）', () => {
