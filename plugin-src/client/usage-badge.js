@@ -51,6 +51,31 @@ import {
   formatPoolSplitLine,
   splitCreditsByExpiry,
 } from './credit-expiry.js';
+import { ensureJetHubStyles } from './jet-hub-styles.js';
+
+/**
+ * 浮层的**定位声明走内联样式**，不依赖注入的样式表。
+ *
+ * ⚠️⚠️ 为什么必须内联：注入的 `<style>` 一旦缺失，组件仍在渲染 ——
+ * 此时若 `position: absolute` 只写在样式表里，浮层就退化成**输入框底栏里的
+ * 普通块**，把宿主的输入卡片撑高（实测本机 114px → 576px，issue IKKGYN）。
+ *
+ * 内联样式随 DOM 走、不会被卸载，所以「不生效就会撑坏宿主布局」的这几条必须内联；
+ * 颜色 / 圆角 / 字号 / 阴影等**纯外观**仍留在样式表里。
+ *
+ * ⚠️⚠️ **`width` / `max-width` 故意不内联**（本机 CDP 实测的反向发现）：
+ * 内联样式优先级高于任何非 `!important` 规则，会把窄屏
+ * `@media (max-width: 720px)` 的 220px **压成 275px**。宽窄属纯外观且有媒体查询，
+ * 必须留在样式表里；这里的判据是「不生效会不会破坏宿主布局」。
+ */
+const POPOVER_ANCHOR_STYLE = Object.freeze({
+  position: 'absolute',
+  right: 0,
+  bottom: 'calc(100% + 8px)',
+  maxHeight: '58vh',
+  overflowY: 'auto',
+  zIndex: 40,
+});
 
 /**
  * 轮询间隔：60 秒。宿主侧还有 TTL 缓存（成功 120s / 全部失败 15s），故真实的
@@ -387,8 +412,32 @@ function UsageBadgeActive(props) {
    */
   const [creditsExpanded, setCreditsExpanded] = React.useState(false);
   const root = React.useRef(null);
+  /** 浮层根节点：只用于「样式表缺失时仍处于绝对定位」这道自检（见下面的 effect）。 */
+  const popRef = React.useRef(null);
   /** 供定时器与按钮调用的「读一次」入口（每次渲染替换，避免闭包过期）。 */
   const read = React.useRef(() => {});
+
+  /**
+   * 样式表自愈 + 定位自检（issue IKKGYN 的最后一道保险）。
+   *
+   * ⚠️ 为什么必须挂在**渲染路径**上：`installJetHubStyles` 只在 apply 阶段
+   * （`ctx.effect`）跑一次，宿主回收标签 / 热更新摘除之后**没有任何东西会补注** ——
+   * 症状是「Jet Hub 面板掉样式，且 F5 刷新前不会恢复」。
+   * 本机 CDP 实测：删掉签名样式表后，关掉再打开浮层、切 provider 重挂载，
+   * 样式表都是 0 份，只有整页重载才恢复。
+   *
+   * ⚠️ 定位自检**独立于样式表**：定位已内联（{@link POPOVER_ANCHOR_STYLE}），
+   * 这里断言的是「内联那几条确实生效」—— 不成立就说明有人改坏了它们，
+   * 早报一条 warn 比等用户截图便宜得多。
+   */
+  React.useEffect(() => {
+    ensureJetHubStyles();
+    if (!open) return;
+    const element = popRef.current;
+    if (element !== null && window.getComputedStyle(element).position !== 'absolute') {
+      console.warn('[jet-hub] 浮层未处于绝对定位：会撑高输入区（检查 POPOVER_ANCHOR_STYLE 是否被改坏）');
+    }
+  }, [open]);
 
   // 换渠道时先清空旧读数：否则会短暂把上一个渠道的余额画到新渠道的名字下。
   React.useEffect(() => {
@@ -869,14 +918,14 @@ function UsageBadgeActive(props) {
         : '正在读取用量…（首次要逐账号查询，可能要几秒）'));
       // 签到不依赖本渠道的读数，故首屏也放出来（用户可能就是想先签到）。
       children.push(renderClaim());
-      return React.createElement('div', { className: 'dim-jh-badgePop' }, children);
+      return React.createElement('div', { className: 'dim-jh-badgePop', style: POPOVER_ANCHOR_STYLE, ref: popRef }, children);
     }
 
     children.push(renderSubscription());
     children.push(renderCredits());
     children.push(renderClaim());
     children.push(renderFoot());
-    return React.createElement('div', { className: 'dim-jh-badgePop' }, children);
+    return React.createElement('div', { className: 'dim-jh-badgePop', style: POPOVER_ANCHOR_STYLE, ref: popRef }, children);
   }
 
   /**

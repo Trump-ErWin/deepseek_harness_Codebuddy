@@ -347,7 +347,9 @@ describe('用量徽标：渲染门控与轮询', () => {
     // 首屏只给一句说明 + 签到按钮，然后 return（不 push 订阅/积分区）
     expect(badge).toContain("key: 'placeholder'")
     expect(badge).toContain('正在读取用量…')
-    expect(badge).toMatch(/children\.push\(renderClaim\(\)\);\s*\n\s*return React\.createElement\('div', \{ className: 'dim-jh-badgePop' \}, children\);/)
+    // ⚠️ props 用 `[^{}]*` 容忍新增属性：浮层已带上内联定位（issue IKKGYN），
+    // 写死整个对象会让这类无关改动假失败（IKK4BY 的同款教训）。
+    expect(badge).toMatch(/children\.push\(renderClaim\(\)\);\s*\n\s*return React\.createElement\('div', \{[^{}]*className: 'dim-jh-badgePop'[^{}]*\}, children\);/)
   })
 
   it('客户端**不**直接调 credits.balances（那是逐账号打上游的端点）', () => {
@@ -604,6 +606,89 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
     expect(styles).toMatch(/\.dim-jh-badgePop \{[^}]*width: 280px/)
     // 双层柔和阴影
     expect(styles).toMatch(/\.dim-jh-badgePop \{[^}]*box-shadow: 0 1px 2px[^}]*0 8px 24px/)
+  })
+
+  /**
+   * 浮层的**定位**必须内联，且与样式表一致（issue IKKGYN）。
+   *
+   * 真机事故：注入的 `<style>` 一旦缺失（热更新 / 别的插件清理），组件仍在渲染，
+   * `position: absolute` 只写在样式表里就会失效 —— 浮层退化成普通块，
+   * 把宿主输入卡片从 114px 撑到 576px（本机 CDP 实测）。
+   *
+   * ⚠️ 这是「一文件两套同义判据」：定位既写在内联样式、又写在 `.dim-jh-badgePop`
+   * 规则里，故必须逐条对拍锁住；只测一处挡不住另一处被改坏。
+   */
+  it('浮层定位走内联样式（样式表缺失时不得撑高宿主输入区）', () => {
+    const anchor = badge.match(/const POPOVER_ANCHOR_STYLE = Object\.freeze\(\{([\s\S]*?)\}\)/)
+    expect(anchor, '必须有一份冻结的内联定位声明').not.toBeNull()
+    const inline = anchor![1]
+    for (const decl of [
+      "position: 'absolute'",
+      'right: 0',
+      "bottom: 'calc(100% + 8px)'",
+      "maxHeight: '58vh'",
+      "overflowY: 'auto'",
+      'zIndex: 40',
+    ]) {
+      expect(inline, `内联定位缺 ${decl}`).toContain(decl)
+    }
+  })
+
+  it('浮层的两处 return 都带上内联定位（漏一处就还有一条撑高路径）', () => {
+    const returns = badge.match(/React\.createElement\('div', \{ className: 'dim-jh-badgePop'[^)]*\}, children\)/g)
+    expect(returns, '浮层应恰好有两处 return').toHaveLength(2)
+    for (const line of returns!) {
+      expect(line, `漏带内联定位：${line}`).toContain('style: POPOVER_ANCHOR_STYLE')
+    }
+  })
+
+  it('内联定位与样式表规则逐条一致（两处同义判据，改一处必须改另一处）', () => {
+    // 样式表侧（CSS 长写法 → 内联 camelCase 写法）
+    const css = styles.match(/\.dim-jh-badgePop \{([^}]*)\}/)![1]
+    expect(css).toMatch(/position: absolute/)
+    expect(css).toMatch(/bottom: calc\(100% \+ 8px\)/)
+    expect(css).toMatch(/right: 0/)
+    expect(css).toMatch(/width: 280px/)
+    expect(css).toMatch(/max-width: min\(280px, 86vw\)/)
+    expect(css).toMatch(/max-height: 58vh/)
+    expect(css).toMatch(/overflow-y: auto/)
+    expect(css).toMatch(/z-index: 40/)
+  })
+
+  /**
+   * 窄屏 media query 仍归样式表所有，内联**不得**覆盖 `width` / `max-width`。
+   *
+   * 真机实测（issue IKKGYN 补丁的反向发现）：把 `width: 280px` 也内联后，
+   * 600px 视口下浮层仍 275px，而设计值是样式表 media query 的 220px ——
+   * 内联样式优先级高于任何非 `!important` 规则，媒体查询改不动它。
+   *
+   * ⇒ 内联**只**保留「不生效就会破坏宿主布局」的定位项；宽窄仍由样式表决定。
+   */
+  it('窄屏宽度（width/max-width）不得内联，否则压不掉 media query', () => {
+    const inline = badge.match(/const POPOVER_ANCHOR_STYLE = Object\.freeze\(\{([\s\S]*?)\}\)/)![1]
+    expect(inline).not.toMatch(/(^|[^\w])width: 280/)
+    expect(inline).not.toMatch(/(^|[^\w])maxWidth:/)
+    // 窄屏规则必须还留在样式表里
+    expect(styles).toMatch(/@media \(max-width: 720px\) \{ \.dim-jh-badgePop \{[^}]*width: 220px/)
+  })
+
+  /**
+   * 徽标必须在**渲染路径**上补一次样式表，否则删了只能 F5。
+   *
+   * 真机实测（IKKGYN）：删掉签名样式表后，关掉/打开浮层、切 provider 重挂载，
+   * 样式表都是 0 份 —— 因为 `installJetHubStyles` 只挂在 `ctx.effect`（apply 阶段），
+   * 渲染路径上不会重跑，用户只能整页刷新。
+   */
+  it('渲染路径必须调 ensureJetHubStyles（apply 之外也要能补注）', () => {
+    expect(badge, '必须从 jet-hub-styles 引入自愈入口').toMatch(
+      /import \{ ensureJetHubStyles \} from '\.\/jet-hub-styles\.js'/,
+    )
+    expect(badge, '组件 effect 里必须真的调它（少这一行就退回 F5 才恢复）').toContain('ensureJetHubStyles();')
+  })
+
+  it('定位自检独立于样式表（内联生效才不撑坏宿主）', () => {
+    expect(badge).toContain('window.getComputedStyle(element).position')
+    expect(badge, '自检必须在浮层打开时才做').toMatch(/if \(!open\) return;[\s\S]{0,200}getComputedStyle/)
   })
 
   it('信息不缺失：时间戳/缓存标记、停用与失败计数、套餐到期都仍在渲染里', () => {
