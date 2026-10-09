@@ -184,6 +184,41 @@ export function todayDayKey() {
 }
 
 /**
+ * GitHub 风格的每日用量格。缺失日期补 0，按 UTC+8 日期顺序排列，
+ * level 0–4 按当前窗口的最大日用量分档。
+ */
+export function historyHeatmapCells(historyDays, days = 30, endDay = todayDayKey()) {
+  const count = Math.max(1, Math.min(90, Math.trunc(Number(days) || 30)));
+  const [year, month, date] = String(endDay).slice(0, 10).split('-').map(Number);
+  const end = new Date(Date.UTC(year, month - 1, date));
+  const today = todayDayKey();
+  const totalsByDay = new Map((Array.isArray(historyDays) ? historyDays : [])
+    .filter((row) => typeof row?.day === 'string')
+    .map((row) => [row.day, row]));
+  const rows = [];
+  for (let offset = count - 1; offset >= 0; offset -= 1) {
+    const d = new Date(end.getTime() - offset * 86400000);
+    const day = d.toISOString().slice(0, 10);
+    const row = totalsByDay.get(day);
+    rows.push({
+      day,
+      weekday: d.getUTCDay(),
+      isToday: day === today,
+      requests: row?.totals?.requests ?? 0,
+      tokens: totalTokensOf(row?.totals),
+      level: 0,
+    });
+  }
+  const maxTokens = rows.reduce((max, row) => Math.max(max, row.tokens), 0);
+  for (const row of rows) {
+    if (row.tokens > 0 && maxTokens > 0) {
+      row.level = Math.min(4, Math.max(1, Math.ceil((row.tokens / maxTokens) * 4)));
+    }
+  }
+  return rows;
+}
+
+/**
  * 趋势图数据：每日一行（日键 + token 合计 + 请求数），新在前，最多 maxBars 根。
  *
  * ⚠️ 缺数据的天**不补零**（历史里没有键就是没用过）—— 补零需要造日历序列，

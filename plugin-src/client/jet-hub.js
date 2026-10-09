@@ -84,8 +84,6 @@ import {
   accountLabel,
   avgPerfDetailTooltip,
   avgPerfText,
-  barDayLabel,
-  barHeightPercent,
   channelCardTitle,
   channelLabel,
   channelOrder,
@@ -94,6 +92,7 @@ import {
   formatEntryTime,
   formatTps,
   formatTtft,
+  historyHeatmapCells,
   hasAnyData,
   historyTitle,
   HISTORY_RANGES,
@@ -103,7 +102,6 @@ import {
   tokenSummaryTooltip,
   todayDayKey,
   totalTokensOf,
-  trendBars,
 } from './token-ledger-panel.js';
 // ⚠️ `formatTokenCount` 用 jet-hub.js 自己的本地实现（有界渲染，见其注释）；
 // 面板模块的同名导出只供趋势图 tooltip 等**弹窗内部**使用，不在这里导入 ——
@@ -2065,7 +2063,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
    * ⚠️ 历史与明细是**两份独立数据**（落盘日聚合 vs 内存流水），各自加载、
    * 各自的刷新按钮——历史来自盘上（重启保留），明细来自内存。
    */
-  const [historyRange, setHistoryRange] = React.useState('7d');
+  const [historyRange, setHistoryRange] = React.useState('30d');
   const [historyFromDay, setHistoryFromDay] = React.useState('');
   const [historyToDay, setHistoryToDay] = React.useState('');
   const [history, setHistory] = React.useState(null);
@@ -2365,8 +2363,13 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
   // 「合计有数、却没有柱子」（空状态文案还反过来说「今天发起的请求明天才能看到」，
   // 而当天数据其实就在响应里）。
   const historyDays = Array.isArray(history?.history) ? history.history : [];
-  const bars = trendBars(historyDays, 90);
-  const maxTokens = bars.reduce((max, b) => Math.max(max, b.tokens), 0);
+  const heatmapDays = historyRange === 'custom'
+    ? Math.min(90, historyFromDay && historyToDay
+      ? Math.max(1, Math.round((Date.parse(historyToDay + 'T00:00:00Z') - Date.parse(historyFromDay + 'T00:00:00Z')) / 86400000) + 1)
+      : 30)
+    : rangeDaysOf(historyRange) || 90;
+  const heatmapEndDay = historyRange === 'custom' && historyToDay ? historyToDay : todayDayKey();
+  const heatmapCells = historyHeatmapCells(historyDays, heatmapDays, heatmapEndDay);
   const selectedHistoryDay = historyDays.find((d) => d?.day === (hoveredDay ?? expandedDay)) ?? null;
   const invalidHistoryRange = historyRange === 'custom' && historyFromDay && historyToDay && historyFromDay > historyToDay;
   const exportHistory = () => downloadCsv('token-usage-history.csv',
@@ -2423,34 +2426,39 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       ? React.createElement('div', { className: 'dim-jh-empty', key: 'histLoading' }, '正在读取历史用量…')
       : historyPhase === 'error'
         ? React.createElement('div', { className: 'dim-jh-empty', key: 'histError' }, '历史用量读取失败（不影响明细）。')
-        : bars.length === 0
+        : historyDays.length === 0
           ? React.createElement('div', { className: 'dim-jh-empty', key: 'histEmpty' },
               '还没有历史用量。请求完成后会立即按 UTC+8 日期累计，历史最多保留 90 天。')
           : React.createElement(React.Fragment, { key: 'histBody' },
-              // 趋势柱状图：每根柱 = 一天，点击下钻该日聚合树（再点收起）。
-              // ⚠️ 柱高必须传 `bars.length`：单日窗口下不传根数时最大柱恒 100%，
-              // 撑满容器成「白块」（见 barHeightPercent 的缺陷注释）。
-              React.createElement('div', { className: 'dim-jh-ledgerTrend', role: 'group', 'aria-label': '每日 Token 用量趋势' },
-                bars.map((b) => React.createElement('button', {
-                  key: b.day,
-                  className: 'dim-jh-ledgerTrendCol',
-                  type: 'button',
-                  title: `${b.day}\n总处理 ${formatTokenCount(b.tokens)}\n请求 ${b.requests} 次\n${tokenSummaryTooltip(historyDays.find((day) => day.day === b.day)?.totals)}\n点击展开当日明细`,
-                  'aria-label': `${b.day}，总处理 ${formatTokenCount(b.tokens)}，${b.requests} 次请求。点击展开`,
-                  onMouseEnter: () => setHoveredDay(b.day),
-                  onMouseLeave: () => setHoveredDay(null),
-                  onFocus: () => setHoveredDay(b.day),
-                  onBlur: () => setHoveredDay(null),
-                  onClick: () => setExpandedDay((prev) => (prev === b.day ? null : b.day)),
-                },
-                  React.createElement('div', {
-                    className: 'dim-jh-ledgerTrendBar',
-                    'data-today': b.isToday ? 'true' : 'false',
-                    'data-active': expandedDay === b.day ? 'true' : 'false',
-                    style: { height: barHeightPercent(b.tokens, maxTokens, bars.length) + '%' },
-                  }),
-                  // 日期短标签常驻显示：光靠色块无法区分哪天（tooltip 要 hover）。
-                  React.createElement('div', { className: 'dim-jh-ledgerTrendLabel' }, barDayLabel(b.day)))),
+              // GitHub 风格用量格：周为列、星期为行，点击有记录的日期展开详情。
+              React.createElement('div', { className: 'dim-jh-ledgerHeatmapWrap' },
+                React.createElement('div', { className: 'dim-jh-ledgerHeatmapWeekdays', 'aria-hidden': 'true' },
+                  ['日', '一', '二', '三', '四', '五', '六'].map((label) =>
+                    React.createElement('span', { key: label }, label))),
+                React.createElement('div', { className: 'dim-jh-ledgerHeatmap', role: 'group', 'aria-label': '每日 Token 用量热力图' },
+                  Array.from({ length: heatmapCells[0]?.weekday ?? 0 }, (_, i) =>
+                    React.createElement('span', { key: 'pad-' + i, className: 'dim-jh-ledgerHeatmapCell dim-jh-ledgerHeatmapCell--pad', 'aria-hidden': 'true' })),
+                  heatmapCells.map((cell) => React.createElement('button', {
+                    key: cell.day,
+                    className: 'dim-jh-ledgerHeatmapCell',
+                    type: 'button',
+                    'data-level': String(cell.level),
+                    'data-today': cell.isToday ? 'true' : 'false',
+                    'data-active': expandedDay === cell.day ? 'true' : 'false',
+                    title: `${cell.day}\n总处理 ${formatTokenCount(cell.tokens)}\n请求 ${cell.requests} 次\n${tokenSummaryTooltip(historyDays.find((day) => day.day === cell.day)?.totals)}\n点击展开当日明细`,
+                    'aria-label': `${cell.day}，总处理 ${formatTokenCount(cell.tokens)}，${cell.requests} 次请求。点击展开`,
+                    onMouseEnter: () => setHoveredDay(cell.day),
+                    onMouseLeave: () => setHoveredDay(null),
+                    onFocus: () => setHoveredDay(cell.day),
+                    onBlur: () => setHoveredDay(null),
+                    onClick: () => setExpandedDay((prev) => (prev === cell.day ? null : cell.day)),
+                  }))),
+                React.createElement('div', { className: 'dim-jh-ledgerHeatmapLegend', 'aria-hidden': 'true' },
+                  React.createElement('span', null, '少'),
+                  [0, 1, 2, 3, 4].map((level) => React.createElement('i', {
+                    key: level, className: 'dim-jh-ledgerHeatmapCell', 'data-level': String(level),
+                  })),
+                  React.createElement('span', null, '多'))),
               selectedHistoryDay ? React.createElement('div', { className: 'dim-jh-ledgerDayPeek' },
                 React.createElement('strong', null, selectedHistoryDay.day),
                 React.createElement('span', null, '总处理 ' + formatTokenCount(selectedHistoryDay.totals?.totalTokens)),
@@ -2466,7 +2474,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
               ...(expandedDay !== null
                 ? historyDays.filter((d) => d?.day === expandedDay).map((dayRow) =>
                     renderDayTree(dayRow))
-                : [])));
+                : []));
     return React.createElement('div', { className: 'dim-jh-ledgerSection', key: 'history' },
       React.createElement('div', { className: 'dim-jh-ledgerSectionTitle' },
         historyTitle(historyRange)),

@@ -558,29 +558,25 @@ const STYLES = `
 .dim-jh-ledgerModelTokens { flex: none; font-size: 11.5px; line-height: 17px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-primary, #1f2329); white-space: nowrap; }
 /* 均值格（首字 · 速率）：三级汇总行（渠道/账号/模型）共用，等宽数字对齐。 */
 .dim-jh-ledgerPerf { flex: none; font-size: 11px; line-height: 16px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
-/* ── 历史视图（第 4 期）：趋势柱状图 + 展开的日聚合树 ──
-   柱状图用纯 div（不引图表库）：每根柱 = 一天，高度按相对最大值的百分比。
-   ⚠️ 容器 height 由 barHeightPercent 的**百分比**决定上限（88%），故这里留出
-   足够净高；柱宽**不能**靠 flex 拉伸填满 —— 单日窗口只有一根柱时
-   flex: 1 0 14px 会把它横向拉满整行，呈现为「一整条白块」。
-   故给单柱/少柱窗口一个 max-width，让它保持柱子的形状。 */
+/* ── 历史视图（第 4 期）：GitHub 风格每日用量格 + 展开的日聚合树 ── */
 .dim-jh-ledgerSection { margin-bottom: 14px; }
 .dim-jh-ledgerSectionTitle { font-size: 13px; line-height: 19px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); margin-bottom: 6px; }
-.dim-jh-ledgerTrend { display: flex; align-items: flex-end; gap: 4px; height: 82px; padding: 4px 2px 0; overflow-x: auto; }
-/* 柱子列：横向可滚、但单柱不吃满宽（见上方注释）。 */
-.dim-jh-ledgerTrendCol { appearance: none; flex: 1 0 20px; min-width: 20px; max-width: 56px; height: 100%; display: flex; flex-direction: column; align-items: stretch; justify-content: flex-end; gap: 3px; padding: 0; border: 0; background: transparent; cursor: pointer; }
-.dim-jh-ledgerTrendCol:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #1677ff); outline-offset: 2px; border-radius: 3px; }
-/* ⚠️ 颜色必须**自带可见性**：品牌变量 --dsw-alias-brand-primary 只在变量
-   *缺失* 时才走 #1677ff 兜底；一旦宿主主题把它定义成接近底色的浅色，再叠
-   opacity 就会退化成一块与背景同色的「白块」（真实缺陷 2026-10-07，深色主题
-   实测）。故：① opacity 从 .45 提到 .55（仍是「未选中」的弱化语义），
-   ② 补 box-shadow 描边 —— 即使底色与背景同色也留有边界，不会「消失」。 */
-.dim-jh-ledgerTrendBar { width: 100%; min-height: 2px; border-radius: 3px 3px 0 0; background: var(--dsw-alias-brand-primary, #1677ff); box-shadow: inset 0 0 0 1px rgba(127,127,127,.45); opacity: .55; transition: opacity .12s ease; }
-.dim-jh-ledgerTrendBar:hover { opacity: .8; }
-.dim-jh-ledgerTrendBar[data-today="true"] { opacity: .95; }
-.dim-jh-ledgerTrendBar[data-active="true"] { opacity: 1; outline: 1.5px solid var(--dsw-alias-brand-primary, #1677ff); }
-/* 日期短标签：常驻显示 MM-DD，根治「不知道哪根柱是哪天」。 */
-.dim-jh-ledgerTrendLabel { flex: none; font-size: 10px; line-height: 12px; text-align: center; color: var(--dsw-alias-label-tertiary, #8f959e); font-variant-numeric: tabular-nums; }
+.dim-jh-ledgerHeatmapWrap { display: flex; align-items: flex-start; gap: 7px; width: 100%; overflow-x: auto; padding: 4px 3px 8px; }
+.dim-jh-ledgerHeatmapWeekdays { flex: none; display: grid; grid-template-rows: repeat(7, 12px); gap: 4px; padding-top: 0; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 9px; line-height: 12px; text-align: right; }
+.dim-jh-ledgerHeatmap { flex: none; display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 12px); grid-auto-columns: 12px; gap: 4px; }
+.dim-jh-ledgerHeatmapCell { appearance: none; box-sizing: border-box; width: 12px; height: 12px; padding: 0; border: 1px solid rgba(34, 211, 238, .16); border-radius: 3px; background: rgba(34, 211, 238, .07); box-shadow: 0 0 2px rgba(34, 211, 238, .08); transition: background .12s ease, box-shadow .12s ease, transform .12s ease; }
+.dim-jh-ledgerHeatmap button.dim-jh-ledgerHeatmapCell { cursor: pointer; }
+.dim-jh-ledgerHeatmapCell[data-level="1"] { background: rgba(34, 211, 238, .25); box-shadow: 0 0 4px rgba(34, 211, 238, .16); }
+.dim-jh-ledgerHeatmapCell[data-level="2"] { background: rgba(34, 211, 238, .46); box-shadow: 0 0 5px rgba(34, 211, 238, .28); }
+.dim-jh-ledgerHeatmapCell[data-level="3"] { background: rgba(6, 182, 212, .84); border-color: rgba(103, 232, 249, .75); box-shadow: 0 0 7px rgba(34, 211, 238, .5); }
+.dim-jh-ledgerHeatmapCell[data-level="4"] { background: #0e7490; border-color: #67e8f9; box-shadow: 0 0 12px rgba(34, 211, 238, .9), inset 0 0 5px rgba(103, 232, 249, .72); }
+.dim-jh-ledgerHeatmapCell--pad { border-color: transparent; background: transparent; box-shadow: none; }
+.dim-jh-ledgerHeatmap button.dim-jh-ledgerHeatmapCell:hover { transform: scale(1.18); border-color: #a5f3fc; box-shadow: 0 0 10px rgba(34, 211, 238, .8); }
+.dim-jh-ledgerHeatmapCell[data-today="true"] { outline: 1px solid #cffafe; outline-offset: 1px; }
+.dim-jh-ledgerHeatmapCell[data-active="true"] { outline: 2px solid #67e8f9; outline-offset: 2px; }
+.dim-jh-ledgerHeatmap button.dim-jh-ledgerHeatmapCell:focus-visible { outline: 2px solid #cffafe; outline-offset: 2px; }
+.dim-jh-ledgerHeatmapLegend { display: flex; align-items: center; gap: 4px; margin: 0 0 0 auto; padding: 2px 3px; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 10px; white-space: nowrap; }
+.dim-jh-ledgerHeatmapLegend .dim-jh-ledgerHeatmapCell { width: 10px; height: 10px; }
 .dim-jh-ledgerDayPeek { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px; min-height: 30px; margin-top: 7px; padding: 5px 9px; border-radius: 7px; background: var(--dsw-alias-bg-layer-2, #f7f8fa); color: var(--dsw-alias-label-secondary, #4e5969); font-size: 11.5px; }
 .dim-jh-ledgerDayPeek strong { color: var(--dsw-alias-label-primary, #1f2329); }
 .dim-jh-ledgerChartHint { margin-top: 7px; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 11px; }
