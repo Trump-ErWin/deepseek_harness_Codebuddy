@@ -275,9 +275,8 @@ export async function* recordThroughStream(
   let failure: string | undefined
   try {
     for await (const chunk of withTokenLedgerAccountContext(openStream(), accountContext)) {
-      // 首块计时：任何 chunk（思考/正文/工具调用都算「模型开始说话」）。
-      // ⚠️ 必须在具体类型判断**之前**：漏块会让「只有思考增量的慢启动」被记成 0。
-      if (ttftMs === 0) ttftMs = Date.now() - meta.startedAt
+      // 结构帧和 usage 只携带元数据，不代表模型已开始输出内容。
+      if (ttftMs === 0 && isContentChunk(chunk)) ttftMs = Date.now() - meta.startedAt
       if (
         typeof chunk === 'object' && chunk !== null
         && (chunk as { type?: unknown }).type === 'usage'
@@ -333,6 +332,24 @@ export async function* recordThroughStream(
       ...(failure !== undefined ? { error: failure } : {}),
     })
   }
+}
+
+/** 判断是否为首字计时应采纳的真实内容帧。 */
+function isContentChunk(chunk: unknown): boolean {
+  if (typeof chunk !== 'object' || chunk === null) return false
+  const type = (chunk as { type?: unknown }).type
+  return typeof type === 'string' && (
+    type === 'text'
+    || type === 'reasoning'
+    || type === 'image'
+    || type === 'tool-call'
+    || type === 'tool-result'
+    || type === 'text-delta'
+    || type === 'reasoning-delta'
+    || type === 'image-delta'
+    || type === 'tool-call-delta'
+    || type === 'tool-result-delta'
+  )
 }
 
 /**
