@@ -41,7 +41,7 @@ describe('createTokenLedgerStore（文件后端）', () => {
       expect(existsSync(file)).toBe(true)
       // 落盘格式带 schema 标记
       const doc = JSON.parse(readFileSync(file, 'utf-8')) as { schema?: string; days?: unknown }
-      expect(doc.schema).toContain('token-ledger/v1')
+      expect(doc.schema).toContain('token-ledger/v2')
 
       // 新实例读回：累计值一致
       const store3 = createTokenLedgerStore({ logger: undefined } as never)

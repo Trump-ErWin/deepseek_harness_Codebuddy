@@ -2215,7 +2215,10 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       React.createElement('thead', null,
         React.createElement('tr', null,
           ['时间', '渠道', '模型', 'TOKEN', '首字', '速率', '耗时'].map((h) =>
-            React.createElement('th', { key: h }, h)))),
+            React.createElement('th', {
+              key: h,
+              title: h === 'TOKEN' ? '总处理量 = 未命中缓存输入 + 缓存命中输入 + 输出；缓存写入单列展示，不重复计入总量' : undefined,
+            }, h)))),
       React.createElement('tbody', null, entries.map((entry, index) => React.createElement('tr', {
         key: entry.ts + '-' + index,
         title: entry.error !== undefined ? '失败：' + entry.error : undefined,
