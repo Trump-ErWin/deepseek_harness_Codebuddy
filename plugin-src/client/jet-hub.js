@@ -2430,14 +2430,9 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
           ? React.createElement('div', { className: 'dim-jh-empty', key: 'histEmpty' },
               '还没有历史用量。请求完成后会立即按 UTC+8 日期累计，历史最多保留 90 天。')
           : React.createElement(React.Fragment, { key: 'histBody' },
-              // GitHub 风格用量格：周为列、星期为行，点击有记录的日期展开详情。
+              // GitHub 风格用量格：固定四行，按日期顺序排列，点击可展开当日详情。
               React.createElement('div', { className: 'dim-jh-ledgerHeatmapWrap' },
-                React.createElement('div', { className: 'dim-jh-ledgerHeatmapWeekdays', 'aria-hidden': 'true' },
-                  ['日', '一', '二', '三', '四', '五', '六'].map((label) =>
-                    React.createElement('span', { key: label }, label))),
                 React.createElement('div', { className: 'dim-jh-ledgerHeatmap', role: 'group', 'aria-label': '每日 Token 用量热力图' },
-                  Array.from({ length: heatmapCells[0]?.weekday ?? 0 }, (_, i) =>
-                    React.createElement('span', { key: 'pad-' + i, className: 'dim-jh-ledgerHeatmapCell dim-jh-ledgerHeatmapCell--pad', 'aria-hidden': 'true' })),
                   heatmapCells.map((cell) => React.createElement('button', {
                     key: cell.day,
                     className: 'dim-jh-ledgerHeatmapCell',
@@ -2452,13 +2447,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
                     onFocus: () => setHoveredDay(cell.day),
                     onBlur: () => setHoveredDay(null),
                     onClick: () => setExpandedDay((prev) => (prev === cell.day ? null : cell.day)),
-                  }))),
-                React.createElement('div', { className: 'dim-jh-ledgerHeatmapLegend', 'aria-hidden': 'true' },
-                  React.createElement('span', null, '少'),
-                  [0, 1, 2, 3, 4].map((level) => React.createElement('i', {
-                    key: level, className: 'dim-jh-ledgerHeatmapCell', 'data-level': String(level),
-                  })),
-                  React.createElement('span', null, '多'))),
+                  })))),
               selectedHistoryDay ? React.createElement('div', { className: 'dim-jh-ledgerDayPeek' },
                 React.createElement('strong', null, selectedHistoryDay.day),
                 React.createElement('span', null, '总处理 ' + formatTokenCount(selectedHistoryDay.totals?.totalTokens)),

@@ -202,7 +202,6 @@ export function historyHeatmapCells(historyDays, days = 30, endDay = todayDayKey
     const row = totalsByDay.get(day);
     rows.push({
       day,
-      weekday: d.getUTCDay(),
       isToday: day === today,
       requests: row?.totals?.requests ?? 0,
       tokens: totalTokensOf(row?.totals),
