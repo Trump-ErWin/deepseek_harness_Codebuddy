@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+
 /**
  * **Token 账本**（全 provider 的用量流水 + 渠道 × provider × 模型三维聚合）。
  *
@@ -185,21 +187,15 @@ let ledger: TokenLedgerEntry[] = []
  * 凭据解析点调用 {@link reportLedgerAccount}，包装层在**收到 usage 帧**
  * 时读取（彼时凭据必然已解析，见 `llm-register-compat.ts` 的时序说明）。
  *
- * ## 归属精度（如实写进 issue 的近似声明）
- *
- * - **单账号 provider**（绝大多数用户每个 provider 只登一个号）⇒ 精确。
- * - **多账号 + 流内换号**：归属记录的是「解析出凭据的那个账号」——
- *   即本轮请求的**起点**。换号（额度用尽等）后 usage 归到新账号要等
- *   该账号再次回报；在换号即时性上它是**近似**，不是 cline-request-log
- *   那种「最终服务账号」的精确口径。
- * - 并发流共用同一 provider 的注册表槽位 ⇒ 交错时按「最后回报」归属。
- *   这是把改动收敛到侧信道的**有意取舍**（全量精确需改 13 个适配器的
- *   内部状态机，收益比不符）。
+ * 每个记账流通过 AsyncLocalStorage 持有独立账号上下文；并发请求不会互相覆盖，
+ * 流内换号时适配器的后续回报会更新当前请求归属。流外回报仍留在 fallback 表，
+ * 用于尚未进入记账流的初始化路径。
  */
 const reportedAccounts = new Map<string, string>()
+const requestAccount = new AsyncLocalStorage<{ accountId: string }>()
 
 /**
- * 回报「该 provider 最近解析出的账号」（凭据解析点调用）。
+ * 回报本请求解析出的账号（凭据解析点调用）。
  *
  * ⚠️ 绝不抛错：它与 {@link recordTokenUsage} 同在推理关键路径上。
  * 空串 / 非串入参直接忽略（不清空旧值 —— 清空语义属于 {@link clearLedgerAccount}）。
@@ -208,6 +204,11 @@ export function reportLedgerAccount(provider: string, accountId: string): void {
   try {
     if (typeof provider !== 'string' || provider.length === 0) return
     if (typeof accountId !== 'string' || accountId.length === 0) return
+    const scoped = requestAccount.getStore()
+    if (scoped !== undefined) {
+      scoped.accountId = accountId.slice(0, 64)
+      return
+    }
     reportedAccounts.set(provider.slice(0, 64), accountId.slice(0, 64))
   } catch {
     // 回报失败绝不反噬推理。
@@ -216,7 +217,22 @@ export function reportLedgerAccount(provider: string, accountId: string): void {
 
 /** 读取该 provider 当前记录的账号（包装层在 usage 帧到达时调用）。 */
 export function peekLedgerAccount(provider: string): string {
+  const scoped = requestAccount.getStore()?.accountId
+  if (scoped) return scoped
   return reportedAccounts.get(provider) ?? ''
+}
+
+/** 每次推进异步流时绑定独立上下文，避免并发请求串用账号归属。 */
+export async function* withTokenLedgerAccountContext<T>(
+  iterable: AsyncIterable<T>,
+  context: { accountId: string },
+): AsyncIterable<T> {
+  const iterator = iterable[Symbol.asyncIterator]()
+  while (true) {
+    const result = await requestAccount.run(context, () => iterator.next())
+    if (result.done) return
+    yield result.value
+  }
 }
 
 /** 诊断用：注册表当前条数。 */
