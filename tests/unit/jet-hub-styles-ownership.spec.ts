@@ -153,6 +153,8 @@ interface FakeStyle {
   attrs: Record<string, string>
   textContent: string
   dataset: Record<string, string>
+  /** 真实 DOM 的 parentNode：null 表示已不在文档里（disposer 用它判断能否释放）。 */
+  parentNode: { children: FakeStyle[] } | null
   setAttribute(k: string, v: string): void
   getAttribute(k: string): string | null
   remove(): void
@@ -164,11 +166,13 @@ function makeElement(tag: string): FakeStyle {
     attrs: {},
     textContent: '',
     dataset: {},
+    parentNode: head,
     setAttribute(k, v) { el.attrs[k] = String(v) },
     getAttribute(k) { return Object.prototype.hasOwnProperty.call(el.attrs, k) ? el.attrs[k] : null },
     remove() {
       const i = head.children.indexOf(el)
       if (i >= 0) head.children.splice(i, 1)
+      el.parentNode = null
     },
   }
   // `dataset.plugin` ⇄ `data-plugin` 的双向映射 —— 宿主自家构建预设用的正是
@@ -202,7 +206,12 @@ async function withDom<T>(run: () => Promise<T>): Promise<T> {
   const globals = globalThis as unknown as Record<string, unknown>
   const saved = { document: globals.document, window: globals.window }
   globals.document = {
-    head: { appendChild(el: FakeStyle) { head.children.push(el) } },
+    head: {
+      appendChild(el: FakeStyle) { head.children.push(el) },
+      // ⚠️ IKKGYN 起 styleElement() 改走 document.head.querySelector（而不是
+      // document.querySelector），桩必须跟上 —— 真实 DOM 两个入口等价。
+      querySelector: (sel: string) => matches(sel)[0] ?? null,
+    },
     createElement: makeElement,
     querySelectorAll: matches,
     querySelector: (sel: string) => matches(sel)[0] ?? null,
@@ -233,6 +242,13 @@ async function loadInstaller(): Promise<() => (() => void)> {
   const url = `${pathToFileURL(resolve(REPO_ROOT, 'plugin-src/client/jet-hub-styles.js')).href}?v=${++seq}`
   const mod = await import(/* @vite-ignore */ url) as { installJetHubStyles: () => () => void }
   return mod.installJetHubStyles
+}
+
+/** IKKGYN 追加：加载 `ensureJetHubStyles`（渲染期自愈入口）。 */
+async function loadEnsurer(): Promise<() => boolean> {
+  const url = `${pathToFileURL(resolve(REPO_ROOT, 'plugin-src/client/jet-hub-styles.js')).href}?v=${++seq}`
+  const mod = await import(/* @vite-ignore */ url) as { ensureJetHubStyles: () => boolean }
+  return mod.ensureJetHubStyles
 }
 
 describe('Jet Hub 样式表归属（IKK764）', () => {
@@ -428,6 +444,146 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
       // 缺陷版特征 3：再次 apply 不自愈（模块级布尔）
       install()
       expect(styleTags(), '缺陷版必须不自愈').toHaveLength(0)
+    })
+  })
+})
+
+/**
+ * 引用计数与渲染期自愈（Gitee issue IKKGYN）。
+ *
+ * ## 两个缺陷（本机 CDP 真机实测复现，非推断）
+ *
+ * ① **旧 disposer 误删后注入的那张**：旧 disposer 是
+ *    `document.querySelector(STYLE_SELECTOR)?.remove()` —— 删的是「当前那张」，
+ *    不是「自己注入的那张」。宿主 `replace()` 会先 `tearDownEntryFiber`
+ *    （`await fiber.inertia`）再重新 import，故 dispose 天然**晚于**新的 apply。
+ *    实测：新表 1 份 → 旧 disposer 跑完 → 0 份，且此后无人补注（回到掉样式面）。
+ *
+ * ② **apply 之外无人补注**：`installJetHubStyles` 只挂在 `ctx.effect`，渲染路径
+ *    不会重跑。实测：删掉签名样式表后，开/关浮层、切 provider 重挂载，样式表
+ *    都是 0 份，只有 F5 整页重载才恢复。
+ */
+describe('Jet Hub 样式表：引用计数与渲染期自愈（IKKGYN）', () => {
+  it('⚠️ 旧 disposer 不得删掉「后注入的那张」（宿主 replace 的真实时序）', async () => {
+    await withDom(async () => {
+      const install = await loadInstaller()
+      // 旧实例：注入并持有 disposer
+      const oldDispose = install()
+      const oldTag = styleTags()[0]!
+      expect(styleTags()).toHaveLength(1)
+
+      // 宿主 replace 时序：removeOwnedStyles(自己) → 新 factory 重跑 → 新 apply
+      inlineBehavior.removeOwnedStyles('dsh-codearts-auth')
+      expect(styleTags()).toHaveLength(0)
+      install() // 新实例注入了一张**新**标签
+      expect(styleTags(), '新实例应注入一张新标签').toHaveLength(1)
+      const newTag = styleTags()[0]!
+      expect(newTag, '必须是不同的元素（否则测不到「删错对象」）').not.toBe(oldTag)
+
+      // 旧 disposer 这时才跑（cordis inertia 让 dispose 晚于新的 apply）
+      oldDispose()
+
+      expect(styleTags(),
+        '旧 disposer 只能释放自己闭包里那张，绝不能删掉后注入的新表').toHaveLength(1)
+      expect(styleTags()[0], '幸存的必须是新表').toBe(newTag)
+    })
+  })
+
+  it('同一个 disposer 被调用两次只释放一次（cordis 重入不得二次减计数）', async () => {
+    await withDom(async () => {
+      const install = await loadInstaller()
+      const disposeA = install() // 实例 A：计数 1
+      const disposeB = install() // 实例 B：计数 2
+      expect(styleTags()[0]!.dataset.jetHubRefs).toBe('2')
+
+      disposeA() // 计数 1，标签仍在
+      expect(styleTags()).toHaveLength(1)
+
+      // ⚠️ cordis 允许同一 disposer 被调用两次。若 released 守卫失效，
+      // 这次重入会把计数从 1 再减到 0 ⇒ 提前删掉 B 仍持有的标签。
+      disposeA()
+      expect(styleTags()[0]!.dataset.jetHubRefs,
+        '重入不得二次减计数（B 仍持有，标签必须还在且计数不变）').toBe('1')
+      expect(styleTags(), '重入不得提前删表').toHaveLength(1)
+
+      disposeB()
+      expect(styleTags(), 'B 释放后（计数归零）应删除').toHaveLength(0)
+    })
+  })
+
+  it('多个持有者：最后一个释放者才删表', async () => {
+    await withDom(async () => {
+      const install = await loadInstaller()
+      const disposeA = install()
+      const disposeB = install()
+      expect(styleTags()).toHaveLength(1)
+      expect(styleTags()[0]!.dataset.jetHubRefs).toBe('2')
+
+      disposeA()
+      expect(styleTags(), '还有一个持有者时不得删表').toHaveLength(1)
+      expect(styleTags()[0]!.dataset.jetHubRefs).toBe('1')
+
+      disposeB()
+      expect(styleTags(), '最后一个持有者释放后应删除').toHaveLength(0)
+    })
+  })
+
+  it('⚠️ 标签被外力删掉后，渲染期自愈能补回（不必 F5）', async () => {
+    await withDom(async () => {
+      const install = await loadInstaller()
+      const ensure = await loadEnsurer()
+      install()
+      expect(styleTags()).toHaveLength(1)
+
+      // 外力删除（宿主回收 / 热更新 / 误删）
+      styleTags()[0]!.remove()
+      expect(styleTags()).toHaveLength(0)
+
+      expect(ensure(), 'ensure 必须报告「补了一次」').toBe(true)
+      expect(styleTags(), '渲染期自愈必须补回样式表').toHaveLength(1)
+      expect(owners(), '补回的表仍须署名（否则又会被认领走）').toEqual(['dsh-codearts-auth'])
+
+      // 幂等：已在场时不得重复注入
+      expect(ensure(), '已在场时必须返回 false（不重复注入）').toBe(false)
+      expect(styleTags()).toHaveLength(1)
+    })
+  })
+
+  it('⚠️ 反向验证：disposer 改回「释放即删当前那张」，误删用例必须变红', async () => {
+    await withDom(async () => {
+      // 精确复刻 IKK764 旧 disposer 的语义
+      const install = () => {
+        const existing = document.head.querySelector('style[data-plugin-css="dsh-codearts-auth/jet-hub.css"]')
+        if (existing !== null) return () => {}
+        const style = document.createElement('style')
+        style.dataset.plugin = 'dsh-codearts-auth'
+        style.dataset.pluginCss = 'dsh-codearts-auth/jet-hub.css'
+        style.textContent = '.dim-jh-page{}'
+        document.head.appendChild(style)
+        return () => {
+          document.head.querySelector('style[data-plugin-css="dsh-codearts-auth/jet-hub.css"]')?.remove()
+        }
+      }
+      const oldDispose = install()
+      const oldTag = styleTags()[0]!
+      inlineBehavior.removeOwnedStyles('dsh-codearts-auth')
+      install()
+      const newTag = styleTags()[0]!
+      expect(newTag).not.toBe(oldTag)
+      oldDispose()
+      // ⚠️ 缺陷版特征：把「后注入的那张」也删了
+      expect(styleTags(), '缺陷版必须表现为误删新表').toHaveLength(0)
+    })
+  })
+
+  it('⚠️ 反向验证：去掉渲染期自愈（ensure 恒返回 false），自愈用例必须变红', async () => {
+    await withDom(async () => {
+      const defectiveEnsure = () => false
+      const install = await loadInstaller()
+      install()
+      styleTags()[0]!.remove()
+      expect(defectiveEnsure(), '缺陷版必须表现为不补注').toBe(false)
+      expect(styleTags(), '缺陷版必须不自愈（这正是 IKKGYN 的症状面）').toHaveLength(0)
     })
   })
 })
