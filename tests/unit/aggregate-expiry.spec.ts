@@ -165,10 +165,9 @@ describe('★ WIRED_EXPIRY_PROVIDERS 必须与 createExpiryProbe 的 switch 一�
       const probed: string[] = []
       const probe = createExpiryProbe({
         disabledModelsFor: () => new Set<string>(),
-        // ⚠️ 凭据形状故意不匹配 ⇒ 折算会失败，但**取号与读目录必须发生**。
-        listAvailableCredentials: async () => [
-          { entry: { id: 'a1' }, credential: { access_token: 'x' } },
-        ],
+        // 目录读取后返回空账号池，避免单测继续触发各 provider 的真实额度接口。
+        // 本用例只验证每个接入渠道都会读取目录，不测试额度折算本身。
+        listAvailableCredentials: async () => [],
       } as never, async (p: string) => { probed.push(p); return 'm1' })
       await probe(provider).catch(() => undefined)
       expect(probed, `${provider} 必须走过折算路径（读目录），不能在短路处提前返回`)

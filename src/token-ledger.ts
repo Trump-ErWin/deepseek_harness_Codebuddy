@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+
 /**
  * **Token 账本**（全 provider 的用量流水 + 渠道 × provider × 模型三维聚合）。
  *
@@ -67,9 +69,9 @@ export interface TokenLedgerEntry {
   /** 思考 token（缺失时省略；已含在 outputTokens 内）。 */
   reasoningTokens?: number
   /**
-   * **首个内容块耗时**（毫秒）—— 用户口中的「首字用时」。
+   * **首个内容块耗时**（毫秒）—— 用户口中的「首字用时」，忽略结构帧与 usage 元数据。
    *
-   * 口径与 `cline-request-log.ttftMs` 一致：**收到任何一块**（含思考增量）
+   * 口径与 `cline-request-log.ttftMs` 一致：收到文本、思考、图片或工具内容帧
    * 的时刻 − 请求发起。0 = 整个流没有产出任何块（失败 / 秒回空），展示层
    * 按「不可测」处理（显示 `—`），不显示 0。
    */
@@ -101,6 +103,8 @@ export interface TokenLedgerModelRow {
   cacheReadTokens: number
   cacheWriteTokens: number
   reasoningTokens: number
+  /** 总处理量 = 未命中缓存的输入 + 缓存命中输入 + 输出；缓存写入不重复计入。 */
+  totalTokens: number
   /** 失败请求数。 */
   errors: number
   /**
@@ -114,15 +118,16 @@ export interface TokenLedgerModelRow {
    * 「每笔请求的速率」的算术平均，口径与用户直觉一致）。无可测请求时
    * `undefined`。
    *
-   * ⚠️ **是算术均值，对离群样本敏感**（用户 2026-10-07 报障）：虽然源头已
-   * 丢弃 `decodeMs` 过短的样本（见 {@link MIN_DECODE_MS_FOR_TPS}），但「一笔
-   * 极快 + 大量极慢」的混合分布下算术均值仍缺乏代表性。要改用中位数需新增
-   * 分位数存储字段并迁移 `token-ledger.json`，风险更高，另行处理。
+   * ⚠️ **是算术均值，对离群样本敏感**：保留该字段以兼容既有口径；同时提供
+   * 基于持久化直方图估算的 P50/P90，便于观察典型速度和慢速尾部。
    *
-   * ⚠️ 已落盘的 `tpsSum/tpsCount` 是**修复前**的累加值（含离群样本），
-   * 重启后读到的历史视图仍会显示被污染的均值 —— 见 flush/迁移说明。
+   * ⚠️ 已落盘的 `tpsSum/tpsCount` 仍可能含早期离群样本；P50/P90 从直方图完整
+   * 覆盖样本后才显示，避免把不完整的分布误当成完整统计。
    */
   avgTps?: number
+  /** 日志 TPS 直方图估算的中位数与 P90；旧账本没有样本时省略。 */
+  p50Tps?: number
+  p90Tps?: number
 }
 
 /** 一个 provider 下、某个账号的聚合（模型行 + 自身小计）。 */
@@ -171,6 +176,62 @@ export const TOKEN_LEDGER_LIMIT = 500
  */
 export const MIN_DECODE_MS_FOR_TPS = 100
 
+/** 稀疏对数直方图：每八分之一倍频程一个桶，覆盖 0.1 到约 1.5M tok/s。 */
+export const TPS_HISTOGRAM_BINS = 192
+const TPS_HISTOGRAM_MIN = 0.1
+const TPS_HISTOGRAM_STEPS_PER_OCTAVE = 8
+
+function tpsBin(value: number): number {
+  return Math.min(TPS_HISTOGRAM_BINS - 1, Math.max(0,
+    Math.floor(Math.log2(Math.max(value, TPS_HISTOGRAM_MIN) / TPS_HISTOGRAM_MIN)
+      * TPS_HISTOGRAM_STEPS_PER_OCTAVE),
+  ))
+}
+
+function tpsBinRepresentative(bin: number): number {
+  const value = TPS_HISTOGRAM_MIN * 2 ** ((bin + 0.5) / TPS_HISTOGRAM_STEPS_PER_OCTAVE)
+  return Math.round(value * 10) / 10
+}
+
+function addTpsSample(histogram: Record<string, number>, value: number): void {
+  const key = String(tpsBin(value))
+  histogram[key] = (histogram[key] ?? 0) + 1
+}
+
+function mergeTpsHistograms(
+  a: Record<string, number> | undefined,
+  b: Record<string, number> | undefined,
+  subtract = false,
+): Record<string, number> {
+  const out: Record<string, number> = { ...(a ?? {}) }
+  for (const [key, value] of Object.entries(b ?? {})) {
+    const next = (out[key] ?? 0) + (subtract ? -value : value)
+    if (next > 0) out[key] = next
+    else delete out[key]
+  }
+  return out
+}
+
+function histogramQuantile(histogram: Record<string, number>, quantile: number): number | undefined {
+  const entries = Object.entries(histogram)
+    .map(([key, count]) => [Number(key), count] as const)
+    .filter(([bin, count]) => Number.isInteger(bin) && bin >= 0 && bin < TPS_HISTOGRAM_BINS && count > 0)
+    .sort(([a], [b]) => a - b)
+  const total = entries.reduce((sum, [, count]) => sum + count, 0)
+  if (total === 0) return undefined
+  const target = Math.ceil(total * quantile)
+  let seen = 0
+  for (const [bin, count] of entries) {
+    seen += count
+    if (seen >= target) return tpsBinRepresentative(bin)
+  }
+  return undefined
+}
+
+function histogramSampleCount(histogram: Record<string, number>): number {
+  return Object.values(histogram).reduce((sum, count) => sum + count, 0)
+}
+
 /** 内存中的流水（最新在前）。 */
 let ledger: TokenLedgerEntry[] = []
 
@@ -185,21 +246,28 @@ let ledger: TokenLedgerEntry[] = []
  * 凭据解析点调用 {@link reportLedgerAccount}，包装层在**收到 usage 帧**
  * 时读取（彼时凭据必然已解析，见 `llm-register-compat.ts` 的时序说明）。
  *
- * ## 归属精度（如实写进 issue 的近似声明）
- *
- * - **单账号 provider**（绝大多数用户每个 provider 只登一个号）⇒ 精确。
- * - **多账号 + 流内换号**：归属记录的是「解析出凭据的那个账号」——
- *   即本轮请求的**起点**。换号（额度用尽等）后 usage 归到新账号要等
- *   该账号再次回报；在换号即时性上它是**近似**，不是 cline-request-log
- *   那种「最终服务账号」的精确口径。
- * - 并发流共用同一 provider 的注册表槽位 ⇒ 交错时按「最后回报」归属。
- *   这是把改动收敛到侧信道的**有意取舍**（全量精确需改 13 个适配器的
- *   内部状态机，收益比不符）。
+ * 每个记账流通过 AsyncLocalStorage 持有独立账号上下文；并发请求不会互相覆盖，
+ * 流内换号时适配器的后续回报会更新当前请求归属。流外回报仍留在 fallback 表，
+ * 用于尚未进入记账流的初始化路径。
  */
 const reportedAccounts = new Map<string, string>()
+const requestAccount = new AsyncLocalStorage<{ accountId: string }>()
+
+/** 为一次调用创建可跨 prepareCall 与 stream 传递的账号上下文。 */
+export function createTokenLedgerAccountContext(): { accountId: string } {
+  return { accountId: '' }
+}
+
+/** 在指定调用上下文中执行同步或异步工作。 */
+export function runWithTokenLedgerAccountContext<T>(
+  context: { accountId: string },
+  action: () => T,
+): T {
+  return requestAccount.run(context, action)
+}
 
 /**
- * 回报「该 provider 最近解析出的账号」（凭据解析点调用）。
+ * 回报本请求解析出的账号（凭据解析点调用）。
  *
  * ⚠️ 绝不抛错：它与 {@link recordTokenUsage} 同在推理关键路径上。
  * 空串 / 非串入参直接忽略（不清空旧值 —— 清空语义属于 {@link clearLedgerAccount}）。
@@ -208,6 +276,11 @@ export function reportLedgerAccount(provider: string, accountId: string): void {
   try {
     if (typeof provider !== 'string' || provider.length === 0) return
     if (typeof accountId !== 'string' || accountId.length === 0) return
+    const scoped = requestAccount.getStore()
+    if (scoped !== undefined) {
+      scoped.accountId = accountId.slice(0, 64)
+      return
+    }
     reportedAccounts.set(provider.slice(0, 64), accountId.slice(0, 64))
   } catch {
     // 回报失败绝不反噬推理。
@@ -216,7 +289,22 @@ export function reportLedgerAccount(provider: string, accountId: string): void {
 
 /** 读取该 provider 当前记录的账号（包装层在 usage 帧到达时调用）。 */
 export function peekLedgerAccount(provider: string): string {
+  const scoped = requestAccount.getStore()?.accountId
+  if (scoped) return scoped
   return reportedAccounts.get(provider) ?? ''
+}
+
+/** 每次推进异步流时绑定独立上下文，避免并发请求串用账号归属。 */
+export async function* withTokenLedgerAccountContext<T>(
+  iterable: AsyncIterable<T>,
+  context: { accountId: string },
+): AsyncIterable<T> {
+  const iterator = iterable[Symbol.asyncIterator]()
+  while (true) {
+    const result = await requestAccount.run(context, () => iterator.next())
+    if (result.done) return
+    yield result.value
+  }
 }
 
 /** 诊断用：注册表当前条数。 */
@@ -240,6 +328,8 @@ export interface TokenLedgerBackend {
   append(entry: TokenLedgerEntry): void
   /** 读取日聚合表（**纯内存读**，不碰磁盘 —— 见 store 的注释）。 */
   load(): TokenLedgerDayMap
+  /** 删除单个 UTC+8 日期的历史累计。 */
+  deleteDay?(day: string): boolean
 }
 
 /**
@@ -302,6 +392,22 @@ export function readTokenLedgerDayMap(): TokenLedgerDayMap {
   return backend?.load() ?? new Map()
 }
 
+/** 日期键必须是真实日历日期，避免把任意值传入持久化删除接口。 */
+export function isValidTokenLedgerDayKey(day: unknown): day is string {
+  if (typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return false
+  const parsed = new Date(`${day}T00:00:00.000Z`)
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === day
+}
+
+/**
+ * 删除历史日累计，不改进程内实时流水（`entries`）及其他任何状态。
+ * 持久化后端同步完成删除；没有可删除能力或日期无效时返回 false。
+ */
+export function deleteTokenLedgerDay(day: string): boolean {
+  if (!isValidTokenLedgerDayKey(day)) return false
+  return backend?.deleteDay?.(day) ?? false
+}
+
 /**
  * **UTC+8 日键**（`YYYY-MM-DD`）。
  *
@@ -352,8 +458,11 @@ export function recordTokenUsage(entry: Omit<TokenLedgerEntry, 'ts'>): void {
     // 「有值」无从分辨）。不测量的东西应当不出现，而不是被修正成一个看似
     // 合理的数 —— 与 ttft「0 = 无任何块 ⇒ 省略」同一条纪律。
     const decodeMs = duration - ttft
-    const tps = ttft > 0 && decodeMs >= MIN_DECODE_MS_FOR_TPS && usageReported
-      ? Math.round((outputTokens / (decodeMs / 1000)) * 10) / 10
+    const rawTps = ttft > 0 && decodeMs >= MIN_DECODE_MS_FOR_TPS && usageReported
+      ? outputTokens / (decodeMs / 1000)
+      : undefined
+    const tps = rawTps !== undefined && Number.isFinite(rawTps)
+      ? Math.round(rawTps * 10) / 10
       : undefined
     const record = Object.freeze({
       ts: Date.now(),
@@ -408,15 +517,17 @@ function emptyTotals(): AccumulatingTotals {
     ttftCount: 0,
     tpsSum: 0,
     tpsCount: 0,
+    tpsHistogram: {},
   }
 }
 
 /** 聚合行的内部形态：均值以 Σ/份数 累加，最终快照前收尾成 `avgXxx`。 */
-export interface AccumulatingTotals extends Omit<TokenLedgerModelRow, 'model'> {
+export interface AccumulatingTotals extends Omit<TokenLedgerModelRow, 'model' | 'totalTokens' | 'p50Tps' | 'p90Tps'> {
   ttftSumMs: number
   ttftCount: number
   tpsSum: number
   tpsCount: number
+  tpsHistogram: Record<string, number>
 }
 
 /**
@@ -430,6 +541,10 @@ export interface AccumulatingTotals extends Omit<TokenLedgerModelRow, 'model'> {
  * 会拿到 **Σ 而不是均值**（名字只差一个 `avg`）。
  */
 function finalizeAverages(t: AccumulatingTotals): Omit<TokenLedgerModelRow, 'model'> {
+  // v1 日桶没有分布数据；只有直方图覆盖全部 TPS 样本时才公布分位数。
+  const hasCompleteTpsHistogram = histogramSampleCount(t.tpsHistogram) === t.tpsCount
+  const p50Tps = hasCompleteTpsHistogram ? histogramQuantile(t.tpsHistogram, 0.5) : undefined
+  const p90Tps = hasCompleteTpsHistogram ? histogramQuantile(t.tpsHistogram, 0.9) : undefined
   return {
     requests: t.requests,
     reportedRequests: t.reportedRequests,
@@ -439,8 +554,11 @@ function finalizeAverages(t: AccumulatingTotals): Omit<TokenLedgerModelRow, 'mod
     cacheWriteTokens: t.cacheWriteTokens,
     reasoningTokens: t.reasoningTokens,
     errors: t.errors,
+    totalTokens: t.inputTokens + t.cacheReadTokens + t.outputTokens,
     ...(t.ttftCount > 0 ? { avgTtftMs: Math.round(t.ttftSumMs / t.ttftCount) } : {}),
     ...(t.tpsCount > 0 ? { avgTps: Math.round((t.tpsSum / t.tpsCount) * 10) / 10 } : {}),
+    ...(p50Tps !== undefined ? { p50Tps } : {}),
+    ...(p90Tps !== undefined ? { p90Tps } : {}),
   }
 }
 
@@ -458,6 +576,7 @@ function accumulate(totals: AccumulatingTotals, entry: TokenLedgerEntry): void {
   if (entry.tps !== undefined && entry.tps > 0) {
     totals.tpsSum += entry.tps
     totals.tpsCount += 1
+    addTpsSample(totals.tpsHistogram, entry.tps)
   }
   // ⚠️ 只有 usageReported 的行才计入 token 汇总：失败行/未报行写 0 会把
   // 「没收到用量」混进「真的用了 0」，摊薄均值类读数。
@@ -471,7 +590,27 @@ function accumulate(totals: AccumulatingTotals, entry: TokenLedgerEntry): void {
 
 /** 排序键：token 合计降序（谁烧得多谁在前），纯读取层约定。 */
 function sumTokens(t: Omit<TokenLedgerModelRow, 'model'>): number {
-  return t.inputTokens + t.outputTokens
+  return t.totalTokens
+}
+
+/** 汇总一份内部统计或日桶；分位数直方图与计数同步合并。 */
+function addAggregateTotals(
+  target: AccumulatingTotals,
+  source: AccumulatingTotals | TokenLedgerDayBucket,
+): void {
+  target.requests += source.requests
+  target.reportedRequests += source.reportedRequests
+  target.inputTokens += source.inputTokens
+  target.outputTokens += source.outputTokens
+  target.cacheReadTokens += source.cacheReadTokens
+  target.cacheWriteTokens += source.cacheWriteTokens
+  target.reasoningTokens += source.reasoningTokens
+  target.errors += source.errors
+  target.ttftSumMs += source.ttftSumMs
+  target.ttftCount += source.ttftCount
+  target.tpsSum += source.tpsSum
+  target.tpsCount += source.tpsCount
+  target.tpsHistogram = mergeTpsHistograms(target.tpsHistogram, source.tpsHistogram)
 }
 
 /**
@@ -533,21 +672,15 @@ export function readTokenLedger(options: { limit?: number } = {}): TokenLedgerSn
           const accountTotals = emptyTotals()
           const modelRows: TokenLedgerModelRow[] = [...models.entries()].map(([model, row]) => {
             // 账号小计 = 其各模型行之和（Σ/份数直加，均值收尾在后面）
-            for (const key of Object.keys(row) as (keyof typeof row)[]) {
-              accountTotals[key] += row[key] ?? 0
-            }
+            addAggregateTotals(accountTotals, row)
             return { model, ...finalizeAverages(row) }
           }).sort((a, b) => sumTokens(b) - sumTokens(a))
           // provider 小计 = 其各账号之和
-          for (const key of Object.keys(accountTotals) as (keyof typeof accountTotals)[]) {
-            providerTotals[key] += accountTotals[key] ?? 0
-          }
+          addAggregateTotals(providerTotals, accountTotals)
           return { accountId, models: modelRows, totals: finalizeAverages(accountTotals) }
         }).sort((a, b) => sumTokens(b.totals) - sumTokens(a.totals))
         // 渠道小计 = 其各 provider 之和
-        for (const key of Object.keys(providerTotals) as (keyof typeof providerTotals)[]) {
-          channelTotals[key] += providerTotals[key] ?? 0
-        }
+        addAggregateTotals(channelTotals, providerTotals)
         return { provider, accounts: accountRows, totals: finalizeAverages(providerTotals) }
       }).sort((a, b) => sumTokens(b.totals) - sumTokens(a.totals))
       return { channel, providers: providerRows, totals: finalizeAverages(channelTotals) }
@@ -606,6 +739,8 @@ export interface TokenLedgerDayBucket {
   /** Σ(TPS) 与样本数（同上）。 */
   tpsSum: number
   tpsCount: number
+  /** 稀疏对数直方图；v1 历史桶缺此字段时保留均值、分位数从升级后开始累计。 */
+  tpsHistogram?: Record<string, number>
 }
 
 /** 每日聚合表：`日键 → (桶键 → 桶)`。序列化形态由 store 负责。 */
@@ -648,6 +783,7 @@ export function mergeDayEntry(days: TokenLedgerDayMap, entry: TokenLedgerEntry):
       ttftCount: 0,
       tpsSum: 0,
       tpsCount: 0,
+      tpsHistogram: {},
     }
     buckets.set(key, bucket)
   }
@@ -662,6 +798,8 @@ export function mergeDayEntry(days: TokenLedgerDayMap, entry: TokenLedgerEntry):
   if (entry.tps !== undefined && entry.tps > 0) {
     bucket.tpsSum += entry.tps
     bucket.tpsCount += 1
+    bucket.tpsHistogram ??= {}
+    addTpsSample(bucket.tpsHistogram, entry.tps)
   }
   if (!entry.usageReported) return
   bucket.inputTokens += entry.inputTokens
@@ -701,10 +839,11 @@ export interface TokenLedgerHistoryDay {
  * @param days - 日聚合表（store 的 `load()` 结果，含启动时从盘上加载的历史）。
  * @param options.sinceDays - 只看最近 N 天（**含今天**，UTC+8 日界）；
  *   省略 = 全部历史（上限 {@link TOKEN_LEDGER_HISTORY_MAX_DAYS}）。
+ * @param options.fromDay / options.toDay - 按 UTC+8 日键筛选闭区间。
  */
 export function readTokenLedgerHistory(
   days: TokenLedgerDayMap,
-  options: { sinceDays?: number } = {},
+  options: { sinceDays?: number; fromDay?: string; toDay?: string } = {},
 ): { days: TokenLedgerHistoryDay[]; totals: Omit<TokenLedgerModelRow, 'model'> } {
   // 过滤窗口：today（UTC+8）往前推 sinceDays-1 天；0/负数按「仅今日」处理。
   const sinceDaysRaw = options.sinceDays
@@ -717,6 +856,8 @@ export function readTokenLedgerHistory(
   const cutoffKey = sinceDays === undefined
     ? undefined
     : utc8DayKey(Date.now() - (sinceDays - 1) * 24 * 60 * 60 * 1000)
+  const fromDay = isValidTokenLedgerDayKey(options.fromDay) ? options.fromDay : undefined
+  const toDay = isValidTokenLedgerDayKey(options.toDay) ? options.toDay : undefined
 
   const grandTotals = emptyTotals()
   const historyDays: TokenLedgerHistoryDay[] = []
@@ -725,6 +866,8 @@ export function readTokenLedgerHistory(
   for (const day of dayKeys) {
     if (day > todayKey) continue // 未来键（手工编辑）：不展示也不入合计
     if (cutoffKey !== undefined && day < cutoffKey) continue // 窗口外
+    if (fromDay !== undefined && day < fromDay) continue
+    if (toDay !== undefined && day > toDay) continue
     const buckets = days.get(day)
     if (buckets === undefined || buckets.size === 0) continue
     // ── 一天的桶 → 四级聚合树（复用与内存版相同的两级收尾模式）──
@@ -760,25 +903,19 @@ export function readTokenLedgerHistory(
           const accountRows: TokenLedgerAccountRow[] = [...accounts.entries()].map(([accountId, models]) => {
             const accountTotals = emptyTotals()
             const modelRows: TokenLedgerModelRow[] = [...models.entries()].map(([model, bucket]) => {
-              for (const k of Object.keys(bucket) as (keyof typeof bucket)[]) {
-                accountTotals[k] += bucket[k] ?? 0
-              }
-              return { model, ...finalizeAverages(bucket) }
+              addAggregateTotals(accountTotals, bucket)
+              const row = emptyTotals()
+              addAggregateTotals(row, bucket)
+              return { model, ...finalizeAverages(row) }
             }).sort((a, b) => sumTokens(b) - sumTokens(a))
-            for (const k of Object.keys(accountTotals) as (keyof typeof accountTotals)[]) {
-              providerTotals[k] += accountTotals[k] ?? 0
-            }
+            addAggregateTotals(providerTotals, accountTotals)
             return { accountId, models: modelRows, totals: finalizeAverages(accountTotals) }
           }).sort((a, b) => sumTokens(b.totals) - sumTokens(a.totals))
-          for (const k of Object.keys(providerTotals) as (keyof typeof providerTotals)[]) {
-            channelTotals[k] += providerTotals[k] ?? 0
-          }
+          addAggregateTotals(channelTotals, providerTotals)
           return { provider, accounts: accountRows, totals: finalizeAverages(providerTotals) }
         }).sort((a, b) => sumTokens(b.totals) - sumTokens(a.totals))
         // 日小计 = 其各渠道之和
-        for (const k of Object.keys(channelTotals) as (keyof typeof channelTotals)[]) {
-          dayTotals[k] += channelTotals[k] ?? 0
-        }
+        addAggregateTotals(dayTotals, channelTotals)
         return { channel, providers: providerRows, totals: finalizeAverages(channelTotals) }
       })
     // 全局合计按**日**累加（Σ/份数直加），不是日均值的均值。
@@ -790,9 +927,7 @@ export function readTokenLedgerHistory(
 
 /** 把一个**日聚合桶的合计**累加进另一个累加器（历史全局合计用）。 */
 function accumulateBucket(target: AccumulatingTotals, source: AccumulatingTotals): void {
-  for (const key of Object.keys(source) as (keyof typeof source)[]) {
-    target[key] += source[key] ?? 0
-  }
+  addAggregateTotals(target, source)
 }
 
 /** 历史视图的最大回看天数（防一次下发过大；落盘本身已有 90 天淘汰）。 */

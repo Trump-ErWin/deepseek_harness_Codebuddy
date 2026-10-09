@@ -5,7 +5,7 @@
  * 而不是 mock 掉 fs —— 落盘格式（`{schema, days}`）与载入钳制才是本文件
  * 要锁的契约。
  */
-import { mkdtempSync, existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -26,6 +26,29 @@ function makeEntry(over: Partial<Omit<TokenLedgerEntry, 'ts'>> = {}): Omit<Token
 }
 
 describe('createTokenLedgerStore（文件后端）', () => {
+  it('超过 5 分钟但持有进程仍存活时不得回收写锁', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-live-lock-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    const lockPath = join(home, 'jet-hub', 'token-ledger.json.lock')
+    try {
+      mkdirSync(lockPath, { recursive: true })
+      writeFileSync(join(lockPath, 'owner.json'), JSON.stringify({ pid: process.pid, nonce: 'live-owner' }))
+      const old = new Date(Date.now() - 10 * 60 * 1000)
+      utimesSync(lockPath, old, old)
+
+      const store = createTokenLedgerStore({ logger: undefined } as never)
+      store.flush()
+
+      expect(existsSync(join(lockPath, 'owner.json'))).toBe(true)
+      expect(existsSync(join(home, 'jet-hub', 'token-ledger.json'))).toBe(false)
+    } finally {
+      rmSync(lockPath, { recursive: true, force: true })
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
   it('append 后 flush 落盘；新实例 load 读回一致', () => {
     const home = mkdtempSync(join(tmpdir(), 'token-ledger-store-'))
     const store = createTokenLedgerStore({ logger: undefined, get: () => undefined } as never)
@@ -41,7 +64,7 @@ describe('createTokenLedgerStore（文件后端）', () => {
       expect(existsSync(file)).toBe(true)
       // 落盘格式带 schema 标记
       const doc = JSON.parse(readFileSync(file, 'utf-8')) as { schema?: string; days?: unknown }
-      expect(doc.schema).toContain('token-ledger/v1')
+      expect(doc.schema).toContain('token-ledger/v2')
 
       // 新实例读回：累计值一致
       const store3 = createTokenLedgerStore({ logger: undefined } as never)
@@ -69,6 +92,38 @@ describe('createTokenLedgerStore（文件后端）', () => {
       const bucket = days.get('2026-10-05')!.get('direct|codearts||GLM-5.2')!
       expect(bucket.requests).toBe(5)
       expect(bucket.inputTokens).toBe(5)
+    } finally {
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
+  it('deleteDay 只删除选中日期；重启与后续新请求都不会恢复旧累计', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-delete-day-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    try {
+      const store = createTokenLedgerStore({ logger: undefined } as never)
+      store.append({ ts: Date.UTC(2026, 9, 5, 2, 0, 0), ...makeEntry({ inputTokens: 20 }) })
+      store.append({ ts: Date.UTC(2026, 9, 6, 2, 0, 0), ...makeEntry({ inputTokens: 30 }) })
+      store.flush()
+
+      expect(store.deleteDay('2026-10-05')).toBe(true)
+      expect(store.load().has('2026-10-05')).toBe(false)
+      expect(store.load().get('2026-10-06')?.get('direct|codearts||GLM-5.2')?.inputTokens).toBe(30)
+      store.flush()
+
+      const file = join(home, 'jet-hub', 'token-ledger.json')
+      const saved = JSON.parse(readFileSync(file, 'utf-8')) as { days: Record<string, unknown> }
+      expect(Object.keys(saved.days)).toEqual(['2026-10-06'])
+
+      // 删除后当天的新请求从零开始，不会把已删历史基线重新加回来。
+      const restarted = createTokenLedgerStore({ logger: undefined } as never)
+      restarted.append({ ts: Date.UTC(2026, 9, 5, 3, 0, 0), ...makeEntry({ inputTokens: 2 }) })
+      restarted.flush()
+      const next = createTokenLedgerStore({ logger: undefined } as never).load()
+      expect(next.get('2026-10-05')?.get('direct|codearts||GLM-5.2')?.inputTokens).toBe(2)
+      expect(next.get('2026-10-06')?.get('direct|codearts||GLM-5.2')?.inputTokens).toBe(30)
     } finally {
       if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
       else process.env.DSH_JET_HUB_STATE_DIR = prev
