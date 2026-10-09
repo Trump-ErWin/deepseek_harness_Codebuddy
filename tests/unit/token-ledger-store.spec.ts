@@ -75,6 +75,38 @@ describe('createTokenLedgerStore（文件后端）', () => {
     }
   })
 
+  it('deleteDay 只删除选中日期；重启与后续新请求都不会恢复旧累计', () => {
+    const home = mkdtempSync(join(tmpdir(), 'token-ledger-delete-day-'))
+    const prev = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = home
+    try {
+      const store = createTokenLedgerStore({ logger: undefined } as never)
+      store.append({ ts: Date.UTC(2026, 9, 5, 2, 0, 0), ...makeEntry({ inputTokens: 20 }) })
+      store.append({ ts: Date.UTC(2026, 9, 6, 2, 0, 0), ...makeEntry({ inputTokens: 30 }) })
+      store.flush()
+
+      expect(store.deleteDay('2026-10-05')).toBe(true)
+      expect(store.load().has('2026-10-05')).toBe(false)
+      expect(store.load().get('2026-10-06')?.get('direct|codearts||GLM-5.2')?.inputTokens).toBe(30)
+      store.flush()
+
+      const file = join(home, 'jet-hub', 'token-ledger.json')
+      const saved = JSON.parse(readFileSync(file, 'utf-8')) as { days: Record<string, unknown> }
+      expect(Object.keys(saved.days)).toEqual(['2026-10-06'])
+
+      // 删除后当天的新请求从零开始，不会把已删历史基线重新加回来。
+      const restarted = createTokenLedgerStore({ logger: undefined } as never)
+      restarted.append({ ts: Date.UTC(2026, 9, 5, 3, 0, 0), ...makeEntry({ inputTokens: 2 }) })
+      restarted.flush()
+      const next = createTokenLedgerStore({ logger: undefined } as never).load()
+      expect(next.get('2026-10-05')?.get('direct|codearts||GLM-5.2')?.inputTokens).toBe(2)
+      expect(next.get('2026-10-06')?.get('direct|codearts||GLM-5.2')?.inputTokens).toBe(30)
+    } finally {
+      if (prev === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+      else process.env.DSH_JET_HUB_STATE_DIR = prev
+    }
+  })
+
   it('文档损坏按空表处理（不抛错、不阻断启动）', () => {
     const home = mkdtempSync(join(tmpdir(), 'token-ledger-store-'))
     const prev = process.env.DSH_JET_HUB_STATE_DIR

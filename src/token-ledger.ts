@@ -240,6 +240,8 @@ export interface TokenLedgerBackend {
   append(entry: TokenLedgerEntry): void
   /** 读取日聚合表（**纯内存读**，不碰磁盘 —— 见 store 的注释）。 */
   load(): TokenLedgerDayMap
+  /** 删除单个 UTC+8 日期的历史累计。 */
+  deleteDay?(day: string): boolean
 }
 
 /**
@@ -300,6 +302,22 @@ export function attachTokenLedgerStore(next: TokenLedgerBackend | undefined): ()
 /** RPC 侧读取日聚合表；未挂载（headless 等）返回空表。 */
 export function readTokenLedgerDayMap(): TokenLedgerDayMap {
   return backend?.load() ?? new Map()
+}
+
+/** 日期键必须是真实日历日期，避免把任意值传入持久化删除接口。 */
+export function isValidTokenLedgerDayKey(day: unknown): day is string {
+  if (typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return false
+  const parsed = new Date(`${day}T00:00:00.000Z`)
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === day
+}
+
+/**
+ * 删除历史日累计，不改进程内实时流水（`entries`）及其他任何状态。
+ * 持久化后端同步完成删除；没有可删除能力或日期无效时返回 false。
+ */
+export function deleteTokenLedgerDay(day: string): boolean {
+  if (!isValidTokenLedgerDayKey(day)) return false
+  return backend?.deleteDay?.(day) ?? false
 }
 
 /**

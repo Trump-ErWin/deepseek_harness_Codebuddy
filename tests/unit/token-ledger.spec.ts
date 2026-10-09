@@ -3,9 +3,12 @@ import {
   MIN_DECODE_MS_FOR_TPS,
   TOKEN_LEDGER_LIMIT,
   attachTokenLedgerStore,
+  deleteTokenLedgerDay,
+  isValidTokenLedgerDayKey,
   mergeDayEntry,
   peekLedgerAccount,
   readTokenLedger,
+  readTokenLedgerDayMap,
   readTokenLedgerHistory,
   recordTokenUsage,
   reportLedgerAccount,
@@ -415,6 +418,31 @@ describe('utc8DayKey / mergeDayEntry（第 2 期 · 日聚合）', () => {
       detach()
     }
     expect(tokenLedgerSize()).toBeGreaterThanOrEqual(1)
+  })
+
+  it('删除历史日只改日聚合，不删除内存实时明细；拒绝非法日期键', () => {
+    seed([OK])
+    const dayMap: TokenLedgerDayMap = new Map()
+    mergeDayEntry(dayMap, { ...OK, ts: Date.UTC(2026, 9, 5, 2, 0, 0) })
+    const detach = attachTokenLedgerStore({
+      append: () => {},
+      load: () => dayMap,
+      deleteDay: (day) => dayMap.delete(day),
+    })
+    try {
+      const before = readTokenLedger()
+      expect(isValidTokenLedgerDayKey('2026-10-05')).toBe(true)
+      expect(isValidTokenLedgerDayKey('2026-02-30')).toBe(false)
+      expect(deleteTokenLedgerDay('../state.json')).toBe(false)
+      expect(deleteTokenLedgerDay('2026-10-05')).toBe(true)
+
+      const after = readTokenLedger()
+      expect(readTokenLedgerDayMap().has('2026-10-05')).toBe(false)
+      expect(after.entries).toEqual(before.entries)
+      expect(after.totals).toEqual(before.totals)
+    } finally {
+      detach()
+    }
   })
 })
 

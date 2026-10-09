@@ -89,6 +89,8 @@ export interface TokenLedgerStore {
   load(): TokenLedgerDayMap
   /** 把一笔请求并入日聚合（内存即时、落盘节流）。 */
   append(entry: import('./token-ledger.js').TokenLedgerEntry): void
+  /** 删除指定 UTC+8 日键的历史累计；同步落盘，其他日期不变。 */
+  deleteDay(day: string): boolean
   /** 立即落盘（dispose / 测试用；正常路径靠节流自动刷）。 */
   flush(): void
 }
@@ -116,6 +118,10 @@ class MemoryLedgerStore implements TokenLedgerStore {
 
   append(entry: import('./token-ledger.js').TokenLedgerEntry): void {
     mergeDayEntry(this.days, entry)
+  }
+
+  deleteDay(day: string): boolean {
+    return this.days.delete(day)
   }
 
   flush(): void {
@@ -208,6 +214,56 @@ class FileLedgerStore implements TokenLedgerStore {
     this.scheduleFlush()
   }
 
+  /**
+   * 删除单日历史。先刷入本实例的待写增量，再以磁盘最新文档为基准只移除目标日，
+   * 避免覆盖其他日期或清空实时明细。写入成功后重置目标日基线，使后续新请求从零累计。
+   */
+  deleteDay(day: string): boolean {
+    if (!this.days.has(day)) return false
+
+    if (this.timer !== undefined) {
+      clearTimeout(this.timer)
+      this.timer = undefined
+    }
+    this.dirty = false
+
+    mkdirSync(join(this.path, '..'), { recursive: true })
+    const merged = this.readFile()
+    // 保留当前进程尚未落盘的其他日期增量。
+    for (const [pendingDay, buckets] of this.days) {
+      if (pendingDay === day) continue
+      const base = this.written.get(pendingDay)
+      let target = merged.get(pendingDay)
+      for (const [key, bucket] of buckets) {
+        const delta = subtractBucket(bucket, base?.get(key))
+        if (delta === undefined) continue
+        if (target === undefined) {
+          target = new Map()
+          merged.set(pendingDay, target)
+        }
+        const existing = target.get(key)
+        target.set(key, existing === undefined ? delta : addBucket(existing, delta))
+      }
+    }
+
+    // 即使磁盘上该日已被外部删除，也要落下其他日期的待写增量。
+    merged.delete(day)
+
+    try {
+      // 删除操作只改目标日，不借机淘汰其他日期。
+      this.writeDays(merged, false)
+    } catch (error) {
+      this.scheduleFlush()
+      throw error
+    }
+
+    // 原 Map 可能被历史读取器暂存，原地更新可确保后续读取马上看不到该日。
+    this.days.clear()
+    for (const [persistedDay, buckets] of merged) this.days.set(persistedDay, buckets)
+    this.written = cloneDays(this.days)
+    return true
+  }
+
   /** 节流落盘：窗口内首笔启动计时器，到点刷盘；期间新写入标记 dirty 再刷一轮。 */
   private scheduleFlush(): void {
     if (this.timer !== undefined) {
@@ -294,19 +350,23 @@ class FileLedgerStore implements TokenLedgerStore {
       // 132ms 同步阻塞，且这段代码跑在 setTimeout 回调里 = 阻塞事件循环）。
       if (!hasDelta) return
       // ③ 原子写（淘汰过老日键）
-      const days: Record<string, Record<string, unknown>> = {}
-      for (const [day, buckets] of pruneDays(merged)) {
-        days[day] = Object.fromEntries(buckets)
-      }
-      const tmp = `${this.path}.tmp`
-      writeFileSync(tmp, JSON.stringify({ schema: SCHEMA, days }, null, 2), 'utf-8')
-      renameSync(tmp, this.path)
+      this.writeDays(merged)
       // ④ 基线前移（只在写盘成功后）
       this.written = cloneDays(this.days)
     } catch (error) {
       // 落盘失败只记日志：账本还有内存兜底，不能反噬推理。
       this.logger?.warn(`[jet-hub] 写入 ${this.path} 失败（本次统计不入盘）: ${String(error)}`)
     }
+  }
+
+  /** 原子写入指定日表。 */
+  private writeDays(source: TokenLedgerDayMap, applyRetention = true): void {
+    const days: Record<string, Record<string, unknown>> = {}
+    const retained = applyRetention ? pruneDays(source) : source
+    for (const [day, buckets] of retained) days[day] = Object.fromEntries(buckets)
+    const tmp = `${this.path}.tmp`
+    writeFileSync(tmp, JSON.stringify({ schema: SCHEMA, days }, null, 2), 'utf-8')
+    renameSync(tmp, this.path)
   }
 }
 
