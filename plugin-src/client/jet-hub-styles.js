@@ -225,6 +225,7 @@ const STYLES = `
    不再用 100vh - 48px 这类视口算式 —— 否则 8vh 大于 24px 时会溢出视口。 */
 .dim-jh-modalOverlay--top .dim-jh-modal { max-height: 100%; }
 .dim-jh-modal { display: flex; flex-direction: column; width: min(560px, 100%); max-height: min(640px, calc(100vh - 48px)); padding: 20px 22px; border-radius: 14px; background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 16px 48px rgba(0,0,0,0.22); }
+.dim-jh-modal--ledger { width: min(960px, 100%); max-height: min(820px, calc(100vh - 40px)); }
 .dim-jh-modalHead { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .dim-jh-modalTitle { min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; font-size: 15px; line-height: 22px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
 .dim-jh-modalSubtitle { overflow: hidden; font-size: 12px; line-height: 18px; font-weight: 400; color: var(--dsw-alias-label-tertiary, #8f959e); text-overflow: ellipsis; white-space: nowrap; }
@@ -532,7 +533,7 @@ const STYLES = `
    卡片结构与网关弹窗的供应商卡片同一规格语言（细边框 + 圆角 + 吸顶头），
    但不吸顶：本弹窗层级只有两级，吸顶收益小于复杂度。
    ⚠️ 本文件整体是 JS 模板字符串，注释里绝不能出现反引号 —— 类名一律裸写。 */
-.dim-jh-ledgerFilters { display: flex; gap: 6px; margin-bottom: 8px; }
+.dim-jh-ledgerFilters { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .dim-jh-ledgerFilterBtn { padding: 2px 10px; font-size: 11.5px; line-height: 17px; border-radius: 999px; opacity: .72; }
 .dim-jh-ledgerFilterBtn[data-active="true"] { opacity: 1; font-weight: 600; }
 .dim-jh-ledgerCard { min-width: 0; border: .5px solid var(--dsw-alias-border-l3, #e5e5e5); border-radius: 10px; overflow: hidden; }
@@ -565,9 +566,10 @@ const STYLES = `
    故给单柱/少柱窗口一个 max-width，让它保持柱子的形状。 */
 .dim-jh-ledgerSection { margin-bottom: 14px; }
 .dim-jh-ledgerSectionTitle { font-size: 13px; line-height: 19px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); margin-bottom: 6px; }
-.dim-jh-ledgerTrend { display: flex; align-items: flex-end; gap: 3px; height: 64px; padding: 4px 2px 0; overflow-x: auto; }
+.dim-jh-ledgerTrend { display: flex; align-items: flex-end; gap: 4px; height: 82px; padding: 4px 2px 0; overflow-x: auto; }
 /* 柱子列：横向可滚、但单柱不吃满宽（见上方注释）。 */
-.dim-jh-ledgerTrendCol { flex: 1 0 14px; min-width: 14px; max-width: 56px; height: 100%; display: flex; align-items: flex-end; cursor: pointer; }
+.dim-jh-ledgerTrendCol { appearance: none; flex: 1 0 20px; min-width: 20px; max-width: 56px; height: 100%; display: flex; flex-direction: column; align-items: stretch; justify-content: flex-end; gap: 3px; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.dim-jh-ledgerTrendCol:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #1677ff); outline-offset: 2px; border-radius: 3px; }
 /* ⚠️ 颜色必须**自带可见性**：品牌变量 --dsw-alias-brand-primary 只在变量
    *缺失* 时才走 #1677ff 兜底；一旦宿主主题把它定义成接近底色的浅色，再叠
    opacity 就会退化成一块与背景同色的「白块」（真实缺陷 2026-10-07，深色主题
@@ -578,12 +580,39 @@ const STYLES = `
 .dim-jh-ledgerTrendBar[data-today="true"] { opacity: .95; }
 .dim-jh-ledgerTrendBar[data-active="true"] { opacity: 1; outline: 1.5px solid var(--dsw-alias-brand-primary, #1677ff); }
 /* 日期短标签：常驻显示 MM-DD，根治「不知道哪根柱是哪天」。 */
-.dim-jh-ledgerTrendLabel { font-size: 10px; line-height: 12px; text-align: center; color: var(--dsw-alias-label-tertiary, #8f959e); font-variant-numeric: tabular-nums; }
+.dim-jh-ledgerTrendLabel { flex: none; font-size: 10px; line-height: 12px; text-align: center; color: var(--dsw-alias-label-tertiary, #8f959e); font-variant-numeric: tabular-nums; }
+.dim-jh-ledgerDayPeek { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px; min-height: 30px; margin-top: 7px; padding: 5px 9px; border-radius: 7px; background: var(--dsw-alias-bg-layer-2, #f7f8fa); color: var(--dsw-alias-label-secondary, #4e5969); font-size: 11.5px; }
+.dim-jh-ledgerDayPeek strong { color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-ledgerChartHint { margin-top: 7px; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 11px; }
+.dim-jh-ledgerDeleteQuick { margin-left: auto; }
+.dim-jh-ledgerDateRange { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.dim-jh-ledgerDateRange label { display: flex; align-items: center; gap: 5px; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 11px; }
+.dim-jh-ledgerDateRange input { width: 136px; padding: 3px 6px; font-size: 11px; }
+.dim-jh-ledgerExport { flex: none; }
 /* 明细表：紧凑小字；模型列允许换行（长 wire 名不能截断 —— 网关弹窗同一条教训）。 */
-.dim-jh-ledgerTable { width: 100%; margin-top: 10px; border-collapse: collapse; font-size: 11.5px; line-height: 17px; }
+.dim-jh-ledgerEntryTools { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 12px 0 5px; }
+.dim-jh-ledgerEntryTools strong { margin-right: 2px; font-size: 13px; color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-ledgerEntryCount { margin-right: auto; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 11px; font-variant-numeric: tabular-nums; }
+.dim-jh-ledgerSearch { flex: 1 1 130px; width: auto; min-width: 120px; padding: 4px 7px; font-size: 11px; }
+.dim-jh-ledgerSelect { min-width: 82px; max-width: 130px; padding: 4px 6px; border: 1px solid var(--dsw-alias-border-l2, #d0d3d9); border-radius: 6px; background: var(--dsw-alias-bg-layer-1, #fff); color: var(--dsw-alias-label-primary, #1f2329); font-size: 11px; }
+.dim-jh-ledgerTable { width: 100%; margin-top: 4px; border-collapse: collapse; table-layout: fixed; font-size: 11.5px; line-height: 17px; }
 .dim-jh-ledgerTable th { position: sticky; top: 0; z-index: 1; padding: 4px 6px; text-align: left; font-weight: 600; color: var(--dsw-alias-label-tertiary, #8f959e); background: var(--dsw-alias-bg-layer-1, #fff); border-bottom: .5px solid var(--dsw-alias-border-l3, #e5e5e5); }
 .dim-jh-ledgerTable td { padding: 3px 6px; border-bottom: .5px solid var(--dsw-alias-border-l3, #f0f1f3); font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary, #4e5969); vertical-align: baseline; }
 .dim-jh-ledgerTable .dim-jh-ledgerEntryModel { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dsw-alias-label-primary, #1f2329); overflow-wrap: anywhere; }
+.dim-jh-ledgerTable tbody tr[data-error="true"] td { color: var(--dsw-alias-state-error-primary, #d93025); }
+.dim-jh-ledgerTable .dim-jh-ledgerError { cursor: help; font-weight: 600; }
+.dim-jh-ledgerTable .dim-jh-ledgerSuccess { color: var(--dsw-alias-state-success-primary, #25803c); }
+.dim-jh-ledgerPagination { display: flex; align-items: center; justify-content: flex-end; gap: 7px; padding: 7px 0; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 11px; }
+@media (max-width: 700px) {
+  .dim-jh-modal--ledger { padding: 14px 12px; }
+  .dim-jh-ledgerPerf { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .dim-jh-ledgerEntryTools { align-items: stretch; }
+  .dim-jh-ledgerEntryCount { flex: 1 1 50%; }
+  .dim-jh-ledgerSearch { flex-basis: 100%; }
+  .dim-jh-ledgerSelect { flex: 1 1 30%; max-width: none; }
+  .dim-jh-ledgerTable { font-size: 10px; }
+  .dim-jh-ledgerTable th, .dim-jh-ledgerTable td { padding: 3px 2px; overflow-wrap: anywhere; }
+}
 
 /* ── 模型列表的「计费/来源」分组（订阅 / 免费 / Cline Cloud / 按量计费）──
    分组由 model-groups.js 的纯函数决定（判据见其模块注释）；这里只管观感。

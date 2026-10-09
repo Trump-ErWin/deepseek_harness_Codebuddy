@@ -839,10 +839,11 @@ export interface TokenLedgerHistoryDay {
  * @param days - 日聚合表（store 的 `load()` 结果，含启动时从盘上加载的历史）。
  * @param options.sinceDays - 只看最近 N 天（**含今天**，UTC+8 日界）；
  *   省略 = 全部历史（上限 {@link TOKEN_LEDGER_HISTORY_MAX_DAYS}）。
+ * @param options.fromDay / options.toDay - 按 UTC+8 日键筛选闭区间。
  */
 export function readTokenLedgerHistory(
   days: TokenLedgerDayMap,
-  options: { sinceDays?: number } = {},
+  options: { sinceDays?: number; fromDay?: string; toDay?: string } = {},
 ): { days: TokenLedgerHistoryDay[]; totals: Omit<TokenLedgerModelRow, 'model'> } {
   // 过滤窗口：today（UTC+8）往前推 sinceDays-1 天；0/负数按「仅今日」处理。
   const sinceDaysRaw = options.sinceDays
@@ -855,6 +856,8 @@ export function readTokenLedgerHistory(
   const cutoffKey = sinceDays === undefined
     ? undefined
     : utc8DayKey(Date.now() - (sinceDays - 1) * 24 * 60 * 60 * 1000)
+  const fromDay = isValidTokenLedgerDayKey(options.fromDay) ? options.fromDay : undefined
+  const toDay = isValidTokenLedgerDayKey(options.toDay) ? options.toDay : undefined
 
   const grandTotals = emptyTotals()
   const historyDays: TokenLedgerHistoryDay[] = []
@@ -863,6 +866,8 @@ export function readTokenLedgerHistory(
   for (const day of dayKeys) {
     if (day > todayKey) continue // 未来键（手工编辑）：不展示也不入合计
     if (cutoffKey !== undefined && day < cutoffKey) continue // 窗口外
+    if (fromDay !== undefined && day < fromDay) continue
+    if (toDay !== undefined && day > toDay) continue
     const buckets = days.get(day)
     if (buckets === undefined || buckets.size === 0) continue
     // ── 一天的桶 → 四级聚合树（复用与内存版相同的两级收尾模式）──

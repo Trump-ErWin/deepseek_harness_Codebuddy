@@ -1675,9 +1675,13 @@ export interface RpcUsageTokenLedgerResponse {
 export interface RpcUsageTokenLedgerHistoryRequest {
   /**
    * 只看最近 N 天（**含今天**，UTC+8 日界）；省略 = 全部历史
-   * （服务端钳到 `TOKEN_LEDGER_HISTORY_MAX_DAYS`）。
+   * （服务端钳到 `TOKEN_LEDGER_HISTORY_MAX_DAYS`）。自选范围可传 fromDay / toDay。
    */
   sinceDays?: number
+  /** 自选日期范围起点（UTC+8 日键，含当日）；与 toDay 配合使用。 */
+  fromDay?: string
+  /** 自选日期范围终点（UTC+8 日键，含当日）；与 fromDay 配合使用。 */
+  toDay?: string
 }
 
 /** 历史日聚合响应（形状直透，不另造平行类型）。 */
