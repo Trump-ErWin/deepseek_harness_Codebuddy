@@ -3,6 +3,7 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { descriptorOf } from '../../src/provider-registry.js'
+import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8')
@@ -74,12 +75,21 @@ describe('Raccoon 在 index.ts 的接线', () => {
   })
 
   it('registerJetHubRpc 传入了 raccoon', () => {
-    // ⚠️ 2026-10-08 改措辞：auth 实例已是**命名对象**（键是 provider id），
-    // 不再是位置参数 —— 故本断言现在的含义是「`raccoon` 键在 auths 对象字面量里，
-    // 且该字面量位于 `modelAdapters` 之前」。
-    // ⚠️ 不限定 raccoon 与 modelAdapters 之间的具体键：将来新增 provider
-    // 会在此处插入新键，写死顺序会让每次扩展都误报失败。
-    expect(indexSource).toMatch(/registerJetHubRpc\([\s\S]*?raccoon,[\s\S]*?modelAdapters\)/)
+    // ⚠️ 2026-10-08 改（Task 3）：原先这条是**相邻性正则**
+    //    `/registerJetHubRpc\([\s\S]*?raccoon,[\s\S]*?modelAdapters\)/` ——
+    //    它把「raccoon 键存在」与「该字面量在 modelAdapters 之前」用**书写顺序**
+    //    Task 3 一度给 `registerJetHubRpc` 加了**第 5 个位置形参** `credits`，
+    //    调用点变成 `… }, modelAdapters, creditsTable)` ⇒ 正则必然假失败。
+    //    该形参随后在设计复审 C1 中被删除，但**本条的改法保留** —— 它守的意图
+    //    （raccoon 的 auth 实例接上了）**与形参个数无关**。
+    //    ⇒ 改为按 **AST** 取调用点第三个实参（auths 对象字面量）的键 ——
+    //    重排 / 插键 / 加形参都不可能让它假失败，而**键真的漏了必然变红**。
+    //    「端到端分派真的落到 raccoon 实例上」由行为用例守：
+    //    `lobsterai-rpc-dispatch.spec.ts` 的「13 个 provider 逐个覆盖」。
+    const authKeys = jetHubAuthsCallKeys(indexSource)
+    expect(Object.keys(authKeys), 'raccoon 必须在 auths 命名对象里（键 = provider id）')
+      .toContain('raccoon')
+    expect(authKeys.raccoon, '`raccoon` 键的值必须是 raccoon 实例').toBe('raccoon')
   })
 
   it('fetchRemoteModels 委托给 RaccoonAuth.fetchModels', () => {

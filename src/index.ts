@@ -72,6 +72,7 @@ import { MINIMAX } from './minimax-product.js'
 //    故 Task 2 才把它并进本行。
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { registerProviderRuntime } from './provider-runtime.js'
+import { createProviderCredits, creditsOf } from './provider-credits.js'
 import type { MinimaxCredential } from './minimax.js'
 import { GeminiAuth } from './gemini-auth.js'
 import { registerGeminiLlm } from './gemini-adapter.js'
@@ -2379,6 +2380,33 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // Task 9 引入命名对象时还在的那 13 个同构 `switch (entry.provider)` case
   // （含 `requireQoderFamily` 取 Qoder 同族实例那一处）**已整体删除**。
   // 上面「键必须是 provider id」那条约定正是该查表能命中 `qodercn` 的前提。
+  // ===== 积分能力表（设计文档 §3.3 / Task 3）=====
+  //
+  // ⚠️ **只建一份，且只挂一个消费点**：`ProviderRuntime.credits` ——
+  //    给**拿不到 `auths` 形参**的跨模块消费点（Task 5 的 `aggregate-expiry.ts`、
+  //    Task 8 的 `account-probe.ts`）。
+  //
+  // ⚠️ `credits.balances` / `credits.status` **不再读这里**（2026-10-08 设计复审 C1）：
+  //    它们由 `registerJetHubEndpoints` 从**已解构的 `auths`** 现造一张等价的表。
+  //    原先本处还把它当第 5 个实参传给 `registerJetHubRpc`，那既是一个纯测试接缝
+  //    （生产路径上两处传的是**同一批实例**、删掉实参行为不变），又是一个
+  //    可选的**位置**形参 —— 在它之前插入新形参会**静默**错位（本仓库实测复发
+  //    6 次的形态）。
+  //
+  // ⚠️ **两处是两个独立的 `createProviderCredits` 调用**（本处 + `jet-hub-rpc.ts`），
+  //    故「有人改了一处忘了另一处」在原理上仍可能。防线是**两侧各自被钉在
+  //    `PROVIDER_REGISTRY` 上**，而不是「只有一份所以不可能漂移」：
+  //    - 本处的表 → `provider-runtime-wiring.spec.ts` 真跑 `apply()`，
+  //      断言每个有余额能力的渠道 `runtimeOf(id).credits` 都**有余额方法**；
+  //    - 端点侧的表 → `credits-runtime-parity.spec.ts` 的「表里的渠道集合 ===
+  //      registry 里有余额能力、且非特例的渠道」（含带 deps 的形态）。
+  //    两侧同源同构，故任一侧少一家都会被点名。
+  //
+  // ⚠️ 三家（loomy / raccoon / zcode）的余额查询走**各自 auth 实例**上的方法
+  //    （实例可能带注入的 `fetchImpl`），故必须传实例 —— 重构前 RPC 就是这么调的。
+  //    其余走自由函数 + 全局 fetch。
+  const creditsTable = createProviderCredits({ loomy, raccoon, zcode })
+
   // ===== 能力注册表（设计文档 §3.3）=====
   //
   // ⚠️ **本段是前瞻接线**（2026-10-08 调序后修正）：`account.refresh` 的分派
@@ -2394,6 +2422,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   //
   // ⚠️ 这里**不注册 opencode**（它没有续期概念）与 aggregate / auto
   //    （虚拟 provider，无账号无凭据）。它们的 runtime 只有 descriptor。
+  //    ⚠️ opencode 的积分也**不在** `creditsTable` 里（它的余额是本地派生的
+  //    通道可用性、零网络，作为特例留在 `credits.balances` 里短路）。
   {
     const registry: ReadonlyArray<readonly [string, JetHubAuthLike]> = [
       ['codearts', service],
@@ -2430,6 +2460,11 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
           refreshAccount: (refName, pool, accountId) =>
             auth.refreshAccountCredential(refName, pool, accountId),
         },
+        // ⚠️ `creditsOf` 而非 `creditsTable[id]`：`in`/下标会命中原型链上的键
+        //（如 `constructor`），与 `jet-hub-rpc.ts` 的 `authOf` 同因。
+        // ⚠️ qoder 系**没有** credits 条目（形态不匹配，是特例），故这里
+        //    对它们是 `undefined` —— 如实表达「该渠道不在表里」。
+        credits: creditsOf(creditsTable, id),
       })
       if (!registered) {
         ctx.logger?.info?.(

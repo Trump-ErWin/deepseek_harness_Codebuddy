@@ -17,6 +17,7 @@ import {
 } from '../../src/cline-request-log.js'
 import { descriptorOf } from '../../src/provider-registry.js'
 import { accountEntry, refreshHarness } from '../helpers/rpc-refresh.js'
+import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
 import { PROVIDER_ICONS } from '../../plugin-src/client/provider-icons.js'
 import { CREDITS_CAPABILITIES } from '../../plugin-src/client/credits-capabilities.js'
 
@@ -809,17 +810,18 @@ describe('Cline 接线（源码级回归）', () => {
     expect(source).toContain('cline.stop()')
     // Jet Hub「显示列表」需要适配器实例
     expect(source).toMatch(/cline: pruned\([^)]*,\s*clineAdapter\)/)
-    // ⚠️ 2026-10-08 改措辞：`registerJetHubRpc` 的 auth 实例已从 13 个**位置
-    // 参数**改为**命名对象**（`auths`，键是 provider id），`modelAdapters` 是
-    // 紧随其后的**独立第 4 个形参**。故「cline 在 modelAdapters 之前」这条
-    // 不变式现在的含义是「`cline` 键在 auths 对象里」（而不是「排在第 N 个槽位」）。
-    // 只断言「cline 键存在、且对象字面量确实在 modelAdapters 之前」，
-    // **不要**写死整串前缀 —— 那会让每加一个 provider 都假失败（加 Loomy、
-    // Raccoon、QoderCN 时各踩一次）。之前的正则把
-    // `…lobsterai, qoder, trae, cline,` 整段写死了，与这条注释矛盾。
-    expect(source).toMatch(
-      /registerJetHubRpc\([\s\S]*?cline,[\s\S]*?modelAdapters\)/,
-    )
+    // ⚠️ 2026-10-08 改（Task 3）：原先这条是**相邻性正则**
+    // `registerJetHubRpc\([\s\S]*?cline,[\s\S]*?modelAdapters\)`。
+    // Task 3 一度给 `registerJetHubRpc` 加了**第 5 个位置形参** `credits`
+    // （调用点变成 `… }, modelAdapters, creditsTable)`）⇒ 正则必然假失败。
+    // 该形参随后在设计复审 C1 中被删除，但**本条的改法保留**：它守的意图
+    // （cline 的 auth 实例接上了）**与形参个数无关**。
+    // ⇒ 按 **AST** 取调用点第三个实参（auths 对象字面量）的键 ——
+    // 重排 / 插键 / 加形参都不会假失败，而键真的漏了必然变红。
+    const authKeys = jetHubAuthsCallKeys(source)
+    expect(Object.keys(authKeys), 'cline 必须在 auths 命名对象里（键 = provider id）')
+      .toContain('cline')
+    expect(authKeys.cline, '`cline` 键的值必须是 cline 实例').toBe('cline')
     // 老契约下的 settings namespace
     // ⚠️ 2026-10-08 改：原先扫 index.ts 源码文本找 `'llm-cline'`。本次重构把 13 个
     //    字面量收敛成从 `PROVIDER_REGISTRY` 派生 ⇒ 文本断言变红而行为没变。
@@ -845,8 +847,15 @@ describe('Cline 接线（源码级回归）', () => {
     expect(result.ok, `cline 续期应成功，实际 error=${result.error?.message}`).toBe(true)
     expect(harness.calls.map((c) => c.provider), 'cline 账号串到了别的实例').toEqual(['cline'])
     expect(harness.calls[0]?.ref).toBe('CLINE_ACCOUNT_WIRE')
-    expect(source).toContain('fetchClineCreditBalance(credential, CLINE)')
-    // 签到必须显式拒绝（而不是落到 unsupported provider 的泛化文案）
+    // ⚠️ 2026-10-08 改（Task 3）：原先这条断言 `src/jet-hub-rpc.ts` 的源码文本里
+    //    含 `fetchClineCreditBalance(credential, CLINE)`。Task 3 把余额调用搬进了
+    //    `src/provider-credits.ts` 的积分表 ⇒ 该文本**不存在了**，而它守的意图
+    //    （cline 的余额真的走它自己的协议原语、且端到端打到自己的上游路径）
+    //    **与文本无关**。⇒ 改为**行为**断言，且**搬到了唯一一处**（避免同一套
+    //    RPC 夹具在多文件重复）：
+    //    `credits-runtime-parity.spec.ts` 的
+    //    「★★ 逐家余额都走自己的上游端点」—— 它真跑端点、逐家核对请求 URL。
+    //    比原断言强：文本只能证明源码里有那串字符，它能证明端到端打到正确路径。
     expect(source).toContain('Cline 不支持每日签到')
   })
 

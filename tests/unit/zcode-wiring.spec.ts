@@ -541,9 +541,18 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
 
   it('★ credits.balances 与 credits.claimAll 都接了 zcode', () => {
     const source = readRpc()
-    // 两处都应有 zcode 分派。
-    const matches = [...source.matchAll(/req\.provider === ZCODE\.id/g)]
-    expect(matches.length).toBeGreaterThanOrEqual(2)
+    // ⚠️ 2026-10-08 改（Task 3）：原先这条数 `req.provider === ZCODE.id` 出现
+    //    **两次**（credits.balances 与 credits.claimAll 各一处）。Task 3 把
+    //    credits.balances 的分派收敛成查表 ⇒ 只剩 claimAll 一处，该计数断言
+    //    必然假失败，而它守的意图（zcode 的余额与签到都接上了）**与文本无关**。
+    //    ⇒ 余额那一半改为**行为**断言（搬到唯一一处）：
+    //    `credits-runtime-parity.spec.ts` 的
+    //    「★★ 逐家余额都走自己的上游端点」（核对 zcode 的
+    //    `/api/v1/zcode-plan/billing/balance` 真的被请求到）+
+    //    「生产积分表的内容」（zcode 在表里、且走传入的 auth 实例）。
+    //    本文件保留 claimAll 那处的真协议分支断言。
+    expect(source, 'zcode 的 claimAll 分支仍须按 id 分派').toMatch(/req\.provider === ZCODE\.id/)
+    expect(source).toMatch(/claimDailyFor/)
   })
 
   it('★ 签到路径为**每个 plan 单独 mint** captcha（captcha 一次性）', () => {

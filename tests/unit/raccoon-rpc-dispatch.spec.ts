@@ -44,11 +44,29 @@ describe('Raccoon 的 RPC 分派', () => {
     //    此处保留一条**结构性**断言（而不是删掉整段）：确认 `account.refresh`
     //    真的走查表分派，而不是退回成某个 provider 专属的硬编码分支。
     expect(branchOf("case 'account.refresh':")).toMatch(/authOf\(auths, entry\.provider\)/)
-    // credits.balances —— ⚠️ 该文件里 `if (req.provider === RACCOON.id)` 出现多次，
-    // 故用**该分支独有的**注释锚点定位，避免命中 onboarding 的那一处。
-    const balanceAnchor = rpcSource.indexOf('余额来自 `GET /points/v1/balance`')
-    expect(balanceAnchor, '未找到 credits.balances 的 raccoon 分支').toBeGreaterThan(-1)
-    expect(rpcSource.slice(balanceAnchor, balanceAnchor + 2000)).toMatch(/raccoon\.fetchCreditBalance/)
+    // credits.balances
+    //
+    // ⚠️ 2026-10-08 改（Task 3）：原先这里用注释锚点
+    //    （`余额来自 \`GET /points/v1/balance\``）切出 credits.balances 的 raccoon
+    //    分支，再断言里面含 `raccoon.fetchCreditBalance`。Task 3 把余额调用搬进了
+    //    `src/provider-credits.ts` 的积分表 ⇒ 那段注释与调用在 `jet-hub-rpc.ts` 里
+    //    **都不存在了**，而它守的意图（raccoon 的余额走它自己的协议原语、
+    //    且端到端打到自己的上游路径）**与文本无关**。
+    //    ⇒ 行为断言搬到了唯一一处（避免同一套 RPC 夹具在多文件重复）：
+    //    `credits-runtime-parity.spec.ts` 的
+    //    「★★ 逐家余额都走自己的上游端点」（真跑端点、核对请求 URL 含 `/balance`）
+    //    + 「余额查询优先走传入的 auth 实例」（哨兵证明走的是实例方法）。
+    //    本文件保留**结构性**断言：确认 credits.balances 真的走查表分派，
+    //    而不是退回成某个 provider 专属的硬编码分支。
+    // ⚠️ 窗口要**足够大**：查表分派排在 opencode 与 qoder 两个特例**之后**
+    //    （它们必须短路），那两个块合计约 3.5 KB ⇒ 用默认的 3000 会切不到查表行，
+    //    变成一条恒假的断言。用**下一个 case**（`cline.quota`）作右边界最稳。
+    const balanceStart = rpcSource.indexOf("case 'credits.balances':")
+    expect(balanceStart, '找不到 credits.balances 分支').toBeGreaterThan(-1)
+    const balanceEnd = rpcSource.indexOf("case 'cline.quota':", balanceStart)
+    expect(balanceEnd, '找不到 cline.quota 分支（右边界）').toBeGreaterThan(balanceStart)
+    expect(rpcSource.slice(balanceStart, balanceEnd))
+      .toMatch(/creditsOf\(credits, req\.provider\)/)
     // credits.claimAll（显式拒绝）
     expect(rpcSource).toMatch(/Raccoon Work 不支持每日签到/)
     // onboarding.status

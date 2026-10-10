@@ -517,7 +517,14 @@ describe('Gemini 接线点（源码断言）', () => {
     expect(refreshStart, '找不到 account.refresh 分支').toBeGreaterThan(-1)
     expect(rpcSource.slice(refreshStart, refreshStart + 4000))
       .toMatch(/authOf\(auths, entry\.provider\)/)
-    expect(rpcSource).toContain('fetchGeminiCreditBalance(credential, GEMINI)')
+    // ⚠️ 2026-10-08 改（Task 3）：原先这条断言 `src/jet-hub-rpc.ts` 的源码文本里
+    //    含 `fetchGeminiCreditBalance(credential, GEMINI)`。Task 3 把余额调用搬进了
+    //    `src/provider-credits.ts` 的积分表 ⇒ 该文本**不存在了**，而它守的意图
+    //    （gemini 的余额走它自己的配额原语、且端到端打到自己的上游路径）
+    //    **与文本无关**。⇒ 行为断言搬到了唯一一处：
+    //    `credits-runtime-parity.spec.ts` 的
+    //    「★★ 逐家余额都走自己的上游端点」（含 gemini 的配额路径）+
+    //    下面那条真跑 `credits.balances` 的用例（配额窗口转两个包）。
     // ⚠️ 漏了会被华为云 HMAC 签名发 Google 凭据。
     expect(probeSource).toContain('entry.provider === GEMINI.id')
     expect(probeSource).toContain('new GeminiAdapter({')
