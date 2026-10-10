@@ -30,15 +30,26 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { browserCandidates, findBrowserExecutable } from '../../src/zcode-captcha.js'
+import { browserCandidates, findBrowserExecutable } from '../../src/chromium-session.js'
 
-/** 被扫描的源码文件（本文件针对的正是它）。 */
+/**
+ * 被扫描的源码文件。
+ *
+ * ⚠ 是 `chromium-session.ts`，**不是** `zcode-captcha.ts`（2026-10-08 抽共享模块）：
+ * 候选链的三个分支函数、出口函数与 `findBrowserExecutable` 全部搬到了那里，
+ * 供 zcode captcha 与库库AI 登录共用。
+ *
+ * ⚠⚠ **本文件的判据全部依赖「扫到的确实是真源码」**，指错文件时的失效是
+ * **静默**的：`fnBody(code, name)` 里的 `expect(start).toBeGreaterThan(-1)`
+ * 会兜住「函数找不到」，但 `stripComments` 那几条整文件正则不会 ——
+ * 它们会在一个不含该代码的文件上求值并**全绿**。改实现文件时**必须同时改这里**。
+ */
 const sourcePath = join(
   dirname(fileURLToPath(import.meta.url)),
   '..',
   '..',
   'src',
-  'zcode-captcha.ts',
+  'chromium-session.ts',
 )
 
 /**
