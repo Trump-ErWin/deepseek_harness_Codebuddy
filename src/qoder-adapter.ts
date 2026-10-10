@@ -47,6 +47,7 @@ import {
 } from './openai-compat.js'
 import {
   BILLING_BUSINESS_CODE,
+  BILLING_BUSINESS_CODES,
   QUEUE_BUSINESS_CODE,
   QUEUE_MAX_ATTEMPTS,
   QUEUE_MAX_DELAY_MS,
@@ -74,6 +75,9 @@ const qoderQueueDelayMs = queueDelayMs
  */
 export {
   BILLING_BUSINESS_CODE as QODER_BILLING_CODE,
+  // ⚠️ IKKJFH：额度类**码值集合**也公开（对外 API 面），
+  // 与上面的单码值并存 —— 单码值只为兼容，判据请用集合。
+  BILLING_BUSINESS_CODES as QODER_BILLING_CODES,
   QUEUE_BUSINESS_CODE as QODER_QUEUE_CODE,
   QUEUE_MAX_ATTEMPTS as QODER_QUEUE_MAX_ATTEMPTS,
   QUEUE_MAX_DELAY_MS as QODER_QUEUE_MAX_DELAY_MS,

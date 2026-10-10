@@ -82,10 +82,8 @@ import {
 import { formatRowTokensPerSecond } from './tokens-per-second.js';
 import {
   accountLabel,
+  avgPerfDetailTooltip,
   avgPerfText,
-  avgPerfTooltip,
-  barDayLabel,
-  barHeightPercent,
   channelCardTitle,
   channelLabel,
   channelOrder,
@@ -94,13 +92,16 @@ import {
   formatEntryTime,
   formatTps,
   formatTtft,
+  historyHeatmapCells,
   hasAnyData,
   historyTitle,
   HISTORY_RANGES,
   ledgerSubtitle,
   rangeDaysOf,
   tokenSummaryText,
-  trendBars,
+  tokenSummaryTooltip,
+  todayDayKey,
+  totalTokensOf,
 } from './token-ledger-panel.js';
 // ⚠️ `formatTokenCount` 用 jet-hub.js 自己的本地实现（有界渲染，见其注释）；
 // 面板模块的同名导出只供趋势图 tooltip 等**弹窗内部**使用，不在这里导入 ——
@@ -1782,6 +1783,25 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
  * ⚠️ 判据全部在 `token-ledger-panel.js`（纯函数）：本组件只画形状，
  * 不做数值换算 —— 与 Cline 请求表 / 网关弹窗同款分工。
  */
+function csvCell(value) {
+  let text = value === null || value === undefined ? '' : String(value);
+  if (/^\s*[=+@-]/.test(text)) text = "'" + text;
+  return '"' + text.replace(/"/g, '""') + '"';
+}
+
+function downloadCsv(filename, headers, rows) {
+  const body = [headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n');
+  const blob = new Blob(['\uFEFF', body], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function TokenLedgerPanel({ rpcCall, onClose }) {
   const mounted = React.useRef(true);
   React.useEffect(() => () => { mounted.current = false; }, []);
@@ -1797,11 +1817,21 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
    * ⚠️ 历史与明细是**两份独立数据**（落盘日聚合 vs 内存流水），各自加载、
    * 各自的刷新按钮——历史来自盘上（重启保留），明细来自内存。
    */
-  const [historyRange, setHistoryRange] = React.useState('7d');
+  const [historyRange, setHistoryRange] = React.useState('30d');
+  const [historyFromDay, setHistoryFromDay] = React.useState('');
+  const [historyToDay, setHistoryToDay] = React.useState('');
   const [history, setHistory] = React.useState(null);
   const [historyPhase, setHistoryPhase] = React.useState('idle');
+  const [deletingHistoryDay, setDeletingHistoryDay] = React.useState(null);
+  const [historyDeleteError, setHistoryDeleteError] = React.useState('');
   /** 展开的那个历史日（`null` = 全收起）。天与天的聚合树同弹窗内切换。 */
   const [expandedDay, setExpandedDay] = React.useState(null);
+  const [hoveredDay, setHoveredDay] = React.useState(null);
+  const [entryQuery, setEntryQuery] = React.useState('');
+  const [entryChannel, setEntryChannel] = React.useState('all');
+  const [entryStatus, setEntryStatus] = React.useState('all');
+  const [entrySort, setEntrySort] = React.useState('newest');
+  const [entryPage, setEntryPage] = React.useState(1);
 
   const load = React.useCallback(async () => {
     setPhase('loading');
@@ -1822,11 +1852,19 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
   React.useEffect(() => { void load(); }, [load]);
 
   /** 读取历史日聚合（窗口切换时重拉；days=0 即「全部」，服务端钳到 90）。 */
-  const loadHistory = React.useCallback(async (rangeKey) => {
+  const loadHistory = React.useCallback(async (rangeKey, fromDay = historyFromDay, toDay = historyToDay) => {
+    if (rangeKey === 'custom' && fromDay && toDay && fromDay > toDay) {
+      setHistory(null);
+      setHistoryPhase('ready');
+      return;
+    }
     setHistoryPhase('loading');
     try {
       const days = rangeDaysOf(rangeKey);
-      const res = await rpcCall('usage.tokenLedgerHistory', days > 0 ? { sinceDays: days } : {});
+      const payload = rangeKey === 'custom'
+        ? { ...(fromDay ? { fromDay } : {}), ...(toDay ? { toDay } : {}) }
+        : days > 0 ? { sinceDays: days } : {};
+      const res = await rpcCall('usage.tokenLedgerHistory', payload);
       if (!mounted.current) return;
       setHistory(res ?? null);
       setHistoryPhase('ready');
@@ -1837,9 +1875,30 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
       setHistory(null);
       setHistoryPhase('error');
     }
-  }, [rpcCall]);
+  }, [historyFromDay, historyToDay, rpcCall]);
 
-  React.useEffect(() => { void loadHistory(historyRange); }, [historyRange, loadHistory]);
+  /** 删除图表中选中的单日累计；确认文案明确限定为历史文件里的这个日期。 */
+  const deleteHistoryDay = React.useCallback(async (day) => {
+    if (typeof day !== 'string' || !confirm(
+      `确认删除 ${day} 的历史用量？只清除这一天的日累计，不会清除实时明细、其他日期或账号设置。`,
+    )) return;
+    setDeletingHistoryDay(day);
+    setHistoryDeleteError('');
+    try {
+      await rpcCall('usage.tokenLedgerDeleteDay', { day });
+      if (!mounted.current) return;
+      setExpandedDay(null);
+      await loadHistory(historyRange);
+    } catch (caught) {
+      if (!mounted.current) return;
+      console.error('[jet-hub] delete token ledger history failed:', caught);
+      setHistoryDeleteError(caught?.message || `${day} 历史用量删除失败`);
+    } finally {
+      if (mounted.current) setDeletingHistoryDay(null);
+    }
+  }, [historyRange, loadHistory, rpcCall]);
+
+  React.useEffect(() => { void loadHistory(historyRange); }, [historyRange, historyFromDay, historyToDay, loadHistory]);
 
   const channels = React.useMemo(() => {
     const list = Array.isArray(snapshot?.channels) ? [...snapshot.channels] : [];
@@ -1856,7 +1915,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
    * 统一走这里，避免 7 个调用点各写一份 title 而漏掉某一处。
    */
   const perfCell = (row) => React.createElement('span', {
-    className: 'dim-jh-ledgerPerf', title: avgPerfTooltip(),
+    className: 'dim-jh-ledgerPerf', title: avgPerfDetailTooltip(row),
   }, avgPerfText(row));
 
   const renderModelRow = (modelRow, key) => React.createElement('div', {
@@ -1866,7 +1925,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
     React.createElement('span', { className: 'dim-jh-ledgerModelReq', title: '请求数（含失败）' },
       modelRow.requests + ' 次'),
     perfCell(modelRow),
-    React.createElement('span', { className: 'dim-jh-ledgerModelTokens' },
+    React.createElement('span', { className: 'dim-jh-ledgerModelTokens', title: tokenSummaryTooltip(modelRow) },
       tokenSummaryText(modelRow)));
 
   const renderSummary = () => {
@@ -1907,7 +1966,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
             React.createElement('span', { className: 'dim-jh-ledgerAccountName', title: accountRow.accountId },
               accountLabel(accountRow.accountId)),
             perfCell(accountRow.totals),
-            React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
+            React.createElement('span', { className: 'dim-jh-ledgerAccountSum', title: tokenSummaryTooltip(accountRow.totals) },
               tokenSummaryText(accountRow.totals))),
           accountRow.models.map((modelRow) =>
             renderModelRow(modelRow, modelRow.model))));
@@ -1926,7 +1985,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
           React.createElement('strong', null, channelCardTitle(channelRow)),
           perfCell(channelRow.totals),
-          React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
+          React.createElement('span', { className: 'dim-jh-ledgerCardSum', title: tokenSummaryTooltip(channelRow.totals) },
             tokenSummaryText(channelRow.totals))),
         channelRow.providers.map((providerRow) => React.createElement('div', {
           key: providerRow.provider, className: 'dim-jh-ledgerProvider',
@@ -1934,30 +1993,127 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
           React.createElement('div', { className: 'dim-jh-ledgerProviderHead' },
             React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, providerRow.provider),
             perfCell(providerRow.totals),
-            React.createElement('span', { className: 'dim-jh-ledgerProviderSum' },
+            React.createElement('span', { className: 'dim-jh-ledgerProviderSum', title: tokenSummaryTooltip(providerRow.totals) },
               tokenSummaryText(providerRow.totals))),
           renderProviderBody(providerRow))))));
   };
 
   const entries = Array.isArray(snapshot?.entries) ? snapshot.entries : [];
+  const visibleEntries = React.useMemo(() => {
+    const query = entryQuery.trim().toLowerCase();
+    const filtered = entries.filter((entry) => {
+      if (entryChannel !== 'all' && entry.channel !== entryChannel) return false;
+      if (entryStatus === 'success' && entry.error !== undefined) return false;
+      if (entryStatus === 'error' && entry.error === undefined) return false;
+      if (query && !String(entry.model ?? '').toLowerCase().includes(query)) return false;
+      return true;
+    });
+    const tokenValue = totalTokensOf;
+    filtered.sort((a, b) => {
+      if (entrySort === 'tokens') return tokenValue(b) - tokenValue(a) || b.ts - a.ts;
+      if (entrySort === 'duration') return (b.durationMs ?? 0) - (a.durationMs ?? 0) || b.ts - a.ts;
+      if (entrySort === 'speed') return (b.tps ?? 0) - (a.tps ?? 0) || b.ts - a.ts;
+      return b.ts - a.ts;
+    });
+    return filtered;
+  }, [entries, entryChannel, entryQuery, entrySort, entryStatus]);
+  React.useEffect(() => { setEntryPage(1); }, [entryChannel, entryQuery, entrySort, entryStatus]);
+  const entryPageCount = Math.max(1, Math.ceil(visibleEntries.length / 50));
+  const safeEntryPage = Math.min(entryPage, entryPageCount);
+  const pageEntries = visibleEntries.slice((safeEntryPage - 1) * 50, safeEntryPage * 50);
+
+  const exportEntries = () => downloadCsv('token-usage-details.csv',
+    ['时间', '渠道', '模型', '状态', '总处理量', '输入', '输出', '缓存命中', '缓存写入', '推理', '首字毫秒', '输出tok每秒', '耗时毫秒', '错误'],
+    visibleEntries.map((entry) => [
+      Number.isFinite(entry.ts) ? new Date(entry.ts).toISOString() : '', channelLabel(entry.channel), entry.model,
+      entry.error === undefined ? '成功' : '失败',
+      // ⚠️ 未收到 usage 的失败行导出**空串**而非 0：界面用 `—` 与真实的 0 严格区分
+      //（见 token-ledger.ts 的「0 会被读成瞬间完成、没花 token」注释），
+      // CSV 若写 0 就与界面自相矛盾，且 Excel 里再也分不出「没数据」与「真的是 0」。
+      entry.usageReported === false ? '' : totalTokensOf(entry),
+      entry.usageReported === false ? '' : entry.inputTokens ?? 0,
+      entry.usageReported === false ? '' : entry.outputTokens ?? 0,
+      entry.cacheReadTokens ?? 0,
+      entry.cacheWriteTokens ?? 0, entry.reasoningTokens ?? 0, entry.ttftMs ?? '',
+      entry.tps ?? '', entry.durationMs ?? '', entry.error ?? '',
+    ]));
+
   const renderEntries = () => {
     if (entries.length === 0) return null;
-    return React.createElement('table', { className: 'dim-jh-ledgerTable', key: 'entries' },
+    const toolbar = React.createElement('div', { className: 'dim-jh-ledgerEntryTools' },
+      React.createElement('strong', null, '最近请求'),
+      React.createElement('span', { className: 'dim-jh-ledgerEntryCount' }, `${visibleEntries.length} / ${entries.length}`),
+      React.createElement('input', {
+        className: 'dim-jh-input dim-jh-ledgerSearch', type: 'search', value: entryQuery,
+        placeholder: '筛选模型', 'aria-label': '按模型筛选请求',
+        onChange: (event) => setEntryQuery(event.target.value),
+      }),
+      React.createElement('select', {
+        className: 'dim-jh-ledgerSelect', value: entryChannel, 'aria-label': '按渠道筛选请求',
+        onChange: (event) => setEntryChannel(event.target.value),
+      }, [
+        React.createElement('option', { key: 'all', value: 'all' }, '全部渠道'),
+        React.createElement('option', { key: 'direct', value: 'direct' }, '直连'),
+        React.createElement('option', { key: 'gateway', value: 'gateway' }, '网关'),
+      ]),
+      React.createElement('select', {
+        className: 'dim-jh-ledgerSelect', value: entryStatus, 'aria-label': '按请求状态筛选',
+        onChange: (event) => setEntryStatus(event.target.value),
+      }, [
+        React.createElement('option', { key: 'all', value: 'all' }, '全部状态'),
+        React.createElement('option', { key: 'success', value: 'success' }, '成功'),
+        React.createElement('option', { key: 'error', value: 'error' }, '失败'),
+      ]),
+      React.createElement('select', {
+        className: 'dim-jh-ledgerSelect', value: entrySort, 'aria-label': '请求排序方式',
+        onChange: (event) => setEntrySort(event.target.value),
+      }, [
+        React.createElement('option', { key: 'newest', value: 'newest' }, '最新优先'),
+        React.createElement('option', { key: 'tokens', value: 'tokens' }, 'Token 量最多'),
+        React.createElement('option', { key: 'duration', value: 'duration' }, '耗时最长'),
+        React.createElement('option', { key: 'speed', value: 'speed' }, '速率最高'),
+      ]),
+      React.createElement('button', {
+        className: 'dim-jh-btn dim-jh-ledgerExport', onClick: exportEntries,
+        disabled: visibleEntries.length === 0, title: '导出当前筛选后的请求明细 CSV',
+      }, '导出明细'));
+    if (visibleEntries.length === 0) return React.createElement('div', { key: 'entries' }, toolbar,
+      React.createElement('div', { className: 'dim-jh-empty' }, '没有符合当前筛选条件的请求。'));
+    return React.createElement('div', { key: 'entries' }, toolbar,
+      React.createElement('table', { className: 'dim-jh-ledgerTable' },
       React.createElement('thead', null,
         React.createElement('tr', null,
-          ['时间', '渠道', '模型', 'TOKEN', '首字', '速率', '耗时'].map((h) =>
-            React.createElement('th', { key: h }, h)))),
-      React.createElement('tbody', null, entries.map((entry, index) => React.createElement('tr', {
+          ['时间', '渠道', '模型', 'TOKEN', '首字', '速率', '耗时', '状态'].map((h) =>
+            React.createElement('th', {
+              key: h,
+              title: h === 'TOKEN' ? '总处理量 = 未命中缓存输入 + 缓存命中输入 + 输出；缓存写入单列展示，不重复计入总量' : undefined,
+            }, h)))),
+      React.createElement('tbody', null, pageEntries.map((entry, index) => React.createElement('tr', {
         key: entry.ts + '-' + index,
-        title: entry.error !== undefined ? '失败：' + entry.error : undefined,
+        'data-error': entry.error !== undefined ? 'true' : 'false',
       },
-        React.createElement('td', null, formatEntryTime(entry.ts)),
+        React.createElement('td', { title: new Date(entry.ts).toLocaleString() }, formatEntryTime(entry.ts)),
         React.createElement('td', null, channelLabel(entry.channel)),
         React.createElement('td', { className: 'dim-jh-ledgerEntryModel' }, entry.model),
-        React.createElement('td', null, entryTokenText(entry)),
+        React.createElement('td', { title: tokenSummaryTooltip(entry) }, entryTokenText(entry)),
         React.createElement('td', null, formatTtft(entry)),
         React.createElement('td', null, formatTps(entry)),
-        React.createElement('td', null, formatDuration(entry.durationMs))))));
+        React.createElement('td', null, formatDuration(entry.durationMs)),
+        React.createElement('td', {
+          className: entry.error !== undefined ? 'dim-jh-ledgerError' : 'dim-jh-ledgerSuccess',
+          title: entry.error !== undefined ? entry.error : '请求成功',
+          'aria-label': entry.error !== undefined ? '失败详情：' + entry.error : '请求成功',
+        }, entry.error !== undefined ? '失败 ⓘ' : '成功 ✓'))))),
+      React.createElement('div', { className: 'dim-jh-ledgerPagination' },
+        React.createElement('span', null, `第 ${safeEntryPage} / ${entryPageCount} 页，每页 50 条`),
+        React.createElement('button', {
+          className: 'dim-jh-btn', disabled: safeEntryPage <= 1,
+          onClick: () => setEntryPage((page) => Math.max(1, page - 1)),
+        }, '上一页'),
+        React.createElement('button', {
+          className: 'dim-jh-btn', disabled: safeEntryPage >= entryPageCount,
+          onClick: () => setEntryPage((page) => Math.min(entryPageCount, page + 1)),
+        }, '下一页')));
   };
 
   // ── 历史视图（第 4 期）：数据源是落盘日聚合，重启保留 ──
@@ -1966,8 +2122,20 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
   // 「合计有数、却没有柱子」（空状态文案还反过来说「今天发起的请求明天才能看到」，
   // 而当天数据其实就在响应里）。
   const historyDays = Array.isArray(history?.history) ? history.history : [];
-  const bars = trendBars(historyDays);
-  const maxTokens = bars.reduce((max, b) => Math.max(max, b.tokens), 0);
+  const heatmapDays = historyRange === 'custom'
+    ? Math.min(90, historyFromDay && historyToDay
+      ? Math.max(1, Math.round((Date.parse(historyToDay + 'T00:00:00Z') - Date.parse(historyFromDay + 'T00:00:00Z')) / 86400000) + 1)
+      : 30)
+    : rangeDaysOf(historyRange) || 90;
+  const heatmapEndDay = historyRange === 'custom' && historyToDay ? historyToDay : todayDayKey();
+  const heatmapCells = historyHeatmapCells(historyDays, heatmapDays, heatmapEndDay);
+  const selectedHistoryDay = historyDays.find((d) => d?.day === (hoveredDay ?? expandedDay)) ?? null;
+  const invalidHistoryRange = historyRange === 'custom' && historyFromDay && historyToDay && historyFromDay > historyToDay;
+  const exportHistory = () => downloadCsv('token-usage-history.csv',
+    ['日期', '请求数', '总处理量', '输入', '输出', '缓存命中', '缓存写入', '推理'],
+    historyDays.map((day) => [day.day, day.totals?.requests ?? 0, day.totals?.totalTokens ?? 0,
+      day.totals?.inputTokens ?? 0, day.totals?.outputTokens ?? 0, day.totals?.cacheReadTokens ?? 0,
+      day.totals?.cacheWriteTokens ?? 0, day.totals?.reasoningTokens ?? 0]));
   const renderHistory = () => {
     // 窗口切换条：与渠道筛选同一观感（胶囊按钮组）。
     const rangeRow = React.createElement('div', { className: 'dim-jh-ledgerFilters', key: 'historyRanges' },
@@ -1977,43 +2145,84 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         'data-active': historyRange === r.key ? 'true' : 'false',
         onClick: () => { setHistoryRange(r.key); setExpandedDay(null); },
       }, r.label)),
-      React.createElement('span', { className: 'dim-jh-ledgerPerf', style: { marginLeft: 'auto' } },
+      React.createElement('button', {
+        key: 'custom', className: 'dim-jh-btn dim-jh-ledgerFilterBtn',
+        'data-active': historyRange === 'custom' ? 'true' : 'false',
+        onClick: () => {
+          const today = todayDayKey();
+          const [year, month, date] = today.split('-').map(Number);
+          const fromDefault = new Date(Date.UTC(year, month - 1, date - 6)).toISOString().slice(0, 10);
+          setHistoryFromDay((value) => value || fromDefault);
+          setHistoryToDay((value) => value || today);
+          setHistoryRange('custom');
+          setExpandedDay(null);
+        },
+      }, '自选'),
+      historyRange === 'custom' ? React.createElement('div', { className: 'dim-jh-ledgerDateRange', key: 'dateRange' },
+        React.createElement('label', null, '从', React.createElement('input', {
+          type: 'date', className: 'dim-jh-input', value: historyFromDay,
+          onChange: (event) => setHistoryFromDay(event.target.value),
+        })),
+        React.createElement('label', null, '到', React.createElement('input', {
+          type: 'date', className: 'dim-jh-input', value: historyToDay,
+          onChange: (event) => setHistoryToDay(event.target.value),
+        }))) : null,
+      React.createElement('button', {
+        className: 'dim-jh-btn dim-jh-ledgerExport', disabled: historyPhase !== 'ready' || historyDays.length === 0,
+        title: '导出当前日期范围的每日汇总 CSV', onClick: exportHistory,
+      }, '导出历史'),
+      React.createElement('span', {
+        className: 'dim-jh-ledgerPerf', style: { marginLeft: 'auto' },
+        title: history?.totals ? tokenSummaryTooltip(history.totals) : undefined,
+      },
         history !== null && history.totals !== undefined
-          ? '合计 ↓' + formatTokenCount(history.totals.inputTokens)
-            + ' ↑' + formatTokenCount(history.totals.outputTokens)
-            + ' · ' + (history.totals.requests ?? 0) + ' 次请求'
+          ? '总处理 ' + formatTokenCount(history.totals.totalTokens)
+            + ' · ' + (history.totals.requests ?? 0) + ' 次'
           : ''));
-    const body = historyPhase === 'loading'
+    const body = invalidHistoryRange
+      ? React.createElement('div', { className: 'dim-jh-empty', key: 'histRangeError', role: 'alert' }, '起始日期不能晚于结束日期。')
+      : historyPhase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty', key: 'histLoading' }, '正在读取历史用量…')
       : historyPhase === 'error'
         ? React.createElement('div', { className: 'dim-jh-empty', key: 'histError' }, '历史用量读取失败（不影响明细）。')
-        : bars.length === 0
+        : historyDays.length === 0
           ? React.createElement('div', { className: 'dim-jh-empty', key: 'histEmpty' },
-              '还没有历史用量。每笔请求都会按日累计入盘 —— 今天发起的请求明天就能在这里看到。')
+              '还没有历史用量。请求完成后会立即按 UTC+8 日期累计，历史最多保留 90 天。')
           : React.createElement(React.Fragment, { key: 'histBody' },
-              // 趋势柱状图：每根柱 = 一天，点击下钻该日聚合树（再点收起）。
-              // ⚠️ 柱高必须传 `bars.length`：单日窗口下不传根数时最大柱恒 100%，
-              // 撑满容器成「白块」（见 barHeightPercent 的缺陷注释）。
-              React.createElement('div', { className: 'dim-jh-ledgerTrend' },
-                bars.map((b) => React.createElement('div', {
-                  key: b.day,
-                  className: 'dim-jh-ledgerTrendCol',
-                  title: b.day + '：↓↑ ' + formatTokenCount(b.tokens) + ' · ' + b.requests + ' 次',
-                  onClick: () => setExpandedDay((prev) => (prev === b.day ? null : b.day)),
-                },
-                  React.createElement('div', {
-                    className: 'dim-jh-ledgerTrendBar',
-                    'data-today': b.isToday ? 'true' : 'false',
-                    'data-active': expandedDay === b.day ? 'true' : 'false',
-                    style: { height: barHeightPercent(b.tokens, maxTokens, bars.length) + '%' },
-                  }),
-                  // 日期短标签常驻显示：光靠色块无法区分哪天（tooltip 要 hover）。
-                  React.createElement('div', { className: 'dim-jh-ledgerTrendLabel' }, barDayLabel(b.day)))),
+              // GitHub 风格用量格：固定四行，按日期顺序排列，点击可展开当日详情。
+              React.createElement('div', { className: 'dim-jh-ledgerHeatmapWrap' },
+                React.createElement('div', { className: 'dim-jh-ledgerHeatmap', role: 'group', 'aria-label': '每日 Token 用量热力图' },
+                  heatmapCells.map((cell) => React.createElement('button', {
+                    key: cell.day,
+                    className: 'dim-jh-ledgerHeatmapCell',
+                    type: 'button',
+                    'data-level': String(cell.level),
+                    'data-today': cell.isToday ? 'true' : 'false',
+                    'data-active': expandedDay === cell.day ? 'true' : 'false',
+                    title: `${cell.day}\n总处理 ${formatTokenCount(cell.tokens)}\n请求 ${cell.requests} 次\n${tokenSummaryTooltip(historyDays.find((day) => day.day === cell.day)?.totals)}\n点击展开当日明细`,
+                    'aria-label': `${cell.day}，总处理 ${formatTokenCount(cell.tokens)}，${cell.requests} 次请求。点击展开`,
+                    onMouseEnter: () => setHoveredDay(cell.day),
+                    onMouseLeave: () => setHoveredDay(null),
+                    onFocus: () => setHoveredDay(cell.day),
+                    onBlur: () => setHoveredDay(null),
+                    onClick: () => setExpandedDay((prev) => (prev === cell.day ? null : cell.day)),
+                  })))),
+              selectedHistoryDay ? React.createElement('div', { className: 'dim-jh-ledgerDayPeek' },
+                React.createElement('strong', null, selectedHistoryDay.day),
+                React.createElement('span', null, '总处理 ' + formatTokenCount(selectedHistoryDay.totals?.totalTokens)),
+                React.createElement('span', null, (selectedHistoryDay.totals?.requests ?? 0) + ' 次请求'),
+                React.createElement('span', { title: tokenSummaryTooltip(selectedHistoryDay.totals) }, '悬停查看 Token 拆分'),
+                React.createElement('button', {
+                  className: 'dim-jh-btn dim-jh-ledgerDeleteQuick',
+                  onClick: () => setExpandedDay(selectedHistoryDay.day),
+                  title: '展开当日详情与删除入口',
+                }, '查看 / 删除')) : React.createElement('div', { className: 'dim-jh-ledgerChartHint' },
+                '悬停查看当日用量，点击日期展开详情'),
               // 展开的那天：完整聚合树（渠道 → provider → 账号 → 模型）。
               ...(expandedDay !== null
                 ? historyDays.filter((d) => d?.day === expandedDay).map((dayRow) =>
                     renderDayTree(dayRow))
-                : [])));
+                : []));
     return React.createElement('div', { className: 'dim-jh-ledgerSection', key: 'history' },
       React.createElement('div', { className: 'dim-jh-ledgerSectionTitle' },
         historyTitle(historyRange)),
@@ -2023,16 +2232,26 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
 
   /** 一天的历史聚合树：结构与实时汇总卡一致（复用 tokenSummaryText 等口径）。 */
   const renderDayTree = (dayRow) => React.createElement('div', { key: 'day-' + dayRow.day, className: 'dim-jh-ledgerCard' },
-    React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
-      React.createElement('strong', null, dayRow.day + ' · ' + (dayRow.totals?.requests ?? 0) + ' 次请求'),
-      perfCell(dayRow.totals),
-      React.createElement('span', { className: 'dim-jh-ledgerCardSum' },
-        tokenSummaryText(dayRow.totals))),
+      React.createElement('div', { className: 'dim-jh-ledgerCardHead' },
+        React.createElement('strong', null, dayRow.day + ' · ' + (dayRow.totals?.requests ?? 0) + ' 次请求'),
+        perfCell(dayRow.totals),
+        React.createElement('span', { className: 'dim-jh-ledgerCardSum', title: tokenSummaryTooltip(dayRow.totals) },
+          tokenSummaryText(dayRow.totals)),
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          'data-kind': 'danger',
+          disabled: deletingHistoryDay === dayRow.day,
+          title: '只删除此日期的历史累计',
+          onClick: () => { void deleteHistoryDay(dayRow.day); },
+        }, deletingHistoryDay === dayRow.day ? '删除中…' : '删除此日')),
+    historyDeleteError
+      ? React.createElement('div', { className: 'dim-jh-empty', role: 'alert' }, historyDeleteError)
+      : null,
     dayRow.channels.map((channelRow) => React.createElement('div', { key: channelRow.channel, className: 'dim-jh-ledgerProvider' },
       React.createElement('div', { className: 'dim-jh-ledgerProviderHead' },
         React.createElement('span', { className: 'dim-jh-ledgerProviderName' }, channelLabel(channelRow.channel)),
         perfCell(channelRow.totals),
-        React.createElement('span', { className: 'dim-jh-ledgerProviderSum' },
+        React.createElement('span', { className: 'dim-jh-ledgerProviderSum', title: tokenSummaryTooltip(channelRow.totals) },
           tokenSummaryText(channelRow.totals))),
       channelRow.providers.map((providerRow) => React.createElement('div', {
         key: providerRow.provider, className: 'dim-jh-ledgerAccount',
@@ -2040,7 +2259,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
           React.createElement('span', { className: 'dim-jh-ledgerAccountName' }, providerRow.provider),
           perfCell(providerRow.totals),
-          React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
+          React.createElement('span', { className: 'dim-jh-ledgerAccountSum', title: tokenSummaryTooltip(providerRow.totals) },
             tokenSummaryText(providerRow.totals))),
         (providerRow.accounts ?? []).length > 1
           ? providerRow.accounts.map((accountRow) => React.createElement('div', {
@@ -2050,7 +2269,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
               React.createElement('div', { className: 'dim-jh-ledgerAccountHead' },
                 React.createElement('span', { className: 'dim-jh-ledgerAccountName' },
                   accountLabel(accountRow.accountId)),
-                React.createElement('span', { className: 'dim-jh-ledgerAccountSum' },
+                React.createElement('span', { className: 'dim-jh-ledgerAccountSum', title: tokenSummaryTooltip(accountRow.totals) },
                   tokenSummaryText(accountRow.totals))),
               accountRow.models.map((modelRow) =>
                 renderModelRow(modelRow, accountRow.accountId + '#' + modelRow.model))))
@@ -2062,10 +2281,10 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
     React.createElement('div', {
-      className: 'dim-jh-modal',
       role: 'dialog',
       'aria-modal': 'true',
       'aria-label': 'Token 用量',
+      className: 'dim-jh-modal dim-jh-modal--ledger',
     },
       React.createElement('div', { className: 'dim-jh-modalHead' },
         React.createElement('div', { className: 'dim-jh-modalTitle' },
@@ -2083,14 +2302,11 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
             'data-kind': 'primary',
             onClick: onClose,
           }, '完成'))),
-      React.createElement('p', { className: 'dim-jh-modalHint' },
-        '按渠道（直连 / 网关）、供应商、账号与模型统计本机发出的每笔模型请求。'
-        + '↓输入 ↑输出 ⚡缓存 ✎缓存写入 🧠推理；— 表示该笔未收到用量（失败或中断）。'
-        + '明细含「首字用时」与「输出速率」（首块之后 → 结束，官方口径）；'
-        + '汇总行的「均值」只对有实测值的请求平均'
-        + '（速率要求解码时长 ≥ 100ms，过短视为不可测；'
-        + '且为算术平均，个别极快/极慢的离群请求会明显拉高或拉低该值 —— 悬停均值格看口径）。'
-        + '明细保留最近 500 笔（重启清空）；按日累计已存盘（token-ledger.json）。'),
+      React.createElement('p', {
+        className: 'dim-jh-modalHint',
+        title: '总处理量 = 输入 + 输出；缓存写入不重复计入。输出速率的均值对离群样本敏感；P50/P90 是完整分布估算。速率要求解码时长至少 100ms。明细最多保留最近 500 笔，重启清空；按日累计写入 token-ledger.json。',
+      },
+        '按渠道、供应商、账号和模型统计用量。悬停数字查看 Token 拆分与性能口径；逐笔明细重启后清空，按日历史会保留。'),
       React.createElement('div', { className: 'dim-jh-modalBody' },
         renderHistory(),
         renderSummary(),

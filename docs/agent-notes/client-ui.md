@@ -2067,3 +2067,113 @@ fallback**（宁可取不到值时背景异常、能一眼看出，也不要一�
 - 回归断言问题 1 的布局（开关被挤出 **0 / 8 行**）。
 
 ⚠️ 单测抓不到布局与 CSS 变量解析，故用源码级断言 + 该脚本双重锁住。
+
+## ⚠️⚠️ 注入的 `<style>` **必须署名** `data-plugin`，否则会被别的插件认领后连带删除（Issue IKK764）
+
+**用户报障**：Jet Hub 面板的整套 `.dim-jh-*` 样式，在**安装 / 更新 / 禁用任意一个别的插件之后**
+立刻退化成浏览器默认样式（标题没层级、按钮变原生控件、卡片配色圆角全丢）；
+**F5 刷新（或重启 DSH）后恢复**，但下一次再装/改插件又复发 —— 用户侧看起来就像「这个插件坏了」。
+
+### 根因：不是 CSS 写错，是注入的 `<style>` **没有署名**
+
+宿主 `@deepseek-ai/dsh-client-modules`（`lib/client.js`）对样式标签有**归属机制**：
+
+| 函数 | 判据 | 位置 |
+|---|---|---|
+| `claimStyles(id)` | 对 `querySelectorAll('style:not([data-plugin])')` 的**每一条** `setAttribute('data-plugin', id)` | `client.js:492-498` |
+| `removeOwnedStyles(id)` | 删除 `style[data-plugin="<id>"]` | `client.js:194-197` |
+| `materialize` 调用点 | factory 执行**之后** `claimStyles(ownerId)` | `client.js:684` |
+
+即：**任何无主的 `<style>` 都会被认领给「当前正在物化的那个插件」**。
+而 `installJetHubStyles()` 是在 `ctx.effect(...)`（插件 apply 阶段）里注入的，
+**必然晚于自己那次 `claimStyles`** ⇒ 旧实现（无署名）下这条标签**始终无主**。
+
+之后任何一个插件物化都会把它认领走；等那个插件热重载 / 被 prune / 被禁用 / factory 抛错，
+宿主就把「它名下」的样式**连根删掉**：
+
+| `removeOwnedStyles` 的触发路径 | 行 |
+|---|---|
+| `updateManifest`（该行 revision 变化） | `client.js:796` |
+| `prune`（该行不再被引用） | `client.js:821` |
+| 条目被替换 `replace` | `client.js:367` |
+| factory 抛错 | `client.js:690` |
+
+宿主 README 把它写作设计：*graph updates discard stale unowned factories, their styles*。
+而「安装/修改插件」本身就是一次 graph update ⇒ **每次都必然踩到**。
+
+⚠️ **让问题无法自愈的是模块级 `injected` 布尔**：标签被外部删除后，即使 apply 再跑
+也直接 `return`，永远不再补注 —— 这就是「只有整页刷新才恢复」的成因。
+
+⚠️ **影响是全局的**：`lib/client/jet-hub.js` 整包**只有这一处**
+`document.createElement('style')`（源码 1 处、产物 1 处，已用 grep 精确计数），
+该标签承载全部 `.dim-jh-*` 规则 ⇒ 掉的是**整套 UI**，不是局部。
+
+### 修法：署名 + 幂等改 DOM 存在性判断
+
+`plugin-src/client/jet-hub-styles.js`（DSH 自家构建预设产出的插件就是这个形状，
+本机实测 `dshmarket` / `dsh-rewind-plugin` 都写了 `tag.dataset.plugin`）：
+
+```js
+const PLUGIN_ID = 'dsh-codearts-auth'          // = build.mjs 的 loaderId
+const STYLE_TAG_ID = PLUGIN_ID + '/jet-hub.css'
+const STYLE_SELECTOR = 'style[data-plugin-css=' + JSON.stringify(STYLE_TAG_ID) + ']'
+
+export function installJetHubStyles() {
+  if (document.querySelector(STYLE_SELECTOR) !== null) return () => {}   // DOM 存在性，不是模块级布尔
+  const style = document.createElement('style')
+  style.dataset.plugin = PLUGIN_ID        // ← 关键：署名
+  style.dataset.pluginCss = STYLE_TAG_ID
+  style.textContent = STYLES
+  document.head.appendChild(style)
+  return () => { document.querySelector(STYLE_SELECTOR)?.remove() }
+}
+```
+
+⚠️⚠️ **`PLUGIN_ID` 必须等于 `build.mjs` 的 `loaderId`**：宿主用的 `ownerId` 是
+`stripClientSuffix(registration.id)`，而 `registration.id` 就是构建脚本注入的 `loaderId`
+（本插件产物顶部 `window.__ModuleLoader__.load({ id: "dsh-codearts-auth", ... })`）。
+两边不一致时署名等于没署（`removeOwnedStyles('真实 id')` 删不到我们、
+`claimStyles` 也认不走）——代价是**它永远无主，缺陷原样复发**。
+`tests/unit/jet-hub-styles-ownership.spec.ts` 有一条用例逐字比对这两处。
+
+⚠️ **本文件不得再出现模板字符串**：整份文件只允许 `STYLES` 首尾那两个反引号
+（三条既有护栏用例会计数，2026-10-08 我加 `data-plugin-css` 时用模板字符串
+接线，一次触发 3 条红）。故 `STYLE_TAG_ID` / `STYLE_SELECTOR` 一律用 `+` 拼接。
+
+⚠️ **不需要 MutationObserver**：署名之后，唯一还能删掉这条标签的是
+`removeOwnedStyles('dsh-codearts-auth')`，它只出现在两条路径 ——
+`replace(自己)`（factory **必然重跑**，DOM 存在性判断随之复位）与
+`prune`（此时本插件已不在模块图里，删样式是**正确**行为）。「DOM 存在性判断」已覆盖。
+
+### 验证（可复用）
+
+`tests/unit/jet-hub-styles-ownership.spec.ts`（10 条）：
+
+- 断言全打在**可观察 DOM 结果**上（标签条数 / `data-plugin` 归属 / 认领与回收后是否幸存），
+  不是源码字符串 —— 因此对实现方式中立；
+- 宿主那侧的 `claimStyles` / `removeOwnedStyles` **优先取真实实现** —— 从已安装的 DSH
+  （`require.resolve` → 全局 `node_modules` → 用户 profile）里抽取两个函数的**真实源码**求值；
+  找不到时（干净克隆 / CI）退化为同语义内联实现，并**干净跳过**对拍用例；
+- 一条「扫描面有效性」护栏：定位到宿主时硬断言其**判据语义**未变
+  （`style:not([data-plugin])` / `factory(...)` 后紧跟 `claimStyles(ownerId)`），
+  否则本文件会静默失效。
+
+⚠️ **已做反向验证**（四种变异各自独立锁死，**不是同一反复**）：
+
+| 变异 | 变红条数 |
+|---|---|
+| 去掉署名（保留 DOM 存在性幂等） | 6 |
+| 幂等改回模块级布尔（保留署名） | 5 |
+| `PLUGIN_ID` 与 `loaderId` 不一致 | 7 |
+| disposer 改成删「所有」`style[data-plugin]`（过度删除） | 1 |
+
+⚠️ 变异 4 最初**全绿**（用例没抓住）—— 因为原 disposer 用例只验「删自己」、
+没验「不删别人的」，现已补上该断言。**这就是反向验证的价值**。
+
+⚠️ 另用独立脚本驱动**真实发布产物** `lib/client/jet-hub.js`（本机 profile 是 `link:` 到它）
+跑过同样的 8 步：署名正确、别的插件认领不到、回收后幸存、外部删除后 apply 能自愈。
+产物与源码构建结果经 sha256 逐字节比对确认同源。
+
+⚠️ 变异验证时**不要**用 `git checkout -- <文件>` 还原（AGENTS.md 明令禁止）——
+我本次这么做过一次，把尚未提交的修复整个丢掉了、只能重做。
+还原应当用**事先备份的副本**（如 `$env:TEMP` 下的备份），或 `git stash` 之外的安全手段。
