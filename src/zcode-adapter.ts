@@ -1551,13 +1551,13 @@ export class ZcodeAdapter extends LlmAdapter {
       tried.add(activeAccountId)
     }
 
-    const next = await pool.getAvailableAccount(this.product.id, options.model, tried)
+    const next = await pool.getAvailableAccount<ZcodeCredential>(this.product.id, options.model, tried)
     if (next === null || next === undefined || tried.has(next.entry.id)) return undefined
     tried.add(next.entry.id)
     return {
       // 池的凭据类型是历史遗留的联合类型；运行时安全性由 provider 过滤保证
       // （查询用 `this.product.id`，取到的必是 zcode 凭据）。
-      credential: next.credential as unknown as ZcodeCredential,
+      credential: next.credential,
       accountId: next.entry.id,
     }
   }

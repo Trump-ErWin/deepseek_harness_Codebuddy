@@ -21,7 +21,7 @@ const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8')
  * 会让「改一处影响多个 spec」—— 正是这些测试要防的形态。
  */
 function factoryBlockOf(source: string, product: string): string {
-  const calls = [...source.matchAll(/createCredentialResolver\(/g)].map(m => m.index!)
+  const calls = [...source.matchAll(/createCredentialResolver(?:<[^>]*>)?\(/g)].map(m => m.index!)
   for (let i = 0; i < calls.length; i++) {
     const block = source.slice(calls[i]!, calls[i + 1] ?? source.length)
     const first = /product: (\w+),/.exec(block)

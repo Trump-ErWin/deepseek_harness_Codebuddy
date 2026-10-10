@@ -419,9 +419,9 @@ export class MinimaxAuth extends Service {
     if (pool !== undefined) {
       // ⚠ `getAvailableAccount` 返回 **`{ entry, credential }`**（两层），
       // **不是**「账号条目本身」—— 照抄既有 provider 的写法：
-      // `const available = await pool.getAvailableAccount(id, ''); available?.credential`
-      const available = await pool.getAvailableAccount(this.product.id, '')
-      if (available) return available.credential as unknown as MinimaxCredential
+      // `const available = await pool.getAvailableAccount<MinimaxCredential>(id, ''); available?.credential`
+      const available = await pool.getAvailableAccount<MinimaxCredential>(this.product.id, '')
+      if (available) return available.credential
     }
     return await this.resolveDefaultCredential()
   }

@@ -1346,12 +1346,12 @@ export class CodeArtsAdapter extends LlmAdapter {
             // 第一**（当失败类别不写标记时尤甚），不排除就会拿回同一个、命中
             // `tried.has` 而立即放弃切换（换号形同虚设）。
             if (this.options.accountPool) {
-              const next = await this.options.accountPool.getAvailableAccount(
+              const next = await this.options.accountPool.getAvailableAccount<CodeArtsCredential>(
                 'codearts', options.model, rateLimitTried,
               )
               if (next && !rateLimitTried.has(next.entry.id)) {
                 rateLimitTried.add(next.entry.id)
-                credential = next.credential as CodeArtsCredential
+                credential = next.credential
                 currentAccountId = next.entry.id
                 authRefreshed = false // 新凭据：重置「已刷新过」标记
                 continue // 用下一个账号重试
@@ -1408,12 +1408,12 @@ export class CodeArtsAdapter extends LlmAdapter {
               )
               rateLimitTried.add(currentAccountId)
             }
-            const next = await this.options.accountPool.getAvailableAccount(
+            const next = await this.options.accountPool.getAvailableAccount<CodeArtsCredential>(
               'codearts', options.model, rateLimitTried,
             )
             if (next && !rateLimitTried.has(next.entry.id)) {
               rateLimitTried.add(next.entry.id)
-              credential = next.credential as CodeArtsCredential
+              credential = next.credential
               currentAccountId = next.entry.id
               authRefreshed = false
               continue
@@ -1443,10 +1443,10 @@ export class CodeArtsAdapter extends LlmAdapter {
                 currentAccountId, parsed.modelId, parsed.resetTimeMs,
               )
             }
-            const next = await this.options.accountPool.getAvailableAccount('codearts', options.model)
+            const next = await this.options.accountPool.getAvailableAccount<CodeArtsCredential>('codearts', options.model)
             if (next && !rateLimitTried.has(next.entry.id)) {
               rateLimitTried.add(next.entry.id)
-              credential = next.credential as CodeArtsCredential
+              credential = next.credential
               currentAccountId = next.entry.id
               authRefreshed = false // Reset auth refresh flag for new credential
               continue // Retry request with new credential

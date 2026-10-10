@@ -974,11 +974,11 @@ export class QoderAdapter extends LlmAdapter {
     // ⚠️ 必须传 `tried`：池按「限流重置时间最早到期」排序，**刚失败的账号可能
     // 仍排第一**，不排除就会拿回同一个、命中下面的检查而立即放弃切换。
     // （与 buddy 的注释同因，见 `buddy-adapter.ts` 的 1200 行附近。）
-    const next = await pool.getAvailableAccount(this.product.id, options.model, tried)
+    const next = await pool.getAvailableAccount<QoderCredential>(this.product.id, options.model, tried)
     if (next === null || tried.has(next.entry.id)) return undefined
     tried.add(next.entry.id)
 
-    const credential = next.credential as QoderCredential
+    const credential = next.credential
     // 切号后必须重新过一遍 uid 补齐（每个账号的 uid 不同，缺了会签名无效）。
     return { credential: await this.ensureUid(credential), accountId: next.entry.id }
   }

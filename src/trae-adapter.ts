@@ -1213,12 +1213,12 @@ export class TraeAdapter extends LlmAdapter {
 
         const maxRotate = TRAE_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
-          const next = await pool.getAvailableAccount(
+          const next = await pool.getAvailableAccount<TraeCredential>(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
-          credential = next.credential as TraeCredential
+          credential = next.credential
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {
@@ -1306,14 +1306,14 @@ export class TraeAdapter extends LlmAdapter {
           //   刚标记的账号立刻又被选中 —— 换号形同虚设；
           // - 不传 `tried` 会在 A/B 之间反复空转（Qoder 已踩过，见
           //   `qoder-adapter.ts` 的 `switchAccountOnQuota` 注释）。
-          const next = await this.options.accountPool.getAvailableAccount(
+          const next = await this.options.accountPool.getAvailableAccount<TraeCredential>(
             this.product.id, options.model, triedStreamAccounts,
           )
           if (next === null || next === undefined || triedStreamAccounts.has(next.entry.id)) {
             throw new LlmError(error.message, 'QUOTA_EXCEEDED')
           }
           triedStreamAccounts.add(next.entry.id)
-          credential = next.credential as TraeCredential
+          credential = next.credential
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (!response.ok) {

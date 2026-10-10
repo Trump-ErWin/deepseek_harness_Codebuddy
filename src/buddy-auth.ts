@@ -441,10 +441,10 @@ export class BuddyAuth extends Service {
   async fetchModels(pool?: AccountPool): Promise<BuddyRemoteModel[]> {
     // 优先账号池
     if (pool) {
-      const available = await pool.getAvailableAccount(this.product.id, '')
+      const available = await pool.getAvailableAccount<BuddyCredential>(this.product.id, '')
       if (available) {
         return fetchModels(
-          available.credential as BuddyCredential,
+          available.credential,
           this.fetchImpl,
           undefined,
           this.product,
@@ -518,7 +518,7 @@ export function createPoolRefresh(
   auth: Pick<BuddyAuth, 'refreshAccountCredential' | 'refresh'>,
 ): () => Promise<void> {
   return async () => {
-    const available = await pool.getAvailableAccount(productId, '')
+    const available = await pool.getAvailableAccount<BuddyCredential>(productId, '')
     // ⚠️ 必须传 `pool` + `entry.id`（issue !IKIRTT）：这条是**发消息途中**按需续期
     // 的路径（比 RPC `account.refresh` 触发得频繁得多），不回写有效期就会让 UI 继续
     // 挂着「已过期」—— 早先七个 provider 的 `refreshAccountCredential` 没有
