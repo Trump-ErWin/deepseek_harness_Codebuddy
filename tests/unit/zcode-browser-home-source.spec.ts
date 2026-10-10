@@ -66,21 +66,26 @@ vi.mock('node:os', async (importOriginal) => {
  * ⚠⚠ **导入时机是这条判据成立的关键，别挪回顶层。**
  *
  * `vi.mock('node:os')` 需要**先注册、再让被测模块求值**，mock 才能穿透到
- * `src/zcode-captcha.ts` 内部的 `import { homedir } from 'node:os'`。
+ * 被测模块内部的 `import { homedir } from 'node:os'`。
  *
  * 实测（本机 Windows，2026-10-08）：在**模块顶层** `await import()` 会让
- * `zcode-captcha.ts` 拿到**真实** `node:os` —— 而 Windows 上真实
+ * 被测模块拿到**真实** `node:os` —— 而 Windows 上真实
  * `homedir()` 恰好就读 `USERPROFILE`，于是判据看到的是「坏值」，
  * **正确实现被误判成红的**（`Received: "__EVIL_USERPROFILE__\scoop\…"`）。
  * 改为在 `beforeAll` 内加载即正常。
+ *
+ * ⚠ 导入路径是 `chromium-session.js`（2026-10-08 抽共享模块）：候选链已搬到
+ * 那里，它才是**直接** `import { homedir } from 'node:os'` 的那个模块。
+ * 经 `zcode-captcha.js` 的 re-export 间接取也行（mock 是模块级的，会穿透），
+ * 但直连被测模块更贴近判据的意图：**家目录只来自 homedir()**。
  */
-let browserCandidates: typeof import('../../src/zcode-captcha.js')['browserCandidates']
-let findBrowserExecutable: typeof import('../../src/zcode-captcha.js')['findBrowserExecutable']
+let browserCandidates: typeof import('../../src/chromium-session.js')['browserCandidates']
+let findBrowserExecutable: typeof import('../../src/chromium-session.js')['findBrowserExecutable']
 let homedirProbe: () => string
 
 beforeAll(async () => {
   homedirProbe = (await import('node:os')).homedir
-  const mod = await import('../../src/zcode-captcha.js')
+  const mod = await import('../../src/chromium-session.js')
   browserCandidates = mod.browserCandidates
   findBrowserExecutable = mod.findBrowserExecutable
 })

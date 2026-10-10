@@ -15,6 +15,12 @@ import {
   readClineRequestHistory,
   resetClineRequestHistory,
 } from '../../src/cline-request-log.js'
+import { descriptorOf } from '../../src/provider-registry.js'
+import { createProviderCredits } from '../../src/provider-credits.js'
+import { accountEntry, refreshHarness } from '../helpers/rpc-refresh.js'
+import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
+import { PROVIDER_ICONS } from '../../plugin-src/client/provider-icons.js'
+import { CREDITS_CAPABILITIES } from '../../plugin-src/client/credits-capabilities.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -114,6 +120,11 @@ async function collect(
     out.push(chunk as unknown as Record<string, unknown>)
   }
   return out
+}
+
+/** 剥掉注释：接线断言不该因为「注释里提到了某个符号」而通过。 */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 }
 
 describe('ClineAdapter 模型目录', () => {
@@ -796,42 +807,82 @@ describe('Cline 接线（源码级回归）', () => {
   const read = (rel: string): string => readFileSync(resolve(root, rel), 'utf8')
 
   it('index.ts 注册 cline 服务、适配器与续期', () => {
-    const source = read('src/index.ts')
+    const source = stripComments(read('src/index.ts'))
     expect(source).toContain('registerClineLlm')
     expect(source).toContain('new ClineAuth(ctx)')
     // 只断言「cline 在续期调度里、且真的被传了池」—— 用 `(pool|p)` 同时接受
     // 逐个 await 与表驱动两种写法，避免每次重构调度器都假失败。
-    expect(source).toMatch(/cline\.refreshAll\((?:pool|p)\)/)
+    // ⚠️ **2026-10-08 改（Task 10）**：原先断言 `src/index.ts` 的源码文本含手抄清单
+    //    字面量（`['x', (p) => x.refreshAll(p)]`）—— 那张清单已被
+    //    `wiredRefreshTargets()` 从**能力注册表**派生取代 ⇒ 该文本形态**不存在了**，
+    //    而它守的意图（该 provider 在续期调度里）**与文本无关**。
+    // ⇒ 改为**结构断言**（注册循环挂了 refreshAll + 派生表被使用）。
+    // ⚠️ 行为断言（真跑 `apply()` 逐个驱动 `auth.refreshAll` 并断言打到**自己那个**
+    //    实例）在 `provider-runtime-wiring.spec.ts` 的「★ 13 家都挂上了
+    //    `auth.refreshAll`」一条里，**比本条更强**。
+    expect(source, '注册循环没有挂 refreshAll（派生表会恒为空）')
+      .toMatch(/refreshAll:\s*\(pool\)\s*=>\s*auth\.refreshAll\(pool\)/)
+    expect(source, 'refreshTargets 又回到手抄清单了')
+      .toMatch(/wiredRefreshTargets\(\)/)
     expect(source).toContain('cline.stop()')
     // Jet Hub「显示列表」需要适配器实例
     expect(source).toMatch(/cline: pruned\([^)]*,\s*clineAdapter\)/)
-    // ⚠️ 形参是**位置参数**，新增 provider 会插在 cline 与 modelAdapters 之间。
-    // 只断言「cline 在 modelAdapters 之前」，**不要**写死整串前缀
-    // —— 那会让每加一个 provider 都假失败（加 Loomy、Raccoon、QoderCN 时各踩一次）。
-    // 之前的正则把 `…lobsterai, qoder, trae, cline,` 整段写死了，与这条注释矛盾，
-    // 故改为只检查「cline 出现在 modelAdapters 之前」这一不变式。
-    expect(source).toMatch(
-      /registerJetHubRpc\([\s\S]*?cline,[\s\S]*?modelAdapters\)/,
-    )
+    // ⚠️ 2026-10-08 改（Task 3）：原先这条是**相邻性正则**
+    // `registerJetHubRpc\([\s\S]*?cline,[\s\S]*?modelAdapters\)`。
+    // Task 3 一度给 `registerJetHubRpc` 加了**第 5 个位置形参** `credits`
+    // （调用点变成 `… }, modelAdapters, creditsTable)`）⇒ 正则必然假失败。
+    // 该形参随后在设计复审 C1 中被删除，但**本条的改法保留**：它守的意图
+    // （cline 的 auth 实例接上了）**与形参个数无关**。
+    // ⇒ 按 **AST** 取调用点第三个实参（auths 对象字面量）的键 ——
+    // 重排 / 插键 / 加形参都不会假失败，而键真的漏了必然变红。
+    const authKeys = jetHubAuthsCallKeys(source)
+    expect(Object.keys(authKeys), 'cline 必须在 auths 命名对象里（键 = provider id）')
+      .toContain('cline')
+    expect(authKeys.cline, '`cline` 键的值必须是 cline 实例').toBe('cline')
     // 老契约下的 settings namespace
-    expect(source).toContain("'llm-cline'")
+    // ⚠️ 2026-10-08 改：原先扫 index.ts 源码文本找 `'llm-cline'`。本次重构把 13 个
+    //    字面量收敛成从 `PROVIDER_REGISTRY` 派生 ⇒ 文本断言变红而行为没变。
+    //    改为断言声明值；「index.ts 真的按它注册了」由
+    //    `provider-registry-consumers.spec.ts` 的 `apply()` 行为用例守。
+    expect(descriptorOf('cline')?.settingsNamespace).toBe('llm-cline')
   })
 
-  it('jet-hub-rpc.ts 为 cline 接上登录、续期与余额三个分派点', () => {
+  it('jet-hub-rpc.ts 为 cline 接上登录、续期与余额三个分派点', async () => {
     const source = read('src/jet-hub-rpc.ts')
     expect(source).toContain('cline.startLogin({ refName })')
-    // `[^)]*` 容忍签名扩展：续期成功后要把新 `expiresAt` 写回账号池，
-    // 故调用点带着 `pool, entry.id`（issue !IKIRTT）—— 写死整串会一改签名就假失败。
-    expect(source).toMatch(/cline\.refreshAccountCredential\(entry\.credentialRef[^)]*\)/)
-    expect(source).toContain('fetchClineCreditBalance(credential, CLINE)')
-    // 签到必须显式拒绝（而不是落到 unsupported provider 的泛化文案）
-    expect(source).toContain('Cline 不支持每日签到')
+    // ⚠️ 2026-10-08 改（Task 2）：原先这条断言
+    //    `/cline\.refreshAccountCredential\(entry\.credentialRef[^)]*\)/`
+    //    —— 扫的是 `account.refresh` 里 13 个同构 `case` 中的 cline 那一个。
+    //    Task 2 把它们收敛成一处查表（`authOf(auths, entry.provider)`）
+    //    ⇒ 该文本形态**不存在了**，而它守的意图（cline 的续期接上了、
+    //    且刷的是池内那个 ref）**与文本无关**。
+    //    ⇒ 改为**行为**断言：驱动端点，断言 cline 账号的续期**恰好**落到
+    //    cline 桩上、且 ref 就是池内条目那个（不是默认单凭据 ref）。
+    const target = accountEntry('cline', 'CLINE_ACCOUNT_WIRE')
+    const harness = refreshHarness([target])
+    const result = await harness.call(target.id)
+    expect(result.ok, `cline 续期应成功，实际 error=${result.error?.message}`).toBe(true)
+    expect(harness.calls.map((c) => c.provider), 'cline 账号串到了别的实例').toEqual(['cline'])
+    expect(harness.calls[0]?.ref).toBe('CLINE_ACCOUNT_WIRE')
+    // ⚠️ 2026-10-08 改（Task 4）：原先这条断言 `src/jet-hub-rpc.ts` 的源码文本里
+    //    含 `'Cline 不支持每日签到'`。Task 4 把「不支持签到」的文案搬到
+    //    `src/provider-credits.ts` 的 `claimUnavailableReason`（那是它该在的地方
+    //    —— 知道该产品形态的那一层），字面量**搬了家**，而它守的意图
+    //    （cline 调 claimAll 会拿到**指明原因**的拒绝、不退化成 unsupported provider）
+    //    **与文本位置无关**。
+    //    ⇒ 改为读**表里的声明值**；「端到端响应里就是这句话」由
+    //    `claim-runtime-parity.spec.ts` 的「cline / workbuddy / raccoon 各回
+    //    逐字保留的可读原因」守（真跑端点、逐字核对）。
+    expect(createProviderCredits().cline?.claimUnavailableReason)
+      .toContain('Cline 不支持每日签到')
   })
 
   it('客户端 PROVIDERS 含 cline 且有图标', () => {
-    const source = read('plugin-src/client/jet-hub.js')
-    expect(source).toMatch(/\{\s*id:\s*'cline',\s*label:\s*'Cline'/)
-    expect(source).toContain('const CLINE_ICON')
+    // ⚠️ 2026-10-08 改：`PROVIDERS` 由 `src/provider-registry.ts` 派生、
+    // 图标常量已抽到纯数据模块 `provider-icons.js`，故改为**行为断言**
+    //（原先扫 `jet-hub.js` 的 `{ id: 'cline', label: 'Cline'` 文本）。
+    expect(descriptorOf('cline')?.label).toBe('Cline')
+    expect(PROVIDER_ICONS.cline).toMatch(/^data:image\/png;base64,/)
   })
 
   /**
@@ -1116,13 +1167,14 @@ describe('Cline 接线（源码级回归）', () => {
   })
 
   it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {
-    const source = read('plugin-src/client/credits-capabilities.js')
-    const entry = /cline:\s*Object\.freeze\(\{([^}]*)\}\)/.exec(source)
-    expect(entry, '未找到 cline 的能力登记').not.toBeNull()
-    const body = entry![1]!
-    expect(body).toMatch(/balance:\s*true/)
-    expect(body).toMatch(/dailyCheckin:\s*false/)
-    expect(body).toMatch(/subscriptionQuota:\s*true/)
+    // ⚠️ 2026-10-08 改：能力表由 registry 派生，故改为**行为断言**
+    //（原先正则扫 `credits-capabilities.js` 的 `cline: Object.freeze({…})` 文本）。
+    expect(descriptorOf('cline')?.credits).toEqual({
+      balance: true, dailyCheckin: false, subscriptionQuota: true,
+    })
+    expect(CREDITS_CAPABILITIES.cline).toEqual({
+      balance: true, dailyCheckin: false, subscriptionQuota: true,
+    })
   })
 })
 

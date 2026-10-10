@@ -217,7 +217,15 @@ describe('★ 旧 auto 的徽标链路：宿主侧（上游 ba10f4f 回归的恢
     //    （实测 10 条接线断言同时变红），而那条不变量正是为了防「位置错位」。
     expect(INDEX).toMatch(/'jet-hub-auto': pruned\(AUTO_PROVIDER, autoAdapter/)
     // 反向：不得再给 registerJetHubRpc 追加参数（末尾必须仍是 modelAdapters）。
-    expect(INDEX).toMatch(/registerJetHubRpc\(ctx, pool, service,[^)]*modelAdapters\)/s)
+    /**
+     * ⚠️ 本断言随上游架构更新（2026-10-11）：
+     * 上游 `feat/provider-capability-abstraction`（Task 9）把 `registerJetHubRpc`
+     * 从 13 个位置参数改成**命名对象** `registerJetHubRpc(ctx, pool, { … }, modelAdapters)`
+     * —— 「位置错位复发 6 次」的陷阱因此被根治。
+     * ⇒ 原断言（位置参数形态）已不成立，改为断言命名对象形态。
+     * 本 PR 的核心约定**未变**：auto 始终经 `modelAdapters` 按 id 传入、不占 auth 槽位。
+     */
+    expect(INDEX).toMatch(/registerJetHubRpc\(ctx, pool, \{[\s\S]*?\}, modelAdapters\)/)
   })
 
   it('★ autoState 由适配器自己提供（调用方拿不到「new 一个」的机会）', () => {
@@ -256,7 +264,15 @@ describe('★ 旧 auto 的徽标链路：宿主侧（上游 ba10f4f 回归的恢
     //    （实测 10 条接线断言同时变红），而那条不变量正是为了防「位置错位」。
     expect(INDEX).toMatch(/'jet-hub-auto': pruned\(AUTO_PROVIDER, autoAdapter/)
     // 反向：不得再给 registerJetHubRpc 追加参数（末尾必须仍是 modelAdapters）。
-    expect(INDEX).toMatch(/registerJetHubRpc\(ctx, pool, service,[^)]*modelAdapters\)/s)
+    /**
+     * ⚠️ 本断言随上游架构更新（2026-10-11）：
+     * 上游 `feat/provider-capability-abstraction`（Task 9）把 `registerJetHubRpc`
+     * 从 13 个位置参数改成**命名对象** `registerJetHubRpc(ctx, pool, { … }, modelAdapters)`
+     * —— 「位置错位复发 6 次」的陷阱因此被根治。
+     * ⇒ 原断言（位置参数形态）已不成立，改为断言命名对象形态。
+     * 本 PR 的核心约定**未变**：auto 始终经 `modelAdapters` 按 id 传入、不占 auth 槽位。
+     */
+    expect(INDEX).toMatch(/registerJetHubRpc\(ctx, pool, \{[\s\S]*?\}, modelAdapters\)/)
   })
 
   it('★ autoState 由适配器自己提供（调用方拿不到「new 一个」的机会）', () => {

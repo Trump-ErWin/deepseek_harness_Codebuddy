@@ -16,10 +16,15 @@
  *
  * ## 链路
  *
- * 唯一启用账号被限流 → `pickBuddyCredential` 候选筛成空集 →
+ * 唯一启用账号被限流 → 候选筛成空集 →
  * `select()` 回笼统的 `exhausted`（未锁定时 `reason` 被丢弃）→ 退到单凭据
  * ref `BUDDY_ACCESS_TOKEN`（Jet Hub 登录只写 `*_ACCOUNT_XXX`，该 ref 不存在）
  * → 适配器抛 `MISSING_CREDENTIAL`。
+ *
+ * ⚠️ 候选筛原先实现在 `src/index.ts` 里那个**已被删除**的 buddy 系编排闭包中
+ * （名字见 git 历史 `d35d9e3`）；Task 6 起收敛到 `src/credential-resolver.ts`
+ * 的 buddy 分支。此处**不复写那个已删符号名** —— 它是「锚点已消失」核对会 grep
+ * 的字符串（同 `raccoon-wiring.spec.ts` 的约定）。
  *
  * ## 与既有用例的关系
  *
@@ -48,6 +53,41 @@ function codeOnly(source: string): string {
 
 const indexCode = codeOnly(indexSource)
 const poolCode = codeOnly(poolSource)
+
+/**
+ * 取**一次 `createCredentialResolver(...)` 调用**的完整源码（**括号配平**切片）。
+ *
+ * ## ⚠️ 为什么必须配平，不能用固定长度窗口（2026-10-08 复审修正）
+ *
+ * 原先用「从 `product: ZCODE,` 往后 1500 字符」这种**定长窗口**。实测该窗口
+ * 越过配置块 **1333 字符**，把后面的 `refresh:`（`zcode.refreshAll(pool)`）与
+ * `mintCaptcha` 段一起圈了进来 —— 于是
+ *
+ * - 「块内不得出现 `throwIfAllRateLimited`」实际上在守**别的代码段**；
+ * - 将来谁在 `refresh` / `mintCaptcha` 里写了同名字符串，本用例会**假红**；
+ * - 反过来，配置块**缩小**到窗口之内时判据也仍然成立 —— 判据与它声称守的东西
+ *   之间的对应关系是靠**距离**维系的，而距离会随任何无关编辑漂移。
+ *
+ * ⇒ 改为按括号配平取「这次调用本身」：与 `source-scope.ts` 的 AST 取函数体同一
+ * 取向（那里记了字符串切片的两次同型事故），只是这里切的是**调用表达式**而非声明。
+ *
+ * @param source - 已剥注释的源码。
+ * @param callStart - `createCredentialResolver(` 在源码里的起始下标。
+ */
+function factoryCallAt(source: string, callStart: number): string {
+  const open = source.indexOf('(', callStart)
+  if (open < 0) throw new Error('createCredentialResolver 后面没有左括号')
+  let depth = 0
+  for (let i = open; i < source.length; i++) {
+    const ch = source[i]
+    if (ch === '(') depth++
+    else if (ch === ')') {
+      depth--
+      if (depth === 0) return source.slice(callStart, i + 1)
+    }
+  }
+  throw new Error('createCredentialResolver 的括号没有配平（源码被截断？）')
+}
 
 const NOW = 1_791_009_000_000
 
@@ -161,36 +201,55 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
   })
 
   describe('接线（源码级）', () => {
-    it('两个 provider 的兜底路径都插入了限流判定', () => {
-      expect(indexCode).toContain('throwIfAllAccountsRateLimited(CODEBUDDY, modelId)')
-      expect(indexCode).toContain('throwIfAllAccountsRateLimited(WORKBUDDY, modelId)')
-    })
-
-    it('判定必须**先于**单凭据 ref 兜底 —— 否则仍会降级成 MISSING_CREDENTIAL', () => {
-      // ⚠️ 锚点必须是**真正的兜底调用**，不能只搜 ref 名：`BUDDY_CREDENTIAL_REF`
-      // 在文件更早处（import 与 `credentialRef(...)` 注册）也出现过，搜名字会
-      // 命中错位置（写用例时实测到：check=12308 反而大于 fallback=751）。
-      const checkCallOrder = (product: string, fallbackCall: string) => {
-        const check = indexCode.indexOf(`throwIfAllAccountsRateLimited(${product}, modelId)`)
-        const fallback = indexCode.indexOf(fallbackCall)
-        expect(check).toBeGreaterThan(-1)
-        expect(fallback).toBeGreaterThan(-1)
-        expect(check).toBeLessThan(fallback)
+    it('两个 provider 都接了限流判定（传的是同一个共享助手）', () => {
+      // ⚠️ 2026-10-08 改（Task 6）：原先断言的是源码里的**调用点文本**
+      //    （逐 provider 点名把限流助手交给编排，原文见 git 历史 `d35d9e3`）。
+      //    Task 6 把 12 个 `resolveCredential` 闭包收敛进
+      //    `createCredentialResolver` 之后，判定变成工厂里的**一次**调用
+      //    （实参是 `config.product`），那些点名文本消失了。
+      //    ⇒ 改锁「两个 provider 的注册项都把同一个共享助手传给了工厂」。
+      //    ⚠️ 注释里**不复写**那些调用点原文 —— 它们是「锚点已消失」核对会 grep
+      //    的字符串（同 `raccoon-wiring.spec.ts` 的约定）。
+      //    ⚠️ 锚点必须用「`product: <CONST>,` 紧跟 `readCredential:`」—— 只用
+      //    `product: <CONST>,` 会命中更早的**选择器定义**（写用例时实测到）。
+      //    「它真的在正确的位置生效（先问池、再判限流）」由下面的
+      //    `ratelimit-misreport-behavior.spec.ts` 真跑 `apply()` 断言 ——
+      //    那条比文本断言强，且不受重构影响。
+      //
+      // ⚠️⚠️ **切片必须是有界的 `factoryCallAt`**（2026-10-08 二次复审修复）：
+      //    这里原先写的是「从 `product: X,` 那一行起 **slice 到文件末尾**」，
+      //    实测块长 29918 / 28590 字符 —— 于是「块内含
+      //    `throwIfAllRateLimited: throwIfAllAccountsRateLimited`」这条断言**恒真**：
+      //    文件尾部还有 10 份同样的注册项文本，删掉 CODEBUDDY 自己那一行它照样通过。
+      //    同型的 CLINE 那条（现由 `it.each(WIRING)` 覆盖）当时也一样是空洞的。
+      //    ⇒ 统一改为「括号配平取**这一次** `createCredentialResolver(...)` 调用」。
+      for (const product of ['CODEBUDDY', 'WORKBUDDY']) {
+        const at = indexCode.search(new RegExp(`product: ${product},\\n\\s*readCredential:`))
+        expect(at, `${product} 的工厂配置项没找到`).toBeGreaterThan(-1)
+        const callStart = indexCode.lastIndexOf('createCredentialResolver', at)
+        expect(callStart, `${product} 的 createCredentialResolver 调用没找到`).toBeGreaterThan(-1)
+        const block = factoryCallAt(indexCode, callStart)
+        expect(block, `${product} 必须把 throwIfAllAccountsRateLimited 交给工厂`).toContain(
+          'throwIfAllRateLimited: throwIfAllAccountsRateLimited',
+        )
       }
-      checkCallOrder('CODEBUDDY', 'ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))')
-      checkCallOrder('WORKBUDDY', 'ctx.credentials.resolve(credentialRef(WORKBUDDY.defaultCredentialRef))')
     })
 
     it('判定放在 getAvailableAccount 兜底**之后**（池里还有号时不该报限流）', () => {
-      const fnStart = indexCode.indexOf('const throwIfAllAccountsRateLimited')
-      expect(fnStart).toBeGreaterThan(-1)
-      for (const product of ['CODEBUDDY', 'WORKBUDDY']) {
-        const available = indexCode.indexOf(`getAvailableAccount(${product}.id, modelId ?? '', picked.tried)`)
-        const check = indexCode.indexOf(`throwIfAllAccountsRateLimited(${product}, modelId)`)
-        expect(available).toBeGreaterThan(-1)
-        // 先问池 → 池也没号 → 才判限流。
-        expect(available).toBeLessThan(check)
-      }
+      // ⚠️ 这条从「源码顺序」改为「工厂内的顺序」：判定必须在池调用**之后**。
+      // 锚点用 `credential-resolver.ts`（判定所在的唯一实现）。
+      const resolverSource = readFileSync(resolve(here, '../../src/credential-resolver.ts'), 'utf8')
+        .replace(/\r\n/g, '\n')
+      const resolverCode = codeOnly(resolverSource)
+      const poolCall = resolverCode.indexOf('await deps.pool.getAvailableAccount(')
+      expect(poolCall, '工厂里找不到池取号调用').toBeGreaterThan(-1)
+      // ⚠️ **必须从池调用处往后找**：工厂里 `throwIfAllRateLimited` 有**两处**
+      // 调用（loomy 分支在池调用之前、池兜底分支在之后）。全文搜会命中 loomy
+      // 那处、把顺序判反（写用例时实测到：5386 < 5271 假红）。
+      const check = resolverCode.indexOf('config.throwIfAllRateLimited?.(config.product, modelId)', poolCall)
+      expect(check, '工厂里池兜底之后找不到限流判定').toBeGreaterThan(-1)
+      // 先问池 → 池也没号 → 才判限流。
+      expect(poolCall).toBeLessThan(check)
     })
 
     it('只统计**启用**账号 —— 停用账号不参与自动选号，算进来会误报', () => {
@@ -246,7 +305,12 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       const end = fnBody.indexOf('\n  }')
       expect(fnBody.slice(0, end)).toContain('if (limited === undefined) return')
       // 单凭据兜底仍在（老数据兼容路径），只是排到判定之后。
-      expect(indexCode).toContain('const resolved = await ctx.credentials.resolve')
+      // ⚠️ 2026-10-08 改（Task 6）：兜底已下沉到工厂，故锚点跟着搬到
+      // `credential-resolver.ts`；断言的是**语义**（工厂真的会退单凭据），
+      // 而不是某个文件的文本。
+      const resolverSource = readFileSync(resolve(here, '../../src/credential-resolver.ts'), 'utf8')
+        .replace(/\r\n/g, '\n')
+      expect(codeOnly(resolverSource)).toContain('await config.readCredential(config.fallback.refName)')
     })
   })
 
@@ -257,28 +321,40 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
    * `cline: no usable credential; log in first` —— 凭据明明在、账号也登录着，
    * 只是被 `cline-free/deepseek-v4.1-flash` 的模型级限流标记挡住。
    *
-   * ⚠️ cline 的取号调用**不带 `tried`**（它只有一个显式回退路径，与 buddy 的
-   * `pickBuddyCredential` 不同），故接线断言的锚点必须按它的实际写法写，
-   * 不能照抄 buddy 那组（照抄会永远红）。
+   * ⚠️ cline 的取号调用**不带 `tried`**（它只有一个显式回退路径），故它的接线
+   * 断言与 buddy 那组**分开写**，不照抄（照抄会永远红）。
+   *
+   * ⚠️ 2026-10-08 改（Task 6）：判定已下沉到 `createCredentialResolver` 的
+   * **唯一一处**实现里，故原先三条「源码文本 + 顺序」断言改为：
+   * ① 注册项把共享助手交给了工厂；② 工厂里判定恰好两处（loomy 分支 + 池兜底分支）；
+   * ③ 助手签名仍只要求 `{ id, displayName }`（cline 与 buddy 是两个类型）。
+   * 「先问池、再判限流」的顺序由 buddy 那组 + `ratelimit-misreport-behavior.spec.ts`
+   * 真跑 `apply()` 覆盖。
    */
   describe('接线（源码级）：cline 同型缺陷', () => {
-    it('cline 的兜底路径也插入了限流判定', () => {
-      expect(indexCode).toContain('throwIfAllAccountsRateLimited(CLINE, modelId)')
+    it('cline 也接了限流判定（与 buddy 系同一个共享助手）', () => {
+      // ⚠️ 锚点同 buddy 那组：`product: CLINE,` 紧跟 `readCredential:`。
+      // ⚠️⚠️ 切片**必须**用有界的 `factoryCallAt`（2026-10-08 二次复审修复）：
+      //    这里原先与 buddy 那组一样「slice 到文件末尾」（实测 21046 字符），
+      //    文件尾部还有 4 份同样的注册项文本 ⇒ 删掉 CLINE 自己那一行它照样通过。
+      //    该形态与本文件 `it.each(WIRING)` 覆盖 CLINE 的那条**重复**，但保留它
+      //    仍有价值：它是**逐条点名**的最短路径，且现在真的有判别力。
+      const at = indexCode.search(/product: CLINE,\n\s*readCredential:/)
+      expect(at, 'CLINE 的工厂配置项没找到').toBeGreaterThan(-1)
+      const callStart = indexCode.lastIndexOf('createCredentialResolver', at)
+      expect(callStart, 'CLINE 的 createCredentialResolver 调用没找到').toBeGreaterThan(-1)
+      const block = factoryCallAt(indexCode, callStart)
+      expect(block, 'CLINE 必须把 throwIfAllAccountsRateLimited 交给工厂').toContain(
+        'throwIfAllRateLimited: throwIfAllAccountsRateLimited',
+      )
     })
 
-    it('判定**先于**单凭据 ref 兜底 —— 否则仍会降级成「请先登录」', () => {
-      const check = indexCode.indexOf('throwIfAllAccountsRateLimited(CLINE, modelId)')
-      const fallback = indexCode.indexOf('ctx.credentials.resolve(credentialRef(CLINE.defaultCredentialRef))')
-      expect(check).toBeGreaterThan(-1)
-      expect(fallback).toBeGreaterThan(-1)
-      expect(check).toBeLessThan(fallback)
-    })
-
-    it('判定放在 getAvailableAccount 之后（池里还有号时不该报限流）', () => {
-      const available = indexCode.indexOf('getAvailableAccount(CLINE.id, modelId ?? \'\')')
-      const check = indexCode.indexOf('throwIfAllAccountsRateLimited(CLINE, modelId)')
-      expect(available).toBeGreaterThan(-1)
-      expect(available).toBeLessThan(check)
+    it('限流判定的调用点集中在工厂里（不是每个 provider 各写一遍）', () => {
+      const resolverSource = readFileSync(resolve(here, '../../src/credential-resolver.ts'), 'utf8')
+        .replace(/\r\n/g, '\n')
+      const occurrences = (codeOnly(resolverSource).match(/throwIfAllRateLimited\?\.\(/g) ?? []).length
+      // loomy 分支 + 池兜底分支 = 2。多于此数说明有人又开了第二个实现。
+      expect(occurrences, '限流判定的调用点应恰好 2 处').toBe(2)
     })
 
     it('助手的 product 参数只要求 id / displayName（cline 与 buddy 是两个类型）', () => {
@@ -320,89 +396,98 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
    * 因此既不会误报「限流」、也不会误报「未登录」。给它接判定属于改变
    * 既有行为，超出本 issue 范围；此处的名单必须与事实一致，不能图省事全列上。
    */
-  describe('接线（源码级）：其余 provider 同型缺陷（IKJOZ9）', () => {
+  describe('接线：其余 provider 同型缺陷（IKJOZ9）', () => {
     /**
-     * 每个 provider 的「池取号调用 → 判定 → 单凭据兜底」三个锚点。
+     * 每个 provider 的**注册项**锚点（`product: <CONST>,`）。
      *
-     * ⚠️ 锚点必须**逐个 provider 写死**，不能只搜函数名：
-     * `getAvailableAccount(X.id, modelId ?? '')` 这个形出现在十处以上，
-     * 只搜形参会命中第一个（buddy），断言恒真。
+     * ⚠️ 2026-10-08 改（Task 6）：原先这张表是「池取号调用 → 判定 → 单凭据兜底」
+     * 三个**源码文本**锚点，逐条比对先后顺序。Task 6 把那三段收敛进
+     * `createCredentialResolver` 之后：
+     *
+     * - `getAvailableAccount(X.id, modelId ?? '', picked.tried)` 的文本形消失
+     *   （工厂里只剩一次 `deps.pool.getAvailableAccount(providerId, …)`）；
+     * - `throwIfAllAccountsRateLimited(X, modelId)` 的**逐个点名**也消失了
+     *   （工厂里只有一处 `config.throwIfAllRateLimited?.(config.product, modelId)`）。
+     *
+     * ⇒ 改为断言**注册项有没有把共享助手交给工厂**。这仍然是**逐个 provider 点名**
+     *（不是「至少存在若干处」），故对新增 provider 不恒真 —— 保持了原判据的
+     * 探测力。而「它真的在正确的位置生效（先问池、再判限流、最后回退）」由
+     * `ratelimit-misreport-behavior.spec.ts` 真跑 `apply()` 逐 provider 断言，
+     * 那条比文本断言强，且不受重构影响。
      */
-    const WIRING: Array<{ product: string; pool: string; fallback: string }> = [
-      { product: 'CODEBUDDY', pool: 'getAvailableAccount(CODEBUDDY.id', fallback: 'credentialRef(BUDDY_CREDENTIAL_REF)' },
-      { product: 'WORKBUDDY', pool: 'getAvailableAccount(WORKBUDDY.id', fallback: 'credentialRef(WORKBUDDY.defaultCredentialRef)' },
-      // ⚠️ lobsterai / trae 的兜底锚点是 `resolveXxxCredentialByRef(...)` 而不是
-      // `ctx.credentials.resolve(credentialRef(...))`：master 把那两处内联的
-      // `JSON.parse` 收敛成了复用解析器（理由见 index.ts 里那处的注释）。
-      // 本断言的价值正在于此 —— master 一改兜底写法，它立刻报红而不是悄悄失配。
-      { product: 'LOBSTERAI', pool: 'getAvailableAccount(LOBSTERAI.id', fallback: 'resolveLobsteraiCredentialByRef(LOBSTERAI.defaultCredentialRef)' },
-      { product: 'QODER', pool: 'getAvailableAccount(QODER.id', fallback: 'credentialRef(QODER.defaultCredentialRef)' },
-      { product: 'QODER_CN', pool: 'getAvailableAccount(QODER_CN.id', fallback: 'credentialRef(QODER_CN.defaultCredentialRef)' },
-      { product: 'TRAE', pool: 'getAvailableAccount(TRAE.id', fallback: 'resolveTraeCredentialByRef(TRAE.defaultCredentialRef)' },
-      { product: 'CLINE', pool: 'getAvailableAccount(CLINE.id', fallback: 'credentialRef(CLINE.defaultCredentialRef)' },
-      { product: 'LOOMY', pool: 'listAccountsByProvider(LOOMY.id)', fallback: 'credentialRef(LOOMY.defaultCredentialRef)' },
-      { product: 'RACCOON', pool: 'getAvailableAccount(RACCOON.id', fallback: 'credentialRef(RACCOON.defaultCredentialRef)' },
-      { product: 'MINIMAX', pool: 'getAvailableAccount(MINIMAX.id', fallback: 'credentialRef(MINIMAX.defaultCredentialRef)' },
-      { product: 'GEMINI', pool: 'getAvailableAccount(GEMINI.id', fallback: 'credentialRef(GEMINI.defaultCredentialRef)' },
-      // ⚠️ **刻意不含 ZCODE** —— 它的兜底形态与其余各家不同，见下方
-      // 「zcode 同型缺陷判定」段（那是唯一一条「不接也算对」的断言）。
+    const WIRING: readonly string[] = [
+      'CODEBUDDY', 'WORKBUDDY', 'LOBSTERAI', 'QODER', 'QODER_CN',
+      'TRAE', 'CLINE', 'LOOMY', 'RACCOON', 'MINIMAX', 'GEMINI',
+      // ⚠️ **刻意不含 ZCODE** —— 它是唯一「不接判定也算对」的一家，
+      // 见下方「zcode 同型缺陷判定」段。
     ]
 
-    it.each(WIRING)('$product：判定已接线，且位于「取号之后、兜底之前」', ({ product, pool, fallback }) => {
-      // ⚠️ 三个锚点必须**在同一切片里**按先后比较，不能各自 indexOf 全文：
-      // `credentialRef(X.defaultCredentialRef)` 在 `registerXxxLlm` 的
-      // `credentialRef:` 注册行就出现过一次（**早于** resolveCredential），
-      // 全文搜索会命中那处、把「判定先于兜底」判反（写用例时实测到）。
-      // 正确做法：先定位取号点，再在**它之后**的切片里找判定与兜底。
-      const available = indexCode.indexOf(pool)
-      expect(available, `${product} 的取号锚点没找到`).toBeGreaterThan(-1)
-      const tail = indexCode.slice(available)
-      const check = tail.indexOf(`throwIfAllAccountsRateLimited(${product}, modelId)`)
-      const fallbackAt = tail.indexOf(fallback)
-      expect(check, `${product} 未接限流判定`).toBeGreaterThan(-1)
-      expect(fallbackAt, `${product} 的兜底锚点没找到`).toBeGreaterThan(-1)
-      // 顺序：先问池 → 池也没号 → 才判限流 → 最后才退单凭据。
-      // ⚠️ 判定放到取号之前，会让「池里明明还有号」也被报成限流。
-      expect(check).toBeLessThan(fallbackAt)
+    /**
+     * 每个 provider 的**工厂配置块**（`product: <CONST>, …`）。
+     *
+     * ⚠️ 锚点不能只用 `product: <CONST>,`：那个形在**选择器定义**里也出现
+     *（`new BuddyBalanceSelector({ product: CODEBUDDY, … })`）且在文件里更早，
+     * `indexOf` 会命中它 ⇒ 窗口里当然没有工厂字段（写本用例时实测到：
+     * 11 个 provider 全部失配）。
+     *
+     * 正确做法：以**工厂调用** `createCredentialResolver(` 为唯一起点，取它之后
+     * 最近的那个 `product: <CONST>,`，并以**下一个工厂调用**为终点 ——
+     * 无论中间夹多少注释、字段顺序如何调整都能正确配对。
+     */
+    function factoryBlocks(): Map<string, string> {
+      const blocks = new Map<string, string>()
+      const calls = [...indexCode.matchAll(/createCredentialResolver(?:<[^>]*>)?\(/g)].map(m => m.index)
+      calls.forEach((at, i) => {
+        const end = calls[i + 1] ?? indexCode.length
+        const block = indexCode.slice(at, end)
+        // ⚠️ 归属判据是「块内**第一个** `product: <CONST>,`」：工厂配置项里
+        // `product` 永远是首字段。不能用「块内是否出现 `product: X,`」——
+        // 下一个 provider 的**选择器定义**恰好夹在两段之间，会被算进上一块
+        //（写用例时实测到：CLINE 的块里含 `product: LOOMY,`）。
+        const productMatch = /product: (\w+),/.exec(block)
+        expect(productMatch, `第 ${i + 1} 个工厂调用里找不到 product 字段`).not.toBeNull()
+        blocks.set(productMatch![1]!, block)
+      })
+      return blocks
+    }
+
+    it.each(WIRING)('$product：注册项把共享限流判定交给了工厂', (product) => {
+      const block = factoryBlocks().get(product)
+      expect(block, `${product} 的工厂配置块没找到（改名了要同步改本用例）`).toBeDefined()
+      expect(
+        block,
+        `${product} 未接限流判定（池被筛空时会误报「请先登录」）`,
+      ).toContain('throwIfAllRateLimited: throwIfAllAccountsRateLimited')
     })
 
-    it('名单覆盖全部走 resolveCredential 取号的 provider（新增 provider 记得加进来）', () => {
-      // ⚠️ **必须同时认两种取号形态**（2026-10-06 审计发现原判据有盲区）：
-      // ① `getAvailableAccount(X.id, modelId …)` —— 绝大多数 provider；
-      // ② `listAccountsByProvider(X.id)` + **自己内联**一份 `modelRateLimits` filter
-      //    —— 本仓库已有 2 处先例（buddy 的 `pickBuddyCredential`、loomy 的
-      //    `resolveCredential`）。只认 ① 的话，将来第 13 个 provider 照抄 ② 的写法
-      //    就会**静默漏接且断言恒绿**。
+    it('名单覆盖全部走工厂取号的 provider（新增 provider 记得加进来）', () => {
+      // ⚠️ **判据与 Task 6 之后的源码形态对齐**：每个 provider 的注册项都以
+      // `product: <CONST>,` 开头、且必然带 `readCredential:`（工厂的必填项）。
+      // 故「有 `product: X,` 且其后紧跟 `readCredential:`」= 「该 provider 走了工厂」。
       //
-      // ⚠️ 排除 `refresh:` 里那些**不带 modelId** 的取号（那是续期路径，刻意用
-      // 空串以便拿到被限流的账号去续期 —— 语义不同，不能判限流）；故 ① 的正则
-      // 必须带 `, modelId`。
-      const guarded = new Set(WIRING.map(w => w.product))
+      // ⚠️ 反向自检（下面第二条断言）不可省：正则失效时 `seen` 会是空集，
+      // `missing` 也随之恒为空 —— 那正是「守卫不守」的形态。
+      const guarded = new Set(WIRING)
       const EXEMPT = new Set([
-        // 助手内部对「任意 provider」的通用统计，参数是形参 `product.id`，
-        // 不是某个具体产品常量。
-        'product',
-        // opencode 是**槽制**，没有 resolveCredential：`listIdentitySlots` 只按
-        // `enabled` 过滤，`PoolEntrySnapshot` 压根不携带 `modelRateLimits`
-        // ⇒ opencode 侧模型级标记**只写不读**（只供面板徽章与「重测」恢复）。
-        // 它槽位耗尽时报的是自己的 `QUOTA_EXCEEDED`，不会误报「未登录」。
-        'OPENCODE',
-        // zcode 是**唯一「不接判定也算对」**的一家：它的兜底 `zcode.current()`
-        // 会再读一次账号池且不看 `enabled`/限流 ⇒ 池被筛空时仍返回凭据，
-        // 根本不会误报「未登录」（IKJOZ9 的症状在它身上不存在）。
+        // zcode 是**唯一「不接判定也算对」**的一家：它的兜底
+        // `fallback: { kind: 'custom', resolve: … zcode.current() }` 会**再读一次
+        // 账号池**且不看 `enabled`/限流 ⇒ 池被筛空时仍返回凭据，根本不会误报
+        // 「未登录」（IKJOZ9 的症状在它身上不存在）。
         // 加判定反而会收窄可用性 —— 见下一段「zcode 同型缺陷判定」。
         'ZCODE',
       ])
-      const seen = [
-        ...[...indexCode.matchAll(/getAvailableAccount\((\w+)\.id, modelId/g)].map(m => m[1]!),
-        ...[...indexCode.matchAll(/listAccountsByProvider\((\w+)\.id\)/g)].map(m => m[1]!),
-      ]
+      const seen = [...indexCode.matchAll(/product: (\w+),\n\s*readCredential:/g)].map(m => m[1]!)
       const missing = [...new Set(seen)].filter(p => !guarded.has(p) && !EXEMPT.has(p))
-      expect(missing, '这些 provider 从池取号（可能内联限流 filter），却没接限流判定').toEqual([])
-      // 反向自检：判据本身不能是空转的 —— 上面必须真的扫到了名单里的成员。
-      expect(seen.filter(p => guarded.has(p)).length, '判据没扫到任何已知 provider，说明正则已失效').toBeGreaterThan(0)
+      expect(missing, '这些 provider 走了工厂，却没接限流判定').toEqual([])
+      // 反向自检：判据必须真的扫到了名单里的成员（正则失效即红）。
+      expect(
+        seen.filter(p => guarded.has(p)).length,
+        '判据没扫到任何已知 provider，说明正则已失效',
+      ).toBeGreaterThan(0)
+      // 且必须扫到的**恰好**是「走了工厂」的那些（不多不少）。
+      expect(new Set(seen).size, '扫到的 provider 数与名单不符（名单或正则需同步）')
+        .toBe(WIRING.length + EXEMPT.size)
     })
-
     /**
      * **锁死「opencode 不需要接线」这个结论**（2026-10-06 审计建议）。
      *
@@ -450,11 +535,25 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
      * 防止后来者「看到别人都接了，顺手也给 zcode 补上」。
      */
     it('zcode 刻意不接限流判定：它的兜底会再读池，本就不会误报「未登录」', () => {
-      const at = indexCode.indexOf('throwIfAllAccountsRateLimited(ZCODE, modelId)')
-      expect(at, 'zcode 又被接上判定了 —— 它的兜底 current() 会再读池，加判定会收窄可用性（见本用例注释）').toBe(-1)
-      // 且必须确认 zcode 的取号点仍在（否则这条会因为「整段被删」而假绿）。
-      expect(indexCode, 'zcode 的取号点不见了，兜底 current() 也应一并复核').toContain('getAvailableAccount(ZCODE.id, modelId')
-      expect(indexCode, 'zcode 的兜底应仍是 zcode.current()').toContain('await zcode.current()')
+      // ⚠️ 2026-10-08 改（Task 6）：原先搜「逐个点名 ZCODE 的那个调用点文本」
+      // （恒应为 -1；原文见 git 历史 `d35d9e3`）。工厂化之后它本就不存在了
+      // ⇒ 那条**恒真**，属于「守卫不守」。改为断言 zcode 的**注册项本身**
+      // 没有 `throwIfAllRateLimited`：这才是有判别力的判据（有人给它补上就会红）。
+      // ⚠️ 此处**不复写**那条旧锚点原文（核对「锚点已消失」时会 grep 它）。
+      const at = indexCode.search(/product: ZCODE,\n\s*readCredential:/)
+      expect(at, 'zcode 的工厂配置项没找到（改名了要同步改本用例）').toBeGreaterThan(-1)
+      // ⚠️ 结构性切片（括号配平取这次调用本身）—— 见 `factoryCallAt` 的说明：
+      //    原先的定长窗口实测越界 1333 字符，圈进了 refresh / mintCaptcha。
+      const callStart = indexCode.lastIndexOf('createCredentialResolver', at)
+      expect(callStart, 'zcode 的 createCredentialResolver 调用没找到').toBeGreaterThan(-1)
+      const block = factoryCallAt(indexCode, callStart)
+      expect(
+        block,
+        'zcode 又被接上判定了 —— 它的兜底 current() 会再读池，加判定会收窄可用性（见本用例注释）',
+      ).not.toContain('throwIfAllRateLimited')
+      // 且必须确认 zcode 的兜底形态仍在（否则这条会因为「整段被删」而假绿）。
+      expect(block, 'zcode 的兜底应仍是 zcode.current()').toContain('await zcode.current()')
+      expect(block, 'zcode 的兜底应是 custom 形态（不是读某个固定 ref）').toContain("kind: 'custom'")
     })
   })
 })

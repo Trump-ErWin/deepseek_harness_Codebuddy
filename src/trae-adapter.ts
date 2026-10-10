@@ -22,28 +22,21 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { reasoningRankOf } from './reasoning-ladder.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import {
-  TRAE_DEFAULT_MODEL,
   TRAE_MAX_CONTEXT_TOKENS,
-  TRAE_REQUEST_TIMEOUT_MS,
   clampTraeMaxTokens,
   isTraeExpired,
   parseTraeSSELine,
-  buildOpenAIChunk,
-  OPENAI_DONE,
-  readStringField,
-  readNumberField,
   isTraeModelCallable,
   traeMaxModeFields,
   traeSOLOHeaders,
   transformToSOLOBody,
   type TraeCredential,
-  type TraeSSEEvent,
   type TraeReasoningConfig,
   type TraeRemoteModel,
 } from './trae.js'
@@ -642,6 +635,12 @@ export class TraeAdapter extends LlmAdapter {
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
   private readonly catalogGate: RemoteCatalogGate
+  /**
+   * ⚠️ **2026-10-08 Task 7c：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+   * 现在只剩 `toCatalogEntry`（本家私有形状 + Max 模式 + 两层可见性过滤）。
+   */
+  private readonly catalog: ModelCatalog
   /** 远端模型元数据索引。 */
   private remoteMeta: ReadonlyMap<string, TraeRemoteModel> = new Map()
   /** 产品级兜底模型索引。 */
@@ -663,6 +662,17 @@ export class TraeAdapter extends LlmAdapter {
     this.catalogGate = new RemoteCatalogGate(
       options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
     )
+    // ⚠️ 共享骨架（Task 7c）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`）。
+        unknownModelInputModalities: () => ['text'] as const,
+      },
+    )
   }
 
   providerInfo(provider: string): LlmProviderInfo {
@@ -675,7 +685,7 @@ export class TraeAdapter extends LlmAdapter {
     const fetchRemote = this.options.fetchRemoteModels
     if (this.remoteModels !== undefined || fetchRemote === undefined) return
     // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
-    // Trae 的目录超时上限 30s（src/trae.ts:68），失败不冷却会被 buildModelCatalog
+    // Trae 的目录超时上限 30s（src/trae.ts），失败不冷却会被 buildModelCatalog
     // 放大成「每模型一次」。
     await this.catalogGate.run(async () => {
       const models = await fetchRemote()
@@ -849,74 +859,99 @@ export class TraeAdapter extends LlmAdapter {
    * 故这里提供「不过滤黑名单」的目录，由 `model.list` 端点使用：它据此拿到
    * 每个 id 的**真实展示名（含倍率）**，再自行回填 `disabled` 状态。
    * 对话框模型选择器读的仍是 `listModels`（已过滤），可见性行为不变。
+   *
+   * ⚠️ **2026-10-08 Task 7c**：骨架（含上面这条理由）已上移到共享实现
+   * `src/model-catalog.ts`，此处只剩委托。
    */
   listAllModels(): readonly { id: string; name: string }[] {
-    // 过滤逻辑与 `listModels` 的第一、二层一致（usage / config_switch /
-    // is_invisible_to_user 已在解析器里剔除；这里再挡 isHidden 与 is_custom_model），
-    // **唯一区别是不套用户黑名单**。
+    return this.catalog.listAllModels()
+  }
+
+  /**
+   * 把本家条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 本家四处**真实差异**：
+   * 1. `contextWindow` 受 **Max 模式**影响（开启时用 `maxContextWindow` /
+   *    `TRAE_MAX_CONTEXT_TOKENS`，两者**不能混用** —— 未开 Max 却声明 1M 会让
+   *    DSH 把超长上下文直接发出去，上游按 200K 校验后拒绝）；
+   * 2. `maxTokens` 二级查找（Max 模式下用 `maxModeOutputTokens`）；
+   * 3. `reasoning` 的默认档**优先采信上游 `default_level`**（见 `reasoningFor`）；
+   * 4. `inputModalities` 逐模型判定（远端 `display_config.multimodal`）——
+   *    早期硬编码 `['text']` 导致 DSH 在**附件准入阶段**就拒掉图片（Issue #IKHDKC）。
+   */
+  private toCatalogEntry(model: TraeRemoteModel): CatalogEntry {
+    const contextWindow = this.contextWindowFor(model.id)
+    const maxTokens = this.maxOutputTokensFor(model.id)
+    const reasoning = this.reasoningFor(model.id)
+    return {
+      id: model.id,
+      name: traeDisplayName(model),
+      // ⚠️ `resolveModel` 用**元数据里的 name**（不带倍率）⇒ 显式提供 `bareName`。
+      bareName: this.remoteMeta.get(model.id)?.name
+        ?? this.fallbackIndex.get(model.id)?.name
+        ?? model.name,
+      // ⚠️ 逐模型判定（见上）；未声明时**保守报 `['text']`**（不是省略）。
+      inputModalities: this.inputModalitiesFor(model.id),
+      ...contextWindow !== undefined ? { contextWindow } : {},
+      ...maxTokens !== undefined ? { maxTokens } : {},
+      ...reasoning !== undefined ? { reasoning } : {},
+    }
+  }
+
+  /**
+   * 本家全部条目（**含两层可见性过滤**）。
+   *
+   * 过滤逻辑分两层（原 `listModels` 的注释）：
+   *
+   * 第一层（解析时，`parseTraeBatchModelList`）：硬性过滤 `usage !==
+   * chat_completion` / `config_switch === false` / `is_invisible_to_user ===
+   * true`。这些条件对 batch 端点（全功能配置表）有意义，避免 summary /
+   * custom_model / multimodal 等非对话条目塞满目录。
+   *
+   * 第二层（运行时，此处）：硬性过滤 `isHidden === true`（兜底表路径没有解析器，
+   * 在 `staticFallbackModels` 里过滤；远端路径由解析器过滤，但测试绕过解析器直接
+   * 喂 `TraeRemoteModel[]`，故此处再补一刀保持一致性）+ `is_custom_model === true`
+   * （自定义模型，需用户在 IDE 内绑定供应商，本插件调不通，一律 4001）。
+   *
+   * ⚠️ `is_invisible_to_user` **不再由 `hideInternalModels` 控制**：新设计
+   * 要求目录与官方 Auto Mode 选择器一致，隐藏模型不在目录中展示。
+   */
+  private catalogEntries(): readonly CatalogEntry[] {
     const source = this.remoteModels === undefined
       ? this.staticFallbackModels()
       : this.remoteModels.filter((model) => isTraeModelCallable(model) && model.isHidden !== true)
-    return source.map((model) => ({ id: model.id, name: traeDisplayName(model) }))
+    return source.map((model) => this.toCatalogEntry(model))
+  }
+
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    await this.ensureRemoteModels()
+    return this.catalogEntries()
+  }
+
+  /**
+   * 同步视图（`listAllModels` 用）。
+   *
+   * ⚠️ **不能** `await ensureRemoteModels()`（同步契约）—— 读 `remoteModels`
+   * 缓存，未落地时回退静态兜底表（这正是原实现的语义）。
+   */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    return this.catalogEntries()
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
-    // 不必拉（省掉一次无谓的 HTTP 请求）。没有任何已登录账号时返回空数组，让
-    // DSH 的 `buildModelCatalog`（它 `.filter(group => group.models.length > 0)`）
-    // 把整个 provider 分组隐藏，减少模型选择列表的臃肿（见 providerCatalogVisible）。
-    // ⚠️ 这里必须返回 `[]` 而**不能抛错**：抛错会被归入 catalog 的 `failures`，
-    // 界面上反而多出一条 provider 报错。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-    await this.ensureRemoteModels()
-    // 过滤逻辑分两层：
-    //
-    // 第一层（解析时，`parseTraeBatchModelList`）：硬性过滤 `usage !==
-    // chat_completion` / `config_switch === false` / `is_invisible_to_user ===
-    // true`。这些条件对 batch 端点（全功能配置表）有意义，避免 summary /
-    // custom_model / multimodal 等非对话条目塞满目录。
-    //
-    // 第二层（运行时，`listAllModels`）：硬性过滤 `isHidden === true`（兜底表
-    // 路径没有解析器，在 `staticFallbackModels` 里过滤；远端路径由解析器过滤，
-    // 但测试绕过解析器直接喂 `TraeRemoteModel[]`，故此处再补一刀保持一致性）+
-    // `is_custom_model === true`（自定义模型，需用户在 IDE 内绑定供应商，本
-    // 插件调不通，一律 4001）。
-    //
-    // ⚠️ `is_invisible_to_user` **不再由 `hideInternalModels` 控制**：新设计
-    // 要求目录与官方 Auto Mode 选择器一致，隐藏模型不在目录中展示。
-    const source = this.listAllModels()
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? source
-      : source.filter((model) => !disabled.has(model.id))
-    return listed.map((model) => ({
-      provider: this.product.id,
-      id: model.id,
-      name: model.name,
-      // ⚠️ 逐模型判定（远端 `display_config.multimodal`）—— 早期这里硬编码
-      // `['text']`，导致 DSH 在附件准入阶段就拒掉图片（Issue #IKHDKC）。
-      inputModalities: this.inputModalitiesFor(model.id),
-    }))
+    return this.catalog.listModels(_provider)
   }
 
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    await this.ensureRemoteModels()
-    const remoteName = this.remoteMeta.get(model)?.name
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: remoteName ?? this.fallbackIndex.get(model)?.name ?? model,
-      // ⚠️ 与 listModels 同源：必须逐模型判定，否则准入闸门仍会拦下图。
-      inputModalities: this.inputModalitiesFor(model),
-    }
-    const contextWindow = this.contextWindowFor(model)
-    if (contextWindow !== undefined) resolved.context = { contextWindow }
-    const maxTokens = this.maxOutputTokensFor(model)
-    if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
-    // 推理强度档位：远端 `reasoning_effort_config` 权威（见 reasoningFor）。
-    const reasoning = this.reasoningFor(model)
-    if (reasoning !== undefined) resolved.reasoning = reasoning
-    return resolved
+  /**
+   * 解析模型元信息。
+   *
+   * ⚠️ 原实现里的四处判据（context / maxTokens / reasoning / modalities）现已
+   * 收敛到 `toCatalogEntry`；骨架的 `resolveModel` 只做回填与「不声明未知」。
+   * ⚠️ `inputModalities` **与 `listModels` 同源**（都走 `toCatalogEntry`）——
+   * 否则准入闸门仍会拦下图（Issue #IKHDKC 的教训）。
+   */
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   async prepareCall(
@@ -1178,12 +1213,12 @@ export class TraeAdapter extends LlmAdapter {
 
         const maxRotate = TRAE_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
-          const next = await pool.getAvailableAccount(
+          const next = await pool.getAvailableAccount<TraeCredential>(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
-          credential = next.credential as TraeCredential
+          credential = next.credential
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {
@@ -1271,14 +1306,14 @@ export class TraeAdapter extends LlmAdapter {
           //   刚标记的账号立刻又被选中 —— 换号形同虚设；
           // - 不传 `tried` 会在 A/B 之间反复空转（Qoder 已踩过，见
           //   `qoder-adapter.ts` 的 `switchAccountOnQuota` 注释）。
-          const next = await this.options.accountPool.getAvailableAccount(
+          const next = await this.options.accountPool.getAvailableAccount<TraeCredential>(
             this.product.id, options.model, triedStreamAccounts,
           )
           if (next === null || next === undefined || triedStreamAccounts.has(next.entry.id)) {
             throw new LlmError(error.message, 'QUOTA_EXCEEDED')
           }
           triedStreamAccounts.add(next.entry.id)
-          credential = next.credential as TraeCredential
+          credential = next.credential
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (!response.ok) {
@@ -1927,12 +1962,20 @@ export class TraeAdapter extends LlmAdapter {
  *   token、闸门是字符，只要内容的字符/token 足够高（系数 5 ⇒ 6.25），任何**有限**
  *   系数都会被绕过。系数 5 只是把触发条件推到实测值（中文 2.13、英文/代码 4.0）
  *   之外，而不是消灭它。
- * - 全仓库**只有 trae 有这条「静默丢历史」的路径**：其余 13 个 provider 把 DSH 的
- *   压缩点当唯一真相；唯一的另一类体积防护（`src/image-budget.ts`，13 家共用）
+ * - 全仓库**只有 trae 有这条「静默丢历史」的路径**：其余 provider 把 DSH 的
+ *   压缩点当唯一真相；唯一的另一类体积防护（`src/image-budget.ts`）
  *   作用在**单张图的编码字节**上，且压不下去时**抛 `UNSUPPORTED_CONTENT`**（可见），
  *   而不是悄悄丢消息。
+ *   ⚠️ **刻意不写「几家共用」**：本节原写「**13 家共用**」，实测按**家**展开
+ *   （一个适配器可能服务两家）只有 **9 家**（`buddy`/`workbuddy`/`cline`/`zcode`/
+ *   `gemini`/`raccoon`/`qoder`/`qodercn`/`lobsterai`）。该数**从写下时就不对**
+ *   —— 引入它的那笔提交里实测同样是 9，不是「后来有人不用了」。
+ *   另有 5 家（`trae` / `loomy` / `minimax` / `codearts` / `opencode`）**完全不用**
+ *   该模块 —— 它们的图片路径各有自己的判据（`loomy` 与 `minimax` 实测都是
+ *   **显式抛 `UNSUPPORTED_CONTENT`**，同样可见、同样不静默）。
+ *   ⇒ 这类「家数」是**必然腐坏**的快照，别在这里写数字。
  *
- * ⇒ 因此删掉它：**静默丢历史这一类缺陷在结构上消失**，trae 与其余 13 家同形，
+ * ⇒ 因此删掉它：**静默丢历史这一类缺陷在结构上消失**，trae 与其余各家同形，
  * 真正的限制只有一个 —— DSH 的压缩点。
  *
  * ## 如果将来要加回来

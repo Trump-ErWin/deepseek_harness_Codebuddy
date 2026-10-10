@@ -712,7 +712,7 @@ describe('写入端点 code 400 的 msg 分流', () => {
 /**
  * 列表查询阶段的失败原因必须**带进 `results`**（复审补）。
  *
- * 下游 `collectBuddyGrowth`（`jet-hub-rpc.ts`）判僵尸账号的依据是**逐项**
+ * 下游 `collectBuddyGrowth`（`src/buddy-growth.ts`）判僵尸账号的依据是**逐项**
  * `results.some(r => /凭据已失效/.test(r.message))`。原实现在列表查询失败时
  * 返回空 `results`，凭据失效就判不出来 ⇒ 前端把「请重新登录」显示成
  * 「本轮无 API 可达的任务」。

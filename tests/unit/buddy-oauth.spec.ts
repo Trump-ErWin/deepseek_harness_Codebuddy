@@ -555,7 +555,20 @@ describe('buddy fetchModels', () => {
             modelPromotions: [{
               enabled: true, priority: 200, modelIds: ['hy4-preview-f'],
               discount: { discountedCredits: '0x', factor: 0 },
-              schedule: { timezone: 'Asia/Shanghai', validFrom: '2026-09-11T00:00:00+08:00', validUntil: '2026-10-11T00:00:00+08:00' },
+              // ⚠️ 促销窗口必须用**相对时间**（2026-10-11 实测的墙钟缺陷）：
+              //    原先写死 `validFrom: '2026-09-11T00:00:00+08:00'` /
+              //    `validUntil: '2026-10-11T00:00:00+08:00'`，于是**那一刻一过本用例就恒红**
+              //    ——实测 2026-10-11 00:10 起 `discountedCreditsRate` 变成 `undefined`。
+              //    这不是「fixture 恰好过期」，而是**测试对墙钟绝对时间敏感**的缺陷：
+              //    任何人任何时刻跑都会在某天开始必红，且失败原因（`undefined to be '免费'`）
+              //    与「促销逻辑坏了」长得一模一样。本文件其它 fixture 都用相对时间
+              //（见 `expires_at: String(Date.now() + 7_200_000)`），此处对齐。
+              //    格式与原先**逐字同形**（`+08:00` 墙上时间），只把值换成相对。
+              schedule: {
+                timezone: 'Asia/Shanghai',
+                validFrom: new Date(Date.now() - 30 * 86_400_000 + 8 * 3_600_000).toISOString().slice(0, 19) + '+08:00',
+                validUntil: new Date(Date.now() + 30 * 86_400_000 + 8 * 3_600_000).toISOString().slice(0, 19) + '+08:00',
+              },
             }],
           },
         }), { status: 200 }),

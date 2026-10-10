@@ -42,8 +42,8 @@ let knownRequiredCount = 0
  * ⚠ 口径：描述**维度**时一律写「账号 × 模型」，`|` 只出现在这个真实 key 里。
  *
  * ⚠ 空/缺失的账号 id 归一成 `-`。这不是「消除」混淆、只是把混淆对象换成一个
- * 本仓库拿不出来的值：账号 id 在 Jet Hub RPC 创建路径上是 `src/jet-hub-rpc.ts:839`
- * 的 `${provider}-${shortId()}`（`shortId()` 为 8 位小写 hex，见同文件 `:158`），
+ * 本仓库拿不出来的值：账号 id 在 Jet Hub RPC 创建路径上是 `src/jet-hub-rpc.ts`
+ * 的 `${provider}-${shortId()}`（`shortId()` 为 8 位小写 hex，见 `jet-hub-rpc.ts` 的该助手），
  * 形如 `zcode-1a2b3c4d`，不会是单个 `-`，故冲突概率远低于直接拼字面量 `undefined`
  * （那会和「一个真的叫 `undefined` 的账号」共用同一条记忆）。
  */

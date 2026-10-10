@@ -39,7 +39,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { providerCatalogVisible } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import type { AccountPool } from './account-pool.js'
@@ -192,6 +192,12 @@ export class MinimaxAdapter extends LlmAdapter {
   private remoteModels: readonly MinimaxModelEntry[] | undefined
   /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
   private readonly catalogGate: RemoteCatalogGate
+  /**
+   * ⚠️ **2026-10-08 Task 7a：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架
+   * （实测与 `loomy` / `raccoon` 归一化后逐字相同），现在只剩 `toCatalogEntry`。
+   */
+  private readonly catalog: ModelCatalog
 
   constructor(private readonly options: MinimaxAdapterOptions) {
     super()
@@ -199,6 +205,17 @@ export class MinimaxAdapter extends LlmAdapter {
     // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
     this.catalogGate = new RemoteCatalogGate(
       options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
+    // ⚠️ 共享骨架（Task 7a）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+        unknownModelInputModalities: () => ['text'] as const,
+        syncCatalog: () => this.syncCatalogEntries(),
+      },
     )
   }
 
@@ -237,11 +254,11 @@ export class MinimaxAdapter extends LlmAdapter {
    * ⚠️ **必须同步返回数组，不能是 `async`**（真实缺陷，2026-09-29 修正）。
    *
    * 本插件 8 个既有适配器的 `listAllModels()` 全是同步返回 `readonly {...}[]`
-   * （见 `llm-adapter.ts:789`、`raccoon-adapter.ts:229` 等），
-   * `jet-hub-rpc.ts` 的接口（`:587` / `:641` 的 `ModelCatalogSource`）也是同步，
+   * （见 `llm-adapter.ts`、`raccoon-adapter.ts` 等），
+   * `jet-hub-rpc.ts` 的接口（`ModelCatalogSource` 的 `listModels` / `listAllModels`）也是同步，
    * 且两处消费者**都不 await**：
-   * - `:2041` `catalog = [...all]`
-   * - `:2125` `ids = all.map((model) => model.id)`
+   * - `catalog = [...all]`
+   * - `ids = all.map((model) => model.id)`
    *
    * 早期这里写成 `async`，返回的是 Promise —— Promise **不是** `undefined`，
    * 故两处都会走进 `all !== undefined` 分支并抛
@@ -252,13 +269,41 @@ export class MinimaxAdapter extends LlmAdapter {
    * （无调用方），一旦接线即爆发。
    *
    * ⚠️ 读缓存而非 `await loadModels()` 是**正确**的：RPC 路径在调用本方法**之前**
-   * 已先 `await llm.listModels(provider)`（`jet-hub-rpc.ts:2011`），
+   * 已先 `await llm.listModels(provider)`（`jet-hub-rpc.ts`），
    * 而 `listModels` 内部会 `await this.loadModels()` 落缓存。
-   * 与 `raccoon-adapter.ts:229-232` 逐字同构。
+   *
+   * ⚠️ **2026-10-08 Task 7a**：本条同步契约**原样上移到共享骨架**
+   * （`src/model-catalog.ts` 的 `listAllModels` + `ModelCatalogConfig.syncCatalog`），
+   * 上面这段缺陷史也随之上移；此处只剩委托。
+   * ⇒ 骨架里**同样**不能把它改成 `async`（同一个 `all is not iterable` 后果）。
    */
   listAllModels(): readonly { id: string; name: string }[] {
+    return this.catalog.listAllModels()
+  }
+
+  private toCatalogEntry(model: MinimaxModelEntry): CatalogEntry {
+    const reasoning = minimaxReasoningInfo(model)
+    const maxTokens = model.maxTokens
+    const contextWindow = model.contextWindow
+    return {
+      id: model.id,
+      name: model.name,
+      // ⚠️ 本家**不剥倍率**（`resolveModel` 也用 `name`）⇒ 不提供 `bareName`。
+      inputModalities: this.inputModalitiesFor(model),
+      ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+      ...maxTokens !== undefined ? { maxTokens } : {},
+      ...reasoning !== undefined ? { reasoning } : {},
+    }
+  }
+
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    const all = await this.loadModels()
+    return all.map((model) => this.toCatalogEntry(model))
+  }
+
+  private syncCatalogEntries(): readonly CatalogEntry[] {
     const source = this.remoteModels ?? minimaxFallbackEntries(this.product)
-    return source.map((model) => ({ id: model.id, name: model.name }))
+    return source.map((model) => this.toCatalogEntry(model))
   }
 
   private inputModalitiesFor(
@@ -268,59 +313,15 @@ export class MinimaxAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 无已登录账号时返回 `[]` → DSH 把整个 provider 分组隐藏。
-    // **必须返回空数组而不能抛错**（抛错会多一条 provider 报错）。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-
-    const all = await this.loadModels()
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? all
-      : all.filter((model) => !disabled.has(model.id))
-
-    return listed.map((model) => ({
-      provider: this.product.id,
-      id: model.id,
-      name: model.name,
-      inputModalities: this.inputModalitiesFor(model),
-    }))
+    return this.catalog.listModels(_provider)
   }
 
   async resolveModel(
     provider: string,
     model: string,
-    _signal?: AbortSignal,
+    signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
-    const all = await this.loadModels()
-    const entry = all.find((item) => item.id === model)
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: entry?.name ?? model,
-      inputModalities: this.inputModalitiesFor(entry),
-    }
-    // ⚠️ 未知模型不编造 context（宁可让 DSH 用默认值，也不报一个假窗口）
-    if (entry !== undefined && entry.contextWindow > 0) {
-      resolved.context = { contextWindow: entry.contextWindow }
-    }
-    // ⚠️ 远端非法值必须过滤：0/负数/NaN 会让 DSH 抛 INVALID_MODEL_MAX_TOKENS，
-    // **整轮对话起不来**（不是降级，是崩）
-    // ⚠️ 先取出局部变量再判：`entry.maxTokens` 是可选属性，直接写
-    // `Number.isSafeInteger(entry.maxTokens) && entry.maxTokens > 0` 时
-    // `Number.isSafeInteger` 带 `number` 形参，**不做**类型收窄，`strict` 下
-    // 第二个条件会报 TS18048（'entry.maxTokens' is possibly 'undefined'）。
-    // 取出局部变量后 `!== undefined` 即可正常收窄，判据本身（safe integer + > 0）
-    // 与 brief 完全一致；`raccoon-adapter.ts` 的 `positiveMaxTokens` 同款写法。
-    const maxTokens = entry?.maxTokens
-    if (maxTokens !== undefined && Number.isSafeInteger(maxTokens) && maxTokens > 0) {
-      resolved.defaultMaxTokens = maxTokens
-    }
-    // ⚠️ 只有 M3.1-Flash-Preview 有档位；其余返回 undefined 表示不声明
-    if (entry !== undefined) {
-      const reasoning = minimaxReasoningInfo(entry)
-      if (reasoning !== undefined) resolved.reasoning = reasoning
-    }
-    return resolved
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /** 兼容 0.1.1-rc.2 的 `prepareCall` shim（与其余适配器同款）。 */

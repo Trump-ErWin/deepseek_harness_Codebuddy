@@ -17,10 +17,10 @@ import {
   LlmAdapter, LlmError,
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate, REMOTE_CATALOG_COOLDOWN_MS } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import {
   RATE_LIMIT_FALLBACK_MS,
   isModelSaturationError,
@@ -495,7 +495,7 @@ function isContentRejection(body: string): boolean {
  *   「每次都拿最先选中的坏账号去撞」；
  * - 太长则把「其实已恢复」的账号白白锁死（服务端策略可能随时间/额度状态解除）；
  * - 30 分钟也限制了误伤窗口：标记**只随时间到期失效**（`getAvailableAccount`
- *   的判据是 `Date.now() >= resetAt`，见 `src/account-pool.ts:578`），
+ *   的判据是 `Date.now() >= resetAt`，见 `src/account-pool.ts`），
  *   所以时长直接等于「这个账号在该模型上被藏起来多久」。
  *   ⚠️ 别指望 `sweepExpiredRateLimits` 来清 —— 它在生产代码里**没有任何调用方**
  *   （只有 `account-pool.spec.ts` 用），到期完全靠上面那个时间比较。
@@ -505,7 +505,8 @@ function isContentRejection(body: string): boolean {
  * 别把它们合并成一个常量 —— 语义不同，将来调其中一个不该动另一个。
  *
  * ⚠️ UI 副作用（已知取舍）：复用的是 `modelRateLimits`，账号卡片因此显示
- * 「限额重置 · <模型> · 30 分钟后」（`plugin-src/client/jet-hub.js:412-418`），
+ * 「限额重置 · <模型> · 30 分钟后」（客户端渲染该行的判据见
+ * `plugin-src/client/jet-hub.js` 的 `dim-jh-rateLimitsLabel`），
  * 而不是「安全策略拦截」—— 该结构只有一个 `模型→时刻` 映射，不带原因字段。
  * 换来的是现成的三条解禁路径都能用它：时间到期、Jet Hub「重置」按钮
  * （`clearModelRateLimits`）、「重测」（`account-probe.ts` 真发一条最小消息，
@@ -536,7 +537,7 @@ const BUDDY_POLICY_BLOCK_COOLDOWN_MS = 30 * 60_000
  * UI 还会为这两个码额外弹全局额度 Toast。
  *
  * 取 `PERMISSION_DENIED` 与本仓库既有惯例一致 —— `cline-adapter.ts` 的地域限制
- * 分支就用的这个码，并配有专门用例断言「错误码不是 AUTH」（`cline-adapter.spec.ts:479`）。
+ * 分支就用的这个码，并配有专门用例断言「错误码不是 AUTH」（`cline-adapter.spec.ts`）。
  * 它同时**不在** harness 的 `DEFAULT_RETRYABLE_CODES`
  * （`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`）里：
  * 「这个账号被策略拦了」是确定性结论，交给 harness 白退避 5 次毫无意义 ——
@@ -586,7 +587,7 @@ export function policyBlockResetAtMs(nowMs: number): number {
  *
  * 它是账号池里**唯一**的「账号 × 模型暂时不可用」载体（`ProviderAccountEntry`
  * 只有 `模型id → 重置时间戳` 这一个映射，没有 reason / 级别字段），复用它的收益：
- * ① `getAvailableAccount` 的过滤天然生效（`account-pool.ts:577-578`）；
+ * ① `getAvailableAccount` 的过滤天然生效（`account-pool.ts`）；
  * ② UI 已有徽章与「重测 / 重置」两条人工解禁路径（`account-probe.ts`）。
  * 代价是徽章文案显示为「限额重置」而非「安全策略拦截」—— 已知取舍，见常量注释。
  *
@@ -915,6 +916,12 @@ export class BuddyAdapter extends LlmAdapter {
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
   private readonly catalogGate: RemoteCatalogGate
+  /**
+   * ⚠️ **2026-10-08 Task 7c：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+   * 现在只剩 `toCatalogEntry`（本家私有形状 + 三级 context 查找 + 同名消歧）。
+   */
+  private readonly catalog: ModelCatalog
   /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
   private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
   /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
@@ -951,6 +958,24 @@ export class BuddyAdapter extends LlmAdapter {
         .filter((model) => model.contextWindow !== undefined)
         .map((model) => [model.id, model.contextWindow as number]),
     )
+    // ⚠️ 共享骨架（Task 7c）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ **本家是唯一真正使用「未知」语义的家**：`inputModalitiesFor` 用
+        // `imageCapabilityKnown` 区分「远端明确 false」与「全都没查到」，
+        // 后者**只报未知**（省略该字段）交给宿主判断。
+        // ⇒ **故意不提供** `unknownModelInputModalities`（其余 **12 家**都提供 `['text']`）。
+        // ⚠️ 家数实测为 12、且**不是**源码处数 10（`qoder-adapter.ts` 一处服务
+        //    两家）—— 两个口径都写错过一次。完整名单与复核方式见
+        //    `model-catalog.ts` 里该字段的表格，别在这里抄。
+        // ⚠️ 若给它写 `['text']`，DSH 会按「确认是纯文本模型」把图片**静默投影成
+        // 占位文本** ⇒ 图片能力被关掉（宿主契约：absent means unknown）。
+      },
+    )
   }
 
   /**
@@ -958,7 +983,8 @@ export class BuddyAdapter extends LlmAdapter {
    *
    * ## 为什么需要它
    *
-   * `pickBuddyCredential`（`src/index.ts`）只问「锁没锁 + 有没有临期积分」，
+   * 余额分档编排（`src/credential-resolver.ts` 的 buddy 分支 + 共享的
+   * `pickBuddyAccount`）只问「锁没锁 + 有没有临期积分」，
    * 从不问「这个模型要不要钱」。于是免费模型也会被「锁定永久积分 + 无临期积分」
    * 这道门拦下，报出「没有可用账号……已锁定永久积分，而所有账号的『N 天内到期』
    * 积分都已用尽」，而它**一分积分都不需要** —— 用户看到的是
@@ -1334,46 +1360,112 @@ export class BuddyAdapter extends LlmAdapter {
    * key（裸 id）补回 —— 那条路径拿不到展示名，只能退化成裸 id，**倍率随之丢失**
    * （用户报障：「关闭的就没有显示倍率」）。
    *
-   * ⚠️ 同名消歧必须基于**未过滤**的全量集合：`displayNameFor(model, source)`
-   * 而非 `listed`。用过滤后的集合会让「关掉其中一个同名模型」改变另一个的
-   * 变体标记，名字随开关跳变。
+   * ⚠️ **2026-10-08 Task 7c**：骨架（含上面这条理由）已上移到共享实现
+   * `src/model-catalog.ts`，此处只剩委托。
    */
   listAllModels(): readonly { id: string; name: string }[] {
-    const source = this.remoteModels ?? this.staticFallbackModels()
-    return source.map((model) => ({ id: model.id, name: displayNameFor(model, source) }))
-  }
-
-  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
-    // 不必拉。返回空数组 → DSH 的 `buildModelCatalog` 把整个 provider 分组隐藏。
-    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`）。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-    await this.ensureRemoteModels()
-    const source = this.remoteModels ?? this.staticFallbackModels()
-    // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
-    // 按本适配器的产品 id 取表，CodeBuddy 与 WorkBuddy 的开关互不影响。
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? source
-      : source.filter((model) => !disabled.has(model.id))
-    return listed.map((model) => ({
-      provider: this.product.id,
-      id: model.id,
-      name: displayNameFor(model, listed),
-      ...this.imageModalitiesField(model.id),
-    }))
+    return this.catalog.listAllModels()
   }
 
   /**
-   * 把 {@link inputModalitiesFor} 的结果摊成 `LlmModelInfo` 的可选字段。
+   * 把本家条目转成共享骨架的中间结构。
    *
-   * ⚠️ 必须**省略**而不是报 `['text']`：宿主契约明写
-   * 「absent means unknown」（dsh-llm `types.d.ts`），而 DSH 见到
-   * 「不含 image」的声明会按「确认是纯文本模型」把图片静默投影成占位文本。
+   * ⚠️ **`all` 是「用于同名消歧的集合」，必须传未过滤的全量集合** ——
+   * 见 `displayNameFor` 的说明（用过滤后的集合会让「关掉其中一个同名模型」
+   * 改变另一个的变体标记，名字随开关跳变）。
+   *
+   * ⚠️ 本家三处**真实差异**（不要「顺手统一」）：
+   * 1. `contextWindow` 三级查找：远端 `maxInputTokens` → 产品兜底表 → 通用静态表
+   *    （对齐 Rust `context_limit_for_model` 的两级查找，多一层产品级）；
+   * 2. `maxOutputTokens` 二级查找（远端 → 产品兜底），**必须声明**：
+   *    不声明等于把这个值永久交给网关默认（实测网关默认仅 32000），
+   *    大文件写入/长回答会在 32000 处被截断成 `finish_reason:'length'`；
+   * 3. `reasoning` 的 `efforts` 取自 `effortsFor`（按模型/产品判据），
+   *    且 `defaultEffort` **必须落在 `efforts` 内**。
+   *
+   * ⚠️ `inputModalities` **缺席即「未知」**（本家是全仓唯一真正使用该语义的家）：
+   * `inputModalitiesFor` 用 `imageCapabilityKnown` 区分「远端明确 false」与
+   * 「全都没查到」，后者返回 `undefined` ⇒ 这里**省略该字段**交给宿主判断。
    */
-  private imageModalitiesField(model: string): { inputModalities?: readonly ('text' | 'image')[] } {
-    const modalities = this.inputModalitiesFor(model)
-    return modalities === undefined ? {} : { inputModalities: modalities }
+  private toCatalogEntry(model: BuddyRemoteModel, all: readonly BuddyRemoteModel[]): CatalogEntry {
+    const contextWindow = this.remoteContextWindows.get(model.id)
+      ?? this.productFallbackContextWindows.get(model.id)
+      ?? CONTEXT_WINDOWS.get(model.id)
+    const maxOutputTokens = positiveMaxTokens(
+      this.remoteMeta.get(model.id)?.maxOutputTokens
+      ?? this.productFallbackMeta.get(model.id)?.maxOutputTokens,
+    )
+    const efforts = this.effortsFor(model.id)
+    const remoteDefault = this.remoteMeta.get(model.id)?.defaultReasoningEffort
+      ?? this.productFallbackIndex.get(model.id)?.defaultReasoningEffort
+    const modalities = this.inputModalitiesFor(model.id)
+    return {
+      id: model.id,
+      // ⚠️ 同名消歧用**未过滤**的 `all`（见上）。
+      name: displayNameFor(model, all),
+      // ⚠️ `resolveModel` 的 name 取自**元数据**（不是 `displayNameFor`）——
+      // 它不带倍率后缀，故显式提供 `bareName`。
+      bareName: this.remoteMeta.get(model.id)?.name
+        ?? this.productFallbackIndex.get(model.id)?.name
+        ?? model.name,
+      ...modalities !== undefined ? { inputModalities: modalities } : {},
+      ...contextWindow !== undefined ? { contextWindow } : {},
+      ...maxOutputTokens !== undefined ? { maxTokens: maxOutputTokens } : {},
+      ...efforts.length > 0
+        ? {
+            reasoning: {
+              efforts: efforts.map((id) => ({
+                id: ReasoningEffortId(id),
+                name: EFFORT_NAMES[id] ?? id,
+              })),
+              ...remoteDefault !== undefined && efforts.includes(remoteDefault)
+                ? { defaultEffort: ReasoningEffortId(remoteDefault) }
+                : {},
+            },
+          }
+        : {},
+    }
+  }
+
+  /**
+   * 本家全部条目（**含 VL 等可见性判据**）—— 远端缓存 ?? 静态兜底表。
+   *
+   * ⚠️ 两条路径（`listModels` / `listAllModels`）都用**同一份未过滤集合**做
+   * 同名消歧：`listModels` 侧原先误用「已过滤」集合，与 `displayNameFor` 的
+   * 注释矛盾（用户 2026-10-08 裁定修正为未过滤 —— 一次**行为变更**：
+   * 关闭同名模型之一时，另一个的变体标记不再跳变）。
+   */
+  private catalogEntries(source: readonly BuddyRemoteModel[]): readonly CatalogEntry[] {
+    return source.map((model) => this.toCatalogEntry(model, source))
+  }
+
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    await this.ensureRemoteModels()
+    return this.catalogEntries(this.remoteModels ?? this.staticFallbackModels())
+  }
+
+  /**
+   * 同步视图（`listAllModels` 用）。
+   *
+   * ⚠️ **不能** `await ensureRemoteModels()`（同步契约）—— 读 `remoteModels`
+   * 缓存，未落地时回退静态兜底表（这正是原实现的语义）。
+   */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    return this.catalogEntries(this.remoteModels ?? this.staticFallbackModels())
+  }
+
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.catalog.listModels(_provider)
+  }
+
+  /**
+   * 解析模型元信息。
+   *
+   * ⚠️ 原实现里的三处判据（context 三级查找 / maxOutputTokens / reasoning）
+   * 现已收敛到 `toCatalogEntry` —— 骨架的 `resolveModel` 只做回填与「不声明未知」。
+   */
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /**
@@ -1389,57 +1481,6 @@ export class BuddyAdapter extends LlmAdapter {
       return productModels.map((model) => ({ id: model.id, name: model.name }))
     }
     return DEFAULT_MODELS.map((id) => ({ id, name: id }))
-  }
-
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    await this.ensureRemoteModels()
-    // 三级查找：远端 maxInputTokens → 产品兜底表 → 通用静态表
-    // （对齐 Rust context_limit_for_model 的两级查找，多一层产品级）。
-    const contextWindow = this.remoteContextWindows.get(model)
-      ?? this.productFallbackContextWindows.get(model)
-      ?? CONTEXT_WINDOWS.get(model)
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: this.remoteMeta.get(model)?.name ?? this.productFallbackIndex.get(model)?.name ?? model,
-      ...this.imageModalitiesField(model),
-    }
-    if (contextWindow !== undefined) resolved.context = { contextWindow }
-    // 单次输出上限：远端 maxOutputTokens（实测 deepseek-v4.1-flash = 128000）
-    // 优先，产品兜底表次之。
-    //
-    // **为什么必须声明**：DSH 在 `resolveCallWithInfo` 里只在调用方未显式给值时
-    // 用 `defaultMaxTokens` 兜底，适配器不声明就等于把这个值永久交给网关默认
-    // （实测网关默认仅 32000 —— 见远端 `auto` 模型的 maxOutputTokens）。结果是
-    // 大文件写入 / 长回答在 32000 处被截断成 finish_reason:'length'，UI 报
-    // 「已达到输出 token 上限」。这与 codearts 适配器显式发 max_tokens 的做法
-    // （llm-adapter.ts）本应一致。
-    //
-    // 远端与兜底表都没有该模型的值时**保持 undefined**，交给网关默认值：
-    // 编造一个偏大的值会让服务端 400 拒绝（参考 codearts 131072 被拒的实测），
-    // 偏小则无谓截断用户输出。
-    const maxOutputTokens = positiveMaxTokens(
-      this.remoteMeta.get(model)?.maxOutputTokens ?? this.productFallbackMeta.get(model)?.maxOutputTokens,
-    )
-    if (maxOutputTokens !== undefined) resolved.defaultMaxTokens = maxOutputTokens
-    // 思考等级：这是"思考强度"选择器出现在模型选择里的唯一入口——composer
-    // 读取 resolveModel().reasoning。无等级可选的模型不声明该字段，UI 显示
-    // "当前模型未提供推理等级"。
-    const efforts = this.effortsFor(model)
-    if (efforts.length > 0) {
-      const remoteDefault = this.remoteMeta.get(model)?.defaultReasoningEffort
-        ?? this.productFallbackIndex.get(model)?.defaultReasoningEffort
-      resolved.reasoning = {
-        efforts: efforts.map((id) => ({
-          id: ReasoningEffortId(id),
-          name: EFFORT_NAMES[id] ?? id,
-        })),
-        ...remoteDefault !== undefined && efforts.includes(remoteDefault)
-          ? { defaultEffort: ReasoningEffortId(remoteDefault) }
-          : {},
-      }
-    }
-    return resolved
   }
 
   /**
@@ -1732,13 +1773,13 @@ export class BuddyAdapter extends LlmAdapter {
       if ((response.status === 401 || response.status === 403) && this.options.accountPool !== undefined) {
         for (;;) {
           // modelId 参与过滤：正在限流期的账号不会被选中（与限流换号同语义）。
-          const next = await this.options.accountPool.getAvailableAccount(
+          const next = await this.options.accountPool.getAvailableAccount<BuddyCredential>(
             this.product.id, options.model, triedAuth,
           )
           if (!next || triedAuth.has(next.entry.id)) break
           triedAuth.add(next.entry.id)
           rotated = true
-          credential = next.credential as BuddyCredential
+          credential = next.credential
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {
@@ -1931,12 +1972,12 @@ export class BuddyAdapter extends LlmAdapter {
           // 必须把 `tried` 传给池：见 `AccountPool.getAvailableAccount` 的说明 ——
           // 池按「重置时间最早到期」排序，刚失败的账号可能仍排第一，
           // 不排除就会拿回同一个、命中下面的 `tried.has` 而立即 break。
-          const next = await this.options.accountPool.getAvailableAccount(
+          const next = await this.options.accountPool.getAvailableAccount<BuddyCredential>(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
-          credential = next.credential as BuddyCredential
+          credential = next.credential
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {
