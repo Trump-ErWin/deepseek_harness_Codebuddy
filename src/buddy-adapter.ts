@@ -505,7 +505,8 @@ function isContentRejection(body: string): boolean {
  * 别把它们合并成一个常量 —— 语义不同，将来调其中一个不该动另一个。
  *
  * ⚠️ UI 副作用（已知取舍）：复用的是 `modelRateLimits`，账号卡片因此显示
- * 「限额重置 · <模型> · 30 分钟后」（`plugin-src/client/jet-hub.js:412-418`），
+ * 「限额重置 · <模型> · 30 分钟后」（客户端渲染该行的判据见
+ * `plugin-src/client/jet-hub.js` 的 `dim-jh-rateLimitsLabel`），
  * 而不是「安全策略拦截」—— 该结构只有一个 `模型→时刻` 映射，不带原因字段。
  * 换来的是现成的三条解禁路径都能用它：时间到期、Jet Hub「重置」按钮
  * （`clearModelRateLimits`）、「重测」（`account-probe.ts` 真发一条最小消息，
@@ -967,7 +968,9 @@ export class BuddyAdapter extends LlmAdapter {
         // ⚠️ **本家是唯一真正使用「未知」语义的家**：`inputModalitiesFor` 用
         // `imageCapabilityKnown` 区分「远端明确 false」与「全都没查到」，
         // 后者**只报未知**（省略该字段）交给宿主判断。
-        // ⇒ **故意不提供** `unknownModelInputModalities`（其余 5 家都提供 `['text']`）。
+        // ⇒ **故意不提供** `unknownModelInputModalities`（其余 **10 家**都提供 `['text']`）。
+        // ⚠️ 家数实测为 10（2026-10-08 独立复审修正，原写「5 家」）。
+        //    完整名单与复核方式见 `model-catalog.ts` 里该字段的表格，别在这里抄。
         // ⚠️ 若给它写 `['text']`，DSH 会按「确认是纯文本模型」把图片**静默投影成
         // 占位文本** ⇒ 图片能力被关掉（宿主契约：absent means unknown）。
       },

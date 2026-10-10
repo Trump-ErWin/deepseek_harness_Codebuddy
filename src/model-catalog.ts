@@ -16,7 +16,10 @@
  *
  * resolveModel(provider, model)      ← ⚠️ provider/id 必须按入参回填
  *   ├─ ① 按 id 找 entry（**找不到不抛错**）
- *   ├─ ② name：entry.name → entry.bareName → **裸 model**（三级回退，绝不空）
+ *   ├─ ② name：entry.bareName → entry.name → **裸 model**（三级回退，绝不空）
+ *   │      ⚠️ **`bareName` 优先**，与设计文档 §3.5.4.3 写的「entry.name →
+ *   │         entry.bareName」**相反** —— 以实现为准，理由见 `resolveModel` 内注释。
+ *   │         （本节原先把顺序写反了，2026-10-08 复审修正。）
  *   ├─ ③ context：未知就不声明
  *   ├─ ④ maxTokens：可选
  *   └─ ⑤ reasoning：efforts 非空才声明；defaultEffort 必须落在 efforts 内
@@ -109,10 +112,19 @@ export interface ModelCatalogConfig {
    *
    * | 家 | 未知 id ⇒ | 理由 |
    * |---|---|---|
-   * | `buddy` | **省略该字段**（不提供本回调） | 它的 `inputModalitiesFor` 用 `imageCapabilityKnown` 区分「明确 false」与「全都没查到」，后者**只报未知**（交给宿主判断） |
-   * | `loomy`/`minimax`/`raccoon`/`gemini`/`qoder` | `['text']` | **保守报 text**：宁可少报能力（用户改用文本描述），也不要报一个服务端可能不认的模态 |
+   * | `buddy`（含 `workbuddy`） | **省略该字段**（不提供本回调） | 它的 `inputModalitiesFor` 用 `imageCapabilityKnown` 区分「明确 false」与「全都没查到」，后者**只报未知**（交给宿主判断） |
+   * | 其余 **10 家** | `['text']` | **保守报 text**：宁可少报能力（用户改用文本描述），也不要报一个服务端可能不认的模态 |
    *
-   * ⚠️ 若把上面 5 家统一成「省略」，用户手填的未知模型会从「明确不支持图片」
+   * ⚠️ **家数实测为 10（2026-10-08 独立复审修正）** —— 本节原先写「**5 家**」
+   * （列了 `loomy/minimax/raccoon/gemini/qoder`），那是本字段刚引入时的快照，
+   * 此后 `cline` / `codearts` / `lobsterai` / `trae` / `zcode` 陆续接入却没人更新它。
+   * 复核方式（剥注释后看**代码里**有没有这个键，别把注释本身算进去）：
+   *
+   *     实际提供该键：cline / codearts / gemini / lobsterai / loomy /
+   *                   minimax / qoder / raccoon / trae / zcode   ← 共 10
+   *     省略该键    ：buddy（workbuddy 复用同一适配器）
+   *
+   * ⚠️ 若把这 10 家统一成「省略」，用户手填的未知模型会从「明确不支持图片」
    * 变成「未知」⇒ **图片会被放行**、发到不支持的服务端（请求失败）。
    * 反之若把 `buddy` 统一成 `['text']`，会**静默关掉图片能力**（见
    * `CatalogEntry.inputModalities` 的说明）。
@@ -260,8 +272,8 @@ export function createModelCatalog(
         if (entry.description !== undefined) resolved.description = entry.description
       } else {
         // ⚠️ **未知 id**：由各家自己的判据决定（见 `unknownModelInputModalities`）。
-        // 骨架**不替各家决定** —— 5 家保守报 `['text']`、buddy 省略该字段，
-        // 两个方向统一都会出真缺陷。
+        // 骨架**不替各家决定** —— 10 家保守报 `['text']`、buddy 省略该字段，
+        // 两个方向统一都会出真缺陷。（家数由上面那个接口字段的表格维护，别抄这里。）
         const unknownModalities = config.unknownModelInputModalities?.()
         if (unknownModalities !== undefined) resolved.inputModalities = unknownModalities
       }

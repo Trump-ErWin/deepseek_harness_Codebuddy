@@ -168,6 +168,46 @@ vi.mock('../../src/llm-adapter.js', async (importOriginal) => {
   return { ...actual, CodeArtsAdapter: MockCodeArtsAdapter }
 })
 
+/**
+ * Loomy / Raccoon 的桩（2026-10-08 复审补齐 —— 此前本文件对这两家**零覆盖**）。
+ *
+ * ⚠️ **它们是第 5 次同型缺陷的事主**：旧 `else if` 链里**没有** loomy / raccoon
+ * 的分支 ⇒ 两者落入 `else`，被交给「华为云 HMAC 签名」的 `CodeArtsAdapter`
+ * 去发讯飞 / 商汤的凭据 —— 探测必然失败，而它们的限流标记（UTC+8 当日 24:00）
+ * **永远清不掉**（症状只是「重测按钮点了没用」）。
+ *
+ * ⚠️ 桩的形状必须带 `credentialRef` / `product`：生产里 `createProbeAdapter`
+ * 就是传这四个字段（见 `index.ts` 的 `probeById`），本文件的价值正在于断言
+ * 「生产把哪个适配器交给了哪个 provider」。
+ */
+vi.mock('../../src/loomy-adapter.js', () => {
+  class MockLoomyAdapter {
+    static readonly instances: Array<{ product?: { id: string }; credentialRef?: string }> = []
+    constructor(options: { product?: { id: string }; credentialRef?: string }) {
+      MockLoomyAdapter.instances.push(options)
+    }
+    // eslint-disable-next-line require-yield
+    async *stream(): AsyncGenerator<never> {
+      throw new LlmError('频率限制', 'RATE_LIMIT')
+    }
+  }
+  return { LoomyAdapter: MockLoomyAdapter, registerLoomyLlm: () => {}, parseLoomyRemoteModels: () => [] }
+})
+
+vi.mock('../../src/raccoon-adapter.js', () => {
+  class MockRaccoonAdapter {
+    static readonly instances: Array<{ product?: { id: string }; credentialRef?: string }> = []
+    constructor(options: { product?: { id: string }; credentialRef?: string }) {
+      MockRaccoonAdapter.instances.push(options)
+    }
+    // eslint-disable-next-line require-yield
+    async *stream(): AsyncGenerator<never> {
+      throw new LlmError('频率限制', 'RATE_LIMIT')
+    }
+  }
+  return { RaccoonAdapter: MockRaccoonAdapter, registerRaccoonLlm: () => {} }
+})
+
 /** 取 mock 的构造记录。 */
 async function adapterInstances(): Promise<Array<{ product?: { id: string; productCode: string } }>> {
   const mod = await import('../../src/buddy-adapter.js') as unknown as {
@@ -230,6 +270,22 @@ async function geminiInstances(): Promise<Array<{ product?: { id: string } }>> {
     GeminiAdapter: { instances: Array<{ product?: { id: string } }> }
   }
   return mod.GeminiAdapter.instances
+}
+
+/** 取 Loomy 桩的构造记录。 */
+async function loomyInstances(): Promise<Array<{ product?: { id: string }; credentialRef?: string }>> {
+  const mod = await import('../../src/loomy-adapter.js') as unknown as {
+    LoomyAdapter: { instances: Array<{ product?: { id: string }; credentialRef?: string }> }
+  }
+  return mod.LoomyAdapter.instances
+}
+
+/** 取 Raccoon 桩的构造记录。 */
+async function raccoonInstances(): Promise<Array<{ product?: { id: string }; credentialRef?: string }>> {
+  const mod = await import('../../src/raccoon-adapter.js') as unknown as {
+    RaccoonAdapter: { instances: Array<{ product?: { id: string }; credentialRef?: string }> }
+  }
+  return mod.RaccoonAdapter.instances
 }
 
 /**
@@ -445,6 +501,8 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline / zcode 不�
     ;(await qoderInstances()).length = 0
     ;(await zcodeInstances()).length = 0
     ;(await geminiInstances()).length = 0
+    ;(await loomyInstances()).length = 0
+    ;(await raccoonInstances()).length = 0
   })
 
   afterEach(() => {
@@ -600,6 +658,53 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline / zcode 不�
     // 反向对照：codearts 不该被分派给 Qoder / Cline 的链路。
     expect(await qoderInstances()).toHaveLength(0)
     expect(await geminiInstances()).toHaveLength(0)
+    expect(calls).toHaveLength(0)
+  })
+
+  /**
+   * ★★ **Loomy / Raccoon：第 5 次同型缺陷的事主**（本节由 2026-10-08 独立复审补齐）。
+   *
+   * ## 为什么之前没有这两条（这是本文件最大的覆盖缺口）
+   *
+   * 实测：改前本文件里 `loomy` 出现 **0 次**、`raccoon` 出现 **0 次** ——
+   * 而这两家**都在** `probeById` 里注册了。旧 `else if` 链对它们**没有分支**，
+   * 落入 `else` 后被交给华为云 HMAC 签名的 `CodeArtsAdapter`。
+   * ⇒ 缺陷只在这两家上存在，而回归测试恰恰没有覆盖它们 ——
+   * 「测试覆盖了 9 家、漏了出事的那 2 家」是 false coverage 的典型形状。
+   *
+   * ⚠️ 必须带 `modelRateLimits`：`retestAccount` 的探测目标是
+   * `Object.keys(entry.modelRateLimits)`，没有标记时它**根本不构造适配器**
+   * ⇒ 用例会变成假绿（见 zcode 那条的同款注释）。
+   */
+  it.each([
+    { provider: 'loomy', credentialRef: 'LOOMY_ACCOUNT_TEST', label: '讯飞' },
+    { provider: 'raccoon', credentialRef: 'RACCOON_ACCOUNT_TEST', label: '商汤小浣熊' },
+  ])('$provider（$label）账号走自己的适配器，而非 CodeArtsAdapter', async ({ provider, credentialRef }) => {
+    const calls = stubFetch()
+    const { retestAccount } = await import('../../src/account-probe.js')
+    const id = `${provider}-1`
+    const result = await retestAccount(makePool([makeEntry({
+      id,
+      provider,
+      credentialRef,
+      // ⚠️ 没标记 ⇒ 不构造适配器 ⇒ 用例假绿。日期按 UTC+8 当日 24:00。
+      modelRateLimits: { 'some-model': Date.now() + 3_600_000 },
+    })]), id)
+
+    expect(result.tested).toBe(1)
+    expect(result.stillLimited).toHaveLength(1)
+
+    const instances = provider === 'loomy' ? await loomyInstances() : await raccoonInstances()
+    expect(instances, `${provider} 没有构造自己的适配器`).toHaveLength(1)
+    // ⚠️ 断言 `product.id` 而不仅是「构造了一个适配器」：分派按产品判定，
+    //    带错产品配置会让请求打到错的端点。
+    expect(instances[0]?.product?.id).toBe(provider)
+    // ⚠️ 且凭据 ref 必须被**原样透传**（生产里 `credentialRef(ref)` 会做校验，
+    //    取错 ref 会让适配器去读别家凭据）。
+    expect(instances[0]?.credentialRef).toBe(credentialRef)
+    // 核心断言：**没有**构造 CodeArtsAdapter（否则就是用华为云签名发别家凭据）。
+    expect(await codeartsInstances()).toHaveLength(0)
+    // 桩适配器在构造后立刻抛错，故不该有任何真实请求发出。
     expect(calls).toHaveLength(0)
   })
 })

@@ -171,9 +171,15 @@ describe('createModelCatalog：两条来自真实缺陷的补充约束', () => {
     // ⚠️ 这是 Task 7b 实测踩到的**核心三态陷阱**：各家对「目录里没有的 id」处理不同，
     //    且**不能统一** —— 两个方向都会出真缺陷。
     //
-    // 形态 A（5 家：loomy/minimax/raccoon/gemini/qoder）：**保守报 `['text']`**
+    // 形态 A（**10 家**：cline/codearts/gemini/lobsterai/loomy/minimax/qoder/
+    //        raccoon/trae/zcode）：**保守报 `['text']`**
     //   ⇒ 若改成「省略」，用户手填的未知模型会从「明确不支持图片」变成「未知」
     //     ⇒ **图片被放行**、发到不支持的服务端（请求失败）。
+    // ⚠️ 家数实测为 10（2026-10-08 独立复审修正，原写「5 家」——
+    //    那是本字段刚引入时的快照，此后 5 家陆续接入却没更新这里）。
+    //    ⚠️ 本条用例**只演示骨架的两种形态**（用一个自造 config 代表形态 A），
+    //    **不**逐家核对谁属于哪一形态 —— 那份名单若要有守卫，应像
+    //    `probe-wiring` 那样从源码派生，而不是在这里抄一份会腐的清单。
     const conservative = createModelCatalog(
       { accountPool: { hasLoggedInAccount: async () => true, disabledModelsFor: () => new Set() } as never },
       {

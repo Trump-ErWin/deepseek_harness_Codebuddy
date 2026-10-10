@@ -529,13 +529,6 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   /**
-   * 模型目录。
-   *
-   * **不发任何网络请求**：Qoder 的模型列表端点需要 WASM 签名
-   * （`qoder_auth_wasm`），本插件不实现，故恒用产品兜底表。
-   * 见设计文档 §2.6 与 `qoder-product.ts` 的 `fallbackModels` 说明。
-   */
-  /**
    * 完整模型目录（**不应用用户黑名单**），含最终展示名（倍率/免费标记）。
    *
    * 设置页必须渲染被关闭的模型（否则用户无法重新打开），而 `listModels` 会按
@@ -544,6 +537,13 @@ export class QoderAdapter extends LlmAdapter {
    *
    * ⚠️ **2026-10-08 Task 7b**：骨架（含上面这条理由）已上移到共享实现
    * `src/model-catalog.ts`，此处只剩委托。
+   *
+   * ⚠️ **2026-10-08 复审**：本方法上方原先还压着**一段无主的 JSDoc**
+   * （以「模型目录。」开头、讲「Qoder 的模型列表端点需要 WASM 签名」）——
+   * 它本来是某个已被删掉的方法的文档，删方法时留下了壳。
+   * 它与紧邻的本块连在一起看像「同一个方法有两套互相矛盾的文档」。
+   * 已删除；那段内容里仍然有效的部分（恒用产品兜底表、不发网络请求）
+   * 在下面 `toCatalogEntry` 的注释里。
    */
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()

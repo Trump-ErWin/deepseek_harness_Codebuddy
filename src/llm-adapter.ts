@@ -978,9 +978,9 @@ export class CodeArtsAdapter extends LlmAdapter {
         // ⚠️ 这是**用户 2026-10-08 裁定的一处行为变更**：原 `resolveModel` 对未知 id
         //    **省略**该字段（而 `listModels` 却声明 `['text']`，同一家内部不一致）
         //    ⇒ 统一为声明。影响面为零：CodeArts 是纯文本网关，VL 模型已被滤掉。
-        unknownModelInputModalities: () => ['text'] as const,
+        unknownModelInputModalities: () => ['text'] as const,
         // ⚠️ **未知模型也声明思考档位**（7b 曾在此引入回归、7d 补回）：
-        // 本网关唯一生效的思考控制是顶层 	hinking.type，与模型无关 ⇒
+        // 本网关唯一生效的思考控制是顶层 `thinking.type`，与模型无关 ⇒
         // 原实现对未知 id 同样给这两档。
         unknownModelReasoning: () => ({
           efforts: [

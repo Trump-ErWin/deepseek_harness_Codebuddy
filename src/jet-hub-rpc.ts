@@ -975,9 +975,20 @@ function providerIdsOf(
  * 而不是把整个插件树卡在 pending（那会让 profile 启动直接失败）。
  */
 /**
- * 各 provider auth 实例在 JetHub 里被用到的**共同部分**。
+ * 各 provider auth 实例的**共同部分**（结构化类型），使 `authOf` 不必依赖
+ * 13 个具体类。
  *
- * 只声明真正被用到的方法（结构化类型），使 `authOf` 不必依赖 13 个具体类。
+ * ⚠️ **名字里的 `JetHub` 比实际语义窄（2026-10-08 独立复审 M-5 实测）**：
+ * 本接口有两个**不同层次**的使用方，第二个并不在 JetHub RPC 里 ——
+ *
+ * | 成员 | 谁在用 |
+ * |---|---|
+ * | `refreshAccountCredential` | **`jet-hub-rpc.ts` 自己**（`account.refresh` 端点，实测该文件里有真调用） |
+ * | `refreshAll` | **`index.ts` 的 runtime 注册循环**（填 `ProviderRuntime.auth.refreshAll`，即 `wiredRefreshTargets()` 的派生依据）。实测本文件里**只有声明、零调用** |
+ *
+ * ⇒ 读到这里别以为 `refreshAll` 有 JetHub 调用方；它的价值是「让注册循环能用
+ * 一个统一的形状遍历 13 家」。**没有改名**是刻意的：改名要动 `index.ts` 的
+ * import 与类型标注，而收益只是名字更准；**语义澄清写在这里即可**。
  */
 export interface JetHubAuthLike {
   refreshAccountCredential(refName: string, pool: AccountPool, accountId: string): Promise<void>

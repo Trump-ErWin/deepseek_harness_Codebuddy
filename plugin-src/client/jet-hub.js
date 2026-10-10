@@ -4929,7 +4929,7 @@ function AggregatePanel({ rpcCall }) {
       //   ⚠️ `load()` 内部已含 `setRejections(rejectionsFromCatalog(models))`，
       //   故不必在这里再摊平一次。
       void res;
-      // ⚠️ 必须 orce = true：load() 默认走宿主侧目录 TTL 缓存（60 秒），
+      // ⚠️ 必须 force = true：load() 默认走宿主侧目录 TTL 缓存（60 秒），
       //    那样拿到的仍是**写之前**的候选表 ⇒ 开关会「点了不动」。
       await load(true);
       setNotice(null);

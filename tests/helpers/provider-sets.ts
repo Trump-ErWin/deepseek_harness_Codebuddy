@@ -24,10 +24,33 @@
  *
  * ## ⚠️ 为什么是函数而不是模块级常量
  *
- * 与 `src/provider-runtime.ts` 的派生表同因：调用方的期望集合要**现算**。
- * 本仓库的反向验证会**临时改写 `PROVIDER_REGISTRY`**（删一个字段、改一个布尔
- * 再跑用例），模块级常量会读到改写前的陈旧值 ⇒ 反向验证失效而无人察觉。
- * 另外调用方都要 `.sort()` 后的副本，缓存也省不下什么。
+ * ⚠️ 与 `src/provider-runtime.ts` 的派生表**同形**（那里是硬要求：注册发生在
+ * `apply()` 里，模块级常量在模块加载时求值会**恒为空表**），但本文件的理由
+ * **不是**那条，而是**求值时机解耦**（2026-10-08 独立复审修正）。
+ *
+ * ⚠️ 原注释声称「本仓库的反向验证会**临时改写 `PROVIDER_REGISTRY`**（删一个字段、
+ * 改一个布尔再跑用例），模块级常量会读到改写前的陈旧值 ⇒ 反向验证失效」——
+ * **该机制在本仓库不存在**，实测如下：
+ *
+ * - `PROVIDER_REGISTRY` 是 `Object.freeze([...])`（且有用例锁 `Object.isFrozen`）
+ *   ⇒ **运行时无法改写**；搜 `PROVIDER_REGISTRY.push/splice/sort/...` 与
+ *   `vi.mock('.../provider-registry')` 全仓 **0 命中**。
+ * - 本仓库的反向验证真实形态是**改源文件**再跑（Task 11 的 RV1/RV2 就是如此）。
+ *   改源文件后 vitest 每个测试文件在**独立模块图**里重新加载 ⇒ **模块级常量也会
+ *   重新求值、不会陈旧**。实测对照：把 `zcode` 的 `channel` 改 `false`，
+ *   用模块级常量的文件 **1 红**、用函数调用的文件 **2 红** —— 两侧都捕到。
+ *
+ * 那为什么仍优先用函数？因为它让「期望集合的求值」与「测试文件的顶层求值时机」
+ * 解耦：调用方普遍在 `beforeEach` / 用例体内现取（并各自 `.sort()` 副本），
+ * 不依赖「本文件被 import 的那一刻 registry 已经是什么样」，也避免将来引入
+ * `apply()` 期注册、`vi.mock` 或 `vi.resetModules` 时踩到模块级快照。
+ * ⇒ 结论（用函数）不变，但**理由要写成「时机解耦 / 鲁棒性」**。
+ *
+ * ⚠️ 反例（**刻意保留的手写清单**）：`tests/helpers/rpc-refresh.ts` 的
+ * `EXPECTED_REFRESH_PROVIDER_IDS` 与 `tests/unit/jet-hub-rpc-auth-wiring.spec.ts`
+ * 的 `EXPECTED_AUTH_PROVIDER_IDS` 是**模块级常量**（`= expectedProviderIdsWithAuth()`）。
+ * 它们在当前机制下**同样有效**（见上对照实验）；若将来真要防「常量快照」，
+ * 应改的是这两个调用点，而不是本文件的理由。
  *
  * ## ⚠️ 为什么这些判据不该由 `src/` 导出
  *
@@ -113,9 +136,27 @@ export const CREDITS_TABLE_EXEMPT: ReadonlyMap<string, string> = new Map([
  * **期望**进生产积分表（`createProviderCredits()`）的 provider id 集合
  * —— 唯一判据：`credits.balance === true` 减去 {@link CREDITS_TABLE_EXEMPT}。
  *
- * ⚠️ 判据是 `credits.balance === true`（**声明了余额能力**）而不是 `channel`
- * —— 两者实测不等价：`aggregate` 的 `balance` 是 `false` 而它同时也不是
- * `channel`；用错判据会把「声明了余额却没进表」的真漏接掩盖过去。
+ * ⚠️ 判据是 `credits.balance === true`（**声明了余额能力**）而不是 `channel`。
+ *
+ * ⚠️⚠️ **但两者的「取值集合当前恰好一致」—— 不要写成「实测不等价」**
+ * （2026-10-08 独立复审修正；原注释声称「`aggregate` 的 `balance` 是 `false`
+ * 而它同时也不是 `channel`」，**该论据是错的**：`aggregate` 两边都是 `false`，
+ * 证明不了任何差异）。
+ *
+ * 实测（15 家 descriptor，逐个比对）：`channel === true` 与
+ * `credits.balance === true` **各 14 家、id 逐字相同**，双向差集皆空；
+ * 把本函数的判据换成 `channel`，产出**仍是同一个 11 元素集合**。
+ * 13 vs 11 的差额**全部来自两张豁免表**（`qoder` / `qodercn` 只在
+ * {@link CREDITS_TABLE_EXEMPT} 里），与判据无关。
+ *
+ * 那为什么仍要用 `credits.balance`？因为它才是**声明语义**的那一个：
+ * `channel` 表达「有没有账号 / 凭据 / 积分」，`credits.balance` 表达
+ * 「声明了余额能力」—— 两件事。当前取值一致是**巧合**（且已出现语义分叉的
+ * 苗头：`opencode` 的 `balance: true` 语义其实是「通道可用性」而非余额，
+ * 见 `CREDITS_TABLE_EXEMPT` 的理由）。一旦将来某家声明了 `balance` 却不
+ * `channel`（或反之），用错判据就会把「声明了余额却没进表」的真漏接**掩盖过去**。
+ * ⇒ 结论（用 `balance`、两张表不合并）不变，但**理由必须是「语义不同」，
+ * 不能是「实测不等价」**。
  *
  * ⚠️ 2026-10-08（Task 11-F）：本判据原先在 `credits-runtime-parity.spec.ts`
  * （**同一文件里两处**）与 `provider-runtime-wiring.spec.ts` 里各写了一遍
@@ -125,4 +166,76 @@ export function expectedProviderIdsInCreditsTable(): string[] {
   return PROVIDER_REGISTRY
     .filter((d) => d.credits.balance === true && !CREDITS_TABLE_EXEMPT.has(d.id))
     .map((d) => d.id)
+}
+
+/**
+ * **会写 `modelRateLimits`、却刻意不注册 probe 的 provider**（Task 8 复审补齐）。
+ *
+ * ## ⚠️ 此表的语义与前面两张**都不同**，不要合并
+ *
+ * 前面两张回答「谁该有 auth」「谁该进积分表」；这张回答
+ * 「**谁有可清的限流标记、却拿不到探测材料**」。
+ *
+ * 判据（机械可核，写在这里以免后人靠记忆）：
+ *
+ *     grep -n 'updateModelRateLimit(' src/*.ts    # 池侧写点
+ *     grep -n 'markLimited' src/*.ts              # 适配器侧注入点
+ *
+ * 实测：**会写标记的共 13 家**（buddy / workbuddy / lobsterai / qoder /
+ * qodercn / cline / zcode / trae / gemini / codearts / loomy / raccoon /
+ * opencode）。`src/index.ts` 的 `probeById` 登记其中 **12 家** ⇒
+ * 本表必须**恰好列出剩下的那 1 家**，否则
+ * `tests/unit/probe-wiring.spec.ts` 会点名变红。
+ *
+ * ## 为什么 `opencode` 拿不到探测材料（逐条实测，不是猜测）
+ *
+ * `ProbeDeps` / `createProbeAdapter(refName, credential)` 只给**一个账号的凭据**，
+ * 而 `OpencodeAdapter` 的构造需要的是 `identitySlots: () => Promise<readonly
+ * IdentitySlot[]>`（整个槽序列）+ `fetchRemoteCatalog` + `disabledModels` ——
+ * 尤其 `markLimited` 的 `slotId` 语义是**池条目 id**，与探测入参的
+ * `refName`（凭据 ref）不是同一个键空间。探测路径刻意不传 `accountPool`
+ *（见 `probeWithAdapter` 的注释），故**无法**在探测时重建槽序列。
+ * ⇒ 补它需要给 `ProbeDeps` 加一条池透传通道，属**接口扩张**，不在 Task 8 范围内。
+ *
+ * ⚠️ **这是一个登记在案的缺口，不是「它不需要」**：`opencode` 没有
+ * `rateLimit: false` 豁免 ⇒ 客户端「重测」按钮**会渲染**（门控是
+ * `supportsRateLimit`，缺省 `true`）⇒ 用户点了会拿到
+ * 「`opencode` 没有探测适配器」的错误。
+ * **原注释把这件事写成「opencode 不写标记，故不需要 probe」，是事实错误**
+ *（2026-10-08 独立复审实测证伪），本表存在的意义就是把它记为缺口而非豁免。
+ */
+export const PROBE_EXEMPT: ReadonlyMap<string, string> = new Map([
+  [
+    'opencode',
+    '探测入参只有一个账号的凭据，而它的适配器需要整个 identitySlots 序列 + 池条目 id '
+    + '（slotId 与 refName 不是同一键空间）；补它要给 ProbeDeps 加池透传，属接口扩张',
+  ],
+])
+
+/**
+ * **期望**注册进 `src/index.ts` 的 `probeById`（可重测）的 provider id 集合
+ * —— 唯一判据：**会写 `modelRateLimits`** 的家减去 {@link PROBE_EXEMPT}。
+ *
+ * ## ⚠️ 为什么不能直接写 `channel − PROBE_EXEMPT`
+ *
+ * 会写标记的家**不等于** `channel: true` 的家：`minimax` 有 `channel: true`
+ * 但实测**不写**标记（两条 grep 均无命中）⇒ 它**本就不需要** probe，
+ * 不是「漏挂」。若用 `channel` 当判据，会把 minimax 误报成漏挂。
+ *
+ * ## ⚠️ 为什么这张清单硬编码在这里（而不是从 registry 派生）
+ *
+ * 「写不写限流标记」是**代码事实**，registry 里没有这个声明字段。硬编码的风险是
+ * 「有人加了写点却忘了更新本清单」—— 故 `probe-wiring.spec.ts` 额外做一件事：
+ * 对清单里每一家，**去源码里找它的写点证据**（`markLimited` 注入或
+ * `updateModelRateLimit` 调用），找不到即红。这样漏更新本清单时**同样会红**，
+ * 而不是静默通过。
+ */
+export const WRITES_RATE_LIMIT_PROVIDERS: readonly string[] = Object.freeze([
+  'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'cline',
+  'zcode', 'trae', 'gemini', 'codearts', 'loomy', 'raccoon', 'opencode',
+])
+
+/** **期望**注册进 `probeById` 的 provider id（会写标记 − {@link PROBE_EXEMPT}）。 */
+export function expectedProviderIdsWithProbe(): string[] {
+  return WRITES_RATE_LIMIT_PROVIDERS.filter((id) => !PROBE_EXEMPT.has(id))
 }

@@ -1456,7 +1456,21 @@ export class AccountPool {
    *
    * 返回类型原先写死成 `CodeArtsCredential | BuddyCredential` 这个**两家的联合**，
    * 而本池服务 **13 家**，各家凭据形状互不相同 ⇒ 每个调用方都得在结果处
-   * 写一个向具体凭据类型的断言才能用。实测 `src/` 里这样的收窄有 **20 处**。
+   * 写一个向具体凭据类型的断言才能用。
+   *
+   * ⚠️ **处数实测为 21（2026-10-08 独立复审按 `90cc881` 的 diff 逐行复核）** ——
+   * 本节原先写「**20 处**」、而那次 commit 的标题与正文写「**19 处**」，**两个数都不对**。
+   * 复核方式（可复现，不要靠记忆）：
+   *
+   *     git show 90cc881 --unified=0 -- '*.ts' |
+   *       grep -E '^-[^-].*\bas [A-Z][A-Za-z]*Credential\b'
+   *
+   * 命中 **22** 行，其中 **21** 行形如 `<x>.credential as <X>Credential`
+   *（唯一的例外是池内 `JSON.parse(...) as CodeArtsCredential | BuddyCredential`，
+   * 它是**被改成** `as TCredential`、不是被删）。逐处核对过上游 API：
+   * **21 处的上游全部是 `getAvailableAccount`**（`lobsterai-adapter.ts` 那处
+   * 因上下文窗口较窄未被正则识别，人工核对确认同源）。
+   * ⚠️ 所以「这样的收窄」= **21**，不是 19/20 —— 引数时请引这个实测值。
    *
    * ⚠️ **那个断言不是「必要的坏味道」，而是纯粹的噪音**：调用方**自己**知道
    * 它在查哪一家（`this.product.id` 或字面量 id），池却把类型信息擦掉了。

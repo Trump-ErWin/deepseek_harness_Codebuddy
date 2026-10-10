@@ -248,6 +248,11 @@ async function waitForGone(
   }, `占位账号被清理（${accountId}）`)
 }
 
+/** 剥掉注释：接线断言不该因为「注释里提到了某个符号」而通过。 */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
 describe('Gemini Jet Hub 登录接入', () => {
   it('★ account.create 立刻返回真实 Google 授权 URL，并登记一个不可续期的占位账号', async () => {
     const { call, calls } = makeRpc()
@@ -466,7 +471,7 @@ describe('Gemini credits.balances', () => {
 
 describe('Gemini 接线点（源码断言）', () => {
   const here = dirname(fileURLToPath(import.meta.url))
-  const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8')
+  const indexSource = stripComments(readFileSync(resolve(here, '../../src/index.ts'), 'utf8'))
   const rpcSource = readFileSync(resolve(here, '../../src/jet-hub-rpc.ts'), 'utf8')
   // ⚠️ Task 8 起：探测适配器的构造在 `index.ts` 的 `probeById`（account-probe 已改为
   //    查能力注册表），故这里读的是 `index.ts`。

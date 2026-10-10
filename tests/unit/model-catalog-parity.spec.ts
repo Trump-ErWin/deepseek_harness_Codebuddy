@@ -38,17 +38,59 @@
  * | `resolveModel` 给未知模型写死 `contextWindow: 200_000` | 本文件 ③⑤ + `model-catalog.spec.ts` + `minimax-adapter.spec.ts` ×2 |
  * | `listAllModels` 也套黑名单 | 本文件 ④ + `model-catalog.spec.ts` ⑥⑮ |
  *
- * 三处变异均已在验证后还原（还原后 43/43 绿）。
+ * 三处变异均已在验证后还原。
+ * ⚠️ 本行原先写「还原后 43/43 绿」—— 那是在本文件**只有** Task 7 那批用例时记的，
+ * 此后本文件增删过用例，那个数字早已对不上（2026-10-08 复审开始前实测是 **27** 条）。
+ * ⇒ **不要在这个头注里写具体条数**（它必然会腐）；当前条数以 `pnpm test` 的输出为准。
+ *
+ * ## ⚠️ 2026-10-08 复审补做的两组反向验证（针对**全 provider 表驱动段**）
+ *
+ * 上面那张表是 Task 7 当时的记录，**它没有覆盖后来补的表驱动段**。补做如下，
+ * 结论与复现方式都记在这里（别只留在会话里）：
+ *
+ * | 变异 | 实测结果 |
+ * |---|---|
+ * | `model-catalog.ts` 的 `resolveModel` 分支给**未知 id** 写死 `contextWindow: 200_000` | **15 条红**，逐家点名 buddy / workbuddy / cline / zcode / trae / gemini / loomy / raccoon / minimax / qoder / qodercn / lobsterai / codearts（即不变式 g 对每家都有牙） |
+ * | 只把 `trae-adapter.ts` 的 `listAllModels` 委托改成 `return []`（**单家**变异） | **1 条红**，且**只**点名 trae ⇒ 证明 `it.each` 的逐家隔离有效（不是「一家坏全段红」） |
+ *
+ * 两处变异均已在验证后还原（还原后 **42/42** 绿，逐字节还原已校验）。
+ * ⚠️ 第二次的条数（15）**小于** 14+1 是因为 `opencode` 不走骨架 —— 它自己实现
+ * `resolveModel`，故骨架变异**不**影响它，这正是「opencode 独立」的又一处体现。
  */
 
 import { describe, expect, it, vi } from 'vitest'
 
 import { createModelCatalog, type CatalogEntry } from '../../src/model-catalog.js'
+import { BuddyAdapter } from '../../src/buddy-adapter.js'
+import { ClineAdapter } from '../../src/cline-adapter.js'
+import { CodeArtsAdapter } from '../../src/llm-adapter.js'
+import { GeminiAdapter } from '../../src/gemini-adapter.js'
+import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
 import { LoomyAdapter, parseLoomyRemoteModels } from '../../src/loomy-adapter.js'
 import { MinimaxAdapter } from '../../src/minimax-adapter.js'
+import { OpencodeAdapter } from '../../src/opencode-adapter.js'
+import { QoderAdapter } from '../../src/qoder-adapter.js'
 import { RaccoonAdapter } from '../../src/raccoon-adapter.js'
+import { TraeAdapter } from '../../src/trae-adapter.js'
+import { ZcodeAdapter } from '../../src/zcode-adapter.js'
 import { fallbackToEntry } from '../../src/minimax.js'
 import { MINIMAX } from '../../src/minimax-product.js'
+import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
+import { QODER, QODER_CN } from '../../src/qoder-product.js'
+
+/**
+ * 表驱动段共用的构造底座：**不发网络、不读磁盘凭据**。
+ *
+ * ⚠️ `resolveCredential` 返回 `undefined` 是**刻意的**：
+ * 各家目录都应能从**内置兜底表 / 静态目录**读出内容（除 zcode 有自己的
+ * 就绪门控，已单独注入 `isReady`）。若某家因此列不出目录，本段会红并点名 ——
+ * 那说明该家的目录**依赖真实凭据**，是应该知道的事实。
+ */
+const NO_CRED = {
+  credentialRef: 'PARITY_ACCOUNT_TEST' as never,
+  resolveCredential: async () => undefined,
+  refresh: async () => {},
+}
 
 /** 造一个 provider 的骨架（替身池 + 可控目录 + 可控黑名单）。 */
 function makeCatalog(
@@ -271,7 +313,19 @@ describe('createModelCatalog 对拍：⑤ 未知模型与空目录的边界', ()
 })
 
 describe('createModelCatalog 对拍：⑥ listAllModels 的同步契约', () => {
-  it('⚠️ 返回**非 Promise**（11 处既有实现全同步，两处调用方契约也是同步）', () => {
+  it('⚠️ 返回**非 Promise**（11 家委托 + opencode 自己实现，全部同步）', () => {
+    // ⚠️ **家数实测（2026-10-08 独立复审修正）**：本文件原先两处说法**互相矛盾** ——
+    //    这里写「11 处既有实现」，另一节写「13 家实际实现全同步」。**两个都不准确**：
+    //
+    //    - 用 `createModelCatalog` 的家 = **11**（buddy / lobsterai / qoder / cline /
+    //      zcode / trae / codearts / gemini / loomy / raccoon / minimax）；
+    //      `qodercn` 复用 QoderAdapter、`workbuddy` 复用 BuddyAdapter ⇒ 不另计。
+    //    - **`opencode` 不用** `createModelCatalog`（5 处协议级差异，见
+    //      `provider-registry` 侧的说明），它的 `listAllModels` 是**自己实现**的
+    //      一行 map（读静态兜底表），**同样同步**。
+    //    - ⇒ 「同步契约」的覆盖是 **12 家**（11 委托 + 1 自实现）。
+    //    ⚠️ 本条用例测的是**骨架本身**（`makeCatalog`），与实现家数无关 ——
+    //    那个数字只是注释，写准是为了别让人以为「只有 11 家同步」。
     const catalog = makeCatalog([LOOMY_ENTRY])
     const result = catalog.listAllModels()
 
@@ -440,6 +494,165 @@ describe('端到端对拍：loomy（同构组，模态恒为数组）', () => {
   })
 })
 
+describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复审补齐 I-1）', () => {
+  /**
+   * ## ⚠️ 为什么补这一段（补之前这里的覆盖是 3/14）
+   *
+   * 上面三节（minimax / loomy / raccoon）是**同构组代表**，用真实适配器跑了
+   * 完整链路。但实测：**其余 11 家**在「端到端对拍」这个交付物里**零覆盖** ——
+   * 而它们的 `toCatalogEntry` 同样是新写的转换，恰恰是「漏字段」风险所在
+   * （见本文件头注：漏掉的字段通常此前也没人断言）。
+   *
+   * ⇒ 本段把 14 家**全部**接上真实适配器，只断言**跨家不变式**
+   * （不针对某一家写死期望值）：
+   *
+   * | # | 不变式 | 为什么它就是缺陷判据 |
+   * |---|---|---|
+   * | a | `listModels()` 每条 `provider` 回填 == 入参 | 回填错 ⇒ DSH 校验 `info.id === provider` 失败、整个分组消失 |
+   * | b | 每条 `id` / `name` **非空** | 空名 ⇒ 选择器出现空白项（用户无法选） |
+   * | c | `listAllModels()` 同步非 Promise 且条数 ≥ `listModels()` | 设置页靠它渲染**被关闭的**模型；少于则那些模型永久无法重新打开 |
+   * | d | `resolveModel()` 上 **目录里每一个 id** 都不抛错，且逐字段与 `listModels` 同源 | 逐条遍历而不是抽样 —— 抽样会漏掉个别畸形条目 |
+   * | e | `resolveModel()` 的 `defaultEffort` 必须落在 `efforts` 内 | 否则选择器空白（真实报障过） |
+   * | f | `resolveModel()` 声明的 `contextWindow` 必须 > 0 | 0/负数会让 DSH 抛 `INVALID_MODEL_MAX_TOKENS`，**整轮对话起不来** |
+   * | g | **未知 id** 不抛错 | 用户手填模型 id 是正常操作 |
+   *
+   * ⚠️ **每家都实测跑通**（无网络、无真实凭据）：`n` 列见下面的 `CASES` 注释。
+   * 若某家将来改成必须有网络才能列目录，本段会红并点名 —— 那是有用的信号。
+   *
+   * ⚠️ **`opencode` 也进来了**（它不用 `createModelCatalog`）：本段的价值正是
+   * 「**所有**对外注册为 LLM provider 的家，其目录行为的跨家契约一致」——
+   * 把 opencode 排除在外就等于承认它可以是例外，而它同样有
+   * 「名字不能空、未知 id 不能抛、context 不能为 0」的契约。
+   * 它的构造形状不同（需要 `identitySlots`），已在下表单列。
+   */
+  const CASES: ReadonlyArray<{ id: string; make: () => unknown }> = [
+    { id: 'buddy', make: () => new BuddyAdapter({ ...NO_CRED, product: CODEBUDDY } as never) },
+    { id: 'workbuddy', make: () => new BuddyAdapter({ ...NO_CRED, product: WORKBUDDY } as never) },
+    {
+      id: 'cline',
+      make: () => new ClineAdapter({
+        ...NO_CRED,
+        // ⚠️ **两个加载器都必须注入**：默认实现会拉真实网络（实测：不注入时
+        //    本用例超时 5s，因为 `ensureRemoteModels()` 在 `listModels` 里被 await）。
+        loadModels: async () => ({ models: [], warnings: [] }),
+        loadModelsDev: async () => new Map(),
+      } as never),
+    },
+    {
+      id: 'zcode',
+      make: () => new ZcodeAdapter({
+        ...NO_CRED,
+        // zcode 独有的**门控**：未就绪直接返回 `[]`（它不抛错，是为了让 DSH
+        // 隐藏整个分组）。不注入时凭据解析为 undefined ⇒ 恒 0 条 ⇒ 本段对它
+        // 退化成恒真（FALSE COVERAGE），故必须显式就绪。
+        isReady: async () => true,
+      } as never),
+    },
+    { id: 'trae', make: () => new TraeAdapter({ ...NO_CRED } as never) },
+    { id: 'gemini', make: () => new GeminiAdapter({ ...NO_CRED } as never) },
+    { id: 'loomy', make: () => new LoomyAdapter({ ...NO_CRED } as never) },
+    { id: 'raccoon', make: () => new RaccoonAdapter({ ...NO_CRED } as never) },
+    { id: 'minimax', make: () => new MinimaxAdapter({ ...NO_CRED } as never) },
+    { id: 'qoder', make: () => new QoderAdapter({ ...NO_CRED, product: QODER } as never) },
+    { id: 'qodercn', make: () => new QoderAdapter({ ...NO_CRED, product: QODER_CN } as never) },
+    { id: 'lobsterai', make: () => new LobsteraiAdapter({ ...NO_CRED } as never) },
+    { id: 'codearts', make: () => new CodeArtsAdapter({ ...NO_CRED } as never) },
+    {
+      id: 'opencode',
+      make: () => new OpencodeAdapter({
+        ...NO_CRED,
+        // ⚠️ opencode 的目录不来自 `createModelCatalog`（5 处协议级差异），
+        //    它需要整个 `identitySlots` 序列与池的代理映射。
+        identitySlots: async () => [{ refName: 'OPENCODE_A', slotId: 's1' }],
+        accountPool: { opencodeProxyFor: () => undefined } as never,
+      } as never),
+    },
+  ]
+
+  it('⚠️ 表的家数 == 全部对外注册的 LLM provider（漏一家 ⇒ 它不过本段任何断言）', async () => {
+    // ⚠️ 判据来自 **PROVIDER_REGISTRY**（唯一的 provider 真源），不手抄。
+    //    实测：`channel: true` 的 14 家正好是上面 14 家（`aggregate` 是
+    //    `channel: false` 的聚合器，不在此列）。
+    const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
+    const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
+    expect(CASES.map(c => c.id).sort()).toEqual(channels)
+    expect(CASES).toHaveLength(14)
+  })
+
+  /**
+   * ⚠️ 每家一个 `it`（`it.each` 而非循环）：失败时**点名是哪一家**。
+   * 用 `for` 循环包全部家会让第一个失败就中断，后面的家**根本没跑**
+   * （FALSE COVERAGE 的另一种形态）。
+   */
+  it.each(CASES)('$id：跨家目录契约', async ({ id, make }) => {
+    const adapter = make() as {
+      listModels(p: string): Promise<readonly { provider: string; id: string; name: string }[]>
+      resolveModel(p: string, m: string): Promise<{
+        provider: string
+        id: string
+        name: string
+        context?: { contextWindow: number }
+        reasoning?: { efforts: readonly { id: string }[]; defaultEffort?: string }
+      }>
+      listAllModels(): readonly { id: string; name: string }[]
+    }
+
+    // ⚠️ 先断言「列得出来」：若某家恒返回空数组，下面所有 `for` 循环体
+    //    都**从未执行** ⇒ 本用例退化成恒真。这条是防 FALSE COVERAGE 的自检。
+    const listed = await adapter.listModels(id)
+    expect(listed.length, `${id} 的目录为空 —— 下面的逐条断言全部不会执行`).toBeGreaterThan(0)
+
+    // (a)(b) provider 回填 + id/name 非空
+    for (const m of listed) {
+      expect(m.provider, `${id} 的 ${m.id} 回填了错的 provider`).toBe(id)
+      expect(typeof m.id).toBe('string')
+      expect(m.id.length, `${id} 有条目 id 为空`).toBeGreaterThan(0)
+      expect(m.name.length, `${id} 的 ${m.id} 名为空（选择器会出现空白项）`).toBeGreaterThan(0)
+    }
+
+    // (c) listAllModels：同步、非 Promise、条数不少于 listModels
+    const all = adapter.listAllModels()
+    expect(all, `${id} 的 listAllModels 返回了 Promise（契约是同步）`).not.toBeInstanceOf(Promise)
+    expect(Array.isArray(all)).toBe(true)
+    expect(
+      all.length,
+      `${id} 的 listAllModels 比 listModels 少 —— 被关闭的模型会永久无法重新打开`,
+    ).toBeGreaterThanOrEqual(listed.length)
+
+    // (d)~(f) 逐条 resolveModel（**遍历全部**，不抽样）
+    for (const m of listed) {
+      const r = await adapter.resolveModel(id, m.id)
+      expect(r.id, `${id} resolveModel(${m.id}) 回填了错的 id`).toBe(m.id)
+      expect(r.provider, `${id} resolveModel(${m.id}) 回填了错的 provider`).toBe(id)
+      expect(r.name.length, `${id} resolveModel(${m.id}) 名为空`).toBeGreaterThan(0)
+
+      const reasoning = r.reasoning
+      if (reasoning !== undefined) {
+        expect(reasoning.efforts.length, `${id} 的 ${m.id} 声明了空 efforts`).toBeGreaterThan(0)
+        if (reasoning.defaultEffort !== undefined) {
+          expect(
+            reasoning.efforts.map(e => e.id),
+            `${id} 的 ${m.id} defaultEffort 不在 efforts 内（选择器会空白）`,
+          ).toContain(reasoning.defaultEffort)
+        }
+      }
+
+      if (r.context !== undefined) {
+        expect(
+          r.context.contextWindow,
+          `${id} 的 ${m.id} 声明了非正数 contextWindow（DSH 会抛 INVALID_MODEL_MAX_TOKENS）`,
+        ).toBeGreaterThan(0)
+      }
+    }
+
+    // (g) 未知 id 不抛错（用户手填模型 id 是正常操作）
+    const unknown = await adapter.resolveModel(id, 'no-such-model-xyz-2026')
+    expect(unknown.name.length, `${id} 对未知 id 给了空名`).toBeGreaterThan(0)
+    // ⚠️ 且未知模型**不得**声明 context（不编造窗口）。
+    expect(unknown.context, `${id} 给未知 id 编造了 contextWindow`).toBeUndefined()
+  })
+})
+
 describe('端到端对拍：raccoon（同构组）', () => {
   function makeRaccoon(models: readonly Record<string, unknown>[]) {
     return new RaccoonAdapter({
@@ -468,7 +681,7 @@ describe('端到端对拍：raccoon（同构组）', () => {
 })
 
 describe('端到端对拍：跨家不变式（不针对某一家）', () => {
-  it('⚠️ listAllModels 是**同步**的（13 家实际实现全同步，契约也同步）', () => {
+  it('⚠️ listAllModels 是**同步**的（11 家委托 + opencode 自实现，全部同步）', () => {
     const adapter = new MinimaxAdapter({
       credentialRef: 'MINIMAX_ACCESS_TOKEN' as never,
       resolveCredential: async () => undefined,
