@@ -55,7 +55,7 @@ import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
 import { LOBSTERAI } from './lobsterai-product.js'
-import { descriptorOf } from './provider-registry.js'
+import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
 import { createProviderOnboarding, onboardingOf } from './provider-onboarding.js'
 import type { ProviderCallContext, ProviderCredits, ProviderOnboarding } from './provider-runtime.js'
@@ -98,7 +98,7 @@ import {
   type ClaimOutcome,
   type CreditBalance,
 } from './credits.js'
-import { CODEBUDDY, WORKBUDDY, productById, type BuddyProduct } from './product.js'
+import { CODEBUDDY, productById, type BuddyProduct } from './product.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
 /**
  * ⚠️ **`collectBuddyGrowth` 已搬到 `src/buddy-growth.ts`**（2026-10-08 Task 4），
@@ -458,14 +458,23 @@ export function buildRaccoonNickname(
  * 仍未登记的渠道（CodeArts / Qoder / Cline / Raccoon / Minimax / ZCode / Gemini /
  * OpenCode）：余额响应里没有逐包到期时间，或根本没有资源包列表 ——
  * 分不出两桶，登记进来只会多一个无效开关。
+ *
+ * ## ⚠️ 2026-10-08 起从 `PROVIDER_REGISTRY` 派生
+ *
+ * 原先这是一份手抄 `Set`，而客户端 `supportsPermanentLock` 读的是 registry 的
+ * `permanentLock` 字段 ⇒ **两处必须一致**（不一致会出现「按钮渲染出来了，
+ * 点了却报 bad-request」）。现在两侧同出一个字段，不再可能漂移。
+ * 上面那张「分桶依据」表已随值迁移到 registry 里各条的注释。
+ *
+ * ⚠️ **本常量是模块级、但这里安全**：它只读 `PROVIDER_REGISTRY`（Task 1 的
+ * **静态数据**），**不读 runtime 注册表** —— 后者要到 `apply()` 才填充，
+ * 模块级求值会得到空集（`WIRED_EXPIRY_PROVIDERS` 那条注释记的正是这个陷阱，
+ * 但那里是**刻意**保持常量的，理由见 `aggregate-expiry.ts`）。
+ * 判据是「读的是不是静态数据」，不是「是不是模块级常量」。
  */
-export const PERMANENT_LOCK_PROVIDERS: ReadonlySet<string> = new Set([
-  LOOMY.id,
-  CODEBUDDY.id,
-  WORKBUDDY.id,
-  LOBSTERAI.id,
-  TRAE.id,
-])
+export const PERMANENT_LOCK_PROVIDERS: ReadonlySet<string> = new Set(
+  PROVIDER_REGISTRY.filter((d) => d.permanentLock === true).map((d) => d.id),
+)
 
 /**
  * 汇总一次批量领取的结果。

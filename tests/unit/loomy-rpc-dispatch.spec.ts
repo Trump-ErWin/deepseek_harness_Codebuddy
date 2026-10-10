@@ -3,6 +3,7 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { descriptorOf } from '../../src/provider-registry.js'
+import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const rpcSource = readFileSync(resolve(here, '../../src/jet-hub-rpc.ts'), 'utf8')
@@ -91,15 +92,18 @@ describe('Loomy RPC 分派', () => {
     //    收敛成一处查表分派（`authOf(auths, entry.provider)`），该分支里
     //    **不再出现 `LOOMY.id`**。
     //    实测（2026-10-08，**复审时逐处重新测量**，不采信旧数）：本文件
-    //    （= `src/jet-hub-rpc.ts` 的**源码文本**，不是本 spec 文件）共 **8** 处
+    //    （= `src/jet-hub-rpc.ts` 的**源码文本**，不是本 spec 文件）共 **7** 处
     //    `LOOMY.id`，逐处为：
-    //      ① `PERMANENT_LOCK_PROVIDERS` 集合；②~④ account.create 的 loomy
+    //      ①~③ account.create 的 loomy
     //      微信登录分支（`else if` 判据 / `provider:` 字段 / 失败告警）；
-    //      ⑤ login.sendSms；⑥ login.submitSms；
-    //      ⑦ loomy.permanentLock 老别名；⑧ **注释里的一处**（`onboarding.status`
+    //      ④ login.sendSms；⑤ login.submitSms；
+    //      ⑥ loomy.permanentLock 老别名；⑦ **注释里的一处**（`onboarding.status`
     //      那段记录「被删掉的手抄判据」的文字，不是代码）。
     //    ⚠️ 其中**没有** `onboarding.*` 的代码分支 —— 它已被 Task 4 收敛成查表
-    //    （见 `src/provider-onboarding.ts`），第 ⑧ 处只是提到它。
+    //    （见 `src/provider-onboarding.ts`），第 ⑦ 处只是提到它。
+    //    ⚠️ 也**不再有**「`PERMANENT_LOCK_PROVIDERS` 集合」那一处（2026-10-08，
+    //    Task 5）：该集合已改为从 `PROVIDER_REGISTRY` 派生 ⇒ 字面量搬走了
+    //    （故计数由 8 降为 7，**不是**有分支被删）。
     //    `>= 5` 这个阈值仍被满足，但**理由已换成这些真协议分支**，
     //    与 account.refresh 无关 —— 写成「含 refresh」会让下一个读者以为那个
     //    case 还在。
@@ -185,9 +189,25 @@ describe('Loomy RPC 分派', () => {
   })
 
   it('后端有 provider 白名单，且与 Loomy/Buddy 的支持面一致', () => {
-    expect(rpcSource).toMatch(/PERMANENT_LOCK_PROVIDERS[\s\S]{0,200}LOOMY\.id/)
-    expect(rpcSource).toContain('CODEBUDDY.id')
-    expect(rpcSource).toContain('WORKBUDDY.id')
+    // ⚠️ 2026-10-08 改（Task 5）：原先第一条断言扫源码文本，要求
+    //    `PERMANENT_LOCK_PROVIDERS` 之后 200 字符内出现 `LOOMY.id` —— 那锁的是
+    //    **手写 Set 字面量**这个写法。本次重构把该集合改为**从 registry 派生**
+    //    （`PROVIDER_REGISTRY.filter(d => d.permanentLock === true)`）⇒ 三个
+    //    `XXX.id` 字面量全部搬家，文本断言变红而**行为完全没变**。
+    //
+    //    ⇒ 改为断言**值**（该集合真的含这三家），并保留「端点必须查这个集合」
+    //      这条结构断言（它守的是「不得绕过白名单直接放行」）。
+    //    ⚠️ 用 id 字面量而不是 `LOOMY.id` 等常量：本文件**不 import** 那些
+    //      product 模块（它整体是「读源码文本」的 spec），而 id 值由
+    //      `descriptorOf` 那几条断言与 registry 对账守着。
+    //    ⚠️ 「集合 == registry 里 permanentLock === true 的那些」由
+    //      `provider-registry-consumers.spec.ts` 的
+    //      「支持锁定的渠道 ⊆ usesExpiryWindow ∪ {loomy}」逐项对账，
+    //      「前后端支持面一致」由 `credits-capabilities.spec.ts` 守 —— 本文件
+    //      不重复那条不变式（重复会变成「同一语义两套判据」）。
+    for (const id of ['loomy', 'buddy', 'workbuddy']) {
+      expect(PERMANENT_LOCK_PROVIDERS.has(id), `${id} 应在永久积分锁定白名单里`).toBe(true)
+    }
     expect(rpcSource).toMatch(/PERMANENT_LOCK_PROVIDERS\.has\(provider\)/)
   })
 
