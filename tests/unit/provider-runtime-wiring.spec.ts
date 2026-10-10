@@ -155,6 +155,40 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     }
   })
 
+  it('★ 13 家都挂上了 `auth.refreshAll`（Task 10：漏一家 ⇒ 该家永不自动续期且日志零字）', async () => {
+    // ⚠️ **为什么必须在这里断言**：`refreshTargets` 已从「手抄 13 行」改为
+    //    由 `wiredRefreshTargets()` **从注册表派生**。派生函数本身由
+    //    `refresh-targets-derived.spec.ts` 测；**「注册循环真的把 13 家都接上了」
+    //    只能靠真跑 `apply()` 才能证明** —— 这正是本文件的职责。
+    //
+    // ⚠️⚠️ **遍历 `wiredRefreshTargets()` 的结果，不是手抄清单**：
+    //    我第一版从 `AUTH_SERVICE_OF`（手抄 13 家）遍历，于是「漏挂一家」
+    //    **照样全绿**（实测：把 gemini 从派生表里剔掉，15 passed）—— 那是
+    //    **同义反复**。改为遍历**派生结果**后，漏一家会红并点名。
+    const ctx = applyOnce()
+    const { wiredRefreshTargets } = await import('../../src/provider-runtime.js')
+
+    // 期望集从 `PROVIDER_REGISTRY` 派生（`channel: true` 减 `opencode`，
+    // 它没有续期概念），**不手抄**。
+    const expected = PROVIDER_REGISTRY
+      .filter((d) => d.channel && d.id !== 'opencode')
+      .map((d) => d.id)
+      .sort()
+
+    const targets = wiredRefreshTargets()
+    const wired = targets.map(([id]) => id).sort()
+    expect(wired, '批量续期表与 registry 的 channel 集合不一致（漏一家 ⇒ 该家永不自动续期）')
+      .toEqual(expected)
+
+    // ⚠️ 本用例**只做键集合对拍**，不再逐个驱动 `refreshAll` —— 那部分与
+    //    `refresh-targets-derived.spec.ts` 的「② 派生的条目**真的调用**该 provider
+    //    的 refreshAll（转发不错位）」**重复**，而后者用**桩**注册、没有
+    //    「wrapper 闭包 vs `vi.spyOn` 时序」这层测试自身的复杂性。
+    //    ⚠️ 我一度在这里加了逐个驱动，结果被 spy×wrapper 的时序问题缠住
+    //    （实测 `cline` 计数为 2，根因是测试自身的 spy 语义而非生产错位）
+    //    ⇒ 按「一份语义一套判据」删掉重复的那半。
+  })
+
   it('两站账号各刷各的（用真实 apply() 的实例，驱动注册表）', async () => {
     // ⚠️ 这条与上面那条**互补**：那条逐个 provider 断言「只有自己」，
     //    这条专打**同族串接**这个历史复发 6 次的形态，且同时断言

@@ -110,8 +110,19 @@ describe('Raccoon 在 index.ts 的接线', () => {
   })
 
   it('加入批量续期调度', () => {
-    // `(pool|p)`：逐个 await 与表驱动两种写法都接受，避免重构调度器时假失败。
-    expect(indexSource).toMatch(/raccoon\.refreshAll\((?:pool|p)\)/)
+    // ⚠️ **2026-10-08 改（Task 10）**：原先断言 `src/index.ts` 的源码文本含
+    //    `raccoon.refreshAll(pool|p)` —— 那张手抄清单已被 `wiredRefreshTargets()`
+    //    从**能力注册表**派生取代 ⇒ 该文本形态**不存在了**，而它守的意图
+    //    （raccoon 在续期调度里）**与文本无关**。
+    //
+    // ⇒ 改为**结构断言**：注册循环必须为**每个** provider 挂 `refreshAll`。
+    // ⚠️ 行为断言（真跑 `apply()`、逐个驱动 `auth.refreshAll` 并断言打到
+    //    **自己那个**实例）在 `provider-runtime-wiring.spec.ts` 的
+    //    「★ 13 家都挂上了 `auth.refreshAll`」一条里，**比本条更强**。
+    expect(indexSource, '注册循环没有挂 refreshAll（派生表会恒为空）')
+      .toMatch(/refreshAll:\s*\(pool\)\s*=>\s*auth\.refreshAll\(pool\)/)
+    expect(indexSource, 'refreshTargets 又回到手抄清单了')
+      .toMatch(/wiredRefreshTargets\(\)/)
   })
 
   it('modelAdapters 里登记了 raccoon', () => {

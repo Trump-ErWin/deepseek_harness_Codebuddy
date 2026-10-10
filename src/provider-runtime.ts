@@ -50,6 +50,7 @@
 
 import type { ProviderDescriptor } from './provider-registry.js'
 import type { AccountPool } from './account-pool.js'
+import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { CheckinStatus, ClaimOutcome, CreditBalance } from './credits.js'
 import type {
   ProviderAccountEntry,
@@ -128,6 +129,29 @@ export interface ProviderRuntime {
      * 但别把它当成「生产会用到」的接口来依赖：**要接生产消费点，先改这段注释。**
      */
     refreshAccount(refName: string, pool: AccountPool, accountId: string): Promise<void>
+    /**
+     * 批量续期该 provider 的**全部账号**（启动首轮 + 30 分钟定时器）。
+     *
+     * ## ⚠️ 两条过滤铁律（AGENTS.md）
+     *
+     * 1. **只按凭据材料过滤，不看 `enabled`**：停用只影响自动选号，与
+     *    「凭据是否需要保持新鲜」无关 —— 停用账号同样出现在面板上并参与积分领取。
+     *    ⚠️ 真实缺陷：两处都按 `enabled` 过滤 ⇒ 停用期间 refresh_token 一路放到失效，
+     *    用户重新启用后拿到的是死凭据，只能重新登录。
+     * 2. **也不能按池里的 `refreshable` 过滤**：那个布尔是被对账的**结果**，
+     *    拿它当门禁会把一次瞬时失败固化成**单向门**（账号从此永不自愈 —— 真实事故
+     *    「codearts 出现 2 个 401，自动续期没有工作吗？重启也还是 401」）。
+     *
+     * ## 谁提供它
+     *
+     * 13 家全部提供（`buddy`/`workbuddy` 与 `qoder`/`qodercn` 是同类两实例）。
+     * ⚠️ 各家签名**实测完全一致**（`(pool: AccountPool) => Promise<void>`，
+     * 见 `grep -n 'async refreshAll(' src/*-auth.ts`）⇒ 无需逐家适配。
+     *
+     * ⚠️ **漏挂一家 ⇒ 该家凭据永不自动续期**，而症状只是「每隔一段时间就要重新登录」，
+     * **日志里一个字都没有**。⇒ `wiredRefreshTargets()` 从本表派生 + 用例锁住。
+     */
+    refreshAll?(pool: AccountPool): Promise<void>
   }
 
   /**
@@ -251,6 +275,44 @@ export interface ProviderRuntime {
    * ⚠️ **要接生产消费点，先改这段注释。**
    */
   readonly onboarding?: ProviderOnboarding
+  /**
+   * 「重测」用的**探测适配器工厂**（Task 8）。
+   *
+   * ## 它解决什么
+   *
+   * `src/account-probe.ts` 原先是一条 `else if (provider === …)` 链，末尾的 `else`
+   * 兜底把**未登记的 provider** 交给「**华为云 HMAC 签名**的 `CodeArtsAdapter`」去发
+   * 别家凭据 ⇒ 探测必然失败，而该 provider 的限流标记（UTC+8 当日 24:00）
+   * **永远清不掉**（症状只是「重测按钮点了没用」，极难定位）。
+   *
+   * ⚠️ 该缺陷**同型复发 4 次**（workbuddy → trae → qoder/qodercn/cline → zcode），
+   * 根因是「清单靠记忆维护」。⇒ 改为查本表：**未登记 ⇒ 抛可读错误**。
+   *
+   * ## ⚠️ 为什么返回**实例**而不是参数对象
+   *
+   * 各家探测差异是**真实的协议差异**，不是参数差异：
+   * - `zcode` 要传 `product`（且它的 captcha 通道有已知取舍）；
+   * - `gemini` 要 `sessionLane: smoke`（否则探测流量与真实推理混进同一会话）
+   *   **且**显式钉 `project`（走自动探测会先多打一次 `loadCodeAssist`，
+   *   它失败时会报「项目号探测失败」而掩盖用户真正想知道的「账号仍受限」）；
+   * - `trae` 不传 `product`（只有一个产品，适配器内部默认 `TRAE`）。
+   *
+   * ⇒ 本域抽象的是「**按 provider 找到那个工厂**」，
+   * **不是**「统一怎么造适配器」（设计文档 §3.5 的边界：抽象编排，不抽象协议）。
+   *
+   * ⚠️ **未注册的 provider 不会重测**：这不是缺陷，而是**行为收紧** ——
+   * 客户端能力表 `accountTest` 目前**只有 `gemini`**，其余渠道根本没有入口。
+   */
+  readonly probe?: {
+    /**
+     * 造一个**只用于探测**的轻量适配器（不落盘、不续期、不拉目录）。
+     *
+     * ⚠️ 调用方（`probeWithAdapter`）已刻意**不传** `accountPool` /
+     * `fetchRemoteModels`，并把 `refresh` 设为 no-op：探测只测这一个账号、
+     * 不写限流标记、不触发全局续期、不为一次探测额外拉目录。
+     */
+    createProbeAdapter(refName: string, credential: unknown): LlmAdapter
+  }
 }
 
 /** 一个 provider 的积分能力实现（见 {@link ProviderRuntime.credits}）。 */
@@ -557,4 +619,40 @@ export function clearProviderRuntimes(): void {
  */
 export function registeredRuntimeIds(): string[] {
   return [...runtimes.keys()]
+}
+
+/**
+ * 派生出「**批量续期表**」：provider id → 它的 `refreshAll`（Task 10）。
+ *
+ * ## 为什么需要它
+ *
+ * `src/index.ts` 原先**手抄 13 行** provider 清单。它的失效形态极隐蔽：
+ * **漏一家 ⇒ 该家凭据永不自动续期**，而症状只是「每隔一段时间就要重新登录」，
+ * **日志里一个字都没有**（`src/index.ts` 的原注释记录了这一点）。
+ * ⇒ 改为从本表派生：**有 `auth.refreshAll` 的才进表**。
+ *
+ * ## ⚠️⚠️ 必须是**函数**，不能是模块级常量
+ *
+ * 注册发生在 `apply()`（`registerProviderRuntime`），而模块级常量在**模块加载时**
+ * 求值 ⇒ 常量版本**恒为空表** ⇒ **所有 provider 都不再自动续期**，而日志里
+ * 只有 `isPoolEmpty` 的常规输出。
+ * （与 `aggregate-expiry.ts` 的 `wiredExpiryProviders()` 是**同一类陷阱**。）
+ *
+ * ## ⚠️ `this` 绑定
+ *
+ * 各家的 `refreshAll` 是**类方法**、内部用 `this.product` / `this.ctx`。
+ * ⇒ 必须包一层 `.call(rt.auth, pool)`；直接传 `rt.auth.refreshAll` 引用会丢 `this`，
+ * 调用即抛 `Cannot read properties of undefined`。
+ * （Task 2 的 `refreshAccount` 也用包一层的方式，同因。）
+ */
+export function wiredRefreshTargets(): Array<readonly [string, (pool: AccountPool) => Promise<void>]> {
+  const out: Array<readonly [string, (pool: AccountPool) => Promise<void>]> = []
+  for (const [id, rt] of runtimes) {
+    const refreshAll = rt.auth?.refreshAll
+    // ⚠️ 判据是**方法存在**，不是「有 auth 域」—— 只注册了 `refreshAccount`
+    //    的 provider 不该进表（它的账号无法批量续期）。
+    if (refreshAll === undefined) continue
+    out.push([id, (pool: AccountPool) => refreshAll.call(rt.auth, pool)])
+  }
+  return out
 }

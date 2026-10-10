@@ -73,7 +73,23 @@ import { MINIMAX } from './minimax-product.js'
 //    brief 原稿称「Task 1 已加过 `descriptorOf`，合并进同一行」，实测**没有** ——
 //    故 Task 2 才把它并进本行。
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
-import { registerProviderRuntime, expiryOf } from './provider-runtime.js'
+import { registerProviderRuntime, expiryOf, wiredRefreshTargets, type ProviderRuntime } from './provider-runtime.js'
+// ⚠️ Task 8：探测适配器的**构造**从 `account-probe.ts` 搬到本文件（注册处）——
+//    那里已改为查注册表，未登记则抛错（不再有 `else` 兜底交给 CodeArtsAdapter）。
+//    ⇒ 这里需要**全部 10 家**会写 `modelRateLimits` 的适配器类（含 loomy / raccoon，
+//    旧链漏了它们 = 同型缺陷第 5 次）。
+import { BuddyAdapter } from './buddy-adapter.js'
+import { LobsteraiAdapter } from './lobsterai-adapter.js'
+import { QoderAdapter } from './qoder-adapter.js'
+import { ClineAdapter } from './cline-adapter.js'
+import { ZcodeAdapter } from './zcode-adapter.js'
+import { TraeAdapter } from './trae-adapter.js'
+import { CodeArtsAdapter } from './llm-adapter.js'
+import { GeminiAdapter } from './gemini-adapter.js'
+import { LoomyAdapter } from './loomy-adapter.js'
+import { RaccoonAdapter } from './raccoon-adapter.js'
+import type { ZcodeCredential } from './zcode.js'
+import { GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
 import { createProviderOnboarding, onboardingOf } from './provider-onboarding.js'
 import type { MinimaxCredential } from './minimax.js'
@@ -96,7 +112,7 @@ import {
   ensureDefaultAnonymousSlot, listIdentitySlots, type PoolEntrySnapshot,
 } from './opencode-auth.js'
 import { OPENCODE } from './opencode-product.js'
-import { deriveProjectId, opencodeUserAgent } from './opencode.js'
+import { deriveProjectId } from './opencode.js'
 import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './opencode-capability.js'
 import { closeAllProxyDispatchers } from './opencode-proxy.js'
 import { execFile } from 'node:child_process'
@@ -289,6 +305,175 @@ export function makeReadImageRequest(ctx: Context) {
       return undefined
     }
   }
+}
+
+/**
+ * 「重测」用的**探测适配器工厂**（Task 8）。
+ *
+ * ⚠️ 各家代码**逐字**从 `src/account-probe.ts` 的 `else if` 链搬来（含各自的
+ * 注释）；那条链已删除，改为查本表（**未登记 ⇒ 抛可读错误**）。
+ *
+ * ## 谁必须在这里
+ *
+ * 判据是「该 provider 会不会写 `modelRateLimits`」（写了才有重测语义）。
+ * 核对方式机械、不要靠记忆：
+ *
+ *     grep -n 'updateModelRateLimit(' src/*.ts
+ *
+ * 命中的适配器：buddy（含 workbuddy）/ lobsterai / qoder（含 qodercn）/
+ * cline / zcode / trae / gemini / codearts / **loomy** / **raccoon**。
+ *
+ * ⚠️⚠️ **`loomy` 与 `raccoon` 是本次顺带修掉的第 5 次同型缺陷**：
+ * 旧 `else if` 链里**没有它们的分支** ⇒ 它们落入 `else`，被交给
+ * 「华为云 HMAC 签名」的 `CodeArtsAdapter` 去发自己的凭据 ——
+ * 探测必然失败，而它们的限流标记（UTC+8 当日 24:00）**永远清不掉**。
+ * 两者都实测会写 `modelRateLimits`（`loomy-adapter.ts` / `raccoon-adapter.ts`）。
+ *
+ * ⚠️ 反例：`minimax` **不写**标记 ⇒ 不需要 probe（实测 grep 无命中）。
+ * `opencode` 同理（它的余额是本地派生的通道可用性，零网络）。
+ *
+ * ⚠️ **`accountTest` 目前只有 `gemini` 为 true** ⇒ 其余渠道在 UI 上**没有**
+ * 重测按钮入口（`jet-hub.js` 的 `onTest: supportsAccountTest(provider)`）。
+ * 故本表的完整性是**内部契约**，不是当前用户可见功能 —— 但缺一家就会在
+ * 「将来给某家开入口」时立刻复发旧缺陷。
+ */
+export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = {
+  // CodeBuddy 系（buddy / workbuddy）→ BuddyAdapter，按各自 product 发请求。
+  buddy: {
+    createProbeAdapter: (ref, credential) => new BuddyAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as BuddyCredential,
+      refresh: async () => {},
+      product: CODEBUDDY,
+    }),
+  },
+  workbuddy: {
+    createProbeAdapter: (ref, credential) => new BuddyAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as BuddyCredential,
+      refresh: async () => {},
+      product: WORKBUDDY,
+    }),
+  },
+  // LobsterAI → 自己的端点与头族。
+  lobsterai: {
+    createProbeAdapter: (ref, credential) => new LobsteraiAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as LobsteraiCredential,
+      refresh: async () => {},
+      product: LOBSTERAI,
+    }),
+  },
+  // Qoder 国际版与中国版**共用同一个适配器类**，差异全在 product 配置里
+  //（区域端点、client_id、模型表）。探测只发一次最小纯文本请求，不涉及
+  // 工具/图片，故除了 product 之外无需注入其它钩子；`uid` 由凭据自身携带
+  //（旧凭据缺 uid 时适配器会明确报错，而不是发出必然失败的请求）。
+  qoder: {
+    createProbeAdapter: (ref, credential) => new QoderAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as QoderCredential,
+      refresh: async () => {},
+      product: QODER,
+    }),
+  },
+  qodercn: {
+    createProbeAdapter: (ref, credential) => new QoderAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as QoderCredential,
+      refresh: async () => {},
+      product: QODER_CN,
+    }),
+  },
+  // Cline → WorkOS 凭据 + 自己的端点。
+  cline: {
+    createProbeAdapter: (ref, credential) => new ClineAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as ClineCredential,
+      refresh: async () => {},
+      product: CLINE,
+    }),
+  },
+  // ZCode（智谱）→ Anthropic Messages 体 + 阿里云 captcha 参数。
+  //
+  // ⚠️ 已知取舍：探测路径**没有** `mintCaptcha` 透传通道（`ProbeDeps` 里没有
+  // 这一项），故**一旦上游索要验证**，这里的适配器就**自建**一个常驻浏览器
+  //（上游不要验证时压根不 mint，也就不会拉）。若宿主里已有 `index.ts`
+  // 注入的那台（`zcode.mintCaptcha`），短时会并存两台（约 200MB/台）。
+  // 这仍然远好于旧缺陷的形态 —— 落 else 会被交给**华为云 HMAC 签名**的
+  // `CodeArtsAdapter` 去发 zcode 凭据，探测必然失败，而 zcode 的额度标记
+  //（UTC+8 当日 24:00）会一直清不掉。
+  // 后续若要消除这层浪费，应给 `ProbeDeps` 加一条 `mintCaptcha` 透传，
+  // 与 `index.ts` 的 `zcode.mintCaptcha` 共用同一台常驻浏览器。
+  zcode: {
+    createProbeAdapter: (ref, credential) => new ZcodeAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as ZcodeCredential,
+      refresh: async () => {},
+      product: ZCODE,
+    }),
+  },
+  // TRAE → SOLO 格式请求体 + Cloud-IDE-JWT 头族。
+  // 只有一个产品（`TRAE` 常量），没有 productById 式的查表，故直接按 id 注册。
+  // 不传 product → TraeAdapter 内部默认用 TRAE。
+  trae: {
+    createProbeAdapter: (ref, credential) => new TraeAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as TraeCredential,
+      refresh: async () => {},
+    }),
+  },
+  // Gemini（Cloud Code Assist）。
+  //
+  // 探测只发一次最小纯文本请求，不涉及图片/工具，故除 product 与 lane 外
+  // 无需其它钩子。
+  //
+  // ⚠️ lane 必须是 `smoke`：原版实测冒烟路径与推理路径的 sessionId **不同**
+  //（同 prompt 同预算下取值不同，说明 lane 进了哈希）。不传会让探测流量与
+  // 真实推理混进同一个会话，污染会话归并与 thoughtSignature 回填。
+  //
+  // ⚠️ `project` **显式钉兜底串**，与「刻意不传 accountPool / fetchRemoteModels」
+  // 同一个理由：探测是**轻量存活检查**，要的是一次到推理端点的真请求。
+  // 若走自动探测，会先多打一次 `loadCodeAssist`，且 LCA 失败（限流/网络抖动）
+  // 会让探测报「项目号探测失败」而不是它真正要报的「账号仍受限」—— 反而掩盖
+  // 了用户点「重测」想知道的答案。探测**不写**任何东西（不传 persistProject）。
+  gemini: {
+    createProbeAdapter: (ref, credential) => new GeminiAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as GeminiCredential,
+      refresh: async () => {},
+      sessionLane: GEMINI_SESSION_LANE_SMOKE,
+      project: GEMINI_DEFAULT_PROJECT,
+      product: GEMINI,
+    }),
+  },
+  // CodeArts → 华为云 HMAC 签名（**它自己的**签名方案，不是「兜底」）。
+  // ⚠️ 旧实现里它是 `else` 的兜底分支 —— 那正是缺陷根源。现在它必须
+  // **显式登记**，未登记的 provider 不再被静默交给它。
+  codearts: {
+    createProbeAdapter: (ref, credential) => new CodeArtsAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as CodeArtsCredential,
+      refresh: async () => {},
+    }),
+  },
+  // Loomy（讯飞）→ 自己的端点。⚠️ 旧链**漏了它**（第 5 次同型缺陷，见上）。
+  loomy: {
+    createProbeAdapter: (ref, credential) => new LoomyAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as LoomyCredential,
+      refresh: async () => {},
+      product: LOOMY,
+    }),
+  },
+  // Raccoon Work（商汤小浣熊）→ 自己的端点。⚠️ 旧链**漏了它**（同第 5 次）。
+  raccoon: {
+    createProbeAdapter: (ref, credential) => new RaccoonAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as RaccoonCredential,
+      refresh: async () => {},
+      product: RACCOON,
+    }),
+  },
 }
 
 /** 注册 codeartsAuth 服务与 codearts LLM 路由（不注册斜杠命令）。 */
@@ -1795,40 +1980,37 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
    * `qoder` 与 `qodercn` 同理）。
    *
    * ⚠️ 条数会随 provider 增长（早期写「十个」已过时）——注释里的数字**不是**契约，
-   * `tests/unit/refresh-bootstrap-wiring.spec.ts` 的清单才是。
+   * 派生的键集合才是（见 `wiredRefreshTargets`）。
    *
    * 收成一张表是为了让「失败必须留日志」这条规则**只写一遍** —— 原先这里是
    * 十个空 catch（注释写着「静默」），把 provider 内部的告警与异常一起吞掉，
    * 「凭据一直刷不动」在日志里完全无痕（issue !IKIRTT 的可观测性条目）。
+   *
+   * ## ⚠️⚠️ 2026-10-08（Task 10）：改为**从能力注册表派生**，且**惰性求值**
+   *
+   * 原先这里**手抄 13 行**。失效形态极隐蔽：**漏一家 ⇒ 该家凭据永不自动续期**，
+   * 而症状只是「每隔一段时间就要重新登录」，**日志里一个字都没有**。
+   *
+   * ⚠️ **必须是函数调用而不是在这里立即求值**：本行（`apply()` 中段）在
+   * **注册循环之前**执行，而注册循环在 `apply()` 的**末尾**。立即求值会得到
+   * **空表** ⇒ 所有 provider 都不再自动续期，而日志里只有 `isPoolEmpty`
+   * 的常规输出（与 Task 5 的 `WIRED_EXPIRY_PROVIDERS` 是同一类陷阱）。
+   *
+   * ⇒ 改为在 `refreshAllCredentials` **内部**每次调用时现取（见下）。
+   * 代价是一次极廉价的 Map 遍历；收益是**与注册时机彻底解耦**。
+   *
+   * ⚠️ 原清单里的**注释已逐条上移到 `probeById`/`wiredRefreshTargets` 侧**或
+   * 保留在本函数上方，**不得静默丢弃**（Task 6 的主导失效类）：
+   * Loomy 不可续期（只探测已过期）、raccoon 的 lead 窗口、minimax 的
+   * refresh_token 轮换、zcode 静态凭据仍回写、**gemini 漏行会让定时器不武装**。
    */
-  const refreshTargets: ReadonlyArray<readonly [string, (pool: AccountPool) => Promise<void>]> = [
-    ['codearts', (p) => service.refreshAll(p)],
-    ['buddy', (p) => buddy.refreshAll(p)],
-    ['workbuddy', (p) => workbuddy.refreshAll(p)],
-    ['lobsterai', (p) => lobsterai.refreshAll(p)],
-    ['qoder', (p) => qoder.refreshAll(p)],
-    ['qodercn', (p) => qoderCn.refreshAll(p)],
-    ['trae', (p) => trae.refreshAll(p)],
-    ['cline', (p) => cline.refreshAll(p)],
-    // ⚠️ Loomy 不可续期：这里只探测**已过期**的账号（见 LoomyAuth.refreshAll）。
-    ['loomy', (p) => loomy.refreshAll(p)],
-    // raccoon **可续期**：只按 refreshable 过滤，且只续进入 lead 窗口的账号。
-    ['raccoon', (p) => raccoon.refreshAll(p)],
-    // MiniMax **可续期**（refresh_token 授权，会轮换 refresh_token）。
-    // 与 raccoon 同款：只按 refreshable 过滤，不看 enabled。
-    ['minimax', (p) => minimax.refreshAll(p)],
-    // zcode **不可续期**（凭据是静态的）—— 但这个方法仍做实事：
-    // 把各账号 ref 下最新的凭据回写一遍，让用户重新登录后无需重启 DSH。
-    // ⚠ 只按 `refreshable` 过滤、**不看 `enabled`**（AGENTS.md 既有约定）。
-    ['zcode', (p) => zcode.refreshAll(p)],
-    // ⚠️ Gemini **可续期**（Google OAuth 的 refresh_token，且会轮换）。
-    // ⚠️ 漏了这一行定时器不武装：凭据到期后**不会自动续期**，
-    // 用户会看到「每隔一小时就要重新登录」，且日志里一个字都没有。
-    ['gemini', (p) => gemini.refreshAll(p)],
-  ]
-
   async function refreshAllCredentials(): Promise<void> {
-    for (const [tag, refreshAll] of refreshTargets) {
+    // ⚠️ **每次现取**（wiredRefreshTargets() 是函数、读注册表）：注册发生在
+    //    pply() 末尾，而本函数最早在调度器 start() 的首轮就被调用 ⇒
+    //    若在这里读一个**在注册前求值的常量**，会得到**空表** ⇒
+    //    所有 provider 都不再自动续期，而日志里只有 isPoolEmpty 的常规输出
+    //    （与 Task 5 的 WIRED_EXPIRY_PROVIDERS 同一类陷阱）。
+    for (const [tag, refreshAll] of wiredRefreshTargets()) {
       try {
         await refreshAll(pool)
       } catch (error) {
@@ -2333,6 +2515,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
    */
   const expiryTable = createProviderExpiry()
 
+
   // ===== 能力注册表（设计文档 §3.3）=====
   //
   // ⚠️ **本段是前瞻接线**（2026-10-08 调序后修正）：`account.refresh` 的分派
@@ -2385,6 +2568,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
           // `this` 丢失（各家方法内部用 `this.product` / `this.ctx`）。
           refreshAccount: (refName, pool, accountId) =>
             auth.refreshAccountCredential(refName, pool, accountId),
+          // ⚠️ **13 家都要挂**：漏一家 ⇒ 该家凭据**永不自动续期**，
+          //    而症状是「每隔一段时间就要重新登录」，且日志里一个字都没有
+          //   （`refresh-targets-derived.spec.ts` 与
+          //    `refresh-bootstrap-wiring.spec.ts` 各有一条断言锁这个）。
+          // ⚠️ 包一层而不是直接挂方法引用：直接挂会让 `this` 丢失
+          //   （各家 `refreshAll` 内部用 `this.product` / `this.ctx`）。
+          refreshAll: (pool) => auth.refreshAll(pool),
         },
         // ⚠️ `creditsOf` 而非 `creditsTable[id]`：`in`/下标会命中原型链上的键
         //（如 `constructor`），与 `jet-hub-rpc.ts` 的 `authOf` 同因。
@@ -2400,6 +2590,10 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         //    ⚠️ `WIRED_EXPIRY_PROVIDERS` **不**从这里派生（它是编译期常量），
         //    两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁死。
         expiry: expiryOf(expiryTable, id),
+        // ⚠️ 与其余域同法：`probeById[id]` 用 `Object.hasOwn` 语义（下标会命中原型链）。
+        // ⚠️ **只有 zcode / gemini / trae 注册** —— 其余如实为 `undefined`
+        //    （`adapterForProbe` 据此抛「不支持重测」，不落回 CodeArtsAdapter）。
+        ...Object.hasOwn(probeById, id) ? { probe: probeById[id] } : {},
       })
       if (!registered) {
         ctx.logger?.info?.(

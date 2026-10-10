@@ -807,7 +807,18 @@ describe('Cline 接线（源码级回归）', () => {
     expect(source).toContain('new ClineAuth(ctx)')
     // 只断言「cline 在续期调度里、且真的被传了池」—— 用 `(pool|p)` 同时接受
     // 逐个 await 与表驱动两种写法，避免每次重构调度器都假失败。
-    expect(source).toMatch(/cline\.refreshAll\((?:pool|p)\)/)
+    // ⚠️ **2026-10-08 改（Task 10）**：原先断言 `src/index.ts` 的源码文本含手抄清单
+    //    字面量（`['x', (p) => x.refreshAll(p)]`）—— 那张清单已被
+    //    `wiredRefreshTargets()` 从**能力注册表**派生取代 ⇒ 该文本形态**不存在了**，
+    //    而它守的意图（该 provider 在续期调度里）**与文本无关**。
+    // ⇒ 改为**结构断言**（注册循环挂了 refreshAll + 派生表被使用）。
+    // ⚠️ 行为断言（真跑 `apply()` 逐个驱动 `auth.refreshAll` 并断言打到**自己那个**
+    //    实例）在 `provider-runtime-wiring.spec.ts` 的「★ 13 家都挂上了
+    //    `auth.refreshAll`」一条里，**比本条更强**。
+    expect(source, '注册循环没有挂 refreshAll（派生表会恒为空）')
+      .toMatch(/refreshAll:\s*\(pool\)\s*=>\s*auth\.refreshAll\(pool\)/)
+    expect(source, 'refreshTargets 又回到手抄清单了')
+      .toMatch(/wiredRefreshTargets\(\)/)
     expect(source).toContain('cline.stop()')
     // Jet Hub「显示列表」需要适配器实例
     expect(source).toMatch(/cline: pruned\([^)]*,\s*clineAdapter\)/)

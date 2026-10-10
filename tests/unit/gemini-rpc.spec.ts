@@ -468,7 +468,9 @@ describe('Gemini 接线点（源码断言）', () => {
   const here = dirname(fileURLToPath(import.meta.url))
   const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8')
   const rpcSource = readFileSync(resolve(here, '../../src/jet-hub-rpc.ts'), 'utf8')
-  const probeSource = readFileSync(resolve(here, '../../src/account-probe.ts'), 'utf8')
+  // ⚠️ Task 8 起：探测适配器的构造在 `index.ts` 的 `probeById`（account-probe 已改为
+  //    查能力注册表），故这里读的是 `index.ts`。
+  const probeSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8')
 
   it('⚠️ index.ts 接线点齐全，且签名缓存在卸载时落盘', () => {
     expect(indexSource).toContain("from './gemini-auth.js'")
@@ -480,7 +482,18 @@ describe('Gemini 接线点（源码断言）', () => {
     expect(indexSource).toContain('new GeminiAuth(ctx)')
     expect(indexSource).toContain('registerGeminiLlm(ctx, {')
     // ⚠️ 漏了这一条 ⇒ 续期定时器**永不武装**（不是「刷得慢」，是压根不刷）。
-    expect(indexSource).toContain("['gemini', (p) => gemini.refreshAll(p)]")
+    // ⚠️ **2026-10-08 改（Task 10）**：原先断言 `src/index.ts` 的源码文本含手抄清单
+    //    字面量（`['x', (p) => x.refreshAll(p)]`）—— 那张清单已被
+    //    `wiredRefreshTargets()` 从**能力注册表**派生取代 ⇒ 该文本形态**不存在了**，
+    //    而它守的意图（该 provider 在续期调度里）**与文本无关**。
+    // ⇒ 改为**结构断言**（注册循环挂了 refreshAll + 派生表被使用）。
+    // ⚠️ 行为断言（真跑 `apply()` 逐个驱动 `auth.refreshAll` 并断言打到**自己那个**
+    //    实例）在 `provider-runtime-wiring.spec.ts` 的「★ 13 家都挂上了
+    //    `auth.refreshAll`」一条里，**比本条更强**。
+    expect(indexSource, '注册循环没有挂 refreshAll（派生表会恒为空）')
+      .toMatch(/refreshAll:\s*\(pool\)\s*=>\s*auth\.refreshAll\(pool\)/)
+    expect(indexSource, 'refreshTargets 又回到手抄清单了')
+      .toMatch(/wiredRefreshTargets\(\)/)
     expect(indexSource).toMatch(/gemini: pruned\([^)]*,\s*geminiAdapter\)/)
     // ⚠️ 2026-10-08 改：原先这里断言**位置参数**的尾部顺序
     //    `/loomy, raccoon, minimax, zcode, gemini, modelAdapters/`。
@@ -525,8 +538,19 @@ describe('Gemini 接线点（源码断言）', () => {
     //    `credits-runtime-parity.spec.ts` 的
     //    「★★ 逐家余额都走自己的上游端点」（含 gemini 的配额路径）+
     //    下面那条真跑 `credits.balances` 的用例（配额窗口转两个包）。
-    // ⚠️ 漏了会被华为云 HMAC 签名发 Google 凭据。
-    expect(probeSource).toContain('entry.provider === GEMINI.id')
-    expect(probeSource).toContain('new GeminiAdapter({')
+    // ⚠️ 2026-10-08 改（Task 8）：原先这两条断言 `src/account-probe.ts` 的源码文本
+    //    含 `entry.provider === GEMINI.id` 与 `new GeminiAdapter({`。Task 8 把
+    //    探测适配器的构造搬进了 `src/index.ts` 的 `probeById`（account-probe 改为
+    //    查能力注册表）⇒ 那两段文本**不在原文件里了**，而它们守的意图
+    //    （gemini 的重测走 GeminiAdapter，**不漏到**华为云 HMAC 签名的 CodeArts）
+    //    **与文本无关**。⇒ 改为**行为断言**，唯一一处：
+    //    `account-probe-adapter.spec.ts` 的「gemini 账号走 GeminiAdapter 而非
+    //    CodeArtsAdapter」+ `account-probe-runtime.spec.ts` 的
+    //    「未注册 probe 的 provider 抛可读错误，不得落回 CodeArtsAdapter」。
+    //
+    // ⚠️ 此处只保留「**结构**」断言：`probeById` 必须真的登记了 gemini
+    //    （少一条就会在「将来给 gemini 之外开入口」时复发旧缺陷）。
+    expect(probeSource).toMatch(/gemini:\s*\{/)
+    expect(probeSource).toMatch(/new GeminiAdapter\(\{/)
   })
 })

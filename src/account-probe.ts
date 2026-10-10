@@ -29,22 +29,11 @@
  *    `getAvailableAccount`（自动选择，只认启用账号）。
  */
 
-import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
-import { BuddyAdapter } from './buddy-adapter.js'
-import { LobsteraiAdapter } from './lobsterai-adapter.js'
-import { QoderAdapter } from './qoder-adapter.js'
-import { ClineAdapter } from './cline-adapter.js'
-import { ZcodeAdapter } from './zcode-adapter.js'
-import { TraeAdapter } from './trae-adapter.js'
-import { CodeArtsAdapter, isRateLimited, parseRateLimitError } from './llm-adapter.js'
-import { productById } from './product.js'
-import { lobsteraiProductById } from './lobsterai-product.js'
-import { qoderProductById } from './qoder-product.js'
-import { clineProductById } from './cline-product.js'
-import { zcodeProductById } from './zcode-product.js'
-import { GeminiAdapter } from './gemini-adapter.js'
-import { GEMINI, GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js'
+import { createUserMessage, LlmError, type LlmAdapter } from '@deepseek-ai/dsh-llm'
+import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
+import { runtimeOf } from './provider-runtime.js'
+// ⚠️ 这些类型仍被 `ProbeCredential` 联合使用（探测入参的**形状**仍由本文件约束），
+//    只是**不再**由本文件构造适配器（那是 `index.ts` 的 `probe.createProbeAdapter`）。
 import type { BuddyCredential } from './buddy.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
@@ -61,14 +50,6 @@ import type {
   RpcRetestResponse,
   RpcTestAccountResponse,
 } from './types.js'
-
-/**
- * TRAE 的 provider id。
- *
- * 单独提为常量而不是内联字面量：本文件已有两处「新增 provider 漏加分派」的
- * 缺陷（workbuddy、trae），把它写成具名常量便于检索与统一改动。
- */
-const TRAE_PROVIDER_ID = 'trae'
 
 /**
  * 探测可能涉及的凭据联合类型。
@@ -181,6 +162,38 @@ function isRateLimitFailure(error: unknown): boolean {
   return isRateLimited(message)
 }
 
+/**
+ * 按 provider 找到它的**探测适配器工厂**并造一个实例（Task 8）。
+ *
+ * ## ⚠️ 为什么未登记时**必须抛**，而不是落回某个默认适配器
+ *
+ * 旧实现是一条 `else if` 链，末尾的 `else` 兜底把**未登记的 provider** 交给
+ * 「**华为云 HMAC 签名**的 `CodeArtsAdapter`」去发别家凭据 ⇒
+ * 探测**必然失败**，而该 provider 的限流标记（UTC+8 当日 24:00）**永远清不掉**。
+ * 症状只是「重测按钮点了没用」—— 极难定位（`account-probe.ts` 的注释记录该缺陷
+ * **同型复发 4 次**：workbuddy → trae → qoder/qodercn/cline → zcode）。
+ *
+ * ⇒ 改为查能力注册表：**未登记 ⇒ 抛可读错误**（带 provider 名）。
+ * 这是**行为收紧**：未登记的渠道从「发一次必然失败的请求」变成「明确报不支持重测」。
+ * 客户端能力表 `accountTest` 目前**只有 `gemini`**，故其余渠道本就没有入口。
+ *
+ * ⚠️ 判据是 `runtime?.probe === undefined` —— **不能**只看 `runtimeOf(provider)`
+ * 是否有值：只注册了 `expiry` 等其它域的 provider **同样不支持重测**。
+ */
+export function adapterForProbe(
+  provider: string,
+  refName: string,
+  credential: unknown,
+): LlmAdapter {
+  const runtime = runtimeOf(provider)
+  if (runtime?.probe === undefined) {
+    // ⚠️ 必须抛，不得落回 CodeArtsAdapter：那会用华为云 HMAC 签名去打别家端点，
+    //    探测必然失败而限流标记永远清不掉（zcode / gemini 各踩过一次）。
+    throw new Error(`${provider} 没有探测适配器（该 provider 不支持重测）`)
+  }
+  return runtime.probe.createProbeAdapter(refName, credential)
+}
+
 /** 用真实适配器对指定账号的指定模型发一次最小请求。 */
 async function probeWithAdapter(
   entry: ProviderAccountEntry,
@@ -189,7 +202,6 @@ async function probeWithAdapter(
   timeoutMs: number,
 ): Promise<ProbeModelResult> {
   const signal = AbortSignal.timeout(timeoutMs)
-  const ref = credentialRef(entry.credentialRef)
 
   // 刻意不传 accountPool / fetchRemoteModels：
   // - 不传 accountPool → 只测这一个账号，且探测本身不写限流标记；
@@ -238,117 +250,31 @@ async function probeWithAdapter(
   // 积分耗尽时静默降级、**不写**标记，故它落 else 无害（`retestAccount`
   // 取不到 modelId 时根本不构造适配器）。新增 provider 时务必同步本分支，
   // 并补 `tests/unit/account-probe-adapter.spec.ts` 的对应用例。
-  const buddyProduct = productById(entry.provider)
-  const lobsteraiProduct = lobsteraiProductById(entry.provider)
-  const qoderProduct = qoderProductById(entry.provider)
-  const clineProduct = clineProductById(entry.provider)
-  const zcodeProduct = zcodeProductById(entry.provider)
-  let adapter:
-    | BuddyAdapter
-    | LobsteraiAdapter
-    | QoderAdapter
-    | ClineAdapter
-    | ZcodeAdapter
-    | TraeAdapter
-    | GeminiAdapter
-    | CodeArtsAdapter
-  if (buddyProduct !== undefined) {
-    adapter = new BuddyAdapter({
-      credentialRef: ref,
-      resolveCredential: async () => credential as BuddyCredential,
-      refresh: async () => {},
-      product: buddyProduct,
-    })
-  } else if (lobsteraiProduct !== undefined) {
-    adapter = new LobsteraiAdapter({
-      credentialRef: ref,
-      resolveCredential: async () => credential as LobsteraiCredential,
-      refresh: async () => {},
-      product: lobsteraiProduct,
-    })
-  } else if (qoderProduct !== undefined) {
-    // Qoder 国际版与中国版**共用同一个适配器类**，差异全在 product 配置里
-    // （区域端点、client_id、模型表）。探测只发一次最小纯文本请求，不涉及
-    // 工具/图片，故除了 product 之外无需注入其它钩子；`uid` 由凭据自身携带
-    // （旧凭据缺 uid 时适配器会明确报错，而不是发出必然失败的请求）。
-    adapter = new QoderAdapter({
-      credentialRef: ref,
-      resolveCredential: async () => credential as QoderCredential,
-      refresh: async () => {},
-      product: qoderProduct,
-    })
-  } else if (clineProduct !== undefined) {
-    adapter = new ClineAdapter({
-      credentialRef: ref,
-      resolveCredential: async () => credential as ClineCredential,
-      refresh: async () => {},
-      product: clineProduct,
-    })
-  } else if (zcodeProduct !== undefined) {
-    // ZCode 的免费额度通道（`/zcode-plan/anthropic`）**按需**要 captcha：
-    // 默认先不带验证头探一次，被 `3007` 拒才产出（需要验证时复用同一个 param
-    // 必再得 `3007`）。
-    // ⇒ 探测路径若上游当下不要验证，**不会**拉起浏览器；要验证才拉。
-    //
-    // ⚠️ 已知取舍：探测路径**没有** `mintCaptcha` 透传通道（`ProbeDeps` 里没有
-    // 这一项），故**一旦上游索要验证**，这里的适配器就**自建**一个常驻浏览器
-    // （上游不要验证时压根不 mint，也就不会拉）。若宿主里已有 `index.ts`
-    // 注入的那台（`zcode.mintCaptcha`），短时会并存两台（约 200MB/台）。
-    // 这仍然远好于本缺陷的形态 —— 落 else 会被交给**华为云 HMAC 签名**的
-    // `CodeArtsAdapter` 去发 zcode 凭据，探测必然失败，而 zcode 的额度标记
-    // （UTC+8 当日 24:00）会一直清不掉。
-    // 后续若要消除这层浪费，应给 `ProbeDeps` 加一条 `mintCaptcha` 透传，
-    // 与 `index.ts` 的 `zcode.mintCaptcha` 共用同一台常驻浏览器。
-    adapter = new ZcodeAdapter({
-      credentialRef: ref,
-      resolveCredential: async () => credential as ZcodeCredential,
-      refresh: async () => {},
-      product: zcodeProduct,
-    })
-  } else if (entry.provider === TRAE_PROVIDER_ID) {
-    // TRAE 只有一个产品（`TRAE` 常量），没有 productById 式的查表，
-    // 故直接按 provider id 判定。不传 product → TraeAdapter 内部默认用 TRAE。
-    adapter = new TraeAdapter({
-      credentialRef: ref,
-      resolveCredential: async () => credential as TraeCredential,
-      refresh: async () => {},
-    })
-  } else if (entry.provider === GEMINI.id) {
-    // Gemini（Cloud Code Assist）→ GeminiAdapter。
-    //
-    // ⚠️ 与 zcode 同因：GeminiAdapter 的限流/额度路径**会写** `modelRateLimits`
-    //（见 `gemini-adapter.ts` 的 `updateModelRateLimit` 调用），故必须有分支。
-    // 落 else 会被交给**华为云 HMAC 签名**的 CodeArtsAdapter 去发 Google 凭据，
-    // 探测必然失败，而账号卡片上的「重测」永远清不掉那个标记。
-    //
-    // 探测只发一次最小纯文本请求，不涉及图片/工具，故除 product 与 lane 外
-    // 无需其它钩子。
-    //
-    // ⚠️ lane 必须是 `smoke`：原版实测冒烟路径与推理路径的 sessionId **不同**
-    //（同 prompt 同预算下取值不同，说明 lane 进了哈希）。不传会让探测流量与
-    // 真实推理混进同一个会话，污染会话归并与 thoughtSignature 回填。
-    //
-    // ⚠️ `project` **显式钉兜底串**，与上面「刻意不传 accountPool / fetchRemoteModels」
-    // 同一个理由：探测是**轻量存活检查**，要的是一次到推理端点的真请求。
-    // 若走自动探测，会先多打一次 `loadCodeAssist`，且 LCA 失败（限流/网络抖动）
-    // 会让探测报「项目号探测失败」而不是它真正要报的「账号仍受限」—— 反而掩盖
-    // 了用户点「重测」想知道的答案。探测**不写**任何东西（不传 persistProject）。
-    adapter = new GeminiAdapter({
-      credentialRef: ref,
-      resolveCredential: async () => credential as GeminiCredential,
-      refresh: async () => {},
-      sessionLane: GEMINI_SESSION_LANE_SMOKE,
-      project: GEMINI_DEFAULT_PROJECT,
-      product: GEMINI,
-    })
-  } else {
-    adapter = new CodeArtsAdapter({
-      credentialRef: ref,
-      resolveCredential: async () => credential as CodeArtsCredential,
-      refresh: async () => {},
-    })
-  }
-
+  // ⚠️ **2026-10-08 Task 8：本链已改为查能力注册表**（原为 `else if` 链 + `else` 兜底）。
+  //
+  // 原实现的 `else` 会把**未登记的 provider** 交给「**华为云 HMAC 签名**的
+  // `CodeArtsAdapter`」去发别家凭据 ⇒ 探测必然失败，而该 provider 的限流标记
+  //（UTC+8 当日 24:00）**永远清不掉**（症状只是「重测按钮点了没用」，极难定位）。
+  // ⚠️ 该缺陷**同型复发 4 次**：workbuddy → trae → qoder/qodercn/cline → zcode，
+  // 根因是「清单靠记忆维护」。
+  //
+  // ⇒ 现在各家在 `src/index.ts` 注册 `probe.createProbeAdapter`，
+  // **未登记 ⇒ 抛可读错误**（见 `adapterForProbe`），不再有 `else` 兜底。
+  //
+  // ⚠️ **判据仍是「该 provider 会不会写 `modelRateLimits`」**（写了才有重测按钮、
+  // 才需要注册 probe）。核对方式是机械的，不要靠记忆：
+  //
+  //     grep -n 'updateModelRateLimit(' src/*.ts
+  //
+  // 命中者（除 `account-pool.ts` 的定义与 `account-probe.ts` 自身的回写）的每个
+  // 适配器都必须在 `index.ts` 注册 probe：buddy（含 workbuddy）/ lobsterai /
+  // qoder（含 qodercn）/ cline / zcode / trae / codearts / **gemini** /
+  // **loomy** / **raccoon**。
+  // 反例：minimax 与 opencode **不写**标记 ⇒ 不需要 probe
+  //（`retestAccount` 取不到 modelId 时根本不构造适配器）。
+  // 新增 provider 时**先跑上面那条 grep**，再补 `index.ts` 的注册与
+  // `tests/unit/account-probe-adapter.spec.ts` 的对应用例。
+  const adapter = adapterForProbe(entry.provider, entry.credentialRef, credential)
   try {
     for await (const _chunk of adapter.stream({
       provider: entry.provider,
