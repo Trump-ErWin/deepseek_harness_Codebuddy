@@ -93,7 +93,7 @@ describe('接线点完整性（源码断言）', () => {
     expect(refreshPart).not.toMatch(/available\.id\b/)
   })
 
-  it('⚠️ jet-hub-rpc.ts 四处分支齐全，且都用 MINIMAX.id 分派', () => {
+  it('⚠️ jet-hub-rpc.ts 的 minimax 真协议分支齐全（account.create）', () => {
     // account.create / credits.status / credits.claimAll / credits.balances
     //
     // ⚠️ 2026-10-08 改（Task 2）：原清单里的 `account.refresh` 已**不再**有
@@ -102,14 +102,21 @@ describe('接线点完整性（源码断言）', () => {
     //    唯一的 `case MINIMAX.id:` 就在那个 switch 里，故该断言现在恒假。
     //    该端点的 minimax 续期由 `lobsterai-rpc-dispatch.spec.ts` 的行为用例守
     //    （从 `REFRESH_PROVIDERS` 派生，含 minimax）+ 下面那条串接用例。
-    //    ⇒ 下面**只**断言剩下四处真协议分支（`provider === MINIMAX.id` 出现
-    //    四次：account.create 与三个 credits 端点）。
-    const dispatchCount = [...rpcSource.matchAll(/provider === MINIMAX\.id/g)].length
-    expect(dispatchCount, '四处真协议分支（account.create + 三个 credits）').toBeGreaterThanOrEqual(4)
-    // 三个 credits 分支
-    expect(rpcSource).toContain('fetchMinimaxSigninStatus(credential)')
+    //
+    // ⚠️⚠️ 2026-10-08 改（Task 3）：原先这里数 `provider === MINIMAX.id` 出现
+    //    **四次**（account.create + 三个 credits 端点），并断言源码里含
+    //    `fetchMinimaxSigninStatus(credential)` / `fetchMinimaxCreditBalance(credential)`。
+    //    Task 3 把三个 credits 端点的分派收敛成查表 ⇒ 只剩 account.create 一处
+    //    （实测 2 处：还有一处是注释锚点），那三条文本断言也**不存在了**。
+    //    它们守的意图（minimax 的余额与签到状态接上了、且各走自己的原语）
+    //    **与文本无关** ⇒ 行为断言搬到了唯一一处：
+    //    `credits-runtime-parity.spec.ts` 的
+    //    「★★ 逐家余额都走自己的上游端点」（minimax 的 credit/details）+
+    //    「fetchStatus 只登记在真有同构状态端点的渠道上」（含 minimax）+
+    //    「credits.status 走注入的 credits 表」。
+    //    本文件只保留**本端点独有的**那处真协议分支。
+    expect(rpcSource).toContain('} else if (provider === MINIMAX.id) {')
     expect(rpcSource).toContain('claimMinimaxDailyCheckin(credential)')
-    expect(rpcSource).toContain('fetchMinimaxCreditBalance(credential)')
   })
 
   /**

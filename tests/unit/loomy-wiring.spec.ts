@@ -3,6 +3,7 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { descriptorOf } from '../../src/provider-registry.js'
+import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8')
@@ -94,13 +95,18 @@ describe('Loomy 在 index.ts 的接线', () => {
   })
 
   it('registerJetHubRpc 传入了 loomy', () => {
-    // ⚠️ 2026-10-08 改措辞：auth 实例已是**命名对象**（键是 provider id），
-    // 不再是位置参数 —— 故本断言现在的含义是「`loomy` 键在 auths 对象字面量里，
-    // 且该字面量位于 `modelAdapters` 之前」。
-    // ⚠️ 断言到 `loomy` 与 `modelAdapters` 之间**不限定**具体键 ——
-    // 每新增一个 provider 都会在这中间插一个键（raccoon 即如此），
-    // 写死 `cline, loomy, modelAdapters` 会让每次新增 provider 都误报失败。
-    expect(indexSource).toMatch(/registerJetHubRpc\([\s\S]*?loomy,[\s\S]*?modelAdapters\)/)
+    // ⚠️ 2026-10-08 改（Task 3）：原先这条是**相邻性正则**
+    //    `/registerJetHubRpc\([\s\S]*?loomy,[\s\S]*?modelAdapters\)/`。
+    //    Task 3 一度给 `registerJetHubRpc` 加了**第 5 个位置形参** `credits`
+    //    （调用点变成 `… }, modelAdapters, creditsTable)`）⇒ 正则必然假失败。
+    //    该形参随后在设计复审 C1 中被删除，但**本条的改法保留**：它守的意图
+    //    （loomy 的 auth 实例接上了）**与形参个数无关**，AST 取键比重排-敏感
+    //    的正则强。
+    //    ⇒ 按 **AST** 取调用点第三个实参（auths 对象字面量）的键。
+    const authKeys = jetHubAuthsCallKeys(indexSource)
+    expect(Object.keys(authKeys), 'loomy 必须在 auths 命名对象里（键 = provider id）')
+      .toContain('loomy')
+    expect(authKeys.loomy, '`loomy` 键的值必须是 loomy 实例').toBe('loomy')
   })
 
   /**

@@ -190,6 +190,48 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
   })
 
   /**
+   * ★ **`credits` 域真的挂上了**（Task 3）。
+   *
+   * ⚠️ 判据从 `PROVIDER_REGISTRY` **派生**，不手写清单：手写清单漏一家会静默
+   * 丢掉那家的覆盖，而全量测试照样全绿（Task 2 复审 Finding I-1 的教训）。
+   *
+   * 守的失效形态：`src/index.ts` 的 `registerProviderRuntime({ … })` 里
+   * **漏掉 `credits:` 那一行** ⇒ `runtimeOf(id).credits` 恒为 `undefined`，
+   * 于是 Task 5 的 `aggregate-expiry.ts` / Task 8 的 `account-probe.ts`
+   * 拿到的是「该渠道不支持积分」—— 而它明明支持。这与 `auth` 域那条守卫同型
+   *（都是「注册清单漏了一个域」），故必须真跑 `apply()` 才有牙。
+   *
+   * ⚠️ 例外是**形态不匹配的特例**（`provider-credits.ts` 文件头）：
+   *    opencode（本地派生的通道可用性、零网络）与 qoder 系（只吃
+   *    `QoderCredential`）**刻意不在**积分表里 —— 它们的 `credits` 如实为
+   *    `undefined`，由 `credits.balances` 里的特例分支短路。
+   */
+  it('★ 每个有余额能力的渠道都挂上了 credits 域（漏接即红并点名）', () => {
+    applyOnce()
+    const SPECIAL_CASES = new Set(['opencode', 'qoder', 'qodercn'])
+    for (const d of PROVIDER_REGISTRY) {
+      const runtime = runtimeOf(d.id)
+      if (runtime === undefined) continue // 非 channel provider（aggregate）不在此表
+      if (SPECIAL_CASES.has(d.id)) {
+        expect(
+          runtime.credits,
+          `${d.id} 是形态不匹配的特例，不该进积分表（它的余额由特例分支短路）`,
+        ).toBeUndefined()
+        continue
+      }
+      expect(
+        runtime.credits,
+        `${d.id} 声明了 balance:${String(d.credits.balance)}，但 runtime 上没有 credits 域 —— `
+        + '`src/index.ts` 的 registerProviderRuntime 漏了 `credits:` 那一行',
+      ).toBeDefined()
+      expect(
+        runtime.credits?.fetchBalance !== undefined || runtime.credits?.fetchBalanceDetailed !== undefined,
+        `${d.id} 的 credits 域没有任何余额方法`,
+      ).toBe(true)
+    }
+  })
+
+  /**
    * ⚠️ **本条的证明力来自「引用同一性」**：`descriptorOf(id)` 返回的是
    * `PROVIDER_REGISTRY` 里那个**冻结的同一个对象**。断言 `toBe` 而不是
    * `toEqual`，故它同时证明「注册段没有另造一份 descriptor」——

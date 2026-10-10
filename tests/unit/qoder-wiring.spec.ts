@@ -49,17 +49,18 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
     // 末尾的 `modelAdapters` 供「显示列表」取不受黑名单影响的全量目录
     // （使被关闭的模型也显示正确的展示名/倍率，而不是退化成裸 id）。
     //
-    // ⚠️ 2026-10-08 改措辞：auth 实例已是**命名对象**（键是 provider id），
-    // 不再是位置参数 —— 故本断言现在的含义是「`qoder` 键在 auths 对象字面量里，
-    // 且该字面量位于 `modelAdapters` 之前」。新增 provider 只是**多一个键**，
-    // 不再有「插队挤掉后续形参」这回事。
-    // ⚠️ 这里仍不限定 `qoder` 与 `modelAdapters` 之间**具体有哪些键** ——
-    // 写死整串会让每加一个 provider 都假失败
-    //（加 Loomy、Raccoon、QoderCN 时各踩过一次）。
+    // ⚠️ 2026-10-08 改（Task 3）：原先这条是**相邻性正则**
+    //    `/registerJetHubRpc\([\s\S]*?qoder,[\s\S]*?modelAdapters\)/` ——
+    //    Task 3 一度给 `registerJetHubRpc` 加了**第 5 个位置形参** `credits`
+    //    （调用点变成 `… }, modelAdapters, creditsTable)`）⇒ 正则必然假失败。
+    //    该形参随后在设计复审 C1 中被删除，但**本条的改法保留**：它守的意图
+    //    （qoder 的 auth 实例接上了）**与形参个数、键的书写顺序都无关**。
+    //    ⇒ 按 **AST** 取调用点第三个实参（auths 对象字面量）的键。
     // 「中国版紧跟国际版」这条更具体的约束由下面的 QoderCN 用例负责。
-    expect(index).toMatch(
-      /registerJetHubRpc\([\s\S]*?qoder,[\s\S]*?modelAdapters\)/,
-    )
+    const authKeys = jetHubAuthsCallKeys(index)
+    expect(Object.keys(authKeys), 'qoder 必须在 auths 命名对象里（键 = provider id）')
+      .toContain('qoder')
+    expect(authKeys.qoder, '`qoder` 键的值必须是国际版实例').toBe('qoder')
     expect(index, 'qoder 适配器须登记进映射').toMatch(/qoder: pruned\([^)]*,\s*qoderAdapter\)/)
   })
 
@@ -321,9 +322,24 @@ describe('Qoder 同族 RPC 注册表（src/jet-hub-rpc.ts）', () => {
   })
 
   it('余额分支按 member.product 取配置', () => {
+    // ⚠️ 2026-10-08 改（Task 3）：原先这条切出 `case 'credits.balances'` 后 3000
+    //    字符，断言里面有 `isQoderFamily(req.provider)` 与
+    //    `fetchQoderCreditBalance(credential, product)`。Task 3 把**其余**渠道的
+    //    余额分派收敛成查表，而 qoder 系作为**形态不匹配的特例**保留（它只吃
+    //    QoderCredential、不走 collectCreditBalances 的泛型）⇒ 那两串文本**仍在**，
+    //    但「特例必须在查表**之前**短路」这条更重要的不变式原先无人守。
+    //    ⇒ 改为断言**顺序**（特例早于查表）+ 保留原有两条内容断言。
     const start = code.indexOf("case 'credits.balances'")
-    const branch = code.slice(start, start + 3000)
+    const branch = code.slice(start, start + 4000)
     expect(branch).toContain('isQoderFamily(req.provider)')
     expect(branch).toContain('fetchQoderCreditBalance(credential, product)')
+    // ⚠️ 核心：qoder 的特例必须**先于**查表 —— 否则它会落到积分表里
+    //    （表里没有 qoder 条目 ⇒ 变成 `unsupported provider`，用户看到
+    //    「该渠道不支持积分」而它其实有余额接口）。行为由
+    //    `credits-runtime-parity.spec.ts` 的「qoder 系不查表」守着。
+    const specialAt = branch.indexOf('isQoderFamily(req.provider)')
+    const lookupAt = branch.indexOf('creditsOf(credits, req.provider)')
+    expect(lookupAt, '找不到查表分派').toBeGreaterThan(-1)
+    expect(specialAt, 'qoder 特例必须早于查表短路').toBeLessThan(lookupAt)
   })
 })
