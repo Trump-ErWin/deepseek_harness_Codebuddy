@@ -89,8 +89,9 @@ buddy: no usable credential; log in from the Jet Hub panel first
 
 **链路**（四个环节都正确，合起来却报出假原因）：
 
-1. 唯一的启用账号带该模型的未过期限流标记 → `pickBuddyCredential`
-   （`src/index.ts`）的候选筛成**空集**；
+1. 唯一的启用账号带该模型的未过期限流标记 → 候选筛（原
+   `src/index.ts` 里 buddy 系那段编排闭包，符号名已随 Task 6 删除
+   —— 见 git 历史 `d35d9e3`）筛成**空集**；
 2. `select()`（`src/buddy-balance-selector.ts`）对空候选只能回一个笼统的
    `{kind:'exhausted'}`，**未锁定时 `reason` 被丢弃**；
 3. 调用方退到**单凭据 ref** `BUDDY_ACCESS_TOKEN` —— 而 Jet Hub 登录只写
@@ -1492,8 +1493,9 @@ buddy: no usable credential; log in from the Jet Hub panel first
 
 **链路**（四个环节都正确，合起来却报出假原因）：
 
-1. 唯一的启用账号带该模型的未过期限流标记 → `pickBuddyCredential`
-   （`src/index.ts`）的候选筛成**空集**；
+1. 唯一的启用账号带该模型的未过期限流标记 → 候选筛（原
+   `src/index.ts` 里 buddy 系那段编排闭包，符号名已随 Task 6 删除
+   —— 见 git 历史 `d35d9e3`）筛成**空集**；
 2. `select()`（`src/buddy-balance-selector.ts`）对空候选只能回一个笼统的
    `{kind:'exhausted'}`，**未锁定时 `reason` 被丢弃**；
 3. 调用方退到**单凭据 ref** `BUDDY_ACCESS_TOKEN` —— 而 Jet Hub 登录只写

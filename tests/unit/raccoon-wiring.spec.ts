@@ -9,6 +9,28 @@ const here = dirname(fileURLToPath(import.meta.url))
 const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8')
 
 /**
+ * 取某 provider 的**工厂配置块**（`createCredentialResolver(...)` 那一段）。
+ *
+ * ⚠️ **归属判据是「块内第一个 `product: <CONST>,`」**，不能写成「块内是否出现
+ * `product: X,`」：选择器的**定义**恰好夹在相邻两个工厂调用之间，于是会被算进
+ * **上一个** provider 的块里（写 loomy 那条时实测到：CLINE 的块里含 `product: LOOMY,`）。
+ * 工厂配置项里 `product` 永远是首字段，取第一个即无歧义。
+ *
+ * ⚠️ 与 `loomy-wiring.spec.ts` 的同名助手**刻意各留一份**：本仓库的源码契约测试
+ * 一律自带切片助手（`source-scope.ts` 那种公共件只用于 AST 取函数体）。抽公共件
+ * 会让「改一处影响多个 spec」—— 正是这些测试要防的形态。
+ */
+function factoryBlockOf(source: string, product: string): string {
+  const calls = [...source.matchAll(/createCredentialResolver\(/g)].map(m => m.index!)
+  for (let i = 0; i < calls.length; i++) {
+    const block = source.slice(calls[i]!, calls[i + 1] ?? source.length)
+    const first = /product: (\w+),/.exec(block)
+    if (first?.[1] === product) return block
+  }
+  throw new Error(`index.ts 里找不到 ${product} 的 createCredentialResolver 配置块`)
+}
+
+/**
  * 源码级回归：新增 provider 的接线点一处都不能漏。
  * 历史缺陷正是「加了 provider 但忘了在 modelAdapters 里登记」→
  * 设置页里被关闭的模型显示成裸 id（丢倍率）。
@@ -25,8 +47,32 @@ describe('Raccoon 在 index.ts 的接线', () => {
     expect(indexSource).toMatch(/const raccoonAdapter = registerRaccoonLlm/)
   })
 
-  it('provider 解析用 RACCOON.id（不写死字面量）', () => {
-    expect(indexSource).toContain("pool.getAvailableAccount(RACCOON.id, '')")
+  /**
+   * ## ⚠️ 这条用例的锚点曾经**错标**（2026-10-08 复审修正，**不是**本次重构引入的）
+   *
+   * 原标题是「provider 解析用 RACCOON.id」，断言的是「池取号时第二实参传**空串**」
+   * 那个文本形。但**在基线上**该文本形就只出现在 **`refresh:` 块**里（续期定位账号），
+   * 而 provider 解析那一处传的是 **`modelId`**（故不含该文本形）。
+   *
+   * ⚠️ 本注释**刻意不复写那个旧锚点原文**：它是验收命令会 grep 的字符串，
+   * 写进注释会让「该锚点已消失」的核对**假命中**（本仓库的既定约定）。
+   *
+   * ⇒ 标题说「解析」，实际守的是「续期」：**名不副实**，且它守的那件事
+   * （续期传空串）已由 `trae-model-id-selection.spec.ts` 的「续期路径刻意不按模型
+   * 过滤」一组逐 provider 覆盖（含 raccoon）。Task 6 之后 provider 解析已下沉进
+   * `createCredentialResolver`，那句文本更不可能回来了。
+   *
+   * 修法：重新指向**真正**验证 raccoon provider 解析的东西 —— 工厂配置项里的
+   * `product: RACCOON,`（工厂正是拿 `config.product.id` 去查池）。这仍然守住原意图
+   * （「不写死字面量 `'raccoon'`」），且与 `loomy-wiring.spec.ts` 的同款改法一致。
+   */
+  it('provider 解析用 RACCOON 常量（不写死字面量）', () => {
+    // 工厂配置块必须把 RACCOON 交给工厂 —— 工厂拿 `config.product.id` 查池。
+    expect(factoryBlockOf(indexSource, 'RACCOON'), '必须把 RACCOON 常量交给工厂')
+      .toContain('product: RACCOON,')
+    // 且整个文件里不得出现写死字面量的查池调用。
+    expect(indexSource).not.toMatch(/getAvailableAccount\('raccoon'/)
+    expect(indexSource).not.toMatch(/listAccountsByProvider\('raccoon'/)
   })
 
   it('refresh 走 refreshAccountCredential（刷新解析凭据所用的那个账号）', () => {

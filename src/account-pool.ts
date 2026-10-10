@@ -37,7 +37,7 @@ const EMPTY_MODEL_SET: ReadonlySet<string> = new Set<string>()
  *
  *
  * 选号按 `modelRateLimits[modelId]` 过滤候选（见本类的 `getAvailableAccount`
- * 与 `src/index.ts` 的 `pickBuddyCredential`）。当一个 provider 只有**一个**
+ * 与 `src/credential-resolver.ts` 的候选筛）。当一个 provider 只有**一个**
  * 启用账号、而它恰好被标记了该模型的限流时，候选集变成空集，调用链一路
  * 返回 `undefined`，最终由适配器抛出「no usable credential; log in from the
  * Jet Hub panel first」—— 而**凭据其实是好的、账号也是启用的**，用户被指去
