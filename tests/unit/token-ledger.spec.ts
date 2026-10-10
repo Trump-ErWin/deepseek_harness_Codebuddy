@@ -6,6 +6,7 @@ import {
   deleteTokenLedgerDay,
   isValidTokenLedgerDayKey,
   mergeDayEntry,
+  parseDayBucketKey,
   peekLedgerAccount,
   readTokenLedger,
   readTokenLedgerDayMap,
@@ -443,6 +444,24 @@ describe('utc8DayKey / mergeDayEntry（第 2 期 · 日聚合）', () => {
     } finally {
       detach()
     }
+  })
+
+  /**
+   * ⚠️ **写出去的桶键必须是读得回来的键**（红队复审发现，实测复现）。
+   *
+   * 写入侧 `mergeDayEntry` 原先直接用 `entry.channel` 拼键，而读取侧唯一判据
+   * `parseDayBucketKey` 只接受 `direct` / `gateway`。调用方传非法 channel 时会
+   * **写出一份自己读不回的桶** —— 落盘后重启该日直接消失（静默数据丢失）。
+   * 生产路径经 `recordTokenUsage` 已归一，但 `store.append` 是公开接口。
+   */
+  it('★ 非法 channel 必须被归一，不得写出读不回的桶键', () => {
+    const days: TokenLedgerDayMap = new Map()
+    // 故意传非法 channel（类型层面是联合类型，运行时仍可能被 JS 调用方传进来）
+    mergeDayEntry(days, { ...OK, channel: 'foo' as never, ts: Date.UTC(2026, 9, 5, 2, 0, 0) })
+    const keys = [...days.get('2026-10-05')!.keys()]
+    expect(keys, '非法 channel 不得原样进入桶键').toEqual(['direct|codearts||GLM-5.2'])
+    // ★ 关键：同一个键必须能被读取侧接受（否则落盘后重启读不回）
+    expect(parseDayBucketKey(keys[0]!), '写出的键必须能被读取侧解析').toBeDefined()
   })
 })
 

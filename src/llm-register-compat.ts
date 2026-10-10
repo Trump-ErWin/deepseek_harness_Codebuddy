@@ -261,10 +261,17 @@ export async function* recordThroughStream(
   let cacheWriteTokens: number | undefined
   let reasoningTokens: number | undefined
   /**
-   * **首个内容块耗时**（第 3 期）：收到任何一块（含思考增量）的时刻 − 发起。
-   * 0 = 还没有任何块。口径与 `cline-request-log.ttftMs` 一致 —— 用户口中的
-   * 「首字用时」。**必须在收块时测量**：包装层是唯一同时知道「发起时刻」与
-   * 「每块到达时刻」的位置（各适配器内部没有统一的测量点）。
+   * **首个内容块耗时**（第 3 期）：收到**内容帧**的时刻 − 发起（判据见
+   * {@link isContentChunk}）。0 = 还没有任何内容帧，展示层按「不可测」显示 `—`。
+   *
+   * ⚠️ **不再等价于「收到任何 chunk」**：结构帧（`block-start` / `block-end`）与
+   * `usage` / `finish` 只携带元数据，把它们算进来会把首字用时记成「适配器建流的
+   * 时刻」（真实缺陷，由 `b0b56a8` 修复并引入 {@link isContentChunk} —— **不是**本次
+   * 改动；本次只补注释与分叉说明）。**必须在收块时测量**：包装层是唯一同时知道
+   * 「发起时刻」与「每块到达时刻」的位置（各适配器内部没有统一的测量点）。
+   *
+   * ⚠️ **与 `cline-request-log.ttftMs` 存在已知分叉**（Cline 那份仍是「任何 chunk」
+   * 口径），详见 `src/token-ledger.ts` 的 `ttftMs` 字段注释 —— 不要照抄「口径一致」。
    */
   let ttftMs = 0
   /**

@@ -2273,8 +2273,13 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
     visibleEntries.map((entry) => [
       Number.isFinite(entry.ts) ? new Date(entry.ts).toISOString() : '', channelLabel(entry.channel), entry.model,
       entry.error === undefined ? '成功' : '失败',
-      totalTokensOf(entry),
-      entry.inputTokens ?? 0, entry.outputTokens ?? 0, entry.cacheReadTokens ?? 0,
+      // ⚠️ 未收到 usage 的失败行导出**空串**而非 0：界面用 `—` 与真实的 0 严格区分
+      //（见 token-ledger.ts 的「0 会被读成瞬间完成、没花 token」注释），
+      // CSV 若写 0 就与界面自相矛盾，且 Excel 里再也分不出「没数据」与「真的是 0」。
+      entry.usageReported === false ? '' : totalTokensOf(entry),
+      entry.usageReported === false ? '' : entry.inputTokens ?? 0,
+      entry.usageReported === false ? '' : entry.outputTokens ?? 0,
+      entry.cacheReadTokens ?? 0,
       entry.cacheWriteTokens ?? 0, entry.reasoningTokens ?? 0, entry.ttftMs ?? '',
       entry.tps ?? '', entry.durationMs ?? '', entry.error ?? '',
     ]));
