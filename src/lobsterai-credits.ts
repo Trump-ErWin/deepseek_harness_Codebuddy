@@ -385,9 +385,15 @@ export async function fetchLobsteraiCreditBalance(
   // 超额扣费/计量回滚等异常下可能下发负值，原样透出会让卡片显示「-12.5 积分」，
   // 既无意义又会误导用户以为欠费。
   const total = roundCredits(Math.max(0, readNumber(envelope.data, 'totalCreditsRemaining')))
-  // totalCreditsRemaining 为 0 且拿不到明细 → 视为「查不到」而非「余额为 0」：
-  // 该字段缺失时 readNumber 返回 0，会把解析失败伪装成 0 积分。
-  if (total === 0 && packages.length === 0) return null
+  // 「字段在不在」是两回事（2026-10-10 彻查修正）：
+  //   · `totalCreditsRemaining` **存在**（服务端形状没变）但为 0 且无明细
+  //     ＝ 余额真的为空（每日登录奖励的包用完了）→ 如实返回 0，面板显示
+  //     「0 积分」，**不再伪装成「查询失败」**——原实现把这种情形也压成 null，
+  //     `collectCreditBalances` 的 null 兜底文案「余额查询失败」让用户误读成
+  //     账号失效（实测 5/6 账号被这句误导，而调用层当天 0 错误）。
+  //   · **字段缺失**＝响应形状变了 → 才视为「查不到」（原注释想防的
+  //     「解析失败伪装成 0 积分」由本条守住，`data:{}` 单测继续走 null）。
+  if (envelope.data.totalCreditsRemaining === undefined && packages.length === 0) return null
   // 失效包的余额同样 clamp：负值计入 expiredTotal 会让「另有 N 已失效」变成负数。
   const expiredTotal = roundCredits(
     packages.reduce((sum, pkg) => sum + (pkg.active ? 0 : Math.max(0, pkg.remaining)), 0),

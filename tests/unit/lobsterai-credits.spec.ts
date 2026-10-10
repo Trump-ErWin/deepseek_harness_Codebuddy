@@ -422,6 +422,18 @@ describe('fetchLobsteraiCreditBalance', () => {
     expect((await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher))?.total).toBe(0)
   })
 
+  it('总额字段在但是 0 且无明细 → 返回 0（余额真的为空，2026-10-10 彻查）', async () => {
+    // 实测 5/6 账号：profile-summary 200 + totalCreditsRemaining:0 + creditItems:[]。
+    // 旧实现返回 null ⇒ 面板「余额查询失败」，用户误读成账号失效（调用层当天 0 错误）。
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: 0, creditItems: [] },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    expect(balance?.total).toBe(0)
+    expect(balance?.packages).toHaveLength(0)
+    expect(balance?.expiredTotal).toBe(0)
+  })
+
   it('既无总额也无明细时返回 null（不把解析失败伪装成 0 积分）', async () => {
     const { fetcher } = stubFetch(() => new Response(JSON.stringify({ code: 0, data: {} }), { status: 200 }))
     expect(await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)).toBeNull()
