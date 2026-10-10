@@ -225,6 +225,7 @@ const STYLES = `
    不再用 100vh - 48px 这类视口算式 —— 否则 8vh 大于 24px 时会溢出视口。 */
 .dim-jh-modalOverlay--top .dim-jh-modal { max-height: 100%; }
 .dim-jh-modal { display: flex; flex-direction: column; width: min(560px, 100%); max-height: min(640px, calc(100vh - 48px)); padding: 20px 22px; border-radius: 14px; background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 16px 48px rgba(0,0,0,0.22); }
+.dim-jh-modal--ledger { width: min(960px, 100%); max-height: min(820px, calc(100vh - 40px)); }
 .dim-jh-modalHead { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .dim-jh-modalTitle { min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; font-size: 15px; line-height: 22px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
 .dim-jh-modalSubtitle { overflow: hidden; font-size: 12px; line-height: 18px; font-weight: 400; color: var(--dsw-alias-label-tertiary, #8f959e); text-overflow: ellipsis; white-space: nowrap; }
@@ -532,7 +533,7 @@ const STYLES = `
    卡片结构与网关弹窗的供应商卡片同一规格语言（细边框 + 圆角 + 吸顶头），
    但不吸顶：本弹窗层级只有两级，吸顶收益小于复杂度。
    ⚠️ 本文件整体是 JS 模板字符串，注释里绝不能出现反引号 —— 类名一律裸写。 */
-.dim-jh-ledgerFilters { display: flex; gap: 6px; margin-bottom: 8px; }
+.dim-jh-ledgerFilters { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .dim-jh-ledgerFilterBtn { padding: 2px 10px; font-size: 11.5px; line-height: 17px; border-radius: 999px; opacity: .72; }
 .dim-jh-ledgerFilterBtn[data-active="true"] { opacity: 1; font-weight: 600; }
 .dim-jh-ledgerCard { min-width: 0; border: .5px solid var(--dsw-alias-border-l3, #e5e5e5); border-radius: 10px; overflow: hidden; }
@@ -557,33 +558,53 @@ const STYLES = `
 .dim-jh-ledgerModelTokens { flex: none; font-size: 11.5px; line-height: 17px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-primary, #1f2329); white-space: nowrap; }
 /* 均值格（首字 · 速率）：三级汇总行（渠道/账号/模型）共用，等宽数字对齐。 */
 .dim-jh-ledgerPerf { flex: none; font-size: 11px; line-height: 16px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
-/* ── 历史视图（第 4 期）：趋势柱状图 + 展开的日聚合树 ──
-   柱状图用纯 div（不引图表库）：每根柱 = 一天，高度按相对最大值的百分比。
-   ⚠️ 容器 height 由 barHeightPercent 的**百分比**决定上限（88%），故这里留出
-   足够净高；柱宽**不能**靠 flex 拉伸填满 —— 单日窗口只有一根柱时
-   flex: 1 0 14px 会把它横向拉满整行，呈现为「一整条白块」。
-   故给单柱/少柱窗口一个 max-width，让它保持柱子的形状。 */
+/* ── 历史视图（第 4 期）：GitHub 风格每日用量格 + 展开的日聚合树 ── */
 .dim-jh-ledgerSection { margin-bottom: 14px; }
 .dim-jh-ledgerSectionTitle { font-size: 13px; line-height: 19px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); margin-bottom: 6px; }
-.dim-jh-ledgerTrend { display: flex; align-items: flex-end; gap: 3px; height: 64px; padding: 4px 2px 0; overflow-x: auto; }
-/* 柱子列：横向可滚、但单柱不吃满宽（见上方注释）。 */
-.dim-jh-ledgerTrendCol { flex: 1 0 14px; min-width: 14px; max-width: 56px; height: 100%; display: flex; align-items: flex-end; cursor: pointer; }
-/* ⚠️ 颜色必须**自带可见性**：品牌变量 --dsw-alias-brand-primary 只在变量
-   *缺失* 时才走 #1677ff 兜底；一旦宿主主题把它定义成接近底色的浅色，再叠
-   opacity 就会退化成一块与背景同色的「白块」（真实缺陷 2026-10-07，深色主题
-   实测）。故：① opacity 从 .45 提到 .55（仍是「未选中」的弱化语义），
-   ② 补 box-shadow 描边 —— 即使底色与背景同色也留有边界，不会「消失」。 */
-.dim-jh-ledgerTrendBar { width: 100%; min-height: 2px; border-radius: 3px 3px 0 0; background: var(--dsw-alias-brand-primary, #1677ff); box-shadow: inset 0 0 0 1px rgba(127,127,127,.45); opacity: .55; transition: opacity .12s ease; }
-.dim-jh-ledgerTrendBar:hover { opacity: .8; }
-.dim-jh-ledgerTrendBar[data-today="true"] { opacity: .95; }
-.dim-jh-ledgerTrendBar[data-active="true"] { opacity: 1; outline: 1.5px solid var(--dsw-alias-brand-primary, #1677ff); }
-/* 日期短标签：常驻显示 MM-DD，根治「不知道哪根柱是哪天」。 */
-.dim-jh-ledgerTrendLabel { font-size: 10px; line-height: 12px; text-align: center; color: var(--dsw-alias-label-tertiary, #8f959e); font-variant-numeric: tabular-nums; }
+.dim-jh-ledgerHeatmapWrap { width: 100%; overflow-x: auto; padding: 4px 3px 8px; }
+.dim-jh-ledgerHeatmap { display: grid; grid-auto-flow: column; grid-template-rows: repeat(4, 12px); grid-auto-columns: 12px; gap: 4px; width: max-content; }
+.dim-jh-ledgerHeatmapCell { appearance: none; box-sizing: border-box; width: 12px; height: 12px; padding: 0; border: 1px solid rgba(34, 211, 238, .16); border-radius: 3px; background: rgba(34, 211, 238, .07); box-shadow: 0 0 2px rgba(34, 211, 238, .08); transition: background .12s ease, box-shadow .12s ease, transform .12s ease; }
+.dim-jh-ledgerHeatmap button.dim-jh-ledgerHeatmapCell { cursor: pointer; }
+.dim-jh-ledgerHeatmapCell[data-level="1"] { background: rgba(34, 211, 238, .25); box-shadow: 0 0 4px rgba(34, 211, 238, .16); }
+.dim-jh-ledgerHeatmapCell[data-level="2"] { background: rgba(34, 211, 238, .46); box-shadow: 0 0 5px rgba(34, 211, 238, .28); }
+.dim-jh-ledgerHeatmapCell[data-level="3"] { background: rgba(6, 182, 212, .84); border-color: rgba(103, 232, 249, .75); box-shadow: 0 0 7px rgba(34, 211, 238, .5); }
+.dim-jh-ledgerHeatmapCell[data-level="4"] { background: #0e7490; border-color: #67e8f9; box-shadow: 0 0 12px rgba(34, 211, 238, .9), inset 0 0 5px rgba(103, 232, 249, .72); }
+.dim-jh-ledgerHeatmap button.dim-jh-ledgerHeatmapCell:hover { transform: scale(1.18); border-color: #a5f3fc; box-shadow: 0 0 10px rgba(34, 211, 238, .8); }
+.dim-jh-ledgerHeatmapCell[data-today="true"] { outline: 1px solid #cffafe; outline-offset: 1px; }
+.dim-jh-ledgerHeatmapCell[data-active="true"] { outline: 2px solid #67e8f9; outline-offset: 2px; }
+.dim-jh-ledgerHeatmap button.dim-jh-ledgerHeatmapCell:focus-visible { outline: 2px solid #cffafe; outline-offset: 2px; }
+.dim-jh-ledgerDayPeek { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px; min-height: 30px; margin-top: 7px; padding: 5px 9px; border-radius: 7px; background: var(--dsw-alias-bg-layer-2, #f7f8fa); color: var(--dsw-alias-label-secondary, #4e5969); font-size: 11.5px; }
+.dim-jh-ledgerDayPeek strong { color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-ledgerChartHint { margin-top: 7px; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 11px; }
+.dim-jh-ledgerDeleteQuick { margin-left: auto; }
+.dim-jh-ledgerDateRange { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.dim-jh-ledgerDateRange label { display: flex; align-items: center; gap: 5px; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 11px; }
+.dim-jh-ledgerDateRange input { width: 136px; padding: 3px 6px; font-size: 11px; }
+.dim-jh-ledgerExport { flex: none; }
 /* 明细表：紧凑小字；模型列允许换行（长 wire 名不能截断 —— 网关弹窗同一条教训）。 */
-.dim-jh-ledgerTable { width: 100%; margin-top: 10px; border-collapse: collapse; font-size: 11.5px; line-height: 17px; }
+.dim-jh-ledgerEntryTools { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 12px 0 5px; }
+.dim-jh-ledgerEntryTools strong { margin-right: 2px; font-size: 13px; color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-ledgerEntryCount { margin-right: auto; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 11px; font-variant-numeric: tabular-nums; }
+.dim-jh-ledgerSearch { flex: 1 1 130px; width: auto; min-width: 120px; padding: 4px 7px; font-size: 11px; }
+.dim-jh-ledgerSelect { min-width: 82px; max-width: 130px; padding: 4px 6px; border: 1px solid var(--dsw-alias-border-l2, #d0d3d9); border-radius: 6px; background: var(--dsw-alias-bg-layer-1, #fff); color: var(--dsw-alias-label-primary, #1f2329); font-size: 11px; }
+.dim-jh-ledgerTable { width: 100%; margin-top: 4px; border-collapse: collapse; table-layout: fixed; font-size: 11.5px; line-height: 17px; }
 .dim-jh-ledgerTable th { position: sticky; top: 0; z-index: 1; padding: 4px 6px; text-align: left; font-weight: 600; color: var(--dsw-alias-label-tertiary, #8f959e); background: var(--dsw-alias-bg-layer-1, #fff); border-bottom: .5px solid var(--dsw-alias-border-l3, #e5e5e5); }
 .dim-jh-ledgerTable td { padding: 3px 6px; border-bottom: .5px solid var(--dsw-alias-border-l3, #f0f1f3); font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary, #4e5969); vertical-align: baseline; }
 .dim-jh-ledgerTable .dim-jh-ledgerEntryModel { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dsw-alias-label-primary, #1f2329); overflow-wrap: anywhere; }
+.dim-jh-ledgerTable tbody tr[data-error="true"] td { color: var(--dsw-alias-state-error-primary, #d93025); }
+.dim-jh-ledgerTable .dim-jh-ledgerError { cursor: help; font-weight: 600; }
+.dim-jh-ledgerTable .dim-jh-ledgerSuccess { color: var(--dsw-alias-state-success-primary, #25803c); }
+.dim-jh-ledgerPagination { display: flex; align-items: center; justify-content: flex-end; gap: 7px; padding: 7px 0; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 11px; }
+@media (max-width: 700px) {
+  .dim-jh-modal--ledger { padding: 14px 12px; }
+  .dim-jh-ledgerPerf { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .dim-jh-ledgerEntryTools { align-items: stretch; }
+  .dim-jh-ledgerEntryCount { flex: 1 1 50%; }
+  .dim-jh-ledgerSearch { flex-basis: 100%; }
+  .dim-jh-ledgerSelect { flex: 1 1 30%; max-width: none; }
+  .dim-jh-ledgerTable { font-size: 10px; }
+  .dim-jh-ledgerTable th, .dim-jh-ledgerTable td { padding: 3px 2px; overflow-wrap: anywhere; }
+}
 
 /* ── 模型列表的「计费/来源」分组（订阅 / 免费 / Cline Cloud / 按量计费）──
    分组由 model-groups.js 的纯函数决定（判据见其模块注释）；这里只管观感。
@@ -1042,15 +1063,141 @@ const STYLES = `
 
 `
 
-let injected = false
-export function installJetHubStyles() {
-  if (injected) return () => {}
-  injected = true
+/**
+ * 本插件的**包 id** —— 必须与 plugin-src/client/build.mjs 的 loaderId 逐字一致。
+ *
+ * ⚠️ 它同时是宿主 claimStyles / removeOwnedStyles 用的 ownerId
+ * （dsh-client-modules 的 stripClientSuffix(registration.id)），
+ * 也就是样式标签 data-plugin 的**正确取值**。改名必须两边一起改。
+ */
+const PLUGIN_ID = 'dsh-codearts-auth'
+
+/** 样式标签的资源标识（宿主 data-plugin-css 的语义，见下）。 */
+const STYLE_TAG_ID = PLUGIN_ID + '/jet-hub.css'
+
+/** 幂等判据用的选择器：按**资源标识**查自己的那张标签。 */
+/** 幂等判据用的选择器：按**资源标识**查自己那张标签。 */
+const STYLE_SELECTOR = 'style[data-plugin-css=' + JSON.stringify(STYLE_TAG_ID) + ']'
+
+/**
+ * 引用计数的挂载键。
+ *
+ * ⚠️⚠️ 计数必须挂在**元素**（dataset）上，不能挂在模块级变量上
+ * （真机实测 2026-10-09，issue IKKGYN）：
+ *
+ * 模块级变量只在**同一个模块实例**内有效，而宿主 replace 会先
+ * tearDownEntryFiber（它会 await 旧 fiber 的 inertia）再重新 import ——
+ * 新 factory 若跑在旧 dispose **之前**，就出现
+ * 「两个实例先后注入、disposer 交错执行」的交错。计数挂在 DOM 上则跨实例共享
+ * 同一份真相。
+ *
+ * ⚠️ 挂载后是 data-jet-hub-refs，是本插件**私有**属性名；
+ * 宿主 claimStyles / removeOwnedStyles 只认 data-plugin，不会碰它。
+ */
+const REFS_KEY = 'jetHubRefs'
+
+/** 当前挂在文档里的样式元素（不在就返回 null）。 */
+function styleElement() {
+  // ⚠️ 用字符串拼接而**不是**模板字符串：本文件的反引号数被单测钉死为 2
+  // （STYLES 的定界符），多一对就会命中「模板字符串被提前闭合」那条闸门。
+  return document.head.querySelector(STYLE_SELECTOR)
+}
+
+/** 插入一份样式表；已存在则**复用**（绝不新建第二份）。 */
+function mountStyles() {
+  const existing = styleElement()
+  if (existing !== null) return existing
   const style = document.createElement('style')
+  // ⚠️ 署名是**关键**（issue IKK764）：claimStyles 只认领无主标签，
+  // removeOwnedStyles 只删自己名下的标签。
+  style.dataset.plugin = PLUGIN_ID
+  style.dataset.pluginCss = STYLE_TAG_ID
   style.textContent = STYLES
   document.head.appendChild(style)
+  return style
+}
+
+/** 把引用计数读成整数（缺失 / 非法一律当 0）。 */
+function refsOf(style) {
+  const n = Number(style.dataset[REFS_KEY])
+  return Number.isFinite(n) ? n : 0
+}
+
+/**
+ * 注入 Jet Hub 的整张样式表。
+ *
+ * ## ⚠️⚠️ 为什么必须写 data-plugin（Gitee issue IKK764）
+ *
+ * 宿主（@deepseek-ai/dsh-client-modules 的 lib/client.js）对 style 标签有归属机制：
+ *
+ * - claimStyles(id)：把自己物化期间出现的**无主**标签
+ *   （选择器 style:not([data-plugin])）**全部**认领给当前插件；
+ * - removeOwnedStyles(id)：按 data-plugin 精确匹配删除，触发路径有四条 ——
+ *   该插件行 revision 变化（updateManifest）、对应行被 prune、factory 抛错、
+ *   条目被替换（replace）。
+ *
+ * 而 installJetHubStyles 是在 ctx.effect(...)（插件 apply 阶段）里注入的，
+ * **必然晚于自己那次 claimStyles**。所以无署名版本有双重缺陷：
+ *
+ * 1. 标签**始终无主** ⇒ 之后任何一个插件物化都会把它认领走；那个插件一热重载 /
+ *    被禁用 / 被卸载，宿主就把「它名下」的样式连根删掉 ⇒ **Jet Hub 整套 UI 掉样式**
+ *    （.dim-jh-* 全量，不是局部）；
+ * 2. 幂等按模块级布尔 ⇒ 标签被外部删除后**永不再补注**。
+ *
+ * 故这里：① 注入时**署名**；② 幂等按**DOM 存在性**判断。
+ *
+ * ## ⚠️⚠️ 为什么 disposer 改用「闭包持有元素 + 元素上引用计数」（IKKGYN）
+ *
+ * 旧 disposer 是 document.querySelector(STYLE_SELECTOR)?.remove() ——
+ * 它删的是**「当前那张」**，不是「自己注入的那张」。只要出现
+ * 「新实例先注入、旧 disposer 后执行」的交错（宿主 replace 的
+ * tearDownEntryFiber 会 await 旧 fiber 的 inertia，故 dispose 天然晚于新的 apply），
+ * 旧 disposer 就会把**新注入的那张**删掉，且此后无人补注 ⇒ IKK764 的故障面重新打开。
+ * 本机 CDP 实测该时序确实成立（新表 1 份 → 旧 disposer 跑完 → 0 份）。
+ *
+ * 现在：disposer **闭包持有自己那张元素**，只减自己的计数 —— 后来注入的那张
+ * （另一个元素）既不会被旧 disposer 减到，也就不会被误删。
+ *
+ * ⚠️ data-plugin-css 只是资源标识（宿主 claimStyles 回读它做 inventory），
+ * 用「包 id + 文件名」的形式，便于将来多张样式表各自幂等。
+ *
+ * ⚠️⚠️ 本文件的样式整体装在模板字符串里，**整份文件只允许 STYLES 首尾那两个
+ * 反引号**：注释里写字面反引号会提前闭合模板（AGENTS.md 红线，已有三条护栏用例
+ * 分别计数）。故上面所有标识符一律裸写，本函数内也不得再引入模板字符串 ——
+ * STYLE_TAG_ID / STYLE_SELECTOR 因此刻意用字符串拼接。
+ */
+export function installJetHubStyles() {
+  const style = mountStyles()
+  style.dataset[REFS_KEY] = String(refsOf(style) + 1)
+  let released = false
   return () => {
+    // 幂等守卫：cordis 允许同一 disposer 被调用两次，重入不得二次减计数。
+    if (released) return
+    released = true
+    // ⚠️ 只动**自己闭包里那张**元素：已被外部删掉就别再计数（元素不在文档里）。
+    if (style.parentNode === null) return
+    const left = refsOf(style) - 1
+    if (left > 0) {
+      style.dataset[REFS_KEY] = String(left)
+      return
+    }
     style.remove()
-    injected = false
   }
+}
+
+/**
+ * 渲染期自愈：样式表被外力摘掉（宿主回收、热更新、误删）时补回。
+ *
+ * ⚠️ 为什么记账还不够：「组件还在、样式没了」正是这样发生的 —— 记账只保证
+ * 「有人持有就不删」，管不住「已经被删掉之后」。而 installJetHubStyles 只挂在
+ * apply 阶段（ctx.effect），**渲染路径上不会重跑**，故必须另开一个渲染期入口，
+ * 否则样式表一丢就只能 F5 整页刷新才恢复。
+ *
+ * @returns 是否真的补了一次（补过就打一条 warn，便于直接定位而不是靠截图取证）
+ */
+export function ensureJetHubStyles() {
+  if (styleElement() !== null) return false
+  mountStyles()
+  console.warn('[jet-hub] 样式表缺失（被卸载或热更新摘除），已重新注入')
+  return true
 }
