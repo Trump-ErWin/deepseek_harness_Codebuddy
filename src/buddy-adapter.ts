@@ -968,9 +968,10 @@ export class BuddyAdapter extends LlmAdapter {
         // ⚠️ **本家是唯一真正使用「未知」语义的家**：`inputModalitiesFor` 用
         // `imageCapabilityKnown` 区分「远端明确 false」与「全都没查到」，
         // 后者**只报未知**（省略该字段）交给宿主判断。
-        // ⇒ **故意不提供** `unknownModelInputModalities`（其余 **10 家**都提供 `['text']`）。
-        // ⚠️ 家数实测为 10（2026-10-08 独立复审修正，原写「5 家」）。
-        //    完整名单与复核方式见 `model-catalog.ts` 里该字段的表格，别在这里抄。
+        // ⇒ **故意不提供** `unknownModelInputModalities`（其余 **12 家**都提供 `['text']`）。
+        // ⚠️ 家数实测为 12、且**不是**源码处数 10（`qoder-adapter.ts` 一处服务
+        //    两家）—— 两个口径都写错过一次。完整名单与复核方式见
+        //    `model-catalog.ts` 里该字段的表格，别在这里抄。
         // ⚠️ 若给它写 `['text']`，DSH 会按「确认是纯文本模型」把图片**静默投影成
         // 占位文本** ⇒ 图片能力被关掉（宿主契约：absent means unknown）。
       },

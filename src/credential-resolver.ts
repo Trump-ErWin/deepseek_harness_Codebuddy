@@ -133,8 +133,15 @@ import type { LoomyTierOptions } from './loomy-balance-rank.js'
  * 一行不用改），而单测不必构造整个池。
  *
  * ⚠️ `TCredential` **默认 `unknown`**：本模块不关心具体形状（形状校验是各家
- * `parseCredential` 的职责），13 家各自传自己的类型即可。默认值让既有测试桩
+ * `parseCredential` 的职责），各个调用点各自传自己的类型即可。默认值让既有测试桩
  * （它们只关心 `entry`）一行不用改。
+ *
+ * ⚠️ **刻意不写「几家」**：本句原写「**13 家**各自传自己的类型」，实测走本模块的
+ * 只有 **12** 个调用点（`codearts` 的 `resolveCredential` 无 fallback 且不收
+ * `modelId`，**刻意不纳入**本模块 —— 见 `AGENTS.md` 的抽象边界一节）。
+ * 这类「家数」是**必然腐坏**的快照，同一 PR 里已在别处写错过多次
+ * （`model-catalog.ts` 的未知模态名单 5 → 10 → 12）。
+ * ⇒ 名单的权威是调用点本身，不是本注释。
  */
 export interface ResolverPool<TCredential = unknown> {
   /** 列出该 provider 的**全部**账号（含已停用）。 */

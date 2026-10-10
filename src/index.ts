@@ -76,8 +76,13 @@ import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { registerProviderRuntime, expiryOf, wiredRefreshTargets, type ProviderRuntime } from './provider-runtime.js'
 // ⚠️ Task 8：探测适配器的**构造**从 `account-probe.ts` 搬到本文件（注册处）——
 //    那里已改为查注册表，未登记则抛错（不再有 `else` 兜底交给 CodeArtsAdapter）。
-//    ⇒ 这里需要**全部 10 家**会写 `modelRateLimits` 的适配器类（含 loomy / raccoon，
+//    ⇒ 这里需要**全部**会写 `modelRateLimits` 的适配器类（含 loomy / raccoon，
 //    旧链漏了它们 = 同型缺陷第 5 次）。
+//    ⚠️ **刻意不写「几家」**：本句原写「全部 **10 家**」，实测那只是**紧邻下面
+//    这一段**导入的类数（10）—— 而 `OpencodeAdapter` 的导入在更下面的独立一行
+//    （它同时供 `registerOpencodeLlm` 用），于是「会写标记的适配器类」实为 **11**；
+//    按**家**展开则是 **13**。同一事实在本文件的另一处又被写成「12 家」。
+//    ⇒ 权威清单与判据见 `probeById` 自己的头注释，别在这里写数字。
 import { BuddyAdapter } from './buddy-adapter.js'
 import { LobsteraiAdapter } from './lobsterai-adapter.js'
 import { QoderAdapter } from './qoder-adapter.js'
@@ -318,8 +323,12 @@ export function makeReadImageRequest(ctx: Context) {
  * 判据是「该 provider 的适配器会不会写 `modelRateLimits`」（写了才有重测语义）。
  * 核对方式机械、不要靠记忆：
  *
- *     grep -n 'updateModelRateLimit(' src/*.ts        # 池侧写点
- *     grep -n 'markLimited' src/*.ts                  # 适配器侧注入点
+ *     grep -n 'updateModelRateLimit(' src/*.ts        # 写点（池侧定义 + 各适配器直调）
+ *     grep -n 'markLimited' src/*.ts                  # 适配器侧经回调注入的写点
+ *
+ * ⚠️ **两条都要跑**：实测多数适配器是**直调** `pool.updateModelRateLimit(...)`
+ * （只有 `cline` / `opencode` 用 `markLimited` 这个名字），只看第二条会把
+ * 大部分家漏掉。
  *
  * 实测（2026-10-08 独立复审按上述两条重跑）：**会写标记的 provider 共 13 家**
  * —— buddy、workbuddy、lobsterai、qoder、qodercn、cline、zcode、trae、
@@ -1860,7 +1869,15 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
        * 的解析顺序。**不要**在这里重复实现那条优先级（重复必然漂移）。
        *
        * ⚠️⚠️ **刻意不接 `throwIfAllAccountsRateLimited`** —— 与 IKJOZ9 修好的
-       * 那 10 家相反。
+       * 那批 provider 相反。
+       *
+       * ⚠️ **刻意不写「几家」**：本句原写「那 8 家」（写这句话时的快照），
+       * 后又改成「那 10 家」—— **两个数都不对**（实测接线处 = **11**，
+       * 与 `buddy-ratelimit-misreport.spec.ts` 的 `WIRING` 表逐一点名的
+       * 11 家一致）。这类「家数」是**必然腐坏**的快照：每新增一家就会失效，
+       * 而「数字对不上」会让人怀疑整段约定。
+       * ⇒ 名单的**唯一权威**是那张 `WIRING` 表（漏一家会点名），
+       * 本注释只留「那批」。
        *
        * 其余各家的兜底是读一个在 Jet Hub 登录路径下**从不被写入**的 `*_ACCESS_TOKEN`，
        * 于是「池被限流筛空」必然一路退化成 `undefined` → 适配器误报「请先登录」
@@ -2689,10 +2706,16 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         //    两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁死。
         expiry: expiryOf(expiryTable, id),
         // ⚠️ 与其余域同法：`probeById[id]` 用 `Object.hasOwn` 语义（下标会命中原型链）。
-        // ⚠️ **`probeById` 现登记 12 家**（buddy / workbuddy / lobsterai / qoder /
-        //    qodercn / cline / zcode / trae / gemini / codearts / loomy / raccoon），
+        // ⚠️ **`probeById` 已登记全部会写限流标记的家**（buddy / workbuddy /
+        //    lobsterai / qoder / qodercn / cline / zcode / trae / gemini /
+        //    codearts / loomy / raccoon / opencode），
         //    其余如实为 `undefined`（`adapterForProbe` 据此抛「不支持重测」，
         //    不落回 CodeArtsAdapter）。
+        //    ⚠️ **刻意不写「几家」**：本句原写「现登记 **12 家**」，实测顶层键是
+        //    **13** —— 漏了正下方那段注解里点名的 `opencode`（它的注册在同文件
+        //    另一处，数的时候极易漏掉）。名单本身也**不要在这里抄**：
+        //    它与 `probeById` 的头注释、`account-probe.ts` 的判据是同一条事实的
+        //    三份抄写，抄写必然漂移。权威名单见 `probeById`。
         //    ⚠️ 原注释写「只有 zcode / gemini / trae 注册」，那是 Task 8 计划里的
         //    **样例**被留在了原地（2026-10-08 独立复审发现）；完整名单与缺项
         //    见 `probeById` 自己的头注释（别在这里再抄一份易腐的清单）。
