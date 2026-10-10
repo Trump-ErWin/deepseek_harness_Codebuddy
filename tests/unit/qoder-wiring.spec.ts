@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { descriptorOf } from '../../src/provider-registry.js'
+import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const read = (p: string): string => readFileSync(resolve(here, p), 'utf8')
@@ -20,7 +22,11 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
   it('注册了 llm-qoder settings namespace（漏了会让模型设置页崩溃）', () => {
     // 模型设置页会用 provider id 计算 deriveKeyRef(provider)，
     // namespace 未注册时在 refFor → provider.toUpperCase 处崩溃。
-    expect(index).toContain("'llm-qoder'")
+    // ⚠️ 2026-10-08 改：原先扫 index.ts 源码文本找 `'llm-qoder'`。本次重构把 13 个
+    //    字面量收敛成从 `PROVIDER_REGISTRY` 派生 ⇒ 文本断言变红而行为没变。
+    //    改为断言声明值；「index.ts 真的按它注册了」由
+    //    `provider-registry-consumers.spec.ts` 的 `apply()` 行为用例守。
+    expect(descriptorOf('qoder')?.settingsNamespace).toBe('llm-qoder')
   })
 
   it('构造并注册了 Qoder 服务与 LLM 路由', () => {
@@ -41,9 +47,12 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
     // 末尾的 `modelAdapters` 供「显示列表」取不受黑名单影响的全量目录
     // （使被关闭的模型也显示正确的展示名/倍率，而不是退化成裸 id）。
     //
-    // ⚠️ 形参是**位置参数**：新增 provider 会插在 cline 与 modelAdapters 之间。
-    // 这里只断言「qoder 出现在 modelAdapters 之前」这一**不变式**，
-    // **不要**写死整串前缀 —— 那会让每加一个 provider 都假失败
+    // ⚠️ 2026-10-08 改措辞：auth 实例已是**命名对象**（键是 provider id），
+    // 不再是位置参数 —— 故本断言现在的含义是「`qoder` 键在 auths 对象字面量里，
+    // 且该字面量位于 `modelAdapters` 之前」。新增 provider 只是**多一个键**，
+    // 不再有「插队挤掉后续形参」这回事。
+    // ⚠️ 这里仍不限定 `qoder` 与 `modelAdapters` 之间**具体有哪些键** ——
+    // 写死整串会让每加一个 provider 都假失败
     //（加 Loomy、Raccoon、QoderCN 时各踩过一次）。
     // 「中国版紧跟国际版」这条更具体的约束由下面的 QoderCN 用例负责。
     expect(index).toMatch(
@@ -132,8 +141,9 @@ describe('QoderCN 宿主侧接线（src/index.ts）', () => {
   const index = read('../../src/index.ts')
 
   it('注册了 llm-qodercn settings namespace', () => {
-    // 漏了会让模型设置页在 deriveKeyRef(provider) → provider.toUpperCase 处崩溃
-    expect(index).toContain("'llm-qodercn'")
+    // 漏了会让模型设置页在 deriveKeyRef(provider) → provider.toUpperCase 处崩溃。
+    // ⚠️ 2026-10-08 改：同上一节，源码文本断言 → registry 行为断言。
+    expect(descriptorOf('qodercn')?.settingsNamespace).toBe('llm-qodercn')
   })
 
   it('用 QODER_CN 构造了第二个 QoderAuth 实例', () => {
@@ -185,12 +195,33 @@ describe('QoderCN 宿主侧接线（src/index.ts）', () => {
     expect(index).toMatch(/qodercn: pruned\([^)]*,\s*qoderCnAdapter\)/)
   })
 
-  it('registerJetHubRpc 把 qoderCn 作为 qoder 之后的位置参数传入', () => {
-    // ⚠️ 形参是位置参数：CN 实例必须紧跟国际版，便于同族对照。
-    // 与既有的 qoder 那条同理，**不要**限定中间有几个 provider。
-    expect(index).toMatch(
-      /registerJetHubRpc\(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, [\w, ]*modelAdapters\)/,
-    )
+  it('registerJetHubRpc 把 qoderCn 接到 provider id `qodercn` 键上', () => {
+    // ⚠️ 2026-10-08 改：原先这里断言**位置参数**的顺序
+    //    `/registerJetHubRpc\(ctx, pool, service, …, qoder, qoderCn, trae, …\)/`
+    //    —— 13 个形参改成**命名对象**后必然变红。
+    //    ⇒ 改为断言**键约定**：键是 provider id `qodercn`，值是变量 `qoderCn`。
+    //    这条比原断言更精确：原断言只能证明「qoderCn 排在 qoder 后面」，
+    //    而真正的风险是「键写成变量名 ⇒ 查表查不到中国版」。
+    //
+    // ⚠️⚠️ **2026-10-08 复审 Finding 2：这里曾写成相邻性正则**
+    //    `/qodercn:\s*qoderCn\b/` —— 它把「键」与「值」用**同一行相邻**绑死，
+    //    而对象字面量里键与值的相邻关系只是书写顺序（换行/加注释/调整排版都会
+    //    让它假失败）。⇒ 改为按 **AST** 取调用点第三个实参的属性名与初值：
+    //    `{ qodercn: qoderCn }` 的映射关系被**结构化**地读出来。
+    //    ⚠️ 键写成 `qoderCn` 这件事**类型层已经拦住**（`JetHubAuths` 没有该键
+    //    ⇒ TS2561），故本用例不再重复证明拼写，只证明**接线用的是 id 键**、
+    //    且值确实指向 `qoderCn` 这个实例（而不是国际版 `qoder`）。
+    //
+    // ⚠️ 「端到端分派真的落到中国版实例上」由行为用例守（真跑 apply +
+    //    account.refresh，且**反向验证**过「两键的值互换 ⇒ 变红」）：
+    //    `tests/unit/jet-hub-rpc-auth-wiring.spec.ts` 的
+    //    「★ 中国版账号分派到 qodercnAuth，不碰国际版 qoderAuth」。
+    const authKeys = jetHubAuthsCallKeys(index)
+    expect(Object.keys(authKeys), '键必须是 provider id `qodercn`（不是变量名 qoderCn）')
+      .toContain('qodercn')
+    expect(authKeys.qodercn, '`qodercn` 键的值必须是 `qoderCn` 实例（不是国际版 qoder）')
+      .toBe('qoderCn')
+    expect(Object.keys(authKeys), '变量名 `qoderCn` 不得出现在键位上').not.toContain('qoderCn')
   })
 
   it('续期调度不看 enabled（对 CN 同样成立）', () => {

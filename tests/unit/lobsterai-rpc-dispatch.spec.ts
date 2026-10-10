@@ -97,13 +97,23 @@ async function callRefresh(
   registerJetHubRpc(
     ctx as never,
     makePool(accounts) as never,
-    makeServiceStub('codearts', calls) as never,
-    makeServiceStub('buddy', calls) as never,
-    makeServiceStub('workbuddy', calls) as never,
-    makeServiceStub('lobsterai', calls) as never,
-    makeServiceStub('qoder', calls) as never,
-    makeServiceStub('qodercn', calls) as never,
-    makeServiceStub('trae', calls) as never,
+    // ⚠️ **命名对象**（2026-10-08 改，原为位置参数）：键是 **provider id**。
+    // 未列出的键（cline/loomy/…）本文件不触发，但类型要求 13 个键都在。
+    {
+      codearts: makeServiceStub('codearts', calls),
+      buddy: makeServiceStub('buddy', calls),
+      workbuddy: makeServiceStub('workbuddy', calls),
+      lobsterai: makeServiceStub('lobsterai', calls),
+      qoder: makeServiceStub('qoder', calls),
+      qodercn: makeServiceStub('qodercn', calls),
+      trae: makeServiceStub('trae', calls),
+      cline: {} as never,
+      loomy: {} as never,
+      raccoon: {} as never,
+      minimax: {} as never,
+      zcode: {} as never,
+      gemini: {} as never,
+    } as never,
   )
   const response = await getHandler()(new Request('http://127.0.0.1/api/jet-hub', {
     method: 'POST',
@@ -275,11 +285,15 @@ describe('account.refresh 失败语义（issue IKJOZA）', () => {
   /**
    * 让指定 provider 的续期**抛错**，其余照常。
    *
-   * ⚠ **必须覆盖 `registerJetHubRpc` 的全部 15 个 provider 形参**（位置传参，
-   * 少传即错位 —— 该函数历史上已因此错位复发 6 次）。缺一个形参时该 provider
-   * 拿到 `undefined`，一旦换成它**根本走不到它自己的失败分支**：
-   * 初版只造了 7 个桩，于是 issue 里真实出现过的 `raccoon` / `minimax` 两条失败
-   * 路径**零覆盖**，还把 raccoon 的报错挂到了 `trae` 上凑数。
+   * ⚠ **必须覆盖 `registerJetHubRpc` 的全部 13 个 provider 键**（2026-10-08 起是
+   * **命名对象**；此前是位置传参，少传即错位 —— 该函数历史上已因此错位复发 6 次）。
+   * 缺一个键时该 provider 拿到 `undefined`，一旦换成它**根本走不到它自己的失败
+   * 分支**：初版只造了 7 个桩，于是 issue 里真实出现过的 `raccoon` / `minimax`
+   * 两条失败路径**零覆盖**，还把 raccoon 的报错挂到了 `trae` 上凑数。
+   *
+   * ⚠️ 命名对象下「漏一个键」由**类型检查**拦住（`JetHubAuths` 的 13 个字段
+   * 都是必填）—— 但这只在 `pnpm typecheck:tests` 覆盖到的文件里成立；
+   * 本文件不在其编译范围内，故这里的键清单仍靠**人工对齐**。
    */
   function makeThrowingStub(throwing: string, message: string) {
     const stub = (name: string) => ({
@@ -311,19 +325,9 @@ describe('account.refresh 失败语义（issue IKJOZA）', () => {
     registerJetHubRpc(
       ctx as never,
       makePool(accounts) as never,
-      services.codearts as never,
-      services.buddy as never,
-      services.workbuddy as never,
-      services.lobsterai as never,
-      services.qoder as never,
-      services.qodercn as never,
-      services.trae as never,
-      services.cline as never,
-      services.loomy as never,
-      services.raccoon as never,
-      services.minimax as never,
-      services.zcode as never,
-      services.gemini as never,
+      // ⚠️ **命名对象**（2026-10-08 改）：键是 **provider id**（`qodercn` 全小写），
+      // 值是实例。位置参数时代这里必须逐个按顺序摆 13 个桩，少一个就错位。
+      services as never,
     )
     const response = await getHandler()(new Request('http://127.0.0.1/api/jet-hub', {
       method: 'POST',

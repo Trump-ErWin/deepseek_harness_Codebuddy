@@ -19,6 +19,7 @@ import {
   supportsSubscriptionQuota,
 } from '../../plugin-src/client/credits-capabilities.js'
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
+import { PROVIDER_REGISTRY } from '../../src/provider-registry.js'
 import { BUDDY_EXPIRING_WINDOW_DAYS } from '../../src/buddy-balance-rank.js'
 import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
 import { LOOMY } from '../../src/loomy-product.js'
@@ -77,9 +78,10 @@ describe('积分能力矩阵', () => {
    * **刻意不维护第二份能力名单**，只按 `claimAll` 返回的信封判「跳过」，所以
    * 宿主漏一个守卫，它就会真去发一轮必然失败的请求。⇒ 两处必须成对存在。
    *
-   * ⚠️ 为什么用源码扫描：`registerJetHubRpc` 是 12 个**位置参数**，在测试里逐个
-   * 填替身既脆弱又与 `jet-hub-rpc.spec.ts` 的桩重复 —— 与本仓库
-   * `raccoon-rpc-dispatch.spec.ts` 对同类守卫的做法一致。
+   * ⚠️ 为什么用源码扫描：`registerJetHubRpc` 的 auths 是**命名对象**（13 个键，
+   * 键是 provider id），在测试里要逐个填替身既脆弱又与 `jet-hub-rpc.spec.ts`
+   * 的桩重复 —— 与本仓库 `raccoon-rpc-dispatch.spec.ts` 对同类守卫的做法一致。
+   * （2026-10-08 改措辞：此处原写「是 12 个**位置参数**」，那是 Task 9 之前的形态。）
    */
   it('宿主端 credits.claimAll 对 workbuddy 有显式守卫（与能力表成对）', () => {
     // ⚠️ 本文件里的 `here` 是**块内局部**变量（另有几处各写各的），这里自解析一次。
@@ -207,11 +209,13 @@ describe('积分能力矩阵', () => {
     expect(supportsSubscriptionQuota('loomy')).toBe(false)
   })
 
-  it('能力矩阵覆盖 PROVIDERS 中的每一个 provider', () => {
-    // 客户端 PROVIDERS 列表与能力表必须同步：漏登记的 provider 会静默失去
-    // 积分能力（默认关闭），而多登记的条目则是死配置。
-    const source = readClientSource()
-    const providerIds = [...source.matchAll(/\{\s*id:\s*'([a-z]+)',\s*label:/g)].map((m) => m[1]!)
+  it('能力矩阵覆盖 PROVIDER_REGISTRY 中的每一个 provider', () => {
+    // ⚠️ 2026-10-08 改：原先从**客户端源码文本**用正则
+    // `/\{\s*id:\s*'([a-z]+)',\s*label:/g` 派生 id —— 那个字符类
+    // **不匹配连字符**，新 provider id 带 `-` 时会**静默漏算一个 id
+    // 而守卫照样全绿**（本仓库原注释：「保险失效比变红更糟」）。
+    // 现在两侧同出一源：客户端 PROVIDERS 由 registry 派生，这里直接读 registry。
+    const providerIds = PROVIDER_REGISTRY.map((d) => d.id)
     expect(providerIds.length).toBeGreaterThan(0)
     for (const id of providerIds) {
       expect(CREDITS_CAPABILITIES, `缺少 ${id} 的能力登记`).toHaveProperty(id)

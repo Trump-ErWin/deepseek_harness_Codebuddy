@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
+import { descriptorOf } from '../../src/provider-registry.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const rpcSource = readFileSync(resolve(here, '../../src/jet-hub-rpc.ts'), 'utf8')
@@ -104,7 +105,13 @@ describe('Loomy RPC 分派', () => {
    * 概念，故只有 buddy 系带这个字段。
    */
   it('buddy 系的响应回传窗口天数（前端文案据此渲染）', () => {
-    expect(rpcSource).toMatch(/provider === CODEBUDDY\.id \|\| provider === WORKBUDDY\.id/)
+    // ⚠️ 2026-10-08 改：原先第一条断言扫源码文本找
+    //    `provider === CODEBUDDY.id || provider === WORKBUDDY.id`。本次重构把该四连
+    //    `||` 收敛成读 registry 的 `usesExpiryWindow` ⇒ 文本断言变红而行为没变。
+    //    留下的两条守的是**取值来源**（必须取自共享助手，不能写死 15）与**类型契约**；
+    //    「哪些渠道真的回传 windowDays」由**真跑端点**的行为用例守：
+    //    `provider-registry-consumers.spec.ts` 的
+    //    「credits.permanentLock 的响应体取决于 registry」。
     expect(rpcSource).toMatch(/windowDays: buddyExpiringWindowDays\(\)/)
     expect(rpcSource).toContain("from './buddy-balance-rank.js'")
     expect(typesSource).toMatch(/interface RpcPermanentLockResponse \{[\s\S]*?windowDays\?: number/)
@@ -122,14 +129,24 @@ describe('Loomy RPC 分派', () => {
    * （提示说只烧 15 天内的、实际按 7 天筛号）。
    */
   it('★ TRAE / LobsterAI 的响应同样回传窗口天数（判据是「按到期时间分桶」）', () => {
-    // 取 `usesExpiryWindow` 那一行起算，避免被别处同名字符串匹配到。
-    const start = rpcSource.indexOf('const usesExpiryWindow =')
-    expect(start, 'jet-hub-rpc.ts 里找不到 usesExpiryWindow').toBeGreaterThan(-1)
-    const decl = rpcSource.slice(start, start + 300)
-    expect(decl, 'usesExpiryWindow 必须含 TRAE').toContain('provider === TRAE.id')
-    expect(decl, 'usesExpiryWindow 必须含 LOBSTERAI').toContain('provider === LOBSTERAI.id')
-    // 判据**不是**「是不是 buddy」—— 保留断言防止有人改回旧写法。
-    expect(decl).not.toMatch(/isBuddy|=== 'buddy'/)
+    // ⚠️ 2026-10-08 改：原先这里扫 `src/jet-hub-rpc.ts` 的源码文本，要求
+    //    `usesExpiryWindow` 那一行里有 `provider === TRAE.id` 与
+    //    `provider === LOBSTERAI.id`。本次重构把该四连 `||` 收敛成读 registry 的
+    //    `usesExpiryWindow`（字面量搬家）⇒ 文本断言变红，而**行为完全没变**。
+    //
+    //    ⇒ **端到端行为断言搬到了唯一一处**（避免同一套 RPC 替身在两个文件里各写一份）：
+    //    `tests/unit/provider-registry-consumers.spec.ts` 的
+    //    「usesExpiryWindow：credits.permanentLock 的响应体取决于 registry（行为断言）」
+    //    —— 它真跑端点，遍历 registry 里每个 `permanentLock` 渠道，逐条核对响应体
+    //    是否带 `windowDays` 且与 `usesExpiryWindow` 一致。**比原断言更强**：
+    //    原断言只证明源码里有那两串字面量，它能证明端到端响应真的带/不带该字段。
+    //
+    //    本文件保留**声明值**断言（廉价的语义锚点）。
+    expect(descriptorOf('trae')?.usesExpiryWindow).toBe(true)
+    expect(descriptorOf('lobsterai')?.usesExpiryWindow).toBe(true)
+    // ⚠️ 判据**不是**「是不是 buddy」、也**不含** loomy —— 后者没有窗口概念
+    //（服务端直接给两个命名池），保留这条防止有人把 loomy 也登记进去。
+    expect(descriptorOf('loomy')?.usesExpiryWindow).toBeUndefined()
   })
 
   it('后端有 provider 白名单，且与 Loomy/Buddy 的支持面一致', () => {

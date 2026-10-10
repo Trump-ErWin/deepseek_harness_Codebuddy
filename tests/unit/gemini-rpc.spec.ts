@@ -20,9 +20,13 @@
  *
  * ## 本文件锁死的三个已知坑
  *
- * 1. **位置参数错位**：`registerJetHubRpc` 的 provider 形参是按顺序传的，
- *    新 provider 一律**追加在末尾**（gemini 排在 zcode 之后），少传/插队会让
- *    后面的 `modelAdapters` 整体错位 —— 本仓库已复发 6 次。
+ * 1. ~~**位置参数错位**：`registerJetHubRpc` 的 provider 形参是按顺序传的，~~
+ *    ~~新 provider 一律**追加在末尾**（gemini 排在 zcode 之后），少传/插队会让~~
+ *    ~~后面的 `modelAdapters` 整体错位 —— 本仓库已复发 6 次。~~
+ *    **已消除**（2026-10-08，Task 9）：auth 实例改成**命名对象**（键是 provider id），
+ *    错位在类型层面不可能，`modelAdapters` 也成了独立形参。
+ *    ⚠️ 这是**历史坑**，留在这里是为了解释本文件为何大量使用「显式摆出 13 个键」的桩；
+ *    别再据此以为现在还有位置顺序可数。
  * 2. **必须立刻返回 loginUrl**：`window.open` 只在用户手势窗口内有效。
  * 3. **`login.poll` 靠「凭据是否已写入」判定**，与 provider 无关；故占位账号
  *    存在但凭据未写时必须回 `done:false`（前端据此继续轮询，而不是提前关窗）。
@@ -37,6 +41,8 @@ import { registerJetHubRpc, JET_HUB_API_PATH } from '../../src/jet-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { GeminiAuth } from '../../src/gemini-auth.js'
 import { GEMINI, GEMINI_ENDPOINT_SANDBOX, GEMINI_QUOTA_PATH } from '../../src/gemini.js'
+import { descriptorOf } from '../../src/provider-registry.js'
+import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
 import { clearGeminiCreditCache } from '../../src/gemini-credits.js'
 
 /** 内存凭据存储（与其它 provider 的 spec 同款）。 */
@@ -151,20 +157,24 @@ function makeRpc(options: { withIdToken?: boolean; gemini?: unknown } = {}) {
   const gemini = options.gemini ?? new GeminiAuth(ctx, { fetchImpl: makeFetchStub(calls, options) })
   registerJetHubRpc(
     ctx, pool,
-    // ⚠️ **13 个 provider 形参**，逐个具名 —— 少一个就错位（见文件头第 1 条）。
-    {} as never, // codearts
-    {} as never, // buddy
-    {} as never, // workbuddy
-    {} as never, // lobsterai
-    {} as never, // qoder
-    {} as never, // qoderCn
-    {} as never, // trae
-    {} as never, // cline
-    {} as never, // loomy
-    {} as never, // raccoon
-    {} as never, // minimax
-    {} as never, // zcode
-    gemini as never, // gemini（追加在末尾）
+    // ⚠️ **命名对象**（2026-10-08 改，原为 13 个位置参数）：键是 **provider id**
+    //（`qodercn` 全小写），值是实例。位置参数时代这里必须逐个具名摆 13 个槽位，
+    // 少一个就整体错位（见文件头第 1 条）。
+    {
+      codearts: {} as never,
+      buddy: {} as never,
+      workbuddy: {} as never,
+      lobsterai: {} as never,
+      qoder: {} as never,
+      qodercn: {} as never,
+      trae: {} as never,
+      cline: {} as never,
+      loomy: {} as never,
+      raccoon: {} as never,
+      minimax: {} as never,
+      zcode: {} as never,
+      gemini: gemini as never,
+    } as never,
     undefined,
   )
   const h = handler()
@@ -462,13 +472,34 @@ describe('Gemini 接线点（源码断言）', () => {
 
   it('⚠️ index.ts 接线点齐全，且签名缓存在卸载时落盘', () => {
     expect(indexSource).toContain("from './gemini-auth.js'")
-    expect(indexSource).toContain("'llm-gemini'")
+    // ⚠️ 2026-10-08 改：原先扫 index.ts 源码文本找 `'llm-gemini'`。本次重构把 13 个
+    //    字面量收敛成从 `PROVIDER_REGISTRY` 派生 ⇒ 文本断言变红而行为没变。
+    //    改为断言声明值；「index.ts 真的按它注册了」由
+    //    `provider-registry-consumers.spec.ts` 的 `apply()` 行为用例守。
+    expect(descriptorOf('gemini')?.settingsNamespace).toBe('llm-gemini')
     expect(indexSource).toContain('new GeminiAuth(ctx)')
     expect(indexSource).toContain('registerGeminiLlm(ctx, {')
     // ⚠️ 漏了这一条 ⇒ 续期定时器**永不武装**（不是「刷得慢」，是压根不刷）。
     expect(indexSource).toContain("['gemini', (p) => gemini.refreshAll(p)]")
     expect(indexSource).toMatch(/gemini: pruned\([^)]*,\s*geminiAdapter\)/)
-    expect(indexSource).toMatch(/loomy, raccoon, minimax, zcode, gemini, modelAdapters/)
+    // ⚠️ 2026-10-08 改：原先这里断言**位置参数**的尾部顺序
+    //    `/loomy, raccoon, minimax, zcode, gemini, modelAdapters/`。
+    //    13 个形参改成**命名对象**后必然变红，而它守的意图（gemini 接上了）
+    //    **与位置无关**。⇒ 改为断言**键存在**（键是 provider id）；
+    //    「端到端分派真的落到 gemini 实例上」由行为用例守：
+    //    `tests/unit/jet-hub-rpc-auth-wiring.spec.ts` 的
+    //    「★★ 每个 provider id 的续期都分派到自己的 auth 实例」。
+    //
+    // ⚠️⚠️ **2026-10-08 复审 Finding 2：这里曾写成相邻性正则**
+    //    `/\bzcode,\s*gemini,/` —— 命名对象下**键的相邻关系零语义**：
+    //    重排成 `… gemini, …, zcode,`（语义等价）或在这两个键之间插入新键都会
+    //    **假失败**。⇒ 改为按 **AST** 取调用点第三个实参的属性名
+    //   （见 `tests/helpers/jet-hub-auths.ts`）后断言键存在。
+    const authKeys = jetHubAuthsCallKeys(indexSource)
+    expect(
+      Object.keys(authKeys),
+      'gemini 必须出现在 registerJetHubRpc 的 auths 命名对象里（键 = provider id）',
+    ).toContain('gemini')
     // 丢的是下一轮能不能带签名。
     expect(indexSource).toContain('geminiSigStore.flush()')
   })

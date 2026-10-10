@@ -38,6 +38,32 @@ import type { ProviderAccountEntry } from '../../src/types.js'
 const { clearDeadModels, deadModelIdsFor, recordDeadModel } =
   await import('../../src/dead-model-store.js')
 
+/**
+ * 造一个 `JetHubAuths` 命名对象（13 个键齐全），每个键都用空对象占位。
+ *
+ * ⚠️ 2026-10-08 起 `registerJetHubRpc` 的 auth 实例是**命名对象**（键是
+ * **provider id**，`qodercn` 全小写），不再是 13 个位置参数。位置参数时代每个
+ * 调用点都要手写 13 个 `{}` 占位，漏一个就让后续形参整体错位（本文件历史上
+ * 因此踩过六次）。有了本助手，调用点只需交出这 13 个键，不必数占位。
+ *
+ * ⚠️ **本助手刻意不收 `overrides` 形参**（2026-10-08 复审 Finding 4）：初版带了
+ * 一个 `overrides` 参数，但 6 个调用点**全部**是 `authsStub()`，从未传过 ——
+ * 一个永远走默认值的形参是死代码，读的人会以为「有调用点在定制桩」。
+ * 本文件的所有用例都只驱动**不读 auth 实例**的端点（积分 / 排序 / 设置），
+ * 需要「某个 provider 的 auth 被真的调用」的行为用例在
+ * `jet-hub-rpc-auth-wiring.spec.ts` 与各 provider 自己的 spec 里（那里**显式**
+ * 摆出所需实例，比一个隐形默认值 + 覆盖更直白）。将来真需要定制时再加回来。
+ */
+function authsStub(): never {
+  const blank = () => ({} as never)
+  return {
+    codearts: blank(), buddy: blank(), workbuddy: blank(), lobsterai: blank(),
+    qoder: blank(), qodercn: blank(), trae: blank(), cline: blank(),
+    loomy: blank(), raccoon: blank(), minimax: blank(), zcode: blank(),
+    gemini: blank(),
+  } as never
+}
+
 describe('积分领取结果汇总', () => {
   it('统计成功数量与累计积分', () => {
     const outcomes: ClaimOutcome[] = [
@@ -728,20 +754,24 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     }
 
     registerJetHubRpc(
-      // ⚠️ 位置参数：中国版 `qoderCn` 紧跟 `qoder`，漏补占位会让后续形参整体错位。
-      // （加 Loomy 踩过一次、加 Raccoon 又踩一次、加 QoderCN 第三次 —— 见计划末尾
-      //  「把 registerJetHubRpc 改成具名参数对象」的后续项建议。）
-      ctx as never, pool as never,
-      makeAuth('codearts') as never,
-      {} as never, {} as never,
-      makeAuth('lobsterai') as never,
-      makeAuth('qoder') as never,
-      {} as never, // qoderCn（本组用例不触发）
-      makeAuth('trae') as never,
-      makeAuth('cline') as never,
-      {} as never, // loomy（本组用例不触发）
-      {} as never, // raccoon（本组用例不触发）
-      {} as never, // zcode（本组用例不触发）
+      // ⚠️ **命名对象**（2026-10-08 改，原为 13 个位置参数）：键是 **provider id**
+      //（`qodercn` 全小写），值是实例。位置参数时代这里漏补一个占位就会让后续
+      // 形参整体错位（本文件历史上踩过六次），命名对象让那类错位不再可能。
+      ctx as never, pool as never, {
+        codearts: makeAuth('codearts'),
+        buddy: {} as never,
+        workbuddy: {} as never,
+        lobsterai: makeAuth('lobsterai'),
+        qoder: makeAuth('qoder'),
+        qodercn: {} as never, // 本组用例不触发
+        trae: makeAuth('trae'),
+        cline: makeAuth('cline'),
+        loomy: {} as never, // 本组用例不触发
+        raccoon: {} as never, // 本组用例不触发
+        minimax: {} as never, // 本组用例不触发
+        zcode: {} as never, // 本组用例不触发
+        gemini: {} as never, // 本组用例不触发
+      } as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -821,8 +851,24 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
         }
       },
     }
-    // ⚠️ 位置参数：`qoderCn` 槽位补 `{}`（本用例只走 codearts，不触发它）。
-    registerJetHubRpc(ctx as never, pool as never, auth as never, {} as never, {} as never, {} as never, {} as never, {} as never, /* qoderCn */ {} as never, {} as never, {} as never, undefined)
+    // ⚠️ 命名对象（2026-10-08 改）：本用例只走 codearts，其余键用 `{}` 占位
+    //（类型要求 13 个键都在，但本文件不在 `pnpm typecheck:tests` 的编译范围内，
+    // 故这里靠人工对齐）。
+    registerJetHubRpc(ctx as never, pool as never, {
+      codearts: auth,
+      buddy: {} as never,
+      workbuddy: {} as never,
+      lobsterai: {} as never,
+      qoder: {} as never,
+      qodercn: {} as never,
+      trae: {} as never,
+      cline: {} as never,
+      loomy: {} as never,
+      raccoon: {} as never,
+      minimax: {} as never,
+      zcode: {} as never,
+      gemini: {} as never,
+    } as never)
     const response = await handler!(new Request('http://localhost/api/jet-hub', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -872,18 +918,23 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       },
     }
     registerJetHubRpc(
-      // ⚠️ 同样的位置参数陷阱：`failingAuth` 必须落在 trae 的位置上。
-      ctx as never, pool as never,
-      {} as never, // codearts
-      {} as never, // buddy
-      {} as never, // workbuddy
-      {} as never, // lobsterai
-      {} as never, // qoder
-      {} as never, // qoderCn
-      failingAuth as never, // trae
-      {} as never, // cline
-      {} as never, // loomy
-      {} as never, // raccoon
+      // ⚠️ 命名对象（2026-10-08 改）：`failingAuth` 落在 **`trae` 这个键**上。
+      // 位置参数时代它靠「数到第 7 个槽位」定位，数错就静默打到别的 provider 上。
+      ctx as never, pool as never, {
+        codearts: {} as never,
+        buddy: {} as never,
+        workbuddy: {} as never,
+        lobsterai: {} as never,
+        qoder: {} as never,
+        qodercn: {} as never,
+        trae: failingAuth,
+        cline: {} as never,
+        loomy: {} as never,
+        raccoon: {} as never,
+        minimax: {} as never,
+        zcode: {} as never,
+        gemini: {} as never,
+      } as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -1082,25 +1133,27 @@ describe('model.list / model.setDisabled 端点', () => {
     }
 
     registerJetHubRpc(
-      // ⚠️ 位置参数：每新增一个 provider 都要在这里补一个 `{}` 占位，
-      // 否则 `modelAdapters` 会错位落到最后一个 auth 形参上
-      // （加 Loomy 时踩过一次，加 Raccoon 又踩一次，加 QoderCN 第三次，
-      //  加 MiniMax 第四次、加 ZCode 第五次 —— 见计划末尾「把
-      //  registerJetHubRpc 改成具名参数对象」的后续项建议）。
-      ctx as never, pool,
-      {} as never, // codearts
-      {} as never, // buddy
-      {} as never, // workbuddy
-      {} as never, // lobsterai
-      {} as never, // qoder
-      {} as never, // qoderCn
-      {} as never, // trae
-      {} as never, // cline
-      {} as never, // loomy
-      {} as never, // raccoon
-      {} as never, // minimax
-      {} as never, // zcode（2026-09-29 新增，紧随 raccoon）
-      {} as never, // gemini（2026-10-03 新增，追加在 zcode 之后）
+      // ⚠️ **命名对象**（2026-10-08 改，原为 13 个位置参数 + `modelAdapters`）。
+      // 位置参数时代每新增一个 provider 都要在这里补一个 `{}` 占位，否则
+      // `modelAdapters` 会错位落到最后一个 auth 形参上（加 Loomy 踩过一次、
+      // 加 Raccoon 又踩一次、加 QoderCN 第三次、加 MiniMax 第四次、加 ZCode 第五次
+      // —— 本文件第 2223 行那段注释记录了第六次）。命名对象下 `modelAdapters`
+      // 是独立的第 4 个形参，**不可能**再被 auth 占位挤掉。
+      ctx as never, pool, {
+        codearts: {} as never,
+        buddy: {} as never,
+        workbuddy: {} as never,
+        lobsterai: {} as never,
+        qoder: {} as never,
+        qodercn: {} as never,
+        trae: {} as never,
+        cline: {} as never,
+        loomy: {} as never,
+        raccoon: {} as never,
+        minimax: {} as never,
+        zcode: {} as never,
+        gemini: {} as never,
+      } as never,
       options.modelAdapters as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -1842,8 +1895,8 @@ describe('积分端点的 provider 能力边界', () => {
     // 而不会因为抛 TypeError 变成误导性的 handler-failed。
     const pool = { listAccounts: async () => [] }
 
-    // ⚠️ 位置参数：`qoderCn` 槽位补 `{}`（加 QoderCN 时第三次踩这个坑）。
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never, /* qoderCn */ {} as never, {} as never, {} as never, {} as never, {} as never)
+    // ⚠️ 命名对象（2026-10-08 改）：13 个键由助手补齐（本组用例只走积分端点）。
+    registerJetHubRpc(ctx as never, pool as never, authsStub())
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     return async (method: string, payload: unknown) => {
@@ -2050,8 +2103,8 @@ describe('account.reorder 端点', () => {
       logger: { warn: () => {}, info: () => {} },
       credentials: { resolve: async () => undefined },
     }
-    // ⚠️ 位置参数：`qoderCn` 槽位补 `{}`（加 QoderCN 时第三次踩这个坑）。
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never, /* qoderCn */ {} as never, {} as never, {} as never, {} as never, {} as never)
+    // ⚠️ 命名对象（2026-10-08 改）：13 个键由助手补齐。
+    registerJetHubRpc(ctx as never, pool as never, authsStub())
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     const call = async (method: string, payload: unknown) => {
@@ -2221,33 +2274,16 @@ describe('provider.status / provider.setEnabled 端点', () => {
     }
 
     registerJetHubRpc(
-      // ⚠️ **位置参数**：auth 实例是按顺序传的，每新增一个 provider 都要在这里
-      // 补一个 `{}` 占位，否则 `modelAdapters` 会错位落到最后一个 auth 形参上。
-      // 加 Raccoon（第 9 个）时本地就因此踩过一次：`modelAdapters` 落到 `raccoon`
-      // 上 → `listAllModels()` 读不到 → `provider.status` 的 total 恒为 0、
-      // 三条用例假失败。改签名后请 `grep -n 'registerJetHubRpc(' tests/` 全部补齐。
-      // ⚠️ 合并上游 `qoderCn`（第 8 个）时**第四次**踩到同一个坑：git 认为本文件
-      // 「无冲突」（改动分散在不同段落），但 `qoderCn` 插入后这里的占位整体错位
-      // 一位 → `modelAdapters` 落到 `raccoon` 上 → 上面那三条用例再次假失败。
-      // **合并新增 provider 后必须重跑本组用例，不能只看 git 是否报冲突。**
-      // ⚠️ **第六次**（2026-10-01，为提交独立 PR 而把本分支重建到最新上游）：
-      // 上游此后又加了 `minimax` 与 `zcode` ⇒ 这里少两个占位、`modelAdapters`
-      // 落到 `zcode` 上，本组 3 条用例**再次**以完全相同的形态失败。
-      // 判据永远是同一条：`provider.status` 的 `total` 恒为 0 ⇒ 先数占位。
+      // ⚠️ **命名对象**（2026-10-08 改，原为 13 个位置参数 + `modelAdapters`）。
+      //
+      // 位置参数时代这里**六次**踩到同一个坑：每新增一个 provider 都要在中间补
+      // 一个 `{}` 占位，否则 `modelAdapters` 会错位落到最后一个 auth 形参上
+      //（加 Raccoon / QoderCN / MiniMax / ZCode 时各踩一次），表现为
+      // `provider.status` 的 `total` 恒为 0、本组 3 条用例假失败。
+      // 命名对象下 `modelAdapters` 是**独立的第 4 个形参**，auth 键的增减
+      // 再也挤不掉它 —— 这正是本次改签名要消除的缺陷。
       ctx as never, pool,
-      {} as never, // codearts
-      {} as never, // buddy
-      {} as never, // workbuddy
-      {} as never, // lobsterai
-      {} as never, // qoder
-      {} as never, // qoderCn
-      {} as never, // trae
-      {} as never, // cline
-      {} as never, // loomy
-      {} as never, // raccoon
-      {} as never, // minimax
-      {} as never, // zcode
-      {} as never, // gemini（新 provider 一律追加在末尾，见 registerJetHubRpc 注释）
+      authsStub(),
       (adapter !== undefined ? { buddy: adapter } : undefined) as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -2628,22 +2664,10 @@ describe('account.test 端点（**无条件**真发一次请求）', () => {
     }
 
     registerJetHubRpc(
-      // ⚠️ 位置参数（16 个）：漏一个就会让 modelAdapters 错位，判据是
-      // 「目录读不出来 / total 恒为 0」。见上一组用例的详细注释。
+      // ⚠️ 命名对象（2026-10-08 改）：`modelAdapters` 是独立的第 4 个形参，
+      // 不再会被 auth 键的数量挤掉（位置参数时代漏一个占位就让它错位）。
       ctx as never, pool,
-      {} as never, // codearts
-      {} as never, // buddy
-      {} as never, // workbuddy
-      {} as never, // lobsterai
-      {} as never, // qoder
-      {} as never, // qoderCn
-      {} as never, // trae
-      {} as never, // cline
-      {} as never, // loomy
-      {} as never, // raccoon
-      {} as never, // minimax
-      {} as never, // zcode
-      {} as never, // gemini
+      authsStub(),
       (adapter !== undefined ? { gemini: adapter } : undefined) as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -2854,19 +2878,11 @@ describe('cline.quota / cline.requestLog 端点', () => {
     }
 
     registerJetHubRpc(
-      // ⚠️ 位置参数：新增 provider 会让 `modelAdapters` 错位（本仓库已踩四次）。
-      // 本组用例不依赖 modelAdapters，但**占位数量必须与签名一致**。
+      // ⚠️ 命名对象（2026-10-08 改）：13 个键由助手补齐。位置参数时代这里只写到
+      // `raccoon`（本组用例不依赖 modelAdapters），占位数量与签名不一致时
+      // 静默错位 —— 现在键名即语义，不存在「数占位」这回事。
       ctx as never, pool,
-      {} as never, // codearts
-      {} as never, // buddy
-      {} as never, // workbuddy
-      {} as never, // lobsterai
-      {} as never, // qoder
-      {} as never, // qoderCn
-      {} as never, // trae
-      {} as never, // cline
-      {} as never, // loomy
-      {} as never, // raccoon
+      authsStub(),
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
