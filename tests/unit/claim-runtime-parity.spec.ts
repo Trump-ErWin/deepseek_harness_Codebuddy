@@ -814,6 +814,57 @@ describe('★ onboarding.* 真的查表（注入哨兵）', () => {
     expect(result.ok).toBe(false)
     expect(result.error?.message).toBe('unsupported provider: unknownprovider')
   })
+
+  /**
+   * ⚠️ **G3-4 的行为变更，必须有用例守着**（2026-10-08 收尾轮补测）。
+   *
+   * 本用例是**反向验证发现的缺口**：G3-4 登记的是「loomy 的 `onboarding.claim`
+   * 失败码由 `jet-hub/handler-failed` 变成 `bad-request`」，但把源码里那个
+   * `code: 'bad-request'` 变异回 `'jet-hub/handler-failed'` 后，
+   * 相关四份用例（本文件 / `loomy-rpc-dispatch` / `raccoon-rpc-dispatch` /
+   * `jet-hub-rpc`）**全绿 190 条** —— 即该行为变更**当时零守卫**。
+   *
+   * 判据要点：
+   * - 断言的是 `code` 而**不只是 `ok:false`**（后者两版都一样，挡不住回归）；
+   * - 断言 message **是服务端原文**（旧行为下它会被降级，用户看不出是领取失败）；
+   * - loomy 与 raccoon **两家都要断言 `bad-request`** —— 它们现在共用同一处
+   *   `catch`，只测一家会漏掉「把统一又拆开」的回归。
+   */
+  it('★ claim 失败一律回 bad-request（不得降级成 handler-failed，G3-4 锁定）', async () => {
+    /**
+     * ⚠️ **两家委托的方法名不同**（`provider-onboarding.ts` 的 `deps` 契约）：
+     * loomy 是 `claimOnboardingTasks`、raccoon 是 `claimLoginReward`。
+     * 写错名字**不会报错** —— 骨架会静默回退到真实实现去打网络，本用例于是
+     * 测的是别的东西（首版就踩了这个坑：loomy 桩名写成了 `claim`，
+     * 结果报的是真实网络错误 `loomy: 请求失败（/onboarding/tasks）`）。
+     */
+    const CLAIM_DEPS = {
+      loomy: { claimOnboardingTasks: async () => { throw new Error('boom-loomy') } },
+      raccoon: { claimLoginReward: async () => { throw new Error('boom-raccoon') } },
+    } as const
+
+    for (const provider of ['loomy', 'raccoon'] as const) {
+      const { call, pool, credentials } = makeRpc(undefined, {
+        ...emptyAuths(),
+        [provider]: CLAIM_DEPS[provider],
+      })
+      await seed(pool, provider, `${provider}-1`, `${provider.toUpperCase()}_ACCOUNT_G34`)
+      await credentials.set(`${provider.toUpperCase()}_ACCOUNT_G34`, JSON.stringify({ access_token: 'AT' }))
+      vi.stubGlobal('fetch', async () => { throw new Error('必须走 auths 里的实例方法') })
+
+      const result = await call('onboarding.claim', { provider, accountId: `${provider}-1` })
+      expect(result.ok, provider).toBe(false)
+      expect(
+        result.error?.code,
+        `${provider} 的领取失败被降级成「未知故障」了 —— 用户看不出是领取失败`,
+      ).toBe('bad-request')
+      expect(
+        result.error?.message,
+        `${provider} 必须把服务端原文透出来，而不是换成固定文案`,
+      ).toBe(`boom-${provider}`)
+    }
+  })
+
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
