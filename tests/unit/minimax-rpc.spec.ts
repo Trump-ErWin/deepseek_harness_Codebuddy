@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { MINIMAX } from '../../src/minimax-product.js'
 import { descriptorOf } from '../../src/provider-registry.js'
+import { createProviderCredits } from '../../src/provider-credits.js'
 import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
 import { accountEntry, refreshHarness } from '../helpers/rpc-refresh.js'
 
@@ -116,7 +117,18 @@ describe('接线点完整性（源码断言）', () => {
     //    「credits.status 走注入的 credits 表」。
     //    本文件只保留**本端点独有的**那处真协议分支。
     expect(rpcSource).toContain('} else if (provider === MINIMAX.id) {')
-    expect(rpcSource).toContain('claimMinimaxDailyCheckin(credential)')
+    // ⚠️ 2026-10-08 改（Task 4）：原先断言 `jet-hub-rpc.ts` 的源码文本里含
+    //    `claimMinimaxDailyCheckin(credential)`。Task 4 把领取调用搬进
+    //    `src/provider-credits.ts` 的能力表 ⇒ 该文本**搬了家**，而它守的意图
+    //    （minimax 的签到接上了、且走它自己的原语）**与文本无关**。
+    //    ⇒ 改为读**表里的声明值**（真实现已由 `credits-runtime-parity.spec.ts` 的
+    //    「fetchStatus 只登记在真有同构状态端点的渠道上」与
+    //    `claim-runtime-parity.spec.ts` 的端点级行为用例覆盖）。
+    expect(createProviderCredits().minimax?.claim, 'minimax 的签到没有接上').toBeTypeOf('function')
+    // ⚠️ 它的预检走**自己**的状态端点（`fetchStatus`），而不是另立一份 claimStatus
+    //    —— 两处声明同一实现必然漂移。
+    expect(createProviderCredits().minimax?.fetchStatus, 'minimax 的状态端点没有接上').toBeTypeOf('function')
+    expect(createProviderCredits().minimax?.claimStatus, 'minimax 不该另立一份 claimStatus').toBeUndefined()
   })
 
   /**

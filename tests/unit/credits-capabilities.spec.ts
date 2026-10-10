@@ -19,6 +19,7 @@ import {
   supportsSubscriptionQuota,
 } from '../../plugin-src/client/credits-capabilities.js'
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
+import { createProviderCredits } from '../../src/provider-credits.js'
 import { PROVIDER_REGISTRY } from '../../src/provider-registry.js'
 import { BUDDY_EXPIRING_WINDOW_DAYS } from '../../src/buddy-balance-rank.js'
 import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
@@ -84,20 +85,38 @@ describe('积分能力矩阵', () => {
    * （2026-10-08 改措辞：此处原写「是 12 个**位置参数**」，那是 Task 9 之前的形态。）
    */
   it('宿主端 credits.claimAll 对 workbuddy 有显式守卫（与能力表成对）', () => {
-    // ⚠️ 本文件里的 `here` 是**块内局部**变量（另有几处各写各的），这里自解析一次。
-    const specDir = dirname(fileURLToPath(import.meta.url))
-    const rpcSource = readFileSync(resolve(specDir, '../../src/jet-hub-rpc.ts'), 'utf8')
-    expect(rpcSource).toContain("if (req.provider === 'workbuddy') {")
-    expect(rpcSource).toContain('WorkBuddy 国际版不支持每日签到')
-    // 守卫必须**早于** `productById` 兜底：否则会走到 buddy 产品分支真发请求
-    const guardAt = rpcSource.indexOf("if (req.provider === 'workbuddy') {")
-    const claimAllAt = rpcSource.indexOf("case 'credits.claimAll'")
-    expect(claimAllAt).toBeGreaterThan(-1)
-    expect(guardAt).toBeGreaterThan(claimAllAt)
-    // 该守卫的返回块里不能出现真实调用（只能是 ok:false 的信封）
-    const guardBlock = rpcSource.slice(guardAt, guardAt + 700)
-    expect(guardBlock).toContain('ok: false')
-    expect(guardBlock).not.toMatch(/collectClaimResults|await /)
+    // ⚠️ 2026-10-08 改（Task 4）：原先这条扫 `src/jet-hub-rpc.ts` 的源码文本，
+    //    断言里面含 `if (req.provider === 'workbuddy') {` 与那句文案，并检查
+    //    守卫**早于** `productById` 兜底。Task 4 把守卫搬进
+    //    `src/provider-credits.ts` 的 `claimUnavailableReason` ⇒ 那两串文本
+    //    **搬了家**，而它守的意图（workbuddy 调 claimAll **不发上游请求**、
+    //    拿到的是**指明能力**的拒绝）**与文本位置无关**。
+    //
+    //    ⇒ 改为**行为**断言：直接断言表里的声明值 + 真跑端点核对响应。
+    //    这比原文本断言强 —— 文本断言只能证明源码里有那串字符，它能证明
+    //    端到端真的返回了那条原因（且 `ok:false`，即**没有**发上游请求）。
+    const workbuddy = createProviderCredits().workbuddy
+    expect(workbuddy?.claim, 'workbuddy 不该有 claim（国际版后端没有签到接口）').toBeUndefined()
+    expect(
+      workbuddy?.claimUnavailableReason,
+      'workbuddy 缺少「不支持每日签到」的可读原因 —— 它会落到通用分支，'
+      + '用国际版凭据去发国内版的签到请求（必然失败的真实上游请求）',
+    ).toContain('WorkBuddy 国际版不支持每日签到')
+    // 反向：确认这条**不是**泛化的 `unsupported provider`（那会让排查者以为
+    // 「provider 没注册」，而真相是「该产品没有这个接口」）。
+    expect(workbuddy?.claimUnavailableReason).not.toContain('unsupported provider')
+    // ⚠️ 「端点真的读了这条声明、且**零上游请求**」由**行为**用例守，
+    //    且**只在唯一一处**（避免同一套 RPC 夹具在两个文件里各写一份）：
+    //    `tests/unit/claim-runtime-parity.spec.ts` 的
+    //    「cline / workbuddy / raccoon 各回**逐字保留**的可读原因」——
+    //    它真跑 `credits.claimAll` 并逐字核对文案。
+    //    ⚠️ **2026-10-08 更正（Task 4 复审 Finding Minor 1）**：本注释原先写
+    //    「把 `fetch` 桩成会抛错（任何真实请求都会让那条用例失败）」，那是**错的**
+    //    —— 那条用例用 `makeRpc()`（无 `fetch` 桩），**没有**任何会抛错的桩。
+    //    它的「零上游请求」由**代码位置**保证，不是由桩保证：端点在**任何上游
+    //    调用之前**读该声明并直接返回（见 `src/jet-hub-rpc.ts` 的
+    //    `impl?.claimUnavailableReason !== undefined` 分支，位于
+    //    `collectClaimResults` 之前）。故断言依然成立，只是理由换了。
   })
 
   it('Qoder 两项能力都有（余额 + 每日领取）', () => {

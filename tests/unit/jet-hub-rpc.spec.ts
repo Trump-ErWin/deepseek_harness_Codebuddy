@@ -15,6 +15,7 @@ import {
   registerJetHubRpc,
 } from '../../src/jet-hub-rpc.js'
 import type { CreditsEndpointDeps } from '../../src/jet-hub-rpc.js'
+import { createProviderCredits } from '../../src/provider-credits.js'
 // ⚠️ 下面每个 `connection.fetch` 替身都**按 path 挑处理器**（用 `JET_HUB_API_PATH`）。
 // 本模块除了 RPC 的 POST 端点还注册了内部载体的 GET 路由；替身若写成
 // 「谁最后注册就记谁」，加一条路由就会让所有 RPC 用例莫名其妙地打到载体页上，
@@ -2031,25 +2032,32 @@ describe('积分端点的 provider 能力边界', () => {
    * 与仓库里 `qoder-wiring.spec.ts` 守卫接线的方式一致。
    */
   it('TRAE 的 claim 分支开启状态预检并注入 fetchStatus（源码级守卫）', () => {
-    // 注意 `here` 是同级另一个 describe 内的局部常量，此处不可见，故就地算路径。
-    const srcPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/jet-hub-rpc.ts')
-    const source = readFileSync(srcPath, 'utf8')
-    // 从 claimAll 的 TRAE 分支起算（前面 credits.status 分支里也有同名判断，
-    // 用 `collectClaimResults<TraeCredential` 定位更准）。
-    const start = source.indexOf('collectClaimResults<TraeCredential')
-    expect(start).toBeGreaterThan(-1)
-    // 截到该分支的收尾 `return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }`
-    // 之后，避免扫到后续其它 provider 分支。
-    const rest = source.slice(start)
-    const end = rest.indexOf('RpcCreditsClaimAllResponse }')
-    const branch = end > -1 ? rest.slice(0, end) : rest.slice(0, 2000)
-    // 剔除注释行：本文件在注释里叙述了这条缺陷的成因（含 precheckStatus 字样）。
-    const code = branch
-      .split('\n')
-      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
-      .join('\n')
-    expect(code, 'TRAE 分支不得关闭状态预检').not.toContain('precheckStatus: false')
-    expect(code, 'TRAE 分支必须注入 fetchStatus').toContain('fetchStatus:')
+    // ⚠️ 2026-10-08 改（Task 4）：原先这条扫 `src/jet-hub-rpc.ts` 的源码文本，
+    //    找 `collectClaimResults<TraeCredential` 那段切片，断言里面没有
+    //    `precheckStatus: false` 且含 `fetchStatus:`。Task 4 把 TRAE 的配置搬进
+    //    `src/provider-credits.ts` 的能力表 ⇒ 那段文本**不存在了**（现在 claimAll
+    //    是查表分派），而它守的意图（**TRAE 必须开状态预检**，否则已签到账号被
+    //    报成「领取成功」= 用户报障「显示成功但 +0 积分」）**与文本位置无关**。
+    //
+    //    ⇒ 改为读**表里的声明值**。这是**更强的**判据：文本断言只能证明源码里
+    //    有那串字符，它能证明运行时真的声明了 `precheckStatus: true` 且**有**
+    //    状态查询实现可用（`claimStatus` / `fetchStatus` 至少有一个）。
+    //    端到端的「已签到账号不发 claim 请求」由
+    //    `claim-runtime-parity.spec.ts` 的「★ TRAE 开启状态预检」守（真跑端点、
+    //    核对实际请求）。
+    const trae = createProviderCredits().trae
+    expect(trae?.claim, 'TRAE 的领取没有接上').toBeTypeOf('function')
+    expect(
+      trae?.precheckStatus,
+      'TRAE 必须显式 precheckStatus: true —— 它的 claim 对「今天已签到」幂等，'
+      + '关掉预检会把已签到账号报成「领取成功」（真实报障：显示成功但 +0 积分）',
+    ).toBe(true)
+    // ⚠️ 预检必须有**可用的**状态查询（否则 precheckStatus:true 是空头承诺：
+    //    骨架拿不到 fetchStatus 就会退回 buddy 式默认实现）。
+    expect(
+      trae?.claimStatus ?? trae?.fetchStatus,
+      'TRAE 声明了 precheckStatus 却没有任何状态查询实现',
+    ).toBeTypeOf('function')
   })
 })
 

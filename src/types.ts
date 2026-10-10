@@ -414,7 +414,12 @@ export interface RpcCreditsStatusResponse {
 export interface RpcCreditsClaimAllRequest {
   provider: string
   /**
-   * 是否同时执行成长中心任务（buddy / workbuddy 专有）。
+   * 是否同时执行成长中心任务（**CodeBuddy 中国版专有**）。
+   *
+   * ⚠️ **不是**「buddy / workbuddy 专有」：WorkBuddy（国际版）后端**根本没有**
+   * 成长中心（contributor 在 !62 复审中实测确认：无任务列表、无 claim 端点），
+   * `src/provider-credits.ts` 只给 `buddy` 挂 `afterClaim`。
+   * 客户端那侧 `GROWTH_TASK_PROVIDERS` 同样只含 `buddy`（决定按钮渲不渲染）。
    *
    * ⚠️ **缺省为 `false`，且必须保持这样**：`credits.claimAll` 同时是「每日首次
    * 启动自动签到」的执行体（见 `src/auto-checkin.ts` 的 `claim` 回调），而成长

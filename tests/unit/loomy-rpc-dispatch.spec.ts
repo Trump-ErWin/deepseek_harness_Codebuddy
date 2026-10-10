@@ -90,9 +90,17 @@ describe('Loomy RPC 分派', () => {
     //    `account.refresh` 的 13 个同构 `case`（含 `case LOOMY.id:`）已被 Task 2
     //    收敛成一处查表分派（`authOf(auths, entry.provider)`），该分支里
     //    **不再出现 `LOOMY.id`**。
-    //    实测（2026-10-08）：本文件共 **12** 处 `LOOMY.id`，其中 account.create
-    //    （3 处）与 login.sendSms / submitSms / onboarding.* / permanentLock 等
-    //    分支占了多数；`>= 5` 这个阈值仍被满足，但**理由已换成这些真协议分支**，
+    //    实测（2026-10-08，**复审时逐处重新测量**，不采信旧数）：本文件
+    //    （= `src/jet-hub-rpc.ts` 的**源码文本**，不是本 spec 文件）共 **8** 处
+    //    `LOOMY.id`，逐处为：
+    //      ① `PERMANENT_LOCK_PROVIDERS` 集合；②~④ account.create 的 loomy
+    //      微信登录分支（`else if` 判据 / `provider:` 字段 / 失败告警）；
+    //      ⑤ login.sendSms；⑥ login.submitSms；
+    //      ⑦ loomy.permanentLock 老别名；⑧ **注释里的一处**（`onboarding.status`
+    //      那段记录「被删掉的手抄判据」的文字，不是代码）。
+    //    ⚠️ 其中**没有** `onboarding.*` 的代码分支 —— 它已被 Task 4 收敛成查表
+    //    （见 `src/provider-onboarding.ts`），第 ⑧ 处只是提到它。
+    //    `>= 5` 这个阈值仍被满足，但**理由已换成这些真协议分支**，
     //    与 account.refresh 无关 —— 写成「含 refresh」会让下一个读者以为那个
     //    case 还在。
     const occurrences = rpcSource.split('LOOMY.id').length - 1
