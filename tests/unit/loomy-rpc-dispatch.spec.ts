@@ -208,6 +208,22 @@ describe('Loomy RPC 分派', () => {
     for (const id of ['loomy', 'buddy', 'workbuddy']) {
       expect(PERMANENT_LOCK_PROVIDERS.has(id), `${id} 应在永久积分锁定白名单里`).toBe(true)
     }
+    /**
+     * ⚠️ 2026-10-08（Task 11-B）复核：这条**保留**，它不是「该被清理的冗余文本断言」。
+     *
+     * 判据是「**该断言能不能被行为用例替代**」：
+     * - 「集合的**内容**对不对」已经由 `permanent-lock-trae-lobsterai.spec.ts` 的
+     *   「后端白名单含两家，且未误加其它 provider」与
+     *   `provider-registry-consumers.spec.ts` 逐项对账 —— 那部分是**重复的**；
+     * - 但本行守的是**另一件事**：「端点在放行写锁定**之前真的查了这个集合**」。
+     *   ⚠️ 这一点**行为侧测不到** —— 行为用例只能观察到「白名单里的家能写、外面的不能」，
+     *   而把端点改成硬编码放行（`if (true)`）后那些行为用例**照样全绿**
+     *   （只要被观察到的几家还在集合里）。它是一个**结构断言**，与
+     *   `authOf(auths, entry.provider)` / `descriptorOf(...)` 同类。
+     *
+     * ⇒ 属于设计文档「编排可抽象，协议不抽象」里**应当保留**的那一类：
+     * 用**符号名**（不是行号、不是位置参数）匹配，重构不失效，语义也不含糊。
+     */
     expect(rpcSource).toMatch(/PERMANENT_LOCK_PROVIDERS\.has\(provider\)/)
   })
 

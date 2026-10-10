@@ -4,6 +4,7 @@ import { apply } from '../../src/index.js'
 import { JET_HUB_API_PATH } from '../../src/jet-hub-rpc.js'
 import { PROVIDER_REGISTRY, descriptorOf } from '../../src/provider-registry.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
+import { AUTH_EXEMPT, expectedProviderIdsWithAuth } from '../helpers/provider-sets.js'
 
 /**
  * ★★ **真接线回归**：`src/index.ts` 把每个 provider 的 auth 实例接到了
@@ -66,19 +67,12 @@ const AUTH_SERVICE: Readonly<Record<string, string>> = {
 }
 
 /**
- * 不占 auth 键位的两个 registry provider —— **理由不同，故必须分别被验证**。
- *
- * ⚠️ 这是一张**硬编码的豁免表**，不是「顺手写的名单」：registry 里**没有**
- * 「有没有 auth 服务」这个字段（`channel` 只表示「有没有账号/凭据/积分」），
- * 而唯一形似的字段 `settingsNamespace` 是**巧合而非语义**（它表示老契约
- * settings namespace；opencode 恰好是唯一没有它的 `channel`）—— 本仓库
- * AGENTS.md 明确反对用巧合字段推断语义（「用布尔而不是『有没有 accountExtras』
- * 来推断：那是巧合而非语义」）。故豁免只能显式列出，并由下面的用例**验证理由**。
+ * ⚠️ 2026-10-08（Task 11-F）：`AUTH_EXEMPT` 的**定义**已上移到
+ * `tests/helpers/rpc-refresh.ts`（同一判据原先在本文件、`rpc-refresh.ts` 与
+ * `provider-runtime-wiring.spec.ts` 里各写了一遍，实测四处集合完全相同）。
+ * 本文件仍负责**验证豁免理由**（下面「两个豁免者的豁免理由逐条被验证」那条）
+ * —— 那是本文件独有的能力：它拿得到 `AUTH_SERVICE`，而 helper 拿不到。
  */
-const AUTH_EXEMPT: ReadonlyMap<string, string> = new Map([
-  ['opencode', '它的 RPC 由 handleMethod 统一分派到 handleOpencodeRpc，没有 XxxAuth 服务'],
-  ['aggregate', '它没有账号 / 凭据 / 续期（registry 的 channel: false）'],
-])
 
 /**
  * **期望**占 auth 键位的 provider 集合 —— 从 `PROVIDER_REGISTRY` 派生，
@@ -98,10 +92,10 @@ const AUTH_EXEMPT: ReadonlyMap<string, string> = new Map([
  *
  * ⇒ 判据改为「registry 是权威、`AUTH_SERVICE` 是被测对象」：新增 provider 时
  * 只改 registry 而忘了登记 auth ⇒ **红，并点名那个 id**。
+ *
+ * ⚠️ 判据本体由 `expectedProviderIdsWithAuth()` 单一持有（Task 11-F 收敛）。
  */
-const EXPECTED_AUTH_PROVIDER_IDS: readonly string[] = PROVIDER_REGISTRY
-  .filter((d) => d.channel && !AUTH_EXEMPT.has(d.id))
-  .map((d) => d.id)
+const EXPECTED_AUTH_PROVIDER_IDS: readonly string[] = expectedProviderIdsWithAuth()
 
 /**
  * 把账号喂给 `AccountPool` 的后端。

@@ -70,7 +70,7 @@ export interface CatalogEntry {
    *
    * ⚠️ **设计文档的 `CatalogEntry` 漏了这个字段**（2026-10-08 预检发现）：
    * `cline-adapter.ts` 与 `lobsterai-adapter.ts` 都会下发它，漏掉就是**静默丢字段**。
-   * ⚠️ 但**免费标记不要写这里** —— `cline-adapter.ts:21` 有铁律：
+   * ⚠️ 但**免费标记不要写这里** —— `cline-adapter.ts` 有铁律：
    * 「免费模型在 `name` 里拼 ` · 免费`。**必须写进 `name` 而非 `description`**」。
    */
   readonly description?: string

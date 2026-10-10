@@ -57,6 +57,7 @@ import { TRAE_ENT_USAGE_PATH } from '../../src/trae.js'
 import { MINIMAX_CREDIT_DETAILS_PATH } from '../../src/minimax-product.js'
 import { GEMINI_QUOTA_PATH } from '../../src/gemini.js'
 import { createProviderCredits } from '../../src/provider-credits.js'
+import { expectedProviderIdsInCreditsTable } from '../helpers/provider-sets.js'
 
 /**
  * 端点级哨兵表的注入点（`vi.hoisted` 让它在 `vi.mock` 的**提升**工厂里可见）。
@@ -514,11 +515,9 @@ describe('★★ 逐家余额都走自己的上游端点（源码文本断言的
     // 判据：registry 里**有余额能力、且不是形态不匹配的特例**的渠道。
     // 特例是 opencode（本地派生、零网络）与 qoder 系（只吃 QoderCredential）——
     // 两者都由 `credits-runtime-parity.spec.ts` 的「特例的优先级」单独守。
-    const SPECIAL_CASES = new Set(['opencode', 'qoder', 'qodercn'])
-    const expected = PROVIDER_REGISTRY
-      .filter((d) => d.credits.balance === true && !SPECIAL_CASES.has(d.id))
-      .map((d) => d.id)
-      .sort()
+    // ⚠️ 2026-10-08（Task 11-F）：特例表与判据改由 `tests/helpers/provider-sets.ts`
+    // 单一持有（原先本文件里就写了两遍、另有一处在 `provider-runtime-wiring.spec.ts`）。
+    const expected = expectedProviderIdsInCreditsTable().sort()
     expect(
       Object.keys(BALANCE_PATH_OF).sort(),
       '端点清单与 registry 漂移：左侧多出 = 清单里有僵尸项，右侧多出 = registry 里'
@@ -554,11 +553,8 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
   it('★ 表里的渠道集合 === registry 里有余额能力、且非特例的渠道', () => {
     // ⚠️ 特例是**形态不匹配**的两类（见 `provider-credits.ts` 文件头）：
     //    opencode（本地派生、零网络）与 qoder 系（只吃 QoderCredential）。
-    const SPECIAL_CASES = new Set(['opencode', 'qoder', 'qodercn'])
-    const expected = PROVIDER_REGISTRY
-      .filter((d) => d.credits.balance === true && !SPECIAL_CASES.has(d.id))
-      .map((d) => d.id)
-      .sort()
+    // ⚠️ 2026-10-08（Task 11-F）：判据改由 `tests/helpers/provider-sets.ts` 单一持有。
+    const expected = expectedProviderIdsInCreditsTable().sort()
     const table = createProviderCredits()
     expect(
       Object.keys(table).sort(),

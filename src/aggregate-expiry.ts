@@ -534,11 +534,11 @@ export async function buddyExpiry(
  *
  * ⇒ 旧实现下，一个**余额已耗尽**的 buddy / workbuddy / lobsterai / trae 仍会被
  * auto 选中，请求随即以 `QUOTA_EXCEEDED` 失败 —— **与 PR #81 报障完全同型**，
- * 且 buddy / workbuddy 都在 `AUTO_PROVIDERS`（`auto-adapter.ts:84`）里。
+ * 且 buddy / workbuddy 都在 `AUTO_PROVIDERS`（`auto-adapter.ts`）里。
  *
  * ⚠️ 本仓库对「余额为 0」早有明确判据，旧实现与它**矛盾**：
- * `buddy-balance-rank.ts` 的 `buddyBalanceTier`（:195-203）在余额全为 0 时返回
- * `BUDDY_BALANCE_TIER.none`，而 `buddyTierUsable`（:210-212）明写
+ * `buddy-balance-rank.ts` 的 `buddyBalanceTier` 在余额全为 0 时返回
+ * `BUDDY_BALANCE_TIER.none`，而 `buddyTierUsable` 明写
  * **`none` 档不可用**。选号器判「不可用」、折算层判「可当选」= 同一语义两套判据
  *（AGENTS.md 首条红线）⇒ 现在两侧**同构**。
  *
@@ -552,7 +552,7 @@ export async function buddyExpiry(
  * ⚠️ 与 `zcodeExpiry` 的收窄是**同一手法**（「已拥有的余额 > 0」才可用；
  * 否则 `UNUSABLE`），两处口径一致 —— 别再让一家修好、另一家漏掉。
  *
- * ⚠️ 与 `buddy-balance-selector.ts:313-314` 那句「解锁时所有候选余额都是 0 仍返回
+ * ⚠️ 与 `buddy-balance-selector.ts` 那句「解锁时所有候选余额都是 0 仍返回
  * 第一个候选，让上游去报真正的失败原因」**不矛盾**：那句讲的是 **provider 内部**
  * 的选号（用户已指定该渠道，此时换号才有意义），本函数讲的是**跨渠道选型**
  * （余额 0 就该让给别的渠道，而不是把请求发过去必然失败）。
@@ -674,7 +674,7 @@ export async function loomyExpiry(credential: LoomyCredential): Promise<number> 
  * **对本渠道该推理不成立**，实测三格反例。
  *
  * ⚠️ 下表第 2 列是**那个被拒的提议**会产生的后果（不是本函数现状 —— 本函数恒返回
- * `NEVER`，没有「当日」分支；「当日」是更早的旧实现，见上文 `:533-539` 的记载）：
+ * `NEVER`，没有「当日」分支；「当日」是更早的旧实现，见上文的实测三格）：
  *
  * | 账户形态 | `credit` | 被拒提议的后果 | 本函数（现状） |
  * |---|---|---|---|
@@ -722,7 +722,7 @@ export async function codeArtsExpiry(credential: CodeArtsCredential): Promise<nu
  *
  * ## ⚠️ 但它**不需要**在本函数里补（这是本注释存在的唯一理由）
  *
- * benefit 耗尽**已经被记账**：`llm-adapter.ts:1290` 命中 `InferHub.4291.200` 时调
+ * benefit 耗尽**已经被记账**：`llm-adapter.ts` 命中 `InferHub.4291.200` 时调
  * `accountPool.updateModelRateLimit(currentAccountId, options.model, 次日 00:00)`，
  * 而账号池按 `entry.modelRateLimits[modelId]` 过滤候选
  *（`getAvailableAccount` / `listAvailableCredentials`）。
@@ -801,7 +801,7 @@ export async function zcodeExpiry(credential: ZcodeCredential): Promise<number> 
   // 完全同形**（都是 0 个桶 + `remaining: 0`），故按下面的判据会被算成 `UNUSABLE`
   // ⇒ **一个能正常推理的企业版账号被永久排除出 auto 候选**。
   //
-  // ⚠️ 上游在 `zcode-upstream.ts:257-259` 已就此**明文警告**：
+  // ⚠️ 上游在 `zcode-upstream.ts` 已就此**明文警告**：
   //    「企业版不下发额度数字、只给外部链接 —— 此时返回 `{enterprise:true,buckets:[]}`，
   //      **不要**显示成 0（**0 是「已用光」的语义**）」
   // 本函数违反的正是这句：把「不下发额度数字」当成了「余额为 0」。

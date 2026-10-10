@@ -15,7 +15,7 @@
  * 3. **图片两跳**：先 `projectRequestImage`（插件侧缩放，640,000 px），
  *    拿不到才 `readImage`（原图）。两者都拿不到**抛错**，绝不静默丢图。
  * 4. **`toolChoice` 恒 AUTO**：`@deepseek-ai/dsh-llm` 的 `GenerateOptions`
- *    **没有** `toolChoice` 字段（实测 `lib/types/types.d.ts:380-416`），
+ *    **没有** `toolChoice` 字段（实测 `lib/types/types.d.ts`），
  *    故不传；`translateGeminiRequest` 内部默认走 `AUTO`。
  */
 
@@ -202,7 +202,7 @@ export interface GeminiAdapterOptions {
   /**
    * 内联一张图片为**原始字节**（由调用方桥接 `ctx.attachments.readImage`）。
    *
-   * ⚠️ 契约与 `buddy-adapter.ts:195` 一致：**读不到必须抛错**，不得返回空。
+   * ⚠️ 契约与 `buddy-adapter.ts` 一致：**读不到必须抛错**，不得返回空。
    * 静默丢图会让用户以为图片被模型看到了（与 cline / lobsterai 同口径）。
    */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string }>
@@ -210,7 +210,7 @@ export interface GeminiAdapterOptions {
    * 取**请求版本**图片（附件服务按目标尺寸缩放）。
    *
    * ⚠️ 契约与 `readImage` **相反**：不可用时返回 `undefined`（不是抛错）——
-   * 缩放是优化，拿不到就发原图（见 `image-budget.ts:151`）。
+   * 缩放是优化，拿不到就发原图（见 `image-budget.ts`）。
    */
   readImageRequest?: (
     attachment: unknown,
@@ -302,9 +302,9 @@ export class GeminiAdapter extends LlmAdapter {
   /**
    * 完整目录（**不套黑名单**），供 Jet Hub「显示列表」用。
    *
-   * ⚠️ **必须同步返回数组，不能是 `async`**（`minimax-adapter.ts:218-242`
-   * 记录的同类缺陷：写成 async 会让 `jet-hub-rpc.ts:2041 [...all]` 与
-   * `:2125 all.map` 抛 `TypeError: all is not iterable`）。
+   * ⚠️ **必须同步返回数组，不能是 `async`**（`minimax-adapter.ts`
+   * 记录的同类缺陷：写成 async 会让 `jet-hub-rpc.ts` 的两个消费者（`[...all]` 与
+   * `all.map`）都抛 `TypeError: all is not iterable`）。
    *
    * ⚠️ **2026-10-08 Task 7b**：该同步契约（连同上面这条缺陷史）已在
    * `src/model-catalog.ts` 的 `syncCatalog` 上统一持有；此处只剩委托。
@@ -381,7 +381,7 @@ export class GeminiAdapter extends LlmAdapter {
   /**
    * 收集并内联本次请求涉及的全部图片。
    *
-   * ⚠️ 两跳都失败时**必须抛错**（`buddy-adapter.ts:1239-1285` 的权威写法）：
+   * ⚠️ 两跳都失败时**必须抛错**（`buddy-adapter.ts` 的权威写法）：
    * 静默丢弃会表现为「图片凭空消失、模型答非所问」，是最难排查的一类问题。
    */
   private async collectInlineImages(

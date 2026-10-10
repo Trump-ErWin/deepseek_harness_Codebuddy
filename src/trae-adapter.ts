@@ -685,7 +685,7 @@ export class TraeAdapter extends LlmAdapter {
     const fetchRemote = this.options.fetchRemoteModels
     if (this.remoteModels !== undefined || fetchRemote === undefined) return
     // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
-    // Trae 的目录超时上限 30s（src/trae.ts:68），失败不冷却会被 buildModelCatalog
+    // Trae 的目录超时上限 30s（src/trae.ts），失败不冷却会被 buildModelCatalog
     // 放大成「每模型一次」。
     await this.catalogGate.run(async () => {
       const models = await fetchRemote()

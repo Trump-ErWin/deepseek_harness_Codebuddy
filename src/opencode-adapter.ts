@@ -334,7 +334,7 @@ export class OpencodeAdapter extends LlmAdapter {
       resolved.reasoning = {
         efforts: capability.efforts.map((effort) => ({
           // ⚠️ `id` 是**品牌类型**（`ReasoningEffortId`），必须经它的构造函数 ——
-          // 与 Qoder 同款（`src/qoder-adapter.ts:581`）。
+          // 与 Qoder 同款（`src/qoder-adapter.ts`）。
           id: ReasoningEffortId(effort),
           // ⚠️ 没有官方中文的档位（models.dev 会下发 `minimal` / `xhigh` 等
           // Qoder 那份表里没有的值）**回退到 id 本身** —— 宁可显示英文原值，

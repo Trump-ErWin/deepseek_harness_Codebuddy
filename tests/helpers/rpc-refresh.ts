@@ -29,9 +29,10 @@
  */
 
 import { registerJetHubRpc, JET_HUB_API_PATH } from '../../src/jet-hub-rpc.js'
-import { PROVIDER_REGISTRY } from '../../src/provider-registry.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
+import { expectedProviderIdsWithAuth } from './provider-sets.js'
 
+/**
 /**
  * 13 个**可续期** provider —— **被测对象**（手写清单，故意不派生）。
  *
@@ -69,18 +70,16 @@ export const REFRESH_PROVIDERS = [
  * **期望**可续期的 provider 集合 —— 从 `PROVIDER_REGISTRY` 派生，
  * ⚠️ **绝不读 `REFRESH_PROVIDERS`**（否则比对恒真，见 `REFRESH_PROVIDERS` 的注释）。
  *
- * 判据与 `jet-hub-rpc-auth-wiring.spec.ts` 的 `AUTH_EXEMPT` **同源**：
- * `channel`（「有没有账号 / 凭据 / 积分」）减去**唯一**的显式豁免 `opencode`。
- * ⚠️ 那两条豁免各自的**理由**由 `jet-hub-rpc-auth-wiring.spec.ts` 的
+ * ⚠️ 2026-10-08（Task 11-F）：判据改由 {@link expectedProviderIdsWithAuth} 单一持有
+ *（原先这里与另外三处各自硬编码 `d.channel && d.id !== 'opencode'`）。
+ * 那两条豁免各自的**理由**由 `jet-hub-rpc-auth-wiring.spec.ts` 的
  * 「两个豁免者的豁免理由逐条被验证」负责 —— 本文件**不另立**第二套豁免判据
- *（本仓库红线：一个语义不许有两套判据）。故这里只写 id，不重复写理由。
+ *（本仓库红线：一个语义不许有两套判据）。
  *
  * ⚠️ 不用 `settingsNamespace` 之类的**巧合字段**推断：`opencode` 恰好是唯一没有
  * 它的 `channel` provider，但那是巧合而非语义（AGENTS.md 明确反对）。
  */
-export const EXPECTED_REFRESH_PROVIDER_IDS: readonly string[] = PROVIDER_REGISTRY
-  .filter((d) => d.channel && d.id !== 'opencode')
-  .map((d) => d.id)
+export const EXPECTED_REFRESH_PROVIDER_IDS: readonly string[] = expectedProviderIdsWithAuth()
 
 /** 一次续期调用的**全部**实参 —— 三个都要断（issue !IKIRTT 靠后两个）。 */
 export interface RefreshCall {

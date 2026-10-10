@@ -143,7 +143,7 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
    * 自己的 credential ref 里读出来**的派生值，故属于「状态」而非「存储」。
    *
    * 为什么不写回池：凭据可能被用户在别处更新（换账号名）、且池的
-   * `sanitizeAccounts`（`src/jet-hub-store.ts:173-191`）只保留
+   * `sanitizeAccounts`（`src/jet-hub-store.ts`）只保留
    * `id`/`provider`/`credentialRef` 三个字段，写进去也会被丢掉。
    */
   accountName?: string

@@ -1097,7 +1097,7 @@ export class AggregateAdapter extends LlmAdapter {
     //（真实缺陷，对抗审计实测证伪，2026-10-07 —— 我自己上一版正是这么错的）。
     //
     // 机制：建池时每个候选的 `expiry` 初值是 `NEVER`（见上方 `pool.push({…, expiry: NEVER})`），
-    // 而 `rankCandidates`（`aggregate-core.ts:145`）**只剔除 `UNUSABLE`** ——
+    // 而 `rankCandidates`（`aggregate-core.ts`）**只剔除 `UNUSABLE`** ——
     // `NEVER` 是合法排序值（语义是「可用、只是不临期」）。于是「只把候选从
     // `usable` 里拿掉」时，它的 `expiry` 仍是 `NEVER` ⇒ **照样进入候选序**，
     // 只是排在最后 ⇒ 当前面的候选失败时**回落到它**（`targets` 是逐个尝试的）。
@@ -1185,7 +1185,7 @@ export class AggregateAdapter extends LlmAdapter {
    * ## ⚠️⚠️ 为什么返回**映射**而不是「过滤后的数组」（真实缺陷，对抗审计实测证伪）
    *
    * 我上一版返回「过滤后的数组」，调用方拿它去折算临期 —— 但**建池时每个候选的
-   * `expiry` 初值是 `NEVER`**，而 `rankCandidates`（`aggregate-core.ts:145`）
+   * `expiry` 初值是 `NEVER`**，而 `rankCandidates`（`aggregate-core.ts`）
    * **只剔除 `UNUSABLE`**（`NEVER` 是合法排序值：「可用、只是不临期」）。
    * ⇒ 被过滤掉的候选 `expiry` 仍是 `NEVER`，**照样进入候选序**、只是排最后；
    * 当前面的候选失败时**回落到它**（`targets` 逐个尝试）。
@@ -1200,8 +1200,8 @@ export class AggregateAdapter extends LlmAdapter {
    *
    * 各 provider 的「额度耗尽」是按 **modelId** 记账的：
    * `AccountPool.getAvailableAccount` / `listAvailableCredentials` 都按
-   * `entry.modelRateLimits[modelId]` 过滤候选（`account-pool.ts:1463-1469` /
-   * `:1546-1552`），而 codearts 的 benefit（免费额度）耗尽正是写进那里的
+   * `entry.modelRateLimits[modelId]` 过滤候选（`account-pool.ts`），
+   * 而 codearts 的 benefit（免费额度）耗尽正是写进那里的
    * （`llm-adapter.ts` 的三处 `updateModelRateLimit` 调用）。
    *
    * 但 `createExpiryProbe` 取号时用的模型键是**该渠道目录的第一个模型**
@@ -1224,7 +1224,7 @@ export class AggregateAdapter extends LlmAdapter {
    * ## 取舍
    *
    * - ⚠️ **只在池实现了 `getAvailableAccount` 时过滤**：它是既有 API，但大量单测桩
-   *   只实现了 `disabledModelsFor`（见 `:580` 的注释）。缺失时**跳过过滤**而不是
+   *   只实现了 `disabledModelsFor`（见 `{@link refreshCatalog}` 的注释）。缺失时**跳过过滤**而不是
    *   判成不可用 —— 宁可少筛一层，不可把整池误剔除（与 `aggregate-expiry.ts` 对
    *   `listAvailableCredentials` 缺失时的降级同一取向）。
    * - ⚠️ 查询失败（抛错）时**保留该候选**：一次池查询异常不该让渠道整体消失。
@@ -1689,7 +1689,7 @@ export class AggregateAdapter extends LlmAdapter {
           //
           // ⚠️ 严格的替代方案是**延迟 `block-start`**（缓冲到第一个 delta 一起发，
           //    使「已开块」等价于「已吐内容」）—— 那确实是本仓库既有做法
-          //   （`buddy-adapter.ts:2068` 的 `announced: '名字可用的那一刻才发'`），
+          //   （`buddy-adapter.ts` 的 `announced: '名字可用的那一刻才发'`），
           //    但它要改动**所有**候选的产出路径（含 tool-call 的 id/name 装配时机），
           //    属于比本修复更大的改动面。留给后续任务，此处取安全的一刀切。
           if (openedBlocks.size > 0) {
@@ -1986,9 +1986,9 @@ export function registerAggregateLlm(
   // ⚠️ **注册后主动预热一次目录**（fire-and-forget，不阻塞注册）。
   //
   // 为什么必须预热：`listAllModels()` 被契约要求是**同步**方法，只能读上一次
-  // 推导结果；而 `provider.status`（`jet-hub-rpc.ts:3883`）会在**冷缓存**下直接
+  // 推导结果；而 `provider.status`（`jet-hub-rpc.ts`）会在**冷缓存**下直接
   // 调它并据条数算 `models.total`，判据是
-  // `closed = total > 0 && disabled === total`（同文件 `:3884-3903`）。
+  // `closed = total > 0 && disabled === total`（该分支即 `provider.status` 的 models.total 判据）。
   // 冷缓存时 `total` 只有 1（`auto`）⇒ 用户一关掉 `auto`，`disabled === total`
   // 即成立 ⇒ `aggregate` 被**误显示为「已关闭」**（掉进设置页的「已关闭」分组）。
   // 预热后 `this.catalog` 在**有已登录渠道时**非空（`refreshCatalog` 只在被调用时
@@ -1997,7 +1997,7 @@ export function registerAggregateLlm(
   // `total` 仍为 1 —— 那种状态下聚合确实无模型可选，`closed` 的判定与事实相符。
   //
   // 成本可控：各家的 `listModels` 内部都有 `providerCatalogVisible` 门控
-  //（`buddy-adapter.ts:1303` 等，门控在 `ensureRemoteModels()` **之前**）——
+  //（`buddy-adapter.ts` 等，门控在 `ensureRemoteModels()` **之前**）——
   // 未登录的渠道直接返回空目录、不发网络请求；已登录渠道本就会被模型选择器
   // 触发同一批请求，预热只是提前一次，随后 60 秒内走 `AGGREGATE_CATALOG_TTL_MS`。
   //

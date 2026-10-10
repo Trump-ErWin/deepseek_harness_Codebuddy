@@ -290,7 +290,7 @@ export class AutoAdapter extends LlmAdapter {
           // 主选型路径（`selectProvider`）已补该复核，但**改道路径原先漏了**：
           // 一个「支持图片但额度已尽」的渠道仍会被选成 imageTarget ⇒ 带图请求
           // 发出去必然失败。可达性真实：buddy 既声明 `['text','image']`
-          //（`buddy-adapter.ts:1272`）**又**会写 `modelRateLimits`（`:1922`）。
+          //（`buddy-adapter.ts`）**又**会写 `modelRateLimits`（见其 `updateModelRateLimit` 调用）。
           //
           // ⚠️ 同一缺陷在本文件已修过主路径、在 `aggregate-adapter.ts` 修过建池路径
           //    —— 这是第三处。**修同型缺陷时必须把同一文件里的所有实例一起找出来**，
@@ -403,7 +403,7 @@ export class AutoAdapter extends LlmAdapter {
    * 「已吐内容就不许切换」是同一个安全方向）。
    *
    * ⚠️ **已透出帧的处理**：零输出意味着 `textDelta` 从未出现，而
-   * `block-start` 只在有内容时才发（`openai-compat.ts:740-746`）⇒ 这一轮唯一
+   * `block-start` 只在有内容时才发（`openai-compat.ts`）⇒ 这一轮唯一
    * 可能已透出的只有 `usage` 帧，而它对 `BlockAssembler` 是**覆盖式**赋值
    * ⇒ 重发安全。故这里**不必缓冲整个流**（那会把透传改成带前瞻的缓冲，属更大的
    * 改动面，与 `aggregate-adapter.ts` 里「延迟 block-start」那条已知代价同类）。
@@ -610,7 +610,7 @@ export class AutoAdapter extends LlmAdapter {
    *
    * 「额度耗尽」在账号池里是**按 modelId 记账**的
    *（`entry.modelRateLimits[modelId]`；codearts 的 benefit 免费额度耗尽就写在那里，
-   * `llm-adapter.ts:1290`），而折算取号用的模型键**未必等于**这里要派发的模型：
+   * `llm-adapter.ts`），而折算取号用的模型键**未必等于**这里要派发的模型：
    *
    * | 消费者 | 折算取号用的键 | 实际派发 |
    * |---|---|---|
@@ -624,7 +624,7 @@ export class AutoAdapter extends LlmAdapter {
    * 上额度已尽时，auto 仍选中 `codearts/deepseek-v4.1-flash` —— 因为折算问的是
    * `glm-5.3-flash`（未被标记），按 modelId 的过滤**整体失效**。
    *
-   * ⚠️ 这**推翻**了 `index.ts:2210-2222` 那句「共享的松弛已核实无害」：该注释
+   * ⚠️ 这**推翻**了 `index.ts` 那句「共享的松弛已核实无害」：该注释
    * 假设「`probeModel` 不参与折算结果、故与派发无关」，但它**参与账号池的
    * 限流过滤** —— 而那正是「这个模型还能不能用」的判据。故这里必须显式复核。
    */
@@ -718,7 +718,7 @@ export class AutoAdapter extends LlmAdapter {
       return available !== null && available !== undefined
     } catch (error) {
       signal?.throwIfAborted()
-      // ⚠️ 三条判据，与 `aggregate-adapter.ts:1684-1689` 的 `isAbortLike` 逐字同构。
+      // ⚠️ 三条判据，与 `aggregate-adapter.ts` 的 `isAbortLike` 逐字同构。
       if (error !== null && typeof error === 'object') {
         const candidate = error as { name?: unknown; code?: unknown }
         if (candidate.name === 'AbortError' || candidate.code === 'ABORTED') throw error
@@ -740,9 +740,9 @@ export class AutoAdapter extends LlmAdapter {
    *
    * ⚠️⚠️ **必须带真实 modelId 取号，不能传空串**（真实缺陷，PR !69 审计实测）：
    * `getAvailableAccount` 对空 modelId 直接 `return true` 跳过限流过滤
-   * （`account-pool.ts:1049-1055`），而候选顺序就是**用户的手动顺序**
-   * （`:1057`）⇒ 空串取回的是「手动序第一个启用账号」，**哪怕它此刻正在限流**。
-   * 本仓库在 `index.ts:598-600` 已为同一坑留下过成文警告，这里是同一个缺陷的第二实例。
+   * （`account-pool.ts`），而候选顺序就是**用户的手动顺序**
+   * （手动序即候选数组的返回序）⇒ 空串取回的是「手动序第一个启用账号」，**哪怕它此刻正在限流**。
+   * 本仓库在 `index.ts` 已为同一坑留下过成文警告，这里是同一个缺陷的第二实例。
    *
    * 后果是多账号池的真实场景：手动序第一个号额度已烧完（折算 `NEVER`）、第二个号还有
    * 9 天后作废的额度 ⇒ auto 只看到第一个号 ⇒ 该 provider 被判成「无临期」而排到最后，

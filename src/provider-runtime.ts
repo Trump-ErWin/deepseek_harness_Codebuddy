@@ -65,6 +65,28 @@ import type {
  *
  * ⚠️ 只放**跨 provider 通用**的东西。各家私有的依赖（product 配置、fetch 包装）
  * 由各家在注册时闭包捕获。
+ *
+ * ## ⚠️ 三个字段的**读取实况**（Task 11-G 逐个实测后登记）
+ *
+ * 本仓库的惯例是「如实登记只被测试读 / 无读者的域」，免得下一个读者满仓找消费方
+ * （同款登记见 `ProviderRuntime` 的 `auth.refreshAccount` / `credits` / `onboarding`）。
+ * 本接口**更该登记**，因为它的读者比那些域**更少**。
+ *
+ * ⚠️ **查读取者时不要 grep 类型名 `ProviderCallContext`** —— 实测那是
+ * **假阴性**：实现侧的形参叫 `call`，类型靠推断、**不写类型名**，故在
+ * `provider-credits.ts` 里 grep 类型名得 **0** 次，而字段其实**有**活的读者。
+ * 正确做法是 grep `call.<字段名>`。
+ *
+ * | 字段 | 实现侧真实读取 | 说明 |
+ * |---|---|---|
+ * | `accountPool` | **2 处** | ✅ **活的**：`provider-credits.ts` 里 TRAE 的 `claim` 读写设备指纹代次（这是 `claim` 必须收 `entry` 的唯一理由）|
+ * | `resolveCredential` | **0 处** | 实现侧目前都自带凭据解析路径（各 auth / 适配器有各自的 `resolveCredential` 选项），未经本字段 |
+ * | `warn` | **0 处** | 实现侧改用 `console.warn`（如 `buddy-growth.ts` 的 `user_id` 缺失告警）**绕过了**本出口 |
+ *
+ * ⚠️ **`resolveCredential` / `warn` 零读取是「尚无」而非「无用」**：
+ * 两者都是实现侧**本该**走的共享入口（`warn` 尤其 —— 绕过它意味着告警不进宿主
+ * 日志，只在控制台），保留它们是为了让新实现有正路可走。
+ * 故这里是**登记**而不是删除；若将来确认永远不会有读者，再一起删。
  */
 export interface ProviderCallContext {
   /** 按 ref 名解析凭据（返回**原始字符串**，由各家自己 parse + 形状校验）。 */
