@@ -51,25 +51,19 @@ import type { ZcodeAuth } from './zcode-auth.js'
 import { ZCODE } from './zcode-product.js'
 import type { ZcodeCredential } from './zcode.js'
 import { phoneFromUserId, isUsableZcodeCredential } from './zcode.js'
-import type { ZcodeBalanceResult } from './zcode-upstream.js'
 import { ZCODE_LOGIN_PROVIDER, type ZcodeLoginProvider } from './zcode-login.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
 import { MINIMAX } from './minimax-product.js'
 import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
-import type { MinimaxCredential } from './minimax.js'
-import {
-  claimMinimaxDailyCheckin,
-  fetchMinimaxCreditBalance,
-  fetchMinimaxSigninStatus,
-} from './minimax-credits.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
-import type { GeminiCredential } from './gemini.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
-import { fetchGeminiCreditBalance } from './gemini-credits.js'
-import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
 import { LOBSTERAI } from './lobsterai-product.js'
+import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
+import { createProviderCredits, creditsOf } from './provider-credits.js'
+import { createProviderOnboarding, onboardingOf } from './provider-onboarding.js'
+import type { ProviderCallContext, ProviderCredits, ProviderOnboarding } from './provider-runtime.js'
 import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
@@ -89,10 +83,16 @@ import type { QoderCredential } from './qoder.js'
 import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits.js'
 import { isTraeRefreshable, traeCredentialExpiresAtMs, traeDisplayNickname } from './trae.js'
 import type { TraeCredential } from './trae.js'
-import { fetchClineCreditBalance } from './cline-credits.js'
 import { fetchClineUsageLimits } from './cline-quota.js'
 import { clineUpstreamOf, readClineRequestHistory } from './cline-request-log.js'
-import { readTokenLedger, readTokenLedgerDayMap, readTokenLedgerHistory, TOKEN_LEDGER_HISTORY_MAX_DAYS } from './token-ledger.js'
+import {
+  deleteTokenLedgerDay,
+  isValidTokenLedgerDayKey,
+  readTokenLedger,
+  readTokenLedgerDayMap,
+  readTokenLedgerHistory,
+  TOKEN_LEDGER_HISTORY_MAX_DAYS,
+} from './token-ledger.js'
 import {
   clineCredentialExpiresAtMs,
   isClineRefreshable,
@@ -110,27 +110,43 @@ import {
   type ClaimOutcome,
   type CreditBalance,
 } from './credits.js'
-import { CODEBUDDY, WORKBUDDY, productById, type BuddyProduct } from './product.js'
-import { runGrowthTaskCompletions } from './buddy-growth.js'
+import { CODEBUDDY, productById, type BuddyProduct } from './product.js'
+import { collectBuddyGrowth } from './buddy-growth.js'
+/**
+ * ⚠️ **`collectBuddyGrowth` 已搬到 `src/buddy-growth.ts`**（2026-10-08 Task 4），
+ * 并在此**原样再导出**以保持既有调用点与用例的 import 路径不变。
+ *
+ * 搬家的理由（不是洁癖）：它是 `credits.afterClaim` 的实现，而 `afterClaim`
+ * 由 `src/provider-credits.ts` 的能力表提供。留在本文件会让那张表必须 import
+ * 本文件 ⇒ `provider-credits.ts ⇄ jet-hub-rpc.ts` **循环 import**（本文件已经
+ * import 前者）。搬到 `buddy-growth.ts` 后依赖是单向的：
+ * `jet-hub-rpc.ts` → `provider-credits.ts` → `buddy-growth.ts`。
+ *
+ * ⚠️ **本再导出是过渡形态**，不是接口：新代码应直接从 `buddy-growth.js` 取。
+ * 它由 `tests/unit/buddy-growth.spec.ts` 的 import 覆盖（唯一的生产消费者是
+ * `src/provider-credits.ts`，它**直接从 `buddy-growth.js` 取**，不经过本文件）。
+ *
+ * ⚠️ **2026-10-08 修正（Task 4 复审 Finding 1）**：本 import 原先还捎带了一个
+ * 成长引擎的**死 import**（本文件零调用），本条注释一度把它写成「本文件与成长
+ * 引擎的接缝」—— 那会让「谁调用成长引擎」这个问题在本文件里得到一个**假答案**。
+ * 现已删除该名字，并改正本注释：本文件**不持有**任何成长引擎入口，成长任务的
+ * 唯一生产入口是 `provider-credits.ts` 的 `afterClaim`（由 `credits.claimAll`
+ * 消费）。别再回到这里找。
+ */
+export { collectBuddyGrowth }
 
 /**
- * 有成长中心任务可做的 provider —— **只有 CodeBuddy 中国版**。
+ * ⚠️ **`GROWTH_CAPABLE_PROVIDERS` 已删除**（2026-10-08 Task 4）。
  *
- * 列成显式白名单而不是「凡 BuddyProduct 都行」，是为了让 `buddy.growthTasks` 对
- * zcode 之类**不读 BuddyProduct** 的渠道也不成立 —— 否则直接调用会对每个账号白发
- * 一轮串行请求。客户端的能力表（`credits-capabilities.js`）是是否渲染按钮的权威，
- * 本表是服务端的第二道守卫。
+ * 它原是一张手抄的 `Set([CODEBUDDY.id])`，与客户端的能力表平行存在。现由
+ * **能力表本身**回答「哪家有成长中心」：`runtime.credits?.afterClaim !== undefined`
+ *（`src/provider-credits.ts` 只给 buddy 挂 `afterClaim`）—— 与 Task 1b 同一个理由：
+ * 消除平行副本，让「哪家有成长中心」由能力注册表说了算。
  *
- * ⚠️ **`workbuddy`（国际版）不在此表**：contributor 在 !62 复审中实测确认
- * `www.workbuddy.ai` 后端**根本没有成长中心**（无任务列表、无 claim 端点）——
- * 不是「未实测」，是**该产品没有这个功能**。故 `WORKBUDDY` 上的 `claimBase` /
- * `webBase` 也只是为共享 `BuddyProduct` 类型而填的占位，不会被本模块读取。
- *
- * ⚠️ 此表与客户端的 `GROWTH_TASK_PROVIDERS`（`plugin-src/client/jet-hub.js`）
- * 必须**同时**改：客户端决定是否传 `runTasks`，本表决定是否受理，只改一处会
- * 让另一处静默失效（多传不会被受理 / 少传则永远不触发）。
+ * ⚠️ 客户端那一侧（`GROWTH_TASK_PROVIDERS`，决定是否传 `runTasks`）**仍然存在且必须存在**：
+ * 它决定「按钮渲不渲染」，而服务端这里决定「受不受理」。两处的**取值来源**现在
+ * 都是能力声明，不再有第三份手抄名单。
  */
-const GROWTH_CAPABLE_PROVIDERS: ReadonlySet<string> = new Set([CODEBUDDY.id])
 
 /**
  * 整轮成长任务的时间预算缺省值（毫秒）。
@@ -140,85 +156,13 @@ const GROWTH_CAPABLE_PROVIDERS: ReadonlySet<string> = new Set([CODEBUDDY.id])
  * 宿主 RPC 的超时（该上界由 dsh 侧决定，本插件不可见也不可控）。
  */
 const DEFAULT_ROUND_BUDGET_MS = 30 * 60 * 1000
-/**
- * 单账号的成长中心任务执行，转成 RPC 明细。
- *
- * 僵尸账号（凭据被外部删除 ⇒ 上游回 401/403）归 `error` 提示但**不计入 failed**：
- * 它的处置是「重新登录」，与「任务真的推不动」完全不同。签到侧已把这类账号归
- * `inactive`（`collectClaimResults` 的 `凭据未配置` 分支同义），成长侧须一致 ——
- * 否则同一个僵尸条目在两处会给出互相矛盾的判定。
- *
- * @param budgetMs 透传给 `runGrowthTaskCompletions`；`undefined` 由其取缺省 10 分钟。
- */
-export async function collectBuddyGrowth(
-  credential: BuddyCredential,
-  product: BuddyProduct,
-  entry: ProviderAccountEntry,
-  budgetMs: number | undefined,
-  roundDeadlineAt: number | undefined,
-): Promise<RpcBuddyGrowthAccountResult> {
-  // 整轮预算已耗尽 ⇒ 该账号**不再发起任何成长请求**。
-  //
-  // ⚠️ 签到侧已经跑完（afterClaim 在 claim 之后调用），所以这里返回的只是成长
-  // 明细，不影响该账号的签到判定。逐项标 `failed` 会让整条提示染黄，而这不是
-  // 任何账号的过错 —— 故用 `ok:true` + `error` 说明「本轮没轮到它」。
-  if (roundDeadlineAt !== undefined && Date.now() >= roundDeadlineAt) {
-    return {
-      accountId: entry.id, nickname: entry.nickname,
-      ok: true, completed: 0, clientOnly: 0, failed: 0,
-      claimedCount: 0, claimedCredit: 0, timedOut: true, tasks: [],
-      error: '本轮时间预算已用尽，未执行成长任务（再点一次即可继续）',
-    }
-  }
-  let report: Awaited<ReturnType<typeof runGrowthTaskCompletions>>
-  try {
-    report = await runGrowthTaskCompletions(credential, product, fetch, { budgetMs })
-  } catch (error) {
-    return {
-      accountId: entry.id, nickname: entry.nickname,
-      ok: false, completed: 0, clientOnly: 0, failed: 0,
-      claimedCount: 0, claimedCredit: 0, timedOut: false, tasks: [],
-      error: error instanceof Error ? error.message : String(error),
-    }
-  }
-  // 凭据失效的判据：逐项 message 里出现「凭据已失效」。它与「任务失败」是
-  // 两回事 —— 前者要重新登录，后者是判据推不动。
-  const expired = report.results.some((r) => /凭据已失效/.test(r.message))
-  return {
-    accountId: entry.id, nickname: entry.nickname,
-    // 僵尸账号视作「无需再管」，不把整条提示染成失败。
-    ok: report.ok || expired,
-    completed: report.completed,
-    clientOnly: report.clientOnly,
-    failed: expired ? 0 : report.failed,
-    claimedCount: report.claimedCount,
-    claimedCredit: report.claimedCredit,
-    timedOut: report.timedOut,
-    tasks: report.results,
-    ...(expired ? { error: '凭据已失效，请在 Jet Hub 重新登录该账号' } : {}),
-  }
-}
 import {
   captchaDemand,
   putSuppliedParam,
 } from './captcha-supply.js'
 import { ZCODE_CAPTCHA_FALLBACK, type ZcodeCaptchaConfig } from './zcode-captcha.js'
 import { buildCarrierPageHtml } from './zcode-carrier-page.js'
-import {
-  claimLobsteraiDailyCheckin,
-  fetchLobsteraiCreditBalance,
-} from './lobsterai-credits.js'
-import {
-  claimCodeArtsDailyCheckin,
-  fetchCodeArtsAccountInfoDetailed,
-} from './codearts-credits.js'
-import {
-  claimTraeDailyCheckin,
-  fetchTraeCheckinStatus,
-  fetchTraeCreditBalance,
-} from './trae-credits.js'
-import {
-  pickTestModel,
+import { pickTestModel,
   resetAccount,
   resetAllAccounts,
   retestAccount,
@@ -238,18 +182,14 @@ import type {
   RpcBackupImportResponse,
   RpcBackupStatusResponse,
   RpcListAccountsRequest,
-  RpcListAccountsResponse,
   RpcCreateAccountRequest,
-  RpcCreateAccountResponse,
   RpcPollLoginRequest,
-  RpcPollLoginResponse,
   RpcUpdateAccountRequest,
   RpcDeleteAccountRequest,
   RpcReorderAccountsRequest,
   RpcGetProviderOrderResponse,
   RpcSetProviderOrderRequest,
   RpcRefreshAccountRequest,
-  RpcRefreshAccountResponse,
   RpcRetestAccountRequest,
   RpcRetestAllRequest,
   RpcTestAccountRequest,
@@ -260,9 +200,7 @@ import type {
   RpcCreditsStatusResponse,
   RpcCreditsClaimAllRequest,
   RpcCreditsClaimAllResponse,
-  RpcBuddyGrowthTasksRequest,
   RpcBuddyGrowthAccountResult,
-  RpcBuddyGrowthTasksResponse,
   RpcCreditsClaimSummary,
   RpcCreditsBalancesRequest,
   RpcCreditsBalanceExtra,
@@ -271,7 +209,6 @@ import type {
   RpcClineQuotaResponse,
   RpcClineRequestLogRequest,
   RpcClineRequestLogResponse,
-  RpcCreditsClaimAccountResult,
   RpcSendSmsRequest,
   RpcSendSmsResponse,
   RpcSubmitSmsRequest,
@@ -311,13 +248,14 @@ import type {
   RpcCaptchaContributeRequest,
   RpcCaptchaContributeResponse,
   RpcUsageBadgeRequest,
-  RpcUsageBadgeResponse,
   RpcUsageBadgePreferenceRequest,
   RpcUsageBadgePreferenceResponse,
   RpcUsageTokenLedgerRequest,
   RpcUsageTokenLedgerResponse,
   RpcUsageTokenLedgerHistoryRequest,
   RpcUsageTokenLedgerHistoryResponse,
+  RpcUsageTokenLedgerDeleteDayRequest,
+  RpcUsageTokenLedgerDeleteDayResponse,
   RpcUsageAutoCheckinRequest,
   RpcUsageAutoCheckinResponse,
   ProviderStatus,
@@ -533,14 +471,23 @@ export function buildRaccoonNickname(
  * 仍未登记的渠道（CodeArts / Qoder / Cline / Raccoon / Minimax / ZCode / Gemini /
  * OpenCode）：余额响应里没有逐包到期时间，或根本没有资源包列表 ——
  * 分不出两桶，登记进来只会多一个无效开关。
+ *
+ * ## ⚠️ 2026-10-08 起从 `PROVIDER_REGISTRY` 派生
+ *
+ * 原先这是一份手抄 `Set`，而客户端 `supportsPermanentLock` 读的是 registry 的
+ * `permanentLock` 字段 ⇒ **两处必须一致**（不一致会出现「按钮渲染出来了，
+ * 点了却报 bad-request」）。现在两侧同出一个字段，不再可能漂移。
+ * 上面那张「分桶依据」表已随值迁移到 registry 里各条的注释。
+ *
+ * ⚠️ **本常量是模块级、但这里安全**：它只读 `PROVIDER_REGISTRY`（Task 1 的
+ * **静态数据**），**不读 runtime 注册表** —— 后者要到 `apply()` 才填充，
+ * 模块级求值会得到空集（`WIRED_EXPIRY_PROVIDERS` 那条注释记的正是这个陷阱，
+ * 但那里是**刻意**保持常量的，理由见 `aggregate-expiry.ts`）。
+ * 判据是「读的是不是静态数据」，不是「是不是模块级常量」。
  */
-export const PERMANENT_LOCK_PROVIDERS: ReadonlySet<string> = new Set([
-  LOOMY.id,
-  CODEBUDDY.id,
-  WORKBUDDY.id,
-  LOBSTERAI.id,
-  TRAE.id,
-])
+export const PERMANENT_LOCK_PROVIDERS: ReadonlySet<string> = new Set(
+  PROVIDER_REGISTRY.filter((d) => d.permanentLock === true).map((d) => d.id),
+)
 
 /**
  * 汇总一次批量领取的结果。
@@ -632,7 +579,13 @@ export interface CreditsEndpointDeps<
    * **不能**混进 `claim` 本身 —— `claim` 的返回类型是 `ClaimOutcome`，装不下
    * 22 项任务的逐项判据。
    *
-   * 只有 buddy / workbuddy 注入；其余 provider 不传，行为逐字不变。
+   * ⚠️ **只有 buddy 注入**（`workbuddy` 后端没有成长中心，见 `src/product.ts`
+   * 的 `WORKBUDDY` 注释）；其余 provider 不传，行为逐字不变。
+   *
+   * ⚠️ 2026-10-08（Task 4）：**「哪家有成长中心」不再由本文件的手抄集合判定**
+   *（原 `GROWTH_CAPABLE_PROVIDERS` 已删除），改由「该家是否提供
+   * `ProviderCredits.afterClaim`」回答。本钩子仍是**同一个骨架接缝**，
+   * 只是调用侧的门控换成了能力表。
    */
   afterClaim?: (
     credential: TCredential,
@@ -679,10 +632,15 @@ export interface CreditsEndpointDeps<
    * CodeBuddy 系拆成「查状态 + 领取」两个独立端点，先查可以省掉一次无效的
    * 领取请求（活动未开 / 今天已领时直接短路）。
    *
-   * LobsterAI 的领取流程**自身就是多步的**（slot → context → check_in），
-   * `claimedToday` / `actions` 判断已在内部完成并会返回对应的
-   * `already-claimed` / `inactive`，外部再查一次纯属重复请求 ——
-   * 故它传 `false` 跳过预检，直接交给 `claim`。
+   * ⚠️ **本骨架只认这个布尔，不认 provider**：各家的取值由能力表给出
+   *（`ProviderCredits.precheckStatus`，见 `src/provider-runtime.ts` 的完整
+   * 「哪家 true / 哪家 false 及各自实测理由」）。本文件**不重复那张表**
+   * —— 一处语义两套判据必然漂移（本仓库首条红线）。
+   *
+   * ⚠️ 调用方若省略它，骨架会回落到**默认的 buddy 式** `fetchCheckinStatus`。
+   * 对**没有同构状态端点**的渠道（如 loomy）那是**发错端点的必然失败请求** ——
+   * 故那些家**必须显式传 `false`**，而不是靠「没配 fetchStatus 就会跳过」这种
+   * 想当然的推断（骨架不看 `fetchStatus` 是否存在）。
    */
   precheckStatus?: boolean
   /**
@@ -1030,32 +988,122 @@ function providerIdsOf(
  * `inject`，因此在 headless / CLI profile 下本模块正常加载、只是不注册端点，
  * 而不是把整个插件树卡在 pending（那会让 profile 启动直接失败）。
  */
+/**
+ * 各 provider auth 实例的**共同部分**（结构化类型），使 `authOf` 不必依赖
+ * 13 个具体类。
+ *
+ * ⚠️ **名字里的 `JetHub` 比实际语义窄（2026-10-08 独立复审 M-5 实测）**：
+ * 本接口有两个**不同层次**的使用方，第二个并不在 JetHub RPC 里 ——
+ *
+ * | 成员 | 谁在用 |
+ * |---|---|
+ * | `refreshAccountCredential` | **`jet-hub-rpc.ts` 自己**（`account.refresh` 端点，实测该文件里有真调用） |
+ * | `refreshAll` | **`index.ts` 的 runtime 注册循环**（填 `ProviderRuntime.auth.refreshAll`，即 `wiredRefreshTargets()` 的派生依据）。实测本文件里**只有声明、零调用** |
+ *
+ * ⇒ 读到这里别以为 `refreshAll` 有 JetHub 调用方；它的价值是「让注册循环能用
+ * 一个统一的形状遍历 13 家」。**没有改名**是刻意的：改名要动 `index.ts` 的
+ * import 与类型标注，而收益只是名字更准；**语义澄清写在这里即可**。
+ */
+export interface JetHubAuthLike {
+  refreshAccountCredential(refName: string, pool: AccountPool, accountId: string): Promise<void>
+  /**
+   * 批量续期该 provider 的全部账号。
+   *
+   * ⚠️ 2026-10-08（Task 10）：`index.ts` 的注册循环用它填
+   * `ProviderRuntime.auth.refreshAll`，而后者是 `wiredRefreshTargets()` 的派生依据。
+   * 实测 13 家签名**完全一致**（`(pool) => Promise<void>`）⇒ 无需逐家适配。
+   */
+  refreshAll(pool: AccountPool): Promise<void>
+}
+
+/**
+ * 各 provider 的 auth 实例（`registerJetHubRpc` 的命名对象形参）。
+ *
+ * ⚠️ **键必须是 provider id，不是变量名**：
+ * - provider id 是 `qodercn`（无连字符、全小写），而 `index.ts` 里的**变量名**
+ *   是 `qoderCn`。若键用变量名，`authOf(auths, 'qodercn')` 就**查不到**中国版
+ *   （键 `qoderCn` ≠ id `qodercn`），症状是「中国版账号续期报
+ *   `Unknown provider: qodercn`」—— 与本仓库历史上的 `workbuddy` 漏接是同一形态。
+ * - 键用 id 后，`account.refresh` 可以直接 `authOf(auths, entry.provider)` 分派。
+ *
+ * ⇒ 调用点写 `qodercn: qoderCn`（**键是 id、值是变量**），这是刻意的。
+ *
+ * ⚠️ **13 个字段都必须保留具体类型**（不要都改成 `JetHubAuthLike`）——
+ * 那会丢掉「13 个键必须都在」的类型检查，而「漏接一个 provider 就编译不过」
+ * 正是本次改名的核心价值。
+ */
+export interface JetHubAuths {
+  readonly codearts: CodeArtsAuth
+  readonly buddy: BuddyAuth
+  readonly workbuddy: BuddyAuth
+  readonly lobsterai: LobsteraiAuth
+  readonly qoder: QoderAuth
+  /** ⚠️ 键是 **provider id**（`qodercn`），值是 `index.ts` 里的 `qoderCn` 实例。 */
+  readonly qodercn: QoderAuth
+  readonly trae: TraeAuth
+  readonly cline: ClineAuth
+  readonly loomy: LoomyAuth
+  readonly raccoon: RaccoonAuth
+  readonly minimax: MinimaxAuth
+  readonly zcode: ZcodeAuth
+  readonly gemini: GeminiAuth
+}
+
+/**
+ * 按 provider id 取 auth 实例。
+ *
+ * ⚠️ **键是 provider id**（`qodercn`），不是变量名（`qoderCn`）——
+ * 这是 `JetHubAuths` 的接口约定（见其注释）。
+ *
+ * ⚠️ 用 `Object.hasOwn` 而非 `in`：`in` 会命中原型链上的键（如 `'constructor'`），
+ * 把 `entry.provider` 为怪值时误判成「有该 provider」。
+ */
+export function authOf(auths: JetHubAuths, provider: string): JetHubAuthLike | undefined {
+  if (!Object.hasOwn(auths, provider)) return undefined
+  return (auths as unknown as Record<string, JetHubAuthLike>)[provider]
+}
+
+/**
+ * ⚠️ 2026-10-08 改：13 个 provider 形参从**位置传参**改为**命名对象**（`auths`）。
+ *
+ * 原注释记录「历史上已因少传/插队错位复发 **6 次**」—— 位置参数天生有这个缺陷
+ *（改签名顺序、插一个新 provider 都会静默错位，而症状是「某个 provider 在用
+ * 另一个 provider 的凭据续期」）。命名对象让错位在**类型层面不可能**，
+ * 且新增 provider 只加一个键。
+ *
+ * ## ⚠️ 积分能力表**不是形参**（2026-10-08 设计复审 C1）
+ *
+ * Task 3 初版曾在本函数末尾加**第 5 个形参** `credits?: Readonly<Record<string,
+ * ProviderCredits>>`，现已删除。三条理由（复审报告 `.superpowers/sdd/
+ * task-3-design-eval.md` §4/§6）：
+ *
+ * 1. **它在生产路径上不承载任何信息** —— `src/index.ts` 传进来的正是
+ *    `createProviderCredits({ loomy, raccoon, zcode })`，而这三个实例就是本函数
+ *    形参 `auths` 里的 `loomy` / `raccoon` / `zcode`；`registerJetHubEndpoints`
+ *    自己现造的那份**逐字节等价**。删掉实参生产行为不变 ⇒ 它是**纯测试接缝**，
+ *    而「形参一侧 === 生产分派」这件事**没有任何测试守着**。
+ * 2. **它重开了 Task 9 刚关掉的门** —— 一个可选的**位置**形参：在它之前插入
+ *    任何新的可选形参，调用点 `(…, modelAdapters, creditsTable)` 就会**静默**
+ *    把表落进新形参（本仓库实测复发 6 次的位置错位形态）。`modelAdapters` 与
+ *    `credits` 值类型不同，互换会被 `tsc` 抓到，但**插入**不会。
+ * 3. ⇒ 改为**从 `auths` 派生**（见 `registerJetHubEndpoints` 里的 `credits`），
+ *    签名回到 4 个形参。
+ *
+ * ⚠️ **全局注册表（`ProviderRuntime.credits`）仍然保留且必须保留** —— 那是
+ * Task 5 的 `aggregate-expiry.ts` / Task 8 的 `account-probe.ts` 这类
+ * **拿不到 `auths` 形参**的跨模块消费点的唯一入口，由 `src/index.ts` 的
+ * `registerProviderRuntime` 挂上。它与本函数现造的表**同源同构**
+ *（同一个工厂、同一批实例），只是消费方不同。
+ *
+ * ⚠️ 端点级「表真的驱动分派」的测试改由模块替身注入
+ *（`tests/unit/credits-runtime-parity.spec.ts` 的 `vi.mock('provider-credits')`）——
+ * 断言仍打在**端点响应**上，判别力与原形参方案逐条等价。
+ */
 export function registerJetHubRpc(
   ctx: Context,
   pool: AccountPool,
-  codearts: CodeArtsAuth,
-  buddy: BuddyAuth,
-  workbuddy: BuddyAuth,
-  lobsterai: LobsteraiAuth,
-  qoder: QoderAuth,
-  /** Qoder **中国版**实例（与 `qoder` 同协议、不同 product；RPC 分支按注册表分派）。 */
-  qoderCn: QoderAuth,
-  trae: TraeAuth,
-  cline: ClineAuth,
-  loomy: LoomyAuth,
-  raccoon: RaccoonAuth,
-  /** MiniMax Code **中国版**实例（OAuth 设备码 + PKCE，与 Qoder 同型但协议不同）。 */
-  minimax: MinimaxAuth,
-  zcode: ZcodeAuth,
-  /**
-   * Gemini（Google Cloud Code Assist 免费线）实例（本地回调 OAuth）。
-   *
-   * ⚠️ **必须排在最后一个 provider 形参位**（即 `zcode` 之后、`modelAdapters`
-   * 之前）：本仓库全部 `registerJetHubRpc` 调用点都是**位置传参**，历史上已因
-   * 少传/插队错位复发 6 次。新 provider 一律**追加**在末尾，既有的 14 个调用点
-   * 才不用逐个补占位。
-   */
-  gemini: GeminiAuth,
+  /** ⚠️ 命名对象，不是 13 个位置参数。键是 provider id（见 `JetHubAuths`）。 */
+  auths: JetHubAuths,
   /**
    * provider → 适配器实例（可选）。
    *
@@ -1066,10 +1114,7 @@ export function registerJetHubRpc(
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(
-      connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai,
-      qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters,
-    )
+    registerJetHubEndpoints(connectionCtx as Context, pool, auths, modelAdapters)
   })
 }
 
@@ -1236,21 +1281,70 @@ async function fullCatalogIds(
 function registerJetHubEndpoints(
   ctx: Context,
   pool: AccountPool,
-  codearts: CodeArtsAuth,
-  buddy: BuddyAuth,
-  workbuddy: BuddyAuth,
-  lobsterai: LobsteraiAuth,
-  qoder: QoderAuth,
-  qoderCn: QoderAuth,
-  trae: TraeAuth,
-  cline: ClineAuth,
-  loomy: LoomyAuth,
-  raccoon: RaccoonAuth,
-  minimax: MinimaxAuth,
-  zcode: ZcodeAuth,
-  gemini: GeminiAuth,
+  auths: JetHubAuths,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
+  // ⚠️ 解构一次，函数体其余部分**逐字不动** —— 这样本次改动的 diff 面最小，
+  //    评审能一眼看出「只是换了个入口」。
+  //
+  // ⚠️ **`qodercn` 必须重命名绑定**：`JetHubAuths` 的键是 provider id
+  //   （`qodercn`），而函数体内部一直用变量名 `qoderCn`。用 `qodercn: qoderCn`
+  //   把 id 键绑到本地名，**函数体一个字都不用改**。
+  //   ⚠️ 若写成 `qoderCn`（键=变量名）会**编译失败**（接口没有该键）——
+  //   那正是我们要的：键必须是 id，否则 `authOf(auths, provider)` 查不到中国版。
+  const {
+    codearts, buddy, workbuddy, lobsterai, qoder,
+    qodercn: qoderCn,
+    trae, cline, loomy, raccoon, minimax, zcode, gemini,
+  } = auths
+  /**
+   * 积分能力表。
+   *
+   * ⚠️ **从 `auths` 现造，没有第 5 个形参**（2026-10-08 设计复审 C1，见
+   * `registerJetHubRpc` 的注释）：三家（loomy / raccoon / zcode）的余额查询走
+   * **本次注册持有的 auth 实例**上的方法（它们可能带注入的 `fetchImpl`），
+   * 其余走自由函数。这正是 `src/index.ts` 显式传参时用的**同一批实例**，
+   * 故生产行为与传参时代**逐字节等价**。
+   *
+   * ⚠️ 结构化类型收窄在**这里**完成（不是把 `ProviderCreditsDeps` 放宽到
+   * `unknown`）：`JetHubAuths` 的字段是三个具体 auth 类，它们**天然**满足
+   * `ProviderCreditsDeps` 只要求的那三个方法 —— 无需 `as`，改坏签名会被 `tsc` 抓到。
+   */
+  const credits: Readonly<Record<string, ProviderCredits>> = createProviderCredits({
+    loomy, raccoon, zcode,
+    // ⚠️ **`credits.claimAll` 走的就是这张表**（Task 4 起），故 LobsterAI 的
+    //    `clientVersion` 必须在这里也接上：它是签到接口的**必填** query 参数，
+    //    且要**动态**解析（带 TTL 缓存）—— 漏掉它会让签到退回产品的兜底常量，
+    //    而兜底值可能已过期（那正是「集中在此避免三处各自拉取」要防的）。
+    //    用惰性调用（不能先 await 成常量：缓存过期后拿到新版本这件事会失效）。
+    lobsteraiClientVersion: () => lobsterai.resolveClientVersion(),
+  })
+  /**
+   * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
+   *
+   * ⚠️ 与 `credits` 同法：从 `auths` 现造、**没有第 5 个形参**（理由见
+   * `registerJetHubRpc` 的注释与设计复审 C1）。两家都走**实例方法**
+   *（实例可能带注入的 `fetchImpl`），与 `src/index.ts` 用的是**同一批实例**。
+   *
+   * ⚠️ 只有 loomy 需要传实例（raccoon 也传，因为它的领取/状态在实例上）。
+   */
+  const onboarding: Readonly<Record<string, ProviderOnboarding>> = createProviderOnboarding({
+    loomy,
+    raccoon,
+  })
+  /**
+   * 传给各家 credits 实现的调用上下文。
+   *
+   * ⚠️ 与 Task 5/8 的 `ProviderCallContext` **同形但不同源**：本函数在
+   * `registerJetHubEndpoints` 的闭包里，持有的是**本次注册的** ctx / pool，
+   * 而全局注册表那条路要等 `index.ts` 装配。两者的字段含义一致
+   *（凭据解析 / 日志 / 账号池），故实现侧只需一个形状。
+   */
+  const callContext: ProviderCallContext = {
+    resolveCredential: (refName) => ctx.credentials.resolve(credentialRef(refName)),
+    warn: (message) => ctx.logger?.warn?.(message),
+    accountPool: pool,
+  }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
   if (!connection || typeof connection.fetch?.register !== 'function') {
@@ -1350,8 +1444,9 @@ function registerJetHubEndpoints(
    * 用量徽标读数服务（宿主侧 TTL 缓存 + 只保留启用账号 + 附加订阅读数）。
    *
    * ⚠️ **取数直接复用内部 `handleMethod`**，不另写 provider 分派：
-   * `credits.balances` 的 12 条分支（含 codearts 的「Token 计费账户」文案、
-   * zcode 的逐桶折算等）是唯一口径，复制一份必然漂移。
+   * `credits.balances` 的分派（Task 3 后是 `credits` 表查表 + opencode / qoder
+   * 两个特例；此前是 12 段 `if`）是唯一口径 —— 含 codearts 的
+   * 「Token 计费账户」文案、zcode 的逐桶折算等，复制一份必然漂移。
    * 第三个参数是 `AbortSignal` 且在当前实现里未被使用，故这里传 `undefined`
    *（该形参是下划线命名 = 有意未用）。
    *
@@ -1504,7 +1599,7 @@ function registerJetHubEndpoints(
    * 账号池（`jet-hub/state.json`）的条目只有 `id`/`provider`/`nickname`/
    * `credentialRef` 等字段，**没有**账号名与手机号 —— 它们在**凭据**里
    * （`user_info.displayName` 与由 17 位 `user_id` 派生的手机号）。
-   * 且 `sanitizeAccounts`（`src/jet-hub-store.ts:173-191`）只保留三个字段，
+   * 且 `sanitizeAccounts`（`src/jet-hub-store.ts`）只保留三个字段，
    * 写回池也会被丢掉。故每次列表时从**各账号自己的 ref** 现读。
    *
    * ## ⚠ 只对 zcode 做，且逐条独立失败
@@ -1556,73 +1651,6 @@ function registerJetHubEndpoints(
       }
     }
     return out
-  }
-
-  /**
-   * 把上游余额**逐桶**映射成 `CreditBalance`。
-   *
-   * ## 为什么必须逐桶（而不是只取首桶）
-   *
-   * `CreditBalance` 的形状是 `{total, packages[], expiredTotal?}` 这类**积分包**
-   * 结构，而 ZCode 是「按模型分的 token 额度池」。上游一个 resource bucket
-   * = 一个模型一段额度，故**一个桶一个包**。
-   *
-   * ⚠ 旧实现只取 `buckets[0]`（经 `result.planName`）拼**一个**包，但
-   * `balance.total` 用的是 `result.remaining`（**全桶汇总**）—— 多桶账号下
-   * 那个包的数字比它自己的 `totalUnits` 还大，自相矛盾，且其余模型的额度
-   * 被**静默丢掉**，用户看不出「GLM-5.3 与 GLM-5.3-Flash 各剩多少」。
-   *
-   * ## 空桶的兜底
-   *
-   * 上游可能一个桶都不给（实测企业版之外仍有账号只有 0 桶）。此时**不能**返回
-   * 空 `packages`（前端会显示成「没有额度」而不是「查不到」），故给一个具名占位包，
-   * 让 UI 至少能显示「0 / 0」并带上 `result.planName`。
-   */
-  function buildZcodeBalance(result: ZcodeBalanceResult): CreditBalance {
-    const packages: CreditBalance['packages'] = result.buckets.map((bucket) => {
-      const remaining = bucket.availableUnits ?? bucket.remainingUnits ?? 0
-      const total = bucket.totalUnits ?? 0
-      return {
-        name: bucket.showName ?? result.planName ?? 'ZCode 免费额度',
-        // ⚠ 单位是 **token**（不是 credit）—— 如实标注，
-        // 避免用户以为 ZCode 有 1 亿积分。
-        unit: 'token',
-        remaining,
-        total,
-        used: Math.max(0, total - remaining),
-        active: true,
-        // ZCode 的额度按日刷新（`period: 'one_time'` 的活动包到点失效），
-        // 故周期起止都留空，只用 `expiredTime` 给到期时刻。
-        cycleStartTime: '',
-        cycleEndTime: '',
-        expiredTime: bucket.expiresAt !== undefined
-          ? new Date(bucket.expiresAt * 1000).toISOString()
-          : (result.expiresAt !== undefined ? new Date(result.expiresAt * 1000).toISOString() : ''),
-      }
-    })
-    if (packages.length === 0) {
-      packages.push({
-        name: result.planName ?? 'ZCode 免费额度',
-        unit: 'token',
-        remaining: result.remaining,
-        total: result.total,
-        used: Math.max(0, result.total - result.remaining),
-        active: true,
-        cycleStartTime: '',
-        cycleEndTime: '',
-        expiredTime: result.expiresAt !== undefined
-          ? new Date(result.expiresAt * 1000).toISOString()
-          : '',
-      })
-    }
-    return {
-      // 仍是**全桶汇总**，与 `packages` 逐项之和一致（`fetchZcodeBalance` 的
-      // `:251-260` 就是这么累加的）。
-      total: result.remaining,
-      // ZCode 不在同一响应里区分「已失效包」，故为 0。
-      expiredTotal: 0,
-      packages,
-    }
   }
 
   /**
@@ -2267,7 +2295,7 @@ function registerJetHubEndpoints(
           const entry = accounts.find((a) => a.id === req.accountId)
           if (!entry) throw new Error(`Account ${req.accountId} not found`)
 
-          // 按 **entry.provider** 分派到对应服务，并调用**按凭据 ref 的**
+          // 按 **entry.provider** 查 `auths` 命名对象分派，并调用**按凭据 ref 的**
           // 续期入口 —— 三处都是修复既有缺陷的关键：
           //
           // 1. 原实现只处理 codearts / buddy，`workbuddy` 会落到 else 抛
@@ -2276,7 +2304,7 @@ function registerJetHubEndpoints(
           //    **默认单凭据 ref**（如 BUDDY_ACCESS_TOKEN），而要刷的是池内条目的
           //    BUDDY_ACCOUNT_XXX —— 于是「刷这个账号」实际刷的是另一个凭据，
           //    结果要么报错要么静默改了错的对象。
-          // 3. ⚠️ **每个分支都必须传 `pool` + `entry.id`**（issue !IKIRTT）：
+          // 3. ⚠️ **分派必须传 `pool` + `entry.id`**（issue !IKIRTT）：
           //    续期成功后要把新的 `expiresAt` 写回账号池，UI 才不再显示
           //    「已过期」。早先只有 raccoon 分支传了，其余七个分支漏传，
           //    凭据续好了、界面纹丝不动，用户没有任何自救手段。
@@ -2285,75 +2313,32 @@ function registerJetHubEndpoints(
           // 「刷新」按钮（按钮是 测试/重测/重置/停用/代理/指纹/删除），
           // 调用方是仓库外的脚本/手工 RPC。下面三处历史注释曾把它写成
           // 「账号卡片的刷新按钮」——那是失实的，会把排障的人引到不存在的 UI。
-          switch (entry.provider) {
-            case 'codearts':
-              await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case 'buddy':
-              await buddy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case 'workbuddy':
-              await workbuddy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case LOBSTERAI.id:
-              await lobsterai.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case QODER.id:
-            case QODER_CN.id:
-              // 同协议族：按 provider 找到对应实例。
-              // ⚠️ 只刷传入的这个 ref，不碰默认单凭据 ref（历史缺陷同因）。
-              // ⚠️ **不要**图省事写 `qoder.refreshAccountCredential(...)` ——
-              // 那会让中国版账号的续期去刷国际版的凭据（两站 token 不通用，
-              // CN 永远续不动而国际版被无谓刷一次）。该串用由
-              // `lobsterai-rpc-dispatch.spec.ts` 的行为级用例锁死（已做反向验证）。
-              await requireQoderFamily(entry.provider).auth.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case TRAE.id:
-              await trae.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case CLINE.id:
-              await cline.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case LOOMY.id:
-              // ⚠️ Loomy **没有 refresh 端点**：这里只能做**有效性探测**，
-              // 失效时抛「请重新登录」。见 LoomyAuth.refreshAccountCredential。
-              await loomy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case RACCOON.id:
-              // raccoon **有** refresh 端点（refresh_token 轮换），这里是真续期。
-              // ⚠️ 只读写传入的 ref，不碰默认单凭据 ref。
-              // ⚠️ **必须传 pool + entry.id**：续期后要把新的 `expiresAt` 写回
-              // 账号池，否则 UI 一直显示「已过期」（真实缺陷：JWT 已续到 15:09、
-              // 账号池仍是 12:02，相差 3.1 小时，但功能完全正常）。
-              await raccoon.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case MINIMAX.id:
-              // MiniMax **有** refresh 端点（`/oauth2/token` 的 refresh_token 授权），
-              // 这里是真续期。⚠️ 必须传 pool + entry.id —— 续期后要把新的
-              // `expiresAt` 写回账号池，否则 UI 一直显示「已过期」。
-              await minimax.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case ZCODE.id:
-              /**
-               * zcode **没有 refresh 端点**（凭据是静态的，与 Loomy 同类）。
-               *
-               * 但这个方法仍做实事：**逐账号重读自己的 ref 并规范化回写** ——
-               * 用户重新登录后重新调用 `account.refresh` 即可生效而无需重启 DSH。
-               * 凭据不可用时如实抛错（引导用户重新登录该账号）。
-               */
-              await zcode.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case GEMINI.id:
-              // Gemini **有** refresh 端点（`oauth2.googleapis.com/token` 的
-              // `refresh_token` grant），这里是真续期。
-              // ⚠️ 必须传 pool + entry.id —— 续期后要把新的 `expiresAt` 写回
-              // 账号池，否则 UI 一直显示「已过期」而实际能正常发消息。
-              // ⚠️ Google 会**轮换 refresh_token**，`GeminiAuth` 内部已回写新值。
-              await gemini.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            default:
-              throw new Error(`Unknown provider: ${entry.provider}`)
+          //
+          // ⚠️ 2026-10-08 改（Task 2）：原先这里是一个 13 个 case 的 switch，
+          // 而**每个分支体都是同一行调用**（`auth.refreshAccountCredential(
+          // entry.credentialRef, pool, entry.id)`），只有实例名不同 —— 纯粹重复，
+          // 且历史上漏接过 `workbuddy`（它对 `account.refresh` 一直报
+          // `Unknown provider`）。分支越多，漏接概率越高。
+          //
+          // ⚠️ **查 `auths` 形参，不查全局注册表**（`provider-runtime.ts`）：
+          //    `auths` 是 Task 9 引入的命名对象，其**键就是 provider id**
+          //    （含 `qodercn`，注意不是变量名 `qoderCn`）。用形参而非全局 Map
+          //    的三个好处：① 测试仍可**直接传桩**控制分派（零全局可变状态）；
+          //    ② 不会与「真跑 apply()」的测试互相污染；③ 闭包捕获的是**本次注册
+          //    的那批实例**，语义上更紧。全局注册表留给**真正跨模块**的消费点
+          //    （Task 5 的 aggregate-expiry、Task 8 的 account-probe）。
+          const auth = authOf(auths, entry.provider)
+          if (auth === undefined) {
+            // ⚠️ 文案必须保持**可读且指明原因**，不要退化成泛化的 unsupported：
+            //    opencode 是「该产品没有续期概念」（凭据是静态 API key），
+            //    而未知 id 是「没注册」。两者都要让排查者看懂。
+            throw new Error(
+              descriptorOf(entry.provider) === undefined
+                ? `Unknown provider: ${entry.provider}`
+                : `Provider ${entry.provider} 不支持续期（它的凭据不是可续期类型）`,
+            )
           }
+          await auth.refreshAccountCredential(entry.credentialRef, pool, entry.id)
           return { ok: true, value: { success: true } }
         } catch (error) {
           /**
@@ -2522,11 +2507,23 @@ function registerJetHubEndpoints(
        * 查询新手任务 / 一次性奖励状态（**Loomy** 的新手任务、**raccoon** 的登录奖励，只读）。
        *
        * ⚠️ 只读：**不得**在此触发任何 `complete`/`claim`（面板挂载时会调用它）。
-       * ⚠️ 两个 provider 共用本端点，故判据是「属于其中之一」而非只认 Loomy。
+       *
+       * ⚠️ **2026-10-08 改（Task 4）：两段 `if (req.provider === X.id)` 收敛成查表**
+       *   —— 分支体里**没有一行协议逻辑**（协议早已封装在 `loomy-onboarding.ts` 与
+       *   `raccoon-credits.ts` 内）。表在 `src/provider-onboarding.ts`，
+       *   各家实现逐字搬迁、**一行未改**（含 raccoon 那条「映射成 Loomy 那套任务
+       *   形状的一项」的语义）。
+       *
+       * ⚠️ 判据从「provider 属于 {loomy, raccoon}」改为「**该家是否提供
+       *   `onboarding.status`**」：那张手抄的 `!== LOOMY.id && !== RACCOON.id`
+       *   与能力表是**两份可漂移的东西**（新增一家要同时改两处，漏一处就静默
+       *   失效）。表由 `auths` 现造，与 `credits.*` 同法。
        */
       case 'onboarding.status': {
         const req = payload as RpcOnboardingStatusRequest
-        if (req.provider !== LOOMY.id && req.provider !== RACCOON.id) {
+        const impl = onboardingOf(onboarding, req.provider)
+        // ⚠️ 未登记 / 无该能力的 provider 回**可读的** bad-request（兜底契约）。
+        if (impl?.status === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const account = pool.findAccount(req.accountId)
@@ -2537,36 +2534,12 @@ function registerJetHubEndpoints(
         if (!resolved) {
           return { ok: false, error: { code: 'bad-request', message: '凭据未配置' } }
         }
-        if (req.provider === RACCOON.id) {
-          // raccoon 只有**一项**一次性奖励（桌面端登录奖励 3000 分），
-          // 把它映射成 Loomy 那套「任务」形状的一项，复用同一个 RPC 与 UI。
-          // ⚠️ 已领状态靠**账单反查**（服务端没有单独的状态端点）。
-          const credential = JSON.parse(resolved.value) as RaccoonCredential
-          const status = await raccoon.fetchOnboardingStatus(credential)
-          return {
-            ok: true,
-            value: {
-              // ⚠️ `tasks` 是 `Record<key, boolean>`（完成状态），不是数组。
-              tasks: { desktop_login_reward: status.claimed },
-              earned: status.claimed ? status.points : 0,
-              total: status.points,
-              titles: { desktop_login_reward: '桌面端登录奖励（每号一次）' },
-              points: { desktop_login_reward: status.points },
-            } satisfies RpcOnboardingStatusResponse,
-          }
-        }
-        const credential = JSON.parse(resolved.value) as LoomyCredential
-        const state = await loomy.fetchOnboardingTasks(credential)
-        return {
-          ok: true,
-          value: {
-            tasks: state.tasks,
-            earned: state.earned,
-            total: state.total,
-            titles: { ...LOOMY_TASK_TITLES },
-            points: { ...LOOMY_TASK_POINTS },
-          } satisfies RpcOnboardingStatusResponse,
-        }
+        // ⚠️ 凭据解析在**守卫之后**、在 try 之外，与旧实现逐字一致：
+        //    这里只有**一个**账号（不是批量循环），故失败应如实冒泡成端点错误，
+        //    不该被吞成某个账号的 failed。
+        const credential = JSON.parse(resolved.value) as unknown
+        const value = await impl.status(credential, callContext)
+        return { ok: true, value: value satisfies RpcOnboardingStatusResponse }
       }
 
       /**
@@ -2620,8 +2593,12 @@ function registerJetHubEndpoints(
          *
          * Loomy 没有窗口概念（服务端直接给两个命名池）→ 不带该字段。
          */
-        const usesExpiryWindow = provider === CODEBUDDY.id || provider === WORKBUDDY.id
-          || provider === TRAE.id || provider === LOBSTERAI.id
+        // ⚠️ 2026-10-08 改：判据从四连 `||` 改为查 registry 的 `usesExpiryWindow`
+        //   —— 判据**本身不变**（仍是「是否按到期时间分桶」，**不是**「是不是 buddy」：
+        //   TRAE 与 LobsterAI 走同一套 `splitBuddyCreditsByExpiry`，同样受
+        //   `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 影响）。改的只是**取值来源**。
+        //   ⚠️ loomy 刻意不在此列：它没有窗口概念（服务端直接给两个命名池）。
+        const usesExpiryWindow = descriptorOf(provider)?.usesExpiryWindow === true
         const lockResponse = (): RpcPermanentLockResponse => ({
           provider,
           locked: pool.permanentLocked(provider),
@@ -2648,11 +2625,17 @@ function registerJetHubEndpoints(
        *
        * ⚠️ 这是**写**操作，且**每号只能领一次** —— 与 `credits.claimAll`
        *（每日签到）语义完全不同，故独立端点。
+       *
+       * ⚠️ **2026-10-08 改（Task 4）：两段 `if (req.provider === X.id)` 收敛成查表**
+       *   —— 与 `onboarding.status` 同法（见那里的注释）。表在
+       *   `src/provider-onboarding.ts`，含 raccoon 那条
+       *   「**已领时 `earned` 报满分、不是 0**」的实测语义（真实报障：
+       *   UI 显示「✅ 1 个此前已完成 / 累计已领 0 / 3000」自相矛盾）。
        */
       case 'onboarding.claim': {
         const req = payload as RpcOnboardingClaimRequest
-        // ⚠️ 两个 provider 共用本端点（Loomy 的新手任务 / raccoon 的登录奖励）。
-        if (req.provider !== LOOMY.id && req.provider !== RACCOON.id) {
+        const impl = onboardingOf(onboarding, req.provider)
+        if (impl?.claim === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const account = pool.findAccount(req.accountId)
@@ -2663,56 +2646,37 @@ function registerJetHubEndpoints(
         if (!resolved) {
           return { ok: false, error: { code: 'bad-request', message: '凭据未配置' } }
         }
-        if (req.provider === RACCOON.id) {
-          // raccoon 的领取端点是**幂等**的：已领过返回 `granted:false`，
-          // 此时 claimed 为空数组、skipped 含该项。
+        const credential = JSON.parse(resolved.value) as unknown
+        let value: RpcOnboardingClaimResponse
+        try {
+          value = await impl.claim(credential, callContext)
+        } catch (error) {
+          // ⚠️ 实现侧用**上抛**表达「领取失败」（而不是返回一条
+          //    「成功但没领到」的响应）—— 这里翻译成既有的可读 bad-request
+          //    （`code: 'bad-request'` + 服务端原文）。
           //
-          // ⚠️ **已领时 `earned` 必须报满分，不是 0**（真实缺陷，用户报障）。
-          // `earned` 回答的是「该项目**累计**领到多少」，与「本次请求是否新增」
-          // 无关。早期在 `already-claimed` 分支写 `earned: 0`，于是 UI 显示
-          // 「✅ 1 个此前已完成 / 累计已领 0 / 3000」—— **自相矛盾**：
-          // 既然「此前已完成」，那 3000 分显然已经拿到手了。
-          const credential = JSON.parse(resolved.value) as RaccoonCredential
-          const outcome = await raccoon.claimLoginReward(credential)
-          if (outcome.kind === 'failed') {
-            return { ok: false, error: { code: 'bad-request', message: outcome.message } }
-          }
-          const claimed = outcome.kind === 'claimed'
-            ? [{ key: 'desktop_login_reward', title: '桌面端登录奖励', points: outcome.credit }]
-            : []
-          // 已领时的金额从**账单反查**取得（领取响应体里没有它），
-          // 与 `onboarding.status` 同一数据源 —— 否则两处会显示不同的数字
-          //（例如活动金额变化后，一处 3000、一处 3500）。
-          // 只读 GET，且仅在「点按钮时已领」这一低频路径上发生。
-          const points = outcome.kind === 'claimed'
-            ? outcome.credit
-            : (await raccoon.fetchOnboardingStatus(credential)).points
+          // ⚠️ **2026-10-08 更正（Task 4 复审 Finding 2）：本注释原先写「与旧实现
+          //    逐字一致」，那是错的** —— 逐字一致只对 **raccoon** 成立（它的旧分支
+          //    自己 catch 了 `outcome.kind === 'failed'` 并回 `bad-request`）；
+          //    **loomy 的旧分支没有 try/catch**，`claimOnboardingTasks` 一抛错就
+          //    冒到外层处理器，变成 `jet-hub/handler-failed`（「未知故障」，
+          //    用户看不出是领取失败）。
+          //
+          // ⇒ 现在两家**统一** `bad-request`，即 loomy 的**错误码变了**
+          //    （`jet-hub/handler-failed` → `bad-request`），这是一处 **G3 例外**
+          //    （见 Task 4 报告 §5 的 G3-4），**方向是改善**：失败原因不再被
+          //    降级成「未知故障」。用户可见影响为零 —— 客户端只渲染
+          //    `error.message`，而 message 逐字未变（仍是服务端原文）。
+          //    ⚠️ 故**不要**为了「零行为变更」把 loomy 改回上抛。
           return {
-            ok: true,
-            value: {
-              claimed,
-              skipped: outcome.kind === 'already-claimed' ? ['desktop_login_reward'] : [],
-              // 该项目累计已领 = 满分（无论本次是否新增）。
-              earned: points,
-              total: points,
-            } satisfies RpcOnboardingClaimResponse,
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: error instanceof Error ? error.message : String(error),
+            },
           }
         }
-        const credential = JSON.parse(resolved.value) as LoomyCredential
-        const result = await loomy.claimOnboardingTasks(credential)
-        return {
-          ok: true,
-          value: {
-            claimed: result.claimed.map((item) => ({
-              key: item.key,
-              title: LOOMY_TASK_TITLES[item.key] ?? item.key,
-              points: item.points,
-            })),
-            skipped: result.skipped,
-            earned: result.earned,
-            total: result.total,
-          } satisfies RpcOnboardingClaimResponse,
-        }
+        return { ok: true, value: value satisfies RpcOnboardingClaimResponse }
       }
 
       // ── 限流标记：重测（发真实请求验证）──
@@ -2803,125 +2767,115 @@ function registerJetHubEndpoints(
       // ── 每日签到（积分领取）──
       // 查询某 provider 下全部启用账号的签到状态。
       //
-      // 四个 provider 分属**三套互不相同的协议**，各自在自己的分支里处理：
-      //   - CodeBuddy 系（buddy / workbuddy）：`productById()` 取 BuddyProduct，
-      //     走 `collectCreditsStatus` 的默认实现；
-      //   - `lobsterai`：slot → context 三步，无独立状态端点；
-      //   - `codearts`：华为云 SDK-HMAC-SHA256 签名，无独立状态端点。
+      // ⚠️ **2026-10-08 改（Task 3）：7 段分支收敛成「有则真查、无则如实 null」**。
+      //    原先 5 段（codearts / lobsterai / trae / cline / loomy）是**逐字同构**的
+      //    「手工拼 `{accountId, nickname, status: null}`」，另 2 段（minimax /
+      //    buddy 系）真查。现在判据统一为「该渠道有没有注册 `fetchStatus`」：
+      //    - 未注册 ⇒ 共享分支如实回 null（与它们原先的行为**逐字等价**）；
+      //    - 已注册 ⇒ 走 `collectCreditsStatus` 真查。
       //
-      // ⚠️ 只有 CodeBuddy 系能经 `productById()` 解析出产品配置；后两者
-      // **必须各自提前分支**，否则会落到下面的 bad-request。历史上 CodeArts
-      // 就是因此恒回 `unsupported provider: codearts`（客户端在面板挂载时
-      // 无条件调用 credits.balances，于是每打开一次设置页都在控制台报错并把
-      // 账号卡片标成查询失败）。现在 CodeArts 已有真实实现，该 bad-request
-      // 只对**未知** provider 生效。
+      //    ⚠️ 那 5 家**不注册** `fetchStatus` 是**诚实**的，不是偷懒：它们确实
+      //    没有与 `CheckinStatus` 同构的状态端点 —— 要么根本没有签到端点
+      //    （cline），要么要走两步且字段语义不同（codearts / lobsterai），
+      //    要么由 claim 流程自带幂等判据（trae / loomy）。臆造一份
+      //    `{streakDays: 0, dailyCredit: 0}` 会让面板显示「连续 0 天」这种
+      //    **看起来像真实读数**的假数据。
+      //
+      //    ⚠️ 与「不支持」的区别：本端点**支持**（返回 200 + 账号列表），
+      //    只是状态本身未知。故**不是**错误（与 claimAll 的守卫不同）。
+      //
+      //    ⚠️⚠️ **本改造对 5 家是行为变更（如实登记，别当成等价重构）**：
+      //    `qoder` / `qodercn` / `raccoon` / `zcode` / `gemini` 原先落到
+      //    `productById()` 的兜底、回 `bad-request: unsupported provider`，
+      //    现在回 `ok: true` + `status: null`。这是**放宽**（把「端点不支持」
+      //    改成「端点支持但状态未知」），与上面那条语义一致，且**无回归风险**：
+      //    - 客户端**零调用**本端点（`plugin-src/client/` 里搜不到
+      //      `credits.status`），自动签到走的是 `credits.claimAll`；
+      //    - 它的实际消费者是外部脚本 / 直接 RPC 调用（见
+      //      `docs/implementation-notes.md`）。
+      //    判据由 `credits-runtime-parity.spec.ts` 的
+      //    「credits.status 对 registry 里的每个渠道都被接受」锁死；
+      //    **未知** provider 仍回 bad-request（兜底契约不变）。
       case 'credits.status': {
         const req = payload as RpcCreditsStatusRequest
-        if (req.provider === 'codearts') {
-          // CodeArts 没有独立的「签到状态」端点：可领状态要经
-          // `statistics/plugin`（账户类型）+ `/v1/ops/delivery`（活动列表）
-          // 两步才能得到，且语义与 CodeBuddy 的 CheckinStatus 不同构
-          //（无 streak_days / daily_credit 等概念）。
-          // 故与 LobsterAI 同样如实返回 null，而不是臆造一份状态对象。
-          const accounts = await pool.listAccounts(req.provider)
-          return {
-            ok: true,
-            value: {
-              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
-            } satisfies RpcCreditsStatusResponse,
-          }
-        }
-        if (req.provider === LOBSTERAI.id) {
-          // LobsterAI 没有独立的「签到状态」端点：活动状态要经
-          // slot → context 两步才能得到，且语义与 CodeBuddy 的
-          // CheckinStatus 不同构（无 streak/dailyCredit 等概念）。
-          // 故这里如实返回 null，而不是臆造一份状态对象。
-          const accounts = await pool.listAccounts(req.provider)
-          return {
-            ok: true,
-            value: {
-              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
-            } satisfies RpcCreditsStatusResponse,
-          }
-        }
-        if (req.provider === TRAE.id) {
-          // TRAE 有签到状态端点，但需要发起 Ug 请求获取（见 claim 内部的多步流程）。
-          // 与 LobsterAI/CodeArts 一样如实返回 null，由 claimAll 自行处理预检。
-          const accounts = await pool.listAccounts(req.provider)
-          return {
-            ok: true,
-            value: {
-              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
-            } satisfies RpcCreditsStatusResponse,
-          }
-        }
-        if (req.provider === CLINE.id) {
-          // Cline **没有签到端点**（对整个 sidecar 二进制做字符串扫描，
-          // checkin / check-in / daily / campaign 均无任何 Cline 业务端点命中；
-          // 见 src/cline-credits.ts 的模块注释）。故与 WorkBuddy 国际版一致，
-          // 如实返回 null，而不是臆造一份状态对象。
-          const accounts = await pool.listAccounts(req.provider)
-          return {
-            ok: true,
-            value: {
-              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
-            } satisfies RpcCreditsStatusResponse,
-          }
-        }
-        if (req.provider === LOOMY.id) {
-          // Loomy 没有独立的「签到状态」端点：每日额度由 `POST /points/first-login`
-          // 触发，其响应自带 `alreadyProcessed`。故与 LobsterAI/CodeArts 同样
-          // 如实返回 null，由 claimAll 内部处理幂等。
-          const accounts = await pool.listAccounts(req.provider)
-          return {
-            ok: true,
-            value: {
-              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
-            } satisfies RpcCreditsStatusResponse,
-          }
-        }
-        if (req.provider === MINIMAX.id) {
-          // ⚠️ MiniMax **有**独立的签到状态端点（`/minimax-cloud/api/v1/signin/status`），
-          // 与 LobsterAI/TRAE/Cline 那几个「如实返回 null」的 provider 不同 ——
-          // 故走共享 helper 真查（`fetchMinimaxSigninStatus` 失败时返回 null，
-          // 由 helper 逐账号 try/catch 兜住，单账号失败不中断整体）。
-          //
-          // ⚠️ **判据是 `is_today && status===3`**（见 `minimaxPanelToCheckinStatus`），
-          // 不是「没有 Claimable」。`active` 恒 true（拿到响应即 true）。
-          const minimaxStatusAccounts = await pool.listAccounts(req.provider)
-          const value = await collectCreditsStatus<MinimaxCredential, undefined>(
-            minimaxStatusAccounts, undefined, {
-              resolve: (ref) => ctx.credentials.resolve(ref),
-              fetchStatus: (credential) => fetchMinimaxSigninStatus(credential),
-              warn: (msg) => ctx.logger?.warn?.(msg),
-            },
-          )
-          return { ok: true, value: { accounts: value } satisfies RpcCreditsStatusResponse }
-        }
-        const product = productById(req.provider)
-        if (product === undefined) {
-          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
-        }
         const accounts = await pool.listAccounts(req.provider)
-        const results = await collectCreditsStatus(accounts, product, {
+        const statusImpl = creditsOf(credits, req.provider)
+
+        if (statusImpl?.fetchStatus === undefined) {
+          // ⚠️ 未知 provider 与「已登记但无状态端点」必须**分开**：
+          //    前者是 bad-request（兜底契约），后者是「如实 null」。
+          //    registry 是权威判据（不是另立一份 provider 名单 —— 两份必然漂移）。
+          if (descriptorOf(req.provider) === undefined) {
+            return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+          }
+          return {
+            ok: true,
+            value: {
+              accounts: accounts.map((entry) => ({
+                accountId: entry.id,
+                nickname: entry.nickname,
+                status: null,
+              })),
+            } satisfies RpcCreditsStatusResponse,
+          }
+        }
+
+        // ⚠️ `collectCreditsStatus` 逐账号 try/catch —— 单账号失败**不中断整体**，
+        //    这与「顺序查询避免并发风控」同属该骨架已验证的语义，**不要重写**。
+        //
+        // ⚠️ 第二参（product）统一传 `undefined`：它**只被透传给 `fetchStatus`**，
+        //    而 `fetchStatus` 现在由 credits 表提供、自带各自的 product 配置，
+        //    不再需要调用侧转发（原先 buddy 系传 `productById()`、minimax 传
+        //    `undefined`，是历史形态）。
+        const value = await collectCreditsStatus(accounts, undefined, {
           resolve: (ref) => ctx.credentials.resolve(ref),
+          fetchStatus: (credential) => statusImpl.fetchStatus!(credential, callContext),
           warn: (msg) => ctx.logger?.warn?.(msg),
         })
-        return { ok: true, value: { accounts: results } satisfies RpcCreditsStatusResponse }
+        return { ok: true, value: { accounts: value } satisfies RpcCreditsStatusResponse }
       }
 
       // 一键领取：逐账号顺序执行（并发易触发风控），单个账号失败不中断整体。
+      //
+      // ⚠️ **2026-10-08 改（Task 4）：14 段 `if (req.provider === X.id)` 收敛成查表**
+      //   —— 那些分支体里**没有一行协议逻辑**（协议早已封装在各家
+      //   `claimXxxDailyCheckin` 内），RPC 层看到的只是「选哪个函数」。
+      //   表在 `src/provider-credits.ts`，各家实现逐字搬迁、**一行未改**。
+      //   ⚠️ 编排仍留在共享骨架 `collectClaimResults` 里，**一行不重写**
+      //   （「顺序执行避免并发风控」「单账号失败不中断」「凭据解析在 try 之内」
+      //    都是实测结论）。
+      //
+      // ⚠️ **表从 `auths` 现造，不查全局注册表**（与 `credits.balances` 同法，
+      //   理由见 `registerJetHubRpc` 的注释与设计复审 C1）：本函数持有本次注册的
+      //   auth 实例，查全局表会让测试无法注入桩、并重开「位置/时序错位」那扇门。
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
         const accounts = await pool.listAccounts(req.provider)
+        // ⚠️ **ZCode 是唯一保留的特例**（与余额侧的 opencode / qoder 同族理由）：
+        //    它的「一键领取」= 补激活上报 → preview → **逐个 plan** claim，
+        //    且**每个 plan 都要重新产一个 captcha**（captcha 一次性，复用会得
+        //    `3007`，这条路径每个 plan 都现产新的）—— 故**不能**复用
+        //    `collectClaimResults` 那套「一个凭据一次 claim」的形状（它假设
+        //    `claim()` 内部自己处理幂等），这里自己遍历账号与 plan。
+        //
+        //    ⚠️ ZCode **没有**独立的「今日是否已领」端点，故不走 `precheckStatus`
+        //    （`claimDailyWith` **自带**激活上报与 preview 查询，重复调用只会多发
+        //    一次无谓请求）。
+        // ⚠️ **Qoder 同族也是保留的特例**（与 `credits.balances` 同因）：
+        //    `claimQoderDailyCheckin` 只吃 `QoderCredential` + `QoderProduct`，
+        //    形态与「表里的实现自带 product 配置」不匹配。它的领取流程**自带活动
+        //    列表查询**（`loadCampaigns` → 逐个 claim），故 `precheckStatus: false`
+        //    跳过外部那次检查 —— 否则会重复发一次 GET（与 LobsterAI 传 false 同因）。
+        //
+        //    ⚠️ 幂等判据是响应体的 `replayed:true`（重复领取同样返回 HTTP 200），
+        //       已在 `claimQoderDailyCheckin` 内部处理。
+        //
+        //    ⚠️ 这两家**刻意不在** credits 表里（`credits-runtime-parity.spec.ts` 的
+        //       「表里的渠道集合」与 `provider-runtime-wiring.spec.ts` 的
+        //       「形态不匹配的特例」两条守卫都要求它们缺席）—— 故这里保持特例分支，
+        //       而不是把它们塞进表里再放宽那两条守卫。
         if (isQoderFamily(req.provider)) {
           const { product } = requireQoderFamily(req.provider)
-          // Qoder 的领取流程**自带活动列表查询**（loadCampaigns → 逐个 claim），
-          // 故 precheckStatus: false 跳过外部那次检查 —— 否则会重复发一次 GET
-          // （与 LobsterAI 传 false 的理由同类）。
-          //
-          // ⚠️ Qoder 的幂等判据是响应体的 `replayed:true`（重复领取同样返回
-          // HTTP 200），已在 claimQoderCampaign 内部处理。
           const value = await collectClaimResults<QoderCredential, undefined>(accounts, undefined, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             claim: (credential) => claimQoderDailyCheckin(credential, product),
@@ -2930,176 +2884,7 @@ function registerJetHubEndpoints(
           })
           return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
         }
-        if (req.provider === 'codearts') {
-          // CodeArts（华为云）走**签名**协议，与两个腾讯系 provider 都不同源：
-          // 领取流程自带「账户类型 + 活动列表」预检（见 claimCodeArtsDailyCheckin），
-          // 故 precheckStatus: false 跳过外部那次 CodeBuddy 式的状态查询 ——
-          // 用 fetchCheckinStatus 打华为端点既发错请求又必然失败。
-          const value = await collectClaimResults<CodeArtsCredential, undefined>(accounts, undefined, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential) => claimCodeArtsDailyCheckin(credential),
-            precheckStatus: false,
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
-        }
-        if (req.provider === LOBSTERAI.id) {
-          // LobsterAI 的 clientVersion 是签到必填参数，需动态解析
-          //（带缓存，通常无额外网络开销）。
-          const clientVersion = await lobsterai.resolveClientVersion()
-          const value = await collectClaimResults(accounts, LOBSTERAI, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential, product) =>
-              claimLobsteraiDailyCheckin(credential, product, clientVersion),
-            // 领取流程内部已做 slot/context 预检，不需要外部再查一次状态。
-            precheckStatus: false,
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
-        }
-        if (req.provider === TRAE.id) {
-          const value = await collectClaimResults<TraeCredential, undefined>(accounts, undefined, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            // ⚠️ **必须开启状态预检**（`precheckStatus` 默认为 true，不要传 false）。
-            //
-            // TRAE 的 claim 对「今天已签到」是**幂等**的：实测重复领取同样返回
-            // `{code:0, message:"success"}`，与真正领取成功**无法区分**。
-            // 早期照抄 LobsterAI 传了 `precheckStatus: false`（那是「领取流程内部
-            // 已做 slot/context 预检」的理由，TRAE 没有这回事），于是已签到的账号
-            // 被报成「领取成功」（用户报障：显示成功但 +0 积分）。
-            // 判据只能是 status 端点的 `checked_in`。
-            fetchStatus: (credential) =>
-              fetchTraeCheckinStatus(credential as TraeCredential, TRAE, fetch),
-            claim: (credential, _product, entry) =>
-              claimTraeDailyCheckin(
-                credential as TraeCredential,
-                TRAE,
-                fetch,
-                pool.traeCheckinDeviceGenerationFor(entry.id),
-                (next) => pool.updateTraeCheckinDeviceGeneration(entry.id, next),
-              ),
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
-        }
-        if (req.provider === LOOMY.id) {
-          // Loomy 的「签到」= `POST /points/first-login`（触发每日赠送额度）。
-          // ⚠️ 语义**不是**「+5000 积分」：`dailyBalance = dailyQuota - dailyConsumed`，
-          // 消耗后不回补。文案由 claimLoomyDailyQuota 的 already-claimed 表达。
-          // 领取流程自带幂等判据（`alreadyProcessed`），故不做额外预检。
-          const values: RpcCreditsClaimAccountResult[] = []
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
-            if (!resolved) {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                outcome: { kind: 'failed', code: -1, message: '凭据未配置' },
-              })
-              continue
-            }
-            let credential: LoomyCredential
-            try {
-              credential = JSON.parse(resolved.value) as LoomyCredential
-            } catch {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                outcome: { kind: 'failed', code: -1, message: '凭据解析失败' },
-              })
-              continue
-            }
-            const outcome = await loomy.claimDailyQuota(credential)
-            values.push({ accountId: account.id, nickname: account.nickname, outcome })
-          }
-          return {
-            ok: true,
-            value: {
-              summary: computeClaimSummary(values.map((v) => v.outcome)),
-              results: values,
-            } satisfies RpcCreditsClaimAllResponse,
-          }
-        }
-        if (req.provider === CLINE.id) {
-          // Cline **没有签到端点**（见 src/cline-credits.ts 的模块注释：
-          // 对整个 sidecar 做字符串扫描，无任何 checkin/campaign 业务端点）。
-          // 客户端按能力矩阵（`credits-capabilities.js` 的
-          // `cline: { balance: true, dailyCheckin: false }`）根本不会渲染
-          // 「一键领取积分」按钮、也不会发起本调用；这里显式返回可读错误，
-          // 而不是落到下面 `productById` 的 `unsupported provider` 泛化文案
-          // —— 后者会让排查者以为是「provider 没注册」，而真相是「该产品无此能力」。
-          return {
-            ok: false,
-            error: {
-              code: 'bad-request',
-              message: 'Cline 不支持每日签到（其后端没有签到接口）',
-            },
-          }
-        }
-        if (req.provider === 'workbuddy') {
-          // WorkBuddy **国际版没有签到接口**：客户端能力矩阵登记为
-          // `workbuddy: { balance: true, dailyCheckin: false }`，故它从不渲染
-          // 「一键领取积分」按钮、也从不调用本方法 —— 也就是说这条守卫此前
-          // **缺失但没被触发**（真实缺陷，2026-10-02 补）。
-          //
-          // ⚠️ 为什么必须补：没有它时 `workbuddy` 会落到下面 `productById` 拿到的
-          // buddy 产品上，用**国际版**凭据去发国内版的签到请求 —— 必然失败，而且是
-          // 一次真实的上游请求。而「每日首次启动自动签到」（`src/auto-checkin.ts`）
-          // 正是靠「调用 `claimAll`、按返回的信封判跳过」来决定遍历范围的，它**不维护
-          // 第二份能力名单** ⇒ 这里漏一个守卫，它就会真去发一轮必然失败的请求。
-          // 两处是同源改动，别只改一半。
-          return {
-            ok: false,
-            error: {
-              code: 'bad-request',
-              message: 'WorkBuddy 国际版不支持每日签到（其后端没有签到接口）',
-            },
-          }
-        }
-        if (req.provider === RACCOON.id) {
-          // raccoon **没有签到端点**：每日 300 积分由服务端按日自动发放
-          //（账单里的 `daily_grant`，实测注册后 1 分钟即到账），
-          // 客户端按能力矩阵（`raccoon: { balance: true, onboardingTasks: true }`，
-          // **无** `dailyCheckin`）根本不会渲染「一键领取积分」按钮、也不会发起本调用。
-          // 这里显式返回可读错误，而不是落到下面 `productById` 的
-          // `unsupported provider` 泛化文案 —— 后者会让排查者以为是
-          //「provider 没注册」，而真相是「该产品无此能力」。
-          return {
-            ok: false,
-            error: {
-              code: 'bad-request',
-              message: 'Raccoon Work 不支持每日签到（每日积分由服务端自动发放；登录奖励请在「新手任务」中领取）',
-            },
-          }
-        }
-        if (req.provider === MINIMAX.id) {
-          // ⚠️ **必须开启状态预检**（`precheckStatus` 默认为 true，不要传 false）。
-          //
-          // 理由与 TRAE 那条同型（见上方 TRAE 分支的详细注释）：MiniMax 的
-          // `claimMinimaxDailyCheckin` 靠响应体的 `claim_result` 判幂等
-          //（`1`=真领取、`2`=已领过），这在 **HTTP 层**是可靠的；但状态预检是
-          // 第二道防线 —— 若某天服务端对已领账号也回 `claim_result: 1`，
-          // 预检能靠 `todayCheckedIn` 先挡住，避免把「今天已领」报成「+积分」。
-          // 反之传 false 会让已签到账号走到 claim 请求（多发一次 POST）。
-          const value = await collectClaimResults<MinimaxCredential, undefined>(accounts, undefined, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchStatus: (credential) => fetchMinimaxSigninStatus(credential),
-            claim: (credential) => claimMinimaxDailyCheckin(credential),
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
-        }
         if (req.provider === ZCODE.id) {
-          /**
-           * ZCode 的「一键领取」= 补激活上报 → preview → 逐个 claim。
-           *
-           * ⚠ **每个 plan 都要重新产一个 captcha**（captcha 一次性，
-           * 复用会得 `3007`，这条路径每个 plan 都现产新的）—— 故不能复用 `collectClaimResults`
-           * 那套「一个凭据一次 claim」的形状（它假设 `claim()` 内部
-           * 自己处理幂等），这里自己遍历账号与 plan。
-           *
-           * ⚠ ZCode **没有**独立的「今日是否已领」端点，故不调
-           * `precheckStatus`（`claimDailyWith` **自带**激活上报与
-           * preview 查询，重复调用只会多发一次无谓请求）。
-           */
           const results: RpcCreditsClaimAllResponse['results'] = []
           const outcomes: ClaimOutcome[] = []
           for (const account of accounts) {
@@ -3147,28 +2932,81 @@ function registerJetHubEndpoints(
             value: { results, summary: computeClaimSummary(outcomes) } satisfies RpcCreditsClaimAllResponse,
           }
         }
-        const product = productById(req.provider)
-        if (product === undefined) {
-          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+
+        const impl = creditsOf(credits, req.provider)
+        if (impl?.claim === undefined) {
+          // ⚠️ 措辞必须**指明是"该产品无此能力"**，不能退化成「provider 没注册」
+          // —— 后者会让排查者去查注册表，而真相是产品没有这个接口。
+          //
+          // ⚠️ 文案由**表**给（`claimUnavailableReason`），不在端点里拼模板：
+          //    三条文案是实测报障修来的、各自信息量不同（raccoon 那条含可操作
+          //    指引「登录奖励请在『新手任务』中领取」），压成一句泛化模板会丢掉它。
+          //    两个真实例子（各自的历史注释都记录了这一点）：
+          //      - cline：对整个 sidecar 做字符串扫描，无任何 checkin/campaign 端点；
+          //      - workbuddy：国际版内核里只有 get-dosage-notify，没有签到接口。
+          //    ⚠️ workbuddy 这条守卫**必须有**：没有它时会落到下面的通用分支，
+          //       用**国际版**凭据去发**国内版**的签到请求 —— 必然失败，而且是一次
+          //       真实的上游请求。而「每日首次启动自动签到」正是靠「调 claimAll、
+          //       按返回的信封判跳过」来决定遍历范围的，它**不维护第二份能力名单**。
+          //
+          // ⚠️ 表里**没有专属文案**的已登记渠道（gemini / opencode / aggregate）
+          //    仍回**旧的** `unsupported provider: X` —— 那是**刻意不动**的行为
+          //    （改成「不支持每日签到」是一处需批准的 G3 例外，见 Task 4 报告）。
+          //    未登记的 id 同样落进这里（兜底契约不变）。
+          if (impl?.claimUnavailableReason !== undefined) {
+            return {
+              ok: false,
+              error: { code: 'bad-request', message: impl.claimUnavailableReason },
+            }
+          }
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` },
+          }
         }
-        // 成长中心任务：与签到**共用这一趟逐账号循环**（见 CreditsEndpointDeps
-        // .afterClaim），故凭据只解析一遍。
+        // ⚠️ 第二参（product）统一传 `undefined`：它只被透传给骨架的 `claim` /
+        //    `fetchStatus` 入参，而这两者现在由 credits 表提供、**自带各自的
+        //    product 配置**，不再需要调用侧转发（原先 buddy 系传
+        //    `productById()`、其余传 `undefined`，是历史形态）。
         //
-        // ⚠️ `runTasks` 缺省为 false：这条路径同时是「每日首次启动自动签到」的
-        // 执行体（见上方 createAutoCheckin 的 claim 回调），而成长一轮单账号实测
-        // 90～270s、全串行、任务间 1.5s 节流。默认开启等于每次启动自动打几十个
-        // 上游请求。只有用户手点「一键领取积分」时才传 true。
-        const value = await collectClaimResults(accounts, product, {
+        // ⚠️ `afterClaim`（成长中心）**必须留在这趟循环里**（见
+        //    `CreditsEndpointDeps.afterClaim` 的长注释）：它与签到共用同一趟
+        //    逐账号循环，凭据只解析一遍。漏掉它的症状**只是**「成长中心不工作了」，
+        //    日志里没有错误。
+        const value = await collectClaimResults(accounts, undefined, {
           resolve: (ref) => ctx.credentials.resolve(ref),
+          // ⚠️ 骨架的 `claim` 是 `(credential, product, entry)` —— 第三参才是
+          //    `entry`（TRAE 用它取签到设备代次）。产品配置由表里的实现闭包捕获，
+          //    故这里把 `product` 丢掉。
+          claim: (credential, _product, entry) => impl.claim!(credential, entry, callContext),
+          // ⚠️ 由能力表驱动，不再散落 provider 字面量。
+          ...impl.precheckStatus === undefined ? {} : { precheckStatus: impl.precheckStatus },
+          // ⚠️ 预检优先用 `claimStatus`，缺席时回落到 `fetchStatus`
+          //（buddy / minimax 的预检与面板读数是同一个端点，只声明一次）。
+          ...(impl.claimStatus ?? impl.fetchStatus) === undefined
+            ? {}
+            : {
+                fetchStatus: (credential: unknown) =>
+                  (impl.claimStatus ?? impl.fetchStatus)!(credential, callContext),
+              },
+          // 成长中心任务：与签到**共用这一趟逐账号循环**（见 CreditsEndpointDeps
+          // .afterClaim），故凭据只解析一遍。
+          //
+          // ⚠️ `runTasks` 缺省为 false：这条路径同时是「每日首次启动自动签到」的
+          // 执行体（见上方 createAutoCheckin 的 claim 回调），而成长一轮单账号实测
+          // 90～270s、全串行、任务间 1.5s 节流。默认开启等于每次启动自动打几十个
+          // 上游请求。只有用户手点「一键领取积分」时才传 true。
+          //
+          // ⚠️ 门控是「**该家是否提供 `afterClaim`**」—— 原先的
+          //    `GROWTH_CAPABLE_PROVIDERS` 手抄集合已删除（Task 1b 同因：
+          //    消除平行副本，让「哪家有成长中心」由能力注册表说了算）。
+          ...req.runTasks !== true || impl.afterClaim === undefined
+            ? {}
+            : {
+                afterClaim: (credential, _product, entry, _outcome, roundDeadlineAt) =>
+                  impl.afterClaim!(credential, entry, { budgetMs: req.budgetMs, roundDeadlineAt }, callContext),
+              },
           warn: (msg) => ctx.logger?.warn?.(msg),
-          ...(req.runTasks === true && GROWTH_CAPABLE_PROVIDERS.has(req.provider)
-            ? {
-                afterClaim: (credential, growthProduct, entry, _outcome, roundDeadlineAt) =>
-                  collectBuddyGrowth(
-                    credential, growthProduct, entry, req.budgetMs, roundDeadlineAt,
-                  ),
-              }
-            : {}),
         })
         return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
       }
@@ -3178,95 +3016,27 @@ function registerJetHubEndpoints(
       // 独立于 account.list 的原因：余额要为每个账号发一次网络请求，而
       // account.list 是打开面板就会调的轻量操作。混在一起会让账号列表被
       // 网络耗时拖慢，且一次查询失败会让整份列表都取不到。
+      //
+      // ⚠️ **2026-10-08 改（Task 3）：11 段 `if (req.provider === X.id)` 收敛成查表**
+      //   —— 那些分支体里**没有一行协议逻辑**（协议早已封装在各家
+      //   `fetch*Balance` 内），RPC 层看到的只是「选哪个函数」。表在
+      //   `src/provider-credits.ts`，各家实现逐字搬迁、**一行未改**。
+      //   ⚠️ 编排仍留在共享骨架 `collectCreditBalances` 里，**一行不重写**
+      //   （「顺序查询避免并发触发风控」「单账号失败不中断」都是实测结论）。
       case 'credits.balances': {
         const req = payload as RpcCreditsBalancesRequest
         const accounts = await pool.listAccounts(req.provider)
-        if (req.provider === 'codearts') {
-          // 余额来自 `statistics/plugin`（与账户类型检测同一个响应），
-          // 故用带原因的钩子：非积分账户要显示「Token 计费账户」而不是
-          // 误导性的「余额查询失败」。
-          const values = await collectCreditBalances<CodeArtsCredential, undefined>(accounts, undefined, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalanceDetailed: async (credential) => {
-              // 用带原因的版本：`fetchCodeArtsAccountInfo` 只回 null，会把
-              // 「AK 限流」「签名失败」「凭据过期」压成同一句笼统文案，
-              // 用户与排查者都拿不到线索（本端点就因此把一次 401 显示成了
-              // 无信息量的「账户信息查询失败」）。
-              const result = await fetchCodeArtsAccountInfoDetailed(credential)
-              if (!result.ok) return { balance: null, error: `账户信息查询失败：${result.message}` }
-              const info = result.info
-              if (!info.isCreditPackage) {
-                return {
-                  balance: null,
-                  error: info.isTokenPackage
-                    ? 'Token 计费账户，无积分余额'
-                    : '非积分计费账户，无积分余额',
-                }
-              }
-              // 积分账户但没有 credit metric：如实报「无积分数据」，
-              // 不显示成 0 —— 0 会让用户以为自己把积分用光了。
-              if (info.credit === undefined) return { balance: null, error: '未返回积分数据' }
-              return { balance: info.credit }
-            },
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
-        if (req.provider === LOBSTERAI.id) {
-          const values = await collectCreditBalances(accounts, LOBSTERAI, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          // ⚠️ LobsterAI 也回传窗口天数（用户报障「账号的积分没按长期、临时方式
-          // 显示」）：它的每个资源包都带 `expiresAt`（已归一化到
-          // `deductionEndTime`），面板要按到期远近分「长期 / 临时」。
-          // 窗口语义与 buddy / TRAE 一致，共用同一个环境变量。
-          return {
-            ok: true,
-            value: {
-              accounts: values,
-              windowDays: buddyExpiringWindowDays(),
-            } satisfies RpcCreditsBalancesResponse,
-          }
-        }
-        if (isQoderFamily(req.provider)) {
-          const { product } = requireQoderFamily(req.provider)
-          // 余额来自 `GET {product.openApiBase}/sash/api/v2/me/usage`（实测只需
-          // Bearer + Cosy-ClientType，**不需要**模型列表那样的 WASM 签名）。
-          // `fetchQoderCreditBalance` 只吃 QoderCredential，故这里不用
-          // collectCreditBalances 的泛型（它会把产品配置转发给 fetchBalance）。
-          const values: RpcCreditsBalancesResponse['accounts'] = []
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
-            if (!resolved) {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                balance: null, error: '凭据未配置',
-              })
-              continue
-            }
-            let credential: QoderCredential
-            try {
-              credential = JSON.parse(resolved.value) as QoderCredential
-            } catch {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                balance: null, error: '凭据解析失败',
-              })
-              continue
-            }
-            const balance = await fetchQoderCreditBalance(credential, product)
-            values.push({
-              accountId: account.id,
-              nickname: account.nickname,
-              balance,
-              // 查不到时带上原因，卡片显示原因而非 0（与其它 provider 同约定）。
-              ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
-            })
-          }
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
+
+        // ⚠️ **两个形态与骨架不匹配的特例，先于查表短路**：
+        //    - `opencode`：余额是**本地派生的通道可用性**（读账号池的
+        //      `modelRateLimits`），**零网络请求**。套进
+        //      `fetchBalance(credential, …)` 形状会逼它去发一个不存在的上游请求
+        //      （实测 Zen 的 15 个候选余额路径全部 404）。
+        //    - `qoder` 系：`fetchQoderCreditBalance` 只吃 `QoderCredential`，
+        //      且 product 来自同族注册表，**不走** `collectCreditBalances` 的
+        //      `(credential, product)` 泛型。
+        // 保留特例而非强行套骨架：套上去会丢语义（设计文档 §3.5 的边界 ——
+        // 抽象的是「选哪个函数」，不是「函数内部怎么做」）。
         if (req.provider === OPENCODE.id) {
           // ⚠️⚠️ **这里不查远端余额**（设计决定，2026-10-02，与用户确认走「限额状态」路 A）。
           //
@@ -3329,88 +3099,12 @@ function registerJetHubEndpoints(
           })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
-        if (req.provider === TRAE.id) {
-          const values = await collectCreditBalances(accounts, TRAE, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalance: (credential, product) => fetchTraeCreditBalance(credential as TraeCredential, product),
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          // ⚠️ TRAE 也回传窗口天数：它的资源包现在带 `deductionEndTime`
-          // （条目级 `expire_time`，秒→毫秒），面板要按「长期 / 临时」分桶显示。
-          // 没有窗口天数前端会拒绝渲染分类行（见 credit-expiry.js 的
-          // normalizeWindowDays —— 非 buddy provider 不带该字段被视为
-          // "没有作废维度"，这是防止凭空渲染假分类行的门禁）。
-          // 窗口语义与 buddy 系一致：距到期不足 windowDays 的算「临时」。
-          return {
-            ok: true,
-            value: {
-              accounts: values,
-              windowDays: buddyExpiringWindowDays(),
-            } satisfies RpcCreditsBalancesResponse,
-          }
-        }
-        if (req.provider === MINIMAX.id) {
-          // 余额来自 `GET /minimax-cloud/api/v1/credit/details`。
-          //
-          // ⚠️ **该端点是平铺响应**（`total_count` 与 `base_resp` 同级、**没有
-          // `data` 键**）—— 与签到端点不同。`fetchMinimaxCreditBalance` 内部已
-          // 用 `unwrapEnvelopeData` 兼容两种形状。
-          // ⚠️ 查不到时（null）由 helper 统一补「余额查询失败」文案，卡片显示
-          // 原因而非 0 —— 这与「余额为 0」是**两回事**，不能混为一谈
-          //（本机实测 `total_count: 0` 且 `details` 缺失正是「真的为 0」）。
-          const values = await collectCreditBalances<MinimaxCredential, undefined>(accounts, undefined, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalance: (credential) => fetchMinimaxCreditBalance(credential),
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
-        if (req.provider === GEMINI.id) {
-          // 余额 = **配额窗口**（不是充值积分）：`POST
-          // /v1internal:retrieveUserQuotaSummary` 两个桶（`gemini-5h` /
-          // `gemini-weekly`）的剩余比例。
-          //
-          // ⚠️ 用 `fetchBalanceDetailed`（而非 `fetchBalance`）：Gemini 的
-          // 「未授权」与「查询失败」是**两回事** —— 前者要显示「尚未授权 Google
-          // 账号」、后者要显示具体原因（网络/HTTP/响应形状）。
-          // `collectCreditBalances` 会把 `{balance: null, error}` 原样透传给
-          // 卡片（helper 只在 `error` 缺失时才补「余额查询失败」），故这里
-          // **不需要**像 CLINE 分支那样手写 for 循环。
-          //
-          // ⚠️ 第二实参传 `GEMINI` 而不是 minimax 那样的 `undefined`：
-          // `fetchGeminiCreditBalance` 的第二形参就是 product（端点/超时来自
-          // 产品配置）。
-          //
-          // ⚠️ 账号规格（Pro / Free / Ultra）搭这趟车回来：`loadCodeAssist` 与
-          // 配额是同一函数里**并行**发的两个端点，档位挂在 `result.tier` 上。
-          // 这里把它翻译成面板要的 `extra.accountTier` —— `label` 是短标签
-          // （面板只放得下一个词），`title` 是上游原文（hover 才看得到）。
-          // 档位取不到时 `extra` 缺席，面板不渲染那一行（**不是错误**）。
-          const values = await collectCreditBalances<GeminiCredential, typeof GEMINI>(accounts, GEMINI, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalanceDetailed: async (credential) => {
-              const { balance, error, tier } = await fetchGeminiCreditBalance(credential, GEMINI)
-              const extra: RpcCreditsBalanceExtra | undefined = tier === undefined
-                ? undefined
-                : { accountTier: { label: tier.label, title: `${tier.name}（${tier.id}）` } }
-              return {
-                balance,
-                ...error === undefined ? {} : { error },
-                ...extra === undefined ? {} : { extra },
-              }
-            },
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
-        if (req.provider === CLINE.id) {
-          // 余额来自 `GET /api/v1/users/{accountId}/balance`（实测
-          // `{data:{userId, balance}, success:true}`）。与 Qoder 分支同因：
-          // `fetchClineCreditBalance` 只吃 ClineCredential，故不用
+        if (isQoderFamily(req.provider)) {
+          const { product } = requireQoderFamily(req.provider)
+          // 余额来自 `GET {product.openApiBase}/sash/api/v2/me/usage`（实测只需
+          // Bearer + Cosy-ClientType，**不需要**模型列表那样的 WASM 签名）。
+          // `fetchQoderCreditBalance` 只吃 QoderCredential，故这里不用
           // collectCreditBalances 的泛型（它会把产品配置转发给 fetchBalance）。
-          //
-          // ⚠️ 账号 id 必须用凭据里的 `account_id`（`usr-…`），**不是** JWT 的
-          // `sub`（`user_…`）—— 传后者实测返回 `400 Invalid request format`。
           const values: RpcCreditsBalancesResponse['accounts'] = []
           for (const account of accounts) {
             const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
@@ -3421,9 +3115,9 @@ function registerJetHubEndpoints(
               })
               continue
             }
-            let credential: ClineCredential
+            let credential: QoderCredential
             try {
-              credential = JSON.parse(resolved.value) as ClineCredential
+              credential = JSON.parse(resolved.value) as QoderCredential
             } catch {
               values.push({
                 accountId: account.id, nickname: account.nickname,
@@ -3431,181 +3125,54 @@ function registerJetHubEndpoints(
               })
               continue
             }
-            const result = await fetchClineCreditBalance(credential, CLINE)
-            values.push({
-              accountId: account.id,
-              nickname: account.nickname,
-              balance: result.balance,
-              // 查不到时带上**具体原因**（含 HTTP 状态码与错误体摘要），
-              // 而不是笼统一句「查询失败」—— 卡片显示原因而非 0
-              //（0 是「已用光」的语义，会误导用户）。
-              ...result.balance === null
-                ? { error: result.error ?? '积分查询失败（凭据失效或响应异常）' }
-                : {},
-            })
-          }
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
-        if (req.provider === LOOMY.id) {
-          // 余额来自 `GET /points/records`（**只读**，无副作用）。
-          // ⚠️ 刻意不用 `first-login`：那是**写**端点，在「打开面板」这种
-          // 高频路径上调用会意外触发签到。
-          const values: RpcCreditsBalancesResponse['accounts'] = []
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
-            if (!resolved) {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                balance: null, error: '凭据未配置',
-              })
-              continue
-            }
-            let credential: LoomyCredential
-            try {
-              credential = JSON.parse(resolved.value) as LoomyCredential
-            } catch {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                balance: null, error: '凭据解析失败',
-              })
-              continue
-            }
-            const balance = await loomy.fetchCreditBalance(credential)
+            const balance = await fetchQoderCreditBalance(credential, product)
             values.push({
               accountId: account.id,
               nickname: account.nickname,
               balance,
-              // 查不到时带原因（不显示成 0，0 是「已用光」的语义）。
+              // 查不到时带上原因，卡片显示原因而非 0（与其它 provider 同约定）。
               ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
             })
           }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
-        if (req.provider === RACCOON.id) {
-          // 余额来自 `GET /points/v1/balance`（**只读**，无副作用）。
-          const values: RpcCreditsBalancesResponse['accounts'] = []
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
-            if (!resolved) {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                balance: null, error: '凭据未配置',
-              })
-              continue
-            }
-            let credential: RaccoonCredential
-            try {
-              credential = JSON.parse(resolved.value) as RaccoonCredential
-            } catch {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                balance: null, error: '凭据解析失败',
-              })
-              continue
-            }
-            const balance = await raccoon.fetchCreditBalance(credential)
-            values.push({
-              accountId: account.id,
-              nickname: account.nickname,
-              balance,
-              // ⚠️ 查不到时带原因（**不显示成 0** —— 0 是「已用光」的语义，
-              // 把「查询失败」显示成 0 会让用户以为自己积分没了）。
-              ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
-            })
-          }
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
-        if (req.provider === ZCODE.id) {
-          /**
-           * 余额来自 `GET /zcode-plan/billing/balance`（**只读**，无副作用）。
-           *
-           * ⚠ ZCode 的额度单位是 **token**，而 Jet Hub 这个字段的语义是
-           * 「积分」。两者量纲不同 —— 但都要展示，故这里如实返回数值
-           * 并在错误文案里说明来源。`balance: null` 表示**查不到**
-           * （不显示成 0，0 是「已用光」的语义）。
-           */
-          const values: RpcCreditsBalancesResponse['accounts'] = []
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
-            if (!resolved) {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                balance: null, error: '凭据未配置',
-              })
-              continue
-            }
-            let credential: ZcodeCredential
-            try {
-              credential = JSON.parse(resolved.value) as ZcodeCredential
-            } catch {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                balance: null, error: '凭据解析失败',
-              })
-              continue
-            }
-            const result = await zcode.fetchBalanceFor(credential)
-            if (result === undefined) {
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                balance: null, error: '额度查询失败（凭据失效或网络异常）',
-              })
-              continue
-            }
-            if (result.enterprise === true) {
-              // 企业版不下发额度数字、只给外部链接 —— 如实说明，不显示 0。
-              values.push({
-                accountId: account.id, nickname: account.nickname,
-                balance: null, error: '企业版账号不下发额度数字，请在 ZCode 内查看',
-              })
-              continue
-            }
-            values.push({
-              accountId: account.id,
-              nickname: account.nickname,
-              /**
-               * ⚠ `CreditBalance` 的形状是 `{total, packages[], expiredTotal?}`
-               * 这类**积分包**结构，而 ZCode 是「按日的 token 额度池」。
-               * 两者结构不同，故**逐桶**如实映射 —— 上游一个 resource bucket
-               * 就是一个包，包名用 `show_name`（实测是模型名，如
-               * `GLM-5.3-Flash`）。
-               *
-               * ## ⚠⚠ 这里曾经只映射 `buckets[0]`（真实缺陷）
-               *
-               * 旧实现只取 `result.planName`（= `buckets[0]?.showName`）拼**一个**
-               * 包 —— 多桶账号的其余额度被**静默丢掉**，UI 上看起来只有
-               * 一个模型的额度。而 `result.remaining` / `total` 却是**全桶汇总**，
-               * 于是那一个包的数字比它自己的 `totalUnits` 还大，自相矛盾。
-               *
-               * 实测（本机账号）上游只回一个桶（`GLM-5.3-Flash`），
-               * 但**不能按「只有一个桶」来写** —— 那正是把缺陷固化成契约；
-               * 且用户要看的恰恰是「GLM-5.3 与 GLM-5.3-Flash 各自剩多少」，
-               * 前端需要按模型逐行渲染、缺桶的模型显示占位。
-               */
-              balance: buildZcodeBalance(result),
-            })
-          }
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
-        const product = productById(req.provider)
-        if (product === undefined) {
+
+        // ── 查表分派 ──
+        // ⚠️ 表由 `registerJetHubEndpoints` 从 `auths` 现造（**不是**形参，
+        //    见 `registerJetHubRpc` 的注释：第 5 个位置形参已在 2026-10-08
+        //    设计复审 C1 中删除）。`src/index.ts` 另有一份**同源同构**的表挂在
+        //    `ProviderRuntime.credits` 上，供 Task 5/8 的跨模块消费点读 ——
+        //    两条接线的消费方不同，但用的是同一个工厂、同一批 auth 实例。
+        const impl = creditsOf(credits, req.provider)
+        if (impl === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
-        const values = await collectCreditBalances(accounts, product, {
+        // ⚠️ 包一层适配：runtime 的签名是 `(credential, call)`，
+        //    `collectCreditBalances` 的入参签名是 `(credential, product)`。
+        const values = await collectCreditBalances(accounts, undefined, {
           resolve: (ref) => ctx.credentials.resolve(ref),
+          ...impl.fetchBalanceDetailed === undefined
+            ? {}
+            : {
+                fetchBalanceDetailed: (credential) =>
+                  impl.fetchBalanceDetailed!(credential, callContext),
+              },
+          ...impl.fetchBalance === undefined
+            ? {}
+            : { fetchBalance: (credential) => impl.fetchBalance!(credential, callContext) },
           warn: (msg) => ctx.logger?.warn?.(msg),
         })
-        // ⚠️ 只有 buddy 系会走到这里（`productById` 只认 CodeBuddy / WorkBuddy），
-        // 而它们正是唯一需要「窗口天数」的 provider：面板要把资源包分成
-        // 临时 / 永久两桶显示，窗口必须**由后端给出**（可被
-        // DSH_BUDDY_EXPIRING_WINDOW_DAYS 覆盖），前端写死就会与选号判据分叉。
-        return {
-          ok: true,
-          value: {
-            accounts: values,
-            windowDays: buddyExpiringWindowDays(),
-          } satisfies RpcCreditsBalancesResponse,
-        }
+        // ⚠️ 只有**按到期时间分桶**的渠道才回传窗口天数（判据是 registry 的
+        //    `usesExpiryWindow`，不是「是不是 buddy」）—— 前端文案若写死 15
+        //    会与真实判据不一致（用户看到「只烧 15 天内的」而实际按 31 天筛号）。
+        //    ⚠️ 改成字段驱动后**行为不变**：登记的正是原先那四段硬编码的
+        //    buddy 系 + TRAE + LobsterAI（loomy 刻意不在内 —— 它由服务端直接
+        //    给两个命名池，没有窗口概念）。
+        const usesWindow = descriptorOf(req.provider)?.usesExpiryWindow === true
+        const value: RpcCreditsBalancesResponse = usesWindow
+          ? { accounts: values, windowDays: buddyExpiringWindowDays() }
+          : { accounts: values }
+        return { ok: true, value }
       }
 
       // ── Cline「订阅额度」：官方额度窗口 + 请求记录 ──
@@ -3773,7 +3340,7 @@ function registerJetHubEndpoints(
         // 背景：`withDeadModelPruning` 会把已失效模型从 `listModels` / `listAllModels`
         // 两侧剔除，于是它既不在 `all` 里、也不在 `disabledMap` 里 —— 上面的两条
         // 补回路径都救不回它。结果是**模型从设置页彻底消失，连开关都摸不着**，
-        // 用户永远无法自行恢复（这正是本段注释在 `:3370-3375` 列为必须避免的根因：
+        // 用户永远无法自行恢复（这正是上文 `withDeadModelPruning` 处列为必须避免的根因：
         // 「用户再也无法重新打开」）。
         //
         // ⇒ 这里把 dead 表里的 id 补回目录，并带上 `dead: true` 让客户端灰显 +
@@ -4527,7 +4094,7 @@ function registerJetHubEndpoints(
        *    触发风控」），不缓存会让上游请求数随轮询线性放大。
        *
        * ⚠️ 未知 provider 的 `bad-request` 由内层 `credits.balances` 给出（那里
-       * 已有 12 条分派与 `unsupported provider` 的统一文案），本分支**原样透传**，
+       * 已有查表分派与 `unsupported provider` 的统一文案），本分支**原样透传**，
        * 不另立一份 provider 名单 —— 两份名单必然漂移。
        *
        * ⚠️ `force: true` = 绕过缓存（手动刷新、签到之后）。
@@ -4604,9 +4171,8 @@ function registerJetHubEndpoints(
        * 数据源是落盘的日聚合表（`token-ledger.json`，重启保留）—— 纯内存
        * 计算（Map 树 → 数组），不打上游、不做额外 I/O。
        *
-       * ⚠️ `sinceDays` 钳制在 `[1, TOKEN_LEDGER_HISTORY_MAX_DAYS]`：0/负数
-       * 按「仅今日」处理（省略 = 全部历史），超过上限裁到上限 —— 落盘本身
-       * 只保留 90 天，更大的窗口只会白算。
+       * `sinceDays` 钳制在 `[1, TOKEN_LEDGER_HISTORY_MAX_DAYS]`；也支持 fromDay / toDay
+       * 按 UTC+8 日键做闭区间查询。落盘本身只保留 90 天。
        */
       case 'usage.tokenLedgerHistory': {
         const req = payload as RpcUsageTokenLedgerHistoryRequest
@@ -4614,8 +4180,23 @@ function registerJetHubEndpoints(
         const sinceDays = typeof raw === 'number' && Number.isFinite(raw)
           ? Math.min(Math.max(Math.trunc(raw), 1), TOKEN_LEDGER_HISTORY_MAX_DAYS)
           : undefined
-        const result = readTokenLedgerHistory(readTokenLedgerDayMap(), { sinceDays })
+        const fromDay = isValidTokenLedgerDayKey(req?.fromDay) ? req.fromDay : undefined
+        const toDay = isValidTokenLedgerDayKey(req?.toDay) ? req.toDay : undefined
+        const result = readTokenLedgerHistory(readTokenLedgerDayMap(), { sinceDays, fromDay, toDay })
         const value: RpcUsageTokenLedgerHistoryResponse = { history: result.days, totals: result.totals }
+        return { ok: true, value }
+      }
+
+      /** 只删除一个 UTC+8 日期的持久化历史累计，不触碰实时明细与其他设置。 */
+      case 'usage.tokenLedgerDeleteDay': {
+        const req = payload as Partial<RpcUsageTokenLedgerDeleteDayRequest>
+        if (!isValidTokenLedgerDayKey(req?.day)) {
+          return { ok: false, error: { code: 'bad-request', message: 'day 必须是有效的 YYYY-MM-DD 日期' } }
+        }
+        if (!deleteTokenLedgerDay(req.day)) {
+          return { ok: false, error: { code: 'not-found', message: `没有可删除的 ${req.day} 历史用量` } }
+        }
+        const value: RpcUsageTokenLedgerDeleteDayResponse = { day: req.day, deleted: true }
         return { ok: true, value }
       }
 

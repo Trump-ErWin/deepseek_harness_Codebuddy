@@ -6,10 +6,10 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
@@ -267,7 +267,6 @@ function isDeepseekV4Model(model: string): boolean {
  * 工具名匹配大参数写文件类工具（content/arguments 可能达到数万 token）。
  * 仅用于对非 deepseek-v4 模型的 DSML 模式降级判定（当前全量模式不再使用此列表）。
  */
-const DSML_LARGE_PARAM_TOOLS = ['write', 'file_write', 'apply_patch']
 /**
  * 判断模型是否应使用 DSML 原生工具调用语法输出。
  *
@@ -952,6 +951,12 @@ export class CodeArtsAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   private readonly chatId: string
   private readonly sessionId: string
+  /**
+   * ⚠️ **2026-10-08 Task 7b：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+   * 现在只剩 `toCatalogEntry`（本家私有形状 + VL 过滤 + 静态 context 表）。
+   */
+  private readonly catalog: ModelCatalog
 
   constructor(private readonly options: CodeArtsAdapterOptions) {
     super()
@@ -961,6 +966,29 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
     this.catalogGate = new RemoteCatalogGate(
       options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
+    // ⚠️ 共享骨架（Task 7b）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: { id: PROVIDER },
+        loadCatalog: () => this.catalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ 未知 id 恒声明 `['text']`（本家是纯文本网关）。
+        // ⚠️ 这是**用户 2026-10-08 裁定的一处行为变更**：原 `resolveModel` 对未知 id
+        //    **省略**该字段（而 `listModels` 却声明 `['text']`，同一家内部不一致）
+        //    ⇒ 统一为声明。影响面为零：CodeArts 是纯文本网关，VL 模型已被滤掉。
+        unknownModelInputModalities: () => ['text'] as const,
+        // ⚠️ **未知模型也声明思考档位**（7b 曾在此引入回归、7d 补回）：
+        // 本网关唯一生效的思考控制是顶层 `thinking.type`，与模型无关 ⇒
+        // 原实现对未知 id 同样给这两档。
+        unknownModelReasoning: () => ({
+          efforts: [
+            { id: ReasoningEffortId('on'), name: '开启' },
+            { id: ReasoningEffortId('off'), name: '关闭' },
+          ],
+          defaultEffort: ReasoningEffortId('on'),
+        }),      },
     )
   }
 
@@ -994,7 +1022,7 @@ export class CodeArtsAdapter extends LlmAdapter {
    * ⚠ **不能省**：DSH 的 `buildModelCatalog` 对每个 provider `await listModels()`
    * 后再对每个模型 `await resolveModelInfo()`，两处都会走到这里。原实现失败
    * 直接返回（不落缓存）⇒ 一次网络故障被放大成「每模型重试一次」，每次顶着
-   * 10s 超时（`src/models.ts:55 FETCH_TIMEOUT_MS`），首屏因此长时间空转。
+   * 10s 超时（`src/models.ts FETCH_TIMEOUT_MS`），首屏因此长时间空转。
    */
   private readonly catalogGate: RemoteCatalogGate
 
@@ -1034,65 +1062,85 @@ export class CodeArtsAdapter extends LlmAdapter {
    * 黑名单过滤掉它们 —— RPC 层只能凭裸 id 补回，展示名随之丢失
    * （用户报障：「关闭的就没有显示倍率」）。CodeArts 目录虽无倍率，但同样
    * 需要正确的 `name`（否则关闭项显示 `deepseek-v4-flash` 这类裸 id）。
+   *
+   * ⚠️ **2026-10-08 Task 7b**：骨架已上移到 `src/model-catalog.ts`，此处只剩委托。
+   * ⚠️ 本家有一处**特有**的「可见性过滤」（VL 多模态不参与，见 `toCatalogEntry`），
+   * 它在 `listModels` 与 `listAllModels` **两条路径上都要生效** ——
+   * 故放在 `toCatalogEntry` 之前的取数回调里（`catalogEntries()`）。
    */
   listAllModels(): readonly { id: string; name: string }[] {
+    return this.catalog.listAllModels()
+  }
+
+  /**
+   * 把本家条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 本家三处**真实差异**（不要「顺手统一」）：
+   * 1. **VL 多模态不参与目录**（`-VL-` / `-VL` 结尾的 id 被滤掉）——
+   *    这是本家的可见性判据，骨架不认识；
+   * 2. `contextWindow` 来自静态 `CONTEXT_WINDOWS` 表（不是远端字段）；
+   * 3. `reasoning` 是**恒声明**的两档（开启/关闭），与 entry 无关 ——
+   *    实测（2026-09-29）：本网关**唯一**真正生效的思考控制是顶层
+   *    `thinking.type`，`reasoning_effort`（含 low/high/none/minimal）与嵌套
+   *    `reasoning.effort` 都被服务端接受但**完全无效果**（判据为服务端上报的
+   *    `reasoning_tokens`，落在基线噪声内；`none` 也照常思考）。
+   *    故**不**臆造 low/high/max 强度阶梯。
+   */
+  private toCatalogEntry(model: { id: string; name: string }): CatalogEntry {
+    const contextWindow = CONTEXT_WINDOWS.get(model.id)
+    return {
+      id: model.id,
+      name: model.name,
+      // ⚠️ 本家恒声明 `['text']`（CodeArts 是纯文本网关；VL 模型上面已滤掉）。
+      inputModalities: ['text'] as const,
+      ...contextWindow !== undefined ? { contextWindow } : {},
+      reasoning: {
+        efforts: [
+          { id: ReasoningEffortId('on'), name: '开启' },
+          { id: ReasoningEffortId('off'), name: '关闭' },
+        ],
+        defaultEffort: ReasoningEffortId('on'),
+      },
+    }
+  }
+
+  /**
+   * 本家全部条目（**含 VL 可见性过滤**）。
+   *
+   * ⚠️ `await this.ensureRemoteModels()` 是**必需**的（不是可选优化）：
+   * 早期实现用 `void` 丢弃 Promise，冷缓存时远端目录尚未落地就走静态兜底表，
+   * 模型选择器会短暂显示错误的模型集合（Jet Hub 的模型开关也据此渲染，
+   * 会造成「关掉的模型又冒出来」）。
+   */
+  private async catalogEntries(): Promise<readonly CatalogEntry[]> {
+    await this.ensureRemoteModels()
     const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
-    // 与 listModels 保持同一套「可见性」过滤（VL 多模态不参与），
-    // 唯一区别是不套用户黑名单。
+    // ⚠️ 与 `listModels` 保持**同一套**「可见性」过滤（VL 多模态不参与），
+    // 唯一区别是不套用户黑名单 —— 那条区别现在由骨架的 `listAllModels` 承担。
     return source
       .filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
-      .map((m) => ({ id: m.id, name: m.name }))
+      .map((m) => this.toCatalogEntry(m))
+  }
+
+  /**
+   * 同步视图（`listAllModels` 用）。
+   *
+   * ⚠️ **不能** `await ensureRemoteModels()`（同步契约）—— 读 `remoteModels`
+   * 缓存，未落地时回退静态兜底表（这正是原实现的语义）。
+   */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
+    return source
+      .filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+      .map((m) => this.toCatalogEntry(m))
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 没有任何已登录账号时返回空数组 → DSH 的 `buildModelCatalog` 把整个
-    // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
-    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
-    // 界面上反而多出一条 provider 报错）。
-    //
-    // ⚠️ **CodeArts 不再有单凭据例外**：早期它额外把固定 ref
-    // `CODEARTS_ACCESS_TOKEN` 计入判据（单凭据模式），该模式已随
-    // `credentialRef` 回退解析一并移除 —— 六个 provider 现在判据完全一致，
-    // 都只看账号池。
-    //
-    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
-    // 不必拉。
-    if (!await providerCatalogVisible(this.options.accountPool, PROVIDER)) return []
-    // 必须 await：ensureRemoteModels 是异步的，早期实现用 `void` 丢弃 Promise，
-    // 冷缓存时远端目录尚未落地就走静态兜底表，模型选择器会短暂显示错误的
-    // 模型集合（Jet Hub 的模型开关也据此渲染，会造成"关掉的模型又冒出来"）。
-    await this.ensureRemoteModels()
-    const visible = this.listAllModels()
-    // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
-    // 只影响此处对外播报的模型目录，不改变 resolveModel/stream 的路由能力
-    // ——与 DSH 对 listModels 的约定一致（目录是建议性的，缺省不构成拒绝）。
-    const disabled = this.options.accountPool?.disabledModelsFor(PROVIDER)
-    const listed = disabled === undefined || disabled.size === 0
-      ? visible
-      : visible.filter((m) => !disabled.has(m.id))
-    return listed.map((m) => ({ provider: PROVIDER, id: m.id, name: m.name, inputModalities: ['text'] as const }))
+    return this.catalog.listModels(_provider)
   }
 
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    await this.ensureRemoteModels()
-    const remoteModel = this.remoteModels?.find((m) => m.id === model)
-    const name = remoteModel?.name ?? model
-    const contextWindow = CONTEXT_WINDOWS.get(model)
-    const resolved: LlmResolvedModelInfo = { provider, id: model, name }
-    if (contextWindow !== undefined) resolved.context = { contextWindow }
-    // 思考开关（实测，2026-09-29）：本网关**唯一**真正生效的思考控制是
-    // 顶层 `thinking.type`。`reasoning_effort`（含 low/high/none/minimal）与
-    // 嵌套 `reasoning.effort` 都被服务端接受但**完全无效果**（判据为服务端
-    // 上报的 reasoning_tokens，落在基线噪声内；`none` 也照常思考）。
-    // 故这里只声明「开启 / 关闭」两档，**不**臆造 low/high/max 强度阶梯。
-    resolved.reasoning = {
-      efforts: [
-        { id: ReasoningEffortId('on'), name: '开启' },
-        { id: ReasoningEffortId('off'), name: '关闭' },
-      ],
-      defaultEffort: ReasoningEffortId('on'),
-    }
-    return resolved
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   async prepareCall(
@@ -1298,12 +1346,12 @@ export class CodeArtsAdapter extends LlmAdapter {
             // 第一**（当失败类别不写标记时尤甚），不排除就会拿回同一个、命中
             // `tried.has` 而立即放弃切换（换号形同虚设）。
             if (this.options.accountPool) {
-              const next = await this.options.accountPool.getAvailableAccount(
+              const next = await this.options.accountPool.getAvailableAccount<CodeArtsCredential>(
                 'codearts', options.model, rateLimitTried,
               )
               if (next && !rateLimitTried.has(next.entry.id)) {
                 rateLimitTried.add(next.entry.id)
-                credential = next.credential as CodeArtsCredential
+                credential = next.credential
                 currentAccountId = next.entry.id
                 authRefreshed = false // 新凭据：重置「已刷新过」标记
                 continue // 用下一个账号重试
@@ -1360,12 +1408,12 @@ export class CodeArtsAdapter extends LlmAdapter {
               )
               rateLimitTried.add(currentAccountId)
             }
-            const next = await this.options.accountPool.getAvailableAccount(
+            const next = await this.options.accountPool.getAvailableAccount<CodeArtsCredential>(
               'codearts', options.model, rateLimitTried,
             )
             if (next && !rateLimitTried.has(next.entry.id)) {
               rateLimitTried.add(next.entry.id)
-              credential = next.credential as CodeArtsCredential
+              credential = next.credential
               currentAccountId = next.entry.id
               authRefreshed = false
               continue
@@ -1395,10 +1443,10 @@ export class CodeArtsAdapter extends LlmAdapter {
                 currentAccountId, parsed.modelId, parsed.resetTimeMs,
               )
             }
-            const next = await this.options.accountPool.getAvailableAccount('codearts', options.model)
+            const next = await this.options.accountPool.getAvailableAccount<CodeArtsCredential>('codearts', options.model)
             if (next && !rateLimitTried.has(next.entry.id)) {
               rateLimitTried.add(next.entry.id)
-              credential = next.credential as CodeArtsCredential
+              credential = next.credential
               currentAccountId = next.entry.id
               authRefreshed = false // Reset auth refresh flag for new credential
               continue // Retry request with new credential

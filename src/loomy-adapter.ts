@@ -21,10 +21,10 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import {
   isLoomyChatModel,
   isLoomyExpired,
@@ -355,6 +355,17 @@ export class LoomyAdapter extends LlmAdapter {
     this.catalogGate = new RemoteCatalogGate(
       options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
     )
+    // ⚠️ 共享骨架：门控 → 读目录 → 黑名单 → 回填 → 三态，全在 `model-catalog.ts`。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+        unknownModelInputModalities: () => ['text'] as const,
+        syncCatalog: () => this.syncCatalogEntries(),
+      },
+    )
   }
 
   /**
@@ -370,10 +381,19 @@ export class LoomyAdapter extends LlmAdapter {
     return { id, name: this.product.displayName }
   }
 
+  /**
+   * ⚠️ **2026-10-08 Task 7a：三个方法收敛到共享骨架** `createModelCatalog`。
+   *
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架（实测与
+   * `minimax` / `raccoon` **归一化后逐字相同**）。现在只剩 `toCatalogEntry`
+   * 这一个**本家私有**的转换，骨架（门控 → 读目录 → 黑名单 → 回填 → 三态）
+   * 由 `src/model-catalog.ts` 统一持有。
+   */
+  private readonly catalog: ModelCatalog
+
   /** 完整目录（**不套黑名单**），带最终展示名。设置页需要它渲染被关闭的模型。 */
   listAllModels(): readonly { id: string; name: string }[] {
-    const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
-    return source.map((model) => ({ id: model.id, name: model.name }))
+    return this.catalog.listAllModels()
   }
 
   /**
@@ -400,52 +420,50 @@ export class LoomyAdapter extends LlmAdapter {
     return this.product.fallbackModels.map(fallbackToRemote)
   }
 
-  private inputModalitiesFor(model: LoomyRemoteModel | undefined): readonly ('text' | 'image')[] {
-    return model?.supportsImage === true ? ['text', 'image'] : ['text']
-  }
-
-  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 无已登录账号时返回 `[]` → DSH 的 buildModelCatalog 把整个 provider
-    // 分组隐藏。**必须返回空数组而不能抛错**（抛错会被归入 catalog 的
-    // failures，界面上反而多一条 provider 报错）。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-
-    const all = await this.loadModels()
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? all
-      : all.filter((model) => !disabled.has(model.id))
-
-    return listed.map((model) => ({
-      provider: this.product.id,
+  /**
+   * 把本家私有的远端/兜底条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 这里是**唯一**还认识「倍率格式」与「supportsImage」的地方 ——
+   * 骨架不认识它们（各家格式不同）。
+   */
+  private toCatalogEntry(
+    model: LoomyRemoteModel,
+    fallback: LoomyFallbackModel | undefined,
+  ): CatalogEntry {
+    const reasoning = this.reasoningFor(model, fallback)
+    const contextWindow = model.contextWindow
+    return {
       id: model.id,
       // 倍率拼进 name（不是 description）：composer 的模型切换菜单只渲染 name。
       name: model.name,
-      inputModalities: this.inputModalitiesFor(model),
-    }))
+      // ⚠️ `resolveModel` 用**裸名**（不带倍率）—— 价格只属于选择列表语境。
+      bareName: splitLoomyRate(model.name).name,
+      // ⚠️ 三态：`supportsImage` 为 false 时是**明确不支持**（不是「未知」）——
+      // 本家的远端条目**总是**带该布尔，故这里恒为数组，不会是 undefined。
+      inputModalities: model.supportsImage ? ['text', 'image'] : ['text'],
+      ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+      ...reasoning !== undefined ? { reasoning } : {},
+    }
   }
 
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+  /** 本家全部条目（远端缓存 ?? 兜底表），已转成中间结构。 */
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
     const all = await this.loadModels()
-    const entry = all.find((item) => item.id === model)
-    const fallback = this.fallbackIndex.get(model)
-    // ⚠️ name **不带倍率**（与 qoder/trae 一致）：价格只属于选择列表语境。
-    const bareName = fallback !== undefined ? splitLoomyRate(fallback.name).name : model
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: entry !== undefined ? splitLoomyRate(entry.name).name : bareName,
-      inputModalities: this.inputModalitiesFor(entry),
-    }
-    const contextWindow = entry?.contextWindow ?? fallback?.contextWindow
-    // 未知模型不编造 context（宁可让 DSH 用默认值，也不报一个假窗口）。
-    if (contextWindow !== undefined && contextWindow > 0) {
-      resolved.context = { contextWindow }
-    }
-    // 思考档位：**远端 `reasoning_efforts` 直接生成**（用户要求）。
-    const reasoning = this.reasoningFor(entry, fallback)
-    if (reasoning !== undefined) resolved.reasoning = reasoning
-    return resolved
+    return all.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
+  }
+
+  /** 同步视图（`listAllModels` 用，见 `ModelCatalogConfig.syncCatalog` 的说明）。 */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
+    return source.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
+  }
+
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.catalog.listModels(_provider)
+  }
+
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /**
@@ -515,7 +533,10 @@ export class LoomyAdapter extends LlmAdapter {
     const entry = all.find((item) => item.id === options.model)
     let imageUrls: Map<string, string> | undefined
     if (imageRefs.size > 0) {
-      if (!this.inputModalitiesFor(entry).includes('image')) {
+      // ⚠️ 这里**不能**走 `this.catalog` —— 它要的是「这个模型支不支持图片」这一个
+      // 判据，而 `resolveModel` 会顺带做 name 回退/context/maxTokens/reasoning，
+      // 在**发请求前**的这条路径上多算一遍没有意义（且 `resolveModel` 是 async）。
+      if (entry?.supportsImage !== true) {
         throw new LlmError(`loomy: 模型 "${options.model}" 不支持图片输入`, 'UNSUPPORTED_CONTENT')
       }
       if (this.options.readImage === undefined) {
@@ -732,12 +753,12 @@ export class LoomyAdapter extends LlmAdapter {
         await markCurrentAccount()
         const maxRotate = LOOMY_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
-          const next = await accountPool.getAvailableAccount(
+          const next = await accountPool.getAvailableAccount<LoomyCredential>(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
-          const nextCred = next.credential as unknown as LoomyCredential
+          const nextCred = next.credential
           if (nextCred === undefined || nextCred.access_token.length === 0) break
           activeAccountId = next.entry.id
           response = await send(nextCred.access_token)

@@ -143,7 +143,7 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
    * 自己的 credential ref 里读出来**的派生值，故属于「状态」而非「存储」。
    *
    * 为什么不写回池：凭据可能被用户在别处更新（换账号名）、且池的
-   * `sanitizeAccounts`（`src/jet-hub-store.ts:173-191`）只保留
+   * `sanitizeAccounts`（`src/jet-hub-store.ts`）只保留
    * `id`/`provider`/`credentialRef` 三个字段，写进去也会被丢掉。
    */
   accountName?: string
@@ -414,7 +414,12 @@ export interface RpcCreditsStatusResponse {
 export interface RpcCreditsClaimAllRequest {
   provider: string
   /**
-   * 是否同时执行成长中心任务（buddy / workbuddy 专有）。
+   * 是否同时执行成长中心任务（**CodeBuddy 中国版专有**）。
+   *
+   * ⚠️ **不是**「buddy / workbuddy 专有」：WorkBuddy（国际版）后端**根本没有**
+   * 成长中心（contributor 在 !62 复审中实测确认：无任务列表、无 claim 端点），
+   * `src/provider-credits.ts` 只给 `buddy` 挂 `afterClaim`。
+   * 客户端那侧 `GROWTH_TASK_PROVIDERS` 同样只含 `buddy`（决定按钮渲不渲染）。
    *
    * ⚠️ **缺省为 `false`，且必须保持这样**：`credits.claimAll` 同时是「每日首次
    * 启动自动签到」的执行体（见 `src/auto-checkin.ts` 的 `claim` 回调），而成长
@@ -1717,9 +1722,13 @@ export interface RpcUsageTokenLedgerResponse {
 export interface RpcUsageTokenLedgerHistoryRequest {
   /**
    * 只看最近 N 天（**含今天**，UTC+8 日界）；省略 = 全部历史
-   * （服务端钳到 `TOKEN_LEDGER_HISTORY_MAX_DAYS`）。
+   * （服务端钳到 `TOKEN_LEDGER_HISTORY_MAX_DAYS`）。自选范围可传 fromDay / toDay。
    */
   sinceDays?: number
+  /** 自选日期范围起点（UTC+8 日键，含当日）；与 toDay 配合使用。 */
+  fromDay?: string
+  /** 自选日期范围终点（UTC+8 日键，含当日）；与 fromDay 配合使用。 */
+  toDay?: string
 }
 
 /** 历史日聚合响应（形状直透，不另造平行类型）。 */
@@ -1727,6 +1736,16 @@ export interface RpcUsageTokenLedgerHistoryResponse {
   history: TokenLedgerHistoryDay[]
   /** 所选窗口的合计（按日累加，均值按全部样本 Σ/份数计算）。 */
   totals: Omit<TokenLedgerModelRow, 'model'>
+}
+
+/** RPC: 删除某一天的历史日累计；不影响进程内 Token 明细。 */
+export interface RpcUsageTokenLedgerDeleteDayRequest {
+  day: string
+}
+
+export interface RpcUsageTokenLedgerDeleteDayResponse {
+  day: string
+  deleted: true
 }
 
 /**

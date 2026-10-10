@@ -5,6 +5,8 @@ import { dirname, resolve } from 'node:path'
 import {
   QoderAdapter,
   QODER_QUEUE_MAX_ATTEMPTS,
+  isBillingBusinessCode,
+  looksLikeBillingError,
   nextUtc8DayStartMs,
   parseQoderQueueError,
   qoderQueueDelayMs,
@@ -1058,6 +1060,122 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
       expect(CLIENT_MAPPING('rate_limit')).toBe('rate_limited')
       expect(CLIENT_MAPPING('billing_error')).not.toBe(CLIENT_MAPPING('rate_limit'))
     })
+
+    /**
+     * 🔴 **兄弟码 `112`（2026-10-10 用户报障实测，Gitee issue IKKJFH）**。
+     *
+     * 现场报文（GUI 失败原因那一行）：
+     * ```
+     * 本轮运行失败  qoder: {"pricingUrl":"https://qoder.com.cn/pricing?client=qoder"} (112/model_error)
+     * 模型请求重试已取消 (2/5)
+     * ```
+     * 后缀 `(112/model_error)` 由本仓 `openai-compat` 的 `[code, type].join('/')`
+     * 拼出 ⇒ 真实帧是
+     * `{ code: 112, message: '{"pricingUrl":"…"}', type: 'model_error' }`。
+     *
+     * ## 它为什么是 `110` 的同族
+     * 报文 payload 是**定价页链接** —— 语义是「要付费/升级才能用」，
+     * 与 `110`（`Billing daily count exceeded`，当日额度耗尽）同属**额度类**：
+     * 都是**确定性**失败，重试一百次结果一样。
+     *
+     * ## 不修的后果（IKKJFH 实测形状）
+     * 三个判据全 false ⇒ 落 `SERVER` ⇒ `SERVER` **在** harness 的
+     * `DEFAULT_RETRYABLE_CODES` 里 ⇒ 白退避 5 次；且
+     * `isQuotaExceededError(SERVER) = false` ⇒ `switchAccountOnQuota`
+     * **永不被调用** ⇒ **既不换号、也不换 provider**，用户侧表现为
+     * 「等一段必然失败的退避，只好手动取消」。
+     * ⚠️ 这与 `110` 当初那个缺陷**完全同型**，只是换了码值 —— 证明「只认码值」
+     * 这条判据本身不够，必须同时有文案兜底（见本组末尾的纯函数用例）。
+     */
+    it('业务码 112（payload 是 pricingUrl）同样归为不可重试', async () => {
+      const inner = JSON.stringify({
+        code: 112,
+        message: JSON.stringify({ pricingUrl: 'https://qoder.com.cn/pricing?client=qoder' }),
+        type: 'model_error',
+      })
+      const fetchImpl = vi.fn(billingFrame(inner)) as unknown as typeof fetch
+
+      const sleeps: number[] = []
+      let thrown
+      try {
+        await collectWith(makeAdapter({
+          fetchImpl, sleep: async (ms) => { sleeps.push(ms) },
+        }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+      } catch (error) { thrown = error }
+
+      // ⚠️ 核心断言：与 110 同一档 —— 不可重试，且**不能**在适配器内部等待
+      expect(thrown?.code, '112 必须归为不可重试的额度错误').toBe('QUOTA_EXCEEDED')
+      expect(sleeps, '额度类不该在适配器内部等待').toEqual([])
+    })
+
+    it('字符串 "112" 同样识别（与 110 的两种编码口径一致）', async () => {
+      const inner = JSON.stringify({
+        code: '112',
+        message: JSON.stringify({ pricingUrl: 'https://qoder.com.cn/pricing?client=qoder' }),
+        type: 'model_error',
+      })
+      const fetchImpl = vi.fn(billingFrame(inner)) as unknown as typeof fetch
+      await expect(collectWith(makeAdapter({ fetchImpl, sleep: async () => {} }),
+        { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+        .rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' })
+    })
+
+    /**
+     * 文案兜底必须**自己**能认 `pricingUrl` —— 不能只靠码值。
+     *
+     * 判据（本仓既有条款原文）：「若上游哪天改用别的码值表达同一语义，
+     * 只认码就会漏判 —— 故两者都认」。`112` 就是这句话的实例。
+     * 故这里**故意不给 `code`**，只留 `pricingUrl` 文案，验证兜底这条腿独立成立。
+     */
+    it('无业务码、只有 pricingUrl 文案时也归为额度（文案兜底独立成立）', async () => {
+      const inner = JSON.stringify({
+        message: JSON.stringify({ pricingUrl: 'https://qoder.com.cn/pricing?client=qoder' }),
+        type: 'model_error',
+      })
+      const fetchImpl = vi.fn(billingFrame(inner)) as unknown as typeof fetch
+      const sleeps: number[] = []
+      let thrown
+      try {
+        await collectWith(makeAdapter({ fetchImpl, sleep: async (ms) => { sleeps.push(ms) } }),
+          { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+      } catch (error) { thrown = error }
+
+      expect(thrown?.code, '仅凭文案也必须归为额度').toBe('QUOTA_EXCEEDED')
+      expect(sleeps).toEqual([])
+    })
+  })
+
+  /**
+   * 判据本身的可执行断言（**别只测调用点**）。
+   *
+   * ⚠️ 为什么单开一组：`112` 那次漏判的根因就在这两个纯函数里，
+   * 而调用点测试只覆盖「某一条路径」。这里把判据本身钉死，
+   * 防止后人改窄正则/改回单码值时**调用点测试仍绿**。
+   */
+  describe('额度判据（纯函数）', () => {
+    it('110 与 112 都算额度（数字与字符串两种编码）', () => {
+      for (const code of [110, '110', 112, '112']) {
+        expect(isBillingBusinessCode(code), `code=${String(code)}`).toBe(true)
+      }
+    })
+
+    it('排队码 10605 不算额度 —— 两类必须分开（语义不同：等待 vs 当天耗尽）', () => {
+      expect(isBillingBusinessCode('10605')).toBe(false)
+      expect(isBillingBusinessCode(10605)).toBe(false)
+    })
+
+    it('pricingUrl 报文算额度（112 的真实 payload 形态）', () => {
+      expect(looksLikeBillingError(JSON.stringify({
+        pricingUrl: 'https://qoder.com.cn/pricing?client=qoder',
+      }))).toBe(true)
+    })
+
+    it('泛词不得误伤：balance / quota 这类仍不算（防正文误判）', () => {
+      // 本仓既有条款：「关键词必须窄」—— 正文里讨论「余额」不得被判成额度错误
+      expect(looksLikeBillingError('your balance is 42 credits')).toBe(false)
+      expect(looksLikeBillingError('quota')).toBe(false)
+      expect(looksLikeBillingError('the model explained how pricing works')).toBe(false)
+    })
   })
 
   /**
@@ -1181,6 +1299,53 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
 
       // ③ 确实换账号重发（第二次请求存在）并拿到内容
       expect(call, '应换账号重发').toBe(2)
+      expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    })
+
+    /**
+     * ⚠️ **IKKJFH 的用户观感就落在这条上**：issue 原文是
+     * 「轮换没生效 —— 既没有换到号池里的下一个账号，也没有换到别的 provider」。
+     *
+     * 光验「`112` 归 `QUOTA_EXCEEDED`」**不够** —— 上面那组只证明错误码对了，
+     * 而 `QUOTA_EXCEEDED` 与「真的切了号」是两件事（`switchAccountOnQuota`
+     * 在无池/无候选时会 `undefined` 返回，码仍然是对的）。
+     * 故这里把 `112` 走一遍完整行为链：**标记 → 取号传 tried → 换号重发 → 拿到内容**。
+     *
+     * ⚠️ 与 `110` 那条行为用例是**同一形状的两份**，不是重复：
+     * 若后人把 `112` 从 `BILLING_BUSINESS_CODES` 里删掉，只有这条会红。
+     */
+    it('112 同样触发换号（issue 现象的另一半：不修则既不换号也不换 provider）', async () => {
+      const { pool, marks, picks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        if (call === 1) {
+          const inner = JSON.stringify({
+            code: 112,
+            message: JSON.stringify({ pricingUrl: 'https://qoder.com.cn/pricing?client=qoder' }),
+            type: 'model_error',
+          })
+          return new Response(
+            `data:${JSON.stringify({ headers: {}, body: inner, statusCodeValue: 200 })}\n\n`,
+            { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+          )
+        }
+        return envelopeResponse([textFrame('新账号可用'), finishFrame])
+      }) as unknown as typeof fetch
+
+      const chunks = await collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+      expect(marks.map((m) => m.accountId), '应标记 acct-A 该模型受限').toEqual(['acct-A'])
+      expect(picks[0]?.has('acct-A'), 'tried 必须含刚失败的账号').toBe(true)
+      expect(call, '112 必须换账号重发').toBe(2)
       expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
     })
 

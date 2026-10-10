@@ -779,7 +779,7 @@ class FileStore implements JetHubStore {
  * 同一目录。PR !66 曾把它放宽成可选、并在 `dead-model-store` 里传 `undefined` ——
  * 那会**跳过优先级更高的 `profileContext.home`**，在 profile home 与 `$DSH_HOME`
  * 不相等时把失效表写到另一个目录，造成「账号池在 A、失效表在 B」的分裂，
- * 正是 `permanent-lock-store.ts:129-133` 明确警告过必须避免的情况。
+ * 正是 `permanent-lock-store.ts` 明确警告过必须避免的情况。
  */
 export function resolveJetHubHome(ctx: Context): string | undefined {
   const override = process.env.DSH_JET_HUB_STATE_DIR

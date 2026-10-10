@@ -31,7 +31,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import {
   clineExhaustedAdvice,
   clineRateLimitResetAt,
@@ -40,7 +41,6 @@ import {
 } from './cline-rate-limit.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { isClineExpired, clineHeaders, type ClineCredential } from './cline.js'
 import {
   clineDisplayName,
@@ -266,9 +266,7 @@ export class ClineAdapter extends LlmAdapter {
    * （30 秒一轮，不会打风暴）。
    */
   private remoteComplete = false
-  /** 正在进行中的目录加载（避免并发重复请求）。 */
-  private loading: Promise<void> | undefined
-  /**
+    /**
    * models.dev 目录（`模型 id → 条目`，含名字/窗口/图片能力）。
    *
    * ⚠️ `undefined` = **还没读到**（不是「空目录」）：读不到时目录照常工作，
@@ -289,6 +287,12 @@ export class ClineAdapter extends LlmAdapter {
    * 详见 `src/remote-catalog-gate.ts` 的实测依据。
    */
   private readonly catalogGate: RemoteCatalogGate
+  /**
+   * ⚠️ **2026-10-08 Task 7d：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+   * 现在只剩 `toCatalogEntry`（本家私有形状 + 免费集合 + 统一思考档位）。
+   */
+  private readonly catalog: ModelCatalog
 
   constructor(private readonly options: ClineAdapterOptions) {
     super()
@@ -299,6 +303,26 @@ export class ClineAdapter extends LlmAdapter {
     // （适配器拿不到 ctx），见 `ClineAdapterOptions.onCatalogLoaded`。
     this.catalogGate = new RemoteCatalogGate(
       options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
+    // ⚠️ 共享骨架（Task 7d）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`）。
+        unknownModelInputModalities: () => ['text'] as const,
+        // ⚠️ **未知模型也声明思考档位**（真实回归防线）：本家档位来自**产品配置**
+        // （远端不下发），与具体模型无关 ⇒ 原实现对未知 id 同样给 5 档。
+        // 由 cline-adapter.spec.ts 的「未知模型同样有 5 档」用例守着。
+        unknownModelReasoning: () => ({
+          efforts: CLINE_REASONING_EFFORTS.map((effort) => ({
+            id: ReasoningEffortId(effort.id),
+            name: effort.name,
+          })),
+          defaultEffort: ReasoningEffortId(CLINE_DEFAULT_REASONING_EFFORT),
+        }),      },
     )
   }
 
@@ -477,80 +501,89 @@ export class ClineAdapter extends LlmAdapter {
    * 之前一定会先走 `ctx.llm.listModels()`（那会 await 加载完成），
    * 故实际使用中不会读到空目录。
    */
-  listAllModels(): readonly { id: string; name: string; isFree: boolean }[] {
-    const source = this.remoteModels ?? this.fallbackCatalog()
-    if (this.remoteModels === undefined) void this.ensureRemoteModels()
-    // ⚠️ 必须带上 `isFree`：Jet Hub 的模型列表要按「计费/来源」分组
-    // （订阅 / 免费 / Cloud / 按量计费），而**免费集合是远端动态下发的**
-    // （见 `cline-models.ts` 的并集规则）—— 让客户端按前缀猜会漂移。
-    return source.map((model) => ({ id: model.id, name: clineDisplayName(model), isFree: model.isFree }))
+  listAllModels(): readonly { id: string; name: string; isFree?: boolean }[] {
+    return this.catalog.listAllModels()
   }
 
-  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 没有任何已登录账号时返回空数组 → DSH 的 `buildModelCatalog` 把整个
-    // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
-    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
-    // 界面上反而多出一条 provider 报错）。
-    //
-    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
-    // 不必拉。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
+  /**
+   * 把本家条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 本家四处**真实差异**：
+   * 1. **`isFree` 必须透出**：Jet Hub 的模型列表要按「计费/来源」分组
+   *    （订阅 / 免费 / Cloud / 按量计费），而**免费集合是远端动态下发的**
+   *    （见 `cline-models.ts` 的并集规则）—— 让客户端按前缀猜会漂移。
+   *    ⚠️ 原声明把 `isFree` 写成**必填**（全仓唯一），而契约
+   *    （`jet-hub-rpc.ts` 的 `ModelCatalogSource`）是**可选** ⇒ 此处按契约放宽
+   *    （纯类型放宽，运行时行为不变：本家恒有值）。
+   * 2. `description` 透传（`cline-models.ts` 的 `models.dev` 补缺）。
+   * 3. `maxTokens` 过 `clampClineMaxTokens`（**必须声明**，否则上限永久退回网关默认）。
+   * 4. `reasoning` 对**所有**模型统一声明（远端不下发档位，见产品配置注释）——
+   *    这是 composer 里「思考强度」选择器的唯一入口。
+   */
+  private toCatalogEntry(model: ClineModel): CatalogEntry {
+    const maxTokens = clampClineMaxTokens(model.maxTokens)
+    return {
+      id: model.id,
+      // 免费标记拼进 `name`（**不是** `description`）：composer 的模型切换菜单
+      // 只渲染 name，description 仅用于 /model 弹窗。
+      name: clineDisplayName(model),
+      // ⚠️ `resolveModel` 的 `name` **不带**免费标记（与 Qoder/TRAE 一致）：
+      // 标记只属于「选择列表」语境；会话记录里带上它会污染历史展示。
+      bareName: model.name,
+      ...model.description === undefined ? {} : { description: model.description },
+      inputModalities: this.inputModalitiesFor(model.id),
+      ...model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {},
+      ...maxTokens !== undefined ? { maxTokens } : {},
+      isFree: model.isFree,
+      reasoning: {
+        efforts: CLINE_REASONING_EFFORTS.map((effort) => ({
+          id: ReasoningEffortId(effort.id),
+          name: effort.name,
+        })),
+        defaultEffort: ReasoningEffortId(CLINE_DEFAULT_REASONING_EFFORT),
+      },
+    }
+  }
+
+  private catalogEntries(source: readonly ClineModel[]): readonly CatalogEntry[] {
+    return source.map((model) => this.toCatalogEntry(model))
+  }
+
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
     // 必须 await：冷缓存时目录尚未落地就返回，模型选择器会短暂显示错误的
     // 模型集合（Jet Hub 的模型开关也据此渲染）。
     // ⚠️ 目录里**已经**并入 models.dev（补缺的模型 / 可读名 / 图片能力），
     // 故这里不需要再单独 await 一次模态表。
     await this.ensureRemoteModels()
-    const source = this.remoteModels ?? this.fallbackCatalog()
-    // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
-    // 只影响此处对外播报的模型目录，不改变 resolveModel/stream 的路由能力
-    // ——与 DSH 对 listModels 的约定一致（目录是建议性的，缺省不构成拒绝）。
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? source
-      : source.filter((model) => !disabled.has(model.id))
-    return listed.map((model) => ({
-      provider: this.product.id,
-      id: model.id,
-      // 免费标记拼进 `name`（**不是** `description`）：composer 的模型切换菜单
-      // 只渲染 name，description 仅用于 /model 弹窗。
-      name: clineDisplayName(model),
-      ...model.description === undefined ? {} : { description: model.description },
-      inputModalities: this.inputModalitiesFor(model.id),
-    }))
+    return this.catalogEntries(this.remoteModels ?? this.fallbackCatalog())
   }
 
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    // 目录里已并入 models.dev（名字 / 窗口 / 图片能力），故 `inputModalities`
-    // 与展示名在这一次 await 之后就都是最终值。
-    await this.ensureRemoteModels()
+  /**
+   * 同步视图（`listAllModels` 用）。
+   *
+   * ⚠️ 原实现的语义：读已缓存目录，**首次调用若缓存为空会触发一次后台加载**
+   * （`void this.ensureRemoteModels()`），由下一次调用拿到结果 ——
+   * 而 `model.list` 端点之前一定会先走 `ctx.llm.listModels()`（那会 await 加载完成），
+   * 故实际使用中不会读到空目录。此处**逐字保留**该 fire-and-forget。
+   */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
     const source = this.remoteModels ?? this.fallbackCatalog()
-    const entry = source.find((candidate) => candidate.id === model)
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      // ⚠️ `resolveModel` 的 `name` **不带**免费标记（与 Qoder/TRAE 一致）：
-      // 标记只属于「选择列表」语境；会话记录里带上它会污染历史展示。
-      name: entry?.name ?? model,
-      inputModalities: this.inputModalitiesFor(model),
-    }
-    // 上下文窗口：远端/兜底表已知时才声明（未知时不编造，让 DSH 用默认值）。
-    if (entry?.contextWindow !== undefined) resolved.context = { contextWindow: entry.contextWindow }
-    // 单次输出上限：必须声明为 `defaultMaxTokens`，否则 DSH 只在调用方显式
-    // 给值时才下发 `max_tokens`，上限永久退回网关默认值
-    //（这正是 buddy 那条「回答在 32000 token 处被截断」的根因）。
-    const maxTokens = clampClineMaxTokens(entry?.maxTokens)
-    if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
-    // 思考档位：对**所有**模型统一声明（远端不下发档位，见产品配置注释）。
-    // 这是 composer 里「思考强度」选择器的唯一入口 —— 不声明则 UI 显示
-    // 「当前模型未提供推理等级」。
-    resolved.reasoning = {
-      efforts: CLINE_REASONING_EFFORTS.map((effort) => ({
-        id: ReasoningEffortId(effort.id),
-        name: effort.name,
-      })),
-      defaultEffort: ReasoningEffortId(CLINE_DEFAULT_REASONING_EFFORT),
-    }
-    return resolved
+    if (this.remoteModels === undefined) void this.ensureRemoteModels()
+    return this.catalogEntries(source)
+  }
+
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.catalog.listModels(_provider)
+  }
+
+  /**
+   * 解析模型元信息。
+   *
+   * ⚠️ 原实现里的四处判据（context / maxTokens / reasoning / modalities）现已
+   * 收敛到 `toCatalogEntry`；骨架的 `resolveModel` 只做回填与「不声明未知」。
+   */
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /**
@@ -734,12 +767,12 @@ export class ClineAdapter extends LlmAdapter {
         }
         for (let round = 0; round < maxRotate; round++) {
           await markLimited()
-          const next = await this.options.accountPool.getAvailableAccount(
+          const next = await this.options.accountPool.getAvailableAccount<ClineCredential>(
             this.product.id, options.model, tried,
           )
           if (next === null || next === undefined || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
-          credential = next.credential as ClineCredential
+          credential = next.credential
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {

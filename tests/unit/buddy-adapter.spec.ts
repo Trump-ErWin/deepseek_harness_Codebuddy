@@ -473,6 +473,57 @@ describe('BuddyAdapter', () => {
       expect((await adapter.resolveModel('buddy', 'deepseek-v4.1-flash')).inputModalities).toEqual(['text', 'image'])
     })
 
+    /**
+     * ⚠️⚠️ **本家唯一真正使用「未知」语义的地方 —— 必须从 `toCatalogEntry`
+     * 这一端测到，不能只测骨架。**
+     *
+     * ## 为什么这条用例曾经缺失（2026-10-08 第二轮反向验证实测）
+     *
+     * `model-catalog-parity.spec.ts` 里有一条「未知模态」用例，但它喂给骨架的是
+     * **手搓的 `CatalogEntry`**（刻意省略 `inputModalities`）—— 那测的是
+     * `createModelCatalog` **拿到**省略态之后的行为，**绕过了 buddy 自己的
+     * `toCatalogEntry`**。而 `buddy-adapter.spec.ts` 里本节的三条用例分别覆盖
+     * 「远端 true / 远端 false / 远端缺字段但有静态表」，**恰好没有一条**让
+     * `inputModalitiesFor` 返回 `undefined`。
+     *
+     * 后果：把 `toCatalogEntry` 里
+     * `...modalities !== undefined ? { inputModalities: modalities } : {}`
+     * 改成 `inputModalities: modalities ?? ['text']`（= 把「不知道」谎报成
+     * 「不支持图片」），**全部 153 条 buddy 用例加上整个 parity 套件零红**
+     * —— 实测确认过。也就是说 Task 7 Step 7 第 1 条要求的反向验证当时**做不出来**，
+     * 而计划原文已经预见到这个风险：
+     * 「⚠️ 若没有这条用例，本步骤必须先补一条，否则这个缺陷会静默流出去」。
+     *
+     * ## 可达性（不是理论分支）
+     *
+     * 兜底表**不可**作为载体：实测 `CODEBUDDY.fallbackModels` 16 条、
+     * `WORKBUDDY.fallbackModels` 23 条，`supportsImages` **全部显式声明**
+     * （未声明者 0 条）⇒ 兜底表这条路永远走不到省略分支。
+     * 真正可达的是 `reconcileWithFallback` 末尾追加的
+     * 「被 agent 引用但不在兜底表」的模型：它只带 `{ id, name, agentReferenced }`，
+     * 三个图片能力来源全落空 ⇒ `imageCapabilityKnown` 为 false
+     * ⇒ 返回 `undefined` ⇒ **必须省略该字段**。
+     * 本用例正是走这条路。
+     */
+    it('⚠️⚠️ 能力全无来源（agentReferenced 追加的模型）⇒ 省略字段，不得谎报 [text]', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [
+          // 未被兜底表覆盖、且**没有** supportsImages —— 三个来源全落空。
+          { id: 'anon-vision', name: 'Anon', agentReferenced: true },
+        ],
+      })
+
+      const hit = (await adapter.listModels('buddy')).find((m) => m.id === 'anon-vision')
+      expect(hit, 'agentReferenced 的模型应被追加进目录').toBeDefined()
+      // ⚠️ 核心：字段**不存在**（`in` 为 false），而不是值为 ['text']。
+      //    后者会让宿主 DSH 把图片**静默投影成占位文本**（见 inputModalitiesFor
+      //    的说明与 jpg 实拍报障）。
+      expect('inputModalities' in hit!).toBe(false)
+
+      // 两个入口必须同判据（`resolveModel` 走的是同一份 CatalogEntry）。
+      expect('inputModalities' in await adapter.resolveModel('buddy', 'anon-vision')).toBe(false)
+    })
+
     // ── issue IKJQ3M ──
     //
     // 「远端下发了完整能力元数据、但模型不在编译期兜底表里」这一档，
@@ -3120,6 +3171,50 @@ describe('BuddyAdapter 模型黑名单', () => {
       disabledModelsFor: (value: string) => (value === provider ? disabled : new Set<string>()),
     } as never
   }
+
+  /**
+   * ★★ **G3-6 的真行为守卫**（2026-10-12 对抗性审计查出该语义**当时零守卫**后补上）。
+   *
+   * 守的是「拉黑一个同名模型后，**另一个的变体标记不得跳变**」——
+   * 消歧必须基于**未过滤**的全量集合（`displayNameFor(model, all)`）。
+   *
+   * ## ⚠️ 为什么原先的守卫是空的
+   *
+   * 唯一「覆盖」过该语义的两条用例是 `model-catalog.spec.ts` 的 ⑮ 与
+   * `model-catalog-parity.spec.ts` 的 ④，而它们都构造**合成 config / 替身池**
+   *（`makeCatalog`）—— 验证的是 `createModelCatalog` **骨架自身**，
+   * **看不见 `buddy` 传进去的实参**。而本文件的四条黑名单用例**只断言 `ids`**，
+   * 「同名模型追加变体标记」那三条又**都不带 `accountPool`**
+   *（⇒ 无黑名单 ⇒ `all` 与过滤后恒等，结构上不可能区分两种实现）。
+   *
+   * **实测**：把消歧集合换成黑名单过滤后的集合（产出仍保持全量，精确复现修复前
+   * 行为），`buddy-adapter.spec.ts` + `model-catalog-parity.spec.ts` +
+   * `model-catalog.spec.ts` 共 **212 条全绿** ⇒ 该语义当时没有任何断言在守。
+   */
+  it('★★ 拉黑一个同名模型后，另一个的名字**不得跳变**（消歧基于未过滤集合）', async () => {
+    // 两个远端模型的 name **完全相同** ⇒ 只能靠变体标记区分
+    //（真实报障形态：国际版 deepseek-v4.1-flash 与 -sg 的 name 撞车而计费不同）。
+    const adapter = makeAdapter({
+      product: { ...WORKBUDDY, fallbackModels: undefined } as never,
+      fetchRemoteModels: async () => [
+        { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', creditsRate: 'x0.00' },
+        { id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', creditsRate: 'x0.03' },
+      ],
+      accountPool: poolWithDisabled('workbuddy', ['deepseek-v4.1-flash']),
+    })
+    const models = await adapter.listModels('workbuddy')
+
+    // 黑名单确实生效：被拉黑的那个不在列表里。
+    expect(models.map((m) => m.id)).toEqual(['deepseek-v4.1-flash-sg'])
+
+    // ★ 关键断言：剩下的那个**仍带变体标记**。
+    //   若消歧改用「已过滤的集合」⇒ 过滤后只剩一个同名 ⇒ 不再需要标记 ⇒
+    //   名字退化成 'Deepseek-V4.1-Flash'（**跳变**）⇒ 本断言变红。
+    expect(
+      models[0]?.name,
+      '拉黑同名模型之一后，另一个的名字跳变了 —— 消歧必须基于**未过滤**的全量集合',
+    ).toBe('Deepseek-V4.1-Flash · x0.03 SG')
+  })
 
   it('被关闭的模型从列表中消失，其余保持原有顺序', async () => {
     const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', ['glm-5.2', 'hy3']) })

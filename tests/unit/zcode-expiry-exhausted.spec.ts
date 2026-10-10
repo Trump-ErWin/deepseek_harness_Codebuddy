@@ -31,10 +31,13 @@
  * `aggregate-expiry.spec.ts` 守的是控制流（未接入渠道 / 无账号 / abort / 缓存），
  * 以及 `codeArtsExpiry` 的「读不到到期时间就不猜」。本文件只守 zcode 的折算格。
  */
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createExpiryProbe, zcodeExpiry } from '../../src/aggregate-expiry.js'
 import { NEVER, UNUSABLE, pickSoonestProvider } from '../../src/aggregate-core.js'
+import { createProviderExpiry } from '../../src/provider-expiry.js'
+import { clearProviderRuntimes, registerProviderRuntime } from '../../src/provider-runtime.js'
+import { descriptorOf } from '../../src/provider-registry.js'
 
 const CRED = {
   zcode_jwt: 'jwt',
@@ -76,7 +79,23 @@ const todayEnd = (): number => {
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - 8 * 3600 * 1000
 }
 
-afterEach(() => { vi.unstubAllGlobals() })
+/**
+ * 把**真实的**临期折算实现挂进 runtime。
+ *
+ * ⚠️ 分派已改为查 `ProviderRuntime.expiry`（Task 5）⇒ 本文件里走
+ * `createExpiryProbe` 的用例（缓存 + `clear()` 那两条）必须先注册 runtime，
+ * 否则探针在「未接入」短路处就返回 `UNUSABLE` 了。
+ * ⚠️ 挂的是**生产那张表**（`createProviderExpiry()`），不是本文件自己写一份映射
+ * —— 后者是「同一语义两套判据」（本仓库首条红线）。
+ */
+beforeEach(() => {
+  clearProviderRuntimes()
+  for (const [id, expiry] of Object.entries(createProviderExpiry())) {
+    registerProviderRuntime({ descriptor: descriptorOf(id)!, expiry })
+  }
+})
+
+afterEach(() => { vi.unstubAllGlobals(); clearProviderRuntimes() })
 
 describe('★ zcode 折算：额度已尽 ⇒ UNUSABLE（退出候选）', () => {
   it('★ 无桶 + 有可领活动 ⇒ UNUSABLE（「可领」不等于「已拥有」）', async () => {
