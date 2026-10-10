@@ -24,6 +24,63 @@ function makePool() {
   } as never
 }
 
+/**
+ * ★★ 聚合层的渠道白名单必须覆盖 registry 里**全部** `channel: true` 的渠道。
+ *
+ * ## ⚠️ 为什么要有这一条（真实缺口，2026-10-12 对抗性审计实测）
+ *
+ * `src/aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS` 是**手写字面量**，而它自己的
+ * 注释声称「新增 provider 时**两处都要加**（与 `modelAdapters` 同一约定）」——
+ * **该声称当时不成立**：`modelAdapters` 有两条守卫（源码文本抓多余键 + 行为抓漏键），
+ * 这里**一条都没有**。实测：从数组里删掉 `'gemini'` 后全量测试**依然全绿**。
+ *
+ * 线上后果（静默）：该渠道的模型**永不进聚合目录** ⇒ 用户看不到它的虚拟模型、
+ * `auto` 也不会用到它，**无报错、无日志** —— 与「手抄 13 行续期清单、漏一家
+ * 日志零字」是同一形态。
+ *
+ * ## 判据为什么是**行为**而不是读那个私有常量
+ *
+ * `AGGREGATE_CHANNELS` 是 `private static readonly`，测试拿不到。但它经
+ * `providerIds()` 决定「向哪些渠道拉目录」⇒ 用 `listModels` 的**调用记录**反推，
+ * 比文本断言强：文本只能证明字面量在，行为能证明它**真的被用上**。
+ *
+ * ⚠️ 判据是**集合**（无序）而不是有序相等：实测 registry 的尾部顺序是
+ * `… zcode, opencode, gemini`，而白名单是 `… gemini, zcode, opencode` —— 两者
+ * **本来就不同序**，故「有序相等」会恒假失败。白名单那边的顺序另有语义
+ *（见该常量注释），本用例**只管集合**。
+ */
+describe('★★ 聚合渠道白名单与 registry 对齐（漏一家即红并点名）', () => {
+  it('每个 channel 渠道都参与聚合（走真实 listModels 调用记录）', async () => {
+    const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
+    const expected = PROVIDER_REGISTRY.filter((d) => d.channel).map((d) => d.id).sort()
+
+    const seen: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        // 让「存活路由」= registry 的全部 channel ⇒ providerIds() 的交集
+        // 就等于 AGGREGATE_CHANNELS 自身，于是调用记录直接暴露该白名单。
+        listProviders: () => expected.map((id) => ({ id, name: id })),
+        listModels: async (provider: string) => {
+          seen.push(provider)
+          return [{ id: 'm1', name: 'M1' }]
+        },
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+    await adapter.listModels(AGGREGATE_PROVIDER)
+
+    expect(
+      [...new Set(seen)].sort(),
+      'AGGREGATE_CHANNELS 与 registry 漂移：左侧多出 = 白名单里有僵尸项；'
+      + '右侧多出 = registry 里有渠道没进聚合（它的模型永不可见，且**静默**）',
+    ).toEqual(expected)
+  })
+})
+
 describe('AggregateAdapter：目录播报', () => {
   it('providerInfo 的 id 必须等于注册路由（DSH 校验）', () => {
     const adapter = new AggregateAdapter(makeCtx({}), { accountPool: makePool() })

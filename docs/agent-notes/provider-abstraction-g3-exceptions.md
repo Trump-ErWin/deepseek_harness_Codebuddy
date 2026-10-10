@@ -114,7 +114,15 @@
 现行经 `descriptorOf()` 判别 ⇒ 报「Provider opencode 不支持续期（它的凭据不是可续期类型）」。
 **真未知 id 仍报 `Unknown provider:`**（两个分支都在，不是把 unknown 吞掉了）。
 
-**守卫**：`jet-hub-rpc-auth-wiring.spec.ts` 断言两句**必须不同** ⇒ 变红 **1** 条。
+**守卫**：`lobsterai-rpc-dispatch.spec.ts` 的
+「★ opencode 账号报「不支持续期」，与「未知 provider」是两句不同的话」——
+核心判据是 `expect(unsupportedMessage).not.toBe(unknown.result.error?.message)` ⇒ 变红 **1** 条。
+
+⚠️ **本行原先写的是 `jet-hub-rpc-auth-wiring.spec.ts`，那是错的**（2026-10-12 对抗性审计
+逐条复现时发现）：该文件全文只有 5 条用例（13 家键位 / 豁免理由 / 逐 provider 分派 /
+qodercn 不串国际版 / 未知 provider），**没有**这条断言。守卫确实**存在且结实**，只是
+本行把**文件指错了**。⇒ 本节教训：**「守卫」小节必须逐条复现过再写**，指错文件等于
+把「有覆盖」这句话变成不可核对的声明。
 
 ## G3-4 · `loomy` 的 `onboarding.claim` 错误码
 
@@ -160,7 +168,32 @@
 
 **反证已锁**：过滤集合下 `Hy3 · X` → `Hy3` **跳变**；现行两态都是 `Hy3 · X`。
 
-**守卫**：把第二实参改回 `listed` ⇒ 变红 **1** 条。
+**守卫**：⚠️⚠️ **当前零守卫**（2026-10-12 对抗性审计 + 变异验证实测，本行原先的写法是错的）。
+
+本行原先写「把第二实参改回 `listed` ⇒ 变红 **1** 条」—— **两处都错**：
+
+1. **指令不可执行**：`\blisted\b` 在现行的 `src/buddy-adapter.ts` 里 **0 命中**。
+   现行实现是 `catalogEntries(source)` 一处产出、`toCatalogEntry(model, source)` 取
+   同一个 `source`，根本没有 `listed` 这个变量 —— 它属于 Task 7c 的**中间态**。
+2. **零守卫**：把「消歧用的集合」换成黑名单过滤后的集合（产出仍保持全量，
+   精确复现修复前行为）后，跑
+   `buddy-adapter.spec.ts` + `model-catalog-parity.spec.ts` + `model-catalog.spec.ts`
+   = **212 passed 全绿**。⇒ 该语义**没有任何断言在守**。
+
+**根因（为什么没守住）**：唯一覆盖它的两条用例是 `model-catalog.spec.ts` 的 ⑮ 与
+`model-catalog-parity.spec.ts` 的 ④，而它们都构造**合成 config / 替身池**（`makeCatalog`）
+—— 验证的是 `createModelCatalog` **骨架自身**，**看不见 `buddy` 传进去的实参**。
+`tests/unit/buddy-adapter.spec.ts` 的 `describe('BuddyAdapter 模型黑名单')` 四条用例
+**只断言 `ids`**（`not.toContain` / `toEqual(map(m => m.id))`），**一次都没断言 `name`**；
+同文件「同名模型追加变体标记」三条又**都不带 `accountPool`** ⇒ 无黑名单 ⇒
+`all` 与「过滤后」恒等，**结构上不可能**区分两种实现。
+
+**后果（用户可见）**：拉黑一个同名模型后，另一个的变体标记**跳变** —— 正是 G3-6
+本该修掉的那个症状。
+
+**补法（尚未实施）**：在 `buddy-adapter.spec.ts` 加一条**真实 adapter + 黑名单 + name**
+的行为用例（例如：有两个同名模型时，关掉其中一个，断言另一个的 `name` **仍是**
+`X · 变体标记` 而不是退回 `X`）。
 
 ---
 
