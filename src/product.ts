@@ -497,8 +497,13 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
  *    登记为 `dailyCheckin: false` ⇒ 按钮不渲染 ⇒ `runTasks: true` 传不进来；
  * 2. **更根本的是**：contributor 在 !62 复审中实测确认 `www.workbuddy.ai` 后端
  *    **根本没有成长中心**（无任务列表、无 claim 端点）。故这不是「等将来开放」，
- *    而是「该产品没有这个功能」。`GROWTH_CAPABLE_PROVIDERS` 与客户端的
- *    `GROWTH_TASK_PROVIDERS` 都已据此**移除** `workbuddy`。
+ *    而是「该产品没有这个功能」。客户端 `GROWTH_TASK_PROVIDERS` 与宿主能力表
+ *    （`src/provider-credits.ts` 里**只有 buddy** 挂 `credits.afterClaim`）
+ *    都已据此**排除** `workbuddy`。
+ *
+ *    ⚠️ 2026-10-08（Task 4）：宿主侧原先另有一张手抄的 `GROWTH_CAPABLE_PROVIDERS`
+ *    集合，**已删除** —— 「哪家有成长中心」现在由「该家是否提供 `credits.afterClaim`」
+ *    回答（能力注册表说了算，不再有第二份可漂移的名单）。
  *
  * 两个字段保留是因为 `BuddyProduct` 把它们声明为必填；若将来类型放宽为可选，
  * 这里可以删掉（`claimBaseOf` / `webBaseOf` 已能正确处理空值并给出可读错误）。

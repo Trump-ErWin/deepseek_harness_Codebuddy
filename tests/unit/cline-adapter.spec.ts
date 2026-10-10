@@ -16,6 +16,7 @@ import {
   resetClineRequestHistory,
 } from '../../src/cline-request-log.js'
 import { descriptorOf } from '../../src/provider-registry.js'
+import { createProviderCredits } from '../../src/provider-credits.js'
 import { accountEntry, refreshHarness } from '../helpers/rpc-refresh.js'
 import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
 import { PROVIDER_ICONS } from '../../plugin-src/client/provider-icons.js'
@@ -847,16 +848,17 @@ describe('Cline 接线（源码级回归）', () => {
     expect(result.ok, `cline 续期应成功，实际 error=${result.error?.message}`).toBe(true)
     expect(harness.calls.map((c) => c.provider), 'cline 账号串到了别的实例').toEqual(['cline'])
     expect(harness.calls[0]?.ref).toBe('CLINE_ACCOUNT_WIRE')
-    // ⚠️ 2026-10-08 改（Task 3）：原先这条断言 `src/jet-hub-rpc.ts` 的源码文本里
-    //    含 `fetchClineCreditBalance(credential, CLINE)`。Task 3 把余额调用搬进了
-    //    `src/provider-credits.ts` 的积分表 ⇒ 该文本**不存在了**，而它守的意图
-    //    （cline 的余额真的走它自己的协议原语、且端到端打到自己的上游路径）
-    //    **与文本无关**。⇒ 改为**行为**断言，且**搬到了唯一一处**（避免同一套
-    //    RPC 夹具在多文件重复）：
-    //    `credits-runtime-parity.spec.ts` 的
-    //    「★★ 逐家余额都走自己的上游端点」—— 它真跑端点、逐家核对请求 URL。
-    //    比原断言强：文本只能证明源码里有那串字符，它能证明端到端打到正确路径。
-    expect(source).toContain('Cline 不支持每日签到')
+    // ⚠️ 2026-10-08 改（Task 4）：原先这条断言 `src/jet-hub-rpc.ts` 的源码文本里
+    //    含 `'Cline 不支持每日签到'`。Task 4 把「不支持签到」的文案搬到
+    //    `src/provider-credits.ts` 的 `claimUnavailableReason`（那是它该在的地方
+    //    —— 知道该产品形态的那一层），字面量**搬了家**，而它守的意图
+    //    （cline 调 claimAll 会拿到**指明原因**的拒绝、不退化成 unsupported provider）
+    //    **与文本位置无关**。
+    //    ⇒ 改为读**表里的声明值**；「端到端响应里就是这句话」由
+    //    `claim-runtime-parity.spec.ts` 的「cline / workbuddy / raccoon 各回
+    //    逐字保留的可读原因」守（真跑端点、逐字核对）。
+    expect(createProviderCredits().cline?.claimUnavailableReason)
+      .toContain('Cline 不支持每日签到')
   })
 
   it('客户端 PROVIDERS 含 cline 且有图标', () => {

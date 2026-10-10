@@ -57,20 +57,25 @@ import { MINIMAX } from './minimax-product.js'
 import { RACCOON } from './raccoon-product.js'
 import { TRAE } from './trae-product.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
-import { fetchCodeArtsAccountInfoDetailed } from './codearts-credits.js'
+import { claimCodeArtsDailyCheckin, fetchCodeArtsAccountInfoDetailed } from './codearts-credits.js'
 import { fetchGeminiCreditBalance } from './gemini-credits.js'
-import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
-import { fetchLoomyCreditBalance } from './loomy-credits.js'
+import { claimLobsteraiDailyCheckin, fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
+import { claimLoomyDailyQuota, fetchLoomyCreditBalance } from './loomy-credits.js'
 import {
+  claimMinimaxDailyCheckin,
   fetchMinimaxCreditBalance,
   fetchMinimaxSigninStatus,
 } from './minimax-credits.js'
 import { fetchRaccoonCreditBalance } from './raccoon-credits.js'
-import { fetchTraeCreditBalance } from './trae-credits.js'
+import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
+import { collectBuddyGrowth } from './buddy-growth.js'
 import { fetchZcodeBalance, type ZcodeBalanceResult } from './zcode-upstream.js'
 import {
+  claimDailyCheckin,
   fetchCheckinStatus,
   fetchCreditBalance,
+  type CheckinStatus,
+  type ClaimOutcome,
   type CreditBalance,
   type CreditPackage,
 } from './credits.js'
@@ -95,11 +100,25 @@ import type { ZcodeCredential } from './zcode.js'
  */
 export interface ProviderCreditsDeps {
   /** Loomy auth 实例（省略时回退到自由函数 + 全局 fetch）。 */
-  readonly loomy?: { fetchCreditBalance(credential: LoomyCredential): Promise<CreditBalance | null> }
+  readonly loomy?: {
+    fetchCreditBalance(credential: LoomyCredential): Promise<CreditBalance | null>
+    /** 一键签到：触发每日额度（`POST /points/first-login`）。 */
+    claimDailyQuota(credential: LoomyCredential): Promise<ClaimOutcome>
+  }
   /** Raccoon auth 实例（省略时回退到自由函数 + 全局 fetch）。 */
-  readonly raccoon?: { fetchCreditBalance(credential: RaccoonCredential): Promise<CreditBalance | null> }
+  readonly raccoon?: {
+    fetchCreditBalance(credential: RaccoonCredential): Promise<CreditBalance | null>
+  }
   /** ZCode auth 实例（省略时回退到自由函数 + 全局 fetch）。 */
   readonly zcode?: { fetchBalanceFor(credential: ZcodeCredential): Promise<ZcodeBalanceResult | undefined> }
+  /**
+   * LobsterAI 的**客户端版本号**解析器。
+   *
+   * ⚠️ 必须**惰性**调用（`() => lobsterai.resolveClientVersion()`），不能注册时
+   * 先 await 一个字符串：该值由远端更新接口解析（带 TTL 缓存），把它固化成闭包
+   * 里的常量会让「缓存过期后拿到新版本」失效 —— 而它是签到接口的**必填** query 参数。
+   */
+  readonly lobsteraiClientVersion?: () => Promise<string>
 }
 
 /**
@@ -212,21 +231,76 @@ export function createProviderCredits(
         if (info.credit === undefined) return fail('未返回积分数据')
         return ok(info.credit)
       },
+      /**
+       * CodeArts（华为云）走**签名**协议，与两个腾讯系 provider 都不同源：
+       * 领取流程自带「账户类型 + 活动列表」预检（见 `claimCodeArtsDailyCheckin`），
+       * 故 `precheckStatus: false` 跳过外部那次 CodeBuddy 式的状态查询 ——
+       * 用 `fetchCheckinStatus` 打华为端点既发错请求又必然失败。
+       */
+      claim: (credential) => claimCodeArtsDailyCheckin(credential as CodeArtsCredential),
+      precheckStatus: false,
     },
 
     lobsterai: {
       fetchBalance: (credential) =>
         fetchLobsteraiCreditBalance(credential as LobsteraiCredential, LOBSTERAI),
+      /**
+       * LobsterAI 的 `clientVersion` 是签到必填参数，需**动态**解析
+       *（带 TTL 缓存，通常无额外网络开销）—— 故必须惰性调用，不能在注册时
+       * 固化成常量：缓存过期后拿到新版本这件事会失效。
+       *
+       * ⚠️ 解析器缺席时回落到产品的兜底常量（与 `lobsterai-adapter.ts` 同法）：
+       * 该值一直发假值 `0.1.0` 也没被拒绝，故兜底可用。
+       *
+       * 领取流程内部已做 slot/context 预检 ⇒ `precheckStatus: false`
+       *（外部再查一次纯属重复请求）。
+       */
+      claim: async (credential) => {
+        const clientVersion = deps.lobsteraiClientVersion !== undefined
+          ? await deps.lobsteraiClientVersion()
+          : LOBSTERAI.fallbackClientVersion
+        return claimLobsteraiDailyCheckin(credential as LobsteraiCredential, LOBSTERAI, clientVersion)
+      },
+      precheckStatus: false,
     },
 
     trae: {
       fetchBalance: (credential) =>
         fetchTraeCreditBalance(credential as TraeCredential, TRAE),
+      /**
+       * ⚠️ **必须开启状态预检**（`precheckStatus: true`）。
+       *
+       * TRAE 的 claim 对「今天已签到」是**幂等**的：实测重复领取同样返回
+       * `{code:0, message:"success"}`，与真正领取成功**无法区分**。
+       * 早期照抄 LobsterAI 传了 `precheckStatus: false`（那是「领取流程内部
+       * 已做 slot/context 预检」的理由，TRAE 没有这回事），于是已签到的账号
+       * 被报成「领取成功」（用户报障：**显示成功但 +0 积分**）。
+       * 判据只能是状态端点的 `checked_in`。
+       *
+       * ⚠️ 这里用 {@link ProviderCredits.claimStatus} 而**不是** `fetchStatus`：
+       * `credits.status` 对 trae **刻意仍回 `null`**（Task 3 的决定，见该字段注释）。
+       */
+      claimStatus: (credential) =>
+        fetchTraeCheckinStatus(credential as TraeCredential, TRAE),
+      claim: (credential, entry, call) =>
+        claimTraeDailyCheckin(
+          credential as TraeCredential,
+          TRAE,
+          fetch,
+          // ⚠️ 设备指纹代次按 `entry.id` 从**账号池**读写 —— 这是 `claim` 必须
+          //    收 `entry` 的唯一理由（见 ProviderCredits.claim 的注释）。
+          call.accountPool.traeCheckinDeviceGenerationFor(entry.id),
+          (next) => call.accountPool.updateTraeCheckinDeviceGeneration(entry.id, next),
+        ),
+      precheckStatus: true,
     },
 
     /**
      * Cline：协议原语自带**具体**原因（含 HTTP 状态码与错误体摘要），
      * 压成「余额查询失败」会丢掉唯一有用的线索。
+     *
+     * ⚠️ 它的 `claimUnavailableReason` 与条目一起写在下方（与 buddy 系同处），
+     * 免得同一家的字段散落两处。
      */
     cline: {
       fetchBalanceDetailed: async (credential) => {
@@ -237,6 +311,7 @@ export function createProviderCredits(
           ? fail(result.error ?? '积分查询失败（凭据失效或响应异常）')
           : ok(result.balance)
       },
+      claimUnavailableReason: 'Cline 不支持每日签到（其后端没有签到接口）',
     },
 
     /** Loomy：`/points/records`（**只读**，无副作用；`first-login` 是写端点）。 */
@@ -253,6 +328,31 @@ export function createProviderCredits(
         // 查不到时带原因（不显示成 0，0 是「已用光」的语义）。
         return balance === null ? fail('积分查询失败（凭据失效或响应异常）') : ok(balance)
       },
+      /**
+       * Loomy 的「签到」= `POST /points/first-login`（触发每日赠送额度）。
+       *
+       * ⚠️ 语义**不是**「+5000 积分」：`dailyBalance = dailyQuota - dailyConsumed`，
+       * 消耗后不回补。文案由 `claimLoomyDailyQuota` 的 `already-claimed` 表达。
+       *
+       * ⚠️ **必须显式 `precheckStatus: false`，这是最容易漏的一格**：
+       * 它**没有**独立的签到状态端点（幂等判据在 claim 响应体的 `alreadyProcessed`），
+       * 而骨架的默认值是 true ⇒ 不传 false 时骨架会拿 **buddy 式**的
+       * `fetchCheckinStatus` 去打 Loomy 端点 —— 一次**必然失败的真实上游请求**。
+       *
+       * ⚠️ 走的是**共享骨架**（不再自写循环）：`claimLoomyDailyQuota` 已返回
+       * `ClaimOutcome`，与骨架的 `claim` 入参同型。旧 RPC 分支之所以自己写循环，
+       * 只是因为当时它按「不传 product」的方式调用 —— **不是语义不兼容**。
+       * 三个返回分支都**没有**设 `coversToday` ⇒ 一律 `true`（「今天已处理过」），
+       * 与旧循环逐条一致（`already-claimed` 也算今天处理过）；由
+       * `tests/unit/claim-runtime-parity.spec.ts` 显式锁住。
+       */
+      claim: async (credential) => {
+        const viaInstance = deps.loomy?.claimDailyQuota
+        return typeof viaInstance === 'function'
+          ? await viaInstance.call(deps.loomy, credential as LoomyCredential)
+          : await claimLoomyDailyQuota(credential as LoomyCredential, LOOMY)
+      },
+      precheckStatus: false,
     },
 
     /** Raccoon：`/points/v1/balance`（**只读**，无副作用）。 */
@@ -266,6 +366,17 @@ export function createProviderCredits(
         // 把「查询失败」显示成 0 会让用户以为自己积分没了）。
         return balance === null ? fail('积分查询失败（凭据失效或响应异常）') : ok(balance)
       },
+      /**
+       * ⚠️ **raccoon 没有签到端点**：每日 300 积分由服务端按日自动发放
+       *（账单里的 `daily_grant`，实测注册后 1 分钟即到账）⇒ **刻意不提供 `claim`**。
+       * 客户端按能力矩阵（`raccoon: { balance: true, onboardingTasks: true }`，
+       * **无** `dailyCheckin`）根本不会渲染「一键领取积分」按钮。
+       *
+       * ⚠️ 文案**逐字保留**，含那句可操作指引「登录奖励请在『新手任务』中领取」
+       * —— 用户看完才知道下一步该点哪里（压成泛化模板会丢掉它）。
+       */
+      claimUnavailableReason: 'Raccoon Work 不支持每日签到（每日积分由服务端自动发放；'
+        + '登录奖励请在「新手任务」中领取）',
     },
 
     /**
@@ -301,8 +412,22 @@ export function createProviderCredits(
       // ⚠️ **有**独立的签到状态端点，与「如实返回 null」的那几家不同。
       // 判据是 `is_today && status===3`（见 `minimaxPanelToCheckinStatus`），
       // 不是「没有 Claimable」。`active` 恒 true（拿到响应即 true）。
+      //
+      // ⚠️ 它同时是**领取预检**的数据源（`precheckStatus` 缺省 true，见下）——
+      //    预检与面板读数是同一个端点，故**只声明一次**（不再写 `claimStatus`：
+      //    两处声明同一实现会漂移）。
       fetchStatus: (credential) =>
         fetchMinimaxSigninStatus(credential as MinimaxCredential),
+      /**
+       * ⚠️ **必须开启状态预检**（`precheckStatus` 缺省 true，不要传 false）。
+       *
+       * 理由与 TRAE 同型：`claimMinimaxDailyCheckin` 靠响应体的 `claim_result`
+       * 判幂等（`1`=真领取、`2`=已领过），这在 **HTTP 层**是可靠的；但状态预检是
+       * 第二道防线 —— 若某天服务端对已领账号也回 `claim_result: 1`，预检能靠
+       * `todayCheckedIn` 先挡住，避免把「今天已领」报成「+积分」。
+       * 反之传 false 会让已签到账号走到 claim 请求（多发一次 POST）。
+       */
+      claim: (credential) => claimMinimaxDailyCheckin(credential as MinimaxCredential),
     },
 
     /**
@@ -336,6 +461,24 @@ export function createProviderCredits(
         fetchCreditBalance(credential as BuddyCredential, CODEBUDDY),
       fetchStatus: (credential) =>
         fetchCheckinStatus(credential as BuddyCredential, CODEBUDDY),
+      // 预检与面板读数是同一个端点 ⇒ 只声明 `fetchStatus`（端点回落到它），
+      // 不再写一份 `claimStatus`（两处声明同一实现必然漂移）。
+      claim: (credential) =>
+        claimDailyCheckin(credential as BuddyCredential, CODEBUDDY),
+      /**
+       * ⚠️ **成长中心（22 项任务）的唯一入口** —— 只有 CodeBuddy 中国版提供。
+       *
+       * ⚠️ 产品配置由**本闭包捕获**（`CODEBUDDY`），不从调用侧转发：通用分支
+       * 拿不到 product（它传 `undefined`），转发过去就是
+       * `collectBuddyGrowth(credential, undefined, …)`，成长中心当场打坏。
+       *
+       * ⚠️ `workbuddy`（国际版）**刻意不提供**：contributor 在 !62 复审中实测确认
+       * `www.workbuddy.ai` 后端**根本没有成长中心**（无任务列表、无 claim 端点）。
+       */
+      afterClaim: (credential, entry, run) =>
+        collectBuddyGrowth(
+          credential as BuddyCredential, CODEBUDDY, entry, run.budgetMs, run.roundDeadlineAt,
+        ),
     },
 
     workbuddy: {
@@ -346,6 +489,15 @@ export function createProviderCredits(
       // `credits.claimAll` 的显式守卫成对拦住）。
       fetchStatus: (credential) =>
         fetchCheckinStatus(credential as BuddyCredential, WORKBUDDY),
+      /**
+       * ⚠️ **这条守卫是载荷性的，必须有**：没有它时 `workbuddy` 会落到
+       * `credits.claimAll` 的通用分支，用**国际版**凭据去发**国内版**的签到
+       * 请求 —— 必然失败，而且是一次**真实的上游请求**。而「每日首次启动自动
+       * 签到」（`src/auto-checkin.ts`）正是靠「调 `claimAll`、按返回的信封判
+       * 跳过」来决定遍历范围的，它**不维护第二份能力名单** ⇒ 这里漏一个守卫，
+       * 它就会真去发一轮必然失败的请求。
+       */
+      claimUnavailableReason: 'WorkBuddy 国际版不支持每日签到（其后端没有签到接口）',
     },
   }
 }

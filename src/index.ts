@@ -73,6 +73,7 @@ import { MINIMAX } from './minimax-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { registerProviderRuntime } from './provider-runtime.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
+import { createProviderOnboarding, onboardingOf } from './provider-onboarding.js'
 import type { MinimaxCredential } from './minimax.js'
 import { GeminiAuth } from './gemini-auth.js'
 import { registerGeminiLlm } from './gemini-adapter.js'
@@ -2405,7 +2406,20 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // ⚠️ 三家（loomy / raccoon / zcode）的余额查询走**各自 auth 实例**上的方法
   //    （实例可能带注入的 `fetchImpl`），故必须传实例 —— 重构前 RPC 就是这么调的。
   //    其余走自由函数 + 全局 fetch。
-  const creditsTable = createProviderCredits({ loomy, raccoon, zcode })
+  const creditsTable = createProviderCredits({
+    loomy, raccoon, zcode,
+    // ⚠️ LobsterAI 的 `clientVersion` 是签到**必填**参数且**动态**解析（带 TTL 缓存）
+    //    —— 故传**惰性**解析器，不能先 await 成一个常量（那会让「缓存过期后拿到
+    //    新版本」失效）。见 `ProviderCreditsDeps.lobsteraiClientVersion`。
+    lobsteraiClientVersion: () => lobsterai.resolveClientVersion(),
+  })
+  /**
+   * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
+   *
+   * ⚠️ 与 `creditsTable` 同款：两处（本处 + `jet-hub-rpc.ts`）是两个独立调用，
+   *    防线是**两侧各自被钉在 `PROVIDER_REGISTRY` 上**，而不是「只有一份」。
+   */
+  const onboardingTable = createProviderOnboarding({ loomy, raccoon })
 
   // ===== 能力注册表（设计文档 §3.3）=====
   //
@@ -2465,6 +2479,9 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         // ⚠️ qoder 系**没有** credits 条目（形态不匹配，是特例），故这里
         //    对它们是 `undefined` —— 如实表达「该渠道不在表里」。
         credits: creditsOf(creditsTable, id),
+        // ⚠️ 与 credits 同法：`onboardingOf` 而非下标（原型链键误判）。
+        // ⚠️ 只有 loomy / raccoon 有条目 —— 其余如实为 `undefined`。
+        onboarding: onboardingOf(onboardingTable, id),
       })
       if (!registered) {
         ctx.logger?.info?.(

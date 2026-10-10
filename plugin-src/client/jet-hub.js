@@ -184,9 +184,14 @@ export function providerLabel(id) {
 /**
  * 有成长中心任务可做的 provider —— **只有 buddy（CodeBuddy 中国版）**。
  *
- * 与宿主 `src/jet-hub-rpc.ts` 的 `GROWTH_CAPABLE_PROVIDERS` 是**同一份清单**
- * （两处都要改）—— 客户端决定是否传 `runTasks`，宿主决定是否受理；只改一处会
- * 出现「传了但被挡回」或反之。
+ * ⚠️ 2026-10-08（Task 4）：宿主侧原先另有一张**手抄的平行清单**
+ * `GROWTH_CAPABLE_PROVIDERS`（`src/jet-hub-rpc.ts`），**已删除** ——
+ * 宿主现在按「该家是否提供 `credits.afterClaim`」受理
+ *（能力注册表 `src/provider-credits.ts` 里**只有 buddy** 挂了它）。
+ *
+ * ⚠️ **本表仍然必须存在**：它决定「按钮渲不渲染 / 要不要传 `runTasks`」，
+ * 而宿主那张决定「受不受理」—— 两侧取值同源（都源自能力声明），但**作用不同**，
+ * 不能只留一处：少了本表，客户端会对没有成长中心的渠道也传 `runTasks`。
  *
  * ⚠️ `workbuddy`（国际版）**不在**清单里：contributor 在 !62 复审中实测确认
  * `www.workbuddy.ai` 后端**根本没有成长中心**（无任务列表、无 claim 端点）。
@@ -2238,7 +2243,8 @@ function ProviderPanel({ provider, rpcCall }) {
   const canLoadCredits = supportsCreditBalance(provider);
   // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
-  // 与服务端 GROWTH_CAPABLE_PROVIDERS 同一份清单（两处都要改），
+  // 有成长中心的 provider 才传 runTasks（见 GROWTH_TASK_PROVIDERS 的注释：
+  // 宿主侧那张手抄的平行清单已在 Task 4 删除，改由「是否提供 credits.afterClaim」判定），
   // 避免按钮渲染了却被服务端挡回 bad-request。
   const supportsGrowthTasks = GROWTH_TASK_PROVIDERS.has(provider);
   /**
