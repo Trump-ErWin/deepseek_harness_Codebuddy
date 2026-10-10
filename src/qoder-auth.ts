@@ -125,8 +125,15 @@ declare module '@deepseek-ai/cordis' {
      * 与 `qoderAuth` 是**两个独立实例**（同一 `QoderAuth` 类，不同 `product`），
      * 正如 `buddyAuth` 与 `workbuddyAuth`。服务名由 `${product.id}Auth` 派生，
      * 故不会与国际版撞名 —— 这也是 `id` 必须区分两站的原因。
+     *
+     * ⚠️ **键名必须由 product id 逐字拼出**：id 是 `qodercn`（**不带连字符、
+     * 全小写**），故服务名是 `qodercnAuth`。本声明一度按变量名的驼峰惯例拼成了
+     * 「Qoder + Cn + Auth」，与运行时注册名**大小写不符** ⇒ 按那个错名取服务
+     * 恒得 `undefined`，而正确的 `ctx.qodercnAuth` 在 TS 里**不可见**
+     * （2026-10-08 修正；因长期零读取者而未暴露）。
+     * ⚠️ 同类陷阱见 `AGENTS.md` 的「provider id 一律纯小写字母」。
      */
-    qoderCnAuth: QoderAuth
+    qodercnAuth: QoderAuth
   }
 }
 

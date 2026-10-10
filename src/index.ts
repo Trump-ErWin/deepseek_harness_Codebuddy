@@ -1054,7 +1054,8 @@ export function apply(ctx: Context): void {
   // 732aef47-…、以及一张自己的 14 条模型表）。刻意**不复制**任何 qoder*.ts
   // 实现文件 —— 协议同源，复制会让同类缺陷（tools 不下发、工具历史丢
   // tool_calls、错误帧不抛错）修两遍。
-  // 服务名由 `${product.id}Auth` 派生，注册为 ctx.qoderCnAuth。
+  // 服务名由 `${product.id}Auth` 派生，注册为 `ctx.qodercnAuth`（product id
+  // `qodercn` 全小写、不带连字符 —— 按变量名驼峰惯例拼会得到大小写不符的名字）。
   // 不注册斜杠命令：入口在 Jet Hub 的「Qoder (中国版)」面板。
   const qoderCn = new QoderAuth(ctx, { product: QODER_CN })
   const qoderCnAdapter = registerQoderLlm(ctx, {
