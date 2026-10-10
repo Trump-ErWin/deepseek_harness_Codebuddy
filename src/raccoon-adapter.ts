@@ -29,10 +29,10 @@ import type {
   LlmResolvedModelInfo,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { isRaccoonExpired, type RaccoonCredential } from './raccoon.js'
 import {
   RACCOON,
@@ -316,6 +316,12 @@ export class RaccoonAdapter extends LlmAdapter {
   private remoteModels: RaccoonRemoteModel[] | undefined
   /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
   private readonly catalogGate: RemoteCatalogGate
+  /**
+   * ⚠️ **2026-10-08 Task 7a：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架
+   * （实测与 `loomy` / `minimax` 归一化后逐字相同），现在只剩 `toCatalogEntry`。
+   */
+  private readonly catalog: ModelCatalog
 
   constructor(private readonly options: RaccoonAdapterOptions) {
     super()
@@ -325,6 +331,17 @@ export class RaccoonAdapter extends LlmAdapter {
     // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
     this.catalogGate = new RemoteCatalogGate(
       options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
+    // ⚠️ 共享骨架（Task 7a）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+        unknownModelInputModalities: () => ['text'] as const,
+        syncCatalog: () => this.syncCatalogEntries(),
+      },
     )
   }
 
@@ -345,10 +362,50 @@ export class RaccoonAdapter extends LlmAdapter {
    *
    * 设置页需要它渲染被关闭的模型 —— 否则那些条目只能凭 `disabledMap` 的 key
    * 补回，而那条路径拿不到展示名，会退化成裸 id（倍率与模型名随之丢失）。
+   *
+   * ⚠️ **2026-10-08 Task 7a**：骨架（含上面这条理由）已上移到共享实现
+   * `src/model-catalog.ts`，此处只剩委托。
    */
   listAllModels(): readonly { id: string; name: string }[] {
+    return this.catalog.listAllModels()
+  }
+
+  /**
+   * 把本家私有条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 这里是**唯一**还认识「倍率格式」与 `supportsImage` 的地方 ——
+   * 骨架不认识它们（各家格式不同）。
+   */
+  private toCatalogEntry(
+    model: RaccoonRemoteModel,
+    fallback: RaccoonFallbackModel | undefined,
+  ): CatalogEntry {
+    const contextWindow = model.contextWindow ?? fallback?.contextWindow
+    const maxTokens = positiveMaxTokens(model.maxTokens ?? fallback?.maxTokens)
+    return {
+      id: model.id,
+      name: model.name,
+      // ⚠️ `resolveModel` 用**裸名**（与 qoder/trae/loomy 一致）：
+      // 价格只属于选择列表语境。本家原本用 `replace(/ · .*$/, '')`。
+      bareName: model.name.replace(/ · .*$/, ''),
+      // ⚠️ 三态：本家远端条目**总是**带 `supportsImage` 布尔 ⇒ 恒为数组。
+      inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
+      ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+      ...maxTokens !== undefined ? { maxTokens } : {},
+      // 思考档位（两态：深度思考 / 关闭思考）。实测确证见 `raccoonReasoningInfo`。
+      // ⚠️ 所有模型一致 —— `extra_body.thinking` 是 provider 级方言，与模型无关。
+      reasoning: raccoonReasoningInfo(),
+    }
+  }
+
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    const all = await this.loadModels()
+    return all.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
+  }
+
+  private syncCatalogEntries(): readonly CatalogEntry[] {
     const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
-    return source.map((model) => ({ id: model.id, name: model.name }))
+    return source.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
   }
 
   /**
@@ -380,50 +437,11 @@ export class RaccoonAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 无已登录账号时返回 `[]` → DSH 的 buildModelCatalog 把整个 provider
-    // 分组隐藏。**必须返回空数组而不能抛错**（抛错会被归入 catalog 的
-    // failures，界面上反而多一条 provider 报错）。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-
-    const all = await this.loadModels()
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? all
-      : all.filter((model) => !disabled.has(model.id))
-
-    return listed.map((model) => ({
-      provider: this.product.id,
-      id: model.id,
-      // 倍率拼进 name（不是 description）：composer 的模型切换菜单只渲染 name。
-      name: model.name,
-      inputModalities: this.inputModalitiesFor(model),
-    }))
+    return this.catalog.listModels(_provider)
   }
 
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    const all = await this.loadModels()
-    const entry = all.find((item) => item.id === model)
-    const fallback = this.fallbackIndex.get(model)
-    // ⚠️ name **不带倍率**（与 qoder/trae/loomy 一致）：价格只属于选择列表语境。
-    const bareName = fallback !== undefined ? fallback.name.replace(/ · .*$/, '') : model
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: entry !== undefined ? entry.name.replace(/ · .*$/, '') : bareName,
-      inputModalities: this.inputModalitiesFor(entry),
-    }
-    const contextWindow = entry?.contextWindow ?? fallback?.contextWindow
-    // 未知模型不编造 context（宁可让 DSH 用默认值，也不报一个假窗口）。
-    if (contextWindow !== undefined && contextWindow > 0) {
-      resolved.context = { contextWindow }
-    }
-    // ⚠️ 远端非法值必须过滤（见 positiveMaxTokens）：不声明就让 DSH 用默认值。
-    const maxTokens = positiveMaxTokens(entry?.maxTokens ?? fallback?.maxTokens)
-    if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
-    // 思考档位（两态：深度思考 / 关闭思考）。实测确证见 `raccoonReasoningInfo`。
-    // ⚠️ 所有模型一致 —— `extra_body.thinking` 是 provider 级方言，与模型无关。
-    resolved.reasoning = raccoonReasoningInfo()
-    return resolved
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /**

@@ -26,8 +26,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { randomUUID } from 'node:crypto'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
 import { QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
@@ -39,7 +39,6 @@ import {
 import {
   collectImages,
   consumeOpenAiSse,
-  contentToText,
   errorDetail,
   httpErrorCode,
   isTransportError,
@@ -453,6 +452,12 @@ export class QoderAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
   private readonly fallbackIndex: ReadonlyMap<string, QoderFallbackModel>
+  /**
+   * ⚠️ **2026-10-08 Task 7b：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+   * 现在只剩 `toCatalogEntry`（本家私有形状 + 静态表判据 + 倍率格式）。
+   */
+  private readonly catalog: ModelCatalog
 
   constructor(private readonly options: QoderAdapterOptions) {
     super()
@@ -460,6 +465,18 @@ export class QoderAdapter extends LlmAdapter {
     this.fetchImpl = options.fetchImpl ?? fetch
     this.fallbackIndex = new Map(
       (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
+    )
+    // ⚠️ 共享骨架（Task 7b）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    // ⚠️ 本家恒用**本地兜底表**（不发网络请求）⇒ 两个取数回调是同一份。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.catalogEntries(),
+        // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+        unknownModelInputModalities: () => ['text'] as const,
+        syncCatalog: () => this.catalogEntries(),
+      },
     )
   }
 
@@ -524,35 +541,40 @@ export class QoderAdapter extends LlmAdapter {
    * 设置页必须渲染被关闭的模型（否则用户无法重新打开），而 `listModels` 会按
    * 黑名单过滤掉它们 —— RPC 层只能凭裸 id 补回，展示名与倍率随之丢失
    * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
+   *
+   * ⚠️ **2026-10-08 Task 7b**：骨架（含上面这条理由）已上移到共享实现
+   * `src/model-catalog.ts`，此处只剩委托。
    */
   listAllModels(): readonly { id: string; name: string }[] {
-    return this.product.fallbackModels.map((model) => ({ id: model.id, name: qoderDisplayName(model) }))
-  }
-
-  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 没有任何已登录账号时返回空数组 → DSH 的 `buildModelCatalog` 把整个
-    // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
-    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
-    // 界面上反而多出一条 provider 报错）。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-    // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const source = this.product.fallbackModels
-    const listed = disabled === undefined || disabled.size === 0
-      ? source
-      : source.filter((model) => !disabled.has(model.id))
-    return listed.map((model) => ({
-      provider: this.product.id,
-      id: model.id,
-      // 倍率拼进 `name`（**不是** `description`）：composer 的模型切换菜单
-      // 只渲染 name，description 仅用于 /model 弹窗。见 qoderDisplayName。
-      name: qoderDisplayName(model),
-      inputModalities: this.inputModalitiesFor(model.id),
-    }))
+    return this.catalog.listAllModels()
   }
 
   /**
-   * 解析模型元信息。
+   * 把本家兜底表条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 本家**恒用本地兜底表**（不发网络请求，见 `listModels` 的说明），
+   * 故 `loadCatalog` 与 `syncCatalog` 取同一份数据。
+   */
+  private toCatalogEntry(model: QoderFallbackModel): CatalogEntry {
+    const reasoning = this.reasoningForEntry(model)
+    return {
+      id: model.id,
+      name: qoderDisplayName(model),
+      // ⚠️ `resolveModel` 用**裸名**（与 trae/loomy/raccoon 一致）：
+      // 价格只属于选择列表语境。本家原本用 `entry.name`（兜底表的裸名）。
+      bareName: model.name,
+      // ⚠️ 模态判据按 **id** 查**静态表**（`inputModalitiesFor(model: string)` 的形态）
+      // —— 这是本家私有的判据，骨架不认识。
+      // ⚠️ 三态：本家恒返回数组（未声明时**保守报 `['text']`**，见原注释：
+      // 「宁可少报能力，也不要报一个服务端不认的模态」）⇒ 不会是 undefined。
+      inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
+      ...model.contextWindow > 0 ? { contextWindow: model.contextWindow } : {},
+      ...reasoning !== undefined ? { reasoning } : {},
+    }
+  }
+
+  /**
+   * 该条目的思考档位。
    *
    * ⚠️ **`reasoning` 是「思考强度」选择器出现在模型菜单里的唯一入口**
    * （composer 读 `resolveModel().reasoning`）。此前本适配器**只声明了
@@ -560,37 +582,44 @@ export class QoderAdapter extends LlmAdapter {
    * 尽管目录早已下发 `thinking_config`（用户报障「qoder中国版可以设置思考档位，
    * 我们应该按照他的设置给出可设置的档位选择」）。
    */
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    const entry = this.fallbackIndex.get(model)
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: entry?.name ?? model,
-      inputModalities: this.inputModalitiesFor(model),
-    }
-    // 上下文窗口：兜底表是**本地估计值**。未知模型不编造 context
-    // （宁可让 DSH 用默认值，也不要报一个假的窗口大小）。
-    if (entry !== undefined) resolved.context = { contextWindow: entry.contextWindow }
+  private reasoningForEntry(
+    entry: QoderFallbackModel,
+  ): LlmResolvedModelInfo['reasoning'] {
     // 思考档位：见 `qoderEffortsFor` 的三条口径（含「关闭思考」的追加规则）。
-    if (entry !== undefined) {
-      const efforts = qoderEffortsFor(entry)
-      if (efforts.length > 0) {
-        const fallback = entry.defaultEffort
-        resolved.reasoning = {
-          efforts: efforts.map((id) => ({
-            id: ReasoningEffortId(id),
-            name: QODER_EFFORT_NAMES[id] ?? id,
-          })),
-          // ⚠️ `defaultEffort` 必须落在 `efforts` 内 —— DSH 会直接拿它发请求，
-          // 给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`
-          // （同 `trae-adapter.ts` 的教训）。
-          ...fallback !== undefined && efforts.includes(fallback)
-            ? { defaultEffort: ReasoningEffortId(fallback) }
-            : {},
-        }
-      }
+    const efforts = qoderEffortsFor(entry)
+    if (efforts.length === 0) return undefined
+    const fallback = entry.defaultEffort
+    return {
+      efforts: efforts.map((id) => ({
+        id: ReasoningEffortId(id),
+        name: QODER_EFFORT_NAMES[id] ?? id,
+      })),
+      // ⚠️ `defaultEffort` 必须落在 `efforts` 内 —— DSH 会直接拿它发请求，
+      // 给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`
+      // （同 `trae-adapter.ts` 的教训）。
+      ...fallback !== undefined && efforts.includes(fallback)
+        ? { defaultEffort: ReasoningEffortId(fallback) }
+        : {},
     }
-    return resolved
+  }
+
+  private catalogEntries(): readonly CatalogEntry[] {
+    return this.product.fallbackModels.map((model) => this.toCatalogEntry(model))
+  }
+
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.catalog.listModels(_provider)
+  }
+
+  /**
+   * 解析模型元信息。
+   *
+   * ⚠️ **`reasoning` 是「思考强度」选择器出现在模型菜单里的唯一入口**
+   * （composer 读 `resolveModel().reasoning`）—— 该判据现在由
+   * `toCatalogEntry` 提供（见 `reasoningForEntry`）。
+   */
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /**

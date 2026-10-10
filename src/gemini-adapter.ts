@@ -35,7 +35,8 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { providerCatalogVisible, type AccountPool } from './account-pool.js'
+import { type AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { collectImages, httpErrorCode } from './openai-compat.js'
 import { projectRequestImage } from './image-budget.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
@@ -260,10 +261,27 @@ export interface GeminiAdapterOptions {
 /** Gemini（Cloud Code Assist）模型适配器。 */
 export class GeminiAdapter extends LlmAdapter {
   private readonly product: GeminiProduct
+  /**
+   * ⚠️ **2026-10-08 Task 7b：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+   * 现在只剩 `toCatalogEntry`（本家私有形状 + 静态表判据）。
+   */
+  private readonly catalog: ModelCatalog
 
   constructor(private readonly options: GeminiAdapterOptions) {
     super()
     this.product = options.product ?? GEMINI
+    // ⚠️ 本家目录是**静态表**（无远端拉取）⇒ 两个取数回调是同一份。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.catalogEntries(),
+        // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+        unknownModelInputModalities: () => ['text'] as const,
+        syncCatalog: () => this.catalogEntries(),
+      },
+    )
   }
 
   providerInfo(provider: string): LlmProviderInfo {
@@ -287,67 +305,52 @@ export class GeminiAdapter extends LlmAdapter {
    * ⚠️ **必须同步返回数组，不能是 `async`**（`minimax-adapter.ts:218-242`
    * 记录的同类缺陷：写成 async 会让 `jet-hub-rpc.ts:2041 [...all]` 与
    * `:2125 all.map` 抛 `TypeError: all is not iterable`）。
+   *
+   * ⚠️ **2026-10-08 Task 7b**：该同步契约（连同上面这条缺陷史）已在
+   * `src/model-catalog.ts` 的 `syncCatalog` 上统一持有；此处只剩委托。
    */
   listAllModels(): readonly { id: string; name: string }[] {
-    return this.loadModels().map((model) => ({ id: model.id, name: model.name }))
+    return this.catalog.listAllModels()
   }
 
-  private inputModalitiesFor(
-    entry: GeminiModelEntry | undefined,
-  ): readonly ('text' | 'image')[] {
-    return entry?.supportsImage === true ? ['text', 'image'] : ['text']
+  /**
+   * 把本家私有条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 本家目录是**静态表**（`geminiFallbackEntries()`，无远端拉取），
+   * 故 `loadCatalog` 与 `syncCatalog` 取同一份数据。
+   */
+  private toCatalogEntry(entry: GeminiModelEntry): CatalogEntry {
+    const reasoning = geminiReasoningInfo(entry)
+    const contextWindow = entry.contextWindow
+    const maxTokens = entry.maxTokens
+    return {
+      id: entry.id,
+      name: entry.name,
+      // ⚠️ 本家**不剥倍率**（`resolveModel` 也用 `name`）⇒ 不提供 `bareName`。
+      // ⚠️ 模态判据**内联在此**（Task 7b：原 `inputModalitiesFor` 已删除）——
+      // 它是本家私有的「该 entry 支不支持图片」，骨架不认识 `supportsImage`。
+      // ⚠️ 三态：本家静态表**总是**带 `supportsImage` 布尔 ⇒ 恒为数组，不会是 undefined。
+      inputModalities: entry.supportsImage === true ? ['text', 'image'] : ['text'],
+      ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+      ...maxTokens !== undefined ? { maxTokens } : {},
+      ...reasoning !== undefined ? { reasoning } : {},
+    }
+  }
+
+  private catalogEntries(): readonly CatalogEntry[] {
+    return this.loadModels().map((entry) => this.toCatalogEntry(entry))
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 无已登录账号时返回 `[]` → DSH 把整个 provider 分组隐藏。
-    // **必须返回空数组而不能抛错**（抛错会多一条 provider 报错）。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-
-    const all = this.loadModels()
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? all
-      : all.filter((model) => !disabled.has(model.id))
-
-    return listed.map((model) => ({
-      provider: this.product.id,
-      id: model.id,
-      name: model.name,
-      inputModalities: this.inputModalitiesFor(model),
-    }))
+    return this.catalog.listModels(_provider)
   }
 
   async resolveModel(
     provider: string,
     model: string,
-    _signal?: AbortSignal,
+    signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
-    const entry = this.loadModels().find((item) => item.id === model)
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: entry?.name ?? model,
-      inputModalities: this.inputModalitiesFor(entry),
-    }
-    // ⚠️ 未知模型不编造 context（宁可让 DSH 用默认值，也不报一个假窗口）
-    if (entry !== undefined && entry.contextWindow > 0) {
-      resolved.context = { contextWindow: entry.contextWindow }
-    }
-    // ⚠️ 远端/静态非法值必须过滤：0/负数/NaN 会让 DSH 抛
-    // `INVALID_MODEL_MAX_TOKENS`，**整轮对话起不来**（不是降级，是崩）。
-    // ⚠️ 先取局部变量再判：`entry.maxTokens` 是可选属性，
-    // `Number.isSafeInteger` 不做类型收窄，直接连写会报 TS18048。
-    const maxTokens = entry?.maxTokens
-    if (maxTokens !== undefined && Number.isSafeInteger(maxTokens) && maxTokens > 0) {
-      resolved.defaultMaxTokens = maxTokens
-    }
-    // ⚠️ 无档位的模型（例如用户手填的未知 id）⇒ `undefined` ⇒ **不声明**
-    //（空数组会让面板显示一个点不开的空下拉框）。
-    if (entry !== undefined) {
-      const reasoning = geminiReasoningInfo(entry)
-      if (reasoning !== undefined) resolved.reasoning = reasoning
-    }
-    return resolved
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /** 兼容 0.1.1-rc.2 的 `prepareCall` shim（与其余适配器同款）。 */
