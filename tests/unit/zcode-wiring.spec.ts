@@ -539,26 +539,42 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     expect(harness.calls.map((c) => c.provider)).toEqual([ZCODE.id])
   })
 
-  it('★ credits.balances 与 credits.claimAll 都接了 zcode', () => {
-    const source = readRpc()
-    // ⚠️ 2026-10-08 改（Task 3）：原先这条数 `req.provider === ZCODE.id` 出现
-    //    **两次**（credits.balances 与 credits.claimAll 各一处）。Task 3 把
-    //    credits.balances 的分派收敛成查表 ⇒ 只剩 claimAll 一处，该计数断言
-    //    必然假失败，而它守的意图（zcode 的余额与签到都接上了）**与文本无关**。
-    //    ⇒ 余额那一半改为**行为**断言（搬到唯一一处）：
-    //    `credits-runtime-parity.spec.ts` 的
-    //    「★★ 逐家余额都走自己的上游端点」（核对 zcode 的
-    //    `/api/v1/zcode-plan/billing/balance` 真的被请求到）+
-    //    「生产积分表的内容」（zcode 在表里、且走传入的 auth 实例）。
-    //    本文件保留 claimAll 那处的真协议分支断言。
-    expect(source, 'zcode 的 claimAll 分支仍须按 id 分派').toMatch(/req\.provider === ZCODE\.id/)
-    expect(source).toMatch(/claimDailyFor/)
+  /**
+   * ⚠️ 2026-10-08（Task 11-B）：本组两条原先都是**源码文本断言**
+   * （`expect(readRpc()).toMatch(/req\.provider === ZCODE\.id/)` 与
+   * `toMatch(/claimDailyFor/)`），现已删除。理由：
+   *
+   * 1. 第五行那种正则**只要源码里出现该字符串就通过** —— 它证明不了
+   *    「claimAll 真的为 zcode 走特例分支、真的逐 plan 现产 captcha」；
+   * 2. 它依赖 `ZCODE.id` 仍以字面量出现在 `jet-hub-rpc.ts` 里，Task 3 就动过这类形态。
+   *
+   * ⚠️ 它们守的意图**已由一条强得多的行为用例覆盖**：
+   * `tests/unit/claim-runtime-parity.spec.ts` 的
+   * 「★ 豁免者 zcode 真的能签到（真跑端点，证明特例分支没断）」——
+   * 它真跑 `credits.claimAll`（provider=zcode），并断言：
+   * - `result.ok === true`（特例分支没断，不是 `unsupported provider`）；
+   * - **逐 plan 展开** `results` 为 2 条、金额 111/222（证明走的是「自己遍历账号与
+   *   plan」那条形状，而不是共享骨架那条「一账号一条 outcome」）；
+   * - `perPlan.length === 2`（**captcha 真的现产了两次**，复用会得上游 3007）。
+   *
+   * 下面保留的这两条断言的是**能力登记**（registry 派生），与实现写法无关 ——
+   * 它们仍能在「有人把 zcode 从能力表里摘掉」时点名报警。
+   */
+  it('★ zcode 的余额能力（registry 判据）：声明 balance', () => {
+    // ⚠️ zcode 的量纲是 **token 而非积分** —— 能力矩阵回答的是「有没有这项能力」，
+    //    不是「量纲是否一致」（量纲差异在面板与 RPC 层如实标注，见 registry 注释）。
+    // ⚠️ 行为侧由 `credits-runtime-parity.spec.ts` 的
+    //    「★★ 逐家余额都走自己的上游端点」守（核对 zcode 的
+    //    `/api/v1/zcode-plan/billing/balance` 真的被请求到）。
+    expect(descriptorOf(ZCODE.id)?.credits?.balance, 'zcode 应声明余额能力').toBe(true)
   })
 
-  it('★ 签到路径为**每个 plan 单独 mint** captcha（captcha 一次性）', () => {
-    const source = readRpc()
-    // claimAll 的 zcode 分支应在循环内调用 claimDailyFor（它内部每个 plan 都调 mint）。
-    expect(source).toMatch(/claimDailyFor/)
+  it('★ zcode 的签到能力（registry 判据）：可签到、且登记为「自动签到有代价」', () => {
+    const zcode = descriptorOf(ZCODE.id)
+    expect(zcode?.credits?.dailyCheckin, 'zcode 应声明可签到').toBe(true)
+    expect(zcode?.autoCheckinExcluded, 'zcode 必须被排除出自动签到').toBe(true)
+    // ⚠️ claimAll 侧的行为由 `claim-runtime-parity.spec.ts`
+    //    的「豁免者 zcode 真的能签到（真跑端点）」守 —— 见上方说明。
   })
 
   it('index.ts 把 zcode 接进 registerJetHubRpc 与 modelAdapters', () => {

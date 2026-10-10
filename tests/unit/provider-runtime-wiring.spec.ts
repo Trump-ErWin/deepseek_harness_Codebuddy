@@ -40,6 +40,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { apply } from '../../src/index.js'
 import { clearProviderRuntimes, registeredRuntimeIds, runtimeOf } from '../../src/provider-runtime.js'
 import { PROVIDER_REGISTRY, descriptorOf } from '../../src/provider-registry.js'
+import { CREDITS_TABLE_EXEMPT, expectedProviderIdsWithAuth } from '../helpers/provider-sets.js'
 
 /**
  * 13 个**可续期** provider → 它在 `ctx` 上的服务名。
@@ -168,12 +169,10 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     const ctx = applyOnce()
     const { wiredRefreshTargets } = await import('../../src/provider-runtime.js')
 
-    // 期望集从 `PROVIDER_REGISTRY` 派生（`channel: true` 减 `opencode`，
+    // 期望集从 `PROVIDER_REGISTRY` 派生（`channel: true` 减 `AUTH_EXEMPT`，
     // 它没有续期概念），**不手抄**。
-    const expected = PROVIDER_REGISTRY
-      .filter((d) => d.channel && d.id !== 'opencode')
-      .map((d) => d.id)
-      .sort()
+    // ⚠️ 判据本体由 `expectedProviderIdsWithAuth()` 单一持有（Task 11-F）。
+    const expected = expectedProviderIdsWithAuth().sort()
 
     const targets = wiredRefreshTargets()
     const wired = targets.map(([id]) => id).sort()
@@ -239,14 +238,17 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
    *    opencode（本地派生的通道可用性、零网络）与 qoder 系（只吃
    *    `QoderCredential`）**刻意不在**积分表里 —— 它们的 `credits` 如实为
    *    `undefined`，由 `credits.balances` 里的特例分支短路。
+   *
+   * ⚠️ 2026-10-08（Task 11-F）：特例表改读 `CREDITS_TABLE_EXEMPT` 单一真源
+   *（原先这里与 `credits-runtime-parity.spec.ts` 的两处各硬编码了一遍
+   * `new Set(['opencode', 'qoder', 'qodercn'])`）。
    */
   it('★ 每个有余额能力的渠道都挂上了 credits 域（漏接即红并点名）', () => {
     applyOnce()
-    const SPECIAL_CASES = new Set(['opencode', 'qoder', 'qodercn'])
     for (const d of PROVIDER_REGISTRY) {
       const runtime = runtimeOf(d.id)
       if (runtime === undefined) continue // 非 channel provider（aggregate）不在此表
-      if (SPECIAL_CASES.has(d.id)) {
+      if (CREDITS_TABLE_EXEMPT.has(d.id)) {
         expect(
           runtime.credits,
           `${d.id} 是形态不匹配的特例，不该进积分表（它的余额由特例分支短路）`,
@@ -335,10 +337,8 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     // ⚠️ 豁免**只有** opencode 一个，且理由与上面三条 `not.toContain` **不同**：
     //    那三条断言「注册表里没有它」，这条断言「它**本来就不该有**」——
     //    前者可能因为清单漏写而通过，后者才把「漏写」变成红的。
-    const shouldRegister = PROVIDER_REGISTRY
-      .filter((d) => d.channel && d.id !== 'opencode')
-      .map((d) => d.id)
-      .sort()
+    // ⚠️ 判据本体由 `expectedProviderIdsWithAuth()` 单一持有（Task 11-F）。
+    const shouldRegister = expectedProviderIdsWithAuth().sort()
     expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(13)
     expect(
       registeredRuntimeIds().sort(),

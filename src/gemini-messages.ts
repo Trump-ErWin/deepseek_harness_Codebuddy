@@ -549,7 +549,7 @@ export interface ConsumeGeminiSseOptions {
    *
    * ⚠️ **必须主动掐**：上游在生成大 functionCall 参数期间可能长时间不 flush
    * 任何字节，裸 `reader.read()` 会**无限期挂起** —— 适配器的 generator
-   * 永不返回，harness 当前步骤既不出结果也不报错（见 `src/sse.ts:1-10`）。
+   * 永不返回，harness 当前步骤既不出结果也不报错（见 `src/sse.ts`）。
    */
   idleTimeoutMs?: number
   /** 首 token 单独的超时（缺省同 `idleTimeoutMs`）。 */

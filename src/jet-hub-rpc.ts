@@ -1556,7 +1556,7 @@ function registerJetHubEndpoints(
    * 账号池（`jet-hub/state.json`）的条目只有 `id`/`provider`/`nickname`/
    * `credentialRef` 等字段，**没有**账号名与手机号 —— 它们在**凭据**里
    * （`user_info.displayName` 与由 17 位 `user_id` 派生的手机号）。
-   * 且 `sanitizeAccounts`（`src/jet-hub-store.ts:173-191`）只保留三个字段，
+   * 且 `sanitizeAccounts`（`src/jet-hub-store.ts`）只保留三个字段，
    * 写回池也会被丢掉。故每次列表时从**各账号自己的 ref** 现读。
    *
    * ## ⚠ 只对 zcode 做，且逐条独立失败
@@ -3297,7 +3297,7 @@ function registerJetHubEndpoints(
         // 背景：`withDeadModelPruning` 会把已失效模型从 `listModels` / `listAllModels`
         // 两侧剔除，于是它既不在 `all` 里、也不在 `disabledMap` 里 —— 上面的两条
         // 补回路径都救不回它。结果是**模型从设置页彻底消失，连开关都摸不着**，
-        // 用户永远无法自行恢复（这正是本段注释在 `:3370-3375` 列为必须避免的根因：
+        // 用户永远无法自行恢复（这正是上文 `withDeadModelPruning` 处列为必须避免的根因：
         // 「用户再也无法重新打开」）。
         //
         // ⇒ 这里把 dead 表里的 id 补回目录，并带上 `dead: true` 让客户端灰显 +

@@ -448,6 +448,63 @@ describe('★ credits.afterClaim：只有 buddy 提供（成长中心，漏了�
     // 反向：确认「有 afterClaim」这件事**不是**所有渠道都成立，否则断言恒真。
     expect(runtimeOf('trae')?.credits?.afterClaim).toBeUndefined()
   })
+
+  /**
+   * ★★★ **生产闭包真的跑得到成长中心**（Task 11-G 补的缺口，见下）。
+   *
+   * ## ⚠️ 上面两条守不住什么（实测取证，2026-10-08）
+   *
+   * 它们只断言 `afterClaim` **是个函数**。反向验证实测：把
+   * `provider-credits.ts` 里 buddy 的 `afterClaim` **实现体**换成
+   * `Promise.resolve(undefined)`（字段仍在、类型仍对）⇒ **上面两条照样全绿**
+   * （71 passed），而成长中心已经**静默消失**。
+   *
+   * 同样地，下面「runTasks:true 时 afterClaim 被调用」那条也守不住 ——
+   * 它注入的是**本文件自己的桩** `afterClaim`，把生产实现整个换掉它也绿。
+   * 那是它该有的样子（它守的是**骨架有没有调这个接缝**），
+   * 但「**生产闭包里到底接了什么**」于是成了零覆盖。
+   *
+   * ## 判据：真跑生产闭包，看它有没有打到成长中心的上游端点
+   *
+   * 不注入任何 credits 表（走 `createProviderCredits()` 的真实返回），
+   * 取出 buddy 的 `afterClaim` 并**直接调用**，断言 `fetch` 收到了
+   * 成长任务列表端点之一。`Promise.resolve(undefined)` 那种空实现
+   * **一个请求都不会发** ⇒ 本条必红。
+   *
+   * ⚠️ 这里**刻意不驱动 `credits.claimAll`**：那条路要先过签到（会发签到请求）、
+   * 还要真凭据形状。直接调生产闭包更贴近「接线有没有接错」这个意图，
+   * 且不受签到侧变化影响。
+   */
+  it('★★★ 生产 afterClaim 闭包真的打到成长中心端点（空实现即红）', async () => {
+    applyOnce()
+    const afterClaim = runtimeOf('buddy')?.credits?.afterClaim
+    expect(afterClaim, 'buddy 必须有 afterClaim').toBeTypeOf('function')
+
+    const seen: string[] = []
+    vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+      seen.push(String(input))
+      // 空 body：`getGrowthJson` 会解析成失败并继续，本用例只关心**请求发出去了**。
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+
+    const entry = {
+      id: 'buddy-g-1', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_GROWTH',
+      nickname: 'g', enabled: true, refreshable: true,
+    } as never
+
+    await afterClaim!(
+      { access_token: 'AT-G', user_id: 'u-1' } as never,
+      entry,
+      { budgetMs: 5_000, roundDeadlineAt: undefined },
+      { resolveCredential: async () => undefined, warn: () => {}, accountPool: {} as never },
+    )
+
+    expect(
+      seen.some((url) => url.includes('/activity/growth/')),
+      '生产 afterClaim 没有打到成长中心端点 —— 成长中心静默消失了'
+      + `（实际请求：${seen.length === 0 ? '（一个都没发）' : seen.map((u) => new URL(u).pathname).join(', ')}）`,
+    ).toBe(true)
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

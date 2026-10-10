@@ -210,11 +210,11 @@ export interface BuddyProduct {
  *
  * 以下字段与既有常量重复，属**待删除的重复定义**（等后续参数化任务把
  * `src/buddy.ts` / `src/buddy-auth.ts` 改为从本模块取值后即可删除）：
- * - `platform: 'ide'`          ↔ `src/buddy.ts:24`  `PLATFORM`
- * - `productCode: 'codebuddy'` ↔ `src/buddy.ts:79`  `BUDDY_PRODUCT_CODE`
- * - `userAgent: 'CodeBuddyIDE/1.106.1'` ↔ `src/buddy.ts:77`  `BUDDY_USER_AGENT`
- * - `defaultCredentialRef: 'BUDDY_ACCESS_TOKEN'` ↔ `src/buddy-auth.ts:27`  `BUDDY_CREDENTIAL_REF`
- * - `endpoint`/`apiDomain`     ↔ `src/buddy.ts:20/86`  `API_ENDPOINT` / `API_DOMAIN`
+ * - `platform: 'ide'`          ↔ `src/buddy.ts`  `PLATFORM`
+ * - `productCode: 'codebuddy'` ↔ `src/buddy.ts`  `BUDDY_PRODUCT_CODE`
+ * - `userAgent: 'CodeBuddyIDE/1.106.1'` ↔ `src/buddy.ts`  `BUDDY_USER_AGENT`
+ * - `defaultCredentialRef: 'BUDDY_ACCESS_TOKEN'` ↔ `src/buddy-auth.ts`  `BUDDY_CREDENTIAL_REF`
+ * - `endpoint`/`apiDomain`     ↔ `src/buddy.ts`  `API_ENDPOINT` / `API_DOMAIN`
  *
  * 迁移完成前两处取值必须保持一致，改动需同步（见文件头「迁移关系」）。
  */
@@ -400,7 +400,7 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     // ⚠️ 档位取 5 档（issue IKJQSH）。本表是这两个模型的**唯一档位来源**：
     // 国际版 `/v3/config` 对它们**不下发 supportedEfforts**，只给一个单值
     // `reasoning: {effort:"high", summary:"auto"}`（即「固定 high、不提供选择」）。
-    // 而 `parseModelMeta`（src/buddy.ts:905）只认 `supportedEfforts` 数组与
+    // 而 `parseModelMeta`（src/buddy.ts）只认 `supportedEfforts` 数组与
     // `defaultEffort`，**不认识 `effort`** —— 故远端这个表态会被静默忽略，
     // 最终落到本表。写 `['high']` 意味着用户永远只有 high 可选，max 从未出现过。
     //

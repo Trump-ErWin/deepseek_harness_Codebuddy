@@ -135,18 +135,33 @@ describe('Qoder Jet Hub RPC 分支（src/jet-hub-rpc.ts）', () => {
     expect(harness.calls[1]?.ref).toBe('QODERCN_ACCOUNT_WIRE_CN')
   })
 
-  it('credits.balances 有 Qoder 同族分支（余额接口只需 Bearer，可用）', () => {
+  /**
+   * ⚠️ 2026-10-08（Task 11-B）：从**源码文本断言**改为 **registry 断言**。
+   *
+   * 原实现 `readFileSync('src/jet-hub-rpc.ts')` 后按 `case 'credits.balances'` …
+   * `case 'model.list'` 切片、再断言该段含 `isQoderFamily(req.provider)` 与
+   * `fetchQoderCreditBalance`。它的问题：
+   *
+   * 1. **依赖 `case` 边界与调用写法** —— 本 PR 的 Task 3 正是把余额分派收敛成查表，
+   *    这类切片断言在别处已因此红过多次（会被无关重构弄假失败）；
+   * 2. 它断言的是「实现里恰好有那串字符」，而它守的意图是
+   *    **「qoder 的余额能力登记为 true，且真的走它自己的上游端点」**。
+   *
+   * 现在断言**登记**（registry，与实现写法无关）：
+   * `qoder` / `qodercn` 的 `credits.balance` 都必须为 `true`。
+   *
+   * ⚠️ 行为侧由 `tests/unit/credits-runtime-parity.spec.ts` 的
+   * 「★ qoder 系不查表：注入的 qoder 实现不得生效（它只吃 QoderCredential）」守 ——
+   * 它**真调** `credits.balances`（provider=qoder），断言端点被接受、
+   * 且不落进共享积分表。协议解析细节由 `tests/unit/qoder-credits.spec.ts`
+   * 的 8 条守（请求路径 / 鉴权头 / 401 / 形状非法等）。故这里不重复。
+   */
+  it('qoder 系的余额能力登记为 true（余额接口只需 Bearer，可用）', () => {
     // 实测修正：Qoder 的余额端点 `/sash/api/v2/me/usage` 只需
     // Bearer + Cosy-ClientType（**不需要** WASM 签名），故余额能力为 true。
     // 早期误判「无积分端点」是因为只按 `/api/` 前缀搜索。
-    const code = codeOnly(rpc)
-    const creditsStart = code.indexOf("case 'credits.balances'")
-    const creditsEnd = code.indexOf("case 'model.list'")
-    expect(creditsStart).toBeGreaterThan(-1)
-    const creditsBlock = code.slice(creditsStart, creditsEnd)
-    // 重构后按同族注册表判定（`QODER.id` 字面量只出现在注册表里，见下面的 describe）。
-    expect(creditsBlock).toContain('isQoderFamily(req.provider)')
-    expect(creditsBlock).toContain('fetchQoderCreditBalance')
+    expect(descriptorOf(QODER.id)?.credits?.balance, 'qoder 应声明余额能力').toBe(true)
+    expect(descriptorOf(QODER_CN.id)?.credits?.balance, 'qodercn 应声明余额能力').toBe(true)
   })
 
   it('credits.claimAll 含 Qoder 同族分支（2026-09-21 抓包解出领取端点）', () => {
@@ -179,7 +194,10 @@ describe('QoderCN 宿主侧接线（src/index.ts）', () => {
   })
 
   it('用 QODER_CN 构造了第二个 QoderAuth 实例', () => {
-    // 服务名由 `${product.id}Auth` 派生 ⇒ 自动是 qoderCnAuth，不会与国际版撞名。
+    // 服务名由 `${product.id}Auth` 派生 ⇒ 自动是 `qodercnAuth`，不会与国际版撞名。
+    // ⚠️ 2026-10-08（Task 11-A）：此处曾写作 `qoderCnAuth`（驼峰）—— **那是错的**，
+    //    与 `src/qoder-auth.ts` 的类型声明同因（见那里的注释）。真实服务名由
+    //    product id `qodercn`（全小写、不带连字符）逐字拼出。
     expect(index).toContain('new QoderAuth(ctx, { product: QODER_CN })')
   })
 

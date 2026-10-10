@@ -495,7 +495,7 @@ function isContentRejection(body: string): boolean {
  *   「每次都拿最先选中的坏账号去撞」；
  * - 太长则把「其实已恢复」的账号白白锁死（服务端策略可能随时间/额度状态解除）；
  * - 30 分钟也限制了误伤窗口：标记**只随时间到期失效**（`getAvailableAccount`
- *   的判据是 `Date.now() >= resetAt`，见 `src/account-pool.ts:578`），
+ *   的判据是 `Date.now() >= resetAt`，见 `src/account-pool.ts`），
  *   所以时长直接等于「这个账号在该模型上被藏起来多久」。
  *   ⚠️ 别指望 `sweepExpiredRateLimits` 来清 —— 它在生产代码里**没有任何调用方**
  *   （只有 `account-pool.spec.ts` 用），到期完全靠上面那个时间比较。
@@ -536,7 +536,7 @@ const BUDDY_POLICY_BLOCK_COOLDOWN_MS = 30 * 60_000
  * UI 还会为这两个码额外弹全局额度 Toast。
  *
  * 取 `PERMISSION_DENIED` 与本仓库既有惯例一致 —— `cline-adapter.ts` 的地域限制
- * 分支就用的这个码，并配有专门用例断言「错误码不是 AUTH」（`cline-adapter.spec.ts:479`）。
+ * 分支就用的这个码，并配有专门用例断言「错误码不是 AUTH」（`cline-adapter.spec.ts`）。
  * 它同时**不在** harness 的 `DEFAULT_RETRYABLE_CODES`
  * （`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`）里：
  * 「这个账号被策略拦了」是确定性结论，交给 harness 白退避 5 次毫无意义 ——
@@ -586,7 +586,7 @@ export function policyBlockResetAtMs(nowMs: number): number {
  *
  * 它是账号池里**唯一**的「账号 × 模型暂时不可用」载体（`ProviderAccountEntry`
  * 只有 `模型id → 重置时间戳` 这一个映射，没有 reason / 级别字段），复用它的收益：
- * ① `getAvailableAccount` 的过滤天然生效（`account-pool.ts:577-578`）；
+ * ① `getAvailableAccount` 的过滤天然生效（`account-pool.ts`）；
  * ② UI 已有徽章与「重测 / 重置」两条人工解禁路径（`account-probe.ts`）。
  * 代价是徽章文案显示为「限额重置」而非「安全策略拦截」—— 已知取舍，见常量注释。
  *

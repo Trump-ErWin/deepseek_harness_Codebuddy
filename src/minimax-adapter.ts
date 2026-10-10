@@ -254,11 +254,11 @@ export class MinimaxAdapter extends LlmAdapter {
    * ⚠️ **必须同步返回数组，不能是 `async`**（真实缺陷，2026-09-29 修正）。
    *
    * 本插件 8 个既有适配器的 `listAllModels()` 全是同步返回 `readonly {...}[]`
-   * （见 `llm-adapter.ts:789`、`raccoon-adapter.ts:229` 等），
-   * `jet-hub-rpc.ts` 的接口（`:587` / `:641` 的 `ModelCatalogSource`）也是同步，
+   * （见 `llm-adapter.ts`、`raccoon-adapter.ts` 等），
+   * `jet-hub-rpc.ts` 的接口（`ModelCatalogSource` 的 `listModels` / `listAllModels`）也是同步，
    * 且两处消费者**都不 await**：
-   * - `:2041` `catalog = [...all]`
-   * - `:2125` `ids = all.map((model) => model.id)`
+   * - `catalog = [...all]`
+   * - `ids = all.map((model) => model.id)`
    *
    * 早期这里写成 `async`，返回的是 Promise —— Promise **不是** `undefined`，
    * 故两处都会走进 `all !== undefined` 分支并抛
@@ -269,7 +269,7 @@ export class MinimaxAdapter extends LlmAdapter {
    * （无调用方），一旦接线即爆发。
    *
    * ⚠️ 读缓存而非 `await loadModels()` 是**正确**的：RPC 路径在调用本方法**之前**
-   * 已先 `await llm.listModels(provider)`（`jet-hub-rpc.ts:2011`），
+   * 已先 `await llm.listModels(provider)`（`jet-hub-rpc.ts`），
    * 而 `listModels` 内部会 `await this.loadModels()` 落缓存。
    *
    * ⚠️ **2026-10-08 Task 7a**：本条同步契约**原样上移到共享骨架**
