@@ -66,6 +66,10 @@ import type { RaccoonCredential } from './raccoon.js'
 import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
 import { MINIMAX } from './minimax-product.js'
+// ⚠️ 只有本文件的 namespace 清单派生需要它（`registerProviderSettings` 的实参）。
+//    brief 原稿称「Task 1 已加过 `descriptorOf`，合并进同一行」，实测**没有** ——
+//    故只导入真正用到的 `PROVIDER_REGISTRY`，不留未使用导入。
+import { PROVIDER_REGISTRY } from './provider-registry.js'
 import type { MinimaxCredential } from './minimax.js'
 import { GeminiAuth } from './gemini-auth.js'
 import { registerGeminiLlm } from './gemini-adapter.js'
@@ -297,10 +301,22 @@ export function apply(ctx: Context): void {
   //
   // ⚠️ 2026-10-01 起各 provider 已**不再**声明为可配置 provider，故这批 namespace
   // 在模型设置页上已无消费者（详见该函数头的说明）。
+  // ⚠️ 2026-10-08 改：namespace 清单从 `PROVIDER_REGISTRY` 派生，不再手抄 13 个。
+  //    原先改 registry 的 `settingsNamespace` **行为完全不变**（宿主侧另有一份
+  //    13 个字面量的副本），是「唯一真相源」名不副实的一处。
+  //
+  // ⚠️ **顺序变了**：原清单是 `buddy, workbuddy, codearts, lobsterai, …`（人工排列），
+  //    派生后是 registry 的声明顺序（`codearts, buddy, workbuddy, …`）。
+  //    ⚠️ **这个顺序无关紧要**：`registerProviderSettings` 内部是 `for (const ns of …)`
+  //    逐个 `settings.register(ns, Config)`，注册顺序不影响 `describe()` 的语义
+  //    （它按 ns 查、不按序）。**但必须确认既有断言不断言顺序** ——
+  //    执行时 `rg -n "llm-buddy|llm-zcode|llm-codearts" tests/unit/` 核对；
+  //    若有断言依赖顺序，改为**集合相等**（`.sort()`）而不是保持原顺序。
   registerProviderSettings(
-    ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
-    'llm-qoder', 'llm-qodercn', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
-    'llm-minimax', 'llm-zcode', 'llm-gemini',
+    ctx,
+    ...PROVIDER_REGISTRY
+      .map((d) => d.settingsNamespace)
+      .filter((ns): ns is string => ns !== undefined),
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -2346,7 +2362,26 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     logger: { warn: (message) => ctx.logger?.warn?.(message) },
   }))
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters)
+  // ⚠️ **命名对象**（2026-10-08 改，原为 13 个位置参数）：位置参数下改顺序/插队
+  // 都会**静默错位**（症状是「某个 provider 用另一个 provider 的凭据续期」），
+  // 本仓库历史上因此复发 6 次。命名对象让错位在类型层面不可能，且新增 provider
+  // 只加一个键。
+  //
+  // ⚠️ **键是 provider id `qodercn`，值是变量 `qoderCn`** —— 两者不同名是刻意的：
+  // 键必须与 `entry.provider` 同形，否则按 id 取实例会落空（`authOf(auths, id)`，
+  // 见 `jet-hub-rpc.ts` 的 `JetHubAuths` 注释）。本地变量名沿用既有惯例。
+  // 写成 `qoderCn:` 会编译失败（接口没有该键），这正是我们要的。
+  //
+  // ⚠️ **分派现状（别把上一句读成已实现）**：`account.refresh` 目前仍走
+  // `switch (entry.provider)` + `requireQoderFamily`，**尚未**改成
+  // `authOf(auths, entry.provider)` 查表分派 —— 那是 Task 2 的改动。本次（Task 9）
+  // 只做了「位置参数 → 命名对象」这一步：`authOf` 已备好，但还没有调用点。
+  registerJetHubRpc(ctx, pool, {
+    codearts: service,
+    buddy, workbuddy, lobsterai, qoder,
+    qodercn: qoderCn,
+    trae, cline, loomy, raccoon, minimax, zcode, gemini,
+  }, modelAdapters)
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
   // 自行降级为日志，绝不会让插件 apply() 失败。
   mountOpenAiGateway(ctx, pool)

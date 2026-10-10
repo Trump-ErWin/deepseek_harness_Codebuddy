@@ -65,6 +65,7 @@ import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
 import { fetchGeminiCreditBalance } from './gemini-credits.js'
 import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
 import { LOBSTERAI } from './lobsterai-product.js'
+import { descriptorOf } from './provider-registry.js'
 import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
@@ -1025,32 +1026,75 @@ function providerIdsOf(
  * `inject`，因此在 headless / CLI profile 下本模块正常加载、只是不注册端点，
  * 而不是把整个插件树卡在 pending（那会让 profile 启动直接失败）。
  */
+/**
+ * 各 provider auth 实例在 JetHub 里被用到的**共同部分**。
+ *
+ * 只声明真正被用到的那一个方法（结构化类型），使 `authOf` 不必依赖 13 个具体类。
+ */
+export interface JetHubAuthLike {
+  refreshAccountCredential(refName: string, pool: AccountPool, accountId: string): Promise<void>
+}
+
+/**
+ * 各 provider 的 auth 实例（`registerJetHubRpc` 的命名对象形参）。
+ *
+ * ⚠️ **键必须是 provider id，不是变量名**：
+ * - provider id 是 `qodercn`（无连字符、全小写），而 `index.ts` 里的**变量名**
+ *   是 `qoderCn`。若键用变量名，`authOf(auths, 'qodercn')` 就**查不到**中国版
+ *   （键 `qoderCn` ≠ id `qodercn`），症状是「中国版账号续期报
+ *   `Unknown provider: qodercn`」—— 与本仓库历史上的 `workbuddy` 漏接是同一形态。
+ * - 键用 id 后，`account.refresh` 可以直接 `authOf(auths, entry.provider)` 分派。
+ *
+ * ⇒ 调用点写 `qodercn: qoderCn`（**键是 id、值是变量**），这是刻意的。
+ *
+ * ⚠️ **13 个字段都必须保留具体类型**（不要都改成 `JetHubAuthLike`）——
+ * 那会丢掉「13 个键必须都在」的类型检查，而「漏接一个 provider 就编译不过」
+ * 正是本次改名的核心价值。
+ */
+export interface JetHubAuths {
+  readonly codearts: CodeArtsAuth
+  readonly buddy: BuddyAuth
+  readonly workbuddy: BuddyAuth
+  readonly lobsterai: LobsteraiAuth
+  readonly qoder: QoderAuth
+  /** ⚠️ 键是 **provider id**（`qodercn`），值是 `index.ts` 里的 `qoderCn` 实例。 */
+  readonly qodercn: QoderAuth
+  readonly trae: TraeAuth
+  readonly cline: ClineAuth
+  readonly loomy: LoomyAuth
+  readonly raccoon: RaccoonAuth
+  readonly minimax: MinimaxAuth
+  readonly zcode: ZcodeAuth
+  readonly gemini: GeminiAuth
+}
+
+/**
+ * 按 provider id 取 auth 实例。
+ *
+ * ⚠️ **键是 provider id**（`qodercn`），不是变量名（`qoderCn`）——
+ * 这是 `JetHubAuths` 的接口约定（见其注释）。
+ *
+ * ⚠️ 用 `Object.hasOwn` 而非 `in`：`in` 会命中原型链上的键（如 `'constructor'`），
+ * 把 `entry.provider` 为怪值时误判成「有该 provider」。
+ */
+export function authOf(auths: JetHubAuths, provider: string): JetHubAuthLike | undefined {
+  if (!Object.hasOwn(auths, provider)) return undefined
+  return (auths as unknown as Record<string, JetHubAuthLike>)[provider]
+}
+
+/**
+ * ⚠️ 2026-10-08 改：13 个 provider 形参从**位置传参**改为**命名对象**（`auths`）。
+ *
+ * 原注释记录「历史上已因少传/插队错位复发 **6 次**」—— 位置参数天生有这个缺陷
+ *（改签名顺序、插一个新 provider 都会静默错位，而症状是「某个 provider 在用
+ * 另一个 provider 的凭据续期」）。命名对象让错位在**类型层面不可能**，
+ * 且新增 provider 只加一个键。
+ */
 export function registerJetHubRpc(
   ctx: Context,
   pool: AccountPool,
-  codearts: CodeArtsAuth,
-  buddy: BuddyAuth,
-  workbuddy: BuddyAuth,
-  lobsterai: LobsteraiAuth,
-  qoder: QoderAuth,
-  /** Qoder **中国版**实例（与 `qoder` 同协议、不同 product；RPC 分支按注册表分派）。 */
-  qoderCn: QoderAuth,
-  trae: TraeAuth,
-  cline: ClineAuth,
-  loomy: LoomyAuth,
-  raccoon: RaccoonAuth,
-  /** MiniMax Code **中国版**实例（OAuth 设备码 + PKCE，与 Qoder 同型但协议不同）。 */
-  minimax: MinimaxAuth,
-  zcode: ZcodeAuth,
-  /**
-   * Gemini（Google Cloud Code Assist 免费线）实例（本地回调 OAuth）。
-   *
-   * ⚠️ **必须排在最后一个 provider 形参位**（即 `zcode` 之后、`modelAdapters`
-   * 之前）：本仓库全部 `registerJetHubRpc` 调用点都是**位置传参**，历史上已因
-   * 少传/插队错位复发 6 次。新 provider 一律**追加**在末尾，既有的 14 个调用点
-   * 才不用逐个补占位。
-   */
-  gemini: GeminiAuth,
+  /** ⚠️ 命名对象，不是 13 个位置参数。键是 provider id（见 `JetHubAuths`）。 */
+  auths: JetHubAuths,
   /**
    * provider → 适配器实例（可选）。
    *
@@ -1061,10 +1105,7 @@ export function registerJetHubRpc(
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(
-      connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai,
-      qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters,
-    )
+    registerJetHubEndpoints(connectionCtx as Context, pool, auths, modelAdapters)
   })
 }
 
@@ -1213,21 +1254,22 @@ async function fullCatalogIds(
 function registerJetHubEndpoints(
   ctx: Context,
   pool: AccountPool,
-  codearts: CodeArtsAuth,
-  buddy: BuddyAuth,
-  workbuddy: BuddyAuth,
-  lobsterai: LobsteraiAuth,
-  qoder: QoderAuth,
-  qoderCn: QoderAuth,
-  trae: TraeAuth,
-  cline: ClineAuth,
-  loomy: LoomyAuth,
-  raccoon: RaccoonAuth,
-  minimax: MinimaxAuth,
-  zcode: ZcodeAuth,
-  gemini: GeminiAuth,
+  auths: JetHubAuths,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
+  // ⚠️ 解构一次，函数体其余部分**逐字不动** —— 这样本次改动的 diff 面最小，
+  //    评审能一眼看出「只是换了个入口」。
+  //
+  // ⚠️ **`qodercn` 必须重命名绑定**：`JetHubAuths` 的键是 provider id
+  //   （`qodercn`），而函数体内部一直用变量名 `qoderCn`。用 `qodercn: qoderCn`
+  //   把 id 键绑到本地名，**函数体一个字都不用改**。
+  //   ⚠️ 若写成 `qoderCn`（键=变量名）会**编译失败**（接口没有该键）——
+  //   那正是我们要的：键必须是 id，否则 `authOf(auths, provider)` 查不到中国版。
+  const {
+    codearts, buddy, workbuddy, lobsterai, qoder,
+    qodercn: qoderCn,
+    trae, cline, loomy, raccoon, minimax, zcode, gemini,
+  } = auths
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
   if (!connection || typeof connection.fetch?.register !== 'function') {
@@ -2597,8 +2639,12 @@ function registerJetHubEndpoints(
          *
          * Loomy 没有窗口概念（服务端直接给两个命名池）→ 不带该字段。
          */
-        const usesExpiryWindow = provider === CODEBUDDY.id || provider === WORKBUDDY.id
-          || provider === TRAE.id || provider === LOBSTERAI.id
+        // ⚠️ 2026-10-08 改：判据从四连 `||` 改为查 registry 的 `usesExpiryWindow`
+        //   —— 判据**本身不变**（仍是「是否按到期时间分桶」，**不是**「是不是 buddy」：
+        //   TRAE 与 LobsterAI 走同一套 `splitBuddyCreditsByExpiry`，同样受
+        //   `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 影响）。改的只是**取值来源**。
+        //   ⚠️ loomy 刻意不在此列：它没有窗口概念（服务端直接给两个命名池）。
+        const usesExpiryWindow = descriptorOf(provider)?.usesExpiryWindow === true
         const lockResponse = (): RpcPermanentLockResponse => ({
           provider,
           locked: pool.permanentLocked(provider),

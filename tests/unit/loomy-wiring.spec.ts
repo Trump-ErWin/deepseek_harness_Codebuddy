@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
+import { descriptorOf } from '../../src/provider-registry.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8')
@@ -67,8 +68,12 @@ describe('Loomy 在 index.ts 的接线', () => {
     expect(indexSource).toContain('const key = modelId ?? ')
   })
 
-  it('settings namespace 已注册', () => {
-    expect(indexSource).toMatch(/registerProviderSettings\([\s\S]*?'llm-loomy'/)
+  it('settings namespace 已声明（行为断言，2026-10-08 改）', () => {
+    // ⚠️ 2026-10-08 改：原先是扫 `src/index.ts` 源码文本找 `'llm-loomy'`。本次重构把
+    //    13 个字面量收敛成从 `PROVIDER_REGISTRY` 派生，字面量搬家 ⇒ 文本断言变红。
+    //    改为断言声明值；「index.ts 真的按它注册了」由
+    //    `provider-registry-consumers.spec.ts` 的 `apply()` 行为用例守。
+    expect(descriptorOf('loomy')?.settingsNamespace).toBe('llm-loomy')
   })
 
   it('加入批量续期调度', () => {
@@ -89,8 +94,11 @@ describe('Loomy 在 index.ts 的接线', () => {
   })
 
   it('registerJetHubRpc 传入了 loomy', () => {
-    // ⚠️ 断言到 `loomy` 与 `modelAdapters` 之间**不限定**具体参数 ——
-    // 每新增一个 provider 都会在这中间插一个实参（raccoon 即如此），
+    // ⚠️ 2026-10-08 改措辞：auth 实例已是**命名对象**（键是 provider id），
+    // 不再是位置参数 —— 故本断言现在的含义是「`loomy` 键在 auths 对象字面量里，
+    // 且该字面量位于 `modelAdapters` 之前」。
+    // ⚠️ 断言到 `loomy` 与 `modelAdapters` 之间**不限定**具体键 ——
+    // 每新增一个 provider 都会在这中间插一个键（raccoon 即如此），
     // 写死 `cline, loomy, modelAdapters` 会让每次新增 provider 都误报失败。
     expect(indexSource).toMatch(/registerJetHubRpc\([\s\S]*?loomy,[\s\S]*?modelAdapters\)/)
   })

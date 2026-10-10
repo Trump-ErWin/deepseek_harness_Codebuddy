@@ -9,8 +9,10 @@ const rpcSource = readFileSync(resolve(here, '../../src/jet-hub-rpc.ts'), 'utf8'
 /**
  * Raccoon 的 RPC 分派（源码级回归）。
  *
- * ⚠️ 为什么用源码扫描而不是实例化端点：`registerJetHubRpc` 的参数是**位置参数**
- * （12 个），在测试里逐个填替身既脆弱又与既有 `jet-hub-rpc.spec.ts` 的桩重复。
+ * ⚠️ 为什么用源码扫描而不是实例化端点：`registerJetHubRpc` 的 auths 是**命名对象**
+ * （13 个键，键是 provider id），在测试里逐个填替身既脆弱又与既有
+ * `jet-hub-rpc.spec.ts` 的桩重复。
+ * （2026-10-08 改措辞：此处原写「参数是**位置参数**（12 个）」，那是 Task 9 之前的形态。）
  * 本文件锁的是**语义约定**（哪个分支返回什么形状），那些约定一旦写错，
  * 表现为「UI 显示矛盾的数字」这类**单测容易漏掉**的问题。
  *

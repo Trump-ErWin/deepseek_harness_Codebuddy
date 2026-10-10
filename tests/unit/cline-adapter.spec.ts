@@ -15,6 +15,9 @@ import {
   readClineRequestHistory,
   resetClineRequestHistory,
 } from '../../src/cline-request-log.js'
+import { descriptorOf } from '../../src/provider-registry.js'
+import { PROVIDER_ICONS } from '../../plugin-src/client/provider-icons.js'
+import { CREDITS_CAPABILITIES } from '../../plugin-src/client/credits-capabilities.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -805,16 +808,23 @@ describe('Cline 接线（源码级回归）', () => {
     expect(source).toContain('cline.stop()')
     // Jet Hub「显示列表」需要适配器实例
     expect(source).toMatch(/cline: pruned\([^)]*,\s*clineAdapter\)/)
-    // ⚠️ 形参是**位置参数**，新增 provider 会插在 cline 与 modelAdapters 之间。
-    // 只断言「cline 在 modelAdapters 之前」，**不要**写死整串前缀
-    // —— 那会让每加一个 provider 都假失败（加 Loomy、Raccoon、QoderCN 时各踩一次）。
-    // 之前的正则把 `…lobsterai, qoder, trae, cline,` 整段写死了，与这条注释矛盾，
-    // 故改为只检查「cline 出现在 modelAdapters 之前」这一不变式。
+    // ⚠️ 2026-10-08 改措辞：`registerJetHubRpc` 的 auth 实例已从 13 个**位置
+    // 参数**改为**命名对象**（`auths`，键是 provider id），`modelAdapters` 是
+    // 紧随其后的**独立第 4 个形参**。故「cline 在 modelAdapters 之前」这条
+    // 不变式现在的含义是「`cline` 键在 auths 对象里」（而不是「排在第 N 个槽位」）。
+    // 只断言「cline 键存在、且对象字面量确实在 modelAdapters 之前」，
+    // **不要**写死整串前缀 —— 那会让每加一个 provider 都假失败（加 Loomy、
+    // Raccoon、QoderCN 时各踩一次）。之前的正则把
+    // `…lobsterai, qoder, trae, cline,` 整段写死了，与这条注释矛盾。
     expect(source).toMatch(
       /registerJetHubRpc\([\s\S]*?cline,[\s\S]*?modelAdapters\)/,
     )
     // 老契约下的 settings namespace
-    expect(source).toContain("'llm-cline'")
+    // ⚠️ 2026-10-08 改：原先扫 index.ts 源码文本找 `'llm-cline'`。本次重构把 13 个
+    //    字面量收敛成从 `PROVIDER_REGISTRY` 派生 ⇒ 文本断言变红而行为没变。
+    //    改为断言声明值；「index.ts 真的按它注册了」由
+    //    `provider-registry-consumers.spec.ts` 的 `apply()` 行为用例守。
+    expect(descriptorOf('cline')?.settingsNamespace).toBe('llm-cline')
   })
 
   it('jet-hub-rpc.ts 为 cline 接上登录、续期与余额三个分派点', () => {
@@ -829,9 +839,11 @@ describe('Cline 接线（源码级回归）', () => {
   })
 
   it('客户端 PROVIDERS 含 cline 且有图标', () => {
-    const source = read('plugin-src/client/jet-hub.js')
-    expect(source).toMatch(/\{\s*id:\s*'cline',\s*label:\s*'Cline'/)
-    expect(source).toContain('const CLINE_ICON')
+    // ⚠️ 2026-10-08 改：`PROVIDERS` 由 `src/provider-registry.ts` 派生、
+    // 图标常量已抽到纯数据模块 `provider-icons.js`，故改为**行为断言**
+    //（原先扫 `jet-hub.js` 的 `{ id: 'cline', label: 'Cline'` 文本）。
+    expect(descriptorOf('cline')?.label).toBe('Cline')
+    expect(PROVIDER_ICONS.cline).toMatch(/^data:image\/png;base64,/)
   })
 
   /**
@@ -1116,13 +1128,14 @@ describe('Cline 接线（源码级回归）', () => {
   })
 
   it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {
-    const source = read('plugin-src/client/credits-capabilities.js')
-    const entry = /cline:\s*Object\.freeze\(\{([^}]*)\}\)/.exec(source)
-    expect(entry, '未找到 cline 的能力登记').not.toBeNull()
-    const body = entry![1]!
-    expect(body).toMatch(/balance:\s*true/)
-    expect(body).toMatch(/dailyCheckin:\s*false/)
-    expect(body).toMatch(/subscriptionQuota:\s*true/)
+    // ⚠️ 2026-10-08 改：能力表由 registry 派生，故改为**行为断言**
+    //（原先正则扫 `credits-capabilities.js` 的 `cline: Object.freeze({…})` 文本）。
+    expect(descriptorOf('cline')?.credits).toEqual({
+      balance: true, dailyCheckin: false, subscriptionQuota: true,
+    })
+    expect(CREDITS_CAPABILITIES.cline).toEqual({
+      balance: true, dailyCheckin: false, subscriptionQuota: true,
+    })
   })
 })
 

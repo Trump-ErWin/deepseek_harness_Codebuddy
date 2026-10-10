@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { MINIMAX } from '../../src/minimax-product.js'
+import { descriptorOf } from '../../src/provider-registry.js'
+import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
 
 /**
  * Task 6（接线）的回归防线。
@@ -43,8 +45,11 @@ describe('接线点完整性（源码断言）', () => {
   it('⚠️ index.ts 六处接线点齐全', () => {
     // 1. import MinimaxAuth
     expect(indexSource).toContain("from './minimax-auth.js'")
-    // 2. registerProviderSettings 的 namespace
-    expect(indexSource).toContain("'llm-minimax'")
+    // 2. settings namespace：⚠️ 2026-10-08 改。原先扫 index.ts 文本找 `'llm-minimax'`，
+    //    本次重构把 13 个字面量收敛成从 `PROVIDER_REGISTRY` 派生 ⇒ 文本断言变红。
+    //    改为断言声明值；「真的按它注册了」由 `provider-registry-consumers.spec.ts`
+    //    的 `apply()` 行为用例守。
+    expect(descriptorOf('minimax')?.settingsNamespace).toBe('llm-minimax')
     // 3. 服务实例 + 适配器注册
     expect(indexSource).toContain('new MinimaxAuth(ctx)')
     expect(indexSource).toContain('registerMinimaxLlm(ctx, {')
@@ -52,9 +57,26 @@ describe('接线点完整性（源码断言）', () => {
     expect(indexSource).toContain("['minimax', (p) => minimax.refreshAll(p)]")
     // 5. modelAdapters 登记
     expect(indexSource).toMatch(/minimax: pruned\([^)]*,\s*minimaxAdapter\)/)
-    // 6. registerJetHubRpc 实参（⚠️ 2026-09-30 合并后 zcode 排在 minimax 之后；
-    //    2026-10-03 加 gemini 时按「新 provider 追加在末尾」的惯例排在 zcode 之后）
-    expect(indexSource).toMatch(/loomy, raccoon, minimax, zcode, gemini, modelAdapters/)
+    // 6. registerJetHubRpc 实参
+    // ⚠️ 2026-10-08 改：原先这里断言**位置参数**的尾部顺序
+    //    `/loomy, raccoon, minimax, zcode, gemini, modelAdapters/`。
+    //    13 个形参改成**命名对象**后必然变红，而它守的意图（minimax 接上了）
+    //    **与位置无关**。⇒ 改为断言**键存在**（键是 provider id）；
+    //    「端到端分派真的落到 minimax 实例上」由行为用例守：
+    //    `tests/unit/jet-hub-rpc-auth-wiring.spec.ts` 的
+    //    「★★ 每个 provider id 的续期都分派到自己的 auth 实例」。
+    //
+    // ⚠️⚠️ **2026-10-08 复审 Finding 2：这里曾写成相邻性正则**
+    //    `/\bminimax,\s*zcode,\s*gemini,/` —— 命名对象下**键的相邻关系零语义**：
+    //    把这三个键重排成 `… zcode, gemini, minimax,`（逐字节等价的语义）会让它
+    //    **假失败**，在中间插入任何新键同样假失败。⇒ 改为按 **AST** 取调用点
+    //    第三个实参的属性名（见 `tests/helpers/jet-hub-auths.ts`）后断言键存在：
+    //    重排 / 插键 / 换行 / 注释都不可能影响它，而**键真的漏了必然变红**。
+    const authKeys = jetHubAuthsCallKeys(indexSource)
+    expect(
+      Object.keys(authKeys),
+      'minimax 必须出现在 registerJetHubRpc 的 auths 命名对象里（键 = provider id）',
+    ).toContain('minimax')
   })
 
   it('⚠️ index.ts 的 refresh 回调必须用两层结构（available.entry.*）', () => {
