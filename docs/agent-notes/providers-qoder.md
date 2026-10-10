@@ -67,3 +67,63 @@ allowBuilds 判定，不换 commit 会得到假的"成功"）：
 2. **README「方式一」的放行键必须按 pnpm 大版本分别给出**，不能把某一代的写法写成通用解。
    唯一跨版本可用的是 `dangerouslyAllowAllBuilds: true`（代价：放行该 profile 里所有依赖的
    构建脚本）。改完请照上表重跑一遍验证 —— 尤其**要换新 commit**，否则缓存会骗你。
+
+## ⚠️ 额度类业务码**不是一个值，是一条链** —— 只认 `110` 会让换号静默失效（Issue IKKJFH）
+
+**用户报障**（2026-10-10，Gitee issue IKKJFH，provider `qoder` 国内版）：
+
+```
+本轮运行失败  qoder: {"pricingUrl":"https://qoder.com.cn/pricing?client=qoder"} (112/model_error)
+模型请求重试已取消 (2/5)
+```
+
+观感是**「轮换没生效」**：白退避、重试计数走到 2/5，期间**既没换号也没换 provider**。
+
+**根因**：`src/model-queue.ts` 的额度判据原先**只认单码值 `110`**，
+`isBillingBusinessCode('112')` 为 false，文案兜底 `looksLikeBillingError` 也不含
+`pricingUrl` ⇒ 三个判据全 false ⇒ 落 `SERVER` ⇒
+
+1. `SERVER` **在** harness 的 `DEFAULT_RETRYABLE_CODES` 里 ⇒ **白退避 5 次**；
+2. `qoder-adapter.isQuotaExceededError(SERVER) = false` ⇒ `switchAccountOnQuota`
+   **永不被调用** ⇒ **既不换号、也不换 provider**。
+
+⚠️ 这与 2026-09-27 那次 `110` 缺陷**完全同型，只是换了码值**。
+
+### 两条判据腿**必须同时在**，缺一条下次换码值就复发
+
+- **码值腿**：`BILLING_BUSINESS_CODES = ['110', '112']`
+  （`BILLING_BUSINESS_CODE` 保留为单值再导出，仅为对外 API 兼容，**判据别用它**）；
+- **文案腿**：`looksLikeBillingError` 增认结构字段 `"pricingUrl"\s*:`。
+
+⚠️ **`pricingUrl` 是窄词**：它是该错误报文的**结构字段名**，不是自然语言。
+判据是**认结构字段，不认主题词** —— 实测 `balance` / `quota` / 正常讨论 pricing 的正文
+都不含这个键名，故不会误伤（单测有反向断言锁住）。
+
+### ⚠️ 证据强度（如实标注，别当成客户端产物实证）
+
+`110` 当年的取证是**读客户端 obf 产物原文**（`billing_error → permission`）。
+`112` **没有**那份证据：本机未装 Qoder 客户端 ⇒ 无产物可读；上游全历史搜
+`pricingUrl` **零命中**。现有依据是**报文语义**（定价页链接 = 付费才能用）＋
+**兄弟码同类**。若哪天能拿到客户端产物，欢迎修正 `112` 的语义。
+
+### 反向验证（四条各自独立，别当同义反复删掉）
+
+| 变异 | 变红用例 |
+|---|---|
+| 集合改回 `['110']` | 纯函数「110 与 112 都算额度」 |
+| 正则撤掉 `"pricingUrl"` | 「pricingUrl 报文算额度」＋「无业务码只有 pricingUrl 文案」 |
+| **源码整体回退到修复前** | **6 条**（含行为用例「112 同样触发换号」） |
+
+⚠️ 「归 `QUOTA_EXCEEDED`」与「真的切了号」是**两件事** ——
+`switchAccountOnQuota` 在无池/无候选时会返回 `undefined` 而码仍然正确。
+故 `112` 必须有一条**走完整行为链**的用例（标记 → 取号传 tried → 换号重发 → 拿到内容），
+只断言错误码会漏掉 issue 现象的另一半。
+
+### 顺带记录：`qoder-adapter.ts` 的 `isBillingBusinessCode(response.status)` **恒 false**
+
+HTTP 分支那条判据（`src/qoder-adapter.ts:809` 附近）把 **HTTP 状态码**传给了判**业务码**的
+函数 —— 两者是不同命名空间（业务码是 `110`/`112`，状态码是 `2xx/4xx/5xx`），
+实测 `200/400/401/403/429/500/502` 逐个喂进去**全部 false**（`110`→true）。
+该分支实际只靠右边的 `looksLikeBillingError(errorText)` 兜住。
+**本次未改**（不在 IKKJFH 范围内）：注释里写明是「为服务端将来改用 HTTP 状态码下发而预留」，
+是否要补「从 body 里解析业务码」那条腿属独立决策，交维护者判断。
