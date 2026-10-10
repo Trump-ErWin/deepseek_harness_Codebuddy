@@ -9,11 +9,28 @@
  *
  * ⚠️ 判据是**行为**（驱动派生函数），**不读源码文本** —— 初稿用
  * `readFileSync` + 正则扫那 13 行字面量，已被 pre-flight 纠正。
+ *
+ * ## `modelAdapters` 的键集合：为什么还留一条源码文本断言
+ *
+ * `modelAdapters` 是 `apply()` 内的**局部变量**（值是适配器实例，注册表里放的是
+ * auth 实例，故 plan Task 10 Step 6 明确要求**保留该字面量**）。它的键集合守卫有两条：
+ *
+ * 1. 用例 ⑦（**源码文本**，剥注释后提键）—— 唯一能捕捉**多余键**的手段：
+ *    `EXTRA_KEYS` 之外多一个键，行为侧无从察觉（`provider.status` 只会多返回一行）；
+ * 2. 用例 ⑧（**行为**，真跑 `apply()` 后驱动 `provider.status`）—— 捕捉**漏键**，
+ *    且失败信息直接指向是哪个 id 取不到目录。
+ *
+ * ⇒ 这是本 PR 刻意保留的**一处**源码文本断言：它守的方向（多余的键）**没有**
+ * 行为等价物。Task 11-B 清理的是「有行为等价物却仍读源码」的那些，不是这一类。
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 
+import { Context } from '@deepseek-ai/cordis'
+
+import { apply } from '../../src/index.js'
+import { JET_HUB_API_PATH } from '../../src/jet-hub-rpc.js'
 import { descriptorOf, PROVIDER_REGISTRY } from '../../src/provider-registry.js'
 import {
   clearProviderRuntimes,
@@ -159,5 +176,89 @@ describe('modelAdapters 的键集合守卫（行为断言）', () => {
         `${id} 在 EXTRA_KEYS 里却有 channel: true —— 应从例外名单删掉`,
       ).not.toBe(true)
     }
+  })
+
+  /**
+   * ⑧ **行为断言**：真跑一次 `apply()`，再从 `provider.status` 侧确认
+   * **registry 里每个 channel 都能取到自己的目录**。
+   *
+   * ## 为什么在 ⑦ 之外还要这一条
+   *
+   * ⑦ 是**源码文本**断言（剥注释后从 `src/index.ts` 提键）。它能捕捉「多余的键」，
+   * 但**读的是文本而不是行为** —— 一旦 `modelAdapters` 的写法换成别的形态
+   * （改名、改成派生、把 `pruned(...)` 换成变量），⑦ 会**假失败**，
+   * 而那正是本仓库花了一整个 Task 11-B 在清理的形态。
+   *
+   * 本用例走**公开路径**：`apply()` → RPC 端点 → `provider.status`
+   * （该端点内部读 `modelAdapters[provider].listAllModels()`）。失败信息直接指向
+   * 是哪个 id 拿不到目录，**与实现写法无关**。
+   *
+   * ⚠️ **漏键的真实症状**（`provider.status` 的 `closed` 判据是
+   * `total > 0 && disabled === total`）：漏键 ⇒ `total` 恒为 0 ⇒ `closed` 恒 false
+   * ⇒ 用户在设置页关掉整个 provider 后，它**显示为未关闭**，且模型仍可选。
+   *
+   * ⚠️ 本用例**刻意不**断言具体目录条数：那是各家上游的快照，会随目录更新腐坏
+   * （本仓库已有多次「注释里的条数腐坏」教训）。这里只断言**非空**。
+   */
+  it('⑧ 真跑 `apply()` 后，registry 的每个 channel 都能从 `provider.status` 取到目录', async () => {
+    clearProviderRuntimes()
+    const ctx = new Context()
+    ctx.provide('credentials', {
+      resolve: async () => undefined,
+      describe: async () => ({ configured: false, writable: true }),
+      set: async () => {},
+      unset: async () => {},
+    } as never)
+    ctx.provide('commands', { register: () => () => {}, definitions: [] } as never)
+    ctx.provide('llm', {
+      registerConfigurableProviders: () => ({ replace() {} }),
+      registerAdapter: () => ({ replace() {} }),
+      listModels: async () => [],
+    } as never)
+    // ⚠️ 桩要带 `register`：`createJetHubStore` 据此选 `SettingsStore` 老契约后端，
+    //    读的是 `scope.get()` 的内存对象（同 `jet-hub-rpc-auth-wiring.spec.ts`）。
+    const state = { value: { accounts: [], disabledModels: {} } }
+    ctx.provide('settings', {
+      register() { return { get: () => state.value, replace: (v: unknown) => { state.value = v } } },
+      describe() { return [] },
+    } as never)
+    let handler: ((req: Request) => Promise<Response>) | undefined
+    ctx.provide('connection', {
+      fetch: {
+        register: (spec: { path: string; fetch: (req: Request) => Promise<Response> }) => {
+          if (spec.path === JET_HUB_API_PATH) handler = spec.fetch
+        },
+      },
+    } as never)
+
+    apply(ctx)
+    // ⚠️ `registerJetHubRpc` 用 `ctx.inject(['connection'], …)` 惰性注册端点，
+    //    cordis 在**微任务**里才解析依赖 ⇒ 不让出一轮，`handler` 仍是 undefined。
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(handler, 'jet-hub RPC 端点未注册').toBeDefined()
+
+    const channelIds = PROVIDER_REGISTRY.filter((d) => d.channel).map((d) => d.id).sort()
+    const res = await handler!(new Request('http://localhost/api/jet-hub', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: 'r-status',
+        method: 'jet-hub',
+        payload: { method: 'provider.status', payload: { providers: channelIds } },
+      }),
+    }))
+    const body = await res.json() as {
+      result: { ok: boolean; value: { statuses: Record<string, { models: { total: number } }> } }
+    }
+
+    expect(body.result.ok, `provider.status 失败：${JSON.stringify(body.result)}`).toBe(true)
+    const missing = channelIds.filter((id) => (body.result.value.statuses[id]?.models.total ?? 0) === 0)
+    expect(
+      missing,
+      '`modelAdapters` 漏了这些 channel 的键（它们的目录取不到 ⇒ provider.status 报 total=0 '
+      + '⇒ 用户在设置页关闭整个 provider 后它显示为「未关闭」且模型仍可选）：'
+      + missing.join(', '),
+    ).toEqual([])
   })
 })
