@@ -178,7 +178,7 @@ describe('★ WIRED_EXPIRY_PROVIDERS：未接入渠道必须被剔除、已接�
     expect(await probe('not-a-channel')).toBe(-1)
   })
 
-  it('★ 清单里的每个渠道都**真的走过了折算路径**（逐条遍历，不再同义反复）', async () => {
+  it('★ 清单里的每个渠道都**真的走过了折算入口**（读了目录、未在短路处返回；**不测折算本身**）', async () => {
     // ⚠️ 补上「清单里的每个渠道都能折算」这个意图的**真实覆盖**（原用例只是
     //    标题那么写、实际没遍历）。判据：用一个「有可用账号」的池喂进去，
     //    每个清单渠道都必须**产生一次目录读取**（`firstModelIdOf` 被调用）——
@@ -197,6 +197,12 @@ describe('★ WIRED_EXPIRY_PROVIDERS：未接入渠道必须被剔除、已接�
         disabledModelsFor: () => new Set<string>(),
         // 目录读取后返回空账号池，避免单测继续触发各 provider 的真实额度接口。
         // 本用例只验证每个接入渠道都会读取目录，不测试额度折算本身。
+        // ⚠️ 这是**规避而非修复**（2026-10-12 审计登记）：出网根因**仍在** ——
+        //    任何人再把「形状正确的凭据」喂进来（历史上就是
+        //    `credential: { access_token: 'x' }`），各 provider 就会去**真实额度接口**。
+        //    彻底修法是在本用例里给全局 `fetch` 打桩并**断言调用 0 次**，
+        //    那样「未来某家新增取额度调用」也会立刻变红。用例名已随之修正
+        //    （原先是「真的走过了折算路径」，与断言不符）。
         listAvailableCredentials: async () => [],
       } as never, async (p: string) => { probed.push(p); return 'm1' })
       await probe(provider).catch(() => undefined)

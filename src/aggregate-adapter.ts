@@ -749,7 +749,22 @@ export class AggregateAdapter extends LlmAdapter {
    *
    * ⚠️ 用字面量而非 import 各 `product.ts` 的常量：那要引入 12 个模块，显著加重本文件
    * 的依赖；而这些 id 是**稳定契约**（`index.ts` 的 `modelAdapters` 表同样用字面量）。
-   * 新增 provider 时**两处都要加**（与 `modelAdapters` 同一约定）。
+   * 新增 provider 时**两处都要加**。
+   *
+   * ## ⚠️ 本清单**有守卫**（2026-10-12 补）
+   *
+   * 原先本行写的是「（与 `modelAdapters` 同一约定）」—— 那句是**误导**：`modelAdapters`
+   * 当时已有两条守卫（源码文本抓多余键 + 行为抓漏键），而**本数组一条都没有**。
+   * 实测（对抗性审计）：从本数组删掉 `'gemini'` 后全量测试**依然全绿**，而线上后果是
+   * 该渠道的模型**永不进聚合目录**、用户看不到、`auto` 也不用，**无报错无日志**。
+   *
+   * 现由 `tests/unit/aggregate-adapter.spec.ts` 的
+   * 「★★ 聚合渠道白名单与 registry 对齐」守：它用 `listModels` 的**调用记录**反推本
+   * 数组（该常量是私有的，行为路径才拿得到），与 `PROVIDER_REGISTRY.filter(d => d.channel)`
+   * 做**集合**比对，漏一家即红并点名。
+   * ⚠️ 判据是**集合**不是有序：本数组与 registry 的尾部顺序**本来就不同**
+   *（本数组 `… gemini, zcode, opencode`，registry `… zcode, opencode, gemini`），
+   * 故不能要求有序相等；顺序本身在本数组内有语义，由下面的排列体现。
    */
   private static readonly AGGREGATE_CHANNELS: readonly string[] = Object.freeze([
     'codearts',

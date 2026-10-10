@@ -370,7 +370,13 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
  * 用户点了会拿到「没有探测适配器」。
  */
 describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守卫）', () => {
-  /** 由文件里的写点反推 provider（**明确登记**，改动写点时必须同步）。 */
+  /**
+   * 由文件里的写点反推 provider（**明确登记**，改动写点时必须同步）。
+   *
+   * ⚠️ `providers` 留 `[]` 表示「**该文件不写限流标记**」—— 这是一个**被验证的声明**
+   * （见下面「登记为不写标记的文件确实没有写点」那条用例），不是偷懒的占位。
+   * 将来该文件真的加了写点，那条用例会红并要求填上 provider。
+   */
   const WRITE_SITE_FILES: ReadonlyArray<readonly [string, readonly string[]]> = [
     ['buddy-adapter.ts', ['buddy', 'workbuddy']],
     ['lobsterai-adapter.ts', ['lobsterai']],
@@ -385,16 +391,49 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     // opencode 的写点是**注入式**的：`index.ts` 把 `markLimited` 传给
     // `registerOpencodeLlm`，适配器内部 3 处调它（不是自己调 `updateModelRateLimit`）。
     ['opencode-adapter.ts', ['opencode']],
+    // ↓ 实测不写标记的三个（登记它们是为了让「每个 *-adapter.ts 都要登记」成立）。
+    ['aggregate-adapter.ts', []],
+    ['auto-adapter.ts', []],
+    ['minimax-adapter.ts', []],
   ]
+
+  /**
+   * ⚠️ 写点判据：**先剥注释**，再匹配**调用形**。
+   *
+   * 原先的实现是 `/markLimited|updateModelRateLimit\(/.test(text)` —— 有**两个**漏洞
+   * （2026-10-12 对抗性审计实测）：
+   *
+   * 1. **纯存在性**：**注释**或**类型声明**里出现 `markLimited` 即可满足 ⇒
+   *    删掉全部真实调用（只留类型声明）仍判「有写点」⇒ 守卫不红。实测
+   *    `opencode-adapter.ts` 的类型声明 `markLimited?: (slotId…) => …` 单独即可命中。
+   * 2. **不剥注释**：本仓确实有注释里写 `updateModelRateLimit(...)` 的先例
+   *    （`trae-errors.ts`、`index.ts`），实测 `cline-adapter.ts` 的注释里也有
+   *    `markLimited` ⇒ 删掉调用照样命中。
+   *
+   * ⇒ 现改为：剥注释 → 匹配**调用形**（`.markLimited?.(` 注入式调用 /
+   * `await markLimited(` 本地包装的调用点 / `updateModelRateLimit(` 直接调用）。
+   *
+   * ⚠️ **残余缺口（如实登记，正则判不了）**：若某文件用一个**本地包装函数**
+   * （如 cline 的 `markLimited`），而它的**定义体**里调 `updateModelRateLimit`，
+   * 那么把**所有调用点**删掉后判据**仍会命中定义体** ⇒ 不红。实测
+   * `cline-adapter.ts` 正是此形态（定义体在 L763 调 `updateModelRateLimit`，
+   * 另有 2 处 `await markLimited()`）。
+   * 判「那段代码是否可达」需要**控制流分析**，不是正则能做到的。
+   * ⇒ 这条缺口应由**行为用例**兜（真实 adapter + 限流响应 + 断言池被写入）。
+   */
+  const WRITE_SITE_PATTERN = /\.markLimited\?\.\(|await\s+markLimited\(|updateModelRateLimit\(/
+
+  /** 剥掉块注释与行注释（避免「注释满足正则」的假绿）。 */
+  const stripComments = (text: string): string =>
+    text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
 
   it('会写 modelRateLimits 的家 == 硬编码清单（漏一家即红）', () => {
     // ⚠️ 这是**派生**而不是「断言源码含某字符串」：扫出来的集合与清单**双向**比对。
     // 有人加了写点却忘更新清单 ⇒ 左侧多出 ⇒ 红；清单写了不存在的家 ⇒ 右侧多出 ⇒ 红。
     const derived = new Set<string>()
     for (const [file, providers] of WRITE_SITE_FILES) {
-      const text = readFileSync(new URL(`../../src/${file}`, import.meta.url), 'utf8')
-      const hasWrite = /markLimited|updateModelRateLimit\(/.test(text)
-      if (hasWrite) for (const p of providers) derived.add(p)
+      const text = stripComments(readFileSync(new URL(`../../src/${file}`, import.meta.url), 'utf8'))
+      if (WRITE_SITE_PATTERN.test(text)) for (const p of providers) derived.add(p)
     }
     expect(
       [...derived].sort(),
@@ -402,6 +441,51 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
       + '左侧多出 = 该家会写标记却没进清单（probe 守卫会漏判它），'
       + '右侧多出 = 清单里写了一家已经不写标记的',
     ).toEqual([...WRITES_RATE_LIMIT_PROVIDERS].sort())
+  })
+
+  /**
+   * ★★ 清单必须覆盖 `src/` 下**全部** `*-adapter.ts`。
+   *
+   * ## ⚠️ 为什么需要这一条（真实缺口，2026-10-12 审计 + 变异实测）
+   *
+   * 上一条用例只能发现「**已登记文件**里的写点变化」。若新增 provider 并带自己的
+   * `foo-adapter.ts`（含写点）而**两处清单都忘了加**，则 `derived` 与
+   * `WRITES_RATE_LIMIT_PROVIDERS` **两侧同时缺失** ⇒ 等式仍成立 ⇒ **全绿**。
+   * 实测：新建含 `updateModelRateLimit(` 的 `src/foo-adapter.ts` 且不登记任何清单，
+   * 该 spec **12 passed 全绿**。
+   *
+   * ⇒ 把「**文件维度**」纳入判据：清单必须覆盖 `src/` 下的全部 `*-adapter.ts`。
+   * 失败方向因此变成**安全**的一侧：忘登记 ⇒ 红。
+   */
+  it('★★ src 下每个 *-adapter.ts 都在 WRITE_SITE_FILES 里（新文件漏登记即红）', async () => {
+    const { readdirSync } = await import('node:fs')
+    const files = readdirSync(new URL('../../src/', import.meta.url))
+      .filter((name) => name.endsWith('-adapter.ts'))
+      .sort()
+    expect(
+      files,
+      '有 adapter 文件没登记进 WRITE_SITE_FILES：新增 provider 时若两处清单都忘，'
+      + '上面那条用例两侧同时缺失、会**静默通过**。'
+      + '请登记它 —— 若它确实不写限流标记，就把 providers 留空（那是一个会被验证的声明）。',
+    ).toEqual(WRITE_SITE_FILES.map(([file]) => file).sort())
+  })
+
+  /**
+   * ★ 登记为「不写标记」（`providers` 为空）的文件，**必须真的没有写点**。
+   *
+   * 否则「空 providers」会变成新的盲区：将来给 minimax 加了写点，上一条用例仍绿
+   *（文件已登记），而第一条用例也仍绿（providers 为空 ⇒ 不进 derived）。
+   */
+  it('★ 登记为「不写标记」的 adapter 确实没有写点', () => {
+    for (const [file, providers] of WRITE_SITE_FILES) {
+      if (providers.length > 0) continue
+      const text = stripComments(readFileSync(new URL(`../../src/${file}`, import.meta.url), 'utf8'))
+      expect(
+        WRITE_SITE_PATTERN.test(text),
+        `${file} 登记为「不写标记」，但剥注释后源码里有写点调用 —— `
+        + '请把它的 provider 填进 WRITE_SITE_FILES 并同步 WRITES_RATE_LIMIT_PROVIDERS',
+      ).toBe(false)
+    }
   })
 
   it('probeById 恰好登记「会写标记 − PROBE_EXEMPT」的那些家', () => {
