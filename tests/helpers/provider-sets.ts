@@ -183,34 +183,49 @@ export function expectedProviderIdsInCreditsTable(): string[] {
  *
  * 实测：**会写标记的共 13 家**（buddy / workbuddy / lobsterai / qoder /
  * qodercn / cline / zcode / trae / gemini / codearts / loomy / raccoon /
- * opencode）。`src/index.ts` 的 `probeById` 登记其中 **12 家** ⇒
- * 本表必须**恰好列出剩下的那 1 家**，否则
- * `tests/unit/probe-wiring.spec.ts` 会点名变红。
+ * opencode）。`src/index.ts` 的 `probeById` 现已登记**全部 13 家** ⇒
+ * **本表当前为空**（见 {@link PROBE_EXEMPT}）。
  *
- * ## 为什么 `opencode` 拿不到探测材料（逐条实测，不是猜测）
- *
- * `ProbeDeps` / `createProbeAdapter(refName, credential)` 只给**一个账号的凭据**，
- * 而 `OpencodeAdapter` 的构造需要的是 `identitySlots: () => Promise<readonly
- * IdentitySlot[]>`（整个槽序列）+ `fetchRemoteCatalog` + `disabledModels` ——
- * 尤其 `markLimited` 的 `slotId` 语义是**池条目 id**，与探测入参的
- * `refName`（凭据 ref）不是同一个键空间。探测路径刻意不传 `accountPool`
- *（见 `probeWithAdapter` 的注释），故**无法**在探测时重建槽序列。
- * ⇒ 补它需要给 `ProbeDeps` 加一条池透传通道，属**接口扩张**，不在 Task 8 范围内。
- *
- * ⚠️ **这是一个登记在案的缺口，不是「它不需要」**：`opencode` 没有
+ * ⚠️ **`opencode` 曾在这里，那条豁免理由是错的**（2026-10-08 第二轮实测证伪，
+ * 逐条反驳写在该常量自己的文档里）。教训与本仓库其它几次同型缺陷一致：
+ * **「拿不到材料」必须写成可复现的核对步骤**，只写结论就会把「漏挂」
+ * 长期伪装成「不需要」。当时该缺口是**用户可见**的 —— `opencode` 没有
  * `rateLimit: false` 豁免 ⇒ 客户端「重测」按钮**会渲染**（门控是
- * `supportsRateLimit`，缺省 `true`）⇒ 用户点了会拿到
- * 「`opencode` 没有探测适配器」的错误。
- * **原注释把这件事写成「opencode 不写标记，故不需要 probe」，是事实错误**
- *（2026-10-08 独立复审实测证伪），本表存在的意义就是把它记为缺口而非豁免。
+ * `supportsRateLimit`，缺省 `true`）⇒ 用户点了必报「没有探测适配器」。
+ *
+ * ## 当前为空 —— 且这是**修好之后**的状态，不是「从来如此」
+ *
+ * 此前这里登记着 `opencode`，理由写的是「探测入参只有一个账号的凭据，而它的
+ * 适配器需要整个 `identitySlots` 序列 + 池条目 id（`slotId` 与 `refName` 不是
+ * 同一键空间）；补它要给 `ProbeDeps` 加池透传，属**接口扩张**」。
+ *
+ * ⚠️ **该理由已逐条实测证伪**（2026-10-08 第二轮）：
+ *
+ * - **不需要整个序列**：探测只要**它自己那一个**槽 —— `OpencodeAdapter.stream()`
+ *   只调 `identitySlots()` 取序列，**不读目录**（`fetchRemoteCatalog` 仅在
+ *   `catalog()` 内使用，而探测本就不该拉目录），且探测路径刻意不传 `markLimited`；
+ * - **不需要池**：`probeWithAdapter` 手上已有完整的 `ProviderAccountEntry`，
+ *   它带着权威的代理（`opencodeProxy`）与指纹代次（`opencodeFingerprintGeneration`）
+ *   —— 而这两样的权威**恰恰在池里、不在凭据里**（`AccountPool.setOpencodeProxy`
+ *   只写池条目，不回写凭据）；
+ * - **`slotId` / `refName` 键空间差异不成立**：探测不调 `markLimited`，
+ *   没有任何「按 slotId 写回」的动作，两者根本不会相遇。
+ *
+ * ⇒ 真正缺的只有「把 `entry` 交给工厂」这一件事，已给
+ * `probe.createProbeAdapter` 加了**可选**的第三参（纯放宽，其余 12 家不受影响），
+ * 槽由 `poolEntrySnapshot` 造（与主接线块**同一实现**，不写第二份派生）。
+ *
+ * ## 为什么保留这张空表而不是删掉
+ *
+ * 它的**存在**本身就是判据：{@link expectedProviderIdsWithProbe} 与
+ * `provider-runtime-wiring.spec.ts` 的守卫都按「会写标记 **−** 豁免」派生。
+ * 将来若真出现形态确实不匹配的家，把 id 与**可核对的**理由填进来即可；
+ * 守卫会同时强制「豁免的家确实会写标记」且「不得同时出现在注册表里」。
+ *
+ * ⚠️ 填理由时必须写**可复现的核对命令**，不要只写结论 —— 上面那条被证伪的
+ * 理由就是「写了结论、没写怎么核对」的产物。
  */
-export const PROBE_EXEMPT: ReadonlyMap<string, string> = new Map([
-  [
-    'opencode',
-    '探测入参只有一个账号的凭据，而它的适配器需要整个 identitySlots 序列 + 池条目 id '
-    + '（slotId 与 refName 不是同一键空间）；补它要给 ProbeDeps 加池透传，属接口扩张',
-  ],
-])
+export const PROBE_EXEMPT: ReadonlyMap<string, string> = new Map()
 
 /**
  * **期望**注册进 `src/index.ts` 的 `probeById`（可重测）的 provider id 集合
@@ -225,8 +240,8 @@ export const PROBE_EXEMPT: ReadonlyMap<string, string> = new Map([
  * ## ⚠️ 为什么这张清单硬编码在这里（而不是从 registry 派生）
  *
  * 「写不写限流标记」是**代码事实**，registry 里没有这个声明字段。硬编码的风险是
- * 「有人加了写点却忘了更新本清单」—— 故 `probe-wiring.spec.ts` 额外做一件事：
- * 对清单里每一家，**去源码里找它的写点证据**（`markLimited` 注入或
+ * 「有人加了写点却忘了更新本清单」—— 故 `provider-runtime-wiring.spec.ts` 额外
+ * 做一件事：对清单里每一家**去源码里找它的写点证据**（`markLimited` 注入或
  * `updateModelRateLimit` 调用），找不到即红。这样漏更新本清单时**同样会红**，
  * 而不是静默通过。
  */

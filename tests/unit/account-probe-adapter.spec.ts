@@ -707,7 +707,148 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline / zcode 不�
     // 桩适配器在构造后立刻抛错，故不该有任何真实请求发出。
     expect(calls).toHaveLength(0)
   })
+
+  /**
+   * ★★ **opencode：第 6 次同型缺陷的事主**（2026-10-08 第二轮补齐）。
+   *
+   * ## 为什么这条必须存在
+   *
+   * 它**不是**「分派表漏了它」——`probeById` 里此前根本没有它的条目，
+   * 而 `tests/helpers/provider-sets.ts` 的 `PROBE_EXEMPT` 把它记为**豁免**，
+   * 理由写的是「探测入参只有一个账号的凭据，而它的适配器需要整个
+   * `identitySlots` 序列 + 池条目 id；补它要给 `ProbeDeps` 加池透传，
+   * 属接口扩张」。
+   *
+   * ⚠️ **该理由已被实测证伪**（逐条反驳见 `PROBE_EXEMPT` 的文档）。
+   * 于是这里出现了一个**用例挡不住的缺口**：豁免表让守卫满意、而用户点
+   * 「重测」会真的报错 —— `opencode` 没有 `rateLimit: false`，
+   * 客户端按钮由 `supportsRateLimit`（缺省 true）门控 ⇒ **按钮会渲染**。
+   *
+   * ## 这条用例锁三件事（缺一条就守不住修复）
+   *
+   * 1. **能造出适配器**：不再抛「没有探测适配器」（`result.tested === 1`）；
+   * 2. **发往 Zen 而不是华为云**：断言真实请求的 host 与头族，
+   *    比「构造了哪个类」更贴近缺陷本身；
+   * 3. **池字段真被用上**：`x-opencode-project` 必须等于
+   *    `deriveProjectId(apiKey, entry.opencodeFingerprintGeneration)` ——
+   *    少了 `entry` 透传，代次会恒为 0 ⇒ project id 不同 ⇒ 这条立刻变红。
+   */
+  it('opencode 账号走 OpencodeAdapter（Zen 端点 + 池字段权威指纹），而非 CodeArtsAdapter', async () => {
+    const calls = stubFetch()
+    const { retestAccount } = await import('../../src/account-probe.js')
+    const { deriveProjectId } = await import('../../src/opencode.js')
+    const apiKey = 'sk-opencode-test-key-0123456789'
+    const id = 'opencode-1'
+    /**
+     * ⚠️ 三条都不能少（少任何一条本用例都会**假绿**）：
+     * - 带 `modelRateLimits`：`retestAccount` 的探测目标是
+     *   `Object.keys(entry.modelRateLimits)`，没有标记时它**根本不构造适配器**
+     *   （见 zcode 那条的同款注释）；
+     * - 凭据必须是 `{ api_key }`（不是默认桩里的 `access_token`）：
+     *   否则工厂退回匿名 key ⇒ 槽变成匿名槽 ⇒ 收费模型被 `pickSlot` 跳过，
+     *   报的是「缺账号」而不是我们要验的限流；
+     * - `opencodeFingerprintGeneration` 非 0：这是**池权威**字段，
+     *   断言它进了 project id 才能证明 `entry` 被真的透传了。
+     */
+    const generation = 3
+    const result = await retestAccount(makeOpencodePool([makeEntry({
+      id,
+      provider: 'opencode',
+      credentialRef: 'OPENCODE_ACCOUNT_TEST',
+      modelRateLimits: { 'big-pickle': Date.now() + 3_600_000 },
+      opencodeFingerprintGeneration: generation,
+    })], apiKey), id)
+
+    // ① 造得出适配器：不再抛「没有探测适配器」。
+    expect(result.tested).toBe(1)
+    expect(result.stillLimited).toHaveLength(1)
+
+    // ② 请求真的发往 Zen（而不是华为云端点）。
+    expect(calls).toHaveLength(1)
+    const url = new URL(calls[0]!.url)
+    expect(url.host).toBe('opencode.ai')
+    expect(url.pathname).toBe('/zen/v1/chat/completions')
+    const flat = Object.entries(calls[0]!.headers).map(([k, v]) => `${k}: ${v}`).join('\n')
+    expect(flat).not.toContain('SDK-HMAC-SHA256')
+    expect(flat).not.toContain('SignedHeaders')
+    expect(calls[0]!.headers.Authorization ?? calls[0]!.headers.authorization).toBe(`Bearer ${apiKey}`)
+
+    // ③ 池字段权威：project id 由 (api_key, 池里的代次) 派生 —— 见用例头注释。
+    expect(calls[0]!.headers['x-opencode-project']).toBe(deriveProjectId(apiKey, generation))
+    // 反证：若代次没被透传（恒 0），project id 会是另一个值。
+    expect(calls[0]!.headers['x-opencode-project']).not.toBe(deriveProjectId(apiKey, 0))
+
+    expect(await codeartsInstances()).toHaveLength(0)
+  })
+
+  /**
+   * ⚠️ **探测不得给适配器注入 `markLimited`**（否则「重测 A 账号」会污染整个池）。
+   *
+   * ## 为什么断言的是「注入点为空」而不是「没有写回发生」
+   *
+   * `retestAccount` 自己**也会**调 `pool.updateModelRateLimit`
+   *（对上游给了新重置时刻的那个分支）—— 所以「没有写回」这个断言**永远不成立**，
+   * 写成那样就是一条恒真的假绿。真正要锁的是：**适配器这一侧**拿不到写回钩子。
+   * 拿不到 ⇒ 它内部的 3 处 `markLimited` 全部是 `undefined?.()` 空操作。
+   *
+   * 同时锁「**停用账号也要能重测**」：`listIdentitySlots` 会跳过
+   * `enabled === false` 的条目，而探测的既定语义（见 `account-probe.ts`
+   * 模块头第 2 条设计）是停用账号照样能测。造槽时**刻意不继承**池里的
+   * `enabled` 就是为此 —— 继承会让重测退化成「没有可用通道」。
+   */
+  it('opencode 探测不注入 markLimited，且停用账号仍可重测', async () => {
+    const calls = stubFetch()
+    const { retestAccount } = await import('../../src/account-probe.js')
+    const { probeById } = await import('../../src/index.js')
+    const apiKey = 'sk-opencode-disabled-key-0123456789'
+    const id = 'opencode-disabled'
+    const entry = makeEntry({
+      id,
+      provider: 'opencode',
+      credentialRef: 'OPENCODE_ACCOUNT_DISABLED',
+      enabled: false,
+      modelRateLimits: { 'big-pickle': Date.now() + 3_600_000 },
+    })
+    const pool = makeOpencodePool([entry], apiKey)
+
+    const result = await retestAccount(pool, id)
+
+    // 停用账号照样进入了探测（未被 `listIdentitySlots` 的 enabled 过滤挡掉）。
+    expect(result.tested).toBe(1)
+    expect(calls).toHaveLength(1)
+
+    // 核心断言：直接把工厂造的适配器拿出来看它拿到了哪些钩子。
+    // ⚠️ 这一步是**实测**而不是推断 —— 少它的话「不写回」只能靠读源码相信。
+    const adapter = probeById['opencode']!
+      .createProbeAdapter(entry.credentialRef, { api_key: apiKey }, entry) as unknown as {
+        options?: { markLimited?: unknown; fetchRemoteCatalog?: unknown; disabledModels?: unknown }
+      }
+    expect(adapter.options?.markLimited, '探测路径不得给适配器注入 markLimited').toBeUndefined()
+    expect(adapter.options?.fetchRemoteCatalog, '探测不该为一次存活检查拉远端目录').toBeUndefined()
+    expect(adapter.options?.disabledModels, '探测不该读黑名单（那是选号的事）').toBeUndefined()
+  })
 })
+
+/**
+ * opencode 专用的池桩：凭据是 `{ api_key }`（不是其余家那份 `access_token`）。
+ *
+ * ⚠️ `makePool` 的固定凭据对本用例是**错的**——`opencode` 的凭据形状是
+ * `{ api_key, nickname?, fingerprint?, proxy? }`（见 `src/opencode.ts`）。
+ * 用错形状会让工厂退回匿名 key，把「账号通道」静默变成「匿名通道」。
+ */
+function makeOpencodePool(
+  entries: ProviderAccountEntry[],
+  apiKey: string,
+): ProbePool {
+  return {
+    ...makePool(entries),
+    async resolveCredentialForAccount() {
+      return { api_key: apiKey } as unknown as Awaited<
+        ReturnType<ProbePool['resolveCredentialForAccount']>
+      >
+    },
+  }
+}
 
 /**
  * 回归：**探测请求必须带首条 system 消息**（否则 WorkBuddy 网关 400 拦截）。

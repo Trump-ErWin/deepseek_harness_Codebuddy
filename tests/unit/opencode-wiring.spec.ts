@@ -40,7 +40,11 @@ describe('index.ts 接线', () => {
     const at = index.indexOf('registerOpencodeLlm(')
     const block = index.slice(at, at + 2600)
     expect(block).toMatch(/opencodeFingerprintGenerationFor\(/)
-    expect(block).toMatch(/deriveProjectId\(/)
+    // ⚠️ 派生本身已收敛进 `poolEntrySnapshot`（唯一实现，见下一条），
+    //    但**池字段必须在这里被读出来交给它** —— 只断言「调了派生函数」
+    //    挡不住「传了个常量代次进去」。
+    expect(block).toMatch(/generation:\s*pool\.opencodeFingerprintGenerationFor\(entry\.id\)/)
+    expect(block).toMatch(/proxy:\s*pool\.opencodeProxyFor\(entry\.id\)/)
   })
   it('⚠️ 匿名通道是池内条目 ⇒ 受限标记要落盘（否则面板看不到、也无法重测清除）', () => {
     // 2026-10-02 起匿名通道不再进程内合成，它有账号条目，
@@ -51,9 +55,18 @@ describe('index.ts 接线', () => {
     expect(block).not.toMatch(/slotId === ANONYMOUS_SLOT_ID\s*\)\s*return/)
   })
   it('⚠️ 匿名槽的指纹 identity 用条目 id（api_key 全是 public，不可用）', () => {
+    // ⚠️ 2026-10-08：这条规则**从 `index.ts` 搬进了 `opencode-auth.ts`**。
+    //    原因是探测路径也需要造槽 ⇒ 若在 `index.ts` 里再写一份就是
+    //    「同一语义两处实现」，而分叉的表现只是「多个匿名通道指纹相同」——
+    //    **不报错**。断言随之改指唯一实现处；`index.ts` 那一侧改为断言
+    //    「它调用的是那个唯一实现」（见上面的代次用例）。
+    const auth = readFileSync(join(here, '../../src/opencode-auth.ts'), 'utf8')
+    expect(auth).toMatch(/isAnonymousCredential\(source\.apiKey\) \? source\.id : source\.apiKey/)
+    // 反向：接线块不该再有自己那份 identity 派生（两处实现即红线）。
     const at = index.indexOf('registerOpencodeLlm(')
     const block = index.slice(at, at + 2600)
-    expect(block).toMatch(/const identity = apiKey === OPENCODE\.anonymousKey \? entry\.id : apiKey/)
+    expect(block).not.toMatch(/const identity = apiKey === OPENCODE\.anonymousKey/)
+    expect(block).toMatch(/poolEntrySnapshot\(/)
   })
   it('⚠️ 启动时保证至少有一条匿名通道（零账号也能用免费模型）', () => {
     expect(index).toMatch(/ensureDefaultAnonymousSlot\(/)

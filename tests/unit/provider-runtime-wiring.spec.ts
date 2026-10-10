@@ -435,6 +435,10 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     for (const [id, reason] of PROBE_EXEMPT) {
       expect(reason.length, `${id} 的豁免理由太短，写清「为什么拿不到探测材料」`).toBeGreaterThan(30)
     }
-    expect(PROBE_EXEMPT.size, '豁免表新增成员时必须复核本段的用例是否仍成立').toBe(1)
+    // ⚠️ 2026-10-08 第二轮：`opencode` 的豁免已**证伪并撤销**（理由见
+    // `provider-sets.ts` 的 `PROBE_EXEMPT` 文档），故现在是 **0**。
+    // 这条数字断言的意义是「豁免表变动时必须回来复核本段是否仍成立」——
+    // 若将来真要新加豁免，改这里的同时**必须**给出可复现的核对步骤。
+    expect(PROBE_EXEMPT.size, '豁免表新增成员时必须复核本段的用例是否仍成立').toBe(0)
   })
 })
