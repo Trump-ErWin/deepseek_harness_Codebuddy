@@ -46,7 +46,14 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { resolveJetHubHome } from './jet-hub-store.js'
-import { isValidTokenLedgerDayKey, mergeDayEntry, TPS_HISTOGRAM_BINS, type TokenLedgerDayBucket, type TokenLedgerDayMap } from './token-ledger.js'
+import {
+  isValidTokenLedgerDayKey,
+  mergeDayEntry,
+  parseDayBucketKey,
+  TPS_HISTOGRAM_BINS,
+  type TokenLedgerDayBucket,
+  type TokenLedgerDayMap,
+} from './token-ledger.js'
 
 /** 独立文档的文件名（与 state.json 同目录）。 */
 export const TOKEN_LEDGER_FILE = 'token-ledger.json'
@@ -61,6 +68,9 @@ const SCHEMA = 'dsh-codearts-auth/token-ledger/v2'
 const LEDGER_LOCK_STALE_MS = 30_000
 const LEDGER_LOCK_ABANDON_MS = 5 * 60_000
 
+/** 锁竞争告警的限流间隔（见 `warnLockContention`）。 */
+const LOCK_WARN_INTERVAL_MS = 5 * 60_000
+
 /** 从本地文件读数时拒绝负数、NaN 和无穷值；计数类字段再截为整数。 */
 function storedNumber(value: unknown, integer = true): number {
   const number = Number(value)
@@ -68,13 +78,17 @@ function storedNumber(value: unknown, integer = true): number {
   return integer ? Math.trunc(number) : number
 }
 
-function isValidBucketKey(key: string): boolean {
-  const parts = key.split('|')
-  return parts.length === 4
-    && (parts[0] === 'direct' || parts[0] === 'gateway')
-    && parts[1].length > 0
-    && parts[3].length > 0
-}
+/**
+ * ⚠️ 桶键合法性**唯一判据**是 `token-ledger.ts` 的 {@link parseDayBucketKey} ——
+ * 本文件**不得**再写第二份校验。
+ *
+ * 真实缺陷：这里曾另写一份 `isValidBucketKey`（额外要求 `model` 非空），与读取侧
+ * 分叉。写入侧允许 `model: ''`（既有语义，见 `token-ledger-wiring.spec.ts` 的
+ * 「model 缺失/垃圾值记空串不抛错」），而那份加严的校验会把这类**已经写进盘**的桶
+ * 判为非法 ⇒ 重启后该日用量静默消失。两个方向都会复发：加严让已有数据读不回，
+ * 放宽让脏键进入聚合。
+ */
+
 
 function readTpsHistogram(value: unknown): Record<string, number> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
@@ -174,7 +188,13 @@ class FileLedgerStore implements TokenLedgerStore {
     this.written = cloneDays(this.days)
   }
 
-  /** 从磁盘读日聚合（构造时用；返回**空表**表示无盘/损坏）。 */
+  /**
+   * 从磁盘读日聚合（构造 / flush / deleteDay 用）。
+   *
+   * 读到损坏文档时把原件 rename 成 `.corrupt-*` 留档（可人工恢复），并返回空表。
+   * ⚠️ `deleteDay` 与 `flush` 共用它，**不再**有「只读检查」式的旁路参数 ——
+   * 那样会让「检查」带破坏性副作用（历史教训见 `deleteDay` 的长注释）。
+   */
   private readFile(): TokenLedgerDayMap {
     const out: TokenLedgerDayMap = new Map()
     try {
@@ -193,7 +213,7 @@ class FileLedgerStore implements TokenLedgerStore {
         const bucketList = rawBuckets as Record<string, unknown>
         const target = new Map<string, TokenLedgerDayBucket>()
         for (const [key, rawBucket] of Object.entries(bucketList)) {
-          if (!isValidBucketKey(key) || typeof rawBucket !== 'object' || rawBucket === null || Array.isArray(rawBucket)) continue
+          if (parseDayBucketKey(key) === undefined || typeof rawBucket !== 'object' || rawBucket === null || Array.isArray(rawBucket)) continue
           const b = rawBucket as Record<string, unknown>
           // 数值字段统一校验（手工编辑/旧版本的脏数据不致命，也不能让负值污染汇总）。
           target.set(key, {
@@ -225,6 +245,10 @@ class FileLedgerStore implements TokenLedgerStore {
       } catch (backupError) {
         this.logger?.warn(`[jet-hub] 账本损坏且备份失败 ${this.path}: ${String(backupError)}`)
       }
+      // ⚠️ 归因澄清：搬走损坏文件后主文件不存在，而 `flush()` **只写增量**（这是本文件
+      // 一直以来的行为，见 `flush()` 的长注释）⇒ 盘上只留本次增量。这不是新的数据
+      // 损失路径（`0779fe8` 同样如此），且**不能**用「全量重建」来救（会覆盖用户
+      // 有意删除的文件，见同一处注释）。保护下限是「原件留档 `.corrupt-*`」。
       this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，已尝试保留损坏文件 ${backupPath}: ${String(error)}`)
       return new Map()
     }
@@ -234,6 +258,23 @@ class FileLedgerStore implements TokenLedgerStore {
   /** 纯内存读（不碰磁盘）—— 见接口注释。 */
   load(): TokenLedgerDayMap {
     return this.days
+  }
+
+  /** 锁竞争告警的限流时间戳（同一实例最多每 {@link LOCK_WARN_INTERVAL_MS} 一条）。 */
+  private lastLockWarnMs = 0
+
+  /**
+   * 记录一次「取不到写锁」。**限流**：`flush` 由节流器每 1 秒重试一轮，若每轮都打
+   * 一条 warn 会把日志淹没（与 codearts 真终态「同一 ref 只告警一次」同款取舍）。
+   * 首次立即告警（用户最需要的那一刻），其后每 5 分钟最多一条。
+   */
+  private warnLockContention(): void {
+    const now = Date.now()
+    if (now - this.lastLockWarnMs < LOCK_WARN_INTERVAL_MS) return
+    this.lastLockWarnMs = now
+    this.logger?.warn(
+      `[jet-hub] Token 账本写锁被占用，本实例本次落盘延后重试（内存统计不受影响）: ${this.path}.lock`,
+    )
   }
 
   append(entry: import('./token-ledger.js').TokenLedgerEntry): void {
@@ -316,8 +357,18 @@ class FileLedgerStore implements TokenLedgerStore {
   }
 
   /**
-   * 删除单日历史。先刷入本实例的待写增量，再以磁盘最新文档为基准只移除目标日，
-   * 避免覆盖其他日期或清空实时明细。写入成功后重置目标日基线，使后续新请求从零累计。
+   * 删除单日历史。
+   *
+   * 语义：**只摘掉目标日**，其他日期在内存与磁盘上都原样保留。
+   * - 内存：原地 `this.days.delete(day)`（见方法末尾的长注释，**不要**从 `merged` 重建）；
+   * - 磁盘：以「盘上最新文档」为底，并入本实例增量，然后只移除目标日。
+   *
+   * ⚠️ 曾经在这里加过一个 `baselineIntact()` 守卫（判据「`written` 的桶是否都还在
+   * 盘上」），意图是防「盘上文档缺桶时重建内存会丢数据」。但两轮复审红队各自实测
+   * 证明该守卫**自身引入了四个更常见的问题**（保留期淘汰导致正常删除被永久拒绝、
+   * 双实例下永久不可用、两次读盘之间的 TOCTOU、拒绝路径仍会搬走损坏文件）。
+   * ⇒ 守卫已删除，改用「只删目标日」这一结构性写法，四个问题同时消失。
+   * 完整论证记录在方法末尾的注释里（改这个方法前**必读**）。
    */
   deleteDay(day: string): boolean {
     if (!this.days.has(day)) return false
@@ -326,7 +377,7 @@ class FileLedgerStore implements TokenLedgerStore {
     const releaseLock = this.acquireWriteLock()
     if (releaseLock === undefined) throw new Error('Token 历史文件正被另一个进程更新，请稍后重试')
     try {
-
+    // ── 接管落盘（取消待执行的节流 flush，本次自己写） ──
     if (this.timer !== undefined) {
       clearTimeout(this.timer)
       this.timer = undefined
@@ -335,7 +386,7 @@ class FileLedgerStore implements TokenLedgerStore {
 
     mkdirSync(join(this.path, '..'), { recursive: true })
     const merged = this.readFile()
-    // 保留当前进程尚未落盘的其他日期增量。
+    // 把本实例相对基线的增量（**目标日除外**）并进盘上内容。
     for (const [pendingDay, buckets] of this.days) {
       if (pendingDay === day) continue
       const base = this.written.get(pendingDay)
@@ -363,9 +414,56 @@ class FileLedgerStore implements TokenLedgerStore {
       throw error
     }
 
-    // 原 Map 可能被历史读取器暂存，原地更新可确保后续读取马上看不到该日。
-    this.days.clear()
-    for (const [persistedDay, buckets] of merged) this.days.set(persistedDay, buckets)
+    /**
+     * ⚠️⚠️ **内存只删目标日，绝不从 `merged` 重建**（关键不变式，勿改回 `clear()`）。
+     *
+     * 这里曾经写的是 `this.days.clear()` + 按 `merged` 逐日重建，那正是**原始缺陷的
+     * 根因**：`merged` 的来源是「盘上文档 + 增量」，而盘上文档可能**缺**很多本实例
+     * 内存里有的日（损坏被搬走之后只写过增量 / 被另一个实例删过 / 超过保留期被
+     * prune）。一旦用它重建内存，那些日就**从内存里也消失** —— 用户看到的是
+     * 「我删了一天，别的日期的历史也没了」，且重启后不可恢复。
+     *
+     * `this.days.delete(day)` 只在原地摘掉目标日：
+     * - 同一 Map 对象被原地修改 ⇒ 历史读取器（`load()` 的调用方）立刻看不到该日；
+     * - 其他日期**原样留在内存**，不受盘上文档缺不缺它们影响；
+     * - `merged` 是从**完整盘上文档**起步、只删目标日得到的，故写盘也**只减少目标日**，
+     *   绝不会连带抹掉盘上其他日期。
+     *
+     * ## 为什么因此**不需要**守卫（曾经加过的 `baselineIntact()` 已删除）
+     *
+     * 那个守卫判据是「`written` 的每个桶都还在盘上」。它想防的正是上面的
+     * `clear()`+重建危害，但两轮复审红队各自实测证明它**自身引入了四个更常见的问题**：
+     *
+     * 1. **保留期淘汰误报**（阻塞级）：`writeDays` 会 prune 掉 >90 天的日，
+     *    而 `written` 前移写的是未 prune 的内存全量 ⇒ 基线恒虚高 ⇒
+     *    **用户正常点「删除某日」被永久拒绝**，且只能重启恢复。触发无需任何外部干预。
+     * 2. **双实例下永久不可用**：另一个实例合法删掉某日后，本实例 `written` 仍含该日
+     *    ⇒ 恒判不一致 ⇒ 删除功能失效到重启（同机多 profile 共享 home 是本仓库
+     *    明载的真实部署形态）。
+     * 3. **两次读盘之间的 TOCTOU**：守卫读一次、拼装又读一次，窗口内不设防，
+     *    可让目标日之外的数据在内存与磁盘同时消失。
+     * 4. **拒绝路径仍有破坏性副作用**：拼装那次读默认会把损坏文件搬走 ⇒
+     *    用户看到「拒绝删除」，主文件却已不在原位（与注释声称相反）。
+     *
+     * 而「只删目标日」这个写法让上述四个问题**同时不存在**：不再有守卫 ⇒ 无 1/2；
+     * 只读一次盘 ⇒ 无 3；损坏文件由 `readFile` 统一留档（与 `flush` 同策、可人工恢复）
+     * ⇒ 无「拒绝但被搬走」的矛盾。
+     *
+     * ⚠️ `written` 仍取**内存全量**（不 prune）：幽灵日规则依赖「`written` 含该日 ⇒
+     * 其增量为 0 ⇒ 不把外部删除的日键写回盘」。若改成 prune 过的版本，被淘汰的日会
+     * 每轮以「全量增量」重新进入 `merged`（再被 prune 丢弃），白白触发整份重写。
+     *
+     * ## ⚠️ 已知反向副作用：删除**不 prune**，可能把超期老日写进盘
+     *
+     * 上面那次 `writeDays(merged, false)` 刻意带 `applyRetention = false`（「不借机
+     * 淘汰其他日期」，避免用户只是想删一天却连带清掉别的）。代价是：**若本实例尚未
+     * flush 过**，`merged` 里可能含 >90 天的老日（`pruneDays` 只在 `writeDays` 的
+     * 默认路径生效）⇒ 这些本该被保留期淘汰的日会被这次删除**写进盘**，直到下一次
+     * `flush` 才清掉（实测：`afterDelete = ["2026-07-02"]` → `afterFlush = ["2026-10-10"]`）。
+     * 影响很小（老日在下次 flush 后消失，且它们本来就在内存里），故**有意保留**；
+     * 记在这里是为了别把它当成 bug 去「修」成 prune —— 那会与上面那条取舍冲突。
+     */
+    this.days.delete(day)
     this.written = cloneDays(this.days)
     return true
     } finally {
@@ -427,11 +525,63 @@ class FileLedgerStore implements TokenLedgerStore {
       mkdirSync(join(this.path, '..'), { recursive: true })
       releaseLock = this.acquireWriteLock()
       if (releaseLock === undefined) {
+        // ⚠️ **锁竞争必须留痕（限流）**：取不到锁时我们只是延后重试，账本在本进程内
+        // 仍然正确（内存兜底），但**盘上会一直不更新** —— 若另一个实例长期持锁（或
+        // 它的锁被误判为存活），用户会看到「历史不更新」却**日志零字**，无从排查。
+        // 与 `src/index.ts` 把十个静默 catch 收成一处 warn 是同一条纪律：
+        // 延后重试是设计，但「一直在延后」必须是可观测的。
+        this.warnLockContention()
         this.scheduleFlush()
         return
       }
       // ① 盘上现况（含别的实例刚写的）
+      //
+      // ⚠️ `readFile()` 遇损坏会把文件 rename 成 `.corrupt-*` 并返回**空表**，因此
+      // 这里读到的 `merged` 可能为空、且主文件此刻可能已不存在。
       const merged = this.readFile()
+      /**
+       * ## ⚠️⚠️ **为什么「主文件不存在」时仍然只写增量**（有意的取舍，勿改回去）
+       *
+       * ⚠️ 先澄清归因（避免后来者误解）：**只写增量是本文件一直以来的行为**，
+       * 包括本次修复之前的 `0779fe8`（实测对照：旧版同样只写出增量 `5`，不复活）。
+       * 下面这段记录的是「本轮修复期间**一度**加过、又**主动撤掉**」的一条防线，
+       * 不是历史遗留代码 —— 撤掉是为了回到「尊重外部删除」的单一语义。
+       *
+       * 那条被撤掉的防线是「发现主文件不在 ⇒ 用 `this.days` 全量重建」，理由是
+       *「损坏被搬走后增量写会丢掉内存里已有的历史」。但**实测证明它方向性地错**：
+       * 「主文件不存在」这个磁盘信号**不足以判定意图**，它至少对应三种情形 ——
+       *
+       * | 场景 | 期望行为 | 全量重建的后果 |
+       * |---|---|---|
+       * | 损坏被搬成 `.corrupt-*` | 救回内存真值 | ✅ 正确 |
+       * | **用户主动 `rm` 掉整个账本**（清历史） | **尊重删除** | ❌ **把删掉的历史复活** |
+       * | 另一实例先重建了新文档（只含它的增量） | 救回本实例旧日 | ❌ 判据不成立（主文件在），**照旧丢** |
+       *
+       * 即：同一信号下，一半情形要救、一半情形要尊重，而**两者在磁盘上完全同形**
+       *（都是 `existsSync === false`）⇒ 单侧启发式必然做反一半。实测那条防线：
+       *「用户 `rm` 文件 → 本实例再 flush」时，被删的 `10-05:100` / `10-06:30`
+       * **全部复活**，直接覆盖用户意图。
+       *
+       * ### 为什么「加文档级世代标记」也修不好（实测推演，勿再试）
+       *
+       * 检测到换代后，唯一可选动作仍是「用内存全量重建」，那会**双重累加**：
+       * A 重建时写进新文档的 `10-05:100`，正是 B 当初写过的**同一份逻辑数据**；
+       * 「盘上 + B 全量内存」= `100 + 100 = 200`，而正确值是 100（两个实例都
+       * 「拥有」该桶）。⇒ 单侧启发式只能在**丢数据**与**双重累加**之间二选一，
+       * 后者比前者更糟（静默的数值损坏）。
+       * 根治需要**按实例记录贡献**的 provenance（存储格式级改动，使「相减」有据
+       * 可依），超出本次范围。
+       *
+       * ### 故当前语义（宁可少救，不可写错）
+       *
+       * 只写增量：盘上缺的旧日**不自动补回** —— 与「幽灵日」规则（尊重外部删除）
+       * 保持**同一套判据**，不再有「有时尊重、有时复活」的分裂。
+       *
+       * ⚠️ **已知代价（如实记录）**：「损坏搬走」或「用户 `rm`」之后，本进程内
+       * `load()`（UI 读它）仍显示旧累计，而盘上只有增量 ⇒ **两者在重启前不一致**
+       *（实测：内存 `105` / 盘上 `5`）。这是「尊重删除」的必然代价，不是缺陷；
+       * 重启后以盘为准（实测 `5`）。损坏原件始终留档 `.corrupt-*` 可人工恢复。
+       */
       // ② 把本实例的增量并进去
       //
       // ⚠️ **必须跳过「零增量」的桶**（真实缺陷，审计发现并原样复现：R1「幽灵日」）：
@@ -467,6 +617,13 @@ class FileLedgerStore implements TokenLedgerStore {
       // ③ 原子写（淘汰过老日键）
       this.writeDays(merged)
       // ④ 基线前移（只在写盘成功后）
+      //
+      // ⚠️ 取**未 prune 的内存全量**（不是「实际写进盘的内容」）：增量口径要求
+      // 「盘上已含我上次写的桶」。若取 prune 后的版本，被保留期淘汰的老日会因
+      // `written` 缺它而每轮都算出「全量增量」、白白触发一次整份读改写（再被 prune
+      // 丢弃）。虚高的老日在 `flush` 里是**无害**的（`delta` 恒 0 ⇒ 不写回 ⇒ 尊重
+      // 保留期淘汰），而在 `deleteDay` 里也不再被用作任何判据（那里的守卫已删除，
+      // 见 `deleteDay` 的长注释）。
       this.written = cloneDays(this.days)
     } catch (error) {
       // 落盘失败只记日志：账本还有内存兜底，不能反噬推理。
