@@ -24,6 +24,23 @@ import { AccountPool } from '../../src/account-pool.js'
 import type { ClaimOutcome, CheckinStatus, CreditBalance } from '../../src/credits.js'
 import { WORKBUDDY } from '../../src/product.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
+import { probeById } from '../../src/index.js'
+import { clearProviderRuntimes, registerProviderRuntime } from '../../src/provider-runtime.js'
+import { descriptorOf } from '../../src/provider-registry.js'
+
+/**
+ * 注册**生产的那张** `probeById`（Task 8 起探测适配器由能力注册表提供）。
+ *
+ * ⚠️ 复用生产表而**不是**在测试里重写一份：本文件的断言正是「生产把哪个适配器
+ * 交给了哪个 provider」—— 重写一份会让它测的是测试自己。
+ */
+function registerProbeRuntimesForTests(): void {
+  clearProviderRuntimes()
+  for (const [id, probe] of Object.entries(probeById)) {
+    const descriptor = descriptorOf(id)
+    if (descriptor !== undefined) registerProviderRuntime({ descriptor, probe })
+  }
+}
 // ⚠️⚠️ 「已失效模型」表的直接操作（2026-10-06 复审 !66 的 model.clearDead 端点用例）。
 //
 // ⚠️⚠️ **必须在任何静态 import 之前设好隔离目录**：该模块的 store / cache 是
@@ -2693,10 +2710,22 @@ describe('account.test 端点（**无条件**真发一次请求）', () => {
       return body.result
     }
 
+    // ⚠️ **Task 8 起**：探测适配器的构造改由能力注册表提供（`src/index.ts` 的
+    // `probeById`）。本组用例驱动 `account.test`，故必须注册 gemini 的 probe，
+    // 否则 `adapterForProbe` 会（正确地）抛「不支持重测」，用例变成测错误路径。
+    // ⚠️ 复用**生产的那张表**，不在测试里重写一份。
+    // ⚠️ 用**静态 import**（不是动态 `await import`）：`setup` 必须保持同步，
+    //    否则本文件 40+ 个调用点都要加 `await`。
+    registerProbeRuntimesForTests()
+
     return { call, storedLimits: () => (stored.accounts as Array<{ modelRateLimits?: Record<string, number> }>)[0]?.modelRateLimits }
   }
 
-  afterEach(() => { vi.unstubAllGlobals() })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    // ⚠️ 清掉本组注册的 runtime，避免污染同文件其余用例。
+    return import('../../src/provider-runtime.js').then(({ clearProviderRuntimes }) => { clearProviderRuntimes() })
+  })
 
   /**
    * ⚠️ 这条是本功能的**核心断言**：账号**没有任何限流标记**时，`account.test`

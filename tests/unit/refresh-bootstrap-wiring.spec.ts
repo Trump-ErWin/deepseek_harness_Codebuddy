@@ -117,30 +117,56 @@ describe('续期调度器：启动必须先跑一轮', () => {
     expect(indexSource.slice(start, start + 400), 'start() 的失败没有兜底').toContain('.catch(')
   })
 
-  it('十个 provider 实例都在批量续期清单里（新增 provider 不得漏接）', () => {
-    const expected = [
-      'service', 'buddy', 'workbuddy', 'lobsterai', 'qoder',
-      'qoderCn', 'trae', 'cline', 'loomy', 'raccoon',
-      // ⚠️ 新增 provider 必须同时加进 `src/index.ts` 的 refreshTargets
-      // **与本清单** —— 只加前者不会被这条用例发现（它会静默不续期）。
-      'minimax',
-    ]
-    for (const name of expected) {
-      expect(
-        indexSource,
-        `${name}.refreshAll 未接入多账号续期调度`,
-      ).toMatch(new RegExp(`\\(?p\\)?\\s*=>\\s*${name}\\.refreshAll\\(p\\)`))
+  it('每个 channel provider 都在批量续期表里（新增 provider 不得漏接）', async () => {
+    // ⚠️ **2026-10-08 改（Task 10）**：原先这条断言 `src/index.ts` 的源码文本
+    //    含 `(p) => xxx.refreshAll(p)` —— 那张 13 行手抄清单已被
+    //    `wiredRefreshTargets()` 取代 ⇒ 该文本形态**不存在了**，而它守的意图
+    //    （每个 channel 都能批量续期）**与文本无关**。
+    //
+    // ⇒ 改为**行为断言**：按注册表的期望集注册 runtime，再断言派生表**逐项相等**
+    //    （而不是「包含」—— 多一家或少一家都要红，且失败信息点名是哪一家）。
+    //
+    // ⚠️ 期望集从 `PROVIDER_REGISTRY` **派生**，不再手抄：
+    //    `channel: true` 减去**没有 auth 域**的家（`opencode` 没有续期概念）。
+    //    这与 `refresh-targets-derived.spec.ts` 是同一条判据的两个视角：
+    //    那里测**派生函数本身**，这里测**注册循环把 13 家都接上了**。
+    const { PROVIDER_REGISTRY, descriptorOf } = await import('../../src/provider-registry.js')
+    const { clearProviderRuntimes, registerProviderRuntime, wiredRefreshTargets } =
+      await import('../../src/provider-runtime.js')
+
+    clearProviderRuntimes()
+    // 模拟 `index.ts` 的注册循环：每个 channel provider 都挂上 `refreshAll`。
+    // ⚠️ 这里**不**引入 `index.ts`（它是装配代码、会真起服务）——
+    //    本用例锁的是「注册循环的**形状**（channel 家都有 auth.refreshAll）」
+    //    与「派生表如实反映它」。
+    const channelIds = PROVIDER_REGISTRY.filter((d) => d.channel).map((d) => d.id)
+    for (const id of channelIds) {
+      registerProviderRuntime({
+        descriptor: descriptorOf(id)!,
+        auth: { refreshAccount: async () => {}, refreshAll: async () => {} },
+      })
     }
+
+    const derived = wiredRefreshTargets().map(([id]) => id).sort()
+    expect(derived).toEqual([...channelIds].sort())
+    // ⚠️ 反向：表里每一项都必须真有 `refreshAll`（否则调度器调不存在的方法）。
+    for (const [, refreshAll] of wiredRefreshTargets()) expect(refreshAll).toBeTypeOf('function')
+    clearProviderRuntimes()
   })
 
   it('每个 provider 的失败都走同一条日志路径（不再有十个静默 catch）', () => {
     // 旧写法是十个 `try { … } catch { /* 静默 */ }`，把 provider 内部的告警
     // 与异常一起吞掉（issue 第 5.4 条）。现在收敛成一个循环 + 一处 warn。
+    //
+    // ⚠️ **2026-10-08 改（Task 10）**：循环的**数据源**从手抄的 `refreshTargets`
+    //    常量改为 `currentRefreshTargets()`（`wiredRefreshTargets()` 的惰性包装）。
+    //    ⇒ 断言改为「循环读的是那个函数」，并**保留**「一处 warn、无空 catch」
+    //    这两条与数据源无关的意图。
     const start = indexSource.indexOf('async function refreshAllCredentials')
     expect(start).toBeGreaterThan(-1)
     // 取到函数体结束（CRLF 安全：用正则找第一个「缩进两格的花括号」）
     const body = indexSource.slice(start, start + 800).split(/\r?\n  \}\r?\n/)[0] ?? ''
-    expect(body).toMatch(/for \(const \[tag, refreshAll\] of refreshTargets\)/)
+    expect(body).toMatch(/for \(const \[tag, refreshAll\] of wiredRefreshTargets\(\)\)/)
     expect(body).toContain('批量续期失败')
     expect(body).not.toMatch(/catch\s*\{\s*\}/)
   })

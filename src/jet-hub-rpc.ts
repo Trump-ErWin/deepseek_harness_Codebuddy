@@ -197,7 +197,6 @@ import type {
   RpcClineQuotaResponse,
   RpcClineRequestLogRequest,
   RpcClineRequestLogResponse,
-  RpcCreditsClaimAccountResult,
   RpcSendSmsRequest,
   RpcSendSmsResponse,
   RpcSubmitSmsRequest,
@@ -978,10 +977,18 @@ function providerIdsOf(
 /**
  * 各 provider auth 实例在 JetHub 里被用到的**共同部分**。
  *
- * 只声明真正被用到的那一个方法（结构化类型），使 `authOf` 不必依赖 13 个具体类。
+ * 只声明真正被用到的方法（结构化类型），使 `authOf` 不必依赖 13 个具体类。
  */
 export interface JetHubAuthLike {
   refreshAccountCredential(refName: string, pool: AccountPool, accountId: string): Promise<void>
+  /**
+   * 批量续期该 provider 的全部账号。
+   *
+   * ⚠️ 2026-10-08（Task 10）：`index.ts` 的注册循环用它填
+   * `ProviderRuntime.auth.refreshAll`，而后者是 `wiredRefreshTargets()` 的派生依据。
+   * 实测 13 家签名**完全一致**（`(pool) => Promise<void>`）⇒ 无需逐家适配。
+   */
+  refreshAll(pool: AccountPool): Promise<void>
 }
 
 /**

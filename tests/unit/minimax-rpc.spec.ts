@@ -56,7 +56,18 @@ describe('接线点完整性（源码断言）', () => {
     expect(indexSource).toContain('new MinimaxAuth(ctx)')
     expect(indexSource).toContain('registerMinimaxLlm(ctx, {')
     // 4. refreshTargets 表
-    expect(indexSource).toContain("['minimax', (p) => minimax.refreshAll(p)]")
+    // ⚠️ **2026-10-08 改（Task 10）**：原先断言 `src/index.ts` 的源码文本含手抄清单
+    //    字面量（`['x', (p) => x.refreshAll(p)]`）—— 那张清单已被
+    //    `wiredRefreshTargets()` 从**能力注册表**派生取代 ⇒ 该文本形态**不存在了**，
+    //    而它守的意图（该 provider 在续期调度里）**与文本无关**。
+    // ⇒ 改为**结构断言**（注册循环挂了 refreshAll + 派生表被使用）。
+    // ⚠️ 行为断言（真跑 `apply()` 逐个驱动 `auth.refreshAll` 并断言打到**自己那个**
+    //    实例）在 `provider-runtime-wiring.spec.ts` 的「★ 13 家都挂上了
+    //    `auth.refreshAll`」一条里，**比本条更强**。
+    expect(indexSource, '注册循环没有挂 refreshAll（派生表会恒为空）')
+      .toMatch(/refreshAll:\s*\(pool\)\s*=>\s*auth\.refreshAll\(pool\)/)
+    expect(indexSource, 'refreshTargets 又回到手抄清单了')
+      .toMatch(/wiredRefreshTargets\(\)/)
     // 5. modelAdapters 登记
     expect(indexSource).toMatch(/minimax: pruned\([^)]*,\s*minimaxAdapter\)/)
     // 6. registerJetHubRpc 实参

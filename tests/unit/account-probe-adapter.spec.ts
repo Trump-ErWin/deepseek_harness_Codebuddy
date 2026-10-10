@@ -15,6 +15,35 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { ProbePool } from '../../src/account-probe.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
+/**
+ * ⚠️ **Task 8 起：适配器的构造改由能力注册表提供**（`src/index.ts` 导出的
+ * `probeById`），不再由 `account-probe.ts` 内部 `else if` 链分派。
+ *
+ * ⇒ 本文件必须在每个用例前把**真实的 `probeById`** 注册进 runtime，
+ * 否则 `adapterForProbe` 会（正确地）抛「不支持重测」。
+ *
+ * ⚠️ 复用生产的那张表而**不是**在测试里重写一份：本文件的价值正是断言
+ * 「生产把哪个适配器交给了哪个 provider」—— 重写一份会让它测的是测试自己。
+ */
+beforeEach(async () => {
+  const [{ probeById }, { registerProviderRuntime, clearProviderRuntimes }, { descriptorOf }] =
+    await Promise.all([
+      import('../../src/index.js'),
+      import('../../src/provider-runtime.js'),
+      import('../../src/provider-registry.js'),
+    ])
+  clearProviderRuntimes()
+  for (const [id, probe] of Object.entries(probeById)) {
+    const descriptor = descriptorOf(id)
+    if (descriptor !== undefined) registerProviderRuntime({ descriptor, probe })
+  }
+})
+
+afterEach(async () => {
+  const { clearProviderRuntimes } = await import('../../src/provider-runtime.js')
+  clearProviderRuntimes()
+})
+
 vi.mock('../../src/buddy-adapter.js', () => {
   /** 记录被构造的选项与每次 `stream()` 的入参；流式请求一律以限流错误结束（不发网络请求）。 */
   class MockBuddyAdapter {

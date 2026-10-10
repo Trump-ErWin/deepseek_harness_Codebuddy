@@ -124,9 +124,20 @@ describe('Loomy 在 index.ts 的接线', () => {
   })
 
   it('加入批量续期调度', () => {
-    // 只断言「loomy 在续期调度里且真被传了池」：`(pool|p)` 同时接受逐个
-    // `await x.refreshAll(pool)` 与表驱动 `(p) => x.refreshAll(p)` 两种写法。
-    expect(indexSource).toMatch(/loomy\.refreshAll\((?:pool|p)\)/)
+    // ⚠️ **2026-10-08 改（Task 10）**：原先断言 `src/index.ts` 的源码文本含
+    //    `loomy.refreshAll(pool|p)` —— 那张手抄清单已被 `wiredRefreshTargets()`
+    //    从**能力注册表**派生取代 ⇒ 该文本形态**不存在了**，而它守的意图
+    //    （loomy 在续期调度里）**与文本无关**。
+    //
+    // ⇒ 改为**结构断言**：注册循环必须为**每个** provider 挂 `refreshAll`
+    //    （它是派生表的唯一来源）。
+    // ⚠️ 行为断言（真跑 `apply()` 后逐个驱动 `auth.refreshAll`、断言打到
+    //    **自己那个**实例）在 `provider-runtime-wiring.spec.ts` 的
+    //    「★ 13 家都挂上了 `auth.refreshAll`」一条里，**比本条更强**。
+    expect(indexSource, '注册循环没有挂 refreshAll（派生表会恒为空）')
+      .toMatch(/refreshAll:\s*\(pool\)\s*=>\s*auth\.refreshAll\(pool\)/)
+    expect(indexSource, 'refreshTargets 又回到手抄清单了')
+      .toMatch(/wiredRefreshTargets\(\)/)
   })
 
   it('cleanup 调用 loomy.stop()', () => {
