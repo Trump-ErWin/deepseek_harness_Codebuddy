@@ -190,6 +190,7 @@ export function adapterForProbe(
   provider: string,
   refName: string,
   credential: unknown,
+  entry?: ProviderAccountEntry,
 ): LlmAdapter {
   const runtime = runtimeOf(provider)
   if (runtime?.probe === undefined) {
@@ -197,7 +198,7 @@ export function adapterForProbe(
     //    探测必然失败而限流标记永远清不掉（zcode / gemini 各踩过一次）。
     throw new Error(`${provider} 没有探测适配器（该 provider 不支持重测）`)
   }
-  return runtime.probe.createProbeAdapter(refName, credential)
+  return runtime.probe.createProbeAdapter(refName, credential, entry)
 }
 
 /** 用真实适配器对指定账号的指定模型发一次最小请求。 */
@@ -261,8 +262,10 @@ async function probeWithAdapter(
   //   会写 —— 判据要看「有没有写点」，不是「某一种失败写不写」。
   // - 旧文说「反例：minimax 与 opencode **不写**标记」—— 对 minimax 成立，
   //   对 **`opencode` 证伪**（`opencode-adapter.ts` 3 处 `markLimited`）。
-  //   opencode 不进 `index.ts` 的 probe 表是**另一个理由**（探测材料拿不到），
-  //   那个理由与该表写在一起，别在这里重复。
+  //   opencode 曾因此不在 `index.ts` 的 probe 表里，理由是「探测材料拿不到」——
+  //   ⚠️ **那个理由 2026-10-08 第二轮已实测证伪并补齐**（见 `index.ts` 的
+  //   `probeById.opencode` 条目）：真正缺的只是「把 `entry` 交给工厂」，
+  //   现在本链**13 家全在**，`PROBE_EXEMPT` 已清空。
   // ⚠️ **2026-10-08 Task 8：本链已改为查能力注册表**（原为 `else if` 链 + `else` 兜底）。
   //
   // 原实现的 `else` 会把**未登记的 provider** 交给「**华为云 HMAC 签名**的
@@ -278,7 +281,7 @@ async function probeWithAdapter(
   // `tests/unit/account-probe-adapter.spec.ts` 的对应用例；
   // 「登记了哪些家、哪些家刻意不登记」由 `index.ts` 的 `probeById` 头注释
   // 与 `PROBE_EXEMPT` 说明，本处不再重复一份易腐的清单。
-  const adapter = adapterForProbe(entry.provider, entry.credentialRef, credential)
+  const adapter = adapterForProbe(entry.provider, entry.credentialRef, credential, entry)
   try {
     for await (const _chunk of adapter.stream({
       provider: entry.provider,

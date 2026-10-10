@@ -98,7 +98,7 @@ import { registerGeminiLlm } from './gemini-adapter.js'
 import { GEMINI } from './gemini.js'
 import type { GeminiCredential } from './gemini.js'
 import { createGeminiSigStore } from './gemini-sigstore.js'
-import { registerOpencodeLlm } from './opencode-adapter.js'
+import { OpencodeAdapter, registerOpencodeLlm } from './opencode-adapter.js'
 import { registerAutoLlm } from './auto-adapter.js'
 import { AGGREGATE_PROVIDER, registerAggregateLlm } from './aggregate-adapter.js'
 // ⚠️ `createExpiryProbe` 从**底座**导入，不是从 `aggregate-adapter.js`
@@ -109,10 +109,10 @@ import { createProviderExpiry } from './provider-expiry.js'
 // （它调 handleOpencodeRpc），本文件**不再**单独注册端点 —— 详见
 // `opencode-rpc.ts` 模块头「为什么是被主 switch 调用」。
 import {
-  ensureDefaultAnonymousSlot, listIdentitySlots, type PoolEntrySnapshot,
+  ensureDefaultAnonymousSlot, listIdentitySlots, poolEntrySnapshot,
 } from './opencode-auth.js'
 import { OPENCODE } from './opencode-product.js'
-import { deriveProjectId } from './opencode.js'
+import type { OpencodeCredential } from './opencode.js'
 import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './opencode-capability.js'
 import { closeAllProxyDispatchers } from './opencode-proxy.js'
 import { execFile } from 'node:child_process'
@@ -324,7 +324,8 @@ export function makeReadImageRequest(ctx: Context) {
  * 实测（2026-10-08 独立复审按上述两条重跑）：**会写标记的 provider 共 13 家**
  * —— buddy、workbuddy、lobsterai、qoder、qodercn、cline、zcode、trae、
  * gemini、codearts、loomy、raccoon、**opencode**。
- * 本表登记其中 **12 家**（不含 `opencode`，见下 {@link PROBE_EXEMPT}）。
+ * 本表登记**全部 13 家**（2026-10-08 第二轮：`opencode` 的缺口已补齐，
+ * 见下 `opencode` 条目与 {@link PROBE_EXEMPT}）。
  *
  * ⚠️⚠️ **`loomy` 与 `raccoon` 是本次顺带修掉的第 5 次同型缺陷**：
  * 旧 `else if` 链里**没有它们的分支** ⇒ 它们落入 `else`，被交给
@@ -332,12 +333,14 @@ export function makeReadImageRequest(ctx: Context) {
  * 探测必然失败，而它们的限流标记（UTC+8 当日 24:00）**永远清不掉**。
  * 两者都实测会写 `modelRateLimits`（`loomy-adapter.ts` / `raccoon-adapter.ts`）。
  *
- * ⚠️ **不在这里的两家，各自理由不同，别混为一谈**（详见 {@link PROBE_EXEMPT}）：
+ * ⚠️ **`opencode` 是第 6 次同型缺陷，但形态不同**：不是「分派表漏了它」，
+ * 而是「登记表里刻意豁免了它」，且**豁免理由是错的**（详见该条目的注释）。
+ * 它**写**标记（`opencode-adapter.ts` 3 处 `markLimited` → `index.ts` 的
+ * `markLimited` → `pool.updateModelRateLimit`），却没有 `rateLimit: false`
+ * 豁免 ⇒ 客户端「重测」按钮**会渲染** ⇒ 用户点了必然报「没有探测适配器」。
  *
- * - `minimax`：**不写**标记（实测两条 grep 均无命中）⇒ 本就没有可清的标记；
- * - `opencode`：**写**标记（`opencode-adapter.ts` 3 处 `markLimited` →
- *   `index.ts` 的 `markLimited` → `pool.updateModelRateLimit`），
- *   但探测所需材料拿不到 ⇒ **形态不匹配**，是**登记在案的缺口**。
+ * ⚠️ **只有 `minimax` 是真正「不需要 probe」的那一家**：**不写**标记
+ * （实测两条 grep 均无命中）⇒ 本就没有可清的标记。
  *
  * ⚠️⚠️ **不要再写「`opencode` 不写标记」**（2026-10-08 原注释如此，独立复审
  * 实测证伪）：它与「余额是本地派生的通道可用性、零网络」说的是**两件事** ——
@@ -348,13 +351,12 @@ export function makeReadImageRequest(ctx: Context) {
  * 都由 `supportsRateLimit(provider)` 门控（缺省 **true**），**不是**
  * `accountTest`（那是另一个「测试」按钮的位）。原注释称「`accountTest` 只有
  * `gemini` 为 true ⇒ 其余渠道没有入口」—— **该推论是错的**：`opencode` 没有
- * `rateLimit: false` 豁免 ⇒ 这些按钮**会渲染** ⇒ 用户点「重测」会走到
- * `retestAccount` ⇒ 命中本表缺项而抛「没有探测适配器」。
+ * `rateLimit: false` 豁免 ⇒ 这些按钮**会渲染**。
  * ⇒ 本表的完整性**已经是用户可见功能**，不是「将来才复发」的内部契约
  * （只有「测试」那一个按钮仍限 `gemini`）。
  *
- * ⚠️ 一致性与「漏一家」由 `tests/unit/probe-wiring.spec.ts` 从
- * `PROVIDER_REGISTRY` + {@link PROBE_EXEMPT} 派生锁死（漏挂会让它**点名**变红）。
+ * ⚠️ 一致性与「漏一家」由 `tests/unit/provider-runtime-wiring.spec.ts` 的 probe
+ * 域守卫从硬编码清单 + {@link PROBE_EXEMPT} 派生锁死（漏挂会让它**点名**变红）。
  */
 export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = {
   // CodeBuddy 系（buddy / workbuddy）→ BuddyAdapter，按各自 product 发请求。
@@ -492,6 +494,75 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
       refresh: async () => {},
       product: RACCOON,
     }),
+  },
+  // OpenCode Zen。
+  //
+  // ## ⚠️ 这里**必须**用第三个参数 `entry`，不能只靠 `credential`
+  //
+  // Zen 的出口与指纹的**权威在账号池条目**，不在凭据里：RPC 的
+  // `opencode.setProxy` 落到 `AccountPool.setOpencodeProxy`，只写
+  // `entry.opencodeProxy`（**不回写凭据**）；指纹代次同理只写
+  // `entry.opencodeFingerprintGeneration`。只拿凭据去造槽，探测就会
+  // **走错的出口 IP、发错的 project id** —— 而探测的全部意义正是
+  // 「用这个账号的真实出网条件打一次请求」。
+  //
+  // ## ⚠️ 早先这里登记的「豁免」理由是**实测证伪的**
+  //
+  // 旧理由称「它的适配器需要整个 identitySlots 序列 + 池条目 id
+  // （slotId 与 refName 不是同一键空间），补它要给 `ProbeDeps` 加池透传，
+  // 属接口扩张」。逐条核对后不成立：
+  //   - 探测**不需要整个序列**，只需要**它自己那一个**槽：`stream()` 只调
+  //     `identitySlots()` 取序列，不读目录（`fetchRemoteCatalog` 只在
+  //     `catalog()` 里用），而探测路径本就刻意不传 `markLimited`；
+  //   - **不需要池**：`probeWithAdapter` 手上已有完整的 `ProviderAccountEntry`，
+  //     它带着权威的代理与代次；
+  //   - `slotId` 与 `refName` 的键空间差异在这里不成立：探测不调
+  //     `markLimited`，没有任何按 slotId 写回的动作。
+  // ⇒ 真正缺的只是「把 `entry` 交给工厂」这一件事，故给
+  // `createProbeAdapter` 加了可选的第三个参数（纯放宽，其余 12 家不受影响）。
+  //
+  // ## 刻意**不**传的四个钩子
+  //
+  // `fetchRemoteCatalog` / `disabledModels` / `markLimited` / `readImage`
+  // 一律不传，与其余家同一理由（探测是轻量存活检查，不写任何状态、
+  // 不为一次探测额外拉目录）。其中 `markLimited` 尤其重要：探测失败若写回
+  // 限流标记，会把「重测 A 账号」变成污染池的副作用。
+  //
+  // ## ⚠️ 槽由 `poolEntrySnapshot` 造，且**不继承**池里的 `enabled`
+  //
+  // `listIdentitySlots` 会跳过 `enabled === false` 的条目，而探测的既定语义是
+  // 「**停用账号也要能重测**」（`account-probe.ts` 模块头第 2 条设计）。
+  // 故这里**不传** `enabled`，用 `poolEntrySnapshot` 的缺省 `true`。
+  //
+  // UA 用产品默认值：`probeById` 是**模块级**常量（在 `apply()` 之前求值），
+  // 够不到那里懒探测出的真机版本。UA 只是伪装维度、服务端未校验真实性
+  // （见 opencode 接线块的注释），且**不影响**限流判定的结论。
+  opencode: {
+    // ⚠️ `OpencodeAdapterOptions` **没有** `credentialRef` / `resolveCredential`
+    // / `refresh` 这三项（其余 12 家的适配器有）：Zen 的身份就是槽本身，
+    // 适配器不做续期、也不按 ref 解析凭据。多传会被 tsc 直接点破。
+    createProbeAdapter: (_ref, credential, entry) => {
+      const credentialKey = (credential as OpencodeCredential | undefined)?.api_key
+      // 凭据坏掉/缺失时退回匿名 key：与主接线块同一兜底口径，
+      // 让探测报「账号不可用」而不是抛空指针。
+      const apiKey = typeof credentialKey === 'string' && credentialKey.length > 0
+        ? credentialKey
+        : OPENCODE.anonymousKey
+      return new OpencodeAdapter({
+        identitySlots: async () => listIdentitySlots(
+          [
+            poolEntrySnapshot({
+              id: entry?.id ?? OPENCODE.id,
+              apiKey,
+              // ⚠️ 刻意不传 `enabled`（缺省 true）：停用账号也要能重测。
+              proxy: entry?.opencodeProxy,
+              generation: entry?.opencodeFingerprintGeneration,
+            }),
+          ],
+          OPENCODE.defaultUserAgent,
+        ),
+      })
+    },
   },
 }
 
@@ -2202,22 +2273,18 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         // 仍是添加账号时的旧值。若直接透传凭据里的 fingerprint，代次涨了而
         // project id **纹丝不动** —— 用户点了「指纹」却什么都没换，且**不报错**，
         // 是最难排查的一类静默失效。
-        const generation = Math.max(
-          pool.opencodeFingerprintGenerationFor(entry.id),
-          0,
-        )
-        // ⚠️ **identity 选择**：匿名槽的 api_key 全是 `public`，用它派生会让
-        // N 条匿名通道拿到**同一个指纹**（彼此无法区分）。故匿名槽改用
-        // **条目 id** 作 identity —— 这正是「多个匿名账号各有独立指纹」的实现点。
-        const identity = apiKey === OPENCODE.anonymousKey ? entry.id : apiKey
-        const snapshot: PoolEntrySnapshot = {
+        //
+        // ⚠️ **派生收敛在 `poolEntrySnapshot`（唯一实现）**：探测路径（账号卡片
+        // 「重测」）也要造同一个投影，两处各写一份就会分叉 —— 而分叉的那一侧
+        // 恰好没有用例挡（identity 选错只是让多个匿名通道指纹相同，**不报错**）。
+        // 池字段是权威（`opencodeProxyFor` / `opencodeFingerprintGenerationFor`）。
+        return poolEntrySnapshot({
           id: entry.id,
-          enabled: entry.enabled,
           apiKey,
+          enabled: entry.enabled,
           proxy: pool.opencodeProxyFor(entry.id),
-          fingerprint: { projectId: deriveProjectId(identity, generation), generation },
-        }
-        return snapshot
+          generation: pool.opencodeFingerprintGenerationFor(entry.id),
+        })
       })),
       // 取值一次即可：`listIdentitySlots` 要的是字符串，不是惰性函数。
       // 首次调用时可能还是产品默认值（探测在后台跑），后续请求才用真机版本 ——

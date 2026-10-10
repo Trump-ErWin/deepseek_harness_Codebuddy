@@ -6,6 +6,7 @@ import { createJetHubStore, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock,
 import type { AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PermanentLockMap } from './jet-hub-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
 import type { PermanentLockStore } from './permanent-lock-store.js'
+import { normalizeOpencodeGeneration } from './opencode-auth.js'
 import type {
   CodeArtsCredential,
   ProviderAccountEntry,
@@ -1838,9 +1839,10 @@ export class AccountPool {
 
   /** 读取 opencode 指纹代次（未设置时为 0）。 */
   opencodeFingerprintGenerationFor(accountId: string): number {
-    const entry = this.readAccounts().find(a => a.id === accountId)
-    const value = entry?.opencodeFingerprintGeneration
-    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+    const value = this.readAccounts().find(a => a.id === accountId)?.opencodeFingerprintGeneration
+    // ⚠️ 归一化收敛在 `normalizeOpencodeGeneration`（唯一实现）：
+    //    槽组装那边读的是**池条目字段**，两边必须是同一判据。
+    return normalizeOpencodeGeneration(value)
   }
 
   /**

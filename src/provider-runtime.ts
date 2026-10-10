@@ -332,8 +332,21 @@ export interface ProviderRuntime {
      * ⚠️ 调用方（`probeWithAdapter`）已刻意**不传** `accountPool` /
      * `fetchRemoteModels`，并把 `refresh` 设为 no-op：探测只测这一个账号、
      * 不写限流标记、不触发全局续期、不为一次探测额外拉目录。
+     *
+     * ## ⚠️ 第三个参数 `entry` 是**账号池条目的只读投影**，不是可选的装饰
+     *
+     * 大多数家只需要 `credential` 就能造出适配器，故它可选。但 `opencode`
+     * **必须**用它：它的出口代理权威在池字段 `entry.opencodeProxy`（`setOpencodeProxy`
+     * 只写池、**不回写凭据**），指纹代次同理在 `entry.opencodeFingerprintGeneration`。
+     * 少了它，探测会走**错的出口 IP / 错的指纹**——而探测的全部意义正是
+     * 「用这个账号的真实出网条件打一次请求」。
+     *
+     * ⚠️ 早先这里有段注释称「opencode 需要整个 identitySlots 序列，故补它要
+     * 给 `ProbeDeps` 加池透传、属接口扩张」——**实测证伪**：探测只需**它自己
+     * 那一个**槽（`stream()` 只调 `identitySlots()`，不读目录，且探测路径本就
+     * 不传 `markLimited`）⇒ 由这一个 `entry` 就能投影出来，**无需**池。
      */
-    createProbeAdapter(refName: string, credential: unknown): LlmAdapter
+    createProbeAdapter(refName: string, credential: unknown, entry?: ProviderAccountEntry): LlmAdapter
   }
 }
 
