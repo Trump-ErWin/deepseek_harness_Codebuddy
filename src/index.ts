@@ -315,13 +315,16 @@ export function makeReadImageRequest(ctx: Context) {
  *
  * ## 谁必须在这里
  *
- * 判据是「该 provider 会不会写 `modelRateLimits`」（写了才有重测语义）。
+ * 判据是「该 provider 的适配器会不会写 `modelRateLimits`」（写了才有重测语义）。
  * 核对方式机械、不要靠记忆：
  *
- *     grep -n 'updateModelRateLimit(' src/*.ts
+ *     grep -n 'updateModelRateLimit(' src/*.ts        # 池侧写点
+ *     grep -n 'markLimited' src/*.ts                  # 适配器侧注入点
  *
- * 命中的适配器：buddy（含 workbuddy）/ lobsterai / qoder（含 qodercn）/
- * cline / zcode / trae / gemini / codearts / **loomy** / **raccoon**。
+ * 实测（2026-10-08 独立复审按上述两条重跑）：**会写标记的 provider 共 13 家**
+ * —— buddy、workbuddy、lobsterai、qoder、qodercn、cline、zcode、trae、
+ * gemini、codearts、loomy、raccoon、**opencode**。
+ * 本表登记其中 **12 家**（不含 `opencode`，见下 {@link PROBE_EXEMPT}）。
  *
  * ⚠️⚠️ **`loomy` 与 `raccoon` 是本次顺带修掉的第 5 次同型缺陷**：
  * 旧 `else if` 链里**没有它们的分支** ⇒ 它们落入 `else`，被交给
@@ -329,13 +332,29 @@ export function makeReadImageRequest(ctx: Context) {
  * 探测必然失败，而它们的限流标记（UTC+8 当日 24:00）**永远清不掉**。
  * 两者都实测会写 `modelRateLimits`（`loomy-adapter.ts` / `raccoon-adapter.ts`）。
  *
- * ⚠️ 反例：`minimax` **不写**标记 ⇒ 不需要 probe（实测 grep 无命中）。
- * `opencode` 同理（它的余额是本地派生的通道可用性，零网络）。
+ * ⚠️ **不在这里的两家，各自理由不同，别混为一谈**（详见 {@link PROBE_EXEMPT}）：
  *
- * ⚠️ **`accountTest` 目前只有 `gemini` 为 true** ⇒ 其余渠道在 UI 上**没有**
- * 重测按钮入口（`jet-hub.js` 的 `onTest: supportsAccountTest(provider)`）。
- * 故本表的完整性是**内部契约**，不是当前用户可见功能 —— 但缺一家就会在
- * 「将来给某家开入口」时立刻复发旧缺陷。
+ * - `minimax`：**不写**标记（实测两条 grep 均无命中）⇒ 本就没有可清的标记；
+ * - `opencode`：**写**标记（`opencode-adapter.ts` 3 处 `markLimited` →
+ *   `index.ts` 的 `markLimited` → `pool.updateModelRateLimit`），
+ *   但探测所需材料拿不到 ⇒ **形态不匹配**，是**登记在案的缺口**。
+ *
+ * ⚠️⚠️ **不要再写「`opencode` 不写标记」**（2026-10-08 原注释如此，独立复审
+ * 实测证伪）：它与「余额是本地派生的通道可用性、零网络」说的是**两件事** ——
+ * 后者是它不进积分表的理由（见 `provider-credits.ts`），前者是它进不进出本表的
+ * 判据。把前者当成后者的推论，恰好把一个**真实的漏挂**说成了「不需要」。
+ *
+ * ⚠️ **UI 入口**：`jet-hub.js` 里「重测所有」/「重置所有」/卡片级「重测」「重置」
+ * 都由 `supportsRateLimit(provider)` 门控（缺省 **true**），**不是**
+ * `accountTest`（那是另一个「测试」按钮的位）。原注释称「`accountTest` 只有
+ * `gemini` 为 true ⇒ 其余渠道没有入口」—— **该推论是错的**：`opencode` 没有
+ * `rateLimit: false` 豁免 ⇒ 这些按钮**会渲染** ⇒ 用户点「重测」会走到
+ * `retestAccount` ⇒ 命中本表缺项而抛「没有探测适配器」。
+ * ⇒ 本表的完整性**已经是用户可见功能**，不是「将来才复发」的内部契约
+ * （只有「测试」那一个按钮仍限 `gemini`）。
+ *
+ * ⚠️ 一致性与「漏一家」由 `tests/unit/probe-wiring.spec.ts` 从
+ * `PROVIDER_REGISTRY` + {@link PROBE_EXEMPT} 派生锁死（漏挂会让它**点名**变红）。
  */
 export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = {
   // CodeBuddy 系（buddy / workbuddy）→ BuddyAdapter，按各自 product 发请求。
@@ -1995,22 +2014,27 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
    * ⚠️ **必须是函数调用而不是在这里立即求值**：本行（`apply()` 中段）在
    * **注册循环之前**执行，而注册循环在 `apply()` 的**末尾**。立即求值会得到
    * **空表** ⇒ 所有 provider 都不再自动续期，而日志里只有 `isPoolEmpty`
-   * 的常规输出（与 Task 5 的 `WIRED_EXPIRY_PROVIDERS` 是同一类陷阱）。
+   * 的常规输出。
    *
    * ⇒ 改为在 `refreshAllCredentials` **内部**每次调用时现取（见下）。
    * 代价是一次极廉价的 Map 遍历；收益是**与注册时机彻底解耦**。
    *
-   * ⚠️ 原清单里的**注释已逐条上移到 `probeById`/`wiredRefreshTargets` 侧**或
-   * 保留在本函数上方，**不得静默丢弃**（Task 6 的主导失效类）：
+   * ⚠️ **与被删清单里的注释的关系**（2026-10-08 独立复审修正）：原先手抄的 13 行
+   * 各自带注释，删除时它们被**压缩成本函数上方这段 5 项摘要**（不是「逐条上移到
+   * `probeById` / `wiredRefreshTargets` 侧」—— 实测那两个符号处对这些家零命中）。
+   * 摘要保留的 5 个失效模式（**不得静默丢弃**，Task 6 的主导失效类）：
    * Loomy 不可续期（只探测已过期）、raccoon 的 lead 窗口、minimax 的
-   * refresh_token 轮换、zcode 静态凭据仍回写、**gemini 漏行会让定时器不武装**。
+   * refresh_token 轮换、zcode 静态凭据仍回写、gemini 漏挂的后果。
+   * ⚠️ 其中 gemini 那条的**后果措辞已过时**：定时器自 issue IKJOZB 起已改为
+   * **无条件武装**（只看池里有没有账号，不看续期表的成员资格）⇒ 漏挂 gemini 的
+   * 真实后果是「**gemini 凭据永不自动续期**」，**不是**「定时器不武装」。
    */
   async function refreshAllCredentials(): Promise<void> {
     // ⚠️ **每次现取**（wiredRefreshTargets() 是函数、读注册表）：注册发生在
-    //    pply() 末尾，而本函数最早在调度器 start() 的首轮就被调用 ⇒
+    //    apply() 末尾，而本函数最早在调度器 start() 的首轮就被调用 ⇒
     //    若在这里读一个**在注册前求值的常量**，会得到**空表** ⇒
     //    所有 provider 都不再自动续期，而日志里只有 isPoolEmpty 的常规输出
-    //    （与 Task 5 的 WIRED_EXPIRY_PROVIDERS 同一类陷阱）。
+    //    （⚠️ 注意 WIRED_EXPIRY_PROVIDERS **不属**这一类：它是刻意保留的纯数据清单，理由见 `aggregate-expiry.ts` 自己的注释。）
     for (const [tag, refreshAll] of wiredRefreshTargets()) {
       try {
         await refreshAll(pool)
@@ -2570,9 +2594,15 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
           refreshAccount: (refName, pool, accountId) =>
             auth.refreshAccountCredential(refName, pool, accountId),
           // ⚠️ **13 家都要挂**：漏一家 ⇒ 该家凭据**永不自动续期**，
-          //    而症状是「每隔一段时间就要重新登录」，且日志里一个字都没有
-          //   （`refresh-targets-derived.spec.ts` 与
-          //    `refresh-bootstrap-wiring.spec.ts` 各有一条断言锁这个）。
+          //    而症状是「每隔一段时间就要重新登录」，且日志里一个字都没有。
+          // ⚠️ **真正锁住这件事的只有 `provider-runtime-wiring.spec.ts`**
+          //    （它真跑 `apply()`，再逐个驱动 `auth.refreshAll` 并断言打到
+          //    **自己那个**实例）。2026-10-08 独立复审修正原注释：它原先点名
+          //    `refresh-targets-derived.spec.ts` 与 `refresh-bootstrap-wiring.spec.ts`
+          //    各有一条 —— 实测**两者都不 import `index.ts`**，
+          //    它们注册的是**自己的桩**再断言桩，改坏本段循环它们照样全绿
+          //    （`refresh-targets-derived.spec.ts` 的用例⑦ 现锁的是
+          //    `modelAdapters` 的键，与本段无关）。
           // ⚠️ 包一层而不是直接挂方法引用：直接挂会让 `this` 丢失
           //   （各家 `refreshAll` 内部用 `this.product` / `this.ctx`）。
           refreshAll: (pool) => auth.refreshAll(pool),
@@ -2592,8 +2622,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         //    两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁死。
         expiry: expiryOf(expiryTable, id),
         // ⚠️ 与其余域同法：`probeById[id]` 用 `Object.hasOwn` 语义（下标会命中原型链）。
-        // ⚠️ **只有 zcode / gemini / trae 注册** —— 其余如实为 `undefined`
-        //    （`adapterForProbe` 据此抛「不支持重测」，不落回 CodeArtsAdapter）。
+        // ⚠️ **`probeById` 现登记 12 家**（buddy / workbuddy / lobsterai / qoder /
+        //    qodercn / cline / zcode / trae / gemini / codearts / loomy / raccoon），
+        //    其余如实为 `undefined`（`adapterForProbe` 据此抛「不支持重测」，
+        //    不落回 CodeArtsAdapter）。
+        //    ⚠️ 原注释写「只有 zcode / gemini / trae 注册」，那是 Task 8 计划里的
+        //    **样例**被留在了原地（2026-10-08 独立复审发现）；完整名单与缺项
+        //    见 `probeById` 自己的头注释（别在这里再抄一份易腐的清单）。
         ...Object.hasOwn(probeById, id) ? { probe: probeById[id] } : {},
       })
       if (!registered) {

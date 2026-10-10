@@ -33,7 +33,6 @@ import type { ProviderAccountEntry } from '../../src/types.js'
 import { expectedProviderIdsWithAuth } from './provider-sets.js'
 
 /**
-/**
  * 13 个**可续期** provider —— **被测对象**（手写清单，故意不派生）。
  *
  * ## ⚠️ 它由 `EXPECTED_REFRESH_PROVIDER_IDS` 守着（Task 2 复审 Finding I-1）

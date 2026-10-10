@@ -830,7 +830,8 @@ export class AggregateAdapter extends LlmAdapter {
   /** 虚拟模型的展示名。
    *
    * ⚠️ **不加「（单渠道）」之类的后缀**（与 brief 初版的 `nameOf` 不同）：
-   * 设计文档 §12.1（`2026-10-06-aggregate-provider-design.md:669-673`）把新 provider
+   * 设计文档 §12.1（`docs/superpowers/specs/2026-10-06-aggregate-provider-design.md`
+   * 的「关于 `auto-adapter.ts` 的三处名字」一节）把新 provider
    * 定成「目录展示规范名 + 运行期渠道后缀」**单一形态**，并逐字写死三处的名字都是
    * 规范名（`listModels` / `resolveModel` → `DeepSeek V4.1 Flash`；`prepareCall`
    * → `DeepSeek V4.1 Flash · buddy`）。加后缀会让选择器与服务端目录名不一致，

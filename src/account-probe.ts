@@ -175,7 +175,13 @@ function isRateLimitFailure(error: unknown): boolean {
  *
  * ⇒ 改为查能力注册表：**未登记 ⇒ 抛可读错误**（带 provider 名）。
  * 这是**行为收紧**：未登记的渠道从「发一次必然失败的请求」变成「明确报不支持重测」。
- * 客户端能力表 `accountTest` 目前**只有 `gemini`**，故其余渠道本就没有入口。
+ * ⚠️ **该收紧是用户可见的**（2026-10-08 独立复审修正原注释的错误推论）：
+ * 原注释称「客户端能力表 `accountTest` 目前**只有 `gemini`**，故其余渠道本就没有入口」——
+ * 实测 `jet-hub.js` 里「重测所有」/「重置所有」/卡片级「重测」「重置」由
+ * **`supportsRateLimit`**（缺省 `true`）门控，与 `accountTest`（另一个「测试」按钮）
+ * **不是一个位** ⇒ 这些按钮对**所有未豁免 `rateLimit: false` 的渠道都会渲染**。
+ * 故本函数抛出的错误是**用户点得到**的路径（经 RPC 外层 catch 变成
+ * `jet-hub/handler-failed`），不是纯内部契约。
  *
  * ⚠️ 判据是 `runtime?.probe === undefined` —— **不能**只看 `runtimeOf(provider)`
  * 是否有值：只注册了 `expiry` 等其它域的 provider **同样不支持重测**。
@@ -242,14 +248,21 @@ async function probeWithAdapter(
   // ⚠️ **判据是「该 provider 会不会写 `modelRateLimits`」**（写了才有重测按钮、
   // 才需要在这里分派）。但**不要靠记忆维护清单**，直接机械核对写入方：
   //
-  //     grep -n 'updateModelRateLimit(' src/*.ts
+  //     grep -n 'updateModelRateLimit(' src/*.ts    # 池侧写点
+  //     grep -n 'markLimited' src/*.ts              # 适配器侧注入点
   //
-  // 命中者（除 `account-pool.ts` 的定义与 `account-probe.ts` 自身的回写）的每个
-  // 适配器都必须在这里有分支：buddy（含 workbuddy）/ lobsterai / qoder（含
-  // qodercn）/ cline / zcode / trae / codearts / **gemini**。反例：loomy 的
-  // 积分耗尽时静默降级、**不写**标记，故它落 else 无害（`retestAccount`
-  // 取不到 modelId 时根本不构造适配器）。新增 provider 时务必同步本分支，
-  // 并补 `tests/unit/account-probe-adapter.spec.ts` 的对应用例。
+  // ⚠️ **2026-10-08 独立复审修正：上面这段旧注释里有两处已过时的判断，
+  // 原文保留在下方供对照，但**不得**再按它们维护清单**：
+  //
+  // - 旧文说「反例：loomy 的积分耗尽时静默降级、**不写**标记，故它落 else 无害」
+  //   —— **实测证伪**：`loomy-adapter.ts` 有 `markLimited` 调用点，且 Task 8 已把
+  //   loomy **加入注册**（同段旧文的末尾也这么写了，两半自相矛盾）。
+  //   真相是：loomy 的**积分耗尽**确实静默降级不写标记，但它的**其它**限流类失败
+  //   会写 —— 判据要看「有没有写点」，不是「某一种失败写不写」。
+  // - 旧文说「反例：minimax 与 opencode **不写**标记」—— 对 minimax 成立，
+  //   对 **`opencode` 证伪**（`opencode-adapter.ts` 3 处 `markLimited`）。
+  //   opencode 不进 `index.ts` 的 probe 表是**另一个理由**（探测材料拿不到），
+  //   那个理由与该表写在一起，别在这里重复。
   // ⚠️ **2026-10-08 Task 8：本链已改为查能力注册表**（原为 `else if` 链 + `else` 兜底）。
   //
   // 原实现的 `else` 会把**未登记的 provider** 交给「**华为云 HMAC 签名**的
@@ -261,19 +274,10 @@ async function probeWithAdapter(
   // ⇒ 现在各家在 `src/index.ts` 注册 `probe.createProbeAdapter`，
   // **未登记 ⇒ 抛可读错误**（见 `adapterForProbe`），不再有 `else` 兜底。
   //
-  // ⚠️ **判据仍是「该 provider 会不会写 `modelRateLimits`」**（写了才有重测按钮、
-  // 才需要注册 probe）。核对方式是机械的，不要靠记忆：
-  //
-  //     grep -n 'updateModelRateLimit(' src/*.ts
-  //
-  // 命中者（除 `account-pool.ts` 的定义与 `account-probe.ts` 自身的回写）的每个
-  // 适配器都必须在 `index.ts` 注册 probe：buddy（含 workbuddy）/ lobsterai /
-  // qoder（含 qodercn）/ cline / zcode / trae / codearts / **gemini** /
-  // **loomy** / **raccoon**。
-  // 反例：minimax 与 opencode **不写**标记 ⇒ 不需要 probe
-  //（`retestAccount` 取不到 modelId 时根本不构造适配器）。
-  // 新增 provider 时**先跑上面那条 grep**，再补 `index.ts` 的注册与
-  // `tests/unit/account-probe-adapter.spec.ts` 的对应用例。
+  // 新增 provider 时**先跑上面那两条 grep**，再补 `index.ts` 的注册与
+  // `tests/unit/account-probe-adapter.spec.ts` 的对应用例；
+  // 「登记了哪些家、哪些家刻意不登记」由 `index.ts` 的 `probeById` 头注释
+  // 与 `PROBE_EXEMPT` 说明，本处不再重复一份易腐的清单。
   const adapter = adapterForProbe(entry.provider, entry.credentialRef, credential)
   try {
     for await (const _chunk of adapter.stream({

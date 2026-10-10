@@ -18,8 +18,13 @@ function codeOnly(source: string): string {
     .join('\n')
 }
 
+/** 剥掉注释：接线断言不该因为「注释里提到了某个符号」而通过。 */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
 describe('Qoder 宿主侧接线（src/index.ts）', () => {
-  const index = read('../../src/index.ts')
+  const index = stripComments(read('../../src/index.ts'))
 
   it('注册了 llm-qoder settings namespace（漏了会让模型设置页崩溃）', () => {
     // 模型设置页会用 provider id 计算 deriveKeyRef(provider)，

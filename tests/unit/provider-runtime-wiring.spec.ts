@@ -36,11 +36,18 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { Context } from '@deepseek-ai/cordis'
-import { apply } from '../../src/index.js'
+import { apply, probeById } from '../../src/index.js'
 import { clearProviderRuntimes, registeredRuntimeIds, runtimeOf } from '../../src/provider-runtime.js'
 import { PROVIDER_REGISTRY, descriptorOf } from '../../src/provider-registry.js'
-import { CREDITS_TABLE_EXEMPT, expectedProviderIdsWithAuth } from '../helpers/provider-sets.js'
+import {
+  CREDITS_TABLE_EXEMPT,
+  PROBE_EXEMPT,
+  WRITES_RATE_LIMIT_PROVIDERS,
+  expectedProviderIdsWithAuth,
+  expectedProviderIdsWithProbe,
+} from '../helpers/provider-sets.js'
 
 /**
  * 13 个**可续期** provider → 它在 `ctx` 上的服务名。
@@ -345,5 +352,89 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
       '右侧多出 = registry 里有而清单漏登记）',
     ).toEqual(shouldRegister)
+  })
+})
+
+/**
+ * ★ **`probe` 域的接线**（Task 8 复审补齐 —— 此前本域**零守卫**）。
+ *
+ * ## 为什么单独要一段
+ *
+ * Task 8 把「重测用的探测适配器」从 `account-probe.ts` 的 `else if` 链搬到了
+ * `src/index.ts` 的 `probeById` 表。那次搬迁**漏了 `opencode`**，而没有任何用例
+ * 变红 —— 因为 probe 域当时**一条守卫都没有**：其它四个域（auth / credits /
+ * onboarding / expiry）都有真跑 `apply()` 的 parity 用例，只有 probe 没有。
+ *
+ * ⇒ 该缺口是**用户可见**的：`opencode` 没有 `rateLimit: false` 豁免，
+ * 客户端「重测」按钮由 `supportsRateLimit`（缺省 `true`）门控 ⇒ 按钮会渲染 ⇒
+ * 用户点了会拿到「没有探测适配器」。
+ */
+describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守卫）', () => {
+  /** 由文件里的写点反推 provider（**明确登记**，改动写点时必须同步）。 */
+  const WRITE_SITE_FILES: ReadonlyArray<readonly [string, readonly string[]]> = [
+    ['buddy-adapter.ts', ['buddy', 'workbuddy']],
+    ['lobsterai-adapter.ts', ['lobsterai']],
+    ['qoder-adapter.ts', ['qoder', 'qodercn']],
+    ['cline-adapter.ts', ['cline']],
+    ['zcode-adapter.ts', ['zcode']],
+    ['trae-adapter.ts', ['trae']],
+    ['gemini-adapter.ts', ['gemini']],
+    ['llm-adapter.ts', ['codearts']],
+    ['loomy-adapter.ts', ['loomy']],
+    ['raccoon-adapter.ts', ['raccoon']],
+    // opencode 的写点是**注入式**的：`index.ts` 把 `markLimited` 传给
+    // `registerOpencodeLlm`，适配器内部 3 处调它（不是自己调 `updateModelRateLimit`）。
+    ['opencode-adapter.ts', ['opencode']],
+  ]
+
+  it('会写 modelRateLimits 的家 == 硬编码清单（漏一家即红）', () => {
+    // ⚠️ 这是**派生**而不是「断言源码含某字符串」：扫出来的集合与清单**双向**比对。
+    // 有人加了写点却忘更新清单 ⇒ 左侧多出 ⇒ 红；清单写了不存在的家 ⇒ 右侧多出 ⇒ 红。
+    const derived = new Set<string>()
+    for (const [file, providers] of WRITE_SITE_FILES) {
+      const text = readFileSync(new URL(`../../src/${file}`, import.meta.url), 'utf8')
+      const hasWrite = /markLimited|updateModelRateLimit\(/.test(text)
+      if (hasWrite) for (const p of providers) derived.add(p)
+    }
+    expect(
+      [...derived].sort(),
+      'WRITES_RATE_LIMIT_PROVIDERS 与源码写点漂移了：'
+      + '左侧多出 = 该家会写标记却没进清单（probe 守卫会漏判它），'
+      + '右侧多出 = 清单里写了一家已经不写标记的',
+    ).toEqual([...WRITES_RATE_LIMIT_PROVIDERS].sort())
+  })
+
+  it('probeById 恰好登记「会写标记 − PROBE_EXEMPT」的那些家', () => {
+    const expected = expectedProviderIdsWithProbe().sort()
+    expect(
+      Object.keys(probeById).sort(),
+      'probeById 与期望集合不一致：'
+      + '左侧多出 = 多注册了一家（要同时给出凭据形状与探测量），'
+      + '右侧多出 = **漏挂**（该家限流标记将永远清不掉，且用户点「重测」会报错）',
+    ).toEqual(expected)
+  })
+
+  it('豁免表里的每一家都确实会写标记（防「用不写标记」当借口重新引入漏挂）', () => {
+    // ⚠️ 这条正是本次缺陷的形态：原注释把 `opencode` 写成「不写标记，故不需要」——
+    //    那是**事实错误**。只要它进了豁免表，就必须同时出现在「会写标记」清单里，
+    //    否则说明有人在用「它不写」当豁免理由。
+    for (const id of PROBE_EXEMPT.keys()) {
+      expect(
+        WRITES_RATE_LIMIT_PROVIDERS.includes(id),
+        `${id} 在 PROBE_EXEMPT 里，但它不在 WRITES_RATE_LIMIT_PROVIDERS —— `
+        + '若它确实不写 modelRateLimits，那它就**不需要 probe、也不该进豁免表**，'
+        + '应直接从两张表里都删掉（豁免表只登记「会写但拿不到探测材料」的家）',
+      ).toBe(true)
+      // 且它**不得**同时在 probeById 里（否则豁免表是僵尸项）。
+      const runtime = runtimeOf(id)
+      expect(runtime?.probe, `${id} 既在豁免表又在 probe 注册里，二者矛盾`).toBeUndefined()
+    }
+  })
+
+  it('豁免理由不是空的（防止为「凑齐 12」而加无名豁免）', () => {
+    for (const [id, reason] of PROBE_EXEMPT) {
+      expect(reason.length, `${id} 的豁免理由太短，写清「为什么拿不到探测材料」`).toBeGreaterThan(30)
+    }
+    expect(PROBE_EXEMPT.size, '豁免表新增成员时必须复核本段的用例是否仍成立').toBe(1)
   })
 })

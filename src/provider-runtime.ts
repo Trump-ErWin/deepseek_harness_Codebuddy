@@ -658,7 +658,12 @@ export function registeredRuntimeIds(): string[] {
  * 注册发生在 `apply()`（`registerProviderRuntime`），而模块级常量在**模块加载时**
  * 求值 ⇒ 常量版本**恒为空表** ⇒ **所有 provider 都不再自动续期**，而日志里
  * 只有 `isPoolEmpty` 的常规输出。
- * （与 `aggregate-expiry.ts` 的 `wiredExpiryProviders()` 是**同一类陷阱**。）
+ *
+ * ⚠️ 反例对照：`src/aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS` **刻意保持
+ * 模块级常量**（理由与实测计数写在该文件里：29 处探针 + 86 处适配器构造都不调
+ * `apply()`），它与 runtime 的一致性由 `expiry-runtime-parity.spec.ts` 真跑
+ * `apply()` 的用例锁死。⇒ 「派生表必须是函数」这条**只适用于读注册表建索引的表**
+ * （本函数），不适用于纯数据清单 —— 别照搬本条去改那张常量。
  *
  * ## ⚠️ `this` 绑定
  *

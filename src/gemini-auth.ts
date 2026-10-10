@@ -188,7 +188,7 @@ export class GeminiAuth extends Service {
     return await this.readCredential(this.credentialRefName)
   }
 
-  /** 续期默认单凭据（`refreshTargets` 的兜底路径）。 */
+  /** 续期默认单凭据（批量续期表的兜底路径）。 */
   async refresh(): Promise<void> {
     const credential = await this.resolveDefaultCredential()
     if (credential === undefined) {

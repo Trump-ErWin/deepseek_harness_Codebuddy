@@ -126,21 +126,34 @@ describe('续期调度器：启动必须先跑一轮', () => {
     // ⇒ 改为**行为断言**：按注册表的期望集注册 runtime，再断言派生表**逐项相等**
     //    （而不是「包含」—— 多一家或少一家都要红，且失败信息点名是哪一家）。
     //
-    // ⚠️ 期望集从 `PROVIDER_REGISTRY` **派生**，不再手抄：
-    //    `channel: true` 减去**没有 auth 域**的家（`opencode` 没有续期概念）。
-    //    这与 `refresh-targets-derived.spec.ts` 是同一条判据的两个视角：
-    //    那里测**派生函数本身**，这里测**注册循环把 13 家都接上了**。
-    const { PROVIDER_REGISTRY, descriptorOf } = await import('../../src/provider-registry.js')
+    // ⚠️ **2026-10-08 独立复审修正：期望集必须用 `expectedProviderIdsWithAuth()`**。
+    //    原版用的是 `PROVIDER_REGISTRY.filter(d => d.channel)`（**14 家，含 opencode**），
+    //    而本仓库的单一事实来源是 **13 家**（`channel` 减去 `opencode` —— 它没有
+    //    续期概念）。同一条判据在 `jet-hub-rpc-auth-wiring.spec.ts` /
+    //    `provider-runtime-wiring.spec.ts` 里都写作 13，**只有这里写 14** ⇒
+    //    两处判据分叉：哪天给 opencode 补一个 `auth.refreshAll`，本文件会因为
+    //    「期望 14、实际 13」而红得**指向错误的修法**（去查 opencode，而真问题在别处）。
+    //    ⇒ 改用同一函数（判据本体由 `tests/helpers/provider-sets.ts` 单一持有）。
+    const { descriptorOf, PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const { clearProviderRuntimes, registerProviderRuntime, wiredRefreshTargets } =
       await import('../../src/provider-runtime.js')
+    const { expectedProviderIdsWithAuth } = await import('../helpers/provider-sets.js')
+
+    const expected = expectedProviderIdsWithAuth().sort()
+    // ⚠️ 先钉住判据集合本身，免得「期望集被某个改动悄悄改小」时本用例跟着一起绿。
+    expect(expected, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(13)
+    // ⚠️ 反方向：期望集里的每一个都必须**确实**在 registry 里有声明（防手抄漂移）。
+    for (const id of expected) {
+      expect(PROVIDER_REGISTRY.some((d) => d.id === id), `registry 缺少声明：${id}`).toBe(true)
+      expect(descriptorOf(id), `descriptorOf(${id}) 取不到`).toBeDefined()
+    }
 
     clearProviderRuntimes()
-    // 模拟 `index.ts` 的注册循环：每个 channel provider 都挂上 `refreshAll`。
+    // 模拟 `index.ts` 的注册循环：每个 channel（有 auth 域）的 provider 都挂上 `refreshAll`。
     // ⚠️ 这里**不**引入 `index.ts`（它是装配代码、会真起服务）——
     //    本用例锁的是「注册循环的**形状**（channel 家都有 auth.refreshAll）」
     //    与「派生表如实反映它」。
-    const channelIds = PROVIDER_REGISTRY.filter((d) => d.channel).map((d) => d.id)
-    for (const id of channelIds) {
+    for (const id of expected) {
       registerProviderRuntime({
         descriptor: descriptorOf(id)!,
         auth: { refreshAccount: async () => {}, refreshAll: async () => {} },
@@ -148,7 +161,8 @@ describe('续期调度器：启动必须先跑一轮', () => {
     }
 
     const derived = wiredRefreshTargets().map(([id]) => id).sort()
-    expect(derived).toEqual([...channelIds].sort())
+    expect(derived, '派生的准期表与期望集不一致（失败信息里的差集就是漏接/多接的那一家）')
+      .toEqual(expected)
     // ⚠️ 反向：表里每一项都必须真有 `refreshAll`（否则调度器调不存在的方法）。
     for (const [, refreshAll] of wiredRefreshTargets()) expect(refreshAll).toBeTypeOf('function')
     clearProviderRuntimes()
@@ -159,13 +173,16 @@ describe('续期调度器：启动必须先跑一轮', () => {
     // 与异常一起吞掉（issue 第 5.4 条）。现在收敛成一个循环 + 一处 warn。
     //
     // ⚠️ **2026-10-08 改（Task 10）**：循环的**数据源**从手抄的 `refreshTargets`
-    //    常量改为 `currentRefreshTargets()`（`wiredRefreshTargets()` 的惰性包装）。
+    //    常量改为 `wiredRefreshTargets()`（从能力注册表派生）。
     //    ⇒ 断言改为「循环读的是那个函数」，并**保留**「一处 warn、无空 catch」
     //    这两条与数据源无关的意图。
     const start = indexSource.indexOf('async function refreshAllCredentials')
     expect(start).toBeGreaterThan(-1)
     // 取到函数体结束（CRLF 安全：用正则找第一个「缩进两格的花括号」）
     const body = indexSource.slice(start, start + 800).split(/\r?\n  \}\r?\n/)[0] ?? ''
+    // ⚠️ `indexSource` 已在文件头部**剥过注释**（否则本行会被注释里逐字写出的
+    //    同名符号喂饱 —— 实测 `wiredRefreshTargets()` 在 `index.ts` 里共 2 处、
+    //    剥注释后只剩 1 处，差值那 1 处就在注释里）。
     expect(body).toMatch(/for \(const \[tag, refreshAll\] of wiredRefreshTargets\(\)\)/)
     expect(body).toContain('批量续期失败')
     expect(body).not.toMatch(/catch\s*\{\s*\}/)

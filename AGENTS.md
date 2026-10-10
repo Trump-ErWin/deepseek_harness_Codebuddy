@@ -205,12 +205,16 @@
 ⚠️ `src/service.ts`（codearts）此前**整份文件零 logger**，而它的令牌最短命 ——
 续期失败将完全无痕，现已补 `refreshAll` 两个分支的日志。
 
-测试：`tests/unit/expiry-sync.spec.ts`（19 条：lead 边界含 `<=`、一致不写盘、
+测试：`tests/unit/expiry-sync.spec.ts`（lead 边界含 `<=`、一致不写盘、
 1 秒容差、不传 refreshableOf、反查传凭据内容、回写失败不反噬、
 「有效期内仍须对账」、续期返回 undefined 时绝不落盘）+
-`tests/unit/refresh-bootstrap-wiring.spec.ts`（19 条：启动首轮排在定时器前、
-十个 provider 都在表里、九个 auth 的 `refreshAccountCredential` 都带
-pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）。
+`tests/unit/refresh-bootstrap-wiring.spec.ts`（启动首轮排在定时器前、
+**每个 channel provider** 都在表里、九个 auth 的 `refreshAccountCredential`
+都带 pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）。
+
+⚠️ **这里刻意不写条数**：原文写「（19 条…）」而 2026-10-08 复审实测该文件已 **21** 条
+（12 个 `it` + `it.each` 展开）—— 条数是**必然腐坏**的快照，接一个 provider
+就会失效，而「数字对不上」会让人怀疑整段约定。**条数以 `pnpm test` 输出为准。**
 
 ### ⚠️ 账号池的 `refreshable` 只是**凭据材料的镜像**，绝不能当续期门禁
 
@@ -503,10 +507,15 @@ UI 上完全看不到错误。
 - ⚠️ **`registerProviderRuntime` 重复注册时保留先注册者、返回 `false`、不抛错**：
   本仓库有**实测的 fiber 重启竞态**（新 fiber 的同步 `apply()` 与旧 fiber 的异步
   `dispose()` 交错），抛错会让整个插件加载失败。
-- ⚠️ **派生表必须是函数，不能是模块级常量**：`wiredRefreshTargets()` /
-  `wiredExpiryProviders()` 读的是注册表，而注册发生在 `apply()` 里 ⇒ 模块级常量
-  在**模块加载时**求值，会恒为空表。**症状是静默的**（所有 provider 都不再自动
-  续期/折算，日志里只有常规输出）。两条都有用例锁住。
+- ⚠️ **读注册表建索引的派生表必须是函数，不能是模块级常量**：
+  `wiredRefreshTargets()` / `registeredRuntimeIds()` 读的是注册表，而注册发生在
+  `apply()` 里 ⇒ 模块级常量在**模块加载时**求值，会恒为空表。**症状是静默的**
+  （所有 provider 都不再自动续期，日志里只有常规输出）。有用例锁住。
+  ⚠️ **纯数据清单不受本条约束**：`src/aggregate-expiry.ts` 的
+  `WIRED_EXPIRY_PROVIDERS` **刻意保持常量**（它不是从注册表读出来的索引，
+  改动会波及 29 处探针 + 86 处适配器构造），它与 runtime 的一致性改由
+  `expiry-runtime-parity.spec.ts` 真跑 `apply()` 的用例锁死。
+  别照搬本条去改那张表。
 - ⚠️ **查表用 `Object.hasOwn` / 导出的 `xxxOf()` 助手，不要用下标**：
   `table[id]` 会命中原型链上的键（如 `constructor`），与 `authOf` 同因。
 

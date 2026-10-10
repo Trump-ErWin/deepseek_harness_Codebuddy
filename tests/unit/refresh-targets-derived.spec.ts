@@ -12,13 +12,12 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 
 import { descriptorOf, PROVIDER_REGISTRY } from '../../src/provider-registry.js'
 import {
   clearProviderRuntimes,
-  registeredRuntimeIds,
   registerProviderRuntime,
-  runtimeOf,
   wiredRefreshTargets,
 } from '../../src/provider-runtime.js'
 
@@ -102,22 +101,63 @@ describe('wiredRefreshTargets：从注册表派生', () => {
 })
 
 describe('modelAdapters 的键集合守卫（行为断言）', () => {
-  it('⑦ registry 的 channel 集合 == 实际注册了 runtime 的 channel 集合', () => {
-    // ⚠️ **坦诚说明本判据的边界**：`modelAdapters` 的具体键最终由 `index.ts`
-    //    的对象字面量给出（装配代码，不可单测）。本用例锁的是**上游**——
-    //    「registry 认为的 channel 集合」与「实际注册了 runtime 的 channel 集合」一致。
-    //    `index.ts` 里 `modelAdapters` 漏一个键的现实防线是 `provider.status`
-    //    会为该 provider 报 `{ total: 0 }`（目录拿不到），而那在设置页上**可见**。
+  it('⑦ registry 的 channel 集合 == `index.ts` 里 modelAdapters 的键集合', () => {
+    // ⚠️ **2026-10-08 独立复审重写本条**。原版是**恒真**的：
+    //
+    //     for (const id of channelIds) {
+    //       if (runtimeOf(id) !== undefined) continue
+    //       registerProviderRuntime({ descriptor: descriptorOf(id)! })   // ← 自己注册
+    //     }
+    //     const runtimeChannels = registeredRuntimeIds()...                 // ← 再自断言
+    //     expect(runtimeChannels).toEqual(channelIds)                       // ← 恒成立
+    //
+    //  用例自己把缺的都补上再比对，断言的是「我刚注册的东西」，与 `index.ts` 的
+    //  `modelAdapters` **毫无关系** —— 漏一个键它照样绿。这是本仓库最重的一条红线
+    //  （同义反复 / 恒真用例比没有更糟：它看起来像个守卫）。
+    //
+    // ## 改成什么
+    //
+    // `modelAdapters` 是 `apply()` 内的**局部变量**，单测取不到实例，但它的
+    // **键**在源码里是逐行字面量（每行 `key: pruned(...)`）⇒ 可以**剥注释后**
+    // 精确提取，与 registry 的 channel 集合**双向**比对。
+    // ⚠️ 必须剥注释：本文件上方那段很长的注释里**逐字出现** `aggregate:` 形态。
+    const source = readFileSync(new URL('../../src/index.ts', import.meta.url), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+
+    const start = source.indexOf('const modelAdapters')
+    expect(start, 'index.ts 里找不到 modelAdapters 定义').toBeGreaterThan(-1)
+    const body = source.slice(start, source.indexOf('\n  }', start))
+    // 顶层键：四空格缩进 + `id:`（值是 `pruned(...)` 或任意表达式）。
+    const keys = [...body.matchAll(/^ {4}([a-z][a-z0-9]*):/gm)].map((m) => m[1]).sort()
+    expect(keys.length, 'modelAdapters 提取到的键太少，说明提取正则与源码形态脱节了')
+      .toBeGreaterThanOrEqual(13)
+
     const channelIds = PROVIDER_REGISTRY.filter((d) => d.channel).map((d) => d.id).sort()
+    // ⚠️ **`aggregate` 是登记在案的例外**（实测 `channel: false` 只有它一家）：
+    //    它必须进本表，理由与别家**相反** —— 别的家进表是为了「关闭时把模型写进
+    //    黑名单」，而聚合层**明确不参与**该机制（`pruned(..., { enabled: false })`，
+    //    见 `index.ts` 那段长注释 §5.2）。它进表是为了 `fullCatalogIds` 能拿到
+    //    **不套黑名单**的全量目录；漏了它会让「关闭整个聚合 provider」时
+    //    只拿到未被关闭的 id。⇒ 它**不该**被当成「多余的键」删掉。
+    const EXTRA_KEYS = ['aggregate']
+    const expected = [...channelIds, ...EXTRA_KEYS].sort()
+    expect(
+      keys,
+      'modelAdapters 的键与期望集合不一致：'
+      + '左侧多出 = 表里多了个未登记的键（若是新例外，请连同理由加进 EXTRA_KEYS，'
+      + '别默默放过），'
+      + '右侧多出 = **漏键**（该 provider 的「显示列表」拿不到全量目录 ⇒ '
+      + '关闭它时模型不会被写进黑名单，出现「provider 已关闭、模型仍可选」的矛盾态）',
+    ).toEqual(expected)
 
-    for (const id of channelIds) {
-      if (runtimeOf(id) !== undefined) continue
-      registerProviderRuntime({ descriptor: descriptorOf(id)! })
+    // ⚠️ 反向：`EXTRA_KEYS` 里的每一个都必须**确实不是** channel —— 否则它该由
+    //    channel 集合覆盖，留在例外名单里会让「漏键」被例外掩盖。
+    for (const id of EXTRA_KEYS) {
+      expect(
+        descriptorOf(id)?.channel,
+        `${id} 在 EXTRA_KEYS 里却有 channel: true —— 应从例外名单删掉`,
+      ).not.toBe(true)
     }
-
-    const runtimeChannels = registeredRuntimeIds()
-      .filter((id) => descriptorOf(id)?.channel === true)
-      .sort()
-    expect(runtimeChannels).toEqual(channelIds)
   })
 })

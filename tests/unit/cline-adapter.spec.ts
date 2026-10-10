@@ -122,6 +122,11 @@ async function collect(
   return out
 }
 
+/** 剥掉注释：接线断言不该因为「注释里提到了某个符号」而通过。 */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
 describe('ClineAdapter 模型目录', () => {
   it('免费模型在 name 里标出（远端 free 集合驱动）', async () => {
     const adapter = makeAdapter()
@@ -802,7 +807,7 @@ describe('Cline 接线（源码级回归）', () => {
   const read = (rel: string): string => readFileSync(resolve(root, rel), 'utf8')
 
   it('index.ts 注册 cline 服务、适配器与续期', () => {
-    const source = read('src/index.ts')
+    const source = stripComments(read('src/index.ts'))
     expect(source).toContain('registerClineLlm')
     expect(source).toContain('new ClineAuth(ctx)')
     // 只断言「cline 在续期调度里、且真的被传了池」—— 用 `(pool|p)` 同时接受
