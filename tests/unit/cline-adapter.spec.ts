@@ -16,6 +16,7 @@ import {
   resetClineRequestHistory,
 } from '../../src/cline-request-log.js'
 import { descriptorOf } from '../../src/provider-registry.js'
+import { accountEntry, refreshHarness } from '../helpers/rpc-refresh.js'
 import { PROVIDER_ICONS } from '../../plugin-src/client/provider-icons.js'
 import { CREDITS_CAPABILITIES } from '../../plugin-src/client/credits-capabilities.js'
 
@@ -827,12 +828,23 @@ describe('Cline 接线（源码级回归）', () => {
     expect(descriptorOf('cline')?.settingsNamespace).toBe('llm-cline')
   })
 
-  it('jet-hub-rpc.ts 为 cline 接上登录、续期与余额三个分派点', () => {
+  it('jet-hub-rpc.ts 为 cline 接上登录、续期与余额三个分派点', async () => {
     const source = read('src/jet-hub-rpc.ts')
     expect(source).toContain('cline.startLogin({ refName })')
-    // `[^)]*` 容忍签名扩展：续期成功后要把新 `expiresAt` 写回账号池，
-    // 故调用点带着 `pool, entry.id`（issue !IKIRTT）—— 写死整串会一改签名就假失败。
-    expect(source).toMatch(/cline\.refreshAccountCredential\(entry\.credentialRef[^)]*\)/)
+    // ⚠️ 2026-10-08 改（Task 2）：原先这条断言
+    //    `/cline\.refreshAccountCredential\(entry\.credentialRef[^)]*\)/`
+    //    —— 扫的是 `account.refresh` 里 13 个同构 `case` 中的 cline 那一个。
+    //    Task 2 把它们收敛成一处查表（`authOf(auths, entry.provider)`）
+    //    ⇒ 该文本形态**不存在了**，而它守的意图（cline 的续期接上了、
+    //    且刷的是池内那个 ref）**与文本无关**。
+    //    ⇒ 改为**行为**断言：驱动端点，断言 cline 账号的续期**恰好**落到
+    //    cline 桩上、且 ref 就是池内条目那个（不是默认单凭据 ref）。
+    const target = accountEntry('cline', 'CLINE_ACCOUNT_WIRE')
+    const harness = refreshHarness([target])
+    const result = await harness.call(target.id)
+    expect(result.ok, `cline 续期应成功，实际 error=${result.error?.message}`).toBe(true)
+    expect(harness.calls.map((c) => c.provider), 'cline 账号串到了别的实例').toEqual(['cline'])
+    expect(harness.calls[0]?.ref).toBe('CLINE_ACCOUNT_WIRE')
     expect(source).toContain('fetchClineCreditBalance(credential, CLINE)')
     // 签到必须显式拒绝（而不是落到 unsupported provider 的泛化文案）
     expect(source).toContain('Cline 不支持每日签到')

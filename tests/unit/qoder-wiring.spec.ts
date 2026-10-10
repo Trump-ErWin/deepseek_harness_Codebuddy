@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { descriptorOf } from '../../src/provider-registry.js'
+import { QODER, QODER_CN } from '../../src/qoder-product.js'
 import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
+import { accountEntry, refreshHarness } from '../helpers/rpc-refresh.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const read = (p: string): string => readFileSync(resolve(here, p), 'utf8')
@@ -93,14 +95,32 @@ describe('Qoder Jet Hub RPC 分支（src/jet-hub-rpc.ts）', () => {
     expect(code).toContain('auth.startLogin({ refName })')
   })
 
-  it('account.refresh 分派包含 qoder', () => {
-    // 重构后走同族注册表：实例由 `requireQoderFamily(entry.provider).auth` 取得，
-    // 两个 provider id 共用同一个 case（见下面的注册表 describe）。
-    // `[^)]*` 容忍签名扩展：现在还要传 `pool` + `entry.id`，
-    // 续期成功后才能把新 `expiresAt` 回写账号池（issue !IKIRTT）。
-    expect(codeOnly(rpc)).toMatch(
-      /requireQoderFamily\(entry\.provider\)\.auth\.refreshAccountCredential\(entry\.credentialRef[^)]*\)/,
-    )
+  /**
+   * ⚠️ 2026-10-08 改（Task 2）：原先这条断言 `requireQoderFamily(entry.provider).auth`
+   * 出现在 `account.refresh` 的分派里 —— 那是**同族注册表**时代的写法
+   *（`case QODER.id: case QODER_CN.id:` 共用一条）。Task 2 把 13 个同构 case
+   * 收敛成一处 `authOf(auths, entry.provider)` 查表 ⇒ 分派不再需要知道
+   * 「谁是 Qoder 同族」，`qodercn` 与 `qoder` 各自是**独立的一个键**。
+   *
+   * ⇒ 改为**行为**断言：两站的续期各刷各的（互不串用），且**恰好**落到自己那个桩上。
+   *    这比原文本断言强：原断言只能证明源码里有那串字符，本断言能证明
+   *    「中国版账号不会串到国际版实例」—— 那才是这条守的缺陷形态。
+   */
+  it('account.refresh 分派含 qoder 与 qodercn，且两站各刷各的（行为断言）', async () => {
+    const intl = accountEntry(QODER.id, 'QODER_ACCOUNT_WIRE_INTL')
+    const cn = accountEntry(QODER_CN.id, 'QODERCN_ACCOUNT_WIRE_CN')
+    const harness = refreshHarness([intl, cn])
+
+    const intlResult = await harness.call(intl.id)
+    expect(intlResult.ok, `国际版续期应成功，实际 error=${intlResult.error?.message}`).toBe(true)
+    expect(harness.calls.map((c) => c.provider)).toEqual([QODER.id])
+    expect(harness.calls[0]?.ref).toBe('QODER_ACCOUNT_WIRE_INTL')
+
+    const cnResult = await harness.call(cn.id)
+    expect(cnResult.ok, `中国版续期应成功，实际 error=${cnResult.error?.message}`).toBe(true)
+    // 累计两次：第二次**只**多了 qodercn —— 串到国际版就会看到 qoder 出现两次。
+    expect(harness.calls.map((c) => c.provider)).toEqual([QODER.id, QODER_CN.id])
+    expect(harness.calls[1]?.ref).toBe('QODERCN_ACCOUNT_WIRE_CN')
   })
 
   it('credits.balances 有 Qoder 同族分支（余额接口只需 Bearer，可用）', () => {
@@ -265,12 +285,28 @@ describe('Qoder 同族 RPC 注册表（src/jet-hub-rpc.ts）', () => {
     expect(loginBlock).not.toContain('fetchQoderUserNickname(credential, QODER)')
   })
 
-  it('单账号续期分派覆盖两个 provider id', () => {
-    const refreshStart = code.indexOf('switch (entry.provider)')
-    const refreshBlock = code.slice(refreshStart, refreshStart + 2400)
-    expect(refreshBlock).toContain('case QODER.id:')
-    expect(refreshBlock).toContain('case QODER_CN.id:')
-    expect(refreshBlock).toContain('requireQoderFamily(entry.provider).auth')
+  /**
+   * ⚠️ 2026-10-08 改（Task 2）：原先这条切出 `switch (entry.provider)` 那段，
+   * 断言里面有 `case QODER.id:` / `case QODER_CN.id:` / `requireQoderFamily(...)`。
+   * 那些文本形态在查表分派后**都不存在了** —— 而它们守的意图是
+   * 「两个 provider id 都被接上、且各用各的实例」，那**与文本无关**。
+   *
+   * ⇒ 改为断言**同族注册表仍然存在**（它服务于登录 / 余额 / 领取三处，Task 2
+   *    **没有**动那些分支）+ 「`account.refresh` 走查表」这个结构。
+   *    「两站续期各刷各的」由上面那条**行为**用例守。
+   */
+  it('单账号续期改走查表；同族注册表仍服务于其余三处分支', () => {
+    const refreshStart = code.indexOf("case 'account.refresh':")
+    expect(refreshStart, '找不到 account.refresh 分支').toBeGreaterThan(-1)
+    const refreshBlock = code.slice(refreshStart, refreshStart + 4000)
+    expect(refreshBlock).toContain('authOf(auths, entry.provider)')
+    // 分派不再需要同族判定（qoder / qodercn 是**两个独立的键**）。
+    expect(refreshBlock).not.toContain('requireQoderFamily')
+    // 但同族注册表本身**必须还在** —— 登录 / 余额 / 领取三处仍按它判定
+    //（见下面「Qoder 同族 RPC 注册表」describe 的用例）。
+    expect(code).toContain('{ product: QODER, auth: qoder }')
+    expect(code).toContain('{ product: QODER_CN, auth: qoderCn }')
+    expect(code).toContain('requireQoderFamily(')
   })
 
   it('领取分支仍传 precheckStatus: false（流程自带活动查询）', () => {

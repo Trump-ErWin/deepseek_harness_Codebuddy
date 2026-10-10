@@ -31,7 +31,19 @@ describe('Raccoon 的 RPC 分派', () => {
     // account.create
     expect(branchOf('} else if (provider === RACCOON.id)')).toMatch(/raccoon\.startLogin\(\)/)
     // account.refresh
-    expect(branchOf('case RACCOON.id:')).toMatch(/raccoon\.refreshAccountCredential/)
+    //
+    // ⚠️ 2026-10-08 改（Task 2）：原先这里是 `branchOf('case RACCOON.id:')`
+    //    + `/raccoon\.refreshAccountCredential/` —— 一个**源码文本**断言。
+    //    Task 2 把 13 个同构 `case` 换成一处查表（`authOf(auths, entry.provider)`）
+    //    ⇒ `case RACCOON.id:` 这个形态**不存在了**，而它守的意图
+    //    （raccoon 账号的续期落到 raccoon 实例上）**与文本无关**。
+    //    ⇒ 改为**行为断言**（真驱动端点、看哪个桩被调用），见
+    //    `lobsterai-rpc-dispatch.spec.ts` 的「七个 provider 各自分派到对应服务」
+    //    与「13 个 provider 逐个覆盖」两组用例 —— 它们用**派生**的
+    //    `REFRESH_PROVIDERS` 清单，新增 provider 时自动跟上。
+    //    此处保留一条**结构性**断言（而不是删掉整段）：确认 `account.refresh`
+    //    真的走查表分派，而不是退回成某个 provider 专属的硬编码分支。
+    expect(branchOf("case 'account.refresh':")).toMatch(/authOf\(auths, entry\.provider\)/)
     // credits.balances —— ⚠️ 该文件里 `if (req.provider === RACCOON.id)` 出现多次，
     // 故用**该分支独有的**注释锚点定位，避免命中 onboarding 的那一处。
     const balanceAnchor = rpcSource.indexOf('余额来自 `GET /points/v1/balance`')

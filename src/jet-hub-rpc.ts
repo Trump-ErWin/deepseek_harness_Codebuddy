@@ -2286,7 +2286,7 @@ function registerJetHubEndpoints(
           const entry = accounts.find((a) => a.id === req.accountId)
           if (!entry) throw new Error(`Account ${req.accountId} not found`)
 
-          // 按 **entry.provider** 分派到对应服务，并调用**按凭据 ref 的**
+          // 按 **entry.provider** 查 `auths` 命名对象分派，并调用**按凭据 ref 的**
           // 续期入口 —— 三处都是修复既有缺陷的关键：
           //
           // 1. 原实现只处理 codearts / buddy，`workbuddy` 会落到 else 抛
@@ -2295,7 +2295,7 @@ function registerJetHubEndpoints(
           //    **默认单凭据 ref**（如 BUDDY_ACCESS_TOKEN），而要刷的是池内条目的
           //    BUDDY_ACCOUNT_XXX —— 于是「刷这个账号」实际刷的是另一个凭据，
           //    结果要么报错要么静默改了错的对象。
-          // 3. ⚠️ **每个分支都必须传 `pool` + `entry.id`**（issue !IKIRTT）：
+          // 3. ⚠️ **分派必须传 `pool` + `entry.id`**（issue !IKIRTT）：
           //    续期成功后要把新的 `expiresAt` 写回账号池，UI 才不再显示
           //    「已过期」。早先只有 raccoon 分支传了，其余七个分支漏传，
           //    凭据续好了、界面纹丝不动，用户没有任何自救手段。
@@ -2304,75 +2304,32 @@ function registerJetHubEndpoints(
           // 「刷新」按钮（按钮是 测试/重测/重置/停用/代理/指纹/删除），
           // 调用方是仓库外的脚本/手工 RPC。下面三处历史注释曾把它写成
           // 「账号卡片的刷新按钮」——那是失实的，会把排障的人引到不存在的 UI。
-          switch (entry.provider) {
-            case 'codearts':
-              await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case 'buddy':
-              await buddy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case 'workbuddy':
-              await workbuddy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case LOBSTERAI.id:
-              await lobsterai.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case QODER.id:
-            case QODER_CN.id:
-              // 同协议族：按 provider 找到对应实例。
-              // ⚠️ 只刷传入的这个 ref，不碰默认单凭据 ref（历史缺陷同因）。
-              // ⚠️ **不要**图省事写 `qoder.refreshAccountCredential(...)` ——
-              // 那会让中国版账号的续期去刷国际版的凭据（两站 token 不通用，
-              // CN 永远续不动而国际版被无谓刷一次）。该串用由
-              // `lobsterai-rpc-dispatch.spec.ts` 的行为级用例锁死（已做反向验证）。
-              await requireQoderFamily(entry.provider).auth.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case TRAE.id:
-              await trae.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case CLINE.id:
-              await cline.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case LOOMY.id:
-              // ⚠️ Loomy **没有 refresh 端点**：这里只能做**有效性探测**，
-              // 失效时抛「请重新登录」。见 LoomyAuth.refreshAccountCredential。
-              await loomy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case RACCOON.id:
-              // raccoon **有** refresh 端点（refresh_token 轮换），这里是真续期。
-              // ⚠️ 只读写传入的 ref，不碰默认单凭据 ref。
-              // ⚠️ **必须传 pool + entry.id**：续期后要把新的 `expiresAt` 写回
-              // 账号池，否则 UI 一直显示「已过期」（真实缺陷：JWT 已续到 15:09、
-              // 账号池仍是 12:02，相差 3.1 小时，但功能完全正常）。
-              await raccoon.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case MINIMAX.id:
-              // MiniMax **有** refresh 端点（`/oauth2/token` 的 refresh_token 授权），
-              // 这里是真续期。⚠️ 必须传 pool + entry.id —— 续期后要把新的
-              // `expiresAt` 写回账号池，否则 UI 一直显示「已过期」。
-              await minimax.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case ZCODE.id:
-              /**
-               * zcode **没有 refresh 端点**（凭据是静态的，与 Loomy 同类）。
-               *
-               * 但这个方法仍做实事：**逐账号重读自己的 ref 并规范化回写** ——
-               * 用户重新登录后重新调用 `account.refresh` 即可生效而无需重启 DSH。
-               * 凭据不可用时如实抛错（引导用户重新登录该账号）。
-               */
-              await zcode.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            case GEMINI.id:
-              // Gemini **有** refresh 端点（`oauth2.googleapis.com/token` 的
-              // `refresh_token` grant），这里是真续期。
-              // ⚠️ 必须传 pool + entry.id —— 续期后要把新的 `expiresAt` 写回
-              // 账号池，否则 UI 一直显示「已过期」而实际能正常发消息。
-              // ⚠️ Google 会**轮换 refresh_token**，`GeminiAuth` 内部已回写新值。
-              await gemini.refreshAccountCredential(entry.credentialRef, pool, entry.id)
-              break
-            default:
-              throw new Error(`Unknown provider: ${entry.provider}`)
+          //
+          // ⚠️ 2026-10-08 改（Task 2）：原先这里是一个 13 个 case 的 switch，
+          // 而**每个分支体都是同一行调用**（`auth.refreshAccountCredential(
+          // entry.credentialRef, pool, entry.id)`），只有实例名不同 —— 纯粹重复，
+          // 且历史上漏接过 `workbuddy`（它对 `account.refresh` 一直报
+          // `Unknown provider`）。分支越多，漏接概率越高。
+          //
+          // ⚠️ **查 `auths` 形参，不查全局注册表**（`provider-runtime.ts`）：
+          //    `auths` 是 Task 9 引入的命名对象，其**键就是 provider id**
+          //    （含 `qodercn`，注意不是变量名 `qoderCn`）。用形参而非全局 Map
+          //    的三个好处：① 测试仍可**直接传桩**控制分派（零全局可变状态）；
+          //    ② 不会与「真跑 apply()」的测试互相污染；③ 闭包捕获的是**本次注册
+          //    的那批实例**，语义上更紧。全局注册表留给**真正跨模块**的消费点
+          //    （Task 5 的 aggregate-expiry、Task 8 的 account-probe）。
+          const auth = authOf(auths, entry.provider)
+          if (auth === undefined) {
+            // ⚠️ 文案必须保持**可读且指明原因**，不要退化成泛化的 unsupported：
+            //    opencode 是「该产品没有续期概念」（凭据是静态 API key），
+            //    而未知 id 是「没注册」。两者都要让排查者看懂。
+            throw new Error(
+              descriptorOf(entry.provider) === undefined
+                ? `Unknown provider: ${entry.provider}`
+                : `Provider ${entry.provider} 不支持续期（它的凭据不是可续期类型）`,
+            )
           }
+          await auth.refreshAccountCredential(entry.credentialRef, pool, entry.id)
           return { ok: true, value: { success: true } }
         } catch (error) {
           /**

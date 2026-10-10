@@ -36,6 +36,7 @@ import { CREDITS_CAPABILITIES } from '../../plugin-src/client/credits-capabiliti
 import { PROVIDER_ICONS } from '../../plugin-src/client/provider-icons.js'
 import { PROVIDER_REGISTRY, descriptorOf } from '../../src/provider-registry.js'
 import { jetHubAuthsCallKeys, jetHubAuthsInterfaceKeys } from '../helpers/jet-hub-auths.js'
+import { accountEntry, refreshHarness } from '../helpers/rpc-refresh.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const readClient = (name: string): string =>
@@ -512,9 +513,30 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     expect(source).toMatch(/else if \(provider === ZCODE\.id\) \{/)
   })
 
-  it('★ account.refresh 的 switch 有 zcode case（否则该端点报 Unknown provider）', () => {
+  /**
+   * ⚠️ 2026-10-08 改（Task 2）：原先这条断言 `expect(readRpc()).toMatch(/case ZCODE\.id:/)`
+   * —— 扫的是 `account.refresh` 那 13 个同构 `case` 里的 zcode 那一个。
+   * Task 2 把它们收敛成一处查表（`authOf(auths, entry.provider)`）
+   * ⇒ 该文本形态**不存在了**，而它守的意图（zcode 的续期接上了、不再报
+   * `Unknown provider`）**与文本无关**。
+   *
+   * ⇒ 改为断言**结构**（真的走查表分派）+ **行为**（zcode 的续期落到 zcode 桩上）。
+   *    行为那一半用 `refreshHarness` 直接驱动端点，比文本断言强：文本只能证明
+   *    源码里有那串字符，行为能证明实参真的落到了 zcode 上。
+   */
+  it('★ account.refresh 走查表分派，且 zcode 账号的续期落到 zcode 桩上', async () => {
     // ⚠️ 该端点**没有面板入口**（issue IKJOZA 取证），别在测试名里写「刷新按钮」。
-    expect(readRpc()).toMatch(/case ZCODE\.id:/)
+    const source = readRpc()
+    const refreshStart = source.indexOf("case 'account.refresh':")
+    expect(refreshStart, '找不到 account.refresh 分支').toBeGreaterThan(-1)
+    expect(source.slice(refreshStart, refreshStart + 4000))
+      .toMatch(/authOf\(auths, entry\.provider\)/)
+
+    const target = accountEntry(ZCODE.id, 'ZCODE_ACCOUNT_WIRE')
+    const harness = refreshHarness([target])
+    const result = await harness.call(target.id)
+    expect(result.ok, `zcode 续期应成功，实际 error=${result.error?.message}`).toBe(true)
+    expect(harness.calls.map((c) => c.provider)).toEqual([ZCODE.id])
   })
 
   it('★ credits.balances 与 credits.claimAll 都接了 zcode', () => {

@@ -35,7 +35,7 @@ import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
 import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
-import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
+import { buildRaccoonNickname, registerJetHubRpc, type JetHubAuthLike } from './jet-hub-rpc.js'
 import { ALL_PRODUCTS, CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { installLoopResume } from './loop-recovery.js'
@@ -66,10 +66,12 @@ import type { RaccoonCredential } from './raccoon.js'
 import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
 import { MINIMAX } from './minimax-product.js'
-// ⚠️ 只有本文件的 namespace 清单派生需要它（`registerProviderSettings` 的实参）。
+// ⚠️ `PROVIDER_REGISTRY` 供 namespace 清单派生（`registerProviderSettings` 的实参）；
+//    `descriptorOf` 供**能力注册表**逐项取元数据（见下面的注册段）。
 //    brief 原稿称「Task 1 已加过 `descriptorOf`，合并进同一行」，实测**没有** ——
-//    故只导入真正用到的 `PROVIDER_REGISTRY`，不留未使用导入。
-import { PROVIDER_REGISTRY } from './provider-registry.js'
+//    故 Task 2 才把它并进本行。
+import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
+import { registerProviderRuntime } from './provider-runtime.js'
 import type { MinimaxCredential } from './minimax.js'
 import { GeminiAuth } from './gemini-auth.js'
 import { registerGeminiLlm } from './gemini-adapter.js'
@@ -2372,10 +2374,71 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 见 `jet-hub-rpc.ts` 的 `JetHubAuths` 注释）。本地变量名沿用既有惯例。
   // 写成 `qoderCn:` 会编译失败（接口没有该键），这正是我们要的。
   //
-  // ⚠️ **分派现状（别把上一句读成已实现）**：`account.refresh` 目前仍走
-  // `switch (entry.provider)` + `requireQoderFamily`，**尚未**改成
-  // `authOf(auths, entry.provider)` 查表分派 —— 那是 Task 2 的改动。本次（Task 9）
-  // 只做了「位置参数 → 命名对象」这一步：`authOf` 已备好，但还没有调用点。
+  // ⚠️ **分派现状**：`account.refresh` **已**改成 `authOf(auths, entry.provider)`
+  // 查表分派（Task 2 完成，见 `jet-hub-rpc.ts` 的 `account.refresh` 分支）——
+  // Task 9 引入命名对象时还在的那 13 个同构 `switch (entry.provider)` case
+  // （含 `requireQoderFamily` 取 Qoder 同族实例那一处）**已整体删除**。
+  // 上面「键必须是 provider id」那条约定正是该查表能命中 `qodercn` 的前提。
+  // ===== 能力注册表（设计文档 §3.3）=====
+  //
+  // ⚠️ **本段是前瞻接线**（2026-10-08 调序后修正）：`account.refresh` 的分派
+  //    **不走**这张表 —— 它查 Task 9 引入的 `auths` 形参（见 `jet-hub-rpc.ts` 的
+  //    `authOf`）。本表是给**真正跨模块**的消费点用的：Task 5 的
+  //    `aggregate-expiry.ts` 与 Task 8 的 `account-probe.ts` ——
+  //    那两个模块拿不到 `auths` 形参。
+  //
+  // ⚠️ 仍必须在**所有 provider 实例都已创建之后**注册：实例要先存在。
+  //
+  // ⚠️ 注册的是**引用**，不是快照：`registerProviderRuntime` 只记 Map 条目，
+  //    各 auth 实例的后续状态变化（凭据缓存、队列）对它透明。
+  //
+  // ⚠️ 这里**不注册 opencode**（它没有续期概念）与 aggregate / auto
+  //    （虚拟 provider，无账号无凭据）。它们的 runtime 只有 descriptor。
+  {
+    const registry: ReadonlyArray<readonly [string, JetHubAuthLike]> = [
+      ['codearts', service],
+      ['buddy', buddy],
+      ['workbuddy', workbuddy],
+      ['lobsterai', lobsterai],
+      ['qoder', qoder],
+      ['qodercn', qoderCn],
+      ['trae', trae],
+      ['cline', cline],
+      ['loomy', loomy],
+      ['raccoon', raccoon],
+      ['minimax', minimax],
+      ['zcode', zcode],
+      ['gemini', gemini],
+    ]
+    for (const [id, auth] of registry) {
+      const descriptor = descriptorOf(id)
+      if (descriptor === undefined) {
+        // ⚠️ 不静默跳过：registry 与这里的清单漂移会表现为「某个 provider 的功能没了」。
+        ctx.logger?.warn?.(`[jet-hub] provider registry 缺少声明：${id}`)
+        continue
+      }
+      // ⚠️ 返回值必须判：`false` 表示「已存在、跳过了本次」——
+      //    那发生在 **fiber 重启竞态**（新 apply 与旧 dispose 交错），是正常现象，
+      //    记一条 info 即可（不是错误）。静默忽略会让「某个 provider 的注册被跳过」
+      //    在日志里无痕。
+      const registered = registerProviderRuntime({
+        descriptor,
+        auth: {
+          // ⚠️ 只传三个参数、顺序固定 —— 各家的 `refreshAccountCredential` 签名一致
+          //（本插件的统一 auth 契约）。包一层而不是直接挂方法引用：直接挂会让
+          // `this` 丢失（各家方法内部用 `this.product` / `this.ctx`）。
+          refreshAccount: (refName, pool, accountId) =>
+            auth.refreshAccountCredential(refName, pool, accountId),
+        },
+      })
+      if (!registered) {
+        ctx.logger?.info?.(
+          `[jet-hub] provider runtime "${id}" 已注册（插件 fiber 重启竞态），跳过本次`,
+        )
+      }
+    }
+  }
+
   registerJetHubRpc(ctx, pool, {
     codearts: service,
     buddy, workbuddy, lobsterai, qoder,

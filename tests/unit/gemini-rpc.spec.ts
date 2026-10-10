@@ -504,9 +504,19 @@ describe('Gemini 接线点（源码断言）', () => {
     expect(indexSource).toContain('geminiSigStore.flush()')
   })
 
-  it('⚠️ jet-hub-rpc 三处分支齐全；account-probe 的分派表已含 gemini', () => {
+  it('⚠️ jet-hub-rpc 的分支齐全；account-probe 的分派表已含 gemini', () => {
     expect(rpcSource).toContain('provider === GEMINI.id')
-    expect(rpcSource).toContain('case GEMINI.id:')
+    // ⚠️ 2026-10-08 改（Task 2）：原先这里断言 `case GEMINI.id:` —— 那是
+    //    `account.refresh` 的 13 个同构 case 之一，Task 2 已把它们收敛成一处
+    //    查表（`authOf(auths, entry.provider)`）⇒ 该文本形态**不存在了**，
+    //    而它守的意图（gemini 的续期接上了）**与文本无关**。
+    //    ⇒ 改为断言**结构**（真的走查表）；「gemini 的续期落到 gemini 实例上」
+    //    由行为用例守：`lobsterai-rpc-dispatch.spec.ts` 的
+    //    「13 个 provider 逐个覆盖」组（从 `REFRESH_PROVIDERS` 派生，含 gemini）。
+    const refreshStart = rpcSource.indexOf("case 'account.refresh':")
+    expect(refreshStart, '找不到 account.refresh 分支').toBeGreaterThan(-1)
+    expect(rpcSource.slice(refreshStart, refreshStart + 4000))
+      .toMatch(/authOf\(auths, entry\.provider\)/)
     expect(rpcSource).toContain('fetchGeminiCreditBalance(credential, GEMINI)')
     // ⚠️ 漏了会被华为云 HMAC 签名发 Google 凭据。
     expect(probeSource).toContain('entry.provider === GEMINI.id')
