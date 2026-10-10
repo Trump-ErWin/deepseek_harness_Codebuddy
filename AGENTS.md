@@ -17,6 +17,7 @@
 - `docs/agent-notes/backup.md`（7 节）：⚠️ **账号备份**：三种「只加不覆盖」的语义边界（选账号导出 / 合并导入 / 第三方转换）；裁剪必须在**发请求之前**且要裁三处；合并导入的判重是**三层**（第 2 层身份字段是关键，含 `IDENTITY_FIELDS` 候选表）；`AccountPool.mergeAccounts` 只调 `writeAccounts`；与「永久积分锁定表」的交叉点；与 `pruneAccountsWithForeignDomain` 的交叉点（残余风险）；测试与反向验证表
 - `docs/agent-notes/providers-opencode.md`（1 节）：⚠️⚠️ OpenCode 出口代理：dispatcher 与 fetch **必须同源**（Issue IKK4BY）—— 外部 undici 的 dispatcher 配全局 fetch 会在 Node 22/24 上恒抛 `UND_ERR_INVALID_ARG`（内置 6/7 与外部 8 的 handler 契约不同源），必须走 `proxyFetch`；`fetch failed` 的真因在 `cause` 里
 - `docs/agent-notes/providers-zcode.md`（4 节）：⚠️ ZCode（智谱）provider：「卡住 + 停止按钮无效」的两个根；⚠️ ZCode 上游节流三件套（吸收自 `dsh-free-glm`，20；⚠️⚠️ `3012` 的 HTTP 状态码是 **405**（不是 403；⚠️ ZCode captcha 的真实形状（2026-10-01，3.14
+- `docs/agent-notes/provider-abstraction-g3-exceptions.md`：⚠️ 2026-10-08 provider 能力抽象重构（计划 1）**做不到「零行为变化」（G3）的 6 处例外**逐条登记（含基线 `ecbb268` → 现行的**可观测量**与变异验证结论）。**动 provider 抽象层、或核对「重构是否改变了行为」前先读它**：5 处确为行为变更（凭据损坏文案 / `account.refresh` 分派 / `onboarding.claim` 错误码 / `codearts` 未知 id 模态 / `buddy` 消歧集合）、1 处（签到文案）逐字节未变只是搬了位置，**5 处已于 2026-10-08 逐条复核后全部接受**；⚠️ 另一条独立教训：**「登记了一处例外」≠「这处例外有守卫」**，必须逐项变异验证（当时实测出 G3-4 **零守卫**）
 
 ## 语言约束
 
