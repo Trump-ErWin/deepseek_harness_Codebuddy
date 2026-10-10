@@ -249,8 +249,12 @@ async function probeWithAdapter(
   // ⚠️ **判据是「该 provider 会不会写 `modelRateLimits`」**（写了才有重测按钮、
   // 才需要在这里分派）。但**不要靠记忆维护清单**，直接机械核对写入方：
   //
-  //     grep -n 'updateModelRateLimit(' src/*.ts    # 池侧写点
-  //     grep -n 'markLimited' src/*.ts              # 适配器侧注入点
+  //     grep -n 'updateModelRateLimit(' src/*.ts    # 写点（池侧定义 + 各适配器直调）
+  //     grep -n 'markLimited' src/*.ts              # 适配器侧经回调注入的写点
+  //
+  // ⚠️ **两条都要跑**：多数适配器是**直调** `pool.updateModelRateLimit(...)`，
+  // 只有 `cline` / `opencode` 用 `markLimited` 这个名字 —— 只看第二条会把
+  // 大部分家漏掉。
   //
   // ⚠️ **2026-10-08 独立复审修正：上面这段旧注释里有两处已过时的判断，
   // 原文保留在下方供对照，但**不得**再按它们维护清单**：

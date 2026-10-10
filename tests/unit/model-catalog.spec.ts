@@ -171,15 +171,16 @@ describe('createModelCatalog：两条来自真实缺陷的补充约束', () => {
     // ⚠️ 这是 Task 7b 实测踩到的**核心三态陷阱**：各家对「目录里没有的 id」处理不同，
     //    且**不能统一** —— 两个方向都会出真缺陷。
     //
-    // 形态 A（**10 家**：cline/codearts/gemini/lobsterai/loomy/minimax/qoder/
-    //        raccoon/trae/zcode）：**保守报 `['text']`**
+    // 形态 A（**12 家**：cline/codearts/gemini/lobsterai/loomy/minimax/qoder/
+    //        qodercn/raccoon/trae/zcode/opencode）：**保守报 `['text']`**
     //   ⇒ 若改成「省略」，用户手填的未知模型会从「明确不支持图片」变成「未知」
     //     ⇒ **图片被放行**、发到不支持的服务端（请求失败）。
-    // ⚠️ 家数实测为 10（2026-10-08 独立复审修正，原写「5 家」——
-    //    那是本字段刚引入时的快照，此后 5 家陆续接入却没更新这里）。
-    //    ⚠️ 本条用例**只演示骨架的两种形态**（用一个自造 config 代表形态 A），
-    //    **不**逐家核对谁属于哪一形态 —— 那份名单若要有守卫，应像
-    //    `probe-wiring` 那样从源码派生，而不是在这里抄一份会腐的清单。
+    // ⚠️ 家数实测为 12（2026-10-08 二次复核修正；原写「5 家」是字段刚引入时的
+    //    快照，后改「10 家」是**源码处数**而非家数 —— 两个口径都错过一次）。
+    //    ⚠️ 本条用例**只演示骨架的两种形态**（用一个自造 config 代表形态 A）。
+    //    **逐家核对**已由 `model-catalog-parity.spec.ts` 的
+    //    `OMIT_UNKNOWN_MODALITIES`（真实适配器、双向断言）承担 —— 名单再腐坏
+    //    会在那里点名到具体哪一家，不必在这里抄第二份。
     const conservative = createModelCatalog(
       { accountPool: { hasLoggedInAccount: async () => true, disabledModelsFor: () => new Set() } as never },
       {
@@ -269,6 +270,10 @@ describe('createModelCatalog：两条来自真实缺陷的补充约束', () => {
 
     // ⚠️ 不提供该回调 ⇒ 未知模型**不声明** reasoning（多数家的正确行为：
     //    档位是「该模型的能力」，未知模型不该臆造）。
+    // ⚠️ 本用例只演示**两种形态**（自造 config）。**逐家核对**谁属于哪一形态
+    //    已由 `model-catalog-parity.spec.ts` 的 `DECLARE_UNKNOWN_REASONING`
+    //    （真实适配器、双向断言）承担 —— 名单腐坏会在那里点名到具体哪一家，
+    //    不必在这里抄第二份会腐的清单。
     const without = makeCatalog([{ id: 'm1', name: 'M1' }])
     expect((await without.catalog.resolveModel('demo', 'unknown-x')).reasoning).toBeUndefined()
 

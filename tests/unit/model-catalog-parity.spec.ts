@@ -515,6 +515,9 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
    * | e | `resolveModel()` 的 `defaultEffort` 必须落在 `efforts` 内 | 否则选择器空白（真实报障过） |
    * | f | `resolveModel()` 声明的 `contextWindow` 必须 > 0 | 0/负数会让 DSH 抛 `INVALID_MODEL_MAX_TOKENS`，**整轮对话起不来** |
    * | g | **未知 id** 不抛错 | 用户手填模型 id 是正常操作 |
+   * | h | **未知 id 的模态形态**符合 `OMIT_UNKNOWN_MODALITIES`（默认 `['text']`） | 报错方向两个都是真缺陷：该省却报 ⇒ 静默关掉图片；该报却省 ⇒ 图片发到不支持的服务端 |
+   * | i | **未知 id 是否声明 `reasoning`** 符合 `DECLARE_UNKNOWN_REASONING`（默认不声明） | 该声明却省 ⇒ 手填模型 id 时失去档位选择器；不该声明却声明 ⇒ 向服务端臆造档位 |
+   * | j | **冷缓存**下 `listAllModels()` **非空**（用全新适配器） | 空 ⇒ 设置页把整个 provider 误显示为「已关闭」（真实缺陷史：`aggregate` 冷缓存 `total=1`） |
    *
    * ⚠️ **每家都实测跑通**（无网络、无真实凭据）：`n` 列见下面的 `CASES` 注释。
    * 若某家将来改成必须有网络才能列目录，本段会红并点名 —— 那是有用的信号。
@@ -569,6 +572,30 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
     },
   ]
 
+  /**
+   * ⚠️ **只有 `buddy` 系对未知 id 省略 `inputModalities`**（它的
+   * `inputModalitiesFor` 用 `imageCapabilityKnown` 区分「明确 false」与
+   * 「全都没查到」，后者**只报未知**）。其余一律**保守报 `['text']`**。
+   *
+   * ⚠️ 这里只列「省略」的家，**默认要求 `['text']`**：将来新增一家若想省略，
+   * 必须**显式**加进本集合，否则下面 (h) 变红并点名它 —— 这是刻意的，
+   * 目的是**迫使新人做显式决定**，而不是默默沿用某一家的行为。
+   */
+  const OMIT_UNKNOWN_MODALITIES: ReadonlySet<string> = new Set(['buddy', 'workbuddy'])
+
+  /**
+   * ⚠️ **只有 `cline` 与 `codearts` 对未知 id 仍声明 `reasoning`**：它们的档位
+   * 来自**产品配置 / 网关协议**（与具体模型无关），故未知模型同样给。
+   * 其余家的档位来自**该模型的**远端配置，未知模型无从得知 ⇒ **不声明**。
+   *
+   * ⚠️ 与 `OMIT_UNKNOWN_MODALITIES` 同为「默认 + 显式例外」：将来新增一家若想
+   * 对未知 id 声明档位，必须**显式**加进本集合，否则下面 (i) 变红并点名它。
+   * ⚠️ 实测为 2 家（跑真实适配器）；`model-catalog.spec.ts` ⑯ 的标题
+   * 「cline/codearts 恒声明」与此一致，但那里的判据是**自造 config**、
+   * 不逐家核对 —— 逐家核对由本段的 (i) 承担。
+   */
+  const DECLARE_UNKNOWN_REASONING: ReadonlySet<string> = new Set(['cline', 'codearts'])
+
   it('⚠️ 表的家数 == 全部对外注册的 LLM provider（漏一家 ⇒ 它不过本段任何断言）', async () => {
     // ⚠️ 判据来自 **PROVIDER_REGISTRY**（唯一的 provider 真源），不手抄。
     //    实测：`channel: true` 的 14 家正好是上面 14 家（`aggregate` 是
@@ -596,6 +623,21 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
       }>
       listAllModels(): readonly { id: string; name: string }[]
     }
+
+    // (j) **冷缓存**下 `listAllModels()` 不得为空。
+    //     ⚠️ 必须用**全新适配器**：下面 (c) 调 `listAllModels` 之前已经
+    //     `await listModels(...)` 过，那是**热**缓存 —— 测不出本条。
+    //     ⚠️ 这是**真实缺陷史**的判据（`src/model-catalog.ts` 的 `syncCatalog`
+    //     注释）：`aggregate` 冷缓存时 `total` 只有 1 ⇒ 用户一关掉 `auto`，
+    //     它就被**误显示为「已关闭」**（`closed = total > 0 && disabled === total`）。
+    //     ⇒ 冷缓存返回空数组 = 该 provider 在设置页被误判为「已关闭」。
+    const cold = make() as { listAllModels(): readonly { id: string; name: string }[] }
+    const coldAll = cold.listAllModels()
+    expect(
+      coldAll.length,
+      `${id} **冷缓存**下 listAllModels 为空 —— 设置页会把整个 provider 误显示为`
+      + '「已关闭」（`closed = total > 0 && disabled === total` 的 total 来自本方法）',
+    ).toBeGreaterThan(0)
 
     // ⚠️ 先断言「列得出来」：若某家恒返回空数组，下面所有 `for` 循环体
     //    都**从未执行** ⇒ 本用例退化成恒真。这条是防 FALSE COVERAGE 的自检。
@@ -650,6 +692,66 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
     expect(unknown.name.length, `${id} 对未知 id 给了空名`).toBeGreaterThan(0)
     // ⚠️ 且未知模型**不得**声明 context（不编造窗口）。
     expect(unknown.context, `${id} 给未知 id 编造了 contextWindow`).toBeUndefined()
+
+    // (h) **未知 id 的模态形态**必须与 `OMIT_UNKNOWN_MODALITIES` 一致。
+    //     ⚠️ 这一条补的是一个**已登记的覆盖缺口**：`model-catalog.spec.ts` ⑬
+    //     自认「不逐家核对谁属于哪一形态」，而 `src/model-catalog.ts` 里那份
+    //     名单**已经腐坏过一次**（写 5 家、实测 10 家）。这里把判据挂到
+    //     **真实适配器**上，名单再腐坏就会点名到具体哪一家。
+    //     ⚠️ 两个方向都是真缺陷，故双向断言（不是「只查省略的那两家」）：
+    //     该省却报 `['text']` ⇒ **图片能力被静默关掉**；
+    //     该报 `['text']` 却省略 ⇒ 图片**被放行**、发到不支持的服务端。
+    const hasModalities = 'inputModalities' in unknown
+    if (OMIT_UNKNOWN_MODALITIES.has(id)) {
+      expect(
+        hasModalities,
+        `${id} 的未知 id 应**省略** inputModalities（它的能力探测能区分「未知」与「明确不支持」），`
+        + `实际报了 ${JSON.stringify(unknown.inputModalities)} —— 会静默关掉图片能力`,
+      ).toBe(false)
+    } else {
+      expect(
+        hasModalities,
+        `${id} 的未知 id 应**保守报 ['text']**（宁可少报能力，也不要报服务端可能不认的模态）；`
+        + '若确要省略，请显式加进 OMIT_UNKNOWN_MODALITIES 并说明理由',
+      ).toBe(true)
+      expect(
+        unknown.inputModalities,
+        `${id} 对未知 id 报的模态不是 ['text']`,
+      ).toEqual(['text'])
+    }
+
+    // (i) **未知 id 是否声明 reasoning** 必须与 `DECLARE_UNKNOWN_REASONING` 一致。
+    //     ⚠️ 与 (h) 同一个形态、同一个理由：`model-catalog.spec.ts` ⑯ 用自造 config
+    //     演示两种形态，但**不逐家核对**谁属于哪一形态。这里挂到真实适配器上。
+    //     ⚠️ 两个方向都是真缺陷：
+    //     该声明却省略 ⇒ 用户手填模型 id 时**失去档位选择器**（cline/codearts 的
+    //       档位本就与模型无关）；
+    //     不该声明却声明 ⇒ 向服务端**臆造**一个它可能不认的档位。
+    const hasReasoning = unknown.reasoning !== undefined
+    if (DECLARE_UNKNOWN_REASONING.has(id)) {
+      expect(
+        hasReasoning,
+        `${id} 对未知 id 应**仍声明 reasoning**（它的档位来自产品配置/网关协议，与模型无关）；`
+        + '省略会让用户手填模型 id 时失去档位选择器',
+      ).toBe(true)
+      expect(
+        unknown.reasoning?.efforts.length,
+        `${id} 对未知 id 声明了空 efforts`,
+      ).toBeGreaterThan(0)
+      const de = unknown.reasoning?.defaultEffort
+      if (de !== undefined) {
+        expect(
+          unknown.reasoning?.efforts.map(e => e.id),
+          `${id} 对未知 id 的 defaultEffort 不在 efforts 内（选择器会空白）`,
+        ).toContain(de)
+      }
+    } else {
+      expect(
+        hasReasoning,
+        `${id} 对未知 id 应**不声明 reasoning**（档位是该模型的能力，未知模型无从得知）；`
+        + '若确要声明，请显式加进 DECLARE_UNKNOWN_REASONING 并说明理由',
+      ).toBe(false)
+    }
   })
 })
 
