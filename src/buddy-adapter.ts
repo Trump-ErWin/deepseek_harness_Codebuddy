@@ -958,7 +958,8 @@ export class BuddyAdapter extends LlmAdapter {
    *
    * ## 为什么需要它
    *
-   * `pickBuddyCredential`（`src/index.ts`）只问「锁没锁 + 有没有临期积分」，
+   * 余额分档编排（`src/credential-resolver.ts` 的 buddy 分支 + 共享的
+   * `pickBuddyAccount`）只问「锁没锁 + 有没有临期积分」，
    * 从不问「这个模型要不要钱」。于是免费模型也会被「锁定永久积分 + 无临期积分」
    * 这道门拦下，报出「没有可用账号……已锁定永久积分，而所有账号的『N 天内到期』
    * 积分都已用尽」，而它**一分积分都不需要** —— 用户看到的是
