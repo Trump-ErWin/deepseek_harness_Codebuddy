@@ -767,12 +767,12 @@ export class ClineAdapter extends LlmAdapter {
         }
         for (let round = 0; round < maxRotate; round++) {
           await markLimited()
-          const next = await this.options.accountPool.getAvailableAccount(
+          const next = await this.options.accountPool.getAvailableAccount<ClineCredential>(
             this.product.id, options.model, tried,
           )
           if (next === null || next === undefined || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
-          credential = next.credential as ClineCredential
+          credential = next.credential
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {

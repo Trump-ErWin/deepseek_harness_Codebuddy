@@ -683,12 +683,12 @@ export class RaccoonAdapter extends LlmAdapter {
         await markCurrentAccount()
         const maxRotate = RACCOON_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
-          const next = await accountPool.getAvailableAccount(
+          const next = await accountPool.getAvailableAccount<RaccoonCredential>(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
-          credential = next.credential as RaccoonCredential
+          credential = next.credential
           activeAccountId = next.entry.id
           response = await send()
           if (response.ok) {

@@ -23,7 +23,7 @@ const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8')
  * 工厂配置项里 `product` 永远是首字段。
  */
 function factoryBlockOf(source: string, product: string): string {
-  const calls = [...source.matchAll(/createCredentialResolver\(/g)].map(m => m.index!)
+  const calls = [...source.matchAll(/createCredentialResolver(?:<[^>]*>)?\(/g)].map(m => m.index!)
   for (let i = 0; i < calls.length; i++) {
     const block = source.slice(calls[i]!, calls[i + 1] ?? source.length)
     const first = /product: (\w+),/.exec(block)

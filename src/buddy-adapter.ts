@@ -1769,13 +1769,13 @@ export class BuddyAdapter extends LlmAdapter {
       if ((response.status === 401 || response.status === 403) && this.options.accountPool !== undefined) {
         for (;;) {
           // modelId 参与过滤：正在限流期的账号不会被选中（与限流换号同语义）。
-          const next = await this.options.accountPool.getAvailableAccount(
+          const next = await this.options.accountPool.getAvailableAccount<BuddyCredential>(
             this.product.id, options.model, triedAuth,
           )
           if (!next || triedAuth.has(next.entry.id)) break
           triedAuth.add(next.entry.id)
           rotated = true
-          credential = next.credential as BuddyCredential
+          credential = next.credential
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {
@@ -1968,12 +1968,12 @@ export class BuddyAdapter extends LlmAdapter {
           // 必须把 `tried` 传给池：见 `AccountPool.getAvailableAccount` 的说明 ——
           // 池按「重置时间最早到期」排序，刚失败的账号可能仍排第一，
           // 不排除就会拿回同一个、命中下面的 `tried.has` 而立即 break。
-          const next = await this.options.accountPool.getAvailableAccount(
+          const next = await this.options.accountPool.getAvailableAccount<BuddyCredential>(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
-          credential = next.credential as BuddyCredential
+          credential = next.credential
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {

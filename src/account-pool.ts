@@ -1451,12 +1451,32 @@ export class AccountPool {
    *
    * 在池这一层排除（而非让调用方自己跳过）是必要的：调用方只能拿到
    * 「池认为最优的一个」，无法枚举候选自己去重。
+   *
+   * ## ⚠️ 为什么带类型参数 `TCredential`（2026-10-08，Task 11）
+   *
+   * 返回类型原先写死成 `CodeArtsCredential | BuddyCredential` 这个**两家的联合**，
+   * 而本池服务 **13 家**，各家凭据形状互不相同 ⇒ 每个调用方都得在结果处
+   * 写一个向具体凭据类型的断言才能用。实测 `src/` 里这样的收窄有 **20 处**。
+   *
+   * ⚠️ **那个断言不是「必要的坏味道」，而是纯粹的噪音**：调用方**自己**知道
+   * 它在查哪一家（`this.product.id` 或字面量 id），池却把类型信息擦掉了。
+   * 断言写错方向时 TS 也不会拦（`as` 双向放行），于是「中国版账号拿到国际版
+   * 凭据类型」这类错位在类型层是**静默**的。
+   *
+   * ⇒ 改为泛型：`getAvailableAccount<ClineCredential>(CLINE.id, model)`，
+   * 类型由**调用点**给出、池原样回传。**纯类型层改动，零运行时行为变化**
+   * （函数体一行未改，`JSON.parse` 的结果照旧不做形状校验 —— 校验是各家
+   * `parseCredential` 的职责，见 `credential-resolver.ts` 的头注）。
+   *
+   * ⚠️ 默认值 `CodeArtsCredential | BuddyCredential` **刻意保留**：13 家之外
+   * 还有测试桩与 `ResolverPool` 这类结构化替身，去掉默认值会让它们全部编译失败，
+   * 而它们本就不关心具体形状。
    */
-  async getAvailableAccount(
+  async getAvailableAccount<TCredential = CodeArtsCredential | BuddyCredential>(
     provider: string,
     modelId: string,
     excludeAccountIds?: ReadonlySet<string>,
-  ): Promise<{ entry: ProviderAccountEntry; credential: CodeArtsCredential | BuddyCredential } | null> {
+  ): Promise<{ entry: ProviderAccountEntry; credential: TCredential } | null> {
     const candidates = this.readAccounts()
       .filter(a => a.provider === provider && a.enabled)
       .filter(a => excludeAccountIds === undefined || !excludeAccountIds.has(a.id))
@@ -1494,7 +1514,7 @@ export class AccountPool {
         continue
       }
       try {
-        const credential = JSON.parse(resolved.value) as CodeArtsCredential | BuddyCredential
+        const credential = JSON.parse(resolved.value) as TCredential
         if (failures.length > 0) {
           this.ctx.logger?.warn?.(
             `[jet-hub] ${failures.length} 个 ${provider} 账号不可用，已跳过：${failures.join('; ')}`,

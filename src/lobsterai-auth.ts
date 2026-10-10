@@ -688,8 +688,8 @@ export class LobsteraiAuth extends Service {
   async fetchModels(pool?: AccountPool): Promise<LobsteraiRemoteModel[]> {
     let credential: LobsteraiCredential | undefined
     if (pool) {
-      const available = await pool.getAvailableAccount(this.product.id, '')
-      if (available) credential = available.credential as LobsteraiCredential
+      const available = await pool.getAvailableAccount<LobsteraiCredential>(this.product.id, '')
+      if (available) credential = available.credential
     }
     if (credential === undefined) credential = await this.resolveStoredCredential()
     if (credential === undefined || credential.access_token.length === 0) return []

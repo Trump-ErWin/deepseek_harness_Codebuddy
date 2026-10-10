@@ -753,12 +753,12 @@ export class LoomyAdapter extends LlmAdapter {
         await markCurrentAccount()
         const maxRotate = LOOMY_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
-          const next = await accountPool.getAvailableAccount(
+          const next = await accountPool.getAvailableAccount<LoomyCredential>(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
-          const nextCred = next.credential as unknown as LoomyCredential
+          const nextCred = next.credential
           if (nextCred === undefined || nextCred.access_token.length === 0) break
           activeAccountId = next.entry.id
           response = await send(nextCred.access_token)

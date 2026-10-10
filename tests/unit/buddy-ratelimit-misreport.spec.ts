@@ -226,7 +226,7 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       for (const product of ['CODEBUDDY', 'WORKBUDDY']) {
         const at = indexCode.search(new RegExp(`product: ${product},\\n\\s*readCredential:`))
         expect(at, `${product} 的工厂配置项没找到`).toBeGreaterThan(-1)
-        const callStart = indexCode.lastIndexOf('createCredentialResolver(', at)
+        const callStart = indexCode.lastIndexOf('createCredentialResolver', at)
         expect(callStart, `${product} 的 createCredentialResolver 调用没找到`).toBeGreaterThan(-1)
         const block = factoryCallAt(indexCode, callStart)
         expect(block, `${product} 必须把 throwIfAllAccountsRateLimited 交给工厂`).toContain(
@@ -341,7 +341,7 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       //    仍有价值：它是**逐条点名**的最短路径，且现在真的有判别力。
       const at = indexCode.search(/product: CLINE,\n\s*readCredential:/)
       expect(at, 'CLINE 的工厂配置项没找到').toBeGreaterThan(-1)
-      const callStart = indexCode.lastIndexOf('createCredentialResolver(', at)
+      const callStart = indexCode.lastIndexOf('createCredentialResolver', at)
       expect(callStart, 'CLINE 的 createCredentialResolver 调用没找到').toBeGreaterThan(-1)
       const block = factoryCallAt(indexCode, callStart)
       expect(block, 'CLINE 必须把 throwIfAllAccountsRateLimited 交给工厂').toContain(
@@ -436,7 +436,7 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
      */
     function factoryBlocks(): Map<string, string> {
       const blocks = new Map<string, string>()
-      const calls = [...indexCode.matchAll(/createCredentialResolver\(/g)].map(m => m.index)
+      const calls = [...indexCode.matchAll(/createCredentialResolver(?:<[^>]*>)?\(/g)].map(m => m.index)
       calls.forEach((at, i) => {
         const end = calls[i + 1] ?? indexCode.length
         const block = indexCode.slice(at, end)
@@ -544,7 +544,7 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       expect(at, 'zcode 的工厂配置项没找到（改名了要同步改本用例）').toBeGreaterThan(-1)
       // ⚠️ 结构性切片（括号配平取这次调用本身）—— 见 `factoryCallAt` 的说明：
       //    原先的定长窗口实测越界 1333 字符，圈进了 refresh / mintCaptcha。
-      const callStart = indexCode.lastIndexOf('createCredentialResolver(', at)
+      const callStart = indexCode.lastIndexOf('createCredentialResolver', at)
       expect(callStart, 'zcode 的 createCredentialResolver 调用没找到').toBeGreaterThan(-1)
       const block = factoryCallAt(indexCode, callStart)
       expect(

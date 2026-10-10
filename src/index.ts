@@ -585,8 +585,8 @@ export function apply(ctx: Context): void {
       //
       // 这里仍保留 `credentialRef` 选项，仅为满足适配器契约与报错文案
       // （其余 provider 同样传各自的默认 ref，但都不再作为回退来源）。
-      const available = await pool.getAvailableAccount('codearts', '')
-      return available?.credential as CodeArtsCredential | undefined
+      const available = await pool.getAvailableAccount<CodeArtsCredential>('codearts', '')
+      return available?.credential
     },
     // 续期按**账号池里的具体账号**走：`refreshAccountCredential` 读写的是
     // `CODEARTS_ACCOUNT_XXX`，而旧的 `service.refresh()` 读写的是已废弃的
@@ -765,7 +765,7 @@ export function apply(ctx: Context): void {
   buddy.lastCatalogOutcome = { scopedOk: false, configOk: false }
   const buddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<BuddyCredential>(
       // ⚠️ 依赖在**每次 apply() 时**构造一次，闭包捕获的是同一批引用。
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(CODEBUDDY.id, id) } },
       {
@@ -822,7 +822,7 @@ export function apply(ctx: Context): void {
     // 保证不会串用 CodeBuddy 的凭据。
     // 选号策略与 CodeBuddy 同款，但用的是**WorkBuddy 自己的锁状态与余额缓存**
     // （两站积分构成不同：实测国际版是「Bonus Pack 14 天 + Free Plan 长期」）。
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<BuddyCredential>(
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(WORKBUDDY.id, id) } },
       {
         product: WORKBUDDY,
@@ -917,7 +917,7 @@ export function apply(ctx: Context): void {
     // 优先按「快到期积分」分档选号（锁定永久积分时只挑有快到期积分的号）。
     // 与 buddy 系同一套编排：候选先按「enabled + 模型未受限」筛，
     // 分档只在这批候选内部进行 —— 不能因为某个号积分多就绕开限流标记。
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<LobsteraiCredential>(
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(LOBSTERAI.id, id) } },
       {
         product: LOBSTERAI,
@@ -995,7 +995,7 @@ export function apply(ctx: Context): void {
     // ⚠️ `modelId` 透传：Qoder 的额度是「模型 + 账号」维度（见
     // `qoder-adapter.ts` 的 `switchAccountOnQuota`），传空串会让它刚写下的
     // 当日额度标记在下次选号时被忽略。
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<QoderCredential>(
       {
         pool,
         // ⚠️ 这里**必须**处理 `undefined`：没有账号条目可标记时要**清空**，否则
@@ -1064,7 +1064,7 @@ export function apply(ctx: Context): void {
     // ⚠️ provider 实参必须是 QODER_CN：写死 'qoder' 会让中国版
     // 永远查不到自己的账号（本插件在 workbuddy 上踩过同类坑）。
     // ⚠️ `modelId` 透传：与 QODER 同因（当日额度是「模型 + 账号」维度）。
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<QoderCredential>(
       {
         pool,
         // 同国际版：`undefined` 是「清空标记」的有意义事件。
@@ -1159,7 +1159,7 @@ export function apply(ctx: Context): void {
     // 优先按「快到期积分」分档选号（锁定永久积分时只挑有快到期积分的号）。
     // 与 buddy 系同一套编排：候选先按「enabled + 模型未受限」筛，
     // 分档只在这批候选内部进行 —— 不能因为某个号积分多就绕开限流标记。
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<TraeCredential>(
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(TRAE.id, id) } },
       {
         product: TRAE,
@@ -1222,7 +1222,7 @@ export function apply(ctx: Context): void {
     // provider 实参用 CLINE 而非字面量 'cline'：写死字面量在
     // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
     // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<ClineCredential>(
       {
         pool,
         // 记录实际选中的池账号（空串 = 回退到单凭据 ref 模式，见适配器注释）。
@@ -1334,7 +1334,7 @@ export function apply(ctx: Context): void {
      * **没有池取号那一步** —— 强行合并会同时引入「凭据坏了就换号」与「回落池」
      * 两个行为变更。设计边界是**抽象编排，不抽象协议**。
      */
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<LoomyCredential>(
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(LOOMY.id, id) } },
       {
         product: LOOMY,
@@ -1410,7 +1410,7 @@ export function apply(ctx: Context): void {
     // provider 实参用 RACCOON 而非字面量：写死字面量在改名/多产品场景下
     // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
     // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<RaccoonCredential>(
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(RACCOON.id, id) } },
       {
         product: RACCOON,
@@ -1483,7 +1483,7 @@ export function apply(ctx: Context): void {
     // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
     // ⚠️ 只从 minimax 自己的账号池取账号，回退到自己的单凭据 ref，
     // 保证不会串用其它 provider 的凭据。
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<MinimaxCredential>(
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(MINIMAX.id, id) } },
       {
         product: MINIMAX,
@@ -1576,7 +1576,7 @@ export function apply(ctx: Context): void {
     credentialRef: credentialRef(GEMINI.defaultCredentialRef),
     // ⚠️ provider 实参用 GEMINI 而非字面量（同 minimax 的既有约定：
     // 写死字面量在改名/多产品场景下会静默查不到账号）。
-    resolveCredential: createCredentialResolver(
+    resolveCredential: createCredentialResolver<GeminiCredential>(
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(GEMINI.id, id) } },
       {
         product: GEMINI,
@@ -1742,7 +1742,7 @@ const resolveZcodeCaptchaConfig = async (): Promise<{ region: string; prefix: st
 const activeZcodeAccountId = new Map<string, string | undefined>()
 const zcodeAdapter = registerZcodeLlm(ctx, {
   credentialRef: credentialRef(ZCODE.defaultCredentialRef),
-  resolveCredential: createCredentialResolver(
+  resolveCredential: createCredentialResolver<ZcodeCredential>(
     {
       pool,
       /**

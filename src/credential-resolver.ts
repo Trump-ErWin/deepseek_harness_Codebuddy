@@ -131,8 +131,12 @@ import type { LoomyTierOptions } from './loomy-balance-rank.js'
  *
  * ⚠️ 只声明真正读到的三个方法：`AccountPool` 天然满足本接口（既有调用点
  * 一行不用改），而单测不必构造整个池。
+ *
+ * ⚠️ `TCredential` **默认 `unknown`**：本模块不关心具体形状（形状校验是各家
+ * `parseCredential` 的职责），13 家各自传自己的类型即可。默认值让既有测试桩
+ * （它们只关心 `entry`）一行不用改。
  */
-export interface ResolverPool {
+export interface ResolverPool<TCredential = unknown> {
   /** 列出该 provider 的**全部**账号（含已停用）。 */
   listAccountsByProvider(provider: string): ReadonlyArray<{
     id: string
@@ -147,12 +151,12 @@ export interface ResolverPool {
     provider: string,
     modelId: string,
     excludeAccountIds?: ReadonlySet<string>,
-  ): Promise<{ entry: { id: string; credentialRef: string }; credential: unknown } | null>
+  ): Promise<{ entry: { id: string; credentialRef: string }; credential: TCredential } | null>
 }
 
 /** 注入的共享设施。 */
-export interface CredentialResolverDeps {
-  readonly pool: ResolverPool
+export interface CredentialResolverDeps<TCredential = unknown> {
+  readonly pool: ResolverPool<TCredential>
   /**
    * 回报「本笔请求解析出的账号」。
    *
@@ -317,7 +321,7 @@ function candidatesOf(
  *   与 `isFreeModel`（不要吞掉）。
  */
 export function createCredentialResolver<TCredential>(
-  deps: CredentialResolverDeps,
+  deps: CredentialResolverDeps<TCredential>,
   config: CredentialResolverConfig<TCredential>,
 ): (modelId?: string) => Promise<TCredential | undefined> {
   const providerId = config.product.id
@@ -448,12 +452,12 @@ export function createCredentialResolver<TCredential>(
      *    （或让 12 家各写一个 `(raw) => raw as X` 的校验器）—— 断言数量变多、
      *    且正是本 Task 要消除的「同一判据 N 处实现」。
      *
-     * ⇒ **结论：在本 Task 的约束下无法消除，只能显式记录。** 真正的解法是把
-     * `AccountPool.getAvailableAccount` 的凭据类型按 provider 泛型化（一次跨模块
-     * 的类型改造），那超出本 Task 范围。若日后有人做那次改造，**这条 `as` 应当
-     * 一并删掉** —— 它是那笔技术债的**唯一可见标记**，别当成噪音清掉。
+     * ⇒ **2026-10-08（Task 11）已完成那次泛型化**：`AccountPool.getAvailableAccount`
+     * 现在收类型参数，本行原来的 `as TCredential` **已按此处预告一并删掉**。
+     * ⚠️ 保留本段叙述（而不是删掉整段）—— 它记录「为什么那个断言曾经必须存在」，
+     * 后人再想「把池的返回改回联合类型」时已知那条路走不通。
      */
-    if (available !== null) return available.credential as TCredential
+    if (available !== null) return available.credential
 
     // ⑤ 回退前先证明失败原因是不是**限流** —— 否则唯一启用账号被该模型限流时
     //    候选被筛空，会被误报成「没登录」，用户据此去重新登录，方向完全错

@@ -736,12 +736,12 @@ export class GeminiAdapter extends LlmAdapter {
               .catch(() => {})
           }
           if (rotations < GEMINI_MAX_ROTATE - 1) {
-            const next = await pool.getAvailableAccount(this.product.id, options.model, tried)
+            const next = await pool.getAvailableAccount<GeminiCredential>(this.product.id, options.model, tried)
             if (next !== null && next !== undefined && !tried.has(next.entry.id)) {
               rotations++
               tried.add(next.entry.id)
               currentAccountId = next.entry.id
-              credential = next.credential as unknown as GeminiCredential
+              credential = next.credential
               // 换号后重置端点与去签状态：新账号值得从默认端点、带签名再试一次。
               endpointIdx = 0
               endpointSwitched = false
