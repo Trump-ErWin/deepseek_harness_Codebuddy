@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
+import { REFRESH_PROVIDERS, accountEntry, refreshHarness } from '../helpers/rpc-refresh.js'
 
 /**
  * 多账号续期调度的**接线**回归（Gitee issue !IKIRTT）。
@@ -206,26 +207,79 @@ describe('按需续期必须回写账号池的有效期', () => {
     expect(source).not.toMatch(/refreshableOf/)
   })
 
-  it('account.refresh 的每个 provider 分支都把 pool 与 entry.id 传下去', () => {
-    const switchStart = rpcSource.indexOf('switch (entry.provider)')
-    const switchBody = rpcSource.slice(switchStart, rpcSource.indexOf('default:', switchStart))
-    const branches = switchBody.match(/case /g) ?? []
-    expect(branches.length).toBeGreaterThanOrEqual(10)
-    // qoder 与 qodercn **共用一个 case**（同族注册表），故调用数比分支数少一。
-    const calls = switchBody.match(/refreshAccountCredential\([^)]*\)/g) ?? []
-    expect(calls.length).toBeGreaterThanOrEqual(branches.length - 1)
-    for (const call of calls) {
-      expect(call, `RPC 分支漏传 pool/entry.id：${call}`).toMatch(/pool,\s*entry\.id/)
+  /**
+   * ⚠️ 2026-10-08 改（Task 2）：原先这条从 `src/jet-hub-rpc.ts` 里正则切出
+   * `switch (entry.provider)` 那段，断言每个 `case` 里的调用都带
+   * `pool, entry.id`。Task 2 把那 13 个同构 case 换成了**一处**查表分派
+   * ⇒ 「switch 切片」这个形态**不存在了**，而它守的意图（续期必须回写账号池）
+   * 与「分支有多少个」**无关**。
+   *
+   * ⇒ 改为**行为断言**：驱动真实端点，断言桩**真的收到**了 pool 与 accountId。
+   *    这比文本断言强 —— 文本只能证明源码里有那串字符，行为能证明实参
+   *    端到端传到了实现里（`[^)]*` 那种写法对「传了但传的是 undefined」无感）。
+   *
+   * ⚠️ 13 个 provider **逐个**覆盖：`switch` 时代「新增 case 忘了传参数」
+   *    是个真实缺陷形态（issue !IKIRTT：只有 raccoon 传了），
+   *    查表时代这个形态消失了，但**「表里某一项没接上」**仍可能发生。
+   */
+  it('account.refresh 的续期实参端到端送达：每个 provider 都收到 pool 与 accountId', async () => {
+    for (const provider of REFRESH_PROVIDERS) {
+      const entry = accountEntry(provider, `${provider.toUpperCase()}_ACCOUNT_WIRE`)
+      const harness = refreshHarness([entry])
+      const result = await harness.call(entry.id)
+      expect(result.ok, `${provider} 的续期应成功，实际 error=${result.error?.message}`).toBe(true)
+      expect(harness.calls, `${provider} 的续期没有分派到它自己的实例`).toEqual([
+        {
+          provider,
+          ref: entry.credentialRef,
+          accountId: entry.id,
+          // ⚠️ **必须 `toBe` 同一个对象**：第 2 个实参不是「某个 pool」，
+          //    而是本次 `registerJetHubRpc` 用的那个 —— 传错对象时回写会落到
+          //    别处（或静默失败），而那正是 issue !IKIRTT 的形态。
+          pool: harness.pool,
+        },
+      ])
     }
   })
 
+  /**
+   * ⚠️ 2026-10-08 改：原先这条用 `indexSource.match(/refreshAccountCredential\([^)]*\)/g)`
+   * 扫源码、断言每处都带 `pool, available.entry.id`。那是**文本**断言 ——
+   * 它对「实参传了但传的是 `undefined`」无感，也会被无关重构打红。
+   *
+   * ⇒ 改为断言**适配器回调真的把它传下去了**：`src/index.ts` 里那 10 处是
+   *    `registerXxxLlm(ctx, { refresh: … })` 的回调，无法在单测里逐个驱动
+   *    （需要真凭据），故这里退一步，用**结构化**断言守住可测的那一半：
+   *    「每个 `refreshAccountCredential(` 调用点的实参列表里都有 `pool` 与
+   *    `available.entry.id` 这两个**语义片段**」，并**额外**断言它们出现在
+   *    **同一个**调用里（避免「一个调用带 pool、另一个带 id」这种拼接式假绿）。
+   *
+   * ⚠️ 本条**保留文本形态**是**刻意**的（与仓库红线不冲突）：它的被测对象
+   *    就是「这 10 处调用点的实参」，而那些回调没有可驱动的单测入口。
+   *    真正的行为覆盖在 `lobsterai-rpc-dispatch.spec.ts` 那条端到端用例上。
+   */
   it('index.ts 的适配器 refresh 回调同样传 pool 与账号 id（按需续期最常触发的路径）', () => {
-    const calls = indexSource.match(/refreshAccountCredential\([^)]*\)/g) ?? []
-    // 八个：codearts / lobsterai / qoder / qodercn / trae / cline / loomy / raccoon。
-    // buddy 与 workbuddy 走 `createPoolRefresh`（下一条用例）。
-    expect(calls.length).toBeGreaterThanOrEqual(8)
+    // ⚠️ 判据必须锚定**调用点**而不是方法名：`src/index.ts` 里还有
+    //    ① 能力注册段里包一层的 `auth.refreshAccountCredential(refName, pool, accountId)`
+    //      （Task 2 新增，有 `.` 但实参名不同）。
+    //    ⚠️ 2026-10-08 复审 Finding 5 后**少了一处**：能力注册段的类型标注原先写作
+    //      内联结构类型 `refreshAccountCredential(r: string, p: AccountPool, id: string)`，
+    //      现已改用 `jet-hub-rpc.ts` 已导出的 `JetHubAuthLike`（同一语义不许两套判据）
+    //      ⇒ 那串文本**不再存在**于 `src/index.ts`。锚定首实参的写法对本条无影响。
+    //    用宽松的 `/refreshAccountCredential\([^)]*\)/` 会把 ① 一起捞进来，
+    //    断言随即以一条**与被测契约无关**的方式失败（实测踩到）。
+    //    ⇒ 锚定**首实参** `available.entry.credentialRef`，它只出现在适配器回调里。
+    //    这比原断言更紧：原断言只查后两个实参，本条同时锁住「刷的是解析出的那个 ref」。
+    //
+    // ⚠️ 跨行调用（raccoon / minimax / gemini 三处是 `(\n  …,\n)` 形态）也要匹配，
+    //    故用 `[\s\S]*?` 而不是 `[^)]*`。
+    const calls = indexSource.match(/\.refreshAccountCredential\(\s*available\.entry\.credentialRef[\s\S]*?\)/g) ?? []
+    // 十个：codearts / lobsterai / qoder / qodercn / trae / cline / loomy /
+    // raccoon / minimax / gemini。buddy 与 workbuddy 走 `createPoolRefresh`（下一条）。
+    expect(calls.length, '适配器回调的调用点数变了，请复核本清单').toBeGreaterThanOrEqual(10)
     for (const call of calls) {
-      expect(call).toMatch(/pool,\s*available\.entry\.id/)
+      expect(call, `适配器回调漏传 pool：${call}`).toMatch(/\bpool\b/)
+      expect(call, `适配器回调漏传账号 id：${call}`).toMatch(/available\.entry\.id/)
     }
   })
 

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { MINIMAX } from '../../src/minimax-product.js'
 import { descriptorOf } from '../../src/provider-registry.js'
 import { jetHubAuthsCallKeys } from '../helpers/jet-hub-auths.js'
+import { accountEntry, refreshHarness } from '../helpers/rpc-refresh.js'
 
 /**
  * Task 6（接线）的回归防线。
@@ -93,23 +94,41 @@ describe('接线点完整性（源码断言）', () => {
   })
 
   it('⚠️ jet-hub-rpc.ts 四处分支齐全，且都用 MINIMAX.id 分派', () => {
-    // account.create / account.refresh / credits.status / credits.claimAll / credits.balances
-    expect(rpcSource).toContain('provider === MINIMAX.id')
-    expect(rpcSource).toContain('case MINIMAX.id:')
+    // account.create / credits.status / credits.claimAll / credits.balances
+    //
+    // ⚠️ 2026-10-08 改（Task 2）：原清单里的 `account.refresh` 已**不再**有
+    //    `case MINIMAX.id:` —— 13 个同构 case 收敛成一处查表
+    //    （`authOf(auths, entry.provider)`）。**实测确认**：Task 2 之前全仓库
+    //    唯一的 `case MINIMAX.id:` 就在那个 switch 里，故该断言现在恒假。
+    //    该端点的 minimax 续期由 `lobsterai-rpc-dispatch.spec.ts` 的行为用例守
+    //    （从 `REFRESH_PROVIDERS` 派生，含 minimax）+ 下面那条串接用例。
+    //    ⇒ 下面**只**断言剩下四处真协议分支（`provider === MINIMAX.id` 出现
+    //    四次：account.create 与三个 credits 端点）。
+    const dispatchCount = [...rpcSource.matchAll(/provider === MINIMAX\.id/g)].length
+    expect(dispatchCount, '四处真协议分支（account.create + 三个 credits）').toBeGreaterThanOrEqual(4)
     // 三个 credits 分支
     expect(rpcSource).toContain('fetchMinimaxSigninStatus(credential)')
     expect(rpcSource).toContain('claimMinimaxDailyCheckin(credential)')
     expect(rpcSource).toContain('fetchMinimaxCreditBalance(credential)')
   })
 
-  it('⚠️ 不得把 minimax 分支串到 RACCOON 常量上', () => {
-    // 真实缺陷形态：CN 那次「中国版账号的刷新去续了国际版凭据」。
-    // 断言 minimax 的 refresh 分支用的是 minimax 实例。
-    const code = stripComments(rpcSource)
-    const idx = code.indexOf('case MINIMAX.id:')
-    expect(idx).toBeGreaterThan(-1)
-    const caseBody = code.slice(idx, idx + 400)
-    expect(caseBody).toContain('minimax.refreshAccountCredential')
-    expect(caseBody).not.toContain('raccoon.refreshAccountCredential')
+  /**
+   * ⚠️ 2026-10-08 改（Task 2）：原先这条切出 `case MINIMAX.id:` 后 400 字符，
+   * 断言里面是 `minimax.refreshAccountCredential`、且**不是**
+   * `raccoon.refreshAccountCredential` —— 一条**源码文本**断言。
+   *
+   * 它守的缺陷形态（「CN 那次中国版账号的刷新去续了国际版凭据」）是**真实**的，
+   * 故**不能**只是删掉：改为**行为**断言 —— 用 `refreshHarness` 给 13 个 provider
+   * 各装一个桩，驱动 minimax 账号的续期，断言**恰好 minimax 的桩**被调用。
+   * 这比文本强：文本只能证明源码里有那串字符，行为能证明实参真的落到了 minimax 上。
+   */
+  it('⚠️ minimax 账号的续期**恰好**落到 minimax 桩上（不得串到 raccoon 等）', async () => {
+    const target = accountEntry('minimax', 'MINIMAX_ACCOUNT_ISO')
+    const harness = refreshHarness([target])
+    const result = await harness.call(target.id)
+    expect(result.ok, `minimax 续期应成功，实际 error=${result.error?.message}`).toBe(true)
+    // 判据是「恰好一个调用，且 provider === 'minimax'」——串到任何别家都会红。
+    expect(harness.calls.map((c) => c.provider)).toEqual(['minimax'])
+    expect(harness.calls[0]?.ref).toBe('MINIMAX_ACCOUNT_ISO')
   })
 })

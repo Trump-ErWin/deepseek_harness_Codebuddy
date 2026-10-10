@@ -62,12 +62,39 @@ describe('Loomy RPC 分派', () => {
     expect(code).not.toContain("loginMode: 'sms'")
   })
 
-  it('account.refresh 的 switch 有 loomy case', () => {
-    expect(rpcSource).toMatch(/case LOOMY\.id:[\s\S]{0,200}refreshAccountCredential/)
+  /**
+   * ⚠️ 2026-10-08 改（Task 2）：原先这条断言
+   * `/case LOOMY\.id:[\s\S]{0,200}refreshAccountCredential/` —— 一个**源码文本**
+   * 断言，扫的是 13 个同构 `case` 里的 loomy 那一个。Task 2 把它们换成一处查表
+   * ⇒ `case LOOMY.id:` 这个形态**不存在了**，而它守的意图（loomy 的续期接上了）
+   * **与文本无关**。
+   *
+   * ⇒ 改为断言 `account.refresh` **真的走查表分派**（结构），并把
+   *    「loomy 的续期落到 loomy 实例上」交给**行为**用例：
+   *    `lobsterai-rpc-dispatch.spec.ts` 的「13 个 provider 逐个覆盖」组
+   *    （从 `REFRESH_PROVIDERS` 派生，含 loomy）。
+   */
+  it('account.refresh 走查表分派（loomy 不再需要自己的 case）', () => {
+    const refreshStart = rpcSource.indexOf("case 'account.refresh':")
+    expect(refreshStart, '找不到 account.refresh 分支').toBeGreaterThan(-1)
+    const refreshBlock = rpcSource.slice(refreshStart, refreshStart + 4000)
+    expect(refreshBlock).toMatch(/authOf\(auths, entry\.provider\)/)
+    // 反向：不得再有 provider 专属的硬编码分支（那正是本次收敛掉的东西）。
+    expect(refreshBlock).not.toMatch(/case LOOMY\.id:/)
   })
 
   it('credits.status / claimAll / balances 各有 loomy 分支', () => {
-    // 三个端点各出现一次（加上 account.create / refresh 的分支，总计 >= 5 次）
+    // 三个端点各出现一次 ⇒ >= 3。
+    // ⚠️ 2026-10-08 改（Task 2 复审 Finding 4）：原文写「加上 account.create /
+    //    refresh 的分支，总计 >= 5 次」—— `refresh` 那半**已不成立**：
+    //    `account.refresh` 的 13 个同构 `case`（含 `case LOOMY.id:`）已被 Task 2
+    //    收敛成一处查表分派（`authOf(auths, entry.provider)`），该分支里
+    //    **不再出现 `LOOMY.id`**。
+    //    实测（2026-10-08）：本文件共 **12** 处 `LOOMY.id`，其中 account.create
+    //    （3 处）与 login.sendSms / submitSms / onboarding.* / permanentLock 等
+    //    分支占了多数；`>= 5` 这个阈值仍被满足，但**理由已换成这些真协议分支**，
+    //    与 account.refresh 无关 —— 写成「含 refresh」会让下一个读者以为那个
+    //    case 还在。
     const occurrences = rpcSource.split('LOOMY.id').length - 1
     expect(occurrences).toBeGreaterThanOrEqual(5)
   })
