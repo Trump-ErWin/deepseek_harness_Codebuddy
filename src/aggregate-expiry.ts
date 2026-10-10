@@ -9,7 +9,7 @@
  * | `aggregate-core.ts` | 该文件定位是**纯逻辑**（哨兵 / 排序 / 倍率解析，模块头明写、零 import），而本模块要发网络请求 ⇒ 把 IO 混进纯函数模块，且 `aggregate-core.spec.ts` 这个纯函数单测会**被迫加载网络模块** |
  * | ✅ 本文件 | 单一职责；两个适配器都依赖它，方向正确 |
  *
- * ## ⚠️ 四个 `*Expiry` 是**搬移**进来的，不是复制
+ * ## ⚠️ 六个 `*Expiry` 是**搬移**进来的，不是复制
  *
  * 它们原先私有在 `auto-adapter.ts` 里（`private async buddyExpiry` 等）。Task 7
  * 把 `expiryOf` 改成委托本模块的 {@link createExpiryProbe} 后，若原处再留一份，
@@ -18,6 +18,17 @@
  * 不崩溃、单测能过，只是把「没做到」说成「做到了」）。
  * Task 3 已用同样手法处理过 `pickSoonestProvider` / `priceFactorFromName`。
  *
+ * ⚠️ 计数是**六**不是四（2026-10-08 更正）：Task 7 搬来时是四个
+ *（buddy / loomy / codeArts / zcode），2026-10-07 又补了 `lobsteraiExpiry` 与
+ * `traeExpiry`（用户质疑后核实加入）—— 旧注释一直没跟着改。
+ *
+ * ## ⚠️ 依赖方向（2026-10-08 起 import `provider-runtime.ts`）
+ *
+ * 本模块**只**依赖底座，不依赖任何聚合侧模块（见上表：依赖聚合适配器就是
+ * **层次颠倒**）。`provider-runtime.ts` 只 import `provider-registry.ts`（纯数据）
+ * 与 `account-pool.ts`（**仅类型**），**不** import 本文件 ⇒ **无环**。
+ * ⚠️ 别在这里 import `aggregate-adapter.ts` / `auto-adapter.ts`。
+ *
  * @module src/aggregate-expiry.ts
  */
 
@@ -25,7 +36,7 @@ import type { AccountPool } from './account-pool.js'
 import { NEVER, UNUSABLE, type ExpiryProbe } from './aggregate-core.js'
 import type { BuddyCredential } from './buddy.js'
 import { fetchCreditBalance } from './credits.js'
-import { CODEBUDDY, WORKBUDDY } from './product.js'
+import { CODEBUDDY } from './product.js'
 import { LOOMY } from './loomy-product.js'
 import type { LoomyCredential } from './loomy.js'
 import { fetchLoomyCreditDetail } from './loomy-credits.js'
@@ -35,12 +46,13 @@ import type { ZcodeCredential } from './zcode.js'
 import { fetchZcodeBalance } from './zcode-upstream.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
 import type { CreditBalance } from './credits.js'
-import { LOBSTERAI, type LobsteraiProduct } from './lobsterai-product.js'
+import type { LobsteraiProduct } from './lobsterai-product.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
-import { TRAE, type TraeProduct } from './trae-product.js'
+import type { TraeProduct } from './trae-product.js'
 import type { TraeCredential } from './trae.js'
 import { fetchTraeCreditBalance } from './trae-credits.js'
+import { runtimeOf } from './provider-runtime.js'
 
 /**
  * 真实临期探针：**每个渠道折算成一个「最早失效时刻」**。
@@ -79,7 +91,7 @@ import { fetchTraeCreditBalance } from './trae-credits.js'
  */
 
 /**
- * **已接入临期折算**的渠道 id（`createExpiryProbe` 的 `switch` 覆盖的那几家）。
+ * **已接入临期折算**的渠道 id。
  *
  * ## ⚠️ 为什么必须导出（审计轮次二实测证伪的缺陷）
  *
@@ -99,8 +111,44 @@ import { fetchTraeCreditBalance } from './trae-credits.js'
  * ⇒ 聚合目录只播报「**至少有一个已接入候选**」的虚拟模型；`auto` 不受影响
  *（它的池跨全部渠道，任一已接入渠道有账号就能路由）。
  *
- * ⚠️ **本清单必须与下方 `switch` 的分支保持一致** —— 有专门用例锁它们相等
- *（`aggregate-expiry.spec.ts` 的「清单与 switch 一致」条），新增渠道时两处都要改。
+ * ## ⚠️⚠️ 为什么它必须是**编译期常量**，不能从 runtime 派生（2026-10-08 设计复审）
+ *
+ * 本清单回答的是「**这个渠道接入了临期折算吗**」—— 那是一个**编译期事实**
+ *（本文件有没有为它写折算原语）。而 `ProviderRuntime.expiry` 回答的是另一个问题：
+ * 「**运行时该调哪个原语**」。两者**不是同一件事**，故不能互为派生源。
+ *
+ * 具体后果（**实测**，不是推断）：本清单在源码里有 **4 个**消费点 ——
+ * 3 处在 `aggregate-adapter.ts` 的过滤（探测过滤 / 候选过滤 / 虚拟模型过滤），
+ * 1 处是本文件的「未接入」短路。而**既有测试**里有两个大批量的构造点：
+ * **29 处**临期探针工厂调用、**86 处** `AggregateAdapter` 构造 —— 那些文件
+ * **一次都不调 `apply()`**（`aggregate-expiry` / `aggregate-wiring` /
+ * `zcode-expiry-exhausted` 三份的 `apply` 命中**都不是真实调用**：实测分别是
+ * 3 / 0 / 0 处，有命中的那份全是注释里的字）。
+ * ⚠️ **计数口径**（便于复核，2026-10-08 实测）：在 `tests/unit` 里 grep
+ * 「工厂名 + 左括号」共 36 处，减去 `expiry-runtime-parity.spec.ts` 自己的 7 处
+ * ⇒ **既有 29 处**；grep「`new` + `AggregateAdapter` + 左括号」共 86 处
+ *（全在既有文件）。⚠️ 本仓库的注释刻意**不写出左括号**，否则注释自己会被
+ * 下一次 grep 计进去（自指），数字就再也复核不出来。
+ * 而 runtime 注册只发生在 `apply()` ⇒ 派生版本在这些场景下**恒为空数组**，于是：
+ *
+ * | 后果 | 严重度 |
+ * |---|---|
+ * | `refreshCatalog` 把所有虚拟模型过滤掉 ⇒ **聚合 provider 的模型列表整个变空** | 致命 |
+ * | 上述 29 + 86 处构造点大面积变红 | 高 |
+ *
+ * ⚠️ **不要**把它说成「生产路径也会变空」—— 那是**没有证据**的推断，已实测证伪：
+ * `src/index.ts` 里聚合适配器确实在 runtime 注册**之前**创建（`registerAggregateLlm`
+ * 调用早于 `registerProviderRuntime` 那段循环），但 `catalog-prewarm` 的首次预热是
+ * `queueMicrotask` 排的，而 `apply()` 是**同步**函数 ⇒ 微任务在 `apply()` **整体
+ * 返回之后**才跑，那时注册（同步段内）早已完成。
+ * 实测（`node -e` 复现同一时序）：`sync-A → registration → sync-B → microtask → prewarm`。
+ * ⇒ 派生版本在**生产**启动窗口内其实是安全的；**决定性证据是上面那两组实测计数**
+ * （29 处探针 + 86 处适配器构造，全都不调 `apply()`），不是「生产会挂」。
+ *
+ * ⇒ 保持常量。它与 runtime 的一致性由
+ * `tests/unit/expiry-runtime-parity.spec.ts` 的「**清单 == runtime 里挂了
+ * `expiry` 域的渠道集合**」锁死（真跑 `apply()`）—— 那条锁的是真实会发生的漂移
+ *「有人加了 runtime 注册却忘了加清单」（或反之），**不是**同义反复。
  */
 export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   'buddy',
@@ -114,6 +162,7 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   'lobsterai',
   'trae',
 ])
+
 /**
  * 临期折算结果的**缓存时长**（毫秒）。用户 2026-10-07 要求加缓存，TTL 由用户在
  * 60 / 90 / 120 中选定 —— **取 60**。
@@ -224,7 +273,7 @@ export function createExpiryProbe(
     // ⚠️ **未接入的渠道直接返回 `UNUSABLE`，不取号、不读目录**（第 3 轮审计实测）。
     //
     // 为什么要在最前面短路：本函数对**未接入**渠道最终也返回 `UNUSABLE`（走下方
-    // `switch` 的 `default`），但那时**已经**做了两件无意义的事：
+    // `credentialExpiry` 的「无 `expiry` 域」分支），但那时**已经**做了两件无意义的事：
     //   ① `await firstModelIdOf(provider)` —— 一次渠道目录读取；
     //   ② `await pool.getAvailableAccount(...)` —— 一次账号池查询。
     // 而 `candidatesFor` 的池包含**全部**渠道的候选 ⇒ 每次 `auto` 请求都会为**每个**
@@ -376,33 +425,55 @@ async function legacySingleCredential(
 }
 
 /**
- * 单个账号的临期折算（按渠道分派）。
+ * 单个账号的临期折算（**按 provider 查能力注册表**）。
  *
  * ⚠️ 从 `createExpiryProbe` 里抽出来，是为了让「探全部账号」的循环保持简单，
- * 且**判据仍然只有一处**（不复制 switch）。
+ * 且**判据仍然只有一处**（不复制分派）。
+ *
+ * ## ⚠️ 2026-10-08 改：原先是一个 7-case `switch`
+ *
+ * 那个 `switch` 的**每个分支体都只是「调一个原语」**
+ *（`buddyExpiry` / `loomyExpiry` / `codeArtsExpiry` / `zcodeExpiry` /
+ * `lobsteraiExpiry` / `traeExpiry`），只有原语名与参数不同 —— 与
+ * `account.refresh` 的 13 个同构 case 完全同型。现在「**选哪个**原语」由
+ * 能力注册表回答（设计文档 §3.5.3）。
+ *
+ * ⚠️ **各家原语函数原样保留** —— 它们是**真实差异**（判据不同、量纲不同：
+ * loomy 是命名池、codearts 无到期概念、zcode 分桶按秒、buddy 系按资源包）。
+ * 本函数只负责「选哪个」，**不**抽象「原语内部做什么」（§3.6 的边界）。
+ *
+ * ⚠️ 层次方向：本模块**只**能依赖底座（见模块头）。`provider-runtime.ts` 不
+ * import 本文件、也不 import 聚合适配器，故无环 —— 但**别**在这里 import
+ * `aggregate-adapter.ts`。
  *
  * @returns 毫秒时间戳（越小越早作废）／`NEVER`（长期）／`UNUSABLE`（查不到）
  */
 async function credentialExpiry(provider: string, credential: unknown): Promise<number> {
-  switch (provider) {
-    case 'buddy':
-      return buddyExpiry(CODEBUDDY, credential as BuddyCredential)
-    case 'workbuddy':
-      return buddyExpiry(WORKBUDDY, credential as BuddyCredential)
-    case 'loomy':
-      return loomyExpiry(credential as LoomyCredential)
-    case 'codearts':
-      return codeArtsExpiry(credential as CodeArtsCredential)
-    case 'zcode':
-      return zcodeExpiry(credential as ZcodeCredential)
-    // ⚠️ 这两家的包与 buddy 同形 ⇒ 走共享折算（判据只写一份，避免同族分叉）。
-    case 'lobsterai':
-      return lobsteraiExpiry(credential as LobsteraiCredential, LOBSTERAI)
-    case 'trae':
-      return traeExpiry(credential as TraeCredential, TRAE)
-    default:
-      return UNUSABLE
+  const runtime = runtimeOf(provider)
+  if (runtime?.expiry === undefined) {
+    // ⚠️ 未接入 ⇒ `UNUSABLE`（**不是** NEVER）：返回 NEVER 会让一个我们对其
+    //    一无所知的渠道被排在候选**最前**并当选 —— 而它可能压根没有可用账号。
+    //    这与模块头的铁律同一条：「宁可少一个候选，不可把未知当可用」。
+    //
+    // ⚠️⚠️ 本分支**只对「清单内但 runtime 缺 `expiry` 域」的渠道可达**：
+    //    清单外的渠道在更早的「未接入」短路处就返回了。生产装配下这个组合被
+    //    `expiry-runtime-parity.spec.ts` 的不变式一挡住（清单 == runtime 里挂了
+    //    `expiry` 域的集合）⇒ 它是**防御性**的，锁的是「有人删了某家的注册、
+    //    却没同步改清单」这一类漂移。
+    //    ⚠️ 但它**不是**同义反复：`expiry-runtime-parity.spec.ts` 有一条
+    //    **行为**用例专门只注册 descriptor、不挂 `expiry` 域，断言这里回
+    //    `UNUSABLE` —— 把本行的 `UNUSABLE` 改成 `NEVER` 会让它变红并点名
+    //    （独立复审实测：此前该分支**零覆盖**，改坏了没有任何用例会红）。
+    //
+    // ⚠️ 这里**刻意不打日志**（2026-10-08 决定）：本函数在候选排序里**每个渠道
+    //    调一次**，而模块内**没有** logger（`createExpiryProbe` 只收
+    //    `pool` / `firstModelIdOf` / `options`，没有 `ctx`）—— 为一条被断言锁住的
+    //    防御性分支去穿一条 logger 通道，会把日志出口变成这个纯底座模块的新依赖。
+    //    真正的防线是上面那条不变式断言（真跑 `apply()`，漏注册一家即红并点名），
+    //    以及 `src/index.ts` 注册失败时已有的 info 日志。
+    return UNUSABLE
   }
+  return runtime.expiry.credentialExpiry(credential)
 }
 
 /**

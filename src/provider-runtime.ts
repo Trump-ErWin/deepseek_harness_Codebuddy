@@ -36,7 +36,16 @@
  *（零全局状态、测试零改动，见 `jet-hub-rpc.ts`）。
  *
  * 本表的消费点是**拿不到 `auths` 形参**的跨模块场景（Task 5 的
- * `aggregate-expiry.ts`、Task 8 的 `account-probe.ts`）—— 即本文件是**前瞻接线**。
+ * `aggregate-expiry.ts`、Task 8 的 `account-probe.ts`）。
+ *
+ * ## ⚠️ 依赖方向：本文件**不得** import 上层模块
+ *
+ * `aggregate-expiry.ts`（Task 5 起的**真实生产消费者**）import 本文件；
+ * 反过来本文件**只** import `provider-registry.ts`（纯数据）与 `account-pool.ts`
+ * （**仅类型**）⇒ **无环**。这条方向是刻意维持的：
+ * `aggregate-expiry.ts` 的模块头记着一条红线 —— 它若依赖聚合适配器就是
+ * 「层次颠倒」（`auto-adapter.ts` 也要复用它）。本表是**底座**，故不得反向
+ * 依赖任何聚合侧模块；将来要在这里加 import 时先确认这一点。
  */
 
 import type { ProviderDescriptor } from './provider-registry.js'
@@ -163,6 +172,58 @@ export interface ProviderRuntime {
    * 此时用 `fetchBalanceDetailed`，原因由实现自己给。
    */
   readonly credits?: ProviderCredits
+
+  /**
+   * 临期折算（供聚合 / auto 的候选排序）。
+   *
+   * ⚠️ **本域「存在」即表示「该渠道已接入临期折算」**：`src/aggregate-expiry.ts`
+   * 的 `credentialExpiry` 按本域分派，缺席 ⇒ `UNUSABLE`（剔除）。
+   *
+   * ⚠️⚠️ **但「已接入清单」并不由本表派生**（2026-10-08 设计复审更正）：
+   * `WIRED_EXPIRY_PROVIDERS`（同文件）是**编译期常量**，理由见那里的长注释 ——
+   * 它在源码里有 **4 个**消费点（`aggregate-adapter.ts` 的**三处**目录/候选过滤，
+   * 加 `aggregate-expiry.ts` 的「未接入」短路），更要紧的是被**大量不调 `apply()`
+   * 的既有测试**消费（实测：在 `tests/unit` 里 grep「临期探针工厂名 + 左括号」共
+   * 36 处，减去 `expiry-runtime-parity.spec.ts` 自己的 7 处 ⇒ **既有 29 处**；
+   * grep「`new` + `AggregateAdapter` + 左括号」共 **86 处**。⚠️ 注释刻意不写出
+   * 左括号，否则注释自己会被下一次 grep 计进去），而本表要到 `apply()` 才填充 ⇒
+   * 派生版本在那些场景下**恒为空数组**，会把**所有虚拟模型过滤掉**
+   *（聚合目录整个变空）。
+   * 两者回答的是**两个不同的问题**（「接入了吗」 vs 「运行时调哪个原语」），
+   * 一致性由 `tests/unit/expiry-runtime-parity.spec.ts` **真跑 `apply()`** 锁死。
+   *
+   * ## ⚠️ 它是本表**第一个有生产读者**的域
+   *
+   * 与 {@link auth.refreshAccount} / {@link credits} / {@link onboarding}
+   * 不同（那三个在生产路径上只被测试读，见各自的注释）：本域被
+   * `src/aggregate-expiry.ts` 的 `credentialExpiry` **真的调用**。
+   * ⚠️ 故本域的**删除**是可见的功能回退：某渠道的 `expiry` 一旦缺席，
+   * 它立刻退出聚合候选池（`UNUSABLE` ⇒ 剔除），且**没有**任何日志 ——
+   * 由 `tests/unit/expiry-runtime-parity.spec.ts` 真跑 `apply()` 逐家点名守着。
+   */
+  readonly expiry?: {
+    /**
+     * 该凭据所属账号的**最早失效时刻**。
+     *
+     * @returns 毫秒时间戳（越小越早作废）／`NEVER`（长期：排最后但**不剔除**）
+     *   ／`UNUSABLE`（查不到：**剔除**）
+     *
+     * ⚠️ 「**有余额但无到期时间**」必须是 `NEVER` 而**不是** `UNUSABLE`：
+     * 实测 lobsterai 的 `expiresAt` 可为**空串**、buddy 的永久积分包也可能不下发
+     * `DeductionEndTime`。这类包**确实有额度**（`remaining > 0`），
+     * 剔除它会丢掉一个可用渠道。
+     * ⚠️ 但「**有效包且 `remaining = 0`（余额已尽）**」必须是 `UNUSABLE`
+     *（真实缺陷已修：旧实现让它返回 `NEVER`，于是余额耗尽的账号仍会被选中，
+     * 请求随即以 `QUOTA_EXCEEDED` 失败）。
+     *
+     * ⚠️ 实现方**原样返回**各家 `*Expiry` 原语的结论，**不要**在这一层改写
+     *（尤其不要把 `UNUSABLE` 折成 `NEVER`：那正是本模块头警告的「把未知当可用」）。
+     *
+     * ⚠️ `credential` 是 `unknown`：各渠道凭据形状不同，由各实现自己收窄
+     *（各家原语的入参类型即各自的凭据类型）。
+     */
+    credentialExpiry(credential: unknown): Promise<number>
+  }
 
   /**
    * **一次性**新手任务 / 登录奖励（Loomy 新手任务、raccoon 桌面端登录奖励）。
@@ -461,6 +522,21 @@ export function registerProviderRuntime(runtime: ProviderRuntime): boolean {
 /** 按 id 取（未注册返回 `undefined`，由调用方决定报错措辞）。 */
 export function runtimeOf(provider: string): ProviderRuntime | undefined {
   return runtimes.get(provider)
+}
+
+/**
+ * 按 provider id 从一张 `expiry` 表里取实现。
+ *
+ * ⚠️ 用 `Object.hasOwn` 而非 `in` 或下标：`in`/下标会命中**原型链**上的键
+ *（如 `constructor`），把 `req.provider` 为怪值时误判成「有该 provider」——
+ * 与 `creditsOf` / `onboardingOf` / `authOf` 同因（四处必须同款）。
+ */
+export function expiryOf(
+  table: Readonly<Record<string, NonNullable<ProviderRuntime['expiry']>>>,
+  provider: string,
+): ProviderRuntime['expiry'] {
+  if (!Object.hasOwn(table, provider)) return undefined
+  return table[provider]
 }
 
 /**

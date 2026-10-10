@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   clearProviderRuntimes,
+  expiryOf,
   registerProviderRuntime,
   registeredRuntimeIds,
   runtimeOf,
@@ -75,5 +76,37 @@ describe('PROVIDER_RUNTIME 注册表', () => {
   it('auth 域可选：不带 auth 也能注册（opencode / aggregate 的形态）', () => {
     expect(registerProviderRuntime({ descriptor: descriptorOf('opencode')! })).toBe(true)
     expect(runtimeOf('opencode')?.auth).toBeUndefined()
+  })
+})
+
+/**
+ * ⚠️ `expiryOf` 是 `expiry` 表的**取值助手**（`src/index.ts` 的注册段用它），
+ * 与 `creditsOf` / `onboardingOf` / `authOf` 同款 —— 四处必须同判据。
+ *
+ * 反向验证：把实现改成下标取值（`table[provider]`）⇒ 下面「原型链键」那条变红。
+ */
+describe('expiryOf：按 id 取实现，且**不得命中原型链**', () => {
+  const table = {
+    buddy: { credentialExpiry: async () => 1 },
+    trae: { credentialExpiry: async () => 2 },
+  }
+
+  it('取到自己的实现（含两个键互不串味）', () => {
+    expect(table.buddy).toBe(expiryOf(table, 'buddy'))
+    expect(table.trae).toBe(expiryOf(table, 'trae'))
+  })
+
+  it('未登记的 id 返回 undefined（调用方据此判「未接入」）', () => {
+    expect(expiryOf(table, 'cline')).toBeUndefined()
+    expect(expiryOf(table, '')).toBeUndefined()
+  })
+
+  it('★ 原型链键不得命中（`constructor` / `toString` / `__proto__` 等）', () => {
+    // ⚠️ 用下标或 `in` 时 `table['constructor']` 会取到 `Object` 构造函数 ⇒
+    //    调用方以为「这个 provider 有 expiry 域」⇒ 折算时抛不可诊断的 TypeError。
+    //    `req.provider` 是外部输入，故这条不是理论风险。
+    for (const key of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+      expect(expiryOf(table, key), `${key} 不得命中`).toBeUndefined()
+    }
   })
 })

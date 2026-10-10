@@ -71,7 +71,7 @@ import { MINIMAX } from './minimax-product.js'
 //    brief 原稿称「Task 1 已加过 `descriptorOf`，合并进同一行」，实测**没有** ——
 //    故 Task 2 才把它并进本行。
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
-import { registerProviderRuntime } from './provider-runtime.js'
+import { registerProviderRuntime, expiryOf } from './provider-runtime.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
 import { createProviderOnboarding, onboardingOf } from './provider-onboarding.js'
 import type { MinimaxCredential } from './minimax.js'
@@ -86,6 +86,7 @@ import { AGGREGATE_PROVIDER, registerAggregateLlm } from './aggregate-adapter.js
 // ⚠️ `createExpiryProbe` 从**底座**导入，不是从 `aggregate-adapter.js`
 //（它定义在 `aggregate-expiry.ts`，理由见该文件与 Task 7 的 Files 说明）。
 import { createExpiryProbe } from './aggregate-expiry.js'
+import { createProviderExpiry } from './provider-expiry.js'
 // ⚠️ opencode 的 RPC 由 `jet-hub-rpc.ts` 的 handleMethod 统一分派
 // （它调 handleOpencodeRpc），本文件**不再**单独注册端点 —— 详见
 // `opencode-rpc.ts` 模块头「为什么是被主 switch 调用」。
@@ -2421,6 +2422,34 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
    */
   const onboardingTable = createProviderOnboarding({ loomy, raccoon })
 
+  /**
+   * **临期折算**能力表（供聚合 / auto 的候选排序）。
+   *
+   * ⚠️ 与 `creditsTable` / `onboardingTable` 的关键区别：本表是**唯一**的一份，
+   *    且它的消费点**只有** `ProviderRuntime.expiry` —— 没有任何端点侧副本
+   *    （那两个域各有第二份「从 `auths` 现造」的表，本域没有：它的消费者是
+   *    `src/aggregate-expiry.ts`，那是个拿不到 `auths` 形参的独立模块）。
+   *
+   * ⚠️ 表**建在 `src/provider-expiry.ts`**（而不是内联在这里）：几十处既有用例
+   *    直接构造 `createExpiryProbe` / `AggregateAdapter`、**不调 `apply()`**，
+   *    它们要验折算**值**（TTL 缓存 / 取全部账号 / `clear()`）就必须让 runtime 里
+   *    有**真实**实现。表若内联在此，那些用例只能各写一份自己的映射 ⇒
+   *    「同一语义两套判据」（本仓库首条红线）。生产与单测**共用同一份**。
+   *
+   * ⚠️ **只挂「已接入临期折算」的 7 家**（`expiry` 域存在即已接入，
+   *    `WIRED_EXPIRY_PROVIDERS` 与它的一致性由
+   *    `tests/unit/expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁死）：
+   *    未接入的渠道**不该**出现在聚合候选里。返回 `UNUSABLE` 也会被剔除，
+   *    但让它压根不进目录更诚实 —— 见 `aggregate-expiry.ts` 的长注释。
+   *
+   * ⚠️ **这里挂的是「选哪个原语」，不是原语本身**：各家的 `*Expiry` 原语
+   *    （判据与量纲各异）原样保留在 `aggregate-expiry.ts`
+   *    （设计文档 §3.5.3 / §3.6 的边界）。
+   *
+   * ⚠️ 用 `expiryOf` 而非下标（原型链键误判），与 `creditsOf` 同因。
+   */
+  const expiryTable = createProviderExpiry()
+
   // ===== 能力注册表（设计文档 §3.3）=====
   //
   // ⚠️ **本段是前瞻接线**（2026-10-08 调序后修正）：`account.refresh` 的分派
@@ -2482,6 +2511,12 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         // ⚠️ 与 credits 同法：`onboardingOf` 而非下标（原型链键误判）。
         // ⚠️ 只有 loomy / raccoon 有条目 —— 其余如实为 `undefined`。
         onboarding: onboardingOf(onboardingTable, id),
+        // ⚠️ 与 credits / onboarding 同法：`expiryOf` 而非下标（原型链键误判）。
+        // ⚠️ 只有**已接入临期折算**的 7 家有条目 —— 其余如实为 `undefined`
+        //    （那是「未接入」的诚实表达：`credentialExpiry` 据此返回 `UNUSABLE`）。
+        //    ⚠️ `WIRED_EXPIRY_PROVIDERS` **不**从这里派生（它是编译期常量），
+        //    两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁死。
+        expiry: expiryOf(expiryTable, id),
       })
       if (!registered) {
         ctx.logger?.info?.(
