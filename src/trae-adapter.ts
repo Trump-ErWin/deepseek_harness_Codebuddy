@@ -49,6 +49,7 @@ import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
 import { reportLedgerAccount } from './token-ledger.js'
+import { planSessionTitleThinking } from './session-title.js'
 
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae'
@@ -1110,9 +1111,32 @@ export class TraeAdapter extends LlmAdapter {
       }))
     }
     if (options.temperature !== undefined) openaiBody.temperature = options.temperature
+    /**
+     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+     *
+     * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+     * 本模型的默认档注入进来。TRAE 的档位来自远端
+     * `reasoning_effort_config.options`（实测形如 `["light","high","extra_high"]`，
+     * **没有 `off`/`none`**）⇒ 本家在多数模型上**关不掉**思考，只能走抬预算兜底。
+     *
+     * ⚠️ `declaredEfforts` **必须与 `reasoningFor` 同源**（对抗审计实测的分叉）：
+     * `reasoningFor` 在 `supportThinking === false` 时**不声明任何档位**，而直接读
+     * `reasoningConfig.options` 会绕过该过滤 ⇒ 「resolveModel 声明 null，标题路径却
+     * 当真存在档位」。方向虽安全（只会多抬预算、不会下发不存在的档），但两份判据
+     * 必须同源，否则将来某家新增 `off` 档时会静默分叉。
+     */
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+      // 与 `reasoningFor(options.model)` 同源：经它过滤 `supportThinking === false`。
+      declaredEfforts: this.reasoningFor(options.model)?.efforts.map((effort) => String(effort.id)) ?? [],
+      maxTokens: options.maxTokens,
+    })
     // 输出额度收敛到上游安全上限（默认 64000，见 clampTraeMaxTokens）。
     // 不收敛时客户端索要 131072 会把上游打成 4xx。
-    const maxTokens = clampTraeMaxTokens(options.maxTokens)
+    // ⚠️ 抬预算（`titlePlan.maxTokens`）必须走**同一个**钳制函数，
+    // 否则会被钳回原值、兜底静默失效。
+    const maxTokens = clampTraeMaxTokens(titlePlan.maxTokens)
     if (maxTokens !== undefined) openaiBody.max_tokens = maxTokens
     if (options.stop !== undefined && options.stop.length > 0) openaiBody.stop = options.stop
 
@@ -1121,8 +1145,12 @@ export class TraeAdapter extends LlmAdapter {
     // 取值来自 `resolveModel` 声明的 `reasoning.efforts`（即远端
     // `reasoning_effort_config.options` 的字符串），故这里不做白名单校验 ——
     // 校验只会把「远端新增档位」变成静默丢弃。
-    if (options.reasoningEffort !== undefined) {
-      openaiBody.reasoning_effort = options.reasoningEffort
+    //
+    // ⚠️ 标题请求改走 `titlePlan.effort`：该模型若声明了 `off`/`none` 就是它，
+    // 否则**保留原档位**（关不掉，靠上面的抬预算兜底）——
+    // 绝不能自作主张把档位删掉（那会让「关不掉」变成「静默降档」）。
+    if (titlePlan.effort !== undefined) {
+      openaiBody.reasoning_effort = titlePlan.effort
     }
 
     // Max 模式（1M 上下文）：成套覆盖 `max_tokens` / `prompt_max_tokens` /
@@ -1140,6 +1168,17 @@ export class TraeAdapter extends LlmAdapter {
           meta?.maxModeOutputTokens,
         ),
       )
+    }
+    // ⚠️⚠️ **标题请求的抬预算必须排在 Max 覆盖之后**（对抗审计实测的缺口）：
+    // `traeMaxModeFields` **无条件**写 `max_tokens`，若抬预算写在它之前就会被
+    // 覆盖掉。且远端 `__max` 明细只校验 `> 0`（`readDetailMaxTokens`），
+    // 一个异常小的值（实测 `100`、`1`）会把预算压到**低于兜底下限** ⇒ 思考又被
+    // 腰斩、本 issue 原样复发。故这里按「取两者较大」收敛，绝不让已抬高的值变小。
+    if (titlePlan.isTitle && maxTokens !== undefined) {
+      const current = openaiBody.max_tokens
+      openaiBody.max_tokens = typeof current === 'number' && Number.isFinite(current) && current > maxTokens
+        ? current
+        : maxTokens
     }
 
     // system 提示并入 messages 顶部（同样要在转换之前，以便 content 被规范化）。

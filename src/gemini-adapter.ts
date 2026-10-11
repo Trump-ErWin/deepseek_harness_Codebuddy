@@ -64,6 +64,7 @@ import {
   type GeminiProduct,
 } from './gemini.js'
 import { consumeGeminiSse, translateGeminiRequest } from './gemini-messages.js'
+import { planSessionTitleThinking } from './session-title.js'
 import { persistGeminiProject, resolveGeminiProject } from './gemini-project.js'
 import type { GeminiSigStore } from './gemini-sigstore.js'
 
@@ -500,6 +501,28 @@ export class GeminiAdapter extends LlmAdapter {
       : undefined
     const spec = geminiModelSpec(options.model, effort)
 
+    /**
+     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+     *
+     * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+     * 本模型的默认档注入进来。本家档位实测为 `['low','medium','high','tiered']`
+     * （**没有 `off`/`none`**），且 `gemini.ts` 的模块头明确写着
+     * 「关掉 `includeThoughts` 照样思考照样计费（假关）」⇒ 本家**关不掉**思考，
+     * 只能走抬预算兜底。
+     *
+     * ⚠️ 缺口尤其明显：`medium` 档的 `thinkingBudget` 实测为 **4000**，而标题
+     * 请求只给 **64** —— 思考预算本身是输出上限的 **62 倍**，必然被腰斩。
+     *
+     * ⚠️ `declaredEfforts` 与 `resolveModel` 的 `reasoningFor` **同源**
+     * （都取 `geminiReasoningInfo(entry)`），避免「UI 与请求」分叉。
+     */
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: requested,
+      declaredEfforts: declared?.efforts.map((item) => String(item.id)) ?? [],
+      maxTokens: options.maxTokens,
+    })
+
     const images = await this.collectInlineImages(options.messages, entry, options.model)
 
     const sessionLane = this.options.sessionLane ?? GEMINI_SESSION_LANE_INFER
@@ -593,7 +616,9 @@ export class GeminiAdapter extends LlmAdapter {
           ...options.system === undefined ? {} : { system: options.system },
           ...options.tools === undefined ? {} : { tools: options.tools },
           ...options.temperature === undefined ? {} : { temperature: options.temperature },
-          ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+          // ⚠️ 标题请求走 `titlePlan.maxTokens`（关不掉思考时已抬到兜底下限）——
+          // 它最终成为 `generationConfig.maxOutputTokens`（见 `gemini-messages.ts`）。
+          ...titlePlan.maxTokens === undefined ? {} : { maxTokens: titlePlan.maxTokens },
           ...this.options.sessionId === undefined ? {} : { sessionId: this.options.sessionId },
           sessionLane,
           sessionGeneration,

@@ -45,6 +45,7 @@ import {
   ModelQueuedError,
   serializeMessages,
 } from './openai-compat.js'
+import { planSessionTitleThinking } from './session-title.js'
 import {
   BILLING_BUSINESS_CODE,
   BILLING_BUSINESS_CODES,
@@ -732,6 +733,24 @@ export class QoderAdapter extends LlmAdapter {
 
     const fallback = this.fallbackIndex.get(options.model)
 
+    /**
+     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+     *
+     * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+     * `qoderEffortsFor` 声明的默认档注入进来。本家的关闭档是 `none`
+     * （由 `supportsDisable` 追加，见 `qoderEffortsFor`）⇒ 声明了它的模型
+     * 关得掉；未声明的模型只能抬预算兜底。
+     *
+     * ⚠️ 在 `buildRequest` **之外**算一次：它在 401 重试时会被再次调用，
+     * 每次重算虽无害但没必要（与 raccoon 的 `thinking` 同款理由）。
+     */
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+      declaredEfforts: fallback === undefined ? [] : qoderEffortsFor(fallback),
+      maxTokens: options.maxTokens,
+    })
+
     /** 用给定凭据构造一次加密请求（首次与 401 重试共用，避免两处漂移）。 */
     const buildRequest = async (c: QoderCredential): Promise<QoderInferRequest> => {
       const client = await QoderEncryptedInfer.create({
@@ -752,8 +771,16 @@ export class QoderAdapter extends LlmAdapter {
         // 工具定义：这是模型**唯一**能学到函数 schema 的通道，
         // 缺了它模型只能用正文 XML 臆造调用（真实缺陷）。
         tools,
-        ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
-        ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
+        /**
+         * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+         *
+         * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+         * `qoderEffortsFor` 声明的默认档注入进来。本家的关闭档是 `none`
+         * （由 `supportsDisable` 追加）⇒ 声明了它的模型关得掉；
+         * 未声明的模型只能抬预算兜底。
+         */
+        ...(titlePlan.maxTokens !== undefined ? { maxTokens: titlePlan.maxTokens } : {}),
+        ...(titlePlan.effort !== undefined ? { reasoningEffort: titlePlan.effort } : {}),
         ...(fallback?.supportsImage !== undefined ? { isVl: fallback.supportsImage } : {}),
         // 官方 `model_config` 的 display_name / max_input_tokens 必须带上。
         ...(fallback?.name !== undefined ? { displayName: fallback.name } : {}),

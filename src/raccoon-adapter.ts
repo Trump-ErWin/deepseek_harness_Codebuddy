@@ -45,6 +45,7 @@ import {
   type RaccoonProduct,
 } from './raccoon-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
+import { planSessionTitleThinking } from './session-title.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
@@ -541,15 +542,31 @@ export class RaccoonAdapter extends LlmAdapter {
      *
      * ⚠️ 在 `buildBody` **之外**算一次：`buildBody` 会在重试时被多次调用，
      * 每次重算虽无害但没必要。
+     *
+     * ⚠️ **会话自动命名（`purpose: 'session-title'`）必须关闭思考**（issue
+     * IKKVDH）：DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，
+     * 而宿主会把本模型的默认档（本家恒为 `'on'`）注入进来
+     * （`effective = requested ?? reasoning.defaultEffort`）。照常开思考时实测
+     * 均值约 222 个思考 token，必然顶穿 64 ⇒ 正文 0 字符、
+     * `finish_reason:'length'` ⇒ DSH 直接拒绝、标题永远停在 fallback。
+     *
+     * 本家的档位表是**恒声明的两档**（`on`/`off`，与模型无关，见
+     * `raccoon-product.ts`）⇒ 任何模型都**关得掉**，故不需要抬预算。
      */
-    const thinking = raccoonThinkingExtraBody(options.reasoningEffort)
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+      declaredEfforts: RACCOON_REASONING_EFFORTS,
+      maxTokens: options.maxTokens,
+    })
+    const thinking = raccoonThinkingExtraBody(titlePlan.effort)
 
     /** 构造请求体。 */
     const buildBody = (): string => JSON.stringify({
       model: options.model,
       messages: wireMessages,
       stream: true,
-      ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
+      ...titlePlan.maxTokens !== undefined ? { max_tokens: titlePlan.maxTokens } : {},
       ...options.temperature !== undefined ? { temperature: options.temperature } : {},
       ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
       // ⚠️ tools 必须真的下发到请求体**顶层**：Qoder/TRAE 都因漏发而让模型
