@@ -1071,6 +1071,21 @@ describe('model.list / model.setDisabled 端点', () => {
     modelAdapters?: Record<string, { listAllModels(): readonly { id: string; name: string }[] }>
     /** 让 `ctx.emit` 抛错，验证「广播失败不反噬已落盘的开关」。 */
     emitThrows?: boolean
+    /**
+     * 让 `listModels` **永不 resolve**（验证核对带超时、开关不被拖住）。
+     *
+     * 真实 `listModels` 在冷缓存下会发远端拉取，远端卡住时它就一直不返回 ——
+     * 本开关必须自己带预算，不能依赖下游会及时 reject。
+     */
+    listModelsHangs?: boolean
+    /**
+     * `listModels` 的额外钩子（在每个 id 过滤前 await 它）。
+     *
+     * 用于构造**并发窗口**：让第一路的目录读取挂起，期间让第二路完整跑完一次
+     * 写入，从而验证「黑名单读取时刻」是否与写入时刻对齐（Issue IKJW33 的
+     * 审计实测缺陷：提前读会误报「没有产生任何变更」）。
+     */
+    onListModels?: () => Promise<void>
   }) {
     // settings 替身：内存里保存 namespace 的值，语义与真实服务一致的
     // 「整体 replace」。
@@ -1115,6 +1130,11 @@ describe('model.list / model.setDisabled 端点', () => {
           return {
             listModels: async (provider: string) => {
               if (options.listModelsError !== undefined) throw new Error(options.listModelsError)
+              // 永不落定：复刻「远端卡住」的真实形态（核对必须自己带超时，
+              // 不能指望下游会及时 reject）。
+              if (options.listModelsHangs === true) return await new Promise(() => {})
+              // 并发窗口钩子（见 `onListModels` 的说明）。
+              if (options.onListModels !== undefined) await options.onListModels()
               // 复刻真实适配器：黑名单命中的模型不会出现在 listModels 结果里。
               // 读的是 settings 替身的当前值（而非构造时的快照），这样
               // model.setDisabled 之后的下一次 listModels 会立刻反映过滤结果，
@@ -1860,6 +1880,611 @@ describe('model.list / model.setDisabled 端点', () => {
       expect((await call('model.setDisabledMany', { modelIds: ['hy3'], disabled: true })).ok).toBe(false)
       expect((await call('model.setDisabledMany', { provider: '', modelIds: ['hy3'], disabled: true })).ok).toBe(false)
       expect(emitted).toEqual([])
+    })
+  })
+
+  /**
+   * ⚠️⚠️ **对不在当前目录里的 id 开关，绝不能静默成功**（Issue IKJW33，用户报障）。
+   *
+   * ## 真实缺陷
+   *
+   * 对**已从上游目录消失**的模型 id 调 `on`/`off`，命令返回「成功 1」，
+   * 但**实际什么都没发生**，且**没有任何警告**。用户实测两例：
+   * `cline/cline-free/deepseek-v4.1-flash` 与 `cline/stealth/space-bunny-alpha`
+   * 在 10-05 记录「上游 model not found」后已从 cline 目录消失（490 → 489），
+   * 此后对它们 `on` 静默无效。作者据「成功 1」**误判过一次**，
+   * 执行后回查目录才发现是空操作。
+   *
+   * ## 为什么是 warnings 而不是 `ok:false` + `not-found`
+   *
+   * issue 建议「返回明确的 `not-found`」。**不采纳**，两个理由：
+   *
+   * 1. **打开方向是幽灵条目的清理路径**（`model.setAllDisabled` 的注释已立此约定）：
+   *    「曾被关闭、后来从服务端目录下线」的历史死键**只能靠打开方向清掉**。
+   *    按目录拒绝就等于这些键永远留在配置里，正好加重 issue 抱怨的第 2 条。
+   * 2. **目录可能读不出来**（凭据过期 / 远端故障）：此时若按「不在目录」拒绝，
+   *    用户会连开关都动不了 —— 与 `model.setAllDisabled` 的既有取舍矛盾。
+   *
+   * ⇒ **照常写入**（既有语义逐字节不变），只在响应里加 `warnings[]` 说明真相。
+   *
+   * ## 判据只用 `listAllModels()`
+   *
+   * 退化路径（`llm.listModels()`）的结果**已被黑名单过滤**，拿它判「不在目录」
+   * 会把每一个正常关闭的模型都误报成「不存在」。提示类信息误报比漏报糟得多，
+   * 故那里**放弃核对**（不产生任何警告）—— 与 `dead-model-store` 的
+   * 「宁可漏判不可误伤」同一原则。生产环境 `src/index.ts` 永远提供
+   * `modelAdapters`，退化路径只可能出现在单测替身里。
+   */
+  describe('目录外 id 的开关必须给出 warnings（Issue IKJW33）', () => {
+    /** 目录里只有这两个；`gone-model` / `dead-model` 都不在其中。 */
+    const CATALOG = [
+      { id: 'glm-5.2', name: 'GLM-5.2' },
+      { id: 'hy3', name: 'Hy3' },
+    ]
+
+    /** 取出 warnings（缺省为空数组，便于直接 join 断言）。 */
+    const warningsOf = (result: unknown): string[] =>
+      ((result as { value?: { warnings?: string[] } }).value?.warnings) ?? []
+
+    it('关闭一个不在目录里的 id → 仍写入黑名单，但 warnings 点名说明它不在目录', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'gone-model',
+        disabled: true,
+      })
+
+      // 写入行为**不变**（向后兼容：既有调用方与 UI 语义不动）。
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({ buddy: { 'gone-model': true } })
+      // 但必须把真相说出来 —— 这正是本 issue 的全部诉求。
+      const text = warningsOf(result).join('\n')
+      expect(text).toContain('gone-model')
+      expect(text).toContain('不在当前模型目录')
+    })
+
+    /**
+     * ⚠️ **这条是 issue 报障的原始形态**：打开一个已下架、且本就未被关闭的 id
+     * ⇒ 黑名单里没有该键、目录里也没有它 ⇒ `delete` 是纯空操作。
+     *
+     * 旧实现返回「成功」且零警告，脚本/AI 助手据此以为开关生效了。
+     */
+    it('打开一个既不在目录、也不在黑名单里的 id → warnings 说明本次没有任何变更', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'gone-model',
+        disabled: false,
+      })
+
+      expect(result.ok).toBe(true)
+      // 黑名单内容仍为空（纯空操作），但用户/脚本现在能知道原因。
+      // ⚠️ 断言 `{}` 而不是 `undefined`：`setModelDisabled` 的既有语义是
+      // **总是落盘**（即使无变更），既有用例「重新打开时从黑名单移除」同样断言 `{}`。
+      // 本 issue 只加提示、不改这条写入语义。
+      expect(storedValue().disabledModels).toEqual({})
+      const text = warningsOf(result).join('\n')
+      expect(text).toContain('gone-model')
+      expect(text).toContain('没有产生任何变更')
+    })
+
+    /**
+     * ⚠️ **打开方向是幽灵条目的唯一清理路径，不得被误报成「不存在」**。
+     *
+     * 该 id 已从目录下线、但黑名单里还挂着 —— 本次 `delete` 是**有效操作**，
+     * 给警告只会制造噪音、并诱导用户以为清理失败了。
+     */
+    it('打开一个已下线但仍在黑名单里的 id → 无警告（这是有效的清理操作）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { 'gone-model': true } },
+        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'gone-model',
+        disabled: false,
+      })
+
+      expect(result.ok).toBe(true)
+      // 幽灵条目被真的清掉了。
+      expect(storedValue().disabledModels).toEqual({})
+      expect(warningsOf(result)).toEqual([])
+    })
+
+    it('目录里的 id 开关不产生任何警告（不能把正常操作变成噪音）', async () => {
+      const { call } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+      })
+
+      const off = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
+      const on = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: false })
+
+      expect(warningsOf(off)).toEqual([])
+      expect(warningsOf(on)).toEqual([])
+    })
+
+    /**
+     * ⚠️ **缺 `modelAdapters` 时仍能核对**（并集少一半，不影响正确性）。
+     *
+     * 判据的主来源是 `llm.listModels()`，`modelAdapters.listAllModels()` 只是
+     * 并集的**另一半**（为 opencode 那种「设置页目录 ≠ 选择器目录」的家准备）。
+     * 故它缺失时不该放弃核对，也不该误报目录内的 id。
+     *
+     * ⚠️ 本用例标题原先写「没有 `listAllModels`（无法核对目录）时不报警告」，
+     * 而判据早已换成 `listModels` —— 标题与注释随之腐坏（审计指出）。
+     * 现按**实际测的东西**重写。
+     */
+    it('缺 modelAdapters 时仍用 listModels 核对，目录内的 id 不报警告', async () => {
+      const { call } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { 'legacy-model': true } },
+      })
+
+      // 没传 modelAdapters：并集少一半，但 `listModels` 仍是权威主来源。
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'glm-5.2',
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(warningsOf(result)).toEqual([])
+    })
+
+    /**
+     * ⚠️ **dead 表里的 id 也算「不在目录」**，但文案必须给出**可操作的**指引。
+     *
+     * `model.list` 会把 dead 的 id 补回目录（带 `dead:true`）让用户能点「重新显示」，
+     * 而 `listAllModels()` 已被 `withDeadModelPruning` 剔除 ⇒ 它天然落在判据的
+     * 「目录外」。issue 的两例正是这个形态（10-05 记录了 model not found）。
+     * 只说「不在目录」是不够的 —— 用户需要知道去点「重新显示」。
+     */
+    it('对已判为失效（dead）的 id 给出「重新显示」的可操作指引', async () => {
+      const { call } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+      })
+      recordDeadModel('buddy', 'dead-model', 'model not found')
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'dead-model',
+        disabled: false,
+      })
+
+      const text = warningsOf(result).join('\n')
+      expect(text).toContain('dead-model')
+      expect(text).toContain('重新显示')
+    })
+
+    it('setDisabledMany 逐条点名目录外的 id（含 dead），目录内的 id 不进 warnings', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+      })
+      recordDeadModel('buddy', 'dead-model', 'model not found')
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['hy3', 'gone-model', 'dead-model'],
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({
+        buddy: { hy3: true, 'gone-model': true, 'dead-model': true },
+      })
+      const text = warningsOf(result).join('\n')
+      expect(text).toContain('gone-model')
+      expect(text).toContain('dead-model')
+      // ⚠️ 目录内的 `hy3` **不得**出现在 warnings 里（否则每条正常操作都变噪音）。
+      expect(text).not.toContain('hy3')
+    })
+
+    /**
+     * 批量打开方向同样要区分「有效清理」与「纯空操作」：
+     * 前者静默、后者必须说明「没有任何变更」。
+     */
+    it('setDisabledMany 打开方向：黑名单里有的静默清理，纯空操作的才警告', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { 'gone-model': true } },
+        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+      })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['gone-model', 'never-seen'],
+        disabled: false,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({})
+      const text = warningsOf(result).join('\n')
+      // 有效清理（gone-model）静默；纯空操作（never-seen）必须点名。
+      expect(text).not.toContain('gone-model')
+      expect(text).toContain('never-seen')
+    })
+
+    /**
+     * ⚠️⚠️ **判据不得用 `listAllModels()`**（真实缺陷，本修复第一版实测证伪）。
+     *
+     * `listAllModels()` 在**冷缓存**时返回各家**编译期兜底表**，而兜底表是
+     * **子集**：实测 `cline` 冷缓存只返回 3 条（`fallbackModels`），远端却有
+     * 460 条 ⇒ 远端任意一个**正常模型**都会被误报成「不在当前模型目录」。
+     *
+     * 而 issue 的复现路径**恰恰就是冷缓存**（脚本直接调 `on`，从未先跑 `list`）
+     * ⇒ 那个版本会把「误报」当成「修复」，每个正常模型都带一条假警告。
+     *
+     * 本用例把 `listAllModels()` 造成**残缺子集**（模拟冷缓存兜底表），
+     * 同时让 `listModels()` 返回**完整**目录 —— 判据若退回 `listAllModels()`，
+     * 目录内的 `glm-5.2` 会被误报，用例立刻变红。
+     */
+    it('冷缓存（listAllModels 是残缺兜底子集）时不得误报目录内的模型', async () => {
+      const { call } = registerEndpoints({
+        models: MODELS,
+        // ⚠️ 兜底子集：只有 1 条，缺 `glm-5.2` / `deepseek-v4-flash`。
+        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+      })
+
+      // 这三个 id 都在**真实目录**（`listModels` 的源 = MODELS）里。
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['glm-5.2', 'deepseek-v4-flash', 'hy3'],
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(warningsOf(result), '冷缓存兜底子集不得被当成权威目录').toEqual([])
+    })
+
+    /**
+     * ⚠️ 关闭一个**目录内**的模型不得报警告 —— 但这条判据有个陷阱：
+     * 写入后该模型会被 `listModels()` 过滤掉，若在写入**之后**读目录，
+     * 它就会被误判成「不在目录」。故目录必须在写入**之前**读。
+     */
+    it('关闭一个目录内的模型 → 无警告（目录须在写入前读，否则被过滤后误报）', async () => {
+      const { call, storedValue } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'glm-5.2',
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+      expect(warningsOf(result)).toEqual([])
+    })
+
+    /**
+     * ⚠️ **被关着的模型仍在目录里**：`listModels()` 会把它过滤掉，故核对集合
+     * 必须把黑名单里的 id **并回来** —— 否则「重新打开一个已关闭的模型」
+     *（最常见、完全正常的操作）会每次都被误报成「不在目录」。
+     */
+    it('重新打开一个已关闭的目录内模型 → 无警告（黑名单里的 id 必须并回目录）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { 'glm-5.2': true } },
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'glm-5.2',
+        disabled: false,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({})
+      expect(warningsOf(result), '被关闭的目录内模型不得被判成「不在目录」').toEqual([])
+    })
+
+    /**
+     * ⚠️ **目录读不出来时必须放弃核对**：`listModels` 在「无已登录账号」时
+     * 返回 `[]`（`createModelCatalog` 的门控隐藏整个 provider）。若据此核对，
+     * 会把**每一个** id 都判成「不在目录」—— 一次凭据过期就能让所有开关
+     * 都带上假警告。空目录意味着「看不到」，不是「全部下架」。
+     */
+    it('目录为空（无账号门控）时不报警告 —— 空目录不等于全部下架', async () => {
+      const { call } = registerEndpoints({ models: [] })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'anything',
+        disabled: false,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(warningsOf(result)).toEqual([])
+    })
+
+    it('目录读取抛错时开关照常成功、且不报警告（读不到 ≠ 下架）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        listModelsError: '令牌已过期',
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'anything',
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({ buddy: { anything: true } })
+      expect(warningsOf(result)).toEqual([])
+    })
+
+    /**
+     * ⚠️ **打开一个目录外的幽灵条目（仍在黑名单里）必须静默** —— 这是
+     * 幽灵条目的**唯一清理路径**，报警告会让用户以为清理失败。
+     *
+     * ⚠️ 这条语义在实现里**只由一处承担**（`readableCatalogIds` 把黑名单里的
+     * id 并回 `known`）。本用例是它的守卫：并回逻辑若被删/改坏，这里变红。
+     */
+    it('打开一个目录外但仍在黑名单里的 id → 无警告（唯一的清理路径，必须静默）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { 'gone-model': true } },
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'gone-model',
+        disabled: false,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({})
+      expect(warningsOf(result), '清理幽灵条目是有效操作，不得报警告').toEqual([])
+    })
+
+    /**
+     * ⚠️⚠️ **开关绝不能被目录拉取拖住**（本次改动唯一的新增代价）。
+     *
+     * `readableCatalogIds` 要 `await llm.listModels()`，而它在**冷缓存**下会真的
+     * 发一次远端拉取（`loadCatalog()`）⇒ 「写开关」这个原本纯本地的操作多了
+     * 一条网络依赖。若远端卡住，用户点一下开关就会一直转圈。
+     *
+     * ⇒ 核对必须**尽力而为**：超时即放弃核对，开关照常写入。
+     * 本用例让 `listModels` **永不 resolve**，断言开关仍在预算内返回成功。
+     *
+     * ⚠️ 用假计时器不可行（涉及真实 Promise 链），故用「永不落定」+ 真实超时预算
+     * 的竞速，与 `account.create` 那条「不阻塞」用例同款做法。
+     */
+    it('目录读取卡住（永不 resolve）时开关仍及时成功，不被远端拖住', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        listModelsHangs: true,
+      })
+
+      const result = await Promise.race([
+        call('model.setDisabled', { provider: 'buddy', modelId: 'glm-5.2', disabled: true }),
+        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 8000)),
+      ])
+
+      expect(result, '开关被目录拉取拖住了：核对必须带超时').not.toBe('timeout')
+      expect((result as { ok: boolean }).ok).toBe(true)
+      // 写入照常生效 —— 核对失败不得影响开关本身。
+      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+    }, 15000)
+
+    /**
+     * ⚠️⚠️ **两个目录来源必须取并集**（真实缺陷，独立审计实测证伪）。
+     *
+     * `model.list`（设置页）用 `modelAdapters[provider].listAllModels()`，而
+     * `listModels()` 在**只有匿名身份**的 `opencode` 上只返回免费模型
+     * （`opencode-adapter.ts` 的 `filter(isFree)`），其 `listAllModels()` 又
+     * **恒返回**编译期兜底表 ⇒ 设置页看得见的**付费模型在 `listModels()` 里
+     * 一个都没有**。审计实测：无付费账号时关闭 13 个设置页可见的模型，
+     * **13/13 全部收到「该模型可能已被上游下架」的假警告**（它并没下架）。
+     *
+     * 本用例复刻该形状：`listModels` 只给 1 条（模拟匿名身份），
+     * `listAllModels` 给全量（设置页目录）⇒ 关闭设置页可见的模型**不得**报警告。
+     */
+    it('两个目录来源不同源时取并集 —— 设置页可见的模型不得被误报（opencode 形态）', async () => {
+      const { call } = registerEndpoints({
+        // ⚠️ 匿名身份下的 `listModels`：只有 1 条。
+        models: [{ id: 'big-pickle', name: 'Big Pickle' }],
+        // ⚠️ 设置页目录（`listAllModels`）：14 条，含全部付费模型。
+        modelAdapters: {
+          opencode: {
+            listAllModels: () => [
+              { id: 'big-pickle', name: 'Big Pickle' },
+              { id: 'glm-5.2', name: 'GLM-5.2' },
+              { id: 'kimi-k2.5', name: 'Kimi K2.5' },
+              { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
+            ],
+          },
+        },
+      })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'opencode',
+        modelIds: ['glm-5.2', 'kimi-k2.5', 'deepseek-v4.1-flash'],
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(
+        warningsOf(result),
+        '设置页可见的模型被判成「不在目录」：判据漏了 listAllModels 这一半',
+      ).toEqual([])
+    })
+
+    /**
+     * ⚠️ **`listModels()` 读失败时必须整体放弃核对**，不得退化成「只用
+     * `listAllModels()` 兜底表」—— 那会退回第一版的大面积误报。
+     *
+     * ⚠️ 这条刻意牺牲了 issue 原始场景的**漏报**（脚本冷启动直调 `on` 且
+     * 首次拉取就失败时不会给提示），因为反向代价更重：把正常模型说成已下架。
+     */
+    it('listModels 读失败时整体放弃核对，不拿兜底表当权威（宁漏勿误）', async () => {
+      const { call } = registerEndpoints({
+        models: MODELS,
+        listModelsError: '令牌已过期',
+        // 兜底表只有 1 条 —— 若退化用它核对，`glm-5.2` 会被误报。
+        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'glm-5.2',
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(warningsOf(result), 'listModels 失败时不得拿兜底子集当权威目录').toEqual([])
+    })
+
+    /**
+     * ⚠️ **`listAllModels()` 抛错不得让开关本身失败**：开关是主操作，
+     * 核对只是提示层（并集少一半仍可用）。
+     */
+    it('listAllModels 抛错时开关照常成功，只用 listModels 那一半核对', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: {
+          buddy: {
+            listAllModels: () => { throw new Error('适配器内部炸了') },
+          },
+        },
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'glm-5.2',
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+      // `glm-5.2` 在 `listModels` 里 ⇒ 仍能正确判为「在目录」。
+      expect(warningsOf(result)).toEqual([])
+    })
+
+    /**
+     * ⚠️⚠️ **黑名单必须在 `await listModels()` 之后读**（真实缺陷，审计实测）。
+     *
+     * 若由调用方在 `await` **之前**取快照，则「快照」与「实际写入」之间隔着一次
+     * `listModels`（冷缓存下最长 2 秒）。期间另一路 RPC 的写入会让快照失真，
+     * 症状是「**实际产生了变更却报『本次没有产生任何变更』**」—— 与 issue
+     * 要消除的误导同型（方向相反：说空操作、其实有效）。
+     *
+     * 本用例让第一路（打开 X）的 `listModels` **让出执行权**，期间第二路
+     * （关闭 X）完整跑完 ⇒ 第一路必须看到「X 已在黑名单里」并静默。
+     */
+    it('核对期间另一路写入黑名单 → 不得误报「没有产生任何变更」', async () => {
+      let releaseFirst!: () => void
+      const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+      let firstCall = true
+
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        // 第一路的 listModels 挂起（模拟冷缓存拉取），第二路正常返回。
+        onListModels: async () => {
+          if (firstCall) { firstCall = false; await firstGate }
+        },
+      })
+
+      // 第一路：打开 `glm-5.2`（此刻它不在黑名单里）。
+      const opening = call('model.setDisabled', { provider: 'buddy', modelId: 'glm-5.2', disabled: false })
+      // 让第一路先进入 await（挂起在 listModels 上）。
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      // 第二路：关闭 `glm-5.2` 并完整跑完。
+      const closing = await call('model.setDisabled', { provider: 'buddy', modelId: 'glm-5.2', disabled: true })
+      expect(closing.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+
+      // 放行第一路：它会把 `glm-5.2` 重新打开（**真的产生了变更**）。
+      releaseFirst()
+      const opened = await opening
+
+      expect(opened.ok).toBe(true)
+      expect(storedValue().disabledModels, '第一路确实把 glm-5.2 打开了').toEqual({})
+      expect(
+        warningsOf(opened),
+        '实际产生了变更却报「没有产生任何变更」：黑名单读得太早、与写入时刻错开了',
+      ).toEqual([])
+    })
+
+    /**
+     * ⚠️⚠️ **批量端点的并发守卫**（覆盖缺口，独立审计实测 M7 变异**零守卫**）。
+     *
+     * 上面那条只覆盖单条端点；审计实测：**只把 `model.setDisabledMany` 的黑名单
+     * 读取提前到 `await` 之前**，159 条用例**全绿** —— 即批量分支的
+     * 「黑名单必须在 await 之后读」这条语义**没有任何回归保护**。
+     *
+     * ⚠️ 而批量端点是**主力路径**：Jet Hub 的「本组全开/全关」正走它，
+     * 而 cline 的目录有 460+ 条（用户几乎只会用分组开关）。缺了守卫，
+     * 将来有人「顺手把两次读合并成一个变量」就会静默退回误报。
+     *
+     * 形状与单条那条同款：第一路（打开 X）挂起在 `listModels` 上，
+     * 期间第二路（关闭 X）完整跑完 ⇒ 第一路必须看到「X 已在黑名单里」并静默。
+     */
+    it('批量端点核对期间另一路写入黑名单 → 不得误报「没有产生任何变更」', async () => {
+      let releaseFirst!: () => void
+      const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+      let firstCall = true
+
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        onListModels: async () => {
+          if (firstCall) { firstCall = false; await firstGate }
+        },
+      })
+
+      // 第一路：批量**打开** `glm-5.2`（此刻它不在黑名单里）。
+      const opening = call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['glm-5.2'],
+        disabled: false,
+      })
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      // 第二路：批量关闭 `glm-5.2` 并完整跑完。
+      const closing = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['glm-5.2'],
+        disabled: true,
+      })
+      expect(closing.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+
+      // 放行第一路：它会把 `glm-5.2` 重新打开（**真的产生了变更**）。
+      releaseFirst()
+      const opened = await opening
+
+      expect(opened.ok).toBe(true)
+      expect(storedValue().disabledModels, '第一路确实把 glm-5.2 打开了').toEqual({})
+      expect(
+        warningsOf(opened),
+        '批量端点实际产生了变更却报「没有产生任何变更」：黑名单读得太早',
+      ).toEqual([])
+    })
+
+    it('llm 服务完全不可用时开关照常成功、且不报警告', async () => {
+      const { call, storedValue } = registerEndpoints({ models: MODELS, withoutLlm: true })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'anything',
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({ buddy: { anything: true } })
+      expect(warningsOf(result)).toEqual([])
     })
   })
 })
