@@ -50,13 +50,15 @@ describe('account-probe：适配器构造走能力注册表', () => {
     //    CodeArtsAdapter 去发别家凭据 —— 探测必然失败、限流标记永远清不掉，
     //    而症状只是「重测按钮点了没用」，极难定位。
     //
-    // ⚠️ **2026-10-08 独立复审改**：原版用 `cline` 当「未注册」的例子，
-    //    而 `cline` **在生产里是注册了的**（见 `index.ts` 的 `probeById`）——
-    //    它只是在本用例的干净注册表里没注册。那会让读者以为 cline 不支持重测。
-    //    改用 `minimax`：它是**生产里真实存在、且合法地不注册 probe** 的家
-    //   （实测它不写 `modelRateLimits` ⇒ 没有可清的标记 ⇒ 本就不需要 probe）。
-    //    这样本用例同时锁住「合法缺项也必须抛错、不得落回 CodeArtsAdapter」。
-    expect(() => adapterForProbe('minimax', 'MINIMAX_ACCOUNT_X', {}))
+    // ⚠️ **样本只能用「生产里也没有登记」的 id**：本用例在
+    //    `clearProviderRuntimes()` 之后的**干净注册表**里跑，用任何**生产里已登记**
+    //    的家都会让读者以为它不支持重测。这条注释批评过原版用 `cline`
+    //   （2026-10-08），随后又用 `minimax` **重犯了一次** —— 而 minimax 在
+    //    2026-10-11（issue IKJW32 接上请求级换号 + 冷却）之后也进了 `probeById`，
+    //    于是这段「实测它不写 modelRateLimits ⇒ 不需要 probe」成了**错误事实**，
+    //    且本文件不 import `probeById` ⇒ 对它零反应。
+    //    ⇒ 别再拿真实 provider 当「合法缺项」的例子 —— 现在这种例子**已经不存在**。
+    expect(() => adapterForProbe('not-a-registered-provider', 'X_ACCOUNT_X', {}))
       .toThrow(/不支持重测|没有探测适配器/)
   })
 
@@ -66,8 +68,8 @@ describe('account-probe：适配器构造走能力注册表', () => {
   })
 
   it('④ 错误信息**带 provider 名**（否则用户与排查者都不知道是哪个渠道）', () => {
-    expect(() => adapterForProbe('minimax', 'MINIMAX_ACCOUNT_X', {}))
-      .toThrow(/minimax/)
+    expect(() => adapterForProbe('open-not-registered', 'X_ACCOUNT_X', {}))
+      .toThrow(/open-not-registered/)
   })
 
   it('⑤ 注册了别的域（但没有 probe）⇒ 仍抛错，不得因「有 runtime」就放行', () => {

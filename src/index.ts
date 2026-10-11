@@ -81,7 +81,7 @@ import { registerProviderRuntime, expiryOf, wiredRefreshTargets, type ProviderRu
 //    ⚠️ **刻意不写「几家」**：本句原写「全部 **10 家**」，实测那只是**紧邻下面
 //    这一段**导入的类数（10）—— 而 `OpencodeAdapter` 的导入在更下面的独立一行
 //    （它同时供 `registerOpencodeLlm` 用），于是「会写标记的适配器类」实为 **11**；
-//    按**家**展开则是 **13**。同一事实在本文件的另一处又被写成「12 家」。
+//    按**家**展开则是「每个会写标记的家」（数字会随 provider 增减腐坏，别写）。
 //    ⇒ 权威清单与判据见 `probeById` 自己的头注释，别在这里写数字。
 import { BuddyAdapter } from './buddy-adapter.js'
 import { LobsteraiAdapter } from './lobsterai-adapter.js'
@@ -92,6 +92,7 @@ import { TraeAdapter } from './trae-adapter.js'
 import { CodeArtsAdapter } from './llm-adapter.js'
 import { GeminiAdapter } from './gemini-adapter.js'
 import { LoomyAdapter } from './loomy-adapter.js'
+import { MinimaxAdapter } from './minimax-adapter.js'
 import { RaccoonAdapter } from './raccoon-adapter.js'
 import type { ZcodeCredential } from './zcode.js'
 import { GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js'
@@ -330,26 +331,22 @@ export function makeReadImageRequest(ctx: Context) {
  * （只有 `cline` / `opencode` 用 `markLimited` 这个名字），只看第二条会把
  * 大部分家漏掉。
  *
- * 实测（2026-10-08 独立复审按上述两条重跑）：**会写标记的 provider 共 13 家**
- * —— buddy、workbuddy、lobsterai、qoder、qodercn、cline、zcode、trae、
- * gemini、codearts、loomy、raccoon、**opencode**。
- * 本表登记**全部 13 家**（2026-10-08 第二轮：`opencode` 的缺口已补齐，
- * 见下 `opencode` 条目与 {@link PROBE_EXEMPT}）。
+ * ⚠️ **不要在这里抄名单、也不要写「几家」**：本段曾写「会写标记的 provider 共
+ * **13 家**」并紧跟 13 个名字，2026-10-11 加入 `minimax`（issue IKJW32）后当场过期
+ * —— 这正是本文件自己记的「同一条事实的多份抄写必然漂移」的又一次实证。
+ * 权威判据是上面那两条 grep；权威清单是 `tests/helpers/provider-sets.ts` 的
+ * `WRITES_RATE_LIMIT_PROVIDERS`（守卫把它与源码写点**双向**比对，
+ * 漏一家 / 多一家都点名变红）。本表必须**恰好**登记那份清单里的家。
  *
- * ⚠️⚠️ **`loomy` 与 `raccoon` 是本次顺带修掉的第 5 次同型缺陷**：
- * 旧 `else if` 链里**没有它们的分支** ⇒ 它们落入 `else`，被交给
- * 「华为云 HMAC 签名」的 `CodeArtsAdapter` 去发自己的凭据 ——
- * 探测必然失败，而它们的限流标记（UTC+8 当日 24:00）**永远清不掉**。
- * 两者都实测会写 `modelRateLimits`（`loomy-adapter.ts` / `raccoon-adapter.ts`）。
+ * 登记史（只记形态、不记数字）：
  *
- * ⚠️ **`opencode` 是第 6 次同型缺陷，但形态不同**：不是「分派表漏了它」，
- * 而是「登记表里刻意豁免了它」，且**豁免理由是错的**（详见该条目的注释）。
- * 它**写**标记（`opencode-adapter.ts` 3 处 `markLimited` → `index.ts` 的
- * `markLimited` → `pool.updateModelRateLimit`），却没有 `rateLimit: false`
- * 豁免 ⇒ 客户端「重测」按钮**会渲染** ⇒ 用户点了必然报「没有探测适配器」。
- *
- * ⚠️ **只有 `minimax` 是真正「不需要 probe」的那一家**：**不写**标记
- * （实测两条 grep 均无命中）⇒ 本就没有可清的标记。
+ * - **第 5 次** `loomy` / `raccoon`：旧 `else if` 链里**没有它们的分支** ⇒ 落入
+ *   `else` 被交给「华为云 HMAC 签名」的 `CodeArtsAdapter`，而它们的限流标记
+ *   （UTC+8 当日 24:00）**永远清不掉**。
+ * - **第 6 次** `opencode`：不是漏项，而是「登记表刻意豁免了它」且**理由被证伪**。
+ * - **第 7 次** `minimax`：它先前**确实**不写标记（14 家里唯一），故曾被判
+ *   「不需要 probe」；2026-10-11 接上请求级换号 + 冷却后该前提作废。
+ *   ⇒ 判据永远是「**现在**写不写标记」，不是「曾经写不写」。
  *
  * ⚠️⚠️ **不要再写「`opencode` 不写标记」**（2026-10-08 原注释如此，独立复审
  * 实测证伪）：它与「余额是本地派生的通道可用性、零网络」说的是**两件事** ——
@@ -504,6 +501,23 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
       product: RACCOON,
     }),
   },
+  // MiniMax Code（中国版）→ Anthropic Messages 端点。
+  //
+  // ⚠️ 它**曾经**不必在这里（issue IKJW32 之前：适配器不写 `modelRateLimits`）。
+  // 2026-10-11 接上请求级换号 + 冷却后它**会写**标记（额度 24h / 限流 1h）
+  // ⇒ 必须登记，否则标记写进去却永远清不掉 —— 与上面 `opencode` 完全同型。
+  // 探测**不传** `fetchRemoteModels` / `accountPool` / `readImage`：与其余家同一
+  // 理由（探测是轻量存活检查，不写任何状态、也不为一次探测额外拉目录）。
+  // ⚠️ 尤其**不传 `accountPool`**：那会让 `stream()` 的反查与轮换在探测路径上
+  // 复活（探测失败若写回限流标记，会把「重测 A 账号」变成污染池的副作用）。
+  minimax: {
+    createProbeAdapter: (ref, credential) => new MinimaxAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as MinimaxCredential,
+      refresh: async () => {},
+      product: MINIMAX,
+    }),
+  },
   // OpenCode Zen。
   //
   // ## ⚠️ 这里**必须**用第三个参数 `entry`，不能只靠 `credential`
@@ -528,7 +542,7 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
   //   - `slotId` 与 `refName` 的键空间差异在这里不成立：探测不调
   //     `markLimited`，没有任何按 slotId 写回的动作。
   // ⇒ 真正缺的只是「把 `entry` 交给工厂」这一件事，故给
-  // `createProbeAdapter` 加了可选的第三个参数（纯放宽，其余 12 家不受影响）。
+  // `createProbeAdapter` 加了可选的第三个参数（纯放宽，其余各家的适配器不受影响）。
   //
   // ## 刻意**不**传的四个钩子
   //
@@ -548,7 +562,7 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
   // （见 opencode 接线块的注释），且**不影响**限流判定的结论。
   opencode: {
     // ⚠️ `OpencodeAdapterOptions` **没有** `credentialRef` / `resolveCredential`
-    // / `refresh` 这三项（其余 12 家的适配器有）：Zen 的身份就是槽本身，
+    // / `refresh` 这三项（其余各家的适配器有）：Zen 的身份就是槽本身，
     // 适配器不做续期、也不按 ref 解析凭据。多传会被 tsc 直接点破。
     createProbeAdapter: (_ref, credential, entry) => {
       const credentialKey = (credential as OpencodeCredential | undefined)?.api_key
@@ -2677,7 +2691,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
           // `this` 丢失（各家方法内部用 `this.product` / `this.ctx`）。
           refreshAccount: (refName, pool, accountId) =>
             auth.refreshAccountCredential(refName, pool, accountId),
-          // ⚠️ **13 家都要挂**：漏一家 ⇒ 该家凭据**永不自动续期**，
+          // ⚠️ **每个会写限流标记的家都要挂**：漏一家 ⇒ 该家凭据**永不自动续期**，
           //    而症状是「每隔一段时间就要重新登录」，且日志里一个字都没有。
           // ⚠️ **真正锁住这件事的只有 `provider-runtime-wiring.spec.ts`**
           //    （它真跑 `apply()`，再逐个驱动 `auth.refreshAll` 并断言打到
@@ -2706,16 +2720,16 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         //    两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁死。
         expiry: expiryOf(expiryTable, id),
         // ⚠️ 与其余域同法：`probeById[id]` 用 `Object.hasOwn` 语义（下标会命中原型链）。
-        // ⚠️ **`probeById` 已登记全部会写限流标记的家**（buddy / workbuddy /
-        //    lobsterai / qoder / qodercn / cline / zcode / trae / gemini /
-        //    codearts / loomy / raccoon / opencode），
+        // ⚠️ **`probeById` 已登记全部会写限流标记的家**（判据 = `probeById` 头注释
+        //    里那两条 grep；权威清单 = `tests/helpers/provider-sets.ts` 的
+        //    `WRITES_RATE_LIMIT_PROVIDERS`），
         //    其余如实为 `undefined`（`adapterForProbe` 据此抛「不支持重测」，
         //    不落回 CodeArtsAdapter）。
-        //    ⚠️ **刻意不写「几家」**：本句原写「现登记 **12 家**」，实测顶层键是
-        //    **13** —— 漏了正下方那段注解里点名的 `opencode`（它的注册在同文件
-        //    另一处，数的时候极易漏掉）。名单本身也**不要在这里抄**：
-        //    它与 `probeById` 的头注释、`account-probe.ts` 的判据是同一条事实的
-        //    三份抄写，抄写必然漂移。权威名单见 `probeById`。
+        //    ⚠️ **刻意不写「几家」、也不抄名单**：本句曾写「现登记 **12 家**」，
+        //    实测顶层键是 13；2026-10-11 加入 `minimax`（issue IKJW32）后是 14 ——
+        //    同一事实的多份抄写必然漂移（`probeById` 头注释、本段、
+        //    `account-probe.ts` 的判据都各抄过一份）。数字与名单一律看
+        //    `probeById` 的键与 `WRITES_RATE_LIMIT_PROVIDERS`，两边由守卫双向比对。
         //    ⚠️ 原注释写「只有 zcode / gemini / trae 注册」，那是 Task 8 计划里的
         //    **样例**被留在了原地（2026-10-08 独立复审发现）；完整名单与缺项
         //    见 `probeById` 自己的头注释（别在这里再抄一份易腐的清单）。

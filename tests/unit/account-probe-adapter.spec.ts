@@ -208,6 +208,30 @@ vi.mock('../../src/raccoon-adapter.js', () => {
   return { RaccoonAdapter: MockRaccoonAdapter, registerRaccoonLlm: () => {} }
 })
 
+/**
+ * minimax 的桩（2026-10-11 补齐 —— 它此前**不在** `probeById` 里，
+ * 因为适配器零写点 ⇒ 没有可清的标记；issue IKJW32 接上请求级换号 + 冷却后
+ * 它会写 `modelRateLimits`，于是必须登记）。
+ *
+ * ⚠️ 与 loomy / raccoon 的桩同一条理由：**刚补的那一家最容易成为新的零覆盖**
+ *（「覆盖了当时**所有**登记的家、恰恰漏了出事的那 1 家」是 false coverage 的典型形状）。
+ * ⚠️ 桩的形状必须带 `credentialRef` / `product` —— 生产里 `createProbeAdapter`
+ * 就是传这几个字段（见 `index.ts` 的 `probeById`）。
+ */
+vi.mock('../../src/minimax-adapter.js', () => {
+  class MockMinimaxAdapter {
+    static readonly instances: Array<{ product?: { id: string }; credentialRef?: string }> = []
+    constructor(options: { product?: { id: string }; credentialRef?: string }) {
+      MockMinimaxAdapter.instances.push(options)
+    }
+    // eslint-disable-next-line require-yield
+    async *stream(): AsyncGenerator<never> {
+      throw new LlmError('频率限制', 'RATE_LIMIT')
+    }
+  }
+  return { MinimaxAdapter: MockMinimaxAdapter, registerMinimaxLlm: () => {} }
+})
+
 /** 取 mock 的构造记录。 */
 async function adapterInstances(): Promise<Array<{ product?: { id: string; productCode: string } }>> {
   const mod = await import('../../src/buddy-adapter.js') as unknown as {
@@ -286,6 +310,14 @@ async function raccoonInstances(): Promise<Array<{ product?: { id: string }; cre
     RaccoonAdapter: { instances: Array<{ product?: { id: string }; credentialRef?: string }> }
   }
   return mod.RaccoonAdapter.instances
+}
+
+/** 取 minimax 桩的构造记录。 */
+async function minimaxInstances(): Promise<Array<{ product?: { id: string }; credentialRef?: string }>> {
+  const mod = await import('../../src/minimax-adapter.js') as unknown as {
+    MinimaxAdapter: { instances: Array<{ product?: { id: string }; credentialRef?: string }> }
+  }
+  return mod.MinimaxAdapter.instances
 }
 
 /**
@@ -670,7 +702,7 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline / zcode 不�
    * 而这两家**都在** `probeById` 里注册了。旧 `else if` 链对它们**没有分支**，
    * 落入 `else` 后被交给华为云 HMAC 签名的 `CodeArtsAdapter`。
    * ⇒ 缺陷只在这两家上存在，而回归测试恰恰没有覆盖它们 ——
-   * 「测试覆盖了 9 家、漏了出事的那 2 家」是 false coverage 的典型形状。
+   * 「覆盖了当时**所有**有分支的家、却漏了出事的那两家」是 false coverage 的典型形状。
    *
    * ⚠️ 必须带 `modelRateLimits`：`retestAccount` 的探测目标是
    * `Object.keys(entry.modelRateLimits)`，没有标记时它**根本不构造适配器**
@@ -703,6 +735,49 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline / zcode 不�
     //    取错 ref 会让适配器去读别家凭据）。
     expect(instances[0]?.credentialRef).toBe(credentialRef)
     // 核心断言：**没有**构造 CodeArtsAdapter（否则就是用华为云签名发别家凭据）。
+    expect(await codeartsInstances()).toHaveLength(0)
+    // 桩适配器在构造后立刻抛错，故不该有任何真实请求发出。
+    expect(calls).toHaveLength(0)
+  })
+
+  /**
+   * ★★ **minimax：第 7 次同型缺陷的事主**（2026-10-11，issue IKJW32 补齐）。
+   *
+   * 它此前**不必**在这里（适配器零写点 ⇒ 没有可清的标记），而接上请求级换号 +
+   * 冷却后它会写 `modelRateLimits`（额度 24h / 限流 1h）⇒ 必须登记进
+   * `probeById`，否则标记写进去却**永远清不掉**（用户点「重测」会拿到
+   * 「没有探测适配器」）—— 与 `opencode` 那条完全同型。
+   *
+   * ⚠️ 这条用例的意义与 loomy / raccoon 那两条相同：**别让刚补的那一家变成
+   * 新的零覆盖**（「覆盖了当时所有登记的家、恰恰漏了出事的那 1 家」是 false coverage
+   * 的典型形状）。
+   *
+   * ⚠️ 必须带 `modelRateLimits`：`retestAccount` 的探测目标是
+   * `Object.keys(entry.modelRateLimits)`，没有标记时它**根本不构造适配器**
+   * ⇒ 用例会变成假绿。
+   */
+  it('minimax 账号走 MinimaxAdapter，而非 CodeArtsAdapter', async () => {
+    const calls = stubFetch()
+    const { retestAccount } = await import('../../src/account-probe.js')
+    const id = 'minimax-1'
+    const credentialRef = 'MINIMAX_ACCOUNT_TEST'
+    const result = await retestAccount(makePool([makeEntry({
+      id,
+      provider: 'minimax',
+      credentialRef,
+      // ⚠️ 没标记 ⇒ 不构造适配器 ⇒ 用例假绿。
+      modelRateLimits: { 'some-model': Date.now() + 3_600_000 },
+    })]), id)
+
+    expect(result.tested).toBe(1)
+    expect(result.stillLimited).toHaveLength(1)
+
+    const instances = await minimaxInstances()
+    expect(instances, 'minimax 没有构造自己的适配器').toHaveLength(1)
+    expect(instances[0]?.product?.id).toBe('minimax')
+    // ⚠️ 凭据 ref 必须被**原样透传**（取错 ref 会让适配器去读别家凭据）。
+    expect(instances[0]?.credentialRef).toBe(credentialRef)
+    // 核心断言：**没有**构造 CodeArtsAdapter（否则就是用华为云签名发 minimax 凭据）。
     expect(await codeartsInstances()).toHaveLength(0)
     // 桩适配器在构造后立刻抛错，故不该有任何真实请求发出。
     expect(calls).toHaveLength(0)

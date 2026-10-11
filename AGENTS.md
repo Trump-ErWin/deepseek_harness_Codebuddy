@@ -13,7 +13,7 @@
 - `docs/agent-notes/providers-buddy.md`（5 节）：模型计费倍率与同名模型（必须写进 `name`，不是 `descriptio；⚠️ CodeArts benefit（免费额度）模型：集合必须动态判定，不；⚠⚠️ 腾讯系内容级风控：system 里的客户端模板句会被**整轮拦死**
 - `docs/agent-notes/providers-cline.md`（3 节）：⚠️ Cline provider：`workos:` 前缀不可剥、免费集合；⚠️ Cline 限流：倒计时用**报文里的人类可读时长**，402 不许倒
 - `docs/agent-notes/providers-trae.md`（2 节）：TRAE（字节跳动）协议要点（五个易踩的坑）
-- `docs/agent-notes/providers-loomy-raccoon-minimax.md`（3 节）：⚠️ Loomy（讯飞）provider：五个不能凭直觉改的点；⚠️ Raccoon Work（商汤小浣熊）provider：不能凭直觉改的；⚠️ MiniMax Code（中国版）provider：不能凭直觉改的点
+- `docs/agent-notes/providers-loomy-raccoon-minimax.md`（3 节）：⚠️ Loomy（讯飞）provider：五个不能凭直觉改的点；⚠️ Raccoon Work（商汤小浣熊）provider：不能凭直觉改的；⚠️ MiniMax Code（中国版）provider：不能凭直觉改的点（§8.7 = **请求级换号 + 冷却**与真机实测的错误报文形状，Issue IKJW32；⚠️ 该家写标记后**必须**同时在 `probeById` 与 `WRITES_RATE_LIMIT_PROVIDERS` 里，否则标记清不掉）
 - `docs/agent-notes/backup.md`（7 节）：⚠️ **账号备份**：三种「只加不覆盖」的语义边界（选账号导出 / 合并导入 / 第三方转换）；裁剪必须在**发请求之前**且要裁三处；合并导入的判重是**三层**（第 2 层身份字段是关键，含 `IDENTITY_FIELDS` 候选表）；`AccountPool.mergeAccounts` 只调 `writeAccounts`；与「永久积分锁定表」的交叉点；与 `pruneAccountsWithForeignDomain` 的交叉点（残余风险）；测试与反向验证表
 - `docs/agent-notes/providers-opencode.md`（1 节）：⚠️⚠️ OpenCode 出口代理：dispatcher 与 fetch **必须同源**（Issue IKK4BY）—— 外部 undici 的 dispatcher 配全局 fetch 会在 Node 22/24 上恒抛 `UND_ERR_INVALID_ARG`（内置 6/7 与外部 8 的 handler 契约不同源），必须走 `proxyFetch`；`fetch failed` 的真因在 `cause` 里
 - `docs/agent-notes/providers-zcode.md`（4 节）：⚠️ ZCode（智谱）provider：「卡住 + 停止按钮无效」的两个根；⚠️ ZCode 上游节流三件套（吸收自 `dsh-free-glm`，20；⚠️⚠️ `3012` 的 HTTP 状态码是 **405**（不是 403；⚠️ ZCode captcha 的真实形状（2026-10-01，3.14

@@ -181,10 +181,13 @@ export function expectedProviderIdsInCreditsTable(): string[] {
  *     grep -n 'updateModelRateLimit(' src/*.ts    # 池侧写点
  *     grep -n 'markLimited' src/*.ts              # 适配器侧注入点
  *
- * 实测：**会写标记的共 13 家**（buddy / workbuddy / lobsterai / qoder /
- * qodercn / cline / zcode / trae / gemini / codearts / loomy / raccoon /
- * opencode）。`src/index.ts` 的 `probeById` 现已登记**全部 13 家** ⇒
- * **本表当前为空**（见 {@link PROBE_EXEMPT}）。
+ * ⚠️ **不要在这里抄名单或数字**：本段曾写「会写标记的共 **13 家**」并紧跟 13 个
+ * 名字，2026-10-11 加入 `minimax`（issue IKJW32：它接上了请求级换号 + 冷却，
+ * 于是**开始写** `modelRateLimits`）后当场过期 —— 而同一段文字里还写着
+ * 「名单**不要在这里抄**」，自相矛盾。权威清单是
+ * {@link WRITES_RATE_LIMIT_PROVIDERS}（守卫把它与源码写点**双向**比对，
+ * 漏一家 / 多一家都点名变红）；`src/index.ts` 的 `probeById` 必须**恰好**
+ * 登记同一批家 ⇒ **本表当前为空**（见 {@link PROBE_EXEMPT}）。
  *
  * ⚠️ **`opencode` 曾在这里，那条豁免理由是错的**（2026-10-08 第二轮实测证伪，
  * 逐条反驳写在该常量自己的文档里）。教训与本仓库其它几次同型缺陷一致：
@@ -212,7 +215,7 @@ export function expectedProviderIdsInCreditsTable(): string[] {
  *   没有任何「按 slotId 写回」的动作，两者根本不会相遇。
  *
  * ⇒ 真正缺的只有「把 `entry` 交给工厂」这一件事，已给
- * `probe.createProbeAdapter` 加了**可选**的第三参（纯放宽，其余 12 家不受影响），
+ * `probe.createProbeAdapter` 加了**可选**的第三参（纯放宽，其余各家的适配器不受影响），
  * 槽由 `poolEntrySnapshot` 造（与主接线块**同一实现**，不写第二份派生）。
  *
  * ## 为什么保留这张空表而不是删掉
@@ -233,9 +236,15 @@ export const PROBE_EXEMPT: ReadonlyMap<string, string> = new Map()
  *
  * ## ⚠️ 为什么不能直接写 `channel − PROBE_EXEMPT`
  *
- * 会写标记的家**不等于** `channel: true` 的家：`minimax` 有 `channel: true`
- * 但实测**不写**标记（两条 grep 均无命中）⇒ 它**本就不需要** probe，
- * 不是「漏挂」。若用 `channel` 当判据，会把 minimax 误报成漏挂。
+ * 会写标记的家**不等于** `channel: true` 的家（`aggregate` / `auto` 这类
+ * 没有自己账号的通道就不会写）⇒ 用 `channel` 当判据会误报。
+ *
+ * ⚠️ **`minimax` 从「不写」变成「会写」是 2026-10-11 的 issue IKJW32**：
+ * 它此前**全文件零命中** `updateModelRateLimit` / `getAvailableAccount`
+ * （14 家里唯一），故当时被排除在本清单之外；接上请求级换号 + 冷却后
+ * 额度 24h / 限流 1h 的标记会真的写进池 ⇒ 必须同时进
+ * {@link WRITES_RATE_LIMIT_PROVIDERS} 与 `probeById`（否则标记写进去却
+ * 永远清不掉）。判据是「**现在**写不写」，不是「曾经写不写」。
  *
  * ## ⚠️ 为什么这张清单硬编码在这里（而不是从 registry 派生）
  *
@@ -248,6 +257,7 @@ export const PROBE_EXEMPT: ReadonlyMap<string, string> = new Map()
 export const WRITES_RATE_LIMIT_PROVIDERS: readonly string[] = Object.freeze([
   'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'cline',
   'zcode', 'trae', 'gemini', 'codearts', 'loomy', 'raccoon', 'opencode',
+  'minimax',
 ])
 
 /** **期望**注册进 `probeById` 的 provider id（会写标记 − {@link PROBE_EXEMPT}）。 */

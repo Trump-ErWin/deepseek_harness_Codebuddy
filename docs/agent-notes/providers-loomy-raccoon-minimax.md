@@ -933,6 +933,141 @@ M3 答过「绿色」/「红色」—— 那是**模型自身识图质量**，�
 不重置会让上一条事件的 `event:` 名残留到下一条 `data:` 上）。
 回归用例 4 条，反向验证过（去掉收尾冲刷 ⇒ 4 条变红）。
 
+#### 8.7 ⚠️ 请求级账号轮换 + 冷却（issue IKJW32，2026-10-11 接上）
+
+修复前：本适配器**全文件零命中** `updateModelRateLimit` / `getAvailableAccount`
+—— 14 家里**唯一**没有换号 / 冷却的一家；首号额度耗尽就把硬失败抛给用户，
+而池的取值顺序不因失败而变 ⇒ 下次请求仍是同一个号（「卡死在一个号上」）。
+
+⚠️ 取证口径（**别把它说成「本机复现」**）：issue 报障环境是「池里 **4 个账号
+3 个余额为 0**」；本次复核的那台机器只有 **1 个 minimax 账号且余额充足**
+（`credit/details` 13 条记录），故本条是靠**代码取证 + 单测**成立的，
+不是靠本机复现的。
+
+**类别→动作表**（照 `loomy-adapter.ts` / `raccoon-adapter.ts` 逐格搬）：
+
+| 类别 | 判据 | 换号 | 写冷却 |
+|---|---|---|---|
+| `quota` | 402 / `insufficient_balance_error` / 额度文案 | ✅ | ✅ 24h |
+| `rate` | 429 / `rate_limit_error` / `overloaded_error` | ✅ | ✅ 1h |
+| `auth` | 401 / 403 / `authentication_error` | ✅ | ❌ **绝不写** |
+| `other` | 其余 4xx（400 参数错） | ❌ | ❌ |
+
+⚠️ `auth` 只换号、绝不写标记，是 2026-10-06「全池被封 24h」事故换来的不变式
+（见 `loomy-adapter.ts` 的 `LoomyFailureClass` 记录），本家照搬。
+⚠️ `quota` 的 24h 是**保守兜底**（本家没有可靠的额度重置字段）：用户真去充值后
+不必等满 24h —— 账号卡片上的「重置」按钮会清掉该标记（这也是它**必须**进
+`probeById` 的另一个理由，见本节末尾）。
+
+**真机实测的错误报文形状**（2026-10-11，`POST /mavis/api/v1/llm/v1/messages`
+＋本机凭据；三发都不产生推理、不消耗额度）：
+
+| 构造 | HTTP | 体 |
+|---|---|---|
+| 坏 token | 401 | `{"code":401,"message":"auth failed"}` —— **自家信封，不是 Anthropic 形状** |
+| `MiniMax-M3.1-Flash-Preview` + `thinking:{type:'disabled'}` | 400 | `{"type":"error","error":{"type":"invalid_request_error","message":"… (2013)"},"request_id":…}` |
+| 不存在的模型名 | **200** | `message_start` 里 model **静默回退**成 `MiniMax-M3`（既有事实，别当错误） |
+
+⚠️ **402 + `insufficient_balance_error` 是额度形态，但本次没有真机复现**
+（本机那个账号余额充足：`credit/details` 有 13 条记录）。该形状来自既有单测与
+§8.4 的记录，实现按它判 ⇒ **别把「判据有测试」误读成「真机见过」**。
+
+⚠️⚠️ **`consumeMinimaxSse` 的错误帧必须带 `error.type`**（本次一并加）：
+MiniMax 系有「HTTP 200 + 业务码」的既有习惯（签到、`timezone_id` 放错位置都是
+200），故流内 `event: error` 帧也要能换号；而服务端的 `message` 完全可能是
+`balance not enough` 这类**不含任何钱义词**的句子 —— 那时只有 `error.type`
+能把它判成 `quota`，只带 message 会让轮换静默失效。回归用例刻意让 message
+不含 `insufficient`（去掉 type 拼接即变红）。
+
+**三处共享语义（缺一会复发）**：
+
+1. `tried` 必须透传给 `getAvailableAccount`（不排除会拿回同一个号，换号形同虚设）；
+2. **每次**失败后**立刻**记账（挪到循环开头会让末号漏记 —— loomy 实测 8 号只记 7 个）；
+3. 401 续期后**必须重新反查账号 id**：本家的 `refresh`（`src/index.ts`）续的是
+   **池内第一个可用账号**，续期后取回的凭据可能属于**另一个号**（同 loomy / raccoon
+   的 `51ded6a` 缺陷）⇒ 不反查就把 24h 冷却记在「只是 401」的无辜账号上。
+
+⚠️ **换号只发生在「尚未产出任何 chunk」时**：流内错误若已 yield 过内容，一律
+原样抛出（重发会让用户看到重复内容）。`drain()` 的 `yieldedAny` 守卫锁这一条。
+
+**⚠️ 连锁（第 7 次同型）：写标记 ⇒ 必须进 `probeById`**
+
+minimax 此前**不必**登记在 `src/index.ts` 的 `probeById`（不写标记 ⇒ 没有可清的
+标记）；接上换号后它会写标记 ⇒ 不登记就「标记写进去却永远清不掉」（用户点「重测」
+报「没有探测适配器」）。`tests/unit/provider-runtime-wiring.spec.ts` 的
+「登记为『不写标记』的 adapter 确实没有写点」**当场点名变红**，本次正是靠它发现的。
+⇒ 判据是「**现在**写不写标记」，别照抄「minimax 不写标记」这条旧结论
+（它已随本 issue 失效，同 `opencode` 的第 6 次形态）。
+
+**反向验证**（9 条独立变异，各自锁死一处，逐条实测）：
+`recordsMinimaxRateLimit` 恒 true ⇒ 3 红；删轮换内的记账 ⇒ 2 红；
+删 401 后的账号反查 ⇒ 1 红；删 401/403 判据 ⇒ 4 红；删 `yieldedAny` 守卫 ⇒ 1 红；
+删 `error.type` 拼接 ⇒ 1 红；quota/rate 冷却时长对调 ⇒ 1 红；不传 `tried` ⇒ 6 红；
+`probeById.minimax` 的 `product` 接错（`MINIMAX` → `RACCOON`）⇒
+`account-probe-adapter.spec.ts` 的 minimax 用例 1 红。
+
+⚠️ **订正上一条里的第 4 项**：那次「4 红」是**同时删掉状态码腿与 `auth failed`
+文案腿**的结果；只删状态码腿时，adapter 级的 401 用例仍由文案腿判 `auth`
+⇒ 按 it 粒度只有分类器那条变红。该判据现在是**两条腿**，别把哪一条当成冗余删掉。
+
+#### 8.7.1 同日三路审计（语义一致性 / 对抗性红队 / 接线连锁）后的修订
+
+三个只读 subagent 的结论合并后有 **3 个真实代码缺陷 + 1 个掩盖型覆盖缺口**，
+逐条修完并补了守卫（全部只读审计，未注入变异）：
+
+| 缺陷 | 形态 | 修法 |
+|---|---|---|
+| **200 + 流内错误的分类保真度不足** | 本家**混用两种信封**：Anthropic 形状 `{"type":"error","error":{…}}` 与**自家信封** `{"code":401,"message":"auth failed"}`（401 实测就是这个）。只认 `frame.error.message` 时自家信封退化成「未知错误」⇒ 额度信息整段丢失 ⇒ 判 `other` ⇒ **不换号**（issue 在 200 路径上原样残留） | `consumeMinimaxSse` 的 error 分支回退读顶层 `message` / `code`；`!sawAnyChunk` 时带**响应原文样本**；适配器加**自家信封码通道**（`code=401/402/403/429`） |
+| **200 + 非 SSE 体** | 网关 HTML / 裸 JSON 信封（`application/json`）一个 SSE 帧都没有 ⇒ 只得到「模型未返回任何内容块」 | 适配器加 `isDefinitelyNotSse`（**只认** `application/json` / `text/html`，其余仍按 SSE —— `new Response(string)` 的默认类型是 `text/plain`，当错误体会让**正常回答整轮失败**） |
+| **坏凭据掐断整池** | 池凭据是裸 `JSON.parse`（不校验形状），`{}` 这类损坏条目会撞 `nextCredential.access_token.length` ⇒ `TypeError`（非 `LlmError`）+ `break` ⇒ **一个坏号废掉整轮**（loomy/raccoon 无此断点，是本家新引入的） | 判空后 `continue` |
+| **`insufficient` × `token` 误封** | `max_tokens` / `input_tokens` / `budget_tokens` 是 Anthropic 的**一等字段名** ⇒ `insufficient max_tokens for the requested thinking budget`（400 参数错）被判 `quota` ⇒ 每个轮换到的号各写 **24h** | 钱义词 `token` 改**词边界**匹配；另：裸 `rate limit` 不再判 rate；**5xx 只信确定性通道**（自报类别 / 自家信封码） |
+
+同时补齐的守卫（都是「此前零覆盖」的格）：`rate` 档 **429 → 1h** 的行为用例
+（此前只跑过 402，把 rate 常量换成 quota 的不会有任何用例变红）、
+`probeById.minimax` 的**真实工厂**用例（凭据接通 + 不持有 `accountPool`，
+`vi.mock` 的桩适配器读不出这两样 ⇒ 原来删掉 `resolveCredential` 也全绿）、
+「已产出内容后失败**仍要记账**」（否则该号永不被冷却）、
+「401 报文不含 auth 文案仍判 auth」（锁状态码腿）、
+「仅 `content_block_start` 后报错不重发」（锁 `yieldedAny` 的宽度）。
+
+⚠️ **三处行为变更登记**（供后续对照，都是审计发现的「非轮换路径也变了」）：
+
+1. **401/403 先续期一次再重发**（新增，对齐 loomy/raccoon）⇒ 探测路径同样会
+   多打一发请求（`refresh` 在 `probeById` 里是 no-op，第二次仍是 401 后走原路径）；
+   若续期后取不到凭据，错误文案变成 `credential expired and refresh failed`。
+2. **生产里 `accountPool` 恒传** ⇒ 单凭据 / 单号池的 402 / 429 / 401 文案从
+   `HTTP <code> — …` 变成「所有账号均不可用（…）」（错误码不变）；
+   单号池余额耗尽会**写 24h 冷却** ⇒ 充值后要点「重置 / 重测」才立刻恢复
+   （这正是必须进 `probeById` 的另一个理由）。
+3. **`error.type` 进入错误文案** ⇒ `account-probe.ts` 的 `isRateLimited` 会命中
+   `rate_limit_error`，探测文案从「无法确认」变「仍受限」（**标记保留行为不变**）。
+
+**同一日第二轮的对抗性发现（机制层面，未真机复现，如实标注）**：
+`MINIMAX_QUOTA_ERROR_TYPES` 等三张 type 表里，除 `insufficient_balance_error` /
+`rate_limit_error` / `invalid_request_error` 之外**没有真机取证**；
+402 的形态仍来自既有单测（本次未复现，本机账号余额充足）。
+
+**变异验证（第二轮，26 + 7 条注入实测）**：26 条里 **19 条与期望一致**
+（`#11` 不传 `tried` 实测 10 红，比预期更多）；**7 条暴露守卫缺失**，已逐条补齐并复验：
+
+| 缺口（改坏了也没人红） | 补的守卫 | 复验：变异 ⇒ 实测红 |
+|---|---|---|
+| `consumeMinimaxSse` 的 `kind`（`error.type`）生产端无人管（消费端那些断言喂的是**测试自己拼的字符串**） | messages 断言文案含 `insufficient_balance_error`；适配器的 200 流内帧用例改用**不含任何额度措辞**的 message | `kind` 置空 ⇒ **2 红** |
+| 同上 `code`（自家信封码） | messages 断言文案含 `code=402`；新增「SSE 自家信封**只有码**也换号」 | `code` 置空 ⇒ **2 红** |
+| `auth failed` 是**纯文案腿**、此前零覆盖 | 判据用例补 `{"error":{"message":"auth failed"}}`（status 0：无码、无 type） | 只删该腿 ⇒ **1 红** |
+| 用例「401 不含 auth 文案仍判 auth」**名不副实**（fixture 是 `{"code":401}`，被**码腿**兜住） | fixture 改成 `{}`（无文案、无码） | 删状态码腿 ⇒ **2 红** |
+| `isDefinitelyNotSse` 的**正腿**没锁（换号结果碰巧相同，但错误形状/错误码变了） | 新增「200 + json 且不可换号 ⇒ 错误含『非 SSE 响应』」 | 该函数恒 `false` ⇒ **1 红** |
+| `reader.cancel()` 零守卫 | messages 用 stub reader 断言 `cancel` 被调用 | 删该行 ⇒ **1 红** |
+| `rawSample`（响应原文）零守卫 | messages 断言「未返回任何内容块」带响应原文 | 置空 ⇒ **1 红** |
+
+⚠️ 两条普遍教训（写下来比记住强）：
+1. **「注释里写了理由」≠「有守卫」** —— `cancel()` 与响应原文样本两条都写了详尽的
+   理由与后果，实测都是**零覆盖**；`{"code":401}` 那条用例甚至**自称**锁住状态码腿，
+   实际被码腿兜住（`{}` 才是真正的判据）。
+2. **加一条「并联通道」会让既有用例失去判别力** —— 补上英文短语通道后，
+   原来靠 `error.type` 判额度的用例不再红（message 里的 `balance not enough`
+   自己就能判）；⇒ 用例的 message 必须**只留一条通道**才锁得住该通道。
+
 ### 9. 能力矩阵与 e2e
 
 ```js

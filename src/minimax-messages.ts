@@ -474,6 +474,17 @@ export async function* consumeMinimaxSse(
   let stopReason: unknown
   let usage: TokenUsage = { inputTokens: 0, outputTokens: 0 }
   let sawAnyChunk = false
+  /**
+   * 响应原文样本（前 500 字符）。
+   *
+   * ⚠️ **只为错误文案服务**：`data:` 行解析失败（网关 HTML / 非标准信封）时，
+   * 整个响应在错误里毫无痕迹 ⇒ 适配器的轮换判据只能得到 `other` ⇒ 换号静默失效。
+   */
+  let rawSample = ''
+  const sampleRaw = (text: string): void => {
+    if (text === '' || rawSample.length >= 500) return
+    rawSample += text.slice(0, 500 - rawSample.length)
+  }
 
   /**
    * 处理一行 SSE。
@@ -514,11 +525,34 @@ export async function* consumeMinimaxSse(
     const type = typeof frame.type === 'string' ? frame.type : eventName
 
     if (type === 'error') {
-      const error = frame.error
-      const message = typeof error === 'object' && error !== null
-        ? String((error as Record<string, unknown>).message ?? '未知错误')
-        : '未知错误'
-      throw new Error(`minimax: 流内错误：${message}`)
+      const nested = frame.error
+      const record = typeof nested === 'object' && nested !== null
+        ? nested as Record<string, unknown>
+        : undefined
+      /**
+       * ⚠️ 服务端在本家**混用两种信封**（2026-10-11 真机实测）：
+       *
+       * - Anthropic 形状：`{"type":"error","error":{"type":…,"message":…}}`
+       * - **自家信封**：`{"code":401,"message":"auth failed"}` —— 401 实测就是这个，
+       *   它**根本没有 `error` 对象**。
+       *
+       * 只认 `frame.error.message` 时自家信封退化成「未知错误」⇒ 额度信息整段丢失
+       * ⇒ 适配器判 `other` ⇒ **换号静默失效**（issue 要修的事在 200 路径上原样残留）。
+       * ⇒ message 回退读顶层；`type` 与 `code` 一并带进文案，后者是适配器的
+       *   确定性通道（实测自家信封的 `code` 与 HTTP 语义同值）。
+       */
+      const messageRaw = record?.message ?? frame.message
+      const message = typeof messageRaw === 'string' && messageRaw !== '' ? messageRaw : '未知错误'
+      const kindRaw = record?.type ?? frame.type
+      // ⚠️ `frame.type` 在本分支恒为 `'error'`（那是分支判据本身），别再重复播报。
+      const kind = typeof kindRaw === 'string' && kindRaw !== '' && kindRaw !== 'error'
+        ? `（${kindRaw}）`
+        : ''
+      const codeRaw = record?.code ?? frame.code
+      const code = typeof codeRaw === 'number' || (typeof codeRaw === 'string' && codeRaw !== '')
+        ? `（code=${String(codeRaw)}）`
+        : ''
+      throw new Error(`minimax: 流内错误${kind}：${message}${code}`)
     }
     if (type === 'message_start') {
       const message = frame.message
@@ -622,20 +656,37 @@ export async function* consumeMinimaxSse(
         }
         break
       }
-      buffer += decoder.decode(value, { stream: true })
+      const piece = decoder.decode(value, { stream: true })
+      sampleRaw(piece)
+      buffer += piece
       // SSE 以空行分隔事件；按行处理，末尾不成行的部分留在 buffer 里。
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
       for (const rawLine of lines) yield* processLine(rawLine)
     }
   } finally {
+    /**
+     * ⚠️ **必须 cancel，不能只 releaseLock**（本仓既有约定，见 `sse.ts` 的
+     * `readWithIdleTimeout`）：请求级轮换会在「流内错误」时**提前离开**这条流，
+     * 只释放锁会把未读完的响应体留在连接上（一次请求最多 7 条）。
+     * 这是本家接上轮换后才出现的新累积（改动前 200 只被消费一次）。
+     */
+    await reader.cancel?.().catch(() => {})
     reader.releaseLock?.()
   }
 
   // ⚠️ 空响应必须报错：静默结束会让 harness 认为「模型正常回答但没内容」，
   // **不会重试**（与 Qoder/CodeArts 的既有约定一致）。
   if (!sawAnyChunk) {
-    throw new Error('minimax: 模型未返回任何内容块')
+    /**
+     * ⚠️ 把**响应原文样本**带上：网关 HTML / 非标准信封在这里只表现为「没有内容块」，
+     * 不带原文时适配器只能判 `other` ⇒ 换号静默失效，用户也看不到服务端说了什么。
+     * （`data:` 行解析失败时同样只有原文能提供线索。）
+     */
+    const sample = rawSample.trim()
+    throw new Error(
+      `minimax: 模型未返回任何内容块${sample === '' ? '' : `（响应原文：${sample.slice(0, 500)}）`}`,
+    )
   }
   yield { type: 'usage', usage }
   yield { type: 'finish', reason: mapMinimaxStopReason(stopReason) }
