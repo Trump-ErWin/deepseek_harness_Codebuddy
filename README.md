@@ -258,6 +258,16 @@ POST http://127.0.0.1:8326/v1/responses           ← OpenAI Responses API
 | 设置页开关 | 关掉后不再监听 |
 | 改端口 | `DSH_OPENAI_GATEWAY_PORT` 填非法值会记录错误并跳过启动，**不会**静默改用其它端口 |
 
+### 请求体上限与 keep-alive
+
+| 项 | 值 | 超限时的行为 |
+|---|---|---|
+| 请求体 | **300 MiB** | `HTTP 413` + `invalid_request_error` / `request_too_large`，响应体里带上限值 |
+| 空闲连接（keep-alive） | **120 秒** | 服务端发 FIN；此后复用该连接会得到 `Connection reset` |
+
+⚠️ 每轮把全量历史重新回传的客户端（Codex 等），历史里并入大截图后可能撞上 413：
+新建会话、或删掉那条带大图的回合即可恢复。
+
 ### 安全边界
 
 - 只绑定 `127.0.0.1`，**不可**改成对外地址 —— 注意这只挡得住远程访问，
