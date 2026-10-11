@@ -812,7 +812,28 @@ export class QoderAdapter extends LlmAdapter {
         // 非 trap 错误原样返回，行为逐字节不变。
         throw describeWasmFailure(error)
       } finally {
-        client?.dispose()
+        // ⚠️⚠️ **释放失败绝不能顶替 `try` 块里的原始错误**（真实缺陷，2026-10-12 审计实测）。
+        //
+        // JS 语义：`finally` 里的 `throw` **无条件覆盖** `try` 里的 `throw`。
+        // 而 `dispose()` → `freePointer()` 的 catch 里**确实会 rethrow**
+        //（见 `qoder-wasm.ts` 的 `freePointer`）—— 它自己的注释就写了
+        //「堆耗尽时它同样会 trap」，即**恰在本修复要治理的那个场景下**会抛。
+        //
+        // 后果（实测）：上游的 401 / AUTH 等错误被改写成「WASM 堆耗尽」，
+        // 而且 `describeWasmFailure` 返回的是**裸 `Error`**（非 `HarnessError`）
+        // ⇒ 外层 `normalizeLlmFailure` 把它归成 `UNKNOWN` ⇒ **同时丢掉
+        // `SERVER` / `AUTH` 这些可重试性判据**（本仓「错误保真」红线的形态）。
+        //
+        // ⇒ 取舍与 `expiry-sync.ts` 的「回写失败只记日志、不上抛」同款：
+        //   释放是**清理动作**，它失败不该改变本次请求的结论。
+        //
+        // ⚠️ 本类**没有 logger 通道**（`QoderAdapterOptions` 里没有 `ctx`），
+        //    故此处**刻意静默**吞掉 —— 不为一条清理失败的日志去新开一条通道。
+        try {
+          client?.dispose()
+        } catch {
+          // 见上：清理失败不上抛、不改写本次请求的结论。
+        }
       }
     }
 

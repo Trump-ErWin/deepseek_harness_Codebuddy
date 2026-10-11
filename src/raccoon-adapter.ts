@@ -315,6 +315,28 @@ export function shouldRotateRaccoonAccount(errorText: string, status: number): b
  * ⚠️ 与 `aggregate-adapter.ts` 的 `isAbortLike` 第四条判据同口径（aborted
  * request|HTTP_?499）—— aggregate 侧判「要不要原样重抛」，本侧判「直接抛
  * 什么形态」，两处覆盖不同的到达路径（raccoon 是直接 provider，不经 aggregate）。
+ *
+ * ## ⚠️⚠️ 已知缺口：**只覆盖 HTTP 状态码路径，不覆盖 SSE 内嵌错误帧**
+ *（2026-10-12 审计实测登记）
+ *
+ * 本函数只在**两个 HTTP 非 ok 的抛出点**被调用。而本文件末尾自己写着
+ * 「业务失败也可能以 **HTTP 200 + SSE 内嵌错误帧**返回，由 `consumeOpenAiSse`
+ * 处理」—— 那条路径**不经过这里**：
+ *
+ * ```
+ * SSE 帧 {statusCodeValue:499, message:'client has aborted request'}（HTTP 200）
+ *   → consumeOpenAiSse 抛 LlmError(code='SERVER')，name ≠ 'AbortError'
+ *   → 外层判据 (signal.aborted || code==='ABORTED') === false
+ *   → kind:'error' ⇒ 终端仍显示「本轮运行失败」
+ * ```
+ *
+ * ⇒ 即**本修复的语义收益在 SSE 路径上没拿到**，两条路径口径不一致。
+ *
+ * ⚠️ **本分支不擅自扩大改动面**：修它要动 `src/openai-compat.ts` 的
+ * `consumeOpenAiSse`（**所有 provider 共享**的错误归类层），影响面远超本次
+ * 范围。故此处**如实登记**，留给维护者决定是否统一。
+ * 若要修，正确的做法是在那一层也识别 499/`aborted request` 并抛 `ABORTED`
+ *（而不是在 adapter 里再兜一层）。
  */
 function abortLikeOrNormal(errorText: string, status: number): LlmError {
   const message = `raccoon: ${errorDetail(errorText)}`

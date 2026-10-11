@@ -99,14 +99,25 @@ const HOST = 'api2.qoder.sh'
 const CALLS = 50
 
 /**
- * 阈值：**页**。
+ * 生产路径的页数上限：**必须接近零**。
  *
- * 实测 A（有 free）= 230 页、B（无 free）= 450 页 ⇒ 取 300 页：
- * A 有 70 页余量、B 超阈 150 页。判据写成「A 通过且 B 不通过」的双断言
- * （见 `it`），因此阈值本身还额外受 B 组保护 —— 若哪天残余来源被根治、
- * A 掉到 0 页，阈值也不会把 B 误放行。
+ * 实测（DSH-like 载荷 / N=50 / 冷堆）= **0 页**。给 10 页余量容抖动。
+ *
+ * ⚠️ 这里**曾经**是 300（与 `MIN_PAGES_FREES_OFF` 共用一个常量），那是按
+ * 「尚有未定位残余、生产路径 230 页」标定的。残余后来被根治（就是漏掉的
+ * 第三处 free，见 `src/qoder-wasm.ts` 的 `Glue.freeString`），生产路径掉到
+ * 0 页 ⇒ 300 就**太松**了。实测：注掉第三处 free 后生产路径涨回约 230 页，
+ * **仍然通过** —— 闸抓不住这条回归。故必须与下面那个常量分开标定。
  */
-const MAX_PAGES = 300
+const MAX_PAGES_PRODUCTION = 10
+
+/**
+ * 关掉全部 free 后的页数下限：**必须显著超阈**。
+ *
+ * 实测（同上口径，`setFreesEnabled(false)`）= **455 页**。取 300 作下限，
+ * 留 155 页余量。
+ */
+const MIN_PAGES_FREES_OFF = 300
 
 /** 跑一批 `create → prepareInfer → dispose`，返回消耗的页数。 */
 async function measurePages(ask: QoderInferAsk): Promise<number> {
@@ -130,6 +141,9 @@ async function measurePages(ask: QoderInferAsk): Promise<number> {
 
 describe('Qoder WASM 堆泄漏闸', () => {
   it('N 次 prepareInfer 的 wasm 堆增长 < 阈值（生产路径带 free）', async () => {
+    // ⚠️ **冷堆起测**：`memory.grow` 是**单调**的，前序用例的高水位会让差值失真
+    //（详见 case ③ 的长注释 —— 那里实测过「热堆下恒真」的假绿形态）。
+    __testing.resetGlue()
     // 预热：排除 compile / instantiate / 首次分配这些**一次性**开销
     // （它们与「每次请求泄漏多少」无关，计入会污染斜率）。
     const warmup = await QoderEncryptedInfer.create({
@@ -141,12 +155,13 @@ describe('Qoder WASM 堆泄漏闸', () => {
     const pages = await measurePages(dshLikeAsk())
     expect(
       pages,
-      `wasm 堆增长 ${pages} 页（阈值 ${MAX_PAGES}）—— free 调用被删了？`
-      + '判据与实测见文件头。',
-    ).toBeLessThan(MAX_PAGES)
+      `wasm 堆增长 ${pages} 页（上限 ${MAX_PAGES_PRODUCTION}）—— 有 free 被删了？`
+      + '判据与标定见文件头。',
+    ).toBeLessThan(MAX_PAGES_PRODUCTION)
   })
 
   it('反向控制：注掉 free 后同一载荷必须超阈（否则本闸是同义反复）', async () => {
+    __testing.resetGlue()
     const warmup = await QoderEncryptedInfer.create({
       user: USER, machineId: MACHINE_ID, metadata: METADATA, host: HOST,
     })
@@ -165,12 +180,22 @@ describe('Qoder WASM 堆泄漏闸', () => {
 
     expect(
       pages,
-      `注掉 free 后只涨了 ${pages} 页（阈值 ${MAX_PAGES}）—— 说明这条闸量不出泄漏，`
-      + '需要重做判据（实测应为 ~450 页）。',
-    ).toBeGreaterThanOrEqual(MAX_PAGES)
+      `注掉 free 后只涨了 ${pages} 页（下限 ${MIN_PAGES_FREES_OFF}）—— 说明这条闸量不出泄漏，`
+      + '需要重做判据（实测应为 ~455 页）。',
+    ).toBeGreaterThanOrEqual(MIN_PAGES_FREES_OFF)
   })
 
   it('dispose 释放 context：连续 create + dispose 不增长', async () => {
+    // ⚠️⚠️ **必须先把 glue 复位到冷堆**（真实缺陷，2026-10-12 审计实测）。
+    //
+    // `memory.grow` 是**单调**的：本文件前面的用例已用 DSH-like 大载荷把线性
+    // 内存推到高水位，此时这 200 次 `create`（不释放 `context`）所需的几页
+    // **已被预留** ⇒ 差值恒 ≈ 0 ⇒ 断言恒真，**量不出「dispose 有没有生效」**。
+    // 实测证据：注掉 `dispose()` 里的 `freePointer('__wbg_qodercontext_free', …)`，
+    //   ① 只跑本用例（冷堆）⇒ **变红**（涨 6 页）；
+    //   ② 跑整个文件（热堆）⇒ **8/8 全绿**（连跑 3 次稳定）。
+    // ⇒ 复位到冷堆后，本用例才真的在守 `dispose()` 这条交付。
+    __testing.resetGlue()
     const REPEAT = 200
     const before = await __testing.wasmHeapBytes()
     for (let i = 0; i < REPEAT; i += 1) {
@@ -180,7 +205,7 @@ describe('Qoder WASM 堆泄漏闸', () => {
       client.dispose()
     }
     const pages = (await __testing.wasmHeapBytes() - before) / PAGE_BYTES
-    // 实测：**不** dispose 时 200 次 = 4 页（1.28 KB/次）；dispose 时 = 0 页。
+    // 实测（冷堆）：**不** dispose 时 200 次 = 4~6 页；dispose 时 = 0~1 页。
     // 阈值给 2 页，既容得下 1 页的测量抖动，又抓得住「dispose 被删掉」。
     expect(pages, `create + dispose 涨了 ${pages} 页（实测应为 0）`).toBeLessThan(2)
   })

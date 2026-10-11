@@ -550,11 +550,15 @@ export class AutoAdapter extends LlmAdapter {
     try {
       expiryAt = await this.expiryOf(choice.provider, signal)
     } catch (error) {
-      // ⚠️ 先让中止原样逃逸（三条判据与 `hasUsableAccountFor` 同构）。
+      // ⚠️ 先让中止原样逃逸（四条判据与 `hasUsableAccountFor` 逐格同构 ——
+      //    含第四条「上游网关 499 口径」，2026-10-12 审计实测补全：
+      //    本处原先只有 name/code 两条，同一份 499 报文会被吞成「倒计时缺席」）。
       signal?.throwIfAborted()
       if (error !== null && typeof error === 'object') {
-        const candidate = error as { name?: unknown; code?: unknown }
+        const candidate = error as { name?: unknown; code?: unknown; message?: unknown }
         if (candidate.name === 'AbortError' || candidate.code === 'ABORTED') throw error
+        const message = typeof candidate.message === 'string' ? candidate.message : ''
+        if (/aborted request|HTTP_?499/i.test(message)) throw error
       }
       // 其余（余额接口抖动等）只让倒计时缺席，不阻断请求。
       expiryAt = undefined

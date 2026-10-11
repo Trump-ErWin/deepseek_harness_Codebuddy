@@ -932,6 +932,81 @@ describe('★ 探针抛 AbortError 时不得被吞成「没有可用候选」（
     await expect(adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash'))
       .rejects.toMatchObject({ name: 'AbortError' })
   })
+
+  it('★ 同族同构：探针抛 **499 报文**（signal 未标记）也必须逃逸，不得折算成 UNUSABLE', async () => {
+    // ⚠️⚠️ 真实缺陷（2026-10-12 审计实测）：本处原先**只认** `name === 'AbortError'`，
+    //    是「同族判据分叉」的实例 —— 同一份 499 报文在 `dispatch` 里归中止、
+    //    在这里却被折算成 `UNUSABLE` ⇒ 整池候选被剔除 ⇒ 用户看到
+    //    「当前没有任何可用候选」而不是中止（M4 那个形态的新实例）。
+    //    修法：本处改为复用共享判据 `isAbortLike`。
+    // ⚠️ 关键约束：错误**不带** `name: 'AbortError'` / `code: 'ABORTED'`，
+    //    否则命中的是旧判据，第四条的覆盖是**假的**（假覆盖教训）。
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => (async function* () { /* 不应走到这里 */ })(),
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+      } as never,
+      expiryProbe: async () => {
+        throw new Error('provider: client has aborted request HTTP_499')
+      },
+    })
+
+    const error = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      .then(() => undefined, (caught: { message?: string }) => caught)
+    expect(
+      error?.message,
+      '499 必须原样逃逸（不得折算成 UNUSABLE 后报「没有可用候选」）',
+    ).toContain('aborted request')
+  })
+})
+
+describe('★ 能力解析（capabilityOf）里的中止判据也必须与 isAbortLike 同构', () => {
+  /**
+   * ⚠️⚠️ 真实缺陷（2026-10-12 审计实测）：这是同族分叉的**第三处** ——
+   * 本处原先只认 `name === 'AbortError'`，499 报文会被折算成
+   * `{ efforts: [], imageCapable: false }` ⇒ 用户看到「候选渠道都不支持
+   * 图片输入」这类**与中止无关**的误导性报错，且整轮不会中止。
+   *
+   * ⚠️ 触发路径：`resolveModelInfo` **接收 signal**，中止时它会抛 —— 而它
+   *    的 throw 落在本方法的 `try` 内。故用 `resolveModelInfo` 抛 499 来打。
+   */
+  it('★ resolveModelInfo 抛 499 报文 ⇒ 必须逃逸，不得折算成「不支持图片」', async () => {
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async () => {
+          // ⚠️ 不带 name / code，只带 499 报文 —— 专门验第四条。
+          throw new Error('provider: client has aborted request HTTP_499')
+        },
+        stream: () => (async function* () { /* 不应走到这里 */ })(),
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+      } as never,
+      expiryProbe: async () => 100,
+    })
+
+    const error = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      .then(() => undefined, (caught: { message?: string }) => caught)
+    expect(
+      error?.message,
+      '499 必须原样逃逸（不得折算成「不支持图片」）',
+    ).toContain('aborted request')
+  })
 })
 
 describe('★ 终审修正：错误码保真 / 渠道白名单 / 第三处 abort（C1 + I1 + I3）', () => {
