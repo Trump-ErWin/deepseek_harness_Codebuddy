@@ -84,6 +84,22 @@ export const RACCOON_REQUEST_IMAGE_MAX_BYTES = 512 * 1024
  *
  * ⚠️ 与 raccoon 的 512 KB **不同值是有意的**：那家硬限 10 MB，
  * 1 MiB 目标下 10 张就到 13 MB 会照样 413。别合并成一个常量。
+ *
+ * ## ⚠️⚠️ 这个常量**必须被显式赋值到每个按体积设限的家**（2026-10-12 修）
+ *
+ * 它**不是** `requestImageTargetFor` 的默认参数 —— 那里的默认是
+ * {@link REQUEST_IMAGE_MAX_BYTES}（**2 MiB**），因为默认值服务的是**腾讯系**
+ * 那道「图片 token 预算」（字节不是它的约束）。
+ *
+ * **真实缺陷**：`qoder` / `qodercn` / `cline` / `lobsterai` 四家的 product 与
+ * `index.ts` 里 zcode 的构造**都忘了赋这个字段**，于是生效的是 2 MiB ——
+ * 而本常量除定义处外**零引用**（死代码），四家的接口注释却都写着「1 MiB」。
+ * 后果不是「慢一点」而是**越过上游硬限**：qoder 在报错原文里写明
+ * `maximum allowed 52428800 bytes`（50 MiB），而 24 张 × 2 MiB × 4/3 = **64 MiB**。
+ *
+ * ⇒ 取值方向是**显式赋值**（不是把默认参数改成 1 MiB —— 那会改变腾讯系的行为）。
+ * 守卫见 `tests/unit/image-budget.spec.ts` 的「按体积设限的家必须显式给
+ * imageMaxBytes」段（对**实际生效的字节目标**断言，而非源码文本）。
  */
 export const DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES = 1024 * 1024
 

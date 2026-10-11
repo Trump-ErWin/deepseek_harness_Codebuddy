@@ -1037,6 +1037,73 @@ describe('TRAE 适配器 · SOLO SSE 到 OpenAI chunk 转换', () => {
     expect(error.message).toBe('trae: boom (code=5000)')
   })
 
+  /**
+   * 流内 `code=4006`（体积超限）**不得**归成 `SERVER`（Gitee issue IKKX0T）。
+   *
+   * ## 为什么这条的代价是不对称的
+   *
+   * `SERVER` **在** harness 的 `DEFAULT_RETRYABLE_CODES`
+   * （`[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`，已在 `dsh-llm`
+   * 实测确认）里 ⇒ 同一个巨型请求体会被**原样重发 5 次**（退避
+   * 500/1000/2000/4000/8000ms，约 15.5 秒），而体积超限是**确定性**失败，
+   * 每次都必然同样失败。
+   *
+   * ⚠️ **这里刻意断言「不在可重试集合里」而不是只断言等于某个字面量**：
+   * 字面量断言只能锁住「当前写的是什么」，锁不住「它为什么不能是 SERVER」。
+   * 后者才是这条缺陷的本质 —— 后人若把它改成 `INVALID_REQUEST` 之类，
+   * 前半条仍会过，但本用例会指出它与 harness 集合的关系。
+   */
+  it('★ 流内 4006（体积超限）不归可重试码，且能触发溢出压缩（Issue IKKX0T）', async () => {
+    const { adapter } = makeAdapter({
+      responses: [sseResponse(soloSse(['error', {
+        code: 4006,
+        message: "We're sorry, the content is too large for AI to understand.",
+      }]))],
+    })
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e as Error)
+    const code = (error as { code?: string }).code
+
+    // ① 必须是溢出码：这是 `dsh-compaction-basic` 唯一认的那个
+    //    （其 request-error listener 第一行 `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()`）。
+    expect(code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    // ② 绝不能落在 harness 会白重试的集合里。
+    expect(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']).not.toContain(code)
+    // ③ 原文与错误码保留（可与上游日志对照），并补一句可操作提示。
+    expect(error.message).toContain('code=4006')
+    expect(error.message).toContain('too large')
+    expect(error.message).toContain('图片')
+  })
+
+  it('4006 与 4001 的归类不可合并（一个是载荷、一个是模型）', async () => {
+    // 4001 = 模型不可调用（换号/压缩都无益）；4006 = 这一次的载荷太大
+    //（压缩/少发图能救）。两者若合并，必有一方的处置方向被牺牲。
+    const tooLarge = await collect(
+      makeAdapter({
+        responses: [sseResponse(soloSse(['error', { code: 4006, message: 'too large' }]))],
+      }).adapter,
+      BASIC_OPTIONS,
+    ).catch((e: unknown) => e as Error)
+    const notCallable = await collect(
+      makeAdapter({
+        responses: [sseResponse(soloSse(['error', { code: 4001, message: 'param is invalid' }]))],
+      }).adapter,
+      BASIC_OPTIONS,
+    ).catch((e: unknown) => e as Error)
+    expect((tooLarge as { code?: string }).code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    expect((notCallable as { code?: string }).code).not.toBe('CONTEXT_WINDOW_EXCEEDED')
+    expect((tooLarge as { code?: string }).code).not.toBe((notCallable as { code?: string }).code)
+  })
+
+  it('未知流内码仍归 SERVER（本修复只挑确定性失败，不放宽其余）', async () => {
+    // ⚠️ 反向守卫：把 4006 挑出来**不能**顺手把整张表改窄 ——
+    // 未知码多属上游真 5xx/瞬时故障，那类**必须**保留重试机会。
+    const { adapter } = makeAdapter({
+      responses: [sseResponse(soloSse(['error', { code: 5000, message: 'upstream exploded' }]))],
+    })
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e as Error)
+    expect((error as { code?: string }).code).toBe('SERVER')
+  })
+
   it('无 done 事件且无内容时仍产出 finish（零块 ⇒ EMPTY_RESPONSE，可重试）', async () => {
     // `metadata` 是可解析事件 ⇒ 不算「上游一个事件都没发」（那条走 TRANSPORT
     // 抛错），且流**正常读到结尾**。但它一个内容块都没产出，故不能报 `stop`

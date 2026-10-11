@@ -5,6 +5,7 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import { BuddyAdapter } from '../../src/buddy-adapter.js'
 import {
+  DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES,
   DEFAULT_IMAGE_PIXEL_BUDGET,
   REQUEST_IMAGE_MAX_BYTES,
   fitImageToPixelBudget,
@@ -325,13 +326,92 @@ describe('五个适配器都真的走了共享投影（不再各自裸发原图�
     expect(bridges.length, `只桥接了 ${bridges.length} 处`).toBeGreaterThanOrEqual(5)
   })
 
-  it('未接缩放的四家仍走原图路径（lobsterai 之外的 loomy / trae / loomy 不误接）', () => {
-    // loomy 与 trae 本轮**没有**接：loomy 实测 24 张全过（无体积问题），
-    // trae 的探测被「仅可见但不可调用」挡住、拿不到阈值。
-    // 这条断言不是为了锁死它们不接，而是**防止误以为已经全接了**。
+  it('未接缩放的两家仍走原图路径（loomy / trae 不误接）', () => {
+    // ⚠️ 本条**只是防止误以为已经全接了**，不是「不许接」：
+    // loomy 与 trae 的两条旧理由都已被 issue IKKX0T 推翻（见 `tests/e2e/README.md`
+    // 与 `docs/agent-notes/protocol-wire.md`），但**当前仍刻意不接** ——
+    // 唯一理由是「边界未经本仓库复测」（两家 fixture 量纲不同，不能直接套用）。
+    // 完整的背景、复测入口与「复测后要改哪 4 处」写在：
+    //   · `src/loomy-product.ts` / `src/trae-product.ts` 的 `imageMaxBytes` 注释
+    //   · `src/loomy-adapter.ts` / `src/trae-adapter.ts` 里 `readImage` 那一段的注释
+    // 复测出边界后**应当**接上并删掉本条。
     for (const rel of ['src/loomy-adapter.ts', 'src/trae-adapter.ts']) {
       expect(codeOnly(read(rel)), `${rel}: 意外接入了缩放`).not.toContain('projectRequestImage')
     }
+  })
+
+  it('zcode 的宿主桥接必须把字节目标传下去（适配器读 options.imageMaxBytes）', () => {
+    // ⚠️ zcode 与前四家**形状不同**：它读的是 `options.imageMaxBytes`（构造参数），
+    // 而不是 product 字段。`index.ts` 原先**一处都没传** ⇒ 同样落到 2 MiB 默认值。
+    // 这条按符号名断言，不用行号（本仓库的既定约定）。
+    const source = codeOnly(read('src/index.ts'))
+    const zcodeBlock = /registerZcodeLlm\(ctx, \{[\s\S]*?\n\}\)/.exec(source)
+    expect(zcodeBlock, '未找到 zcode 的注册块（符号被改名了？）').not.toBeNull()
+    expect(
+      zcodeBlock![0],
+      'zcode 的注册处没传 imageMaxBytes ⇒ 缩放目标回退到 2 MiB 默认值',
+    ).toContain('imageMaxBytes')
+  })
+})
+
+/**
+ * ⚠️ **按体积设限的家必须显式给 `imageMaxBytes`**（2026-10-12 修）。
+ *
+ * ## 真实缺陷
+ *
+ * `qoder` / `qodercn` / `cline` / `lobsterai` 四家的 product **都没赋**这个字段，
+ * 于是适配器把 `undefined` 传给 `requestImageTargetFor`，落到它的**默认参数**
+ * `REQUEST_IMAGE_MAX_BYTES` = **2 MiB** —— 而那个默认是为腾讯系那道
+ * **图片 token 预算**准备的（字节不是它的约束），这四家撞的却都是**请求体体积**。
+ *
+ * 后果不是「慢一点」，而是**越过上游的硬限**：qoder 的上游在报错里写明了
+ * `maximum allowed 52428800 bytes`（50 MiB，issue IKKX0T 实测），而
+ * 24 张 × 2 MiB × 4/3 = **64 MiB** > 50 MiB。文档与实现从此分叉：
+ * `src/image-budget.ts` 与四家接口注释都写着「1 MiB」，
+ * 而 `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES` 这个**专为该用途定义**的常量
+ * 除定义处外**零引用**（死代码），没有任何用例能发现这件事。
+ *
+ * ## 为什么断言「真值」而不是「源码里有赋值」
+ *
+ * 源码级断言（`toContain('imageMaxBytes:')`）挡不住「赋了一个错的值」，
+ * 而本缺陷的两种形态（漏赋值 / 赋成 2 MiB）**症状完全相同**。
+ * 故这里直接对**产品配置对象**求值，并断言经过 `requestImageTargetFor`
+ * 之后的**实际字节目标** —— 那是链路里真正生效的那个数。
+ */
+describe('按体积设限的家必须显式给 imageMaxBytes（Issue IKKX0T 的连带缺陷）', () => {
+  /** 这些家撞的都是**请求体体积**，故字节目标是主约束。 */
+  const BODY_LIMITED_PRODUCTS = [
+    ['qoder', () => import('../../src/qoder-product.js').then((m) => m.QODER)],
+    ['qodercn', () => import('../../src/qoder-product.js').then((m) => m.QODER_CN)],
+    ['cline', () => import('../../src/cline-product.js').then((m) => m.CLINE)],
+    ['lobsterai', () => import('../../src/lobsterai-product.js').then((m) => m.LOBSTERAI)],
+  ] as const
+
+  it.each(BODY_LIMITED_PRODUCTS)('%s：实际生效的字节目标是 1 MiB，不是回退默认的 2 MiB', async (name, load) => {
+    const product = await load()
+    const target = requestImageTargetFor(2560, 1600, product.imagePixelBudget, product.imageMaxBytes)
+    expect(target, '派生目标失败（尺寸非法？）').toBeDefined()
+    expect(
+      target!.maxBytes,
+      `${name} 没显式给 imageMaxBytes，回退到了 2 MiB 的默认值 —— `
+      + '那会让请求体翻倍并可能越过上游硬限（qoder 明写 50 MiB）',
+    ).toBe(DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES)
+    expect(target!.maxBytes, '本用例的前提是它与默认回退值不同，否则断言是同义反复')
+      .not.toBe(REQUEST_IMAGE_MAX_BYTES)
+  })
+
+  it('⚠️ qoder 的硬限算术：24 张必须留在上游写明的 50 MiB 之内', () => {
+    // 上游在报错原文里给出了精确值：`maximum allowed 52428800 bytes`。
+    // 这条把「1 MiB 够不够」从「注释里的话」变成**可计算的判据**：
+    // 2 MiB 时 24 张 = 64 MiB **超限**，1 MiB 时 = 32 MiB 有余量。
+    const QODER_UPSTREAM_LIMIT = 52_428_800
+    const images = 24
+    const base64Growth = 4 / 3
+    const bodyAt = (perImage: number): number => images * perImage * base64Growth
+    expect(bodyAt(DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES), '1 MiB 应当有余量')
+      .toBeLessThan(QODER_UPSTREAM_LIMIT)
+    expect(bodyAt(REQUEST_IMAGE_MAX_BYTES), '2 MiB 会越过上游硬限 —— 这正是本缺陷')
+      .toBeGreaterThan(QODER_UPSTREAM_LIMIT)
   })
 })
 
