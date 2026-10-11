@@ -299,6 +299,34 @@ export function shouldRotateRaccoonAccount(errorText: string, status: number): b
 }
 
 /**
+ * 499「客户端断开」口径的统一抛出：归 aborted 形态，而非普通错误。
+ *
+ * 🔴 实测（2026-10-11，本会话多次）：raccoon 网关返回 **HTTP 499 + body
+ * `client has aborted request`**（nginx「client closed request」＝ 连接在响应
+ * 完成前被断开，多为**请求体过大/网关超时**）。旧路径把它包成普通
+ * `LlmError`（code=httpErrorCode(499)）⇒ agent loop 按 name/code 归
+ * `kind:'error'` ⇒ 终端显示「本轮运行失败」，用户误以为 provider 坏了。
+ *
+ * 归 **aborted** 的语义收益：
+ * - 终端显示「已中止」而非「运行失败」（如实：请求没跑完，重发即可）；
+ * - **不改道**：499 的真实成因多为请求体过大（长上下文），换号重发**照样 499**
+ *   —— 改道只会烧光轮换预算；真正的恢复是压缩上下文（pressure-lane 的
+ *   预警/compaction 兜底正是干这个的）。
+ * ⚠️ 与 `aggregate-adapter.ts` 的 `isAbortLike` 第四条判据同口径（aborted
+ * request|HTTP_?499）—— aggregate 侧判「要不要原样重抛」，本侧判「直接抛
+ * 什么形态」，两处覆盖不同的到达路径（raccoon 是直接 provider，不经 aggregate）。
+ */
+function abortLikeOrNormal(errorText: string, status: number): LlmError {
+  const message = `raccoon: ${errorDetail(errorText)}`
+  if (status === 499 || /aborted request|HTTP_?499/i.test(errorText)) {
+    const e = new LlmError(message, 'ABORTED', { status })
+    e.name = 'AbortError'
+    return e
+  }
+  return new LlmError(message, httpErrorCode(status), { status })
+}
+
+/**
  * 该类别是否要写冷却标记。
  *
  * ⚠️ `auth` 不在其中 —— 见 {@link RaccoonFailureClass} 的事故说明。
@@ -724,7 +752,7 @@ export class RaccoonAdapter extends LlmAdapter {
           await markCurrentAccount()
           if (failureClass === 'other') {
             // 新账号失败但不是可换号类别：按原错误分类抛出（buddy 同款）。
-            throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
+            throw abortLikeOrNormal(errorText, status)
           }
         }
         throw new LlmError(
@@ -735,7 +763,7 @@ export class RaccoonAdapter extends LlmAdapter {
           { status },
         )
       }
-      throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
+      throw abortLikeOrNormal(errorText, status)
     }
 
     // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回，由 consumeOpenAiSse 处理。
