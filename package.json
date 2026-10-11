@@ -1,6 +1,6 @@
 {
   "name": "dsh-codearts-auth",
-  "version": "0.2.0-rc.3",
+  "version": "0.2.0-rc.10",
   "description": "deepseek-harness plugin: sign in and manage accounts across multiple AI coding providers, with multi-account pools and silent credential refresh",
   "type": "module",
   "main": "lib/index.js",
