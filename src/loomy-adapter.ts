@@ -547,6 +547,27 @@ export class LoomyAdapter extends LlmAdapter {
       // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
       imageUrls = new Map()
       for (const [id, ref] of imageRefs) {
+        /**
+         * ⚠️ **此处刻意走「原图」路径，未接 `readImageRequest` 缩放桥接**
+         * （Gitee issue IKKX0T，2026-10-12 复核）。
+         *
+         * 既有理由「loomy 实测 24 张全过、无证据说明它有约束」**已被推翻**：
+         * issue 的独立实测给出 `413 Request Entity Too Large` / `504`，
+         * 且本仓库那个「24 张」= **91.8 MiB** 恰落在 issue 的 87.4~96.6 MiB
+         * 区间**内部** —— 即当时是**侥幸通过**，不是没有约束。
+         *
+         * ⇒ **但当前仍不接**，理由只有一条：**边界未经本仓库复测**。
+         * 两家 fixture 的量纲不同（issue 3.45 MiB/张 vs 本仓库 2.87 MiB/张），
+         * 直接套用别家的 `imageMaxBytes` 等于写进一个没验证的猜测
+         * （本仓库规矩：拿不到阈值就不定值）。
+         *
+         * **复测入口**：`pnpm test:e2e:image-bisect`
+         * （`tests/e2e/image-limit-bisect.e2e.spec.ts`，二分到 ≤3 张）。
+         * 复测后：① 给 `LoomyProduct.imageMaxBytes` 赋值；
+         * ② 这里改为 `projectRequestImage(ref, {...})` 并保留「拿不到就回退原图」；
+         * ③ 宿主侧 `index.ts` 补 `readImageRequest` 桥接；
+         * ④ 删掉 `tests/unit/image-budget.spec.ts` 里那条「loomy/trae 不误接」守卫。
+         */
         const image = await this.options.readImage(ref)
         if (image === undefined) continue
         imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)

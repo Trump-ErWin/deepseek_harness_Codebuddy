@@ -70,8 +70,8 @@ buddy: 内容过长，请精简或新建任务 prompt is too long: 100001 tokens
 | **qoder** | 8 张过 / **15 张** | `TRANSPORT: fetch failed`（≈57 MiB） | **请求体体积** → 缩放后 **24 张全过** ✅ |
 | **lobsterai** | 12 张过 / **13 张** | `SERVER code=500`（≈50 MiB） | **请求体体积**（不是预算 —— 500 不是准入报文）→ 缩放后 **24 张全过** ✅ |
 | **cline** | 24 张（≈159K token）全过 / **32 张** | `TRANSPORT` | **请求体体积** → 缩放后 **32 张全过** ✅ |
-| **loomy** | **24 张全过** | — | 未撞墙（本 fixture 下），故未接缩放 |
-| **trae** | **未探到边界**（本轮只测了 1 张，通过） | — | ⚠️ **上一轮的「1 张即 4001 仅可见但不可调用」已被推翻**，见下 |
+| **loomy** | ⚠️ **本仓库记「24 张全过」，该结论已被 issue IKKX0T 的独立实测质疑**（见下） | issue 实测 `413 Request Entity Too Large`（纯 HTML）/ `504` | **请求体体积** —— 本仓库 24 张 = **91.8 MiB** 恰落在 issue 的 87.4~96.6 MiB 区间**内** ⇒「全过」很可能是**侥幸通过**而非「无约束」|
+| **trae** | ⚠️ **本仓库记「未探到边界」；issue IKKX0T 实测 (21,24] 张** | `code=4006 content is too large for AI to understand` / `502 + HTML` | **请求体体积**（⚠️ 4006 的**归类已修** —— 它原先落 `SERVER` 会被白重试 5 次；详见 `docs/agent-notes/providers-trae.md` 的「流内 `code=4006`」一节）|
 | codearts | 未测 | — | 其 `deepseek-v4` 系是华为云免费福利额度，非用户候选模型 |
 
 ⚠️ **trae 那格是本轮最该记住的教训**：上一轮同一账号对
@@ -98,11 +98,31 @@ qoder ≈57 MiB、cline ≈122 MiB）。两种约束**只有缩放图片这一�
   qoder / lobsterai / cline 1 MiB、buddy 2 MiB。**别合并成一个常量**，
   也别把 buddy 的 640,000 当全局像素预算推给别家 ——
   这正是本仓库 `endpoint` 那条教训的形状。
-- **未接的两家**：loomy（实测 24 张全过，无证据说明它有约束）、
-  trae（⚠️ **理由已变**：原来说「探测被『仅可见但不可调用』挡住」，
-  而本轮该账号同一模型已能正常收图 —— 旧理由失效，但**新理由仍然成立**：
-  它的**原图边界从未探过**（本轮只测了 1 张原图就通过），
-  **拿不到阈值就不定值**这条规矩不变）。
+- ⚠️⚠️ **「1 MiB」这半句曾经只是文档、实现里并不成立**（2026-10-12 修，
+  issue IKKX0T 连带发现）：四家的 product **都没赋** `imageMaxBytes`，
+  适配器把 `undefined` 传给 `requestImageTargetFor`，落到它的默认参数
+  **2 MiB**（那个默认是为**腾讯系的图片 token 预算**准备的）——
+  而 `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES`（1 MiB，**专为该用途定义**）
+  除定义处外**零引用**，是死代码。
+  ⇒ 后果不是「慢一点」而是**越过上游硬限**：qoder 报错原文写明
+  `maximum allowed 52428800 bytes`（50 MiB），而 24 张 × 2 MiB × 4/3 = **64 MiB**。
+  ⇒ 修法是**显式赋值**（不是改默认参数 —— 那会改变腾讯系的行为），
+  已补齐 **5 处**：`qoder` / `qodercn` / `cline` / `lobsterai` 的 product
+  + `index.ts` 里 zcode 的构造（它读 `options.imageMaxBytes`，形状与前四家不同）。
+  守卫在 `tests/unit/image-budget.spec.ts`：对**实际生效的字节目标**断言
+  （源码文本断言挡不住「赋了一个错的值」，而两种形态症状相同）。
+- **未接的两家**（⚠️ **两条旧理由都已被 issue IKKX0T 推翻，但结论仍是「暂不定值」**）：
+  - **loomy**：旧理由「实测 24 张全过，无证据说明它有约束」**已失效** ——
+    issue 的独立实测给出 `413 Request Entity Too Large` / `504`（纯 HTML）。
+    ⚠️ **关键换算**：本仓库 fixture 是 2.87 MiB/张、24 张 = **91.8 MiB**，
+    而 issue（3.45 MiB/张）的边界区间是 **87.4~96.6 MiB** —— 91.8 **恰在区间内部**。
+    即「24 张全过」很可能是**在边界内 4 MiB 处侥幸通过**，而不是「这家没有约束」。
+    ⇒ 这正是「某次实测没看到**不能**推广成不存在」的又一实例。
+  - **trae**：旧理由「原图边界从未探过」**已失效** —— issue 实测 (21,24] 张。
+  - ⚠️ **但两家都仍不接**：issue 是**第三方实测、探针未入库**，而本仓库的规矩是
+    **用自己的账号与 fixture 复测过才定值**（同 fixture 下量纲才可比）。
+    复测入口已备好：`pnpm test:e2e:image-bisect`（二分到 ≤3 张，
+    见 `tests/e2e/image-limit-bisect.e2e.spec.ts`）。**复测出边界后再定 `imageMaxBytes`。**
   ⚠️ 别"为了统一"给它们塞一个猜出来的预算。
 - ⚠️ **接线漏改的教训**：本轮先改了适配器**却没在宿主桥接**，
   结果 qoder / qodercn / lobsterai / cline 四家的修复**静默不生效**
@@ -1659,8 +1679,8 @@ buddy: 内容过长，请精简或新建任务 prompt is too long: 100001 tokens
 | **qoder** | 8 张过 / **15 张** | `TRANSPORT: fetch failed`（≈57 MiB） | **请求体体积** → 缩放后 **24 张全过** ✅ |
 | **lobsterai** | 12 张过 / **13 张** | `SERVER code=500`（≈50 MiB） | **请求体体积**（不是预算 —— 500 不是准入报文）→ 缩放后 **24 张全过** ✅ |
 | **cline** | 24 张（≈159K token）全过 / **32 张** | `TRANSPORT` | **请求体体积** → 缩放后 **32 张全过** ✅ |
-| **loomy** | **24 张全过** | — | 未撞墙（本 fixture 下），故未接缩放 |
-| **trae** | **未探到边界**（本轮只测了 1 张，通过） | — | ⚠️ **上一轮的「1 张即 4001 仅可见但不可调用」已被推翻**，见下 |
+| **loomy** | ⚠️ **本仓库记「24 张全过」，该结论已被 issue IKKX0T 的独立实测质疑**（见下） | issue 实测 `413 Request Entity Too Large`（纯 HTML）/ `504` | **请求体体积** —— 本仓库 24 张 = **91.8 MiB** 恰落在 issue 的 87.4~96.6 MiB 区间**内** ⇒「全过」很可能是**侥幸通过**而非「无约束」|
+| **trae** | ⚠️ **本仓库记「未探到边界」；issue IKKX0T 实测 (21,24] 张** | `code=4006 content is too large for AI to understand` / `502 + HTML` | **请求体体积**（⚠️ 4006 的**归类已修** —— 它原先落 `SERVER` 会被白重试 5 次；详见 `docs/agent-notes/providers-trae.md` 的「流内 `code=4006`」一节）|
 | codearts | 未测 | — | 其 `deepseek-v4` 系是华为云免费福利额度，非用户候选模型 |
 
 ⚠️ **trae 那格是本轮最该记住的教训**：上一轮同一账号对
@@ -1687,11 +1707,31 @@ qoder ≈57 MiB、cline ≈122 MiB）。两种约束**只有缩放图片这一�
   qoder / lobsterai / cline 1 MiB、buddy 2 MiB。**别合并成一个常量**，
   也别把 buddy 的 640,000 当全局像素预算推给别家 ——
   这正是本仓库 `endpoint` 那条教训的形状。
-- **未接的两家**：loomy（实测 24 张全过，无证据说明它有约束）、
-  trae（⚠️ **理由已变**：原来说「探测被『仅可见但不可调用』挡住」，
-  而本轮该账号同一模型已能正常收图 —— 旧理由失效，但**新理由仍然成立**：
-  它的**原图边界从未探过**（本轮只测了 1 张原图就通过），
-  **拿不到阈值就不定值**这条规矩不变）。
+- ⚠️⚠️ **「1 MiB」这半句曾经只是文档、实现里并不成立**（2026-10-12 修，
+  issue IKKX0T 连带发现）：四家的 product **都没赋** `imageMaxBytes`，
+  适配器把 `undefined` 传给 `requestImageTargetFor`，落到它的默认参数
+  **2 MiB**（那个默认是为**腾讯系的图片 token 预算**准备的）——
+  而 `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES`（1 MiB，**专为该用途定义**）
+  除定义处外**零引用**，是死代码。
+  ⇒ 后果不是「慢一点」而是**越过上游硬限**：qoder 报错原文写明
+  `maximum allowed 52428800 bytes`（50 MiB），而 24 张 × 2 MiB × 4/3 = **64 MiB**。
+  ⇒ 修法是**显式赋值**（不是改默认参数 —— 那会改变腾讯系的行为），
+  已补齐 **5 处**：`qoder` / `qodercn` / `cline` / `lobsterai` 的 product
+  + `index.ts` 里 zcode 的构造（它读 `options.imageMaxBytes`，形状与前四家不同）。
+  守卫在 `tests/unit/image-budget.spec.ts`：对**实际生效的字节目标**断言
+  （源码文本断言挡不住「赋了一个错的值」，而两种形态症状相同）。
+- **未接的两家**（⚠️ **两条旧理由都已被 issue IKKX0T 推翻，但结论仍是「暂不定值」**）：
+  - **loomy**：旧理由「实测 24 张全过，无证据说明它有约束」**已失效** ——
+    issue 的独立实测给出 `413 Request Entity Too Large` / `504`（纯 HTML）。
+    ⚠️ **关键换算**：本仓库 fixture 是 2.87 MiB/张、24 张 = **91.8 MiB**，
+    而 issue（3.45 MiB/张）的边界区间是 **87.4~96.6 MiB** —— 91.8 **恰在区间内部**。
+    即「24 张全过」很可能是**在边界内 4 MiB 处侥幸通过**，而不是「这家没有约束」。
+    ⇒ 这正是「某次实测没看到**不能**推广成不存在」的又一实例。
+  - **trae**：旧理由「原图边界从未探过」**已失效** —— issue 实测 (21,24] 张。
+  - ⚠️ **但两家都仍不接**：issue 是**第三方实测、探针未入库**，而本仓库的规矩是
+    **用自己的账号与 fixture 复测过才定值**（同 fixture 下量纲才可比）。
+    复测入口已备好：`pnpm test:e2e:image-bisect`（二分到 ≤3 张，
+    见 `tests/e2e/image-limit-bisect.e2e.spec.ts`）。**复测出边界后再定 `imageMaxBytes`。**
   ⚠️ 别"为了统一"给它们塞一个猜出来的预算。
 - ⚠️ **接线漏改的教训**：本轮先改了适配器**却没在宿主桥接**，
   结果 qoder / qodercn / lobsterai / cline 四家的修复**静默不生效**
@@ -1926,8 +1966,8 @@ buddy: 内容过长，请精简或新建任务 prompt is too long: 100001 tokens
 | **qoder** | 8 张过 / **15 张** | `TRANSPORT: fetch failed`（≈57 MiB） | **请求体体积** → 缩放后 **24 张全过** ✅ |
 | **lobsterai** | 12 张过 / **13 张** | `SERVER code=500`（≈50 MiB） | **请求体体积**（不是预算 —— 500 不是准入报文）→ 缩放后 **24 张全过** ✅ |
 | **cline** | 24 张（≈159K token）全过 / **32 张** | `TRANSPORT` | **请求体体积** → 缩放后 **32 张全过** ✅ |
-| **loomy** | **24 张全过** | — | 未撞墙（本 fixture 下），故未接缩放 |
-| **trae** | **未探到边界**（本轮只测了 1 张，通过） | — | ⚠️ **上一轮的「1 张即 4001 仅可见但不可调用」已被推翻**，见下 |
+| **loomy** | ⚠️ **本仓库记「24 张全过」，该结论已被 issue IKKX0T 的独立实测质疑**（见下） | issue 实测 `413 Request Entity Too Large`（纯 HTML）/ `504` | **请求体体积** —— 本仓库 24 张 = **91.8 MiB** 恰落在 issue 的 87.4~96.6 MiB 区间**内** ⇒「全过」很可能是**侥幸通过**而非「无约束」|
+| **trae** | ⚠️ **本仓库记「未探到边界」；issue IKKX0T 实测 (21,24] 张** | `code=4006 content is too large for AI to understand` / `502 + HTML` | **请求体体积**（⚠️ 4006 的**归类已修** —— 它原先落 `SERVER` 会被白重试 5 次；详见 `docs/agent-notes/providers-trae.md` 的「流内 `code=4006`」一节）|
 | codearts | 未测 | — | 其 `deepseek-v4` 系是华为云免费福利额度，非用户候选模型 |
 
 ⚠️ **trae 那格是本轮最该记住的教训**：上一轮同一账号对
@@ -1954,11 +1994,31 @@ qoder ≈57 MiB、cline ≈122 MiB）。两种约束**只有缩放图片这一�
   qoder / lobsterai / cline 1 MiB、buddy 2 MiB。**别合并成一个常量**，
   也别把 buddy 的 640,000 当全局像素预算推给别家 ——
   这正是本仓库 `endpoint` 那条教训的形状。
-- **未接的两家**：loomy（实测 24 张全过，无证据说明它有约束）、
-  trae（⚠️ **理由已变**：原来说「探测被『仅可见但不可调用』挡住」，
-  而本轮该账号同一模型已能正常收图 —— 旧理由失效，但**新理由仍然成立**：
-  它的**原图边界从未探过**（本轮只测了 1 张原图就通过），
-  **拿不到阈值就不定值**这条规矩不变）。
+- ⚠️⚠️ **「1 MiB」这半句曾经只是文档、实现里并不成立**（2026-10-12 修，
+  issue IKKX0T 连带发现）：四家的 product **都没赋** `imageMaxBytes`，
+  适配器把 `undefined` 传给 `requestImageTargetFor`，落到它的默认参数
+  **2 MiB**（那个默认是为**腾讯系的图片 token 预算**准备的）——
+  而 `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES`（1 MiB，**专为该用途定义**）
+  除定义处外**零引用**，是死代码。
+  ⇒ 后果不是「慢一点」而是**越过上游硬限**：qoder 报错原文写明
+  `maximum allowed 52428800 bytes`（50 MiB），而 24 张 × 2 MiB × 4/3 = **64 MiB**。
+  ⇒ 修法是**显式赋值**（不是改默认参数 —— 那会改变腾讯系的行为），
+  已补齐 **5 处**：`qoder` / `qodercn` / `cline` / `lobsterai` 的 product
+  + `index.ts` 里 zcode 的构造（它读 `options.imageMaxBytes`，形状与前四家不同）。
+  守卫在 `tests/unit/image-budget.spec.ts`：对**实际生效的字节目标**断言
+  （源码文本断言挡不住「赋了一个错的值」，而两种形态症状相同）。
+- **未接的两家**（⚠️ **两条旧理由都已被 issue IKKX0T 推翻，但结论仍是「暂不定值」**）：
+  - **loomy**：旧理由「实测 24 张全过，无证据说明它有约束」**已失效** ——
+    issue 的独立实测给出 `413 Request Entity Too Large` / `504`（纯 HTML）。
+    ⚠️ **关键换算**：本仓库 fixture 是 2.87 MiB/张、24 张 = **91.8 MiB**，
+    而 issue（3.45 MiB/张）的边界区间是 **87.4~96.6 MiB** —— 91.8 **恰在区间内部**。
+    即「24 张全过」很可能是**在边界内 4 MiB 处侥幸通过**，而不是「这家没有约束」。
+    ⇒ 这正是「某次实测没看到**不能**推广成不存在」的又一实例。
+  - **trae**：旧理由「原图边界从未探过」**已失效** —— issue 实测 (21,24] 张。
+  - ⚠️ **但两家都仍不接**：issue 是**第三方实测、探针未入库**，而本仓库的规矩是
+    **用自己的账号与 fixture 复测过才定值**（同 fixture 下量纲才可比）。
+    复测入口已备好：`pnpm test:e2e:image-bisect`（二分到 ≤3 张，
+    见 `tests/e2e/image-limit-bisect.e2e.spec.ts`）。**复测出边界后再定 `imageMaxBytes`。**
   ⚠️ 别"为了统一"给它们塞一个猜出来的预算。
 - ⚠️ **接线漏改的教训**：本轮先改了适配器**却没在宿主桥接**，
   结果 qoder / qodercn / lobsterai / cline 四家的修复**静默不生效**

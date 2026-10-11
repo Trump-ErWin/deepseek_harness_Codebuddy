@@ -67,10 +67,52 @@ export const PROBE_COUNTS = [0, 1, 8, 15, 24]
  */
 
 /** 撞墙判据：只有图片 token 上限的报文算数，其余失败都说明探测被污染了。 */
-export type BurstVerdict = 'overflow' | 'transport' | 'auth' | 'other' | 'ok'
+export type BurstVerdict = 'overflow' | 'too-large' | 'transport' | 'auth' | 'other' | 'ok'
+
+/**
+ * 「请求体/载荷过大」类报文（Gitee issue IKKX0T 补的三家形态）。
+ *
+ * ## 为什么必须与 `overflow` 分开
+ *
+ * 两者是**两种不同的约束**，旋钮不同（见 `src/image-budget.ts` 的说明）：
+ * - `overflow` = 图片**视觉 token** 预算（腾讯系，`prompt is too long: N > M maximum`）
+ *   → 靠**降像素**；
+ * - `too-large` = **请求体体积**（trae / loomy / qoder / raccoon / lobsterai / cline）
+ *   → 靠**降编码字节**。
+ *
+ * 探针要回答的是「边界在第几张」，两者都能回答；但**定预算时**必须知道是哪一种
+ * ——拿 token 预算去治体积限制会白缩像素，反之亦然。
+ *
+ * ⚠️ **判据必须窄**：只认**明确指向载荷体积**的措辞。`502 + HTML` 与 `504` 那两条
+ * 形态**刻意不在此列** —— 它们与「上游真崩了」无法区分，把它们当边界证据会得出
+ * 「这家上限是 N 张」的假结论（issue IKKX0T 记录的 trae 502 就是这种）。
+ */
+const TOO_LARGE_PATTERNS: readonly RegExp[] = [
+  // trae 流内 `code=4006`：`We're sorry, the content is too large for AI to understand.`
+  /content\s+is\s+too\s+large/i,
+  /\bcode=?4006\b/i,
+  // loomy：`413 Request Entity Too Large`（纯 HTML，无 JSON、无字节数）
+  /request\s+entity\s+too\s+large/i,
+  // qoder：`413 Request body size exceeds maximum allowed 52428800 bytes`（**精确值**）
+  /request\s+body\s+size\s+exceeds/i,
+  // raccoon：`HTTP_413: request body exceeds 10MB`
+  /request\s+body\s+exceeds/i,
+  // 通用兜底：明确带字节数的体积报文
+  /payload\s+too\s+large/i,
+]
+
+/** 报文是否明确指向「载荷体积过大」。 */
+export function isPayloadTooLarge(text: string): boolean {
+  return TOO_LARGE_PATTERNS.some((pattern) => pattern.test(text))
+}
 
 export function classifyFailure(text: string, code?: string): BurstVerdict {
   if (isImageTokenOverflow(text)) return 'overflow'
+  // ⚠️ 顺序：体积判据必须排在 transport 之前 —— `413` 与 `504` 都可能被上游
+  // 以 HTML 形态给出，而 `classifyFailure` 的 transport 正则含 `ECONNRESET` 等，
+  // 两者不会互撞；但体积报文里若同时出现 "fetch failed" 措辞，
+  // 以**更具体**的体积判据为准才不会漏掉边界。
+  if (isPayloadTooLarge(text)) return 'too-large'
   if (code === 'TRANSPORT' || /transport error|fetch failed|socket hang|ECONNRESET/i.test(text)) return 'transport'
   if (code === 'AUTH' || /authorization_verify|unauthorized|api 密钥/i.test(text)) return 'auth'
   return 'other'
@@ -242,17 +284,103 @@ export async function probeImageBurst(options: {
     console.log(`  [${options.label}] ${count === 0 ? '基线(无图)' : `${count} 张（估算 ≈${estimated} token）`} → `
       + `${ok ? `成功（${answer.trim().slice(0, 40)}）` : `${verdict}：code=${code ?? '?'} ${errorText.slice(0, 120)}`}`)
     results.push({ count, ok, answer: answer.trim(), code, errorText, verdict })
-    // 只有真正的图片预算撞墙才值得停在边界上。
-    if (verdict === 'overflow') break
+    // 真正的边界只有两种形态：图片 token 预算、请求体体积。两者都值得停在边界上
+    //（前者靠降像素、后者靠降编码字节，见 classifyFailure 的说明）。
+    if (verdict === 'overflow' || verdict === 'too-large') break
     // 其余失败必须**中止并如实标注探测无效** —— 把 `TRANSPORT`／`AUTH`
     // 当成「撞墙」，就会得出「这家网关上限是 N 张」的假结论（我第一版就是这么错的）。
     if (verdict !== 'ok') {
-      console.log(`  ⚠️ 探测中止：${verdict} 类失败与图片 token 预算无关，`
+      console.log(`  ⚠️ 探测中止：${verdict} 类失败与图片上限无关，`
         + '不能据此判断该网关的上限。')
       break
     }
   }
   return results
+}
+
+/**
+ * 在 `(pass, fail]` 上**二分**出真实边界张数（Gitee issue IKKX0T 的探测方法）。
+ *
+ * ## 为什么需要它
+ *
+ * `probeImageBurst` 走的是**固定序列**（`PROBE_COUNTS` = `[0,1,8,15,24]`），
+ * 得到的是「区间」而非边界。issue 作者用二分把误差压到 ≤3 张，才拿到
+ * 「trae (21,24]」「loomy (19,21]」这种可用于**定预算值**的精度。
+ *
+ * ⚠️ **本仓库的规矩是「拿不到阈值就不定值」**（`docs/agent-notes/protocol-wire.md`）：
+ * 固定序列给出的 `24` 这种上界**不足以**用来定 `imageMaxBytes` ——
+ * 真实边界可能是 16，也可能是 24，取上界定值会留下 8 张的过冲。
+ *
+ * ## 三条实现约束
+ *
+ * - **必须复用 `probeImageBurst`**（同一份 `classifyFailure` / `system` / 去重逻辑），
+ *   否则二分出来的边界与固定序列的结论**不可比**；
+ * - **只在 `(pass, fail]` 上二分**：调用方需先给出一个已知通过的 `low` 与
+ *   已知失败的 `high`（未验证的区间不能二分 —— 会得到无意义的收敛）；
+ * - **`tolerance` 默认 3 张**（对齐 issue 的误差声明），且循环上限兜底，
+ *   防止上游行为不稳定时无限二分。
+ *
+ * @returns 二分出的边界信息；`low` 或 `high` 不满足前提时返回 `undefined`
+ */
+export async function bisectImageLimit(options: {
+  label: string
+  stream: (messages: unknown[], signal: AbortSignal, system: string) => AsyncIterable<unknown>
+  /** 已知**通过**的张数（含 0）。 */
+  low: number
+  /** 已知**失败**的张数，且必须 > low。 */
+  high: number
+  /** 收敛容差（张）；默认 3。 */
+  tolerance?: number
+  prompt?: string
+  system?: string
+  timeoutMs?: number
+}): Promise<{
+  /** 已知通过的最大张数（下界）。 */
+  pass: number
+  /** 已知失败的最小张数（上界）。 */
+  fail: number
+  /** 边界处的失败形态 —— 决定该用哪个旋钮（像素 vs 字节）。 */
+  verdict: BurstVerdict
+  /** 全部探测记录（含二分的每一步）。 */
+  steps: BurstResult[]
+} | undefined> {
+  const tolerance = options.tolerance ?? 3
+  if (!Number.isFinite(options.low) || !Number.isFinite(options.high)) return undefined
+  if (options.low < 0 || options.high <= options.low) return undefined
+
+  const steps: BurstResult[] = []
+  let pass = options.low
+  let fail = options.high
+  let verdict: BurstVerdict = 'other'
+
+  // 上限兜底：区间宽 3 张时必然收敛，log2 上限给 12 次足够任何合理区间。
+  for (let round = 0; round < 12 && fail - pass > tolerance; round++) {
+    const mid = Math.floor((pass + fail) / 2)
+    if (mid <= pass || mid >= fail) break
+    const [result] = await probeImageBurst({
+      label: `${options.label} 二分 mid=${mid}`,
+      counts: [mid],
+      ...options.prompt === undefined ? {} : { prompt: options.prompt },
+      ...options.system === undefined ? {} : { system: options.system },
+      ...options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs },
+      stream: options.stream,
+    })
+    if (result === undefined) break
+    steps.push(result)
+    // ⚠️ 非边界类失败（transport / auth / other）**必须中止**：把它当成
+    // 「mid 太大」会把边界算小，得出一个假的预算值。
+    if (!result.ok && result.verdict !== 'overflow' && result.verdict !== 'too-large') {
+      console.log(`  ⚠️ 二分中止：mid=${mid} 出现 ${result.verdict} 类失败，与图片上限无关。`)
+      break
+    }
+    if (result.ok) {
+      pass = mid
+    } else {
+      fail = mid
+      verdict = result.verdict
+    }
+  }
+  return { pass, fail, verdict, steps }
 }
 
 /**

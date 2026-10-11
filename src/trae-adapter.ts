@@ -19,7 +19,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
@@ -216,6 +216,55 @@ class TraeStreamErrorCause extends Error {
  */
 function isRotatableStreamError(code: number): boolean {
   return code === 1005 || code === 4008 || code === 4011
+}
+
+/**
+ * 流内错误码 `4006`：**请求体过大**（上游原文 `content is too large for AI to understand`）。
+ *
+ * ## 为什么必须单列（Gitee issue IKKX0T 的独立实测）
+ *
+ * 归类点原先是行内三元 `code === 1005 || code === 4008 ? 'QUOTA_EXCEEDED' : 'SERVER'`，
+ * 于是 4006 落到 **`SERVER`** —— 而 `SERVER` **在** harness 的
+ * `DEFAULT_RETRYABLE_CODES`（`[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`，
+ * 已在 `dsh-llm` 实测确认）里 ⇒ 同一个巨型请求体会被**原样重发 5 次**
+ * （退避 500/1000/2000/4000/8000ms，约 15.5 秒），而它每次必然同样失败。
+ *
+ * ⚠️ **归错的代价是不对称的**（与 `buddy-adapter.ts` 的 `GATEWAY_PROMPT_TOO_LONG` 同因）：
+ * 体积超限是**确定性**失败，重试毫无意义；归成 `CONTEXT_WINDOW_EXCEEDED` 则
+ * ① 不在可重试集合里（不白重试），② 还能触发 `dsh-compaction-basic` 的溢出压缩
+ * ——它的 listener 第一行就是 `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()`。
+ * 图片撑大的请求体正是压缩能真正缓解的那一类。
+ *
+ * ⚠️ **与 `4001` 的区别**：4001 是「模型不可调用」（换号/压缩都无益，如实报错）；
+ * 4006 是「这一次的载荷太大」（压缩/少发图能救）。两者**不可合并**。
+ *
+ * ⚠️ **只认 4006 这一个码，不做措辞匹配**：同族的 `502 + HTML` 形态
+ * （issue 记录的另一条 trae 报文）与「上游真的崩了」**无法区分** ——
+ * 把它也归成溢出会让真正的 5xx 故障失去重试机会（`upstreamStatusOrFallback`
+ * 的注释记着同一条方向：5xx 必须原样透出）。
+ */
+function isStreamPayloadTooLargeError(code: number): boolean {
+  return code === 4006
+}
+
+/**
+ * 流内 `event:error` → provider-neutral 错误码。
+ *
+ * 抽成函数而不是继续写在行内三元里：这张表要**逐格**可测（本仓库的既有教训是
+ * 「同一张判据表的两个实现必须逐格同构」，散落在调用点就没法对拍）。
+ *
+ * 顺序即优先级，且**不可重排**：
+ * 1. `4006` 体积超限 → `CONTEXT_WINDOW_EXCEEDED`（不重试 + 可压缩）；
+ * 2. `1005` / `4008` 额度类 → `QUOTA_EXCEEDED`（终态，用户需签到/换号）；
+ * 3. 其余（含 `4001` 模型不可调用）→ `SERVER`。
+ *
+ * ⚠️ 第 3 条保留 `SERVER` 是**有意**的：它覆盖的多数是上游真 5xx/未知故障，
+ * 那类确实该重试。本函数只把「确定为确定性失败」的码挑出来。
+ */
+function streamErrorCode(code: number): string {
+  if (isStreamPayloadTooLargeError(code)) return CONTEXT_WINDOW_EXCEEDED_CODE
+  if (code === 1005 || code === 4008) return 'QUOTA_EXCEEDED'
+  return 'SERVER'
 }
 
 /**
@@ -575,6 +624,14 @@ function httpErrorCode(status: number): string {
  */
 function traeStreamErrorMessage(code: number, message: string, model: string): string {
   const base = `trae: ${message} (code=${code})`
+  if (code === 4006) {
+    // 上游原文 *"We're sorry, the content is too large for AI to understand."*
+    // 说的是**这一次请求的载荷**太大（实测：约 (21,24] 张 2560×1600 原图，
+    // 即请求体 ≈100 MiB 量级，Gitee issue IKKX0T）。原文不提「图片」也不提
+    // 「体积」，容易被读成模型能力问题，故补一句可操作的指向。
+    return `${base} —— 本次请求的内容过大：多为一次携带的图片过多/过大。`
+      + '请减少本轮的图片数量或改用更小的截图后重试。'
+  }
   if (code !== 4001) return base
   return `${base} —— 模型「${model}」不被上游接受：它通常是「仅可见但不可调用」的`
     + '自定义模型（需先在 TRAE IDE 内自行配置供应商），请改用模型列表中的其它模型'
@@ -1076,6 +1133,28 @@ export class TraeAdapter extends LlmAdapter {
       }
       imageUrls = new Map()
       for (const [id, ref] of imageRefs) {
+        /**
+         * ⚠️ **此处刻意走「原图」路径，未接 `readImageRequest` 缩放桥接**
+         * （Gitee issue IKKX0T，2026-10-12 复核）。
+         *
+         * 既有理由「原图边界从未探过，拿不到阈值就不定值」**已失效**：
+         * issue 的独立实测给出边界 **`(21, 24]` 张** 2560×1600 原图，
+         * 形态是流内 `code=4006 content is too large for AI to understand`
+         * （该码原先被归成可重试的 `SERVER`，已于本次修掉 —— 见
+         * `streamErrorCode` 的注释，所以现在失败是**快速且文案明确**的）。
+         *
+         * ⇒ **但当前仍不接**，理由只有一条：**边界未经本仓库复测**。
+         * issue 的 fixture 是 3.45 MiB/张、本仓库的是 2.87 MiB/张，
+         * 量纲不同 ⇒ 同一个「≈100 MiB 请求体」边界对应的**张数也不同**，
+         * 直接套用别家的 `imageMaxBytes` 等于写进一个没验证的猜测。
+         *
+         * **复测入口**：`pnpm test:e2e:image-bisect`
+         * （`tests/e2e/image-limit-bisect.e2e.spec.ts`，二分到 ≤3 张）。
+         * 复测后：① 给 `TraeProduct.imageMaxBytes` 赋值；
+         * ② 这里改为 `projectRequestImage(ref, {...})` 并保留「拿不到就回退原图」；
+         * ③ 宿主侧 `index.ts` 补 `readImageRequest` 桥接；
+         * ④ 删掉 `tests/unit/image-budget.spec.ts` 里那条「loomy/trae 不误接」守卫。
+         */
         const image = await this.options.readImage(ref)
         if (image === undefined) continue
         imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
@@ -1730,10 +1809,9 @@ export class TraeAdapter extends LlmAdapter {
                       })
                     }
                     // 4001（模型不可调用）不换号：换账号也是同一模型被拒。
-                    throw new LlmError(
-                      message,
-                      ev.errorCode === 1005 || ev.errorCode === 4008 ? 'QUOTA_EXCEEDED' : 'SERVER',
-                    )
+                    // ⚠️ 归类走 {@link streamErrorCode}（4006 体积超限**不能**落 SERVER，
+                    //    否则会被 harness 原样重发 5 次 —— 见该函数的说明）。
+                    throw new LlmError(message, streamErrorCode(ev.errorCode))
                   }
                   break
                 }

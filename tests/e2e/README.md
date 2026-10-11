@@ -14,6 +14,7 @@
 | `trae-channels-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` | 拉真实多通道目录，并用**真实适配器**对 `glm-5.1`（agent 通道）与 `glm-5-turbo`（work 通道）各发一条最短消息 —— **验证「模型只在列出它的通道里可调用」**。消耗 2 次极小额度 |
 | `cline-chat-probe.e2e.spec.ts` | `DSH_CLINE_CHAT_E2E=1` + `DSH_CLINE_CHAT_E2E_CONFIRM=yes` | **默认只请求 `cline-free/mimo-v2.6-flash`**（用户指定的日常验证模型）。其余免费模型需 `DSH_CLINE_CHAT_E2E_ALL_FREE=1` 才遍历。**付费模型一律拒绝请求**（见下「Cline 探针的付费保护」） |
 | `image-burst-cross-provider.e2e.spec.ts`（`pnpm test:e2e:image-burst`） | `DSH_IMAGE_BURST_E2E=1` + `DSH_IMAGE_BURST_E2E_CONFIRM=yes` | **issue !IKITT9 的图片压力探测**（跨 provider）。腾讯两站各一组：原图 15 张必须报 `prompt is too long` 且归成 `CONTEXT_WINDOW_EXCEEDED`、缩放后同张数必须过、且**缩到 1011×632 后模型仍读得出截图地址栏**（这条是预算档位的正当性来源）。另含 qoder / cline / lobsterai / raccoon / trae / loomy 各一组。⚠️ 单次请求带十几张图，**消耗明显**（全跑约 8 分钟）；缺 fixture 时整体跳过（见下） |
+| `image-limit-bisect.e2e.spec.ts`（`pnpm test:e2e:image-bisect`） | `DSH_IMAGE_BISECT_E2E=1` + `DSH_IMAGE_BISECT_E2E_CONFIRM=yes` | **loomy / trae 的边界二分复测**（Gitee issue IKKX0T）。⚠️ 比上面那个**贵得多**（二分每步都是一整轮十几张图）。用途是复核两条**已被第三方实测质疑**的既有结论：loomy「24 张全过、无约束」、trae「未探到边界」。**二分出边界后才能定 `imageMaxBytes`**（本仓库规矩：拿不到阈值就不定值）。文件内含一条**离线判据用例**（零额度，不受闸门约束） |
 
 ## ⚠️ 图片探针的 fixture 不入库
 
@@ -61,8 +62,8 @@
 | qoder | 8 过 / **15 张**（≈57 MiB） | **24 张全过** | 请求体体积 |
 | lobsterai | 12 过 / **13 张**（≈50 MiB，`SERVER code=500`） | **24 张全过** | 请求体体积（500 不是准入报文） |
 | cline | 24 全过 / **32 张**（≈122 MiB） | **32 张全过** | 请求体体积 |
-| loomy | **24 张全过** | 未测（无必要） | 本 fixture 下未撞墙 |
-| trae | ⚠️ **未探到边界**（本轮 1 张通过） | 24 张全过（探索性） | ⚠️ **上一轮的「1 张即 4001／仅可见但不可调用」已被推翻** |
+| loomy | ⚠️ **本仓库记「24 张全过」，但该结论已被 issue IKKX0T 质疑** | 未测（无必要？**不再成立**） | **请求体体积** —— 本仓库 24 张 = **91.8 MiB**，恰落在 issue（3.45 MiB/张）的 87.4~96.6 MiB 区间**内** ⇒「全过」很可能是**侥幸通过** |
+| trae | ⚠️ **本仓库记「未探到边界」；issue IKKX0T 实测 (21,24] 张** | 24 张全过（探索性） | **请求体体积**（`code=4006 content is too large`；该码的**归类已修**，见 `docs/agent-notes/providers-trae.md`）|
 
 ⚠️ **trae 那一格是本文件最该记住的教训**：上一轮同一账号对 `deepseek-v4.1-flash`
 与 `glm-5.3-flash` 都回 `4001 param is invalid`（适配器诊断「仅可见但不可调用」），
@@ -162,6 +163,10 @@ pnpm test:e2e:trae-claim
 
 # ⚠️ 会消耗极小额度：验证多通道目录与「按模型路由通道」
 pnpm test:e2e:trae-channels
+
+# ⚠️ 会消耗明显额度：loomy / trae 的图片边界**二分**复测（Issue IKKX0T）
+#    比 image-burst 贵得多（二分每步一整轮十几张图）。定 imageMaxBytes 前跑它。
+pnpm test:e2e:image-bisect
 
 # 安全：Cline 只读探针（凭据/前缀证据/余额/免费集合，不发模型请求、不续期）
 pnpm test:e2e:cline
