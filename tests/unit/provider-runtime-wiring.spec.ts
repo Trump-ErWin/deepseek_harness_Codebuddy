@@ -391,10 +391,13 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     // opencode 的写点是**注入式**的：`index.ts` 把 `markLimited` 传给
     // `registerOpencodeLlm`，适配器内部 3 处调它（不是自己调 `updateModelRateLimit`）。
     ['opencode-adapter.ts', ['opencode']],
-    // ↓ 实测不写标记的三个（登记它们是为了让「每个 *-adapter.ts 都要登记」成立）。
+    // ⚠️ minimax **曾经**登记为空（不写标记）—— 2026-10-11 的 issue IKJW32 给它
+    //    接上请求级换号 + 冷却后，它会写 `modelRateLimits`（额度 24h / 限流 1h）。
+    //    下面那条「登记为不写标记的确实没有写点」用例就是靠这个变化**红**出来的。
+    ['minimax-adapter.ts', ['minimax']],
+    // ↓ 实测不写标记的两个（登记它们是为了让「每个 *-adapter.ts 都要登记」成立）。
     ['aggregate-adapter.ts', []],
     ['auto-adapter.ts', []],
-    ['minimax-adapter.ts', []],
   ]
 
   /**
@@ -515,7 +518,7 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     }
   })
 
-  it('豁免理由不是空的（防止为「凑齐 12」而加无名豁免）', () => {
+  it('豁免理由不是空的（防止为「凑齐」而加无名豁免）', () => {
     for (const [id, reason] of PROBE_EXEMPT) {
       expect(reason.length, `${id} 的豁免理由太短，写清「为什么拿不到探测材料」`).toBeGreaterThan(30)
     }
@@ -524,5 +527,61 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     // 这条数字断言的意义是「豁免表变动时必须回来复核本段是否仍成立」——
     // 若将来真要新加豁免，改这里的同时**必须**给出可复现的核对步骤。
     expect(PROBE_EXEMPT.size, '豁免表新增成员时必须复核本段的用例是否仍成立').toBe(0)
+  })
+
+  /**
+   * ★★ **`probeById.minimax` 的真实工厂产出**（issue IKJW32 审计补齐）。
+   *
+   * ## 为什么必须用**真实**适配器
+   *
+   * `tests/unit/account-probe-adapter.spec.ts` 用的是 `vi.mock` 的**桩**适配器：
+   * 它只记录 `{ product, credentialRef }`、`stream()` 直接抛错、**完全不读凭据** ——
+   * 于是「工厂把传入的凭据真的接到了请求上」这件事**零覆盖**：把
+   * `resolveCredential: async () => credential as MinimaxCredential` 删掉，
+   * 那两个文件**全绿**，而生产上 minimax 的「重测 / 重置」会恒返回
+   * `无法确认：minimax: no usable credential; log in first`、24h 标记永远清不掉。
+   *
+   * ## 同时锁住第二条不变量：探测**不写任何状态**
+   *
+   * 探测失败若写回 `modelRateLimits`，用户点一次「重测」就会把该账号该模型
+   * **封 24h**（quota）/ 1h（rate），而探测路径没有任何回滚 ⇒ 纯污染账号池
+   *（本家接上换号之前没有这个后果，是 IKJW32 才引入的风险面）。
+   */
+  it('★★ probeById.minimax 用真实适配器：凭据接通、且无池时不换号不写标记', async () => {
+    const { MINIMAX } = await import('../../src/minimax-product.js')
+    const calls: Array<{ url: string; auth: string | null }> = []
+    const originalFetch = globalThis.fetch
+    vi.stubGlobal('fetch', (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), auth: new Headers(init?.headers).get('Authorization') })
+      return new Response(
+        '{"type":"error","error":{"type":"insufficient_balance_error","message":"insufficient balance"}}',
+        { status: 402, headers: { 'content-type': 'application/json' } },
+      )
+    }) as typeof fetch)
+    try {
+      const credential = { access_token: 'tok-probe-minimax', token_type: 'Bearer' }
+      const adapter = probeById['minimax']!.createProbeAdapter(
+        'MINIMAX_ACCOUNT_TEST', credential as never,
+      )
+      // ⚠️ 读真实适配器实例的构造选项：桩适配器读不出这两个字段。
+      const options = (adapter as unknown as {
+        options: { accountPool?: unknown; fetchRemoteModels?: unknown }
+      }).options
+      expect(options.accountPool, '探测不得持有账号池（否则失败会写回限流标记）').toBeUndefined()
+      expect(options.fetchRemoteModels, '探测不得为一次存活检查额外拉远端目录').toBeUndefined()
+
+      const error = await adapter.stream({ model: 'MiniMax-M3', messages: [] } as never)
+        .next().then(() => null).catch((e: unknown) => e)
+
+      // ① 凭据真的接到了请求上（否则生产上「重测」恒报「未登录」）
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.auth).toBe('Bearer tok-probe-minimax')
+      expect(calls[0]?.url).toBe(`${MINIMAX.apiHost}/mavis/api/v1/llm/v1/messages`)
+      // ② 402 原样透出（探测靠它判「额度类失败」并决定是否保留标记）
+      expect(error).toMatchObject({ code: 'QUOTA_EXCEEDED' })
+    } finally {
+      globalThis.fetch = originalFetch
+      vi.unstubAllGlobals()
+    }
   })
 })

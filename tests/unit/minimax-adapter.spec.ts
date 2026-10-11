@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import {
   MinimaxAdapter,
+  classifyMinimaxFailure,
   minimaxReasoningInfo,
+  recordsMinimaxRateLimit,
   registerMinimaxLlm,
+  shouldRotateMinimaxAccount,
 } from '../../src/minimax-adapter.js'
-import { fallbackToEntry, type MinimaxModelEntry } from '../../src/minimax.js'
+import { fallbackToEntry, type MinimaxCredential, type MinimaxModelEntry } from '../../src/minimax.js'
 import { MINIMAX } from '../../src/minimax-product.js'
 
 const [M31, M3, HS, M27] = MINIMAX.fallbackModels.map(fallbackToEntry)
@@ -519,3 +522,634 @@ describe('MinimaxAdapter 目录缓存语义（★ 兜底表不进缓存）', () 
  * 留着会让「实现推理」这件事被测试判为回归。
  * 推理的回归用例见 `tests/unit/minimax-messages.spec.ts`。
  */
+
+// ===== 请求级账号轮换（issue IKJW32，2026-10-11）=====
+//
+// ## 背景（issue 原文的代码取证）
+//
+// 本适配器原先**全文件零命中** `updateModelRateLimit` / `getAvailableAccount`
+// —— 14 家里唯一没有换号与冷却的一家。失败处理只有「直接 throw LlmError」，
+// 于是首号额度耗尽就把硬失败抛给用户；`resolveCredential` 下次仍按池的手动
+// 顺序取回**同一个号**（池排序不因失败而变）⇒「卡死在一个号上」。
+// 用户环境实测：池里 4 个 minimax 账号中 3 个余额为 0。
+//
+// ## 语义表抄自 loomy / raccoon（见 `src/minimax-adapter.ts` 文件头）
+//
+// | 类别 | 判据 | 换号 | 写冷却 |
+// |---|---|---|---|
+// | `quota` | 402 / 额度文案 / `insufficient_balance_error` | ✅ | ✅ 24h |
+// | `rate` | 429 / `rate_limit_error` / `overloaded_error` | ✅ | ✅ 1h |
+// | `auth` | 401 / 403 / `authentication_error` | ✅ | ❌ **绝不写** |
+// | `other` | 其余 4xx（400 参数错等） | ❌ | ❌ |
+//
+// ⚠️ 认证类「只换号、绝不写标记」是 2026-10-06「全池被封 24h」事故换来的
+// 不变式，本 describe 有两条用例（全池 401 / 8 号全耗尽）专门锁它。
+describe('classifyMinimaxFailure 判据（状态码 / 自报类别 / 文案三通道）', () => {
+  it('★ 状态码通道：401/403 认证、402 额度、429 限流，且**状态码优先于文案**', () => {
+    expect(classifyMinimaxFailure('', 401)).toBe('auth')
+    expect(classifyMinimaxFailure('', 403)).toBe('auth')
+    expect(classifyMinimaxFailure('', 402)).toBe('quota')
+    expect(classifyMinimaxFailure('', 429)).toBe('rate')
+    // ⚠️ 实测 401 的体是 `{"code":401,"message":"auth failed"}`（自家信封，不是
+    //    Anthropic 形状）；网关故障常在报文里捎带余额提示 ⇒ **以状态码为准**。
+    expect(classifyMinimaxFailure('{"code":401,"message":"insufficient balance"}', 401)).toBe('auth')
+  })
+
+  it('★ 自报类别通道：Anthropic `error.type`（实测 400 的错误体就是这个形状）', () => {
+    expect(classifyMinimaxFailure(
+      '{"type":"error","error":{"type":"insufficient_balance_error","message":"x"}}', 0,
+    )).toBe('quota')
+    expect(classifyMinimaxFailure('{"error":{"type":"rate_limit_error"}}', 0)).toBe('rate')
+    expect(classifyMinimaxFailure('{"error":{"type":"overloaded_error"}}', 0)).toBe('rate')
+    expect(classifyMinimaxFailure('{"error":{"type":"authentication_error"}}', 0)).toBe('auth')
+    // ⚠️ 参数错（实测 `invalid_request_error … (2013)`）不是可换类别 —— 换号无益。
+    expect(classifyMinimaxFailure('{"error":{"type":"invalid_request_error","message":"… (2013)"}}', 0))
+      .toBe('other')
+  })
+
+  it('★★ 权限类文案归 auth，绝不因含 `insufficient` 被判额度（loomy / raccoon 的同款教训）', () => {
+    expect(classifyMinimaxFailure('insufficient permissions to access this resource', 400)).toBe('auth')
+    // ⚠️ 上下文窗口超长与「钱」无关 ⇒ other（误判会封可用账号 24h）
+    expect(classifyMinimaxFailure('the context window is insufficient for this model', 400))
+      .toBe('other')
+    // ⚠️ 顺序判别力：额度**文案**与权限文案**共现**时必须以权限为准（否则写 24h）。
+    expect(classifyMinimaxFailure('insufficient permissions; quota exceeded', 400)).toBe('auth')
+  })
+
+  it('★★ `insufficient` × `max_tokens` 不得判额度（否则每个轮换到的号各写 24h）', () => {
+    /**
+     * 真实形态（Anthropic Messages）：`max_tokens` / `input_tokens` /
+     * `budget_tokens` 是**一等字段名**，与「钱」毫无关系。
+     * 初版的钱义词表含裸 `token` ⇒ 这条 400 参数错会被判 `quota` ⇒ 整池封一天。
+     */
+    expect(classifyMinimaxFailure(
+      '{"error":{"type":"invalid_request_error","message":"insufficient max_tokens for the requested thinking budget"}}',
+      400,
+    )).toBe('other')
+    expect(classifyMinimaxFailure('insufficient input_tokens', 400)).toBe('other')
+    // ⚠️ 反过来，「token 配额不足」这种**真额度**措辞仍要判 quota（词边界匹配）。
+    expect(classifyMinimaxFailure('insufficient tokens remaining', 400)).toBe('quota')
+  })
+
+  it('★ 英文低余额文案（不含 `insufficient`）必须判 quota —— 否则换号静默失效', () => {
+    expect(classifyMinimaxFailure('Your credit balance is too low to access the API', 400)).toBe('quota')
+    expect(classifyMinimaxFailure('{"error":{"code":1004,"message":"balance not enough"}}', 0)).toBe('quota')
+    expect(classifyMinimaxFailure('out of credits', 400)).toBe('quota')
+  })
+
+  it('★★ 自家信封的 `code` 是确定性通道（实测 401 体就是自家信封，不是 Anthropic 形状）', () => {
+    // ⚠️ 这几个都是 status=0（200 + 流内错误 / 非 SSE 的 200），状态码通道全失效。
+    expect(classifyMinimaxFailure('minimax: 流内错误：balance not enough（code=402）', 0)).toBe('quota')
+    expect(classifyMinimaxFailure('{"code":402,"message":"balance not enough"}', 0)).toBe('quota')
+    expect(classifyMinimaxFailure('{"code":429,"message":"too many requests"}', 0)).toBe('rate')
+    // ⚠️ 无 message 文案、只有码：仍要能判 auth（文案腿单独锁一条，见下）。
+    expect(classifyMinimaxFailure('{"code":401}', 0)).toBe('auth')
+    expect(classifyMinimaxFailure('{"code":401,"message":"auth failed"}', 0)).toBe('auth')
+    // ⚠️ 只认这四个码，其余码不猜。
+    expect(classifyMinimaxFailure('{"code":1004,"message":"something else"}', 0)).toBe('other')
+    /**
+     * ⚠️ `auth failed` 是一条**纯文案腿**（报文既无码、也无 auth 类 `error.type`）——
+     * 它此前**零覆盖**：删掉它没有任何用例变红（变异验证实测）。
+     * 真实价值：401 报文**不带 `code` 字段**时它是唯一的 auth 线索。
+     */
+    expect(classifyMinimaxFailure('{"type":"error","error":{"message":"auth failed"}}', 0)).toBe('auth')
+  })
+
+  it('★ 5xx 只信确定性通道：服务端故障携带额度文案时**不得**写 24h', () => {
+    expect(classifyMinimaxFailure('insufficient balance', 500)).toBe('other')
+    expect(classifyMinimaxFailure('{"code":402,"message":"insufficient balance"}', 500)).toBe('quota')
+    // ⚠️ `overloaded_error` 走自报类别通道 ⇒ rate（1h），不受 5xx 判据影响。
+    expect(classifyMinimaxFailure('{"error":{"type":"overloaded_error"}}', 529)).toBe('rate')
+  })
+
+  it('★ 文案通道：中英文额度与限流措辞（裸 `rate limit` 不再判 rate）', () => {
+    expect(classifyMinimaxFailure('余额不足，请充值', 400)).toBe('quota')
+    expect(classifyMinimaxFailure('积分耗尽', 400)).toBe('quota')
+    expect(classifyMinimaxFailure('insufficient quota', 400)).toBe('quota')
+    expect(classifyMinimaxFailure('Too many requests', 400)).toBe('rate')
+    /**
+     * ⚠️ 实测形态：`400 + invalid_request_error: rate limit field invalid`
+     * —— 它是**字段名**不是限流。裸 `rate limit` 判 rate 会白写 1h 冷却
+     *（方向与「宁可漏判不可误伤」相反）。
+     */
+    expect(classifyMinimaxFailure(
+      '{"error":{"type":"invalid_request_error","message":"rate limit field invalid"}}', 400,
+    )).toBe('other')
+  })
+
+  it('★ 只有 quota / rate 写冷却；auth 与 other 都不写', () => {
+    expect(recordsMinimaxRateLimit('quota')).toBe(true)
+    expect(recordsMinimaxRateLimit('rate')).toBe(true)
+    expect(recordsMinimaxRateLimit('auth')).toBe(false)
+    expect(recordsMinimaxRateLimit('other')).toBe(false)
+    // ⚠️ 入参是**已判定的类别**（不是原文 + 状态码）：同一个判据只能有一处实现。
+    expect(shouldRotateMinimaxAccount('auth')).toBe(true)
+    expect(shouldRotateMinimaxAccount('quota')).toBe(true)
+    expect(shouldRotateMinimaxAccount('rate')).toBe(true)
+    expect(shouldRotateMinimaxAccount('other')).toBe(false)
+  })
+})
+
+describe('MinimaxAdapter 请求级账号轮换（余额耗尽无感切号）', () => {
+  const CRED_A: MinimaxCredential = { access_token: 'tok-A', token_type: 'Bearer' }
+  const CRED_B: MinimaxCredential = { access_token: 'tok-B', token_type: 'Bearer' }
+
+  interface StubAccount {
+    id: string
+    cred: MinimaxCredential
+  }
+
+  function makePoolStub(accounts: StubAccount[] = [
+    { id: 'minimax-A', cred: CRED_A },
+    { id: 'minimax-B', cred: CRED_B },
+  ]) {
+    const marks: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    const picks: Array<{ model: string; exclude: ReadonlySet<string> | undefined }> = []
+    const pool = {
+      updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+        marks.push({ accountId, modelId, resetAtMs })
+      },
+      getAvailableAccount: async (_provider: string, model: string, exclude?: ReadonlySet<string>) => {
+        // ⚠️ **存快照**而不是活引用：`tried` 在循环里持续增长，存引用时断言读到的
+        // 是「全部结束后」的集合，证明不了**调用当时**排除了谁。
+        picks.push({ model, exclude: exclude === undefined ? undefined : new Set(exclude) })
+        for (const account of accounts) {
+          if (exclude?.has(account.id) === true) continue
+          return { entry: { id: account.id }, credential: account.cred }
+        }
+        return null
+      },
+      findAccountIdByCredential: async (_provider: string, identity: string) =>
+        accounts.find((account) => account.cred.access_token === identity)?.id ?? '',
+    }
+    return { pool, marks, picks }
+  }
+
+  const sseOk = (): Response => new Response([
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+    '',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"从二号账号返回"}}',
+    '',
+    'data: {"type":"content_block_stop","index":0}',
+    '',
+  ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+
+  /** 402 + Anthropic 额度错误体（`insufficient_balance_error`）。 */
+  const quotaResponse = (who: string): Response => new Response(
+    JSON.stringify({
+      type: 'error',
+      error: { type: 'insufficient_balance_error', message: `insufficient balance (${who})` },
+    }),
+    { status: 402 },
+  )
+
+  /**
+   * HTTP **200** + 流内错误帧（MiniMax 系「200 + 业务码」的既有习惯）。
+   *
+   * ⚠️ `message` 用 `request rejected` —— 它**不含**任何额度/限流措辞，也**不是**
+   * `MINIMAX_QUOTA_PHRASES` 里的短语：于是只有 `error.type`
+   *（`insufficient_balance_error`）这一条通道能把它判成 `quota`。
+   * 这样就同时锁住两件事：① `minimax-messages.ts` 必须把 `error.type` 带进文案；
+   * ② 适配器的自报类别通道真的接上了。
+   *（早先这里用 `balance not enough`，在加了英文短语通道之后**失去判别力** ——
+   *  变异验证实测：把 `kind` 置空后该用例仍绿。）
+   */
+  const sseQuotaError = (): Response => new Response([
+    'event: error',
+    'data: {"type":"error","error":{"type":"insufficient_balance_error","message":"request rejected"}}',
+    '',
+  ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+
+  /** HTTP 200 + **自家信封**流内错误（只有业务码，没有任何文案线索）。 */
+  const sseEnvelopeQuota = (): Response => new Response([
+    'event: error',
+    'data: {"code":402,"message":"request rejected"}',
+    '',
+  ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+
+  function makeRotateAdapter(options: {
+    resolveCredential: () => Promise<MinimaxCredential | undefined>
+    accountPool?: unknown
+    refresh?: () => Promise<void>
+  }): MinimaxAdapter {
+    return new MinimaxAdapter({
+      credentialRef: 'MINIMAX_ACCESS_TOKEN' as never,
+      resolveCredential: options.resolveCredential,
+      refresh: options.refresh ?? (async () => {}),
+      fetchRemoteModels: async () => [M31, M3, HS, M27],
+      ...options.accountPool === undefined ? {} : { accountPool: options.accountPool as never },
+      product: MINIMAX,
+    })
+  }
+
+  /** 临时替换全局 fetch（本适配器**没有** `fetchImpl` 选项，与既有用例同款）。 */
+  async function withFetch<T>(impl: typeof fetch, body: () => Promise<T>): Promise<T> {
+    const original = globalThis.fetch
+    globalThis.fetch = impl
+    try {
+      return await body()
+    } finally {
+      globalThis.fetch = original
+    }
+  }
+
+  const request = { model: 'MiniMax-M3', messages: [] }
+
+  /** 收集全部 chunk；抛错时返回错误对象（用例自行断言）。 */
+  async function collect(adapter: MinimaxAdapter): Promise<{ chunks: unknown[]; error: unknown }> {
+    const chunks: unknown[] = []
+    try {
+      for await (const chunk of adapter.stream(request as never)) chunks.push(chunk)
+      return { chunks, error: null }
+    } catch (error) {
+      return { chunks, error }
+    }
+  }
+
+  const textDelta = (chunks: unknown[]): boolean =>
+    chunks.some((chunk) => (chunk as { type?: string }).type === 'text-delta')
+
+  it('★ 一号额度耗尽（402 insufficient_balance_error）→ 标记该模型 + 切二号重发成功', async () => {
+    const { pool, marks, picks } = makePoolStub()
+    const seenAuth: string[] = []
+    let call = 0
+    const fetcher = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      call += 1
+      seenAuth.push(String(new Headers(init?.headers).get('Authorization') ?? ''))
+      return call === 1 ? quotaResponse('A') : sseOk()
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { chunks } = await withFetch(fetcher, () => collect(adapter))
+
+    // ⚠️ 判别力在**第二发的 Authorization**：换号若不生效会是 tok-A。
+    expect(seenAuth[0]).toContain('tok-A')
+    expect(seenAuth[1]).toContain('tok-B')
+    expect(textDelta(chunks)).toBe(true)
+    expect(marks).toHaveLength(1)
+    expect(marks[0]?.accountId).toBe('minimax-A')
+    // ⚠️ 限流是**按模型**记的：modelId 传空串会让池的模型级过滤失效。
+    expect(marks[0]?.modelId).toBe('MiniMax-M3')
+    expect(picks[0]?.model).toBe('MiniMax-M3')
+    expect(picks[0]?.exclude?.has('minimax-A')).toBe(true)
+    // 额度类是 24h 档（不是 1h、更不是「现在」）
+    expect((marks[0]?.resetAtMs ?? 0) - Date.now()).toBeGreaterThan(23 * 3_600_000)
+  })
+
+  it('★ 两号都耗尽 → 报「所有账号均不可用」并带**最后一次**的真实原因', async () => {
+    const { pool, marks } = makePoolStub()
+    const fetcher = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const auth = String(new Headers(init?.headers).get('Authorization') ?? '')
+      return quotaResponse(auth.includes('tok-B') ? 'B-真实原因' : 'A')
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { error } = await withFetch(fetcher, () => collect(adapter))
+
+    expect((error as Error).message).toContain('所有账号')
+    // ⚠️ 笼统的「均不可用」会丢掉服务端真正说的东西（buddy 的同款教训）
+    expect((error as Error).message).toContain('B-真实原因')
+    expect(error).toMatchObject({ code: 'QUOTA_EXCEEDED' })
+    expect(marks.map((mark) => mark.accountId)).toEqual(['minimax-A', 'minimax-B'])
+  })
+
+  it('非额度类 4xx（400 参数错）不换号，按原错误抛出', async () => {
+    const { pool, picks } = makePoolStub()
+    const fetcher = (async () => new Response(
+      '{"type":"error","error":{"type":"invalid_request_error","message":"param is invalid (2013)"}}',
+      { status: 400 },
+    )) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { error } = await withFetch(fetcher, () => collect(adapter))
+
+    expect((error as Error).message).toContain('2013')
+    expect(error).toMatchObject({ code: 'INVALID_REQUEST' })
+    // 换号一次都没发生（`findAccountIdByCredential` 是记账键反查，不进 picks）。
+    expect(picks).toHaveLength(0)
+  })
+
+  it('★ 401 授权失败：先续期一次、再换号，且**绝不写冷却标记**', async () => {
+    const { pool, marks, picks } = makePoolStub()
+    let refreshCalls = 0
+    const seenAuth: string[] = []
+    const fetcher = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const auth = String(new Headers(init?.headers).get('Authorization') ?? '')
+      seenAuth.push(auth)
+      // A 恒 401（网关侧授权故障），B 正常
+      return auth.includes('tok-A')
+        ? new Response('{"code":401,"message":"auth failed"}', { status: 401 })
+        : sseOk()
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({
+      resolveCredential: async () => CRED_A,
+      accountPool: pool,
+      refresh: async () => { refreshCalls += 1 },
+    })
+    const { chunks } = await withFetch(fetcher, () => collect(adapter))
+
+    expect(refreshCalls).toBe(1)
+    // A(401) → 续期一次后仍拿 A 重发(401) → 换到 B
+    expect(seenAuth.map((auth) => auth.includes('tok-B'))).toEqual([false, false, true])
+    expect(textDelta(chunks)).toBe(true)
+    // ⚠️⚠️ 认证类**绝不写标记**：写了会把网关侧的授权故障放大成「全池封 24h」。
+    expect(marks).toHaveLength(0)
+    expect(picks[0]?.exclude?.has('minimax-A')).toBe(true)
+  })
+
+  it('★★ 401 打遍全池：不留任何标记（池保持可用）', async () => {
+    const { pool, marks, picks } = makePoolStub()
+    const fetcher = (async () =>
+      new Response('{"code":401,"message":"auth failed"}', { status: 401 })) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { error } = await withFetch(fetcher, () => collect(adapter))
+
+    expect((error as Error).message).toContain('所有账号')
+    expect(error).toMatchObject({ code: 'AUTH' })
+    expect(marks).toHaveLength(0)
+    // A →（续期后仍是 A）→ B →（池已无候选）。⚠️ 第二次取号返回 null 也要算一次
+    // 「问过池」——断言长度 2 才能同时锁住「B 被真的试过」与「不会拿回同一个号」。
+    expect(picks).toHaveLength(2)
+    expect(picks[0]?.exclude?.has('minimax-A')).toBe(true)
+    expect(picks[1]?.exclude?.has('minimax-A')).toBe(true)
+    expect(picks[1]?.exclude?.has('minimax-B')).toBe(true)
+  })
+
+  it('★★ 8 账号全耗尽（轮换预算恰好用尽）→ 8 个号全部被标记，末号不漏', async () => {
+    const accounts: StubAccount[] = Array.from({ length: 8 }, (_, index) => ({
+      id: `minimax-${index + 1}`,
+      cred: { access_token: `tok-${index + 1}`, token_type: 'Bearer' },
+    }))
+    const { pool, marks } = makePoolStub(accounts)
+    const fetcher = (async () => quotaResponse('all')) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => accounts[0]!.cred, accountPool: pool })
+    const { error } = await withFetch(fetcher, () => collect(adapter))
+
+    expect((error as Error).message).toContain('所有账号')
+    // ⚠️ 记账必须**每次失败后立刻**做：挪到循环开头会让末号永远漏记，
+    //    下次请求又选中它 —— 正是本 issue 要修的「卡死在一个号上」。
+    expect(marks.map((mark) => mark.accountId)).toEqual(accounts.map((account) => account.id))
+  })
+
+  it('★★ 401 续期后凭据换成了另一个账号 → 冷却标记记在**真正耗尽的那个号**上', async () => {
+    const { pool, marks } = makePoolStub()
+    let resolveCalls = 0
+    // 复刻生产语义：首次取号 = A；`refresh()`（`src/index.ts`）续的是池内**第一个
+    // 可用账号**，续期后 `resolveCredential` 可能返回**另一个账号** B 的凭据。
+    const resolveCredential = async (): Promise<MinimaxCredential> => {
+      resolveCalls += 1
+      return resolveCalls === 1 ? CRED_A : CRED_B
+    }
+    let sent = 0
+    const fetcher = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      sent += 1
+      if (sent === 1) return new Response('{"code":401,"message":"auth failed"}', { status: 401 })
+      const auth = String(new Headers(init?.headers).get('Authorization') ?? '')
+      return quotaResponse(auth.includes('tok-B') ? 'B' : 'A')
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential, accountPool: pool })
+    await withFetch(fetcher, () => collect(adapter))
+
+    // ⚠️ 若不重新反查账号 id，第一条标记会落在「只是授权失败」的 A 上，
+    //    而真正额度耗尽的 B 逍遥法外（loomy / raccoon 的 `51ded6a` 同款缺陷）。
+    expect(marks[0]?.accountId).toBe('minimax-B')
+  })
+
+  it('★ HTTP 200 + 流内额度错误帧（零输出）同样换号（MiniMax 系「200 + 业务码」习惯）', async () => {
+    const { pool, marks } = makePoolStub()
+    let call = 0
+    const fetcher = (async () => {
+      call += 1
+      return call === 1 ? sseQuotaError() : sseOk()
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { chunks } = await withFetch(fetcher, () => collect(adapter))
+
+    expect(call).toBe(2)
+    expect(textDelta(chunks)).toBe(true)
+    expect(marks).toHaveLength(1)
+    expect(marks[0]?.accountId).toBe('minimax-A')
+  })
+
+  it('★ 已产出内容后的流内错误**不换号重发**（否则用户看到重复内容）', async () => {
+    const { pool, picks } = makePoolStub()
+    let call = 0
+    const fetcher = (async () => {
+      call += 1
+      return new Response([
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        '',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"前半段"}}',
+        '',
+        'event: error',
+        'data: {"type":"error","error":{"type":"insufficient_balance_error","message":"insufficient balance"}}',
+        '',
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { chunks, error } = await withFetch(fetcher, () => collect(adapter))
+
+    expect(call).toBe(1)               // 不重发
+    expect(picks).toHaveLength(0)      // 不换号
+    expect(textDelta(chunks)).toBe(true)  // 已产出的内容照常交给 harness
+    expect((error as Error).message).toContain('流内错误')
+  })
+
+  it('★★ 已产出内容后失败**仍要记账**（否则该号永不被冷却，下次又选中它）', async () => {
+    const { pool, marks, picks } = makePoolStub()
+    const fetcher = (async () => new Response([
+      // ⚠️ 只有 `content_block_start`（没有任何 text-delta）：`yieldedAny` 仍是真，
+      //    故不能重发 —— 但该账号已明确额度耗尽，**必须**写冷却。
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      '',
+      'event: error',
+      'data: {"type":"error","error":{"type":"insufficient_balance_error","message":"insufficient balance"}}',
+      '',
+    ].join('\n'), { status: 200, headers: { 'content-type': 'text/event-stream' } })) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { error } = await withFetch(fetcher, () => collect(adapter))
+
+    expect((error as Error).message).toContain('流内错误')
+    expect(picks).toHaveLength(0)      // 不换号（不能重发）
+    expect(marks).toHaveLength(1)      // ←★ 但冷却必须写上
+    expect(marks[0]?.accountId).toBe('minimax-A')
+    expect(marks[0]?.modelId).toBe('MiniMax-M3')
+  })
+
+  it('★★ 429 走 **1 小时**档（rate），不是 24 小时档（quota）', async () => {
+    // ⚠️ 语义表里 `rate` 与 `quota` 的冷却时长不同，但此前的行为用例**只跑过 402**
+    //    ⇒ 把 rate 分支的常量换成 quota 的（429 也记 24h）不会有任何用例变红。
+    const { pool, marks, picks } = makePoolStub()
+    let call = 0
+    const fetcher = (async () => {
+      call += 1
+      return call === 1
+        ? new Response('{"type":"error","error":{"type":"rate_limit_error","message":"too many requests"}}', {
+            status: 429,
+            headers: { 'content-type': 'application/json' },
+          })
+        : sseOk()
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { chunks } = await withFetch(fetcher, () => collect(adapter))
+
+    expect(call).toBe(2)
+    expect(textDelta(chunks)).toBe(true)
+    expect(marks).toHaveLength(1)
+    expect(marks[0]?.accountId).toBe('minimax-A')
+    const remaining = (marks[0]?.resetAtMs ?? 0) - Date.now()
+    expect(remaining).toBeGreaterThan(50 * 60_000)      // ≈1h
+    expect(remaining).toBeLessThan(2 * 3_600_000)
+    expect(picks[0]?.exclude?.has('minimax-A')).toBe(true)
+  })
+
+  it('★★ 池内第 2 个号凭据损坏（`{}`）时**不掐断轮换**，仍能轮到第 3 个号', async () => {
+    /**
+     * ⚠️ `AccountPool.getAvailableAccount` 对凭据只做裸 `JSON.parse`、**零形状校验**
+     *（该文件把「手工编辑过的备份」列为可达输入）。初版写
+     * `nextCredential.access_token.length` + `break` ⇒ 抛 `TypeError`（非 LlmError）
+     * 并**放弃整池**，后面的好号永远轮不到。⇒ 坏号跳过（`continue`）。
+     */
+    const broken = { access_token: undefined } as unknown as MinimaxCredential
+    const accounts: StubAccount[] = [
+      { id: 'minimax-A', cred: CRED_A },
+      { id: 'minimax-BROKEN', cred: broken },
+      { id: 'minimax-C', cred: { access_token: 'tok-C', token_type: 'Bearer' } as MinimaxCredential },
+    ]
+    const { pool, marks } = makePoolStub(accounts)
+    const seenAuth: string[] = []
+    let call = 0
+    const fetcher = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      call += 1
+      seenAuth.push(String(new Headers(init?.headers).get('Authorization') ?? ''))
+      return call === 1 ? quotaResponse('A') : sseOk()
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { chunks, error } = await withFetch(fetcher, () => collect(adapter))
+
+    expect(error).toBeNull()                            // 不再抛 TypeError
+    expect(seenAuth[1]).toContain('tok-C')              // 坏号被跳过，直接轮到 C
+    expect(textDelta(chunks)).toBe(true)
+    expect(marks.map((mark) => mark.accountId)).toEqual(['minimax-A'])
+  })
+
+  it('★ HTTP 200 + `application/json` 自家信封（额度）同样换号（不是「未返回任何内容块」）', async () => {
+    /**
+     * ⚠️ MiniMax 系有「HTTP 200 + 业务码」的既有习惯（签到 / `timezone_id` 都是 200）。
+     * 这种响应**一个 SSE 帧都没有**，若只交给 `consumeMinimaxSse`，只会得到
+     * 「模型未返回任何内容块」⇒ 额度信息整段丢失 ⇒ 判 other ⇒ 不换号。
+     */
+    const { pool, marks } = makePoolStub()
+    let call = 0
+    const fetcher = (async () => {
+      call += 1
+      return call === 1
+        ? new Response('{"code":402,"message":"balance not enough"}', {
+            status: 200,
+            headers: { 'content-type': 'application/json; charset=utf-8' },
+          })
+        : sseOk()
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { chunks } = await withFetch(fetcher, () => collect(adapter))
+
+    expect(call).toBe(2)
+    expect(textDelta(chunks)).toBe(true)
+    expect(marks).toHaveLength(1)
+    expect(marks[0]?.accountId).toBe('minimax-A')
+  })
+
+  it('★ content-type 缺失但实为 SSE 的 200 不得被当成错误体（否则正常回答整轮失败）', async () => {
+    const { pool } = makePoolStub()
+    const fetcher = (async () => new Response([
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      '',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"正常回答"}}',
+      '',
+    // ⚠️ 刻意**不带** content-type：`new Response(string)` 会给出 `text/plain`，
+    //    网关也可能这么转发。判据必须只认「明确非流式」（json / html）。
+    ].join('\n'), { status: 200 })) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { chunks, error } = await withFetch(fetcher, () => collect(adapter))
+
+    expect(error).toBeNull()
+    expect(textDelta(chunks)).toBe(true)
+  })
+
+  it('★ 401 报文**无任何可判线索**时仍判 auth（锁住状态码腿，不靠文案/码腿）', async () => {
+    /**
+     * ⚠️ 报文刻意是 `{}`：**没有** auth 文案、**没有** `code` 字段
+     *（早先这里用 `{"code":401}` —— 那会被**自家信封码腿**判 auth，
+     * 于是删掉状态码腿它照样绿，用例名不副实；变异验证实测出来了）。
+     */
+    const { pool, marks, picks } = makePoolStub()
+    const seenAuth: string[] = []
+    const fetcher = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const auth = String(new Headers(init?.headers).get('Authorization') ?? '')
+      seenAuth.push(auth)
+      return auth.includes('tok-A')
+        ? new Response('{}', { status: 401, headers: { 'content-type': 'application/json' } })
+        : sseOk()
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { chunks } = await withFetch(fetcher, () => collect(adapter))
+
+    // A(401) → 续期后仍拿 A 重发(401) → 换到 B
+    expect(seenAuth.map((auth) => auth.includes('tok-B'))).toEqual([false, false, true])
+    expect(textDelta(chunks)).toBe(true)
+    expect(marks).toHaveLength(0)      // ⚠️ 认证类绝不写冷却
+    expect(picks[0]?.exclude?.has('minimax-A')).toBe(true)
+  })
+
+  it('★ SSE 自家信封（只有 `code`，无文案线索）同样换号', async () => {
+    // ⚠️ 锁的是 `minimax-messages.ts` 真的把 `code=` 带进了错误文案：
+    //    置空后这条帧只剩「未知错误」⇒ 判 other ⇒ 不换号。
+    const { pool, marks } = makePoolStub()
+    let call = 0
+    const fetcher = (async () => {
+      call += 1
+      return call === 1 ? sseEnvelopeQuota() : sseOk()
+    }) as typeof fetch
+
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A, accountPool: pool })
+    const { chunks } = await withFetch(fetcher, () => collect(adapter))
+
+    expect(call).toBe(2)
+    expect(textDelta(chunks)).toBe(true)
+    expect(marks).toHaveLength(1)
+    expect(marks[0]?.accountId).toBe('minimax-A')
+  })
+
+  it('★ 200 + `application/json` 且不可换号时：错误形状是「非 SSE 响应」而不是「未返回任何内容块」', async () => {
+    /**
+     * ⚠️ 锁 `isDefinitelyNotSse` 的**正腿**（json / html）：把它改成 `return false`
+     * 后，JSON 体会被当 SSE 消费、零帧，错误退化成 `consumeMinimaxSse` 的
+     * 「模型未返回任何内容块」—— 换号结果碰巧相同（原文样本兜住了分类），
+     * 但**用户看到的错误形状与错误码变了**，此前无人锁。
+     */
+    const fetcher = (async () => new Response('{"code":402,"message":"request rejected"}', {
+      status: 200,
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+    })) as typeof fetch
+
+    // ⚠️ 不给账号池 ⇒ 不换号，直接抛。
+    const adapter = makeRotateAdapter({ resolveCredential: async () => CRED_A })
+    const { error } = await withFetch(fetcher, () => collect(adapter))
+
+    expect((error as Error).message).toContain('非 SSE 响应')
+    expect((error as Error).message).toContain('request rejected')
+    expect(error).toMatchObject({ code: 'SERVER' })
+  })
+})

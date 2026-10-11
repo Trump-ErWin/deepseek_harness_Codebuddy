@@ -322,8 +322,16 @@ export interface ProviderRuntime {
    * ⇒ 本域抽象的是「**按 provider 找到那个工厂**」，
    * **不是**「统一怎么造适配器」（设计文档 §3.5 的边界：抽象编排，不抽象协议）。
    *
-   * ⚠️ **未注册的 provider 不会重测**：这不是缺陷，而是**行为收紧** ——
-   * 客户端能力表 `accountTest` 目前**只有 `gemini`**，其余渠道根本没有入口。
+   * ⚠️ **未注册的 provider 会抛可读错误**（见 `account-probe.ts` 的
+   * `adapterForProbe`），**不落回** `CodeArtsAdapter`。
+   *
+   * ⚠️ **不要用 `accountTest` 论证「没有入口」**：本段原话是「客户端能力表
+   * `accountTest` 目前**只有 `gemini`**，其余渠道根本没有入口」——**该推论是错的**。
+   * 重测 / 重置按钮由 `supportsRateLimit` 门控（缺省 **true**），只有登记了
+   * `rateLimit: false` 的家（loomy / gemini）才真的没有入口 ⇒ **漏登记的家会
+   * 渲染按钮、用户一点就报错**（`opencode` 与 `minimax` 都踩过；后者是
+   * issue IKJW32 接上换号后才补上的）。⇒ 本域的注册**是用户可见功能**，
+   * 不是「将来才复发」的内部契约。
    */
   readonly probe?: {
     /**

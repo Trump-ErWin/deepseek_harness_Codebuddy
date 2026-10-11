@@ -264,12 +264,16 @@ async function probeWithAdapter(
   //   loomy **加入注册**（同段旧文的末尾也这么写了，两半自相矛盾）。
   //   真相是：loomy 的**积分耗尽**确实静默降级不写标记，但它的**其它**限流类失败
   //   会写 —— 判据要看「有没有写点」，不是「某一种失败写不写」。
-  // - 旧文说「反例：minimax 与 opencode **不写**标记」—— 对 minimax 成立，
-  //   对 **`opencode` 证伪**（`opencode-adapter.ts` 3 处 `markLimited`）。
-  //   opencode 曾因此不在 `index.ts` 的 probe 表里，理由是「探测材料拿不到」——
+  // - 旧文说「反例：minimax 与 opencode **不写**标记」—— 对 **`opencode` 证伪**
+  //   （`opencode-adapter.ts` 3 处 `markLimited`）。opencode 曾因此不在
+  //   `index.ts` 的 probe 表里，理由是「探测材料拿不到」——
   //   ⚠️ **那个理由 2026-10-08 第二轮已实测证伪并补齐**（见 `index.ts` 的
-  //   `probeById.opencode` 条目）：真正缺的只是「把 `entry` 交给工厂」，
-  //   现在本链**13 家全在**，`PROBE_EXEMPT` 已清空。
+  //   `probeById.opencode` 条目）：真正缺的只是「把 `entry` 交给工厂」。
+  //   ⚠️ **对 `minimax` 的那半也已在 2026-10-11 证伪**（issue IKJW32）：它原先
+  //   确实零写点，接上请求级换号 + 冷却后会写 `modelRateLimits`（额度 24h /
+  //   限流 1h）⇒ 必须进 `probeById`。**这条旧文两次都被证明是「当时的快照」**，
+  //   正是「清单靠记忆维护」必漏的又一个实例：判据只能是「现在有没有写点」。
+  //   现在本链**14 家全在**，`PROBE_EXEMPT` 仍为空表。
   // ⚠️ **2026-10-08 Task 8：本链已改为查能力注册表**（原为 `else if` 链 + `else` 兜底）。
   //
   // 原实现的 `else` 会把**未登记的 provider** 交给「**华为云 HMAC 签名**的
