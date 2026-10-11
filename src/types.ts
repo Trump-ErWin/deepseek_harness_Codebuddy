@@ -1667,16 +1667,6 @@ export interface RpcUsageBadgeResponse {
    * ⇒ 倍率只能显示在胶囊里（那里才有「实际用了谁」）。
    */
   autoPrice?: number
-  /**
-   * 读数失败的可行动原因（已由宿主翻译成人话）。
-   *
-   * ⚠️ 存在的理由：真实故障（2026-10-02）里宿主跑的是旧代码、页面却拿到了新 bundle，
-   * 弹窗里赫然写着裸的 `unknown method: usage.badgePreference` —— 用户完全不知道
-   * 该做什么。有了它，客户端才能把「宿主进程没重启」这类故障讲清楚。
-   *
-   * ⚠️ 与 `autoActual` 同时被上游 `ba10f4f` 删除，一并补回。
-   */
-  readError?: string
 }
 
 /**

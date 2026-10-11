@@ -116,7 +116,7 @@ describe('AggregateAdapter：目录播报', () => {
     }), { accountPool: makePool() })
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
-    expect(entry!.name).toBe('DeepSeek V4.1 Flash · x0.15')
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · 最低 x0.15')
   })
 
   it('★ 多个候选时取**最便宜**的那个倍率（轮换的第二判据就是倍率升序）', async () => {
@@ -127,7 +127,7 @@ describe('AggregateAdapter：目录播报', () => {
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
     // 最便宜的是 codearts 的 x0.03 —— 那才是最可能被路由到的那个价。
-    expect(entry!.name).toBe('DeepSeek V4.1 Flash · x0.03')
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · 最低 x0.03')
   })
 
   it('★ 全部候选都无倍率标注 ⇒ 不加后缀（不得渲染出 xInfinity）', async () => {
@@ -148,11 +148,36 @@ describe('AggregateAdapter：目录播报', () => {
     }), { accountPool: makePool() })
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
-    expect(entry!.name).toBe('DeepSeek V4.1 Flash · 免费')
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · 最低 免费')
   })
 
-  it('★ 倍率只加在选择器路径上：resolveModel 仍是规范名（三处既有断言钉住）', async () => {
-    // ⚠️ `resolveModel` / `describeCatalog` 的名字被逐字钉住（本文件 :88、
+  it('★★ 跨临期档：显示的倍率不得声称「本次就用这个价」（真实缺陷，复审实测）', async () => {
+    // ⚠️ 这条是本组唯一覆盖**跨临期档**的用例，而缺陷恰恰只在跨档时出现
+    //    （其余用例的候选都在同一档，故取全局最小 === 取该档最小，二者无差别
+    //    ⇒ 对缺陷免疫，属覆盖缺口而非假用例）。
+    //
+    // 缺陷机制：`rankCandidates` 的第一判据是**临期升序**，倍率只在**同档内**才
+    // 起作用。初版 `pickerNameOf` 取全局最小 price 并直接拼 `· x0.03`，于是：
+    //   候选 buddy x0.29（临期最早）/ codearts x0.03（临期晚）
+    //   ⇒ 选择器显示 x0.03，实际发往 buddy（x0.29）。
+    // 用户据此以为「聚合会挑便宜的」，而实际挑的是最贵的 —— 与原报障的诉求相反。
+    //
+    // 修法是**如实表达下界**：`最低 x…` 只声称「该虚拟模型下最便宜的可路由候选」，
+    // 不声称本次会用它。（无法按「临期最早那档」取真实价：`CandidateEntry` 不含
+    // `expiry`，而本方法契约要求**同步**、不能在选择器渲染路径上打网络。）
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.29' }],
+      codearts: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.03' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    expect(entry, '虚拟模型必须存在').toBeDefined()
+    // ⛔ 修前这里是 `· x0.03`（读起来像「本次就用 0.03」，而实际可能发往 x0.29）。
+    expect(entry!.name, '必须标明这是下界，不能声称本次就用它').toBe('DeepSeek V4.1 Flash · 最低 x0.03')
+    expect(entry!.name, '「最低」二字不可省').toContain('最低')
+  })
+
+  it('★ 倍率只加在选择器路径上：resolveModel 仍是规范名（三处既有断言钉住）', async () => {    // ⚠️ `resolveModel` / `describeCatalog` 的名字被逐字钉住（本文件 :88、
     //    aggregate-rejections.spec.ts:251、aggregate-catalog.spec.ts:21），
     //    且 `describeCatalog` 的候选子列表**逐条**显示倍率 —— 模型名上再叠一次
     //    会出现「两个倍率」的重复展示。
@@ -182,7 +207,7 @@ describe('AggregateAdapter：目录播报', () => {
     const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
     // 前置断言：模型确实在（否则下面那条断言会因 undefined 而**假通过**的变体）。
     expect(entry, '虚拟模型必须存在（buddy 是已接入候选）').toBeDefined()
-    expect(entry!.name).toBe('DeepSeek V4.1 Flash · x0.15')
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · 最低 x0.15')
   })
 
   it('被用户关闭的虚拟模型不播报（套 disabledModelsFor 黑名单）', async () => {

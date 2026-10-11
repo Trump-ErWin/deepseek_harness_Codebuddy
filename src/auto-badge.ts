@@ -92,10 +92,8 @@ export async function resolveAutoBadgeRewrite(
         viaImageFallback: decided.viaImageFallback,
       },
       // ⚠️ `Infinity`（只有长期积分）会被 JSON 序列化成 `null`，客户端按
-      //    `typeof === 'number'` 判空 ⇒ 只有有限时刻才回传。
-      ...(typeof decided.expiryAt === 'number' && Number.isFinite(decided.expiryAt)
-        ? { autoExpiryAt: decided.expiryAt }
-        : {}),
+      //    `typeof === 'number'` 判空 ⇒ 只有有限且非哨兵的时刻才回传。
+      ...usableExpiry(decided.expiryAt),
       ...finitePrice(autoState.priceOf(decided.provider, decided.model)),
     }
   }
@@ -116,9 +114,9 @@ export async function resolveAutoBadgeRewrite(
     autoActual: { provider: picked.provider, model: picked.model, viaImageFallback: false },
     // ⚠️ 预测路径的失效时刻来自 `selectProvider` 顺带写入的 `lastWinnerExpiryAt`
     //（零额外请求，见 `auto-adapter.ts` 的 `selectProvider`）。
-    ...(typeof autoState.lastWinnerExpiryAt === 'number' && Number.isFinite(autoState.lastWinnerExpiryAt)
-      ? { autoExpiryAt: autoState.lastWinnerExpiryAt }
-      : {}),
+    // ⚠️ 该字段在适配器侧必须是**活值（getter）**：消费方是「先 selectProvider、
+    //    再读它」，值快照会恒读到 `undefined`（真实缺陷，复审实测）。
+    ...usableExpiry(autoState.lastWinnerExpiryAt),
     // 预测路径同样能拿到倍率：`selectProvider` 内部就是经 `firstModelOf` 取模型的，
     // 那一轮目录循环已把倍率记进表里。
     ...finitePrice(autoState.priceOf(picked.provider, picked.model)),
@@ -126,10 +124,45 @@ export async function resolveAutoBadgeRewrite(
 }
 
 /**
+ * `aggregate-core.ts` 的 `UNUSABLE` 哨兵值 —— **此处刻意重复字面量**。
+ *
+ * ⚠️ 本模块刻意**零 import**（它被宿主 RPC 层与单测直接使用，注释见模块头：
+ * 不反向依赖 `auto-adapter.js` 以免拖进一堆运行时依赖）。故这里复刻 `-1`，
+ * 一致性由 `tests/unit/auto-badge-rpc.spec.ts` **与 `aggregate-core` 对拍**锁死
+ * —— 那条用例会直接 `import { UNUSABLE }` 并断言本常量与它相等，改一侧即红。
+ */
+export const UNUSABLE_EXPIRY = -1
+
+/**
+ * 只有**有限且非 `UNUSABLE`** 的时刻才放进响应（与 {@link finitePrice} 对称）。
+ *
+ * ⚠️ `UNUSABLE = -1`（`aggregate-core.ts` 的哨兵，表示「该渠道当前不可用」）
+ * 既非 `undefined` 也非 `Infinity`，且 `Number.isFinite(-1) === true`
+ * ⇒ 只判 `Number.isFinite` 会让它**穿过宿主与客户端两道守卫**，最终被
+ * `expiryCountdownText` 渲染成 `1/1 07:59过期`（1970 年派生的荒谬时间）。
+ * 复审实测（PR !84）：
+ *
+ * ```
+ * expiryCountdownText(-1, now)    -> "1/1 07:59过期"
+ * autoBadgeName({ expiryAt: -1 }) -> "自动 → buddy GLM-5.3-Flash · 1/1 07:59过期"
+ * ```
+ *
+ * ⚠️ 收口放在**本模块**（而不是客户端再加一道判断）：这里是「能不能回传给客户端」
+ * 的唯一出口，两处拼装（真实历史 / 预测回退）都经过它 —— 放客户端会变成
+ * 「同一语义两套实现」（本仓库红线）。
+ *
+ * ⚠️ 判据用 `!== UNUSABLE_EXPIRY` 而非 `> 0`：到期时刻是**绝对毫秒时间戳**，
+ * 理论上可能是任何正整数；`> 0` 会顺带挡掉它，但写成哨兵比较更精确地表达意图。
+ */
+function usableExpiry(at: number | undefined): { autoExpiryAt?: number } {
+  return typeof at === 'number' && Number.isFinite(at) && at !== UNUSABLE_EXPIRY ? { autoExpiryAt: at } : {}
+}
+
+/**
  * 只有**有限**倍率才放进响应。
  *
  * ⚠️ `Infinity` 是「无标注」的哨兵（`priceFactorFromName` 的返回值），直接回传
- * 会让客户端拼出 `xInfinity`（`aggregate-panel-logic.js:205` 记录过同一个坑）。
+ * 会让客户端拼出 `xInfinity`（`aggregate-panel-logic.js` 记录过同一个坑）。
  * ⚠️ `0` 是**合法值**（显示「免费」），故判据必须是 `Number.isFinite` 而不是 truthy
  *（`0` 是 falsy，用 `if (price)` 会把「免费」静默吞掉 —— 本仓库在
  * `buddySaturationDelayMs` 上踩过同型的 `|| 默认值` 坑）。

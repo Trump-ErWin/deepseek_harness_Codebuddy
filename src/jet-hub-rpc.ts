@@ -19,10 +19,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from './account-pool.js'
-import {
-  AUTO_PROVIDER as AUTO_PROVIDER_ID,
-  type AutoAdapter,
-} from './auto-adapter.js'
+import { AUTO_PROVIDER as AUTO_PROVIDER_ID } from './auto-adapter.js'
 import { resolveAutoBadgeRewrite, type AutoBadgeState } from './auto-badge.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { isGatewayEnabled } from './openai-gateway/config.js'
