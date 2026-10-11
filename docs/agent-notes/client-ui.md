@@ -210,6 +210,207 @@ buddy: no usable credential; log in from the Jet Hub panel first
   「安全策略拦截（11140）：账号冷却 + 流内错误帧」段（7 条）。
   ⚠️ 已做**反向验证**：错误码退回 `AUTH` → **7 条**变红；禁用冷却标记 → **5 条**变红
   （含认证 / 限流 / 流内三条通道各自那条）；禁用流内识别 → **2 条**变红。
+### ⚠️⚠️ 承上：**额度用尽**也不能用 harness 常量 `QUOTA_EXCEEDED_CODE`（Issue IKJVCW）
+
+上一条讲的是「自定义文案要避开 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA`」。
+**但「避开 `QUOTA`」这件事有一个隐蔽的陷阱** —— 它让 codearts 成了十个
+provider 里**唯一**中招的一家。
+
+#### 陷阱：harness 常量的字面值就是被替换的那个码
+
+```ts
+// @deepseek-ai/dsh-llm
+export declare const QUOTA_EXCEEDED_CODE = "QUOTA"   // ← 就是 "QUOTA"
+```
+
+于是「用 harness 的规范化常量」这个看起来最正确的写法，
+**恰好产出会被客户端吞掉的码**（`failureMessage`，实测见下）：
+
+```js
+if (code === "QUOTA" || code === "ACCOUNT_QUOTA") return t("message.failure.quota");
+return code === "AUTH" ? t("message.failure.auth") : message;
+```
+
+`message.failure.quota` 的中文是「**当前请求的额度已用尽**」。
+
+#### 真实症状（用户报障）
+
+`codeartsQuotaExhaustedMessage()` 精心写的
+
+> `codearts: 模型 deepseek-v4.1-flash 的免费额度（benefit）已用尽，`
+> `预计 5.5 小时后重置（按 UTC+8 自然日结算，预计 …）。可改用其它模型，或…`
+
+**一个字都到不了用户眼前**，只剩「当前请求的额度已用尽」——
+既没有原因（benefit 额度）、也没有出路（换模型 / 切账号 / 何时恢复）。
+用户会去等额度恢复，而实际该做的是换模型。
+
+#### 判据：**字面量 `'QUOTA_EXCEEDED'`，不是 `QUOTA_EXCEEDED_CODE`**
+
+| 码 | 客户端替换文案？ | 在 `DEFAULT_RETRYABLE_CODES`？ | 语义 |
+|---|---|---|---|
+| `QUOTA`（= harness 常量） | **是** | 否 | 额度 |
+| `'QUOTA_EXCEEDED'`（字面量） | **否** | 否 | 额度 |
+| `PERMISSION_DENIED` | 否 | 否 | 权限（**额度用它属语义错位**） |
+
+⚠️ **不要为了「与 harness 词汇一致」改回常量**，也**不要**照 IKJVCW 建议把额度
+一律改 `PERMISSION_DENIED`：仓库里 buddy / cline / lobsterai / trae / zcode /
+minimax 等 **~20 处**额度错误一律用字面量 `'QUOTA_EXCEEDED'`，且**都不被替换** ——
+`codearts` 改用 harness 常量才是异类，**这正是缺陷只在本家复现的原因**。
+
+⚠️ 下游判据**已经双认**这个词汇差异，不必配套改：
+`account-probe.isRateLimitFailure` 与 `qoder-adapter.isQuotaExceededError`
+都同时接受 `'QUOTA_EXCEEDED'` 与 `'QUOTA'`；`dead-model-store` 的
+`IGNORED_CODES` **只收** `'QUOTA_EXCEEDED'`（原先靠 `/额度/` 文案兜底才没把模型
+误记成 30 天失效，改后是显式命中，**比原来更稳**）。
+
+#### ⚠️ 客户端按码判定的点**不止一处**（别只盯着 `failureMessage`）
+
+审计实测（2026-10-11，桌面端 `app.asar` 与 `dsh-client-ui-chat/lib/client.js` 双份一致）：
+
+| # | 判定点 | 判据 | 对 `'QUOTA_EXCEEDED'` 的影响 |
+|---|---|---|---|
+| 1 | `failureMessage` | 替换 **5** 个码：`ACCOUNT_SIGNED_OUT` / `ACCOUNT_SIGN_IN_REQUIRED` / `QUOTA` / `ACCOUNT_QUOTA` / `AUTH` | ✅ 不命中 ⇒ **message 完整透出**（本修复的目的） |
+| 2 | `quotaNotice` | `code !== "QUOTA" && code !== "ACCOUNT_QUOTA"` | ❌ 不命中 ⇒ **全局额度 Toast 不再触发**（见下） |
+| 3 | `displayFailure` | `if (code === "AUTH") return { code, message: "" }` | ✅ 不涉及（但这是 `AUTH` 的 message 被**置空串**之处） |
+
+⚠️ **第 1 处的「5 个码」不要写成「三个码」** —— `src/sse.ts` 的
+`REASONING_LOOP_CODE` 注释里**早就登记了同一份 5 码清单**，同一仓库两套同义
+数字必有一处是错的（本次修复初版就写错成三个，被审计抓出）。
+
+⚠️ **第 2 处是本修复的已知取舍**（审计实测，**不要**当缺陷再「修」回去）：
+`quotaNotice` 驱动一条**不随 Chat 面板消失**的全局额度 Toast，它只认
+`QUOTA` / `ACCOUNT_QUOTA`。改用 `'QUOTA_EXCEEDED'` 后该 Toast 不再出现。
+⇒ 取舍是「失败行有真实原因、但没有全局 Toast」vs「失败行被换成误导文案、
+但有全局 Toast」，**取前者**：真实原因就在失败行里，用户一定看得到；
+而后者的误导文案会把用户引向「等额度恢复」这个错误动作。
+若将来确实需要那条 Toast，做法是在 `plugin-src/client/` 自行注册
+`shell.quota-notice` 条目接管该码，**不是**把码改回 `QUOTA`。
+
+#### 三处产出点缺一不可
+
+`src/llm-adapter.ts` 有**三条**会产出该码的路径（少一条就会退回「被客户端顶掉文案」）：
+
+1. SSE 通道 `InferHub.4291.200`（HTTP 200 + 流内错误帧）；
+2. 4xx 通道的同一个码（服务端也可能以 4xx 下发）；
+3. **`httpErrorCode()` 里的额度归一化**（`400 + insufficient balance` 等措辞）
+   —— 这条最易漏，因为它**不在**那两块醒目的额度分支里。
+
+#### ⚠️⚠️ 401/403 下的额度分流**不得**为了「整齐」而调整（一次假阳性审计）
+
+4xx 分支的真实顺序是：
+
+```
+isAuthError（401/403 恒真 ⇒ 续期 + continue 重试）
+  → isSseQuotaExhaustedErrorCode（额度）→ isRateLimited → … → httpErrorCode
+```
+
+401/403 先被 `isAuthError` 接走续期一次，**第二轮**才轮到额度判据。
+逐格实测（重建 `lib/` 后走 `stream()`）：
+
+| 报文（4xx + 文案） | 400 | 401 | 403 |
+|---|---|---|---|
+| `insufficient balance` | 额度 | **AUTH** | **AUTH** |
+| `insufficient quota` | 额度 | **额度** | **额度** |
+| `out of credits` | 额度 | **AUTH** | **AUTH** |
+| `quota exceeded` | 额度 | **AUTH** | **AUTH** |
+| `InferHub.4291.200` + `insufficient quota` | 额度 | **额度** | **额度** |
+
+只有 `insufficient quota`（与 `4291` 码值腿）能穿透 ——
+因为 `isSseQuotaExhaustedErrorCode` 的**文案腿只认 `insufficient quota`**，
+不认 `balance` / `credits`。这是**既有行为**，不是本次改动引入。
+
+⚠️ **不要为了让这张表变整齐去调 `httpErrorCode` 的 401/403 优先级** ——
+独立审计曾报过一条「高」严重度缺陷：`httpErrorCode` 里
+`if (status === 401 || status === 403) return 'AUTH'` 排在
+`isQuotaExceededError(detail)` 之前，故「403 + `insufficient balance` 落 `AUTH`、
+同一文案用 400 却归额度」。**我照它改过，已撤回** —— 那是**孤立函数的假阳性**：
+审计只测了被建议修改的那个函数，没看它在真实控制流里**本就排在额度判据之后**。
+（教训：**审计结论必须回到生产路径复核**，不能只测被点名的那个函数。）
+
+而且该调整**违反本仓库的成文铁律**（`AGENTS.md`「同族判据必须逐格同构」）：
+
+> **401/403 先判**，恒归认证类 —— 状态码与额度文案并存时
+> （网关侧故障常在报文里捎带余额提示）**以状态码为准**
+
+codearts 的 401/403 来自**网关**（`APIG.0602` Invalid token / `APIG.0301` 验签失败），
+网关故障时捎带余额词是常态。让余额词改写分类 ⇒ 真凭据失效被说成「额度用尽」，
+用户被引向「等额度恢复」而非重新登录。该铁律是 2026-10-06 raccoon / loomy
+「一个请求内 6 个号各被封 24h」事故的产物。
+
+⚠️ 且「codearts 会用 401/403 下发额度文案」**无实测支撑**（141 个真实会话零命中；
+`InferHub.4291` 仅 1 次命中且是在讨论参考实现的 Rust 源码）。
+**将来真抓到该报文再按实测处理**，不要据构造报文改分类顺序 ——
+提建议者自己在「无法确认」里也承认「无线上真实报文，证据强度不足」。
+
+#### `errorDetail` 的两条腿：**只加不减**
+
+`errorDetail`（`src/llm-adapter.ts`）是上述分类的唯一输入。审计实测它
+**不认** `{"error":"<字符串>"}` 形态（只认 `typeof data.error === 'object'`），
+于是该形态退回**整段 JSON** —— 用户看到一坨不可读的裸 JSON。
+`src/openai-compat.ts` 的**同名函数**早已修过这个形态，本份没跟上
+（又一例「一文件两套同义判据」，两处改一处时**必须同时改另一处**）。
+
+⚠️ 修它时**只加腿、不减腿**：`error.code` / `error.type` / `error.message` /
+`error_code`+`error_msg` / 顶层 `message` 五条原有腿**必须全部保留** ——
+OpenAI 形态常把额度语义写在 `{"error":{"code":"insufficient_quota"}}` 里，
+少了 code 那条腿，该报文会从额度**掉回** `AUTH`/`INVALID_REQUEST`。
+（改的第一版真的把几条腿一起删了，是比原缺陷更糟的回退。）
+
+⚠️ **测 `errorDetail` 必须直接断言它的返回值**，**不要**绕道「分类结果」：
+`{"error":"insufficient balance"}` 这种报文，即使字符串腿失效、函数退回整段
+JSON，**整段 JSON 里也含该短语** ⇒ 额度判据照样命中 ⇒ 用例全绿。
+第一版就是这么写的，反向验证时才发现是**假守卫**（禁用该腿后 11 条全绿）。
+故 `errorDetail` 已**导出**（与 `isSseQueueErrorCode` 同款惯例）供单测直接锁定。
+
+测试：
+- `tests/unit/llm-adapter.spec.ts` 的两段（`IKJVCW`）：
+  「★ 额度错误的码不得被客户端替换」（8 条）+「★ errorDetail 的形态覆盖」（6 条）。
+
+⚠️ 已做**反向验证**（逐条实测变红，非推断）：
+- 额度码改回 `'QUOTA'` → **3 条**变红（三条产出路径各自独立锁死）；
+- `httpErrorCode` 恢复「401/403 短路在前」→ **1 条**变红（报出 `'AUTH'`）；
+- 额度判据放宽成裸 `insufficient` → **1 条**变红（反向守卫，报出 `QUOTA_EXCEEDED`）；
+- 禁用 `errorDetail` 的字符串腿 → **2 条**变红（报出裸 JSON 形态）；
+- 删掉 `errorDetail` 的 `error.code` 腿 → **1 条**变红。
+
+⚠️ **试过但失败的攻击角度**（记下以免后人重复）：
+「本仓库不再有地域封锁判据」是**结论而非疏漏** —— 详见下条。
+
+### ⚠️⚠️ **不要给 codearts 加「地域封锁」判据**（IKJVCW 的 B 部分，已被推翻）
+
+修复初版曾照 `cline-adapter` 的 `isClineRegionForbidden` 给 codearts 加了一套
+「非凭据拒绝」判据（`isNonCredentialDenial` + 4 个 marker），**已整体撤回**。
+撤回依据（四路独立取证，两轮审计交叉确认）：
+
+| 取证 | 结果 |
+|---|---|
+| 全量解压 `~/.dsh/sessions` 下 **141 个真实会话** | `not available in your region` / `country` / `region not supported` / `not subscribed to required model plan` / **`access forbidden`** 命中 **0 次** |
+| codearts **真实错误码词汇表**（同批会话抽取） | 全是 `APIG.0301`(验签失败) / `APIG.0602` / `APIG.0101` / `TM.00001041`(并发上限) / `InferHub.4005.200`(unsupported model) / `InferHub.002002009.404`(not registered) / `InferHub.4004.200` / `InferHub.4291.200` / `InferHub.ModelArts.81111.429` / `STS5.1806` —— **无一条地域/订阅类** |
+| 端点结构 | `CHAT_API_BASE` 与 `QUEUE_STATUS_BASE` 都硬编码 `snap-access.cn-north-4.myhuaweicloud.com`（中国区华为云），插件**没有任何 region 切换能力** ⇒ 「换出口 / 换区」这个出路在 codearts 上**不存在** |
+| 把真实词汇表逐条喂给新判据 | 命中 **0/12** —— 对生产流量零作用 |
+
+⚠️ **所有地域类 marker 的证据都来自 Cline**（`cline-adapter.ts` 的实测报文、
+`providers-cline.md` 坑 6、`implementation-notes.md`）。这是「移植既有实现」
+的典型误用：抄了别家的**判据表**而非本家的实测事实（`AGENTS.md` 的
+「先抄『类别→动作』表」那条纪律的同型错误）。
+
+⚠️ 照搬还有**直接坏处**（实测）：新表与 cline 表对同一报文**给出相反结论**
+—— `{"error":"access forbidden: x is not permitted"}` 在 cline 判「地域」、
+在新表判「不是非凭据」；反向也不一致（`not subscribed` 在新表判真、cline 判假），
+既非子集也非超集，是**第三套口径**。
+
+⚠️ 而且 `not subscribed to required model plan` 归「与凭据无关」是**错的**：
+本仓库自己的实测（`src/cline-rate-limit.ts` 注释、`providers-cline.md`）记它是
+`ENTITLEMENT_ERROR` ——「有余额（500000）但**没有订阅计划**」，是**账号级**属性
+⇒ 不同账号订阅状态可不同 ⇒ 正确处置是**换号**，而不是硬失败。
+（撤回前命中该 marker 时 `getAvailableAccount` 调用 **0 次**。）
+
+⚠️ 撤回还顺带消除两处**由它引入**的损害：非 JSON 403（CDN/网关 HTML 页）
+含 marker 时会把**整页 HTML（含 `<script>`）**原样送进失败行；以及
+「地域文案 + 额度文案」并存的报文被错分到权限分支而**失去换号机会**。
+
+**结论**：将来若真在 codearts 上抓到地域封锁报文，**按实测再加**；
+现在加是凭空的，且会长期维护一张无依据且与别家相反的表。
 
 ## 模型黑名单（Jet Hub「显示列表」开关）
 
