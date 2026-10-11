@@ -59,6 +59,11 @@ vi.mock('../../src/qoder-wasm.js', async (importOriginal) => {
           captured.payload = actual.buildQoderInferPayload(ask, 'fixed-request-id')
           return { url: 'https://example.invalid/x', headers: {}, body: 'enc' }
         },
+        // ⚠️ 替身必须**镜像真实类的接口**：适配器在 `buildRequest` 的
+        // `finally` 里调 `dispose()` 释放 wasm `QoderContext`
+        // （见 `src/qoder-wasm.ts` 文件头的「wasm 堆泄漏」）。
+        // 替身缺这个方法会让每个用例都报 `client?.dispose is not a function`。
+        dispose: () => {},
       }),
     },
   }
