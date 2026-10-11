@@ -171,17 +171,36 @@ export const HOST_STALE_HINT = '插件宿主未加载最新版本，请重启 DS
 /**
  * 把 RPC 错误翻译成**用户能行动**的一句话。
  *
- * - 命中「宿主没有这个方法」⇒ 给出 {@link HOST_STALE_HINT}；
+ * ## 两种「宿主跑旧代码」的形态（都必须翻译）
+ *
+ * | 形态 | 宿主的原始文案 | 触发条件 |
+ * |---|---|---|
+ * | 宿主**没有这个方法** | `unknown method: usage.badgePreference` | 新客户端 + 更旧的宿主 |
+ * | 宿主**不认这个 provider** | `unsupported provider: jet-hub-auto` | 客户端已支持 auto 徽标、宿主还没加载该 PR |
+ *
+ * ⚠️ 第二种形态是 2026-10-11 复审**实测**出来的（在 master 上真跑 `usage.badge`
+ * 端点取证）：新增的 `jet-hub-auto` 徽标分支让客户端会去请求一个**旧宿主不认识**
+ * 的 provider，而旧宿主对它的回包正是 `unsupported provider: jet-hub-auto`。
+ * 原先只认 `unknown method` ⇒ 用户看到的是这句裸技术文案，完全不知道该做什么
+ * （而实际动作只有「重启 DSH」）—— 正是本常量要消灭的那类静默失败。
+ *
+ * ## ⚠️ 判据仍然要**窄**
+ *
+ * - `unknown method`：宿主 `handleMethod` 的 `default` 分支写死的文案
+ *   （`src/jet-hub-rpc.ts`），改动它时本函数要同步。
+ * - `unsupported provider`：`credits.balances` 查表失败时的写死文案（同上文件）。
+ *   必须**带上冒号与 provider 名**才算命中吗？不需要 —— 这个短语在宿主侧只出现在
+ *   「provider 未登记」这一处，不会与参数错误混淆。
+ * - **不要**泛化成「含 unknown / 不支持」之类：那会把真实的参数错误也吞掉，
+ *   让用户去重启一个本来就正常的宿主。
+ *
  * - 其它错误**原样透出**（凭据过期、网络失败等，它们的文案本身就有指向性）；
  * - 拿不到消息时回落到调用方给的 `fallback`。
- *
- * ⚠️ 判据要**窄**：只认 `unknown method` 这一个短语。这是宿主 `handleMethod`
- * 的 `default` 分支写死的文案（`src/jet-hub-rpc.ts`），改动它时本函数要同步；
- * 不要泛化成「含 unknown / 不支持」之类，那会把真实的参数错误也吞掉。
  */
 export function describeBadgeError(error, fallback = '') {
   const message = typeof error?.message === 'string' ? error.message : '';
   if (message.includes('unknown method')) return HOST_STALE_HINT;
+  if (message.includes('unsupported provider')) return HOST_STALE_HINT;
   return message.length > 0 ? message : fallback;
 }
 

@@ -50,7 +50,10 @@ const codeOf = (text) => text
  * 删干净了**：
  * - `src/auto-adapter.ts`：删掉 `lastDecision` / `lastWinnerExpiryAt`；
  * - `src/jet-hub-rpc.ts`：删掉 `usage.badge` 的 auto 改写块与 `autoAdapter` 参数；
- * - `src/types.ts`：删掉 `autoActual` / `autoExpiryAt` / `readError`；
+ * - `src/types.ts`：删掉 `autoActual` / `autoExpiryAt`；
+ *   ⚠️ 原注释此处还列了 `readError`，但复审用 `git log -S readError` 核实：该字段
+ *   **从未在响应类型里存在过**（master 与 PR base 全仓都没有），是本次一并新造的
+ *   幽灵字段、且两端都不使用 ⇒ 已删除，并加了反向断言禁止再加回来。
  * - `plugin-src/client/usage-badge.js`：删掉 auto 专用门控分支与折叠胶囊的三要素。
  *
  * ⇒ 用户实际在用的是旧 auto（选择器里叫「Auto（临期优先 · 整池）」，而新的叫
@@ -235,14 +238,27 @@ describe('★ 旧 auto 的徽标链路：宿主侧（上游 ba10f4f 回归的恢
     expect(ADAPTER).toMatch(/selectProvider: \(\) => this\.selectProvider\(undefined, p => this\.firstModelOf\(p\)\)/)
   })
 
-  it('★ 响应类型必须含 autoActual / autoExpiryAt / readError / autoPrice（上游删过前三个）', () => {
+  it('★ 响应类型必须含 autoActual / autoExpiryAt / autoPrice（上游删过前两个）', () => {
     const response = /export interface RpcUsageBadgeResponse \{([\s\S]*?)\n\}/.exec(TYPES)?.[1] ?? ''
     expect(response.length).toBeGreaterThan(0)
     expect(response).toMatch(/autoActual\?:/)
     expect(response).toMatch(/autoExpiryAt\?:/)
-    expect(response).toMatch(/readError\?:/)
     // 倍率（用户报障「没倍率显示？」）：auto 自己没有倍率，只能靠响应带回来。
     expect(response).toMatch(/autoPrice\?:/)
+    /**
+     * ⚠️ 反向断言：**不得**再引入 `readError`（复审实测，2026-10-11）。
+     *
+     * 该字段是本次提交**新造**的（`git log -S readError` 显示响应字段只出现在本 PR
+     * 的提交里；master 与 PR base 全仓都没有它），其注释声称「与 `autoActual` 同时被
+     * 上游删除、一并补回」—— 与 git 历史不符。
+     *
+     * 更关键的是它**两端都不使用**：宿主从不设置它、客户端也从读它
+     *（客户端的 `readError` 是**本地** `useState`，与响应字段无关；错误文案实际由
+     * `describeBadgeError(error)` 在客户端侧翻译）。
+     * ⇒ 留一个永不生效的字段只会让后来者以为「宿主会回传可行动原因」而据此写代码。
+     * 「宿主过期」那句文案的真实落点是 `describeBadgeError`（已覆盖 D5 的两种形态）。
+     */
+    expect(response, '不得引入两端都不使用的幽灵字段 readError').not.toMatch(/readError\?:/)
   })
 
   it('★ 倍率来自**已算过**的那轮目录循环（不得为它重查一次目录）', () => {
@@ -393,6 +409,43 @@ describe('★ 旧 auto 的徽标链路：客户端侧', () => {
     // 畸形输入不抛错
     expect(shortProviderName(undefined)).toBe('');
     expect(shortProviderName(null)).toBe('');
+  })
+
+  /**
+   * ★★ 折叠胶囊必须真的**读**宿主回传的三个 auto 字段（接线缺口，PR !84 复审实测）。
+   *
+   * ## 为什么单独守这一条
+   *
+   * 上面那些用例断言的是 `autoBadgeName` 这个**纯函数**的行为 —— 而「纯函数正确」
+   * **不等于**「它被正确调用」：胶囊的数据来自 `UsageBadgeActive` 里对
+   * `value?.autoActual` / `value?.autoPrice` / `value?.autoExpiryAt` 的取数。
+   * `usage-badge.js` import 了 `react`，单测环境**无法 import 它**（本仓库
+   * node_modules 里没有 react），故只能做源码断言。
+   *
+   * ## ⚠️ 为什么要写成「精确整行」而不是 `/autoActual/` 这类子串
+   *
+   * 复审实测：把这三行改成 `autoActual: undefined,`（功能完全失效）之后，
+   * `usage-badge-client.spec.ts` / `aggregate-badge.spec.ts` / 本文件其余用例
+   * **119 条全绿** —— 一个都没抓到。即：**这条接线此前零守卫**。
+   * 子串式断言（`toContain('autoActual')`）对这类「短路成 undefined」免疫，
+   * 所以这里断言的是**取数的完整形态**（含 `value?.` 前缀与逗号结尾），
+   * 改坏任一处都会失配。
+   *
+   * ⚠️ 基于**去注释**源码：本文件与 `usage-badge.js` 的注释里大量引用这些字段名
+   *（例如「胶囊的数据来自 `value?.autoActual`」），对全文断言会把注释判成违规
+   *（`usage-badge-client.spec.ts` 的 `codeOf` 同款，那里因这个坑红过两次）。
+   */
+  it('★★ 折叠胶囊必须读取宿主的 autoActual / autoPrice / autoExpiryAt（接线缺口）', () => {
+    const badgeActive = BADGE_CODE.slice(BADGE_CODE.indexOf('const badgeName = autoBadgeName({'))
+    expect(badgeActive.length, '应当能定位到 autoBadgeName 的调用点').toBeGreaterThan(0)
+    // ⚠️ 三行都必须**带 `value?.` 取值**。写成 `undefined,` / 硬编码常量都会失配。
+    expect(badgeActive, '胶囊必须读 autoActual（渠道+模型）').toMatch(/autoActual: value\?\.autoActual,/)
+    expect(badgeActive, '胶囊必须读 autoPrice（倍率）').toMatch(/price: value\?\.autoPrice,/)
+    expect(badgeActive, '胶囊必须读 autoExpiryAt（临期倒计时）').toMatch(/expiryAt: value\?\.autoExpiryAt,/)
+    // 反向：取值必须来自**宿主读数** `value`，不得改成别的来源（例如局部常量、props）。
+    for (const field of ['autoActual', 'autoPrice', 'autoExpiryAt']) {
+      expect(BADGE_CODE, `${field} 不得从 props 取`).not.toMatch(new RegExp(`${field}:\\s*props\\.`))
+    }
   })
 })
 

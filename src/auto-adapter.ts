@@ -111,6 +111,19 @@ interface AutoChoice {
 interface DispatchTarget extends AutoChoice {
   /** 目标模型声明的档位 id（空 = 该模型不声明任何思考档位）。 */
   efforts: readonly string[]
+  /**
+   * **该目标自己**的临期失效时刻（`Infinity` = 只有长期积分）。
+   *
+   * ⚠️⚠️ 必须是「目标自己的」，不能借用主胜者的 `lastExpiryAt`——真实缺陷
+   * （PR !84 复审实测，用户可见）：带图改道时主胜者（如 buddy）与实际发往的目标
+   * （如 codearts）**不是同一个渠道**，两者临期时刻互不相干。徽标把渠道显示成
+   * 改道后的 codearts，却把倒计时显示成 buddy 的到期时间 —— 张冠李戴。
+   * 实测：codearts 真实 `900`，徽标却显示主胜者 buddy 的 `100`。
+   *
+   * 语义上它就是「这个 provider 的这条候选额度何时作废」，与聚合的候选序同一口径
+   * （都来自 `expiryOf`）。
+   */
+  expiryAt?: number
 }
 
 /** auto 适配器对外只挂一个模型；真实能力在选型后从目标 provider 借用。 */
@@ -261,13 +274,41 @@ export class AutoAdapter extends LlmAdapter {
    */
   autoState(): {
     lastDecision: { provider: string; model: string; viaImageFallback: boolean; expiryAt?: number } | null
-    lastWinnerExpiryAt?: number
+    readonly lastWinnerExpiryAt?: number
     selectProvider(): Promise<{ provider: string; model: string } | undefined>
     priceOf(provider: string, model: string): number | undefined
   } {
+    /** ⚠️ getter 必须闭包捕获**适配器实例**（见下面 `lastWinnerExpiryAt` 的注释）。 */
+    const self = this
     return {
       lastDecision: this.lastDecision ?? null,
-      lastWinnerExpiryAt: this.lastWinnerExpiryAt,
+      /**
+       * ⚠️⚠️ **必须是 getter（活值），不能是取值那一刻的拷贝**（真实缺陷，PR !84
+       * 复审实测端到端复现）：
+       *
+       * 消费方 `resolveAutoBadgeRewrite` 的调用序是「**先** `await
+       * autoState.selectProvider()`，**再**读 `lastWinnerExpiryAt`」—— 而
+       * `lastExpiryAt` 正是 `selectProvider` 在内部顺带写入的。
+       * 写成 `lastWinnerExpiryAt: this.lastWinnerExpiryAt`（值拷贝）时，快照在
+       * `selectProvider` **之前**就已求值 ⇒ 字段永远冻在 `undefined`。
+       *
+       * 实测（真实类 + 真实纯函数，复刻 `jet-hub-rpc.ts` 的调用序）：
+       * ```
+       * 快照时 lastWinnerExpiryAt      = undefined
+       * selectProvider 返回            = codearts/m1
+       * 适配器真实 lastWinnerExpiryAt  = 100
+       * ★ 但快照里的值仍是             = undefined
+       * ⇒ rewrite.autoExpiryAt 缺席（预期 100）
+       * ```
+       * 症状：**插件重启后首轮（无真实历史）的胶囊永远没有临期倒计时**，发过消息
+       * 后（走 `lastDecision.expiryAt`）才出现 —— 极易被当成正常。
+       *
+       * ⚠️ 用 getter 而非「让 `selectProvider` 回传临期」：后者要改 `AutoBadgeState`
+       * 的公开契约与全部桩，而 getter 在结构化类型下仍是同形属性，**零调用方改动**。
+       * ⚠️ getter 里**不能写 `this`** —— 对象字面量的方法/访问器里 `this` 指向**返回
+       * 的那个对象**（它没有 `lastExpiryAt`），必须闭包捕获适配器实例。
+       */
+      get lastWinnerExpiryAt() { return self.lastWinnerExpiryAt },
       selectProvider: () => this.selectProvider(undefined, p => this.firstModelOf(p)),
       priceOf: (provider, model) => this.priceOf(provider, model),
     }
@@ -476,14 +517,60 @@ export class AutoAdapter extends LlmAdapter {
    * 不影响其余能力。
    */
   private async dispatchTargetOf(choice: AutoChoice, signal?: AbortSignal): Promise<DispatchTarget> {
+    /**
+     * ⚠️ **必须为每个目标单独取临期时刻**（真实缺陷，PR !84 复审实测）：
+     * 带图改道时实际发往的渠道与主胜者不同，两者临期互不相干 —— 借用主胜者的值
+     * 会让徽标「渠道显示 A、倒计时显示 B」。
+     *
+     * ⚠️ 这条查询**不是新增量级的开销**：`prepareCall` 选 `imageTarget` 的那个循环
+     * 已经为每个候选渠道算过一次 `expiryOf`（正是用它挑「支持图片且临期最早」），
+     * 而 `expiryOf` 走注入的共享探针、带 TTL 缓存（生产装配注入的是与 aggregate
+     * **同一个** `sharedExpiryProbe`，`EXPIRY_CACHE_TTL_MS` 60 秒，与选型缓存的
+     * 默认 TTL 同量级）⇒ 两条路径上通常都命中缓存。
+     * ⚠️ **不保证**必然命中：探针缓存（60 秒）与选型缓存是两套独立 TTL，若恰在
+     * 边界上（`prepareCall` 与 `dispatch` 之间隔着模型解析等 `await`），新目标会
+     * **真打一次该渠道的余额接口**。量级 = 每请求 ≤1 次额外余额查询，且只查选中的
+     * 那一个（不随候选数放大）。
+     * ⚠️ 副作用：这条查询发生在 **`prepareCall` 期间**（harness 的请求路径上同步
+     * `await`），若某渠道余额接口慢，首字节延迟会变大。权衡后仍选择在此取：倒计时
+     * 是小号信息，而「张冠李戴」是用户能直接看到的错误（见上）。
+     *
+     * ## ⚠️ 两条失败语义（都是本仓库踩过的坑）
+     *
+     * 1. **中止必须原样逃逸**（与 `hasUsableAccountFor` 逐格同构 —— 本仓库红线：
+     *    「abort 必须立刻以 AbortError 结束，绝不能被降级」）。`expiryOf` →
+     *    `createExpiryProbe` 刻意在中止时 `throwIfAborted()`，裸 `catch {}` 会把它
+     *    吞成「倒计时缺席」。
+     * 2. **不得放进 `UNUSABLE` 哨兵**：`expiryOf` 正常返回 `UNUSABLE(-1)`（该渠道
+     *    当前不可用）或 `NEVER(Infinity)`。`-1` 既非 `undefined` 也非 `Infinity`，
+     *    且 `Number.isFinite(-1) === true` ⇒ 能穿过宿主与客户端两道守卫，最终
+     *    渲染成 `1/1 07:59过期`（1970 年派生的荒谬时间）。只放行有限且非哨兵的值。
+     */
+    let expiryAt: number | undefined
+    try {
+      expiryAt = await this.expiryOf(choice.provider, signal)
+    } catch (error) {
+      // ⚠️ 先让中止原样逃逸（三条判据与 `hasUsableAccountFor` 同构）。
+      signal?.throwIfAborted()
+      if (error !== null && typeof error === 'object') {
+        const candidate = error as { name?: unknown; code?: unknown }
+        if (candidate.name === 'AbortError' || candidate.code === 'ABORTED') throw error
+      }
+      // 其余（余额接口抖动等）只让倒计时缺席，不阻断请求。
+      expiryAt = undefined
+    }
+    const usableExpiry = typeof expiryAt === 'number' && Number.isFinite(expiryAt) && expiryAt !== UNUSABLE
+      ? expiryAt
+      : undefined
+    const withExpiry = usableExpiry === undefined ? {} : { expiryAt: usableExpiry }
     try {
       const info = await this.ctx.llm.resolveModelInfo(choice.provider, choice.model, signal)
       const efforts = (info.reasoning?.efforts ?? [])
         .map((effort) => String(effort.id))
         .filter((id) => id.length > 0)
-      return { ...choice, efforts }
+      return { ...choice, efforts, ...withExpiry }
     } catch {
-      return { ...choice, efforts: [] }
+      return { ...choice, efforts: [], ...withExpiry }
     }
   }
 
@@ -548,7 +635,13 @@ export class AutoAdapter extends LlmAdapter {
       model: target.model,
       at: this.options.now?.() ?? Date.now(),
       viaImageFallback,
-      expiryAt: this.lastExpiryAt,
+      // ⚠️⚠️ **目标自己**的临期时刻，不是主胜者的（见 `DispatchTarget.expiryAt` 的
+      //    长注释：借用主胜者的值会让徽标「渠道 A、倒计时 B」张冠李戴 —— 带图改道时
+      //    两者必然不同，PR !84 复审实测抓到）。
+      //    仅当目标没解析出时刻时才退回主胜者的值（那至少是「同一池里最近会作废的
+      //    额度」，比完全不显示更有信息量）；`Infinity` 经 JSON 会变 `null`，客户端
+      //    本就按 `typeof === 'number'` 判空，故这里原样带着即可。
+      ...(target.expiryAt === undefined ? { expiryAt: this.lastExpiryAt } : { expiryAt: target.expiryAt }),
     }
     const requested = options.reasoningEffort
     const base = { ...options, provider: target.provider, model: target.model }
