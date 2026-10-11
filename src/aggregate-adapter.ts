@@ -1222,9 +1222,14 @@ export class AggregateAdapter extends LlmAdapter {
           // 该报错与「真的没登录」无法区分。
           // ⚠️ 真实缺陷（Task 7 复审 M4）：本处是同一缺陷的**第二实例** ——
           // `aggregate-expiry.ts` 已修，这里漏了。
+          //
+          // ⚠️⚠️ **判据必须与 `isAbortLike` 逐格同构（2026-10-12 审计实测补全）**：
+          // 本处原先只认 `name === 'AbortError'`，于是同一份 499 报文在
+          // `dispatch` 里归**中止**、在这里却被折算成 `UNUSABLE` ⇒ 用户取消后
+          // 看到的是「当前没有任何可用候选」而不是中止（正是 M4 那个形态的
+          // 新实例）。故改为直接复用共享判据，杜绝再次分叉。
           signal?.throwIfAborted()
-          if (error !== null && typeof error === 'object'
-            && (error as { name?: unknown }).name === 'AbortError') throw error
+          if (isAbortLike(error, signal)) throw error
           expiry = UNUSABLE
         }
         seen.set(candidate.provider, expiry)
@@ -1392,9 +1397,13 @@ export class AggregateAdapter extends LlmAdapter {
       // 「候选渠道都不支持图片输入」这类**与中止无关**的误导性报错，且整轮不会中止。
       // 与本仓库口径相反：中止应**立刻**以 `AbortError` 结束
       //（`aggregate-core.ts` 的哨兵注释：「abort 立刻抛，绝不折算」）。
+      //
+      // ⚠️⚠️ **判据必须与 `isAbortLike` 逐格同构（2026-10-12 审计实测补全）**：
+      // 本处原先只认 `name === 'AbortError'`，同族分叉的**第三处**。
+      // 不修的话，同一份 499 报文在这里会被折算成 `{imageCapable:false}` ⇒
+      // 用户看到「候选渠道都不支持图片输入」这类与中止无关的误导性报错。
       signal?.throwIfAborted()
-      if (error !== null && typeof error === 'object'
-        && (error as { name?: unknown }).name === 'AbortError') throw error
+      if (isAbortLike(error, signal)) throw error
       // ⚠️ 走这里的结果**不入缓存**（见 `capabilityCache` 的注释）——否则一次瞬时
       //    失败会让该候选在整段 TTL 内恒被当成「无档位 / 不支持图片 / 无窗口」。
       return { efforts: [], imageCapable: false, resolved: false }

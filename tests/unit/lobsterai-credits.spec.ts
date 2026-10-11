@@ -494,6 +494,90 @@ describe('fetchLobsteraiCreditBalance', () => {
     }
   })
 
+  /**
+   * ★★ **`Number.isFinite` 不够**：还要卡上界（2026-10-12 审计实测）。
+   *
+   * `Number.isFinite` 只排除 `Infinity`/`NaN`，**不排除「有限但下游会溢出」
+   * 的值**：下游 `roundCredits(v) = Math.round(v * 100) / 100` 里 `v * 100`
+   * 在 `|v| > Number.MAX_VALUE / 100 ≈ 1.797e306` 时**自己溢出**。
+   * ⇒ 308 位串与 JSON 合法字面量 `1e308` 都能骗过 `Number.isFinite`，
+   *   却在 `roundCredits` 里变成 `Infinity`（JSON 序列化成 `null`）。
+   *
+   * ⚠️ 上一版只测了 401 位串 —— 那**恰好**是 `Number.isFinite` 挡得住的那一点，
+   * 于是「已挡住 Infinity」这个结论**看起来成立**，实际漏了真正能绕过的路径。
+   */
+  it('★★ 308 位数字串（有限但下游会溢出）→ 必须归「解析失败」', async () => {
+    const s308 = '9'.repeat(308)
+    // 前提：确实「有限」（否则测的就不是上界这条腿了）
+    expect(Number.isFinite(Number(s308)), '前提：308 位串应是有限数').toBe(true)
+    // 且下游 roundCredits 确实会溢出（证明上界守卫是必要的）
+    expect(Math.round(Number(s308) * 100) / 100).toBe(Number.POSITIVE_INFINITY)
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: s308, creditItems: [] },
+    }), { status: 200 }))
+    expect(await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)).toBeNull()
+  })
+
+  it('★★ JSON 合法字面量 1e308（数字形态）→ 同样必须归「解析失败」', async () => {
+    // ⚠️ 这条走**数字分支**（不是字符串），证明两个分支的上界守卫都在。
+    expect(Number.isFinite(1e308), '前提：1e308 是有限数').toBe(true)
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: 1e308, creditItems: [] },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    expect(balance).toBeNull()
+  })
+
+  it('★★ 上界不得误伤：1e15 与以内的真实量级照常解析', async () => {
+    for (const [raw, want] of [[1e15, 1e15], [999999999.99, 999999999.99], ['1e6', undefined]] as const) {
+      const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+        code: 0, data: { totalCreditsRemaining: raw, creditItems: [] },
+      }), { status: 200 }))
+      const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+      if (want === undefined) {
+        // ⚠️ `'1e6'` 是**字符串**科学计数 —— 正则不认，如实归「解析失败」。
+        //    这里**不是**上界守卫的功劳，而是「只认定点写法」的既有口径。
+        expect(balance, `字符串 ${JSON.stringify(raw)} 不在定点写法内`).toBeNull()
+      } else {
+        expect(balance?.total, `${raw} 不应被上界误伤`).toBe(want)
+      }
+    }
+  })
+
+  /**
+   * ★★ **有明细时同样不得把非法 total 伪装成 0**（2026-10-12 审计实测）。
+   *
+   * 旧判据 `if (!hasTotal && packages.length === 0) return null` 只在**无明细**
+   * 时生效 ⇒ `packages.length > 0` 时 `total` 仍是 `readNumber` 的兜底 0，
+   * 于是「解析失败」照样伪装成「余额 0」—— 与本次要修的是同一件事，
+   * 只是发生在另一条分支上。上一版的 4 条测试全部用 `creditItems: []`，
+   * **系统性避开了这条路径**。
+   */
+  it('★★ 有明细 + total 为 null → 用明细合计兜底，不得伪装成 0', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0,
+      data: {
+        totalCreditsRemaining: null,
+        creditItems: [{ creditsRemaining: 50, expiresAt: '2099-01-01 00:00:00' }],
+      },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    expect(balance, '有明细时不该返回 null').not.toBeNull()
+    expect(balance?.total, '应取明细里有效包的合计（50），而不是伪造 0').toBe(50)
+  })
+
+  it('★★ 有明细 + total 为 308 位溢出串 → 同样用明细合计兜底', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0,
+      data: {
+        totalCreditsRemaining: '9'.repeat(308),
+        creditItems: [{ creditsRemaining: 77, expiresAt: '2099-01-01 00:00:00' }],
+      },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    expect(balance?.total, '非法 total 时应回落到明细合计').toBe(77)
+  })
+
   it('网络失败返回 null', async () => {
     const fetcher = vi.fn(async () => { throw new Error('down') }) as unknown as typeof fetch
     expect(await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)).toBeNull()

@@ -51,19 +51,27 @@
  * 它发生在**发出任何网络请求之前**（实测 ~25 ms），UI 只显示
  * 「本轮运行失败 unreachable」，极难定位。故：
  *
- * - `prepareInfer()` 读完 url / headers / body **立即**释放 `result`；
+ * - `prepareInfer()` 读完 url / headers / body 后释放 `result`，
+ *   并释放 `requestresult_url` / `requestresult_body` 返回的**字符串**
+ *  （第三处，见 {@link Glue.freeString}）；
  * - `QoderEncryptedInfer.dispose()` 释放 `context`，由
  *   `src/qoder-adapter.ts` 的 `buildRequest()` 在请求构造完成后调用。
  *
- * 🔴 **只释放 `result` 与 `context` 这两个对象**。`qodercontext_new` 的
- * 4 个**输入字符串**由 Rust 侧持有，若手工 `__wbindgen_export4` 去释放它们
- * 会**当场 trap `unreachable`**（实测）。
+ * 🔴 **只释放「对象」与「返回值字符串」，绝不碰输入字符串**。
+ * `qodercontext_new` 的 4 个**输入字符串**由 Rust 侧持有（走
+ * `writeString` → `__wbindgen_export2`），若手工去释放它们会**当场 trap
+ * `unreachable`**（实测）。
  *
- * ⚠️ **残留未消（如实记录）**：补上这两处 free 后，泄漏**减半但未归零** ——
- * medium 载荷（40 条消息/1.5 KB + 12 工具/2 KB，N=50）实测
- * `117.8 KB/次（有 free） vs 227.8 KB/次（注掉 free）`。**残余那 ~118 KB/次
- * 另有来源，尚未定位**。本改动只是把撞墙时间推后约一倍，
- * **不是**「已修复泄漏」；残余若再累积，长上下文会话仍会撞 4 GB 天花板。
+ * ⚠️ **「残余另有来源、尚未定位」这个旧结论已被证伪（2026-10-12 审计实测）**：
+ * 当初补了 `result` + `context` 两处后仍见约 118 KB/次，就断言「另有来源」，
+ * 并猜测「出自 `prepareInferRequest` 内部」—— **两个结论都是错的**。
+ * 实际就是漏掉的**第三处**（返回值字符串）。证据：泄漏量与 `url + body` 长度
+ * **近似 1:1**（tiny 0.000 / small 0.793 / medium 0.990 / large 0.960），
+ * 而只加长 `host`（url 120→20121 B）时泄漏随之增长；`create + dispose`
+ * 100 次实测 **0.0 B/次**（与 result/context 无关）。
+ * 补上 {@link Glue.freeString} 后同口径扫描**归零**。
+ * ⇒ 本文件**不再声称**「泄漏未根治」；若将来又见到增长，那是**新的**成因，
+ *   请照本次的方法（尺寸扫描 + 比值）先定位再下结论。
  */
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -390,6 +398,13 @@ interface Glue {
    * 不释放的后果见文件头「wasm 堆泄漏」一节。
    */
   freePointer: (name: WasmFreeExport, ptr: number) => void
+  /**
+   * 释放 wasm-bindgen 的**返回值字符串**（`__wbindgen_export4(ptr, len, 1)`）。
+   *
+   * ⚠️ 与 `freePointer` 是**两套 ABI**：那个是 `(ptr, 0)`，这个是 `(ptr, len, 1)`。
+   * 不释放的后果见文件头「wasm 堆泄漏」与 {@link freeString} 的注释。
+   */
+  freeString: (ptr: number, len: number) => void
 }
 
 /**
@@ -570,6 +585,40 @@ async function createGlue(): Promise<Glue> {
     }
   }
 
+  /**
+   * 释放 wasm-bindgen 的**返回值字符串**（`__wbindgen_export4(ptr, len, 1)`）。
+   *
+   * ⚠️ 与 `freePointer` 是**两套 ABI**，别混用：`__wbg_*_free` 的 arity 是 2
+   * `(ptr, 0)`；`__wbindgen_export4` 的 arity 是 3 `(ptr, len, 1)` ——
+   * 末位 `1` 是 wasm-bindgen 约定的「这是字符串」标记。
+   *
+   * ## 🔴 为什么需要它（真实缺陷，2026-10-12 审计实测）
+   *
+   * `requestresult_url` / `requestresult_body` 返回的是 Rust 侧**新分配的
+   * `String`**，其所有权随返回值交给 JS，**必须**由 JS 释放。早期实现只读了
+   * `ptr`/`len` 就丢弃 ⇒ 每次推理泄漏 ≈ **返回字符串长度**（实测与 `url + body`
+   * 长度近似 **1:1**：tiny 0.000 / small 0.793 / medium 0.990 / large 0.960）。
+   *
+   * 这正是文件头一度写「残余另有来源、尚未定位」的那份泄漏 —— 它**不是**
+   * 未知来源，就是漏掉的这一处。同文件 `callString` 早就这么做了
+   *（它读的也是 wasm-bindgen 返回串），本处当初漏了。
+   *
+   * ⚠️ **绝不可**拿它对 `qodercontext_new` 的**输入字符串**调用：那些由 Rust
+   * 侧持有（走 `writeString` → `__wbindgen_export2`），手工释放会当场 trap
+   * `unreachable`（实测）。故输入侧不在此处释放。
+   */
+  const freeString = (ptr: number, len: number): void => {
+    // ⚠️ 与 `freePointer` 共用**同一根反向控制拉杆**：否则关掉 freePointer 后
+    // 这一处仍在释放，泄漏量掉到阈值以下，反向控制用例会以「闸坏了」的形式假红。
+    if (!freesEnabled) return
+    if (ptr === 0) return
+    try {
+      exports.__wbindgen_export4!(ptr, len, 1)
+    } catch (error) {
+      throw describeWasmFailure(error)
+    }
+  }
+
   /** wasm-bindgen 的「调用 JS 函数并捕获异常」包装。 */
   const guard = (fn: (...args: number[]) => void, args: number[]): void => {
     try {
@@ -660,6 +709,7 @@ async function createGlue(): Promise<Glue> {
     callString,
     callPointer,
     freePointer,
+    freeString,
   }
 }
 
@@ -812,15 +862,22 @@ export class QoderEncryptedInfer {
 
       const readResultString = (invoke: (stack: number, ptr: number) => void): string => {
         let out = ''
+        let outPtr = 0
+        let outLen = 0
         const v = g.view()
         const stack = g.exports.__wbindgen_add_to_stack_pointer!(-16)
         try {
           invoke(stack, result)
-          const ptr = v.getInt32(stack + 0, true)
-          const len = v.getInt32(stack + 4, true)
-          out = ptr ? g.readString(ptr, len) : ''
+          outPtr = v.getInt32(stack + 0, true)
+          outLen = v.getInt32(stack + 4, true)
+          out = outPtr ? g.readString(outPtr, outLen) : ''
         } finally {
           g.exports.__wbindgen_add_to_stack_pointer!(16)
+          // 🔴 **第三处 free（2026-10-12 审计实测补上）**：`requestresult_url` /
+          // `requestresult_body` 返回的是 Rust 侧**新分配**的 `String`，所有权已
+          // 交给 JS ⇒ 不释放就每次推理泄漏 ≈ 返回字符串长度（实测与 url+body
+          // 长度近似 1:1）。与同文件 `callString` 同款。
+          g.freeString(outPtr, outLen)
         }
         return out
       }
