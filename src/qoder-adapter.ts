@@ -29,7 +29,7 @@ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelIn
 import { AccountPool } from './account-pool.js'
 import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
-import { QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
+import { describeWasmFailure, QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
 import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderProduct } from './qoder-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
@@ -753,50 +753,67 @@ export class QoderAdapter extends LlmAdapter {
 
     /** 用给定凭据构造一次加密请求（首次与 401 重试共用，避免两处漂移）。 */
     const buildRequest = async (c: QoderCredential): Promise<QoderInferRequest> => {
-      const client = await QoderEncryptedInfer.create({
-        user: {
-          uid: c.uid!,
-          securityOauthToken: c.security_oauth_token ?? c.access_token,
-        },
-        machineId: c.machine_id,
-        metadata: { ...this.product.clientMetadata },
-        host: this.product.encryptedInferBase,
-      })
-      return client.prepareInfer({
-        modelKey: options.model,
-        userText,
-        ...(systemText !== undefined ? { systemText } : {}),
-        isReasoning: fallback?.supportsThinking ?? false,
-        history,
-        // 工具定义：这是模型**唯一**能学到函数 schema 的通道，
-        // 缺了它模型只能用正文 XML 臆造调用（真实缺陷）。
-        tools,
-        /**
-         * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
-         *
-         * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
-         * `qoderEffortsFor` 声明的默认档注入进来。本家的关闭档是 `none`
-         * （由 `supportsDisable` 追加）⇒ 声明了它的模型关得掉；
-         * 未声明的模型只能抬预算兜底。
-         */
-        ...(titlePlan.maxTokens !== undefined ? { maxTokens: titlePlan.maxTokens } : {}),
-        ...(titlePlan.effort !== undefined ? { reasoningEffort: titlePlan.effort } : {}),
-        ...(fallback?.supportsImage !== undefined ? { isVl: fallback.supportsImage } : {}),
-        // 官方 `model_config` 的 display_name / max_input_tokens 必须带上。
-        ...(fallback?.name !== undefined ? { displayName: fallback.name } : {}),
-        ...(fallback?.contextWindow !== undefined ? { maxInputTokens: fallback.contextWindow } : {}),
-        // ⚠️ **`business` 必填**，否则服务端把请求路由到错误的后端节点。
-        //
-        // 实测（2026-09-20）：不带 `business` 时 `qfmodel`（Qwen3.8-Flash）
-        // 恒落到故障节点 `oa_qwen-plus-2025-04-28` 并返回
-        // `[FAIL]node:... msg:Execution failed`；补上 `business` 后立即正常
-        // （其余模型如 `qmodel_38max` 恰好不受影响，故早期排查易误判为
-        // 「该模型服务端故障」）。`agent` / `sec_scan` 等取值都能通。
-        //
-        // 源码依据：`MPi(A) { return A === 'sec_scan' ? 'security' : 'default' }`
-        // —— 服务端按 `business.type` 选路由池，缺字段会走异常分支。
-        business: { type: 'agent' },
-      })
+      // 🔴 `client` 持有 wasm `QoderContext`，**本次构造用完必须释放**：
+      // 该类每次请求都新建实例，不释放则进程级共享的 wasm 堆只增不减，
+      // 长上下文会话最终以裸 `RuntimeError: unreachable` 暴毙
+      // （8/8 历史命中都在 Qoder 路由上；见 `src/qoder-wasm.ts` 文件头）。
+      // 用 `try/finally` 而非顺序调用：`create` / `prepareInfer` 抛错时同样要
+      // 释放，否则**异常路径**反倒成了泄漏最多的那条路。
+      let client: QoderEncryptedInfer | undefined
+      try {
+        client = await QoderEncryptedInfer.create({
+          user: {
+            uid: c.uid!,
+            securityOauthToken: c.security_oauth_token ?? c.access_token,
+          },
+          machineId: c.machine_id,
+          metadata: { ...this.product.clientMetadata },
+          host: this.product.encryptedInferBase,
+        })
+        return client.prepareInfer({
+          modelKey: options.model,
+          userText,
+          ...(systemText !== undefined ? { systemText } : {}),
+          isReasoning: fallback?.supportsThinking ?? false,
+          history,
+          // 工具定义：这是模型**唯一**能学到函数 schema 的通道，
+          // 缺了它模型只能用正文 XML 臆造调用（真实缺陷）。
+          tools,
+          /**
+           * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+           *
+           * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+           * `qoderEffortsFor` 声明的默认档注入进来。本家的关闭档是 `none`
+           * （由 `supportsDisable` 追加）⇒ 声明了它的模型关得掉；
+           * 未声明的模型只能抬预算兜底。
+           */
+          ...(titlePlan.maxTokens !== undefined ? { maxTokens: titlePlan.maxTokens } : {}),
+          ...(titlePlan.effort !== undefined ? { reasoningEffort: titlePlan.effort } : {}),
+          ...(fallback?.supportsImage !== undefined ? { isVl: fallback.supportsImage } : {}),
+          // 官方 `model_config` 的 display_name / max_input_tokens 必须带上。
+          ...(fallback?.name !== undefined ? { displayName: fallback.name } : {}),
+          ...(fallback?.contextWindow !== undefined ? { maxInputTokens: fallback.contextWindow } : {}),
+          // ⚠️ **`business` 必填**，否则服务端把请求路由到错误的后端节点。
+          //
+          // 实测（2026-09-20）：不带 `business` 时 `qfmodel`（Qwen3.8-Flash）
+          // 恒落到故障节点 `oa_qwen-plus-2025-04-28` 并返回
+          // `[FAIL]node:... msg:Execution failed`；补上 `business` 后立即正常
+          // （其余模型如 `qmodel_38max` 恰好不受影响，故早期排查易误判为
+          // 「该模型服务端故障」）。`agent` / `sec_scan` 等取值都能通。
+          //
+          // 源码依据：`MPi(A) { return A === 'sec_scan' ? 'security' : 'default' }`
+          // —— 服务端按 `business.type` 选路由池，缺字段会走异常分支。
+          business: { type: 'agent' },
+        })
+      } catch (error) {
+        // wasm trap（裸 `unreachable`）在 `qoder-wasm.ts` 的 glue 层已被改写；
+        // 这里再兜一次，覆盖 glue 之外的路径（如 `finally` 里的栈指针回退），
+        // 保证**任何**情况下都不会有裸 `unreachable` 冒到 UI。
+        // 非 trap 错误原样返回，行为逐字节不变。
+        throw describeWasmFailure(error)
+      } finally {
+        client?.dispose()
+      }
     }
 
     // 3. 发送（⚠️ 头必须原样透传：Authorization 是 WASM 生成的

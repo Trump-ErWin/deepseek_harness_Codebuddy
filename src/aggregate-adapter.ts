@@ -2036,16 +2036,25 @@ function abortError(): Error {
  * 该错误是否是「调用方中止」类，而不是「这个候选坏了」类。
  *
  * ⚠️ 两者**必须分开**：中止时换候选会让用户在取消后仍继续跑（且最终抛出的
- * 可能是个误导性的上游错误）。判据取三条：
+ * 可能是个误导性的上游错误）。判据取四条：
  * - `signal.aborted` —— 最权威（调用方确实取消了）；
  * - `name === 'AbortError'` —— `throwIfAborted` / `timers/promises` 的形态；
- * - `code === 'ABORTED'` —— 某些适配器上报失败时的机器码。
+ * - `code === 'ABORTED'` —— 某些适配器上报失败时的机器码；
+ * - 🔴 `message` 含 `aborted request` / `HTTP_499` / `HTTP 499` —— **上游网关的
+ *   499 口径**（nginx「client closed request」＝ 连接在响应完成前被断开）。
+ *   实测（2026-10-11，本会话两次 + 工单 `raccoon-499/01` 取证）：raccoon 网关把
+ *   这类断开报成 `provider: client has aborted request HTTP_499` 的 **error 帧**，
+ *   三条旧判据全不命中 ⇒ 被归成「本轮运行失败」⇒ 消费者看到误导性的 provider
+ *   故障，而真相是「请求没跑完，重发即可」。归 aborted 的语义收益：终端不再
+ *   显示「运行失败」，且外层不把它当「候选坏了」去改道（重发是新请求，不是换候选）。
  */
 function isAbortLike(error: unknown, signal?: AbortSignal): boolean {
   if (signal?.aborted === true) return true
   if (error === null || typeof error !== 'object') return false
-  const candidate = error as { name?: unknown; code?: unknown }
-  return candidate.name === 'AbortError' || candidate.code === 'ABORTED'
+  const candidate = error as { name?: unknown; code?: unknown; message?: unknown }
+  if (candidate.name === 'AbortError' || candidate.code === 'ABORTED') return true
+  const message = typeof candidate.message === 'string' ? candidate.message : ''
+  return /aborted request|HTTP_?499/i.test(message)
 }
 
 /** 在 `ctx.llm` 上注册聚合路由（幂等）。 */
