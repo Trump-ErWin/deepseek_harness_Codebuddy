@@ -138,12 +138,34 @@ function readBool(source: Record<string, unknown>, key: string): boolean {
   return source[key] === true
 }
 
-/** 从 JSON 安全读取数字（兼容字符串形态）。 */
-function readNumber(source: Record<string, unknown>, key: string): number {
+/**
+ * 从 JSON 读取可解析为数字的值（兼容字符串形态）；**不可解析时返回
+ * `undefined`**，与「解析出来就是 0」严格区分。
+ *
+ * ⚠️ 本函数是「一个字段是不是数字」的**唯一判据源**：`readNumber`（不可解析
+ * 时兜底 0）与下方余额判据的 `hasTotal`（不可解析即视为「没下发」）都必须经它，
+ * 否则同一件事会出现两套同义判据（AGENTS.md 首条红线）——「服务端明确下发的 0」
+ * 与「字段缺失」正是被这种分叉压成同一个分支的。
+ */
+function parseNumericField(source: Record<string, unknown>, key: string): number | undefined {
   const value = source[key]
   if (typeof value === 'number' && Number.isFinite(value)) return value
-  if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim())) return Number(value)
-  return 0
+  if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim())) {
+    // ⚠️⚠️ **字符串分支同样必须过 `Number.isFinite`**：正则只保证「长得像定点
+    // 数字」，**不保证落在 double 范围内** —— 401 位纯数字串能通过正则，而
+    // `Number(...)` 得到 `Infinity`。少了这一层，`hasTotal` 会判成「服务端明确
+    // 下发」并透出 `total: Infinity`（JSON 序列化成 `null`，卡片显示异常）——
+    // 正是本判据要防的「解析失败伪装成余额」的 Infinity 版本。
+    // 数字分支早已有这道守卫（上一行），两分支必须**同口径**。
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+/** 从 JSON 安全读取数字（兼容字符串形态）；不可解析时取 0。 */
+function readNumber(source: Record<string, unknown>, key: string): number {
+  return parseNumericField(source, key) ?? 0
 }
 
 /** 从 JSON 安全读取非空数组。 */
@@ -393,7 +415,15 @@ export async function fetchLobsteraiCreditBalance(
   //     账号失效（实测 5/6 账号被这句误导，而调用层当天 0 错误）。
   //   · **字段缺失**＝响应形状变了 → 才视为「查不到」（原注释想防的
   //     「解析失败伪装成 0 积分」由本条守住，`data:{}` 单测继续走 null）。
-  if (envelope.data.totalCreditsRemaining === undefined && packages.length === 0) return null
+  //
+  // ⚠️⚠️ **判据必须是「能不能解析成数字」，不能是「键存不存在」**
+  //（2026-10-12 订正）：`=== undefined` 只挡住「键缺失」，实测它会把
+  // `{totalCreditsRemaining: null}` / `{...: "abc"}` / 溢出成 `Infinity` 的
+  // 超长数字串**都**判成「服务端明确下发 0」⇒ 把**解析失败伪装成余额 0**
+  // —— 正是上面那条注释想防的事，只是换了个入口。
+  // 故统一经 `parseNumericField`（「一个字段是不是数字」的唯一判据源）。
+  const hasTotal = parseNumericField(envelope.data, 'totalCreditsRemaining') !== undefined
+  if (!hasTotal && packages.length === 0) return null
   // 失效包的余额同样 clamp：负值计入 expiredTotal 会让「另有 N 已失效」变成负数。
   const expiredTotal = roundCredits(
     packages.reduce((sum, pkg) => sum + (pkg.active ? 0 : Math.max(0, pkg.remaining)), 0),

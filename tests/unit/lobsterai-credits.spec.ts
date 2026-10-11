@@ -439,6 +439,61 @@ describe('fetchLobsteraiCreditBalance', () => {
     expect(await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)).toBeNull()
   })
 
+  /**
+   * ★★ 判据必须是「**能不能解析成数字**」，不能是「键存不存在」。
+   *
+   * 真实缺陷（2026-10-12 实测）：`envelope.data.totalCreditsRemaining === undefined`
+   * 只挡住「键缺失」，于是**非数字**的值会被当成「服务端明确下发 0」——
+   * 把「解析失败」伪装成「余额 0」，正是上面那条注释想防的事，只换了入口。
+   *
+   * ⚠️ 这三条**必须能抓到该差异**（每条都做过变异验证：把判据退回
+   * `=== undefined` ⇒ 三条全红；放宽成 `'in data'` ⇒ 第三条红）。
+   */
+  it('★ 总额字段值为 null 且无明细 → 仍返回 null（非数字不算「明确下发」）', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: null, creditItems: [] },
+    }), { status: 200 }))
+    expect(
+      await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher),
+      'null 被当成了「明确下发 0」',
+    ).toBeNull()
+  })
+
+  it('★ 总额字段为非数字串且无明细 → 仍返回 null', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: 'abc', creditItems: [] },
+    }), { status: 200 }))
+    expect(
+      await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher),
+      '非数字串被当成了「明确下发 0」',
+    ).toBeNull()
+  })
+
+  it('★ 超长数字串（溢出成 Infinity）→ 归「解析失败」而非「明确下发」', async () => {
+    // ⚠️ 正则 `/^-?\d+(\.\d+)?$/` 只保证「长得像定点数字」，**不保证落在
+    //    double 范围内** —— 401 位纯数字串能过正则，而 `Number(...)` 得到
+    //    `Infinity`。少了 `Number.isFinite`，这里会透出 `total: Infinity`
+    //    （JSON 序列化成 `null`，卡片显示异常）。
+    const huge = '9'.repeat(401)
+    expect(Number(huge)).toBe(Number.POSITIVE_INFINITY) // 前提：确实溢出
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: huge, creditItems: [] },
+    }), { status: 200 }))
+    expect(await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)).toBeNull()
+  })
+
+  it('★ 反例：字符串 "0" 与正常范围字符串仍照常解析（守卫不得误伤）', async () => {
+    for (const [raw, want] of [['0', 0], ['123.45', 123.45]] as const) {
+      const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+        code: 0, data: { totalCreditsRemaining: raw, creditItems: [] },
+      }), { status: 200 }))
+      expect(
+        (await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher))?.total,
+        `字符串 ${JSON.stringify(raw)} 应解析为 ${want}`,
+      ).toBe(want)
+    }
+  })
+
   it('网络失败返回 null', async () => {
     const fetcher = vi.fn(async () => { throw new Error('down') }) as unknown as typeof fetch
     expect(await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)).toBeNull()
