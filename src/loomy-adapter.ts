@@ -45,6 +45,7 @@ import {
   isTransportError,
   serializeMessages,
 } from './openai-compat.js'
+import { planSessionTitleThinking } from './session-title.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `LOOMY.id`）。 */
 export const PROVIDER = 'loomy'
@@ -608,10 +609,32 @@ export class LoomyAdapter extends LlmAdapter {
      */
     const effortsForModel = (await this.loadModels()).find((m) => m.id === options.model)?.efforts
       ?? this.fallbackIndex.get(options.model)?.efforts
-    const effort = options.reasoningEffort !== undefined
+    /**
+     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+     *
+     * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+     * 远端声明的默认档注入进来。本家远端 `reasoning_efforts` 实测形如
+     * `['none','low','medium','high','xhigh']`（**含 `none`**）⇒ 声明了它的
+     * 模型关得掉；远端未声明档位的模型只能抬预算兜底。
+     */
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+      declaredEfforts: effortsForModel ?? [],
+      maxTokens: options.maxTokens,
+    })
+    /**
+     * ⚠️ **仍须做档位白名单校验**（这是本家原有的判据，不能因为接入标题逻辑
+     * 而丢掉）：DSH 会把用户选的档位直接透传，给一个远端不认的值比不给更糟。
+     *
+     * 两种请求的取值来源不同，但**都要过这一关**：
+     * - 标题请求：`titlePlan.effort`（声明了 `none` 时就是它）；
+     * - 普通请求：调用方给的档位（与本次改动前**逐字节等价**）。
+     */
+    const effort = titlePlan.effort !== undefined
       && effortsForModel !== undefined
-      && effortsForModel.includes(options.reasoningEffort)
-      ? options.reasoningEffort
+      && effortsForModel.includes(titlePlan.effort)
+      ? titlePlan.effort
       : undefined
 
     /** 构造请求体。 */
@@ -619,7 +642,7 @@ export class LoomyAdapter extends LlmAdapter {
       model: options.model,
       messages: wireMessages,
       stream: true,
-      ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
+      ...titlePlan.maxTokens !== undefined ? { max_tokens: titlePlan.maxTokens } : {},
       ...options.temperature !== undefined ? { temperature: options.temperature } : {},
       ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
       ...effort !== undefined ? { reasoning_effort: effort } : {},

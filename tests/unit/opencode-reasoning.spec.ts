@@ -90,7 +90,12 @@ describe('档位必须真的发出去（否则只是 UI 装饰）', () => {
   })
 
   it('⚠️ 适配器把 options.reasoningEffort 传进 payload（品牌类型转字符串）', () => {
-    expect(adapter).toMatch(/reasoningEffort: String\(options\.reasoningEffort\)/)
+    // ⚠️ 断言的是**接线意图**（用户选的档位一路到达 payload），不是某一行字面量：
+    // issue IKKVDH 之后中间多了一层 `titlePlan`（它会为标题请求挑选关闭档），
+    // 故这里必须容忍该层存在 —— 钉死旧表达式会让每次接线重构都假失败。
+    // 两段分别对应「源头取 options.reasoningEffort」与「终点写进 payload」。
+    expect(adapter).toMatch(/requestedEffort:[^,]*options\.reasoningEffort/)
+    expect(adapter).toMatch(/reasoningEffort:\s*titlePlan\.effort/)
   })
 
   it('⚠️ none（关闭思考）照发 —— toggle 形态就产出这一档', () => {

@@ -45,6 +45,7 @@ import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
 import { reportLedgerAccount } from './token-ledger.js'
+import { planSessionTitleThinking } from './session-title.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -1661,12 +1662,11 @@ export class BuddyAdapter extends LlmAdapter {
     // 取值优先级：调用方显式给的 options.maxTokens（DSH 会先注入 resolveModel
     // 声明的 defaultMaxTokens）→ 远端 maxOutputTokens → 产品兜底表。
     // 三者皆无则不发该字段，保持网关默认（不编造，理由见 resolveModel）。
-    const maxTokens = positiveMaxTokens(
+    const declaredMaxTokens = positiveMaxTokens(
       options.maxTokens
         ?? this.remoteMeta.get(options.model)?.maxOutputTokens
         ?? this.productFallbackMeta.get(options.model)?.maxOutputTokens,
     )
-    if (maxTokens !== undefined) bodyObj.max_tokens = maxTokens
     // DeepSeek 思维链开关（逆向官方 codebuddy.js，对齐 workbuddy2api-panel
     // thinking.go）。**实测关键结论（2026-09，直连三站点对照）**：
     //   - 裸请求（无 reasoning_effort、无 thinking）→ reasoning_content 恒为 0；
@@ -1677,24 +1677,52 @@ export class BuddyAdapter extends LlmAdapter {
     // 为对齐官方客户端出站形态，并覆盖未来后端按它判定的情形）。
     // 三站点（workbuddy 国际/中国 UA、codebuddy）行为一致 → endpoint/UA 无关。
     const deepseek = isDeepSeekModel(options.model)
-    if (deepseek) {
-      bodyObj.thinking = { type: 'enabled' }
-    }
     // 思考强度：composer 选中的等级透传为 `reasoning_effort`（实测
     // low/high/max 会显著改变返回的 reasoning_content 长度，服务端真实生效）。
     // 只在该模型确实支持该等级时才发，否则服务端会因非法参数 400。
     const efforts = this.effortsFor(options.model)
-    if (options.reasoningEffort !== undefined && efforts.includes(options.reasoningEffort)) {
-      bodyObj.reasoning_effort = options.reasoningEffort
-    } else if (deepseek && efforts.length > 0) {
-      // composer 未选档位（历史请求可能 `adapterDefaults: undefined`）或所选
-      // 档位不被支持时，必须补一个档位——否则请求体里只剩 thinking，上游仍按
-      // 不思考应答（实测）。回退顺序：声明默认档 → high（对齐官方客户端
-      // REASONING_SUPPLEMENTS.defaultEffort 与 thinking.go 的兜底）→ 最低支持档
-      // （绝不臆造模型未声明的档位，否则服务端 400）。
-      bodyObj.reasoning_effort = this.defaultEffortFor(options.model)
-        ?? (efforts.includes('high') ? 'high' : efforts[0])
+    const requestedEffort = options.reasoningEffort !== undefined && efforts.includes(options.reasoningEffort)
+      ? options.reasoningEffort
+      : undefined
+    /**
+     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策。
+     *
+     * 见 `session-title.ts` 的模块头：DSH 用 **64 token** 发标题请求、
+     * 且**不传 `reasoningEffort`**，而宿主会把本模型的默认档注入进来
+     * （`effective = requested ?? reasoning.defaultEffort`）。若照常开思考，
+     * 实测 64 个 token 会被思考**全部吃满**、正文 0 字符、
+     * `finish_reason: 'length'` ⇒ `dsh-session-title-llm` 直接拒绝，
+     * 标题永远停在 fallback（issue IKKVDH）。
+     *
+     * 本家的关闭手段是**发裸请求**（`disableByOmission`）：实测
+     * 「无 `reasoning_effort`、无 `thinking` → `reasoning_content` 恒为 0」。
+     * ⚠️ 故下面**不能**再给 deepseek 系补默认档 —— 那正是缺陷的成因。
+     */
+    const plan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: requestedEffort ?? (deepseek && efforts.length > 0
+        ? this.defaultEffortFor(options.model) ?? (efforts.includes('high') ? 'high' : efforts[0])
+        : undefined),
+      declaredEfforts: efforts,
+      maxTokens: declaredMaxTokens,
+      // ⚠️ 只有 deepseek 系实测「不发字段即关闭」；其余模型族（glm/kimi）
+      // 走各自 thinkingFormat，语义未实测，故不给它们这个豁免。
+      disableByOmission: deepseek,
+    })
+    if (plan.isTitle) {
+      // 标题请求：关得掉就不发任何思考字段（buddy 的 deepseek 系）；
+      // 关不掉（如 glm/kimi 无 `off` 档）则保留原档位并由 plan 抬预算兜底。
+      if (plan.effort !== undefined) bodyObj.reasoning_effort = plan.effort
+    } else {
+      if (deepseek) {
+        bodyObj.thinking = { type: 'enabled' }
+      }
+      if (plan.effort !== undefined) {
+        bodyObj.reasoning_effort = plan.effort
+      }
     }
+    const maxTokens = plan.maxTokens
+    if (maxTokens !== undefined) bodyObj.max_tokens = maxTokens
     const body = JSON.stringify(bodyObj)
 
     // 4. 发送请求（401/403 时刷新当前账号一次，仍失败则换号重试）

@@ -15,6 +15,7 @@ import { isCodeArtsBenefitModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { planSessionTitleThinking } from './session-title.js'
 import type { CodeArtsCredential } from './types.js'
 import {
   registerAdapterIdempotent,
@@ -1305,6 +1306,25 @@ export class CodeArtsAdapter extends LlmAdapter {
       messages.splice(messages.findIndex(m => m.role === 'system') + 1, 0, { role: 'system', content: buildDsmlSystemPrompt(wireTools) })
       wireTools = undefined
     }
+    /**
+     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+     *
+     * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+     * 本模型声明的默认档（本家恒为 `'on'`）注入进来
+     * （`effective = requested ?? reasoning.defaultEffort`）。照常开思考时实测
+     * 64 个 token 会被思考**全部吃满**、正文 0 字符、`finish_reason:'length'`
+     * ⇒ `dsh-session-title-llm` 直接拒绝，标题永远停在 fallback。
+     *
+     * 本家的档位表是**恒声明的两档**（`on`/`off`，见 `resolveModel`），
+     * 与具体模型无关 ⇒ 任何模型都**关得掉**，故这里必然走「关掉思考」分支，
+     * 不需要抬预算（抬预算是「花钱买通」，思考本身要计费）。
+     */
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+      declaredEfforts: ['on', 'off'],
+      maxTokens: options.maxTokens,
+    })
     const body = JSON.stringify({
       model: options.model,
       messages,
@@ -1321,7 +1341,13 @@ export class CodeArtsAdapter extends LlmAdapter {
       // （两者是不同网关的方言，混用会静默无效）。
       // 实测判据：`disabled` → reasoning_tokens 3/3 全为 0、正文仍正确；
       // `enabled` 与不传等价（服务端默认就开着），故「开启」档**不发**该字段。
-      ...options.reasoningEffort === 'off' ? { thinking: { type: 'disabled' } } : {},
+      //
+      // ⚠️ 标题请求走 `titlePlan`（上方），它会把档位定成 `'off'`，
+      // 于是这里同样发 `disabled` —— 两条判据**合并写**在一个表达式里，
+      // 避免「标题请求绕开了关闭」这类静默失效。
+      ...titlePlan.thinkingOff || options.reasoningEffort === 'off'
+        ? { thinking: { type: 'disabled' } }
+        : {},
       // 对齐 CodeArts Agent IDE 请求体（deveco-code 内核日志实证）：
       // tool_stream=true 让后端将超大工具调用参数（如大文件 file_write）
       // 分段流式传输，避免单次 SSE 事件过大导致连接被掐断
@@ -1342,7 +1368,10 @@ export class CodeArtsAdapter extends LlmAdapter {
       // 走网关的路径由 `openai-gateway/messages.ts` 的 `normalizeMaxTokens`
       // 预先收敛，但**不经过网关的直连路径完全绕过那道判据**。
       // ⇒ 这里是最后一道防线，必须自己收敛，不能依赖上游调用方守规矩。
-      max_tokens: clampCodeArtsMaxTokens(options.maxTokens) ?? CODEARTS_MAX_OUTPUT_TOKENS,
+      // ⚠️ 抬预算（`titlePlan.maxTokens`，关不掉思考时才有值）必须走**同一个**
+      // 钳制函数，否则会被钳回原值、兜底静默失效。标题请求的 512 远小于上限，
+      // 故实际不会被钳；这里统一走一遍是为了「预算只有一个出口」。
+      max_tokens: clampCodeArtsMaxTokens(titlePlan.maxTokens) ?? CODEARTS_MAX_OUTPUT_TOKENS,
       ...wireTools !== undefined && wireTools.length > 0 ? { tools: wireTools } : {},
     })
     const url = `${CHAT_API_BASE}/chat/completions`
