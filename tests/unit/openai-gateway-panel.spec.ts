@@ -13,6 +13,7 @@ import {
   gatewayEndpoint,
   gatewayLoopbackOnly,
   gatewayFootnote,
+  nonLoopbackNotice,
   gatewayEffortRow,
   gatewayEffortRows,
   gatewayEffortsCurl,
@@ -107,14 +108,24 @@ describe('本机网关面板的文案与判定', () => {
    * 可配之后会变成错误陈述：用户绑了容器桥接 IP 时，看到「只绑 127.0.0.1」
    * 会以为「外面连不上是设计如此」，从而把真实故障排查方向带偏。
    */
-  it('★ 回环判据：127.0.0.0/8 与 ::1 算回环，其余一律按「不只回环」处理', () => {
-    expect(gatewayLoopbackOnly(RUNNING)).toBe(true)
-    expect(gatewayLoopbackOnly({ ...RUNNING, address: { host: '127.0.0.2', port: 8326 } })).toBe(true)
-    expect(gatewayLoopbackOnly({ ...RUNNING, address: { host: '::1', port: 8326 } })).toBe(true)
-    expect(gatewayLoopbackOnly({ ...RUNNING, address: { host: '172.21.0.8', port: 8326 } })).toBe(false)
-    expect(gatewayLoopbackOnly({ ...RUNNING, address: { host: '0.0.0.0', port: 8326 } })).toBe(false)
-    // ⚠️ 主机名解析不做（前端不猜 DNS）：未知按**不保守漏报**处理 —— 提示仍出现。
-    expect(gatewayLoopbackOnly({ ...RUNNING, address: { host: 'localhost', port: 8326 } })).toBe(false)
+  /**
+   * ⚠️ 回环判据必须与宿主侧**同源**（审计实测：两套判据立刻漂移）。
+   *
+   * 客户端初版自己写 `/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/` + `=== '[::1]'`，
+   * 于是 `127.1` / `0:0:0:0:0:0:0:1` / `::ffff:127.0.0.1` / `localhost`
+   * 这些**内核实测只在回环可达**的写法被判成「已对外暴露」⇒ 面板输出它自己
+   * 声称要消除的那种错误安全陈述。这批逐条锁住。
+   */
+  it('★ 回环判据：127.0.0.0/8、::1、IPv4-mapped 回环、localhost 都算回环', () => {
+    for (const host of [
+      '127.0.0.1', '127.0.0.2', '127.1', '127.0.0.1.', '::1', '[::1]',
+      '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1', '::ffff:7f00:1', 'localhost',
+    ]) {
+      expect(gatewayLoopbackOnly({ ...RUNNING, address: { host, port: 8326 } }), host).toBe(true)
+    }
+    for (const host of ['172.21.0.8', '192.168.3.125', '0.0.0.0', '::', '::ffff:0:0', 'fe80::1', 'host.docker.internal']) {
+      expect(gatewayLoopbackOnly({ ...RUNNING, address: { host, port: 8326 } }), host).toBe(false)
+    }
     // address 缺失时按回环（此时根本没有「已暴露」这件事可说，且不该在没运行时报警）。
     expect(gatewayLoopbackOnly(OFF)).toBe(true)
     expect(gatewayLoopbackOnly(null)).toBe(true)
@@ -156,6 +167,39 @@ describe('本机网关面板的文案与判定', () => {
     expect(text).toContain('密钥')
     // ⚠️ 「不要配置进浏览器端工具或扩展」也必须留着（暴露面变大时它更关键）。
     expect(text).toContain('浏览器端工具或扩展')
+    // ⚠️ **必须点名宿主**（红队 netns 实测：宿主经端口映射可达，而它既不是
+    // 「同网络容器」也不是「同机进程」，只说「同网络」会把它漏掉）。
+    expect(text).toContain('宿主')
+    expect(nonLoopbackNotice(bridged)).toContain('宿主')
+  })
+
+  /**
+   * ⚠️⚠️ **这些文案渲染进 React 文本节点，markdown 的 `**` 会原样显示星号**。
+   *
+   * 本仓库已有同型事故（`clineExhaustedAdvice`：用户截图里就是 `**当日免费额度**`，
+   * 见 `docs/agent-notes/providers-cline.md` 的三条规矩）。我在初版非回环脚注里
+   * 写了 `隔离**只**靠密钥` —— 那会原样显示星号。
+   *
+   * 判据用**真实函数的返回值**（而不是源码文本），对实现方式中立。
+   */
+  it('★★ 面板文案一律不得含 markdown 标记（星号会原样显示）', () => {
+    const bridged = { ...RUNNING, address: { host: '172.21.0.8', port: 8326 } }
+    const texts = [
+      gatewayFootnote(RUNNING), gatewayFootnote(bridged), gatewayFootnote(null),
+      nonLoopbackNotice(bridged),
+      ...gatewayStatusLines(RUNNING), ...gatewayStatusLines(bridged),
+      ...gatewayStatusLines(WANTED_BUT_DOWN), ...gatewayStatusLines(ENV_BLOCKED),
+      gatewayToggleNotice(bridged, true), gatewayToggleNotice(RUNNING, true),
+      gatewayToggleNotice(OFF, false), gatewayToggleNotice(ENV_BLOCKED, true),
+      gatewayButtonTitle(RUNNING), gatewayButtonTitle(bridged),
+      gatewayApiKeyHint({ fromEnv: true, path: null, value: 'k' }),
+      gatewayApiKeyHint({ fromEnv: false, path: 'C:/x/api-key', value: 'k' }),
+      gatewayEndpoint(RUNNING), gatewayEndpoint(bridged),
+      gatewayModelsCurl(gatewayEndpoint(RUNNING)), gatewayEffortsCurl(gatewayEndpoint(bridged)),
+    ]
+    for (const text of texts) {
+      expect(text, text).not.toContain('**')
+    }
   })
 
   it('「已选择开启但没监听」必须与「运行中」说不同的话', () => {
