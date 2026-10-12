@@ -496,9 +496,22 @@ export async function completeLogin(
  *
  * ⚠️ refresh_token **一次性**：成功后必须立即落盘（见模块头注释的死循环教训）。
  *
+ * ⚠️ **并发互斥**（2026-10-12 事故的根因加固）：refresh_token 一次性 ——
+ *    两个并发调用（如续期调度器 + 用户点刷新）带着**同一个** token 同时打到
+ *    STS，先到的消费掉、后到的拿 STS5.1806；若先到的写盘前被中断（用户停轮 /
+ *    进程退出），新 token 就**永久丢失**，唯一出路是重新登录。故这里用模块级
+ *    in-flight Promise 把并发调用合并为一次：后到者直接等先到者的结果。
+ *
  * @returns 新凭据；refresh_token 失效（STS5.1806）返回 undefined（需重新登录）。
  */
-export async function refreshStoredCredential(): Promise<OfficeAceCredential | undefined> {  const current = readStoredCredential()
+let refreshInFlight: Promise<OfficeAceCredential | undefined> | undefined
+export function refreshStoredCredential(): Promise<OfficeAceCredential | undefined> {
+  refreshInFlight ??= doRefreshStoredCredential().finally(() => { refreshInFlight = undefined })
+  return refreshInFlight
+}
+
+async function doRefreshStoredCredential(): Promise<OfficeAceCredential | undefined> {
+  const current = readStoredCredential()
   if (current === undefined || current.refreshToken.length === 0) return undefined
   const privateKey = await importDpopPrivateKey(current.dpopPrivateJwk)
   const publicJwk: JsonWebKey = { kty: 'EC', crv: 'P-256', x: current.dpopPrivateJwk.x, y: current.dpopPrivateJwk.y }
@@ -516,7 +529,14 @@ export async function refreshStoredCredential(): Promise<OfficeAceCredential | u
     signal: AbortSignal.timeout(30_000),
   })
   if (!r.ok) {
-    // STS5.1806 = refresh_token 已被消费/失效 → 需要重新登录
+    // ⚠️ **必须留痕**（仓库约定：失败不允许静默吞掉）。此前这里静默
+    //    `return undefined`，refresh_token 被消费丢失（STS5.1806）时日志零字，
+    //    用户只看到「渠道停了 / 余额不更新」，无从排查（2026-10-12 事故实测）。
+    const detail = await r.text().catch(() => '')
+    console.warn(
+      `[officeace] STS 续期失败 HTTP ${r.status}：${detail.slice(0, 200)}`
+      + '（refresh_token 是一次性的：若报 STS5.1806 已被消费，必须重新登录才能恢复云端 API）',
+    )
     return undefined
   }
   const token = (await r.json()) as IamTokenResponse
