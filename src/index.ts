@@ -2287,6 +2287,16 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   //（协议逆向见 `officeace-auth.ts` 模块头）。
   const officeAceAdapter = registerOfficeAceLlm(ctx, {
     disabledModels: () => pool.disabledModelsFor(OFFICEACE.id),
+    // ⚠️ **按当前选中账号的 ref 取凭据**（2026-10-13）：凭据存在 DSH 凭据库里
+    //    按 `credentialRef` 索引（与 gemini / raccoon 同款）。缺省会读兼容文件
+    //    `session.json`，那份是**所有账号共用**的 ⇒ 号池轮换形同虚设。
+    credentialProvider: async () => {
+      const available = await pool.getAvailableAccount(OFFICEACE.id, '')
+      const ref = available?.entry?.credentialRef
+        ?? pool.listAccountsByProvider(OFFICEACE.id).find((e) => e.enabled !== false)?.credentialRef
+      if (ref === undefined) return officeaceAuth.readStoredCredential()
+      return officeaceAuth.readCredential(ref, ctx.credentials as never)
+    },
     // ⚠️ **必须注入**（同其余渠道）：宿主在「登录 / 点刷新积分」等时机调它把新凭据
     //    拉进来。漏接的症状是该渠道的账号永不过期 —— 用户重新登录后旧凭据仍被
     //    继续用，且日志里一个字都没有。
@@ -2747,8 +2757,11 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   //    ⚠️ opencode 的积分也**不在** `creditsTable` 里（它的余额是本地派生的
   //    通道可用性、零网络，作为特例留在 `credits.balances` 里短路）。
   const officeaceAuthService = {
+    // ⚠️ **必须传 `ctx.credentials`**：多账号下每个账号的凭据存在 DSH 凭据库里
+    //    按 ref 索引。不传 ⇒ 走兼容文件 `session.json`，那一份是**所有账号共用**
+    //    的，续期会串号（2026-10-13 改造）。
     refreshAccountCredential: (refName: string, pool: unknown, accountId: string) =>
-      officeaceAuth.refreshAccountCredential(refName, pool as never, accountId),
+      officeaceAuth.refreshAccountCredential(refName, pool as never, accountId, ctx.credentials as never),
     /**
      * ⚠️ `refreshAll` **内部必须走本对象的 `refreshAccountCredential`**，不能直接调
      * 模块函数：守卫用例（`provider-runtime-wiring.spec.ts`）的判据是「布桩在

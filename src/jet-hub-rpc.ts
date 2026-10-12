@@ -1938,12 +1938,20 @@ function registerJetHubEndpoints(
    * - `dpopPrivateJwk`：DPoP 的 ES256 私钥（换 token 时签名，且**刷新要复用**）。
    *
    * ⚠️ 放内存而不落盘：`state` 与 `code` 都是**分钟级一次性**凭据，登录完成即无意义；
-   *    落盘只会留下无用的秘密副本。真正需要持久化的 `dpopPrivateJwk` 在
-   *    `completeLogin` 之后由凭据存储接管（`~/.dsh-officeace/session.json`）。
+   *    落盘只会留下无用的秘密副本。真正需要持久化的凭据在 `persistLogin` 之后
+   *    由 **DSH 凭据库**接管（按 `credentialRef` 索引，见 `officeace-auth.ts`）。
+   *
+   * ⚠️ `credentialRef` **必须跟着走**：登录完成时按它把凭据写进**这一个账号**
+   *    的槽位。缺了它，新凭据就落到公共 `session.json` 覆盖了别人（2026-10-13）。
    */
   const pendingOfficeAceState = new Map<
     string,
-    { state: string; codeVerifier: string; dpopPrivateJwk: import('./officeace-auth.js').DpopPrivateJwk }
+    {
+      state: string
+      codeVerifier: string
+      dpopPrivateJwk: import('./officeace-auth.js').DpopPrivateJwk
+      credentialRef: string
+    }
   >()
 
   /**
@@ -2816,36 +2824,6 @@ function registerJetHubEndpoints(
           return { ok: true, value: { accountId: id, loginUrl: geminiStarted.loginUrl } }
         } else if (provider === OFFICEACE.id) {
           /**
-           * ⚠️ **单凭据渠道：禁止重复登录**（2026-10-13 实测）。
-           *
-           * OfficeAce 的凭据是**单一文件** `~/.dsh-officeace/session.json`
-           * （华为云 OAuth 单账号流程），不像 buddy / gemini 那样「每卡片一份
-           * 独立凭据」。故建第二条卡片有两个必现后果：
-           *   1. 第二次登录**直接覆盖**那个文件 ⇒ 第一条卡片的凭据被静默冲掉；
-           *   2. 两条卡片显示**同一份**余额 ⇒ 面板合计重复计数（实测量到
-           *      6500 显示成 13000）。
-           *
-           * 故入口直接拒绝：已有条目时报错并要求先删除。这比「在余额汇总里
-           * 按凭据文件去重」更正确 —— 后者只掩盖显示，第一条的凭据**依然**
-           * 已被覆盖丢失，是数据损坏而非显示瑕疵。
-           *
-           * @see officeace-auth.ts 模块头「单凭据文件」设计说明
-           */
-          const existing = await pool.listAccounts(OFFICEACE.id)
-          if (existing.length > 0) {
-            return {
-              ok: false,
-              error: {
-                code: 'bad-request',
-                message:
-                  `OfficeAce 是单凭据渠道（凭据存于本机 session.json），同一时间只能有一个账号。`
-                  + '请先删除已有的 OfficeAce 账号，再重新登录 —— 否则新登录会覆盖原凭据，'
-                  + '且余额会被重复计数。',
-              },
-            }
-          }
-
-          /**
            * OfficeAce（华为 ModelArts MaaS）走**华为云 OAuth（PKCE + DPoP）**，
            * 全程**不依赖 OfficeAce 客户端**（协议逆向见 `officeace-auth.ts` 模块头）。
            *
@@ -2881,6 +2859,10 @@ function registerJetHubEndpoints(
             state: started.state,
             codeVerifier: started._internal.codeVerifier,
             dpopPrivateJwk: started._internal.dpopPrivateJwk,
+            // ⚠️ **必须带上 ref**：`completeLogin` 按它分文件落盘。缺省会让
+            //    新账号的凭据写进公共 `session.json`，覆盖其他账号的凭据
+            //    （多账号共存的前提，2026-10-13 改造）。
+            credentialRef: refName,
           })
 
           return { ok: true, value: { accountId: id, loginUrl: started.authorizeUrl } }
@@ -3070,8 +3052,17 @@ function registerJetHubEndpoints(
                     pending.codeVerifier,
                     pending.dpopPrivateJwk,
                   )
+                  // ⚠️ **落库走 DSH 凭据库（标准范式）**：与 gemini / raccoon /
+                  //    minimax 的 `persistLogin(credential, { refName })` 同款 ——
+                  //    凭据按 `credentialRef` 索引 ⇒ 每个账号一份，互不覆盖。
+                  //    这是号池多账号能成立的根（自己写 session.json 的版本
+                  //    必然串号，2026-10-13 改造）。
+                  const persisted = await auths.officeace.persistLogin(credential, {
+                    refName: pending.credentialRef ?? entry.credentialRef,
+                    credentials: ctx.credentials as never,
+                  })
                   pendingOfficeAceState.delete(req.accountId)
-                  const accountId = credential.accountId ?? ''
+                  const accountId = persisted.accountId ?? credential.accountId ?? ''
                   await pool.updateAccount(req.accountId, {
                     nickname: accountId.length > 0
                       ? `OfficeAce ${accountId.slice(0, 8)}`
@@ -3880,55 +3871,63 @@ function registerJetHubEndpoints(
           //    冒泡成 `ok:false`（真实症状：`officeace 应被接受` 变红）。
           //    取不到就如实回「查询失败」，与网络失败同一条降级路径。
           const fetchSummary = auths.officeace?.fetchSubscriptionSummary
-          const subscription = fetchSummary === undefined
-            ? undefined
-            : await fetchSummary.call(auths.officeace).catch(() => undefined)
-          if (subscription === undefined) {
-            return {
-              ok: true,
-              value: {
-                accounts: accounts.map((account) => ({
-                  accountId: account.id,
-                  nickname: account.nickname,
-                  balance: null,
-                  error: '积分查询失败（华为云订阅接口不可达或凭据已失效）',
-                })),
-                // ⚠️ **失败路径也要回传 `windowDays`**：该字段表达的是「本渠道
-                //    按到期时间分桶」（registry 的 `usesExpiryWindow`），与本次
-                //    读数成功与否**无关**。只在成功路径带它会让「空账号池 / 查询
-                //    失败」时形状不一致 —— 守卫用例遍历 registry 时正会红
-                //（实测症状：`officeace 必须回传 windowDays`）。
-                windowDays: buddyExpiringWindowDays(),
-              } satisfies RpcCreditsBalancesResponse,
+          // ⚠️ **逐账号查询，不共享一份结果**（2026-10-13）：
+          //    原实现只查一次就拿去填所有卡片 ⇒ N 个账号显示同一个余额，
+          //    面板合计被放大 N 倍（实测两个账号显示 13000 = 6500×2）。
+          //    每个账号按自己的 `credentialRef` 查自己那份订阅。
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const subscription = fetchSummary === undefined
+              ? undefined
+              : await fetchSummary.call(
+                auths.officeace,
+                48,
+                account.credentialRef,
+                undefined,
+                ctx.credentials as never,
+              ).catch(() => undefined)
+            if (subscription === undefined) {
+              values.push({
+                accountId: account.id,
+                nickname: account.nickname,
+                balance: null,
+                error: '积分查询失败（华为云订阅接口不可达或凭据已失效）',
+              })
+              continue
             }
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              balance: {
+                total: subscription.totalCredits,
+                packages: subscription.creditGroups.map((group) => ({
+                  name: group.name,
+                  unit: OFFICEACE.quotaUnit,
+                  remaining: group.remaining,
+                  total: group.total,
+                  used: group.used ?? 0,
+                  active: !group.expired,
+                  cycleStartTime: '',
+                  cycleEndTime: '',
+                  expiredTime: group.expiresAt ?? '',
+                  // 分桶判据字段：订阅套餐包无固定到期（永久桶），活动/签到包有明确到期。
+                  ...(group.expiresAt !== undefined && group.expiresAt !== null
+                    ? { deductionEndTime: new Date(group.expiresAt).getTime() }
+                    : {}),
+                })),
+                expiredTotal: subscription.creditGroups.filter((g) => g.expired).length,
+              },
+            })
           }
-          const values = accounts.map((account) => ({
-            accountId: account.id,
-            nickname: account.nickname,
-            balance: {
-              total: subscription.totalCredits,
-              packages: subscription.creditGroups.map((group) => ({
-                name: group.name,
-                unit: OFFICEACE.quotaUnit,
-                remaining: group.remaining,
-                total: group.total,
-                used: group.used ?? 0,
-                active: !group.expired,
-                cycleStartTime: '',
-                cycleEndTime: '',
-                expiredTime: group.expiresAt ?? '',
-                // 分桶判据字段：订阅套餐包无固定到期（永久桶），活动/签到包有明确到期。
-                ...(group.expiresAt !== undefined && group.expiresAt !== null
-                  ? { deductionEndTime: new Date(group.expiresAt).getTime() }
-                  : {}),
-              })),
-              expiredTotal: subscription.creditGroups.filter((g) => g.expired).length,
-            },
-          }))
           return {
             ok: true,
             value: {
               accounts: values,
+              // ⚠️ **成功/失败都要回传 `windowDays`**：该字段表达的是「本渠道
+              //    按到期时间分桶」（registry 的 `usesExpiryWindow`），与本次
+              //    读数成功与否**无关**。只在成功路径带它会让「空账号池 / 查询
+              //    失败」时形状不一致 —— 守卫用例遍历 registry 时正会红
+              //（实测症状：`officeace 必须回传 windowDays`）。
               windowDays: buddyExpiringWindowDays(),
             } satisfies RpcCreditsBalancesResponse,
           }

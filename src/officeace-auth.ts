@@ -38,6 +38,7 @@ import * as https from 'node:https'
 import * as net from 'node:net'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { OFFICEACE } from './officeace-product.js'
 
 /** WebCrypto 的 JWK/CryptoKey 类型（lib.dom 不可用时手动声明最小形状）。 */
@@ -88,11 +89,26 @@ interface StoredSession extends OfficeAceCredential {
 }
 
 // ────────────────────────── 存储 ──────────────────────────
+//
+// ⚠️ **按 credentialRef 分文件**（2026-10-13 改造）：原先所有卡片共用
+//    `session.json` 一个文件 ⇒ 第二次登录覆盖第一次的凭据，多账号无法共存。
+//    现在每个账号一份 `session-<ref>.json`，与其余渠道「每卡片一份独立凭据」
+//    的形状对齐 —— 号池轮换/多账号才真正可用。
+//
+//    ⚠️ 兼容：无 ref 时仍落 `session.json`（老数据、以及不传 ref 的调用点），
+//    `readStoredCredential()` 的默认读取路径不变。
+
+/** 凭据 ref → 文件名（只保留安全字符，避免 ref 里的特殊字符污染路径）。 */
+function storeFileFor(ref?: string): string {
+  if (ref === undefined || ref.length === 0) return storeFile()
+  const safe = ref.replace(/[^A-Za-z0-9._-]/g, '_')
+  return path.join(storeDir(), `session-${safe}.json`)
+}
 
 /** 读当前凭据；不存在/损坏返回 undefined。 */
-export function readStoredCredential(): OfficeAceCredential | undefined {
+export function readStoredCredential(ref?: string): OfficeAceCredential | undefined {
   try {
-    const raw = fs.readFileSync(storeFile(), 'utf8').replace(/^\uFEFF/, '')
+    const raw = fs.readFileSync(storeFileFor(ref), 'utf8').replace(/^\uFEFF/, '')
     const j = JSON.parse(raw) as StoredSession
     if (typeof j.modelAppKey !== 'string' || j.modelAppKey.length === 0) return undefined
     return j
@@ -102,17 +118,18 @@ export function readStoredCredential(): OfficeAceCredential | undefined {
 }
 
 /** 写凭据（原子替换：先写 tmp 再 rename，防进程中途被杀留下半文件）。 */
-function writeStoredCredential(credential: OfficeAceCredential): void {
+function writeStoredCredential(credential: OfficeAceCredential, ref?: string): void {
+  const target = storeFileFor(ref)
   fs.mkdirSync(storeDir(), { recursive: true })
   const payload: StoredSession = { ...credential, savedAt: new Date().toISOString() }
-  const tmp = `${storeFile()}.tmp-${process.pid}`
+  const tmp = `${target}.tmp-${process.pid}`
   fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8')
-  fs.renameSync(tmp, storeFile())
+  fs.renameSync(tmp, target)
 }
 
 /** 清除凭据（登出/刷新死循环时的自救入口）。 */
-export function clearStoredCredential(): void {
-  try { fs.rmSync(storeFile(), { force: true }) } catch { /* ignore */ }
+export function clearStoredCredential(ref?: string): void {
+  try { fs.rmSync(storeFileFor(ref), { force: true }) } catch { /* ignore */ }
 }
 
 // ────────────────────────── DPoP（复刻 OfficeAce oauth-crypto.js）──────────────────────────
@@ -461,9 +478,18 @@ export function readSessionCookie(): string | undefined {
 }
 
 /**
- * 完成登录：code → token → modelInfo → 落盘。
+ * 完成登录：code → token → modelInfo → **返回凭据（不落盘）**。
  *
  * ⚠️ 必须在轮询到 code 后**立刻**调用（code 秒级时效）。
+ *
+ * ⚠️ **落盘由调用方通过 {@link persistLogin} 完成**（与 gemini / raccoon /
+ *    minimax 同款 `persistLogin(credential, { refName })` 范式）：凭据存进
+ *    DSH 凭据库并按 `credentialRef` 索引 —— **这才是号池能多账号的根**。
+ *    本文件早先自己写了 `session.json`，那是绕开凭据库的孤岛，正是
+ *    「第二条卡片覆盖第一条」的成因（2026-10-13 改造）。
+ *
+ * ⚠️ 兼容：仍在**默认文件**写一份（`session.json`），供尚未走凭据库的
+ *    老调用点与 `probeOfficeAce` 读取。多账号路径**不依赖**它。
  */
 export async function completeLogin(
   code: string,
@@ -485,8 +511,56 @@ export async function completeLogin(
     dpopPrivateJwk,
   }
   await fetchModelInfo(credential)
-  writeStoredCredential(credential)
   return credential
+}
+
+/**
+ * 落库凭据（登录成功后由 RPC 调用）—— **DSH 标准范式**。
+ *
+ * 与 `gemini-auth.ts` / `raccoon-auth.ts` / `minimax-auth.ts` 的
+ * `persistLogin(credential, { refName })` **同款**：
+ * `ctx.credentials.set(credentialRef(refName), JSON.stringify(credential))`。
+ *
+ * ⚠️ 凭据按 `refName` 索引进 DSH 凭据库 ⇒ 每个账号一份，**互不覆盖**，
+ *    号池多账号/轮换天然成立。这是与「自己写 session.json」的本质区别。
+ */
+export async function persistLogin(
+  credential: OfficeAceCredential,
+  options: { refName: string; credentials: CredentialStore },
+): Promise<{ accountId?: string }> {
+  await options.credentials.set(credentialRef(options.refName), JSON.stringify(credential))
+  // 兼容：老调用点（probe / 面板状态探测）仍读默认文件，顺手写一份。
+  try { writeStoredCredential(credential) } catch { /* 兼容路径失败不影响主流程 */ }
+  return credential.accountId === undefined ? {} : { accountId: credential.accountId }
+}
+
+/** 凭据存储的最小接口（`ctx.credentials` 的形状）。 */
+export interface CredentialStore {
+  set(ref: string, value: string): Promise<void>
+  resolve(ref: string): Promise<{ value: string } | undefined>
+  unset?(ref: string): Promise<void>
+}
+
+/**
+ * 按 ref 读凭据（**优先 DSH 凭据库**，回落默认文件）。
+ *
+ * ⚠️ 这个次序不能反：多账号下每个账号的凭据在凭据库里按 ref 索引，
+ *    `session.json` 只是老数据的兼容兜底 —— 先读文件会串号。
+ */
+export async function readCredential(
+  ref: string,
+  credentials?: CredentialStore,
+): Promise<OfficeAceCredential | undefined> {
+  if (credentials !== undefined) {
+    try {
+      const resolved = await credentials.resolve(credentialRef(ref))
+      if (resolved !== undefined && resolved.value.length > 0) {
+        const parsed = JSON.parse(resolved.value) as OfficeAceCredential
+        if (typeof parsed.modelAppKey === 'string' && parsed.modelAppKey.length > 0) return parsed
+      }
+    } catch { /* 解析失败 → 回落文件 */ }
+  }
+  return readStoredCredential()
 }
 
 // ────────────────────────── 刷新 ──────────────────────────
@@ -504,15 +578,40 @@ export async function completeLogin(
  *
  * @returns 新凭据；refresh_token 失效（STS5.1806）返回 undefined（需重新登录）。
  */
-let refreshInFlight: Promise<OfficeAceCredential | undefined> | undefined
-export function refreshStoredCredential(): Promise<OfficeAceCredential | undefined> {
-  refreshInFlight ??= doRefreshStoredCredential().finally(() => { refreshInFlight = undefined })
-  return refreshInFlight
+// ⚠️ **按 ref 分桶**：不同账号的 refresh_token 互不相干，合并到同一个
+//    in-flight 会让「A 正在续期」把 B 的续期也挡住（B 白白等到 A 完成，
+//    且拿回的是 A 的结果 —— 在多账号下这是错值，不只是延迟）。
+const refreshInFlight = new Map<string, Promise<OfficeAceCredential | undefined>>()
+export function refreshStoredCredential(ref?: string): Promise<OfficeAceCredential | undefined> {
+  const key = ref ?? ''
+  const pending = refreshInFlight.get(key)
+  if (pending !== undefined) return pending
+  const task = doRefreshStoredCredential(ref).finally(() => { refreshInFlight.delete(key) })
+  refreshInFlight.set(key, task)
+  return task
 }
 
-async function doRefreshStoredCredential(): Promise<OfficeAceCredential | undefined> {
-  const current = readStoredCredential()
+async function doRefreshStoredCredential(ref?: string): Promise<OfficeAceCredential | undefined> {
+  const current = readStoredCredential(ref)
   if (current === undefined || current.refreshToken.length === 0) return undefined
+  const next = await doRefreshCredential(current)
+  if (next === undefined) return undefined
+  // STS 刷新成功即旧 refresh_token 作废 —— 立即落盘（顺序不能反）
+  writeStoredCredential(next, ref)
+  return next
+}
+
+/**
+ * 续期**一份已读入内存的凭据**（纯协议：STS 交换 + modelInfo），**不落盘**。
+ *
+ * ⚠️ 抽出来的原因：凭据可能来自 DSH 凭据库（`refreshAccountCredential` 的
+ *    多账号路径），也可能来自兼容文件（老数据）。落盘职责留给调用方 ——
+ *    否则写回凭据库的凭据会被顺手再写一份到 `session.json`，重新制造串号。
+ */
+async function doRefreshCredential(
+  current: OfficeAceCredential,
+): Promise<OfficeAceCredential | undefined> {
+  if (current.refreshToken.length === 0) return undefined
   const privateKey = await importDpopPrivateKey(current.dpopPrivateJwk)
   const publicJwk: JsonWebKey = { kty: 'EC', crv: 'P-256', x: current.dpopPrivateJwk.x, y: current.dpopPrivateJwk.y }
   const dpopJwt = await generateDpopJwt(privateKey, publicJwk, 'POST', TOKEN_URL)
@@ -550,12 +649,10 @@ async function doRefreshStoredCredential(): Promise<OfficeAceCredential | undefi
     expiresAt: c.expiration,
     refreshToken: token.refresh_token ?? current.refreshToken,
   }
-  // STS 刷新成功即旧 refresh_token 作废 —— 立即落盘（顺序不能反）
-  writeStoredCredential(next)
-  // modelInfo 里的 MaaS 凭据也随之更新（可能轮换）
+  // ⚠️ **不落盘**（由调用方负责）：本函数只做协议交换。
+  //    modelInfo 里的 MaaS 凭据也随之更新（可能轮换）。
   try {
     await fetchModelInfo(next)
-    writeStoredCredential(next)
   } catch {
     // modelInfo 拉取失败不回滚 STS：推理凭据可能仍有效
   }
@@ -563,39 +660,61 @@ async function doRefreshStoredCredential(): Promise<OfficeAceCredential | undefi
 }
 
 /**
- * 「按账号续期」的兼容入口 —— 满足 `JetHubAuthLike` 的形状，供
+ * 「按账号续期」入口 —— 满足 `JetHubAuthLike` 的形状，供
  * `account.refresh` / 批量续期表 / `provider-runtime` 统一分派。
  *
- * ## ⚠️ 为什么忽略 `refName` / `pool` / `accountId`
+ * ## ⚠️ `refName` **必须真正生效**（2026-10-13 修正）
  *
- * OfficeAce 的凭据是**单一文件**（`~/.dsh-officeace/session.json`），
- * 不像其余渠道那样「每账号一个 credentialRef」。它的登录是华为云 OAuth
- * 的**单账号**流程，账号池里的条目只是展示用的占位。
+ * 原注释写的是「OfficeAce 是单凭据文件，故忽略 refName」—— 那是**凭据共用**
+ * 这个缺陷的伴随假设。凭据改为**按 ref 分文件**后，多账号天然共存，这里就
+ * 必须按 `refName` 定位到那一份文件去续期；否则 N 个账号会把同一份凭据
+ * 续期 N 次（后 N-1 次拿到 STS5.1806 —— refresh_token 一次性已被消费）。
  *
- * 故这里做的是「重读并续期那一份凭据」—— 与 Loomy / ZCode 的
- * `refreshAccountCredential` 同类（它们也只做有效性探测 / 重读，没有真正的
- * per-ref 刷新协议）。
- *
- * ⚠️ 返回值恒 `undefined`（`void` 语义）：续期成功与否由**调用方后续读凭据**判定，
- * 这里不抛错 —— 与其余渠道一致（失败不阻断批量续期）。
+ * ⚠️ 返回值恒 `undefined`（`void` 语义）：续期成功与否由**调用方后续读凭据**
+ * 判定，这里不抛错 —— 与其余渠道一致（失败不阻断批量续期）。
  */
 export async function refreshAccountCredential(
-  _refName: string,
+  refName: string,
+  pool: unknown,
+  accountId: string,
+  credentials?: CredentialStore,
+): Promise<void> {
+  // ⚠️ **优先走 DSH 凭据库**（多账号的正确路径）：按 ref 读、续期、写回。
+  //    回落文件版 `refreshStoredCredential(ref)` 只为兼容老数据。
+  const current = await readCredential(refName, credentials)
+  if (current === undefined) {
+    const legacy = await refreshStoredCredential(refName).catch(() => undefined)
+    await writebackExpiry(legacy, pool, accountId)
+    return
+  }
+  const next = await doRefreshCredential(current)
+  if (next === undefined) return
+  if (credentials !== undefined) {
+    try {
+      await credentials.set(credentialRef(refName), JSON.stringify(next))
+    } catch { /* 写回失败不阻断 */ }
+  } else {
+    writeStoredCredential(next, refName)
+  }
+  await writebackExpiry(next, pool, accountId)
+}
+
+/** 把新有效期写回账号池条目（与 gemini 同款），抽出来供两条路径复用。 */
+async function writebackExpiry(
+  next: OfficeAceCredential | undefined,
   pool: unknown,
   accountId: string,
 ): Promise<void> {
-  const next = await refreshStoredCredential().catch(() => undefined)
-  // ⚠️ 续期成功后**必须把新有效期写回池条目**（与 gemini 同款）：漏写时卡片
-  //    「有效期」停在旧值直至显示「已过期」（真实症状 2026-10-13）。
-  if (next !== undefined) {
-    const p = pool as {
-      updateAccount?: (id: string, patch: { expiresAt: number }) => Promise<unknown>
-    } | undefined
-    try {
-      await p?.updateAccount?.(accountId, { expiresAt: new Date(next.expiresAt).getTime() })
-    } catch {
-      // 写回失败不阻断续期（凭据已落盘，下次刷新会再试）
-    }
+  // ⚠️ 续期成功后**必须把新有效期写回池条目**：漏写时卡片「有效期」停在旧值
+  //    直至显示「已过期」（真实症状 2026-10-13）。
+  if (next === undefined) return
+  const p = pool as {
+    updateAccount?: (id: string, patch: { expiresAt: number }) => Promise<unknown>
+  } | undefined
+  try {
+    await p?.updateAccount?.(accountId, { expiresAt: new Date(next.expiresAt).getTime() })
+  } catch {
+    // 写回失败不阻断续期（凭据已落盘，下次刷新会再试）
   }
 }
 
@@ -650,9 +769,17 @@ export interface OfficeAceSubscriptionSummary {
   }>
 }
 
-/** 订阅缓存的落盘路径（余额离线兜底用，与凭据同目录）。 */
-function subscriptionCacheFile(): string {
-  return path.join(storeDir(), 'subscription-cache.json')
+/**
+ * 订阅缓存的落盘路径（余额离线兜底用，与凭据同目录）。
+ *
+ * ⚠️ **按 ref 分文件**（2026-10-13）：多账号下若共用一个缓存文件，
+ *    后查的账号会把先查的余额盖掉 ⇒ 所有卡片显示最后一次查询的结果。
+ */
+function subscriptionCacheFile(ref?: string): string {
+  if (ref === undefined || ref.length === 0) {
+    return path.join(storeDir(), 'subscription-cache.json')
+  }
+  return path.join(storeDir(), `subscription-cache-${ref.replace(/[^A-Za-z0-9._-]/g, '_')}.json`)
 }
 
 interface CachedSubscription extends OfficeAceSubscriptionSummary {
@@ -660,9 +787,9 @@ interface CachedSubscription extends OfficeAceSubscriptionSummary {
   cachedAt: string
 }
 
-function readSubscriptionCache(): CachedSubscription | undefined {
+function readSubscriptionCache(ref?: string): CachedSubscription | undefined {
   try {
-    const j = JSON.parse(fs.readFileSync(subscriptionCacheFile(), 'utf8').replace(/^\uFEFF/, '')) as CachedSubscription
+    const j = JSON.parse(fs.readFileSync(subscriptionCacheFile(ref), 'utf8').replace(/^\uFEFF/, '')) as CachedSubscription
     if (typeof j.totalCredits !== 'number') return undefined
     return j
   } catch {
@@ -670,13 +797,14 @@ function readSubscriptionCache(): CachedSubscription | undefined {
   }
 }
 
-function writeSubscriptionCache(summary: OfficeAceSubscriptionSummary): void {
+function writeSubscriptionCache(summary: OfficeAceSubscriptionSummary, ref?: string): void {
   try {
     fs.mkdirSync(storeDir(), { recursive: true })
     const payload: CachedSubscription = { ...summary, cachedAt: new Date().toISOString() }
-    const tmp = `${subscriptionCacheFile()}.tmp-${process.pid}`
+    const target = subscriptionCacheFile(ref)
+    const tmp = `${target}.tmp-${process.pid}`
     fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8')
-    fs.renameSync(tmp, subscriptionCacheFile())
+    fs.renameSync(tmp, target)
   } catch { /* 缓存失败不影响主流程 */ }
 }
 
@@ -689,10 +817,41 @@ function writeSubscriptionCache(summary: OfficeAceSubscriptionSummary): void {
  * 缓存**兜底（`stale: true` 标记，展示层据此标注「数据截至 hh:mm」）。
  * 推理本身从不依赖此函数——余额只是展示。
  *
+ * ## ⚠️ 多账号（2026-10-13）：查**哪个**账号由入参决定
+ *
+ * 传了 `credential` / `ref` 时**优先走云侧 V11 直读** —— 因为下面的本地 API 走
+ * 的是果办客户端的**全局单一 cookie**（`oc_sid`），它只反映「当前登录在果办里的
+ * 那一个账号」，**无法按 ref 区分** ⇒ 多账号下会让所有卡片显示同一个账号的
+ * 余额（实测两个账号都显示 6500）。故多账号**必须**走云侧。
+ *
  * @param staleHours - 缓存超过多少小时视为过期（默认 48）。过期且在线拉取
  *   失败时仍返回缓存（聊胜于无），由 `stale` 标记让 UI 如实呈现。
+ * @param ref - 账号的 credentialRef（用于定位缓存文件）。
+ * @param credential - 直接注入凭据（**多账号最可靠**：免一次解析，且明确指向某账号）。
+ * @param credentials - DSH 凭据库；给了就按 `ref` 从库里读（多账号标准路径）。
  */
-export async function fetchSubscriptionSummary(staleHours = 48): Promise<(OfficeAceSubscriptionSummary & { stale?: boolean; cachedAt?: string }) | undefined> {
+export async function fetchSubscriptionSummary(
+  staleHours = 48,
+  ref?: string,
+  credential?: OfficeAceCredential,
+  credentials?: CredentialStore,
+): Promise<(OfficeAceSubscriptionSummary & { stale?: boolean; cachedAt?: string }) | undefined> {
+  // 0. **多账号路径**：有 ref 时先走云侧直读（本地 cookie 无法区分账号）。
+  //    成功即返回，不落到下面的本地 API —— 那会串号。
+  if (ref !== undefined && ref.length > 0) {
+    try {
+      const own = credential ?? await readCredential(ref, credentials)
+      const cloud = own === undefined ? undefined : await fetchCloudSubscriptionFor(own)
+      if (cloud !== undefined) {
+        writeSubscriptionCache(cloud, ref)
+        return cloud
+      }
+    } catch { /* 掉到该账号的缓存兜底 */ }
+    const own = readSubscriptionCache(ref)
+    if (own !== undefined) return { ...own, stale: true }
+    return undefined
+  }
+
   // 1. **主路径：OfficeAce 本地 API**（装了客户端且在运行时可用，实测稳定）
   try {
     const sidValue = readSessionCookie()
@@ -748,6 +907,8 @@ export async function fetchSubscriptionSummary(staleHours = 48): Promise<(Office
       return cloud
     }
   } catch { /* 掉到缓存兜底 */ }
+  // ⚠️ 云侧直读失败时**不要**跨账号兜底：读 `ref` 的缓存，没有就是没有
+  //（退回全局缓存会把 A 的余额显示成 B 的，比显示「查询失败」更糟）。
 
   // 3. 离线兜底：最近一次缓存（标注 stale）
   const cached = readSubscriptionCache()
@@ -838,8 +999,26 @@ async function signAndGet(url: string, credential: OfficeAceCredential): Promise
  * 与 bonus 桶（`bonus_skus[]`）—— 与果办界面右上角的分桶完全同源
  *（复刻自 OfficeAce `hHe()` 的归一化逻辑）。
  */
-async function fetchCloudSubscription(): Promise<OfficeAceSubscriptionSummary | undefined> {
-  const credential = readStoredCredential()
+/**
+ * 云侧直读的**兼容包装**：先按 ref 读凭据，再调 {@link fetchCloudSubscriptionFor}。
+ *
+ * ⚠️ 多账号调用方应**直接用 `fetchCloudSubscriptionFor(credential)`** 并显式
+ *    传入自己那份凭据 —— 由本函数去猜该读哪份，正是串号的来源。
+ */
+async function fetchCloudSubscription(ref?: string): Promise<OfficeAceSubscriptionSummary | undefined> {
+  const credential = readStoredCredential(ref)
+  return fetchCloudSubscriptionFor(credential)
+}
+
+/**
+ * 用**给定**凭据云侧直读订阅（V11 签名）。
+ *
+ * ⚠️ 凭据由调用方明确指定，本函数不做任何「该读哪一份」的猜测 ——
+ *    多账号下这个猜测必错（实测两个账号都显示第一个账号的余额）。
+ */
+async function fetchCloudSubscriptionFor(
+  credential: OfficeAceCredential | undefined,
+): Promise<OfficeAceSubscriptionSummary | undefined> {
   if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
     return undefined
   }
