@@ -98,6 +98,32 @@ describe('Issue IKL7UN：网关监听地址可配', () => {
     expect(() => createOpenAiGateway({ llm, home: undefined, env: ENV('0.0.0.0', 8326) })).toThrow(/DSH_OPENAI_GATEWAY_HOST/)
   })
 
+  /**
+   * ⚠️⚠️ **第三轮审计的方法学结论：纯函数绿 ≠ 安全。**
+   *
+   * 审计实测 `isWildcardHost('0。0。0。0') === false`（判据放行）**而内核真的绑了
+   * 全部网卡**（从局域网 IP 反连得到 `HTTP 401`）。⇒ 光断言纯函数不够，
+   * 必须有**真实入口 + 真 bind + 局域网反连**这一层。
+   *
+   * 本用例锁的是「这些写法在**构造期**就被拒」（`createOpenAiGateway` 是同步的，
+   * 非法 host 在这里即抛 ⇒ 架构上不可能先绑上去再报错）。
+   */
+  it('★★ 非 ASCII 分隔符的 host 必须在构造期被拒（真实入口，非纯函数断言）', () => {
+    // Linux 上 glibc 会把下列分隔符当 `.`：实测真 bind 全部得到 `0.0.0.0`。
+    const bypasses = [
+      '0\u30020\u30020\u30020',  // U+3002 表意句号
+      '0\uff610\uff610\uff610',  // U+FF61 半角表意句号
+      '0\u18060\u18060\u18060',  // U+1806 蒙古文破折号
+      '0\u20240\u20240\u20240',  // U+2024 一点前导符
+      '0\ufe520\ufe520\ufe520',  // U+FE52 小句点
+      '\uff10.\uff10.\uff10.\uff10',
+    ]
+    for (const host of bypasses) {
+      expect(() => createOpenAiGateway({ llm, home: undefined, env: ENV(host, 8326) }), JSON.stringify(host))
+        .toThrow(/DSH_OPENAI_GATEWAY_HOST/)
+    }
+  })
+
   it('★ 监听日志印的是完整可达 URL（IPv6 也要能抄）', async () => {
     const logs: string[] = []
     const port = await freePort()
