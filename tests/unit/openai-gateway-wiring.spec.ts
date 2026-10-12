@@ -18,6 +18,14 @@ interface FakeContext {
   logger: { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void }
   llm: unknown
   effect(fn: () => unknown, name?: string): unknown
+  /**
+   * ⚠️ 必须提供：`mountOpenAiGateway()` 会经 `ctx.get('attachments')` 桥接附件服务
+   * （见 `makeGatewayAttachmentBridge`）。**缺了它整条启动链会在这一步抛**
+   * —— 而那条抛错被刻意 catch 成一条日志（网关是旁路功能），于是用例会
+   * 「通过」但**从未真的启动过网关**：任何「host/端口真的生效了吗」的断言都
+   * 得不到验证（本文件新增的 IKL7UN 用例正是这么发现的）。
+   */
+  get(name: string): unknown
 }
 
 function makeContext(): { ctx: FakeContext; cleanups: Array<() => unknown>; logs: string[] } {
@@ -35,6 +43,8 @@ function makeContext(): { ctx: FakeContext; cleanups: Array<() => unknown>; logs
       resolveModelInfo: async () => ({}),
       stream: () => { throw new Error('not used in wiring tests') },
     },
+    // 附件服务缺失：网关的文本能力不受影响（这是真实支持的降级路径）。
+    get: () => undefined,
     effect(fn) {
       const cleanup = fn()
       if (typeof cleanup === 'function') cleanups.push(cleanup)
@@ -46,6 +56,7 @@ function makeContext(): { ctx: FakeContext; cleanups: Array<() => unknown>; logs
 
 const ENV_KEYS = [
   'DSH_OPENAI_GATEWAY_PORT',
+  'DSH_OPENAI_GATEWAY_HOST',
   'DSH_OPENAI_GATEWAY_API_KEY',
   'DSH_OPENAI_GATEWAY_ENABLED',
   'DSH_JET_HUB_STATE_DIR',
@@ -59,6 +70,7 @@ beforeEach(() => {
   process.env.DSH_JET_HUB_STATE_DIR = home
   process.env.DSH_OPENAI_GATEWAY_API_KEY = 'wiring-test-key'
   delete process.env.DSH_OPENAI_GATEWAY_PORT
+  delete process.env.DSH_OPENAI_GATEWAY_HOST
   delete process.env.DSH_OPENAI_GATEWAY_ENABLED
 })
 
@@ -139,5 +151,46 @@ describe('网关的插件接线', () => {
 
     const { isGatewayRunning } = await import('../../src/openai-gateway/runtime.js')
     expect(isGatewayRunning()).toBe(false)
+  })
+
+  /**
+   * Issue IKL7UN 的**接线**锁：host 必须从 env 一路走到内核绑定的网卡上。
+   *
+   * ⚠️ 与 `openai-gateway-host-binding.spec.ts` 的分工：那里直接调
+   * `createOpenAiGateway()`（验证 server 用了 host），这里走**插件真实入口**
+   * `mountOpenAiGateway()` + 模块级 runtime 单例（验证 env → 配置 → 工厂 → start
+   * 这条链没断）。少了这一层，「工厂里把 host 丢掉」这种改动不会被发现。
+   */
+  it('★ DSH_OPENAI_GATEWAY_HOST 经插件入口生效，且反映在 gatewayAddress() 上', async () => {
+    const { ctx } = makeContext()
+    // 127.0.0.2 是 Linux/macOS/Windows 上都存在的另一个回环地址（实测可绑），
+    // 用它就不必占用真实网卡，也不会与「只绑 127.0.0.1」的实现混淆。
+    process.env.DSH_OPENAI_GATEWAY_HOST = '127.0.0.2'
+
+    mountOpenAiGateway(ctx)
+    await settle()
+
+    const { isGatewayRunning, gatewayAddress } = await import('../../src/openai-gateway/runtime.js')
+    expect(isGatewayRunning()).toBe(true)
+    expect(gatewayAddress()?.host).toBe('127.0.0.2')
+    // 端口是 OS 分配的（未指定 PORT），只锁它是个合法端口号。
+    expect(gatewayAddress()?.port).toBeGreaterThan(0)
+  })
+
+  it('★ 非法 host（通配地址）只降级为日志，绝不抛回 apply()', async () => {
+    const { ctx, logs } = makeContext()
+    process.env.DSH_OPENAI_GATEWAY_HOST = '0.0.0.0'
+
+    // 与端口非法同一条契约：网关是旁路功能，它配错不能拖垮整个插件。
+    expect(() => mountOpenAiGateway(ctx)).not.toThrow()
+    await settle()
+
+    const { isGatewayRunning } = await import('../../src/openai-gateway/runtime.js')
+    expect(isGatewayRunning()).toBe(false)
+    const text = logs.join('\n')
+    expect(text).toContain('DSH_OPENAI_GATEWAY_HOST')
+    // ⚠️ 日志必须说明「未启动」而不是只留一句环境变量名 —— 用户要能据此知道
+    // 网关没在跑（否则会以为只是没生效而反复重启）。
+    expect(text).toContain('未启动')
   })
 })
