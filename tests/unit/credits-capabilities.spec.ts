@@ -395,6 +395,120 @@ describe('客户端积分请求门控（源码级回归）', () => {
     expect(guardIndex).toBeLessThan(callIndex)
   })
 
+  /**
+   * ★ **自愈后的账号重读**（issue IKKHL5 的客户端残留，报告者复验时实测到）。
+   *
+   * ## 缺陷
+   *
+   * 宿主侧的 `credits.balances` 会**对已过期账号先续期再查余额**，续期成功后把
+   * 新的 `expiresAt` 回写账号池。但**卡片红字读的是 `account.list` 的快照**
+   *（`AccountCard` 里 `account.expiresAt <= Date.now()`），而 `loadCredits`
+   * 不重读账号列表 ⇒ 「积分已经能读了，卡片却还红着『已过期 · 自动续期』」，
+   * 点别的卡片再切回来才恢复正常。
+   *
+   * ## 为什么必须有这条用例
+   *
+   * 这是**跨端点**的时序契约（`credits.balances` 的副作用要反映到
+   * `account.list` 的消费者上），两个端点各自的单测都覆盖不到它 ——
+   * 服务端 22 条 + 客户端能力门控若干条，全都测不出这个残留。
+   */
+  /**
+   * ★ **自愈后的账号重读**（issue IKKHL5 的客户端残留，报告者复验时实测到）。
+   *
+   * ## 缺陷
+   *
+   * 宿主侧的 `credits.balances` 会**对已过期账号先续期再查余额**，续期成功后把
+   * 新的 `expiresAt` 回写账号池。但**卡片红字读的是 `account.list` 的快照**
+   *（`AccountCard` 里 `account.expiresAt <= Date.now()`），而 `loadCredits`
+   * 不重读账号列表 ⇒ 「积分已经能读了，卡片却还红着『已过期 · 自动续期』」。
+   *
+   * ## ⚠️⚠️ 初版修复对**主场景无效**（对抗审计实测证伪，本组用例因而重写）
+   *
+   * 初版用「调用前快照里有没有已过期账号」（`hadExpired`）作条件。但挂载
+   * effect 里 `void loadAccounts(); … void loadCredits();` 是**同步先后**
+   * 发起的，而 `loadAccounts` 要到它的首个 `await rpcCall('account.list')`
+   * **之后**才写 `accountsRef.current` ⇒ 挂载 / 切 provider 时读到的必然是
+   * **初始空数组**（`useRef([])`），`hadExpired` 恒 false、**永不补读**。
+   * 而「睡眠恢复后打开面板」**正是本 issue 的主场景** ⇒ 初版只对「点刷新积分」
+   * 等列表已加载的路径有效，主路径完全没修。
+   *
+   * ## 现行修法：成功后**无条件**静默补读
+   *
+   * 不再依赖任何「调用前快照」（那个判据在主场景下不可能为真）。代价是每次
+   * 余额查询多一次 `account.list` —— 这是**刻意的取舍**：它读的是账号池的
+   * 内存副本（不是上游请求），而卡片状态错误的代价更高。
+   * 且必须走 `quiet` 变体，否则普通 `loadAccounts` 的 `setPhase('loading')`
+   * 会让列表在自愈成功那一刻闪一下。
+   */
+  it('★ loadCredits 成功后**无条件**补读账号列表（不得再用「调用前快照」作条件）', () => {
+    const start = source.indexOf('const loadCredits = React.useCallback')
+    expect(start).toBeGreaterThan(-1)
+    const body = source.slice(start, start + 3000)
+    const rpcIndex = body.indexOf("rpcCall('credits.balances'")
+    expect(rpcIndex).toBeGreaterThan(-1)
+
+    // ① 必须调静默补读，且在余额请求**之后**（拿到新余额后才同步有效期）。
+    const reReadIndex = body.indexOf('await reloadAccountsQuietly()')
+    expect(reReadIndex, 'loadCredits 成功后必须补读账号列表').toBeGreaterThan(-1)
+    expect(reReadIndex, '补读必须在余额请求之后').toBeGreaterThan(rpcIndex)
+
+    // ② ⚠️ **不得**再用「调用前快照」作条件 —— 那正是初版对主场景失效的原因
+    //    （挂载时 accountsRef.current 必为初始空数组）。这条是**防复辟**断言。
+    // ⚠️ 只在**代码行**上查（剔除注释）：本函数的注释里保留了叙述该缺陷的
+    //    文字（含那个旧标识符），那是刻意的历史记录，不该让断言自伤
+    //    —— 与本仓库「不要在注释里写出会被验收 grep 的字符串」是同一条教训。
+    const codeOnly = body
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(codeOnly, '挂载首轮 accountsRef 为空 ⇒ 该判据恒假，不得复辟')
+      .not.toContain('hadExpired')
+    expect(codeOnly).not.toContain('snapshotBefore')
+  })
+
+  it('★ 补读走 quiet 变体（不得让列表在自愈成功那一刻闪「正在读取」）', () => {
+    // 普通 `loadAccounts` 首行是 `setPhase('loading')`，用它会让整块列表
+    // 在余额回来那一刻闪一下 —— 本函数只是顺带同步有效期，不该改变加载态。
+    const start = source.indexOf('const reloadAccountsQuietly = React.useCallback')
+    expect(start, '未找到 reloadAccountsQuietly（补读的静默变体）').toBeGreaterThan(-1)
+    const body = source.slice(start, start + 1200)
+    expect(body).toContain("rpcCall('account.list'")
+    expect(body, 'quiet 变体不得 setPhase').not.toContain("setPhase('loading')")
+    // 失败必须静默（余额已经拿到了，不该把面板推进错误态）
+    expect(body, 'quiet 变体不得 setError').not.toContain('setError(')
+  })
+
+  it('★ 挂载 effect 仍是「并行发起」也不影响正确性（现行修法不依赖时序）', () => {
+    // 这条锁住「新修法对挂载路径有效」这个**关键性质**：既然补读是无条件的，
+    // 就与 loadAccounts/loadCredits 的先后无关 —— 初版正是因为依赖了时序
+    // （快照必须在账号加载完之后）才对主场景失效。
+    //
+    // ⚠️ 锚点用**该调用本身**（`void loadAccounts();`）而不是
+    // `React.useEffect(() => {`：后者会命中文件里**更早**的其它 effect
+    //（本组件有多个），取到的片段里当然没有这两个调用 —— 初版就是这么假失败的。
+    const mountCall = source.indexOf('void loadAccounts();')
+    expect(mountCall, '未找到挂载 effect 里的 void loadAccounts()').toBeGreaterThan(-1)
+    const effectBody = source.slice(mountCall, mountCall + 300)
+    expect(effectBody).toContain('if (canLoadCredits) void loadCredits();')
+    // 无需把挂载改成串行：补读是无条件的（见上一条）
+    expect(source).toMatch(/await reloadAccountsQuietly\(\)/)
+  })
+
+  it('loadCredits 的 useCallback deps 含补读函数（避免陈旧闭包）', () => {
+    // 补读是**本函数新增的调用**：deps 不带它会让 React 持有旧闭包
+    //（陈旧 provider / rpcCall），补读打到错误的面板上。
+    //
+    // ⚠️ **不写死整串 deps**（本仓 AGENTS.md 明令「接线断言一律容忍重构与
+    // 签名扩展」；初版写死了 `[provider, rpcCall, canLoadCredits, loadAccounts]`
+    // 整串，加一个依赖就假失败）。这里只断言「补读函数出现在 deps 数组里」。
+    const start = source.indexOf('const loadCredits = React.useCallback')
+    const body = source.slice(start, start + 3200)
+    const depsMatch = /\}, \[([^\]]*)\]\)/.exec(body)
+    expect(depsMatch, '未解析到 loadCredits 的 deps 数组').not.toBeNull()
+    expect(depsMatch![1], 'deps 必须含 reloadAccountsQuietly').toContain('reloadAccountsQuietly')
+    expect(depsMatch![1], 'deps 必须含 provider').toContain('provider')
+  })
+
   it('「刷新积分」按钮与账号卡片的「积分」行都按能力渲染', () => {
     // 归一化 CRLF：本仓库源码在 Windows 上是 CRLF，直接比对多行字面量会假失败。
     const normalized = source.replace(/\r\n/g, '\n')
