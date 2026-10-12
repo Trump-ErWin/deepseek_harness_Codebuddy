@@ -100,6 +100,84 @@ export interface ZcodeCaptchaConfig {
   prefix: string
   /** 场景 id。 */
   sceneId: string
+  /**
+   * 上游是否**启用** captcha（服务端 `data.configs.captcha.enabled`）。
+   *
+   * ⚠ **可选**：缺席 = 「不知道」，不是 `false`。两者语义完全不同
+   * （见 {@link requiresCaptchaUpfront}）。
+   */
+  enabled?: boolean
+  /**
+   * 上游是否**对模型请求（推理）跳过** captcha 校验
+   * （服务端 `data.configs.captcha.skip_model_request`）。
+   *
+   * ## 为什么这个字段必须读出来（2026-10-12，用户要求核实 3.14.5）
+   *
+   * 官方闭源版 **3.14.5** 的渲染层产物（`out/renderer/assets/styles-*.js`）
+   * 逆向得到这样一条链：
+   *
+   * ```js
+   * // ① 准入：只有智谱积分账号走这条
+   * function xnn(e){ return e?.access?.type==='zhipu-account' && e.access.mode==='start-plan' }
+   *
+   * // ② 索要 captcha（`model-request` 与 `captcha-retry` 两种 reason 都进这里）
+   * async function Lnn(e){
+   *   if (!xnn(e.providerConfig)) return
+   *   if (t?.enabled===false || t?.skipModelRequest===true) return { headers:{} }  // ← 跳过
+   *   const n = await Pnn(t, {...})
+   *   return { headers: unn({ captchaVerifyParam: n, captchaRegion: t.region }) }
+   * }
+   * ```
+   *
+   * 且 host 侧新增 `interaction/requestProviderRuntimeHeaders` RPC，其 `reason`
+   * 取值域是 `['model-request', 'captcha-retry']` —— **推理请求真的会走 captcha**，
+   * 被拒后还会用 `captcha-retry` 重试一轮。
+   *
+   * 服务端**当前**把开关关着（本机实测，只发 GET、零额度）：
+   * `{ enabled:true, prefix:'no8xfe', region:'cn', sceneId:'11xygtvd',
+   *    skip_model_request:true }` ⇒ `Lnn` 第二行即返回，不产 param、不注头。
+   *
+   * ⚠ **官方把它转成 camelCase**（`getCaptchaConfig()` 里逐字
+   * `let { skip_model_request: r, ...o } = n; return { ...o,
+   * ...typeof r === 'boolean' ? { skipModelRequest: r } : {} }`）——
+   * 我们的读法必须与它一致，且**同样只在真的是布尔时才写字段**。
+   */
+  skipModelRequest?: boolean
+}
+
+/**
+ * 上游是否**明确要求**推理请求带 captcha —— 即「首发就该带，别再先探」。
+ *
+ * ## 三态（这是本判据的全部要点，别简化成布尔）
+ *
+ * | `skipModelRequest` | `enabled` | 返回 | 理由 |
+ * |---|---|---|---|
+ * | **`false`** | 非 `false` | **`true`** | 上游明确要 ⇒ 先探**必然**被 `3007` 拒，白吃一发往返 |
+ * | `true` | 非 `false` | `false` | 上游明确不校验 ⇒ 先探零成本，且能省掉一次 mint |
+ * | **缺席 / 非布尔** | 任意 | `false` | **不知道就不猜** |
+ * | 任意 | **`false`** | `false` | 上游把 captcha 整个关了 ⇒ 一票否决 |
+ *
+ * ## ⚠⚠ 两个最容易写反的地方
+ *
+ * 1. **方向**：能省的是 `skipModelRequest === false`（明确要 ⇒ 直接带），
+ *    **不是** `true`。`true` 表示上游不校验，先探本来就零成本、无可省。
+ * 2. **缺席 ≠ `false`**：若写成 `skipModelRequest !== true` 或
+ *    `Boolean(skipModelRequest === false)` 之类的宽松判据，就会在
+ *    **老配置 / 上游字段漂移**时把「不知道」当成「上游明确要验证」，
+ *    于是**每个请求白发一个 param** —— 白扣的是阿里云**设备级**配额
+ *    （同设备每小时 150 次，实测口径见 `captcha-backoff.ts`）。
+ *    这正是本仓库记过的「读不到就不猜」原则（同额度桶那条）。
+ *
+ * ⚠ 判据**只读配置**，不发网络、不碰浏览器 ⇒ 可以在热路径上每次调用。
+ */
+export function requiresCaptchaUpfront(
+  config: Pick<ZcodeCaptchaConfig, 'enabled' | 'skipModelRequest'> | undefined,
+): boolean {
+  if (config === undefined) return false
+  // 上游把 captcha 整个关掉时，无论 skip_model_request 是什么都不该带。
+  if (config.enabled === false) return false
+  // ⚠ 严格等于 `false`：`undefined`（缺席）走不到这里 ⇒ 保守回到先探。
+  return config.skipModelRequest === false
 }
 
 /**
