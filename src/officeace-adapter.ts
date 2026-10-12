@@ -35,10 +35,44 @@ export interface OfficeAceAdapterOptions {
    *    `ctx.llm.adapterByProvider.get(id).options.refresh` 是函数）。
    */
   refresh?: () => Promise<void>
+  /**
+   * 图片读取桥（宿主 `makeReadImage(ctx)`）—— **图片输入的必要条件**。
+   *
+   * 未提供时收到图片消息会报 `UNSUPPORTED_CONTENT`（与 trae 同约定）：
+   * 静默丢图会让用户以为模型看到了图，实际它什么都没看见。
+   */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 黑名单模型 id（面板「显示列表」开关）。 */
   disabledModels?: () => ReadonlySet<string>
   /** 目录可用后回调 —— 接线层注入 `broadcastCatalogChanged(ctx)`。 */
   onCatalogLoaded?: () => void
+}
+
+/**
+ * 该模型是否接受图片输入（**实测表**，依据见 `OFFICEACE_MODELS` 的 `multimodal` 注）。
+ *
+ * `/v2/models` 不返回能力元数据，只能逐个实测 —— 未入库的 id 保守按不支持。
+ */
+function isMultimodalModel(model: string): boolean {
+  return OFFICEACE_MODELS.some((m) => m.id === model && (m as { multimodal?: boolean }).multimodal === true)
+}
+
+/**
+ * 收集消息中的图片附件引用（含工具结果内层，任意深度），按 attachmentId 去重。
+ *
+ * ⚠️ 与 trae / buddy / lobsterai 的同名助手同义。收集必须**递归**进
+ * `tool-result.content`：只走一层时，深层图片会被收进 refs 却在序列化时丢失。
+ */
+function collectImages(content: readonly unknown[], refs: Map<string, unknown>): void {
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as { type?: unknown; attachment?: { attachmentId?: unknown }; content?: unknown }
+    if (block.type === 'image' && typeof block.attachment?.attachmentId === 'string') {
+      refs.set(block.attachment.attachmentId, block.attachment)
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) collectImages(block.content, refs)
+  }
 }
 
 export class OfficeAceAdapter extends LlmAdapter {
@@ -104,7 +138,10 @@ export class OfficeAceAdapter extends LlmAdapter {
           provider: OFFICEACE.id,
           id: m.id,
           name: coeff !== undefined ? `${m.name} · x${coeff}` : m.name,
-          inputModalities: ['text'],
+          // ⚠️ **图片准入闸门**（实测表见 `OFFICEACE_MODELS` 的 `multimodal` 注）：
+          //    不声明 `image` 时附件在入库阶段就被拒（用户看到「当前模型不支持
+          //    图片」）—— 这是对 6 个纯文本模型的**诚实**行为。
+          inputModalities: isMultimodalModel(m.id) ? (['text', 'image'] as const) : (['text'] as const),
         }
       })
   }
@@ -131,7 +168,8 @@ export class OfficeAceAdapter extends LlmAdapter {
       provider,
       id: model,
       name: coeff !== undefined ? `${baseName} · x${coeff}` : baseName,
-      inputModalities: ['text'],
+      // 与 listModels 同源：准入闸门两处都要说真话（实测表见 OFFICEACE_MODELS）。
+      inputModalities: isMultimodalModel(model) ? (['text', 'image'] as const) : (['text'] as const),
       // ⚠️ **未知 id 不编造 `context`**：目录外的模型我们不知道它的上下文窗口，
       //    拿一个猜测值（131072）会让自动压缩按错误阈值决策 —— 如实 `undefined`
       //    比编一个数诚实（`model-catalog-parity.spec.ts` 会红并点名这种编造）。
@@ -196,9 +234,75 @@ export class OfficeAceAdapter extends LlmAdapter {
       ? options.maxTokens
       : undefined
 
+    // ── 图片输入（多模态）──
+    // 收集 → 闸门 → 读字节 → 注入序列化结果。四步各自可失败，逐一说明：
+    const imageRefs = new Map<string, unknown>()
+    for (const message of options.messages) {
+      const content = Array.isArray(message.content) ? message.content : []
+      collectImages(content, imageRefs)
+    }
+    let imageUrls: Map<string, string> | undefined
+    if (imageRefs.size > 0) {
+      if (!isMultimodalModel(model)) {
+        // ⚠️ 双保险：DSH 的准入闸门（inputModalities）已在附件阶段拦住大多数，
+        //    但目录缓存过期 / 模型 id 未入库时仍可能漏到这里 —— 上游会对纯文本
+        //    模型回 400 并报废整轮对话，早失败 + 文案明确更好。
+        throw new Error(
+          `OfficeAce: 模型 "${model}" 不支持图片输入。`
+          + `已实测支持：DeepSeek-V4.1-Flash、Kimi-K2.6（见 OFFICEACE_MODELS 的 multimodal 注）`,
+        )
+      }
+      if (this.options.readImage === undefined) {
+        throw new Error(
+          'OfficeAce: 图片输入需要附件服务桥接（readImage）；'
+          + '请确认当前 profile 已装载 @deepseek-ai/dsh-attachment-local',
+        )
+      }
+      imageUrls = new Map()
+      for (const [id, ref] of imageRefs) {
+        const image = await this.options.readImage(ref)
+        if (image === undefined) continue
+        imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
+      }
+    }
+
+    const wireMessages = serializeMessages(options.messages)
+    // 把图片 parts 注回 user 消息：共享 `serializeMessages` 会把 content 压成
+    // 纯文本（图片静默丢失 ——「发不了图片」的成因），这里按 user 消息出现顺序
+    // 一一对应，把该消息内（含 tool-result 内层）的图片补成
+    // `{type:'image_url'}` parts（MaaS 实测接受该形态，deepseek-v4.1-flash /
+    // kimi-k2.6 均正常描述图片内容）。
+    if (imageUrls !== undefined) {
+      const originalUsers = options.messages.filter((m) => m.role === 'user')
+      let userIdx = 0
+      for (const wire of wireMessages) {
+        if (wire.role !== 'user') continue
+        const original = originalUsers[userIdx++]
+        if (original === undefined) break
+        const inner: unknown[] = Array.isArray(original.content) ? original.content : []
+        const parts: Array<Record<string, unknown>> = []
+        const text = typeof wire.content === 'string' ? wire.content : ''
+        if (text.length > 0) parts.push({ type: 'text', text })
+        for (const raw of inner) {
+          if (typeof raw !== 'object' || raw === null) continue
+          const block = raw as { type?: unknown; attachment?: { attachmentId?: unknown } }
+          if (block.type === 'image') {
+            const url = block.attachment?.attachmentId === undefined
+              ? undefined
+              : imageUrls.get(String(block.attachment.attachmentId))
+            // 解析不到字节时留占位文本，而不是静默吞掉整张图。
+            parts.push(url === undefined
+              ? { type: 'text', text: '[image unavailable]' }
+              : { type: 'image_url', image_url: { url } })
+          }
+        }
+        if (parts.length > 0) wire.content = parts
+      }
+    }
+
     const payload = JSON.stringify({
       model,
-      messages: serializeMessages(options.messages),
+      messages: wireMessages,
       stream: true,
       ...maxTokens === undefined ? {} : { max_tokens: maxTokens },
       ...options.temperature === undefined ? {} : { temperature: options.temperature },

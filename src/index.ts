@@ -2297,6 +2297,10 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
       if (ref === undefined) return officeaceAuth.readStoredCredential()
       return officeaceAuth.readCredential(ref, ctx.credentials as never)
     },
+    // ⚠️ **图片输入桥**（2026-10-13）：deepseek-v4.1-flash / kimi-k2.6 实测支持
+    //    多模态（1×1 PNG 探针通过）。漏接 = 用户发图后适配器报
+    //    「需要附件服务」—— 图根本到不了模型。
+    readImage: makeReadImage(ctx),
     // ⚠️ **必须注入**（同其余渠道）：宿主在「登录 / 点刷新积分」等时机调它把新凭据
     //    拉进来。漏接的症状是该渠道的账号永不过期 —— 用户重新登录后旧凭据仍被
     //    继续用，且日志里一个字都没有。
