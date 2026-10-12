@@ -184,11 +184,23 @@ export class OfficeAceAdapter extends LlmAdapter {
     const onAbort = () => controller.abort()
     options.signal?.addEventListener('abort', onAbort)
 
+    // ⚠️ **max_tokens 下限保护**（2026-10-12 实测定位「渠道老是停」）：
+    //    OfficeAce 全系模型带思考链，且思考 token 计入 max_tokens 预算。
+    //    实测 deepseek-v4.1-flash：max_tokens=32 → reasoning_tokens=32、
+    //    content 0 字、finish_reason=length；512 同样 0 字；不限 → 2s 完整回复。
+    //    即：小预算会被思考链**全部烧光**，正文一个字都不剩 —— 外部表现就是
+    //    「回复是空的 / 渠道停了」。故低于下限的预算直接**丢弃**（交给端点默认
+    //    上限兜底），只有够大的预算才透传。下限取 4096：留足思考 + 正文余量。
+    const MAX_TOKENS_FLOOR = 4096
+    const maxTokens = options.maxTokens !== undefined && options.maxTokens >= MAX_TOKENS_FLOOR
+      ? options.maxTokens
+      : undefined
+
     const payload = JSON.stringify({
       model,
       messages: serializeMessages(options.messages),
       stream: true,
-      ...options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens },
+      ...maxTokens === undefined ? {} : { max_tokens: maxTokens },
       ...options.temperature === undefined ? {} : { temperature: options.temperature },
     })
 
@@ -231,7 +243,7 @@ export class OfficeAceAdapter extends LlmAdapter {
                   label: OFFICEACE.id,
                   firstTokenTimeoutMs: OFFICEACE.headerTimeoutMs,
                   chunkTimeoutMs: OFFICEACE.chunkTimeoutMs,
-                  ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+                  ...maxTokens === undefined ? {} : { maxTokens },
                 },
               )
               return
@@ -251,7 +263,7 @@ export class OfficeAceAdapter extends LlmAdapter {
           label: OFFICEACE.id,
           firstTokenTimeoutMs: OFFICEACE.headerTimeoutMs,
           chunkTimeoutMs: OFFICEACE.chunkTimeoutMs,
-          ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+          ...maxTokens === undefined ? {} : { maxTokens },
         },
       )
     } finally {
