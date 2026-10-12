@@ -1169,7 +1169,14 @@ export interface RpcProviderSetEnabledRequest {
 export interface RpcProviderSetEnabledResponse {
   provider: string
   enabled: boolean
-  /** 实际被写入黑名单的模型数（关闭方向）或清空的条目数（打开方向）。 */
+  /**
+   * **实际被改变的**模型数（关闭方向 = 本次真正新关掉的条数；打开方向 = 清空的条目数）。
+   *
+   * ⚠️ 关闭方向**不是**「本次写入黑名单的条数」：`setModelsDisabled` 是**合并**
+   * 语义，传入的并集里可能有相当一部分早就关着（历史遗留的完整黑名单 / 用户此前
+   * 逐条关过），按写入条数报会**少报**用户看到的实际结果。与 {@link accounts}
+   * 的口径（只算实际变更数）保持一致。
+   */
   models: number
   /** 实际被改变的账号数（已是目标状态的账号不计入）。 */
   accounts: number
