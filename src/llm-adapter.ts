@@ -302,9 +302,14 @@ export function serializeMessages(messages: readonly { role: string; content: un
  * 模型将工具 schema 注入 system 消息、请求体不发送 `tools` 字段，让模型
  * 以 DSML 流式输出工具调用，从根上规避网关空闲断连。
  */
-function isDeepseekV4Model(model: string): boolean {
-  return /^deepseek-v4-(flash|pro)$/.test(model)
-}
+/**
+ * ⚠️ **已移至共享层 `./dsml.js`**（2026-10-13）。
+ *
+ * OfficeAce 通道复用不到本文件的实现 ⇒ 漏注入 DSML 提示 ⇒ 模型臆造
+ * `<｜DSML｜ calls>` 语法。协议定义**必须只有一份**。
+ */
+export { isDeepseekV4Model, needsDsmlToolMode, buildDsmlSystemPrompt } from './dsml.js'
+import { isDeepseekV4Model, needsDsmlToolMode, buildDsmlSystemPrompt, DSML_INVOKE_CLOSE, DSML_INVOKE_OPEN_PREFIX, DSML_TOOL_CALLS_CLOSE, DSML_TOOL_CALLS_OPEN } from './dsml.js'
 
 /**
  * 工具名匹配大参数写文件类工具（content/arguments 可能达到数万 token）。
@@ -327,44 +332,6 @@ function isDeepseekV4Model(model: string): boolean {
  * 非 deepseek-v4 模型（如 openpangu / GLM-5.2 等）使用华为标准 IAM AK/SK 鉴权，
  * 不走 CodeArts Agent APIG 网关，无 60s 空闲断连问题，继续保持标准 tool_calls。
  */
-function needsDsmlToolMode(model: string, _toolNames: readonly string[]): boolean {
-  return isDeepseekV4Model(model)
-}
-
-/**
- * 构造让 deepseek-v4 以原生 DSML 格式调用工具的 system 提示。
- *
- * 适配器不把 `tools` 字段发给后端（否则模型走标准 tool_calls 一次性
- * 打包路径），而是把 OpenAI function schema 以文本注入 system 消息，
- * 并明确要求模型使用 `<｜DSML｜tool_calls>` 语法。`parseDsmlToolCalls`
- * 会把模型输出的 DSML 块解析为结构化 tool-call，harness 无需感知差异。
- */
-function buildDsmlSystemPrompt(tools: Array<{
-  type: string
-  function: { name: string; description?: string; parameters?: unknown }
-}>): string {
-  const toolJson = JSON.stringify(tools.map((tool) => ({
-    name: tool.function.name,
-    description: tool.function.description,
-    parameters: tool.function.parameters,
-  })), null, 2)
-  return [
-    '以下是你可用的工具及其 JSON Schema。当需要调用工具完成任务时，',
-    '必须使用原生 DSML 工具调用语法输出，格式如下：',
-    '<｜DSML｜tool_calls><｜DSML｜invoke name="工具名"><｜DSML｜parameter name="参数名" string="true">参数值</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>',
-    '',
-    '规则：',
-    '- 工具名必须是下面列表中的 name。',
-    '- 每个参数用一个 <｜DSML｜parameter> 标签包裹，参数值放在标签之间。',
-    '- 字符串参数加 string="true" 属性；对象/数组/数字/布尔参数不要加该属性。',
-    '- 一次可以输出多个 <｜DSML｜invoke> 调用（工具可以并行）。',
-    '- 文件内容请一次性完整写入单个 write 调用的 content 参数，不要拆分或省略。',
-    '',
-    '工具列表（JSON Schema）：',
-    toolJson,
-  ].join('\n')
-}
-
 /**
  * CodeArts 并发排队端点。当后端按账户的会话
  * 并发上限达到时，chat completions 请求会以
@@ -775,10 +742,9 @@ function readCodeArtsChunk(
  * - 边界：DSML 标签使用全角 `｜`（U+FF5C）而非半角 `|`，与模型实际
  *   输出一致。`<thought>` 为半角普通 XML 标签，与 DSML 官方文档一致。
  */
-const DSML_TOOL_CALLS_OPEN = '<｜DSML｜tool_calls>'
-const DSML_TOOL_CALLS_CLOSE = '</｜DSML｜tool_calls>'
-const DSML_INVOKE_OPEN_PREFIX = '<｜DSML｜invoke'
-const DSML_INVOKE_CLOSE = '</｜DSML｜invoke>'
+// ⚠️ **协议常量已从 `./dsml.js` 导入**（2026-10-13）：此前本地硬编码，
+//    与 `buildDsmlSystemPrompt` 分处两地 —— 一旦分叉（比如提示词教
+//    `tool_calls`、解析器认别的），工具调用就静默失效。现在只有一份。
 const DSML_PARAM_OPEN_PREFIX = '<｜DSML｜parameter'
 const DSML_PARAM_CLOSE = '</｜DSML｜parameter>'
 const THOUGHT_OPEN = '<thought>'

@@ -21,6 +21,7 @@ import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js'
 import { basicAuthorization, fetchModelTokenRates, isExpiring, readOfficeAceCredential, refreshStoredCredential, type OfficeAceCredential } from './officeace-auth.js'
 import { consumeOpenAiSse, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
+import { buildDsmlSystemPrompt, needsDsmlToolMode, type DsmlToolSpec } from './dsml.js'
 
 export interface OfficeAceAdapterOptions {
   /** 凭据（测试注入）；缺省每次从本机读取。 */
@@ -300,10 +301,43 @@ export class OfficeAceAdapter extends LlmAdapter {
       }
     }
 
+    // ── 工具定义下发 ──
+    //
+    // ⚠️ **这是「工具调用被当正文、模型停住不动」的真正根因**（2026-10-13）。
+    //    本适配器**原本既不发 `tools` 字段、也不注入 DSML 提示**，模型在零
+    //    协议指引下凭训练印象臆造出 `<｜DSML｜ calls>` —— 而解析器只认
+    //    `<｜DSML｜tool_calls>`（见 dsml.ts）。标记写得再「规范」也解析不了，
+    //    因为**协议名本身就是错的**。归一化修不了这个，必须先下发正确语法。
+    //
+    // 走 DSML 注入（而非标准 `tools` 字段）的理由与 codearts 一致：
+    // 该通道同样经网关，标准 tool_calls 的参数一次性打包会触发 ~60s 空闲
+    // 断连；DSML 经 `delta.content` 流式输出，全程有数据流。
+    const wireTools = options.tools?.map((tool) => ({
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      },
+    }) satisfies DsmlToolSpec)
+    let toolsPayload = wireTools
+    if (wireTools !== undefined && wireTools.length > 0
+        && needsDsmlToolMode(model, wireTools.map((tool) => tool.function.name))) {
+      // 注入位置：system 之后、user 之前（实测放末尾会让思考泄漏进正文，
+      // 见 dsml.ts 注释）。
+      wireMessages.splice(
+        wireMessages.findIndex((m) => m.role === 'system') + 1,
+        0,
+        { role: 'system', content: buildDsmlSystemPrompt(wireTools) },
+      )
+      toolsPayload = undefined
+    }
+
     const payload = JSON.stringify({
       model,
       messages: wireMessages,
       stream: true,
+      ...toolsPayload !== undefined && toolsPayload.length > 0 ? { tools: toolsPayload } : {},
       ...maxTokens === undefined ? {} : { max_tokens: maxTokens },
       ...options.temperature === undefined ? {} : { temperature: options.temperature },
     })
