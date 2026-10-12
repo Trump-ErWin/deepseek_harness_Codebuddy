@@ -581,10 +581,22 @@ async function doRefreshStoredCredential(): Promise<OfficeAceCredential | undefi
  */
 export async function refreshAccountCredential(
   _refName: string,
-  _pool: unknown,
-  _accountId: string,
+  pool: unknown,
+  accountId: string,
 ): Promise<void> {
-  await refreshStoredCredential().catch(() => undefined)
+  const next = await refreshStoredCredential().catch(() => undefined)
+  // ⚠️ 续期成功后**必须把新有效期写回池条目**（与 gemini 同款）：漏写时卡片
+  //    「有效期」停在旧值直至显示「已过期」（真实症状 2026-10-13）。
+  if (next !== undefined) {
+    const p = pool as {
+      updateAccount?: (id: string, patch: { expiresAt: number }) => Promise<unknown>
+    } | undefined
+    try {
+      await p?.updateAccount?.(accountId, { expiresAt: new Date(next.expiresAt).getTime() })
+    } catch {
+      // 写回失败不阻断续期（凭据已落盘，下次刷新会再试）
+    }
+  }
 }
 
 /**
