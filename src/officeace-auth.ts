@@ -841,10 +841,16 @@ export async function fetchSubscriptionSummary(
   if (ref !== undefined && ref.length > 0) {
     try {
       const own = credential ?? await readCredential(ref, credentials)
-      const cloud = own === undefined ? undefined : await fetchCloudSubscriptionFor(own)
-      if (cloud !== undefined) {
-        writeSubscriptionCache(cloud, ref)
-        return cloud
+      if (own !== undefined) {
+        // ⚠️ **先自动签到再查余额**（顺序不能反）：签到会把当日 1000 分打进
+        //    `bonus_skus`，先查就永远少显示那一份 —— 用户会以为没领到。
+        //    `maybeClaimBonus` 内部按小时去重，不会重复打服务端。
+        await maybeClaimBonus(own, ref)
+        const cloud = await fetchCloudSubscriptionFor(own)
+        if (cloud !== undefined) {
+          writeSubscriptionCache(cloud, ref)
+          return cloud
+        }
       }
     } catch { /* 掉到该账号的缓存兜底 */ }
     const own = readSubscriptionCache(ref)
@@ -935,7 +941,22 @@ export async function fetchSubscriptionSummary(
  *
  * @returns 响应正文；非 2xx 或异常返回空串（调用方按「读不到」降级）。
  */
-async function signAndGet(url: string, credential: OfficeAceCredential): Promise<string> {
+/**
+ * V11 签名的请求 —— **GET 与 POST 共用**。
+ *
+ * ⚠️ POST 与 GET 的**唯一**差异是 `Content-Type` 是否进入签名头集合
+ * （规则 1：GET 不带），以及 body 参与 payload 哈希。其余（密钥派生、
+ * LF 分隔、尾斜杠）完全一致 —— 故抽成一个函数，避免两处签名逻辑漂移
+ * （那正是当初 GET 反复 401 的成因）。
+ *
+ * @param body - 请求体文本；`undefined`（无 body）时按空串计哈希。
+ */
+async function signAndRequest(
+  url: string,
+  credential: OfficeAceCredential,
+  method: 'GET' | 'POST',
+  body?: string,
+): Promise<string> {
   const region = 'cn-southwest-2'
   const service = 'apic'
   const pad = (n: number): string => (n >= 10 ? String(n) : `0${n}`)
@@ -953,13 +974,16 @@ async function signAndGet(url: string, credential: OfficeAceCredential): Promise
   u.searchParams.forEach((v, n) => queryPairs.push([n, v]))
   queryPairs.sort(([a, b], [c, d]) => (a === c ? b.localeCompare(d) : a.localeCompare(c)))
   const canonicalQuery = queryPairs.map(([k, v]) => `${urlEncode(k)}=${urlEncode(v)}`).join('&')
-  // 规则 1：GET 不带 Content-Type
+
+  // 规则 1：**GET 不带 `Content-Type`**；POST 必须带（且要与签名头集合一致）。
+  const contentType = 'application/json;charset=utf8'
   const original: Record<string, string> = {
     'x-subscription-type': 'v2',
     'X-Sdk-Date': xdate,
     'X-Security-Token': credential.securityToken.trim(),
     Host: u.host,
   }
+  if (method === 'POST') original['Content-Type'] = contentType
   if (credential.projectId) original['X-Project-ID'] = credential.projectId
   // R()：签名用**小写名**，值 trim + 折叠空白
   const lower: Record<string, string> = {}
@@ -968,7 +992,12 @@ async function signAndGet(url: string, credential: OfficeAceCredential): Promise
   // 规则 3：头行 LF 分隔 + 末尾 LF
   let canonicalHeaders = ''
   for (const h of signedHeaders) canonicalHeaders += `${h}:${lower[h]}\n`
-  const canonicalRequest = ['GET', canonicalUri, canonicalQuery, canonicalHeaders, signedHeaders.join(';'), createHash('sha256').update('').digest('hex')].join('\n')
+  // payload 哈希：**待签body文本**（无 body 时为空串）
+  const payloadHash = createHash('sha256').update(body ?? '', 'utf8').digest('hex')
+  const canonicalRequest = [
+    method, canonicalUri, canonicalQuery, canonicalHeaders,
+    signedHeaders.join(';'), payloadHash,
+  ].join('\n')
   const scope = `${xdate.slice(0, 8)}/${region}/${service}`
   const stringToSign = ['V11-HMAC-SHA256', xdate, scope, createHash('sha256').update(canonicalRequest).digest('hex')].join('\n')
   // 规则 2：密钥派生
@@ -981,14 +1010,19 @@ async function signAndGet(url: string, credential: OfficeAceCredential): Promise
   const signature = createHmac('sha256', Buffer.from(derivedKey, 'utf8')).update(stringToSign).digest('hex')
 
   const r = await fetch(url, {
-    method: 'GET',
+    method,
     headers: {
       ...original,
       Authorization: `V11-HMAC-SHA256 Credential=${credential.access}/${scope}, SignedHeaders=${signedHeaders.join(';')}, Signature=${signature}`,
     },
+    ...body === undefined ? {} : { body },
     signal: AbortSignal.timeout(30_000),
   })
   return r.ok ? await r.text() : ''
+}
+
+async function signAndGet(url: string, credential: OfficeAceCredential): Promise<string> {
+  return signAndRequest(url, credential, 'GET')
 }
 
 /**
@@ -1007,6 +1041,10 @@ async function signAndGet(url: string, credential: OfficeAceCredential): Promise
  */
 async function fetchCloudSubscription(ref?: string): Promise<OfficeAceSubscriptionSummary | undefined> {
   const credential = readStoredCredential(ref)
+  if (credential === undefined) return undefined
+  // 无 ref 的单账号兜底路径也自动签到一次（多账号路径在
+  // `fetchSubscriptionSummary` 里处理）。ref 缺省时用文件名做去重键。
+  await maybeClaimBonus(credential, ref ?? '__default__')
   return fetchCloudSubscriptionFor(credential)
 }
 
@@ -1077,6 +1115,75 @@ async function fetchCloudSubscriptionFor(
     usedCredits: creditGroups.reduce((sum, g) => sum + (g.used ?? 0), 0),
     creditGroups,
   }
+}
+
+/**
+ * 自动领取每日福利（**签到**）——`POST /v1/subscription/bonus/claim`。
+ *
+ * ## 为什么需要它（以及为什么必须是**自动**的）
+ *
+ * OfficeAce 的签到实际上是「每日送 1000 积分」的活动桶（`bonus_skus` 里的
+ * `bonus-bonus-daily-checkin-2026`）。果办客户端的做法是**订阅页一挂载就自动
+ * 调这个端点**（源码 `SubscriptionStateProvider`：用「年+月+日+时」做去重键，
+ * 每小时最多领一次）—— **UI 上没有签到按钮**，不存在「手动签到」这回事。
+ *
+ * 故插件侧也必须是自动的：拉余额之前顺手领一次。
+ *
+ * ⚠️ **积分当日作废**（实测 2026-10-13）：`expired_time` 是当天 23:59:59。
+ *    当天不领就永久失去那 1000 分 —— 这正是自动领取的价值所在。
+ *
+ * @returns 领取到的活动桶；失败返回空数组（**不抛错**：签到失败不该阻断余额展示）。
+ */
+export async function claimDailyBonus(
+  credential: OfficeAceCredential,
+): Promise<Array<{ activityId: string; activityName: string; points: number }>> {
+  if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
+    return []
+  }
+  try {
+    // ⚠️ **POST 必须带 `Content-Type`**（规则 1 的另一面）：实测不带会得到
+    //    HTTP 500 `OfficeAce.11020001 内部服务器错误`；带了才是 200。
+    //    body 为空即可 —— 该端点不需要入参（果办也是 `void 0`）。
+    const body = await signAndRequest(
+      `${OFFICEACE.defaultBaseUrl.replace(/\/+$/, '')}/v1/subscription/bonus/claim`,
+      credential,
+      'POST',
+    )
+    if (body.length === 0) return []
+    const j = JSON.parse(body) as {
+      bonus_skus?: Array<{
+        activity_id?: unknown
+        activity_name?: unknown
+        points?: unknown
+      }>
+    }
+    return (j.bonus_skus ?? []).map((s) => ({
+      activityId: String(s.activity_id ?? ''),
+      activityName: typeof s.activity_name === 'string' ? s.activity_name : '活动奖励',
+      points: Number(s.points) || 0,
+    }))
+  } catch {
+    // ⚠️ 签到失败**绝不阻断**余额查询（还有 LOGGER 约定：记日志而不是静默吞）。
+    return []
+  }
+}
+
+/**
+ * 「够了就不要再领」的节流：同一 ref **每小时最多领一次**（与果办客户端同款
+ * 去重键：年+月+日+时）。
+ *
+ * ⚠️ 不去重的后果：余额每次刷新都打一次 claim ⇒ 面板每开一次就多发一个
+ *    请求，且服务端若对重复领取返回异常，日志会被刷屏。
+ * ⚠️ 按 ref 而非全局：多账号下每个账号**各自**都要领，共用一把锁会让
+ *    第二个账号永远领不到（它的签到分当日作废）。
+ */
+const lastClaimAt = new Map<string, string>()
+function maybeClaimBonus(credential: OfficeAceCredential, ref: string): Promise<unknown> {
+  const now = new Date()
+  const hourKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}`
+  if (lastClaimAt.get(ref) === hourKey) return Promise.resolve([])
+  lastClaimAt.set(ref, hourKey)
+  return claimDailyBonus(credential).catch(() => [])
 }
 
 /** Basic 授权头值（推理用）。 */
