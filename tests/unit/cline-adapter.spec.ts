@@ -289,6 +289,216 @@ describe('ClineAdapter resolveModel', () => {
   })
 })
 
+/**
+ * ⚠️⚠️ **目录构建的性能与「同一份来源」不变式**（Gitee issue IKL3YH）。
+ *
+ * 用户实测（Windows，DSH 桌面版）：宿主进程每 ~15 秒被唤醒一次、峰值 1.1–1.5 核，
+ * Node inspector 函数级剖析的热点落在 `toCatalogEntry → inputModalitiesFor`。
+ * 根因有**两层**，第二层是主因：
+ *
+ * 1. `inputModalitiesFor` 对**每个**模型做一次 `remoteModels.find(...)`
+ *    （实测全仓 `remoteModels.find` 形态**只有这一处**，其余家都是 `.get()` 索引
+ *    或直接吃已解析的 entry）⇒ 整表 O(N²)；
+ * 2. `resolveModel` 每次都**整份重建** `CatalogEntry[]`。DSH 的
+ *    `buildModelCatalog` 形状是「1 次 `listModels` + **每模型一次**
+ *    `resolveModelInfo`」，而 `dsh-llm` 的 `resolveModelInfo` 直连适配器、
+ *    **无任何缓存** ⇒ N 次调用造成 N² 次条目构造。
+ *    实测（N=471，本仓已编译产物）：原实现 **293 ms/次**，
+ *    只把 `find` 换 Map 是 121 ms，再把 `CatalogEntry[]` 缓存是 **1.2 ms**。
+ *
+ * 同一处还**掩盖了一个潜伏缺陷**：`inputModalitiesFor` 只查 `remoteModels`，
+ * 而离线/首拉失败时它是 `undefined` ⇒ 兜底表里 `supportsImage: true` 的策划条目
+ * （`stealth/space-bunny-alpha` 等 3 条）被误报成**纯文本**。后果不是「少个功能」，
+ * 而是「支持图片的模型发不了图」—— DSH 见到不含 `image` 的声明会**静默把图片
+ * 投影成文本占位符**（与 `src/cline-models-dev.ts` 记录的那次用户报障同形）。
+ *
+ * ⇒ 修法：条目**自己**就带 `supportsImage`，直接读它（O(1)，且离线路径也正确）；
+ * id → 条目的查找只在 `stream()` 的门禁里需要，改用一次性 Map 索引，
+ * 且**与 `listModels` 取同一份来源**（不然会出现「目录说支持、发图被拒」的分叉）。
+ */
+describe('ClineAdapter 目录构建的性能与来源一致性（issue IKL3YH）', () => {
+  /** 造 n 条远端目录（前缀即兜底表原本那几条）。 */
+  function bigCatalog(n: number): ClineModel[] {
+    const models: ClineModel[] = MODELS.map((model) => ({ ...model }))
+    for (let i = models.length; i < n; i++) {
+      models.push({
+        id: `vendor/model-${i}`,
+        name: `Model ${i}`,
+        isFree: false,
+        supportsImage: i % 3 === 0,
+      })
+    }
+    return models
+  }
+
+  it('★ 远端目录不可用时，兜底条目的图片能力照常播报（不被误报纯文本）', async () => {
+    // 注入式 loadModels 返回空 models 且**不带** `remote` ⇒ `got = false`
+    // ⇒ `remoteModels` 保持 undefined。这正是离线 / 首拉失败时的生产形态。
+    const adapter = makeAdapter({
+      loadModels: async () => ({ models: [], warnings: ['offline'] }),
+    })
+    const listed = await adapter.listModels('cline')
+    const bunny = listed.find((model) => model.id === 'stealth/space-bunny-alpha')
+    // 兜底表里它是 supportsImage: true（见 cline-product.ts）。
+    expect(bunny?.inputModalities).toContain('image')
+  })
+
+  it('★ 离线兜底目录下 listModels 与 stream 判据同源（不能一个放行一个拒绝）', async () => {
+    const bodies: string[] = []
+    const adapter = makeAdapter({
+      loadModels: async () => ({ models: [], warnings: ['offline'] }),
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        bodies.push(String(init.body))
+        return sseResponse([
+          JSON.stringify({ choices: [{ delta: { content: 'ok' } }] }),
+          JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+        ])
+      }) as unknown as typeof fetch,
+    })
+
+    const listed = await adapter.listModels('cline')
+    // 目录侧声明支持图片。
+    expect(listed.find((model) => model.id === 'stealth/space-bunny-alpha')?.inputModalities)
+      .toContain('image')
+
+    // ⇒ `stream()` 的门禁就必须放行（同一份来源）。
+    //   修复前这里会抛「不支持图片输入」，与目录的声明自相矛盾。
+    await collect(adapter, {
+      model: 'stealth/space-bunny-alpha',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }],
+      }],
+    })
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0]).toContain('data:image/png;base64,')
+  })
+
+  it('★ 逐模型 resolveModel 不再整份重建目录（O(N²) 回归门）', async () => {
+    const models = bigCatalog(60)
+    const adapter = makeAdapter({
+      loadModels: async () => ({
+        models,
+        warnings: [],
+        remote: {
+          freeIds: [],
+          remoteIds: models.map((model) => model.id),
+          entries: [],
+          warnings: [],
+          complete: true,
+        },
+      }),
+    })
+
+    const spy = vi.spyOn(
+      ClineAdapter.prototype as unknown as { toCatalogEntry: (model: ClineModel) => unknown },
+      'toCatalogEntry',
+    )
+    try {
+      const listed = await adapter.listModels('cline')
+      expect(spy.mock.calls.length).toBeGreaterThanOrEqual(listed.length)
+
+      // 宿主形状：对**目录里每个模型**各调一次 resolveModel。
+      for (const model of listed) await adapter.resolveModel('cline', model.id)
+
+      // 旧实现每次 resolveModel 都整份重建 ⇒ ≈ N + N²；修好后 ≈ N。
+      // 判据取 2N（宽到不会因无关重构假失败，又远小于 N²）。
+      expect(spy.mock.calls.length).toBeLessThanOrEqual(2 * listed.length)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  /**
+   * ⚠️ **兜底路径也要守卫**：`entriesCache` / `catalogIndexCache` 都以
+   * 「来源数组的 `===`」为失效判据，若 `fallbackCatalog()` 每次返回**新数组**，
+   * 离线路径会每调用一次就白建一份缓存 —— 缓存等于没有，且**症状完全静默**
+   * （只是慢，没有任何报错）。上一版用例走的是**远端**目录，测不到这一条。
+   */
+  it('★ 兜底（离线）路径同样不整份重建目录（缓存的失效判据不能被架空）', async () => {
+    const adapter = makeAdapter({
+      loadModels: async () => ({ models: [], warnings: ['offline'] }),
+    })
+    const spy = vi.spyOn(
+      ClineAdapter.prototype as unknown as { toCatalogEntry: (model: ClineModel) => unknown },
+      'toCatalogEntry',
+    )
+    try {
+      const listed = await adapter.listModels('cline')
+      expect(listed.length).toBeGreaterThan(0)
+      for (const model of listed) await adapter.resolveModel('cline', model.id)
+      // 兜底表只有几条，故这里没有「N² 很大」的余量 —— 判据就取 2N。
+      expect(spy.mock.calls.length).toBeLessThanOrEqual(2 * listed.length)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  /**
+   * ⚠️ **缓存的失效判据必须是「来源数组身份变了」，不能是「长度变了」。**
+   *
+   * 该判据有一个**真实可达**的反例：目录只有一部分来源成功（`complete: false`，
+   * 于是冷却过后会**重拉**），而重拉回来后**条数完全相同**、只是某个模型的
+   * 图片能力变了。若按长度失效，`stream()` 会一直用陈旧索引判能力 ⇒ 要么
+   * 误放行、要么误拒绝，且**永不恢复**。
+   *
+   * ⚠️ **必须走 `complete: false` 的残缺路径**：完整目录（`complete: true`）会被
+   * `remoteComplete` 永久短路，`remoteModels` 根本不会被重新赋值 —— 那种情况下
+   * 「缓存陈旧」与「远端目录陈旧」是**同一件事**（是既有设计，不是本缺陷），
+   * 拿它写用例会测出一个假判据。
+   */
+  it('★ 残缺目录重拉后等长但内容变了 ⇒ 缓存必须失效（不能按长度判）', async () => {
+    /** 两份**等长**目录：同一 id 的图片能力相反。 */
+    const makeRemote = (imageFlag: boolean): ClineModel[] => ([
+      { id: 'vendor/target', name: 'Target', isFree: false, supportsImage: imageFlag },
+      { id: 'vendor/filler', name: 'Filler', isFree: false, supportsImage: false },
+    ])
+    let current = makeRemote(false)
+    const adapter = makeAdapter({
+      loadModels: async () => ({
+        models: current,
+        warnings: ['models 部分失败'],
+        remote: {
+          freeIds: [],
+          // 非空 ⇒ `got = true`（残缺也展示）；`complete: false` ⇒ 冷却后**会重拉**。
+          remoteIds: current.map((model) => model.id),
+          entries: [],
+          warnings: ['models 部分失败'],
+          complete: false,
+        },
+      }),
+      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'ok' } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+
+    // 第一轮：目录说不支持图片 ⇒ 门禁必须拒绝（同时把索引建立起来）。
+    await adapter.listModels('cline')
+    await expect(collect(adapter, {
+      model: 'vendor/target',
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a' } }] }],
+    })).rejects.toThrow(/不支持图片输入/)
+
+    // 第二轮：**等长**的新目录，同一个 id 变成支持图片；清冷却等价于「冷却到期」。
+    current = makeRemote(true)
+    const gate = (adapter as unknown as { catalogGate: { reset(): void } }).catalogGate
+    gate.reset()
+    await adapter.listModels('cline')
+    // 前置：重拉**真的**发生了（否则本用例测不到缓存失效）。
+    expect((adapter as unknown as { remoteModels: readonly ClineModel[] }).remoteModels)
+      .toContainEqual(expect.objectContaining({ id: 'vendor/target', supportsImage: true }))
+
+    // 门禁必须按**新**目录放行 —— 按长度失效的话这里会沿用陈旧索引、继续拒绝。
+    await expect(collect(adapter, {
+      model: 'vendor/target',
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a' } }] }],
+    })).resolves.toBeDefined()
+  })
+})
+
 describe('ClineAdapter 请求构造', () => {
   it('POST 到 OpenAI 兼容端点，鉴权头保留 workos: 前缀', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = []
