@@ -27,9 +27,9 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-  it('共 15 条（14 个真渠道 + aggregate）', () => {
-    expect(PROVIDER_REGISTRY).toHaveLength(15)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(14)
+  it('共 16 条（15 个真渠道 + aggregate）', () => {
+    expect(PROVIDER_REGISTRY).toHaveLength(16)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(15)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
   })
 
@@ -95,22 +95,22 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(Object.isFrozen(PROVIDER_REGISTRY), 'registry 数组应冻结').toBe(true)
   })
 
-  it('permanentLock 恰好是既有的 5 家', () => {
+  it('permanentLock 恰好是既有的 6 家（officeace 2026-10-12 加入）', () => {
     const locked = PROVIDER_REGISTRY.filter((d) => d.permanentLock === true)
       .map((d) => d.id).sort()
-    expect(locked).toEqual(['buddy', 'lobsterai', 'loomy', 'trae', 'workbuddy'])
+    expect(locked).toEqual(['buddy', 'lobsterai', 'loomy', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('usesExpiryWindow 恰好是既有的 4 家（loomy 不在内，它没有窗口概念）', () => {
+  it('usesExpiryWindow 恰好是既有的 5 家（loomy 不在内，它没有窗口概念）', () => {
     const win = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
-    expect(win).toEqual(['buddy', 'lobsterai', 'trae', 'workbuddy'])
+    expect(win).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('rateLimit === false 恰好是既有的 2 家', () => {
+  it('rateLimit === false 恰好是既有的 3 家（officeace 2026-10-12 加入）', () => {
     const off = PROVIDER_REGISTRY.filter((d) => d.rateLimit === false)
       .map((d) => d.id).sort()
-    expect(off).toEqual(['gemini', 'loomy'])
+    expect(off).toEqual(['gemini', 'loomy', 'officeace'])
   })
 
   it('accountTest === true 恰好是 gemini', () => {
@@ -118,10 +118,10 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(t).toEqual(['gemini'])
   })
 
-  it('creditPackages 恰好是既有的 6 家', () => {
+  it('creditPackages 恰好是既有的 7 家（officeace 2026-10-12 加入）', () => {
     const p = PROVIDER_REGISTRY.filter((d) => d.creditPackages === true)
       .map((d) => d.id).sort()
-    expect(p).toEqual(['buddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'workbuddy'])
+    expect(p).toEqual(['buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy'])
   })
 
   it('autoCheckinExcluded 恰好是 zcode', () => {
@@ -129,12 +129,12 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(x).toEqual(['zcode'])
   })
 
-  it('channel === true 的 14 家都有 settingsNamespace 除了 opencode', () => {
+  it('channel === true 的 15 家都有 settingsNamespace 除了 opencode', () => {
     const withNs = PROVIDER_REGISTRY.filter((d) => d.settingsNamespace !== undefined)
       .map((d) => d.id).sort()
     expect(withNs).toEqual([
       'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy', 'minimax',
-      'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
   })
 })

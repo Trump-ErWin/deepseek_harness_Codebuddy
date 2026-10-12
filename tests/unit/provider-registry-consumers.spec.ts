@@ -35,11 +35,11 @@ describe('autoCheckinExcluded：宿主消费取决于 registry', () => {
 })
 
 describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry', () => {
-  it('恰好是 registry 里 usesExpiryWindow === true 的 4 家', () => {
+  it('恰好是 registry 里 usesExpiryWindow === true 的 5 家（officeace 2026-10-12 加入）', () => {
     const withWindow = PROVIDER_REGISTRY
       .filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
-    expect(withWindow).toEqual(['buddy', 'lobsterai', 'trae', 'workbuddy'])
+    expect(withWindow).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
   it('支持锁定的渠道 ⊆ usesExpiryWindow ∪ {loomy}（loomy 无窗口概念）', () => {
@@ -49,19 +49,19 @@ describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry
     const viaWindow = PROVIDER_REGISTRY
       .filter((d) => d.permanentLock === true && d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
-    expect(viaWindow).toEqual(['buddy', 'lobsterai', 'trae', 'workbuddy'])
+    expect(viaWindow).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
     expect(locked).toEqual([...viaWindow, 'loomy'].sort())
   })
 })
 
 describe('settingsNamespace：registerProviderSettings 的清单取决于 registry', () => {
-  it('13 家声明了 namespace，且 opencode 没有', () => {
+  it('14 家声明了 namespace，且 opencode 没有', () => {
     const withNs = PROVIDER_REGISTRY
       .filter((d) => d.settingsNamespace !== undefined)
       .map((d) => d.id).sort()
     expect(withNs).toEqual([
       'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy', 'minimax',
-      'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
     expect(descriptorOf('opencode')?.settingsNamespace).toBeUndefined()
     expect(descriptorOf('aggregate')?.settingsNamespace).toBeUndefined()
@@ -83,6 +83,7 @@ describe('settingsNamespace：registerProviderSettings 的清单取决于 regist
     expect(descriptorOf('minimax')?.settingsNamespace).toBe('llm-minimax')
     expect(descriptorOf('zcode')?.settingsNamespace).toBe('llm-zcode')
     expect(descriptorOf('gemini')?.settingsNamespace).toBe('llm-gemini')
+    expect(descriptorOf('officeace')?.settingsNamespace).toBe('llm-officeace')
   })
 })
 
@@ -137,7 +138,7 @@ describe('registerProviderSettings：index.ts 真的按 registry 注册（行为
     const want = PROVIDER_REGISTRY
       .map((d) => d.settingsNamespace)
       .filter((ns): ns is string => ns !== undefined)
-    expect(want).toHaveLength(13)
+    expect(want).toHaveLength(14)
     // 只取 `llm-*`：settings 里还有本插件自己的 `jet-hub` 条目，与 provider 无关。
     const got = registeredNamespaces().filter((ns) => ns.startsWith('llm-')).sort()
     // ⚠️ 断言**集合相等**而非顺序：注册顺序不影响 `describe()` 的语义（它按 ns 查、
@@ -207,6 +208,7 @@ describe('usesExpiryWindow：credits.permanentLock 的响应体取决于 registr
         minimax: {} as never,
         zcode: {} as never,
         gemini: {} as never,
+        officeace: {} as never,
       } as never,
     )
     if (handler === undefined) throw new Error('jet-hub RPC 端点未注册')

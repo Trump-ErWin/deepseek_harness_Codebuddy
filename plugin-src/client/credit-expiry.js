@@ -62,7 +62,20 @@ export function daysUntilExpiry(pkg, now) {
 }
 
 /**
- * 分成 `{ expiring, permanent }` 两桶（本计费周期口径）。
+ * 分成 `{ expiring, longTerm, permanent, earliestExpiringAt }` **三桶**（本计费周期口径）。
+ *
+ * ## 三档语义（用户 2026-10-12 明确要求）
+ *
+ * | 桶 | 判据 | 颜色 |
+ * |---|---|---|
+ * | `permanent` | **服务端没给到期时间**（真·永久，如订阅套餐包） | 绿（`ok`） |
+ * | `longTerm` | 有到期时间，但**超出**窗口（还早，不急） | 黄（`warn`） |
+ * | `expiring` | 有到期时间且在**窗口内**（再不用就作废） | 红（`error`）+ 倒计时 |
+ *
+ * ⚠️ **`permanent` 与 `longTerm` 必须分开**：首版把「到期时间未知」与「到期还远」
+ * 合成一个 `permanent` 桶 —— 那会让「真永久」的积分和「30 天后到期」的积分
+ * 显示成同一个颜色，用户无法分辨哪些是永远不会作废的。两桶的**选号行为相同**
+ *（都不算临时），但**展示语义不同**。
  *
  * @param packages - `credits.balances` 带回来的 `balance.packages`。
  * @param windowDays - 后端回传的窗口天数。
@@ -75,7 +88,10 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
   const windowMs = days * DAY_MS;
   const at = typeof now === 'number' && Number.isFinite(now) ? now : Date.now();
   let expiring = 0;
+  let longTerm = 0;
   let permanent = 0;
+  /** 临期桶里**最早**的作废时刻（倒计时用）；无临期包时 `null`。 */
+  let earliestExpiringAt = null;
   for (const pkg of packages) {
     // 失效包跳过：服务端仍会返回它的余额，但那部分扣不到。
     if (!pkg || pkg.active !== true) continue;
@@ -83,11 +99,19 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
     if (!Number.isFinite(remaining) || remaining <= 0) continue;
     const end = Number(pkg.deductionEndTime);
     const known = Number.isFinite(end) && end > 0;
-    // 到期时间未知归永久（保守方向：宁可少用，不可误烧长期积分）。
-    if (known && end - at < windowMs) expiring += remaining;
-    else permanent += remaining;
+    if (!known) {
+      // 服务端没给到期时间 ⇒ 真·永久（保守方向：宁可少用，不可误烧长期积分）。
+      permanent += remaining;
+      continue;
+    }
+    if (end - at < windowMs) {
+      expiring += remaining;
+      if (earliestExpiringAt === null || end < earliestExpiringAt) earliestExpiringAt = end;
+    } else {
+      longTerm += remaining;
+    }
   }
-  return { expiring, permanent };
+  return { expiring, longTerm, permanent, earliestExpiringAt };
 }
 
 /** 这个包属于哪一桶的中文标签（tooltip 前缀用）。 */
@@ -114,19 +138,88 @@ export function formatExpiryHint(pkg, windowDays, now) {
 }
 
 /**
- * 账号卡片上那行「长期 Y · 临时 X」的文案；无有效分类时返回 null。
+ * 账号卡片上那行「永久 Y · 长期 Z · 临期 X」的文案；无有效分类时返回 null。
  *
- * ⚠️ **长期在前、临时在后**（用户 2026-09-29 定）：与 Loomy 那行的
- * 「永久 … · 每日 …」同一顺序，两个 provider 的卡片读起来才对齐。
- * ⚠️ 用词是「长期」不是「永久」（用户 2026-09-29 定）：buddy / TRAE 的积分
- * 都有到期日，只是距现在较远 —— 说「永久」是错的（用户明确纠正过）。
+ * ⚠️ **三档顺序固定：永久 → 长期 → 临期**（用户 2026-10-12 定）：
+ * 与「余额由远及近」的直觉一致，且临期放最后便于一眼扫到。
+ *
+ * ⚠️ 用词「长期」不是「永久」（用户 2026-09-29 定）：有到期日的积分即使很远
+ * 也不能叫永久 —— 说「永久」是错的（用户明确纠正过）。只有**服务端没给
+ * 到期时间**的才是真·永久。
+ *
+ * @param split - `splitCreditsByExpiry` 的返回值。
+ * @param format - 数值格式化函数（按单位）。
+ * @returns 单行文本；全为 0 或不可分类时返回 `null`。
  */
 export function formatExpirySplitLine(split, format) {
   if (!split) return null;
-  const expiring = format(split.expiring);
-  const permanent = format(split.permanent);
-  if (expiring === null || permanent === null) return null;
-  return `长期 ${permanent} · 临时 ${expiring}`;
+  const parts = [];
+  // 只显示**非零**桶：0 值进文案只会让一行变长而无信息（用户看不到「永久 0」的价值）。
+  const permanent = split.permanent > 0 ? format(split.permanent) : null;
+  const longTerm = split.longTerm > 0 ? format(split.longTerm) : null;
+  const expiring = split.expiring > 0 ? format(split.expiring) : null;
+  if (permanent !== null) parts.push(`永久 ${permanent}`);
+  if (longTerm !== null) parts.push(`长期 ${longTerm}`);
+  if (expiring !== null) parts.push(`临期 ${expiring}`);
+  return parts.length === 0 ? null : parts.join(' · ');
+}
+
+/**
+ * 三档分桶的**带色分段**（供胶囊/卡片逐段渲染，各带各的 tone）。
+ *
+ * ## 为什么需要它（而不是复用 `formatExpirySplitLine` 的字符串）
+ *
+ * 字符串版本把三档拼成一句、只能整体一个颜色 —— 而用户要的正是
+ * 「永久绿 / 长期黄 / 临期红」（2026-10-12 明确要求）。React 侧要逐段渲染
+ * 才能各带 `data-tone`，故这里返回**结构化分段**。
+ *
+ * 临期段额外带**倒计时**（`倒计时` 字段），因为「临期 100」只说了有多少会作废，
+ * 没说**还有多久** —— 而那正是要补的决策信息。
+ *
+ * @returns `[{ key, text, tone, countdown? }]`；无内容时 `[]`。
+ *   `tone` 取值限定在 CSS 里已有的 `ok` / `warn` / `error`。
+ */
+export function expirySplitParts(split, format, now) {
+  if (!split) return [];
+  const parts = [];
+  const permanent = split.permanent > 0 ? format(split.permanent) : null;
+  const longTerm = split.longTerm > 0 ? format(split.longTerm) : null;
+  const expiring = split.expiring > 0 ? format(split.expiring) : null;
+  if (permanent !== null) parts.push({ key: 'permanent', text: `永久 ${permanent}`, tone: 'ok' });
+  if (longTerm !== null) parts.push({ key: 'longTerm', text: `长期 ${longTerm}`, tone: 'warn' });
+  if (expiring !== null) {
+    const at = split.earliestExpiringAt;
+    const countdown = typeof at === 'number' && Number.isFinite(at) && at > 0
+      ? expiryCountdown(at, now)
+      : '';
+    parts.push({
+      key: 'expiring',
+      text: `临期 ${expiring}`,
+      tone: 'error',
+      ...(countdown.length > 0 ? { countdown } : {}),
+    });
+  }
+  return parts;
+}
+
+/**
+ * 临期积分的**粗粒度**倒计时（「3 天 4 小时」/「5 小时 20 分钟」/「9 分钟」）。
+ *
+ * ⚠️ 粗粒度是刻意的：这是一眼扫过的信息，秒级精度只会让面板无谓重渲染。
+ * ⚠️ 已过期 / 不可解析返回**空串**（调用方不渲染倒计时，而不是显示「已过期」）。
+ */
+export function expiryCountdown(expiresAtMs, now) {
+  const at = Number(expiresAtMs);
+  if (!Number.isFinite(at) || at <= 0) return '';
+  const ref = typeof now === 'number' && Number.isFinite(now) ? now : Date.now();
+  const minutes = Math.round((at - ref) / 60_000);
+  if (minutes <= 0) return '';
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const mins = minutes % 60;
+  if (days > 0) return `${days} 天 ${hours} 小时`;
+  if (hours > 0) return `${hours} 小时 ${mins} 分钟`;
+  return `${Math.max(1, mins)} 分钟`;
 }
 
 /**

@@ -102,6 +102,11 @@ import type { MinimaxCredential } from './minimax.js'
 import { GeminiAuth } from './gemini-auth.js'
 import { registerGeminiLlm } from './gemini-adapter.js'
 import { GEMINI } from './gemini.js'
+// OfficeAce（华为 ModelArts MaaS 云端直连）：适配器 + 产品配置 + 鉴权模块
+//（登录 / 推理 / 续期 / 余额 / 倍率全部直连云端，**不依赖 OfficeAce 客户端**）。
+import { registerOfficeAceLlm } from './officeace-adapter.js'
+import { OFFICEACE } from './officeace-product.js'
+import * as officeaceAuth from './officeace-auth.js'
 import type { GeminiCredential } from './gemini.js'
 import { createGeminiSigStore } from './gemini-sigstore.js'
 import { OpencodeAdapter, registerOpencodeLlm } from './opencode-adapter.js'
@@ -2272,6 +2277,59 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     zcodeAdapter.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
+  // ===== OfficeAce（华为 ModelArts MaaS，云端直连）=====
+  //
+  // 形态与前面所有 provider 相同：进程内 LlmAdapter 直发远端，无子进程、无端口。
+  //
+  // 独有语义：**凭据完全自主** —— 登录走华为云 OAuth（PKCE + DPoP），推理用
+  // `model_app_key:secret` 的 Basic 鉴权，STS 用 refresh_token 续期（30 天），
+  // 积分余额与倍率经 V11 签名直读云侧。全程**不经过 OfficeAce 客户端**
+  //（协议逆向见 `officeace-auth.ts` 模块头）。
+  const officeAceAdapter = registerOfficeAceLlm(ctx, {
+    disabledModels: () => pool.disabledModelsFor(OFFICEACE.id),
+    // ⚠️ **必须注入**（同其余渠道）：宿主在「登录 / 点刷新积分」等时机调它把新凭据
+    //    拉进来。漏接的症状是该渠道的账号永不过期 —— 用户重新登录后旧凭据仍被
+    //    继续用，且日志里一个字都没有。
+    // ⚠️ **必须走账号池**（与 gemini 同款，守卫用例断言）：OfficeAce 只有一个账号
+    //    条目，但仍要先按 `getAvailableAccount(provider, '')` 从池里取 ——
+    //    「池筛掉后回落到单凭据 `refresh()`」正是被 `trae-model-id-selection.spec.ts`
+    //    断言禁止的失效形态（那个用例的判据是「续期拿到的 ref === 被限流账号的 ref」）。
+    refresh: async () => {
+      // ⚠️ 必须走账号池（与 gemini / loomy 同款，守卫用例断言）：OfficeAce 只有
+      //     一个账号条目，但仍要从池里取 —— 「池筛掉后回落到单凭据 `refresh()`」
+      //     正是 `trae-model-id-selection.spec.ts` 明文禁止的失效形态（判据是
+      //     「续期拿到的 ref === 被该模型限流的那个账号的 ref」且 fallback 计数为 0）。
+      const available = await pool.getAvailableAccount(OFFICEACE.id, '')
+      if (available) {
+        await officeaceAuthService.refreshAccountCredential(
+          available.entry.credentialRef, pool, available.entry.id,
+        )
+        return
+      }
+      // ⚠️ 池被限流标记筛空时**不能回落 `refreshAll`**：那会让被限流的账号
+      //    永远等不到续期（issue 的核心）。改为从池里直接取**第一个启用账号**。
+      // ⚠️ `listAccountsByProvider` 是**同步**返回数组（不是 Promise）——
+      //    给它接 `.catch()` 是类型错误。
+      const all = pool.listAccountsByProvider(OFFICEACE.id)
+      const first = all.find((entry) => entry.enabled !== false) ?? all[0]
+      if (first !== undefined) {
+        await officeaceAuthService.refreshAccountCredential(
+          first.credentialRef, pool, first.id,
+        )
+        return
+      }
+      // 池里真的没有账号（尚未登录）⇒ 才允许续期那一份本机凭据。
+      await officeaceAuth.refreshStoredCredential().catch(() => undefined)
+    },
+    // ⚠️ 必须注入：DSH 的模型目录是**推送式**的（客户端把 catalog 缓存在
+    //    `status === 'ready'` 的短路 store 里，只在收到 `llm/adapters-updated`
+    //    等事件时才重读）。不广播 = 注册成功、`listModels` 也正常，但模型选择器
+    //    里**看不到分组**（真实症状 2026-10-12）。
+    onCatalogLoaded: () => { ctx.emit('llm/adapters-updated') },
+  })
+  // 冷启动也广播一次：首次目录在注册后异步就绪，不补这一发就只能等用户重启。
+  ctx.emit('llm/adapters-updated')
+
   // ===== OpenCode Zen（账号槽 + 匿名槽平权混合池）=====
   //
   // 形态与前面所有 provider 相同：进程内 LlmAdapter 直发远端，无子进程、无端口。
@@ -2525,6 +2583,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     gemini: pruned(GEMINI.id, geminiAdapter),
     zcode: pruned(ZCODE.id, zcodeAdapter),
     opencode: pruned(OPENCODE.id, opencodeAdapter),
+    // OfficeAce（华为 MaaS 云端直连）：目录静态 + 平台侧可用性，同其余渠道。
+    officeace: pruned(OFFICEACE.id, officeAceAdapter),
     // ⚠️ 聚合 provider 也必须进这张表（设计文档 §5.2 的必改点）：`jet-hub-rpc.ts` 的
     // `fullCatalogIds` **优先**用本表的 `listAllModels()`（不套黑名单的全量目录），
     // 缺失时才退化到 `llm.listModels(provider)` —— 后者已被适配器按黑名单过滤。
@@ -2686,7 +2746,50 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   //    （虚拟 provider，无账号无凭据）。它们的 runtime 只有 descriptor。
   //    ⚠️ opencode 的积分也**不在** `creditsTable` 里（它的余额是本地派生的
   //    通道可用性、零网络，作为特例留在 `credits.balances` 里短路）。
+  const officeaceAuthService = {
+    refreshAccountCredential: (refName: string, pool: unknown, accountId: string) =>
+      officeaceAuth.refreshAccountCredential(refName, pool as never, accountId),
+    /**
+     * ⚠️ `refreshAll` **内部必须走本对象的 `refreshAccountCredential`**，不能直接调
+     * 模块函数：守卫用例（`provider-runtime-wiring.spec.ts`）的判据是「布桩在
+     * `ctx.officeaceAuth.refreshAccountCredential` 上，然后断言 `refreshAll` 打到它」。
+     * 绕开本对象走模块函数 ⇒ spy 收不到，用例静默少一家覆盖。
+     */
+    refreshAll: async (pool: unknown) => {
+      const p = pool as {
+        listAccountsByProvider?: (id: string) => Promise<readonly { id: string; credentialRef: string }[]>
+      } | undefined
+      if (p?.listAccountsByProvider === undefined) {
+        await officeaceAuth.refreshStoredCredential().catch(() => undefined)
+        return
+      }
+      const accounts = await p.listAccountsByProvider('officeace').catch(() => [])
+      if (accounts.length === 0) {
+        await officeaceAuth.refreshStoredCredential().catch(() => undefined)
+        return
+      }
+      for (const account of accounts) {
+        await officeaceAuthService.refreshAccountCredential(account.credentialRef, pool, account.id)
+      }
+    },
+    /** 状态探测 / 登录 / 余额（面板与 RPC 用到的其余入口）。 */
+    readOfficeAceCredential: () => officeaceAuth.readOfficeAceCredential(),
+    refreshStoredCredential: () => officeaceAuth.refreshStoredCredential(),
+    isExpiring: (credential: Parameters<typeof officeaceAuth.isExpiring>[0]) =>
+      officeaceAuth.isExpiring(credential),
+    startLogin: () => officeaceAuth.startLogin(),
+    pollLoginCode: (state: string) => officeaceAuth.pollLoginCode(state),
+    completeLogin: (...args: Parameters<typeof officeaceAuth.completeLogin>) =>
+      officeaceAuth.completeLogin(...args),
+    fetchSubscriptionSummary: () => officeaceAuth.fetchSubscriptionSummary(),
+  }
   {
+  /**
+   * OfficeAce 的 auth 服务形状包装（`officeaceAuthService`）—— 定义在下方
+   * 的能力注册段里。它必须与 `ctx.provide("officeaceAuth", …)` 及
+   * `registerJetHubRpc` 的 `auths.officeace` 是**同一个对象**（守卫用例布桩在
+   * ctx 上，两处各建一个会让 spy 收不到调用；理由见定义处注释）。
+   */
     const registry: ReadonlyArray<readonly [string, JetHubAuthLike]> = [
       ['codearts', service],
       ['buddy', buddy],
@@ -2701,6 +2804,12 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
       ['minimax', minimax],
       ['zcode', zcode],
       ['gemini', gemini],
+      // OfficeAce（华为 MaaS 云端直连）：值是 **auth 服务形状的包装对象**
+      //（`officeaceAuthService`，不是 Service 实例）—— 必须与
+      // `ctx.provide('officeaceAuth', …)` 及 `registerJetHubRpc` 的
+      // `auths.officeace` 是**同一个对象**，否则守卫用例布在 ctx 上的 spy
+      // 收不到本循环的调用（实测症状：`续期没有分派到它自己的实例（实际：无）`）。
+      ['officeace', officeaceAuthService as unknown as JetHubAuthLike],
     ]
     for (const [id, auth] of registry) {
       const descriptor = descriptorOf(id)
@@ -2773,11 +2882,34 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     }
   }
 
+  /**
+   * OfficeAce 的 auth **不是 `Service` 子类**（它导出的是纯函数集合，没有实例
+   * 状态需要挂到 cordis 服务上）。但仓库的统一 auth 契约（`JetHubAuthLike`）
+   * 与多条守卫用例都按 **`ctx.<provider>Auth` 服务名**取实例 —— 故这里显式
+   * 把命名空间包成一个服务形状的对象。
+   *
+   * ⚠️ **必须包一层普通对象，不能直接挂模块命名空间**：ES 模块的命名空间对象
+   * 只有 getter，守卫用例会把 `refreshAccountCredential` 换成 spy（`vi.fn()`）
+   * ⇒ 直接挂会抛 `Cannot set property … which has only a getter`。
+   *
+   * ⚠️⚠️ **同一个对象必须同时用于 `ctx.provide` 与 `registerJetHubRpc` 的
+   * `auths.officeace`**：守卫用例的判据是「布桩在 `ctx.officeaceAuth` 上，
+   * 然后断言 `account.refresh` 打到**同一个**实例」。两处各建一个包装对象
+   * 会让 spy 永远收不到调用（实测症状：`expected [] to deeply equal
+   * ['officeaceAuth']`）。
+   *
+   * ⚠️ 不注册的话症状是「OfficeAce 的凭据永不自动续期」且日志里一个字都没有
+   *（`provider-runtime-wiring.spec.ts` 真跑 apply 会红）。
+   */
+
   registerJetHubRpc(ctx, pool, {
     codearts: service,
     buddy, workbuddy, lobsterai, qoder,
     qodercn: qoderCn,
     trae, cline, loomy, raccoon, minimax, zcode, gemini,
+    // OfficeAce（华为 ModelArts MaaS 云端直连）：值是 **auth 服务形状的包装对象**
+    //（纯函数集合 + 统一 auth 契约），不是 Service 实例。
+    officeace: officeaceAuthService as never,
   }, modelAdapters)
 
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
@@ -2789,4 +2921,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 该服务缺席的 profile 里本功能整体不生效，不会让插件永久 pending。
   installLoopResume(ctx)
   ctx.provide('accountPool', pool)
+  // ⚠️ 与 `registerJetHubRpc` 的 `auths.officeace` 是**同一个对象**
+  //（理由见上面 `officeaceAuthService` 的注释：两处各建一个会让守卫用例的
+  //  spy 收不到调用）。
+  ctx.provide('officeaceAuth', officeaceAuthService as never)
 }

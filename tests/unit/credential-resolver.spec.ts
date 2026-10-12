@@ -706,6 +706,7 @@ describe('★ 接线层：apply() 出来的真实闭包（替代源码文本断�
     raccoon: 'RACCOON',
     minimax: 'MINIMAX',
     gemini: 'GEMINI',
+    officeace: {} as never,
     zcode: 'ZCODE',
   }
 

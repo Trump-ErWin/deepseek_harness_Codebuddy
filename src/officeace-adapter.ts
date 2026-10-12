@@ -1,0 +1,292 @@
+/**
+ * OfficeAce 适配器：把 DSH 的 `LlmAdapter` 调用转发到华为 ModelArts MaaS。
+ *
+ * ## 与 AutoClaw 适配器的差异
+ *
+ * - **直连云端**（无本地网关）；凭据从本机 Redis 读（见 `officeace-auth.ts`）
+ * - `listModels` 静态（`OFFICEACE_MODELS`）+ 探测门控（凭据读不到 = 隐藏分组）
+ * - 响应含 `reasoning_content`，`consumeOpenAiSse` 已兼容 OpenAI 协议
+ */
+
+import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import type {
+  GenerateOptions,
+  LlmModelInfo,
+  LlmProviderInfo,
+  LlmResolvedModelInfo,
+  StreamChunk,
+} from '@deepseek-ai/dsh-llm'
+import type { Context } from '@deepseek-ai/cordis'
+import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js'
+import { basicAuthorization, fetchModelTokenRates, isExpiring, readOfficeAceCredential, refreshStoredCredential, type OfficeAceCredential } from './officeace-auth.js'
+import { consumeOpenAiSse, serializeMessages } from './openai-compat.js'
+import { registerAdapterIdempotent } from './llm-register-compat.js'
+
+export interface OfficeAceAdapterOptions {
+  /** 凭据（测试注入）；缺省每次从本机读取。 */
+  credentialProvider?: () => Promise<OfficeAceCredential | undefined>
+  /** 覆盖默认的 fetch（测试注入）。 */
+  fetchImpl?: typeof fetch
+  /**
+   * 凭据续期（宿主在「登录 / 点刷新积分」等时机调用）。
+   *
+   * ⚠️ **必须由接线层注入**：漏接的症状是该渠道的账号永不过期 —— 用户重新登录后
+   *    旧凭据仍被继续用，且日志里一个字都没有（守卫用例断言
+   *    `ctx.llm.adapterByProvider.get(id).options.refresh` 是函数）。
+   */
+  refresh?: () => Promise<void>
+  /** 黑名单模型 id（面板「显示列表」开关）。 */
+  disabledModels?: () => ReadonlySet<string>
+  /** 目录可用后回调 —— 接线层注入 `broadcastCatalogChanged(ctx)`。 */
+  onCatalogLoaded?: () => void
+}
+
+export class OfficeAceAdapter extends LlmAdapter {
+  /** 目录是否已广播过（只广播一次）。 */
+  private announced = false
+  /** 倍率缓存（listModels 时填充，resolveModel 复用——保持两处名字一致）。 */
+  private rateCache = new Map<string, number>()
+
+  constructor(private readonly options: OfficeAceAdapterOptions = {}) {
+    super()
+  }
+
+  /**
+   * 取当前可用凭据；STS 临期（10 分钟内）先静默刷新。
+   *
+   * ⚠️ 刷新失败（refresh_token 已消费）返回旧凭据 —— 推理可能仍可用
+   *（MaaS Basic 凭据与 STS 生命周期不同步）；真正失效由 stream 的 401 报错兜底。
+   */
+  private async resolveCredential(): Promise<OfficeAceCredential | undefined> {
+    if (this.options.credentialProvider) return this.options.credentialProvider()
+    let credential = await readOfficeAceCredential()
+    if (credential !== undefined && isExpiring(credential)) {
+      credential = (await refreshStoredCredential().catch(() => undefined)) ?? credential
+    }
+    return credential
+  }
+
+  providerInfo(provider: string): LlmProviderInfo {
+    const id = typeof provider === 'string' && provider.length > 0 ? provider : OFFICEACE.id
+    return { id, name: OFFICEACE.displayName }
+  }
+
+  /** ⚠️ 必须同步（Jet Hub `ModelCatalogSource` 不 await，同 minimax 教训）。 */
+  listAllModels(): readonly { id: string; name: string; isFree?: boolean }[] {
+    return OFFICEACE_MODELS.map((m) => ({ id: m.id, name: m.name }))
+  }
+
+  /**
+   * 目录：凭据可读 + `/v2/models` 可达才暴露（隐藏不可恢复的分组，
+   * 与 AutoClaw 同一约定：空目录 = 隐藏，而不是报错）。
+   */
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    const disabled = this.options.disabledModels?.() ?? new Set<string>()
+    const credential = await this.resolveCredential()
+    if (credential === undefined) return []
+    try {
+      const probe = await this.probe(credential)
+      if (!probe) return []
+    } catch {
+      return []
+    }
+    this.announceLater()
+    // 倍率（costCoefficient）：OfficeAce 主界面显示 `0.7x` 的那个值，来自
+    // `/api/subscription/model-token-rates`。取不到（未装 OfficeAce）时优雅降级
+    // —— 名字后不带 x 系数，模型照常可选。
+    const rates = await fetchModelTokenRates()
+    this.rateCache = rates
+    return OFFICEACE_MODELS
+      .filter((m) => !disabled.has(m.id))
+      .map((m) => {
+        const coeff = rates.get(m.id)
+        return {
+          provider: OFFICEACE.id,
+          id: m.id,
+          name: coeff !== undefined ? `${m.name} · x${coeff}` : m.name,
+          inputModalities: ['text'],
+        }
+      })
+  }
+
+  private announceLater(): void {
+    if (this.announced) return
+    this.announced = true
+    setTimeout(() => {
+      try {
+        this.options.onCatalogLoaded?.()
+      } catch {
+        // 广播失败不中断请求
+      }
+    }, 0)
+  }
+
+  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    const known = OFFICEACE_MODELS.find((m) => m.id === model)
+    // ⚠️ 倍率要与 listModels 同源（否则选择器显示 `GLM-5.2 · x0.7`、
+    //    选中后底部胶囊却只显示 `GLM-5.2`——两处名字不一致）。缓存命中时同步取。
+    const coeff = this.rateCache.get(model)
+    const baseName = known?.name ?? model
+    return {
+      provider,
+      id: model,
+      name: coeff !== undefined ? `${baseName} · x${coeff}` : baseName,
+      inputModalities: ['text'],
+      // ⚠️ **未知 id 不编造 `context`**：目录外的模型我们不知道它的上下文窗口，
+      //    拿一个猜测值（131072）会让自动压缩按错误阈值决策 —— 如实 `undefined`
+      //    比编一个数诚实（`model-catalog-parity.spec.ts` 会红并点名这种编造）。
+      ...(known === undefined ? {} : { context: { contextWindow: known.contextWindow } }),
+    }
+  }
+
+  /** 探测：模型端点 200 且 JSON（凭据有效即通过）。 */
+  private async probe(credential: OfficeAceCredential): Promise<boolean> {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 8_000)
+    try {
+      const f = this.options.fetchImpl ?? fetch
+      const r = await f(`${OFFICEACE.defaultBaseUrl}${OFFICEACE.modelsPath}`, {
+        headers: { Authorization: basicAuthorization(credential) },
+        signal: ctrl.signal,
+      })
+      const ct = r.headers.get('content-type') ?? ''
+      return r.ok && ct.includes('application/json')
+    } catch {
+      return false
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<{
+    model: LlmResolvedModelInfo
+    stream: (options: GenerateOptions) => AsyncGenerator<StreamChunk>
+  }> {
+    return {
+      model: await this.resolveModel(provider, model, signal),
+      stream: (options: GenerateOptions) => this.stream(options),
+    }
+  }
+
+  /** ⚠️ 单参数 `stream(options)`（`LlmAdapter` 基类契约）。 */
+  async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    const model = options.model
+    const credential = await this.resolveCredential()
+    if (credential === undefined) {
+      throw new Error(
+        '未找到 OfficeAce 凭据：请启动 OfficeAce 并登录华为云账号（凭据缓存于本机 Redis），'
+        + '或确认 Redis 6399 与 Windows 凭据管理器条目可读',
+      )
+    }
+    const f = this.options.fetchImpl ?? fetch
+
+    const controller = new AbortController()
+    const onAbort = () => controller.abort()
+    options.signal?.addEventListener('abort', onAbort)
+
+    const payload = JSON.stringify({
+      model,
+      messages: serializeMessages(options.messages),
+      stream: true,
+      ...options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens },
+      ...options.temperature === undefined ? {} : { temperature: options.temperature },
+    })
+
+    try {
+      const response = await f(`${OFFICEACE.defaultBaseUrl}${OFFICEACE.chatPath}`, {
+        method: 'POST',
+        headers: {
+          Authorization: basicAuthorization(credential),
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+        },
+        body: payload,
+        signal: controller.signal,
+      })
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => '')
+        // ⚠️ 401 = Basic 凭据失效。MaaS 的凭据与 STS 生命周期不同步，**STS 也快到期**
+        //    是常见成因 —— 这里续期一次再重发，与 trae / gemini 同款模式。
+        //    不接 `options.refresh` 时静默失败（接线层漏接的症状即此）。
+        if (response.status === 401 && this.options.refresh !== undefined) {
+          await this.options.refresh().catch(() => undefined)
+          const renewed = await this.resolveCredential()
+          if (renewed !== undefined && renewed !== credential) {
+            const retry = await f(`${OFFICEACE.defaultBaseUrl}${OFFICEACE.chatPath}`, {
+              method: 'POST',
+              headers: {
+                Authorization: basicAuthorization(renewed),
+                'Content-Type': 'application/json',
+                Accept: 'text/event-stream',
+              },
+              body: payload,
+              signal: controller.signal,
+            })
+            if (retry.ok) {
+              yield* consumeOpenAiSse(
+                retry,
+                { signal: controller.signal },
+                {
+                  label: OFFICEACE.id,
+                  firstTokenTimeoutMs: OFFICEACE.headerTimeoutMs,
+                  chunkTimeoutMs: OFFICEACE.chunkTimeoutMs,
+                  ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+                },
+              )
+              return
+            }
+          }
+        }
+        throw new Error(
+          `OfficeAce (华为MaaS) 返回 HTTP ${response.status}：${text.slice(0, 200)}`
+          + `（${this.diagnose(response.status)}）`,
+        )
+      }
+
+      yield* consumeOpenAiSse(
+        response,
+        { signal: controller.signal },
+        {
+          label: OFFICEACE.id,
+          firstTokenTimeoutMs: OFFICEACE.headerTimeoutMs,
+          chunkTimeoutMs: OFFICEACE.chunkTimeoutMs,
+          ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+        },
+      )
+    } finally {
+      options.signal?.removeEventListener('abort', onAbort)
+      controller.abort()
+    }
+  }
+
+  private diagnose(status: number): string {
+    if (status === 401) return 'Basic 凭据失效：OfficeAce 会话已过期，请重新登录 OfficeAce 客户端'
+    if (status === 403) return '该账号未订阅此模型（ModelArts.81004）：请在 OfficeAce 或华为云控制台订阅'
+    if (status === 404) return '模型不存在：检查模型 id 是否在目录中'
+    if (status === 429) return '限流：稍后重试'
+    if (status >= 500) return '华为云服务端错误：稍后重试'
+    return '请确认 OfficeAce 已登录且账号有可用额度'
+  }
+}
+
+/** 在 `ctx.llm` 上注册 OfficeAce provider 路由（幂等，返回**原始适配器实例**）。 */
+export function registerOfficeAceLlm(
+  ctx: Context,
+  options: OfficeAceAdapterOptions = {},
+): OfficeAceAdapter {
+  const adapter = new OfficeAceAdapter(options)
+  // ⚠️ **返回 `adapter` 而不是 `registerAdapterIdempotent` 的返回值**：
+  //    后者的语义是「`registerAdapter` 的结果」—— 重复注册时它返回 `undefined`，
+  //    非重复时返回宿主给的句柄（**不是**适配器实例）。接线层要把它放进
+  //    `modelAdapters` 供 `provider.status` 调 `listAllModels()`，拿到句柄会
+  //    报 `listAllModels is not a function`（实测症状，2026-10-12）。
+  //    与 `registerGeminiLlm` / `registerZcodeLlm` 同款（它们也返回原始实例）。
+  registerAdapterIdempotent(
+    ctx.llm,
+    [OFFICEACE.id],
+    adapter,
+    (message: string) => ctx.logger?.warn?.(message),
+  )
+  return adapter
+}
