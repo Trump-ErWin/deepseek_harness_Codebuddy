@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { JET_HUB_API_PATH, registerJetHubRpc } from '../../src/jet-hub-rpc.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
@@ -396,15 +399,55 @@ describe('credits.balances 的按需自愈（issue IKKHL5 建议 C）', () => {
    * `typeof` 时**没有任何**用例变红）。这两条不是同义反复，而是分别锁住
    * 「临界时刻算不算过期」与「非数字值不得被 JS 强制转换后误判」。
    */
+  /**
+   * ⚠️ **边界必须用冻结时钟**（对抗审计实测的高危点，初版是**概率性**守卫）。
+   *
+   * 初版写法：用例内 `const now = Date.now()`，随后 heal 内部**再调一次**
+   * `Date.now()` —— 两次调用**跨毫秒**才检出 `<` 变异。实测同一副本单文件
+   * 跑 20 次：变异后 **10 红 10 绿（50%）**，而全量 CI 下 **0 检出**。
+   * 一条只在 50% 情况下生效的守卫，等于没有。
+   *
+   * ⇒ 用 `vi.setSystemTime` 把 `Date.now()` 钉死，令 `expiresAt` 与判据里的
+   * `Date.now()` **严格相等**，`<=` 与 `<` 的差异因此**确定可判**。
+   */
   it('★ 恰好等于当前时刻算过期（`<=` 边界，不是 `<`）', async () => {
-    const now = Date.now()
-    const { call, calls } = setup({ accounts: [expiredEntry({ id: 'a1', expiresAt: now })] })
+    vi.useFakeTimers()
+    try {
+      const frozen = new Date('2030-01-01T00:00:00.000Z')
+      vi.setSystemTime(frozen)
+      // ⚠️ 冻结后 Date.now() 恒为 frozen.getTime()；expiresAt 与它**严格相等**。
+      const { call, calls } = setup({
+        accounts: [expiredEntry({ id: 'a1', expiresAt: frozen.getTime() })],
+      })
 
-    await call('credits.balances', { provider: 'minimax' })
+      await call('credits.balances', { provider: 'minimax' })
 
-    // 客户端判据是 `<= Date.now()`；宿主若写成 `<` 会出现「面板说已过期、
-    // 宿主却不续期」的分叉（用户点刷新看不到任何自救）。
-    expect(calls).toHaveLength(1)
+      // 客户端判据是 `<= Date.now()`；宿主若写成 `<` 会出现「面板说已过期、
+      // 宿主却不续期」的分叉（用户点刷新看不到任何自救）。
+      // ⚠️ 这条断言现在是**确定性**的：改成 `<` 必红（冻结时钟不会跨毫秒）。
+      expect(calls, '`<=` 边界：恰好到期即应续期').toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('★ 比当前时刻晚 1ms 不算过期（`<=` 的另一侧边界）', async () => {
+    // 与上一条配对，锁住「不是无条件续期」——两条一起才能确定判据是 `<=`
+    // 而不是 `<= 任何值`。
+    vi.useFakeTimers()
+    try {
+      const frozen = new Date('2030-01-01T00:00:00.000Z')
+      vi.setSystemTime(frozen)
+      const { call, calls } = setup({
+        accounts: [expiredEntry({ id: 'a1', expiresAt: frozen.getTime() + 1 })],
+      })
+
+      await call('credits.balances', { provider: 'minimax' })
+
+      expect(calls, '未到期不应续期').toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('★ 非数字的 expiresAt 不得被强制转换后误判（`typeof` 检查）', async () => {
@@ -421,6 +464,47 @@ describe('credits.balances 的按需自愈（issue IKKHL5 建议 C）', () => {
     await call('credits.balances', { provider: 'minimax' })
 
     expect(calls, '字符串形式的 expiresAt 不应触发续期').toEqual([])
+  })
+
+  /**
+   * ★ **整轮预算**（对抗审计实测的真实缺陷）。
+   *
+   * 自愈是逐账号顺序 `await`，每家续期超时 20~60s ⇒ 39 个账号全过期时最坏
+   * 约 39 分钟，发生在**用户点一下就等**的端点上。不设闸门的话，症状会从
+   * 「积分行 401」**恶化成「整个端点超时、余额一起丢」**。
+   *
+   * ⚠️ 断言「到点后**停止继续自愈、但端点仍正常返回**」——
+   * 不是「失败」：没来得及续期的账号交给下一轮远好于拿不到任何结果。
+   */
+  it('★ 自愈受整轮预算约束：到点即停，余下账号不续（但端点仍成功返回）', async () => {
+    // 造 40 个过期账号；让每次续期「耗时」超过预算（用假时钟推进），
+    // 这样第 2 个账号起就应被预算挡下。
+    const accounts = Array.from({ length: 40 }, (_, i) => expiredEntry({ id: `a${i}` }))
+    let refreshes = 0
+    const { call, warns } = setup({
+      accounts,
+      auths: {
+        minimax: async () => {
+          refreshes += 1
+          // ⚠️ 推进假时钟：模拟一次真实续期耗时（各家超时 20~60s）。
+          // 预算是 60s，故推进 61s 后下一次循环必被挡下。
+          vi.advanceTimersByTime(61_000)
+        },
+      },
+    })
+
+    vi.useFakeTimers()
+    try {
+      const result = await call('credits.balances', { provider: 'minimax' })
+      // 端点必须仍然成功（不是整体失败）
+      expect(result.ok).toBe(true)
+      // 只续了第一个，其余被预算挡下 —— 而不是 40 个全跑
+      expect(refreshes, '预算生效后不应继续续期').toBe(1)
+      // 且必须留痕（否则用户/排查者看不到「本轮没跑完」）
+      expect(warns.some((w) => w.includes('整轮预算'))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -483,6 +567,101 @@ describe('credits.claimAll 的按需自愈（与余额查询同一层）', () =>
       const result = await h.call('credits.claimAll', { provider })
       expect(result.ok, `${provider} 应仍返回可读错误`).toBe(false)
       expect(result.error?.message).toContain('不支持每日签到')
+    }
+  })
+})
+
+/**
+ * ★ **`SELF_HEAL_REFRESHABLE_PROVIDERS` 的漂移守卫**（对抗审计实测的零守卫缺口）。
+ *
+ * ## 为什么需要这组用例
+ *
+ * 那张 Set 是**硬编码手抄**的（`PROVIDER_REGISTRY` 里没有「有无 refresh 端点」
+ * 这个字段，故硬编码本身可接受），而实际分派走 `authOf(auths, provider)`。
+ * 两者**一旦漂移**就是静默缺陷：
+ * - Set 少了某家 ⇒ 该家**永不参与自愈**（症状与本次要修的完全一样）；
+ * - Set 多了不存在的 id ⇒ `refreshAccountByProvider` 抛错、被 catch 记一条噪音 warn。
+ *
+ * 对抗审计实测（独立副本变异）：**删掉 `TRAE.id` 或 `LOBSTERAI.id` ⇒ 零测试变红**；
+ * 加一个假 id `'not-a-channel'` ⇒ 同样零变红。即这两类漂移此前**完全没有守卫**
+ * ——「各家都有自愈分派」那条用例只覆盖了 codearts/raccoon/gemini/buddy/
+ * workbuddy/qodercn，恰好漏掉 trae 与 lobsterai。
+ *
+ * 本组用例**逐家点名**（不写魔数、不写「>= N」），任何一家掉出 Set 都会红。
+ */
+describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const rpcSource = readFileSync(resolve(here, '../../src/jet-hub-rpc.ts'), 'utf8')
+
+  /**
+   * 从源码里抽出 Set 的字面量成员与 `.id` 常量名。
+   *
+   * ⚠️ **只取 `new Set([...])` 的成员区间**，不从 `const` 起取整段 ——
+   * 否则定义前的长篇注释会被一起扫进来，注释里的引号串会造成误报。
+   *
+   * ⚠️ 字面量正则用 `[^']+` 而不是 `[a-z]+`（初版教训）：对抗审计的假 id
+   * `'not-a-channel'` 含连字符，`[a-z]+` **匹配不到它** ⇒ 加假 id 时
+   * 三条守卫全绿（实测 V3 盲区）。用「引号内任意非引号字符」才能全覆盖。
+   */
+  function selfHealSetParts(): { literals: string[]; constants: string[] } {
+    const declared = rpcSource.indexOf('const SELF_HEAL_REFRESHABLE_PROVIDERS')
+    expect(declared, '未找到 SELF_HEAL_REFRESHABLE_PROVIDERS').toBeGreaterThan(-1)
+    const open = rpcSource.indexOf('new Set([', declared)
+    expect(open, '未找到 new Set([ 字面量').toBeGreaterThan(-1)
+    const close = rpcSource.indexOf('])', open)
+    expect(close).toBeGreaterThan(open)
+    const body = rpcSource.slice(open + 'new Set(['.length, close)
+    return {
+      literals: [...body.matchAll(/'([^']+)'/g)].map((m) => m[1]!),
+      constants: [...body.matchAll(/([A-Z][A-Z_]+)\.id/g)].map((m) => m[1]!),
+    }
+  }
+
+  /** `.id` 常量的运行期值（与源码里的常量名互为印证）。 */
+  const ID_OF: Record<string, string> = {
+    LOBSTERAI: 'lobsterai', QODER: 'qoder', QODER_CN: 'qodercn', TRAE: 'trae',
+    CLINE: 'cline', RACCOON: 'raccoon', MINIMAX: 'minimax', GEMINI: 'gemini',
+  }
+
+  it('★ Set 里的字面量恰好是 codearts / buddy / workbuddy（多一个少一个都红）', () => {
+    const { literals } = selfHealSetParts()
+    expect(literals.slice().sort()).toEqual(['buddy', 'codearts', 'workbuddy'])
+  })
+
+  it('★ Set 里的 `.id` 常量恰好是那八家（逐家点名，不写魔数阈值）', () => {
+    // ⚠️ 逐家列举而不是 `expect(constants.length).toBeGreaterThanOrEqual(8)` ——
+    // 后者在「删掉 trae、加上一个假的」时**仍然通过**，正是审计实测的漏报形态。
+    const { constants } = selfHealSetParts()
+    expect(constants.slice().sort()).toEqual([
+      'CLINE', 'GEMINI', 'LOBSTERAI', 'MINIMAX', 'QODER', 'QODER_CN', 'RACCOON', 'TRAE',
+    ])
+  })
+
+  it('★ Set 的成员逐家正确，且 loomy / zcode 必须不在其中', () => {
+    const { literals, constants } = selfHealSetParts()
+    const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
+    expect([...inSet].sort()).toEqual([
+      'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'minimax',
+      'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy',
+    ])
+    // 反向：两家没有 refresh 端点，必须**静默跳过**而非尝试续期。
+    expect(inSet.has('loomy')).toBe(false)
+    expect(inSet.has('zcode')).toBe(false)
+  })
+
+  it('★ Set 里的每一个 id 都必须在 JetHubAuths 里有对应键（不得有假 id）', () => {
+    // 对抗审计实测：加一个 `'not-a-channel'` 到 Set ⇒ 零测试变红，而运行期
+    // 它会走 refreshAccountByProvider → authOf 查不到 → 抛错 → 被 catch
+    // 记一条噪音 warn。这条锁住「Set ⊆ Auths 的键」。
+    const authsStart = rpcSource.indexOf('export interface JetHubAuths {')
+    const authsEnd = rpcSource.indexOf('}', authsStart)
+    const keys = new Set(
+      [...rpcSource.slice(authsStart, authsEnd).matchAll(/readonly (\w+):/g)].map((m) => m[1]!),
+    )
+    const { literals, constants } = selfHealSetParts()
+    for (const id of [...literals, ...constants.map((c) => ID_OF[c] ?? c)]) {
+      expect(keys.has(id), `Set 里的 ${id} 在 JetHubAuths 里没有对应键（会抛 Unknown provider）`)
+        .toBe(true)
     }
   })
 })
