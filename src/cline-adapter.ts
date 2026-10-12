@@ -33,6 +33,7 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
 import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import type { CatalogHealth } from './types.js'
 import {
   clineExhaustedAdvice,
   clineRateLimitResetAt,
@@ -446,6 +447,43 @@ export class ClineAdapter extends LlmAdapter {
     // 后者把「明确 false」与「没这条记录」压成同一结果，正是本条要修的形态。
     if (entry?.supportsImage === undefined) return undefined
     return entry.supportsImage ? ['text', 'image'] : ['text']
+  }
+
+  /**
+   * 目录健康快照（issue IKKZUG 第 5 点：可观测性）。
+   *
+   * ## 为什么需要
+   *
+   * 本家的目录来自**三个来源**，其中 `models.dev` 是 5.39 MB 的外部站点、
+   * **经常拉不到**（用户实测直连三次：超时 / 超时 / 1.9 秒成功）。而失败时
+   * 只有一行 `console.warn`，**宿主不落盘** ⇒ 用户与排障者看到的只是
+   * 「贴不了图」，**无从判断**是「这个模型不支持图片」还是「目录还没拉到」。
+   *
+   * 用户正是靠手工推演才定位到这一层 —— 那不该是排障的常规成本。
+   *
+   * ## 三条纪律
+   *
+   * 1. ⚠️ **零 IO**：设置页挂载时对每个供应商都会调它，一旦触发网络请求
+   *    就会拖慢首屏（本端点全程只用同步内存副本正是为此）。故只读内存字段。
+   * 2. ⚠️ `note` **只在异常时给**：完整时不写该字段 —— 一句「一切正常」
+   *    对排障毫无价值，真正需要看的正是异常时（也省掉前端一处渲染分支）。
+   * 3. ⚠️ `complete: false` **不等于故障**：插件会按闸门冷却**自动重试**
+   *    （见 `remoteComplete`），用户无需做任何事。它只说明「现在看到的
+   *    列表与能力可能不全，但会自愈」—— 故文案里必须写明这一点，
+   *    否则用户会以为要自己去修。
+   */
+  describeCatalogHealth(): CatalogHealth {
+    const total = (this.remoteModels ?? this.fallbackCatalog()).length
+    const modelsDevReady = this.modelsDev !== undefined
+    return {
+      total,
+      complete: this.remoteComplete,
+      ...this.remoteComplete ? {} : {
+        note: modelsDevReady
+          ? 'Cline 模型目录来源未取全（会自动重试）'
+          : 'models.dev 未就绪 —— cline-pass/* 的模型与图片能力只由它提供（会自动重试）',
+      },
+    }
   }
 
   /**

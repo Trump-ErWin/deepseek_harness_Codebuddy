@@ -1491,6 +1491,52 @@ describe('Cline 接线（源码级回归）', () => {
     expect(message).toContain('not-a-real-model')
   })
 
+  // ── issue IKKZUG 第 5 点：让「目录没拉到」**可观测** ──
+  //
+  // 排障困境：models.dev 拉不到时只有一行 console.warn（宿主不落盘），
+  // 现象只是「贴不了图」，无从判断是「模型不支持」还是「目录没拉到」。
+  // 用户正是靠手工推演才定位到这一层 —— 那不该是常规成本。
+
+  it('⚠️ 目录健康快照：models.dev 未就绪时 complete=false 且点名该来源', async () => {
+    const adapter = makeAdapter({
+      loadModelsDev: async () => { throw new Error('models.dev timeout') },
+    })
+    await adapter.listModels('cline')
+    const health = adapter.describeCatalogHealth()
+    expect(health.complete).toBe(false)
+    // ⚠️ 文案必须**点名 models.dev** 且说明「会自动重试」——
+    // 后者缺了会让用户以为要自己去修。
+    expect(health.note).toContain('models.dev')
+    expect(health.note).toContain('会自动重试')
+  })
+
+  it('⚠️ 目录健康快照：完整时 complete=true 且**不给** note（不渲染「一切正常」）', async () => {
+    // ⚠️ 反向验证的另一半：一律给 note 会让前端多一处永远为真的渲染分支。
+    const adapter = makeAdapter({
+      loadModelsDev: async () => new Map([
+        ['cline-pass/deepseek-v4.1-flash', { id: 'cline-pass/deepseek-v4.1-flash', supportsImage: true }],
+      ]),
+    })
+    await adapter.listModels('cline')
+    const health = adapter.describeCatalogHealth()
+    expect(health.complete).toBe(true)
+    expect(health.note, '完整时不该给 note').toBeUndefined()
+    expect(health.total).toBeGreaterThan(0)
+  })
+
+  it('⚠️ 目录健康快照必须**零 IO**（设置页挂载时逐供应商调用）', async () => {
+    // ⚠️ 若它在内部触发拉取，`provider.status` 会在设置页挂载时对每个
+    // 供应商发网络请求 —— 首屏被拖慢，而那个端点全程只用同步内存副本。
+    let devCalls = 0
+    const adapter = makeAdapter({
+      loadModelsDev: async () => { devCalls++; return new Map() },
+    })
+    await adapter.listModels('cline')
+    const before = devCalls
+    for (let i = 0; i < 5; i++) adapter.describeCatalogHealth()
+    expect(devCalls, '读快照不得触发任何拉取').toBe(before)
+  })
+
   it('⚠️ 目录已完整且 models.dev 也已读到时，仍保持「已完整」（不得反复重拉）', async () => {
     // ⚠️ 反向验证的另一半：上一条若把判据写成「恒 false」就会变成
     // 「每次都重拉两个 Cline 端点」的请求风暴 —— 那同样是缺陷。
