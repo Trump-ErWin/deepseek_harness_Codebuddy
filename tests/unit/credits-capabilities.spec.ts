@@ -395,6 +395,66 @@ describe('客户端积分请求门控（源码级回归）', () => {
     expect(guardIndex).toBeLessThan(callIndex)
   })
 
+  /**
+   * ★ **自愈后的账号重读**（issue IKKHL5 的客户端残留，报告者复验时实测到）。
+   *
+   * ## 缺陷
+   *
+   * 宿主侧的 `credits.balances` 会**对已过期账号先续期再查余额**，续期成功后把
+   * 新的 `expiresAt` 回写账号池。但**卡片红字读的是 `account.list` 的快照**
+   *（`AccountCard` 里 `account.expiresAt <= Date.now()`），而 `loadCredits`
+   * 不重读账号列表 ⇒ 「积分已经能读了，卡片却还红着『已过期 · 自动续期』」，
+   * 点别的卡片再切回来才恢复正常。
+   *
+   * ## 为什么必须有这条用例
+   *
+   * 这是**跨端点**的时序契约（`credits.balances` 的副作用要反映到
+   * `account.list` 的消费者上），两个端点各自的单测都覆盖不到它 ——
+   * 服务端 22 条 + 客户端能力门控若干条，全都测不出这个残留。
+   */
+  it('★ loadCredits 在「调用前有已过期账号」时会补读一次账号列表', () => {
+    const start = source.indexOf('const loadCredits = React.useCallback')
+    expect(start).toBeGreaterThan(-1)
+    const body = source.slice(start, start + 2400)
+
+    // ① 快照必须在**发请求之前**取：请求回来时账号池已被宿主改过，
+    //    那时再判会恒为「没有过期账号」而永不补读。
+    const snapshotIndex = body.indexOf('const snapshotBefore = accountsRef.current')
+    const rpcIndex = body.indexOf("rpcCall('credits.balances'")
+    expect(snapshotIndex, 'loadCredits 必须在请求前取账号快照').toBeGreaterThan(-1)
+    expect(rpcIndex).toBeGreaterThan(-1)
+    expect(snapshotIndex, '快照必须取在 credits.balances 之前').toBeLessThan(rpcIndex)
+
+    // ② 判据必须与卡片红字**逐字一致**（同一个表达式），否则会出现
+    //    「卡片红着、却不补读」或反之的无谓往返。
+    expect(body).toContain('typeof account.expiresAt === \'number\'')
+    expect(body).toContain('account.expiresAt > 0')
+    expect(body).toContain('account.expiresAt <= Date.now()')
+
+    // ③ 补读必须有条件（常态零新增往返），且真的调 loadAccounts。
+    expect(body).toMatch(/if \(hadExpired\) await loadAccounts\(\)/)
+  })
+
+  it('★ loadCredits 的补读判据是**调用前**的状态，不是请求后的（反向语义）', () => {
+    // 防止有人「简化」成请求之后再判 —— 那样恒为假，等于没修。
+    const start = source.indexOf('const loadCredits = React.useCallback')
+    const body = source.slice(start, start + 2400)
+    const rpcIndex = body.indexOf("rpcCall('credits.balances'")
+    const hadExpiredIndex = body.indexOf('const hadExpired =')
+    expect(hadExpiredIndex, 'hadExpired 必须显式求值一次').toBeGreaterThan(-1)
+    expect(hadExpiredIndex, 'hadExpired 必须求值于请求之前').toBeLessThan(rpcIndex)
+  })
+
+  it('loadCredits 的 useCallback deps 含 loadAccounts（避免陈旧闭包）', () => {
+    // 补读是**本函数新增的调用**：deps 不带 loadAccounts 会让 React 持有旧的
+    // 那个闭包（陈旧 provider / rpcCall），补读打到错误的面板上。
+    // ⚠️ 窗口 3000：deps 行在函数末尾，距 `const loadCredits` 起点约 2623 字符
+    //（函数头新增的快照注释把它又推远了一点）—— 取 2600 会假失败。
+    const start = source.indexOf('const loadCredits = React.useCallback')
+    const body = source.slice(start, start + 3000)
+    expect(body).toMatch(/\}, \[provider, rpcCall, canLoadCredits, loadAccounts\]\)/)
+  })
+
   it('「刷新积分」按钮与账号卡片的「积分」行都按能力渲染', () => {
     // 归一化 CRLF：本仓库源码在 Windows 上是 CRLF，直接比对多行字面量会假失败。
     const normalized = source.replace(/\r\n/g, '\n')

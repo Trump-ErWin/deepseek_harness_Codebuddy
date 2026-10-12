@@ -2517,6 +2517,24 @@ function ProviderPanel({ provider, rpcCall }) {
    */
   const loadCredits = React.useCallback(async () => {
     if (!canLoadCredits) return;
+    // ⚠️ **自愈后要补一次账号重读的条件，必须在发请求之前取**（issue IKKHL5
+    // 的客户端残留，报告者 @honu 复验时实测到）：
+    //
+    // `credits.balances` 在宿主侧会**对已过期账号先续期再查余额**（见
+    // `src/jet-hub-rpc.ts` 的 `healExpiredAccountBeforeBalance`），续期成功后
+    // 会把新的 `expiresAt` 回写账号池。但**卡片红字读的是 `account.list`
+    // 的快照**（`AccountCard` 里 `account.expiresAt <= Date.now()`），而本函数
+    // 不重读账号列表 ⇒ 「积分已经能读了，卡片却还红着『已过期』」，
+    // 点别的卡片再切回来才恢复。
+    //
+    // 判据用**与卡片逐字相同**的表达式，且必须在 `await` 之前取快照：
+    // 请求回来时账号池已经变了，再判就恒为「没有过期账号」而永不补读。
+    const snapshotBefore = accountsRef.current;
+    const hadExpired = snapshotBefore.some(
+      (account) => typeof account.expiresAt === 'number'
+        && account.expiresAt > 0
+        && account.expiresAt <= Date.now(),
+    );
     setCreditsLoading(true);
     try {
       const res = await rpcCall('credits.balances', { provider });
@@ -2531,6 +2549,12 @@ function ProviderPanel({ provider, rpcCall }) {
       setCredits(next);
       // 窗口天数随余额一起回来（buddy 系 + TRAE 带）——积分行据此分「临时 / 长期」。
       setExpiryWindowDays(res?.windowDays ?? null);
+      // ⚠️ **只有「调用前确实有已过期账号」时才补读**（fix A，最小改动）：
+      // 常态（没有过期账号）零新增往返 —— 本面板本来就会在挂载、切 provider、
+      // 领取后各拉一次，无条件加一次 `account.list` 是纯浪费。
+      // ⚠️ 这一步**失败不影响余额**：`loadAccounts` 内部自带 try/catch 与错误态，
+      // 故这里不包 try（它不会抛）。
+      if (hadExpired) await loadAccounts();
     } catch (caught) {
       console.error('[jet-hub] load credits failed:', caught);
       if (!mounted.current) return;
@@ -2551,7 +2575,10 @@ function ProviderPanel({ provider, rpcCall }) {
     } finally {
       if (mounted.current) setCreditsLoading(false);
     }
-  }, [provider, rpcCall, canLoadCredits]);
+    // ⚠️ `loadAccounts` 必须进 deps：本函数现在会调它（自愈后补读账号），
+    // 而它的依赖是 `[provider, rpcCall]` —— 不进 deps 会让 React 持有**旧的**
+    // 那个闭包（陈旧 provider / rpcCall），补读打到错误的面板上。
+  }, [provider, rpcCall, canLoadCredits, loadAccounts]);
 
   React.useEffect(() => {
     mounted.current = true;
