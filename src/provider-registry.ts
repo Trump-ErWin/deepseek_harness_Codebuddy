@@ -338,8 +338,15 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     logoClass: 'officeace',
     // ⚠️ **有**积分余额：数据来自云侧 `GET /v1/subscription`（V11 签名直读，
     //    与果办界面右上角同源同口径，2026-10-12 扣减实锤），**不依赖 OfficeAce 客户端**。
-    // ⚠️ `dailyCheckin: false` 是**诚实**的：该渠道没有签到端点 ——
-    //    不能为了「让按钮出现」而登记成 true（那样客户端会去请求一个必然失败的上游）。
+    //
+    // ⚠️ `dailyCheckin: false` 但**该渠道确实有签到** —— 这里是**故意**不登记 true：
+    //    签到走的是云侧 `POST /v1/subscription/bonus/claim`，且果办客户端的实现是
+    //    「订阅页一挂载就自动领、**UI 上没有按钮**」（源码 `SubscriptionStateProvider`
+    //    用「年+月+日+时」去重，每小时最多一次）。
+    //    故本渠道的签到在**拉余额时自动完成**（见 `officeace-auth.ts` 的
+    //    `maybeClaimBonus`）—— 登记成 true 会让面板渲染一个手动签到按钮，
+    //    而它背后的 `credits.claim` RPC 对本渠道没有意义（真正的领取是自动的）。
+    //    ⚠️ 语义：该字段表达「是否存在**手动**签到入口」，不是「有没有签到收益」。
     credits: { balance: true, dailyCheckin: false },
     // ⚠️ 余额响应里每个积分包都带到期时间（订阅套餐包无固定到期 = 永久桶，
     //    签到 / 活动包有明确到期）⇒ 可按 `deductionEndTime` 分「永久 / 长期 / 临期」三档。
