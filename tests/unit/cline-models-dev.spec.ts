@@ -117,6 +117,41 @@ describe('applyModelsDevCatalog', () => {
     expect(ids[lastPass + 1]?.startsWith('cline-pass/')).toBe(true)
   })
 
+  // ⚠️⚠️ **明确 false 必须落成字段，而不是省略**（issue IKKZUG 第 1 点的前置）。
+  //
+  // 修复前补进来的条目写作
+  //   `...entry.supportsImage ? { supportsImage: true } : {}`
+  // ⇒ models.dev **明确说 false**（实测 `cline-pass/glm-5.3` 就是不带图的）
+  // 时字段**缺席** ⇒ 在三态语义下被读成「**未知**」，而它其实是
+  // 「**确认不支持**」。
+  //
+  // 后果有两个方向都真实存在：宿主会按「未知」**放行**图片（发到不支持图的服务端），
+  // 而门禁文案会说「能力尚未加载完成」—— 与事实相反。
+  //
+  // ⚠️ 这条在**两态**下无害（`['text']` 两边一致），是三态改造**暴露**出来的。
+  it('models.dev 明确 supportsImage=false 时必须落成 false（不得省略成「未知」）', () => {
+    const dev = new Map([
+      ['cline-pass/glm-5.3', { id: 'cline-pass/glm-5.3', supportsImage: false }],
+    ])
+    const merged = applyModelsDevCatalog([{ id: 'other/model', name: 'other' }], dev)
+    const glm = merged.find((m) => m.id === 'cline-pass/glm-5.3')
+    expect(glm, '补进来的条目').toBeDefined()
+    // ⚠️ 用 `toBe(false)` 而不是 `toBeDefined()`：后者对 `undefined` 也成立。
+    expect(glm?.supportsImage, '明确 false 不能退化成 undefined（= 未知）').toBe(false)
+  })
+
+  it('⚠️ 但「本地兜底表显式 false」仍然赢（models.dev 不得覆盖它）', () => {
+    // 与上一条**成对**：新条目用 dev 的值，已有条目仍「本地优先」。
+    const dev = new Map([
+      ['cline-free/local-false', { id: 'cline-free/local-false', supportsImage: true }],
+    ])
+    const merged = applyModelsDevCatalog(
+      [{ id: 'cline-free/local-false', name: 'local', supportsImage: false }],
+      dev,
+    )
+    expect(merged.find((m) => m.id === 'cline-free/local-false')?.supportsImage).toBe(false)
+  })
+
   it('网关把 id 当名字下发时，用可读名替换', () => {
     const merged = applyModelsDevCatalog(base, parseClineModelsDev(REAL_SHAPE))
     const pass = merged.find((m) => m.id === 'cline-pass/deepseek-v4.1-flash')!

@@ -183,7 +183,19 @@ export function applyModelsDevCatalog(
       name: entry.name ?? id,
       isFree: false,
       ...entry.contextWindow === undefined ? {} : { contextWindow: entry.contextWindow },
-      ...entry.supportsImage ? { supportsImage: true } : {},
+      // ⚠️⚠️ **必须原样落 `supportsImage`（含 `false`），不能只写 true**
+      // （issue IKKZUG）。原写法是
+      //   `...entry.supportsImage ? { supportsImage: true } : {}`
+      // ⇒ models.dev **明确说 false**（实测 `cline-pass/glm-5.3` 就是不带图的）
+      // 时字段**缺席**，在三态语义下被读成「**未知**」，而它其实是
+      // 「**确认不支持**」。两个方向都真实有害：宿主会按「未知」**放行**图片
+      // （发到不支持图的服务端），门禁文案也会说「能力尚未加载完成」——
+      // 与事实相反。
+      //
+      // ⚠️ 这条在**两态**下无害（两边都归 `['text']`），是三态改造**暴露**的。
+      // ⚠️ `ClineModelsDevEntry.supportsImage` 是**必填** boolean（不是可选），
+      // 所以这里不存在「dev 没给」的情形，无需再判 undefined。
+      supportsImage: entry.supportsImage,
     })
     pending.set(prefix, bucket)
   }
@@ -204,8 +216,14 @@ export function applyModelsDevCatalog(
           ...model.contextWindow === undefined && entry.contextWindow !== undefined
             ? { contextWindow: entry.contextWindow }
             : {},
-          // ⚠️ `supportsImage` 只在**缺失**时补：本地兜底表显式 `false` 也照样赢。
-          ...model.supportsImage === undefined && entry.supportsImage ? { supportsImage: true } : {},
+          // ⚠️ `supportsImage` 只在**本地缺失**时采用 models.dev 的值：本地兜底表
+          // 显式 `false` 也照样赢（策展数据优先于社区目录，见模块头口径 2）。
+          //
+          // ⚠️⚠️ 但**必须原样采用，含 `false`**（issue IKKZUG）：原写法是
+          // `&& entry.supportsImage`，于是 dev 说 false 时字段仍**缺席**
+          // ⇒ 被读成「未知」。这与上面「补缺」分支是同一个缺陷的两个入口，
+          // 只修一个就会从另一个入口漏回去。
+          ...model.supportsImage === undefined ? { supportsImage: entry.supportsImage } : {},
         })
     const prefix = prefixOf(model.id)
     if (lastIndexOfPrefix.get(prefix) === index) {
