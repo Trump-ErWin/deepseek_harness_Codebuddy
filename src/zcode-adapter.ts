@@ -109,6 +109,7 @@ import {
 import type { CarrierOutcome } from './captcha-carrier.js'
 import {
   describeZcodeRequestShape,
+  extractZcodeLogId,
   formatZcodeDiagnostic,
   formatZcodeEdgePageHint,
   formatZcodeUnusualActivityMessage,
@@ -1349,6 +1350,15 @@ export class ZcodeAdapter extends LlmAdapter {
             sentAt: upstreamStartedAt,
             status: response.status,
             shape: describeZcodeRequestShape(body.system, body.messages),
+            /**
+             * ★ `logid` —— 上游侧排障的**唯一凭据**（2026-10-12 新增）。
+             *
+             * ⚠ **双来源**：体优先、头兜底。边缘 HTML 页的体里没有 `logid`，
+             *   但头里仍有 `x-request-id`（实测两者值相同，见
+             *   {@link extractZcodeLogId}）。
+             * ⚠ 取不到时该项整段省略 —— 不编造、也不留空壳。
+             */
+            logId: extractZcodeLogId(text, response.headers),
             now: Date.now(),
           })
           : undefined
