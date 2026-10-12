@@ -2133,7 +2133,12 @@ export function toClaimOutcome(
          * `messages`，照搬推理侧那套 `describeZcodeRequestShape` 会得到
          * 「身份块 0 字符」，**把一条正常请求误报成身份块缺失**。
          * ⇒ 只用与请求形态无关的那几项（见 `ZcodeDiagnosticInput.shape`）。
+         *
+         * ★ `logId`（2026-10-12）：由 `claimZcodePlan` 在**持有 `response` 与
+         * 完整正文**的那一层提取并带上来（那里才有 header 与未截断的体），
+         * 本层只负责渲染 —— 与「在信息最全的地方归一」同一条纪律。
          */
+        logId: outcome.logId,
         now: Date.now(),
       })
     return {

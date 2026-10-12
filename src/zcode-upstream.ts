@@ -35,6 +35,7 @@
 import type { ZcodeCredential } from './zcode.js'
 import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js'
 import {
+  extractZcodeLogId,
   formatZcodeEdgePageHint,
   hasZcodeUnusualActivity,
   looksLikeZcodeHtmlPage,
@@ -249,6 +250,15 @@ export interface ZcodeClaimOutcome {
   alreadyClaimed?: boolean
   httpStatus?: number
   message?: string
+  /**
+   * 上游的 `logid`（排障凭据，2026-10-12 新增）。
+   *
+   * ⚠ 与推理侧同源：由 {@link extractZcodeLogId} **双来源**取
+   * （体顶层 `logid` 优先，HTTP 头 `x-request-id` 兜底）——
+   * 后者让**边缘 HTML 页**也有凭据可取。
+   * ⚠ 取不到即 `undefined`，不编造（诊断行会整项省略）。
+   */
+  logId?: string
 }
 
 /**
@@ -679,6 +689,13 @@ export async function claimZcodePlan(
   // 1003 = 已领取过 —— **幂等成功，不是错误**。
   const alreadyClaimed = code === 1003
   const ok = response.ok && (code === 0 || alreadyClaimed)
+  /**
+   * ★ `logid` 在**持有 `response` 与完整 `text` 的这一层**提取（2026-10-12）——
+   * 与上面把风控归一成 `code` 同一条纪律：**在信息最全的地方取，
+   * 不要在已经丢过信息的下游猜**。下游（`zcode-auth.ts` 的 `toClaimOutcome`）
+   * 只拿得到 `message` 字符串，那里既没有 header、正文也可能已被截断。
+   */
+  const logId = extractZcodeLogId(text, response.headers)
   return {
     planId,
     code,
@@ -686,6 +703,7 @@ export async function claimZcodePlan(
     alreadyClaimed,
     httpStatus: response.status,
     message: message ?? (ok ? undefined : `HTTP ${response.status}`),
+    ...logId === undefined ? {} : { logId },
   }
 }
 
