@@ -67,6 +67,39 @@ export interface LoomyProduct {
   defaultCredentialRef: string
   /** 远端模型列表不可用时的兜底模型目录（8 个 chat 模型）。 */
   fallbackModels: readonly LoomyFallbackModel[]
+  /**
+   * 单张请求图片的像素预算。**当前刻意不赋值** —— 见下。
+   *
+   * ## ⚠️ 这里为什么是「声明了但不赋值」
+   *
+   * 本仓库既有文档曾记「loomy 实测 24 张全过、**无证据说明它有约束**」，
+   * 并据此**未接缩放**。该结论**已被 Gitee issue IKKX0T 的独立实测质疑**：
+   * 那边给出 `413 Request Entity Too Large`（纯 HTML）/ `504`。
+   *
+   * ⚠️ **关键换算**：本仓库 fixture 是 2.87 MiB/张、24 张 = **91.8 MiB**，
+   * 而 issue（3.45 MiB/张）的边界区间是 **87.4~96.6 MiB** —— 91.8 **恰在区间内部**。
+   * 即「24 张全过」很可能是**在边界内 4 MiB 处侥幸通过**，而不是「这家没有约束」。
+   * 这正是「某次实测没看到**不能**推广成不存在」的又一实例。
+   *
+   * ⇒ 按本仓库既定规矩（「拿不到阈值就不定值」），定值前必须先复测：
+   * `pnpm test:e2e:image-bisect`（`tests/e2e/image-limit-bisect.e2e.spec.ts`，
+   * 二分到 ≤3 张并打印「张数 → 请求体 MiB」的换算）。
+   *
+   * ⚠️ **不要**照抄别家的 1 MiB（那是按各自实测边界推出来的，见
+   * `src/image-budget.ts`），也**不要**因为「字段没人用」就删掉它 ——
+   * 它是复测后定值的落点，且与其余按体积设限的家形状一致。
+   */
+  imagePixelBudget?: number
+  /**
+   * 单张请求图片的**编码字节目标**（base64 展开前）。**当前刻意不赋值** —— 理由同上。
+   *
+   * ⚠️ 复测出边界后**必须显式赋值**（不能靠 `requestImageTargetFor` 的默认参数兜底）：
+   * 那个默认是 2 MiB，为腾讯系的**图片 token 预算**准备的，而 loomy 撞的是体积 ——
+   * 同款缺陷与后果（越过上游硬限）见 `src/image-budget.ts` 的
+   * `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES` 与 `tests/unit/image-budget.spec.ts`
+   * 的「按体积设限的家必须显式给 imageMaxBytes」段。
+   */
+  imageMaxBytes?: number
 }
 
 /**

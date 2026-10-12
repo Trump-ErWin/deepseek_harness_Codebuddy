@@ -34,6 +34,7 @@ import { describe, expect, it } from 'vitest'
 
 import { buildCreateAccountPayload, newAccountAsksChannel } from '../../plugin-src/client/new-account.js'
 import { normalizeZcodeLoginProvider } from '../../src/jet-hub-rpc.js'
+import { PROVIDER_REGISTRY } from '../../src/provider-registry.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const jetHubSource = readFileSync(resolve(HERE, '../../plugin-src/client/jet-hub.js'), 'utf8')
@@ -64,17 +65,19 @@ const jetHubCode = stripComments(jetHubSource)
  *
  * 保留遍历仍然有价值（能把「某个具体 provider 被误判」指名道姓地报出来），
  * 但样本必须来自真源。
+ *
+ * ⚠️ 2026-10-08：真源从「解析 `jet-hub.js` 的 `PROVIDERS` 源码文本」改为
+ * **直接读 `PROVIDER_REGISTRY`** —— 客户端 `PROVIDERS` 现在就是由它派生的。
+ * 原先那个正则 `\bid:\s*'([a-z0-9]+)'` 同样是「从源码文本派生判据」的形态
+ *（本 Task 要消除的东西），且它会随 `PROVIDERS` 改为 `.map()` 而整份套件
+ * 变成 Failed Suite。
  */
 function readProviderIds (): string[] {
-  const start = jetHubSource.indexOf('const PROVIDERS = Object.freeze([')
-  const end = jetHubSource.indexOf(']);', start)
-  if (start < 0 || end < 0) throw new Error('未能定位 PROVIDERS 字面量，解析方式需随结构变更更新')
-  const block = jetHubSource.slice(start, end)
-  const ids = [...block.matchAll(/\bid:\s*'([a-z0-9]+)'/g)].map((m) => m[1])
-  // ⚠ 解析失败会得到空数组，而「遍历空数组」的断言**照样全绿** ——
+  const ids = PROVIDER_REGISTRY.map((d) => d.id)
+  // ⚠ 取不到会得到空数组，而「遍历空数组」的断言**照样全绿** ——
   //   那是本轮最危险的一种假绿（比缺测试更坏：看起来测了，其实没测）。
-  //   故显式设一道数量下限，解析器一失配就立刻红。
-  if (ids.length < 10) throw new Error(`PROVIDERS 只解析出 ${ids.length} 个 id，解析器大概率已失配`)
+  //   故显式设一道数量下限，真源一失配就立刻红。
+  if (ids.length < 10) throw new Error(`PROVIDER_REGISTRY 只解析出 ${ids.length} 个 id，真源大概率已失配`)
   return ids
 }
 

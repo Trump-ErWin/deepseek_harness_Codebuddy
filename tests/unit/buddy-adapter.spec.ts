@@ -473,6 +473,57 @@ describe('BuddyAdapter', () => {
       expect((await adapter.resolveModel('buddy', 'deepseek-v4.1-flash')).inputModalities).toEqual(['text', 'image'])
     })
 
+    /**
+     * ⚠️⚠️ **本家唯一真正使用「未知」语义的地方 —— 必须从 `toCatalogEntry`
+     * 这一端测到，不能只测骨架。**
+     *
+     * ## 为什么这条用例曾经缺失（2026-10-08 第二轮反向验证实测）
+     *
+     * `model-catalog-parity.spec.ts` 里有一条「未知模态」用例，但它喂给骨架的是
+     * **手搓的 `CatalogEntry`**（刻意省略 `inputModalities`）—— 那测的是
+     * `createModelCatalog` **拿到**省略态之后的行为，**绕过了 buddy 自己的
+     * `toCatalogEntry`**。而 `buddy-adapter.spec.ts` 里本节的三条用例分别覆盖
+     * 「远端 true / 远端 false / 远端缺字段但有静态表」，**恰好没有一条**让
+     * `inputModalitiesFor` 返回 `undefined`。
+     *
+     * 后果：把 `toCatalogEntry` 里
+     * `...modalities !== undefined ? { inputModalities: modalities } : {}`
+     * 改成 `inputModalities: modalities ?? ['text']`（= 把「不知道」谎报成
+     * 「不支持图片」），**全部 153 条 buddy 用例加上整个 parity 套件零红**
+     * —— 实测确认过。也就是说 Task 7 Step 7 第 1 条要求的反向验证当时**做不出来**，
+     * 而计划原文已经预见到这个风险：
+     * 「⚠️ 若没有这条用例，本步骤必须先补一条，否则这个缺陷会静默流出去」。
+     *
+     * ## 可达性（不是理论分支）
+     *
+     * 兜底表**不可**作为载体：实测 `CODEBUDDY.fallbackModels` 16 条、
+     * `WORKBUDDY.fallbackModels` 23 条，`supportsImages` **全部显式声明**
+     * （未声明者 0 条）⇒ 兜底表这条路永远走不到省略分支。
+     * 真正可达的是 `reconcileWithFallback` 末尾追加的
+     * 「被 agent 引用但不在兜底表」的模型：它只带 `{ id, name, agentReferenced }`，
+     * 三个图片能力来源全落空 ⇒ `imageCapabilityKnown` 为 false
+     * ⇒ 返回 `undefined` ⇒ **必须省略该字段**。
+     * 本用例正是走这条路。
+     */
+    it('⚠️⚠️ 能力全无来源（agentReferenced 追加的模型）⇒ 省略字段，不得谎报 [text]', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [
+          // 未被兜底表覆盖、且**没有** supportsImages —— 三个来源全落空。
+          { id: 'anon-vision', name: 'Anon', agentReferenced: true },
+        ],
+      })
+
+      const hit = (await adapter.listModels('buddy')).find((m) => m.id === 'anon-vision')
+      expect(hit, 'agentReferenced 的模型应被追加进目录').toBeDefined()
+      // ⚠️ 核心：字段**不存在**（`in` 为 false），而不是值为 ['text']。
+      //    后者会让宿主 DSH 把图片**静默投影成占位文本**（见 inputModalitiesFor
+      //    的说明与 jpg 实拍报障）。
+      expect('inputModalities' in hit!).toBe(false)
+
+      // 两个入口必须同判据（`resolveModel` 走的是同一份 CatalogEntry）。
+      expect('inputModalities' in await adapter.resolveModel('buddy', 'anon-vision')).toBe(false)
+    })
+
     // ── issue IKJQ3M ──
     //
     // 「远端下发了完整能力元数据、但模型不在编译期兜底表里」这一档，
@@ -1805,16 +1856,23 @@ describe('BuddyAdapter message serialization', () => {
     } as never)
 
     const payload = JSON.parse(body!) as { messages: Array<Record<string, unknown>> }
-    const assistant = payload.messages[0]
-    expect(assistant.role).toBe('assistant')
+    // ⚠️ 首条**不再是** assistant：以 assistant 开头的 wire 会被 `space-bunny`
+    // 判 400/11148「工具记录不完整」（实测；见下面「wire 首条不得是 assistant」段），
+    // 适配器因此在首位补了一条最小 system。这里按**角色**取而不是按位置 ——
+    // 位置断言恰恰是把「首条是 assistant」误当成契约的地方。
+    expect(payload.messages[0]?.role).toBe('system')
+    const assistant = payload.messages.find((m) => m.role === 'assistant') as Record<string, unknown>
+    expect(assistant).toBeDefined()
     // 正文为空且带 tool_calls 时 content 必须为 null（对齐 openai_chat.rs）。
     expect(assistant.content).toBeNull()
     // 推理模型要求 assistant 消息始终携带 reasoning_content 字段。
     expect(assistant.reasoning_content).toBe('let me check')
     expect(assistant.tool_calls).toMatchObject([{ id: 'call_1', type: 'function', function: { name: 'shell' } }])
 
-    // 工具结果展开为独立的 role:'tool' 消息。
-    const tool = payload.messages[1]
+    // 工具结果展开为独立的 role:'tool' 消息，且**紧跟**在 assistant 之后
+    // （按角色取而非按下标 —— 首位现在可能是适配器补的 system）。
+    const assistantIndex = payload.messages.findIndex((m) => m.role === 'assistant')
+    const tool = payload.messages[assistantIndex + 1]
     expect(tool).toMatchObject({ role: 'tool', tool_call_id: 'call_1', content: 'file.txt' })
   })
 
@@ -3121,6 +3179,50 @@ describe('BuddyAdapter 模型黑名单', () => {
     } as never
   }
 
+  /**
+   * ★★ **G3-6 的真行为守卫**（2026-10-12 对抗性审计查出该语义**当时零守卫**后补上）。
+   *
+   * 守的是「拉黑一个同名模型后，**另一个的变体标记不得跳变**」——
+   * 消歧必须基于**未过滤**的全量集合（`displayNameFor(model, all)`）。
+   *
+   * ## ⚠️ 为什么原先的守卫是空的
+   *
+   * 唯一「覆盖」过该语义的两条用例是 `model-catalog.spec.ts` 的 ⑮ 与
+   * `model-catalog-parity.spec.ts` 的 ④，而它们都构造**合成 config / 替身池**
+   *（`makeCatalog`）—— 验证的是 `createModelCatalog` **骨架自身**，
+   * **看不见 `buddy` 传进去的实参**。而本文件的四条黑名单用例**只断言 `ids`**，
+   * 「同名模型追加变体标记」那三条又**都不带 `accountPool`**
+   *（⇒ 无黑名单 ⇒ `all` 与过滤后恒等，结构上不可能区分两种实现）。
+   *
+   * **实测**：把消歧集合换成黑名单过滤后的集合（产出仍保持全量，精确复现修复前
+   * 行为），`buddy-adapter.spec.ts` + `model-catalog-parity.spec.ts` +
+   * `model-catalog.spec.ts` 共 **212 条全绿** ⇒ 该语义当时没有任何断言在守。
+   */
+  it('★★ 拉黑一个同名模型后，另一个的名字**不得跳变**（消歧基于未过滤集合）', async () => {
+    // 两个远端模型的 name **完全相同** ⇒ 只能靠变体标记区分
+    //（真实报障形态：国际版 deepseek-v4.1-flash 与 -sg 的 name 撞车而计费不同）。
+    const adapter = makeAdapter({
+      product: { ...WORKBUDDY, fallbackModels: undefined } as never,
+      fetchRemoteModels: async () => [
+        { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', creditsRate: 'x0.00' },
+        { id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', creditsRate: 'x0.03' },
+      ],
+      accountPool: poolWithDisabled('workbuddy', ['deepseek-v4.1-flash']),
+    })
+    const models = await adapter.listModels('workbuddy')
+
+    // 黑名单确实生效：被拉黑的那个不在列表里。
+    expect(models.map((m) => m.id)).toEqual(['deepseek-v4.1-flash-sg'])
+
+    // ★ 关键断言：剩下的那个**仍带变体标记**。
+    //   若消歧改用「已过滤的集合」⇒ 过滤后只剩一个同名 ⇒ 不再需要标记 ⇒
+    //   名字退化成 'Deepseek-V4.1-Flash'（**跳变**）⇒ 本断言变红。
+    expect(
+      models[0]?.name,
+      '拉黑同名模型之一后，另一个的名字跳变了 —— 消歧必须基于**未过滤**的全量集合',
+    ).toBe('Deepseek-V4.1-Flash · x0.03 SG')
+  })
+
   it('被关闭的模型从列表中消失，其余保持原有顺序', async () => {
     const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', ['glm-5.2', 'hy3']) })
     const models = await adapter.listModels('buddy')
@@ -3618,5 +3720,252 @@ describe('BuddyAdapter 残缺目录自愈（★ IKJVTF I3）', () => {
     const afterFirst = calls
     await adapter.listModels('buddy')
     expect(calls).toBe(afterFirst)
+  })
+})
+
+/**
+ * 腾讯系内容级风控指纹改写的**直连**落点（2026-10-12 真实报障）。
+ *
+ * ## 这组用例守的是什么
+ * 网关那侧早有改写（IKJNA1），但**直连路径**没有 —— 而触发面在
+ * `assistant` **正文**（实测 400/11128；`user` / `tool` 结果 /
+ * `reasoning_content` / `tool_calls[].arguments` 都不拦）。
+ * 于是「排查这个风控 bug 的会话」几乎必然中招：模型先 `read` 记录该指纹
+ * 的文档（tool 结果，不拦），再把它**逐字复述进自己的正文**（拦）；那句一旦
+ * 进了历史就每轮原样重放，会话从此报废，且**换任何腾讯系模型都一样**
+ * ——用户当时报的就是 `step-5-preview` 与 `space-bunny` 同一个错。
+ *
+ * ## 断言为什么必须成对
+ * 「该改的改了」与「不该改的一字没动」必须同时锁：
+ * 只测前者，实现会一路扩写成「把整份历史都洗一遍」，那会破坏用户原话、
+ * 工具输出（要回读给模型看的证据）与模型自己的思考，并且白吃腾讯侧的
+ * 前缀缓存。每条「扩大范围」的冲动都该在这里变红。
+ */
+describe('BuddyAdapter 直连路径的腾讯风控指纹改写', () => {
+  const TRIGGER = 'Main branch (you will usually use this for PRs)'
+  const REWRITE = 'Main branch (PRs usually go here)'
+
+  /** 走真实适配器发一次，返回**请求体里**的 messages（即 wire 形状）。 */
+  async function wireOf(
+    messages: readonly unknown[],
+    extra: Record<string, unknown> = {},
+    product?: BuddyProduct,
+  ): Promise<Array<Record<string, any>>> {
+    let body: Record<string, unknown> = {}
+    const adapter = makeAdapter({
+      ...(product === undefined ? {} : { product }),
+      fetchImpl: async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: 'glm-5.3',
+      messages,
+      signal: new AbortController().signal,
+      ...extra,
+    } as never)
+    return (body.messages ?? []) as Array<Record<string, any>>
+  }
+
+  /** 收集 wire 上的全部文本（content 为字符串或 parts 数组两种形态都要覆盖）。 */
+  function textsOfWire(messages: ReadonlyArray<Record<string, any>>): string[] {
+    const out: string[] = []
+    for (const message of messages) {
+      const c = message.content
+      if (typeof c === 'string') out.push(c)
+      else if (Array.isArray(c)) {
+        for (const block of c) {
+          if (block !== null && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string') {
+            out.push(String((block as { text: unknown }).text))
+          }
+        }
+      }
+    }
+    return out
+  }
+
+  const text = (value: string) => [{ type: 'text', text: value }]
+
+  it('★ system 与 assistant 正文里的指纹都被改写', async () => {
+    const wire = await wireOf([
+      { role: 'system', content: text(`S: ${TRIGGER}`) },
+      { role: 'user', content: text('继续') },
+      { role: 'assistant', content: text(`A: ${TRIGGER}`) },
+      { role: 'user', content: text('再说一次') },
+    ])
+    const texts = textsOfWire(wire)
+    expect(texts).toContain(`S: ${REWRITE}`)
+    expect(texts).toContain(`A: ${REWRITE}`)
+    expect(texts.some((value) => value.includes(TRIGGER))).toBe(false)
+  })
+
+  it('★ options.system（绕过 serializeMessages 的第四个产出点）同样被改写', async () => {
+    // `stream()` 里 `messages.unshift({role:'system', content: options.system})`
+    // 排在 `serializeMessages` **之外**，只改那个函数救不到这条路。
+    const wire = await wireOf([{ role: 'user', content: text('hi') }], {
+      system: `O: ${TRIGGER}`,
+    })
+    expect(wire[0]?.role).toBe('system')
+    expect(String(wire[0]?.content)).toBe(`O: ${REWRITE}`)
+  })
+
+  it('★ 不该改的一字不动：user / tool 结果 / reasoning_content / tool_calls.arguments', async () => {
+    // 这四个位置实测都**不拦**（依据见 openai-gateway/tencent-fingerprint.ts 的表）。
+    // 改它们换不来放行，只会篡改用户原话与证据，并白吃上游前缀缓存。
+    const wire = await wireOf([
+      { role: 'system', content: text('You are helpful.') },
+      { role: 'user', content: text(`U: ${TRIGGER}`) },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: `R: ${TRIGGER}` },
+          { type: 'text', text: '干净正文' },
+          { type: 'tool-call', id: 'call-1', name: 'read', arguments: `{"q":"${TRIGGER}"}` },
+        ],
+      },
+      { role: 'tool', toolCallId: 'call-1', content: text(`T: ${TRIGGER}`) },
+      { role: 'user', content: text('结果如何') },
+    ])
+    const texts = textsOfWire(wire)
+    // 没有任何一处被改写
+    expect(texts.some((value) => value.includes(REWRITE))).toBe(false)
+    // user 与 tool 结果原样
+    expect(texts).toContain(`U: ${TRIGGER}`)
+    expect(texts).toContain(`T: ${TRIGGER}`)
+    // assistant 正文原样（它本来就不含指纹）
+    expect(texts).toContain('干净正文')
+    const assistant = wire.find((message) => message.role === 'assistant') as Record<string, any>
+    // reasoning_content 与工具参数都保持原文
+    expect(String(assistant.reasoning_content)).toBe(`R: ${TRIGGER}`)
+    expect(String(assistant.tool_calls[0].function.arguments)).toContain(TRIGGER)
+  })
+
+  it('★ 不含指纹的历史：wire 逐字节不变（不得破坏腾讯侧前缀缓存）', async () => {
+    const original = 'On branch master\nYour branch is up to date.\nNothing to commit.'
+    const wire = await wireOf([
+      { role: 'system', content: text('You are helpful.') },
+      { role: 'assistant', content: text(original) },
+      { role: 'user', content: text('继续') },
+    ])
+    const assistant = wire.find((message) => message.role === 'assistant') as Record<string, any>
+    expect(assistant.content).toBe(original)
+  })
+
+  it('★ WorkBuddy（国际版）同样生效：两个产品共用这一层', async () => {
+    const wire = await wireOf(
+      [
+        { role: 'system', content: text('You are helpful.') },
+        { role: 'assistant', content: text(`A: ${TRIGGER}`) },
+        { role: 'user', content: text('继续') },
+      ],
+      {},
+      WORKBUDDY,
+    )
+    expect(textsOfWire(wire)).toContain(`A: ${REWRITE}`)
+  })
+
+  /**
+   * 首条角色（2026-10-12 实测，与上面的指纹问题是**两件事**）。
+   *
+   * 同一份请求体，仅让首条变成「带 tool_calls 的 assistant」：
+   *   `space-bunny` → 400/11148 `tool calls and tool results do not match`
+   *                   （`displayMsg.zh`=「工具记录不完整，请新建任务」）
+   *   `step-5-preview` → 200（宽容）
+   * 而在前面补一条 system，两个模型都 200。
+   *
+   * ⚠️ 这条的价值在于**反直觉**：报错文案说的是「工具记录不匹配」，但逐格核对
+   * 真实 wire 后配对是干净的（无孤儿、无重复、覆盖完整）—— 真正的判据是**首条
+   * 角色**。按文案去改配对逻辑会修一个不存在的原因。
+   */
+  /**
+   * 非腾讯系产品经 BuddyAdapter 时**逐字节不变**（2026-10-12 审计补的 F1/F2 防线）。
+   *
+   * ## 为什么这条不可省
+   * `buddy` 与 `workbuddy` **都在** `TENCENT_PROVIDERS` 那张表里，所以
+   * 「喂 WORKBUDDY 也能改写」那条用例**无法区分**「读 `this.product.id`」与
+   * 「写死 `'buddy'`」。审计实测把 `serializeMessages(…, this.product.id)` 改成
+   * `serializeMessages(…, 'buddy')`（完全忽略产品配置）后，163 条用例**全绿** ——
+   * 那条 WorkBuddy 用例是**改坏也不红**的同义反复。
+   *
+   * 只有「**非**腾讯系 provider 必须原样返回」这条能把它区分开：产品 id 换成
+   * 集合外的值时，写死 `'buddy'` 会去改写、而本实现必须不动 ⇒ 立刻分岔。
+   *
+   * ⚠️ `as never` 是**刻意**的：`BuddyProduct.id` 是 `'buddy' | 'workbuddy'`
+   * 联合类型，构造「非腾讯系」产品本就该被类型系统拦住。这里要测的是**运行时**
+   * 判据（`isTencentContentFingerprintProvider` 遇到未知 id 的行为），故必须
+   * 绕过类型；真实产品里没有第三个 buddy 系成员，只能这么造。
+   */
+  it('★ 非腾讯系产品：wire 逐字节不变（provider 被写死 buddy 时这条会红）', async () => {
+    const nonTencent = { ...CODEBUDDY, id: 'not-tencent', displayName: 'Not Tencent' } as never as BuddyProduct
+    const wire = await wireOf(
+      [
+        { role: 'system', content: text(`S: ${TRIGGER}`) },
+        { role: 'user', content: text('hi') },
+        { role: 'assistant', content: text(`A: ${TRIGGER}`) },
+        { role: 'user', content: text('继续') },
+      ],
+      {},
+      nonTencent,
+    )
+    const texts = textsOfWire(wire)
+    expect(texts).toContain(`S: ${TRIGGER}`)
+    expect(texts).toContain(`A: ${TRIGGER}`)
+    expect(texts.some((value) => value.includes(REWRITE))).toBe(false)
+  })
+
+  describe('wire 首条必须是 system', () => {
+    const assistantWithCall = {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: '我读一下。' },
+        { type: 'tool-call', id: 'call-1', name: 'read', arguments: '{"q":"x"}' },
+      ],
+    }
+    const toolResult = { role: 'tool', toolCallId: 'call-1', content: text('result body') }
+
+    it('★ 历史被削头到以 assistant 开头时，补一条最小 system 在首位', async () => {
+      const wire = await wireOf([assistantWithCall, toolResult, { role: 'user', content: text('然后呢') }])
+      expect(wire[0]?.role).toBe('system')
+      expect(String(wire[0]?.content)).toBe('You are a helpful assistant.')
+      // 补位不得破坏原有的工具配对：调用仍在、结果仍在，且紧随其后
+      expect(wire[1]?.role).toBe('assistant')
+      expect((wire[1]?.tool_calls as Array<Record<string, any>>)[0].id).toBe('call-1')
+      expect(wire[2]?.role).toBe('tool')
+    })
+
+    /**
+     * ⚠️ 这条覆盖 2026-10-12 审计抓出的**真缺陷**：原判据是 `=== 'assistant'`，
+     * 漏掉 **user-first / tool-first** 的历史 —— 而本仓库 `account-probe.ts` 的
+     * `PROBE_SYSTEM` 注释里有 2026-09-25 的双端点对照实测：**WorkBuddy 网关
+     * 强制 `messages[0]` 是 system**，否则 400 + 11128。
+     * 那类历史真实存在（历史被压缩削头；DSH 一次性调用只带 user 不带 system）。
+     */
+    it.each([
+      ['user 开头', [{ role: 'user', content: text('hi') }]],
+      ['tool 开头', [assistantWithCall, toolResult]],
+      ['assistant 开头', [assistantWithCall, toolResult]],
+    ])('★ 历史以 %s 时补 system（WorkBuddy 网关强制首条是 system）', async (_label, messages) => {
+      const wire = await wireOf(messages as readonly unknown[])
+      expect(wire[0]?.role).toBe('system')
+      expect(wire.filter((m) => m.role === 'system')).toHaveLength(1)
+    })
+
+    it('★ 首条已有 system 时不多塞一条', async () => {
+      const withSystem = await wireOf([
+        { role: 'system', content: text('You are helpful.') },
+        { role: 'user', content: text('hi') },
+      ])
+      // 只有用户自己那一条，且内容不被换掉
+      expect(withSystem.filter((m) => m.role === 'system')).toHaveLength(1)
+      expect(String(withSystem[0]?.content)).toBe('You are helpful.')
+    })
+
+    it('★ options.system 已在首位时不重复补位', async () => {
+      const wire = await wireOf([assistantWithCall, toolResult], { system: 'Real system prompt.' })
+      const systems = wire.filter((m) => m.role === 'system')
+      expect(systems).toHaveLength(1)
+      expect(String(systems[0]?.content)).toBe('Real system prompt.')
+    })
   })
 })

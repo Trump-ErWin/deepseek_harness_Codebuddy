@@ -951,7 +951,7 @@ POST /api/v1/chat/completions  model=cline-pass/deepseek-v4.1-flash
 |---|---|---|
 | 1 | 标记时长取值序：`retry-after` 头（秒数 / HTTP 日期，**0 是合法值**）→ **报文里的 `Try again in 19h 39m`** → 通用绝对时刻句式 → 兜底快照 | `src/cline-rate-limit.ts` 的 `clineRateLimitResetAt` |
 | 2 | `recordsClineRateLimit` **只认 429**（402 不写徽章，但仍换号 —— 「不写徽章 ≠ 不换号」） | 同上 |
-| 3 | cline 的 `resolveCredential` 接上 `throwIfAllAccountsRateLimited(CLINE, modelId)`，且**必须先于**单凭据 ref 兜底 | `src/index.ts` |
+| 3 | cline 的 `resolveCredential` 接上共享的限流判定助手（`throwIfAllAccountsRateLimited`），且**必须先于**单凭据 ref 兜底。⚠️ Task 6 起该判定已下沉进 `src/credential-resolver.ts` 的共享工厂：接线判据变成「cline 的工厂配置项把该助手交给了工厂」，不再是逐个 provider 的调用点文本 | `src/index.ts` |
 | 4 | 全部账号失败时按「免费额度 / 短时限流 / 402」给**三种不同**建议；**识别出语义就不再复述上游原文**（只在没识别出时附上），文案保持简短 | `clineExhaustedAdvice` |
 | 5 | 每个失败账号（含最后一个）都写标记 | `cline-adapter.ts` 的 `markLimited` |
 

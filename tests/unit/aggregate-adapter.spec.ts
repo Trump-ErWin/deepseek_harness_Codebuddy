@@ -24,6 +24,63 @@ function makePool() {
   } as never
 }
 
+/**
+ * ★★ 聚合层的渠道白名单必须覆盖 registry 里**全部** `channel: true` 的渠道。
+ *
+ * ## ⚠️ 为什么要有这一条（真实缺口，2026-10-12 对抗性审计实测）
+ *
+ * `src/aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS` 是**手写字面量**，而它自己的
+ * 注释声称「新增 provider 时**两处都要加**（与 `modelAdapters` 同一约定）」——
+ * **该声称当时不成立**：`modelAdapters` 有两条守卫（源码文本抓多余键 + 行为抓漏键），
+ * 这里**一条都没有**。实测：从数组里删掉 `'gemini'` 后全量测试**依然全绿**。
+ *
+ * 线上后果（静默）：该渠道的模型**永不进聚合目录** ⇒ 用户看不到它的虚拟模型、
+ * `auto` 也不会用到它，**无报错、无日志** —— 与「手抄 13 行续期清单、漏一家
+ * 日志零字」是同一形态。
+ *
+ * ## 判据为什么是**行为**而不是读那个私有常量
+ *
+ * `AGGREGATE_CHANNELS` 是 `private static readonly`，测试拿不到。但它经
+ * `providerIds()` 决定「向哪些渠道拉目录」⇒ 用 `listModels` 的**调用记录**反推，
+ * 比文本断言强：文本只能证明字面量在，行为能证明它**真的被用上**。
+ *
+ * ⚠️ 判据是**集合**（无序）而不是有序相等：实测 registry 的尾部顺序是
+ * `… zcode, opencode, gemini`，而白名单是 `… gemini, zcode, opencode` —— 两者
+ * **本来就不同序**，故「有序相等」会恒假失败。白名单那边的顺序另有语义
+ *（见该常量注释），本用例**只管集合**。
+ */
+describe('★★ 聚合渠道白名单与 registry 对齐（漏一家即红并点名）', () => {
+  it('每个 channel 渠道都参与聚合（走真实 listModels 调用记录）', async () => {
+    const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
+    const expected = PROVIDER_REGISTRY.filter((d) => d.channel).map((d) => d.id).sort()
+
+    const seen: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        // 让「存活路由」= registry 的全部 channel ⇒ providerIds() 的交集
+        // 就等于 AGGREGATE_CHANNELS 自身，于是调用记录直接暴露该白名单。
+        listProviders: () => expected.map((id) => ({ id, name: id })),
+        listModels: async (provider: string) => {
+          seen.push(provider)
+          return [{ id: 'm1', name: 'M1' }]
+        },
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+    await adapter.listModels(AGGREGATE_PROVIDER)
+
+    expect(
+      [...new Set(seen)].sort(),
+      'AGGREGATE_CHANNELS 与 registry 漂移：左侧多出 = 白名单里有僵尸项；'
+      + '右侧多出 = registry 里有渠道没进聚合（它的模型永不可见，且**静默**）',
+    ).toEqual(expected)
+  })
+})
+
 describe('AggregateAdapter：目录播报', () => {
   it('providerInfo 的 id 必须等于注册路由（DSH 校验）', () => {
     const adapter = new AggregateAdapter(makeCtx({}), { accountPool: makePool() })
@@ -45,6 +102,112 @@ describe('AggregateAdapter：目录播报', () => {
     }), { accountPool: makePool() })
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     expect(new Set(models.map((m) => m.id)).size).toBe(models.length)
+  })
+
+  /**
+   * ★ 模型选择器里的虚拟模型名**必须带倍率**（用户报障 2026-10-08：「没倍率显示？」）。
+   *
+   * 根因：`nameOf` 只回规范名，而倍率其实早就算好了（`CandidateEntry.price`），
+   * 只是从没被展示层用过 ⇒ 用户在聚合下看不到价格，无法判断「挑的是不是便宜的」。
+   */
+  it('★ 选择器名带倍率后缀（取最便宜的候选）', async () => {
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · 最低 x0.15')
+  })
+
+  it('★ 多个候选时取**最便宜**的那个倍率（轮换的第二判据就是倍率升序）', async () => {
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.29' }],
+      codearts: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.03' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    // 最便宜的是 codearts 的 x0.03 —— 那才是最可能被路由到的那个价。
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · 最低 x0.03')
+  })
+
+  it('★ 全部候选都无倍率标注 ⇒ 不加后缀（不得渲染出 xInfinity）', async () => {
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash')
+    expect(entry!.name).not.toContain('Infinity')
+  })
+
+  it('★ 倍率为 0 显示「免费」（本仓库既有口径）', async () => {
+    // ⚠️ 必须用一个**已接入临期折算**的渠道（buddy）：未接入的候选会被
+    //    `pickerNameOf` 的价格过滤剔掉（见下一条用例），拿不到「免费」。
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · 免费' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · 最低 免费')
+  })
+
+  it('★★ 跨临期档：显示的倍率不得声称「本次就用这个价」（真实缺陷，复审实测）', async () => {
+    // ⚠️ 这条是本组唯一覆盖**跨临期档**的用例，而缺陷恰恰只在跨档时出现
+    //    （其余用例的候选都在同一档，故取全局最小 === 取该档最小，二者无差别
+    //    ⇒ 对缺陷免疫，属覆盖缺口而非假用例）。
+    //
+    // 缺陷机制：`rankCandidates` 的第一判据是**临期升序**，倍率只在**同档内**才
+    // 起作用。初版 `pickerNameOf` 取全局最小 price 并直接拼 `· x0.03`，于是：
+    //   候选 buddy x0.29（临期最早）/ codearts x0.03（临期晚）
+    //   ⇒ 选择器显示 x0.03，实际发往 buddy（x0.29）。
+    // 用户据此以为「聚合会挑便宜的」，而实际挑的是最贵的 —— 与原报障的诉求相反。
+    //
+    // 修法是**如实表达下界**：`最低 x…` 只声称「该虚拟模型下最便宜的可路由候选」，
+    // 不声称本次会用它。（无法按「临期最早那档」取真实价：`CandidateEntry` 不含
+    // `expiry`，而本方法契约要求**同步**、不能在选择器渲染路径上打网络。）
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.29' }],
+      codearts: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.03' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    expect(entry, '虚拟模型必须存在').toBeDefined()
+    // ⛔ 修前这里是 `· x0.03`（读起来像「本次就用 0.03」，而实际可能发往 x0.29）。
+    expect(entry!.name, '必须标明这是下界，不能声称本次就用它').toBe('DeepSeek V4.1 Flash · 最低 x0.03')
+    expect(entry!.name, '「最低」二字不可省').toContain('最低')
+  })
+
+  it('★ 倍率只加在选择器路径上：resolveModel 仍是规范名（三处既有断言钉住）', async () => {    // ⚠️ `resolveModel` / `describeCatalog` 的名字被逐字钉住（本文件 :88、
+    //    aggregate-rejections.spec.ts:251、aggregate-catalog.spec.ts:21），
+    //    且 `describeCatalog` 的候选子列表**逐条**显示倍率 —— 模型名上再叠一次
+    //    会出现「两个倍率」的重复展示。
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
+    }), { accountPool: makePool() })
+    const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    expect(info.name).toBe('DeepSeek V4.1 Flash')
+  })
+
+  it('★ 未接入临期折算的候选不参与报价（它永远不会被路由到）', async () => {
+    // ⚠️ `cline` 在 `AGGREGATE_CHANNELS` 里，但**不在** `WIRED_EXPIRY_PROVIDERS` 里
+    //   （`expiryProbe` 对它返回 UNUSABLE ⇒ 永不路由）。把它的价格显示出来等于
+    //    替一个用不上的候选报价（规格 §9.2.1：只广告可路由的东西）。
+    //
+    // ⚠️ 必须同时给一个**已接入**的候选（buddy），否则整条虚拟模型会被
+    //    `refreshCatalog` 的模型层过滤掉（「至少有一个已接入候选」），
+    //    用例就变成在测「模型不存在」而不是在测价格过滤 —— 那是一条**恒真**的假用例
+    //   （第一版就是这么写错的：只用 cline，`entry` 直接是 undefined）。
+    //
+    // cline 报 x0.01（最便宜）：若过滤失效就会显示它。
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
+      cline: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.01' }],
+    }), { accountPool: makePool() })
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
+    // 前置断言：模型确实在（否则下面那条断言会因 undefined 而**假通过**的变体）。
+    expect(entry, '虚拟模型必须存在（buddy 是已接入候选）').toBeDefined()
+    expect(entry!.name).toBe('DeepSeek V4.1 Flash · 最低 x0.15')
   })
 
   it('被用户关闭的虚拟模型不播报（套 disabledModelsFor 黑名单）', async () => {
@@ -768,6 +931,81 @@ describe('★ 探针抛 AbortError 时不得被吞成「没有可用候选」（
 
     await expect(adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash'))
       .rejects.toMatchObject({ name: 'AbortError' })
+  })
+
+  it('★ 同族同构：探针抛 **499 报文**（signal 未标记）也必须逃逸，不得折算成 UNUSABLE', async () => {
+    // ⚠️⚠️ 真实缺陷（2026-10-12 审计实测）：本处原先**只认** `name === 'AbortError'`，
+    //    是「同族判据分叉」的实例 —— 同一份 499 报文在 `dispatch` 里归中止、
+    //    在这里却被折算成 `UNUSABLE` ⇒ 整池候选被剔除 ⇒ 用户看到
+    //    「当前没有任何可用候选」而不是中止（M4 那个形态的新实例）。
+    //    修法：本处改为复用共享判据 `isAbortLike`。
+    // ⚠️ 关键约束：错误**不带** `name: 'AbortError'` / `code: 'ABORTED'`，
+    //    否则命中的是旧判据，第四条的覆盖是**假的**（假覆盖教训）。
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => (async function* () { /* 不应走到这里 */ })(),
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+      } as never,
+      expiryProbe: async () => {
+        throw new Error('provider: client has aborted request HTTP_499')
+      },
+    })
+
+    const error = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      .then(() => undefined, (caught: { message?: string }) => caught)
+    expect(
+      error?.message,
+      '499 必须原样逃逸（不得折算成 UNUSABLE 后报「没有可用候选」）',
+    ).toContain('aborted request')
+  })
+})
+
+describe('★ 能力解析（capabilityOf）里的中止判据也必须与 isAbortLike 同构', () => {
+  /**
+   * ⚠️⚠️ 真实缺陷（2026-10-12 审计实测）：这是同族分叉的**第三处** ——
+   * 本处原先只认 `name === 'AbortError'`，499 报文会被折算成
+   * `{ efforts: [], imageCapable: false }` ⇒ 用户看到「候选渠道都不支持
+   * 图片输入」这类**与中止无关**的误导性报错，且整轮不会中止。
+   *
+   * ⚠️ 触发路径：`resolveModelInfo` **接收 signal**，中止时它会抛 —— 而它
+   *    的 throw 落在本方法的 `try` 内。故用 `resolveModelInfo` 抛 499 来打。
+   */
+  it('★ resolveModelInfo 抛 499 报文 ⇒ 必须逃逸，不得折算成「不支持图片」', async () => {
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async () => {
+          // ⚠️ 不带 name / code，只带 499 报文 —— 专门验第四条。
+          throw new Error('provider: client has aborted request HTTP_499')
+        },
+        stream: () => (async function* () { /* 不应走到这里 */ })(),
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+      } as never,
+      expiryProbe: async () => 100,
+    })
+
+    const error = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      .then(() => undefined, (caught: { message?: string }) => caught)
+    expect(
+      error?.message,
+      '499 必须原样逃逸（不得折算成「不支持图片」）',
+    ).toContain('aborted request')
   })
 })
 

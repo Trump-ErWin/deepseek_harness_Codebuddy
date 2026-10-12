@@ -89,8 +89,9 @@ buddy: no usable credential; log in from the Jet Hub panel first
 
 **链路**（四个环节都正确，合起来却报出假原因）：
 
-1. 唯一的启用账号带该模型的未过期限流标记 → `pickBuddyCredential`
-   （`src/index.ts`）的候选筛成**空集**；
+1. 唯一的启用账号带该模型的未过期限流标记 → 候选筛（原
+   `src/index.ts` 里 buddy 系那段编排闭包，符号名已随 Task 6 删除
+   —— 见 git 历史 `d35d9e3`）筛成**空集**；
 2. `select()`（`src/buddy-balance-selector.ts`）对空候选只能回一个笼统的
    `{kind:'exhausted'}`，**未锁定时 `reason` 被丢弃**；
 3. 调用方退到**单凭据 ref** `BUDDY_ACCESS_TOKEN` —— 而 Jet Hub 登录只写
@@ -209,6 +210,207 @@ buddy: no usable credential; log in from the Jet Hub panel first
   「安全策略拦截（11140）：账号冷却 + 流内错误帧」段（7 条）。
   ⚠️ 已做**反向验证**：错误码退回 `AUTH` → **7 条**变红；禁用冷却标记 → **5 条**变红
   （含认证 / 限流 / 流内三条通道各自那条）；禁用流内识别 → **2 条**变红。
+### ⚠️⚠️ 承上：**额度用尽**也不能用 harness 常量 `QUOTA_EXCEEDED_CODE`（Issue IKJVCW）
+
+上一条讲的是「自定义文案要避开 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA`」。
+**但「避开 `QUOTA`」这件事有一个隐蔽的陷阱** —— 它让 codearts 成了十个
+provider 里**唯一**中招的一家。
+
+#### 陷阱：harness 常量的字面值就是被替换的那个码
+
+```ts
+// @deepseek-ai/dsh-llm
+export declare const QUOTA_EXCEEDED_CODE = "QUOTA"   // ← 就是 "QUOTA"
+```
+
+于是「用 harness 的规范化常量」这个看起来最正确的写法，
+**恰好产出会被客户端吞掉的码**（`failureMessage`，实测见下）：
+
+```js
+if (code === "QUOTA" || code === "ACCOUNT_QUOTA") return t("message.failure.quota");
+return code === "AUTH" ? t("message.failure.auth") : message;
+```
+
+`message.failure.quota` 的中文是「**当前请求的额度已用尽**」。
+
+#### 真实症状（用户报障）
+
+`codeartsQuotaExhaustedMessage()` 精心写的
+
+> `codearts: 模型 deepseek-v4.1-flash 的免费额度（benefit）已用尽，`
+> `预计 5.5 小时后重置（按 UTC+8 自然日结算，预计 …）。可改用其它模型，或…`
+
+**一个字都到不了用户眼前**，只剩「当前请求的额度已用尽」——
+既没有原因（benefit 额度）、也没有出路（换模型 / 切账号 / 何时恢复）。
+用户会去等额度恢复，而实际该做的是换模型。
+
+#### 判据：**字面量 `'QUOTA_EXCEEDED'`，不是 `QUOTA_EXCEEDED_CODE`**
+
+| 码 | 客户端替换文案？ | 在 `DEFAULT_RETRYABLE_CODES`？ | 语义 |
+|---|---|---|---|
+| `QUOTA`（= harness 常量） | **是** | 否 | 额度 |
+| `'QUOTA_EXCEEDED'`（字面量） | **否** | 否 | 额度 |
+| `PERMISSION_DENIED` | 否 | 否 | 权限（**额度用它属语义错位**） |
+
+⚠️ **不要为了「与 harness 词汇一致」改回常量**，也**不要**照 IKJVCW 建议把额度
+一律改 `PERMISSION_DENIED`：仓库里 buddy / cline / lobsterai / trae / zcode /
+minimax 等 **~20 处**额度错误一律用字面量 `'QUOTA_EXCEEDED'`，且**都不被替换** ——
+`codearts` 改用 harness 常量才是异类，**这正是缺陷只在本家复现的原因**。
+
+⚠️ 下游判据**已经双认**这个词汇差异，不必配套改：
+`account-probe.isRateLimitFailure` 与 `qoder-adapter.isQuotaExceededError`
+都同时接受 `'QUOTA_EXCEEDED'` 与 `'QUOTA'`；`dead-model-store` 的
+`IGNORED_CODES` **只收** `'QUOTA_EXCEEDED'`（原先靠 `/额度/` 文案兜底才没把模型
+误记成 30 天失效，改后是显式命中，**比原来更稳**）。
+
+#### ⚠️ 客户端按码判定的点**不止一处**（别只盯着 `failureMessage`）
+
+审计实测（2026-10-11，桌面端 `app.asar` 与 `dsh-client-ui-chat/lib/client.js` 双份一致）：
+
+| # | 判定点 | 判据 | 对 `'QUOTA_EXCEEDED'` 的影响 |
+|---|---|---|---|
+| 1 | `failureMessage` | 替换 **5** 个码：`ACCOUNT_SIGNED_OUT` / `ACCOUNT_SIGN_IN_REQUIRED` / `QUOTA` / `ACCOUNT_QUOTA` / `AUTH` | ✅ 不命中 ⇒ **message 完整透出**（本修复的目的） |
+| 2 | `quotaNotice` | `code !== "QUOTA" && code !== "ACCOUNT_QUOTA"` | ❌ 不命中 ⇒ **全局额度 Toast 不再触发**（见下） |
+| 3 | `displayFailure` | `if (code === "AUTH") return { code, message: "" }` | ✅ 不涉及（但这是 `AUTH` 的 message 被**置空串**之处） |
+
+⚠️ **第 1 处的「5 个码」不要写成「三个码」** —— `src/sse.ts` 的
+`REASONING_LOOP_CODE` 注释里**早就登记了同一份 5 码清单**，同一仓库两套同义
+数字必有一处是错的（本次修复初版就写错成三个，被审计抓出）。
+
+⚠️ **第 2 处是本修复的已知取舍**（审计实测，**不要**当缺陷再「修」回去）：
+`quotaNotice` 驱动一条**不随 Chat 面板消失**的全局额度 Toast，它只认
+`QUOTA` / `ACCOUNT_QUOTA`。改用 `'QUOTA_EXCEEDED'` 后该 Toast 不再出现。
+⇒ 取舍是「失败行有真实原因、但没有全局 Toast」vs「失败行被换成误导文案、
+但有全局 Toast」，**取前者**：真实原因就在失败行里，用户一定看得到；
+而后者的误导文案会把用户引向「等额度恢复」这个错误动作。
+若将来确实需要那条 Toast，做法是在 `plugin-src/client/` 自行注册
+`shell.quota-notice` 条目接管该码，**不是**把码改回 `QUOTA`。
+
+#### 三处产出点缺一不可
+
+`src/llm-adapter.ts` 有**三条**会产出该码的路径（少一条就会退回「被客户端顶掉文案」）：
+
+1. SSE 通道 `InferHub.4291.200`（HTTP 200 + 流内错误帧）；
+2. 4xx 通道的同一个码（服务端也可能以 4xx 下发）；
+3. **`httpErrorCode()` 里的额度归一化**（`400 + insufficient balance` 等措辞）
+   —— 这条最易漏，因为它**不在**那两块醒目的额度分支里。
+
+#### ⚠️⚠️ 401/403 下的额度分流**不得**为了「整齐」而调整（一次假阳性审计）
+
+4xx 分支的真实顺序是：
+
+```
+isAuthError（401/403 恒真 ⇒ 续期 + continue 重试）
+  → isSseQuotaExhaustedErrorCode（额度）→ isRateLimited → … → httpErrorCode
+```
+
+401/403 先被 `isAuthError` 接走续期一次，**第二轮**才轮到额度判据。
+逐格实测（重建 `lib/` 后走 `stream()`）：
+
+| 报文（4xx + 文案） | 400 | 401 | 403 |
+|---|---|---|---|
+| `insufficient balance` | 额度 | **AUTH** | **AUTH** |
+| `insufficient quota` | 额度 | **额度** | **额度** |
+| `out of credits` | 额度 | **AUTH** | **AUTH** |
+| `quota exceeded` | 额度 | **AUTH** | **AUTH** |
+| `InferHub.4291.200` + `insufficient quota` | 额度 | **额度** | **额度** |
+
+只有 `insufficient quota`（与 `4291` 码值腿）能穿透 ——
+因为 `isSseQuotaExhaustedErrorCode` 的**文案腿只认 `insufficient quota`**，
+不认 `balance` / `credits`。这是**既有行为**，不是本次改动引入。
+
+⚠️ **不要为了让这张表变整齐去调 `httpErrorCode` 的 401/403 优先级** ——
+独立审计曾报过一条「高」严重度缺陷：`httpErrorCode` 里
+`if (status === 401 || status === 403) return 'AUTH'` 排在
+`isQuotaExceededError(detail)` 之前，故「403 + `insufficient balance` 落 `AUTH`、
+同一文案用 400 却归额度」。**我照它改过，已撤回** —— 那是**孤立函数的假阳性**：
+审计只测了被建议修改的那个函数，没看它在真实控制流里**本就排在额度判据之后**。
+（教训：**审计结论必须回到生产路径复核**，不能只测被点名的那个函数。）
+
+而且该调整**违反本仓库的成文铁律**（`AGENTS.md`「同族判据必须逐格同构」）：
+
+> **401/403 先判**，恒归认证类 —— 状态码与额度文案并存时
+> （网关侧故障常在报文里捎带余额提示）**以状态码为准**
+
+codearts 的 401/403 来自**网关**（`APIG.0602` Invalid token / `APIG.0301` 验签失败），
+网关故障时捎带余额词是常态。让余额词改写分类 ⇒ 真凭据失效被说成「额度用尽」，
+用户被引向「等额度恢复」而非重新登录。该铁律是 2026-10-06 raccoon / loomy
+「一个请求内 6 个号各被封 24h」事故的产物。
+
+⚠️ 且「codearts 会用 401/403 下发额度文案」**无实测支撑**（141 个真实会话零命中；
+`InferHub.4291` 仅 1 次命中且是在讨论参考实现的 Rust 源码）。
+**将来真抓到该报文再按实测处理**，不要据构造报文改分类顺序 ——
+提建议者自己在「无法确认」里也承认「无线上真实报文，证据强度不足」。
+
+#### `errorDetail` 的两条腿：**只加不减**
+
+`errorDetail`（`src/llm-adapter.ts`）是上述分类的唯一输入。审计实测它
+**不认** `{"error":"<字符串>"}` 形态（只认 `typeof data.error === 'object'`），
+于是该形态退回**整段 JSON** —— 用户看到一坨不可读的裸 JSON。
+`src/openai-compat.ts` 的**同名函数**早已修过这个形态，本份没跟上
+（又一例「一文件两套同义判据」，两处改一处时**必须同时改另一处**）。
+
+⚠️ 修它时**只加腿、不减腿**：`error.code` / `error.type` / `error.message` /
+`error_code`+`error_msg` / 顶层 `message` 五条原有腿**必须全部保留** ——
+OpenAI 形态常把额度语义写在 `{"error":{"code":"insufficient_quota"}}` 里，
+少了 code 那条腿，该报文会从额度**掉回** `AUTH`/`INVALID_REQUEST`。
+（改的第一版真的把几条腿一起删了，是比原缺陷更糟的回退。）
+
+⚠️ **测 `errorDetail` 必须直接断言它的返回值**，**不要**绕道「分类结果」：
+`{"error":"insufficient balance"}` 这种报文，即使字符串腿失效、函数退回整段
+JSON，**整段 JSON 里也含该短语** ⇒ 额度判据照样命中 ⇒ 用例全绿。
+第一版就是这么写的，反向验证时才发现是**假守卫**（禁用该腿后 11 条全绿）。
+故 `errorDetail` 已**导出**（与 `isSseQueueErrorCode` 同款惯例）供单测直接锁定。
+
+测试：
+- `tests/unit/llm-adapter.spec.ts` 的两段（`IKJVCW`）：
+  「★ 额度错误的码不得被客户端替换」（8 条）+「★ errorDetail 的形态覆盖」（6 条）。
+
+⚠️ 已做**反向验证**（逐条实测变红，非推断）：
+- 额度码改回 `'QUOTA'` → **3 条**变红（三条产出路径各自独立锁死）；
+- `httpErrorCode` 恢复「401/403 短路在前」→ **1 条**变红（报出 `'AUTH'`）；
+- 额度判据放宽成裸 `insufficient` → **1 条**变红（反向守卫，报出 `QUOTA_EXCEEDED`）；
+- 禁用 `errorDetail` 的字符串腿 → **2 条**变红（报出裸 JSON 形态）；
+- 删掉 `errorDetail` 的 `error.code` 腿 → **1 条**变红。
+
+⚠️ **试过但失败的攻击角度**（记下以免后人重复）：
+「本仓库不再有地域封锁判据」是**结论而非疏漏** —— 详见下条。
+
+### ⚠️⚠️ **不要给 codearts 加「地域封锁」判据**（IKJVCW 的 B 部分，已被推翻）
+
+修复初版曾照 `cline-adapter` 的 `isClineRegionForbidden` 给 codearts 加了一套
+「非凭据拒绝」判据（`isNonCredentialDenial` + 4 个 marker），**已整体撤回**。
+撤回依据（四路独立取证，两轮审计交叉确认）：
+
+| 取证 | 结果 |
+|---|---|
+| 全量解压 `~/.dsh/sessions` 下 **141 个真实会话** | `not available in your region` / `country` / `region not supported` / `not subscribed to required model plan` / **`access forbidden`** 命中 **0 次** |
+| codearts **真实错误码词汇表**（同批会话抽取） | 全是 `APIG.0301`(验签失败) / `APIG.0602` / `APIG.0101` / `TM.00001041`(并发上限) / `InferHub.4005.200`(unsupported model) / `InferHub.002002009.404`(not registered) / `InferHub.4004.200` / `InferHub.4291.200` / `InferHub.ModelArts.81111.429` / `STS5.1806` —— **无一条地域/订阅类** |
+| 端点结构 | `CHAT_API_BASE` 与 `QUEUE_STATUS_BASE` 都硬编码 `snap-access.cn-north-4.myhuaweicloud.com`（中国区华为云），插件**没有任何 region 切换能力** ⇒ 「换出口 / 换区」这个出路在 codearts 上**不存在** |
+| 把真实词汇表逐条喂给新判据 | 命中 **0/12** —— 对生产流量零作用 |
+
+⚠️ **所有地域类 marker 的证据都来自 Cline**（`cline-adapter.ts` 的实测报文、
+`providers-cline.md` 坑 6、`implementation-notes.md`）。这是「移植既有实现」
+的典型误用：抄了别家的**判据表**而非本家的实测事实（`AGENTS.md` 的
+「先抄『类别→动作』表」那条纪律的同型错误）。
+
+⚠️ 照搬还有**直接坏处**（实测）：新表与 cline 表对同一报文**给出相反结论**
+—— `{"error":"access forbidden: x is not permitted"}` 在 cline 判「地域」、
+在新表判「不是非凭据」；反向也不一致（`not subscribed` 在新表判真、cline 判假），
+既非子集也非超集，是**第三套口径**。
+
+⚠️ 而且 `not subscribed to required model plan` 归「与凭据无关」是**错的**：
+本仓库自己的实测（`src/cline-rate-limit.ts` 注释、`providers-cline.md`）记它是
+`ENTITLEMENT_ERROR` ——「有余额（500000）但**没有订阅计划**」，是**账号级**属性
+⇒ 不同账号订阅状态可不同 ⇒ 正确处置是**换号**，而不是硬失败。
+（撤回前命中该 marker 时 `getAvailableAccount` 调用 **0 次**。）
+
+⚠️ 撤回还顺带消除两处**由它引入**的损害：非 JSON 403（CDN/网关 HTML 页）
+含 marker 时会把**整页 HTML（含 `<script>`）**原样送进失败行；以及
+「地域文案 + 额度文案」并存的报文被错分到权限分支而**失去换号机会**。
+
+**结论**：将来若真在 codearts 上抓到地域封锁报文，**按实测再加**；
+现在加是凭空的，且会长期维护一张无依据且与别家相反的表。
 
 ## 模型黑名单（Jet Hub「显示列表」开关）
 
@@ -524,6 +726,83 @@ lobsterai / loomy / minimax / raccoon / trae / zcode 都是**单来源**目录
 ⚠️ **同名消歧必须基于未过滤的全量集合**（`displayNameFor(model, source)` 而非
 `listed`）：用过滤后的集合会让「关掉其中一个同名模型」改变另一个的变体标记，
 名字随开关跳变。
+
+### ⚠️⚠️ 判「某个 id 在不在目录里」时，**两个目录来源都必须取并集**（Issue IKJW33）
+
+**真实缺陷**（Gitee issue IKJW33，用户报障 2026-10-08）：对**已从远端目录消失**的
+模型 id 调 `on`/`off`，命令返回「✅ 成功 1」但**实际什么都没发生、且零警告**。
+用户实测两例：`cline/cline-free/deepseek-v4.1-flash` 与
+`cline/stealth/space-bunny-alpha` 在记录「上游 model not found」后从 cline 目录
+消失（490 → 489）。后果：① 脚本/AI 助手据「成功 1」误判开关已生效（**作者本人
+就据此误判过一次**）；② 黑名单里残留幽灵条目，GUI 看不见、关闭记录却还挂着。
+
+修法是照常写入 + 响应里补 `warnings[]`（**不改成 `ok:false`+`not-found`**：
+打开方向是幽灵条目的**唯一**清理路径，且目录可能读不出来）。但**判据本身**踩了
+两个方向相反的坑，**每个方向都被实测证伪过一次** —— 这是本节最该记住的：
+
+| 只用 | 症状 | 实测证据 |
+|---|---|---|
+| `listAllModels()` | **误报**：冷缓存下它返回**编译期兜底表**（`model-catalog.ts` 的 `cached ?? config.syncCatalog()`），而兜底表是**子集** | 探针实测 cline 冷缓存只有 **3** 条，远端有 **460** 条 ⇒ 远端任意正常模型都被判「不在目录」。而 issue 的复现路径**恰恰是冷缓存**（脚本直接调 `on`，从未先跑 `list`） |
+| `listModels()` | **反向误报**：`opencode` 的 `listAllModels()` **恒返回**编译期兜底表（永不读远端），而 `listModels()` 在**只有匿名槽**时还会 `filter(isFree)` | 审计端到端实测：无付费账号时关闭 13 个**设置页可见**的模型，**13/13 全部收到假警告**（「该模型可能已被上游下架」，而它并没下架，只是当前身份看不到） |
+
+⇒ **取并集**：`llm.listModels()` ∪ `modelAdapters[provider].listAllModels()` ∪
+黑名单里 `true` 的 id。方向刻意是「**宁漏勿误**」：`known` 越大 ⇒ 误报越少。
+提示类信息的**误报比漏报糟得多**（用户会对整类提示脱敏），故宁可漏报。
+
+四条**不能省**的实现约束：
+
+1. ⚠️ **`listModels()` 读失败（超时/抛错/空目录）必须整体放弃核对**，**不得**
+   退化成「只用 `listAllModels()` 兜底表」—— 那会退回上表第一行的误报形态。
+   代价是「首次拉取就失败」时**漏报**（issue 的原始场景最可能命中），
+   **这是刻意的取舍，别当漏写删掉**。空目录另有一层理由：
+   `createModelCatalog` 在「无已登录账号」时返回 `[]`（门控隐藏整个 provider），
+   空目录意味着「看不到」而非「全部下架」。
+2. ⚠️ **黑名单必须在 `await` 之后读**（放在核对函数内部，不由调用方传快照）：
+   提前取快照会让「快照」与「实际写入」之间隔着一次 `listModels`（最长 2 秒），
+   期间另一路 RPC 的写入使快照失真 ⇒ 实测「**实际产生了变更却报『本次没有产生
+   任何变更』**」（与 issue 要消除的误导同型）。放在 await 之后，从读黑名单到
+   写入全是**同步代码、无 await** ⇒ 窗口归零。
+3. ⚠️ **必须带超时**（`CATALOG_READ_TIMEOUT_MS = 2000`）：`listModels()` 冷缓存下
+   会真的发远端拉取 ⇒ 「写开关」这个原本纯本地的操作多了一条网络依赖。
+   开关**绝不能**被远端拖住。GUI 路径缓存通常已热（先看到列表才会去点开关），
+   是纯内存读；只有脚本冷启动直调开关才可能等一次拉取。
+4. ⚠️ **`listAllModels()` 抛错要吞掉**（单独 try/catch）：开关是主操作，
+   核对只是提示层，失败只少一半来源、不能让开关失败。
+
+⚠️ **「有效清理」静默这条语义只由一处承担**（并回黑名单里的 id）——
+`catalogWarnings` **不再判一次 `before[id]`**：那会是**同义的两套判据**
+（本仓库踩过「一文件两套同义判据必然先腐坏一套」），且内层在生产路径上**不可达**
+（实测：把 `before` 换成「操作后」快照，**没有任何用例变红**）。
+
+⚠️ **`dead` 表里的 id 算「不在目录」，但文案必须可操作**：失效模型被
+`withDeadModelPruning` 从**两个来源**同时剔除，而 `model.list` 又把它们补回
+设置页（`dead:true`）供用户点「重新显示」⇒ 它们天然落在「目录外」。
+issue 的两例正是这个形态 —— 只说「不在目录」不够，必须给出
+「可在模型列表里点『重新显示』恢复」这条指引。
+
+⚠️⚠️ **本节的测试曾整片恒真，是本 issue 最隐蔽的一处缺陷**（审计内存变异实测）：
+`model-groups.spec.ts` 里对客户端渲染的断言写成独立的
+`toMatch(/'data-tone': 'warn'/)` + `toMatch(/role: 'status'/)`，而这两个字面量在
+**全文件**分别出现 **5 次**与 **2 次**（别的面板也有）⇒ 断言被别处满足。
+实测四个变异**全部仍绿**：删掉整个渲染块 / 改成 `'warning'`+`role:'alert'`
+（**正是注释自称防住的那个坑**）/ 删掉 `data-tone` / GUI 完全不展示。
+⇒ 源码级断言必须**锚定到片段**再断言相邻关系：
+
+```js
+const start = client.indexOf('toggleWarnings.length > 0')
+const block = client.slice(start, client.indexOf(': null,', start))
+expect(block).toMatch(/'data-tone': 'warn',\s*\r?\n\s*role: 'status'/)
+```
+
+⚠️ 同理，「两个入口都接了」这类**并列断言**要用**计数**（`match(...).length === 2`），
+`toMatch` 只要求任意一处命中 ⇒ 只接一个入口时照样绿（审计变异 E2 实测）。
+
+回归用例：`tests/unit/jet-hub-rpc.spec.ts` 的「目录外 id 的开关必须给出 warnings
+（Issue IKJW33）」段 + `tests/unit/model-groups.spec.ts` 的三条渲染/接线断言。
+⚠️ **条数以 `pnpm test` 输出为准**（本节刻意不写数字：接一个 provider 就会失效）。
+⚠️ 已做**反向验证**（10+ 条变异各自独立锁死）：去掉并集、失败时退化用兜底表、
+不吞 `listAllModels` 异常、黑名单改在 await 之前读、去掉超时、去掉 dead 指引、
+两个方向文案对调、客户端不渲染/不消费、`tone` 写错 —— **每条都有对应用例变红**。
 
 ## 目录门控：没有已登录账号就隐藏整个 provider
 
@@ -860,6 +1139,132 @@ fallback**（宁可取不到值时背景异常、能一眼看出，也不要一�
 绝不能「关不掉模型就只停账号」—— 那会让供应商显示成已关闭而模型其实还在，
 用户按「已关闭」的预期却仍能选到它。前端把这种情形表现为**开关禁用**并给出原因
 （`providerSwitchState` 的 `reason`），而不是让用户点下去只得到一句错误提示。
+
+#### ⚠️⚠️ 但「拿到目录」必须取**两个来源的并集**（真实缺陷，2026-10-11）
+
+上面那条约定立了很久，却**有一个入口绕过了它**：`fullCatalogIds` 原先是
+「**优先** `modelAdapters[provider].listAllModels()`，只要它存在就短路、
+**根本不读 `llm.listModels()`**」。
+
+而 `listAllModels()` 在**冷缓存**下返回各家**编译期兜底表**
+（`model-catalog.ts` 的 `cached ?? config.syncCatalog()`）—— 它是**子集**：
+实测 `cline` 冷缓存只有 **3** 条，远端有 **460** 条。
+
+⇒ 两个关闭方向都只写兜底表那几条进黑名单，**其余几百条仍可选**，而端点返回「成功」：
+
+| 端点 | 后果 |
+|---|---|
+| `model.setAllDisabled` | 用户以为整个供应商已关闭，对话框里那几百条**仍能选中** |
+| `provider.setEnabled` | **更重**：`provider.status` 的 `closed` 判据是 `total > 0 && disabled === total`，而 `total` **也**取自 `listAllModels()` ⇒ 界面**显示已关闭**、模型却仍可选（正是上一节列为必须避免的形态的镜像） |
+
+⚠️ 用户报障路径**恰恰是冷缓存**：脚本/设置页首次打开就点「关闭全部」。
+⚠️ 而上一节那句「读失败时不落盘」的守卫**拦不住它** —— 冷缓存兜底表返回子集时
+它**不算失败**。这正是「判据写得对，但判据的**输入**是错的」这类缺陷的典型：
+守卫本身没问题，问题在它拿到的目录不完整。
+
+**修法**：`fullCatalogIds` 取 `适配器目录 ∪ 远端目录`，并把「目录是否可用」
+如实回报给调用方（`FullCatalogResult.complete`）。三个调用点按**各自的完整度要求**
+分流（这是它不能再返回单一 `{ ids } | { error }` 的原因）：
+
+| 调用点 | 需求 | 目录不可用时 |
+|---|---|---|
+| `model.setAllDisabled` / `provider.setEnabled` | **必须完整**（要写黑名单） | **拒绝且不落盘** |
+| `account.test` | **尽力而为**（只要一个 id 就能测） | 用拿到的那些照常测 |
+
+⚠️⚠️ **「目录不可用」有两种形态，必须都判**（我第一版只判了前者，漏了后者）：
+
+1. **远端读失败**（超时 / 抛错 / 无 llm 服务）—— 有 `remoteError`；
+2. **远端读到但为空** —— `createModelCatalog` 在「无已登录账号」时门控返回 `[]`，
+   含义是「**看不到**」而**不是**「该 provider 一个模型都没有」。
+   ⚠️ 此时适配器兜底表**仍可能有内容**，照它写黑名单就是**同一个缺陷的另一个入口**
+   （实测：远端 `[]` + 兜底表 1 条 ⇒ 「关闭全部」只关那 1 条并返回成功）。
+   这一种**没有** `remoteError`（它不是错误）。
+
+⇒ 判据收敛为 `complete: boolean`（= 远端读到且非空），**别让调用方各自拼**
+「`remoteIds === undefined` 或 `remoteIds.length === 0`」—— 那正是本仓库踩过的
+「一文件两套同义判据必然先腐坏一套」。`remoteIds` 字段已因此**删除**
+（保留它就是留下第二套同义判据，审计独立指出过这一点）。
+
+⚠️ **`account.test` 的「尽力而为」是刻意的、不可改成拒绝**：它只要**一个** id 就能测，
+而「适配器有目录 + llm 临时故障（令牌过期）」是真实且常见的组合。
+若那里也拒绝，该端点会从**能测**退化成
+`bad-request: 无法确定要测试的模型：读取模型列表失败：令牌已过期` ——
+而它自己的注释明确把这类退化列为「**自造的失败**」（实测确认过这个收缩）。
+
+⚠️ **两种不可用的文案必须分开**（它们对用户意义不同）：
+`account.test` 的「没账号」（`… 没有可测试的模型`）vs「读不到」
+（`无法确定要测试的模型：读取模型列表失败：…`）；
+`provider.setEnabled` 同理（`该供应商没有可关闭的模型，未做任何变更` vs 带 `remoteError`）。
+
+⚠️⚠️ **两个关闭端点的文案必须逐字同构**（审计报的「缺口 4」）：`model.setAllDisabled`
+原先用 `remoteError ?? '当前读不到完整的模型目录，未做任何变更'` 一刀切，
+于是**同一个 `complete === false` 在两个端点给出不同可读性** ——
+「远端读到但为空」（没账号）在它这里落到通用文案、在 `provider.setEnabled` 却走分流。
+现统一为同一个三元表达式。
+
+⚠️ **断言只 `toContain('没有可关闭的模型')` 是恒真的**（审计实测）：
+文案退化成 `没有可关闭的模型：undefined`（把 `remoteError` 的 `undefined` 拼进模板）
+**也含该子串** ⇒ 变异无法察觉。必须补
+`expect(message).not.toContain('undefined')`。
+⚠️ 同型缺口还有 `account.test`：把判据从 `remoteError !== undefined` 改成
+`!catalog.complete`，生产 spec **全绿**而行为已分叉成 `无法确定要测试的模型：undefined`
+—— 「远端读到但为空」这条组合**零守卫**（既有用例只覆盖 `withoutLlm` 与
+`listModelsError`，两者**都带** `remoteError`）。已补用例。
+
+⚠️ **不要写「`ids` 可能为空」的分支**（审计指出的死代码）：
+`complete === true` ⟺ 远端读到且非空 ⟹ 并集 `ids` **必非空**（`ids` ⊇ 远端目录）
+⇒ `if (catalog.ids.length === 0)` 在数学上不可达，且它与 `!complete` 分支在
+「远端读到但为空」上**给出相同文案**（同义的两套判据）。
+`provider.setEnabled` 里那个分支已按本仓库「一文件两套同义判据必然先腐坏一套」删除
+（实测：加回它全绿，无法通过变异察觉）。⚠️ 删它**必须**同时保留 `!complete` 的文案分流
+（否则「远端读到但为空」会打印 `undefined`）。
+
+⚠️ **新增代价**：`fullCatalogIds` 现在**总是**读一次远端（旧实现在适配器存在时根本不读）。
+已用 `CATALOG_READ_TIMEOUT_MS`（2 秒）封住，超时即按「远端读失败」处理 ⇒
+两个关闭方向**拒绝**、`account.test` 照常测。GUI 路径缓存通常已热（纯内存读）。
+
+#### ⚠️⚠️ 读取侧：`provider.status` 的 `closed` 也必须核实（同一根因的残留）
+
+写入侧修好后**读取侧还没修**（独立审计发现）：`provider.status` 的
+`closed = total > 0 && disabled === total` 仍**只基于 `listAllModels()`**（子集）
+⇒ 冷缓存 + 旧版本写下的**不完整**黑名单会**误报已关闭**：
+
+```
+兜底表 [hy3]（冷缓存）+ 黑名单 { hy3: true }（旧版本「关闭全部」的产物）
+⇒ total=1, disabled=1 ⇒ closed:true
+而远端还有 glm-5.2 / deepseek-v4-flash 可选 ⇒ 界面显示「已关闭」却仍能选
+```
+
+⇒ **只在子集判据说「已关闭」时才核实**（用 `fullCatalogIds` 取并集重算）。
+理由：`closed` 的**危险方向只有 `true` 这一个**（报 false 是安全的 ——
+用户可点开关，点了会得到明确错误）。故常见路径（未关闭）**零网络**，
+只有「真的可能已关闭」才付一次读取。
+
+⚠️⚠️ **核实的判据是「远端读成功」，不是 `complete`**：`complete` 额外要求远端
+**非空**，而这里恰好有一个**正常**的空形态 —— 「全部模型都已关闭」时
+`listModels()` 被黑名单**过滤成 `[]`**（那正是本端点要回答的那个状态！）。
+用 `complete` 会让「一关全就永远显示未关闭」（本修复第一版踩过，两条既有用例当场变红）。
+⚠️ 核实不了（远端读失败）时**保守报未关闭**（安全方向）。
+
+⚠️ **代价与边界**：多个「已关闭」的供应商会串行各读一次目录（每次上限 2 秒）；
+⚠️ 「远端读到但为空」（无账号门控）与「全部已关闭」在远端**同形**，
+此时并集只剩兜底表 —— 若兜底表全命中仍报已关闭（用户确实没有可选模型），可接受。
+⚠️ 存量**已修复**（不再误报），但**不回溯**：升级前写下的不完整黑名单本身仍在
+配置里（用户点一次「关闭全部」或「打开全部」即可重写为完整集合）。
+
+回归用例：`tests/unit/jet-hub-rpc.spec.ts` 的
+「disabled:true 取两个目录来源的并集（冷缓存兜底子集不得当权威）」、
+「关闭供应商：冷缓存兜底子集不得当权威」、「远端读到但为空（无账号门控）→ 同样拒绝且不落盘」、
+「⚠️ 远端读失败时拒绝且不落盘」、「⚠️ 适配器有目录 + 远端读失败 → 仍用适配器目录照常测」、
+「⚠️ 兜底子集判据说「已关闭」时必须核实」、「⚠️ 真的全关时仍报已关闭」、
+「⚠️ 核实不了（远端读失败）时保守报未关闭」、「未关闭时不核实目录（子集判据为 false 即返回，零网络）」等。
+⚠️ **条数以 `pnpm test` 输出为准**（本节刻意不写数字）。
+⚠️ 已做**反向验证**（15 条变异各自独立锁死）：退回短路、去掉适配器半边、不回报
+`remoteError`、改判 `ids` 是否为空（两个端点各一）、`account.test` 改拒绝、
+不判远端为空、不吞适配器异常、`account.test` 判据改成 `!complete`、
+文案恒用带原因那句、加回 `ids.length === 0` 死分支（**全绿 ⇒ 确认是死代码**）、
+`provider.status` 退回不核实、核实用 `complete`、核实失败不保守、未关闭时也核实
+—— 除「死代码」那一条外**每条都有对应用例变红**。
 
 ### ⚠️ 开关**不在**左侧行尾（2026-10-01 用户要求搬到页头弹窗）
 
@@ -1492,8 +1897,9 @@ buddy: no usable credential; log in from the Jet Hub panel first
 
 **链路**（四个环节都正确，合起来却报出假原因）：
 
-1. 唯一的启用账号带该模型的未过期限流标记 → `pickBuddyCredential`
-   （`src/index.ts`）的候选筛成**空集**；
+1. 唯一的启用账号带该模型的未过期限流标记 → 候选筛（原
+   `src/index.ts` 里 buddy 系那段编排闭包，符号名已随 Task 6 删除
+   —— 见 git 历史 `d35d9e3`）筛成**空集**；
 2. `select()`（`src/buddy-balance-selector.ts`）对空候选只能回一个笼统的
    `{kind:'exhausted'}`，**未锁定时 `reason` 被丢弃**；
 3. 调用方退到**单凭据 ref** `BUDDY_ACCESS_TOKEN` —— 而 Jet Hub 登录只写

@@ -62,10 +62,10 @@ import type {
   LlmResolvedModelInfo,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { collectImages, serializeMessages } from './openai-compat.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import type { ZcodeCredential } from './zcode.js'
@@ -117,6 +117,7 @@ import {
   noteZcodeRequestSent,
   readZcodeBusinessCodeFromBody,
 } from './zcode-diagnostics.js'
+import { planSessionTitleThinking } from './session-title.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
 export const PROVIDER = 'zcode'
@@ -351,6 +352,14 @@ export class ZcodeAdapter extends LlmAdapter {
   private remoteModels: ZcodeRemoteModel[] | undefined
   /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
   private readonly catalogGate: RemoteCatalogGate
+  /**
+   * ⚠️ **2026-10-08 Task 7d：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+   * 现在只剩 `toCatalogEntry`（本家私有形状 + 档位小写 id/大写名）。
+   * ⚠️ `ready()` 门控**留在本家**（`listModels` 里，在骨架门控之前）——
+   * 它是本家特有判据（磁盘上有没有可用凭据）。
+   */
+  private readonly catalog: ModelCatalog
   /** 自建的常驻浏览器（仅当调用方没注入 `mintCaptcha` 时用）。 */
   private captchaBrowser: ZcodeCaptchaBrowser | undefined
   /** captcha 配置缓存（配置很少变，但与凭据一样**不长期缓存**）。 */
@@ -382,6 +391,17 @@ export class ZcodeAdapter extends LlmAdapter {
     this.catalogGate = new RemoteCatalogGate(
       options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
     )
+    // ⚠️ 共享骨架（Task 7d）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`）。
+        unknownModelInputModalities: () => ['text'] as const,
+      },
+    )
   }
 
   /**
@@ -403,10 +423,106 @@ export class ZcodeAdapter extends LlmAdapter {
    * 设置页需要它渲染被关闭的模型 —— 否则那些条目只能凭 `disabledMap` 的 key
    * 补回，而那条路径拿不到展示名，会退化成裸 id
    * （`AGENTS.md` 记过 Raccoon 的同款用户报障）。
+   *
+   * ⚠️ **2026-10-08 Task 7d**：骨架（含上面这条理由）已上移到共享实现
+   * `src/model-catalog.ts`，此处只剩委托。
    */
   listAllModels(): readonly { id: string; name: string }[] {
+    return this.catalog.listAllModels()
+  }
+
+  /**
+   * 把本家条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 本家四处**真实差异**：
+   * 1. `contextWindow` / `maxTokens` 都走「远端 → 兜底表」二级查找；
+   * 2. `reasoning` 的档位来自上游 `client/configs` 的
+   *    `builtinModels[].reasoning.{levels, defaultLevel}`，且
+   *    **`id` 必须保持小写**（它是要发给上游的协议值 `output_config.effort`）、
+   *    **展示名用大写**（用户要求，DSH 直接渲染 `efforts[].name`）；
+   * 3. `inputModalities` 读远端 `supportsImage`（未声明时**保守报 `['text']`**）。
+   */
+  private toCatalogEntry(
+    model: ZcodeRemoteModel,
+    fallback: ZcodeFallbackModel | undefined,
+  ): CatalogEntry {
+    const contextWindow = model.contextWindow ?? fallback?.contextWindow
+    const maxTokens = positiveMaxTokens(model.maxTokens ?? fallback?.maxTokens)
+    const levels = model.reasoningLevels ?? fallback?.reasoningLevels
+    const defaultLevel = model.defaultReasoningLevel ?? fallback?.defaultReasoningLevel
+    return {
+      id: model.id,
+      name: model.name,
+      // ⚠️ `resolveModel` 用「远端名 → 兜底名 → 裸 id」三级回退。
+      bareName: model.name,
+      // ⚠️ 三态：本家条目**总是**带 `supportsImage` 布尔 ⇒ 恒为数组。
+      inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
+      ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+      ...maxTokens !== undefined ? { maxTokens } : {},
+      ...levels !== undefined && levels.length > 0
+        ? {
+            reasoning: {
+              /**
+               * ⚠ **`id` 必须保持小写**（`low`/`high`/`max`）—— 它是要发给上游的
+               * 协议值（`output_config.effort`），官方 `client/configs` 里就是小写。
+               * 改成大写会让上游认不出档次（通常静默忽略整个字段）。
+               *
+               * **展示名**按用户要求用大写（`Low`/`High`/`Max`）：DSH 的选择器
+               * 直接渲染 `efforts[].name`（不本地化、不查字典），故给什么显示什么。
+               * 小写形态（`max`/`high`/`low`）在 UI 里看着像标识符而不像选项。
+               *
+               * ⚠ `ReasoningEffortId` 是 branded 类型，必须用构造函数（同 qoder 的写法）。
+               */
+              efforts: levels.map((id) => ({ id: ReasoningEffortId(id), name: reasoningEffortLabel(id) })),
+              ...defaultLevel !== undefined && levels.includes(defaultLevel)
+                ? { defaultEffort: ReasoningEffortId(defaultLevel) }
+                : {},
+            },
+          }
+        : {},
+    }
+  }
+
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    const all = await this.loadModels()
+    return all.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
+  }
+
+  /**
+   * 同步视图（`listAllModels` 用）。
+   *
+   * ⚠️ **不能** `await loadModels()`（同步契约）—— 读 `remoteModels` 缓存，
+   * 未落地时回退兜底表（这正是原实现的语义）。
+   */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
     const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
-    return source.map((model) => ({ id: model.id, name: model.name }))
+    return source.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
+  }
+
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠ **门控顺序**（本家特有，必须在骨架的门控**之前**）：
+    // 未就绪（磁盘上没有可用凭据）时返回 `[]` → DSH 的 buildModelCatalog
+    // 把整个 provider 分组隐藏。**必须返回空数组而不能抛错**。
+    if (!await this.ready()) return []
+    return this.catalog.listModels(_provider)
+  }
+
+  /**
+   * 解析模型元信息。
+   *
+   * ⚠️ **`reasoning` 必须声明** —— 否则 DSH 的选择器根本不出现。
+   * **真实缺陷**（用户报障）：「使用 zcode 的 glm-5.3-flash 没法选中思考档位，
+   * 而 ZCode 自己可以设置」。根因与本仓库 qoder 那次**完全同型**：
+   * DSH 的档位选择器**只**从 `resolveModel().reasoning` 渲染
+   * （`dsh-client-ui-model-selection`：`reasoning === undefined ? [] : …efforts`），
+   * 只声明 `context` 是不够的。该判据现已收敛到 `toCatalogEntry`。
+   */
+  async resolveModel(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /**
@@ -433,10 +549,6 @@ export class ZcodeAdapter extends LlmAdapter {
     return this.product.fallbackModels.map(fallbackToRemote)
   }
 
-  private inputModalitiesFor(model: ZcodeRemoteModel | undefined): readonly ('text' | 'image')[] {
-    return model?.supportsImage === true ? ['text', 'image'] : ['text']
-  }
-
   /** 就绪判据：默认看磁盘上有没有可用凭据。 */
   private async ready(): Promise<boolean> {
     if (this.options.isReady !== undefined) {
@@ -451,89 +563,6 @@ export class ZcodeAdapter extends LlmAdapter {
     } catch {
       return false
     }
-  }
-
-  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠ 未就绪时返回 `[]` → DSH 的 buildModelCatalog 把整个 provider 分组隐藏。
-    // **必须返回空数组而不能抛错**（抛错会被归入 catalog 的 failures，
-    // 界面上反而多一条 provider 报错）。
-    if (!await this.ready()) return []
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-
-    const all = await this.loadModels()
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? all
-      : all.filter((model) => !disabled.has(model.id))
-
-    return listed.map((model) => ({
-      provider: this.product.id,
-      id: model.id,
-      name: model.name,
-      inputModalities: this.inputModalitiesFor(model),
-    }))
-  }
-
-  async resolveModel(
-    provider: string,
-    model: string,
-    _signal?: AbortSignal,
-  ): Promise<LlmResolvedModelInfo> {
-    const all = await this.loadModels()
-    const entry = all.find((item) => item.id === model)
-    const fallback = this.fallbackIndex.get(model)
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: entry?.name ?? fallback?.name ?? model,
-      inputModalities: this.inputModalitiesFor(entry),
-    }
-    const contextWindow = entry?.contextWindow ?? fallback?.contextWindow
-    // 未知模型不编造 context（宁可让 DSH 用默认值，也不报一个假窗口）。
-    if (contextWindow !== undefined && contextWindow > 0) {
-      resolved.context = { contextWindow }
-    }
-    const maxTokens = positiveMaxTokens(entry?.maxTokens ?? fallback?.maxTokens)
-    if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
-    /**
-     * ★ **思考档位必须在这里声明** —— 否则 DSH 的选择器根本不出现。
-     *
-     * ⚠ **真实缺陷**（用户报障）：「使用 zcode 的 glm-5.3-flash 没法选中思考档位，
-     * 而 ZCode 自己可以设置」。根因与本仓库 qoder 那次**完全同型**：
-     * DSH 的档位选择器**只**从 `resolveModel().reasoning` 渲染
-     * （`dsh-client-ui-model-selection`：`reasoning === undefined ? [] : …efforts`），
-     * 只声明 `context` 是不够的。
-     *
-     * 档位来自上游 `client/configs` 的
-     * `builtinModels[].reasoning.{levels, defaultLevel}`：
-     *   - `levels` 的**键序**即展示顺序（实测 `low` / `high` / `max`）
-     *   - `defaultLevel` 实测为 `max`
-     *
-     * ⚠ `defaultEffort` **必须落在 `efforts` 内**，否则不发 ——
-     * 指向不存在的选项会让选择器显示空白（qoder 那边的既有约定）。
-     */
-    const levels = entry?.reasoningLevels ?? fallback?.reasoningLevels
-    if (levels !== undefined && levels.length > 0) {
-      const defaultLevel = entry?.defaultReasoningLevel ?? fallback?.defaultReasoningLevel
-      resolved.reasoning = {
-        /**
-         * ⚠ **`id` 必须保持小写**（`low`/`high`/`max`）—— 它是要发给上游的
-         * 协议值（`output_config.effort`），官方 `client/configs` 里就是小写。
-         * 改成大写会让上游认不出档次（通常静默忽略整个字段）。
-         *
-         * **展示名**按用户要求用大写（`Low`/`High`/`Max`）：DSH 的选择器
-         * 直接渲染 `efforts[].name`（不本地化、不查字典），故给什么显示什么。
-         * 小写形态（`max`/`high`/`low`）在 UI 里看着像标识符而不像选项。
-         *
-         * ⚠ `ReasoningEffortId` 是 branded 类型，必须用构造函数（同 qoder 的写法）。
-         */
-        efforts: levels.map((id) => ({ id: ReasoningEffortId(id), name: reasoningEffortLabel(id) })),
-        ...defaultLevel !== undefined && levels.includes(defaultLevel)
-          ? { defaultEffort: ReasoningEffortId(defaultLevel) }
-          : {},
-      }
-    }
-    return resolved
   }
 
   /**
@@ -708,7 +737,9 @@ export class ZcodeAdapter extends LlmAdapter {
        */
       const all = await this.loadModels()
       const entry = all.find((item) => item.id === options.model)
-      if (!this.inputModalitiesFor(entry).includes('image')) {
+      // ⚠️ 判据**内联在此**（Task 7d：原 `inputModalitiesFor` 已删除）——
+      //    它是本家私有的「该 entry 支不支持图片」，骨架不认识 `supportsImage`。
+      if (entry?.supportsImage !== true) {
         throw new LlmError(
           `zcode: 模型 "${options.model}" 不支持图片输入`,
           'UNSUPPORTED_CONTENT',
@@ -865,13 +896,39 @@ export class ZcodeAdapter extends LlmAdapter {
      * 也不发默认值 —— 上游有自己的 `defaultLevel`，我们别去覆盖它。
      */
     const effort = options.reasoningEffort
-    if (effort !== undefined && effort.length > 0) {
+    /**
+     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+     *
+     * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+     * 本模型的默认档注入进来（`effective = requested ?? reasoning.defaultEffort`）。
+     * ZCode 的档位来自上游 `client/configs`（实测形如 `['low','high','max']`，
+     * **没有 `off`/`none`**）⇒ 本家**关不掉**思考，只能走抬预算兜底。
+     *
+     * ⚠️ 实测佐证（本机 737 会话日志）：zcode 标题成功率仅 **20%**（2 成 / 8 败），
+     * 与已修的 lobsterai(21%)、workbuddy(39%) 同量级 ⇒ 确实被 64 token 吃满。
+     *
+     * ⚠️ `declaredEfforts` **必须与 `reasoningFor` 同源**（都取
+     * `entry.reasoningLevels`）—— 若这里另读一份，会出现「UI 声明了关闭档、
+     * 请求却把预算抬高」或反过来的分叉（TRAE 的 `supportThinking` 就是一处实例）。
+     */
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: effort === undefined ? undefined : String(effort),
+      declaredEfforts: (await this.loadModels()).find((item) => item.id === options.model)?.reasoningLevels ?? [],
+      maxTokens: options.maxTokens,
+    })
+    if (titlePlan.effort !== undefined && titlePlan.effort.length > 0) {
       const all = await this.loadModels()
       const entry = all.find((item) => item.id === options.model)
       const levels = entry?.reasoningLevels
-      if (levels !== undefined && levels.includes(effort)) {
-        body.output_config = { effort }
+      if (levels !== undefined && levels.includes(titlePlan.effort)) {
+        body.output_config = { effort: titlePlan.effort }
       }
+    }
+    // ⚠️ 抬预算必须在 `body` 构造**之后**覆盖（见上方的 `max_tokens` 初值）：
+    // 那里写的是 `options.maxTokens ?? 8192`，此处按决策结果覆盖。
+    if (titlePlan.isTitle && titlePlan.maxTokens !== undefined) {
+      body.max_tokens = titlePlan.maxTokens
     }
 
     /**
@@ -1521,13 +1578,13 @@ export class ZcodeAdapter extends LlmAdapter {
       tried.add(activeAccountId)
     }
 
-    const next = await pool.getAvailableAccount(this.product.id, options.model, tried)
+    const next = await pool.getAvailableAccount<ZcodeCredential>(this.product.id, options.model, tried)
     if (next === null || next === undefined || tried.has(next.entry.id)) return undefined
     tried.add(next.entry.id)
     return {
       // 池的凭据类型是历史遗留的联合类型；运行时安全性由 provider 过滤保证
       // （查询用 `this.product.id`，取到的必是 zcode 凭据）。
-      credential: next.credential as unknown as ZcodeCredential,
+      credential: next.credential,
       accountId: next.entry.id,
     }
   }

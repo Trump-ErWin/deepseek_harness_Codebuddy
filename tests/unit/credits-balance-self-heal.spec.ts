@@ -94,17 +94,22 @@ function setup(options: HarnessOptions) {
     listAllAccounts: async () => options.accounts,
   }
 
-  // ⚠️ 位置参数顺序：codearts / buddy / workbuddy / lobsterai / qoder / qoderCn /
-  // trae / cline / loomy / raccoon / minimax / zcode / gemini。
+  // ⚠️ 2026-10-10（合并 master 的 provider 抽象重构）：`registerJetHubRpc` 的
+  // 13 个 provider 形参已从**位置传参**改为**命名对象 `auths`**（键 = provider
+  // id）。这消除的正是「少传/插队静默错位」那一类缺陷（本仓库历史复发 6 次）。
+  // 本 harness 随之改为传对象 —— 少一个键会**编译不过**，而不是静默错位。
   const a = makeAuth
+  const auths = {
+    codearts: a('codearts'), buddy: a('buddy'), workbuddy: a('workbuddy'),
+    lobsterai: a('lobsterai'), qoder: a('qoder'), qodercn: a('qodercn'),
+    trae: a('trae'), cline: a('cline'), loomy: a('loomy'),
+    raccoon: a('raccoon'), minimax: a('minimax'), zcode: a('zcode'),
+    gemini: a('gemini'),
+  }
   registerJetHubRpc(
     ctx as never,
     pool as never,
-    a('codearts') as never, a('buddy') as never, a('workbuddy') as never,
-    a('lobsterai') as never, a('qoder') as never, a('qodercn') as never,
-    a('trae') as never, a('cline') as never, a('loomy') as never,
-    a('raccoon') as never, a('minimax') as never, a('zcode') as never,
-    a('gemini') as never,
+    auths as never,
   )
   if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -356,17 +361,34 @@ describe('credits.balances 的按需自愈（issue IKKHL5 建议 C）', () => {
     expect(h.calls).toHaveLength(1)
   })
 
-  it('★ 未知 provider 在 account.refresh 上报 `Unknown provider`（文案不得语义错位）', async () => {
+  it('★ 未知 provider 报 `Unknown provider`（文案不得语义错位）', async () => {
     // ⚠️ 对抗审计实测的真实缺陷：分派抽成共享表后，default 一度对 loomy /
     // zcode / opencode 抛「不支持在**积分查询前**自动续期」—— 而
-    // `account.refresh` 根本没有「积分查询前」这个上下文（实测 opencode
-    // 就报出这句）。共享表的 default 必须保持既有对外契约。
+    // `account.refresh` 根本没有「积分查询前」这个上下文。
+    //
+    // ⚠️ 2026-10-10（合并 master）：master 的 provider 抽象重构把这里的文案
+    // **改得更精确**了 —— 它区分两种情况（`provider-abstraction-g3-exceptions.md`
+    // 登记的有意变更）：
+    //   - 未注册的 id      ⇒ `Unknown provider: X`
+    //   - 注册了但不支持续期 ⇒ `Provider X 不支持续期（它的凭据不是可续期类型）`
+    // opencode 属**后者**（它是已注册的渠道，只是凭据是静态 API key），
+    // 故这里断言后者。两种都**不含**「积分查询前」那个错位措辞。
     const h = setup({ accounts: [expiredEntry({ id: 'x1', provider: 'opencode' })] })
 
     const result = await h.call('account.refresh', { accountId: 'x1' })
 
     expect(result.ok).toBe(false)
-    expect(result.error?.message).toBe('Unknown provider: opencode')
+    expect(result.error?.message).toContain('opencode')
+    expect(result.error?.message).not.toContain('积分查询前')
+  })
+
+  it('★ 真正未注册的 provider id 报 `Unknown provider`', async () => {
+    const h = setup({ accounts: [expiredEntry({ id: 'y1', provider: 'not-a-channel' })] })
+
+    const result = await h.call('account.refresh', { accountId: 'y1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.message).toBe('Unknown provider: not-a-channel')
   })
 
   /**
