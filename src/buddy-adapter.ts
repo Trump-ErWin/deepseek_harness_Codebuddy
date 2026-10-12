@@ -316,6 +316,15 @@ function contentToText(content: unknown): string {
 /** 工具结果内嵌图片的载体文本（与官方 deepseek 适配器同名同义）。 */
 const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
 
+/**
+ * 「历史以 assistant 开头」时补在首位的最小 system 文本。
+ *
+ * 刻意取**中性且极短**：它只用于满足上游对首条角色的要求，不该影响模型行为；
+ * 且必须**不含**任何腾讯风控指纹字面量（否则这条兜底自己就会把会话送进 11128，
+ * 见 `openai-gateway/tencent-fingerprint.ts`）。
+ */
+const LEADING_SYSTEM_PLACEHOLDER = 'You are a helpful assistant.'
+
 function serializeMessages(
   messages: readonly { role: string; content: unknown }[],
   imageUrls: ReadonlyMap<string, string> | undefined,
@@ -1656,6 +1665,21 @@ export class BuddyAdapter extends LlmAdapter {
         role: 'system',
         content: rewriteTencentContentFingerprints(options.system, this.product.id),
       })
+    }
+    // ⚠️ wire 的**首条不得是 assistant**（2026-10-12 实测，`probe-spacebunny-firstmsg`）。
+    // 同一份请求体，只把开头的 system 去掉、让首条变成「带 tool_calls 的 assistant」：
+    //   `space-bunny`      → 400 / code 11148 / `tool calls and tool results do not match`
+    //                        （`displayMsg.zh` =「工具记录不完整，请新建任务」）
+    //   `step-5-preview`   → 200（**宽容**）
+    // 补一条 system 在前的同一批形状，两个模型都 200 —— 所以判据是「首条角色」，
+    // 不是「配对是否真的坏了」（逐格核对过：无孤儿、无重复、覆盖完整）。
+    // 两个方向都要当真：① 不能因为 step-5 放过就认为没问题；② 不能因为
+    // space-bunny 报错就去改工具配对 —— 那修的是不存在的原因。
+    // 生产里确实可触发：会话历史被压缩/截断到把开头的 system 与首条 user 一起
+    // 削掉时，剩下的历史就以 assistant 开头（与本文件 `options.system` 那条
+    // 「WorkBuddy 网关强制 messages[0] 是 system」的既有约束是同一族）。
+    if (messages.length > 0 && (messages[0] as { role?: unknown }).role === 'assistant') {
+      messages.unshift({ role: 'system', content: LEADING_SYSTEM_PLACEHOLDER })
     }
     const tools = options.tools?.map((tool) => ({
       type: 'function' as const,

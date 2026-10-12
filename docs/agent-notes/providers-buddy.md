@@ -1028,3 +1028,35 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 `content` 与 `tool_calls`」回 `tool calls and tool results do not match, please`
 （适配器报 `INVALID_REQUEST`），而 `step-5-preview` 容忍**同一份**历史。
 需单独取证后再动。
+
+### 已修：上面那个「尚未修」的独立问题，真因**不是**工具配对（2026-10-12 同日）
+
+末节登记的 `space-bunny` 报 `tool calls and tool results do not match`，取证后结论是
+**报错文案在骗人**：
+
+1. 先逐格核对真实适配器产出的 wire（`dump-buddy-tool-count.mts`）：**无孤儿、无重复 id、
+   每条 assistant 的调用都被紧随的结果完整覆盖** ⇒ 配对根本没坏；
+2. 再做单变量实验（`probe-spacebunny-firstmsg.mjs`）：同一份请求体，**只把开头的
+   system 去掉、让首条变成「带 tool_calls 的 assistant」**——
+   `space-bunny` → 400/**11148**（`displayMsg.zh`=「工具记录不完整，请新建任务」），
+   `step-5-preview` → **200**。补回一条 system，两个模型都 200。
+
+⇒ 真正的判据是 **wire 的首条角色**，与工具配对无关。上游那句文案是误导性的。
+（另注：`11101 Unmarshal chat params failed` 是另一类 —— 那是 `arguments` 传了**对象**
+而非 JSON 字符串，Go 侧反序列化失败。）
+
+**修法**：`buddy-adapter.ts` 的 `stream()` 在序列化后检查「首条是不是 assistant」，
+是则补一条最小中性 system（`LEADING_SYSTEM_PLACEHOLDER`）。该文本刻意不含任何
+风控指纹字面量 —— 否则这条兜底自己会把会话送进 11128。
+
+生产里确实可触发：会话历史被压缩/截断到把开头的 system 与首条 user 一起削掉时，
+剩下的历史就以 assistant 开头。与既有的「WorkBuddy 网关强制 `messages[0]` 是 system」
+是同族约束，只是 CodeBuddy 侧只在「首条是带 tool_calls 的 assistant」时发作。
+
+⚠️ 有一条**既有**用例 `sends assistant reasoning_content and null content for tool-only
+turns` 原先按**下标**断言 `messages[0]` 是 assistant —— 那正是把旧形状当契约的地方，
+已改为按角色取。教训：wire 的位置断言在上游补位时会整体平移，别用下标锁角色。
+
+用例：`tests/unit/buddy-adapter.spec.ts` 的「wire 首条不得是 assistant」段（3 条：
+补位且不破坏配对、正常历史不多塞、`options.system` 已就位时不重复补）。
+验收：同一份被拦历史走真实适配器，`step-5-preview` 与 `space-bunny` **都 ✅**。

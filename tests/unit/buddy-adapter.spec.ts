@@ -1856,16 +1856,23 @@ describe('BuddyAdapter message serialization', () => {
     } as never)
 
     const payload = JSON.parse(body!) as { messages: Array<Record<string, unknown>> }
-    const assistant = payload.messages[0]
-    expect(assistant.role).toBe('assistant')
+    // ⚠️ 首条**不再是** assistant：以 assistant 开头的 wire 会被 `space-bunny`
+    // 判 400/11148「工具记录不完整」（实测；见下面「wire 首条不得是 assistant」段），
+    // 适配器因此在首位补了一条最小 system。这里按**角色**取而不是按位置 ——
+    // 位置断言恰恰是把「首条是 assistant」误当成契约的地方。
+    expect(payload.messages[0]?.role).toBe('system')
+    const assistant = payload.messages.find((m) => m.role === 'assistant') as Record<string, unknown>
+    expect(assistant).toBeDefined()
     // 正文为空且带 tool_calls 时 content 必须为 null（对齐 openai_chat.rs）。
     expect(assistant.content).toBeNull()
     // 推理模型要求 assistant 消息始终携带 reasoning_content 字段。
     expect(assistant.reasoning_content).toBe('let me check')
     expect(assistant.tool_calls).toMatchObject([{ id: 'call_1', type: 'function', function: { name: 'shell' } }])
 
-    // 工具结果展开为独立的 role:'tool' 消息。
-    const tool = payload.messages[1]
+    // 工具结果展开为独立的 role:'tool' 消息，且**紧跟**在 assistant 之后
+    // （按角色取而非按下标 —— 首位现在可能是适配器补的 system）。
+    const assistantIndex = payload.messages.findIndex((m) => m.role === 'assistant')
+    const tool = payload.messages[assistantIndex + 1]
     expect(tool).toMatchObject({ role: 'tool', tool_call_id: 'call_1', content: 'file.txt' })
   })
 
@@ -3856,5 +3863,57 @@ describe('BuddyAdapter 直连路径的腾讯风控指纹改写', () => {
       WORKBUDDY,
     )
     expect(textsOfWire(wire)).toContain(`A: ${REWRITE}`)
+  })
+
+  /**
+   * 首条角色（2026-10-12 实测，与上面的指纹问题是**两件事**）。
+   *
+   * 同一份请求体，仅让首条变成「带 tool_calls 的 assistant」：
+   *   `space-bunny` → 400/11148 `tool calls and tool results do not match`
+   *                   （`displayMsg.zh`=「工具记录不完整，请新建任务」）
+   *   `step-5-preview` → 200（宽容）
+   * 而在前面补一条 system，两个模型都 200。
+   *
+   * ⚠️ 这条的价值在于**反直觉**：报错文案说的是「工具记录不匹配」，但逐格核对
+   * 真实 wire 后配对是干净的（无孤儿、无重复、覆盖完整）—— 真正的判据是**首条
+   * 角色**。按文案去改配对逻辑会修一个不存在的原因。
+   */
+  describe('wire 首条不得是 assistant', () => {
+    const assistantWithCall = {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: '我读一下。' },
+        { type: 'tool-call', id: 'call-1', name: 'read', arguments: '{"q":"x"}' },
+      ],
+    }
+    const toolResult = { role: 'tool', toolCallId: 'call-1', content: text('result body') }
+
+    it('★ 历史被削头到以 assistant 开头时，补一条最小 system 在首位', async () => {
+      const wire = await wireOf([assistantWithCall, toolResult, { role: 'user', content: text('然后呢') }])
+      expect(wire[0]?.role).toBe('system')
+      expect(String(wire[0]?.content)).toBe('You are a helpful assistant.')
+      // 补位不得破坏原有的工具配对：调用仍在、结果仍在，且紧随其后
+      expect(wire[1]?.role).toBe('assistant')
+      expect((wire[1]?.tool_calls as Array<Record<string, any>>)[0].id).toBe('call-1')
+      expect(wire[2]?.role).toBe('tool')
+    })
+
+    it('★ 正常历史（首条是 system / user）不被多塞一条 system', async () => {
+      const withSystem = await wireOf([
+        { role: 'system', content: text('You are helpful.') },
+        { role: 'user', content: text('hi') },
+      ])
+      expect(withSystem.filter((m) => m.role === 'system')).toHaveLength(1)
+      const withUser = await wireOf([{ role: 'user', content: text('hi') }])
+      expect(withUser[0]?.role).toBe('user')
+      expect(withUser.some((m) => m.role === 'system')).toBe(false)
+    })
+
+    it('★ options.system 已在首位时不重复补位', async () => {
+      const wire = await wireOf([assistantWithCall, toolResult], { system: 'Real system prompt.' })
+      const systems = wire.filter((m) => m.role === 'system')
+      expect(systems).toHaveLength(1)
+      expect(String(systems[0]?.content)).toBe('Real system prompt.')
+    })
   })
 })
