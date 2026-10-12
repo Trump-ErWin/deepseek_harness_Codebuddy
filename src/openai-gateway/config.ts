@@ -20,39 +20,83 @@ export function isGatewayEnabled(env: NodeJS.ProcessEnv = process.env): boolean 
 }
 
 /**
- * 通配地址的**规范化形态**，逐个精确比较。
+ * 全部「不该出现在地址里」的字符类别（**按 Unicode 类别，绝不枚举码点**）。
  *
- * ⚠️ 必须用 URL 规范化后的形态比较，**不能**比较用户写的字面量：
- * `0` / `0x0` / `0.0` / `00.0.0.0` 这些紧凑写法在 Linux 的 `inet_aton` 下都是
- * `0.0.0.0`（issue 报告者的场景正是 Linux 容器），而 IPv6 全零有
- * `::` / `::0` / `0::` / `0:0:0:0:0:0:0:0` 等任意多个等价写法。
- * 实测交叉验证（`tmp-wildcard-agreement.mjs` 式的探针，逐条绑真 socket 后用
- * `127.0.0.2` 反连确认是否绑了全部网卡）显示：**URL 规范化 + 这 3 个字面量
- * 没有假阴性** —— 每一个真会绑全部网卡的写法都落到这 3 个形态之一。
+ * ⚠️⚠️ 第二轮对抗审计实测：枚举 `[\s\u200b-\u200f…]` 必然漏，而漏一个就等于
+ * 漏一条通往「绑全部网卡」的路径（审计在 Windows 上端到端确证 7 条、系统扫描
+ * 出 25 条）。逐类都有实测样本：
  *
- * ⚠️ 反向的假阳性（`0.0.0.0.` / `0` 等「URL 能规范化但内核解析不了」的写法）
- * 是**有意接受**的：它们本来就会以 `ENOENT` / `ENOTFOUND` 启动失败，
- * 用「通配地址」这条更清楚的报错挡住，比让用户去猜 DNS 解析失败好。
+ * | 类别 | 实测可绕样本 | 说明 |
+ * |---|---|---|
+ * | `Cf` 格式 | `\u00ad` 软连字符、`\u180e` 蒙古文元音分隔符、`\u2061`–`\u2064`、`\u206a`–`\u206f` | 160+ 码点，枚举必漏 |
+ * | `Mn`/`Me` 组合标记 | `\u034f` CGJ（**它是 `Mn` 不是 `Cf`**） | 不占宽度、内核忽略 |
+ * | `Cc` 控制 | `\u0000`–`\u001f` | |
+ * | `Zs`/`Zl`/`Zp` 分隔 | 空格、NBSP、行/段分隔 | |
+ * | `Cs` 代理 | 落单的代理码元 | |
+ *
+ * ⚠️ **`\p{Mn}` 是第二轮才补上的**：`\u034f`（CGJ）在 Unicode 里是组合用附加符号，
+ * 不在 `Cf` 里 —— 只按 `Cf` 过滤会把它漏掉，而实测它同样能让内核绑全网卡。
  */
-const WILDCARD_HOSTS = new Set([
-  '0.0.0.0',        // IPv4 全部网卡
-  '[::]',           // IPv6 全部网卡（`::` / `0::` / 全零展开都规范化到这里）
-  '[::ffff:0:0]',   // IPv4-mapped 全部网卡（`::ffff:0.0.0.0` 也是它）
-])
+const INVISIBLE = /[\p{Cf}\p{Cc}\p{Cs}\p{Mn}\p{Me}\p{Zs}\p{Zl}\p{Zp}]/gu
 
 /**
- * 剥掉 URL 记法的方括号。
+ * 归一化：把用户可能写的各种形态收敛成**判据可比较的裸地址**。
  *
- * `server.listen()` 收的是**裸地址**（`::1`），而浏览器地址栏给的是
- * `[::1]`。用户两种都可能写/粘贴，故入口统一剥、出口统一加
- * （见 {@link formatGatewayHost}）—— 两处都用同一个助手，避免两套判据。
+ * 四步（顺序有意义）：
  *
- * 幂等地容忍多层方括号：只剥掉**配对**的最外层。
+ * 1. **NFKC 归一化**：全角数字 `０.０.０.０` 是实测可绕的形态（类别过滤拦不住它，
+ *    因为它既不可见也不是控制符），NFKC 把它折成半角 `0.0.0.0`；
+ * 2. **剥掉全部不可见字符**（按 {@link INVISIBLE} 的类别）；
+ * 3. **剥方括号与 `:端口`**（含**空端口** `[::]:` —— 第二轮实测的独立成因：
+ *    原正则 `(?::\d+)?` 不匹配空端口 ⇒ 整串原样放行 ⇒ 内核照绑 `::`）；
+ * 4. **剥 zone id**（只对 IPv6 形态）。
+ *
+ * ⚠️ 这个函数**只给判据用**。交给 `listen()` 的形态走
+ * {@link stripHostBrackets}，它**保留 zone id** —— 见那里的注释。
+ */
+function normalizeHostForCompare(host: string): string {
+  let value = host.normalize('NFKC').replace(INVISIBLE, '')
+  // 剥方括号与端口。⚠️ `\d*`（不是 `\d+`）：`[::]:` 的空端口也要剥掉。
+  const bracketed = /^\[([^\]]*)\](?::\d*)?$/.exec(value)
+  if (bracketed !== null) {
+    value = bracketed[1]!
+  } else if (/^[^:]+:\d*$/.test(value)) {
+    // 裸 `host:port`（IPv4 / 主机名）。⚠️ 不能对裸 IPv6 用这条：`::1` 会被切成 `:`。
+    value = value.slice(0, value.lastIndexOf(':'))
+  }
+  // 幂等地剥掉可能残留的方括号（`[[::1]]`）。
+  while (value.startsWith('[') && value.endsWith(']') && value.length > 2) {
+    value = value.slice(1, -1)
+  }
+  // 只对 IPv6 形态剥 zone id（`%` 之后到串尾）。
+  if (value.includes(':')) {
+    const zone = value.indexOf('%')
+    if (zone > 0) value = value.slice(0, zone)
+  }
+  return value
+}
+
+/**
+ * 交给 `server.listen()` 的地址形态。
+ *
+ * ⚠️ 与 {@link normalizeHostForCompare} **必须分开**（第二轮审计实测的回归）：
+ * 判据需要剥 zone id（`::%eth0` 就是 `::` ⇒ 必须判为通配），但**交给 `listen()`
+ * 的串不能剥** —— Linux 上 `fe80::215:5dff:fe1c:fc88%eth0` **带 zone 能 bind**
+ * （scope id 生效），剥成裸地址后反而 `EINVAL(22)` 绑不上。把两者合成一个函数
+ * 会让「修好判据」与「弄坏 link-local」同时发生。
+ *
+ * 仍然要剥掉的是：不可见字符（它们绝不会是地址的一部分）、方括号、端口。
  */
 export function stripHostBrackets(host: string): string {
-  let value = host.trim()
+  let value = host.normalize('NFKC').replace(INVISIBLE, '')
+  const bracketed = /^\[([^\]]*)\](?::\d*)?$/.exec(value)
+  if (bracketed !== null) {
+    value = bracketed[1]!
+  } else if (/^[^:]+:\d*$/.test(value)) {
+    value = value.slice(0, value.lastIndexOf(':'))
+  }
   while (value.startsWith('[') && value.endsWith(']') && value.length > 2) {
-    value = value.slice(1, -1).trim()
+    value = value.slice(1, -1)
   }
   return value
 }
@@ -76,31 +120,171 @@ export function gatewayHttpUrl(host: string, port: number, suffix = ''): string 
 }
 
 /**
+ * 把 IPv6 字面量展开成 **8 组 16 位**（`::` 按 RFC 4291 补零）。
+ *
+ * ⚠️ 必须自己展开，**不能**靠 `new URL()` 规范化：它对 `::%eth0` / `::\u200b`
+ * 抛错，而 `catch` 放行就是本 issue 的高危假阴性（见 {@link stripHostBrackets}）。
+ * 返回 `undefined` 表示「不是合法 IPv6 字面量」—— 调用方据此**放行**
+ * （交给内核报错），而不是猜成通配。
+ */
+function expandIpv6(value: string): number[] | undefined {
+  const text = value.toLowerCase()
+  if (!/^[0-9a-f:.]+$/.test(text)) return undefined
+  const halves = text.split('::')
+  if (halves.length > 2) return undefined
+  const parse = (part: string): number[] | undefined => {
+    if (part === '') return []
+    const groups = part.split(':')
+    const out: number[] = []
+    for (let index = 0; index < groups.length; index++) {
+      const group = groups[index]!
+      // 尾组允许 IPv4 点分写法（`::ffff:127.0.0.1`）。
+      if (group.includes('.')) {
+        if (index !== groups.length - 1) return undefined
+        const octets = group.split('.')
+        if (octets.length !== 4) return undefined
+        const nums = octets.map((octet) => (/^\d{1,3}$/.test(octet) ? Number(octet) : Number.NaN))
+        if (nums.some((num) => !Number.isInteger(num) || num < 0 || num > 255)) return undefined
+        out.push((nums[0]! << 8) | nums[1]!, (nums[2]! << 8) | nums[3]!)
+        continue
+      }
+      if (!/^[0-9a-f]{1,4}$/.test(group)) return undefined
+      out.push(Number.parseInt(group, 16))
+    }
+    return out
+  }
+  const head = parse(halves[0]!)
+  if (head === undefined) return undefined
+  if (halves.length === 1) return head.length === 8 ? head : undefined
+  const tail = parse(halves[1]!)
+  if (tail === undefined) return undefined
+  const missing = 8 - head.length - tail.length
+  if (missing < 1) return undefined
+  return [...head, ...Array.from({ length: missing }, () => 0), ...tail]
+}
+
+/**
+ * IPv4 解析，**兼容 `inet_aton` 的历史写法**。
+ *
+ * ⚠️ 为什么必须兼容，而不是只认点分四段：Linux 的 `inet_aton`（glibc）接受
+ * 单段（`2130706433`）、两段（`127.1`）、三段、十六进制段（`0x0`）、八进制段
+ * （`0177.0.0.1`）与尾随点（`0.0.0.0.`）。这些写法在**容器（Linux）**上会被
+ * 解析成真实地址 —— 其中 `0` / `0x0` / `00.0.0.0` 全是 `0.0.0.0`（通配）。
+ *
+ * ⚠️ 初版把归一化交给 `new URL()`，恰好把这些紧凑写法规范化成了 `0.0.0.0`
+ * 并拒掉；若换成「只认点分四段」的实现，反而会**放宽**成放行 —— 那是一次
+ * 严格性回退（独立审计的穷举用例会先变红）。
+ *
+ * 返回 `undefined` 表示「不是 IPv4 字面量」（主机名、畸形串）⇒ 调用方放行。
+ */
+function parseIpv4(value: string): number | undefined {
+  const text = value.endsWith('.') ? value.slice(0, -1) : value
+  const parts = text.split('.')
+  if (parts.length === 0 || parts.length > 4) return undefined
+  const nums: number[] = []
+  for (const part of parts) {
+    if (part === '') return undefined
+    let num: number
+    if (/^0[xX][0-9a-fA-F]+$/.test(part)) {
+      num = Number.parseInt(part.slice(2), 16)
+    } else if (/^0[0-7]+$/.test(part)) {
+      // ⚠️ 八进制只在**有前导 0 且后面全是 0-7** 时成立（`08` 不是八进制）。
+      num = Number.parseInt(part.slice(1), 8)
+    } else if (/^\d+$/.test(part)) {
+      num = Number(part)
+    } else {
+      return undefined
+    }
+    if (!Number.isSafeInteger(num) || num < 0) return undefined
+    nums.push(num)
+  }
+  // `inet_aton` 的段数语义：最后一段占满剩余的字节数。
+  const last = nums[nums.length - 1]!
+  const limit = 256 ** (4 - nums.length + 1)
+  if (last >= limit) return undefined
+  for (const num of nums.slice(0, -1)) if (num > 255) return undefined
+  let result = 0
+  for (const num of nums.slice(0, -1)) result = (result << 8) | num
+  // 单段时 `4 - 1 + 1 = 4` ⇒ `last` 占满 32 位。
+  return ((result * limit) + last) >>> 0
+}
+
+/**
  * 是否等价于「绑定所有网卡」的通配地址。
  *
- * ⚠️ 不能改成 `net.isIP(host) === 0 ⇒ 放行`：`[::]` / `0` / `0x0` 的
- * `net.isIP()` 都是 0，会静默从判据里漏掉（实测：`0` 与 `0x0` 在 Linux 上
- * 就是 `0.0.0.0`）。
+ * ⚠️⚠️ **判据不得依赖 `new URL()` 的宽容度**（初版就是，被两轮审计实测证伪）：
+ * 它对含 `%`（zone id）、不可见字符、`host:port` 的输入会**抛错**，而 `catch`
+ * 里 `return false`（放行）会让这些写法静默绑上全部网卡。故这里：
+ *
+ * 1. 先用 {@link normalizeHostForCompare} 把地址摘干净
+ *    （NFKC + Unicode 类别剥不可见字符 + 端口 + **zone id**）；
+ * 2. IPv4 走 {@link parseIpv4}（含 `inet_aton` 紧凑写法）判「是否为 0」；
+ * 3. IPv6 走 {@link expandIpv6} 展开成 8 组后判「是否全零」，
+ *    IPv4-mapped（`::ffff:0.0.0.0`）也据此判为通配（它绑全部 IPv4 网卡）。
+ *
+ * 解析不出来的形态**一律放行**（交给内核报 `ENOTFOUND` / `EADDRNOTAVAIL`）：
+ * 猜成通配会把用户确实想用的主机名（容器服务名等）挡在启动之外，而那种误伤
+ * 没有内核报错兜底（用户只会看到「不允许」却不知道自己写错了什么）。
+ * ⚠️ 但**「放行」的前提是归一化已经把不可见字符摘干净** —— 否则漏一个 `Cf`
+ * 就等于漏一条通往全网卡的路径（第二轮审计实测 25 条）。
  */
 export function isWildcardHost(host: string): boolean {
-  const value = stripHostBrackets(host)
+  const value = normalizeHostForCompare(host)
   if (value === '') return true
-  // 带方括号的形态 URL 能直接解析；裸 IPv6 必须先括起来（否则被当成端口）。
-  try {
-    return WILDCARD_HOSTS.has(new URL(`http://${formatGatewayHost(value)}/`).hostname)
-  } catch {
-    // URL 也规范化不了 ⇒ 它连「是个地址」都不成立，绑定时内核会给出更准确的
-    // `ENOTFOUND` / `EADDRNOTAVAIL`。**不要在这里猜成通配** —— 猜错会把
-    // 一个用户确实想用的主机名（如容器内的服务名）挡在启动之外。
-    return false
+  if (!value.includes(':')) return parseIpv4(value) === 0
+  const groups = expandIpv6(value)
+  if (groups === undefined) return false
+  // 全零 ⇒ `::`（绑所有 IPv6 网卡，实测也覆盖 IPv4）。
+  if (groups.every((group) => group === 0)) return true
+  // `::ffff:0:0` / `::ffff:0.0.0.0` ⇒ 全部 IPv4 网卡。
+  const mapped = groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff
+  return mapped && groups[6] === 0 && groups[7] === 0
+}
+
+/**
+ * 是否只绑在本机回环上（供 UI 判断「安全声明该怎么说」）。
+ *
+ * ⚠️ **与 `isWildcardHost` 同源**：两者都走 {@link normalizeHostForCompare}。
+ * 初版客户端自己写了一套字面量正则（`/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/` +
+ * `=== '[::1]'`），于是 `127.1` / `0:0:0:0:0:0:0:1` / `::ffff:127.0.0.1` /
+ * `localhost` 这些**内核实测只在回环可达**的写法被判成「已对外暴露」——
+ * 面板因此输出它自己声称要消除的那种错误陈述（审计实测）。
+ *
+ * 判据：`127.0.0.0/8` 整个网段 + `::1` + IPv4-mapped 回环 + `localhost`。
+ * ⚠️ 主机名只认 `localhost`（不做 DNS）：其余主机名**未知即按「不只回环」**
+ * 处理（宁可多提示，不漏暴露风险）。
+ */
+export function isLoopbackHost(host: string): boolean {
+  const value = normalizeHostForCompare(host).toLowerCase()
+  if (value === '') return true
+  if (value === 'localhost' || value.endsWith('.localhost')) return true
+  if (!value.includes(':')) {
+    const ipv4 = parseIpv4(value)
+    if (ipv4 === undefined) return false
+    // `127.0.0.0/8`：Linux 实测绑 127.0.0.2 后 127.0.0.1 连不上、反之亦然 ——
+    // 同一网段里的不同回环地址，对外都不可达。
+    return ipv4 >>> 24 === 127
   }
+  const groups = expandIpv6(value)
+  if (groups === undefined) return false
+  // `::1`
+  if (groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1) return true
+  // `::ffff:127.0.0.0/8`（IPv4-mapped 回环）：
+  // `::ffff:127.0.0.1` → 组 6 = `0x7f00`、组 7 = `0x0001` ⇒ 高字节 127。
+  const mapped = groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff
+  return mapped && groups[6]! >>> 8 === 0x7f
 }
 
 /**
  * 解析监听地址。
  *
  * ⚠️ `server.listen()` 收到 `[::1]` 会得到一个必然 `EADDRNOTAVAIL` 的启动
- * 失败，故这里统一剥方括号，让用户按 URL 习惯粘贴也能用。
+ * 失败，故这里剥方括号，让用户按 URL 习惯粘贴也能用。
+ *
+ * ⚠️⚠️ **判据与返回值刻意走两个函数**：判据用 `isWildcardHost`（内部剥 zone id），
+ * 返回值用 {@link stripHostBrackets}（**保留 zone id**）。第二轮审计实测的回归：
+ * 合成一个函数会剥掉 `fe80::1%eth0` 的 zone ⇒ Linux 上 `bind` 反而 `EINVAL(22)`
+ * （带 zone 本来能绑成功）⇒ 用户再也绑不上 link-local 地址。
  *
  * ⚠️ **整体取舍：只做通配地址这一条判据，不做「这个地址在本机存不存在」的
  * 预检**。理由：那需要 DNS 查询（`localhost` / `host.docker.internal` /
@@ -110,9 +294,12 @@ export function isWildcardHost(host: string): boolean {
  * 改成 DNS 预检**。
  */
 function resolveHost(env: NodeJS.ProcessEnv): string {
-  const raw = env.DSH_OPENAI_GATEWAY_HOST?.trim()
-  if (raw === undefined || raw === '') return DEFAULT_GATEWAY_HOST
+  const raw = env.DSH_OPENAI_GATEWAY_HOST
+  if (raw === undefined || raw.trim() === '') return DEFAULT_GATEWAY_HOST
   const host = stripHostBrackets(raw)
+  // ⚠️ 归一化后为空（值只有空白或只有不可见字符）⇒ 回落默认。**绝不能把空串
+  // 交给 `listen()`**：那会被当成「绑全部网卡」，正是本判据要防的事。
+  if (host === '') return DEFAULT_GATEWAY_HOST
   if (isWildcardHost(host)) {
     // ⚠️ 报错要给出**做法**：只说「不允许」会让人去搜「怎么绕过这个校验」，
     // 而容器场景的正解（绑容器自己的接口地址）必须写在错误里。

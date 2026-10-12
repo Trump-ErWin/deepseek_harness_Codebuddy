@@ -115,4 +115,42 @@ describe('Issue IKL7UN：网关监听地址可配', () => {
     expect(logs.join('\n')).toContain(`已监听 ${gatewayHttpUrl('127.0.0.2', port, '/v1')}`)
     expect(gatewayHttpUrl('::1', 8326, '/v1')).toBe('http://[::1]:8326/v1')
   })
+
+  /**
+   * ★★ IPv6 host 的**内核绑定**覆盖（红队审计实测出的假绿空间）。
+   *
+   * ⚠️ 原先只有 IPv4（`127.0.0.2`）的真连断言。红队把 `listen()` 变异成
+   * `host.includes(':') ? '127.0.0.1' : host`（**IPv6 用户仍然连不上 = 缺陷保留**），
+   * 四个相关 spec **123 条全绿** —— 即新增的 IPv6 方括号处理当时只有纯函数断言。
+   *
+   * ⚠️ 判据同样带**阴性对照**：绑 `::1` 后必须 `::1` 可达、且 `127.0.0.1`
+   * 连不上（证明没有退化成「绑全部网卡」）。`::1` 在 Windows 与 Linux 上都是
+   * 默认存在的回环地址，故不需要额外环境假设。
+   */
+  it('★★ 绑 IPv6 host（::1）时该地址可达，且没有退化成绑全部网卡', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm, home: undefined, env: ENV('::1', port) })
+    started.push(gateway)
+    await gateway.start()
+
+    // `address()` 必须回传裸 IPv6（不是 `[::1]`）—— 它是 listen 的入参形态。
+    expect(gateway.address()).toEqual({ host: '::1', port })
+    expect(await probe('::1', port)).toBe('HTTP 401')
+    // 阴性对照：绑 ::1 时 IPv4 回环连不上（若实现改成绑全部网卡，这条会变 401）。
+    expect(await probe('127.0.0.1', port)).toBe('ECONNREFUSED')
+  })
+
+  /**
+   * ⚠️ 带方括号的 IPv6（用户从浏览器地址栏复制的形态）必须与裸形态等价。
+   * 直接把它交给 `listen()` 会得到必然的 `EADDRNOTAVAIL`。
+   */
+  it('★ 带方括号的 [::1] 等价于 ::1（否则复制粘贴必失败）', async () => {
+    const port = await freePort()
+    const gateway = createOpenAiGateway({ llm, home: undefined, env: ENV('[::1]', port) })
+    started.push(gateway)
+    await gateway.start()
+
+    expect(gateway.address()).toEqual({ host: '::1', port })
+    expect(await probe('::1', port)).toBe('HTTP 401')
+  })
 })

@@ -54,12 +54,15 @@
 // ⚠️ 搜索判据与模型清单**共用同一份实现**（`model-filter.js`）：两处各写一套
 // 「空搜索词算命中全部」之类的约定，迟早漂移成「同一句话在两张表里搜出不同结果」。
 import { isFilterActive, matchesModelQuery } from './model-filter.js';
-// ⚠️ host 的方括号处理**必须与宿主侧同源**（`src/openai-gateway/config.ts` 的
-// `formatGatewayHost` / `stripHostBrackets`）。前端若自己写一遍 `includes(':')`，
-// 两处判据迟早漂移，症状是「面板上的地址与日志里的地址不一致」——
-// 而地址是用户要抄走的东西，不一致等于失效。
+// ⚠️⚠️ host 的归一化与「是否只绑回环」**必须与宿主侧同源**
+// （`src/openai-gateway/config.ts` 的 `formatGatewayHost` / `isLoopbackHost`）。
+// 初版前端自己写了 `/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/` + `=== '[::1]'`，而
+// 宿主侧走的是 URL 规范化 —— 两套判据立刻漂移：`127.1` / `0:0:0:0:0:0:0:1` /
+// `::ffff:127.0.0.1` / `localhost` 这些**内核实测只在回环可达**的写法被判成
+// 「已对外暴露」，面板于是输出它自己声称要消除的那种**错误安全陈述**
+// （两轮独立审计各自实测到，2026-10-13）。
 // ⚠️ 该模块必须**零 node import**（它同时被 esbuild 打进浏览器 bundle）。
-import { formatGatewayHost, gatewayHttpUrl } from '../../src/openai-gateway/config.js';
+import { formatGatewayHost, gatewayHttpUrl, isLoopbackHost } from '../../src/openai-gateway/config.js';
 
 export async function copyToClipboard(value) {
   try {
@@ -611,14 +614,15 @@ export function gatewayEndpoint(status) {
 /**
  * 网关是否只绑在本机回环上。
  *
- * ⚠️ 这条判据存在的原因是**文案不能说谎**：设置页里有「网关只绑定 127.0.0.1」
- * 这样的安全声明（原为常量文案）。host 一旦可配（issue IKL7UN），那句声明在
- * 用户绑了桥接 IP 之后就是**错误陈述**，会让人误以为「外部连不上是正常的」
- * 而把真实故障排查方向带偏。
+ * ⚠️⚠️ **判据直接复用宿主侧实现**（`src/openai-gateway/config.ts` 的
+ * `isLoopbackHost`），**不要**在客户端另写一套正则。初版就是自己写的
+ * `/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/` + `=== '[::1]'`，于是
+ * `127.1` / `0:0:0:0:0:0:0:1` / `::ffff:127.0.0.1` / `localhost` 这些
+ * **内核实测只在回环可达**的写法被判成「已对外暴露」，面板会输出它自己声称
+ * 要消除的那种**错误安全陈述**（两轮独立审计各自实测到）。
  *
- * 判据只看地址字面量，不做 DNS —— 与宿主侧 `isWildcardHost` 同样的取舍
- * （见 `src/openai-gateway/config.ts`）：`localhost` 这类主机名由内核解析，
- * 前端不猜。**未知即按「不是纯回环」处理**（提示更保守，不会漏掉暴露风险）。
+ * 取舍与宿主侧一致：主机名只认 `localhost`，其余**未知即按「不只回环」**
+ * 处理（宁可多提示，不漏暴露风险）。
  *
  * @param {GatewayStatus | null | undefined} status
  * @returns {boolean}
@@ -626,11 +630,7 @@ export function gatewayEndpoint(status) {
 export function gatewayLoopbackOnly(status) {
   const host = status?.address?.host;
   if (typeof host !== 'string' || host.trim() === '') return true;
-  const value = formatGatewayHost(host).toLowerCase();
-  // `127.0.0.0/8` 整个网段都是回环（Linux 实测：绑 127.0.0.2 后 127.0.0.1 连不上，
-  // 反之亦然 —— 它是**同一网段里的不同回环地址**，对外都不可达）。
-  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(value)) return true;
-  return value === '[::1]';
+  return isLoopbackHost(host);
 }
 
 /**
@@ -646,8 +646,17 @@ export function gatewayLoopbackOnly(status) {
  * - 「已绑对外地址」却不说 ⇒ 用户以为「同机隔离仍然成立」，把网关配进
  *   浏览器端工具或扩展（面板脚注里点名警告的正是这件事）。
  *
+ * ⚠️ **必须点名「宿主」**：容器化部署下经端口映射可达的**不止同网络容器**，
+ * 宿主本身也在暴露面内（红队用 network namespace + bridge 实测：同 bridge
+ * 的另一个容器与宿主都能连到，跨 bridge 网络才被隔离）。只说「同网络」会把
+ * 宿主漏掉，而宿主恰恰是用户最可能低估的那一端。
+ *
  * ⚠️ 必须同时给出**怎么改回去**：只说「暴露面变大了」会让用户卡在
  * 「那我该填什么」上，而他填的就是本 issue 的正解（容器自身 IP）。
+ *
+ * ⚠️ **纯文本，不得出现 `**`**：这些文案渲染进 React 文本节点，markdown 的
+ * `**加粗**` 会**原样显示星号**（本仓库已有同型事故，见 `clineExhaustedAdvice`
+ * 的三条规矩）。有用例 `not.toContain('**')` 守着。
  *
  * @param {GatewayStatus} status 必定带 address（调用方已判过 running）
  * @returns {string}
@@ -656,8 +665,8 @@ export function nonLoopbackNotice(status) {
   const address = status?.address;
   const host = typeof address?.host === 'string' && address.host.trim() !== '' ? address.host : '非回环地址';
   return `监听地址是 ${host}（不再是本机回环）：只应在容器/端口映射场景使用，`
-    + '此时同网络的其它主机也能连到这个端口。仅本机使用时把 DSH_OPENAI_GATEWAY_HOST '
-    + '改回 127.0.0.1（或删除该环境变量）并重启。';
+    + '此时同一容器网络内的其它容器与宿主都能连到这个端口。仅本机使用时把 '
+    + 'DSH_OPENAI_GATEWAY_HOST 改回 127.0.0.1（或删除该环境变量）并重启。';
 }
 
 /**
@@ -675,13 +684,16 @@ export function nonLoopbackNotice(status) {
  * ⚠️ 回环分支必须**逐字节保留**原文案：它是用户 2026-10-04 定下的措辞，
  * 且该分支覆盖绝大多数（非容器）部署 —— 改它等于无故改动既有 UI 文案。
  *
+ * ⚠️ 非回环分支**必须点名宿主**（红队 netns 实测宿主可达），且**不得出现
+ * `**`**（会原样显示星号，见 {@link nonLoopbackNotice} 的同条理由）。
+ *
  * @param {GatewayStatus | null | undefined} status
  * @returns {string}
  */
 export function gatewayFootnote(status) {
   if (status?.running && !gatewayLoopbackOnly(status)) {
     const host = typeof status.address?.host === 'string' ? status.address.host : '非回环地址';
-    return `网关绑定在 ${host}，同网络（含同机）的其它主机都能连到该端口 —— 隔离**只**靠密钥，`
+    return `网关绑定在 ${host}，同一容器网络内的其它容器与宿主都能连到该端口 —— 隔离只靠密钥，`
       + '不要把它配置进任何浏览器端工具或扩展。仅本机使用时把 DSH_OPENAI_GATEWAY_HOST '
       + '改回 127.0.0.1（或删除该环境变量）并重启。';
   }

@@ -1,9 +1,29 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer, request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mountOpenAiGateway } from '../../src/openai-gateway/index.js'
 import { disposeGatewayRuntime } from '../../src/openai-gateway/runtime.js'
+
+/**
+ * 从指定 host 连一次，返回状态码或错误码。
+ *
+ * ⚠️ 存在的理由：`gatewayAddress()` 只回传**配置字符串**，它证明不了内核真的
+ * 绑在那张网卡上（独立审计 M6 实测：`listen()` 写死 `127.0.0.1` 时，
+ * 只断言 `address()` 的用例照样全绿）。只有真实 HTTP 往返能锁住绑定面。
+ */
+function probeHost(host: string, port: number): Promise<string> {
+  return new Promise((resolve) => {
+    const req = request({ host, port, path: '/v1/models', method: 'GET', timeout: 2000 }, (res) => {
+      res.resume()
+      resolve(`HTTP ${res.statusCode ?? 0}`)
+    })
+    req.on('error', (error: NodeJS.ErrnoException) => resolve(error.code ?? error.message))
+    req.on('timeout', () => { req.destroy(); resolve('timeout') })
+    req.end()
+  })
+}
 
 /**
  * 网关的插件接线（`src/index.ts` 的 `mountOpenAiGateway(ctx)` 一行）的回归锁。
@@ -90,6 +110,25 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 10; i++) await Promise.resolve()
 }
 
+/**
+ * 在 `127.0.0.1` 上挑一个当前空闲的端口。
+ *
+ * ⚠️ 存在的理由：本文件的阴性对照要断言「`127.0.0.1:PORT` 连不上」，而
+ * 并发跑的其它测试进程可能正好占着默认端口 8326 ⇒ 那条断言会拿到 401 而
+ * **假失败**（实测在并发跑全量套件时踩到）。显式挑空闲端口即可消除这个耦合。
+ */
+async function freePort(): Promise<number> {
+  const server = createServer()
+  return new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      const port = typeof address === 'object' && address !== null ? address.port : 0
+      server.close(() => resolve(port))
+    })
+  })
+}
+
 describe('网关的插件接线', () => {
   it('端口环境变量非法时不得把异常抛回插件 apply()', async () => {
     const { ctx, logs } = makeContext()
@@ -160,12 +199,26 @@ describe('网关的插件接线', () => {
    * `createOpenAiGateway()`（验证 server 用了 host），这里走**插件真实入口**
    * `mountOpenAiGateway()` + 模块级 runtime 单例（验证 env → 配置 → 工厂 → start
    * 这条链没断）。少了这一层，「工厂里把 host 丢掉」这种改动不会被发现。
+   *
+   * ⚠️⚠️ **`gatewayAddress()` 的断言是弱判据**（独立审计 M6/M7 实测）：它返回的是
+   * `config.host` 这个**字符串**，不是内核实际绑定的地址。把 `server.listen()`
+   * 改回写死 `'127.0.0.1'`（即把缺陷原样放回去）时，下面那条 `address()` 断言
+   * **照样通过** —— 因为配置字符串仍然是对的。
+   * ⇒ 故这里**必须再做一次真连**：从 127.0.0.2 连得上、且 127.0.0.1 连不上。
+   * 光靠 `address()` 会给人虚假的安全感（这条用例的「★」标记曾经就名不副实）。
    */
-  it('★ DSH_OPENAI_GATEWAY_HOST 经插件入口生效，且反映在 gatewayAddress() 上', async () => {
+  it('★ DSH_OPENAI_GATEWAY_HOST 经插件入口生效（含真实连通性，不只是配置字符串）', async () => {
     const { ctx } = makeContext()
     // 127.0.0.2 是 Linux/macOS/Windows 上都存在的另一个回环地址（实测可绑），
     // 用它就不必占用真实网卡，也不会与「只绑 127.0.0.1」的实现混淆。
     process.env.DSH_OPENAI_GATEWAY_HOST = '127.0.0.2'
+    // ⚠️ **必须显式挑一个在 127.0.0.1 上空闲的端口**，不能用默认 8326：
+    // 下面的阴性对照要断言「127.0.0.1 连不上」，而 `127.0.0.2:PORT` 的绑定
+    // **不保留** `127.0.0.1:PORT`（不同地址、互不冲突）。若端口恰好被别的进程
+    // 或**并发跑的另一个测试进程**占用在 127.0.0.1 上，阴性对照就会拿到 401
+    // 而不是 ECONNREFUSED —— 实测在并发跑全量套件时假失败过。
+    const port = await freePort()
+    process.env.DSH_OPENAI_GATEWAY_PORT = String(port)
 
     mountOpenAiGateway(ctx)
     await settle()
@@ -173,8 +226,12 @@ describe('网关的插件接线', () => {
     const { isGatewayRunning, gatewayAddress } = await import('../../src/openai-gateway/runtime.js')
     expect(isGatewayRunning()).toBe(true)
     expect(gatewayAddress()?.host).toBe('127.0.0.2')
-    // 端口是 OS 分配的（未指定 PORT），只锁它是个合法端口号。
-    expect(gatewayAddress()?.port).toBeGreaterThan(0)
+    expect(gatewayAddress()?.port).toBe(port)
+
+    // ⚠️ 物理判据：真的绑在 127.0.0.2 上（401 = HTTP 往返成功、未带 key）。
+    expect(await probeHost('127.0.0.2', port)).toBe('HTTP 401')
+    // 阴性对照：写死 127.0.0.1 的实现会让这条变成 HTTP 401。
+    expect(await probeHost('127.0.0.1', port)).toBe('ECONNREFUSED')
   })
 
   it('★ 非法 host（通配地址）只降级为日志，绝不抛回 apply()', async () => {
