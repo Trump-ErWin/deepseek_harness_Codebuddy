@@ -1000,6 +1000,82 @@ export function stripCourseLeakIfEnabled(text: string): string {
   return isCourseLeakStripEnabled() ? stripCourseLeak(text) : text
 }
 
+// ────────────────────────── DSML 标记归一化 ──────────────────────────
+
+/**
+ * 对**完整字符串**做 DSML 工具调用标记归一化（幂等）。
+ *
+ * ## 为什么需要（2026-10-13 实测）
+ *
+ * DSH 的工具调用协议是模型写在正文里的文本标记（`<｜DSML｜invoke …>`，
+ * 竖线是 U+FF5C 全角竖线）。部分模型（实测 deepseek-v4.1-flash 经 OfficeAce
+ * MaaS、step-5-preview 经 CodeBuddy）会把它**写坏成双竖线** `<｜｜DSML｜｜` ——
+ * 宿主解析器不认，工具调用整段当正文显示，模型「停住不动」。
+ *
+ * 这是**分词器保真度**问题：全角双竖线常被合并成单个 token，模型难以精确
+ * 复现单根。适配器是唯一能在「进入宿主解析器之前」修正的层级。
+ *
+ * 规则（逐条对应实测的坏形态，幂等 —— 归一化后的文本再过一遍不变）：
+ * 1. `<｜{2,}DSML` → `<｜DSML`（开/闭标签左侧双竖线；`\/?` 兼容闭标签）
+ * 2. `DSML｜{2,}` → `DSML｜`（右侧双竖线）
+ */
+export function fixDsmlMarkers(text: string): string {
+  return text
+    .replace(/(<\/?)｜{2,}DSML/g, '$1｜DSML')
+    .replace(/DSML｜{2,}/g, 'DSML｜')
+}
+
+/**
+ * {@link fixDsmlMarkers} 的**流式安全**版本。
+ *
+ * ## 为什么不能逐帧直接 `replace`
+ *
+ * 标记会被上游切成任意片段（`<｜` + `｜DSML｜` + `｜invoke…`），逐帧 replace
+ * 每帧都只见半截模式 —— 与 think 标签逐帧漏判是同一类坑（本文件上方
+ * `splitThinkTaggedContent` 的注释记录过实测：二分帧 7/11 种切法漏判）。
+ * 故这里持有**待定缓冲**：凡是可能构成模式前缀的尾部都扣住不发，等下一帧
+ * 拼齐再判。
+ *
+ * 代价：文本恰好以 `<`、`<｜`、`DSML｜` 等结尾时，最后几个字符会延迟到
+ * 下一帧（或 `flush()`）—— 对流式 UI 只是几字符的延迟，无正确性影响。
+ */
+export function createDsmlMarkerNormalizer() {
+  /** 待定缓冲（可能构成模式前缀的尾部）。 */
+  let pending = ''
+  /** 这些模式的**真前缀**都可能还差后续输入才算得清，必须扣住。 */
+  const PREFIX_PATTERNS = ['<｜｜DSML', '</｜｜DSML', 'DSML｜｜']
+  /** 最长模式长度（决定扣住窗口上限）。 */
+  const MAX_PENDING = 9
+
+  /** 计算应扣住的尾部长度（最长匹配优先）。 */
+  function holdBackLen(s: string): number {
+    const max = Math.min(s.length, MAX_PENDING)
+    for (let len = max; len >= 1; len--) {
+      const tail = s.slice(-len)
+      if (PREFIX_PATTERNS.some((p) => p.startsWith(tail))) return len
+    }
+    return 0
+  }
+
+  return {
+    /** 喂入一帧文本，返回可安全下发的部分（可能为空串）。 */
+    push(text: string): string {
+      pending += text
+      const fixed = fixDsmlMarkers(pending)
+      const hold = holdBackLen(fixed)
+      const out = hold > 0 ? fixed.slice(0, fixed.length - hold) : fixed
+      pending = hold > 0 ? fixed.slice(fixed.length - hold) : ''
+      return out
+    },
+    /** 流结束：下发全部剩余（再做一次完整归一化兜底）。 */
+    flush(): string {
+      const out = fixDsmlMarkers(pending)
+      pending = ''
+      return out
+    },
+  }
+}
+
 /**
  * 清洗**历史消息**里已持久化的行首泄漏；**供各适配器的序列化前调用**。
  *
