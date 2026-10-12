@@ -267,6 +267,43 @@ export class ClineAdapter extends LlmAdapter {
    * （30 秒一轮，不会打风暴）。
    */
   private remoteComplete = false
+  /**
+   * 兜底目录的**记忆化**结果（issue IKL3YH）。
+   *
+   * ⚠️ 不是为了省那点构造开销，而是为了**数组身份稳定**：下面的
+   * `entriesCache` / `catalogIndexCache` 都以「来源数组的 `===`」为失效判据，
+   * 若 `fallbackCatalog()` 每次返回新数组，离线路径会**每调用一次就重建一份**
+   * 缓存（先是白建，接着被下一次覆盖）—— 缓存等于没有，且**症状静默**。
+   *
+   * 它的取值只来自 `this.product.fallbackModels`（静态产品配置），故记忆化安全。
+   */
+  private fallbackModelsCache: ClineModel[] | undefined
+  /**
+   * 已构建好的 `CatalogEntry[]`，按**来源数组身份**失效（issue IKL3YH）。
+   *
+   * ⚠️⚠️ 这是本次性能缺陷的**主因**修复点。DSH 的 `buildModelCatalog` 形状是
+   * 「1 次 `listModels` + **每模型一次** `resolveModelInfo`」，而 `dsh-llm` 的
+   * `resolveModelInfo` 会**直连适配器、不做任何缓存**。共享骨架
+   * `model-catalog.ts` 的 `resolveModel` 每次都 `await config.loadCatalog()`
+   * ⇒ 整份目录被重建 N 次，叠加每个条目的模态查找就是 O(N²)。
+   *
+   * 实测（本仓产物，N=471 的宿主调用形状）：原实现 **293 ms/次**；
+   * 只修模态查找是 121 ms；**再补上本缓存是 1.2 ms**。
+   *
+   * 失效判据用**身份**而不是长度：`ensureRemoteModels` 每次补齐都赋一个
+   * **新数组**（`this.remoteModels = merged`），故「补齐 / 登录后重拉」都能
+   * 自然失效；用长度会在「换了模型但条数相同」时读到陈旧目录。
+   */
+  private entriesCache: { source: readonly ClineModel[]; entries: readonly CatalogEntry[] } | undefined
+  /**
+   * `模型 id → 条目` 的 O(1) 索引，同样按来源数组身份失效。
+   *
+   * ⚠️ 只服务 `stream()` 的门禁（`inputModalitiesFor`）。`toCatalogEntry`
+   * **不再走它** —— 它手上就有条目本体，直接读字段即可（见 `toCatalogEntry`）。
+   */
+  private catalogIndexCache:
+    | { source: readonly ClineModel[]; index: Map<string, ClineModel> }
+    | undefined
     /**
    * models.dev 目录（`模型 id → 条目`，含名字/窗口/图片能力）。
    *
@@ -358,8 +395,29 @@ export class ClineAdapter extends LlmAdapter {
    * —— 注意这与「明确读到不支持」是两回事，但外部行为一致。
    */
   private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
-    const entry = this.remoteModels?.find((candidate) => candidate.id === model)
-    return entry?.supportsImage === true ? ['text', 'image'] : ['text']
+    const source = this.remoteModels ?? this.fallbackCatalog()
+    return this.catalogIndexFor(source).get(model)?.supportsImage === true
+      ? ['text', 'image']
+      : ['text']
+  }
+
+  /**
+   * 取（或建）`模型 id → 条目` 的 O(1) 索引，按来源数组身份失效。
+   *
+   * ⚠️ **原实现在这里做的是 `remoteModels.find(...)`**（issue IKL3YH 的热点）：
+   * 每个模型一次全表线性扫描 ⇒ 整表 O(N²)。实测该形态**全仓只有这一处**
+   * （其余家是 `remoteMeta.get()` / `fallbackIndex.get()` 或直接吃已解析的条目）。
+   *
+   * ⚠️ 判据必须是「来源数组身份变了」而**不是**「长度变了」：目录补齐会换上
+   * 一个条数可能相同的新数组，只看长度会读到陈旧索引。
+   */
+  private catalogIndexFor(source: readonly ClineModel[]): Map<string, ClineModel> {
+    if (this.catalogIndexCache !== undefined && this.catalogIndexCache.source === source) {
+      return this.catalogIndexCache.index
+    }
+    const index = new Map(source.map((model) => [model.id, model]))
+    this.catalogIndexCache = { source, index }
+    return index
   }
 
   /**
@@ -478,7 +536,11 @@ export class ClineAdapter extends LlmAdapter {
 
   /** 兜底目录（远端不可用时的静态表，含 5 个免费模型）。 */
   private fallbackCatalog(): ClineModel[] {
-    return this.product.fallbackModels.map((model) => ({
+    // ⚠️ 记忆化：`entriesCache` / `catalogIndexCache` 都以来源数组的 `===` 为
+    // 失效判据，若这里每次返回新数组，离线路径会每调用一次就白建一份缓存
+    // （见 `fallbackModelsCache` 的说明）。
+    if (this.fallbackModelsCache !== undefined) return this.fallbackModelsCache
+    this.fallbackModelsCache = this.product.fallbackModels.map((model) => ({
       id: model.id,
       name: model.name,
       isFree: model.isFree === true,
@@ -487,6 +549,7 @@ export class ClineAdapter extends LlmAdapter {
       ...model.supportsImage === undefined ? {} : { supportsImage: model.supportsImage },
       ...model.description === undefined ? {} : { description: model.description },
     }))
+    return this.fallbackModelsCache
   }
 
   /**
@@ -520,6 +583,14 @@ export class ClineAdapter extends LlmAdapter {
    * 3. `maxTokens` 过 `clampClineMaxTokens`（**必须声明**，否则上限永久退回网关默认）。
    * 4. `reasoning` 对**所有**模型统一声明（远端不下发档位，见产品配置注释）——
    *    这是 composer 里「思考强度」选择器的唯一入口。
+   *
+   * ⚠️⚠️ **`inputModalities` 直接读条目自己的 `supportsImage`**（issue IKL3YH）。
+   * 原实现是 `this.inputModalitiesFor(model.id)`，即拿 id 回 `remoteModels` 里
+   * **全表线性查找**一次 —— 而这里手上**就是那条条目**，查找纯属多余，且
+   * 整表累积成 O(N²)。更糟的是它**掩盖了一个真缺陷**：搜索源只有
+   * `remoteModels`，离线 / 首拉失败时它是 `undefined` ⇒ 兜底表里
+   * `supportsImage: true` 的策划条目（`stealth/space-bunny-alpha` 等）
+   * 被误报成**纯文本**，DSH 于是把图片静默投影成占位符。
    */
   private toCatalogEntry(model: ClineModel): CatalogEntry {
     const maxTokens = clampClineMaxTokens(model.maxTokens)
@@ -532,7 +603,8 @@ export class ClineAdapter extends LlmAdapter {
       // 标记只属于「选择列表」语境；会话记录里带上它会污染历史展示。
       bareName: model.name,
       ...model.description === undefined ? {} : { description: model.description },
-      inputModalities: this.inputModalitiesFor(model.id),
+      // ⚠️ 直接读字段，**不要**回头查索引（见方法注释：那是 O(N²) + 离线误报）。
+      inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
       ...model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {},
       ...maxTokens !== undefined ? { maxTokens } : {},
       isFree: model.isFree,
@@ -546,8 +618,24 @@ export class ClineAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * 把一份来源目录转成 `CatalogEntry[]`，**按来源数组身份缓存**（issue IKL3YH）。
+   *
+   * ⚠️ 必须缓存：`resolveModel` 会**每个模型**调用一次 `loadCatalog`，
+   * 而 DSH 的 `buildModelCatalog` 恰好是「1 次 `listModels` + 每模型一次
+   * `resolveModelInfo`」，且 `dsh-llm` 的 `resolveModelInfo` **不做缓存**。
+   * 不缓存就是 N² 次条目构造 —— 实测 N=471 时 293 ms/次 对 1.2 ms/次。
+   *
+   * ⚠️ 失效判据用**身份**（`ensureRemoteModels` 每次落目录都赋新数组）
+   * 而不是长度：补齐后的目录条数可能不变，只看长度会读到陈旧条目。
+   */
   private catalogEntries(source: readonly ClineModel[]): readonly CatalogEntry[] {
-    return source.map((model) => this.toCatalogEntry(model))
+    if (this.entriesCache !== undefined && this.entriesCache.source === source) {
+      return this.entriesCache.entries
+    }
+    const entries = source.map((model) => this.toCatalogEntry(model))
+    this.entriesCache = { source, entries }
+    return entries
   }
 
   private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {

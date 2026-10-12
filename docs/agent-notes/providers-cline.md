@@ -1904,3 +1904,80 @@ empty / 列表四个分支**全部**在 modalBody 里，只有 modalHead / modal
 
 顺带吸收参考实现的既有经验：时间列**定宽 82px**（防时间戳被截断）、
 模型名 `word-break: break-word`（长模型名不撑宽表格）。
+
+### ⚠️⚠️ 模型目录构建的 O(N²)：`remoteModels.find` 热点 + `resolveModel` 每次整份重建（issue IKL3YH）
+
+**用户报障**（Windows，DSH 桌面版）：宿主进程风扇周期性狂转 —— 每 ~15 秒被唤醒一次、
+持续 ~7 秒、峰值 1.1–1.5 核；Node inspector 函数级剖析的热点落在
+`toCatalogEntry → inputModalitiesFor`。用户自己做的 A/B 是「把 `.find` 换成 Map 索引后
+宿主 CPU 从 0.425 核降到 0.160 核」。
+
+**根因有两层，第二层才是主因**（用户只诊断出第一层）：
+
+1. `inputModalitiesFor` 对**每个**模型做一次 `this.remoteModels?.find(...)`。
+   实测**全仓该形态只有这一处** —— 其余家都是 `remoteMeta.get()` /
+   `fallbackIndex.get()` 或直接吃已解析的 entry。
+2. `resolveModel` 每次都 `await config.loadCatalog()` **整份重建** `CatalogEntry[]`。
+   DSH 的 `buildModelCatalog` 形状是「1 次 `listModels` + **每模型一次**
+   `resolveModelInfo`」（`dsh-api-session-controller` 的 `catalog.js`），而
+   `dsh-llm` 的 `resolveModelInfo` **直连适配器、不做任何缓存**
+   （`normalizeModelInfo` 只是校验）⇒ N 次调用造成 N² 次条目构造。
+
+实测（本仓 `lib/` 产物，宿主调用形状，3 轮中位数，N=471 的真实目录量级）：
+
+| 实现 | N=100 | N=471 | N=1000 |
+|---|---|---|---|
+| 修复前 | 13.6 ms | **312.6 ms** | **5498.7 ms** |
+| 修复后 | 0.5 ms | **1.5 ms** | **5.4 ms** |
+
+计数实验（N=471，一次宿主调用形状）：`inputModalitiesFor` 被调 **221,841** 次
+（= 471×471），`CatalogEntry[]` 被整份重建 **471** 次、每次 471 条。
+
+**同一处还掩盖着一个潜伏缺陷**：`inputModalitiesFor` 的搜索源只有 `remoteModels`，
+离线 / 首拉失败时它是 `undefined` ⇒ 兜底表里 `supportsImage: true` 的策划条目
+（`stealth/space-bunny-alpha`、`cline-free/mimo-v2.6-flash`、
+`cline-free/muse-spark-1.3-contributor`）被误报成**纯文本**（实测确认）。
+后果不是「少个功能」而是「支持图片的模型发不了图」—— DSH 见到不含 `image` 的
+声明会**静默把图片投影成文本占位符**，正是本文件 §「图片能力只查本地兜底表」
+记过的同型缺陷。
+
+**修法三条**（都在 `src/cline-adapter.ts`）：
+
+1. `toCatalogEntry(model)` **直接读 `model.supportsImage`** —— 手上就是那条条目，
+   回头拿 id 查表纯属多余。这同时修好了离线误报（兜底条目自己带该字段）。
+2. `catalogIndexFor(source)`：`stream()` 门禁用的 `id → 条目` Map 索引，**按来源数组
+   身份失效**（`.get()` 是 O(1)：221,841 次查找不再各扫 471 条）。
+3. `catalogEntries(source)`：按来源数组身份缓存 `CatalogEntry[]`。
+   ⚠️ **这一条是主因修复点**，别只做前两条（只做前两条仍留 121 ms/次）。
+
+**⚠️ 三个实现约束（各自都有反向验证）**：
+
+- **失效判据必须是「来源数组身份变了」，不能是「长度变了」**。目录补齐换的是
+  新数组，条数可能完全相同（用户改某个模型的图片能力、或换掉同数量的条目）
+  ⇒ 按长度判会一直用陈旧索引，**永不恢复**。`ensureRemoteModels` 每次落目录都赋
+  新数组（`this.remoteModels = merged`），身份判据因此天然正确。
+- **`fallbackCatalog()` 必须记忆化**：它是 `? :` 另一侧的来源，若每次返回新数组，
+  上面两个缓存的失效判据被**架空**（每调用一次就白建一份新缓存）—— 缓存等于没有，
+  且**症状完全静默**（只是慢，没有任何报错）。有用例专门守这一条。
+- **`stream()` 的门禁与目录必须同源**：`inputModalitiesFor` 自己也回落到
+  `fallbackCatalog()`（而不是只查 `remoteModels`），否则会出现
+  「`listModels` 说支持、发图被拒」的分叉。
+
+**反向验证（已做，逐条独立）**：去掉 `CatalogEntry[]` 缓存 → O(N²) 用例变红
+（实测 3660 次 vs 上限 120）；`fallbackCatalog()` 去掉记忆化 → 兜底路径用例变红；
+把索引失效判据改成比长度 → 「残缺目录重拉后等长但内容变了」用例变红；
+只还原 `inputModalitiesFor` → 「listModels 与 stream 判据同源」变红；
+两处一起还原（= 修复前）→ 「兜底条目的图片能力照常播报」变红。
+⚠️ 注意「**只**还原 `toCatalogEntry` 一处」**不会**变红 —— 那是**故意**的两道防线
+（纵深防御），不是漏守卫；要按上面那两条分别做。
+
+**⚠️ 规模是会变的**：以上数字取决于目录条数（实测生产 488 条 / 其中 466 条来自
+`/api/v1/models`）。O(N²) 的代价随 N 平方增长，**不要**按「才几百条、无所谓」判断
+—— N=1000 时单次就是 5.5 秒的同步阻塞，而它发生在**模型目录构建**路径上。
+
+**⚠️ 未在本机复现的一条**：用户称「每 ~15 秒重建一次」。master 里**找不到** 15 秒
+周期的触发源 —— DSH 客户端的 `ModelCatalogDirectory` 只在 4 个宿主事件上重拉
+（且有 `status === 'ready'` 短路），插件自己的 `catalog-prewarm` 是 **0/35s/75s
+三轮有界**，客户端两个轮询（5 秒 `readActiveProvider`、60 秒余额）都是**纯内存读**、
+不触达宿主目录重建。故周期数字**未定案**；但缺陷本身与周期无关：任何一次模型选择器
+打开 / 目录事件都会吃满一次 N² 重建。
