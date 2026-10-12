@@ -3029,6 +3029,11 @@ function registerJetHubEndpoints(
                       ? `OfficeAce ${accountId.slice(0, 8)}`
                       : req.accountId,
                     refreshable: true,
+                    // ⚠️ **必须回填 expiresAt**（与 gemini / zcode 同款）：漏写时
+                    //    卡片「有效期」永远显示「未知」（真实症状 2026-10-13，
+                    //    用户重登成功后面板仍显示未知）。STS 寿命 2 小时，
+                    //    `credential.expiresAt` 是 ISO 字符串。
+                    expiresAt: new Date(credential.expiresAt).getTime(),
                   })
                   return { ok: true, value: { done: true, success: true } }
                 } catch (error) {
