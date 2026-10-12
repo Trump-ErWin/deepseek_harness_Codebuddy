@@ -2816,6 +2816,36 @@ function registerJetHubEndpoints(
           return { ok: true, value: { accountId: id, loginUrl: geminiStarted.loginUrl } }
         } else if (provider === OFFICEACE.id) {
           /**
+           * ⚠️ **单凭据渠道：禁止重复登录**（2026-10-13 实测）。
+           *
+           * OfficeAce 的凭据是**单一文件** `~/.dsh-officeace/session.json`
+           * （华为云 OAuth 单账号流程），不像 buddy / gemini 那样「每卡片一份
+           * 独立凭据」。故建第二条卡片有两个必现后果：
+           *   1. 第二次登录**直接覆盖**那个文件 ⇒ 第一条卡片的凭据被静默冲掉；
+           *   2. 两条卡片显示**同一份**余额 ⇒ 面板合计重复计数（实测量到
+           *      6500 显示成 13000）。
+           *
+           * 故入口直接拒绝：已有条目时报错并要求先删除。这比「在余额汇总里
+           * 按凭据文件去重」更正确 —— 后者只掩盖显示，第一条的凭据**依然**
+           * 已被覆盖丢失，是数据损坏而非显示瑕疵。
+           *
+           * @see officeace-auth.ts 模块头「单凭据文件」设计说明
+           */
+          const existing = await pool.listAccounts(OFFICEACE.id)
+          if (existing.length > 0) {
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message:
+                  `OfficeAce 是单凭据渠道（凭据存于本机 session.json），同一时间只能有一个账号。`
+                  + '请先删除已有的 OfficeAce 账号，再重新登录 —— 否则新登录会覆盖原凭据，'
+                  + '且余额会被重复计数。',
+              },
+            }
+          }
+
+          /**
            * OfficeAce（华为 ModelArts MaaS）走**华为云 OAuth（PKCE + DPoP）**，
            * 全程**不依赖 OfficeAce 客户端**（协议逆向见 `officeace-auth.ts` 模块头）。
            *
