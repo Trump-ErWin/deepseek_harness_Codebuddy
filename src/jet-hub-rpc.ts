@@ -2228,6 +2228,24 @@ function registerJetHubEndpoints(
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
         const accounts = await pool.listAccounts(req.provider)
+        // ⚠️ OfficeAce 自愈回填（2026-10-13）：`expiresAt` 回填是后加的
+        //    （`6fb110f`），修复前登录留下的池条目缺这个字段 ⇒ 卡片恒显示
+        //    「未知」且不会自己补上。列表时若发现缺失，从凭据文件读真实
+        //    有效期补上并**写回池**（一次性自愈，之后走正常的登录/续期回填）。
+        if (req.provider === OFFICEACE.id && accounts.some((a) => a.expiresAt === undefined)) {
+          const credential = await auths.officeace?.readOfficeAceCredential?.().catch(() => undefined)
+          const expiresAt = credential?.expiresAt !== undefined
+            ? new Date(credential.expiresAt as string).getTime()
+            : Number.NaN
+          if (!Number.isNaN(expiresAt)) {
+            for (const account of accounts) {
+              if (account.expiresAt === undefined) {
+                account.expiresAt = expiresAt
+                void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
+              }
+            }
+          }
+        }
         return { ok: true, value: { accounts: await enrichAccountIdentity(accounts, req.provider) } }
       }
 
