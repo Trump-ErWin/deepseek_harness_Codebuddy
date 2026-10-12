@@ -45,8 +45,12 @@ import {
  * | ★ 同一句只在 `tool_calls[].arguments` | ✅ 200 | 该字段不扫 |
  * | ★ 与文档同字节数的良性长文本 | ✅ 200 | **体量不是原因** |
  *
- * ★ 那四行是 2026-10-12 补测的（`scripts/probe-buddy-role-matrix.mjs` /
- * `probe-buddy-assistant-bisect.mjs`）。**初版只测了 system / user / tool 三个位置**，
+ * ★ 那四行是 2026-10-12 补测的，**可复核凭据已入库**：
+ * `tests/e2e/buddy-fingerprint-roles.e2e.spec.ts`（双闸门、默认 skip）。
+ * ⚠️ 那个文件不是可选的补充 —— 「assistant 正文 ❌拦、其余四格 ✅放行」已被写进
+ * `tencent-fingerprint.ts` 的**实现约束**（决定改写范围），而单测只能锁「代码按
+ * 那个范围做」，**锁不住那个范围本身对不对**。当初翻车正是在这里：
+ * **初版只测了 system / user / tool 三个位置**，
  * 于是把「只拦 system」写成了硬约束，而 `assistant` 那一格从未测过 ——
  * 当时那条 assistant 探针还把触发句改写成了转述形态（`I see … here.`），
  * 而服务端是**逐字符**匹配，那个形态本身不含触发串，**等于空跑**。
@@ -225,7 +229,7 @@ describe('OpenAI 网关 Chat 路径：改 system 与 assistant 正文，其余�
     //   `space-bunny` 同错即此）。
     // ⚠️ 本用例**以前**断言的是「assistant 原样保留」——那是初版只测了
     // system/user/tool 三个位置得出的**过窄**结论，已由 2026-10-12 的
-    // 补测（`scripts/probe-buddy-role-matrix.mjs`）证伪并翻案。
+    // 补测（`tests/e2e/buddy-fingerprint-roles.e2e.spec.ts`）证伪并翻案。
     const options = await toGenerateOptions({
       model: 'workbuddy/deepseek-v4.1-flash',
       messages: [

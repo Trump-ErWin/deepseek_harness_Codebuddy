@@ -317,11 +317,17 @@ function contentToText(content: unknown): string {
 const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
 
 /**
- * 「历史以 assistant 开头」时补在首位的最小 system 文本。
+ * 「wire 首条不是 system」时补在首位的最小 system 文本。
  *
- * 刻意取**中性且极短**：它只用于满足上游对首条角色的要求，不该影响模型行为；
- * 且必须**不含**任何腾讯风控指纹字面量（否则这条兜底自己就会把会话送进 11128，
- * 见 `openai-gateway/tencent-fingerprint.ts`）。
+ * 判据本身有**两个**来源（WorkBuddy 网关的 11128 硬要求 + space-bunny 的 11148），
+ * 依据写在 `stream()` 里那段注释。此处只说这条文本自身的两条约束：
+ *
+ * - 刻意取**中性且极短**：它只为满足上游对首条角色的要求，不该影响模型行为；
+ * - **必须不含任何腾讯风控指纹字面量** —— 否则这条兜底自己就会把会话送进 11128，
+ *   与 `openai-gateway/tencent-fingerprint.ts` 那层改写互相抵消。
+ *
+ * ⚠️ 与 `account-probe.ts` 的 `PROBE_SYSTEM` **同值但语义独立**（那里是探测用的
+ * system，这里是首条兜底）。两处各写各的，改一处不要顺手改另一处。
  */
 const LEADING_SYSTEM_PLACEHOLDER = 'You are a helpful assistant.'
 
@@ -1666,19 +1672,28 @@ export class BuddyAdapter extends LlmAdapter {
         content: rewriteTencentContentFingerprints(options.system, this.product.id),
       })
     }
-    // ⚠️ wire 的**首条不得是 assistant**（2026-10-12 实测，`probe-spacebunny-firstmsg`）。
-    // 同一份请求体，只把开头的 system 去掉、让首条变成「带 tool_calls 的 assistant」：
-    //   `space-bunny`      → 400 / code 11148 / `tool calls and tool results do not match`
-    //                        （`displayMsg.zh` =「工具记录不完整，请新建任务」）
-    //   `step-5-preview`   → 200（**宽容**）
-    // 补一条 system 在前的同一批形状，两个模型都 200 —— 所以判据是「首条角色」，
-    // 不是「配对是否真的坏了」（逐格核对过：无孤儿、无重复、覆盖完整）。
-    // 两个方向都要当真：① 不能因为 step-5 放过就认为没问题；② 不能因为
-    // space-bunny 报错就去改工具配对 —— 那修的是不存在的原因。
-    // 生产里确实可触发：会话历史被压缩/截断到把开头的 system 与首条 user 一起
-    // 削掉时，剩下的历史就以 assistant 开头（与本文件 `options.system` 那条
-    // 「WorkBuddy 网关强制 messages[0] 是 system」的既有约束是同一族）。
-    if (messages.length > 0 && (messages[0] as { role?: unknown }).role === 'assistant') {
+    // ⚠️ wire 的**首条必须是 system**（2026-10-12 补测 + 本仓库既有约束）。
+    //
+    // 两个**独立**来源指向同一条要求，必须同时满足：
+    //
+    // ① WorkBuddy 网关**硬性要求** `messages[0]` 是 system，否则 400 + 11128
+    //    `first message is not system prompt`，且 `displayMsg` 把它伪装成「安全
+    //    策略拦截」（见 `account-probe.ts` 的 `PROBE_SYSTEM` 注释，内含
+    //    2026-09-25 双端点对照实测：WorkBuddy 无 system → 400/11128、有 system
+    //    → 200；CodeBuddy 两种都 200）。
+    // ② space-bunny 的 11148：仅当「首条是**带 tool_calls 的 assistant**」时报
+    //    `tool calls and tool results do not match`（`displayMsg.zh`=「工具记录不
+    //    完整，请新建任务」），step-5-preview 则宽容；把 system 补到前面两个都 200。
+    //
+    // ⚠️ 判据因此是 `!== 'system'`，**不是** `=== 'assistant'` —— 后者漏掉
+    // **user-first / tool-first** 的历史（实测存在：历史被压缩削头；以及 DSH 的
+    // 一次性调用只带 user 而不带 system，见 `GenerateOptions.system` 的注释），
+    // 那些在 WorkBuddy 上仍是同一个 11128。判据依赖「另一个产品碰巧不校验」同样是
+    // 错的 —— 与 `PROBE_SYSTEM` 那段「无条件给所有 provider 都带 system」的取舍一致。
+    //
+    // ⚠️ 补在 `options.system` unshift **之后**：真实 system 优先，只有连它都没有
+    // 时才需要这条兜底 ⇒ 不会重复插入。
+    if (messages.length > 0 && (messages[0] as { role?: unknown }).role !== 'system') {
       messages.unshift({ role: 'system', content: LEADING_SYSTEM_PLACEHOLDER })
     }
     const tools = options.tools?.map((tool) => ({

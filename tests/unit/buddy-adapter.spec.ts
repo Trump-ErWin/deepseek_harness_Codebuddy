@@ -3878,7 +3878,43 @@ describe('BuddyAdapter 直连路径的腾讯风控指纹改写', () => {
    * 真实 wire 后配对是干净的（无孤儿、无重复、覆盖完整）—— 真正的判据是**首条
    * 角色**。按文案去改配对逻辑会修一个不存在的原因。
    */
-  describe('wire 首条不得是 assistant', () => {
+  /**
+   * 非腾讯系产品经 BuddyAdapter 时**逐字节不变**（2026-10-12 审计补的 F1/F2 防线）。
+   *
+   * ## 为什么这条不可省
+   * `buddy` 与 `workbuddy` **都在** `TENCENT_PROVIDERS` 那张表里，所以
+   * 「喂 WORKBUDDY 也能改写」那条用例**无法区分**「读 `this.product.id`」与
+   * 「写死 `'buddy'`」。审计实测把 `serializeMessages(…, this.product.id)` 改成
+   * `serializeMessages(…, 'buddy')`（完全忽略产品配置）后，163 条用例**全绿** ——
+   * 那条 WorkBuddy 用例是**改坏也不红**的同义反复。
+   *
+   * 只有「**非**腾讯系 provider 必须原样返回」这条能把它区分开：产品 id 换成
+   * 集合外的值时，写死 `'buddy'` 会去改写、而本实现必须不动 ⇒ 立刻分岔。
+   *
+   * ⚠️ `as never` 是**刻意**的：`BuddyProduct.id` 是 `'buddy' | 'workbuddy'`
+   * 联合类型，构造「非腾讯系」产品本就该被类型系统拦住。这里要测的是**运行时**
+   * 判据（`isTencentContentFingerprintProvider` 遇到未知 id 的行为），故必须
+   * 绕过类型；真实产品里没有第三个 buddy 系成员，只能这么造。
+   */
+  it('★ 非腾讯系产品：wire 逐字节不变（provider 被写死 buddy 时这条会红）', async () => {
+    const nonTencent = { ...CODEBUDDY, id: 'not-tencent', displayName: 'Not Tencent' } as never as BuddyProduct
+    const wire = await wireOf(
+      [
+        { role: 'system', content: text(`S: ${TRIGGER}`) },
+        { role: 'user', content: text('hi') },
+        { role: 'assistant', content: text(`A: ${TRIGGER}`) },
+        { role: 'user', content: text('继续') },
+      ],
+      {},
+      nonTencent,
+    )
+    const texts = textsOfWire(wire)
+    expect(texts).toContain(`S: ${TRIGGER}`)
+    expect(texts).toContain(`A: ${TRIGGER}`)
+    expect(texts.some((value) => value.includes(REWRITE))).toBe(false)
+  })
+
+  describe('wire 首条必须是 system', () => {
     const assistantWithCall = {
       role: 'assistant',
       content: [
@@ -3898,15 +3934,31 @@ describe('BuddyAdapter 直连路径的腾讯风控指纹改写', () => {
       expect(wire[2]?.role).toBe('tool')
     })
 
-    it('★ 正常历史（首条是 system / user）不被多塞一条 system', async () => {
+    /**
+     * ⚠️ 这条覆盖 2026-10-12 审计抓出的**真缺陷**：原判据是 `=== 'assistant'`，
+     * 漏掉 **user-first / tool-first** 的历史 —— 而本仓库 `account-probe.ts` 的
+     * `PROBE_SYSTEM` 注释里有 2026-09-25 的双端点对照实测：**WorkBuddy 网关
+     * 强制 `messages[0]` 是 system**，否则 400 + 11128。
+     * 那类历史真实存在（历史被压缩削头；DSH 一次性调用只带 user 不带 system）。
+     */
+    it.each([
+      ['user 开头', [{ role: 'user', content: text('hi') }]],
+      ['tool 开头', [assistantWithCall, toolResult]],
+      ['assistant 开头', [assistantWithCall, toolResult]],
+    ])('★ 历史以 %s 时补 system（WorkBuddy 网关强制首条是 system）', async (_label, messages) => {
+      const wire = await wireOf(messages as readonly unknown[])
+      expect(wire[0]?.role).toBe('system')
+      expect(wire.filter((m) => m.role === 'system')).toHaveLength(1)
+    })
+
+    it('★ 首条已有 system 时不多塞一条', async () => {
       const withSystem = await wireOf([
         { role: 'system', content: text('You are helpful.') },
         { role: 'user', content: text('hi') },
       ])
+      // 只有用户自己那一条，且内容不被换掉
       expect(withSystem.filter((m) => m.role === 'system')).toHaveLength(1)
-      const withUser = await wireOf([{ role: 'user', content: text('hi') }])
-      expect(withUser[0]?.role).toBe('user')
-      expect(withUser.some((m) => m.role === 'system')).toBe(false)
+      expect(String(withSystem[0]?.content)).toBe('You are helpful.')
     })
 
     it('★ options.system 已在首位时不重复补位', async () => {
