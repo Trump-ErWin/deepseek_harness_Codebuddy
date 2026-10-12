@@ -3715,3 +3715,146 @@ describe('BuddyAdapter 残缺目录自愈（★ IKJVTF I3）', () => {
     expect(calls).toBe(afterFirst)
   })
 })
+
+/**
+ * 腾讯系内容级风控指纹改写的**直连**落点（2026-10-12 真实报障）。
+ *
+ * ## 这组用例守的是什么
+ * 网关那侧早有改写（IKJNA1），但**直连路径**没有 —— 而触发面在
+ * `assistant` **正文**（实测 400/11128；`user` / `tool` 结果 /
+ * `reasoning_content` / `tool_calls[].arguments` 都不拦）。
+ * 于是「排查这个风控 bug 的会话」几乎必然中招：模型先 `read` 记录该指纹
+ * 的文档（tool 结果，不拦），再把它**逐字复述进自己的正文**（拦）；那句一旦
+ * 进了历史就每轮原样重放，会话从此报废，且**换任何腾讯系模型都一样**
+ * ——用户当时报的就是 `step-5-preview` 与 `space-bunny` 同一个错。
+ *
+ * ## 断言为什么必须成对
+ * 「该改的改了」与「不该改的一字没动」必须同时锁：
+ * 只测前者，实现会一路扩写成「把整份历史都洗一遍」，那会破坏用户原话、
+ * 工具输出（要回读给模型看的证据）与模型自己的思考，并且白吃腾讯侧的
+ * 前缀缓存。每条「扩大范围」的冲动都该在这里变红。
+ */
+describe('BuddyAdapter 直连路径的腾讯风控指纹改写', () => {
+  const TRIGGER = 'Main branch (you will usually use this for PRs)'
+  const REWRITE = 'Main branch (PRs usually go here)'
+
+  /** 走真实适配器发一次，返回**请求体里**的 messages（即 wire 形状）。 */
+  async function wireOf(
+    messages: readonly unknown[],
+    extra: Record<string, unknown> = {},
+    product?: BuddyProduct,
+  ): Promise<Array<Record<string, any>>> {
+    let body: Record<string, unknown> = {}
+    const adapter = makeAdapter({
+      ...(product === undefined ? {} : { product }),
+      fetchImpl: async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: 'glm-5.3',
+      messages,
+      signal: new AbortController().signal,
+      ...extra,
+    } as never)
+    return (body.messages ?? []) as Array<Record<string, any>>
+  }
+
+  /** 收集 wire 上的全部文本（content 为字符串或 parts 数组两种形态都要覆盖）。 */
+  function textsOfWire(messages: ReadonlyArray<Record<string, any>>): string[] {
+    const out: string[] = []
+    for (const message of messages) {
+      const c = message.content
+      if (typeof c === 'string') out.push(c)
+      else if (Array.isArray(c)) {
+        for (const block of c) {
+          if (block !== null && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string') {
+            out.push(String((block as { text: unknown }).text))
+          }
+        }
+      }
+    }
+    return out
+  }
+
+  const text = (value: string) => [{ type: 'text', text: value }]
+
+  it('★ system 与 assistant 正文里的指纹都被改写', async () => {
+    const wire = await wireOf([
+      { role: 'system', content: text(`S: ${TRIGGER}`) },
+      { role: 'user', content: text('继续') },
+      { role: 'assistant', content: text(`A: ${TRIGGER}`) },
+      { role: 'user', content: text('再说一次') },
+    ])
+    const texts = textsOfWire(wire)
+    expect(texts).toContain(`S: ${REWRITE}`)
+    expect(texts).toContain(`A: ${REWRITE}`)
+    expect(texts.some((value) => value.includes(TRIGGER))).toBe(false)
+  })
+
+  it('★ options.system（绕过 serializeMessages 的第四个产出点）同样被改写', async () => {
+    // `stream()` 里 `messages.unshift({role:'system', content: options.system})`
+    // 排在 `serializeMessages` **之外**，只改那个函数救不到这条路。
+    const wire = await wireOf([{ role: 'user', content: text('hi') }], {
+      system: `O: ${TRIGGER}`,
+    })
+    expect(wire[0]?.role).toBe('system')
+    expect(String(wire[0]?.content)).toBe(`O: ${REWRITE}`)
+  })
+
+  it('★ 不该改的一字不动：user / tool 结果 / reasoning_content / tool_calls.arguments', async () => {
+    // 这四个位置实测都**不拦**（依据见 openai-gateway/tencent-fingerprint.ts 的表）。
+    // 改它们换不来放行，只会篡改用户原话与证据，并白吃上游前缀缓存。
+    const wire = await wireOf([
+      { role: 'system', content: text('You are helpful.') },
+      { role: 'user', content: text(`U: ${TRIGGER}`) },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: `R: ${TRIGGER}` },
+          { type: 'text', text: '干净正文' },
+          { type: 'tool-call', id: 'call-1', name: 'read', arguments: `{"q":"${TRIGGER}"}` },
+        ],
+      },
+      { role: 'tool', toolCallId: 'call-1', content: text(`T: ${TRIGGER}`) },
+      { role: 'user', content: text('结果如何') },
+    ])
+    const texts = textsOfWire(wire)
+    // 没有任何一处被改写
+    expect(texts.some((value) => value.includes(REWRITE))).toBe(false)
+    // user 与 tool 结果原样
+    expect(texts).toContain(`U: ${TRIGGER}`)
+    expect(texts).toContain(`T: ${TRIGGER}`)
+    // assistant 正文原样（它本来就不含指纹）
+    expect(texts).toContain('干净正文')
+    const assistant = wire.find((message) => message.role === 'assistant') as Record<string, any>
+    // reasoning_content 与工具参数都保持原文
+    expect(String(assistant.reasoning_content)).toBe(`R: ${TRIGGER}`)
+    expect(String(assistant.tool_calls[0].function.arguments)).toContain(TRIGGER)
+  })
+
+  it('★ 不含指纹的历史：wire 逐字节不变（不得破坏腾讯侧前缀缓存）', async () => {
+    const original = 'On branch master\nYour branch is up to date.\nNothing to commit.'
+    const wire = await wireOf([
+      { role: 'system', content: text('You are helpful.') },
+      { role: 'assistant', content: text(original) },
+      { role: 'user', content: text('继续') },
+    ])
+    const assistant = wire.find((message) => message.role === 'assistant') as Record<string, any>
+    expect(assistant.content).toBe(original)
+  })
+
+  it('★ WorkBuddy（国际版）同样生效：两个产品共用这一层', async () => {
+    const wire = await wireOf(
+      [
+        { role: 'system', content: text('You are helpful.') },
+        { role: 'assistant', content: text(`A: ${TRIGGER}`) },
+        { role: 'user', content: text('继续') },
+      ],
+      {},
+      WORKBUDDY,
+    )
+    expect(textsOfWire(wire)).toContain(`A: ${REWRITE}`)
+  })
+})

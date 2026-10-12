@@ -36,10 +36,26 @@ import {
  * | 只差一个词（`normally`） | ✅ 200 | **逐字符**匹配，不能泛化 |
  * | 内层多一个空格 | ✅ 200 | 同上 |
  * | 全小写 / 全大写 | ❌ 400 | **大小写不敏感** |
- * | 同一句在 **user** 消息 | ✅ 200 | 只拦 system |
+ * | 同一句在 **user** 消息 | ✅ 200 | 该角色不拦 |
  * | 同一句在 **tool** 消息 | ✅ 200 | 同上 |
  * | 指纹在**第二条** system（非 `messages[0]`） | ❌ 400 | 所有 system 都要改 |
  * | 改写该句 | ✅ 200 | 修法有效 |
+ * | ★ 同一句在 **assistant 正文** | ❌ **400** | **assistant 也要改**（下注） |
+ * | ★ 同一句只在 `reasoning_content` | ✅ 200 | 该字段不扫 |
+ * | ★ 同一句只在 `tool_calls[].arguments` | ✅ 200 | 该字段不扫 |
+ * | ★ 与文档同字节数的良性长文本 | ✅ 200 | **体量不是原因** |
+ *
+ * ★ 那四行是 2026-10-12 补测的（`scripts/probe-buddy-role-matrix.mjs` /
+ * `probe-buddy-assistant-bisect.mjs`）。**初版只测了 system / user / tool 三个位置**，
+ * 于是把「只拦 system」写成了硬约束，而 `assistant` 那一格从未测过 ——
+ * 当时那条 assistant 探针还把触发句改写成了转述形态（`I see … here.`），
+ * 而服务端是**逐字符**匹配，那个形态本身不含触发串，**等于空跑**。
+ * 真实报障是「排查这个风控 bug 的会话」把那句复述进了 assistant 正文，
+ * 于是该会话从此每轮被拦、且**换任何腾讯系模型都一样**（跟会话走，不跟模型走）。
+ *
+ * ⚠️ 因此这套改写有**两类**调用方，缺一即复发：
+ * `src/openai-gateway/{messages,responses}.ts`（外部客户端方向）与
+ * `src/buddy-adapter.ts` 的 `serializeMessages` + `options.system`（DSH 直连方向）。
  */
 const TRIGGER = 'Main branch (you will usually use this for PRs)'
 const REWRITE = 'Main branch (PRs usually go here)'
@@ -171,7 +187,7 @@ describe('腾讯系内容级风控指纹改写（IKJNA1）：纯函数', () => {
   })
 })
 
-describe('OpenAI 网关 Chat 路径：只改 system，其余角色一概不碰', () => {
+describe('OpenAI 网关 Chat 路径：改 system 与 assistant 正文，其余角色一概不碰', () => {
   it('★ workbuddy：system 被改写', async () => {
     const options = await toGenerateOptions({
       model: 'workbuddy/deepseek-v4.1-flash',
@@ -199,23 +215,43 @@ describe('OpenAI 网关 Chat 路径：只改 system，其余角色一概不碰',
     expect(systems).toEqual(['You are a helpful assistant.', `${REWRITE}: master`])
   })
 
-  it('★ user / assistant / tool 里的同一句**原样保留**（实测那三个角色不拦）', async () => {
-    // 改写它们没有任何收益，却会篡改用户原话与工具输出 —— 而工具输出往往
-    // 是要回读给模型看的证据。
+  it('★ assistant **正文**要改（实测该位置 400/11128），user / tool 仍原样保留', async () => {
+    // 分角色对待的依据全在 `tencent-fingerprint.ts` 那张实测表里：
+    // - `user` / `tool` 结果 / `reasoning_content` / `tool_calls.arguments`
+    //   实测**不拦** ⇒ 改它们换不来放行，却会篡改用户原话与工具输出
+    //   （工具输出往往是要回读给模型看的证据）；
+    // - `assistant` 正文实测**拦** ⇒ 必须改，否则一句进了历史的坏话
+    //   会让整个会话从此每轮报废（2026-10-12 用户报 `step-5-preview` /
+    //   `space-bunny` 同错即此）。
+    // ⚠️ 本用例**以前**断言的是「assistant 原样保留」——那是初版只测了
+    // system/user/tool 三个位置得出的**过窄**结论，已由 2026-10-12 的
+    // 补测（`scripts/probe-buddy-role-matrix.mjs`）证伪并翻案。
     const options = await toGenerateOptions({
       model: 'workbuddy/deepseek-v4.1-flash',
       messages: [
         { role: 'system', content: 'You are a helpful assistant.' },
         { role: 'user', content: `看看这句：${TRIGGER}` },
         { role: 'assistant', content: `好的：${TRIGGER}`, tool_calls: [
-          { id: 'call-1', type: 'function', function: { name: 'read', arguments: '{}' } },
+          { id: 'call-1', type: 'function', function: { name: 'read', arguments: `{"q":"${TRIGGER}"}` } },
         ] },
         { role: 'tool', tool_call_id: 'call-1', content: `${TRIGGER}: master` },
       ],
     }, abort())
     const all = textsOf(options.messages)
-    expect(all.filter((text) => text.includes(TRIGGER)).length).toBe(3)
-    expect(all.some((text) => text.includes(REWRITE))).toBe(false)
+    // assistant 正文：已改写
+    expect(all).toContain(`好的：${REWRITE}`)
+    expect(all.some((text) => text.startsWith('好的：') && text.includes(TRIGGER))).toBe(false)
+    // user 与 tool 结果：逐字不变（两处各含一次触发串）
+    expect(all).toContain(`看看这句：${TRIGGER}`)
+    expect(all).toContain(`${TRIGGER}: master`)
+    // 改写只发生在 assistant 正文这一处 ⇒ 全文只剩 user/tool 两处含原句
+    expect(all.filter((text) => text.includes(TRIGGER))).toHaveLength(2)
+    // 非文本通道不在本函数的管辖内（网关不产 reasoning，工具参数须原样）
+    const toolCall = options.messages
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .find((block) => (block as { type?: unknown }).type === 'tool-call') as
+        { arguments?: unknown } | undefined
+    expect(String(toolCall?.arguments)).toContain(TRIGGER)
   })
 
   it('★ 非腾讯系 provider：整条请求逐字节不变', async () => {
@@ -255,6 +291,22 @@ describe('OpenAI 网关 Responses 路径：与 Chat 同一判据', () => {
     expect(texts[1]).toBe(`also ${REWRITE}`)
     // user 消息不碰
     expect(texts).toContain(`keep ${TRIGGER}`)
+  })
+
+  it('★ input 里的 assistant 正文也走改写（与 Chat 端**同判据**）', async () => {
+    // 两端判据不一致时，症状是「同一份历史在 /v1/chat/completions 放行、
+    // 在 /v1/responses 被拦」——排查时会误判成端点差异，实际是漏了一个接入点。
+    const options = await toResponsesGenerateOptions({
+      model: 'workbuddy/deepseek-v4.1-flash',
+      input: [
+        { type: 'message', role: 'assistant', content: `上一轮我说过：${TRIGGER}` },
+        { type: 'message', role: 'user', content: `用户原话：${TRIGGER}` },
+      ],
+    }, abort())
+    const texts = textsOf(options.messages)
+    expect(texts).toContain(`上一轮我说过：${REWRITE}`)
+    // user 不碰
+    expect(texts).toContain(`用户原话：${TRIGGER}`)
   })
 
   it('★ 非腾讯系 provider：instructions 逐字节不变', async () => {

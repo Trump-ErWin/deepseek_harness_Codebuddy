@@ -46,6 +46,13 @@ import {
 } from './llm-register-compat.js'
 import { reportLedgerAccount } from './token-ledger.js'
 import { planSessionTitleThinking } from './session-title.js'
+// ⚠️ 腾讯系内容级风控的指纹改写 —— 与 **OpenAI 网关**共用同一份真相源
+// （`src/openai-gateway/tencent-fingerprint.ts`）。该模块**零 import**，
+// 故从 `src/` 反向引它不构成环。
+// 直连路径**必须**也走它：会话历史里的 `assistant` 正文实测会被拦
+// （400/11128），而「排查这个风控问题的会话」必然会把那句复述进正文 ——
+// 只在网关补 = 换一个入口又被拦。依据见那个文件的头。
+import { rewriteTencentContentFingerprints } from './openai-gateway/tencent-fingerprint.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -297,16 +304,24 @@ function contentToText(content: unknown): string {
  * - assistant 消息**始终**携带 `reasoning_content` 字段（推理模型缺失会 400）
  *   ——与 codearts 的 deepseek-v4 校验一致；
  * - 正文为空且带 tool_calls 时 `content` 必须为 `null`（对齐 openai_chat.rs）。
+ *
+ * ⚠️ 第三件事（2026-10-12 补）：**腾讯系内容级风控的指纹改写**。
+ * `system` 与 `assistant` 正文这两处要过 `rewriteTencentContentFingerprints`
+ * ——与 OpenAI 网关**同一份表、同一判据**（为什么两处都要、以及为什么
+ * `user` / `tool` / `reasoning_content` / `tool_calls.arguments` 都不要，
+ * 全部是实测结论，见 `src/openai-gateway/tencent-fingerprint.ts` 的文件头）。
+ * `provider` 形参就是为它加的：本函数服务 `buddy` / `workbuddy` 两个产品，
+ * 而这个函数**自己**该只对腾讯系生效 —— 非腾讯系必须逐字节不变。
  */
 /** 工具结果内嵌图片的载体文本（与官方 deepseek 适配器同名同义）。 */
 const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
 
 function serializeMessages(
   messages: readonly { role: string; content: unknown }[],
-  imageUrls?: ReadonlyMap<string, string>,
+  imageUrls: ReadonlyMap<string, string> | undefined,
+  provider: string,
 ): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
-
   // 工具结果内嵌图片（read_image 等）不能并入 `role:'tool'` 消息：OpenAI 兼容
   // 协议要求每条 tool 消息紧跟其 assistant tool_call，中间插入任何消息都会 400。
   // 故与官方 deepseek 适配器一致：挂起到其后的独立 user 消息统一发出。
@@ -364,7 +379,13 @@ function serializeMessages(
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'reasoning')
         .map((block) => String(block.text))
         .join('')
-      const text = contentToText(content)
+      // ⚠️ assistant **正文**要过腾讯系风控指纹改写（实测该位置 400/11128，
+      // 依据见 `openai-gateway/tencent-fingerprint.ts` 的表）。这是**存量自愈**：
+      // 坏的那句一旦进了历史就每轮原样重放，整个会话从此报废（换任何腾讯系模型
+      // 都一样）——2026-10-12 用户报 `step-5-preview` / `space-bunny` 同错即此。
+      // 与之相对，`reasoning_content` 与 `tool_calls.arguments` 实测**不拦**，
+      // 故下面两条**刻意不**改写（改了既换不来放行，又破坏回读证据）。
+      const text = rewriteTencentContentFingerprints(contentToText(content), provider)
       // 挂起的工具结果图片必须在 assistant 之前发出（对齐官方适配器）：
       // 否则它们会漂到这条 assistant 之后，与产生它们的工具调用脱节。
       flushToolImages()
@@ -379,7 +400,8 @@ function serializeMessages(
     }
     if (message.role === 'system') {
       flushToolImages()
-      wire.push({ role: 'system', content: contentToText(message.content) })
+      // system 是这条风控的**已知**位置（IKJNA1），与网关路径同一判据、同一份表。
+      wire.push({ role: 'system', content: rewriteTencentContentFingerprints(contentToText(message.content), provider) })
       continue
     }
     // user 角色：工具结果搭载在 harness 用户消息中；展开为独立的 role:'tool' 消息。
@@ -1626,9 +1648,14 @@ export class BuddyAdapter extends LlmAdapter {
         imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
       }
     }
-    const messages = serializeMessages(options.messages, imageUrls)
+    const messages = serializeMessages(options.messages, imageUrls, this.product.id)
     if (options.system !== undefined && options.system.length > 0) {
-      messages.unshift({ role: 'system', content: options.system })
+      // ⚠️ 这条是 `serializeMessages` 之外的**第四个**产出点：`options.system`
+      // 不经过那个函数，漏掉它等于「走 messages 的会话被救了、走 system 的会话照样被拦」。
+      messages.unshift({
+        role: 'system',
+        content: rewriteTencentContentFingerprints(options.system, this.product.id),
+      })
     }
     const tools = options.tools?.map((tool) => ({
       type: 'function' as const,

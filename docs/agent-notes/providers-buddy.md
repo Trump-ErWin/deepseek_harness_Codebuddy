@@ -540,7 +540,7 @@ provider = workbuddy   model = deepseek-v4.1-flash
 
 回归用例在 `tests/unit/openai-gateway-tencent-fingerprint.spec.ts`（17 条）。
 ⚠️ 已做**反向验证**：正则去掉 `i` → 大小写用例红；`instructions` 那处改回原样 →
-Responses 端用例红。
+Responses 端用例红。
 
 ## 模型计费倍率与同名模型（必须写进 `name`，不是 `description`）
 
@@ -929,7 +929,7 @@ IDE 按 name 归并，我们按 id 列出。二者是**不同区域的独立计�
 `scripts/probe-lobsterai-cost.mjs`（LobsterAI 倍率归属）、
 `scripts/probe-lobsterai-dupes.mjs`（LobsterAI 同名检查）、
 `scripts/probe-codearts-benefit.mjs`（CodeArts benefit 集合与判定）、
-`scripts/verify-description.mjs`（端到端打印**切换菜单实际渲染的 name**）
+`scripts/verify-description.mjs`（端到端打印**切换菜单实际渲染的 name**）
 
 ## ⚠️ CodeArts benefit（免费额度）模型：集合必须动态判定，不能硬编码模型名
 
@@ -978,3 +978,53 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 - 回归用例：`tests/unit/models.spec.ts`（集合判定 / 落盘不含改写 id / 缓存往返）、
   `tests/unit/llm-adapter.spec.ts`（v4.1 带 `maas_type` 且参与签名、无后缀
   v4-flash 不带）、`tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
+
+## ⚠️⚠️ 更正：腾讯风控**也拦 `assistant` 正文**，且直连路径必须一起改（2026-10-12）
+
+上面「腾讯系内容级风控」一节的「只动 system，`user` / `assistant` / `tool` 一概不碰」**已被实测推翻**，
+以本节为准。补测矩阵（真实登录态直打 `copilot.tencent.com`，触发串取磁盘原文逐字）：
+
+| 触发串位置 | 结果 |
+|---|---|
+| `system`（含非首位） | ❌ 400/11128（已知） |
+| `user` | ✅ 200 |
+| `tool` 结果 | ✅ 200 |
+| **`assistant` 正文 `content`** | ❌ **400/11128 ← 新格** |
+| `assistant` 的 `reasoning_content` | ✅ 200 |
+| `tool_calls[].function.arguments` | ✅ 200 |
+| 与文档同字节数的良性长文本 | ✅ 200 ⇒ **体量不是原因** |
+
+**为什么初版漏了这格**：那条 assistant 探针把触发句改写成了转述形态（`I see … here.`），
+而服务端是**逐字符**匹配 —— 那个形态本身不含触发串，**等于空跑**，却得出了「assistant 放行」的结论。
+
+**已落地的修法**（四处产出点，缺一即复发）：
+
+- `src/openai-gateway/messages.ts` 的 `assistant` 分支（原来只有 `system`）；
+- `src/openai-gateway/responses.ts` 的 `assistant` 分支（与 Chat 同判据）；
+- `src/buddy-adapter.ts` 的 `serializeMessages`：**`assistant` 正文 + `system`**（DSH **直连**方向，
+  原先**完全没有任何改写**）；
+- `src/buddy-adapter.ts` 的 `stream()` 里 `options.system` 那一条 —— 它**绕过** `serializeMessages`，
+  是最容易漏的第四个点。
+
+`user` / `tool` 结果 / `reasoning_content` / `arguments` **刻意不改**：实测不拦，
+改它们换不来放行，却会篡改用户原话与要回读给模型看的证据，并白吃腾讯侧前缀缓存。
+用例把「该改的改了」与「不该改的一字没动」**两侧**都锁住
+（`tests/unit/buddy-adapter.spec.ts` 的「直连路径的腾讯风控指纹改写」段）。
+
+**真实报障机制（自指污染）**：排查这个风控 bug 的会话会先 `read` 记录该指纹的文档
+（`providers-buddy.md` 自己就逐字写着那句 —— tool 结果，不拦），模型随后把它**逐字复述进
+自己的正文**（拦）。那句一旦进了历史就每轮原样重放 ⇒ 会话从此报废，且
+**换任何腾讯系模型都一样** —— 用户当时报的 `step-5-preview` 与 `space-bunny` 同一个错，
+正是「症状跟会话走、不跟模型走」。
+
+**取证 / 验收脚本**（⚠️ 均在 `scripts/` 下，而**该目录被 `.gitignore` 忽略**，
+属本机一次性工具、**不入库**，故以下名字在仓库里查不到，别当假指路）：
+`probe-buddy-role-matrix.mjs`（角色矩阵）、`probe-buddy-assistant-bisect.mjs`
+（二分定位到单行 + 体量对照，写在另一份 checkout `dsh-codearts/scripts/`）、
+`verify-buddy-fingerprint-fix.mts`（同一份被拦历史：裸 fetch ❌11128 /
+打过补丁的真实 `BuddyAdapter` ✅）。要长期保留就得把它们挪进版本控制内的目录。
+
+⚠️ **另有一个独立问题，与指纹无关、尚未修**：`space-bunny` 对「assistant 同时带非空
+`content` 与 `tool_calls`」回 `tool calls and tool results do not match, please`
+（适配器报 `INVALID_REQUEST`），而 `step-5-preview` 容忍**同一份**历史。
+需单独取证后再动。
