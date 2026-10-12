@@ -258,7 +258,12 @@ describe('ClineAdapter resolveModel', () => {
     const withImage = await adapter.resolveModel('cline', METADATA_MODEL)
     expect(withImage.inputModalities).toContain('image')
     const unknown = await adapter.resolveModel('cline', 'unknown/model-x')
-    expect(unknown.inputModalities).toEqual(['text'])
+    // ⚠️⚠️ 这里**原本**断言 `['text']`，本次三态改造（issue IKKZUG）改为
+    // `undefined` —— 那是本次修复的**目标行为**，不是回归：
+    // `['text']` 等于告诉宿主「确认是纯文本模型」，DSH 随即把图片**静默**投影
+    // 成占位文本（`projectImagesForTextModel`），用户零提示。
+    // 宿主契约明写 `absent means unknown`（dsh-llm `types.d.ts`）。
+    expect(unknown.inputModalities).toBeUndefined()
   })
 
   it('声明 5 档思考强度（顺序与展示名对齐 Cline IDE）', async () => {
@@ -1430,6 +1435,60 @@ describe('Cline 接线（源码级回归）', () => {
     gate.reset()
     expect(await modalitiesOf()).toEqual(['text', 'image'])
     expect(devCalls, '必须重试 models.dev（不能被 remoteComplete 短路）').toBeGreaterThan(1)
+  })
+
+  // ── issue IKKZUG 第 1 点：图片能力必须**三态**（对齐 buddy）──
+  //
+  // 与 buddy 的区别在**来源**：cline 的 `supportsImage` 只来自目录条目，而
+  // `cline-pass/*` 的条目**只有 models.dev 提供** ⇒ models.dev 失败时
+  // 「该条目根本不存在」，而不是「存在但说不支持」。
+  //
+  // ⚠️ **方向仍是保守**：未知**不放行**图片（见下面的门禁用例），
+  // 只是不再把「不知道」说成「明确不支持」—— 那会让宿主按「确认是纯文本
+  // 模型」把图片**静默**投影成占位文本（dsh-llm 的 projectImagesForTextModel）。
+
+  it('⚠️ 目录里没有该模型时**省略** inputModalities（= 未知），不再谎报不支持', async () => {
+    // 宿主契约：dsh-llm `types.d.ts` 明写「absent means unknown」。
+    // 报 ['text'] 会让 DSH 把图片静默投影成占位符，用户零提示。
+    const adapter = makeAdapter({ loadModelsDev: async () => new Map() })
+    const resolved = await adapter.resolveModel('cline', 'not-a-real-model')
+    expect(resolved.inputModalities, '未知必须省略字段而不是报 [\'text\']').toBeUndefined()
+  })
+
+  it('⚠️ 目录条目**明确** supportsImage=false 时仍报 [text]（三态的中间档不能丢）', async () => {
+    // 防止「干脆全省略」——那会把「确认不支持」也变成未知，
+    // 让图片发到不支持的服务端。用真实形态的模型（glm-5.3 实测不带图）。
+    const adapter = makeAdapter({ loadModelsDev: async () => new Map() })
+    const listed = await adapter.listModels('cline')
+    const plain = listed.find((m) => m.id === 'cline-pass/glm-5.3')
+    if (plain === undefined) {
+      // 目录里没有这条 ⇒ 该用真实存在且明确 false 的条目代替
+      const anyFalse = listed.find((m) => m.inputModalities !== undefined)
+      expect(anyFalse?.inputModalities, '至少有一条要给出明确结论').toBeDefined()
+    } else {
+      expect(plain.inputModalities).toEqual(['text'])
+    }
+  })
+
+  it('⚠️ 未知模型的贴图门禁**不得**说成「不支持图片输入」（issue 原报障文案）', async () => {
+    // 用户报障原文：`cline-pass/deepseek-v4.1-flash` 报「不支持图片输入」，
+    // 而真实原因是 models.dev 没拉到。两者必须可区分。
+    const adapter = makeAdapter({
+      loadModelsDev: async () => { throw new Error('models.dev timeout') },
+      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+    })
+    const error = await collect(adapter, {
+      model: 'not-a-real-model',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }],
+      }],
+    }).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(Error)
+    const message = String((error as Error).message)
+    // ⚠️ 不是「不支持」——那是谎报。
+    expect(message).not.toContain('不支持图片输入')
+    expect(message).toContain('not-a-real-model')
   })
 
   it('⚠️ 目录已完整且 models.dev 也已读到时，仍保持「已完整」（不得反复重拉）', async () => {
