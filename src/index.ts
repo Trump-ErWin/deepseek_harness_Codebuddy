@@ -2756,10 +2756,30 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   //    （虚拟 provider，无账号无凭据）。它们的 runtime 只有 descriptor。
   //    ⚠️ opencode 的积分也**不在** `creditsTable` 里（它的余额是本地派生的
   //    通道可用性、零网络，作为特例留在 `credits.balances` 里短路）。
-  const officeaceAuthService = {
-    // ⚠️ **必须传 `ctx.credentials`**：多账号下每个账号的凭据存在 DSH 凭据库里
-    //    按 ref 索引。不传 ⇒ 走兼容文件 `session.json`，那一份是**所有账号共用**
-    //    的，续期会串号（2026-10-13 改造）。
+  /**
+   * OfficeAce 的 auth **不是 `Service` 子类**（它导出的是纯函数集合，没有实例
+   * 状态需要挂到 cordis 服务上）。但仓库的统一 auth 契约（`JetHubAuthLike`）
+   * 与多条守卫用例都按 **`ctx.<provider>Auth` 服务名**取实例 —— 故这里显式
+   * 把命名空间包成一个服务形状的对象。
+   *
+   * ⚠️⚠️ **必须「复制」模块导出，不能手工枚举**（2026-10-13 事故）：
+   *    早先这里是手写的一份方法清单，`persistLogin` 加入后忘了同步 ⇒
+   *    `login.poll` 调 `auths.officeace.persistLogin` 得到 `undefined`，
+   *    被 catch 成「登录交换失败」—— 用户看到的是**授权完却登录失败**，
+   *    而日志里只有一句被吞掉的类型错误。手工枚举的清单**必然**漂移。
+   *
+   * ⚠️ **不能用 `Object.create(officeaceAuth)` 继承**：赋值会沿原型链走到
+   *    模块命名空间的 getter-only 属性，照样抛
+   *    `Cannot set property … which has only a getter`（已实测证伪）。
+   *    故一次性展开复制 —— 模块导出是静态函数，复制的是引用，不会失效。
+   *
+   * ⚠️ **不能直接挂模块命名空间**：同上，getter-only 会让守卫用例的 spy 崩溃。
+   */
+  const officeaceAuthService: typeof officeaceAuth = { ...officeaceAuth }
+  // ⚠️ 以下几个需要注入 `ctx.credentials`（多账号根）：凭据存在 DSH 凭据库里
+  //    按 ref 索引。不传 ⇒ 走兼容文件 `session.json`，那份是**所有账号共用**
+  //    的，续期会串号（2026-10-13 改造）。
+  Object.assign(officeaceAuthService, {
     refreshAccountCredential: (refName: string, pool: unknown, accountId: string) =>
       officeaceAuth.refreshAccountCredential(refName, pool as never, accountId, ctx.credentials as never),
     /**
@@ -2767,6 +2787,16 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
      * 模块函数：守卫用例（`provider-runtime-wiring.spec.ts`）的判据是「布桩在
      * `ctx.officeaceAuth.refreshAccountCredential` 上，然后断言 `refreshAll` 打到它」。
      * 绕开本对象走模块函数 ⇒ spy 收不到，用例静默少一家覆盖。
+     */
+    /**
+     * ⚠️ `refreshAll` **内部必须走本对象的 `refreshAccountCredential`**，不能直接调
+     * 模块函数：守卫用例（`provider-runtime-wiring.spec.ts`）的判据是「布桩在
+     * `ctx.officeaceAuth.refreshAccountCredential` 上，然后断言 `refreshAll` 打到它」。
+     * 绕开本对象走模块函数 ⇒ spy 收不到，用例静默少一家覆盖。
+     *
+     * ⚠️ 这是**唯一**需要覆盖的转发方法：其余导出（含 `startLogin` /
+     * `completeLogin` / `persistLogin` / `fetchSubscriptionSummary` …）由
+     * 上面的展开复制直接提供，无需再抄一遍 —— 抄了就会漂移。
      */
     refreshAll: async (pool: unknown) => {
       const p = pool as {
@@ -2785,17 +2815,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         await officeaceAuthService.refreshAccountCredential(account.credentialRef, pool, account.id)
       }
     },
-    /** 状态探测 / 登录 / 余额（面板与 RPC 用到的其余入口）。 */
-    readOfficeAceCredential: () => officeaceAuth.readOfficeAceCredential(),
-    refreshStoredCredential: () => officeaceAuth.refreshStoredCredential(),
-    isExpiring: (credential: Parameters<typeof officeaceAuth.isExpiring>[0]) =>
-      officeaceAuth.isExpiring(credential),
-    startLogin: () => officeaceAuth.startLogin(),
-    pollLoginCode: (state: string) => officeaceAuth.pollLoginCode(state),
-    completeLogin: (...args: Parameters<typeof officeaceAuth.completeLogin>) =>
-      officeaceAuth.completeLogin(...args),
-    fetchSubscriptionSummary: () => officeaceAuth.fetchSubscriptionSummary(),
-  }
+  })
   {
   /**
    * OfficeAce 的 auth 服务形状包装（`officeaceAuthService`）—— 定义在下方
