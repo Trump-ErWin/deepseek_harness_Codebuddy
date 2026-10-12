@@ -375,7 +375,11 @@ describe('Qoder 同族 RPC 注册表（src/jet-hub-rpc.ts）', () => {
     //    但「特例必须在查表**之前**短路」这条更重要的不变式原先无人守。
     //    ⇒ 改为断言**顺序**（特例早于查表）+ 保留原有两条内容断言。
     const start = code.indexOf("case 'credits.balances'")
-    const branch = code.slice(start, start + 4000)
+    // ⚠️ 切片长度要**够覆盖到查表那一行**：2026-10-12 加 officeace 特例后，
+    //    `creditsOf(credits, req.provider)` 被推到 4000 字符之外 ⇒ 原长度下
+    //    `lookupAt` 变成 -1、报「找不到查表分派」。这里放宽到 8000（仍是
+    //    「本 case 内」的合理范围），改的是**窗口**不是判据。
+    const branch = code.slice(start, start + 8000)
     expect(branch).toContain('isQoderFamily(req.provider)')
     expect(branch).toContain('fetchQoderCreditBalance(credential, product)')
     // ⚠️ 核心：qoder 的特例必须**先于**查表 —— 否则它会落到积分表里

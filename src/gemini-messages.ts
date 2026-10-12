@@ -38,7 +38,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { normalizeHarnessMessages } from './message-shape.js'
-import { readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import { createDsmlMarkerNormalizer, fixDsmlMarkers, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 import type { GeminiInlineImage, GeminiModelSpec } from './gemini.js'
 import {
   deriveGeminiSessionId,
@@ -587,6 +587,8 @@ export async function* consumeGeminiSse(
   let nextIndex = 0
   let finishReason: string | undefined
   let sawAnyChunk = false
+  /** DSML 标记归一化器（见 sse.ts）；每个 SSE 消费一个实例。 */
+  const dsmlFix = createDsmlMarkerNormalizer()
   /** 用量：保留「最大 totalTokenCount」的那一份。 */
   let usage: Partial<TokenUsage> = {}
   let usageTotal = -1
@@ -594,9 +596,19 @@ export async function* consumeGeminiSse(
 
   const closeBlock = function* (): Generator<StreamChunk> {
     if (block === undefined) return
+    // ⚠️ 收尾先下发待定缓冲（DSML 归一化，见 sse.ts），否则最后几个字符
+    //    永远不到达。closeBlock 也是权威出口，故这里做**整串兜底**归一化
+    //    （幂等），保证落块文本干净。
+    if (block.kind === 'text') {
+      const tail = dsmlFix.flush()
+      if (tail.length > 0) {
+        block.text += tail
+        yield { type: 'text-delta', index: block.index, text: tail }
+      }
+    }
     let content: ContentBlock
     if (block.kind === 'text') {
-      content = { type: 'text', text: block.text }
+      content = { type: 'text', text: fixDsmlMarkers(block.text) }
     } else if (block.kind === 'reasoning') {
       content = { type: 'reasoning', text: block.text }
     } else {
@@ -696,8 +708,12 @@ export async function* consumeGeminiSse(
       if (block?.kind !== 'text') yield* openBlock('text')
       sawAnyChunk = true
       if (block !== undefined) {
-        block.text += part.text
-        yield { type: 'text-delta', index: block.index, text: part.text }
+        // ⚠️ **先归一化再累积**（2026-10-13，见 sse.ts 注释）。
+        const fixedText = dsmlFix.push(part.text)
+        block.text += fixedText
+        if (fixedText.length > 0) {
+          yield { type: 'text-delta', index: block.index, text: fixedText }
+        }
       }
     }
   }

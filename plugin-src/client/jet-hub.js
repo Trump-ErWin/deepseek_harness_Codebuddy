@@ -19,6 +19,7 @@ import {
   formatPoolSplitLine,
   formatPackageTooltip,
   splitCreditsByExpiry,
+  expirySplitParts,
   expiryBucketLabel,
   daysUntilExpiry,
 } from './credit-expiry.js';
@@ -384,6 +385,13 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
   // 用 `formatCredits` 会把 94539275 显示成「9453.93万」而非「94.54M」。
   const formatForUnit = (value) => formatUnits(value, unit);
   const expiryText = formatExpirySplitLine(split, formatForUnit);
+  /**
+   * 三档**带色分段**（用户 2026-10-12：永久绿 / 长期黄 / 临期红 + 倒计时）。
+   *
+   * ⚠️ 与 `expiryText` 同源（都走 `credit-expiry.js`），这里额外要结构化分段
+   * 是为了让 React 逐段设 `data-tone` —— 单个字符串只能整体一个颜色。
+   */
+  const expiryParts = expirySplitParts(split, formatForUnit, now);
   // 明细放进 title，不占版面；账号卡片本身已经信息密集了
   const detail = [
     all.length > 1 ? `共 ${all.length} 个资源包，${activeCount} 个有效` : null,
@@ -430,24 +438,37 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     poolSplitText
       ? React.createElement('span', { className: 'dim-jh-creditPools' }, poolSplitText)
       : null,
-    // 两个 buddy + TRAE + LobsterAI：按「会不会近期作废」分桶，与选号判据同一套规则。
-    // 这条也解释了「锁定永久积分后为什么没有可用账号」——临时桶是 0。
-    // ⚠️ 用词「长期」不是「永久」：这些积分都有到期日，只是较远（用户定）。
+    // 两个 buddy + TRAE + LobsterAI + OfficeAce：按「会不会近期作废」分**三档**，
+    // 与选号判据同一套规则（后端只分两档，前端把「真永久」与「到期还远」拆开着色）。
+    // 这条也解释了「锁定永久积分后为什么没有可用账号」——临期桶是 0。
+    // ⚠️ 用词「长期」不是「永久」：有到期日的积分即使很远也不叫永久（用户定）；
+    //    只有**服务端没给到期时间**的才是真·永久（绿）。
     // ⚠️ 与上面的池分桶互斥：有当日池的（loomy / raccoon）走池名分桶，
     // 没有的走到期时间分桶。
-    !poolSplitText && expiryText
+    !poolSplitText && expiryParts.length > 0
       ? React.createElement('span', {
           className: 'dim-jh-creditPools',
-          title: `临时 = 距扣费截止不足 ${windowDays} 天（再不用就作废，优先消耗）；`
-            + '长期 = 其余积分（锁定永久积分后不参与消耗）。',
-        }, expiryText)
+          title: `永久 = 服务端未给到期时间（不会作废）；`
+            + `长期 = 有到期时间但距扣费截止还有 ${windowDays} 天以上；`
+            + `临期 = 距扣费截止不足 ${windowDays} 天（再不用就作废，优先消耗，锁定永久积分后不参与消耗）。`,
+        }, expiryParts.flatMap((part, index) => {
+          const node = React.createElement('span', {
+            key: part.key,
+            className: 'dim-jh-creditPoolPart',
+            'data-tone': part.tone,
+          }, part.countdown === undefined ? part.text : `${part.text}（${part.countdown}）`);
+          // 段间分隔符：与其它分桶行的 ` · ` 一致。
+          return index === 0
+            ? [node]
+            : [React.createElement('span', { key: `sep-${part.key}`, className: 'dim-jh-creditPoolSep' }, ' · '), node];
+        }))
       : null,
     // ⚠️ 配额单位（Gemini）下**不渲染**这句：它的两个「包」是 5 小时窗口与
     // 周窗口，不是资源包 —— 说「2/2 个资源包有效」既没信息量又误导
     // （用户报障原文：「不要渲染 / 2/2 个资源包有效」）。窗口自身的读数
     // 已由上面的 `quotaText` 逐条列出，这里再补一句纯属噪音。
     // ⚠️ 非配额单位（真正由多个资源包构成余额的 provider）行为**逐字不变**。
-    quotaText === null && !poolSplitText && !expiryText && all.length > 1
+    quotaText === null && !poolSplitText && expiryParts.length === 0 && all.length > 1
       ? React.createElement('span', { className: 'dim-jh-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,

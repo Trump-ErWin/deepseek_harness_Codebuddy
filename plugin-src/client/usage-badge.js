@@ -48,6 +48,7 @@ import {
 } from './quota-format.js';
 import { formatUnits, formatQuotaLine, formatClaimGains, unitLabel, QUOTA_UNIT } from './credits-format.js';
 import {
+  expirySplitParts,
   formatExpirySplitLine,
   formatPoolSplitLine,
   splitCreditsByExpiry,
@@ -1194,10 +1195,11 @@ function UsageBadgeActive(props) {
               title: row.error || undefined,
             }, row.balance === null ? (row.error || '查询失败') : balanceLine(row.balance)),
           ]),
-          // 分桶/资源包说明：灰色小字，存在时才占一行
+          // 分桶/资源包说明：小字**逐段带色**（永久绿 / 长期黄 / 临期红 + 倒计时），
+          // 存在时才占一行。用户 2026-10-12 明确要求三档分色。
           row.balance === null
             ? null
-            : renderNote(splitLine(row.balance, windowDays, provider)),
+            : renderSplitNote(splitParts(row.balance, windowDays, provider)),
         ]))),
       hidden === 0
         ? null
@@ -1215,6 +1217,32 @@ function UsageBadgeActive(props) {
   function renderNote(text) {
     if (typeof text !== 'string' || text.length === 0) return null;
     return React.createElement('div', { key: 'note', className: 'dim-jh-badgeRowNote' }, text);
+  }
+
+  /**
+   * 一行**逐段带色**的小字（分桶说明）；无内容返回 `null`（不占位）。
+   *
+   * ⚠️ 颜色语义（用户 2026-10-12 定）：
+   * - `permanent`（**服务端没给到期时间**，真·永久）→ `ok` 绿
+   * - `longTerm`（有到期时间但还早）→ `warn` 黄
+   * - `expiring`（窗口内，再不用就作废）→ `error` 红，且带**倒计时**
+   *
+   * 段间用 ` · ` 分隔（与全局其它分桶行的分隔符一致）。倒计时放在括号里
+   * （`临期 100（2 天 4 小时）`）—— 用户要的「临期 100（倒计时）」正是这个形状。
+   */
+  function renderSplitNote(parts) {
+    if (!Array.isArray(parts) || parts.length === 0) return null;
+    const children = [];
+    parts.forEach((part, index) => {
+      if (index > 0) children.push(React.createElement('span', { key: `sep-${part.key}`, className: 'dim-jh-badgeNoteSep' }, ' · '));
+      children.push(React.createElement('span', {
+        key: part.key,
+        className: 'dim-jh-badgeNotePart',
+        'data-tone': part.tone,
+        ...(part.countdown === undefined ? {} : { title: `最早作废：${part.countdown}后` }),
+      }, part.countdown === undefined ? part.text : `${part.text}（${part.countdown}）`));
+    });
+    return React.createElement('div', { key: 'note', className: 'dim-jh-badgeRowNote' }, children);
   }
 
   /**
@@ -1363,13 +1391,17 @@ function balanceLine(balance) {
 }
 
 /**
- * 分桶文案（当日池优先，其次按到期分桶）。
+ * 分桶**分段**（当日池优先，其次按到期分三档带色）。
  *
  * ⚠️ 与设置页账号卡片**同一套口径、同一批函数**（`credit-expiry.js`）：
- * 两处若各算各的，用户会看到「卡片说临时 55、徽标说长期 55」这种无法解释的偏差。
+ * 两处若各算各的，用户会看到「卡片说临期 55、徽标说长期 55」这种无法解释的偏差。
  * `now` 在渲染这一刻现取 —— 分桶是时间的函数，缓存它会让越线的包继续算长期。
+ *
+ * @returns `[{ key, text, tone, countdown? }]`。当日池（loomy / raccoon）走
+ *   `formatPoolSplitLine` 的单串口径（那两家的池没有到期维度），统一包成
+ *   **无色的 `muted` 段**；到期分桶走 `expirySplitParts` 的**三档带色**分段。
  */
-function splitLine(balance, windowDays, provider) {
+function splitParts(balance, windowDays, provider) {
   const packages = balance.packages || [];
   const unit = packages.find((pkg) => pkg && pkg.unit)?.unit;
   /**
@@ -1385,15 +1417,27 @@ function splitLine(balance, windowDays, provider) {
     for (const pkg of packages) {
       if (!pkg) continue;
       const left = quotaResetsIn(pkg.cycleEndTime);
-      if (left.length > 0) parts.push(`${pkg.name || '未命名'} ${left}`);
+      if (left.length > 0) parts.push({ key: pkg.name || 'unnamed', text: `${pkg.name || '未命名'} ${left}`, tone: 'muted' });
     }
-    return parts.join(' · ');
+    return parts;
   }
   const format = (value) => formatUnits(value, unit);
   const poolText = formatPoolSplitLine(packages, format, provider === 'loomy' ? '永久' : '长期');
-  if (poolText !== null) return poolText;
-  const expiryText = formatExpirySplitLine(splitCreditsByExpiry(packages, windowDays, Date.now()), format);
-  return expiryText ?? '';
+  // 当日池（loomy / raccoon）：池按名字分，没有到期维度 ⇒ 单段无色。
+  if (poolText !== null) return [{ key: 'pool', text: poolText, tone: 'muted' }];
+  // 其余渠道：按到期时间分**三档**，逐段带色（永久绿 / 长期黄 / 临期红 + 倒计时）。
+  return expirySplitParts(splitCreditsByExpiry(packages, windowDays, Date.now()), format, Date.now());
+}
+
+/**
+ * 分桶文案（纯字符串，供不支持分段的调用方/测试复用）。
+ *
+ * ⚠️ 与 `splitParts` **同源**：把分段重新拼成一行，避免两处各写一套判据。
+ */
+function splitLine(balance, windowDays, provider) {
+  return splitParts(balance, windowDays, provider)
+    .map((part) => (part.countdown === undefined ? part.text : `${part.text}（${part.countdown}）`))
+    .join(' · ');
 }
 
 /**

@@ -65,6 +65,7 @@ import { BuddyAdapter } from '../../src/buddy-adapter.js'
 import { ClineAdapter } from '../../src/cline-adapter.js'
 import { CodeArtsAdapter } from '../../src/llm-adapter.js'
 import { GeminiAdapter } from '../../src/gemini-adapter.js'
+import { OfficeAceAdapter } from '../../src/officeace-adapter.js'
 import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
 import { LoomyAdapter, parseLoomyRemoteModels } from '../../src/loomy-adapter.js'
 import { MinimaxAdapter } from '../../src/minimax-adapter.js'
@@ -553,6 +554,25 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
     },
     { id: 'trae', make: () => new TraeAdapter({ ...NO_CRED } as never) },
     { id: 'gemini', make: () => new GeminiAdapter({ ...NO_CRED } as never) },
+    {
+      id: 'officeace',
+      // ⚠️ officeace 的目录是**静态**的（`OFFICEACE_MODELS` 常量），不依赖凭据 ——
+      //    但 `listModels` 有「凭据可读 + 探测通过」门控，未就绪返回 `[]`。
+      //    这里注入一个**恒有凭据**的 provider 让它真正列出目录（否则本段对它
+      //    退化成恒真 = FALSE COVERAGE）。
+      make: () => new OfficeAceAdapter({
+        credentialProvider: async () => ({
+          modelAppKey: 'k', modelAppSecret: 's', maasBaseUrl: 'https://example.invalid',
+          access: 'ak', secret: 'sk', securityToken: 'st', projectId: '',
+          expiresAt: '2099-01-01T00:00:00.000Z', refreshToken: 'rt',
+          dpopPrivateJwk: {},
+        }),
+        // ⚠️ 探测必须注入为**恒真**：默认实现会真发一次网络请求。
+        fetchImpl: (async () => new Response('{}', {
+          status: 200, headers: { 'content-type': 'application/json' },
+        })) as never,
+      } as never),
+    },
     { id: 'loomy', make: () => new LoomyAdapter({ ...NO_CRED } as never) },
     { id: 'raccoon', make: () => new RaccoonAdapter({ ...NO_CRED } as never) },
     { id: 'minimax', make: () => new MinimaxAdapter({ ...NO_CRED } as never) },
@@ -613,7 +633,7 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    expect(CASES).toHaveLength(14)
+    expect(CASES).toHaveLength(15)
   })
 
   /**

@@ -88,6 +88,7 @@ function makeRpc(modelAdapters: Record<string, unknown> | undefined) {
       qoder: {} as never, qodercn: {} as never, trae: {} as never, cline: {} as never,
       loomy: {} as never, raccoon: {} as never, minimax: {} as never, zcode: {} as never,
       gemini: {} as never,
+      officeace: {} as never,
     } as never,
     modelAdapters as never,
   )

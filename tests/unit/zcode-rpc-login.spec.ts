@@ -149,6 +149,7 @@ function makeRpc() {
       minimax: {} as never,
       zcode: zcode as never,
       gemini: {} as never,
+      officeace: {} as never,
     } as never,
     undefined,
   )
@@ -577,6 +578,7 @@ describe('ZCode Jet Hub 登录接入', () => {
       //    仍要由行为证明（`authOf` 按 id 取，取错就落到别的 stub 上）。
       zcode: stub('zcode') as never,
       gemini: stub('gemini') as never,
+      officeace: {} as never,
     })
 
     const h = handler()

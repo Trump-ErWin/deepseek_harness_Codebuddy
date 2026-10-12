@@ -99,6 +99,7 @@ function setup (zcodeStub: unknown = {}, warns: string[] = []) {
       minimax: {} as never,
       zcode: zcodeStub as never,
       gemini: {} as never,
+      officeace: {} as never,
     } as never,
   )
 

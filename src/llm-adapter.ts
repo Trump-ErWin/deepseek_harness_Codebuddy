@@ -14,7 +14,7 @@ import { nextUtc8DayStartMs } from './model-queue.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import { planSessionTitleThinking } from './session-title.js'
 import type { CodeArtsCredential } from './types.js'
 import {
@@ -302,9 +302,14 @@ export function serializeMessages(messages: readonly { role: string; content: un
  * 模型将工具 schema 注入 system 消息、请求体不发送 `tools` 字段，让模型
  * 以 DSML 流式输出工具调用，从根上规避网关空闲断连。
  */
-function isDeepseekV4Model(model: string): boolean {
-  return /^deepseek-v4-(flash|pro)$/.test(model)
-}
+/**
+ * ⚠️ **已移至共享层 `./dsml.js`**（2026-10-13）。
+ *
+ * OfficeAce 通道复用不到本文件的实现 ⇒ 漏注入 DSML 提示 ⇒ 模型臆造
+ * `<｜DSML｜ calls>` 语法。协议定义**必须只有一份**。
+ */
+export { isDeepseekV4Model, needsDsmlToolMode, buildDsmlSystemPrompt } from './dsml.js'
+import { isDeepseekV4Model, needsDsmlToolMode, buildDsmlSystemPrompt, DSML_INVOKE_CLOSE, DSML_INVOKE_OPEN_PREFIX, DSML_TOOL_CALLS_CLOSE, DSML_TOOL_CALLS_OPEN } from './dsml.js'
 
 /**
  * 工具名匹配大参数写文件类工具（content/arguments 可能达到数万 token）。
@@ -327,44 +332,6 @@ function isDeepseekV4Model(model: string): boolean {
  * 非 deepseek-v4 模型（如 openpangu / GLM-5.2 等）使用华为标准 IAM AK/SK 鉴权，
  * 不走 CodeArts Agent APIG 网关，无 60s 空闲断连问题，继续保持标准 tool_calls。
  */
-function needsDsmlToolMode(model: string, _toolNames: readonly string[]): boolean {
-  return isDeepseekV4Model(model)
-}
-
-/**
- * 构造让 deepseek-v4 以原生 DSML 格式调用工具的 system 提示。
- *
- * 适配器不把 `tools` 字段发给后端（否则模型走标准 tool_calls 一次性
- * 打包路径），而是把 OpenAI function schema 以文本注入 system 消息，
- * 并明确要求模型使用 `<｜DSML｜tool_calls>` 语法。`parseDsmlToolCalls`
- * 会把模型输出的 DSML 块解析为结构化 tool-call，harness 无需感知差异。
- */
-function buildDsmlSystemPrompt(tools: Array<{
-  type: string
-  function: { name: string; description?: string; parameters?: unknown }
-}>): string {
-  const toolJson = JSON.stringify(tools.map((tool) => ({
-    name: tool.function.name,
-    description: tool.function.description,
-    parameters: tool.function.parameters,
-  })), null, 2)
-  return [
-    '以下是你可用的工具及其 JSON Schema。当需要调用工具完成任务时，',
-    '必须使用原生 DSML 工具调用语法输出，格式如下：',
-    '<｜DSML｜tool_calls><｜DSML｜invoke name="工具名"><｜DSML｜parameter name="参数名" string="true">参数值</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>',
-    '',
-    '规则：',
-    '- 工具名必须是下面列表中的 name。',
-    '- 每个参数用一个 <｜DSML｜parameter> 标签包裹，参数值放在标签之间。',
-    '- 字符串参数加 string="true" 属性；对象/数组/数字/布尔参数不要加该属性。',
-    '- 一次可以输出多个 <｜DSML｜invoke> 调用（工具可以并行）。',
-    '- 文件内容请一次性完整写入单个 write 调用的 content 参数，不要拆分或省略。',
-    '',
-    '工具列表（JSON Schema）：',
-    toolJson,
-  ].join('\n')
-}
-
 /**
  * CodeArts 并发排队端点。当后端按账户的会话
  * 并发上限达到时，chat completions 请求会以
@@ -775,10 +742,9 @@ function readCodeArtsChunk(
  * - 边界：DSML 标签使用全角 `｜`（U+FF5C）而非半角 `|`，与模型实际
  *   输出一致。`<thought>` 为半角普通 XML 标签，与 DSML 官方文档一致。
  */
-const DSML_TOOL_CALLS_OPEN = '<｜DSML｜tool_calls>'
-const DSML_TOOL_CALLS_CLOSE = '</｜DSML｜tool_calls>'
-const DSML_INVOKE_OPEN_PREFIX = '<｜DSML｜invoke'
-const DSML_INVOKE_CLOSE = '</｜DSML｜invoke>'
+// ⚠️ **协议常量已从 `./dsml.js` 导入**（2026-10-13）：此前本地硬编码，
+//    与 `buildDsmlSystemPrompt` 分处两地 —— 一旦分叉（比如提示词教
+//    `tool_calls`、解析器认别的），工具调用就静默失效。现在只有一份。
 const DSML_PARAM_OPEN_PREFIX = '<｜DSML｜parameter'
 const DSML_PARAM_CLOSE = '</｜DSML｜parameter>'
 const THOUGHT_OPEN = '<thought>'
@@ -1711,6 +1677,11 @@ export class CodeArtsAdapter extends LlmAdapter {
      * 把整段思考**复制回正文**，等于归位失效并放大问题。故此处只加守卫。
      */
     const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    /**
+     * DSML 标记归一化器（见 sse.ts `createDsmlMarkerNormalizer`）。
+     * ⚠️ **每个 `stream()` 调用一个实例**：待定缓冲是跨帧状态，共用会串流。
+     */
+    const dsmlFix = createDsmlMarkerNormalizer()
     let proseLoopDetected = false
     /**
      * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
@@ -1761,8 +1732,16 @@ export class CodeArtsAdapter extends LlmAdapter {
           if (proseLoopGuard.observe(text)) proseLoopDetected = true
         }
         if (!proseLoopDetected) {
-          block.text += text
-          yield { type: 'text-delta', index: block.index, text }
+          // ⚠️ **先归一化再累积**（2026-10-13）：本文件是 codearts 等多家渠道的
+          //    基础正文出口，此前**漏接**归一化 —— 实测重启后会话仍有 270 处
+          //    `<｜｜DSML｜｜` 坏标记，正是走这条路径（首批只覆盖了
+          //    openai-compat 与 buddy）。push() 流式安全，
+          //    见 sse.ts `createDsmlMarkerNormalizer`。
+          const fixedText = dsmlFix.push(text)
+          block.text += fixedText
+          if (fixedText.length > 0) {
+            yield { type: 'text-delta', index: block.index, text: fixedText }
+          }
         }
       }
       if (reasoning.length > 0) {
@@ -2149,6 +2128,18 @@ export class CodeArtsAdapter extends LlmAdapter {
     //
     // ⚠️ 截断必须在 `visible` 回退**之前**应用：否则「正文命中循环 → 截断后为空
     // → 回退又把推理文本复制进正文」会把病态循环原样搬到可见区。
+    // ── DSML 归一化收尾：下发待定缓冲 ──（与 openai-compat.ts / buddy 同款）
+    // 扣住的尾部在流结束时必须放行，否则最后几个字符永远不到达宿主。
+    {
+      const tail = dsmlFix.flush()
+      if (tail.length > 0 && !proseLoopDetected) {
+        const tailBlock = blocks.find(candidate => candidate.kind === 'text')
+        if (tailBlock !== undefined) {
+          tailBlock.text += tail
+          yield { type: 'text-delta', index: tailBlock.index, text: tail }
+        }
+      }
+    }
     const truncatedText = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
       ? (textBlock?.text ?? '').slice(0, proseLoopGuard.cutAt)
       : undefined

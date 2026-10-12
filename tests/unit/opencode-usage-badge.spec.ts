@@ -94,6 +94,7 @@ function makeRpc() {
       minimax: {} as never,
       zcode: {} as never,
       gemini: {} as never,
+      officeace: {} as never,
     } as never,
     undefined,
   )

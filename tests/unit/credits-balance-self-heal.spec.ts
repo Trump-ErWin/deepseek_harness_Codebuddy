@@ -108,6 +108,7 @@ function setup(options: HarnessOptions) {
     trae: a('trae'), cline: a('cline'), loomy: a('loomy'),
     raccoon: a('raccoon'), minimax: a('minimax'), zcode: a('zcode'),
     gemini: a('gemini'),
+    officeace: {} as never,
   }
   registerJetHubRpc(
     ctx as never,

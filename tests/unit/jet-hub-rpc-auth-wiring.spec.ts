@@ -64,6 +64,10 @@ const AUTH_SERVICE: Readonly<Record<string, string>> = {
   minimax: 'minimaxAuth',
   zcode: 'zcodeAuth',
   gemini: 'geminiAuth',
+  // ⚠️ OfficeAce 的值是 **auth 模块命名空间**，不是 `ctx.*Auth` 服务实例 ——
+  //    它导出的是纯函数（`refreshAccountCredential` 在命名空间上）。见
+  //    `JetHubAuths.officeace` 的注释与 `officeace-auth.ts` 模块头。
+  officeace: 'officeaceAuth',
 }
 
 /**
@@ -219,7 +223,7 @@ function entry(provider: string, credentialRef: string): ProviderAccountEntry {
 }
 
 describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.refresh）', () => {
-  it('registry 里占 auth 键位的恰好 13 家（opencode / aggregate 豁免）', () => {
+  it('registry 里占 auth 键位的恰好 14 家（opencode / aggregate 豁免）', () => {
     // ★ **方向性**：以 `PROVIDER_REGISTRY` 为权威，`AUTH_SERVICE` 是被测对象。
     //   「registry 里有、表里没有」⇒ 红，且 `toEqual` 的差异**点名那个 id**
     //   （而不是让下面的逐 provider 用例静默少跑一家）。
@@ -229,7 +233,7 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
       '左侧多出的 id = 表里有而 registry 没有（僵尸项），右侧多出的 id = ' +
       'registry 里有而本表漏登记（该 provider 的续期会零行为覆盖）',
     ).toEqual([...EXPECTED_AUTH_PROVIDER_IDS].sort())
-    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(13)
+    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(14)
     // 另一方向（原断言的**全部**证明力都在这条上，单独留着免得它随上面那条一起消失）：
     // 表里的每个键都必须是 registry 里真实存在的 provider id（防拼写错误造成的僵尸项）。
     for (const id of Object.keys(AUTH_SERVICE)) {

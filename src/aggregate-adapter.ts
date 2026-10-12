@@ -781,6 +781,9 @@ export class AggregateAdapter extends LlmAdapter {
     'gemini',
     'zcode',
     'opencode',
+    // officeace（2026-10-12）：华为 MaaS 云端直连渠道，`channel: true`
+    // ⇒ 必须进聚合目录，否则它的模型**永不进聚合、静默不可见**。
+    'officeace',
   ])
 
   /**

@@ -79,6 +79,7 @@ function authsStub(): never {
     qoder: blank(), qodercn: blank(), trae: blank(), cline: blank(),
     loomy: blank(), raccoon: blank(), minimax: blank(), zcode: blank(),
     gemini: blank(),
+    officeace: {} as never,
   } as never
 }
 
@@ -789,6 +790,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
         minimax: {} as never, // 本组用例不触发
         zcode: {} as never, // 本组用例不触发
         gemini: {} as never, // 本组用例不触发
+        officeace: {} as never, // officeace（auth 模块命名空间占位）
       } as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -886,6 +888,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       minimax: {} as never,
       zcode: {} as never,
       gemini: {} as never,
+      officeace: {} as never,
     } as never)
     const response = await handler!(new Request('http://localhost/api/jet-hub', {
       method: 'POST',
@@ -952,6 +955,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
         minimax: {} as never,
         zcode: {} as never,
         gemini: {} as never,
+        officeace: {} as never,
       } as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -1191,6 +1195,7 @@ describe('model.list / model.setDisabled 端点', () => {
         minimax: {} as never,
         zcode: {} as never,
         gemini: {} as never,
+        officeace: {} as never,
       } as never,
       options.modelAdapters as never,
     )

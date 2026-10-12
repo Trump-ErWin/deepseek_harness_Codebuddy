@@ -453,6 +453,9 @@ describe('H2 · 续期路径刻意不按模型过滤（与上一组的反面）'
     raccoon: 'raccoonAuth',
     minimax: 'minimaxAuth',
     gemini: 'geminiAuth',
+    // ⚠️ officeace 的值是 auth 服务形状的包装对象（`officeaceAuthService`），
+    //    不是 `Service` 子类实例 —— 但它同样以 `ctx.officeaceAuth` 注册。
+    officeace: 'officeaceAuth',
   }
 
   /**
@@ -544,7 +547,8 @@ describe('H2 · 续期路径刻意不按模型过滤（与上一组的反面）'
   }
 
   it('⚠️ 名单非空（防空洞自检：名单为空时 it.each 一条都不跑，整组恒绿）', () => {
-    expect(REFRESH_PROVIDERS.length).toBe(12)
+    // ⚠️ 2026-10-12 加 officeace：12 → 13。
+    expect(REFRESH_PROVIDERS.length).toBe(13)
     expect(REFRESH_PROVIDERS).not.toContain('zcode')
   })
 
