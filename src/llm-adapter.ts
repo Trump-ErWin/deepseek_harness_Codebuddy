@@ -14,7 +14,7 @@ import { nextUtc8DayStartMs } from './model-queue.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import { planSessionTitleThinking } from './session-title.js'
 import type { CodeArtsCredential } from './types.js'
 import {
@@ -1711,6 +1711,11 @@ export class CodeArtsAdapter extends LlmAdapter {
      * 把整段思考**复制回正文**，等于归位失效并放大问题。故此处只加守卫。
      */
     const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    /**
+     * DSML 标记归一化器（见 sse.ts `createDsmlMarkerNormalizer`）。
+     * ⚠️ **每个 `stream()` 调用一个实例**：待定缓冲是跨帧状态，共用会串流。
+     */
+    const dsmlFix = createDsmlMarkerNormalizer()
     let proseLoopDetected = false
     /**
      * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
@@ -1761,8 +1766,16 @@ export class CodeArtsAdapter extends LlmAdapter {
           if (proseLoopGuard.observe(text)) proseLoopDetected = true
         }
         if (!proseLoopDetected) {
-          block.text += text
-          yield { type: 'text-delta', index: block.index, text }
+          // ⚠️ **先归一化再累积**（2026-10-13）：本文件是 codearts 等多家渠道的
+          //    基础正文出口，此前**漏接**归一化 —— 实测重启后会话仍有 270 处
+          //    `<｜｜DSML｜｜` 坏标记，正是走这条路径（首批只覆盖了
+          //    openai-compat 与 buddy）。push() 流式安全，
+          //    见 sse.ts `createDsmlMarkerNormalizer`。
+          const fixedText = dsmlFix.push(text)
+          block.text += fixedText
+          if (fixedText.length > 0) {
+            yield { type: 'text-delta', index: block.index, text: fixedText }
+          }
         }
       }
       if (reasoning.length > 0) {
@@ -2149,6 +2162,18 @@ export class CodeArtsAdapter extends LlmAdapter {
     //
     // ⚠️ 截断必须在 `visible` 回退**之前**应用：否则「正文命中循环 → 截断后为空
     // → 回退又把推理文本复制进正文」会把病态循环原样搬到可见区。
+    // ── DSML 归一化收尾：下发待定缓冲 ──（与 openai-compat.ts / buddy 同款）
+    // 扣住的尾部在流结束时必须放行，否则最后几个字符永远不到达宿主。
+    {
+      const tail = dsmlFix.flush()
+      if (tail.length > 0 && !proseLoopDetected) {
+        const tailBlock = blocks.find(candidate => candidate.kind === 'text')
+        if (tailBlock !== undefined) {
+          tailBlock.text += tail
+          yield { type: 'text-delta', index: tailBlock.index, text: tail }
+        }
+      }
+    }
     const truncatedText = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
       ? (textBlock?.text ?? '').slice(0, proseLoopGuard.cutAt)
       : undefined
