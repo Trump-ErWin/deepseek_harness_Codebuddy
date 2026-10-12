@@ -1376,6 +1376,82 @@ describe('Cline 接线（源码级回归）', () => {
     expect(byId.get('cline-free/mimo-v2.6-flash')?.inputModalities).toEqual(['text', 'image'])
   })
 
+  // ── issue IKKZUG：models.dev 失败后必须能**自愈**，不能固化 ──
+  //
+  // 真实缺陷：models.dev 超时后 `remoteComplete` 仍为 true（`complete` 只反映
+  // 两个 Cline 端点，**不含** models.dev），而短路判据是
+  // `if (this.remoteComplete) return` ⇒ 闸门的冷却永远读不到 ⇒ models.dev
+  // 在整个进程生命周期内只被调 1 次，cline-pass/* 一直「明确不支持图片」。
+  //
+  // 用户实测：桌面端 10-11 23:02 启动 → 10-12 00:30 仍稳定拒图，**只能重启**。
+
+  it('⚠️⚠️ models.dev 失败**不得**让目录被判成「已完整」（否则永不自愈）', async () => {
+    let devCalls = 0
+    const adapter = makeAdapter({
+      // ⚠️ `models` **不能为空**：`ensureModelsDev` 在 `if (models.length > 0)`
+      // 之内被调用，而 models.dev 的职责正是「补进目录里没有的 cline-pass/*」。
+      // 目录本身为空 ⇒ 压根不会去读 models.dev（那是本仓库的既有设计，
+      // 空目录时补无可补）。所以这里给一条真实存在的条目。
+      loadModels: async () => ({
+        models: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'DS Free' }],
+        warnings: [],
+        remote: {
+          freeIds: ['cline-free/deepseek-v4.1-flash'],
+          remoteIds: ['cline-free/deepseek-v4.1-flash'],
+          entries: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'DS Free' }],
+          complete: true,
+        },
+      }) as never,
+      loadModelsDev: async () => {
+        devCalls++
+        // 首拉失败，之后恢复 —— 模拟「第一次超时、第二次成功」。
+        if (devCalls === 1) throw new Error('models.dev timeout')
+        return new Map([
+          ['cline-pass/deepseek-v4.1-flash', { id: 'cline-pass/deepseek-v4.1-flash', supportsImage: true }],
+        ])
+      },
+      // ⚠️ 闸门默认 30 秒冷却会挡住第二次拉取；这里把它压到 0，
+      // 让「能否自愈」这一条**独立于冷却时长**地被观测（冷却本身有另两条用例）。
+      onCatalogLoaded: () => {},
+    } as never)
+    const gate = (adapter as unknown as {
+      catalogGate: { reset: () => void; cooling: () => boolean }
+    }).catalogGate
+    const modalitiesOf = async (): Promise<unknown> => {
+      const listed = await adapter.listModels('cline')
+      return listed.find((m) => m.id === 'cline-pass/deepseek-v4.1-flash')?.inputModalities
+    }
+
+    // 第一次：models.dev 没读到 ⇒ 该模型**根本不在目录里**（缺模型，不是误判模态）。
+    expect(await modalitiesOf()).toBeUndefined()
+
+    // ⚠️ 关键：清掉冷却后必须**真的重新拉**并把 models.dev 合进来 ——
+    // 修复前这里被 `remoteComplete` 短路，models.dev 永不再读（只能重启）。
+    gate.reset()
+    expect(await modalitiesOf()).toEqual(['text', 'image'])
+    expect(devCalls, '必须重试 models.dev（不能被 remoteComplete 短路）').toBeGreaterThan(1)
+  })
+
+  it('⚠️ 目录已完整且 models.dev 也已读到时，仍保持「已完整」（不得反复重拉）', async () => {
+    // ⚠️ 反向验证的另一半：上一条若把判据写成「恒 false」就会变成
+    // 「每次都重拉两个 Cline 端点」的请求风暴 —— 那同样是缺陷。
+    let devCalls = 0
+    let endpointCalls = 0
+    const adapter = makeAdapter({
+      loadModelsDev: async () => {
+        devCalls++
+        return new Map([
+          ['cline-pass/deepseek-v4.1-flash', { id: 'cline-pass/deepseek-v4.1-flash', supportsImage: true }],
+        ])
+      },
+    })
+    const internal = adapter as unknown as { remoteComplete: boolean }
+    void endpointCalls
+    for (let i = 0; i < 5; i++) await adapter.listModels('cline')
+    expect(devCalls, '两者都就绪后不该反复重拉 models.dev').toBe(1)
+    expect(internal.remoteComplete, '两者都就绪 ⇒ 判为已完整').toBe(true)
+  })
+
   it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {
     // ⚠️ 2026-10-08 改：能力表由 registry 派生，故改为**行为断言**
     //（原先正则扫 `credits-capabilities.js` 的 `cline: Object.freeze({…})` 文本）。

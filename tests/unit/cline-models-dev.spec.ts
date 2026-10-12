@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  CLINE_MODELS_DEV_TIMEOUT_MS,
   applyModelsDevCatalog,
   makeClineModelsDevLoader,
   parseClineModelsDev,
@@ -178,5 +179,54 @@ describe('makeClineModelsDevLoader', () => {
     await expect(load()).rejects.toThrow(/HTTP 500/)
     await expect(load()).rejects.toThrow(/HTTP 500/)
     expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  // ── issue IKKZUG：拉取本身要健壮 ──
+  //
+  // 真实测（用户 oct_heaven，Windows 直连 3 次）：20010ms 超时 / 20010ms 超时 /
+  // 1908ms 成功。目标 api.json **解压后 5.39 MB**、Brotli 编码、无 Content-Length。
+  // 成功那次只用 1.9 秒，失败的都是整段卡死 —— 说明慢链路需要余量，
+  // 而 20 秒在 5.39MB 上偏紧。
+
+  it('⚠️ 超时上限是 60 秒（5.39MB 的目标，20 秒偏紧）', () => {
+    // 反向验证：把常量改回 20_000 本条即红。
+    expect(CLINE_MODELS_DEV_TIMEOUT_MS).toBe(60_000)
+  })
+
+  it('⚠️ 显式请求 Brotli（服务端支持，而 Node fetch 默认不带 ⇒ 白下 5.39MB）', async () => {
+    // ⚠️ 缺这一条的真实代价不是「慢」而是**超时**：5.39MB 未压缩传输在慢链路上
+    // 极易撞上上限，而压缩后通常只有几百 KB。
+    let seen: Headers | undefined
+    const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+      seen = new Headers(init?.headers)
+      return new Response(JSON.stringify(REAL_SHAPE), { status: 200 })
+    })
+    await makeClineModelsDevLoader({ fetcher: fetcher as never })()
+    expect(seen?.get('accept-encoding'), '未显式声明 br ⇒ 下 5.39MB 明文').toMatch(/br/i)
+  })
+
+  it('ETag 可用时做条件请求（304 不重下 5.39MB）', async () => {
+    // 两段：第一次带 ETag，第二次回 304 ⇒ 应复用上次结果、不再 JSON.parse。
+    const payloads: Array<() => unknown> = [
+      () => JSON.stringify(REAL_SHAPE),
+      () => { throw new Error('304 分支不应走到 JSON.parse') },
+    ]
+    let call = 0
+    const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+      const headers = new Headers(init?.headers)
+      const current = call++
+      if (current === 0) {
+        expect(headers.get('if-none-match'), '第二次必须带上 ETag').toBeNull()
+        return new Response(payloads[0]!(), { status: 200, headers: { ETag: '"W/"abc"' } })
+      }
+      expect(headers.get('if-none-match'), '第二次必须带上 ETag').toBe('"W/"abc"')
+      return new Response(null, { status: 304 })
+    })
+    const load = makeClineModelsDevLoader({ fetcher: fetcher as never, ttlMs: 0 })
+    const first = await load()
+    expect(first.size).toBeGreaterThan(0)
+    const second = await load()
+    // 304 必须回落成「与上次相同的结果」，而不是空表。
+    expect(second.size).toBe(first.size)
   })
 })

@@ -61,7 +61,19 @@ import type { ClineModel } from './cline-models.js'
 export const CLINE_MODELS_DEV_URL = 'https://models.dev/api.json'
 
 /** 单次目录请求超时（毫秒）。 */
-export const CLINE_MODELS_DEV_TIMEOUT_MS = 20_000
+export const CLINE_MODELS_DEV_TIMEOUT_MS = 60_000
+
+/**
+ * ⚠️ 20s → 60s（issue IKKZUG，2026-10-12）。
+ *
+ * 实测（本机 Windows 直连 models.dev 三次）：`20010ms 超时` / `20010ms 超时` /
+ * `1908ms 成功`。**成功只用 1.9 秒，失败的都是整段卡死** —— 说明这不是「慢」，
+ * 而是「要么很快、要么整段挂住」，20 秒在 5.39 MB 的目标上偏紧。
+ *
+ * 方向是安全的：本模块**失败只记日志、返回空表**（见 `ensureModelsDev`），
+ * 超时放宽只影响「多等一会儿」，不会让任何一次失败变成阻塞 —— 而收益是慢链路
+ * 从「必然失败」变成「大概率成功」。
+ */
 
 /**
  * 缓存有效期。
@@ -230,17 +242,50 @@ export function makeClineModelsDevLoader(
   options: ClineModelsDevLoaderOptions = {},
 ): () => Promise<Map<string, ClineModelsDevEntry>> {
   const fetcher = options.fetcher ?? fetch
+  /**
+   * 上次成功拿到的 ETag 与结果（供条件请求 + 304 回退）。
+   *
+   * ⚠️ **不能**指望 `TtlCache` 承担回退：它只缓存**本次** `load()` 的返回值，
+   * 而 304 分支必须**返回上一次的结果** —— 那时 `load()` 拿不到新 body。
+   * 故这两份状态由本闭包自己持有。
+   */
+  let lastEtag: string | undefined
+  let lastResult: Map<string, ClineModelsDevEntry> | undefined
+
   const cache = new TtlCache<Map<string, ClineModelsDevEntry>>({
     ttlMs: options.ttlMs ?? CLINE_MODELS_DEV_TTL_MS,
     ...options.now === undefined ? {} : { now: options.now },
     load: async () => {
       const response = await fetcher(CLINE_MODELS_DEV_URL, {
         method: 'GET',
-        headers: { Accept: 'application/json' },
+        headers: {
+          Accept: 'application/json',
+          // ⚠️ **必须显式声明**（issue IKKZUG）：服务端支持 Brotli，而
+          // Node 原生 `fetch` **默认不带** `Accept-Encoding` ⇒ 每次都在下
+          // **解压后 5.39 MB** 的明文。代价不只是慢，而是**极易撞上超时上限**
+          // （成功那次只用 1.9 秒，失败的都是整段卡死）。
+          'Accept-Encoding': 'br, gzip',
+          // 条件请求：带上次的 ETag，命中就只回一个 304 而不重下 5.39MB。
+          ...lastEtag === undefined ? {} : { 'If-None-Match': lastEtag },
+        },
         signal: AbortSignal.timeout(CLINE_MODELS_DEV_TIMEOUT_MS),
       })
+      // ⚠️ 304 必须**回落成上次的结果**，绝不能当成「空目录」——
+      // 那会把所有模型的图片能力一次性打回纯文本（正是本模块要防的形态）。
+      if (response.status === 304) {
+        if (lastResult !== undefined) return lastResult
+        // ⚠️ 没有上次结果却收到 304：协议上不该发生，但**不能**返回空表，
+        // 那正是「把没读到说成不支持」。抛错让调用方按「未就绪」处理。
+        throw new Error('models.dev 返回 304 但本地没有可回落的结果')
+      }
       if (!response.ok) throw new Error(`models.dev HTTP ${response.status}`)
-      return parseClineModelsDev(await response.json())
+      const parsed = parseClineModelsDev(await response.json())
+      lastResult = parsed
+      const etag = response.headers.get('etag')
+      // ⚠️ 服务端**撤掉** ETag 时必须清空，否则会一直带着一个失效的
+      // If-None-Match 请求（服务端不再回 304，白白多一个请求头）。
+      lastEtag = etag ?? undefined
+      return parsed
     },
   })
   return async () => await cache.get()
