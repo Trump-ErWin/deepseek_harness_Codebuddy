@@ -1024,10 +1024,8 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 `verify-buddy-fingerprint-fix.mts`（同一份被拦历史：裸 fetch ❌11128 /
 打过补丁的真实 `BuddyAdapter` ✅）。要长期保留就得把它们挪进版本控制内的目录。
 
-⚠️ **另有一个独立问题，与指纹无关、尚未修**：`space-bunny` 对「assistant 同时带非空
-`content` 与 `tool_calls`」回 `tool calls and tool results do not match, please`
-（适配器报 `INVALID_REQUEST`），而 `step-5-preview` 容忍**同一份**历史。
-需单独取证后再动。
+ℹ️ 验收时还暴露过一个「`space-bunny` 报 `tool calls and tool results do not match`」的
+现象 —— **已在下一小节解决**（真因不是工具配对，而是 wire 首条角色）。
 
 ### 已修：上面那个「尚未修」的独立问题，真因**不是**工具配对（2026-10-12 同日）
 
@@ -1060,3 +1058,39 @@ turns` 原先按**下标**断言 `messages[0]` 是 assistant —— 那正是把
 用例：`tests/unit/buddy-adapter.spec.ts` 的「wire 首条不得是 assistant」段（3 条：
 补位且不破坏配对、正常历史不多塞、`options.system` 已就位时不重复补）。
 验收：同一份被拦历史走真实适配器，`step-5-preview` 与 `space-bunny` **都 ✅**。
+
+### ⚠️ 2026-10-12 子代理审计抓到两个**真缺陷**（均已修）
+
+对上面两个提交跑了一轮 subagent 驱动的审计 + 对抗性审计（两个独立视角并行：
+功能面 / 测试面，各自做了变异验证）。抓到的东西按严重度：
+
+**① 补位判据过窄（真缺陷，我第一版就写错了）**
+判据写成 `role === 'assistant'`，只覆盖 assistant-first。**user-first / tool-first 照样原样发出** ——
+而本仓库 `account-probe.ts` 的 `PROBE_SYSTEM` 注释里早有 2026-09-25 的双端点对照实测：
+**WorkBuddy 网关强制 `messages[0]` 是 system，否则 400 + 11128**。
+⇒ 真正的判据是 **`!== 'system'`**。与 `PROBE_SYSTEM` 那段「无条件给所有 provider
+都带 system，判据不该依赖另一个产品碰巧不校验」的取舍一致。
+
+**② `this.product.id` 零覆盖（测试盲区，实测存活变异）**
+`serializeMessages(…, this.product.id)` 改成 `serializeMessages(…, 'buddy')`
+（完全忽略产品配置）⇒ **163 条用例全绿**。原因：`buddy` 与 `workbuddy` **都在**
+`TENCENT_PROVIDERS` 那张表里，「喂 WORKBUDDY 也能改写」那条用例**结构上无法区分**
+这两个实现 —— 是同义反复。
+修法：**反向**用例（喂非腾讯系产品，断言 wire 逐字节不变）。已验证它能抓住该变异。
+
+⚠️ 两条的**共同教训**：「按文案/按当前观察写死判据」会漏掉相邻形态。真实判据往往是
+「X 必须满足」，而不是「我实测到的那种坏法」—— 后者永远漏其余分支。
+
+**③ 实测凭据从 `scripts/` 挪进 `tests/e2e/`（悬空引用）**
+上面那张角色表与「首条角色」那条判据，原先只以**脚本**形式存在于被 gitignore 的
+`scripts/`（另一份 checkout），注释指向它们 ⇒ 后人无法复核。现各入库一个带双闸门的
+e2e 规格（`buddy-fingerprint-roles.e2e.spec.ts` / `buddy-first-message-role.e2e.spec.ts`）。
+⚠️ 这两个文件**不可省**：单测只能锁「代码按那个范围做」，**锁不住那个范围本身对不对**。
+
+**④ `buddy-growth.ts` 是第三条旁路（当前无害，已加路标）**
+它有两处直发 `POST …/v2/chat/completions`，**不经 `BuddyAdapter`、故不过改写**。
+当前安全（请求体写死「你好」/「1+1等于几」，无指纹也无 assistant 历史），
+但那条安全性依赖「请求体写死」这个易碎前提 ⇒ 已在其注释里写明将来要接上。
+
+**⑤ 未采纳**：一条 `toLowerCase()` 预检的性能优化建议（5.4×，属优化非正确性，
+且实测非命中时 `String.replace` 返回**同一对象**、前缀缓存没被破坏）—— 留待需要时再做。

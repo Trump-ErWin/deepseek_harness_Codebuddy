@@ -833,6 +833,15 @@ export async function claimAllGrowth(
  * 故这是本机唯一还能 API 化的积分相关动作（做任务本身必须客户端真操作）。
  * 幂等：重复调用只是多发一次对话，不重复计积分（活跃按天去重，服务端保证）。
  * 低频：串行 + 单账号单条，避免触发风控。
+ *
+ * ⚠️ **本文件是第三条直连腾讯端点的旁路，不经 `BuddyAdapter`，因此不过
+ * `tencent-fingerprint` 的内容级风控改写**（同一文件里另一处发 chat 的
+ * `fetchRealRequestId` 同理）。当前**安全**，因为两处的请求体都是**写死的短消息**
+ * （「你好」/「1+1等于几」），既不含风控指纹、也没有 assistant 历史。
+ * ⚠️ 但这条安全性**依赖「请求体写死」这个易碎前提**：一旦将来改成携带会话历史
+ * 或把用户内容拼进来，就必须同时接上 `rewriteTencentContentFingerprints`
+ * （见 `src/openai-gateway/tencent-fingerprint.ts`），否则会静默变成一个
+ * 未改写的入口 —— 而那种失败的表象是「整轮 400/11128」，极难归因。
  */
 export async function keepStreakActive(
   credential: BuddyCredential,
