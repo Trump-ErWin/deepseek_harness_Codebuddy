@@ -54,6 +54,12 @@
 // ⚠️ 搜索判据与模型清单**共用同一份实现**（`model-filter.js`）：两处各写一套
 // 「空搜索词算命中全部」之类的约定，迟早漂移成「同一句话在两张表里搜出不同结果」。
 import { isFilterActive, matchesModelQuery } from './model-filter.js';
+// ⚠️ host 的方括号处理**必须与宿主侧同源**（`src/openai-gateway/config.ts` 的
+// `formatGatewayHost` / `stripHostBrackets`）。前端若自己写一遍 `includes(':')`，
+// 两处判据迟早漂移，症状是「面板上的地址与日志里的地址不一致」——
+// 而地址是用户要抄走的东西，不一致等于失效。
+// ⚠️ 该模块必须**零 node import**（它同时被 esbuild 打进浏览器 bundle）。
+import { formatGatewayHost, gatewayHttpUrl } from '../../src/openai-gateway/config.js';
 
 export async function copyToClipboard(value) {
   try {
@@ -588,13 +594,99 @@ export function gatewayButtonTitle(status) {
  * `DSH_OPENAI_GATEWAY_PORT` 改过，写死 `8326` 会让用户拿一个连不上的地址去
  * 配客户端，且这种错误在客户端侧表现为「连不上」，极难自查。
  *
+ * ⚠️ **host 同样来自宿主侧**（`DSH_OPENAI_GATEWAY_HOST`，issue IKL7UN）：
+ * 容器化部署里它是容器桥接 IP（如 `172.21.0.8`），此时前端若还印
+ * `127.0.0.1` 就是把**宿主地址**当成容器内地址展示 —— 用户抄走后从宿主访问
+ * 恰好连不上（那正是 issue 报告者的症状）。故这里一律用真实监听地址。
+ *
  * @param {GatewayStatus | null | undefined} status
  * @returns {string}
  */
 export function gatewayEndpoint(status) {
   const address = status?.address
-  if (!address) return ''
-  return `http://${address.host}:${address.port}/v1`
+  if (!address) return '';
+  return gatewayHttpUrl(address.host, address.port, '/v1');
+}
+
+/**
+ * 网关是否只绑在本机回环上。
+ *
+ * ⚠️ 这条判据存在的原因是**文案不能说谎**：设置页里有「网关只绑定 127.0.0.1」
+ * 这样的安全声明（原为常量文案）。host 一旦可配（issue IKL7UN），那句声明在
+ * 用户绑了桥接 IP 之后就是**错误陈述**，会让人误以为「外部连不上是正常的」
+ * 而把真实故障排查方向带偏。
+ *
+ * 判据只看地址字面量，不做 DNS —— 与宿主侧 `isWildcardHost` 同样的取舍
+ * （见 `src/openai-gateway/config.ts`）：`localhost` 这类主机名由内核解析，
+ * 前端不猜。**未知即按「不是纯回环」处理**（提示更保守，不会漏掉暴露风险）。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {boolean}
+ */
+export function gatewayLoopbackOnly(status) {
+  const host = status?.address?.host;
+  if (typeof host !== 'string' || host.trim() === '') return true;
+  const value = formatGatewayHost(host).toLowerCase();
+  // `127.0.0.0/8` 整个网段都是回环（Linux 实测：绑 127.0.0.2 后 127.0.0.1 连不上，
+  // 反之亦然 —— 它是**同一网段里的不同回环地址**，对外都不可达）。
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(value)) return true;
+  return value === '[::1]';
+}
+
+/**
+ * 绑了**非回环**地址时的提示行（issue IKL7UN）。
+ *
+ * ## 为什么这条必须存在
+ *
+ * 面板里原有的安全声明是常量：「网关只绑定 127.0.0.1」。host 可配之后，用户
+ * 完全可能（容器化部署下**必须**）把它设成容器桥接 IP —— 此时那句声明就是
+ * 错误陈述，而错误的后果是双向的：
+ *
+ * - 「只绑回环」⇒ 用户以为「外部连不上是设计如此」，放弃排查；
+ * - 「已绑对外地址」却不说 ⇒ 用户以为「同机隔离仍然成立」，把网关配进
+ *   浏览器端工具或扩展（面板脚注里点名警告的正是这件事）。
+ *
+ * ⚠️ 必须同时给出**怎么改回去**：只说「暴露面变大了」会让用户卡在
+ * 「那我该填什么」上，而他填的就是本 issue 的正解（容器自身 IP）。
+ *
+ * @param {GatewayStatus} status 必定带 address（调用方已判过 running）
+ * @returns {string}
+ */
+export function nonLoopbackNotice(status) {
+  const address = status?.address;
+  const host = typeof address?.host === 'string' && address.host.trim() !== '' ? address.host : '非回环地址';
+  return `监听地址是 ${host}（不再是本机回环）：只应在容器/端口映射场景使用，`
+    + '此时同网络的其它主机也能连到这个端口。仅本机使用时把 DSH_OPENAI_GATEWAY_HOST '
+    + '改回 127.0.0.1（或删除该环境变量）并重启。';
+}
+
+/**
+ * 弹窗末尾那条**安全脚注**（不属于三段中的任何一段）。
+ *
+ * ## 为什么必须按实际监听地址分支（issue IKL7UN）
+ *
+ * 原文案是常量：「网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 ——
+ * 真正的隔离靠密钥，不要把它配置进任何浏览器端工具或扩展。」
+ *
+ * `DSH_OPENAI_GATEWAY_HOST` 一旦可配，这句话在绑了桥接 IP 的部署里就**前后
+ * 矛盾**：前半句说「只绑定 127.0.0.1」（错），后半句却警告「同机其它用户也能
+ * 连」—— 用户读到矛盾的说明时最可能的反应是**两边都不信**。
+ *
+ * ⚠️ 回环分支必须**逐字节保留**原文案：它是用户 2026-10-04 定下的措辞，
+ * 且该分支覆盖绝大多数（非容器）部署 —— 改它等于无故改动既有 UI 文案。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {string}
+ */
+export function gatewayFootnote(status) {
+  if (status?.running && !gatewayLoopbackOnly(status)) {
+    const host = typeof status.address?.host === 'string' ? status.address.host : '非回环地址';
+    return `网关绑定在 ${host}，同网络（含同机）的其它主机都能连到该端口 —— 隔离**只**靠密钥，`
+      + '不要把它配置进任何浏览器端工具或扩展。仅本机使用时把 DSH_OPENAI_GATEWAY_HOST '
+      + '改回 127.0.0.1（或删除该环境变量）并重启。';
+  }
+  return '网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 —— 真正的隔离靠密钥，'
+    + '不要把它配置进任何浏览器端工具或扩展。';
 }
 
 /**
@@ -623,6 +715,11 @@ export function gatewayStatusLines(status) {
       '协议支持：OpenAI Chat Completions 与 OpenAI Responses API。',
       // 地址单列一行（带端口），它是用户要抄走的东西。
       endpoint ? `API 请求地址：${endpoint}` : '',
+      // ⚠️ 暴露面变了必须**明说**（issue IKL7UN）。原先「只绑定 127.0.0.1」是
+      // 常量文案，host 可配之后它就是错误陈述 —— 用户会以为「外面连不上是
+      // 设计如此」而放弃排查。反之，回环部署下**不加这句**，避免把刚精简过的
+      // 三行文案重新撑肿（精简是用户 2026-10-04 的明确要求）。
+      gatewayLoopbackOnly(status) ? '' : nonLoopbackNotice(status),
     ].filter(Boolean)
   }
   if (status.enabled) {

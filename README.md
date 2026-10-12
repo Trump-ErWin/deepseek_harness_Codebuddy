@@ -248,6 +248,36 @@ POST http://127.0.0.1:8326/v1/responses           ← OpenAI Responses API
 ⚠️ **两个端点同时可用，没有「格式开关」**：客户端用哪一套协议，由它自己请求的
 路径决定。
 
+⚠️ 上面那两个地址里的 **host 与端口都可被环境变量改掉**
+（`DSH_OPENAI_GATEWAY_HOST` / `DSH_OPENAI_GATEWAY_PORT`）；设置页里的
+「API 请求地址」显示的是**实际监听地址**，照它抄即可。
+
+### 容器化部署（Docker / Compose）
+
+默认只绑 `127.0.0.1`，因此**端口映射对网关无效**：容器里 `curl 127.0.0.1:8326`
+能通只是假象，docker-proxy 与同网络的其它容器走的是容器桥接 IP（`eth0`），
+那个地址上没有监听，于是宿主侧看到 `Connection reset by peer`
+（对照：Web 端口绑的是容器 IP，所以映射可用）。
+
+修法是让网关绑**容器自身的接口地址**：
+
+```yaml
+environment:
+  - DSH_OPENAI_GATEWAY_ENABLED=1
+  - DSH_OPENAI_GATEWAY_HOST=172.21.0.8   # 容器自身 IP：hostname -i 或 ip -4 addr show eth0
+  - DSH_OPENAI_GATEWAY_PORT=8326
+```
+
+```console
+$ docker exec dsh ss -tlnp | grep 8326
+LISTEN  172.21.0.8:8326     # 绑上桥接 IP 后，端口映射才可达
+```
+
+⚠️ **不许填 `0.0.0.0` / `::` 这类通配地址**：会被显式拒绝并在启动前报错
+（dsh 本体的 `--host` 也是同一姿态）。绑通配等于把网关暴露给整个网络，
+真正的隔离只剩 API Key —— 而本网关承担的是「用你已登录的账号发请求」。
+容器场景填容器自身 IP 即可，暴露面仍在同一容器网络内。
+
 ### 拿到地址与密钥
 
 鉴权使用 `Authorization: Bearer <网关 API Key>`。
@@ -271,6 +301,7 @@ POST http://127.0.0.1:8326/v1/responses           ← OpenAI Responses API
 | 环境变量 | `DSH_OPENAI_GATEWAY_ENABLED=0`（**完全不启动**，连 API Key 文件都不生成）|
 | 设置页开关 | 关掉后不再监听 |
 | 改端口 | `DSH_OPENAI_GATEWAY_PORT` 填非法值会记录错误并跳过启动，**不会**静默改用其它端口 |
+| 改地址 | `DSH_OPENAI_GATEWAY_HOST` 填通配地址（`0.0.0.0` / `::`）同样记录错误并跳过启动 —— **不会**静默绑到全部网卡 |
 
 ### 请求体上限与 keep-alive
 
@@ -284,8 +315,11 @@ POST http://127.0.0.1:8326/v1/responses           ← OpenAI Responses API
 
 ### 安全边界
 
-- 只绑定 `127.0.0.1`，**不可**改成对外地址 —— 注意这只挡得住远程访问，
-  **同机其它用户/进程仍可连到该端口**，真正的隔离靠 API Key。
+- **默认**只绑定 `127.0.0.1`，且**拒绝**通配地址（`0.0.0.0` / `::`）。
+  只有容器/端口映射这类「客户端不在同一网络命名空间」的场景才需要改
+  `DSH_OPENAI_GATEWAY_HOST`，且应填**具体接口地址**（如容器自身 IP）而不是通配。
+  ⚠️ 无论绑哪张网卡，**同机（乃至同网段）的其它用户或进程都能连到该端口**，
+  真正的隔离靠 API Key —— 不要把它配置进任何浏览器端工具或扩展。
 - 密钥以明文写在 `$DSH_HOME/openai-gateway/api-key`。POSIX 下的 `0600` 权限在
   **Windows 上不生效**，多用户机器请改用 `DSH_OPENAI_GATEWAY_API_KEY` 环境变量。
 
@@ -347,6 +381,7 @@ ZCode (智谱) • 94.54MToken
 |---|---|---|
 | `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` | 关闭 | 设为真值时，**没有已登录账号的渠道**在模型选择器里整体隐藏 |
 | `DSH_OPENAI_GATEWAY_ENABLED` | `1` | 设为 `0` / `false` / `off` / `no` 时完全不启动网关 |
+| `DSH_OPENAI_GATEWAY_HOST` | `127.0.0.1` | 网关监听地址。容器/端口映射场景填**容器自身 IP**（`hostname -i`）；填 `0.0.0.0` / `::` 等通配地址会被拒绝并跳过启动 |
 | `DSH_OPENAI_GATEWAY_PORT` | `8326` | 网关监听端口 |
 | `DSH_OPENAI_GATEWAY_API_KEY` | 自动生成 | 网关 Bearer 密钥 |
 | `DSH_REASONING_LOOP_GUARD` | 开启 | 思考死循环守卫总开关 |
