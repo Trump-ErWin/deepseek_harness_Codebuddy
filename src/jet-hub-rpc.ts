@@ -1243,34 +1243,134 @@ export interface ModelCatalogSource {
  */
 
 /**
- * 取某 provider 的**全量模型 id**（不套黑名单），供「关闭全部」与「关闭供应商」共用。
+ * `fullCatalogIds` 的返回值。
  *
- * 两条路径的优先级（与 `model.list` 保持一致的取舍，但**不需要展示名**：
- * 这里只要 id 来写黑名单，故不走 `model.list` 那套回填 disabled 的复杂逻辑）：
- * 1. 优先 `modelAdapters[provider].listAllModels()` —— **同步**，不触发远端拉取；
- * 2. 缺失时退化 `llm.listModels(provider)` —— 异步，且**结果已被黑名单过滤**。
+ * ⚠️ **刻意是「部分成功」的形状**，因为三个调用点对目录的**完整度要求不同**
+ *（这是本函数不能再返回单一 `{ ids } | { error }` 的原因）：
  *
- * ⚠️ 第 2 条路径拿不到「已关闭」的模型（它们不在 `listModels` 返回值里），
- * 故它写出的黑名单是**不完整**的。这对「关闭全部」无影响（已关闭的本就无需再关），
- * 但意味着**不能用它判断「是否全部已关闭」** —— 状态判定必须用
- * `listAllModels()` 的全量目录（见 `provider.status`）。
+ * | 调用点 | 需求 | 对「远端那一半缺失」的动作 |
+ * |---|---|---|
+ * | `model.setAllDisabled` / `provider.setEnabled` | **必须完整**（要写黑名单） | **拒绝且不落盘** |
+ * | `account.test` | **尽力而为**（只要一个 id 就能测） | 用拿到的那些照常测 |
+ */
+interface FullCatalogResult {
+  /** **并集**（适配器目录 ∪ 远端目录），已去重。 */
+  ids: string[]
+  /**
+   * **目录是否可用于「写黑名单」类操作**（远端读到且**非空**）。
+   *
+   * ⚠️⚠️ 写黑名单的调用方**必须判这个字段**，不要自己判「`ids` 是否为空」——
+   * 冷缓存下适配器兜底表会让 `ids` 看起来非空，而它只是**子集**。
+   *
+   * ⚠️ 它刻意**合并了两种**「目录不可用」形态（它们对调用方的动作相同，
+   * 都是「不能拿兜底子集当权威」）：
+   *
+   * 1. **远端读失败**（超时 / 抛错 / 无 llm 服务）⇒ 见 {@link remoteError}；
+   * 2. **远端读到但为空** —— `createModelCatalog` 在「无已登录账号」时门控
+   *    返回 `[]`，含义是「**看不到**」而**不是**「该 provider 一个模型都没有」。
+   *    ⚠️ 此时适配器兜底表**仍可能有内容**，照它写黑名单就是**同一个缺陷的
+   *    另一个入口**（实测：远端 `[]` + 兜底表 1 条 ⇒ 「关闭全部」只关那 1 条
+   *    并返回成功）。⚠️ 这一种**没有** `remoteError`（它不是错误）。
+   *
+   * ⇒ 让调用方各自写一遍这个复合判据，就是本仓库踩过的
+   * 「一文件两套同义判据必然先腐坏一套」⇒ 收敛成这一个字段。
+   */
+  complete: boolean
+  /**
+   * 目录不可用的**原因**；仅当是「远端读失败」时有值。
+   *
+   * ⚠️ 为 `undefined` 而 `complete === false` ⇒ 就是上面第 2 种形态
+   *（远端读到但为空），调用方据此给不同的文案。
+   */
+  remoteError?: string
+}
+
+/**
+ * 取某 provider 的**模型 id**（两个目录来源的并集），供「关闭全部」「关闭供应商」
+ * 与「测试账号选模型」共用。
  *
- * @returns `{ ids }` 成功；`{ error }` 失败原因（调用方据此拒绝且**不落盘**）。
+ * ## ⚠️⚠️ 并集是必须的，不能「优先 `listAllModels()`」（真实缺陷）
+ *
+ * 本仓库有两个「目录」来源，**并不总是同源**：
+ *
+ * | 来源 | 形态 |
+ * |---|---|
+ * | `modelAdapters[provider].listAllModels()` | 不套黑名单；**冷缓存下是编译期兜底表（子集）** |
+ * | `llm.listModels(provider)` | **真实远端目录 − 黑名单**；异步、可能失败 |
+ *
+ * 原实现是「**优先** `listAllModels()`，只要它存在就短路、根本不看 `listModels()`」，
+ * 而冷缓存下兜底表是**子集**（`model-catalog.ts` 的 `cached ?? config.syncCatalog()`；
+ * 实测 `cline` 冷缓存只有 **3** 条，远端有 **460** 条）⇒ 两个关闭方向都会写出
+ * **只含兜底表条目**的黑名单，而端点返回「成功」：
+ *
+ * - `model.setAllDisabled`：用户以为整个供应商已关闭，而**几百个模型仍可选**；
+ * - `provider.setEnabled`：更重 —— `provider.status` 的 `closed` 判据是
+ *   `total > 0 && disabled === total`，而 `total` 也取自 `listAllModels()`
+ *   ⇒ 界面**显示为已关闭**，对话框里那几百条却**仍能选中**。这正是该端点注释里
+ *   列为**必须避免**的「账号全停用但模型仍可见」形态的镜像。
+ *
+ * 用户报障路径**恰恰是冷缓存**（脚本/设置页首次打开就点「关闭全部」）。
+ * ⚠️ 既有注释其实早已立下约定「失败时**不落盘** —— 否则会写入一个不完整的
+ * 黑名单，用户看到『关了一半』且无从判断原因」，但 `listAllModels()` 冷缓存返回
+ * 子集时它**不算失败**，于是绕过了那条守卫。并集把那个缺口补上。
+ *
+ * ## ⚠️ 适配器那一半**不能丢**（即使远端成功）
+ *
+ * `listModels()` 会把**已被用户关闭**的模型过滤掉，而适配器目录带着它们。
+ * 漏掉会让 `provider.setEnabled` 的 `ids.length === 0` 判据在「全部已关闭」时
+ * 误判成「没有可关闭的模型」而拒绝操作。
+ *
+ * ## ⚠️ 与 `readableCatalogIds` 的分工：**目录来源只此一处**
+ *
+ * 两者共用本函数取目录，区别只在**失败时的动作**：写黑名单的调用方**拒绝操作**，
+ * 提示层（`readableCatalogIds`）**放弃核对**。
+ * ⚠️ **不要在这里或那里再各写一份目录来源逻辑** —— 本仓库踩过「一文件两套同义
+ * 判据必然先腐坏一套」（IKJW33 修复时实测出内层判据在生产路径上不可达）。
+ *
+ * ⚠️ **远端读取带超时**（{@link CATALOG_READ_TIMEOUT_MS}）：这是写操作的前置读取，
+ * 不能把用户点开关的等待无限拉长。
+ *
+ * @param ctx - 取 `llm` 服务用。
+ * @param modelAdapters - 设置页目录来源（并集的一半，同步、不产生网络请求）。
+ * @param provider - 目标 provider。
+ * @returns 见 {@link FullCatalogResult}（**部分成功**是合法结果）。
  */
 async function fullCatalogIds(
   ctx: Context,
   modelAdapters: Readonly<Record<string, ModelCatalogSource>> | undefined,
   provider: string,
-): Promise<{ ids: string[] } | { error: string }> {
-  const all = modelAdapters?.[provider]?.listAllModels()
-  if (all !== undefined) return { ids: all.map((model) => model.id) }
-  const llm = llmServiceOf(ctx)
-  if (llm === undefined) return { error: 'llm 服务不可用' }
+): Promise<FullCatalogResult> {
+  // ── 来源一：适配器目录（同步；但**冷缓存下是兜底子集**）──
+  // ⚠️ 它抛错**不独自决定成败**：远端那一半仍可能成功，故单独吞掉。
+  const adapterIds: string[] = []
   try {
-    return { ids: (await llm.listModels(provider)).map((model) => model.id) }
+    for (const model of modelAdapters?.[provider]?.listAllModels() ?? []) adapterIds.push(model.id)
+  } catch {
+    /* 适配器异常不该让整个读取失败：远端目录仍可用 */
+  }
+
+  // ── 来源二：远端真实目录（权威；冷缓存下会真发一次拉取）──
+  const llm = llmServiceOf(ctx)
+  if (llm === undefined) {
+    // ⚠️ 远端拿不到 ⇒ 只剩兜底子集 ⇒ **不可用于写黑名单**（`complete: false`）。
+    return { ids: adapterIds, complete: false, remoteError: 'llm 服务不可用' }
+  }
+  let remoteIds: string[]
+  try {
+    remoteIds = (await withTimeout(llm.listModels(provider), CATALOG_READ_TIMEOUT_MS))
+      .map((model) => model.id)
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
-    return { error: `读取模型列表失败：${reason}` }
+    return { ids: adapterIds, complete: false, remoteError: `读取模型列表失败：${reason}` }
+  }
+
+  // ⚠️⚠️ **远端读到但为空 ⇒ 同样不可用于写黑名单**（`complete: false`，且**无**
+  // `remoteError` —— 它不是错误）。含义是「看不到」（无账号门控），不是
+  // 「该 provider 一个模型都没有」；此时适配器兜底表仍可能有内容，照它写黑名单
+  // 就是同一个缺陷的另一个入口（见 `FullCatalogResult.complete` 的长注释）。
+  return {
+    ids: [...new Set([...adapterIds, ...remoteIds])],
+    complete: remoteIds.length > 0,
   }
 }
 
@@ -1378,6 +1478,12 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  *    `[]`（门控隐藏整个 provider）⇒ 空目录意味着「看不到」而非「全部下架」；
  * 3. **`llm` 服务缺失**：拿不到远端目录，无从核对。
  *
+ * ⚠️ **目录来源取自 `fullCatalogIds`，本函数不自己再取一遍** ——
+ * 两处各写一份「哪个来源优先」的判据，就是本仓库踩过的
+ * 「一文件两套同义判据必然先腐坏一套」（那次实测出内层判据在生产路径上**不可达**）。
+ * 这里只负责把它的**失败**翻译成「放弃核对」（提示层错了不如不说），
+ * 而两个关闭方向把同一个失败翻译成「拒绝操作」（写黑名单必须完整）。
+ *
  * ⚠️ **必须带超时**：`listModels()` 在**冷缓存**下会真的发一次远端拉取
  *（`loadCatalog()`），于是「开关」这个原本纯本地的写操作多了一条网络依赖。
  * 开关**绝不能**被远端拖住 —— 用户点一下开关却转圈几十秒，比少一条提示糟得多。
@@ -1397,31 +1503,17 @@ async function readableCatalogIds(
   modelAdapters: Readonly<Record<string, ModelCatalogSource>> | undefined,
   provider: string,
 ): Promise<ReadonlySet<string> | undefined> {
-  const llm = llmServiceOf(ctx)
-  if (llm === undefined) return undefined
-  let listed: Array<{ id: string }>
-  try {
-    listed = await withTimeout(llm.listModels(provider), CATALOG_READ_TIMEOUT_MS)
-  } catch {
-    // ⚠️⚠️ **读不到就整体放弃**，不得退化成「只用 listAllModels 兜底表」——
-    // 那会退回第一版的大面积误报（见函数头）。
-    return undefined
-  }
-  // ⚠️ 空目录 = 「看不到」（无账号门控），不是「全部下架」。
-  if (listed.length === 0) return undefined
-  const known = new Set(listed.map((model) => model.id))
-  // ⚠️ 并上设置页目录（`listAllModels()`）：opencode 恒返回编译期兜底表，
-  // 而 `listModels()` 在只有匿名槽时只给免费模型 ⇒ 少了这一半，设置页可见的
-  // 付费模型会被误报成「已下架」（审计实测 13/13 假警告）。
-  // ⚠️ 它**不保证存在**（外部 / 旧适配器）⇒ 缺失时只是并集少一半，仍可核对。
-  // ⚠️ 读它**不产生网络请求**（契约要求同步）；⚠️ 它抛错也**不能**让开关失败
-  //（开关是主操作、核对只是提示层）⇒ 单独 try/catch，失败就只用另一半来源。
-  try {
-    for (const model of modelAdapters?.[provider]?.listAllModels() ?? []) known.add(model.id)
-  } catch {
-    /* 提示层的核对失败不得反噬开关本身 */
-  }
+  const catalog = await fullCatalogIds(ctx, modelAdapters, provider)
+  // ⚠️⚠️ **目录不可用 ⇒ 整体放弃核对**（判 `complete`，它同时覆盖
+  // 「远端读失败」与「远端读到但为空」两种形态 —— 见该字段的长注释）。
+  // 不得退化成「只用 listAllModels 兜底表」：那会退回第一版的大面积误报。
+  // 提示层错了不如不说。
+  if (!catalog.complete) return undefined
+  const known = new Set(catalog.ids)
   // ⚠️ 并回「被关着」的 id —— **必须在 await 之后读**（理由见函数头）。
+  // ⚠️ `fullCatalogIds` 的并集**已含**适配器目录里那些被关闭的 id，
+  // 但**不含**「既不在适配器目录、也不在远端目录」的历史死键（那些只存在于
+  // 黑名单里）。它们必须并回来：打开方向正是清理它们的唯一路径。
   for (const [id, disabled] of Object.entries(pool.listDisabledModels(provider))) {
     if (disabled === true) known.add(id)
   }
@@ -2907,22 +2999,30 @@ function registerJetHubEndpoints(
         }
 
         // 模型推断：显式指定 > 已有的限流标记（用户最可能想看的就是它）> 全量目录第一个。
-        // ⚠️ 只有前两者都拿不到时才去读目录 —— `fullCatalogIds` 在读不到时返回
-        // `{ error }`，若无条件先读它，一个「明明有标记可测」的账号会因为目录服务
-        // 暂时不可用而被拒，属于自造的失败。
+        // ⚠️ 只有前两者都拿不到时才去读目录 —— 若无条件先读它，一个「明明有标记可测」
+        // 的账号会因为目录服务暂时不可用而被拒，属于自造的失败。
+        //
+        // ⚠️⚠️ **本调用点对目录是「尽力而为」，与两个关闭方向刻意不同**：
+        // 它只要**一个** id 就能测，故远端读失败时**不拒绝**，用拿到的（适配器兜底表
+        // 或空）照常继续。⚠️ 这与 `model.setAllDisabled` 的「必须完整 ⇒ 拒绝」是
+        // **两种不同的完整度要求**，不是同一条判据的两个写法（实测：若这里也拒绝，
+        // 「适配器有目录 + llm 临时故障」会从「能测」退化成 bad-request）。
         //
         // 目录也读不出来时如实报错，**不**猜一个模型名发出去（猜错会得到与账号
         // 无关的 404，把「账号不可用」和「模型名不对」两件事混成一条报错）。
         let modelId = pickTestModel(entry, [], req.modelId)
         if (modelId === '') {
           const catalog = await fullCatalogIds(ctx, modelAdapters, entry.provider)
-          if ('error' in catalog) {
+          modelId = pickTestModel(entry, catalog.ids, req.modelId)
+          // ⚠️ 一个 id 都挑不出来**且远端也读失败**时才报「无法确定」并带上原因；
+          // 远端成功但目录为空 ⇒ 落到下面那句「没有可测试的模型」（两件事不同：
+          // 前者是「读不到」，后者是「读到了但里面没有模型」）。
+          if (modelId === '' && catalog.remoteError !== undefined) {
             return {
               ok: false,
-              error: { code: 'bad-request', message: `无法确定要测试的模型：${catalog.error}` },
+              error: { code: 'bad-request', message: `无法确定要测试的模型：${catalog.remoteError}` },
             }
           }
-          modelId = pickTestModel(entry, catalog.ids, req.modelId)
         }
         if (modelId === '') {
           return {
@@ -3716,12 +3816,28 @@ function registerJetHubEndpoints(
         }
         if (req.disabled) {
           // 关闭全部：先取全量目录，再一次性写入黑名单。
-          // 目录读取的三条分支（适配器 → llm → 失败即拒绝）与「关闭供应商」
-          // 完全一致，故共用 fullCatalogIds；⚠️ 失败时**不落盘** ——
-          // 否则会写入一个不完整的黑名单，用户看到「关了一半」且无从判断原因。
+          // ⚠️⚠️ **目录不可用 ⇒ 拒绝且不落盘**（既有约定：宁可明确失败，也不要
+          // 静默关一半）。判据是 `catalog.complete`（同时覆盖「远端读失败」与
+          // 「远端读到但为空」）而**不是**「`ids` 是否为空」—— 冷缓存下适配器
+          // 兜底表会让 `ids` 看起来非空，而它只是**子集**，据此写黑名单正是
+          // 本 issue 修的缺陷（用户看到「关闭成功」，而几百个远端模型仍可选）。
           const catalog = await fullCatalogIds(ctx, modelAdapters, req.provider)
-          if ('error' in catalog) {
-            return { ok: false, error: { code: 'bad-request', message: catalog.error } }
+          if (!catalog.complete) {
+            // ⚠️ 文案与 `provider.setEnabled` **逐字同构**（两种形态对用户意义
+            // 不同：`remoteError` 有值 = 「**读不到**」（可重试）；无值 =
+            // 「**没账号**」（去登录））。⚠️ 不要用 `remoteError ?? '…'` 一刀切：
+            // 那样「远端读到但为空」会走通用文案，与另一个端点**不对称** ——
+            // 同一个 `complete === false` 在两个端点上给出不同的可读性
+            //（审计把这条列为覆盖缺口 4，已统一）。
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message: catalog.remoteError === undefined
+                  ? '该供应商没有可关闭的模型，未做任何变更'
+                  : `没有可关闭的模型：${catalog.remoteError}`,
+              },
+            }
           }
           await pool.setModelsDisabled(req.provider, catalog.ids)
           ctx.logger.info(`[jet-hub] 关闭 ${req.provider} 的全部 ${catalog.ids.length} 个模型`)
@@ -3743,7 +3859,7 @@ function registerJetHubEndpoints(
        * 读取多个供应商的汇总状态（Jet Hub 左侧导航分组 + 一键开关据此渲染）。
        *
        * 为什么一次取全部：8 个供应商若逐个查，就是 16 次往返，且每次都要走
-       * 异步凭据解析。这里**全程只用同步的内存副本**，不产生任何网络请求：
+       * 异步凭据解析。这里**默认全程只用同步的内存副本**，不产生网络请求：
        * - 模型目录用 `modelAdapters[provider].listAllModels()`（同步；它内部
        *   在冷缓存时会**后台**补拉，但不阻塞本次返回）；
        * - 账号用 `pool.listAccountsByProvider()`（同步读内存）。
@@ -3754,6 +3870,33 @@ function registerJetHubEndpoints(
        *
        * 适配器缺失（外部/旧适配器）时 `total = 0`、`closed = false`：
        * 保守判为「未关闭」，让用户可以尝试操作，而不是误报成已关闭。
+       *
+       * ## ⚠️⚠️ `closed` 必须只走「安全方向」，故它在必要时**会去核实一次**
+       *
+       * `listAllModels()` 在**冷缓存**下返回各家**编译期兜底表**（子集），
+       * 而 `closed = total > 0 && disabled === total` 是**基于那个子集**算的
+       * ⇒ 子集可能**误报已关闭**（真实缺陷，独立审计实测）：
+       *
+       * ```
+       * 兜底表 [hy3]（冷缓存） + 黑名单 { hy3: true }（旧版本「关闭全部」写下的）
+       * ⇒ total=1, disabled=1 ⇒ closed:true
+       * 而远端还有 glm-5.2 / deepseek-v4-flash 可选 ⇒ 界面显示「已关闭」却仍能选
+       * ```
+       *
+       * ⚠️ 危险方向**只有 `closed: true` 这一个**：报 false 是安全的（用户可点开关，
+       * 点了会得到明确错误）。故这里**只在子集判据说「已关闭」时才去核实**
+       *（用 `fullCatalogIds` 取并集）：
+       *
+       * - 核实成功 ⇒ 用并集重算 `total` / `disabled` / `closed`；
+       * - 核实不了（远端读失败 / 为空）⇒ **保守报未关闭**（安全方向），
+       *   与「适配器缺失」同一取舍。
+       *
+       * ⚠️ 这样**常见路径零网络**：绝大多数供应商是「未关闭」，子集判据
+       * 直接给 false、不触发核实（冷缓存下也不触发）。只有**真的可能已关闭**
+       * 的供应商才付一次目录读取；缓存已热时那次读是纯内存的。
+       * ⚠️ 代价：多个「已关闭」供应商会**串行**各读一次（每次上限
+       * {@link CATALOG_READ_TIMEOUT_MS}）—— 首屏最多因此多花「已关闭家数 × 2 秒」
+       * 的最坏值，而实际情况是缓存已热（用户会先看到列表才会去关）。
        */
       case 'provider.status': {
         const req = payload as RpcProviderStatusRequest
@@ -3766,7 +3909,7 @@ function registerJetHubEndpoints(
           // 无意义的键（前端按 PROVIDERS 取，多出来的键会被忽略，但脏数据不该产生）。
           if (provider.length === 0) continue
           const catalog = modelAdapters?.[provider]?.listAllModels()
-          const total = catalog?.length ?? 0
+          let total = catalog?.length ?? 0
           // ⚠️ `listAllModels()` **不带 disabled 字段**，故必须另取黑名单再按 id 计数。
           const disabledMap = pool.listDisabledModels(provider)
           let disabled = 0
@@ -3774,6 +3917,30 @@ function registerJetHubEndpoints(
             for (const model of catalog) {
               // 与 `disabledModelsFor` 的判定对齐：只有显式 true 才算已关闭。
               if (disabledMap[model.id] === true) disabled++
+            }
+          }
+          let closed = total > 0 && disabled === total
+          // ⚠️⚠️ 只有「即将报已关闭」才核实（危险方向，见方法头）。
+          if (closed) {
+            const full = await fullCatalogIds(ctx, modelAdapters, provider)
+            // ⚠️⚠️ **判据是「远端读成功」，不是 `complete`**：`complete` 额外要求
+            // 远端**非空**，而这里恰好有一个**正常**的空形态 ——
+            // 「全部模型都已关闭」时 `listModels()` 被黑名单过滤成 `[]`
+            //（实测：这正是本端点要正确回答的那个状态！）。
+            // 若这里用 `complete`，一关全就永远核实不了、`closed` 恒为 false
+            // ⇒ 「关闭供应商」后界面永远显示未关闭（本修复第一版踩过，
+            // 两条既有用例当场变红）。
+            // ⚠️ 而「无账号门控」（真的看不到）时远端也是 `[]`，两者**同形**；
+            // 此时并集只剩适配器兜底表，`disabled` 会按它算 —— 因为
+            // `closed` 的判据是「子集里全部命中」，若兜底表全命中就仍报已关闭。
+            // 这是可接受的：兜底表全关 + 远端看不到 ⇒ 用户确实没有可选模型。
+            if (full.remoteError === undefined) {
+              total = full.ids.length
+              disabled = full.ids.filter((id) => disabledMap[id] === true).length
+              closed = total > 0 && disabled === total
+            } else {
+              // 核实不了（远端读失败）⇒ 保守报未关闭（安全方向）。
+              closed = false
             }
           }
           const entries = pool.listAccountsByProvider(provider)
@@ -3785,7 +3952,7 @@ function registerJetHubEndpoints(
               //（老文档可能缺该字段，缺省语义等同启用）。
               enabled: entries.filter((entry) => entry.enabled !== false).length,
             },
-            closed: total > 0 && disabled === total,
+            closed,
           }
         }
         const value: RpcProviderStatusResponse = { statuses }
@@ -3839,15 +4006,34 @@ function registerJetHubEndpoints(
           modelCount = Object.keys(cleared).length
         } else {
           const catalog = await fullCatalogIds(ctx, modelAdapters, req.provider)
-          if ('error' in catalog) {
-            // 目录读不出来 → 整个关闭操作失败，**不落盘、不广播**。
-            return { ok: false, error: { code: 'bad-request', message: catalog.error } }
-          }
-          if (catalog.ids.length === 0) {
-            // 「不关闭模型就不关闭供应商」的落点。
+          if (!catalog.complete) {
+            // 目录不可用 → 整个关闭操作失败，**不落盘、不广播**。
+            // ⚠️ 与 `model.setAllDisabled` 同判据（`complete`，它同时覆盖
+            // 「远端读失败」与「远端读到但为空」）：兜底子集不算「完整目录」，
+            // 据此关闭会让供应商**显示已关闭而模型仍可选**。
+            //
+            // ⚠️ 文案按 `remoteError` 分流：两种形态对用户意义不同 ——
+            // 前者是「**读不到**」（可重试），后者是「**没账号**」（去登录）。
+            // ⚠️ 不要写成 `没有可关闭的模型：${catalog.remoteError}` 一刀切：
+            // `remoteError` 在「远端读到但为空」时是 `undefined`，
+            // 拼进模板会向用户打印字面量 `undefined`（审计实测过这个形态）。
+            //
+            // ⚠️⚠️ **这里不需要单独的「目录为空」分支**（审计指出的死代码）：
+            // `complete === true` ⟺ 远端读到且非空 ⟹ 并集 `ids` 必非空
+            //（`ids` 是适配器目录 ∪ 远端目录）⇒ 原先那句
+            // `if (catalog.ids.length === 0)` 在数学上不可达，且它与本分支在
+            // 「远端空」上**给出相同文案**（同义的两套判据）。
+            // 按本仓库「一文件两套同义判据必然先腐坏一套」的既有处置删除。
+            // 后果：即使将来有人放宽 `complete` 的定义，`setModelsDisabled`
+            // 对空列表也是**直接返回不落盘**（见该方法注释），不会写坏数据。
             return {
               ok: false,
-              error: { code: 'bad-request', message: '该供应商没有可关闭的模型，未做任何变更' },
+              error: {
+                code: 'bad-request',
+                message: catalog.remoteError === undefined
+                  ? '该供应商没有可关闭的模型，未做任何变更'
+                  : `没有可关闭的模型：${catalog.remoteError}`,
+              },
             }
           }
           await pool.setModelsDisabled(req.provider, catalog.ids)
