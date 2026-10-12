@@ -3017,7 +3017,10 @@ describe('account.reorder 端点', () => {
  *
  * 这套用例的重点是几条**不能被"改动"破坏的不变式**：
  * 1. 关闭方向必须**先关模型、再停账号**（顺序反了会留下「账号全停但模型可见」的中间态）；
- * 2. 目录读失败或目录为空时**整个操作失败、不落盘、不广播**（「不关闭模型就不关闭供应商」）；
+ * 2. **远端读失败**时整个操作失败、不落盘、不广播（「不关闭模型就不关闭供应商」）。
+ *    「远端读到但为空」（无账号门控）**不算读失败**：用并集照常关闭，只有并集
+ *    也为空才拒绝 —— 否则无账号供应商永远关不掉（与 `provider.status` 的
+ *    核实判据 `full.remoteError === undefined` 对齐）；
  * 3. 两个方向都必须广播 `llm/adapters-updated`（否则对话框选择器要重启才更新）；
  * 4. `enabled` 非布尔一律拒绝（不猜默认值）。
  */
@@ -3527,6 +3530,81 @@ describe('provider.status / provider.setEnabled 端点', () => {
       const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
       expect(result.ok).toBe(true)
       expect(result.value).toMatchObject({ models: 3, accounts: 0 })
+    })
+
+    /**
+     * ⚠️⚠️ **无账号供应商必须能关闭**（本修复的核心用例）。
+     *
+     * 真实形态：`createModelCatalog` 对「没有已登录账号」的 provider **门控**
+     * 返回 `[]` —— 远端**读成功了**，只是为空（`remoteError === undefined`）。
+     * 旧判据 `complete`（要求远端非空）会把这种形态与「远端读失败」混为一谈，
+     * 于是无账号供应商**永远无法关闭**（不登录永远读到 `[]`）。
+     *
+     * 与 `provider.status` 的核实判据（`full.remoteError === undefined` 即读成功；
+     * 见其「无账号门控时远端同形 `[]`，兜底表全关 + 远端看不到 ⇒ 用户确实没有
+     * 可选模型，可接受」注释）对齐后：这里用并集（适配器兜底表）照常落盘，
+     * `provider.status` 随后正确报 `closed:true`，开关状态自洽。
+     */
+    it('⚠️ 无账号门控（远端读到但为空）时仍可关闭：用适配器兜底表落盘', async () => {
+      const { call, storedDisabled, storedAccounts, emitted, writeOrder } = setup({
+        // 远端目录按已登录账号门控：无账号 ⇒ 读到空数组（不是读失败）。
+        catalog: [],
+        // 适配器兜底表（冷缓存下 `listAllModels()` 的真实形态）。
+        listAllSubset: [{ id: 'hy3', name: 'Hy3' }, { id: 'glm-5.2', name: 'GLM-5.2' }],
+        // 无账号。
+        accounts: [],
+      })
+
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+
+      expect(result.ok, '无账号供应商必须能关闭').toBe(true)
+      expect(result.value).toMatchObject({ models: 2, accounts: 0 })
+      // 黑名单 = 兜底表（远端读成功但为空，并集只剩兜底表）。
+      expect(Object.keys(storedDisabled().buddy ?? {}).sort()).toEqual(['glm-5.2', 'hy3'])
+      // 先关模型、后停账号（无账号 ⇒ accounts 写入为 0 条）。
+      expect(writeOrder).toEqual(['models'])
+      // 必须广播（前端开关状态靠它刷新）。
+      expect(emitted).toContain('llm/adapters-updated')
+    })
+
+    /** 关闭后 `provider.status` 必须报已关闭 —— 两个端点的判据不能各说各话。 */
+    it('⚠️ 无账号门控下关闭后，provider.status 报 closed:true（判据联动）', async () => {
+      // 同一 setup 里先关再查：远端仍门控为空，兜底表全命中。
+      const { call } = setup({
+        catalog: [],
+        listAllSubset: [{ id: 'hy3', name: 'Hy3' }],
+      })
+
+      const closeResult = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(closeResult.ok).toBe(true)
+
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      expect(s.models).toEqual({ total: 1, disabled: 1 })
+      expect(s.closed, '关闭操作落盘后 status 必须报已关闭（否则开关永远弹回）').toBe(true)
+    })
+
+    /**
+     * ⚠️ 远端门控为空**且**适配器缺失（旧版外部适配器）⇒ 并集为空，
+     * 真没东西可关 → 拒绝且不落盘。这是 `remoteError` 判据收紧后的
+     * 「目录为空」落点（原判据把这种形态与「远端读失败」合并拒绝）。
+     */
+    it('⚠️ 远端为空且适配器缺失 → 拒绝「没有可关闭的模型」且不落盘', async () => {
+      const { call, emitted, writeOrder, storedAccounts } = setup({
+        catalog: [],
+        withAdapter: false,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(false)
+      const message = result.error?.message ?? ''
+      expect(message).toContain('没有可关闭的模型')
+      // ⚠️ 反向断言：不得把 `remoteError` 的 undefined 拼进用户可见文案。
+      expect(message, '不得把 undefined 拼进用户可见文案').not.toContain('undefined')
+      // 不落盘、不停账号、不广播。
+      expect(writeOrder).toEqual([])
+      expect(emitted).toEqual([])
+      expect(storedAccounts()[0].enabled).toBe(true)
     })
   })
 
