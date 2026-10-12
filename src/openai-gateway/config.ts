@@ -102,16 +102,61 @@ export function stripHostBrackets(host: string): string {
 }
 
 /**
+ * 地址里**允许出现**的字符（ASCII）。
+ *
+ * ⚠️⚠️ **这是 fail-closed 的最后一道闸门，第三轮审计实测补上。**
+ *
+ * 前三版判据都是「**认不出来就放行**」（fail-open），而攻击面是**无界**的：
+ * 内核会把一堆**非 ASCII 的分隔符**当成 `.`，例如 **`U+3002` 表意句号**
+ * （类别 `Po`，NFKC **不**折它）。实测 `0。0。0。0`：
+ *
+ * - 判据：`parseIpv4` 解析失败 ⇒ **放行**；
+ * - 内核：**真的绑上全部网卡**（从局域网 IP 反连得到 `HTTP 200`）。
+ *
+ * 逐个补分隔符是不可能的（`Po` / `Mc` / `Co` / `Cn` … 各类都有候选）。⇒ 反过来做：
+ * **只放行确定合法的字符**，其余一律判非法并拒绝。合法集合就是主机地址真正会
+ * 用到的那几类（IPv4 / IPv6 / 主机名 / zone id）；国际域名请用 punycode。
+ *
+ * ⚠️ 该集合覆盖本 issue 的全部正解（`127.0.0.1` / `172.21.0.8` / `::1` /
+ * `fe80::1%eth0` / `localhost` / `host.docker.internal`），**不误伤**。
+ */
+const LEGAL_HOST = /^[A-Za-z0-9.:%_-]+$/
+
+/**
+ * 是否只含合法主机字符（ASCII 字母数字 + `.` `:` `%` `_` `-`）。
+ *
+ * ⚠️ 空串不算合法（调用方另有回落逻辑）。这是**判据侧**的闸门：不含非法字符
+ * 才继续走通配识别，否则直接拒绝（fail-closed）—— 不再依赖「解析失败就放行」。
+ */
+export function isLegalHostText(host: string): boolean {
+  return host !== '' && LEGAL_HOST.test(host)
+}
+
+/**
  * 把裸地址还原成**能放进 URL** 的形态（IPv6 必须加方括号）。
  *
  * ⚠️ 这是本 issue 带出来的连带缺陷：`http://${host}:${port}` 对
  * `::1` 会拼出 `http://::1:8326`，那不是一个合法 URL（端口被解析成 IPv6
  * 的一段）—— 设置页会展示一个抄不走、连不上的地址，而排障方向会跑偏到
  * 「网关没起」。凡是往 URL 里塞 host 的地方都必须过这个函数。
+ *
+ * ⚠️⚠️ **URL 里必须剥掉 zone id**（第三轮审计实测的回归）：`listen()` 侧要
+ * **保留** zone（`fe80::1%eth0` 才绑得上 link-local），但 URL 语法里
+ * **没有** zone id 的位置 —— 实测 `new URL('http://[fe80::1%eth0]:8326/v1')`
+ * 抛 `ERR_INVALID_URL`。⇒ 面板与日志会给出一个抄走连不上的地址，正是第一轮
+ * 修过的同型缺陷。规范做法是把 `%` 转义成 `%25`，但浏览器与多数客户端都
+ * 不支持带 zone 的 URL，故这里**直接剥掉**：同一网卡上的地址不带 zone 也
+ * 能连（客户端与网关同机时 zone 是冗余的）。
+ *
+ * ⇒ **两个方向都要保住**：`listen` 串留 zone（{@link stripHostBrackets}），
+ * URL 串剥 zone（本函数）。
  */
 export function formatGatewayHost(host: string): string {
   const value = stripHostBrackets(host)
-  return value.includes(':') ? `[${value}]` : value
+  // 剥 zone id（只对 IPv6 形态；`%` 在 URL 里非法）。
+  const zone = value.includes(':') ? value.indexOf('%') : -1
+  const bare = zone > 0 ? value.slice(0, zone) : value
+  return bare.includes(':') ? `[${bare}]` : bare
 }
 
 /** 拼网关基地址（含协议与端口）。`suffix` 传 `/v1` 之类的路径。 */
@@ -300,6 +345,17 @@ function resolveHost(env: NodeJS.ProcessEnv): string {
   // ⚠️ 归一化后为空（值只有空白或只有不可见字符）⇒ 回落默认。**绝不能把空串
   // 交给 `listen()`**：那会被当成「绑全部网卡」，正是本判据要防的事。
   if (host === '') return DEFAULT_GATEWAY_HOST
+  // ⚠️⚠️ **fail-closed 闸门（第三轮审计实测补上）**：只放行确定合法的字符。
+  // 反过来「认不出来就放行」在本 issue 里是**高危**的 —— 内核会把 `U+3002`
+  // 表意句号之类的非 ASCII 分隔符当成 `.`，实测 `0。0。0。0` 真的绑上全部网卡，
+  // 而「解析失败 ⇒ 放行」的写法会放它过去。**顺序必须在通配判据之前**。
+  if (!isLegalHostText(host)) {
+    throw new Error(
+      `DSH_OPENAI_GATEWAY_HOST 含非法字符（${raw}）：只接受 IPv4 / IPv6 / 主机名形态`
+      + '（ASCII 字母数字与 `.` `:` `%` `_` `-`）。'
+      + '若确实要用非 ASCII 主机名，请改用 punycode 写法（如 `xn--…`）。',
+    )
+  }
   if (isWildcardHost(host)) {
     // ⚠️ 报错要给出**做法**：只说「不允许」会让人去搜「怎么绕过这个校验」，
     // 而容器场景的正解（绑容器自己的接口地址）必须写在错误里。

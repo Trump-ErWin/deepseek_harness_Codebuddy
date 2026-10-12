@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { resolveGatewayConfig, isLoopbackHost, isWildcardHost, stripHostBrackets } from '../../src/openai-gateway/config.js'
+import { resolveGatewayConfig, isLoopbackHost, isWildcardHost, stripHostBrackets, gatewayHttpUrl } from '../../src/openai-gateway/config.js'
 import { loadOrCreateApiKey } from '../../src/openai-gateway/auth.js'
 
 describe('OpenAI gateway config', () => {
@@ -104,6 +104,99 @@ describe('OpenAI gateway config', () => {
     expect(resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: '::1%lo' }).host).toBe('::1%lo')
   })
 
+  /**
+   * ⚠️⚠️ **第三轮审计实测出的 fail-open 残余**（2026-10-13）。
+   *
+   * 前三版判据都是「**认不出来就放行**」，而攻击面**无界**：内核会把一批
+   * **非 ASCII 的分隔符**当成 `.`。最典型的是 **`U+3002` 表意句号**（类别 `Po`，
+   * NFKC **不**折它）—— 实测 `0。0。0。0`：
+   *
+   * - 判据：`parseIpv4` 解析失败 ⇒ 放行；
+   * - 内核：**真的绑上全部网卡**（从局域网 IP 反连得到 `HTTP 200`）。
+   *
+   * ⇒ 修法是**方向反转**：只放行确定合法的字符（fail-closed），其余一律拒绝。
+   * 逐个补分隔符是不可能的（`Po`/`Mc`/`Co`/`Cn`… 各类都有候选）。
+   */
+  it('★★ 非 ASCII 分隔符 / 兼容字符一律拒绝（fail-closed，第三轮审计实测）', () => {
+    const illegal = [
+      '0\u30020\u30020\u30020',       // U+3002 表意句号 —— **实测真的绑全部网卡**
+      '\u3002', '\u3002\u3002',
+      // ⚠️ 下面两条是**第三轮审计在 Linux 上逐个真 bind 实测**同样绑 `0.0.0.0` 的
+      // 命中码点（连同 U+3002，HEAD 判据共放行了 3 条）：
+      '0\uff610\uff610\uff610',       // U+FF61 半角表意句号
+      '0\u18060\u18060\u18060',       // U+1806 蒙古文破折号（`Pd`）
+      // 同一轮 Linux 扫描的完整命中集（12 个码点）——其余几个在此一并锁住：
+      '0\u00ad0\u00ad0\u00ad0', '0\u200b0\u200b0\u200b0', '0\u200c0\u200c0\u200c0',
+      '0\u200d0\u200d0\u200d0', '0\u20240\u20240\u20240', '0\u20600\u20600\u20600',
+      '0\ufe520\ufe520\ufe520', '0\ufeff0\ufeff0\ufeff0', '0\uff0e0\uff0e0\uff0e0',
+      '\uff10.\uff10.\uff10.\uff10',  // 全角数字
+      '\uff10',
+      '\u0660.\u0660.\u0660.\u0660',  // 阿拉伯-印度数字
+      '\u06f0.\u06f0.\u06f0.\u06f0',  // 波斯数字
+      '\u0966.\u0966.\u0966.\u0966',  // 天城文数字
+      '\u2070',                        // 上标零 —— NFKC 折成 `0` ⇒ 按通配拒绝
+      '::\u0903', '::\u093e',          // `Mc` 组合用间距标记
+      '::\ue000', '::\uf8ff',          // `Co` 私用区
+      '::\u0378',                      // `Cn` 未分配
+      '::\u2028', '::\u2029',          // 行/段分隔
+      'localhost\u3002com',
+      '0\u30020\u30020\u30020.0',
+    ]
+    for (const host of illegal) {
+      expect(() => resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: host }), JSON.stringify(host)).toThrow(/DSH_OPENAI_GATEWAY_HOST/)
+    }
+    // ⚠️ 三类**刻意不列入**，因为它们实测**无害**（NFKC 折成合法 ASCII 或
+    // 直接折成通配写法，且内核绑不上）：
+    //   - `\uff1a`（全角冒号）→ 折成 `:`，内核 ENOTFOUND；
+    //   - `\u2460` / `\u2160` / `\u00b2`（带圈 1 / 罗马 I / 上标 2）→ 折成
+    //     `1` / `I` / `2`，内核 ENOTFOUND；
+    //   - `127.0.0.1\u00a0`（NBSP）/ `\u3000`（表意空格）/ `\n` / `\t` → 被不可见
+    //     字符剥离 ⇒ 剩下合法地址或空串（后者回落默认值，均无害）。
+    // fail-closed 的目的是「挡住能绑全网卡的形态」，不是「挡住所有怪异字符串」。
+  })
+
+  /**
+   * ⚠️⚠️ **URL 里必须剥 zone id**（第三轮审计实测的回归）。
+   *
+   * `listen()` 侧要**保留** zone（`fe80::1%eth0` 才绑得上 link-local，见下一条），
+   * 但 URL 语法里没有 zone 的位置 —— 实测 `new URL('http://[fe80::1%eth0]:8326/v1')`
+   * 抛 `ERR_INVALID_URL`。⇒ 面板与日志会给出抄走连不上的地址（第一轮修过的同型缺陷）。
+   */
+  it('★★ gatewayHttpUrl 必须产出**合法** URL（含 zone id 的地址要剥掉 zone）', () => {
+    // 正例：含 zone 的 IPv6 —— 剥掉 zone 后必须是合法 URL。
+    for (const host of ['fe80::1%eth0', 'fe80::215:5dff:fe1c:fc88%eth0', '::1%lo']) {
+      const url = gatewayHttpUrl(host, 8326, '/v1')
+      expect(url, host).not.toContain('%')
+      expect(() => new URL(url), `${host} -> ${url}`).not.toThrow()
+    }
+    expect(gatewayHttpUrl('fe80::1%eth0', 8326, '/v1')).toBe('http://[fe80::1]:8326/v1')
+    expect(gatewayHttpUrl('::1%lo', 8326, '/v1')).toBe('http://[::1]:8326/v1')
+    // 普通形态不受影响。
+    expect(gatewayHttpUrl('::1', 8326, '/v1')).toBe('http://[::1]:8326/v1')
+    expect(gatewayHttpUrl('127.0.0.1', 8326, '/v1')).toBe('http://127.0.0.1:8326/v1')
+    expect(gatewayHttpUrl('172.21.0.8', 8326, '/v1')).toBe('http://172.21.0.8:8326/v1')
+    expect(gatewayHttpUrl('localhost', 8326, '/v1')).toBe('http://localhost:8326/v1')
+    // ⚠️ 反向：**listen 串仍必须保留 zone**（两条修法各管一个方向，别互相吃掉）。
+    expect(stripHostBrackets('fe80::1%eth0')).toBe('fe80::1%eth0')
+    expect(resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: 'fe80::1%eth0' }).host).toBe('fe80::1%eth0')
+  })
+
+  /**
+   * ⚠️ 反向：fail-closed **不得误伤**合法字符集。
+   * 合法集合 = ASCII 字母数字 + `.` `:` `%` `_` `-`（覆盖 IPv4/IPv6/主机名/zone id）。
+   */
+  it('★★ fail-closed 不得误伤合法主机字符（含 zone id 与下划线主机名）', () => {
+    for (const host of [
+      '127.0.0.1', '127.0.0.2', '127.1', '172.21.0.8', '192.168.3.125',
+      '::1', '[::1]', '::1%lo', 'fe80::1', 'fe80::1%eth0', 'fe80::215:5dff:fe1c:fc88%eth0',
+      '::ffff:127.0.0.1', '2001:db8::1',
+      'localhost', 'host.docker.internal', 'dsh.internal', 'my_host', 'my-host',
+      'a.b.c.d.e', 'xn--fsq.com',
+    ]) {
+      expect(() => resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: host }), host).not.toThrow()
+    }
+  })
+
   it('★ 拒绝通配地址：写出各种等价写法都不许静默监听全部网卡', () => {
     const wildcards = [
       '0.0.0.0',
@@ -140,14 +233,19 @@ describe('OpenAI gateway config', () => {
    * ⚠️ 反向边界：**内核解析不了的紧凑写法必须放行**（不能一律当通配拒掉）。
    *
    * 实测（Windows `dns.lookup` 与 Linux `getaddrinfo` 双平台一致）：
-   * `0x.0` / `0e0` / `0.0.0.0e0` / `+0` / `-0` / `0x` 在两边都**解析失败**
+   * `0x.0` / `0e0` / `0.0.0.0e0` / `-0` / `0x` 在两边都**解析失败**
    * （`ENOTFOUND` / `gaierror`）⇒ 它们绑不上任何东西，交给内核报错即可。
    * 把它们判成通配会把「名为 `0x` 的容器」这类真实主机名误挡。
+   *
+   * ⚠️ `+0` **不在此列**：`+` 不是合法主机字符，被 fail-closed 闸门拒掉
+   * （那是**有意的**——`+` 在 `inet_aton` 里是「接受」的正号写法，属危险方向）。
    */
   it('★ 内核解析不了的写法不得被判成通配（否则误伤真实主机名）', () => {
-    for (const host of ['0x.0', '0e0', '0.0.0.0e0', '+0', '-0', '0x', '0X']) {
+    for (const host of ['0x.0', '0e0', '0.0.0.0e0', '-0', '0x']) {
       expect(resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: host }).host, host).toBe(host)
     }
+    // 危险方向：带 `+` 的写法一律拒绝（`+` 不在合法字符集内）。
+    expect(() => resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: '+0' })).toThrow(/DSH_OPENAI_GATEWAY_HOST/)
   })
 
   /**
