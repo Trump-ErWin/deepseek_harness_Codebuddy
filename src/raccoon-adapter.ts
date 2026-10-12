@@ -29,10 +29,10 @@ import type {
   LlmResolvedModelInfo,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { isRaccoonExpired, type RaccoonCredential } from './raccoon.js'
 import {
   RACCOON,
@@ -45,6 +45,7 @@ import {
   type RaccoonProduct,
 } from './raccoon-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
+import { planSessionTitleThinking } from './session-title.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
@@ -298,6 +299,56 @@ export function shouldRotateRaccoonAccount(errorText: string, status: number): b
 }
 
 /**
+ * 499「客户端断开」口径的统一抛出：归 aborted 形态，而非普通错误。
+ *
+ * 🔴 实测（2026-10-11，本会话多次）：raccoon 网关返回 **HTTP 499 + body
+ * `client has aborted request`**（nginx「client closed request」＝ 连接在响应
+ * 完成前被断开，多为**请求体过大/网关超时**）。旧路径把它包成普通
+ * `LlmError`（code=httpErrorCode(499)）⇒ agent loop 按 name/code 归
+ * `kind:'error'` ⇒ 终端显示「本轮运行失败」，用户误以为 provider 坏了。
+ *
+ * 归 **aborted** 的语义收益：
+ * - 终端显示「已中止」而非「运行失败」（如实：请求没跑完，重发即可）；
+ * - **不改道**：499 的真实成因多为请求体过大（长上下文），换号重发**照样 499**
+ *   —— 改道只会烧光轮换预算；真正的恢复是压缩上下文（pressure-lane 的
+ *   预警/compaction 兜底正是干这个的）。
+ * ⚠️ 与 `aggregate-adapter.ts` 的 `isAbortLike` 第四条判据同口径（aborted
+ * request|HTTP_?499）—— aggregate 侧判「要不要原样重抛」，本侧判「直接抛
+ * 什么形态」，两处覆盖不同的到达路径（raccoon 是直接 provider，不经 aggregate）。
+ *
+ * ## ⚠️⚠️ 已知缺口：**只覆盖 HTTP 状态码路径，不覆盖 SSE 内嵌错误帧**
+ *（2026-10-12 审计实测登记）
+ *
+ * 本函数只在**两个 HTTP 非 ok 的抛出点**被调用。而本文件末尾自己写着
+ * 「业务失败也可能以 **HTTP 200 + SSE 内嵌错误帧**返回，由 `consumeOpenAiSse`
+ * 处理」—— 那条路径**不经过这里**：
+ *
+ * ```
+ * SSE 帧 {statusCodeValue:499, message:'client has aborted request'}（HTTP 200）
+ *   → consumeOpenAiSse 抛 LlmError(code='SERVER')，name ≠ 'AbortError'
+ *   → 外层判据 (signal.aborted || code==='ABORTED') === false
+ *   → kind:'error' ⇒ 终端仍显示「本轮运行失败」
+ * ```
+ *
+ * ⇒ 即**本修复的语义收益在 SSE 路径上没拿到**，两条路径口径不一致。
+ *
+ * ⚠️ **本分支不擅自扩大改动面**：修它要动 `src/openai-compat.ts` 的
+ * `consumeOpenAiSse`（**所有 provider 共享**的错误归类层），影响面远超本次
+ * 范围。故此处**如实登记**，留给维护者决定是否统一。
+ * 若要修，正确的做法是在那一层也识别 499/`aborted request` 并抛 `ABORTED`
+ *（而不是在 adapter 里再兜一层）。
+ */
+function abortLikeOrNormal(errorText: string, status: number): LlmError {
+  const message = `raccoon: ${errorDetail(errorText)}`
+  if (status === 499 || /aborted request|HTTP_?499/i.test(errorText)) {
+    const e = new LlmError(message, 'ABORTED', { status })
+    e.name = 'AbortError'
+    return e
+  }
+  return new LlmError(message, httpErrorCode(status), { status })
+}
+
+/**
  * 该类别是否要写冷却标记。
  *
  * ⚠️ `auth` 不在其中 —— 见 {@link RaccoonFailureClass} 的事故说明。
@@ -316,6 +367,12 @@ export class RaccoonAdapter extends LlmAdapter {
   private remoteModels: RaccoonRemoteModel[] | undefined
   /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
   private readonly catalogGate: RemoteCatalogGate
+  /**
+   * ⚠️ **2026-10-08 Task 7a：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架
+   * （实测与 `loomy` / `minimax` 归一化后逐字相同），现在只剩 `toCatalogEntry`。
+   */
+  private readonly catalog: ModelCatalog
 
   constructor(private readonly options: RaccoonAdapterOptions) {
     super()
@@ -325,6 +382,17 @@ export class RaccoonAdapter extends LlmAdapter {
     // 目录落地后通知客户端重读（issue IKJVTF 的缺陷①）。
     this.catalogGate = new RemoteCatalogGate(
       options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
+    )
+    // ⚠️ 共享骨架（Task 7a）：门控 → 读目录 → 黑名单 → 回填 → 三态。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+        unknownModelInputModalities: () => ['text'] as const,
+        syncCatalog: () => this.syncCatalogEntries(),
+      },
     )
   }
 
@@ -345,10 +413,50 @@ export class RaccoonAdapter extends LlmAdapter {
    *
    * 设置页需要它渲染被关闭的模型 —— 否则那些条目只能凭 `disabledMap` 的 key
    * 补回，而那条路径拿不到展示名，会退化成裸 id（倍率与模型名随之丢失）。
+   *
+   * ⚠️ **2026-10-08 Task 7a**：骨架（含上面这条理由）已上移到共享实现
+   * `src/model-catalog.ts`，此处只剩委托。
    */
   listAllModels(): readonly { id: string; name: string }[] {
+    return this.catalog.listAllModels()
+  }
+
+  /**
+   * 把本家私有条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 这里是**唯一**还认识「倍率格式」与 `supportsImage` 的地方 ——
+   * 骨架不认识它们（各家格式不同）。
+   */
+  private toCatalogEntry(
+    model: RaccoonRemoteModel,
+    fallback: RaccoonFallbackModel | undefined,
+  ): CatalogEntry {
+    const contextWindow = model.contextWindow ?? fallback?.contextWindow
+    const maxTokens = positiveMaxTokens(model.maxTokens ?? fallback?.maxTokens)
+    return {
+      id: model.id,
+      name: model.name,
+      // ⚠️ `resolveModel` 用**裸名**（与 qoder/trae/loomy 一致）：
+      // 价格只属于选择列表语境。本家原本用 `replace(/ · .*$/, '')`。
+      bareName: model.name.replace(/ · .*$/, ''),
+      // ⚠️ 三态：本家远端条目**总是**带 `supportsImage` 布尔 ⇒ 恒为数组。
+      inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
+      ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+      ...maxTokens !== undefined ? { maxTokens } : {},
+      // 思考档位（两态：深度思考 / 关闭思考）。实测确证见 `raccoonReasoningInfo`。
+      // ⚠️ 所有模型一致 —— `extra_body.thinking` 是 provider 级方言，与模型无关。
+      reasoning: raccoonReasoningInfo(),
+    }
+  }
+
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    const all = await this.loadModels()
+    return all.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
+  }
+
+  private syncCatalogEntries(): readonly CatalogEntry[] {
     const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
-    return source.map((model) => ({ id: model.id, name: model.name }))
+    return source.map((model) => this.toCatalogEntry(model, this.fallbackIndex.get(model.id)))
   }
 
   /**
@@ -380,50 +488,11 @@ export class RaccoonAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️ 无已登录账号时返回 `[]` → DSH 的 buildModelCatalog 把整个 provider
-    // 分组隐藏。**必须返回空数组而不能抛错**（抛错会被归入 catalog 的
-    // failures，界面上反而多一条 provider 报错）。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-
-    const all = await this.loadModels()
-    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const listed = disabled === undefined || disabled.size === 0
-      ? all
-      : all.filter((model) => !disabled.has(model.id))
-
-    return listed.map((model) => ({
-      provider: this.product.id,
-      id: model.id,
-      // 倍率拼进 name（不是 description）：composer 的模型切换菜单只渲染 name。
-      name: model.name,
-      inputModalities: this.inputModalitiesFor(model),
-    }))
+    return this.catalog.listModels(_provider)
   }
 
-  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    const all = await this.loadModels()
-    const entry = all.find((item) => item.id === model)
-    const fallback = this.fallbackIndex.get(model)
-    // ⚠️ name **不带倍率**（与 qoder/trae/loomy 一致）：价格只属于选择列表语境。
-    const bareName = fallback !== undefined ? fallback.name.replace(/ · .*$/, '') : model
-    const resolved: LlmResolvedModelInfo = {
-      provider,
-      id: model,
-      name: entry !== undefined ? entry.name.replace(/ · .*$/, '') : bareName,
-      inputModalities: this.inputModalitiesFor(entry),
-    }
-    const contextWindow = entry?.contextWindow ?? fallback?.contextWindow
-    // 未知模型不编造 context（宁可让 DSH 用默认值，也不报一个假窗口）。
-    if (contextWindow !== undefined && contextWindow > 0) {
-      resolved.context = { contextWindow }
-    }
-    // ⚠️ 远端非法值必须过滤（见 positiveMaxTokens）：不声明就让 DSH 用默认值。
-    const maxTokens = positiveMaxTokens(entry?.maxTokens ?? fallback?.maxTokens)
-    if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
-    // 思考档位（两态：深度思考 / 关闭思考）。实测确证见 `raccoonReasoningInfo`。
-    // ⚠️ 所有模型一致 —— `extra_body.thinking` 是 provider 级方言，与模型无关。
-    resolved.reasoning = raccoonReasoningInfo()
-    return resolved
+  async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
   }
 
   /**
@@ -523,15 +592,31 @@ export class RaccoonAdapter extends LlmAdapter {
      *
      * ⚠️ 在 `buildBody` **之外**算一次：`buildBody` 会在重试时被多次调用，
      * 每次重算虽无害但没必要。
+     *
+     * ⚠️ **会话自动命名（`purpose: 'session-title'`）必须关闭思考**（issue
+     * IKKVDH）：DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，
+     * 而宿主会把本模型的默认档（本家恒为 `'on'`）注入进来
+     * （`effective = requested ?? reasoning.defaultEffort`）。照常开思考时实测
+     * 均值约 222 个思考 token，必然顶穿 64 ⇒ 正文 0 字符、
+     * `finish_reason:'length'` ⇒ DSH 直接拒绝、标题永远停在 fallback。
+     *
+     * 本家的档位表是**恒声明的两档**（`on`/`off`，与模型无关，见
+     * `raccoon-product.ts`）⇒ 任何模型都**关得掉**，故不需要抬预算。
      */
-    const thinking = raccoonThinkingExtraBody(options.reasoningEffort)
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+      declaredEfforts: RACCOON_REASONING_EFFORTS,
+      maxTokens: options.maxTokens,
+    })
+    const thinking = raccoonThinkingExtraBody(titlePlan.effort)
 
     /** 构造请求体。 */
     const buildBody = (): string => JSON.stringify({
       model: options.model,
       messages: wireMessages,
       stream: true,
-      ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
+      ...titlePlan.maxTokens !== undefined ? { max_tokens: titlePlan.maxTokens } : {},
       ...options.temperature !== undefined ? { temperature: options.temperature } : {},
       ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
       // ⚠️ tools 必须真的下发到请求体**顶层**：Qoder/TRAE 都因漏发而让模型
@@ -665,12 +750,12 @@ export class RaccoonAdapter extends LlmAdapter {
         await markCurrentAccount()
         const maxRotate = RACCOON_MAX_ROTATE - 1
         for (let round = 0; round < maxRotate; round++) {
-          const next = await accountPool.getAvailableAccount(
+          const next = await accountPool.getAvailableAccount<RaccoonCredential>(
             this.product.id, options.model, tried,
           )
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
-          credential = next.credential as RaccoonCredential
+          credential = next.credential
           activeAccountId = next.entry.id
           response = await send()
           if (response.ok) {
@@ -689,7 +774,7 @@ export class RaccoonAdapter extends LlmAdapter {
           await markCurrentAccount()
           if (failureClass === 'other') {
             // 新账号失败但不是可换号类别：按原错误分类抛出（buddy 同款）。
-            throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
+            throw abortLikeOrNormal(errorText, status)
           }
         }
         throw new LlmError(
@@ -700,7 +785,7 @@ export class RaccoonAdapter extends LlmAdapter {
           { status },
         )
       }
-      throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(status), { status })
+      throw abortLikeOrNormal(errorText, status)
     }
 
     // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回，由 consumeOpenAiSse 处理。

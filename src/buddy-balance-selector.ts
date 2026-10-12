@@ -363,7 +363,27 @@ function failedEntry(id: string, error: string): BuddyAccountBalanceEntry {
 }
 
 /**
- * 选号 + 取凭据的完整编排（供 `src/index.ts` 的两个 buddy provider 调用）。
+ * `select` 的**结构化**形状（`BuddyBalanceSelector` 满足它，无需继承）。
+ *
+ * ## 为什么不是直接收 `BuddyBalanceSelector`
+ *
+ * `BuddyBalanceSelector` 带 `private` 成员 ⇒ 它是**名义类型**：任何结构等价的
+ * 替身都**不能**赋给它。而 `credential-resolver.ts` 必须能在单测里注入替身
+ *（否则选号编排的每一格都得起一台真适配器）。
+ *
+ * ⚠️ 这是**纯放宽**：`select` 的签名本就不提及 `TProduct` / `TCredential`
+ *（它只吃 `BuddyCandidateAccount[]` 与 `BuddyTierOptions`），故真实例天然满足
+ * 本接口 —— 既有调用点一个都不用改。
+ */
+export interface BuddySelectorLike {
+  select(
+    candidates: readonly BuddyCandidateAccount[],
+    options?: BuddyTierOptions,
+  ): Promise<BuddySelectionResult>
+}
+
+/**
+ * 选号 + 取凭据的完整编排（供 `src/index.ts` 的 buddy 系 provider 调用）。
  *
  * ## 为什么需要这一层
  *
@@ -379,14 +399,14 @@ function failedEntry(id: string, error: string): BuddyAccountBalanceEntry {
  *   从而**继续尝试池里的其余账号**（既有行为）。
  *
  * @param selector - 该 provider 专属的选号器（缓存不能跨站共用）。
+ *   ⚠️ 只要求 {@link BuddySelectorLike} 这个**结构**形状，不要求具体类 ——
+ *   具体类带 `private` 成员（名义类型），会让 `credential-resolver.ts` 的
+ *   测试替身无法传入。真实例天然满足该接口，既有调用点不受影响。
  * @param candidates - 已按 `enabled` + 模型限流过滤的候选。
  * @param options - 锁定标志与凭据解析器。
  */
-export async function pickBuddyAccount<
-  TCredential = BuddyCredential,
-  TProduct = BuddyProduct,
->(
-  selector: BuddyBalanceSelector<TProduct, TCredential>,
+export async function pickBuddyAccount<TCredential = BuddyCredential>(
+  selector: BuddySelectorLike,
   candidates: readonly BuddyCandidateAccount[],
   options: {
     /** 是否允许消耗永久积分（= 未锁定）。 */

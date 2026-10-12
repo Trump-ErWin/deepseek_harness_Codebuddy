@@ -540,7 +540,7 @@ provider = workbuddy   model = deepseek-v4.1-flash
 
 回归用例在 `tests/unit/openai-gateway-tencent-fingerprint.spec.ts`（17 条）。
 ⚠️ 已做**反向验证**：正则去掉 `i` → 大小写用例红；`instructions` 那处改回原样 →
-Responses 端用例红。
+Responses 端用例红。
 
 ## 模型计费倍率与同名模型（必须写进 `name`，不是 `description`）
 
@@ -929,7 +929,7 @@ IDE 按 name 归并，我们按 id 列出。二者是**不同区域的独立计�
 `scripts/probe-lobsterai-cost.mjs`（LobsterAI 倍率归属）、
 `scripts/probe-lobsterai-dupes.mjs`（LobsterAI 同名检查）、
 `scripts/probe-codearts-benefit.mjs`（CodeArts benefit 集合与判定）、
-`scripts/verify-description.mjs`（端到端打印**切换菜单实际渲染的 name**）
+`scripts/verify-description.mjs`（端到端打印**切换菜单实际渲染的 name**）
 
 ## ⚠️ CodeArts benefit（免费额度）模型：集合必须动态判定，不能硬编码模型名
 
@@ -978,3 +978,119 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 - 回归用例：`tests/unit/models.spec.ts`（集合判定 / 落盘不含改写 id / 缓存往返）、
   `tests/unit/llm-adapter.spec.ts`（v4.1 带 `maas_type` 且参与签名、无后缀
   v4-flash 不带）、`tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
+
+## ⚠️⚠️ 更正：腾讯风控**也拦 `assistant` 正文**，且直连路径必须一起改（2026-10-12）
+
+上面「腾讯系内容级风控」一节的「只动 system，`user` / `assistant` / `tool` 一概不碰」**已被实测推翻**，
+以本节为准。补测矩阵（真实登录态直打 `copilot.tencent.com`，触发串取磁盘原文逐字）：
+
+| 触发串位置 | 结果 |
+|---|---|
+| `system`（含非首位） | ❌ 400/11128（已知） |
+| `user` | ✅ 200 |
+| `tool` 结果 | ✅ 200 |
+| **`assistant` 正文 `content`** | ❌ **400/11128 ← 新格** |
+| `assistant` 的 `reasoning_content` | ✅ 200 |
+| `tool_calls[].function.arguments` | ✅ 200 |
+| 与文档同字节数的良性长文本 | ✅ 200 ⇒ **体量不是原因** |
+
+**为什么初版漏了这格**：那条 assistant 探针把触发句改写成了转述形态（`I see … here.`），
+而服务端是**逐字符**匹配 —— 那个形态本身不含触发串，**等于空跑**，却得出了「assistant 放行」的结论。
+
+**已落地的修法**（四处产出点，缺一即复发）：
+
+- `src/openai-gateway/messages.ts` 的 `assistant` 分支（原来只有 `system`）；
+- `src/openai-gateway/responses.ts` 的 `assistant` 分支（与 Chat 同判据）；
+- `src/buddy-adapter.ts` 的 `serializeMessages`：**`assistant` 正文 + `system`**（DSH **直连**方向，
+  原先**完全没有任何改写**）；
+- `src/buddy-adapter.ts` 的 `stream()` 里 `options.system` 那一条 —— 它**绕过** `serializeMessages`，
+  是最容易漏的第四个点。
+
+`user` / `tool` 结果 / `reasoning_content` / `arguments` **刻意不改**：实测不拦，
+改它们换不来放行，却会篡改用户原话与要回读给模型看的证据，并白吃腾讯侧前缀缓存。
+用例把「该改的改了」与「不该改的一字没动」**两侧**都锁住
+（`tests/unit/buddy-adapter.spec.ts` 的「直连路径的腾讯风控指纹改写」段）。
+
+**真实报障机制（自指污染）**：排查这个风控 bug 的会话会先 `read` 记录该指纹的文档
+（`providers-buddy.md` 自己就逐字写着那句 —— tool 结果，不拦），模型随后把它**逐字复述进
+自己的正文**（拦）。那句一旦进了历史就每轮原样重放 ⇒ 会话从此报废，且
+**换任何腾讯系模型都一样** —— 用户当时报的 `step-5-preview` 与 `space-bunny` 同一个错，
+正是「症状跟会话走、不跟模型走」。
+
+**取证 / 验收脚本**（⚠️ 均在 `scripts/` 下，而**该目录被 `.gitignore` 忽略**，
+属本机一次性工具、**不入库**，故以下名字在仓库里查不到，别当假指路）：
+`probe-buddy-role-matrix.mjs`（角色矩阵）、`probe-buddy-assistant-bisect.mjs`
+（二分定位到单行 + 体量对照，写在另一份 checkout `dsh-codearts/scripts/`）、
+`verify-buddy-fingerprint-fix.mts`（同一份被拦历史：裸 fetch ❌11128 /
+打过补丁的真实 `BuddyAdapter` ✅）。要长期保留就得把它们挪进版本控制内的目录。
+
+ℹ️ 验收时还暴露过一个「`space-bunny` 报 `tool calls and tool results do not match`」的
+现象 —— **已在下一小节解决**（真因不是工具配对，而是 wire 首条角色）。
+
+### 已修：上面那个「尚未修」的独立问题，真因**不是**工具配对（2026-10-12 同日）
+
+末节登记的 `space-bunny` 报 `tool calls and tool results do not match`，取证后结论是
+**报错文案在骗人**：
+
+1. 先逐格核对真实适配器产出的 wire（`dump-buddy-tool-count.mts`）：**无孤儿、无重复 id、
+   每条 assistant 的调用都被紧随的结果完整覆盖** ⇒ 配对根本没坏；
+2. 再做单变量实验（`probe-spacebunny-firstmsg.mjs`）：同一份请求体，**只把开头的
+   system 去掉、让首条变成「带 tool_calls 的 assistant」**——
+   `space-bunny` → 400/**11148**（`displayMsg.zh`=「工具记录不完整，请新建任务」），
+   `step-5-preview` → **200**。补回一条 system，两个模型都 200。
+
+⇒ 真正的判据是 **wire 的首条角色**，与工具配对无关。上游那句文案是误导性的。
+（另注：`11101 Unmarshal chat params failed` 是另一类 —— 那是 `arguments` 传了**对象**
+而非 JSON 字符串，Go 侧反序列化失败。）
+
+**修法**：`buddy-adapter.ts` 的 `stream()` 在序列化后检查「首条是不是 assistant」，
+是则补一条最小中性 system（`LEADING_SYSTEM_PLACEHOLDER`）。该文本刻意不含任何
+风控指纹字面量 —— 否则这条兜底自己会把会话送进 11128。
+
+生产里确实可触发：会话历史被压缩/截断到把开头的 system 与首条 user 一起削掉时，
+剩下的历史就以 assistant 开头。与既有的「WorkBuddy 网关强制 `messages[0]` 是 system」
+是同族约束，只是 CodeBuddy 侧只在「首条是带 tool_calls 的 assistant」时发作。
+
+⚠️ 有一条**既有**用例 `sends assistant reasoning_content and null content for tool-only
+turns` 原先按**下标**断言 `messages[0]` 是 assistant —— 那正是把旧形状当契约的地方，
+已改为按角色取。教训：wire 的位置断言在上游补位时会整体平移，别用下标锁角色。
+
+用例：`tests/unit/buddy-adapter.spec.ts` 的「wire 首条不得是 assistant」段（3 条：
+补位且不破坏配对、正常历史不多塞、`options.system` 已就位时不重复补）。
+验收：同一份被拦历史走真实适配器，`step-5-preview` 与 `space-bunny` **都 ✅**。
+
+### ⚠️ 2026-10-12 子代理审计抓到两个**真缺陷**（均已修）
+
+对上面两个提交跑了一轮 subagent 驱动的审计 + 对抗性审计（两个独立视角并行：
+功能面 / 测试面，各自做了变异验证）。抓到的东西按严重度：
+
+**① 补位判据过窄（真缺陷，我第一版就写错了）**
+判据写成 `role === 'assistant'`，只覆盖 assistant-first。**user-first / tool-first 照样原样发出** ——
+而本仓库 `account-probe.ts` 的 `PROBE_SYSTEM` 注释里早有 2026-09-25 的双端点对照实测：
+**WorkBuddy 网关强制 `messages[0]` 是 system，否则 400 + 11128**。
+⇒ 真正的判据是 **`!== 'system'`**。与 `PROBE_SYSTEM` 那段「无条件给所有 provider
+都带 system，判据不该依赖另一个产品碰巧不校验」的取舍一致。
+
+**② `this.product.id` 零覆盖（测试盲区，实测存活变异）**
+`serializeMessages(…, this.product.id)` 改成 `serializeMessages(…, 'buddy')`
+（完全忽略产品配置）⇒ **163 条用例全绿**。原因：`buddy` 与 `workbuddy` **都在**
+`TENCENT_PROVIDERS` 那张表里，「喂 WORKBUDDY 也能改写」那条用例**结构上无法区分**
+这两个实现 —— 是同义反复。
+修法：**反向**用例（喂非腾讯系产品，断言 wire 逐字节不变）。已验证它能抓住该变异。
+
+⚠️ 两条的**共同教训**：「按文案/按当前观察写死判据」会漏掉相邻形态。真实判据往往是
+「X 必须满足」，而不是「我实测到的那种坏法」—— 后者永远漏其余分支。
+
+**③ 实测凭据从 `scripts/` 挪进 `tests/e2e/`（悬空引用）**
+上面那张角色表与「首条角色」那条判据，原先只以**脚本**形式存在于被 gitignore 的
+`scripts/`（另一份 checkout），注释指向它们 ⇒ 后人无法复核。现各入库一个带双闸门的
+e2e 规格（`buddy-fingerprint-roles.e2e.spec.ts` / `buddy-first-message-role.e2e.spec.ts`）。
+⚠️ 这两个文件**不可省**：单测只能锁「代码按那个范围做」，**锁不住那个范围本身对不对**。
+
+**④ `buddy-growth.ts` 是第三条旁路（当前无害，已加路标）**
+它有两处直发 `POST …/v2/chat/completions`，**不经 `BuddyAdapter`、故不过改写**。
+当前安全（请求体写死「你好」/「1+1等于几」，无指纹也无 assistant 历史），
+但那条安全性依赖「请求体写死」这个易碎前提 ⇒ 已在其注释里写明将来要接上。
+
+**⑤ 未采纳**：一条 `toLowerCase()` 预检的性能优化建议（5.4×，属优化非正确性，
+且实测非命中时 `String.replace` 返回**同一对象**、前缀缓存没被破坏）—— 留待需要时再做。

@@ -19,6 +19,7 @@ import {
   sanitizeProviderOrder,
 } from '../../src/jet-hub-store.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
+import { PROVIDER_REGISTRY } from '../../src/provider-registry.js'
 
 /** 造一个最小 ctx；`settings` 按用例给（undefined = 服务缺失）。 */
 function makeCtx(settings: unknown): never {
@@ -389,17 +390,19 @@ describe('文件后端（FileStore）', () => {
    * 新增 ZCode 后全套单测仍然全绿，而 `ZCODE_ACCOUNT_*` 的账号在 `state.json`
    * 缺失时会静默消失（凭据还在，只是索引建不出来，用户只能重新登录）。
    *
-   * 故本用例从**客户端唯一的 provider 清单**（`plugin-src/client/jet-hub.js`
-   * 的 `PROVIDERS`）取 id —— 派生方式与 `credits-capabilities.spec.ts` 的
-   * 「能力矩阵覆盖 PROVIDERS 中的每一个 provider」**完全一致**，只保留一处
-   * 正则，避免两处漂移。上游再加 provider 而忘记同步本表时，这里会红。
+   * 故本用例从**客户端唯一的 provider 清单**取 id —— 该清单
+   * （`plugin-src/client/jet-hub.js` 的 `PROVIDERS`）与
+   * `credits-capabilities.spec.ts` 的同名断言一样，**已改为直接读
+   * `PROVIDER_REGISTRY`**（2026-10-08），不再解析源码文本。
+   * 上游再加 provider 而忘记同步本表时，这里会红。
    */
   it('恢复表覆盖客户端 PROVIDERS 的全部 provider（从真实清单派生）', () => {
-    // ⚠️ 用 `import.meta.url` 直接拼 URL（不引 `fileURLToPath` / `dirname`）：
-    // 本文件的 import 区最容易被上游改动，少一处依赖就少一处合并冲突面。
-    const source = readFileSync(new URL('../../plugin-src/client/jet-hub.js', import.meta.url), 'utf8')
-    const allIds = [...source.matchAll(/\{\s*id:\s*'([a-z]+)',\s*label:/g)].map((m) => m[1]!)
-    // 防「正则该更新了却静默取到 0 项」这类假绿。
+    // ⚠️ 2026-10-08 改：原先从**客户端源码文本**用正则
+    // `/\{\s*id:\s*'([a-z]+)',\s*label:/g` 派生 id —— 那个字符类
+    // **不匹配连字符**，新 provider id 带 `-` 时会**静默漏算一个 id
+    // 而守卫照样全绿**。现在直接读 registry，两侧同出一源。
+    const allIds = PROVIDER_REGISTRY.map((d) => d.id)
+    // 防「清单为空导致下游断言恒真」这类假绿。
     expect(allIds.length).toBeGreaterThan(0)
 
     /**

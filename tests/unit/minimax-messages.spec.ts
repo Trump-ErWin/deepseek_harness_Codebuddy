@@ -7,7 +7,7 @@
  * 不是凭空编的 —— 尤其 `thinking` / `signature_delta` / `input_json_delta`
  * 三个块，它们在真实响应里都出现过。
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   buildMinimaxMessagesPayload,
   consumeMinimaxSse,
@@ -689,6 +689,74 @@ describe('consumeMinimaxSse', () => {
       'data: {"type":"error","error":{"type":"invalid_request_error","message":"invalid params, model requires adaptive thinking (2013)"}}',
       '',
     ].join('\n'))).rejects.toThrow(/requires adaptive thinking/)
+  })
+
+  /**
+   * ⚠️ 下面四条锁的都是**生产端**（`consumeMinimaxSse` 真的产出了什么文案），
+   * 不是消费端判据 —— 变异验证实测：把 `kind` / `code` / 原文样本 / `cancel()`
+   * 任何一处改坏，此前 **0 条用例变红**（消费端那些断言喂的是测试自己拼的字符串）。
+   */
+  it('★★ 自家信封的流内错误必须带 `code=`（适配器的确定性通道）', async () => {
+    /**
+     * 实测（2026-10-11 真机）：401 的体就是自家信封 `{"code":401,"message":"auth failed"}`
+     * —— 它**没有 `error` 对象**。若这里退化成「未知错误」，额度信息整段丢失
+     *（适配器拿到的只有 `未知错误`）⇒ 判 `other` ⇒ 换号静默失效。
+     */
+    await expect(collect([
+      'event: error',
+      'data: {"code":402,"message":"request rejected"}',
+      '',
+    ].join('\n'))).rejects.toThrow(/code=402/)
+    // 自家信封的 message 也要原样带出（不能只看 `frame.error.message`）。
+    await expect(collect([
+      'event: error',
+      'data: {"code":402,"message":"request rejected"}',
+      '',
+    ].join('\n'))).rejects.toThrow(/request rejected/)
+  })
+
+  it('★★ 流内错误的 `error.type` 必须进文案（message 无关键词时它是唯一线索）', async () => {
+    // ⚠️ `message` 刻意**不含**任何额度/限流措辞：只有 `error.type` 能把它判成额度。
+    await expect(collect([
+      'event: error',
+      'data: {"type":"error","error":{"type":"insufficient_balance_error","message":"request rejected"}}',
+      '',
+    ].join('\n'))).rejects.toThrow(/insufficient_balance_error/)
+  })
+
+  it('★★ 「模型未返回任何内容块」必须带**响应原文**（网关 HTML / 非标准信封的唯一线索）', async () => {
+    // ⚠️ 不带原文时适配器只能判 `other` ⇒ 不换号，且用户看不到服务端说了什么。
+    await expect(collect('<html><body>502 Bad Gateway</body></html>')).rejects
+      .toThrow(/响应原文：.*502 Bad Gateway/)
+  })
+
+  it('★★ 提前离开流（流内错误）时必须 `cancel()` 响应体，不能只 `releaseLock()`', async () => {
+    /**
+     * ⚠️ 请求级轮换会在**流内错误**时提前离开这条流（换号重发），只释放锁会把
+     * 未读完的响应体留在连接上（一次请求最多 7 条）。本仓既有约定见
+     * `src/sse.ts` 的 `readWithIdleTimeout`（`await reader.cancel().catch(() => {})`）。
+     */
+    const cancel = vi.fn(async () => {})
+    const releaseLock = vi.fn()
+    const bytes = new TextEncoder().encode([
+      'event: error',
+      'data: {"type":"error","error":{"type":"insufficient_balance_error","message":"x"}}',
+      '',
+    ].join('\n'))
+    const body = {
+      getReader: () => ({
+        read: async () => ({ done: false, value: bytes }),
+        cancel,
+        releaseLock,
+      }),
+    } as unknown as ReadableStream<Uint8Array>
+
+    await expect((async () => {
+      for await (const _chunk of consumeMinimaxSse({ body })) void _chunk
+    })()).rejects.toThrow(/流内错误/)
+
+    expect(cancel).toHaveBeenCalled()
+    expect(releaseLock).toHaveBeenCalled()
   })
 
   it('⚠️ 只有 ping、没有内容块 ⇒ 抛错（EMPTY 不得静默结束）', async () => {

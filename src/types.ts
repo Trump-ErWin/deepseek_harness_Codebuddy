@@ -143,7 +143,7 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
    * 自己的 credential ref 里读出来**的派生值，故属于「状态」而非「存储」。
    *
    * 为什么不写回池：凭据可能被用户在别处更新（换账号名）、且池的
-   * `sanitizeAccounts`（`src/jet-hub-store.ts:173-191`）只保留
+   * `sanitizeAccounts`（`src/jet-hub-store.ts`）只保留
    * `id`/`provider`/`credentialRef` 三个字段，写进去也会被丢掉。
    */
   accountName?: string
@@ -414,7 +414,12 @@ export interface RpcCreditsStatusResponse {
 export interface RpcCreditsClaimAllRequest {
   provider: string
   /**
-   * 是否同时执行成长中心任务（buddy / workbuddy 专有）。
+   * 是否同时执行成长中心任务（**CodeBuddy 中国版专有**）。
+   *
+   * ⚠️ **不是**「buddy / workbuddy 专有」：WorkBuddy（国际版）后端**根本没有**
+   * 成长中心（contributor 在 !62 复审中实测确认：无任务列表、无 claim 端点），
+   * `src/provider-credits.ts` 只给 `buddy` 挂 `afterClaim`。
+   * 客户端那侧 `GROWTH_TASK_PROVIDERS` 同样只含 `buddy`（决定按钮渲不渲染）。
    *
    * ⚠️ **缺省为 `false`，且必须保持这样**：`credits.claimAll` 同时是「每日首次
    * 启动自动签到」的执行体（见 `src/auto-checkin.ts` 的 `claim` 回调），而成长
@@ -936,6 +941,30 @@ export interface RpcModelSetDisabledRequest {
 export interface RpcModelSetDisabledResponse {
   provider: string
   disabledModels: Record<string, boolean>
+  /**
+   * 「本次操作没有它看上去那么有效」的说明（Issue IKJW33）。
+   *
+   * ⚠️ **缺省 = 无警告**，不是空数组 —— 与全仓「未知不编造」的约定一致，
+   * 也让既有调用方（只读 `disabledModels`）逐字节不受影响。
+   *
+   * ## 为什么需要它
+   *
+   * 对**已从上游目录消失**的模型 id 调开关时，旧实现返回「成功 1」却
+   * **什么都没发生、且没有任何警告**：脚本与 AI 助手据此以为开关生效了
+   * （issue 作者本人就据此误判过一次，回查目录才发现是空操作）。
+   *
+   * ⚠️ **为什么是 warnings 而不是 `ok:false` + `not-found`**（issue 的原始建议
+   * 未被采纳，两个理由）：
+   *
+   * 1. **打开方向是幽灵条目的唯一清理路径**：`model.setAllDisabled` 的注释已立
+   *    此约定 —— 「曾被关闭、后来从服务端目录下线」的历史死键**只能靠打开方向
+   *    清掉**。按目录拒绝会让这些键永远留在配置里，正好加重 issue 抱怨的第 2 条。
+   * 2. **目录可能读不出来**（凭据过期 / 远端故障）：此时若按「不在目录」拒绝，
+   *    用户会连开关都动不了。
+   *
+   * ⇒ **照常写入**（既有语义逐字节不变），只在响应里说明真相。
+   */
+  warnings?: string[]
 }
 
 /**
@@ -1630,6 +1659,38 @@ export interface RpcUsageBadgeResponse {
    * 后台任务跑起来后变化，缓存住会让界面一直停在旧状态（看起来像「开关点了没反应」）。
    */
   autoCheckin: RpcUsageAutoCheckinState
+  /**
+   * `jet-hub-auto` 本次**实际**发往的渠道与模型（仅当请求的是 auto 且已发过请求时存在）。
+   *
+   * ⚠️ 宿主端的 auto 没有自己的账号与余额，`usage.badge` 会把请求改写成「临期胜者」
+   * 再去查余额；这份字段就是告诉客户端「改写成了谁」，供折叠胶囊显示
+   * 「实际在用的渠道 + 模型」—— 徽标是**止损工具**，用户原话「以为在用 A，
+   * 实际在烧 B，等发现时积分已经没了」。
+   *
+   * ⚠️ 上游 `ba10f4f` 重写 aggregate 时把本字段一并删掉了（旧 auto 的徽标随之失效）。
+   * 这里补回来（用户 2026-10-08 选定「两条都修」）。
+   */
+  autoActual?: { provider: string; model: string; viaImageFallback: boolean }
+  /**
+   * 本次 auto 胜者的额度失效时刻（毫秒）—— 折叠胶囊的临期倒计时用。
+   *
+   * ⚠️ **只有有限值才回传**：`Infinity`（只有长期积分）会被 JSON 序列化成 `null`，
+   * 客户端按 `typeof === 'number'` 判空。故 `null` 与「字段缺席」在语义上等价，
+   * 客户端只需判 `typeof`。
+   */
+  autoExpiryAt?: number
+  /**
+   * auto 本次目标的**计费倍率**（`priceFactorFromName` 的结果）。
+   *
+   * ⚠️ 只有**有限**值才回传：`Infinity` 是「无标注」的哨兵，拼进文案会渲染出
+   * `xInfinity`。`0` 是合法值（显示「免费」）。
+   *
+   * ⚠️ 存在的理由（用户报障 2026-10-08「没倍率显示？」）：auto 是跨渠道的单一
+   * 模型名，**它自己没有倍率** —— 倍率取决于这次选中谁。模型选择器显示的是
+   * `listModels` 的静态名（对所有请求都一样），往那里写死倍率就是编造。
+   * ⇒ 倍率只能显示在胶囊里（那里才有「实际用了谁」）。
+   */
+  autoPrice?: number
 }
 
 /**
@@ -1675,9 +1736,13 @@ export interface RpcUsageTokenLedgerResponse {
 export interface RpcUsageTokenLedgerHistoryRequest {
   /**
    * 只看最近 N 天（**含今天**，UTC+8 日界）；省略 = 全部历史
-   * （服务端钳到 `TOKEN_LEDGER_HISTORY_MAX_DAYS`）。
+   * （服务端钳到 `TOKEN_LEDGER_HISTORY_MAX_DAYS`）。自选范围可传 fromDay / toDay。
    */
   sinceDays?: number
+  /** 自选日期范围起点（UTC+8 日键，含当日）；与 toDay 配合使用。 */
+  fromDay?: string
+  /** 自选日期范围终点（UTC+8 日键，含当日）；与 fromDay 配合使用。 */
+  toDay?: string
 }
 
 /** 历史日聚合响应（形状直透，不另造平行类型）。 */
@@ -1685,6 +1750,16 @@ export interface RpcUsageTokenLedgerHistoryResponse {
   history: TokenLedgerHistoryDay[]
   /** 所选窗口的合计（按日累加，均值按全部样本 Σ/份数计算）。 */
   totals: Omit<TokenLedgerModelRow, 'model'>
+}
+
+/** RPC: 删除某一天的历史日累计；不影响进程内 Token 明细。 */
+export interface RpcUsageTokenLedgerDeleteDayRequest {
+  day: string
+}
+
+export interface RpcUsageTokenLedgerDeleteDayResponse {
+  day: string
+  deleted: true
 }
 
 /**

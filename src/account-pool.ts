@@ -6,6 +6,7 @@ import { createJetHubStore, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock,
 import type { AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PermanentLockMap } from './jet-hub-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
 import type { PermanentLockStore } from './permanent-lock-store.js'
+import { normalizeOpencodeGeneration } from './opencode-auth.js'
 import type {
   CodeArtsCredential,
   ProviderAccountEntry,
@@ -37,7 +38,7 @@ const EMPTY_MODEL_SET: ReadonlySet<string> = new Set<string>()
  *
  *
  * 选号按 `modelRateLimits[modelId]` 过滤候选（见本类的 `getAvailableAccount`
- * 与 `src/index.ts` 的 `pickBuddyCredential`）。当一个 provider 只有**一个**
+ * 与 `src/credential-resolver.ts` 的候选筛）。当一个 provider 只有**一个**
  * 启用账号、而它恰好被标记了该模型的限流时，候选集变成空集，调用链一路
  * 返回 `undefined`，最终由适配器抛出「no usable credential; log in from the
  * Jet Hub panel first」—— 而**凭据其实是好的、账号也是启用的**，用户被指去
@@ -1451,12 +1452,46 @@ export class AccountPool {
    *
    * 在池这一层排除（而非让调用方自己跳过）是必要的：调用方只能拿到
    * 「池认为最优的一个」，无法枚举候选自己去重。
+   *
+   * ## ⚠️ 为什么带类型参数 `TCredential`（2026-10-08，Task 11）
+   *
+   * 返回类型原先写死成 `CodeArtsCredential | BuddyCredential` 这个**两家的联合**，
+   * 而本池服务 **13 家**，各家凭据形状互不相同 ⇒ 每个调用方都得在结果处
+   * 写一个向具体凭据类型的断言才能用。
+   *
+   * ⚠️ **处数实测为 21（2026-10-08 独立复审按 `90cc881` 的 diff 逐行复核）** ——
+   * 本节原先写「**20 处**」、而那次 commit 的标题与正文写「**19 处**」，**两个数都不对**。
+   * 复核方式（可复现，不要靠记忆）：
+   *
+   *     git show 90cc881 --unified=0 -- '*.ts' |
+   *       grep -E '^-[^-].*\bas [A-Z][A-Za-z]*Credential\b'
+   *
+   * 命中 **22** 行，其中 **21** 行形如 `<x>.credential as <X>Credential`
+   *（唯一的例外是池内 `JSON.parse(...) as CodeArtsCredential | BuddyCredential`，
+   * 它是**被改成** `as TCredential`、不是被删）。逐处核对过上游 API：
+   * **21 处的上游全部是 `getAvailableAccount`**（`lobsterai-adapter.ts` 那处
+   * 因上下文窗口较窄未被正则识别，人工核对确认同源）。
+   * ⚠️ 所以「这样的收窄」= **21**，不是 19/20 —— 引数时请引这个实测值。
+   *
+   * ⚠️ **那个断言不是「必要的坏味道」，而是纯粹的噪音**：调用方**自己**知道
+   * 它在查哪一家（`this.product.id` 或字面量 id），池却把类型信息擦掉了。
+   * 断言写错方向时 TS 也不会拦（`as` 双向放行），于是「中国版账号拿到国际版
+   * 凭据类型」这类错位在类型层是**静默**的。
+   *
+   * ⇒ 改为泛型：`getAvailableAccount<ClineCredential>(CLINE.id, model)`，
+   * 类型由**调用点**给出、池原样回传。**纯类型层改动，零运行时行为变化**
+   * （函数体一行未改，`JSON.parse` 的结果照旧不做形状校验 —— 校验是各家
+   * `parseCredential` 的职责，见 `credential-resolver.ts` 的头注）。
+   *
+   * ⚠️ 默认值 `CodeArtsCredential | BuddyCredential` **刻意保留**：13 家之外
+   * 还有测试桩与 `ResolverPool` 这类结构化替身，去掉默认值会让它们全部编译失败，
+   * 而它们本就不关心具体形状。
    */
-  async getAvailableAccount(
+  async getAvailableAccount<TCredential = CodeArtsCredential | BuddyCredential>(
     provider: string,
     modelId: string,
     excludeAccountIds?: ReadonlySet<string>,
-  ): Promise<{ entry: ProviderAccountEntry; credential: CodeArtsCredential | BuddyCredential } | null> {
+  ): Promise<{ entry: ProviderAccountEntry; credential: TCredential } | null> {
     const candidates = this.readAccounts()
       .filter(a => a.provider === provider && a.enabled)
       .filter(a => excludeAccountIds === undefined || !excludeAccountIds.has(a.id))
@@ -1494,7 +1529,7 @@ export class AccountPool {
         continue
       }
       try {
-        const credential = JSON.parse(resolved.value) as CodeArtsCredential | BuddyCredential
+        const credential = JSON.parse(resolved.value) as TCredential
         if (failures.length > 0) {
           this.ctx.logger?.warn?.(
             `[jet-hub] ${failures.length} 个 ${provider} 账号不可用，已跳过：${failures.join('; ')}`,
@@ -1804,9 +1839,10 @@ export class AccountPool {
 
   /** 读取 opencode 指纹代次（未设置时为 0）。 */
   opencodeFingerprintGenerationFor(accountId: string): number {
-    const entry = this.readAccounts().find(a => a.id === accountId)
-    const value = entry?.opencodeFingerprintGeneration
-    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+    const value = this.readAccounts().find(a => a.id === accountId)?.opencodeFingerprintGeneration
+    // ⚠️ 归一化收敛在 `normalizeOpencodeGeneration`（唯一实现）：
+    //    槽组装那边读的是**池条目字段**，两边必须是同一判据。
+    return normalizeOpencodeGeneration(value)
   }
 
   /**

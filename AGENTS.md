@@ -7,16 +7,18 @@
 
 - `docs/agent-notes/dev-tasks.md`：「常见开发任务」的**调试与协议排障**细节（主文件只留导航表）
 - `docs/agent-notes/misc.md`（8 节）：⚠️ 两条通用判据：一文件两套同义判据 / `String(undefined)`（PR !62）；⚠️ 包装适配器时必须包 `prepareCall`，不是 `stream`（PR !66）；项目概述（十个 provider 的协议源流与差异总览）；⚠⚠️ 客户端**不得**注册 `settings.models.provi；⚠️ dsh peer 范围必须**枚举并集**，不能用 `^0.1.2-r；LobsterAI 模型列表（三个易踩的坑）；…
-- `docs/agent-notes/providers-qoder.md`（1 节）：⚠️ 安装（git 插件）的 allowBuilds 键在 pnpm 10 
-- `docs/agent-notes/client-ui.md`（21 节）：⚠⚠️ 注入的 `<style>` **必须署名 `data-plugin`**，否则被别的插件认领后连带删除（Issue IKK764）；⚠⚠️ 一键签到的汇总**必须按单位分列**，不得跨单位求和（2026-10-04）；⚠ 「通用面板」里的按钮与弹窗**必须按 provider 分支**（Iss；账号池与多账号（含模型饱和 14003 不许换号）；模型黑名单（Jet Hub「显示列表」开关）；目录门控：没有已登录账号就隐藏整个 provider；…
-- `docs/agent-notes/protocol-wire.md`（14 节）：⚠⚠ RPC 的 `catch` **不得**把失败包成 `ok:true`（Issue IKJOZA）；⚠️ 图片必须按像素预算发**请求版本**，不能恒发原图（Issue !IK；单次输出上限（`maxOutputTokens`）必须下发，不能只用来过滤；⚠️ 持久化：DSH 0.1.7 移除 `settings.register；⚠️ 「锁定永久积分」三家**共用一张表与一个端点**，但判据必须各算；…
+- `docs/agent-notes/providers-qoder.md`（2 节）：⚠️ 安装（git 插件）的 allowBuilds 键在 pnpm 10 / 11 语义**互不兼容**（Issue IKJCOC）；⚠️ 额度类业务码**不是一个值，是一条链** —— 只认 `110` 会让换号静默失效（Issue IKKJFH，码值腿 + 文案腿必须同时在）
+- `docs/agent-notes/client-ui.md`（23 节）：⚠⚠️ 注入的 `<style>` **必须署名 `data-plugin`**，否则被别的插件认领后连带删除（Issue IKK764）；⚠⚠️ 一键签到的汇总**必须按单位分列**，不得跨单位求和（2026-10-04）；⚠ 「通用面板」里的按钮与弹窗**必须按 provider 分支**（Iss；账号池与多账号（含模型饱和 14003 不许换号）；模型黑名单（Jet Hub「显示列表」开关）；⚠⚠️ **判「某个 id 在不在目录里」时两个目录来源（`listModels` / `listAllModels`）必须取并集**（Issue IKJW33：只用任一个都被实测证伪 —— 冷缓存下 `listAllModels` 是编译期兜底**子集**（cline 实测 3/460）⇒ 误报；而 `opencode` 的 `listAllModels` 恒兜底表 + `listModels` 匿名身份只给免费模型 ⇒ 反向误报 13/13；另含「黑名单必须在 `await` 之后读」与「源码级断言必须锚定片段、并列断言必须用计数」两条测试教训）；⚠⚠️ **「关闭全部/关闭供应商」写黑名单前必须取同一份并集，且「远端读到但为空」也要判**（同一个 `fullCatalogIds` 缺陷的另一入口：远端 `[]` + 兜底表 1 条 ⇒ 只关那 1 条却返回成功 ⇒ 供应商**显示已关闭而模型仍可选**；判据收敛为 `complete`，`account.test` 是刻意例外「尽力而为」不得改拒绝）；目录门控：没有已登录账号就隐藏整个 provider；⚠⚠️ **额度错误的码不得被客户端替换**（Issue IKJVCW：harness 常量 `QUOTA_EXCEEDED_CODE` 的字面值就是 `'QUOTA'`，客户端会丢掉 message 换成「当前请求的额度已用尽」；额度须用字面量 `'QUOTA_EXCEEDED'`，四处产出点缺一不可，含 `httpErrorCode` 的 401/403 短路；⚠️ **不要给 codearts 加「地域封锁」判据** —— 141 个真实会话零命中，那套 marker 是从 cline 照搬的，已撤回）；…
+- `docs/agent-notes/protocol-wire.md`（15 节）：⚠⚠ RPC 的 `catch` **不得**把失败包成 `ok:true`（Issue IKJOZA）；⚠️ 网关请求体超限**必须是 413、不能是断连**（Issue IKKUBJ：销毁 socket 让 413 发不出去 ⇒ 客户端只看到连接重置、会话永久不可用；上限还须与自家图片声明自洽、`keepAliveTimeout` 必须显式设置）；⚠️ 图片必须按像素预算发**请求版本**，不能恒发原图（Issue !IK；单次输出上限（`maxOutputTokens`）必须下发，不能只用来过滤；⚠️ 持久化：DSH 0.1.7 移除 `settings.register；⚠️ 「锁定永久积分」三家**共用一张表与一个端点**，但判据必须各算；…
 - `docs/agent-notes/providers-buddy.md`（5 节）：模型计费倍率与同名模型（必须写进 `name`，不是 `descriptio；⚠️ CodeArts benefit（免费额度）模型：集合必须动态判定，不；⚠⚠️ 腾讯系内容级风控：system 里的客户端模板句会被**整轮拦死**
 - `docs/agent-notes/providers-cline.md`（3 节）：⚠️ Cline provider：`workos:` 前缀不可剥、免费集合；⚠️ Cline 限流：倒计时用**报文里的人类可读时长**，402 不许倒
-- `docs/agent-notes/providers-trae.md`（2 节）：TRAE（字节跳动）协议要点（五个易踩的坑）
-- `docs/agent-notes/providers-loomy-raccoon-minimax.md`（3 节）：⚠️ Loomy（讯飞）provider：五个不能凭直觉改的点；⚠️ Raccoon Work（商汤小浣熊）provider：不能凭直觉改的；⚠️ MiniMax Code（中国版）provider：不能凭直觉改的点
+- `docs/agent-notes/providers-trae.md`（2 节）：TRAE（字节跳动）协议要点（五个易踩的坑）；⚠️ 流内 `code=4006`（体积超限）**不得**归 `SERVER`（Issue IKKX0T：原先落 `SERVER` ⇒ 巨型请求体被**原样重发 5 次**；修法是抽出 `streamErrorCode()` 逐格表，4006 → `CONTEXT_WINDOW_EXCEEDED` 以**兼得「不重试」与「触发溢出压缩」**；⚠️ 4001 与 4006 不可合并、`502+HTML` 刻意不动）
+- `docs/agent-notes/providers-loomy-raccoon-minimax.md`（3 节）：⚠️ Loomy（讯飞）provider：五个不能凭直觉改的点；⚠️ Raccoon Work（商汤小浣熊）provider：不能凭直觉改的；⚠️ MiniMax Code（中国版）provider：不能凭直觉改的点（§8.7 = **请求级换号 + 冷却**与真机实测的错误报文形状，Issue IKJW32；⚠️ 该家写标记后**必须**同时在 `probeById` 与 `WRITES_RATE_LIMIT_PROVIDERS` 里，否则标记清不掉）
 - `docs/agent-notes/backup.md`（7 节）：⚠️ **账号备份**：三种「只加不覆盖」的语义边界（选账号导出 / 合并导入 / 第三方转换）；裁剪必须在**发请求之前**且要裁三处；合并导入的判重是**三层**（第 2 层身份字段是关键，含 `IDENTITY_FIELDS` 候选表）；`AccountPool.mergeAccounts` 只调 `writeAccounts`；与「永久积分锁定表」的交叉点；与 `pruneAccountsWithForeignDomain` 的交叉点（残余风险）；测试与反向验证表
 - `docs/agent-notes/providers-opencode.md`（1 节）：⚠️⚠️ OpenCode 出口代理：dispatcher 与 fetch **必须同源**（Issue IKK4BY）—— 外部 undici 的 dispatcher 配全局 fetch 会在 Node 22/24 上恒抛 `UND_ERR_INVALID_ARG`（内置 6/7 与外部 8 的 handler 契约不同源），必须走 `proxyFetch`；`fetch failed` 的真因在 `cause` 里
 - `docs/agent-notes/providers-zcode.md`（4 节）：⚠️ ZCode（智谱）provider：「卡住 + 停止按钮无效」的两个根；⚠️ ZCode 上游节流三件套（吸收自 `dsh-free-glm`，20；⚠️⚠️ `3012` 的 HTTP 状态码是 **405**（不是 403；⚠️ ZCode captcha 的真实形状（2026-10-01，3.14
+- `docs/agent-notes/providers-kukuai.md`（7 节）：⚠️ 库库AI（百度 GenFlowPro）provider 的**实测**事实，**与 `docs/superpowers/specs/...-design.md` §1.5/§4 冲突时以它为准**：登录态**全明文**（`encrypted_value` 长度全 0，不需要 DPAPI）；`freepoint/homenew` 必需的**常量** query（`clienttype=400&app_id=123971023&web=1&channel=chunlei&version=1.6.8`，缺则 `errno=2 params error`，而源码里传的是空对象 `{}`）；**余额不在 `homenew`** 而在 `/bizapi/gfpro/getgfvipremain`（取 `data.list` 里 `assetType===1`，`totalPoint` 是**字符串**）；**领积分是写操作**（`POST freepoint/rewardClaim`，参数放 **query** 且请求键是 `period_id` 而值取响应的 `period_no`）—— design doc 说的「服务端自动发放」与「`autoClaim` 自动领取」**均已被实测推翻**；IDE 是 **cookie 登录不是 OAuth**，且三步都不依赖 IDE
+- `docs/agent-notes/provider-abstraction-g3-exceptions.md`：⚠️ 2026-10-08 provider 能力抽象重构（计划 1）**做不到「零行为变化」（G3）的 6 处例外**逐条登记（含基线 `ecbb268` → 现行的**可观测量**与变异验证结论）。**动 provider 抽象层、或核对「重构是否改变了行为」前先读它**：5 处确为行为变更（凭据损坏文案 / `account.refresh` 分派 / `onboarding.claim` 错误码 / `codearts` 未知 id 模态 / `buddy` 消歧集合）、1 处（签到文案）逐字节未变只是搬了位置，**5 处已于 2026-10-08 逐条复核后全部接受**；⚠️ 另一条独立教训：**「登记了一处例外」≠「这处例外有守卫」**，必须逐项变异验证（当时实测出 G3-4 **零守卫**）
 
 ## 语言约束
 
@@ -89,7 +91,7 @@
 
 ### `ctx.xxxAuth` 服务统一接口
 
-本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyAuth`、`workbuddyAuth`、`lobsteraiAuth`、`qoderAuth`、`qoderCnAuth`、`traeAuth`、`clineAuth`）均遵循统一接口：
+本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyAuth`、`workbuddyAuth`、`lobsteraiAuth`、`qoderAuth`、`qodercnAuth`、`traeAuth`、`clineAuth`）均遵循统一接口：
 
 - `login(options?)` — 执行浏览器登录流程
 - `startLogin(options?)` — 两步式登录（先返回 loginUrl，Jet Hub 据此弹窗）
@@ -205,12 +207,16 @@
 ⚠️ `src/service.ts`（codearts）此前**整份文件零 logger**，而它的令牌最短命 ——
 续期失败将完全无痕，现已补 `refreshAll` 两个分支的日志。
 
-测试：`tests/unit/expiry-sync.spec.ts`（19 条：lead 边界含 `<=`、一致不写盘、
+测试：`tests/unit/expiry-sync.spec.ts`（lead 边界含 `<=`、一致不写盘、
 1 秒容差、不传 refreshableOf、反查传凭据内容、回写失败不反噬、
 「有效期内仍须对账」、续期返回 undefined 时绝不落盘）+
-`tests/unit/refresh-bootstrap-wiring.spec.ts`（19 条：启动首轮排在定时器前、
-十个 provider 都在表里、九个 auth 的 `refreshAccountCredential` 都带
-pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）。
+`tests/unit/refresh-bootstrap-wiring.spec.ts`（启动首轮排在定时器前、
+**每个 channel provider** 都在表里、九个 auth 的 `refreshAccountCredential`
+都带 pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）。
+
+⚠️ **这里刻意不写条数**：原文写「（19 条…）」而 2026-10-08 复审实测该文件已 **21** 条
+（12 个 `it` + `it.each` 展开）—— 条数是**必然腐坏**的快照，接一个 provider
+就会失效，而「数字对不上」会让人怀疑整段约定。**条数以 `pnpm test` 输出为准。**
 
 ### ⚠️ 账号池的 `refreshable` 只是**凭据材料的镜像**，绝不能当续期门禁
 
@@ -311,7 +317,7 @@ oauth 用例变红。四条各自独立锁死，**别把它们当同义反复删
 `cline-adapter.spec.ts` 的注释里）。
 
 
-服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，两个 `QoderAuth` 实例（同一类、不同 `product`）分别注册为 `qoderAuth` 与 `qoderCnAuth`，`TraeAuth` 注册为 `traeAuth`，`ClineAuth` 注册为 `clineAuth`，互不覆盖。
+服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，两个 `QoderAuth` 实例（同一类、不同 `product`）分别注册为 `qoderAuth` 与 `qodercnAuth`，`TraeAuth` 注册为 `traeAuth`，`ClineAuth` 注册为 `clineAuth`，互不覆盖。
 
 ⚠️ 服务名撞车会**在构造时抛** `service "..." has been registered`，故新增同族产品时
 **provider id 必须互不相同** —— 这也是 `qodercn` 这个 id 不带连字符的原因
@@ -477,7 +483,70 @@ UI 上完全看不到错误。
 - `buddy` 与 `workbuddy` 共用 `BuddyAdapter`，行为差异全部由 `src/product.ts` 的 `BuddyProduct` 配置驱动；新增同源产品只需加一份配置并注册实例
 - `lobsterai` 用独立的 `LobsteraiAdapter`（协议不同源，见项目概述）；它的产品配置是 `src/lobsterai-product.ts` 的 `LobsteraiProduct`，与 `BuddyProduct` **平行而非继承**
 - `qoder` 用独立的 `QoderAdapter`（协议不同源，见项目概述）；产品配置是 `src/qoder-product.ts` 的 `QoderProduct`，同样**平行而非继承**。它的 OpenAI 协议层逻辑复用 `src/openai-compat.ts`
-- `trae` 用独立的 `TraeAdapter`（协议不同源）；它的产品配置是 `src/trae-product.ts` 的 `TraeProduct`，同样**平行而非继承**。与其它三个 provider 最根本的差异是**载荷与响应都要转换**：请求体经 `transformToSOLOBody` 转成 SOLO 格式，响应经 `parseTraeSSELine` 从 SOLO 自定义 SSE 转成 OpenAI chunk
+- `trae` 用独立的 `TraeAdapter`（协议不同源）；它的产品配置是 `src/trae-product.ts` 的 `TraeProduct`，同样**平行而非继承**。与其它四个 provider 最根本的差异是**载荷与响应都要转换**：请求体经 `transformToSOLOBody` 转成 SOLO 格式，响应经 `parseTraeSSELine` 从 SOLO 自定义 SSE 转成 OpenAI chunk
+
+## ⚠️ 两张注册表：`PROVIDER_REGISTRY`（数据）与 `PROVIDER_RUNTIME`（实现）
+
+2026-10-08 的 provider 能力抽象重构引入了**两张职责不同的注册表**。
+新增 provider 时**必须知道改哪张、以及为什么**。
+
+### `src/provider-registry.ts` —— **纯数据**，零 import
+
+各家的**元数据与能力声明**（id / 展示名 / 图标 / `channel` / `credits` /
+`permanentLock` / `usesExpiryWindow` / `accountTest` …）。
+
+- ⚠️ **必须零 import**：它同时被 Node 宿主（`tsc`）与浏览器客户端（`esbuild`）使用，
+  任何 `node:*` 依赖都会让客户端打包失败。客户端的能力表（
+  `plugin-src/client/credits-capabilities.js`）**从它派生**，不再手抄。
+- ⚠️ **provider id 一律纯小写字母**（不带连字符）—— 它同时是 cordis 服务名
+  （`${product.id}Auth`）、LLM 路由名与客户端 key。`qodercn` 不带连字符正因如此。
+
+### `src/provider-runtime.ts` —— **实现**，运行时按 id 查表
+
+各家的**能力实现**（`auth` / `credits` / `onboarding` / `expiry` / `probe`），
+在 `apply()` 里经 `registerProviderRuntime({ descriptor, auth, … })` 注册。
+
+- ⚠️ **`registerProviderRuntime` 重复注册时保留先注册者、返回 `false`、不抛错**：
+  本仓库有**实测的 fiber 重启竞态**（新 fiber 的同步 `apply()` 与旧 fiber 的异步
+  `dispose()` 交错），抛错会让整个插件加载失败。
+- ⚠️ **读注册表建索引的派生表必须是函数，不能是模块级常量**：
+  `wiredRefreshTargets()` / `registeredRuntimeIds()` 读的是注册表，而注册发生在
+  `apply()` 里 ⇒ 模块级常量在**模块加载时**求值，会恒为空表。**症状是静默的**
+  （所有 provider 都不再自动续期，日志里只有常规输出）。有用例锁住。
+  ⚠️ **纯数据清单不受本条约束**：`src/aggregate-expiry.ts` 的
+  `WIRED_EXPIRY_PROVIDERS` **刻意保持常量**（它不是从注册表读出来的索引，
+  改动会波及 29 处探针 + 86 处适配器构造），它与 runtime 的一致性改由
+  `expiry-runtime-parity.spec.ts` 真跑 `apply()` 的用例锁死。
+  别照搬本条去改那张表。
+- ⚠️ **查表用 `Object.hasOwn` / 导出的 `xxxOf()` 助手，不要用下标**：
+  `table[id]` 会命中原型链上的键（如 `constructor`），与 `authOf` 同因。
+
+### 抽象边界：**编排可抽象，协议不抽象**
+
+设计文档 §3.5 的边界。已抽出的**编排**骨架（`credential-resolver` /
+`model-catalog` / `provider-credits` / `provider-onboarding` / `provider-expiry` /
+`buddy-balance-selector`）只回答「**选哪个原语、按什么顺序**」；
+各家的**协议**实现（签名、端点、载荷转换）留在各自模块内，**不强行统一**。
+
+⚠️ **形态确实不匹配的家要如实排除，不要为「凑齐 N 家」而丢语义**：
+`codearts` 的 `resolveCredential` 无 fallback 且不收 `modelId`（不纳入
+`createCredentialResolver`）；`opencode` 的门控/黑名单/模态/context 与
+`createModelCatalog` 有 5 处协议级差异（不纳入）；`loomy` 的 reason 类型与
+`BuddyBalanceSelector` 结构不兼容（保留自己的分支）。
+
+### ⚠️ 三类**静默失效**及其防线（重构时逐条核对）
+
+| 失效形态 | 症状 | 防线 |
+|---|---|---|
+| **漏接一家** | 该家凭据永不自动续期 / 重测标记永远清不掉，**日志零字** | 派生表 + 从 `PROVIDER_REGISTRY` 派生的用例（漏一家**点名**） |
+| **位置/键错位** | 中国版账号用国际版凭据续期（历史复发 6 次） | 命名对象形参（`JetHubAuths`，键 = provider id）+ 逐 provider 断言「恰好自己那个实例被调」 |
+| **「未知」被写成「否定」** | 图片静默发不出去 / 或发到不支持的服务端 | `inputModalities` 三态（省略 = 未知，`['text']` = 明确不支持）+ 双向用例 |
+
+⚠️ 另有两条**注释级**陷阱（本重构各踩过多次）：
+- **不要引用行号**（`foo.ts:123`）—— 最大的文件 4000+ 行，每次重构都会失效。
+  **按符号名引用**。
+- **不要在注释里写出「会被验收 grep 的字符串」**（被删的符号名、`foo(` 形态）——
+  会让「该符号应不存在」这类检查失效。
 
 ## ⚠️ 移植既有实现的轮换/重试语义：先抄「类别→动作」表，不是抄循环骨架
 

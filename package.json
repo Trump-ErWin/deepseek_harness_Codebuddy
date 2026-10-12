@@ -1,6 +1,6 @@
 {
   "name": "dsh-codearts-auth",
-  "version": "0.2.0-rc.3",
+  "version": "0.2.0-rc.10",
   "description": "deepseek-harness plugin: sign in and manage accounts across multiple AI coding providers, with multi-account pools and silent credential refresh",
   "type": "module",
   "main": "lib/index.js",
@@ -27,6 +27,8 @@
     "build:all": "pnpm build && pnpm build:assets && pnpm build:client",
     "prepare": "pnpm build:all",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:tests": "tsc -p tsconfig.tests.json",
+    "pretest": "pnpm typecheck:tests",
     "test": "vitest run",
     "test:e2e:login": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/login.e2e.spec.ts",
     "test:e2e:buddy": "cross-env DSH_BUDDY_E2E=1 DSH_BUDDY_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-models.e2e.spec.ts",
@@ -65,7 +67,8 @@
     "test:e2e:minimax-claim": "cross-env DSH_MINIMAX_E2E=1 DSH_MINIMAX_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-claim-probe.e2e.spec.ts",
     "test:e2e:minimax-chat": "cross-env DSH_MINIMAX_CHAT_E2E=1 DSH_MINIMAX_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-chat-probe.e2e.spec.ts",
     "test:e2e:minimax-image": "cross-env DSH_MINIMAX_IMAGE_E2E=1 DSH_MINIMAX_IMAGE_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-image-probe.e2e.spec.ts",
-    "test:e2e:image-burst": "cross-env DSH_IMAGE_BURST_E2E=1 DSH_IMAGE_BURST_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/image-burst-cross-provider.e2e.spec.ts"
+    "test:e2e:image-burst": "cross-env DSH_IMAGE_BURST_E2E=1 DSH_IMAGE_BURST_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/image-burst-cross-provider.e2e.spec.ts",
+    "test:e2e:image-bisect": "cross-env DSH_IMAGE_BISECT_E2E=1 DSH_IMAGE_BISECT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/image-limit-bisect.e2e.spec.ts"
   },
   "dsh": {
     "bundle": {

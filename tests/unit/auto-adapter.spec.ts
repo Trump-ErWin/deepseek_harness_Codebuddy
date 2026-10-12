@@ -398,6 +398,109 @@ describe('★★ auto：胜者必须在将要派发的模型上仍有可用账�
     expect(sent, '中止不得继续发请求').toEqual([])
     expect(error?.name).toBe('AbortError')
   })
+
+  it('★★ 中止必须逃逸：池抛上游网关 499 报文（`aborted request HTTP_499`）', async () => {
+    // ⚠️ 同族判据逐格同构（本仓硬要求）：`aggregate-adapter.ts` 的 `isAbortLike`
+    //    已扩到**四条**，本处（`hasUsableAccountFor`）必须同步 —— 否则同一份报文
+    //    在两个 provider 上被判成不同类别。
+    // ⚠️ 关键约束：错误**不带** `name: 'AbortError'` / `code: 'ABORTED'`，
+    //    否则命中的是旧判据，第四条的覆盖是**假的**（假覆盖教训）。
+    const { adapter, sent } = makeAuto({
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => {
+        throw new Error('provider: client has aborted request HTTP_499')
+      },
+    })
+    const error = await run(adapter)
+    expect(sent, '499 中止不得继续发请求').toEqual([])
+    expect(error?.message).toContain('aborted request')
+  })
+
+  it('★ 反例：池抛普通异常 ⇒ 视为可用（第四条的判据不得恒真）', async () => {
+    const { adapter, sent } = makeAuto({
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => { throw new Error('pool exploded') },
+    })
+    await run(adapter)
+    expect(sent, '普通异常应被吞成「视为可用」并继续').toHaveLength(1)
+  })
+})
+
+describe('★★ auto：`dispatchTargetOf` 的 catch 也必须让 499 中止逃逸', () => {
+  /**
+   * ⚠️⚠️ 这是 auto 侧**第二处**内联中止判据（第一处是 `hasUsableAccountFor`）。
+   *
+   * PR #87 的 `c3d9e9c` **只补了第一处** —— 审计实测（2026-10-12）：本处
+   * 仍是 `name`/`code` 两条，499 报文会被吞成「倒计时缺席」后**照常发请求**。
+   * 本分支按「同族判据必须逐格同构」补齐，并**单独锁死**。
+   *
+   * ⚠️ 落点定位（实测确认，别搞错）：`selectProvider` 的候选循环会调**多次**
+   *    `expiryOf`（本用例目录下实测 5 次）且那处**没有** try/catch（异常直接冒泡）；
+   *    带 catch 的是 `dispatchTargetOf`。故用**调用栈**定位那一次。
+   *    ⚠️ 不用「第 N 次调用」定位：按次数定位在候选数变化时会**假绿**
+   *    （我在另一分支上实测踩过：selectProvider 那处没有 catch，
+   *      早抛会让 prepareCall 直接 reject，测到的就不是这个 catch）。
+   */
+  const makeExpiryCtx = () => {
+    const sent: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, error: () => {} },
+      llm: {
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.1' }],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string; model: string }) => {
+          sent.push(`${o.provider}/${o.model}`)
+          return (async function* () { /* noop */ })()
+        },
+      },
+    }
+    const adapter = new AutoAdapter(ctx as never, {
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        getAvailableAccount: async () => ({ entry: { id: 'A' }, credential: { token: 't' } }),
+      } as never,
+      now: () => 1_000,
+      ttlMs: 0,
+    })
+    return { adapter, sent }
+  }
+
+  /** 只在 `dispatchTargetOf` 那次 `expiryOf` 抛错（用调用栈定位，与次数解耦）。 */
+  const armDispatchExpiryCall = (adapter: AutoAdapter, error: Error): void => {
+    adapter.expiryOf = async () => {
+      const stack = new Error().stack ?? ''
+      if (stack.includes('dispatchTargetOf')) throw error
+      return 100
+    }
+  }
+
+  const drain = async (adapter: AutoAdapter): Promise<{ message?: string } | undefined> => {
+    try {
+      const call = await adapter.prepareCall('jet-hub-auto', 'auto')
+      for await (const _ of call.stream({
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)) { /* drain */ void _ }
+      return undefined
+    } catch (error) {
+      return error as { message?: string }
+    }
+  }
+
+  it('★ `dispatchTargetOf` 的 `expiryOf` 抛 499 ⇒ 必须逃逸，不得吞成「倒计时缺席」', async () => {
+    const { adapter, sent } = makeExpiryCtx()
+    armDispatchExpiryCall(adapter, new Error('provider: client has aborted request HTTP_499'))
+    const caught = await drain(adapter)
+    expect(caught?.message, '499 必须原样上抛（不得吞成倒计时缺席）').toContain('aborted request')
+    expect(sent, '中止后不得继续发请求').toEqual([])
+  })
+
+  it('★ 反例：同一处抛普通异常 ⇒ 只让倒计时缺席、**照常发请求**（判据不得恒真）', async () => {
+    const { adapter, sent } = makeExpiryCtx()
+    armDispatchExpiryCall(adapter, new Error('余额接口抖动'))
+    const caught = await drain(adapter)
+    expect(caught, '普通异常不该上抛').toBeUndefined()
+    expect(sent, '普通异常不该阻断请求').toHaveLength(1)
+  })
 })
 
 /**
@@ -697,5 +800,238 @@ describe('★★ auto：零输出撞墙时改道下一个 provider（B 方案）
     sent.length = 0
     await run()
     expect(sent, '缓存窗口内也不得再撞冷却中的目标').toEqual(['zcode/glm-5.3-flash'])
+  })
+})
+
+/**
+ * ★★ 徽标的临期倒计时必须属于**实际发往的渠道**（真实缺陷，PR !84 复审实测）。
+ *
+ * ## 缺陷机制
+ *
+ * 徽标的三要素是「实际用了谁（渠道+模型）+ 倍率 + 临期倒计时」。其中渠道/模型与倍率
+ * 都取自**本次真正发出去的目标**，但倒计时原实现取的是 `selectProvider` 顺带记下的
+ * `lastExpiryAt` —— 那是**主胜者**的失效时刻。
+ *
+ * 带图请求会让二者**分叉**：主胜者不支持图片时改道到「支持图片且临期最早」的另一个
+ * 渠道（`prepareCall` 里的 `imageTarget`）。此时徽标显示 provider = 改道后的渠道，
+ * 而倒计时显示主胜者的到期时间 ⇒ **张冠李戴**：用户看到「CodeArts 的额度 12:00 过期」，
+ * 而 12:00 其实是 CodeBuddy 的额度作废时间，据此做的「先烧哪个」判断是错的。
+ *
+ * 实测（修前）：改道到 codearts（真实临期 `900`）后，徽标拿到的 `expiryAt` 是主胜者
+ * buddy 的 `100`。
+ *
+ * ## 为什么必须驱动真实调用链
+ *
+ * 倒计时在 `dispatchTargetOf` → `dispatch` 之间传递，直接调私有方法会绕过真实路径
+ * （PR !66 的教训）。故这里用 `prepareCall` + 带图消息触发改道。
+ */
+describe('★★ auto：徽标倒计时必须属于实际发往的渠道（带图改道不张冠李戴）', () => {
+  /** buddy 不支持图片（当主胜者）；codearts 支持图片（当改道目标）。 */
+  const makeImageWorld = () => {
+    const sent: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, error: () => {} },
+      llm: {
+        listModels: async (p: string) => (p === 'codearts'
+          ? [{ id: 'vision-model', name: 'Vision · x0.03', inputModalities: ['text', 'image'] }]
+          : [{ id: 'text-model', name: 'Text · x0.29', inputModalities: ['text'] }]),
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string; model: string }) => {
+          sent.push(`${o.provider}/${o.model}`)
+          return (async function* () { /* noop */ })()
+        },
+      },
+    }
+    const adapter = new AutoAdapter(ctx as never, {
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: { token: 't' } }),
+      } as never,
+      now: () => 1_000,
+      ttlMs: 0,
+    })
+    // ⚠️ 两个渠道的临期**刻意不同**：buddy(主胜者)=100、codearts(改道目标)=900。
+    //    只有它们不同，才能区分「倒计时取自谁」。
+    adapter.expiryOf = async (provider: string) => (provider === 'buddy' ? 100 : 900)
+    return { adapter, sent }
+  }
+
+  const runWithImage = async (adapter: AutoAdapter): Promise<void> => {
+    const call = await adapter.prepareCall('jet-hub-auto', 'auto')
+    for await (const _ of call.stream({
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'hi' },
+          { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AA==' } },
+        ],
+      }],
+    } as never)) { /* drain */ }
+  }
+
+  it('★★ 改道后 expiryAt 是**改道目标**的临期时刻，不是主胜者的', async () => {
+    const { adapter, sent } = makeImageWorld()
+    await runWithImage(adapter)
+
+    // 前置断言：确实走了改道路径（否则本用例会因「没改道」而变成同义反复）。
+    expect(sent, '应当改道到支持图片的 codearts').toEqual(['codearts/vision-model'])
+
+    const state = adapter.autoState()
+    expect(state.lastDecision?.provider).toBe('codearts')
+    expect(state.lastDecision?.viaImageFallback).toBe(true)
+    // ⛔ 修前这里拿到 100（主胜者 buddy 的），徽标会显示 buddy 的到期时间。
+    expect(state.lastDecision?.expiryAt, '倒计时必须属于实际发往的 codearts').toBe(900)
+    // ⚠️ 同时确认主胜者的时刻**没有被污染**（两个字段语义不同，不能混用）。
+    expect(state.lastWinnerExpiryAt, '主胜者时刻仍是 buddy 的').toBe(100)
+  })
+
+  it('★ 对照：不带图 ⇒ 正常路径，倒计时就是主胜者的', async () => {
+    const { adapter, sent } = makeImageWorld()
+    const call = await adapter.prepareCall('jet-hub-auto', 'auto')
+    for await (const _ of call.stream({ messages: [userMessage()] } as never)) { /* drain */ }
+
+    expect(sent, '不带图 ⇒ 主胜者 buddy 当选').toEqual(['buddy/text-model'])
+    const state = adapter.autoState()
+    expect(state.lastDecision?.provider).toBe('buddy')
+    expect(state.lastDecision?.expiryAt, '正常路径两者同源（都是 buddy）').toBe(100)
+  })
+})
+
+/**
+ * ★★ 徽标的**倍率表**（`priceByModel` / `rememberPrice` / `priceOf` / `autoState`）接线。
+ *
+ * ## 为什么单独守（PR !84 复审的系统性变异扫描，2026-10-11）
+ *
+ * 用「短路成空实现」逐格扫描本 PR 的新增分支时，发现 `auto-adapter.ts` 里这四处
+ * **全部零守卫**（改坏后相关 41 条用例全绿）：
+ *
+ * | 变异 | 后果 |
+ * |---|---|
+ * | `rememberPrice` 的键丢掉 provider 前缀 | **同名模型跨渠道串价**（buddy 的 x0.29 被当成 codearts 的价） |
+ * | `priceOf` 的读侧丢掉 provider 前缀 | 同上（读写两侧**必须**同构） |
+ * | `autoState()` 里 `priceOf` 不转发 | 徽标**永远没有倍率** —— 正是用户报障「没倍率显示？」的形态 |
+ *
+ * ⚠️ 「同名模型跨渠道串价」是真实可达的：buddy / codearts / loomy / zcode 的目录里
+ * 都有 `deepseek-v4.1-flash`、`glm-5.3-flash` 这类**同名**模型，而它们的倍率不同
+ *（例如 buddy x0.29 / codearts x0.03）。表键不含渠道时，先写入的那家会把另一家的
+ * 价覆盖掉 —— 徽标于是显示一个**不属于实际渠道**的倍率（与「编造倍率」同类的误导）。
+ */
+describe('★★ auto：徽标倍率表必须按「渠道 + 模型」键控（不得跨渠道串价）', () => {
+  /** 两个渠道各有同名模型，倍率刻意不同。 */
+  const CATALOG = {
+    buddy: [{ id: 'shared-model', name: 'Shared · x0.29', inputModalities: ['text'] }],
+    codearts: [{ id: 'shared-model', name: 'Shared · x0.03', inputModalities: ['text'] }],
+  }
+
+  const makeAdapter = () => {
+    const ctx = {
+      logger: { warn: () => {}, error: () => {} },
+      llm: {
+        listModels: async (p: string) => (CATALOG as Record<string, unknown[]>)[p] ?? [],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => (async function* () { /* noop */ })(),
+      },
+    }
+    const adapter = new AutoAdapter(ctx as never, {
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: { token: 't' } }),
+      } as never,
+      now: () => 1_000,
+      ttlMs: 0,
+    })
+    // 让 codearts 临期更早 ⇒ 它当选，从而 `firstModelOf` 会为它记下 0.03。
+    adapter.expiryOf = async (provider: string) => (provider === 'codearts' ? 100 : 900)
+    return adapter
+  }
+
+  it('★★ 同名模型在不同渠道上价不同 ⇒ 查询必须区分渠道（不得串价）', async () => {
+    const adapter = makeAdapter()
+    // 走真实选型路径，让 `firstModelOf` 真的把倍率记进表里。
+    await adapter.prepareCall('jet-hub-auto', 'auto')
+
+    // ⚠️ 选型会为**每个候选渠道**探测（`selectProvider` 遍历 `AUTO_PROVIDERS`），
+    //    故两家都会被记下 —— 关键是**各自的价互不覆盖**。
+    expect(adapter.priceOf('codearts', 'shared-model'), 'codearts 的倍率').toBeCloseTo(0.03)
+    // ⛔ 键不含渠道时，这一格会**串成 codearts 的 0.03**（buddy 明明是 x0.29）。
+    expect(adapter.priceOf('buddy', 'shared-model'), 'buddy 必须仍是自己的 x0.29').toBeCloseTo(0.29)
+  })
+
+  it('★★ autoState() 必须转发 priceOf（否则徽标永远没有倍率）', async () => {
+    const adapter = makeAdapter()
+    await adapter.prepareCall('jet-hub-auto', 'auto')
+
+    const state = adapter.autoState()
+    // ⛔ 这一格是用户报障「没倍率显示？」的直接根因形态。
+    expect(state.priceOf('codearts', 'shared-model'), 'autoState 必须转发倍率查询').toBeCloseTo(0.03)
+    // 且**逐渠道区分**：同一个 modelId 在另一家上是另一个价（串价就会两者相等）。
+    expect(state.priceOf('buddy', 'shared-model'), '同名模型不得跨渠道串价').toBeCloseTo(0.29)
+  })
+
+  it('★ 未记过的「渠道 + 模型」组合回 undefined（不猜、不回落）', () => {
+    const adapter = makeAdapter()
+    // 表是空的：刚重启、还没走过选型 —— 属**正常**情形，调用方据此不显示倍率。
+    expect(adapter.priceOf('buddy', 'never-seen')).toBeUndefined()
+    expect(adapter.autoState().priceOf('codearts', 'never-seen')).toBeUndefined()
+  })
+})
+
+/**
+ * ★★ `auto` 的目录契约与**实际发出目标**的最小形状（复审变异扫描出的另 2 处零守卫）。
+ *
+ * ## 为什么守这两条（系统扫描：全量 7204 条里改动后**零新增失败**）
+ *
+ * | 变异 | 修前结果 | 后果 |
+ * |---|---|---|
+ * | `listAllModels()` 返回 `[]` | GREEN | `fullCatalogIds` 拿不到 id ⇒ 「全部已关闭」判据失效（见 `provider.status`） |
+ * | `lastDispatch.model` 恒空串 | GREEN | 胶囊显示「自动 → CodeArts」**但没有模型名** —— 三要素缺一 |
+ *
+ * ⚠️ 第二条尤其要紧：**模型名**是用户判断「这次到底在用哪个模型」的唯一依据
+ *（provider 名只到渠道粒度，同一渠道下有多个模型）。而它是三要素里唯一
+ * 没有任何用例断言过的一个（provider / 倍率 / 倒计时都有守卫）。
+ */
+describe('★★ auto：目录契约与 lastDispatch 的 model 字段', () => {
+  const makeAdapter = () => {
+    const ctx = {
+      logger: { warn: () => {}, error: () => {} },
+      llm: {
+        listModels: async (p: string) => (p === 'buddy'
+          ? [{ id: 'real-model-id', name: 'Real Model · x0.1', inputModalities: ['text'] }]
+          : []),
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => (async function* () { /* noop */ })(),
+      },
+    }
+    const adapter = new AutoAdapter(ctx as never, {
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: { token: 't' } }),
+      } as never,
+      now: () => 1_000,
+      ttlMs: 0,
+    })
+    adapter.expiryOf = async (provider: string) => (provider === 'buddy' ? 100 : -1)
+    return adapter
+  }
+
+  it('★★ listAllModels 必须给出 auto 那一个模型（否则「全部已关闭」判据失效）', () => {
+    const adapter = makeAdapter()
+    const all = adapter.listAllModels()
+    expect(all.length, 'auto 必须播报自己的那一个模型').toBe(1)
+    expect(all[0]?.id).toBe('auto')
+    expect(all[0]?.name, '展示名不得为空（DSH 校验要求）').toBeTruthy()
+    // 与 `listModels` 同形（auto 不参与用户黑名单，故两者返回相同）。
+    expect(all[0]?.id).toBe('auto')
+  })
+
+  it('★★ lastDispatch 必须记下**真实模型名**（胶囊的「在用哪个模型」全靠它）', async () => {
+    const adapter = makeAdapter()
+    const call = await adapter.prepareCall('jet-hub-auto', 'auto')
+    for await (const _ of call.stream({ messages: [userMessage()] } as never)) { /* drain */ }
+
+    const decided = adapter.autoState().lastDecision
+    expect(decided?.provider).toBe('buddy')
+    // ⛔ 恒空串时这里是 `''` —— 胶囊会显示「自动 → buddy」而没有模型名。
+    expect(decided?.model, '必须记下真实 modelId（不是空串）').toBe('real-model-id')
   })
 })

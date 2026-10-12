@@ -10,6 +10,8 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { descriptorOf } from '../../src/provider-registry.js'
+import { PROVIDER_ICONS } from '../../plugin-src/client/provider-icons.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const hub = readFileSync(join(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
@@ -18,19 +20,25 @@ const product = readFileSync(join(here, '../../src/opencode-product.ts'), 'utf8'
 
 describe('PROVIDERS 登记', () => {
   it('含 opencode 条目', () => {
-    expect(hub).toMatch(/\{\s*id:\s*'opencode',\s*label:\s*'OpenCode'/)
+    // ⚠️ 2026-10-08 改：`PROVIDERS` 由 `src/provider-registry.ts` 派生，
+    // 故读 registry 的**行为断言**，不再扫 `jet-hub.js` 的源码文本。
+    expect(descriptorOf('opencode')).toBeDefined()
+    expect(descriptorOf('opencode')?.label).toBe('OpenCode')
   })
   it('⚠️ label 与 OPENCODE.displayName 逐字一致（rail 宽度算式依赖它）', () => {
     const name = product.match(/displayName:\s*'([^']+)'/)?.[1]
     expect(name).toBe('OpenCode')
-    expect(hub).toMatch(new RegExp(`id: 'opencode', label: '${name}'`))
+    expect(descriptorOf('opencode')?.label).toBe(name)
   })
   it('⚠️ label 长度不触发 rail 换行（≤ 12 字符，参照 raccoon 的约束）', () => {
-    const label = hub.match(/id: 'opencode', label: '([^']+)'/)?.[1] ?? ''
+    const label = descriptorOf('opencode')?.label ?? ''
     expect(label.length).toBeLessThanOrEqual(12)
   })
   it('图标常量已定义且是合法 base64 data URL', () => {
-    const m = hub.match(/const OPENCODE_ICON = 'data:image\/svg\+xml;base64,([^']+)'/)
+    // ⚠️ 2026-10-08：图标已从 `jet-hub.js` 抽到纯数据模块 `provider-icons.js`，
+    // 故直接读该模块的实际值（行为断言）。
+    const uri = PROVIDER_ICONS.opencode ?? ''
+    const m = /^data:image\/svg\+xml;base64,(.+)$/.exec(uri)
     expect(m, '应定义 OPENCODE_ICON').not.toBeNull()
     const svg = Buffer.from(m![1]!, 'base64').toString('utf8')
     expect(svg.startsWith('<svg')).toBe(true)

@@ -5,6 +5,7 @@ import {
   CHAT_API_BASE,
   CodeArtsAdapter,
   codeartsQuotaExhaustedMessage,
+  errorDetail,
   formatResetIn,
   isSseQueueErrorCode,
   isSseQuotaExhaustedErrorCode,
@@ -2192,9 +2193,14 @@ describe('CodeArtsAdapter', () => {
         thrown = error
       }
 
-      // ① 立刻失败，且归为**不可重试**的 QUOTA（不在 harness 的可重试集合里）。
+      // ① 立刻失败，且归为**不可重试**的额度错误（不在 harness 的可重试集合里）。
+      //
+      // ⚠️ 码必须是字面量 `'QUOTA_EXCEEDED'`，**不能**是 harness 常量
+      // `QUOTA_EXCEEDED_CODE`（它的字面值是 `'QUOTA'`）—— 客户端对
+      // `"QUOTA"` 会把 message 整条换成「当前请求的额度已用尽」，
+      // 下面第 ② 条断言里那句解禁时间就永远到不了用户眼前（issue IKJVCW）。
       expect(thrown).toBeInstanceOf(LlmError)
-      expect((thrown as LlmError).code).toBe('QUOTA')
+      expect((thrown as LlmError).code).toBe('QUOTA_EXCEEDED')
       // ② 报错必须**带解禁时间**（用户明确要求：「其它渠道限额到了会提示多少时间
       //    后会解除限额，这个 codearts 的也加上吧」）。
       expect((thrown as LlmError).message).toMatch(/预计 .*后重置/)
@@ -2277,7 +2283,7 @@ describe('CodeArtsAdapter', () => {
         thrown = error
       }
       expect(thrown).toBeInstanceOf(LlmError)
-      expect((thrown as LlmError).code).toBe('QUOTA')
+      expect((thrown as LlmError).code).toBe('QUOTA_EXCEEDED')
       expect((thrown as LlmError).message).toMatch(/预计 .*后重置/)
       // 立即失败，**不**落入排队重试（修复前会被当限流/排队）。
       expect(chatCalls).toBe(1)
@@ -2313,6 +2319,334 @@ describe('CodeArtsAdapter', () => {
       expect(msg).toContain('4 小时后重置')
       expect(msg).toContain('2026-10-02T16:00:00.000Z') // UTC+8 次日 00:00
       expect(msg).toContain('Jet Hub')
+    })
+  })
+
+  /**
+   * ★★ **额度耗尽的错误码不得被 DSH 客户端替换掉文案**（Gitee issue IKJVCW）。
+   *
+   * ## 真实缺陷
+   *
+   * harness 导出的 `QUOTA_EXCEEDED_CODE` 字面值是 **`'QUOTA'`**，而 DSH 客户端
+   * 的 `failureMessage()`（实测 `dsh-client-ui-chat/lib/client.js`，桌面端
+   * `app.asar` 内为逐字节同串）对 **5 个码**做文案替换：
+   * ```js
+   * if (code === "ACCOUNT_SIGNED_OUT") return t("message.failure.accountSignedOut");
+   * if (code === "ACCOUNT_SIGN_IN_REQUIRED") return t("message.failure.accountSignInRequired");
+   * if (code === "QUOTA" || code === "ACCOUNT_QUOTA") return t("message.failure.quota");
+   * return code === "AUTH" ? t("message.failure.auth") : message;
+   * ```
+   * locale：`"message.failure.quota": "当前请求的额度已用尽"`。
+   * ⚠️ **本仓库的 `src/sse.ts` 早就登记了同一份 5 码清单**（`REASONING_LOOP_CODE`
+   * 的注释里），改这里时别写成「三个码」—— 两套同义数字必有一处是错的。
+   *
+   * 于是 {@link codeartsQuotaExhaustedMessage} 里那句**带解禁时间**的说明
+   * 一个字都到不了用户眼前，用户看不到「预计 X 小时后重置」「可改用其它模型」，
+   * 只看到一句暗示「该充值了」的通用文案。
+   *
+   * ## ⚠️ 断言的写法（两处刻意的取舍，都是审计实测后改的）
+   *
+   * ① **不断言等于某个具体码**，而是断言「**不被客户端替换**」这条不变式：
+   *    `'QUOTA_EXCEEDED'` 恰好满足（与仓库 ~20 处惯例一致、语义准确），
+   *    但即便将来换成别的合格码，这组用例也应继续为绿。
+   * ② **`CLIENT_REPLACED_CODES` 是手抄常量**（交付物测试不读客户端产物，
+   *    因为 `pnpm test` 要能在无客户端产物的环境跑）。故它只能锁「我们没改回
+   *    已知的坏码」，**锁不住客户端单方面把 `QUOTA_EXCEEDED` 加进替换表**。
+   *    该残余风险由下面「取证记录」那条注释承担（写明版本与日期，便于复核）。
+   *
+   * 取证记录：`2026-10-11`，桌面端 `DeepSeek Harness/resources/app.asar`
+   * 与 `dsh-client-ui-chat/lib/client.js` 双份一致，均只替换上述 5 个码。
+   *
+   * ## ⚠️ 一处**已知取舍**（审计实测，勿当缺陷再"修"回去）
+   *
+   * 客户端还有**第二处**只认 `QUOTA` / `ACCOUNT_QUOTA` 的判定 —— `quotaNotice`
+   * （`if (quotaNoticeHolds.size > 0 || code !== "QUOTA" && code !== "ACCOUNT_QUOTA") continue`），
+   * 它驱动一条**不随 Chat 面板消失**的全局额度 Toast。改用 `'QUOTA_EXCEEDED'`
+   * 后该 Toast **不再触发**。
+   * ⇒ 这是「失败行有真实原因、但没有全局 Toast」与「失败行被换成误导文案、
+   * 但有全局 Toast」之间的取舍，**取前者**：真实原因在失败行里，用户一定看得到；
+   * 而后者的误导文案会把用户引向「等额度恢复」这个错误动作。
+   */
+  describe('★ 额度错误的码不得被客户端替换（issue IKJVCW）', () => {
+    /**
+     * 客户端 `failureMessage()` 会吞掉 message 的码（手抄，见上文「取证记录」）。
+     *
+     * ⚠️ 只列**本插件可能产出**的三个：`ACCOUNT_SIGNED_OUT` /
+     * `ACCOUNT_SIGN_IN_REQUIRED` 是 DeepSeek 自家登录态专用，插件产生不了。
+     */
+    const CLIENT_REPLACED_CODES = ['QUOTA', 'ACCOUNT_QUOTA', 'AUTH']
+
+    it('断言前提：harness 常量 QUOTA_EXCEEDED_CODE 的字面值就是会被替换的 "QUOTA"', async () => {
+      // ⚠️ 这条锚的是**上游事实**（harness 的常量值），不是同义反复：
+      // 若 DSH 某天把该常量改成不被替换的值，这里变红，提示可以重新评估选型
+      // （而不是让下面几条悄悄失去意义）。
+      //
+      // 注：同段还有一条 `CLIENT_REPLACED_CODES` 与上游常量对拍的断言，
+      // 已按审计意见**删除** —— 它比较的是两个常量，零信息量（客户端改表不会红）。
+      const { QUOTA_EXCEEDED_CODE } = await import('@deepseek-ai/dsh-llm')
+      expect(QUOTA_EXCEEDED_CODE).toBe('QUOTA')
+    })
+
+    it('SSE 额度耗尽（InferHub.4291.200）的码不被替换，且 message 带着解禁时间', async () => {
+      const pool = {
+        findAccountIdByCredential: async () => 'acct-1',
+        getAvailableAccount: async () => null,
+        updateModelRateLimit: async () => {},
+      }
+      const fetchImpl = vi.fn(async () => new Response(
+        'data:{"error_code":"InferHub.4291.200","error_msg":"insufficient quota"}\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      ))
+      const adapter = makeAdapter({ fetchImpl, accountPool: pool })
+      let thrown: unknown
+      try {
+        for await (const _ of adapter.stream(streamOptions)) { /* 不应产出 */ }
+      } catch (error) {
+        thrown = error
+      }
+      const code = (thrown as LlmError).code
+      // ① 码不在客户端替换表里 ⇒ 下面那句 message 真的能到用户眼前。
+      expect(CLIENT_REPLACED_CODES).not.toContain(code)
+      // ② 正因为 ① 成立，带解禁时间的说明才是有意义地被断言。
+      expect((thrown as LlmError).message).toMatch(/预计 .*后重置/)
+    })
+
+    it('HTTP 4xx 额度耗尽同样是不可替换的码，且 message 带解禁时间', async () => {
+      // 两条通道都接（`AGENTS.md` 的既有铁律）：只改 SSE 那条会漏掉 4xx 形态。
+      const fetchImpl = vi.fn(async () => new Response(
+        JSON.stringify({ error_code: 'InferHub.4291.200', error_msg: 'insufficient quota' }),
+        { status: 400, headers: { 'content-type': 'application/json' } },
+      ))
+      let thrown: unknown
+      try {
+        for await (const _ of makeAdapter({ fetchImpl }).stream(streamOptions)) { /* 不应产出 */ }
+      } catch (error) {
+        thrown = error
+      }
+      expect(CLIENT_REPLACED_CODES).not.toContain((thrown as LlmError).code)
+      expect((thrown as LlmError).message).toMatch(/预计 .*后重置/)
+    })
+
+    it('httpErrorCode 的额度归一化：400 + insufficient balance 归额度', async () => {
+      const fetchImpl = vi.fn(async () => new Response(
+        JSON.stringify({ error: { message: 'insufficient balance' } }),
+        { status: 400, headers: { 'content-type': 'application/json' } },
+      ))
+      let thrown: unknown
+      try {
+        for await (const _ of makeAdapter({ fetchImpl }).stream(streamOptions)) { /* 不应产出 */ }
+      } catch (error) {
+        thrown = error
+      }
+      const code = (thrown as LlmError).code
+      expect(CLIENT_REPLACED_CODES).not.toContain(code)
+      // 顺带锁死它仍归额度（而不是被 400 兜底成 INVALID_REQUEST）。
+      expect(code).toBe('QUOTA_EXCEEDED')
+    })
+
+    /**
+     * ★★ **401/403 下额度文案的分流是「按 `4291` 判据」而非「按状态码」** ——
+     * 逐格实测的真实行为（重建 `lib/` 后走 `stream()`）：
+     *
+     * | 报文（4xx + `<文案>`） | 400 | 401 | 403 |
+     * |---|---|---|---|
+     * | `insufficient balance` | 额度 | **AUTH** | **AUTH** |
+     * | `insufficient quota` | 额度 | **额度** | **额度** |
+     * | `out of credits` | 额度 | **AUTH** | **AUTH** |
+     * | `quota exceeded` | 额度 | **AUTH** | **AUTH** |
+     * | `InferHub.4291.200` + `insufficient quota` | 额度 | **额度** | **额度** |
+     *
+     * ## 为什么 401/403 与 400 不同（这是**既有**行为，不是本次改动引入）
+     *
+     * 4xx 分支的顺序是：
+     * ```
+     * isAuthError（401/403 恒真 ⇒ 续期 + continue 重试）
+     *   → isSseQuotaExhaustedErrorCode（额度）→ isRateLimited → … → httpErrorCode
+     * ```
+     * 401/403 先被 `isAuthError` 接走做一次续期（`continue`），**第二轮**
+     * `authRefreshed` 已为 true、跳过续期，此时才轮到额度判据 ——
+     * 而 `isSseQuotaExhaustedErrorCode` 的**文案腿只认 `insufficient quota`**
+     * （不认 `balance` / `credits`），故只有它能在 401/403 下穿透到额度分支。
+     *
+     * ## ⚠️ 这条铁律**不得**为了让上表变整齐而被改掉
+     *
+     * `AGENTS.md`（「同族判据必须逐格同构」）：
+     * > **401/403 先判**，恒归认证类 —— 状态码与额度文案并存时
+     * > （网关侧故障常在报文里捎带余额提示）**以状态码为准**
+     *
+     * codearts 的 401/403 来自**网关**（`APIG.0602` Invalid token /
+     * `APIG.0301` 验签失败），网关故障时捎带余额词是常态。让余额词改写分类
+     * ⇒ 真凭据失效被说成「额度用尽」，用户被引向「等额度恢复」而非重新登录。
+     * 该铁律是 2026-10-06 raccoon / loomy「一个请求内 6 个号各被封 24h」
+     * 事故的产物。
+     *
+     * ⚠️ **我一度照独立审计的建议，把额度判据提到 `httpErrorCode` 的
+     * 401/403 短路之前，已撤回** —— 那条建议是**孤立函数的假阳性**：
+     * 它只看 `httpErrorCode` 本身，没看它在真实控制流里排在额度判据**之后**。
+     * ⇒ 审计结论**必须回到生产路径复核**，不能只测被建议修改的那个函数。
+     *
+     * ⚠️ 且「codearts 会用 401/403 下发额度文案」**无实测支撑**（141 个真实会话
+     * 零命中）。将来真抓到该报文**再按实测处理**，不要据构造报文改分类顺序。
+     */
+    it('★ 401/403 下的额度分流：只有 `insufficient quota` 能穿透（其余归 AUTH）', async () => {
+      // 逐格实测的真实归属（见上方表格）。这张表是**既有行为**的快照，
+      // 不是理想设计 —— 它是「401/403 先判」这条铁律的必然结果。
+      const grid: Array<[string, string, string, string]> = [
+        // [文案, 400 的码, 401 的码, 403 的码]
+        ['insufficient balance', 'QUOTA_EXCEEDED', 'AUTH', 'AUTH'],
+        ['insufficient quota', 'QUOTA_EXCEEDED', 'QUOTA_EXCEEDED', 'QUOTA_EXCEEDED'],
+        ['out of credits', 'QUOTA_EXCEEDED', 'AUTH', 'AUTH'],
+        ['quota exceeded', 'QUOTA_EXCEEDED', 'AUTH', 'AUTH'],
+      ]
+      for (const [msg, at400, at401, at403] of grid) {
+        const expected: Record<number, string> = { 400: at400, 401: at401, 403: at403 }
+        for (const status of [400, 401, 403]) {
+          const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+            if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+              return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+            }
+            return new Response(
+              JSON.stringify({ error_code: 'X', error_msg: msg }),
+              { status, headers: { 'content-type': 'application/json' } },
+            )
+          })
+          let thrown: unknown
+          try {
+            for await (const _ of makeAdapter({ fetchImpl }).stream(streamOptions)) { /* 不应产出 */ }
+          } catch (error) {
+            thrown = error
+          }
+          expect((thrown as LlmError).code, `status=${status} msg=${msg}`).toBe(expected[status])
+        }
+      }
+    })
+
+    it('★ 华为额度码 `InferHub.4291.200` 在 401/403 下也能穿透到额度', async () => {
+      // 与上一条的 `insufficient quota` 同因（都命中 `isSseQuotaExhaustedErrorCode`），
+      // 但这条走的是**码值腿**（`4291`）而非文案腿 —— 两条腿都要有守卫。
+      for (const status of [400, 401, 403]) {
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+          if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          return new Response(
+            JSON.stringify({ error_code: 'InferHub.4291.200', error_msg: 'insufficient quota' }),
+            { status, headers: { 'content-type': 'application/json' } },
+          )
+        })
+        let thrown: unknown
+        try {
+          for await (const _ of makeAdapter({ fetchImpl }).stream(streamOptions)) { /* 不应产出 */ }
+        } catch (error) {
+          thrown = error
+        }
+        const code = (thrown as LlmError).code
+        expect(code, `status=${status}`).toBe('QUOTA_EXCEEDED')
+        // 本 issue 的主诉：额度码不得落在客户端替换表里。
+        expect(CLIENT_REPLACED_CODES, `status=${status}`).not.toContain(code)
+      }
+    })
+
+    it('真凭据失效（APIG.0602）仍续期重试一次（额度判据不得误伤认证路径）', async () => {
+      let refreshed = 0
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+          return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        return new Response(
+          JSON.stringify({ error_code: 'APIG.0602', error_msg: 'Invalid token' }),
+          { status: 403, headers: { 'content-type': 'application/json' } },
+        )
+      })
+      const adapter = makeAdapter({ fetchImpl, refresh: async () => { refreshed += 1 } })
+      try {
+        for await (const _ of adapter.stream(streamOptions)) { /* 不应产出 */ }
+      } catch {
+        // 续期后仍失败 ⇒ 照常抛出，这里只关心「续期发生过」。
+      }
+      expect(refreshed).toBe(1)
+    })
+  })
+
+  /**
+   * ★ `errorDetail` 的**两条腿**（独立审计实测的真实缺陷 + 一处我自己引入又修掉的回退）。
+   *
+   * 该函数是 `httpErrorCode` 与 4xx 额度判据的唯一输入，故它认不出的报文形态
+   * 会直接决定用户看到什么码。两种形态必须**都认**：
+   *
+   * | 报文 | 原先 | 现在 |
+   * |---|---|---|
+   * | `{"error":"<字符串>"}` | ❌ 整段 JSON 原样返回（用户看到裸 JSON） | ✅ 取该字符串 |
+   * | `{"error":{"code":"insufficient_quota"}}` | ✅ 取 `error.code` | ✅ **必须保留**（见下） |
+   *
+   * ⚠️ 第二行是**回归守卫**：修第一种形态时若图省事把 `error.code` / `error.type`
+   * 两条腿一起删掉（我改的第一版真的这么干过），`insufficient_quota` 这类
+   * 「把额度语义写在 code 里」的报文会从额度**掉回** `AUTH` —— 那是比原缺陷
+   * 更糟的回退。故「只加腿、不减腿」这条约定必须有行为用例守着。
+   */
+  describe('★ errorDetail 的形态覆盖（issue IKJVCW 审计）', () => {
+    /**
+     * ⚠️⚠️ **必须直接断言 `errorDetail` 的返回值，不能绕道「分类结果」**
+     * （第一版就是这么错的，反向验证时发现是假守卫）：
+     *
+     * 报文 `{"error":"insufficient balance"}` 在字符串腿**失效**时，
+     * `errorDetail` 退回**整段 JSON**，而整段 JSON 里**本身就含**
+     * `insufficient balance` 这个子串 ⇒ 额度判据照样命中 ⇒ 用例全绿。
+     * 即「绕道分类」测的是「函数有没有返回点什么」，而不是「那条腿在不在」。
+     *
+     * 故本段**逐条断言返回值**：它必须是**人类可读的短语**，
+     * 而**不是**带 JSON 外壳的原文。
+     */
+    it('★ 顶层 error 是字符串时取出该文案（原先返回整段裸 JSON）', () => {
+      expect(errorDetail(JSON.stringify({ error: 'access forbidden: model not permitted' })))
+        .toBe('access forbidden: model not permitted')
+    })
+
+    it('★ 同形态下**不带** JSON 外壳（这是与「退回 body」的区别所在）', () => {
+      const detail = errorDetail(JSON.stringify({ error: 'insufficient balance' }))
+      expect(detail).toBe('insufficient balance')
+      // 反向：修复前这里会是 `{"error":"insufficient balance"}`。
+      expect(detail).not.toContain('{"error"')
+    })
+
+    it('★ 回归守卫：error.code / error.type / error.message 三条腿都保留', () => {
+      // ⚠️ 修字符串形态时若把这几条一起删掉（我改的第一版真的这么干过），
+      // `insufficient_quota` 这类「额度语义写在 code 里」的报文会从额度
+      // **掉回** `AUTH`/`INVALID_REQUEST` —— 比原缺陷更糟的回退。
+      expect(errorDetail(JSON.stringify({ error: { code: 'insufficient_quota' } })))
+        .toBe('insufficient_quota')
+      expect(errorDetail(JSON.stringify({ error: { type: 'rate_limit_error' } })))
+        .toBe('rate_limit_error')
+      expect(errorDetail(JSON.stringify({ error: { message: 'insufficient balance' } })))
+        .toBe('insufficient balance')
+    })
+
+    it('回归守卫：华为云形态（error_code/error_msg）与顶层 message 也保留', () => {
+      expect(errorDetail(JSON.stringify({ error_code: 'InferHub.4291.200', error_msg: 'insufficient quota' })))
+        .toBe('InferHub.4291.200 insufficient quota')
+      expect(errorDetail(JSON.stringify({ message: 'insufficient credits' })))
+        .toBe('insufficient credits')
+    })
+
+    it('非 JSON 体原样返回（既有行为不变）', () => {
+      expect(errorDetail('plain text failure')).toBe('plain text failure')
+    })
+
+    it('★ 行为面：字符串 error 的额度文案真的会被归为额度（端到端，走 400）', async () => {
+      // 上一条测的是判据本身；这条确认它**接进了生产路径**（4xx 分支调用它）。
+      // ⚠️ 用 **400** 而不是 403：401/403 走网关短路、恒归 `AUTH`
+      //（见上文那条铁律），在 403 上断言额度会与它冲突。
+      const fetchImpl = vi.fn(async () => new Response(
+        JSON.stringify({ error: 'insufficient credits' }),
+        { status: 400, headers: { 'content-type': 'application/json' } },
+      ))
+      let thrown: unknown
+      try {
+        for await (const _ of makeAdapter({ fetchImpl }).stream(streamOptions)) { /* 不应产出 */ }
+      } catch (error) {
+        thrown = error
+      }
+      expect((thrown as LlmError).code).toBe('QUOTA_EXCEEDED')
     })
   })
 })
