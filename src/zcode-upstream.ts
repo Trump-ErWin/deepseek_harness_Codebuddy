@@ -140,6 +140,48 @@ export interface ZcodeBalanceBucket {
   availableUnits?: number
   /** 到期时间（Unix 秒）。 */
   expiresAt?: number
+  /**
+   * ★★ **该桶专属的模型**（上游 `capabilities`，实测形状 `["model:glm-5.3"]`）。
+   *
+   * ## 为什么必须读它（真实缺陷，用户报障 2026-10-12）
+   *
+   * **用户报障原文**：「智谱账号送的 8m 算力其中分为 5.3-3m 和 5.3flsh-5m，
+   * 插件判断这个账号没用完，就不会切换下一个账号使用」。
+   *
+   * 本机**只读实测**（`scripts/probe-zcode-plan-buckets.mjs`，启用账号）：
+   *
+   * ```json
+   * [bucket] show_name=GLM-5.3        capabilities=["model:glm-5.3"]
+   *          total_units=3000000   remaining_units=3000000
+   * [bucket] show_name=GLM-5.3-Flash  capabilities=["model:glm-5.3-flash"]
+   *          total_units=5000000   remaining_units=5000000
+   * ```
+   *
+   * ⇒ **8M 就是这两个桶（3M + 5M），且上游明确下发了模型归属。**
+   * 而此前本类型**没有这个字段**，`fetchZcodeBalance` 把它整体丢弃 ⇒
+   * 插件只知道「总剩余 8M」，于是 GLM-5.3 的 3M 烧光、Flash 的 5M 还在时，
+   * 折算层仍判「这账号有额度」（判据是全桶汇总的 `remaining > 0`）⇒
+   * **该模型的标记永远不写**，auto/aggregate 继续把它当可用候选派发 GLM-5.3。
+   *
+   * ⚠️ **缺失/为空 ⇒ 视为「通用桶」**（覆盖所有模型），**不要**当成「不覆盖任何模型」：
+   * 后者会让一个仍有余额的通用桶（如赠送的 1 亿 token）被忽略 ⇒ 一个**确实可用**
+   * 的账号被判成「该模型已耗尽」而被**误封**（方向相反的错误，代价更大）。
+   * 判据见 `zcode-entitlements.ts` 的 `bucketCoversModel`。
+   */
+  capabilities?: readonly string[]
+  /**
+   * 权益 id（实测 `ent_2_0817_glm_5p3` / `ent_2_0817_glm_5p3f`）。
+   *
+   * ⚠ **不参与任何判定** —— 判定一律走 {@link capabilities}
+   *（它是上游下发的**语义**字段；`entitlement_id` 是命名约定，改版就可能变）。
+   *
+   * ⚠️⚠️ **它当前是「只写不读」的数据**（审计指出 2026-10-12）：`src/` 与
+   * `plugin-src/client/` 里**零消费方**（唯一读者是本模块的单测）。
+   * 保留它的理由是**排查留证**：出问题时能一眼看出「是哪个 entitlement
+   * 在起作用」，而 `capabilities` 只给模型维度、给不出计划维度。
+   * ⇒ 别把它当「已接线」的字段用；要用它请先加消费者（并删掉这句说明）。
+   */
+  entitlementId?: string
 }
 
 /** 余额查询结果。 */
@@ -216,6 +258,26 @@ export interface ZcodeClaimOutcome {
  */
 function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/**
+ * 读一个桶的 `capabilities`（上游实测 `["model:glm-5.3"]`）。
+ *
+ * ⚠ **只收非空字符串**：上游可能在别的形态下给 `null` / 数字 / 空串，
+ * 让它们进数组会污染 `bucketCoversModel` 的前缀解析（`String(null)` 会得到
+ * `"null"` 这种看似合法的段）。
+ *
+ * ⚠ **全空时返回 `undefined`（而不是 `[]`）**：`undefined` 与 `[]` 在判据里
+ * **语义不同** —— 前者是「上游没说」，后者是「上游说它不覆盖任何模型」。
+ * 本仓库对这类「未知 vs 否定」的三态区分有明确规则（见 `inputModalities` 的
+ * 注释），且这里的错误方向代价很大：把 `undefined` 当成 `[]` 会让一个**仍有
+ * 余额的通用桶**被忽略，从而误封一个可用账号。
+ */
+function capabilitiesOf(record: Record<string, unknown>): readonly string[] | undefined {
+  const raw = record.capabilities
+  if (!Array.isArray(raw)) return undefined
+  const out = raw.filter((item): item is string => typeof item === 'string' && item.length > 0)
+  return out.length > 0 ? out : undefined
 }
 
 /**
@@ -304,6 +366,12 @@ export async function fetchZcodeBalance(
       remainingUnits: num(record.remaining_units),
       availableUnits: num(record.available_units),
       expiresAt: num(record.expires_at),
+      // ★ 模型归属（实测 `["model:glm-5.3"]`）—— 按模型判定靠它（见字段注释）。
+      ...(() => {
+        const capabilities = capabilitiesOf(record)
+        return capabilities === undefined ? {} : { capabilities }
+      })(),
+      ...typeof record.entitlement_id === 'string' ? { entitlementId: record.entitlement_id } : {},
     })
   }
 
