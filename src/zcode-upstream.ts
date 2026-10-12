@@ -41,6 +41,13 @@ import {
   parseZcodeBusinessCode,
 } from './zcode-diagnostics.js'
 import type { ZcodeRemoteModelLike } from './zcode-product.js'
+/**
+ * ⚠ **只取类型**：`zcode-captcha.ts` 反过来不 import 本文件，故无循环。
+ * 用 `import type` 是为了在编译后**不产生运行时依赖** —— captcha 那侧会拉起
+ * `chromium-session.js`（含 `node:child_process`），而本文件的调用方里有
+ * 只需要「读配置」的纯网络路径。
+ */
+import type { ZcodeCaptchaConfig } from './zcode-captcha.js'
 
 /** ZCode 平台 origin（官方默认）。 */
 export const ZCODE_ORIGIN = 'https://zcode.z.ai'
@@ -695,7 +702,7 @@ export async function claimZcodePlan(
 export async function fetchZcodeCaptchaConfig(
   credential: ZcodeCredential,
   fetchImpl: typeof fetch = fetch,
-): Promise<{ region: string; prefix: string; sceneId: string } | undefined> {
+): Promise<ZcodeCaptchaConfig | undefined> {
   const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
   const url = `${ZCODE_CLIENT_CONFIGS_URL}?app_version=${encodeURIComponent(appVersion)}&platform=unknown`
   try {
@@ -705,7 +712,17 @@ export async function fetchZcodeCaptchaConfig(
     }, 20_000)
     if (!response.ok) return undefined
     const parsed = await response.json() as {
-      data?: { configs?: { captcha?: { region?: unknown; prefix?: unknown; sceneId?: unknown } } }
+      data?: {
+        configs?: {
+          captcha?: {
+            region?: unknown
+            prefix?: unknown
+            sceneId?: unknown
+            enabled?: unknown
+            skip_model_request?: unknown
+          }
+        }
+      }
     }
     const captcha = parsed.data?.configs?.captcha
     if (captcha === undefined) return undefined
@@ -715,7 +732,26 @@ export async function fetchZcodeCaptchaConfig(
     if (typeof region !== 'string' || typeof prefix !== 'string' || typeof sceneId !== 'string') {
       return undefined
     }
-    return { region, prefix, sceneId }
+    /**
+     * ★ 两个开关**只在真的是布尔时**才写进返回值 —— 与官方
+     * `getCaptchaConfig()` 的 `typeof r === 'boolean' ? { skipModelRequest: r } : {}`
+     * **逐字同口径**。
+     *
+     * ⚠ 不能写成 `enabled: captcha.enabled === true` 这类强制布尔化：
+     *   那会把「字段缺席（不知道）」压成 `false`，而 `requiresCaptchaUpfront`
+     *   靠**区分**二者来决定要不要在首发抖一个 param。
+     *   压平的方向恰好是危险侧：`enabled: false` 会一票否决、
+     *   `skipModelRequest: false` 会让它每请求白烧一个设备级配额。
+     */
+    return {
+      region,
+      prefix,
+      sceneId,
+      ...typeof captcha.enabled === 'boolean' ? { enabled: captcha.enabled } : {},
+      ...typeof captcha.skip_model_request === 'boolean'
+        ? { skipModelRequest: captcha.skip_model_request }
+        : {},
+    }
   } catch {
     return undefined
   }
