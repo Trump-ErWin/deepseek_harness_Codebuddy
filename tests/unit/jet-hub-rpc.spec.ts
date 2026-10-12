@@ -1588,6 +1588,119 @@ describe('model.list / model.setDisabled 端点', () => {
       expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true, hy3: true } })
     })
 
+    /**
+     * ⚠️⚠️ **「关闭全部」必须以两个目录来源的并集为准**（真实缺陷，独立审计发现）。
+     *
+     * `fullCatalogIds` 原先**优先**用 `modelAdapters[provider].listAllModels()`，
+     * 只要它存在就短路、**根本不看 `llm.listModels()`**。而 `listAllModels()` 在
+     * **冷缓存**下返回的是各家**编译期兜底表**（`model-catalog.ts`：
+     * `cached ?? config.syncCatalog()`）—— 它是**子集**：实测 `cline` 冷缓存
+     * 只有 **3** 条（`fallbackModels`），而远端有 **460** 条。
+     *
+     * ⇒ 「关闭全部」只把兜底表那 3 条写进黑名单，**其余 457 条仍然可选**，
+     * 而端点返回「成功」。这比 issue IKJW33 的静默空操作**更严重**：
+     * 后者至少什么都没改，这里却让用户以为整个供应商已关闭（模型选择器里
+     * 那几百条还在，还能继续消耗额度）。
+     *
+     * ⚠️ 用户报障路径**恰恰是冷缓存**：脚本/设置页首次打开就点「关闭全部」。
+     * 既有注释其实早已立下约定「失败时**不落盘** —— 否则会写入一个不完整的
+     * 黑名单，用户看到『关了一半』且无从判断原因」，但 `listAllModels()` 冷缓存
+     * 返回子集时它**不算失败**，于是绕过了那条守卫。
+     */
+    it('disabled:true 取两个目录来源的并集（冷缓存兜底子集不得当权威）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        // `listModels` 的源：**完整远端目录**（3 条）。
+        models: MODELS,
+        // `listAllModels` 只给 1 条：模拟**冷缓存兜底表**（子集）。
+        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(true)
+      expect(
+        storedValue().disabledModels,
+        '只关了兜底子集：远端其余模型仍然可选，而端点返回「成功」',
+      ).toEqual({ buddy: { 'hy3': true, 'glm-5.2': true, 'deepseek-v4-flash': true } })
+    })
+
+    /**
+     * 反向：`listAllModels()` 是**完整**目录、`listModels()` 因黑名单过滤而更少时，
+     * 并集同样不能漏掉 `listAllModels()` 那一半（它带「已关闭」的模型）。
+     *
+     * ⚠️ 这条守的是**并集**而不是「改用 listModels 就好」—— 单取 `listModels()`
+     * 会漏掉已被关闭的条目，而 `setModelsDisabled` 是合并语义，漏掉它们虽无
+     * 实际危害，但会让 `provider.setEnabled` 的 `ids.length === 0` 判据在
+     * 「全部已关闭」时误判成「没有可关闭的模型」而拒绝操作。
+     */
+    it('disabled:true 并集保留 listAllModels 侧的条目（不得只用 listModels）', async () => {
+      const catalog = [
+        { id: 'glm-5.2', name: 'GLM-5.2' },
+        { id: 'hy3', name: 'Hy3' },
+      ]
+      const { call, storedValue } = registerEndpoints({
+        // `listModels` 只剩 1 条（`hy3` 已被关闭 ⇒ 被适配器过滤掉）。
+        models: catalog,
+        disabledModels: { buddy: { hy3: true } },
+        modelAdapters: { buddy: { listAllModels: () => catalog } },
+      })
+
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true, 'glm-5.2': true } })
+    })
+
+    /**
+     * ⚠️⚠️ **远端读失败 + 适配器有兜底表 ⇒ 必须拒绝且不落盘**（覆盖缺口，变异实测）。
+     *
+     * 判据必须是 `remoteIds === undefined` 而**不是**「`ids` 是否为空」：
+     * 冷缓存/门控下适配器兜底表会让并集 `ids` 看起来**非空**，而它只是**子集**。
+     * 若改判 `ids.length === 0`，这条用例就是唯一变红的那个 —— 也就是说
+     * 「关一半」会静默通过。
+     */
+    it('⚠️ 远端读失败时拒绝且不落盘（即使适配器有兜底表，也不得只关它）', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({
+        models: MODELS,
+        listModelsError: '令牌已过期',
+        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('令牌已过期')
+      // 关键：兜底子集**不得**被写进黑名单（那正是「显示已关闭、模型仍可选」的成因）。
+      expect(storedValue().disabledModels).toBeUndefined()
+      expect(emitted).toEqual([])
+    })
+
+    /**
+     * ⚠️⚠️ **远端读到但为空（`[]`）⇒ 也必须拒绝**（残留入口，自查探针实测发现）。
+     *
+     * `remoteIds === undefined`（读失败）与 `remoteIds.length === 0`（读到但为空）
+     * 是**两种不同的失败**，但动作相同 —— 都不能拿适配器兜底子集当权威。
+     * 初版只判了前者 ⇒ 这条路径会**继续**写兜底子集黑名单并返回成功：
+     * 实测（探针）「远端 `[]` + 兜底表 1 条」⇒ `disabledModels = { m1: true }`
+     * 且 `ok:true`，即**同一个缺陷的另一个入口**。
+     *
+     * ⇒ 判据收敛为 `catalog.complete`（同时覆盖两种形态）。
+     * 本用例是它的守卫：若退回只判 `undefined`，这里变红。
+     */
+    it('⚠️ 远端读到但为空（无账号门控）→ 同样拒绝且不落盘（残留入口）', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({
+        // 远端**成功**但返回空（门控隐藏整个 provider）……
+        models: [],
+        // ……而适配器兜底表仍有 1 条 ⇒ 不得据此写黑名单。
+        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(false)
+      expect(storedValue().disabledModels, '兜底子集不得被当成完整目录写入').toBeUndefined()
+      expect(emitted).toEqual([])
+    })
+
     it('disabled:false 清空该 provider 的全部关闭项（含目录里没有的历史遗留键）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
@@ -2227,7 +2340,88 @@ describe('model.list / model.setDisabled 端点', () => {
     })
 
     /**
-     * ⚠️ **打开一个目录外的幽灵条目（仍在黑名单里）必须静默** —— 这是
+     * ⚠️⚠️ **远端目录为空 ⇒ 必须放弃核对，即使适配器有兜底表**（覆盖缺口，变异实测）。
+     *
+     * 形态：**无已登录账号** ⇒ `createModelCatalog` 的门控让 `listModels()` 返回 `[]`
+     *（隐藏整个 provider 分组），而 `modelAdapters[provider].listAllModels()`
+     * **仍然返回兜底表**（它不走那条门控）。
+     *
+     * ⇒ 此时「并集」里只剩适配器那一半。若拿它当权威目录核对，**每一个**远端模型
+     * 都会被判成「不在当前模型目录」而误报 —— 一次未登录就能让所有开关带上假警告。
+     * 空远端意味着「**看不到**」而非「全部下架」。
+     *
+     * ⚠️ 判据必须是 `remoteIds.length === 0`（远端那一半），**不能**用并集
+     * `ids.length === 0` —— 并集里适配器那一半会让「远端为空」这件事看不出来，
+     * 而那正是本判据要防的形态（变异实测：改判 `ids` 后本用例是**唯一**变红的）。
+     */
+    it('远端目录为空（无账号门控）但适配器有兜底表 → 放弃核对，不误报', async () => {
+      const { call } = registerEndpoints({
+        // ⚠️ `listModels` 返回**空**（门控隐藏），但适配器有兜底表。
+        models: [],
+        // ⚠️ 兜底表**只含 `hy3`**，而被测 id 是 `glm-5.2`（**不在**兜底表里）。
+        // 这样才真正走到「并集里只剩适配器那一半、且被测 id 不在其中」的形态 ——
+        // 若兜底表含被测 id，两个来源都会说「在目录」，本用例就测不到那个分支
+        //（变异实测：初版写成兜底表 = MODELS 时，改判 `ids` 后用例**仍然全绿**）。
+        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'glm-5.2',
+        disabled: false,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(
+        warningsOf(result),
+        '远端为空（看不到）被当成「全部下架」：拿兜底表核对会把每个模型都误报',
+      ).toEqual([])
+    })
+
+    /**
+     * ⚠️ 反向：**远端读失败**（不是空）时同样放弃核对，即使适配器有兜底表。
+     * 与上一条是两个不同的分支（`remoteIds === undefined` vs `length === 0`）。
+     */
+    it('远端读失败但适配器有兜底表 → 放弃核对（不得拿兜底子集当权威）', async () => {
+      const { call } = registerEndpoints({
+        models: MODELS,
+        listModelsError: '令牌已过期',
+        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'glm-5.2',
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(warningsOf(result)).toEqual([])
+    })
+
+    /**
+     * ⚠️ 适配器的 `listAllModels()` **抛错**不得让核对整体失效：
+     * 远端那一半仍然可用（它与 `listModels` 是两个独立来源）。
+     */
+    it('适配器 listAllModels 抛错时仍用远端那一半核对（不因它整体放弃）', async () => {
+      const { call } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: { buddy: { listAllModels: () => { throw new Error('适配器内部炸了') } } },
+      })
+
+      const result = await call('model.setDisabled', {
+        provider: 'buddy',
+        modelId: 'glm-5.2',
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      // `glm-5.2` 在远端目录里 ⇒ 判为「在目录」、无警告。
+      expect(warningsOf(result)).toEqual([])
+    })
+
+    /**
+     * ⚠️ **打开一个目录外但仍在黑名单里的 id 必须静默** —— 这是
      * 幽灵条目的**唯一清理路径**，报警告会让用户以为清理失败。
      *
      * ⚠️ 这条语义在实现里**只由一处承担**（`readableCatalogIds` 把黑名单里的
@@ -2845,6 +3039,23 @@ describe('provider.status / provider.setEnabled 端点', () => {
     emitThrows?: boolean
     /** 是否提供适配器（false = 模拟外部/旧适配器，只有 llm 可用）。 */
     withAdapter?: boolean
+    /**
+     * 让 `listAllModels()` 只返回这个**子集**（模拟**冷缓存兜底表**）。
+     *
+     * ⚠️ 真实形态：`model-catalog.ts` 的 `listAllModels()` 是
+     * `cached ?? config.syncCatalog()`，冷缓存时返回各家的**编译期兜底表**，
+     * 而它是**子集**（实测 cline 3 条 vs 远端 460 条）。
+     * 与 `catalog`（= `listModels` 的源，完整目录）**刻意不同源**，
+     * 用来复现「只关兜底子集」的缺陷。
+     */
+    listAllSubset?: Array<{ id: string; name: string }>
+    /**
+     * `listModels` 的调用钩子（用于计数/挂起）。
+     *
+     * ⚠️ `provider.status` 的「核实」路径会读远端目录，故本组需要它来断言
+     * 「未关闭时不核实」（零网络代价）。
+     */
+    onListModels?: () => Promise<void>
   } = {}) {
     let stored: Record<string, unknown> = {
       // ⚠️ 账号条目必须补齐 `credentialRef`（非空）与 `createdAt`/`refreshable`：
@@ -2893,7 +3104,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
     } as never)
 
     const adapter = options.catalog !== undefined && options.withAdapter !== false
-      ? { listAllModels: () => options.catalog! }
+      ? { listAllModels: () => options.listAllSubset ?? options.catalog! }
       : undefined
 
     const ctx = {
@@ -2905,6 +3116,8 @@ describe('provider.status / provider.setEnabled 端点', () => {
           return {
             listModels: async (provider: string) => {
               if (options.listModelsError !== undefined) throw new Error(options.listModelsError)
+              // 计数钩子：验证「未关闭时不核实目录」（零网络代价）。
+              if (options.onListModels !== undefined) await options.onListModels()
               const disabled = ((stored.disabledModels as Record<string, Record<string, boolean>> | undefined)?.[provider]) ?? {}
               // 复刻真实适配器：黑名单命中的模型不出现在 listModels 结果里。
               return (options.catalog ?? [])
@@ -3032,6 +3245,99 @@ describe('provider.status / provider.setEnabled 端点', () => {
       expect(statuses.qoder?.closed ?? false).toBe(false)
     })
 
+    /**
+     * ⚠️⚠️ **`closed` 不得基于兜底子集误报**（真实缺陷，独立审计实测）。
+     *
+     * `listAllModels()` 在冷缓存下是**子集**，而 `closed = total > 0 && disabled === total`
+     * 若基于它算，就会把「旧版本『关闭全部』写下的**不完整**黑名单」判成已关闭：
+     *
+     * ```
+     * 兜底表 [hy3] + 黑名单 { hy3: true } ⇒ total=1, disabled=1 ⇒ closed:true
+     * 而远端还有 glm-5.2 / deepseek-v4-flash 可选 ⇒ 界面显示「已关闭」却仍能选
+     * ```
+     *
+     * 修法：**只在子集判据说「已关闭」时才核实**（危险方向只有这一个；
+     * 报 false 是安全的）。核实用并集重算。
+     */
+    it('⚠️ 兜底子集判据说「已关闭」时必须核实 —— 不得误报（存量不完整黑名单）', async () => {
+      const { call } = setup({
+        // 远端 3 条（用户实际能选的集合）。
+        catalog: CATALOG,
+        // 兜底表只有 1 条（冷缓存子集）……
+        listAllSubset: [{ id: 'hy3', name: 'Hy3' }],
+        // ……而黑名单恰好把它全命中（旧版本「关闭全部」的不完整产物）。
+        disabledModels: { buddy: { hy3: true } },
+      })
+
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+
+      // 核实后 `total` 用并集（3 条），只关了 1 条 ⇒ 未关闭。
+      expect(s.models).toEqual({ total: 3, disabled: 1 })
+      expect(s.closed, '子集判据误报已关闭：界面说关了，远端模型却仍可选').toBe(false)
+    })
+
+    /**
+     * ⚠️ 反向：**真的全关**时仍须报已关闭。
+     *
+     * ⚠️ 这条尤其重要：全部关闭时 `listModels()` 会被黑名单**过滤成空数组**
+     *（那是本端点要正确回答的那个状态，不是「看不到」）。核实的判据因此
+     * **不能**用 `fullCatalogIds` 的 `complete`（它额外要求远端非空）——
+     * 用错会让「一关全就永远显示未关闭」（本修复第一版踩过，两条既有用例当场变红）。
+     */
+    it('⚠️ 真的全关时仍报已关闭（核实判据不得用「远端非空」）', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+      })
+
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+
+      expect(s.models).toEqual({ total: 3, disabled: 3 })
+      expect(s.closed).toBe(true)
+    })
+
+    /**
+     * ⚠️ **远端读失败时保守报未关闭**（安全方向：报 false 用户可点开关、
+     * 点了会得到明确错误；报 true 则会把可用模型说成已关闭）。
+     */
+    it('⚠️ 核实不了（远端读失败）时保守报未关闭（安全方向）', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        listModelsError: '令牌已过期',
+        listAllSubset: [{ id: 'hy3', name: 'Hy3' }],
+        disabledModels: { buddy: { hy3: true } },
+      })
+
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses.buddy
+
+      expect(s.closed, '读不到目录时必须报未关闭（安全方向）').toBe(false)
+    })
+
+    /**
+     * ⚠️ **未关闭的供应商不该触发核实**（零网络代价）。
+     *
+     * 子集判据给 false 时直接返回 —— 绝大多数供应商走这条，
+     * 故冷缓存下首屏**不会**因本次修复多打任何远端请求。
+     */
+    it('未关闭时不核实目录（子集判据为 false 即返回，零网络）', async () => {
+      let listModelsCalls = 0
+      const { call } = setup({
+        catalog: CATALOG,
+        // 兜底表与远端同源，且只关 1 条 ⇒ 子集判据就是 false。
+        disabledModels: { buddy: { hy3: true } },
+        onListModels: async () => { listModelsCalls++ },
+      })
+
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses.buddy
+
+      expect(s.closed).toBe(false)
+      expect(listModelsCalls, '未关闭的供应商不该读远端目录').toBe(0)
+    })
+
     it('providers 非字符串数组 → bad-request', async () => {
       const { call } = setup({ catalog: CATALOG })
       expect((await call('provider.status', { providers: 'buddy' })).ok).toBe(false)
@@ -3058,6 +3364,66 @@ describe('provider.status / provider.setEnabled 端点', () => {
       expect(result.value).toMatchObject({ provider: 'buddy', enabled: false, models: 3, accounts: 1 })
       expect(Object.keys(storedDisabled().buddy).sort()).toEqual(['deepseek-v4-flash', 'glm-5.2', 'hy3'])
       expect(storedAccounts()[0].enabled).toBe(false)
+    })
+
+    /**
+     * ⚠️⚠️ **关闭供应商同样必须以并集为准**（与 `model.setAllDisabled` 同源缺陷）。
+     *
+     * 两者共用 `fullCatalogIds`，故「冷缓存下只关兜底子集」在这里的后果**更重**：
+     * 供应商级开关的语义是「关闭该供应商 = 关掉它的全部模型 + 停用它的全部账号」，
+     * 而 `provider.status` 的 `closed` 判据是
+     * `total > 0 && disabled === total`（`total` 取自 `listAllModels()`）。
+     *
+     * ⇒ 冷缓存下这里会写出一个**只含兜底表条目**的黑名单，于是：
+     * - 界面上该供应商**显示为已关闭**（因为 `total` 也只有兜底表那几条、
+     *   恰好 `disabled === total`）；
+     * - 而对话框里**几百个模型仍然可选**（它们从未进黑名单）。
+     *
+     * 这正是 `provider.setEnabled` 注释里列为**必须避免**的
+     * 「账号全停用但模型仍可见」形态的镜像 —— 用户按关闭的预期，却仍能选到它。
+     */
+    it('关闭供应商：冷缓存兜底子集不得当权威（否则显示已关闭、模型却仍可选）', async () => {
+      const { call, storedDisabled } = setup({
+        // `listModels` 的源：完整目录（3 条）。
+        catalog: CATALOG,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        // `listAllModels` 只给 1 条：模拟冷缓存兜底子集。
+        listAllSubset: [{ id: 'hy3', name: 'Hy3' }],
+      })
+
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+
+      expect(result.ok).toBe(true)
+      expect(
+        Object.keys(storedDisabled().buddy ?? {}).sort(),
+        '只关了兜底子集：供应商显示「已关闭」，而其余模型仍可选',
+      ).toEqual(['deepseek-v4-flash', 'glm-5.2', 'hy3'])
+    })
+
+    /**
+     * ⚠️⚠️ **关闭供应商时远端读失败 + 适配器有兜底表 ⇒ 必须拒绝且不落盘**。
+     *
+     * 与 `model.setAllDisabled` 同判据（`remoteIds`，不是 `ids` 是否为空）。
+     * 这里后果更重：`provider.status` 的 `closed` 判据是
+     * `total > 0 && disabled === total`，而 `total` 也取自 `listAllModels()`
+     * ⇒ 只关兜底子集会同时写出「显示已关闭」与「几百条模型仍可选」。
+     */
+    it('⚠️ 关闭供应商：远端读失败时拒绝且不落盘（不得只关兜底子集）', async () => {
+      const { call, storedDisabled, storedAccounts, emitted } = setup({
+        catalog: CATALOG,
+        listModelsError: '令牌已过期',
+        listAllSubset: [{ id: 'hy3', name: 'Hy3' }],
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('令牌已过期')
+      // 不写黑名单、不停账号、不广播 —— 三条都要（否则会留下半套状态）。
+      expect(storedDisabled().buddy).toBeUndefined()
+      expect(storedAccounts()[0].enabled).toBe(true)
+      expect(emitted).toEqual([])
     })
 
     it('⚠️ 顺序必须是「先关模型、再停账号」', async () => {
@@ -3112,10 +3478,38 @@ describe('provider.status / provider.setEnabled 端点', () => {
       })
       const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
       expect(result.ok).toBe(false)
-      expect(result.error?.message).toContain('没有可关闭的模型')
+      const message = result.error?.message ?? ''
+      expect(message).toContain('没有可关闭的模型')
+      // ⚠️⚠️ **必须加这条反向断言**（真实缺口，独立对抗审计实测零守卫）：
+      // 只写 `toContain('没有可关闭的模型')` 时，文案退化成
+      // `没有可关闭的模型：undefined`（把 `remoteError` 的 undefined 拼进去）
+      // **也含该子串** ⇒ 断言恒真、变异无法察觉。
+      expect(message, '不得把 undefined 拼进用户可见文案').not.toContain('undefined')
       // ⚠️ 关键：绝不能「关不掉模型就只停账号」——那会让它显示成已关闭而模型仍在。
       expect(writeOrder).toEqual([])
       expect(emitted).toEqual([])
+      expect(storedAccounts()[0].enabled).toBe(true)
+    })
+
+    /**
+     * ⚠️ **远端读失败时文案要带上原因**（与上一条的「远端读到但为空」是**两种形态**，
+     * 靠 `remoteError` 是否为空分流）。两者对用户意义不同：
+     * 前者是「**读不到**」（可重试），后者是「**没账号**」（去登录）。
+     */
+    it('⚠️ 远端读失败 → 文案带上服务端原因（与「没有可关闭的模型」区分）', async () => {
+      const { call, storedAccounts } = setup({
+        catalog: CATALOG,
+        listModelsError: '令牌已过期',
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+
+      expect(result.ok).toBe(false)
+      const message = result.error?.message ?? ''
+      expect(message).toContain('令牌已过期')
+      expect(message).not.toContain('undefined')
+      // 不落盘、不停账号。
       expect(storedAccounts()[0].enabled).toBe(true)
     })
 
@@ -3261,6 +3655,14 @@ describe('account.test 端点（**无条件**真发一次请求）', () => {
     catalog?: Array<{ id: string; name: string }>
     /** 省略 llm 服务，验证「目录读不出来」的降级路径。 */
     withoutLlm?: boolean
+    /**
+     * 让 `llm.listModels()` **抛错**（远端临时故障：凭据过期 / 上游抖动）。
+     *
+     * ⚠️ 与 `withoutLlm`（服务整体缺失）是**两个不同分支**，且必须分开覆盖：
+     * 本端点是唯一一个「远端读失败**不拒绝**」的调用点（它只要一个 id 就能测），
+     * 而 `withoutLlm` 走的是「llm 服务不可用」那条。
+     */
+    listModelsError?: string
   } = {}) {
     let stored: Record<string, unknown> = {
       accounts: [{
@@ -3304,7 +3706,12 @@ describe('account.test 端点（**无条件**真发一次请求）', () => {
           return { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         }
         if (key === 'llm' && options.withoutLlm !== true) {
-          return { listModels: async (provider: string) => (options.catalog ?? []).map(m => ({ ...m, provider })) }
+          return {
+            listModels: async (provider: string) => {
+              if (options.listModelsError !== undefined) throw new Error(options.listModelsError)
+              return (options.catalog ?? []).map(m => ({ ...m, provider }))
+            },
+          }
         }
         return undefined
       },
@@ -3429,6 +3836,71 @@ describe('account.test 端点（**无条件**真发一次请求）', () => {
     expect(result.ok).toBe(false)
     expect(result.error?.message).toContain('无法确定要测试的模型')
     // 猜一个模型名发出去会得到与账号无关的 404，把两件事混成一条报错。
+    expect(calls).toHaveLength(0)
+  })
+
+  /**
+   * ⚠️⚠️ **本端点对目录是「尽力而为」，与两个关闭方向刻意不同**（真实的行为收缩，
+   * 本次修复中实测发现并避免）。
+   *
+   * 两个关闭方向要求目录**完整**（远端读失败 ⇒ 拒绝），因为黑名单写一半会让
+   * 「显示已关闭、模型却仍可选」。而本端点只要**一个** id 就能测 ⇒ 远端读失败时
+   * 必须用**适配器那一半**照常继续。
+   *
+   * ⚠️ 实测证据：若这里也按「远端失败即拒绝」处理，那么
+   * 「适配器有目录 + llm 临时故障（令牌过期）」会从**能测**退化成
+   * `bad-request: 无法确定要测试的模型：读取模型列表失败：令牌已过期`
+   * —— 而该端点的注释明确把这类退化列为「**自造的失败**」。
+   */
+  it('⚠️ 适配器有目录 + 远端读失败 → 仍用适配器目录照常测（不得退化成 bad-request）', async () => {
+    const calls = stubFetch()
+    const { call } = setup({
+      // 远端读失败……
+      listModelsError: '令牌已过期',
+      // ……但适配器有目录（冷缓存兜底表形态）。
+      catalog: [{ id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' }],
+    })
+
+    const result = await call('account.test', { accountId: 'gemini-1' })
+
+    expect(result.ok, '远端故障不该让「有兜底目录可测」的账号被拒（自造的失败）').toBe(true)
+    expect((result.value as { modelId: string }).modelId).toBe('gemini-3.8-flash')
+    // 真的发了请求（探活的本意）。
+    expect(calls.length).toBeGreaterThanOrEqual(1)
+  })
+
+  /**
+   * ⚠️⚠️ **远端读到但为空（无账号门控）⇒ 文案必须是「没有可测试的模型」，
+   * 且**不得泄漏 `undefined`**（真实缺口，独立对抗审计实测零守卫）。
+   *
+   * 这是「远端读到但为空」与「远端读失败」的**唯一分流点**
+   * （`complete === false && remoteError === undefined` 就是前者）。
+   * 既有用例只覆盖了 `withoutLlm` 与 `listModelsError`（两者**都带**
+   * `remoteError`）⇒ 这条组合完全没有守卫。
+   *
+   * ⚠️ 审计实测的变异（把判据从 `remoteError !== undefined` 改成 `!complete`）：
+   * 生产 spec **170 条全绿**，而行为已经分叉成
+   * `无法确定要测试的模型：undefined`（**泄漏 undefined**）。
+   * 两者对用户的意义不同：前者是「**没账号**」，后者是「**读不到**」。
+   */
+  it('⚠️ 远端读到但为空（无账号门控）→ 文案是「没有可测试的模型」，不得泄漏 undefined', async () => {
+    const calls = stubFetch()
+    const { call } = setup({
+      // ⚠️ `catalog: []` 同时让远端与适配器都为空 ⇒
+      // `complete === false` 且 `remoteError === undefined`（正是本用例要锁的形态）。
+      catalog: [],
+    })
+
+    const result = await call('account.test', { accountId: 'gemini-1' })
+
+    expect(result.ok).toBe(false)
+    const message = result.error?.message ?? ''
+    // 「没账号」的语义 —— 而不是「读不到」。
+    expect(message).toContain('没有可测试的模型')
+    expect(message).not.toContain('无法确定要测试的模型')
+    // ⚠️ 关键反向断言：`remoteError` 为 undefined 时若拼进模板会打印出
+    // 字面量 `undefined`（审计实测的变异形态），用户看到的是插件内部错误。
+    expect(message, '不得把 undefined 拼进用户可见文案').not.toContain('undefined')
     expect(calls).toHaveLength(0)
   })
 
