@@ -265,6 +265,20 @@ export class ClineAdapter extends LlmAdapter {
    *
    * 判据用「已完整」而非「已定义」：残缺时放行到闸门，由冷却控制重试节奏
    * （30 秒一轮，不会打风暴）。
+   *
+   * ⚠️⚠️ **「完整」必须包含 models.dev**（issue IKKZUG，2026-10-12）。
+   *
+   * 修复前它只反映**两个 Cline 端点**（`remote.complete`），**不含 models.dev**
+   * ⇒ models.dev 超时后 `remoteComplete` 仍是 `true` ⇒ 上面这个短路把闸门
+   * 彻底旁路 ⇒ 闸门的冷却永远读不到 ⇒ models.dev 在整个进程生命周期内
+   * 只被调 1 次。而 `cline-pass/*` 的模型条目与图片能力**只由 models.dev 提供**
+   * ⇒ 它们会「明确不支持图片」到进程结束，**只能重启才能恢复**。
+   *
+   * 用户实测：桌面端 10-11 23:02 启动 → 10-12 00:30 仍稳定拒图。
+   *
+   * ⇒ 现在的口径是「**两个端点 + models.dev 都就绪**」。⚠️ 方向是「宁可多试
+   * 一次」：多试的代价只是多发一次 models.dev 请求（自带 TTL 与闸门冷却），
+   * 而漏判的代价是整个 provider 的图片能力永久失效。
    */
   private remoteComplete = false
   /**
@@ -472,6 +486,12 @@ export class ClineAdapter extends LlmAdapter {
         // ⚠️ 用 `=== true` 而非直接取值：万一有调用方（旧注入式替身）省了该字段，
         // 保守按**不完整**处理 —— 方向是「宁可多试一次」。
         // 反过来（把缺失当完整）会让残缺目录永久固化，那正是本 issue 的缺陷②。
+        //
+        // ⚠️⚠️ **完整必须同时包含 models.dev**（issue IKKZUG，2026-10-12）：
+        // 它也是目录来源，而 `cline-pass/*` 的模型条目与图片能力**只有它提供**。
+        // 漏掉它 ⇒ models.dev 超时后目录被判成「已完整」⇒ 下面的 `remoteComplete`
+        // 短路永久生效 ⇒ 整个进程生命周期内不再重试 ⇒ 只能重启才能恢复。
+        // 详见 `remoteComplete` 字段的注释与该 issue 的实测（23:02→次日 00:30）。
         const complete = remote === undefined ? got : remote.complete === true
         // ⚠️ **warnings 循环必须在 `if (!got)` 之前**（真实回退，审计发现）：
         // 基线里它排在 `if (!gotRemote) return false` **之前**，而基线那两个端点
@@ -494,8 +514,12 @@ export class ClineAdapter extends LlmAdapter {
         // ⚠️ 残缺目录也落缓存（否则每次 `listModels` 都重拉两个端点），
         // 但 `remoteComplete` 保持 false ⇒ 下次仍进闸门，由冷却控制重试。
         this.remoteModels = merged
-        this.remoteComplete = complete
-        return { got: true, complete }
+        // ⚠️⚠️ 并上「models.dev 已读到」（issue IKKZUG）。
+        // 判据是 `modelsDev !== undefined`（**读到过**，含读到空表），
+        // 与「merged 里有没有补进条目」无关 —— 上游确实没有 cline-pass 块时
+        // 读到的是空表，那同样属于「已就绪」，不该无限重试。
+        this.remoteComplete = complete && this.modelsDev !== undefined
+        return { got: true, complete: this.remoteComplete }
       } catch (error) {
         // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态兜底表。
         // eslint-disable-next-line no-console
