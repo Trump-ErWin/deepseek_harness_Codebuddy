@@ -1717,5 +1717,542 @@ round2: pick=zcode-A ...                                  ← 死循环，每次
 而是「审计 subagent 与主会话」。⇒ 那条约定应读作
 「**任何**两个会改工作区的参与者都不许并行」，不限 subagent。
 
+## ⚠️⚠️ 3.14.5 起官方**架构上支持**推理带 captcha，开关是服务端下发的 `skip_model_request`（2026-10-12）
+
+**用户要求**（并同时更新了闭源版到 `ZCode.exe` **3.14.5.7961**）：
+「检查一下现在推理过程是不是要 captcha 了，如果推理过程中又要了我们使用 zcode
+对话推理过程中也要对应的调用 captcha 流程」。
+
+### 一、先澄清一个**归属**：不是那次重构造成的
+
+用户同时报「一键领取没有弹出 chromium」并怀疑 `3aa34a3`（抽出共享 `ChromiumSession`，
+为集成库库AI 而做的重构）改坏了 captcha 流程。**逐项取证后：不成立。**
+
+- `git show --stat 3aa34a3` 只动 **3 个文件**（新增 `src/chromium-session.ts`、
+  瘦身 `src/zcode-captcha.ts`、5 个测试），**没有**碰 `zcode-auth.ts` /
+  `captcha-carrier.ts` / `jet-hub-rpc.ts` / `captcha-supply.ts`；
+- 逐字对比重构前后（旧 2119 行 → 新 1138 行）：`spawn` 参数（含
+  `--window-position` / `--window-size` / `--lang` / `detached`）、端口挑选与
+  「应答端口一致性」校验、`taskkill /T /F`、profile 退避删除、`STEALTH_PATCH`、
+  `buildDomExpression` / `buildMintExpression`、页面复用与 `pageBusy` 无条件复位
+  **全部逐字保留**；
+- **114 条** captcha 相关单测全绿。
+
+⇒ 「不弹 chromium」是 `19226ca`（2026-10-01「captcha 全链路重做」）引入的
+**内部载体优先**设计（桌面版走 `dshDesktop.browser` 的隐藏 webview guest，
+取不到才落 chromium）。旧记录已写明其收益口径是「**去掉对 chromium 的依赖**，
+不是提速」。想看 chromium 用 `DSH_ZCODE_INTERNAL_CARRIER=0`；web 版拿不到
+`dshDesktop.browser`，必然弹 chromium。
+
+### 二、逆向**最新闭源版** `app.asar` 得到的官方判据链（3.14.5.7961）
+
+产物：`C:\Users\Jet\AppData\Local\Programs\ZCode\resources\app.asar`（326 MB）。
+captcha 逻辑在 `/out/renderer/assets/styles-C4MhEMbW.js`（6.1 MB，文件名随版本变）。
+
+```js
+// ① 准入：只有智谱积分账号走这条路
+function xnn(e){ return e?.access?.type==='zhipu-account' && e.access.mode==='start-plan' }
+
+// ② 索要 captcha（`model-request` 与 `captcha-retry` 两种 reason 都进这里）
+async function Lnn(e){
+  if (!xnn(e.providerConfig)) return
+  const t = await U4(f3(e.codingPlanSubscriptionService), e.signal)
+  if (t?.enabled===false || t?.skipModelRequest===true) return { headers:{} }   // ← 跳过
+  if (!t || p3(t)) throw Error(Snn)
+  const n = await Pnn(t, { providerId, requestId, source, signal })
+  Inn(e.providerId, n)
+  return { captchaVerifyParam: n, headers: unn({ captchaVerifyParam: n, captchaRegion: t.region }) }
+}
+```
+
+`/out/host/index.js` 侧新增配对机制：
+
+```js
+// schema：requestProviderRuntimeHeaders 的 reason 取值域
+reason: t.enum(["model-request", "captcha-retry"])
+
+// host 把 renderer 回的 runtimeProviderHeaders 合进请求头（**只认这两个键**）
+for (const [le, Ze] of Object.entries(m.response.runtimeProviderHeaders ?? {})) {
+  const De = ["X-Aliyun-Captcha-Verify-Param","X-Aliyun-Captcha-Verify-Region"]
+    .find(Nt => Nt.toLowerCase() === le.trim().toLowerCase())
+  if (De && Ze.trim()) H[De] = Ze.trim()
+}
+```
+
+⇒ **推理请求真的会走 captcha**，且被拒后有 `captcha-retry` 重试一轮。
+
+⚠ **`access` 是本地设置，不是服务端下发**：`znn()` 读的是
+`providerSettingsService.getView().providers[].effectiveConfig.access`。
+故 `xnn` 的准入判据在我们这边**不可复现**（我们不是官方壳）。
+
+⚠ **官方那把 `skip_model_request` 转成 camelCase**（`/out/host/index.js` 的
+`getCaptchaConfig()`）：
+```js
+let { skip_model_request: r, ...o } = n
+return { ...o, ...typeof r === 'boolean' ? { skipModelRequest: r } : {} }
+```
+⇒ **只在真的是布尔时才写字段**，缺席就是缺席 —— 我们的读法必须同口径。
+
+### 三、服务端**当前**把开关关着（本机一手实测，只发 GET、零额度）
+
+`GET /api/v1/client/configs?app_version=3.14.5&platform=unknown`，三个账号一致：
+
+```json
+"captcha": { "enabled": true, "prefix": "no8xfe", "region": "cn",
+             "sceneId": "11xygtvd", "skip_model_request": true }
+```
+
+`skip_model_request: true` ⇒ 官方 `Lnn` 第二行即返回，**不产 param、不注头**
+⇒ **现在推理仍然不要 captcha**，我们既有的「先探后取」依然正确。
+
+⚠ **判据只能来自这两条**（逆向产物 + 一手实测），别再用「官方更新说明」
+推断：3.14.4 的说明写「关闭模型请求验证码校验」，而 3.14.5 的架构**已经把
+推理带 captcha 的能力做进去了**，只是**服务端开关没开** —— 两者不矛盾。
+
+### 四、修了什么（缺陷：这个信号我们**读不到**）
+
+`fetchZcodeCaptchaConfig` 此前只读 `region`/`prefix`/`sceneId`，
+把 `skip_model_request` 与 `enabled` **整体丢弃** ⇒ 「上游要不要验证」不可读，
+门控只能一律「先探后取」。这在 `true` 时最优（那一发必然成功、零成本），
+但服务端一旦翻成 **`false`**，先探**必然**被 `400/3007` 拒 ⇒
+**每一个用户请求都白吃一发往返**（再在适配器内部补产重发）。
+
+**落点（4 处）**：
+1. `zcode-upstream.ts` 的 `fetchZcodeCaptchaConfig` 补读两个字段，
+   **只在真的是布尔时才写**（与官方 `getCaptchaConfig()` 逐字同口径）；
+2. `zcode-captcha.ts` 的 `ZcodeCaptchaConfig` 加两个**可选**字段
+   + 新纯判据 `requiresCaptchaUpfront()`；
+3. `zcode-adapter.ts` 内层循环门控加 `upfrontCaptcha`（**只在 `attempt === 0`**）；
+4. `captcha-requirement.ts` 加第三个观测计数 `upfrontCaptchaCount`
+   （**独立成项**，不并进 `knownRequiredCount`：后者的语义是「跨请求靠 2 分钟
+   记忆少探一次」，本项是「靠上游配置少探一次」，证据来源与失效条件都不同）。
+
+⚠⚠ **方向别写反**：能省的是 `skipModelRequest === false`（明确要 ⇒ 直接带），
+**不是** `true`。`true` 表示上游不校验，先探本来就零成本、无可省。
+
+### 五、三态判据（最容易写错的两格）
+
+| `skipModelRequest` | `enabled` | 首发动作 | 理由 |
+|---|---|---|---|
+| **`false`** | 非 `false` | **直接带 param** | 上游明确要 ⇒ 先探必被 `3007` 拒 |
+| `true` | 非 `false` | 先探 | 上游不校验 ⇒ 先探零成本且省一次 mint |
+| **缺席 / 非布尔** | 任意 | 先探 | **不知道就不猜** |
+| 任意 | **`false`** | 先探 | 上游把 captcha 整个关了 ⇒ 一票否决 |
+
+⚠ **缺席 ≠ `false`**：写成 `skipModelRequest !== true` 这类宽松判据，
+会在老配置/字段漂移时把「不知道」当成「上游明确要验证」⇒
+**每个请求白发一个 param**，白扣的是阿里云**设备级**配额（同设备 150/小时）。
+同「额度桶：读不到就不猜」那条纪律。
+
+### 六、回归与反向验证
+
+- `tests/unit/zcode-captcha-upfront.spec.ts`（新，**三态 + 接线**；
+  ⚠ 条数以 `pnpm test` 输出为准，别在文档里写死）。
+  含**接线守卫**两条：`index.ts` 必须把 `fetchCaptchaConfig()` 的**原样结果**
+  交给 `setCaptchaConfig`（不能重建一个只有三个字段的对象）、
+  适配器必须真的**读**判据并进 mint 门控（不是只 import）。
+- `tests/unit/captcha-requirement.spec.ts` / `zcode-captcha-lazy.spec.ts`
+  的 3 条 `toEqual` 形状断言随之更新（新增观测项 ⇒ **合理的联动**，
+  不是行为回归；已在断言里显式写出新字段并保留「无配置时必须为 0」的守护）。
+- **7 个变异全部被抓住**（`scripts/mutate-zcode-captcha-upfront.mjs`，
+  带三重守卫：旧片段出现次数必须恰好 1、写入后**回读校验**、
+  还原后与备份 **sha256 一致**）：
+
+  | 变异 | 结果 |
+  |---|---|
+  | M1 宽松判据（把「缺席」当「要验证」） | 🔴 1 条红 |
+  | M2 方向写反（只看 `=== true`） | 🔴 4 条红 |
+  | M3 去掉 `enabled` 一票否决 | 🔴 1 条红 |
+  | M4 强制布尔化（缺席压成 false） | 🔴 1 条红 |
+  | M5 适配器门控去掉 `upfrontCaptcha` | 🔴 3 条红 |
+  | M6 `index.ts` 重建对象（丢两个开关） | 🔴 1 条红 |
+  | M7 观测记错桶（upfront 记进 probeFirst） | 🔴 1 条红 |
+
+⚠⚠ **反向验证脚本第一次跑时 M4「未施加」**：工作区文件是 **CRLF**，
+而脚本里的多行片段写的是 `\n` ⇒ `split(old)` 数到 **0 次**。
+**是脚本自带的「出现次数必须恰好 1」守卫把它拦下的**（否则会显示「全绿」，
+被误读成「用例抓不住这个回归」）。修法：匹配与替换都在 `\n` 空间做，
+写回时按原文件行尾还原。**这正是本仓库记过的 CRLF 假绿，第二次踩到。**
+
+### 七、端到端取证（零网络，import `lib/` 编译产物）
+
+`scripts/verify-zcode-captcha-upfront-live.mjs`：用**真实报文**过生产解析函数，
+并逐格对照判据表（14 格全符合），关键三行：
+
+```
+当前线上（skip=true）      → {…,"enabled":true,"skipModelRequest":true}  ⇒ 判据 false（仍先探，行为逐字未变）
+服务端翻开关（skip=false）  → {…,"skipModelRequest":false}               ⇒ 判据 true （首发直接带）
+老配置（无该字段）          → {…,"enabled":true}                          ⇒ 判据 false（不猜，仍先探）
+```
+
+⇒ **当前线上行为与改动前逐字一致**（`skip_model_request: true`），
+修复只在服务端翻开关后生效 —— 这是「**零当前行为变化、换来未来自愈**」的改动。
+
+取证脚本（均只读、零额度，`scripts/` 被 gitignore ⇒ **不随提交分发**）：
+`scan-zcode-captcha-trace.mjs`（asar 全量 captcha 痕迹扫描）、
+`find-zcode-needle.mjs` / `extract-zcode-context.mjs`（按 need 定位并取上下文）、
+`probe-zcode-captcha-config-live.mjs`（**一手**拉服务端 captcha 配置）、
+`probe-zcode-access-mode.mjs`（access 与 providers 结构）、
+`mutate-zcode-captcha-upfront.mjs`（反向验证矩阵）、
+`verify-zcode-captcha-upfront-live.mjs`（端到端判据对照）。
+
+### 八、仍未做（如实登记）
+
+1. **`access.mode` 侧无法覆盖**：`xnn()` 依赖官方壳的本地 provider 设置
+   （`access.type === 'zhipu-account' && access.mode === 'start-plan'`），
+   我们直连上游时没有这个概念 ⇒ 若将来上游改成「只对 `off-peak` 模式索要」，
+   我们的判据（只看 `enabled` + `skip_model_request`）可能不够。
+   **未实测**，故不预先加判据。
+2. **`captcha-retry` 那一轮的语义未对齐**：官方在推理被拒后会带
+   `reason: 'captcha-retry'` **重新要一次** runtime headers。
+   我们的对应物是适配器内 `3007` 分支的补产重发（语义等价），
+   但**没有**「因 3012 而重取」那条 —— 而 3012 按现有实测**不是** captcha 问题
+   （判据是请求体身份块，见本章前半），故不合并。
+3. **3012 与 captcha 的因果关系**：本次**未发现**二者有因果。
+   用户截图里那行诊断（`身份块 2898 字符(42+2856) · HTTP 405`）
+   只出现在**推理**路径的 `describeZcodeRequestShape`；领取路径刻意**不传**
+   `shape`（它只有 `{plan_id}`，照搬会误报「身份块 0 字符」）。
+   ⇒ 那条 3012 是**推理**被拦，与「领取没弹 chromium」是**两件独立的事**。
+
+## ⚠️⚠️ 「web 版一键领取不弹 chromium」的真因：`preview` 回了 `plans=[]`（2026-10-12 续查）
+
+**用户澄清（关键）**：不弹的是 **dsh web** 环境（不是 desktop），
+「以前点领取积分按钮都会弹，现在不弹了」；且界面**有结果文字：
+「今日暂无领取额度」**。
+
+⚠ **上一轮我按 desktop 前提作答，方向是错的** —— 本节是对它的订正。
+「不弹 chromium」与「显示今日暂无额度」**不是两个问题，而是同一件事**。
+
+### 一、判据链：返回点在**任何 captcha 产出之前**
+
+`claimDailyWith`（`src/zcode-auth.ts`）的顺序是：
+
+```
+setCaptchaDemand(true)                 ← 只是置需求位（web 版无人消费它）
+await reportZcodeActivation(...)
+plans = await fetchZcodeClaimablePlans(...)   ← GET /billing/preview
+if (plans.length === 0) return [{ kind:'already-claimed', message:'今日暂无可领额度…' }]
+                                        ↑ ★ 在这里就返回了
+const captchaConfig = await this.fetchCaptchaConfig() ...   ← 下面才开始 mint
+```
+
+而浏览器是**惰性**创建的（`captchaPoolInstance()` 里 `this.captchaBrowser ??= new …`
+才 `spawn`）⇒ **preview 空 ⇒ 一次 mint 都不发生 ⇒ 一台浏览器都不起**。
+
+⚠ **判据与文案自 `90890d0`（2026-09-29 最初实现）起一字未改**
+（`git log -S'plans.length === 0' -- src/zcode-auth.ts` 只命中那一次）
+⇒ **确认不是回归，也与 `3aa34a3` 的 ChromiumSession 重构无关**。
+
+### 二、反向对照（`scripts/verify-zcode-claim-mint-gate.mjs`，零网络零浏览器）
+
+用**生产编译产物**跑 `claimDaily`，只换 preview 的桩：
+
+| preview | mint 调用次数 | outcome | claim 是否发出 |
+|---|---|---|---|
+| **有 plan** | **1** ★ ⇒ 会 spawn 浏览器 | `claimed` | 是 |
+| **无 plan** | **0** ★ ⇒ 一台浏览器都不起 | `already-claimed` / 「今日暂无可领额度…」 | **否** |
+
+⇒ 与用户现象逐字吻合，且**这是正确行为**：没有可领的东西时，
+没有任何理由去起一个 200–400MB 的浏览器、白扣一次设备级 captcha 配额
+（阿里云同设备 150/小时）。
+
+### 三、服务端 side 的一手实测（只发 GET，零额度）
+
+`scripts/probe-zcode-balance-vs-preview.mjs` —— **两个端点语义不同，别混**：
+
+| 端点 | 回答什么 | 本机实测 |
+|---|---|---|
+| `GET /billing/balance` 的 `data.plans[]` | 你**拥有**哪些活动 | 启用账号 **1 条** |
+| `GET /billing/preview` 的 `data.plans[]` | 今天**可领**哪些 | 启用账号 **0 条** |
+
+启用账号（本机唯一 enabled）的 balance 原文：
+
+```
+plan_id=zcode-v3-start-plan-0817  name="ZCode Start Plan"  status=active
+starts_at=2026-10-09 21:40   ends_at=2026-10-13 23:59
+entitlement ent_2_0817_glm_5p3   GLM-5.3        3000000 units  used_units=0
+entitlement ent_2_0817_glm_5p3f  GLM-5.3-Flash  5000000 units  used_units=0
+bucket period_end = 2026-10-12 23:59:59（当日）
+```
+
+⚠ **两个决定性的观察**：
+1. **`used_units` 全为 0** ⇒ 这个账号**一次都没领过**。故文案
+   **刻意不说「今天已领取」**（那会是个谎），只说「今日暂无可领额度（服务端按日刷新）」。
+2. 该账号 `account.createdAt` = **今天 19:02**（`starts_at` 却是 10-09）
+   ⇒ 典型的「**新登录账号、当日份额还没投放 / 活动窗口未对齐**」。
+
+⚠ **「今天已领过」与「活动未投放」在 wire 上无法区分**（都只表现为 `plans=[]`），
+故 `already-claimed` 这个 kind 是**刻意的归并**（两者用户动作相同：明天再来）。
+真正的区分需要上游给「已领」标记，**它没给**。
+
+⚠ **多形态排除**：`app_version`（3.14.3 / 3.14.5）、`platform`（win32 / unknown）、
+带不带 query —— 四种形态对同一账号**都回 `plans=0`** ⇒ 不是请求形态问题。
+
+### 四、排除了哪些「看起来很像」的嫌疑（都实测过）
+
+| 嫌疑 | 结论 | 证据 |
+|---|---|---|
+| `3aa34a3` 的 ChromiumSession 重构改坏了 captcha | ❌ **不成立** | 只动 3 个文件、spawn 参数逐字保留、114 条 captcha 单测全绿 |
+| web 版被内部载体抢走（`supplied > 0`） | ❌ 不成立 | web 版 client 拿不到 `dshDesktop.browser` ⇒ 贡献循环第一行就 return；`supplied` 恒 0 |
+| 退避冷却闸门拦住了 mint | ❌ 不成立 | `remainingMs()=0`（放行） |
+| 找不到浏览器 | ❌ 不成立 | `findBrowserExecutable()` = scoop chromium（存在） |
+| 预取池默认关闭导致行为变化 | ❌ 与「弹不弹」无关 | 池默认 `false` 只影响**已开始 mint 之后**的取参路径 |
+| desktop 实例污染供给槽 | ❌ 本机当时只有 web | 用户确认「只有 dsh web（没开 desktop）」 |
+
+### 五、用户自查方法（下次再遇到「不弹」）
+
+**看结果文字即可定性**，不需要抓包：
+
+| 界面显示 | 含义 | 浏览器会不会起 |
+|---|---|---|
+| 「今日暂无领取额度」 | `preview.plans=[]` ⇒ 上游今天没给可领份额 | **不会**（正确：无物可领） |
+| 「领取成功 +N」/「今日已领取」 | 走通了 mint → claim | 会（或走了内部载体） |
+| 「captcha 产出失败 …」/「找不到可用的浏览器」 | mint 阶段失败 | 尝试过、失败 |
+| 点下去**完全没反应** | 前端重入闸门或 RPC 卡住 | 需另查 |
+
+⚠ 若想**确认** captcha 链路完好，用一个**确实有可领份额**的账号点一次；
+或看下面这条命令（只读、零额度）：
+
+```
+node scripts/probe-zcode-balance-vs-preview.mjs   # balance.plans 有、preview.plans 空 ⇒ 就是本形态
+```
+
+### 六、⚠⚠⚠ 用户反证「以前有额度也会弹」——已复现，且**结论不用改**
+
+用户追问（关键）：**「之前就算弹出今日暂无额度，领取过程中还是弹出 chromium 的」**。
+
+⚠ 我第一版结论只覆盖了**单账号**语义（「preview 空 ⇒ 必不 mint」）。
+用户描述的现象在**多账号**下完全成立 —— 而 `credits.claimAll` 的 zcode 分支
+正是**逐账号循环**（`jet-hub-rpc.ts`），preview 也是**按账号**查的。
+
+`scripts/verify-zcode-multiaccount-claim.mjs`（生产编译产物、零网络）实测：
+
+| 场景 | mint 次数 | 上游调用序 | 各账号 outcome |
+|---|---|---|---|
+| ① 单账号、无额度 | **0** | `preview→0` | `already-claimed` |
+| ② 单账号、有额度 | **1** ★弹 | `preview→1 → claim` | `claimed` |
+| ③ A 有额度 + B 无 | **1** ★弹 | `preview→1 → claim → preview→0` | A `claimed` / B `already-claimed` |
+| ④ A 无 + B 有额度 | **1** ★弹 | `preview→0 → preview→1 → claim` | A `already-claimed` / B `claimed` |
+| ⑤ 全部无额度 | **0** | `preview→0 → preview→0` | 都 `already-claimed` |
+
+⇒ **「弹出 chromium」与「显示今日暂无额度」可以在同一次一键领取里同时出现**
+（场景③④：只要有**任意一个**账号 preview 有 plan）。
+这**精确解释**了用户的历史观感，且**不需要**「preview 空却仍 mint」这种矛盾行为。
+
+⇒ 现在不弹，是因为**本机唯一 enabled 的账号 preview 为空**（场景①或⑤）。
+用户池里其余 4 个账号 `balance.balances=0`（无权益）、且全部 `enabled=false`，
+故当前**没有任何**账号会触发 mint。
+
+⚠ **决定性的一点**：用户问「如果真的还能领积分要 captcha，那不是没生成吗？」
+—— **不会**。判据是**逐账号**的：只要那个账号 preview 有 plan，
+`plans.length !== 0` 就**不会**提前 return，后面 `mintClaimCaptcha` 照常产出 param
+（场景②③④ 实测 mint>0）。**不存在**「该带 captcha 却没生成」的窗口。
+
+### 七、⚠⚠ 排查时踩过的**自我指涉**假证据（别重犯）
+
+我扫会话日志找历史行为时，`找不到可用的浏览器` 这一串在某个会话里命中 **307 次**。
+若当真，会得出「浏览器探测长期失败」的错误结论。
+
+`scripts/inspect-zcode-needle-provenance.mjs` 按**事件类型与角色**拆开：
+
+```
+命中行数: 66
+按事件类型: { "tool/result": 15, "assistant/message": 40, "tool/call": 3, … }
+按角色:     { "tool": 15, "assistant": 40, … }
+```
+
+⇒ **全部来自我自己读 `zcode-captcha.ts` 源码、以及写分析文字**——
+`tool/result` 里是文件内容回显，`assistant/message` 是我的推理与总结。
+**没有一条是真实运行日志**（真实运行日志应是 `assistant/attempt` 或宿主 logger 输出）。
+
+⚠ 这正是本仓库记过的**循环论证**：统计口径命中的是**判据自己的字面量**
+（我写文档时把那句话打进了会话记录），不构成证据。
+⇒ **扫日志找行为证据时，必须先按 `type`/`role` 过滤掉「我自己写的文字」**，
+否则「读代码」与「线上发生过」会被混为一谈。
+
+### 八、★ 决定性验证：激活上报成功、preview 仍空（排除我方缺陷）
+
+`src/zcode-upstream.ts` 的 `reportZcodeActivation` 头注释有一句**很重的断言**：
+
+> ⚠ **这一步不能省**：不补这两条事件，`preview` 恒为空 `plans: []`
+> —— 于是「今天可领」永远是「没有可领」，用户以为签到坏了。
+
+⇒ 它把「preview 为空」的**第一嫌疑人**指向了自己（激活没生效）。
+而该函数**内部吞掉全部异常**（best-effort），故**不能只看「没抛错」就认为成功**。
+
+`scripts/probe-zcode-activation-then-preview.mjs` 按**生产顺序**（先上报、再 preview）
+并**自己发一次**拿到真实 HTTP：
+
+```
+① [app_launch]        HTTP 200  {"code":0,"msg":"","logid":"20261012144129…"}
+   [app_daily_active] HTTP 200  {"code":0,"msg":"","logid":"20261012144130…"}
+①′ 生产封装 reportZcodeActivation() ✅ 返回、未抛
+② 紧接着 fetchZcodeClaimablePlans() → plans.length = 0     ← ★ 仍为空
+```
+
+⇒ **激活上报 200/code:0 成功、紧接着 preview 仍空** ⇒ **排除「激活没生效」**，
+确认是**上游当日对该账号无投放**（我方无法靠改代码解决的一侧）。
+
+⚠ 这一步**必须做**：少了它，「preview 空」究竟是我方没上报、还是上游没投放
+**无法区分** —— 而两者处置完全相反（前者要修 `reportZcodeActivation`，后者只能等/换账号）。
+
+### 九 ⚠ 对「不弹 chromium 是否意味着 captcha 没生成」的正面回答
+
+用户问：**「领取过程如果真的还能领积分要 captcha，那不是没生成吗？」**
+
+**不会漏。** 判据是**逐账号**的，`plans.length === 0` 只跳过**那一个账号**：
+
+```
+for (const account of accounts) {              ← jet-hub-rpc.ts 的逐账号循环
+  accountOutcomes = await zcode.claimDailyFor(credential, mint 回调)
+      └─ claimDailyWith:  preview(该账号) → 空 ⇒ 只有它 return
+                                      → 非空 ⇒ 继续 mint（★ 产 param、弹浏览器）
+}
+```
+
+⇒ 只要**任意一个**账号 preview 有 plan，那一个账号**必然**走到 `mintClaimCaptcha`
+（实测场景②③④的 mint=1）。**不存在**「该带 captcha 却没生成」的窗口 ——
+因为 mint 就发生在**该账号自己**的 plan 循环里，与别的账号空不空无关。
+
+⚠ 反过来说：**preview 空的账号不做 captcha 产出是刻意的正确行为** ——
+没有可领的东西却去起一个 200–400MB 的浏览器、白扣一次设备级
+配额（阿里云同设备 150/小时），那才是缺陷。
+
+### 十、★★ `logid` 进诊断行（2026-10-12，3012 排障的**唯一凭据**）
+
+**动因**：笔记本章第三节早已写着「响应体还带 **`logid`** —— 向用户索取现场时
+**优先要它**（上游侧排障凭据）」，但**它从未被解析过**
+（全仓 `grep -i logid` 在 `src/` 里**零命中**）⇒ 用户报障时我们只能给出
+「账号#1 · 身份块 2898 字符 · HTTP 405」，**没有一样是上游能据以查日志的**。
+
+⚠ 这是典型的「**文档记了、代码没做**」缺口 —— 排查价值最高的一项恰好从未落地。
+
+#### 10.1 一手实测：`logid` 在**两个地方**，且值相同
+
+`scripts/probe-zcode-logid-shape.mjs`（只发 GET、零额度）四个端点
+（`client/configs` / `billing/preview` / `billing/balance` / `event/report`）
+**全部同时带这两个**：
+
+```
+[header] x-request-id = 20261012145652694e8f48d3614ae49634
+[body]   logid        = 20261012145652694e8f48d3614ae49634   ← ★ 逐字相同
+```
+
+#### 10.2 判据：**双来源**（体优先、头兜底）—— 两者覆盖不同故障，都不能省
+
+| 来源 | 覆盖 | 为什么另一条盖不住 |
+|---|---|---|
+| 响应体顶层 `logid` | **业务层错误**（`{"code":3012,…}`） | 主路；值是上游业务日志 id |
+| HTTP 头 `x-request-id` | **边缘/网关 HTML 页**（502 / 504 / 阿里云 ESA） | 那种响应**体里没有 `logid`**，而它是另一类高频故障 |
+
+⚠ **体优先于头**：实测二者相同，故这条只在将来分叉时才有可观测差异 ——
+写成显式优先级是为了「分叉时行为确定」，不是依赖「它们恰好相等」。
+
+⚠ **取不到一律 `undefined`**，绝不编造、也不渲染空壳：
+- 空白（`""` / `"   "`）等同没有（上游确实下发过空 `logid`）；
+- **非字符串**（数字 / 对象）也 `undefined` —— 若 `String()` 化会渲染出
+  `logid [object Object]`，**比没有更糟**（会让人以为拿到了凭据）。
+
+#### 10.3 落点（三处，含两处**在信息最全的地方**提取）
+
+| 文件 | 做什么 |
+|---|---|
+| `zcode-diagnostics.ts` | 新增纯函数 `extractZcodeLogId(body, headers)`；`ZcodeDiagnosticInput.logId`（**可选**）；诊断行末位追加 `logid <值>`（缺则整项省略） |
+| `zcode-adapter.ts`（推理） | `logId: extractZcodeLogId(text, response.headers)` —— 手里就有 `response` |
+| `zcode-upstream.ts`（领取） | `claimZcodePlan` 在**持有 `response` 与完整 `text`** 的那层提取，落进 `ZcodeClaimOutcome.logId`；`zcode-auth.ts` 只负责渲染 |
+
+⚠ 领取侧**必须**在 `claimZcodePlan` 里提取（不能在下游 `toClaimOutcome`）：
+下游只拿得到 `message` 字符串 —— **既没有 header、正文也可能已被
+`text.slice(0, 200)` 截断**。与本章既有那条纪律同源：
+「**在信息最全的地方归一，不要在已经丢过信息的下游猜**」。
+
+⚠ `logid` 排在诊断行**最后**：它最长（32 位十六进制），
+放前面会把「账号 / 计数 / 身份块」这些一眼要看的信息挤出屏幕。
+
+#### 10.4 回归与**反向验证**
+
+- `tests/unit/zcode-diagnostics.spec.ts` 新增一段（体/头/优先级/大小写不敏感/
+  空白与非字符串防御/**接线守卫**两条）。
+  ⚠ 条数以 `pnpm test` 输出为准，别在文档里写死。
+- **8 个变异全部被抓住**（`scripts/mutate-zcode-logid.mjs`，三重守卫：
+  旧片段出现次数必须恰好 1、写入后**回读校验**、还原后 **sha256 一致**）：
+
+  | 变异 | 结果 |
+  |---|---|
+  | L1 体不再优先（改成头优先） | 🔴 2 条红 |
+  | L2 去掉 header 兜底（边缘页就没凭据了） | 🔴 2 条红 |
+  | L3 空白/非字符串不再防御 | 🔴 3 条红 |
+  | L4 诊断行不再渲染 logid | 🔴 1 条红 |
+  | L5 推理路径没接上 | 🔴 1 条红 |
+  | L6 领取路径没接上 | 🔴 1 条红 |
+  | L7 领取侧不在持有 response 的那层提取 | 🔴 1 条红 |
+  | L8 大小写不敏感失效（写死小写键） | 🔴 1 条红 |
+
+⚠ L3 第一版**没有唯一片段**（同一段「非空字符串」逻辑在
+`extractZcodeLogId` 与 `readHeaderCaseInsensitive` 里各内联一份），
+脚本的「出现次数必须恰好 1」守卫把它拦下 ⇒ 顺手抽成共享助手
+`nonEmptyString()`。**这既是给变异让路，也消掉了一处真实重复。**
+
+- 端到端取证（`scripts/verify-zcode-logid-e2e.mjs`，零网络、import `lib/`）：
+  6 格形态全符合，含「阿里云 ESA 页靠头取到」「nginx 502 页无头时如实
+  `undefined`」「真实 `Headers` 对象（有 `get`）」；并复验**红线**
+  （诊断行仍不含 accountId / JWT 的任何子串）。
+
+#### 10.5 这解决 3012 了吗 —— **没有**
+
+⚠ 必须说清：`logid` 是**排障凭据**，不是修复。它把「用户报障时我们什么都问不出来」
+变成「用户能把上游能查的那一串交回来」。3012 的根因**依然未知**
+（「身份块达标仍 3012」仍无解释，见本章前半的 §二）。
+
+### 十一、B1 归因统计：**本机零现场**，且自检证明过滤器没过严（2026-10-12）
+
+原计划用本机历史做「账号级 vs 出口 IP 级」的归因。结论：**做不了，因为没有现场**。
+
+#### 11.1 两个脚本的分工（**第二个是必需的**）
+
+| 脚本 | 做什么 |
+|---|---|
+| `analyze-zcode-3012-attribution.mjs` | 按「真实运行事件」白名单聚合 3012 现场，输出账号/时间窗归因 |
+| `verify-zcode-3012-filter.mjs` | **自检**：把过滤前后的命中全量列出来，证明「0 现场」不是**过滤过严**造成的 |
+
+⚠ **少了第二个脚本，「0 个现场」这个结论是不可信的** ——
+它既可以意味着「真的没发生」，也可以意味着「我的过滤器把真实现场滤掉了」。
+两者结论完全相反（前者 ⇒ 无从归因；后者 ⇒ 我写错了判据）。
+
+#### 11.2 自检结果：994 条命中**全部**是我自己写的文字
+
+含 `unusual activity` 的文件 **71 个**、命中行 **994 条**，按事件类型全量拆开：
+
+| `type` | 条数 | 性质 |
+|---|---|---|
+| `tool/result` | **444** | 我**读文件**的内容回显（`zcode-*.ts` 的源码本体） |
+| `assistant/message` | **343** | 我**写的推理与总结** |
+| `tool/call` | **191** | 我 `write` / `edit` 的**参数**（设计文档、注释） |
+| `agent/inbox/spliced` | 8 | 子代理消息 |
+| `user/message` | 8 | 用户消息里引用的文字 |
+
+⇒ **`assistant/attempt` 与宿主 logger 输出：0 条**。
+即**本机从未真实发生过 3012**；那 994 条**全部是文本层面的自指涉**
+（我写文档、读源码时把 `3012` / `unusual activity` 打进了会话记录）。
+
+⚠ 这是本章 §七 那条教训的**第二次实例**，且这次是**定量**的：
+**71 个文件 / 994 行**听起来像「大量真实现场」，实际**一条都不是**。
+⇒ 凡「从会话日志统计线上行为」，**必须先用 `type` 白名单把运行事件与
+对话文本分开**，否则数字会大到误导（会把「我读过这段代码」当成「线上发生过」）。
+
+#### 11.3 这个结论本身的价值
+
+1. **排除了「本机早就有 3012、只是没注意」这条可能** —— 用户说「本机没有有问题的
+   会话」是**实测成立**的，不是印象；
+2. **归因统计只能等真实现场**。有了 §十 的 `logid`，下次在**有问题的机器**上
+   撞到 3012 时拿到的就是**上游能查日志的凭据** —— 归因从「猜」变成「可查」；
+3. 脚本**已就位**（在 `scripts/`，被 gitignore），下次直接跑即可。
+
+
+
+
+
+
+
 
 

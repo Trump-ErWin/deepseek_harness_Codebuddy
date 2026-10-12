@@ -265,6 +265,20 @@ export class ClineAdapter extends LlmAdapter {
    *
    * 判据用「已完整」而非「已定义」：残缺时放行到闸门，由冷却控制重试节奏
    * （30 秒一轮，不会打风暴）。
+   *
+   * ⚠️⚠️ **「完整」必须包含 models.dev**（issue IKKZUG，2026-10-12）。
+   *
+   * 修复前它只反映**两个 Cline 端点**（`remote.complete`），**不含 models.dev**
+   * ⇒ models.dev 超时后 `remoteComplete` 仍是 `true` ⇒ 上面这个短路把闸门
+   * 彻底旁路 ⇒ 闸门的冷却永远读不到 ⇒ models.dev 在整个进程生命周期内
+   * 只被调 1 次。而 `cline-pass/*` 的模型条目与图片能力**只由 models.dev 提供**
+   * ⇒ 它们会「明确不支持图片」到进程结束，**只能重启才能恢复**。
+   *
+   * 用户实测：桌面端 10-11 23:02 启动 → 10-12 00:30 仍稳定拒图。
+   *
+   * ⇒ 现在的口径是「**两个端点 + models.dev 都就绪**」。⚠️ 方向是「宁可多试
+   * 一次」：多试的代价只是多发一次 models.dev 请求（自带 TTL 与闸门冷却），
+   * 而漏判的代价是整个 provider 的图片能力永久失效。
    */
   private remoteComplete = false
   /**
@@ -349,8 +363,16 @@ export class ClineAdapter extends LlmAdapter {
         product: this.product,
         loadCatalog: () => this.loadCatalogEntries(),
         syncCatalog: () => this.syncCatalogEntries(),
-        // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`）。
-        unknownModelInputModalities: () => ['text'] as const,
+        // ⚠️ **未知 id 省略 `inputModalities`**（issue IKKZUG），与 buddy 同口径。
+        // ⚠️ `unknownModelInputModalities` **刻意不提供**（返回 undefined）：
+        // 骨架的契约是「不提供 ⇒ 省略该字段」（见 `ModelCatalogConfig` 的说明），
+        // 而本家的 `supportsImage` 就是「远端没读到 ⇒ 未知」的高发场景
+        // ——`cline-pass/*` 只由 models.dev 提供，报 `['text']` 会让宿主
+        // 把图片静默投影成占位文本。
+        // ⚠️ 与其余 12 家的 `['text']` **刻意不同**：它们的能力来源要么是
+        // 编译期表（恒可用，不存在未知态）、要么已实测过保守方向；cline 有
+        // 真实的「外部站点失败」场景。**不要**为了「统一」改回去。
+        // ⚠️ 思考档位仍**统一给 5 档**（下方），那是另一条独立决策。
         // ⚠️ **未知模型也声明思考档位**（真实回归防线）：本家档位来自**产品配置**
         // （远端不下发），与具体模型无关 ⇒ 原实现对未知 id 同样给 5 档。
         // 由 cline-adapter.spec.ts 的「未知模型同样有 5 档」用例守着。
@@ -378,27 +400,52 @@ export class ClineAdapter extends LlmAdapter {
   }
 
   /**
-   * 模型接受的输入模态。
+   * 模型接受的输入模态；`undefined` = **能力未知**。
    *
-   * 两级判据（**顺序不能颠倒**）：
+   * ## 两级判据（**顺序不能颠倒**）
+   *
    * 判据是**目录条目上的 `supportsImage`**，而它有两个来源（优先级即顺序）：
    * 1. **本地兜底表/内嵌目录**（`product.fallbackModels` 的策展条目）——
    *    从官方客户端内嵌目录提取的，比社区目录权威；显式 `false` 也照样赢。
    * 2. **models.dev**（`src/cline-models-dev.ts` 补进目录）—— 补前者覆盖不到的
    *    模型（`cline-pass/*` 等）。
    *
-   * ⚠️ **这是「支持图片的模型发不了图」的修复点**：修复前只看第 1 级，而它
-   * 全表只有寥寥几条 `cline-free/*` 条目 ⇒ `cline-pass/*` 等**全部**被播报成
-   * 纯文本 ⇒ DSH 根本不把图片送进来。详见 `src/cline-models-dev.ts`。
+   * ## ⚠️⚠️ 三态：为什么 `undefined` 是**必需**的第三态（issue IKKZUG）
    *
-   * ⚠️ 没有结论时保守报 `text`（宁可少报能力，也不要报一个服务端不认的模态）
-   * —— 注意这与「明确读到不支持」是两回事，但外部行为一致。
+   * 修复前恒返回两态，而这两态把**语义相反**的两种状态压成了同一个结果：
+   * - 目录条目**明确** `supportsImage: false`（**确认不支持**）；
+   * - 目录里**压根没有该 id**（**不知道**）。
+   *
+   * 而 cline 的「不知道」是**真实高频**的：`cline-pass/*` 的条目**只由
+   * models.dev 提供**（网关 `recommended-models` 实测只下发 14 条，models.dev
+   * 有 18 条），而 models.dev 是一个 5.39 MB 的外部站点、超时 20~60 秒
+   * （用户实测直连三次：超时/超时/1.9 秒成功）。
+   *
+   * 报 `['text']` 的代价有二，第二个更隐蔽：
+   * 1. 门禁文案说「模型不支持图片输入」，而真实原因是「目录还没拉到」——
+   *    用户会去换模型、查文档，而解法只是**等目录就绪**；
+   * 2. `['text']` 报给宿主后，DSH 见到「不含 image」的声明会按
+   *    「**确认是纯文本模型**」把图片**静默投影成占位文本**
+   *    （dsh-llm 的 `projectImagesForTextModel`）⇒ 图片既没进请求体、
+   *    用户也拿不到任何原因。
+   *
+   * ✅ 宿主契约明写 `absent means unknown`（dsh-llm `types.d.ts` 的
+   * `inputModalities`），故「不知道」必须表达为**省略该字段**。
+   *
+   * ⚠️ 与 `buddy-adapter.ts` 同构，但**判据的来源不同**：buddy 查四个来源
+   * （远端 / 产品兜底表 / `IMAGE_MODELS` / 覆盖白名单），cline 只需查**目录
+   * 条目这一个字段** —— 因为合并阶段已把两个来源都归一进条目了。
+   *
+   * ⚠️ **方向仍是保守**：未知**不放行**图片（见 `stream()` 的门禁），
+   * 只是不再谎报「不支持」。
    */
-  private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
+  private inputModalitiesFor(model: string): readonly ('text' | 'image')[] | undefined {
     const source = this.remoteModels ?? this.fallbackCatalog()
-    return this.catalogIndexFor(source).get(model)?.supportsImage === true
-      ? ['text', 'image']
-      : ['text']
+    const entry = this.catalogIndexFor(source).get(model)
+    // ⚠️ 必须判 `=== undefined`（**字段缺席**）而不是 `!== true`：
+    // 后者把「明确 false」与「没这条记录」压成同一结果，正是本条要修的形态。
+    if (entry?.supportsImage === undefined) return undefined
+    return entry.supportsImage ? ['text', 'image'] : ['text']
   }
 
   /**
@@ -472,6 +519,12 @@ export class ClineAdapter extends LlmAdapter {
         // ⚠️ 用 `=== true` 而非直接取值：万一有调用方（旧注入式替身）省了该字段，
         // 保守按**不完整**处理 —— 方向是「宁可多试一次」。
         // 反过来（把缺失当完整）会让残缺目录永久固化，那正是本 issue 的缺陷②。
+        //
+        // ⚠️⚠️ **完整必须同时包含 models.dev**（issue IKKZUG，2026-10-12）：
+        // 它也是目录来源，而 `cline-pass/*` 的模型条目与图片能力**只有它提供**。
+        // 漏掉它 ⇒ models.dev 超时后目录被判成「已完整」⇒ 下面的 `remoteComplete`
+        // 短路永久生效 ⇒ 整个进程生命周期内不再重试 ⇒ 只能重启才能恢复。
+        // 详见 `remoteComplete` 字段的注释与该 issue 的实测（23:02→次日 00:30）。
         const complete = remote === undefined ? got : remote.complete === true
         // ⚠️ **warnings 循环必须在 `if (!got)` 之前**（真实回退，审计发现）：
         // 基线里它排在 `if (!gotRemote) return false` **之前**，而基线那两个端点
@@ -494,8 +547,12 @@ export class ClineAdapter extends LlmAdapter {
         // ⚠️ 残缺目录也落缓存（否则每次 `listModels` 都重拉两个端点），
         // 但 `remoteComplete` 保持 false ⇒ 下次仍进闸门，由冷却控制重试。
         this.remoteModels = merged
-        this.remoteComplete = complete
-        return { got: true, complete }
+        // ⚠️⚠️ 并上「models.dev 已读到」（issue IKKZUG）。
+        // 判据是 `modelsDev !== undefined`（**读到过**，含读到空表），
+        // 与「merged 里有没有补进条目」无关 —— 上游确实没有 cline-pass 块时
+        // 读到的是空表，那同样属于「已就绪」，不该无限重试。
+        this.remoteComplete = complete && this.modelsDev !== undefined
+        return { got: true, complete: this.remoteComplete }
       } catch (error) {
         // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态兜底表。
         // eslint-disable-next-line no-console
@@ -604,7 +661,12 @@ export class ClineAdapter extends LlmAdapter {
       bareName: model.name,
       ...model.description === undefined ? {} : { description: model.description },
       // ⚠️ 直接读字段，**不要**回头查索引（见方法注释：那是 O(N²) + 离线误报）。
-      inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
+      // ⚠️⚠️ 三态（issue IKKZUG）：`supportsImage` **缺席** = 未知 ⇒ 必须
+      // **省略** `inputModalities` 字段（宿主契约 `absent means unknown`），
+      // 报 `['text']` 会让 DSH 把图片静默投影成占位文本。
+      ...(model.supportsImage === undefined
+        ? {}
+        : { inputModalities: model.supportsImage ? ['text', 'image'] as const : ['text'] as const }),
       ...model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {},
       ...maxTokens !== undefined ? { maxTokens } : {},
       isFree: model.isFree,
@@ -709,7 +771,22 @@ export class ClineAdapter extends LlmAdapter {
       // `resolveModel`，缺了这一步会把支持图片的模型误判成纯文本
       // —— 那正是「支持图片的模型发不了图」的形态。
       await this.ensureRemoteModels()
-      if (!this.inputModalitiesFor(options.model).includes('image')) {
+      // ⚠️⚠️ **三态门禁**（issue IKKZUG）：未知**仍然拒绝**，但**不得**说成
+      // 「不支持」—— 那会把「目录还没拉到」误导成「这个模型看不了图」，
+      // 用户会去换模型、查文档，而解法只是等目录就绪。
+      //
+      // ⚠️ 错误码用 `INVALID_REQUEST`（**不在** harness 的可重试集合里）：
+      // 这类「等一会儿就好」的错误**不该由 harness 自动重试** ——
+      // 自动重试会让用户在 15 秒里看到 6 次闪动（500/1000/2000/4000/8000 ms）。
+      // ⚠️ **不要**用 `TRANSPORT`：实测它在 `DEFAULT_RETRYABLE_CODES` 里。
+      const modalities = this.inputModalitiesFor(options.model)
+      if (modalities === undefined) {
+        throw new LlmError(
+          `cline: 模型 "${options.model}" 的能力列表尚未加载完成，暂时无法判断是否支持图片；请稍后重试。`,
+          'INVALID_REQUEST',
+        )
+      }
+      if (!modalities.includes('image')) {
         throw new LlmError(
           `cline: 模型 "${options.model}" 不支持图片输入`,
           'UNSUPPORTED_CONTENT',

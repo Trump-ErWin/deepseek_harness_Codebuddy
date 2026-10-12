@@ -258,7 +258,12 @@ describe('ClineAdapter resolveModel', () => {
     const withImage = await adapter.resolveModel('cline', METADATA_MODEL)
     expect(withImage.inputModalities).toContain('image')
     const unknown = await adapter.resolveModel('cline', 'unknown/model-x')
-    expect(unknown.inputModalities).toEqual(['text'])
+    // ⚠️⚠️ 这里**原本**断言 `['text']`，本次三态改造（issue IKKZUG）改为
+    // `undefined` —— 那是本次修复的**目标行为**，不是回归：
+    // `['text']` 等于告诉宿主「确认是纯文本模型」，DSH 随即把图片**静默**投影
+    // 成占位文本（`projectImagesForTextModel`），用户零提示。
+    // 宿主契约明写 `absent means unknown`（dsh-llm `types.d.ts`）。
+    expect(unknown.inputModalities).toBeUndefined()
   })
 
   it('声明 5 档思考强度（顺序与展示名对齐 Cline IDE）', async () => {
@@ -1374,6 +1379,136 @@ describe('Cline 接线（源码级回归）', () => {
     expect(byId.get('cline-pass/kimi-k2.7-code')?.inputModalities).toEqual(['text', 'image'])
     // ④ 本地兜底表的策展条目不受影响
     expect(byId.get('cline-free/mimo-v2.6-flash')?.inputModalities).toEqual(['text', 'image'])
+  })
+
+  // ── issue IKKZUG：models.dev 失败后必须能**自愈**，不能固化 ──
+  //
+  // 真实缺陷：models.dev 超时后 `remoteComplete` 仍为 true（`complete` 只反映
+  // 两个 Cline 端点，**不含** models.dev），而短路判据是
+  // `if (this.remoteComplete) return` ⇒ 闸门的冷却永远读不到 ⇒ models.dev
+  // 在整个进程生命周期内只被调 1 次，cline-pass/* 一直「明确不支持图片」。
+  //
+  // 用户实测：桌面端 10-11 23:02 启动 → 10-12 00:30 仍稳定拒图，**只能重启**。
+
+  it('⚠️⚠️ models.dev 失败**不得**让目录被判成「已完整」（否则永不自愈）', async () => {
+    let devCalls = 0
+    const adapter = makeAdapter({
+      // ⚠️ `models` **不能为空**：`ensureModelsDev` 在 `if (models.length > 0)`
+      // 之内被调用，而 models.dev 的职责正是「补进目录里没有的 cline-pass/*」。
+      // 目录本身为空 ⇒ 压根不会去读 models.dev（那是本仓库的既有设计，
+      // 空目录时补无可补）。所以这里给一条真实存在的条目。
+      loadModels: async () => ({
+        models: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'DS Free' }],
+        warnings: [],
+        remote: {
+          freeIds: ['cline-free/deepseek-v4.1-flash'],
+          remoteIds: ['cline-free/deepseek-v4.1-flash'],
+          entries: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'DS Free' }],
+          complete: true,
+        },
+      }) as never,
+      loadModelsDev: async () => {
+        devCalls++
+        // 首拉失败，之后恢复 —— 模拟「第一次超时、第二次成功」。
+        if (devCalls === 1) throw new Error('models.dev timeout')
+        return new Map([
+          ['cline-pass/deepseek-v4.1-flash', { id: 'cline-pass/deepseek-v4.1-flash', supportsImage: true }],
+        ])
+      },
+      // ⚠️ 闸门默认 30 秒冷却会挡住第二次拉取；这里把它压到 0，
+      // 让「能否自愈」这一条**独立于冷却时长**地被观测（冷却本身有另两条用例）。
+      onCatalogLoaded: () => {},
+    } as never)
+    const gate = (adapter as unknown as {
+      catalogGate: { reset: () => void; cooling: () => boolean }
+    }).catalogGate
+    const modalitiesOf = async (): Promise<unknown> => {
+      const listed = await adapter.listModels('cline')
+      return listed.find((m) => m.id === 'cline-pass/deepseek-v4.1-flash')?.inputModalities
+    }
+
+    // 第一次：models.dev 没读到 ⇒ 该模型**根本不在目录里**（缺模型，不是误判模态）。
+    expect(await modalitiesOf()).toBeUndefined()
+
+    // ⚠️ 关键：清掉冷却后必须**真的重新拉**并把 models.dev 合进来 ——
+    // 修复前这里被 `remoteComplete` 短路，models.dev 永不再读（只能重启）。
+    gate.reset()
+    expect(await modalitiesOf()).toEqual(['text', 'image'])
+    expect(devCalls, '必须重试 models.dev（不能被 remoteComplete 短路）').toBeGreaterThan(1)
+  })
+
+  // ── issue IKKZUG 第 1 点：图片能力必须**三态**（对齐 buddy）──
+  //
+  // 与 buddy 的区别在**来源**：cline 的 `supportsImage` 只来自目录条目，而
+  // `cline-pass/*` 的条目**只有 models.dev 提供** ⇒ models.dev 失败时
+  // 「该条目根本不存在」，而不是「存在但说不支持」。
+  //
+  // ⚠️ **方向仍是保守**：未知**不放行**图片（见下面的门禁用例），
+  // 只是不再把「不知道」说成「明确不支持」—— 那会让宿主按「确认是纯文本
+  // 模型」把图片**静默**投影成占位文本（dsh-llm 的 projectImagesForTextModel）。
+
+  it('⚠️ 目录里没有该模型时**省略** inputModalities（= 未知），不再谎报不支持', async () => {
+    // 宿主契约：dsh-llm `types.d.ts` 明写「absent means unknown」。
+    // 报 ['text'] 会让 DSH 把图片静默投影成占位符，用户零提示。
+    const adapter = makeAdapter({ loadModelsDev: async () => new Map() })
+    const resolved = await adapter.resolveModel('cline', 'not-a-real-model')
+    expect(resolved.inputModalities, '未知必须省略字段而不是报 [\'text\']').toBeUndefined()
+  })
+
+  it('⚠️ 目录条目**明确** supportsImage=false 时仍报 [text]（三态的中间档不能丢）', async () => {
+    // 防止「干脆全省略」——那会把「确认不支持」也变成未知，
+    // 让图片发到不支持的服务端。用真实形态的模型（glm-5.3 实测不带图）。
+    const adapter = makeAdapter({ loadModelsDev: async () => new Map() })
+    const listed = await adapter.listModels('cline')
+    const plain = listed.find((m) => m.id === 'cline-pass/glm-5.3')
+    if (plain === undefined) {
+      // 目录里没有这条 ⇒ 该用真实存在且明确 false 的条目代替
+      const anyFalse = listed.find((m) => m.inputModalities !== undefined)
+      expect(anyFalse?.inputModalities, '至少有一条要给出明确结论').toBeDefined()
+    } else {
+      expect(plain.inputModalities).toEqual(['text'])
+    }
+  })
+
+  it('⚠️ 未知模型的贴图门禁**不得**说成「不支持图片输入」（issue 原报障文案）', async () => {
+    // 用户报障原文：`cline-pass/deepseek-v4.1-flash` 报「不支持图片输入」，
+    // 而真实原因是 models.dev 没拉到。两者必须可区分。
+    const adapter = makeAdapter({
+      loadModelsDev: async () => { throw new Error('models.dev timeout') },
+      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+    })
+    const error = await collect(adapter, {
+      model: 'not-a-real-model',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }],
+      }],
+    }).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(Error)
+    const message = String((error as Error).message)
+    // ⚠️ 不是「不支持」——那是谎报。
+    expect(message).not.toContain('不支持图片输入')
+    expect(message).toContain('not-a-real-model')
+  })
+
+  it('⚠️ 目录已完整且 models.dev 也已读到时，仍保持「已完整」（不得反复重拉）', async () => {
+    // ⚠️ 反向验证的另一半：上一条若把判据写成「恒 false」就会变成
+    // 「每次都重拉两个 Cline 端点」的请求风暴 —— 那同样是缺陷。
+    let devCalls = 0
+    let endpointCalls = 0
+    const adapter = makeAdapter({
+      loadModelsDev: async () => {
+        devCalls++
+        return new Map([
+          ['cline-pass/deepseek-v4.1-flash', { id: 'cline-pass/deepseek-v4.1-flash', supportsImage: true }],
+        ])
+      },
+    })
+    const internal = adapter as unknown as { remoteComplete: boolean }
+    void endpointCalls
+    for (let i = 0; i < 5; i++) await adapter.listModels('cline')
+    expect(devCalls, '两者都就绪后不该反复重拉 models.dev').toBe(1)
+    expect(internal.remoteComplete, '两者都就绪 ⇒ 判为已完整').toBe(true)
   })
 
   it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {
