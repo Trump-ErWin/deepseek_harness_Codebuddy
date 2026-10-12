@@ -1701,6 +1701,92 @@ describe('model.list / model.setDisabled 端点', () => {
       expect(emitted).toEqual([])
     })
 
+    /**
+     * ⚠️⚠️ **幂等：已全部关闭时再点「关闭全部」必须成功**（本组新增的核心用例）。
+     *
+     * 真实缺陷（2026-08 审计实测）：`complete` 的定义是「远端读到且**非空**」，
+     * 而「**全部模型都已关闭**」时 `listModels()` 会被黑名单过滤成 `[]`
+     *（`createModelCatalog.listModels` 的 `listed = all.filter(entry => !disabled.has(entry.id))`）
+     * ⇒ `complete === false`。于是用户在**已经全关**的状态下再点一次「关闭全部」
+     *（或在模型列表里确认一下），会得到
+     * 「该供应商没有可关闭的模型，未做任何变更」—— 而它明明有 3 个、只是都已关。
+     *
+     * ⚠️ 该形态与「无账号门控」在 `fullCatalogIds` 里**完全同形**
+     *（都是 `remoteIds === []` 且无 `remoteError`），**无法**靠目录侧区分，
+     * 故判据只能建在「黑名单已覆盖并集」这个**结果**上。
+     *
+     * ⚠️ 前端联动路径会命中它：停用最后一个账号时问「是否同时关闭它的全部模型」，
+     * 若模型此前已全关，用户会看到误导告警
+     * 「账号已停用，但关闭模型失败：该供应商没有可关闭的模型」。
+     */
+    it('⚠️ 已全部关闭时再点「关闭全部」→ 幂等成功（不得报「没有可关闭的模型」）', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: { buddy: { listAllModels: () => MODELS } },
+        // 三条**全部**已关 ⇒ `listModels()` 会被过滤成 `[]` ⇒ `complete === false`
+        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok, '已全关时必须是幂等成功，不能误报「没有可关闭的模型」').toBe(true)
+      // 黑名单保持不变（幂等：不产生新变更）
+      expect(storedValue().disabledModels).toEqual({
+        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+      })
+      // ⚠️ 仍须广播：客户端那份 `status === 'ready'` 的目录缓存要靠它失效，
+      //    调用方（前端）也据此刷新开关状态。
+      expect(emitted).toContain('llm/adapters-updated')
+    })
+
+    /**
+     * ⚠️⚠️ **幂等短路不得掩盖真正的「目录不完整」**（上一条的反向守卫）。
+     *
+     * 幂等分支的条件必须是「并集里的 id **全部**已在黑名单」，而不是「目录为空」——
+     * 否则「远端读到但为空 + 黑名单只覆盖了一部分」这种**真该拒绝**的形态
+     * （拿兜底子集当权威 = IKJW33 那个缺陷）会被静默放行。
+     *
+     * 变异验证：把幂等分支的条件从 `pending.length === 0` 改成
+     * `catalog.ids.length === 0 || !catalog.complete`，本条**变红**。
+     */
+    it('⚠️ 远端读到但为空 + 只有部分已关 ⇒ 仍拒绝（幂等短路不得掩盖真缺口）', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({
+        // 远端成功但为空（无账号门控 / 全部已关，两种成因在此同形）
+        models: [],
+        // 兜底表 2 条，但黑名单只覆盖了其中 1 条 ⇒ pending 非空 ⇒ 必须拒绝
+        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }, { id: 'glm-5.2', name: 'GLM-5.2' }] } },
+        disabledModels: { buddy: { hy3: true } },
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok, '有新增项但目录不完整 ⇒ 必须拒绝').toBe(false)
+      // 兜底子集不得被写成「完整黑名单」：glm-5.2 仍是打开的
+      expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true } })
+      expect(emitted).toEqual([])
+    })
+
+    /**
+     * ⚠️ **只关新增的那几条**（幂等分支的写入侧）。
+     *
+     * 已关的 id 不该被重复写入 —— 黑名单是「键存在即关闭」的映射，
+     * 重复写 `true` 无意义，但会让 `models` 计数虚高（见下一条）。
+     */
+    it('⚠️ 已全关时再关：不重复写盘（无变更即不产生新写入）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: { buddy: { listAllModels: () => MODELS } },
+        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+      })
+
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      // 逐字节不变（顺带锁住「幂等分支不落盘」）
+      expect(storedValue().disabledModels).toEqual({
+        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+      })
+    })
+
     it('disabled:false 清空该 provider 的全部关闭项（含目录里没有的历史遗留键）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
@@ -3523,6 +3609,65 @@ describe('provider.status / provider.setEnabled 端点', () => {
       })
       const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
       expect(result.value).toMatchObject({ models: 3, accounts: 0 })
+    })
+
+    /**
+     * ⚠️⚠️ **`models` 必须报「本次真正改变的」条数，不是「本次写入的」条数**
+     *（真实缺陷，2026-08 审计实测）。
+     *
+     * `setModelsDisabled` 是**合并**语义，传入的并集里可能有相当一部分**早就关着**
+     *（历史遗留的完整黑名单 / 用户此前逐条关过）。按「写入条数」报会**少报**
+     * 用户看到的实际结果：实测远端 3 条 / 适配器兜底表 1 条 / 黑名单已有另 2 条
+     * ⇒ 并集 3 条、其中 2 条已是 `true`，写完后 3 条全关，而返回 `models: 1`，
+     * 前端 `summarizeProviderToggle` 便播报「已关闭 1 个模型」。
+     *
+     * 变异验证：把 `modelCount = pending.length` 改回 `catalog.ids.length`，
+     * 本条**变红**（报 3 而非 1）。
+     */
+    it('⚠️ models 报实际变更数，不是写入条数（已关的不重复计入）', async () => {
+      const { call, storedDisabled } = setup({
+        catalog: [
+          { id: 'glm-5.2', name: 'GLM-5.2' },
+          { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+          { id: 'hy3', name: 'Hy3' },
+        ],
+        // ⚠️ 适配器目录必须给**全部 3 条**：并集里那 2 条「早就关着」的 id 只能
+        // 来自它（`listModels` 会把黑名单命中的过滤掉）—— 这正是「写入条数」与
+        // 「变更条数」产生差异的唯一来源。若这里只给 1 条，并集就等于 `pending`，
+        // 本用例**无法区分**两种计数（实测：变异成写入条数后仍全绿 = 假守卫）。
+        listAllSubset: [
+          { id: 'glm-5.2', name: 'GLM-5.2' },
+          { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+          { id: 'hy3', name: 'Hy3' },
+        ],
+        // 另外 2 条**早就关着**（历史遗留的完整黑名单）
+        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true } },
+      })
+
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+
+      expect(result.ok).toBe(true)
+      // 并集 3 条里只有 hy3 是本次新关的 ⇒ 只应报 1
+      expect(
+        (result.value as { models: number }).models,
+        '报的是写入条数（3）而非实际变更数（1）⇒ 前端播报会少报',
+      ).toBe(1)
+      // 但黑名单最终确实覆盖全部 3 条（合并语义不受影响）
+      expect(Object.keys(storedDisabled().buddy ?? {}).sort())
+        .toEqual(['deepseek-v4-flash', 'glm-5.2', 'hy3'])
+    })
+
+    /** 反向：一条都没关过时，`models` 仍等于并集大小（不得被新判据改小）。 */
+    it('全部未关时 models 等于并集大小（计数判据不误伤常规路径）', async () => {
+      const { call } = setup({
+        catalog: [
+          { id: 'glm-5.2', name: 'GLM-5.2' },
+          { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+          { id: 'hy3', name: 'Hy3' },
+        ],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.value).toMatchObject({ models: 3 })
     })
 
     it('无账号时关闭仍可执行（关模型、停 0 个账号）', async () => {
