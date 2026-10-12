@@ -520,6 +520,57 @@ cline-pass 部分模型为什么不全**，例如当前这个模型就看不到�
   `cline: 模型 "cline-pass/deepseek-v4.1-flash" 不支持图片输入`）
   与 `models.dev 补全 cline-pass 目录`。
 
+#### ⚠️⚠️ models.dev 失败会**永久固化**：`complete` 判据漏了它（Issue IKKZUG）
+
+**真实报障**（用户 oct_heaven，2026-10-12）：`cline-pass/*` 整段时间贴不了图、
+读不了图，**只有重启才能恢复**（实测桌面端 10-11 23:02 启动 → 10-12 00:30
+仍稳定拒图）。
+
+**根因三处叠加**，第 3 条最隐蔽：
+
+1. **能力来源单一**：`cline-pass/*` 的条目与图片能力**只由 models.dev 提供**
+   （网关 `recommended-models` 实测只下发 14 条，models.dev 有 18 条）；
+2. **models.dev 经常拉不到**：目标 `api.json` **解压后 5.39 MB**、Brotli、
+   无 `Content-Length`；用户直连实测三次 = `20010ms 超时` / `20010ms 超时` /
+   `1908ms 成功` ⇒ **不是「慢」，而是「要么很快、要么整段挂住」**；
+3. ⚠️⚠️ **`remoteComplete` 判据漏了 models.dev**：`complete` 只反映**两个
+   Cline 端点**（`remote.complete`），而短路判据是 `if (this.remoteComplete)
+   return` ⇒ models.dev 超时后它仍为 `true` ⇒ **闸门的冷却永远读不到**
+   ⇒ models.dev 整个进程生命周期只被调 1 次。
+
+⇒ 修法：`complete && this.modelsDev !== undefined`。判据用「**读到过**」
+（含读到**空表** —— 上游确实没有 `cline-pass` 块时那也是「已就绪」，
+不该无限重试）。方向是「宁可多试一次」：多试只是多发一次请求（自带 TTL +
+闸门 30 秒冷却），漏判的代价是整个 provider 的图片能力永久失效。
+
+**同源的第二个坑（被三态改造暴露）**：`applyModelsDevCatalog` 原先写
+
+    ...entry.supportsImage ? { supportsImage: true } : {}   // false 被吞成「缺席」
+
+⇒ models.dev **明确说 false**（实测 `cline-pass/glm-5.3` 就是不带图的）时字段
+**缺席** ⇒ 三态下被读成「**未知**」，而它其实是「**确认不支持**」。
+两个方向都真实有害：宿主按「未知」**放行**图片（发到不支持图的服务端）、
+门禁文案说「能力尚未加载完成」。⚠️ 这条在**两态**下无害（两边都归 `['text']`），
+是三态改造**暴露**的。**两个入口都要改**（补缺分支 + 已有条目的合并分支）。
+
+**拉取健壮化**（同 issue 第 3 点）：超时 20s → **60s**、显式
+`Accept-Encoding: br, gzip`（Node 原生 `fetch` **默认不带**，一直在下 5.39 MB
+明文 —— 代价不只是慢，而是**极易撞上超时上限**）、ETag 条件请求。
+⚠️ **304 必须回落成上次的结果**，绝不能当成「空目录」（那会把所有模型的图片
+能力一次性打回纯文本）；⚠️ 服务端撤掉 ETag 时必须清空，否则一直带着失效的
+`If-None-Match`；⚠️ 没有上次结果却收到 304 时**抛错**，让调用方按「未就绪」
+处理 —— 返回空表就是把「没读到」说成「不支持」。
+
+**三态判定**（同 issue 第 1 点，通用纪律见 `misc.md`）：`inputModalitiesFor`
+必须判 `supportsImage === undefined`（**字段缺席**）而不是 `!== true`；
+未知时 `toCatalogEntry` **省略** `inputModalities`；`stream()` 门禁分流为
+`INVALID_REQUEST` + 可区分文案（**不用 `TRANSPORT`** —— 它在
+`DEFAULT_RETRYABLE_CODES` 里，会白重试 5 次）。
+⚠️ `cline` 已按 `model-catalog-parity` 的显式例外机制登记进
+`OMIT_UNKNOWN_MODALITIES` —— **不是把 buddy 的做法推广**，而是先确认了它
+确实存在「未知态」（能力来源会在进程运行中拿不到）。有些家的目录是编译期表
+恒可用、根本不存在未知态，那些**不**该加进来。
+
 ⚠️ **排障提示（本次顺带查明的第三种「看不到」）**：目录里有 14 条 `cline-pass`，
 但**用户的黑名单关掉了 10 条**（`~/.dsh/jet-hub/state.json` 的
 `disabledModels.cline`，实测 474 条 cline 模型被关），模型选择器里因此只剩
@@ -1025,7 +1076,8 @@ HTTP 日期 / **★ 实测报文 → 19h39m，且文案**不含**原文、含「
 长度 < 150** / **★ 轮次用尽时最后一个账号也被标记** / 402 不写标记且文案含「充值」 /
 无池账号不写标记）、`tests/unit/retry-after.spec.ts`（10 条）、
 `buddy-ratelimit-misreport.spec.ts` 的「cline 同型缺陷」接线段（4 条）。
-⚠️ 已做**反向验证**：把「报文时长」那条分支短路 → 2 条变红；去掉循环后的补标记 → 2 条变红。
+⚠️ 已做**反向验证**：把「报文时长」那条分支短路 → 2 条变红；去掉循环后的补标记 → 2 条变红。
+
 
 ## ⚠️ Cline provider：`workos:` 前缀不可剥、免费集合动态下发
 
