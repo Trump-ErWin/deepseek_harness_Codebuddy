@@ -1766,7 +1766,11 @@ function registerJetHubEndpoints(
    * 本函数让**积分查询这个用户主动发起的动作**自带续期：不必等定时器，
    * 一次刷新面板就同时消灭「已过期」显示与 401。
    */
-  const healExpiredAccountBeforeBalance = async (entry: ProviderAccountEntry): Promise<void> => {
+  const healExpiredAccountBeforeBalance = async (
+    entry: ProviderAccountEntry,
+    /** 「现在」的注入点（只供测试；见 {@link healExpiredAccounts} 的说明）。 */
+    now: () => number = Date.now,
+  ): Promise<void> => {
     // ⚠️ 判据与客户端**逐字一致**（同一个表达式），否则会出现「面板说没过期、
     // 这里却发续期请求」或反之的无谓请求。
     //
@@ -1777,7 +1781,7 @@ function registerJetHubEndpoints(
     // 宿主与 UI **行为分叉**。
     const expired = typeof entry.expiresAt === 'number'
       && entry.expiresAt > 0
-      && entry.expiresAt <= Date.now()
+      && entry.expiresAt <= now()
     // ⚠️ **不判 `entry.refreshable`**（issue IKKHL5 建议 C 的原文写的是
     // 「已过期且 refreshable」）：那个布尔是**凭据材料的镜像**、可能被误标，
     // 而本插件已有一条铁律——误标过一次就永不自愈（见 AGENTS.md「账号池的
@@ -1838,6 +1842,28 @@ function registerJetHubEndpoints(
   }
 
   /**
+   * 自愈的**整轮预算**（毫秒）。
+   *
+   * ⚠️ **必须有**（对抗审计实测的真实缺陷）：本自愈是**逐账号顺序 await，
+   * 每个账号一个真实 HTTP 续期**，而各家 `AbortSignal.timeout` 是
+   * 20~60 秒（codearts / buddy / raccoon 60s，lobsterai / qoder / trae /
+   * cline / minimax 30s，gemini 20s）。池里 39 个账号全过期且全部超时时，
+   * 最坏 **39 × 60s ≈ 39 分钟**，而这发生在**用户点一下就等**的
+   * `credits.balances` / `credits.claimAll` 入口上（徽标还会每 60 秒轮询
+   * 走同一个 `handleMethod`）。
+   *
+   * 原有的 `DEFAULT_ROUND_BUDGET_MS`（30 分钟）**管不到这里** —— 它只在
+   * `collectClaimResults` 的成长任务路径（`afterClaim`）里被消费。
+   * 若不设闸门，症状会从「积分行报 HTTP 401」**恶化成「整个端点超时、
+   * 余额与领取结果一起丢」** —— 比原缺陷更糟。
+   *
+   * ⚠️ 语义与 `collectClaimResults` 的 `roundBudgetMs` 保持一致：
+   * 到点后**停止继续自愈、但不失败**（余下账号留给下一轮/定时器），
+   * 因为「没来得及续期」远好于「整个端点拿不到任何结果」。
+   */
+  const SELF_HEAL_ROUND_BUDGET_MS = 60_000
+
+  /**
    * 逐账号**顺序**执行自愈（供 `credits.balances` 与 `credits.claimAll` 共用）。
    *
    * ⚠️ **必须串行、不得改 `Promise.all`**（对抗审计实测的测试盲区：改成并行后
@@ -1845,10 +1871,37 @@ function registerJetHubEndpoints(
    * `collectCreditBalances` 的注释；并发续期还有轮换 token 的覆盖风险）。
    * 由 `credits-balance-self-heal.spec.ts` 的**双账号**顺序用例锁住
    *（单账号时串行与并行不可区分 —— 那正是它当初漏掉的原因）。
+   *
+   * ⚠️ **受 {@link SELF_HEAL_ROUND_BUDGET_MS} 约束**：到点即停，余下账号
+   * 交给下一轮（见该常量的说明 —— 不能让自愈把端点本身拖超时）。
+   * ⚠️ 预算判据在**每个账号之前**检查：已经开始的续期不打断
+   *（它有自己的 20~60 秒超时兜底），故实际耗时上界是
+   * `预算 + 单个续期超时`，而不是「预算 + N × 超时」。
    */
-  const healExpiredAccounts = async (accounts: readonly ProviderAccountEntry[]): Promise<void> => {
+  const healExpiredAccounts = async (
+    accounts: readonly ProviderAccountEntry[],
+    /**
+     * 「现在」的注入点。⚠️ **只供测试**注入确定时刻 ——
+     * 生产不传即用 `Date.now()`。
+     *
+     * 存在的理由（对抗审计实测的高危点）：`<=` 边界用例原先在自己体内取
+     * `const now = Date.now()`，而 heal 内部**再调一次** `Date.now()`，
+     * 两者跨毫秒才检出 ⇒ 实测单文件 20 次只有 **10 次**变红（50%），
+     * 全量 CI 下 **0 检出**。注入 now 后边界判定变得确定。
+     */
+    now: () => number = Date.now,
+  ): Promise<void> => {
+    const deadlineAt = now() + SELF_HEAL_ROUND_BUDGET_MS
     for (const entry of accounts) {
-      await healExpiredAccountBeforeBalance(entry)
+      // ⚠️ 到点即停、**不失败**：已开始的续期不打断（见函数注释）。
+      if (now() >= deadlineAt) {
+        ctx.logger?.warn?.(
+          `[jet-hub] 自愈续期已达整轮预算（${SELF_HEAL_ROUND_BUDGET_MS}ms），`
+          + `本轮停止继续续期（余下账号交给下一轮/定时器）`,
+        )
+        return
+      }
+      await healExpiredAccountBeforeBalance(entry, now)
     }
   }
 
