@@ -26,6 +26,7 @@ import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
 import { LOOMY } from '../../src/loomy-product.js'
 import { TRAE } from '../../src/trae-product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
+import { OFFICEACE } from '../../src/officeace-product.js'
 
 /**
  * 积分能力矩阵的回归测试。
@@ -269,13 +270,15 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     expect(supportsRateLimit('不存在的 provider')).toBe(true)
   })
 
-  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好两个）', () => {
+  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好三个）', () => {
     const disabled = Object.entries(RATE_LIMIT_CAPABILITIES)
       .filter(([, caps]) => caps.rateLimit === false)
       .map(([id]) => id)
       .sort()
-    // loomy：根本不返回限流错误；gemini：限流是服务端配额窗口制。
-    expect(disabled).toEqual(['gemini', 'loomy'])
+    // loomy：根本不返回限流错误；gemini：限流是服务端配额窗口制；
+    // officeace（2026-10-12）：限流由华为云 MaaS 侧按账号配额管理，
+    // 本地标记清掉 / 重测通过都恢复不了配额（与 gemini 同因）。
+    expect(disabled).toEqual(['gemini', 'loomy', 'officeace'])
   })
 
   it('客户端源码里按钮仍走 supportsRateLimit 门控（不是在本文件另写白名单）', () => {
@@ -565,8 +568,10 @@ describe('永久积分锁定能力', () => {
    * ⚠️ 2026-10-06 新增 TRAE（字节）与 LobsterAI（有道）：它们的余额响应带逐包
    * 到期时间（TRAE 的条目级 `expire_time`、LobsterAI 的 `expiresAt`），
    * 归一化到 `deductionEndTime` 后即可用同一个 `splitBuddyCreditsByExpiry` 分桶。
+   * ⚠️ 2026-10-12 新增 OfficeAce（华为 MaaS）：creditGroups 自带 expiresAt
+   *（订阅套餐包无固定到期 = 永久桶，签到 / 活动包有明确到期），同款判据可分桶。
    */
-  const SUPPORTED = [LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id]
+  const SUPPORTED = [LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id]
   const UNSUPPORTED = [
     'codearts', 'qoder', 'qodercn', 'cline', 'raccoon',
   ]

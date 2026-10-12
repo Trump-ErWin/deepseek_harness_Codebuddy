@@ -332,6 +332,28 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
+    id: 'officeace',
+    label: 'OfficeAce',
+    displayName: 'OfficeAce',
+    logoClass: 'officeace',
+    // ⚠️ **有**积分余额：数据来自云侧 `GET /v1/subscription`（V11 签名直读，
+    //    与果办界面右上角同源同口径，2026-10-12 扣减实锤），**不依赖 OfficeAce 客户端**。
+    // ⚠️ `dailyCheckin: false` 是**诚实**的：该渠道没有签到端点 ——
+    //    不能为了「让按钮出现」而登记成 true（那样客户端会去请求一个必然失败的上游）。
+    credits: { balance: true, dailyCheckin: false },
+    // ⚠️ 余额响应里每个积分包都带到期时间（订阅套餐包无固定到期 = 永久桶，
+    //    签到 / 活动包有明确到期）⇒ 可按 `deductionEndTime` 分「永久 / 长期 / 临期」三档。
+    creditPackages: true,
+    permanentLock: true,
+    usesExpiryWindow: true,
+    // ⚠️ 与 gemini 同值但**理由不同**：它确实会回 429、适配器也写 `modelRateLimits`，
+    //    但限流由华为云 MaaS 侧按账号配额管理 —— 本地标记清掉、重测通过，
+    //    配额本身一点没恢复，下一次请求立刻又是 429。
+    rateLimit: false,
+    settingsNamespace: 'llm-officeace',
+    channel: true,
+  },
+  {
     id: 'aggregate',
     label: '聚合 (跨渠道)',
     displayName: '聚合 (跨渠道)',

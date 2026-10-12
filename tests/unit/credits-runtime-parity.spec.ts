@@ -94,13 +94,14 @@ class FakeCredentials {
   async unset(ref: string) { this.store.delete(ref) }
 }
 
-/** 13 个 auth 键的**空桩**（本文件只走 credits 端点，不碰 auth 实例）。 */
+/** 14 个 auth 键的**空桩**（本文件只走 credits 端点，不碰 auth 实例）。 */
 function emptyAuths(): Record<string, unknown> {
   const stub = {} as never
   return {
     codearts: stub, buddy: stub, workbuddy: stub, lobsterai: stub,
     qoder: stub, qodercn: stub, trae: stub, cline: stub, loomy: stub,
     raccoon: stub, minimax: stub, zcode: stub, gemini: stub,
+    officeace: stub,
   }
 }
 
@@ -412,7 +413,7 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     // 写死它是**有意**的：若有人改 registry，这条会红并要求他复核，
     // 而不是让 windowDays 静默地多出/少掉一家。
     const withWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true).map((d) => d.id).sort()
-    expect(withWindow).toEqual(['buddy', 'lobsterai', 'trae', 'workbuddy'])
+    expect(withWindow).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 })
 

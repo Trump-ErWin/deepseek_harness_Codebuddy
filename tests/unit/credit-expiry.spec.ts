@@ -17,6 +17,8 @@ import { dirname, resolve } from 'node:path'
 import {
   daysUntilExpiry,
   expiryBucketLabel,
+  expiryCountdown,
+  expirySplitParts,
   findDailyPool,
   formatExpirySplitLine,
   formatPackageExpiry,
@@ -58,17 +60,37 @@ function backendSplit(packages: CreditPackage[], windowDays = WINDOW_DAYS, now =
   )
 }
 
-describe('splitCreditsByExpiry（前端分桶）', () => {
-  it('14 天内到期算临时，更久算永久', () => {
+/**
+ * 把前端**三档**归约成后端的**两档**口径。
+ *
+ * ⚠️ 这是 2026-10-12 引入三档展示后的**必要适配**，不是放宽断言：
+ * 后端 `splitBuddyCreditsByExpiry` 是**选号判据**（只关心「会不会近期作废」，
+ * 故只有 `expiring` / `permanent` 两桶）；前端 `splitCreditsByExpiry` 是
+ * **展示口径**（用户要求把「真永久」与「到期还远」分开着色，故三桶）。
+ *
+ * 两者的**共同维度**是 `expiring`（必须逐分不差）；而前端的
+ * `permanent + longTerm` 恰好等于后端的 `permanent`（同一个集合的两种切法）。
+ * 故对账时按此归约 —— 这样「前端多算/少算临时积分」这类真实漂移仍会被抓住。
+ */
+function reduceFrontendToBackend(frontend: { expiring: number; longTerm: number; permanent: number }) {
+  return { expiring: frontend.expiring, permanent: frontend.permanent + frontend.longTerm }
+}
+
+describe('splitCreditsByExpiry（前端三档分桶）', () => {
+  it('15 天内到期算临期，更久算长期，无到期时间算永久', () => {
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 9 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 100, permanent: 0 })
+      .toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 9 * DAY })
+    // ⚠️ 3008 天有**明确到期时间** ⇒ 长期（黄），不是永久（绿）。
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 3008 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, permanent: 100 })
+      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null })
+    // 只有**服务端没给到期时间**才是真·永久。
+    expect(splitCreditsByExpiry([pkg({ deductionEndTime: undefined })], WINDOW_DAYS, NOW))
+      .toEqual({ expiring: 0, longTerm: 0, permanent: 100, earliestExpiringAt: null })
   })
 
-  it('恰好 15 天归永久（判据是"不足 15 天"）', () => {
+  it('恰好 15 天归长期（判据是"不足 15 天"）', () => {
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 15 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, permanent: 100 })
+      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null })
   })
 
   it('失效包与零余额包不计入', () => {
@@ -76,7 +98,7 @@ describe('splitCreditsByExpiry（前端分桶）', () => {
       pkg({ active: false, remaining: 999, deductionEndTime: NOW + DAY }),
       pkg({ remaining: 0 }),
       pkg({ remaining: 100, deductionEndTime: NOW + 20 * DAY }),
-    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, permanent: 100 })
+    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null })
   })
 
   it('到期时间未知归永久（保守方向）', () => {
@@ -84,7 +106,21 @@ describe('splitCreditsByExpiry（前端分桶）', () => {
       pkg({ deductionEndTime: undefined }),
       pkg({ deductionEndTime: 0 }),
       pkg({ deductionEndTime: Number.NaN }),
-    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, permanent: 300 })
+    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 0, permanent: 300, earliestExpiringAt: null })
+  })
+
+  /**
+   * ⚠️ 临期桶要带回**最早**的作废时刻 —— 它是倒计时的数据源（用户 2026-10-12 要求
+   * 「临期 100（倒计时）」）。多个临期包时取最早的那个：那才是用户真正会先失去的额度。
+   */
+  it('临期桶带最早作废时刻（多包取最早）', () => {
+    const split = splitCreditsByExpiry([
+      pkg({ remaining: 50, deductionEndTime: NOW + 9 * DAY }),
+      pkg({ remaining: 30, deductionEndTime: NOW + 2 * DAY }),
+      pkg({ remaining: 20, deductionEndTime: NOW + 12 * DAY }),
+    ], WINDOW_DAYS, NOW)
+    expect(split?.expiring).toBe(100)
+    expect(split?.earliestExpiringAt).toBe(NOW + 2 * DAY)
   })
 
   /**
@@ -107,7 +143,9 @@ describe('splitCreditsByExpiry（前端分桶）', () => {
 
   it('now 非法时退回当前时间而不是算出 NaN', () => {
     const split = splitCreditsByExpiry([pkg({ deductionEndTime: Date.now() + 9 * DAY })], WINDOW_DAYS, NaN)
-    expect(split).toEqual({ expiring: 100, permanent: 0 })
+    expect(split?.expiring).toBe(100)
+    expect(split?.longTerm).toBe(0)
+    expect(split?.permanent).toBe(0)
   })
 })
 
@@ -143,7 +181,11 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
   for (const [label, packages, windowDays] of fixtures) {
     const days = windowDays ?? WINDOW_DAYS
     it(label, () => {
-      expect(splitCreditsByExpiry(packages, days, NOW)).toEqual(backendSplit(packages, days, NOW))
+      // ⚠️ 前端三档归约成后端两档后比对（见 `reduceFrontendToBackend` 的说明）：
+      // 共同维度是 `expiring`，且 permanent+longTerm 必须等于后端的 permanent。
+      const frontend = splitCreditsByExpiry(packages, days, NOW)
+      expect(frontend).not.toBeNull()
+      expect(reduceFrontendToBackend(frontend!)).toEqual(backendSplit(packages, days, NOW))
     })
   }
 
@@ -153,13 +195,13 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
    */
   it('时间前进后两侧同步越线', () => {
     const packages = [pkg({ remaining: 100, deductionEndTime: NOW + 15 * DAY + 30_000 })]
-    expect(splitCreditsByExpiry(packages, WINDOW_DAYS, NOW))
-      .toEqual(backendSplit(packages, WINDOW_DAYS, NOW))
+    const before = splitCreditsByExpiry(packages, WINDOW_DAYS, NOW)
+    expect(reduceFrontendToBackend(before!)).toEqual(backendSplit(packages, WINDOW_DAYS, NOW))
     // 40 秒后越过 15 天线
     const later = NOW + 40_000
-    expect(splitCreditsByExpiry(packages, WINDOW_DAYS, later)).toEqual({ expiring: 100, permanent: 0 })
-    expect(splitCreditsByExpiry(packages, WINDOW_DAYS, later))
-      .toEqual(backendSplit(packages, WINDOW_DAYS, later))
+    const after = splitCreditsByExpiry(packages, WINDOW_DAYS, later)
+    expect(after).toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 15 * DAY + 30_000 })
+    expect(reduceFrontendToBackend(after!)).toEqual(backendSplit(packages, WINDOW_DAYS, later))
   })
 
   /**
@@ -173,9 +215,11 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
    * 凭空渲染假分类行）。
    *
    * 这里锁死「TRAE 的真实到期数据 + 窗口 → 正确分桶」：
-   * 500 落在 15 天内 ⇒ 临时；三个 150 都在 15 天外 ⇒ 长期。
+   * 500 落在 15 天内 ⇒ 临期（红）；三个 150 都在 15 天外 ⇒ 长期（黄）。
+   * ⚠️ 2026-10-12 起分**三档**：这三个 150 有明确到期日 ⇒ 长期（不是永久），
+   * 只有服务端不给到期时间才是永久。
    */
-  it('TRAE 真实数据分桶：9/30 到期的 500 是临时、三个 10/28+ 的 150 是长期', () => {
+  it('TRAE 真实数据分桶：9/30 到期的 500 是临期、三个 10/28+ 的 150 是长期', () => {
     const base = NOW // 2026-10-01 前后的固定时刻由文件顶部的 NOW 提供
     const traePackages = [
       pkg({ name: '每月登录赠送', remaining: 500, deductionEndTime: base + 1 * DAY }),
@@ -184,12 +228,13 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
       pkg({ name: '签到奖励', remaining: 150, deductionEndTime: base + 30 * DAY }),
     ]
     expect(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base))
-      .toEqual({ expiring: 500, permanent: 450 })
+      .toEqual({ expiring: 500, longTerm: 450, permanent: 0, earliestExpiringAt: base + 1 * DAY })
     expect(formatExpirySplitLine(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base), v => String(v)))
-      .toBe('长期 450 · 临时 500')
-    // 与后端同规则（TRAE 复用 buddy 的分桶判据，不存在第二套标准）
-    expect(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base))
-      .toEqual(backendSplit(traePackages, WINDOW_DAYS, base))
+      .toBe('长期 450 · 临期 500')
+    // 与后端同规则（TRAE 复用 buddy 的分桶判据，不存在第二套标准）——
+    // 前端三档归约成后端两档后必须逐分不差。
+    const frontend = splitCreditsByExpiry(traePackages, WINDOW_DAYS, base)
+    expect(reduceFrontendToBackend(frontend!)).toEqual(backendSplit(traePackages, WINDOW_DAYS, base))
   })
 })
 
@@ -229,17 +274,19 @@ describe('formatExpirySplitLine（卡片那一行）', () => {
   const format = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(2))
 
   /**
-   * ⚠️ **长期在前、临时在后**（用户 2026-09-29 要求），且用词是「长期」不是
-   * 「永久」（用户 2026-09-29 纠正：buddy / TRAE 的积分都有到期日，只是较远）。
+   * ⚠️ **三档顺序固定：永久 → 长期 → 临期**（用户 2026-10-12 定），用词是
+   * 「长期」不是「永久」——只有**服务端没给到期时间**的才叫永久（用户
+   * 2026-09-29 纠正过：buddy / TRAE 的积分都有到期日，只是较远）。
    *
-   * 小数按两位显示（`100.50`）—— 与卡片上**总额**用的 `formatCredits` 同一口径，
-   * 服务端精确值本就带小数（实测 `74.61000076`），这里不另立规则。
+   * 小数按两位显示（`100.50`）—— 与卡片上**总额**用的 `formatCredits` 同一口径。
    */
-  it('长期在前、临时在后', () => {
-    expect(formatExpirySplitLine({ expiring: 250, permanent: 100.5 }, format))
-      .toBe('长期 100.50 · 临时 250')
-    expect(formatExpirySplitLine({ expiring: 74.61, permanent: 0 }, format))
-      .toBe('长期 0 · 临时 74.61')
+  it('永久在前、长期居中、临期在后', () => {
+    expect(formatExpirySplitLine({ permanent: 3852, longTerm: 3753, expiring: 100 }, format))
+      .toBe('永久 3852 · 长期 3753 · 临期 100')
+    expect(formatExpirySplitLine({ permanent: 0, longTerm: 100.5, expiring: 250 }, format))
+      .toBe('长期 100.50 · 临期 250')
+    expect(formatExpirySplitLine({ permanent: 0, longTerm: 0, expiring: 74.61 }, format))
+      .toBe('临期 74.61')
   })
 
   it('分类不可用时返回 null（调用方据此不渲染）', () => {
@@ -247,12 +294,88 @@ describe('formatExpirySplitLine（卡片那一行）', () => {
   })
 
   /**
-   * 全 0 也要显示 —— 「临时 0」正是「锁定永久积分后为什么没有可用账号」的答案
-   * （实测中国版那个号就是长期 10064 · 临时 0：明明有分却全被判长期）。
-   * 隐藏它会让用户对着有余额的卡片困惑。
+   * ⚠️ 三档全 0 时返回 `null`（**不渲染**）—— 与两档时代的「长期 0 · 临时 0」
+   * 不同：现在 0 值桶**不参与拼接**（0 值进文案只让一行变长而无信息）。
+   * 「锁定永久积分后为什么没有可用账号」这个线索由**账号卡片整体**给出
+   * （余额为 0 的那一行），不需要靠分桶行里的一串 0。
    */
-  it('两桶皆 0 仍显示（这是锁定失效的线索）', () => {
-    expect(formatExpirySplitLine({ expiring: 0, permanent: 0 }, format)).toBe('长期 0 · 临时 0')
+  it('三档皆 0 返回 null（不渲染空行）', () => {
+    expect(formatExpirySplitLine({ permanent: 0, longTerm: 0, expiring: 0 }, format)).toBeNull()
+  })
+})
+
+/**
+ * 三档**带色分段**（`expirySplitParts`）—— 用户 2026-10-12 明确要求
+ * 「永久（绿）/ 长期（黄）/ 临期（红 + 倒计时）」。
+ *
+ * ⚠️ 为什么不用 `formatExpirySplitLine` 的字符串：那个只能整体一个颜色，
+ * 而三档要各带各的色。React 侧必须拿到**结构化分段**才能逐段设 `data-tone`。
+ */
+describe('expirySplitParts（三档带色分段）', () => {
+  const format = (v: number) => String(Math.round(v))
+  const NOW_MS = Date.UTC(2026, 9, 12, 0, 0, 0)
+
+  it('三档各自带色：永久 ok（绿）/ 长期 warn（黄）/ 临期 error（红）', () => {
+    const parts = expirySplitParts(
+      { permanent: 3852, longTerm: 3753, expiring: 100, earliestExpiringAt: NOW_MS + 2 * DAY },
+      format,
+      NOW_MS,
+    )
+    expect(parts).toEqual([
+      { key: 'permanent', text: '永久 3852', tone: 'ok' },
+      { key: 'longTerm', text: '长期 3753', tone: 'warn' },
+      { key: 'expiring', text: '临期 100', tone: 'error', countdown: '2 天 0 小时' },
+    ])
+  })
+
+  it('临期段带倒计时（用户要的「倒计时」）', () => {
+    const parts = expirySplitParts(
+      { permanent: 0, longTerm: 0, expiring: 50, earliestExpiringAt: NOW_MS + 5 * 3600_000 + 20 * 60_000 },
+      format,
+      NOW_MS,
+    )
+    expect(parts).toEqual([
+      { key: 'expiring', text: '临期 50', tone: 'error', countdown: '5 小时 20 分钟' },
+    ])
+  })
+
+  it('零值桶不出现（不占版面）', () => {
+    expect(expirySplitParts({ permanent: 100, longTerm: 0, expiring: 0, earliestExpiringAt: null }, format, NOW_MS))
+      .toEqual([{ key: 'permanent', text: '永久 100', tone: 'ok' }])
+  })
+
+  it('分类不可用 / 全 0 时返回空数组', () => {
+    expect(expirySplitParts(null, format, NOW_MS)).toEqual([])
+    expect(expirySplitParts({ permanent: 0, longTerm: 0, expiring: 0, earliestExpiringAt: null }, format, NOW_MS))
+      .toEqual([])
+  })
+
+  /**
+   * ⚠️ 倒计时缺失时**不编造**：`earliestExpiringAt` 拿不到就只给金额，
+   * 不显示「已过期」这类噪音（与 `quotaCountdown` 同款约定）。
+   */
+  it('最早作废时刻缺失/已过期时不给倒计时', () => {
+    expect(expirySplitParts({ permanent: 0, longTerm: 0, expiring: 50, earliestExpiringAt: null }, format, NOW_MS))
+      .toEqual([{ key: 'expiring', text: '临期 50', tone: 'error' }])
+    expect(expirySplitParts({ permanent: 0, longTerm: 0, expiring: 50, earliestExpiringAt: NOW_MS - DAY }, format, NOW_MS))
+      .toEqual([{ key: 'expiring', text: '临期 50', tone: 'error' }])
+  })
+})
+
+describe('expiryCountdown（临期倒计时）', () => {
+  const base = Date.UTC(2026, 9, 12, 0, 0, 0)
+  it('粗粒度：天 / 小时 / 分钟', () => {
+    expect(expiryCountdown(base + 3 * DAY + 4 * 3600_000, base)).toBe('3 天 4 小时')
+    expect(expiryCountdown(base + 5 * 3600_000 + 20 * 60_000, base)).toBe('5 小时 20 分钟')
+    expect(expiryCountdown(base + 9 * 60_000, base)).toBe('9 分钟')
+    // 不足 1 分钟也至少显示 1 分钟（不出现「0 分钟」）
+    expect(expiryCountdown(base + 30_000, base)).toBe('1 分钟')
+  })
+  it('已过期 / 非法值返回空串（不显示噪音）', () => {
+    expect(expiryCountdown(base - 1000, base)).toBe('')
+    expect(expiryCountdown(0, base)).toBe('')
+    expect(expiryCountdown(Number.NaN, base)).toBe('')
+    expect(expiryCountdown(undefined as never, base)).toBe('')
   })
 })
 

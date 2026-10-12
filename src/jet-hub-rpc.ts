@@ -56,6 +56,12 @@ import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
+// OfficeAce（华为 MaaS 云端直连）：面板状态探测 / 登录流程 / 余额查询所需的
+// 产品配置与鉴权模块（协议逆向见 `officeace-auth.ts` 模块头）。
+import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js'
+import type * as OfficeAceAuthModule from './officeace-auth.js'
+/** 以模块命名空间为类型（`startLogin` / `pollLoginCode` / `fetchSubscriptionSummary` 等纯函数）。 */
+type OfficeAceAuth = typeof OfficeAceAuthModule
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -1044,6 +1050,14 @@ export interface JetHubAuths {
   readonly minimax: MinimaxAuth
   readonly zcode: ZcodeAuth
   readonly gemini: GeminiAuth
+  /**
+   * OfficeAce（华为 ModelArts MaaS 云端直连）。
+   *
+   * ⚠️ 值是 **auth 模块命名空间**（`import * as officeaceAuth`），不是 Service 实例
+   * —— 该模块导出的是纯函数（`startLogin` / `pollLoginCode` / `completeLogin` /
+   * `fetchSubscriptionSummary`），没有类实例。见 `officeace-auth.ts` 模块头。
+   */
+  readonly officeace: OfficeAceAuth
 }
 
 /**
@@ -1915,6 +1929,24 @@ function registerJetHubEndpoints(
   const pendingSmsMsgid = new Map<string, { phone: string; msgid: string }>()
 
   /**
+   * OfficeAce 登录的中间状态（账号 id → `{ state, codeVerifier, dpopPrivateJwk }`）。
+   *
+   * 华为云 OAuth 需要三件东西跨「发起登录」与「轮询取码」两次 RPC 保持：
+   * - `state`：云侧签发的一次性状态（**必须**来自 `POST /v1/claw/auth/state`，
+   *   自制 state 会在轮询时 404 —— 实测踩过）；
+   * - `codeVerifier`：PKCE 原文（换 token 时用）；
+   * - `dpopPrivateJwk`：DPoP 的 ES256 私钥（换 token 时签名，且**刷新要复用**）。
+   *
+   * ⚠️ 放内存而不落盘：`state` 与 `code` 都是**分钟级一次性**凭据，登录完成即无意义；
+   *    落盘只会留下无用的秘密副本。真正需要持久化的 `dpopPrivateJwk` 在
+   *    `completeLogin` 之后由凭据存储接管（`~/.dsh-officeace/session.json`）。
+   */
+  const pendingOfficeAceState = new Map<
+    string,
+    { state: string; codeVerifier: string; dpopPrivateJwk: import('./officeace-auth.js').DpopPrivateJwk }
+  >()
+
+  /**
    * 用量徽标的显示偏好（`$DSH_HOME/jet-hub/ui-preferences.json`）。
    *
    * ⚠️ 与账号池**分开**的独立文档：`state.json` 是整体替换语义，同机另一条工作区
@@ -2764,6 +2796,46 @@ function registerJetHubEndpoints(
           })
 
           return { ok: true, value: { accountId: id, loginUrl: geminiStarted.loginUrl } }
+        } else if (provider === OFFICEACE.id) {
+          /**
+           * OfficeAce（华为 ModelArts MaaS）走**华为云 OAuth（PKCE + DPoP）**，
+           * 全程**不依赖 OfficeAce 客户端**（协议逆向见 `officeace-auth.ts` 模块头）。
+           *
+           * ⚠️ 两步式（同 zcode / gemini）：`window.open` 只在用户手势窗口内有效，
+           * 等授权完成才返回 URL 会被浏览器拦截 —— 这里先返回 authorizeUrl，
+           * 后台轮询 `code` 再换 token（`login.poll` 里做）。
+           *
+           * ⚠️ 华为 SSO 通常**自动重定向**（无需扫码 / 无需输密码），用户开页即完成。
+           *
+           * ⚠️ `state` **必须**用云侧签发的那一个（`POST /v1/claw/auth/state`）：
+           * 自制 state 会在轮询时 404（实测踩过）。`codeVerifier` 与 `dpopPrivateJwk`
+           * 与 state 同批生成，必须一起暂存到 `pendingOfficeAceState` 供 `login.poll` 使用。
+           */
+          await pool.addAccount({
+            id,
+            provider: OFFICEACE.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let started: Awaited<ReturnType<OfficeAceAuth['startLogin']>>
+          try {
+            started = await auths.officeace.startLogin()
+          } catch (error) {
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 OfficeAce 登录（华为云授权状态获取失败）：${reason}`)
+          }
+          pendingOfficeAceState.set(id, {
+            state: started.state,
+            codeVerifier: started._internal.codeVerifier,
+            dpopPrivateJwk: started._internal.dpopPrivateJwk,
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: started.authorizeUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -2931,7 +3003,48 @@ function registerJetHubEndpoints(
         //   而实际上该账号一发请求就 `凭据无效`。这里对 zcode 追加**形状校验**。
         const ref = credentialRef(entry.credentialRef)
         const resolved = await ctx.credentials.resolve(ref)
-        if (!resolved) return { ok: true, value: { done: false } }
+        if (!resolved) {
+          /**
+           * OfficeAce 的占位条目走**凭据缺失即未完成**：这里代为轮询云侧 code。
+           * 用户授权完成后云侧立即返回 `code` → 换 token → 凭据落盘 → `done`。
+           *
+           * ⚠️ `code` 是**秒级时效** —— 轮询到必须**立刻** `completeLogin`
+           *（内部一次性完成 token 交换 + modelInfo + 落盘），不能延后。
+           */
+          if (entry.provider === OFFICEACE.id) {
+            const pending = pendingOfficeAceState.get(req.accountId)
+            if (pending !== undefined) {
+              const code = await auths.officeace.pollLoginCode(pending.state).catch(() => undefined)
+              if (code !== undefined) {
+                try {
+                  const credential = await auths.officeace.completeLogin(
+                    code,
+                    pending.codeVerifier,
+                    pending.dpopPrivateJwk,
+                  )
+                  pendingOfficeAceState.delete(req.accountId)
+                  const accountId = credential.accountId ?? ''
+                  await pool.updateAccount(req.accountId, {
+                    nickname: accountId.length > 0
+                      ? `OfficeAce ${accountId.slice(0, 8)}`
+                      : req.accountId,
+                    refreshable: true,
+                  })
+                  return { ok: true, value: { done: true, success: true } }
+                } catch (error) {
+                  // code 过期 / 交换失败：授权 code 一次性，保留 state 继续轮询没有意义
+                  //（云侧不会再给新 code）—— 清中间态，用户需重新发起登录。
+                  pendingOfficeAceState.delete(req.accountId)
+                  const reason = error instanceof Error ? error.message : String(error)
+                  return { ok: true, value: { done: false, error: `登录交换失败：${reason}，请重新点击「+ 新建账号」` } }
+                }
+              }
+              // 未就绪（用户还没完成授权）：继续轮询
+              return { ok: true, value: { done: false } }
+            }
+          }
+          return { ok: true, value: { done: false } }
+        }
         if (entry.provider === ZCODE.id) {
           let parsed: unknown
           try {
@@ -3692,6 +3805,80 @@ function registerJetHubEndpoints(
             })
           }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+
+        // ── OfficeAce（华为 ModelArts MaaS）──
+        //
+        // ⚠️ **不套查表分派**：它的余额不是「拿凭据调上游」的形状，而是
+        //    **云侧 V11 签名直读**（`GET /v1/subscription`）——凭据是 STS 三元组
+        //    且签名逻辑在 `officeace-auth.ts` 内部，没有 `fetchBalance(credential)`
+        //    这个可注入点。与 opencode / qoder 同属「形态与骨架不匹配」的特例。
+        //
+        // 返回的 `creditGroups` 含套餐桶（`skus[].quotas`）与活动桶
+        //（`bonus_skus[]`），逐桶带 `expiresAt` —— 归一化到 `deductionEndTime`
+        // 后由通用判据分成「永久 / 长期 / 临期」三档（`PERMANENT_LOCK_PROVIDERS` 同款）。
+        //
+        // ⚠️ **必须回传 `windowDays`**：客户端 `splitCreditsByExpiry` 的
+        // `normalizeWindowDays` 对 `undefined` 返回 `null` ⇒ 整个分桶行静默不渲染
+        //（真实症状：胶囊只有合计、没有「永久绿 / 长期黄 / 临期红」三行）。
+        if (req.provider === OFFICEACE.id) {
+          // ⚠️ 用可选链取 auth：本端点的多条单测用**空桩 auths**（`{}`）遍历
+          //    registry，缺 `officeace` 键时直接取属性会抛 TypeError ⇒ 整个 case
+          //    冒泡成 `ok:false`（真实症状：`officeace 应被接受` 变红）。
+          //    取不到就如实回「查询失败」，与网络失败同一条降级路径。
+          const fetchSummary = auths.officeace?.fetchSubscriptionSummary
+          const subscription = fetchSummary === undefined
+            ? undefined
+            : await fetchSummary.call(auths.officeace).catch(() => undefined)
+          if (subscription === undefined) {
+            return {
+              ok: true,
+              value: {
+                accounts: accounts.map((account) => ({
+                  accountId: account.id,
+                  nickname: account.nickname,
+                  balance: null,
+                  error: '积分查询失败（华为云订阅接口不可达或凭据已失效）',
+                })),
+                // ⚠️ **失败路径也要回传 `windowDays`**：该字段表达的是「本渠道
+                //    按到期时间分桶」（registry 的 `usesExpiryWindow`），与本次
+                //    读数成功与否**无关**。只在成功路径带它会让「空账号池 / 查询
+                //    失败」时形状不一致 —— 守卫用例遍历 registry 时正会红
+                //（实测症状：`officeace 必须回传 windowDays`）。
+                windowDays: buddyExpiringWindowDays(),
+              } satisfies RpcCreditsBalancesResponse,
+            }
+          }
+          const values = accounts.map((account) => ({
+            accountId: account.id,
+            nickname: account.nickname,
+            balance: {
+              total: subscription.totalCredits,
+              packages: subscription.creditGroups.map((group) => ({
+                name: group.name,
+                unit: OFFICEACE.quotaUnit,
+                remaining: group.remaining,
+                total: group.total,
+                used: group.used ?? 0,
+                active: !group.expired,
+                cycleStartTime: '',
+                cycleEndTime: '',
+                expiredTime: group.expiresAt ?? '',
+                // 分桶判据字段：订阅套餐包无固定到期（永久桶），活动/签到包有明确到期。
+                ...(group.expiresAt !== undefined && group.expiresAt !== null
+                  ? { deductionEndTime: new Date(group.expiresAt).getTime() }
+                  : {}),
+              })),
+              expiredTotal: subscription.creditGroups.filter((g) => g.expired).length,
+            },
+          }))
+          return {
+            ok: true,
+            value: {
+              accounts: values,
+              windowDays: buddyExpiringWindowDays(),
+            } satisfies RpcCreditsBalancesResponse,
+          }
         }
 
         // ── 查表分派 ──
@@ -4945,6 +5132,39 @@ function registerJetHubEndpoints(
         }
         const value: RpcUsageAutoCheckinResponse = { autoCheckin: await autoCheckin.setEnabled(req.enabled) }
         return { ok: true, value }
+      }
+
+      case 'officeace.status': {
+        /**
+         * OfficeAce（华为 MaaS）凭据状态：**只读探测**，不抛错。
+         *
+         * ⚠️ STS 临期先**静默刷新**（refresh_token 30 天，一次性）—— 刷新失败
+         * 不阻塞状态展示，仍按旧凭据回 `ready: true`（推理可能仍可用：MaaS 的
+         * Basic 凭据与 STS 生命周期不同步），真正失效由 `stream` 的 401 兜底。
+         */
+        let credential = await auths.officeace.readOfficeAceCredential().catch(() => undefined)
+        if (credential !== undefined && auths.officeace.isExpiring(credential)) {
+          credential = (await auths.officeace.refreshStoredCredential().catch(() => undefined)) ?? credential
+        }
+        const base = { quotaUnit: OFFICEACE.quotaUnit }
+        if (credential === undefined) {
+          return {
+            ok: true,
+            value: { ...base, ready: false, user: undefined, models: [], expiresAt: undefined },
+          }
+        }
+        return {
+          ok: true,
+          value: {
+            ...base,
+            ready: true,
+            user: credential.displayName ?? (credential.accountId !== undefined && credential.accountId.length > 0
+              ? `华为云 ${credential.accountId.slice(0, 8)}`
+              : '华为云账号'),
+            models: OFFICEACE_MODELS.map((m) => ({ id: m.id, name: m.name })),
+            expiresAt: credential.expiresAt,
+          },
+        }
       }
 
       default:

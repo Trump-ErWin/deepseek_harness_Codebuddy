@@ -121,6 +121,10 @@ export function expectedProviderIdsWithAuth(): string[] {
  *   形状会逼它去发一个不存在的上游请求。
  * - `qoder` / `qodercn`：余额原语只吃 `QoderCredential`、且 product 来自同族
  *   注册表，**与共享骨架的 `(credential, product)` 泛型不兼容**。
+ * - `officeace`：余额是**云侧 V11 签名直读**（`GET /v1/subscription`），
+ *   凭据是 STS 三元组、签名逻辑封装在 `officeace-auth.ts` 内部 ——
+ *   **没有** `fetchBalance(credential)` 这个可注入点。与 `qoder` 同属
+ *   「形态套不进骨架」，故在 `credits.balances` 里作为特例短路（2026-10-12）。
  *
  * ⚠️ 与 {@link AUTH_EXEMPT} **不是同一张表**（虽然都含 `opencode`）：
  * 那张是「没有 auth 服务」，这张是「余额形态套不进骨架」。两者各自有
@@ -130,6 +134,7 @@ export const CREDITS_TABLE_EXEMPT: ReadonlyMap<string, string> = new Map([
   ['opencode', '余额是本地派生的通道可用性（零网络），套 fetchBalance 形状会发不存在的请求'],
   ['qoder', 'fetchQoderCreditBalance 只吃 QoderCredential，与共享骨架的泛型不兼容'],
   ['qodercn', '同 qoder（两者复用同一个 QoderAuth，余额原语同形）'],
+  ['officeace', '余额是云侧 V11 签名直读（STS 凭据 + 签名在 auth 模块内），没有 fetchBalance 注入点'],
 ])
 
 /**

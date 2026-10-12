@@ -174,6 +174,7 @@ function makeRpc(options: { withIdToken?: boolean; gemini?: unknown } = {}) {
       minimax: {} as never,
       zcode: {} as never,
       gemini: gemini as never,
+      officeace: {} as never,
     } as never,
     undefined,
   )
@@ -386,6 +387,7 @@ describe('Gemini account.refresh 分派', () => {
     const seen: Array<{ ref: string; accountId?: string; withPool: boolean }> = []
     const { call, pool } = makeRpc({
       gemini: {
+      officeace: {} as never,
         async refreshAccountCredential(ref: string, p?: unknown, accountId?: string) {
           seen.push({ ref, accountId, withPool: p !== undefined })
         },

@@ -582,6 +582,13 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   // `tests/unit/jet-hub-store.spec.ts` 的「恢复表覆盖客户端 PROVIDERS 的全部
   // provider（从真实清单派生）」用例锁死 —— 合并新增 provider 前**先跑它**。
   ['GEMINI', 'gemini'],
+  // ⚠️ 第 15 个 provider（officeace，2026-10-12）—— 同款坑第 **四** 次。
+  // 漏加 = `OFFICEACE_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
+  // 本表与客户端 `PROVIDERS` 的一致性由
+  // `tests/unit/jet-hub-store.spec.ts` 的「恢复表覆盖客户端 PROVIDERS 的全部
+  // provider（从真实清单派生）」用例锁死 —— 合并新增 provider 前**先跑它**。
+  ['OFFICEACE', 'officeace'],
 ]
 
 /** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */

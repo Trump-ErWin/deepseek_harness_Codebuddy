@@ -85,6 +85,7 @@ describe('registerJetHubRpc：auths 是命名对象（类型层守卫）', () =>
       minimax: stub,
       zcode: stub,
       gemini: stub,
+      officeace: {} as never,
     })
     // 运行时只要求端点真的注册了（证明桩搭对了，上面那行的类型检查才有意义）。
     expect(registered.length).toBeGreaterThan(0)
