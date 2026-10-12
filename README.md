@@ -156,6 +156,12 @@ dsh plugin --profile <name> install <path-to-this-repo>
 - **`loomy`** 是唯一用**短信验证码**登录、且**不能自动续期**的渠道。
 - **`zcode`** 的领取路径需要一次性验证参数，由本机浏览器环境产出（web 版需要
   chromium，桌面版用自带内核）。
+  ⚠ **推理（对话）路径是否也要它，由服务端开关决定**：官方 3.14.5 起
+  `GET /api/v1/client/configs` 会下发 `captcha.skip_model_request`
+  —— 当前实测是 `true`（**不校验**，故按最省的方式「先探后取」：
+  不带验证头先发一发，被 `3007` 拒了才产）；一旦服务端翻成 `false`，
+  插件会**自动改为首发直接带上**，不再白吃那发注定失败的往返
+  （判据是三态：缺席 = 不知道 = 保持先探，见 `requiresCaptchaUpfront`）。
 - **`qoder` / `qodercn`** 共用同一套实现，差异仅在产品配置。
 - **`minimax`** 是唯一的 Anthropic Messages 协议族渠道。
 

@@ -35,12 +35,20 @@
 import type { ZcodeCredential } from './zcode.js'
 import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js'
 import {
+  extractZcodeLogId,
   formatZcodeEdgePageHint,
   hasZcodeUnusualActivity,
   looksLikeZcodeHtmlPage,
   parseZcodeBusinessCode,
 } from './zcode-diagnostics.js'
 import type { ZcodeRemoteModelLike } from './zcode-product.js'
+/**
+ * ⚠ **只取类型**：`zcode-captcha.ts` 反过来不 import 本文件，故无循环。
+ * 用 `import type` 是为了在编译后**不产生运行时依赖** —— captcha 那侧会拉起
+ * `chromium-session.js`（含 `node:child_process`），而本文件的调用方里有
+ * 只需要「读配置」的纯网络路径。
+ */
+import type { ZcodeCaptchaConfig } from './zcode-captcha.js'
 
 /** ZCode 平台 origin（官方默认）。 */
 export const ZCODE_ORIGIN = 'https://zcode.z.ai'
@@ -242,6 +250,15 @@ export interface ZcodeClaimOutcome {
   alreadyClaimed?: boolean
   httpStatus?: number
   message?: string
+  /**
+   * 上游的 `logid`（排障凭据，2026-10-12 新增）。
+   *
+   * ⚠ 与推理侧同源：由 {@link extractZcodeLogId} **双来源**取
+   * （体顶层 `logid` 优先，HTTP 头 `x-request-id` 兜底）——
+   * 后者让**边缘 HTML 页**也有凭据可取。
+   * ⚠ 取不到即 `undefined`，不编造（诊断行会整项省略）。
+   */
+  logId?: string
 }
 
 /**
@@ -672,6 +689,13 @@ export async function claimZcodePlan(
   // 1003 = 已领取过 —— **幂等成功，不是错误**。
   const alreadyClaimed = code === 1003
   const ok = response.ok && (code === 0 || alreadyClaimed)
+  /**
+   * ★ `logid` 在**持有 `response` 与完整 `text` 的这一层**提取（2026-10-12）——
+   * 与上面把风控归一成 `code` 同一条纪律：**在信息最全的地方取，
+   * 不要在已经丢过信息的下游猜**。下游（`zcode-auth.ts` 的 `toClaimOutcome`）
+   * 只拿得到 `message` 字符串，那里既没有 header、正文也可能已被截断。
+   */
+  const logId = extractZcodeLogId(text, response.headers)
   return {
     planId,
     code,
@@ -679,6 +703,7 @@ export async function claimZcodePlan(
     alreadyClaimed,
     httpStatus: response.status,
     message: message ?? (ok ? undefined : `HTTP ${response.status}`),
+    ...logId === undefined ? {} : { logId },
   }
 }
 
@@ -695,7 +720,7 @@ export async function claimZcodePlan(
 export async function fetchZcodeCaptchaConfig(
   credential: ZcodeCredential,
   fetchImpl: typeof fetch = fetch,
-): Promise<{ region: string; prefix: string; sceneId: string } | undefined> {
+): Promise<ZcodeCaptchaConfig | undefined> {
   const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
   const url = `${ZCODE_CLIENT_CONFIGS_URL}?app_version=${encodeURIComponent(appVersion)}&platform=unknown`
   try {
@@ -705,7 +730,17 @@ export async function fetchZcodeCaptchaConfig(
     }, 20_000)
     if (!response.ok) return undefined
     const parsed = await response.json() as {
-      data?: { configs?: { captcha?: { region?: unknown; prefix?: unknown; sceneId?: unknown } } }
+      data?: {
+        configs?: {
+          captcha?: {
+            region?: unknown
+            prefix?: unknown
+            sceneId?: unknown
+            enabled?: unknown
+            skip_model_request?: unknown
+          }
+        }
+      }
     }
     const captcha = parsed.data?.configs?.captcha
     if (captcha === undefined) return undefined
@@ -715,7 +750,26 @@ export async function fetchZcodeCaptchaConfig(
     if (typeof region !== 'string' || typeof prefix !== 'string' || typeof sceneId !== 'string') {
       return undefined
     }
-    return { region, prefix, sceneId }
+    /**
+     * ★ 两个开关**只在真的是布尔时**才写进返回值 —— 与官方
+     * `getCaptchaConfig()` 的 `typeof r === 'boolean' ? { skipModelRequest: r } : {}`
+     * **逐字同口径**。
+     *
+     * ⚠ 不能写成 `enabled: captcha.enabled === true` 这类强制布尔化：
+     *   那会把「字段缺席（不知道）」压成 `false`，而 `requiresCaptchaUpfront`
+     *   靠**区分**二者来决定要不要在首发抖一个 param。
+     *   压平的方向恰好是危险侧：`enabled: false` 会一票否决、
+     *   `skipModelRequest: false` 会让它每请求白烧一个设备级配额。
+     */
+    return {
+      region,
+      prefix,
+      sceneId,
+      ...typeof captcha.enabled === 'boolean' ? { enabled: captcha.enabled } : {},
+      ...typeof captcha.skip_model_request === 'boolean'
+        ? { skipModelRequest: captcha.skip_model_request }
+        : {},
+    }
   } catch {
     return undefined
   }

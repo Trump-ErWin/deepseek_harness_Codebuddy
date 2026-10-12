@@ -28,7 +28,7 @@ import { RACCOON } from './raccoon-product.js'
 import { ZcodeAuth } from './zcode-auth.js'
 import { registerZcodeLlm } from './zcode-adapter.js'
 import { ZCODE } from './zcode-product.js'
-import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
+import { ZCODE_CAPTCHA_FALLBACK, type ZcodeCaptchaConfig } from './zcode-captcha.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
 import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
 import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
@@ -1831,7 +1831,7 @@ const zcode = new ZcodeAuth(ctx, {
  * 那个能力已下沉到 `ZcodeAuth.fetchCaptchaConfig()`
  *（见其 `captchaConfigCacheInstance`），故这里只做「拿 → 回退」的编排。
  */
-const resolveZcodeCaptchaConfig = async (): Promise<{ region: string; prefix: string; sceneId: string }> => {
+const resolveZcodeCaptchaConfig = async (): Promise<ZcodeCaptchaConfig> => {
   const remote = await zcode.fetchCaptchaConfig().catch(() => undefined)
   if (remote !== undefined) {
     zcodeAdapter.setCaptchaConfig(remote)
