@@ -3145,6 +3145,16 @@ describe('provider.status / provider.setEnabled 端点', () => {
      * 「未关闭时不核实」（零网络代价）。
      */
     onListModels?: () => Promise<void>
+    /**
+     * 适配器的**目录健康快照**（可选诊断钩子，`describeCatalogHealth`）。
+     *
+     * ⚠️ 只有 cline 实现它（issue IKKZUG 第 5 点）：目录能力来自三个来源，
+     * 其中 models.dev 是外部站点、经常拉不到，而失败时只有 `console.warn`
+     * ⇒ 用户与排障者都看不到现场。此钩子让 `provider.status` 能报出来。
+     */
+    catalogHealth?: { total: number; complete: boolean; note?: string }
+    /** 让诊断钩子抛错（验证「诊断不得反噬主流程」）。 */
+    catalogHealthThrows?: boolean
   } = {}) {
     let stored: Record<string, unknown> = {
       // ⚠️ 账号条目必须补齐 `credentialRef`（非空）与 `createdAt`/`refreshable`：
@@ -3193,7 +3203,17 @@ describe('provider.status / provider.setEnabled 端点', () => {
     } as never)
 
     const adapter = options.catalog !== undefined && options.withAdapter !== false
-      ? { listAllModels: () => options.listAllSubset ?? options.catalog! }
+      ? {
+          listAllModels: () => options.listAllSubset ?? options.catalog!,
+          ...(options.catalogHealth === undefined && options.catalogHealthThrows !== true)
+            ? {}
+            : {
+                describeCatalogHealth: () => {
+                  if (options.catalogHealthThrows === true) throw new Error('诊断钩子内部炸了')
+                  return options.catalogHealth!
+                },
+              },
+        }
       : undefined
 
     const ctx = {
@@ -3332,6 +3352,49 @@ describe('provider.status / provider.setEnabled 端点', () => {
       expect(statuses.buddy.closed).toBe(true)
       // qoder 没有目录 → 未关闭
       expect(statuses.qoder?.closed ?? false).toBe(false)
+    })
+
+    // ── issue IKKZUG 第 5 点：目录健康状态要**可观测** ──
+    //
+    // 真实困境（用户 oct_heaven 定位到这一层很不容易）：cline 的目录来自
+    // **三个来源**，其中 models.dev 是 5.39 MB 的外部站点、经常拉不到；
+    // 而失败时只有 `console.warn`，**宿主不落盘** ⇒ 用户与排障者都看不到现场，
+    // 现象只是「贴不了图」，无从判断是「模型不支持」还是「目录没拉到」。
+
+    it('⚠️ 报出目录健康快照（来源就绪度），供排障区分「不支持」与「没拉到」', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        // 目录已拉到但**残缺**（models.dev 没读到）—— 这正是 IKKZUG 的现场。
+        catalogHealth: { total: 460, complete: false, note: 'models.dev 未就绪' },
+      })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const statuses = (result.value as {
+        statuses: Record<string, { catalog?: { total: number; complete: boolean; note?: string } }>
+      }).statuses
+      expect(statuses.buddy.catalog).toEqual({ total: 460, complete: false, note: 'models.dev 未就绪' })
+    })
+
+    it('⚠️ 适配器不实现该钩子时不得报错（其余 13 家）', async () => {
+      // ⚠️ 这是「可选钩子」的守卫：诊断**绝不能**成为新 provider 的接入门槛。
+      const { call } = setup({ catalog: CATALOG })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const statuses = (result.value as {
+        statuses: Record<string, { catalog?: unknown; closed: boolean }>
+      }).statuses
+      expect(statuses.buddy.closed).toBe(false)
+      expect(statuses.buddy.catalog, '未实现钩子 ⇒ 字段缺席而不是空对象').toBeUndefined()
+    })
+
+    it('⚠️ 钩子抛错不得让整个 provider.status 失败（诊断不能反噬）', async () => {
+      const { call } = setup({ catalog: CATALOG, catalogHealthThrows: true })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      expect(result.ok, '诊断钩子抛错不得让整个端点失败').toBe(true)
+      const statuses = (result.value as {
+        statuses: Record<string, { catalog?: unknown; models: { total: number } }>
+      }).statuses
+      // 主流程的字段必须仍然正确（诊断缺席而不是整个状态丢失）。
+      expect(statuses.buddy.models.total).toBeGreaterThan(0)
+      expect(statuses.buddy.catalog).toBeUndefined()
     })
 
     /**

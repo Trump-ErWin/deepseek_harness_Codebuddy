@@ -256,6 +256,7 @@ import type {
   RpcUsageAutoCheckinRequest,
   RpcUsageAutoCheckinResponse,
   ProviderStatus,
+  CatalogHealth,
 
   ProviderAccountStatus,
 } from './types.js'
@@ -1148,6 +1149,17 @@ export interface ModelCatalogSource {
    *（见 `AggregateAdapter.rejectionFingerprint`）。
    */
   clearChoiceCache?(): void
+  /**
+   * 目录健康快照（**可选** —— 只有目录来自**多个外部来源**的适配器实现它，
+   * 目前只有 `cline`：它的 `cline-pass/*` 条目与图片能力**只由 models.dev 提供**，
+   * 而那是 5.39 MB 的外部站点、经常拉不到）。
+   *
+   * ⚠️ 必须**零 IO**：`provider.status` 在设置页挂载时对**每个**供应商都会调它，
+   * 一旦它触发网络请求，首屏会被拖慢（本端点全程只用同步内存副本正是为此）。
+   * ⚠️ 抛错会被调用点吞掉（诊断不得反噬主流程），故实现方可以放心地
+   * 「读到什么就报什么」。
+   */
+  describeCatalogHealth?(): CatalogHealth
   /**
    * 清空**临期折算缓存**（**可选** —— 只有聚合适配器实现它）。
    *
@@ -4275,6 +4287,18 @@ function registerJetHubEndpoints(
             }
           }
           const entries = pool.listAccountsByProvider(provider)
+          // ⚠️ 目录健康快照是**可选诊断**（issue IKKZUG 第 5 点）：
+          // 只有目录来自多个外部来源的适配器实现它（目前只有 cline）。
+          // 三条纪律：① 钩子不存在 ⇒ 字段**缺席**（不是空对象，前端按
+          // 「无信息」渲染，不得当成「一切正常」）；② 钩子抛错 ⇒ 吞掉并
+          // 缺席（诊断不得反噬主流程）；③ **不发起任何 IO**（本端点全程只用
+          // 同步内存副本，见本方法的注释）。
+          let catalogHealth: CatalogHealth | undefined
+          try {
+            catalogHealth = modelAdapters?.[provider]?.describeCatalogHealth?.()
+          } catch {
+            catalogHealth = undefined
+          }
           statuses[provider] = {
             models: { total, disabled },
             accounts: {
@@ -4284,6 +4308,7 @@ function registerJetHubEndpoints(
               enabled: entries.filter((entry) => entry.enabled !== false).length,
             },
             closed,
+            ...catalogHealth === undefined ? {} : { catalog: catalogHealth },
           }
         }
         const value: RpcProviderStatusResponse = { statuses }
