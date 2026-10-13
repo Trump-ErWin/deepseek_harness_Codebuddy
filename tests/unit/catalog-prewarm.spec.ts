@@ -297,8 +297,16 @@ describe('IKJVTF 接线：十个适配器都接上了广播', () => {
     // 完整判据来自 remote（每个来源各自的取数结果），**不能**由 warnings 反推：
     // 「主动跳过」（无凭据时的 /models）与「取到了」在 warnings 上不可区分。
     expect(source).toMatch(/const complete = remote === undefined \? got : remote\.complete === true/)
+    // ⚠️⚠️ **完整必须并上 models.dev**（issue IKKZUG）：它是目录的第三个来源，
+    // 而 `cline-pass/*` 的模型与图片能力**只有它提供**。漏掉它 ⇒ models.dev
+    // 超时后目录被判成「已完整」⇒ 下面的短路永久生效 ⇒ 只能重启才能恢复
+    // （用户实测：23:02 启动 → 次日 00:30 仍稳定拒图）。
+    expect(source).toMatch(/this\.remoteComplete = complete && this\.modelsDev !== undefined/)
     // 残缺也要落缓存（否则每次 listModels 都重拉），但 complete=false 留冷却
-    expect(source).toMatch(/return \{ got: true, complete \}/)
+    // ⚠️ 断言写成**不变式**（返回值里的 complete 必须是同一个合并后的判据），
+    // 而不是 `complete }` 这种具体表达式 —— 早先这里写死 `complete }`，
+    // 结果「把 complete 改成合并后的判据」反而让用例变红，而那正是本次要的修复。
+    expect(source).toMatch(/return \{ got: true, complete: this\.remoteComplete \}/)
     // 完全没拿到时不落缓存
     expect(source).toMatch(/if \(!got\) return \{ got: false, complete: false \}/)
     // 死代码（重复 return true）已清掉

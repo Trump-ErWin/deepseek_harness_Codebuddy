@@ -934,6 +934,50 @@ describe('TRAE 适配器 · SOLO SSE 到 OpenAI chunk 转换', () => {
     expect(usage?.usage.reasoningTokens).toBe(135)
   })
 
+  /**
+   * ★ 真实缺陷回归（用户报障「trae 的缓存命中率一直是 0」）：
+   * 适配器的 `token_usage` 分支早期只读三个字段，把上游**确实下发**的
+   * `cache_read_input_tokens` 整对丢弃 ⇒ 界面恒显 0%。
+   *
+   * 报文取自 2026-10-12 实机直发 dump（`deepseek-v4.1-flash`，同前缀两次）。
+   */
+  it('★ token_usage 上报缓存命中，且未命中量已扣除命中部分', async () => {
+    const { adapter } = makeAdapter({
+      responses: [sseResponse(soloSse(
+        ['output', { response: 'OK' }],
+        ['token_usage', {
+          prompt_tokens: 5144, completion_tokens: 32, total_tokens: 5176,
+          cache_creation_input_tokens: 0, cache_read_input_tokens: 5120,
+          reasoning_tokens: 30, cluster: 'normal_context',
+        }],
+        ['done', { finish_reason: 'stop' }],
+      ))],
+    })
+    const chunks = await collect(adapter, BASIC_OPTIONS)
+    const usage = chunks.find((c) => c.type === 'usage') as {
+      usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; reasoningTokens?: number }
+    } | undefined
+    expect(usage?.usage.cacheReadTokens).toBe(5120)
+    // 5144 是**含缓存**的总输入，未命中量必须是减完的 24。
+    expect(usage?.usage.inputTokens).toBe(24)
+    expect(usage?.usage.outputTokens).toBe(32)
+    expect(usage?.usage.reasoningTokens).toBe(30)
+  })
+
+  it('★ 无缓存命中时不发 cacheReadTokens（不伪造 0）', async () => {
+    const { adapter } = makeAdapter({
+      responses: [sseResponse(soloSse(
+        ['output', { response: 'x' }],
+        ['token_usage', { prompt_tokens: 4894, completion_tokens: 118, cache_read_input_tokens: 0 }],
+        ['done', { finish_reason: 'stop' }],
+      ))],
+    })
+    const chunks = await collect(adapter, BASIC_OPTIONS)
+    const usage = chunks.find((c) => c.type === 'usage') as { usage: Record<string, unknown> } | undefined
+    expect(usage?.usage).not.toHaveProperty('cacheReadTokens')
+    expect(usage?.usage.inputTokens).toBe(4894)
+  })
+
   it('tool_calls 产出 tool-call-delta 与 block-end(tool-call)', async () => {
     const { adapter } = makeAdapter({
       responses: [sseResponse(soloSse(

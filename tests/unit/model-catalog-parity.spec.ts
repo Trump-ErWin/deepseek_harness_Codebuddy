@@ -593,15 +593,25 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
   ]
 
   /**
-   * ⚠️ **只有 `buddy` 系对未知 id 省略 `inputModalities`**（它的
-   * `inputModalitiesFor` 用 `imageCapabilityKnown` 区分「明确 false」与
-   * 「全都没查到」，后者**只报未知**）。其余一律**保守报 `['text']`**。
+   * ⚠️ **对未知 id 省略 `inputModalities` 的家**：`buddy` 系与 `cline`
+   * （issue IKKZUG，2026-10-12 新增 cline）。
+   *
+   * | 家 | 为什么「未知」是真实状态 |
+   * |---|---|
+   * | `buddy`（含 `workbuddy`） | `imageCapabilityKnown` 区分「明确 false」与「全都没查到」，后者只报未知 |
+   * | `cline` | **能力只来自目录条目，而 `cline-pass/*` 的条目只由 models.dev 提供** —— 那是 5.39 MB 的外部站点，用户实测直连三次（超时/超时/1.9s 成功）⇒ 「未知」是高频状态而非理论边界 |
+   *
+   * 其余一律**保守报 `['text']`**。
    *
    * ⚠️ 这里只列「省略」的家，**默认要求 `['text']`**：将来新增一家若想省略，
    * 必须**显式**加进本集合，否则下面 (h) 变红并点名它 —— 这是刻意的，
    * 目的是**迫使新人做显式决定**，而不是默默沿用某一家的行为。
+   *
+   * ⚠️ cline 是**第二个**省略家，不是「buddy 的特例推广」：加它之前先确认了
+   * 它确实存在「未知态」（能力来源会在进程运行中拿不到），而有些家的目录是
+   * 编译期表恒可用、根本不存在未知态 —— 那些**不**该加进来。
    */
-  const OMIT_UNKNOWN_MODALITIES: ReadonlySet<string> = new Set(['buddy', 'workbuddy'])
+  const OMIT_UNKNOWN_MODALITIES: ReadonlySet<string> = new Set(['buddy', 'workbuddy', 'cline'])
 
   /**
    * ⚠️ **只有 `cline` 与 `codearts` 对未知 id 仍声明 `reasoning`**：它们的档位

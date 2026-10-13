@@ -156,6 +156,12 @@ dsh plugin --profile <name> install <path-to-this-repo>
 - **`loomy`** 是唯一用**短信验证码**登录、且**不能自动续期**的渠道。
 - **`zcode`** 的领取路径需要一次性验证参数，由本机浏览器环境产出（web 版需要
   chromium，桌面版用自带内核）。
+  ⚠ **推理（对话）路径是否也要它，由服务端开关决定**：官方 3.14.5 起
+  `GET /api/v1/client/configs` 会下发 `captcha.skip_model_request`
+  —— 当前实测是 `true`（**不校验**，故按最省的方式「先探后取」：
+  不带验证头先发一发，被 `3007` 拒了才产）；一旦服务端翻成 `false`，
+  插件会**自动改为首发直接带上**，不再白吃那发注定失败的往返
+  （判据是三态：缺席 = 不知道 = 保持先探，见 `requiresCaptchaUpfront`）。
 - **`qoder` / `qodercn`** 共用同一套实现，差异仅在产品配置。
 - **`minimax`** 是唯一的 Anthropic Messages 协议族渠道。
 
@@ -205,6 +211,14 @@ codearts、cline 等都有）。聚合路由把「同一个真实模型」在各
 `lobsterai` / `trae` 七家。其余渠道**暂不参与**（插件对它们的额度到期时刻没有
 可靠信息，宁可少一个候选，不可把未知当可用）—— 它们仍可**直连**正常使用。
 
+⚠️ **`zcode` 的额度是「按模型」分桶的**，故它的可用性是**逐模型**判定的：
+赠送的 8M 实测分成 `GLM-5.3` 3M 与 `GLM-5.3-Flash` 5M 两个**专属桶**
+（上游在余额接口里下发 `capabilities: ["model:<模型>"]`）。某个模型烧光而另一个
+还有额度时，只会把**烧光的那个模型**在该账号上标记为当日用尽 ——
+另一个模型照常可用，不会因为「账号整体还有额度」而误派发到已尽的模型上。
+若账号另有**不限定模型**的通用赠送额度（如 1 亿 token），且它还有余额，
+则两个模型都仍可用（通用额度能承接它们）。
+
 **上下文窗口**：聚合模型声明的是**候选渠道里的最大值**。同一个模型在 buddy /
 codearts 上都是 1M，那么 `aggregate` 下选它也声明 1M（与直连一致）。⚠️ 若某次
 请求恰好被路由到窗口更小的候选，由**失败切换**兜住（上游报超长 ⇒ 换下一个候选）。
@@ -234,6 +248,41 @@ POST http://127.0.0.1:8326/v1/responses           ← OpenAI Responses API
 ⚠️ **两个端点同时可用，没有「格式开关」**：客户端用哪一套协议，由它自己请求的
 路径决定。
 
+⚠️ 上面那两个地址里的 **host 与端口都可被环境变量改掉**
+（`DSH_OPENAI_GATEWAY_HOST` / `DSH_OPENAI_GATEWAY_PORT`）；设置页里的
+「API 请求地址」显示的是**实际监听地址**，照它抄即可。
+
+### 容器化部署（Docker / Compose）
+
+默认只绑 `127.0.0.1`，因此**端口映射对网关无效**：容器里 `curl 127.0.0.1:8326`
+能通只是假象，docker-proxy 与同网络的其它容器走的是容器桥接 IP（`eth0`），
+那个地址上没有监听，于是宿主侧看到 `Connection reset by peer`
+（对照：Web 端口绑的是容器 IP，所以映射可用）。
+
+修法是让网关绑**容器自身的接口地址**：
+
+```yaml
+environment:
+  - DSH_OPENAI_GATEWAY_ENABLED=1
+  - DSH_OPENAI_GATEWAY_HOST=172.21.0.8   # 容器自身 IP：hostname -i 或 ip -4 addr show eth0
+  - DSH_OPENAI_GATEWAY_PORT=8326
+```
+
+```console
+$ docker exec dsh ss -tlnp | grep 8326
+LISTEN  172.21.0.8:8326     # 绑上桥接 IP 后，端口映射才可达
+```
+
+⚠️ **不许填 `0.0.0.0` / `::` 这类通配地址**：会被显式拒绝并在启动前报错
+（dsh 本体的 `--host` 也是同一姿态）。绑通配等于把网关暴露给整个网络，
+真正的隔离只剩 API Key —— 而本网关承担的是「用你已登录的账号发请求」。
+容器场景填容器自身 IP 即可。
+
+⚠️ **暴露面不止「同一容器网络内的其它容器」，还包括宿主**：经端口映射（`-p`）
+或 bridge 网关，宿主本身就能连到该端口。跨 bridge 网络的容器才被隔离。
+设置页里绑了非回环地址时会显示这条提示；不打算对外提供时请保持默认
+`127.0.0.1`（或删除该环境变量）。
+
 ### 拿到地址与密钥
 
 鉴权使用 `Authorization: Bearer <网关 API Key>`。
@@ -257,6 +306,7 @@ POST http://127.0.0.1:8326/v1/responses           ← OpenAI Responses API
 | 环境变量 | `DSH_OPENAI_GATEWAY_ENABLED=0`（**完全不启动**，连 API Key 文件都不生成）|
 | 设置页开关 | 关掉后不再监听 |
 | 改端口 | `DSH_OPENAI_GATEWAY_PORT` 填非法值会记录错误并跳过启动，**不会**静默改用其它端口 |
+| 改地址 | `DSH_OPENAI_GATEWAY_HOST` 填通配地址（`0.0.0.0` / `::`）同样记录错误并跳过启动 —— **不会**静默绑到全部网卡 |
 
 ### 请求体上限与 keep-alive
 
@@ -270,8 +320,12 @@ POST http://127.0.0.1:8326/v1/responses           ← OpenAI Responses API
 
 ### 安全边界
 
-- 只绑定 `127.0.0.1`，**不可**改成对外地址 —— 注意这只挡得住远程访问，
-  **同机其它用户/进程仍可连到该端口**，真正的隔离靠 API Key。
+- **默认**只绑定 `127.0.0.1`，且**拒绝**通配地址（`0.0.0.0` / `::`）。
+  只有容器/端口映射这类「客户端不在同一网络命名空间」的场景才需要改
+  `DSH_OPENAI_GATEWAY_HOST`，且应填**具体接口地址**（如容器自身 IP）而不是通配。
+  ⚠️ 改了之后暴露面**包含宿主**（端口映射/bridge 网关都能连到），
+  同机与同容器网络的其它用户或进程也能连到该端口 —— 真正的隔离靠 API Key，
+  不要把它配置进任何浏览器端工具或扩展。
 - 密钥以明文写在 `$DSH_HOME/openai-gateway/api-key`。POSIX 下的 `0600` 权限在
   **Windows 上不生效**，多用户机器请改用 `DSH_OPENAI_GATEWAY_API_KEY` 环境变量。
 
@@ -333,6 +387,7 @@ ZCode (智谱) • 94.54MToken
 |---|---|---|
 | `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` | 关闭 | 设为真值时，**没有已登录账号的渠道**在模型选择器里整体隐藏 |
 | `DSH_OPENAI_GATEWAY_ENABLED` | `1` | 设为 `0` / `false` / `off` / `no` 时完全不启动网关 |
+| `DSH_OPENAI_GATEWAY_HOST` | `127.0.0.1` | 网关监听地址。容器/端口映射场景填**容器自身 IP**（`hostname -i`）；填 `0.0.0.0` / `::` 等通配地址会被拒绝并跳过启动 |
 | `DSH_OPENAI_GATEWAY_PORT` | `8326` | 网关监听端口 |
 | `DSH_OPENAI_GATEWAY_API_KEY` | 自动生成 | 网关 Bearer 密钥 |
 | `DSH_REASONING_LOOP_GUARD` | 开启 | 思考死循环守卫总开关 |
