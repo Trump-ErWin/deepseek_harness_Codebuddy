@@ -64,6 +64,9 @@ const STYLES = `
 /* Gemini Code Assist：内联 SVG 自带蓝紫渐变星形，白底容器中显示清晰。
    ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
 .dim-jh-providerIcon.gemini { background: white; }
+/* Accio（阿里）：内联 SVG 自带品牌橙圆角方块 + 白色 A 字，白底容器中显示清晰。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
+.dim-jh-providerIcon.accio { background: white; }
 /* 聚合 provider：内联 SVG（三渠道汇聚），白底容器中显示清晰。
    ⚠️ 加这一条是必要的 —— 上面每家的 logoClass 都各自声明了背景，
       没有兜底规则，缺了会让聚合的图标容器**没有背景**（与其它行不一致）。 */
@@ -1068,6 +1071,34 @@ const STYLES = `
 .dim-jh-aggToggleOff { color: var(--dsw-alias-label-tertiary); text-decoration: line-through; }
 .dim-jh-aggFooter { display: flex; flex-direction: column; gap: 2px; padding-top: 8px; border-top: 1px solid var(--dsw-alias-border-secondary); }
 .dim-jh-aggFooter p { margin: 0; font-size: 11px; line-height: 1.7; color: var(--dsw-alias-label-tertiary); }
+
+/* ── Accio 专属积分区（三类桶 + 重置倒计时 + 发放规则说明）──
+   ⚠️ 本文件的样式整体是模板字符串 —— 注释里**绝不能出现反引号**（会提前闭合）。
+   要强调属性名就直接裸写，例如 min-width: 0。 */
+/* 整块：与账号卡片区隔开一段距离，并沿用面板的纵向排布。 */
+.dim-jh-accioPanel { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; padding: 10px 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-2); }
+.dim-jh-accioHead { display: flex; flex-direction: column; gap: 4px; }
+.dim-jh-accioTitle { margin: 0; font-size: 13px; line-height: 18px; font-weight: 680; color: var(--dsw-alias-label-primary); }
+/* 说明文案：这是本面板的核心内容（每日额度怎么来的），不要压得太小。 */
+.dim-jh-accioNote { margin: 0; font-size: 12px; line-height: 1.7; color: var(--dsw-alias-label-secondary); }
+/* 失败态复用同一个类名，靠 data-tone 换成警告色。 */
+.dim-jh-accioNote[data-tone='warn'] { color: var(--dsw-alias-state-warn-primary, #b45309); }
+/* 单账号块：与账号卡片同宽，内部纵向排布。 */
+.dim-jh-accioAccount { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l3); border-radius: 8px; background: var(--dsw-alias-bg-layer-1); }
+.dim-jh-accioAccount + .dim-jh-accioAccount { margin-top: 2px; }
+.dim-jh-accioAccountHead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dim-jh-accioAccountName { font-size: 13px; font-weight: 620; color: var(--dsw-alias-label-primary); }
+/* 账号规格（Free / Pro …）：次要标签。 */
+.dim-jh-accioAccountTier { flex: none; padding: 1px 6px; border-radius: 4px; font-size: 11px; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-3); }
+/* 重置倒计时：靠右，用等宽数字避免每分钟跳动时整行抖动。 */
+.dim-jh-accioCountdown { margin-left: auto; flex: none; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary); }
+/* 三类桶：每桶一行，名称 / 剩余 / 已用三格。 */
+.dim-jh-accioBuckets { display: flex; flex-direction: column; gap: 3px; }
+.dim-jh-accioBucket { display: flex; align-items: baseline; gap: 8px; font-size: 12px; line-height: 1.6; }
+/* min-width: 0 让长桶名可以被省略号截断，而不是把后面两格挤出容器。 */
+.dim-jh-accioBucketName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-secondary); }
+.dim-jh-accioBucketValue { flex: none; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-primary); }
+.dim-jh-accioBucketUsed { flex: none; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary); }
 
 `
 

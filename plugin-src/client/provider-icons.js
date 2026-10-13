@@ -1,5 +1,6 @@
 /**
- * 各 provider 面板图标的**纯数据模块**（15 条 base64 / SVG data URI，合计约 40 KB）。
+ * 各 provider 面板图标的**纯数据模块**（每个渠道一条 base64 / SVG data URI，
+ * 条数 = `src/provider-registry.ts` 的 id 数，故**不在此写死数字**）。
  *
  * ## 为什么单独成文件（而不是留在 `jet-hub.js` 里）
  *
@@ -22,7 +23,7 @@
  *
  * ## 为什么不搬进 `src/provider-registry.ts`
  *
- * 宿主侧（Node）**从不使用图标**，搬过去会让 `lib/index.js` 白白背上这约 40 KB
+ * 宿主侧（Node）**从不使用图标**，搬过去会让 `lib/index.js` 白白背上这几十 KB
  * 的字面量。故 registry 只持有 `logoClass`，图标留在这里，并由
  * `provider-registry.spec.ts` 的「两边 id 集合相等」断言锁住同步。
  */
@@ -219,6 +220,21 @@ const GEMINI_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53M
 /** 聚合 provider 的图标（三个候选渠道汇聚到一个中心）。 */
 const AGGREGATE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGNpcmNsZSBjeD0iNSIgY3k9IjUiIHI9IjIuNiIgZmlsbD0iIzRGOERGNyIvPjxjaXJjbGUgY3g9IjUiIGN5PSIxOSIgcj0iMi42IiBmaWxsPSIjOUI3MkNCIi8+PGNpcmNsZSBjeD0iMTkiIGN5PSIxMiIgcj0iMi42IiBmaWxsPSIjNEY4REY3Ii8+PHBhdGggZD0iTTcgNi4yIDE2LjQgMTFNNyAxNy44IDE2LjQgMTMiIHN0cm9rZT0iIzlCNzJDQiIgc3Ryb2tlLXdpZHRoPSIxLjciIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgZmlsbD0ibm9uZSIvPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTIiIHI9IjEuNSIgZmlsbD0iIzlCNzJDQiIvPjwvc3ZnPg==';
 
+/**
+ * Accio（阿里）面板图标（内联 SVG data URL，手绘）。
+ *
+ * ⚠️ 与 Qoder / LobsterAI / TRAE / OpenCode / Gemini 同款做法：没有可取的
+ * 官方小尺寸位图资源，走内联 SVG（体积小、无色差、20×20 下清晰）。
+ * 图形：品牌橙圆角方块 + 白色「A」字形（呼应 Accio 首字母）。
+ *
+ * ⚠️ **必须自带图形与底色** —— 容器按 `logoClass: 'accio'` 给**白底**
+ *（见 `jet-hub-styles.js` 的 `.dim-jh-providerIcon.accio`）。
+ *
+ * 生成方式：纯 Node 拼 base64（`.tmp-accio/gen-icon.mjs`，不入库），
+ * **不用 `btoa()`** —— 该 bundle 由 esbuild 打包，目标环境未必提供它。
+ */
+const ACCIO_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iI0ZGNkEwMCIvPjxwYXRoIGQ9Ik03LjQgMTcuMiAxMSA2LjhoMmwzLjYgMTAuNGgtMi4xbC0uNzItMi4yNEgxMC4ybC0uNzIgMi4yNEg3LjRaIiBmaWxsPSIjZmZmIi8+PHBhdGggZD0iTTEwLjc0IDEzLjI2aDIuNTJMMTIgOS41bC0xLjI2IDMuNzZaIiBmaWxsPSIjRkY2QTAwIi8+PC9zdmc+';
+
 
 /**
  * provider id → 图标 data URI。
@@ -242,5 +258,6 @@ export const PROVIDER_ICONS = {
   zcode: ZCODE_ICON,
   opencode: OPENCODE_ICON,
   gemini: GEMINI_ICON,
+  accio: ACCIO_ICON,
   aggregate: AGGREGATE_ICON,
 };

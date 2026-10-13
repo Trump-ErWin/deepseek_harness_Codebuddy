@@ -62,7 +62,7 @@ import { expectedProviderIdsWithAuth } from './provider-sets.js'
  */
 export const REFRESH_PROVIDERS = [
   'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn',
-  'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini',
+  'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini', 'accio',
 ] as const
 
 /**

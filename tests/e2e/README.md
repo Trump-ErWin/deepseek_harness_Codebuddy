@@ -17,6 +17,8 @@
 | `image-limit-bisect.e2e.spec.ts`（`pnpm test:e2e:image-bisect`） | `DSH_IMAGE_BISECT_E2E=1` + `DSH_IMAGE_BISECT_E2E_CONFIRM=yes` | **loomy / trae 的边界二分复测**（Gitee issue IKKX0T）。⚠️ 比上面那个**贵得多**（二分每步都是一整轮十几张图）。用途是复核两条**已被第三方实测质疑**的既有结论：loomy「24 张全过、无约束」、trae「未探到边界」。**二分出边界后才能定 `imageMaxBytes`**（本仓库规矩：拿不到阈值就不定值）。文件内含一条**离线判据用例**（零额度，不受闸门约束） |
 | `buddy-fingerprint-roles.e2e.spec.ts` | `DSH_BUDDY_FINGERPRINT_E2E=1` + `DSH_BUDDY_FINGERPRINT_E2E_CONFIRM=yes` | **腾讯系内容级风控的「角色矩阵」实测凭据**（每例 `max_tokens=16`，被拒不耗额度）。断言 `system` 与 **`assistant` 正文**含指纹会被 400/11128，而 `user` / `tool` 结果 / `reasoning_content` / `tool_calls.arguments` **放行**。⚠️ **不可省**：那四行结论已被写进 `src/openai-gateway/tencent-fingerprint.ts` 的**实现约束**（决定改写范围），单测只能锁「代码按那个范围做」，**锁不住那个范围本身对不对**。2026-10-12 的翻车正是「`assistant` 那一格从未测过」 |
 | `buddy-first-message-role.e2e.spec.ts` | `DSH_BUDDY_FIRSTMSG_E2E=1` + `DSH_BUDDY_FIRSTMSG_E2E_CONFIRM=yes` | **「wire 首条角色」实测凭据**。断言 `space-bunny` 在「首条是带 tool_calls 的 assistant」时回 400/**11148**（`displayMsg.zh`=「工具记录不完整，请新建任务」），而 `step-5-preview` **容忍同一形状**。⚠️ 「换个模型就好」是假解法。该判据写死在 `buddy-adapter.ts` 的 `stream()` 里，且 2026-10-12 的审计在**判据本身上**抓到一个真缺陷（初版写 `=== 'assistant'`，漏掉 user-first / tool-first） |
+| `accio-chat-probe.e2e.spec.ts` | `DSH_ACCIO_CHAT_E2E=1` + `DSH_ACCIO_CHAT_E2E_CONFIRM=yes` | 发一条极小请求。**默认用全目录最低倍率模型** `1Drift-N8kP2Q7wR5mX`（x0.013，实测最低）。可用 `ACCIO_PROBE_MODEL` 覆盖，⚠️ **未知 id 直接拒绝**、倍率超 x0.2 需 `ACCIO_PROBE_ALLOW_EXPENSIVE=1` |
+| `accio-tools-probe.e2e.spec.ts` | `DSH_ACCIO_TOOLS_E2E=1` + `DSH_ACCIO_TOOLS_E2E_CONFIRM=yes` | 工具调用**往返**（带 tools → 结构化 `tool-call` → 回传结果 → 最终正文）+ **思考链分离逐字对账**。⚠️ 另断言 `accioToolCallMergeTransform` 真的生效：同一个 id **恰好一个块**且参数**非空**（未合并会变成「N 个块 + 首块 `{}`」⇒ harness 把同一工具执行 N 次） |
 
 ## ⚠️ 图片探针的 fixture 不入库
 
@@ -108,6 +110,8 @@
 | `cline-probe.e2e.spec.ts` | `DSH_CLINE_E2E=1` | **只读**：凭据结构（含 `account_id` 与 `workos:` 前缀）、**前缀不可剥的现场证据**（带前缀 200 / 剥掉 401）、积分余额（打印原始值供核对单位）、远端 `free` 集合与 `/models` 目录。**不发模型请求、不续期** |
 | `minimax-probe.e2e.spec.ts` | `DSH_MINIMAX_E2E=1` | **只读**：远端模型目录（4 个模型 + 只有 M3.1 有档位）、签到状态、积分余额。**绝不领取**（`claim` 会消耗当天唯一一次机会）。⚠️ 读的是 **MiniMax Code 客户端自己的登录态**（`~/.minimax/auth/prod/cn/mcode-public/auth.json`），**不是**本插件的凭据存储 —— 该 provider 尚未在任何机器上完成过插件登录。⚠️ **token 过期时自动 skip 并打印指引**，**不代客户端续期**（代续期若遇服务端轮换 refresh_token 就会弄坏用户客户端登录态，详见 `minimax-credential.ts` 的长注释） |
 | `minimax-chat-probe.e2e.spec.ts` | `DSH_MINIMAX_CHAT_E2E=1` + `DSH_MINIMAX_CHAT_E2E_CONFIRM=yes` | 发一次 Anthropic Messages 推理请求。⚠️ **本轮该链路未端到端验证**：本机账号 `insufficient_balance_error`（HTTP 402）。保留探针是为了充值后一条命令验证，并把「未验证」留在代码里。⚠️ 该文件头如实标注了 `thinking.type=adaptive` 的**证据强度**（客户端取证支持 adaptive 形态，但「非 adaptive 会 400」目前只有计划文档声称、无服务端证据） |
+| `accio-probe.e2e.spec.ts` | `DSH_ACCIO_E2E=1` | **只读**：登录（池里有凭据则直接用，否则现场 PKCE 登录，**人工在浏览器授权**）→ 模型目录（倍率来自 `effectiveMultiple` 且按升序；兜底表**不许腐坏**）→ 账号身份（`userinfo`，token 在 **body**）→ 三类积分桶 + 重置倒计时（`currentSubscription` / `quota`，token 在 **query**）。**不发模型请求、不续期、不写任何存储**（登录产物只进内存凭据提供者） |
+| `accio-refresh-probe.e2e.spec.ts` | `DSH_ACCIO_REFRESH_E2E=1` + `DSH_ACCIO_REFRESH_E2E_CONFIRM=yes` | ⚠️⚠️ **续期端点的轮换语义**（`docs/agent-notes/providers-accio.md` §10 U-A）。回答三问：①是否轮换 `refresh_token`；②旧的轮换后是否**立即失效**；③是否顺带触发当日额度发放。**只读订阅**（不发模型请求），但**真实消费一次 `refresh_token`** |
 
 > CodeArts deepseek-v4 系列使用华为云免费福利额度（每日 1000 万免费 Tokens），
 > 不产生额外费用，因此 `DSH_CODEARTS_E2E=1` 不需要确认变量。
@@ -181,6 +185,19 @@ pnpm test:e2e:minimax
 
 # ⚠️ 发一次 MiniMax 推理请求（**本轮必然失败：账号无余额 402**；充值后才有意义）
 pnpm test:e2e:minimax-chat
+
+# 安全：Accio 只读探针（登录 + 模型目录 + 账号 + 积分；不发模型请求、不续期、不落盘）
+pnpm test:e2e:accio
+
+# ⚠️ 会消耗 Accio 积分：发一条极小请求（**默认全目录最低倍率 x0.013** 的模型）
+pnpm test:e2e:accio-chat
+
+# ⚠️ 会消耗 Accio 积分：工具调用往返 + 思考链分离（默认同上，最低倍率）
+pnpm test:e2e:accio-tools
+
+# ⚠️⚠️ Accio 续期**轮换语义**（会真实消费一次 refresh_token）
+#    只碰**本插件自己现场登录的**凭据（只进内存）；无法证明归属时**整体 skip**
+pnpm test:e2e:accio-refresh
 ```
 
 ## ⚠️ Cline 探针的付费保护（请勿削弱）
@@ -221,6 +238,72 @@ DSH_CLINE_CHAT_E2E_ALL_FREE=1       可选：才遍历其余免费模型
 > Qoder 官方客户端用**硬件指纹**派生 `machine_id`，而本插件用**随机 UUID**
 > （见设计文档 §8）。若续期返回 4xx（非 401），说明服务端校验了设备标识，
 > 该假设被推翻 —— 此时必须改用硬件指纹派生，否则用户每天都要重新登录。
+
+## ⚠️ Accio 探针的三条硬规矩（请勿削弱）
+
+### 1. 判「成功」**不能只看 HTTP 200**
+
+实测：把 token 放进 `Authorization` 头而不是 body 的 `token` 字段时，上游**恒**回
+
+```
+HTTP 200
+data: {"turn_complete":true,"error_code":"402","error_message":"unauthorized"}
+```
+
+⇒ 只看状态码会把**认证 / 额度失败**读成「成功但模型没吐字」，而且 harness 也
+不会按额度类重试。四个 Accio 探针因此都**至少两条判据同时成立**才算通过：
+
+| 探针 | 判据 |
+|---|---|
+| `accio-probe`（三个只读端点） | 信封 `success !== false` **且** 拿到了 `data` 对象 |
+| `accio-chat-probe` / `accio-tools-probe` | 原始帧里**有** `content.parts[].text` **且没有**非 `'200'` 的 `error_code`（`'200'` 是成功哨兵，实测正常帧也带） |
+
+⚠️ 两个流式探针**刻意不 catch** `consumeAccioSse` 抛出的 `LlmError`：流内 402 抛的是
+**字面量码 `'QUOTA_EXCEEDED'`**（不是 harness 的 `QUOTA_EXCEEDED_CODE`，其字面值是
+`'QUOTA'`，会被客户端换成固定文案）。吞掉它就等于把「额度/认证失败」降级成
+「模型没返回内容」—— 那正是 `src/accio-messages.ts` 修过的真实缺陷。
+
+### 2. ⚠️⚠️ 续期探针**只碰我们自己的凭据**
+
+参考实现明确记录「**刷新会轮换 `refresh_token`**」。若拿**用户 Accio 桌面端**的
+会话去试，轮换后那份即失效 ⇒ **用户桌面端的登录被弄坏**。
+
+`accio-refresh-probe.e2e.spec.ts` 因此：
+
+- **从不读** Accio 桌面端数据（`credentials.enc` / DPAPI），也**从不读**账号池里的
+  `ACCIO_ACCOUNT_*`（那可能是用户在 Jet Hub 登录的真实账号，轮换掉同样会打断它）；
+- **现场跑一次自己的 PKCE 登录**，凭据只写进**内存**凭据提供者，**一个字节都不落盘**
+  —— 轮换掉它不破坏任何东西；
+- 归属门禁 `ownershipFailureOf()` 有**三条判据，缺一不可**：
+  ① `DSH_ACCIO_REFRESH_E2E_CREDENTIAL_JSON` **未设置**（环境变量里的凭据**结构上
+  无法证明**归属）；② 凭据带 `region`（只有本插件的 `finishLogin` 会写它）；
+  ③ `refresh_token` 非空。
+  任一不成立就 **`ctx.skip()` 并打印原因** —— 宁可什么都不测，也不赌一把。
+
+该文件里还有一条**离线用例**（零网络、零额度）逐条变异验证这三条判据各自能拦住
+（含正例），别把它当噪音删掉。
+
+### 3. 对话 / 工具探针**必须用最低倍率模型**
+
+实测全目录最低倍率是 `1Drift-N8kP2Q7wR5mX`（**x0.013**，即
+`ACCIO.fallbackModels[0]`），最高的是 x2.8 —— **215 倍**价差。两个会花钱的探针因此：
+
+- 默认取 `ACCIO.fallbackModels[0]`；
+- 可用 `ACCIO_PROBE_MODEL` 覆盖，但**未知 id 直接拒绝**（id 形如 `1Drift-N8kP2Q7wR5mX`，
+  非人类可读，写错会得到一个与账号无关的 404，把「模型名不对」与「账号不可用」
+  混成同一条报错）；
+- 倍率高于 **x0.2** 的模型需要**额外显式 opt-in**（`ACCIO_PROBE_ALLOW_EXPENSIVE=1`）
+  —— 沿用 Cline 探针的「付费保护」形态。
+
+⚠️ `accio-probe`（只读）里有一条联动断言钉住这个前提：**最便宜的那个必须仍是
+`ACCIO.fallbackModels[0]`**。上游改了倍率排序，那两个花钱的探针会立刻变红而不是
+悄悄按新价刷额度。
+
+> ⚠️ **`maxOutputTokens` 为什么是 256 而不是 64**：Accio **关不掉思考**
+> （`includeThoughts` / `thinkingBudget` / `thinkingLevel` / `reasoningEffort`
+> 四类字段实测全部无效，见 `src/accio-adapter.ts` 文件头）。实测短回答的思考约
+> 150 token ⇒ 预算 64 会被思考**吃满**、正文零产出，得到的是**假阴性**
+> （`src/session-title.ts` 记录的同型缺陷）。256 是「思考够用 + 正文几个字」的实用下限。
 
 ## Qoder 设备身份为何只能在 e2e 里验证
 
