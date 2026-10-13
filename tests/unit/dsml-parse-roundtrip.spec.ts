@@ -24,7 +24,6 @@ import {
   parseDsmlToolCalls,
 } from '../../src/dsml.js'
 
-const BAR = '\uFF5C'
 const SRC = join(process.cwd(), 'src')
 
 describe('DSML 解析（共享层）', () => {
@@ -79,12 +78,27 @@ describe('DSML 解析（共享层）', () => {
 })
 
 describe('成对性守卫：注入提示的通道，消费器必须解析', () => {
+  /**
+   * ⚠️ **本组是源码级断言，强度有限**（2026-10-13 审计结论，必须如实标注）：
+   * 它们只能证明「那行字还在文件里」，**挡不住「删掉接线、保留注释」**。
+   * 行为级守卫在 `dsml-consume-wiring.spec.ts`（真喂 SSE 流、断言 chunk），
+   * 两处互补：这里防「整段协议被删」，那里防「接了但不通」。
+   */
   it('⑥ officeace 注入提示与 dsmlToolMode 必须同时存在（缺一 = 工具永不执行）', () => {
     const c = readFileSync(join(SRC, 'officeace-adapter.ts'), 'utf8')
-    const injects = /buildDsmlSystemPrompt/.test(c)
-    const parses = /dsmlToolMode/.test(c)
-    expect(injects, 'officeace 未注入 DSML 提示').toBe(true)
+    // ⚠️ **剥注释后再断言**：旧写法直接在原文上 `/dsmlToolMode/`，而该文件
+    //    的**注释里**就含这个词 ⇒ 断言可被注释满足（AGENTS.md 明令禁止
+    //    「在注释里写出会被验收 grep 的字符串」）。剥注释后必须仍命中。
+    const code = c.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    const injects = /buildDsmlSystemPrompt\s*\(/.test(code)
+    const parses = /dsmlToolMode\s*:\s*true/.test(code)
+    expect(injects, 'officeace 未注入 DSML 提示（剥注释后）').toBe(true)
     expect(parses, 'officeace 注入了提示却没开 dsmlToolMode ⇒ 教了但没人解').toBe(true)
+    // 两半必须由**同一个**开关驱动：解析开关要在 `dsmlMode` 守卫内出现两次
+    // （主路径 + 401 重试路径），漏一处就有半条通道静默失效。
+    expect(code.match(/dsmlToolMode\s*:\s*true/g)?.length, 'dsmlToolMode 实参少于 2 处（主路径 / 401 重试）')
+      .toBeGreaterThanOrEqual(2)
+    expect(code, '两半不由同一开关驱动').toMatch(/dsmlMode/)
   })
 
   it('⑦ 解析器实现只允许 dsml.ts 一处（不得 llm-adapter 里再留副本）', () => {
@@ -95,14 +109,19 @@ describe('成对性守卫：注入提示的通道，消费器必须解析', () =
     expect(llm).toMatch(/from '\.\/dsml\.js'/)
   })
 
-  it('⑧ consumeOpenAiSse 支持 dsmlToolMode（OfficeAce 走这条）', () => {
-    const c = readFileSync(join(SRC, 'openai-compat.ts'), 'utf8')
-    expect(c).toContain('dsmlToolMode')
-    expect(c).toContain('DsmlContentExtractor')
+  it('⑧ 接线行为级守卫必须存在（源码 grep 挡不住「删接线留注释」）', () => {
+    // ⚠️ 真实教训（2026-10-13）：本组 ⑥⑦⑧⑨ 全是源码 grep，实测「删掉
+    //    `if (dsmlExtractor !== undefined) {…}` 整块」后**入库用例仍全绿**。
+    //    故这里改为断言**行为级 spec 存在且含真断言**，把守卫指向它。
+    const spec = readFileSync(join(process.cwd(), 'tests/unit/dsml-consume-wiring.spec.ts'), 'utf8')
+    expect(spec, '缺少 consumeOpenAiSse 的行为级 DSML 守卫').toContain('consumeOpenAiSse')
+    expect(spec, '未开启/开启的对照断言缺失').toMatch(/dsmlToolMode:\s*true/)
+    // 必须有真断言（而非只有 console.log 的探针）
+    expect((spec.match(/expect\(/g) ?? []).length, '行为级 spec 断言过少').toBeGreaterThanOrEqual(10)
   })
 
   it('⑨ 未开启 dsmlToolMode 时行为不变（不误伤普通通道）', () => {
-    // 默认构造的提取器为 undefined ⇒ 正文直传。用文档化常量确认开关默认关。
+    // 默认构造的提取器为 undefined ⇒ 正文直传。
     const c = readFileSync(join(SRC, 'openai-compat.ts'), 'utf8')
     expect(c).toMatch(/config\.dsmlToolMode === true \? new DsmlContentExtractor\(\) : undefined/)
   })

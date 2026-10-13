@@ -513,9 +513,81 @@ export async function* consumeOpenAiSse(
   const dsmlExtractor = config.dsmlToolMode === true ? new DsmlContentExtractor() : undefined
   /**
    * DSML 解析出的调用所用的 wire 下标（**负数**，与上游标准 `tool_calls`
-   * 的 0/1/2… 天然隔离，避免两套机制抢同一个 `toolCalls` 槽位）。
+   * 的 0/1/2… 隔离，避免两套机制抢同一个 `toolCalls` 槽位）。
+   *
+   * ⚠️ **负数只是「与合规上游不撞」，不是「天然隔离」**（2026-10-13 对抗性
+   * 审计实测）：OpenAI 协议里 `tool_calls[].index` 是**非负整数**，但上游
+   * 并非总是合规 —— 真发 `{index:-1}` 时会与本计数器首个键 **-1 撞车**：
+   * 上游的 `callId` 覆盖掉已 yield 的 `dsml_1`，参数被 `+=` 拼成
+   * `{...}{...}` 两段相连的非法 JSON ⇒ `isTruncatedArguments` 判真 ⇒
+   * **误报 max-tokens 触发重试（工具可能重复执行）**。
+   * 故上游分支现经 {@link allocUpstreamWireIndex} 把不合规下标挪进非负空间。
    */
   let dsmlWireIndex = -1
+  /**
+   * 为**不合规**的上游 `tool_calls[].index` 分配一个未被占用的非负下标。
+   *
+   * 仅在 `call.index` 不是非负整数时调用（罕见），保证与 DSML 的负数键
+   * 以及其它上游键都不相撞。
+   */
+  function allocUpstreamWireIndex(): number {
+    let max = -1
+    for (const key of toolCalls.keys()) {
+      if (Number.isInteger(key) && key >= 0 && key > max) max = key
+    }
+    return max + 1
+  }
+  /**
+   * 取（按需创建）**正文块**。
+   *
+   * ⚠️ **必须延后建块**（2026-10-13 审计）：旧实现在解析 DSML **之前**就
+   * 无条件建块并 `yield block-start`，纯 DSML 响应于是留下一个**孤儿
+   * `block-start(text)`**（无 `text-delta`、收尾也因正文为空而不发
+   * `block-end`）—— 宿主 `BlockAssembler` 对没有 `block-end` 的 partial
+   * 同样会用 `partial.text` 组装成 `{type:'text',text:''}`，空块落进会话。
+   * 这恰好是本文件自己写明「不发射空 text 块」的那条不变式。
+   * 与 `suppressor` 的延后建块同策。
+   */
+  function ensureTextBlock(): { block: { index: number; kind: 'text'; text: string }; created: boolean } {
+    const found = blocks.find(candidate => candidate.kind === 'text')
+    if (found === undefined) {
+      const block: { index: number; kind: 'text'; text: string } = { index: nextIndex++, kind: 'text', text: '' }
+      blocks.push(block)
+      return { block, created: true }
+    }
+    return { block: found as { index: number; kind: 'text'; text: string }, created: false }
+  }
+  /** 取（按需创建）**思考块**，与 {@link ensureTextBlock} 同策。 */
+  function ensureReasoningBlock(): { block: { index: number; kind: 'reasoning'; text: string }; created: boolean } {
+    const found = blocks.find(candidate => candidate.kind === 'reasoning')
+    if (found === undefined) {
+      const block: { index: number; kind: 'reasoning'; text: string } = { index: nextIndex++, kind: 'reasoning', text: '' }
+      blocks.push(block)
+      return { block, created: true }
+    }
+    return { block: found as { index: number; kind: 'reasoning'; text: string }, created: false }
+  }
+  /**
+   * 把一段**思考**增量落到 reasoning 块（含死循环守卫与纯空白抑制）。
+   *
+   * ⚠️ 两个 reasoning 出口（`<thought>` 与 `delta.reasoning_content`）必须
+   * **共用同一个 `suppressor` 实例**，否则第二处会从空态重新累积
+   * （明明已有非空白内容却被判为「至今仍空白」）。见 `suppressor` 注释。
+   */
+  function* emitReasoningDelta(chunk: string): Generator<StreamChunk> {
+    if (chunk.length === 0) return
+    if (loopGuard !== undefined) {
+      if (loopGuard.observe(chunk)) loopDetected = true
+    }
+    if (loopDetected) return
+    const emit = suppressor.feed(chunk)
+    if (emit === undefined) return
+    const { block, created } = ensureReasoningBlock()
+    if (created) yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+    // ⚠️ **整块回写**（赋值，不是 `+=`）：helper 内部已累积全部文本。
+    block.text = suppressor.text()
+    yield { type: 'reasoning-delta', index: block.index, text: emit }
+  }
   const toolCalls = new Map<number, {
     index: number
     text: string
@@ -786,12 +858,6 @@ export async function* consumeOpenAiSse(
           : (!gotAnyContent && typeof choice?.message?.content === 'string' ? choice.message.content : undefined)
         if (textDelta !== undefined && textDelta.length > 0) {
           if (typeof deltaContent === 'string' && deltaContent.length > 0) gotAnyContent = true
-          let block = blocks.find(candidate => candidate.kind === 'text')
-          if (block === undefined) {
-            block = { index: nextIndex++, kind: 'text', text: '' }
-            blocks.push(block)
-            yield { type: 'block-start', index: block.index, blockType: 'text' }
-          }
           // 正文死循环守卫（见 `proseLoopGuard` 注释）。
           //
           // ⚠️ 与思考守卫的关键差异：命中后**只停止累积与发射**，**绝不**
@@ -818,54 +884,86 @@ export async function* consumeOpenAiSse(
           // 现改为**收尾无条件调用** `splitThinkTaggedContent`：
           // 它无闭标签时返回 `undefined`，调用方走原路径，
           // 故普通响应仍**逐字节不变**（功能等价，只是多一次字符串扫描）。
-          if (!proseLoopDetected) {
-            // ⚠️ **先归一化再累积**（2026-10-13）：坏标记 `<｜｜DSML｜｜` 若原样
-            //    累积，宿主解析器不认，工具调用整段当正文 —— 模型「停住不动」
-            //    （实测 deepseek-v4.1-flash / step-5-preview）。push() 是流式
-            //    安全的：跨帧的模式由待定缓冲拼齐（见该函数注释）。
-            let delta = dsmlFix.push(textDelta)
-            // ── DSML 工具调用解析（OfficeAce 等走本函数的通道）──
-            // 提取器把 DSML 块从正文里摘出来转成结构化调用；产出的 `text`
-            // 才是真正该显示的正文（标签本身不再下发）。
-            if (dsmlExtractor !== undefined) {
-              const extracted = dsmlExtractor.feed(delta)
-              if (extracted.toolCalls.length > 0) {
-                for (const call of extracted.toolCalls) {
-                  const wireIndex = dsmlWireIndex--
-                  const callId = `dsml_${Math.abs(wireIndex)}`
-                  const block: {
-                    index: number
-                    text: string
-                    callId?: string
-                    name?: string
-                    announced: boolean
-                  } = { index: nextIndex++, text: '', callId, announced: false }
-                  toolCalls.set(wireIndex, block)
-                  toolIds.set(wireIndex, callId)
-                  block.name = call.name
-                  block.text = call.arguments
-                  if (hasUsableToolName(block.name)) {
-                    block.announced = true
-                    toolOrder.push(block.index)
-                    yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
-                    yield {
-                      type: 'tool-call-delta',
-                      index: block.index,
-                      id: ToolCallId(callId),
-                      name: block.name,
-                      argumentsDelta: block.text,
-                    }
+          // ⚠️ **先归一化**（2026-10-13 审计修正）：坏标记 `<｜｜DSML｜｜` 若原样
+          //    累积，宿主解析器不认，工具调用整段当正文 —— 模型「停住不动」
+          //    （实测 deepseek-v4.1-flash / step-5-preview）。push() 是流式
+          //    安全的：跨帧的模式由待定缓冲拼齐（见该函数注释）。
+          //    ⚠️ 归一化**必须留在死循环门禁之外**：门禁只管「可见正文要不要
+          //    继续累积」，而扣住的缓冲是**跨帧状态** —— 跳过一次 push 会让
+          //    待定缓冲与上游流失步，后续帧的标签再也拼不齐。
+          let delta = dsmlFix.push(textDelta)
+          // ── DSML 工具调用 / `<thought>` 解析（OfficeAce 等走本函数的通道）──
+          //
+          // ⚠️⚠️ **必须在死循环门禁之外**（2026-10-13 对抗性审计实测的**真缺陷**）。
+          //
+          // 旧实现把整段 DSML 解析塞在 `if (!proseLoopDetected)` **内部**，
+          // 而同一函数里的标准 `delta?.tool_calls` 分支在**外部** —— 两条
+          // 路径行为不一致。实测（正文循环后紧跟 DSML 块）：
+          //
+          // | 路径 | 命中正文循环后到达的调用 |
+          // |---|---|
+          // | 标准 `tool_calls` | ✅ 照常解析并执行（`finish=tool-calls`）|
+          // | DSML（修复前）| ❌ **整体丢弃**（`tool-calls` 数 0、无报错）|
+          //
+          // 后果与「无报错中断」同型：模型本意要调工具，harness 却报
+          // `max-tokens` 重试、工具永不执行。这与本文件自己写明的设计意图
+          // （上面那段「工具调用在循环正文之后到达且有效，必须照常执行」）
+          // 直接矛盾 —— 修法即让 DSML 与标准路径**同层**：解析不受门禁管辖，
+          // 只有**可见正文的累积与发射**受管辖。
+          if (dsmlExtractor !== undefined) {
+            const extracted = dsmlExtractor.feed(delta)
+            if (extracted.toolCalls.length > 0) {
+              for (const call of extracted.toolCalls) {
+                const wireIndex = dsmlWireIndex--
+                const callId = `dsml_${Math.abs(wireIndex)}`
+                const block: {
+                  index: number
+                  text: string
+                  callId?: string
+                  name?: string
+                  announced: boolean
+                } = { index: nextIndex++, text: '', callId, announced: false }
+                toolCalls.set(wireIndex, block)
+                toolIds.set(wireIndex, callId)
+                block.name = call.name
+                block.text = call.arguments
+                if (hasUsableToolName(block.name)) {
+                  block.announced = true
+                  toolOrder.push(block.index)
+                  yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+                  yield {
+                    type: 'tool-call-delta',
+                    index: block.index,
+                    id: ToolCallId(callId),
+                    name: block.name,
+                    argumentsDelta: block.text,
                   }
                 }
               }
-              delta = extracted.text
             }
-            const fixedDelta = delta
-            block.text += fixedDelta
-            // 归一化可能把整帧都扣进缓冲（fixedDelta 为空）—— 空帧不发。
-            if (fixedDelta.length > 0) {
-              yield { type: 'text-delta', index: block.index, text: fixedDelta }
-            }
+            // ⚠️ **`reasoning` 必须放行**（2026-10-13 审计的**真缺陷**）：
+            //    提取器把 `<thought>…</thought>` 的**内容摘出来**放进
+            //    `reasoning`（正文不再包含它），旧实现只取 `text` 与
+            //    `toolCalls` ⇒ **该段既不在正文也不在 reasoning，凭空消失**。
+            //    codearts 侧（`llm-adapter.ts` 的 `emitDsmlFeed`）两个通道都接，
+            //    本函数漏了一半。`<thought>` 不闭合时更严重：其后全部内容
+            //    滞留缓冲、随 `flush()` 以 `reasoning` 返回后被丢弃 ⇒
+            //    **整段回复消失**（用户看到空响应）。
+            yield* emitReasoningDelta(extracted.reasoning)
+            delta = extracted.text
+          }
+          // 可见正文的累积与发射**受死循环门禁管辖**（与旧行为一致）。
+          //
+          // ⚠️ **建块必须在「确有可见正文」之后**（2026-10-13 审计）：旧实现
+          //    先无条件建块并 `yield block-start`，纯 DSML 响应（提取器把整帧
+          //    都摘成 tool-call、`delta` 为空）于是留下孤儿 `block-start(text)`
+          //    —— 宿主 `BlockAssembler` 会用 `partial.text`（空串）组装出
+          //    `{type:'text',text:''}`，正是本文件自己禁止的空块。
+          if (!proseLoopDetected && delta.length > 0) {
+            const { block, created } = ensureTextBlock()
+            if (created) yield { type: 'block-start', index: block.index, blockType: 'text' }
+            block.text += delta
+            yield { type: 'text-delta', index: block.index, text: delta }
           }
         }
         // 同样必须用 `typeof === 'string'`：reasoning_content 也会显式返回 null。
@@ -892,29 +990,22 @@ export async function* consumeOpenAiSse(
           // 可达性：扫描 281 会话 / **27949 个 attempt**，reasoning 帧与 usage 帧
           // 时间戳完全相同的次数为 **0**（相差 ≤2ms 也为 0）—— 真实流量中不可达，
           // 但修复成本为零，故仍按正确写法实现。
-          if (loopGuard !== undefined) {
-            if (loopGuard.observe(reasoningDelta)) loopDetected = true
-          }
-          if (!loopDetected) {
-            // 纯空白思考：`emit === undefined` ⇒ 本片一个 chunk 都不发，
-            // 于是既不建块、也不消耗 `nextIndex`（见 helper 注释与 `blank-reasoning.spec.ts`）。
-            const emit = suppressor.feed(reasoningDelta)
-            if (emit !== undefined) {
-              let block = blocks.find(candidate => candidate.kind === 'reasoning')
-              if (block === undefined) {
-                block = { index: nextIndex++, kind: 'reasoning', text: '' }
-                blocks.push(block)
-                yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
-              }
-              // ⚠️ **整块回写**（赋值，不是 `+=`）：helper 内部已累积全部文本，
-              // 用 `+=` 会把已发过的部分再写一遍（双写）。
-              block.text = suppressor.text()
-              yield { type: 'reasoning-delta', index: block.index, text: emit }
-            }
-          }
+          //
+          // ⚠️ 与 `<thought>`（`emitReasoningDelta`）**共用同一个 helper 与同一个
+          //    `suppressor`** —— 本适配器的两个 reasoning 出口必须同源，否则
+          //    第二处会从空态重新累积（见 `suppressor` 注释）。
+          yield* emitReasoningDelta(reasoningDelta)
         }
         for (const call of delta?.tool_calls ?? []) {
-          const wireIndex = call.index ?? 0
+          // ⚠️ **必须把不合规的下标挪进非负空间**（2026-10-13 对抗性审计）：
+          //    DSML 侧用负数键（-1/-2…），而上游若真发 `{index:-1}` 就会与
+          //    它撞同一个 Map 键 —— callId 被覆盖、参数被拼成 `{...}{...}`
+          //    非法 JSON ⇒ 误报 max-tokens 触发重试（工具可能重复执行）。
+          //    协议规定 index 是非负整数，此处对越界值做一次归一。
+          const rawIndex = call.index
+          const wireIndex = Number.isInteger(rawIndex) && (rawIndex as number) >= 0
+            ? rawIndex as number
+            : allocUpstreamWireIndex()
           if (typeof call.id === 'string' && call.id.length > 0) toolIds.set(wireIndex, call.id)
           const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
           let block = toolCalls.get(wireIndex)
@@ -1030,7 +1121,6 @@ export async function* consumeOpenAiSse(
    */
   let emittedProse = ''
   // 按创建顺序关闭每个块
-  const textBlock = blocks.find(block => block.kind === 'text')
   for (const index of toolOrder) {
     const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
     // `toolOrder` 只收「名字已可用」的块（见 tool_calls 分支），故此处名字必然
@@ -1063,27 +1153,40 @@ export async function* consumeOpenAiSse(
   // ── DSML 归一化收尾：下发待定缓冲 ──
   // 扣住的尾部（可能是模式前缀）在流结束时必须放行，否则最后几个字符
   // 永远不到达宿主。顺序：先 flush 进累积文本，block-end 才能带上它。
+  // ⚠️ 放行目标用 `ensureTextBlock()`（按需建块）：缓冲里若真有内容，
+  //    就得有块承载它；纯标签残片场景下这段本就不会发（tail 为空）。
   {
     const tail = dsmlFix.flush()
     if (tail.length > 0 && !proseLoopDetected) {
-      const tailBlock = blocks.find(candidate => candidate.kind === 'text')
-      if (tailBlock !== undefined) {
-        tailBlock.text += tail
-        yield { type: 'text-delta', index: tailBlock.index, text: tail }
-      }
+      const { block: tailBlock, created } = ensureTextBlock()
+      if (created) yield { type: 'block-start', index: tailBlock.index, blockType: 'text' }
+      tailBlock.text += tail
+      yield { type: 'text-delta', index: tailBlock.index, text: tail }
     }
   }
-  // ── DSML 提取器收尾：把残留缓冲放行到正文 ──
+  // ── DSML 提取器收尾：把残留缓冲按态放行 ──
   // 未闭合的 DSML 块（流被截断）不能被吞掉，flush() 会补回开标签，
   // 保证用户看到的是完整残片而非凭空消失的一段文本。
+  //
+  // ⚠️ **`flushed.reasoning` 也必须放行**（2026-10-13 审计的真缺陷）：
+  //    `<thought>` 未闭合时，其后**全部内容**都滞留在缓冲里并以 `reasoning`
+  //    返回 —— 只放行 `text` 会让整段回复**凭空消失**（用户看到空响应）。
   if (dsmlExtractor !== undefined) {
     const flushed = dsmlExtractor.flush()
-    const tailBlock = blocks.find(candidate => candidate.kind === 'text')
-    if (flushed.text.length > 0 && tailBlock !== undefined && !proseLoopDetected) {
+    if (flushed.reasoning.length > 0) yield* emitReasoningDelta(flushed.reasoning)
+    if (flushed.text.length > 0 && !proseLoopDetected) {
+      const { block: tailBlock, created } = ensureTextBlock()
+      if (created) yield { type: 'block-start', index: tailBlock.index, blockType: 'text' }
       tailBlock.text += flushed.text
       yield { type: 'text-delta', index: tailBlock.index, text: flushed.text }
     }
   }
+  // ── 两个 flush 之后**才**取正文块 ──
+  // ⚠️ **顺序不可颠倒**：上面两处 flush 都可能在此时**首次**创建正文块
+  //    （纯 DSML / 纯标签响应里正文块此前不存在），若提前捕获引用，新块
+  //    就永远拿不到 `block-end` ⇒ 孤儿 `block-start(text)` ⇒ 宿主
+  //    `BlockAssembler` 用 `partial.text`（空串）组装出空 text 块。
+  const textBlock = blocks.find(block => block.kind === 'text')
   if (textBlock !== undefined) {
     // ── think 标签归位（见 `splitThinkTaggedContent`）──
     //

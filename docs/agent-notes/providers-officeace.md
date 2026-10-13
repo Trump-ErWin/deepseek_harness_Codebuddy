@@ -241,17 +241,55 @@ assistant 消息只有 `reasoning` + `text` 两块、**没有任何 `tool/call` 
   与提示词同处一层；`llm-adapter.ts` 改从共享层导入，删本地副本。
 - `consumeOpenAiSse` 新增可选 `dsmlToolMode`：正文 delta 先过提取器，
   解析出的调用复用既有 tool-call 注册/发射路径（wire 下标取**负数**，
-  与标准 `tool_calls` 的 0/1/2… 天然隔离，不抢槽位）。**默认关闭**，
+  与标准 `tool_calls` 的 0/1/2… 隔离，不抢槽位）。**默认关闭**，
   关闭时行为与从前逐字节一致；收尾 flush 把未闭合残片放行，不吞内容。
-- `officeace-adapter.ts` 注入提示与 `dsmlToolMode` **成对**开启 ——
-  单边存在就等于没修。
+- `officeace-adapter.ts` 由**同一个 `dsmlMode` 开关**同时驱动两半
+  （注入提示 + 传 `dsmlToolMode`）—— 单边存在就等于没修。
 
-### 守卫（`tests/unit/dsml-parse-roundtrip.spec.ts`）
+### ⚠️⚠️ OfficeAce **默认不走 DSML**（2026-10-13 三次事故后决定）
 
-- **二分帧穷举**：整块按**每一个切分点**断开喂入，都必须解析出调用、
-  且标签不泄漏进可见正文（DSML 标签必然跨帧，只测整块等于没测）。
-- 成对性：注入了 `buildDsmlSystemPrompt` 的文件必须同时出现 `dsmlToolMode`。
-- 截断残片：无闭标签时 `flush()` 补回开标签，不得吞掉用户可见内容。
+`officeace-adapter.ts` 的 `dsmlMode` **默认 `false`**，只有
+`OFFICEACE_DSML=1` 且模型匹配 `needsDsmlToolMode` 时才为真。
+
+| 开关 | 「教」= 注入 `buildDsmlSystemPrompt` | 「解」= 传 `dsmlToolMode` | 请求体 |
+|---|---|---|---|
+| 默认（未设 env）| ✗ | ✗ | 发标准 `tools` 字段 |
+| `OFFICEACE_DSML=1` | ✓（且不发 `tools`）| ✓ | 只发注入的 system 提示 |
+
+**为何默认关**：DSML 把工具协议从「框架保证的结构化字段」降级成「模型自觉
+遵守的文本约定」，而 `deepseek-v4.1-flash` 经本渠道**无法稳定遵循** —— 三轮
+迭代（注入提示 → 大小写判定 → `calls` 别名兼容）全部到位后，模型仍在同一轮
+里混写 `<｜DSML｜tool_calls>` 与 `<｜DSML｜ calls>`；更常见的是**压根不发工具
+调用**，只输出「我这就去查：」然后结束（用户视角 = 「Agent 不干活」）。
+两害相权：标准 `tools` 字段下**工具必定可用**，超时风险留给需要它的场景权衡。
+
+⚠️ 故本节描述的「解析接线」在**默认配置下不执行** —— 它是为
+`OFFICEACE_DSML=1` 那条路径准备的。**codearts 通道不受本开关影响**，
+`needsDsmlToolMode` 在那边仍是恒开（见 `llm-adapter.ts`）。
+
+### 守卫
+
+行为级（**真喂 SSE 流、断言 chunk**）：
+`tests/unit/dsml-consume-wiring.spec.ts` —— 这是**唯一**能证明接线通了的守卫。
+
+- ① / ②：开启时解析出 tool-call、关闭时**逐字节**保持旧行为（对照）。
+- ③：逐字符分帧（标签必然跨帧，只测整块等于没测）。
+- ④ / ⑤：开标签**别名**端到端；⑤ 专门覆盖 `\s*` 的**多空白**形态
+  （`<｜DSML｜␣␣calls>` / `\t` / U+3000）—— 枚举式保留候选会在此提前放行。
+- ⑥ / ⑦：`<thought>` 内容归位到 reasoning；未闭合时残片也须放行。
+- ⑧：**正文死循环命中后到达的 DSML 调用仍须执行**。
+- ⑨：纯 DSML 响应不得留下孤儿 `block-start(text)`。
+- ⑩：上游不合规的 `index:-1` 不得与 DSML 的负数下标撞车。
+- ⑪：名字不可用的调用一个 chunk 都不发（报 max-tokens 而非静默 stop）。
+
+源码级（强度有限，只能防「整段协议被删」）：
+`tests/unit/dsml-parse-roundtrip.spec.ts` 的 ⑥（**剥注释后**断言
+`buildDsmlSystemPrompt(` 与 `dsmlToolMode: true` 各≥2 处）、⑦⑧⑨。
+
+⚠️ **两组的强度差异必须如实标注**：源码 grep **挡不住「删掉接线、保留注释」**
+—— 2026-10-13 审计实测，删掉 `openai-compat.ts` 里
+`if (dsmlExtractor !== undefined) {…}` **整块**后，当时的入库用例**全部仍绿**
+（只有钉住构造那一行的 ⑨ 才红）。这正是必须另立行为级 spec 的原因。
 
 ⚠️ 与 §6 的 `reasoning-delta` 归一化缺口是**两件事**：那条是「标记写坏了要修」，
 本条是「协议根本没接全」。

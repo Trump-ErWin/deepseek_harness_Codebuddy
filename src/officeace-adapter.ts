@@ -343,6 +343,10 @@ export class OfficeAceAdapter extends LlmAdapter {
      *
      *    确需开启（例如实测本渠道不再触发 60s 断连）时，设环境变量
      *    `OFFICEACE_DSML=1` 后重启 dsh。
+     *
+     * ⚠️ **本开关同时驱动「教」与「解」两半**（注入提示 + 传给
+     * `consumeOpenAiSse` 的解析开关），**不得只改一处** —— 单边存在时
+     * 模型写的 DSML 无人解析，工具调用会整段当正文显示。
      */
     let dsmlMode = false
     if (process.env.OFFICEACE_DSML === '1'
