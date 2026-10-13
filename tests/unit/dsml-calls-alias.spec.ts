@@ -31,7 +31,6 @@ import {
   needsDsmlToolMode,
 } from '../../src/dsml.js'
 
-const BAR = '\uFF5C'
 /** 拼一个规范的 DSML 块。 */
 function block(body: string): string {
   return `${DSML_TOOL_CALLS_OPEN}${body}${DSML_TOOL_CALLS_CLOSE}`

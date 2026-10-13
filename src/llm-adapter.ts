@@ -314,15 +314,6 @@ import {
   DsmlContentExtractor,
   isDeepseekV4Model,
   needsDsmlToolMode,
-  parseDsmlToolCalls,
-  DSML_INVOKE_CLOSE,
-  DSML_INVOKE_OPEN_PREFIX,
-  DSML_PARAM_CLOSE,
-  DSML_PARAM_OPEN_PREFIX,
-  DSML_TOOL_CALLS_CLOSE,
-  DSML_TOOL_CALLS_OPEN,
-  THOUGHT_CLOSE,
-  THOUGHT_OPEN,
 } from './dsml.js'
 
 /**

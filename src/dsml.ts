@@ -83,18 +83,6 @@ export function needsDsmlToolMode(model: string, _toolNames: readonly string[]):
   return isDeepseekV4Model(model) || /^deepseek-v4\.\d+-(flash|pro)$/i.test(model)
 }
 
-/**
- * 构造让模型以原生 DSML 格式调用工具的 system 提示。
- *
- * 用法：适配器**不**发送 `tools` 字段（否则模型走标准 tool_calls 一次性
- * 打包路径），而是把 OpenAI function schema 以文本注入 system 消息，并明确
- * 要求模型使用 {@link DSML_TOOL_CALLS_OPEN} 语法。
- *
- * ⚠️ **注入位置有讲究**（实测 2026-08-22）：应置于 system 之后、user 之前
- *    （与 CodeArts Agent IDE 实际请求体一致）。push 到 messages 末尾时，
- *    deepseek-v4 倾向把思考写入正文而非 `reasoning_content`；unshift 到
- *    user 之前后恢复走 reasoning 通道，思考不再泄漏到正文。
- */
 // ══════════════════════════ 解析侧 ══════════════════════════
 //
 // ⚠️ **2026-10-13 迁移**：整套解析器原先只在 `llm-adapter.ts`（codearts）
@@ -103,6 +91,10 @@ export function needsDsmlToolMode(model: string, _toolNames: readonly string[]):
 //    模型写出的 DSML 文本**无人解析**，照样整段当正文 —— 用户报「还是不行」。
 //
 //    故解析器必须与提示词**同处一个共享层**：教得会、也解得开。
+//
+// ⚠️ **解析侧与提示词（`buildDsmlSystemPrompt`）刻意同处本文件**：协议的
+//    「写法」与「读法」只有一份定义，才不会出现「提示教 A、解析认 B」而
+//    静默失效（这正是本通道连续三次事故的共同病根）。
 
 export const DSML_PARAM_OPEN_PREFIX = '<｜DSML｜parameter'
 export const DSML_PARAM_CLOSE = '</｜DSML｜parameter>'
@@ -216,9 +208,39 @@ export function parseDsmlToolCalls(block: string): Array<{ name: string; argumen
 }
 
 /**
+ * `｜DSML｜` 之后允许**任意空白**（归一正则用 `\s*`），因此「别名候选」
+ * **不能用有限字符串枚举** —— 枚举必然漏掉多空格 / `\t` / U+3000 等形态。
+ *
+ * 实测（2026-10-13 对抗性审计）：`<｜DSML｜  calls>`（**两个空格**）逐字符
+ * 拆帧时，归一正则当帧还匹配不上（`calls>` 尚未到齐），而保留候选只有
+ * **单空格**的枚举项 ⇒ 标签被**提前放行** ⇒ 整段当正文、工具永不执行；
+ * `\t` / U+3000 同型。**整帧到达时一概不复现**，故只测整块的用例挡不住。
+ *
+ * ⚠️ **只认「开标签」前缀，绝不能把前导 `/` 也算进来**（2026-10-13 回归）：
+ * 判据一旦接受 `</…`，正文/推理里**已写完的闭标签**（如模型在解释协议时
+ * 引用 `</｜DSML｜tool_calls>`）就会被当成「未完成的标签前缀」扣进缓冲，
+ * 收尾再以 `text` 放行 ⇒ **闭标签从 reasoning 泄漏进正文**
+ * （`llm-adapter.spec.ts` 的「does not leak DSML tags from reasoning to
+ * text via visible fallback」实测变红）。闭标签的空白形态由 `feed()` 开头
+ * 的 `replace` 负责归一，**不需要**靠保留候选兜。
+ */
+function isDsmlLabelPrefix(tail: string): boolean {
+  return /^<｜DSML｜\s*(?:t(?:o(?:o(?:l_?)?)?)?)?(?:c(?:a(?:l(?:l(?:s)?)?)?)?)?>?$/.test(tail)
+}
+
+/**
  * 计算缓冲区末尾与任一开标签的最长公共前缀长度。流式提取器据此决定保留
  * 多少缓冲区等待下次 feed：末尾若是某开标签的不完整前缀（`<tho` 跨 chunk），
  * 保留该前缀；否则全部放行，避免短文本被过度缓冲。
+ *
+ * 判据 = 字符串前缀枚举 **并上** {@link isDsmlLabelPrefix}（覆盖 `\s*` 形态）。
+ *
+ * ⚠️ **别名那一路必须从「最后一个 `<`」起判，不能按固定长度窗口扫**
+ * （2026-10-13 自审修正）：`｜DSML｜` 之后的空白是 `\s*`，**长度无上限**，
+ * 任何固定 `maxCheck` 都会被「空白够多」绕过 —— 例如
+ * `<｜DSML｜` + 20 个空格 + `calls>` 总长 33 字符，窗口只回看 32 字符时
+ * 连开头的 `<` 都够不着 ⇒ 判据不命中 ⇒ 标签被**提前放行**。
+ * 从最后一个 `<` 起判则与空白长度无关（`lastIndexOf` 是 O(n)，无额外成本）。
  */
 function longestOpenPrefixTail(buffer: string, prefixes: readonly string[]): number {
   let keepLen = 0
@@ -226,6 +248,11 @@ function longestOpenPrefixTail(buffer: string, prefixes: readonly string[]): num
   for (let i = 1; i <= maxCheck; i++) {
     const tail = buffer.slice(buffer.length - i)
     if (prefixes.some(p => p.startsWith(tail))) keepLen = i
+  }
+  const lastLt = buffer.lastIndexOf('<')
+  if (lastLt !== -1) {
+    const tail = buffer.slice(lastLt)
+    if (isDsmlLabelPrefix(tail) && tail.length > keepLen) keepLen = tail.length
   }
   return keepLen
 }
@@ -359,6 +386,22 @@ export class DsmlContentExtractor {
   }
 }
 
+/**
+ * 构造让模型以原生 DSML 格式调用工具的 system 提示。
+ *
+ * 用法：适配器**不**发送 `tools` 字段（否则模型走标准 tool_calls 一次性
+ * 打包路径），而是把 OpenAI function schema 以文本注入 system 消息，并明确
+ * 要求模型使用 {@link DSML_TOOL_CALLS_OPEN} 语法。
+ *
+ * ⚠️ **必须与解析侧（{@link DsmlContentExtractor}）成对启用**：本函数只
+ *    负责「教模型怎么写」，`DsmlContentExtractor` 负责「把它读回来」。
+ *    只教不解 ⇒ 模型写出的 DSML 整段当正文显示、工具永不执行。
+ *
+ * ⚠️ **注入位置有讲究**（实测 2026-08-22）：应置于 system 之后、user 之前
+ *    （与 CodeArts Agent IDE 实际请求体一致）。push 到 messages 末尾时，
+ *    deepseek-v4 倾向把思考写入正文而非 `reasoning_content`；unshift 到
+ *    user 之前后恢复走 reasoning 通道，思考不再泄漏到正文。
+ */
 export function buildDsmlSystemPrompt(tools: DsmlToolSpec[]): string {
   const toolJson = JSON.stringify(tools.map((tool) => ({
     name: tool.function.name,
