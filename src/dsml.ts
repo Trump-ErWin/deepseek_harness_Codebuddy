@@ -43,6 +43,78 @@ export const DSML_INVOKE_OPEN_PREFIX = '<｜DSML｜invoke'
 /** 单个 invoke 块的闭标签。 */
 export const DSML_INVOKE_CLOSE = '</｜DSML｜invoke>'
 
+/**
+ * 把**一个** DSML 标签名的**两侧空白**压成规范形。
+ *
+ * 输入形如 `<｜DSML｜ invoke name="x">` 或 `</｜DSML｜ parameter>`，输出
+ * `<｜DSML｜invoke name="x">` / `</｜DSML｜parameter>`。
+ *
+ * ⚠️⚠️ **这是本文件 2026-10-13 三次事故的共同病根**：模型（实测
+ * `deepseek-v4.1-flash` 经 codearts 与 officeace 两家）会在 `｜DSML｜`
+ * **之后**插入空白 —— `tool_calls` 之外，`invoke` / `parameter` 同样中招
+ * （现场逐字：`<｜DSML｜ invoke name="pwsh">`、`<｜DSML｜ parameter
+ * name="command" string="true">`）。而此前别名归一**只覆盖 `calls` /
+ * `tool_calls` 一种名字**，`invoke` / `parameter` 的空白形态**从未被归一**
+ * ⇒ `DSML_INVOKE_OPEN_PREFIX`（`<｜DSML｜invoke`）的 `indexOf` 恒不命中
+ * ⇒ `parseDsmlToolCalls` 返回**空数组**（不是 undefined）⇒ 调用方把整块
+ * 当成「解析成功但无调用」⇒ **内容凭空消失**（用户看到「模型很快就结束
+ * 了，没有原因」）。
+ *
+ * 故此处对**任意标签名**做归一（`[a-zA-Z_][\w-]*`），名字白名单由调用方
+ * 自己决定 —— 本函数不认识协议，只修「空白」这一种笔误。
+ */
+export function normalizeDsmlLabel(tag: string): string {
+  // `(<\/?)` 捕获开/闭标签的 `<` 或 `</`，拼回去时保持原样。
+  // `\s*` 覆盖任意空白（含 `\t` / U+3000 / 换行），长度无上限。
+  // `([a-zA-Z_][\w-]*)` 是标签名，其后原样保留（可能是 `>`、` name="…">` 等）。
+  // 两侧各 `｜{1,}`：**独立**容忍左/右任意根竖线（实测有左双右单、
+  // 左单右双两种混合形态），且单竖线规范形天然命中（`{1,}` 含 1）。
+  // 本函数是**导出**的，可能被单独调用（不走 `normalizeDsmlText` 的前置
+  // 归一），故自己也要容错。
+  return tag.replace(/(<\/?)｜+DSML｜+\s*([a-zA-Z_][\w-]*)/g, '$1｜DSML｜$2')
+}
+
+/**
+ * 对**整段文本**做 DSML 协议级归一：双竖线、别名（`calls` → `tool_calls`）
+ * 与标签空白（`<｜DSML｜ invoke` → `<｜DSML｜invoke`）一次做完。
+ *
+ * 三种笔误都来自实测（2026-10-13）：
+ *
+ * | 形态 | 受害模型 | 不修的后果 |
+ * |---|---|---|
+ * | `<｜｜DSML｜｜` 双竖线 | deepseek-v4.1-flash / step-5-preview | 宿主解析器不认 ⇒ 标签当正文 |
+ * | `<｜DSML｜ calls>` 缺 `tool_` | deepseek-v4.1-flash | 开闭标签不匹配 ⇒ 永不进 in-dsml |
+ * | `<｜DSML｜ invoke` / `parameter` 带空白 | deepseek-v4.1-flash | `indexOf(invoke)` 不命中 ⇒ **内容凭空消失** |
+ *
+ * ⚠️ **顺序有意为之**：先双竖线、再别名、最后空白。双竖线必须先修
+ * （否则 `<｜｜DSML｜｜ calls>` 里的双竖线会让后续 `｜DSML｜` 定位失败）；
+ * 别名与空白互相独立，交换顺序结果相同（均幂等）。
+ *
+ * 用于 `feed()` 的整段入口；**流式增量**不能用它（模式会跨帧），那是
+ * `createDsmlMarkerNormalizer` 的职责。
+ *
+ * ⚠️⚠️ **本函数的双竖线规则与 `sse.ts` 的 `fixDsmlMarkers` 逐字同源**
+ * （同两条正则、同一条 `DSML` 后边界前视）。**两份实现是不得已的分叉**：
+ * `feed()` 拿到的 buffer 是**累积后的完整片段**（不是流式增量），而
+ * `sse.ts` 那份要服务 8 个适配器的逐帧路径。判据分叉的代价由
+ * `dsml-label-forms.spec.ts` ⑦ 的「两份判据必须一致」对拍锁死 ——
+ * 改任一条正则时**必须同步另一条**，否则「教得会、解不开」会以另一种
+ * 形态复发（正是本文件四次事故的共同病根）。
+ */
+export function normalizeDsmlText(text: string): string {
+  // ⚠️ 前视里的 `[tcip]` 是**协议标签名首字母**（`t`ool_calls / `c`alls /
+  //    `i`nvoke / `p`arameter / `t`hought），与 `sse.ts` 的 `fixDsmlMarkers`
+  //    逐字同源。少了它，右侧双竖线后紧跟字母的实测形态
+  //    （`<｜DSML｜｜invoke …>`）一条都修不了 —— 详见该函数的注释。
+  const AFTER = '(?=｜|\\s|>|\\/|$|[tcip])'
+  const fixedBars = text
+    .replace(new RegExp(`(<\\/?)｜{2,}DSML${AFTER}`, 'g'), '$1｜DSML')
+    .replace(new RegExp(`DSML｜{2,}${AFTER}`, 'g'), 'DSML｜')
+  return normalizeDsmlLabel(
+    fixedBars.replace(/(<\/?)｜DSML｜\s*(?:tool_)?calls>/g, '$1｜DSML｜tool_calls>'),
+  )
+}
+
 /** OpenAI function 形态的工具定义（构造提示用）。 */
 export interface DsmlToolSpec {
   type: string
@@ -142,9 +214,24 @@ function tryParseScalar(value: string): unknown {
   return value
 }
 
-/** 解析单个 DSML invoke 块为 { name, arguments }。 */
+/**
+ * 解析单个 DSML invoke 块为 { name, arguments }。
+ *
+ * ⚠️ **工具名必须从 `invoke` 开标签里取，不能整块搜第一个 `name=`**
+ * （2026-10-13 真缺陷）：旧实现用 `/name\s*=\s*"([^"]*)"/.exec(block)`
+ * 在**整块**上找第一个匹配，而 `block` 里 invoke 开标签之后紧跟
+ * `<｜DSML｜parameter name="command" …>` —— 当模型漏写 invoke 的 name
+ * （`<｜DSML｜invoke>`）时，第一个 `name=` 命中 **parameter 名**
+ * ⇒ 工具名变成 `command`/`path`/`pattern` 这类参数名 ⇒
+ * `unknown tool "command"`（工具永不执行，且报错信息毫无线索）。
+ * 故先切出 invoke 开标签（`<｜DSML｜invoke …>` 到第一个 `>`），只在
+ * **那一段**上找 name；找不到就返回 undefined（调用方回退为纯文本）。
+ */
 function parseDsmlInvoke(block: string): { name: string; arguments: string } | undefined {
-  const nameMatch = /name\s*=\s*"([^"]*)"/.exec(block)
+  const openEnd = block.indexOf('>')
+  if (openEnd === -1) return undefined
+  const openTag = block.slice(0, openEnd + 1)
+  const nameMatch = /name\s*=\s*"([^"]*)"/.exec(openTag)
   if (nameMatch === null) return undefined
   const name = nameMatch[1]
   const params: Record<string, unknown> = {}
@@ -184,9 +271,31 @@ function parseDsmlInvoke(block: string): { name: string; arguments: string } | u
 /**
  * 从一段已闭合的 DSML tool_calls 块中解析所有 invoke，返回结构化
  * tool-call 列表。返回 undefined 表示解析失败（调用方应回退为纯文本）。
+ *
+ * ⚠️⚠️ **空数组 ≠ 解析失败，但它必须被调用方区别对待**（2026-10-13 真缺陷）。
+ *
+ * 旧语义把 `[]` 当「解析成功、只是没有调用」，而 `feed()` 的 `in-dsml`
+ * 分支据此**静默丢弃整块** —— 实测现场：模型输出
+ * `<｜DSML｜ invoke …>`（`｜DSML｜` 后带空白）时，归一只覆盖
+ * `tool_calls`/`calls`，`indexOf(DSML_INVOKE_OPEN_PREFIX)` 恒不命中
+ * ⇒ 循环一次都不进 ⇒ 返回 `[]` ⇒ 整段工具调用**凭空消失**，
+ * 用户看到「模型很快就结束了，没有原因」（reasoning 在、正文只剩一句、
+ * `finish=stop`、零 tool-call）。
+ *
+ * 归一化修好后 `invoke` 空白形态能进循环，但**空块仍是合法输入**
+ * （模型写了 `<｜DSML｜tool_calls></｜DSML｜tool_calls>` 却什么都没调）
+ * —— 故这里保持返回 `[]`，由 `feed()` 按下方规则分流：
+ * **一个 invoke 都没解析到时整块作为正文放行**，绝不静默吞掉。
  */
 export function parseDsmlToolCalls(block: string): Array<{ name: string; arguments: string }> | undefined {
-  let inner = block
+  // ⚠️ **入口先自保一次归一**（2026-10-13 真缺陷）：本函数是**导出**的，
+  //     除 `feed()` 外还有别处直接调用（测试、将来的新通道）。旧实现假定
+  //     调用方已经归一过，于是 `<｜DSML｜ invoke …>`（带空白）形态经
+  //     `feed()` 修好后、从本函数直接进却仍返回 `[]` —— 两处行为不一致，
+  //     而「不一致」正是本仓库反复出事的那类缺陷。归一是幂等的，规范形
+  //     再过一遍逐字节不变，故这里无条件做一次。
+  const normalized = normalizeDsmlText(block)
+  let inner = normalized
   if (inner.startsWith(DSML_TOOL_CALLS_OPEN)) inner = inner.slice(DSML_TOOL_CALLS_OPEN.length)
   if (inner.endsWith(DSML_TOOL_CALLS_CLOSE)) inner = inner.slice(0, inner.length - DSML_TOOL_CALLS_CLOSE.length)
   const calls: Array<{ name: string; arguments: string }> = []
@@ -224,8 +333,63 @@ export function parseDsmlToolCalls(block: string): Array<{ name: string; argumen
  * text via visible fallback」实测变红）。闭标签的空白形态由 `feed()` 开头
  * 的 `replace` 负责归一，**不需要**靠保留候选兜。
  */
+/**
+ * 判据：缓冲区尾部是否可能是**某个 DSML 开标签的未完成前缀**。
+ *
+ * 覆盖四类实测形态（2026-10-13）：
+ *
+ * | 形态 | 例 | 为什么必须扣住 |
+ * |---|---|---|
+ * | 规范开标签 | `<｜DSML｜tool_calls>` | 标准路径 |
+ * | 别名（缺 `tool_`） | `<｜DSML｜ calls>` | `indexOf` 不认 |
+ * | 任意标签名 + 空白 | `<｜DSML｜ invoke` / `<｜DSML｜␣␣parameter` | 空白长度无上限 |
+ * | **双竖线坏标记** | `<｜｜DSML｜｜tool_calls>` | 归一正则要等 buffer 拼齐才匹配 |
+ *
+ * ⚠️ **双竖线那一类极易漏**（本文件 2026-10-13 补记）：逐字符拆帧时 buffer
+ * 永远只有 1~2 个字符（`<`、`<｜`、`<｜｜`…），`normalizeDsmlText` 的
+ * `｜{2,}DSML` **根本匹配不上**（`DSML` 还没到）⇒ 若判据不认 `<｜｜`，
+ * 它就被当普通正文放行，其后每个字符都跟着放行 ⇒ 整段双竖线标记漏到正文
+ * （实测：`text += "<｜｜"` 之后逐字符如数放行，工具调用全丢）。
+ *
+ * ⚠️ **只认「开标签」前缀，绝不能把前导 `/` 也算进来**（2026-10-13 回归）：
+ * 判据一旦接受 `</…`，正文/推理里**已写完的闭标签**（如模型在解释协议时
+ * 引用 `</｜DSML｜tool_calls>`）就会被当成「未完成的标签前缀」扣进缓冲，
+ * 收尾再以 `text` 放行 ⇒ **闭标签从 reasoning 泄漏进正文**
+ * （`llm-adapter.spec.ts` 的「does not leak DSML tags from reasoning to
+ * text via visible fallback」实测变红）。闭标签的空白形态由 `feed()` 开头
+ * 的归一负责，**不需要**靠保留候选兜。
+ */
 function isDsmlLabelPrefix(tail: string): boolean {
-  return /^<｜DSML｜\s*(?:t(?:o(?:o(?:l_?)?)?)?)?(?:c(?:a(?:l(?:l(?:s)?)?)?)?)?>?$/.test(tail)
+  // 分两段判，因为「竖线」与 `DSML` 名字本身在没到齐时也必须扣住：
+  //
+  // ① `^<｜{0,3}$` —— 只有 `<` 加 0~3 根竖线（`<`、`<｜`、`<｜｜`、`<｜｜｜`）。
+  //    逐字符拆帧时 buffer 恒在「竖线已到、`DSML` 未到」这个状态，
+  //    归一正则的 `｜{2,}DSML` 匹配不上 ⇒ 不判这一段就会把 `<｜｜` 当正文
+  //    放行，其后每个字符跟着放行 ⇒ 整段双竖线标记漏到正文、工具全丢。
+  //    ⚠️ **上界 3 是刻意的**：实测坏标记是双竖线，三根留一根冗余容错。
+  //      不写 `｜+`（无上界）是因为那会把正文里任意长的 `<｜｜｜｜｜`
+  //      也扣住不放 —— 宁可放过四根以上的异常形态，也不无限期扣留正文。
+  // ② `^<｜+D(?:S(?:M(?:L)?)?)?…` —— `DSML` 路径。
+  //    ⚠️⚠️ **两侧必须是 `｜+` 而不是 `｜{2,}`**（2026-10-13 实测回归）：
+  //    初版写成 `｜{2,}` 只想覆盖双竖线坏标记，结果**漏掉了规范的单竖线
+  //    形态**（`<｜DSML｜ tool_calls>` / `<｜DSML｜  calls>`）—— 而它恰是
+  //    最常见的一种（多空白别名走的就是这条路）⇒ `isDsmlLabelPrefix` 返回
+  //    false ⇒ `keepLen=0` ⇒ 标签被**提前放行** ⇒ 整段当正文、工具永不执行
+  //    （`dsml-consume-wiring.spec.ts` ⑤ 实测变红）。
+  //    `｜+` 同时覆盖单竖线（规范）与双竖线（坏标记），两侧独立伸缩。
+  //    `DSML` 四字符用 `(?:D(?:S(?:M(?:L)?)?)?)?` 逐级可选 —— 它本身也可能
+  //    被拆帧切开（实测逐字符时 `<｜D`、`<｜DS`、`<｜DSM` 都会出现）。
+  //    其后右侧竖线（`｜*`）、空白（`\s*`）、标签名（`[a-zA-Z_][\w-]*`）、
+  //    `>` 的任意未完成组合同理放开。
+  //
+  // `[a-zA-Z_][\w-]*` 放开到任意标签名（`tool_calls` / `calls` / `invoke` /
+  // `parameter` / `thought` …），与 {@link normalizeDsmlLabel} 的名字规则
+  // 逐字一致 —— 两处若漂移，「判据扣住的名字」与「归一改得动的名字」就会
+  // 不一致（那正是本文件三次事故的共同病根）。
+  if (/^<｜{0,3}$/.test(tail)) return true
+  // 右侧竖线上界 3（与 ① 同口径：实测坏标记是双竖线，三根冗余容错，
+  // 无上界会把正文里任意长的竖线串也扣住不放）。
+  return /^<｜+D(?:S(?:M(?:L)?)?)?(?:｜{0,3}|\s|[a-zA-Z_][\w-]*|>)*$/.test(tail)
 }
 
 /**
@@ -295,13 +459,16 @@ export class DsmlContentExtractor {
     let reasoning = ''
     const toolCalls: Array<{ name: string; arguments: string }> = []
     this.buffer += chunk
-    // ── 开标签别名归一（2026-10-13）──
+    // ── 协议级归一（2026-10-13 三次事故的修法）──
     // `<｜DSML｜ calls>` / `<｜DSML｜calls>` / `<｜DSML｜ tool_calls>`
-    // 一律改写为规范形 `<｜DSML｜tool_calls>`，后续 indexOf 才认。
-    // ⚠️ 必须放在 buffer 累积**之后**：别名可能被拆成多帧到达，只有等
-    //    buffer 拼齐才改得动（这也是不能用 sse.ts 逐帧归一化器的原因）。
-    // 幂等：规范形再过一遍，`(?:tool_)?calls` 命中后重建出同一字符串。
-    this.buffer = this.buffer.replace(/(<\/?)｜DSML｜\s*(?:tool_)?calls>/g, '$1｜DSML｜tool_calls>')
+    // 一律改写为规范形 `<｜DSML｜tool_calls>`，后续 indexOf 才认；
+    // **同时**把 `｜DSML｜` 之后的空白从**每一个**标签名上压掉
+    // （`<｜DSML｜ invoke` → `<｜DSML｜invoke`、`<｜DSML｜ parameter` →
+    // `<｜DSML｜parameter`）—— 后者是「内容凭空消失」那条缺陷的直接根因。
+    // ⚠️ 必须放在 buffer 累积**之后**：别名与空白形态都可能被拆成多帧到达，
+    //    只有等 buffer 拼齐才改得动（这也是不能用 sse.ts 逐帧归一化器的原因）。
+    // 幂等：规范形再过一遍，两个正则命中后重建出同一字符串。
+    this.buffer = normalizeDsmlText(this.buffer)
     for (;;) {
       if (this.state === 'normal') {
         const thoughtIdx = this.buffer.indexOf(THOUGHT_OPEN)
@@ -356,8 +523,26 @@ export class DsmlContentExtractor {
       if (closeIdx === -1) break
       const block = this.buffer.slice(0, closeIdx + DSML_TOOL_CALLS_CLOSE.length)
       const parsed = parseDsmlToolCalls(block)
-      if (parsed === undefined) {
-        // 解析失败：整块作为纯文本放行，避免吞内容
+      // ⚠️⚠️ **`parsed.length === 0` 也必须整块放行**（2026-10-13 真缺陷）。
+      //
+      // 旧实现只判 `parsed === undefined`，把 `[]`（一个 invoke 都没解析到）
+      // 当成「解析成功、只是没有调用」⇒ **整块被静默丢弃**。实测现场
+      // （session-bac90b72 seq=47，codearts/deepseek-v4.1-flash）：模型输出
+      // `<｜DSML｜ invoke …>` / `<｜DSML｜ parameter …>`（`｜DSML｜` 后带空白，
+      // 而归一只覆盖 `tool_calls`/`calls` 名字）⇒ `indexOf(invoke)` 恒不命中
+      // ⇒ `parseDsmlToolCalls` 返回 `[]` ⇒ 整段工具调用消失，用户看到
+      // 「模型很快就结束了，没有原因」（reasoning 在、正文只剩一句、
+      // `finish=stop`、零 tool-call、usage 全 0）。
+      //
+      // 放行方向遵循本仓库元规则「**宁可漏判不可误伤**」：宁可让一段坏 DSML
+      // 以**原文**显示给用户（看得见、可诊断），也绝不可让它凭空消失
+      // （用户只会以为模型坏了，且没有任何线索）。
+      //
+      // ⚠️ 合法空块（模型写了开闭标签却什么都没调）也走这一支 —— 那种
+      // 情形下放行原文同样是对的：用户该看到「模型想调工具但没调」，
+      // 而不是一片空白。
+      if (parsed === undefined || parsed.length === 0) {
+        // 解析失败或零调用：整块作为纯文本放行，避免吞内容
         text += block
       } else {
         toolCalls.push(...parsed)
