@@ -23,6 +23,44 @@ import { consumeOpenAiSse, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
 import { buildDsmlSystemPrompt, needsDsmlToolMode, type DsmlToolSpec } from './dsml.js'
 
+/**
+ * 推理/探测该用哪个 host —— **必须优先用凭据里按账号下发的 `maasBaseUrl`**。
+ *
+ * ## ⚠️⚠️ 这是一个阻断级真实缺陷（2026-10-13 真机实测）
+ *
+ * 症状：Jet Hub 里 provider 列表**有** OfficeAce、账号也在，但**对话的模型选择器里
+ * 一个 OfficeAce 模型都看不到**。
+ *
+ * 根因：适配器原先一律打硬编码的 `OFFICEACE.defaultBaseUrl`
+ *（`https://officeace.cn-southwest-2.huaweicloud-agentarts.com`），
+ * 而华为**按账号下发专属网关** `modelgw-0004.officeace.cn-southwest-2...`。
+ * 同一个 Basic 凭据实测：
+ *
+ * | host | `/v2/models` | `/v2/chat/completions` |
+ * |---|---|---|
+ * | `officeace…`（硬编码）| **401** `APIG.1009 AppKey or AppSecret is invalid` | **401** |
+ * | `modelgw-0004.officeace…`（凭据里）| **200** | **200** |
+ *
+ * 后果链：`probe` 401 ⇒ `listModels` 返回 `[]` ⇒ 模型选择器**空分组**；
+ * 且 `listModels` 的空返回与「无账号」**同形**，故「目录门控」会把整个
+ * provider 隐藏 —— 用户看到的就是「加了账号却没有模型」。
+ *
+ * ⚠️ 字段其实早就写进了凭据（`fetchModelInfo` 从云侧 `model_api_url_base` 取），
+ *    只是**从没被读过** —— 属「写了不读的死字段」，我在此前审计中已登记为
+ *    已知缺口并**低估了它**（判为影响有限），真机证明它是主路径。
+ *
+ * ⚠️ **只用于 Basic 鉴权的推理/探测路径**。V11 签名那套（`/v1/subscription`、
+ *    `/v1/model-token-rates`）实测**两个 host 都存在且都要求签名**，
+ *    属管理面 API，**不要**一起改。
+ *
+ * @returns 规范化（去尾斜杠）后的 base URL；凭据没带时回退默认域（零行为变化）。
+ */
+export function maasBaseUrlOf(credential: OfficeAceCredential): string {
+  const raw = typeof credential.maasBaseUrl === 'string' ? credential.maasBaseUrl.trim() : ''
+  const base = raw.length > 0 ? raw : OFFICEACE.defaultBaseUrl
+  return base.replace(/\/+$/, '')
+}
+
 export interface OfficeAceAdapterOptions {
   /** 凭据（测试注入）；缺省每次从本机读取。 */
   credentialProvider?: () => Promise<OfficeAceCredential | undefined>
@@ -184,7 +222,7 @@ export class OfficeAceAdapter extends LlmAdapter {
     const timer = setTimeout(() => ctrl.abort(), 8_000)
     try {
       const f = this.options.fetchImpl ?? fetch
-      const r = await f(`${OFFICEACE.defaultBaseUrl}${OFFICEACE.modelsPath}`, {
+      const r = await f(`${maasBaseUrlOf(credential)}${OFFICEACE.modelsPath}`, {
         headers: { Authorization: basicAuthorization(credential) },
         signal: ctrl.signal,
       })
@@ -373,7 +411,7 @@ export class OfficeAceAdapter extends LlmAdapter {
     })
 
     try {
-      const response = await f(`${OFFICEACE.defaultBaseUrl}${OFFICEACE.chatPath}`, {
+      const response = await f(`${maasBaseUrlOf(credential)}${OFFICEACE.chatPath}`, {
         method: 'POST',
         headers: {
           Authorization: basicAuthorization(credential),
@@ -393,7 +431,7 @@ export class OfficeAceAdapter extends LlmAdapter {
           await this.options.refresh().catch(() => undefined)
           const renewed = await this.resolveCredential()
           if (renewed !== undefined && renewed !== credential) {
-            const retry = await f(`${OFFICEACE.defaultBaseUrl}${OFFICEACE.chatPath}`, {
+            const retry = await f(`${maasBaseUrlOf(renewed)}${OFFICEACE.chatPath}`, {
               method: 'POST',
               headers: {
                 Authorization: basicAuthorization(renewed),
