@@ -409,6 +409,115 @@ wire 上于是完全没有工具调用记录，模型看到的是「我说了段
 
 ⚠️ **验证「修复有效」必须做反向验证**：临时让 `normalizeHarnessMessages` 恒返回
 原数组（= 修复前行为），确认用例**会失败**。否则可能写出一组恒真的同义反复。
+
+## ⚠️⚠️ 自动续跑不得在 `agent/status` 派发栈内投递（Issue IKLEOW）
+
+**真实报障**（用户 2026-10-13）：思考循环被守卫中止 → 插件自动续跑之后，
+**对话的进行中状态丢失** —— Stop 按钮消失、插话（Steer）置灰且被服务端拒绝。
+
+### 根因：`setPhase` 是**同步派发**，在它的监听器里同步 `followup()` 会重入
+
+`packages/core/agent-loop/src/agent.ts` 的 `setPhase`：
+
+```ts
+private setPhase(next: Phase): void {
+  const previousStatus = this.status
+  this.phase = next
+  const status = this.status
+  if (status !== previousStatus) this.dispatch.emit('agent/status', { status })
+}
+```
+
+`kick()` 的 `finally` 里 `setPhase({kind:'idle'})` 派发 `idle`；若监听器**在该
+派发栈内**同步 `agent.followup()`，`wakeDriver()`（相位已是 idle）会立刻
+`setPhase({kind:'running'})` 并**再次同步派发** `running`。一次 idle 转换因此
+产生**两个方向相反的信号**，客户端最终采用哪一个**取决于监听器注册顺序**。
+
+客户端三处门禁**共用同一个 running 位**（`InputBar` 的 Stop、`QueueDock` 的
+Steer、`session-controller` 的 `session/steer-unavailable` 准入），故该位一错，
+**Stop 与插话同时失效**。
+
+### 判据：不能用「最终 running 位」，要用**派发嵌套**
+
+⚠️⚠️ **本缺陷的教训（我第一版测试就踩了）**：把「最终 running 位」或
+「请求开始时的 running 采样」当判据，**同步与微任务两种实现下取值完全一样**
+（实测都是 `TFTF` / 全 `true`）—— 那是一组**恒真的同义反复**。
+真正有区分力的判据是「**续跑唤醒的那次 `running` 派发是否嵌套在 `idle` 派发内**」：
+
+| 投递方式 | `agent/status` 观测（`{status, nested}`）|
+|---|---|
+| 栈内同步（缺陷）| `[running/F, idle/F, running/`**`T`**`, idle/F]` |
+| 脱离派发栈（修复）| `[running/F, idle/F, running/F, idle/F]` |
+
+### 修法（四条，缺一不可）
+
+1. **脱离派发栈**：新增 `LoopResumeScheduler`，生产默认 `queueMicrotask`（不是
+   定时器 —— 需求是「刚失败、此刻就续跑」，微任务只需让出同步栈）。**这是本
+   函数唯一的投递路径**。
+2. **投递前复核**：让出栈之后**重读权威值** `status === 'idle'` 且收件箱为空。
+   `observeIdle` 里那次读取只是便宜的前置过滤（窗口内别人可能已把新一轮跑起来）。
+3. **停止伪造 `source: { kind: 'user' }`**：按 harness 约定，`kind:'user'` 是
+   **宿主对「直接人类输入」的证明**，而 `tool-goal` 的 create / edit / pause /
+   resume 都据此授权 ⇒ 伪造会让自动续跑**冒用人类授权**且 UI 误渲染成用户发言。
+   改用自有 kind `loop-resume`（⚠️ 0.2.0 起 source kind 由生产者自声明，
+   `MessageSourceMap` 已删除共享的 `plugin` 包装）。
+4. **收窄 `observeInput`**：只有**真介入**才清零连续续跑预算。
+
+### ⚠️ `observeInput` 的收窄：是**健壮性**修正，不是已发生缺陷的修复
+
+⚠️⚠️ **issue 根因 2 的归因已被实测推翻**，别再照抄它。它声称「harness 自身的
+`runtime-context` 注入把预算反复清零 ⇒ 续跑**无界**」。三条实测反证：
+
+1. `runtime-context` **根本不走 `agent/inbox/inserted`** —— 它是 `preStep` 里经
+   `runtimeContext.project()` 直接拼进本次请求的（`packages/core/agent-loop/src/agent.ts`
+   的 `preStep`），**721 个会话零命中**。
+2. 回放全部 13 个含循环中止的会话：连续续跑**从未超过 2**（= 默认上限），
+   也从未触发上限告警。
+3. 把判据由「宽」（除我之外都清零）换成「窄」（只有真介入才清零），
+   **13 个会话结果逐个相同**（投出次数与上限告警数完全一致）。
+
+⇒ 收窄防的是「**某个每步注入通知的插件把上限架空**」这一形态。真实词表与频次
+（721 个会话扫 `inserted[].source.kind`）：
+
+| kind | 会话数 | 性质 | 清零？ |
+|---|---|---|---|
+| `user` | 712 | 人类输入（宿主证明）| ✅ |
+| `agent-message` | 122 | 别的 agent 发来的 | ✅ |
+| `subagent-settled` | 68 | 子代理收尾 | ✅ |
+| `goal` | 13 | 目标驱动器排的下一轮 | ✅ |
+| `user-approval` | 5 | 人工审批结果 | ✅ |
+| `tool-jobs` | 130 | 后台任务通知（自动）| ❌ |
+| `agent-instructions` | 97 | 工作区指令刷新（自动）| ❌ |
+| `repeat-tool-reminder` | 11 | 重复工具提醒（自动）| ❌ |
+| `tool-goal` | 10 | 目标工具收尾说明（自动）| ❌ |
+
+⚠️ **来源缺失 / 形状未知时不清零**（按自动通知处理）：这是 fail-safe 的一侧 ——
+清零会让预算被反复重置、续跑更频繁；不清算则计数继续累积、更快撞上限。
+
+### ⚠️ `Inbox.hasPending` 不是契约成员
+
+本插件原先读 `agent.inbox.hasPending`。它**从未进 `dsh-agent` 的 `Inbox` 公开
+契约**（0.2.0 起类型里已无此项；运行时 `ReactLoopInbox` 仍有该 getter）。
+改用契约成员 `nextTurn` / `nextStep` 的长度判断（语义等价：实现就是二者之和 > 0）。
+
+### 测试
+
+- `tests/unit/loop-recovery.spec.ts` —— 纯逻辑（判据/上限/来源/投递前复核/收窄）。
+  ⚠️ 它注入 `schedule: task => task()`（同步）以便断言，**故它结构上无法发现重入**
+  —— 这正是 issue 指出「单测没抓到」的原因。
+- `tests/unit/loop-recovery-reentry.spec.ts` —— **真实组合测试**（用真实的
+  `@deepseek-ai/dsh-agent-loop` + session/system-prompt/tools/agent）。
+  ⚠️ 宿主包不在 devDependencies（只随 DSH 安装），故按
+  `jet-hub-styles-ownership.spec.ts` 的先例**动态定位并惰性 import**，
+  找不到时**干净 skip**。
+  ⚠️ profile 的宿主包在**共享的 `profiles/node_modules`**，不是
+  `profiles/<名字>/node_modules`（本机实测；只写后者会永远 skip）。
+  **两种监听器顺序各跑一遍** —— 缺陷的表现形式取决于注册顺序，只验一种等于没验。
+- **反向验证已做**（四者各自独立变红，别当同义反复删掉）：
+  `defaultSchedule` 改回 `task => task()` → 嵌套断言在**两种顺序下**都变红；
+  source 改回 `{kind:'user'}` → 3 条变红；删掉投递前的两行复核 → 2 条变红；
+  停用 `isInterventionSource` 收窄 → 2 条变红。
+
 ## 常见开发任务
 
 ### 新增功能
