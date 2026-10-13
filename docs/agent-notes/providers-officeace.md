@@ -1,0 +1,206 @@
+# OfficeAce（华为 MaaS / 果办）provider 笔记
+
+> 来自 PR #89 的三轮审计（接线审计 / 展示层审计 / 对抗性审计）。
+> 每条都是**实测**或**逐行核对**得出的，不是推测。
+
+## 0. 它是什么
+
+华为云 ModelArts MaaS 的桌面客户端「果办」背后的云端 API。第 15 个 provider，
+id = `officeace`，服务名 `officeaceAuth`。登录/推理/续期/余额/倍率**五项云端直连**，
+不需要安装或运行果办客户端（对抗审计逐字段核对后确认该声称成立；本地 API
+降级链只存在于 `ref === undefined` 的老单账号兼容路径，生产 RPC 恒传
+`credentialRef` 故走不到）。
+
+## 1. 协议要点
+
+| 项 | 端点 | 鉴权 |
+|---|---|---|
+| 登录 | 华为云 OAuth PKCE（`client_id='pdp5_for_agentarts'`，公开客户端无 secret） | code_verifier + ES256 DPoP JWT |
+| 推理 | `POST {maas}/v2/chat/completions` | `Basic base64(model_app_key:secret)` |
+| 续期 | `POST sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens` | refresh_token（**30 天且一次性**）|
+| 余额 | `GET {base}/v1/subscription` | V11-HMAC-SHA256 |
+| 倍率 | `GET {base}/v1/model-token-rates` | V11-HMAC-SHA256 |
+
+### ⚠️ V11 签名的三条铁律（各自都曾导致 APIG.0301，别凭直觉改）
+
+1. **GET 请求不发 `Content-Type`** —— 多这一个头，签名串多一行，服务端重算必不匹配
+   （`officeace-auth.ts` 的 `signAndRequest`：`if (method === 'POST') original['Content-Type'] = contentType`）。
+2. **密钥派生用 hex 字符串作 key，不是 raw bytes**：
+   `HMAC(sha256, ak).update(sk)` → 拼 scope + `0x01` → 取前 32 字节 →
+   **`.toString('hex')`** → 再 `Buffer.from(derivedKey, 'utf8')` 当 HMAC key。
+3. **分隔符是 LF**（canonical 头行与 stringToSign），不是空格；路径**强制尾斜杠**。
+
+### ⚠️ `expires_at` **没有**秒/毫秒混淆 —— 别"顺手"加归一化
+
+华为 STS 的 `expiration` 是 **ISO 8601 字符串**（`IamTokenResponse.credentials.expiration: string`），
+消费侧一律 `Date.parse(...)`。故 buddy / lobsterai / accio 那条 `> 1e12` 防御分支
+**对 officeace 不适用**，加了反而是错。这是「同族只共享信封骨架，不共享每个字段形状」的又一例。
+
+### ⚠️ DPoP 私钥**必须复用同一把**
+
+`generateDpopKeyPair` 只在 `startLogin()` 调一次，私钥 JWK 持久化进凭据，
+续期时 `importDpopPrivateKey(current.dpopPrivateJwk)`。换一把 ⇒ 服务端拒绝。
+payload 必须齐 `{htm, htu, iat, jti}`；**无 `ath` 是正确的**（RFC 9449：没有 access token 时省略）。
+
+## 2. ⚠️⚠️ 续期三条规则（2026-10-13 审计补齐，此前一条都没有）
+
+**背景**：`refresh_token` **一次性**，而三条入口（定时器 `refreshAll` /
+适配器 401 兜底 / `account.refresh` RPC 与积分自愈）会并发进入同一个 ref。
+
+初版实现的三个缺陷：
+
+| 缺陷 | 症状 |
+|---|---|
+| `refreshAccountCredential` **直连** `doRefreshCredential`，无锁 | 并发时先到者消费 token、后到者拿 STS5.1806；先到者写盘前被打断 ⇒ **新 token 永久丢失，只能重新登录** |
+| **无任何过期判据** | 定时器每 30 分钟续期一次 ⇒ **一天烧掉 48 个一次性 token**（STS 寿命约 2 小时，根本不需要） |
+| 失败时**不回读凭据** | 并发下把「他处已续成功」误判成本账号失效 ⇒ 永久标死 |
+
+⚠️ **原先的 `refreshInFlight` 闸只加在 `refreshStoredCredential` 那条「兼容文件腿」上，
+生产主路径完全绕过它** —— 这是最隐蔽的一种错法：**加了锁，但加错了一条腿**。
+
+现已按 codearts 的同款三件套补齐（`refreshAccountCredential` 内）：
+
+1. **per-ref `SerialQueue`**（`queueFor(refName)`，队列表上限 64，超额淘汰最早创建者）；
+2. **锁内重读 + lead-time**：拿到锁时凭据可能已被上一轮换新，距过期还早时
+   只对账池值、**不发请求**（`shouldRefreshNow`，lead = 1 小时）；
+3. **判终态前重读**：续期被拒时先看磁盘那份 `refresh_token` 是否**已经不等于**
+   本次用的那份 —— 并发下服务端烧掉的是**旧的**一份，磁盘上此刻躺着**新的、可用的**
+   凭据，那是「他处已续成功」而不是「本账号失效」。
+
+守卫：`tests/unit/officeace-refresh-guards.spec.ts`（5 条，逐条做过反向验证）。
+
+## 3. ⚠️ 接线陷阱（新 provider 通用，此处已复发）
+
+`src/jet-hub-rpc.ts` 的 `SELF_HEAL_REFRESHABLE_PROVIDERS` ——
+officeace 初版**漏登记**，症状是「系统睡眠/挂起恢复后刷新积分报 HTTP 401、
+卡片红『已过期』、窗口内无手动自救、**日志零字**」，与 issue IKKHL5 逐字相同。
+STS 寿命约 2 小时，恰好落在「恢复后到定时器补触发那一轮（最多 30 分钟）」的窗口内。
+
+⚠️ **这条不是「记得加」能解决的** —— 原有的守卫是**硬编码白名单**，
+只锁住已知的 11 家，新增 provider 漏接时**零用例变红**。
+现已改为**从 `PROVIDER_REGISTRY` 派生**（`credits-balance-self-heal.spec.ts`
+的 `★★ 每个「有余额能力的渠道」都必须在自愈 Set 里`），并做过反向验证：
+删掉 `OFFICEACE.id` 精确点名变红。
+
+同款陷阱还有 `src/jet-hub-store.ts` 的 `REF_PREFIX_TO_PROVIDER`（漏加 =
+`OFFICEACE_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失）。
+
+## 4. ⚠️ 多账号：`session.json` 共享文件是「串号」根源
+
+凭据已改按 `credentialRef` 分文件 + 走 DSH 凭据库，但**兼容用的公共
+`session.json` 仍在**（`persistLogin` 每次登录都顺手写一份）。读它的三处都会串号：
+
+| 读点 | 症状 | 状态 |
+|---|---|---|
+| `account.list` 的 `expiresAt` 自愈回填 | 把**同一份**有效期写给所有缺该字段的账号（方向还可能相反） | 已修：逐账号 `ctx.credentials.resolve` |
+| `officeace.status` RPC | 三个字段描述的都是「最后登录的那个账号」 | 无客户端调用方（客户端零命中），是埋好的地雷 |
+| `probeOfficeAce` / `readOfficeAceCredential` | 面板门控读共享文件 | 生产路径已绕开 |
+
+**教训**：改「单凭据 → 多凭据」时，**别只改主路径** —— 旧的单文件读取点
+会一颗颗变成串号源。逐个 grep 该文件名，别凭「主路径已经改了」的印象收工。
+
+## 5. 展示层：三档分桶与倒计时的两个真实缺陷（2026-10-13 审计）
+
+详见 `client-ui.md`。这里只记 officeace 相关的一条：
+
+⚠️ **TRAE 的 `active` 是硬编码 `true`**（`src/trae-credits.ts`），压根不反映是否过期。
+这让 `earliestExpiringAt` 选中已过期包成为**必然可达**而非理论风险 ——
+选中后 `expiryCountdown` 拿到过去时刻返回空串 ⇒ **整段倒计时消失**。
+已修（选举时要求 `end > now`）。
+
+## 5.5 ⚠️⚠️ 换账号登录：华为 authui 会静默复用会话（2026-10-13 用户报障）
+
+> 「新建账号那个链接就自动用之前登录的账号授权了」
+
+**根因不在授权链接参数** —— `state` / `code_challenge` 每次都是新随机值，PKCE 完整。
+复用发生在**更前面一层**：浏览器里 `auth.huaweicloud.com` 的登录会话 cookie。实测三条：
+
+| 试验 | 结果 |
+|---|---|
+| `authui/login.html?service=<authorize>` | **200 直接放行**（复用会话，看不到登录框）|
+| authorize 里追加 `&prompt=login` | **仍 200、无重定向** ⇒ **authui 忽略该参数**，此路不通 |
+| `authui/logout?service=<authorize>` | **302 先清会话**再跳 authorize；跟随后落到 `/authui/login`（注意从 `login.html` 变成 `login`）|
+
+⇒ 只有两条路：先 logout，或**换一个 cookie jar**。
+
+### 选「无痕窗口」而不是 logout —— 理由是作用域
+
+实测 `logout` 的 `Set-Cookie` 有 4 条，其中：
+`cloud_verify_ticket=; Max-Age=0`（清票据）+ `IAMIdentity=…; Path=/`（重写）。
+**作用域是整个 `auth.huaweicloud.com` 域，不是单次授权** ⇒ 在用户日常浏览器里执行会
+**连带登出华为云控制台**。无痕窗口是全新 cookie jar，天然无会话，
+**既不碰用户既有会话、也不需要 logout**。
+
+⚠️ **官方（果办）同样没解决这点**，别当参考实现：它的 `LoginPage` 用
+`window.open(url, 'officeclaw-login', 'popup,…')` 开**共享 cookie** 的小窗，
+「重新登录」走 `authui/logout`（`LoginCallbackPage`）。即官方也无法换账号登录。
+
+### 实现落点与三条实测约束
+
+客户端**做不到**无痕（`window.open` 无法请求无痕 —— 那是进程级启动参数），
+故由宿主 `spawn` 浏览器可执行文件（`src/login.ts` 的 `openIncognitoWindow`）：
+
+1. ⚠️⚠️ **不要用「app 模式」开关**（真机证伪，阻断级）：初版传了它想让窗口去掉
+   地址栏，结果 360 极速浏览器 X 上显示「**域名解析错误 —— 请检查域名拼写**」——
+   该浏览器把开关的值当**域名**去解析。隔离探针（本地 HTTP 服务器 + 独立
+   `--user-data-dir`）证明该开关本身能被 Chromium 正确解析并发出请求
+   ⇒ 是**该浏览器对它的改写**，不是 URL 编码问题（实测 28 个 `%` 序列逐字送达）。
+   ⇒ 换取账号**不依赖**它，而它的失败是阻断级 ⇒ 只用无痕开关。
+2. **浏览器路径必须读注册表**（`UrlAssociations\https\UserChoice` → ProgId →
+   `shell\open\command`）：用户装的可能是 Chrome / Edge / 360 / Firefox，
+   路径各不相同，硬编码必然错。⚠️ 三个根都要试（HKCR / HKCU\Software\Classes /
+   HKLM），本机的 360 就只注册在 **HKCU\Software\Classes**。
+3. **轮询不依赖浏览器 cookie**：`GET /v1/claw/auth/code?state=` 是**匿名服务端轮询**
+   （实测直接返回 `AgentArts.11000004` 参数校验错，说明不需要任何身份）
+   ⇒ 无痕窗口完成授权后，宿主照样拿得到 code。窗口关掉也不影响。
+
+### ⚠️⚠️ 测试纪律：**开窗的行为测试只能放 e2e**（用户 2026-10-13 明确要求）
+
+> 「打开浏览器窗口的测试只能放在 e2e 测试里」
+> 「单元测试里不要加打开浏览器 url 的测试，打开一堆空白窗口没用，挡我视线」
+
+这是我**真实污染过用户桌面**两次换来的纪律：
+
+1. **单测里直接调 `openIncognitoWindow`**：初版写
+   `expect(() => openIncognitoWindow('https://example.invalid')).not.toThrow()`，
+   想验「不抛错、返回 boolean」。该函数**会真的 spawn 浏览器** ⇒
+   每跑一次 `pnpm test` 就在用户桌面弹一个 `example.invalid` 窗口。
+2. **间接污染（更隐蔽）**：`officeace-rpc-multi-account.spec.ts` 走的是**真实的
+   `account.create` RPC**，其桩数据里带
+   `authorizeUrl: 'https://auth.huaweicloud.com/stub'`。接线后宿主就真去打开那个
+   桩 URL ⇒ 全量测试一跑，用户桌面多出一堆 **`auth.huaweicloud.com/stub`**
+   空白窗口。**根因不是那个用例写错了**（它的桩完全合理），而是**被测代码
+   在测试环境下产生了真实副作用**。
+
+**修法是两层的，缺一不可**：
+
+1. **被测代码加测试断路器**：`openIncognitoWindow` 开头
+   `if (process.env.NODE_ENV === 'test') return false`。
+   ⚠️ 判据必须按**运行环境**，**不能按 URL 特征打补丁**（`if (url.includes('stub'))`）
+   —— 换个用例换个 URL 立刻复发。
+   ⚠️ 返回 `false` 而不是抛错：调用方据此走正常回退分支，断言形态与生产一致。
+2. **真开窗的验证移到 `tests/e2e/`**，带闸门
+   （`DSH_OFFICEACE_E2E=1`，见 `pnpm test:e2e:officeace`），**默认跳过** ——
+   与 `login.e2e.spec.ts` 同款范式（`describe.runIf(E2E)`）。
+
+**守卫**：`tests/unit/officeace-incognito-login.spec.ts` 的
+⑩（测试断路器存在）与 ⑪（本文件不得 import `src/login.js`，且 e2e 版本必须存在）。
+
+### 另一条源码级断言的教训
+
+⚠️ **判据要避开字符串字面量**：⑪ 的第一版写成「剥注释后匹配
+`openIncognitoWindow(` 调用形态」，结果扫到了**同一文件里另一条用例的字符串
+字面量**（它断言 `jet-hub-rpc.ts` 的源码文本）而恒红。⇒ 只锚定 **import 语句**
+（没 import 就必然调不到真实实现，精确且不会假失败）。
+
+## 6. 待办 / 已知缺口
+
+- **`maasBaseUrl` 是死字段**：写了从不读。若某账号的 `model_api_url_base`
+  与默认值不同，请求会打到错误的 host。修法：适配器改用它并加默认值兜底。
+- **`fetchModelTokenRates` 读共享 `session.json`** ⇒ 多账号下倍率取「最后登录那个」。
+  影响低（倍率是账号级静态配置，取不到时空表降级），但它与 §4 是同一类。
+- **V11 `scope` 硬编码 `cn-southwest-2` / `apic`**：当前与 URL 一致故正确，
+  但没有守卫 —— 账号若被分配到别的 region，签名 scope 与 Host 都会错。
+- **`reasoning-delta` 未接 DSML 归一化**：11 处思考链出口全发原文，
+  守卫清单里也没登记。见 `protocol-wire.md`。
+- **`login.poll` 的 `done:false, error` 客户端零消费** ⇒ 用户看到「转圈 5 分钟」。

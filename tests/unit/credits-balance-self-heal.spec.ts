@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { JET_HUB_API_PATH, registerJetHubRpc } from '../../src/jet-hub-rpc.js'
+import { PROVIDER_REGISTRY } from '../../src/provider-registry.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
 /**
@@ -622,6 +623,7 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
   const ID_OF: Record<string, string> = {
     LOBSTERAI: 'lobsterai', QODER: 'qoder', QODER_CN: 'qodercn', TRAE: 'trae',
     CLINE: 'cline', RACCOON: 'raccoon', MINIMAX: 'minimax', GEMINI: 'gemini',
+    OFFICEACE: 'officeace',
   }
 
   it('★ Set 里的字面量恰好是 codearts / buddy / workbuddy（多一个少一个都红）', () => {
@@ -629,12 +631,13 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     expect(literals.slice().sort()).toEqual(['buddy', 'codearts', 'workbuddy'])
   })
 
-  it('★ Set 里的 `.id` 常量恰好是那八家（逐家点名，不写魔数阈值）', () => {
+  it('★ Set 里的 `.id` 常量恰好是那九家（逐家点名，不写魔数阈值）', () => {
     // ⚠️ 逐家列举而不是 `expect(constants.length).toBeGreaterThanOrEqual(8)` ——
     // 后者在「删掉 trae、加上一个假的」时**仍然通过**，正是审计实测的漏报形态。
     const { constants } = selfHealSetParts()
     expect(constants.slice().sort()).toEqual([
-      'CLINE', 'GEMINI', 'LOBSTERAI', 'MINIMAX', 'QODER', 'QODER_CN', 'RACCOON', 'TRAE',
+      'CLINE', 'GEMINI', 'LOBSTERAI', 'MINIMAX', 'OFFICEACE', 'QODER', 'QODER_CN',
+      'RACCOON', 'TRAE',
     ])
   })
 
@@ -643,11 +646,60 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
     expect([...inSet].sort()).toEqual([
       'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'minimax',
-      'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy',
+      'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy',
     ])
     // 反向：两家没有 refresh 端点，必须**静默跳过**而非尝试续期。
     expect(inSet.has('loomy')).toBe(false)
     expect(inSet.has('zcode')).toBe(false)
+  })
+
+  /**
+   * ★★ **根治守卫**：Set 的成员关系**从 `PROVIDER_REGISTRY` 派生**，不再手抄。
+   *
+   * ## 为什么上面那几条还不够（2026-10-13 审计实测）
+   *
+   * 「逐家点名」只锁住了**已知的 12 家**。它拦得住「删掉 trae」「加个假 id」，
+   * 却**拦不住第 16 个 provider 加进来时被漏掉** —— officeace 就是这么漏的
+   * （症状与 issue IKKHL5 逐字相同：睡眠/挂起恢复后积分行报 401、日志零字）。
+   *
+   * ⚠️ 这正是 `docs/agent-notes/providers-accio.md` 记的「接线陷阱（新 provider 通用）」：
+   * **加 provider 的人不会去看这张手抄的 Set**，而漏接的代价是静默的。
+   *
+   * ## 判据从哪来
+   *
+   * 取「声明了余额能力（`credits.balance === true`）」**且**「是渠道（`channel`）」
+   * **且**「不是静态凭据/匿名渠道」的集合。
+   *
+   * ⚠️ **豁免表必须显式写出来，不许靠「反正都不在」**——否则将来有人给
+   * loomy / zcode / opencode 加上余额能力时会得到一条**难以理解**的红。
+   */
+  it('★★ 每个「有余额能力的渠道」都必须在自愈 Set 里（漏一家即红，不许静默）', () => {
+    // 没有 refresh 端点 / 静态凭据 / 匿名通道 ⇒ 自愈对它们没有意义（强行调只会抛）。
+    const NO_REFRESH_ENDPOINT = new Map<string, string>([
+      ['loomy', '无 refresh 端点：refreshAll 只探测有效性，拿它当续期用只会白发请求'],
+      ['zcode', '静态 API Key 凭据，无 OAuth 续期'],
+      ['opencode', '匿名通道，无凭据可续'],
+      ['aggregate', '虚拟渠道，无自有凭据'],
+      ['auto', '虚拟渠道（auto-adapter 聚合），无自有凭据'],
+    ])
+    const { literals, constants } = selfHealSetParts()
+    const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
+
+    const expected = PROVIDER_REGISTRY
+      .filter((d) => d.channel && d.credits.balance === true && !NO_REFRESH_ENDPOINT.has(d.id))
+      .map((d) => d.id)
+      .sort()
+
+    // 反向：Set 里的每个成员都必须是有余额能力的渠道（防「加了不该自愈的渠道」）。
+    const withBalance = new Set(
+      PROVIDER_REGISTRY.filter((d) => d.credits.balance === true).map((d) => d.id),
+    )
+    for (const id of inSet) {
+      expect(withBalance.has(id), `自愈 Set 里的 ${id} 没有声明余额能力，登记理由是什么？`)
+        .toBe(true)
+    }
+    expect([...inSet].sort(), '自愈 Set 漏了渠道（症状：睡眠后积分行 401 且日志零字）')
+      .toEqual(expected)
   })
 
   it('★ Set 里的每一个 id 都必须在 JetHubAuths 里有对应键（不得有假 id）', () => {

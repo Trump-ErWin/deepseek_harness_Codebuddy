@@ -124,7 +124,27 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
   })
 
   /**
-   * ⚠️ 窗口不可用时**必须返回 null**（而不是 0/0）：调用方据此不渲染分类行。
+   * ⚠️⚠️ **已过期的包不得当选「最早作废时刻」**（2026-10-13 审计修正）。
+   *
+   * 取最早时不约束 `> now`，则「一个已过期但 `active` 仍为 true 的包」会
+   * **恒定当选**（它比任何未来时刻都早）⇒ `expiryCountdown` 拿到过去时刻、
+   * 返回空串 ⇒ **整段倒计时消失**，尽管桶里还有一笔钱几天后作废。
+   *
+   * ⚠️ 可达性不是假设：TRAE 的 `active` 是**硬编码 true**
+   * （`src/trae-credits.ts`），压根不反映是否过期；buddy 系也会在
+   * 「解析时刻算 `active`、渲染时刻算分桶」之间跨过到期点时出现。
+   */
+  it('临期桶里的已过期包不参与「最早」选举（否则倒计时整段消失）', () => {
+    const split = splitCreditsByExpiry([
+      pkg({ remaining: 100, deductionEndTime: NOW - 5 * DAY }), // 已过期但 active 仍为 true
+      pkg({ remaining: 50, deductionEndTime: NOW + 3 * DAY }),
+    ], WINDOW_DAYS, NOW)
+    expect(split?.expiring, '两笔都计入临期桶（它确实会作废）').toBe(150)
+    // ⚠️ 关键：取未过期那笔，而不是那个 5 天前的。
+    expect(split?.earliestExpiringAt, '已过期包会让倒计时恒空，必须被排除').toBe(NOW + 3 * DAY)
+  })
+
+  /** 窗口不可用时**必须返回 null**（而不是 0/0）：调用方据此不渲染分类行。
    * 把"不知道窗口"渲染成"临时 0 · 永久 0"是在说谎 —— 非 buddy provider 的
    * 积分根本没有这个维度（后端不给它们带 windowDays，于是这里是 undefined/null；
    * 而 `Number(null) === 0`，不显式挡住就会被当成"窗口 0 天"）。
@@ -373,9 +393,29 @@ describe('expiryCountdown（临期倒计时）', () => {
   })
   it('已过期 / 非法值返回空串（不显示噪音）', () => {
     expect(expiryCountdown(base - 1000, base)).toBe('')
+    expect(expiryCountdown(base, base)).toBe('')
     expect(expiryCountdown(0, base)).toBe('')
     expect(expiryCountdown(Number.NaN, base)).toBe('')
     expect(expiryCountdown(undefined as never, base)).toBe('')
+  })
+
+  /**
+   * ⚠️⚠️ **「还没过期」与「已过期」必须分道**（2026-10-13 审计修正）。
+   *
+   * 原实现用 `Math.round((at-ref)/60000)`：剩余 29 秒时 round 出 0 ⇒ 命中
+   * `minutes <= 0` 返回空串 ⇒ 用户看到倒计时一路数到「1 分钟」后**整段突然
+   * 消失**，而「马上就作废」恰恰是最该看到的信号。
+   *
+   * 改用**向上取整**：只要 `at > ref` 就至少给 1 分钟，绝不静默消失。
+   */
+  it('剩余不足 1 分钟时仍显示倒计时（不得静默消失）', () => {
+    expect(expiryCountdown(base + 1, base)).toBe('1 分钟')
+    expect(expiryCountdown(base + 29_000, base)).toBe('1 分钟')
+    expect(expiryCountdown(base + 59_999, base)).toBe('1 分钟')
+    // 恰好 1 分钟整 —— 与「不足 1 分钟」同为 1 分钟（粗粒度刻意的设计）
+    expect(expiryCountdown(base + 60_000, base)).toBe('1 分钟')
+    // ⚠️ 61 秒必须是 2 分钟：向上取整不能把「超过 1 分钟」也压成 1
+    expect(expiryCountdown(base + 61_000, base)).toBe('2 分钟')
   })
 })
 

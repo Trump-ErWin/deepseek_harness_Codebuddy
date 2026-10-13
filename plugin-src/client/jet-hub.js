@@ -3044,26 +3044,48 @@ function ProviderPanel({ provider, rpcCall }) {
       // 返回才渲染、`account.create` 又要求先有手机号 —— **顺序死锁**，
       // 表单永远出不来。改用微信扫码后该分支已删除。
       if (loginUrl) {
-        // 登录页在**新窗口**中打开。这里必须能成功弹出：
-        // 后端对全部 provider 都是「先返回 loginUrl、后台再等回调」的两步式，
-        // 因此本行紧跟用户点击、仍处于浏览器的 transient activation 窗口内。
+        // ⚠️⚠️ **OfficeAce：宿主已用无痕窗口打开，客户端不要再开一个**（2026-10-13）。
         //
-        // ⚠️ 绝不能在弹窗失败时回退到 `window.location.href = loginUrl`：
-        // 那会把整个设置页（甚至用户正在编辑的会话）导航到外部登录页，
-        // 登录完成后也回不来。这正是用户报障「主页面直接跳转过去了」的现象。
-        // 早期 CodeArts/LobsterAI 走的是**阻塞式**登录（后端 await 到用户
-        // 授权完成才返回），拿到 URL 时手势早已过期、window.open 必被拦截，
-        // 于是每次都命中那个跳转兜底。根因已在后端修掉（改为两步式），
-        // 这里也不再保留那条破坏性兜底。
-        const loginWindow = window.open(loginUrl, '_blank', 'width=800,height=600');
-        if (!loginWindow || loginWindow.closed) {
-          // 弹窗被拦截：展示可点击链接让用户自行打开，而不是劫持当前页面。
-          // 轮询照常进行，用户手动打开也能完成登录。
+        // 为什么需要无痕：华为 authui 会**静默复用**浏览器已有会话 —— 带 cookie
+        // 打开授权页直接放行、看不到登录框，于是「新建账号」永远只能建出同一个号。
+        // 无痕是全新 cookie jar，天然无会话，可换账号登录，且**不碰**用户日常
+        // 浏览器里的华为云控制台会话（对比 `authui/logout`：作用域是整个域）。
+        //
+        // ⚠️ 客户端**做不到**这件事：`window.open` 无法请求无痕模式（那是进程级
+        // 启动参数），故由宿主 `spawn` 浏览器可执行文件完成，并把结果回传。
+        //
+        // ⚠️ 判据用 `res.incognitoOpened === true` **精确匹配**，不要写成
+        // `!== false`：老宿主不返回该字段（`undefined`），必须让它走回退分支，
+        // 否则升级期会出现「宿主没开、客户端也不开」= **窗口根本不出来**。
+        //
+        // `loginWindow` 两种打开方式都要持有：轮询结束时用它关窗。
+        let loginWindow = null;
+        if (res.incognitoOpened === true) {
+          // 宿主已开好无痕窗，这里只记日志以便排障（不打印 URL，见上面的信息泄露注释）。
+          console.log('[jet-hub] account.create 已由宿主以无痕窗口打开授权页');
+        } else {
+          // 回退路径（其余 provider，或无痕窗口没拉起来）：
+          // 登录页在**新窗口**中打开。这里必须能成功弹出：
+          // 后端对全部 provider 都是「先返回 loginUrl、后台再等回调」的两步式，
+          // 因此本行紧跟用户点击、仍处于浏览器的 transient activation 窗口内。
           //
-          // 这里**不**调 setError：本函数运行时 phase 是 'ready'，错误文案只在
-          // 'error' 阶段渲染，设了也看不见；提示由下面的 loginUrlForManual 区块负责。
-          setLoginUrlForManual(loginUrl);
-          setLoginLinkCopied(null);
+          // ⚠️ 绝不能在弹窗失败时回退到 `window.location.href = loginUrl`：
+          // 那会把整个设置页（甚至用户正在编辑的会话）导航到外部登录页，
+          // 登录完成后也回不来。这正是用户报障「主页面直接跳转过去了」的现象。
+          // 早期 CodeArts/LobsterAI 走的是**阻塞式**登录（后端 await 到用户
+          // 授权完成才返回），拿到 URL 时手势早已过期、window.open 必被拦截，
+          // 于是每次都命中那个跳转兜底。根因已在后端修掉（改为两步式），
+          // 这里也不再保留那条破坏性兜底。
+          loginWindow = window.open(loginUrl, '_blank', 'width=800,height=600');
+          if (!loginWindow || loginWindow.closed) {
+            // 弹窗被拦截：展示可点击链接让用户自行打开，而不是劫持当前页面。
+            // 轮询照常进行，用户手动打开也能完成登录。
+            //
+            // 这里**不**调 setError：本函数运行时 phase 是 'ready'，错误文案只在
+            // 'error' 阶段渲染，设了也看不见；提示由下面的 loginUrlForManual 区块负责。
+            setLoginUrlForManual(loginUrl);
+            setLoginLinkCopied(null);
+          }
         }
         // 轮询等待登录完成。
         // ⚠ 超时**不用**另起的 `setTimeout`，而是记 deadline 在轮询里判：这样全场只有

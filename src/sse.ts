@@ -1020,9 +1020,15 @@ export function stripCourseLeakIfEnabled(text: string): string {
  * 2. `DSML｜{2,}` → `DSML｜`（右侧双竖线）
  */
 export function fixDsmlMarkers(text: string): string {
+  // ⚠️⚠️ **`DSML` 后必须有分隔边界**（2026-10-13 审计修正）：不加这个前视时，
+  //    正文里只要出现 `<｜｜DSMLX …` 这种**以 DSML 开头的普通词**就会被
+  //    无声改掉一个竖线 —— 讨论 DSML 协议的助手、代码片段、日志转储都会中招。
+  //    方向遵循仓库元规则「**宁可漏判不可误伤**」：宁可放过一个真坏标记，
+  //    也不可篡改用户的合法正文。
+  //    合法边界 = 竖线 / 空白 / `>` / `/` / 字符串结尾。
   return text
-    .replace(/(<\/?)｜{2,}DSML/g, '$1｜DSML')
-    .replace(/DSML｜{2,}/g, 'DSML｜')
+    .replace(/(<\/?)｜{2,}DSML(?=｜|\s|>|\/|$)/g, '$1｜DSML')
+    .replace(/DSML｜{2,}(?=｜|\s|>|\/|$)/g, 'DSML｜')
 }
 
 /**
@@ -1046,7 +1052,6 @@ export function createDsmlMarkerNormalizer() {
   const PREFIX_PATTERNS = ['<｜｜DSML', '</｜｜DSML', 'DSML｜｜']
   /** 最长模式长度（决定扣住窗口上限）。 */
   const MAX_PENDING = 9
-
   /** 计算应扣住的尾部长度（最长匹配优先）。 */
   function holdBackLen(s: string): number {
     const max = Math.min(s.length, MAX_PENDING)
