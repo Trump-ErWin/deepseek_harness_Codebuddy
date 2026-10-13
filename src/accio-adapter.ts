@@ -77,7 +77,7 @@ import {
   isAccioExpired,
   type AccioCredential,
 } from './accio.js'
-import { consumeAccioSse, serializeAccioMessages, toAccioTools } from './accio-messages.js'
+import { consumeAccioSse, isAccioErrorFrame, serializeAccioMessages, toAccioTools } from './accio-messages.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 // ⚠️ 图片守卫必须复用**共享的递归收集器**（它按 `tool-result` 递归下钻）——
 // 本仓库其余适配器（buddy / lobsterai / trae / gemini / cline / qoder / …）全部走它，
@@ -542,16 +542,154 @@ export function mergeAccioToolArgs(fragments: readonly string[]): string {
  * 首字延迟**（TTFT）并让正文与思考的增量下发全部失效，代价远大于收益。
  * ⇒ 保留当前策略；若将来真机上观测到交错，应先取证再改。
  */
+/**
+ * 抽取一帧上的**终帧元数据**（`turn_complete` / `usage_metadata` / `finish_reason`）。
+ *
+ * ⚠️ 只抽这三个键，**不透传整帧**：工具分片帧还带 `partial` / `raw_response_json`
+ * （后者是整份 OpenAI 原始 chunk，体积大且与合并产物无关）—— 拼进 flush 帧会
+ * 让每帧体积膨胀数倍且语义混乱。元数据三键是消费侧真正读的（归一化层把它们
+ * 映射成 `usageMetadata` / `finishReason`，`turn_complete` 仅作标记）。
+ */
+function frameMetaOf(frame: unknown): Record<string, unknown> | undefined {
+  if (frame === null || typeof frame !== 'object') return undefined
+  const f = frame as Record<string, unknown>
+  const meta: Record<string, unknown> = {}
+  if (f.turn_complete !== undefined) meta.turn_complete = f.turn_complete
+  if (f.usage_metadata !== undefined) meta.usage_metadata = f.usage_metadata
+  if (f.usageMetadata !== undefined) meta.usageMetadata = f.usageMetadata
+  if (f.finish_reason !== undefined) meta.finish_reason = f.finish_reason
+  if (f.finishReason !== undefined) meta.finishReason = f.finishReason
+  return Object.keys(meta).length > 0 ? meta : undefined
+}
+
+/**
+ * 从一个 `function_call` 上抽**参数串**（`args_json` / `argsJson` / 对象 `args`）。
+ *
+ * ⚠️ 三种形态与 `normalizeAccioPart`（`src/accio-messages.ts`）**同口径**：
+ * 上游实测下发 snake 的**字符串** `args_json`，但标准 Gemini 形态是对象 `args`，
+ * camel 的 `argsJson` 也被归一化层容忍。本层原先只认 `args_json`
+ * ⇒ 另两种形态被**静默清空为 `{}`**（模型以为执行了，实际用空参数跑工具）。
+ *
+ * ⚠️⚠️ **空串必须继续回退**（2026-10-13 对抗验证查出）：原先写
+ * `if (typeof raw === 'string') return raw` —— `args_json: ""` 是**字符串**，
+ * 于是直接返回空串、**永不回退**到同帧的 `args` 对象。而归一化层
+ * （`normalizeAccioPart` 的 `parseArgsJson` 对空串返回 `undefined`）**会**回退 ⇒
+ * 同一个帧「合并层得 `{}`、归一化层得真实参数」——**两层判据不一致**，
+ * 且症状正是上面那句「静默空参数」。⇒ 空串按「没有」处理。
+ *
+ * ⚠️ `args` 是对象时**序列化成串**：本层的缓冲按「字符串片段累积」工作
+ * （`mergeAccioToolArgs` 处理分片），对象直传会破坏合并语义。
+ */
+function accioArgsTextOf(call: Record<string, unknown>): string {
+  const raw = call.args_json ?? call.argsJson
+  if (typeof raw === 'string' && raw !== '') return raw
+  const obj = call.args
+  if (obj !== null && typeof obj === 'object' && !Array.isArray(obj)) {
+    try { return JSON.stringify(obj) } catch { return '' }
+  }
+  return ''
+}
+
+/**
+ * 取一份 `usage` 上的 **total**（用于「取最大 total」判定；读不到时 `-1`）。
+ *
+ * ⚠️ 与 `consumeGeminiSse` 的 `noteUsage`（`src/gemini-messages.ts`）**同口径**：
+ * snake `total_token_count` 与 camel `totalTokenCount` 都认。
+ */
+function usageTotalOf(u: unknown): number {
+  if (u === null || typeof u !== 'object' || Array.isArray(u)) return -1
+  const r = u as Record<string, unknown>
+  const raw = r.totalTokenCount ?? r.total_token_count
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : -1
+}
+
+/**
+ * 合并两帧的**终帧元数据**（被吸收帧上的 `turn_complete` / `usage_metadata` /
+ * `finish_reason`）。
+ *
+ * ## 两类键的语义**不同**，必须分开处理
+ *
+ * - `finish_reason` / `turn_complete` 等：**后者覆盖前者**（终帧的就是最终值）；
+ * - `usage`（`usage_metadata` / `usageMetadata`）：⚠️⚠️ **取「total 更大」的那一份**，
+ *   相等时后者胜 —— 这正是消费侧 `noteUsage` 的语义。
+ *
+ * ## ⚠️⚠️ 为什么必须取最大（2026-10-13 审计修正）
+ *
+ * 原实现是**无差别字段级后覆盖先**，注释却声称「与消费侧取最大 total 的语义一致」
+ * —— 注释与代码**不一致**，而实测代价是**合并路径比透传路径更弱**：
+ *
+ * | 终帧 usage | 合并（吸收）路径 | 透传路径（`noteUsage`） |
+ * |---|---|---|
+ * | 部分键（无 prompt/cached/thoughts） | 丢掉先前那份的键 | 保住 |
+ * | 空对象 `{}` | usage **全零** | 保住先前完整值 |
+ * | total 偏小（336→4） | 取**偏小**值 | 取 336 |
+ *
+ * 同样两份 usage，只是「帧上带不带 `function_call`」，计量结果就不同 —— 这属于
+ * 「同一个量两条判据」，且合并路径是**更差**的那条。⇒ 与消费侧统一为取最大 total。
+ *
+ * ⚠️⚠️ **首份也必须收敛**（2026-10-13 对抗验证查出）：原先 `prev === undefined`
+ * 时直接 `return { ...next }` **早退**，于是「首帧同时带两个 usage 键」时两个键
+ * **都被保留** ⇒ 归一化层恒取 snake（`f.usage_metadata ?? f.usageMetadata`）⇒
+ * **陈旧的小值胜出**（实测：首帧 snake total=10 / camel total=3100 ⇒ 得 10，
+ * 期望 3100）。⇒ 收敛逻辑必须**覆盖首份**，不能靠早退绕过。
+ *
+ * ⚠️ 收敛后**只留一个 usage 键**：两个键并存时另一个永远是死的（归一化层恒取
+ * snake），还可能是陈旧值。
+ */
+function mergeFrameMeta(
+  prev: Record<string, unknown> | undefined,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = prev === undefined ? {} : { ...prev }
+  // 非 usage 键：后者覆盖前者。
+  for (const [key, value] of Object.entries(next)) {
+    if (key === 'usage_metadata' || key === 'usageMetadata') continue
+    out[key] = value
+  }
+  // usage：先把**两侧**的候选都收集起来（各自可能是 snake 或 camel），取 total 最大者，
+  // 最后统一写回**单一**的 `usage_metadata` 键。
+  const candidates: unknown[] = [out.usage_metadata, out.usageMetadata, next.usage_metadata, next.usageMetadata]
+  delete out.usage_metadata
+  delete out.usageMetadata
+  let winner: unknown
+  for (const c of candidates) {
+    if (c === undefined || c === null) continue
+    if (winner === undefined || usageTotalOf(c) >= usageTotalOf(winner)) winner = c
+  }
+  if (winner !== undefined) out.usage_metadata = winner
+  return out
+}
+
 export function accioToolCallMergeTransform(): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   let buffer = ''
   /** 本次待合并的调用：`id` → 已见到的参数片段（**保持首见顺序**）。 */
   const pending = new Map<string, { id: string; name: string; fragments: string[] }>()
+  /**
+   * ⚠️⚠️ 被吸收帧上携带的**终帧元数据**（`usage_metadata` / `finish_reason` /
+   * `turn_complete` 等，2026-10-13 wire 探针定罪的真实缺陷）：
+   * 上游把**最后一个 `function_call` 分片**与终帧元数据放在**同一帧**里
+   * （`{content:{parts:[{function_call:{…,args_json}}]}, turn_complete:true,
+   * usage_metadata:{…}, finish_reason:"STOP"}`）。吸收工具 part 时若不把
+   * 这些字段暂存下来，flush 只吐工具 part ⇒ usage 恒归零、finish 恒兜底
+   * `stop` —— 正是用户报障「思考一下就中断」的根因（工具帧其实到了，
+   * 但终帧元数据被合并缓冲吞掉）。
+   */
+  let pendingMeta: Record<string, unknown> | undefined
 
   /** 把已缓冲的调用拼成**一帧**交出去（无缓冲时是空操作）。 */
   const flushPending = (out: string[]): void => {
-    if (pending.size === 0) return
+    if (pending.size === 0) {
+      // ⚠️ 无工具调用时元数据也要交出去：终帧可能不带 function_call
+      //（纯文本轮次的收尾帧就是这种），吸收路径根本没跑过 —— 但若
+      // `pendingMeta` 有值（理论上不会），仍照发，宁多勿丢。
+      if (pendingMeta !== undefined) {
+        out.push(`data: ${JSON.stringify(pendingMeta)}`)
+        pendingMeta = undefined
+      }
+      return
+    }
     const parts: unknown[] = []
     for (const entry of pending.values()) {
       const args = mergeAccioToolArgs(entry.fragments)
@@ -566,7 +704,67 @@ export function accioToolCallMergeTransform(): TransformStream<Uint8Array, Uint8
       })
     }
     pending.clear()
-    out.push(`data: ${JSON.stringify({ content: { role: 'model', parts }, partial: true })}`)
+    // ⚠️ 终帧元数据**拼在同一帧**上（与上游原形一致）：归一化层会把
+    // `usage_metadata`/`finish_reason` 映射到 `usageMetadata`/`finishReason`，
+    // 消费侧于是拿到真实的用量与结束原因。
+    const frame: Record<string, unknown> = {
+      content: { role: 'model', parts },
+      partial: true,
+      ...(pendingMeta !== undefined ? pendingMeta : {}),
+    }
+    pendingMeta = undefined
+    out.push(`data: ${JSON.stringify(frame)}`)
+  }
+
+  /**
+   * 生成一个**不与已有键冲突**的匿名调用键。
+   *
+   * ⚠️ 原先用 `anon-${pending.size}`：一旦上游**显式**下发 `id: "anon-0"` 之类，
+   * 两者会撞进同一个 `pending` 条目 ⇒ **两个调用被误合并成一个**（名字被后者覆盖、
+   * 参数串接成非法 JSON，消费侧解析失败退化成 `{}`）。本 PR 把顶层 `function_call`
+   * 也纳入合并路径后，这条路才变得可达。
+   */
+  const anonKey = (): string => {
+    let n = pending.size
+    while (pending.has(`anon-${n}`)) n++
+    return `anon-${n}`
+  }
+
+  /**
+   * 把一帧里的工具调用 part 收进缓冲（按 `id` 分组、保持首见顺序）。
+   * `content.parts` 形状与改写后的顶层 `function_call` 形状共用这一条路径。
+   *
+   * ⚠️ **同时暂存帧上的终帧元数据**：上游会把最后一个分片与
+   * `turn_complete`/`usage_metadata`/`finish_reason` 放在同一帧（见
+   * `pendingMeta` 的注释）。只吸收 part 不存元数据 = 吞掉 usage 与 finish。
+   *
+   * ⚠️⚠️ **畸形 part 只跳过、绝不抛**（2026-10-13 审计修正）：`function_call` 为
+   * `null` / 非对象时原先直接解引用 `call.id` ⇒ **裸 `TypeError` 打断整条流**，
+   * 且 `transform` 的异常发生在 `controller.enqueue` **之前** ⇒ **同一个 chunk 里
+   * 已经解析出的正文/思考一起被丢掉**（这正是 `consumeAccioSse` 的 `pendingError`
+   * 设计要避免的同型缺陷，在上一层复发）。而且裸 `TypeError` 不是 `LlmError` ⇒
+   * harness 归类 `UNKNOWN`、**不在可重试集合**，用户只能重新发。
+   * ⇒ 判据与 `normalizeAccioPart` 保持一致：**不是对象就跳过**（那里同样丢弃无名调用）。
+   */
+  const absorbCallParts = (callParts: unknown[], meta: Record<string, unknown> | undefined): void => {
+    for (const part of callParts) {
+      const call = (part as { function_call?: unknown } | null)?.function_call
+      if (call === null || typeof call !== 'object' || Array.isArray(call)) continue
+      const c = call as Record<string, unknown>
+      const id = typeof c.id === 'string' && c.id !== '' ? c.id : anonKey()
+      const name = typeof c.name === 'string' ? c.name : ''
+      // ⚠️ 参数三种形态与 `normalizeAccioPart` **同口径**（`args_json` snake 实测 /
+      // `argsJson` camel / 对象 `args`）。原先只认 `args_json` ⇒ 另两种形态被
+      // **静默清空为 `{}`**（模型以为执行了，实际用空参数跑工具 —— 比报错更坏）。
+      const args = accioArgsTextOf(c)
+      const entry = pending.get(id)
+      if (entry === undefined) pending.set(id, { id, name, fragments: args === '' ? [] : [args] })
+      else {
+        if (name !== '') entry.name = name
+        if (args !== '') entry.fragments.push(args)
+      }
+    }
+    if (meta !== undefined) pendingMeta = mergeFrameMeta(pendingMeta, meta)
   }
 
   /** 处理一行；把要交出的行推进 `out`。 */
@@ -576,9 +774,80 @@ export function accioToolCallMergeTransform(): TransformStream<Uint8Array, Uint8
     if (payload === '' || payload === '[DONE]') { flushPending(out); out.push(line); return }
     let parsed: unknown
     try { parsed = JSON.parse(payload) } catch { flushPending(out); out.push(line); return }
-    const frame = parsed as { content?: { parts?: unknown }; [key: string]: unknown } | null
+    const frame = parsed as { content?: { parts?: unknown }; function_call?: unknown; [key: string]: unknown } | null
+
+    /**
+     * ⚠️⚠️ **流内错误帧绝不能被吸收**（2026-10-13 审计修正，本 PR 引入的净回归）。
+     *
+     * 错误判据（`accioErrorFrame`）在**下一层** `consumeAccioSse` 的 `processLine` 里，
+     * 而本层跑在它**之前**。若错误帧恰好与工具 part **同帧**（上游确实会在帧上混发
+     * `error_code`），本层的改写/吸收会新造一个只含 `content.parts` 的帧 ⇒
+     * `error_code` / `error_message` 被吞 ⇒ 下一层的判据再也看不到它 ⇒
+     * **额度/认证失败被反转成「工具调用成功」**，服务端原文一个字都到不了用户眼前
+     * （违反铁律「流内错误必须抛出」「绝不丢服务端原文」）。
+     *
+     * ⇒ 错误帧**原样透传**（不 flush、不改写、不吸收），把判据留给下一层。
+     * 判据复用 `isAccioErrorFrame` —— **只此一处**，不在这里另写一份（两份必然漂移）。
+     *
+     * ⚠️ **投递边界的如实说明**（2026-10-13 对抗验证追问）：错误帧**之前**已产出的帧
+     * 一定交付（本层先 `flushPending`/已 `enqueue`，下一层也是先交出再抛）；
+     * 与错误帧**同 chunk** 且在其**之后**的帧也会交付（同一批 `out`）；
+     * 但**跨 chunk 的后续帧不会交付** —— 下一层抛出后流即终止，这是「流内错误
+     * ⇒ 整条流作废」的**刻意设计**，不是丢失。此处不要试图「抢救」后续帧：
+     * 上游报错后继续读只会得到无意义的数据。
+     */
+    if (isAccioErrorFrame(frame)) { flushPending(out); out.push(line); return }
+
     const parts = frame?.content?.parts
-    if (!Array.isArray(parts)) { flushPending(out); out.push(line); return }
+    const hasPartsArray = Array.isArray(parts)
+    const topCall = frame?.function_call ?? frame?.functionCall
+    /**
+     * ⚠️ **改写的触发条件看「`content.parts` 不是数组」，不是「`content` 缺失」**
+     * （2026-10-13 审计修正）。上游确实会下发 `{content:{role:'model'}}`
+     * （**有 content 无 parts**，PR 文档 §4.4.0 自己记录的真实终帧形状）——
+     * 原先要求 `content` 完全缺失，于是这种帧里的顶层 `function_call` 被**静默丢弃**
+     * ⇒ 工具调用凭空消失 ⇒ 又回到「思考一下就中断」。
+     *
+     * ⚠️ **改写是加性的**：用 `{...frame}` 保留帧上其余顶层字段
+     * （`usage_metadata` / `finish_reason` / 上游将来新增的字段）。新造只含
+     * `content` 的帧会把它们一并丢弃。
+     *
+     * ⚠️ **如实登记一处已知损失**（2026-10-13 对抗验证追问）：被**吸收**的工具帧最终由
+     * `flushPending` **重新合成**（`{content:{role,parts}, ...pendingMeta}`）⇒
+     * 原帧 `content` 内的**非 `parts`** 字段（如上游附加键）**不会**出现在合成帧里。
+     * 实测这**不影响下游**：消费侧只读 `content.parts` / `usageMetadata` /
+     * `finishReason`（`consumeGeminiSse` 的 `processFrame`）。故**刻意不为它增加
+     * 一条元数据通道** —— 那会让合并层多背一个「原帧 content 附加键」的包袱，
+     * 收益为零。若将来上游出现消费侧真正要读的 content 级字段，**必须**在此处
+     * 一并接上（否则会被静默丢弃）。
+     *
+     * ⚠️ **`candidates` 已存在时绝不改写**：那种帧是**标准 Gemini 形状**，
+     * 归一化层对它是「原样透传」（`normalizeAccioFrame` 的 `Array.isArray(f.candidates)`
+     * 分支）。本层若照改写就会把 `candidates` 里的正文**整帧吞掉** ——
+     * 两层判据不一致（AGENTS.md 反复记的「一文件两套同义判据」）。
+     */
+    let effectiveLine = line
+    if (!hasPartsArray
+      && frame !== null && typeof frame === 'object'
+      && topCall !== null && typeof topCall === 'object' && !Array.isArray(topCall)
+      && !Array.isArray(frame.candidates)) {
+      effectiveLine = `data: ${JSON.stringify({
+        ...frame,
+        content: { role: 'model', parts: [{ function_call: topCall }] },
+      })}`
+    }
+    // ⚠️ 帧上的终帧元数据（`turn_complete`/`usage_metadata`/`finish_reason`）：
+    // 与最后一个工具分片同帧到达（见 pendingMeta 注释），吸收时必须一并暂存。
+    const meta = frameMetaOf(frame)
+    if (effectiveLine !== line) {
+      const rewritten = JSON.parse(effectiveLine.slice(5).trim()) as { content?: { parts?: unknown } }
+      const rewrittenParts = rewritten.content?.parts
+      if (Array.isArray(rewrittenParts)) {
+        absorbCallParts(rewrittenParts, meta)
+        return
+      }
+    }
+    if (!hasPartsArray) { flushPending(out); out.push(line); return }
 
     const isCall = (part: unknown): boolean =>
       part !== null && typeof part === 'object'
@@ -601,18 +870,7 @@ export function accioToolCallMergeTransform(): TransformStream<Uint8Array, Uint8
     if (otherParts.length > 0) {
       out.push(`data: ${JSON.stringify({ ...frame, content: { ...frame!.content, parts: otherParts } })}`)
     }
-    for (const part of callParts) {
-      const call = (part as { function_call: Record<string, unknown> }).function_call
-      const id = typeof call.id === 'string' && call.id !== '' ? call.id : `anon-${pending.size}`
-      const name = typeof call.name === 'string' ? call.name : ''
-      const args = typeof call.args_json === 'string' ? call.args_json : ''
-      const entry = pending.get(id)
-      if (entry === undefined) pending.set(id, { id, name, fragments: args === '' ? [] : [args] })
-      else {
-        if (name !== '') entry.name = name
-        if (args !== '') entry.fragments.push(args)
-      }
-    }
+    absorbCallParts(callParts, meta)
   }
 
   return new TransformStream<Uint8Array, Uint8Array>({

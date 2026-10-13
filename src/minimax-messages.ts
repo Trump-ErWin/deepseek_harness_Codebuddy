@@ -58,6 +58,7 @@ import type {
   ContentBlock,
   FinishReason,
   Message,
+  RequestMessage,
   StreamChunk,
   ToolSchema,
   TokenUsage,
@@ -76,7 +77,16 @@ import { createDsmlMarkerNormalizer, fixDsmlMarkers, resolveToolPairing } from '
  */
 export function buildMinimaxMessagesPayload(options: {
   model: string
-  messages: readonly Message[]
+  /**
+   * 待翻译的历史。
+   *
+   * ⚠️ 类型是 **`RequestMessage`**（= `Message | RequestUserInput`）而不是
+   * `Message`：0.2.0 的 `GenerateOptions.messages` 就是这个联合 —— 一次性
+   * 调用方（标题生成、子请求）可以传**无 id / 无 source** 的用户输入。
+   * 下游 `serializeMinimaxMessages` 第 1 步就把它交给
+   * `normalizeHarnessMessages`（按结构读取），全程不触碰 `id` / `source`。
+   */
+  messages: readonly RequestMessage[]
   system?: string
   tools?: readonly ToolSchema[]
   temperature?: number
@@ -184,7 +194,7 @@ export interface MinimaxInlineImage {
  * 调用方没内联成功时**不静默丢图** —— 那会让用户以为图片被模型看到了。
  */
 export function serializeMinimaxMessages(
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   images?: ReadonlyMap<string, MinimaxInlineImage>,
 ): Array<Record<string, unknown>> {
   // ⚠️⚠️ 步骤 1：归一化「一等 tool 消息」形状（**本 provider 曾因此整轮 400**）。
@@ -275,15 +285,24 @@ export function serializeMinimaxMessages(
         })
         continue
       }
-      if (block.type === 'tool-result') {
+      // ⚠️ 判据必须走**宽松读取**而不是直接 `block.type === 'tool-result'`：
+      // 0.2.0 的 `ContentBlockMap` 已删除 `'tool-result'`（它只是 ≤0.1.6 的
+      // 历史形状），直接比较会让 TS 把该分支收窄成 `never`（TS2367）并连带
+      // 报出 `toolCallId`/`content`/`isError` 不存在。此处读的是
+      // `normalizeHarnessMessages` 降级产出的**宽松块**，故按结构读取。
+      const legacy = block as { type?: unknown; toolCallId?: unknown; content?: unknown; isError?: unknown }
+      if (legacy.type === 'tool-result') {
         // ⚠️ 孤儿结果不下发（服务端同样 400）。
-        if (!keepResultIds.has(String(block.toolCallId))) continue
+        if (!keepResultIds.has(String(legacy.toolCallId))) continue
         pendingToolResults.push({
           type: 'tool_result',
-          tool_use_id: block.toolCallId,
+          tool_use_id: legacy.toolCallId,
           // ⚠️ 工具结果内的图片也要内联（否则「工具返回截图」的场景会丢图）。
-          content: serializeToolResultContent(block.content, images),
-          ...(block.isError === true ? { is_error: true } : {}),
+          content: serializeToolResultContent(
+            Array.isArray(legacy.content) ? legacy.content as readonly ContentBlock[] : [],
+            images,
+          ),
+          ...(legacy.isError === true ? { is_error: true } : {}),
         })
         continue
       }
