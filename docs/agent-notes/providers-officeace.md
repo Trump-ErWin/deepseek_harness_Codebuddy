@@ -286,6 +286,10 @@ assistant 消息只有 `reasoning` + `text` 两块、**没有任何 `tool/call` 
 
 ### ⚠️⚠️ OfficeAce **默认不走 DSML**（2026-10-13 三次事故后决定）
 
+> ⚠️ 这里的「三次事故」是**当时**的计数；当天晚些又发生第四次
+> （「聚合 provider 很快就结束了没有原因」），见下方「第四次事故」。
+> 两者根因同族：协议实现散落，换个通道/换个笔误就漏一半。
+
 `officeace-adapter.ts` 的 `dsmlMode` **默认 `false`**，只有
 `OFFICEACE_DSML=1` 且模型匹配 `needsDsmlToolMode` 时才为真。
 
@@ -331,6 +335,67 @@ assistant 消息只有 `reasoning` + `text` 两块、**没有任何 `tool/call` 
 
 ⚠️ 与 §6 的 `reasoning-delta` 归一化缺口是**两件事**：那条是「标记写坏了要修」，
 本条是「协议根本没接全」。
+
+### ⚠️⚠️⚠️ 第四次事故（2026-10-13 晚，用户报障「聚合 provider 很快就结束了没有原因」）
+
+**现场取证**（真实会话 `session-bac90b72`，逐字样本）：
+
+| seq | provider/model | 观感 |
+|---|---|---|
+| 17 / 34 | `aggregate/deepseek-v4-1-flash` | reasoning + 一句正文，`finish=stop`，**零 tool-call**，usage 全 0 |
+| 47 | `codearts/deepseek-v4.1-flash` | text 块**整段是 DSML 原文**（690 字符） |
+
+**根因不是「协议没接」，而是「协议接了但读不出这一种笔误」**：
+模型输出的是
+
+```
+<｜DSML｜ calls>\n<｜DSML｜ invoke name="pwsh">\n<｜DSML｜ parameter name="command" string="true">…</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>
+```
+
+`｜DSML｜` 之后**带空格**，且不只在 `calls` 上 —— `invoke` / `parameter` 同样中招。
+而当时 `feed()` 的归一正则 `(<\/?)｜DSML｜\s*(?:tool_)?calls>` **只覆盖
+`tool_calls` / `calls` 一种名字** ⇒ `indexOf(DSML_INVOKE_OPEN_PREFIX)`
+恒不命中 ⇒ `parseDsmlToolCalls` 返回**空数组** ⇒ `in-dsml` 分支把它当
+「解析成功但无调用」⇒ **整段工具调用被静默丢弃**。
+
+⇒ 症状与「无报错中断」同型，且**比标签泄漏更糟**：用户连「模型写了什么」
+都看不到（那 690 字符不是泄漏，是同一根因在**整帧**路径下的另一种表现）。
+
+⚠️ **这条与 §5.6 前三版是同一个病根的第四种形态**：协议定义散落、
+换个通道/换个笔误就漏一半。修法仍是**收归一处**（`normalizeDsmlText`）。
+
+**本轮修的 4 条真缺陷**（均反向验证，见 `scripts/reverse-verify-dsml.mjs`）：
+
+1. **`invoke` / `parameter` 的空白形态从未被归一** ⇒ 内容凭空消失。
+   新增 `normalizeDsmlLabel`（对**任意**标签名压空白，名字规则与
+   `normalizeDsmlText` 同源）。
+2. **`parseDsmlToolCalls` 的空数组被当「解析成功」** ⇒ `in-dsml` 分支
+   静默丢块。改为 `parsed === undefined || parsed.length === 0` 一并放行原文。
+3. **`parseDsmlInvoke` 在整块上搜 `name=`** ⇒ 模型漏写 invoke 的 name 时，
+   第一个 `name=` 命中 **parameter 名** ⇒ 工具名变成 `command` /
+   `path` / `pattern` ⇒ `unknown tool "command"`。改为只在 invoke 开标签内找。
+4. **`fixDsmlMarkers` 的 `DSML` 后前视漏了字母** ⇒ `<｜DSML｜｜invoke`
+   （右侧双竖线后紧跟 `i`）**一条都修不了**，只修左侧、留下半修形态。
+   前视补上协议标签名首字母 `[tcip]`（`t`ool_calls / `c`alls /
+   `i`nvoke / `p`arameter / `t`hought）；**不泛化成任意字母**，否则
+   `DSMLX` 这类普通词重新被误伤。
+
+**顺带修的两条判据缺口**（都在 `isDsmlLabelPrefix`，均为本轮自伤后修复）：
+
+- 第二段写成 `｜{2,}` 只认双竖线 ⇒ **漏掉规范单竖线形态**（多空白别名走的路）
+  ⇒ 标签被提前放行（`dsml-consume-wiring` ⑤ 实测变红）。改回 `｜+`。
+- `DSML` 四字符本身会被拆帧切开（逐字符时 `<｜D`、`<｜DS`…），
+  加第一段 `^<｜{0,3}$` 纯竖线判据 + 第二段 `D(?:S(?:M(?:L)?)?)?` 逐级可选。
+
+**新增守卫**：`tests/unit/dsml-label-forms.spec.ts`（23 条，**行为级**）。
+灵魂是**二分帧 + 逐字符穷举**，样本直接抄**真实会话原文**（自造 fixture
+曾在真实数据上失效，见 `session-replay.spec.ts` 的建立理由）。
+
+⚠️ **`aggregate` 为何也中招**：它只是**透传** `options`（含 `tools`）给
+`ctx.llm.stream({ provider: target.provider, model: target.realId })`，
+下层 codearts 注入了 DSML 提示、模型写 DSML、解析器读不出 ⇒
+**聚合层零改动也照样中招**。即：这类缺陷的排查不能停在聚合层。
+
 
 ## 6. 待办 / 已知缺口
 

@@ -551,6 +551,59 @@ textOut = stripBareThinkCloseTagIfEnabled(textOut)       // 兜底，默认关
 **这是上游行为，不是我们的重复发射**（帧是独立的两条，非同一帧二次发射），
 **不需要处理**。
 
+#### ⚠️⚠️⚠️ 「没有任何报错就中断」怎么查（DSML 篇：内容凭空消失比标签泄漏更糟）
+
+用户报障（2026-10-13 晚）：**「用聚合 provider 的 ds v4.1 flash 发起会话很快
+就结束了没有原因」**、**「指定 codebuddy 的 ds v4.1 flash 重复执行后出现
+DSML tag 泄露并终止」**。怀疑与最近几个 DSML 提交有关。
+
+**排查路径（可复用）**：这类现象**无法靠读代码推断**，必须回会话日志。
+`inspect-session.mjs` 不在仓库里时，用 `zstdDecompressSync` 直接读
+`~/.dsh/sessions/<工作区转义名>/<session-id>/session.v4.jsonl.zstd`
+（工作区名把 `\` `/` `:` 换成 `-`）。三步：
+
+1. **找现场**：`model/selection` 事件给出每轮的 provider/model；
+   `assistant/message` 的 `data.message.content` 给出落盘的块。
+2. **看块结构与 finish**：只有 reasoning+text、零 tool-call、`finish=stop`、
+   usage 全 0 ⇒ 工具调用被吞（不是模型抖动）。
+3. **看原始 chunk 流**（`data.stream`）：`text-delta 数=0` 而 `block-end`
+   的 `block.text` 是整段原文 ⇒ 走的是 `flush()` 补回开标签那条路
+   ⇒ 提取器**从未认出**这个块。
+
+**本次真相**：模型输出
+
+```
+<｜DSML｜ calls>\n<｜DSML｜ invoke name="pwsh">\n<｜DSML｜ parameter name="command" string="true">…</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>
+```
+
+`｜DSML｜` 之后**带空格**，且 `invoke` / `parameter` 同样中招 —— 而归一正则
+`(<\/?)｜DSML｜\s*(?:tool_)?calls>` **只覆盖 `tool_calls` / `calls` 一种名字**。
+⇒ `indexOf(DSML_INVOKE_OPEN_PREFIX)` 恒不命中 ⇒ `parseDsmlToolCalls` 返回
+**空数组** ⇒ `in-dsml` 分支把它当「解析成功但无调用」⇒ **整段被静默丢弃**。
+
+⚠️⚠️ **`[]` 与「解析出一个调用」在旧实现里走同一支**（`toolCalls.push(...parsed)`，
+空数组 push 0 个）⇒ 静默。这是本仓库反复出现的那类缺陷的又一变体：
+**「空」被当成「正常的无」**。判据必须显式区分，且方向取「**宁可漏判不可误伤**」
+—— 放行原文让用户看得见，远比凭空消失好诊断。
+
+⚠️ **`aggregate` 为何也中招**：它只透传 `options` 给下层
+（`ctx.llm.stream({ provider: target.provider, model: target.realId })`），
+下层 codearts 注入 DSML 提示、模型写 DSML、解析器读不出 ⇒ **聚合层零改动
+也照样中招**。⇒ 这类缺陷的排查**不能停在聚合层**，必须追到真实 provider。
+
+**其它同型现场（同一根因的不同表现）**：
+
+| 表现 | 触发条件 |
+|---|---|
+| 内容凭空消失、`finish=stop` | 空格形态 + 空数组被当成功（**拆帧**路径） |
+| 690 字符 DSML 原文进 text 块 | 空格形态但**整帧**到达（`flush()` 补回开标签） |
+| `unknown tool "command"` | `parseDsmlInvoke` 在整块上搜 `name=`，误命中 parameter 名 |
+| 半修形态 `<｜DSML｜invoke` | `fixDsmlMarkers` 的 `DSML` 后前视漏了字母 |
+
+完整修法与守卫见 `providers-officeace.md` §5.6「第四次事故」，
+行为级守卫 `tests/unit/dsml-label-forms.spec.ts`（23 条，二分帧穷举），
+反向验证 `scripts/reverse-verify-dsml.mjs`（7/7 有效）。
+
 #### ⚠️ 正文（text 通道）死循环：必须**独立实例**且**绝不 `cancel()`**
 
 **真实缺陷**（用户报障，2026-09-25）：唯一活动 session（`lilishop-go` /

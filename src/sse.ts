@@ -1026,9 +1026,25 @@ export function fixDsmlMarkers(text: string): string {
   //    方向遵循仓库元规则「**宁可漏判不可误伤**」：宁可放过一个真坏标记，
   //    也不可篡改用户的合法正文。
   //    合法边界 = 竖线 / 空白 / `>` / `/` / 字符串结尾。
+  //
+  // ⚠️⚠️⚠️ **前视必须包含「协议标签名首字母」**（2026-10-13 二次审计修正）：
+  //    原前视只列 `｜|\s|>|\/|$`，**漏了字母** ⇒ 实测形态
+  //    `<｜｜DSML｜｜invoke name="…">`（右侧双竖线后紧跟 `invoke` 的 `i`）
+  //    **一条都修不了**：第一段把 `<｜｜DSML` 修成 `<｜DSML`，第二段却因
+  //    `DSML｜｜` 后视遇到 `i` 而跳过 ⇒ 留下 `<｜DSML｜｜invoke` 这种半修
+  //    形态，比不修更糟（看起来修过、实际仍解析不了）。
+  //    本文件 `dsml.ts` 的 `normalizeDsmlText` 已同步加上同一前视
+  //    （两份判据必须同源，由 `dsml-label-forms.spec.ts` ⑦ 对拍锁死）。
+  //
+  //    合法边界的完整集合 = `｜` / 空白 / `>` / `/` / `$` **∪ 协议标签名的
+  //    首字母**（`t`ool_calls、`c`alls、`i`nvoke、`p`arameter、`t`hought）。
+  //    ⚠️ 不泛化成「任意字母」：那会让 `DSMLX` 这类以 DSML 开头的普通词
+  //    重新被误伤（正是本轮要守住的边界）。
+  //    ⚠️ `t` 同时是 `tool_calls` 与 `thought` 的首字母（字符类里去重即可）。
+  const AFTER = '(?=｜|\\s|>|\\/|$|[tcip])'
   return text
-    .replace(/(<\/?)｜{2,}DSML(?=｜|\s|>|\/|$)/g, '$1｜DSML')
-    .replace(/DSML｜{2,}(?=｜|\s|>|\/|$)/g, 'DSML｜')
+    .replace(new RegExp(`(<\\/?)｜{2,}DSML${AFTER}`, 'g'), '$1｜DSML')
+    .replace(new RegExp(`DSML｜{2,}${AFTER}`, 'g'), 'DSML｜')
 }
 
 /**
