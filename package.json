@@ -31,6 +31,7 @@
     "pretest": "pnpm typecheck:tests",
     "test": "vitest run",
     "test:e2e:login": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/login.e2e.spec.ts",
+    "test:e2e:officeace": "cross-env DSH_OFFICEACE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/officeace-incognito-login.e2e.spec.ts",
     "test:e2e:buddy": "cross-env DSH_BUDDY_E2E=1 DSH_BUDDY_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-models.e2e.spec.ts",
     "test:e2e:buddy-cache": "cross-env DSH_BUDDY_E2E=1 DSH_BUDDY_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-cache-probe.e2e.spec.ts",
     "test:e2e:buddy-probe": "cross-env DSH_BUDDY_PROBE=1 vitest run --config vitest.e2e.config.ts tests/e2e/buddy-login-probe.e2e.spec.ts",

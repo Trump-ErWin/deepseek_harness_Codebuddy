@@ -40,6 +40,8 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { OFFICEACE } from './officeace-product.js'
+import { SerialQueue } from './serial-queue.js'
+import { shouldRefreshNow } from './expiry-sync.js'
 
 /** WebCrypto 的 JWK/CryptoKey 类型（lib.dom 不可用时手动声明最小形状）。 */
 export type DpopPrivateJwk = { kty?: string; crv?: string; x?: string; y?: string; d?: string }
@@ -672,6 +674,28 @@ async function doRefreshCredential(
  *
  * ⚠️ 返回值恒 `undefined`（`void` 语义）：续期成功与否由**调用方后续读凭据**
  * 判定，这里不抛错 —— 与其余渠道一致（失败不阻断批量续期）。
+ *
+ * ## ⚠️⚠️⚠️ per-ref 串行 + 锁内重读 + 终态前重读（2026-10-13 审计补齐）
+ *
+ * 模块头（`:30-31`）自己写明 `refresh_token` **一次性**，而三条续期入口
+ * （定时器 `refreshAll` / 适配器 401 兜底 / 面板 `account.refresh` 与自愈）
+ * 都会并发进入**同一个 ref**。原先这里直连 `doRefreshCredential` ⇒
+ * 先到者消费掉 token、后到者拿 STS5.1806；更糟的是若先到者写盘前被中断，
+ * **新 token 永久丢失、只能重新登录**。
+ *
+ * ⚠️ 原先的 `refreshInFlight` 闸只包住了 `refreshStoredCredential`
+ * （**兼容的文件那条腿**），生产主路径完全绕过它 —— 「加了锁但加错了一条腿」。
+ *
+ * 三条规则**必须一起**（同 codearts；AGENTS.md 记过「只搬第一条会继续误标」）：
+ * 1. **per-ref 串行**（`SerialQueue`）：同进程内三条入口必然串行；
+ * 2. **锁内重读 + lead-time**：拿到锁时凭据可能已被上一轮换新，距过期还早时
+ *    只对账池值、**不发第二次请求**（少烧一个一次性 token）；
+ * 3. **判终态前重读**：续期被拒时先看磁盘那份 `refresh_token` 是否**已经不等于**
+ *    本次用的那份 —— 并发下服务端烧掉的是**旧的**一份，磁盘上此刻躺着**新的、
+ *    可用的**凭据，那是「他处已续成功」而不是「本账号不可续期」。
+ *
+ * ⚠️ 该锁**只在单进程内有效**（dsh web 与 desktop 各自持锁），
+ * 跨进程互踩靠上面第 3 条兜 —— 两处都得有。
  */
 export async function refreshAccountCredential(
   refName: string,
@@ -679,24 +703,91 @@ export async function refreshAccountCredential(
   accountId: string,
   credentials?: CredentialStore,
 ): Promise<void> {
-  // ⚠️ **优先走 DSH 凭据库**（多账号的正确路径）：按 ref 读、续期、写回。
-  //    回落文件版 `refreshStoredCredential(ref)` 只为兼容老数据。
-  const current = await readCredential(refName, credentials)
-  if (current === undefined) {
-    const legacy = await refreshStoredCredential(refName).catch(() => undefined)
-    await writebackExpiry(legacy, pool, accountId)
-    return
+  await queueFor(refName).run(async () => {
+    // ⚠️ **锁内重读**（规则 2）：等锁期间上一轮可能已换好凭据并落盘。
+    const current = await readCredential(refName, credentials)
+    if (current === undefined) {
+      const legacy = await refreshStoredCredential(refName).catch(() => undefined)
+      await writebackExpiry(legacy, pool, accountId)
+      return
+    }
+    // ⚠️ **lead-time 判据**（规则 2 的另一半）：STS 凭据寿命约 2 小时，
+    //    而定时器每 30 分钟跑一轮 —— 无条件续期等于**每 30 分钟烧掉一个
+    //    一次性 refresh_token**（一天 48 次），且每次还捎带一次
+    //    `fetchModelInfo` 的签名请求。距过期还早时只对账池值、不发请求。
+    if (!shouldRefreshNow(officeaceExpiresAtMs(current))) {
+      await writebackExpiry(current, pool, accountId)
+      return
+    }
+    const next = await doRefreshCredential(current)
+    if (next === undefined) {
+      // ⚠️ **判终态前重读**（规则 3）：先确认「是不是别处已经续成功了」。
+      const elsewhere = await latestAfterFailedRefresh(refName, credentials, current)
+      await writebackExpiry(elsewhere, pool, accountId)
+      return
+    }
+    if (credentials !== undefined) {
+      try {
+        await credentials.set(credentialRef(refName), JSON.stringify(next))
+      } catch { /* 写回失败不阻断 */ }
+    } else {
+      writeStoredCredential(next, refName)
+    }
+    await writebackExpiry(next, pool, accountId)
+  })
+}
+
+/**
+ * per-`credentialRef` 的串行队列（与 codearts 的 `refreshQueues` 同型）。
+ *
+ * ⚠️ 队列表**必须有上限**：账号可被反复增删，无界 Map 会缓慢泄漏。
+ */
+const refreshQueues = new Map<string, SerialQueue>()
+
+function queueFor(refName: string): SerialQueue {
+  const existing = refreshQueues.get(refName)
+  if (existing !== undefined) return existing
+  const created = new SerialQueue()
+  if (refreshQueues.size >= 64) {
+    // ⚠️ 超额时先淘汰**最早创建**的那个（Map 保序）—— 丢一把锁只是退回
+    // 「并发窗口」这个既有形态，不会丢凭据、也不会抛错。
+    const oldest = refreshQueues.keys().next()
+    if (!oldest.done) refreshQueues.delete(oldest.value)
   }
-  const next = await doRefreshCredential(current)
-  if (next === undefined) return
-  if (credentials !== undefined) {
-    try {
-      await credentials.set(credentialRef(refName), JSON.stringify(next))
-    } catch { /* 写回失败不阻断 */ }
-  } else {
-    writeStoredCredential(next, refName)
-  }
-  await writebackExpiry(next, pool, accountId)
+  refreshQueues.set(refName, created)
+  return created
+}
+
+/** 凭据里读到的过期时刻（毫秒）；读不到/非法返回 `undefined`（⇒ 需要续期）。 */
+function officeaceExpiresAtMs(credential: OfficeAceCredential): number | undefined {
+  // ⚠️ 华为 STS 的 `expiration` 是 **ISO 8601 字符串**（不是数值时间戳），
+  //    故这里**不需要** buddy / accio 那条秒→毫秒归一化，也不是一个 bug。
+  const parsed = Date.parse(credential.expiresAt)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+}
+
+/**
+ * 续期失败后判断「是不是别处已经续成功了」。
+ *
+ * 并发/跨进程下，服务端烧掉的是**旧的**那份 `refresh_token`，而此刻磁盘上
+ * 可能正躺着一份**新的、可用的**凭据 —— 那是「他处已续成功」，不是本账号失效。
+ * 少了这层判据，一次交错就会把好账号永久标死（与 codearts 同型事故）。
+ *
+ * @returns 磁盘上那份**更新**的凭据；若确实没有更新则 `undefined`（真终态）。
+ */
+async function latestAfterFailedRefresh(
+  refName: string,
+  credentials: CredentialStore | undefined,
+  attempted: OfficeAceCredential,
+): Promise<OfficeAceCredential | undefined> {
+  const latest = await readCredential(refName, credentials).catch(() => undefined)
+  if (latest === undefined) return undefined
+  if (latest.refreshToken === attempted.refreshToken) return undefined
+  // ⚠️ 只在「换过 token」且「新 token 尚未过期」时才认为他处续成功；
+  //    一份同样已过期的凭据不该被当成好消息。
+  const exp = officeaceExpiresAtMs(latest)
+  if (exp === undefined || Date.now() >= exp) return undefined
+  return latest
 }
 
 /** 把新有效期写回账号池条目（与 gemini 同款），抽出来供两条路径复用。 */

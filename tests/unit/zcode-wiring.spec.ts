@@ -446,7 +446,13 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     // 提交流程里不应有 zcode 专属分支。
     expect(source).not.toMatch(/else if \(provider === 'zcode'\)/)
     // 通用路径仍在：拿到 loginUrl 就弹窗。
-    expect(source).toMatch(/const loginWindow = window\.open\(loginUrl/)
+    // ⚠️ 判据**刻意不锚定 `const`、也不锚定「声明与赋值同一行」**
+    //    （2026-10-13 改造）：OfficeAce 的换账号登录需要「宿主已开无痕窗时就不再弹」
+    //    的分支，于是该变量变成 `let loginWindow = null;` 提前声明、
+    //    `window.open(...)` 移到分支内（两种打开方式都要持有它，供轮询结束时关窗）。
+    //    本用例要守的是「**通用弹窗路径仍在**」，与声明位置无关 —— 写死形态会让
+    //    一次纯结构重构假失败（仓库既有教训：接线类断言须容忍重构）。
+    expect(source, '通用 window.open 弹窗路径不见了').toMatch(/window\.open\(loginUrl/)
     // 空 loginUrl 的通用错误分支也要保留（它是所有 provider 的兜底）。
     expect(source).toMatch(/后端未返回登录地址/)
   })

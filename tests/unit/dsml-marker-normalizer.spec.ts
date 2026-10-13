@@ -62,6 +62,34 @@ describe('fixDsmlMarkers（整串）', () => {
   it('⑥ 三根竖线也收敛到一根', () => {
     expect(fixDsmlMarkers(`<${BAR}${BAR}${BAR}DSML${BAR}${BAR}${BAR} calls>`)).toBe(GOOD_OPEN_CALLS)
   })
+
+  /**
+   * ⚠️⚠️ **`DSML` 后必须有分隔边界**（2026-10-13 审计修正）。
+   *
+   * 原判据只要求「`<` + 双竖线 + `DSML`」，**不要求后面跟什么** ⇒ 正文里任何
+   * 以 `DSML` 开头的普通词（如讨论 DSML 协议的助手输出、代码片段、日志转储）
+   * 都会被无声改掉一个竖线。这是**篡改用户的合法正文**。
+   *
+   * 方向遵循仓库元规则「**宁可漏判不可误伤**」：宁可放过一个真坏标记，
+   * 也不可改坏一段正常文本。合法边界 = 竖线 / 空白 / `>` / `/` / 字符串结尾。
+   */
+  it('⑦ `DSML` 后无分隔边界时**不动**（不得篡改合法正文）', () => {
+    // 讨论 DSML 协议本身 —— 极易被过宽判据误伤
+    const discussing = `<${BAR}${BAR}DSMLX 这不是标记，只是文字`
+    expect(fixDsmlMarkers(discussing), 'DSMLX 不是标记，原样保留').toBe(discussing)
+    // 右侧同理
+    const rightSide = `工具名 DSML${BAR}${BAR}Xyz 也不是标记`
+    expect(fixDsmlMarkers(rightSide), '右侧也无边界时不改').toBe(rightSide)
+  })
+
+  it('⑧ `DSML` 后有分隔边界时**仍要修**（收紧不得变成漏判）', () => {
+    // 五种合法边界逐一验过：收紧判据的目的是「少误伤」而非「不修」
+    expect(fixDsmlMarkers(`<${BAR}${BAR}DSML${BAR} calls>`)).toBe(GOOD_OPEN_CALLS)
+    expect(fixDsmlMarkers(`<${BAR}${BAR}DSML calls>`)).toBe(`<${BAR}DSML calls>`)
+    expect(fixDsmlMarkers(`<${BAR}${BAR}DSML>`)).toBe(`<${BAR}DSML>`)
+    expect(fixDsmlMarkers(`<${BAR}${BAR}DSML`)).toBe(`<${BAR}DSML`)
+    expect(fixDsmlMarkers(`</${BAR}${BAR}DSML${BAR} param>`)).toBe(`</${BAR}DSML${BAR} param>`)
+  })
 })
 
 describe('createDsmlMarkerNormalizer（流式安全）', () => {

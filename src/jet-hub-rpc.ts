@@ -18,6 +18,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
+import { openIncognitoWindow } from './login.js'
 import { AccountPool } from './account-pool.js'
 import { AUTO_PROVIDER as AUTO_PROVIDER_ID } from './auto-adapter.js'
 import { resolveAutoBadgeRewrite, type AutoBadgeState } from './auto-badge.js'
@@ -1736,6 +1737,14 @@ function registerJetHubEndpoints(
     RACCOON.id,
     MINIMAX.id,
     GEMINI.id,
+    // ⚠️ officeace（2026-10-13 审计补）：STS 寿命**约 2 小时**，正落在
+    // 「睡眠/挂起恢复后到定时器补触发那一轮之间」这个窗口内 ⇒ 漏登记的症状
+    // 与 issue IKKHL5 逐字相同（卡片红「已过期」+ 积分行 HTTP 401 + 窗口内
+    // 无手动自救），且**日志零字**。
+    // 同款陷阱已发生过一次（accio），见 `docs/agent-notes/providers-accio.md`
+    // 的「接线陷阱（新 provider 通用）」。⚠️ 它有真实 refresh 端点
+    // （`officeace-auth.ts` 的 `doRefreshCredential` 打华为 STS），故不属于豁免。
+    OFFICEACE.id,
   ])
 
   /**
@@ -2262,22 +2271,39 @@ function registerJetHubEndpoints(
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
         const accounts = await pool.listAccounts(req.provider)
-        // ⚠️ OfficeAce 自愈回填（2026-10-13）：`expiresAt` 回填是后加的
+        // ⚠️ OfficeAce 自愈回填（2026-10-13 修正）：`expiresAt` 回填是后加的
         //    （`6fb110f`），修复前登录留下的池条目缺这个字段 ⇒ 卡片恒显示
         //    「未知」且不会自己补上。列表时若发现缺失，从凭据文件读真实
         //    有效期补上并**写回池**（一次性自愈，之后走正常的登录/续期回填）。
+        //
+        // ⚠️⚠️ **必须逐账号按 ref 读凭据**（2026-10-13 审计修正，原为广播缺陷）：
+        //    原实现调 `readOfficeAceCredential()`（**无 ref** ⇒ 读共享的
+        //    `session.json`，即「最后一次登录的那个账号」）再把同一个值写给
+        //    **所有**缺 `expiresAt` 的账号 ⇒ 多账号下 A 的有效期显示成 B 的，
+        //    方向还可能相反（把好账号显示成已过期）。
+        //    这是 AGENTS.md「位置/键错位」防线复发的那一类（已复发 7 次）。
         if (req.provider === OFFICEACE.id && accounts.some((a) => a.expiresAt === undefined)) {
-          const credential = await auths.officeace?.readOfficeAceCredential?.().catch(() => undefined)
-          const expiresAt = credential?.expiresAt !== undefined
-            ? new Date(credential.expiresAt as string).getTime()
-            : Number.NaN
-          if (!Number.isNaN(expiresAt)) {
-            for (const account of accounts) {
-              if (account.expiresAt === undefined) {
-                account.expiresAt = expiresAt
-                void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
+          for (const account of accounts) {
+            if (account.expiresAt !== undefined) continue
+            // ⚠️ 逐账号 resolve：该账号自己的 `credentialRef`（**不是** ref 名）。
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+              .catch(() => null)
+            if (!resolved) continue
+            let expiresAt = Number.NaN
+            try {
+              // ⚠️ `expiresAt` 是 STS 的 ISO 8601 字符串（不是数值时间戳 ——
+              //    华为这侧没有 buddy / accio 那条秒/毫秒混淆，故无需归一化）。
+              const credential = JSON.parse(resolved.value) as { expiresAt?: unknown }
+              if (typeof credential.expiresAt === 'string') {
+                expiresAt = Date.parse(credential.expiresAt)
               }
-            }
+            } catch { /* 凭据不是合法 JSON ⇒ 跳过该账号 */ }
+            // ⚠️ 解析不出来就**跳过这个账号**（绝不广播、也绝不写 NaN：
+            // `updateAccount` 落盘时 `JSON.stringify` 会整个丢弃 `undefined`，
+            // 写 NaN 则会让卡片显示「已过期」——两者都比「显示未知」更糟）。
+            if (!Number.isFinite(expiresAt) || expiresAt <= 0) continue
+            account.expiresAt = expiresAt
+            void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
           }
         }
         return { ok: true, value: { accounts: await enrichAccountIdentity(accounts, req.provider) } }
@@ -2891,7 +2917,26 @@ function registerJetHubEndpoints(
             credentialRef: refName,
           })
 
-          return { ok: true, value: { accountId: id, loginUrl: started.authorizeUrl } }
+          // ⚠️ **宿主侧直接拉起无痕窗口**（2026-10-13，用户要求）：
+          //    华为 authui 会静默复用浏览器已有会话 ⇒ 带 cookie 打开授权页
+          //    看不到登录框 ⇒ 「新建账号」永远只能建出同一个号。无痕窗口是
+          //    全新 cookie jar，天然无会话，且**不碰用户日常浏览器里的
+          //    华为云控制台会话**（对比 `authui/logout`：它的作用域是整个
+          //    域，会连带登出控制台）。实测依据见 `login.ts` 的
+          //    `openIncognitoWindow` 注释。
+          //
+          // ⚠️ 客户端**无法**自己做这件事：`window.open` 不能请求无痕模式
+          //    （那是进程级启动参数），故必须由宿主 `spawn` 浏览器可执行文件。
+          //
+          // ⚠️ 打开失败（读不到默认浏览器 / spawn 失败）时返回 `false`，
+          //    客户端据此回退到自己的 `window.open` —— 保持原行为不变，
+          //    不让「换个打开方式」变成「开不了窗口」。
+          const incognitoOpened = openIncognitoWindow(started.authorizeUrl)
+
+          return {
+            ok: true,
+            value: { accountId: id, loginUrl: started.authorizeUrl, incognitoOpened },
+          }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }

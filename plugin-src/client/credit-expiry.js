@@ -106,7 +106,15 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
     }
     if (end - at < windowMs) {
       expiring += remaining;
-      if (earliestExpiringAt === null || end < earliestExpiringAt) earliestExpiringAt = end;
+      // ⚠️⚠️ **必须排除已过期的包**（2026-10-13 审计修正）：这里取的是临期桶里
+      //    **最早**的作废时刻用于倒计时，而 `end` 若不约束 `> at`，那么
+      //    「一个已过期但 `active` 仍为 true 的包」会**恒定当选**（它比任何
+      //    未来时刻都早）⇒ `expiryCountdown` 拿到过去时刻、返回空串 ⇒
+      //    **整段倒计时消失**，尽管桶里还有一笔钱几天后作废。
+      //    ⚠️ 可达性不是假设：TRAE 的 `active` 是**硬编码 true**
+      //    （`trae-credits.ts`），压根不反映是否过期。
+      //    方向：宁可少显示倒计时，不可显示一个错的。
+      if (end > at && (earliestExpiringAt === null || end < earliestExpiringAt)) earliestExpiringAt = end;
     } else {
       longTerm += remaining;
     }
@@ -212,14 +220,19 @@ export function expiryCountdown(expiresAtMs, now) {
   const at = Number(expiresAtMs);
   if (!Number.isFinite(at) || at <= 0) return '';
   const ref = typeof now === 'number' && Number.isFinite(now) ? now : Date.now();
-  const minutes = Math.round((at - ref) / 60_000);
-  if (minutes <= 0) return '';
+  // ⚠️ 已过期与「还没过期」必须分道：前者返回空串（调用方不渲染）。
+  if (at <= ref) return '';
+  // ⚠️⚠️ **用向上取整而不是 `Math.round`**（2026-10-13 审计修正）：
+  //    round 会把「剩余 0~30 秒」也归到 0，于是用户看到倒计时一路数到
+  //    「1 分钟」后**整段突然消失** —— 而「马上就作废」恰恰是最该看到的信号。
+  //    向上取整让「还没过期」恒定至少显示 1 分钟。
+  const minutes = Math.ceil((at - ref) / 60_000);
   const days = Math.floor(minutes / 1440);
   const hours = Math.floor((minutes % 1440) / 60);
   const mins = minutes % 60;
   if (days > 0) return `${days} 天 ${hours} 小时`;
   if (hours > 0) return `${hours} 小时 ${mins} 分钟`;
-  return `${Math.max(1, mins)} 分钟`;
+  return `${mins} 分钟`;
 }
 
 /**
