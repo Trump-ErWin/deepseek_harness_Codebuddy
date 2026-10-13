@@ -321,8 +321,38 @@ export class OfficeAceAdapter extends LlmAdapter {
       },
     }) satisfies DsmlToolSpec)
     let toolsPayload = wireTools
-    if (wireTools !== undefined && wireTools.length > 0
+    /**
+     * 是否走 DSML 模式。**必须与 `consumeOpenAiSse` 的 `dsmlToolMode` 成对**：
+     * 注入提示让模型写 DSML，消费器就必须解析 DSML —— 缺任一半，工具调用
+     * 都会变成「整段标签当正文、工具永不执行」。
+     *
+     * ⚠️ **OfficeAce 默认关闭**（2026-10-13 三次事故后决定）。
+     *
+     *    DSML 的本意是绕开网关 ~60s 空闲超时（标准 `tool_calls` 要求参数
+     *    一次性打包，生成期间 SSE 无数据流会被掐断）。但实测
+     *    `deepseek-v4.1-flash` 经本渠道**无法稳定遵循文本协议**：
+     *
+     *    - 三轮迭代（注入提示 → 大小写判定 → `calls` 别名兼容）全部到位后，
+     *      模型仍在同一轮里混写 `<｜DSML｜tool_calls>` 与 `<｜DSML｜ calls>`；
+     *    - 更常见的是**压根不发工具调用**，只输出「我这就去查：」然后结束
+     *      —— 用户视角就是「Agent 不干活」。
+     *
+     *    根因是 DSML 把工具协议从「框架保证的结构化字段」降级成「模型自觉
+     *    遵守的文本约定」，而该模型不可靠。两害相权：**标准 `tools` 字段下
+     *    工具必定可用**，超时风险留给需要它的场景自行权衡。
+     *
+     *    确需开启（例如实测本渠道不再触发 60s 断连）时，设环境变量
+     *    `OFFICEACE_DSML=1` 后重启 dsh。
+     *
+     * ⚠️ **本开关同时驱动「教」与「解」两半**（注入提示 + 传给
+     * `consumeOpenAiSse` 的解析开关），**不得只改一处** —— 单边存在时
+     * 模型写的 DSML 无人解析，工具调用会整段当正文显示。
+     */
+    let dsmlMode = false
+    if (process.env.OFFICEACE_DSML === '1'
+        && wireTools !== undefined && wireTools.length > 0
         && needsDsmlToolMode(model, wireTools.map((tool) => tool.function.name))) {
+      dsmlMode = true
       // 注入位置：system 之后、user 之前（实测放末尾会让思考泄漏进正文，
       // 见 dsml.ts 注释）。
       wireMessages.splice(
@@ -382,6 +412,7 @@ export class OfficeAceAdapter extends LlmAdapter {
                   firstTokenTimeoutMs: OFFICEACE.headerTimeoutMs,
                   chunkTimeoutMs: OFFICEACE.chunkTimeoutMs,
                   ...maxTokens === undefined ? {} : { maxTokens },
+                  ...dsmlMode ? { dsmlToolMode: true } : {},
                 },
               )
               return
@@ -402,6 +433,7 @@ export class OfficeAceAdapter extends LlmAdapter {
           firstTokenTimeoutMs: OFFICEACE.headerTimeoutMs,
           chunkTimeoutMs: OFFICEACE.chunkTimeoutMs,
           ...maxTokens === undefined ? {} : { maxTokens },
+          ...dsmlMode ? { dsmlToolMode: true } : {},
         },
       )
     } finally {
