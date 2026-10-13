@@ -16,6 +16,9 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   ACCIO_PROVIDER,
   AccioAdapter,
+  accioModelCodeOf,
+  accioModelIdOf,
+  accioReasoningOf,
   displayNameOfAccioModel,
   normalizeAccioModel as adapterNormalizeAccioModel,
 } from '../../src/accio-adapter.js'
@@ -172,6 +175,91 @@ describe('ACCIO_PROVIDER', () => {
   })
 })
 
+/**
+ * ⚠️⚠️ **对外 id 必须是「人话」（用户要求，2026-10-13）**。
+ *
+ * 用户原话（附模型自报截图的追问）：「为什么现在还是回复中的模型不是标准模型 id」。
+ *
+ * ## 背景：上游 `modelCode` 是**故意不可读**的内部代号
+ *
+ * 实测 38 条目录里 id 形如 `1Drift-N8kP2Q7wR5mX` / `1Chronos-…` / `1Orbit-…`，
+ * 真名只在 `modelDisplayName` 里。而 DSH 把 **`CatalogEntry.id`** 注入给模型当
+ * 身份 ⇒ 模型自报的是一串乱码（用户看到的正是这个）。
+ *
+ * ## 判据：**对外 id 用 slug，上行仍用 `modelCode`**
+ *
+ * | 流向 | 用什么 |
+ * |---|---|
+ * | `listModels` / `resolveModel` 的 `id`、注入给模型的身份 | **slug**（如 `qwen-3-8-flash`） |
+ * | `POST /api/adk/llm/generateContent` 的 body `model` | **上游 `modelCode`**（必须） |
+ *
+ * ⚠️ 上行**绝不能**发 slug —— 服务端只认 `modelCode`（发错即请求打空）。
+ * ⇒ 两者必须由映射函数（{@link accioModelCodeOf}）桥接，这是本组的核心不变式。
+ */
+describe('⭐ 对外 id = slug（人话），上行仍用 modelCode', () => {
+  it('★ `accioModelIdOf`：展示名 → 人话 slug（与聚合的归一同一套规则）', () => {
+    expect(accioModelIdOf({ id: '1Drift-F8hS3mK7pL2n', name: 'Qwen 3.8 Flash' }))
+      .toBe('qwen-3-8-flash')
+    expect(accioModelIdOf({ id: '1Orbit-Q7hN3xR6cP2m', name: 'Ultimate' })).toBe('ultimate')
+    // ⚠️ 点号转连字符（`V4.1` → `v4-1`），与 `normalizeModelKey` 同口径。
+    expect(accioModelIdOf({ id: '1Nova-Q3xM8vJ1rH6z', name: 'DeepSeek V4.1 Flash' }))
+      .toBe('deepseek-v4-1-flash')
+  })
+
+  it('★ slug 不含任何非 [a-z0-9-] 字符（上游展示名带空格/点号/大小写）', () => {
+    for (const name of ['Qwen 3.8 27B', 'GLM-5.3', 'MiniMax M3', 'Kimi K2.6', 'Professional']) {
+      expect(accioModelIdOf({ id: 'X', name }), name).toMatch(/^[a-z0-9-]+$/)
+    }
+  })
+
+  it('⚠️ 兜底：名字归一后为空时回退到原始 id（绝不产出空 id）', () => {
+    // 空 id 会让 DSH 的目录校验抛 INVALID_CATALOG，整个 provider 不可用。
+    expect(accioModelIdOf({ id: '1Abc-Def123', name: '   ' })).toBe('1Abc-Def123')
+    expect(accioModelIdOf({ id: '1Abc-Def123', name: '·' })).toBe('1Abc-Def123')
+  })
+
+  it('★ 双向映射：slug → modelCode 必须能回查（上行靠它）', () => {
+    const models = [
+      { id: '1Drift-F8hS3mK7pL2n', name: 'Qwen 3.8 Flash' },
+      { id: '1Orbit-Q7hN3xR6cP2m', name: 'Ultimate' },
+    ]
+    expect(accioModelCodeOf(models, 'qwen-3-8-flash')).toBe('1Drift-F8hS3mK7pL2n')
+    expect(accioModelCodeOf(models, 'ultimate')).toBe('1Orbit-Q7hN3xR6cP2m')
+  })
+
+  it('⚠️ 回查不到时**原样返回入参**（不抛错、不返回空）', () => {
+    // 判据：用户可能手填一个 id；未知 id 必须原样透传给上游（由它报错），
+    // 而不是在这里静默变成空串（那会让请求发到一个空模型名）。
+    const models = [{ id: '1Drift-F8hS3mK7pL2n', name: 'Qwen 3.8 Flash' }]
+    expect(accioModelCodeOf(models, 'unknown-thing')).toBe('unknown-thing')
+  })
+
+  it('★ 行为级：`listModels` 吐出的 id 是 slug，**不是** 上游 modelCode', async () => {
+    const { adapter } = makeAdapter({
+      remoteModels: [
+        { id: '1Drift-F8hS3mK7pL2n', name: 'Qwen 3.8 Flash', contextWindow: 1_000_000, supportsImage: true, multiple: 0.03 },
+      ],
+    })
+    const models = await adapter.listModels(ACCIO_PROVIDER)
+    expect(models.map((m) => m.id)).toEqual(['qwen-3-8-flash'])
+    // ⚠️ 上游代号**不得**再出现在对外 id 里（这正是用户报障的形态）。
+    expect(models.map((m) => m.id)).not.toContain('1Drift-F8hS3mK7pL2n')
+  })
+
+  it('★⚠️ 行为级：请求体里的 `model` 仍是**上游 modelCode**（不是 slug）', async () => {
+    // ⚠️ 这是本组最关键的判据：改 id 时若忘了映射，请求会打到 slug
+    //（服务端不认）—— 功能整体失效，且症状是「模型不回复」这种误导性形态。
+    const { adapter, fetcher } = makeAdapter({
+      remoteModels: [
+        { id: '1Drift-F8hS3mK7pL2n', name: 'Qwen 3.8 Flash', contextWindow: 1_000_000, supportsImage: true, multiple: 0.03 },
+      ],
+      responses: [sseResponse(accioSse({ content: { role: 'model', parts: [{ text: 'ok' }] } }))],
+    })
+    await collect(adapter, { ...BASIC_OPTIONS, model: 'qwen-3-8-flash' } as GenerateOptions)
+    expect(sentBody(fetcher).model).toBe('1Drift-F8hS3mK7pL2n')
+  })
+})
+
 describe('displayNameOfAccioModel —— ⚠️ 倍率必须进 name，不是 description', () => {
   // composer 的模型切换菜单**只渲染 `name`**（`description` 完全不读），
   // 故倍率写进 description 等于没写（用户报障的原始成因）。
@@ -206,8 +294,116 @@ describe('displayNameOfAccioModel —— ⚠️ 倍率必须进 name，不是 de
   })
 })
 
-describe('目录解析只有一份实现（adapter 只再导出）', () => {
-  it('⚠️ adapter 导出的 normalizeAccioModel 与 accio-auth 的是同一个函数', () => {
+/**
+ * ⚠️⚠️ **思考档位声明**（2026-10-13，用户要求「即使只有一档也要显示」）。
+ *
+ * ## 为什么这一层必须有独立用例（而不是只测 `normalizeAccioModel`）
+ *
+ * `normalizeAccioModel` 只负责**接住**远端字段；**「怎么声明给 DSH」是另一套判据**：
+ * - `efforts` 非空 ⇒ 全列，但 `defaultEffort` **必须落在集合内**（否则 DSH 会丢弃
+ *   整个档位声明，`model-catalog.ts` 里有那段 `legal` 检查）；
+ * - `efforts` 空 + `defaultEffort` 有值 ⇒ **单档**（用户明确要求的那一格）；
+ * - 两者都无 ⇒ 不声明。
+ *
+ * ⇒ 这三格若只在 `normalizeAccioModel` 测，**永远测不到**。
+ */
+describe('accioReasoningOf —— 把远端档位映射成 DSH 声明', () => {
+  it('★ 有数组：全列 + default 落在集合内时带上', () => {
+    const r = accioReasoningOf({ efforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'high' })
+    expect(r?.efforts.map((e) => e.id)).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    expect(r?.defaultEffort).toBe('high')
+  })
+
+  it('★ 有数组但 default 不在集合内 ⇒ **丢弃 default**，档位本身照给', () => {
+    // ⚠️ DSH 会校验 `defaultEffort ∈ efforts`，指到集合外会让**整条档位声明**
+    //    被丢弃（`model-catalog.ts` 的 `legal` 检查）—— 那比「少一个默认档」更糟。
+    const r = accioReasoningOf({ efforts: ['low', 'high'], defaultEffort: 'max' })
+    expect(r?.efforts.map((e) => e.id)).toEqual(['low', 'high'])
+    expect(r?.defaultEffort).toBeUndefined()
+  })
+
+  it('★⚠️ 关键格：数组为空 + default 有值 ⇒ **单档**（用户要求的「只有一档也要显示」）', () => {
+    // 真机形态：GLM-5.3 / MiniMax M3 等的 `reasoningEfforts` 是 null，但 default 有值。
+    // 实测把该值发过去**服务端接受**（max / adaptive 都返回正常正文）⇒ 它是真档位。
+    for (const def of ['max', 'adaptive', 'high']) {
+      const r = accioReasoningOf({ defaultEffort: def })
+      expect(r?.efforts.map((e) => e.id), def).toEqual([def])
+      expect(r?.defaultEffort, def).toBe(def)
+    }
+  })
+
+  it('★ 两者都无 ⇒ 不声明（返回 undefined，不编造档位）', () => {
+    expect(accioReasoningOf({})).toBeUndefined()
+    expect(accioReasoningOf({ efforts: [] })).toBeUndefined()
+    expect(accioReasoningOf({ efforts: [], defaultEffort: undefined })).toBeUndefined()
+  })
+
+  it('★ 档位 id 原样当展示名（不翻译成中文 —— 排查时要能对上日志）', () => {
+    const r = accioReasoningOf({ efforts: ['low', 'high'], defaultEffort: 'low' })
+    expect(r?.efforts.map((e) => e.name)).toEqual(['low', 'high'])
+  })
+
+  it('★ 单档那格的名字也是原样 id（不是「默认」之类自造文案）', () => {
+    expect(accioReasoningOf({ defaultEffort: 'adaptive' })?.efforts[0]?.name).toBe('adaptive')
+  })
+})
+
+/**
+ * ⚠️⚠️ **风控拦截页**（2026-10-13 真机实测发现的静默失效）。
+ *
+ * ## 真实形态（本轮探测逐字留下的原文）
+ *
+ * 请求缺 `utdid`（或只放 header、不放 `properties.utdid`）时，阿里网关回：
+ * **HTTP `200`** + `content-type: text/html;charset=UTF-8`，body 是一段跳转脚本：
+ * `<a id="a-link" href="https://bixi-intl.alicdn.com/punish/…">` +
+ * `window._config_ = {"action":"deny",…}` + `<!--rgv587_flag:sm-->`。
+ *
+ * ## 不识别时的后果
+ *
+ * 这段 HTML 被喂给 SSE 解析器 ⇒ **零帧** ⇒ 最终报「模型未返回任何内容块」。
+ * 用户看到「模型不回复」，真因却是**风控** —— 排查方向完全错。
+ * ⚠️ 本轮的档位探测就**被它误导过一轮**（「思考字符恒为 0」被误读成「档位无效」）。
+ */
+describe('⚠️ 风控拦截页（HTTP 200 + text/html）必须报明确错误', () => {
+  /** 真机抓到的拦截页形态（截断，字段保真）。 */
+  const BLOCK_PAGE = '\n\n<a id="a-link"\n    href="https://bixi-intl.alicdn.com/punish/punish:resource:template:ICBUSpace:default_447831.html?qrcode=X"'
+    + '></a>\n<script>\nvar host = location.host;\n</script>\n window._config_ = {"action":"deny"};\n<!--rgv587_flag:sm-->'
+
+  it('★ HTTP 200 + text/html ⇒ 抛 SERVER（不重试），且带服务端原文', async () => {
+    const { adapter } = makeAdapter({
+      responses: [new Response(BLOCK_PAGE, { status: 200, headers: { 'content-type': 'text/html;charset=UTF-8' } })],
+    })
+    await expect(collect(adapter, BASIC_OPTIONS)).rejects.toMatchObject({ code: 'SERVER' })
+  })
+
+  it('★ 错误文案必须点出「风控 / 未返回事件流」，而不是「没有内容块」', async () => {
+    const { adapter } = makeAdapter({
+      responses: [new Response(BLOCK_PAGE, { status: 200, headers: { 'content-type': 'text/html;charset=UTF-8' } })],
+    })
+    // ⚠️ 判据是**真因可见**：只说「模型没返回内容」会把排查引向模型侧。
+    await expect(collect(adapter, BASIC_OPTIONS)).rejects.toThrow(/风控|未返回事件流/)
+  })
+
+  it('★ 服务端原文必须进错误信息（诊断的硬证据）', async () => {
+    // ⚠️ 断言用页面**开头**就能看到的特征：实现按前 200 字符截断
+    //（尾部的 `rgv587_flag` 可能被截掉）—— 断言「截断后必然还在」的那部分，
+    //  否则这条用例会因截断长度变化而假失败。
+    const { adapter } = makeAdapter({
+      responses: [new Response(BLOCK_PAGE, { status: 200, headers: { 'content-type': 'text/html' } })],
+    })
+    await expect(collect(adapter, BASIC_OPTIONS)).rejects.toThrow(/bixi-intl|a-link|服务端原文/)
+  })
+
+  it('★ 正常 SSE（text/event-stream）不得被这条判据误伤', async () => {
+    // ⚠️ 反向守卫：判据是 `content-type` 而不是「响应里有 HTML 字样」。
+    const { adapter } = makeAdapter({
+      responses: [sseResponse(accioSse({ content: { role: 'model', parts: [{ text: 'ok' }] } }))],
+    })
+    await expect(collect(adapter, BASIC_OPTIONS)).resolves.toBeDefined()
+  })
+})
+
+describe('目录解析只有一份实现（adapter 只再导出）', () => {  it('⚠️ adapter 导出的 normalizeAccioModel 与 accio-auth 的是同一个函数', () => {
     // 「同一语义两套判据」是本仓库首条红线：adapter 不得自带第二份解析器。
     expect(adapterNormalizeAccioModel).toBe(normalizeAccioModel)
   })
@@ -256,11 +452,13 @@ describe('AccioAdapter · providerInfo', () => {
 describe('AccioAdapter · listModels', () => {
   it('远端目录可用时采信远端，且**倍率拼进 name**', async () => {
     const { adapter } = makeAdapter({
-      remoteModels: [{ id: 'm1', name: 'Qwen 3.8 Flash', contextWindow: 1_000_000, multiple: 0.03 }],
+      remoteModels: [{ id: '1Drift-F8hS3mK7pL2n', name: 'Qwen 3.8 Flash', contextWindow: 1_000_000, multiple: 0.03 }],
     })
     const models = await adapter.listModels(ACCIO_PROVIDER)
     expect(models).toHaveLength(1)
-    expect(models[0]!.id).toBe('m1')
+    // ⚠️ **对外 id 是 slug，不是上游 `modelCode`**（2026-10-13，用户要求）——
+    // 理由见 `accioModelIdOf`：DSH 会把 id 注入给模型当身份。
+    expect(models[0]!.id).toBe('qwen-3-8-flash')
     expect(models[0]!.name).toBe('Qwen 3.8 Flash · x0.03')
   })
 
@@ -269,7 +467,7 @@ describe('AccioAdapter · listModels', () => {
     const models = await adapter.listModels(ACCIO_PROVIDER)
     expect(models).toHaveLength(ACCIO.fallbackModels.length)
     // 兜底表首条：Qwen 3.8 27B，倍率 0.013。
-    expect(models[0]!.id).toBe(ACCIO.fallbackModels[0]!.id)
+    expect(models[0]!.id).toBe(accioModelIdOf(ACCIO.fallbackModels[0]!))
     expect(models[0]!.name).toBe(`${ACCIO.fallbackModels[0]!.name} · x${ACCIO.fallbackModels[0]!.multiple}`)
   })
 
@@ -283,42 +481,44 @@ describe('AccioAdapter · listModels', () => {
   it('应用账号池的模型黑名单（关闭的模型不出现在目录里）', async () => {
     const { adapter } = makeAdapter({
       remoteModels: [
-        { id: 'a', name: 'A', multiple: 0.1 },
-        { id: 'b', name: 'B', multiple: 0.2 },
+        { id: 'a', name: 'Model A', multiple: 0.1 },
+        { id: 'b', name: 'Model B', multiple: 0.2 },
       ],
-      accountPool: { disabledModelsFor: () => new Set(['a']) },
+      // ⚠️ 黑名单的键是**对外 id**（= slug），故这里用 `model-a`。
+      accountPool: { disabledModelsFor: () => new Set(['model-a']) },
     })
-    expect((await adapter.listModels(ACCIO_PROVIDER)).map((m) => m.id)).toEqual(['b'])
+    expect((await adapter.listModels(ACCIO_PROVIDER)).map((m) => m.id)).toEqual(['model-b'])
   })
 
   it('listAllModels 不受黑名单影响（设置页要能重新打开已关闭的模型）', async () => {
     const { adapter } = makeAdapter({
       remoteModels: [
-        { id: 'a', name: 'A', multiple: 0.1 },
-        { id: 'b', name: 'B', multiple: 0.2 },
+        { id: 'a', name: 'Model A', multiple: 0.1 },
+        { id: 'b', name: 'Model B', multiple: 0.2 },
       ],
-      accountPool: { disabledModelsFor: () => new Set(['a']) },
+      accountPool: { disabledModelsFor: () => new Set(['model-a']) },
     })
     await adapter.listModels(ACCIO_PROVIDER)
-    expect(adapter.listAllModels().map((m) => m.id).sort()).toEqual(['a', 'b'])
+    expect(adapter.listAllModels().map((m) => m.id).sort()).toEqual(['model-a', 'model-b'])
   })
 })
 
 describe('AccioAdapter · resolveModel', () => {
   it('已知模型解析出 contextWindow（来自目录）', async () => {
     const { adapter } = makeAdapter({
-      remoteModels: [{ id: 'm1', name: 'Qwen', contextWindow: 512_000, multiple: 0.013 }],
+      remoteModels: [{ id: '1Nova-Q3xM8vJ1rH6z', name: 'DeepSeek V4.1 Flash', contextWindow: 512_000, multiple: 0.013 }],
     })
-    const resolved = await adapter.resolveModel(ACCIO_PROVIDER, 'm1')
-    expect(resolved.id).toBe('m1')
+    // ⚠️ `resolveModel` 收的也是**对外 id**（slug）。
+    const resolved = await adapter.resolveModel(ACCIO_PROVIDER, 'deepseek-v4-1-flash')
+    expect(resolved.id).toBe('deepseek-v4-1-flash')
     expect(resolved.context?.contextWindow).toBe(512_000)
   })
 
   it('resolveModel 的 name **不带倍率**（价格只属于选择列表语境）', async () => {
     const { adapter } = makeAdapter({
-      remoteModels: [{ id: 'm1', name: 'Qwen', contextWindow: 512_000, multiple: 0.013 }],
+      remoteModels: [{ id: '1Nova-Q3xM8vJ1rH6z', name: 'Qwen', contextWindow: 512_000, multiple: 0.013 }],
     })
-    expect((await adapter.resolveModel(ACCIO_PROVIDER, 'm1')).name).toBe('Qwen')
+    expect((await adapter.resolveModel(ACCIO_PROVIDER, 'qwen')).name).toBe('Qwen')
   })
 
   it('⚠️⚠️ inputModalities 必须**省略**（三态：省略 = 未知）', async () => {
@@ -1028,17 +1228,20 @@ describe('AccioAdapter · 错误分类', () => {
 describe('AccioAdapter · prepareCall', () => {
   it('返回模型信息与绑定的 stream 函数（PR !66：必须包 prepareCall）', async () => {
     const { adapter, fetcher } = makeAdapter({
-      remoteModels: [{ id: 'm1', name: 'Qwen', contextWindow: 512_000, multiple: 0.013 }],
+      remoteModels: [{ id: '1Nova-Q3xM8vJ1rH6z', name: 'Qwen', contextWindow: 512_000, multiple: 0.013 }],
       responses: [sseResponse(accioSse(frame([textPart('好')])))],
     })
-    const prepared = await adapter.prepareCall(ACCIO_PROVIDER, 'm1')
-    expect(prepared.model.id).toBe('m1')
+    const prepared = await adapter.prepareCall(ACCIO_PROVIDER, 'qwen')
+    expect(prepared.model.id).toBe('qwen')
     expect(prepared.model.context?.contextWindow).toBe(512_000)
     expect(typeof prepared.stream).toBe('function')
     // 经 prepareCall 返回的 stream 必须真能发请求（不是空壳）。
     const chunks: StreamChunk[] = []
-    for await (const chunk of prepared.stream({ ...BASIC_OPTIONS, model: 'm1' } as GenerateOptions)) chunks.push(chunk)
+    for await (const chunk of prepared.stream({ ...BASIC_OPTIONS, model: 'qwen' } as GenerateOptions)) chunks.push(chunk)
     expect(fetcher).toHaveBeenCalledTimes(1)
     expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    // ⚠️ **上行必须是上游 `modelCode`**（不是 slug）—— `prepareCall` 路径同样走
+    //    `stream`，若那条缝里漏了映射，这里的断言会红。
+    expect(sentBody(fetcher).model).toBe('1Nova-Q3xM8vJ1rH6z')
   })
 })

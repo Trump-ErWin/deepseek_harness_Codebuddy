@@ -114,6 +114,86 @@ describe('★ 纯函数（Task 6 的适配器要复用，不许再写第二份�
     expect(normalizeAccioModel({ modelCode: '1X', visible: true })?.name).toBe('1X')
   })
 
+  /**
+   * ⚠️⚠️ **思考档位**（2026-10-13 真机实测后新增，用户要求）。
+   *
+   * 用户原话：「accio 的模型没有档位，需要有档位即使是只有一档也要显示，
+   * 使用远端真实下发的档位」。
+   *
+   * 下面三条的**形状**全部来自真机探测（38 条目录）：
+   * - 4 条 `数组(2档)` / 2 条 `数组(3档)` / 1 条 `数组(5档)`；
+   * - **31 条 `null`**，其中 6 条**同时给了 `defaultReasoningEffort`**
+   *   （GLM-5.3 `max` / MiniMax M3 `adaptive` / DeepSeek V4.1 Flash `high` …）。
+   */
+  describe('normalizeAccioModel：思考档位（远端真实下发）', () => {
+    it('★ reasoningEfforts 数组原样接住（顺序不排 —— 那是服务端给的由弱到强）', () => {
+      const m = normalizeAccioModel({
+        modelCode: '1Orbit-Q7hN3xR6cP2m', modelDisplayName: 'Ultimate', visible: true,
+        reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultReasoningEffort: 'high',
+      })
+      // ⚠️ 断言**整个数组**（含顺序）：排序＝替服务端决定语义。
+      expect(m?.efforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+      expect(m?.defaultEffort).toBe('high')
+    })
+
+    it('★ 关键格：reasoningEfforts 为 null 但 default 有值 ⇒ 保留 default（这是「单档」的来源）', () => {
+      // 真机形态：GLM-5.3 / GLM-5.2 / GLM 5.3 Flash 的 default 都是 "max"。
+      const m = normalizeAccioModel({
+        modelCode: '1Chronos-L53W8nP2qR6m', modelDisplayName: 'GLM-5.3', visible: true,
+        reasoningEfforts: null,
+        defaultReasoningEffort: 'max',
+      })
+      // ⚠️ `efforts` 保持**缺席**（不是 `[]`）：空数组与「无信息」在 DSH 里
+      //    是两回事 —— 前者会让档位声明被丢弃、后者根本不声明。
+      expect(m?.efforts).toBeUndefined()
+      expect(m?.defaultEffort).toBe('max')
+    })
+
+    it('★ MiniMax M3 的 default 是 "adaptive"（非 low/high 系，原样保留不归一）', () => {
+      const m = normalizeAccioModel({
+        modelCode: '1Zenith-M27hS2SR5xQ2p', modelDisplayName: 'MiniMax M3', visible: true,
+        reasoningEfforts: null, defaultReasoningEffort: 'adaptive',
+      })
+      expect(m?.defaultEffort).toBe('adaptive')
+    })
+
+    it('★ 两者都为 null ⇒ 两个字段都缺席（不编造档位）', () => {
+      const m = normalizeAccioModel({
+        modelCode: '1Drift-F8hS3mK7pL2n', modelDisplayName: 'Qwen 3.8 Flash', visible: true,
+        reasoningEfforts: null, defaultReasoningEffort: null,
+      })
+      expect(m?.efforts).toBeUndefined()
+      expect(m?.defaultEffort).toBeUndefined()
+    })
+
+    it('★ 空数组与带脏值的数组都收敛成「无档位」（不产出空白项）', () => {
+      for (const raw of [[], [''], ['  '], [null], [undefined], [1], [{}], 'low', 42]) {
+        const m = normalizeAccioModel({
+          modelCode: '1X', visible: true, reasoningEfforts: raw,
+        })
+        expect(m?.efforts, JSON.stringify(raw)).toBeUndefined()
+      }
+    })
+
+    it('★ 数组里的脏值被逐个丢弃，合法值保留（不整组报废）', () => {
+      const m = normalizeAccioModel({
+        modelCode: '1X', visible: true,
+        reasoningEfforts: ['low', null, '', 'high', 7],
+      })
+      expect(m?.efforts).toEqual(['low', 'high'])
+    })
+
+    it('★ defaultReasoningEffort 非字符串/空串 ⇒ 缺席（不给 DSH 一个非法档位 id）', () => {
+      for (const raw of [null, undefined, '', '   ', 42, {}, []]) {
+        const m = normalizeAccioModel({
+          modelCode: '1X', visible: true, defaultReasoningEffort: raw,
+        })
+        expect(m?.defaultEffort, JSON.stringify(raw)).toBeUndefined()
+      }
+    })
+  })
+
   it('parseAccioCatalog：展平 data[].modelList[] 且按倍率升序（便宜在前）', () => {
     const models = parseAccioCatalog({
       success: true,

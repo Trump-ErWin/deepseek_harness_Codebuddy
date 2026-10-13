@@ -288,10 +288,14 @@ data: {"turn_complete":true,"error_code":"402","error_message":"unauthorized"}
 实测全目录最低倍率是 `1Drift-N8kP2Q7wR5mX`（**x0.013**，即
 `ACCIO.fallbackModels[0]`），最高的是 x2.8 —— **215 倍**价差。两个会花钱的探针因此：
 
-- 默认取 `ACCIO.fallbackModels[0]`；
-- 可用 `ACCIO_PROBE_MODEL` 覆盖，但**未知 id 直接拒绝**（id 形如 `1Drift-N8kP2Q7wR5mX`，
-  非人类可读，写错会得到一个与账号无关的 404，把「模型名不对」与「账号不可用」
-  混成同一条报错）；
+- 默认取 `ACCIO.fallbackModels[0]`（上游 `modelCode`，`1Drift-N8kP2Q7wR5mX`）；
+- 可用 `ACCIO_PROBE_MODEL` 覆盖，**两种写法都接受**（2026-10-13 起）：
+  **对外 id（slug，如 `qwen-3-8-27b`）**或**上游 `modelCode`**。
+  ⚠️ 为什么两种都认：对外 id 已改成 slug（模型选择器里显示的就是它），
+  而探针**自己发裸 fetch**、上行必须用 `modelCode` ⇒ 照选择器写进来的 slug
+  若被拒会让人以为「模型不存在」；
+- **未知 id 直接拒绝**（不是静默回落）：写错会得到一个与账号无关的 404，
+  把「模型名不对」与「账号不可用」混成同一条报错，而两者倍率可能差 200 倍；
 - 倍率高于 **x0.2** 的模型需要**额外显式 opt-in**（`ACCIO_PROBE_ALLOW_EXPENSIVE=1`）
   —— 沿用 Cline 探针的「付费保护」形态。
 

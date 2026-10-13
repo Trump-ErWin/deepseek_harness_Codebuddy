@@ -192,6 +192,57 @@ export function formatPoolSplitLine(packages, format, longTermLabel = '长期') 
 }
 
 /**
+ * **逐命名池全列** —— 供 Accio 的三类桶使用（用户 2026-10-13 要求与 Loomy 同形）。
+ *
+ * ## 与 {@link formatPoolSplitLine} 的区别（为什么不能复用它）
+ *
+ * `formatPoolSplitLine` 是**两桶**形状：它把「当日池之外的**全部**池」求和成一个
+ * `longTermLabel`（`'长期 2100 · 每日 500'`）。那对两家的形态成立：
+ *
+ * | provider | 池 |
+ * |---|---|
+ * | Loomy | `永久积分` + `每日赠送` |
+ * | Raccoon | `奖励积分` / `会员积分` / `充值积分` + `每日积分` |
+ *
+ * 而 Accio 的桶是**三类语义并列**（`每日积分` / `每月积分` / `推荐积分`）：
+ * 「每月」与「推荐」**都不该被笼统求和成「长期」** —— 它们的到期规则不同
+ * （每月有 `nextBillingDate`、推荐是活动赠送），求和会让用户以为是一份东西。
+ *
+ * ## 为什么按**服务端下发的顺序**列出，不排序
+ *
+ * 池的顺序由宿主 `flattenAccioCredits` 决定（`daily` → `monthly` → `referral`，
+ * 即「最先作废的在前」）。前端再排一次就是「同一语义两处判据」——排序规则
+ * 一变就会与宿主的意图分叉。
+ *
+ * ⚠️ **不改 `formatPoolSplitLine`**：它的输出是既有契约（见 `credit-expiry.spec.ts`
+ * 那组逐字断言），而 loomy / raccoon 走的正是它。
+ *
+ * @param packages - `balance.packages`。⚠️ 按**池名**识别，不用下标
+ *   （Raccoon / Accio 的池都可能缺项）。
+ * @param format - 数字格式化（与卡片总额同一个）。
+ * @returns 形如 `'每日 199 · 每月 0 · 推荐 0'` 的文案；无可列池或格式化失败时
+ *   返回 `null`（调用方据此不渲染该行，退回别的分桶）。
+ */
+export function formatNamedPoolLine(packages, format) {
+  if (!Array.isArray(packages)) return null;
+  const parts = [];
+  for (const pkg of packages) {
+    // 失效包不列出：扣不到的额度显示出来会让用户以为还有。
+    if (!pkg || pkg.active !== true) continue;
+    const name = typeof pkg.name === 'string' ? pkg.name.trim() : '';
+    if (name === '') continue;
+    const value = format(Number(pkg.remaining) || 0);
+    // ⚠️ 任一格式化失败 ⇒ 整个函数返回 null（不产出半截文案）。
+    if (value === null) return null;
+    // 「每日积分 199」在版面上重复且长 ⇒ 去掉「积分」后缀做短标签。
+    // ⚠️ 只在**后缀**时去掉（`'积分商城'` 这类名字不受影响）。
+    const short = name.endsWith('积分') ? name.slice(0, -2) : name;
+    parts.push(`${short} ${value}`);
+  }
+  return parts.length === 0 ? null : parts.join(' · ');
+}
+
+/**
  * 取出包的到期时刻（毫秒）；**拿不到返回 null**（= 没有到期概念）。
  *
  * ⚠️ 这是 `formatPackageExpiry` 与包列表**排序**共用的唯一判据来源 ——
