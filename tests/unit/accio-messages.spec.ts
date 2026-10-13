@@ -158,6 +158,30 @@ describe('normalizeAccioFrame —— Accio 顶层帧 → 标准 Gemini candidate
     it('🔴 顶层 function_call 无 name ⇒ 仍丢弃（与 content.parts 内的判据同口径）', () => {
       expect(normalizeAccioFrame({ function_call: { args_json: '{}' } })).toBeUndefined()
     })
+
+    it('🔴 无名顶层 call **不得连坐**丢掉 usage/finish（MAX_TOKENS 不得伪装成 stop）', () => {
+      // ⚠️ 2026-10-13 审计修正：调用无名时该调用整块丢弃（既有约定），
+      // 但 usage / finish 必须保住 —— 否则 `MAX_TOKENS` 截断被伪装成正常结束、
+      // harness 不会重试（正是本 PR 要消灭的那类失败）。
+      // ⚠️ 这一格必须**直测纯函数**：走完整管线时，顶层 call 会先被合并层
+      // 包成 `{function_call:{id:'anon-N',name:''}}`（合并层会补一个 id 键），
+      // 于是永远命不中「无名」这条分支 —— 端到端用例锁不住它（实测变异 M8 零红）。
+      const out = normalizeAccioFrame({
+        function_call: { args_json: '{}' },
+        usage_metadata: { prompt_token_count: 7, candidates_token_count: 3, total_token_count: 9 },
+        finish_reason: 'MAX_TOKENS',
+      }) as { candidates?: Array<{ finishReason?: string }>; usageMetadata?: Record<string, unknown> } | undefined
+      expect(out).toBeDefined()
+      expect(out?.candidates?.[0]?.finishReason).toBe('MAX_TOKENS')
+      expect(out?.usageMetadata?.totalTokenCount).toBe(9)
+      // 与「`function_call: null`」「完全无 call」两格**同形**（判据一致）
+      const nullCall = normalizeAccioFrame({
+        function_call: null,
+        usage_metadata: { prompt_token_count: 7, candidates_token_count: 3, total_token_count: 9 },
+        finish_reason: 'MAX_TOKENS',
+      }) as { usageMetadata?: Record<string, unknown> } | undefined
+      expect(nullCall?.usageMetadata?.totalTokenCount).toBe(9)
+    })
   })
 })
 
@@ -522,6 +546,306 @@ describe('consumeAccioSse —— 归一化后交给共享消费器', () => {
       expect(usage?.usage.outputTokens).toBe(2)
       const finish = chunks.find((c) => c.type === 'finish')
       expect((finish as { reason?: { kind?: string } })?.reason?.kind).toBe('stop')
+    })
+  })
+
+  // ⚠️⚠️ 2026-10-13 **独立审计 + 对抗性审计**（本轮双审计）查出的净回归：
+  // 本 PR 新增的「顶层 function_call 改写」跑在 `consumeAccioSse` 的错误判据
+  // **之前**，而它新造了一个只含 `content.parts` 的帧 ⇒ 同帧的 `error_code` /
+  // `error_message` 被吞 ⇒ **额度/认证失败被反转成「工具调用成功」**。
+  // 触发条件：「错误码与工具 part 同帧」—— 上游确实会在帧上混发 `error_code`
+  // （见 §4.3「判成功的口径：有 content.parts、**无 error_code**」），故必须守卫。
+  // ⚠️ 这一格原先**零守卫**（实测：把修复回退，118 条用例全绿）—— 故本组是新增防线。
+  describe('⚠️⚠️ 错误帧绝不可被合并层吸收（审计修正：额度失败不得反转成成功）', () => {
+    /** 走完整管线（合并层 → 归一化消费层），返回抛出的错误或「未抛」。 */
+    async function drain(lines: string[]): Promise<{ thrown?: Error; text: string; calls: number }> {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream(lines).pipeThrough(accioToolCallMergeTransform())
+      const chunks: Array<{ type: string; text?: string; block?: { type?: string } }> = []
+      try {
+        for await (const c of consumeAccioSse({ body: merged })) chunks.push(c as never)
+      } catch (e) {
+        return {
+          thrown: e as Error,
+          text: chunks.filter((c) => c.type === 'text-delta').map((c) => c.text ?? '').join(''),
+          calls: chunks.filter((c) => c.type === 'block-end' && c.block?.type === 'tool-call').length,
+        }
+      }
+      return {
+        text: chunks.filter((c) => c.type === 'text-delta').map((c) => c.text ?? '').join(''),
+        calls: chunks.filter((c) => c.type === 'block-end' && c.block?.type === 'tool-call').length,
+      }
+    }
+
+    it('🔴 顶层 function_call 与 error_code:402 同帧 ⇒ 必须抛额度错误，且不得产出工具调用', async () => {
+      const r = await drain([
+        'data: {"function_call":{"id":"c1","name":"read_file","args_json":"{}"},"error_code":"402","error_message":"unauthorized"}\n',
+        'data: [DONE]\n',
+      ])
+      expect(r.thrown).toBeDefined()
+      expect(String(r.thrown?.message)).toContain('402')
+      expect(String(r.thrown?.message)).toContain('unauthorized')
+      expect(r.calls).toBe(0)
+    })
+
+    it('🔴 content.parts 内的 function_call 与 error_code 同帧 ⇒ 同样必须抛', async () => {
+      const r = await drain([
+        'data: {"content":{"parts":[{"function_call":{"id":"c1","name":"f","args_json":"{}"}}]},"error_code":"500","error_message":"internal boom"}\n',
+        'data: [DONE]\n',
+      ])
+      expect(r.thrown).toBeDefined()
+      expect(String(r.thrown?.message)).toContain('500')
+      expect(String(r.thrown?.message)).toContain('internal boom')
+      expect(r.calls).toBe(0)
+    })
+
+    it('🔴 错误帧前的正常正文必须照常交付（错误不得吞掉已产出的帧）', async () => {
+      const r = await drain([
+        'data: {"content":{"parts":[{"text":"甲"}]}}\n'
+        + 'data: {"content":{"parts":[{"text":"乙"}]}}\n'
+        + 'data: {"function_call":{"id":"c1","name":"f","args_json":"{}"},"error_code":"402","error_message":"unauthorized"}\n',
+      ])
+      expect(r.thrown).toBeDefined()
+      expect(r.text).toBe('甲乙')
+    })
+
+    it('🔴 error_code:"200" 成功哨兵与工具同帧 ⇒ 不得抛错（哨兵语义不得被本判据破坏）', async () => {
+      const r = await drain([
+        'data: {"function_call":{"id":"c1","name":"f","args_json":"{}"},"error_code":"200"}\n',
+        'data: [DONE]\n',
+      ])
+      expect(r.thrown).toBeUndefined()
+      expect(r.calls).toBe(1)
+    })
+  })
+
+  // ⚠️ 2026-10-13 双审计查出的另两处净回归：合并层吸收工具 part 时
+  // ① 对 `function_call: null` 抛**裸 TypeError**（不是 LlmError ⇒ harness 归类
+  //    UNKNOWN、不在可重试集合），且异常发生在 `enqueue` 之前 ⇒ **同一个 chunk 里
+  //    已解析出的正文一起丢失**；
+  // ② 参数只认 snake `args_json` ⇒ camel `argsJson` / 对象 `args` 被**静默清空为 `{}`**
+  //    （模型以为执行了，实际用空参数跑工具）。
+  describe('⚠️ 合并层：畸形帧只跳过、参数三形态同口径（审计修正）', () => {
+    it('🔴 function_call:null 与正常正文同 chunk ⇒ 正文必须全部交付（原先裸 TypeError 全丢）', async () => {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      // ⚠️ 全部放在**同一个 chunk** 里：这样才能证明「坏帧不吞同 chunk 已产出的帧」。
+      const oneChunk =
+        'data: {"content":{"parts":[{"text":"甲"}]}}\n'
+        + 'data: {"content":{"parts":[{"text":"乙"}]}}\n'
+        + 'data: {"function_call":null}\n'
+        + 'data: {"content":{"parts":[{"text":"丙"}]}}\n'
+      const enc = new TextEncoder()
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(enc.encode(oneChunk)); controller.close() },
+      })
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: body.pipeThrough(accioToolCallMergeTransform()) })) chunks.push(c)
+      const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
+      expect(text).toBe('甲乙丙')
+    })
+
+    it('🔴 camel functionCall:null 与标准 candidates 帧同 chunk ⇒ 正文必须交付', async () => {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const oneChunk =
+        'data: {"candidates":[{"content":{"parts":[{"text":"标准正文"}]}}]}\n'
+        + 'data: {"functionCall":null}\n'
+      const enc = new TextEncoder()
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(enc.encode(oneChunk)); controller.close() },
+      })
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: body.pipeThrough(accioToolCallMergeTransform()) })) chunks.push(c)
+      const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
+      expect(text).toBe('标准正文')
+    })
+
+    it('🔴 `content.parts` 内的 function_call:null 与正文同帧 ⇒ 正文必须交付（裸 TypeError 不得吞 chunk）', async () => {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      // ⚠️ 这一格走的是 `absorbCallParts` 的**另一条入口**（`content.parts` 路径，
+      // 不经顶层改写分支）—— 该守卫必须**自身独立正确**，不能靠上层遮蔽。
+      const merged = sseStream([
+        'data: {"content":{"parts":[{"text":"正文甲"}]}}\n',
+        'data: {"content":{"parts":[{"function_call":null},{"text":"正文乙"}]}}\n',
+        'data: {"content":{"parts":[{"text":"正文丙"}]}}\n',
+        'data: [DONE]\n',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+      const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
+      expect(text).toBe('正文甲正文乙正文丙')
+      // ⚠️ 畸形 part 只该被跳过，绝不产出工具块
+      expect(chunks.filter((c) => c.type === 'block-end' && (c.block as { type?: string }).type === 'tool-call').length).toBe(0)
+    })
+
+    it('🔴 顶层 call 的 camel `argsJson` 参数不得被清空', async () => {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream([
+        'data: {"function_call":{"id":"c1","name":"read_file","argsJson":"{\\"file_path\\":\\"a.txt\\"}"}}\n',
+        'data: [DONE]\n',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+      const call = chunks.find((c) => c.type === 'block-end' && (c.block as { type?: string }).type === 'tool-call')
+      expect(JSON.parse((call!.block as { arguments: string }).arguments)).toEqual({ file_path: 'a.txt' })
+    })
+
+    it('🔴 顶层 call 的对象 `args` 参数不得被清空', async () => {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream([
+        'data: {"function_call":{"id":"c1","name":"read_file","args":{"file_path":"a.txt"}}}\n',
+        'data: [DONE]\n',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+      const call = chunks.find((c) => c.type === 'block-end' && (c.block as { type?: string }).type === 'tool-call')
+      expect(JSON.parse((call!.block as { arguments: string }).arguments)).toEqual({ file_path: 'a.txt' })
+    })
+
+    it('🔴 `args_json` 为空串时必须回退到同帧的 `args` 对象（不得静默变空参数）', async () => {
+      // ⚠️ 2026-10-13 对抗验证查出：空串也是字符串，初版直接 return ⇒ **永不回退**，
+      // 而归一化层（`parseArgsJson` 对空串返回 undefined）**会**回退 ⇒
+      // 同一个帧「合并层得 {}、归一化层得真实参数」= 两层判据不一致。
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream([
+        'data: {"function_call":{"id":"c1","name":"read_file","args_json":"","args":{"file_path":"a.txt"}}}\n',
+        'data: [DONE]\n',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+      const call = chunks.find((c) => c.type === 'block-end' && (c.block as { type?: string }).type === 'tool-call')
+      expect(JSON.parse((call!.block as { arguments: string }).arguments)).toEqual({ file_path: 'a.txt' })
+      // 与归一化层纯函数的结论**必须一致**（同口径的判据）
+      const norm = normalizeAccioFrame({ function_call: { id: 'c1', name: 'read_file', args_json: '', args: { file_path: 'a.txt' } } }) as
+        { candidates: Array<{ content: { parts: Array<{ functionCall: { args: unknown } }> } }> }
+      expect(norm.candidates[0]!.content.parts[0]!.functionCall.args).toEqual({ file_path: 'a.txt' })
+    })
+
+    it('🔴 匿名调用键不得与上游显式 id 撞车（两个调用必须分别产出）', async () => {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream([
+        'data: {"function_call":{"id":"anon-1","name":"alpha","args_json":"{\\"a\\":1}"}}\n',
+        'data: {"function_call":{"name":"beta","args_json":"{\\"b\\":2}"}}\n',
+        'data: [DONE]\n',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+      const calls = chunks
+        .filter((c) => c.type === 'block-end' && (c.block as { type?: string }).type === 'tool-call')
+        .map((c) => [((c.block as { name: string }).name), JSON.parse((c.block as { arguments: string }).arguments)])
+      expect(calls.length).toBe(2)
+      expect(calls).toContainEqual(['alpha', { a: 1 }])
+      expect(calls).toContainEqual(['beta', { b: 2 }])
+    })
+  })
+
+  // ⚠️ 2026-10-13 双审计查出的另两处：本 PR 新纳入合并路径的帧形状被漏判，
+  // 以及 usage 合并语义弱于消费侧。三格都实测可达。
+  describe('⚠️ 合并层：漏判的帧形状与 usage 合并语义（审计修正）', () => {
+    it('🔴 content 有值但**无 parts** + 顶层 call ⇒ 工具调用不得丢（PR 文档自记的真实终帧形状）', async () => {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream([
+        'data: {"content":{"role":"model","parts":[{"text":"Let me call get_goal.","thought":true}]},"partial":true}\n',
+        // ⚠️ 终帧：**有 content 但无 parts**，顶层带 call + usage + finish（无尾换行、无 [DONE]）
+        'data: {"content":{"role":"model"},"function_call":{"id":"call_x","name":"get_goal","args_json":"{}"},"usage_metadata":{"prompt_token_count":301,"total_token_count":337},"finish_reason":"STOP"}',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+      const calls = chunks.filter((c) => c.type === 'block-end' && (c.block as { type?: string }).type === 'tool-call')
+      expect(calls.length).toBe(1)
+      expect((calls[0]!.block as { name: string }).name).toBe('get_goal')
+      const finish = chunks.find((c) => c.type === 'finish')
+      expect((finish as { reason?: { kind?: string } })?.reason?.kind).toBe('tool-calls')
+    })
+
+    it('🔴 标准 candidates 帧 + 顶层 call ⇒ 正文不得被改写吞掉', async () => {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream([
+        'data: {"candidates":[{"content":{"parts":[{"text":"标准正文"}]}}],"function_call":{"id":"c1","name":"f","args_json":"{}"}}\n',
+        'data: [DONE]\n',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+      const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
+      expect(text).toBe('标准正文')
+    })
+
+    it('🔴 被吸收帧的 usage 取**最大 total**（不得被后到的偏小/空 usage 抹掉，与消费侧同口径）', async () => {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream([
+        'data: {"content":{"parts":[{"function_call":{"id":"c","name":"f"}}]},"usage_metadata":{"prompt_token_count":300,"cached_content_token_count":100,"candidates_token_count":10,"thoughts_token_count":4,"total_token_count":310}}\n',
+        // ⚠️ 终帧 usage **total 偏小**（310 → 4）：取最大 ⇒ 必须保住 310 那一份的**全部键**
+        //（回退前的实现会取到 4 那份，`inputTokens`/`cacheReadTokens`/`reasoningTokens` 全丢）
+        'data: {"content":{"parts":[{"function_call":{"id":"c","name":"f","args_json":"{}"}}]},"usage_metadata":{"prompt_token_count":3,"candidates_token_count":1,"total_token_count":4},"finish_reason":"STOP"}\n',
+        'data: [DONE]\n',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+      const usage = chunks.find((c) => c.type === 'usage')
+      expect(usage?.usage.totalTokens).toBe(310)
+      expect(usage?.usage.inputTokens).toBe(200)
+      expect(usage?.usage.cacheReadTokens).toBe(100)
+      expect(usage?.usage.reasoningTokens).toBe(4)
+    })
+
+    it('🔴 **首帧**同时带 snake+camel 两个 usage 键 ⇒ 必须收敛且取最大（不得让陈旧 snake 胜出）', async () => {
+      // ⚠️ 2026-10-13 对抗验证查出：初版在 `prev === undefined` 时**早退**，
+      // 于是首帧的两个 usage 键**都被保留** ⇒ 归一化层恒取 snake
+      // （`f.usage_metadata ?? f.usageMetadata`）⇒ **陈旧的小值胜出**。
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream([
+        'data: {"content":{"parts":[{"function_call":{"id":"c","name":"f"}}]},"usage_metadata":{"prompt_token_count":10,"total_token_count":10},"usageMetadata":{"promptTokenCount":3000,"totalTokenCount":3100}}\n',
+        'data: [DONE]\n',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+      const usage = chunks.find((c) => c.type === 'usage')
+      expect(usage?.usage.totalTokens).toBe(3100)
+      expect(usage?.usage.inputTokens).toBe(3000)
+    })
+
+    it('🔴 被吸收帧的**帧级**附加字段不得被改写/合成丢掉（`usage_metadata` 之外仍须保留语义）', async () => {
+      // ⚠️ 如实登记：被吸收帧最终由 `flushPending` **重新合成**，故 `content` 内的
+      // **非 `parts`** 字段（如 `extra`）**确实不会**出现在合成帧里 —— 实测下游不读它，
+      // 故刻意不补（见 `handleLine` 的注释）。本条锁的是**帧级**字段：改写用
+      // `{...frame}` 保留，且元数据照常被 `frameMetaOf` 抽走。
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream([
+        'data: {"content":{"role":"model"},"function_call":{"id":"c","name":"f","args_json":"{}"},"usage_metadata":{"prompt_token_count":7,"total_token_count":9}}\n',
+        'data: [DONE]\n',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const dec = new TextDecoder()
+      const reader = merged.getReader()
+      let text = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        text += dec.decode(value, { stream: true })
+      }
+      text += dec.decode()
+      // 帧级 `usage_metadata` 被改写分支保留（并经 frameMetaOf 拼进合成帧）
+      expect(text).toContain('usage_metadata')
+      // `content` 级附加字段**已知会丢**，如实断言（避免注释与行为再次不一致）
+      expect(text).not.toContain('"extra"')
+    })
+
+    it('🔴 无名顶层 call 不得连坐丢掉 usage/finish（端到端：该形状经合并层后仍须保住元数据）', async () => {
+      // ⚠️ **本条是回归锁，不是「无名分支」的防线**（2026-10-13 对抗验证指出）：
+      // 走完整管线时，合并层会给匿名 call 补 `id:"anon-N"` ⇒ 归一化层的
+      // 「无名」分支**根本不会命中**（实测：把该修复回退，本条**照样通过**）。
+      // 真正锁住「无名不连坐」的是上面 `normalizeAccioFrame` describe 里的
+      // **纯函数版**（同名用例，变异实测 1 红）。两者同名易误判，故在此注明。
+      // 本条的价值：锁住「该形状端到端不崩、元数据能到达」这条整体性质。
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream([
+        'data: {"content":{"parts":[{"text":"想想","thought":true}]},"partial":true}\n',
+        'data: {"function_call":{"args_json":"{}"},"usage_metadata":{"prompt_token_count":7,"candidates_token_count":3,"total_token_count":9},"finish_reason":"MAX_TOKENS"}',
+      ]).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+      const finish = chunks.find((c) => c.type === 'finish')
+      expect((finish as { reason?: { kind?: string } })?.reason?.kind).toBe('max-tokens')
+      const usage = chunks.find((c) => c.type === 'usage')
+      expect(usage?.usage.totalTokens).toBe(9)
     })
   })
 })
