@@ -1,0 +1,585 @@
+# Accio（阿里巴巴国际站 AI 电商工作台）provider 接入实测笔记
+
+> 2026-10-12 起登记。基线：**Accio Work 0.34.4**（`Accio-0.34.4-20261011-1654-win_a24e060a.exe`）。
+> 本文件是**实测事实**的唯一登记处；设计文档在
+> `docs/superpowers/specs/2026-10-12-accio-provider-design.md`（**不入库**，本地保留）。
+> 关联 issue：[Gitee IKL47K](https://gitee.com/iJetLi/deepseek-harness-codearts/issues/IKL47K)。
+> 参考实现：[tidys/dsh-connect-accio](https://github.com/tidys/dsh-connect-accio) v0.2.0。
+
+## 0. 三条与参考实现相反的结论（最重要）
+
+参考实现（`dsh-connect-accio`）做的是：读本机 `credentials.enc`（DPAPI 解密）
++ 用 Accio 自带的 `security_guard.node` 给每个 LLM 请求签名。**本次逐条实测推翻了它的两个前提**：
+
+| # | 参考实现的前提 | 实测结论 | 证据 |
+|---|---|---|---|
+| 1 | 必须读本机凭据 | ❌ **有标准 OAuth 2.0 + PKCE，可完全脱离 IDE** | §2 |
+| 2 | 必须带 SecurityGuard 签名 | ❌ **不必需**，不带 `pctb-x-*` 同样成功 | §4 |
+| 3 | 「Accio 没有签到接口」（如实说明、不给按钮） | ⚠️ 半对：**没有签到端点**，但**登录会触发服务端按日发放** | §6 |
+
+⇒ 本 provider **全平台、零本机依赖、零新增 npm 依赖**：不读 `credentials.enc`、
+不用 DPAPI、**不碰 Accio 安装目录**、不需要那串阿里 DLL。
+
+⚠️ **实施阶段（Task 6，真机）又推翻了本笔记初版的第四处**（与参考实现无关，是**我们
+自己照搬「同族 = Gemini」的假设**）：**`system_instruction` 必须是字符串**，
+对象形态恒回 HTTP 200 + 流内 400。详见 **§4.1.1**。
+
+## 1. ⚠️⚠️ 真缺陷一：`cmd /c start` 会把授权 URL 截断
+
+**本次最耗时的一个坑，症状极具误导性**（三个现象全部由这一个 bug 解释）。
+
+### 错误写法（探针最初用的）
+
+```js
+execFile('cmd', ['/c', 'start', '', url])     // ❌
+```
+
+`cmd.exe` 把 URL 里的 **`&` 当命令分隔符**，URL 在第一个 `&` 处被截断：
+
+```
+地址栏实际得到：
+https://www.accio-ai.com/login?return_url=http%3A%2F%2F127.0.0.1%3A<port>%2Fauth%2Fcallback
+  %3Flogin_trace_id%3D…%26launcher_timestamp%3D<ts>
+                                                            ↑ 到此为止
+丢失：&state=…&code_challenge=…&code_challenge_method=S256&client_id=accio-work
+```
+
+⚠️ `<port>` / `<ts>` 是占位符：这里要展示的是**截断位置**，端口与时间戳属于
+**某一次实测的本机痕迹**，没有教学价值，不入库。
+
+### 观察到的三个现象与真因
+
+| 现象 | 真因 |
+|---|---|
+| 弹「**请升级客户端**」modal | `code_challenge` 丢失 ⇒ 恰好命中登录页的 legacy 客户端门禁（见 §3）|
+| 弹出一个**文件管理器**窗口 | 残余片段被 `explorer.exe` 当**路径**打开（探针为兜底也调了 explorer）|
+| 回调日志**完全为空** | URL 截断后 `state` / `code_challenge` 全没了，流程走不完 |
+
+### 正确写法（不经过任何 shell）
+
+```js
+execFile('rundll32.exe', ['url.dll,FileProtocolHandler', url])   // ✅
+```
+
+⇒ **必须加源码级回归锁**：断言实现里出现 `rundll32` 且**不出现** `cmd` + `start` 组合。
+已落地在 `tests/unit/accio-oauth.spec.ts` 的「★ 防回退锁：打开浏览器绝不能用
+`cmd /c start`」段（它**先切出 `openBrowser` 函数体再断言**，并对 `indexOf` 结果
+先断言 `>= 0` —— 否则 `-1 < 非负下标` 恒成立，删掉目标照样全绿）。
+⚠️ 该段也**逐字锁住** `execFile('rundll32.exe', ['url.dll,FileProtocolHandler', url], () => {})`
+里那个空回调：`execFile` 的失败是**异步 `'error'` 事件**，而**第三个参数的回调就是它的
+消费者**（传了回调 Node 才代为挂 `'error'` 监听器）⇒ **删掉 `() => {}` 会变成未捕获异常
+并打挂宿主**。这一条同样是实测结论，不是风格偏好。
+
+## 2. 登录：标准 OAuth 2.0 + PKCE（S256）
+
+逆向 `out/main/index.js` 的 `startLoginWithCallbackMode` **逐字**：
+
+```js
+const u = `${Md("web")}/login?return_url=${encodeURIComponent(this.pendingRedirectUri)}`
+        + `&state=${encodeURIComponent(this.pendingState)}`
+        + `&code_challenge=${encodeURIComponent(c)}`
+        + `&code_challenge_method=S256`
+        + `&client_id=${encodeURIComponent(eh)}`     // eh = "accio-work"
+```
+
+| 项 | 值 |
+|---|---|
+| 中国版授权页 | `https://www.accio-ai.com/login` |
+| 国际版授权页 | `https://zh.accio.com/login` |
+| `client_id` | **`accio-work`**（**公开客户端，无 `client_secret`**）|
+| PKCE | `code_verifier` = 48 随机字节 base64url；`code_challenge` = `base64url(SHA-256(verifier))` |
+| `state` | 32 随机字节 hex |
+| 回调 | 桌面端用 `http://<local-gateway>/auth/callback` 或 `accio://`；**代码里对 `return_url` 无白名单校验** ⇒ 我们可用自己的 loopback |
+
+**兑换**（逆向 `exchangeCodeForToken` 逐字，实测 HTTP 200 跑通）：
+
+```
+POST https://phoenix-gw.alibaba.com/api/oauth/token
+body { code, codeVerifier, clientId: "accio-work", redirectUri }
+→ {"success":true,"code":"200","data":{
+     "accessToken":"<32 字符，不透明串>",
+     "expiresAt":1794407698,          ← ⚠️ 秒
+     "refreshToken":"<128 字符>",
+     "sgcookie":"<base64 串，约 112 字符>"}}
+```
+
+⚠️ **示例里的值是脱敏后的形态**（`<…>` 是占位说明）：真实值**不得**抄进本文件 ——
+`accessToken` / `refreshToken` / `sgcookie` 都是凭据本体，写进长期资产就是一次泄露。
+
+⚠️ 官方客户端自己在这里做了 `1e3 * t.expiresAt` 归一化 —— 见 §5 的真缺陷二。
+
+**续期**：`POST /api/auth/refresh_token` `{accessToken, refreshToken}`。
+⚠️ **本笔记仍未实测该端点**（见 §10 U-A）：参考实现明确记录「刷新**会轮换**
+refresh_token」，测它会**作废用户本机 IDE 当前的登录态**。
+⇒ 已写好**带双闸门**的探针 `tests/e2e/accio-refresh-probe.e2e.spec.ts`
+（`DSH_ACCIO_REFRESH_E2E=1` + `..._CONFIRM=yes`；它现场跑本插件自己的 PKCE 登录、
+凭据只进内存、**从不读**桌面端数据与池里的 `ACCIO_ACCOUNT_*`），
+但**尚未运行** ⇒ U-A 的答案仍是「未验证」，**不要**照参考实现当结论用。
+实现侧已按「会轮换」的最坏假设做了防御（`accio-auth.ts` 的 per-ref `SerialQueue`、
+判终态前重读凭据、判据读凭据而非池里的 `refreshable`）。
+
+## 3. 登录页的「请升级客户端」门禁（legacy 客户端判据）
+
+真源是登录页 bundle **`kiIt5C4K.js`**（`/login-csr.js` 的传递依赖；**不在 asar 里，在 CDN 上**）：
+
+```js
+const d = "/login/redirect"
+const f = { "accio-work": {displayName:"Accio Work"}, wren_extension:{…}, ma:{…} }
+const U = new Set(["127.0.0.1", "localhost"])
+function m(r){ const n = new URL(r); return n.protocol==="http:" && U.has(n.hostname) }
+function s(r){ return ["phoenix:","accio:"].includes(proto) || m(r) }   // 「本地回环」
+function S(r){ return s(n.return_url) && !n.code_challenge }            // ← 弹窗判据
+function b(r){ return known(client_id) && e ? 跳 `${origin}/login/redirect?${原query}` : q(r) }
+```
+
+⇒ 门禁拦的是**旧版客户端**（旧版不做 PKCE ⇒ `return_url` 指向本地却**没有** `code_challenge`）。
+**带 `code_challenge` 的合法客户端不该被拦** —— 我们那次被拦，正是 §1 的 URL 截断造成的。
+
+⚠️ **不要**把这个 modal 当成「Accio 不支持第三方登录」的证据。
+它也不影响后端：用户删掉 modal 后点「继续」流程照样走完（服务端不校验版本）。
+
+⚠️ 埋点名是 `legacy_client_upgrade_modal_shown` / `legacy_client_upgrade_prechecked` ——
+搜「版本门禁」时用这两个词才找得到。
+
+## 4. ★★ 推理端点：**不需要 SecurityGuard 签名**
+
+### 4.1 权威请求形状
+
+来源：`out/main/gateway-worker.js` 的 `streamGenerateContent`（逐字）。
+⚠️ **`generateContent` 只在 gateway-worker 里，`index.js` 里 0 处命中** ——
+搜实现时别只扫 `index.js`。
+
+```
+POST {gateway}/api/adk/llm/generateContent?sg_k={md5(requestId)}
+  gateway = https://phoenix-gw.alibaba.com
+  baseUrl = {gateway}/api/adk/llm                     // 常量 aee
+  sg_k    = md5hex(requestId,'utf8')                  // Kt() 逐字
+headers: Content-Type: application/json
+         Accept: text/event-stream
+         utdid:   <设备 id>
+         version: <客户端版本>
+         appKey:  'OneChat'                           // 常量，非产品名
+```
+
+**请求体**（Gemini 风格，键名 snake_case）：
+
+```jsonc
+{
+  "model": "<modelCode>",
+  "empid": "", "tenant": "", "iai_tag": "",      // ⚠️ 必须空串
+  "request_id": "req-<ts>", "user_request_id": "req-<ts>",
+  "contents": [{"role":"user","parts":[{"text":"hi"}]}],
+  "system_instruction": "……",                    // ⚠️⚠️ **字符串**，不是 {parts:[…]}！见 §4.1.1
+  "tools": [{ "name": "…", "description": "…", "parameters_json": "<JSON Schema 字符串>" }],
+                                                 // ⚠️⚠️ **扁平形态**，不是 {function_declarations:[…]}！见 §4.1.2
+  "temperature": 0, "max_output_tokens": 32, "stop_sequences": [],
+  "properties": {"utdid":"…","version":"0.34.4","appKey":"OneChat","normalized_response":"true"},
+  "token": "<accessToken>",                       // ★ 见 4.2
+  "message_id": "<md5hex(requestId+random)>",     // ⚠️ 必填，缺则 400
+  "incremental": true
+}
+```
+
+#### 4.1.1 ⚠️⚠️ `system_instruction` 是**字符串**，不是 Gemini 的 `{parts:[…]}` 对象
+
+**本笔记初版写错了这一格**（照搬 Gemini 的 `systemInstruction.parts` 形态），
+Task 6 真机实测推翻：**对象形态恒回 `HTTP 200` + 流内 `400 Invalid request format`**。
+（`src/accio-adapter.ts` 的 `buildAccioBody` 初版就是这么写的，commit `3034d03` 修正；
+`tests/unit/accio-product.spec.ts` 同步锁定**字符串**形态。）
+
+**权威证据**（官方 proto，`out/main/gateway-worker.js` 逐字）：
+
+```js
+systemInstruction: gt(e.systemInstruction) ? globalThis.String(e.systemInstruction)
+                 : gt(e.system_instruction) ? globalThis.String(e.system_instruction) : ''
+```
+
+两处都用 **`String()`** 归一；诊断路径的判据同样是
+`typeof t.system_instruction === 'string' ? t.system_instruction : ''`。
+
+⇒ **Accio 与 Gemini 在这一格上不同形**。照搬 Gemini 会得到一个
+「HTTP 200 但流内 400」的静默失败 —— 而 400 又会被误读成「参数错」而非「形状错」。
+
+⚠️ **教训（可推广）**：本 provider 与 Gemini 同族的是**信封骨架**
+（`contents` / `parts` / `thought` / `usage_metadata`），**不是每一个字段**。
+「同族」只能作为**起点**，逐字段仍要拿官方 proto 核对 —— 否则会把
+「相似」当成「相同」，而失败的形态恰好是最难查的那种（200 + 流内错误码）。
+
+**响应帧**（实测）：
+
+```json
+{"content":{"role":"model","parts":[{"text":"The","thought":true}]},"partial":true,
+ "raw_response_json":"{\"choices\":[{\"delta\":{\"reasoning_content\":\"The\"},…}]}"}
+```
+
+⚠️ **形状要点**：`content` / `usage_metadata` 在**顶层**（**不包在 `candidates[]` 里**），
+与标准 Gemini 不同 ⇒ 需要一层**薄归一化**才能复用 `src/gemini-messages.ts` 的
+`consumeGeminiSse`（那时 `content` 会被当作 `inner`，但它找的是 `inner.candidates` ⇒ 命中不了）。
+
+#### 4.1.2 ⚠️⚠️ `tools` 是**扁平**形态，不是 `{function_declarations:[…]}`
+
+**本笔记初版把这一格写成了包装形态**（`"tools": [{"function_declarations":[ … ]}]`，
+那是照 Gemini 的形状推断的），**实测与实现都是扁平的**：
+
+```jsonc
+// ✅ 实测被上游接受的形状（`src/accio-messages.ts` 的 `toAccioTools` 产出，
+//    经 `src/accio.ts` 的 `accioToSnake` 后键名变 snake）
+"tools": [
+  { "name": "read_file",
+    "description": "Read a file from disk.",
+    "parameters_json": "{\"type\":\"object\",\"properties\":{\"file_path\":{…}},\"required\":[\"file_path\"]}" }
+]
+```
+
+**证据（间接，但成立）**：Task 6 的两支真机探针 `probe-tool-shards.mjs` /
+`probe-tool-merge.mjs`（见 §9）用的**正是扁平形态**（`parametersJson` 字符串），
+上游回的是真实 `function_call` 帧 —— `task-6-report.md` §4.2 逐字记录：
+
+```
+frame#8  {"function_call":{"id":"call_c3a3…","name":"read_file"}}                              ← 首帧无参数
+frame#9  {"function_call":{"id":"call_c3a3…","name":"read_file","args_json":"{\"file_path\":…}"}}
+frame#10 {"function_call":{"id":"call_c3a3…","name":"read_file","args_json":"{\"file_path\":…}"}}
+```
+
+上游**按我们下发的 `name` 回了一个同名工具调用、且参数键与 schema 里的 `file_path` 对得上**
+⇒ 扁平形态**被接受且被正确理解**。⚠️ **探针本体在 `.tmp-accio/`（已 gitignore）且没有日志留存**，
+故这条属「**已验证但证据未留存**」，不是「未验证」（§10 把两者分开登记）。
+
+⚠️ **包装形态没有被实测过**（既没证伪也没证实）。**不要**因为「官方 proto 里是
+`function_declarations`」就切过去：那是**官方客户端内部对象 → wire** 的转换结果，
+wire 上真正被接受的是上面这个扁平形状。切换是**未验证的改动**，而且会顺带激活下面这个隐患。
+
+##### ⚠️ 为什么参数名是安全的（这一条关掉了「包装形态」的隐患）
+
+`toAccioTools` 把**整份 JSON Schema 序列化成字符串**放进 `parameters_json`：
+
+```ts
+parametersJson: JSON.stringify(fn.parameters ?? { type: 'object', properties: {} })
+```
+
+而 `accioToSnake`（`src/accio.ts`）**不下钻字符串** —— 它只对数组与对象递归，
+字符串原样返回。⇒ **工具参数名（`filePath` / `oldString` …）是「数据」，不在改写路径上**，
+无论驼峰还是下划线都**逐字节**送到上游，与模型据 schema 生成的 `args_json` 键天然一致。
+
+⚠️⚠️ **反过来说：这正是「必须保持字符串化」的理由。** 若改成包装形态并把 schema 写成
+**对象**（`{ function_declarations: [{ name, parameters: { properties: { filePath: … } } }] }`），
+`accioToSnake` 就会**递归下钻到 schema 内部**，把参数名 `filePath` 静默改写成 `file_path` ——
+模型看到的是 `file_path`、生成的 `args_json` 也是 `file_path`，但**其它任何按原 schema
+消费这份定义的地方（含调用方自己的校验）会对不上**，且**没有任何报错**。
+本仓库把这类缺陷登记为「同一份语义两处判据」，这里则是「**schema 被当协议字段改写**」。
+
+⇒ `src/accio.ts` 的 `buildAccioBody` tools 区域已就地写下这条警告（改 schema 前先读它）。
+
+### 4.2 ★ 两个变量各自独立验证过
+
+**四格矩阵**（模型 `1Drift-N8kP2Q7wR5mX`，倍率 0.013，`max_output_tokens=32`）：
+
+| # | 签名 | token 位置 | 结果 |
+|---|---|---|---|
+| 1 | ❌ | **body** | ✅ **HTTP 200 + 真实内容帧** |
+| 2 | ❌ | `Authorization: Bearer` | ❌ 流内 `{"error_code":"402","error_message":"unauthorized"}` |
+| 3 | ✅ | body | ✅ HTTP 200 + 内容帧 |
+| 4 | ✅ | `Authorization: Bearer` | ❌ 同上 402 |
+
+⇒ **签名不必需**（由「1 vs 3」这对干净对照支撑）；
+**token 必须在 body 的 `token` 字段**（由「1 vs 2」支撑）。
+
+⚠️ **`sgcookie` 的必需性是另一回事** —— 上面四格**全部带了** `sgcookie`
+（探针把它写在公共路径上），故**那一轮不能回答它**。补做的干净对照
+（唯一变量 = sgcookie，两者都不带签名、token 都在 body）：**带 ✅ / 不带 ✅**
+⇒ `sgcookie` **也不必需**。
+
+⚠️ **但设计仍保留并带上它**：保留零成本，删除是单向下注（上游哪天收紧就整体失效）。
+
+⚠️ **教训（可推广）**：写对照矩阵时**必须检查每个变量是否真的独立** ——
+把某个赋值写在公共路径上，会让「所有格子」共享它，从而**静默地**让该维度失去对照。
+「四格都成功了」不等于「四个变量都被验证了」。
+
+### 4.3 判「成功」的口径
+
+⚠️ **不能只看 HTTP 200** —— 第 2/4 格就是 **HTTP 200 + 流内 `error_code: 402`**。
+必须同时检查：
+
+1. 有 `content.parts` **且**有 `text`；
+2. **无** `error_code`。
+
+漏掉第 2 条会把「认证失败」读成「模型返回空内容」。
+
+### 4.4 SSE 与工具调用
+
+- `data:` 单行 JSON 帧；`[DONE]` 或流结束收尾。
+- 思维链：`parts[].thought === true` ⇒ 映射到 **`reasoning`**，**不得混入正文**。
+- 工具调用：`parts[].function_call`；⚠️ **响应是 snake_case（`args_json`），
+  请求是 camelCase（`argsJson`）** —— 参考实现记录「读 camelCase 名会静默得到 0 个工具调用」。
+- ⚠️⚠️ **工具调用分片到达，且共享消费者 `consumeGeminiSse` 不合并**（Task 6 实测）：
+  上游把**一次**调用拆成多帧（首帧 `{id,name}` 无参数，后续帧**重复完整的**
+  `args_json`）。`consumeAccioSse` 对每个 `functionCall` part 各产出一个**独立**的
+  tool-call 块 ⇒ 一次调用会变成 **N 个块**（首个参数 `{}`），harness 会**执行 N 次**。
+  ⇒ **合并职责归适配器**（设计如此）：`accio-adapter.ts` 的
+  `accioToolCallMergeTransform`。E2E 探针 `test:e2e:accio-tools` 专门断言
+  「同一个 id **恰好一个块**且参数**非空**」。
+
+### 4.4.1 ⚠️ 思考**关不掉**（四类字段逐格实测全部无效）
+
+`includeThoughts` / `thinkingBudget` / `thinkingLevel` / `reasoningEffort` 四类字段
+逐格实测：**思考字符数一个都没变**（`reasoningEffort=off` 甚至回 **505**）。
+
+⇒ 会话命名只能走 `planSessionTitleThinking` 的**抬预算**兜底（issue IKKVDH）；
+⇒ 目录里**不声明**任何思考档位（未声明 ⇒ DSH 不发该字段）；
+⇒ 两个花钱的 E2E 探针的 `maxOutputTokens` 取 **256** 而非 64 —— 实测短回答的思考
+本身就要吃掉几十个 token，64 会让「有思考、没正文」的假失败混进来。
+
+### 4.5 为什么复用 `consumeGeminiSse` 而不是重写
+
+Accio 与 Gemini 是**同一族协议**（信封 + `content.parts[]` + `thought` + `usage_metadata`）。
+用户裁定：**复用 `consumeGeminiSse`，但不共用 gemini 的 provider 配置**。
+
+⚠️ `consumeGeminiSse` 里的逻辑**全是踩坑换来的**，重写必然重新踩：
+
+1. `readWithIdleTimeout` —— 裸 `reader.read()` 在上游长时间不 flush 时**无限期挂起**（「永远转圈」）；
+2. 结束时**先 flush 解码器**、再把余量按整行走一遍 —— 否则**最后一条事件被丢弃**；
+3. `noteUsage` 取**最大** `totalTokenCount` —— 上游多帧重复播报且早期帧偏小；
+4. 工具调用**独占一块**、参数一次性发完；
+5. **空响应必须抛错** —— 静默结束会让 harness 认为「正常回答但没内容」，**不会重试**；
+6. 跳过注释行心跳（`:` 开头）。
+
+⚠️ **不共用 provider 配置**：`gemini-messages.ts` 是**协议层**，不含 gemini 的
+OAuth / 项目号 / 配额语义；accio 不 import `gemini-product.ts` / `gemini-auth.ts` /
+`gemini-credits.ts`，也**不复用** `GEMINI_GENERATE_PATH`（那是 Cloud Code 的路径）。
+
+⚠️ **Accio 与 Qoder 同属阿里但协议完全不同**（别照着 Qoder 写）：
+Qoder 是 OpenAI 风格 + WASM **加密** body（`api2.qoder.sh`），
+Accio 是 Gemini 风格**明文**（`phoenix-gw.alibaba.com`）。同属一个集团 ≠ 同协议。
+
+## 5. ⚠️⚠️ 真缺陷二（未发生但极易发生）：`expires_at` 秒/毫秒混淆
+
+上游 `expiresAt` 是**秒**（实测 `1794407698` ≈ 2026-11-11），官方客户端自己 `1e3 *` 归一化。
+
+**若直接当毫秒用**：
+
+```
+new Date(1794407698) → 1970-01-21        ⇒ 判定「早已过期」
+⇒ 每个请求都触发续期
+⇒ 并发下反复消费 refresh_token
+⇒ 最终 invalid_grant ⇒ 账号被标死，用户只能重新登录
+```
+
+这与本仓库 **codearts 的「续期单向门」事故同型**，且更隐蔽（错的是**时间量纲**，不是布尔）。
+
+⇒ **归一化只做一次**（在 `accio-oauth.ts` 的兑换/续期返回处 → `accio.ts` 的
+`accioExpiresAtMs`），并加防御分支：
+`expiresAt > 1e12` 视为已是毫秒（容忍上游某天改单位），否则 `×1000`。
+单测**必须做反向验证**：去掉 `×1000` ⇒ 用例必须变红
+（已落地：`tests/unit/accio-oauth.spec.ts` 的「⚠️⚠️ 上游 expiresAt 是秒 ⇒ 必须 ×1000」，
+断言的正是 `1_794_407_698 → 1_794_407_698_000` 与 `getFullYear() > 2025`）。
+
+⚠️ **这一条是「预防」而不是「已发生」**：本 provider 从第一版实现起就带着归一化，
+故它**没有**在真实账号上造成过标死。登记在此是因为它极易复发（新增 provider 时
+照抄 `expires_at` 字段名却忘了量纲），而代价是**账号单向门**。
+
+## 6. 积分：**没有签到端点**，但**登录会触发按日发放**
+
+**只读端点**（全部实测 200）：
+
+| 端点 | 方法 | token 位置 | 用途 |
+|---|---|---|---|
+| `/api/auth/userinfo` | **POST** | **body** | 身份：`userId` / `userName` / `routeRegion` / `userLevel` / `maskedMobile` |
+| `/api/entitlement/currentSubscription` | **GET** | **query** | 三类桶：`daily` / `monthly` / `referral` |
+| `/api/entitlement/quota` | GET | query | `usagePercent` / `refreshCountdownSeconds` |
+| `/api/entitlement/listGrantRecords` | GET | query | 积分来源与有效期 |
+| `/api/entitlement/listUserMessageBill` | GET | query | 最近逐条用量 |
+
+⚠️ **传参方式不统一**：`userinfo` 必须 **POST + body**（GET 会 `405`），
+其余 **GET + query**（缺 token 会 `400`）。用错即静默走偏。
+
+⚠️ **实现只接线了上表的前三行**（`userinfo` / `currentSubscription` / `quota`）：
+`listGrantRecords` / `listUserMessageBill` 是**取证时**实测过的端点，插件**不调用**
+（前者只用来确认「登录触发发放」与 24 小时有效期，后者只用来确认逐条用量的形状）。
+将来若要展示「积分来源明细」或「最近用量」，这两条已经验证过可用。
+
+**实测 grant records**：
+
+```
+source=DAILY_GIFT  type=DAILY_REWARD        amount=200  reason=DAILY_GIFT
+    effective=<登录时刻 ms>  expiry=effective+86400000      ← 差 86400000 ms = 24h
+source=ACCIO_WORK  type=PHOENIX_FIRST_GIFT  amount=500  reason=ACCIO_FIRST_GIFT  （注册赠送，一次性）
+```
+
+⚠️ 时间戳写成**相对形态**（`effective` + 86400000）而不是抄实测的绝对值：
+绝对值是**某次登录的本机痕迹**，而这条记录要说明的是「**差值恰好 24 小时**」这个事实。
+
+- 每日 **200 积分**，**有效期恰好 24 小时、不累积**；`quota.refreshCountdownSeconds = 86400`。
+- **那条 200 的 `effective` 正是登录时刻** ⇒ 证实「登录触发当日发放」
+  （用户原话：「每日签到领取积分的操作是登录一次」）。
+- ⇒ `dailyCheckin` **不登记**（显式写 `false`，如实：没有可调用的签到端点）。
+- ⚠️ **「刷新每日额度」入口至今（2026-10-13 实施完成时）仍未实现**：它本质是
+  **重新登录既有账号**，而现有 RPC 表面**没有**这个能力 —— 实测三条障碍：
+  ① `account.create` **恒新建** id（`const id = \`${provider}-${shortId()}\``），
+  且 `RpcCreateAccountRequest` **没有 `accountId` 字段** ⇒ 复用它会加一个幽灵账号，
+  而**原账号的额度根本没刷新**（正是「骗人的按钮」）；
+  ② 账号的 `region` **没有暴露给客户端**（不在 `ProviderAccountEntry` / 状态里）；
+     ⚠️ **注意与 §9.1 ④ 区分**：④ 接的是「**新建账号时**选区域」（`account.create` 的入参，
+     已落地）；本条说的是「**已登录账号的 region 读不回来**」（面板想展示/复用既有账号的
+     区域时拿不到）—— 这是 `account.relogin` 那条 RPC 的障碍之一，**仍未解决**。
+  ③ `login.poll` 对**已登录**账号立刻回 `done: true` ⇒ 会给出**假成功**。
+  ⇒ 需要**宿主侧新增一条 RPC**（如 `account.relogin`）才能落地；
+  在那之前面板**刻意不渲染该按钮**（不是忘了做），只如实说明「每日积分由服务端在
+  登录时发放，有效期 24 小时、不累积；要刷新请删除该账号后重新登录一次」。
+  ⚠️ **不要**把它接到 `credits.claim`（`dailyCheckin` 已是 false），
+  也不要接到 `account.create`（那会造幽灵账号）。
+  ⚠️ 由 `tests/unit/accio-client-panel.spec.ts` 的用例守着「不得渲染该死控件、
+  也不得接 `account.create`」，且**守 registry 的注释不得再声称该入口已存在**
+  （早先那里写过「面板另有一个 accio 专属入口」—— 那条承诺未兑现，已订正）。
+
+## 7. 模型目录（实测 15 个可见模型）
+
+`POST /api/llm/config/v2` `{token}` → `data[].modelList[]`，字段：
+`modelCode` / `modelDisplayName` / `contextWindow` / `multimodal` / `effectiveMultiple` /
+`reasoningEfforts` / `defaultReasoningEffort` / `visible` / `freeUse`。
+
+| modelCode | 倍率 | 上下文 | 多模态 | 显示名 |
+|---|---|---|---|---|
+| `1Drift-N8kP2Q7wR5mX` | 0.013 | 512,000 | ✅ | Qwen 3.8 27B |
+| `1Drift-F8hS3mK7pL2n` | 0.03 | 1,000,000 | ✅ | Qwen 3.8 Flash |
+| `1Chronos-F53X9nQ3rT8w` | 0.03 | 1,000,000 | ✅ | GLM 5.3 Flash |
+| `1Nova-Q3xM8vJ1rH6z` | 0.045 | 1,000,000 | ✅ | DeepSeek V4.1 Flash |
+| `1Zenith-M27hS2SR5xQ2p` | 0.08 | 1,000,000 | ✅ | MiniMax M3 |
+| `1Chronos-dX3cV9sA2mK7` | 0.12 | 200,000 | ❌ | GLM 5.1 |
+| `1Nexus-R3wF8qJ5vB6h` | 0.13 | 1,000,000 | ✅ | Standard |
+| `1Drift-A3bM5nK8pQ2w` | 0.13 | 256,000 | ❌ | Qwen 3.5 A3B |
+| `1Synapse-G5aJ8wL1dV4s` | 0.14 | 256,000 | ✅ | Kimi K2.6 |
+| `1Chronos-L53W8nP2qR6m` | 0.16 | 1,000,000 | ❌ | GLM-5.3 |
+| `1Chronos-G5p2V9sA2mK7` | 0.16 | 1,000,000 | ❌ | GLM-5.2 |
+| `1Nova-bW7yT4kL9pN2` | 0.17 | 1,000,000 | ❌ | DeepSeek V4 Pro |
+| `1Drift-T3TB6WS9a23w` | 0.44 | 1,000,000 | ✅ | Qwen 3.8 Max |
+| `1Orbit-I9eY4tK8bW1f` | 1 | 1,000,000 | ✅ | Professional |
+| `1Orbit-Q7hN3xR6cP2m` | 2.8 | 1,000,000 | ✅ | Ultimate |
+
+⚠️ **倍率必须进展示名**（`名称 · x倍率`）：跨度 0.013~2.8（**215 倍**），是选型时最重要的信号，
+而 DSH 的模型信息没有承载它的字段。本仓库既有约定：**倍率写进 `name`，不是 `description`**；
+id 保持裸 `modelCode`。
+
+⚠️ **模型 id 非人类可读**（`1Drift-…`）⇒ 目录**必须动态拉取**，兜底表只作离线回退。
+排序按倍率升序（便宜在前），无倍率的排最后。
+
+## 8. 区域
+
+- **gateway 同一个**（`phoenix-gw.alibaba.com`），与区域无关。
+- 只有**登录页域名**不同：中国版 `www.accio-ai.com` / 国际版 `zh.accio.com`。
+- 区域由服务端按账号下发（`userinfo.routeRegion`，实测 `CN`）。
+- ⇒ **单 provider + product 配置收敛区域**（用户裁定），区域在登录时由用户选
+  （采 zcode 的 `loginProvider` 模式），**不做成第二个 provider id**。
+- ✅ **入口已落地**（2026-10-13 终审 I2）：客户端「+ 新建账号」弹窗里选区域，
+  经 `account.create` 的 `accioRegion` 下发 → 宿主 `normalizeAccioRegion` 白名单 →
+  `AccioAuth.startLogin` 的 `region` → `ACCIO.loginBaseUrlOf(region)` 选登录域，
+  并写进凭据（续期与推理按它选域名）。落点与反向验证见 §9.1 ④。
+- ⚠️ **区域不可事后纠正**：它写进凭据后，续期与推理都按它走；选错只能**删除账号重登**。
+
+## 9. 相关文件（`.tmp-accio/`，已 gitignore，只读取证工具）
+
+| 文件 | 用途 |
+|---|---|
+| `scan.mjs` / `grep-asar.mjs` / `dump.mjs` / `extract.mjs` | 解析 `app.asar` 目录表、按关键词定位、按偏移取出文件 |
+| `probe2.mjs` | **PKCE 登录探针**（成功跑通；含 `rundll32` 修复后的浏览器打开） |
+| `probe-cred.mjs` | 签名必要性四格对照（⚠️ 其 sgcookie 未隔离，见 §4.2） |
+| `probe-sgcookie.mjs` | **sgcookie 必需性的干净对照**（§4.2） |
+| `probe-credits.mjs` | 积分语义取证（§6） |
+| `probe-tool-shards.mjs` / `probe-tool-merge.mjs` | **工具调用的分片到达**取证（§4.4）：上游把一次调用拆成多帧。⚠️ 这两支是 §4.1.2「扁平 `tools` 形状被接受」的**间接证据来源** —— 它们下发的就是扁平形态，上游回了真实 `function_call` 帧 |
+| `loginjs*.mjs` / `findgate.mjs` / `kii.mjs` / `resolveae*.mjs` | 定位登录页 legacy 门禁真源（`kiIt5C4K.js`，§3） |
+
+⚠️ 这些是**只读取证工具**，不入库；`src/` 不引用它们。
+
+## 9.1 实施阶段（2026-10-13）新增的三条**接线**结论
+
+不是协议事实，但同样是「漏了会静默失效」的判据，登记在此以免下次接 provider 重踩。
+
+### ① ⚠️⚠️ 必须登记进 `SELF_HEAL_REFRESHABLE_PROVIDERS`（本 provider **真的漏过**）
+
+`src/jet-hub-rpc.ts` 的 `SELF_HEAL_REFRESHABLE_PROVIDERS` 决定「积分查询前要不要
+先按需续期」。accio **有** refresh 端点、池内 `expiresAt` 也确实会被写 ⇒
+不属 loomy / zcode 那类「设计上无端点」的豁免。
+
+**漏登记的后果**（Task 7 实际发生过）：过期账号在积分端点**永不自愈** ——
+积分行报「未登录」而上游其实只需一次 refresh，症状与 issue IKKHL5 **逐字相同**，
+且**日志零字**。
+
+⚠️ 根因是**守卫只有单向**：`credits-balance-self-heal.spec.ts` 原先只锁
+「本集合 ⊆ `JetHubAuths` 的键」（挡住假 id），**反向没有** ⇒ 新 provider 进了
+`JetHubAuths` 却忘了登记到这里时**全绿**。现已补反向用例（逐键点名 + 显式豁免表
+`SELF_HEAL_EXEMPT`，豁免必须带可核对理由），漏登记会**点名变红**。
+
+### ② `rateLimit: false` —— 两个按钮对本家**恒为惰性**
+
+判据是本仓库 registry 自己的落地问法：「这个按钮点下去，能不能让用户**少**受限一次？」
+答否即 `false`。accio 两条都不满足：
+
+- 适配器**不写** `modelRateLimits`（`provider-runtime-wiring.spec.ts` 的
+  `WRITE_SITE_FILES` 把它登记为空，并有用例验证它确实无写点）⇒ 永远没有标记可清；
+- `src/index.ts` 的 `probeById` **没有**它的条目 ⇒ 点「重测」时 `retestAccount` 走到
+  `modelIds.length === 0` 处**提前返回**：零请求、零清除。
+
+⇒ 面板级「重测所有 / 重置所有」与卡片级两个按钮**全部恒为惰性**（正是本仓库记录过的
+报障形态「按钮响应这么快，是不是坏了」）。
+
+⚠️ 与 loomy / gemini **理由不同**（它们是真会限流、只是按钮管辖不到）：
+accio 是**根本没有这组按钮的作用对象**。
+⚠️ 「省略 = true 以免老用户失去按钮」那条理由**不适用于全新 provider**（无存量用户，
+无功能回退可言）。⇒ 将来接上请求级换号 + 冷却时，**这一行要一起改回 `true`**，
+且届时必须**同时**进 `probeById` 与 `WRITES_RATE_LIMIT_PROVIDERS`。
+
+### ③ 其余「漏一处即静默失效」的接线点（同批已逐处接上）
+
+| 位置 | 漏掉的症状 |
+|---|---|
+| `src/jet-hub-store.ts` 的 `ACCIO` 前缀表 | `state.json` 缺失时 `ACCIO_ACCOUNT_*` 的账号**静默消失**（同款坑第**四**次） |
+| `src/aggregate-adapter.ts` 的参与渠道清单 | 聚合里**选不到** Accio 的模型（静默） |
+| `src/provider-registry.ts`（纯数据）+ `provider-runtime.ts`（实现） | 能力声明与实现分叉；客户端能力表从前者派生 |
+| `src/provider-credits.ts` 的 `accio` 分支 | 积分端点 `bad-request`，而客户端仍会发请求 |
+
+### ④ ✅ 区域选择入口**已接上**（2026-10-13 终审 I2 修复）
+
+`RpcCreateAccountRequest.accioRegion` 存在且过白名单（`normalizeAccioRegion`，未知值回落 `'cn'`）。
+**客户端原本没有入口** ⇒ 宿主恒收到 `undefined` ⇒ 恒回落 `'cn'` ⇒ **国际账号根本登不进去**
+（这是**功能缺口**，不是「少一个偏好」：登录页域名按区域分，而区域由服务端按账号下发、
+登录前无从推断）。
+
+现已在客户端接上，落点**三处必须同步**（前两处判据方向相反，见 `new-account.js` 的注释）：
+
+| # | 位置 | 改动 |
+|---|---|---|
+| ① | `new-account.js` 的 `PROVIDERS_ASKING_OPTIONS`（**白名单**） | 加 `'accio'` |
+| ② | `new-account.js` 的 `buildCreateAccountPayload`（**排除法**） | 第三个形参 `accioRegion`，`provider === 'accio'` 时下发 |
+| ③ | `tests/unit/new-account-dialog.spec.ts` 的 `EXCLUSIVE_FIELDS` | 加 `'accioRegion'`（**第三处**，漏了它不变式会退化成只查旧字段） |
+
+`plugin-src/client/jet-hub.js` 的弹窗按 `accioDialog = provider === 'accio'` 分支
+（accio 问**登录区域**、zcode 问**登录渠道**），选项值 `'cn'` / `'global'` 与宿主白名单逐值对齐。
+
+⚠️ **反向验证已做**（四个变异，各自点名变红）：只改白名单 / 只改载荷 / 调用点漏传第三个实参 /
+弹窗不分支。⚠️ 其中「弹窗不分支」第一次写断言时**没抓住**（只断言 `accioDialog ?` 这个
+**形态存在**，而变异 `const accioDialog = false` 让三元永远走 else 支）—— 已改为**钉住赋值**。
+
+## 10. 未验证项（截至 2026-10-13 实施完成）
+
+⚠️ **实施阶段没有运行任何 E2E 探针**（会开浏览器 / 花积分 / 轮换凭据）。
+四个探针已写好并**全带闸门**（默认 skip），清单与运行方式见 `tests/e2e/README.md`。
+
+⚠️⚠️ **本节刻意区分两种状态 —— 别把它们混成一句「未验证」**：
+
+| 状态 | 含义 | 该做什么 |
+|---|---|---|
+| **未验证** | 从来没有跑过任何对照，结论**不存在** | 需要跑探针 / 做对照才能得到结论 |
+| **已验证，但证据未留存** | **真机跑过并得到结论**，但探针在 `.tmp-accio/`（已 gitignore）、**没有日志或产物留在库里** | 结论**可以照用**；若要做成回归防线，需要**重跑并留存证据** |
+
+⚠️ 把第二类写成第一类会让人**重做一遍已经做过的事**；把第一类写成第二类则是**编造结论**。
+下表逐行标注属于哪一类。
+
+| # | 状态 | 事项 | 为什么要紧 |
+|---|---|---|---|
+| U-A | **未验证** | **续期端点形状与轮换语义** | 参考实现记录「刷新会轮换 refresh_token」；三入口并发会标死账号（codearts 同型）。⚠️ 测它必须用**我们自己的**账号，不能拿用户的 IDE 会话试。⇒ 探针 `test:e2e:accio-refresh` **已就绪但尚未运行**，实现侧已按最坏假设做防御（见 §2） |
+| U-A′ | **未验证** | ⚠️⚠️ **`refresh_token` 是「会话级」还是「账号级」？** | **探针结构上无法回答这个**：它只能证明「凭据由本插件现场 PKCE 登录写入」，**不能**排除「用户用**同一账号**也登录了 IDE」。若服务端是**账号级**轮换，则轮换会作废**同账号** IDE 的登录 —— 即使用的是我们自己的凭据。⇒ **跑续期探针前请先确认该账号没在 IDE 上登录**，或接受这个风险。这是 E2E 探针 `test:e2e:accio-refresh` 的**已知残余风险**（Task 9 复审指出） |
+| U-B | ~~已定~~ | ~~`rateLimit` 是否该登记~~ ⇒ **已定：登记 `false`** | 依据不是「会不会限流」（未实测），而是「两个按钮对本家**恒为惰性**」：适配器不写 `modelRateLimits`、`probeById` 里没有它 ⇒ 零请求、零清除。理由与判据见 §9.1 ②。⚠️ 将来接上请求级换号 + 冷却时**这一行要一起改回 `true`** |
+| U-C | **未验证** | 是否纳入**临期折算**（`ProviderRuntime.expiry`） | 当前**未纳入**：Accio 的余额按**三类语义桶**下发（daily / monthly / referral），而折算层要的是**逐包到期时刻**。纳入须同时进 `WIRED_EXPIRY_PROVIDERS` 与 `aggregate-adapter.ts` 的参与清单 |
+| U-D | **未验证** | 图片真实上限 | `multimodal: true` 的模型是否真收图。⇒ 当前**未接**图片通路（`inputModalities` 省略 = 未知，适配器**显式报错**而不是静默丢图），故这一条同时决定「将来能不能接 `readImage`」 |
+| U-E | **未验证** | 国际版账号能否用中国版登录页（反之） | 跨区域登录是否被拒。⚠️ 区域选择入口**已接上**（见 §9.1 ③），故现在**可以触发**这一条：选国际版登录域去登一个中国版账号（或反之）会得到什么。⇒ 探针 `test:e2e:accio` 未覆盖跨区域组合，仍待人工验证 |
+| **U-F** | ⚠️ **已验证，但证据未留存** | **`tools` 的扁平形态被上游接受**（§4.1.2） | Task 6 的 `probe-tool-shards.mjs` / `probe-tool-merge.mjs` **真机跑过**并拿到真实 `function_call` 帧（`task-6-report.md` §4.2 逐字记录 frame#8/#9/#10），两支探针下发的**都是扁平 `parametersJson` 形态** ⇒ 「扁平可用」是**跑出来的结论**。⚠️ 但探针在 `.tmp-accio/`（gitignore）、**没有日志入库**，且 `tests/unit/accio-adapter.spec.ts` 那条只写「实测该形状可用」而**未注明来源** ⇒ 属**证据未留存**：结论照用，但**没有可复核的产物**。要做成回归防线须**重跑并留存**（例如把探针搬进 `tests/e2e/` 的闸门探针并落日志） |
+| **U-G** | ⚠️ **已验证，但证据未留存** | **工具调用分片到达、后续帧重复完整参数**（§4.4） | 同上两支探针的结论（「有 args 的帧数=2，不同取值个数=1」）。已由适配器 `accioToolCallMergeTransform` 合并，且 `tests/unit/accio-adapter.spec.ts` 的 6 条用例锁住行为 —— 但**行为用例的输入是我们自造的帧**，上游真形状的**原始证据未留存**。⇒ 与 U-F 同批重跑即可一并补齐 |

@@ -76,6 +76,7 @@ const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   ['minimax', 'minimaxAuth'],
   ['zcode', 'zcodeAuth'],
   ['gemini', 'geminiAuth'],
+  ['accio', 'accioAuth'],
 ]
 
 /**
@@ -218,7 +219,7 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     expect(intlSpy, '中国版账号串到了国际版 qoderAuth').not.toHaveBeenCalled()
   })
 
-  it('注册表覆盖 13 个可续期 provider，且**不含** opencode / aggregate / auto', () => {
+  it('注册表覆盖 14 个可续期 provider，且**不含** opencode / aggregate / auto', () => {
     applyOnce()
     const ids = registeredRuntimeIds().sort()
     expect(ids).toEqual(AUTH_SERVICE_OF.map(([id]) => id).sort())
@@ -346,7 +347,7 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    前者可能因为清单漏写而通过，后者才把「漏写」变成红的。
     // ⚠️ 判据本体由 `expectedProviderIdsWithAuth()` 单一持有（Task 11-F）。
     const shouldRegister = expectedProviderIdsWithAuth().sort()
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(13)
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(14)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
@@ -398,6 +399,10 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     // ↓ 实测不写标记的两个（登记它们是为了让「每个 *-adapter.ts 都要登记」成立）。
     ['aggregate-adapter.ts', []],
     ['auto-adapter.ts', []],
+    // accio（Accio 阿里）**不写** `modelRateLimits`：本任务（Task 6）只实现
+    // 目录 / 解析 / 流式，请求级换号与冷却不在范围内。留空是**被验证的声明**
+    // （见下面「登记为不写标记的文件确实没有写点」那条用例）。
+    ['accio-adapter.ts', []],
   ]
 
   /**

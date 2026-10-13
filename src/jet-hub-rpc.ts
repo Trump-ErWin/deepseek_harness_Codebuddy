@@ -56,6 +56,9 @@ import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
+import type { AccioAuth } from './accio-auth.js'
+import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
+import { ACCIO } from './accio-product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -988,7 +991,7 @@ function providerIdsOf(
  */
 /**
  * 各 provider auth 实例的**共同部分**（结构化类型），使 `authOf` 不必依赖
- * 13 个具体类。
+ * 各家具体类（逐个 import 会把它们全拖进依赖图）。
  *
  * ⚠️ **名字里的 `JetHub` 比实际语义窄（2026-10-08 独立复审 M-5 实测）**：
  * 本接口有两个**不同层次**的使用方，第二个并不在 JetHub RPC 里 ——
@@ -999,7 +1002,7 @@ function providerIdsOf(
  * | `refreshAll` | **`index.ts` 的 runtime 注册循环**（填 `ProviderRuntime.auth.refreshAll`，即 `wiredRefreshTargets()` 的派生依据）。实测本文件里**只有声明、零调用** |
  *
  * ⇒ 读到这里别以为 `refreshAll` 有 JetHub 调用方；它的价值是「让注册循环能用
- * 一个统一的形状遍历 13 家」。**没有改名**是刻意的：改名要动 `index.ts` 的
+ * 一个统一的形状遍历各家的实例」。**没有改名**是刻意的：改名要动 `index.ts` 的
  * import 与类型标注，而收益只是名字更准；**语义澄清写在这里即可**。
  */
 export interface JetHubAuthLike {
@@ -1009,7 +1012,7 @@ export interface JetHubAuthLike {
    *
    * ⚠️ 2026-10-08（Task 10）：`index.ts` 的注册循环用它填
    * `ProviderRuntime.auth.refreshAll`，而后者是 `wiredRefreshTargets()` 的派生依据。
-   * 实测 13 家签名**完全一致**（`(pool) => Promise<void>`）⇒ 无需逐家适配。
+   * 实测各家签名**完全一致**（`(pool) => Promise<void>`）⇒ 无需逐家适配。
    */
   refreshAll(pool: AccountPool): Promise<void>
 }
@@ -1026,9 +1029,14 @@ export interface JetHubAuthLike {
  *
  * ⇒ 调用点写 `qodercn: qoderCn`（**键是 id、值是变量**），这是刻意的。
  *
- * ⚠️ **13 个字段都必须保留具体类型**（不要都改成 `JetHubAuthLike`）——
- * 那会丢掉「13 个键必须都在」的类型检查，而「漏接一个 provider 就编译不过」
+ * ⚠️ **每个字段都必须保留具体类型**（不要都改成 `JetHubAuthLike`）——
+ * 那会丢掉「全部键必须都在」的类型检查，而「漏接一个 provider 就编译不过」
  * 正是本次改名的核心价值。
+ *
+ * ⚠️ **刻意不写「N 个字段」**：条数随 provider 增删必然腐坏（本仓库已多次
+ * 记录「注释里的数字先烂」），且「数字对不上」会让人怀疑整段约定。
+ * 权威条数以本接口的字段为准，一致性由
+ * `tests/unit/zcode-wiring.spec.ts` 的「接口键 === 调用点键」锁死。
  */
 export interface JetHubAuths {
   readonly codearts: CodeArtsAuth
@@ -1045,6 +1053,7 @@ export interface JetHubAuths {
   readonly minimax: MinimaxAuth
   readonly zcode: ZcodeAuth
   readonly gemini: GeminiAuth
+  readonly accio: AccioAuth
 }
 
 /**
@@ -1062,7 +1071,7 @@ export function authOf(auths: JetHubAuths, provider: string): JetHubAuthLike | u
 }
 
 /**
- * ⚠️ 2026-10-08 改：13 个 provider 形参从**位置传参**改为**命名对象**（`auths`）。
+ * ⚠️ 2026-10-08 改：各 provider 形参从**位置传参**改为**命名对象**（`auths`）。
  *
  * 原注释记录「历史上已因少传/插队错位复发 **6 次**」—— 位置参数天生有这个缺陷
  *（改签名顺序、插一个新 provider 都会静默错位，而症状是「某个 provider 在用
@@ -1100,7 +1109,7 @@ export function authOf(auths: JetHubAuths, provider: string): JetHubAuthLike | u
 export function registerJetHubRpc(
   ctx: Context,
   pool: AccountPool,
-  /** ⚠️ 命名对象，不是 13 个位置参数。键是 provider id（见 `JetHubAuths`）。 */
+  /** ⚠️ 命名对象，不是位置参数。键是 provider id（见 `JetHubAuths`）。 */
   auths: JetHubAuths,
   /**
    * provider → 适配器实例（可选）。
@@ -1597,7 +1606,7 @@ function registerJetHubEndpoints(
   const {
     codearts, buddy, workbuddy, lobsterai, qoder,
     qodercn: qoderCn,
-    trae, cline, loomy, raccoon, minimax, zcode, gemini,
+    trae, cline, loomy, raccoon, minimax, zcode, gemini, accio,
   } = auths
   /**
    * 积分能力表。
@@ -1704,11 +1713,19 @@ function registerJetHubEndpoints(
    *
    * - loomy / zcode：没有 refresh 端点，其 `refreshAccountCredential` 做的是
    *   **有效性探测**，拿来当续期用只会白发请求；
-   * - opencode：匿名通道，无凭据可续。
+   * - opencode：匿名通道，无凭据可续（且它**不在** `JetHubAuths` 里）。
    *
-   * ⚠️ 本集合的**成员关系**必须与 `JetHubAuths` 的键一致（去掉 loomy / zcode）——
+   * ⚠️ 本集合的**成员关系**必须与 `JetHubAuths` 的键一致，**只去掉 loomy / zcode**
+   * 这两家「设计上没有 refresh 端点」的（opencode 根本不在 `JetHubAuths` 里）——
    * 合并 2026-10-08 的 provider 抽象重构后用 {@link authOf} 查表，
    * 故这里只是**能力判据**（该不该尝试自愈），不是分派表本身。
+   *
+   * ⚠️⚠️ **这个「只去掉两家」的方向此前没有守卫**（2026-10-12 复审实测）：
+   * `credits-balance-self-heal.spec.ts` 原先只锁「本集合 ⊆ `JetHubAuths` 的键」
+   * （挡住假 id），**反向没有** —— 于是新 provider 进了 `JetHubAuths` 却忘了
+   * 登记到这里时**全绿**，而它的过期账号**永不自愈**（issue IKKHL5 的形态：
+   * 积分行报「未登录」而上游其实只需一次 refresh）。现该文件已补上反向用例
+   * （逐键点名 + 显式豁免表），新增 provider 漏登记会**点名变红**。
    */
   const SELF_HEAL_REFRESHABLE_PROVIDERS: ReadonlySet<string> = new Set([
     'codearts',
@@ -1722,6 +1739,10 @@ function registerJetHubEndpoints(
     RACCOON.id,
     MINIMAX.id,
     GEMINI.id,
+    // ⚠️ accio **有** refresh 端点（`accio-auth.ts` 的 `refreshCredential`）且
+    // 池内 `expiresAt` 确实会被写 ⇒ 不属 loomy / zcode 那类豁免。
+    // 漏登记的后果是「凭据明明能续，面板却报未登录」（2026-10-12 复审发现）。
+    ACCIO.id,
   ])
 
   /**
@@ -1957,7 +1978,7 @@ function registerJetHubEndpoints(
    * 把它计为「跳过」。客户端的能力表（`credits-capabilities.js`）仍是唯一权威。
    *
    * ⚠️ 「有账号的渠道」由账号池派生（`pool.listAllAccounts()` 只是同步内存副本
-   * 的异步外壳），不遍历 12 个渠道里没账号的那些 —— 那些调下去只会拿到空结果。
+   * 的异步外壳），不遍历**没有账号**的那些渠道 —— 那些调下去只会拿到空结果。
    */
   const autoCheckin = createAutoCheckin({
     store: createAutoCheckinStore(ctx),
@@ -2790,6 +2811,59 @@ function registerJetHubEndpoints(
           })
 
           return { ok: true, value: { accountId: id, loginUrl: geminiStarted.loginUrl } }
+        } else if (provider === ACCIO.id) {
+          /**
+           * Accio（阿里）走**浏览器回调式 OAuth 2.0 + PKCE**（本地
+           * `createServer` 监听 `127.0.0.1` 的 `/api/oauth/callback`）。
+           *
+           * ⚠️ 与 codearts / lobsterai / gemini 同型：**必须先返回 URL 再等结果**
+           * —— `window.open` 只在用户手势窗口内有效，等授权完成才返回 URL 会让
+           * 弹窗被拦截（AGENTS.md 记过 CodeArts 的同类缺陷）。
+           *
+           * ## ⚠️⚠️ 本分支**刻意不调 `pool.addAccount`**（与其余十家**相反**）
+           *
+           * 既有模式是「RPC 登记占位条目、`auth.startLogin` 不碰池」（本文件
+           * 十余处；gemini 的 `startLogin()` 甚至不接收 `pool`）。而
+           * `AccioAuth.startLogin` **自己**登记占位条目（见
+           * `accio-auth.ts` 的 `startLoginFlow`：它要保证「返回 loginUrl 时占位
+           * 条目已就位」，否则前端 `login.poll` 会先看到一个不存在的账号）。
+           *
+           * ⇒ 这里再 `addAccount` 就是**同 id 的两次写入**：会被
+           * `writeAccounts` 的 dedup 兜住并打一条 warn —— 功能上无害，但那条
+           * 日志会**误导排查**（看起来像「RPC 与 auth 都登记了，谁才是对的」）。
+           * 故本分支必须把 `pool` / `accountId` **透传给 `startLogin`**，
+           * 由它登记；失败时也由它 `removePlaceholder` 清掉。
+           *
+           * ⚠️ `region` 必须过白名单（`normalizeAccioRegion`）：它来自**客户端
+           * 自报**的 RPC 载荷（无 schema 校验），且决定登录域名与凭据里的
+           * `region` —— 未登记值回落 `'cn'` 并留痕（与 zcode 的
+           * `normalizeZcodeLoginProvider` 同因，issue IKJLK3 E2）。
+           */
+          let accioStarted: StartedAccioLogin
+          try {
+            accioStarted = await accio.startLogin({
+              refName,
+              region: normalizeAccioRegion(req.accioRegion),
+              pool,
+              accountId: id,
+            })
+          } catch (error) {
+            // ⚠️ 占位条目由 `startLogin` 自己清理（`fail()` 里的
+            //    `removePlaceholder`），这里**不得**再 removeAccount ——
+            //    那是同 id 的第二次写入，且会与它自己的清理竞争。
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 Accio 登录（本地回调服务启动失败）：${reason}`)
+          }
+
+          // ⚠️ **不接收 result 的解析值**：`AccioAuth` 的 `result` 是
+          // `Promise<void>` —— 凭据落盘、账号池回填、昵称与有效期全部在
+          // `finishLogin` 里做完（与其余家「RPC 回填」的分工相反）。
+          // 这里只挂日志与失败清理。
+          accioStarted.result.catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${ACCIO.id} login failed for ${id}: ${String(error)}`)
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: accioStarted.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }

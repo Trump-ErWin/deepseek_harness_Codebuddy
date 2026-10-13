@@ -141,7 +141,7 @@ describe('续期调度器：启动必须先跑一轮', () => {
 
     const expected = expectedProviderIdsWithAuth().sort()
     // ⚠️ 先钉住判据集合本身，免得「期望集被某个改动悄悄改小」时本用例跟着一起绿。
-    expect(expected, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(13)
+    expect(expected, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(14)
     // ⚠️ 反方向：期望集里的每一个都必须**确实**在 registry 里有声明（防手抄漂移）。
     for (const id of expected) {
       expect(PROVIDER_REGISTRY.some((d) => d.id === id), `registry 缺少声明：${id}`).toBe(true)

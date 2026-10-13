@@ -64,7 +64,7 @@ describe('registerJetHubRpc：auths 是命名对象（类型层守卫）', () =>
     // ⇒ 那个指令在新旧两种签名下**都被消耗**，恒绿、零证明力。
     //
     // 反之，本行是**正向**调用：
-    // - 命名对象签名 ⇒ 13 个键齐全、类型正确 ⇒ 编译通过；
+    // - 命名对象签名 ⇒ 全部键齐全、类型正确 ⇒ 编译通过；
     // - 位置参数签名 ⇒ `{ … }` 不能赋给 `CodeArtsAuth` ⇒ **编译失败**。
     // ⇒ 判据是 `pnpm typecheck:tests` 的 exit code，不是 vitest。
     //    已做反向验证：把签名改回 13 个位置参数 ⇒ 该命令变红（见 Task 9 报告）。
@@ -85,16 +85,17 @@ describe('registerJetHubRpc：auths 是命名对象（类型层守卫）', () =>
       minimax: stub,
       zcode: stub,
       gemini: stub,
+      accio: stub,
     })
     // 运行时只要求端点真的注册了（证明桩搭对了，上面那行的类型检查才有意义）。
     expect(registered.length).toBeGreaterThan(0)
   })
 
-  it('缺少某个 provider 键在类型层面被拒绝（13 个键必须都在）', () => {
-    // @ts-expect-error —— 只给 codearts，缺其余 12 个键，必须报错。
+  it('缺少某个 provider 键在类型层面被拒绝（全部键必须都在）', () => {
+    // @ts-expect-error —— 只给 codearts，缺其余全部键，必须报错。
     //
     // ⚠️ 本指令**不能**区分新旧签名（见上一条的注释），它守的是另一条不变式：
-    //    `JetHubAuths` 的 13 个键**一个都不能少** —— 那正是本 Task 的价值
+    //    `JetHubAuths` 的**全部键一个都不能少** —— 那正是本 Task 的价值
     //    （漏接一个 provider 就编译不过，而不是运行时报 `Unknown provider`）。
     //    故**不要**把 `JetHubAuths` 的字段都放宽成 `JetHubAuthLike`，
     //    那会让「漏一个键」重新变成静默失效。

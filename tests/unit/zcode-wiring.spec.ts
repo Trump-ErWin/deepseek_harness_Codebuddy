@@ -407,10 +407,10 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     expect(ids).toContain('raccoon')
     // ⚠️ 计数会随 provider 增删变化（2026-09-30 加 minimax：11 → 12；
     // 2026-10-01 加 opencode：12 → 13；2026-10-03 加 gemini：13 → 14；
-    // 2026-10-07 加 aggregate：14 → 15）。
+    // 2026-10-07 加 aggregate：14 → 15；2026-10-13 加 accio：15 → 16）。
     // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
     // 上面的具体 id；若将来再加 provider，记得同步这里。
-    expect(ids).toHaveLength(15)
+    expect(ids).toHaveLength(16)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -639,9 +639,9 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
   it('★ 客户端每个 provider 都在 JetHubAuths 里有同名键（除两个被验证的豁免）', () => {
     const keys = jetHubAuthKeys()
     const clientIds = clientProviderIds()
-    expect(clientIds.length).toBe(15)
-    // ⚠️ 13 个 auth 键（15 个客户端 id − opencode − aggregate）。
-    expect(keys).toHaveLength(13)
+    expect(clientIds.length).toBe(16)
+    // ⚠️ 14 个 auth 键（16 个客户端 id − opencode − aggregate）。
+    expect(keys).toHaveLength(14)
     const withoutKey = clientIds.filter((id) => !keys.includes(id))
     expect([...withoutKey].sort()).toEqual(['aggregate', 'opencode'])
   })

@@ -6,13 +6,18 @@ deepseek-harness 插件：统一管理多个 AI 编程服务的账号，并把�
 的模型选择器。支持**多账号池**（同一服务登录多个账号，按可用性自动选号）与
 **凭据静默续期**（到期前自动刷新，无需再次打开浏览器）。
 
-- **14 个 provider 路由**，外加 1 个**聚合**路由（见下）
+- **15 个 provider 路由**，外加 1 个**聚合**路由（见下）
 - 登录、状态、续期、积分领取**全部在 Jet Hub 设置页完成**，不注册任何斜杠命令
 - 附带一个**本机 OpenAI 兼容网关**，供其它客户端复用已登录账号
 
 > 📌 **本 README 只写「怎么用」。** 各 provider 的协议、端点、登录流程、请求头
 > 构造、实测数据与事故史等**实现细节**，统一记录在不入库的内部文档
 > `docs/implementation-notes.md` 中。需要改动实现或排查协议问题时读它。
+>
+> ⚠️ **accio 的章节该文件里还没有**（`implementation-notes.md` 目前零处 accio）——
+> 读它时**不要**以为 accio 没有实现笔记。accio 的实测结论与坑点当前登记在
+> `docs/agent-notes/providers-accio.md`（含三条与参考实现相反的结论、两个真缺陷、
+> 区域选择与接线陷阱），补写 `implementation-notes.md` 的 accio 章节是**独立任务**。
 
 ---
 
@@ -129,7 +134,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 
 ## 支持的渠道
 
-14 个 provider 路由，互不覆盖，可同时使用。
+15 个 provider 路由，互不覆盖，可同时使用。
 
 | id | 渠道 | 登录方式 | 积分能力 |
 |---|---|---|---|
@@ -147,11 +152,13 @@ dsh plugin --profile <name> install <path-to-this-repo>
 | `zcode` | ZCode（智谱 z.ai） | OAuth 设备码 | 余额 + 每日领取 |
 | `opencode` | OpenCode | — | 余额 |
 | `gemini` | Gemini Code Assist | 浏览器回调 | 余额 |
+| `accio` | Accio（阿里） | 浏览器回调 | 余额（三类桶；**无签到**） |
 
 各渠道的能力与限制要点：
 
 - **图片输入**：`buddy` / `workbuddy` / `trae`（逐模型）/ `minimax`（部分模型）支持；
-  `lobsterai`、`zcode` **不支持**；其余以模型声明为准。
+  `lobsterai`、`zcode` **不支持**；`accio` **未实测**（面板会明确报错而不是静默丢图）；
+  其余以模型声明为准。
 - **思考档位**：多数渠道支持，档位名按各渠道自己的定义下发；未声明的渠道不发送该字段。
 - **`loomy`** 是唯一用**短信验证码**登录、且**不能自动续期**的渠道。
 - **`zcode`** 的领取路径需要一次性验证参数，由本机浏览器环境产出（web 版需要
@@ -164,6 +171,21 @@ dsh plugin --profile <name> install <path-to-this-repo>
   （判据是三态：缺席 = 不知道 = 保持先探，见 `requiresCaptchaUpfront`）。
 - **`qoder` / `qodercn`** 共用同一套实现，差异仅在产品配置。
 - **`minimax`** 是唯一的 Anthropic Messages 协议族渠道。
+- **`accio`** 登录走浏览器回调。⚠️ **新建账号时必须先选登录区域**（中国版
+  `www.accio-ai.com` / 国际版 `zh.accio.com`）：两个区域的**登录页域名不同**，
+  而区域由服务端按账号下发、**登录前无法自动判断** ⇒ 选错会打开打不开的登录页，
+  **登录不会成功**。区域会写进凭据，续期与推理按它选域名。
+  ⚠️ **它没有签到按钮** —— 每日积分由服务端在**登录时**发放（24 小时有效、
+  **不累积**，未登录的那天不补），没有可调用的领取接口。面板上的积分按服务端下发的
+  **三类桶**（每日 / 每月 / 推荐）分列显示，并给出每日额度的重置倒计时。
+  ⚠️ **「刷新每日额度」入口尚未实现**：它本质是**重新登录既有账号**，
+  需要宿主侧新增一条 RPC（现有的「+ 新建账号」每次都会新造账号，拿它重登只会
+  多出一个空账号而原账号额度不变）。**当前要刷新请删除该账号后重新登录一次。**
+  ⚠️ 模型**倍率跨度极大**（0.013 ~ 2.8，**215 倍**），故倍率直接写进模型展示名
+  （`模型名 · x倍率`），选型时看名字即可。
+  ⚠️ **图片输入未实测**，面板会明确报「暂不支持图片输入」而不是静默丢掉。
+  ⚠️ **该渠道不产生限流标记**（也不会被限流探针测出东西），故「重测 / 重置」这组
+  按钮对它**整组不渲染** —— 渲染出来只会是点不动的死控件。
 
 ### 一键领取积分
 
@@ -578,7 +600,8 @@ E2E 探针**按 provider 分列**（如 `pnpm test:e2e:codearts`、`pnpm test:e2
 `pnpm test:e2e:loomy`），**均有闸门、默认全部跳过** —— 需要显式设置对应环境变量
 （部分还需 `..._CONFIRM=yes`）才会真正发出请求。详见 `tests/e2e/README.md`。
 
-⚠️ 带 `-claim` / `-chat` 后缀的探针会**真实消耗额度或领取机会**，运行前请确认。
+⚠️ 带 `-claim` / `-chat` / `-tools` 后缀的探针会**真实消耗额度或领取机会**；
+带 `-refresh` 后缀的会**真实轮换一次凭据**（如 `accio-refresh`）。运行前请确认。
 
 ### 项目结构
 
@@ -590,5 +613,5 @@ E2E 探针**按 provider 分列**（如 `pnpm test:e2e:codearts`、`pnpm test:e2
 | `tests/unit/` | 单元测试 |
 | `tests/e2e/` | 端到端测试（默认跳过） |
 | `docs/agent-notes/` | 逐 provider 的事故史与约定（开发向） |
-| `docs/implementation-notes.md` | **全部实现细节与协议笔记（不入库）** |
+| `docs/implementation-notes.md` | **全部实现细节与协议笔记（不入库）**。⚠️ **目前没有 accio 章节** —— accio 的实测笔记在 `docs/agent-notes/providers-accio.md`，补写该章节是独立任务 |
 | `cordis.patch.yml` | DSH bundle 补丁 |
