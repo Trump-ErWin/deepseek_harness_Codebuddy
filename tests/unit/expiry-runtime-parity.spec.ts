@@ -44,7 +44,11 @@ import { descriptorOf } from '../../src/provider-registry.js'
 // ⚠️ 2026-10-13 合并审计加入 accio：用户要求「聚合的 qwen3.8-flash 轮换列表里要有
 //    accio」，而**决定候选表可见性的是这张表**（不是 AGGREGATE_CHANNELS）⇒
 //    只把它加进 AGGREGATE_CHANNELS 是无效接线（模型层归并了，候选层被剔除）。
-const EXPECTED_WIRED = ['accio', 'buddy', 'codearts', 'lobsterai', 'loomy', 'trae', 'workbuddy', 'zcode']
+// ⚠️ 2026-10-13 加入 officeace：用户要求「officeace 加入聚合轮换」。它与 buddy 系
+//    **同形**（订阅的每个积分桶都带 `expiresAt`），折算原语见 `officeaceExpiry`。
+const EXPECTED_WIRED = [
+  'accio', 'buddy', 'codearts', 'lobsterai', 'loomy', 'officeace', 'trae', 'workbuddy', 'zcode',
+]
 
 class FakeCredentials {
   async resolve(): Promise<undefined> { return undefined }

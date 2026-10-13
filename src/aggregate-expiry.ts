@@ -55,6 +55,8 @@ import type { TraeCredential } from './trae.js'
 import { fetchTraeCreditBalance } from './trae-credits.js'
 import type { AccioCredential } from './accio.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
+import type { OfficeAceCredential } from './officeace-auth.js'
+import { fetchSubscriptionSummary } from './officeace-auth.js'
 import { runtimeOf, type ProviderExpiryContext } from './provider-runtime.js'
 
 /**
@@ -169,6 +171,11 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   //    是这张表、不是 `AGGREGATE_CHANNELS`** —— 漏加它 ⇒ 归一化补丁再对也没用
   //    （模型层归并了，候选层却被这道闸门剔掉），症状**静默**。
   'accio',
+  // ⚠️ officeace（2026-10-13 用户要求「加入聚合轮换」）：与 buddy 系**同形**
+  //    （订阅的每个积分桶都带 `expiresAt`），折算原语见 `officeaceExpiry`。
+  //    ⚠️ 与 accio 同款陷阱：**决定候选表可见性的是这张表、不是
+  //    `AGGREGATE_CHANNELS`** —— 只加后者 ⇒ 归一化再对也没用，症状静默。
+  'officeace',
 ])
 
 /**
@@ -331,7 +338,11 @@ export function createExpiryProbe(
     //   而 `credential` 里没有账号 id（`device_mid` 是我们每次随机生成的，不可用）。
     //   ⚠️ 旧回退路径（`legacySingleCredential`）拿不到 id，故那里显式填 `undefined`
     //   —— 后果只是「那条路径下 zcode 写不了标记」，不影响折算值。
-    let credentials: Array<{ entry: { id?: string }; credential: unknown }>
+    //
+    // ★ 2026-10-13：**同时保留 `credentialRef`** —— officeace 的余额入口只有拿到
+    //   它才走云侧直读（否则回落果办客户端的全局单 cookie ⇒ 多账号串号，
+    //   而聚合候选排序是**每账号**粒度 ⇒ 会选错人）。同样只在回退路径缺失。
+    let credentials: Array<{ entry: { id?: string; credentialRef?: string }; credential: unknown }>
     /**
      * 该渠道目录的第一个模型 id（空串 = 目录读不到）。
      *
@@ -501,6 +512,11 @@ export function createExpiryProbe(
          */
         value = await credentialExpiry(provider, credential, {
           ...item.entry.id === undefined ? {} : { accountId: item.entry.id },
+          // ⚠️ officeace 的余额查询**必须**拿到 ref 才走云侧直读（见该字段注释）；
+          //    其余家忽略它。
+          ...item.entry.credentialRef === undefined || item.entry.credentialRef.length === 0
+            ? {}
+            : { credentialRef: item.entry.credentialRef },
           catalogIds,
           ...markModelsExhausted === undefined ? {} : { markModelsExhausted },
           ...clearModelsExhausted === undefined ? {} : { clearModelsExhausted },
@@ -812,6 +828,69 @@ export async function accioExpiry(credential: AccioCredential): Promise<number> 
   //    但按名字判更耐重构（少一个桶时不会错位）。
   const hasDaily = usable.some((pkg) => pkg.name === '每日积分')
   return hasDaily ? nextUtc8DayStartMs() : NEVER
+}
+
+/**
+ * officeace：与 **buddy 系同形**（订阅的每个积分桶都带 `expiresAt` ⇒ 归一化到
+ * `deductionEndTime`），故折算口径与 `sharedPackageExpiry` **逐格一致**。
+ *
+ * ## 为什么单独一条原语（而不是直接复用 `sharedPackageExpiry`）
+ *
+ * 那个共享实现吃的是 `fetchBalance: () => Promise<CreditBalance | null>`，而
+ * officeace 的余额入口是 {@link fetchSubscriptionSummary}：签名是
+ * `(staleHours, ref, credential, credentials)`，且返回的是
+ * `OfficeAceSubscriptionSummary`（不是 `CreditBalance`）—— 形状套不进那个泛型。
+ * 这与 `qoder` / `opencode` 被排除在共享骨架外的理由同源（「形态不匹配就如实
+ * 排除，不为凑齐 N 家而丢语义」）。
+ *
+ * ⚠️ **但判据必须与 `sharedPackageExpiry` 逐格同构**（本仓库红线）：
+ *
+ * | 情形 | 折算值 | 依据 |
+ * |---|---|---|
+ * | 有 `remaining > 0` 的有效桶，且**至少一个**给了到期时间 | 那些到期时间的**最小值** | 与 buddy 系同口径 |
+ * | 有 `remaining > 0` 的有效桶，但**都没给**到期时间 | `NEVER`（长期，排最后但不剔除） | 服务端没下发 ⇒ 不臆造 |
+ * | 一个 `remaining > 0` 的有效桶都没有 | `UNUSABLE`（剔除） | 没有可烧的额度 |
+ * | 查询失败 / 未登录 / 只拿到缓存 | `UNUSABLE` | 读不到就不猜 |
+ *
+ * ## ⚠️ 为什么要带 `ref`（2026-10-13）
+ *
+ * `fetchSubscriptionSummary` 传了 `ref` 才走**云侧 V11 直读**；不传会回落到
+ * 果办客户端的**全局单一 cookie**（只反映「当前登录在果办里的那一个账号」）
+ * ⇒ 多账号下所有账号都折算成同一个余额（实测两个账号都显示 6500）。
+ * 聚合的候选排序是**每账号**粒度，串号会让选号直接选错人。
+ *
+ * ⚠️ 未传 `ref` 时（老调用点）仍可工作，但只对单账号正确 —— 见
+ * `ProviderExpiryContext` 是否携带 ref。
+ */
+export async function officeaceExpiry(
+  credential: OfficeAceCredential,
+  ref?: string,
+): Promise<number> {
+  let summary
+  try {
+    summary = await fetchSubscriptionSummary(48, ref, credential)
+  } catch {
+    return UNUSABLE
+  }
+  if (summary === undefined) return UNUSABLE
+  let earliest = NEVER
+  // ⚠️ 与 `sharedPackageExpiry` 同因：`earliest` 的初值 `NEVER` 无法区分
+  //    「一个有效包都没有」（⇒ 剔除）与「有余额但不下发到期时间」（⇒ 长期）。
+  let hasAnyCredit = false
+  for (const group of summary.creditGroups) {
+    // ⚠️ 判据与共享实现同口径（`active` 且 `remaining > 0`）。
+    //    officeace 的 `expired` 是独立布尔（不是 `active`），故这里取反。
+    if (group.expired === true) continue
+    if (!(typeof group.remaining === 'number' && group.remaining > 0)) continue
+    hasAnyCredit = true
+    // ⚠️ `expiresAt` 是 ISO 8601 字符串（与 STS 的 `expiration` 同形），
+    //    不是数值时间戳 —— 别顺手加 `> 1e12` 归一化（那是兄弟渠道的坑）。
+    const end = typeof group.expiresAt === 'string' ? Date.parse(group.expiresAt) : Number.NaN
+    if (Number.isFinite(end) && end > 0 && end < earliest) earliest = end
+  }
+  // 有余额但都没给到期时间 ⇒ 长期（排最后，不剔除）。
+  if (hasAnyCredit) return earliest
+  return UNUSABLE
 }
 
 /**
