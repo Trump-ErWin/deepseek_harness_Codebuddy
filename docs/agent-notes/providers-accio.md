@@ -319,15 +319,94 @@ parametersJson: JSON.stringify(fn.parameters ?? { type: 'object', properties: {}
   `accioToolCallMergeTransform`。E2E 探针 `test:e2e:accio-tools` 专门断言
   「同一个 id **恰好一个块**且参数**非空**」。
 
-### 4.4.1 ⚠️ 思考**关不掉**（四类字段逐格实测全部无效）
+### 4.4.1 ⚠️⚠️ 档位**真实生效**，但思考**关不掉**（2026-10-13 大修）
 
-`includeThoughts` / `thinkingBudget` / `thinkingLevel` / `reasoningEffort` 四类字段
-逐格实测：**思考字符数一个都没变**（`reasoningEffort=off` 甚至回 **505**）。
+> **本节原先的结论「四类字段全部无效 ⇒ 目录里不声明任何档位」已被推翻一半。**
+> 原文（保留作对照）：`includeThoughts` / `thinkingBudget` / `thinkingLevel` /
+> `reasoningEffort` 四类字段逐格实测「思考字符数一个都没变」。
 
-⇒ 会话命名只能走 `planSessionTitleThinking` 的**抬预算**兜底（issue IKKVDH）；
-⇒ 目录里**不声明**任何思考档位（未声明 ⇒ DSH 不发该字段）；
-⇒ 两个花钱的 E2E 探针的 `maxOutputTokens` 取 **256** 而非 64 —— 实测短回答的思考
-本身就要吃掉几十个 token，64 会让「有思考、没正文」的假失败混进来。
+#### 为什么旧结论不可靠（两个方法论错误）
+
+1. **用的值是非法档位**：旧探针试的是 `off` / `none` / `minimal`，而远端下发的
+   合法档位只有 `low` / `medium` / `high` / `xhigh` / `max`。**用非法值测出
+   「无效」，不能推论合法值也无效**（`off` 回 505 正说明服务端**在校验**它）。
+2. **拿「思考字符数」当判据**：实测同一档位内的字符数波动 **186 ~ 490**
+   （信噪比太低），档位差异被噪声淹没 ⇒ 必然得到「看不出区别」。
+
+#### 重做后的实测结论（用户要求「用远端真实下发的档位」）
+
+用 **服务端权威计数** `thoughts_token_count`（`usage_metadata` 里），
+对档位最多的 `Ultimate`（5 档）每档跑 5 次：
+
+| 档位 | thoughts_token_count（5 次） | 中位 |
+|---|---|---|
+| `low` | 10, 33, 33, 34, 41 | **33** |
+| `medium` | 18, 37, 40, 42, 49 | **40** |
+| `high` | 22, 34, 41, 44, 44 | **41** |
+| `xhigh` | 38, 40, 43, 44, 47 | **43** |
+| `max` | 37, 41, 43, 48, 50 | **43** |
+
+⇒ **中位数单调递增**（33→40→41→43→43）⇒ 档位**真实生效**。
+⇒ 另外 `Standard`（2 档）的 `low`(中位 178) 与基线(284) 区间不重叠，交叉验证成立。
+
+⚠️ 但仍然**关不掉**思考：即使 `low` 也有 33 个思考 token（不是 0）。
+⇒ 「关不掉」这半边**依然成立**（会话命名仍走 `planSessionTitleThinking` 的抬预算兜底）。
+
+#### 远端字段的真实形状（38 条全量探测）
+
+| 形态 | 条数 | 处理 |
+|---|---|---|
+| `reasoningEfforts = null` | **31** | 见下 |
+| 数组(2 档) | 4 | 全列 |
+| 数组(3 档) | 2 | 全列 |
+| 数组(5 档) | 1 | 全列 |
+
+⚠️ **没有「只有一档的数组」** —— 但**有 6 条 `efforts=null` 却给了
+`defaultReasoningEffort`**（`GLM-5.3`/`GLM-5.2`/`GLM 5.3 Flash` = `max`、
+`DeepSeek V4.1 Flash`/`DeepSeek V4 Pro` = `high`、`MiniMax M3` = `adaptive`）。
+实测**把这些值发过去服务端接受**（`max` 与 `adaptive` 都返回正常正文）
+⇒ 它们就是**真实可用的单档**，正是用户要的「即使只有一档也要显示」。
+
+⇒ 落地在 `accio-adapter.ts` 的 `accioReasoningOf`（三格判据）+ `toCatalogEntry`；
+解析在 `accio-auth.ts` 的 `normalizeAccioModel`。9 个模型有档位、6 个如实留空。
+
+#### ⚠️ 但两条**不受本次推翻影响**的旧结论（仍然有效）
+
+1. **会话命名仍走 `planSessionTitleThinking` 的抬预算兜底**（issue IKKVDH）——
+   因为「关不掉思考」这半边成立（`low` 也有 33 个思考 token）。声明档位**不改变**
+   这一点：档位只调**多少**，不能调到 0。
+2. **两个花钱的 E2E 探针的 `maxOutputTokens` 取 256 而非 64** —— 实测短回答的
+   思考本身就要吃掉几十个 token，64 会让「有思考、没正文」的假失败混进来。
+
+### 4.4.2 ⚠️⚠️ `utdid` 必需：不带会被**风控拦截**（HTTP 200 + HTML）
+
+**本轮最意外的发现**，与档位探测同批测出。
+
+| `utdid` 形态 | 结果 |
+|---|---|
+| 真实值（`properties.utdid` **且** header `utdid`） | ✅ 正常 |
+| **自造随机值**（同上两处） | ✅ 正常（⇒ 生产兜底 `FALLBACK_UTDID` **安全**） |
+| **完全不带** | 🚫 风控 |
+| **只放 header、不放 `properties.utdid`** | 🚫 风控 |
+
+⇒ **必须在 `properties`（body）里**；只放 header 不算。
+
+**风控响应的形态**（⚠️ 极难发现）：
+
+- **HTTP `200`**（不是 4xx）；
+- `content-type: text/html;charset=UTF-8`；
+- body 是跳转脚本：`<a id="a-link" href="https://bixi-intl.alicdn.com/punish/…">`
+  + `window._config_ = {"action":"deny",…}` + `<!--rgv587_flag:sm-->`。
+
+⚠️ **不给 `content-type` 校验的后果是静默的**：该 HTML 会被喂给 SSE 解析器
+⇒ **零帧** ⇒ 最终报「模型未返回任何内容块」。用户看到「模型不回复」，
+真因却是**风控**，排查方向完全错 —— **本轮探测就被它误导过一轮**
+（「思考字符恒为 0」一度被读成「档位无效」）。
+⇒ 已在 `accio-adapter.ts` 的 `stream()` 里加 `content-type` 校验，归 `SERVER`
+（**不重试**：风控是身份/环境问题，原样重发只会再被拦）。
+
+⚠️ **目录端点（`/api/llm/config/v2`）不带 `utdid` 也正常** ⇒ 该约束
+**只在推理路径上**暴露，这正是它难被发现的原因。
 
 ### 4.5 为什么复用 `consumeGeminiSse` 而不是重写
 
@@ -456,11 +535,80 @@ source=ACCIO_WORK  type=PHOENIX_FIRST_GIFT  amount=500  reason=ACCIO_FIRST_GIFT 
 | `1Orbit-Q7hN3xR6cP2m` | 2.8 | 1,000,000 | ✅ | Ultimate |
 
 ⚠️ **倍率必须进展示名**（`名称 · x倍率`）：跨度 0.013~2.8（**215 倍**），是选型时最重要的信号，
-而 DSH 的模型信息没有承载它的字段。本仓库既有约定：**倍率写进 `name`，不是 `description`**；
-id 保持裸 `modelCode`。
+而 DSH 的模型信息没有承载它的字段。本仓库既有约定：**倍率写进 `name`，不是 `description`**。
 
-⚠️ **模型 id 非人类可读**（`1Drift-…`）⇒ 目录**必须动态拉取**，兜底表只作离线回退。
+⚠️ **上游 `modelCode` 非人类可读**（`1Drift-…`）⇒ 目录**必须动态拉取**，兜底表只作离线回退。
 排序按倍率升序（便宜在前），无倍率的排最后。
+
+### ⚠️⚠️ 对外 id 是「人话」slug，上行仍是 `modelCode`（2026-10-13，用户要求）
+
+**用户追问原文**（附模型自报截图）：「为什么现在还是回复中的模型不是标准模型 id」。
+
+#### 现象与根因
+
+DSH 会把 **`CatalogEntry.id` 注入给模型当身份** —— 而 accio 原先的 `id` 就是上游
+`modelCode`（`1Drift-N8kP2Q7wR5mX` 这类**故意不可读**的内部代号，真名只在
+`modelDisplayName` 里）⇒ **模型只能自报一串乱码**，且它自己也无从知道那是什么基座。
+
+⇒ 对外 id 改用**展示名归一后的 slug**（`qwen-3-8-flash`），由
+`accio-adapter.ts` 的 `accioModelIdOf` 产出。归一**复用** `normalizeNameKey`
+（`canonical-models.ts`）—— 与聚合的规范键**同一套规则**，两处各写一份必然漂移。
+
+#### ⚠️⚠️ 关键不变式：**id 用 slug，上行用 `modelCode`**
+
+| 流向 | 用什么 |
+|---|---|
+| `listModels` / `resolveModel` 的 `id`、注入给模型的身份 | **slug** |
+| `POST /api/adk/llm/generateContent` 的 body `model` | **上游 `modelCode`**（服务端只认它） |
+
+⇒ `stream()` 里必须经 `accioModelCodeOf` 反查（**未知 id 原样透传**，由上游报错）。
+⚠️ **漏掉这一步的后果极具误导性**：请求体带上 slug、服务端不认，症状是
+「**模型不回复**」而不是参数错误 —— 与本节其余几条坑同型。
+
+#### ⚠️ 连带失效：`CANONICAL_OVERRIDES` 的索引键**也必须**改成 slug
+
+补丁按 `realId` 查，而 `realId` 来自 `ctx.llm.listModels(provider)` 返回的 **`id`**
+⇒ id 改成 slug 后，补丁若仍按 `modelCode` 索引就**恒不命中**，accio 会掉回
+`qwen-3-8-flash` 孤例键 ⇒ **聚合轮换列表里又看不到它**（正是补丁要解决的症状），
+且**没有任何报错**。⇒ 两处必须**同时**改。
+
+### 聚合里的归并（与上面**同源**，但改的是键通道）
+
+**用户诉求原文**：「accio 的 qwen3.8-flash，聚合当中的 qwen3.8-flash 轮换列表里要有」。
+
+聚合按**规范键**把各家的同一个模型归成一个虚拟模型，而 accio 的 `1Drift-…` 对聚合
+**毫无信息**：
+
+| accio 在聚合里的通道 | Qwen 3.8 Flash 归到 | 与 loomy/trae/qoder 同键？ |
+|---|---|---|
+| `id`（默认） | `1drift-f8hs3mk7pl2n` | ❌ 各自成一个孤立虚拟模型 |
+| `name`（**必须**） | `qwen-3-8-flash` → 补丁 → `qwen3-8-flash` | ✅ 同一个 |
+
+⇒ 两处改动（都在 `src/canonical-models.ts`）：
+1. **`PRIMARY_CHANNEL` 加 `accio: 'name'`** —— 与 `qoder` **完全同因**
+   （它的 id 也是内部代号 `qfmodel`）；
+2. **`CANONICAL_OVERRIDES.accio` 加 `qwen-3-8-flash → qwen3-8-flash`**
+   （⚠️ 索引键是**对外 id（slug）**，见上一小节）—— 因为 accio 的展示名
+   `Qwen 3.8 Flash` 里**有空格**，`normalizeNameKey` 转成连字符后得
+   `qwen-3-8-flash`，而三家（loomy/trae/qoder）走 id 通道、id 是 `qwen3.8-flash`
+   （无空格）⇒ 得 `qwen3-8-flash`（**无连字符**）。同一模型、键却不同 ⇒ 必须显式补丁。
+
+⚠️ **只登记确知同模型的**（`Qwen 3.8 Flash`）：
+- `Qwen 3.8 Max` **不需补丁** —— accio 得 `qwen-3-8-max`、loomy 也得 `qwen-3-8-max`，
+  本来就一致；
+- `Qwen 3.8 27B` / `Qwen 3.5 A3B` / `Standard` / `Professional` / `Ultimate`
+  **不登记** —— 它们是独立模型，猜着并入 = **请求打到错的模型且无提示**。
+  ⚠️ 27B 与 A3B 是两个不同模型，绝不能并进 `qwen3-8-flash`。
+
+测试：
+- `tests/unit/accio-adapter.spec.ts` 的「对外 id = slug，上行仍用 modelCode」7 条
+  （含两条**行为级**：`listModels` 的 id 是 slug、请求体 `model` 是 `modelCode`）；
+- `tests/unit/canonical-models.spec.ts` 的 4 条（name 通道 / 跨渠道同键 /
+  Max 无需补丁 / 独有模型自成键）；
+- 端到端：真实目录 15 条，id 全为人话且 `slug → modelCode` **回查 0 失败**。
+
+**反向验证**（各自逐字节还原）：去掉上行映射 ⇒ 2 条红；id 退回 `modelCode` ⇒ 8 条红；
+补丁索引退回 `modelCode` ⇒ 1 条红。
 
 ## 8. 区域
 

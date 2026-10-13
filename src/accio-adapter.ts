@@ -45,7 +45,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -55,6 +55,8 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
 import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+// ⚠️ 对外 id 的归一规则**必须与聚合共用**（见 `accioModelIdOf` 的注释）。
+import { normalizeNameKey } from './canonical-models.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
@@ -134,6 +136,113 @@ export function displayNameOfAccioModel(model: { name: string; multiple?: number
   const multiple = model.multiple
   if (multiple === undefined || !Number.isFinite(multiple)) return model.name
   return `${model.name} · x${multiple}`
+}
+
+/**
+ * 把一个 accio 模型条目映射成 DSH 的**思考档位声明**；无可声明时返回 `undefined`。
+ *
+ * ## ⚠️ 核心判据：`efforts` 为空但 `defaultEffort` 有值时，也要**声明一档**
+ *
+ * 用户要求原文：「需要有档位**即使是只有一档也要显示**，使用远端真实下发的档位」。
+ *
+ * 远端实测（38 条）：只有 7 条给了 `reasoningEfforts` 数组；而 **5 条只给了
+ * `defaultReasoningEffort`、数组是 `null`**（GLM-5.3 `max` / GLM-5.2 `max` /
+ * GLM 5.3 Flash `max` / DeepSeek V4.1 Flash `high` / DeepSeek V4 Pro `high` /
+ * MiniMax M3 `adaptive`）。⚠️ 这几个的 default **实测发过去服务端接受**
+ * （`max` 与 `adaptive` 都 ✅ 返回正常正文）⇒ 它就是一个**真实可用的档位**。
+ *
+ * ⇒ 三格判据（**顺序不可换**）：
+ *
+ * | 形态 | 声明 |
+ * |---|---|
+ * | `efforts` 非空 | 全部档位；`defaultEffort` **落在集合内才带**（DSH 会校验，指到集合外会抛 `UNSUPPORTED_REASONING_EFFORT`） |
+ * | `efforts` 空、`defaultEffort` 有值 | **单档**（就声明那一个） |
+ * | 两者都无 | **不声明**（`undefined`）—— 编造档位 = 让用户选一个服务端不认的值 |
+ *
+ * ## 显示名
+ *
+ * ⚠️ **原样用上游的档位 id 当 `name`**，不做「low→低」这类翻译：
+ * - 这些 id 是**服务端认的字面量**（要原样回发），译成中文会让用户
+ *   在排查时对不上日志；
+ * - 本仓库既有先例：`cline` 的档位用 `CLINE_REASONING_EFFORTS` 的**固定英文名**
+ *   （`Low` / `Medium` / …）—— 名字属于**展示层契约**，而 accio 的 id 本身
+ *   已经是可读英文，无需再造一份映射表（造了就有「两处判据」腐坏风险）。
+ */
+export function accioReasoningOf(
+  model: Pick<AccioFallbackModel, 'efforts' | 'defaultEffort'>,
+): NonNullable<CatalogEntry['reasoning']> | undefined {
+  const declared = model.efforts ?? []
+  const fallback = model.defaultEffort
+  // ── 格 1：远端给了档位数组（可能同时给 default） ──
+  if (declared.length > 0) {
+    return {
+      efforts: declared.map((id) => ({ id: ReasoningEffortId(id), name: id })),
+      // ⚠️ `defaultEffort` **必须落在 `efforts` 内**才带：DSH 会校验，
+      //    指到集合外会让整条记录的档位声明被丢弃（`model-catalog.ts` 里那段
+      //    `legal` 检查）—— 那不是崩溃，但会让「默认档」静默消失。
+      ...fallback !== undefined && declared.includes(fallback)
+        ? { defaultEffort: ReasoningEffortId(fallback) }
+        : {},
+    }
+  }
+  // ── 格 2：只有 default（数组是 null）⇒ **单档**（用户要求的「只有一档也要显示」）──
+  if (fallback !== undefined) {
+    return {
+      efforts: [{ id: ReasoningEffortId(fallback), name: fallback }],
+      defaultEffort: ReasoningEffortId(fallback),
+    }
+  }
+  // ── 格 3：两者都无 ⇒ 不声明（不编造） ──
+  return undefined
+}
+
+/**
+ * 一个 accio 模型条目的**对外 id**（DSH 目录里的 `id`，也是注入给模型的身份）。
+ *
+ * ## 为什么必须是「人话」（用户要求，2026-10-13）
+ *
+ * 用户追问（附模型自报截图）：「为什么现在还是回复中的模型不是标准模型 id」。
+ *
+ * 上游 `modelCode` 形如 `1Drift-F8hS3mK7pL2n` —— **故意不可读**的内部代号，
+ * 真名只在 `modelDisplayName` 里。而 DSH 把 `CatalogEntry.id` 注入给模型当身份
+ * ⇒ 模型只能自报一串乱码（它自己也无从知道那是哪个基座）。
+ *
+ * ⇒ 对外 id 改用**展示名归一后的 slug**（`qwen-3-8-flash`）。
+ *
+ * ## ⚠️ 与聚合**共用同一套归一规则**
+ *
+ * 用 `normalizeNameKey`（`canonical-models.ts`），**不自己写第二份**：
+ * 聚合的规范键就是这么算的，两处若各写一份必然漂移 —— 而漂移的后果是
+ * 「直连看到的 id」与「聚合里的键」对不上，用户无法把两处对应起来。
+ *
+ * ## ⚠️ 兜底：归一后为空时回退原始 id
+ *
+ * 展示名可能是空白 / 只由分隔符组成（`'·'`）⇒ 归一后得空串 ⇒ 若原样返回，
+ * DSH 的目录校验会因**空 id** 抛 `INVALID_CATALOG`，**整个 provider 不可用**。
+ * ⇒ 宁可回退成一个不可读但非空的 id（与改造前行为一致），也不产出空串。
+ */
+export function accioModelIdOf(model: Pick<AccioFallbackModel, 'id' | 'name'>): string {
+  const slug = normalizeNameKey(model.name)
+  return slug === '' ? model.id : slug
+}
+
+/**
+ * 由**对外 slug** 反查上游 `modelCode`（上行请求必须用它）；查不到则**原样返回**。
+ *
+ * ⚠️ **上行绝不能发 slug**：Accio 的推理端点只认 `modelCode`，发 slug 会请求打空，
+ * 而症状是「模型不回复」这种极具误导性的形态。
+ *
+ * ⚠️ **查不到时原样返回入参**（不抛错、不返回空串）：
+ * - 用户可能手填一个 id（DSH 允许），此时应由**上游**报错，而不是在这里
+ *   静默变成空模型名（那会让请求发到一个空 `model` 字段）；
+ * - 抛错则会把这个未知 id 变成一次**本地失败**，掩盖上游的真实错误信息。
+ */
+export function accioModelCodeOf(
+  models: readonly Pick<AccioFallbackModel, 'id' | 'name'>[],
+  slug: string,
+): string {
+  const hit = models.find((model) => accioModelIdOf(model) === slug)
+  return hit === undefined ? slug : hit.id
 }
 
 /** 解析 `AccioAdapter` 的构造选项。 */
@@ -627,8 +736,12 @@ export class AccioAdapter extends LlmAdapter {
    * （在 `accio-auth.ts` 一处落地），而不是在这里开第二份解析。
    */
   private toCatalogEntry(model: AccioFallbackModel): CatalogEntry {
+    const reasoning = accioReasoningOf(model)
     return {
-      id: model.id,
+      // ⚠️ **对外 id 是「人话」slug**（用户要求，2026-10-13）：上游 `modelCode`
+      //    形如 `1Drift-…` 是内部代号，而 DSH 会把它注入给模型当身份 ⇒
+      //    模型只能自报乱码。上行仍用 `modelCode`（见 `stream` 的 `accioModelCodeOf`）。
+      id: accioModelIdOf(model),
       // 倍率写进 `name`（**不是** `description`）：composer 的模型切换菜单只渲染 name。
       name: displayNameOfAccioModel(model),
       // ⚠️ `resolveModel` 用**不带倍率**的裸名 ⇒ 显式提供 `bareName`。
@@ -638,6 +751,7 @@ export class AccioAdapter extends LlmAdapter {
       ...model.maxTokens !== undefined && Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0
         ? { maxTokens: model.maxTokens }
         : {},
+      ...reasoning === undefined ? {} : { reasoning },
     }
   }
 
@@ -729,6 +843,23 @@ export class AccioAdapter extends LlmAdapter {
       )
     }
 
+    /**
+     * 1b. ⚠️⚠️ **`options.model` 是「人话」slug，上行的 body 必须用上游 `modelCode`**。
+     *
+     * 对外 id 自 2026-10-13 起是 slug（`qwen-3-8-flash`），因为 DSH 把
+     * `CatalogEntry.id` 注入给模型当身份 —— 用上游代号会让模型只会自报乱码
+     * （用户追问「为什么不是标准模型 id」）。
+     *
+     * ⚠️ 但**上游只认 `modelCode`** ⇒ 这里必须映射回去。漏了这一步的后果：
+     * 请求体带上 slug、服务端不认，症状是「模型不回复」这种**极具误导性**的形态
+     * （不是参数错误）。故本行是**功能承重**，不是装饰。
+     *
+     * ⚠️ 未知 id **原样透传**（`accioModelCodeOf` 的语义）：用户手填的 id 应由
+     * 上游报错，本地不得静默改成空模型名。
+     */
+    const sourceModels = this.remoteModels ?? this.product.fallbackModels
+    const wireModel = accioModelCodeOf(sourceModels, options.model)
+
     // 2. 凭据（过期则先静默续期）。
     // ⚠️ 传 `options.model`：多账号池按它过滤限流账号（与 trae 同因）。
     let credential = await this.options.resolveCredential(options.model)
@@ -782,7 +913,9 @@ export class AccioAdapter extends LlmAdapter {
     }
     const { contents, systemInstruction } = serializeAccioMessages(wireMessages)
     const body = buildAccioBody({
-      model: options.model,
+      // ⚠️ **上行用 `wireModel`（= 上游 `modelCode`），不是 `options.model`（slug）** ——
+      //    见上面 1b 的说明。这是本次改动最容易漏、且后果最隐蔽的一处。
+      model: wireModel,
       accessToken: credential.access_token,
       contents,
       systemInstruction,
@@ -849,6 +982,44 @@ export class AccioAdapter extends LlmAdapter {
     }
     if (response.body === null) {
       throw new LlmError('accio: empty model response body', 'EMPTY_RESPONSE')
+    }
+    /**
+     * ⚠️⚠️ **必须校验 `content-type`：HTTP 200 也可能是一张风控拦截页**
+     * （2026-10-13 真机实测发现，与本仓库记过的「流内 402 被 HTTP 200 掩盖」同型）。
+     *
+     * ## 现象
+     *
+     * 请求**不带 `utdid`**（或只放 header 不放 `properties.utdid`）时，阿里网关回：
+     * - **HTTP `200`**（不是 4xx！）；
+     * - `content-type: text/html;charset=UTF-8`；
+     * - body 是一段跳转脚本：`<a id="a-link" href="https://bixi-intl.alicdn.com/punish/…">`
+     *   + `window._config_ = {"action":"deny",…}` + `<!--rgv587_flag:sm-->`。
+     *
+     * ## 不校验的后果（**静默**）
+     *
+     * 这段 HTML 会被喂给 SSE 解析器 ⇒ **一帧都解析不出来** ⇒ 最终报
+     * 「模型未返回任何内容块」。用户看到的是「模型不回复」，而真因是**风控**，
+     * 排查方向完全错（本轮实测就曾被它误导成「档位无效」）。
+     *
+     * ## 为什么判 `content-type` 而不是判 body 文本
+     *
+     * 正常响应恒为 `text/event-stream`（实测）；而 body 文本的形态（脚本内容、
+     * 域名、标记）都可能变 —— 判结构比判内容稳。
+     *
+     * ⚠️ 归类 `SERVER`（**不重试**）：风控是**身份/环境**问题，原样重发只会
+     * 再被拦（与 `trae-adapter.ts` 的 4006 不重试同理）。
+     */
+    const contentType = response.headers.get('content-type') ?? ''
+    if (!contentType.includes('text/event-stream')) {
+      // ⚠️ 读 body 只为**把服务端原文带给用户/日志**（诊断用），失败不影响判据。
+      const peek = await response.text().catch(() => '')
+      throw new LlmError(
+        `accio: 上游未返回事件流（content-type: ${contentType || '(空)'}）——`
+        + `通常是被风控拦截（网关返回 200 + HTML 拦截页）。`
+        + `${peek === '' ? '' : ` 服务端原文：${peek.slice(0, 200)}`}`,
+        'SERVER',
+        { status: response.status },
+      )
     }
 
     // 7. 消费 SSE。

@@ -59,7 +59,7 @@ import {
   type AccioCredential,
 } from '../../src/accio.js'
 import { consumeAccioSse, serializeAccioMessages, toAccioTools } from '../../src/accio-messages.js'
-import { toAccioWireMessages } from '../../src/accio-adapter.js'
+import { accioModelIdOf, toAccioWireMessages } from '../../src/accio-adapter.js'
 // ⚠️ 复用既有的通用凭据读取（见 `accio-probe.e2e.spec.ts` 的同一段说明）。
 import { credentialFor, enabledAccountRef } from './image-probe-shared.js'
 
@@ -84,19 +84,27 @@ const ALLOW_EXPENSIVE = process.env.ACCIO_PROBE_ALLOW_EXPENSIVE === '1'
 const PROBE_UTDID = 'accio-e2e-probe-chat'
 
 /**
- * 解析被测模型：默认最便宜的那个；覆盖值必须是**已知 id**，
+ * 解析被测模型：默认最便宜的那个；覆盖值必须是**已知模型**，
  * 且倍率超限时要显式 opt-in。
+ *
+ * ⚠️ **覆盖值同时接受「对外 id（slug）」与「上游 `modelCode`」**（2026-10-13）：
+ * 对外 id 自该日起改成了 slug（`qwen-3-8-27b`），而本探针**自己发裸 fetch**、
+ * 上行必须用 `modelCode` ⇒ 两种写法都在这里认掉，避免用户照着模型选择器里的
+ * 名字（slug）写进来却被拒。
  */
 function resolveProbeModel(): AccioFallbackModel {
   const override = process.env.ACCIO_PROBE_MODEL
   if (override === undefined || override === '') return CHEAPEST
-  const known = ACCIO.fallbackModels.find((m) => m.id === override)
+  const known = ACCIO.fallbackModels.find(
+    (m) => m.id === override || accioModelIdOf(m) === override,
+  )
   // ⚠️ 拒绝未知 id（不是「回落到默认」）：静默回落会让「我想测 A」变成「其实测了 B」，
   // 而两者的倍率可能差 200 倍。
   expect(
     known,
-    `ACCIO_PROBE_MODEL=${override} 不在已知模型表里（id 非人类可读，写错会得到与账号无关的 404）。`
-    + `已知 id：${ACCIO.fallbackModels.map((m) => m.id).join(', ')}`,
+    `ACCIO_PROBE_MODEL=${override} 不在已知模型表里（写错会得到与账号无关的 404）。`
+    + `可写对外 id（${ACCIO.fallbackModels.map((m) => accioModelIdOf(m)).join(', ')}）`
+    + `或上游 modelCode（${ACCIO.fallbackModels.map((m) => m.id).join(', ')}）。`,
   ).toBeDefined()
   const model = known!
   const multiple = model.multiple ?? 0

@@ -16,6 +16,7 @@ import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
 import {
   formatExpirySplitLine,
+  formatNamedPoolLine,
   formatPoolSplitLine,
   formatPackageTooltip,
   splitCreditsByExpiry,
@@ -438,22 +439,64 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
    */
   const quotaDetail = quotaText === null ? null : formatQuotaDetail(all);
   /**
-   * Loomy / Raccoon 的「当日刷新池」必须**单独显示**（用户明确要求）。
+   * Loomy / Raccoon 的「当日刷新池」**单独显示**（用户明确要求）。
    *
-   * 两家的积分都由语义不同的池构成，其中有一个当日刷新（今天不用就没了）：
+   * 两家都有「今天不用就没了」的当日池：
    * - Loomy：`每日赠送`（每天 5000，消耗后不回补）+ `永久积分`
    * - Raccoon：`每日积分`（`daily_points`）+ 奖励 / 会员 / 充值
    *
    * 判据是**池名**（见 `findDailyPool`），不是下标 —— Raccoon 的池是按
    * 「服务端给了哪个字段」动态 push 的，下标会错位。
+   *
+   * ## ⚠️⚠️ 但 **accio 必须排除在这条之外**（真实缺陷，2026-10-13）
+   *
+   * `findDailyPool` 认的当日池名里**包含 `每日积分`** —— 而那正是 **accio 的**
+   * 每日桶名！所以 accio 一旦传进来，这里也算出 `长期 0 · 每日 199`，
+   * 与下面的 `namedPoolText`（`每日 199 · 每月 0 · 推荐 0`）**同时渲染**
+   * ⇒ 卡片上 `每日 199` 出现**两遍**（用户报障，附截图）。
+   *
+   * ⇒ 两条分池线**互斥**：accio 走 `namedPoolText`（见 {@link formatNamedPoolLine}），
+   * 其余走本函数。
+   *
+   * ⚠️ 这里写成「accio ⇒ 短路成 null，否则照算」而**不是排除法**（即
+   * 「provider 不等于 accio 时才走这条」那种写法）：排除法是本仓库明令反对的形态
+   * ——将来新增 provider 忘了登记时，它会**静默**落进 accio 这个分支。
+   * ⚠️ 本条注释刻意**不写出那个被 grep 的形态字面量**：有断言在整份源码里搜它，
+   * 注释里出现会让那条断言**假红**（本仓库记录过的注释级陷阱）。
    */
-  const poolSplitText = formatPoolSplitLine(
-    all,
-    formatForUnit,
-    // Loomy 的另一个池就叫「永久积分」；Raccoon 的奖励/会员/充值三种池
-    // 到期规则各不相同，不能统称永久。
-    provider === 'loomy' ? '永久' : '长期',
-  );
+  const poolSplitText = provider === 'accio'
+    ? null
+    : formatPoolSplitLine(
+        all,
+        formatForUnit,
+        // Loomy 的另一个池就叫「永久积分」；Raccoon 的奖励/会员/充值三种池
+        // 到期规则各不相同，不能统称永久。
+        provider === 'loomy' ? '永久' : '长期',
+      );
+  /**
+   * ⚠️ Accio 走**逐命名池全列**（`formatNamedPoolLine`），不是上面的两桶形状。
+   *
+   * 用户的报障原文（2026-10-13，附截图）：「accio 的显示和别的 provider 没统一，
+   * 例如 loomy 的」—— accio 原先**另起一个独立区块**（`AccioDailyPanel`）显示
+   * 三类桶，而别家都在账号卡片里。现改为与 loomy 同形：卡片里就是积分行。
+   *
+   * ⚠️ 为什么不能直接用 `formatPoolSplitLine`：它是两桶形状，会把「每月」与
+   * 「推荐」笼统求和成「长期」，而这两类语义并列（到期规则不同）——
+   * 见 `formatNamedPoolLine` 的注释。
+   */
+  const namedPoolText = provider === 'accio' ? formatNamedPoolLine(all, formatForUnit) : null;
+  /**
+   * Accio 的「每日额度 ⋯ 后刷新」附注（`null` = 不渲染）。
+   *
+   * ⚠️ 只在**当日池存在**时才有值：`accioResetSeconds` 按池名找 `每日积分`，
+   * 那个包上才挂着 `quota` 端点的倒计时（其余桶刻意留空 —— 见 `accio-credits.ts`）。
+   */
+  const accioResetNote = provider === 'accio'
+    ? (() => {
+        const countdown = formatAccioResetCountdown(accioResetSeconds(all, now));
+        return countdown === null ? null : `每日额度 ${countdown}后刷新`;
+      })()
+    : null;
   return React.createElement('div', { className: 'dim-jh-metaRow' },
     // ⚠ 标签按单位走：ZCode 是 token，显示「Token」而不是「积分」。
     React.createElement('dt', null, label),
@@ -470,6 +513,23 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     // 不同 provider，不能假定都是积分。
     poolSplitText
       ? React.createElement('span', { className: 'dim-jh-creditPools' }, poolSplitText)
+      : null,
+    // ⚠️ Accio 的逐池列（与 loomy 的 `poolSplitText` 同位置、同样式，故视觉统一）。
+    namedPoolText
+      ? React.createElement('span', { className: 'dim-jh-creditPools' }, namedPoolText)
+      : null,
+    /**
+     * ⚠️ Accio 的每日额度重置倒计时（**唯一**与 loomy 不同的附注）。
+     *
+     * 别的家没有这一条；但 accio 的每日额度是 24 小时作废且**不累积**，
+     * 「还有多久刷新」是用户唯一能据此决定「现在要不要用掉」的信息。
+     * ⚠️ 它放在**积分行内**（而不是另起区块）—— 这正是 2026-10-13 的统一要求。
+     */
+    accioResetNote
+      ? React.createElement('span', {
+          className: 'dim-jh-creditPools',
+          title: ACCIO_DAILY_REWARD_NOTE,
+        }, accioResetNote)
       : null,
     // 两个 buddy + TRAE + LobsterAI：按「会不会近期作废」分桶，与选号判据同一套规则。
     // 这条也解释了「锁定永久积分后为什么没有可用账号」——临时桶是 0。
@@ -2430,96 +2490,6 @@ function accioResetSeconds(packages, now) {
   return Math.max(0, Math.round((end - at) / 1000));
 }
 
-/**
- * Accio（阿里）账号面板 —— 本仓库唯一的 **provider 专属面板**。
- *
- * ## 为什么 accio 需要一个专属面板，而不是复用通用卡片
- *
- * 通用卡片（{@link CreditBalanceRow}）答的是「每个账号还剩多少积分」，而 accio
- * 有三件通用形状装不下的东西：
- *
- * 1. **三类语义不同的积分桶**（每日 / 每月 / 推荐）—— 通用卡片按**到期时间**
- *    分成「临时 / 长期」两桶（`splitCreditsByExpiry`），而 accio 的桶是服务端
- *    按语义分开下发的，混成一桶就丢掉了「哪一份明天就没了」；
- * 2. **每日额度的重置倒计时** —— 它只对「每日」这一桶成立；
- * 3. **每日额度的发放规则说明** —— accio 没有签到端点，这一条必须写在面板上，
- *    否则用户会去找一个不存在的「领取」按钮。
- *
- * ## ⚠️ 本提交**没有**「刷新每日额度」按钮（刻意）
- *
- * 每日额度只能靠**重新登录**触发服务端重新发放，而现有 RPC 面上没有
- * 「重新登录**既有**账号」的出口：`account.create` 每次都用
- * `${provider}-${shortId()}` 现造 id 与凭据 ref（`src/jet-hub-rpc.ts`），
- * 拿它当重登录用会**多出一条幽灵账号**、而原账号的额度一点没刷新；
- * 账号的 `region` 也没下发给客户端；`login.poll` 对已登录账号第一秒就返回
- * `done: true`（假成功）。⇒ 在宿主侧新增那条 RPC 之前，本面板**只做诚实展示**，
- * 并把**今天真的可用**的手动路径写进文案（删号重登）。
- *
- * ## 与通用面板的关系
- *
- * 本组件**只接管积分那一段展示**：`ProviderPanel` 对 accio 把 `AccountCard`
- * 的通用积分行关掉（`showCredits: canLoadCredits && !accioPanel`），改由本组件
- * 逐账号渲染三类桶 + 倒计时。
- *
- * ⚠️ **绝不替换整张账号卡片**：`AccountCard` 上挂着「删除 / 启用开关 / 拖拽排序 /
- * 显示列表」等控件，而「删除该账号后重新登录」正是上面文案给出的**唯一**手动
- * 路径 —— 把卡片换成只读面板，等于让那句指导无从执行。
- *
- * @param props {{ accounts: Array, credits: Object, creditsLoading: boolean }}
- */
-function AccioDailyPanel({ accounts, credits, creditsLoading }) {
-  return React.createElement('div', { className: 'dim-jh-accioPanel' },
-    React.createElement('div', { className: 'dim-jh-accioHead' },
-      React.createElement('h3', { className: 'dim-jh-accioTitle' }, 'Accio 每日额度'),
-      // ⚠️ 字面说明是本面板存在的理由：它必须与积分桶**在同一屏**。
-      //    「还没有账号」那一格由 ProviderPanel 的通用空态负责，本组件不重复渲染。
-      React.createElement('p', { className: 'dim-jh-accioNote' }, ACCIO_DAILY_REWARD_NOTE)),
-    accounts.map((account) => {
-      // 余额来自通用面板已经拉好的 `credits`（同一份 `credits.balances`
-      // 响应）——本组件**不自己发请求**，否则同一个账号会被查两次。
-      const entry = credits[account.id] || {};
-      const packages = entry.balance?.packages || [];
-      const seconds = accioResetSeconds(packages, Date.now());
-      const countdown = formatAccioResetCountdown(seconds);
-      return React.createElement('div', {
-        key: account.id,
-        className: 'dim-jh-accioAccount',
-      },
-        React.createElement('div', { className: 'dim-jh-accioAccountHead' },
-          React.createElement('span', { className: 'dim-jh-accioAccountName' },
-            account.nickname || account.id),
-          // 账号规格（Free / …）搭 `credits.balances` 的 `extra` 回来，
-          // 取不到就整块不渲染（它只是一栏附注信息，与 AccountCard 同款取舍）。
-          entry.extra?.accountTier
-            ? React.createElement('span', {
-                className: 'dim-jh-accioAccountTier',
-                title: entry.extra.accountTier.title,
-              }, entry.extra.accountTier.label)
-            : null,
-          countdown === null
-            ? null
-            : React.createElement('span', {
-                className: 'dim-jh-accioCountdown',
-                title: '距服务端刷新每日额度还剩的时间（由 quota 端点下发的倒计时现算）。',
-              }, `每日额度 ${countdown}后刷新`)),
-        // 三类积分桶**逐桶**渲染：只显示合计会丢掉「哪一份明天就没了」。
-        creditsLoading && entry.balance === undefined
-          ? React.createElement('div', { className: 'dim-jh-accioNote' }, '积分读取中…')
-          : entry.error || !entry.balance
-            ? React.createElement('div', { className: 'dim-jh-accioNote', 'data-tone': 'warn' },
-                entry.error || '积分查询失败')
-            : React.createElement('div', { className: 'dim-jh-accioBuckets' },
-                packages.map((pkg, index) => React.createElement('div', {
-                  key: `${pkg.name || 'bucket'}-${index}`,
-                  className: 'dim-jh-accioBucket',
-                },
-                  React.createElement('span', { className: 'dim-jh-accioBucketName' }, pkg.name || '未命名'),
-                  React.createElement('span', { className: 'dim-jh-accioBucketValue' },
-                    `${formatUnits(pkg.remaining, pkg.unit) ?? '?'} / ${formatUnits(pkg.total, pkg.unit) ?? '?'}`),
-                  React.createElement('span', { className: 'dim-jh-accioBucketUsed' },
-                    `已用 ${formatUnits(pkg.used, pkg.unit) ?? '?'}`)))));
-    }));
-}
 
 function ProviderPanel({ provider, rpcCall }) {
   const [accounts, setAccounts] = React.useState([]);
@@ -2703,19 +2673,6 @@ function ProviderPanel({ provider, rpcCall }) {
    * 永远停在「查询失败」、控制台每次都留报错。
    */
   const canLoadCredits = supportsCreditBalance(provider);
-  /**
-   * 本 provider 是否由**专属展示面板**渲染积分（当前只有 accio）。
-   *
-   * ⚠️ 写成**正向**判据（`===`）而不是排除法：本仓库明确反对
-   * `provider !== 'xxx'` 这种形态 —— 将来新增 provider 时忘了登记会**静默**
-   * 落进专属分支（或反之），失败方向不可预测。
-   *
-   * ⚠️ 为什么要**替换**通用的积分行而不是叠加：`CreditBalanceRow` 按**到期
-   * 时间**把包分成「临时 / 长期」两桶，会把 accio 的「每月 / 推荐」两桶合并
-   * 成一个数 —— 恰好丢掉本面板要回答的「哪一份明天就没了」；两处同时渲染
-   * 还会把同一份余额显示两遍。
-   */
-  const accioPanel = provider === 'accio';
   /**
    * 「新建账号」弹窗里问的是**登录区域**（accio）而不是**登录渠道**（zcode）。
    *
@@ -3871,17 +3828,6 @@ function ProviderPanel({ provider, rpcCall }) {
                     role: 'alert',
                   }, React.createElement('div', null, `顺序保存失败：${reorderError}`))
                 : null,
-              // Accio 专属积分区（三类桶 + 重置倒计时 + 发放规则说明）。
-              // ⚠️ 必须是 `React.createElement(组件, props)` 而不是直接函数调用
-              // （本仓库记录过 React #310 事故）；本组件自身无 hook，但保持同款写法，
-              // 免得将来给它加 state 时踩坑。
-              accioPanel
-                ? React.createElement(AccioDailyPanel, {
-                    accounts,
-                    credits,
-                    creditsLoading,
-                  })
-                : null,
               accounts.map((account, index) => React.createElement(AccountCard, {
                 key: account.id,
                 account,
@@ -3894,10 +3840,12 @@ function ProviderPanel({ provider, rpcCall }) {
                 busy: probeBusy !== null,
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
-                // ⚠️ accio 关掉通用积分行：它的积分已由 `AccioDailyPanel` 按
-                // **服务端语义桶**渲染，而通用行按**到期时间**分桶，会把「每月 /
-                // 推荐」两桶合成一个数、并把同一份余额显示两遍。
-                showCredits: canLoadCredits && !accioPanel,
+                // ⚠️ accio **不再**关掉通用积分行（2026-10-13 改）：
+                // 用户报障原文「accio 的显示和别的 provider 没统一，例如 loomy 的」。
+                // 现改为与 loomy 同形 —— 卡片里就是积分行，三类桶由
+                // `CreditBalanceRow` 的 `formatNamedPoolLine` 逐池列出，
+                // 倒计时作为同一行内的一个附注（见那里的注释）。
+                showCredits: canLoadCredits,
                 // 账号名 hover 列资源包：只有余额真由多个包构成的 provider 才挂
                 // （loomy 的池是我们合成的、无到期字段，列出来会把「每日赠送」
                 // 标成长期 —— 恰好说反）。

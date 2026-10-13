@@ -177,6 +177,29 @@ export function normalizeAccioModel(raw: unknown): AccioFallbackModel | undefine
   const maxTokens = typeof row.maxTokens === 'number' && Number.isFinite(row.maxTokens)
     ? row.maxTokens
     : undefined
+  /**
+   * ⚠️ 档位（`reasoningEfforts` / `defaultReasoningEffort`）—— **2026-10-13 新增**。
+   *
+   * ## 实测的形状要点（逐条真机验证）
+   *
+   * 1. **`reasoningEfforts` 可能是 `null`**（38 条里 31 条）—— 必须与「空数组」同样
+   *    表达为「无档位」，**不能**当成 `[]` 后照常声明（那会让选择器空白）；
+   * 2. **元素是字符串**（`low` / `medium` / `high` / `xhigh` / `max`），顺序是
+   *    服务端给的**由弱到强**，**原样保留**（排序＝替服务端决定语义）；
+   * 3. **`defaultReasoningEffort` 可以在 `efforts` 为 `null` 时单独存在**
+   *    （GLM-5.3 `max`、MiniMax M3 `adaptive`）—— 实测**发过去服务端接受**，
+   *    故它是**一个可用的单档**（用户要求「即使只有一档也要显示」正是这一格）；
+   * 4. 非字符串 / 空串元素**丢弃**（脏值会让 DSH 的档位选择器渲染出空白项）。
+   */
+  const efforts = Array.isArray(row.reasoningEfforts)
+    ? (row.reasoningEfforts as unknown[]).filter(
+        (e): e is string => typeof e === 'string' && e.trim() !== '',
+      )
+    : []
+  const defaultEffort = typeof row.defaultReasoningEffort === 'string'
+    && row.defaultReasoningEffort.trim() !== ''
+    ? row.defaultReasoningEffort
+    : undefined
   return {
     id,
     name: displayName === '' ? id : displayName,
@@ -184,6 +207,8 @@ export function normalizeAccioModel(raw: unknown): AccioFallbackModel | undefine
     supportsImage: row.multimodal === true,
     ...multiple === undefined ? {} : { multiple },
     ...maxTokens === undefined ? {} : { maxTokens },
+    ...efforts.length === 0 ? {} : { efforts },
+    ...defaultEffort === undefined ? {} : { defaultEffort },
   }
 }
 

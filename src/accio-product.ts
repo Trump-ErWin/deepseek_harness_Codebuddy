@@ -38,6 +38,34 @@ export interface AccioFallbackModel {
    * 必须在展示名里体现（本仓库既有约定：倍率写进 `name`，不是 `description`）。
    */
   multiple?: number
+  /**
+   * 思考档位（上游 `reasoningEfforts`），**原样保留**远端下发的顺序。
+   *
+   * ## 为什么必须声明它（2026-10-13 实测，用户要求）
+   *
+   * 用户原话：「accio 的模型没有档位，需要有档位即使是只有一档也要显示，
+   * 使用远端真实下发的档位」。
+   *
+   * ⚠️ 本次**推翻**了笔记 §4.4.1 的旧结论「思考关不掉 ⇒ 目录里不声明任何档位」——
+   * 那条结论来自**用非法值**（`off` / `none` / `minimal`，都不在远端声明的集合里）
+   * 做的对照。本轮用**远端声明的合法档位**实测，`thoughts_token_count`
+   * 中位数随档位**单调递增**（Ultimate 五档：33→40→41→43→43）⇒ 档位**真实生效**。
+   *
+   * ⚠️ **`null` 与 `[]` 都必须如实表达为「无档位」**（远端 38 条里 31 条是 `null`）：
+   * 编造档位会让用户选了一个**服务端不认**的值。
+   */
+  efforts?: readonly string[]
+  /**
+   * 默认档位（上游 `defaultReasoningEffort`）。
+   *
+   * ⚠️ 实测有三种形态，**必须都如实处理**：
+   * - 与 `efforts` 同时给出（如 Ultimate：`default="high"` + 5 档）⇒ 直接用；
+   * - **只给 default、`efforts` 为 `null`**（如 GLM-5.3 `default="max"`、
+   *   MiniMax M3 `default="adaptive"`）—— 实测**把该值发过去服务端接受**
+   *   （`max` / `adaptive` 都 ✅）⇒ 它就是一个**可用的单档**；
+   * - 两者都为 `null`（如 Qwen 3.8 Flash）⇒ 确实无档位信息。
+   */
+  defaultEffort?: string
 }
 
 export interface AccioProduct {
