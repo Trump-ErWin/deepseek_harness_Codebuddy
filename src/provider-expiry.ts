@@ -60,10 +60,12 @@ import {
   codeArtsExpiry,
   lobsteraiExpiry,
   loomyExpiry,
+  officeaceExpiry,
   traeExpiry,
   zcodeExpiry,
 } from './aggregate-expiry.js'
 import type { AccioCredential } from './accio.js'
+import type { OfficeAceCredential } from './officeace-auth.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE } from './trae-product.js'
@@ -108,5 +110,14 @@ export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>>
     //    加它时必须**同时**进 `WIRED_EXPIRY_PROVIDERS`（`expiry-runtime-parity.spec.ts`
     //    真跑 `apply()` 锁这两者一致；只改一处会红）。
     accio: { credentialExpiry: (c) => accioExpiry(c as AccioCredential) },
+    // ⚠️ officeace：与 **buddy 系同形**（订阅的每个积分桶都带 `expiresAt`）。
+    //    ⚠️ **必须传 `context.credentialRef`**：它的余额入口只有拿到 ref 才走
+    //    云侧直读，否则回落到果办客户端的全局单 cookie ⇒ 多账号折算成同一份
+    //    余额（串号），而聚合候选排序是每账号粒度 ⇒ 会选错人。
+    //    同 accio：两处（本表 + `WIRED_EXPIRY_PROVIDERS`）必须同改。
+    officeace: {
+      credentialExpiry: (c, context) =>
+        officeaceExpiry(c as OfficeAceCredential, context?.credentialRef),
+    },
   }
 }

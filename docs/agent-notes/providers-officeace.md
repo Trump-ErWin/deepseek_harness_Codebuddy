@@ -207,6 +207,74 @@ STS 寿命约 2 小时，恰好落在「恢复后到定时器补触发那一轮�
 字面量**（它断言 `jet-hub-rpc.ts` 的源码文本）而恒红。⇒ 只锚定 **import 语句**
 （没 import 就必然调不到真实实现，精确且不会假失败）。
 
+## 5.8 ⚠️⚠️ 聚合轮换：决定可见性的是 `WIRED_EXPIRY_PROVIDERS`，不是 `AGGREGATE_CHANNELS`
+
+**用户要求**（2026-10-13）：「officeace 的模型好像没有加入聚合 provider 的轮换中，
+我们需要加入」。
+
+⚠️ **同款陷阱已复发三次**（cline → accio → officeace），症状**恒定静默**：
+
+```
+aggregate-adapter.ts 有 4 处按 WIRED_EXPIRY_PROVIDERS 过滤
+  （探测过滤 / 候选过滤 / 虚拟模型过滤 / 价格）
+⇒ 该表里没有的渠道，折算恒为 UNUSABLE ⇒ 候选表里永远没有它
+⇒ 而 AGGREGATE_CHANNELS 只影响「进不进目录构建」，**不决定候选可见性**
+```
+
+**接入必须三处同改**（少一处都是静默失效）：
+
+1. `aggregate-expiry.ts` 的 `officeaceExpiry` 折算原语；
+2. `WIRED_EXPIRY_PROVIDERS` 白名单（**这才是决定候选表可见性的那个**）；
+3. `provider-expiry.ts` 的 `createProviderExpiry()` 表。
+   （2 与 3 的一致性由 `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁死。）
+
+### 折算判据：与 buddy 系**同形**（不是与 loomy/accio 同形）
+
+officeace 的订阅**每个积分桶都带 `expiresAt`**（ISO 8601）⇒ 走「有效包取最早」
+那套，判据与 `sharedPackageExpiry` **逐格一致**：
+
+| 情形 | 折算值 |
+|---|---|
+| 有 `remaining > 0` 且未失效的桶，至少一个给了到期时间 | 那些时刻的**最小值** |
+| 有可用桶但都没给到期时间 | `NEVER`（长期，排最后但不剔除）|
+| 一个可用桶都没有 | `UNUSABLE`（剔除）|
+| 查询失败 / 未登录 | `UNUSABLE`（读不到就不猜）|
+
+⚠️ **为什么不用共享的 `sharedPackageExpiry`**：它吃
+`fetchBalance: () => Promise<CreditBalance | null>`，而 officeace 的余额入口是
+`fetchSubscriptionSummary(staleHours, ref, credential, credentials)`，返回
+`OfficeAceSubscriptionSummary` —— **形状套不进那个泛型**（与 qoder / opencode
+被排除在共享骨架外的理由同源）。但**判据必须同构**（本仓库红线）。
+
+### ⚠️ 必须把 `credentialRef` 传下去（否则多账号串号）
+
+`fetchSubscriptionSummary` **传了 `ref` 才走云侧 V11 直读**；不传会回落到
+果办客户端的**全局单一 cookie**（只反映「当前登录在果办里的那一个账号」）
+⇒ 多账号下所有账号折算成**同一个余额**（实测两个账号都显示 6500），
+而聚合候选排序是**每账号**粒度 ⇒ **会选错人**。
+
+为此给 `ProviderExpiryContext` 新增可选 `credentialRef`
+（其余家忽略它 —— 与 `catalogIds` 同一模式），并在折算调用点从
+`item.entry.credentialRef` 填充。
+
+### 真机验证（2026-10-13 本机）
+
+折算输出 = `2026-10-13T15:59:59.000Z`，逐桶核对**语义正确**：
+
+| 桶 | remaining | expiresAt | 参与折算？ |
+|---|---|---|---|
+| 个人体验版 | 500 | **无** | ❌ 不参与（不臆造时刻）|
+| 新用户专属福利 | 4000 | 11-12 | ✅ |
+| 每日签到有礼 | 993.32 | **今天 15:59** | ✅ 取最小 |
+| 国庆黄金周·登录翻倍礼 | 1000 | 今天 15:59 | ✅ 同刻 |
+
+⇒ 正是「临期优先」要的语义：今天作废的签到积分排最前，
+而「个人体验版」被判长期、**不拉低最小值**。
+
+**守卫**：`tests/unit/officeace-expiry.spec.ts`（12 条：9 条折算判据 + 3 条接线）。
+已反向验证：移出白名单 ⇒ **3 条独立守卫同时变红**并点名；
+丢掉 ref 传递 ⇒ ⑫ **精确变红**（收到 `undefined`）。
+
 ## 5.7 ⚠️⚠️ 模型列表为空 = 打错了 host（`maasBaseUrl` 是死字段，2026-10-13 真机实测）
 
 **用户报障**：「provider 列表里有 OfficeAce、我也加了账号，但**对话中选择模型的
