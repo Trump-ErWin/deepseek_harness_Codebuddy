@@ -415,8 +415,7 @@ ZCode (智谱) • 94.54MToken
 | `DSH_OPENAI_GATEWAY_API_KEY` | 自动生成 | 网关 Bearer 密钥 |
 | `DSH_REASONING_LOOP_GUARD` | 开启 | 思考死循环守卫总开关 |
 | `DSH_REASONING_LOOP_AUTO_RESUME` | 开启 | 中止后是否自动补一句「继续」并重跑 |
-| `DSH_REASONING_LOOP_AUTO_RESUME_MAX` | `2` | 连续自动续跑上限（最大 `10`）|
-| `DSH_TRAE_CHANNELS` | `solo_work_lite,solo_agent_remote` | TRAE 要拉取的通道，**顺序即优先级** |
+| `DSH_REASONING_LOOP_AUTO_RESUME_MAX` | `2` | 连续自动续跑上限（最大 `10`）|| `DSH_TRAE_CHANNELS` | `solo_work_lite,solo_agent_remote` | TRAE 要拉取的通道，**顺序即优先级** |
 | `DSH_TRAE_MAX_COMPLETION_TOKENS` | `64000` | TRAE 单次输出上限（设 `0` 关闭收敛）|
 
 更多 provider 专属变量（如 `DSH_ZCODE_INTERNAL_CARRIER`、
