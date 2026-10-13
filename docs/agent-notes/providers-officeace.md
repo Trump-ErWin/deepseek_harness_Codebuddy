@@ -207,6 +207,44 @@ STS 寿命约 2 小时，恰好落在「恢复后到定时器补触发那一轮�
 字面量**（它断言 `jet-hub-rpc.ts` 的源码文本）而恒红。⇒ 只锚定 **import 语句**
 （没 import 就必然调不到真实实现，精确且不会假失败）。
 
+## 5.7 ⚠️⚠️ 模型列表为空 = 打错了 host（`maasBaseUrl` 是死字段，2026-10-13 真机实测）
+
+**用户报障**：「provider 列表里有 OfficeAce、我也加了账号，但**对话中选择模型的
+列表里看不到 OfficeAce 的模型**」。
+
+**根因**：适配器一律打硬编码的 `OFFICEACE.defaultBaseUrl`
+（`https://officeace.cn-southwest-2.huaweicloud-agentarts.com`），
+而华为**按账号下发专属网关**（本机是 `modelgw-0004.officeace.cn-southwest-2...`）。
+同一个 Basic 凭据实测：
+
+| host | `/v2/models` | `/v2/chat/completions` |
+|---|---|---|
+| `officeace…`（硬编码，修复前）| **401** `APIG.1009 AppKey or AppSecret is invalid` | **401** |
+| `modelgw-0004.officeace…`（凭据里）| **200** | **200** |
+
+**后果链（全程零日志）**：`probe` 401 ⇒ `listModels` 返回 `[]` ⇒ 选择器空分组；
+而空返回与「无账号」**同形** ⇒ 目录门控把**整个 provider 隐藏**。
+
+⚠️ **`maasBaseUrl` 一直都在凭据里**（`fetchModelInfo` 从云侧 `model_api_url_base`
+取），只是**从没被读过** —— 典型「写了不读的死字段」。我在 PR #89 审计时**已登记
+这条为已知缺口，却低估了它**（当时判为「影响有限，若账号被分到别的 region 才暴露」）。
+真机证明：**它就是主路径**，而且**默认域对新账号直接 401**。
+⇒ **教训：写进凭据却没人读的字段，要按「可能已经是主路径」对待，而不是按注释里的
+推断定性。** 这条缺口当时只要跑一次真实的 `listModels` 就会暴露。
+
+**修法**（`src/officeace-adapter.ts` 的 `maasBaseUrlOf`）：
+推理/探测三处（probe、stream 首发、401 重试）改用 **`credential.maasBaseUrl`**，
+缺失时回退 `defaultBaseUrl`（老凭据零行为变化）；尾斜杠规范化。
+
+⚠️ **只改 Basic 鉴权的推理面**。V11 签名那套（`/v1/subscription`、
+`/v1/model-token-rates`）实测**两个 host 都存在且都要求 IAM 签名**
+（返回 `failed parse aksk format` 而非 404/DNS 错）⇒ 它们是**管理面 API**，
+**不要**「为统一」一起改 —— 会把余额与倍率一起打挂。
+
+**守卫**：`tests/unit/officeace-base-url.spec.ts`（9 条：纯函数边界 / 端到端
+mock fetch 断言 probe 与推理真打账号域 / 缺字段回退 / **范围守卫**防误改 V11）。
+已反向验证：改回硬编码 ⇒ 行为断言与源码断言**各自精确变红**。
+
 ## 5.6 ⚠️⚠️ DSML 工具调用是**闭环**：只「教」不「解」= 工具永不执行（2026-10-13）
 
 DeepSeek-V4 系模型走 DSML 而非标准 `tool_calls`（理由见 `src/dsml.ts` 头注：
