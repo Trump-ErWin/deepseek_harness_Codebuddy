@@ -542,16 +542,56 @@ export function mergeAccioToolArgs(fragments: readonly string[]): string {
  * 首字延迟**（TTFT）并让正文与思考的增量下发全部失效，代价远大于收益。
  * ⇒ 保留当前策略；若将来真机上观测到交错，应先取证再改。
  */
+/**
+ * 抽取一帧上的**终帧元数据**（`turn_complete` / `usage_metadata` / `finish_reason`）。
+ *
+ * ⚠️ 只抽这三个键，**不透传整帧**：工具分片帧还带 `partial` / `raw_response_json`
+ * （后者是整份 OpenAI 原始 chunk，体积大且与合并产物无关）—— 拼进 flush 帧会
+ * 让每帧体积膨胀数倍且语义混乱。元数据三键是消费侧真正读的（归一化层把它们
+ * 映射成 `usageMetadata` / `finishReason`，`turn_complete` 仅作标记）。
+ */
+function frameMetaOf(frame: unknown): Record<string, unknown> | undefined {
+  if (frame === null || typeof frame !== 'object') return undefined
+  const f = frame as Record<string, unknown>
+  const meta: Record<string, unknown> = {}
+  if (f.turn_complete !== undefined) meta.turn_complete = f.turn_complete
+  if (f.usage_metadata !== undefined) meta.usage_metadata = f.usage_metadata
+  if (f.usageMetadata !== undefined) meta.usageMetadata = f.usageMetadata
+  if (f.finish_reason !== undefined) meta.finish_reason = f.finish_reason
+  if (f.finishReason !== undefined) meta.finishReason = f.finishReason
+  return Object.keys(meta).length > 0 ? meta : undefined
+}
+
 export function accioToolCallMergeTransform(): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   let buffer = ''
   /** 本次待合并的调用：`id` → 已见到的参数片段（**保持首见顺序**）。 */
   const pending = new Map<string, { id: string; name: string; fragments: string[] }>()
+  /**
+   * ⚠️⚠️ 被吸收帧上携带的**终帧元数据**（`usage_metadata` / `finish_reason` /
+   * `turn_complete` 等，2026-10-13 wire 探针定罪的真实缺陷）：
+   * 上游把**最后一个 `function_call` 分片**与终帧元数据放在**同一帧**里
+   * （`{content:{parts:[{function_call:{…,args_json}}]}, turn_complete:true,
+   * usage_metadata:{…}, finish_reason:"STOP"}`）。吸收工具 part 时若不把
+   * 这些字段暂存下来，flush 只吐工具 part ⇒ usage 恒归零、finish 恒兜底
+   * `stop` —— 正是用户报障「思考一下就中断」的根因（工具帧其实到了，
+   * 但终帧元数据被合并缓冲吞掉）。
+   */
+  let pendingMeta: Record<string, unknown> | undefined
 
   /** 把已缓冲的调用拼成**一帧**交出去（无缓冲时是空操作）。 */
   const flushPending = (out: string[]): void => {
-    if (pending.size === 0) return
+    if (pending.size === 0) {
+      // ⚠️ 无工具调用时元数据也要交出去：终帧可能不带 function_call
+      //（纯文本轮次的收尾帧就是这种），吸收路径根本没跑过 —— 但若
+      // `pendingMeta` 有值（理论上不会），仍照发，宁多勿丢。
+      if (pendingMeta !== undefined) {
+        out.push(`data: ${JSON.stringify(pendingMeta)}`)
+        pendingMeta = undefined
+      }
+      return
+    }
     const parts: unknown[] = []
     for (const entry of pending.values()) {
       const args = mergeAccioToolArgs(entry.fragments)
@@ -566,7 +606,44 @@ export function accioToolCallMergeTransform(): TransformStream<Uint8Array, Uint8
       })
     }
     pending.clear()
-    out.push(`data: ${JSON.stringify({ content: { role: 'model', parts }, partial: true })}`)
+    // ⚠️ 终帧元数据**拼在同一帧**上（与上游原形一致）：归一化层会把
+    // `usage_metadata`/`finish_reason` 映射到 `usageMetadata`/`finishReason`，
+    // 消费侧于是拿到真实的用量与结束原因。
+    const frame: Record<string, unknown> = {
+      content: { role: 'model', parts },
+      partial: true,
+      ...(pendingMeta !== undefined ? pendingMeta : {}),
+    }
+    pendingMeta = undefined
+    out.push(`data: ${JSON.stringify(frame)}`)
+  }
+
+  /**
+   * 把一帧里的工具调用 part 收进缓冲（按 `id` 分组、保持首见顺序）。
+   * `content.parts` 形状与改写后的顶层 `function_call` 形状共用这一条路径。
+   *
+   * ⚠️ **同时暂存帧上的终帧元数据**：上游会把最后一个分片与
+   * `turn_complete`/`usage_metadata`/`finish_reason` 放在同一帧（见
+   * `pendingMeta` 的注释）。只吸收 part 不存元数据 = 吞掉 usage 与 finish。
+   */
+  const absorbCallParts = (callParts: unknown[], meta: Record<string, unknown> | undefined): void => {
+    for (const part of callParts) {
+      const call = (part as { function_call: Record<string, unknown> }).function_call
+      const id = typeof call.id === 'string' && call.id !== '' ? call.id : `anon-${pending.size}`
+      const name = typeof call.name === 'string' ? call.name : ''
+      const args = typeof call.args_json === 'string' ? call.args_json : ''
+      const entry = pending.get(id)
+      if (entry === undefined) pending.set(id, { id, name, fragments: args === '' ? [] : [args] })
+      else {
+        if (name !== '') entry.name = name
+        if (args !== '') entry.fragments.push(args)
+      }
+    }
+    if (meta !== undefined) {
+      // 多帧都带元数据时**后者覆盖前者**（与消费侧「取最大 total」的语义一致：
+      // 终帧的 usage 是最终值）。字段级合并不必要 —— 上游元数据是整帧重复播报。
+      pendingMeta = { ...(pendingMeta ?? {}), ...meta }
+    }
   }
 
   /** 处理一行；把要交出的行推进 `out`。 */
@@ -576,7 +653,32 @@ export function accioToolCallMergeTransform(): TransformStream<Uint8Array, Uint8
     if (payload === '' || payload === '[DONE]') { flushPending(out); out.push(line); return }
     let parsed: unknown
     try { parsed = JSON.parse(payload) } catch { flushPending(out); out.push(line); return }
-    const frame = parsed as { content?: { parts?: unknown }; [key: string]: unknown } | null
+    const frame = parsed as { content?: { parts?: unknown }; function_call?: unknown; [key: string]: unknown } | null
+    // ⚠️⚠️ 顶层 `function_call`（无 `content` 信封）：改写成 `content.parts` 形状后
+    // 走同一套合并流程（2026-10-13 真实缺陷，见 normalizeAccioFrame 的长注释）。
+    // 不改写的话本函数会把它原样透传（下面 `!Array.isArray(parts)` 的分支），
+    // 归一化层虽已能识别，但**合并不会发生** ⇒ 一次调用拆成 N 块、harness 执行 N 次。
+    // 改写只动信封：`id` / `name` / `args_json` 原样保留，与 `content.parts` 形状
+    // 共用同一条缓冲路径。
+    let effectiveLine = line
+    if (frame !== null && typeof frame === 'object'
+      && (frame.function_call !== undefined || frame.functionCall !== undefined)
+      && (frame.content === undefined || frame.content === null)) {
+      effectiveLine = `data: ${JSON.stringify({
+        content: { role: 'model', parts: [{ function_call: frame.function_call ?? frame.functionCall }] },
+      })}`
+    }
+    // ⚠️ 帧上的终帧元数据（`turn_complete`/`usage_metadata`/`finish_reason`）：
+    // 与最后一个工具分片同帧到达（见 pendingMeta 注释），吸收时必须一并暂存。
+    const meta = frameMetaOf(frame)
+    if (effectiveLine !== line) {
+      const rewritten = JSON.parse(effectiveLine.slice(5).trim()) as { content?: { parts?: unknown } }
+      const rewrittenParts = rewritten.content?.parts
+      if (Array.isArray(rewrittenParts)) {
+        absorbCallParts(rewrittenParts, meta)
+        return
+      }
+    }
     const parts = frame?.content?.parts
     if (!Array.isArray(parts)) { flushPending(out); out.push(line); return }
 
@@ -601,18 +703,7 @@ export function accioToolCallMergeTransform(): TransformStream<Uint8Array, Uint8
     if (otherParts.length > 0) {
       out.push(`data: ${JSON.stringify({ ...frame, content: { ...frame!.content, parts: otherParts } })}`)
     }
-    for (const part of callParts) {
-      const call = (part as { function_call: Record<string, unknown> }).function_call
-      const id = typeof call.id === 'string' && call.id !== '' ? call.id : `anon-${pending.size}`
-      const name = typeof call.name === 'string' ? call.name : ''
-      const args = typeof call.args_json === 'string' ? call.args_json : ''
-      const entry = pending.get(id)
-      if (entry === undefined) pending.set(id, { id, name, fragments: args === '' ? [] : [args] })
-      else {
-        if (name !== '') entry.name = name
-        if (args !== '') entry.fragments.push(args)
-      }
-    }
+    absorbCallParts(callParts, meta)
   }
 
   return new TransformStream<Uint8Array, Uint8Array>({

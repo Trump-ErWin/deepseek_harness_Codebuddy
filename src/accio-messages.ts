@@ -202,19 +202,65 @@ function normalizeAccioPart(part: unknown): unknown | undefined {
 /**
  * 把一帧 Accio 报文归一化成 `consumeGeminiSse` 认得的形状。
  *
- * ⚠️ **返回 `undefined` 而不是空 `candidates`**：空数组会被消费侧读成
- * 「这一帧有内容但为空」，而实际语义是「这帧无用」。
- *
  * ⚠️ 已经是标准形状（含 `candidates`）时**原样返回同一引用** ——
  * 容忍上游某天改成标准形状，也便于测试断言。
+ *
+ * ## ⚠️⚠️ 「无 `content`」≠「无用帧」（2026-10-13 真实缺陷，用户报障
+ * 「accio 思考一下就中断」的根因之一）
+ *
+ * 旧判据「无 `content` 一律 `return undefined`」把三类**有语义**的帧整帧丢弃：
+ *
+ * 1. **顶层 `function_call`**（agent-notes §4.2 的 task-6-report 逐字记录的
+ *    真实形状 `{"function_call":{"id":…,"name":…}}`，**不带** `content`）——
+ *    丢弃它 = 模型的工具调用凭空消失，流里只剩思考 ⇒ 兜底 `stop` ⇒
+ *    「思考一下就中断、无正文无工具调用、轮次显示正常完成」；
+ * 2. **终帧的 `usage_metadata` / `finish_reason`**（与 `content` 同为顶层字段，
+ *    工具轮次的终帧只有它们、没有正文）—— 丢弃它 = `MAX_TOKENS` 截断被
+ *    伪装成正常 `stop`，usage 恒归零；
+ * 3. 纯 usage 帧（无 finish）—— 丢弃它 = 计量丢失。
+ *
+ * 实测证据（session `35b01df3`，accio/deepseek-v4-1-flash 13 轮静默 stop）：
+ * 每轮思考结尾都是工具意图（"Let me call get_goal."），然后流里再无任何内容；
+ * 唯一拿到真实 usage 的轮次恰好是纯文本轮次（终帧带 `content`，usage 搭车存活）。
+ *
+ * ## 产出形状的取舍
+ *
+ * - 仅 usage（无 finish）⇒ `{candidates:[], usageMetadata}`：消费侧对空
+ *   `candidates` 只记用量、不算内容、继续读（见 `consumeGeminiSse` 的
+ *   `processFrame`），**不会**触发「模型未返回任何内容块」；
+ * - 有 finish ⇒ `candidates:[{finishReason}]`（**不带** `content`）：
+ *   `finishReason` 只有挂在**非空** candidate 上才会被读到（空 candidates
+ *   在读 finishReason 之前就 return 了）；
+ * - 顶层 `function_call` ⇒ 包成 `candidates[0].content.parts[].functionCall`，
+ *   复用 {@link normalizeAccioPart} 做 snake → camel 换名。
  */
 export function normalizeAccioFrame(frame: unknown): unknown | undefined {
   if (frame === null || typeof frame !== 'object') return undefined
   const f = frame as Record<string, unknown>
   // 已是标准形状：透传（同一引用）
   if (Array.isArray(f.candidates)) return frame
+  const usage = mapUsage(f.usage_metadata ?? f.usageMetadata)
+  const finish = f.finish_reason ?? f.finishReason
+  const finishText = typeof finish === 'string' && finish !== '' ? finish : undefined
+
   const content = f.content
-  if (content === null || typeof content !== 'object') return undefined
+  if (content === null || typeof content !== 'object') {
+    // 顶层 function_call（无 content 信封）：包成标准 part 形状，绝不丢。
+    const topCall = f.function_call ?? f.functionCall
+    if (topCall !== null && typeof topCall === 'object') {
+      const part = normalizeAccioPart({ function_call: topCall })
+      if (part !== undefined) {
+        const candidate: Record<string, unknown> = { content: { role: 'model', parts: [part] } }
+        if (finishText !== undefined) candidate.finishReason = finishText
+        return { candidates: [candidate], ...(usage !== undefined ? { usageMetadata: usage } : {}) }
+      }
+      return undefined
+    }
+    // 终帧 / 纯 usage 帧：保住 usage 与 finish 语义。
+    if (usage === undefined && finishText === undefined) return undefined
+    if (finishText !== undefined) return { candidates: [{ finishReason: finishText }], ...(usage !== undefined ? { usageMetadata: usage } : {}) }
+    return { candidates: [], usageMetadata: usage }
+  }
 
   // ⚠️ parts 必须逐个过一遍：工具调用的 snake → camel 换名发生在这里
   // （只包 `candidates` 是不够的，见文件头）。
@@ -230,12 +276,10 @@ export function normalizeAccioFrame(frame: unknown): unknown | undefined {
   }
 
   const out: Record<string, unknown> = { candidates: [{ content: normalizedContent }] }
-  const usage = mapUsage(f.usage_metadata ?? f.usageMetadata)
   if (usage !== undefined) out.usageMetadata = usage
   // finish_reason 上游可能给在顶层
-  const finish = f.finish_reason ?? f.finishReason
-  if (typeof finish === 'string' && finish !== '') {
-    ;(out.candidates as Array<Record<string, unknown>>)[0]!.finishReason = finish
+  if (finishText !== undefined) {
+    ;(out.candidates as Array<Record<string, unknown>>)[0]!.finishReason = finishText
   }
   return out
 }
@@ -370,38 +414,52 @@ export function consumeAccioSse(options: {
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   let buffer = ''
+  // ⚠️ 错误帧**不就地抛**：同一个 chunk 里可能已经攒了正常帧（`out`），
+  // 就地抛会让它们连 `enqueue` 都执行不到而被静默丢弃。故先记下来，
+  // 把已攒下的行交出去之后再抛（见 {@link accioErrorFrame}）。
+  // ⚠️ 提到 transform/flush 之外共享：flush 里处理的尾行同样可能是错误帧。
+  let pendingError: LlmError | undefined
+
+  /** 处理一行（裁 `\r` → 错误判据 → 归一化）；产物推进 `out`。 */
+  const processLine = (line: string, out: string[]): void => {
+    const trimmedEnd = line.endsWith('\r') ? line.slice(0, -1) : line
+    if (!trimmedEnd.startsWith('data:')) { out.push(trimmedEnd); return }
+    const payload = trimmedEnd.slice(5).trim()
+    if (payload === '' || payload === '[DONE]') { out.push(trimmedEnd); return }
+    let parsed: unknown
+    try { parsed = JSON.parse(payload) } catch { return }
+    // ⚠️ 错误判据必须在归一化**之前**：错误帧没有 `content`，归一化恒返回
+    // `undefined`，原先的 `continue` 会把它整帧丢掉（本任务修的真实缺陷）。
+    const error = accioErrorFrame(parsed)
+    if (error !== undefined) { pendingError ??= error; return }
+    const norm = normalizeAccioFrame(parsed)
+    if (norm === undefined) return
+    out.push(`data: ${JSON.stringify(norm)}`)
+  }
+
   const rewritten = options.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       buffer += decoder.decode(chunk, { stream: true })
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
       const out: string[] = []
-      // ⚠️ 错误帧**不就地抛**：同一个 chunk 里可能已经攒了正常帧（`out`），
-      // 就地抛会让它们连 `enqueue` 都执行不到而被静默丢弃。故先记下来，
-      // 把已攒下的行交出去之后再抛（见 {@link accioErrorFrame}）。
-      let pendingError: LlmError | undefined
-      for (const line of lines) {
-        const trimmedEnd = line.endsWith('\r') ? line.slice(0, -1) : line
-        if (!trimmedEnd.startsWith('data:')) { out.push(trimmedEnd); continue }
-        const payload = trimmedEnd.slice(5).trim()
-        if (payload === '' || payload === '[DONE]') { out.push(trimmedEnd); continue }
-        let parsed: unknown
-        try { parsed = JSON.parse(payload) } catch { continue }
-        // ⚠️ 错误判据必须在归一化**之前**：错误帧没有 `content`，归一化恒返回
-        // `undefined`，原先的 `continue` 会把它整帧丢掉（本任务修的真实缺陷）。
-        const error = accioErrorFrame(parsed)
-        if (error !== undefined) { pendingError ??= error; continue }
-        const norm = normalizeAccioFrame(parsed)
-        if (norm === undefined) continue
-        out.push(`data: ${JSON.stringify(norm)}`)
-      }
+      for (const line of lines) processLine(line, out)
       if (out.length > 0) controller.enqueue(encoder.encode(`${out.join('\n')}\n`))
       if (pendingError !== undefined) throw pendingError
     },
     flush(controller) {
-      // ⚠️ 先刷解码器里的残留多字节序列，再交出余量（见文件头第 2 条教训）。
+      // ⚠️⚠️ 尾行必须走**同一条归一化路径**，不能裸透传（2026-10-13 wire 探针定罪）：
+      // 实测上游流以终帧收尾、**没有 `[DONE]`**；合并层（accioToolCallMergeTransform）
+      // 的 flush 产物也**不带尾换行** ⇒ `transform` 把这行留在 buffer ⇒
+      // 若这里裸透传，`consumeGeminiSse` 收到的是**未归一化**的 Accio 顶层帧
+      // （无 `candidates`）⇒ 被当纯 usageMetadata 帧 ⇒ 工具调用/usage/finish 全丢
+      // —— 正是「思考一下就中断」在第一轮修复后仍复发的缺口。
+      // 先刷解码器里的残留多字节序列（见文件头第 2 条教训），再把余量当一行处理。
       buffer += decoder.decode()
-      if (buffer !== '') controller.enqueue(encoder.encode(buffer))
+      const out: string[] = []
+      if (buffer !== '') processLine(buffer, out)
+      if (out.length > 0) controller.enqueue(encoder.encode(`${out.join('\n')}\n`))
+      if (pendingError !== undefined) throw pendingError
     },
   }))
   return consumeGeminiSse({
