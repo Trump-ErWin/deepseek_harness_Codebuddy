@@ -670,17 +670,18 @@ describe('consumeMinimaxSse', () => {
     expect(finish.reason.kind).toBe('tool-calls')
   })
 
-  it('⚠️ tool-call-delta 的 id 来自 block-start（不是空串）', async () => {
+  it('⚠️ tool-call-delta 的 id 来自 block-start（不是空串），且必须携带 name', async () => {
     const chunks = await collect([
       'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-9","name":"f","input":{}}}',
       '',
       'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}',
     ].join('\n'))
     const delta = chunks.find(
-      (c): c is { type: 'tool-call-delta'; id: string } =>
+      (c): c is { type: 'tool-call-delta'; id: string; name?: string } =>
         (c as { type: string }).type === 'tool-call-delta',
     )
     expect(delta?.id).toBe('call-9')
+    expect(delta?.name).toBe('f')
   })
 
   it('⚠️ event:error 必须抛错（不能静默结束）', async () => {
