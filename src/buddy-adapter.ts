@@ -53,6 +53,9 @@ import { planSessionTitleThinking } from './session-title.js'
 // （400/11128），而「排查这个风控问题的会话」必然会把那句复述进正文 ——
 // 只在网关补 = 换一个入口又被拦。依据见那个文件的头。
 import { rewriteTencentContentFingerprints } from './openai-gateway/tencent-fingerprint.js'
+// ⚠️ `detail` 那条腿**只留一份实现**（`openai-compat.ts`）：本仓库 6 份同义的
+// `errorDetail` 各写一条判据必然漂移（IKLBSH A1）。
+import { detailFieldText } from './openai-compat.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -676,6 +679,9 @@ function errorDetail(body: string): string {
       // 腾讯系用 `msg` 而非 `message`。
       typeof data.msg === 'string' ? data.msg : undefined,
       typeof data.message === 'string' ? data.message : undefined,
+      // ⚠️ 上游代理的 `{"error":"…","detail":"<真实原因>"}` 形态（IKLBSH A1）。
+      // 判据只留一份实现（`openai-compat.ts` 的 `detailFieldText`）；必须是最后一条腿。
+      detailFieldText(data),
     ].filter((value): value is string => value !== undefined)
     if (parts.length > 0) return parts.join(' ')
   } catch {

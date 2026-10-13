@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   candidateRowLabel,
   expiryLabel,
@@ -13,8 +14,14 @@ import {
   toggleRejection,
 } from '../../plugin-src/client/aggregate-panel-logic.js'
 
-/** 仓库根（源码级断言用）。 */
-const here = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
+/** 仓库根（源码级断言用）。
+ *
+ * ⚠️ **必须用 `fileURLToPath`，不能用 `URL.pathname`**（真实缺陷，Gitee issue
+ * IKLBSH A3）：`pathname` 把路径里的空格编码成 `%20`，而原先的
+ * `replace(/^\/([A-Za-z]:)/, '$1')` 只修盘符、不修 `%20` ⇒ 含空格路径下
+ * `readFileSync` 恒 ENOENT，症状是**整份 spec 收集失败**。
+ */
+const here = fileURLToPath(new URL('.', import.meta.url))
 
 /** 造一个候选（照 `aggregate.catalog` 的响应形状）。 */
 function candidate(provider, realId, extra = {}) {
@@ -222,7 +229,11 @@ describe('★ 客户端 RPC 调用必须显式传 payload（真实缺陷回归�
     //    而不是等用户报「Invalid Jet Hub management request.」。
     const fs = await import('node:fs/promises')
     const path = await import('node:path')
-    const dir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+    // ⚠️ `fileURLToPath`（不是 `URL.pathname`）—— 见文件头 `here` 的注释（IKLBSH A3）。
+    // ⚠️ 这里取的是 `new URL('.', …)`（**目录**），故**不再**套 `path.dirname` ——
+    // 原先 `URL.pathname` 给的是**文件**路径、需要 dirname；换成 `'.'` 后再 dirname
+    // 会把 `tests/unit` 削成 `tests`（我改的第一版就这么错，实测 ENOENT）。
+    const dir = fileURLToPath(new URL('.', import.meta.url))
     const clientDir = path.resolve(dir, '../../plugin-src/client')
     const files = (await fs.readdir(clientDir)).filter((f) => f.endsWith('.js'))
     expect(files.length).toBeGreaterThan(10)
@@ -258,7 +269,11 @@ describe('★ 聚合面板必须按 rpcCall 的真实契约消费返回值（真
     //    故本守卫**只扫 AggregatePanel 组件体**。
     const fs = await import('node:fs/promises')
     const path = await import('node:path')
-    const dir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+    // ⚠️ `fileURLToPath`（不是 `URL.pathname`）—— 见文件头 `here` 的注释（IKLBSH A3）。
+    // ⚠️ 这里取的是 `new URL('.', …)`（**目录**），故**不再**套 `path.dirname` ——
+    // 原先 `URL.pathname` 给的是**文件**路径、需要 dirname；换成 `'.'` 后再 dirname
+    // 会把 `tests/unit` 削成 `tests`（我改的第一版就这么错，实测 ENOENT）。
+    const dir = fileURLToPath(new URL('.', import.meta.url))
     const source = await fs.readFile(path.resolve(dir, '../../plugin-src/client/jet-hub.js'), 'utf8')
     const start = source.indexOf('function AggregatePanel(')
     expect(start, 'AggregatePanel 必须存在').toBeGreaterThan(0)
@@ -278,7 +293,11 @@ describe('★ 聚合面板必须按 rpcCall 的真实契约消费返回值（真
   it('★ 对照：account.test 的 res.ok 是业务字段，必须**保留**（守卫不得误伤）', async () => {
     const fs = await import('node:fs/promises')
     const path = await import('node:path')
-    const dir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+    // ⚠️ `fileURLToPath`（不是 `URL.pathname`）—— 见文件头 `here` 的注释（IKLBSH A3）。
+    // ⚠️ 这里取的是 `new URL('.', …)`（**目录**），故**不再**套 `path.dirname` ——
+    // 原先 `URL.pathname` 给的是**文件**路径、需要 dirname；换成 `'.'` 后再 dirname
+    // 会把 `tests/unit` 削成 `tests`（我改的第一版就这么错，实测 ENOENT）。
+    const dir = fileURLToPath(new URL('.', import.meta.url))
     const source = await fs.readFile(path.resolve(dir, '../../plugin-src/client/jet-hub.js'), 'utf8')
     // `summarizeTest` 读的是 `account.test` 返回的**值**里的 ok —— 那是业务语义。
     expect(source).toMatch(/function summarizeTest\(res\)/)

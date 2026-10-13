@@ -274,8 +274,89 @@ export function errorMessage(error: unknown): string {
   try { return String(error) } catch { return 'unknown error' }
 }
 
-/** 从错误体提取可读 detail 文本。 */
+/**
+ * 读取错误体里 `detail` 字段的可读文本（字符串，或 `{message}` 嵌套对象）。
+ *
+ * ## 为什么单独成函数（Gitee issue IKLBSH A1）
+ *
+ * 上游代理的顶层 catch 常把异常包成
+ * `{"error":"acp-proxy failure","detail":"<真实原因>"}`：`error` 那条腿能取出的
+ * 只是**没有信息量的摘要**，而真正的原因（连接超时 / 鉴权细节 / 上游栈信息）
+ * 全在 `detail` 里。只认前者时用户只看到四个字，**根因完全不可见**。
+ *
+ * ⚠️⚠️ **本仓库有 6 份同义的 `errorDetail`**（`openai-compat` / `llm-adapter` /
+ * `buddy-adapter` / `lobsterai-adapter` / `trae-adapter` / `accio-adapter`）。
+ * 6 份各写一条判据必然漂移 —— 那正是本仓库首条红线「同一语义两套判据」的形态
+ * （`llm-adapter.ts` 的注释里就记着「两处改一处时**必须同时改另一处**」）。
+ * 故这条腿**只留一份实现**，其余 5 份 import 它。
+ *
+ * ⚠️ **证据强度如实标注：没有真实报文**。866 个真实会话（解压后 3.0 GB，
+ * 覆盖全部 `turn/end` 错误事件）里 `"detail"` **零命中**
+ * （`scripts/tmp-scan-iklbsh.mjs`）。该形态的依据是 ① 上游代理类实现的既有惯例、
+ * ② harness 自带的 `providerErrorDetail`（`dsh-llm-deepseek/lib/index.js`）
+ * 本身就**产出** `{message, detail}` 这一对字段。
+ * 属于「结构上必然可达、但未实测」的一条腿。
+ *
+ * ⚠️ **只加不减**（与 `errorDetail` 的既有纪律一致）：本函数只影响原先
+ * 「所有腿都落空 ⇒ 退回整段裸 JSON」那一种形态；它排在**最后**一条腿，
+ * 既有腿的优先级与产出**逐字节不变**。
+ */
+export function detailFieldText(value: unknown): string | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const detail = (value as Record<string, unknown>).detail
+  if (typeof detail === 'string') return detail.length > 0 ? detail : undefined
+  // 嵌套对象只认 `message`：整对象 stringify 会把 `{code,…}` 又变成一坨
+  // 不可读的裸 JSON，与这条腿的目的相反。
+  if (detail !== null && typeof detail === 'object' && !Array.isArray(detail)) {
+    const message = (detail as Record<string, unknown>).message
+    if (typeof message === 'string' && message.length > 0) return message
+  }
+  return undefined
+}
+
+/**
+ * 从错误体提取可读 detail 文本（**含**顶层 `detail` 字段）。
+ *
+ * ## ⚠️⚠️ 这个函数是**展示**出口；`httpErrorCode` 一类**分类**出口必须排除 detail 腿
+ *
+ * `detail` 对展示有价值，但它会**加长分类判据的输入** ⇒ 可能翻转错误码
+ * （真实净回归，两轮审计独立确证）：
+ *
+ * | 报文 | 只算既有腿 | 加上 detail 腿 |
+ * |---|---|---|
+ * | `{"message":"bad request","detail":"insufficient quota"}` | `INVALID_REQUEST` | **`QUOTA_EXCEEDED`** |
+ * | `{"message":"bad request","detail":"prompt is too long for this model"}` | `INVALID_REQUEST` | **`CONTEXT_WINDOW_EXCEEDED`** |
+ *
+ * 后者还会**触发 DSH 的上下文溢出压缩** —— 纯展示改进换来行为变更，且**零守卫**
+ * （我加的用例只断言返回值，没有一条锁分类结果）。
+ *
+ * ⇒ 处置：**默认保持含 detail（= 展示行为不变）**，只有**分类调用点**显式传
+ * `{ forClassify: true }` 把它排除。本仓库需要排除的只有 `llm-adapter.ts` 的
+ * **两处**（`httpErrorCode` 与 4xx 额度判据）—— 它们是 `errorDetail` 产物
+ * 的**唯一**分类消费者（buddy 的 `httpErrorCode` 刻意收**原始 body**，见其注释）。
+ */
 export function errorDetail(body: string): string {
+  return errorDetailImpl(body, true)
+}
+
+/**
+ * 从错误体提取**分类用**的可读文本 —— **不含**顶层 `detail` 字段。
+ *
+ * ⚠️ 分类调用点（`httpErrorCode` / `isSseQuotaExhaustedErrorCode` 一类）
+ * **必须**走本出口，理由与实测表见 {@link errorDetail}。
+ * 本出口保证分类输入与「加 detail 腿之前」**逐字节相同**。
+ */
+export function errorDetailForClassify(body: string): string {
+  return errorDetailImpl(body, false)
+}
+
+/**
+ * `errorDetail` 的唯一实现（两条出口共用，**不各写一份** —— 那是本仓库首条红线
+ * 「同一语义两套判据」，且必然漂移）。
+ *
+ * @param includeDetailField - `true` = 展示出口；`false` = 分类出口。
+ */
+function errorDetailImpl(body: string, includeDetailField: boolean): string {
   try {
     const data = JSON.parse(body) as Record<string, unknown>
     // ⚠️ `error` 也要认：Cline 的部分错误体是 `{error: "<文案>", success: false}`
@@ -290,6 +371,9 @@ export function errorDetail(body: string): string {
       typeof data.message === 'string' ? data.message : undefined,
       typeof data.msg === 'string' ? data.msg : undefined,
       typeof nested === 'string' ? nested : undefined,
+      includeDetailField ? detailFieldText(data) : undefined,
+      // ⚠️ **最后一条腿**，且只在展示出口计入（见上）。
+
     ].filter((value): value is string => value !== undefined)
     if (parts.length > 0) return parts.join(' ')
   } catch {

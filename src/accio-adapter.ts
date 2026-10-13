@@ -82,7 +82,7 @@ import { normalizeHarnessMessages } from './message-shape.js'
 // ⚠️ 图片守卫必须复用**共享的递归收集器**（它按 `tool-result` 递归下钻）——
 // 本仓库其余适配器（buddy / lobsterai / trae / gemini / cline / qoder / …）全部走它，
 // 不在这里手写第三份判据（「同一语义两套判据」是首条红线）。
-import { collectImages } from './openai-compat.js'
+import { collectImages, detailFieldText } from './openai-compat.js'
 import { resolveToolPairing } from './sse.js'
 // ⚠️ 目录解析的**唯一实现**在 `accio-auth.ts`（`AccioAuth.fetchModels` 用的就是它们）。
 // 本文件只再导出，**不写第二份** —— 否则就是本仓库红线「同一语义两套判据」。
@@ -437,6 +437,9 @@ function errorDetail(body: string): string {
       typeof data.code === 'string' || typeof data.code === 'number' ? `code=${String(data.code)}` : undefined,
       typeof data.message === 'string' ? data.message : undefined,
       typeof data.error === 'string' ? data.error : undefined,
+      // ⚠️ 上游代理的 `{"error":"…","detail":"<真实原因>"}` 形态（IKLBSH A1）。
+      // 判据只留一份实现（本文件已经在 import `openai-compat`）；必须是最后一条腿。
+      detailFieldText(data),
     ].filter((value): value is string => value !== undefined)
     if (parts.length > 0) return parts.join(' ')
   } catch { /* 非 JSON 错误体：原样返回 */ }

@@ -4,6 +4,49 @@
 
 ## 常见开发任务（续：调试与协议排障）
 
+### ⚠️⚠️ 测试里取仓库路径**必须用 `fileURLToPath`，不能用 `URL.pathname`**（Issue IKLBSH A3）
+
+**真实缺陷**：`URL.pathname` 对路径里的空格做**百分号编码**
+（`D:\Vibe coding\…` → `/D:/Vibe%20coding/…`），而原先的
+`new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')`
+只修**盘符前缀**、**不修 `%20`** ⇒ 仓库路径含空格时 `readFileSync` 恒 ENOENT。
+
+⚠️ **症状极具误导性**：vitest 把它报成**整份 spec 收集失败**
+（`Error: ENOENT … scandir`，不是单个用例失败），看起来像测试基建坏了，
+而不是「路径判据错了」。且**本机路径不含空格时永远看不到** —— 本地全绿、
+报障者全红。
+
+修法：
+```ts
+import { fileURLToPath } from 'node:url'
+const here = fileURLToPath(new URL('.', import.meta.url))   // 目录，末尾带分隔符
+```
+
+⚠️ **`new URL('.', …)` 给的是目录，`URL.pathname` 给的是文件路径** ——
+换成 `fileURLToPath` 后**不要再套 `path.dirname`**：我改的第一版多套了一层，
+把 `tests/unit` 削成 `tests`，实测 ENOENT（`aggregate-panel-logic.spec.ts`）。
+
+**涉及 4 个 spec、6 处**：`aggregate-badge.spec.ts`、`aggregate-panel-logic.spec.ts`
+（1 处顶层 + 3 处函数内）、`auto-badge-restore.spec.ts`。
+
+⚠️ **反向验证的边界（对抗审计实测证伪了「可验证性」）**：把 6 处全部改回
+`URL.pathname` ⇒ 那 3 个 spec 在**本机当前路径（不含空格）下 98 条全绿**。
+即「改回去在本机全绿」——这条修复是**结构性**的，逐文件变异验证**测不出来**。
+
+⇒ 已补 `tests/unit/path-source-read.spec.ts`，用**两条互补判据**把它变成
+「所有人都会红」：
+1. **活体**：在临时目录里真建一个**含空格**的目录，断言
+   `fileURLToPath` 得到的路径**可读**、`URL.pathname` 得到的**不可读**
+   （阳性对照——若 Node 哪天改了 `pathname` 行为，该格会红）；
+2. **结构性扫描**：`tests/` 下任何 `import.meta.url).pathname` **用法**都判违规
+   （剥注释后匹配，避免把讨论该写法的注释误判）。此判据**与仓库路径无关**，
+   故在任意环境下都能抓住回归。
+
+⚠️ **该扫描必须排除它自己**：守卫 spec 的用例标题与报错文案里**必然**出现那串
+被禁写法（否则说不清「禁止什么」）—— 本 spec 第一版漏了这一步，**立刻自伤**
+（自己扫自己）。守卫类 spec 的惯例：`resolve(fileURLToPath(import.meta.url))`
+与扫描结果比对后剔除自身。
+
 - **响应根本不是 SSE**（网关直接回了 JSON，没有任何 `data:` 帧）：
   早期同样静默空结束。现抛错并**带上原文片段**，否则用户只能看到一个没有原因的失败。
 

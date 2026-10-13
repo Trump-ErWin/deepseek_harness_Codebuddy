@@ -6,7 +6,9 @@ import {
   CodeArtsAdapter,
   codeartsQuotaExhaustedMessage,
   errorDetail,
+  errorDetailForClassify,
   formatResetIn,
+  isBenefitNotFoundBody,
   isSseQueueErrorCode,
   isSseQuotaExhaustedErrorCode,
   QUEUE_STATUS_BASE,
@@ -2647,6 +2649,357 @@ describe('CodeArtsAdapter', () => {
         thrown = error
       }
       expect((thrown as LlmError).code).toBe('QUOTA_EXCEEDED')
+    })
+
+    /**
+     * ★ `detail` 那条腿（Gitee issue IKLBSH A1）。
+     *
+     * 上游代理的顶层 catch 把异常包成
+     * `{"error":"acp-proxy failure","detail":"<真实原因>"}`：`error` 只能取出
+     * **没有信息量的摘要**，真正的原因全在 `detail` 里。
+     *
+     * ⚠️ **证据强度如实标注**：866 个真实会话（解压 3.0 GB，覆盖全部
+     * `turn/end` 错误事件）里 `"detail"` **零命中**（`scripts/tmp-scan-iklbsh.mjs`）。
+     * 该形态的依据是 ① 上游代理类实现的既有惯例、② harness 自带的
+     * `providerErrorDetail`（`dsh-llm-deepseek/lib/index.js`）本身就**产出**
+     * `{message, detail}` 这一对字段 ⇒ 结构上必然可达。
+     *
+     * ⚠️ **只加不减**：新腿排在**最后**，既有腿的产出逐字节不变（见下三条回归守卫）;
+     * 且它只在原先「所有腿落空 ⇒ 退回整段裸 JSON」那一种形态上生效。
+     */
+    it('★ detail 是字符串时取出它（原先只看到 error 那句摘要）', () => {
+      expect(errorDetail(JSON.stringify({
+        error: 'acp-proxy failure',
+        detail: 'connect ETIMEDOUT 10.0.0.1:443',
+      }))).toBe('acp-proxy failure connect ETIMEDOUT 10.0.0.1:443')
+    })
+
+    it('★ detail 是 `{message}` 嵌套对象时取 message（整对象 stringify 等于没收）', () => {
+      expect(errorDetail(JSON.stringify({
+        error: 'acp-proxy failure',
+        detail: { message: 'upstream refused', code: 502 },
+      }))).toBe('acp-proxy failure upstream refused')
+      // 反向：`code: 502` 不该被拼进来（否则又从「可读」退回「一坨字段」）。
+      expect(errorDetail(JSON.stringify({
+        error: 'x', detail: { message: 'upstream refused', code: 502 },
+      }))).not.toContain('502')
+    })
+
+    it('★ 回归守卫：detail 腿**不得**挤掉既有腿（它是追加的最后一条）', () => {
+      // ⚠️ 判据不是「谁优先」，而是「既有腿的产出**一个都不能少**」：
+      // `errorDetail` 的产物是**拼接**文本，下游 `isQuotaExceededError` /
+      // `isContextWindowExceededError` 都在**整串**上跑正则 ⇒ 只要 code 那条腿
+      // 的值仍在串里，`insufficient_quota` 就仍会被判成额度。若为了塞 detail
+      // 而把它顶掉（或改成 `detail ?? 既有腿`），额度报文会**掉回** `AUTH`。
+      const joined = errorDetail(JSON.stringify({
+        error: { code: 'insufficient_quota', message: 'quota gone' },
+        detail: 'noise',
+      }))
+      expect(joined).toContain('insufficient_quota')
+      expect(joined).toContain('quota gone')
+      // detail 追加在**末尾**（顺序本身不承载语义，但锚定它可防止有人把它
+      // 提到前面从而改变「拼接文本的前缀」）。
+      expect(joined.endsWith('noise')).toBe(true)
+      // 空串 / 非字符串 / 数组都不算命中（否则会产出空片段或裸 JSON）。
+      expect(errorDetail(JSON.stringify({ error: 'only-error', detail: '' })))
+        .toBe('only-error')
+      expect(errorDetail(JSON.stringify({ error: 'only-error', detail: 42 })))
+        .toBe('only-error')
+      expect(errorDetail(JSON.stringify({ error: 'only-error', detail: ['a'] })))
+        .toBe('only-error')
+      // 空对象 detail 退回既有行为（**不回退成 `[object Object]`**）。
+      expect(errorDetail(JSON.stringify({ error: 'only-error', detail: {} })))
+        .toBe('only-error')
+    })
+
+    it('★ `isBenefitNotFoundBody` 只认该码（判据本身，供 HTTP 4xx 通道复用）', () => {
+      // 判据与 SSE 通道**同源**（同一个常量），但**全等** —— `4004` 这一族里
+      // 没有证据表明其它尾号是同一语义（`4004.200` 是实测唯一的 benefit 码）；
+      // 放宽成 `InferHub.4004.` 前缀会把未知语义的报文变成可重试，属行为变更。
+      expect(isBenefitNotFoundBody('{"error_code":"InferHub.4004.200","error_msg":"benefit not found"}')).toBe(true)
+      // 反向：别的尾号、别的 InferHub 码都不得命中。
+      expect(isBenefitNotFoundBody('InferHub.4004.999')).toBe(false)
+      expect(isBenefitNotFoundBody('{"error_code":"InferHub.002002009.404"}')).toBe(false)
+      expect(isBenefitNotFoundBody('{"error_code":"InferHub.4291.200"}')).toBe(false)
+      expect(isBenefitNotFoundBody('')).toBe(false)
+    })
+
+    /**
+     * ★★ **`detail` 腿不得进入分类**（真实净回归，两轮审计独立确证）。
+     *
+     * ## 缺陷本体
+     *
+     * `httpErrorCode(status, body)` 拿 `errorDetail(body)` 的**产物**去跑
+     * `isQuotaExceededError` / `isContextWindowExceededError` 正则。
+     * 无条件把 detail 计入产物时，**纯展示改进变成行为变更**：
+     *
+     * | 报文 | 只算既有腿 | 加上 detail 腿 |
+     * |---|---|---|
+     * | `{"message":"bad request","detail":"insufficient quota"}` | `INVALID_REQUEST` | **`QUOTA_EXCEEDED`** |
+     * | `{"message":"bad request","detail":"prompt is too long for this model"}` | `INVALID_REQUEST` | **`CONTEXT_WINDOW_EXCEEDED`** |
+     *
+     * 后者还会**触发 DSH 的上下文溢出压缩**、改变重试与换号行为。
+     *
+     * ⚠️ **这个回归原本零守卫**：我加 A1 的 3 条用例时只断言 `errorDetail` 的
+     * **返回值**，没有一条锁**分类结果** ⇒ 把 `httpErrorCode` 的输入换回含 detail
+     * 的产物时，全量测试**一条都不红**（实测）。
+     *
+     * ## 修法（两条出口分开）
+     *
+     * `errorDetail`（**展示**，含 detail）／`errorDetailForClassify`（**分类**，不含）
+     * ——两条出口**共用同一个 `errorDetailImpl`**，不各写一份（首条红线）。
+     * 分类调用点只有 `llm-adapter.ts` 的**两处**：`httpErrorCode` 与 4xx 额度判据。
+     */
+    it('★★ 分类出口找不到 detail 字段、展示出口找得到（两条出口的差就是这一条腿）', () => {
+      const body = JSON.stringify({ message: 'bad request', detail: 'insufficient quota' })
+      // 展示出口：含 detail（用户看得到真实原因）。
+      expect(errorDetail(body)).toBe('bad request insufficient quota')
+      // 分类出口：**不含** detail（判据输入与「加腿之前」逐字节相同）。
+      expect(errorDetailForClassify(body)).toBe('bad request')
+    })
+
+    it('★★ 行为面：detail 里的额度措辞**不得**翻转 codearts 的错误码（本回归的守卫）', async () => {
+      // ⚠️ 这条是**行为级**（走 `stream()` → 真实 `httpErrorCode`），
+      // 不是「返回值断言」—— 后者测不到分类。**这就是审计指出的守卫缺口。**
+      // ⚠️ 选例必须**避开**「原始 body 已命中额度」的那些措辞 —— 4xx 分支里
+      // `isSseQuotaExhaustedErrorCode(errorDetailForClassify(body), rawBody)`
+      // 的**第二参是原始 body**（既有行为，与 detail 腿无关），
+      // `insufficient quota` 那种会被它先接走 ⇒ 测不出 detail 腿的影响。
+      // 下面这些**只**能靠 `httpErrorCode` 里的 `isQuotaExceededError(detail)`
+      // / `isContextWindowExceededError(detail)` 命中 ⇒ 它们才是回归的触发形态。
+      const grid: Array<[string, string]> = [
+        // [detail 文本, 期望的码（修复后 = 与加 detail 腿之前一致）]
+        ['out of credits', 'INVALID_REQUEST'],
+        ['insufficient balance', 'INVALID_REQUEST'],
+        ['quota exceeded', 'INVALID_REQUEST'],
+        ['prompt is too long for this model', 'INVALID_REQUEST'],
+        ['maximum context length exceeded', 'INVALID_REQUEST'],
+      ]
+      for (const [detailText, expected] of grid) {
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+          if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          // 既有腿**非空**（`message`）+ detail 含敏感措辞 —— 这正是回归的触发形态。
+          return new Response(
+            JSON.stringify({ message: 'bad request', detail: detailText }),
+            { status: 400, headers: { 'content-type': 'application/json' } },
+          )
+        })
+        let thrown: unknown
+        try {
+          for await (const _ of makeAdapter({ fetchImpl }).stream(streamOptions)) { /* 不应产出 */ }
+        } catch (error) {
+          thrown = error
+        }
+        expect((thrown as LlmError).code, `detail=${detailText}`).toBe(expected)
+      }
+    })
+
+    it('★★ 第二处分类点：4xx 额度判据也不得被 detail 的**码值腿**（4291）翻转', async () => {
+      // ⚠️ 这个站点比上一处**更隐蔽**，第一版守卫漏了它（变异实测：把
+      // `errorDetailForClassify` 换回 `errorDetail` 后，上面那条行为用例**仍绿**）——
+      // 因为 `isSseQuotaExhaustedErrorCode(code, message)` 的**第二参是原始 body**
+      // （既有行为），文案腿「insufficient quota」**本就**看得到 detail ⇒ 测不出差别。
+      //
+      // 真正会被 detail 腿翻转的是**码值腿**（`code.includes('4291')`）：
+      // detail 里出现 `InferHub.4291.200` 时，展示出口的产物含 `4291` ⇒ 判额度；
+      // 分类出口不含 ⇒ 报文落回 `INVALID_REQUEST`（= 加 detail 腿之前的行为）。
+      //
+      // 实测（`scripts/tmp-check-site2.mts` 的对照，已固化到本用例）：
+      //   `{"message":"bad request","detail":"InferHub.4291.200"}`
+      //     展示出口命中 = true   分类出口命中 = false   ⇒ ★ 被翻转
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+          return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        return new Response(
+          JSON.stringify({ message: 'bad request', detail: 'InferHub.4291.200' }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        )
+      })
+      let thrown: unknown
+      try {
+        for await (const _ of makeAdapter({ fetchImpl }).stream(streamOptions)) { /* 不应产出 */ }
+      } catch (error) {
+        thrown = error
+      }
+      // 期望「与加 detail 腿之前一致」⇒ 400 兜底成 INVALID_REQUEST。
+      // ⚠️ **不要**把它期望成 QUOTA_EXCEEDED —— 那正是本回归的形态。
+      expect((thrown as LlmError).code).toBe('INVALID_REQUEST')
+    })
+
+    it('★ 对照：既有腿上**本来就有**额度语义时仍归额度（分类出口不得把既有腿也丢）', async () => {
+      // 反向守卫：修分类出口时若图省事「凡有 detail 就不判额度」或把既有腿一起丢，
+      // `{"error":{"code":"insufficient_quota"}}` 这类报文会从额度**掉回**
+      // `INVALID_REQUEST` —— 那是比原缺陷更糟的回退。
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+          return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        return new Response(
+          JSON.stringify({ error: { code: 'insufficient_quota' }, detail: 'noise' }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        )
+      })
+      let thrown: unknown
+      try {
+        for await (const _ of makeAdapter({ fetchImpl }).stream(streamOptions)) { /* 不应产出 */ }
+      } catch (error) {
+        thrown = error
+      }
+      expect((thrown as LlmError).code).toBe('QUOTA_EXCEEDED')
+    })
+  })
+
+  /**
+   * ★ **benefit 去头重试的 4xx 通道**（Gitee issue IKLBSH A6）。
+   *
+   * 同一个上游条件（该账号没有 benefit 免费额度包）走**两条**通道下发：
+   * SSE 200（已接）与 HTTP **4xx**（修复前**未接**）。后者会径直落到
+   * `httpErrorCode` 归成 `INVALID_REQUEST` 抛出，**去头重试一次也不试** ——
+   * 「同一条件下 SSE 能自愈、4xx 却硬报错」，即本仓库首条红线
+   *「同一语义两套判据」的形态。
+   *
+   * ⚠️ **该缺陷由既有分支显式锁定过**：`origin/issue/IKJOF7-benefit-diagnostics`
+   *（2026-10-05 取证提交）用 `it.fails` 写了「HTTP 4xx + 正文含
+   * `InferHub.4004.200` 时也应当去头重试」，当时的结论是「已确认，但本分支不修」。
+   *
+   * ⚠️ **不去采纳 issue 建议的「1s/2s/3s 退避重试最多 3 次」**：issue 自己给的
+   * 证据是「去掉请求头后密集取样 9 次全部 200」—— 那证明的正是**去头即通**，
+   * 而非「需要多次退避」；且 `benefitHeaderDropped` 的既有语义写明「只试一次，
+   * 避免与真实失败互相掩盖」。按证据改，不按建议改。
+   */
+  describe('★ benefit 去头重试必须接上 4xx 通道（issue IKLBSH A6）', () => {
+    it('★ 4xx + InferHub.4004.200：去头重试一次并成功（修复前直接抛 INVALID_REQUEST）', async () => {
+      setBenefitMemoryCache([]) // 只走静态兜底集合 ⇒ deepseek-v4.1-flash 是 benefit 模型
+      try {
+        const seen: Array<string | null> = []
+        let chatCalls = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          chatCalls += 1
+          const maasType = new Headers(init?.headers).get('maas_type')
+          seen.push(maasType)
+          if (maasType !== null) {
+            // 第一次（带头）：服务端以 **4xx** 下发同一个 benefit-not-found 码。
+            return new Response(
+              JSON.stringify({ error_code: 'InferHub.4004.200', error_msg: 'benefit not found' }),
+              { status: 400, headers: { 'content-type': 'application/json' } },
+            )
+          }
+          // 第二次（去头）：正常出流 —— 与 issue 的「去头后密集取样 9 次全部 200」一致。
+          return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        const texts: string[] = []
+        for await (const chunk of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) {
+          if (chunk.type === 'text-delta') texts.push(chunk.text)
+        }
+        // ① 真的产出了内容（= 去头重试生效）；
+        expect(texts).toEqual(['ok'])
+        // ② 恰好两次请求，且第一次带头、第二次**不带**头；
+        expect(seen).toEqual(['benefit', null])
+        // ③ **只去头一次**：不得因两条通道各试一次而放大成三轮。
+        expect(chatCalls).toBe(2)
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★ 对照：非 benefit 模型上同一报文**不得**触发去头重试（判据不许放宽）', async () => {
+      // `isBenefitModel` 前置条件是**有意**的：去掉它会把任何来源的同名码
+      // 都变成可重试（IKJOF7 的建议 1 未被采纳的理由即此）。
+      setBenefitMemoryCache([])
+      try {
+        let chatCalls = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          chatCalls += 1
+          // 无后缀 deepseek-v4-flash 是**非 benefit** 模型：恒不带 maas_type。
+          expect(new Headers(init?.headers).get('maas_type')).toBeNull()
+          return new Response(
+            JSON.stringify({ error_code: 'InferHub.4004.200', error_msg: 'benefit not found' }),
+            { status: 400, headers: { 'content-type': 'application/json' } },
+          )
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        let thrown: unknown
+        try {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4-flash' } as never)) { /* 不应产出 */ }
+        } catch (error) {
+          thrown = error
+        }
+        // 如实抛出（不被「去头重试」吞掉），且**只有一次**请求。
+        expect((thrown as LlmError).code).toBe('INVALID_REQUEST')
+        expect(chatCalls).toBe(1)
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★ 对照：4xx 报文**不含**该码时不得触发去头重试（判据不得放宽成「凡 4xx 都重试」）', async () => {
+      setBenefitMemoryCache([])
+      try {
+        let chatCalls = 0
+        const maasTypes: Array<string | null> = []
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          chatCalls += 1
+          maasTypes.push(new Headers(init?.headers).get('maas_type'))
+          // 另一个 400：同样带 benefit 头，但**不是** benefit-not-found。
+          return new Response(
+            JSON.stringify({ error_code: 'InferHub.002002009.404', error_msg: 'model is not registered' }),
+            { status: 400, headers: { 'content-type': 'application/json' } },
+          )
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        try {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) { /* 不应产出 */ }
+        } catch { /* 抛错即可 */ }
+        expect(maasTypes).toEqual(['benefit'])
+        expect(chatCalls).toBe(1)
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★ SSE 200 通道的既有行为不变（本次只加 4xx 那条腿）', async () => {
+      // 回归守卫：SSE 形态（HTTP 200 + 内嵌 error_code）原先就能去头重试，
+      // 改动后必须仍然如此（且同样只去头一次）。
+      setBenefitMemoryCache([])
+      try {
+        const seen: Array<string | null> = []
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          const maasType = new Headers(init?.headers).get('maas_type')
+          seen.push(maasType)
+          if (maasType !== null) {
+            return new Response(
+              'data:{"text":"[DONE]","error_code":"InferHub.4004.200","error_msg":"benefit not found"}\n\n',
+              { status: 200, headers: { 'content-type': 'text/event-stream' } },
+            )
+          }
+          return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        const texts: string[] = []
+        for await (const chunk of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) {
+          if (chunk.type === 'text-delta') texts.push(chunk.text)
+        }
+        expect(texts).toEqual(['ok'])
+        expect(seen).toEqual(['benefit', null])
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
     })
   })
 })

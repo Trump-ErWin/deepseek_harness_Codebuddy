@@ -258,6 +258,42 @@ describe('轮换：认证与形状门禁', () => {
     expect(warns.join()).toContain('session id')
   })
 
+  /**
+   * ★★ **FreeTierError 的错误码绝不能取 `AUTH`**（Gitee issue IKLBSH）。
+   *
+   * `AUTH` 会让 DSH 客户端**丢弃本条 message、换成固定文案「API 密钥无效」**
+   *（`dsh-client-ui-chat/lib/client.js` 的 `failureMessage`）。而本条文案恰好是
+   * **唯一**能指路的那句（「根因是 session id **形状**、换 key 或换出口都无效」）
+   * —— 换成「API 密钥无效」后用户会去换 key / 重新登录，**全是无效动作**。
+   *
+   * ⚠️ **有真实流量取证的缺陷**（`scripts/tmp-scan-iklbsh.mjs` 扫 866 个会话）：
+   * 两条真实 `turn/end` 失败事件的 code 就是 `AUTH`，message 正是本支路的
+   * `opencode: HTTP 403 — {"type":"error","error":{"type":"FreeTierError",…}}`
+   *（会话 `session-d7c80d34`，2026-10-02）—— 即该缺陷**在真实流量上发生过**。
+   *
+   * 修法与 `buddy` 的 `11140`（同样从 `AUTH` 改成 `PERMISSION_DENIED`）同款：
+   * ① 客户端不替换该码 ⇒ 文案完整送达；② `dead-model-store` 的 `IGNORED_CODES`
+   * 收它 ⇒ 模型不会被误记成下架 30 天；③ 它不在 `DEFAULT_RETRYABLE_CODES`
+   * 里 ⇒ 仍是「确定性、不白退避」，与「不重试也不换槽」的设计一致。
+   */
+  it('★★ FreeTierError 的错误码必须是 PERMISSION_DENIED，不能是 AUTH（否则文案被客户端吞掉）', async () => {
+    vi.stubGlobal('fetch', async () => new Response(
+      '{"type":"error","error":{"type":"FreeTierError","message":"OpenCode\'s free tier can only be used from within OpenCode"}}',
+      { status: 403 },
+    ))
+    const a = new OpencodeAdapter({
+      identitySlots: async () => [account('a', 'sk-a')],
+      markLimited: async () => {},
+    })
+    const error = await run(a).catch((e: unknown) => e as { code?: unknown; message?: unknown })
+    // ① 码不对就会吞文案 —— 这是本用例的主诉。
+    expect(error).toMatchObject({ code: 'PERMISSION_DENIED' })
+    expect(error.code).not.toBe('AUTH')
+    // ② 指路的文案必须还在（客户端对 `PERMISSION_DENIED` 原样透传 message）。
+    expect(String(error.message)).toContain('形状')
+    expect(String(error.message)).toContain('换 API key 或换出口都无效')
+  })
+
   it('⚠️ 认证失败且只有一个槽时直接透传（不报「所有通道均受限」）', async () => {
     // 匿名槽就是唯一一个：报「所有通道均受限 / QUOTA_EXCEEDED」会让用户
     // 以为要等额度恢复，而真实原因是这条通道没被接受。
