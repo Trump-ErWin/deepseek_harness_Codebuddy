@@ -107,6 +107,58 @@ describe('normalizeAccioFrame —— Accio 顶层帧 → 标准 Gemini candidate
       expect(out.candidates[0].content.parts[0].functionCall.args).toEqual({})
     })
   })
+
+  // ⚠️⚠️ 2026-10-13 真实缺陷（用户报障「accio 思考一下就中断」的根因）：
+  // 旧判据「无 content 一律 return undefined」把三类**有语义**的帧整帧丢弃 ——
+  // 顶层 function_call（task-6-report 逐字记录的真实形状，不带 content）、
+  // 终帧的 usage_metadata / finish_reason（工具轮次的终帧只有它们没有正文）。
+  // 运行时后果：模型思考完决定调工具 → 工具帧被丢 → 流里只剩思考 → 兜底 stop
+  // → 「思考一下就中断、无正文无工具、轮次显示正常完成」，且 usage 恒归零。
+  // 实测证据：session 35b01df3（accio/deepseek-v4-1-flash）13 轮静默 stop，
+  // 每轮思考结尾都是工具意图（"Let me call get_goal."）。
+  describe('⚠️⚠️ 无 content 但有语义的帧不得丢弃（2026-10-13 静默 stop 根因）', () => {
+    it('🔴 顶层 function_call（无 content 信封）⇒ 包成 candidates[0].content.parts（snake→camel）', () => {
+      const raw = { function_call: { id: 'call_c3a3', name: 'read_file' } }
+      const out = normalizeAccioFrame(raw) as any
+      expect(Array.isArray(out?.candidates)).toBe(true)
+      const parts = out.candidates[0].content.parts as any[]
+      expect(parts[0].functionCall).toEqual({ name: 'read_file', args: {} })
+    })
+
+    it('🔴 顶层 function_call 带 args_json 字符串 ⇒ 解析成 args 对象', () => {
+      const raw = { function_call: { id: 'c1', name: 'f', args_json: '{"path":"a"}' } }
+      const out = normalizeAccioFrame(raw) as any
+      expect(out.candidates[0].content.parts[0].functionCall.args).toEqual({ path: 'a' })
+    })
+
+    it('🔴 无 content 的终帧：finish_reason + usage_metadata 都必须保住', () => {
+      const raw = {
+        turn_complete: true,
+        finish_reason: 'MAX_TOKENS',
+        usage_metadata: { prompt_token_count: 10, candidates_token_count: 7, total_token_count: 17 },
+      }
+      const out = normalizeAccioFrame(raw) as any
+      // finish 必须挂在**非空** candidate 上（空 candidates 在读 finishReason 前就 return）
+      expect(out.candidates[0].finishReason).toBe('MAX_TOKENS')
+      expect(out.usageMetadata).toEqual({ promptTokenCount: 10, candidatesTokenCount: 7, totalTokenCount: 17 })
+    })
+
+    it('🔴 纯 usage 帧（无 finish）⇒ 空 candidates + usageMetadata（消费侧只记用量不算内容）', () => {
+      const raw = { usage_metadata: { prompt_token_count: 3, total_token_count: 5 } }
+      const out = normalizeAccioFrame(raw) as any
+      expect(out.candidates).toEqual([])
+      expect(out.usageMetadata).toEqual({ promptTokenCount: 3, totalTokenCount: 5 })
+    })
+
+    it('🔴 无 content 且无任何语义字段 ⇒ 仍返回 undefined（真无用帧不编造）', () => {
+      expect(normalizeAccioFrame({ turn_complete: true })).toBeUndefined()
+      expect(normalizeAccioFrame({ partial: true })).toBeUndefined()
+    })
+
+    it('🔴 顶层 function_call 无 name ⇒ 仍丢弃（与 content.parts 内的判据同口径）', () => {
+      expect(normalizeAccioFrame({ function_call: { args_json: '{}' } })).toBeUndefined()
+    })
+  })
 })
 
 describe('serializeAccioMessages', () => {
@@ -352,5 +404,124 @@ describe('consumeAccioSse —— 归一化后交给共享消费器', () => {
     // ⚠️ 措辞如实：改写层会裁掉行尾的 `\r`，所以是「原样发回」而非「逐字透传」。
     expect(await rewritten).toContain(': keep-alive')
     expect(await rewritten).toContain('event: ping')
+  })
+
+  // ⚠️⚠️ 2026-10-13 真实缺陷的**端到端**回归（session 35b01df3 的真实形状）：
+  // 思考（content.parts 里的 thought）→ 顶层 function_call 分片（**无 content 信封**，
+  // task-6-report 逐字记录的 frame#8/#9/#10 形状）→ 无 content 的终帧。
+  // 修复前：工具帧与终帧全被归一化层丢弃 ⇒ 流里只剩思考 ⇒ 兜底 stop ⇒
+  // 「思考一下就中断」，usage 全零、无工具调用、轮次显示正常完成。
+  // ⚠️ 走**完整管线**（先 accioToolCallMergeTransform 合并、再归一化消费）：
+  // 顶层 function_call 分片必须被合并成恰好一个调用 —— 只测归一化层会看到
+  // 2 个块（合并不在那一层），那不是真实链路。
+  it('🔴 端到端：思考 → 顶层 function_call 分片 → 终帧 ⇒ 必须产出工具调用 + 真实 usage + tool-calls 收尾', async () => {
+    const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+    const merged = sseStream([
+      'data: {"content":{"role":"model","parts":[{"text":"Let me call get_goal.","thought":true}]},"partial":true}\n',
+      'data: {"function_call":{"id":"call_c3a3","name":"get_goal"}}\n',
+      'data: {"function_call":{"id":"call_c3a3","name":"get_goal","args_json":"{}"}}\n',
+      'data: {"turn_complete":true,"finish_reason":"stop","usage_metadata":{"prompt_token_count":100,"candidates_token_count":50,"thoughts_token_count":30,"total_token_count":150}}\n',
+      'data: [DONE]\n',
+    ]).pipeThrough(accioToolCallMergeTransform())
+    const chunks = []
+    for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+
+    // 思考块必须在（不被工具帧吞掉）
+    const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join('')
+    expect(reasoning).toBe('Let me call get_goal.')
+    // 工具调用必须在，且分片合并成**恰好一个**块
+    const calls = chunks.filter((c) => c.type === 'block-end' && c.block.type === 'tool-call')
+    expect(calls.length).toBe(1)
+    expect((calls[0]!.block as { name: string }).name).toBe('get_goal')
+    // 终帧的 usage 必须真实到达（修复前恒为 {0,0}）
+    const usage = chunks.find((c) => c.type === 'usage')
+    expect(usage?.usage.inputTokens).toBe(100)
+    expect(usage?.usage.outputTokens).toBe(50)
+    expect(usage?.usage.reasoningTokens).toBe(30)
+    // finish 必须是 tool-calls（修复前是兜底 stop）
+    const finish = chunks.find((c) => c.type === 'finish')
+    expect((finish as { reason?: { kind?: string } })?.reason?.kind).toBe('tool-calls')
+  })
+
+  it('🔴 端到端：无 content 的 MAX_TOKENS 终帧 ⇒ finish 必须是 max-tokens（不得伪装成 stop）', async () => {
+    const chunks = []
+    for await (const c of consumeAccioSse({
+      body: sseStream([
+        'data: {"content":{"role":"model","parts":[{"text":"想想","thought":true}]},"partial":true}\n',
+        'data: {"turn_complete":true,"finish_reason":"MAX_TOKENS","usage_metadata":{"prompt_token_count":10,"candidates_token_count":64,"total_token_count":74}}\n',
+        'data: [DONE]\n',
+      ]),
+    })) chunks.push(c)
+
+    const finish = chunks.find((c) => c.type === 'finish')
+    expect((finish as { reason?: { kind?: string } })?.reason?.kind).toBe('max-tokens')
+  })
+
+  // ⚠️⚠️ 2026-10-13 深夜 wire 探针定罪的**双重丢失**（第一轮修复后仍复发的那条）：
+  //
+  // 上游真实形状（probe-wire-frames 抓的 frame#13/#14）：终帧把**最后一个
+  // function_call 分片**与 `turn_complete`/`usage_metadata`/`finish_reason` 放在
+  // **同一帧**，且整条流**没有 `[DONE]`**。两处缺陷叠加：
+  //
+  // 1. **合并层吞元数据**：`accioToolCallMergeTransform` 把带 function_call 的
+  //    终帧吸收进 pending 缓冲，flush 只吐工具 part ⇒ usage/finish 丢失；
+  // 2. **归一化层 flush 裸透尾行**：合并层 flush 产物**不带尾换行** ⇒
+  //    `consumeAccioSse` 的 transform 把它留在 buffer ⇒ flush 原样吐出
+  //    **未归一化**的顶层帧 ⇒ `consumeGeminiSse` 当纯 usageMetadata 帧 ⇒
+  //    工具调用/usage/finish 全丢。
+  //
+  // 复合症状 = 用户报障「思考一下就中断」：思考正常、无工具调用、usage 全零、
+  // finish 兜底 stop、轮次显示正常完成。
+  describe('⚠️⚠️ 终帧与最后一个工具分片同帧 + 流无 [DONE]（wire 实测形状）', () => {
+    /** 复刻 wire 探针抓到的真实帧序列（截短 raw_response_json）。 */
+    const realWireLines = [
+      'data: {"content":{"role":"model","parts":[{"text":"Use","thought":true}]},"partial":true}\n',
+      'data: {"content":{"role":"model","parts":[{"text":" the","thought":true}]},"partial":true}\n',
+      'data: {"content":{"role":"model","parts":[{"text":" tool.","thought":true}]},"partial":true}\n',
+      'data: {"content":{"role":"model","parts":[{"function_call":{"id":"call_00","name":"get_current_time"}}]},"partial":true}\n',
+      // ⚠️ 终帧：最后一个分片 + 元数据同帧，且**没有后续 [DONE]**（真实流如此）
+      'data: {"content":{"role":"model","parts":[{"function_call":{"id":"call_00","name":"get_current_time","args_json":"{}"}}]},"turn_complete":true,"usage_metadata":{"prompt_token_count":301,"candidates_token_count":36,"total_token_count":337,"thoughts_token_count":13},"finish_reason":"STOP"}\n',
+    ]
+
+    it('🔴 完整管线：工具调用 + 真实 usage + tool-calls 收尾（终帧元数据不得被合并缓冲吞掉）', async () => {
+      const { accioToolCallMergeTransform } = await import('../../src/accio-adapter.js')
+      const merged = sseStream(realWireLines).pipeThrough(accioToolCallMergeTransform())
+      const chunks = []
+      for await (const c of consumeAccioSse({ body: merged })) chunks.push(c)
+
+      const calls = chunks.filter((c) => c.type === 'block-end' && c.block.type === 'tool-call')
+      expect(calls.length).toBe(1)
+      expect((calls[0]!.block as { name: string }).name).toBe('get_current_time')
+      const usage = chunks.find((c) => c.type === 'usage')
+      expect(usage?.usage.inputTokens).toBe(301)
+      expect(usage?.usage.outputTokens).toBe(36)
+      expect(usage?.usage.reasoningTokens).toBe(13)
+      const finish = chunks.find((c) => c.type === 'finish')
+      expect((finish as { reason?: { kind?: string } })?.reason?.kind).toBe('tool-calls')
+    })
+
+    it('🔴 归一化层 flush 不得裸透尾行（无 [DONE] 的流，尾行必须照常归一化）', async () => {
+      // 不走合并层，直接喂归一化层：终帧是**最后一行且无尾换行**，
+      // transform 会把它留在 buffer —— flush 必须对它跑同一条归一化路径。
+      const enc = new TextEncoder()
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(enc.encode(
+            'data: {"content":{"role":"model","parts":[{"text":"想想","thought":true}]},"partial":true}\n'
+            // ⚠️ 无换行结尾：模拟合并层 flush 产物 / 上游不带 [DONE] 的收尾
+            + 'data: {"content":{"role":"model"},"turn_complete":true,"usage_metadata":{"prompt_token_count":5,"candidates_token_count":2,"total_token_count":7},"finish_reason":"STOP"}',
+          ))
+          controller.close()
+        },
+      })
+      const chunks = []
+      for await (const c of consumeAccioSse({ body })) chunks.push(c)
+
+      const usage = chunks.find((c) => c.type === 'usage')
+      expect(usage?.usage.inputTokens).toBe(5)
+      expect(usage?.usage.outputTokens).toBe(2)
+      const finish = chunks.find((c) => c.type === 'finish')
+      expect((finish as { reason?: { kind?: string } })?.reason?.kind).toBe('stop')
+    })
   })
 })

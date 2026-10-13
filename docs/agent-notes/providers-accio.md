@@ -319,6 +319,72 @@ parametersJson: JSON.stringify(fn.parameters ?? { type: 'object', properties: {}
   `accioToolCallMergeTransform`。E2E 探针 `test:e2e:accio-tools` 专门断言
   「同一个 id **恰好一个块**且参数**非空**」。
 
+### 4.4.0 ⚠️⚠️⚠️ 「思考一下就中断」：终帧被管线**双重丢失**（2026-10-13 深夜 wire 探针定罪）
+
+> **用户报障「accio 思考一下就中断」（DSH 直连与 ZCode 双侧复现）的根因。**
+> 症状：模型思考一段后轮次**显示正常完成**（`completed`），无正文、无工具调用、
+> 无任何报错，usage 全零。用户反复发「继续」也救不回来。
+> 第一轮修复（顶层 `function_call` / 无 `content` 终帧）上线后**仍复发**——
+> wire 探针（`.tmp-accio/probe-wire-frames.mjs`，三格：无工具 / 1 工具 / 73 工具）
+> 抓到原始帧才定罪：**工具帧与终帧其实都到了**，是管线内部把它们丢了。
+
+#### wire 实测的真实帧形状（与此前所有推断的关键差异）
+
+1. **`function_call` 在 `content.parts` 里**（不是顶层）——frame#13
+   `{content:{parts:[{function_call:{id,name}}]}}`，frame#14 补 `args_json`。
+   之前「顶层 function_call」的假设**不成立**（第一轮修的分支无害但非根因）。
+2. **终帧把最后一个工具分片与元数据放在同一帧**：frame#14 =
+   `{content:{parts:[{function_call:{…,args_json}}]}, turn_complete:true,
+   usage_metadata:{…}, finish_reason:"STOP"}`。
+3. **流没有 `[DONE]`**，终帧就是最后一行（带换行）。
+4. 纯文本轮次的终帧是 `{content:{role:"model"}}`（**有 content 无 parts**）。
+
+#### 双重丢失链（两处缺陷叠加，缺一都修不好）
+
+```
+终帧（最后一个分片 + usage/finish 同帧）
+  → ① 合并层 accioToolCallMergeTransform：看到 function_call 就吸收进 pending，
+    flush 只吐工具 part ⇒ usage/finish 元数据被吞
+  → ② 归一化层 consumeAccioSse 的 flush：合并层产物不带尾换行 ⇒ transform
+    把尾行留在 buffer ⇒ flush 原样裸透（不归一化）⇒ consumeGeminiSse 收到
+    无 candidates 的顶层帧 ⇒ 当纯 usageMetadata 帧 ⇒ 工具/usage/finish 全丢
+  → 流里只剩思考 ⇒ mapGeminiFinish(undefined, 0) 兜底 stop ⇒ 轮次「正常完成」
+```
+
+#### 修法（两处必须一起改）
+
+1. **合并层**：吸收工具 part 时把帧上的 `turn_complete`/`usage_metadata`/
+   `finish_reason` 暂存（`frameMetaOf` 只抽这三键，不透传整帧——`raw_response_json`
+   体积大且无关）；flush 时拼进合并帧（与上游原形一致）。多帧带元数据时后者覆盖
+   （终帧 usage 是最终值，与消费侧「取最大 total」语义一致）。
+2. **归一化层**：`flush` 的尾行必须走**同一条 `processLine` 归一化路径**，
+   绝不裸透传。错误帧判据与归一化抽成 `processLine` 共享（transform 与 flush
+   共用，`pendingError` 提到外层）。
+
+#### 验证
+
+- **真实 wire 帧驱动完整管线**（`.tmp-accio/wire-*.txt` 三格）：修复前
+  工具 0 块 / usage 全零 / 兜底 stop；修复后 1 工具块 + 真实 usage
+  （input 301 / output 36 / reasoning 13）+ `tool-calls`；纯文本两格拿到
+  真实 usage + 正常 stop。
+- 回归测试 `tests/unit/accio-messages.spec.ts`（「终帧与最后一个工具分片同帧 +
+  流无 [DONE]」组 2 条）；反向验证：回退两处修复 ⇒ 恰好 2 条变红。
+- 全量 323 文件 / 7909 passed。
+
+#### ⚠️⚠️ 方法论教训（比第一轮的教训更狠）
+
+- **「会话日志只存插件产出后的 StreamChunk」意味着：推断「帧没到」与「帧到了
+  被丢」在日志里**同形**——必须抓 wire 帧才能分辨。第一轮修复基于「usage 全零
+  ⇒ 终帧没到」的推断，方向就错了**一半**（终帧到了，死在合并缓冲里）。
+- **修完必须用真实流量回归**：第一轮修复全量测试 7907 绿、反向验证过，
+  但测试喂的都是**自造帧**（带 `[DONE]`、终帧不带工具分片）——真实形状
+  （无 `[DONE]`、分片与元数据同帧）一条用例都没覆盖。**自造帧永远要对着
+  wire 抓包核对一遍。**
+- **TransformStream 的 flush 是独立代码路径**：transform 处理「完整行」，
+  flush 处理「尾行」——两条路径必须跑**同一个**处理函数，否则尾行行为分叉
+  （本例：尾行不归一化）。写任何行缓冲 TransformStream 时先问一句：
+  「flush 里的尾行走的路径与 transform 一致吗？」
+
 ### 4.4.1 ⚠️⚠️ 档位**真实生效**，但思考**关不掉**（2026-10-13 大修）
 
 > **本节原先的结论「四类字段全部无效 ⇒ 目录里不声明任何档位」已被推翻一半。**
