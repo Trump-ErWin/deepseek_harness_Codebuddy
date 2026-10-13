@@ -438,6 +438,40 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
   `tests/unit/llm-adapter.spec.ts`（v4.1 带 `maas_type` 且参与签名、无后缀
   v4-flash 不带）、`tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
 
+### ⚠️⚠️ `InferHub.4004.200` 有**两条下发通道**，只接一条 = 两套判据（Issue IKLBSH A6）
+
+同一个上游条件（该账号没有 benefit 包）走两条通道，**修复前只接了 SSE 那条**：
+
+| 通道 | 形态 | 修复前 |
+|---|---|---|
+| SSE | HTTP **200** + `{error_code:"InferHub.4004.200",…}` | ✅ `consumeSse` 抛 `BENEFIT_NOT_FOUND_CODE` → 去头重试 |
+| HTTP | **4xx** + 同一码 | ❌ **未接** → 径直落 `httpErrorCode` 归 `INVALID_REQUEST` 抛出，**去头一次也不试** |
+
+症状：**同一条件下 SSE 能自愈、4xx 却硬报错** —— 即「同一语义两套判据」。
+
+⚠️ **该缺陷由既有分支显式锁定过**：`origin/issue/IKJOF7-benefit-diagnostics`
+（2026-10-05，Gitee IKJOF7 取证提交）用 `it.fails` 写了
+「HTTP 4xx + 正文含 `InferHub.4004.200` 时也应当去头重试」，当时的结论是
+**「已确认，但本分支不修」**（该提交只做了可观测性）。现已补上那一半。
+
+**修法**：`isBenefitNotFoundBody(body)`（`src/llm-adapter.ts`）在 4xx 分支里
+**复用同一个码值常量**与**同一个 `benefitHeaderDropped` 门禁**（只去头一次）——
+两条通道共享标记，故叠加也**不会**放大成两轮请求。
+
+⚠️ **不去采纳 issue 建议的「1s / 2s / 3s 递增退避重试最多 3 次」**：issue 给的
+证据是「去掉请求头后密集取样 9 次全部 200」—— 那证明的正是**去头即通**，
+而不是「需要多次退避」；且 `benefitHeaderDropped` 的既有语义写明「只试一次，
+避免与真实失败互相掩盖」。**按证据改，不按建议改。**
+
+⚠️ **4xx 分支的处理顺序不能挪**（`stream()` 的 HTTP 非 2xx 分支）：
+鉴权刷新 → **额度** → **benefit 4xx** → 限流换号 → 排队探测 → `httpErrorCode`。
+benefit 那条必须排在**限流之前**（否则被 `isRateLimited` 截走当可重试），
+且必须在**额度判据之后**（`4004` 与 `4291` 是两个码，互不混淆但顺序仍锚定）。
+
+回归用例：`tests/unit/llm-adapter.spec.ts` 的
+「★ benefit 去头重试必须接上 4xx 通道」（4 条：主用例 + 非 benefit 模型对照 +
+报文不含该码对照 + SSE 通道既有行为不变）。
+
 ## ⚠⚠️ 腾讯系内容级风控：system 里的客户端模板句会被**整轮拦死**（Issue IKJNA1）
 
 **用户报障**（Gitee issue IKJNA1，2026-10-04）：ZCode 经本机 OpenAI 网关调

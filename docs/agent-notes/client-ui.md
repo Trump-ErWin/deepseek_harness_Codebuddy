@@ -412,6 +412,106 @@ JSON，**整段 JSON 里也含该短语** ⇒ 额度判据照样命中 ⇒ 用�
 **结论**：将来若真在 codearts 上抓到地域封锁报文，**按实测再加**；
 现在加是凭空的，且会长期维护一张无依据且与别家相反的表。
 
+### ⚠️⚠️ **错误码取 `AUTH` 会连 message 一起吞掉**（Issue IKLBSH，第二次复发）
+
+上面的 `failureMessage` 铁律在 opencode 上**又犯了一次**，且这次有**真实报文**：
+
+| | 取值 | 用户看到 |
+|---|---|---|
+| 修前 | `'AUTH'` | 「**API 密钥无效**」+ **报文与指路文案全丢** |
+| 修后 | `'PERMISSION_DENIED'` | 完整文案（「根因是 session id **形状**、换 key 或换出口都无效」）|
+
+**取证**（`scripts/scan-error-corpus.mjs` 扫 868 个真实会话的真实失败面）：
+两条 `turn/end` 失败事件的 `code` 就是 `AUTH`，message 逐字是
+```
+opencode: HTTP 403 — {"type":"error","error":{"type":"FreeTierError",
+            "message":"Error from provider (Console): OpenCode's free tier
+            can only be used from within OpenCode"}}
+```
+（会话 `session-d7c80d34`，2026-10-02）⇒ 该缺陷**在真实流量上发生过**。
+
+⚠️ **这不是孤例，是复发形态**：`buddy` 的 `11140`（2026-09-27）从 `AUTH`
+改成 `PERMISSION_DENIED` 时，`buddy-adapter.ts` 的注释里就已逐字记下同一条
+`failureMessage` 判据。**下次接新 provider 时，凡「文案本身就是出路」的错误
+（形状门禁 / 账号级拦截 / 需要用户做非登录动作的），码一律避开
+`AUTH` / `QUOTA` / `ACCOUNT_QUOTA` 三个。** 判据可复用
+`dead-model-store` 的 `IGNORED_CODES`（`AUTH` / `QUOTA_EXCEEDED` / `RATE_LIMIT` /
+`MISSING_CREDENTIAL` / `PERMISSION_DENIED`）—— 它是「与模型是否存在无关」
+的白名单，正好覆盖这类错误。
+
+⚠️ **`PERMISSION_DENIED` 不在 `DEFAULT_RETRYABLE_CODES` 里**（该集合是
+`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`）⇒ 改成它
+**不会**引入「白退避 5 次」的回退 —— 这是选它而不选 `SERVER` 的理由。
+
+⚠️ **本条追认 A4（「非凭据 401/403 一律判 AUTH」）**：它与 `codearts` 的**地域
+marker 表**是两件事 ——
+
+| A4 的两半 | 取证结论 |
+|---|---|
+| 「非凭据 401/403 → `AUTH` → 客户端吞文案」的**机制** | ✅ **真实存在**，有真实报文（上表；opencode 已修）|
+| issue 建议的 `isNonCredentialDenial` + 地域 marker 表 | ❌ **无实测支撑**，见上一节，**维持撤回** |
+
+⚠️ **`buddy-adapter.ts` 的通用 403 出口仍会产出 `AUTH`**（`httpErrorCode` 的
+`401 || 403 → AUTH`）。该出口在**换号耗尽**且最后一次不是 11140 形态时可达
+⇒ 同样吞文案。**但我没有真实报文**（真实失败面里 `buddy`/`workbuddy` 的 403
+**全部**是 11140 形态）⇒ **只登记、不据推断改**（`AGENTS.md` 的既有纪律：
+没有实测报文就不改分类）。
+
+### ⚠️ **`errorDetail` 要认 `detail` 字段**（Issue IKLBSH A1）
+
+上游代理（如包装成 `acp-proxy failure` 的那类）把异常包成
+`{"error":"<摘要>","detail":"<真实原因>"}`：只读 `error` 会只剩**没有信息量的
+摘要**，真正的原因（连接超时 / 鉴权细节）全在 `detail` 里。
+
+⚠️ **本仓库有 6 份同义的 `errorDetail`**（`openai-compat` / `llm-adapter` /
+`buddy-adapter` / `lobsterai-adapter` / `trae-adapter` / `accio-adapter`）。
+6 份各写一条判据必然漂移，故该腿**只留一份实现**
+（`openai-compat.ts` 的 `detailFieldText`），其余 5 份 import 它。
+
+⚠️ **证据强度如实标注（两轮审计独立复核后修订）**：868 会话 / 190 条真实失败面
+里 `"detail"` **零命中**；全文命中逐条查证**全部**是 JSON Schema 的
+`description` 字段与源码讨论窗口。⇒ 定性是「**结构上可达、零实测**」，
+**不是**「真实存在」。我原本的旁证「harness 的 `providerErrorDetail` 也产出该
+字段」**被审计证伪** —— 它只在 `DeepSeekFilesError` 那条路上产出，与 HTTP 错误体
+不是同一数据面。**别把它写成「已实测」**。
+
+#### ⚠️⚠️ 展示出口与分类出口**必须分开**（真实净回归，两轮审计独立确证）
+
+「无条件加一条 detail 腿」会把**纯展示改进变成行为变更**：
+`httpErrorCode(status, body)` 拿 `errorDetail(body)` 的**产物**去跑
+`isQuotaExceededError` / `isContextWindowExceededError` 正则 ⇒
+
+| 报文 | 只算既有腿 | 加上 detail 腿 |
+|---|---|---|
+| `{"message":"bad request","detail":"out of credits"}` | `INVALID_REQUEST` | **`QUOTA_EXCEEDED`** |
+| `{"message":"bad request","detail":"prompt is too long for this model"}` | `INVALID_REQUEST` | **`CONTEXT_WINDOW_EXCEEDED`** |
+
+后者还会**触发 DSH 的上下文溢出压缩**、改变重试与换号行为。
+
+⇒ 修法：**两条出口** —— `errorDetail`（**展示**，含 detail）／
+`errorDetailForClassify`（**分类**，不含），两者**共用** `errorDetailImpl`
+（不各写一份，那是首条红线）。分类调用点**只有 `llm-adapter.ts` 的两处**：
+`httpErrorCode` 与 4xx 额度判据。
+
+⚠️ **该回归原本零守卫**：我加的 3 条 A1 用例只断言 `errorDetail` 的**返回值**，
+没有一条锁**分类结果** ⇒ 把分类输入换回含 detail 的产物时全量测试**一条都不红**
+（两轮审计各自实测确认）。⇒ 已补 2 条**行为级**分类守卫 + 1 条结构性扫描
+（`tests/unit/error-detail-wiring.spec.ts`）。
+
+⚠️ **第二处分类点比第一处更隐蔽**：`isSseQuotaExhaustedErrorCode(code, message)`
+的**第二参是原始 body**（既有行为），故文案腿「insufficient quota」**本就**
+看得到 detail ⇒ 用「额度措辞」的报文测它**测不出差别**。真正会被翻转的是
+**码值腿**（`4291`）：detail 里出现 `InferHub.4291.200` 时才翻转。
+（我第一版守卫在这里也漏了 —— 变异实测：换回展示出口后那条行为用例**仍绿**。）
+
+⚠️⚠️ **「接线了 6 处」≠「6 处都有守卫」**（对抗审计实测）：把 `detailFieldText`
+改成恒 `undefined` ⇒ 只红 3 条且**全在 `llm-adapter.spec.ts`**；`openai-compat`
+自己那份**零行为级守卫**（变异实测 0 条红）。⇒ 已补结构性扫描覆盖全部 6 处。
+
+⚠️ **为什么守卫用「计数 + 扫描」而非逐文件断言**：新增第 7 份 `errorDetail` 时
+新文件不在清单里 ⇒ **静默漏掉**。扫描 + 计数才能同时抓住「漏接一处」与
+「新增一份没接」。
+
 ## 模型黑名单（Jet Hub「显示列表」开关）
 
 同一 `jet-hub` 命名空间的 `disabledModels` 字段保存「被关闭的模型」，形如 `{ buddy: { 'glm-5.2': true } }`。要点：

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { autoBadgeName, expiryCountdownText, shortProviderName } from '../../plugin-src/client/badge-model.js'
 import { resolveAutoBadgeRewrite } from '../../src/auto-badge.js'
 
@@ -25,7 +26,15 @@ function makeState({
   };
 }
 
-const here = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
+/**
+ * 仓库根（源码级断言用）。
+ *
+ * ⚠️ **必须用 `fileURLToPath`，不能用 `URL.pathname`**（真实缺陷，Gitee issue
+ * IKLBSH A3）：`pathname` 对路径里的空格做百分号编码（`%20`），而原先的
+ * `replace(/^\/([A-Za-z]:)/, '$1')` 只修盘符、不修 `%20` ⇒ 含空格路径下
+ * `readFileSync` 恒 ENOENT，症状是**整份 spec 收集失败**。
+ */
+const here = fileURLToPath(new URL('.', import.meta.url))
 const read = (rel) => readFileSync(resolve(here, '../..', rel), 'utf8')
 
 /**

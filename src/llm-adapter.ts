@@ -14,6 +14,9 @@ import { nextUtc8DayStartMs } from './model-queue.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
+// ⚠️ `detailFieldText`（`detail` 那条腿）**只留一份实现** —— 本仓库 6 份同义的
+// `errorDetail` 各写一条判据必然漂移（见 `openai-compat.ts` 的注释，IKLBSH A1）。
+import { detailFieldText } from './openai-compat.js'
 import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import { planSessionTitleThinking } from './session-title.js'
 import type { CodeArtsCredential } from './types.js'
@@ -594,6 +597,41 @@ export function isSseQuotaExhaustedErrorCode(code: string, message: string): boo
 }
 
 /**
+ * HTTP **4xx** 报文里是否表示「该账号没有 benefit（免费额度）包」。
+ *
+ * ## 为什么需要它（Gitee issue IKLBSH A6）
+ *
+ * 同一个上游条件走**两条**通道下发：
+ *
+ * | 通道 | 形态 | 修复前 |
+ * |---|---|---|
+ * | SSE | HTTP 200 + `{error_code:"InferHub.4004.200", …}` | ✅ 已接（`consumeSse` 抛 `BENEFIT_NOT_FOUND_CODE`）|
+ * | HTTP | **4xx** + 同一码 | ❌ **未接** ⇒ 去头重试一次也不试，直接归 `INVALID_REQUEST` 抛出 |
+ *
+ * 「SSE 能自愈、4xx 却硬报错」＝同一个语义两套判据，正是本仓库首条红线的形态。
+ *
+ * ⚠️ **该缺陷已被独立锁定**：`origin/issue/IKJOF7-benefit-diagnostics` 分支
+ *（2026-10-05）用 `it.fails` 显式锁死了它（「HTTP 4xx + 正文含
+ * `InferHub.4004.200` 时也应当去头重试」），当时结论是「已确认，但本分支不修」。
+ *
+ * ⚠️ **判据复用同一个码值常量**（`CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE`），
+ * 不另写第二份 —— 与 SSE 通道的判据（`consumeSse` 的 `===` 比较）**同源**，
+ * 否则两条通道会在上游改码时分别漂移（这正是本缺陷的成因形态）。
+ *
+ * ⚠️ 与 {@link isSseQuotaExhaustedErrorCode} 的 `4291` **刻意不同**：那条腿用
+ * 子串是为了容忍 `InferHub.4291.xxx` 的其它尾号，而 `4004` 这一族里
+ * **没有证据**表明其它尾号是同一语义（`4004.200` 是实测唯一的 benefit 码）。
+ * 按证据收紧到**全等**：放宽成 `InferHub.4004.` 前缀会把该族里未知语义的
+ * 报文也变成可重试，属行为变更。将来真抓到别的尾号**再按实测放宽**。
+ *
+ * ⚠️ 不解析 JSON 而直接判原文：4xx 的报文形态与 SSE 不同（字段名可能不叫
+ * `error_code`），这正是上面那条注释记录的教训。
+ */
+export function isBenefitNotFoundBody(body: string): boolean {
+  return body.includes(CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE)
+}
+
+/**
  * 从错误体提取可分类的 detail 文本（OpenAI 风格 error 或 CodeArts error_code/error_msg）。
  *
  * ⚠️ **本次只「加腿」，且如实标注证据强度**：新增顶层字符串 `error` 一条。
@@ -623,8 +661,44 @@ export function isSseQuotaExhaustedErrorCode(code: string, message: string): boo
  * 即使字符串腿失效、函数退回整段 JSON，**整段 JSON 里也含该短语** ⇒
  * 额度判据照样命中 ⇒ 那是**假守卫**（实测确认过，第一版就是这么错的）。
  * 直接断言本函数的**返回值**才测得到那条腿。
+ *
+ * ## ⚠️⚠️ 本函数是**展示**出口；分类出口是 {@link errorDetailForClassify}
+ *
+ * 无条件把 `detail` 计入产物会**翻转错误码**（真实净回归，两轮审计独立确证）：
+ *
+ * | 报文 | 只算既有腿 | 加上 detail 腿 |
+ * |---|---|---|
+ * | `{"message":"bad request","detail":"insufficient quota"}` | `INVALID_REQUEST` | **`QUOTA_EXCEEDED`** |
+ * | `{"message":"bad request","detail":"prompt is too long for this model"}` | `INVALID_REQUEST` | **`CONTEXT_WINDOW_EXCEEDED`** |
+ *
+ * 后者还会**触发 DSH 的上下文溢出压缩**。本函数是 `httpErrorCode` 与 4xx 额度判据
+ * 的**唯一分类输入** ⇒ 那两处**必须**改走 {@link errorDetailForClassify}，
+ * 否则一个纯展示改进会静默改变分类行为（且我加的用例只断言返回值，零分类守卫）。
+ *
+ * ⚠️ **本份（codearts）与 `openai-compat.ts` 那份是同名不同实现**，
+ * 两条出口的语义必须两处一致。
  */
 export function errorDetail(body: string): string {
+  return errorDetailImpl(body, true)
+}
+
+/**
+ * 从错误体提取**分类用**的可读文本 —— **不含**顶层 `detail` 字段。
+ *
+ * ⚠️ 分类调用点（`httpErrorCode` / `isSseQuotaExhaustedErrorCode`）**必须**走本出口：
+ * 它保证分类输入与「加 detail 腿之前」**逐字节相同**（见 {@link errorDetail} 的实测表）。
+ */
+export function errorDetailForClassify(body: string): string {
+  return errorDetailImpl(body, false)
+}
+
+/**
+ * `errorDetail` 的唯一实现（两条出口共用，**不各写一份** —— 那是本仓库首条红线
+ * 「同一语义两套判据」，且必然漂移）。
+ *
+ * @param includeDetailField - `true` = 展示出口；`false` = 分类出口。
+ */
+function errorDetailImpl(body: string, includeDetailField: boolean): string {
   try {
     const data = JSON.parse(body) as Record<string, unknown>
     const error = typeof data.error === 'object' && data.error !== null
@@ -640,6 +714,12 @@ export function errorDetail(body: string): string {
       typeof data.error_code === 'string' ? data.error_code : undefined,
       typeof data.error_msg === 'string' ? data.error_msg : undefined,
       typeof data.message === 'string' ? data.message : undefined,
+      // ⚠️ 上游代理的 `{"error":"acp-proxy failure","detail":"<真实原因>"}` 形态
+      //（Gitee issue IKLBSH A1）—— 只认 `error` 会丢掉真正的原因。
+      // 判据**只留一份实现**（`openai-compat.ts` 的 `detailFieldText`）；本仓库
+      // 6 份同义 `errorDetail` 各写一条必然漂移（「同一语义两套判据」）。
+      // ⚠️ **只在展示出口计入**（见上）。
+      includeDetailField ? detailFieldText(data) : undefined,
     ].filter((value): value is string => value !== undefined)
     if (parts.length > 0) return parts.join(' ')
   } catch {
@@ -672,7 +752,9 @@ export function errorDetail(body: string): string {
  */
 function httpErrorCode(status: number, body: string): string {
   if (status === 401 || status === 403) return 'AUTH'
-  const detail = errorDetail(body)
+  // ⚠️ **分类必须走 `errorDetailForClassify`**（不含 detail 腿）—— 用展示出口会让
+  // detail 里的额度/超限措辞**翻转错误码**（实测表见 `errorDetail` 的 doc）。
+  const detail = errorDetailForClassify(body)
   if (isQuotaExceededError(detail)) return CODEARTS_QUOTA_EXHAUSTED_CODE
   if (status === 429) return 'RATE_LIMIT'
   if (status === 400) {
@@ -1229,7 +1311,9 @@ export class CodeArtsAdapter extends LlmAdapter {
         //
         // ⚠️ 判据用整个错误体（`errorDetail` 会拼出 `error_code` + `error_msg`）：
         // 4xx 的报文形态与 SSE 不同，不能指望顶层 `error_code` 字段名一致。
-        if (isSseQuotaExhaustedErrorCode(errorDetail(errorText), errorText)) {
+        // ⚠️ **分类必须走 `errorDetailForClassify`**（不含 detail 腿）—— 理由同上，
+        // 用展示出口会让 detail 里的额度措辞翻转这条判据。
+        if (isSseQuotaExhaustedErrorCode(errorDetailForClassify(errorText), errorText)) {
           const message = codeartsQuotaExhaustedMessage(options.model, nextUtc8DayStartMs())
           if (this.options.accountPool) {
             if (currentAccountId) {
@@ -1250,6 +1334,32 @@ export class CodeArtsAdapter extends LlmAdapter {
             }
           }
           throw new LlmError(message, CODEARTS_QUOTA_EXHAUSTED_CODE, { status: response.status })
+        }
+        // ── benefit 去头重试的 **4xx 通道**（Gitee issue IKLBSH A6）──
+        //
+        // 同一个上游条件（该账号没有 benefit 免费额度包）会走**两条**通道下发：
+        // SSE 200（`consumeSse` 已接，见 `CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE`）
+        // 与 HTTP 4xx。此前**只有 200 那条接上了** —— 4xx 形态会径直落到
+        // `httpErrorCode` 归成 `INVALID_REQUEST` 抛出，**去头重试一次也不试**，
+        // 于是「同一条件下 SSE 能自愈、4xx 却硬报错」。
+        //
+        // ⚠️ 这不是推断：`origin/issue/IKJOF7-benefit-diagnostics` 分支
+        //（2026-10-05 取证提交）用 `it.fails` **显式锁定**了该缺陷
+        //（「HTTP 4xx + 正文含 InferHub.4004.200 时也应当去头重试」），
+        // 当时的结论是「已确认，但本分支不修」——本处即补上那一半。
+        //
+        // 判据复用既有的 `benefitHeaderDropped` 门禁（**只试一次**）——它与
+        // SSE 通道**共享同一个标记**，故两条通道叠加也只会去头一次，不会
+        // 「各试一次」把请求放大成两轮。
+        //
+        // ⚠️ 不采纳 issue 建议的「1s / 2s / 3s 递增退避重试最多 3 次」：
+        // 去头重试是**一次**（`benefitHeaderDropped` 的既有语义，注释写明
+        // 「只试一次，避免与真实失败互相掩盖」），且 issue 自己给的证据是
+        // 「去掉请求头后密集取样 9 次全部 200」——那说明的正是**去头即通**，
+        // 而非「需要多次退避」。按证据改，不按建议改。
+        if (isBenefitModel && !benefitHeaderDropped && isBenefitNotFoundBody(errorText)) {
+          benefitHeaderDropped = true
+          continue
         }
         // 限流处理：记录当前账号在该模型上的重置时间，然后切换账号重试
         // （外层 for(;;) 会在拿到新凭据后重新签名发请求）。用 tried 集合

@@ -1,9 +1,25 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { AGGREGATE_PROVIDER_ID, resolveBadgeProvider } from '../../plugin-src/client/badge-model.js'
 
-const here = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
+/**
+ * 仓库根（源码级断言用）。
+ *
+ * ⚠️ **必须用 `fileURLToPath`，不能用 `URL.pathname`**（真实缺陷，Gitee issue
+ * IKLBSH A3）：`pathname` 对路径里的空格做**百分号编码**（`D:\Vibe coding\…`
+ * → `/D:/Vibe%20coding/…`），而原先只 `replace(/^\/([A-Za-z]:)/, '$1')` 修盘符
+ * 前缀、**不修 `%20`** ⇒ `readFileSync` 对含空格路径恒 ENOENT，
+ * 而 vitest 把它报成**整份 spec 收集失败**（不是单个用例失败），
+ * 看起来像测试基建坏了而不是路径判据错了。
+ * `fileURLToPath`（`node:url` 自带）做正确的百分号解码。
+ *
+ * ⚠️ 该修复的守卫在 `tests/unit/path-source-read.spec.ts`（结构性扫描）——
+ * 因为**在本机无空格路径下把这里改回去仍全绿**（对抗审计实测 98 条绿），
+ * 逐文件的变异验证测不出它。
+ */
+const here = fileURLToPath(new URL('.', import.meta.url))
 const read = (rel) => readFileSync(resolve(here, '../..', rel), 'utf8')
 
 /**
