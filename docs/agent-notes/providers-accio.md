@@ -319,6 +319,164 @@ parametersJson: JSON.stringify(fn.parameters ?? { type: 'object', properties: {}
   `accioToolCallMergeTransform`。E2E 探针 `test:e2e:accio-tools` 专门断言
   「同一个 id **恰好一个块**且参数**非空**」。
 
+### 4.4.0 ⚠️⚠️⚠️ 「思考一下就中断」：终帧被管线**双重丢失**（2026-10-13 深夜 wire 探针定罪）
+
+> **用户报障「accio 思考一下就中断」（DSH 直连与 ZCode 双侧复现）的根因。**
+> 症状：模型思考一段后轮次**显示正常完成**（`completed`），无正文、无工具调用、
+> 无任何报错，usage 全零。用户反复发「继续」也救不回来。
+> 第一轮修复（顶层 `function_call` / 无 `content` 终帧）上线后**仍复发**——
+> wire 探针（`.tmp-accio/probe-wire-frames.mjs`，三格：无工具 / 1 工具 / 73 工具）
+> 抓到原始帧才定罪：**工具帧与终帧其实都到了**，是管线内部把它们丢了。
+
+#### wire 实测的真实帧形状（与此前所有推断的关键差异）
+
+1. **`function_call` 在 `content.parts` 里**（不是顶层）——frame#13
+   `{content:{parts:[{function_call:{id,name}}]}}`，frame#14 补 `args_json`。
+   之前「顶层 function_call」的假设**不成立**（第一轮修的分支无害但非根因）。
+2. **终帧把最后一个工具分片与元数据放在同一帧**：frame#14 =
+   `{content:{parts:[{function_call:{…,args_json}}]}, turn_complete:true,
+   usage_metadata:{…}, finish_reason:"STOP"}`。
+3. **流没有 `[DONE]`**，终帧就是最后一行（带换行）。
+4. 纯文本轮次的终帧是 `{content:{role:"model"}}`（**有 content 无 parts**）。
+
+#### 双重丢失链（两处缺陷叠加）
+
+> ⚠️ **本小节初版写「缺一都修不好」——该归因已被四格矩阵实测证伪，
+> 见 §4.4.0.1「一条被证伪的 PR 声明」**：修复②是症状的必要且充分条件，
+> 修复①只影响 usage 计量。两处都值得修，但别把它们写成同等的因。
+
+```
+终帧（最后一个分片 + usage/finish 同帧）
+  → ① 合并层 accioToolCallMergeTransform：看到 function_call 就吸收进 pending，
+    flush 只吐工具 part ⇒ usage/finish 元数据被吞（→ 用量恒归零）
+  → ② 归一化层 consumeAccioSse 的 flush：合并层产物不带尾换行 ⇒ transform
+    把尾行留在 buffer ⇒ flush 原样裸透（不归一化）⇒ consumeGeminiSse 收到
+    无 candidates 的顶层帧 ⇒ 当纯 usageMetadata 帧 ⇒ 工具/usage/finish 全丢
+  → 流里只剩思考 ⇒ mapGeminiFinish(undefined, 0) 兜底 stop ⇒ 轮次「正常完成」
+```
+
+#### 修法（两处必须一起改）
+
+1. **合并层**：吸收工具 part 时把帧上的 `turn_complete`/`usage_metadata`/
+   `finish_reason` 暂存（`frameMetaOf` 只抽这三键，不透传整帧——`raw_response_json`
+   体积大且无关）；flush 时拼进合并帧（与上游原形一致）。多帧带元数据时后者覆盖
+   （终帧 usage 是最终值，与消费侧「取最大 total」语义一致）。
+2. **归一化层**：`flush` 的尾行必须走**同一条 `processLine` 归一化路径**，
+   绝不裸透传。错误帧判据与归一化抽成 `processLine` 共享（transform 与 flush
+   共用，`pendingError` 提到外层）。
+
+#### 验证
+
+- **真实 wire 帧驱动完整管线**（`.tmp-accio/wire-*.txt` 三格）：修复前
+  工具 0 块 / usage 全零 / 兜底 stop；修复后 1 工具块 + 真实 usage
+  （input 301 / output 36 / reasoning 13）+ `tool-calls`；纯文本两格拿到
+  真实 usage + 正常 stop。
+- 回归测试 `tests/unit/accio-messages.spec.ts`（「终帧与最后一个工具分片同帧 +
+  流无 [DONE]」组 2 条）；反向验证：回退两处修复 ⇒ 恰好 2 条变红。
+- 全量 323 文件 / 7909 passed。
+
+#### ⚠️⚠️ 方法论教训（比第一轮的教训更狠）
+
+- **「会话日志只存插件产出后的 StreamChunk」意味着：推断「帧没到」与「帧到了
+  被丢」在日志里**同形**——必须抓 wire 帧才能分辨。第一轮修复基于「usage 全零
+  ⇒ 终帧没到」的推断，方向就错了**一半**（终帧到了，死在合并缓冲里）。
+- **修完必须用真实流量回归**：第一轮修复全量测试 7907 绿、反向验证过，
+  但测试喂的都是**自造帧**（带 `[DONE]`、终帧不带工具分片）——真实形状
+  （无 `[DONE]`、分片与元数据同帧）一条用例都没覆盖。**自造帧永远要对着
+  wire 抓包核对一遍。**
+- **TransformStream 的 flush 是独立代码路径**：transform 处理「完整行」，
+  flush 处理「尾行」——两条路径必须跑**同一个**处理函数，否则尾行行为分叉
+  （本例：尾行不归一化）。写任何行缓冲 TransformStream 时先问一句：
+  「flush 里的尾行走的路径与 transform 一致吗？」
+
+### 4.4.0.1 ⚠️⚠️⚠️ 双审计修正：**新增的改写分支自己犯了同一类错**（2026-10-13 深夜）
+
+> 本节 §4.4.0 的修复方向正确（真实 wire 形状确实由它修好），但**新增的
+> 「顶层 `function_call` 改写」自己引入了 9 处缺陷**，其中一处比原缺陷更坏。
+> 由**常规审计 + 对抗性审计**两轮独立跑出，**逐条经父 agent 用 master/PR 同进程
+> A/B 复核**（所有结论均为实测，不是读代码推断）。
+
+#### 根因：改写跑在**错误判据之前**，且是**替换式**而非加性
+
+`accioToolCallMergeTransform` 在 `consumeAccioSse` **之前**，而
+`accioErrorFrame` 的判据在后者内部。初版改写**新造**了一个只含
+`content.parts` 的帧 ⇒ 帧上其余顶层字段全丢 ⇒ 判据的**输入**被毁掉。
+
+| # | 缺陷（初版） | 实测（PR 初版 vs master 基线） | 修法 |
+|---|---|---|---|
+| 1 | 错误帧被**吸收** ⇒ `error_code` 丢失 | `error_code:402` + 工具同帧：基线**抛 QUOTA_EXCEEDED**，初版**静默返回工具调用成功**（额度失败反转成成功） | 错误帧**原样透传**（复用 `isAccioErrorFrame`，判据只此一处） |
+| 2 | `function_call:null` **裸 TypeError** | 基线 `text="甲乙丙"`；初版 `THREW TypeError` 且**同 chunk 已产出的正文全丢**（`transform` 抛在 `enqueue` 之前），且 TypeError 不是 `LlmError` ⇒ 不可重试 | `absorbCallParts` 加对象守卫（与 `normalizeAccioPart` 同口径） |
+| 3 | 参数只认 snake `args_json` | camel `argsJson` / 对象 `args` ⇒ **静默清空为 `{}`**（模型以为执行了，实际空参数） | 抽出 `accioArgsTextOf`，三形态同口径 |
+| 4 | `candidates` 帧被改写吞掉 | 基线 `text="标准正文"`；初版 `text=""`（两层判据不一致） | 加 `!Array.isArray(frame.candidates)` 守卫 |
+| 5 | `content` 有值但**无 parts** 时漏判 | `{content:{role}}` + 顶层 call ⇒ 工具**静默丢弃**、`finish=stop`（= 「思考一下就中断」原症状；**PR 文档 §4.4.0 自己记录了该形状**） | 触发条件改为「`content.parts` 不是数组」 |
+| 6 | `anon-${pending.size}` 键撞车 | 显式 `id:"anon-1"` + 无 id 调用 ⇒ **两个调用被误合并成一个**、参数串接成非法 JSON | `anonKey()` 跳过已占键 |
+| 7 | usage **字段级后覆盖先** | 终帧 total 偏小（336→4）⇒ 取**偏小**值、`inputTokens`/`cacheReadTokens` 全丢；终帧 `{}` ⇒ usage 全零。**同一批数据走透传路径却键完整** ⇒ 合并路径比消费侧更弱 | `mergeFrameMeta` 取**最大 total**（与 `noteUsage` 同口径）+ 收敛到一个 usage 键 |
+| 8 | `normalizeAccioFrame` 无名 call **连坐**丢 usage/finish | 同一个「无名 part + MAX_TOKENS + usage」：在 `content.parts` 里得 `max-tokens`，在**顶层**得 `stop` ⇒ **MAX_TOKENS 伪装成正常结束** | 丢调用后**继续走**下面的 usage/finish 分支 |
+| 9 | 测试：`finish` 抽取**零守卫** | 删掉 `frameMetaOf` 的 `finish_reason` 抽取 ⇒ 118 条用例**全绿** | 补被测行为用例 |
+
+#### 第二轮（对抗验证）又查出 2 处 —— 都是「注释自称同口径、代码不是」
+
+| # | 缺陷 | 实测 | 修法 |
+|---|---|---|---|
+| 10 | `args_json: ""` **不回退**到 `args` 对象 | 空串是字符串 ⇒ `typeof raw === 'string'` 直接 return，**永不回退**；同一帧归一化层得 `{"file_path":"a.txt"}`、合并层得 `{}` ⇒ **两层判据不一致**，且正是「静默空参数」 | `&& raw !== ''` |
+| 11 | `mergeFrameMeta` **首份双 usage 键**早退 | `prev === undefined` 时直接 `return {...next}` ⇒ 两个 usage 键**都被保留** ⇒ 归一化层恒取 snake ⇒ **陈旧小值胜出**（snake total=10 / camel total=3100 ⇒ 得 10） | 收敛逻辑覆盖首份，只留**单一** `usage_metadata` 键 |
+
+⚠️ 另登记一处**刻意保留**的已知损失（不修，但要写准）：
+被**吸收**的工具帧最终由 `flushPending` **重新合成** ⇒ 原帧 `content` 内的
+**非 `parts`** 字段（上游附加键）不会出现在合成帧里。实测**不影响下游**
+（消费侧只读 `content.parts` / `usageMetadata` / `finishReason`），故**刻意不为它
+增加元数据通道**；若将来上游出现消费侧真正要读的 content 级字段，**必须**在此接上。
+
+⚠️ 以及一处**刻意设计**（不是丢失）：错误帧**之后**跨 chunk 的帧不会交付
+（下一层抛出后流即终止 = 「流内错误 ⇒ 整条流作废」）；与错误帧**同 chunk** 且
+在其后的帧会交付，错误帧**之前**的帧一定交付。
+
+#### ⚠️⚠️ 两条方法论教训
+
+- **「修同一类缺陷」时要问：我的新代码是否犯了同一类错？** 本 PR 的叙事是
+  「终帧语义不得被管线吞掉」，而它新增的改写层**第一件事就是吞掉帧上的语义**
+  （`error_code`）。**修缺陷的代码必须接受与缺陷同等的审查强度。**
+- **`master/PR` 同进程 A/B 是定性的唯一可靠手段**。只跑 PR 自己的用例会漏掉
+  净回归：初版 118 条全绿，而同一输入在 master 上**行为正确**（会抛错）。
+  ⇒ 判「是不是回归」必须**两侧都跑**，不能只看修复侧。
+
+#### ⚠️ 一条被**证伪**的 PR 声明
+
+PR 文档 §4.4.0 写「两处缺陷叠加，**缺一都修不好**」。四格矩阵实测
+（A=PR+PR / B=旧合并层+PR消费层 / C=PR合并层+旧消费层 / D=都回退）：
+
+```
+A = calls=[get_current_time] usage={301,36,337,r13} finish=tool-calls
+B = calls=[get_current_time] usage={0,0}            finish=tool-calls   ← 只缺①
+C = calls=[]                 usage={0,0}            finish=stop         ← 只缺②
+D = calls=[]                 usage={0,0}            finish=stop
+```
+
+⇒ **修复②（flush 不裸透）是「思考一下就中断」的必要且充分条件**；
+**修复①只影响 usage 计量**（缺它时工具调用照常到达、轮次会正常继续，用户
+看不到中断）。①确实修了「用量恒归零」这个真缺陷，但把它写成症状的必需条件
+是**过度归因**。
+
+#### 回归测试（本条新增 17 条，逐条反向验证）
+
+`tests/unit/accio-messages.spec.ts` 三组：「错误帧绝不可被合并层吸收」4 条、
+「畸形帧只跳过、参数三形态同口径」6 条、「漏判的帧形状与 usage 合并语义」7 条。
+
+⚠️ **11 处修复逐条做了反向验证**（每处单独回退 ⇒ 各自 ≥1 条变红）：
+M1=3 条、M2=1、M3=3、M4=2、M5=2、M6=1、M7=1、M8=1、M9=3、M10=1、M11=1。
+⚠️ 其中 **M2 与 M8 的第一次尝试零红**：`content.parts` 内的 `null` 与
+「无名顶层 call」两条路径**必须直测纯函数/对应入口**——走端到端时会被上层
+（改写分支补 `id`、合并层补 `anon-N`）**遮蔽**，用例看着在测、实际测不到。
+⇒ **「有守卫」必须用变异证明，不能靠用例标题**。
+⚠️ 同名的两条「无名 call 不连坐」用例中，**端到端那条是回归锁而非防线**
+（合并层会补 `id` ⇒ 命不中「无名」分支，变异下照绿）；真正守门的是**纯函数版**。
+用例标题里已注明，避免下一个人误判。
+
+⚠️ **两轮审计的定性口径不同，别混用**：第一轮（常规 + 对抗）的 9 处里只有
+**修复 1、4、5** 是 PR **新引入的净回归**（master 上行为正确）；2、3、6、7
+是**既有缺陷被新路径放大/暴露**；8 是**既有的同类残留**。判定「是不是回归」
+必须 **master/PR 同进程 A/B**，只跑修复侧会漏判。
+
 ### 4.4.1 ⚠️⚠️ 档位**真实生效**，但思考**关不掉**（2026-10-13 大修）
 
 > **本节原先的结论「四类字段全部无效 ⇒ 目录里不声明任何档位」已被推翻一半。**
