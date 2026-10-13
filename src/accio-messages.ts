@@ -71,7 +71,7 @@ const ACCIO_QUOTA_ERROR_CODE = '402'
 const ACCIO_QUOTA_EXCEEDED_CODE = 'QUOTA_EXCEEDED'
 
 /**
- * 把一帧解析后的报文判定为**流内错误帧**（是则返回该抛的错误，否则 `undefined`）。
+ * 该帧是否是**流内错误帧**（布尔判据）。
  *
  * ## 判据（三条，缺一不可）
  *
@@ -79,24 +79,52 @@ const ACCIO_QUOTA_EXCEEDED_CODE = 'QUOTA_EXCEEDED'
  *    `{"turn_complete":true,"error_code":"402","error_message":"unauthorized"}`；
  * 2. ⚠️ **`error_code === '200'` 是成功哨兵，绝不可抛** —— 实测正常帧也会带它
  *    （`{"error_code":"200","content":{…}}`）。故必须先判 `'200'` 再判错误；
- * 3. `'402'`（字符串或数字）⇒ `QUOTA_EXCEEDED`；其余非 `200` 码 ⇒ 通用错误，
- *    且**逐字带上服务端原文**（本仓库铁律：绝不丢服务端原文）。
+ * 3. 其余非 `200` 码 ⇒ 错误（归类见 {@link accioErrorFrame}）。
+ *
+ * ## ⚠️⚠️ 为什么必须**导出**成独立的布尔判据（2026-10-13 审计修正）
+ *
+ * 合并层 `accioToolCallMergeTransform`（`src/accio-adapter.ts`）跑在
+ * `consumeAccioSse` **之前**，而本判据只在后者的 `processLine` 里生效。若合并层把
+ * 「错误码与工具 part **同帧**」的帧吸收进 pending 缓冲，flush 时只吐工具 part
+ * ⇒ `error_code` / `error_message` 被吞 ⇒ 本判据再也看不到它 ⇒
+ * **额度/认证失败被反转成「工具调用成功」**（本仓库铁律「流内错误必须抛出」
+ * 「绝不丢服务端原文」同时被违反）。
+ *
+ * ⇒ 合并层必须能问一句「这是不是错误帧」，对错误帧**原样透传、绝不吸收**。
+ *
+ * ⚠️ **判据只此一处**（{@link accioErrorFrame} 复用它）—— 两处各写一份必然漂移，
+ * 漂移的后果是「同一个帧，一层认作错误、另一层认作正常」。
+ */
+export function isAccioErrorFrame(frame: unknown): boolean {
+  if (frame === null || typeof frame !== 'object' || Array.isArray(frame)) return false
+  const f = frame as Record<string, unknown>
+  const rawCode = f.error_code ?? f.errorCode
+  const rawMessage = f.error_message ?? f.errorMessage
+  const code = typeof rawCode === 'string' || typeof rawCode === 'number' ? String(rawCode) : ''
+  const message = typeof rawMessage === 'string' ? rawMessage : ''
+  if (code === '' && message === '') return false
+  // ⚠️ 成功哨兵：`error_code: "200"`（实测正常帧会带）**必须先于**错误判据返回，
+  // 否则每一条正常响应都会被当成错误抛掉。
+  return code !== '200'
+}
+
+/**
+ * 把一帧解析后的报文判定为**流内错误帧**（是则返回该抛的错误，否则 `undefined`）。
+ *
+ * `'402'`（字符串或数字）⇒ `QUOTA_EXCEEDED`；其余非 `200` 码 ⇒ 通用错误，
+ * 且**逐字带上服务端原文**（本仓库铁律：绝不丢服务端原文）。
  *
  * ⚠️ **返回错误而不是就地 `throw`**：调用点在**同一个 chunk** 里可能已经攒了
  * 若干条正常帧（`out` 数组），就地抛出会让它们连 `controller.enqueue` 都执行不到
  * 而被静默丢弃。故判据与抛出**分离**，由调用点在把已攒下的行交出去**之后**再抛。
  */
 function accioErrorFrame(frame: unknown): LlmError | undefined {
-  if (frame === null || typeof frame !== 'object' || Array.isArray(frame)) return undefined
+  if (!isAccioErrorFrame(frame)) return undefined
   const f = frame as Record<string, unknown>
   const rawCode = f.error_code ?? f.errorCode
   const rawMessage = f.error_message ?? f.errorMessage
   const code = typeof rawCode === 'string' || typeof rawCode === 'number' ? String(rawCode) : ''
   const message = typeof rawMessage === 'string' ? rawMessage : ''
-  if (code === '' && message === '') return undefined
-  // ⚠️ 成功哨兵：`error_code: "200"`（实测正常帧会带）**必须先于**错误判据返回，
-  // 否则每一条正常响应都会被当成错误抛掉。
-  if (code === '200') return undefined
   // ⚠️ 文案逐字保留（`error_code` 与 `error_message` 都带），便于排障与对账。
   const detail = [code === '' ? '' : `error_code=${code}`, message].filter((s) => s !== '').join(' ')
   if (code === ACCIO_QUOTA_ERROR_CODE) {
@@ -254,7 +282,16 @@ export function normalizeAccioFrame(frame: unknown): unknown | undefined {
         if (finishText !== undefined) candidate.finishReason = finishText
         return { candidates: [candidate], ...(usage !== undefined ? { usageMetadata: usage } : {}) }
       }
-      return undefined
+      // ⚠️⚠️ 调用**无名**（`normalizeAccioPart` 判据）⇒ 该调用整块丢弃，这是既有约定
+      // （产出无名工具调用会让上游/适配器 400）。**但 usage / finish 绝不能被连坐丢掉**
+      // （2026-10-13 审计修正：原先此处直接 `return undefined`）。
+      //
+      // 连坐的后果是可观测的，而且正是本 PR 要消灭的那一类：同一个「无名 part +
+      // MAX_TOKENS + usage」形状，放在 `content.parts` 里得到 `finish=max-tokens`
+      // + 真实 usage，放在**顶层**却得到 `finish=stop` + usage 全零 ⇒
+      // **MAX_TOKENS 截断被伪装成正常结束，harness 不会重试**。
+      // 故丢掉调用之后**继续往下走**，由下面「终帧 / 纯 usage 帧」那条分支保住元数据。
+      // （与紧邻的 `function_call: null` / 完全无 call 两格判据一致。）
     }
     // 终帧 / 纯 usage 帧：保住 usage 与 finish 语义。
     if (usage === undefined && finishText === undefined) return undefined
