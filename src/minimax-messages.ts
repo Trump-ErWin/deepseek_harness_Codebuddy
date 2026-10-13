@@ -627,6 +627,7 @@ export async function* consumeMinimaxSse(
           type: 'tool-call-delta',
           index,
           id: ToolCallId(state?.toolId ?? ''),
+          ...state?.toolName !== undefined && state.toolName.length > 0 ? { name: state.toolName } : {},
           argumentsDelta: d.partial_json,
         }
       }
