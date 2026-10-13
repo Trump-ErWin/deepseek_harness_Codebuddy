@@ -55,6 +55,7 @@ import {
   createDsmlMarkerNormalizer,
   fixDsmlMarkers,
 } from './sse.js'
+import { DsmlContentExtractor } from './dsml.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { isBillingBusinessCode, looksLikeBillingError, parseQueueError, queueDelayMs } from './model-queue.js'
 
@@ -378,6 +379,17 @@ export interface ConsumeOpenAiSseOptions {
    */
   maxTokens?: number
   /**
+   * 是否把正文里的 **DSML 工具调用块**解析为结构化 tool-call。
+   *
+   * ⚠️ **只在该通道确实用 DSML 时开启**（与注入 `buildDsmlSystemPrompt`
+   * **成对出现**）：适配器不把 `tools` 发给上游、改为把 schema 注入 system
+   * 提示，模型便以 `<｜DSML｜tool_calls>` 文本输出调用 —— 本消费器必须
+   * 把它解析回来，否则整段标签当正文显示，工具**永不执行**。
+   *
+   * 关闭时本消费器行为与从前**逐字节一致**（纯文本通道不受影响）。
+   */
+  dsmlToolMode?: boolean
+  /**
    * 每解析成功一帧就回调一次（**旁路观测**，不得影响流本身）。
    *
    * Cline 用它取网关下发的路由元数据（真正服务这笔请求的上游渠道），
@@ -487,6 +499,23 @@ export async function* consumeOpenAiSse(
    * 待定缓冲是跨帧状态，共用会串流。
    */
   const dsmlFix = createDsmlMarkerNormalizer()
+  /**
+   * DSML 流式提取器（见 dsml.ts `DsmlContentExtractor`）。
+   *
+   * ⚠️ **只在 `dsmlToolMode` 开启时创建并接管正文**（2026-10-13）。
+   *
+   * 为什么必须在这里：OfficeAce 走本函数，而 DSML 解析器原先**只存在于
+   * `llm-adapter.ts`（codearts）**。上一版只给 OfficeAce 注入了 DSML 提示
+   * （「教模型写」），本函数却不解析 ⇒ 模型写出的 DSML 文本整段当正文，
+   * 用户报「还是不行」。**教得会、还要解得开**，故解析器收归共享层后
+   * 在本函数接入。
+   */
+  const dsmlExtractor = config.dsmlToolMode === true ? new DsmlContentExtractor() : undefined
+  /**
+   * DSML 解析出的调用所用的 wire 下标（**负数**，与上游标准 `tool_calls`
+   * 的 0/1/2… 天然隔离，避免两套机制抢同一个 `toolCalls` 槽位）。
+   */
+  let dsmlWireIndex = -1
   const toolCalls = new Map<number, {
     index: number
     text: string
@@ -794,7 +823,44 @@ export async function* consumeOpenAiSse(
             //    累积，宿主解析器不认，工具调用整段当正文 —— 模型「停住不动」
             //    （实测 deepseek-v4.1-flash / step-5-preview）。push() 是流式
             //    安全的：跨帧的模式由待定缓冲拼齐（见该函数注释）。
-            const fixedDelta = dsmlFix.push(textDelta)
+            let delta = dsmlFix.push(textDelta)
+            // ── DSML 工具调用解析（OfficeAce 等走本函数的通道）──
+            // 提取器把 DSML 块从正文里摘出来转成结构化调用；产出的 `text`
+            // 才是真正该显示的正文（标签本身不再下发）。
+            if (dsmlExtractor !== undefined) {
+              const extracted = dsmlExtractor.feed(delta)
+              if (extracted.toolCalls.length > 0) {
+                for (const call of extracted.toolCalls) {
+                  const wireIndex = dsmlWireIndex--
+                  const callId = `dsml_${Math.abs(wireIndex)}`
+                  const block: {
+                    index: number
+                    text: string
+                    callId?: string
+                    name?: string
+                    announced: boolean
+                  } = { index: nextIndex++, text: '', callId, announced: false }
+                  toolCalls.set(wireIndex, block)
+                  toolIds.set(wireIndex, callId)
+                  block.name = call.name
+                  block.text = call.arguments
+                  if (hasUsableToolName(block.name)) {
+                    block.announced = true
+                    toolOrder.push(block.index)
+                    yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+                    yield {
+                      type: 'tool-call-delta',
+                      index: block.index,
+                      id: ToolCallId(callId),
+                      name: block.name,
+                      argumentsDelta: block.text,
+                    }
+                  }
+                }
+              }
+              delta = extracted.text
+            }
+            const fixedDelta = delta
             block.text += fixedDelta
             // 归一化可能把整帧都扣进缓冲（fixedDelta 为空）—— 空帧不发。
             if (fixedDelta.length > 0) {
@@ -1005,6 +1071,17 @@ export async function* consumeOpenAiSse(
         tailBlock.text += tail
         yield { type: 'text-delta', index: tailBlock.index, text: tail }
       }
+    }
+  }
+  // ── DSML 提取器收尾：把残留缓冲放行到正文 ──
+  // 未闭合的 DSML 块（流被截断）不能被吞掉，flush() 会补回开标签，
+  // 保证用户看到的是完整残片而非凭空消失的一段文本。
+  if (dsmlExtractor !== undefined) {
+    const flushed = dsmlExtractor.flush()
+    const tailBlock = blocks.find(candidate => candidate.kind === 'text')
+    if (flushed.text.length > 0 && tailBlock !== undefined && !proseLoopDetected) {
+      tailBlock.text += flushed.text
+      yield { type: 'text-delta', index: tailBlock.index, text: flushed.text }
     }
   }
   if (textBlock !== undefined) {
