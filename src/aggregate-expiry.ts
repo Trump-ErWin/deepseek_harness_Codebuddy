@@ -53,6 +53,8 @@ import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
 import type { TraeProduct } from './trae-product.js'
 import type { TraeCredential } from './trae.js'
 import { fetchTraeCreditBalance } from './trae-credits.js'
+import type { AccioCredential } from './accio.js'
+import { fetchAccioBalanceDetailed } from './accio-credits.js'
 import { runtimeOf, type ProviderExpiryContext } from './provider-runtime.js'
 
 /**
@@ -162,6 +164,11 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   //    实测这两家的 `CreditPackage` 与 buddy **同形**，都有 `deductionEndTime`。
   'lobsterai',
   'trae',
+  // ⚠️ accio（2026-10-13 合并审计发现「聚合里看不到它」后补）：用户明确要求
+  //    「聚合当中的 qwen3.8-flash 轮换列表里要有 accio」，而**决定候选表可见性的
+  //    是这张表、不是 `AGGREGATE_CHANNELS`** —— 漏加它 ⇒ 归一化补丁再对也没用
+  //    （模型层归并了，候选层却被这道闸门剔掉），症状**静默**。
+  'accio',
 ])
 
 /**
@@ -757,6 +764,54 @@ export async function loomyExpiry(credential: LoomyCredential): Promise<number> 
   if (detail === null) return UNUSABLE
   if (detail.daily > 0) return nextUtc8DayStartMs()
   return detail.permanent > 0 ? NEVER : UNUSABLE
+}
+
+/**
+ * accio：与 **loomy 同形**（命名池、无逐包时间戳），但有一条更强的信息。
+ *
+ * ## 判据（2026-10-13 合并审计发现「聚合里看不到 accio」后补）
+ *
+ * | 情形 | 折算值 | 依据 |
+ * |---|---|---|
+ * | `每日积分 > 0` | **当日 24:00**（`nextUtc8DayStartMs()`） | 每日额度 24h 作废且**不累积** |
+ * | 只剩 `每月积分` / `推荐积分` | `NEVER`（长期，排最后但不剔除） | 上游**没有**下发它们的到期时间 |
+ * | 三类桶全为 0 | `UNUSABLE`（剔除） | 没有可烧的额度 |
+ * | 查询失败 / 未登录 | `UNUSABLE` | 读不到就不猜 |
+ *
+ * ## ⚠️ 为什么用 `nextUtc8DayStartMs()` 而不是 `quota.refreshCountdownSeconds`
+ *
+ * `accio-credits.ts` 的 `accioQuotaResetIso` 能用倒计时算出**精确**的重置时刻，
+ * 但那条路径的注释明确写着「`refreshCountdownSeconds` 只说**额度何时刷新**，
+ * 与『这批积分何时作废』在 Accio 上**未被实测为同一时刻**」——
+ * 故**刻意不写 `deductionEndTime`**（写进去就是编造）。
+ *
+ * ⇒ 本函数**尊重那个结论**：只在**有每日额度**时给一个「当日结束」的**保守上界**
+ *（与 loomy 的 `daily > 0 → 当日 24:00` 逐字同判据），**不**把倒计时当到期时间用。
+ * 语义上这是「临期优先」排序要的信息（今天就作废的排前面），而不是精确的作废时刻。
+ *
+ * ⚠️ **两家同形 ⇒ 判据必须逐格同构**（本仓库红线）：若将来 loomy 那一格改了
+ *（例如上游开始下发真实到期时间），**这里要一起改**。
+ */
+export async function accioExpiry(credential: AccioCredential): Promise<number> {
+  let detail
+  try {
+    detail = await fetchAccioBalanceDetailed(credential)
+  } catch {
+    return UNUSABLE
+  }
+  if (detail.balance === null) return UNUSABLE
+  const buckets = detail.balance.packages
+  // ⚠️ 桶的判据与 `sharedPackageExpiry` 同口径（`active === true` 且 `remaining > 0`），
+  //    只是**不取** `deductionEndTime`（Accio 本来就不下发）。
+  const usable = buckets.filter(
+    (pkg) => pkg.active === true && typeof pkg.remaining === 'number' && pkg.remaining > 0,
+  )
+  if (usable.length === 0) return UNUSABLE
+  // 每日额度按展示名识别（`makeAccioPackage` 的 name 就是 `每日积分`）。
+  // ⚠️ 用**展示名**而不是下标：桶的顺序由 `ACCIO_CREDIT_BUCKETS` 固定，
+  //    但按名字判更耐重构（少一个桶时不会错位）。
+  const hasDaily = usable.some((pkg) => pkg.name === '每日积分')
+  return hasDaily ? nextUtc8DayStartMs() : NEVER
 }
 
 /**

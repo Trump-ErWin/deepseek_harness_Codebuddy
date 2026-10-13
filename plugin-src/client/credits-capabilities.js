@@ -99,17 +99,20 @@ export const CREDITS_CAPABILITIES = Object.freeze(creditCapabilitiesOf());
  * ## 登记 `false` 的判据（2026-10-03 纳入 Gemini 后重写）
  *
  * 不是「该渠道不会限流」，而是「**该渠道的限流不由这组按钮的语义管辖**」。
- * 目前两个子类都登记 `false`：
+ * 当前登记 `false` 的家**理由各不相同**（逐条见 registry 里各自的字段注释）：
  * - Loomy：**根本不返回限流错误** —— 重测永远测不出东西，重置没有标记可清；
- * - Gemini：**限流是服务端配额窗口制** —— 本地标记与重测都不改变配额本身，
- *   按钮只剩「白烧配额」与「把受限账号放回池里再撞一次」两种副作用。
+ * - Gemini / OfficeAce：**限流是服务端配额制** —— 本地标记与重测都不改变配额本身，
+ *   按钮只剩「白烧配额」与「把受限账号放回池里再撞一次」两种副作用；
+ * - Accio：**根本不写 `modelRateLimits`、也不在 `probeById` 里** ——
+ *   两个按钮点下去零请求、零清除（恒为惰性）。
+ * ⚠️ 2026-10-13 合并审计补 OfficeAce：此前这里只列三家（漏了它），
+ *    而实测 `rateLimit === false` 是**四家**。判据以 registry 为准，本段只是说明。
  *
  * 落地问法：「这个按钮点下去，能不能让用户**少**受限一次？」答否即 `false`。
  *
  * ⚠️ 2026-10-08 起**从 `src/provider-registry.ts` 的 `rateLimit` 字段派生**。
- * 上面那段「登记 `false` 的判据」与两个子类的理由**已随值迁移**到 registry
- * 里各自的 `rateLimit` 字段注释（Loomy 完全不返回限流错误；Gemini 是服务端
- * 配额窗口制、按钮只剩副作用）。
+ * 上面那段「登记 `false` 的判据」与各家理由**已随值迁移**到 registry
+ * 里各自的 `rateLimit` 字段注释。
  */
 export const RATE_LIMIT_CAPABILITIES = Object.freeze(
   Object.fromEntries(

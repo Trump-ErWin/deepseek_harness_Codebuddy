@@ -56,6 +56,7 @@ import { LOBSTERAI_PROFILE_SUMMARY_PATH } from '../../src/lobsterai-credits.js'
 import { TRAE_ENT_USAGE_PATH } from '../../src/trae.js'
 import { MINIMAX_CREDIT_DETAILS_PATH } from '../../src/minimax-product.js'
 import { GEMINI_QUOTA_PATH } from '../../src/gemini.js'
+import { ACCIO_SUBSCRIPTION_PATH } from '../../src/accio-product.js'
 import { createProviderCredits } from '../../src/provider-credits.js'
 import { expectedProviderIdsInCreditsTable } from '../helpers/provider-sets.js'
 
@@ -486,6 +487,9 @@ const BALANCE_PATH_OF: Readonly<Record<string, string>> = {
   minimax: MINIMAX_CREDIT_DETAILS_PATH,
   zcode: '/api/v1/zcode-plan/billing/balance',
   gemini: GEMINI_QUOTA_PATH,
+  // ⚠️ accio 的**必需**端点是 currentSubscription（三类积分桶）；
+  //    quota 与 userinfo 都是可容忍的补充（失败不影响余额）。
+  accio: ACCIO_SUBSCRIPTION_PATH,
 }
 
 /**
@@ -564,7 +568,7 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     ).toEqual(expected)
     // 反向：确认上面那圈里真的既有 true 也有特例，否则断言可能恒真。
     expect(PROVIDER_REGISTRY.some((d) => d.credits.balance !== true)).toBe(true)
-    expect(expected.length).toBe(11)
+    expect(expected.length).toBe(12)
     // ⚠️ **关键集合判据必须对「生产真正调用的那种形态」也成立**（2026-10-08 复审 C1）：
     //    上面那次是 `createProviderCredits()`（无 deps），而端点与 `index.ts` 调的
     //    都是 `createProviderCredits({ loomy, raccoon, zcode })`。deps 只应影响**实现**，

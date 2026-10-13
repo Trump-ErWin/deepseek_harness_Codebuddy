@@ -19,7 +19,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
 
   it('每个 provider 都有非空 label / logoClass', () => {
     // ⚠️ 不断言 icon：registry **刻意不持有图标**（那会让宿主产物白白背上
-    //    约 40 KB 的 data URI 字面量，而宿主从不使用图标）。图标在客户端的
+    //    几十 KB 的 data URI 字面量，而宿主从不使用图标）。图标在客户端的
     //    PROVIDER_ICONS 里，由 Step 8 那条「两边 id 集合相等」的守卫覆盖。
     for (const d of PROVIDER_REGISTRY) {
       expect(d.label.length, `${d.id} 缺 label`).toBeGreaterThan(0)
@@ -27,9 +27,11 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-  it('共 16 条（15 个真渠道 + aggregate）', () => {
-    expect(PROVIDER_REGISTRY).toHaveLength(16)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(15)
+  it('共 17 条（16 个真渠道 + aggregate）', () => {
+    // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
+    //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
+    expect(PROVIDER_REGISTRY).toHaveLength(17)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(16)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
   })
 
@@ -61,8 +63,8 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
   /**
    * ⚠️ **三张派生表必须同款：外层与内层各自 `Object.freeze`**（2026-10-08 复审修复）。
    *
-   * 重构前 `credits-capabilities.js` 的 15 条字面量各自带 `Object.freeze({…})`；
-   * 改成派生时只保住了外层的 `Object.freeze(creditCapabilitiesOf())` —— 那只冻结
+   * 重构前 `credits-capabilities.js` 是**逐条手写的字面量**、每条各自带
+   * `Object.freeze({…})`；改成派生时只保住了外层的 `Object.freeze(creditCapabilitiesOf())` —— 那只冻结
    * **外层容器**，**内层条目仍可被改写**。同文件另外两张表
    *（`RATE_LIMIT_CAPABILITIES` / `ACCOUNT_TEST_CAPABILITIES`）各自都留着
    * `Object.freeze({…})`，故这是**只在其中一张表上静默失效的保险**。
@@ -107,10 +109,17 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(win).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('rateLimit === false 恰好是既有的 3 家（officeace 2026-10-12 加入）', () => {
+  it('rateLimit === false 恰好是 4 家（officeace 2026-10-12、accio 2026-10-13 加入）', () => {
     const off = PROVIDER_REGISTRY.filter((d) => d.rateLimit === false)
       .map((d) => d.id).sort()
-    expect(off).toEqual(['gemini', 'loomy', 'officeace'])
+    // ⚠️ 四家**理由各不相同**（见 registry 里各自的字段注释）：
+    // - loomy：根本不返回限流错误（静默降级扣永久积分）；
+    // - gemini / officeace：限流是服务端配额窗口制，本地标记与重测都不改变配额；
+    // - accio：**不写 `modelRateLimits` 且不在 `probeById` 里** ⇒
+    //   两个按钮恒为惰性（零请求、零清除）。
+    // 新增一家时**不要**只改这里：判据是 registry 的落地问法
+    //「这个按钮点下去，能不能让用户少受限一次？」
+    expect(off).toEqual(['accio', 'gemini', 'loomy', 'officeace'])
   })
 
   it('accountTest === true 恰好是 gemini', () => {
@@ -133,7 +142,7 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     const withNs = PROVIDER_REGISTRY.filter((d) => d.settingsNamespace !== undefined)
       .map((d) => d.id).sort()
     expect(withNs).toEqual([
-      'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy', 'minimax',
+      'accio', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy', 'minimax',
       'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
   })

@@ -66,6 +66,9 @@ export const REFRESH_PROVIDERS = [
   // officeace（2026-10-12）：华为云 OAuth 单账号，`refreshAccountCredential`
   // 重读并续期那一份凭据（见 `officeace-auth.ts` 的该函数注释）。
   'officeace',
+  // accio（2026-10-13）：有真实 refresh 端点（`accio-auth.ts` 的
+  // `refreshCredential`），`refreshAccountCredential` 续期并回写池内 `expiresAt`。
+  'accio',
 ] as const
 
 /**

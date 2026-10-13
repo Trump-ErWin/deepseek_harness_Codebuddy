@@ -80,6 +80,7 @@ const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   //    `officeaceAuthService`），不是 `Service` 子类实例 —— 但它同样以
   //    `ctx.officeaceAuth` 注册，故这里与其余渠道同列。
   ['officeace', 'officeaceAuth'],
+  ['accio', 'accioAuth'],
 ]
 
 /**
@@ -350,7 +351,8 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    前者可能因为清单漏写而通过，后者才把「漏写」变成红的。
     // ⚠️ 判据本体由 `expectedProviderIdsWithAuth()` 单一持有（Task 11-F）。
     const shouldRegister = expectedProviderIdsWithAuth().sort()
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(14)
+    // ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 13 → 15。
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(15)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
@@ -406,6 +408,10 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     //    限流由华为云 MaaS 侧按账号配额管理，本地标记清掉、重测通过也恢复不了配额
     //    （与 gemini / loomy 同因）。登记为空是**被验证的声明**，不是「忘了接」。
     ['officeace-adapter.ts', []],
+    // accio（Accio 阿里）**不写** `modelRateLimits`：本任务（Task 6）只实现
+    // 目录 / 解析 / 流式，请求级换号与冷却不在范围内。留空是**被验证的声明**
+    // （见下面「登记为不写标记的文件确实没有写点」那条用例）。
+    ['accio-adapter.ts', []],
   ]
 
   /**
