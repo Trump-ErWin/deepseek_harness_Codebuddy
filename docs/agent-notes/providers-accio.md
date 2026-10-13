@@ -610,6 +610,50 @@ DSH 会把 **`CatalogEntry.id` 注入给模型当身份** —— 而 accio 原�
 **反向验证**（各自逐字节还原）：去掉上行映射 ⇒ 2 条红；id 退回 `modelCode` ⇒ 8 条红；
 补丁索引退回 `modelCode` ⇒ 1 条红。
 
+### ⚠️⚠️ 但**光有归一化补丁还不够**：候选表另有一道闸门（2026-10-13 合并审计实测）
+
+**这是本节最容易误判的一处** —— 我当时只验到「规范键归并对了」（`canonicalKeyFor`
+返回 `via: 'patch'` ⇒ `qwen3-8-flash`）就宣布「✅ 仍归并到一起」，
+**但用户要的是「轮换列表里要有 accio」，而那是另一层**。
+
+| 层 | 由什么决定 | 当时状态 |
+|---|---|---|
+| ① **模型层**：同名模型归成一个虚拟模型 | `PRIMARY_CHANNEL` + `CANONICAL_OVERRIDES` | ✅ 已对（补丁命中） |
+| ② **候选层**：哪些渠道出现在该虚拟模型的候选表里 | **`WIRED_EXPIRY_PROVIDERS`** | ❌ **不在表里 ⇒ 被剔掉** |
+
+`aggregate-adapter.ts` 有 **4 处**按 `WIRED_EXPIRY_PROVIDERS.includes(...)` 过滤
+（探测 / 候选 / 虚拟模型 / 价格）。**只把它加进 `AGGREGATE_CHANNELS` 是无效接线**
+—— 那只是「进聚合目录」，候选层仍会被剔。症状**完全静默**（无报错、无日志），
+用户只会看到「聚合里选不到 accio」。
+
+**实测证据**（审计方用真实适配器跑的）：`loomy + accio` 的候选表**只有 loomy**；
+`prepareCall` 实际也只发往 loomy。而 `canonicalKeyFor('accio', …)` 同时返回
+`via: 'patch'` ⇒ **两层结论相反**，只看一层必然误判。
+
+⇒ 修法（两处**必须同改**，`expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁一致）：
+1. `aggregate-expiry.ts` 加 `accioExpiry`（与 **loomy 同形**：命名池、无逐包时间戳）；
+2. `WIRED_EXPIRY_PROVIDERS` 加 `'accio'` + `provider-expiry.ts` 的
+   `createProviderExpiry()` 加一条。
+
+**`accioExpiry` 的三格判据**：有每日额度 ⇒ **当日 24:00**（24h 作废且不累积）；
+只剩每月/推荐 ⇒ `NEVER`（上游**没有**下发它们的到期时间 ⇒ 不猜）；
+全 0 / 查询失败 ⇒ `UNUSABLE`（**不是 NEVER** —— 把它当长期可用会把请求发到没额度的渠道）。
+
+⚠️ **刻意不用 `quota.refreshCountdownSeconds` 当到期时间**：`accio-credits.ts` 已记录
+「它只说**额度何时刷新**，与『这批积分何时作废』**未被实测为同一时刻**」⇒
+写进 `deductionEndTime` 就是编造。本函数只在**有每日额度**时给「当日结束」这个
+**保守上界**（排序要的是「今天就作废的排前面」，不是精确作废时刻）。
+
+⚠️ **officeace 仍未接入**（同一次审计发现、**本轮刻意未做**）：它与 buddy 系同形
+（有 `deductionEndTime`）⇒ **可接而未接**。接法同上，但需产品确认；
+在那之前它同样**进不了聚合候选表** —— 注释已如实登记，别读成「已经能进」。
+
+测试：`tests/unit/aggregate-expiry.spec.ts` 的 `★ accioExpiry` 4 条（当日 24:00 /
+只剩月包 ⇒ NEVER / 全 0 ⇒ UNUSABLE / 未登录 ⇒ UNUSABLE）+
+`expiry-runtime-parity.spec.ts` 的清单对拍。
+**反向验证**：删掉白名单里的 accio ⇒ 2 条红；把「有每日额度」改成恒 NEVER ⇒ 1 条红；
+删掉「全 0 ⇒ UNUSABLE」⇒ 1 条红。
+
 ## 8. 区域
 
 - **gateway 同一个**（`phoenix-gw.alibaba.com`），与区域无关。

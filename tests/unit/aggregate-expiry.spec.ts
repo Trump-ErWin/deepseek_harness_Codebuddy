@@ -218,6 +218,82 @@ describe('★ WIRED_EXPIRY_PROVIDERS：未接入渠道必须被剔除、已接�
   }, 30_000)
 })
 
+describe('★ accioExpiry：命名池折算（与 loomy 同形，2026-10-13 合并审计补）', () => {
+  /**
+   * ⚠️ **为什么必须有这一组**：把 accio 加进 `WIRED_EXPIRY_PROVIDERS` 只是
+   * 「允许它出现在聚合候选表里」；**折算值本身对不对**要单独锁。
+   *
+   * 三条判据（逐格，缺一格就是将来的事故）：
+   *  - 有每日额度 ⇒ **当日 24:00**（24h 作废且不累积 ⇒ 临期优先里排最前）；
+   *  - 只剩每月/推荐 ⇒ `NEVER`（上游**没有**下发它们的到期时间 ⇒ 不猜）；
+   *  - 三类桶全 0 / 查询失败 ⇒ `UNUSABLE`（**不是 NEVER**：把它当「长期可用」
+   *    会让请求被发到一个没额度的渠道）。
+   */
+  const makeDetail = (rows: Array<{ label: string; remaining: number }>) => ({
+    balance: {
+      total: rows.reduce((s, r) => s + r.remaining, 0),
+      packages: rows.map((r) => ({
+        name: r.label,
+        unit: 'credit',
+        remaining: r.remaining,
+        total: r.remaining,
+        used: 0,
+        active: true,
+        cycleStartTime: '',
+        cycleEndTime: '',
+        expiredTime: '',
+      })),
+    },
+  })
+
+  it('★ 有每日额度 ⇒ 当日 24:00（不是 NEVER）', async () => {
+    const { accioExpiry } = await import('../../src/aggregate-expiry.js')
+    const { fetchAccioBalanceDetailed } = await import('../../src/accio-credits.js')
+    const spy = vi.spyOn(
+      await import('../../src/accio-credits.js'),
+      'fetchAccioBalanceDetailed',
+    ).mockResolvedValue(makeDetail([{ label: '每日积分', remaining: 199 }]) as never)
+    void fetchAccioBalanceDetailed
+    const v = await accioExpiry({ access_token: 'x', refresh_token: 'y', expires_at: Date.now() + 1e6 } as never)
+    expect(v).toBeGreaterThan(Date.now())
+    expect(v).toBeLessThan(Date.now() + 48 * 3600_000)
+    spy.mockRestore()
+  })
+
+  it('★ 只剩每月/推荐（无每日）⇒ NEVER（长期，不剔除）', async () => {
+    const { accioExpiry } = await import('../../src/aggregate-expiry.js')
+    const spy = vi.spyOn(
+      await import('../../src/accio-credits.js'),
+      'fetchAccioBalanceDetailed',
+    ).mockResolvedValue(makeDetail([{ label: '每月积分', remaining: 500 }]) as never)
+    expect(await accioExpiry({} as never)).toBe(NEVER)
+    spy.mockRestore()
+  })
+
+  it('★ 三类桶全为 0 ⇒ UNUSABLE（**不是** NEVER）', async () => {
+    const { accioExpiry } = await import('../../src/aggregate-expiry.js')
+    const spy = vi.spyOn(
+      await import('../../src/accio-credits.js'),
+      'fetchAccioBalanceDetailed',
+    ).mockResolvedValue(makeDetail([
+      { label: '每日积分', remaining: 0 },
+      { label: '每月积分', remaining: 0 },
+    ]) as never)
+    expect(await accioExpiry({} as never)).toBe(UNUSABLE)
+    spy.mockRestore()
+  })
+
+  it('★ 查询失败 / 未登录（balance 为 null）⇒ UNUSABLE', async () => {
+    const { accioExpiry } = await import('../../src/aggregate-expiry.js')
+    const spy = vi.spyOn(
+      await import('../../src/accio-credits.js'),
+      'fetchAccioBalanceDetailed',
+    ).mockResolvedValue({ balance: null, error: '未登录' } as never)
+    expect(await accioExpiry({} as never)).toBe(UNUSABLE)
+    spy.mockRestore()
+  })
+})
+
 describe('★ 第 3 轮审计：未接入渠道必须短路（不取号、不读目录）', () => {
   it('未接入渠道：不得调用 firstModelIdOf，也不得取号', async () => {
     // ⚠️ 实测缺陷：初版对未接入渠道**先取号、后**才走到分派的兜底返回 UNUSABLE
