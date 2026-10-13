@@ -556,7 +556,9 @@ class MemoryStore implements JetHubStore {
  * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
  * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
  * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `zcode`
- * / `opencode` / `gemini` / `accio`。
+ * / `opencode` / `gemini` / `officeace` / `accio`。
+ * ⚠️ 这行清单必须与**下面那张表的实际项数**一致（2026-10-13 合并审计：
+ *    此前它漏了 `officeace` —— 表里有、清单里没有，属注释失实）。
  */
 const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   ['CODEARTS', 'codearts'],
@@ -585,11 +587,9 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   // ⚠️ 第 15 个 provider（officeace，2026-10-12）—— 同款坑第 **四** 次。
   // 漏加 = `OFFICEACE_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
-  // 本表与客户端 `PROVIDERS` 的一致性由
-  // `tests/unit/jet-hub-store.spec.ts` 的「恢复表覆盖客户端 PROVIDERS 的全部
-  // provider（从真实清单派生）」用例锁死 —— 合并新增 provider 前**先跑它**。
   ['OFFICEACE', 'officeace'],
-  // ⚠️ 第 15 个 provider（accio，2026-10-13）—— 同款坑第 **四** 次。
+  // ⚠️ 第 16 个 provider（accio，2026-10-13）—— 同款坑第 **五** 次
+  //（⚠️ 与 officeace **同一次合并**并入，两者各算一次复发）。
   // 漏加 = `ACCIO_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
   ['ACCIO', 'accio'],

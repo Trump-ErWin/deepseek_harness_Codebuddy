@@ -78,9 +78,23 @@ STS 寿命约 2 小时，恰好落在「恢复后到定时器补触发那一轮�
 
 ⚠️ **这条不是「记得加」能解决的** —— 原有的守卫是**硬编码白名单**，
 只锁住已知的 11 家，新增 provider 漏接时**零用例变红**。
-现已改为**从 `PROVIDER_REGISTRY` 派生**（`credits-balance-self-heal.spec.ts`
-的 `★★ 每个「有余额能力的渠道」都必须在自愈 Set 里`），并做过反向验证：
+现已把**守卫用例的期望值**改为**从 `PROVIDER_REGISTRY` 派生**
+（`credits-balance-self-heal.spec.ts` 的
+`★★ 每个「有余额能力的渠道」都必须在自愈 Set 里`），并做过反向验证：
 删掉 `OFFICEACE.id` 精确点名变红。
+
+⚠️⚠️ **但生产侧的那个 Set 仍是硬编码**（`src/jet-hub-rpc.ts` 的
+`SELF_HEAL_REFRESHABLE_PROVIDERS`，形如 `new Set([...])` 字面量）——
+**2026-10-13 合并审计实测确认**。两者是**两个不同的东西**：
+
+| | 是什么 | 漏加新 provider 的后果 |
+|---|---|---|
+| 生产 `SELF_HEAL_REFRESHABLE_PROVIDERS` | 硬编码 `Set` | 该家**永不自愈**（症状静默、日志零字） |
+| 守卫用例的**期望值** | 从 `PROVIDER_REGISTRY` 派生 | **用例变红**（把静默失效变成显式失败） |
+
+⇒ **加新 provider 时仍必须手动往那个 `Set` 里加一行**；守卫的作用是
+「忘了加就会红」，不是「加了就自动生效」。别把「期望值已派生」读成
+「生产 Set 已派生」—— 那正是本节此前措辞的歧义。
 
 同款陷阱还有 `src/jet-hub-store.ts` 的 `REF_PREFIX_TO_PROVIDER`（漏加 =
 `OFFICEACE_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失）。

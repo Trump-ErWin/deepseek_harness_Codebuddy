@@ -354,9 +354,15 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     creditPackages: true,
     permanentLock: true,
     usesExpiryWindow: true,
-    // ⚠️ 与 gemini 同值但**理由不同**：它确实会回 429、适配器也写 `modelRateLimits`，
-    //    但限流由华为云 MaaS 侧按账号配额管理 —— 本地标记清掉、重测通过，
-    //    配额本身一点没恢复，下一次请求立刻又是 429。
+    // ⚠️ `rateLimit: false` 的**真实理由**（2026-10-13 合并审计实测订正）：
+    //    本适配器**根本不写** `modelRateLimits`（`officeace-adapter.ts` 里
+    //    `modelRateLimits` / `updateModelRateLimit` / `markLimited` **零命中**，
+    //    `provider-runtime-wiring.spec.ts` 也把它登记为空数组）⇒
+    //    账号永远没有标记可清 ⇒ 两个按钮点下去**零请求、零清除**（恒惰性）。
+    //    ⚠️ 此前这里写的是「它确实会回 429、适配器也写 `modelRateLimits`，
+    //    但限流由华为云 MaaS 侧按账号配额管理」——**那句失实**（前半个分句是错的），
+    //    真实判据与 accio 同因（「根本没有这组按钮的作用对象」），
+    //    与 loomy / gemini 的「会写但清不掉」**不是同一回事**。
     rateLimit: false,
     settingsNamespace: 'llm-officeace',
     channel: true,

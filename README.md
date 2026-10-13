@@ -6,7 +6,7 @@ deepseek-harness 插件：统一管理多个 AI 编程服务的账号，并把�
 的模型选择器。支持**多账号池**（同一服务登录多个账号，按可用性自动选号）与
 **凭据静默续期**（到期前自动刷新，无需再次打开浏览器）。
 
-- **15 个 provider 路由**，外加 1 个**聚合**路由（见下）
+- **16 个 provider 路由**，外加 1 个**聚合**路由（见下）
 - 登录、状态、续期、积分领取**全部在 Jet Hub 设置页完成**，不注册任何斜杠命令
 - 附带一个**本机 OpenAI 兼容网关**，供其它客户端复用已登录账号
 
@@ -134,7 +134,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 
 ## 支持的渠道
 
-15 个 provider 路由，互不覆盖，可同时使用。
+16 个 provider 路由，互不覆盖，可同时使用。
 
 | id | 渠道 | 登录方式 | 积分能力 |
 |---|---|---|---|
@@ -152,6 +152,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 | `zcode` | ZCode（智谱 z.ai） | OAuth 设备码 | 余额 + 每日领取 |
 | `opencode` | OpenCode | — | 余额 |
 | `gemini` | Gemini Code Assist | 浏览器回调 | 余额 |
+| `officeace` | OfficeAce（华为 MaaS / 果办） | 华为云 OAuth PKCE | 余额 + 自动领取（**无手动签到入口**） |
 | `accio` | Accio（阿里） | 浏览器回调 | 余额（三类桶；**无签到**） |
 
 各渠道的能力与限制要点：

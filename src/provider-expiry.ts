@@ -55,6 +55,7 @@
  */
 
 import {
+  accioExpiry,
   buddyExpiry,
   codeArtsExpiry,
   lobsteraiExpiry,
@@ -62,6 +63,7 @@ import {
   traeExpiry,
   zcodeExpiry,
 } from './aggregate-expiry.js'
+import type { AccioCredential } from './accio.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE } from './trae-product.js'
@@ -102,5 +104,9 @@ export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>>
     zcode: { credentialExpiry: (c, context) => zcodeExpiry(c as ZcodeCredential, context) },
     lobsterai: { credentialExpiry: (c) => lobsteraiExpiry(c as LobsteraiCredential, LOBSTERAI) },
     trae: { credentialExpiry: (c) => traeExpiry(c as TraeCredential, TRAE) },
+    // ⚠️ accio：与 loomy **同形**（命名池、无逐包时间戳）⇒ 单独一条原语。
+    //    加它时必须**同时**进 `WIRED_EXPIRY_PROVIDERS`（`expiry-runtime-parity.spec.ts`
+    //    真跑 `apply()` 锁这两者一致；只改一处会红）。
+    accio: { credentialExpiry: (c) => accioExpiry(c as AccioCredential) },
   }
 }

@@ -22,7 +22,9 @@
 
 因此你要添加的 provider 如果属于**已有脉系**（比如再加一个腾讯系产品），只需加一份 `BuddyProduct` 配置并注册实例；如果是**全新的脉系**（全新的API协议、认证方式、签到流程），需要仿照 LobsterAI 创建一套独立但遵循相同架构模式的实现。
 
-> 📌 **最新一份完整范例是 `accio`（2026-10-13，第 15 个 provider）**：
+> 📌 **最新一份完整范例是 `accio`（2026-10-13，第 16 个 provider）**：
+> ⚠️ 序号按 `PROVIDER_REGISTRY` 的声明顺序数；officeace（第 15，2026-10-12）
+> 与 accio **同一次**合入 master，故两者相差一格。
 > `src/accio-product.ts` → `accio.ts` → `accio-oauth.ts` → `accio-auth.ts` →
 > `accio-messages.ts` → `accio-adapter.ts` → `accio-credits.ts`，另有客户端专属面板。
 > 它的实测笔记（`docs/agent-notes/providers-accio.md`）里有三条**与参考实现相反**
