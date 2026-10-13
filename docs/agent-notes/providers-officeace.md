@@ -207,6 +207,93 @@ STS 寿命约 2 小时，恰好落在「恢复后到定时器补触发那一轮�
 字面量**（它断言 `jet-hub-rpc.ts` 的源码文本）而恒红。⇒ 只锚定 **import 语句**
 （没 import 就必然调不到真实实现，精确且不会假失败）。
 
+## 5.6 ⚠️⚠️ DSML 工具调用是**闭环**：只「教」不「解」= 工具永不执行（2026-10-13）
+
+DeepSeek-V4 系模型走 DSML 而非标准 `tool_calls`（理由见 `src/dsml.ts` 头注：
+标准 `tool_calls` 的参数需一次性打包，会撞 APIG ~60s 空闲断连）。
+
+⚠️ **这条协议由插件负责收发，宿主不参与**。实测宿主 bundle（116 MB
+`app.asar`）用 `findstr` 搜 `DsmlContentExtractor` / `parseDsmlToolCalls` /
+`DSML_TOOL_CALLS_OPEN` —— **全部零命中**，只有标准 `tool_calls`。
+
+故一个通道要用 DSML，必须**两半都接**：
+
+| 一半 | 做什么 | 落点 |
+|---|---|---|
+| **教** | 不发 `tools` 字段，改把 schema 注入 system 提示 | `buildDsmlSystemPrompt` |
+| **解** | 把正文里的 DSML 块摘出来转成结构化 tool-call | `DsmlContentExtractor` |
+
+⚠️ **只接「教」的后果**：模型写出的 DSML 整段当**正文**显示，工具
+**永不执行** —— 用户看到的是标签文本而不是执行结果，且日志里那条
+assistant 消息只有 `reasoning` + `text` 两块、**没有任何 `tool/call` 记录**。
+
+这正是本通道**合并初期的真实状态**：`officeace-adapter.ts` 注入了提示且
+`toolsPayload = undefined`（模型只会写 DSML），而它走的 `consumeOpenAiSse`
+（`openai-compat.ts`）**不解析 DSML** —— 解析器当时只存在于
+`llm-adapter.ts`（CodeArts 专用），本通道复用不到。
+
+这跟当初**漏注入** `buildDsmlSystemPrompt` 是**同一个病根**：
+协议实现散落，换个通道就漏一半。
+
+### 修法：协议实现只有一份，收发成对
+
+- 解析器（状态机 + `parseDsmlToolCalls` + 标量还原）**下沉到 `src/dsml.ts`**，
+  与提示词同处一层；`llm-adapter.ts` 改从共享层导入，删本地副本。
+- `consumeOpenAiSse` 新增可选 `dsmlToolMode`：正文 delta 先过提取器，
+  解析出的调用复用既有 tool-call 注册/发射路径（wire 下标取**负数**，
+  与标准 `tool_calls` 的 0/1/2… 隔离，不抢槽位）。**默认关闭**，
+  关闭时行为与从前逐字节一致；收尾 flush 把未闭合残片放行，不吞内容。
+- `officeace-adapter.ts` 由**同一个 `dsmlMode` 开关**同时驱动两半
+  （注入提示 + 传 `dsmlToolMode`）—— 单边存在就等于没修。
+
+### ⚠️⚠️ OfficeAce **默认不走 DSML**（2026-10-13 三次事故后决定）
+
+`officeace-adapter.ts` 的 `dsmlMode` **默认 `false`**，只有
+`OFFICEACE_DSML=1` 且模型匹配 `needsDsmlToolMode` 时才为真。
+
+| 开关 | 「教」= 注入 `buildDsmlSystemPrompt` | 「解」= 传 `dsmlToolMode` | 请求体 |
+|---|---|---|---|
+| 默认（未设 env）| ✗ | ✗ | 发标准 `tools` 字段 |
+| `OFFICEACE_DSML=1` | ✓（且不发 `tools`）| ✓ | 只发注入的 system 提示 |
+
+**为何默认关**：DSML 把工具协议从「框架保证的结构化字段」降级成「模型自觉
+遵守的文本约定」，而 `deepseek-v4.1-flash` 经本渠道**无法稳定遵循** —— 三轮
+迭代（注入提示 → 大小写判定 → `calls` 别名兼容）全部到位后，模型仍在同一轮
+里混写 `<｜DSML｜tool_calls>` 与 `<｜DSML｜ calls>`；更常见的是**压根不发工具
+调用**，只输出「我这就去查：」然后结束（用户视角 = 「Agent 不干活」）。
+两害相权：标准 `tools` 字段下**工具必定可用**，超时风险留给需要它的场景权衡。
+
+⚠️ 故本节描述的「解析接线」在**默认配置下不执行** —— 它是为
+`OFFICEACE_DSML=1` 那条路径准备的。**codearts 通道不受本开关影响**，
+`needsDsmlToolMode` 在那边仍是恒开（见 `llm-adapter.ts`）。
+
+### 守卫
+
+行为级（**真喂 SSE 流、断言 chunk**）：
+`tests/unit/dsml-consume-wiring.spec.ts` —— 这是**唯一**能证明接线通了的守卫。
+
+- ① / ②：开启时解析出 tool-call、关闭时**逐字节**保持旧行为（对照）。
+- ③：逐字符分帧（标签必然跨帧，只测整块等于没测）。
+- ④ / ⑤：开标签**别名**端到端；⑤ 专门覆盖 `\s*` 的**多空白**形态
+  （`<｜DSML｜␣␣calls>` / `\t` / U+3000）—— 枚举式保留候选会在此提前放行。
+- ⑥ / ⑦：`<thought>` 内容归位到 reasoning；未闭合时残片也须放行。
+- ⑧：**正文死循环命中后到达的 DSML 调用仍须执行**。
+- ⑨：纯 DSML 响应不得留下孤儿 `block-start(text)`。
+- ⑩：上游不合规的 `index:-1` 不得与 DSML 的负数下标撞车。
+- ⑪：名字不可用的调用一个 chunk 都不发（报 max-tokens 而非静默 stop）。
+
+源码级（强度有限，只能防「整段协议被删」）：
+`tests/unit/dsml-parse-roundtrip.spec.ts` 的 ⑥（**剥注释后**断言
+`buildDsmlSystemPrompt(` 与 `dsmlToolMode: true` 各≥2 处）、⑦⑧⑨。
+
+⚠️ **两组的强度差异必须如实标注**：源码 grep **挡不住「删掉接线、保留注释」**
+—— 2026-10-13 审计实测，删掉 `openai-compat.ts` 里
+`if (dsmlExtractor !== undefined) {…}` **整块**后，当时的入库用例**全部仍绿**
+（只有钉住构造那一行的 ⑨ 才红）。这正是必须另立行为级 spec 的原因。
+
+⚠️ 与 §6 的 `reasoning-delta` 归一化缺口是**两件事**：那条是「标记写坏了要修」，
+本条是「协议根本没接全」。
+
 ## 6. 待办 / 已知缺口
 
 - **`maasBaseUrl` 是死字段**：写了从不读。若某账号的 `model_api_url_base`
