@@ -682,6 +682,10 @@ describe('★ 接线层：apply() 出来的真实闭包（替代源码文本断�
   const LEDGER_PROVIDERS = [
     'lobsterai', 'qoder', 'qodercn', 'trae', 'cline',
     'loomy', 'raccoon', 'minimax', 'gemini', 'zcode',
+    // ⚠️ accio（2026-10-13）：它与上面几家**同形**（走 `createCredentialResolver`
+    // 的**纯池选号**分支、无余额分档），故账本分支**可达**，必须进名单 ——
+    // 漏了它，「删掉 accio 注册项里的 `reportAccount`」不会让任何用例变红。
+    'accio',
   ] as const
 
   /** 有 `reportAccount` 注册项、但账本分支结构上不可达的两家（见上）。 */
@@ -708,11 +712,12 @@ describe('★ 接线层：apply() 出来的真实闭包（替代源码文本断�
     gemini: 'GEMINI',
     officeace: {} as never,
     zcode: 'ZCODE',
+    accio: 'ACCIO',
   }
 
   it('⚠️ 账本名单自检：覆盖全部可驱动的 provider，且不可达的那两家被显式登记', () => {
     // 名单为空时 `it.each` 一条都不跑 ⇒ 整组恒绿。这条把该形态钉死。
-    expect(LEDGER_PROVIDERS.length).toBe(10)
+    expect(LEDGER_PROVIDERS.length).toBe(11)
     for (const p of LEDGER_UNREACHABLE) {
       expect(LEDGER_PROVIDERS, `${p} 已可达 ⇒ 应把它补进账本名单`).not.toContain(p as never)
     }

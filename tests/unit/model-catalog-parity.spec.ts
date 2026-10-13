@@ -62,6 +62,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { createModelCatalog, type CatalogEntry } from '../../src/model-catalog.js'
 import { BuddyAdapter } from '../../src/buddy-adapter.js'
+import { AccioAdapter } from '../../src/accio-adapter.js'
 import { ClineAdapter } from '../../src/cline-adapter.js'
 import { CodeArtsAdapter } from '../../src/llm-adapter.js'
 import { GeminiAdapter } from '../../src/gemini-adapter.js'
@@ -581,6 +582,17 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
     { id: 'lobsterai', make: () => new LobsteraiAdapter({ ...NO_CRED } as never) },
     { id: 'codearts', make: () => new CodeArtsAdapter({ ...NO_CRED } as never) },
     {
+      id: 'accio',
+      make: () => new AccioAdapter({
+        ...NO_CRED,
+        // ⚠️ **不注入 `fetchRemoteModels`**：那会走远端拉取（真发网络）。
+        //    不注入时 `ensureRemoteModels` 提前返回 ⇒ 目录回退
+        //    `ACCIO.fallbackModels`（15 条），本段因此是零网络的。
+        // ⚠️ **刻意不传 `accountPool`**：与其余各家同款，且它同时保证
+        //    `providerCatalogVisible` 不因「没有已登录账号」把目录挡空。
+      } as never),
+    },
+    {
       id: 'opencode',
       make: () => new OpencodeAdapter({
         ...NO_CRED,
@@ -593,13 +605,17 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
   ]
 
   /**
-   * ⚠️ **对未知 id 省略 `inputModalities` 的家**：`buddy` 系与 `cline`
-   * （issue IKKZUG，2026-10-12 新增 cline）。
+   * ⚠️ **对未知 id 省略 `inputModalities` 的家**：`buddy` 系、`cline` 与 `accio`
+   * （`cline` 为 issue IKKZUG 2026-10-12 新增；`accio` 为本 provider 新增）。
    *
    * | 家 | 为什么「未知」是真实状态 |
    * |---|---|
    * | `buddy`（含 `workbuddy`） | `imageCapabilityKnown` 区分「明确 false」与「全都没查到」，后者只报未知 |
    * | `cline` | **能力只来自目录条目，而 `cline-pass/*` 的条目只由 models.dev 提供** —— 那是 5.39 MB 的外部站点，用户实测直连三次（超时/超时/1.9s 成功）⇒ 「未知」是高频状态而非理论边界 |
+   * | `accio` | **整个图片通路未实测**（`serializeAccioMessages` 的 `flattenText` 只保留 text 块），故适配器**恒省略** —— 写 `['text']` 是把「未知」写成「明确不支持」（AGENTS.md 静默失效表的「未知被写成否定」那一格：将来接上图片通路时，这个明确的否定会让 DSH 在附件准入阶段就静默拒掉图片） |
+   *
+   * ⚠️ `accio` 与 `accio-adapter.ts` 的 `toCatalogEntry`「恒省略」是**同一件事的
+   * 两处落点**，漏一处就会在这里变红（Task 7 的交接要点 4）。
    *
    * 其余一律**保守报 `['text']`**。
    *
@@ -611,7 +627,7 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
    * 它确实存在「未知态」（能力来源会在进程运行中拿不到），而有些家的目录是
    * 编译期表恒可用、根本不存在未知态 —— 那些**不**该加进来。
    */
-  const OMIT_UNKNOWN_MODALITIES: ReadonlySet<string> = new Set(['buddy', 'workbuddy', 'cline'])
+  const OMIT_UNKNOWN_MODALITIES: ReadonlySet<string> = new Set(['buddy', 'workbuddy', 'cline', 'accio'])
 
   /**
    * ⚠️ **只有 `cline` 与 `codearts` 对未知 id 仍声明 `reasoning`**：它们的档位
@@ -628,12 +644,13 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
 
   it('⚠️ 表的家数 == 全部对外注册的 LLM provider（漏一家 ⇒ 它不过本段任何断言）', async () => {
     // ⚠️ 判据来自 **PROVIDER_REGISTRY**（唯一的 provider 真源），不手抄。
-    //    实测：`channel: true` 的 14 家正好是上面 14 家（`aggregate` 是
+    //    实测：`channel: true` 的 16 家正好是上面 16 家（`aggregate` 是
     //    `channel: false` 的聚合器，不在此列）。
+    //    ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 14 → 16。
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    expect(CASES).toHaveLength(15)
+    expect(CASES).toHaveLength(16)
   })
 
   /**

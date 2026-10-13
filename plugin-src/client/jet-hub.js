@@ -16,6 +16,7 @@ import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
 import {
   formatExpirySplitLine,
+  formatNamedPoolLine,
   formatPoolSplitLine,
   formatPackageTooltip,
   splitCreditsByExpiry,
@@ -203,6 +204,47 @@ export function providerLabel(id) {
  * 留着就是等一个不会到来的能力。
  */
 const GROWTH_TASK_PROVIDERS = new Set(['buddy']);
+
+/**
+ * Accio 的「每日额度」桶名 —— 必须与宿主 `src/accio-credits.ts` 的
+ * `ACCIO_CREDIT_BUCKETS` 里 `daily` 那一行**逐字一致**。
+ *
+ * ⚠️ 按**池名**定位而不是下标：宿主对「缺席的桶不产出」是刻意设计
+ * （`entitlement` 里没有 `daily` 时那一行根本不存在），下标会错位 ——
+ * 错位的后果是「倒计时那一行永远不出现」，**静默失效**，没有任何报错。
+ * 一致性由 `tests/unit/accio-client-panel.spec.ts` 从宿主源码真读该字面量锁死。
+ */
+const ACCIO_DAILY_BUCKET = '每日积分';
+
+/**
+ * Accio 每日额度的**诚实说明**（本面板唯一的说明文案来源）。
+ *
+ * ## 为什么必须把这四件事写清楚
+ *
+ * Accio **没有签到端点**：每日积分由服务端在**登录时**发放
+ * （`DAILY_REWARD`，24 小时有效、**不累积**）。用户对「签到」的心智模型是
+ * 「每天点一下领一笔」，而这个模型每一处都会出错：
+ *
+ * | 不说清 | 后果 |
+ * |---|---|
+ * | 登录时发放 | 用户会去找一个不存在的「领取」按钮 |
+ * | 24 小时有效 | 用户以为可以攒着 |
+ * | 不累积 | 用户以为昨天没登录的那份今天还能补 |
+ * | 重新拿到的办法 | 用户不知道「删号重登」是当前唯一可行的手动路径 |
+ *
+ * ⚠️ **文案里刻意不写具体数字**（实测是 200，但那是**某一时刻的读数**）：
+ * 同一屏正下方就是服务端下发的 `remaining / total`，写死数字会在上游调整额度时
+ * 变成「说明说 200、桶显示 300」的**自相矛盾**。数量以宿主下发的桶为准。
+ *
+ * ⚠️ **本提交刻意不提供「刷新每日额度」按钮**：它需要宿主侧新增
+ * 「重新登录既有账号」的 RPC（现有的 `account.create` 每次都新造账号 id，
+ * 见 `src/jet-hub-rpc.ts`），在 RPC 接线之前渲染那个按钮就是一个
+ * **骗人的控件**。故这里只给出**今天真的能用**的手动路径。
+ * ⚠️ 文案里**不得**出现 `**` 之类的标记（它会被原样渲染成星号）。
+ */
+const ACCIO_DAILY_REWARD_NOTE =
+  'Accio 的每日积分由服务端在登录时发放，有效期 24 小时，次日刷新、不累积。'
+  + '它没有可调用的领取接口 —— 要重新拿到这份每日额度，请删除该账号后重新登录一次。';
 
 function ProviderLogo({ provider }) {
   const p = PROVIDERS.find(p => p.id === provider);
@@ -405,22 +447,64 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
    */
   const quotaDetail = quotaText === null ? null : formatQuotaDetail(all);
   /**
-   * Loomy / Raccoon 的「当日刷新池」必须**单独显示**（用户明确要求）。
+   * Loomy / Raccoon 的「当日刷新池」**单独显示**（用户明确要求）。
    *
-   * 两家的积分都由语义不同的池构成，其中有一个当日刷新（今天不用就没了）：
+   * 两家都有「今天不用就没了」的当日池：
    * - Loomy：`每日赠送`（每天 5000，消耗后不回补）+ `永久积分`
    * - Raccoon：`每日积分`（`daily_points`）+ 奖励 / 会员 / 充值
    *
    * 判据是**池名**（见 `findDailyPool`），不是下标 —— Raccoon 的池是按
    * 「服务端给了哪个字段」动态 push 的，下标会错位。
+   *
+   * ## ⚠️⚠️ 但 **accio 必须排除在这条之外**（真实缺陷，2026-10-13）
+   *
+   * `findDailyPool` 认的当日池名里**包含 `每日积分`** —— 而那正是 **accio 的**
+   * 每日桶名！所以 accio 一旦传进来，这里也算出 `长期 0 · 每日 199`，
+   * 与下面的 `namedPoolText`（`每日 199 · 每月 0 · 推荐 0`）**同时渲染**
+   * ⇒ 卡片上 `每日 199` 出现**两遍**（用户报障，附截图）。
+   *
+   * ⇒ 两条分池线**互斥**：accio 走 `namedPoolText`（见 {@link formatNamedPoolLine}），
+   * 其余走本函数。
+   *
+   * ⚠️ 这里写成「accio ⇒ 短路成 null，否则照算」而**不是排除法**（即
+   * 「provider 不等于 accio 时才走这条」那种写法）：排除法是本仓库明令反对的形态
+   * ——将来新增 provider 忘了登记时，它会**静默**落进 accio 这个分支。
+   * ⚠️ 本条注释刻意**不写出那个被 grep 的形态字面量**：有断言在整份源码里搜它，
+   * 注释里出现会让那条断言**假红**（本仓库记录过的注释级陷阱）。
    */
-  const poolSplitText = formatPoolSplitLine(
-    all,
-    formatForUnit,
-    // Loomy 的另一个池就叫「永久积分」；Raccoon 的奖励/会员/充值三种池
-    // 到期规则各不相同，不能统称永久。
-    provider === 'loomy' ? '永久' : '长期',
-  );
+  const poolSplitText = provider === 'accio'
+    ? null
+    : formatPoolSplitLine(
+        all,
+        formatForUnit,
+        // Loomy 的另一个池就叫「永久积分」；Raccoon 的奖励/会员/充值三种池
+        // 到期规则各不相同，不能统称永久。
+        provider === 'loomy' ? '永久' : '长期',
+      );
+  /**
+   * ⚠️ Accio 走**逐命名池全列**（`formatNamedPoolLine`），不是上面的两桶形状。
+   *
+   * 用户的报障原文（2026-10-13，附截图）：「accio 的显示和别的 provider 没统一，
+   * 例如 loomy 的」—— accio 原先**另起一个独立区块**（`AccioDailyPanel`）显示
+   * 三类桶，而别家都在账号卡片里。现改为与 loomy 同形：卡片里就是积分行。
+   *
+   * ⚠️ 为什么不能直接用 `formatPoolSplitLine`：它是两桶形状，会把「每月」与
+   * 「推荐」笼统求和成「长期」，而这两类语义并列（到期规则不同）——
+   * 见 `formatNamedPoolLine` 的注释。
+   */
+  const namedPoolText = provider === 'accio' ? formatNamedPoolLine(all, formatForUnit) : null;
+  /**
+   * Accio 的「每日额度 ⋯ 后刷新」附注（`null` = 不渲染）。
+   *
+   * ⚠️ 只在**当日池存在**时才有值：`accioResetSeconds` 按池名找 `每日积分`，
+   * 那个包上才挂着 `quota` 端点的倒计时（其余桶刻意留空 —— 见 `accio-credits.ts`）。
+   */
+  const accioResetNote = provider === 'accio'
+    ? (() => {
+        const countdown = formatAccioResetCountdown(accioResetSeconds(all, now));
+        return countdown === null ? null : `每日额度 ${countdown}后刷新`;
+      })()
+    : null;
   return React.createElement('div', { className: 'dim-jh-metaRow' },
     // ⚠ 标签按单位走：ZCode 是 token，显示「Token」而不是「积分」。
     React.createElement('dt', null, label),
@@ -443,6 +527,26 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     // 这条也解释了「锁定永久积分后为什么没有可用账号」——临期桶是 0。
     // ⚠️ 用词「长期」不是「永久」：有到期日的积分即使很远也不叫永久（用户定）；
     //    只有**服务端没给到期时间**的才是真·永久（绿）。
+    // ⚠️ Accio 的逐池列（与 loomy 的 `poolSplitText` 同位置、同样式，故视觉统一）。
+    namedPoolText
+      ? React.createElement('span', { className: 'dim-jh-creditPools' }, namedPoolText)
+      : null,
+    /**
+     * ⚠️ Accio 的每日额度重置倒计时（**唯一**与 loomy 不同的附注）。
+     *
+     * 别的家没有这一条；但 accio 的每日额度是 24 小时作废且**不累积**，
+     * 「还有多久刷新」是用户唯一能据此决定「现在要不要用掉」的信息。
+     * ⚠️ 它放在**积分行内**（而不是另起区块）—— 这正是 2026-10-13 的统一要求。
+     */
+    accioResetNote
+      ? React.createElement('span', {
+          className: 'dim-jh-creditPools',
+          title: ACCIO_DAILY_REWARD_NOTE,
+        }, accioResetNote)
+      : null,
+    // 两个 buddy + TRAE + LobsterAI：按「会不会近期作废」分桶，与选号判据同一套规则。
+    // 这条也解释了「锁定永久积分后为什么没有可用账号」——临时桶是 0。
+    // ⚠️ 用词「长期」不是「永久」：这些积分都有到期日，只是较远（用户定）。
     // ⚠️ 与上面的池分桶互斥：有当日池的（loomy / raccoon）走池名分桶，
     // 没有的走到期时间分桶。
     !poolSplitText && expiryParts.length > 0
@@ -2368,6 +2472,49 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
         renderEntries())));
 }
 
+/**
+ * 把「距每日额度刷新还剩多少秒」格式化成 `12 小时 34 分`。
+ *
+ * ⚠️ 秒数由**宿主**下发（`quota.refreshCountdownSeconds`，见
+ * `src/accio-credits.ts` 的 `AccioQuota`），客户端**不得**写死它：上游改刷新
+ * 周期后写死的倒计时会与真实重置时刻脱节，而且不会有任何报错
+ * （本仓库记录的「静默失效」形态）。
+ *
+ * @param {number} seconds 剩余秒数。
+ * @returns {string|null} 不可读（负 / 非有限 / 非数字）时返回 null，调用方整行不渲染。
+ */
+function formatAccioResetCountdown(seconds) {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return null;
+  const totalMinutes = Math.floor(seconds / 60);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分`;
+  if (minutes > 0) return `${minutes} 分`;
+  return `${seconds} 秒`;
+}
+
+/**
+ * 从宿主下发的资源包里算「距每日额度刷新还剩多少秒」。
+ *
+ * 宿主把倒计时写进了**每日桶**的 `cycleEndTime`（`src/accio-credits.ts` 的
+ * `accioQuotaResetIso`，字段本义就是「计量周期结束时间」），故这里从该时刻现算。
+ *
+ * ⚠️ 按 {@link ACCIO_DAILY_BUCKET} **池名**定位，不用下标（见该常量的注释）。
+ * ⚠️ 算不出时返回 null（调用方整行不渲染）——**不编造一个倒计时**。
+ */
+function accioResetSeconds(packages, now) {
+  if (!Array.isArray(packages)) return null;
+  const daily = packages.find(pkg => pkg && pkg.name === ACCIO_DAILY_BUCKET);
+  if (daily === undefined) return null;
+  const end = typeof daily.cycleEndTime === 'string' && daily.cycleEndTime.length > 0
+    ? Date.parse(daily.cycleEndTime)
+    : Number.NaN;
+  if (!Number.isFinite(end)) return null;
+  const at = typeof now === 'number' && Number.isFinite(now) ? now : Date.now();
+  return Math.max(0, Math.round((end - at) / 1000));
+}
+
+
 function ProviderPanel({ provider, rpcCall }) {
   const [accounts, setAccounts] = React.useState([]);
   const [phase, setPhase] = React.useState('loading');
@@ -2381,6 +2528,17 @@ function ProviderPanel({ provider, rpcCall }) {
    * 缺省 `bigmodel`，与后端 `req.zcodeProvider ?? 'bigmodel'` 对齐。
    */
   const [zcodeProvider, setZcodeProvider] = React.useState('bigmodel');
+  /**
+   * Accio 登录区域（仅 `provider === 'accio'` 时用）。
+   *
+   * ⚠️ **这不是「多一个可选偏好」，而是登录能否成功的前提**：Accio 的登录页
+   * 按区域分域名（`cn` → `www.accio-ai.com`，`global` → `zh.accio.com`），
+   * 而区域**由服务端按账号下发、登录前无从推断**（`userinfo.routeRegion` 要
+   * 先有凭据才能查）。选错 ⇒ 国际账号打不开中国版登录页 ⇒ **根本登不进去**。
+   *
+   * 缺省 `cn`，与宿主 `normalizeAccioRegion` 的回落值一致（未知值也回落 `cn`）。
+   */
+  const [accioRegion, setAccioRegion] = React.useState('cn');
   /**
    * ★ 弹窗是否开着（`false` = 关着）。
    *
@@ -2539,6 +2697,15 @@ function ProviderPanel({ provider, rpcCall }) {
    * 永远停在「查询失败」、控制台每次都留报错。
    */
   const canLoadCredits = supportsCreditBalance(provider);
+  /**
+   * 「新建账号」弹窗里问的是**登录区域**（accio）而不是**登录渠道**（zcode）。
+   *
+   * ⚠️ 写成**正向**判据，与本仓库「反对排除法」的约定一致；
+   * 且它与 `newAccountAsksChannel(provider)` 是**两件事**：
+   * 前者回答「弹窗内容长什么样」，后者回答「要不要弹」。
+   * 两者都必须由 `provider` 驱动，任一处漏改都会得到「弹窗内容与判据不匹配」。
+   */
+  const accioDialog = provider === 'accio';
   // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
   // 有成长中心的 provider 才传 runTasks（见 GROWTH_TASK_PROVIDERS 的注释：
@@ -3016,10 +3183,11 @@ function ProviderPanel({ provider, rpcCall }) {
       //   用户在 DevTools 里截图 / 复制日志求助时会把它一起外泄，state 在登录窗口内
       //   可被重放。⇒ 这里只记 provider 与本地生成的 `accountId`（不是凭据）。
       //
-      // ⚠ `zcodeProvider` 只在 zcode 时下发（`buildCreateAccountPayload` 内部分支），
-      //   其余 provider 的载荷与接入渠道弹窗前**逐字节相同**。
-      const res = await rpcCall('account.create', buildCreateAccountPayload(provider, zcodeProvider));
-      accountId = res.accountId;
+      // ⚠ `zcodeProvider` / `accioRegion` 各自**只在对应 provider 时下发**
+      //   （`buildCreateAccountPayload` 内部分支），
+      //   其余 provider 的载荷与接入预选弹窗前**逐字节相同**。
+      const res = await rpcCall('account.create',
+        buildCreateAccountPayload(provider, zcodeProvider, accioRegion));      accountId = res.accountId;
       loginUrl = res.loginUrl;
       console.log('[jet-hub] account.create ok, provider =', provider, ', accountId =', accountId);
       // ⚠ **`reused` 分支必判**：后端若声明「复用了池里已有条目、新建条目与登录 URL」，
@@ -3516,10 +3684,13 @@ function ProviderPanel({ provider, rpcCall }) {
           },
           disabled: creating,
         }, creating ? '正在登录…' : '+ 新建账号'),
-        // ★ 渠道选择对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
+        // ★ 预选对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
+        //
+        // ⚠ 内容按 provider 分支：zcode 问**登录渠道**，accio 问**登录区域**
+        //   （两者都收在 `newAccountAsksChannel` 的白名单里）。
         //
         // ⚠ `newAccountAsksChannel(provider)` 这道是**防御性**的：按钮已经分支过，
-        //   正常路径下非 zcode 永远不会把 `pendingLogin` 置为「开」。
+        //   正常路径下不在白名单的 provider 永远不会把 `pendingLogin` 置为「开」。
         //   但状态是活的（用户切 provider 时本面板会重新挂载，理论上仍可能
         //   残留一帧），漏掉它就会退回 issue 里那个「非 zcode 弹出 ZCode 窗」的形态。
         //
@@ -3541,19 +3712,35 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: (event) => event.stopPropagation(),
             },
               React.createElement('h3', { className: 'dim-jh-zcDialogTitle' },
-                '添加 ZCode 账号'),
+                accioDialog ? '添加 Accio 账号' : '添加 ZCode 账号'),
               React.createElement('p', { className: 'dim-jh-zcDialogHint' },
-                '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，',
-                '可用 z.ai（国际）登录另一个账号。'),
+                accioDialog
+                  // ⚠ 必须说清「区域不可事后推断、选错就登不进去」：
+                  //   它不是偏好设置，而是登录页域名本身（见 accioRegion 的注释）。
+                  ? 'Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前'
+                    + '无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。'
+                  : '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，'),
+              accioDialog
+                ? null
+                : React.createElement('p', { className: 'dim-jh-zcDialogHint' },
+                    '可用 z.ai（国际）登录另一个账号。'),
               React.createElement('label', { className: 'dim-jh-zcProvider' },
-                '登录渠道',
-                React.createElement('select', {
-                  className: 'dim-jh-zcSelect',
-                  value: zcodeProvider,
-                  onChange: (event) => setZcodeProvider(event.target.value),
-                },
-                  React.createElement('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
-                  React.createElement('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）'))),
+                accioDialog ? '登录区域' : '登录渠道',
+                accioDialog
+                  ? React.createElement('select', {
+                      className: 'dim-jh-zcSelect',
+                      value: accioRegion,
+                      onChange: (event) => setAccioRegion(event.target.value),
+                    },
+                      React.createElement('option', { value: 'cn' }, '中国版（www.accio-ai.com）'),
+                      React.createElement('option', { value: 'global' }, '国际版（zh.accio.com）'))
+                  : React.createElement('select', {
+                      className: 'dim-jh-zcSelect',
+                      value: zcodeProvider,
+                      onChange: (event) => setZcodeProvider(event.target.value),
+                    },
+                      React.createElement('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
+                      React.createElement('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）'))),
               React.createElement('div', { className: 'dim-jh-zcDialogActions' },
                 React.createElement('button', {
                   className: 'dim-jh-btn',
@@ -3699,6 +3886,11 @@ function ProviderPanel({ provider, rpcCall }) {
                 busy: probeBusy !== null,
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
+                // ⚠️ accio **不再**关掉通用积分行（2026-10-13 改）：
+                // 用户报障原文「accio 的显示和别的 provider 没统一，例如 loomy 的」。
+                // 现改为与 loomy 同形 —— 卡片里就是积分行，三类桶由
+                // `CreditBalanceRow` 的 `formatNamedPoolLine` 逐池列出，
+                // 倒计时作为同一行内的一个附注（见那里的注释）。
                 showCredits: canLoadCredits,
                 // 账号名 hover 列资源包：只有余额真由多个包构成的 provider 才挂
                 // （loomy 的池是我们合成的、无到期字段，列出来会把「每日赠送」

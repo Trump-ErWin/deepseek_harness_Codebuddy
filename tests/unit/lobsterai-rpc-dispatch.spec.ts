@@ -106,10 +106,11 @@ describe('account.refresh 分派（T7 回归）', () => {
     // ⚠️ 兜住「channel 集合变了」这个前提：豁免理由若因新 provider 而失效，
     //    上面那条会以「莫名其妙的差异」失败，这条先把原因指出来。
     //    （豁免的**理由**由 `jet-hub-rpc-auth-wiring.spec.ts` 逐条验证，本文件不重复。）
+    // ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 13 → 15。
     expect(
       EXPECTED_REFRESH_PROVIDER_IDS,
       'channel 集合变了，请复核 opencode 豁免是否仍成立（见 AUTH_EXEMPT）',
-    ).toHaveLength(14)
+    ).toHaveLength(15)
   })
 
   it('buddy 账号刷新**自己的** credentialRef，而不是默认单凭据 ref', async () => {

@@ -784,6 +784,12 @@ export class AggregateAdapter extends LlmAdapter {
     // officeace（2026-10-12）：华为 MaaS 云端直连渠道，`channel: true`
     // ⇒ 必须进聚合目录，否则它的模型**永不进聚合、静默不可见**。
     'officeace',
+    // ⚠️ accio（阿里 Accio Work，2026-10-13）—— 漏加会让它的模型**永不可见**
+    //    且**静默**（症状只是「聚合里选不到 Accio 的模型」）。
+    //    ⚠️ 它**不在** `WIRED_EXPIRY_PROVIDERS` 里：Accio 的余额按三类桶
+    //    （daily / monthly / referral）下发，**没有逐包到期时间**
+    //    ⇒ 分不出「临时 / 长期」两桶，接进折算只会得到 `UNUSABLE`。
+    'accio',
   ])
 
   /**
