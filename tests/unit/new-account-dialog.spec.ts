@@ -33,6 +33,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 import { buildCreateAccountPayload, newAccountAsksChannel } from '../../plugin-src/client/new-account.js'
+import { normalizeAccioRegion } from '../../src/accio-auth.js'
 import { normalizeZcodeLoginProvider } from '../../src/jet-hub-rpc.js'
 import { PROVIDER_REGISTRY } from '../../src/provider-registry.js'
 
@@ -84,6 +85,25 @@ function readProviderIds (): string[] {
 const PROVIDER_IDS = readProviderIds()
 
 /**
+ * 载荷里**专属字段**的完整清单（每个「需要预选」的 provider 各占一个）。
+ *
+ * ⚠️ 加新 provider 时**这里也要加** —— 与 `new-account.js` 的两个函数一样，
+ * 它同样是「必须同步」的第三处。漏了它，下面那条不变式会**退化成**
+ * 只检查旧字段，新 provider 的载荷字段无人守（正是本组要防的形态）。
+ */
+const EXCLUSIVE_FIELDS = ['zcodeProvider', 'accioRegion']
+
+/**
+ * 载荷里带了哪些专属字段（0 个 / 1 个 / 多个）。
+ *
+ * ⚠️ 返回值是**数组**而不是布尔：不变式要判的是「**恰好一个**」，
+ * 布尔表达不了「两个都带」这种串味。
+ */
+function exclusiveFieldsOf (payload: Record<string, unknown>): string[] {
+  return EXCLUSIVE_FIELDS.filter((f) => Object.prototype.hasOwnProperty.call(payload, f))
+}
+
+/**
  * ⚠ **合成探针 id**：真实 `PROVIDERS` 里**还没有**、但将来很可能出现的新 provider 名。
  *
  * ## 为什么需要它们（本轮两次踩坑才想清楚）
@@ -108,7 +128,7 @@ const PROBE_IDS = ['newbie', 'new-provider', 'zzz', 'some-future-provider', 'cod
 describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）', () => {
   /**
    * ★★ **本组的核心不变式**：对每个样本 id，
-   * 「弹窗问渠道」⟺「载荷带 zcodeProvider」，两者必须同时成立。
+   * 「弹窗问预选项」⟺「载荷带**恰好一个**专属字段」。
    *
    * ## 为什么它比逐个枚举更强
    *
@@ -119,24 +139,29 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
    *
    * ⚠ 样本 = 真实 `PROVIDERS` ∪ 合成探针。**只有真实列表是不够的**
    * （新增 provider 那一刻它还不在列表里），见上面 `PROBE_IDS` 的说明。
+   *
+   * ⚠️ 「恰好一个」而不是「至少一个」：后者放过「accio 的载荷里同时带了
+   * `zcodeProvider`」这种串味（后端会拿它去开错授权端点）。
    */
-  it('★★ 不变式：弹窗判据 ⟺ 载荷带渠道（真实 provider + 合成探针）', () => {
+  it('★★ 不变式：弹窗判据 ⟺ 载荷带恰好一个专属字段（真实 provider + 合成探针）', () => {
     for (const id of [...PROVIDER_IDS, ...PROBE_IDS]) {
       const asks = newAccountAsksChannel(id)
-      const has = Object.prototype.hasOwnProperty.call(
-        buildCreateAccountPayload(id, 'zai'), 'zcodeProvider',
-      )
-      expect(asks, `${id}：弹窗判据(${asks}) 与载荷带渠道(${has}) 不一致 —— 将来新增 provider 时两处都要改`).toBe(has)
+      const fields = exclusiveFieldsOf(buildCreateAccountPayload(id, 'zai', 'global') as Record<string, unknown>)
+      const has = fields.length === 1
+      expect(asks, `${id}：弹窗判据(${asks}) 与载荷专属字段(${JSON.stringify(fields)}) 不一致 —— 将来新增 provider 时两处都要改`).toBe(has)
     }
   })
 
-  it('★ 只有 zcode 需要先问登录渠道，其余 provider 点按钮即登录', () => {
+  it('★ 只有 zcode 与 accio 需要先问一句，其余 provider 点按钮即登录', () => {
     expect(newAccountAsksChannel('zcode')).toBe(true)
+    // ⚠ accio 的预选项是**登录区域**：区域决定登录页域名，而区域由服务端按账号
+    //   下发、登录前无从推断 ⇒ 选错就登不进去（国际用户拿中国版登录页）。
+    expect(newAccountAsksChannel('accio')).toBe(true)
     // ⚠ 这条对**全部** provider 取一遍：A1 的形态是「弹窗对 provider 零分支」，
     //   只抽查两三个 provider 的话，新增一个 provider 漏判就会静默溜过去。
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode') continue
-      expect(newAccountAsksChannel(id), `${id} 不该弹 zCode 的渠道窗`).toBe(false)
+      if (id === 'zcode' || id === 'accio') continue
+      expect(newAccountAsksChannel(id), `${id} 不该弹预选窗`).toBe(false)
     }
   })
 
@@ -153,12 +178,12 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
     expect(newAccountAsksChannel(undefined as unknown as string)).toBe(false)
   })
 
-  it('★ 非 zcode 的载荷里**不许**出现 zcodeProvider（A2：选择被静默丢弃）', () => {
+  it('★ 不需要预选的 provider 载荷里**不许**出现任何专属字段（A2：选择被静默丢弃）', () => {
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode') continue
-      const payload = buildCreateAccountPayload(id, 'zai')
+      if (id === 'zcode' || id === 'accio') continue
+      const payload = buildCreateAccountPayload(id, 'zai', 'global')
       expect(payload).toEqual({ provider: id })
-      expect(Object.prototype.hasOwnProperty.call(payload, 'zcodeProvider')).toBe(false)
+      expect(exclusiveFieldsOf(payload as Record<string, unknown>)).toEqual([])
     }
   })
 
@@ -177,7 +202,103 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
   })
 
   it('★ account.create 的载荷由纯函数构造（不是就地拼的三元）', () => {
-    expect(jetHubCode).toContain("rpcCall('account.create', buildCreateAccountPayload(")
+    // ⚠️ `stripComments` 之后再断言：上面那段解释「为什么要用纯函数」的注释里
+    //    就写着 `rpcCall('account.create', buildCreateAccountPayload(`，
+    //    对整份源码断言会被**注释**喂绿（本文件头已警告过这个形态）。
+    // ⚠️ 用 `[\s\S]` 而不是 `toContain`：调用点跨行（`rpcCall('account.create',`
+    //    与构造器分两行），写死整串会假失败。
+    expect(jetHubCode, 'account.create 的载荷必须由纯函数构造')
+      .toMatch(/rpcCall\('account\.create',\s*buildCreateAccountPayload\(/)
+    // ⚠️ 三个实参都要传：只传两个会让 accio 的区域**恒为 undefined** ⇒ 宿主
+    //    回落到 `cn` ⇒ 国际用户静默登不进去（正是本任务要修的功能缺口）。
+    expect(jetHubCode, '调用点必须把 accioRegion 一起传给载荷构造器')
+      .toMatch(/buildCreateAccountPayload\(provider,\s*zcodeProvider,\s*accioRegion\)/)
+  })
+})
+
+/**
+ * ★★ accio 的**区域选择入口**（Task 8 计划项 / 终审 I2）。
+ *
+ * ## 为什么这一条是功能性的，不是「多一个选项」
+ *
+ * Accio 的登录页**按区域分域名**（`cn` → `www.accio-ai.com`，
+ * `global` → `zh.accio.com`），而区域**由服务端按账号下发**（`userinfo.routeRegion`，
+ * 需要先有凭据才能查）⇒ 登录前**无从推断**。缺了这个入口时，
+ * `buildCreateAccountPayload` 恒不下发 `accioRegion`、宿主恒回落 `cn`
+ * ⇒ **国际账号根本打不开登录页**（真实功能缺口，不是体验问题）。
+ *
+ * ## 为什么断言落在「两处 + 调用点」
+ *
+ * `new-account.js` 的注释明确警告：`newAccountAsksChannel`（白名单）与
+ * `buildCreateAccountPayload`（排除法）**判据方向相反**，只改一处会静默失效。
+ * 本组因此**逐处**断言，而不是只断言最终效果 —— 后者在只改一处时仍可能绿
+ * （例如「弹窗没弹、载荷也没发」在效果上与「都不需要」同形）。
+ */
+describe('F. accio 区域选择入口（终审 I2）', () => {
+  it('★ 弹窗判据把 accio 纳入白名单', () => {
+    expect(newAccountAsksChannel('accio')).toBe(true)
+  })
+
+  it('★ 载荷构造把 accioRegion 下发（且**只**下发给 accio）', () => {
+    expect(buildCreateAccountPayload('accio', 'bigmodel', 'global'))
+      .toEqual({ provider: 'accio', accioRegion: 'global' })
+    expect(buildCreateAccountPayload('accio', 'bigmodel', 'cn'))
+      .toEqual({ provider: 'accio', accioRegion: 'cn' })
+    // 两个专属字段**不得串味**：accio 的载荷里不能出现 zcode 的渠道。
+    expect(exclusiveFieldsOf(buildCreateAccountPayload('accio', 'zai', 'global') as Record<string, unknown>))
+      .toEqual(['accioRegion'])
+    // 反向：zcode 的载荷里不能出现 accio 的区域。
+    expect(exclusiveFieldsOf(buildCreateAccountPayload('zcode', 'zai', 'global') as Record<string, unknown>))
+      .toEqual(['zcodeProvider'])
+  })
+
+  it('★ 宿主侧白名单与客户端两个选项**逐值对齐**（新增区域时三处一起改）', () => {
+    // 客户端的两个 <option> 值必须都能过宿主的 `normalizeAccioRegion`，
+    // 否则用户选了国际版、宿主却回落 `cn` —— 静默失效，界面看起来完全正常。
+    const rpcSource = readFileSync(resolve(HERE, '../../src/jet-hub-rpc.ts'), 'utf8')
+    expect(stripComments(rpcSource)).toContain('region: normalizeAccioRegion(req.accioRegion)')
+    for (const region of ['cn', 'global']) {
+      expect(normalizeAccioRegion(region)).toBe(region)
+    }
+  })
+
+  it('★ 弹窗按 provider 分支：accio 问区域、zcode 问渠道，两者的选项都在', () => {
+    // ⚠️ 先断言「分支判据本身」——**必须钉住赋值**，不能只钉 `accioDialog ?`：
+    //    实测变异 `const accioDialog = false`（弹窗永不按 accio 分支）时，
+    //    只断言 `accioDialog\s*\?` **照样全绿**（那个三元还在，只是永远走 else 支）。
+    //    这是本仓库记过的「找不到却全绿」的同型：断言的是形态存在，不是它**求值**。
+    expect(jetHubCode, '弹窗分支判据必须是 provider 驱动的正向比较')
+      .toMatch(/const accioDialog = provider === 'accio';/)
+    expect(jetHubCode, '弹窗内容必须按 accio 分支').toMatch(/accioDialog\s*\?/)
+    // accio 的两个区域选项（值必须与宿主白名单逐字一致）。
+    // ⚠️ 断言范围收在**accio 那一支**里：整份文件断言会被 zcode 的选项喂绿。
+    // ⚠️ 锚点用 **accio 专属的标签文案**（`'登录区域'`），而不是 `accioDialog` ——
+    //    后者第一次出现在文件靠上的 const 声明处，切出来的是一大段无关代码。
+    // ⚠️ `indexOf` 的结果**必须先断言 `>= 0`** 再切片：`-1` 会让 `slice(-1)`
+    //    静默切到「最后一个字符」，后续 `toContain` 于是指向一段无关文本
+    //    （本仓库记过的「找不到却全绿」形态）。
+    const regionAt = jetHubCode.indexOf("'登录区域'")
+    expect(regionAt, '未找到 accio 的「登录区域」标签').toBeGreaterThanOrEqual(0)
+    // 从标签往后切到弹窗动作区为止 —— 这一段就是 accio 的 <select> 本体。
+    const actionsAt = jetHubCode.indexOf('dim-jh-zcDialogActions', regionAt)
+    expect(actionsAt, '未找到弹窗动作区').toBeGreaterThan(regionAt)
+    const dialogBranch = jetHubCode.slice(regionAt, actionsAt)
+    expect(dialogBranch, '未切出 accio 的区域下拉').not.toBe('')
+    expect(dialogBranch).toContain("value: 'cn'")
+    expect(dialogBranch).toContain("value: 'global'")
+    // zcode 的两个渠道选项**不得**被这次改动弄丢。
+    expect(jetHubCode).toContain("value: 'bigmodel'")
+    expect(jetHubCode).toContain("value: 'zai'")
+    // 区域 state 与它的 setter 必须真的接在 select 上（不是定义了不用）。
+    expect(jetHubCode).toMatch(/const \[accioRegion, setAccioRegion\] = React\.useState\('cn'\)/)
+    expect(jetHubCode).toMatch(/onChange: \(event\) => setAccioRegion\(event\.target\.value\)/)
+    expect(jetHubCode).toMatch(/value: accioRegion/)
+  })
+
+  it('⚠️ 区域不是「偏好」而是登录前提 —— 弹窗文案必须说清「选错会打开打不开的登录页」', () => {
+    // 缺了这句，用户会以为选错了也能事后纠正；而 region 会写进凭据并决定续期域。
+    expect(jetHubCode).toMatch(/区域由服务端按账号下发/)
+    expect(jetHubCode).toMatch(/登录页/)
   })
 })
 

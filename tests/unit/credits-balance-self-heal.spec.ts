@@ -110,6 +110,10 @@ function setup(options: HarnessOptions) {
     raccoon: a('raccoon'), minimax: a('minimax'), zcode: a('zcode'),
     gemini: a('gemini'),
     officeace: {} as never,
+    // ⚠️ accio 必须在这里：本 harness 的 auths 与 `JetHubAuths` **逐键同形**
+    //（少一个键本应编译不过，但调用处是 `as never` 转型，故由下面那条
+    //「JetHubAuths 的每个键都在 Set 里」的守卫在**源码层**兜）。
+    accio: a('accio'),
   }
   registerJetHubRpc(
     ctx as never,
@@ -619,24 +623,53 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     }
   }
 
+  /**
+   * 从源码里抽出 `JetHubAuths` 的键集合（= 生产路径上「有 auth 服务的渠道」）。
+   *
+   * ⚠️ 只取接口体区间（`interface {` 到第一个 `}`），不扫全文 —— 否则别处的
+   * `readonly xxx:` 会被误算进来。
+   */
+  function jetHubAuthsKeys(): Set<string> {
+    const start = rpcSource.indexOf('export interface JetHubAuths {')
+    expect(start, '未找到 JetHubAuths 接口').toBeGreaterThan(-1)
+    const end = rpcSource.indexOf('}', start)
+    expect(end).toBeGreaterThan(start)
+    return new Set(
+      [...rpcSource.slice(start, end).matchAll(/readonly (\w+):/g)].map((m) => m[1]!),
+    )
+  }
+
   /** `.id` 常量的运行期值（与源码里的常量名互为印证）。 */
   const ID_OF: Record<string, string> = {
     LOBSTERAI: 'lobsterai', QODER: 'qoder', QODER_CN: 'qodercn', TRAE: 'trae',
     CLINE: 'cline', RACCOON: 'raccoon', MINIMAX: 'minimax', GEMINI: 'gemini',
     OFFICEACE: 'officeace',
+    ACCIO: 'accio',
   }
+
+  /**
+   * ⚠️ **刻意豁免的两家**：设计上**没有 refresh 端点**，其
+   * `refreshAccountCredential` 做的是「有效性探测」，拿来当续期用只会白发请求
+   * （理由的权威表述见 `src/jet-hub-rpc.ts` 的 `SELF_HEAL_REFRESHABLE_PROVIDERS`
+   * 文档注释）。**豁免必须是显式且带理由的** —— 用「忘了登记」冒充豁免，
+   * 正是本次复审抓到的缺陷形态（accio 就是这样漏掉的）。
+   */
+  const SELF_HEAL_EXEMPT: ReadonlyMap<string, string> = new Map([
+    ['loomy', 'Loomy 没有 refresh 端点，refreshAccountCredential 只是有效性探测'],
+    ['zcode', 'ZCode 同上：没有 refresh 端点，探测当续期用只会白发请求'],
+  ])
 
   it('★ Set 里的字面量恰好是 codearts / buddy / workbuddy（多一个少一个都红）', () => {
     const { literals } = selfHealSetParts()
     expect(literals.slice().sort()).toEqual(['buddy', 'codearts', 'workbuddy'])
   })
 
-  it('★ Set 里的 `.id` 常量恰好是那九家（逐家点名，不写魔数阈值）', () => {
-    // ⚠️ 逐家列举而不是 `expect(constants.length).toBeGreaterThanOrEqual(8)` ——
+  it('★ Set 里的 `.id` 常量恰好是那十家（逐家点名，不写魔数阈值）', () => {
+    // ⚠️ 逐家列举而不是 `expect(constants.length).toBeGreaterThanOrEqual(10)` ——
     // 后者在「删掉 trae、加上一个假的」时**仍然通过**，正是审计实测的漏报形态。
     const { constants } = selfHealSetParts()
     expect(constants.slice().sort()).toEqual([
-      'CLINE', 'GEMINI', 'LOBSTERAI', 'MINIMAX', 'OFFICEACE', 'QODER', 'QODER_CN',
+      'ACCIO', 'CLINE', 'GEMINI', 'LOBSTERAI', 'MINIMAX', 'OFFICEACE', 'QODER', 'QODER_CN',
       'RACCOON', 'TRAE',
     ])
   })
@@ -645,7 +678,7 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     const { literals, constants } = selfHealSetParts()
     const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
     expect([...inSet].sort()).toEqual([
-      'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'minimax',
+      'accio', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'minimax',
       'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy',
     ])
     // 反向：两家没有 refresh 端点，必须**静默跳过**而非尝试续期。
@@ -658,9 +691,10 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
    *
    * ## 为什么上面那几条还不够（2026-10-13 审计实测）
    *
-   * 「逐家点名」只锁住了**已知的 12 家**。它拦得住「删掉 trae」「加个假 id」，
-   * 却**拦不住第 16 个 provider 加进来时被漏掉** —— officeace 就是这么漏的
-   * （症状与 issue IKKHL5 逐字相同：睡眠/挂起恢复后积分行报 401、日志零字）。
+   * 「逐家点名」只锁住了**当时已知的那些家**（3 个字面量 + 10 个 `.id` 常量）。
+   * 它拦得住「删掉 trae」「加个假 id」，
+   * 却**拦不住下一个 provider 加进来时被漏掉** —— officeace（**第 15 个**）
+   * 就是这么漏的（症状与 issue IKKHL5 逐字相同：睡眠/挂起恢复后积分行报 401、日志零字）。
    *
    * ⚠️ 这正是 `docs/agent-notes/providers-accio.md` 记的「接线陷阱（新 provider 通用）」：
    * **加 provider 的人不会去看这张手抄的 Set**，而漏接的代价是静默的。
@@ -706,15 +740,72 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     // 对抗审计实测：加一个 `'not-a-channel'` 到 Set ⇒ 零测试变红，而运行期
     // 它会走 refreshAccountByProvider → authOf 查不到 → 抛错 → 被 catch
     // 记一条噪音 warn。这条锁住「Set ⊆ Auths 的键」。
-    const authsStart = rpcSource.indexOf('export interface JetHubAuths {')
-    const authsEnd = rpcSource.indexOf('}', authsStart)
-    const keys = new Set(
-      [...rpcSource.slice(authsStart, authsEnd).matchAll(/readonly (\w+):/g)].map((m) => m[1]!),
-    )
+    const keys = jetHubAuthsKeys()
     const { literals, constants } = selfHealSetParts()
     for (const id of [...literals, ...constants.map((c) => ID_OF[c] ?? c)]) {
       expect(keys.has(id), `Set 里的 ${id} 在 JetHubAuths 里没有对应键（会抛 Unknown provider）`)
         .toBe(true)
     }
+  })
+
+  /**
+   * ★★ **反向守卫：`JetHubAuths` 的每个键都必须在 Set 里**（除非显式豁免）。
+   *
+   * ## ⚠️ 为什么必须补这一条（2026-10-12 复审实测的真实缺陷）
+   *
+   * 上面那条只锁了 `Set ⊆ Auths 的键`（挡住假 id）。**反方向没有任何守卫** ——
+   * 于是 Task 7 把 `accio` 加进 `JetHubAuths` 却忘了加进 Set 时，**全绿**：
+   * 而症状是 `healExpiredAccountBeforeBalance` 在
+   * `SELF_HEAL_REFRESHABLE_PROVIDERS.has(entry.provider)` 处短路 ⇒
+   * accio 的过期账号**永不参与自愈**，`credits.balances` 拿陈旧凭据直连上游 ⇒
+   * 面板报「未登录」，而 `refresh_token` 完好 —— **正是 issue IKKHL5 的形态**。
+   *
+   * ## 为什么必须逐键点名（而不是「两边长度相等」）
+   *
+   * 长度相等在「新增一家进 Auths、另一家掉出 Set」时**仍然通过**（等量替换），
+   * 而那恰好是位置错位那类静默缺陷。逐键 `for` + 失败信息带 id 才能点名。
+   */
+  it('★★ JetHubAuths 的每个键都在 Set 里，或落在显式豁免表里（漏登记即点名变红）', () => {
+    const keys = jetHubAuthsKeys()
+    // 自证这条守卫不是空跑：键集合必须真的是「全部渠道」，不是被正则漏算后的残集。
+    expect(keys.size, 'JetHubAuths 键集合被解析成了空集/残集，守卫会假绿').toBeGreaterThan(10)
+    expect(keys.has('accio'), 'JetHubAuths 里应有 accio（Task 7 已接线）').toBe(true)
+
+    const { literals, constants } = selfHealSetParts()
+    const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
+    for (const key of [...keys].sort()) {
+      const exemptReason = SELF_HEAL_EXEMPT.get(key)
+      if (exemptReason !== undefined) {
+        // 豁免的家**不得**同时在 Set 里（否则豁免表是僵尸项、两处判断分叉）。
+        expect(inSet.has(key), `${key} 已在豁免表里，就不该再出现在 Set 里`).toBe(false)
+        continue
+      }
+      expect(
+        inSet.has(key),
+        `JetHubAuths 有 ${key}，但它不在 SELF_HEAL_REFRESHABLE_PROVIDERS 里 ⇒ `
+        + '该家的过期账号**永不参与自愈**（积分行会报「未登录」，而凭据其实能续，'
+        + 'issue IKKHL5 的形态）。若它确实没有 refresh 端点，'
+        + '请把它加进本文件的 SELF_HEAL_EXEMPT 并写明可核对的理由。',
+      ).toBe(true)
+    }
+  })
+
+  /**
+   * ★ accio **行为级**自愈（与源码层守卫互为印证）。
+   *
+   * 源码级断言（上面两条）只能证明「名字在集合里」；这条证明「运行期真的会
+   * 为 accio 发起续期」。反向验证：从 Set 里删掉 `ACCIO.id` ⇒ 本条与上面
+   * 那条反向守卫**同时**变红。
+   */
+  it('★ accio 的过期账号会先续期再查余额（不漏接新 provider）', async () => {
+    const { call, calls } = setup({
+      accounts: [expiredEntry({ id: 'accio-1', provider: 'accio', credentialRef: 'ACCIO_ACCOUNT_1' })],
+    })
+
+    await call('credits.balances', { provider: 'accio' })
+
+    expect(calls).toEqual([
+      { provider: 'accio', ref: 'ACCIO_ACCOUNT_1', accountId: 'accio-1' },
+    ])
   })
 })

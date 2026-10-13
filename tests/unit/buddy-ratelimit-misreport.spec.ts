@@ -418,6 +418,11 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
     const WIRING: readonly string[] = [
       'CODEBUDDY', 'WORKBUDDY', 'LOBSTERAI', 'QODER', 'QODER_CN',
       'TRAE', 'CLINE', 'LOOMY', 'RACCOON', 'MINIMAX', 'GEMINI',
+      // ⚠️ **ACCIO 必须在内**：它的兜底是**固定 ref**（`ACCIO_ACCESS_TOKEN`），
+      // 而 Jet Hub 登录只写 `ACCIO_ACCOUNT_XXX` ⇒ 与上面 11 家是**同一形态**的
+      // 受害者（池被筛空时报误导性的「请先登录」）。见下方
+      // 「accio 走固定 ref 兜底，故必须接判定」。
+      'ACCIO',
       // ⚠️ **刻意不含 ZCODE** —— 它是唯一「不接判定也算对」的一家，
       // 见下方「zcode 同型缺陷判定」段。
     ]
@@ -554,6 +559,34 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       // 且必须确认 zcode 的兜底形态仍在（否则这条会因为「整段被删」而假绿）。
       expect(block, 'zcode 的兜底应仍是 zcode.current()').toContain('await zcode.current()')
       expect(block, 'zcode 的兜底应是 custom 形态（不是读某个固定 ref）').toContain("kind: 'custom'")
+    })
+
+    /**
+     * **accio 与 zcode 恰好相反**：它走**固定 ref** 兜底，故**必须**接判定。
+     *
+     * ⚠️ 这条与上一条是**一对**：两条一起把「兜底形态 → 是否该接判定」这个
+     * 判据钉死。只看名单（`WIRING`）会漏掉「有人把 accio 的兜底改成 custom」
+     * 或「有人照着 zcode 的样子把 accio 的判定删掉」两种形态。
+     *
+     * ⚠️ 今天这层判定是**恒不命中的**（accio 适配器不写 `modelRateLimits`，
+     * 见 `provider-runtime-wiring.spec.ts` 的 `WRITE_SITE_FILES` 里 accio 那条
+     * 空登记 + 「登记为不写标记的 adapter 确实没有写点」用例）。**这不是冗余**：
+     * 判据是「兜底形态会不会让池被筛空时报错」而不是「今天有没有标记」——
+     * 将来接上请求级换号（如 minimax 在 IKJW32 那样）时守卫已在位。
+     */
+    it('★ accio 走固定 ref 兜底，故必须接判定（与 zcode 的 custom 兜底相反）', () => {
+      const at = indexCode.search(/product: ACCIO,\n\s*readCredential:/)
+      expect(at, 'accio 的工厂配置项没找到（改名了要同步改本用例）').toBeGreaterThan(-1)
+      const callStart = indexCode.lastIndexOf('createCredentialResolver', at)
+      expect(callStart, 'accio 的 createCredentialResolver 调用没找到').toBeGreaterThan(-1)
+      const block = factoryCallAt(indexCode, callStart)
+      // ① 兜底形态确实是固定 ref（若改成 custom，判据就该跟着改）。
+      expect(block, 'accio 的兜底不再是固定 ref —— 本用例的判据前提已失效').toContain("kind: 'ref'")
+      // ② 故判定必须接着（删掉它会让池被筛空时报「请先登录」）。
+      expect(
+        block,
+        'accio 的固定 ref 兜底没接限流判定 —— 池被筛空时会误报「请先登录」（IKJOZ9 形态）',
+      ).toContain('throwIfAllRateLimited: throwIfAllAccountsRateLimited')
     })
   })
 })

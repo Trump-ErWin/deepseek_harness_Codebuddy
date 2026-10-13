@@ -402,8 +402,8 @@ export interface ProviderRuntime {
    * ⚠️ **不要用 `accountTest` 论证「没有入口」**：本段原话是「客户端能力表
    * `accountTest` 目前**只有 `gemini`**，其余渠道根本没有入口」——**该推论是错的**。
    * 重测 / 重置按钮由 `supportsRateLimit` 门控（缺省 **true**），只有登记了
-   * `rateLimit: false` 的家（loomy / gemini）才真的没有入口 ⇒ **漏登记的家会
-   * 渲染按钮、用户一点就报错**（`opencode` 与 `minimax` 都踩过；后者是
+   * `rateLimit: false` 的家（loomy / gemini / officeace / accio，理由各不同）才真的没有入口
+   * ⇒ **漏登记的家会渲染按钮、用户一点就报错**（`opencode` 与 `minimax` 都踩过；后者是
    * issue IKJW32 接上换号后才补上的）。⇒ 本域的注册**是用户可见功能**，
    * 不是「将来才复发」的内部契约。
    */

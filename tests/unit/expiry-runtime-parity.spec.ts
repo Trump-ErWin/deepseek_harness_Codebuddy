@@ -40,8 +40,11 @@ import { apply } from '../../src/index.js'
 import { clearProviderRuntimes, registerProviderRuntime, registeredRuntimeIds, runtimeOf } from '../../src/provider-runtime.js'
 import { descriptorOf } from '../../src/provider-registry.js'
 
-/** 既有 7 家已接入临期折算的渠道（**期望值** —— 真相源是下面两个不变式）。 */
-const EXPECTED_WIRED = ['buddy', 'codearts', 'lobsterai', 'loomy', 'trae', 'workbuddy', 'zcode']
+/** 已接入临期折算的渠道（**期望值** —— 真相源是下面两个不变式）。 */
+// ⚠️ 2026-10-13 合并审计加入 accio：用户要求「聚合的 qwen3.8-flash 轮换列表里要有
+//    accio」，而**决定候选表可见性的是这张表**（不是 AGGREGATE_CHANNELS）⇒
+//    只把它加进 AGGREGATE_CHANNELS 是无效接线（模型层归并了，候选层被剔除）。
+const EXPECTED_WIRED = ['accio', 'buddy', 'codearts', 'lobsterai', 'loomy', 'trae', 'workbuddy', 'zcode']
 
 class FakeCredentials {
   async resolve(): Promise<undefined> { return undefined }
