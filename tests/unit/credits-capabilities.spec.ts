@@ -255,6 +255,9 @@ describe('积分能力矩阵', () => {
  * 「重测」只会白烧本就紧张的窗口配额，「重置」只会把受限账号放回池里再撞 429。
  * 故与 Loomy 同处登记 `false`（**理由不同**，见
  * {@link RATE_LIMIT_CAPABILITIES} 的注释）。
+ *
+ * ⚠️ 2026-10-12 追加 **Accio**（第三种理由：**根本没有作用对象** ——
+ * 不写 `modelRateLimits`、也不在 `probeById` 里 ⇒ 两个按钮恒为惰性）。
  */
 describe('模型限流按钮门控（重测 / 重置）', () => {
   it('gemini 显式登记为「限流不由这组按钮管辖」', () => {
@@ -270,15 +273,18 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     expect(supportsRateLimit('不存在的 provider')).toBe(true)
   })
 
-  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好三个）', () => {
+  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好四个）', () => {
     const disabled = Object.entries(RATE_LIMIT_CAPABILITIES)
       .filter(([, caps]) => caps.rateLimit === false)
       .map(([id]) => id)
       .sort()
-    // loomy：根本不返回限流错误；gemini：限流是服务端配额窗口制；
-    // officeace（2026-10-12）：限流由华为云 MaaS 侧按账号配额管理，
-    // 本地标记清掉 / 重测通过都恢复不了配额（与 gemini 同因）。
-    expect(disabled).toEqual(['gemini', 'loomy', 'officeace'])
+    // 四家 rationale 各不相同（registry 里各有字段注释）：
+    // - accio：**不写 modelRateLimits 且不在 probeById 里** ⇒ 两个按钮恒为惰性
+    //   （点了零请求、零清除，用户会以为按钮坏了）；
+    // - gemini / officeace：限流由服务端配额管理，本地标记清掉 / 重测通过
+    //   都恢复不了配额；
+    // - loomy：根本不返回限流错误。
+    expect(disabled).toEqual(['accio', 'gemini', 'loomy', 'officeace'])
   })
 
   it('客户端源码里按钮仍走 supportsRateLimit 门控（不是在本文件另写白名单）', () => {

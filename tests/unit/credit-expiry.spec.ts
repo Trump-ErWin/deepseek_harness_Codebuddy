@@ -21,6 +21,7 @@ import {
   expirySplitParts,
   findDailyPool,
   formatExpirySplitLine,
+  formatNamedPoolLine,
   formatPackageExpiry,
   formatPackageTooltip,
   formatPoolSplitLine,
@@ -475,6 +476,67 @@ describe('formatPoolSplitLine（当日池单独显示）', () => {
       pkg({ name: '充值积分', remaining: 999, active: false }),
     ]
     expect(formatPoolSplitLine(packages, format, '长期')).toBe('长期 100 · 每日 500')
+  })
+})
+
+/**
+ * **逐命名池全列**（Accio 的三类桶）。
+ *
+ * ## 为什么需要它，而不是复用 `formatPoolSplitLine`
+ *
+ * `formatPoolSplitLine` 是**两桶**形状（「长期 X · 每日 Y」）—— 它把「每日池之外
+ * 的**全部**池」求和成一个 `longTermLabel`。对 Loomy（永久 + 每日）与
+ * Raccoon（奖励/会员/充值 + 每日）都成立，但 Accio 的桶是**三类语义并列**
+ * （`每日积分` / `每月积分` / `推荐积分`），每月与推荐**都不该被笼统求和成
+ * 「长期」** —— 用户 2026-10-13 要求「完全改成 loomy 那样」，而 loomy 的展示
+ * 恰恰是**逐池列名**（`永久 15000 · 每日 4992`），不是「长期 = 其余之和」。
+ *
+ * ⇒ 新增本函数，**逐池按服务端下发的名字列出**。
+ *
+ * ⚠️ **刻意不改 `formatPoolSplitLine`**：它的输出是既有契约
+ * （`'长期 2100 · 每日 500'` / `'永久 15000 · 每日 4992'`，见上面那组用例），
+ * 而 loomy / raccoon 走的就是它 —— 改它等于同时改两家已验收的显示。
+ */
+describe('formatNamedPoolLine（逐命名池全列，Accio）', () => {
+  const format = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(2))
+
+  it('Accio：三个池按服务端下发的顺序逐个列出（不求和、不归类）', () => {
+    const packages = [
+      pkg({ name: '每日积分', remaining: 199 }),
+      pkg({ name: '每月积分', remaining: 0 }),
+      pkg({ name: '推荐积分', remaining: 0 }),
+    ]
+    expect(formatNamedPoolLine(packages, format)).toBe('每日 199 · 每月 0 · 推荐 0')
+  })
+
+  /** ⚠️ 池名去掉「积分」后缀做短标签（版面上「每日积分 199」重复且长）。 */
+  it('去掉「积分」后缀做短标签', () => {
+    expect(formatNamedPoolLine([pkg({ name: '每日积分', remaining: 5 })], format)).toBe('每日 5')
+  })
+
+  it('认不出的池名原样使用（不猜、不丢）', () => {
+    expect(formatNamedPoolLine([pkg({ name: 'Bonus Pack', remaining: 7 })], format))
+      .toBe('Bonus Pack 7')
+  })
+
+  /** 失效包不列出（扣不到的东西显示出来会让用户以为还有）。 */
+  it('失效包不列出', () => {
+    const packages = [
+      pkg({ name: '每日积分', remaining: 10 }),
+      pkg({ name: '每月积分', remaining: 999, active: false }),
+    ]
+    expect(formatNamedPoolLine(packages, format)).toBe('每日 10')
+  })
+
+  it('一个都没有时返回 null（调用方据此不渲染该行）', () => {
+    expect(formatNamedPoolLine([], format)).toBeNull()
+    expect(formatNamedPoolLine(undefined as never, format)).toBeNull()
+    expect(formatNamedPoolLine([pkg({ name: '每月积分', remaining: 1, active: false })], format)).toBeNull()
+  })
+
+  /** 数字格式化失败（拿到非有限值）时**整个返回 null**，不产出半截文案。 */
+  it('格式化失败时返回 null（不产出半截文案）', () => {
+    expect(formatNamedPoolLine([pkg({ name: '每日积分', remaining: 1 })], () => null as never)).toBeNull()
   })
 })
 

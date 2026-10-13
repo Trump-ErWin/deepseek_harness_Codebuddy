@@ -64,6 +64,9 @@ const STYLES = `
 /* Gemini Code Assist：内联 SVG 自带蓝紫渐变星形，白底容器中显示清晰。
    ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
 .dim-jh-providerIcon.gemini { background: white; }
+/* Accio（阿里）：内联 SVG 自带品牌橙圆角方块 + 白色 A 字，白底容器中显示清晰。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
+.dim-jh-providerIcon.accio { background: white; }
 /* 聚合 provider：内联 SVG（三渠道汇聚），白底容器中显示清晰。
    ⚠️ 加这一条是必要的 —— 上面每家的 logoClass 都各自声明了背景，
       没有兜底规则，缺了会让聚合的图标容器**没有背景**（与其它行不一致）。 */
@@ -1092,6 +1095,17 @@ const STYLES = `
 .dim-jh-aggToggleOff { color: var(--dsw-alias-label-tertiary); text-decoration: line-through; }
 .dim-jh-aggFooter { display: flex; flex-direction: column; gap: 2px; padding-top: 8px; border-top: 1px solid var(--dsw-alias-border-secondary); }
 .dim-jh-aggFooter p { margin: 0; font-size: 11px; line-height: 1.7; color: var(--dsw-alias-label-tertiary); }
+
+/* ── Accio：**没有**专属样式 ──
+   ⚠️ 2026-10-13 删除了原先的「专属积分区」整段（dim-jh-accioPanel /
+   accioHead / accioAccount* / accioCountdown / accioBuckets* 共 12 条）。
+   原因：用户报障「accio 的显示和别的 provider 没统一，例如 loomy 的」——
+   accio 原先另起一个独立区块，现改为与 loomy 同形（积分行直接进账号卡片，
+   三类桶由 formatNamedPoolLine 逐池列出、倒计时作为同一行内的附注）。
+   ⇒ 那 12 条样式已零引用，留着就是死代码（且会让人以为还有那个面板）。
+   ⚠️ 图标底色 .dim-jh-providerIcon.accio 在文件上方，**仍在用**，别一起删。
+   ⚠️ 本文件整体是模板字符串：注释里**绝不能出现反引号**（会提前闭合，
+   esbuild 的报错会指向注释行、看起来像 CSS 写错）。本条注释就曾踩过。 */
 
 `
 

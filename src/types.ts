@@ -198,6 +198,18 @@ export interface RpcCreateAccountRequest {
    * 行为必须逐字节不变。
    */
   zcodeProvider?: 'bigmodel' | 'zai'
+  /**
+   * 登录区域（**仅 Accio 需要**）。
+   *
+   * ⚠️ **gateway 与区域无关**（`phoenix-gw.alibaba.com` 两个区域同一个），
+   * 区域只决定**登录页域名**（`'cn'` → `www.accio-ai.com`，
+   * `'global'` → `zh.accio.com`）。它会被写进凭据并随续期保留。
+   *
+   * ⚠️ 来自**客户端自报**的 RPC 载荷（无 schema 校验）⇒ 必须过
+   * `normalizeAccioRegion` 白名单，未登记值回落 `'cn'`（与 `zcodeProvider`
+   * 同因，issue IKJLK3 E2）。
+   */
+  accioRegion?: 'cn' | 'global'
 }
 export interface RpcCreateAccountResponse {
   accountId: string
