@@ -76,6 +76,23 @@ describe('parseLoomyRemoteModels', () => {
     })
     expect(models[0]!.supportsImage).toBe(false)
   })
+
+  /**
+   * ★ 2026-10-14 用户报障「loomy 的 qwen3.8max 输入不能上图」：远端对
+   * `qwen-3.8-max` 漏报（`input_modalities: ['text']`、`vision: false`）而实测能读图
+   * ⇒ **不能照抄声明值**。判据与同批 10 个模型的对照表见 `src/loomy-product.ts`。
+   */
+  it('★ 远端漏报时 qwen-3.8-max 仍判定支持图片（声明值与覆盖表分叉）', () => {
+    const models = parseLoomyRemoteModels({
+      data: [remoteEntry({
+        id: 'qwen-3.8-max',
+        name: 'Qwen 3.8 Max（x12.0）',
+        capabilities: { reasoning: true, vision: false, input_modalities: ['text'] },
+      })],
+    })
+    expect(models[0]!.id).toBe('qwen-3.8-max')
+    expect(models[0]!.supportsImage).toBe(true)
+  })
 })
 
 describe('LoomyAdapter.listModels', () => {
@@ -895,5 +912,61 @@ describe('LoomyAdapter 请求级账号轮换（余额耗尽无感切号）', () 
 
     // 真正耗尽的是 B —— A 只返回了 401（认证类，本就不该写标记）。
     expect(marks.map((m) => m.accountId)).toEqual(['loomy-B'])
+  })
+})
+
+/**
+ * ★ 图片能力覆盖（2026-10-14 用户报障：loomy 的 qwen3.8max 输入不能上图）。
+ *
+ * DSH 的图片准入闸门读的是**模型目录里的 `inputModalities`**
+ *（`dsh-api-session-controller` 的 `MODEL_DOES_NOT_SUPPORT_IMAGES`），不是适配器
+ * 内部的 `supportsImage`。所以这里断言的必须是宿主真正读到的那个字段，且**远端与
+ * 兜底两条路径都要过** —— 只改一侧，远端可用时那一侧就白改了（`contextWindow`
+ * 曾有同型隐患，见上方 issue IKJW31 一组）。
+ */
+describe('LoomyAdapter 图片能力覆盖（2026-10-14 远端漏报）', () => {
+  /** 远端对 qwen-3.8-max 的真实声明：`input_modalities: ['text']`、`vision: false`。 */
+  const textOnlyQwen = () => parseLoomyRemoteModels({
+    data: [remoteEntry({
+      id: 'qwen-3.8-max',
+      name: 'Qwen 3.8 Max（x12.0）',
+      capabilities: { reasoning: true, vision: false, input_modalities: ['text'] },
+    })],
+  })
+
+  it('★ 远端路径：qwen-3.8-max 的目录条目含 image（图不再被准入闸门拦下）', async () => {
+    const adapter = makeAdapter({ fetchRemoteModels: async () => textOnlyQwen() })
+    const models = await adapter.listModels('loomy')
+    const entry = models.find((m) => m.id === 'qwen-3.8-max')
+    expect(entry?.inputModalities).toContain('image')
+  })
+
+  it('★ 兜底表路径：远端整体失败时同样含 image（两条路径同一判据）', async () => {
+    const adapter = makeAdapter({ fetchRemoteModels: async () => { throw new Error('boom') } })
+    const models = await adapter.listModels('loomy')
+    const entry = models.find((m) => m.id === 'qwen-3.8-max')
+    expect(entry?.inputModalities).toContain('image')
+  })
+
+  it('⚠️ 该家其余模型不受影响：纯文本模型仍只报 text', async () => {
+    const adapter = makeAdapter({ fetchRemoteModels: async () => { throw new Error('boom') } })
+    const models = await adapter.listModels('loomy')
+    const byId = new Map(models.map((m) => [m.id, m.inputModalities]))
+    expect(byId.get('spark-x')).toEqual(['text'])
+    expect(byId.get('deepseek-v4-flash-0731')).toEqual(['text'])
+  })
+
+  it('⚠️ 远端声明纯文本的**其它**模型不得被覆盖表误放行（不恒真）', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => parseLoomyRemoteModels({
+        data: [remoteEntry({
+          id: 'spark-x',
+          name: 'Spark X2.5（x0.1）',
+          capabilities: { reasoning: true, input_modalities: ['text'] },
+        })],
+      }),
+    })
+    const models = await adapter.listModels('loomy')
+    expect(models[0]!.inputModalities).toEqual(['text'])
   })
 })
