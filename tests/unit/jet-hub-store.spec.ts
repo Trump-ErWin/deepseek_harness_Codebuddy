@@ -15,6 +15,7 @@ import {
   sanitizeAccounts,
   sanitizeDisabledModels,
   sanitizeGatewayEnabled,
+  sanitizeNativeWebSearchEnabled,
   sanitizePermanentLocks,
   sanitizeProviderOrder,
 } from '../../src/jet-hub-store.js'
@@ -51,6 +52,21 @@ describe('sanitizeGatewayEnabled', () => {
     expect(sanitizeGatewayEnabled('false')).toBe(true)
     expect(sanitizeGatewayEnabled(0)).toBe(true)
     expect(sanitizeGatewayEnabled({})).toBe(true)
+  })
+})
+
+describe('sanitizeNativeWebSearchEnabled', () => {
+  it('只有显式 false 才算关闭，其余一律按启用（与网关开关逐字同构）', () => {
+    // ⚠️ 方向不能反：丢键 / 脏值都必须回到**默认启用**。反过来（只认 true）
+    // 会让读取失败变成「原生搜索被静默关闭」，用户只会看到搜索突然开始要
+    // API Key，而他自己根本没关过。
+    expect(sanitizeNativeWebSearchEnabled(false)).toBe(false)
+    expect(sanitizeNativeWebSearchEnabled(undefined)).toBe(true)
+    expect(sanitizeNativeWebSearchEnabled(null)).toBe(true)
+    expect(sanitizeNativeWebSearchEnabled(true)).toBe(true)
+    expect(sanitizeNativeWebSearchEnabled('false')).toBe(true)
+    expect(sanitizeNativeWebSearchEnabled(0)).toBe(true)
+    expect(sanitizeNativeWebSearchEnabled({})).toBe(true)
   })
 })
 

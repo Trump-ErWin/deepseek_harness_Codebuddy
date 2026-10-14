@@ -1380,6 +1380,27 @@ export interface RpcGatewaySetEnabledRequest {
   enabled: boolean
 }
 
+/** RPC: 「渠道原生搜索」开关的读取响应。 */
+export interface RpcNativeSearchGetEnabledResponse {
+  /** `true` = 支持原生搜索的渠道走自己后端的搜索接口；`false` = 全部回官方搜索。 */
+  enabled: boolean
+}
+
+/** RPC: 「渠道原生搜索」开关写入请求。 */
+export interface RpcNativeSearchSetEnabledRequest {
+  enabled: boolean
+}
+
+/**
+ * RPC: 「渠道原生搜索」开关写入响应。
+ *
+ * ⚠️ 回传的是**落盘后重读的值**，不是请求里的值 —— 与 `gateway.setEnabled`
+ * 同取向：客户端一律以后端回传为准，不做乐观更新。
+ */
+export interface RpcNativeSearchSetEnabledResponse {
+  enabled: boolean
+}
+
 /**
  * RPC: 网关凭据信息。
  *
