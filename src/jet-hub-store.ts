@@ -499,6 +499,7 @@ class SettingsStore implements JetHubStore {
         aggregateRejections?: unknown
         loomyPermanentLocked?: unknown
         gatewayEnabled?: unknown
+        nativeWebSearchEnabled?: unknown
         providerOrder?: unknown
       }
       | undefined
@@ -512,6 +513,8 @@ class SettingsStore implements JetHubStore {
       loomyPermanentLocked: value.loomyPermanentLocked === true,
       // 老文档没这个键 → 启用，与升级前行为一致。
       gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+      // 老文档没这个键 → 启用（原生搜索本就是新功能，默认开启才符合「装上就能用」）。
+      nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
       // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
       providerOrder: sanitizeProviderOrder(value.providerOrder),
     }
@@ -536,6 +539,14 @@ class SettingsStore implements JetHubStore {
       loomyPermanentLocked: state.loomyPermanentLocked === true,
       // 开关丢失只会让网关回到默认启用（可逆），故接受老版本重写时丢掉本键。
       gatewayEnabled: state.gatewayEnabled !== false,
+      // ⚠️ **必须带上本键**（真实缺陷，PR95 审计实测证伪）：
+      //    `replace` 是**整体替换**语义 —— 漏掉本键会让用户明确关闭的「渠道原生
+      //    搜索」在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
+      //    重启后**静默回到原生搜索**（用户无从察觉，正是本键加进来时那条
+      //    「只有显式 false 才算关闭」要守的东西）。
+      //    探针实测（老契约后端）：`setNativeWebSearchEnabled(false)` 的
+      //    replace 载荷里根本没有本键，新实例读回 `true`。
+      nativeWebSearchEnabled: state.nativeWebSearchEnabled !== false,
       // 顺序丢失只会回到声明顺序（可逆，重拖一次即恢复），同理接受丢失。
       providerOrder: state.providerOrder ?? [],
     })
@@ -730,6 +741,7 @@ class FileStore implements JetHubStore {
         aggregateRejections?: unknown
         loomyPermanentLocked?: unknown
         gatewayEnabled?: unknown
+        nativeWebSearchEnabled?: unknown
         providerOrder?: unknown
       }
       return {
@@ -741,6 +753,8 @@ class FileStore implements JetHubStore {
         loomyPermanentLocked: value.loomyPermanentLocked === true,
         // 老文档没这个键 → 启用，与升级前行为一致。
         gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+        // 老文档没这个键 → 启用，与升级前行为一致。
+        nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
         // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
         providerOrder: sanitizeProviderOrder(value.providerOrder),
       }
@@ -790,6 +804,8 @@ class FileStore implements JetHubStore {
         loomyPermanentLocked: false,
         // 恢复出的文档本来就不含任何开关信息 → 启用（与全新安装一致）。
         gatewayEnabled: true,
+        // 同上：恢复出的文档不含原生搜索开关信息 → 启用（与全新安装一致）。
+        nativeWebSearchEnabled: true,
         // 凭据文件里也没有顺序信息 → 空数组（未自定义，与全新安装一致）。
         providerOrder: [],
       }

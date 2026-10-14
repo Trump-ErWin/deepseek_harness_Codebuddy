@@ -33,7 +33,11 @@ import { isQoderExpired, type QoderCredential } from './qoder.js'
 import { describeWasmFailure, QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
 // ⚠️ 原生搜索的契约来自**契约文件**（不是工具层 `web-native.ts`）：
 //    避免「渠道层 import 工具层」的反向依赖，见 `native-search-contract.ts` 模块头。
-import { NativeSearchCodes, WebNativeError, type NativeSource } from './native-search-contract.js'
+import { classifyNativeAbort, NativeSearchCodes, WebNativeError, type NativeSource } from './native-search-contract.js'
+// ⚠️ `errorMessage` 只留**一份**实现（`openai-compat.ts`）：本仓库原有 6 份同义
+//    实现，PR95 审计时确认为「该腿的唯一实现」，新代码一律从这里取
+//    （与 `detailFieldText` 同一条铁律，见 `buddy-adapter.ts` 的同款注释）。
+import { errorMessage } from './openai-compat.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
 import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderProduct } from './qoder-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
@@ -388,6 +392,16 @@ function resolveChunkTimeoutMs(): number {
   return Number.parseInt(process.env.DSH_QODER_SSE_CHUNK_TIMEOUT_MS ?? '', 10) || 120_000
 }
 
+/**
+ * 单次原生搜索请求的预算（毫秒）。
+ *
+ * ⚠️ **与 `buddy-adapter.ts` 的 `NATIVE_SEARCH_TIMEOUT_MS` 同值同义**（两边各写
+ * 一份是刻意的：两者的模块依赖方向不同，且都属「渠道层自己的预算」；
+ * 共享会诱使渠道层去 import 工具层 —— 见 `native-search-contract.ts` 模块头）。
+ * 20s 与官方客户端 `WEB_SEARCH_TIMEOUT_MS = 2e4` 对齐。
+ */
+const NATIVE_SEARCH_TIMEOUT_MS = 20_000
+
 /** `QoderAdapter` 的构造选项。 */
 export interface QoderAdapterOptions {
   /** 默认凭据 ref（仅用于类型/日志，实际解析走 `resolveCredential`）。 */
@@ -559,10 +573,22 @@ export class QoderAdapter extends LlmAdapter {
    *    长上下文会话最终以裸 `RuntimeError: unreachable` 暴毙（真实事故史见
    *    `qoder-wasm.ts` 文件头）。用 `try/finally` 而非顺序调用。
    * 2. **`publishedTime` / `hostname` / `hostLogo` 一律丢弃**：官方 output schema
-   *    是 `additionalProperties: false`，多传字段会让 `createSuccessResult` 抛
+   *    有 `additionalProperties: false`，多传字段会让 `createSuccessResult` 抛
    *    `ToolOutputError`，**整条调用失败**（不是少一条结果）。
+   *    ⚠️ **但 `publishedTime` 其实有对应字段**（PR95 审计修正）：官方
+   *    `dsh-tool-web` 的 output schema 与 seam 的 `WebSearchSource` **都**声明了
+   *    可选的 `publishedAt?: string`（语义就是「provider 给的发布时间戳」）。
+   *    原注释把三个字段一锅端说成「schema 不允许」，那对 `hostname` /
+   *    `hostLogo` 成立，对 `publishedTime` **不成立**。
+   *    ⚠️ **本次仍照原样丢弃**：接它需要先确认 Qoder 的 `publishedTime` 确实是
+   *    ISO-8601 字符串（seam 的类型注释如此声明，但我们**没有真机取证**），
+   *    而接错的后果是整条调用失败（`ToolOutputError`）—— 收益（多一列时间）远
+   *    小于风险。**待办**：取一次真实响应确认格式后再接。
    * 3. **`X-Session-ID` 用随机 UUID**：实测不传也能 200，但官方客户端会带；
    *    这里跟随官方行为。它与账号无关，只是会话标识。
+   * 4. **自己 arm 一份 20s 预算**（PR95 审计修正）：只透传 `signal` 会让
+   *    `NativeSearchCodes.timeout` / `aborted` 在本路径永不产生，而契约注释却
+   *    声称「各适配器 20s 预算小于官方 30s」⇒ 注释与实现不符。
    *
    * @param query - 单个查询串（已由工具层 trim + 去重）。
    * @param credential - `resolveCredentialFor` 的返回值（本方法自己收窄）。
@@ -609,12 +635,55 @@ export class QoderAdapter extends LlmAdapter {
       // ④ 发送（headers 原样透传；`X-Session-ID` 跟随官方行为）
       // ⚠️ 用 `this.fetchImpl`（可注入）而不是模块级 `fetch`：单测要拦上游，
       //    而这一层**必须**用真 WASM 生成签名（签名无法 mock），故只能换 fetch。
-      const response = await this.fetchImpl(req.url, {
-        method: 'POST',
-        headers: { ...req.headers, 'X-Session-ID': randomUUID() },
-        body: req.body,
-        signal,
-      })
+      //
+      // ⚠️⚠️ **必须自己 arm 一份预算**（PR95 审计修正的真实缺口）：本模块此前
+      //    只透传 `signal`，于是 `NativeSearchCodes.timeout` / `aborted` 在 Qoder
+      //    路径**永不产生**，而契约注释却声称「各适配器的 20s 预算小于官方 30s」
+      //    —— 注释与实现不符（buddy 有、qoder 没有）。用 `AbortSignal.any` 熔合
+      //    调用方取消、外层 deadline 与本预算三者。
+      const timeout = AbortSignal.timeout(NATIVE_SEARCH_TIMEOUT_MS)
+      const composed = AbortSignal.any([signal, timeout])
+
+      let response: Response
+      try {
+        response = await this.fetchImpl(req.url, {
+          method: 'POST',
+          headers: { ...req.headers, 'X-Session-ID': randomUUID() },
+          body: req.body,
+          signal: composed,
+        })
+      } catch (error) {
+        // ⚠️ 归因读 `signal.reason` 的形状，**不能先判 `signal.aborted`**：
+        //    外层 `tool-call-timeout-policy` 的 deadline 到期时布尔值同样为真。
+        //    判据与实测对照见 `native-search-contract.ts` 的 `classifyNativeAbort`。
+        const stop = classifyNativeAbort(composed)
+        if (stop === 'aborted') {
+          throw new WebNativeError(`${this.product.id} search aborted`, NativeSearchCodes.aborted, { cause: error })
+        }
+        if (stop === 'timeout') {
+          const budget = timeout.aborted
+            ? `after ${NATIVE_SEARCH_TIMEOUT_MS}ms`
+            : 'before this search returned (the host tool budget elapsed)'
+          throw new WebNativeError(
+            `${this.product.id} search timed out ${budget}.\n\n`
+            + `The request used endpoint ${JSON.stringify(endpoint)}. `
+            + 'Search uses the same account as chat but a separate endpoint. '
+            + 'Retry, or narrow the request; if it keeps timing out the endpoint or network may be unreachable.',
+            NativeSearchCodes.timeout,
+            { cause: error },
+          )
+        }
+        // 非 abort 的传输失败（DNS / TLS / 连接重置）：归 `upstream`，
+        // 与 buddy 的 `transport error` 腿同口径。
+        throw new WebNativeError(
+          `${this.product.id} search request failed: ${errorMessage(error)}\n\n`
+          + `The request used endpoint ${JSON.stringify(endpoint)}. `
+          + 'Search uses the same account as chat but a separate endpoint. '
+          + 'If the network is unreachable or the endpoint is wrong, the user must decide how to proceed.',
+          NativeSearchCodes.upstream,
+          { cause: error },
+        )
+      }
 
       if (!response.ok) {
         const detail = await readQoderErrorDetail(response)

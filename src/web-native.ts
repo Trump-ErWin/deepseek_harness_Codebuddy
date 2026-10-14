@@ -382,8 +382,3 @@ function readQueries(value: unknown): string[] {
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
 }
-
-/** 错误 → 单行说明。 */
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
