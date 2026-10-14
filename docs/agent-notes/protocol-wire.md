@@ -1011,6 +1011,136 @@ jsonl，同一 `call_id` 两个不同 `id`）：
 - 回归用例：`tests/unit/openai-gateway-responses.spec.ts`（转换 + 流式/非流式事件序列）
   与 `tests/unit/openai-gateway-server.spec.ts` 的「Responses API 出口」段（HTTP 层）。
 
+### ⚠️⚠️ 网关是**最后一道防线**：空名工具调用必须**剔除**，不能 400（Issue IKLRIK）
+
+**用户报障**（2026-10-14）：Claude Desktop「Code」页面 → cc-switch → 本机网关，
+历史里落了一条 `name: ""` 的 `tool_use`，客户端回 `No such tool available:`，
+**此后每轮必 400**，整条会话报废（只能新建）。
+
+| 入口 | 原判据位置 | 原结果（实测）|
+|---|---|---|
+| `/v1/responses` | `responses.ts` 的 `function_call` 分支 | 400 / 21ms |
+| `/v1/chat/completions` | `messages.ts` 的 `convertToolCalls` | 400 / 37ms |
+
+**根因不是「没校验」，而是「校验的位置与强度选错了」**：
+下游每一层对**同一份坏数据**都是「**剔除并继续**」——
+`src/sse.ts` 的 `resolveToolPairing`（**九个**适配器都调它）注释原文：
+「宁可丢失一轮工具上下文，也好过整条会话死亡」。
+而网关站在**所有这些剔除防线之前** ⇒ 同一仓库里两套口径，**更严的那套在最外层**，
+于是「在适配器层可恢复的数据」在网关层变成致命参数错误。
+
+⚠️ **判据（可推广）**：网关的消费者是「**把历史全部回传**」的客户端
+（Codex / Claude 系），它们**没法自愈** ⇒ 网关必须与下游**同一取舍**。
+凡是「下游会剔除」的坏数据，网关不得比下游更严。位置决定了取舍。
+
+**修法（三种入口 + 响应向，缺一不可）**：
+
+| # | 落点 | 做法 |
+|---|---|---|
+| 1 | `responses.ts` 入站 | `name` 不可用（**共享判据 `hasUsableToolName`**，trim 后非空）⇒ `continue` **剔除**该调用 |
+| 2 | 同上 | **预扫**（`unusableFunctionCallIds`）空名调用的 id 集合，把**配对的** `function_call_output` 一并剔除 |
+| 3 | `messages.ts` 入站 | `convertToolCalls` 过滤空名那条；`collectUnusableCallIds` 预扫后剔除配对的 `role:'tool'` 结果（`convertMessage` 返回 `undefined` ⇒ 调用方 filter 掉，**绝不发空消息充数**）|
+| 4 | `responses.ts` 出站 | 三处 `name` 覆盖（`tool-call-delta` / `block-end`）加**非空守卫**：空串**不是** `undefined`，旧判据 `!== undefined` 会放它过去 |
+| 5 | 同上 | **名字始终不可用的 `function_call`：一个事件都不发**（连 `done` 也不发）—— `added` 发出就改不了 `name`，等于把坏块交给客户端**持久化** |
+
+⚠️ **两侧都要管（#2 / #3）**：只剔调用会留下**孤儿工具结果**，上游照样拒 ——
+`resolveToolPairing` 本来就是两侧都管，同因。
+⚠️ **判据必须只有一份**：`hasUsableToolName` 住在 `src/sse.ts`，网关**复用**它。
+自己再写 `name.length > 0` 必然漂移，而那正是本 issue 的成因。
+⚠️ **只放宽「名字」这一格**：`id` / `arguments` 缺失**仍然 400**（真·形状错误）。
+判断顺序本身有语义：`name` 与 `call_id` **同时**不可用时取**剔除**（那条数据本就无法
+回放，且正是会被每轮重放的那条）—— 已用独立用例把该方向锁死并写明理由。
+
+⚠️⚠️ **工具调用 id 是「不透明标识符」，绝不能 `trim`**（反向验证实测出的真漂移）：
+修法要在**两处**判断同一调用坏不坏 —— 主转换 `convertToolCalls` 与预扫
+`collectUnusableCallIds`。若预扫把 id `trim` 后再查、而结果那侧用的是**原样** id
+（客户端回传时就是这样），配对就**查不中** ⇒ **孤儿 `tool-result` 泄漏到 wire 上**
+（上游照样 400）。故判据抽成**一处** `isUsableToolCallId`（`messages.ts`），
+**只判非空、不 trim** —— 注意它与 `hasUsableToolName` 的差别是**刻意的**：
+工具名要 trim 后判（空白名上游也拒），id 不能 trim（`" call_1 "` 与 `"call_1"`
+是两个不同的 id）。⚠️ 这条一致性守卫的**第一版用例没有牙**（反向验证：把预扫改成
+trim 后仍全绿）⇒ 有区分力的输入是「**id 带首尾空格**的坏调用」，现已按此锁死。
+
+**响应向的对称缺口（同因同源，实测三方向）**——帧类型与已开项 **kind 不符**时：
+
+| 方向 | 已开项 | 异类帧 | 旧行为（实测输出）| 反向验证 |
+|---|---|---|---|---|
+| A | `reasoning` | `tool-call-delta` | 用 `rs_…` id 发 `function_call_arguments.delta` | **有牙**（有报障）|
+| B | `function_call` | `text-delta` | 用 `fc_…` id 发 `output_text.delta`，**正文静默丢失** | **有牙** |
+| C | `reasoning` | `block-end(tool-call)` | 工具名/参数被写进 reasoning 项 | **无牙**（纯防御）|
+
+⚠️⚠️ **方向 A 正是本次报废会话的起点**：客户端据此组装出 `{id:'rs_…', name:''}`
+（参数完整、名字从未出现）并持久化，之后每轮回传就是入站那份坏数据。
+修法是 `sameKind()` 守卫（语义与 `BlockAssembler` 的「`block-start` 按 index 幂等且
+**不更新 `blockType`**」一致），**流式与非流式共用同一份判据**。
+⚠️ **方向 C 与两处非流式判据「无牙」是实测结论，不是猜测**：删掉守卫用例仍全绿 ——
+因为异类 `block-end` 被灌进 reasoning 项后，`closeItem` / `outputItemJson` **仍按
+`item.kind` 输出**，`response.output` 逐字节相同 ⇒ 这几处**刻意不写用例**
+（写了就是恒真的虚假安全感）；保留它们只为「两条组装路径同口径」这条纪律。
+
+**⚠️⚠️ 一条关于「名字延迟到达」的回归教训（我第一版就写错了）**：
+`closeItem` 的判据必须读「名字**现在**是否可用」，**不能**读「**曾经**发过 `added`
+（`announced`）」。因为 **`block-end` 才是名字的权威来源**（各适配器都在收尾循环里
+补发它，见 `buddy-adapter.ts` 的 `toolOrder` 段）⇒「首帧名字为空、`block-end` 才带
+真名」是**正常形态**。以 `announced` 为判据会把这种「名字与参数都齐全」的真实调用
+**整条丢弃**（探针实测：`output` 里只剩一个空 message）——**比改前的坏形态更糟**。
+正确语义：名字可用且未发过 `added` ⇒ **此刻补发** `added` + 把已攒参数**全量**补发；
+仍不可用 ⇒ 一个事件都不发。
+
+**反向验证**（15 个变异，逐条与上表的「期望」核对，12 红 / 3 绿全部相符）：
+`hasUsableToolName` 判据是三处唯一实现；⚠️ `hasUsableToolName` 的签名加了类型谓词
+`name is string`，那是**纯编译期**收窄（运行期逐字节不变），为的是让调用方不必写
+`String(...)` / `!` —— 那两种写法都会把「判据」与「取值」拆成两份、进而漂移。
+
+### ⚠️⚠️ 两条由**独立审计打穿**的回归（都在本 issue 的修法之内，都已修）
+
+⚠️ **这一节是本 issue 最重要的教训**：两条都不是原缺陷，而是**我自己的修法引入的**，
+且**全量测试全绿**——只有「盯住不变式本身」的独立审计/对抗审计才抓得到。
+
+**① 非流式 `output[]` 顺序被翻转（B1，对抗审计实测打穿）**
+
+`output_index` 的语义是「本项在 `output[]` 里的下标」＝**开项顺序**，而 `outputOf`
+按它排序。**各适配器的收尾顺序与开项顺序相反**（工具块的 `block-end` 集中在流末尾
+补发，见 `buddy-adapter.ts` 的 `toolOrder` 段）。
+
+我的第一版让**流式**在「名字可用那一刻」占号、**非流式**在「收尾时」占号
+⇒ 非流式退化成收尾顺序。实测（三工具、收尾逆序 2→1→0）：
+
+| | 流式 | 非流式（缺陷）| 非流式（修后）|
+|---|---|---|---|
+| `output` 顺序 | `["cA","cB","cC"]` | **`["cC","cB","cA"]`（完全倒序）** | `["cA","cB","cC"]` ✅ |
+
+⚠️ **修法**：两条路径必须在**同一时刻**占号 —— `assignOutputIndex()` 一份实现
+（幂等），非流式的**每个 delta 处**也调它（与流式的 `toolAddedEvent` 同时刻）。
+⚠️ **原用例锁不住它的原因**：那三条只覆盖「**坏**工具项被剔后不占号」，输入恒为
+「坏项在前、无工具↔正文顺序对照」，而顺序正确的**单工具**场景是**恒真**的
+⇒ **判据必须写成「两条路径给出相同顺序」，且输入必须含并行工具 + 收尾逆序**。
+
+**② 坏块会话产出「空 assistant 消息」把 400 挪到上游（独立审计指出）**
+
+「剔除坏调用」之后，那条 assistant 会留成 **content 为空**的助手消息，成为 wire 上的
+**开头发言**（实测经 `serializeMessage` 产出 `[{role:'assistant',content:''}]`，
+且**没有任何 user 消息**）⇒ 对 OpenAI 兼容端点是典型的 `model_param_invalid` 400。
+⚠️ 修法：`convertMessage` 的 assistant 分支在「`tool_calls` 全被剔光 **且** 正文为空」
+时返回 `undefined`（整条剔除）。
+⚠️ **边界（必须一起锁）**：**正文非空**的 assistant 即使调用被剔光也**必须保留**
+——那是模型真实的发言、用户真看到的内容，剔掉会让它从历史里消失。
+⚠️ 如实标注：**无** `tool_calls` 的空 assistant 在改前也产出同形，故这**不是本次引入的
+回归**；但修法把它从「罕见」变成「**坏块会话的必经路径**」，故一并堵上。
+
+⚠️ **一个方法论教训（写变异验证时必读）**：我做的变异验证里，有一处（非流式
+`block-end` 新建时急躁占号）**实测无牙** —— 该变异态与修复态输出**逐字节相同**
+（那条路径无并发开项，`assignOutputIndex` 随即覆盖）。**无牙 ≠ 该判据无用**，
+但**绝不能为它编造一个恒真的用例**：如实登记「无牙」比假装有牙诚实。
+另有审计员指出的同类陷阱：跨模块副本做变异验证时，`instanceof OpenAiGatewayError`
+这类断言会因**类身份不同**而假红 —— 「用例变红」**不自动等于**「红的原因是被测变异」。
+
+⚠️ **本机网关默认只在 `127.0.0.1` 监听**（见本节另一条 IKL7UN），排查时别去外网找。
+
+回归用例：`tests/unit/openai-gateway-responses.spec.ts` 与
+`tests/unit/openai-gateway-messages.spec.ts` 的
+「★ 空名 `function_call` 是剔除而不是 400（Issue IKLRIK）」两段。
+
 ### ⚠️⚠️ 工具结果**可以带图**：`textFromContent` 不能用在 tool 结果上（真实报障，2026-10-04）
 
 **用户报障**：在 Codex 里走本机网关接 **TRAE**，一让模型看图就整轮失败：
