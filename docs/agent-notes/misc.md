@@ -3,7 +3,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）、`raccoon`（商汤 **Raccoon Work** / 小浣熊）与 `minimax`（**MiniMax Code 中国版**，首个 **Anthropic Messages** 协议族）十个 LLM provider 路由。
+本项目是 DeepSeek Harness 的一个插件（`dsh-providers-hub`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）、`raccoon`（商汤 **Raccoon Work** / 小浣熊）与 `minimax`（**MiniMax Code 中国版**，首个 **Anthropic Messages** 协议族）十个 LLM provider 路由。
 
 `buddy` 与 `workbuddy` 同源：共用同一 CLI 内核与同一认证协议，差异全部收敛在 `src/product.ts` 的产品配置中。关键差异是 **`endpoint`**：中国版为 `copilot.tencent.com`，国际版为 `www.workbuddy.ai`，两者返回不同模型池，因此 endpoint 必须随产品切换、不可当作全局常量。此外 `platform` 分别为 `ide` 与 `workbuddy-ai`，国际版登录 URL 还追加 `version` / `loginSessionId`。
 
@@ -674,7 +674,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 新增同族产品**不要**在四处分支各加一条平行 case —— 平行 case 越多，漏接概率越高
 （`workbuddy` 的「刷新」按钮就是这么一直坏着的）。
 
-- **包名**：`dsh-codearts-auth`
+- **包名**：`dsh-providers-hub`
 - **入口**：`lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）
 - **构建**：`pnpm build:all`（`tsc` 编译宿主侧 + `esbuild` 打包客户端）
 - **语言**：TypeScript
