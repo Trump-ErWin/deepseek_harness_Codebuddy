@@ -969,4 +969,28 @@ describe('LoomyAdapter 图片能力覆盖（2026-10-14 远端漏报）', () => {
     const models = await adapter.listModels('loomy')
     expect(models[0]!.inputModalities).toEqual(['text'])
   })
+
+  /**
+   * ★ 上游把 id 改成**大写**时不得静默失效（2026-10-14 审计发现）。
+   *
+   * 断言打在 `inputModalities`（宿主准入闸门真正读的字段）上，而不是内部
+   * `supportsImage` —— 否则「适配器算对了但目录播报错了」这类分叉抓不到。
+   * 远端原值逐字节大小写变体都要能过，同时**对外 id 必须原样保留**
+   *（它是 `fallbackIndex` / `effortsForModel` 的索引键，改了会连带静默失效）。
+   */
+  it('★ 远端把 id 下成大写时，qwen-3.8-max 仍判定支持图片且对外 id 不变', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => parseLoomyRemoteModels({
+        data: [remoteEntry({
+          id: 'Qwen-3.8-Max',
+          name: 'Qwen 3.8 Max（x12.0）',
+          capabilities: { reasoning: true, vision: false, input_modalities: ['text'] },
+        })],
+      }),
+    })
+    const models = await adapter.listModels('loomy')
+    const entry = models.find((m) => m.id === 'Qwen-3.8-Max')
+    expect(entry, '对外 id 必须原样保留（不得被归一化改掉）').toBeDefined()
+    expect(entry?.inputModalities, '闸门读的字段').toContain('image')
+  })
 })

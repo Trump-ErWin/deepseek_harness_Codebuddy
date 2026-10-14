@@ -128,4 +128,55 @@ describe('Loomy 产品配置', () => {
     // 实测疑似「声明 image 但读不出」的 MiniMax-M3 本次刻意不降级（见源码注释）
     expect(LOOMY_IMAGE_CAPABILITY_OVERRIDES.has('MiniMax-M3')).toBe(false)
   })
+
+  /**
+   * ★ 覆盖表查表口径（2026-10-14 审计发现：静默失效面）。
+   *
+   * 修复前覆盖表用**逐字节精确匹配**，而同一文件读远端模态的
+   * `readInputModalities()` 却 `.toLowerCase()` 归一 ⇒ 上游一旦把 id 改成
+   * `Qwen-3.8-Max` 或前后带空白，覆盖表恒不命中、图被准入闸门重新拒掉，
+   * 而**零报错、测试全绿**（正是本次修复前的用户症状原样复现）。
+   *
+   * ⚠️ 这两条**必须**存在：现有其它用例构造的 id 全小写，
+   * 结构上抓不到这个面（反向验证：去掉 `loomyCatalogKey` ⇒ 立刻变红）。
+   */
+  it('★ 图片能力查表对大小写不敏感（上游改大小写不得静默失效）', () => {
+    expect(loomySupportsImage('Qwen-3.8-Max', false)).toBe(true)
+    expect(loomySupportsImage('QWEN-3.8-MAX', false)).toBe(true)
+  })
+
+  it('★ 图片能力查表忽略首尾空白', () => {
+    expect(loomySupportsImage(' qwen-3.8-max ', false)).toBe(true)
+    expect(loomySupportsImage('\tqwen-3.8-max\n', false)).toBe(true)
+  })
+
+  it('⚠️ 归一化不得把未登记模型误放行（大小写变体也不行）', () => {
+    // 只有表内条目享受「补报」；大小写变体不能变成通配
+    expect(loomySupportsImage('SPARK-X', false)).toBe(false)
+    expect(loomySupportsImage('Spark-X', false)).toBe(false)
+    expect(loomySupportsImage('SPARK-X', true)).toBe(true)
+  })
+
+  /**
+   * ★ 上下文窗口覆盖表**同一口径**（2026-10-14 审计发现）。
+   *
+   * 源码注释自称两张表「同一条纪律」，但修复前 `loomyContextWindow` 同样是
+   * 精确匹配 ⇒ 口径不一致会让那句话变成假的。这里逐格锁死两者一致。
+   */
+  it('★ 上下文窗口查表与图片能力同口径（大小写/空白不敏感）', () => {
+    expect(loomyContextWindow('Spark-X', 1_048_576)).toBe(262_144)
+    expect(loomyContextWindow(' spark-x ', 1_048_576)).toBe(262_144)
+    // 未登记条目照传声明值，归一化不是通配
+    expect(loomyContextWindow('SOME-OTHER', 4096)).toBe(4096)
+  })
+
+  it('⚠️ 两张覆盖表的键都必须已归一（否则恒不命中，且无人报错）', () => {
+    // 这是「表内条目必须小写」的机器守卫：加新条目时忘了小写会在这里红。
+    for (const key of Object.keys(LOOMY_CONTEXT_WINDOW_OVERRIDES)) {
+      expect(key, `上下文窗口覆盖表键 "${key}" 未归一为小写`).toBe(key.trim().toLowerCase())
+    }
+    for (const key of Array.from(LOOMY_IMAGE_CAPABILITY_OVERRIDES)) {
+      expect(key, `图片能力覆盖表条目 "${key}" 未归一为小写`).toBe(key.trim().toLowerCase())
+    }
+  })
 })
