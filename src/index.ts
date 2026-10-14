@@ -2908,38 +2908,29 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     refreshAccountCredential: (refName: string, pool: unknown, accountId: string) =>
       officeaceAuth.refreshAccountCredential(refName, pool as never, accountId, ctx.credentials as never),
     /**
-     * ⚠️ `refreshAll` **内部必须走本对象的 `refreshAccountCredential`**，不能直接调
-     * 模块函数：守卫用例（`provider-runtime-wiring.spec.ts`）的判据是「布桩在
-     * `ctx.officeaceAuth.refreshAccountCredential` 上，然后断言 `refreshAll` 打到它」。
-     * 绕开本对象走模块函数 ⇒ spy 收不到，用例静默少一家覆盖。
-     */
-    /**
-     * ⚠️ `refreshAll` **内部必须走本对象的 `refreshAccountCredential`**，不能直接调
-     * 模块函数：守卫用例（`provider-runtime-wiring.spec.ts`）的判据是「布桩在
-     * `ctx.officeaceAuth.refreshAccountCredential` 上，然后断言 `refreshAll` 打到它」。
-     * 绕开本对象走模块函数 ⇒ spy 收不到，用例静默少一家覆盖。
+     * 批量续期：**复用 `officeace-auth.ts` 的 `refreshAccountList`**，
+     * 只把「续期某一个账号」分派到本对象的 `refreshAccountCredential`。
      *
-     * ⚠️ 这是**唯一**需要覆盖的转发方法：其余导出（含 `startLogin` /
-     * `completeLogin` / `persistLogin` / `fetchSubscriptionSummary` …）由
-     * 上面的展开复制直接提供，无需再抄一遍 —— 抄了就会漂移。
+     * ⚠️⚠️ **不要再抄一份遍历逻辑**（IKLPTZ 的真实成因）：这里原先逐字复制了
+     * 模块里的那份，连注释都一样，于是「把同步的 `listAccountsByProvider`
+     * 当 Promise 用」这个误判被**复制了两遍**，一个 bug 要修两处、测试也要
+     * 覆盖两处。收成一份之后，`refreshAccountList` 的签名就是唯一真源。
+     *
+     * ⚠️ **不得直接挂模块函数 `officeaceAuth.refreshAll`**：那份走的是**没有
+     * `ctx.credentials`** 的兼容文件腿，多账号下会串号（2026-10-13 改造）。
+     * 这里必须走本对象 —— 它的 `refreshAccountCredential` 才注入了凭据库。
+     *
+     * ⚠️ 守卫用例（`provider-runtime-wiring.spec.ts`）的判据是「布桩在
+     * `ctx.officeaceAuth.refreshAccountCredential` 上，然后断言 `refreshAll`
+     * 打到它」。故这里**必须**经 `officeaceAuthService` 取方法（走本对象），
+     * 绕开它去调模块函数 ⇒ spy 收不到，用例静默少一家覆盖。
      */
-    refreshAll: async (pool: unknown) => {
-      const p = pool as {
-        listAccountsByProvider?: (id: string) => Promise<readonly { id: string; credentialRef: string }[]>
-      } | undefined
-      if (p?.listAccountsByProvider === undefined) {
-        await officeaceAuth.refreshStoredCredential().catch(() => undefined)
-        return
-      }
-      const accounts = await p.listAccountsByProvider('officeace').catch(() => [])
-      if (accounts.length === 0) {
-        await officeaceAuth.refreshStoredCredential().catch(() => undefined)
-        return
-      }
-      for (const account of accounts) {
-        await officeaceAuthService.refreshAccountCredential(account.credentialRef, pool, account.id)
-      }
-    },
+    refreshAll: (pool: unknown) => officeaceAuth.refreshAccountList(
+      pool,
+      (account) => officeaceAuthService.refreshAccountCredential(
+        account.credentialRef, pool, account.id,
+      ),
+    ),
   })
   {
   /**
