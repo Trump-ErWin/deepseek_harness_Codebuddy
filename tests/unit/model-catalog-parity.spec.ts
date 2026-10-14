@@ -605,17 +605,19 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
   ]
 
   /**
-   * ⚠️ **对未知 id 省略 `inputModalities` 的家**：`buddy` 系、`cline` 与 `accio`
-   * （`cline` 为 issue IKKZUG 2026-10-12 新增；`accio` 为本 provider 新增）。
+   * ⚠️ **对未知 id 省略 `inputModalities` 的家**：`buddy` 系与 `cline`
+   * （`cline` 为 issue IKKZUG 2026-10-12 新增）。
    *
    * | 家 | 为什么「未知」是真实状态 |
    * |---|---|
    * | `buddy`（含 `workbuddy`） | `imageCapabilityKnown` 区分「明确 false」与「全都没查到」，后者只报未知 |
    * | `cline` | **能力只来自目录条目，而 `cline-pass/*` 的条目只由 models.dev 提供** —— 那是 5.39 MB 的外部站点，用户实测直连三次（超时/超时/1.9s 成功）⇒ 「未知」是高频状态而非理论边界 |
-   * | `accio` | **整个图片通路未实测**（`serializeAccioMessages` 的 `flattenText` 只保留 text 块），故适配器**恒省略** —— 写 `['text']` 是把「未知」写成「明确不支持」（AGENTS.md 静默失效表的「未知被写成否定」那一格：将来接上图片通路时，这个明确的否定会让 DSH 在附件准入阶段就静默拒掉图片） |
    *
-   * ⚠️ `accio` 与 `accio-adapter.ts` 的 `toCatalogEntry`「恒省略」是**同一件事的
-   * 两处落点**，漏一处就会在这里变红（Task 7 的交接要点 4）。
+   * ⚠️ **`accio` 曾在此集合里，2026-10-14 已移出**（issue IKLR7V）：它的图片通路
+   * 真机实测打通（上游原生收图、`multimodal:true` 四色全对），且远端条目的
+   * `multimodal` 字段**从不缺失** ⇒ 已知模型**不再有「未知」态**，改为按逐模型的
+   * `supportsImage` 声明（`false` 写 `['text']`）。⚠️ 它的**未知 id** 仍保守报 `['text']`
+   * （不是省略）—— 未知 id 的能力是真的无从得知，而放行图片会让上游**静默忽略**它。
    *
    * 其余一律**保守报 `['text']`**。
    *
@@ -627,7 +629,7 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
    * 它确实存在「未知态」（能力来源会在进程运行中拿不到），而有些家的目录是
    * 编译期表恒可用、根本不存在未知态 —— 那些**不**该加进来。
    */
-  const OMIT_UNKNOWN_MODALITIES: ReadonlySet<string> = new Set(['buddy', 'workbuddy', 'cline', 'accio'])
+  const OMIT_UNKNOWN_MODALITIES: ReadonlySet<string> = new Set(['buddy', 'workbuddy', 'cline'])
 
   /**
    * ⚠️ **只有 `cline` 与 `codearts` 对未知 id 仍声明 `reasoning`**：它们的档位

@@ -19,6 +19,7 @@
 | `buddy-first-message-role.e2e.spec.ts` | `DSH_BUDDY_FIRSTMSG_E2E=1` + `DSH_BUDDY_FIRSTMSG_E2E_CONFIRM=yes` | **「wire 首条角色」实测凭据**。断言 `space-bunny` 在「首条是带 tool_calls 的 assistant」时回 400/**11148**（`displayMsg.zh`=「工具记录不完整，请新建任务」），而 `step-5-preview` **容忍同一形状**。⚠️ 「换个模型就好」是假解法。该判据写死在 `buddy-adapter.ts` 的 `stream()` 里，且 2026-10-12 的审计在**判据本身上**抓到一个真缺陷（初版写 `=== 'assistant'`，漏掉 user-first / tool-first） |
 | `accio-chat-probe.e2e.spec.ts` | `DSH_ACCIO_CHAT_E2E=1` + `DSH_ACCIO_CHAT_E2E_CONFIRM=yes` | 发一条极小请求。**默认用全目录最低倍率模型** `1Drift-N8kP2Q7wR5mX`（x0.013，实测最低）。可用 `ACCIO_PROBE_MODEL` 覆盖，⚠️ **未知 id 直接拒绝**、倍率超 x0.2 需 `ACCIO_PROBE_ALLOW_EXPENSIVE=1` |
 | `accio-tools-probe.e2e.spec.ts` | `DSH_ACCIO_TOOLS_E2E=1` + `DSH_ACCIO_TOOLS_E2E_CONFIRM=yes` | 工具调用**往返**（带 tools → 结构化 `tool-call` → 回传结果 → 最终正文）+ **思考链分离逐字对账**。⚠️ 另断言 `accioToolCallMergeTransform` 真的生效：同一个 id **恰好一个块**且参数**非空**（未合并会变成「N 个块 + 首块 `{}`」⇒ harness 把同一工具执行 N 次） |
+| `accio-image-probe.e2e.spec.ts`（`pnpm test:e2e:accio-image`） | `DSH_ACCIO_IMAGE_E2E=1` + `DSH_ACCIO_IMAGE_E2E_CONFIRM=yes` | **图片通路**（issue IKLR7V 的验收与**证据留存**，见下）。经**生产适配器全链路**发一张**现场生成**的 16×16 四象限纯色 PNG（左上红/右上绿/左下蓝/右下白），判据三条同时成立：**没抛错 + 字节桥接真被调用 + 四色全对**。另含纯文本对照，以及 ⚠️⚠️ 「`multimodal:false` 的模型带图必须被**本地拒绝**」——实测上游对它是**静默忽略图片**（GLM 5.1 会据此**幻觉**出四个颜色），这条是本家 `inputModalities` 写 `['text']` 的**唯一依据**，单测锁不住 |
 
 ## ⚠️ 图片探针的 fixture 不入库
 
@@ -198,7 +199,38 @@ pnpm test:e2e:accio-tools
 # ⚠️⚠️ Accio 续期**轮换语义**（会真实消费一次 refresh_token）
 #    只碰**本插件自己现场登录的**凭据（只进内存）；无法证明归属时**整体 skip**
 pnpm test:e2e:accio-refresh
+
+# ⚠️ 会消耗 Accio 积分：**图片通路**（四象限色块图四色全对 + multimodal:false 必须被拒）
+pnpm test:e2e:accio-image
 ```
+
+## ⚠️ Accio 图片探针：为什么它必须存在，以及两个账号来源
+
+**存在理由**：`docs/agent-notes/providers-accio.md` §10 的 U-D（图片通路）由它给出答案，
+而同一份笔记的 U-F / U-G 记着一条教训 —— **「真机跑过，但证据没留在库里」等于下次没人敢信**
+（结论照用，却没有可复核的产物）。本探针就是**把 U-D 的证据留存下来**。
+
+它的核心判据（⚠️ **不能只看 HTTP 200**，与其余 accio 探针同口径）：
+
+| 判据 | 为什么必须 |
+|---|---|
+| 没抛错 | HTTP 200 也可能是风控 HTML 或流内 `error_code` 非 `'200'` 的业务失败 |
+| **字节桥接真被调用**（`readCalls > 0`） | 否则是「静默丢图」的假成功 —— 模型答「我没看到图」时，**失败原因会被误读成「上游不支持图片」**（本文件末尾有一条源码级守卫钉住这两条断言必须同时存在） |
+| **四色全对** | 这才证明图片**真的被模型读到了**（实测真收图的模型 3/3 全对；忽略图的模型 0/4） |
+
+**账号来源（两个，优先级明确）**：
+
+```
+DSH_ACCIO_IMAGE_E2E_CREDENTIAL_JSON='{"access_token":"…","refresh_token":"…","region":"cn"}'   # 可选，显式指定
+DSH_ACCIO_IMAGE_E2E_ANY_ACCOUNT=1                                                              # 可选，放宽到「任意账号」
+```
+
+⚠️ 与 `accio-chat` / `accio-tools` **刻意不同**：那两家只认**启用**账号
+（`enabledAccountRef`），而本机实测 5 个 accio 账号**全是 `enabled: false`**
+⇒ 只认启用账号会让本探针在本机**永远跑不起来**，U-D 的证据就又留不下来。
+故本探针支持 `DSH_ACCIO_IMAGE_E2E_ANY_ACCOUNT=1` 放宽到任意账号 ——
+**但必须显式 opt-in**，且日志会**点名用了哪个 ref**：放宽是有代价的
+（会消耗一个**用户已停用**账号的额度），默认行为**仍是只认启用账号**。
 
 ## ⚠️ Cline 探针的付费保护（请勿削弱）
 

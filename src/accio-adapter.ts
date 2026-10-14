@@ -77,12 +77,20 @@ import {
   isAccioExpired,
   type AccioCredential,
 } from './accio.js'
-import { consumeAccioSse, isAccioErrorFrame, serializeAccioMessages, toAccioTools } from './accio-messages.js'
+import {
+  ACCIO_IMAGE_PIXEL_BUDGET,
+  consumeAccioSse,
+  isAccioErrorFrame,
+  serializeAccioMessages,
+  toAccioTools,
+} from './accio-messages.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 // ⚠️ 图片守卫必须复用**共享的递归收集器**（它按 `tool-result` 递归下钻）——
 // 本仓库其余适配器（buddy / lobsterai / trae / gemini / cline / qoder / …）全部走它，
 // 不在这里手写第三份判据（「同一语义两套判据」是首条红线）。
 import { collectImages, detailFieldText } from './openai-compat.js'
+// ⚠️ 像素预算与「取请求版本」投影同样复用共享实现（issue IKLR7V 的接线建议）。
+import { projectRequestImage } from './image-budget.js'
 import { resolveToolPairing } from './sse.js'
 // ⚠️ 目录解析的**唯一实现**在 `accio-auth.ts`（`AccioAuth.fetchModels` 用的就是它们）。
 // 本文件只再导出，**不写第二份** —— 否则就是本仓库红线「同一语义两套判据」。
@@ -113,6 +121,16 @@ export const ACCIO_SSE_IDLE_TIMEOUT_MS = 120_000
  * 形状对齐实测值（24 字符、base64url 字符集）。
  */
 const FALLBACK_UTDID = `accio-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`
+
+/**
+ * 工具结果内嵌图片被提升为独立 user 消息时，加在它前面的说明文字。
+ *
+ * ⚠️ **不可省**：`functionResponse` 只吃字符串、没有承载图片的位置，所以内嵌图
+ * 只能挂到 `role:'tool'` 之后。而一张**没有任何上下文**的图片会让模型无从判断
+ * 它是「工具的输出」还是「用户新发的内容」—— 本常量就是那句上下文
+ * （与 `trae-adapter.ts` 的 `TOOL_RESULT_IMAGE_TEXT` 同一用途）。
+ */
+const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
 
 /**
  * 把 `modelDisplayName` 与**计费倍率**拼成展示名：`模型名 · x倍率`。
@@ -260,6 +278,24 @@ export interface AccioAdapterOptions {
   fetchRemoteModels?: () => Promise<AccioFallbackModel[]>
   /** 注入的 fetch（测试用）；缺省全局 `fetch`。 */
   fetchImpl?: typeof fetch
+  /**
+   * 内联一张图片为**原始字节**（由调用方桥接 `ctx.attachments.readImage`）。
+   *
+   * ⚠️ 契约与 `buddy-adapter.ts` 一致：**读不到必须返回 `undefined`**（不是抛错，
+   * 也不是返回空）—— 由 {@link AccioAdapter.stream} 统一判成
+   * `UNSUPPORTED_CONTENT`。静默丢图会让用户以为图片被模型看到了。
+   */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  /**
+   * 取**请求版本**图片（附件服务按目标尺寸缩放）。
+   *
+   * ⚠️ 契约与 `readImage` **相反**：不可用时返回 `undefined`（不是抛错）——
+   * 缩放是优化，拿不到就发原图（见 `image-budget.ts`）。
+   */
+  readImageRequest?: (
+    attachment: unknown,
+    target: { width: number; height: number; maxBytes: number },
+  ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 多账号池（用于记录当前账号归属）。 */
   accountPool?: AccountPool
   /**
@@ -318,6 +354,21 @@ function contentToText(content: unknown): string {
  *    `role:'tool'` 消息）—— 漏掉它 `tool-result` 判据恒不命中，
  *    `resolveToolPairing` 会把 assistant 的 `tool_calls` **整体剔除**；
  * 2. **孤儿工具调用/结果必须剔除**（上游对无法配对的条目回 400）。
+ *
+ * ## 图片（issue IKLR7V 接线，2026-10-14）
+ *
+ * ⚠️ 本层**必须保留图片块**，不能只取文本。三种位置都要覆盖：
+ *
+ * | 位置 | 处理 |
+ * |---|---|
+ * | user 消息的顶层 `content[]` | `content` 产出**数组**（含 `image` 块）⇒ 由 `serializeAccioMessages` 的 `accioUserParts` 内联 |
+ * | `tool-result` **内嵌**的图片 | **提升**为紧随其后的一条 user 消息（协议约束见下） |
+ * | 其余 | 维持原样（纯文本仍然产出**字符串** `content`，线上格式逐字节不变） |
+ *
+ * ⚠️ **工具结果内嵌图片不能就地并进 `functionResponse`**：`functionResponse` 只吃
+ * `responseJson`（一个**字符串**），塞图片没有位置。沿用 `trae-adapter.ts` 的
+ * `flushToolImages` 范式 —— 该图挂到 `role:'tool'` **之后**的独立 user 消息里，
+ * 并带一句 `TOOL_RESULT_IMAGE_TEXT` 说明来路（否则模型看到一张**没有上下文**的图）。
  */
 export function toAccioWireMessages(
   messages: readonly { role: string; content?: unknown }[],
@@ -375,21 +426,94 @@ export function toAccioWireMessages(
         typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result',
     )
     const text = contentToText(message.content)
-    if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+    /**
+     * ⚠️ **只取本消息自己的图片**（先剔掉 `tool-result` 块）：工具结果内嵌的图片
+     * 由下面 `pendingToolImages` 挂到 `role:'tool'` **之后**。一并收进来会把它们
+     * 排到 tool 消息**之前** —— 那正是 `trae-adapter.ts` 记的 4027 事故形态
+     * （「tool 消息必须紧跟其 assistant tool_calls 的应答，中间插任何东西都被拒」）。
+     */
+    const ownBlocks = imageBlocksOf(
+      content.filter(
+        (block) => !(typeof block === 'object' && block !== null
+          && (block as { type?: unknown }).type === 'tool-result'),
+      ),
+    )
+    /**
+     * ⚠️⚠️ **判据必须把 `ownBlocks.length > 0` 算进去**（真实缺陷，本文件的洞探针抓到）：
+     * 初版是 `if (text.length > 0 || toolResults.length === 0)`，于是
+     * 「**只有图片 + 工具结果、没有文本**」的消息（`content: [image, tool-result]`）
+     * 两腿**同时为假** ⇒ 整条消息被跳过 ⇒ **图片被静默丢弃**（没有任何报错）。
+     * 这与本函数承诺的「绝不静默丢弃」直接矛盾，也与 `collectImages` 收得到它
+     * （守卫认为「有图」）相矛盾 —— 那种「收了却发不出去」正是最隐蔽的形态。
+     */
+    const hasOwn = text.length > 0 || ownBlocks.length > 0
+    /**
+     * ⚠️⚠️ **带工具结果时，本消息的正文/图片必须延后到 `role:'tool'` 之后**
+     * （与 `trae-adapter.ts` 的 `deferred` 同一理由、同一范式）。
+     *
+     * Accio 是 **Gemini 风格**：工具结果下发为 `{role:'user', parts:[{functionResponse}]}`，
+     * 而**函数响应必须紧跟发起该调用的 model 消息** —— 中间插任何东西都会破坏配对。
+     * `trae-adapter.ts` 记的 4027 事故（`Messages with role 'tool' must be a response to
+     * a preceding message with 'tool_calls'`）就是这条约束在另一协议形态下的爆炸：
+     * 坏报文一旦落进会话历史，**每轮原样重放**、5 次重试与「继续」全部无效，
+     * 只有换 provider 才能恢复。⇒ 顺序不是风格问题，是**会话能不能继续**的问题。
+     */
+    const deferred = toolResults.length > 0
+    /**
+     * 组装「本消息自己的正文 + 图片」的 wire 形态。
+     *
+     * ⚠️ **空文本块必须剔除**（`text === ''` 时不加 `{type:'text'}`）：
+     * 「只有图片、没有正文」的消息（`content: [image]`）很常见，
+     * 带上 `{text:''}` 会产出一个**空 part** —— 上游对空 part 的处理未实测，
+     * 而本仓库既有的纯文本路径也不会产出空文本块（`if (text !== '')`）。
+     * 保持两侧一致，少一个未实测的形状。
+     */
+    const ownFrame = (): Record<string, unknown> => {
+      if (ownBlocks.length === 0) return { role: 'user', content: text }
+      return {
+        role: 'user',
+        content: text === '' ? ownBlocks : [...ownBlocks, { type: 'text', text }],
+      }
+    }
+    if (hasOwn && !deferred) wire.push(ownFrame())
+    const pending: Array<Record<string, unknown>> = []
     for (const result of toolResults) {
       const id = String(result.toolCallId)
       // 丢弃孤儿工具结果（没有对应 tool_call 同样会被上游拒绝）。
       if (!keepResultIds.has(id)) continue
+      const embedded = imageBlocksOf(Array.isArray(result.content) ? result.content : [])
       wire.push({
         role: 'tool',
         tool_call_id: id,
         // ⚠️ **name 必须回填**：Accio 的 `functionResponse` 按 name 配对。
         name: toolNames.get(id) ?? '',
-        content: contentToText(result.content) || '(no output)',
+        content: contentToText(result.content) || (embedded.length > 0 ? TOOL_RESULT_IMAGE_TEXT : '(no output)'),
       })
+      pending.push(...embedded)
+    }
+    // 延后的本消息正文/图片：排在 `role:'tool'` **之后**（成因见上 `deferred`）。
+    if (deferred && hasOwn) wire.push(ownFrame())
+    // 工具结果内嵌图片：同样排在 `role:'tool'` **之后**的独立 user 消息
+    //（`functionResponse` 只吃 `responseJson` 字符串，没有承载图的位置）。
+    if (pending.length > 0) {
+      wire.push({ role: 'user', content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pending] })
     }
   }
   return wire
+}
+
+/**
+ * 取出 content 里的 `image` 块（**原样保留**，含 `attachment` 引用）。
+ *
+ * ⚠️ 只收**本层**的 `image` 块，**不递归**进 `tool-result`：递归由调用方
+ * 按「工具结果图片要排到 tool 消息之后」的位置约束单独处理。
+ */
+function imageBlocksOf(content: readonly unknown[]): Array<Record<string, unknown>> {
+  return content.filter(
+    (block): block is Record<string, unknown> =>
+      typeof block === 'object' && block !== null
+      && (block as { type?: unknown }).type === 'image',
+  )
 }
 
 /** 安全读取 `Error.message`。 */
@@ -928,10 +1052,18 @@ export class AccioAdapter extends LlmAdapter {
         product: this.product,
         loadCatalog: () => this.loadCatalogEntries(),
         syncCatalog: () => this.syncCatalogEntries(),
-        // ⚠️⚠️ **刻意不提供 `unknownModelInputModalities`**：未知 id 同样
-        // **省略** `inputModalities`（= 未知）。理由见 `toCatalogEntry` 的长注释 ——
-        // 本 provider 的图片通路未实测，写 `['text']` 就是把「未知」写成
-        // 「明确不支持」（AGENTS.md 的静默失效格）。
+        /**
+         * ⚠️ **未知 id**（用户手填）：保守报 `['text']`。
+         *
+         * 本家目录条目的 `multimodal` 字段**从不缺失** ⇒ 已知模型没有「未知」态
+         * （见 `toCatalogEntry`）。而**未知 id** 的能力真的无从得知，故取保守侧：
+         * 报 `['text']` 让 DSH 在附件准入阶段就拒图，而不是把图放行到一个
+         * **可能静默忽略它**的服务端（实测 `multimodal: false` 的模型正是那种行为）。
+         *
+         * ⚠️ 与 `stream()` 的未知 id 判据**同向**（那里同样保守拒绝）——
+         * 两处必须一致，否则会出现「准入放行、适配器再拒」这种白撞一轮的形态。
+         */
+        unknownModelInputModalities: () => ['text'] as const,
       },
     )
   }
@@ -962,39 +1094,39 @@ export class AccioAdapter extends LlmAdapter {
   /**
    * 把本家条目转成共享骨架的中间结构。
    *
-   * ## ⚠️⚠️ `inputModalities` 的三态决策（本文件最重要的一个判据）
+   * ## ⚠️⚠️ `inputModalities` 的三态决策（2026-10-14 真机实测后**已改**）
    *
-   * `normalizeAccioModel` 把上游的 `multimodal` 压成**二值**
-   * （`supportsImage: row.multimodal === true`），于是 `false` **同时**表示
-   * 「上游明确说 false」与「上游没有这个字段」—— 两种语义被折叠成一个布尔。
+   * ### 改之前的判据（已废弃，别再改回去）
    *
-   * 而 DSH 的 `inputModalities` 是**三态**：
-   * - 数组 = 已知能力；
-   * - **省略 = 未知**（交给宿主判断）；
-   * - `['text']` = **明确声明不支持图片**（图片会被拒）。
+   * 原先**恒省略**，理由是「本 provider 的图片通路整体未实测」——那时确实没有
+   * 任何一次真实图片请求被验证过，故「未知」是唯一诚实的编码。
    *
-   * ### 本适配器的选择：**恒省略**（= 未知）
+   * ### 现在为什么可以写数组
    *
-   * 判据是**本 provider 的图片通路整体未实测**（`ACCIO_IMAGE_PIXEL_BUDGET` 只是
-   * 预留的接入点，`serializeAccioMessages` 的 `flattenText` 也只保留 text 块）。
-   * 在这种前提下：
+   * issue IKLR7V 的真机实测把那个前提消掉了：
    *
-   * - 写 `['text','image']` 是**编造能力** —— 上游 `multimodal: true` 只说明
-   *   **目录声明**，没有任何一次真实图片请求被验证过（设计 §10 的 U-D 未验证项）；
-   * - 写 `['text']` 是**把「未知」写成「明确不支持」** —— 一旦将来接上图片通路，
-   *   这个明确的否定会让 DSH 在**附件准入阶段**就拒掉图片，且症状是静默的
-   *   （`buddy` 实测过同一形态：能力表拿不到就静默关掉图片能力）；
-   * - **省略**是唯一诚实的编码：既不放行一个未验证的能力，也不断言一个未验证的否定。
+   * | 声明 | 实测（四象限色块图） |
+   * |---|---|
+   * | `multimodal: true`（3 个模型） | **3/3 四色全对**（红/绿/蓝/白）⇒ 真收图 |
+   * | `multimodal: false`（3 个模型） | **3/3 未认图**；GLM-5.3 / Qwen 3.5 A3B 明说「没看到图片」，**GLM 5.1 幻觉**出一份答案 |
    *
-   * ⚠️ **代价是图片会走到适配器**（DSH 对「未知」不投影）—— 故
-   * {@link AccioAdapter.stream} 在收到图片时**显式抛 `UNSUPPORTED_CONTENT`**，
-   * 绝不静默丢弃（静默丢弃会让用户以为模型看到了图）。
+   * 且远端 15 条可见模型的 `multimodal` 字段**从不缺失**（38 条原始行里
+   * 可见的都有该键）、与兜底表 **100% 一致**。
    *
-   * ⚠️ **不采用「读原始 row」的替代方案**：那要求适配器自己再解析一遍目录
-   * （`fetchRemoteModels` 返回的已是归一化后的 `AccioFallbackModel`），
-   * 等于在本文件重写第二份解析器 —— 本仓库首条红线。
-   * 若将来接上图片通路，正确的改法是给 `AccioFallbackModel` 加一个**三态字段**
-   * （在 `accio-auth.ts` 一处落地），而不是在这里开第二份解析。
+   * ### ⇒ 本家**不再有「未知」态**，与 loomy / raccoon / zcode / minimax / qoder 同形
+   *
+   * DSH 的三态语义在这里落成：
+   * - `supportsImage === true` ⇒ `['text','image']`；
+   * - `supportsImage === false` ⇒ **`['text']`（明确不支持）**。
+   *
+   * ⚠️⚠️ **`false` 必须写成 `['text']`，不能省略** —— 这是本次实测最重要的结论：
+   * 上游对 `multimodal: false` 的模型**不报错，而是静默忽略图片**（GLM 5.1 甚至
+   * 据此编造答案）。若省略（= 未知），DSH 会把图片一路放行到适配器，用户就会拿到
+   * 一份**基于幻觉的、看起来正常的回答** —— 这是最难排查的一类失败。
+   * 写 `['text']` 则让 DSH 在**附件准入阶段**就拒掉，用户当场得到「当前模型不支持图片」。
+   *
+   * ⚠️ 与 `model-catalog-parity.spec.ts` 的 `OMIT_UNKNOWN_MODALITIES` **必须同改**：
+   * 那条用例按「真实适配器」双向断言，只改一处会变红并点名 accio。
    */
   private toCatalogEntry(model: AccioFallbackModel): CatalogEntry {
     const reasoning = accioReasoningOf(model)
@@ -1007,7 +1139,8 @@ export class AccioAdapter extends LlmAdapter {
       name: displayNameOfAccioModel(model),
       // ⚠️ `resolveModel` 用**不带倍率**的裸名 ⇒ 显式提供 `bareName`。
       bareName: model.name,
-      // ⚠️⚠️ 刻意**省略**（见上）：三态里的「未知」。
+      // ⚠️ 逐模型声明（判据见上）：`false` 是**明确不支持**，不是「未知」。
+      inputModalities: model.supportsImage ? ['text', 'image'] : ['text'],
       ...model.contextWindow > 0 ? { contextWindow: model.contextWindow } : {},
       ...model.maxTokens !== undefined && Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0
         ? { maxTokens: model.maxTokens }
@@ -1079,29 +1212,102 @@ export class AccioAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    // 1. 图片：本 provider 的通路**未实测**，故 `inputModalities` 是省略（未知）
-    //    ⇒ DSH 不会在附件准入阶段拦下图片，图片会走到这里。
-    //    ⚠️ **必须显式报错**：`serializeAccioMessages` 的 `flattenText` 只保留
-    //    `type === 'text'` 的块，静默放行等于把图片**静默丢掉**
-    //    （用户以为模型看到了图）—— 与本函数承诺的「绝不静默丢弃」直接矛盾。
-    //
-    //    ⚠️⚠️ **扫描必须递归**（真实缺陷，本轮修复）：`normalizeHarnessMessages`
-    //    刻意**整体保留** `content` 数组，而 `tool-result` 块的 `content` 里
-    //    可以内嵌 `image`（本仓库其余适配器都按该形状收图）。只扫**顶层**
-    //    `message.content` 会让这种嵌套图片**绕过守卫**，然后被 `flattenText`
-    //    悄悄丢掉 —— 守卫形同虚设。
-    //    ⇒ 复用共享的 `collectImages`（`src/openai-compat.ts`），它按
-    //    `tool-result` **递归下钻**，与 buddy / lobsterai / trae / gemini /
-    //    cline / qoder / raccoon / minimax / zcode 同一实现（不手写第二份判据）。
+    /**
+     * 1. 图片：**收集 → 判定模型能力 → 读字节内联**（issue IKLR7V 接线，2026-10-14）。
+     *
+     * ## 为什么不再是「发现即抛」
+     *
+     * 本 provider 原先 `inputModalities` **恒省略**（= 未知 ⇒ DSH 不投影、图片一路走到这里），
+     * 而本函数**显式抛 `UNSUPPORTED_CONTENT`**。两个保守选择叠加出的形态是
+     * **每次带图都白撞一轮**（失败约 1 秒后切换下一个候选），且 accio 在聚合里
+     * 被折算成「不支持图片」而被剔出候选表。
+     *
+     * 2026-10-14 真机实测（issue IKLR7V）推翻了这条前提：
+     * - 上游**原生收图**，形状是 Gemini 风格的 `parts[].inline_data = {mime_type,data}`；
+     * - `multimodal: true` 的模型**四色全对**（3/3 样本），`multimodal: false` 的模型
+     *   **静默忽略图片**（3/3 样本：两家明说「没看到图片」，一家**幻觉**出答案）；
+     * - 远端 15 条可见模型的 `multimodal` 字段**从不缺失**，且与兜底表 **100% 一致**。
+     *
+     * ⇒ 通路接通，且 `inputModalities` 按**逐模型**的 `supportsImage` 如实声明
+     * （见 `toCatalogEntry`）。
+     *
+     * ## 三条判据（顺序不可换）
+     *
+     * 1. **递归收集**（共享 `collectImages`，它按 `tool-result` 下钻）—— 只扫顶层会漏掉
+     *    工具结果内嵌图片，然后被序列化层静默丢掉（守卫形同虚设）；
+     * 2. **模型能力**：`supportsImage !== true` ⇒ 显式报错。⚠️ 绝不能「照发不误」：
+     *    实测 `multimodal: false` 的模型**不报错、而是静默忽略图片**（GLM 5.1 还
+     *    据此**幻觉**出一份看似合理的答案）—— 那正是最难排查的静默失败形态；
+     * 3. **附件服务**：未接线 ⇒ 显式报错（绝不静默退化成纯文本）。
+     */
     const imageRefs = new Map<string, unknown>()
     for (const message of options.messages) {
       if (Array.isArray(message.content)) collectImages(message.content, imageRefs)
     }
+    let images: Map<string, { mediaType: string; data: string }> | undefined
     if (imageRefs.size > 0) {
-      throw new LlmError(
-        'accio: 本 provider 的图片通路尚未实测，暂不支持图片输入',
-        'UNSUPPORTED_CONTENT',
-      )
+      const sourceModels = this.remoteModels ?? this.product.fallbackModels
+      const declared = sourceModels.find((model) => accioModelIdOf(model) === options.model)
+        ?? sourceModels.find((model) => model.id === options.model)
+      // ⚠️ 未知 id（用户手填）**保守拒绝**：能力无从得知，而「发过去被静默忽略」比报错更难查。
+      //    （与 `toCatalogEntry` 的未知 id 处理一致：不编造能力。）
+      if (declared?.supportsImage !== true) {
+        throw new LlmError(
+          `accio: 模型 "${options.model}" 不接受图片输入`
+          + '（上游对声明 multimodal:false 的模型会**静默忽略图片**，'
+          + '故这里显式拒绝而不是照发）。',
+          'UNSUPPORTED_CONTENT',
+        )
+      }
+      /**
+       * ⚠️ **两个桥接都没接线时必须显式报错**（绝不退化成纯文本）：静默丢图会让
+       * 用户以为模型看到了图。
+       *
+       * ⚠️ 判据是**两者皆缺**，不是「`readImage` 缺失」：只接了「请求版本」投影
+       * （`readImageRequest`）也能完成内联 —— 那正是「优先缩放、拿不到才发原图」
+       * 这条设计的正常形态。把它判成「需要附件服务」会让一个**能工作的配置**报错。
+       */
+      const readImage = this.options.readImage
+      if (readImage === undefined && this.options.readImageRequest === undefined) {
+        throw new LlmError(
+          'accio: 图片输入需要附件服务（readImage / readImageRequest 均未提供）；'
+          + '请确认当前 profile 已装载 @deepseek-ai/dsh-attachment-local。',
+          'UNSUPPORTED_CONTENT',
+        )
+      }
+      images = new Map()
+      for (const [id, ref] of imageRefs) {
+        // ⚠️ 先试**请求版本**（按像素预算缩放，`ACCIO_IMAGE_PIXEL_BUDGET` 正是为此定义）；
+        // 拿不到才发原图。缩放的合理性与「为什么预算做成固定值」见 `src/image-budget.ts`。
+        const projected = await projectRequestImage(ref, {
+          readImageRequest: this.options.readImageRequest,
+          pixelBudget: ACCIO_IMAGE_PIXEL_BUDGET,
+        })
+        let inline = projected
+        if (inline === undefined && readImage !== undefined) {
+          try {
+            inline = await readImage(ref)
+          } catch (error) {
+            // 读取抛错必须冒泡成明确的 LlmError（与 buddy 同口径）：吞掉会表现为
+            // 「图片凭空消失、模型答非所问」。
+            throw new LlmError(
+              `accio: 读取图片附件失败（${id}）：${errorMessage(error)}`,
+              'UNSUPPORTED_CONTENT',
+              { cause: error as Error },
+            )
+          }
+        }
+        if (inline === undefined || inline.data.byteLength === 0) {
+          throw new LlmError(
+            `accio: 图片附件读取不到内容（${id}）；附件服务可能未就绪，或该对象已不存在。`,
+            'UNSUPPORTED_CONTENT',
+          )
+        }
+        images.set(id, {
+          mediaType: inline.mediaType === '' ? 'image/png' : inline.mediaType,
+          data: Buffer.from(inline.data).toString('base64'),
+        })
+      }
     }
 
     /**
@@ -1172,7 +1378,9 @@ export class AccioAdapter extends LlmAdapter {
     if (options.system !== undefined && options.system !== '') {
       wireMessages.unshift({ role: 'system', content: options.system })
     }
-    const { contents, systemInstruction } = serializeAccioMessages(wireMessages)
+    // ⚠️ `images` 为 `undefined` 表示**本请求无图** ⇒ `serializeAccioMessages`
+    // 走原来的纯文本路径（线上格式逐字节不变）。
+    const { contents, systemInstruction } = serializeAccioMessages(wireMessages, images)
     const body = buildAccioBody({
       // ⚠️ **上行用 `wireModel`（= 上游 `modelCode`），不是 `options.model`（slug）** ——
       //    见上面 1b 的说明。这是本次改动最容易漏、且后果最隐蔽的一处。

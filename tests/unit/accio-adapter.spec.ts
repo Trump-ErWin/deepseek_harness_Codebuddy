@@ -98,6 +98,17 @@ function makeAdapter(options: {
   /** 传 `'throw'` 模拟远端目录整体失败。 */
   remote?: 'throw'
   accountPool?: unknown
+  /**
+   * 附件字节桥接（issue IKLR7V）。
+   *
+   * ⚠️ 默认**不提供** ⇒ 带图请求会走「需要附件服务」的显式报错分支；
+   * 要测真正的内联通路必须显式注入（或用 `readImage` 覆盖具体行为）。
+   */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  readImageRequest?: (
+    attachment: unknown,
+    target: { width: number; height: number; maxBytes: number },
+  ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
 } = {}): AdapterHarness {
   const credential = options.credential === undefined ? makeCredential() : options.credential ?? undefined
   let refreshedOnce = false
@@ -123,6 +134,8 @@ function makeAdapter(options: {
         ? {}
         : { fetchRemoteModels: async () => options.remoteModels! },
     ...options.accountPool === undefined ? {} : { accountPool: options.accountPool as never },
+    ...options.readImage === undefined ? {} : { readImage: options.readImage },
+    ...options.readImageRequest === undefined ? {} : { readImageRequest: options.readImageRequest },
   })
   return { adapter, fetcher, refresh }
 }
@@ -521,38 +534,92 @@ describe('AccioAdapter · resolveModel', () => {
     expect((await adapter.resolveModel(ACCIO_PROVIDER, 'qwen')).name).toBe('Qwen')
   })
 
-  it('⚠️⚠️ inputModalities 必须**省略**（三态：省略 = 未知）', async () => {
-    // 图片通路在本 provider **未实测**（`ACCIO_IMAGE_PIXEL_BUDGET` 只是预留接入点）。
-    // 省略 = 未知是诚实的编码；写 ['text','image'] 是编造能力，
-    // 写 ['text'] 则是把「未知」写成「明确不支持」（AGENTS.md 的静默失效格）。
+  /**
+   * ⚠️⚠️ **本段是「已推翻的判据」的第二次修订**（2026-10-14，issue IKLR7V）——
+   * 读它之前先看这段历史，别再改回去。
+   *
+   * | 时期 | 判据 | 依据 |
+   * |---|---|---|
+   * | 初版 | **恒省略**（= 未知） | 图片通路整体未实测 |
+   * | 2026-10-14 起（现行） | `supportsImage ? ['text','image'] : ['text']` | 真机实测：上游原生收图 |
+   *
+   * 实测证据（四象限色块图，`multimodal` 逐个对照）：
+   * - `multimodal: true` 的 3 个模型 **3/3 四色全对**；
+   * - `multimodal: false` 的 3 个模型 **3/3 未认图**（两家明说「没看到图片」，
+   *   **GLM 5.1 幻觉**出一份答案）。
+   *
+   * ⇒ `false` 必须写 **`['text']`（明确不支持）**，不能省略：省略 = 未知 ⇒ DSH 放行
+   * 图片 ⇒ 上游**静默忽略** ⇒ 用户拿到一份**基于幻觉的、看起来正常的回答**。
+   */
+  it('⚠️⚠️ supportsImage=true ⇒ [text,image]；false ⇒ [text]（明确不支持，不是省略）', async () => {
+    // ⚠️⚠️ **`resolveModel` 收的是对外 slug（展示名归一），不是上游 `modelCode` 原始 id**
+    //     —— 这条差异使本用例的初版**恒真**：它原先用 `id`（'img'）去查，而目录里的
+    //     条目 id 是 slug（'vision'）⇒ **两次都落到「未知 id」分支**，于是
+    //     「true 也 undefined、false 也 undefined」双双通过 —— 恰好掩盖了
+    //     「已知模型的能力根本没被断言」这个空洞。改用展示名可预测的 ASCII 名后
+    //     才真正测到已知模型分支（下面的 slug 断言就是防这个陷阱的）。
     const { adapter } = makeAdapter({
       remoteModels: [
-        { id: 'img', name: '声明支持图片', contextWindow: 1_000_000, supportsImage: true, multiple: 0.1 },
-        { id: 'txt', name: '声明不支持图片', contextWindow: 1_000_000, supportsImage: false, multiple: 0.2 },
+        { id: 'code-vision', name: 'Vision', contextWindow: 1_000_000, supportsImage: true, multiple: 0.1 },
+        { id: 'code-plain', name: 'Plain', contextWindow: 1_000_000, supportsImage: false, multiple: 0.2 },
       ],
     })
-    const img = await adapter.resolveModel(ACCIO_PROVIDER, 'img')
-    const txt = await adapter.resolveModel(ACCIO_PROVIDER, 'txt')
-    expect(img.inputModalities, '声明 multimodal 也不得写 image').toBeUndefined()
-    expect(txt.inputModalities, '声明不支持也不得写成明确否定').toBeUndefined()
-    expect(img.inputModalities).not.toEqual(['text', 'image'])
-    expect(txt.inputModalities).not.toEqual(['text'])
+    // 正例：确认 slug 确实是展示名归一后的结果（不是上游 id）——否则上面那条
+    // 「已知模型」的断言又会在未知分支上空转。
+    expect(accioModelIdOf({ id: 'code-vision', name: 'Vision' }), 'slug 取自展示名').toBe('vision')
+    const img = await adapter.resolveModel(ACCIO_PROVIDER, 'vision')
+    const txt = await adapter.resolveModel(ACCIO_PROVIDER, 'plain')
+    expect(img.inputModalities, '声明 multimodal:true ⇒ 实测真收图，如实声明').toEqual(['text', 'image'])
+    // ⚠️ 这一条是**本 issue 最重要的结论**：false 若是省略，图片会一路走到上游，
+    // 被**静默忽略**（GLM 5.1 实测据此幻觉出答案），属最难排查的失败形态。
+    expect(txt.inputModalities, '声明 multimodal:false ⇒ 必须明确报 [text]，不得省略').toEqual(['text'])
   })
 
-  it('listModels 同样省略 inputModalities（与 resolveModel 同源）', async () => {
+  it('listModels 与 resolveModel 同源（模态按逐模型 supportsImage）', async () => {
     const { adapter } = makeAdapter({
       remoteModels: [{ id: 'm1', name: 'Qwen', contextWindow: 1_000_000, supportsImage: true, multiple: 0.1 }],
     })
     const models = await adapter.listModels(ACCIO_PROVIDER)
-    expect(models[0]!.inputModalities).toBeUndefined()
+    expect(models[0]!.inputModalities).toEqual(['text', 'image'])
   })
 
-  it('未知模型 id 同样省略 inputModalities（不编造、也不写成否定）', async () => {
+  it('未知模型 id 保守报 [text]（不编造能力；与 stream() 的保守拒绝同向）', async () => {
+    // ⚠️ 两处必须**同向**：目录报 [text] 让 DSH 在准入阶段拒图，而 `stream()` 同样拒绝。
+    //    若目录省略（放行）而适配器拒绝，就会退化成「每次带图白撞一轮」的形态
+    //    （正是本 issue 描述的缺陷）。
     const { adapter } = makeAdapter()
     const resolved = await adapter.resolveModel(ACCIO_PROVIDER, 'no-such-model')
     expect(resolved.name).toBe('no-such-model')
-    expect(resolved.inputModalities).toBeUndefined()
+    expect(resolved.inputModalities, '未知 id 的能力无从得知 ⇒ 保守报 [text]').toEqual(['text'])
     expect(resolved.context).toBeUndefined()
+  })
+
+  /**
+   * ⚠️⚠️ **本 issue 的第二个症状的守卫**：聚合带图时 accio 曾被整体剔出候选集。
+   *
+   * issue 把机制描述为「本机给 accio 打了个 `NO_IMAGE` 硬标记」，但实测（全仓搜
+   * `NO_IMAGE` **零命中**）真实机制是：`inputModalities` 恒省略 ⇒ 聚合的
+   * `capabilityOf` 里 `imageCapable = inputModalities?.includes('image') === true`
+   * 折算成 `false` ⇒ `imageTargets` 把它的每个模型都过滤掉。
+   *
+   * ⇒ 本用例直接按**聚合的那条判据**求值（不 mock 聚合，只复用同一个表达式），
+   * 锁死「视觉模型进候选、纯文本模型被剔」这个方向。
+   */
+  it('⚠️⚠️ 聚合折算：multimodal:true 的模型 imageCapable=true（否则带图时 accio 整体被剔）', async () => {
+    const { adapter } = makeAdapter({
+      remoteModels: [
+        { id: 'code-vision', name: 'Vision', contextWindow: 1_000_000, supportsImage: true, multiple: 0.1 },
+        { id: 'code-plain', name: 'Plain', contextWindow: 1_000_000, supportsImage: false, multiple: 0.2 },
+      ],
+    })
+    // ⚠️ 与 `aggregate-adapter.ts` 的 `capabilityOf` **逐字同一个表达式**。
+    //    两处若分叉，就会出现「目录说支持、聚合却剔掉它」的静默缺口。
+    const imageCapableOf = (m: { inputModalities?: readonly string[] }): boolean =>
+      m.inputModalities?.includes('image') === true
+    expect(imageCapableOf(await adapter.resolveModel(ACCIO_PROVIDER, 'vision')),
+      '⚠️ 接线后 accio 的视觉模型必须进带图候选表').toBe(true)
+    expect(imageCapableOf(await adapter.resolveModel(ACCIO_PROVIDER, 'plain')),
+      '声明 false 的模型必须仍被剔出带图候选（上游会静默忽略它的图）').toBe(false)
   })
 })
 
@@ -868,40 +935,109 @@ describe('AccioAdapter · 消息序列化', () => {
 // 图片：明确报错，不静默丢弃
 // ---------------------------------------------------------------------------
 
-describe('AccioAdapter · 图片', () => {
-  it('⚠️ 收到图片时显式报 UNSUPPORTED_CONTENT（不静默丢弃）', async () => {
-    // `inputModalities` 省略 = 未知 ⇒ DSH 会把图片放行到这里。
-    // 而本 provider 的图片通路**未实测**、序列化层只保留 text 块 ⇒
-    // 若不显式拒绝，图片会被**静默丢掉**（用户以为模型看到了）。
-    const { adapter } = makeAdapter({ responses: [okResponse()] })
-    const error = await collect(adapter, {
+describe('AccioAdapter · 图片（issue IKLR7V 接线）', () => {
+  /** 一张 1×1 PNG 的字节（内容无关紧要 —— 探针验的是**形状与位置**）。 */
+  const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+  /** 带图的 BASIC_OPTIONS（模型走兜底表的 multimodal:true 条目）。 */
+  function imageOptions(extra: Partial<GenerateOptions> = {}): GenerateOptions {
+    return {
       ...BASIC_OPTIONS,
       messages: [{
         role: 'user',
         content: [
           { type: 'text', text: '这是什么' },
-          { type: 'image', attachment: { attachmentId: 'att-1' } },
+          { type: 'image', attachment: { attachmentId: 'att-1', width: 16, height: 16 } },
         ],
       }],
-    } as unknown as GenerateOptions).catch((e: unknown) => e)
-    expect((error as { code?: string }).code).toBe('UNSUPPORTED_CONTENT')
+      ...extra,
+    } as unknown as GenerateOptions
+  }
+
+  it('⚠️⚠️ 带图请求必须把图片内联成 parts[].inline_data（实测形状）', async () => {
+    // 上游形状（2026-10-14 真机实测四色全对）：Gemini 风格的
+    // `parts[].inline_data = { mime_type, data }`，与既有 contents 信封同构。
+    const { adapter, fetcher } = makeAdapter({
+      responses: [okResponse()],
+      readImage: async () => ({ data: PNG_BYTES, mediaType: 'image/png' }),
+    })
+    await collect(adapter, imageOptions())
+
+    const contents = sentBody(fetcher).contents as Array<{ role: string; parts: Array<Record<string, unknown>> }>
+    const user = contents.find((c) => c.role === 'user')!
+    expect(user, '带图请求必须有 user 消息').toBeDefined()
+    const imagePart = user.parts.find((p) => p.inline_data !== undefined) as
+      | { inline_data: { mime_type: string; data: string } }
+      | undefined
+    expect(imagePart, '⚠️ 图片必须内联成 inline_data（不得静默丢弃）').toBeDefined()
+    expect(imagePart!.inline_data.mime_type).toBe('image/png')
+    expect(imagePart!.inline_data.data).toBe(Buffer.from(PNG_BYTES).toString('base64'))
+    // 文本与图片必须在**同一条** parts 里（分成两条会让模型看到一张没有上下文的图）。
+    expect(user.parts.some((p) => p.text !== undefined), '文本与图片同条消息').toBe(true)
   })
 
-  it('⚠️⚠️ 嵌套在 tool-result 里的图片同样必须报错（守卫必须递归）', async () => {
-    // 真实缺陷（本轮修复）：守卫初版只扫**顶层** `message.content`，
-    // 而 `normalizeHarnessMessages` 刻意**整体保留** content 数组，
-    // `tool-result` 块的 `content` 里可以内嵌 `image`（本仓库其余适配器
-    // 都按这个形状收图）。只扫一层 ⇒ 这种图片**绕过守卫**，
-    // 再被 `serializeAccioMessages` 的 `flattenText`（只留 text 块）
-    // **静默丢掉** —— 与守卫自己承诺的「绝不静默丢弃」直接矛盾。
-    //
-    // ⚠️ 本用例覆盖 **0.1.7 一等 `role:'tool'`** 形态。注意：守卫看的是
-    // `options.messages`（**未归一化**的原始形状），而 0.1.7 的一等工具消息
-    // 其 `content` 本来就在**顶层** ⇒ 该形态**不足以**区分「递归」与「只扫一层」。
-    // 真正能区分的是下一条 **0.1.5 包裹形态**用例（那里 `tool-result`
-    // 的 `content` 才是真正的第二层）—— 反向验证时红的正是它。
+  it('⚠️⚠️ multimodal:false 的模型收到图片必须显式报错（上游会静默忽略，甚至幻觉）', async () => {
+    // 实测（issue IKLR7V）：`multimodal: false` 的模型**不报错**，而是静默忽略图片
+    // —— GLM 5.1 甚至据此**幻觉**出一份答案。故本地必须显式拒绝。
+    const { adapter, fetcher } = makeAdapter({
+      responses: [okResponse()],
+      readImage: async () => ({ data: PNG_BYTES, mediaType: 'image/png' }),
+      remoteModels: [
+        { id: '1Nexus-R3wF8qJ5vB6h', name: 'Standard', contextWindow: 1_000_000, supportsImage: true, multiple: 0.13 },
+        { id: '1Chronos-dX3cV9sA2mK7', name: 'GLM 5.1', contextWindow: 200_000, supportsImage: false, multiple: 0.12 },
+      ],
+    })
+    // 用**声明 false** 的那个模型的 slug（'glm-5-1'）。
+    const error = await collect(adapter, imageOptions({ model: 'glm-5-1' } as Partial<GenerateOptions>))
+      .catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('UNSUPPORTED_CONTENT')
+    expect(fetcher, '不得把图发到一个会静默忽略它的模型上').not.toHaveBeenCalled()
+  })
+
+  it('⚠️ 附件服务未接线时显式报错（绝不静默退化成纯文本）', async () => {
+    // 静默退化会让用户以为模型看到了图。
     const { adapter, fetcher } = makeAdapter({ responses: [okResponse()] })
-    const error = await collect(adapter, {
+    const error = await collect(adapter, imageOptions()).catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('UNSUPPORTED_CONTENT')
+    // ⚠️ 断言必须**锚定本分支独有**的措辞（`readImage / readImageRequest 均未提供`）：
+    //    泛泛断言「附件服务」会**放行** —— 下游还有另一条同样含该词的报错
+    //    （「图片附件读取不到内容…附件服务可能未就绪」）。实测把本守卫整条删掉、
+    //    只留下游那条时，「附件服务」断言**照样通过**（本用例初版就是这种假绿）。
+    expect((error as Error).message).toContain('readImage / readImageRequest 均未提供')
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('⚠️ 优先用「请求版本」（按 ACCIO_IMAGE_PIXEL_BUDGET 缩放），拿不到才回退原图', async () => {
+    // `ACCIO_IMAGE_PIXEL_BUDGET` 原先只是「无引用的预留常量」，接线后必须真的生效。
+    const seen: Array<{ width: number; height: number; maxBytes: number }> = []
+    const { adapter, fetcher } = makeAdapter({
+      responses: [okResponse()],
+      readImageRequest: async (_attachment, target) => {
+        seen.push(target)
+        return { data: PNG_BYTES, mediaType: 'image/webp' }
+      },
+    })
+    await collect(adapter, imageOptions())
+    expect(seen.length, '必须走请求版本投影').toBe(1)
+    // 16×16 的图小于预算 ⇒ 尺寸原样（`fitImageToPixelBudget` 不放大）。
+    expect(seen[0]).toMatchObject({ width: 16, height: 16 })
+    expect(seen[0]!.maxBytes).toBeGreaterThan(0)
+    // 且上行用的是投影后的 mediaType（不是原图的）。
+    const contents = sentBody(fetcher).contents as Array<{ parts: Array<Record<string, unknown>> }>
+    const part = contents.flatMap((c) => c.parts).find((p) => p.inline_data !== undefined) as
+      | { inline_data: { mime_type: string } }
+      | undefined
+    expect(part!.inline_data.mime_type).toBe('image/webp')
+  })
+
+  it('⚠️⚠️ 工具结果内嵌图片必须排到 role:tool **之后**（不得挤在它前面）', async () => {
+    // `functionResponse` 只吃字符串、没有承载图的位置 ⇒ 内嵌图只能挂到 tool 消息之后。
+    // 排在前面会违反 role:'tool' 的协议约束（trae 记过 4027 事故）。
+    const { adapter, fetcher } = makeAdapter({
+      responses: [okResponse()],
+      readImage: async () => ({ data: PNG_BYTES, mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
       ...BASIC_OPTIONS,
       messages: [
         { role: 'user', content: '看图' },
@@ -914,24 +1050,45 @@ describe('AccioAdapter · 图片', () => {
           toolCallId: 'c1',
           content: [
             { type: 'text', text: '截图如下' },
-            { type: 'image', attachment: { attachmentId: 'att-nested' } },
+            { type: 'image', attachment: { attachmentId: 'att-nested', width: 16, height: 16 } },
           ],
         },
       ],
-    } as unknown as GenerateOptions).catch((e: unknown) => e)
-    expect((error as { code?: string }).code).toBe('UNSUPPORTED_CONTENT')
-    // 而且必须**在发请求之前**就拒绝（守卫在 `stream()` 第一段）。
-    expect(fetcher, '不得先把带图的请求发出去').not.toHaveBeenCalled()
+    } as unknown as GenerateOptions)
+
+    const contents = sentBody(fetcher).contents as Array<{
+      role: string
+      parts: Array<Record<string, unknown>>
+    }>
+    const toolIdx = contents.findIndex((c) => c.parts.some((p) => p.function_response !== undefined))
+    const imageIdx = contents.findIndex((c) => c.parts.some((p) => p.inline_data !== undefined))
+    expect(toolIdx, '工具结果必须下发').toBeGreaterThanOrEqual(0)
+    expect(imageIdx, '⚠️ 内嵌图片不得被静默丢弃').toBeGreaterThanOrEqual(0)
+    expect(imageIdx, '⚠️ 图片必须排在 tool 消息之后').toBeGreaterThan(toolIdx)
+    // 图片所在消息必须带那句上下文说明（否则模型看到一张没有来路的图）。
+    expect(JSON.stringify(contents[imageIdx]!.parts)).toContain('tool result')
   })
 
-  it('⚠️⚠️ 0.1.5 包裹形态里**第二层**的嵌套图片必须报错（递归守卫的判别用例）', async () => {
-    // ⚠️ 这条是 Finding #3 的**判别用例**：图片在 `tool-result` 块的 `content`
-    // 里（真正的第二层）。只扫顶层的旧实现会漏掉它 ⇒ 图片被 `flattenText`
-    // 静默丢弃。反向验证 (b) 时**只有这条**变红。
-    const { adapter, fetcher } = makeAdapter({ responses: [okResponse()] })
-    const error = await collect(adapter, {
+  it('⚠️⚠️ 0.1.5 包裹形态里**第二层**的嵌套图片也必须被提升（递归的判别用例）', async () => {
+    // ⚠️ 这条是**判别用例**：图片在 `tool-result` 块的 `content` 里（真正的第二层），
+    // 且该块被包在一条 **user** 消息里（0.1.5 形状）。只扫顶层 `message.content` 的
+    // 实现会漏掉它 ⇒ 图片被静默丢弃。
+    //
+    // ⚠️ **必须带上配对的 assistant `tool-call`**：没有它，`resolveToolPairing` 会
+    // 把这个工具结果判成**孤儿**而整体丢弃（那是对的 —— 孤儿工具结果会被上游 400）。
+    // 初版用例漏了这一点，于是它测的是「孤儿被丢」而不是「第二层图片被提升」，
+    // 得到的失败是**假阳性**。
+    const { adapter, fetcher } = makeAdapter({
+      responses: [okResponse()],
+      readImage: async () => ({ data: PNG_BYTES, mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
       ...BASIC_OPTIONS,
       messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'screenshot', arguments: '{}' }],
+        },
         {
           role: 'user',
           content: [{
@@ -939,18 +1096,98 @@ describe('AccioAdapter · 图片', () => {
             toolCallId: 'c1',
             content: [
               { type: 'text', text: '截图如下' },
-              { type: 'image', attachment: { attachmentId: 'att-nested' } },
+              { type: 'image', attachment: { attachmentId: 'att-nested', width: 16, height: 16 } },
             ],
           }],
         },
       ],
-    } as unknown as GenerateOptions).catch((e: unknown) => e)
-    expect((error as { code?: string }).code).toBe('UNSUPPORTED_CONTENT')
-    expect(fetcher, '不得先把带图的请求发出去').not.toHaveBeenCalled()
+    } as unknown as GenerateOptions)
+
+    const contents = sentBody(fetcher).contents as Array<{ parts: Array<Record<string, unknown>> }>
+    const imagePart = contents.flatMap((c) => c.parts).find((p) => p.inline_data !== undefined)
+    expect(imagePart, '⚠️ 第二层的嵌套图片被静默丢弃了（递归没做）').toBeDefined()
+  })
+
+  it('⚠️⚠️ 「只有图片 + 工具结果、没有正文」的消息不得把图片静默丢掉', async () => {
+    // ## 真实缺陷（本文件的「洞探针」抓到，2026-10-14）
+    //
+    // `toAccioWireMessages` 的 user 分支初版是
+    // `if (text.length > 0 || toolResults.length === 0)`，于是
+    // `content: [image, tool-result]`（**无正文**）这种消息两腿**同时为假**
+    // ⇒ 整条消息被跳过 ⇒ **图片被静默丢弃**，且没有任何报错。
+    //
+    // ⚠️ 这比「一开始就没收图」更隐蔽：`collectImages`（`stream()` 的守卫）
+    // **收得到**它，所以上层认为「本次带图」，而 wire 上根本没有那张图 ——
+    // 正是本仓库首条红线所指的「收了却发不出去」。
+    const { adapter, fetcher } = makeAdapter({
+      responses: [okResponse()],
+      readImage: async () => ({ data: PNG_BYTES, mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
+      ...BASIC_OPTIONS,
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'screenshot', arguments: '{}' }],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'image', attachment: { attachmentId: 'att-1', width: 16, height: 16 } },
+            { type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'ok' }] },
+          ],
+        },
+      ],
+    } as unknown as GenerateOptions)
+
+    const contents = sentBody(fetcher).contents as Array<{
+      role: string
+      parts: Array<Record<string, unknown>>
+    }>
+    expect(contents.flatMap((c) => c.parts).some((p) => p.inline_data !== undefined),
+      '⚠️ 「只有图片 + 工具结果」的消息把图片静默丢掉了').toBe(true)
+  })
+
+  it('⚠️⚠️ 带工具结果时，本消息的正文/图片必须**排在 role:tool 之后**', async () => {
+    // Accio 是 Gemini 风格：`functionResponse` 必须**紧跟**发起该调用的 model 消息，
+    // 中间插任何东西都会破坏配对（trae 的 4027 事故是这条约束在另一协议下的爆炸：
+    // 坏报文落进历史后**每轮原样重放**，只能换 provider 才能恢复）。
+    const { adapter, fetcher } = makeAdapter({
+      responses: [okResponse()],
+      readImage: async () => ({ data: PNG_BYTES, mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
+      ...BASIC_OPTIONS,
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'screenshot', arguments: '{}' }],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '这是截图' },
+            { type: 'image', attachment: { attachmentId: 'att-1', width: 16, height: 16 } },
+            { type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'ok' }] },
+          ],
+        },
+      ],
+    } as unknown as GenerateOptions)
+
+    const contents = sentBody(fetcher).contents as Array<{
+      role: string
+      parts: Array<Record<string, unknown>>
+    }>
+    const toolIdx = contents.findIndex((c) => c.parts.some((p) => p.function_response !== undefined))
+    const imageIdx = contents.findIndex((c) => c.parts.some((p) => p.inline_data !== undefined))
+    expect(toolIdx, '工具结果必须下发').toBeGreaterThanOrEqual(0)
+    expect(imageIdx, '图片不得被静默丢弃').toBeGreaterThanOrEqual(0)
+    expect(imageIdx, '⚠️ 带图的本消息必须排在 tool 消息之后（否则破坏 functionResponse 配对）')
+      .toBeGreaterThan(toolIdx)
   })
 
   it('无图片时不误报（纯文本与纯文本工具结果照常放行）', async () => {
-    // 反向对照：递归收集器不能把「没有图片」判成「有图片」，
+    // 反向对照：收集器不能把「没有图片」判成「有图片」，
     // 否则所有带工具结果的会话都会被这条守卫拒掉。
     const { adapter, fetcher } = makeAdapter({ responses: [okResponse()] })
     await collect(adapter, {
@@ -962,6 +1199,41 @@ describe('AccioAdapter · 图片', () => {
       ],
     } as unknown as GenerateOptions)
     expect(fetcher).toHaveBeenCalledTimes(1)
+    // ⚠️ 且无图时必须**仍然产出字符串 content**（不升级成多模态 parts）——
+    // 线上格式逐字节不变，避免破坏前缀缓存。
+    const contents = sentBody(fetcher).contents as Array<{ parts: Array<Record<string, unknown>> }>
+    expect(contents.flatMap((c) => c.parts).some((p) => p.inline_data !== undefined)).toBe(false)
+  })
+
+  it('读取抛错时冒泡成可读的 LlmError（不静默丢图）', async () => {
+    const { adapter } = makeAdapter({
+      responses: [okResponse()],
+      readImage: async () => { throw new Error('附件已损坏') },
+    })
+    const error = await collect(adapter, imageOptions()).catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('UNSUPPORTED_CONTENT')
+    expect((error as Error).message).toContain('附件已损坏')
+  })
+
+  it('读取到空字节同样报错（不得发出一个空图 part）', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      responses: [okResponse()],
+      readImage: async () => ({ data: new Uint8Array(0), mediaType: 'image/png' }),
+    })
+    const error = await collect(adapter, imageOptions()).catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('UNSUPPORTED_CONTENT')
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('⚠️ 未知模型 id 带图时保守拒绝（能力无从得知，发过去会被静默忽略）', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      responses: [okResponse()],
+      readImage: async () => ({ data: PNG_BYTES, mediaType: 'image/png' }),
+    })
+    const error = await collect(adapter, imageOptions({ model: 'hand-typed-unknown' } as Partial<GenerateOptions>))
+      .catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('UNSUPPORTED_CONTENT')
+    expect(fetcher).not.toHaveBeenCalled()
   })
 })
 
