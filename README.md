@@ -59,7 +59,7 @@ dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codea
 
 ```yaml
 allowBuilds:
-  dsh-codearts-auth: true
+  dsh-providers-hub: true
 ```
 
 报 **`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`** 的（**pnpm 11.x**）—— git 托管包
@@ -67,7 +67,7 @@ allowBuilds:
 
 ```yaml
 allowBuilds:
-  dsh-codearts-auth@git+https://gitee.com/iJetLi/deepseek-harness-codearts.git#<第 1 步打印的 commit>: true
+  dsh-providers-hub@git+https://gitee.com/iJetLi/deepseek-harness-codearts.git#<第 1 步打印的 commit>: true
 ```
 
 **两代通用（省事，但放宽了权限）**：
@@ -80,7 +80,7 @@ dangerouslyAllowAllBuilds: true
 
 **3. 重跑第 1 步的命令**：这次会拉取、构建并安装成功。之后每次升级重新 `add` 即可。
 
-⚠️ **不要**写 `dsh-codearts-auth@git+https://gitee.com/…`（不带 `#<commit>`）——
+⚠️ **不要**写 `dsh-providers-hub@git+https://gitee.com/…`（不带 `#<commit>`）——
 这个"看起来最自然"的键在两代 pnpm 上都不工作。
 
 ⚠️ pnpm 11.x 的精确键里带 commit，因此**升级（重新 `add` 拉到新 commit）后该键
