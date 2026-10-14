@@ -835,10 +835,19 @@ export function apply(ctx: Context): void {
   /**
    * 「锁定永久积分 + 无可用账号」的报错文案（buddy / workbuddy / lobsterai / trae 共用）。
    *
-   * ## ⚠️ 必须**分两种原因**报（与 Loomy 那条同型缺陷）
+   * ## ⚠️ 必须**分三种原因**报（与 Loomy 那条同型缺陷）
    *
    * 把「余额查询失败（一次网络抖动）」混成「额度已用尽」，用户会去解锁、
    * 或白等到明天 —— 而号其实有钱。故 `kind === 'unknown'` 单独一条文案。
+   *
+   * 同理，`kind === 'no-candidates'`（**一个候选都没筛出来**，余额分档压根
+   * 没跑）也绝不能报「积分都已用尽」：那是在替服务端断言一件我们从没查过的
+   * 事（真实报障 2026-10-13，CodeBuddy：`明明有积分却显示不可用`）。
+   * ⚠️ 全被模型限流这一支已在 `credential-resolver.ts` 用
+   * `throwIfAllRateLimited` 提前拦下（报出解禁时刻），故走到本分支的
+   * `no-candidates` 主要是「没有任何启用中的账号」——但文案仍**并列**两种
+   * 可能，不把话说死：判定本身依赖 `throwIfAllRateLimited` 被接线，
+   * 谎报一个确定原因会把用户指向错误的方向。
    *
    * ## 为什么抽成函数而不是四家各写一遍
    *
@@ -855,6 +864,14 @@ export function apply(ctx: Context): void {
           `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
           + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
           + '的积分 —— 请重试，或在 Jet Hub 对应面板检查凭据是否失效。',
+        )
+      }
+      if (reason.kind === 'no-candidates') {
+        return new Error(
+          `${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+          + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+          + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+          + '或改用其它 provider / 模型，或解锁永久积分后重试。',
         )
       }
       return new Error(
