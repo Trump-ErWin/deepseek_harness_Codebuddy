@@ -828,12 +828,138 @@ describe('BuddyAdapter', () => {
       expect(catalogCalls, '贴图这一轮必须自动重看目录').toBe(2)
       // ⚠️ 且图片**真的进了请求体** —— 只断言「不抛错」是同义反复：
       // 一条把图片静默丢掉的实现同样不抛错（TRAE/lobsterai 都踩过这个坑）。
+      //
+      // ⚠️ **不按 parts 顺序断言**：issue IKLIFH 的 `0dd27ca` 起顺序为「图在前」，
+      // 而两种顺序上游都能看到。按下标/顺序写死会让实现一调顺序就假失败 ——
+      // 那正是本次合并前 master 上 3 条红灯的成因。
       const user = (sentBody?.messages as Array<Record<string, unknown>> | undefined)
         ?.find((m) => m.role === 'user')
-      expect(user?.content).toEqual([
-        { type: 'text', text: '这是什么颜色？' },
-        { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
-      ])
+      const parts = user?.content as Array<Record<string, unknown>> | undefined
+      expect(parts, '请求体里必须有那条带图的 user 消息').toHaveLength(2)
+      expect(parts).toContainEqual({ type: 'text', text: '这是什么颜色？' })
+      expect(parts).toContainEqual({ type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } })
+    })
+  })
+
+  // ── Issue IKLIFH：工具结果里的图片必须与提问同条 ──
+  //
+  // 真实报障「codebuddy hy4 不支持识别图片」。实测（2026-10-14，直连
+  // copilot.tencent.com，hy4-preview + 同一张 1024x768 双色图，问左右颜色）：
+  //
+  //   图与提问**同一条** user                     ✅ 答「左白右蓝」
+  //   图单独一条 user（带/不带提示句），问在下一条 ❌ 答「图像已被过滤」
+  //   图并入 role:'tool' 消息本身                 ❌ 答「不支持读取图片」
+  //
+  // ⚠️ wire 上**确实有图**、上游也**不报错**（HTTP 200 + 正常流），只是模型
+  // 看不见并自称「当前模型不支持图片」⇒ 用户会误判成模型能力问题去换模型。
+  // ⚠️ 与 hy4 无关：同一张图换 `deepseek-v4-flash` 同样答「已被过滤」，
+  // 而两者远端都是 `supportsImages: true`。
+  describe('Issue IKLIFH：工具结果图片与提问同条', () => {
+    const IMAGE_ID = 'att-1'
+
+    /** 构造：assistant tool_call → 工具结果内嵌图片 → 后续提问（截图 #1 的形状）。 */
+    function messagesWithAsk(askText: string, extraUserText?: string) {
+      return [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'tc1', name: 'read_image', arguments: '{}' }],
+        },
+        {
+          role: 'tool',
+          toolCallId: 'tc1',
+          content: [
+            { type: 'text', text: 'preview 1024x768px.' },
+            { type: 'image', attachment: { attachmentId: IMAGE_ID } },
+          ],
+        },
+        ...extraUserText === undefined ? [] : [{ role: 'user', content: extraUserText }],
+        { role: 'user', content: askText },
+      ]
+    }
+
+    function adapterCapturing() {
+      let sentBody: Record<string, unknown> | undefined
+      const adapter = makeAdapter({
+        readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+        fetchImpl: async (_url, init) => {
+          sentBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: [DONE]\n\n')
+        },
+      })
+      return { adapter, body: () => sentBody }
+    }
+
+    it('图片与提问合并为同一条 user 消息（真实报障形态）', async () => {
+      const { adapter, body } = adapterCapturing()
+      await collectChunks(adapter, {
+        model: 'hy4-preview',
+        messages: messagesWithAsk('这页写了什么？'),
+        signal: new AbortController().signal,
+      } as never)
+
+      const messages = (body().messages as Array<Record<string, unknown>>)
+      const toolIndex = messages.findIndex((m) => m.role === 'tool')
+      expect(toolIndex, '工具结果必须下发').toBeGreaterThan(-1)
+      // 协议约束：tool 必须紧跟其 assistant tool_calls，否则上游 400。
+      const assistantIndex = messages.findIndex((m) => m.role === 'assistant')
+      expect(toolIndex).toBe(assistantIndex + 1)
+
+      // ⚠️ 核心断言：图与问**同一条**。
+      const imageIndex = messages.findIndex((m) => Array.isArray(m.content)
+        && (m.content as Array<{ type: string }>).some((p) => p.type === 'image_url'))
+      const askIndex = messages.findIndex((m) => Array.isArray(m.content)
+        && (m.content as Array<{ type: string; text?: string }>).some((p) => p.text?.includes('这页写了什么')))
+      expect(imageIndex, '图片不得静默丢弃').toBeGreaterThan(-1)
+      expect(askIndex, '提问不得静默丢弃').toBeGreaterThan(-1)
+      expect(imageIndex, '图片必须与提问同条（Issue IKLIFH 的正题）').toBe(askIndex)
+      expect(imageIndex, '且必须排在 tool 之后').toBeGreaterThan(toolIndex)
+    })
+
+    /**
+     * 工具结果后跟**多于一条** user 消息时，图与**全部**正文必须合并成一条。
+     *
+     * ⚠️ 这条 2026-10-14 之前是**红的**，且红的不是断言而是**真缺陷**：
+     * `const deferred = toolResults.length > 0` 在「tool 结果 → 无工具结果的
+     * user（『好的』）→ 真正的提问」这一序列上判错 —— 中间那条把挂图与延后正文
+     * **一起 flush 掉并单独发出**，真正的提问随后成了纯字符串 user 消息，
+     * 图与问重新分处两条，**恰好复现 IKLIFH 本次要消灭的形态**。
+     *
+     * ⚠️ 旧版这条断言的是**缺陷形态本身**（`askIndex > imageIndex`，即允许
+     * 分处两条），等于把 bug 锁成了契约。现在按正确行为锁定：三者同条。
+     */
+    it('工具结果后跟多条 user 消息时，图与全部正文合并为同一条（修 IKLIFH 的漏网序列）', async () => {
+      const { adapter, body } = adapterCapturing()
+      await collectChunks(adapter, {
+        model: 'hy4-preview',
+        messages: messagesWithAsk('这页写了什么？', '好的'),
+        signal: new AbortController().signal,
+      } as never)
+
+      const messages = (body().messages as Array<Record<string, unknown>>)
+      const users = messages.filter((m) => m.role === 'user')
+      // 不得因为多一条 user 就多发一条消息。
+      expect(users, '图与提问必须合并成同一条 user 消息').toHaveLength(1)
+      const parts = users[0]!.content as Array<{ type: string; text?: string }>
+      expect(parts.some((p) => p.type === 'image_url'), '图片不得静默丢弃').toBe(true)
+      // 中间那条「好的」与真正的提问都要在这同一条里。
+      expect(parts.some((p) => p.text?.includes('好的')), '中间那条正文不得被丢弃').toBe(true)
+      expect(parts.some((p) => p.text?.includes('这页写了什么')), '提问不得与图分处两条').toBe(true)
+    })
+
+    it('无挂图时不凭空多发 user 消息（纯文本形态逐字节不变）', async () => {
+      const { adapter, body } = adapterCapturing()
+      await collectChunks(adapter, {
+        model: 'hy4-preview',
+        messages: [{ role: 'user', content: '你好' }],
+        signal: new AbortController().signal,
+      } as never)
+
+      const messages = (body().messages as Array<Record<string, unknown>>)
+      const users = messages.filter((m) => m.role === 'user')
+      expect(users).toHaveLength(1)
+      // 纯文本必须是**字符串**（不是 parts 数组），否则上游报 model_param_invalid。
+      expect(typeof users[0]!.content).toBe('string')
+      expect(users[0]!.content).toBe('你好')
     })
   })
 
@@ -1483,6 +1609,73 @@ describe('BuddyAdapter credential handling', () => {
     expect(body).not.toHaveProperty('reasoning_effort')
   })
 
+  // ── workbuddy 一律不发 reasoning_effort（2026-10-14 实测）──
+  //
+  // 真实报障：会话 `5cb92a4b`（标题「111」）用 workbuddy/deepseek-v4.1-flash
+  // 连续 23 步全是 reasoning + tool-call、**text 块为 0**，用户看不到正文。
+  //
+  // 实测（固定会话 111 的真实 messages + 标准 tools，逐格 13~15 个有效样本）：
+  //   不发该字段 → 有正文 15/15；low → 1/14；high → 4/15；max → 6/13。
+  // 而**不带 tools** 时四格全部 15/15 ⇒ 正文没丢，丢的是「模型开思考 + 有工具
+  // 可调」时那句前言（上游把工具路由进 tool_calls 时一并吞掉同轮 content）。
+  // 反证：同一请求体只换模型为 `hy4-preview-f` → 前言正常返回（75 字符）。
+  //
+  // ⚠️ 用例刻意锁「**判据挂在产品上**」这件事：CodeBuddy（中国版）不在该轮实测
+  // 范围内，2026-09 的既有结论恰恰依赖它下发该字段 ⇒ 两家行为必须不同。
+  // 若把判据写成模型族（deepseek 前缀），下面 CodeBuddy 那条会变红。
+  describe('workbuddy 不发 reasoning_effort（保住正文）', () => {
+    /** 抓 workbuddy 产品的请求体。 */
+    async function captureWorkbuddyBody(
+      overrides: Record<string, unknown> = {},
+    ): Promise<Record<string, unknown>> {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        product: WORKBUDDY,
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: new AbortController().signal,
+        ...overrides,
+      } as never)
+      return body
+    }
+
+    it.each(['low', 'high', 'max'])(
+      '用户显式选 %s 档时也不下发 reasoning_effort',
+      async (effort) => {
+        expect(await captureWorkbuddyBody({ reasoningEffort: effort }))
+          .not.toHaveProperty('reasoning_effort')
+      },
+    )
+
+    it('未选档位时不补默认档（补了就会吞掉正文）', async () => {
+      expect(await captureWorkbuddyBody()).not.toHaveProperty('reasoning_effort')
+    })
+
+    it('⚠️ 与该判据正交：thinking 开关仍照发', async () => {
+      // 2026-09 实测「仅带 thinking → reasoning_content 仍为 0」，它单独不改变
+      // 思考开关；删掉会改变出站报文形态、对齐官方客户端，故保留。
+      expect(await captureWorkbuddyBody()).toMatchObject({ thinking: { type: 'enabled' } })
+    })
+
+    it('⚠️ CodeBuddy（中国版）行为不变：仍下发 reasoning_effort', async () => {
+      // 反向守卫：判据若误写成模型族，这条会红。
+      expect(await captureBody({ reasoningEffort: 'max' })).toMatchObject({ reasoning_effort: 'max' })
+      expect(await captureBody()).toMatchObject({ reasoning_effort: 'high' })
+    })
+
+    it('非 deepseek 模型在 workbuddy 上同样不发（本就无档位）', async () => {
+      const body = await captureWorkbuddyBody({ model: 'glm-5.2' })
+      expect(body).not.toHaveProperty('reasoning_effort')
+      expect(body).not.toHaveProperty('thinking')
+    })
+  })
+
   // CodeBuddy 只接受 OpenAI 多模态 parts 形态的图片；
   // {type:'image'} 会被服务端以 `unsupported content type ... image` 400。
   it('stream sends user images as inline image_url parts', async () => {
@@ -1497,10 +1690,12 @@ describe('BuddyAdapter credential handling', () => {
       }],
     })
     const user = (body.messages as Array<Record<string, unknown>>).find((m) => m.role === 'user')!
-    expect(user.content).toEqual([
-      { type: 'text', text: 'what is this?' },
-      { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
-    ])
+    // ⚠️ **不按 parts 顺序断言**（issue IKLIFH 的 `0dd27ca` 起顺序为「图在前」）：
+    // 两种顺序上游都能看到，顺序不是契约。
+    const parts = user.content as Array<Record<string, unknown>>
+    expect(parts).toHaveLength(2)
+    expect(parts).toContainEqual({ type: 'text', text: 'what is this?' })
+    expect(parts).toContainEqual({ type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } })
   })
 
   it('stream rejects images for a model that declares text-only', async () => {

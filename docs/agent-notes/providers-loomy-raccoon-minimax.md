@@ -1,7 +1,7 @@
 <!-- 搬自 AGENTS.md（2026-10-06 拆分：注入预算 65,536 B，超出部分每轮被截断永不可见）。
      内容逐字节原样保留；本文件按需阅读，不进每轮注入。 -->
 
-## ⚠️ Loomy（讯飞）provider：五个不能凭直觉改的点
+## ⚠️ Loomy（讯飞）provider：六个不能凭直觉改的点
 
 `loomy` 是第 8 个 provider，与其余七者**都不同源**。实现是独立一套
 `src/loomy*.ts`（`loomy-product` / `loomy` / `loomy-sign` / `loomy-oauth` /
@@ -59,7 +59,9 @@
    返回 `Spark X2.5 · x0.1` 而非 `Spark X2.5`（实现时暴露的真实缺陷）。
    该函数**幂等**，单测锁死。
    ⚠️ chat 模型过滤判据是 **`type === 'chat'`**，不能看 `input_modalities`
-   —— 5 个 chat 模型的输入模态含 `image`（能看图），不是生图模型。
+   —— 2026-10-14 实测 9 个 chat 模型里 6 个的输入模态含 `image`（能看图），
+   不是生图模型；另有 1 个（`qwen-3.8-max`）**不声明** `image` 却实测读得出图，
+   见下面第 6 条。
 
 5. **积分是两个池**：永久（`balance`）与每日赠送（`dailyBalance`）分开计算。
    每日额度由 `POST /points/first-login` 触发（官方登录后立即调用），
@@ -71,6 +73,57 @@
    —— 后者是**写**端点，在「打开面板」这种高频路径上调用会意外触发签到。
    ⚠️ `dailyQuota` **只在 `first-login` 响应里**，`points/records` 不返回它，
    故未签到时该字段缺省 —— **不要硬编码 5000**（额度可能随活动变化）。
+
+6. **图片能力要过覆盖表，别照抄 `input_modalities`**（2026-10-14 用户报障
+   「loomy 的 qwen3.8max 输入不能上图」）。远端 `GET /api/v1/models` 对
+   `qwen-3.8-max` 下发 `capabilities.input_modalities: ['text']`（`vision: false`），
+   而实测**它读得出图**。照抄声明值的后果不是「图旁边多个提示」，而是 DSH 在
+   **附件入库阶段**就按目录拒绝（`dsh-api-session-controller` 的
+   `MODEL_DOES_NOT_SUPPORT_IMAGES`）⇒ 用户看到「当前模型不支持图片，请切换支持
+   图片的模型」，而那正是他唯一想用的模型。
+
+   判据是**随机纯色 PNG**（64×64，约 137 B，纯标准库生成）：纯文本模型答不出颜色，
+   读得到的答得出。2026-10-14 用真实凭据直连生产端点逐个实测（一次一色）：
+
+   | 模型 | 远端 `input_modalities` | 实测读图 | 备注 |
+   |---|---|---|---|
+   | `DeepSeek-V4.1-Flash` | text,image | ✅ | |
+   | `Kimi-k2.6` | text,image,video | ✅ | |
+   | `qwen3.8-flash` | text,image,video | ✅ | |
+   | `mimo-v2.5` | text,audio,image,video | ✅ | |
+   | `GLM-5.3-Flash` | text,image,video | ⚠️ | 颜色名答错一次；RGB 3 次中 2 次命中 |
+   | **`qwen-3.8-max`** | **text（漏报）** | ✅ | 4/5 次答对 ⇒ 进覆盖表 |
+   | `MiniMax-M3` | text,image,video | ❌ | 4/4 未命中；答案像经典 CSS 色值（`135,206,235`…）⇒ 疑似在编 |
+   | `deepseek-v4-flash-0731` | text | ❌ | 思考链吃满预算，正文为空 |
+   | `spark-x` | text | ❌ | 自称「我无法读取图片」 |
+   | `auto` | 无声明 | ❌ | 未定论（思考吃满 / 答「灰」） |
+
+   - 覆盖表 `LOOMY_IMAGE_CAPABILITY_OVERRIDES` + 判据函数 `loomySupportsImage()`
+     在 `loomy-product.ts`；⚠️ **远端与兜底表两条路径都必须过它**（同第 3 条
+     旁 `loomyContextWindow` 那条纪律：只改一侧，远端可用时那一侧就白改了）。
+   - ⚠️ **不要写成「该家恒支持图片」**：白名单只覆盖实测确认的个案，恒 true 会把图
+     放给纯文本模型，让上游回一个更晚、更难懂的 400。
+   - ⚠️ `MiniMax-M3` 的**疑似假声明**（声明 image、实测读不出）本次**刻意不降级**：
+     用户当时明确只关心 `qwen-3.8-max`，且降级已声明能力会改变既有可用路径 ——
+     raccoon 的 `sn-glm-5-3` 就有「网关节点不一致、3 次只对 1 次」的先例 ⇒ 单账号
+     证据不足以判死。它按**已知 provider 缺陷**登记在此，待多节点复核后再决定。
+   - ⚠️⚠️ **覆盖表查表必须归一，且两张表同一口径**（2026-10-14 合并后审计发现，
+     修复见 `loomyCatalogKey()`）：原实现是 `Set.has(modelId)` / `OVER[modelId]`
+     **逐字节精确匹配**，而**同一文件**里读远端模态的 `readInputModalities()` 却
+     `.toLowerCase()` 归一了 ⇒ 同一个「模型身份」概念在相邻两处两套标准。
+     后果是**静默失效**：上游一旦把 id 下成 `Qwen-3.8-Max` 或前后带空白，
+     覆盖表恒不命中 ⇒ `inputModalities` 退回 `['text']` ⇒ 准入闸门重新拒图、
+     **用户看到的就是本条要修的症状原样复现**，而**零报错、零日志、测试全绿**
+     （现有用例构造的 id 全小写，结构上抓不到）。与 zcode 的
+     「上游小写 vs 目录大写」是**同一个坑换了个 provider**。
+     ⚠️ **归一只能发生在查表那一刻，绝不改对外 `model.id`** —— 它同时是
+     `fallbackIndex` / `effortsForModel` 的索引键与 DSH 的模型身份，
+     改了会重演 accio「改对外 id ⇒ 聚合补丁索引恒不命中」那类静默连带失效。
+     ⚠️ 附带取舍（**已登记，别当它不存在**）：归一后仅大小写不同的两个 id 会折叠
+     成一个键；判定可接受（上游 8 条 chat 模型本就混用大小写，说明按 id 而非按
+     大小写区分模型；且「不归一 ⇒ 静默拒图」已经真实发生过一次）。
+     守卫在 `tests/unit/loomy-product.spec.ts` 的「查表口径」三条 + 一张
+     「两张覆盖表的键都必须已归一」的机器守卫（加新条目忘了小写会红）。
 
 ### 短信登录：唯一没有 loginUrl 的 provider
 
