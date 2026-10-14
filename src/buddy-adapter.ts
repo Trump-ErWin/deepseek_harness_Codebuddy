@@ -55,7 +55,7 @@ import { planSessionTitleThinking } from './session-title.js'
 import { rewriteTencentContentFingerprints } from './openai-gateway/tencent-fingerprint.js'
 // ⚠️ `detail` 那条腿**只留一份实现**（`openai-compat.ts`）：本仓库 6 份同义的
 // `errorDetail` 各写一条判据必然漂移（IKLBSH A1）。
-import { detailFieldText } from './openai-compat.js'
+import { detailFieldText, TOOL_RESULT_IMAGE_TEXT } from './openai-compat.js'
 // ⚠️ 原生搜索的错误码与错误类型从**契约文件**取（`native-search-contract.ts`）：
 //    取数虽已下沉到本适配器，但「同一种失败在任何渠道报同一个码」这条不能破 ——
 //    否则排查时会把「无账号」误判成「上游故障」。
@@ -607,7 +607,14 @@ function serializeMessages(
             .filter((part) => part.type === 'text')
             .map((part) => String(part.text))
             .join('')
-          if (joined.length > 0) resultText = joined
+          // ⚠️⚠️ **有图无文时绝不能落到 `(no output)`**（Issue IKLSB8，与
+          // `openai-compat.ts` 同一处同义修复）。`resultParts !== undefined`
+          // 的含义是「该工具结果里有内容」，只是内容**不是文本**；原先只在
+          // `joined` 非空时改写 `resultText`，纯图片型工具结果于是保留初值
+          // `(no output)` ⇒ 模型答「Read 没有返回内容」，用户误判成模型没有
+          // 视觉能力。判据用 `resultParts !== undefined`（**有内容**）而不是
+          // 「有图」：`[image unavailable]` 占位符也走这条腿，它同样不是没有输出。
+          resultText = joined.length > 0 ? joined : TOOL_RESULT_IMAGE_TEXT
         } else {
           resultText = contentToText(result.content) || '(no output)'
         }

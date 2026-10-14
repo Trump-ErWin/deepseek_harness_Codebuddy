@@ -946,6 +946,53 @@ describe('BuddyAdapter', () => {
       expect(parts.some((p) => p.text?.includes('这页写了什么')), '提问不得与图分处两条').toBe(true)
     })
 
+    /**
+     * ⚠️⚠️ Issue IKLSB8：**纯图片型工具结果不得被压成字面量 `(no output)`**。
+     *
+     * 工具结果里**只有图片、没有任何文本**时，`contentToText` 返回空串 ⇒ 落到
+     * `|| '(no output)'` 兜底 ⇒ 模型收到的是「工具没有任何输出」，于是答
+     * 「Read 没有返回内容 / gave no output」——用户据此以为模型没有视觉能力，
+     * 而真实原因是「有输出，输出是图」。Claude Code 的
+     * `tool_result.content=[{type:'image'}]` 恰是这一形状。
+     *
+     * ⚠️ 判据必须是「内容说清了『输出在这里、只是它是图』」：只断言
+     * 「不是 `(no output)`」是弱断言 —— 换成任意占位串都会绿。
+     */
+    it('⚠️⚠️ 纯图片工具结果不得写成 `(no output)`（Issue IKLSB8）', async () => {
+      const { adapter, body } = adapterCapturing()
+      await collectChunks(adapter, {
+        model: 'hy4-preview',
+        messages: [
+          {
+            role: 'assistant',
+            content: [{ type: 'tool-call', id: 'tc1', name: 'read_image', arguments: '{}' }],
+          },
+          {
+            role: 'tool',
+            toolCallId: 'tc1',
+            // 刻意**只有图片**（Claude Code 的真实形状，也是本 issue 的现场）。
+            content: [{ type: 'image', attachment: { attachmentId: IMAGE_ID } }],
+          },
+          { role: 'user', content: '这页写了什么？' },
+        ] as never,
+        signal: new AbortController().signal,
+      } as never)
+
+      const messages = (body().messages as Array<Record<string, unknown>>)
+      const tool = messages.find((m) => m.role === 'tool')!
+      expect(tool, '工具结果必须下发').toBeDefined()
+      expect(
+        String(tool.content),
+        '纯图片工具结果退化成 `(no output)` ⇒ 模型答「没有返回内容」，用户误判成模型没有视觉能力',
+      ).not.toBe('(no output)')
+      expect(
+        String(tool.content),
+        '至少要说明「输出在这里、只是它是图片」，否则模型无法解释为何没有文本',
+      ).toMatch(/image/i)
+      // 图片本体照旧必须真的上 wire（不得因为改了正文兜底而丢图）。
+      expect(JSON.stringify(messages)).toContain('image_url')
+    })
+
     it('无挂图时不凭空多发 user 消息（纯文本形态逐字节不变）', async () => {
       const { adapter, body } = adapterCapturing()
       await collectChunks(adapter, {
@@ -4058,6 +4105,31 @@ describe('BuddyAdapter 直连路径的腾讯风控指纹改写', () => {
       WORKBUDDY,
     )
     expect(textsOfWire(wire)).toContain(`A: ${REWRITE}`)
+  })
+
+  it('★ IKLS2L：Claude Code 身份句在**直连**路径也被改写（system 与 assistant 两处）', async () => {
+    // Claude Code 的 `[model-check]` 探测路径漏传 `skipSystemPromptPrefix`，
+    // 于是身份句每次都被注入 system ⇒ 每次 400/11128（Gitee IKLS2L）。
+    // 这条守的是「DSH 直连方向也过这一层」—— 只在网关补 = 换一个入口又被拦。
+    const C_TRIGGER = "You are Claude Code, Anthropic's official CLI for Claude"
+    const C_REWRITE = "You are Claude Code, Anthropic's CLI for Claude"
+    // ① options.system（第四个产出点）
+    const viaSystem = await wireOf([{ role: 'user', content: text('hi') }], { system: `${C_TRIGGER}.` })
+    expect(viaSystem[0]?.role).toBe('system')
+    expect(String(viaSystem[0]?.content)).toBe(`${C_REWRITE}.`)
+    // ② serializeMessages 的 system 与 assistant 正文两处
+    const wire = await wireOf([
+      { role: 'system', content: text(`S: ${C_TRIGGER}`) },
+      { role: 'user', content: text('继续') },
+      { role: 'assistant', content: text(`A: ${C_TRIGGER}`) },
+      { role: 'user', content: text('再说一次') },
+    ])
+    const texts = textsOfWire(wire)
+    expect(texts).toContain(`S: ${C_REWRITE}`)
+    expect(texts).toContain(`A: ${C_REWRITE}`)
+    // user 不碰（实测该角色放行）。
+    expect(texts).toContain('继续')
+    expect(texts.some((value) => value.includes(C_TRIGGER))).toBe(false)
   })
 
   /**
