@@ -106,6 +106,48 @@ export function raccoonThinkingExtraBody(
 }
 
 /**
+ * 从「已声明的档位」里挑出**默认档**（Issue IKLIDV 的方向取反修复）。
+ *
+ * ## 为什么单独抽成入参化的纯函数
+ *
+ * 原实现的兜底分支是 `RACCOON_REASONING_EFFORTS[0] ?? RACCOON_EFFORT_ON`
+ * —— 把「数组第一项」当成了「默认档」。那个等价关系**只在旧顺序下偶然成立**
+ *（`['on','off']` 的首项恰是 `on`）。顺序按强度序规整成 `['off','on']` 后，
+ * 该分支会静默回退成 **`off`（关闭思考）**：与「实测服务端默认即开启」相反，
+ * 且是无人察觉的行为变更。
+ *
+ * ⚠️ **该分支在生产里不可达**（`RACCOON_DEFAULT_EFFORT` 恒在列表内）
+ * ⇒ 任何「喂真实常量」的断言都**恒真**，抓不到它。
+ * 故这里把 `declared` / `preferred` 都做成**入参**，让用例能构造
+ * 「首选档不在列表里」这一格，从而真正锁住兜底方向。
+ *
+ * ⚠️ 兜底值是**语义上正确的「开启」**，与顺序彻底解耦：
+ * 有序数组的下标表达位置，不表达语义。
+ *
+ * ⚠️⚠️ **取舍（已实测，审计登记）**：兜底值 `RACCOON_EFFORT_ON` 可能**不在
+ * `declared` 里**（若将来有人把该常量删掉）。那一刻新旧两种写法的失败形态不同：
+ * - 旧式 `declared[0]`：返回值**恒在列表内**，但会静默给出 `off`（**错档**）；
+ * - 本式：返回列表外的 `on` ⇒ `dsh-llm` 的 `normalizeModelInfo` 抛
+ *   **`INVALID_MODEL_REASONING`**（**响亮报错**，实测确认）。
+ *
+ * 本函数**刻意选后者**：这是「静默给错档」与「响亮的配置错误」之间的取舍，
+ * 而后者更容易被发现。⚠️ 又因该分支**生产不可达**（`RACCOON_DEFAULT_EFFORT`
+ * 恒在列表内），这个取舍当前无任何现实影响 —— 记在这里是为了避免下一个人
+ * 看到「返回值可能不在列表内」时误以为是漏了防御而改回去。
+ *
+ * @param declared - 该模型声明的档位 id。
+ * @param preferred - 期望的默认档。
+ * @returns `preferred`（若它确实被声明），否则为 `RACCOON_EFFORT_ON`（**可能不在
+ *   `declared` 内** —— 见上方取舍）。
+ */
+export function raccoonDefaultEffort(
+  declared: readonly string[],
+  preferred: string,
+): string {
+  return declared.includes(preferred) ? preferred : RACCOON_EFFORT_ON
+}
+
+/**
  * 该模型在 UI 上可选的思考档位。
  *
  * ⚠️ **所有模型都返回同样两档** —— 实测 `extra_body.thinking` 是 **provider 级
@@ -122,10 +164,9 @@ export function raccoonReasoningInfo(): {
     id: ReasoningEffortId(id),
     name: RACCOON_EFFORT_NAMES[id] ?? id,
   }))
-  // ⚠️ 默认档必须确实在列表里（防御：常量被改乱时不至于抛错）
-  const defaultEffort = RACCOON_REASONING_EFFORTS.includes(RACCOON_DEFAULT_EFFORT)
-    ? ReasoningEffortId(RACCOON_DEFAULT_EFFORT)
-    : ReasoningEffortId(RACCOON_REASONING_EFFORTS[0] ?? RACCOON_EFFORT_ON)
+  const defaultEffort = ReasoningEffortId(
+    raccoonDefaultEffort(RACCOON_REASONING_EFFORTS, RACCOON_DEFAULT_EFFORT),
+  )
   return { efforts, defaultEffort }
 }
 

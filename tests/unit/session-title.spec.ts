@@ -57,8 +57,13 @@ describe('thinkingOffEffortOf：从声明档里挑「关闭思考」', () => {
     expect(thinkingOffEffortOf(['low', 'high'])).toBeUndefined()
     expect(thinkingOffEffortOf(['off', 'high'])).toBe('off')
     expect(thinkingOffEffortOf(['none', 'low'])).toBe('none')
-    // Raccoon 的两档形态
-    expect(thinkingOffEffortOf(['on', 'off'])).toBe('off')
+    // Raccoon / CodeArts 的两档形态：**两种顺序都要验**（Issue IKLIDV）。
+    // ⚠️ 本函数按 **rank** 找（`isThinkingOffEffort`）、**不看位置** —— 这正是
+    // 顺序可以自由规整的前提。⚠️ 第一版只留了强度序那一条，于是把顺序规整的
+    // 「顺带」变成了唯一一条「逆序输入仍取 off」判别性用例的**删除**（审计发现）：
+    // 规格化后的真实声明是 `['off','on']`，但**逆序输入必须同样正确**才是那条前提本身。
+    expect(thinkingOffEffortOf(['off', 'on'])).toBe('off')
+    expect(thinkingOffEffortOf(['on', 'off'])).toBe('off')   // ← 顺序无关性（别删）
   })
 
   it('⚠️ 声明档为空时返回 undefined（不可视为「已关闭」）', () => {

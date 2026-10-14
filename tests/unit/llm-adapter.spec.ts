@@ -1,5 +1,6 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import {
   CHAT_API_BASE,
@@ -80,6 +81,56 @@ function poolWithCredentials(loggedInRefs: readonly string[]) {
   }
 }
 
+/**
+ * 字符级剥注释：丢掉注释内容，**保留字符串字面量与其内容**。
+ *
+ * 供「档位三处出口必须同源」那条**源码级**守卫使用（见其长注释）。
+ *
+ * 为什么不能用正则（两条都是实测踩出来的）：
+ * 1. 非贪婪的块注释配对，遇到注释里孤立的块注释起始符，会与**后面的**
+ *    结束符配对 ⇒ 把中间的真实代码整段吃掉 ⇒ 反向断言**恒绿**（假绿）；
+ * 2. 只剥「整行是块注释」的行也不行 —— 本文件的 JSDoc 是**多行**的，
+ *    只剥首尾行会剩下若干以 `*` 开头的正文行，里面的示例字面量被当真码 ⇒ **假红**。
+ *
+ * 状态机四态：代码 / 行注释 / 块注释 / 字符串。注释整段丢弃；字符串原样保留。
+ *
+ * @param source - 待处理的 TypeScript 源码文本。
+ * @returns 去掉注释后的文本（行数与原文一致，注释位置留空行以外内容被删）。
+ */
+function stripCommentsAndKeepStrings(source: string): string {
+  let out = ''
+  let state: 'code' | 'line' | 'block' | 'single' | 'double' | 'template' = 'code'
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i]!
+    const next = source[i + 1]
+    if (state === 'code') {
+      if (c === '/' && next === '/') { state = 'line'; i++; continue }
+      if (c === '/' && next === '*') { state = 'block'; i++; continue }
+      if (c === "'") { state = 'single'; out += c; continue }
+      if (c === '"') { state = 'double'; out += c; continue }
+      if (c === '`') { state = 'template'; out += c; continue }
+      out += c
+      continue
+    }
+    if (state === 'line') {
+      if (c === '\n') { state = 'code'; out += c }
+      continue
+    }
+    if (state === 'block') {
+      if (c === '*' && next === '/') { state = 'code'; i++ }
+      // 换行保留，避免把两行粘成一行后产生假匹配。
+      else if (c === '\n') out += c
+      continue
+    }
+    // 字符串态：处理转义，遇到对应闭合引号回到 code。
+    const quote = state === 'single' ? "'" : state === 'double' ? '"' : '`'
+    if (c === '\\') { out += c + (next ?? ''); i++; continue }
+    if (c === quote && state !== 'template') { state = 'code'; out += c; continue }
+    out += c
+  }
+  return out
+}
+
 describe('CodeArtsAdapter', () => {
   it('providerInfo identifies the codearts route', () => {
     expect(makeAdapter().providerInfo('codearts')).toMatchObject({ id: 'codearts', name: 'CodeArts Agent' })
@@ -158,21 +209,127 @@ describe('CodeArtsAdapter', () => {
   //   - `{type:'enabled'}` 与不传等价（服务端默认就开着）。
   // 而 `reasoning_effort`（low/high/none/minimal）与嵌套 `reasoning.effort`
   // **都被接受但完全无效果**（落在基线噪声内，`none` 也照常思考）。
-  // 故只声明「开启 / 关闭」两档，**不得**臆造 low/high/max 强度阶梯。
+  // 故只声明「关闭 / 开启」两档（**强度序**，Issue IKLIDV），**不得**臆造 low/high/max 强度阶梯。
   it('resolveModel declares the thinking on/off switch for every model', async () => {
     const adapter = makeAdapter()
     for (const model of ['GLM-5.2', 'glm-5.3-flash', 'deepseek-v4-flash', 'deepseek-v4.1-flash', 'openpangu-2.0-pro']) {
       const resolved = await adapter.resolveModel('codearts', model)
+      // ⚠️ **顺序 = 强度序（弱 → 强）**（Issue IKLIDV）：`off`(rank 0) 必须在
+      // `on`(rank 5) 之前。DSH 把该数组当**展示顺序**（`dsh-llm` 类型注释
+      // `adapter-preferred display order`），客户端直接 `map` 不排序
+      //（`dsh-client-ui-model-selection/lib/client.js` 的 `effortChoices`）
+      // ⇒ 写成 `['on','off']` 会让「开启」落在横向档位轴的最左。
       expect({ model, efforts: resolved.reasoning?.efforts.map(e => e.id) }).toEqual({
-        model, efforts: ['on', 'off'],
+        model, efforts: ['off', 'on'],
       })
       // 展示名必须是中文（DSH 直接渲染 name，不本地化）。
-      expect(resolved.reasoning?.efforts.map(e => e.name)).toEqual(['开启', '关闭'])
+      expect(resolved.reasoning?.efforts.map(e => e.name)).toEqual(['关闭', '开启'])
       // ⚠️ defaultEffort 必须落在 efforts 内，否则 DSH 会抛
-      // UNSUPPORTED_REASONING_EFFORT（dsh-llm 的 resolveCallWithInfo 校验）。
+      // INVALID_MODEL_REASONING（dsh-llm 的 normalizeModelInfo 校验；
+      // ⚠️ 不是 UNSUPPORTED_REASONING_EFFORT —— 那个码指「请求档位不在声明内」，实测确认）。
       expect(resolved.reasoning?.defaultEffort).toBe('on')
+      // ⚠️ 默认档**与数组位置解耦**：靠 `defaultEffort` 表达，不靠「排首位」。
       expect(resolved.reasoning!.efforts.some(e => e.id === resolved.reasoning!.defaultEffort)).toBe(true)
+      // 默认档**不是**首项 —— 顺序规整后这条才有判别力（旧顺序下首项恰是 'on'）。
+      expect(resolved.reasoning!.efforts[0]!.id).not.toBe(resolved.reasoning!.defaultEffort)
     }
+  })
+
+  /**
+   * ⚠️ **未知模型与已知模型必须同一份档位顺序**（Issue IKLIDV）。
+   *
+   * 同一文件里原先写了**两份**逐字相同的 `['on','off']` 字面量
+   *（`toCatalogEntry` 与 `unknownModelReasoning`）—— 那正是「一文件两套同义判据」
+   * 的形态：只改一处，用户**手填模型 id** 时看到的档位轴方向会与已知模型相反，
+   * 而两条路径各自都能通过「只断言自己那份」的用例。
+   *
+   * 本用例把两者**放在一起比较**，故任何一处漏改都会红。
+   */
+  it('⚠️ 未知模型的档位顺序必须与已知模型一致（同一事实不许写两份）', async () => {
+    const known = await makeAdapter().resolveModel('codearts', 'GLM-5.2')
+    const unknown = await makeAdapter().resolveModel('codearts', '手填-不存在的模型-id')
+    expect(unknown.reasoning?.efforts.map(e => e.id))
+      .toEqual(known.reasoning?.efforts.map(e => e.id))
+    expect(unknown.reasoning?.efforts.map(e => e.name))
+      .toEqual(known.reasoning?.efforts.map(e => e.name))
+    expect(unknown.reasoning?.defaultEffort).toBe(known.reasoning?.defaultEffort)
+  })
+
+  /**
+   * ⚠️ **同一事实的三处出口必须同源**（Issue IKLIDV，源码级守卫）。
+   *
+   * 这两档在本文件里被消费三次：`toCatalogEntry`（已知模型）、
+   * `unknownModelReasoning`（未知/手填模型）、以及 `stream()` 里给
+   * `planSessionTitleThinking` 的 `declaredEfforts`。
+   *
+   * ⚠️ 为什么必须是**源码级**断言：三处的**行为断言抓不到漂移**。
+   * - 前两处我已用「放在一起对比」的行为用例锁住；
+   * - 但第三处（`declaredEfforts`）是**语义等价**的 —— `thinkingOffEffortOf`
+   *   按 rank 找关闭档、不看顺序，所以把它退回硬编码 `['on','off']`
+   *   后**行为完全不变**、所有行为用例照绿（反向验证实测确认）。
+   *   而它一旦漂移，症状是「标题请求挑的关闭档不在声明里」这种静默失效。
+   *
+   * ⚠️⚠️ **本用例第一版有三个实测到的漏洞（审计发现，已逐一补堵）**：
+   * 1. **假红**：①②锚在**含注释**的原文上，而本文件的注释里恰恰大量出现这些片段
+   *   ⇒ 一句「应写作 `efforts: [...CODEARTS_REASONING_EFFORTS]`」的注释就能把
+   *   计数从 2 顶到 3 而**误报**。现在**先剥注释再数**。
+   * 2. **假红**：①写死「恰好 2 处」⇒ 将来合法地新增第三处出口（或把两处收敛成
+   *   一个局部常量）都会变红。现在改用**「≥2 且与已知/未知两条路径各自绑定」**
+   *   的判据，并把「不得有内联字面量」交给 ③ 反向守。
+   * 3. **假绿（最严重）**：③原先只认**单引号、单行、裸字符串**形态
+   *   ⇒ 把 HEAD 的**真实历史写法**（跨行对象字面量
+   *   `{ id: ReasoningEffortId('on'), name: '开启' }`）写回内联**照样全绿**。
+   *   现在 ③ 覆盖：单/双引号、跨行、以及 `ReasoningEffortId('on')` 对象字面量，
+   *   并先用**字符级状态机**剥注释（正则做不到，见下方 helper 的注释）。
+   *
+   * ⚠️ 本用例**天生是文本匹配**，做不到语言级准确；它的定位是「防手改漏改」的
+   * 粗网，不是编译器。**已实测的取舍**：把两处 `[...CODEARTS_REASONING_EFFORTS]`
+   * 提前收敛成一个局部 `const` 再引用，本用例会**变红**（判据要求「直接引用该常量」）。
+   * 那是**有意的**：那种重写要么同步改这里、要么说明「同源」这个性质已经换了表达
+   * —— 无论哪种都该有人**看一眼**，而不是让守卫静默失效。故遇到假红请**改这里**，
+   * **不要**删掉它了事（它守的是「三处同源」这个行为断言结构上抓不到的性质）。
+   */
+  it('⚠️ 档位的三处出口必须同源（同一常量），不得各写一份字面量', () => {
+    const raw = readFileSync(new URL('../../src/llm-adapter.ts', import.meta.url), 'utf8')
+    /**
+     * ⚠️ **必须用字符级状态机剥注释**，不能用正则：
+     * - 非贪婪的「块注释到块注释结束」配对，遇到注释里孤立的块注释起始符
+     *   会与**后面的**结束符配对，把中间真码整段吃掉 ⇒ 反向断言恒绿（位置相关的假绿，实测）；
+     * - 只剥「整行是块注释」的行也不行：本文件的 JSDoc 是**多行**的，
+     *   只剥首尾行会留下一堆以 `*` 开头的正文行，其中的示例字面量会被当真码（实测假红）。
+     *
+     * 状态机：区分「代码 / 行注释 / 块注释 / 字符串」，注释内容整体丢弃、
+     * 其余原样保留。字符串**保留内容**（本用例要匹配的正是字符串字面量里的 `'on'`），
+     * 但把引号内的转义处理好，避免 `'\''` 之类误判状态。
+     */
+    const code = stripCommentsAndKeepStrings(raw)
+
+    // ① 两条「按目录条目产出档位」的路径都必须从同一常量派生（≥2 处）。
+    expect(
+      (code.match(/efforts:\s*\[\.\.\.CODEARTS_REASONING_EFFORTS\]/g) ?? []).length,
+      '已知模型与未知模型两条路径都必须引用 CODEARTS_REASONING_EFFORTS',
+    ).toBeGreaterThanOrEqual(2)
+    // ② 标题请求的 declaredEfforts 也必须从该常量派生（允许折行）。
+    expect(code).toMatch(/declaredEfforts:\s*CODEARTS_REASONING_EFFORTS\s*\n?\s*\.map\(/)
+
+    // ③ 反向：剥掉注释后的**代码**里不得再出现这两档的内联字面量。
+    //    覆盖历史/可能的写法：裸串（单/双引号、单行/跨行）、ReasoningEffortId 对象字面量。
+    //
+    //    ⚠️ **必须先挖掉常量自身的定义块** —— 那份定义**本来就该**是字面量
+    //    （它是唯一权威），不排除它会把自己判成违规（实测：整条断言恒红）。
+    //    挖掉的范围以 `CODEARTS_REASONING_EFFORTS ... ])` 为界（到 Object.freeze 收尾）。
+    const definitionOfConstant =
+      /export const CODEARTS_REASONING_EFFORTS[\s\S]*?Object\.freeze\(\[[\s\S]*?\]\)/
+    expect(definitionOfConstant.test(code), '常量定义块应存在（否则本用例的排除范围失效）').toBe(true)
+    const codeOutsideConstant = code.replace(definitionOfConstant, '')
+
+    const inlineEffortArray =
+      /\[\s*(?:['"](?:on|off)['"]\s*,\s*){2}\]|\[\s*(?:\{\s*id:\s*ReasoningEffortId\(\s*['"](?:on|off)['"]\s*\)[\s\S]{0,80}?\}\s*,?\s*){2}\]/
+    expect(codeOutsideConstant, '档位数组不得再内联字面量（应引用 CODEARTS_REASONING_EFFORTS）')
+      .not.toMatch(inlineEffortArray)
+    // ④ 反向：`declaredEfforts` 不得退回内联字面量。
+    expect(code, 'declaredEfforts 不得退回内联字面量')
+      .not.toMatch(/declaredEfforts:\s*\[\s*['"](?:on|off)['"]/)
   })
 
   it('maps the "off" effort onto top-level thinking.type=disabled, and sends nothing for "on"', async () => {
