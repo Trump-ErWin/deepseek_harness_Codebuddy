@@ -588,6 +588,82 @@ OAuth / 项目号 / 配额语义；accio 不 import `gemini-product.ts` / `gemin
 Qoder 是 OpenAI 风格 + WASM **加密** body（`api2.qoder.sh`），
 Accio 是 Gemini 风格**明文**（`phoenix-gw.alibaba.com`）。同属一个集团 ≠ 同协议。
 
+### 4.6 ✅ 图片通路（2026-10-14 接线，issue IKLR7V）—— U-D 由此验证
+
+**结论：上游原生收图**，且接线已完成。这一节是 U-D 那个「未验证项」的答案。
+
+#### ① 上行形状（真机实测，四色全对）
+
+图片放在 **Gemini 风格的 `parts[].inline_data = { mime_type, data }`**，与既有
+`contents` 信封**同构**。本仓库产出 camelCase `inlineData`，由 `buildAccioBody` 的
+`accioToSnake` 转成 `inline_data`（⚠️ **绝不能**把图塞进 `properties` 子树 ——
+那棵子树刻意不参与 snake 转换）。
+
+⚠️ 手写探针（**不经适配器**）与端到端探针（**经生产 `stream()` 全链路**）都跑了：
+两者都是 HTTP 200、流内零错误帧、**四色全对（红/绿/蓝/白 4/4）**。
+
+#### ② ⚠️⚠️ 最重要的实测结论：`multimodal:false` 的模型**不报错，而是静默忽略图片**
+
+逐个模型对照（16×16 四象限色块图）：
+
+| 目录声明 | 实测 |
+|---|---|
+| `multimodal: true`（Qwen 3.8 27B / Qwen 3.8 Flash / DeepSeek V4.1 Flash） | **3/3 四色全对** ⇒ 真收图 |
+| `multimodal: false`（GLM 5.1 / GLM-5.3 / Qwen 3.5 A3B） | **3/3 未认图**：GLM-5.3 与 Qwen 3.5 A3B 明说「没看到图片」；**GLM 5.1 幻觉**出「黄色，红色，绿色，蓝色」 |
+
+⇒ 这就是「`false` 必须写成 `['text']`（明确不支持）、**不能省略**」的依据：
+省略 = 未知 ⇒ DSH 放行图片 ⇒ 上游**静默忽略** ⇒ 用户拿到一份**基于幻觉的、
+看起来完全正常的回答**。写 `['text']` 则让 DSH 在**附件准入阶段**就拒掉。
+
+⚠️ **同一条判据在适配器里还有第二处落点**（纵深防御）：`stream()` 里若
+`supportsImage !== true` 就显式抛 `UNSUPPORTED_CONTENT`。两处**必须同向** ——
+只改一处会退化成「准入放行、适配器再拒」这种**每次带图白撞一轮**的形态。
+
+#### ③ `multimodal` 字段**可信**（issue 留的那个「仍需抽查」已抽查）
+
+远端 38 条原始行、其中 15 条可见：**`multimodal` 从不缺失**（`Object.hasOwn` 全命中），
+取值只有 `true`(10) / `false`(5)，无其它形态；且与兜底表的 `supportsImage`
+**逐条 100% 一致**（0 条不一致）。
+
+⚠️ 但**「从不缺失」是 2026-10-14 的快照**，不是协议保证：`normalizeAccioModel` 仍是
+二值投影（`row.multimodal === true`），字段若某天缺失会落成 `false`
+⇒ **退化成「明确不支持」而不是「未知」**。届时的症状是「图片能力被静默关掉」，
+排查入口就是本节这张表。
+
+#### ④ 落点（四处，缺一不可）
+
+| 文件 | 改动 |
+|---|---|
+| `src/accio-messages.ts` | 新增 `accioUserParts`（含 `tool-result` **递归**）；`serializeAccioMessages` 增可选的 `images` 参数 |
+| `src/accio-adapter.ts` | `toAccioWireMessages` **保留图片块**（顶层 + 工具结果内嵌**提升到 `role:'tool'` 之后**，同 trae 的 `flushToolImages` 范式）；`stream()` 由「发现即抛」改为「收集 → 能力门禁 → 读字节」；`toCatalogEntry` 按逐模型声明模态 |
+| `src/index.ts` | 接上 `readImage` / `readImageRequest` |
+| `ACCIO_IMAGE_PIXEL_BUDGET` | 由**死常量**变成真的生效（经 `projectRequestImage` 投影，拿不到才回退原图） |
+
+⚠️ **工具结果内嵌图片不能就地并进 `functionResponse`**：它只吃 `responseJson`
+（一个字符串），没有承载图的位置。沿用 trae 的范式挂到 `role:'tool'` **之后**
+并带一句上下文说明（否则模型看到一张**没有来路**的图）。
+
+#### ⑤ 连带解决：聚合带图时候选表里**不再缺 accio**
+
+issue 把这一条描述为「本机给 accio 打了 `NO_IMAGE` 硬标记」，但**全仓搜 `NO_IMAGE`
+零命中** —— 真实机制是：`inputModalities` 恒省略 ⇒ 聚合的 `capabilityOf` 里
+`imageCapable = inputModalities?.includes('image') === true` 折算成 `false`
+⇒ `imageTargets` 把每个模型都过滤掉。**效果等价，机制不同**。
+接线后视觉模型自然进候选表（`tests/unit/accio-adapter.spec.ts` 有一条按聚合
+**逐字同一表达式**求值的守卫），纯文本模型仍被剔。
+
+#### ⑥ 反向验证（7 个变异，逐个被点名用例杀死）
+
+| 变异 | 杀死它的用例数 |
+|---|---|
+| 序列化不产 `inlineData`（回到只推文本） | 6 |
+| 杀掉 `tool-result` 递归 | **1**（判别用例） |
+| `multimodal:false` 退回省略 | 1 |
+| 未知 id 退回省略 | 2 |
+| 删掉模型能力门禁 | 2 |
+| 删掉附件服务门禁 | **1**（⚠️ 初版**假绿**：泛断言「附件服务」被下游另一条同词报错放行，已改为锚定「均未提供」） |
+| 内嵌图不再提升 / 不用请求版本投影 | 2 / 1 |
+
 ## 5. ⚠️⚠️ 真缺陷二（未发生但极易发生）：`expires_at` 秒/毫秒混淆
 
 上游 `expiresAt` 是**秒**（实测 `1794407698` ≈ 2026-11-11），官方客户端自己 `1e3 *` 归一化。
@@ -929,7 +1005,7 @@ accio 是**根本没有这组按钮的作用对象**。
 | U-A′ | **未验证** | ⚠️⚠️ **`refresh_token` 是「会话级」还是「账号级」？** | **探针结构上无法回答这个**：它只能证明「凭据由本插件现场 PKCE 登录写入」，**不能**排除「用户用**同一账号**也登录了 IDE」。若服务端是**账号级**轮换，则轮换会作废**同账号** IDE 的登录 —— 即使用的是我们自己的凭据。⇒ **跑续期探针前请先确认该账号没在 IDE 上登录**，或接受这个风险。这是 E2E 探针 `test:e2e:accio-refresh` 的**已知残余风险**（Task 9 复审指出） |
 | U-B | ~~已定~~ | ~~`rateLimit` 是否该登记~~ ⇒ **已定：登记 `false`** | 依据不是「会不会限流」（未实测），而是「两个按钮对本家**恒为惰性**」：适配器不写 `modelRateLimits`、`probeById` 里没有它 ⇒ 零请求、零清除。理由与判据见 §9.1 ②。⚠️ 将来接上请求级换号 + 冷却时**这一行要一起改回 `true`** |
 | U-C | **未验证** | 是否纳入**临期折算**（`ProviderRuntime.expiry`） | 当前**未纳入**：Accio 的余额按**三类语义桶**下发（daily / monthly / referral），而折算层要的是**逐包到期时刻**。纳入须同时进 `WIRED_EXPIRY_PROVIDERS` 与 `aggregate-adapter.ts` 的参与清单 |
-| U-D | **未验证** | 图片真实上限 | `multimodal: true` 的模型是否真收图。⇒ 当前**未接**图片通路（`inputModalities` 省略 = 未知，适配器**显式报错**而不是静默丢图），故这一条同时决定「将来能不能接 `readImage`」 |
+| U-D | ✅ **已验证（2026-10-14，issue IKLR7V）** | 图片通路 | **上游原生收图**，形状 `parts[].inline_data = {mime_type,data}`（Gemini 同构）；四象限色块图**四色全对**。⚠️ **`multimodal` 字段可信**（15 条可见模型从不缺失、与兜底表 100% 一致），但 **`multimodal:false` 的模型不报错、而是静默忽略图片**（GLM 5.1 据此**幻觉**出答案）⇒ `inputModalities` 必须按逐模型声明，`false` 写 `['text']`。详见 §4.6 |
 | U-E | **未验证** | 国际版账号能否用中国版登录页（反之） | 跨区域登录是否被拒。⚠️ 区域选择入口**已接上**（见 §9.1 ③），故现在**可以触发**这一条：选国际版登录域去登一个中国版账号（或反之）会得到什么。⇒ 探针 `test:e2e:accio` 未覆盖跨区域组合，仍待人工验证 |
 | **U-F** | ⚠️ **已验证，但证据未留存** | **`tools` 的扁平形态被上游接受**（§4.1.2） | Task 6 的 `probe-tool-shards.mjs` / `probe-tool-merge.mjs` **真机跑过**并拿到真实 `function_call` 帧（`task-6-report.md` §4.2 逐字记录 frame#8/#9/#10），两支探针下发的**都是扁平 `parametersJson` 形态** ⇒ 「扁平可用」是**跑出来的结论**。⚠️ 但探针在 `.tmp-accio/`（gitignore）、**没有日志入库**，且 `tests/unit/accio-adapter.spec.ts` 那条只写「实测该形状可用」而**未注明来源** ⇒ 属**证据未留存**：结论照用，但**没有可复核的产物**。要做成回归防线须**重跑并留存**（例如把探针搬进 `tests/e2e/` 的闸门探针并落日志） |
 | **U-G** | ⚠️ **已验证，但证据未留存** | **工具调用分片到达、后续帧重复完整参数**（§4.4） | 同上两支探针的结论（「有 args 的帧数=2，不同取值个数=1」）。已由适配器 `accioToolCallMergeTransform` 合并，且 `tests/unit/accio-adapter.spec.ts` 的 6 条用例锁住行为 —— 但**行为用例的输入是我们自造的帧**，上游真形状的**原始证据未留存**。⇒ 与 U-F 同批重跑即可一并补齐 |

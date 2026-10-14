@@ -1846,11 +1846,13 @@ export function apply(ctx: Context): void {
     fetchRemoteModels: () => accio.fetchModels(pool),
     accountPool: pool,
     product: ACCIO,
-    // ⚠️ **刻意不接 `readImage` / `readImageRequest`**：Accio 的图片通路**未实测**
-    //    （`serializeAccioMessages` 的 `flattenText` 只保留 text 块），故适配器的
-    //    `inputModalities` 恒**省略**（= 未知），并在收到图片时显式抛
-    //    `UNSUPPORTED_CONTENT`（绝不静默丢弃）。接上字节桥接等于放行一条
-    //    没有任何实测支撑的通路 —— 见 `accio-adapter.ts` 的 `toCatalogEntry` 注释。
+    // ⚠️ **图片通路已接通**（issue IKLR7V，2026-10-14 真机实测）：
+    //    上游原生收图（Gemini 风格的 `parts[].inline_data`），且 `multimodal: true`
+    //    的模型四色全对、`multimodal: false` 的模型**静默忽略图片**（含一家会幻觉）。
+    //    故这里接上字节桥接，`inputModalities` 按**逐模型**的 `supportsImage` 如实声明。
+    //    ⚠️ 泛型参数（`AccioCredential`）与上面 `resolveCredential` 一致。
+    readImage: makeReadImage(ctx),
+    readImageRequest: makeReadImageRequest(ctx),
   })
 
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
