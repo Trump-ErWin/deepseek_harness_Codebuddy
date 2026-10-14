@@ -115,6 +115,21 @@ export interface JetHubState {
    */
   gatewayEnabled?: boolean
   /**
+   * 渠道原生搜索总开关（`false` = 全部搜索回官方 provider）。
+   *
+   * 「原生搜索」指支持它的渠道（CodeBuddy / WorkBuddy）用**自己后端的搜索接口**
+   * （`/agenttool/v1/search` 与 `/agenttool/v1/webfetch`）；关掉后这些渠道也回落到
+   * DeepSeek 官方搜索（需要 `DEEPSEEK_API_KEY`）。
+   *
+   * ⚠️ 与 `gatewayEnabled` 同级、**可以**住在这里：老版本代码整体重写 `state.json`
+   * 时会丢掉本键，后果仅仅是**回到原生搜索**，用户再关一次即可 —— 没有任何
+   * 不可逆后果（对照 `loomyPermanentLocked` 的不可逆性，那才需要独立文档）。
+   *
+   * 缺键语义为**启用**：老用户升级后行为与升级前一致（原生搜索本就是新功能，
+   * 默认开启才符合「装上就能用」）。
+   */
+  nativeWebSearchEnabled?: boolean
+  /**
    * 供应商自定义显示顺序（「供应商开关」弹窗的拖拽排序，2026-10-06）。
    *
    * ⚠️ 与 `gatewayEnabled` 同级、**可以**住在这里：老版本代码整体重写
@@ -154,6 +169,7 @@ const jetHubSchema = Schema.object({
   disabledModels: Schema.dict(Schema.any()).default({}),
   loomyPermanentLocked: Schema.boolean().default(false),
   gatewayEnabled: Schema.boolean().default(true),
+  nativeWebSearchEnabled: Schema.boolean().default(true),
   providerOrder: Schema.array(Schema.string()).default([]),
 })
 
@@ -168,6 +184,22 @@ const jetHubSchema = Schema.object({
  * 任何一次读取失败都变成「网关被静默关闭」，而用户根本不知道自己关过它。
  */
 export function sanitizeGatewayEnabled(raw: unknown): boolean {
+  return raw !== false
+}
+
+/**
+ * 归一化「渠道原生搜索」总开关。
+ *
+ * 判据与 {@link sanitizeGatewayEnabled} **逐字同构**，理由也同向：
+ * **只有显式 `false` 才算关闭**，其余（缺键 / `true` / 字符串 / 对象 / 数组）
+ * 一律按启用处理。
+ *
+ * ⚠️ 方向不能反。文档缺失、被手工编辑成脏值、或老版本代码整体重写时丢了本键，
+ * 都必须**回到默认启用** —— 反过来（只认 `true`）会让任何一次读取失败都变成
+ * 「原生搜索被静默关闭」，用户根本不知道自己关过它，只会看到搜索突然开始
+ * 要 API Key。
+ */
+export function sanitizeNativeWebSearchEnabled(raw: unknown): boolean {
   return raw !== false
 }
 

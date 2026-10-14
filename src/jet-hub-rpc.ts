@@ -249,6 +249,9 @@ import type {
   RpcProviderSetEnabledResponse,
   RpcGatewayStatusResponse,
   RpcGatewaySetEnabledRequest,
+  RpcNativeSearchGetEnabledResponse,
+  RpcNativeSearchSetEnabledRequest,
+  RpcNativeSearchSetEnabledResponse,
   RpcGatewayModel,
   RpcCaptchaDemandResponse,
   RpcCaptchaCarrierUrlResponse,
@@ -5046,6 +5049,35 @@ function registerJetHubEndpoints(
           models,
           modelsSource,
         }
+        return { ok: true, value }
+      }
+
+      // ── 渠道原生搜索总开关（Jet Hub 页头的开关）──
+      //
+      // 语义：**开** = 支持原生搜索的渠道（CodeBuddy / WorkBuddy）走自己后端的
+      // 搜索接口；**关** = 所有渠道一律回官方 DeepSeek 搜索。
+      // 消费方是 `src/web-native.ts` 的 `tools/execute` 监听器（经 `index.ts`
+      // 传入 `() => pool.nativeWebSearchEnabled()`）。
+      case 'nativeSearch.getEnabled': {
+        const value: RpcNativeSearchGetEnabledResponse = { enabled: pool.nativeWebSearchEnabled() }
+        return { ok: true, value }
+      }
+
+      case 'nativeSearch.setEnabled': {
+        const req = payload as RpcNativeSearchSetEnabledRequest
+        // ⚠️ 与 `gateway.setEnabled` 同约定：**不做默认值猜测** ——
+        // 默认成 true 会静默打开用户特意关闭的开关。
+        if (typeof req.enabled !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        }
+        await pool.setNativeWebSearchEnabled(req.enabled)
+        // 不刷新任何缓存：监听器是**每次现读** `pool.nativeWebSearchEnabled()`，
+        // 写完即生效（没有需要失效的派生状态）。
+        ctx.logger.info(
+          `[jet-hub] ${req.enabled ? '打开' : '关闭'}渠道原生搜索`
+          + `${req.enabled ? '' : '（所有渠道改用 DeepSeek 官方搜索）'}`,
+        )
+        const value: RpcNativeSearchSetEnabledResponse = { enabled: pool.nativeWebSearchEnabled() }
         return { ok: true, value }
       }
 
