@@ -64,6 +64,26 @@ import {
 const TRIGGER = 'Main branch (you will usually use this for PRs)'
 const REWRITE = 'Main branch (PRs usually go here)'
 
+/**
+ * 第二条指纹：**Claude Code 的身份句**（Gitee issue IKLS2L，2026-10-14 本机实测）。
+ *
+ * ⚠️ 本文件里留了这句字面量（与 ZCode 那条一样）——它已不再有自指污染风险：
+ * 改写覆盖 `system` 与 `assistant` 正文两处（见下面「assistant 正文要改」用例），
+ * 而这正是 2026-10-12 那次「排查风控的会话把自己拦死」的修法。
+ */
+const CLAUDE_TRIGGER = "You are Claude Code, Anthropic's official CLI for Claude"
+const CLAUDE_REWRITE = "You are Claude Code, Anthropic's CLI for Claude"
+/**
+ * Claude Code v2.1.295 里的另外两个内建常量（issue 从二进制读出；本机实发复核过）。
+ *
+ * - `sf` = 身份句 + `, running within the Claude Agent SDK.` ⇒ **也被拦**，
+ *   且因为 `find` 不带尾句点，这一条**顺带把它也覆盖了**（下面有用例钉住）。
+ * - `af` = `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
+ *   ⇒ 实测**放行**，故**刻意不登记**（下面有用例钉住「不许顺手多登记一行」）。
+ */
+const CLAUDE_SDK_VARIANT = `${CLAUDE_TRIGGER}, running within the Claude Agent SDK.`
+const CLAUDE_AGENT_VARIANT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+
 /** ZCode 真实的 gitStatus 注入块形态（issue 报障现场）。 */
 const ZCODE_GITSTATUS = [
   '<git_status>',
@@ -191,6 +211,119 @@ describe('腾讯系内容级风控指纹改写（IKJNA1）：纯函数', () => {
   })
 })
 
+/**
+ * 第二条指纹：Claude Code 身份句（Gitee issue IKLS2L）。
+ *
+ * ## 上游事实（2026-10-14 本机对 `www.workbuddy.ai` + `copilot.tencent.com` 双端点实发）
+ *
+ * Claude Desktop 的「Code」页（内置 Claude Code v2.1.295）经 cc-switch →
+ * 本机网关调腾讯系时，**`mrt()` 的 `[model-check]` 探测路径漏传
+ * `skipSystemPromptPrefix`** ⇒ 每次都把身份句注入 system ⇒ 每次都 400/11128。
+ * 实测窗口 277 次尝试 / 94 次失败（约 34%），日志累计 187 次。
+ *
+ * | 探针（`max_tokens=16` / 非流式会被 11101 先拒，故必须 `stream:true`） | workbuddy | buddy |
+ * |---|---|---|
+ * | 中性 system | ✅ 200 | ✅ 200 |
+ * | `You are Claude Code, Anthropic's official CLI for Claude` | ❌ 400/11128 | ❌ 400/11128 |
+ * | 同句 + 尾句点 / + SDK 后缀 | ❌ 400/11128 | ❌ 400/11128 |
+ * | 少一个字母（`…for Claud`） | ✅ 200 | ✅ 200 |
+ * | **多**一个字母（`…for ClaudeX`） | ❌ 400/11128 | ❌ 400/11128 |
+ * | 拆成前半句 / 后半句**单独**发 | ✅ 200 | ✅ 200 |
+ * | **assistant 正文**放同一句 | ❌ 400/11128 | ❌ 400/11128 |
+ * | 同一句放 `user` | ✅ 200 | ✅ 200 |
+ * | **候选替换串**（`…Anthropic's CLI for Claude.`） | ✅ 200 | ✅ 200 |
+ *
+ * ## ⚠️⚠️ 锚点与 ZCode 那条**相反**：该指纹**行首锚定**，不是位置无关
+ *
+ * 这是本轮实测**推翻** issue 描述的一格（issue 按 IKJNA1 同构写成了「子串精确匹配」）：
+ *
+ * | 形态 | 结果 |
+ * |---|---|
+ * | 裸串（在绝对开头） | ❌ 400/11128 |
+ * | **前接空格 / 前换行 / 前接任意前言 / 双换行包裹** | ✅ **200 放行** |
+ * | 后接句点 / 破折号 / 中文句号 / 一长段正文 | ❌ 400/11128 |
+ *
+ * ⇒ 语义是「**前导字符一个都不容忍、后缀完全自由**」。
+ *
+ * ⚠️ 这条对**将来加新指纹的人**是硬提醒：拿「夹在句中放行」当判据会得到**假阴性**
+ * （真因是锚点，不是这句不再触发），据此删掉一条仍然必需的登记就重新打开这个 bug。
+ * 下面 `find` 的正则**刻意不做行首锚定** —— 改写宁可略宽（漏改 = 整轮 400，
+ * 多改 = 语义等价的措辞变化）。
+ */
+describe('腾讯系内容级风控指纹改写（IKLS2L）：Claude Code 身份句', () => {
+  it('★ 身份句被改写为等义形态（实测替换后两端点均 200）', () => {
+    expect(rewriteTencentContentFingerprints(CLAUDE_TRIGGER, 'workbuddy')).toBe(CLAUDE_REWRITE)
+    expect(rewriteTencentContentFingerprints(`${CLAUDE_TRIGGER}.`, 'buddy')).toBe(`${CLAUDE_REWRITE}.`)
+  })
+
+  it('★ `find` 不带尾句点 ⇒ 同一行**顺带覆盖** SDK 变体（少一个尾句点是有意的）', () => {
+    // 若有人「补全」成带尾句点，这条就会红 —— 那个变更会让 SDK 变体漏改写，
+    // 而它是 Claude Code 三个常量之一（`Qno` 会按条件选它注入）。
+    expect(rewriteTencentContentFingerprints(CLAUDE_SDK_VARIANT, 'workbuddy'))
+      .toBe(`${CLAUDE_REWRITE}, running within the Claude Agent SDK.`)
+    // 反向：改写后的文本**不得**再含原触发串（否则等于没改）。
+    expect(rewriteTencentContentFingerprints(CLAUDE_SDK_VARIANT, 'buddy')).not.toContain(CLAUDE_TRIGGER)
+  })
+
+  it('★ 第三个常量（`Claude agent`）实测放行 ⇒ **刻意不登记**，逐字节不变', () => {
+    // 「表就是为此设计的」不等于「能加的都加上」：多登记一条 = 替上游无谓改写
+    // 用户提示词，且会破坏前缀缓存。判据是**实测**（该串两端点均 200）。
+    for (const provider of ['buddy', 'workbuddy']) {
+      expect(rewriteTencentContentFingerprints(CLAUDE_AGENT_VARIANT, provider)).toBe(CLAUDE_AGENT_VARIANT)
+    }
+  })
+
+  it('★ 非腾讯系：身份句逐字节不变（别替别家上游改写用户提示词）', () => {
+    for (const provider of ['qoder', 'qodercn', 'trae', 'codearts', 'lobsterai', '']) {
+      expect(rewriteTencentContentFingerprints(CLAUDE_TRIGGER, provider)).toBe(CLAUDE_TRIGGER)
+    }
+  })
+
+  it('★ 大小写不敏感（实测全大写同样被拦），且不泛化成关键词', () => {
+    // ⚠️ 替换串**固定**为 `replace` 的字面量形态（大小写不保留）—— 与 ZCode 那条
+    // 同一行为（`main branch (…)` → `Main branch (PRs usually go here)`）。
+    // 若将来改成保留大小写，这条与上面 ZCode 那条会同时红，是**有意的**：
+    // 替换串是**我们**的等义措辞，不是用户原文的变形。
+    expect(rewriteTencentContentFingerprints(CLAUDE_TRIGGER.toUpperCase(), 'workbuddy'))
+      .toBe(CLAUDE_REWRITE)
+    // 拆开的两半单独发实测放行 ⇒ 它们**不**单独触发，不能各自登记一条。
+    // （`find` 是整串，故这两半本来就命中不了；这里钉的是「别改成关键词表」。）
+    for (const half of ['You are Claude Code', "Anthropic's official CLI for Claude"]) {
+      expect(rewriteTencentContentFingerprints(half, 'workbuddy')).toBe(half)
+    }
+  })
+
+  it('★ 真实 Claude Code system 提示词：只改身份句那一行，其余段落逐字节不变', () => {
+    // 现场形状：身份句是最前一行，后面跟真正的行为约定（这些**不能**被碰）。
+    const realSystem = [
+      `${CLAUDE_TRIGGER}.`,
+      '',
+      'You are an interactive CLI tool that helps users with software engineering tasks.',
+      '',
+      '# Tone and style',
+      '- Be concise and direct.',
+    ].join('\n')
+    const out = rewriteTencentContentFingerprints(realSystem, 'workbuddy')
+    expect(out).not.toContain(CLAUDE_TRIGGER)
+    expect(out).toContain(`${CLAUDE_REWRITE}.`)
+    expect(out).toContain('You are an interactive CLI tool that helps users with software engineering tasks.')
+    expect(out).toContain('# Tone and style')
+    expect(out).toContain('- Be concise and direct.')
+    expect(out.split('\n')).toHaveLength(realSystem.split('\n').length)
+  })
+
+  it('★ 两条指纹互不干扰（Claude 条不影响 ZCode 条，反之亦然）', () => {
+    expect(rewriteTencentContentFingerprints(`${TRIGGER}: master`, 'workbuddy'))
+      .toBe(`${REWRITE}: master`)
+    expect(rewriteTencentContentFingerprints(`${TRIGGER}: master\n${CLAUDE_TRIGGER}`, 'workbuddy'))
+      .toBe(`${REWRITE}: master\n${CLAUDE_REWRITE}`)
+    // 连续两次调用结果一致（`g` 正则的 lastIndex 不留状态）。
+    const mixed = `${CLAUDE_TRIGGER}\n${TRIGGER}`
+    expect(rewriteTencentContentFingerprints(mixed, 'workbuddy'))
+      .toBe(rewriteTencentContentFingerprints(mixed, 'workbuddy'))
+  })
+})
+
 describe('OpenAI 网关 Chat 路径：改 system 与 assistant 正文，其余角色一概不碰', () => {
   it('★ workbuddy：system 被改写', async () => {
     const options = await toGenerateOptions({
@@ -268,6 +401,27 @@ describe('OpenAI 网关 Chat 路径：改 system 与 assistant 正文，其余�
     }, abort())
     expect(textsOf(options.messages)[0]).toBe(ZCODE_GITSTATUS)
   })
+
+  it('★ IKLS2L：Claude Code 的 system 身份句在网关路径被改写（外部客户端入口）', async () => {
+    // 现场链路：Claude Desktop「Code」页 → cc-switch（Anthropic→Responses 转换）
+    // → 本机网关。system 里带的是 Claude Code 自己的身份句常量。
+    const options = await toGenerateOptions({
+      model: 'workbuddy/deepseek-v4.1-flash',
+      messages: [
+        { role: 'system', content: `${CLAUDE_TRIGGER}.` },
+        { role: 'user', content: '说：OK' },
+      ],
+    }, abort())
+    const system = textsOf(options.messages)[0]
+    expect(system).not.toContain(CLAUDE_TRIGGER)
+    expect(system).toContain(CLAUDE_REWRITE)
+    // 非腾讯系客户端（如 qoder）不得被改写。
+    const other = await toGenerateOptions({
+      model: 'qoder/qfmodel',
+      messages: [{ role: 'system', content: `${CLAUDE_TRIGGER}.` }, { role: 'user', content: 'hi' }],
+    }, abort())
+    expect(textsOf(other.messages)[0]).toBe(`${CLAUDE_TRIGGER}.`)
+  })
 })
 
 describe('OpenAI 网关 Responses 路径：与 Chat 同一判据', () => {
@@ -320,5 +474,34 @@ describe('OpenAI 网关 Responses 路径：与 Chat 同一判据', () => {
       input: 'hi',
     }, abort())
     expect(textsOf(options.messages)[0]).toBe(ZCODE_GITSTATUS)
+  })
+
+  it('★ IKLS2L：`instructions` 里的 Claude 身份句被改写（Responses 端唯一 system 通道）', async () => {
+    // issue 的现场就是 `/v1/responses`：cc-switch 把 Anthropic 的 system 转成
+    // `instructions`。漏掉这一格等于「该端点没修」。
+    const options = await toResponsesGenerateOptions({
+      model: 'workbuddy/deepseek-v4.1-flash',
+      instructions: `${CLAUDE_TRIGGER}.`,
+      input: 'hi',
+    }, abort())
+    const text = textsOf(options.messages)[0]
+    expect(text).not.toContain(CLAUDE_TRIGGER)
+    expect(text).toContain(CLAUDE_REWRITE)
+  })
+
+  it('★ IKLS2L：input 里的 assistant 正文放 Claude 身份句也走改写（历史重放路径）', async () => {
+    // 与 ZCode 那条同型：一旦这句进了 assistant 历史就会每轮原样重放，
+    // 排查这个风控 bug 的会话本身会被拦死（2026-10-12 报障的机制）。
+    const options = await toResponsesGenerateOptions({
+      model: 'workbuddy/deepseek-v4.1-flash',
+      input: [
+        { type: 'message', role: 'assistant', content: `我记录到这一句：${CLAUDE_TRIGGER}` },
+        { type: 'message', role: 'user', content: `这是用户原话：${CLAUDE_TRIGGER}` },
+      ],
+    }, abort())
+    const texts = textsOf(options.messages)
+    expect(texts).toContain(`我记录到这一句：${CLAUDE_REWRITE}`)
+    // user 不碰（实测该角色放行，改它只是篡改用户原话）。
+    expect(texts).toContain(`这是用户原话：${CLAUDE_TRIGGER}`)
   })
 })
