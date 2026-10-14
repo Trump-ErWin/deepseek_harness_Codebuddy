@@ -837,6 +837,118 @@ describe('BuddyAdapter', () => {
     })
   })
 
+  // ── Issue IKLIFH：工具结果里的图片必须与提问同条 ──
+  //
+  // 真实报障「codebuddy hy4 不支持识别图片」。实测（2026-10-14，直连
+  // copilot.tencent.com，hy4-preview + 同一张 1024x768 双色图，问左右颜色）：
+  //
+  //   图与提问**同一条** user                     ✅ 答「左白右蓝」
+  //   图单独一条 user（带/不带提示句），问在下一条 ❌ 答「图像已被过滤」
+  //   图并入 role:'tool' 消息本身                 ❌ 答「不支持读取图片」
+  //
+  // ⚠️ wire 上**确实有图**、上游也**不报错**（HTTP 200 + 正常流），只是模型
+  // 看不见并自称「当前模型不支持图片」⇒ 用户会误判成模型能力问题去换模型。
+  // ⚠️ 与 hy4 无关：同一张图换 `deepseek-v4-flash` 同样答「已被过滤」，
+  // 而两者远端都是 `supportsImages: true`。
+  describe('Issue IKLIFH：工具结果图片与提问同条', () => {
+    const IMAGE_ID = 'att-1'
+
+    /** 构造：assistant tool_call → 工具结果内嵌图片 → 后续提问（截图 #1 的形状）。 */
+    function messagesWithAsk(askText: string, extraUserText?: string) {
+      return [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'tc1', name: 'read_image', arguments: '{}' }],
+        },
+        {
+          role: 'tool',
+          toolCallId: 'tc1',
+          content: [
+            { type: 'text', text: 'preview 1024x768px.' },
+            { type: 'image', attachment: { attachmentId: IMAGE_ID } },
+          ],
+        },
+        ...extraUserText === undefined ? [] : [{ role: 'user', content: extraUserText }],
+        { role: 'user', content: askText },
+      ]
+    }
+
+    function adapterCapturing() {
+      let sentBody: Record<string, unknown> | undefined
+      const adapter = makeAdapter({
+        readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+        fetchImpl: async (_url, init) => {
+          sentBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: [DONE]\n\n')
+        },
+      })
+      return { adapter, body: () => sentBody }
+    }
+
+    it('图片与提问合并为同一条 user 消息（真实报障形态）', async () => {
+      const { adapter, body } = adapterCapturing()
+      await collectChunks(adapter, {
+        model: 'hy4-preview',
+        messages: messagesWithAsk('这页写了什么？'),
+        signal: new AbortController().signal,
+      } as never)
+
+      const messages = (body().messages as Array<Record<string, unknown>>)
+      const toolIndex = messages.findIndex((m) => m.role === 'tool')
+      expect(toolIndex, '工具结果必须下发').toBeGreaterThan(-1)
+      // 协议约束：tool 必须紧跟其 assistant tool_calls，否则上游 400。
+      const assistantIndex = messages.findIndex((m) => m.role === 'assistant')
+      expect(toolIndex).toBe(assistantIndex + 1)
+
+      // ⚠️ 核心断言：图与问**同一条**。
+      const imageIndex = messages.findIndex((m) => Array.isArray(m.content)
+        && (m.content as Array<{ type: string }>).some((p) => p.type === 'image_url'))
+      const askIndex = messages.findIndex((m) => Array.isArray(m.content)
+        && (m.content as Array<{ type: string; text?: string }>).some((p) => p.text?.includes('这页写了什么')))
+      expect(imageIndex, '图片不得静默丢弃').toBeGreaterThan(-1)
+      expect(askIndex, '提问不得静默丢弃').toBeGreaterThan(-1)
+      expect(imageIndex, '图片必须与提问同条（Issue IKLIFH 的正题）').toBe(askIndex)
+      expect(imageIndex, '且必须排在 tool 之后').toBeGreaterThan(toolIndex)
+    })
+
+    it('图片与提问**分处两条** user 消息时，模型看不到（回归锁定旧缺陷形态）', async () => {
+      const { adapter, body } = adapterCapturing()
+      await collectChunks(adapter, {
+        model: 'hy4-preview',
+        messages: messagesWithAsk('这页写了什么？', '好的'),
+        signal: new AbortController().signal,
+      } as never)
+
+      const messages = (body().messages as Array<Record<string, unknown>>)
+      const imageIndex = messages.findIndex((m) => Array.isArray(m.content)
+        && (m.content as Array<{ type: string }>).some((p) => p.type === 'image_url'))
+      const askIndex = messages.findIndex((m) => Array.isArray(m.content)
+        && (m.content as Array<{ type: string; text?: string }>).some((p) => p.text?.includes('这页写了什么')))
+      // 中间那条「好的」也要搭车（它与图同条，不该另发一条）。
+      expect(imageIndex, '图与延后正文应先合并发出').toBeGreaterThan(-1)
+      expect(askIndex).toBeGreaterThan(imageIndex)
+      // 图所在的这条不得只有图片而没有正文 → 否则又回到「图单独一条」。
+      const imageMsg = messages[imageIndex] as { content: Array<{ type: string }> }
+      expect(imageMsg.content.some((p) => p.type === 'text'), '图不得单独成一条（无任何文本）').toBe(true)
+    })
+
+    it('无挂图时不凭空多发 user 消息（纯文本形态逐字节不变）', async () => {
+      const { adapter, body } = adapterCapturing()
+      await collectChunks(adapter, {
+        model: 'hy4-preview',
+        messages: [{ role: 'user', content: '你好' }],
+        signal: new AbortController().signal,
+      } as never)
+
+      const messages = (body().messages as Array<Record<string, unknown>>)
+      const users = messages.filter((m) => m.role === 'user')
+      expect(users).toHaveLength(1)
+      // 纯文本必须是**字符串**（不是 parts 数组），否则上游报 model_param_invalid。
+      expect(typeof users[0]!.content).toBe('string')
+      expect(users[0]!.content).toBe('你好')
+    })
+  })
+
   // ── 思考强度声明 ──
   // composer 的模型选择器读取 resolveModel().reasoning.efforts；不声明该字段
   // 就显示"当前模型未提供推理等级"。

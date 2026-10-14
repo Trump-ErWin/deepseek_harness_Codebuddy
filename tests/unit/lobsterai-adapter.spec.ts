@@ -830,6 +830,92 @@ describe('LobsteraiAdapter 错误处理', () => {
       type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' },
     })
   })
+
+  /**
+   * ⚠️ Issue IKLIFH：工具结果里的图片必须与**提问同在一条 user 消息**。
+   *
+   * 真实报障「codebuddy hy4 不支持识别图片」。实测（直连上游，同一张图）：
+   * 图与问**同条** ✅ 模型答出颜色；图**单独成一条**（无论带不带提示句）
+   * ❌ 模型答「图像已被过滤」。且 wire 上确实有图、上游也**不报错**
+   * （HTTP 200 + 正常流），只是模型看不见 —— 症状极具误导性。
+   *
+   * 旧实现把图片单独发成一条 `TOOL_RESULT_IMAGE_TEXT` + 图片的 user 消息，
+   * 提问在**再下一条**，恰好命中该形态。
+   */
+  it('工具结果内嵌图片与后续提问合并为同一条 user 消息', async () => {
+    const { adapter, calls } = makeAdapter(() => textSse('hi'), {
+      fetchRemoteModels: async () => [{ id: 'glm-5.2', name: 'GLM-5.2', supportsImage: true }],
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+    })
+    const options = generateOptions({
+      messages: [
+        {
+          role: 'assistant',
+          content: [{
+            type: 'tool-call', id: 't1', name: 'read_image', arguments: '{}',
+          }],
+        },
+        createUserMessage({
+          content: [{
+            type: 'tool-result',
+            toolCallId: 't1',
+            content: [
+              { type: 'text', text: '截图完成' },
+              { type: 'image', attachment: { attachmentId: 'a1' } },
+            ],
+          }],
+          source: { kind: 'user' },
+        }),
+        createUserMessage({
+          content: [{ type: 'text', text: '这页写了什么？' }],
+          source: { kind: 'user' },
+        }),
+      ],
+    } as never)
+    await collect(options, adapter)
+    const body = JSON.parse(String(calls[0]!.init?.body)) as { messages: Array<Record<string, unknown>> }
+
+    const toolIndex = body.messages.findIndex((m) => m.role === 'tool')
+    expect(toolIndex, '工具结果必须下发').toBeGreaterThan(-1)
+    // 协议约束：tool 必须紧跟其 assistant tool_calls（否则上游 400）。
+    const assistantIndex = body.messages.findIndex((m) => m.role === 'assistant')
+    expect(toolIndex).toBe(assistantIndex + 1)
+
+    // 核心断言：图片与提问**同在一条** user 消息里。
+    const imageIndex = body.messages.findIndex((m) => Array.isArray(m.content)
+      && (m.content as Array<{ type: string }>).some((p) => p.type === 'image_url'))
+    const askIndex = body.messages.findIndex((m) => Array.isArray(m.content)
+      && (m.content as Array<{ type: string; text?: string }>).some((p) => p.text?.includes('这页写了什么')))
+    expect(imageIndex, '图片不得静默丢弃').toBeGreaterThan(-1)
+    expect(askIndex, '提问不得静默丢弃').toBeGreaterThan(-1)
+    expect(imageIndex, '图片必须与提问同条（Issue IKLIFH）').toBe(askIndex)
+    // 且必须排在 tool 之后（否则违反 tool 配对约束）。
+    expect(imageIndex).toBeGreaterThan(toolIndex)
+  })
+
+  /**
+   * ⚠️ 反向验证的另一半：无图时**不得**凭空多出一条 user 消息。
+   * 修法把纯文本路径也交给了 `flushToolImages`，若它对「无挂图」也发消息，
+   * 每轮纯文本对话都会多一条空 parts 消息（实测上游报 `model_param_invalid`）。
+   */
+  it('无挂图时不凭空多发 user 消息（纯文本形态不变）', async () => {
+    const { adapter, calls } = makeAdapter(() => textSse('hi'), {
+      fetchRemoteModels: async () => [{ id: 'glm-5.2', name: 'GLM-5.2', supportsImage: true }],
+    })
+    const options = generateOptions({
+      messages: [createUserMessage({
+        content: [{ type: 'text', text: '你好' }],
+        source: { kind: 'user' },
+      })],
+    } as never)
+    await collect(options, adapter)
+    const body = JSON.parse(String(calls[0]!.init?.body)) as { messages: Array<Record<string, unknown>> }
+    const users = body.messages.filter((m) => m.role === 'user')
+    expect(users).toHaveLength(1)
+    // 纯文本必须是**字符串**形态（不是 parts 数组），否则上游会拒收。
+    expect(typeof users[0]!.content).toBe('string')
+    expect(users[0]!.content).toBe('你好')
+  })
 })
 
 describe('LobsteraiAdapter SSE 消费', () => {
