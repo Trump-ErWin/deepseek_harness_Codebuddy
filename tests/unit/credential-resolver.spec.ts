@@ -253,6 +253,8 @@ describe('createCredentialResolver · 骨架 C（buddy 协议分档）', () => {
     isFreeModel?: (modelId?: string) => Promise<boolean> | boolean
     reportPickedAccount?: boolean
     reports?: Array<string | undefined>
+    /** 限流判定（真实实现见 `src/index.ts` 的 `throwIfAllAccountsRateLimited`）。 */
+    throwIfAllRateLimited?: (product: { id: string; displayName: string }, modelId?: string) => void
   }) {
     return createCredentialResolver(
       {
@@ -272,6 +274,9 @@ describe('createCredentialResolver · 骨架 C（buddy 协议分档）', () => {
             : { reportPickedAccount: overrides.reportPickedAccount },
         },
         fallback: { kind: 'ref', refName: 'FALLBACK' },
+        ...overrides.throwIfAllRateLimited === undefined
+          ? {}
+          : { throwIfAllRateLimited: overrides.throwIfAllRateLimited },
       },
     )
   }
@@ -381,6 +386,89 @@ describe('createCredentialResolver · 骨架 C（buddy 协议分档）', () => {
       readCredential: async () => ({ c: 1 }),
     })
     await expect(resolve('m')).rejects.toThrow('无法确认')
+  })
+
+  /**
+   * ★ 真实报障 2026-10-13（CodeBuddy：`明明有积分却显示不可用`）。
+   *
+   * 全部启用账号被**目标模型**限流 ⇒ `candidatesOf` 把它们全滤掉 ⇒ 候选空集
+   * ⇒ 余额分档一次都没跑 ⇒ `pickBuddyAccount` 返回 `locked`（reason 缺席）。
+   * 修复前这里直接 `throw plan.lockedError({kind:'exhausted'})`，把**限流**
+   * 谎报成「积分都已用尽」，用户据此去解锁永久积分 —— 方向完全错，
+   * 而解禁时刻就在池里。
+   *
+   * ⚠️ 判据是「**候选为空**才先问限流」，故本条必须让池里真的有一个被限流的
+   * 账号（`poolOf` 的 `modelRateLimits` 让 `candidatesOf` 筛空它）。
+   *
+   * 变异：把 `if (candidates.length === 0) config.throwIfAllRateLimited?.(…)`
+   * 删掉 ⇒ 红（会抛 `额度已用尽` 而不是限流错）。
+   */
+  it('★ 锁定 + 候选被模型限流筛空 ⇒ 报**限流**（带解禁时刻），不谎报「积分已用尽」', async () => {
+    const resetAt = Date.now() + 3_600_000
+    const resolve = make({
+      pool: poolOf([
+        { id: 'a1', provider: 'buddy', credentialRef: 'R1', modelRateLimits: { m: resetAt } },
+      ], { R1: '{}' }, true),
+      // 候选空集 ⇒ 假选择器**永远不会被调用**（这正是本缺陷的形态）。
+      selector: fakeSelector({ pick: PICK_A1 }),
+      readCredential: async () => ({ c: 1 }),
+      throwIfAllRateLimited: (_product, modelId) => {
+        if (modelId !== 'm') return
+        throw new Error('模型 m 的可用账号均在限流中')
+      },
+    })
+    await expect(resolve('m')).rejects.toThrow('均在限流中')
+  })
+
+  /**
+   * ⚠️ **阳性对照**：候选非空时不得触发限流判定。
+   *
+   * 候选非空 ⇒ 至少一个启用账号未被限流 ⇒ 此时报「限流」本身就是错的。
+   * 且余额分档**真的跑过**，那句「积分已用尽」有事实依据。
+   *
+   * 变异：把 `if (candidates.length === 0)` 的守卫去掉（无条件调）⇒ 红。
+   */
+  it('⚠️ 锁定 + 候选非空（凭据全坏）⇒ **不**触发限流判定，仍报原锁定文案', async () => {
+    let called = 0
+    const resolve = make({
+      pool: poolOf(ENTRIES, { R1: '{}' }, true),
+      // 候选非空，但凭据读不出来 ⇒ `pickBuddyAccount` 耗尽候选后返回 locked。
+      selector: fakeSelector({ pick: PICK_A1 }),
+      readCredential: async () => undefined,
+      throwIfAllRateLimited: () => { called++; throw new Error('不该判限流') },
+    })
+    await expect(resolve('m')).rejects.toThrow('额度已用尽')
+    expect(called, '候选非空时不该判限流').toBe(0)
+  })
+
+  /**
+   * ⚠️ 候选被限流筛空，但**限流判定静默返回**（未接线 / 不是全限流）⇒ 仍须
+   * 抛出**不谎报**的文案。
+   *
+   * 走到这里的 `no-candidates` 已排除「全被模型限流」（上一条），剩下的是
+   * 「该 provider 下没有启用中的账号」等情形 —— 文案不得说「积分都已用尽」。
+   *
+   * 变异：把 `buddyLockedError` 的 `no-candidates` 分支删掉（落回 exhausted 文案）⇒ 红。
+   */
+  it('⚠️ 锁定 + 候选空集 + 限流判定静默 ⇒ 报「没有任何候选账号」而不是「积分已用尽」', async () => {
+    const resolve = createCredentialResolver(
+      { pool: poolOf([], {}, true) },
+      {
+        product: { id: 'buddy', displayName: 'CodeBuddy' },
+        readCredential: async () => ({ c: 1 }),
+        balance: {
+          kind: 'buddy',
+          selector: fakeSelector({ pick: PICK_A1 }) as never,
+          // 与 `src/index.ts` 的 `buddyLockedError` 同口径（只取关键判据）。
+          lockedError: (reason) => new Error(
+            reason.kind === 'no-candidates' ? '没有任何候选账号' : '额度已用尽',
+          ) as never,
+        },
+        fallback: { kind: 'ref', refName: 'FALLBACK' },
+        throwIfAllRateLimited: () => { /* 静默：不是全限流 */ },
+      },
+    )
+    await expect(resolve('m')).rejects.toThrow('没有任何候选账号')
   })
 
   it('⚠️ 未锁定 + 分档没选出 ⇒ 退兜底（不抛错）', async () => {

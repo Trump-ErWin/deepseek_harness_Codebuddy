@@ -312,11 +312,21 @@ describe('BuddyBalanceSelector.balanceOf（带 TTL 的余额查询）', () => {
 })
 
 describe('BuddyBalanceSelector.select（分档选号）', () => {
-  it('空候选返回 ok:false（exhausted，不是查询失败）', async () => {
+  /**
+   * ⚠️ **空候选的原因必须与「查到了、确实是 0」分开**（真实报障 2026-10-13）。
+   *
+   * 候选为空 = **余额分档一次都没跑**，我们对任何账号的余额一无所知；
+   * 报 `exhausted` 是在替服务端断言一件从没查过的事。真实场景：全部账号被
+   * 目标模型限流 → `candidatesOf` 把它们全滤掉 → 报「积分都已用尽」，
+   * 用户据此去解锁永久积分（而解禁时刻就在 `modelRateLimits` 里）。
+   *
+   * 变异：把 `select()` 空候选那一支改回 `{ kind: 'exhausted' }` ⇒ 红。
+   */
+  it('空候选返回 ok:false 且原因是 no-candidates（**不是**查询失败、也不是「已用尽」）', async () => {
     const { selector } = makeSelector({})
     const result = await selector.select([], {})
     expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.reason).toEqual({ kind: 'exhausted' })
+    if (!result.ok) expect(result.reason).toEqual({ kind: 'no-candidates' })
   })
 
   it('优先选「有 15 天内到期积分」的号，即使它排在后面', async () => {
@@ -506,13 +516,20 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
     expect(result.tried).toEqual(new Set(['a1']))
   })
 
-  it('空候选不查余额（未锁定也直接返回 exhausted）', async () => {
+  /**
+   * ⚠️ 空候选**不查余额**（一次网络都不发），且原因与「查到了、确实是 0」分开。
+   *
+   * 变异：去掉 `pickBuddyAccount` 开头对 `candidates.length === 0` 的定因
+   * （让 `reason` 保持 `undefined`）⇒ 本条红（`reason` 变 undefined）。
+   */
+  it('空候选不查余额，且带上 no-candidates 原因（未锁定也如此）', async () => {
     const { selector, calls } = makeSelector({ a1: balance() })
     const result = await pickBuddyAccount(selector, [], {
       allowPermanent: true,
       resolveCredential: resolver(),
     })
     expect(result.kind).toBe('exhausted')
+    expect(result.reason).toEqual({ kind: 'no-candidates' })
     expect(calls).toEqual([])
   })
 })

@@ -85,7 +85,7 @@ export interface BuddyCandidateAccount {
 /**
  * 锁定状态下「无可用账号」的原因。
  *
- * ⚠️ 两者**必须分开报**（与 Loomy 那份同一修复）：混成一句「额度都已用尽」
+ * ⚠️ 三者**必须分开报**（与 Loomy 那份同一修复）：混成一句「额度都已用尽」
  * 会让一次网络抖动伪装成"钱花完了"，用户于是去解锁、或白等到明天 ——
  * 而号其实有钱。
  */
@@ -94,6 +94,16 @@ export type BuddyNoAccountReason =
   | { kind: 'exhausted' }
   /** 至少一个候选**查询失败**，无法判定它是否真的没额度。 */
   | { kind: 'unknown'; errors: string[] }
+  /**
+   * **一个候选都没有** ⇒ 压根没走到余额查询，也就无从断言「积分用尽」。
+   *
+   * ⚠️ 这一档是**必须**的（真实报障 2026-10-13，CodeBuddy）：候选由
+   * `candidatesOf` 按 `enabled` + 模型限流筛出，**全部账号都被目标模型限流**
+   * 时它就是个空集 —— 循环一次都不执行，`reason` 保持 `undefined`，调用方的
+   * `?? { kind: 'exhausted' }` 兜底于是把「限流」谎报成「积分都已用尽」，
+   * 用户据此去解锁永久积分，方向完全错（解禁时刻其实就写在 `modelRateLimits` 里）。
+   */
+  | { kind: 'no-candidates' }
 
 /** 选号结果：选中，或「为什么没选中」。 */
 export type BuddySelectionResult
@@ -321,7 +331,9 @@ export class BuddyBalanceSelector<
     options: BuddyTierOptions = {},
   ): Promise<BuddySelectionResult> {
     if (candidates.length === 0) {
-      return { ok: false, reason: { kind: 'exhausted' } }
+      // ⚠️ 空候选 = **压根没查过余额**，不能报 `exhausted`（那是在替服务端
+      //    断言「积分是 0」）。见 `no-candidates` 的说明。
+      return { ok: false, reason: { kind: 'no-candidates' } }
     }
 
     // 并发查余额：账号数通常个位数，并发比串行快得多。
@@ -437,7 +449,15 @@ export async function pickBuddyAccount<TCredential = BuddyCredential>(
 > {
   const tried = new Set<string>()
   const allowPermanent = options.allowPermanent !== false
+  /**
+   * ⚠️ **候选为空必须当场定因**（真实报障 2026-10-13，CodeBuddy）：
+   * 下面的循环上界是候选数，空候选时**一次都不执行**，`reason` 会保持
+   * `undefined`；调用方的 `?? { kind: 'exhausted' }` 于是把「候选被模型限流
+   * 筛空」**凭空**断言成「积分都已用尽」，用户据此去解锁永久积分 ——
+   * 而解禁时刻其实就写在 `modelRateLimits` 里。
+   */
   let reason: BuddyNoAccountReason | undefined
+    = candidates.length === 0 ? { kind: 'no-candidates' } : undefined
   // 循环上界取候选数：每次迭代至少排除一个账号，故必然终止。
   for (let remaining = candidates; remaining.length > 0;) {
     const picked = await selector.select(

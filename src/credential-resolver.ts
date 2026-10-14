@@ -391,6 +391,25 @@ export function createCredentialResolver<TCredential>(
       if (picked.kind === 'locked') {
         // ⚠️ **锁定时绝不可落到下面的池兜底** —— 那会绕过锁定、照样消耗永久
         //    积分，使锁定形同虚设（用户明确要求报错）。文案由调用方逐字提供。
+        //
+        // ⚠️ 但报错**之前**必须先证明失败原因是不是**限流**（真实报障
+        //    2026-10-13，CodeBuddy：`明明有积分却显示不可用`）。候选为空时
+        //    余额分档**一次都没跑过**，那句「积分都已用尽」是凭空断言；而
+        //    「全部启用账号被目标模型限流」正是候选为空的常见成因 ——
+        //    `candidatesOf` 会按 `modelRateLimits` 把它们全滤掉，解禁时刻
+        //    明明就在池里，却被这条 throw 短路掉了。
+        //
+        //    ⚠️ 判据用 `candidates.length === 0` 而**不是** `picked.reason`
+        //    的 kind：候选非空时余额分档已经跑过，限流标记在筛候选那一步
+        //    就生效了，此时再去问一次是多余的网络无关判断；且候选非空 ⇒
+        //    至少一个启用账号未被限流 ⇒ `throwIfAllRateLimited` 必然静默返回。
+        //
+        //    ⚠️ 这与本文件 ⑤ 的修法同型（Gitee IKJOZ9）：那里也是「先证明
+        //    是不是限流，再退兜底」。本处只是把它补到锁定分支上。
+        if (candidates.length === 0) config.throwIfAllRateLimited?.(config.product, modelId)
+        // `??` 兜底现在只覆盖一种残留情形：**候选非空但凭据全坏**（分档每次都
+        // 选出了号，只是 `readCredential` 读不出来）—— 那条路径确实查过余额，
+        // 故沿用「已用尽」的既有文案，不在本次修复范围内。
         throw plan.lockedError(picked.reason ?? { kind: 'exhausted' })
       }
     } else if (plan?.kind === 'loomy') {
