@@ -36,9 +36,9 @@
  * 仍然失败。因此用例同时锁死「不绕过限流标记」「不静默换模型」两条红线。
  */
 import { describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { allAccountsRateLimitedForModel } from '../../src/account-pool.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
@@ -352,9 +352,56 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
     it('限流判定的调用点集中在工厂里（不是每个 provider 各写一遍）', () => {
       const resolverSource = readFileSync(resolve(here, '../../src/credential-resolver.ts'), 'utf8')
         .replace(/\r\n/g, '\n')
-      const occurrences = (codeOnly(resolverSource).match(/throwIfAllRateLimited\?\.\(/g) ?? []).length
-      // loomy 分支 + 池兜底分支 = 2。多于此数说明有人又开了第二个实现。
-      expect(occurrences, '限流判定的调用点应恰好 2 处').toBe(2)
+      const resolverCode = codeOnly(resolverSource)
+
+      /**
+       * ⚠️ 判据已从「恰好 2 处」改为「**只出现在本文件**」（2026-10-13）。
+       *
+       * 原判据是数量断言（`toBe(2)`：loomy 分支 + 池兜底分支）。它在
+       * 2026-10-13 的锁定分支修复里**先红了** —— 而那次修复恰恰是**同一处实现
+       * 里新增一个分支**，不是「又开了第二个实现」。数量断言分不清这两者，
+       * 于是它守的东西（防止第二处实现）与它实际测的东西（分支总数）脱钩，
+       * 改一次无关分支就得改它一次，最后没人敢动。
+       *
+       * ⇒ 换成**直接测原意**：`src/` 下除本文件外，任何地方都不得出现
+       * `throwIfAllRateLimited?.(` 调用。这既挡住了「第二个实现」，也允许
+       * 本文件按需增删分支。
+       *
+       * ⚠️ 用 `readdirSync` 递归扫**全部** `.ts`（含 `client/` 子目录），
+       * 而不是只点名几个文件 —— 后者会漏掉将来新加的模块。
+       */
+      const srcRoot = resolve(here, '../../src')
+      const offenders: string[] = []
+      const walk = (dir: string): void => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          const full = join(dir, entry.name)
+          if (entry.isDirectory()) { walk(full); continue }
+          if (!entry.name.endsWith('.ts')) continue
+          if (resolve(full) === resolve(here, '../../src/credential-resolver.ts')) continue
+          const source = codeOnly(readFileSync(full, 'utf8').replace(/\r\n/g, '\n'))
+          if (source.includes('throwIfAllRateLimited?.(')) offenders.push(entry.name)
+        }
+      }
+      walk(srcRoot)
+      expect(offenders, '限流判定只该在 credential-resolver.ts 里调用，别处又开了一份实现').toEqual([])
+
+      // 本文件内的三处调用**按分支点名**（顺序即代码顺序），而不是数个数：
+      // 锁定分支（2026-10-13 新增）→ loomy 分支 → 池兜底分支。
+      const occurrences = [...resolverCode.matchAll(/throwIfAllRateLimited\?\.\(/g)]
+      expect(occurrences.length, '至少要有 loomy 分支 + 池兜底分支两处').toBeGreaterThanOrEqual(2)
+      // ⚠️ 锁定分支那一处必须**在** `if (picked.kind === 'locked')` 与紧随的
+      // `throw plan.lockedError` **之间** —— 放到 throw 之后就成了死代码
+      //（永远执行不到），而数量断言对这种事完全无感。
+      const lockedAt = resolverCode.indexOf("if (picked.kind === 'locked')")
+      expect(lockedAt, '锁定分支没找到').toBeGreaterThan(-1)
+      const lockedThrowAt = resolverCode.indexOf('throw plan.lockedError', lockedAt)
+      const lockedCallAt = resolverCode.indexOf('throwIfAllRateLimited?.(', lockedAt)
+      expect(lockedCallAt, '锁定分支里应有一处限流判定').toBeGreaterThan(-1)
+      expect(lockedCallAt, '锁定分支的限流判定必须排在 throw plan.lockedError **之前**')
+        .toBeLessThan(lockedThrowAt)
+      // 且必须带 `candidates.length === 0` 守卫：候选非空时余额分档已经跑过，
+      // 此时再判限流会把「凭据全坏」误报成「限流」（有用例锁死）。
+      expect(resolverCode.slice(lockedAt, lockedThrowAt)).toContain('candidates.length === 0')
     })
 
     it('助手的 product 参数只要求 id / displayName（cline 与 buddy 是两个类型）', () => {
