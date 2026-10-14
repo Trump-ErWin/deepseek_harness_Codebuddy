@@ -68,6 +68,44 @@
 - LLM provider 通过 `ctx.llm.registerProvider()` 注册
 - 命令通过 `ctx.commands.register()` 注册
 - 插件配置通过 `ctx.schema` 在 profile layer 栈中声明
+
+## ⚠️ 渠道原生搜索（`src/web-native.ts`）
+
+buddy 系渠道（`buddy` / `workbuddy`）的官方 `web_search` / `web_fetch` 改走**渠道自带
+的搜索后端**（`POST {endpoint}/agenttool/v1/search` 与 `/agenttool/v1/webfetch`），
+其余渠道一律 `next()` 放行 —— **不路由、不回退**，官方链路逐字节不变。
+
+Jet Hub 页头有总开关（`nativeWebSearchEnabled`，缺键默认启用）：关掉即**所有渠道**
+（含 buddy 系）回官方搜索，此时 buddy 渠道报 `DEEPSEEK_API_KEY` 缺失属**预期**。
+
+### 动它之前必须知道的五条
+
+1. **`tools/execute` 是 cordis waterfall**：不调 `next()` 即短路，返回值**必须**是
+   `{ value }` 形状（返回 `undefined` 会让宿主在 `normalizeDispatchResult` 里抛
+   `TypeError`）。短路经 `createSuccessResult(exec, 原工具, value)` 用**原工具自己的**
+   output 契约渲染。
+2. **短路会跳过官方入参校验**：官方 schema 校验在 `defineTool` 包装的 `execute`
+   **内部**，短路后根本不执行 ⇒ 参数判据必须在这里自己复刻（见 `readQueries`）。
+3. **总开关必须每次现读**：`index.ts` 传的是 `() => pool.nativeWebSearchEnabled()`
+   这个**函数**，不是布尔快照。改成快照会让「关→开」热切换失效（必须重启）。
+4. **输出投影贴合官方 schema**：`sources[{url,title?,snippet?}]`（`url` 必填、
+   `additionalProperties: false`）、`body.kind` 固定 `'text'` —— 上游 `content`
+   已是 Markdown，标 `html` 会被官方**二次 turndown** 破坏内容。
+5. **凭据必须与聊天链路同源**：经 `BuddyAdapter.resolveCredentialFor` 复用**同一个**
+   `resolveCredential` 实例；另建一份会让「enabled / 模型级限流 / 免费判定 /
+   余额分档 / 池兜底 / 账本回报」六步在两条链路上漂移。
+
+### 实测边界（2026-10-14 真机）
+
+- 两个 host（`copilot.tencent.com` / `www.workbuddy.ai`）行为一致；
+  `max_results` 完全生效：**1/3/5/8 原样返回、>8 封顶 8**；
+- ✅ 已验证：buddy / workbuddy 搜索通、qoder 等正确放行、开关热切换无需重启；
+- ⚠️ **未验证**：本监听器在 `tools/execute` 链中的**位置**（决定外层超时策略是否
+  生效）、宿主升级后 `requestHeader()` 在工具执行时**是否已就绪**。
+
+研究记录见 `docs/workbuddy-native-search-research.md`（含端点探测、请求头最小集、
+与 DeepSeek 官方搜索的架构差异）。
+
 ## 工作方式
 
 ### ⚠️ 子任务优先用 **inline** 执行，不要新开 subagent
