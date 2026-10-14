@@ -21,6 +21,9 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import { OfficeAceAdapter } from '../../src/officeace-adapter.js'
 import { OFFICEACE_MODELS } from '../../src/officeace-product.js'
 
@@ -154,5 +157,156 @@ describe('OfficeAce 图片输入', () => {
     const messages = captured?.messages as Array<{ role: string; content: unknown }>
     const user = messages.find((m) => m.role === 'user')
     expect(user?.content).toBe('你好')
+  })
+})
+
+/**
+ * Issue IKLSB8（2026-10-14 真机报障）：**`tool-result` 内层图片被静默丢弃，
+ * 且工具结果降级为字面量 `(no output)`**。
+ *
+ * ## 缺陷成因（两道后果同时发生）
+ *
+ * `serializeMessages(options.messages)` **只传了 1 个实参**，而第二参是图片字节
+ * 映射。缺了它：① 共享实现里 `imageUrls === undefined` 那一段整节跳过 ⇒ 内层图
+ * 根本没有腿去读；② 图片型工具结果被 `contentToText` 压成空串 ⇒ 落到
+ * `'(no output)'` 兜底 ⇒ 模型收到「工具没有任何输出」。
+ *
+ * ⚠️ 喂给模型的是**字面量**「没有输出」这一点尤其有害：界面表现为模型说
+ * 「Read 没有返回内容 / gave no output」，用户据此以为模型没有视觉能力，
+ * 而真实原因是「有输出，输出是图」。
+ *
+ * ## 为什么这些用例是**判别性**的（不是同义反复）
+ *
+ * | 用例 | 变异后变红的方式 |
+ * |---|---|
+ * | A | `serializeMessages(msg)` 退回单参 ⇒ 内层图消失 |
+ * | B | 注图循环若改回「按 user 顺序一一对应」⇒ 图被注到**前一条**文本消息上 |
+ * | C | 共享实现的 `joined.length > 0 ? joined : TEXT` 退回 `if (joined.length>0)` ⇒ 回到 `(no output)` |
+ *
+ * ⚠️ B 的输入**刻意**含一条「只含工具结果」的 user 消息（真实 Claude Code
+ * 形状）：`wireMessages` 与 `options.messages` 的 user **数量并不相等**
+ * （工具结果展开成 `role:'tool'`），旧补偿循环正是在这里错位。
+ */
+describe('OfficeAce 工具结果内嵌图片（Issue IKLSB8）', () => {
+  /** 真实 Claude Code 形态：图在 `tool-result.content` 内层，提问在同一条 user 消息里。 */
+  function nestedToolResultImage(model: string) {
+    return {
+      model,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '看图' }] },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: '我看看' },
+            { type: 'tool-call', id: 'c1', name: 'Read', arguments: '{}' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool-result', toolCallId: 'c1', isError: false,
+              content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }],
+            },
+            { type: 'text', text: '图里是什么？' },
+          ],
+        },
+      ],
+    }
+  }
+
+  it('A（判别）tool-result 内层图片必须进请求（原始缺陷：图片字节根本没上 wire）', async () => {
+    let captured: Record<string, unknown> | undefined
+    const adapter = makeAdapter((b) => { captured = b as Record<string, unknown> })
+    await drain(adapter.stream(nestedToolResultImage('deepseek-v4.1-flash') as never))
+
+    const wire = JSON.stringify(captured?.messages)
+    expect(wire, '内层图片没有上 wire ⇒ 模型完全看不到图（原始缺陷复现）').toContain('"image_url"')
+    expect(wire).toContain('data:image/png;base64,')
+  })
+
+  it('B（判别）图必须与提问同一条 user 消息，且**不得**错注到前一条文本上', async () => {
+    let captured: Record<string, unknown> | undefined
+    const adapter = makeAdapter((b) => { captured = b as Record<string, unknown> })
+    await drain(adapter.stream(nestedToolResultImage('deepseek-v4.1-flash') as never))
+
+    const messages = captured?.messages as Array<{ role: string; content: unknown }>
+    // 带图的那条 user 必须同时带提问正文（`0dd27ca` 的阶段结论：图与问同条才可见）。
+    const withImage = messages.filter((m) => m.role === 'user'
+      && JSON.stringify(m.content).includes('image_url'))
+    expect(withImage, '带图 user 消息条数不为 1 ⇒ 图被注到了别处').toHaveLength(1)
+    expect(
+      JSON.stringify(withImage[0]!.content),
+      '图与提问不在同一条 user 消息 ⇒ 上游会让模型看不见图（issue IKLIFH 同型）',
+    ).toContain('图里是什么？')
+    // 第一条 user（"看图"）**必须**保持纯文本：旧实现把图注到这里，带图那条反而没图。
+    const first = messages.find((m) => m.role === 'user')!
+    expect(
+      JSON.stringify(first.content),
+      '图被错注到**前一条**纯文本 user 上（旧的按顺序配对实现即此症状）',
+    ).not.toContain('image_url')
+  })
+
+  it('C（判别）纯图片工具结果不得被压成字面量 `(no output)`', async () => {
+    let captured: Record<string, unknown> | undefined
+    const adapter = makeAdapter((b) => { captured = b as Record<string, unknown> })
+    await drain(adapter.stream(nestedToolResultImage('deepseek-v4.1-flash') as never))
+
+    const messages = captured?.messages as Array<{ role: string; content: unknown }>
+    const tool = messages.find((m) => m.role === 'tool')!
+    expect(tool, '工具结果没有下发 ⇒ 工具调用与结果脱节').toBeDefined()
+    // 判据是**内容说清了「输出在这里、只是它是图」**，而不是「没有输出」。
+    expect(
+      String(tool.content),
+      '工具结果退化成 `(no output)` ⇒ 模型会说「Read 没有返回内容」，用户误判成模型没有视觉能力',
+    ).not.toBe('(no output)')
+    expect(String(tool.content), '至少要让模型知道「这是工具结果附带的图片」').toMatch(/image/i)
+  })
+
+  it('D（对照）内层图 + 正文时，正文照旧保留（有图不得吞掉同一结果里的文字）', async () => {
+    let captured: Record<string, unknown> | undefined
+    const adapter = makeAdapter((b) => { captured = b as Record<string, unknown> })
+    await drain(adapter.stream({
+      model: 'deepseek-v4.1-flash',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '看图' }] },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'Read', arguments: '{}' }],
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool-result', toolCallId: 'c1', isError: false,
+              content: [
+                { type: 'text', text: '截图如下' },
+                { type: 'image', attachment: { attachmentId: 'att-1' } },
+              ],
+            },
+            { type: 'text', text: '图里是什么？' },
+          ],
+        },
+      ],
+    } as never))
+
+    const messages = captured?.messages as Array<{ role: string; content: unknown }>
+    const tool = messages.find((m) => m.role === 'tool')!
+    expect(String(tool.content), '工具结果自带的正文被吞掉').toContain('截图如下')
+    expect(JSON.stringify(captured?.messages)).toContain('image_url')
+  })
+
+  it('E（接线）适配器必须把 imageUrls 交给共享序列化（源码级判据）', () => {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const src = readFileSync(join(here, '../../src/officeace-adapter.ts'), 'utf8')
+    expect(
+      src,
+      '`serializeMessages(options.messages)` 单参调用 = 图片通路整体关闭（本 issue 的根因）',
+    ).toMatch(/serializeMessages\(options\.messages, imageUrls\)/)
+    // ⚠️ 反向：不得再自己维护第二套注图实现（它够不到 tool-result 内层、且索引会错位）。
+    expect(
+      src,
+      '不得再出现第二套「按 user 顺序一一对应」的注图循环（收集与注入必须同源同深度）',
+    ).not.toMatch(/originalUsers/)
   })
 })

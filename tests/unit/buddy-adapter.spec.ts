@@ -946,6 +946,53 @@ describe('BuddyAdapter', () => {
       expect(parts.some((p) => p.text?.includes('这页写了什么')), '提问不得与图分处两条').toBe(true)
     })
 
+    /**
+     * ⚠️⚠️ Issue IKLSB8：**纯图片型工具结果不得被压成字面量 `(no output)`**。
+     *
+     * 工具结果里**只有图片、没有任何文本**时，`contentToText` 返回空串 ⇒ 落到
+     * `|| '(no output)'` 兜底 ⇒ 模型收到的是「工具没有任何输出」，于是答
+     * 「Read 没有返回内容 / gave no output」——用户据此以为模型没有视觉能力，
+     * 而真实原因是「有输出，输出是图」。Claude Code 的
+     * `tool_result.content=[{type:'image'}]` 恰是这一形状。
+     *
+     * ⚠️ 判据必须是「内容说清了『输出在这里、只是它是图』」：只断言
+     * 「不是 `(no output)`」是弱断言 —— 换成任意占位串都会绿。
+     */
+    it('⚠️⚠️ 纯图片工具结果不得写成 `(no output)`（Issue IKLSB8）', async () => {
+      const { adapter, body } = adapterCapturing()
+      await collectChunks(adapter, {
+        model: 'hy4-preview',
+        messages: [
+          {
+            role: 'assistant',
+            content: [{ type: 'tool-call', id: 'tc1', name: 'read_image', arguments: '{}' }],
+          },
+          {
+            role: 'tool',
+            toolCallId: 'tc1',
+            // 刻意**只有图片**（Claude Code 的真实形状，也是本 issue 的现场）。
+            content: [{ type: 'image', attachment: { attachmentId: IMAGE_ID } }],
+          },
+          { role: 'user', content: '这页写了什么？' },
+        ] as never,
+        signal: new AbortController().signal,
+      } as never)
+
+      const messages = (body().messages as Array<Record<string, unknown>>)
+      const tool = messages.find((m) => m.role === 'tool')!
+      expect(tool, '工具结果必须下发').toBeDefined()
+      expect(
+        String(tool.content),
+        '纯图片工具结果退化成 `(no output)` ⇒ 模型答「没有返回内容」，用户误判成模型没有视觉能力',
+      ).not.toBe('(no output)')
+      expect(
+        String(tool.content),
+        '至少要说明「输出在这里、只是它是图片」，否则模型无法解释为何没有文本',
+      ).toMatch(/image/i)
+      // 图片本体照旧必须真的上 wire（不得因为改了正文兜底而丢图）。
+      expect(JSON.stringify(messages)).toContain('image_url')
+    })
+
     it('无挂图时不凭空多发 user 消息（纯文本形态逐字节不变）', async () => {
       const { adapter, body } = adapterCapturing()
       await collectChunks(adapter, {

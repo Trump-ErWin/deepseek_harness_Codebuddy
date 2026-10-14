@@ -897,6 +897,60 @@ describe('LobsteraiAdapter 错误处理', () => {
   })
 
   /**
+   * ⚠️⚠️ Issue IKLSB8：**纯图片型工具结果不得被压成字面量 `(no output)`**。
+   *
+   * 这是 `role:'tool'` 的 content 兜底那一格。工具结果里**只有图片**时
+   * `contentToText` 返回空串 ⇒ 落到 `|| '(no output)'` ⇒ 模型被告知
+   * 「工具没有任何输出」，于是答「Read 没有返回内容 / gave no output」，
+   * 用户据此以为模型没有视觉能力 —— 而真实原因是「有输出，输出是图」。
+   *
+   * 判据必须是「内容说清了『输出在这里、只是它是图』」，而不是「不是
+   * `(no output)`」这种弱断言：断言写弱了，把文本换成任意占位串都会绿。
+   */
+  it('⚠️⚠️ 纯图片工具结果不得写成 `(no output)`（Issue IKLSB8）', async () => {
+    const { adapter, calls } = makeAdapter(() => textSse('hi'), {
+      fetchRemoteModels: async () => [{ id: 'glm-5.2', name: 'GLM-5.2', supportsImage: true }],
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+    })
+    const options = generateOptions({
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 't1', name: 'read_image', arguments: '{}' }],
+        },
+        createUserMessage({
+          content: [{
+            type: 'tool-result',
+            toolCallId: 't1',
+            // ⚠️ 刻意**只有图片、没有任何文本** —— 这正是 Claude Code 的
+            // `tool_result.content=[{type:'image'}]` 形状，也是本 issue 的现场。
+            content: [{ type: 'image', attachment: { attachmentId: 'a1' } }],
+          }],
+          source: { kind: 'user' },
+        }),
+        createUserMessage({
+          content: [{ type: 'text', text: '这页写了什么？' }],
+          source: { kind: 'user' },
+        }),
+      ],
+    } as never)
+    await collect(options, adapter)
+    const body = JSON.parse(String(calls[0]!.init?.body)) as { messages: Array<Record<string, unknown>> }
+    const tool = body.messages.find((m) => m.role === 'tool')!
+    expect(tool, '工具结果必须下发').toBeDefined()
+    expect(
+      String(tool.content),
+      '纯图片工具结果退化成 `(no output)` ⇒ 模型会说「没有返回内容」，用户误判成模型没有视觉能力',
+    ).not.toBe('(no output)')
+    expect(
+      String(tool.content),
+      '至少要说明「输出在这里、只是它是图片」（否则模型无法解释为何没有文本）',
+    ).toMatch(/image/i)
+    // 图片本体照旧必须真的上 wire（不得因为改了正文兜底而丢掉图）。
+    expect(JSON.stringify(body.messages)).toContain('image_url')
+  })
+
+  /**
    * ⚠️ 反向验证的另一半：无图时**不得**凭空多出一条 user 消息。
    * 修法把纯文本路径也交给了 `flushToolImages`，若它对「无挂图」也发消息，
    * 每轮纯文本对话都会多一条空 parts 消息（实测上游报 `model_param_invalid`）。
