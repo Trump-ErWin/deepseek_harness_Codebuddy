@@ -745,10 +745,13 @@ describe('LobsteraiAdapter 错误处理', () => {
     await collect(options, adapter)
     const body = JSON.parse(String(calls[0]!.init?.body)) as { messages: Array<Record<string, unknown>> }
     const user = body.messages.find((m) => m.role === 'user')!
-    expect(user.content).toEqual([
-      { type: 'text', text: '看图' },
-      { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
-    ])
+    // ⚠️ **不按 parts 顺序断言**（issue IKLIFH 的 `0dd27ca` 起顺序为「图在前」）：
+    // 两种顺序上游都能看到，而按顺序写死会让实现一改顺序就假失败。
+    // 这里分别断言「两种块都在」与「文本内容正确」，顺序无关。
+    const parts = user.content as Array<Record<string, unknown>>
+    expect(parts).toHaveLength(2)
+    expect(parts).toContainEqual({ type: 'text', text: '看图' })
+    expect(parts).toContainEqual({ type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } })
   })
 
   it('模型支持图片但附件服务不可用时报错（而非静默丢图）', async () => {

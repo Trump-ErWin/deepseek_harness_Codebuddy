@@ -536,10 +536,27 @@ function serializeMessages(
     // 「看不见」（实测 hy4-preview 与 deepseek-v4-flash 均答「图像已被过滤」，
     // 而两者远端都是 `supportsImages: true`）。明细见 flushToolImages 的表。
     //
-    // ⚠️ 含工具结果时**整条延后**：OpenAI 兼容协议要求 tool 消息**紧跟**其
-    // assistant `tool_calls`，中间插任何 user 消息都会 400（trae 上游对应
+    // ⚠️⚠️ **延后判据必须看「有没有挂图」，不能只看「本条有没有工具结果」**
+    // （2026-10-14 修复）。原实现 `const deferred = toolResults.length > 0`
+    // 在「tool 结果 → 一条无工具结果的 user（『好的』）→ 真正的提问」这一
+    // 真实序列上判错：那中间条把 `pendingToolImages` 与 `pendingOwnParts`
+    // **一起 flush 掉并单独发出**，真正的提问随后成了**纯字符串** user 消息
+    // ⇒ 图与问重新分处两条，**恰好复现 IKLIFH 本次要消灭的形态**。
+    //
+    // 触发前提：工具结果后跟**多于一条** user 消息。实测 wire（hy4-preview）：
+    //   修复前 [3]=user `image_url+text(好的)`、[4]=user `"这页写了什么？"`
+    //   修复后 [3]=user `image_url+text(好的)+text(这页写了什么？)`（同一条）
+    //
+    // ⚠️ 含工具结果时**整条延后**这条不变：OpenAI 兼容协议要求 tool 消息**紧跟**
+    // 其 assistant `tool_calls`，中间插任何 user 消息都会 400（trae 上游对应
     // `code=4027`，回归见 `trae-adapter.spec.ts`）。与 trae 的 `deferred` 同型。
+    //
+    // ⚠️ 「有挂图」还必须覆盖「历史上一条延后的正文」：那种情况下
+    // `pendingOwnParts` 非空而 `pendingToolImages` 已空，若只看后者就会把
+    // 正文提前发出、同样与后续提问分处两条。
     const deferred = toolResults.length > 0
+      || pendingToolImages.length > 0
+      || pendingOwnParts !== undefined
     // ⚠️ 本条同时是上一条延后内容的「搭车机会」：`pendingOwnParts` 里的正文
     // 必须与本条内容、挂起图片**一起**发出一条，否则那份正文与提问分处两条。
     //
@@ -547,7 +564,13 @@ function serializeMessages(
     // 包装成 `[{type:'text',…}]` 发出去，上游会以 `model_param_invalid` 400
     // 拒收整个请求（实测）。故这里只在**确实有挂图**或本条本身有图时才用
     // parts，纯文本一律传 `undefined` 走字符串分支。
-    const combined: Array<Record<string, unknown>> | undefined = pendingToolImages.length > 0 || parts !== undefined
+    //
+    // ⚠️ 三个条件缺一不可（2026-10-14）：前两个覆盖「图还在排队」，
+    // **第三个覆盖「图已随上一条发出、但还有正文没走」** —— 那种情况下
+    // `pendingOwnParts` 非空而 `pendingToolImages` 已空，只看前两个会让本条
+    // 正文被提前单独发出、同样与提问分处两条。
+    const combined: Array<Record<string, unknown>> | undefined =
+      pendingToolImages.length > 0 || parts !== undefined || pendingOwnParts !== undefined
       ? [
         ...(pendingOwnParts ?? []),
         ...(parts ?? (text.length > 0 ? [{ type: 'text', text }] : [])),
@@ -555,6 +578,8 @@ function serializeMessages(
       : undefined
     pendingOwnParts = undefined
     if (deferred) {
+      // ⚠️ `combined` 已含本条内容，直接沿用即可；仅当它是 undefined 而本条有
+      // 正文时（无图、无上一条延后内容）才需要把本条正文兜进来。
       pendingOwnParts = combined ?? (text.length > 0 ? [{ type: 'text', text }] : undefined)
     } else if (combined !== undefined || toolResults.length === 0) {
       // ⚠️ 核心修复：挂起图片与本条内容**同一条**发出，而非让图片单独成一条。
