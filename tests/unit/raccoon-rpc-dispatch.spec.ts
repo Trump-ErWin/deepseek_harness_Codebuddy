@@ -204,9 +204,18 @@ describe('Raccoon 的 RPC 分派', () => {
   it('account.create 的失败路径都删除占位条目（不留幽灵账号）', () => {
     const createStart = rpcSource.indexOf('provider === RACCOON.id')
     const branch = rpcSource.slice(createStart, createStart + 3000)
-    // startLogin 抛错 + 后台 catch 各一处
-    const removals = branch.match(/pool\.removeAccount\(id\)/g)
-    expect(removals?.length, '两处失败路径都应删占位条目').toBeGreaterThanOrEqual(2)
+    /**
+     * ⚠️ 2026-10-14 改（Gitee issue IKLI7J）：后台 catch 原先自己写
+     * `pool.removeAccount(id)`，现统一走 `failLogin(id, error)` —— 它**同时**
+     * 做两件事：记登录终态失败（供 `login.poll` 报给前端）+ 删占位条目。
+     * ⇒ 两条腿必须分开断言：只数 `pool.removeAccount(id)` 会把后台那条判成
+     * 「漏删」而假红；反过来只看 `failLogin` 又会漏掉同步抛错那条。
+     */
+    // ① 同步路径：`startLogin` 抛错 → 删条目后 throw（客户端立刻看到错误）
+    expect(branch, 'startLogin 抛错路径必须删占位条目').toContain('pool.removeAccount(id)')
+    // ② 异步路径：后台 catch → 共享收尾（删条目 + 记终态原因）
+    expect(branch, '后台失败路径必须走 failLogin（删条目 + 记终态原因）')
+      .toMatch(/failLogin\(id,\s*error\)/)
   })
 
   it('account.create 回填 refreshable（raccoon 有 refresh 端点）', () => {
