@@ -71,9 +71,26 @@
 
 ## ⚠️ 渠道原生搜索（`src/web-native.ts`）
 
-buddy 系渠道（`buddy` / `workbuddy`）的官方 `web_search` / `web_fetch` 改走**渠道自带
-的搜索后端**（`POST {endpoint}/agenttool/v1/search` 与 `/agenttool/v1/webfetch`），
-其余渠道一律 `next()` 放行 —— **不路由、不回退**，官方链路逐字节不变。
+buddy 系渠道（`buddy` / `workbuddy`）的官方 **`web_search`** 改走**渠道自带的
+搜索后端**（`POST {endpoint}/agenttool/v1/search`），其余渠道一律 `next()` 放行
+—— **不路由、不回退**，官方链路逐字节不变。
+
+### ⚠️ 只管 `web_search`，**刻意不管** `web_fetch`（2026-10-14 修正）
+
+本模块早期**同时**接管过 `web_fetch`（`/agenttool/v1/webfetch`），那是**净损失**，
+现已整体剔除。**不要加回来**。理由三条（均有实测）：
+
+1. **官方 fetch 根本不需要凭据**：宿主 `cordis.yml` 里 `web.fetchProvider: http`
+   → `@deepseek-ai/dsh-web-fetch-http`，官方文档原话「**不发送凭据**」，零配置、
+   自带 SSRF 防护与明确响应上限（5 MB / 100k 字符）。实测：删掉 `DEEPSEEK_API_KEY`
+   后它照样 200。⇒ 接管它**没有换来任何能力**（search 不同 —— 官方**要** key）。
+2. **复杂表格塌陷**：同一份 `api-docs.deepseek.com/.../pricing` 页面，官方保留
+   `| a | b |` 行列结构；腾讯原生把整表挤成一行 ⇒ 模型读不出「哪个数字对应哪个
+   模型」。而查文档/查价格恰是 fetch 最常被用的场景。
+3. **依赖账号有效**：账号过期时腾讯 fetch 直接失败；官方永远可用。
+
+（腾讯 fetch 确有独到之处：返回页面 `标题` 与多语言全文。但代价是表格结构丢失，
+ 用户 2026-10-14 权衡后决定撤回。守卫用例见 `web-native.spec.ts` 的「渠道判断」。）
 
 Jet Hub 页头有总开关（`nativeWebSearchEnabled`，缺键默认启用）：关掉即**所有渠道**
 （含 buddy 系）回官方搜索，此时 buddy 渠道报 `DEEPSEEK_API_KEY` 缺失属**预期**。
@@ -89,8 +106,8 @@ Jet Hub 页头有总开关（`nativeWebSearchEnabled`，缺键默认启用）：
 3. **总开关必须每次现读**：`index.ts` 传的是 `() => pool.nativeWebSearchEnabled()`
    这个**函数**，不是布尔快照。改成快照会让「关→开」热切换失效（必须重启）。
 4. **输出投影贴合官方 schema**：`sources[{url,title?,snippet?}]`（`url` 必填、
-   `additionalProperties: false`）、`body.kind` 固定 `'text'` —— 上游 `content`
-   已是 Markdown，标 `html` 会被官方**二次 turndown** 破坏内容。
+   `additionalProperties: false`）—— 多传字段会让 `createSuccessResult` 抛
+   `ToolOutputError`，整条调用失败（不是少一条结果）。
 5. **凭据必须与聊天链路同源**：经 `BuddyAdapter.resolveCredentialFor` 复用**同一个**
    `resolveCredential` 实例；另建一份会让「enabled / 模型级限流 / 免费判定 /
    余额分档 / 池兜底 / 账本回报」六步在两条链路上漂移。
@@ -100,6 +117,7 @@ Jet Hub 页头有总开关（`nativeWebSearchEnabled`，缺键默认启用）：
 - 两个 host（`copilot.tencent.com` / `www.workbuddy.ai`）行为一致；
   `max_results` 完全生效：**1/3/5/8 原样返回、>8 封顶 8**；
 - ✅ 已验证：buddy / workbuddy 搜索通、qoder 等正确放行、开关热切换无需重启；
+- ✅ 已验证：`web_fetch` 在任何渠道都走官方（开关开着时也不出现 `workbuddy fetch` 文案）；
 - ⚠️ **未验证**：本监听器在 `tools/execute` 链中的**位置**（决定外层超时策略是否
   生效）、宿主升级后 `requestHeader()` 在工具执行时**是否已就绪**。
 

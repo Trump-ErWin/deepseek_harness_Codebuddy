@@ -1,5 +1,5 @@
 /**
- * 让 DSH 官方的 `web_search` / `web_fetch` 在 **buddy 系渠道**下走腾讯原生后端。
+ * 让 DSH 官方的 `web_search` 在 **buddy 系渠道**下走腾讯原生后端。
  *
  * ## 这个模块解决什么
  *
@@ -9,8 +9,26 @@
  * 路由下搜索必然落到 API Key 路径，没有 key 就报
  * `WEB_PROVIDER_CREDENTIAL_MISSING`。
  *
- * 而腾讯客户端**自带**原生搜索（`/agenttool/v1/search` 与 `/agenttool/v1/webfetch`），
- * 与聊天同源、同账号。本模块把那两个端点接到官方工具上。
+ * 而腾讯客户端**自带**原生搜索（`/agenttool/v1/search`），与聊天同源、同账号。
+ * 本模块把那个端点接到官方工具上。
+ *
+ * ## ⚠️ 只管 `web_search`，**刻意不管** `web_fetch`（2026-10-14 修正）
+ *
+ * 本模块早期同时接管了 `web_fetch`（`/agenttool/v1/webfetch`），**那是净损失**，
+ * 现已整体剔除。理由（三条，均有实测依据）：
+ *
+ * 1. **官方 fetch 根本不需要凭据**：宿主 `cordis.yml` 里
+ *    `web.fetchProvider: http` → `@deepseek-ai/dsh-web-fetch-http`，官方文档原话
+ *    「**不发送凭据**」，零配置、自带 SSRF 防护与明确响应上限（5 MB / 100k 字符）。
+ *    实测：本机删掉 `DEEPSEEK_API_KEY` 后它照样 200。
+ *    ⇒ 接管它**没有换来任何能力**（不像 search —— 那个官方**要** key）。
+ * 2. **复杂表格塌陷**：同一份 `api-docs.deepseek.com/.../pricing` 页面，官方保留
+ *    `| a | b |` 的行列结构，腾讯原生把整表挤成一行 ⇒ 模型读不出「哪个数字对应
+ *    哪个模型」。而查文档/查价格恰是 fetch 最常被用的场景。
+ * 3. **依赖账号有效**：账号过期时腾讯 fetch 直接失败；官方永远可用。
+ *
+ * （腾讯 fetch 确有独到之处：返回页面 `标题` 与多语言全文。但代价是表格结构丢失，
+ *  用户 2026-10-14 权衡后决定撤回。）
  *
  * ## 设计约束（用户明确要求）
  *
@@ -69,7 +87,7 @@ interface ToolExecuteScope {
 
 /** `tools/execute` 事件里本模块用到的那部分 exec。 */
 export interface WebNativeToolExecution {
-  /** 工具名（`web_search` / `web_fetch`）。 */
+  /** 工具名（本模块只处理 `web_search`）。 */
   readonly name: string
   /**
    * 工具入参（**未经官方 schema 校验**）。
@@ -141,8 +159,6 @@ const UPSTREAM_TIMEOUT_MS = 20_000
 
 /** 官方 `web_search` 工具名。 */
 const WEB_SEARCH = 'web_search'
-/** 官方 `web_fetch` 工具名。 */
-const WEB_FETCH = 'web_fetch'
 
 /**
  * 原生搜索链路的失败。
@@ -189,27 +205,9 @@ interface NativeSearchResponse {
   results?: Array<{ title?: unknown; url?: unknown; snippet?: unknown } | null | unknown>
 }
 
-/** 上游 webfetch 响应的形状（只声明用到的字段）。 */
-interface NativeFetchResponse {
-  url?: unknown
-  title?: unknown
-  content?: unknown
-  content_length?: unknown
-  truncated?: unknown
-  status_code?: unknown
-}
-
 /** 官方 `web_search` 的 output value。 */
 interface WebSearchValue {
   sources: Array<{ url: string; title?: string; snippet?: string }>
-  truncated: boolean
-}
-
-/** 官方 `web_fetch` 的 output value。 */
-interface WebFetchValue {
-  url: string
-  statusCode: number
-  body: { kind: 'text'; content: string }
   truncated: boolean
 }
 
@@ -242,8 +240,15 @@ export function installWebNative(
     // 不是随手写的 `as any` —— 收窄后的接口就是本模块真正读写的全部字段。
     const toolScope = scope as unknown as ToolExecuteScope
     toolScope.on('tools/execute', async (exec, next) => {
-      // ① 只管官方这两个 web 工具，其余一概放行。
-      if (exec.name !== WEB_SEARCH && exec.name !== WEB_FETCH) return next()
+      // ① 只管官方 `web_search`，其余一概放行。
+      //
+      //    ⚠️ **刻意不管 `web_fetch`**（2026-10-14 修正，理由见模块头）：
+      //    官方 fetch 走 `web-fetch-http` 提供方（`fetchProvider: http`），
+      //    **不发送凭据**、零配置、自带 SSRF 防护与明确响应上限。接管它是净损失
+      //    —— 实测三点：复杂表格会塌成一行、依赖账号有效、且解决不了任何问题
+      //    （search 要接管是因为官方**要** API key，fetch 本来就不需要）。
+      //    ⇒ 任何渠道的 `web_fetch` 都走官方，我们不碰。
+      if (exec.name !== WEB_SEARCH) return next()
 
       // ② 总开关。关掉即**所有渠道**回官方搜索 —— 与「只做 buddy 系」不同，
       //    这一条对 buddy 系**也**生效（用户显式要求「要么都用原生要么都用官方」）。
@@ -275,12 +280,12 @@ export function installWebNative(
   })
 }
 
-/** 按工具名分发到 search / fetch。 */
+/** 解析凭据、校验可用性，然后调上游搜索。 */
 async function runNative(
   exec: WebNativeToolExecution,
   product: BuddyProduct,
   adapter: NativeSearchAdapter,
-): Promise<WebSearchValue | WebFetchValue> {
+): Promise<WebSearchValue> {
   const model = exec.agent?.session.requestHeader()?.config?.model
   // ⚠️ 与聊天链路同一个 `resolveCredential` 实例：筛号规则（enabled / 模型级
   //    限流 / 免费判定 / 余额分档 / 池兜底）因此完全一致。
@@ -301,7 +306,6 @@ async function runNative(
   }
 
   const args = asRecord(exec.arguments) ?? {}
-  if (exec.name === WEB_FETCH) return await nativeFetch(args, accessToken, product, exec.signal)
   return await nativeSearch(args, accessToken, product, exec.signal)
 }
 
@@ -390,7 +394,7 @@ async function searchOnce(
   // ⚠️ 响应体先过 `asRecord`：上游返回 JSON `null` 时直接读 `.results` 会抛
   //    `TypeError: Cannot read properties of null`（对抗性审查 F2），
   //    而我们想要的是「响应无法解析」这条业务错误。
-  const { json } = await postJson(endpoint, body, accessToken, product, signal, 'search')
+  const json = await postJson(endpoint, body, accessToken, product, signal)
   const results = (asRecord(json) as NativeSearchResponse | undefined)?.results
   if (!Array.isArray(results)) {
     throw new WebNativeError(
@@ -426,68 +430,13 @@ async function searchOnce(
 }
 
 /**
- * 调上游抓取并投影成官方 `web_fetch` 的 output value。
- *
- * ⚠️ **`body.kind` 固定 `'text'`**：上游返回的 `content` **已经是转好的
- * Markdown**（实测含 `**加粗**`、`[链接](…)`、`# 标题`），而官方 `renderBody`
- * 对 `kind: 'html'` 会**再过一遍 turndown** —— 标错会把 Markdown 当 HTML 二次
- * 转换，内容被破坏。故这里必须标 `text`（原样输出）。
- *
- * ⚠️ 官方 `web_fetch` 工具**只有 `url` 一个参数**（无 `prompt`），故请求体只发
- * `url`；上游接受 `{ url }` 这一形态（`prompt` 是可选的）。
- */
-async function nativeFetch(
-  args: Record<string, unknown>,
-  accessToken: string,
-  product: BuddyProduct,
-  signal: AbortSignal,
-): Promise<WebFetchValue> {
-  const url = typeof args.url === 'string' ? args.url.trim() : ''
-  if (url.length === 0) throw new WebNativeError('url must be a non-empty string', INVALID_ARGS_CODE)
-
-  const endpoint = `${product.endpoint}/agenttool/v1/webfetch`
-  const { json: rawJson, httpStatus } = await postJson(endpoint, { url }, accessToken, product, signal, 'fetch')
-  const json = (asRecord(rawJson) ?? {}) as NativeFetchResponse
-
-  // ⚠️ `content` 必须是字符串：非字符串时静默变 `''` 会让模型拿到「成功但空正文」，
-  //    且没有任何提示（对抗性审查 m5）。宁可报「响应无法解析」，让模型知道要换 URL。
-  if (typeof json.content !== 'string') {
-    throw new WebNativeError(
-      `${product.id} returned a fetch response without a string "content".\n\n`
-      + `The request used endpoint ${JSON.stringify(endpoint)}. `
-      + 'Expected { url, content, status_code }. The page may be unsupported or the upstream API changed.',
-      BAD_RESPONSE_CODE,
-    )
-  }
-
-  // ⚠️ `statusCode` 在官方 output schema 里是 **integer**（宿主 `json-schema.js`
-  //    用 `Number.isInteger` 判）。故：
-  //    - 非数字 / 非整数 → 回落到 **HTTP 响应本身的 status**（不是硬编码 200！）；
-  //    - 硬编码 200 会在上游返回错误页且不带 `status_code` 时，让模型误以为抓取成功
-  //      （对抗性审查 m3：实测 `{url, content:'Not Found'}` → 报 statusCode=200）；
-  //    - 浮点（如 200.5）会让 `createSuccessResult` 抛 `ToolOutputError`，整条调用失败
-  //      （对抗性审查 m4）。
-  const upstreamCode = Number.isInteger(json.status_code) ? (json.status_code as number) : undefined
-  const statusCode = upstreamCode ?? httpStatus
-
-  return {
-    url: typeof json.url === 'string' && json.url.length > 0 ? json.url : url,
-    statusCode,
-    body: { kind: 'text', content: json.content },
-    truncated: json.truncated === true,
-  }
-}
-
-/**
- * 发一次上游 POST 并解析 JSON。
+ * 发一次上游搜索 POST 并解析 JSON。
  *
  * 错误语义对齐官方：**直接抛**（工具层不包装，由宿主 `toolErrorResult` 统一转
  * `isError`），且文案带排障指引（端点、下一步动作、给模型的约束）。
  *
- * @param operation - 本次调用的动作名（`search` / `fetch`），只用于**错误文案**：
- *   两端点共用本函数，写死 "search" 会让抓取失败时归因误导（对抗性审查 Minor-1）。
- * @returns 解析后的 JSON 体，以及**上游 HTTP 状态**（后者供 fetch 在
- *   响应体缺 `status_code` 时回落 —— 绝不硬编码 200）。
+ * ⚠️ 文案里的动作名**写死 `search`** —— 本模块只管 `web_search`（2026-10-14
+ * 剔除了 `web_fetch` 接管，见模块头），故不再需要 `operation` 参数区分。
  */
 async function postJson(
   endpoint: string,
@@ -495,8 +444,7 @@ async function postJson(
   accessToken: string,
   product: BuddyProduct,
   signal: AbortSignal,
-  operation: 'search' | 'fetch',
-): Promise<{ json: unknown; httpStatus: number }> {
+): Promise<unknown> {
   const timeout = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
   const composed = AbortSignal.any([signal, timeout])
 
@@ -517,25 +465,25 @@ async function postJson(
     // 后者是本模块自己的预算用尽（`WEB_NATIVE_TIMEOUT`），都不是上游故障。
     if (signal.aborted) {
       throw new WebNativeError(
-        `${product.id} ${operation} aborted`,
+        `${product.id} search aborted`,
         'WEB_NATIVE_ABORTED',
         { cause: error },
       )
     }
     if (timeout.aborted) {
       throw new WebNativeError(
-        `${product.id} ${operation} timed out after ${UPSTREAM_TIMEOUT_MS}ms.\n\n`
+        `${product.id} search timed out after ${UPSTREAM_TIMEOUT_MS}ms.\n\n`
         + `The request used endpoint ${JSON.stringify(endpoint)}. `
-        + 'Web search/fetch uses the same account as chat but a separate endpoint. '
+        + 'Web search uses the same account as chat but a separate endpoint. '
         + 'Retry, or narrow the request; if it keeps timing out the endpoint or network may be unreachable.',
         TIMEOUT_CODE,
         { cause: error },
       )
     }
     throw new WebNativeError(
-      `${product.id} ${operation} request failed: ${errorMessage(error)}\n\n`
+      `${product.id} search request failed: ${errorMessage(error)}\n\n`
       + `The request used endpoint ${JSON.stringify(endpoint)}. `
-      + 'Web search/fetch uses the same account as chat but a separate endpoint. '
+      + 'Web search uses the same account as chat but a separate endpoint. '
       + 'If the network is unreachable or the endpoint is wrong, the user must decide how to proceed.',
       UPSTREAM_CODE,
       { cause: error },
@@ -545,9 +493,9 @@ async function postJson(
   if (!response.ok) {
     const detail = await readErrorDetail(response)
     throw new WebNativeError(
-      `${product.id} ${operation} request failed (HTTP ${response.status})${detail}\n\n`
+      `${product.id} search request failed (HTTP ${response.status})${detail}\n\n`
       + `The request used endpoint ${JSON.stringify(endpoint)}. `
-      + 'Web search/fetch uses the same account as chat but a separate endpoint. '
+      + 'Web search uses the same account as chat but a separate endpoint. '
       + "If the account's sign-in has expired, guide the user to sign in again from the Jet Hub panel; "
       + 'the endpoint does not need changing.',
       UPSTREAM_CODE,
@@ -556,7 +504,7 @@ async function postJson(
 
   try {
     const json: unknown = await response.json()
-    return { json, httpStatus: response.status }
+    return json
   } catch (error) {
     throw new WebNativeError(
       `${product.id} returned a non-JSON response.\n\n`

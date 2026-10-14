@@ -6,12 +6,14 @@
  * 1. **渠道判断**：只有 `buddy` / `workbuddy` 走原生；其余一律 `next()` 放行。
  * 2. **短路形状**：命中时必须返回 `{ value }`（返回 `undefined` 会让模型拿到
  *    空结果 —— 实测确认）。
- * 3. **结果投影**：search 的 `results[]` → 官方 `sources[]`；fetch 的
- *    `content` → `body: { kind: 'text' }`（标 `html` 会被官方二次 turndown）。
+ * 3. **结果投影**：search 的 `results[]` → 官方 `sources[]`。
  * 4. **多 query 合并**：复刻官方「按 rank 轮转 + url 去重 + cap」。
  * 5. **选号一致性**：调适配器的 `resolveCredentialFor(model)`，且 `model`
  *    取自当前会话路由（吞掉会让搜索选到聊天链路不会选的号）。
  * 6. **错误语义**：直接抛，不自己包装（宿主 `toolErrorResult` 统一转 `isError`）。
+ * 7. ⚠️ **`web_fetch` 一律放行**：官方 fetch 走 `web-fetch-http`（`fetchProvider: http`），
+ *    **不发送凭据**、零配置、自带 SSRF 防护与明确响应上限。本模块早期接管过它，
+ *    2026-10-14 已整体剔除（实测是净损失，理由见 `web-native.ts` 模块头）。
  *
  * ## 测试策略
  *
@@ -141,6 +143,42 @@ function jsonResponse(body: unknown, status = 200): Response {
 // ───────────────────────── ① 渠道判断 ─────────────────────────
 
 describe('渠道判断：只做 buddy 系', () => {
+  it('⚠️ web_fetch 必须放行给官方（2026-10-14 决定：本模块不接管它）', async () => {
+    // ⚠️ 这是**已被推翻过一次的决策**：本模块早期同时实现了腾讯
+    //    `/agenttool/v1/webfetch`，2026-10-14 实测后整体剔除（是净损失，
+    //    理由见 web-native.ts 模块头）。这条守卫锁住「不再接管」，防止
+    //    将来有人顺手把它加回来 —— 加回来会让表格式页面的结构塌陷。
+    const { adapter } = makeAdapter()
+    const run = mount({ workbuddy: adapter })
+    const next = vi.fn(async () => ({ value: 'OFFICIAL-FETCH' }))
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const result = await run(
+        makeExec({ name: 'web_fetch', provider: 'workbuddy', args: { url: 'https://e.com/' } }),
+        next,
+      )
+      expect(next).toHaveBeenCalledTimes(1)
+      expect(result).toEqual({ value: 'OFFICIAL-FETCH' })
+      // 关键：一次上游请求都不该发
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('⚠️ web_fetch 在总开关开着时也必须放行（开关只管 web_search）', async () => {
+    const { adapter } = makeAdapter()
+    const run = mount({ workbuddy: adapter }, () => true)
+    const next = vi.fn(async () => ({ value: 'OFFICIAL-FETCH' }))
+    const result = await run(
+      makeExec({ name: 'web_fetch', provider: 'workbuddy', args: { url: 'https://e.com/' } }),
+      next,
+    )
+    expect(next).toHaveBeenCalledTimes(1)
+    expect(result).toEqual({ value: 'OFFICIAL-FETCH' })
+  })
+
   it('workbuddy 渠道命中，走原生（官方工具体不执行）', async () => {
     const { adapter } = makeAdapter()
     const run = mount({ workbuddy: adapter })
@@ -296,20 +334,6 @@ describe('请求形状：与客户端原生实现对齐', () => {
     }
   })
 
-  it('fetch 只发 { url }（官方 web_fetch 无 prompt 参数）', async () => {
-    const { adapter } = makeAdapter()
-    const run = mount({ workbuddy: adapter })
-    const fetchMock = vi.fn(async () => jsonResponse({ url: 'https://e.com/', content: 'hi', status_code: 200 }))
-    vi.stubGlobal('fetch', fetchMock)
-    try {
-      await run(makeExec({ name: 'web_fetch', provider: 'workbuddy', args: { url: 'https://e.com/' } }))
-      const [url, init] = fetchMock.mock.calls[0]! as unknown as [string, RequestInit]
-      expect(url).toBe('https://www.workbuddy.ai/agenttool/v1/webfetch')
-      expect(JSON.parse(String(init.body))).toEqual({ url: 'https://e.com/' })
-    } finally {
-      vi.unstubAllGlobals()
-    }
-  })
 })
 
 // ───────────────────────── ④ 结果投影 ─────────────────────────
@@ -377,50 +401,6 @@ describe('结果投影：search', () => {
     } finally {
       vi.unstubAllGlobals()
     }
-  })
-})
-
-describe('结果投影：fetch', () => {
-  it('⚠️ body.kind 恒为 text（标 html 会被官方二次 turndown 破坏 Markdown）', async () => {
-    const { adapter } = makeAdapter()
-    const run = mount({ workbuddy: adapter })
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({
-      url: 'https://e.com/', content: '**md**', status_code: 200, truncated: false,
-    })))
-    try {
-      const result = await run(makeExec({ name: 'web_fetch', provider: 'workbuddy', args: { url: 'https://e.com/' } }))
-      expect(result).toEqual({
-        value: {
-          url: 'https://e.com/',
-          statusCode: 200,
-          body: { kind: 'text', content: '**md**' },
-          truncated: false,
-        },
-      })
-    } finally {
-      vi.unstubAllGlobals()
-    }
-  })
-
-  it('上游 url 为空时回落到请求的 url', async () => {
-    const { adapter } = makeAdapter()
-    const run = mount({ workbuddy: adapter })
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ content: 'x', status_code: 200 })))
-    try {
-      const result = await run(makeExec({
-        name: 'web_fetch', provider: 'workbuddy', args: { url: 'https://asked.com/' },
-      })) as { value: { url: string } }
-      expect(result.value.url).toBe('https://asked.com/')
-    } finally {
-      vi.unstubAllGlobals()
-    }
-  })
-
-  it('url 为空串 → WEB_NATIVE_INVALID_ARGS', async () => {
-    const { adapter } = makeAdapter()
-    const run = mount({ workbuddy: adapter })
-    await expect(run(makeExec({ name: 'web_fetch', provider: 'workbuddy', args: { url: '  ' } })))
-      .rejects.toMatchObject({ code: 'WEB_NATIVE_INVALID_ARGS' })
   })
 })
 
@@ -752,71 +732,6 @@ describe('对抗性审查回归：畸形上游数据不得炸掉整条调用', (
       // 两个都发出去了，且 q2 被中止（裸 Promise.all 不会中止兄弟）
       expect(started).toContain('q2')
       expect(aborted).toContain('q2')
-    } finally {
-      vi.unstubAllGlobals()
-    }
-  })
-})
-
-describe('对抗性审查回归：fetch 响应字段的防御', () => {
-  it('⚠️ m5：content 非字符串时报「响应无法解析」，而不是静默空正文', async () => {
-    const { adapter } = makeAdapter()
-    const run = mount({ workbuddy: adapter })
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ url: 'https://e.com/', status_code: 200 })))
-    try {
-      await expect(run(makeExec({ name: 'web_fetch', provider: 'workbuddy', args: { url: 'https://e.com/' } })))
-        .rejects.toMatchObject({ code: 'WEB_NATIVE_BAD_RESPONSE' })
-    } finally {
-      vi.unstubAllGlobals()
-    }
-  })
-
-  it('⚠️ m4：status_code 为浮点数时回落到 HTTP 状态（官方 integer 判据会让整条调用失败）', async () => {
-    const { adapter } = makeAdapter()
-    const run = mount({ workbuddy: adapter })
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({
-      url: 'https://e.com/', content: 'x', status_code: 200.5,
-    })))
-    try {
-      const result = await run(makeExec({
-        name: 'web_fetch', provider: 'workbuddy', args: { url: 'https://e.com/' },
-      })) as { value: { statusCode: number } }
-      expect(Number.isInteger(result.value.statusCode)).toBe(true)
-      expect(result.value.statusCode).toBe(200)
-    } finally {
-      vi.unstubAllGlobals()
-    }
-  })
-
-  it('⚠️ m3：status_code 缺失时回落 HTTP 状态，不得伪造 200', async () => {
-    const { adapter } = makeAdapter()
-    const run = mount({ workbuddy: adapter })
-    // 上游 HTTP 200 但响应体不带 status_code ⇒ 回落 `response.status`(=200)，
-    // 而不是**硬编码** 200 —— 两者在这里数值相同，故另用一个可区分的场景：
-    // 见下一条（HTTP 200 与「上游声称的 status_code」不一致时以响应体为准）。
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ url: 'https://e.com/', content: 'x' })))
-    try {
-      const result = await run(makeExec({
-        name: 'web_fetch', provider: 'workbuddy', args: { url: 'https://e.com/' },
-      })) as { value: { statusCode: number } }
-      expect(result.value.statusCode).toBe(200)
-    } finally {
-      vi.unstubAllGlobals()
-    }
-  })
-
-  it('⚠️ m3：响应体给了 status_code 时以它为准（不被 HTTP 状态覆盖）', async () => {
-    const { adapter } = makeAdapter()
-    const run = mount({ workbuddy: adapter })
-    // HTTP 200，但上游说目标页面是 404 —— 应如实透传 404
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({
-      url: 'https://e.com/', content: 'Not Found', status_code: 404,
-    })))
-    try {
-      const result = await run(makeExec({
-        name: 'web_fetch', provider: 'workbuddy', args: { url: 'https://e.com/' },
-      })) as { value: { statusCode: number } }
-      expect(result.value.statusCode).toBe(404)
     } finally {
       vi.unstubAllGlobals()
     }
