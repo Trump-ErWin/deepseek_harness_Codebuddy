@@ -650,6 +650,12 @@ const STYLES = `
 .dim-jh-switch:focus-visible { outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 30%, transparent); }
 .dim-jh-switch:disabled { opacity: 0.5; cursor: default; }
 
+/* 「渠道原生搜索」开关（页头，取代原「关闭」按钮）。
+   white-space: nowrap 是必需的：页头按钮行不换行，而 label 内的文字
+   默认会在窄面板下折成两行，把整行高度撑开（与页头按钮同款约束）。
+   字号与 .dim-jh-btn 对齐，视觉上仍是「一排控件」的一部分。 */
+.dim-jh-nativeSearch { flex: none; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 13px; color: var(--dsw-alias-label-p, inherit); cursor: pointer; user-select: none; }
+
 /* ── 账号备份（导出 / 恢复）── */
 /* 口令输入框：宽度撑满弹窗内容区，避免在窄面板下挤坏布局。
    ⚠️ 背景必须用**真实存在**的 token。早期写的是 --dsw-alias-bg-input，而主题里

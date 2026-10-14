@@ -1023,6 +1023,29 @@ export class BuddyAdapter extends LlmAdapter {
   }
 
   /**
+   * 复用本适配器**同一套**选号编排解析凭据（供插件内部的原生搜索使用）。
+   *
+   * ## 为什么需要这个转发方法
+   *
+   * `options` 是构造器的 `private readonly`，插件其余模块（`web-native.ts`）
+   * 从外部读 `adapter.options.resolveCredential` 会**编译失败**（`strict: true`）。
+   * 而原生搜索**必须**与聊天链路用同一个 `resolveCredential` 实例 ——
+   * 另建一份会让「enabled 过滤 / 模型级限流 / 免费判定 / 余额分档 / 池兜底 /
+   * 账本回报」这六步在两条链路上漂移（见 `credential-resolver.ts` 的模块头）。
+   *
+   * 故这里只开一个**窄接口**：转发到同一个函数，不放松 `options` 的封装。
+   *
+   * ⚠️ `modelId` **必须透传**：它同时决定模型级限流过滤与免费判定，
+   * 吞掉会让搜索选到聊天链路不会选的号（例如正在限流期的号）。
+   *
+   * @param modelId - 本次请求的模型 id（取自当前会话路由）。
+   * @returns 选中账号的凭据；无可用账号时为 `undefined`。
+   */
+  async resolveCredentialFor(modelId: string | undefined): Promise<BuddyCredential | undefined> {
+    return await this.options.resolveCredential(modelId)
+  }
+
+  /**
    * 该模型此刻是否**免费**（消耗 0 积分）。
    *
    * ## 为什么需要它
