@@ -38,6 +38,7 @@ import { buildRaccoonNickname, registerJetHubRpc, type JetHubAuthLike } from './
 import { ALL_PRODUCTS, CODEBUDDY, WORKBUDDY } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { installLoopResume } from './loop-recovery.js'
+import { installWebNative } from './web-native.js'
 import {
   attachTokenLedgerStore,
   reportLedgerAccount,
@@ -3090,6 +3091,31 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // ⚠️ 它依赖 `agents` 服务，故内部用 `ctx.inject(['agents'], …)` 挂载：
   // 该服务缺席的 profile 里本功能整体不生效，不会让插件永久 pending。
   installLoopResume(ctx)
+  // 官方 `web_search` 在**支持原生搜索的渠道**下改走渠道自带后端
+  //（其余渠道 `next()` 放行，官方链路逐字节不变）。
+  //
+  // | 渠道 | 原生后端 |
+  // |---|---|
+  // | buddy / workbuddy | 腾讯 `/agenttool/v1/search`（Bearer） |
+  // | qoder / qodercn | Qoder `/api/v1/webSearch/oneSearch`（WASM 签名） |
+  //
+  // ⚠️ 传**聊天链路用的那些适配器实例**：搜索与聊天因此共用同一个
+  // `resolveCredential`（enabled / 模型级限流 / 免费判定 / 余额分档 / 池兜底
+  // 六步完全一致，见 `web-native.ts` 模块头）。
+  // ⚠️ **不接管 `web_fetch`**：官方 fetch 走 `http` 提供方、不发送凭据、零配置，
+  // 接管它是净损失（2026-10-14 实测，理由见 `web-native.ts` 模块头）。
+  // ⚠️ 总开关传**函数**而不是布尔值：用户在 Jet Hub 面板里切换后必须立即生效，
+  // 不能被启动时的快照钉死。
+  installWebNative(
+    ctx,
+    {
+      buddy: buddyAdapter,
+      workbuddy: workbuddyAdapter,
+      qoder: qoderAdapter,
+      qodercn: qoderCnAdapter,
+    },
+    () => pool.nativeWebSearchEnabled(),
+  )
   ctx.provide('accountPool', pool)
   // ⚠️ 与 `registerJetHubRpc` 的 `auths.officeace` 是**同一个对象**
   //（理由见上面 `officeaceAuthService` 的注释：两处各建一个会让守卫用例的
