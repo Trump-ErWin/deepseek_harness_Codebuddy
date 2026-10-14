@@ -2653,6 +2653,68 @@ describe('AccountPool · setAccountsEnabled（供应商级批量启停）', () =
   })
 
   /**
+   * 「渠道原生搜索」总开关（PR95 审计补）。
+   *
+   * ⚠️ 本组的**存在理由**：本键加进来时只接了内存副本与 RPC，**两个持久化后端
+   * 都没接**（`load()` 既不读也不归一化、`SettingsStore.save()` 连写都不写），
+   * 于是用户关掉开关后**重启静默回到原生搜索**。上面那组网关用例逐条覆盖了
+   * 整条链，本键一条都没有 —— 加一个 `sanitizeXxx` 再给它写 7 条单测，
+   * 看上去「有覆盖」，其实真正该接的线一处没接。
+   *
+   * ⚠️ 判据必须是**跨实例读回**（与本节开头那条注释同因）：只断言同实例读回，
+   * 一个「没写磁盘」的实现照样骗过用例。
+   */
+  describe('渠道原生搜索总开关', () => {
+    it('默认启用（老用户升级后行为不变）', () => {
+      expect(new AccountPool(createMockContext() as never).nativeWebSearchEnabled()).toBe(true)
+    })
+
+    it('⚠️ 关闭后可读回，且跨实例落盘（关了就是关了）', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      expect(writer.nativeWebSearchEnabled()).toBe(true)
+      await writer.setNativeWebSearchEnabled(false)
+      expect(writer.nativeWebSearchEnabled()).toBe(false)
+
+      // 新实例从同一后端载入 —— 证明不是只改了内存副本。
+      expect(new AccountPool(seeded as never).nativeWebSearchEnabled()).toBe(false)
+    })
+
+    it('重新打开后可读回 true', async () => {
+      const seeded = createMockContext()
+      const pool = new AccountPool(seeded as never)
+      await pool.setNativeWebSearchEnabled(false)
+      await pool.setNativeWebSearchEnabled(true)
+      expect(pool.nativeWebSearchEnabled()).toBe(true)
+    })
+
+    it('⚠️ 改开关不得抹掉同一文档里的账号与黑名单', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const pool = new AccountPool(seeded as never)
+      await pool.setNativeWebSearchEnabled(false)
+
+      const raw = seeded.replacePayloads.at(-1) as
+        { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, unknown>; nativeWebSearchEnabled?: boolean }
+      expect(raw.accounts).toHaveLength(1)
+      expect(raw.disabledModels).toBeDefined()
+      expect(raw.nativeWebSearchEnabled).toBe(false)
+    })
+
+    it('⚠️ 另一次无关写入不得把已关闭的本开关抹回启用', async () => {
+      // 与拒绝表那个真实缺陷同型：`SettingsStore.save` 是整体替换白名单，
+      // 漏掉本键时任何一次账号/黑名单/顺序写入都会把它从文档里删掉。
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      await writer.setNativeWebSearchEnabled(false)
+      // 无关写入：不带本键（`ctx.cache` 里仍带着 false，由 queueStoreSave 快照带上）
+      const other = new AccountPool(seeded as never)
+      await other.setProviderOrder(['buddy'])
+
+      expect(new AccountPool(seeded as never).nativeWebSearchEnabled()).toBe(false)
+    })
+  })
+
+  /**
    * 账号入库的**观察点**（Gitee issue IKJOZB）。
    *
    * 该 issue 的根因是「冷启动空池 ⇒ 续期调度器不武装 ⇒ 之后登录的账号永不续期」。
