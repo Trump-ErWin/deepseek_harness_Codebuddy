@@ -129,12 +129,37 @@ async function drive(options: DriveOptions = {}): Promise<DriveResult> {
   return result
 }
 
-/** 取请求体里那条 user 消息的多模态 parts。 */
+/**
+ * 取请求体里那条 user 消息的多模态 parts。
+ *
+ * ⚠️ **按 role 找消息，不按索引**：新形态（issue IKLIFH，`0dd27ca`）把图片与
+ * 提问合并进**同一条** user 消息，且 parts 顺序为「图在前、文本在后」
+ * （`flushToolImages` 实测两种顺序都能被上游看到，故取「图在前」）。
+ * 早先这里返回 `[text, image]`、`[image, text]` 两种形态下都由调用方按
+ * **下标 `[1]`** 取图，于是新形态下取到文本 ⇒ `undefined`。
+ * ⚠️ 那是**断言与实现漂移**，不是实现缺陷：wire 上图片确实在（见下方
+ * `imageUrlOf` 的存在性断言）。
+ */
 function userParts(body?: Record<string, unknown>): Array<{ type: string; image_url?: { url: string } }> {
   const messages = (body?.messages ?? []) as Array<Record<string, unknown>>
   const user = messages.find((m) => m.role === 'user')
   return (user?.content ?? []) as Array<{ type: string; image_url?: { url: string } }>
 }
+
+/**
+ * 从 user 消息的 parts 里取出**第一张图片**的 data URL。
+ *
+ * ⚠️ **必须按 `type` 找，不得按下标**：parts 顺序不是契约（两种顺序上游都收），
+ * 按下标取会在顺序一变时静默取到文本 —— 那正是本次 5 条红灯的成因。
+ * @param parts - user 消息的 parts
+ * @returns 第一张图片的 data URL；没有图片时返回 undefined
+ */
+function imageUrlOf(parts: Array<{ type: string; image_url?: { url: string } }>): string | undefined {
+  return parts.find((part) => part.type === 'image_url')?.image_url?.url
+}
+
+/** ⚠️ 反向验证锚点：被 {@link imageUrlOf} 的调用点引用，不得删除。 */
+export const IMAGE_BUDGET_REVERSE_ANCHOR = true
 
 describe('fitImageToPixelBudget：按总像素预算求目标尺寸', () => {
   it('⚠️ 1721×997 的截图在默认预算下缩到 1051×608', () => {
@@ -200,7 +225,7 @@ describe('BuddyAdapter：发请求版本，拿不到时回退原图', () => {
       readImageRequest: async () => ({ data: new Uint8Array([9, 9]), mediaType: 'image/jpeg' }),
     })
 
-    expect(userParts(body)[1]?.image_url?.url).toBe('data:image/jpeg;base64,CQk=')
+    expect(imageUrlOf(userParts(body))).toBe('data:image/jpeg;base64,CQk=')
     expect(targets).toEqual([{ width: 1051, height: 608, maxBytes: REQUEST_IMAGE_MAX_BYTES }])
     expect(readImage, '有请求版本时不该再去读原图').not.toHaveBeenCalled()
   })
@@ -212,7 +237,7 @@ describe('BuddyAdapter：发请求版本，拿不到时回退原图', () => {
     })
     expect(error).toBeUndefined()
     expect(targets).toHaveLength(1)
-    expect(userParts(body)[1]?.image_url?.url).toBe('data:image/png;base64,AQID')
+    expect(imageUrlOf(userParts(body))).toBe('data:image/png;base64,AQID')
   })
 
   it('桥接抛错时也回退原图（缩放失败不该打死一次本来能成功的请求）', async () => {
@@ -226,7 +251,7 @@ describe('BuddyAdapter：发请求版本，拿不到时回退原图', () => {
     // **它没吞**的情形。适配器自己兜住并回退 —— 两层各自都要挡住，
     // 否则「加上了缩放」反而成为新的故障源。
     expect(error).toBeUndefined()
-    expect(userParts(body)[1]?.image_url?.url).toBe('data:image/png;base64,AQID')
+    expect(imageUrlOf(userParts(body))).toBe('data:image/png;base64,AQID')
   })
 
   it('未配置 readImageRequest 时保持既有行为（发原图）', async () => {
@@ -234,7 +259,7 @@ describe('BuddyAdapter：发请求版本，拿不到时回退原图', () => {
       readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
     })
     expect(targets).toEqual([])
-    expect(userParts(body)[1]?.image_url?.url).toBe('data:image/png;base64,AQID')
+    expect(imageUrlOf(userParts(body))).toBe('data:image/png;base64,AQID')
   })
 
   it('⚠️ 附件引用没有固有尺寸时不派生（宁可发原图也不瞎猜目标）', async () => {
@@ -246,7 +271,7 @@ describe('BuddyAdapter：发请求版本，拿不到时回退原图', () => {
     })
     expect(targets).toEqual([])
     expect(readImageRequest).not.toHaveBeenCalled()
-    expect(userParts(body)[1]?.image_url?.url).toBe('data:image/png;base64,AQID')
+    expect(imageUrlOf(userParts(body))).toBe('data:image/png;base64,AQID')
   })
 
   it('产品配置更小的预算时，适配器按产品的值派生', async () => {
