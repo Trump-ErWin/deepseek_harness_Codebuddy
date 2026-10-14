@@ -286,7 +286,18 @@ export function serializeMessages(
             .filter((part) => part.type === 'text')
             .map((part) => String(part.text))
             .join('')
-          if (joined.length > 0) resultText = joined
+          // ⚠️⚠️ **有图无文时绝不能落到 `(no output)`**（Issue IKLSB8，真实报障）。
+          //
+          // `resultParts !== undefined` 的含义是「该工具结果里有内容」，只是内容
+          // **不是文本**（全是图片）。原先这里只在 `joined` 非空时改写 `resultText`，
+          // 于是纯图片型工具结果保留了初值 `(no output)` —— 模型收到的是
+          // **「工具没有任何输出」**，于是回答「Read 没有返回内容 / gave no output」，
+          // 用户据此以为模型没有视觉能力；真实原因是「有输出，输出是图」。
+          //
+          // 判据必须用 `resultParts !== undefined`（**有内容**）而不是「有图」：
+          // `[image unavailable]` 占位符也走这条腿，它同样不是「没有输出」。
+          // 与 `trae-adapter.ts` / `accio-adapter.ts` 逐字同义（那两家早已如此兜底）。
+          resultText = joined.length > 0 ? joined : TOOL_RESULT_IMAGE_TEXT
         } else {
           resultText = contentToText(result.content) || '(no output)'
         }
