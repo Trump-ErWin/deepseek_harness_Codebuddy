@@ -5697,7 +5697,16 @@ function AggregatePanel({ rpcCall }) {
       '如何核查：展开任一模型，逐条看渠道与真实 modelId；不同意就关掉那一行。')));
 }
 
-export function JetHubPage({ close, rpcCall }) {
+/**
+ * Jet Hub 设置页根组件。
+ *
+ * ⚠️ 宿主对 `settings.section` 还会注入一个 `close`（契约
+ * `SettingsSectionOwnerProps`，是 section 收到的**唯一**一个 shell 能力）。
+ * 本页**刻意不接收**它：它原本只驱动页头那个「关闭」按钮，而该按钮已被
+ * 「渠道原生搜索」开关取代（关闭途径仍有设置面板右上角的 × 与点击空白处）。
+ * 将来若要做「从 Jet Hub 直接启动会话」，需要把它加回签名。
+ */
+export function JetHubPage({ rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
   const [version, setVersion] = React.useState(0);
@@ -6232,6 +6241,53 @@ export function JetHubPage({ close, rpcCall }) {
    */
   const providerSummary = providerToggleSummary(PROVIDERS, providerStatuses);
 
+  /**
+   * 「渠道原生搜索」总开关。
+   *
+   * 开 = 支持原生搜索的渠道（CodeBuddy / WorkBuddy）走自己后端的搜索接口；
+   * 关 = 所有渠道一律回官方 DeepSeek 搜索（需要 `DEEPSEEK_API_KEY`）。
+   *
+   * ⚠️ 与 `toggleGateway` 同取向：**不做乐观更新**。开关的实际效果由服务端
+   * 落盘值决定，本地先改会让界面显示「已关闭」而搜索其实还在走原生。
+   */
+  const [nativeSearchOn, setNativeSearchOn] = React.useState(true);
+  const [nativeSearchBusy, setNativeSearchBusy] = React.useState(false);
+  const [nativeSearchFailed, setNativeSearchFailed] = React.useState(false);
+
+  const loadNativeSearchStatus = React.useCallback(async () => {
+    try {
+      const res = await rpcCall('nativeSearch.getEnabled', {});
+      if (!mounted.current) return;
+      setNativeSearchOn(res?.enabled !== false);
+      setNativeSearchFailed(false);
+    } catch (caught) {
+      console.error('[jet-hub] load native search status failed:', caught);
+      if (!mounted.current) return;
+      // 降级为「默认开启」并标记读取失败：开关本身不可用，但不影响其余功能。
+      setNativeSearchOn(true);
+      setNativeSearchFailed(true);
+    }
+  }, [rpcCall]);
+
+  const toggleNativeSearch = React.useCallback(async (nextEnabled) => {
+    setNativeSearchBusy(true);
+    try {
+      const res = await rpcCall('nativeSearch.setEnabled', { enabled: nextEnabled });
+      if (!mounted.current) return;
+      setNativeSearchOn(res?.enabled !== false);
+      setNativeSearchFailed(false);
+    } catch (caught) {
+      console.error('[jet-hub] toggle native search failed:', caught);
+      if (!mounted.current) return;
+      // 保留原状态：重新拉一次以确保与服务端一致。
+      await loadNativeSearchStatus();
+    } finally {
+      if (mounted.current) setNativeSearchBusy(false);
+    }
+  }, [rpcCall, loadNativeSearchStatus]);
+
+  React.useEffect(() => { void loadNativeSearchStatus(); }, [loadNativeSearchStatus]);
+
   return React.createElement('section', { className: 'dim-jh-page', 'aria-label': 'Jet Hub Provider 设置' },
     // ⚠️ 页头左侧的「Jet Hub」标题块已**整块删除**（用户 2026-10-07 要求：
     // 标题只占宽度、不带任何操作，空间全给按钮行）。这里先后删过两样东西，
@@ -6303,10 +6359,31 @@ export function JetHubPage({ close, rpcCall }) {
             setShowTokenLedger(true);
           },
         }, 'Token 用量'),
-        close ? React.createElement('button', {
-          className: 'dim-jh-btn',
-          onClick: close,
-        }, '关闭') : null)),
+        // 「渠道原生搜索」总开关。**取代**了原先这里的「关闭」按钮 ——
+        // 关闭设置页仍有右上角 × 与点击空白处两条路径，而那个按钮与外壳的 ×
+        // 语义完全重复（用户 2026-10-14 决定）。
+        //
+        // 语义：开 = 支持原生搜索的渠道（CodeBuddy / WorkBuddy）走自己后端的
+        // 搜索接口；关 = 所有渠道一律回官方 DeepSeek 搜索（需要 API Key）。
+        React.createElement('label', {
+          className: 'dim-jh-nativeSearch',
+          title: (nativeSearchFailed
+            ? '⚠️ 开关状态读取失败，当前显示的是默认值（开启）。点击即可重新提交一次。'
+            : '渠道原生搜索：为支持原生搜索的渠道（CodeBuddy / WorkBuddy）启用其自带搜索。'
+              + '关闭后所有渠道都改用 DeepSeek 官方搜索（需要 DEEPSEEK_API_KEY）。'),
+        },
+          React.createElement('input', {
+            type: 'checkbox',
+            className: 'dim-jh-switch',
+            checked: nativeSearchOn,
+            // ⚠️ **只**因提交中而禁用：读取失败时不禁用 —— 那会让用户在
+            //    唯一一次读取抖动后**彻底失去**自救路径（连切换都点不动），
+            //    与网关面板「任何一个附属字段采集失败都不该把用户挡在关掉它
+            //    这条自救路径之外」同一取向。
+            disabled: nativeSearchBusy,
+            onChange: (event) => void toggleNativeSearch(event.target.checked),
+          }),
+          React.createElement('span', null, '渠道原生搜索')))),
     // 签到结果放在页头下方横跨整宽：页头是 flex 且不换行，塞进去会挤压按钮。
     // `flex: none` 是必需的 —— `dim-jh-page` 是 column flex 且 `dim-jh-layout`
     // 带 `flex: 1`，不锁住的话提示条会被压扁（与 modal 内同款做法）。
