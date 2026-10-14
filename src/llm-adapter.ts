@@ -28,6 +28,72 @@ import { reportLedgerAccount } from './token-ledger.js'
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
 export const PROVIDER = 'codearts'
 /**
+ * 本家**恒声明**的两档思考开关 —— 顺序即**强度序（弱 → 强）**（Issue IKLIDV）。
+ *
+ * ## 为什么顺序是「关闭 → 开启」
+ *
+ * DSH 的契约把该数组当作**展示顺序**
+ *（`dsh-llm/lib/types/types.d.ts` 原文：`Supported efforts in adapter-preferred
+ * display order`），而官方客户端**直接 `map`、不排序**
+ *（`dsh-client-ui-model-selection/lib/client.js` 的 `effortChoices`：
+ * `[…, ...reasoning.efforts.map(…)]`）。故任何「把档位数组铺成一条轴」的渲染
+ * —— 官方那个纵向 `menuitemradio` 列表、以及第三方横向滑条 —— 都直接吃这个顺序。
+ *
+ * 原实现写成 `['on','off']`（把默认档排在最前）。那个动机在**纵向列表**里成立，
+ * 一旦铺成**横向轴**就变成「左强右弱」：「开启」贴最左、「关闭」贴最右，
+ * 与「左弱右强」的直觉相反。
+ *
+ * 强度序的**唯一权威**是本仓库的 `reasoning-ladder.ts`
+ *（`REASONING_EFFORT_RANK`：`off: 0` / `on: 5`）⇒ `off` 必须在前。
+ * 三处旁证同向：
+ * - DSH 自家 `dsh-llm-deepseek` 声明 `[off, low, high, max]`；
+ * - DSH 自家 `dsh-llm-pi-ai` 的 `THINKING_LEVELS` 是
+ *   `[off, minimal, low, medium, high, xhigh, max]`；
+ * - 本仓库 `zcode-upstream.ts` 的 `orderReasoningLevels` **主动**把上游的
+ *   乱序（实测插入序 `low, max, high`）排成 `none → minimal → low → … → max`。
+ *
+ * ⚠️ **`defaultEffort` 与数组位置是两件事**：默认档由 {@link CODEARTS_DEFAULT_EFFORT}
+ * 单独表达，**不**靠「排在首位」。故本顺序的调整不改变任何默认行为。
+ *
+ * ⚠️ **本声明的顺序不参与任何语义判断**：关闭思考靠
+ * `thinkingOffEffortOf` 的 `.find(isThinkingOffEffort)`（按 rank 找，不按位置），
+ * `session-title` 那条路径也只用它当集合。
+ *
+ * ⚠️ **本常量是这两档的唯一定义处**：同一文件里原先写了**两份**逐字相同的
+ * 数组（已知模型的 `toCatalogEntry` 与未知模型的 `unknownModelReasoning`）——
+ * 那正是「一文件两套同义判据」的形态，改一处必漏另一处（用户手填模型 id 时会
+ * 看到与已知模型相反方向的档位轴）。现已收敛到这一份。
+ *
+ * ⚠️ 网关的 `openai_efforts` 是这份顺序的**机械投影**
+ *（`openai-gateway/effort-view.ts` 逐个 push `canonical`），故本顺序同时决定
+ * `/v1/models` 里那一列的可读性：升序 ⇒ `["none","high"]`。
+ */
+export const CODEARTS_REASONING_EFFORTS: readonly { id: ReturnType<typeof ReasoningEffortId>; name: string }[] =
+  Object.freeze([
+    { id: ReasoningEffortId('off'), name: '关闭' },
+    { id: ReasoningEffortId('on'), name: '开启' },
+  ])
+
+/**
+ * 默认思考档 = `开启`。
+ *
+ * 依据（实测 2026-09-29）：不传 `thinking` 与服务端默认等价，而服务端**默认就开着**
+ *（`{type:'enabled'}` 与不传的 `reasoning_tokens` 落在同一基线）⇒ 标成 `on`
+ * 是**如实描述**，不是我们强行改变行为。
+ *
+ * ⚠️ 必须落在 {@link CODEARTS_REASONING_EFFORTS} 内：DSH 在 `normalizeModelInfo`
+ * 里校验「`defaultEffort` 必须是被声明过的 id」，不在则抛 **`INVALID_MODEL_REASONING`**
+ *（整轮对话起不来）。
+ * ⚠️ 别与 `UNSUPPORTED_REASONING_EFFORT` 混淆 —— 那个码是**另一回事**：
+ * 指「**请求**里带的档位不在该模型声明内」（`resolveCallWithInfo` 抛）。
+ * 审计实测（2026-10-14，`dsh-llm/lib/index.js`）：`defaultEffort='on'` 而
+ * `efforts=[low,high]` ⇒ code 为 `INVALID_MODEL_REASONING`。本行原写
+ * `UNSUPPORTED_REASONING_EFFORT` 是**张冠李戴**（同型措辞在 `raccoon-adapter.ts`
+ * 与 `trae-adapter.ts` 是既有问题，本次只修这一处新增注释）。
+ */
+export const CODEARTS_DEFAULT_EFFORT = 'on'
+
+/**
  * 「该账号没有 benefit（免费额度）包」的稳定失败码。
  *
  * CodeArts 对**积分制**账户（体验版等，没有 benefit 免费额度包）会以
@@ -866,13 +932,13 @@ export class CodeArtsAdapter extends LlmAdapter {
         // ⚠️ **未知模型也声明思考档位**（7b 曾在此引入回归、7d 补回）：
         // 本网关唯一生效的思考控制是顶层 `thinking.type`，与模型无关 ⇒
         // 原实现对未知 id 同样给这两档。
+        // ⚠️ 顺序规则见 `CODEARTS_REASONING_EFFORTS` 的长注释（**强度序：弱 → 强**）。
+        // 未知模型与已知模型必须同一份顺序，否则用户手填 id 时档位轴会翻向。
         unknownModelReasoning: () => ({
-          efforts: [
-            { id: ReasoningEffortId('on'), name: '开启' },
-            { id: ReasoningEffortId('off'), name: '关闭' },
-          ],
-          defaultEffort: ReasoningEffortId('on'),
-        }),      },
+          efforts: [...CODEARTS_REASONING_EFFORTS],
+          defaultEffort: ReasoningEffortId(CODEARTS_DEFAULT_EFFORT),
+        }),
+      },
     )
   }
 
@@ -963,7 +1029,7 @@ export class CodeArtsAdapter extends LlmAdapter {
    * 1. **VL 多模态不参与目录**（`-VL-` / `-VL` 结尾的 id 被滤掉）——
    *    这是本家的可见性判据，骨架不认识；
    * 2. `contextWindow` 来自静态 `CONTEXT_WINDOWS` 表（不是远端字段）；
-   * 3. `reasoning` 是**恒声明**的两档（开启/关闭），与 entry 无关 ——
+   * 3. `reasoning` 是**恒声明**的两档（关闭/开启，**强度序**），与 entry 无关 ——
    *    实测（2026-09-29）：本网关**唯一**真正生效的思考控制是顶层
    *    `thinking.type`，`reasoning_effort`（含 low/high/none/minimal）与嵌套
    *    `reasoning.effort` 都被服务端接受但**完全无效果**（判据为服务端上报的
@@ -979,11 +1045,12 @@ export class CodeArtsAdapter extends LlmAdapter {
       inputModalities: ['text'] as const,
       ...contextWindow !== undefined ? { contextWindow } : {},
       reasoning: {
-        efforts: [
-          { id: ReasoningEffortId('on'), name: '开启' },
-          { id: ReasoningEffortId('off'), name: '关闭' },
-        ],
-        defaultEffort: ReasoningEffortId('on'),
+        // ⚠️ 顺序 = **强度序（弱 → 强）**，逐条理由见 `CODEARTS_REASONING_EFFORTS`
+        // 的长注释（Issue IKLIDV）—— 简言之：DSH 把该数组当展示顺序、客户端不排序，
+        // 故 `['on','off']` 会让「开启」落在横向轴的最左。
+        // ⚠️ `defaultEffort` 仍由 `CODEARTS_DEFAULT_EFFORT` 单独表达，与位置无关。
+        efforts: [...CODEARTS_REASONING_EFFORTS],
+        defaultEffort: ReasoningEffortId(CODEARTS_DEFAULT_EFFORT),
       },
     }
   }
@@ -1114,7 +1181,10 @@ export class CodeArtsAdapter extends LlmAdapter {
     const titlePlan = planSessionTitleThinking({
       purpose: options.purpose,
       requestedEffort: options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
-      declaredEfforts: ['on', 'off'],
+      // ⚠️ 与 `resolveModel` 声明的档位**同源**（`CODEARTS_REASONING_EFFORTS`）——
+      // 各写一份必然漂移，而漂移的症状是「标题请求挑的关闭档不在声明里」。
+      // ⚠️ `thinkingOffEffortOf` 按 **rank** 找关闭档（不按位置），故顺序调整不影响它。
+      declaredEfforts: CODEARTS_REASONING_EFFORTS.map((effort) => String(effort.id)),
       maxTokens: options.maxTokens,
     })
     const body = JSON.stringify({

@@ -92,20 +92,11 @@ const MINIMAX_ADAPTIVE_ONLY_PREFIX = 'MiniMax-M3.1'
  * —— 而它**实际可以开关思考**（真机实测）。那是**功能缺失**：
  * 用户在 UI 上无法为 M3 关闭思考。
  *
- * 修法（照 Qoder `qoderEffortsFor` 的既有口径）：
- * - `efforts` 取远端 `effort_options`（只有 M3.1 有）；
- * - `thinkingMode === 'switchable'` 时**追加 `none`**（= 「关闭思考」档）
- *   —— DSH 的 `LlmModelReasoningInfo` **没有** `supportsDisable` 字段，
- *   「可关闭」就是靠 `efforts` 里出现 `none` 表达的；
- * - 两者皆无 ⇒ `undefined`（不声明）。
- *
- * ⚠️ `forced_on` 的模型**绝不**追加 `none`：M3.1 会硬 400，
- * M2.7 会被静默忽略（那会让用户以为关掉了、实际没关 —— 比不给选项更糟）。
- *
  * 修法（照客户端 `thinking.js` 的**权威词汇**）：
  * - `efforts` 取远端 `effort_options`（只有 M3.1 有）；
  * - `thinkingMode === 'switchable'` 时给出**开/关两态**：
- *   `on`（→ `thinking:{type:'adaptive'}`）与 `none`（→ `{type:'disabled'}`）。
+ *   `on`（→ `thinking:{type:'adaptive'}`）与 `none`（→ `{type:'disabled'}`）；
+ *   ⚠️ **数组顺序是 `none` 在前、`on` 在后**（强度序，见下）。
  *   ⚠️ 客户端用的就是 `on` / `off` 这两个词
  *   （`isMiniMaxM3ThinkingMode`：`value === 'on' || value === 'off'`），
  *   `off` 在 DSH 侧的惯用名是 `none`（Qoder 的「关闭思考」也用 `none`）；
@@ -115,6 +106,11 @@ const MINIMAX_ADAPTIVE_ONLY_PREFIX = 'MiniMax-M3.1'
  * 实测 M3 **不发 `thinking` 时默认「不思考」**（两轮各 0 字符），
  * 而 `adaptive` 有 **2785 / 2797** 字符。若只声明 `none`，用户**只能关、无法开**
  * —— 那比不给选项更糟（把模型的强项藏起来了）。
+ *
+ * ⚠️⚠️ **这两个档位的追加顺序是 `none` → `on`（强度序），不是 `on` → `none`**
+ *（Issue IKLIDV）：DSH 把 `reasoning.efforts` 当**展示顺序**、客户端**直接 `map`
+ * 不排序** ⇒ 原写法会让「开启」落在横向档位轴的最左（左强右弱）。
+ * 详见函数体内 `switchable` 分支的注释。
  *
  * ⚠️ `forced_on` 的模型**绝不**追加任何开关：M3.1 会硬 400，
  * M2.7 会被静默忽略（那会让用户以为关掉了、实际没关）。
@@ -132,12 +128,28 @@ export function minimaxReasoningInfo(
   if ((options === undefined || options.length === 0) && !switchable) return undefined
   const ids = [...(options ?? [])]
   if (switchable) {
-    // ⚠️ 顺序：**先 `on` 后 `none`** —— DSH 按数组顺序渲染，
-    // 「开启」应排在「关闭」之前（默认档也由 `defaultEffort` 表达，
-    // 但 M3 远端没给 `default_effort`，故把 `on` 放前面更符合直觉）。
+    // ⚠️ 顺序：**先 `none` 后 `on`**（= 强度序，弱 → 强），Issue IKLIDV。
+    //
+    // ⚠️⚠️ 原实现是**先 `on` 后 `none`**，理由是「DSH 按数组顺序渲染，把默认档
+    // 放前面更符合直觉」。那个动机只在**纵向列表**里成立：DSH 实际把该数组当
+    // **展示顺序**（`dsh-llm/lib/types/types.d.ts`：`adapter-preferred display
+    // order`），客户端**直接 `map` 不排序**（`dsh-client-ui-model-selection`）。
+    // 一旦按数组顺序铺成**横向档位轴**，`['on','none']` 就变成「左强右弱」——
+    // 「开启」贴最左、「关闭」贴最右。强度序的权威是本仓库
+    // `REASONING_EFFORT_RANK`（`none: 0` / `on: 5`）⇒ `none` 必须在前。
+    // 同一形态在 codearts（`llm-adapter.ts`）与 raccoon（`raccoon-product.ts`）
+    // 各有一处，三处已一并按同一条规则规整。
+    //
+    // ⚠️ 默认档**不靠位置**表达：M3 远端没给 `default_effort`，故它**没有**
+    // `defaultEffort`（保持服务端默认 = 实测不思考，见下）。移动位置不改变这一点。
+    //
+    // ⚠️ 远端 `effort_options` 那段**保持原序**（如实镜像上游，不重排）——
+    // 只有这一对我们自己追加的两档按强度序排。故当远端档位存在时，
+    // 整条数组**不一定全局单调**（如 M3.1 的 `default` 本就未登记强度）；
+    // 而 M3 这种「只有我们追加的两档」的情形是全局升序的。
     // 幂等：远端若哪天自己下了这几个名字，不重复追加。
-    if (!ids.includes('on')) ids.push('on')
     if (!ids.includes('none')) ids.push('none')
+    if (!ids.includes('on')) ids.push('on')
   }
   const efforts = ids.map((id) => {
     if (id === 'none') return { id: ReasoningEffortId(id), name: '关闭思考' }
