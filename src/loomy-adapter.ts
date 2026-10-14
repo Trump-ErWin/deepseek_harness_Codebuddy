@@ -33,7 +33,7 @@ import {
   splitLoomyRate,
   type LoomyCredential,
 } from './loomy.js'
-import { LOOMY, loomyContextWindow, type LoomyFallbackModel, type LoomyProduct } from './loomy-product.js'
+import { LOOMY, loomyContextWindow, loomySupportsImage, type LoomyFallbackModel, type LoomyProduct } from './loomy-product.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
@@ -169,7 +169,11 @@ export function parseLoomyRemoteModels(payload: unknown): LoomyRemoteModel[] {
       contextWindow: Number.isFinite(contextWindow) && contextWindow > 0
         ? loomyContextWindow(id, contextWindow)
         : 0,
-      supportsImage: readInputModalities(entry).includes('image'),
+      // ⚠️⚠️ **必须过 `loomySupportsImage`**（2026-10-14 用户报障）：远端对
+      // `qwen-3.8-max` 漏报 `input_modalities`（只给 `['text']`），照抄会让 DSH
+      // 把图投影成文本占位符、图根本发不出去。判据与证据见 `loomy-product.ts`
+      // 的覆盖表注释。
+      supportsImage: loomySupportsImage(id, readInputModalities(entry).includes('image')),
       supportsThinking: capabilities.reasoning === true,
       // ⚠️ 档位缺失时**不写这两个键**（而不是写空数组）：下游据此区分
       // 「该模型不提供档位」与「提供了但为空」。
@@ -192,7 +196,9 @@ function fallbackToRemote(model: LoomyFallbackModel): LoomyRemoteModel {
     contextWindow: loomyContextWindow(model.id, model.contextWindow),
     // 兜底表不声明图片能力：宁可少报（用户改用文本描述），
     // 也不要报一个服务端可能不认的模态。
-    supportsImage: false,
+    // ⚠️ 但**同样要过覆盖表**（与上一行的 `contextWindow` 同一条纪律）：兜底表
+    // 起算值恒为 false，覆盖表是唯一的真相源，两条路径因此不可能分叉。
+    supportsImage: loomySupportsImage(model.id, false),
     supportsThinking: true,
     ...model.efforts !== undefined && model.efforts.length > 0
       ? { efforts: [...model.efforts] }

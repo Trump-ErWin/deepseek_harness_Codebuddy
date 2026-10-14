@@ -196,6 +196,81 @@ export function loomyContextWindow(modelId: string, declared: number): number {
   return LOOMY_CONTEXT_WINDOW_OVERRIDES[modelId] ?? declared
 }
 
+/**
+ * 远端声明为**纯文本**、但实测**能读图**的模型（`input_modalities` 漏报）。
+ *
+ * ## 为什么需要（真实缺陷，2026-10-14 用户报障）
+ *
+ * 用户报障「loomy 的模型输入不能上图？尤其是 qwen3.8max」。根因与 raccoon 那起
+ * （`tags.vision` 不是能力契约，见 `RACCOON_IMAGE_CAPABILITY_OVERRIDES`）**同型**，
+ * 只是这次的「元数据」是 `input_modalities` 而不是 `tags`：
+ *
+ * 1. 远端 `GET /api/v1/models` 对 `qwen-3.8-max` 下发
+ *    `capabilities.input_modalities = ['text']`（`vision: false`）；
+ * 2. 适配器原样直译 ⇒ `supportsImage: false` ⇒ `toCatalogEntry` 播报
+ *    `inputModalities: ['text']`；
+ * 3. DSH 按它做准入（`dsh-api-session-controller` 的
+ *    `MODEL_DOES_NOT_SUPPORT_IMAGES`）与投影 ⇒ **图片根本发不出去**，
+ *    用户看到的是「当前模型不支持图片，请切换支持图片的模型」。
+ *
+ * ### 硬证据（2026-10-14，真实凭据直连生产端点）
+ *
+ * 判据是**随机纯色 PNG**（纯标准库生成，64×64，约 137 B）：纯文本模型答不出颜色，
+ * 读得到的模型答得出。`qwen-3.8-max` 两轮合计 **4/5 次答对**：
+ *
+ * | 判据 | 目标 | 模型回答 |
+ * |---|---|---|
+ * | 颜色名 | 紫 (150,40,200) | 「紫色」 |
+ * | 颜色名 | 蓝 (40,70,220) | 「蓝色」 |
+ * | RGB 三元组 | (144,127,136) | `142,132,140` |
+ * | RGB 三元组 | (197,197,174) | `180,186,169` |
+ * | RGB 三元组 | (129,204,71) | HTTP 504（上游网关超时，不计） |
+ *
+ * ### 同批实测的对照（一次一色，同一账号）
+ *
+ * | 模型 | 远端 `input_modalities` | 实测读图 | 备注 |
+ * |---|---|---|---|
+ * | `DeepSeek-V4.1-Flash` | text,image | ✅ | |
+ * | `Kimi-k2.6` | text,image,video | ✅ | |
+ * | `qwen3.8-flash` | text,image,video | ✅ | |
+ * | `mimo-v2.5` | text,audio,image,video | ✅ | |
+ * | `GLM-5.3-Flash` | text,image,video | ⚠️ | 颜色名答错一次；RGB 3 次中 2 次命中 |
+ * | **`qwen-3.8-max`** | **text（漏报）** | ✅ | **本表要修的就是它** |
+ * | `MiniMax-M3` | text,image,video | ❌ | 4/4 未命中；答案像经典 CSS 色值（`135,206,235`…）⇒ 疑似在编 |
+ * | `deepseek-v4-flash-0731` | text | ❌ | 思考链吃满预算，正文为空 |
+ * | `spark-x` | text | ❌ | 自称「我无法读取图片」 |
+ * | `auto` | 无声明 | ❌ | 未定论（思考吃满 / 答「灰」） |
+ *
+ * ⚠️ **`MiniMax-M3` 的疑似假声明（声明 image、实测读不出）本次刻意不动**：
+ * 用户 2026-10-14 明确「我主要关心 loomy 的 qwen3.8max」，且**降级**一个已声明的
+ * 能力会改变既有可用路径 —— raccoon 的 `sn-glm-5-3` 就有「网关节点不一致、
+ * 3 次只对 1 次」的先例 ⇒ 单账号证据不足以判死。它按**已知 provider 缺陷**
+ * 记录在案，待多节点复核后再决定。
+ *
+ * ⚠️ **不要改成「该家恒支持图片」**：白名单只覆盖**实测确认**的个案。将来上架
+ * 纯文本模型时恒 true 会把图放行，让上游回一个更难懂的 400（错误更晚、更难查）。
+ */
+export const LOOMY_IMAGE_CAPABILITY_OVERRIDES: ReadonlySet<string> = new Set([
+  'qwen-3.8-max',
+])
+
+/**
+ * 取一个模型的**真实**图片能力。
+ *
+ * ⚠️ 远端与兜底表**两条路径都必须过这里** —— 与 {@link loomyContextWindow}
+ * 同一条纪律：只改一侧，远端可用时那一侧就白改了（`contextWindow` 曾差点踩空）。
+ * ⚠️ 与 raccoon 的**两个真相源**（兜底表 `supportsImage` + 远端判定函数）不同，
+ * 本家只有一个真相源（本函数）——兜底表的 `supportsImage` 恒由 `false` 起算，
+ * 故不存在「兜底表与远端判定分叉」的形态。
+ *
+ * @param modelId 模型 id。
+ * @param declared 远端 `input_modalities` 是否含 `image`（兜底表一律传 `false`）。
+ * @returns 覆盖值（若有），否则原样返回 `declared`。
+ */
+export function loomySupportsImage(modelId: string, declared: boolean): boolean {
+  return LOOMY_IMAGE_CAPABILITY_OVERRIDES.has(modelId) || declared
+}
+
 const LOOMY_FALLBACK_MODELS: readonly LoomyFallbackModel[] = [
   { id: 'deepseek-v4-flash-0731', name: 'DeepSeek V4 Flash 0731 · x3.0', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },
   { id: 'MiniMax-M3', name: 'MiniMax M3 · x4.0', contextWindow: 1_048_576, efforts: [...LOOMY_EFFORTS], defaultEffort: LOOMY_DEFAULT_EFFORT },

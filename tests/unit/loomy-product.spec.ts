@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  ALL_LOOMY_PRODUCTS, LOOMY, LOOMY_CONTEXT_WINDOW_OVERRIDES, loomyContextWindow, loomyProductById,
+  ALL_LOOMY_PRODUCTS, LOOMY, LOOMY_CONTEXT_WINDOW_OVERRIDES, LOOMY_IMAGE_CAPABILITY_OVERRIDES,
+  loomyContextWindow, loomyProductById, loomySupportsImage,
 } from '../../src/loomy-product.js'
 
 describe('Loomy 产品配置', () => {
@@ -85,5 +86,46 @@ describe('Loomy 产品配置', () => {
       if (override === undefined) continue
       expect(model.contextWindow, `${model.id} 兜底表未按覆盖表修正`).toBe(override)
     }
+  })
+
+  /**
+   * ★ 图片能力覆盖表（2026-10-14 用户报障「loomy 的 qwen3.8max 输入不能上图」）。
+   *
+   * 远端 `GET /api/v1/models` 对 `qwen-3.8-max` 下发
+   * `capabilities.input_modalities: ['text']`（`vision: false`，**漏报**），而实测
+   * 4/5 次正确读出随机纯色 PNG（64×64）的颜色 / RGB 三元组 ⇒ 照抄声明值会让 DSH
+   * 在附件入库阶段就拒图（`MODEL_DOES_NOT_SUPPORT_IMAGES`），用户看到的是
+   * 「当前模型不支持图片，请切换支持图片的模型」。
+   * 判据、原始回答与同批 10 个模型的对照表见 `src/loomy-product.ts` 覆盖表注释。
+   *
+   * 这一组锁死三条：覆盖生效、覆盖表**不恒真**（未登记模型照传声明值）、表内
+   * 只放有实测证据的条目。
+   */
+  it('★ 覆盖表让 qwen-3.8-max 在远端漏报（声明 text）时仍判定支持图片', () => {
+    expect(Array.from(LOOMY_IMAGE_CAPABILITY_OVERRIDES)).toEqual(['qwen-3.8-max'])
+    expect(loomySupportsImage('qwen-3.8-max', false)).toBe(true)
+    // 声明为 image 时当然还是 true（覆盖表只做「补报」，不做「降级」）
+    expect(loomySupportsImage('qwen-3.8-max', true)).toBe(true)
+  })
+
+  it('⚠️ 覆盖表不得退化成「该家恒支持图片」：未登记模型照传声明值', () => {
+    // 两个方向都要传对：声明 text 的仍是 text，声明 image 的仍是 image。
+    // 恒 true 会把图放给纯文本模型，让上游回一个更晚、更难懂的 400。
+    expect(loomySupportsImage('spark-x', false)).toBe(false)
+    expect(loomySupportsImage('Kimi-k2.6', false)).toBe(false)
+    expect(loomySupportsImage('Kimi-k2.6', true)).toBe(true)
+    expect(loomySupportsImage('qwen3.8-flash', true)).toBe(true)
+  })
+
+  it('⚠️ 覆盖表只放**实测确认能读图**的模型，且必须存在于兜底表', () => {
+    const ids = new Set(LOOMY.fallbackModels.map((m) => m.id))
+    for (const id of Array.from(LOOMY_IMAGE_CAPABILITY_OVERRIDES)) {
+      expect(ids.has(id), `${id} 不在兜底表里`).toBe(true)
+    }
+    // 实测确认读不了图的（spark-x / deepseek-v4-flash-0731）绝不混进表里
+    expect(LOOMY_IMAGE_CAPABILITY_OVERRIDES.has('spark-x')).toBe(false)
+    expect(LOOMY_IMAGE_CAPABILITY_OVERRIDES.has('deepseek-v4-flash-0731')).toBe(false)
+    // 实测疑似「声明 image 但读不出」的 MiniMax-M3 本次刻意不降级（见源码注释）
+    expect(LOOMY_IMAGE_CAPABILITY_OVERRIDES.has('MiniMax-M3')).toBe(false)
   })
 })
