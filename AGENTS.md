@@ -68,6 +68,122 @@
 - LLM provider 通过 `ctx.llm.registerProvider()` 注册
 - 命令通过 `ctx.commands.register()` 注册
 - 插件配置通过 `ctx.schema` 在 profile layer 栈中声明
+
+## ⚠️ 渠道原生搜索（`src/web-native.ts` + `src/native-search-contract.ts`）
+
+**支持原生搜索的渠道**的官方 `web_search` 改走**渠道自带后端**，其余渠道一律
+`next()` 放行 —— **不路由、不回退**，官方链路逐字节不变。
+
+| 渠道 | 原生后端 | 鉴权 |
+|---|---|---|
+| `buddy` / `workbuddy` | 腾讯 `POST {endpoint}/agenttool/v1/search` | `Bearer <access_token>` |
+| `qoder` / `qodercn` | Qoder `POST {encryptedInferBase}/api/v1/webSearch/oneSearch` | **COSY 签名（WASM）** |
+
+### ⚠️ 架构：两层 + 一个契约文件（2026-10-14 改造）
+
+| 文件 | 职责 |
+|---|---|
+| `src/native-search-contract.ts` | **共享契约**：错误类型 / 错误码 / `NativeSource` / `NativeSearchAdapter` 接口 |
+| `src/web-native.ts` | **工具层**：拦截 `tools/execute`、官方入参校验、多 query 合并、cap |
+| `src/{buddy,qoder}-adapter.ts` | **渠道层**：`searchOnce` 取数 + 字段投影（各渠道形状不同） |
+
+⚠️ **契约必须单独成文件**：否则渠道层要 `import` 工具层，**依赖方向反了**
+（渠道是更底层的实现，不该知道「谁在拦截工具执行」）。改动前先读它的模块头。
+
+⚠️ **取数不可放在工具层**：腾讯的 `results[].url` 与 Qoder 的 `pageItems[].link`
+形状不同，若混在工具层会让「渠道判断」与「字段投影」纠缠（改造前就是这样，
+Qoder 根本接不进来）。
+
+### ⚠️ 只管 `web_search`，**刻意不管** `web_fetch`（2026-10-14 修正）
+
+本模块早期**同时**接管过 `web_fetch`（`/agenttool/v1/webfetch`），那是**净损失**，
+现已整体剔除。**不要加回来**。理由三条（均有实测）：
+
+1. **官方 fetch 根本不需要凭据**：宿主 `cordis.yml` 里 `web.fetchProvider: http`
+   → `@deepseek-ai/dsh-web-fetch-http`，官方文档原话「**不发送凭据**」，零配置、
+   自带 SSRF 防护与明确响应上限（5 MB / 100k 字符）。实测：删掉 `DEEPSEEK_API_KEY`
+   后它照样 200。⇒ 接管它**没有换来任何能力**（search 不同 —— 官方**要** key）。
+2. **复杂表格塌陷**：同一份 `api-docs.deepseek.com/.../pricing` 页面，官方保留
+   `| a | b |` 行列结构；腾讯原生把整表挤成一行 ⇒ 模型读不出「哪个数字对应哪个
+   模型」。而查文档/查价格恰是 fetch 最常被用的场景。
+3. **依赖账号有效**：账号过期时腾讯 fetch 直接失败；官方永远可用。
+
+（腾讯 fetch 确有独到之处：返回页面 `标题` 与多语言全文。但代价是表格结构丢失，
+ 用户 2026-10-14 权衡后决定撤回。守卫用例见 `web-native.spec.ts` 的「渠道判断」。）
+
+Jet Hub 页头有总开关（`nativeWebSearchEnabled`，缺键默认启用）：关掉即**所有渠道**
+（含 buddy 系）回官方搜索，此时 buddy 渠道报 `DEEPSEEK_API_KEY` 缺失属**预期**。
+
+### 动它之前必须知道的七条
+
+1. **`tools/execute` 是 cordis waterfall**：不调 `next()` 即短路，返回值**必须**是
+   `{ value }` 形状（返回 `undefined` 会让宿主在 `normalizeDispatchResult` 里抛
+   `TypeError`）。短路经 `createSuccessResult(exec, 原工具, value)` 用**原工具自己的**
+   output 契约渲染。
+2. **短路会跳过官方入参校验**：官方 schema 校验在 `defineTool` 包装的 `execute`
+   **内部**，短路后根本不执行 ⇒ 参数判据必须在这里自己复刻（见 `readQueries`）。
+3. **总开关必须每次现读**：`index.ts` 传的是 `() => pool.nativeWebSearchEnabled()`
+   这个**函数**，不是布尔快照。改成快照会让「关→开」热切换失效（必须重启）。
+4. **输出投影贴合官方 schema**：`sources[{url,title?,snippet?}]`（`url` 必填、
+   `additionalProperties: false`）—— 多传字段会让 `createSuccessResult` 抛
+   `ToolOutputError`，整条调用失败（不是少一条结果）。
+   各适配器**必须丢掉**自己多余的字段（Qoder 的 `hostname` / `hostLogo` 在此列）。
+   ⚠️ **但 `publishedTime` 是例外**（2026-10-14 审计修正）：官方 output schema 与
+   seam 的 `WebSearchSource` **都**声明了可选的 `publishedAt?: string`，原注释把三个
+   字段一锅端说成「schema 不允许」**对 `publishedTime` 不成立**。当前**刻意仍丢弃**
+   —— 接它要先真机确认 Qoder 下发的是 ISO-8601 字符串，接错的代价是整条调用失败。
+5. **凭据必须与聊天链路同源**：经 `Xxx.resolveCredentialFor` 复用**同一个**
+   `resolveCredential` 实例；另建一份会让「enabled / 模型级限流 / 免费判定 /
+   余额分档 / 池兜底 / 账本回报」六步在两条链路上漂移。
+6. **Qoder 的 WASM 上下文必须 `dispose`**：`QoderContext` 是 wasm 堆上的 Rust 对象，
+   `gluePromise` 是**进程级单例** —— 不释放会让堆只增不减，长上下文会话最终以裸
+   `RuntimeError: unreachable` 暴毙（真实事故史见 `qoder-wasm.ts` 文件头）。
+   用 `try/finally`（`finally` 里的 `throw` 会**无条件覆盖** `try` 里的原始错误）。
+7. **`url` 字段名各家不同**：腾讯叫 `results[].url`、Qoder 叫 `pageItems[].link`。
+   投影在**适配器**里做，工具层的合并算法对渠道无感。
+8. ⚠️⚠️ **取消 / 超时的归因必须读 `signal.reason`，不能只看 `signal.aborted`**
+   （2026-10-14 审计新增，**实测六格对照**）。本模块在 cordis waterfall 的**内层**
+   （见下方「实测边界」），生产环境拿到的 `exec.signal` 已被外层
+   `tool-call-timeout-policy` 换成带 deadline 的信号 ⇒ 外层到期时
+   `aborted === true` 但**原因不是取消**：
+   | 场景 | `reason.constructor` | `reason.name` |
+   |---|---|---|
+   | 调用方取消 | `DOMException` | `AbortError` |
+   | 本模块自己的 `AbortSignal.timeout` | `DOMException` | `TimeoutError` |
+   | **外层 deadline 到期** | **`TimeoutReason`** | **`TimeoutReason`** |
+   判据**只留一份实现** `classifyNativeAbort`（`native-search-contract.ts`），
+   buddy 与 qoder **都必须走它**；旧写法（先判 `aborted` 就归 aborted）会把超时报成
+   「用户取消了搜索」，文案里那串排障指引**全部丢失**。
+   ⚠️ 两个渠道**各自**必须自己 arm 一份 `AbortSignal.any([signal, AbortSignal.timeout(20s)])`
+   —— 只透传 `signal` 会让 `timeout` / `aborted` 在该路径永不产生（qoder 曾如此，
+   而契约注释却声称「各适配器都有 20s 预算」⇒ **注释与实现不符**）。
+
+### 实测边界（2026-10-14 真机）
+
+- 两个 host（`copilot.tencent.com` / `www.workbuddy.ai`）行为一致；
+  `max_results` 完全生效：**1/3/5/8 原样返回、>8 封顶 8**；
+- ✅ 已验证：buddy / workbuddy 搜索通、开关热切换无需重启；
+- ✅ 已验证：**Qoder 原生搜索调通** —— CN 免费账号 `POST gateway.qoder.com.cn/.../oneSearch`
+  → HTTP 200 返回 10 条 `pageItems`；**与客户端真实调用逐条对比：URL 10/10、标题 10/10、
+  顺序完全一致**（客户端侧证据取自 `~/.qoder-cn/projects/…/d6bb315c-….jsonl`）。
+  协议细节见 `docs/agent-notes/providers-qoder.md` 的「渠道原生搜索」一节；
+- ✅ 已验证：`web_fetch` 在任何渠道都走官方（开关开着时也不出现 `workbuddy fetch` 文案）；
+- ✅ **已验证**（2026-10-14 PR95 审计补测）：本监听器在 `tools/execute` 链中的
+  **位置** = **内层**。依据两条：① `dsh-base/cordis.patch.yml` 里
+  `tool-call-timeout-policy`（L401）**先于** `tool-web`（L486）声明，而 cordis 的
+  waterfall 是「**先注册者在外层**」（cordis 的 `dispatch` 按注册序 `push`，
+  `waterfall` 顺序 `shift`）；② 真 cordis 探针实测链序
+  `A-before → B-sees:DEADLINE-FROM-A → INNER-BODY → A-after` —— 后注册者拿到的
+  `exec.signal` **已被前注册者替换**。⇒ 外层超时策略**生效**，本模块必须在
+  内层处理「外层 deadline 也可能 abort 我的 signal」（见上面第 8 条）。
+  ⚠️ 由此推翻本 PR 原注释「我们的 20s 预算总是先于宿主 30s 触发」：
+  `searchTimeoutMs` 是**可配置项**，调小后外层先到期。
+- ⚠️ **仍未验证**：宿主升级后 `requestHeader()` 在工具执行时**是否已就绪**。
+- ⚠️ **未接入**：Qoder 的 `bailian` 搜索后端（需百炼 API Key，默认不用）。
+
+研究记录见 `docs/workbuddy-native-search-research.md`（含端点探测、请求头最小集、
+与 DeepSeek 官方搜索的架构差异）。
+
 ## 工作方式
 
 ### ⚠️ 子任务优先用 **inline** 执行，不要新开 subagent

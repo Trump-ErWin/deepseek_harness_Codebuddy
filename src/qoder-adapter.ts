@@ -23,6 +23,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { randomUUID } from 'node:crypto'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -30,6 +31,13 @@ import { AccountPool } from './account-pool.js'
 import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
 import { describeWasmFailure, QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
+// ⚠️ 原生搜索的契约来自**契约文件**（不是工具层 `web-native.ts`）：
+//    避免「渠道层 import 工具层」的反向依赖，见 `native-search-contract.ts` 模块头。
+import { classifyNativeAbort, NativeSearchCodes, WebNativeError, type NativeSource } from './native-search-contract.js'
+// ⚠️ `errorMessage` 只留**一份**实现（`openai-compat.ts`）：本仓库原有 6 份同义
+//    实现，PR95 审计时确认为「该腿的唯一实现」，新代码一律从这里取
+//    （与 `detailFieldText` 同一条铁律，见 `buddy-adapter.ts` 的同款注释）。
+import { errorMessage } from './openai-compat.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
 import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderProduct } from './qoder-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
@@ -384,6 +392,16 @@ function resolveChunkTimeoutMs(): number {
   return Number.parseInt(process.env.DSH_QODER_SSE_CHUNK_TIMEOUT_MS ?? '', 10) || 120_000
 }
 
+/**
+ * 单次原生搜索请求的预算（毫秒）。
+ *
+ * ⚠️ **与 `buddy-adapter.ts` 的 `NATIVE_SEARCH_TIMEOUT_MS` 同值同义**（两边各写
+ * 一份是刻意的：两者的模块依赖方向不同，且都属「渠道层自己的预算」；
+ * 共享会诱使渠道层去 import 工具层 —— 见 `native-search-contract.ts` 模块头）。
+ * 20s 与官方客户端 `WEB_SEARCH_TIMEOUT_MS = 2e4` 对齐。
+ */
+const NATIVE_SEARCH_TIMEOUT_MS = 20_000
+
 /** `QoderAdapter` 的构造选项。 */
 export interface QoderAdapterOptions {
   /** 默认凭据 ref（仅用于类型/日志，实际解析走 `resolveCredential`）。 */
@@ -505,6 +523,237 @@ export class QoderAdapter extends LlmAdapter {
       }, ms)
       signal?.addEventListener('abort', onAbort, { once: true })
     })
+  }
+
+  /**
+   * 复用本适配器**同一套**选号编排解析凭据（供插件内部的原生搜索使用）。
+   *
+   * ## 为什么需要这个转发方法
+   *
+   * `options` 是构造器的 `private readonly`，插件其余模块从外部读
+   * `adapter.options.resolveCredential` 会**编译失败**（`strict: true`）。
+   * 而原生搜索**必须**与聊天链路用同一个 `resolveCredential` 实例 ——
+   * 另建一份会让「enabled 过滤 / 模型级限流 / 免费判定 / 余额分档 / 池兜底 /
+   * 账本回报」这六步在两条链路上漂移（与 `BuddyAdapter.resolveCredentialFor`
+   * 同款理由）。
+   *
+   * ⚠️ `modelId` **必须透传**：它同时决定模型级限流过滤与免费判定，
+   * 吞掉会让搜索选到聊天链路不会选的号（例如正在限流期的号）。
+   *
+   * @param modelId - 本次请求的模型 id（取自当前会话路由）。
+   * @returns 选中账号的凭据；无可用账号时为 `undefined`。
+   */
+  async resolveCredentialFor(modelId: string | undefined): Promise<QoderCredential | undefined> {
+    return await this.options.resolveCredential(modelId)
+  }
+
+  /**
+   * 原生搜索：执行**一次单 query**，返回投影成官方 `sources[]` 形态的结果。
+   *
+   * ## 协议（全部来自官方客户端源码 + 真机实测，2026-10-14）
+   *
+   * | 项 | 值 |
+   * |---|---|
+   * | host | 本产品的 `encryptedInferBase`（CN `gateway.qoder.com.cn`；国际实测 `center.qoder.sh` / `api2.qoder.sh` 均可） |
+   * | path | `/api/v1/webSearch/oneSearch` |
+   * | body | `{ payload: JSON.stringify({query, timeRange:'NoLimit', contents:{...}}), encodeVersion:'1' }` |
+   * | 信封 | body 由 **WASM 加密**；请求头由 `prepareRequest` 生成（含 `Authorization: Bearer COSY.<载荷>.<签名>`） |
+   * | 响应 | `{ requestId, pageItems: [{title, link, snippet, publishedTime, hostname, hostLogo}], searchInformation }` |
+   *
+   * 官方客户端对应实现（`qoder-worker-runtime` 的 `tPl` / `APl` / `$rA`）：
+   * ```js
+   * let n = i.prepareRequest(A, e, "POST", "auth", t, void 0)
+   * return { url: n.url, headers: kc(n.headers), body: n.body ?? t, free: () => n.free() }
+   * ```
+   *
+   * ## ⚠️ 三个必须遵守的点
+   *
+   * 1. **`QoderEncryptedInfer` 每次建、每次 `dispose()`**：`gluePromise` 是进程级
+   *    单例，`QoderContext` 是 wasm 堆上的 Rust 对象，不释放会让堆只增不减，
+   *    长上下文会话最终以裸 `RuntimeError: unreachable` 暴毙（真实事故史见
+   *    `qoder-wasm.ts` 文件头）。用 `try/finally` 而非顺序调用。
+   * 2. **`publishedTime` / `hostname` / `hostLogo` 一律丢弃**：官方 output schema
+   *    有 `additionalProperties: false`，多传字段会让 `createSuccessResult` 抛
+   *    `ToolOutputError`，**整条调用失败**（不是少一条结果）。
+   *    ⚠️ **但 `publishedTime` 其实有对应字段**（PR95 审计修正）：官方
+   *    `dsh-tool-web` 的 output schema 与 seam 的 `WebSearchSource` **都**声明了
+   *    可选的 `publishedAt?: string`（语义就是「provider 给的发布时间戳」）。
+   *    原注释把三个字段一锅端说成「schema 不允许」，那对 `hostname` /
+   *    `hostLogo` 成立，对 `publishedTime` **不成立**。
+   *    ⚠️ **本次仍照原样丢弃**：接它需要先确认 Qoder 的 `publishedTime` 确实是
+   *    ISO-8601 字符串（seam 的类型注释如此声明，但我们**没有真机取证**），
+   *    而接错的后果是整条调用失败（`ToolOutputError`）—— 收益（多一列时间）远
+   *    小于风险。**待办**：取一次真实响应确认格式后再接。
+   * 3. **`X-Session-ID` 用随机 UUID**：实测不传也能 200，但官方客户端会带；
+   *    这里跟随官方行为。它与账号无关，只是会话标识。
+   * 4. **自己 arm 一份 20s 预算**（PR95 审计修正）：只透传 `signal` 会让
+   *    `NativeSearchCodes.timeout` / `aborted` 在本路径永不产生，而契约注释却
+   *    声称「各适配器 20s 预算小于官方 30s」⇒ 注释与实现不符。
+   *
+   * @param query - 单个查询串（已由工具层 trim + 去重）。
+   * @param credential - `resolveCredentialFor` 的返回值（本方法自己收窄）。
+   * @param signal - 取消信号（工具层传多 query 的 batch signal）。
+   */
+  async searchOnce(query: string, credential: unknown, signal: AbortSignal): Promise<NativeSource[]> {
+    const c = credential as QoderCredential | undefined
+    const accessToken = typeof c?.security_oauth_token === 'string' && c.security_oauth_token.length > 0
+      ? c.security_oauth_token
+      : (typeof c?.access_token === 'string' ? c.access_token : '')
+    if (accessToken.length === 0 || typeof c?.machine_id !== 'string' || c.machine_id.length === 0) {
+      throw new WebNativeError(
+        `${this.product.id} search has no usable account; sign in to a ${this.product.id} account `
+        + `from the Jet Hub panel first. The current route is "${this.product.id}". `
+        + 'Only the user can change accounts.',
+        NativeSearchCodes.noAccount,
+      )
+    }
+
+    const host = this.product.encryptedInferBase
+    const endpoint = `${host}/api/v1/webSearch/oneSearch`
+
+    // ⚠️ 每次新建 + `finally` 释放（理由见上方第 1 点）。
+    let client: QoderEncryptedInfer | undefined
+    try {
+      client = await QoderEncryptedInfer.create({
+        user: { uid: c.uid ?? '', securityOauthToken: accessToken },
+        machineId: c.machine_id,
+        metadata: { ...this.product.clientMetadata },
+        host,
+      })
+
+      // ① 构造 payload（照官方 `WebSearchTool` 的字段与默认值）
+      const payload = {
+        query,
+        timeRange: 'NoLimit',
+        contents: { mainText: false, markdownText: false, summary: false },
+      }
+      // ② 信封（官方的 `{ payload, encodeVersion }`）
+      const bodyJson = JSON.stringify({ payload: JSON.stringify(payload), encodeVersion: '1' })
+      // ③ 签名（WASM 生成 url + 全套 Cosy-* 头）
+      const req = client.prepareRequest(host, '/api/v1/webSearch/oneSearch', 'POST', 'auth', bodyJson, undefined)
+
+      // ④ 发送（headers 原样透传；`X-Session-ID` 跟随官方行为）
+      // ⚠️ 用 `this.fetchImpl`（可注入）而不是模块级 `fetch`：单测要拦上游，
+      //    而这一层**必须**用真 WASM 生成签名（签名无法 mock），故只能换 fetch。
+      //
+      // ⚠️⚠️ **必须自己 arm 一份预算**（PR95 审计修正的真实缺口）：本模块此前
+      //    只透传 `signal`，于是 `NativeSearchCodes.timeout` / `aborted` 在 Qoder
+      //    路径**永不产生**，而契约注释却声称「各适配器的 20s 预算小于官方 30s」
+      //    —— 注释与实现不符（buddy 有、qoder 没有）。用 `AbortSignal.any` 熔合
+      //    调用方取消、外层 deadline 与本预算三者。
+      const timeout = AbortSignal.timeout(NATIVE_SEARCH_TIMEOUT_MS)
+      const composed = AbortSignal.any([signal, timeout])
+
+      let response: Response
+      try {
+        response = await this.fetchImpl(req.url, {
+          method: 'POST',
+          headers: { ...req.headers, 'X-Session-ID': randomUUID() },
+          body: req.body,
+          signal: composed,
+        })
+      } catch (error) {
+        // ⚠️ 归因读 `signal.reason` 的形状，**不能先判 `signal.aborted`**：
+        //    外层 `tool-call-timeout-policy` 的 deadline 到期时布尔值同样为真。
+        //    判据与实测对照见 `native-search-contract.ts` 的 `classifyNativeAbort`。
+        const stop = classifyNativeAbort(composed)
+        if (stop === 'aborted') {
+          throw new WebNativeError(`${this.product.id} search aborted`, NativeSearchCodes.aborted, { cause: error })
+        }
+        if (stop === 'timeout') {
+          const budget = timeout.aborted
+            ? `after ${NATIVE_SEARCH_TIMEOUT_MS}ms`
+            : 'before this search returned (the host tool budget elapsed)'
+          throw new WebNativeError(
+            `${this.product.id} search timed out ${budget}.\n\n`
+            + `The request used endpoint ${JSON.stringify(endpoint)}. `
+            + 'Search uses the same account as chat but a separate endpoint. '
+            + 'Retry, or narrow the request; if it keeps timing out the endpoint or network may be unreachable.',
+            NativeSearchCodes.timeout,
+            { cause: error },
+          )
+        }
+        // 非 abort 的传输失败（DNS / TLS / 连接重置）：归 `upstream`，
+        // 与 buddy 的 `transport error` 腿同口径。
+        throw new WebNativeError(
+          `${this.product.id} search request failed: ${errorMessage(error)}\n\n`
+          + `The request used endpoint ${JSON.stringify(endpoint)}. `
+          + 'Search uses the same account as chat but a separate endpoint. '
+          + 'If the network is unreachable or the endpoint is wrong, the user must decide how to proceed.',
+          NativeSearchCodes.upstream,
+          { cause: error },
+        )
+      }
+
+      if (!response.ok) {
+        const detail = await readQoderErrorDetail(response)
+        throw new WebNativeError(
+          `${this.product.id} search request failed (HTTP ${response.status})${detail}\n\n`
+          + `The request used endpoint ${JSON.stringify(endpoint)}. `
+          + 'Search uses the same account as chat but a separate endpoint. '
+          + "If the account's sign-in has expired, guide the user to sign in again from the Jet Hub panel; "
+          + 'the endpoint does not need changing.',
+          NativeSearchCodes.upstream,
+        )
+      }
+
+      let json: unknown
+      try {
+        json = await response.json()
+      } catch (error) {
+        throw new WebNativeError(
+          `${this.product.id} returned a non-JSON search response.\n\n`
+          + `The request used endpoint ${JSON.stringify(endpoint)}. `
+          + 'Expected a JSON body with { pageItems: [{ title, link, snippet }] }.',
+          NativeSearchCodes.badResponse,
+          { cause: error },
+        )
+      }
+
+      // ⚠️ 响应体先过 `asRecord`：JSON `null` 时直接读 `.pageItems` 会抛
+      //    `TypeError`，而我们想要的是「响应无法解析」这条业务错误。
+      const record = asRecord(json)
+      const items = record?.pageItems ?? record?.page_items
+      if (!Array.isArray(items)) {
+        throw new WebNativeError(
+          `${this.product.id} returned an unparseable search response: "pageItems" is not an array.\n\n`
+          + `The request used endpoint ${JSON.stringify(endpoint)}. `
+          + 'Expected { pageItems: [{ title, link, snippet }] }. '
+          + 'This usually means the upstream API changed, or the account lacks search permission.',
+          NativeSearchCodes.badResponse,
+        )
+      }
+
+      const sources: NativeSource[] = []
+      for (const raw of items) {
+        // ⚠️ 必须先挡 `null` / 非对象：`pageItems: [null]` 时读 `.link` 会抛
+        //    `TypeError`，导致**整条工具调用**失败，与本段意图（畸形条目丢弃）相反。
+        const item = asRecord(raw)
+        if (item === undefined) continue
+        // ⚠️ Qoder 的 url 字段叫 **`link`**（不是腾讯的 `url`）。
+        const url = typeof item.link === 'string' ? item.link : ''
+        // ⚠️ `url` 是官方 schema 必填项；给不出 url 的条目直接丢弃，
+        //    否则 `createSuccessResult` 会抛 `ToolOutputError`（整条调用失败）。
+        if (url.length === 0) continue
+        const title = typeof item.title === 'string' && item.title.length > 0 ? item.title : undefined
+        const snippet = typeof item.snippet === 'string' && item.snippet.length > 0 ? item.snippet : undefined
+        sources.push({
+          url,
+          ...title === undefined ? {} : { title },
+          ...snippet === undefined ? {} : { snippet },
+        })
+      }
+      return sources
+    } catch (error) {
+      // ⚠️ wasm trap（裸 `unreachable`）必须被改写成人话（与聊天链路同款处理
+      //    见 `src/qoder-adapter.ts` 的 `buildRequest`）。
+      throw describeWasmFailure(error)
+    } finally {
+      // 🔴 **释放失败绝不能顶替 `try` 块里的原始错误**（真实缺陷，2026-10-12 审计）：
+      //    JS 的 `finally` 里 `throw` 会**无条件覆盖** `try` 里的 `throw`。
+      //    而 `dispose()` → `freePointer()` 的 catch 里确实会 rethrow。
+      try { client?.dispose?.() } catch { /* 静默：不覆盖原始错误 */ }
+    }
   }
 
   /**
@@ -1233,4 +1482,27 @@ export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): Qo
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
   return adapter
+}
+
+// ─────────────────────── 原生搜索的支撑（2026-10-14） ───────────────────────
+
+/**
+ * 把未知值收敛成记录；非对象（含 `null`）返回 `undefined`。
+ *
+ * ⚠️ 与「返回 `{}`」不同：原生搜索的逐项过滤需要区分「不是对象」（丢弃）
+ * 与「是空对象」。
+ */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+}
+
+/** 从非 2xx 响应里取一段可读的上游说明（截断，且不回显敏感内容）。 */
+async function readQoderErrorDetail(response: Response): Promise<string> {
+  try {
+    const text = await response.text()
+    const trimmed = text.trim().slice(0, 300)
+    return trimmed.length > 0 ? `: ${trimmed}` : ''
+  } catch {
+    return ''
+  }
 }

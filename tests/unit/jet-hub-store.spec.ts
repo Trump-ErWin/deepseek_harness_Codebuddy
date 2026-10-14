@@ -15,6 +15,7 @@ import {
   sanitizeAccounts,
   sanitizeDisabledModels,
   sanitizeGatewayEnabled,
+  sanitizeNativeWebSearchEnabled,
   sanitizePermanentLocks,
   sanitizeProviderOrder,
 } from '../../src/jet-hub-store.js'
@@ -51,6 +52,21 @@ describe('sanitizeGatewayEnabled', () => {
     expect(sanitizeGatewayEnabled('false')).toBe(true)
     expect(sanitizeGatewayEnabled(0)).toBe(true)
     expect(sanitizeGatewayEnabled({})).toBe(true)
+  })
+})
+
+describe('sanitizeNativeWebSearchEnabled', () => {
+  it('只有显式 false 才算关闭，其余一律按启用（与网关开关逐字同构）', () => {
+    // ⚠️ 方向不能反：丢键 / 脏值都必须回到**默认启用**。反过来（只认 true）
+    // 会让读取失败变成「原生搜索被静默关闭」，用户只会看到搜索突然开始要
+    // API Key，而他自己根本没关过。
+    expect(sanitizeNativeWebSearchEnabled(false)).toBe(false)
+    expect(sanitizeNativeWebSearchEnabled(undefined)).toBe(true)
+    expect(sanitizeNativeWebSearchEnabled(null)).toBe(true)
+    expect(sanitizeNativeWebSearchEnabled(true)).toBe(true)
+    expect(sanitizeNativeWebSearchEnabled('false')).toBe(true)
+    expect(sanitizeNativeWebSearchEnabled(0)).toBe(true)
+    expect(sanitizeNativeWebSearchEnabled({})).toBe(true)
   })
 })
 
@@ -110,6 +126,8 @@ describe('老契约后端（SettingsStore）', () => {
       aggregateRejections: {},
       loomyPermanentLocked: false,
       gatewayEnabled: true,
+      // save 未携带原生搜索开关 → 写出启用（缺省），读回同值。
+      nativeWebSearchEnabled: true,
       // save 未携带顺序 → 写出空数组（未自定义），读回同值。
       providerOrder: [],
     })
@@ -204,6 +222,11 @@ describe('老契约后端（SettingsStore）', () => {
 })
 
 describe('文件后端（FileStore）', () => {
+  /**
+   * ⚠️ 这两处 `toEqual` 是**整份文档**的逐键断言（`不落盘 permanentLocks` 之类的
+   * 反例也靠它）。新增持久化键时**必须**在这里补一行 —— 否则它会以「期望值与
+   * 实际值差一个键」的形式失败，看起来像回归，其实是快照过期。
+   */
   it('写入后可被新实例读回（跨重启持久化）', async () => {
     const writer = createJetHubStore(makeCtx(undefined))
     await writer.save({ accounts: [ACCOUNT], disabledModels: { buddy: { 'glm-5.2': true } } })
@@ -221,6 +244,8 @@ describe('文件后端（FileStore）', () => {
       loomyPermanentLocked: false,
       // 网关开关缺省启用 —— 与升级前行为一致
       gatewayEnabled: true,
+      // 原生搜索开关缺省启用 —— 与升级前行为一致
+      nativeWebSearchEnabled: true,
       // 顺序缺省空数组（未自定义）—— 与升级前行为一致
       providerOrder: [],
     })
@@ -267,6 +292,44 @@ describe('文件后端（FileStore）', () => {
       'utf-8',
     )
     expect(createJetHubStore(makeCtx(undefined)).load()?.gatewayEnabled).toBe(true)
+  })
+
+  /**
+   * 「渠道原生搜索」总开关的**持久化**守卫（PR95 审计补）。
+   *
+   * ⚠️ 本组用例的存在理由：本键加进 `JetHubState` 时**只**接了 `AccountPool`
+   * 的内存副本与 RPC，**两个后端都没接** —— 于是 `sanitizeNativeWebSearchEnabled`
+   * 有 7 条单测、却**零生产调用者**，用户关掉开关后重启**静默回到原生搜索**。
+   * 上面那组网关用例逐条同构地覆盖了整条链，本键却一条都没有；这组就是把它补成
+   * 同构的（**跨实例读回**才是有效判据 —— 只断言 `sanitize*` 的返回值是同义反复，
+   * 那 7 条单测当初全绿也正是因为这个）。
+   */
+  it('⚠️ 原生搜索开关 false 可跨实例读回（关了就是关了，含老契约后端）', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, nativeWebSearchEnabled: false })
+
+    const reader = createJetHubStore(makeCtx(undefined))
+    expect(reader.load()?.nativeWebSearchEnabled).toBe(false)
+  })
+
+  it('老文档没有原生搜索开关时缺省为启用（= 升级前行为）', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {} }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.nativeWebSearchEnabled).toBe(true)
+  })
+
+  it('原生搜索开关落盘时脏值被归一化为启用', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {}, nativeWebSearchEnabled: 'off' }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.nativeWebSearchEnabled).toBe(true)
   })
 
   /**
@@ -476,6 +539,8 @@ describe('文件后端（FileStore）', () => {
       loomyPermanentLocked: false,
       // 写盘时缺省即启用：读回应如实带回这个默认值。
       gatewayEnabled: true,
+      // 原生搜索开关同理：写盘时缺省即启用，读回同值。
+      nativeWebSearchEnabled: true,
       // 顺序缺省空数组（未自定义）：读回同值。
       providerOrder: [],
     })

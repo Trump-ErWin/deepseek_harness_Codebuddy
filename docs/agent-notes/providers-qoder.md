@@ -127,3 +127,94 @@ HTTP 分支那条判据（`src/qoder-adapter.ts:809` 附近）把 **HTTP 状态�
 该分支实际只靠右边的 `looksLikeBillingError(errorText)` 兜住。
 **本次未改**（不在 IKKJFH 范围内）：注释里写明是「为服务端将来改用 HTTP 状态码下发而预留」，
 是否要补「从 body 里解析业务码」那条腿属独立决策，交维护者判断。
+
+## ⚠️ 渠道原生搜索（2026-10-14 接入）
+
+Qoder 客户端**自带** WebSearch 能力，与聊天同源同账号。本插件把它接到官方
+`web_search` 工具上（`QoderAdapter.searchOnce`，见
+`src/native-search-contract.ts` 的契约说明）。
+
+### 端点与请求形状（全部来自官方客户端源码 + 真机实测）
+
+| 项 | 值 |
+|---|---|
+| host | 本产品的 `encryptedInferBase`（CN = `gateway.qoder.com.cn`；国际实测 `center.qoder.sh` / `api2.qoder.sh` / `gateway.qoder.com.cn` **都能通**） |
+| path | `/api/v1/webSearch/oneSearch` |
+| method | `POST` |
+| 鉴权 | **WASM 签名**（`prepareRequest(host, path, 'POST', 'auth', body)`，本插件已实现于 `src/qoder-wasm.ts`） |
+| 请求头 | `Authorization: Bearer COSY.<载荷>.<签名>` + 18 个 `Cosy-*` 头（全由 WASM 生成）+ `X-Session-ID` |
+
+**明文 payload**（信封内层）：
+```json
+{ "query": "…", "timeRange": "NoLimit",
+  "contents": { "mainText": false, "markdownText": false, "summary": false } }
+```
+
+**明文 body**（信封外层）：
+```json
+{ "payload": "<上面那个 JSON 的字符串>", "encodeVersion": "1" }
+```
+
+**响应**：`{ requestId, pageItems: [{title, link, snippet, publishedTime, hostname, hostLogo}], searchInformation: {searchTime} }`
+
+### 源码依据（`qoder-worker-runtime.obf.mjs`，asar.unpacked 里）
+
+```js
+p0d = "/algo/api/v1/webSearch/oneSearch"
+$bt = class { async search(A) {
+  let e = { query: A.query, …, timeRange: "NoLimit",
+            contents: { mainText: false, markdownText: false, summary: false } }
+  return (await this.sender.send(mi.builder().operation("webSearch.search")
+    .endpoint("webSearch").post(p0d).withSignature("auth")
+    .json({ payload: JSON.stringify(e), encodeVersion: "1" }).build())).json(m0d)
+}}
+// path 另有 `/api/v1/webSearch/unifiedSearch`（通义灵码环境走它）
+function APl() { return ePl() ? "/api/v1/webSearch/unifiedSearch" : "/api/v1/webSearch/oneSearch" }
+// endpoint host：webSearch 与 center **同一个 host**
+poe = { prod: { center: `https://${Mme}`, webSearch: `https://${Mme}`, … } }
+```
+
+### ⚠️ 四个不能改错的点
+
+1. **`hostname` / `hostLogo` 必须丢弃**：官方 output schema 是
+   `additionalProperties: false`，多传字段会让 `createSuccessResult` 抛
+   `ToolOutputError`，**整条调用失败**（不是少一条结果）。
+   ⚠️⚠️ **但 `publishedTime` 属于另一格**（2026-10-14 PR95 审计修正）：官方
+   `dsh-tool-web` 的 output schema 与 seam 的 `WebSearchSource` **都**声明了
+   可选的 `publishedAt?: string`（「provider 给的发布时间戳」）—— 原注释把三个
+   字段一锅端说成「schema 不允许」，对 `publishedTime` **不成立**。
+   **当前刻意仍丢弃**：接它要先真机确认 Qoder 下发的是 ISO-8601 字符串，
+   接错的代价是整条调用失败，收益（多一列时间）不抵风险。**待办**。
+2. **url 字段叫 `link`**（腾讯叫 `url`）—— 投影时必须改名。
+3. **WASM 实例必须 `dispose`**：`QoderContext` 是 wasm 堆上的 Rust 对象，
+   `gluePromise` 是进程级单例，不释放会让堆只增不减 → 长上下文会话最终以裸
+   `RuntimeError: unreachable` 暴毙（真实事故史见 `qoder-wasm.ts` 文件头）。
+4. **两处 path 别混**：`oneSearch` 是默认；`unifiedSearch` 只在通义灵码环境下用。
+
+### 与腾讯（buddy 系）的差异对照
+
+| | 腾讯 | Qoder |
+|---|---|---|
+| 端点 | `/agenttool/v1/search` | `/api/v1/webSearch/oneSearch` |
+| 参数 | `{query, type:'text2text', max_results}` | `{query, timeRange, contents}` |
+| 鉴权 | `Bearer <access_token>` | **COSY 签名（WASM）** |
+| 信封 | 明文 JSON | `{payload, encodeVersion}` + 加密 body |
+| 结果字段 | `results[].{title,url,snippet}` | `pageItems[].{title,link,snippet,…}` |
+| 上限 | 8（上游实测封顶） | 实测返回 10 条（本插件仍按官方 `MAX_RESULTS=8` 截断） |
+
+### 实测记录（2026-10-14）
+
+- CN 免费账号（`qfmodel` 所在的号）：`POST https://gateway.qoder.com.cn/algo/api/v1/webSearch/oneSearch?Encode=1` → **HTTP 200**，
+  返回 10 条 `pageItems`。
+- **与客户端真实调用逐条对比**（客户端侧证据取自本机
+  `~/.qoder-cn/projects/…/d6bb315c-….jsonl` 的真实会话记录）：
+  **URL 10/10 一致、标题 10/10 一致、顺序完全一致**。
+- `searchInformation: { searchTime: 371 }` 是搜索耗时，客户端**未使用**该字段。
+
+### ⚠️ 未验证
+
+- 官方还有第二个后端：`tools.webSearch.provider = bailian`（阿里百炼 MCP，
+  `https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp`，需 Bailian API Key）。
+  本插件**未接入**它 —— 默认走 `qoder` 后端（用户机器上也是默认）。
+- 国际版（`qoder` 非 CN）的搜索 host 官方源码写的是 `center.qoder.sh`，
+  实测三个 host 都能通；本插件用 `product.encryptedInferBase`（`api2.qoder.sh`）。

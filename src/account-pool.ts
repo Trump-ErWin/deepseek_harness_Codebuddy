@@ -274,6 +274,17 @@ export class AccountPool {
    */
   private gatewayEnabledCache = true
   /**
+   * 「渠道原生搜索」总开关的进程内副本（`false` = 全部搜索回官方 provider）。
+   *
+   * 缺键语义是**启用**（与 {@link gatewayEnabledCache} 同一方向）：老文档没有
+   * 本键时保持原生搜索，不会因读取失败而静默改走官方（那会让搜索突然开始
+   * 要 API Key，用户看不出是自己关过还是坏了）。
+   *
+   * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
+   * 唯一后果是回到原生搜索，用户再关一次即可。
+   */
+  private nativeWebSearchCache = true
+  /**
    * 供应商自定义显示顺序（「供应商开关」弹窗拖拽排序）的进程内副本。
    *
    * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
@@ -366,6 +377,8 @@ export class AccountPool {
       this.aggregateRejectionCache = state.aggregateRejections ?? {}
       // 网关开关同理：老文档没有该键 → 保持默认启用。
       this.gatewayEnabledCache = state.gatewayEnabled !== false
+      // 原生搜索总开关同理：老文档没有该键 → 保持默认启用。
+      this.nativeWebSearchCache = state.nativeWebSearchEnabled !== false
       // 供应商顺序同理：老文档没有该键 → 空数组（未自定义）。
       this.providerOrderCache = state.providerOrder ?? []
     }
@@ -452,6 +465,7 @@ export class AccountPool {
         // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
         // 分两次快照会让同一份文档里的字段互相矛盾。
         gatewayEnabled: this.gatewayEnabledCache,
+        nativeWebSearchEnabled: this.nativeWebSearchCache,
         providerOrder: this.providerOrderCache,
       })
     })
@@ -685,6 +699,37 @@ export class AccountPool {
     this.loaded = true
     if (this.store.kind === 'memory') {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，网关开关仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
+  }
+
+  /**
+   * 「渠道原生搜索」总开关当前是否启用。
+   *
+   * 缺键语义为**启用**（见 {@link nativeWebSearchCache}）。
+   *
+   * ⚠️ 调用方（`web-native.ts` 的监听器）**必须每次现读**，不能缓存返回值：
+   * 用户随时可能在 Jet Hub 面板里切换。
+   */
+  nativeWebSearchEnabled(): boolean {
+    this.ensureLoaded()
+    return this.nativeWebSearchCache
+  }
+
+  /**
+   * 打开/关闭「渠道原生搜索」并落盘。
+   *
+   * 关闭后，即使 CodeBuddy / WorkBuddy 渠道也改为走 DeepSeek 官方搜索
+   *（需要 `DEEPSEEK_API_KEY`）—— 即所有渠道的搜索行为统一。
+   */
+  async setNativeWebSearchEnabled(enabled: boolean): Promise<void> {
+    this.ensureLoaded()
+    if (this.nativeWebSearchCache === enabled) return
+    this.nativeWebSearchCache = enabled
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，原生搜索开关仅本次会话有效')
       return
     }
     await this.queueStoreSave()
