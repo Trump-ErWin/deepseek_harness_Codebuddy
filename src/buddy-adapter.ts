@@ -60,7 +60,7 @@ import { detailFieldText } from './openai-compat.js'
 //    取数虽已下沉到本适配器，但「同一种失败在任何渠道报同一个码」这条不能破 ——
 //    否则排查时会把「无账号」误判成「上游故障」。
 //    契约单独成文件是为了避免「渠道层 import 工具层」的反向依赖。
-import { NativeSearchCodes, WebNativeError, type NativeSource } from './native-search-contract.js'
+import { classifyNativeAbort, NativeSearchCodes, WebNativeError, type NativeSource } from './native-search-contract.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -3196,18 +3196,30 @@ async function postBuddySearchJson(
       signal: composed,
     })
   } catch (error) {
-    // 取消与超时必须区分：前者是正常终止（`aborted`），
-    // 后者是预算用尽（`timeout`），都不是上游故障。
-    if (signal.aborted) {
+    // ⚠️⚠️ **不能先判 `signal.aborted` 就直接归 `aborted`**（PR95 审计修正的
+    //    真实缺陷）：本模块在 cordis waterfall 的**内层**，拿到的 `signal` 已被
+    //    外层 `tool-call-timeout-policy` 换成带 deadline 的信号 ⇒ 外层到期时
+    //    `signal.aborted` 同样为真。旧判据会把**超时**报成「search aborted」
+    //    （像是用户按了停止），文案里那串排障指引全部丢失。
+    //    归因必须读 `signal.reason` 的形状 —— 判据与实测六格对照见
+    //    `native-search-contract.ts` 的 `classifyNativeAbort`。
+    const stop = classifyNativeAbort(composed)
+    if (stop === 'aborted') {
       throw new WebNativeError(
         `${product.id} search aborted`,
         NativeSearchCodes.aborted,
         { cause: error },
       )
     }
-    if (timeout.aborted) {
+    if (stop === 'timeout') {
+      // ⚠️ 文案区分**谁**的预算用尽：本模块自己 arm 的（`timeout.aborted`）
+      //    报我们自己的毫秒数；外层 deadline 到期（`timeout.aborted` 为假）
+      //    则说明是宿主给的工具预算被吃满，不能再谎称「我们的 20s 预算」。
+      const budget = timeout.aborted
+        ? `after ${NATIVE_SEARCH_TIMEOUT_MS}ms`
+        : 'before this search returned (the host tool budget elapsed)'
       throw new WebNativeError(
-        `${product.id} search timed out after ${NATIVE_SEARCH_TIMEOUT_MS}ms.\n\n`
+        `${product.id} search timed out ${budget}.\n\n`
         + `The request used endpoint ${JSON.stringify(endpoint)}. `
         + 'Web search uses the same account as chat but a separate endpoint. '
         + 'Retry, or narrow the request; if it keeps timing out the endpoint or network may be unreachable.',

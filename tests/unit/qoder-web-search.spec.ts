@@ -45,7 +45,7 @@ function makeCredential(overrides: Partial<QoderCredential> = {}): QoderCredenti
 function makeAdapter(options: {
   credential?: QoderCredential | undefined
   product?: QoderProduct
-  response?: (() => Response | Promise<Response>) | undefined
+  response?: ((init?: RequestInit) => Response | Promise<Response>) | undefined
 } = {}) {
   const fetchCalls: Array<{ url: string; init: RequestInit }> = []
   const credential = 'credential' in options ? options.credential : makeCredential()
@@ -57,7 +57,7 @@ function makeAdapter(options: {
     fetchImpl: (async (url: string | URL, init?: RequestInit) => {
       fetchCalls.push({ url: String(url), init: init ?? {} })
       if (options.response === undefined) return new Response('{}', { status: 200 })
-      return await options.response()
+      return await options.response(init)
     }) as unknown as typeof fetch,
   })
   return { adapter, fetchCalls }
@@ -297,5 +297,92 @@ describe('Qoder 搜索：并发安全', () => {
     }
     // 已中止的信号不该产生成功的上游调用（fetch 替身会立刻拒绝）
     expect(fetchCalls.length).toBeLessThanOrEqual(1)
+  })
+})
+
+// ───────────────────────── ⑥ 取消 / 超时归因（PR95 审计补） ─────────────────────────
+
+/**
+ * ⚠️ 本组的存在理由（PR95 对抗审计实测出的**两个无牙区**）：
+ *
+ * 1. **变异 M-SIG-Q**：把 `searchOnce` 里的 `signal: composed` 换成
+ *    `new AbortController().signal`（即**彻底忽略调用方取消**），
+ *    本文件原有 22 条用例**全部仍绿** —— 没有一条测信号传递。
+ * 2. **变异 M-MSG-Q**：往 HTTP 错误文案里塞 `[MUTANT-UPSTREAM-MSG]`，
+ *    22 条同样全绿 —— 原有用例只断言 `code`，**从不断言 `message`**。
+ *
+ * 故这组既锁「信号真被透传下去」，也锁「归因与文案」。
+ */
+describe('Qoder 搜索：取消 / 超时的归因', () => {
+  it('⚠️ 调用方取消（DOMException/AbortError）→ aborted，且信号真的传给了 fetch', async () => {
+    const controller = new AbortController()
+    // 调用方取消：reason 是 DOMException/AbortError（实测形状见契约注释）
+    controller.abort(new DOMException('user stop', 'AbortError'))
+    const { adapter, fetchCalls } = makeAdapter({
+      response: async () => { throw new DOMException('user stop', 'AbortError') },
+    })
+    await expect(adapter.searchOnce('x', makeCredential(), controller.signal))
+      .rejects.toMatchObject({ code: NativeSearchCodes.aborted })
+    // ⚠️ M-SIG-Q 的反证：fetch 收到的 signal 必须是 `composed`（可被调用方与
+    //    本模块预算共同中止的那个），**不是**新造的、与调用方无关的信号。
+    expect(fetchCalls).toHaveLength(1)
+    expect(fetchCalls[0]!.init.signal).not.toBe(controller.signal)
+    expect((fetchCalls[0]!.init.signal as AbortSignal).aborted).toBe(true)
+  })
+
+  it('⚠️ 本模块自己的 20s 预算到期 → timeout（不是 aborted）', async () => {
+    // 照 `web-native.spec.ts` 的既有手法：把 20s 预算缩成 1ms，
+    // 从而毫秒级走到 native 预算分支而不真等 20s。
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal)
+    const spy = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) =>
+      realTimeout(ms === 20_000 ? 1 : ms))
+    const { adapter } = makeAdapter({
+      // 替身等本模块的预算真到期，再按其 reason 抛出（与真 fetch 行为一致）。
+      response: async (init?: RequestInit) => {
+        const sig = init?.signal
+        const reason: unknown = await new Promise((resolve) => {
+          if (sig?.aborted === true) return resolve(sig.reason)
+          sig?.addEventListener('abort', () => resolve(sig.reason), { once: true })
+        })
+        throw reason instanceof Error ? reason : new DOMException('timed out', 'TimeoutError')
+      },
+    })
+    try {
+      const err = await adapter.searchOnce('x', makeCredential(), new AbortController().signal)
+        .catch((e: unknown) => e)
+      expect(err).toMatchObject({ code: NativeSearchCodes.timeout })
+      // 文案必须说明是**我们的** 20s 预算用尽
+      expect((err as Error).message).toMatch(/timed out after 20000ms/)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('⚠️⚠️ 外层 harness deadline 到期（TimeoutReason/TOOL_TIMEOUT）必须归 timeout，不得误报 aborted', async () => {
+    // 本组最关键的一格：本模块在 cordis waterfall 的**内层**，生产环境里传进来的
+    // `signal` 就是外层 `tool-call-timeout-policy` 的 deadline 信号。它的
+    // `reason` 是 harness 的 `TimeoutReason`（name/code 见实测对照），
+    // 与「调用方取消」的 `DOMException/AbortError` **形状不同**。
+    // 旧实现「先判 signal.aborted 就归 aborted」会把超时报成「用户取消了搜索」，
+    // 文案里那串排障指引全部丢失。
+    const caller = new AbortController()
+    const timeoutReason = Object.assign(new Error('TOOL_TIMEOUT after 1ms'), {
+      name: 'TimeoutReason', code: 'TOOL_TIMEOUT', timeoutMs: 1,
+    })
+    caller.abort(timeoutReason)
+    const { adapter } = makeAdapter({ response: async () => { throw timeoutReason } })
+
+    const err = await adapter.searchOnce('x', makeCredential(), caller.signal).catch((e: unknown) => e)
+    // 反证必须写在前：旧实现会命中的正是这一格
+    expect((err as { code?: string }).code).not.toBe(NativeSearchCodes.aborted)
+    expect(err).toMatchObject({ code: NativeSearchCodes.timeout })
+    expect((err as Error).message).toMatch(/timed out/)
+    expect((err as Error).message).toMatch(/webSearch\/oneSearch/)
+  })
+
+  it('⚠️ 非 abort 的传输失败 → upstream（不吞成 aborted）', async () => {
+    const { adapter } = makeAdapter({ response: async () => { throw new Error('ECONNRESET') } })
+    await expect(adapter.searchOnce('x', makeCredential(), new AbortController().signal))
+      .rejects.toMatchObject({ code: NativeSearchCodes.upstream })
   })
 })

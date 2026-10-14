@@ -176,9 +176,15 @@ poe = { prod: { center: `https://${Mme}`, webSearch: `https://${Mme}`, … } }
 
 ### ⚠️ 四个不能改错的点
 
-1. **`publishedTime` / `hostname` / `hostLogo` 必须丢弃**：官方 output schema 是
+1. **`hostname` / `hostLogo` 必须丢弃**：官方 output schema 是
    `additionalProperties: false`，多传字段会让 `createSuccessResult` 抛
    `ToolOutputError`，**整条调用失败**（不是少一条结果）。
+   ⚠️⚠️ **但 `publishedTime` 属于另一格**（2026-10-14 PR95 审计修正）：官方
+   `dsh-tool-web` 的 output schema 与 seam 的 `WebSearchSource` **都**声明了
+   可选的 `publishedAt?: string`（「provider 给的发布时间戳」）—— 原注释把三个
+   字段一锅端说成「schema 不允许」，对 `publishedTime` **不成立**。
+   **当前刻意仍丢弃**：接它要先真机确认 Qoder 下发的是 ISO-8601 字符串，
+   接错的代价是整条调用失败，收益（多一列时间）不抵风险。**待办**。
 2. **url 字段叫 `link`**（腾讯叫 `url`）—— 投影时必须改名。
 3. **WASM 实例必须 `dispose`**：`QoderContext` 是 wasm 堆上的 Rust 对象，
    `gluePromise` 是进程级单例，不释放会让堆只增不减 → 长上下文会话最终以裸

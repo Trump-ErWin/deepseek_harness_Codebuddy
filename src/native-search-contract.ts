@@ -65,15 +65,62 @@ export const NativeSearchCodes = {
    * 上游请求超时。
    *
    * ⚠️ 与 `upstream` 分开（对抗性审查 m2）：超时是一条独立的失败归因。
-   * 且要知悉：各适配器的 20s 预算**小于**官方 `web_search` 的 `timeoutMs`（30s），
-   * 故本超时**总是先于**宿主 `tool-call-timeout-policy` 的 `TOOL_TIMEOUT` 触发
-   * —— 模型看到的是本链路的文案，而不是「tool call timed out」。
-   * 这是刻意的：原生链路的预算由各适配器自己兜，不依赖外层包装器。
+   *
+   * ⚠️⚠️ **本码不再「总是先于」宿主的 `TOOL_TIMEOUT`**（PR95 审计修正，原注释
+   * 断言「各适配器的 20s 预算小于官方 30s ⇒ 本超时总是先触发」）。实测结论：
+   *
+   * 1. 宿主 `tool-call-timeout-policy` 在 `dsh-base/cordis.patch.yml` 里的加载
+   *    顺序**早于** `tool-web`，而 cordis 的 waterfall 是「先注册者在外层」
+   *    （实测链序 `A-before → B → 工具体 → A-after`）⇒ 本模块在**内层**，
+   *    拿到的 `exec.signal` **已被外层换成带 deadline 的信号**。
+   * 2. `searchTimeoutMs` 是 `tool-web` 的**可配置项**（默认 30s，可被
+   *    `cordis.yml` 覆盖）。一旦部署调到 < 本模块预算，**外层先到期**。
+   * 3. 外层到期时 `signal.aborted === true` 但 `signal.reason` 是 harness 的
+   *    `TimeoutReason`（`name:'TimeoutReason'`、带 `code:'TOOL_TIMEOUT'`），
+   *    与「调用方取消」（`DOMException` / `name:'AbortError'`）**形状不同**
+   *    ⇒ 必须靠 {@link classifyNativeAbort} 读 `reason`，**不能只看布尔值**
+   *    （只看布尔会把超时误报成「用户取消」，丢掉全部排障指引）。
    */
   timeout: 'WEB_NATIVE_TIMEOUT',
   /** 调用方取消（正常终止，不是失败）。 */
   aborted: 'WEB_NATIVE_ABORTED',
 } as const
+
+/**
+ * 把一次 abort **归因**成三种结果之一（**两层共用的唯一实现**）。
+ *
+ * ## 为什么不能只看 `signal.aborted`
+ *
+ * 实测（PR95 审计，六格形状对照；`@deepseek-ai/dsh-timeout` 的 `deadline()`）：
+ *
+ * | 场景 | `reason.constructor` | `reason.name` | `reason.code` |
+ * |---|---|---|---|
+ * | 调用方取消（`abort()` 不带 reason / 带 `AbortError`） | `DOMException` | `AbortError` | 20 |
+ * | 本模块自己的 `AbortSignal.timeout` | `DOMException` | `TimeoutError` | 23 |
+ * | **宿主 timeout-policy 的 `deadline()` 到期** | **`TimeoutReason`** | **`TimeoutReason`** | `TOOL_TIMEOUT` |
+ *
+ * ⇒ `aborted === true` 对三者**全部成立**。若先判它并归 `aborted`，宿主 deadline
+ * 到期时模型看到的是「search aborted」（像是用户按了停止），而真实原因是超时、
+ * 文案里那串排障指引（端点、重试建议）**全部丢失**。
+ *
+ * ## 判据（刻意宽松，避免假阴性）
+ *
+ * 1. `reason.name === 'TimeoutReason'` → `timeout`（harness 的 `deadline()`）；
+ * 2. `reason.name === 'TimeoutError'` → `timeout`（`AbortSignal.timeout`）；
+ * 3. 其余（含 `AbortError` / `undefined` / 未知形状）→ `aborted`。
+ *
+ * ⚠️ 第 3 条是**放行未知**：未知形状归「取消」是保守方向 —— `aborted` 不重试、
+ * 不消耗配额；反过来把取消报成超时会诱导重试。
+ *
+ * @param signal - 熔合后的信号（本模块自己的预算 + 外层 deadline + 调用方取消）。
+ * @returns `'timeout'` / `'aborted'` / `'none'`（未 abort）。
+ */
+export function classifyNativeAbort(signal: AbortSignal): 'timeout' | 'aborted' | 'none' {
+  if (!signal.aborted) return 'none'
+  const name = (signal.reason as { name?: unknown } | undefined)?.name
+  if (name === 'TimeoutReason' || name === 'TimeoutError') return 'timeout'
+  return 'aborted'
+}
 
 /**
  * 一条已投影成官方 `sources[]` 形态的结果。

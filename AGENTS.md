@@ -127,8 +127,11 @@ Jet Hub 页头有总开关（`nativeWebSearchEnabled`，缺键默认启用）：
 4. **输出投影贴合官方 schema**：`sources[{url,title?,snippet?}]`（`url` 必填、
    `additionalProperties: false`）—— 多传字段会让 `createSuccessResult` 抛
    `ToolOutputError`，整条调用失败（不是少一条结果）。
-   各适配器**必须丢掉**自己多余的字段（Qoder 的 `publishedTime` / `hostname` /
-   `hostLogo` 都在此列）。
+   各适配器**必须丢掉**自己多余的字段（Qoder 的 `hostname` / `hostLogo` 在此列）。
+   ⚠️ **但 `publishedTime` 是例外**（2026-10-14 审计修正）：官方 output schema 与
+   seam 的 `WebSearchSource` **都**声明了可选的 `publishedAt?: string`，原注释把三个
+   字段一锅端说成「schema 不允许」**对 `publishedTime` 不成立**。当前**刻意仍丢弃**
+   —— 接它要先真机确认 Qoder 下发的是 ISO-8601 字符串，接错的代价是整条调用失败。
 5. **凭据必须与聊天链路同源**：经 `Xxx.resolveCredentialFor` 复用**同一个**
    `resolveCredential` 实例；另建一份会让「enabled / 模型级限流 / 免费判定 /
    余额分档 / 池兜底 / 账本回报」六步在两条链路上漂移。
@@ -138,6 +141,22 @@ Jet Hub 页头有总开关（`nativeWebSearchEnabled`，缺键默认启用）：
    用 `try/finally`（`finally` 里的 `throw` 会**无条件覆盖** `try` 里的原始错误）。
 7. **`url` 字段名各家不同**：腾讯叫 `results[].url`、Qoder 叫 `pageItems[].link`。
    投影在**适配器**里做，工具层的合并算法对渠道无感。
+8. ⚠️⚠️ **取消 / 超时的归因必须读 `signal.reason`，不能只看 `signal.aborted`**
+   （2026-10-14 审计新增，**实测六格对照**）。本模块在 cordis waterfall 的**内层**
+   （见下方「实测边界」），生产环境拿到的 `exec.signal` 已被外层
+   `tool-call-timeout-policy` 换成带 deadline 的信号 ⇒ 外层到期时
+   `aborted === true` 但**原因不是取消**：
+   | 场景 | `reason.constructor` | `reason.name` |
+   |---|---|---|
+   | 调用方取消 | `DOMException` | `AbortError` |
+   | 本模块自己的 `AbortSignal.timeout` | `DOMException` | `TimeoutError` |
+   | **外层 deadline 到期** | **`TimeoutReason`** | **`TimeoutReason`** |
+   判据**只留一份实现** `classifyNativeAbort`（`native-search-contract.ts`），
+   buddy 与 qoder **都必须走它**；旧写法（先判 `aborted` 就归 aborted）会把超时报成
+   「用户取消了搜索」，文案里那串排障指引**全部丢失**。
+   ⚠️ 两个渠道**各自**必须自己 arm 一份 `AbortSignal.any([signal, AbortSignal.timeout(20s)])`
+   —— 只透传 `signal` 会让 `timeout` / `aborted` 在该路径永不产生（qoder 曾如此，
+   而契约注释却声称「各适配器都有 20s 预算」⇒ **注释与实现不符**）。
 
 ### 实测边界（2026-10-14 真机）
 
@@ -149,8 +168,17 @@ Jet Hub 页头有总开关（`nativeWebSearchEnabled`，缺键默认启用）：
   顺序完全一致**（客户端侧证据取自 `~/.qoder-cn/projects/…/d6bb315c-….jsonl`）。
   协议细节见 `docs/agent-notes/providers-qoder.md` 的「渠道原生搜索」一节；
 - ✅ 已验证：`web_fetch` 在任何渠道都走官方（开关开着时也不出现 `workbuddy fetch` 文案）；
-- ⚠️ **未验证**：本监听器在 `tools/execute` 链中的**位置**（决定外层超时策略是否
-  生效）、宿主升级后 `requestHeader()` 在工具执行时**是否已就绪**；
+- ✅ **已验证**（2026-10-14 PR95 审计补测）：本监听器在 `tools/execute` 链中的
+  **位置** = **内层**。依据两条：① `dsh-base/cordis.patch.yml` 里
+  `tool-call-timeout-policy`（L401）**先于** `tool-web`（L486）声明，而 cordis 的
+  waterfall 是「**先注册者在外层**」（cordis 的 `dispatch` 按注册序 `push`，
+  `waterfall` 顺序 `shift`）；② 真 cordis 探针实测链序
+  `A-before → B-sees:DEADLINE-FROM-A → INNER-BODY → A-after` —— 后注册者拿到的
+  `exec.signal` **已被前注册者替换**。⇒ 外层超时策略**生效**，本模块必须在
+  内层处理「外层 deadline 也可能 abort 我的 signal」（见上面第 8 条）。
+  ⚠️ 由此推翻本 PR 原注释「我们的 20s 预算总是先于宿主 30s 触发」：
+  `searchTimeoutMs` 是**可配置项**，调小后外层先到期。
+- ⚠️ **仍未验证**：宿主升级后 `requestHeader()` 在工具执行时**是否已就绪**。
 - ⚠️ **未接入**：Qoder 的 `bailian` 搜索后端（需百炼 API Key，默认不用）。
 
 研究记录见 `docs/workbuddy-native-search-research.md`（含端点探测、请求头最小集、

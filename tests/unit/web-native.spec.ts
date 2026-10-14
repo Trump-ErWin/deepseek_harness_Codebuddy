@@ -700,11 +700,68 @@ describe('错误：直接抛，不自己包装', () => {
       throw reason instanceof Error ? reason : new DOMException('timed out', 'TimeoutError')
     }))
     try {
-      await expect(run(makeExec({ provider: 'workbuddy' })))
-        .rejects.toMatchObject({ code: 'WEB_NATIVE_TIMEOUT' })
+      const err = await run(makeExec({ provider: 'workbuddy' })).catch((e: unknown) => e)
+      expect(err).toMatchObject({ code: 'WEB_NATIVE_TIMEOUT' })
+      // 文案必须点明是**我们自己的** 20s 预算用尽（不是外层工具预算）。
+      expect((err as Error).message).toMatch(/timed out after 20000ms/)
     } finally {
       vi.unstubAllGlobals()
       vi.restoreAllMocks()
+    }
+  })
+
+  /**
+   * ⚠️⚠️ **本条对应 PR95 审计发现的真实缺陷（D3）**。
+   *
+   * 本模块在 cordis waterfall 的**内层**（实测：`dsh-base` 的
+   * `tool-call-timeout-policy` 先注册 ⇒ 在外层），所以生产环境里传进来的
+   * `exec.signal` **就是**外层那条带 deadline 的信号。外层到期时：
+   *
+   * - `signal.aborted === true`（新旧实现在这里**没有区别**）；
+   * - 但 `signal.reason` 是 harness 的 `TimeoutReason`
+   *   （`name:'TimeoutReason'`、`code:'TOOL_TIMEOUT'`），
+   *   **不是**调用方取消的 `DOMException`/`AbortError`。
+   *
+   * 旧实现先判 `signal.aborted` 就归 `aborted` ⇒ 把**超时**报成「search aborted」
+   * （像是用户按了停止），文案里那串排障指引（端点、重试建议）**全部丢失**。
+   *
+   * ⚠️ 判据刻意写成「**不是** aborted 且**是** timeout」两条：只写后者的话，
+   * 一个把两者都判成 timeout 的实现也能过。
+   */
+  it('⚠️⚠️ 外层 harness deadline 到期（TimeoutReason）→ TIMEOUT，不得误报 aborted', async () => {
+    const { adapter } = makeAdapter()
+    const run = mount({ workbuddy: adapter })
+    const authority = new AbortController()
+    const timeoutReason = Object.assign(new Error('TOOL_TIMEOUT after 1ms'), {
+      name: 'TimeoutReason', code: 'TOOL_TIMEOUT', timeoutMs: 1,
+    })
+    // 模拟外层 deadline 到期：它 abort 的是**它自己替换后的** exec.signal，
+    // 故这里直接给一个已带该 reason 中止的信号。
+    authority.abort(timeoutReason)
+    vi.stubGlobal('fetch', vi.fn(async () => { throw timeoutReason }))
+    try {
+      const err = await run(makeExec({ provider: 'workbuddy', signal: authority.signal }))
+        .catch((e: unknown) => e)
+      expect((err as { code?: string }).code).not.toBe('WEB_NATIVE_ABORTED')
+      expect(err).toMatchObject({ code: 'WEB_NATIVE_TIMEOUT' })
+      expect((err as Error).message).toMatch(/agenttool\/v1\/search/)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('⚠️ 调用方取消（AbortError）仍归 ABORTED（新判据不得把取消翻成超时）', async () => {
+    const { adapter } = makeAdapter()
+    const run = mount({ workbuddy: adapter })
+    const controller = new AbortController()
+    controller.abort(new DOMException('user stop', 'AbortError'))
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new DOMException('user stop', 'AbortError') }))
+    try {
+      const err = await run(makeExec({ provider: 'workbuddy', signal: controller.signal }))
+        .catch((e: unknown) => e)
+      expect(err).toMatchObject({ code: 'WEB_NATIVE_ABORTED' })
+    } finally {
+      vi.unstubAllGlobals()
     }
   })
 })
