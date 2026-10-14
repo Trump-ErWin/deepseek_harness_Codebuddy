@@ -602,7 +602,7 @@ describe('prepareCall：真实链路 prepareCall → call.stream', () => {
         listProviders: () => [{ id: 'buddy', name: 'b' }, { id: 'codearts', name: 'c' }],
         resolveModelInfo: async (provider: string) => (provider === 'buddy'
           ? { reasoning: { efforts: [{ id: 'low' }, { id: 'high' }] } }
-          : { reasoning: { efforts: [{ id: 'on' }, { id: 'off' }] } }),
+          : { reasoning: { efforts: [{ id: 'off' }, { id: 'on' }] } }),
         stream: (options: { provider: string; reasoningEffort?: string }) => {
           seen.push({ provider: options.provider, effort: options.reasoningEffort })
           return (async function* () { yield { type: 'text', text: 'ok' } })()
@@ -654,7 +654,7 @@ describe('prepareCall：真实链路 prepareCall → call.stream', () => {
         listProviders: () => [{ id: 'buddy', name: 'b' }, { id: 'codearts', name: 'c' }],
         resolveModelInfo: async (provider: string) => (provider === 'buddy'
           ? { reasoning: { efforts: [{ id: 'low' }, { id: 'high' }] } }
-          : { reasoning: { efforts: [{ id: 'on' }, { id: 'off' }] } }),
+          : { reasoning: { efforts: [{ id: 'off' }, { id: 'on' }] } }),
         stream: (options: { provider: string; reasoningEffort?: string }) => {
           seen.push({ provider: options.provider, effort: options.reasoningEffort })
           return (async function* () {

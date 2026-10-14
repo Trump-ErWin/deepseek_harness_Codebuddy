@@ -1351,7 +1351,22 @@ IPv4 / IPv6 / 主机名 / zone id；国际域名请用 punycode。
 | LobsterAI | 关闭 / 高 / **Max** | `off` / `high` / **`xhigh`** | `max` → 400 |
 | Cline | None / … / **Extra** | `none` / … / **`max`** | `xhigh` → 400 |
 | TRAE | **Light** / High / **Extra High** | **`light`** / `high` / **`extra_high`** | `low` / `xhigh` → 400 |
-| Raccoon | **开启 / 关闭** | **`on`** / `off` | 恰好能用 |
+| Raccoon | **关闭 / 开启** | **`off`** / `on` | 恰好能用 |
+
+⚠️⚠️ **档位数组的顺序 = 强度序（弱 → 强），不是「默认档排第一」**（Issue IKLIDV）。
+DSH 的契约把该数组当**展示顺序**（`dsh-llm/lib/types/types.d.ts` 原文
+`Supported efforts in adapter-preferred display order`），而官方客户端**直接 `map`
+不排序**（`dsh-client-ui-model-selection/lib/client.js` 的 `effortChoices`）
+⇒ 任何「按数组顺序铺成一条轴」的渲染（官方纵向 `menuitemradio` 列表、第三方横向滑条）
+都直接吃它。把默认档排首位只在**纵向**列表里成立，铺成**横向**轴就变成「左强右弱」。
+强度序的权威是本仓库 `REASONING_EFFORT_RANK`。三处同型已一并规整（顺序全部为
+`关闭 → 开启`）：`llm-adapter.ts` 的 `CODEARTS_REASONING_EFFORTS`（**唯一定义处**，
+已知与未知模型共用）、`raccoon-product.ts` 的 `RACCOON_REASONING_EFFORTS`、
+`minimax-adapter.ts` 的 switchable 追加档。⚠️ `defaultEffort` 与数组位置是**两件事**，
+且**不得**用 `array[0]` 推定默认档（raccoon 那处曾如此，顺序一改就会静默把默认档
+翻成「关闭」—— 修法见 `raccoonDefaultEffort`，入参化以便用例真能测到那一格）。
+⚠️ **Qoder 不在此列**：它的乱序是**上游目录原样**（实测 8 个账号键序完全一致），
+如实镜像、刻意不重排；**排序责任在渲染方**（见 `qoder-product.ts` 的注释）。
 
 ⚠️ **`id` 与 `name` 不是同一个概念**，仓库里已有两处同款教训：
 `lobsterai-adapter.ts` 的 `reasoningFor`（Issue #IKHCZF：最强档显示成 XHigh，而产品侧

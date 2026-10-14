@@ -867,7 +867,7 @@ POST /minimax-cloud/api/v1/signin/claim?timezone_id=<IANA>   # body {}
 | 模型 | mode | effort_options | 实测行为 | 我方声明 |
 |---|---|---|---|---|
 | M3.1-Flash-Preview | `forced_on` | ✅ `default/low/medium/high/xhigh/max` | 传 disabled ⇒ **硬 400** | 6 档（默认 `default`） |
-| **M3** | **`switchable`** | ❌ 无 | **不发 ⇒ 不思考**；adaptive ⇒ 2785+ 字符 | `on` + `none` |
+| **M3** | **`switchable`** | ❌ 无 | **不发 ⇒ 不思考**；adaptive ⇒ 2785+ 字符 | `none` + `on`（强度序） |
 | M2.7 / M2.7-highspeed | `forced_on` | ❌ 无 | 传 disabled ⇒ **静默忽略** | 不声明 |
 
 **M3.1 必须 adaptive**（服务端原话，实测 HTTP 400）：
@@ -885,8 +885,11 @@ POST /minimax-cloud/api/v1/signin/claim?timezone_id=<IANA>   # body {}
 我第二版只加 `none` ⇒ **只能关、无法开**（把模型强项藏起来了）。
 
 ⇒ 取客户端**权威词汇**（`thinking.js` 的 `isMiniMaxM3ThinkingMode`：
-`value === 'on' || value === 'off'`）声明 **`['on','none']`**
-（`on`→`adaptive`、`none`→`disabled`；`off` 在 DSH 侧的惯用名是 `none`）。
+`value === 'on' || value === 'off'`）声明 **`['none','on']`**（**强度序**，Issue IKLIDV；
+`on`→`adaptive`、`none`→`disabled`；`off` 在 DSH 侧的惯用名是 `none`）。
+⚠️ 原写法是 `['on','none']`（把默认档排首位）—— 那在**横向档位轴**上会变成
+「左强右弱」（「开启」贴最左）。规整理由见下方「展示名」那段。
+
 ⚠️ **不设 `defaultEffort`**（M3 无 `default_effort`）⇒ 保持服务端默认（=不思考），
 **不擅自**设成 `on`（那会改变用户既有行为）。
 
@@ -895,6 +898,11 @@ POST /minimax-cloud/api/v1/signin/claim?timezone_id=<IANA>   # body {}
 
 ⚠️ **展示名**：远端档位用原文（官方 IDE 就是 `default`/`low`/…），
 但 `on`/`none` 是**我们追加**的，给中文「开启思考」/「关闭思考」。
+⚠️ **追加顺序是 `none` 在前、`on` 在后**（强度序，Issue IKLIDV）：DSH 把
+`reasoning.efforts` 当**展示顺序**且客户端**不排序**，原先的 `['on','none']`
+会让「开启」落在横向档位轴的最左（左强右弱）。⚠️ 远端 `effort_options` 那段
+**保持原序**（如实镜像上游），故两段拼接后的数组**不一定全局单调** ——
+只有「我们自己追加的那一对」按强度序排。
 
 ⚠️ **档位真的生效**（实测同一难题）：M3.1 `low`=572 / `medium`=1181 /
 `max`=1297 字符 ⇒ **不是空转**。故断言必须比较**不同档位的思考量**，

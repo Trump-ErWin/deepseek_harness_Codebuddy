@@ -27,7 +27,9 @@ const bridge = {
  * 该模型根本不认识的档位硬塞过去。
  */
 describe('normalizeReasoningEffort', () => {
-  const ON_OFF = { reasoning: { efforts: [{ id: 'on' }, { id: 'off' }] } }
+  // ⚠️ 顺序按真实声明（强度序：`off` 在 `on` 前，Issue IKLIDV）。
+  // 翻译层按 rank 就近匹配、**不看位置**，故顺序在此不影响任何结论。
+  const ON_OFF = { reasoning: { efforts: [{ id: 'off' }, { id: 'on' }] } }
 
   it('★ 模型未声明思考档位时不下发该参数（而不是原样透传未知的档位）', () => {
     // 原样透传会得到 DSH 侧的 UNSUPPORTED_REASONING_EFFORT（实机报障原句）。
@@ -201,7 +203,7 @@ describe('OpenAI gateway request conversion', () => {  it('parses a namespaced m
   })
 
   it('maps generic reasoning levels to the provider declared on/off levels', () => {
-    const info = { reasoning: { efforts: [{ id: 'on' }, { id: 'off' }] } }
+    const info = { reasoning: { efforts: [{ id: 'off' }, { id: 'on' }] } }
     expect(normalizeReasoningEffort('max', info)).toBe('on')
     expect(normalizeReasoningEffort('high', info)).toBe('on')
     expect(normalizeReasoningEffort('none', info)).toBe('off')
