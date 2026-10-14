@@ -69,6 +69,9 @@
  */
 import { describe, expect, it } from 'vitest'
 import { describeWasmFailure, QoderEncryptedInfer, __testing, type QoderInferAsk } from '../../src/qoder-wasm.js'
+// ⚠️ 生产路径的原生搜索也走 WASM（`searchOnce` 内部 create/dispose），
+//    故它同样属于本闸的管辖范围。
+import { QoderAdapter } from '../../src/qoder-adapter.js'
 
 const PAGE_BYTES = 65_536
 
@@ -228,6 +231,56 @@ describe('Qoder WASM 堆泄漏闸', () => {
     })
     await expect(Promise.resolve().then(() => next.prepareInfer(dshLikeAsk()))).resolves.toBeTruthy()
     next.dispose()
+  })
+
+  it('⚠️ 生产路径 `QoderAdapter.searchOnce` 必须自己 dispose（否则每次搜索都泄漏）', async () => {
+    // ⚠️⚠️ 这条用例的存在理由（2026-10-14 变异测试实测）：
+    //
+    // 上面三条守的是 `QoderEncryptedInfer` 的**直接**用法。而原生搜索走的是
+    // `QoderAdapter.searchOnce` —— 它在内部 **自己** `create` / `dispose`。
+    // 把 `searchOnce` 里那句 `client?.dispose?.()` 删掉后，本文件原有 4 条用例
+    // **全部仍绿**（实测）⇒ 存在一个**零守卫**的生产路径。
+    //
+    // ## 🔴 `REPEAT = 500` 是**标定过的**，不要调小
+    //
+    // 首次写这条用例时用了 30 次，结果**变异抓不到**（删掉 dispose 后仍全绿）。
+    // 独立诊断（`create` 有/无 dispose 各 500 次，冷堆）实测：
+    //
+    // | 组 | 30 次 | 500 次 |
+    // |---|---|---|
+    // | create + dispose（生产路径） | 1 页 | **1 页** |
+    // | create **不** dispose（反向控制） | 1 页 | **13 页** |
+    //
+    // ⇒ 30 次时 `memory.grow` 的单调性把差异吃掉了（首次分配就把堆推到高水位，
+    //    后续复用 ⇒ 两种实现都只涨 1 页，**信噪比 1.0**）；500 次时信噪比 **13×**。
+    __testing.resetGlue()
+    const REPEAT = 500
+    const before = await __testing.wasmHeapBytes()
+    for (let i = 0; i < REPEAT; i += 1) {
+      // fetch 恒失败即可：本用例只关心 `searchOnce` **有没有走 finally 里的
+      // dispose**，不关心搜索结果。失败路径同样必须释放。
+      const adapter = new QoderAdapter({
+        credentialRef: 'QODER_ACCOUNT_LEAK_GATE' as never,
+        resolveCredential: async () => ({
+          security_oauth_token: 'leak-gate-token',
+          access_token: 'leak-gate-token',
+          machine_id: MACHINE_ID,
+          uid: USER.uid,
+        }) as never,
+        refresh: async () => {},
+        fetchImpl: (async () => { throw new Error('leak-gate: 故意失败') }) as unknown as typeof fetch,
+      })
+      await adapter.searchOnce('leak gate', {
+        security_oauth_token: 'leak-gate-token',
+        access_token: 'leak-gate-token',
+        machine_id: MACHINE_ID,
+        uid: USER.uid,
+      }, new AbortController().signal).catch(() => { /* 失败是预期的 */ })
+    }
+    const pages = (await __testing.wasmHeapBytes() - before) / PAGE_BYTES
+    // 标定：生产路径 1 页、无 dispose 13 页 ⇒ 阈值 4 页落在两者之间且留足余量。
+    expect(pages, `searchOnce × ${REPEAT} 涨了 ${pages} 页（应 ≈1，说明 finally 里的 dispose 失效）`)
+      .toBeLessThan(4)
   })
 })
 

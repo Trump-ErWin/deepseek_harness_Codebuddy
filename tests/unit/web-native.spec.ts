@@ -35,12 +35,18 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
+import { installWebNative, type WebNativeToolExecution } from '../../src/web-native.js'
+// ⚠️ 契约（错误类型 / 错误码 / 适配器面 / 结果形状）住在 `native-search-contract.ts`，
+//    **不从 `web-native.ts` 取** —— 那个模块现在只留工具层逻辑（2026-10-14 架构改造）。
 import {
-  installWebNative,
+  NativeSearchCodes,
   WebNativeError,
   type NativeSearchAdapter,
-  type WebNativeToolExecution,
-} from '../../src/web-native.js'
+  type NativeSource,
+} from '../../src/native-search-contract.js'
+// ⚠️ 替身的 `searchOnce` 委托给**真实的腾讯实现**（理由见 `makeAdapter` 注释）。
+import { performBuddySearch } from '../../src/buddy-adapter.js'
+import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
 
 // ───────────────────────── 替身 ─────────────────────────
 
@@ -72,7 +78,27 @@ function makeExec(overrides: {
   }
 }
 
-/** 造一个记录调用的适配器替身。 */
+/**
+ * 造一个记录调用的适配器替身。
+ *
+ * ## ⚠️ `searchOnce` 委托给**真实的腾讯实现**（`performBuddySearch`）
+ *
+ * 本文件测的是**工具层**（`web-native.ts`：渠道判断 / 合并 / 入参校验），按
+ * 「结构化替身」原则，`searchOnce` 本该用一个手写假实现。
+ *
+ * **但 2026-10-14 的架构改造**把腾讯取数搬到了 `buddy-adapter.ts`，而本文件
+ * 原有的 20+ 条用例（请求形状 / `results[]` 投影 / 边界防御）**测的正是那段逻辑**。
+ * 若这里换成假实现，那些用例会全部失去意义（变成自测自）。
+ *
+ * 故此处**故意委托真实实现**：`fetch` 仍被 `vi.stubGlobal` 拦截，故全程无网络。
+ * 这是「借真实实现驱动工具层」的取舍 —— 代价是本文件对 `buddy-adapter.ts` 有
+ * 隐性耦合；好处是那 20+ 条用例**逐字保持有效**，不用改一行断言。
+ *
+ * ⚠️ Qoder 渠道的工具层行为**不在这里测**（Qoder 的取数在 `qoder-adapter.ts`，
+ * 由 `qoder-web-search.spec.ts` 覆盖）。本文件的渠道用例全部走腾讯。
+ *
+ * @param credential - 凭据替身；`'default'` 表示「有效凭据」。
+ */
 function makeAdapter(credential: { access_token: string } | undefined | 'default' = 'default') {
   const calls: Array<string | undefined> = []
   const resolved = credential === 'default' ? { access_token: 'AT' } : credential
@@ -81,6 +107,8 @@ function makeAdapter(credential: { access_token: string } | undefined | 'default
       calls.push(modelId)
       return resolved as never
     },
+    searchOnce: async (query, cred, signal) =>
+      await performBuddySearch(query, cred, signal, WORKBUDDY),
   }
   return { adapter, calls }
 }
@@ -90,6 +118,8 @@ function makeAdapter(credential: { access_token: string } | undefined | 'default
  *
  * ⚠️ 不能写成 `makeAdapter(undefined)`：JS 的默认参数在实参为 `undefined` 时
  * **会触发默认值**，于是替身照样返回有效凭据，用例变成假绿（首版就踩了这个坑）。
+ *
+ * ⚠️ 这里也委托真实实现：无凭据时它会抛 `noAccount` 错误 —— 正是我们要断言的。
  */
 function makeNoCredentialAdapter() {
   const calls: Array<string | undefined> = []
@@ -98,8 +128,19 @@ function makeNoCredentialAdapter() {
       calls.push(modelId)
       return undefined as never
     },
+    searchOnce: async (query, cred, signal) =>
+      await performBuddySearch(query, cred, signal, WORKBUDDY),
   }
   return { adapter, calls }
+}
+
+/** 造一个绑定到指定产品（决定端点前缀）的适配器替身。 */
+function makeProductAdapter(product: typeof CODEBUDDY | typeof WORKBUDDY) {
+  const adapter: NativeSearchAdapter = {
+    resolveCredentialFor: async () => ({ access_token: 'AT' }) as never,
+    searchOnce: async (query, cred, signal) => await performBuddySearch(query, cred, signal, product),
+  }
+  return adapter
 }
 
 /**
@@ -321,7 +362,8 @@ describe('请求形状：与客户端原生实现对齐', () => {
   })
 
   it('buddy 渠道用 copilot.tencent.com（与插件 product.ts 一致）', async () => {
-    const { adapter } = makeAdapter()
+    // ⚠️ 端点前缀由**产品配置**决定，故这里必须绑 `CODEBUDDY`（不是默认的 WORKBUDDY）。
+    const adapter = makeProductAdapter(CODEBUDDY)
     const run = mount({ buddy: adapter })
     const fetchMock = vi.fn(async () => jsonResponse({ results: [] }))
     vi.stubGlobal('fetch', fetchMock)
@@ -869,6 +911,9 @@ describe('真实 cordis 集成', () => {
 
   const adapter: NativeSearchAdapter = {
     resolveCredentialFor: async () => ({ access_token: 'AT' }) as never,
+    // 与 `makeAdapter` 同款：委托真实腾讯实现，`fetch` 由用例 stub。
+    searchOnce: async (query, cred, signal) =>
+      await performBuddySearch(query, cred, signal, WORKBUDDY),
   }
 
   function exec(provider: string): WebNativeToolExecution {
