@@ -4107,6 +4107,31 @@ describe('BuddyAdapter 直连路径的腾讯风控指纹改写', () => {
     expect(textsOfWire(wire)).toContain(`A: ${REWRITE}`)
   })
 
+  it('★ IKLS2L：Claude Code 身份句在**直连**路径也被改写（system 与 assistant 两处）', async () => {
+    // Claude Code 的 `[model-check]` 探测路径漏传 `skipSystemPromptPrefix`，
+    // 于是身份句每次都被注入 system ⇒ 每次 400/11128（Gitee IKLS2L）。
+    // 这条守的是「DSH 直连方向也过这一层」—— 只在网关补 = 换一个入口又被拦。
+    const C_TRIGGER = "You are Claude Code, Anthropic's official CLI for Claude"
+    const C_REWRITE = "You are Claude Code, Anthropic's CLI for Claude"
+    // ① options.system（第四个产出点）
+    const viaSystem = await wireOf([{ role: 'user', content: text('hi') }], { system: `${C_TRIGGER}.` })
+    expect(viaSystem[0]?.role).toBe('system')
+    expect(String(viaSystem[0]?.content)).toBe(`${C_REWRITE}.`)
+    // ② serializeMessages 的 system 与 assistant 正文两处
+    const wire = await wireOf([
+      { role: 'system', content: text(`S: ${C_TRIGGER}`) },
+      { role: 'user', content: text('继续') },
+      { role: 'assistant', content: text(`A: ${C_TRIGGER}`) },
+      { role: 'user', content: text('再说一次') },
+    ])
+    const texts = textsOfWire(wire)
+    expect(texts).toContain(`S: ${C_REWRITE}`)
+    expect(texts).toContain(`A: ${C_REWRITE}`)
+    // user 不碰（实测该角色放行）。
+    expect(texts).toContain('继续')
+    expect(texts.some((value) => value.includes(C_TRIGGER))).toBe(false)
+  })
+
   /**
    * 首条角色（2026-10-12 实测，与上面的指纹问题是**两件事**）。
    *
