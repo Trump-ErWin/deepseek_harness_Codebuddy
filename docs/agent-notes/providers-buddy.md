@@ -572,6 +572,63 @@ provider = workbuddy   model = deepseek-v4.1-flash
 只读探针 `scripts/probe-workbuddy-gitstatus-fingerprint.mjs`（绕开适配器、逐账号发
 同一条对照请求；`--cn` 切 CodeBuddy）可随时重跑复核上表。
 
+### ⚠️⚠️ 第二条指纹：**Claude Code 的身份句**，且它的锚点与上一条**相反**（Issue IKLS2L，2026-10-14）
+
+**用户报障**（Gitee issue IKLS2L）：Claude Desktop 的「Code」页（内置 Claude Code
+v2.1.295）经 cc-switch（Anthropic→Responses 转换）→ 本机网关 `127.0.0.1:8326/v1/responses`
+调 `hub/hub-deepseek-v4.1-flash`（聚合，12 条候选）时稳定失败：
+
+```text
+HTTP 400 / code 11128 / Illegal API invocation from an unapproved channel
+```
+
+实测窗口 **277 次尝试 / 94 次失败**（约 34%），日志累计 187 次该错误。可用性不坏
+（hub 会自动切到 officeace 等），但**每次白撞一次往返**，且 `markRecentFailure` 会把
+workbuddy（链上第 2 位、`x0.00` 免费的渠道）标成「近期失败过」而被并发请求避开。
+
+**成因（Claude Code 侧，不在本仓库内）**：`mrt()` 的 `[model-check]` 探测路径调用
+`Qno({...})` 时**漏传 `skipSystemPromptPrefix`** ⇒ 每次都注入身份句；主请求路径
+`aF()` 传了，故多数请求正常。这正是「同一会话里成功与失败交替」的来源。
+
+**本仓库的修法**：`CONTENT_FINGERPRINTS` 补一行（表就是为此设计的）。`find` **刻意不带
+尾句点**，一条同时覆盖 `yl` 与 `sf` 两个常量；`af` 实测放行故**不登记**。
+
+| 探针（`max_tokens=16`；⚠️ **必须 `stream:true`**） | workbuddy | buddy |
+|---|---|---|
+| 中性 system | ✅ 200 | ✅ 200 |
+| `You are Claude Code, Anthropic's official CLI for Claude` | ❌ 400/11128 | ❌ 400/11128 |
+| 同句 + 尾句点 / + `, running within the Claude Agent SDK.` | ❌ 400/11128 | ❌ 400/11128 |
+| `You are a Claude agent, built on Anthropic's Claude Agent SDK.` | ✅ 200 | ✅ 200 |
+| 少一个字母（`…for Claud`） | ✅ 200 | ✅ 200 |
+| **多**一个字母（`…for ClaudeX`） | ❌ 400/11128 | ❌ 400/11128 |
+| 拆成前半句 / 后半句**单独**发 | ✅ 200 | ✅ 200 |
+| **assistant 正文**放同一句 | ❌ 400/11128 | ❌ 400/11128 |
+| 同一句放 `user` | ✅ 200 | ✅ 200 |
+| **改写后**（`…Anthropic's CLI for Claude.`） | ✅ 200 | ✅ 200 |
+
+⚠️⚠️ **该指纹的锚点是「行首」的，与上一条「位置无关」相反** —— 这是本轮实测推翻
+issue 描述的一格（issue 按 IKJNA1 同构写成了「子串精确匹配、位置无关」）：
+
+| 形态 | 结果 |
+|---|---|
+| 裸串（在文本**绝对开头**） | ❌ 400/11128 |
+| **前接空格 / 前换行 / 前接任意前言 / 双换行包裹** | ✅ **200 放行** |
+| 后接句点 / 破折号 / 中文句号 / 一长段正文 | ❌ 400/11128 |
+
+⇒ 语义是「**前导字符一个都不容忍、后缀完全自由**」。**这条对将来加新指纹的人是硬提醒**：
+拿「夹在句中放行」当判据会得到**假阴性**（真因是锚点，不是这句不再触发），据此删掉一条
+仍然必需的登记就重新打开这个 bug。故 `tencent-fingerprint.ts` 里 **`find` 刻意不做行首锚定**
+—— 改写宁可略宽（漏改 = 整轮 400；多改 = 语义等价的措辞变化）。
+
+⚠️ **非流式请求会被更早地拒掉**：两端点对不带 `stream:true` 的请求都回
+`HTTP 400 / code 11101 Non-stream chat request is currently not supported` —— 探针若不带它，
+会把「不支持非流式」**误读成风控拦截**（本轮探针第一版就踩了，八个格子全报 400）。
+
+**可复核凭据**：`tests/e2e/buddy-fingerprint-roles.e2e.spec.ts` 的
+「Claude Code 身份句（IKLS2L 实测依据）」一节 —— 含**贪心探针**（行首/非行首**两侧都测**）
+与「`af` 刻意不登记」的反向断言。⚠️ 与 ZCode 那条不同，这句字面量**可以**写在源码里：
+改写已覆盖 `system` 与 `assistant` 正文两处，排查这个风控 bug 的会话不会再拦死自己。
+
 回归用例在 `tests/unit/openai-gateway-tencent-fingerprint.spec.ts`（17 条）。
 ⚠️ 已做**反向验证**：正则去掉 `i` → 大小写用例红；`instructions` 那处改回原样 →
 Responses 端用例红。

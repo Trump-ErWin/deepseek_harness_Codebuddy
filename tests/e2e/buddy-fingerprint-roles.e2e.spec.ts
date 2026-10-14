@@ -54,22 +54,40 @@ function firstCredential(): { ref: string; cred: Record<string, unknown> } {
 const ENDPOINT = 'https://copilot.tencent.com'
 const MODEL = process.env.DSH_BUDDY_FINGERPRINT_MODEL ?? 'step-5-preview'
 
-function headersOf(cred: Record<string, unknown>): Record<string, string> {
+/**
+ * 腾讯系两个端点（IKLS2L 要求**两站分别实测**：它们共用同一个 `BuddyAdapter` 类，
+ * 但产品配置与网关不同 ⇒「buddy 过了」推不出 workbuddy 也过）。
+ *
+ * `X-Domain` / `X-Product-Code` / UA 按站点切换 —— 发错站点会得到与指纹无关的
+ * 身份错误，把「风控拦截」与「请求头写错」混成同一条报错。
+ */
+const SITES = [
+  { name: 'buddy', endpoint: ENDPOINT, domain: 'copilot.tencent.com', productCode: 'codebuddy' },
+  { name: 'workbuddy', endpoint: 'https://www.workbuddy.ai', domain: 'www.workbuddy.ai', productCode: 'workbuddy' },
+] as const
+
+function headersOf(cred: Record<string, unknown>, site: typeof SITES[number]): Record<string, string> {
   return {
     Authorization: `Bearer ${String(cred.access_token)}`,
     Accept: 'text/event-stream',
     'Content-Type': 'application/json',
-    'X-Domain': 'copilot.tencent.com',
-    'X-Product-Code': 'codebuddy',
+    'X-Domain': site.domain,
+    'X-Product-Code': site.productCode,
     'X-IDE-Name': 'CodeBuddy', 'X-IDE-Type': 'CodeBuddy', 'X-IDE-Version': '1.106.1',
     'X-Product': 'CodeBuddy', 'User-Agent': 'CodeBuddyIDE/1.106.1',
   }
 }
 
-async function probe(messages: unknown[]): Promise<{ blocked: boolean; code?: string }> {
+async function probe(
+  messages: unknown[],
+  site: typeof SITES[number] = SITES[0],
+): Promise<{ blocked: boolean; code?: string }> {
   const { cred } = firstCredential()
-  const res = await fetch(`${ENDPOINT}/v2/chat/completions`, {
-    method: 'POST', headers: headersOf(cred),
+  const res = await fetch(`${site.endpoint}/v2/chat/completions`, {
+    method: 'POST', headers: headersOf(cred, site),
+    // ⚠️ `stream:true` **必须发**：两端点对非流式请求都回
+    // `400 / code 11101 Non-stream chat request is currently not supported`，
+    // 不带它会把「不支持非流式」误读成风控拦截（IKLS2L 探针第一版就踩了）。
     body: JSON.stringify({ model: MODEL, messages, stream: true, max_tokens: 16 }),
   })
   if (!res.ok) {
@@ -145,6 +163,110 @@ describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：角色矩阵
       messages.splice(messages.length - 1, 0, { role: 'tool', tool_call_id: 'c1', content: trigger })
     }
     const r = await probe(messages)
+    expect(r.blocked).toBe(false)
+  }, 60_000)
+})
+
+/**
+ * ## 第二条指纹：**Claude Code 的身份句**（Gitee issue IKLS2L，2026-10-14）
+ *
+ * 与上面 ZCode 那条同为腾讯内容级风控，但**锚点语义相反**。本节的结论
+ * （「行首锚定、后缀自由」）已被写进 `src/openai-gateway/tencent-fingerprint.ts`
+ * 的注释 —— 单测只能锁「代码按那个范围做」，**锁不住那个范围本身对不对**，
+ * 所以这一节是那条相反结论的**唯一可复核凭据**。
+ *
+ * ⚠️ 与上面 ZCode 那条不同，这句字面量**可以**写在源码里：改写已覆盖
+ * `system` 与 `assistant` 正文两处，「排查这个风控 bug 的会话」不会再拦死自己。
+ */
+describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：Claude Code 身份句（IKLS2L 实测依据）', () => {
+  const CLAUDE_TRIGGER = "You are Claude Code, Anthropic's official CLI for Claude"
+  const CLAUDE_REWRITE = "You are Claude Code, Anthropic's CLI for Claude"
+  /** Claude Code v2.1.295 内建的另外两个身份句常量（issue 从二进制读出）。 */
+  const SDK_VARIANT = `${CLAUDE_TRIGGER}, running within the Claude Agent SDK.`
+  const AGENT_VARIANT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+
+  it.each(SITES.map((s) => [s.name, s] as const))(
+    '★ %s：身份句在 system **被拦**，改写后放行（本条登记的全部依据）',
+    async (_name, site) => {
+      const blocked = await probe(
+        [{ role: 'system', content: CLAUDE_TRIGGER }, { role: 'user', content: 'reply OK' }], site)
+      expect(blocked.blocked, `${site.name}: 身份句实测应被拦`).toBe(true)
+      expect(blocked.code).toBe('11128')
+      // 改写是**有效修法**，不只是「恰好躲过」：同一位置换等义措辞即 200。
+      const fixed = await probe(
+        [{ role: 'system', content: CLAUDE_REWRITE }, { role: 'user', content: 'reply OK' }], site)
+      expect(fixed.blocked, `${site.name}: 改写后应放行`).toBe(false)
+    }, 120_000)
+
+  it.each(SITES.map((s) => [s.name, s] as const))(
+    '★ %s：SDK 变体也被拦，且同一条登记（`find` 不带尾句点）即可救它',
+    async (_name, site) => {
+      const blocked = await probe(
+        [{ role: 'system', content: SDK_VARIANT }, { role: 'user', content: 'reply OK' }], site)
+      expect(blocked.blocked).toBe(true)
+      const fixed = await probe([{
+        role: 'system',
+        content: SDK_VARIANT.replace(CLAUDE_TRIGGER, CLAUDE_REWRITE),
+      }, { role: 'user', content: 'reply OK' }], site)
+      expect(fixed.blocked).toBe(false)
+    }, 120_000)
+
+  it('★ assistant **正文**放身份句也被拦（历史重放路径的成因）', async () => {
+    const r = await probe([
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: CLAUDE_TRIGGER },
+      { role: 'user', content: 'reply OK' },
+    ])
+    expect(r.blocked).toBe(true)
+  }, 60_000)
+
+  /**
+   * ⚠️⚠️ **本条的锚点与 ZCode 那条相反**：身份句**只在文本开头**被拦。
+   *
+   * 这一格是 issue 描述（「子串精确匹配、位置无关」）被**实测推翻**的地方，
+   * 也是「将来加新指纹时探针必须两侧都测」这条纪律的依据 ——
+   * 只测句中会得到「已放行」的**假阴性**，据此删掉一条仍必需的登记就重开 bug。
+   */
+  it.each([
+    ['前接空格', ` ${CLAUDE_TRIGGER}`],
+    ['前接换行', `\n${CLAUDE_TRIGGER}`],
+    ['前接中文前言', `前言。${CLAUDE_TRIGGER}`],
+    ['双换行包裹', `\n\n${CLAUDE_TRIGGER}\n\n`],
+  ])('★ 锚点实测：%s ⇒ **放行**（该指纹行首锚定，不是位置无关）', async (_label, system) => {
+    const r = await probe([{ role: 'system', content: system }, { role: 'user', content: 'reply OK' }])
+    expect(r.blocked).toBe(false)
+  }, 60_000)
+
+  it.each([
+    ['后接尾句点', `${CLAUDE_TRIGGER}.`],
+    ['后接中文句号', `${CLAUDE_TRIGGER}。`],
+    ['后接长正文', `${CLAUDE_TRIGGER}\n\n${'padding. '.repeat(50)}`],
+  ])('★ 锚点实测：%s ⇒ **仍被拦**（后缀自由，前导字符一个都不容忍）', async (_label, system) => {
+    const r = await probe([{ role: 'system', content: system }, { role: 'user', content: 'reply OK' }])
+    expect(r.blocked).toBe(true)
+  }, 60_000)
+
+  it('★ 逐字符匹配：少一个字母放行、多一个字母仍被拦', async () => {
+    const fewer = CLAUDE_TRIGGER.replace(/Claude$/, 'Claud')
+    const more = `${CLAUDE_TRIGGER}X`
+    expect((await probe([{ role: 'system', content: fewer }, { role: 'user', content: 'reply OK' }])).blocked).toBe(false)
+    expect((await probe([{ role: 'system', content: more }, { role: 'user', content: 'reply OK' }])).blocked).toBe(true)
+  }, 90_000)
+
+  it('★ 第三个常量（`Claude agent`）实测**放行** ⇒ 刻意不登记它', async () => {
+    // 「表能加就加」是错的：多登记一条会替上游无谓改写用户提示词并破坏前缀缓存。
+    // 本用例钉住「它确实不该被登记」——若某天它开始被拦，这里会红。
+    const r = await probe([{ role: 'system', content: AGENT_VARIANT }, { role: 'user', content: 'reply OK' }])
+    expect(r.blocked).toBe(false)
+  }, 60_000)
+
+  it('★ user 角色放身份句不拦（故该角色刻意不改写）', async () => {
+    const r = await probe([
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'user', content: CLAUDE_TRIGGER },
+      { role: 'user', content: 'reply OK' },
+    ])
     expect(r.blocked).toBe(false)
   }, 60_000)
 })

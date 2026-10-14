@@ -19,7 +19,7 @@ import type {
 import type { Context } from '@deepseek-ai/cordis'
 import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js'
 import { basicAuthorization, fetchModelTokenRates, isExpiring, readOfficeAceCredential, refreshStoredCredential, type OfficeAceCredential } from './officeace-auth.js'
-import { consumeOpenAiSse, serializeMessages } from './openai-compat.js'
+import { collectImages, consumeOpenAiSse, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
 import { buildDsmlSystemPrompt, needsDsmlToolMode, type DsmlToolSpec } from './dsml.js'
 
@@ -99,20 +99,13 @@ function isMultimodalModel(model: string): boolean {
 /**
  * 收集消息中的图片附件引用（含工具结果内层，任意深度），按 attachmentId 去重。
  *
- * ⚠️ 与 trae / buddy / lobsterai 的同名助手同义。收集必须**递归**进
- * `tool-result.content`：只走一层时，深层图片会被收进 refs 却在序列化时丢失。
+ * ⚠️ **已改为复用共享实现**（Issue IKLSB8）。原先这里是一份与
+ * `openai-compat.ts` 逐字同义的私有副本，看似无害，实际是缺陷的一半：
+ * 收集侧递归进 `tool-result` 内层，而**注入侧不递归** ⇒ 深层图片被收进 refs、
+ * 读出了字节、却在序列化阶段被静默丢弃（连 `[image unavailable]` 占位符都没有）。
+ * 判据：**收集与注入必须同源同深度**，两份实现分处两文件时没有任何东西保证它们
+ * 同步 —— 共享一份才让这类分叉不可能发生（同 `buddy-adapter.ts` 的注释所警告）。
  */
-function collectImages(content: readonly unknown[], refs: Map<string, unknown>): void {
-  for (const raw of content) {
-    if (typeof raw !== 'object' || raw === null) continue
-    const block = raw as { type?: unknown; attachment?: { attachmentId?: unknown }; content?: unknown }
-    if (block.type === 'image' && typeof block.attachment?.attachmentId === 'string') {
-      refs.set(block.attachment.attachmentId, block.attachment)
-      continue
-    }
-    if (block.type === 'tool-result' && Array.isArray(block.content)) collectImages(block.content, refs)
-  }
-}
 
 export class OfficeAceAdapter extends LlmAdapter {
   /** 目录是否已广播过（只广播一次）。 */
@@ -305,39 +298,34 @@ export class OfficeAceAdapter extends LlmAdapter {
       }
     }
 
-    const wireMessages = serializeMessages(options.messages)
-    // 把图片 parts 注回 user 消息：共享 `serializeMessages` 会把 content 压成
-    // 纯文本（图片静默丢失 ——「发不了图片」的成因），这里按 user 消息出现顺序
-    // 一一对应，把该消息内（含 tool-result 内层）的图片补成
-    // `{type:'image_url'}` parts（MaaS 实测接受该形态，deepseek-v4.1-flash /
-    // kimi-k2.6 均正常描述图片内容）。
-    if (imageUrls !== undefined) {
-      const originalUsers = options.messages.filter((m) => m.role === 'user')
-      let userIdx = 0
-      for (const wire of wireMessages) {
-        if (wire.role !== 'user') continue
-        const original = originalUsers[userIdx++]
-        if (original === undefined) break
-        const inner: unknown[] = Array.isArray(original.content) ? original.content : []
-        const parts: Array<Record<string, unknown>> = []
-        const text = typeof wire.content === 'string' ? wire.content : ''
-        if (text.length > 0) parts.push({ type: 'text', text })
-        for (const raw of inner) {
-          if (typeof raw !== 'object' || raw === null) continue
-          const block = raw as { type?: unknown; attachment?: { attachmentId?: unknown } }
-          if (block.type === 'image') {
-            const url = block.attachment?.attachmentId === undefined
-              ? undefined
-              : imageUrls.get(String(block.attachment.attachmentId))
-            // 解析不到字节时留占位文本，而不是静默吞掉整张图。
-            parts.push(url === undefined
-              ? { type: 'text', text: '[image unavailable]' }
-              : { type: 'image_url', image_url: { url } })
-          }
-        }
-        if (parts.length > 0) wire.content = parts
-      }
-    }
+    // ⚠️⚠️ **`imageUrls` 必须交给共享 `serializeMessages`**（Issue IKLSB8，
+    // 2026-10-14 真机报障）。此前这里**只传了 1 个实参**，而共享实现的第二参
+    // 是图片字节映射；缺了它有两道后果**同时**发生：
+    //
+    // 1. 工具结果内层的图片（= **Claude Code / Claude Desktop 唯一的图片形状**，
+    //    即 `tool_result.content=[{type:'image'}]`）没有任何一条腿去读它 ——
+    //    共享实现里 `imageUrls === undefined` 那一段整节跳过 ⇒ 图片字节
+    //    **根本没进请求**（实测 `input_tokens` ≈76 vs 带图 ≈245，是字节缺失
+    //    而不是上游拒绝）；
+    // 2. 图片型工具结果被 `contentToText` 压成空串 ⇒ 落到 `'(no output)'` 兜底
+    //    ⇒ 模型被告知「工具没有任何输出」，于是答「Read 没有返回内容」，
+    //    用户据此误判成模型没有视觉能力（真实原因是「有输出，输出是图」）。
+    //
+    // ⚠️ 旧实现在此之后有一段**补偿性注图循环**（按 `role==='user'` 出现顺序
+    // 一一对应，把图补成 parts）。它有两个独立缺陷，故**整段删除**、不再保留：
+    //
+    // - **够不到内层**：只遍历 user 消息 content 的**顶层**，而 `collectImages`
+    //   是递归的 ⇒ 收进了 refs、读出了字节、注入时却丢掉（连 `[image unavailable]`
+    //   都没有）。这正是 `buddy-adapter.ts` 注释里警告过的形态。
+    // - **索引错位**：`wireMessages` 与 `options.messages` 的 user **数量并不相等**
+    //   —— 工具结果会被展开成 `role:'tool'`，而「只含工具结果」的 user 消息
+    //   在源里占一个位置、在 wire 上却不是 user。实测（真实 Claude Code 形态：
+    //   user(看图) → assistant(tool_call) → user(仅工具结果) → user(图+提问)）
+    //   注图循环把**图注到了前一条文本消息上**，带图那条反而没有图。
+    //
+    // ⇒ 不再自己维护第二套「D+/注入」实现：共享实现已与 `collectImages` 同深度，
+    // 且遵守 `0dd27ca` 的阶段结论（图片必须与提问**同一条** user 消息，图在前）。
+    const wireMessages = serializeMessages(options.messages, imageUrls)
 
     // ── 工具定义下发 ──
     //
