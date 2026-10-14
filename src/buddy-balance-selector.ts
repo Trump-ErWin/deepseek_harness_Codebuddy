@@ -85,7 +85,7 @@ export interface BuddyCandidateAccount {
 /**
  * 锁定状态下「无可用账号」的原因。
  *
- * ⚠️ 三者**必须分开报**（与 Loomy 那份同一修复）：混成一句「额度都已用尽」
+ * ⚠️ 四者**必须分开报**（与 Loomy 那份同一修复）：混成一句「额度都已用尽」
  * 会让一次网络抖动伪装成"钱花完了"，用户于是去解锁、或白等到明天 ——
  * 而号其实有钱。
  */
@@ -104,6 +104,26 @@ export type BuddyNoAccountReason =
    * 用户据此去解锁永久积分，方向完全错（解禁时刻其实就写在 `modelRateLimits` 里）。
    */
   | { kind: 'no-candidates' }
+  /**
+   * **候选非空、余额也真的查了、分档每次都选出了「可用档」的号** —— 只是那些号
+   * 的**凭据**解析不出来（`readCredential` 返回 `undefined`）。
+   *
+   * ⚠️ 这一档同样是**必须**的，而且它比 `no-candidates` 更隐蔽（2026-10-14 审计
+   * 实测打穿）：分档返回 `ok: true` 这一事实**本身就证明**该号有可用的临期积分
+   * （锁定时 `buddyTierUsable` 只对 `expiring` 为真），所以此时**恰恰不能**说
+   * 「积分都已用尽」—— 我们刚刚查到它有钱，矛盾出在**凭据**上。
+   *
+   * 可达时序（三条都是真实路径，不是理论构造）：
+   * 1. 余额缓存（60s TTL）在上一轮请求里命中并写入了「该号有临期积分」，
+   *    凭据在这 60 秒内失效（续期失败 / 被并发烧掉 / 用户删除）；
+   * 2. 多候选时同理：`select()` 逐个把「档位最优但凭据坏」的号排除，耗尽后
+   *    `reason` 从未被赋值（它是 `undefined` 而非 `exhausted`）；
+   * 3. 单候选最直接：一次 `select()` 就选出了那个有临期积分的号。
+   *
+   * ⇒ 报「积分都已用尽」会再一次把用户推向「解锁永久积分」（**不可撤回地烧钱**），
+   *   而真正该做的是**修凭据 / 重新登录那个账号**。
+   */
+  | { kind: 'credential-only' }
 
 /** 选号结果：选中，或「为什么没选中」。 */
 export type BuddySelectionResult
@@ -441,10 +461,12 @@ export async function pickBuddyAccount<TCredential = BuddyCredential>(
     kind: 'locked' | 'exhausted'
     tried: ReadonlySet<string>
     /**
-     * 锁定判「无可用账号」的具体原因（`exhausted` 时没有这个信息可言）。
-     * ⚠️ 调用方必须据它区分「真的用尽」与「查不到」再报错。
+     * 判「无可用账号」的具体原因。
+     * ⚠️ **总是非空**（四种成因各有名字）：调用方必须据它区分
+     * 「真的用尽」/「查不到」/「凭据全坏」再报错 —— 混报会把用户引向
+     * 「解锁永久积分」这个不可撤回的错动作。
      */
-    reason?: BuddyNoAccountReason
+    reason: BuddyNoAccountReason
   }
 > {
   const tried = new Set<string>()
@@ -477,5 +499,16 @@ export async function pickBuddyAccount<TCredential = BuddyCredential>(
   }
   // 锁定时的「无可用账号」是**用户要的确定性结果**，与凭据无关；
   // 未锁定时的失败只可能是凭据问题，交给调用方继续走池的兜底。
-  return { kind: allowPermanent ? 'exhausted' : 'locked', tried, ...reason ? { reason } : {} }
+  //
+  // ⚠️ `reason` 仍缺席 ⇒ **是「凭据全坏」而不是「积分用尽」**（2026-10-14 审计
+  //    实测打穿的漏网路径）。走到这里只有两种情形：
+  //    ① 候选为空 —— 开头已预置 `no-candidates`，故此时 `reason` 非空；
+  //    ② 候选非空、每次 `select()` 都返回 `ok:true`，但那些号的凭据都解析不出来
+  //       ⇒ 循环耗尽候选，`reason` 一次都没被赋值。
+  //    而 `ok:true` **本身就证明**该号落在「可用档」（锁定时只有 `expiring` 可用）
+  //    ⇒ 明知它有钱却报「积分都已用尽」是**自相矛盾**，且会把用户推向
+  //    「解锁永久积分」（不可撤回地烧钱）。故必须如实归到 `credential-only`。
+  //    ⚠️ 不能省着不填让调用方的 `?? { kind: 'exhausted' }` 兜底 —— 那正是缺陷本体。
+  if (reason === undefined) reason = { kind: 'credential-only' }
+  return { kind: allowPermanent ? 'exhausted' : 'locked', tried, reason }
 }

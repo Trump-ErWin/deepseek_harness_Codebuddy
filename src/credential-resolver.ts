@@ -207,8 +207,9 @@ export interface BuddyBalancePlan {
   /**
    * 锁定且无可用账号时的报错文案（各家不同，**必须由调用方逐字提供**）。
    *
-   * ⚠️ 必须按 `reason.kind` 分两种报（与 loomy 同型缺陷）：把「余额查不到」
-   * 报成「额度已用尽」，用户会去解锁或白等，而号其实有钱。
+   * ⚠️ 必须按 `reason.kind` 分三种报（与 loomy 同型缺陷）：把「余额查不到」
+   * 报成「额度已用尽」，用户会去解锁或白等，而号其实有钱；
+   * 把「凭据全坏」也报成「额度已用尽」同样是**自相矛盾**（分档刚证明它有钱）。
    */
   readonly lockedError: (reason: BuddyNoAccountReason) => Error
   /**
@@ -407,10 +408,19 @@ export function createCredentialResolver<TCredential>(
         //    ⚠️ 这与本文件 ⑤ 的修法同型（Gitee IKJOZ9）：那里也是「先证明
         //    是不是限流，再退兜底」。本处只是把它补到锁定分支上。
         if (candidates.length === 0) config.throwIfAllRateLimited?.(config.product, modelId)
-        // `??` 兜底现在只覆盖一种残留情形：**候选非空但凭据全坏**（分档每次都
-        // 选出了号，只是 `readCredential` 读不出来）—— 那条路径确实查过余额，
-        // 故沿用「已用尽」的既有文案，不在本次修复范围内。
-        throw plan.lockedError(picked.reason ?? { kind: 'exhausted' })
+        // ⚠️ **不再写 `?? { kind: 'exhausted' }` 兜底**（2026-10-14 审计实测打穿的
+        //    漏网路径）。`pickBuddyAccount` 的返回类型已收紧为 `reason` **必填**，
+        //    而它缺席时**只有一个**成因 —— 候选非空、每次 `select()` 都 `ok:true`，
+        //    但那些号的凭据全解析不出来（详见 `credential-only` 的说明）。此时
+        //    `ok:true` 已证明该号落在可用档（有钱），报「积分都已用尽」是
+        //    **自相矛盾**，且会把用户推向「解锁永久积分」（不可撤回地烧钱）。
+        //
+        //    ⚠️ **两种兜底值都不能写**：写 `exhausted` 会让「有人再写一份不填
+        //    `reason` 的编排」静默退回同一个缺陷；写 `credential-only` 则是
+        //    **不可达的死代码** —— 实测变异验证：把它改回 `exhausted` 时全套
+        //    用例仍绿（27 passed），即该行从未被执行。⇒ 让**类型系统**保证非空
+        //    （`tsconfig` 的 `strict` 已开，`strictNullChecks` 生效）。
+        throw plan.lockedError(picked.reason)
       }
     } else if (plan?.kind === 'loomy') {
       const candidates = candidatesOf(deps.pool, providerId, modelId)

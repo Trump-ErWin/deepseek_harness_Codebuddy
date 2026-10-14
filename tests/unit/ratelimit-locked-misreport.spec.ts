@@ -36,11 +36,12 @@
  * （有用例锁死）。
  */
 import { Context } from '@deepseek-ai/cordis'
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { apply } from '../../src/index.js'
 
 class FakeCredentials {
@@ -128,6 +129,19 @@ afterAll(() => {
 /** 目标模型：用一个**真实模型 id** 才有意义（限流按模型记）。 */
 const MODEL = 'glm-5.3'
 const HOUR = 3_600_000
+
+/**
+ * 剥掉注释的源码（源码级判据专用）。
+ *
+ * ⚠️ 与 `buddy-ratelimit-misreport.spec.ts` 的同名助手**同口径**：注释里出现
+ * 目标字符串会让断言假命中（本仓库记过这条教训）。
+ */
+function codeOnly(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
+/** 本文件所在目录（源码级判据要读 `src/`）。 */
+const here = dirname(fileURLToPath(import.meta.url))
 
 /** 取某 provider 注册的 `resolveCredential`（它是 `registerXxxLlm` 的入参闭包）。 */
 function resolveOf(ctx: TestCtx, provider: string): (modelId?: string) => Promise<unknown> {
@@ -379,5 +393,164 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
       expect(String(thrown?.message), `${provider} 的文案不该提到 ${DISPLAY_NAME[provider]} 的锁定`)
         .not.toContain('天内到期')
     }, 60_000)
+  })
+
+  /**
+   * ★ **同一类误报的第三条腿**（2026-10-14 审计实测打穿）：
+   * **候选非空、余额分档确实选出了有临期积分的号，但那些号的凭据读不出来**。
+   *
+   * 修复前 `pickBuddyAccount` 的 `reason` 保持 `undefined`（循环只在
+   * `!picked.ok` 时赋值），调用方的 `?? { kind: 'exhausted' }` 于是报
+   * 「所有账号的『N 天内到期』积分都已用尽」—— 而分档刚证明它们**有钱**。
+   *
+   * ⚠️ **本文件走真 `apply()` + 真 `AccountPool` + 真 `fetchCreditBalance`**，
+   * 故这一格必须在这里守：`buddy-balance-selector.spec.ts` 的单元级用例用假
+   * 选择器，证明不了「真实余额响应的解析路径也走通」。
+   *
+   * ## 怎么让这一格真的可达（三步缺一不可）
+   *
+   * 1. 桩 `fetch` 返回**真实的 `get-user-resource` 形状**（双层嵌套
+   *    `data.Response.Data.Accounts[]`），且包带**未来 9 天的 `DeductionEndTime`**
+   *    ⇒ 该号落在「有临期积分」档（锁定态下唯一可用档）；
+   * 2. 账号与凭据**都在池里**（候选非空、`enabled: true`）；
+   * 3. **凭据在余额查询之后才失效** —— 光「一开始就没有凭据」测不到本条：
+   *    `balanceOf` 也要解析凭据才能查余额，凭据一开始就缺 ⇒ 归 `unknown` 档，
+   *    走的是**另一条腿**（余额查不到）。故必须让 `credentials.resolve`
+   *    **第一次给凭据、之后返回 undefined**，精确复现「余额缓存 60s TTL 内
+   *    凭据失效」那条真实时序。
+   */
+  describe('★ 候选非空 + 分档选出有积分的号 + 凭据读不出来 ⇒ 不得报「积分已用尽」', () => {
+    /**
+     * ⚠️ **为什么只有 buddy / workbuddy 这两家**（实测，不是偷懒）：
+     * 本用例靠「凭据第一次读得到、之后读不到」制造那条真实时序，而
+     * `lobsterai` / `trae` 的 `readCredential` **带形状校验**（校验
+     * `access_token` 是字符串）⇒ 桩掉 `credentials.resolve` 后它们报的是
+     * **`unknown`**（余额查询异常），走的是另一条腿。
+     * 那条腿（余额查不到 ⇒ 「无法确认」）**已有用例覆盖**
+     * （`buddy-permanent-lock.spec.ts` 的「锁定 + 余额查不到」）。
+     * ⇒ 本用例只钉**新增的 `credential-only` 那一格**，并把范围如实收窄；
+     * 四家的**文案接线**由下面那条 `it.each` 逐家断言（不依赖本时序）。
+     */
+    const CREDENTIAL_ONLY_FAMILY = ['buddy', 'workbuddy'] as const
+
+    it.each(CREDENTIAL_ONLY_FAMILY)('%s：报「凭据读不出来」并**劝阻解锁**', async (provider) => {
+      const ctx = boot([provider])
+      const id = await addAccount(ctx, provider)
+
+      // ① 真余额形状：9 天后到期的 250 积分 ⇒ 锁定态下该号「可用」。
+      const balanceBody = {
+        code: 0,
+        data: {
+          Response: {
+            Data: {
+              Accounts: [{
+                PackageName: 'Bonus Pack',
+                CapacityUnit: 'credits',
+                CycleCapacityRemain: 250,
+                CycleCapacitySize: 250,
+                CycleCapacityUsed: 0,
+                Status: 1,
+                DeductionEndTime: Date.now() + 9 * 24 * 60 * 60 * 1000,
+              }],
+            },
+          },
+        },
+      }
+      // ② 桩 fetch：余额端点返回上面那份真形状。
+      vi.stubGlobal('fetch', async () => new Response(JSON.stringify(balanceBody), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+
+      /**
+       * ③ **凭据在余额查询之后失效**（真实时序）：`resolveCredential` 在
+       *    `balanceOf` 里被调一次（成功）→ 之后（`pickBuddyAccount` 的
+       *    `options.resolveCredential`）返回 undefined。
+       *
+       * ⚠️ 不能「一开始就删凭据」：那会让 `balanceOf` 也解析不出凭据 ⇒
+       *    归 `unknown` 档，测到的是另一条腿（余额查不到），不是本条。
+       */
+      let allowCredential = true
+      const credentials = ctx.credentials
+      const originalResolve = credentials.resolve.bind(credentials)
+      credentials.resolve = async (ref: unknown) => {
+        if (allowCredential) return await originalResolve(ref)
+        return undefined
+      }
+      const resolve = resolveOf(ctx, provider)
+
+      /**
+       * 预热：这一轮**会成功取到凭据**（凭据此刻还在），它同时把「该号有 9 天内
+       * 到期的 250 积分」写进了余额缓存（TTL 60s）。
+       *
+       * ⚠️ 预热**必须成功**，否则缓存里没有那份余额，第二次调用会真发网络 ⇒
+       *    归 `unknown` 档，测到的就不是本条了。下面 `allowCredential = false`
+       *    模拟「凭据在这 60 秒窗口内失效」。
+       */
+      await resolve(MODEL).then(() => undefined, () => undefined)
+      allowCredential = false
+
+      /**
+       * ⚠️ **前提自证**：预热那一轮必须真的**成功取到了凭据**（否则说明桩没生效，
+       * 本条会退化成测「余额查不到」那条腿 —— 断言仍可能绿，但测的是别的东西）。
+       * 判据：下一轮报出的原因必须是凭据问题，而**不是** `unknown`。
+       * 这里用文案区分（`unknown` 的文案含「无法确认」）。
+       */
+      let thrown: { message?: string } | undefined
+      try {
+        await resolve(MODEL)
+      } catch (error: unknown) {
+        thrown = error as { message?: string }
+      }
+      vi.unstubAllGlobals()
+
+      expect(thrown, `${provider} 应当抛错，却静默返回了 undefined`).toBeDefined()
+      const message = String(thrown?.message)
+      // ① 红线：**不得**报「积分都已用尽」（分档刚证明它有钱）
+      expect(message, `${provider} 不得报「积分都已用尽」`).not.toContain('积分都已用尽')
+      expect(message, `${provider} 不得提「天内到期」`).not.toContain('天内到期')
+      // ② 必须正向点名**凭据**（给用户正确的下一步）
+      expect(message, `${provider} 应点名「凭据」`).toContain('凭据')
+      // ③ 必须**明确劝阻解锁**（解锁会不可撤回地烧掉永久积分）
+      expect(message, `${provider} 应明确劝阻解锁永久积分`).toContain('不要')
+      expect(message, `${provider} 的文案应说明这与「积分用尽」是两件事`)
+        .toContain('两件事')
+      // ⚠️ **不得退化成 `unknown` 那条腿**（「无法确认」）：那说明预热没成功、
+      //    余额缓存是空的 ⇒ 本条测的就不是「分档选出了号但凭据坏」这一格。
+      expect(message, `${provider} 走的必须是 credential-only，不是 unknown`)
+        .not.toContain('无法确认')
+      expect(id, '（账号确实建过 ⇒ 候选非空）').toBeTruthy()
+    }, 60_000)
+
+    /**
+     * ⚠️ **四家的文案接线**（与上面的时序无关）：`buddyLockedError` 是四家**共用**
+     * 的那一份，故「它有没有 `credential-only` 分支」在四家上同时成立。
+     *
+     * 判据用**源码级**（`codeOnly` 剥注释后再找），理由：`credential-only` 的
+     * 触发时序对本文件是可达的（上面那两条），但对 `lobsterai` / `trae` 需要
+     * 桩掉它们**带形状校验**的凭据解析器才能复现 —— 而那会让用例测到别的行为。
+     * 故这里只钉「分支在、且**劝退了用户别去解锁**」这两件**文案契约**事实。
+     *
+     * 变异：把 `credential-only` 那一支从 `buddyLockedError` 删掉 ⇒ 本条红。
+     */
+    it('四家共用的 buddyLockedError 必须有 credential-only 分支，且文案劝阻解锁', () => {
+      const indexCode = codeOnly(readFileSync(resolve(here, '../../src/index.ts'), 'utf8').replace(/\r\n/g, '\n'))
+      const at = indexCode.indexOf('const buddyLockedError')
+      expect(at, 'buddyLockedError 没找到').toBeGreaterThan(-1)
+      // 取到下一个顶层 `const ` 声明为止（`loomyLockedError`），切成这一段的源码。
+      const end = indexCode.indexOf('const loomyLockedError', at)
+      expect(end, 'loomyLockedError 没找到（切块终点）').toBeGreaterThan(at)
+      const block = indexCode.slice(at, end)
+
+      expect(block, 'buddyLockedError 必须有 credential-only 分支').toContain("reason.kind === 'credential-only'")
+      // ⚠️ 文案必须**同时**含「凭据」与「两件事」：前者给用户正确的下一步，
+      //    后者防止用户把它误读回「钱花完了」。
+      const branch = block.slice(block.indexOf("reason.kind === 'credential-only'"))
+      expect(branch, '文案必须点名「凭据」').toContain('凭据')
+      expect(branch, '文案必须说明这与「积分用尽」是两件事').toContain('两件事')
+      // ⚠️ **必须明确劝阻解锁**（解锁不可撤回地烧掉永久积分）——
+      //    这是本档唯一与「用户损失」直接相关的判据。
+      expect(branch, '文案必须劝阻用户去解锁永久积分').toContain('不要')
+    })
   })
 })
