@@ -56,6 +56,11 @@ import { rewriteTencentContentFingerprints } from './openai-gateway/tencent-fing
 // ⚠️ `detail` 那条腿**只留一份实现**（`openai-compat.ts`）：本仓库 6 份同义的
 // `errorDetail` 各写一条判据必然漂移（IKLBSH A1）。
 import { detailFieldText } from './openai-compat.js'
+// ⚠️ 原生搜索的错误码与错误类型从**契约文件**取（`native-search-contract.ts`）：
+//    取数虽已下沉到本适配器，但「同一种失败在任何渠道报同一个码」这条不能破 ——
+//    否则排查时会把「无账号」误判成「上游故障」。
+//    契约单独成文件是为了避免「渠道层 import 工具层」的反向依赖。
+import { NativeSearchCodes, WebNativeError, type NativeSource } from './native-search-contract.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -641,6 +646,16 @@ function errorMessage(error: unknown): string {
 }
 
 /**
+ * 把未知值收敛成记录；非对象（含 `null`）返回 `undefined`。
+ *
+ * ⚠️ 与「返回 `{}`」不同：原生搜索的逐项过滤需要区分「不是对象」（丢弃）
+ * 与「是空对象」。搬自 `web-native.ts`（2026-10-14 架构改造）。
+ */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+}
+
+/**
  * 腾讯侧**安全策略拦截**（业务码 11140）判定。
  *
  * ⚠️ 这类拒绝**也回 HTTP 403**，报文实测（2026-09-27，workbuddy /
@@ -1195,6 +1210,36 @@ export class BuddyAdapter extends LlmAdapter {
    */
   async resolveCredentialFor(modelId: string | undefined): Promise<BuddyCredential | undefined> {
     return await this.options.resolveCredential(modelId)
+  }
+
+  /**
+   * 原生搜索：执行**一次单 query**，返回投影成官方 `sources[]` 形态的结果。
+   *
+   * ## 这份实现是从 `web-native.ts` 搬过来的（2026-10-14 架构改造）
+   *
+   * 原先 `web-native.ts` 里写死了腾讯的取数逻辑（`Bearer` + `/agenttool/v1/search`
+   * + `results[]` 投影），Qoder 渠道接不进来（它的鉴权是 WASM 签名、字段名是
+   * `pageItems[].link`）。现把「取数」下沉到各适配器，`web-native.ts` 只保留
+   * 「官方语义」（入参校验 / 并发中止 / rank 轮转合并 / cap）。
+   *
+   * ## 契约（对齐 `NativeSearchAdapter.searchOnce`）
+   *
+   * - **自己校验凭据**：腾讯的判据是 `access_token` 为非空字符串。凭据是
+   *   `JSON.parse` 出来的外部数据，形状不可信（缺字段 / 类型错都可能）——
+   *   只判 `credential === undefined` 会让坏凭据抛
+   *   `TypeError: Cannot read properties of undefined (reading 'length')`，
+   *   模型看到的是无意义的 JS 报错，而不是「去登录」的指引。
+   * - **投影在这一层做掉**：`results[].{title,url,snippet}` → `NativeSource[]`，
+   *   并且**丢弃无 url 的条目**（`url` 是官方 schema 必填项，
+   *   `additionalProperties: false` —— 整条调用会因一个坏条目失败）。
+   * - **不做多 query 合并**：那是 `web-native.ts` 的职责。
+   *
+   * @param query - 单个查询串（已由调用方 trim + 去重）。
+   * @param credential - `resolveCredentialFor` 的返回值（本方法自己收窄）。
+   * @param signal - 取消信号（调用方传多 query 的 batch signal）。
+   */
+  async searchOnce(query: string, credential: unknown, signal: AbortSignal): Promise<NativeSource[]> {
+    return await performBuddySearch(query, credential, signal, this.product)
   }
 
   /**
@@ -3026,4 +3071,193 @@ export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): Bu
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
   return adapter
+}
+
+// ─────────────────────── 原生搜索（`searchOnce` 的支撑） ───────────────────────
+//
+// ⚠️ 这些是从 `web-native.ts` 搬过来的（2026-10-14 架构改造）。搬家的理由见
+// `BuddyAdapter.searchOnce` 的注释：取数逻辑各渠道不同（腾讯 `Bearer` + `results[]`、
+// Qoder WASM 签名 + `pageItems[].link`），故下沉到适配器；`web-native.ts` 只留
+// 「官方语义」（入参校验 / 并发中止 / rank 轮转合并 / cap）。
+
+/**
+ * 单次搜索请求的 `max_results`。
+ *
+ * ⚠️ **写死 8**：与官方 `WEB_SEARCH_MAX_RESULTS = 8` 一致，且**实测就是上游上限**
+ * —— 1/3/5/8 原样返回、>8 一律封顶 8（见 `docs/workbuddy-native-search-research.md` §6.5）。
+ */
+const NATIVE_SEARCH_MAX_RESULTS = 8
+
+/**
+ * 执行一次腾讯原生搜索（**模块级导出**，供单测直接驱动）。
+ *
+ * ⚠️ 之所以抽成独立函数而不是全塞在 `BuddyAdapter.searchOnce` 里：单测要用
+ * 真 `product` 配置（端点前缀随产品变）驱动它，而构造一个完整 `BuddyAdapter`
+ * 需要 `AccountPool` 等重依赖。抽出来后测试可以直接传 `CODEBUDDY` / `WORKBUDDY`。
+ *
+ * @param query - 单个查询串。
+ * @param credential - 凭据（本函数自己收窄成 `BuddyCredential`）。
+ * @param signal - 取消信号。
+ * @param product - 产品配置（决定 `{endpoint}/agenttool/v1/search` 的前缀与错误文案里的 id）。
+ * @throws {WebNativeError} 无可用账号 / 上游非 2xx / 响应无法解析 / 超时。
+ */
+export async function performBuddySearch(
+  query: string,
+  credential: unknown,
+  signal: AbortSignal,
+  product: BuddyProduct,
+): Promise<NativeSource[]> {
+  const accessToken = typeof (credential as BuddyCredential | undefined)?.access_token === 'string'
+    ? (credential as BuddyCredential).access_token
+    : ''
+  if (accessToken.length === 0) {
+    throw new WebNativeError(
+      `${product.id} search has no usable account; sign in to a ${product.id} account `
+      + `from the Jet Hub panel first. The current route is "${product.id}". `
+      + 'Only the user can change accounts.',
+      NativeSearchCodes.noAccount,
+    )
+  }
+
+  const endpoint = `${product.endpoint}/agenttool/v1/search`
+  const body = { query, type: 'text2text', max_results: NATIVE_SEARCH_MAX_RESULTS }
+  // ⚠️ 响应体先过 `asRecord`：上游返回 JSON `null` 时直接读 `.results` 会抛
+  //    `TypeError: Cannot read properties of null`（对抗性审查 F2），
+  //    而我们想要的是「响应无法解析」这条业务错误。
+  const json = await postBuddySearchJson(endpoint, body, accessToken, product, signal)
+  const results = (asRecord(json) as BuddySearchResponse | undefined)?.results
+  if (!Array.isArray(results)) {
+    throw new WebNativeError(
+      `${product.id} returned an unparseable search response: "results" is not an array.\n\n`
+      + `The request used endpoint ${JSON.stringify(endpoint)}. `
+      + 'Expected { results: [{ title, url, snippet }] }. '
+      + 'This usually means the upstream API changed, or the account lacks search permission.',
+      NativeSearchCodes.badResponse,
+    )
+  }
+
+  const sources: NativeSource[] = []
+  for (const raw of results) {
+    // ⚠️ 必须先挡 `null` / 非对象：`results: [null]` 时读 `item.url` 会抛
+    //    `TypeError: Cannot read properties of null`（真实缺陷，对抗性审查 F1）——
+    //    那会让**整条工具调用**失败，与本段的意图（畸形条目**丢弃**、少一条而已）相反。
+    const item = asRecord(raw)
+    if (item === undefined) continue
+    const url = typeof item.url === 'string' ? item.url : ''
+    // ⚠️ `url` 是官方 schema 的必填项（`additionalProperties: false` + `required`）。
+    //    上游给不出 url 的条目直接丢弃，否则 `createSuccessResult` 会抛
+    //    `ToolOutputError`（整个工具调用失败，而不是少一条结果）。
+    if (url.length === 0) continue
+    const title = typeof item.title === 'string' && item.title.length > 0 ? item.title : undefined
+    const snippet = typeof item.snippet === 'string' && item.snippet.length > 0 ? item.snippet : undefined
+    sources.push({
+      url,
+      ...title === undefined ? {} : { title },
+      ...snippet === undefined ? {} : { snippet },
+    })
+  }
+  return sources
+}
+
+/** 上游 search 请求超时（毫秒）。与客户端 `WEB_SEARCH_TIMEOUT_MS = 2e4` 对齐。 */
+const NATIVE_SEARCH_TIMEOUT_MS = 20_000
+
+/** 上游 search 响应的形状（只声明用到的字段；逐项都当作不可信输入处理）。 */
+interface BuddySearchResponse {
+  results?: Array<{ title?: unknown; url?: unknown; snippet?: unknown } | null | unknown>
+}
+
+/**
+ * 发一次搜索 POST 并解析 JSON。
+ *
+ * 错误语义对齐官方：**直接抛**（工具层不包装，由宿主 `toolErrorResult` 统一转
+ * `isError`），且文案带排障指引（端点、下一步动作、给模型的约束）。
+ */
+async function postBuddySearchJson(
+  endpoint: string,
+  body: unknown,
+  accessToken: string,
+  product: BuddyProduct,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const timeout = AbortSignal.timeout(NATIVE_SEARCH_TIMEOUT_MS)
+  const composed = AbortSignal.any([signal, timeout])
+
+  let response: Response
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json;charset=UTF-8',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: composed,
+    })
+  } catch (error) {
+    // 取消与超时必须区分：前者是正常终止（`aborted`），
+    // 后者是预算用尽（`timeout`），都不是上游故障。
+    if (signal.aborted) {
+      throw new WebNativeError(
+        `${product.id} search aborted`,
+        NativeSearchCodes.aborted,
+        { cause: error },
+      )
+    }
+    if (timeout.aborted) {
+      throw new WebNativeError(
+        `${product.id} search timed out after ${NATIVE_SEARCH_TIMEOUT_MS}ms.\n\n`
+        + `The request used endpoint ${JSON.stringify(endpoint)}. `
+        + 'Web search uses the same account as chat but a separate endpoint. '
+        + 'Retry, or narrow the request; if it keeps timing out the endpoint or network may be unreachable.',
+        NativeSearchCodes.timeout,
+        { cause: error },
+      )
+    }
+    throw new WebNativeError(
+      `${product.id} search request failed: ${errorMessage(error)}\n\n`
+      + `The request used endpoint ${JSON.stringify(endpoint)}. `
+      + 'Web search uses the same account as chat but a separate endpoint. '
+      + 'If the network is unreachable or the endpoint is wrong, the user must decide how to proceed.',
+      NativeSearchCodes.upstream,
+      { cause: error },
+    )
+  }
+
+  if (!response.ok) {
+    const detail = await readBuddyErrorDetail(response)
+    throw new WebNativeError(
+      `${product.id} search request failed (HTTP ${response.status})${detail}\n\n`
+      + `The request used endpoint ${JSON.stringify(endpoint)}. `
+      + 'Web search uses the same account as chat but a separate endpoint. '
+      + "If the account's sign-in has expired, guide the user to sign in again from the Jet Hub panel; "
+      + 'the endpoint does not need changing.',
+      NativeSearchCodes.upstream,
+    )
+  }
+
+  try {
+    const json: unknown = await response.json()
+    return json
+  } catch (error) {
+    throw new WebNativeError(
+      `${product.id} returned a non-JSON response.\n\n`
+      + `The request used endpoint ${JSON.stringify(endpoint)}. `
+      + 'Expected a JSON body with { results: [{ title, url, snippet }] }.',
+      NativeSearchCodes.badResponse,
+      { cause: error },
+    )
+  }
+}
+
+/** 从非 2xx 响应里取一段可读的上游说明（截断，且不回显敏感内容）。 */
+async function readBuddyErrorDetail(response: Response): Promise<string> {
+  try {
+    const text = await response.text()
+    const trimmed = text.trim().slice(0, 300)
+    return trimmed.length > 0 ? `: ${trimmed}` : ''
+  } catch {
+    return ''
+  }
 }

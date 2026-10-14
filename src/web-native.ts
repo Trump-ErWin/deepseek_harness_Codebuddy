@@ -59,9 +59,12 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { HarnessError } from '@deepseek-ai/dsh-llm'
-import type { BuddyCredential } from './buddy.js'
-import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
+import {
+  NativeSearchCodes,
+  WebNativeError,
+  type NativeSearchAdapter,
+  type NativeSource,
+} from './native-search-contract.js'
 
 /**
  * `tools/execute` 的事件类型说明。
@@ -112,18 +115,6 @@ export interface WebNativeToolExecution {
 }
 
 /**
- * 纳入本模块的渠道 → 产品配置。
- *
- * ⚠️ **必须复用 `product.ts` 的常量**，不要另抄一份 endpoint：两者是**同一客户端
- * 的两套环境端点**（中国区 `copilot.tencent.com` / 国际版 `www.workbuddy.ai`），
- * 插件改端点时必须一起跟随。
- */
-const CHANNEL_PRODUCTS: Readonly<Record<string, BuddyProduct>> = {
-  buddy: CODEBUDDY,
-  workbuddy: WORKBUDDY,
-}
-
-/**
  * 单次搜索返回的 source 上限。
  *
  * ⚠️ **写死 8**：这是官方 `@deepseek-ai/dsh-tool-web` 的 `searchMaxResults`
@@ -154,70 +145,13 @@ const MAX_RESULTS = 8
  */
 const MAX_QUERIES = 4
 
-/** 上游请求超时（毫秒）。与客户端 `WEB_SEARCH_TIMEOUT_MS = 2e4` 对齐。 */
-const UPSTREAM_TIMEOUT_MS = 20_000
-
 /** 官方 `web_search` 工具名。 */
 const WEB_SEARCH = 'web_search'
 
-/**
- * 原生搜索链路的失败。
- *
- * ⚠️ **刻意不复用官方的 `WEB_*` 码**：那套码描述的是 `ctx.web` 的
- * **provider 选择**语义（`WEB_PROVIDER_*` / `WEB_DUPLICATE_PROVIDER` …），
- * 而本模块**绕过了 `ctx.web`**，直接调上游。借用会让后续排查误判归属。
- *
- * 形态对齐官方：官方工具层**不做任何包装**（零 try/catch），异常一路抛到
- * `dispatchToolBody` 的 catch，由 `toolErrorResult()` 统一转成
- * `{ isError: true, content: [{text: 'Error: …'}], error: { message, info } }`。
- * 故这里也**只抛不包**，让宿主产出与官方逐字同形的错误结果。
- */
-export class WebNativeError extends HarnessError {}
-
-/** 无可用账号。 */
-const NO_ACCOUNT_CODE = 'WEB_NATIVE_NO_ACCOUNT'
-/** 上游非 2xx。 */
-const UPSTREAM_CODE = 'WEB_NATIVE_UPSTREAM'
-/** 响应无法解析（上游返回了非预期形状）。 */
-const BAD_RESPONSE_CODE = 'WEB_NATIVE_BAD_RESPONSE'
-/**
- * 入参不合法。
- *
- * ⚠️ 与 {@link BAD_RESPONSE_CODE} **必须分开**（对抗性审查 m1）：后者描述的是
- * **上游响应**解析失败，而这里描述的是**模型给的入参**不合法。官方对应路径是
- * `defineTool` 的 `validate()` → `ToolArgsError`，其 code 是 **`INVALID_ARGS`**。
- * 复用「响应」码会让排查误判归属（本是模型传错参数，却去查上游）。
- */
-const INVALID_ARGS_CODE = 'WEB_NATIVE_INVALID_ARGS'
-/**
- * 上游请求超时。
- *
- * ⚠️ 与 {@link UPSTREAM_CODE} 分开（对抗性审查 m2）：超时是一条独立的失败归因。
- * 且要知悉：本模块的 `UPSTREAM_TIMEOUT_MS`（20s）**小于**官方 `web_search` 的
- * `timeoutMs`（30s），故本超时**总是先于**宿主 `tool-call-timeout-policy` 的
- * `TOOL_TIMEOUT` 触发 —— 模型看到的是本模块的文案，而不是「tool call timed out」。
- * 这是刻意的：原生链路的预算由本模块自己兜，不依赖外层包装器。
- */
-const TIMEOUT_CODE = 'WEB_NATIVE_TIMEOUT'
-
-/** 上游 search 响应的形状（只声明用到的字段；逐项都当作不可信输入处理）。 */
-interface NativeSearchResponse {
-  results?: Array<{ title?: unknown; url?: unknown; snippet?: unknown } | null | unknown>
-}
-
 /** 官方 `web_search` 的 output value。 */
 interface WebSearchValue {
-  sources: Array<{ url: string; title?: string; snippet?: string }>
+  sources: NativeSource[]
   truncated: boolean
-}
-
-/** 适配器需要暴露给本模块的最小面（结构化，便于单测注入替身）。 */
-export interface NativeSearchAdapter {
-  /**
-   * 用聊天链路**同一套**编排解析凭据（`BuddyAdapter.resolveCredentialFor`）。
-   * @param modelId - 当前会话路由的模型 id。
-   */
-  resolveCredentialFor(modelId: string | undefined): Promise<BuddyCredential | undefined>
 }
 
 /**
@@ -261,52 +195,41 @@ export function installWebNative(
       const channel = route?.provider
       if (channel === undefined) return next()
 
-      // ④ 只做 buddy 系。**没有 else 分支** —— 不通过即 `next()` 原样放行，
-      //    官方链路（`runSearchQueries` → `ctx.web.search` → DeepSeek provider）
-      //    逐字节不变。
+      // ④ 只做**注册了适配器**的渠道。**没有 else 分支** —— 不通过即 `next()`
+      //    原样放行，官方链路（`runSearchQueries` → `ctx.web.search` → DeepSeek
+      //    provider）逐字节不变。
       //
       //    ⚠️ 必须用 `Object.hasOwn` 而不是直接下标取值（真实缺陷，对抗性审查 M3）：
-      //    两个表都是对象字面量，`channel` 取到原型链上的名字时查找会命中
+      //    表是对象字面量，`channel` 取到原型链上的名字时查找会命中
       //    （`'constructor'` → `Object.prototype.constructor`，truthy 且非 `undefined`），
       //    于是守卫失效、进入短路分支。虽然要求会话路由的 provider 恰为这些字符串
       //    （可达性低），但守卫写法本身必须成立。
-      if (!Object.hasOwn(CHANNEL_PRODUCTS, channel) || !Object.hasOwn(adapters, channel)) return next()
-      const product = CHANNEL_PRODUCTS[channel]!
+      if (!Object.hasOwn(adapters, channel)) return next()
       const adapter = adapters[channel]!
 
       // ⑤ 短路：返回 `{ value }`，官方工具体不执行。
-      return { value: await runNative(exec, product, adapter) }
+      return { value: await runNative(exec, adapter) }
     })
   })
 }
 
-/** 解析凭据、校验可用性，然后调上游搜索。 */
+/**
+ * 解析凭据、调上游搜索、按官方规则合并。
+ *
+ * ⚠️ 这里**不关心具体渠道**：取数（含凭据校验与字段投影）全在适配器的
+ * `searchOnce` 里，本函数只做「官方语义」那部分（凭据判空 + 多 query 合并）。
+ */
 async function runNative(
   exec: WebNativeToolExecution,
-  product: BuddyProduct,
   adapter: NativeSearchAdapter,
 ): Promise<WebSearchValue> {
   const model = exec.agent?.session.requestHeader()?.config?.model
   // ⚠️ 与聊天链路同一个 `resolveCredential` 实例：筛号规则（enabled / 模型级
   //    限流 / 免费判定 / 余额分档 / 池兜底）因此完全一致。
   const credential = await adapter.resolveCredentialFor(model)
-  // ⚠️ 必须同时判 `access_token` **是不是非空字符串**，不能只判 credential 存在：
-  //    凭据是 `JSON.parse` 出来的外部数据，形状不可信（缺字段 / 类型错都可能）。
-  //    只判 `credential === undefined` 会让坏凭据抛
-  //    `TypeError: Cannot read properties of undefined (reading 'length')` ——
-  //    模型看到的是一句无意义的 JS 报错，而不是「去登录」的指引。
-  const accessToken = typeof credential?.access_token === 'string' ? credential.access_token : ''
-  if (accessToken.length === 0) {
-    throw new WebNativeError(
-      `${product.id} search has no usable account; sign in to a ${product.id} account `
-      + `from the Jet Hub panel first. The current route is "${product.id}". `
-      + 'Only the user can change accounts.',
-      NO_ACCOUNT_CODE,
-    )
-  }
 
   const args = asRecord(exec.arguments) ?? {}
-  return await nativeSearch(args, accessToken, product, exec.signal)
+  return await nativeSearch(args, adapter, credential, exec.signal)
 }
 
 /**
@@ -314,11 +237,14 @@ async function runNative(
  *
  * 官方入参是 `queries: string[]`（1~4 个，结果按 rank 轮转合并），故这里对
  * 每个 query 各发一次，再按官方 `mergeSearchResults` 的规则合并。
+ *
+ * ⚠️ **取数走适配器的 `searchOnce`**（各渠道自己实现，含凭据校验与字段投影），
+ * 本函数只管「官方语义」那部分：入参校验、并发中止、rank 轮转合并、cap。
  */
 async function nativeSearch(
   args: Record<string, unknown>,
-  accessToken: string,
-  product: BuddyProduct,
+  adapter: NativeSearchAdapter,
+  credential: unknown,
   signal: AbortSignal,
 ): Promise<WebSearchValue> {
   const queries = readQueries(args.queries)
@@ -344,10 +270,10 @@ async function nativeSearch(
    * 故本处**没有任何可观测的行为差异**，保留它只为把「顺序不变量」这层隐式
    * 依赖去掉：将来谁调整了「先抛后合并」的顺序，也不会因此崩。
    */
-  const perQuery = new Map<number, WebSearchValue['sources']>()
+  const perQuery = new Map<number, NativeSource[]>()
   const searches = queries.map(async (query, index) => {
     try {
-      perQuery.set(index, await searchOnce(query, accessToken, product, batchSignal))
+      perQuery.set(index, await adapter.searchOnce(query, credential, batchSignal))
     } catch (error) {
       // 只记**首个**失败，与官方一致（后续失败不再覆盖归因）。
       if (firstFailure === undefined) firstFailure = { error }
@@ -380,151 +306,6 @@ async function nativeSearch(
     }
   }
   return { sources, truncated }
-}
-
-/** 一次单 query 搜索；返回投影后的 source 列表。 */
-async function searchOnce(
-  query: string,
-  accessToken: string,
-  product: BuddyProduct,
-  signal: AbortSignal,
-): Promise<WebSearchValue['sources']> {
-  const endpoint = `${product.endpoint}/agenttool/v1/search`
-  const body = { query, type: 'text2text', max_results: MAX_RESULTS }
-  // ⚠️ 响应体先过 `asRecord`：上游返回 JSON `null` 时直接读 `.results` 会抛
-  //    `TypeError: Cannot read properties of null`（对抗性审查 F2），
-  //    而我们想要的是「响应无法解析」这条业务错误。
-  const json = await postJson(endpoint, body, accessToken, product, signal)
-  const results = (asRecord(json) as NativeSearchResponse | undefined)?.results
-  if (!Array.isArray(results)) {
-    throw new WebNativeError(
-      `${product.id} returned an unparseable search response: "results" is not an array.\n\n`
-      + `The request used endpoint ${JSON.stringify(endpoint)}. `
-      + 'Expected { results: [{ title, url, snippet }] }. '
-      + 'This usually means the upstream API changed, or the account lacks search permission.',
-      BAD_RESPONSE_CODE,
-    )
-  }
-
-  const sources: WebSearchValue['sources'] = []
-  for (const raw of results) {
-    // ⚠️ 必须先挡 `null` / 非对象：`results: [null]` 时读 `item.url` 会抛
-    //    `TypeError: Cannot read properties of null`（真实缺陷，对抗性审查 F1）——
-    //    那会让**整条工具调用**失败，与本段的意图（畸形条目**丢弃**、少一条而已）相反。
-    const item = asRecord(raw)
-    if (item === undefined) continue
-    const url = typeof item.url === 'string' ? item.url : ''
-    // ⚠️ `url` 是官方 schema 的必填项（`additionalProperties: false` + `required`）。
-    //    上游给不出 url 的条目直接丢弃，否则 `createSuccessResult` 会抛
-    //    `ToolOutputError`（整个工具调用失败，而不是少一条结果）。
-    if (url.length === 0) continue
-    const title = typeof item.title === 'string' && item.title.length > 0 ? item.title : undefined
-    const snippet = typeof item.snippet === 'string' && item.snippet.length > 0 ? item.snippet : undefined
-    sources.push({
-      url,
-      ...title === undefined ? {} : { title },
-      ...snippet === undefined ? {} : { snippet },
-    })
-  }
-  return sources
-}
-
-/**
- * 发一次上游搜索 POST 并解析 JSON。
- *
- * 错误语义对齐官方：**直接抛**（工具层不包装，由宿主 `toolErrorResult` 统一转
- * `isError`），且文案带排障指引（端点、下一步动作、给模型的约束）。
- *
- * ⚠️ 文案里的动作名**写死 `search`** —— 本模块只管 `web_search`（2026-10-14
- * 剔除了 `web_fetch` 接管，见模块头），故不再需要 `operation` 参数区分。
- */
-async function postJson(
-  endpoint: string,
-  body: unknown,
-  accessToken: string,
-  product: BuddyProduct,
-  signal: AbortSignal,
-): Promise<unknown> {
-  const timeout = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
-  const composed = AbortSignal.any([signal, timeout])
-
-  let response: Response
-  try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json;charset=UTF-8',
-        'Accept': 'application/json',
-      },
-      body: JSON.stringify(body),
-      signal: composed,
-    })
-  } catch (error) {
-    // 取消与超时必须区分：前者是正常终止（`WEB_NATIVE_ABORTED`），
-    // 后者是本模块自己的预算用尽（`WEB_NATIVE_TIMEOUT`），都不是上游故障。
-    if (signal.aborted) {
-      throw new WebNativeError(
-        `${product.id} search aborted`,
-        'WEB_NATIVE_ABORTED',
-        { cause: error },
-      )
-    }
-    if (timeout.aborted) {
-      throw new WebNativeError(
-        `${product.id} search timed out after ${UPSTREAM_TIMEOUT_MS}ms.\n\n`
-        + `The request used endpoint ${JSON.stringify(endpoint)}. `
-        + 'Web search uses the same account as chat but a separate endpoint. '
-        + 'Retry, or narrow the request; if it keeps timing out the endpoint or network may be unreachable.',
-        TIMEOUT_CODE,
-        { cause: error },
-      )
-    }
-    throw new WebNativeError(
-      `${product.id} search request failed: ${errorMessage(error)}\n\n`
-      + `The request used endpoint ${JSON.stringify(endpoint)}. `
-      + 'Web search uses the same account as chat but a separate endpoint. '
-      + 'If the network is unreachable or the endpoint is wrong, the user must decide how to proceed.',
-      UPSTREAM_CODE,
-      { cause: error },
-    )
-  }
-
-  if (!response.ok) {
-    const detail = await readErrorDetail(response)
-    throw new WebNativeError(
-      `${product.id} search request failed (HTTP ${response.status})${detail}\n\n`
-      + `The request used endpoint ${JSON.stringify(endpoint)}. `
-      + 'Web search uses the same account as chat but a separate endpoint. '
-      + "If the account's sign-in has expired, guide the user to sign in again from the Jet Hub panel; "
-      + 'the endpoint does not need changing.',
-      UPSTREAM_CODE,
-    )
-  }
-
-  try {
-    const json: unknown = await response.json()
-    return json
-  } catch (error) {
-    throw new WebNativeError(
-      `${product.id} returned a non-JSON response.\n\n`
-      + `The request used endpoint ${JSON.stringify(endpoint)}. `
-      + 'Expected a JSON body with { results: [{ title, url, snippet }] }.',
-      BAD_RESPONSE_CODE,
-      { cause: error },
-    )
-  }
-}
-
-/** 从非 2xx 响应里取一段可读的上游说明（截断，且不回显敏感内容）。 */
-async function readErrorDetail(response: Response): Promise<string> {
-  try {
-    const text = await response.text()
-    const trimmed = text.trim().slice(0, 300)
-    return trimmed.length > 0 ? `: ${trimmed}` : ''
-  } catch {
-    return ''
-  }
 }
 
 /**
@@ -566,26 +347,26 @@ function readQueries(value: unknown): string[] {
   if (!Array.isArray(value)) {
     throw new WebNativeError(
       'queries must be an array of strings',
-      INVALID_ARGS_CODE,
+      NativeSearchCodes.invalidArgs,
     )
   }
   if (value.length === 0) {
-    throw new WebNativeError('queries must contain at least one query', INVALID_ARGS_CODE)
+    throw new WebNativeError('queries must contain at least one query', NativeSearchCodes.invalidArgs)
   }
   if (value.length > MAX_QUERIES) {
     throw new WebNativeError(
       `queries must contain at most ${MAX_QUERIES} queries`,
-      INVALID_ARGS_CODE,
+      NativeSearchCodes.invalidArgs,
     )
   }
   const out: string[] = []
   for (const item of value) {
     if (typeof item !== 'string') {
-      throw new WebNativeError('each query must be a non-empty string', INVALID_ARGS_CODE)
+      throw new WebNativeError('each query must be a non-empty string', NativeSearchCodes.invalidArgs)
     }
     const query = item.trim()
     if (query.length === 0) {
-      throw new WebNativeError('each query must be a non-empty string', INVALID_ARGS_CODE)
+      throw new WebNativeError('each query must be a non-empty string', NativeSearchCodes.invalidArgs)
     }
     if (!out.includes(query)) out.push(query)
   }

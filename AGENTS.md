@@ -69,11 +69,30 @@
 - 命令通过 `ctx.commands.register()` 注册
 - 插件配置通过 `ctx.schema` 在 profile layer 栈中声明
 
-## ⚠️ 渠道原生搜索（`src/web-native.ts`）
+## ⚠️ 渠道原生搜索（`src/web-native.ts` + `src/native-search-contract.ts`）
 
-buddy 系渠道（`buddy` / `workbuddy`）的官方 **`web_search`** 改走**渠道自带的
-搜索后端**（`POST {endpoint}/agenttool/v1/search`），其余渠道一律 `next()` 放行
-—— **不路由、不回退**，官方链路逐字节不变。
+**支持原生搜索的渠道**的官方 `web_search` 改走**渠道自带后端**，其余渠道一律
+`next()` 放行 —— **不路由、不回退**，官方链路逐字节不变。
+
+| 渠道 | 原生后端 | 鉴权 |
+|---|---|---|
+| `buddy` / `workbuddy` | 腾讯 `POST {endpoint}/agenttool/v1/search` | `Bearer <access_token>` |
+| `qoder` / `qodercn` | Qoder `POST {encryptedInferBase}/api/v1/webSearch/oneSearch` | **COSY 签名（WASM）** |
+
+### ⚠️ 架构：两层 + 一个契约文件（2026-10-14 改造）
+
+| 文件 | 职责 |
+|---|---|
+| `src/native-search-contract.ts` | **共享契约**：错误类型 / 错误码 / `NativeSource` / `NativeSearchAdapter` 接口 |
+| `src/web-native.ts` | **工具层**：拦截 `tools/execute`、官方入参校验、多 query 合并、cap |
+| `src/{buddy,qoder}-adapter.ts` | **渠道层**：`searchOnce` 取数 + 字段投影（各渠道形状不同） |
+
+⚠️ **契约必须单独成文件**：否则渠道层要 `import` 工具层，**依赖方向反了**
+（渠道是更底层的实现，不该知道「谁在拦截工具执行」）。改动前先读它的模块头。
+
+⚠️ **取数不可放在工具层**：腾讯的 `results[].url` 与 Qoder 的 `pageItems[].link`
+形状不同，若混在工具层会让「渠道判断」与「字段投影」纠缠（改造前就是这样，
+Qoder 根本接不进来）。
 
 ### ⚠️ 只管 `web_search`，**刻意不管** `web_fetch`（2026-10-14 修正）
 
@@ -95,7 +114,7 @@ buddy 系渠道（`buddy` / `workbuddy`）的官方 **`web_search`** 改走**渠
 Jet Hub 页头有总开关（`nativeWebSearchEnabled`，缺键默认启用）：关掉即**所有渠道**
 （含 buddy 系）回官方搜索，此时 buddy 渠道报 `DEEPSEEK_API_KEY` 缺失属**预期**。
 
-### 动它之前必须知道的五条
+### 动它之前必须知道的七条
 
 1. **`tools/execute` 是 cordis waterfall**：不调 `next()` 即短路，返回值**必须**是
    `{ value }` 形状（返回 `undefined` 会让宿主在 `normalizeDispatchResult` 里抛
@@ -108,18 +127,31 @@ Jet Hub 页头有总开关（`nativeWebSearchEnabled`，缺键默认启用）：
 4. **输出投影贴合官方 schema**：`sources[{url,title?,snippet?}]`（`url` 必填、
    `additionalProperties: false`）—— 多传字段会让 `createSuccessResult` 抛
    `ToolOutputError`，整条调用失败（不是少一条结果）。
-5. **凭据必须与聊天链路同源**：经 `BuddyAdapter.resolveCredentialFor` 复用**同一个**
+   各适配器**必须丢掉**自己多余的字段（Qoder 的 `publishedTime` / `hostname` /
+   `hostLogo` 都在此列）。
+5. **凭据必须与聊天链路同源**：经 `Xxx.resolveCredentialFor` 复用**同一个**
    `resolveCredential` 实例；另建一份会让「enabled / 模型级限流 / 免费判定 /
    余额分档 / 池兜底 / 账本回报」六步在两条链路上漂移。
+6. **Qoder 的 WASM 上下文必须 `dispose`**：`QoderContext` 是 wasm 堆上的 Rust 对象，
+   `gluePromise` 是**进程级单例** —— 不释放会让堆只增不减，长上下文会话最终以裸
+   `RuntimeError: unreachable` 暴毙（真实事故史见 `qoder-wasm.ts` 文件头）。
+   用 `try/finally`（`finally` 里的 `throw` 会**无条件覆盖** `try` 里的原始错误）。
+7. **`url` 字段名各家不同**：腾讯叫 `results[].url`、Qoder 叫 `pageItems[].link`。
+   投影在**适配器**里做，工具层的合并算法对渠道无感。
 
 ### 实测边界（2026-10-14 真机）
 
 - 两个 host（`copilot.tencent.com` / `www.workbuddy.ai`）行为一致；
   `max_results` 完全生效：**1/3/5/8 原样返回、>8 封顶 8**；
-- ✅ 已验证：buddy / workbuddy 搜索通、qoder 等正确放行、开关热切换无需重启；
+- ✅ 已验证：buddy / workbuddy 搜索通、开关热切换无需重启；
+- ✅ 已验证：**Qoder 原生搜索调通** —— CN 免费账号 `POST gateway.qoder.com.cn/.../oneSearch`
+  → HTTP 200 返回 10 条 `pageItems`；**与客户端真实调用逐条对比：URL 10/10、标题 10/10、
+  顺序完全一致**（客户端侧证据取自 `~/.qoder-cn/projects/…/d6bb315c-….jsonl`）。
+  协议细节见 `docs/agent-notes/providers-qoder.md` 的「渠道原生搜索」一节；
 - ✅ 已验证：`web_fetch` 在任何渠道都走官方（开关开着时也不出现 `workbuddy fetch` 文案）；
 - ⚠️ **未验证**：本监听器在 `tools/execute` 链中的**位置**（决定外层超时策略是否
-  生效）、宿主升级后 `requestHeader()` 在工具执行时**是否已就绪**。
+  生效）、宿主升级后 `requestHeader()` 在工具执行时**是否已就绪**；
+- ⚠️ **未接入**：Qoder 的 `bailian` 搜索后端（需百炼 API Key，默认不用）。
 
 研究记录见 `docs/workbuddy-native-search-research.md`（含端点探测、请求头最小集、
 与 DeepSeek 官方搜索的架构差异）。
