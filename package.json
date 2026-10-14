@@ -73,7 +73,8 @@
     "test:e2e:accio": "cross-env DSH_ACCIO_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/accio-probe.e2e.spec.ts",
     "test:e2e:accio-chat": "cross-env DSH_ACCIO_CHAT_E2E=1 DSH_ACCIO_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-chat-probe.e2e.spec.ts",
     "test:e2e:accio-tools": "cross-env DSH_ACCIO_TOOLS_E2E=1 DSH_ACCIO_TOOLS_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-tools-probe.e2e.spec.ts",
-    "test:e2e:accio-refresh": "cross-env DSH_ACCIO_REFRESH_E2E=1 DSH_ACCIO_REFRESH_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-refresh-probe.e2e.spec.ts"
+    "test:e2e:accio-refresh": "cross-env DSH_ACCIO_REFRESH_E2E=1 DSH_ACCIO_REFRESH_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-refresh-probe.e2e.spec.ts",
+    "test:e2e:accio-image": "cross-env DSH_ACCIO_IMAGE_E2E=1 DSH_ACCIO_IMAGE_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-image-probe.e2e.spec.ts"
   },
   "dsh": {
     "bundle": {

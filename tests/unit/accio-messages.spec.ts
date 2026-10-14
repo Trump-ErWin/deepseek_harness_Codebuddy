@@ -21,6 +21,8 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
+  ACCIO_IMAGE_PIXEL_BUDGET,
+  accioUserParts,
   consumeAccioSse,
   normalizeAccioFrame,
   toAccioTools,
@@ -225,7 +227,7 @@ describe('serializeAccioMessages', () => {
     }])
   })
 
-  it('content 为数组时只取 text 块（图片本轮不发：见 ACCIO_IMAGE_PIXEL_BUDGET 注释）', () => {
+  it('content 为数组时取全部 text 块（拼接）', () => {
     const out = serializeAccioMessages([
       { role: 'user', content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] },
     ])
@@ -235,6 +237,94 @@ describe('serializeAccioMessages', () => {
   it('空内容不产出空 parts 条目', () => {
     expect(serializeAccioMessages([{ role: 'user', content: '' }]).contents).toEqual([])
     expect(serializeAccioMessages([]).contents).toEqual([])
+  })
+
+  /**
+   * ## 图片内联（issue IKLR7V 接线，2026-10-14）
+   *
+   * 上游形状由真机实测确定：Gemini 风格的 `parts[].inline_data = {mime_type,data}`
+   * （四象限色块图**四色全对**）。本层产出 camelCase `inlineData`，由
+   * `buildAccioBody` 的 `accioToSnake` 转成 snake（形状断言见 `accio-product.spec.ts`）。
+   */
+  describe('图片内联', () => {
+    const IMAGES = new Map([['att-1', { mediaType: 'image/png', data: 'QUJD' }]])
+
+    it('⚠️⚠️ 有图时产出 inlineData（文本与图在同一条 parts 里）', () => {
+      const out = serializeAccioMessages([
+        { role: 'user', content: [
+          { type: 'text', text: '看图' },
+          { type: 'image', attachment: { attachmentId: 'att-1' } },
+        ] },
+      ], IMAGES)
+      expect(out.contents).toEqual([{
+        role: 'user',
+        parts: [
+          { text: '看图' },
+          { inlineData: { mimeType: 'image/png', data: 'QUJD' } },
+        ],
+      }])
+    })
+
+    it('⚠️⚠️ images 为 undefined 时**不得**产出 inlineData（无图请求格式逐字节不变）', () => {
+      // 无图请求必须保持原来的纯文本路径 —— 升级成多模态形态会破坏前缀缓存。
+      const out = serializeAccioMessages([
+        { role: 'user', content: [
+          { type: 'text', text: '看图' },
+          { type: 'image', attachment: { attachmentId: 'att-1' } },
+        ] },
+      ])
+      expect(out.contents).toEqual([{ role: 'user', parts: [{ text: '看图' }] }])
+    })
+
+    it('⚠️⚠️ 有图但拿不到字节 ⇒ **抛错**（绝不静默丢弃整张图）', () => {
+      // 静默丢弃会让用户以为模型看到了图（本仓库首条红线）。
+      expect(() => serializeAccioMessages([
+        { role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'missing' } }] },
+      ], IMAGES)).toThrow(/图片未能内联/)
+    })
+
+    it('⚠️ `attachmentId` 缺失/非字符串时同样抛错（不得产出空图）', () => {
+      expect(() => serializeAccioMessages([
+        { role: 'user', content: [{ type: 'image', attachment: {} }] },
+      ], IMAGES)).toThrow(/图片未能内联/)
+    })
+
+    it('⚠️⚠️ tool-result 内嵌图片必须**递归**取出（深层图片不得被静默丢弃）', () => {
+      // 与 `collectImages` 的递归深度对称：收集侧任意深度、序列化侧只走一层
+      // ⇒ 深层图片被收进 refs 却在序列化时静默消失（连占位符都没有）。
+      const out = serializeAccioMessages([
+        { role: 'user', content: [{
+          type: 'tool-result',
+          toolCallId: 'c1',
+          content: [
+            { type: 'text', text: '截图' },
+            { type: 'image', attachment: { attachmentId: 'att-1' } },
+          ],
+        }] },
+      ], IMAGES)
+      const parts = (out.contents[0] as { parts: Array<Record<string, unknown>> }).parts
+      expect(parts, '内嵌文本仍要保留').toContainEqual({ text: '截图' })
+      expect(parts.some((p) => p.inlineData !== undefined), '深层图片必须被取出').toBe(true)
+    })
+
+    it('无图时 user 消息仍走字符串路径（不因传了 images 就升级）', () => {
+      // ⚠️ `images` 非 undefined（含空 Map）**不等于**本消息有图 —— 判据必须是
+      // 「这条消息自己有没有 image 块」，而不是「请求里有没有图」。
+      const out = serializeAccioMessages([
+        { role: 'user', content: [{ type: 'text', text: '纯文本' }] },
+      ], IMAGES)
+      expect(out.contents).toEqual([{ role: 'user', parts: [{ text: '纯文本' }] }])
+    })
+  })
+
+  describe('accioUserParts（纯函数）', () => {
+    it('无图时返回 undefined（调用方据此走纯文本路径）', () => {
+      expect(accioUserParts([{ type: 'text', text: 'x' }], undefined)).toBeUndefined()
+    })
+
+    it('ACCIO_IMAGE_PIXEL_BUDGET 是正数（接线后真的被用，不再是死常量）', () => {
+      expect(ACCIO_IMAGE_PIXEL_BUDGET).toBeGreaterThan(0)
+    })
   })
 })
 
