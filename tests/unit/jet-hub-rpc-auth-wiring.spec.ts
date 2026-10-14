@@ -133,12 +133,16 @@ class FakeCredentials {
 /**
  * 跑一次真实的 `apply()`，返回可驱动 `account.refresh` 的调用器，
  * 以及每个 auth 服务上 `refreshAccountCredential` 的 spy。
+ *
+ * ⚠️ **它是 `async`**：返回前必须把 `apply()` 的 fire-and-forget 首轮续期
+ * 跑完并清空记录（理由见函数内 `settleBackground` 的注释）——
+ * 否则背景噪声会混进「恰好只有自己那个实例」的断言。
  */
-function setup(accounts: ProviderAccountEntry[]): {
+async function setup(accounts: ProviderAccountEntry[]): Promise<{
   call: (method: string, payload: unknown) => Promise<{ ok: boolean; error?: { message?: string } }>
   spyOf: (serviceName: string) => ReturnType<typeof vi.fn>
   calledServices: () => string[]
-} {
+}> {
   const ctx = new Context()
   ctx.provide('credentials', new FakeCredentials() as never)
   ctx.provide('commands', { register: () => () => {}, definitions: [] } as never)
@@ -201,6 +205,38 @@ function setup(accounts: ProviderAccountEntry[]): {
     return (await res.json() as { result: { ok: boolean; error?: { message?: string } } }).result
   }
 
+  /**
+   * ⚠️⚠️ **清空背景噪声：`apply()` 内部有一条 fire-and-forget 的首轮续期。**
+   *
+   * `src/index.ts` 的 `apply()` 会 `void refreshAllCredentials()` —— 它**不 await**，
+   * 且在**微任务**里才真正跑。它逐 provider 调 `refreshAll`，而 officeace 的
+   * `refreshAll` 会**对每个账号调 `refreshAccountCredential`**（那正是本文件布桩的
+   * 方法）⇒ 上面 `called` 记录器里会混进一条**与本次 RPC 无关**的
+   * `officeaceAuth`。
+   *
+   * ## 为什么这件事现在才暴露（IKLPTZ 的连带效应）
+   *
+   * 在 IKLPTZ（officeace 的 `refreshAll` 把同步池当 Promise）**未修**时，
+   * 那条首轮续期跑到 officeace 就抛 `TypeError` 并被上层吞掉 ⇒ **背景噪声根本不产生**，
+   * 本文件的「恰好只有自己那个实例」断言因此一直是绿的。
+   * 缺陷一修，背景链走通，噪声出现 ⇒ 断言把 codearts 那轮的
+   * `['officeaceAuth','codeartsAuth']` 判成错位。
+   *
+   * ⚠️ 但**分派本身是对的**（`codeartsAuth` 确实在列表里），多出来的那条是噪声。
+   * 故修法**不是**放宽断言（那会连真正的错位一起放过），而是
+   * **在开始测量之前把背景链跑完并清空记录** —— 让断言只衡量「本次 RPC 分派给了谁」，
+   * 这才是本用例的判据。
+   *
+   * ⚠️ **不得删掉这段**：删了它会退化成「靠启动时序侥幸绿」，
+   * 一旦背景链的时长随 provider 数量变化就会重新变成偶发假失败。
+   */
+  const settleBackground = async (): Promise<void> => {
+    // 让出若干拍：首轮链有多个 `await`（读池 → 逐账号续期 → 兜底）。
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setTimeout(resolve, 0))
+    called.length = 0
+  }
+  await settleBackground()
+
   return {
     call,
     spyOf: (serviceName: string) => {
@@ -209,8 +245,7 @@ function setup(accounts: ProviderAccountEntry[]): {
       return spy
     },
     calledServices: () => [...called],
-  }
-}
+  }}
 
 function entry(provider: string, credentialRef: string): ProviderAccountEntry {
   return {
@@ -266,7 +301,7 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     // 每个 provider 的续期必须**只有**它自己的实例被调用 —— 这直接证伪
     // 「qodercn 的账号去刷了 qoder 的凭据」这类串接。
     const accounts = EXPECTED_AUTH_PROVIDER_IDS.map((id) => entry(id, `${id.toUpperCase()}_ACCOUNT_WIRE`))
-    const { call, calledServices } = setup(accounts)
+    const { call, calledServices } = await setup(accounts)
 
     for (const id of EXPECTED_AUTH_PROVIDER_IDS) {
       const expected = AUTH_SERVICE[id]!
@@ -291,7 +326,7 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
       entry('qoder', 'QODER_ACCOUNT_INTL'),
       entry('qodercn', 'QODERCN_ACCOUNT_CN'),
     ]
-    const { call, spyOf } = setup(accounts)
+    const { call, spyOf } = await setup(accounts)
 
     const cn = await call('account.refresh', { accountId: 'qodercn-1' })
     expect(cn.ok, `中国版续期应成功，实际 error=${cn.error?.message}`).toBe(true)
@@ -306,7 +341,7 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
   })
 
   it('未知 provider 仍报 Unknown provider（命名对象没有把兜底吃掉）', async () => {
-    const { call } = setup([entry('mystery', 'MYSTERY_ACCOUNT_1')])
+    const { call } = await setup([entry('mystery', 'MYSTERY_ACCOUNT_1')])
     const result = await call('account.refresh', { accountId: 'mystery-1' })
     expect(result.ok).toBe(false)
     expect(result.error?.message).toMatch(/Unknown provider/)

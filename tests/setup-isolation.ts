@@ -48,6 +48,43 @@ const stateDir = mkdtempSync(join(tmpdir(), 'dsh-jet-hub-'))
 process.env.DSH_JET_HUB_STATE_DIR = stateDir
 
 /**
+ * ⚠️⚠️ **OfficeAce 的用户级目录必须隔离**（2026-10-14，IKLPTZ 修复时实测到的
+ * **真实事故路径**，不是理论风险）。
+ *
+ * `src/officeace-auth.ts` 的三条用户级路径都由本变量覆盖：
+ * `~/.dsh-officeace`（凭据 `session.json` + 兼容文件 + 余额缓存）
+ * 与 `~/.office-claw`（客户端 cookie + CA）。其中 `session.json` 是
+ * **用户真实的华为云凭据**，而其 `refresh_token` **一次性** —— 读进来续一次
+ * 就烧掉了，用户只能重新登录。
+ *
+ * ## 为什么「在 spec 里改 `USERPROFILE`」不够
+ *
+ * `src/index.ts` 的 `apply()` 内部有 `void refreshAllCredentials()`
+ * 的 **fire-and-forget 首轮续期**。spec 的 `afterEach` 把 `USERPROFILE`
+ * 恢复成真实值**之后**，那条后台链才跑到 OfficeAce 的「池为空 ⇒ 续期本机
+ * 凭据」兜底分支 ⇒ 用**真实 home** 读凭据并真发 STS 请求。
+ *
+ * 实测证据：修复 IKLPTZ 前 `refreshAll` 恒抛 `TypeError`，这条路径**被遮蔽**；
+ * 修好之后它**被打通**，vitest 输出里随即出现真实上游报文
+ * `STS5.1806 has been used`（一次性 token 已被消费的专属错误码）。
+ *
+ * ⇒ 唯一可靠的做法是**进程级**把该目录指向临时目录（与上面
+ * `DSH_JET_HUB_STATE_DIR` 同型），而不是靠用例自己改环境变量抢时序。
+ * 这样 `apply()` 的后台链无论何时跑、跑多少次，都只会看临时目录。
+ *
+ * ⚠️ **必须覆盖全部三条腿**（2026-10-14 对抗性审计打穿后补）：凭据目录、
+ * 兼容文件目录、以及 `.office-claw`。审计实测：漏掉 `.office-claw` 时
+ * `readSessionCookie()` 会读到用户**真实**的 `~/.office-claw/session.cookie`
+ * 并**成功 DPAPI 解密**（耗时约 1.1s，真跑 powershell）。当时它**不可达**
+ * （生产调用点都传了 `ref` ⇒ 走云侧直读），但那是**脆弱的绿** ——
+ * 任何新测试调 `readSessionCookie()` / `fetchModelTokenRates()` 就会踩到。
+ * ⇒ 现已收进同源覆盖（`officeAceClientHome()` 复用本变量）。
+ */
+if (process.env.DSH_OFFICEACE_HOME === undefined) {
+  process.env.DSH_OFFICEACE_HOME = mkdtempSync(join(tmpdir(), 'dsh-officeace-'))
+}
+
+/**
  * Qoder 设备身份：**测试里绝不能真的 spawn `runtime-info.exe`**
  * （单次约 3.8 秒，且结果随开发机是否装了桌面端而变）。
  * 指向不存在的路径即等价于「未安装」。

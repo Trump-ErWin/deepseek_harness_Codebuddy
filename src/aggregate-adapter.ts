@@ -1902,13 +1902,13 @@ export function maxAttemptsFor(models: readonly VirtualModel[]): number {
  *
  * | 渠道 | 档位 id |
  * |---|---|
- * | codearts | `on` / `off`（只有开关，注释明确「不臆造强度阶梯」） |
+ * | codearts | `off` / `on`（只有开关，声明顺序即强度序；注释明确「不臆造强度阶梯」） |
  * | buddy / workbuddy | `low` / `high` / `max`（**逐模型不同**） |
  * | zcode | `low` / `high` / `max` |
  * | loomy | `none` / `low` / `medium` / `high` / `xhigh` |
  * | trae | `light` / `high` / `extra_high`（**私有名**） |
  * | lobsterai | `off` / `high` / `xhigh` |
- * | raccoon | `on` / `off` |
+ * | raccoon | `off` / `on`（同 codearts，强度序） |
  *
  * `deepseek-v4.1-flash` 跨 buddy + codearts + cline ⇒ **交集为空**。而空档位的后果
  * 本仓库有明确记录（`opencode-adapter.ts`：「档位为空时**不声明**本字段，声明空数组

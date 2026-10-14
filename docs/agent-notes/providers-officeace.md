@@ -69,6 +69,138 @@ payload 必须齐 `{htm, htu, iat, jti}`；**无 `ath` 是正确的**（RFC 9449
 
 守卫：`tests/unit/officeace-refresh-guards.spec.ts`（5 条，逐条做过反向验证）。
 
+## 2.5 ⚠️⚠️ 批量续期把**同步**池当 Promise（Issue IKLPTZ，2026-10-14 报障）
+
+**症状**：宿主每次启动 + 每 30 分钟一轮，日志固定一条
+`[jet-hub] officeace 批量续期失败：p.listAccountsByProvider(...).catch is not a function`，
+被 `refreshAllCredentials` 逐 provider `try` 吞成 warn ⇒ **界面零提示**，
+OfficeAce 的**批量**续期整条失效。
+
+### 双重误判：一个 bug 被复制了两遍
+
+```ts
+const accounts = await p.listAccountsByProvider('officeace').catch(() => [])
+```
+
+`AccountPool.listAccountsByProvider` 是**同步**方法（`src/account-pool.ts`
+返回 `ProviderAccountEntry[]`），数组没有 `.catch` ⇒ 恒抛 `TypeError`。
+
+⚠️⚠️ 该行在**两处**逐字出现（连注释都相同）：
+
+| 位置 | 角色 |
+|---|---|
+| `src/officeace-auth.ts` 的模块导出 `refreshAll` | 兼容文件腿 |
+| `src/index.ts` 的 `officeaceAuthService.refreshAll` | **定时器实际走的是这份**（`ctx.credentials` 只能在那里注入）|
+
+⇒ 只修一处会让另一处继续静默失效。
+
+**类型系统为什么没拦**：两处都把形参声明为 `unknown` 再**内联断言**收窄，
+其中返回值写成了 `Promise<…>`；断言直接覆盖 `unknown` 的推导结果 ⇒ `tsc` 全程通过。
+⚠️ **别声称「加了结构化接口就能拦住它」**：`unknown as X` 恒被允许。
+真正有牙的是：① 行为用例；② 结构上**只留一份遍历实现**
+（`refreshAccountList`，两处只提供各自的 `refreshOne` 分派）。
+
+⚠️ **如实标注那句「编译期写不出来」的射程**（2026-10-14 复审）：本函数**当前那句
+赋值**处写不出来（`accounts` 显式标注为数组，`.catch` 与 `for…of Promise` 都编不过），
+但**换个地方重新断言**一份 Promise 版本（`?.(…).catch()`、跨行 + 非空断言）
+`tsc` **仍然全绿**（复审实测 exit 0）。⇒ 拦截力来自「只有一份实现」，不是类型。
+
+### ⚠️ 登记行为变更（**两处**；第一版只登记了一处、且登记错了格子）
+
+⚠️⚠️ 本节曾被**对抗性审计打穿**：第一版写「池返回 rejected Promise → 等价」，
+实测那格**根本不是等价**，而是新代码**抛 `TypeError: accounts is not iterable`**
+（`accounts.length===0` 对 Promise 为 false ⇒ 进 `for…of` 抛）——**连兜底都绕过**，
+比修复前的行为更糟。⇒ 已修（接受两种形态）并更正如下。
+
+`refreshAccountList` 与修复前相比共**两格**不同：
+
+| 池返回 | 修复前 `await ….catch(…)` | 现（`await` + `Array.isArray` 归一） |
+|---|---|---|
+| 数组（生产实际形态） | 逐个续期 | 逐个续期（**等价**） |
+| Promise（resolved 数组） | 逐个续期（`await` 到了数组） | 逐个续期（**等价**，已恢复） |
+| Promise（rejected） | 吞成 `[]` ⇒ 兜底 | 兜底（**等价**，已恢复） |
+| 非数组（形状不符） | `accounts.length` undefined ⇒ `for…of` 抛 | 归入「空池兜底」（**刻意变更**：不再抛） |
+| 池**同步 throw** | **逃逸出 `refreshAll`**（`.catch` 接不住同步 throw，已实测） | 吞成 `[]` ⇒ 兜底（**刻意变更**） |
+
+⇒ **刻意的变更只剩两条**（非数组、同步 throw），方向都是「归入空池兜底而不是抛」。
+理由：`refreshAllCredentials` 的语义是「单个 provider 失败不阻断其余」，
+而读池抖动/桩写错不该让 OfficeAce 整条从续期表里消失（那正是 IKLPTZ 的症状）。
+按本仓库惯例**必须登记**（`provider-abstraction-g3-exceptions.md`）。
+
+⚠️ **「只接受同步池」这条收紧已被撤销**：它把「调用方给了 Promise」从「能用」
+变成「抛错」，是**新引入的回归**（审计实测旧代码能跑、新代码抛）。生产池是同步的
+⇒ 那格**当前不可达**，但不可达不是等价 —— 已恢复兼容。
+
+守卫：
+- `officeace-refresh-all.spec.ts` 用例⑤（读池抛错时 `fallbackRefresh` **真被调用一次**；
+  改成静默 `return` 即变红）；
+- 用例⑤b（**Promise 池**必须与数组池等效：逐个续期、不抛）；
+- 用例⑤c（**非数组**归入兜底、不抛 `TypeError`）。
+
+**影响面（如实）**：只坏**批量/定时**续期；适配器的按需续期走
+`refreshAccountCredential`（401 兜底 / `credentialProvider`），不经过这两行 ⇒ 仍可用。
+
+### 连带发现 ①：修复后暴露了一处**被缺陷遮蔽**的测试失败
+
+`jet-hub-rpc-auth-wiring.spec.ts` 的「每个 provider 的续期只分派到自己实例」
+在缺陷在场时**是绿的** —— 因为 `apply()` 内部的
+`void refreshAllCredentials()`（fire-and-forget 首轮）跑到 officeace 就抛
+`TypeError`，**背景噪声根本不产生**。修好后首轮走通并调用
+`refreshAccountCredential`，噪声混进断言 ⇒ 误报「codearts 轮分派错位」
+（实际 `['officeaceAuth','codeartsAuth']` —— **codearts 是对的**，多的是噪声）。
+
+修法是**在开始测量前把背景链跑完并清空记录**（`setup()` 改 `async` +
+`settleBackground()`），**不是放宽断言**。已反向验证：把
+`auths.qodercn` 错接成 `qoder` ⇒ 立刻 2 条变红并点名。
+
+### 连带发现 ②：⚠️⚠️ 单测会**消费用户真实的一次性凭据**（安全）
+
+`officeace-auth.ts` 的 `storeDir()` 默认落 `~/.dsh-officeace`，那里的
+`session.json` 是**用户真实的华为云凭据**，而 `refresh_token` **一次性**。
+
+**触发路径**（实测踩到，非理论风险）：`apply()` 的 fire-and-forget 首轮续期在
+spec 的 `afterEach` 恢复 `USERPROFILE` **之后**才跑到「池为空 ⇒ 续期本机凭据」
+兜底分支 ⇒ 用**真实 home** 读凭据并真发 STS 请求；vitest 输出里随即出现真实上游报文
+`STS5.1806 has been used`（一次性 token 已被消费的专属错误码）。
+**用例自己改 `USERPROFILE` 抢不过这条后台链。**
+
+⇒ 修法与 `jet-hub-store.ts` 的 `DSH_JET_HUB_STATE_DIR` **同型**：
+`storeDir()` 支持 `DSH_OFFICEACE_HOME` 覆盖，`tests/setup-isolation.ts` 把它
+指向临时目录（**进程级**，对后台链同样生效）。另给
+`refreshAccountList` 加第三参 `fallbackRefresh`，让单测能替换掉那个碰盘的入口。
+
+⚠️ 反向验证过：把 setup 里的隔离关掉 ⇒ 守卫用例⑩立刻变红。
+⚠️ 全程用**哈希对拍**确认用户真实 `session.json` 未被改写。
+
+守卫：`tests/unit/officeace-refresh-all.spec.ts`（18 条；含防复发：结构委托 /
+**调用点普查** / AST 源码判据 / 数组无 `.catch` 的事实 / 隔离三条腿）。
+
+### ⚠️⚠️ 守卫网被**两轮独立审计**打穿（逐条已修 + 反向验证）
+
+**第一轮**（4 处，见下表前半）与**第二轮对抗性审计**（3 处，后半）。
+⚠️ 教训统一为一句：**「守卫写好了」≠「守卫有牙」** —— 第一轮有 4 条是
+「用例在、但判据测不到目标」（同义反复 / 空洞断言 / 只测一半）。
+
+| 缺口 | 变异（打穿方式） | 修法 |
+|---|---|---|
+| ⑧ 正则三漏 | 逐行正则只认「同行、无修饰」；`!` / `?.` / 跨行**全漏**。放宽成 `[!?]?` **也只修好两种** | 改 **AST** 按节点形状判定 + ⑧b **判据自检**（7 种绕过必须命中、4 种合法不得误报） |
+| ② 是弱判据 | 模块 `refreshAll` 改成「读了池但**一个账号都不续**」⇒ **全绿** | ② 改为经隔离凭据走**每账号一次 `updateAccount` 对账** |
+| ⑤ 不验证自身语义 | catch 分支改成静默 `return`（**不走兜底**）⇒ ⑤ 仍绿 | 补 `expect(fallback).toHaveBeenCalledTimes(1)` |
+| ⑩ 只守一半 | `storeDir()` 改成**不读** env ⇒ ⑩ 仍绿 | 拆 ⑩a（env）+ **⑩b（写进去读得回来）** |
+
+**第二轮（对抗性）**：
+
+| 缺口 | 打穿方式 | 修法 |
+|---|---|---|
+| ⚠️⚠️ ⑧ 对**间接写法**失明 | 四种写法真写进 `src/`、⑧ **全绿**：`(await …).catch()`／`const r=…; r.catch()`／`const s=…; s('x').catch()`／**`const list=q=>q.listAccountsByProvider('x'); list(p).catch()`**（最像重构的写法）。穷举间接写法需数据流分析 ⇒ **不可判定** | **换判据**：⑦b **调用点普查**（「再写一份遍历」必然新增一个调用点 ⇒ 可判定，与写法无关）。⑧ 降级为**辅助**并如实标注射程 |
+| ⚠️⚠️ **新引入的行为回归** | 第一版按「只接受同步」写 ⇒ Promise 池掉进 `for…of` 抛 `accounts is not iterable`，**连兜底都绕过**（旧代码 `await ….catch()` 是能处理 Promise 的）。且 doc 把「rejected Promise」那格写成「等价」—— **登记错了格子** | 恢复兼容：`await` 一次 + `Array.isArray` 归一；doc 改表（**刻意变更只剩**「非数组」与「同步 throw」两条）；新增 ⑤b/⑤c |
+| `.office-claw` 未隔离 | `readSessionCookie()` 直接 `os.homedir()`，**不受**该 env 覆盖。审计实测：用户真实 cookie 存在且**能 DPAPI 解密**（约 1.05s） | 抽 `officeAceClientHome()` 复用同一 env（三条腿同源）；新增 ⑩c |
+| ⑩a 判据过弱 | `/temp\|tmp/i` —— 审计预置**仓库内** `.audit-tmpdir`（名字含 tmp）⇒ 全绿 | 改为与 `os.tmpdir()` 做**路径前缀**比较 |
+| ⚠️ ⑩c 第一版是**空的** | 我只断言「隔离目录无 cookie ⇒ undefined」，但 spec 的 `beforeEach` 又把 `USERPROFILE` 指向了隔离目录（第二道防线）⇒ **env 覆盖完全失效也仍绿**（实测把 `officeAceClientHome()` 改成忽略 env，18 passed） | ⑩c 内**主动把 `USERPROFILE` 指回真实 home**（撤掉第二道防线），把 env 覆盖单独隔离出来测；改后同一变异**立刻变红** |
+
+⚠️ **`lib/` 是旧产物**：`pnpm build:all` 之前，从 `lib/` 加载的真实插件跑的是
+**修复前**代码（审计提示，非缺陷）。改完宿主侧必须重建并重启 DSH。
+
 ## 3. ⚠️ 接线陷阱（新 provider 通用，此处已复发）
 
 `src/jet-hub-rpc.ts` 的 `SELF_HEAL_REFRESHABLE_PROVIDERS` ——
