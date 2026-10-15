@@ -377,7 +377,7 @@ describe('请求指纹', () => {
     expect(seen['x-opencode-client']).toBe('cli')
   })
 
-  it('body 恒带 stream:true 与 shell/read V2 门禁工具', async () => {
+  it('body 恒带 stream:true 与 read 门禁工具（不注入 shell）', async () => {
     let body: Record<string, unknown> = {}
     vi.stubGlobal('fetch', async (_u: string, init: RequestInit) => {
       body = JSON.parse(String(init.body)) as Record<string, unknown>
@@ -387,8 +387,7 @@ describe('请求指纹', () => {
     await run(a)
     expect(body.stream).toBe(true)
     const names = (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name)
-    expect(names).toContain('shell')
-    expect(names).toContain('read')
+    expect(names).toEqual(['read'])
   })
 
   it('同一会话内 session id 稳定（跨请求不漂移）', async () => {
