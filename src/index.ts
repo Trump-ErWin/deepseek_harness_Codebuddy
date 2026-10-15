@@ -68,7 +68,7 @@ import type { LoomyCredential } from './loomy.js'
 import type { RaccoonCredential } from './raccoon.js'
 import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
-import { MINIMAX } from './minimax-product.js'
+import { MINIMAX, MINIMAX_INTL } from './minimax-product.js'
 // ⚠️ `PROVIDER_REGISTRY` 供 namespace 清单派生（`registerProviderSettings` 的实参）；
 //    `descriptorOf` 供**能力注册表**逐项取元数据（见下面的注册段）。
 //    brief 原稿称「Task 1 已加过 `descriptorOf`，合并进同一行」，实测**没有** ——
@@ -534,6 +534,17 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
       resolveCredential: async () => credential as MinimaxCredential,
       refresh: async () => {},
       product: MINIMAX,
+    }),
+  },
+  // MiniMax Code 国际版 —— 与中国版同因（它同样会写 `modelRateLimits`），
+  // 只是 product 换成 `MINIMAX_INTL`（探测请求必须打到 `agent.minimax.io`，
+  // 否则国际站账号的「重测」会用国内站主机发凭据、必然 401 ⇒ 标记永远清不掉）。
+  minimaxintl: {
+    createProbeAdapter: (ref, credential) => new MinimaxAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as MinimaxCredential,
+      refresh: async () => {},
+      product: MINIMAX_INTL,
     }),
   },
   // OpenCode Zen。
@@ -1726,6 +1737,61 @@ export function apply(ctx: Context): void {
     product: MINIMAX,
   })
 
+  // ===== MiniMax Code 国际版（minimaxintl）=====
+  //
+  // 与中国版是**同一套协议实现**的第二个实例（差异全在 `MINIMAX_INTL` 配置里：
+  // 主机 `account.minimax.io` / `agent.minimax.io`、目录 region `en`、
+  // 凭据 ref 前缀 `MINIMAXINTL_`）。刻意**不复制**任何 `src/minimax*.ts`
+  // 实现文件 —— 协议同源，复制会让同类缺陷（SSE 收尾丢帧、换号记账、
+  // 思考档位）修两遍。
+  //
+  // 服务名由 `${product.id}Auth` 派生，注册为 `ctx.minimaxintlAuth`
+  //（product id 全小写、不带连字符 —— 按变量名驼峰惯例拼会得到大小写不符的名字）。
+  //
+  // ⚠️ **两站账号不互通、API 主机也不同** ⇒ 它们是两个 provider 而不是
+  //    「一个 provider 加一个站点参数」（理由见 `src/minimax-product.ts` 文件头）。
+  // ⚠️ 三项**未真机验证**（无国际站账号）：推理路径 / 签到端点形状 / 兜底模型表。
+  const minimaxIntl = new MinimaxAuth(ctx, { product: MINIMAX_INTL })
+  const minimaxIntlAdapter = registerMinimaxLlm(ctx, {
+    credentialRef: credentialRef(MINIMAX_INTL.defaultCredentialRef),
+    // ⚠️ provider 实参必须是 MINIMAX_INTL：写死 MINIMAX 会让国际站永远查不到
+    // 自己的账号（本插件在 workbuddy 上踩过同类坑）。
+    resolveCredential: createCredentialResolver<MinimaxCredential>(
+      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(MINIMAX_INTL.id, id) } },
+      {
+        product: MINIMAX_INTL,
+        readCredential: async (refName) => {
+          const resolved = await ctx.credentials.resolve(credentialRef(refName))
+          if (!resolved) return undefined
+          try {
+            return JSON.parse(resolved.value) as unknown as MinimaxCredential
+          } catch {
+            return undefined
+          }
+        },
+        fallback: { kind: 'ref', refName: MINIMAX_INTL.defaultCredentialRef },
+        throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+      },
+    ),
+    refresh: async () => {
+      // 同中国版：刷新**解析凭据时所用的那一个**账号，不是默认单凭据 ref。
+      const available = await pool.getAvailableAccount(MINIMAX_INTL.id, '')
+      if (available) {
+        // ⚠️ **必须传 pool + entry.id**（两层结构）：否则续期成功后新 `expiresAt`
+        // 写不回账号池，UI 会一直显示「已过期」而实际能正常发消息。
+        await minimaxIntl.refreshAccountCredential(
+          available.entry.credentialRef, pool, available.entry.id,
+        )
+      } else {
+        await minimaxIntl.refresh()
+      }
+    },
+    fetchRemoteModels: () => minimaxIntl.fetchRemoteModelsOnly(pool),
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: MINIMAX_INTL,
+  })
+
   // ===== Gemini（Google Cloud Code Assist 免费线）=====
   //
   // ⚠️ **只做 OAuth**（用户拍板）：API key / AI Studio 两条线不做 —— 免费线
@@ -2829,6 +2895,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     loomy: pruned(LOOMY.id, loomyAdapter),
     raccoon: pruned(RACCOON.id, raccoonAdapter),
     minimax: pruned(MINIMAX.id, minimaxAdapter),
+    minimaxintl: pruned(MINIMAX_INTL.id, minimaxIntlAdapter),
     accio: pruned(ACCIO.id, accioAdapter),
     gemini: pruned(GEMINI.id, geminiAdapter),
     zcode: pruned(ZCODE.id, zcodeAdapter),
@@ -3067,6 +3134,10 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
       ['loomy', loomy],
       ['raccoon', raccoon],
       ['minimax', minimax],
+      // ⚠️ MiniMax Code 国际版：与 `minimax` **共用同一个 `MinimaxAuth` 类**，
+      //    故键与值都是它自己那个实例（`minimaxintl`）。写成 `minimax: minimaxIntl`
+      //    这类错位会让国际站账号的续期去刷国内站凭据（同族串接，本仓库复发过 6 次）。
+      ['minimaxintl', minimaxIntl],
       ['zcode', zcode],
       ['gemini', gemini],
       // OfficeAce（华为 MaaS 云端直连）：值是 **auth 服务形状的包装对象**
@@ -3172,7 +3243,12 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     codearts: service,
     buddy, workbuddy, lobsterai, qoder,
     qodercn: qoderCn,
-    trae, cline, loomy, raccoon, minimax, zcode, gemini,
+    trae, cline, loomy, raccoon, minimax,
+    // ⚠️ 键是 **provider id** `minimaxintl`，值是变量 `minimaxIntl`
+    //（两者大小写不同：id 全小写、变量名带驼峰）—— 写成简写 `minimaxintl,`
+    // 会去引用一个不存在的变量。与上面 `qodercn: qoderCn` 同因。
+    minimaxintl: minimaxIntl,
+    zcode, gemini,
     // OfficeAce（华为 ModelArts MaaS 云端直连）：值是 **auth 服务形状的包装对象**
     //（纯函数集合 + 统一 auth 契约），不是 Service 实例。
     officeace: officeaceAuthService as never,

@@ -130,7 +130,15 @@ describe('接线点完整性（源码断言）', () => {
     //    「fetchStatus 只登记在真有同构状态端点的渠道上」（含 minimax）+
     //    「credits.status 走注入的 credits 表」。
     //    本文件只保留**本端点独有的**那处真协议分支。
-    expect(rpcSource).toContain('} else if (provider === MINIMAX.id) {')
+    // ⚠️ 2026-10-15 改：加国际站后该分支收成「两个 id 合用一条」
+    //    （`provider === MINIMAX.id || provider === MINIMAX_INTL.id`）——
+    //    照 `qoderFamily` 的做法，**不复制**第二份分支体（复制会让
+    //    「登录成功后回填哪些字段」修一处漏一处）。故这里的判据跟着换成
+    //    「两个 id 都在这个条件里」：任何一个被删掉都红。
+    expect(rpcSource, 'minimax 的 account.create 分支不见了')
+      .toMatch(/\} else if \(provider === MINIMAX\.id \|\| provider === MINIMAX_INTL\.id\) \{/)
+    expect(rpcSource, '分支内必须按同族表取 product/auth（不得写死 MINIMAX）')
+      .toContain('requireMinimaxFamily(provider)')
     // ⚠️ 2026-10-08 改（Task 4）：原先断言 `jet-hub-rpc.ts` 的源码文本里含
     //    `claimMinimaxDailyCheckin(credential)`。Task 4 把领取调用搬进
     //    `src/provider-credits.ts` 的能力表 ⇒ 该文本**搬了家**，而它守的意图

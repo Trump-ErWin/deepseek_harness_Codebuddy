@@ -68,6 +68,8 @@
     "test:e2e:minimax-claim": "cross-env DSH_MINIMAX_E2E=1 DSH_MINIMAX_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-claim-probe.e2e.spec.ts",
     "test:e2e:minimax-chat": "cross-env DSH_MINIMAX_CHAT_E2E=1 DSH_MINIMAX_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-chat-probe.e2e.spec.ts",
     "test:e2e:minimax-image": "cross-env DSH_MINIMAX_IMAGE_E2E=1 DSH_MINIMAX_IMAGE_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-image-probe.e2e.spec.ts",
+    "test:e2e:minimaxintl": "cross-env DSH_MINIMAXINTL_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/minimaxintl-probe.e2e.spec.ts",
+    "test:e2e:minimaxintl-claim": "cross-env DSH_MINIMAXINTL_E2E=1 DSH_MINIMAXINTL_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimaxintl-claim-probe.e2e.spec.ts",
     "test:e2e:image-burst": "cross-env DSH_IMAGE_BURST_E2E=1 DSH_IMAGE_BURST_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/image-burst-cross-provider.e2e.spec.ts",
     "test:e2e:image-bisect": "cross-env DSH_IMAGE_BISECT_E2E=1 DSH_IMAGE_BISECT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/image-limit-bisect.e2e.spec.ts",
     "test:e2e:accio": "cross-env DSH_ACCIO_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/accio-probe.e2e.spec.ts",
