@@ -4573,3 +4573,467 @@ describe('cline.quota / cline.requestLog 端点', () => {
     })
   })
 })
+
+/**
+ * ★★ 聚合门控与手工排序端点（用户 2026-10-15）：`setAllowed` / `setOrder` / `setOrderMode`
+ * / `rejectNonExpiring`，以及 `aggregate.catalog` 的 `orderMode`/`order` 透传。
+ *
+ * ⚠️ 本组**必须有**：这五个端点此前**只有适配器层用例**（`aggregate-adapter.spec.ts`），
+ *    RPC 层一条都没有 ⇒ 参数校验、`clearChoiceCache` 调用、返回形状全都没被守过
+ *   （本仓库的成文教训：`sanitize*` 有 7 条单测而**零生产调用者**）。
+ */
+describe('★★ 聚合门控 / 手工排序端点', () => {
+  // ⚠️ `Handler` 是各 describe 块自己声明的局部类型（本文件的既有体例），故这里也带一份。
+  type Handler = (request: Request) => Promise<Response>
+
+  const ALL_AUTH = {
+    codearts: {} as never,
+    buddy: {} as never,
+    workbuddy: {} as never,
+    lobsterai: {} as never,
+    qoder: {} as never,
+    qodercn: {} as never,
+    trae: {} as never,
+    cline: {} as never,
+    loomy: {} as never,
+    raccoon: {} as never,
+    minimax: {} as never,
+    zcode: {} as never,
+    gemini: {} as never,
+    officeace: {} as never,
+  }
+
+  function setup(options: {
+    /** 聚合适配器替身（只实现被测到的方法）。 */
+    aggregate?: Record<string, unknown>
+  } = {}) {
+    let handler: Handler | undefined
+    let stored: Record<string, unknown> = { accounts: [] }
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? {
+            register: () => ({
+              get: () => stored,
+              replace: async (value: Record<string, unknown>) => { stored = value },
+            }),
+          }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: false, writable: true }),
+        resolve: async () => undefined,
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+
+    const ctx = {
+      get: (key: string) => {
+        if (key === 'connection') {
+          return {
+            fetch: {
+              register: (config: { path: string; fetch: Handler }) => {
+                if (config.path === JET_HUB_API_PATH) handler = config.fetch
+              },
+            },
+          }
+        }
+        return undefined
+      },
+      inject: (_deps: string[], callback: (c: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      emit: () => {},
+    }
+
+    registerJetHubRpc(
+      ctx as never,
+      pool,
+      ALL_AUTH,
+      (options.aggregate === undefined
+        ? {}
+        : { aggregate: options.aggregate }) as never,
+    )
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request',
+          rpcId: 'rpc-1',
+          method: 'jet-hub',
+          payload: { method, payload },
+        }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { message: string } } }
+      return body.result
+    }
+
+    return { call, pool, storedValue: () => stored }
+  }
+
+  it('aggregate.setAllowed：三字段必填，缺一即 bad-request', async () => {
+    const { call } = setup()
+    for (const bad of [
+      {},
+      { canonicalId: 'm', provider: 'raccoon' },
+      { canonicalId: '', provider: 'raccoon', realId: 'r' },
+      { canonicalId: 'm', provider: '', realId: 'r' },
+      { canonicalId: 'm', provider: 'raccoon', realId: '' },
+    ]) {
+      expect((await call('aggregate.setAllowed', bad)).ok, JSON.stringify(bad)).toBe(false)
+    }
+  })
+
+  it('★ aggregate.setAllowed 写入白名单并**同时**回两张表（面板一次校正）', async () => {
+    const { call, pool } = setup()
+    const result = await call('aggregate.setAllowed', {
+      canonicalId: 'glm-5-3', provider: 'raccoon', realId: 'sn-glm-5-3', allowed: true,
+    })
+    expect(result.ok).toBe(true)
+    const value = result.value as {
+      aggregateRejections: Record<string, unknown>
+      aggregateAllowed: Record<string, unknown>
+    }
+    expect(value.aggregateAllowed).toEqual({ 'glm-5-3': { raccoon: { 'sn-glm-5-3': true } } })
+    // ⚠️ 拒绝表**不动**（用户 2026-10-15 的修正：两表各有各的域）
+    expect(value.aggregateRejections).toEqual({})
+    expect(pool.listAggregateAllowed()['glm-5-3']?.raccoon?.['sn-glm-5-3']).toBe(true)
+  })
+
+  it('★ aggregate.setAllowed(false) 删键（不写 false）', async () => {
+    const { call, pool } = setup()
+    await call('aggregate.setAllowed', {
+      canonicalId: 'glm-5-3', provider: 'raccoon', realId: 'sn-glm-5-3', allowed: true,
+    })
+    const result = await call('aggregate.setAllowed', {
+      canonicalId: 'glm-5-3', provider: 'raccoon', realId: 'sn-glm-5-3', allowed: false,
+    })
+    expect(result.ok).toBe(true)
+    expect(pool.listAggregateAllowed()).toEqual({})
+  })
+
+  it('★ 写白名单后清 choiceCache（改动立刻生效，不依赖 60 秒 TTL）', async () => {
+    let cleared = 0
+    const { call } = setup({ aggregate: { clearChoiceCache: () => { cleared += 1 } } })
+    await call('aggregate.setAllowed', {
+      canonicalId: 'm', provider: 'raccoon', realId: 'r', allowed: true,
+    })
+    expect(cleared, '★ 漏了它 ⇒ 「手工打开」最长 60 秒后才生效').toBeGreaterThan(0)
+  })
+
+  it('★ aggregate.setRejected 也清 choiceCache（两个方向体例必须对齐）', async () => {
+    let cleared = 0
+    const { call } = setup({ aggregate: { clearChoiceCache: () => { cleared += 1 } } })
+    await call('aggregate.setRejected', {
+      canonicalId: 'm', provider: 'buddy', realId: 'r', rejected: true,
+    })
+    expect(cleared).toBeGreaterThan(0)
+  })
+
+  it('aggregate.setOrder：拒绝非数组 / 非字符串元素（不得静默清空顺序）', async () => {
+    const { call, pool } = setup()
+    for (const bad of [
+      { canonicalId: 'm' },
+      { canonicalId: 'm', order: 'a,b' },
+      { canonicalId: 'm', order: [1, 2] },
+      { canonicalId: '', order: [] },
+      { canonicalId: 'm', order: [null] },
+    ]) {
+      const result = await call('aggregate.setOrder', bad)
+      expect(result.ok, JSON.stringify(bad)).toBe(false)
+    }
+    // ⚠️ 关键：一连串 bad-request **不得**改到顺序表（否则「拖坏了」会静默丢顺序）。
+    expect(pool.listAggregateOrder()).toEqual({})
+  })
+
+  it('★ aggregate.setOrder 返回**服务端过滤去重后**的权威数组', async () => {
+    const { call, pool } = setup()
+    const result = await call('aggregate.setOrder', {
+      canonicalId: 'glm-5-3',
+      order: ['raccoon\u0000sn-glm-5-3', 'junk-no-separator', 'raccoon\u0000sn-glm-5-3', 'buddy\u0000glm-5.3'],
+    })
+    expect(result.ok).toBe(true)
+    expect(result.value).toEqual({
+      canonicalId: 'glm-5-3',
+      order: ['raccoon\u0000sn-glm-5-3', 'buddy\u0000glm-5.3'],
+    })
+    // 客户端以响应为准 ⇒ 落盘内容必须与响应逐字相同。
+    expect(pool.listAggregateOrder()['glm-5-3']).toEqual(result.value && (result.value as { order: string[] }).order)
+  })
+
+  it('aggregate.setOrderMode：只接受 expiry / manual，畸形值 bad-request', async () => {
+    const { call, pool } = setup()
+    for (const bad of [{}, { mode: 'MANUAL' }, { mode: 'expiry ' }, { mode: 1 }, { mode: null }]) {
+      expect((await call('aggregate.setOrderMode', bad)).ok, JSON.stringify(bad)).toBe(false)
+    }
+    expect(pool.listAggregateOrderMode(), '畸形值不得改到模式（防显示与行为分叉）').toBe('expiry')
+  })
+
+  it('★ aggregate.setOrderMode 写入并回权威值 + 清 choiceCache', async () => {
+    let cleared = 0
+    const { call, pool } = setup({ aggregate: { clearChoiceCache: () => { cleared += 1 } } })
+    const result = await call('aggregate.setOrderMode', { mode: 'manual' })
+    expect(result.ok).toBe(true)
+    expect(result.value).toEqual({ orderMode: 'manual' })
+    expect(pool.listAggregateOrderMode()).toBe('manual')
+    expect(cleared, '★ 顺序参与了候选排序 ⇒ 模式变了缓存必须失效').toBeGreaterThan(0)
+  })
+
+  it('★★ aggregate.rejectNonExpiring：只清**未接入**渠道的白名单（keep 集合必须来自权威常量）', async () => {
+    // ⚠️⚠️ 判据必须**行为化**：在**已接入**渠道（buddy）与**未接入**渠道（raccoon）上
+    //    各播一条白名单，然后断言「只掉了未接入的那条」。
+    //    若实现把 `WIRED_EXPIRY_PROVIDERS` 写死成一份副本（或写错方向），
+    //    已接入渠道的手工打开会被**静默清掉** —— 而那是用户有意义的设置。
+    const { call, pool } = setup()
+    await call('aggregate.setAllowed', {
+      canonicalId: 'a', provider: 'buddy', realId: 'keep-me', allowed: true,
+    })
+    await call('aggregate.setAllowed', {
+      canonicalId: 'a', provider: 'raccoon', realId: 'drop-me-1', allowed: true,
+    })
+    await call('aggregate.setAllowed', {
+      canonicalId: 'b', provider: 'raccoon', realId: 'drop-me-2', allowed: true,
+    })
+
+    const result = await call('aggregate.rejectNonExpiring', {})
+    expect(result.ok).toBe(true)
+    const value = result.value as { cleared: number; aggregateAllowed: Record<string, unknown> }
+    expect(value.cleared, '★ cleared = 被清掉的**候选条数**（面板文案要用它）').toBe(2)
+    expect(value.aggregateAllowed, '★ 已接入渠道(buddy)的白名单必须保留').toEqual({
+      a: { buddy: { 'keep-me': true } },
+    })
+    expect(pool.listAggregateAllowed()).toEqual({ a: { buddy: { 'keep-me': true } } })
+  })
+
+  it('★ 幂等：再点一次 cleared === 0 且仍回 ok:true（不是错误）', async () => {
+    const { call } = setup()
+    await call('aggregate.setAllowed', {
+      canonicalId: 'a', provider: 'raccoon', realId: 'r', allowed: true,
+    })
+    expect((await call('aggregate.rejectNonExpiring', {})).value).toMatchObject({ cleared: 1 })
+    const again = await call('aggregate.rejectNonExpiring', {})
+    expect(again.ok, '★ 空点击不是错误').toBe(true)
+    expect((again.value as { cleared: number }).cleared).toBe(0)
+  })
+
+  it('★ aggregate.catalog 原样透传 models / orderMode（不在 RPC 层重算）', async () => {
+    const { call } = setup({
+      aggregate: {
+        describeCatalog: async () => ({
+          models: [{
+            canonicalId: 'glm-5-3',
+            name: 'GLM-5.3',
+            candidates: [{
+              provider: 'raccoon', realId: 'sn-glm-5-3', realName: 'GLM-5-3 · x0.75',
+              price: 0.75, viaPatch: false, rejected: true,
+              state: 'default-rejected', expiryWired: false,
+            }],
+            order: ['raccoon\u0000sn-glm-5-3'],
+          }],
+          orderMode: 'manual',
+        }),
+      },
+    })
+    const result = await call('aggregate.catalog', {})
+    expect(result.ok).toBe(true)
+    const value = result.value as { models: unknown[]; orderMode: string }
+    expect(value.orderMode, '★ 排序模式由宿主下发，客户端不得推导').toBe('manual')
+    expect(value.models).toHaveLength(1)
+    expect((value.models[0] as { candidates: Array<{ state: string }> }).candidates[0]!.state)
+      .toBe('default-rejected')
+  })
+
+  it('★ aggregate.catalog 透传 force（面板「刷新」必须绕目录 TTL）', async () => {
+    const seen: boolean[] = []
+    const { call } = setup({
+      aggregate: {
+        describeCatalog: async (force?: boolean) => { seen.push(force === true); return { models: [], orderMode: 'expiry' } },
+      },
+    })
+    await call('aggregate.catalog', {})
+    await call('aggregate.catalog', { force: true })
+    expect(seen).toEqual([false, true])
+  })
+
+  it('★ aggregate.expiryOrder 透传 force（每 5 分钟自动重探 / 手动点击要新鲜值）', async () => {
+    const seen: Array<boolean | undefined> = []
+    const { call } = setup({
+      aggregate: {
+        describeExpiryOrder: async (_signal?: AbortSignal, force?: boolean) => { seen.push(force); return {} },
+      },
+    })
+    await call('aggregate.expiryOrder', {})
+    await call('aggregate.expiryOrder', { force: true })
+    expect(seen).toEqual([false, true])
+  })
+
+  it('未注册聚合适配器时：写端点仍可用（走池），读端点安静降级', async () => {
+    // ⚠️ `aggregate.catalog` / `expiryOrder` 对未注册**回空值**而不是报错（既有取向：
+    //    面板是可选装饰，为它报错会在设置页显示无意义的错误）。
+    const { call } = setup()
+    expect((await call('aggregate.catalog', {})).ok, '未注册 ⇒ 明确报 unavailable').toBe(false)
+    expect((await call('aggregate.expiryOrder', {})).ok).toBe(true)
+    expect((await call('aggregate.expiryOrder', {})).value).toEqual({ order: {} })
+    // 写端点不依赖适配器实例（它们只动账号池的两张表）。
+    expect((await call('aggregate.setOrderMode', { mode: 'manual' })).ok).toBe(true)
+  })
+})
+
+/**
+ * ★★ `credits.balances` 的 `accountIds` 裁剪（2026-10-15，规格 §7-8）。
+ *
+ * ⚠️ 两条**必须同时成立**的判据（缺一条就是真缺陷）：
+ *  ① 传了 `accountIds` ⇒ **只查**那些账号（收益：徽标不再查停用号）；
+ *  ② 但**自愈仍对全部账号跑** —— AGENTS.md 的成文铁律「续期不得按 `enabled` 过滤」：
+ *     停用只影响自动选号，与「凭据是否需要保持新鲜」无关。若把 `healExpiredAccounts`
+ *     也裁掉，停用账号的 refresh_token 会在停用期间一路放到失效，
+ *     用户重新启用后拿到死凭据、只能重新登录（真实事故形态）。
+ */
+describe('★★ credits.balances 的 accountIds 裁剪', () => {
+  type Handler = (request: Request) => Promise<Response>
+
+  function setup() {
+    let handler: Handler | undefined
+    let stored: Record<string, unknown> = { accounts: [] }
+    const healed: string[][] = []
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? {
+            register: () => ({
+              get: () => stored,
+              replace: async (value: Record<string, unknown>) => { stored = value },
+            }),
+          }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: false, writable: true }),
+        resolve: async () => undefined,
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+
+    // 三条账号（两条启用、一条停用）
+    stored = {
+      accounts: [
+        { id: 'a1', provider: 'buddy', nickname: 'a1', enabled: true, credentialRef: 'BUDDY_ACCOUNT_A1', createdAt: 1, refreshable: true },
+        { id: 'a2', provider: 'buddy', nickname: 'a2', enabled: false, credentialRef: 'BUDDY_ACCOUNT_A2', createdAt: 2, refreshable: true },
+        { id: 'a3', provider: 'buddy', nickname: 'a3', enabled: true, credentialRef: 'BUDDY_ACCOUNT_A3', createdAt: 3, refreshable: true },
+      ],
+    }
+
+    const ctx = {
+      get: (key: string) => {
+        if (key === 'connection') {
+          return {
+            fetch: {
+              register: (config: { path: string; fetch: Handler }) => {
+                if (config.path === JET_HUB_API_PATH) handler = config.fetch
+              },
+            },
+          }
+        }
+        return undefined
+      },
+      inject: (_deps: string[], callback: (c: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      emit: () => {},
+      credentials: {
+        resolve: async () => undefined,
+        describe: async () => ({ configured: false, writable: true }),
+      },
+    }
+
+    registerJetHubRpc(ctx as never, pool, {} as never, {} as never)
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+          payload: { method, payload },
+        }),
+      }))
+      return (await response.json() as { result: { ok: boolean; value?: unknown } }).result
+    }
+    return { call, healed }
+  }
+
+  const accountIdsOf = (result: { value?: unknown }) =>
+    ((result.value as { accounts: Array<{ accountId: string }> }).accounts).map((row) => row.accountId).sort()
+
+  it('★ 省略 accountIds ⇒ 查全部（积分面板的现状语义，逐字节不变）', async () => {
+    const { call } = setup()
+    const result = await call('credits.balances', { provider: 'buddy' })
+    expect(result.ok).toBe(true)
+    expect(accountIdsOf(result), '★ 省略时含停用账号').toEqual(['a1', 'a2', 'a3'])
+  })
+
+  it('★ 传 accountIds ⇒ 只查那些账号（徽标的收益）', async () => {
+    const { call } = setup()
+    const result = await call('credits.balances', { provider: 'buddy', accountIds: ['a1', 'a3'] })
+    expect(result.ok).toBe(true)
+    expect(accountIdsOf(result)).toEqual(['a1', 'a3'])
+  })
+
+  it('★★ 传**空数组** ⇒ 一条都不查（不得被当成「省略 = 查全部」）', async () => {
+    // ⚠️ 这是最容易被写成反义的一格：`accountIds: []` 若被 falsy 判断吞掉，
+    //    「全部账号都停用」反而会去查全部账号 —— 与收益完全相反。
+    const { call } = setup()
+    const result = await call('credits.balances', { provider: 'buddy', accountIds: [] })
+    expect(result.ok).toBe(true)
+    expect(accountIdsOf(result), '★ 空数组 = 查空集').toEqual([])
+  })
+
+  it('★ 畸形 accountIds（非数组 / 含非字符串）按「省略」处理，不抛错', async () => {
+    const { call } = setup()
+    expect(accountIdsOf(await call('credits.balances', { provider: 'buddy', accountIds: 'a1' })))
+      .toEqual(['a1', 'a2', 'a3'])
+    expect(accountIdsOf(await call('credits.balances', { provider: 'buddy', accountIds: [1, 'a1'] })))
+      .toEqual(['a1'])
+  })
+
+  it('★★ 自愈**不受** accountIds 影响（铁律：续期不得按 enabled 过滤）', async () => {
+    // ⚠️⚠️ 判据打在**行为**上：`credits.balances` 会对过期账号先续期。
+    //    传了只含启用账号的 accountIds 时，**停用账号的凭据仍必须被续期** ——
+    //    否则它在停用期间一路放到失效，用户重新启用后只能重新登录。
+    //
+    // ⚠️ 本用例用**源码级判据**（下方 `it`）兜底：自愈是否真的覆盖停用账号
+    //    取决于 `healExpiredAccounts` 内部，而它在单测里不发网络请求（无凭据）。
+    //    ⇒ 这里先断言端点在**裁剪后仍然调用了自愈**（不是「裁剪后再自愈」）。
+    const { call } = setup()
+    const result = await call('credits.balances', { provider: 'buddy', accountIds: ['a1'] })
+    expect(result.ok).toBe(true)
+    expect(accountIdsOf(result), '余额查询确实被裁剪了').toEqual(['a1'])
+  })
+
+  it('★★ 源码级：自愈必须传 `allAccounts`，余额查询才传裁剪后的 `accounts`', async () => {
+    // ⚠️ 上面那条行为用例**分不出**「自愈收到全部账号」与「自愈收到裁剪后的账号」
+    //    （单测无凭据 ⇒ 自愈内部对两者都不发请求）。⇒ 按本仓库惯例补一条
+    //    **源码级判据**，并锚定具体片段（不是泛泛断言「文件里出现过 allAccounts」）。
+    const raw = await import('node:fs/promises').then((fs) => fs.readFile(
+      new URL('../../src/jet-hub-rpc.ts', import.meta.url), 'utf8',
+    ))
+    const code = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    // ★ 关键：余额端点那一处自愈必须是 `allAccounts`（不是被裁剪的 `accounts`）。
+    expect(code, '★ 自愈必须用未裁剪的 allAccounts（停用账号也要续期）')
+      .toMatch(/await healExpiredAccounts\(allAccounts\)/)
+    // ⚠️ **不得**断言「文件里再没有 `healExpiredAccounts(accounts)`」——那会误红：
+    //    `credits.claimAll` 端点（另一个 case）本来就有这一行，且它是**正确的**
+    //    （领取路径不裁剪账号）。⇒ 判据只锚定余额端点的**邻域**。
+    const balancesStart = code.indexOf("case 'credits.balances':")
+    expect(balancesStart, '必须能定位余额端点').toBeGreaterThan(0)
+    // 到下一个 case 为止（余额端点的边界）。
+    const nextCase = code.indexOf("case '", balancesStart + 1)
+    const balancesBlock = code.slice(balancesStart, nextCase > 0 ? nextCase : undefined)
+    expect(balancesBlock, '★ 余额端点的自愈不得传裁剪后的 accounts')
+      .not.toMatch(/healExpiredAccounts\(accounts\)/)
+    // ★ 且裁剪真的发生了（否则上面两条可以在「没有裁剪功能」时空过）。
+    expect(code).toMatch(/requestedIds\.has\(entry\.id\)/)
+  })
+})
