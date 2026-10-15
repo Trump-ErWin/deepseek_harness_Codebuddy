@@ -57,6 +57,7 @@ import type { AccioCredential } from './accio.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
 import { fetchSubscriptionSummary } from './officeace-auth.js'
+import { officeaceBreakerOpen } from './officeace-credential-health.js'
 import { runtimeOf, type ProviderExpiryContext } from './provider-runtime.js'
 
 /**
@@ -866,6 +867,15 @@ export async function officeaceExpiry(
   credential: OfficeAceCredential,
   ref?: string,
 ): Promise<number> {
+  // ⚠️ **熔断优先于一切**（Gitee issue IKLTHB 第 ③ 条）：Basic 凭据被华为 MaaS
+  //    连续拒绝时，这里**必须**判 `UNUSABLE`，否则会出现最难看的一种组合 ——
+  //    余额读得到（V11 签名是**另一套鉴权**，它不受影响）⇒ 折算成一个正常值
+  //    ⇒ officeace **留在候选表里甚至排第一** ⇒ 每轮都先撞一次 401 再改道。
+  //
+  // ⚠️ 判据只在这里读，**不写**：熔断的记账点在适配器（只有它看得见 401 报文），
+  //    折算层只消费。这样「什么算凭据拒绝」只有一份实现（`isBasicCredentialRejection`），
+  //    也避免折算探测自己把渠道熔断（余额读失败与推理被拒是两件事）。
+  if (officeaceBreakerOpen(credential)) return UNUSABLE
   let summary
   try {
     summary = await fetchSubscriptionSummary(48, ref, credential)

@@ -201,6 +201,245 @@ spec 的 `afterEach` 恢复 `USERPROFILE` **之后**才跑到「池为空 ⇒ �
 ⚠️ **`lib/` 是旧产物**：`pnpm build:all` 之前，从 `lib/` 加载的真实插件跑的是
 **修复前**代码（审计提示，非缺陷）。改完宿主侧必须重建并重启 DSH。
 
+## 2.7 ⚠️⚠️ Issue IKLTHB（2026-10-15）：哑锁 / 401 诊断错与无效重登 / 401 不算渠道不可用
+
+报障人 ChaunceyG，三个缺陷**一条链**：401 连失败 264+ 次，每轮都白烧一次尝试，
+同时「锁定永久积分」那个开关一直是**哑锁**。
+
+### ① 「锁定永久积分」曾是**哑锁**（登记了字段，没有执行代码）
+
+`provider-registry.ts` 里 officeace 登记了 `permanentLock: true`，面板照它渲染
+开关并**逐字承诺**「这类积分用尽后将没有可用账号」，而全仓读
+`permanentLocked()` 的**只有** `credential-resolver.ts` 的 buddy / loomy 两个分支 ——
+officeace 走的是**适配器自己的** `credentialProvider` ⇒ 开关写进
+`permanent-locks.json` 后行为与关闭**完全一致**（用户照旧烧永久套餐包），
+且**零用例变红**。
+
+修法（用户从 issue 给的两条路里选了第 2 条）：新增 `src/officeace-lock.ts`，
+`index.ts` 按锁定态分道：
+
+| 状态 | 行为 |
+|---|---|
+| 未锁定 | `resolveUnlocked()` **逐字保留**原路径（连 `summaryOf` 都不调）|
+| 锁定 | 逐账号读订阅摘要 ⇒ 只挑**有「N 天内到期」桶**的账号；都不满足 ⇒ **抛错，绝不回落池** |
+
+⚠️ **判据与 buddy 系同口径**：窗口取 `buddyExpiringWindowMs()`
+（`DSH_BUDDY_EXPIRING_WINDOW_DAYS`，默认 15 天），与面板 RPC
+（`credits.permanentLock` 回传的 `windowDays`）**同一个函数**——写死天数会出现
+「提示说 15 天、实际按 31 天筛号」。
+⚠️ **缺失到期时间 ⇒ 算永久**（保守方向：锁定时少用一个号，而不是把长期积分
+误当临期烧掉）。
+⚠️ **本机不能改服务端扣减顺序**（云侧定的），锁定能做的只有「拒绝只有永久桶的账号」——
+文案必须说「扣减顺序由服务端决定」，不得暗示我们能控序。
+⚠️ **刻意没给 `officeaceExpiry` 加锁定语义**：buddy 的 `sharedPackageExpiry`
+同样把「只剩永久桶」的账号保留在候选表里（算 `NEVER`），由凭据路径拒绝 ——
+与验收参照物保持一致。
+
+守卫（新增；⚠️ **刻意不写条数** —— 条数是必然腐坏的快照，以 `pnpm test` 输出为准）：
+- `tests/unit/officeace-lock.spec.ts`：分桶边界（恰好 15 天 ⇒ 永久、
+  少 1ms ⇒ 临期）、缺到期时间 ⇒ 永久、`expired`/`remaining<=0` 跳过、
+  未锁定 ⇒ **零次** `summaryOf`、锁定 + 只剩永久 ⇒ 拒绝且 `resolveUnlocked`
+  **一次都没被调**、多账号换号、读失败 ⇒「无法确认」而不是「额度已用尽」、
+  临期判定**刻意不缓存**（永久/未知缓存 60s）、池为空的兼容路径、文案逐字
+  （含「解锁」、不含「重新登录」、**无 `code`**）、⑨⑩ **窗口同源**
+  （env 非默认值 ⇒ 筛号与文案同时跟随；注入值 ⇒ 文案用注入值）。
+- `tests/unit/permanent-lock-execution.spec.ts`：**执行路径普查** ——
+  凡 `permanentLock: true` 的渠道都必须在这里登记「实现模块 + 守卫用例 + 判别符号」，
+  多一家少一家都红（与 `expiry-runtime-parity.spec.ts` 的 `EXPECTED_WIRED` 同款）；
+  并用**真实 `apply()`** 驱动 officeace 那条闭包，证明锁定真的会拒、
+  解锁真的可用、锁 buddy 不影响 officeace、**锁定时 `listModels` 仍不 reject**。
+
+### ⚠️⚠️ 连带回归：**锁定只该约束「推理取号」，不该把只读目录也一起关掉**
+
+第一版修法把「会抛错的 `credentialProvider`」直接留在 `listModels` 里 ⇒
+**锁定后 `listModels` 抛错**。而 `listModels` 的调用方**全都不接这个错**
+（`dsh-llm/lib/index.js` 的 `llm.listModels()` 就是一句 `await`），于是一串
+与「锁定」毫不相干的症状：
+
+| 调用方 | 症状 |
+|---|---|
+| `jet-hub-rpc.ts` 的 `model.list` | 面板报「读取模型列表失败：…锁定…」|
+| `jet-hub-rpc.ts` 的 `readableCatalogIds` | **关不掉该供应商**（判据读 `remoteError`）|
+| `aggregate-adapter.refreshCatalog` | 记一条 warn 后**静默少一个候选** |
+| DSH 模型选择器 | 分组消失（与「目录门控」的空分组**同形**）|
+
+⚠️ 判据：**`/v2/models` 与 `/v1/model-token-rates` 都是只读、不扣积分**的，
+没有理由因为锁定而一起关掉 —— buddy 系也正是这样（锁定后模型照常列在目录里，
+发消息才报「没有可用账号」）。故适配器新增 `probeCredential`（缺省回落
+`credentialProvider`，既往嵌入方与单测行为不变），`index.ts` 把它与
+`resolveUnlocked` **共用同一份** `resolveOfficeAceCredential`；
+`tests/unit/permanent-lock-execution.spec.ts` 的 ⑦ 钉这条（锁定 + 只剩永久桶 ⇒
+目录探测照常给出凭据、`listModels()` 不 reject，**同刻**推理侧仍必须抛错）。
+
+### ② 401 诊断错 + **无效重登**（引导用户做一件结构上不可能有用的事）
+
+报文恒为 `HTTP 401 {"error_msg":"AppKey or AppSecret is invalid","error_code":"APIG.1009"}`，
+而旧文案写的是「Basic 凭据失效：OfficeAce 会话已过期，**请重新登录** OfficeAce 客户端」。
+**有反证**：用户照做后 `credentialRef` 与 STS 三元组**都换了**，
+而 `modelAppKey`/`modelAppSecret` **逐字节不变**（`ffff8ba7…c476` / `bd4da972…d76b`，
+`accountId` 也没变）⇒ 重登在结构上改不了这个结果，却被指引做了一遍又一遍。
+
+两个实现错误：
+
+1. **`renewed !== credential` 恒为真** —— `resolveCredential()` 每次调用都
+   重新 `JSON.parse` ⇒ 对象身份必然不同 ⇒ 「续期+重发」是**无条件**执行的
+   （真正有效的判据是**逐字段比对 Basic 三元组**）。
+2. **`shouldRefreshNow` 的 1 小时 lead-time** ⇒ 有时根本没真发续期。
+
+修法：新增 `basicAuthFingerprint(credential)`（`modelAppKey\0modelAppSecret\0maasBaseUrlOf(credential)`，
+⚠️ **与熔断用的指纹不是同一条判据**，刻意分成两个函数），并把「本次续期结果」
+从布尔改为**四态** `RenewalOutcome = 'not-attempted' | 'unchanged' | 'changed' | 'unreadable'`：
+
+| 态 | 何时 | 文案指向 |
+|---|---|---|
+| `unchanged` | 真发过续期，三元组一个字节都没变 | **「重新登录 OfficeAce 改不了这个结果」**，去华为云控制台核对 MaaS 应用凭据/订阅 |
+| `changed` | 刚换过凭据仍被拒 | 新凭据也被拒 ⇒ 权限/订阅面 |
+| `unreadable` | 续期后读不到新凭据 | 先查凭据库/登录态，**别去查一个不存在的问题** |
+| `not-attempted` | 没走 401 重试路径 | 可先点一次「刷新」看凭据会不会变 |
+
+⚠️ **判据键在报文、不在状态码**：华为文档把 `APIG.1009` 定义为 **HTTP 400**，
+而现场收到的是 **401** ⇒ `isBasicCredentialRejection(status, body)` 必须同时看
+body（`/APIG\.1009/i` 或 `/AppKey or AppSecret/i`），只认状态码会漏。
+非该形状的 401 如实说「**不是已知的「AppKey/AppSecret 无效」形状**」并提示核对
+`maasBaseUrl` 与出口 —— 不能硬套凭据失效。
+⚠️ 抛的是**裸 `Error`（无 `code`）**：`AUTH` / `QUOTA` / `ACCOUNT_QUOTA` 会被
+DSH 客户端**整段替换 message**，而这里文案本身就是出路（同 `IKLBSH` 的形态）。
+
+### ③ 401 不算「渠道不可用」⇒ 每轮白烧一次尝试（静默降级 `max→high`）
+
+新增 `src/officeace-credential-health.ts`：**渠道级熔断**。
+
+- **键 = Basic 密钥对的 sha256 前 16 位**（`officeaceCredentialFingerprint`），
+  **不是 `credentialRef`** —— 重登会换 ref/账号而 key 一模一样，按 ref 记账
+  等于每次重登都重置熔断器（也就等于没有）。顺带中和了
+  `account.create` 造出的幽灵池条目（恒新 id + ref）。
+  ⚠️ 只存哈希，**不存明文密钥**。
+- 阈值 2 次连续拒绝 ⇒ 熔断；`DSH_OFFICEACE_BREAKER_MINUTES`（默认 10，**0 = 关闭**，
+  判据里**不得**用 `parseInt(x) || default` 那种写法）；TTL 到期自动放行
+  （**半开**：计数不重置 ⇒ 再被拒立刻重新熔断）；**成功一次即清除**。
+- 熔断期内在 `stream()` 里**直接抛错、零请求**；文案含「已临时跳过本渠道」
+  「连续拒绝 2 次」「约 10 分钟后自动重试」「这与额度无关」，并明确
+  **劝阻去解锁**（解锁会不可撤回地烧掉永久积分）。
+- ⚠️ **半开的严格性如实登记**：判据只有 `until <= now`，**没有 in-flight 闸门**
+  ⇒ 到期那一瞬间并发到达的 N 个请求会各自放行一次（随后第一次失败立即重熔）。
+  代价是「每 10 分钟最多多打几次注定 401 的请求」，故不加单飞机制 ——
+  **不要**把它读成「严格只探测一次」。
+- ⚠️ 熔断表**只在成功时删记录**：TTL 到期不删（半开要留计数）、
+  `BREAKER_MINUTES=0`（关闭）时计数仍会累积但恒不拦请求。
+  上界 = 进程内见过的**不同 Basic 密钥对**数（有界且极小，故敢用纯内存 Map）。
+- `aggregate-expiry.ts` 的 `officeaceExpiry` 开头短路成 `UNUSABLE`：熔断的渠道
+  **不该再出现在聚合候选表**里。⚠️ 只读记账（余额/倍率）**不清理**熔断状态、
+  也不受它影响（V11 签名是**另一套认证面**）⇒ **读到余额不得覆盖熔断**。
+  ⚠️ 折算结论另有一层 60 秒缓存（`EXPIRY_CACHE_TTL_MS`）⇒ 熔断生效/解除都可能
+  滞后最多 60 秒，两个方向都有界。
+
+### ⑦ 第一轮 subagent 审计的结论与落地（2026-10-15）
+
+审计范围 = 本 issue 的全部改动。**结论：无阻断级问题**（专门找过「锁定后仍可能烧
+永久积分」与「401 白烧请求」两类，都没有路径）。它同时指出**两处判据无牙**、
+两处注释与实现不符 —— 均已修，且**都补了会红的判据**：
+
+| 发现 | 为什么算无牙 | 落地 |
+|---|---|---|
+| **窗口天数同源**这条不变式 | 所有期望值都是 `buddyExpiringWindowDays()` **现算**的 ⇒ 把窗口**写死 15 天**（写死在筛号里、或写死在文案里）默认 env 下全部用例仍绿 | `officeaceLock.spec` ⑨：把 env 设成 **3 天**、桶 5 天后到期 ⇒ 必须**拒绝**且文案必须说「**3** 天」（不注入 `windowMs`，走生产路径）；`permanent-lock-execution.spec` ⑥ 补「env=31 ⇒ 面板文案跟着变」 |
+| 普查登记表的 ② | 只做 `includes(provider)`，而**普查文件自己**含全部六家渠道名 ⇒ 把任意一条登记指向本文件也绿，注释却自称「真的会驱动那条路径」 | 登记表新增 `drives`（**判别符号**：`pickBuddyAccount` / `loomyBalanceTier` / `createOfficeAceCredentialProvider`），②断言「模块真的导出它 + 用例真的引用它 + 不许指向普查文件自己」；注释同时写明**它仍不是「路径被执行过」的证明**（那由 B 段真实 `apply()` 承担） |
+| 熔断「半开」= 严格一次探测 | 注释写「允许**一次**尝试」，而实现只有 TTL 判据、无并发闸门 | 改注释（见上方 ③ 的第一条），**不**加单飞机制 |
+| 文案窗口 ≠ 筛号窗口 | 文案自己调 `buddyExpiringWindowMs()`，筛号用可注入的 `deps.windowMs` ⇒ 注入态下「按 1 天筛、报文说 15 天」（一条判据两份取值） | `officeaceLockedError(reason, windowMs)` 改为**入参**，装配处把**同一个** `windowMs()` 传进去；⑩ 钉住「注入 2 天 ⇒ 报文说 2 天」「非法值 ⇒ 回落 env」 |
+| 文案写死「每日签到赠送 1000 分」 | 云侧常量写进本地文案（accio 已登记过同类教训） | 改成「每日签到赠送的额度当日作废」，不写数字 |
+
+⚠️ 同一轮里**我自己**（不是审计）另发现并修掉两处，都补了判据：
+① 锁定后 `listModels` 抛错的**连带回归**（见上一节）；
+② 续期真的换掉了 Basic 三元组时，熔断**记在旧凭据上** ⇒ 熔断器追不上实际在用的
+那份、每轮仍白撞一次（正是本 issue 第 ③ 条）⇒ 改记在**产生最终拒绝的那份**上
+（`officeace-401-diagnosis.spec` 的 ⑥ 两侧同时断言：新凭据记了账、旧凭据**一个字节
+也不该有**）。
+⚠️ 另：本轮审计**开工期间工作区被我自己并发修改**（还一度有一处模板字符串语法错误
+持续了 ~43 秒）⇒ 审计报告里为此单列了时点哈希。**教训**：声称「只读审计」的
+subagent 在跑时，主会话就该**停手**，否则它的证据会落在两个快照上（本仓库
+`AGENTS.md` 早写了同一条纪律，这次违反的是「唯一的写者」这半边）。
+
+### ⑧ 第二轮**对抗性**审计的结论与落地（2026-10-15）
+
+第二轮是**对抗性**审计（subagent，只读）：**31 条变异**逐条注入 + 跑对应用例 +
+**原字节回写** + SHA256 逐文件比对。**结论：无阻断缺陷**（25 条变异变红 ⇒ 守卫有牙；
+专门找过「锁定后仍可能烧永久积分」与「401 白烧请求」两类，都没有路径）。它查出
+**四处无牙守卫**与**两处判据强度问题**，我另在同轮查出**一条真缺口**（失效方向恰好
+就是 issue 第 ① / ③ 条）。**全部已修 + 已补会红的判据**，并且我**再自己变异验证过
+一遍**：8 条变异（M1–M8）**全部 RED、全部 RESTORE-OK**（源文件 SHA256 逐字节回原）。
+
+| 审计发现 | 为什么算无牙（实测证据） | 落地 |
+|---|---|---|
+| ⚠️ **`remaining` 守卫整条无牙**（真缺陷） | ④ 里唯一的 `<= 0` 样本是 `remaining: 0`，而 **0 加进任何桶等于没加** ⇒ 删掉那行守卫（或只删半条腿）**逐字节同效、仍全绿**（变异 d / d1 / d2 三向 GREEN）。失效方向 = `NaN` 让临期桶变 `NaN` ⇒ 判定翻「永久」⇒ **锁定态放行、烧永久积分** | `officeace-lock.spec` 新增 **④b**：喂 `remaining: -5` 与 `Number.NaN`，断言两桶都不计入（M3/M4 证明删任一半条腿都会红：`-5` 抓 `<= 0`、`NaN` 抓 `isFinite`）。⚠️ 如实标注：**未取证**华为云会下发这两种形状，钉的是「该判据不可能变红」这件事 |
+| 两处**死代码默认参数** | `officeaceLockedError` 与 `splitOfficeAceCreditsByExpiry` 的 `windowMs =` 改成常数 15 天后 **22 条全绿** ⇒ 生产装配恒显式传参、默认值永不求值，却给「一条判据两份取值」留了后门 | 两个 `windowMs` 改成**必填**（删默认值）⇒「忘了传窗口」变成**编译错误**。`officeaceLockedError` 内部的 NaN/≤0 回落腿**保留**（那是防御，不是兜底），由 ⑩ **显式传 `Number.NaN`** 钉住 |
+| `noteOfficeaceRejection` 的 `minutes > 0` 闸门无牙 | ⑥ 在 `env=0` 下只喂 **1 次**拒绝（`consecutive=1` 恒不达阈值 2），第 2 次**没带 env** ⇒ 恰好绕开。风险低（`until = now` 随后立刻判关）但返回值 `open: true` **是错的** | ⑥ 的两次拒绝都带 `env`，并断言第二次为 `{ open: false, consecutive: 2 }`（M5 变红） |
+| ① 的「**双向**一致」是错觉 | `expect(registered).toEqual(declared)` 紧跟 `expect(declared).toEqual(registered)`；`toEqual` 对数组**对称** ⇒ 第二条在第一条通过时**不可能单独失败**（三个方向的变异只让第一条红） | 改成两个**差集**断言：各自只负责一个方向，且**差集内容会进失败信息**（谁多了谁少了一眼可见） |
+| 两条 `it` **标题与函数体逐字相同** | 同一判据写了两遍（变异 l 让两条同时红）⇒「看起来覆盖了两件事」是假的 | 删掉重复那条，腾出的位置换成**真新增覆盖** ⑥b（见下） |
+| ⑦b 判别力为**零** | 整条只有 `resolves.toBeUndefined()`；实测把兼容路径退化成裸 `return undefined`（变异 f）时 **⑦ 红而 ⑦b 仍绿** | ⑦b 补**对照格**：「池空但本机凭据**有临期额度**」必须**真的返回它**（M8 证明该格会红），并断言「根本没有凭据时不去读余额」 |
+
+#### ⚠️⚠️ 同轮**我自己**查出的真缺口：`APIG.1009` 的判据**钉死在 401**（自相矛盾）
+
+对抗性审计的变异 m1/m2 只证明「凡 401 都算」与「只认 400」两个方向会红，**没有测
+「400 + 真机报文」这一格** —— 而华为官方文档把 `APIG.1009` 定义为 HTTP **400**、
+真机回的是 401（issue 取样即 401）。实测**三处各自**钉死了 401：
+
+1. `isBasicCredentialRejection(status, body)`：`if (status !== 401) return false`，
+   而它**正上方**的注释写着「判据**不得**依赖状态码」；
+2. `diagnose()`：整个 `APIG.1009` 分派**嵌在** `if (status === 401)` 里面；
+3. 续期闸门：`if (response.status === 401 && this.options.refresh !== undefined)`。
+
+⇒ 一旦网关按文档回 400，**归因文案与熔断双双失效**，每轮又白撞一次（正是 ③）。
+三处一起改：判据改为「**4xx + 报文点名这对 Basic 凭据**」；`diagnose` 改为
+**先判形状、再判 401**；续期闸门改成**超集**（`401` 照旧一律尝试续期，行为零回退）。
+下界设在 **400** 而不是「不看状态码」，理由是 **2xx 的 body 是模型输出** ——
+用户正是在排查这个错误，模型完全可能原样复述这句报文，不设下界会让一次**成功**的
+回答熔断整渠道 10 分钟；**5xx** 是基础设施抖动、形状未知，与「网关空体 401 不熔断」
+同一条理由。
+判据：`credential-health.spec` **④**（400/403 ⇒ true）+ **④b**（2xx ⇒ false，注释写明
+「模型输出不得熔断渠道」）+ **④c**（5xx ⇒ false）；`officeace-401-diagnosis.spec`
+**⑥b**（真机报文 + **400** ⇒ 必须给出同一套归因且熔断记账为 1）。
+⚠️ 那条 ④ 的**原版是写反的**：标题写「只认报文，不认状态码」，断言却把
+`(400, APIG.1009) === false` 当期望值**锁死**了 —— 又一个「注释说一套、判据做另一套」。
+⚠️ 该缺口的两半分别由 M6（分派嵌套）与 M7（续期闸门）证明**有牙**。
+
+#### ⑧ 附带登记：红线实证、未取证项与刻意不修的缺口
+
+- ✅ **`AUTH`/`QUOTA` 会连 message 一起被客户端丢掉**这条红线，本轮从「文档相传」
+  升级为**对着装好的 DSH 源码实证**：`dsh-client-ui-chat/lib/client.js:1222` 把
+  `QUOTA`/`ACCOUNT_QUOTA` 换成 `message.failure.quota`、`:1223` 把 `AUTH` 换成
+  `message.failure.auth`，且 `:7392-7395` 对 `AUTH` 直接给出 `message: ""`
+  （**整段抹掉**，不是某一个渲染点替换）。⇒ 锁定文案与 401 归因**必须是裸 `Error`
+  （无 `code`）**，用例断言 `.code === undefined`。
+- ⚠️ **仍未取证**：华为官方错误码页**没抓到**（本机 `web_search` 端点的 token 失效、
+  Bing 忽略 `site:` 过滤）⇒「官方定义 400」目前**仍是 issue 报障方的一面之词**。
+  修法**不依赖**它：判据只认报文措辞，状态码只当**状态类**边界用。
+- ⚠️ **登记一处诚实性小缺口（刻意不修）**：`jet-hub-rpc.ts` 的 `officeace.status`
+  用**无 ref** 的 `readOfficeAceCredential()` 判 `ready: true`，**完全不看锁定表**
+  ⇒ 锁定期间面板仍显示「就绪」，而推理侧会抛「没有可用账号」。它**不烧积分**
+  （只读探测），**不是绕过**，但症状会让人以为锁定没生效。修它要给该 RPC 响应加锁定态
+  并同步客户端文案（面板 + bundle 重建）⇒ 收益不抵本轮风险，**登记**即可，建议将来
+  随「每日额度刷新入口」一起做（那本来就要动这段响应）。
+- ✅ 上一轮登记的「熔断产生的 `UNUSABLE` 会不会被折算缓存留得比熔断更久」**本轮关闭**：
+  `aggregate-expiry.ts:194` 的 `EXPIRY_CACHE_TTL_MS = 60_000`（60 秒）**远短于**熔断默认
+  10 分钟 ⇒ 缓存最多让「不可用」结论滞后 1 分钟，恢复侧以熔断 TTL 为准。
+- ⚠️ **审计工具自身会产生假绿**（方法论）：该轮变异助手前两轮把 m1/m2 报成 GREEN 且
+  摘要**为空** —— 是它自己 `2>&1 | Out-String` 在 `$ErrorActionPreference='Stop'` 下
+  偶发捕空，使判定退化成 GREEN，**不是守卫无牙**；改成「重定向到文件 + 未解析到
+  `Test Files` 就重试」后重跑全表才是权威结果。⇒ **摘要为空必须人工复核**，
+  别把工具故障当成「守卫有牙」或「守卫无牙」的证据。
+
+### 如实登记的缺口（**别据此改代码**）
+
+- ⚠️ 「额度耗尽 ⇒ 云侧撤销 MaaS 授权」这条链**未被证明**（issue 原文即要求
+  不要据此改代码）。上面三条修法都不依赖它。
+- ⚠️ `.trial` 类 SKU 的 `expiresAt` 在 `fetchCloudSubscriptionFor` 里被**刻意丢弃**
+  ⇒ 按窗口判据它算**永久** ⇒ 只有试用包的账号在锁定时会被拒（保守，绝不烧钱）。
+  要支持它应修**归一化层**，不是在锁定层加 provider 特例。
+- ⚠️ 重登会产生**新账号条目/新 ref**（`account.create` 恒新造 id），旧条目留在池里
+  ⇒ 可能的重复/幽灵条目。面板上**刻意没有**「刷新每日额度」入口：它本质是
+  重新登录**既有**账号，需要宿主侧新增一条 RPC（如 `account.relogin`）——
+  `account.create` 拿来做这件事只会造幽灵账号而额度一点没刷新，
+  `login.poll` 对已登录账号又立刻回 `done: true`（假成功）。
+
 ## 3. ⚠️ 接线陷阱（新 provider 通用，此处已复发）
 
 `src/jet-hub-rpc.ts` 的 `SELF_HEAL_REFRESHABLE_PROVIDERS` ——
@@ -403,7 +642,8 @@ officeace 的订阅**每个积分桶都带 `expiresAt`**（ISO 8601）⇒ 走「
 ⇒ 正是「临期优先」要的语义：今天作废的签到积分排最前，
 而「个人体验版」被判长期、**不拉低最小值**。
 
-**守卫**：`tests/unit/officeace-expiry.spec.ts`（12 条：9 条折算判据 + 3 条接线）。
+**守卫**：`tests/unit/officeace-expiry.spec.ts`（折算判据 + 接线两段；
+⚠️ **刻意不写条数**，2026-10-15 加了两条熔断短路用例后旧数字已腐坏）。
 已反向验证：移出白名单 ⇒ **3 条独立守卫同时变红**并点名；
 丢掉 ref 传递 ⇒ ⑫ **精确变红**（收到 `undefined`）。
 
@@ -599,8 +839,11 @@ assistant 消息只有 `reasoning` + `text` 两块、**没有任何 `tool/call` 
 
 ## 6. 待办 / 已知缺口
 
-- **`maasBaseUrl` 是死字段**：写了从不读。若某账号的 `model_api_url_base`
-  与默认值不同，请求会打到错误的 host。修法：适配器改用它并加默认值兜底。
+- ✅ ~~**`maasBaseUrl` 是死字段**：写了从不读~~ —— **2026-10-13 已修**（见 §5.7）：
+  推理/探测三处改读凭据里的 `maasBaseUrl`（缺失回退默认域）；V11 管理面
+  （`/v1/subscription`、`/v1/model-token-rates`）实测两个 host 都存在且都要求 IAM
+  签名，**刻意不动**。原文这条已过期，保留一行是为了让「写过却没人读的字段」
+  这个教训留在原地。
 - **`fetchModelTokenRates` 读共享 `session.json`** ⇒ 多账号下倍率取「最后登录那个」。
   影响低（倍率是账号级静态配置，取不到时空表降级），但它与 §4 是同一类。
 - **V11 `scope` 硬编码 `cn-southwest-2` / `apic`**：当前与 URL 一致故正确，
@@ -608,3 +851,8 @@ assistant 消息只有 `reasoning` + `text` 两块、**没有任何 `tool/call` 
 - **`reasoning-delta` 未接 DSML 归一化**：11 处思考链出口全发原文，
   守卫清单里也没登记。见 `protocol-wire.md`。
 - **`login.poll` 的 `done:false, error` 客户端零消费** ⇒ 用户看到「转圈 5 分钟」。
+- ⚠️ **`officeace.status` 不反映「永久积分锁定」**（2026-10-15 第二轮审计登记，
+  **刻意不修**，详见 §2.7 ⑧）：该 RPC 用**无 ref** 的 `readOfficeAceCredential()`
+  判 `ready: true`，与锁定表无关 ⇒ 锁定期间面板显示「就绪」而推理侧抛
+  「没有可用账号」。**不是绕过**（不烧积分），是**诚实性**缺口；修它要同时改
+  RPC 响应与客户端文案（含 bundle 重建），建议与「每日额度刷新入口」一起做。
