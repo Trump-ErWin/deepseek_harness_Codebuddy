@@ -55,7 +55,7 @@ import { CLINE } from './cline-product.js'
 import { GEMINI } from './gemini.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { LOOMY } from './loomy-product.js'
-import { MINIMAX } from './minimax-product.js'
+import { MINIMAX, MINIMAX_INTL } from './minimax-product.js'
 import { RACCOON } from './raccoon-product.js'
 import { TRAE } from './trae-product.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
@@ -421,16 +421,20 @@ export function createProviderCredits(
     },
 
     /**
-     * MiniMax：`GET /minimax-cloud/api/v1/credit/details`。
+     * MiniMax Code **中国版**：`GET /minimax-cloud/api/v1/credit/details`。
      *
      * ⚠️ 该端点是**平铺响应**（`total_count` 与 `base_resp` 同级、没有 `data` 键），
      * `fetchMinimaxCreditBalance` 内部已兼容两种形状。
      * ⚠️ 查不到时（null）由共享骨架统一补「余额查询失败」—— 卡片显示原因而非 0
      *（本机实测 `total_count: 0` 且 `details` 缺失正是「真的为 0」）。
+     *
+     * ⚠️ 第二个实参传 `undefined`（**不是** `fetch`）：三个原语的签名是
+     * `(credential, fetcher = fetch, product = MINIMAX)`，传 `undefined` 会触达
+     * 同一个默认参数 ⇒ 与「不传」逐字节等价，只把**站点**显式钉住。
      */
     minimax: {
       fetchBalance: (credential) =>
-        fetchMinimaxCreditBalance(credential as MinimaxCredential),
+        fetchMinimaxCreditBalance(credential as MinimaxCredential, undefined, MINIMAX),
       // ⚠️ **有**独立的签到状态端点，与「如实返回 null」的那几家不同。
       // 判据是 `is_today && status===3`（见 `minimaxPanelToCheckinStatus`），
       // 不是「没有 Claimable」。`active` 恒 true（拿到响应即 true）。
@@ -439,7 +443,7 @@ export function createProviderCredits(
       //    预检与面板读数是同一个端点，故**只声明一次**（不再写 `claimStatus`：
       //    两处声明同一实现会漂移）。
       fetchStatus: (credential) =>
-        fetchMinimaxSigninStatus(credential as MinimaxCredential),
+        fetchMinimaxSigninStatus(credential as MinimaxCredential, undefined, MINIMAX),
       /**
        * ⚠️ **必须开启状态预检**（`precheckStatus` 缺省 true，不要传 false）。
        *
@@ -449,7 +453,30 @@ export function createProviderCredits(
        * `todayCheckedIn` 先挡住，避免把「今天已领」报成「+积分」。
        * 反之传 false 会让已签到账号走到 claim 请求（多发一次 POST）。
        */
-      claim: (credential) => claimMinimaxDailyCheckin(credential as MinimaxCredential),
+      claim: (credential) =>
+        claimMinimaxDailyCheckin(credential as MinimaxCredential, undefined, MINIMAX),
+    },
+
+    /**
+     * MiniMax Code **国际版**（`minimaxintl`）—— 与上面的中国版**同形**，
+     * 只把 `product` 换成 {@link MINIMAX_INTL}（主机 `agent.minimax.io`、
+     * ref 前缀 `MINIMAXINTL_*`）。
+     *
+     * ⚠️ **必须各占一条**：三个原语都用 `product.apiHost` 构造 URL —— 共用一条
+     * 会让国际站账号的签到/余额打到 `agent.minimax.cn`，而两站**账号不互通**
+     * ⇒ 必然 401，症状是「国际站账号的积分永远查询失败」，且**不报错到面板以外**。
+     *
+     * ⚠️ 三项**未真机验证**（本机无国际站账号）：签到端点形状假设与中国版同形，
+     * 见 `src/minimax-product.ts` 文件头的未实测清单。
+     */
+    minimaxintl: {
+      fetchBalance: (credential) =>
+        fetchMinimaxCreditBalance(credential as MinimaxCredential, undefined, MINIMAX_INTL),
+      fetchStatus: (credential) =>
+        fetchMinimaxSigninStatus(credential as MinimaxCredential, undefined, MINIMAX_INTL),
+      // 预检与幂等理由同中国版（见上）。
+      claim: (credential) =>
+        claimMinimaxDailyCheckin(credential as MinimaxCredential, undefined, MINIMAX_INTL),
     },
 
     /**

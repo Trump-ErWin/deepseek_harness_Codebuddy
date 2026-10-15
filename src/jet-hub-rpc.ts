@@ -52,7 +52,7 @@ import { phoneFromUserId, isUsableZcodeCredential } from './zcode.js'
 import { ZCODE_LOGIN_PROVIDER, type ZcodeLoginProvider } from './zcode-login.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
-import { MINIMAX } from './minimax-product.js'
+import { MINIMAX, MINIMAX_INTL, type MinimaxProduct } from './minimax-product.js'
 import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
@@ -1062,6 +1062,16 @@ export interface JetHubAuths {
   readonly loomy: LoomyAuth
   readonly raccoon: RaccoonAuth
   readonly minimax: MinimaxAuth
+  /**
+   * MiniMax Code **国际版**（key 是 provider id `minimaxintl`）。
+   *
+   * ⚠️ 与 `minimax` **共用同一个 `MinimaxAuth` 类**（两站只差产品配置），故这里
+   * 的类型相同、只是**另一个实例** —— 与 `qoder` / `qodercn` 同型。
+   * 两站账号不互通、凭据 ref 前缀不同（`MINIMAX_*` / `MINIMAXINTL_*`），
+   * 若这里的**键与值接错**，症状是「国际站账号的续期去刷了国内站凭据」，
+   * 而按 id 查表（`authOf`）会把国际站账号分派到**国内站实例**上。
+   */
+  readonly minimaxintl: MinimaxAuth
   readonly zcode: ZcodeAuth
   readonly gemini: GeminiAuth
   /**
@@ -1625,7 +1635,10 @@ function registerJetHubEndpoints(
   const {
     codearts, buddy, workbuddy, lobsterai, qoder,
     qodercn: qoderCn,
-    trae, cline, loomy, raccoon, minimax, zcode, gemini, accio,
+    trae, cline, loomy, raccoon, minimax,
+    // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
+    minimaxintl,
+    zcode, gemini, accio,
   } = auths
   /**
    * 积分能力表。
@@ -1717,6 +1730,33 @@ function registerJetHubEndpoints(
   }
 
   /**
+   * MiniMax Code **同族**成员：中国版与国际版共用同一组 RPC 实现，只换
+   * `product` 与 `auth` 实例。
+   *
+   * ⚠️ 与 `qoderFamily` **同因**（见上方注释）：本文件里 MiniMax 相关分支有
+   * 三处（`account.create` / 逐家积分表 / 逐家续期表），平行 case 越多、
+   * 「漏接一处」的概率越高。收成一个表，加第三个站点只改这一处。
+   *
+   * ⚠️ **为什么不是「一个 provider 加一个站点参数」**：两站账号不互通，
+   * 且**凭据 ref 前缀与 API 主机都不同** ⇒ 是两个 provider（理由见
+   * `src/minimax-product.ts` 文件头的双站点对照表）。
+   */
+  interface MinimaxFamilyMember {
+    readonly product: MinimaxProduct
+    readonly auth: MinimaxAuth
+  }
+  const minimaxFamily: readonly MinimaxFamilyMember[] = [
+    { product: MINIMAX, auth: minimax },
+    { product: MINIMAX_INTL, auth: minimaxintl },
+  ]
+  /** 取同族成员；不存在时抛错（调用方须先判定，理由同 `requireQoderFamily`）。 */
+  const requireMinimaxFamily = (provider: string): MinimaxFamilyMember => {
+    const member = minimaxFamily.find((item) => item.product.id === provider)
+    if (member === undefined) throw new Error(`Unknown MiniMax family provider: ${provider}`)
+    return member
+  }
+
+  /**
    * **真正支持按需续期**的 provider 集合（有 refresh 端点的）。
    *
    * ⚠️ 这是「跳过」与「报错」的分界线，两者的区别是**本质的**：
@@ -1757,6 +1797,12 @@ function registerJetHubEndpoints(
     CLINE.id,
     RACCOON.id,
     MINIMAX.id,
+    // ⚠️ minimaxintl（MiniMax Code 国际版，2026-10-15）：与 `minimax` 共用同一个
+    //    auth 类，**有**真实 refresh 端点（`/oauth2/token` 的 refresh_token 授权）
+    //    ⇒ 不属 loomy / zcode 那类「设计上没有 refresh 端点」的豁免。
+    //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
+    //    只需一次 refresh，且**日志零字**。
+    MINIMAX_INTL.id,
     GEMINI.id,
     // ⚠️ officeace（2026-10-13 审计补）：STS 寿命**约 2 小时**，正落在
     // 「睡眠/挂起恢复后到定时器补触发那一轮之间」这个窗口内 ⇒ 漏登记的症状
@@ -3017,10 +3063,23 @@ function registerJetHubEndpoints(
           })
 
           return { ok: true, value: { accountId: id, loginUrl: raccoonStarted.loginUrl } }
-        } else if (provider === MINIMAX.id) {
-          // MiniMax Code（中国版）走 **OAuth 设备码 + PKCE**（与 Qoder 同型：
-          // 不起本地监听端口，`startLogin` 立即返回指向 `agent.minimax.cn` 的
-          // `verification_uri_complete`，后台轮询换 token）。
+        } else if (provider === MINIMAX.id || provider === MINIMAX_INTL.id) {
+          /**
+           * MiniMax Code 走 **OAuth 设备码 + PKCE**（与 Qoder 同型：不起本地监听
+           * 端口，`startLogin` 立即返回 `verification_uri_complete`，后台轮询换
+           * token）。
+           *
+           * ## ⚠️ 两个站点合用一个分支（表驱动）
+           *
+           * 国内站（`minimax`）与国际站（`minimaxintl`）**账号不互通、主机不同**，
+           * 但登录流程逐步骤相同（只差 product 配置）⇒ 照 `qoderFamily` 的做法
+           * 收成一张表，**不复制**第二个分支体。
+           * 复制会让「登录成功后要回填哪些字段」「失败要删占位条目」这类约定
+           * 修一处漏一处（本仓库在 workbuddy / qodercn 上各踩过一次）。
+           */
+          // 分支内一律用 `product` / `auth`，**不要**出现 `MINIMAX` 字面量 ——
+          // 否则国际站会拿中国版的域名与凭据 ref 前缀发请求（与上面 Qoder 分支同因）。
+          const { product: minimaxProduct, auth: minimaxAuth } = requireMinimaxFamily(provider)
           //
           // ⚠️ 绝不能在用户授权完成后才返回 loginUrl —— `window.open` 只在
           //    用户手势窗口内有效，那时手势早已过期、弹窗必被拦截。
@@ -3030,7 +3089,7 @@ function registerJetHubEndpoints(
           //    写法照 `RACCOON.id` 分支（那是已验证的形态）。
           await pool.addAccount({
             id,
-            provider: MINIMAX.id,
+            provider: minimaxProduct.id,
             nickname: id,
             enabled: true,
             credentialRef: refName,
@@ -3040,7 +3099,7 @@ function registerJetHubEndpoints(
 
           let minimaxStarted: StartedMinimaxLoginFlow
           try {
-            minimaxStarted = await minimax.startLogin()
+            minimaxStarted = await minimaxAuth.startLogin()
           } catch (error) {
             // 设备码申请失败：删掉占位条目，不留幽灵账号。
             void pool.removeAccount(id).catch(() => {})
@@ -3049,14 +3108,25 @@ function registerJetHubEndpoints(
           }
 
           minimaxStarted.result.then(async (credential) => {
-            const result = await minimax.persistLogin(credential, { refName })
+            const result = await minimaxAuth.persistLogin(credential, { refName })
+            /**
+             * 昵称：两站必须可区分（同一面板左右没有，但**账号列表与用量徽标**
+             * 都会显示它，而两站账号可能出现在同一个聚合候选里）。
+             *
+             * ⚠️ **国内站逐字节保持原行为**（`result.accountId` 对真实凭据恒
+             * `undefined` ⇒ 退化为 `id`）：改它会让存量用户的账号名变化。
+             * 国际站是**新增**的，加标记不构成行为回退。
+             */
+            const nickname = result.accountId === undefined
+              ? (provider === MINIMAX_INTL.id ? `MiniMax 国际版 ${id}` : id)
+              : `MiniMax ${result.accountId.slice(0, 8)}`
             await pool.updateAccount(id, {
               // ⚠️ `persistLogin` 的 `accountId` 对真实凭据**恒为 `undefined`** ——
               // MiniMax 的 `access_token` **不是 JWT**（`mmoat_` 前缀、60 字符、
               // 0 个点），故 `decodeJwtSub` 恒不命中、`account_id` 不会被写入。
               // 这是**预期行为**（账号 id 由本层生成），不是缺陷：此时退化为 `id`。
               // 一旦上游改发 JWT，这里会自动用上服务端的 account_id。
-              nickname: result.accountId === undefined ? id : `MiniMax ${result.accountId.slice(0, 8)}`,
+              nickname,
               // ⚠️ **必须用 `minimaxCredentialExpiresAtMs`**（优先 `expires_at`，
               // 它由 OAuth 响应的 `expires_in` 自算）—— 不能指望从 token 解 JWT，
               // 那样会得到 `undefined`，UI 永远显示「未知」。
@@ -3065,7 +3135,7 @@ function registerJetHubEndpoints(
               refreshable: isMinimaxRefreshable(credential),
             })
           }).catch((error: unknown) => {
-            ctx.logger.warn(`[jet-hub] background ${MINIMAX.id} login failed for ${id}: ${String(error)}`)
+            ctx.logger.warn(`[jet-hub] background ${minimaxProduct.id} login failed for ${id}: ${String(error)}`)
             // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
             void failLogin(id, error)
           })

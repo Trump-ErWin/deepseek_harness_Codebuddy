@@ -11,7 +11,7 @@ deepseek-harness 插件：统一管理多个 AI 编程服务的账号，并把�
 的模型选择器。支持**多账号池**（同一服务登录多个账号，按可用性自动选号）与
 **凭据静默续期**（到期前自动刷新，无需再次打开浏览器）。
 
-- **16 个 provider 路由**，外加 1 个**聚合**路由（见下）
+- **17 个 provider 路由**，外加 1 个**聚合**路由（见下）
 - 登录、状态、续期、积分领取**全部在 Jet Hub 设置页完成**，不注册任何斜杠命令
 - 附带一个**本机 OpenAI 兼容网关**，供其它客户端复用已登录账号
 
@@ -192,7 +192,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 
 ## 支持的渠道
 
-16 个 provider 路由，互不覆盖，可同时使用。
+17 个 provider 路由，互不覆盖，可同时使用。
 
 | id | 渠道 | 登录方式 | 积分能力 |
 |---|---|---|---|
@@ -206,7 +206,8 @@ dsh plugin --profile <name> install <path-to-this-repo>
 | `cline` | Cline | WorkOS 设备码轮询 | 余额 |
 | `loomy` | Loomy（讯飞） | 短信验证码 | 余额（两个池）+ 每日额度 + 新手任务 |
 | `raccoon` | Raccoon Work（商汤） | 微信扫码 / 短信 | 余额 + 一次性登录奖励 |
-| `minimax` | MiniMax Code（中国版） | OAuth 设备码 + PKCE | 余额 + 每日签到 |
+| `minimax` | MiniMax Code (中国版) | OAuth 设备码 + PKCE | 余额 + 每日签到 |
+| `minimaxintl` | MiniMax Code (国际版) | 同上（共用实现） | 余额 + 每日签到 |
 | `zcode` | ZCode（智谱 z.ai） | OAuth 设备码 | 余额 + 每日领取 |
 | `opencode` | OpenCode | — | 余额 |
 | `gemini` | Gemini Code Assist | 浏览器回调 | 余额 |
@@ -215,7 +216,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 
 各渠道的能力与限制要点：
 
-- **图片输入**：`buddy` / `workbuddy` / `trae`（逐模型）/ `minimax`（部分模型）/
+- **图片输入**：`buddy` / `workbuddy` / `trae`（逐模型）/ `minimax` / `minimaxintl`（部分模型）/
   `accio`（逐模型）支持；`lobsterai`、`zcode` **不支持**；其余以模型声明为准。
   ⚠️ `accio` 的图片通路**已于 2026-10-14 实测接通**（issue IKLR7V，上游原生收图
   `parts[].inline_data`，四色全对）；但它的 `multimodal: false` 模型**不报错、而是静默
@@ -232,7 +233,18 @@ dsh plugin --profile <name> install <path-to-this-repo>
   插件会**自动改为首发直接带上**，不再白吃那发注定失败的往返
   （判据是三态：缺席 = 不知道 = 保持先探，见 `requiresCaptchaUpfront`）。
 - **`qoder` / `qodercn`** 共用同一套实现，差异仅在产品配置。
-- **`minimax`** 是唯一的 Anthropic Messages 协议族渠道。
+- **`minimax` / `minimaxintl`** 共用同一套实现（**唯一**的 Anthropic Messages
+  协议族渠道），差异仅在产品配置。⚠️ 两站的**账号不互通、API 主机也不同**，
+  故它们是**两个独立面板** —— 各自在自己的面板里点「+ 新建账号」即可，
+  **无需选择站点**（`minimax` → `agent.minimax.cn`，`minimaxintl` → `agent.minimax.io`）。
+  ✅ **国际版已完成真机验证**（2026-10-15）：登录、账号管理、模型目录、**推理**、
+  **每日签到**、**积分查询**全部实测可用 —— 与国内站**协议同形**（认证同样只需
+  `Authorization: Bearer`）。核验入口见 `tests/e2e/README.md` 的
+  `test:e2e:minimaxintl`。
+  ⚠️ 国际站的**目录端点当前是公开的**（无 token、垃圾 token 都 200）⇒
+  「能看到模型列表」**不代表**凭据有效（凭据证据看签到 / 积分 / 推理）。
+  ⚠️ 若国际站各端点**同时**报 `token is required` / `invalid signature`，
+  请先怀疑**上游故障**而不是配置 —— 此时**官方 mcode 客户端也会同样失败**。
 - **`accio`** 登录走浏览器回调。⚠️ **新建账号时必须先选登录区域**（中国版
   `www.accio-ai.com` / 国际版 `zh.accio.com`）：两个区域的**登录页域名不同**，
   而区域由服务端按账号下发、**登录前无法自动判断** ⇒ 选错会打开打不开的登录页，

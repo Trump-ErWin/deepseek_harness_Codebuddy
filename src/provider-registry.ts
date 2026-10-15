@@ -283,11 +283,38 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
   },
   {
     id: 'minimax',
-    label: 'MiniMax Code',
-    displayName: 'MiniMax Code',
+    // ⚠️ 2026-10-15 加国际版（`minimaxintl`）后必须带括注，否则左栏会出现
+    //    「MiniMax Code」+「MiniMax Code (国际版)」两条，用户看不出前者是国内站
+    //    （与 `Qoder (中国版)` / `WorkBuddy (国际版)` 的既有命名风格一致）。
+    label: 'MiniMax Code (中国版)',
+    displayName: 'MiniMax Code (中国版)',
     logoClass: 'minimax',
     credits: { balance: true, dailyCheckin: true },
     settingsNamespace: 'llm-minimax',
+    channel: true,
+  },
+  {
+    /**
+     * MiniMax Code **国际版**（`minimaxintl`）。
+     *
+     * ⚠️ 与上面的国内站**共用全部** `src/minimax*.ts` 实现（适配器 / 认证服务 /
+     *    OAuth / 积分 / 消息序列化），差异只在 `src/minimax-product.ts` 的
+     *    `MINIMAX_INTL` 常量里（主机 / region / ref 前缀）。
+     *
+     * ⚠️ **`rateLimit` 刻意不写 false**：两站共用同一个 `MinimaxAdapter`，而它
+     *    自 issue IKJW32 起会写 `modelRateLimits`（额度 24h / 限流 1h）⇒ 缺省
+     *    `true` 是**正确**的，且必须同时进 `probeById` 与
+     *    `WRITES_RATE_LIMIT_PROVIDERS`（否则标记写进去却永远清不掉）。
+     *
+     * ⚠️ 三项**未真机验证**（无国际站账号）：推理路径、签到端点形状、兜底模型表
+     *    —— 见 `src/minimax-product.ts` 文件头的未实测清单。
+     */
+    id: 'minimaxintl',
+    label: 'MiniMax Code (国际版)',
+    displayName: 'MiniMax Code (国际版)',
+    logoClass: 'minimaxintl',
+    credits: { balance: true, dailyCheckin: true },
+    settingsNamespace: 'llm-minimaxintl',
     channel: true,
   },
   {

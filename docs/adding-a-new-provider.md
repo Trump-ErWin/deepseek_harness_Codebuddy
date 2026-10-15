@@ -8,22 +8,34 @@
 
 ## 概述
 
-本插件已集成 **15 个 provider**（完整清单与能力见 README 的「支持的渠道」），
-按**协议源流**分成多支脉系。最早的两支是：
+本插件已集成 **17 个 provider**（完整清单与能力见 README 的「支持的渠道」；
+⚠️ 按 `PROVIDER_REGISTRY` 里的**真实渠道**数，不含 `aggregate`（它是跨渠道聚合的
+虚拟入口，`channel: false`）），按**协议源流**分成多支脉系。最早的两支是：
 
 | 脉系 | Provider | 特点 |
 |------|----------|------|
 | **CodeBuddy 系** | `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy 国际版） | 同源：共用同一 CLI 内核、同一认证协议（external-link 轮询式）、同一 chat 端点格式，差异全部收敛在 `BuddyProduct` |
 | **LobsterAI 系** | `lobsterai`（有道龙虾） | 不同源：完全独立的登录协议（本地回调 + authCode 换 token）、独立请求头（`X-LobsterAI-Client-*`）、独立签到协议 |
+| **MiniMax 系** | `minimax`（MiniMax Code 中国版）、`minimaxintl`（MiniMax Code 国际版） | 同源：**首个 Anthropic Messages 协议族**，两站只差 6 个字段（`id` / `label` / `displayName` / `accountHost` / `apiHost` / `region` 与 ref 前缀），其余共用全部实现 |
 
 此后陆续加入的 `qoder` / `qodercn` / `trae` / `cline` / `loomy` / `raccoon` /
-`minimax` / `zcode` / `opencode` / `gemini` / `accio` **各自成支**（协议互不同源），
+`zcode` / `opencode` / `gemini` / `officeace` / `accio` **各自成支**（协议互不同源），
 它们的实测结论与逐条坑点分散登记在 `docs/agent-notes/providers-*.md`。
 
 因此你要添加的 provider 如果属于**已有脉系**（比如再加一个腾讯系产品），只需加一份 `BuddyProduct` 配置并注册实例；如果是**全新的脉系**（全新的API协议、认证方式、签到流程），需要仿照 LobsterAI 创建一套独立但遵循相同架构模式的实现。
 
-> 📌 **最新一份完整范例是 `accio`（2026-10-13，第 16 个 provider）**：
-> ⚠️ 序号按 `PROVIDER_REGISTRY` 的声明顺序数；officeace（第 15，2026-10-12）
+> 📌 **最新一份「同源加点」范例是 `minimaxintl`（2026-10-15）**：它给已有的 `minimax`
+> 脉系再加一站（国际站），改动量极小 —— 主要是在 `src/minimax-product.ts` 加一份
+> 产品常量，再把两站共用适配器类所依赖的**各处接线**逐一补齐
+> （`PROVIDER_REGISTRY` / `provider-runtime` 注册表、`src/index.ts` 的 `probeById`、
+> `WRITES_RATE_LIMIT_PROVIDERS`、`SELF_HEAL_REFRESHABLE_PROVIDERS`、ref 前缀表、
+> 积分表、客户端图标与样式）。
+> ⚠️ **最容易漏的是「接线点」**：漏一处**都是静默失效**（界面缺项或功能不工作，
+> 没有任何报错）—— 详见 `docs/agent-notes/providers-loomy-raccoon-minimax.md` 的
+> MiniMax 一节（§0 双站点用两个 provider id 的理由，以及那串必须逐个到位的接线表）。
+
+> 📌 **最新一份「全新脉系」范例是 `accio`（2026-10-13，第 17 个 provider）**：
+> ⚠️ 序号按 `PROVIDER_REGISTRY` 的声明顺序数；officeace（第 16，2026-10-12）
 > 与 accio **同一次**合入 master，故两者相差一格。
 > `src/accio-product.ts` → `accio.ts` → `accio-oauth.ts` → `accio-auth.ts` →
 > `accio-messages.ts` → `accio-adapter.ts` → `accio-credits.ts`，另有客户端专属面板。
