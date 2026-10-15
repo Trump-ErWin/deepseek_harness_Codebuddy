@@ -16,7 +16,7 @@
 |------|----------|------|
 | **CodeBuddy 系** | `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy 国际版） | 同源：共用同一 CLI 内核、同一认证协议（external-link 轮询式）、同一 chat 端点格式，差异全部收敛在 `BuddyProduct` |
 | **LobsterAI 系** | `lobsterai`（有道龙虾） | 不同源：完全独立的登录协议（本地回调 + authCode 换 token）、独立请求头（`X-LobsterAI-Client-*`）、独立签到协议 |
-| **MiniMax 系** | `minimax`（MiniMax Code 中国版）、`minimaxintl`（MiniMax Code 国际版） | 同源：**首个 Anthropic Messages 协议族**，两站只差 6 个字段（`id` / `label` / `displayName` / `accountHost` / `apiHost` / `region` 与 ref 前缀），其余共用全部实现 |
+| **MiniMax 系** | `minimax`（MiniMax Code 中国版）、`minimaxintl`（MiniMax Code 国际版） | 同源：**首个 Anthropic Messages 协议族**，两站只差 `MinimaxProduct` 的 **6 个字段**（`id` / `displayName` / `accountHost` / `apiHost` / `region` / `defaultCredentialRef`），其余共用全部实现（判据由 `minimax-intl.spec.ts` 的「除这 6 个字段外逐字段相同 + 反向自检」锁住）。⚠️ `label` / `logoClass` / `settingsNamespace` 属 **`PROVIDER_REGISTRY` 描述符**字段，不在 `MinimaxProduct` 里，别混进这 6 个 |
 
 此后陆续加入的 `qoder` / `qodercn` / `trae` / `cline` / `loomy` / `raccoon` /
 `zcode` / `opencode` / `gemini` / `officeace` / `accio` **各自成支**（协议互不同源），

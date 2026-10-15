@@ -1750,7 +1750,11 @@ export function apply(ctx: Context): void {
   //
   // ⚠️ **两站账号不互通、API 主机也不同** ⇒ 它们是两个 provider 而不是
   //    「一个 provider 加一个站点参数」（理由见 `src/minimax-product.ts` 文件头）。
-  // ⚠️ 三项**未真机验证**（无国际站账号）：推理路径 / 签到端点形状 / 兜底模型表。
+  // ⚠️ **验证状态如实标注**（2026-10-16 合并审计修正 —— 原文写「三项未真机验证」，
+  //    已被本 PR 后续的真机取证推翻，见 `src/minimax-product.ts` 文件头的实测表）：
+  //    推理路径与签到端点形状**已真机验证通过**（2026-10-15，真实国际站账号，
+  //    推理 200 + 真实 SSE、签到/积分 200）；**只有兜底模型表**未按国际站远端采集
+  //   （它与国内站共用同一份，只在远端失败时兜底）。
   const minimaxIntl = new MinimaxAuth(ctx, { product: MINIMAX_INTL })
   const minimaxIntlAdapter = registerMinimaxLlm(ctx, {
     credentialRef: credentialRef(MINIMAX_INTL.defaultCredentialRef),

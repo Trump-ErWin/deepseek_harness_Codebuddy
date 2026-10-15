@@ -38,10 +38,14 @@ import type { MinimaxCredential } from '../../src/minimax.js'
  * 故本文件的断言全部落在**可观测量**上：真实 fetch 收到的 URL 主机、
  * 真实 `apply()` 后的服务实例分派、真实 ref 反查结果。
  *
- * ⚠️ 三项**未真机验证**（本机无国际站账号）：国际站的推理路径、签到端点形状、
- * 兜底模型表。本文件只能锁「我们按同形实现」这个**实现事实**，锁不住
- * 「上游真的同形」—— 后者要 `tests/e2e/minimaxintl-*.e2e.spec.ts` 真机核验。
- * 详见 `src/minimax-product.ts` 文件头的未实测清单。
+ * ⚠️ **验证状态如实标注**（2026-10-16 合并审计修正 —— 原文写「三项未真机验证」，
+ * 已被本 PR 后续的真机取证推翻，且与 `src/minimax-product.ts` 文件头互相否定）：
+ * **推理路径与签到/积分端点已真机验证通过**（2026-10-15，真实国际站账号；
+ * 见 `tests/e2e/minimaxintl-probe.e2e.spec.ts`）。**未验证的只有兜底模型表**
+ * （两站共用同一份国内站快照，仅远端失败时兜底）。
+ *
+ * 本文件锁的是「我们按同形实现」这个**实现事实**；「上游持续同形」由
+ * `tests/e2e/minimaxintl-*.e2e.spec.ts` 真机核验，两者互补。
  */
 
 /** 造一个 JSON `Response`。 */
@@ -578,5 +582,226 @@ describe('★★ 两站账号各刷各的实例（同族串接的核心风险）
     const body = await res.json() as { result: { ok: boolean } }
     expect(body.result.ok).toBe(true)
     expect(log, '中国站账号的续期串到了国际站实例').toEqual(['minimax'])
+  })
+
+  /**
+   * ★★ **登录（`account.create`）也必须落在自己那个 auth 实例上**。
+   *
+   * ## 它守的失效形态
+   *
+   * `minimaxFamily` 是一张 `{ product, auth }` **配对表**（`src/jet-hub-rpc.ts`）。
+   * 若把国际站那格的 `auth` 接成**国内站实例**，症状是：用户在国际站面板点
+   * 「+ 新建账号」→ 打开的是 `account.minimax.cn` 的授权页 → 国内站 token 被写进
+   * `MINIMAXINTL_ACCOUNT_*` ⇒ 国际站**全链路 401**，而界面上没有任何提示。
+   *
+   * ⚠️ **为什么必须有这条**：本形态原先只有 `minimax-rpc.spec.ts` 的**源码文本**
+   * 断言（`toContain('requireMinimaxFamily(provider)')`）—— 文本只证明那串字符在，
+   * 证明不了**配对**正确。合并审计**实测**：把国际站那格改成 `auth: minimax`，
+   * 全量 8416 条**全绿**。上面两条 `account.refresh` 用例也抓不到它
+   *（续期走 `auths` 查表，**不经过** `minimaxFamily`）。
+   *
+   * ⚠️ 三个判据**缺一不可**：①「**谁**被调用」；② 返回的 loginUrl 属于哪一站；
+   * ③ 占位条目记的是哪个 provider / ref 前缀。
+   * 只看 ② 会漏掉「占位条目挂错站」；只看 ① 会漏掉「auth 对但 product 配错」。
+   */
+  it('account.create(provider=minimaxintl) 的登录走国际站实例，不碰国内站实例', async () => {
+    const log: string[] = []
+    const created: Array<{ provider?: string; credentialRef?: string }> = []
+    /** 只记录「我被调用了吗」，并返回**带自己站域名**的 loginUrl。 */
+    const stubStartLogin = (id: string, loginUrl: string) => ({
+      startLogin: async () => {
+        log.push(id)
+        // ⚠️ `result` **永不 settle**：本用例只验「谁被调用」与返回的 loginUrl；
+        //    让它立刻 resolve 会把后台链推进到 `persistLogin`（本用例不测那段）。
+        return { loginUrl, result: new Promise(() => {}) }
+      },
+      persistLogin: async () => { throw new Error('persistLogin 不该在本用例被调用') },
+    })
+    const { registerJetHubRpc, JET_HUB_API_PATH } = await import('../../src/jet-hub-rpc.js')
+    let handler: ((req: Request) => Promise<Response>) | undefined
+    const ctx = {
+      get: (key: string) => key === 'connection'
+        ? {
+            fetch: {
+              register: (spec: { path: string; fetch: (req: Request) => Promise<Response> }) => {
+                if (spec.path === JET_HUB_API_PATH) handler = spec.fetch
+              },
+            },
+          }
+        : undefined,
+      inject: (_deps: string[], callback: (c: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      emit: () => {},
+    }
+    const pool = {
+      listAllAccounts: async () => [],
+      listAccounts: async () => [],
+      addAccount: async (entry: { provider?: string; credentialRef?: string }) => { created.push(entry) },
+      removeAccount: async () => {},
+      updateAccount: async () => {},
+    }
+    registerJetHubRpc(ctx as never, pool as never, {
+      codearts: {} as never, buddy: {} as never, workbuddy: {} as never,
+      lobsterai: {} as never, qoder: {} as never, qodercn: {} as never,
+      trae: {} as never, cline: {} as never, loomy: {} as never,
+      raccoon: {} as never, zcode: {} as never, gemini: {} as never,
+      officeace: {} as never, accio: {} as never,
+      minimax: stubStartLogin('minimax', 'https://account.minimax.cn/oauth2/device') as never,
+      minimaxintl: stubStartLogin('minimaxintl', 'https://account.minimax.io/oauth2/device') as never,
+    } as never)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const h = handler
+    expect(h, 'jet-hub RPC 端点未注册').toBeDefined()
+
+    const res = await h!(new Request('http://localhost/api/jet-hub', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request', rpcId: 'c1', method: 'jet-hub',
+        payload: { method: 'account.create', payload: { provider: 'minimaxintl' } },
+      }),
+    }))
+    const body = await res.json() as {
+      result: { ok: boolean; value?: { loginUrl?: string }; error?: { message?: string } }
+    }
+    expect(body.result.ok, `account.create 应成功，实际 error=${body.result.error?.message}`).toBe(true)
+    // ★★ 判据①：**恰好**国际站那个实例被调用（接错成国内站实例即红）。
+    expect(log, '国际站登录串到了别的实例（会拿国内站 token 写进 MINIMAXINTL_*）')
+      .toEqual(['minimaxintl'])
+    // ★★ 判据②：拿到的授权页必须是**国际站**的域。
+    expect(body.result.value?.loginUrl).toContain('account.minimax.io')
+    expect(body.result.value?.loginUrl).not.toContain('account.minimax.cn')
+    // ★★ 判据③：占位条目必须挂在**国际站** provider 与它自己的 ref 前缀下。
+    expect(created, 'account.create 没有登记占位条目').toHaveLength(1)
+    expect(created[0]?.provider).toBe('minimaxintl')
+    expect(created[0]?.credentialRef).toMatch(/^MINIMAXINTL_ACCOUNT_/)
+  })
+})
+
+/**
+ * ★★ **重试接线守卫**（2026-10-16 合并审计补齐）。
+ *
+ * ## 它守的失效形态
+ *
+ * `minimaxFetchWithRetry` 本体有 14 条纯函数用例（`minimax-transport-retry.spec.ts`），
+ * 但那个文件**只 import 了 `src/minimax.js` 本身** —— 合并审计**实测**：
+ * 把三处业务调用点（`minimax-credits.ts` 的 `requestEnvelope`、
+ * `minimax-auth.ts` 的 `fetchRawModels`、`minimax-adapter.ts` 的 `send`）
+ * 的包装删掉、退回**裸 `fetch`**，**全量 8416 条测试仍然全绿**。
+ * ⇒ 本 PR 的**头号功能（传输级重试）当时零接线守卫**：
+ * 「函数是对的」与「它真的被用上了」是两件事。
+ *
+ * ## 判据
+ *
+ * 每条路径都用「**第一次抛 undici 形状的 `fetch failed`（真因是自签证书）、
+ * 第二次成功**」的 fetcher，断言**总调用次数 == 2**：
+ * - 接线在 ⇒ 2 次（第一次失败被重发）
+ * - 接线被摘掉 ⇒ **1 次**（第一次的异常直接冒泡）⇒ 用例变红
+ *
+ * ⚠️ 判据必须打在**业务入口**上（`fetchMinimaxSigninStatus` / `claimMinimaxDailyCheckin` /
+ * `fetchMinimaxCreditBalance` / `fetchModelsWith` / `adapter.stream`），不能只打
+ * `minimaxFetchWithRetry` 本身 —— 后者证明不了「调用点接上了」。
+ */
+describe('★★ 重试接线：业务路径真的走了 minimaxFetchWithRetry（不是只测了函数本体）', () => {
+  /** undici 形状的 `fetch failed`：真因挂在 `cause` 上（本机实测的失败形态）。 */
+  function fetchFailed(): TypeError {
+    const cause = new Error('self-signed certificate in certificate chain') as NodeJS.ErrnoException
+    cause.code = 'SELF_SIGNED_CERT_IN_CHAIN'
+    return new TypeError('fetch failed', { cause })
+  }
+
+  /**
+   * 首次抛传输错误、之后一律成功的 fetcher，并记录总调用次数。
+   *
+   * ⚠️ **刻意不复用 `recorder`**：那个 helper 从不抛错，抓不到本组要守的形态。
+   */
+  function retryProbe(response: () => Response): { calls: () => number; seen: string[]; fetcher: typeof fetch } {
+    const seen: string[] = []
+    let count = 0
+    const fetcher = (async (input: RequestInfo | URL) => {
+      seen.push(String(input))
+      count += 1
+      if (count === 1) throw fetchFailed()
+      return response()
+    }) as typeof fetch
+    return { calls: () => count, seen, fetcher }
+  }
+
+  /** 一个形状合法的签到面板（7 天，恰好 1 条 `is_today`）。 */
+  const panel = {
+    scene: 2,
+    days: Array.from({ length: 7 }, (_, i) => ({
+      day_no: i + 1, points: 400, bonus_points: 0,
+      status: i === 0 ? 3 : 1, is_today: i === 0,
+    })),
+  }
+
+  it('★ 签到状态（GET）首次传输失败后**由业务入口**重发', async () => {
+    const { calls, fetcher } = retryProbe(() => json({ data: panel, base_resp: { status_code: 0 } }))
+    const status = await fetchMinimaxSigninStatus(credential(), fetcher, MINIMAX)
+    expect(calls(), '签到状态路径没有接上重试（第一次的 fetch failed 直接冒泡了）').toBe(2)
+    expect(status?.active).toBe(true)
+  })
+
+  it('★ 领取（**POST 写操作**）同样接上了重试，且幂等仍由 claim_result 判', async () => {
+    const { calls, fetcher } = retryProbe(() => json({
+      data: { claim_result: 1, points: 400, panel },
+      base_resp: { status_code: 0 },
+    }))
+    const outcome = await claimMinimaxDailyCheckin(credential(), fetcher, MINIMAX_INTL)
+    expect(calls(), '领取路径没有接上重试').toBe(2)
+    expect(outcome.kind).toBe('claimed')
+  })
+
+  it('★ 余额（GET）首次传输失败后由业务入口重发', async () => {
+    const { calls, fetcher } = retryProbe(() => json({
+      details: [{ remaining_amount: '800.00' }], total_count: 1,
+      base_resp: { status_code: 0 },
+    }))
+    const balance = await fetchMinimaxCreditBalance(credential(), fetcher, MINIMAX)
+    expect(calls(), '余额路径没有接上重试').toBe(2)
+    expect(balance?.total).toBe(800)
+  })
+
+  it('★ 远端目录首次传输失败后重发，且拿到的是**远端**条目而非兜底表', async () => {
+    const { calls, fetcher } = retryProbe(() => json({
+      providers: [{ providerId: 'minimax', config: { models: { 'MiniMax-M3': { name: 'M3' } } } }],
+    }))
+    const auth = new MinimaxAuth(makeContext(), { product: MINIMAX_INTL, fetchImpl: fetcher })
+    const models = await auth.fetchModelsWith(credential())
+    expect(calls(), '目录路径没有接上重试（`fetchRawModels` 的包装被摘掉了）').toBe(2)
+    // ⚠️ 反向判据：兜底表的首条是 `MiniMax-M3.1-Flash-Preview`，远端给的是 `MiniMax-M3`
+    //    ⇒ 若重试没生效而回落了兜底表，这条会红（不只是"调用次数不对"）。
+    expect(models.map((m) => m.id), '拿到的是兜底表而不是远端目录').toContain('MiniMax-M3')
+  })
+
+  it('★★ 推理（`send`）首次传输失败后重发（本 PR 的修复本体，此前零接线守卫）', async () => {
+    const seen: string[] = []
+    let count = 0
+    vi.stubGlobal('fetch', (async (input: RequestInfo | URL) => {
+      seen.push(String(input))
+      count += 1
+      if (count === 1) throw fetchFailed()
+      return new Response(
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    }) as typeof fetch)
+    try {
+      const adapter = new MinimaxAdapter({
+        credentialRef: 'MINIMAX_ACCESS_TOKEN' as never,
+        resolveCredential: async () => credential(),
+        refresh: async () => {},
+        product: MINIMAX_INTL,
+      } as never)
+      await (async () => {
+        for await (const _chunk of adapter.stream({ model: 'MiniMax-M3', messages: [] } as never)) {
+          // drain
+        }
+      })().catch(() => {})
+    } finally {
+      vi.unstubAllGlobals()
+    }
+    expect(seen.length, '推理路径没有接上重试（`send` 的包装被摘掉了）').toBe(2)
   })
 })

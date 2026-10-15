@@ -1014,9 +1014,10 @@ const STYLES = `
 .dim-jh-badgeAutoClose:hover { border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-brand-primary); }
 .dim-jh-badgeAutoStatusHead { font-size: 10.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
 .dim-jh-badgeAutoChannels { display: flex; flex-wrap: wrap; gap: 2px 5px; margin-top: 3px; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-label-tertiary); }
-/* 分隔符跟在条目**后面**（不是用 ::before 加在下一个前面）：9 个渠道在 280px 里必然
+/* 分隔符跟在条目**后面**（不是用 ::before 加在下一个前面）：十余个渠道在 280px 里必然
    换行，::before 的写法会让换行处那一行**以孤立的点开头**（预览里实测到了）；
-   ::after 则表现为行尾的「·」，与行内文本的分隔习惯一致。 */
+   ::after 则表现为行尾的「·」，与行内文本的分隔习惯一致。
+   ⚠️ 刻意不写死渠道数：原文写「9 个」，加 minimaxintl 后已是 10 个（2026-10-16 审计）。 */
 .dim-jh-badgeAutoChannel:not(:last-child)::after { content: " ·"; opacity: .6; }
 /* 偏好：分段控件（未选中透明、选中浮起），比三个独立胶囊更紧凑整齐 */
 .dim-jh-badgePref { display: flex; gap: 2px; padding: 2px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 7px; background: var(--dsw-alias-bg-layer-2); }
