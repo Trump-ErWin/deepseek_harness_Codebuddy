@@ -1,130 +1,217 @@
-# PR：账号备份（选账号导出 / 合并导入 / 第三方转换）+ 限额账号自动沉底
+# PR：MiniMax Code **国际版**渠道 + MiniMax 请求的**传输级重试**
 
-两个功能，拆成两个独立提交，可分别审阅（也便于你只挑其中一个合并）。
+一个功能 + 一个健壮性修复，合并为**单个提交**，便于一次性审阅：
+
+```
+feat(minimax): 新增国际站渠道（双站点共用实现）+ 传输级重试
+```
 
 ---
 
-## 提交 1 / 2：`feat(backup): 选账号导出 / 合并导入，并可直接导入第三方账号列表`
+## 一、为什么做
 
-### 为什么做
+原 `minimax` 渠道只覆盖 **MiniMax Code 中国版**（`agent.minimax.cn`）。而 MiniMax Code
+**国际版是独立的账号体系与独立的 API 主机**（`agent.minimax.io`），且国际站同样有
+「每日签到送积分」的活动 —— 也就是说，只用中国版会**少一个可用渠道、也少一份每日积分**。
 
-原备份只在「换 DSH 版本时整体迁移」这一种场景下堪用：只有「导出全部 / 导入即整体替换」。而实际使用中冒出来的需求都是**局部的**，整体替换语义会把它们全做坏：
+本 PR 把国际版作为**并列渠道**加上。
 
-1. **只想导出其中几个账号** —— 原先只能导全部，产物带着全部凭据，泄漏面与体积都大。
-2. **只想从一份备份里挑一个账号加进来** —— 原先只能整体替换，一导入就把本机现有账号池**清空**，不可逆。
-3. **手头是第三方账号列表**（非本插件格式）—— 原先完全无法导入。
+### ⚠️ 关键设计决策（请重点审阅）：为什么用**两个 provider id**，而不是
+「单 id + 站点落在凭据里」
 
-### 做了什么
+需求沟通过程中我先做过「同 id」方案，被否掉，最终确认走**双 id**。理由是**实测的**，
+不是偏好：
 
-- **选账号导出**：`backup.export` 增 `accountIds`，弹窗逐个勾选，默认全部。
-- **合并导入**：`backup.import` 增 `mode: 'merge'`，只追加，不碰黑名单 / 锁定表 / 他人凭据；`replace` 保留为默认并兼容旧行为。
-- **第三方列表导入**：`plugin-src/client/backup-convert.js` —— 识别常见形状、按 `access_token` 的 `iss` realm 主机分派 provider、生成**确定性 id**（重复导入不堆重复账号）、字段对齐与坏条目降级。
+1. **模型目录按 provider 缓存一份**。单 id 下两个站点会**争用同一份目录缓存**，
+   于是另一站的模型要么进不了列表、要么被静默回退成本站模型；
+2. **且 MiniMax 对不存在的模型名回 `HTTP 200` + 静默回退**（不是报错）——
+   这意味着「回退错了」在界面上**完全看不出来**，用户会在国际站面板里看到中国站的
+   模型名并以为可用。
 
-### 两处关键约束（请重点审阅）
+⇒ 两个站点必须是两个 provider id：`minimax`（中国版，原有）、`minimaxintl`（国际版，新增）。
+它们**共用同一套实现**（同一个适配器类、同一套 OAuth、同一套积分逻辑），
+差异**全部**收敛在 `src/minimax-product.ts` 的一份产品常量里（只差 6 个字段：
+`id` / `displayName` / `accountHost` / `apiHost` / `region` / `defaultCredentialRef`）。
 
-**① 裁剪必须发生在发请求之前**（`backup-payload.js`）。判重虽然在宿主侧，但宿主只知道「载荷里有哪些账号」，不知道用户在界面上勾了哪几个。必须同时裁 `accounts` / `credentials` / `disabledModels` 三处。
+---
 
-⚠️ **裁 `credentials` 是安全边界而非优化**：备份里不在勾选范围内的 `credentialRef` 可能已被本机现有账号占用，回写等于**覆盖现有账号的凭据**，与「只增加不覆盖」的承诺相反。「全部账号」也必须裁（原始载荷还含账号池之外的各 provider 默认单凭据 ref）。同理 `merge` 分支只写被采纳账号引用的凭据。
+## 二、做了什么
 
-⚠️ **模式取白名单，不透传请求字符串**（`req?.mode === 'merge' ? 'merge' : 'replace'`）：未知值被 `?? 'replace'` 静默当成整体替换，用户以为只加一个账号、实际账号池被清空且不可逆 —— 这是本层唯一一个「写错就毁数据」的地方。
+### 1. 新增国际站渠道 `minimaxintl`
 
-**② 合并导入的判重是三层，第 2 层才是关键**：① 池里已有的 `id`；② 池里已有的**身份**；③ 备份文件内部重复的 `id`。
+`src/minimax-product.ts` 新增 `MINIMAX_INTL` 常量：
 
-⚠️ 只按 `id` 不够：本插件登录时 `id` 由 `shortId()` **随机**生成，而第三方转换来的 id 是**确定性哈希** —— 同一个人有两套 id。而用户最常见的场景恰恰是「这个号我已经手登过了」。
+| 字段 | 中国版 `minimax` | 国际版 `minimaxintl` |
+|---|---|---|
+| `accountHost` | `account.minimax.cn` | **`account.minimax.io`** |
+| `apiHost` | `agent.minimax.cn` | **`agent.minimax.io`** |
+| `region` | `cn` | **`en`** |
+| `defaultCredentialRef` | `MINIMAX_ACCESS_TOKEN` | **`MINIMAXINTL_ACCESS_TOKEN`** |
+| 显示名 | `MiniMax Code (中国版)` | `MiniMax Code (国际版)` |
 
-第 2 层字段候选表 `IDENTITY_FIELDS` 按 provider 通读凭据形状取并集：`user_id`（buddy/workbuddy/lobsterai/raccoon/zcode）、`uid`（qoder/qodercn/trae）、`userid`（loomy）、`account_id`（cline/minimax）、`sub`（gemini）；`opencode` 单独认 `api_key` 并**排除匿名槽**（全部匿名槽共用 `public`，拿它当身份会把用户刻意加的多条匿名通道判成同一账号而拒绝导入）。
+（账号凭据实际落在 `MINIMAX_ACCOUNT_*` / `MINIMAXINTL_ACCOUNT_*`，
+上面的 `defaultCredentialRef` 只是单凭据时代的兼容缺省值。）
 
-⚠️ **只收「一账号一值」的稳定标识**：`access_token` / `refresh_token` 会轮换，`email` 会随用户改邮箱而变 —— 拿它们当身份会让同一账号在轮换/改邮箱后被判成新账号。
+⚠️ **两个站点的账号不互通、API 主机也不同**（均已实测：跨站互打一律 401），
+故它们是**两个独立面板** —— 各自在自己的面板里点「+ 新建账号」即可，**无需选择站点**。
 
-⚠️ 第 3 层不能省：重复条目会留下两条同 id 账号，之后 `updateAccount` / `removeAccount` 按 id 查找只命中第一条，出现「删不掉、改不动」的幽灵账号。故 `AccountPool.mergeAccounts` 内部也自带一层去重。
+### 2. ⚠️⚠️ 两站共用实现的**代价：一串接线点必须逐个到位**（请重点审阅）
 
-### 测试
+这是本 PR **最容易出错的地方**，也是需求里明确的告警点：
+
+> 两站共用适配器类 ⇒ `probeById` / `WRITES_RATE_LIMIT_PROVIDERS` / `SELF_HEAL` /
+> ref 前缀表 / 积分表**每处都要两站到位**，漏一处**静默失效**。
+
+本 PR 逐处补齐（**7 个宿主侧文件 + 2 个客户端文件**）：
+
+| 接线点 | 文件 | 漏掉的症状 |
+|---|---|---|
+| 渠道声明 | `src/provider-registry.ts` | 面板**根本不出现** |
+| 探测（「重测」按钮） | `src/index.ts` 的 `probeById` | ⚠️ 用**错误的主机**发探测 ⇒ 必然 401 ⇒ 限流标记**永远清不掉** |
+| 适配器实例 + 续期目标 + `auths` 对象 | `src/index.ts` | 渠道不可推理 / 账号不自愈 |
+| 自愈续期清单 + auth 接口 | `src/jet-hub-rpc.ts` | 过期账号在积分端点**永不自愈**（报「未登录」而上游只需一次 refresh），且**日志零字** |
+| 凭据 ref 前缀表 | `src/jet-hub-store.ts` | 凭据读不出 / 归属错站 |
+| 积分能力表 | `src/provider-credits.ts` | 积分行不显示 |
+| 聚合参与渠道清单 | `src/aggregate-adapter.ts` | 它的模型**永不进聚合目录、静默不可见** |
+| 客户端图标 | `plugin-src/client/provider-icons.js` | 图标缺失 |
+| 客户端样式 | `plugin-src/client/jet-hub-styles.js` | 样式不生效 |
+
+⚠️ 这些**都不是「看起来像坏了」的失败，而是静默失效**（界面缺项或功能不工作、
+没有任何报错），故本 PR 的用例对它们**逐键点名**（见下「测试」）。
+
+📌 **一处刻意的「不改」**：`src/provider-runtime.ts` **不需要**为国际版加条目 ——
+它从 `PROVIDER_REGISTRY` 派生。加一份反而是多余的第二份真源。
+
+### 3. 传输级重试（`fetch failed` 的真实缺陷）
+
+**报障现象**：「模型连接测试失败，显示 `fetch failed`」「积分查询及领取失败」。
+
+**本机取证**（同一凭据、同一端点、连打 10 次）：
+
+```
+签到 (signin/status): 成功 5/10 —— 失败全是
+  fetch failed ← self-signed certificate in certificate chain [SELF_SIGNED_CERT_IN_CHAIN]
+目录 (models)       : 成功 10/10
+```
+
+⇒ 环境里的 **HTTPS 检查代理**（企业 / 杀软 / 代理软件的 MITM 证书）约 **50%** 概率
+打断到本家的请求。**这是环境问题，但症状落在插件上**：一次偶发中断 = 整轮请求失败。
+
+**修法**：`src/minimax.ts` 新增 `minimaxFetchWithRetry` + `isMinimaxTransportError`，
+**三处共用同一份**（不各写一份 —— 同义判据分两处必然漂移）：
+
+- 推理（`src/minimax-adapter.ts` 的 `send()`）
+- 目录（`src/minimax-auth.ts` 的 `fetchRawModels`）
+- 签到 / 积分（`src/minimax-credits.ts` 的 `requestEnvelope`）
+
+**效果实测**：裸 `fetch` **5/10** → 走本函数（插件真实代码路径）**10/10**。
+
+**四条边界**（每条都做了变异验证，见下）：
+
+1. **只重试传输错误，绝不重试 HTTP 状态错误** —— 4xx/5xx 是服务端的**明确答复**
+   （401 要续期、402 要充值、429 要冷却），重发只会原样失败且掩盖真因；
+2. **abort 绝不重试** —— 用户点了停止还继续发是**不可接受**的行为；
+3. **真因在 `cause` 里** —— undici 把底层错误包成一句 `TypeError: fetch failed`，
+   判据必须**沿 `cause` 链**找；只读 `message` 会漏掉
+   `SELF_SIGNED_CERT_IN_CHAIN` / `UND_ERR_*` / `ECONNRESET`
+   （变异验证：改成只读 `message` ⇒ **4 条用例变红**）；
+4. **重试耗尽时抛最后一次的原错误对象** —— 保住 `cause` 链，真因仍可见
+   （换成自定义文案会让用户再也看不到「自签证书」这类唯一出路）。
+
+---
+
+## 三、真机验证（国际版可用性）
+
+⚠️ 提 PR 前必须说清一件事：**中途我曾把一次上游故障窗口误判为「国际站要求网关签名、
+不可用」**，并据此写下过错误结论。该结论**已被证伪**，原因与教训已写进
+`docs/agent-notes/providers-loomy-raccoon-minimax.md`：
+
+> 决定性证据是**官方客户端自己也连不上**（`Code: 50112` = 官方 mcode 的
+> `LLM_AUTH_ERROR` 枚举），且探针抓到的官方推理请求头**也只有 `Authorization: Bearer`**
+> —— 与本插件实现逐字相同。故障恢复后，同样的请求**全部 200**。
+
+改用真实国际站账号逐端点实测的结果：
+
+| 端点 | 结果 |
+|---|---|
+| `POST /mavis/api/v1/llm/v1/messages`（推理） | ✅ **200 + 真实 SSE**（认证只需 `Authorization: Bearer`） |
+| `GET /minimax-cloud/api/v1/signin/status`（签到） | ✅ **200**（真实签到面板） |
+| `GET /minimax-cloud/api/v1/credit/details`（积分） | ✅ **200**（真实余额） |
+| `GET /mavis/api/v1/models?region=en&buildEnv=prod`（目录） | ✅ **200**（4 个模型） |
+
+⇒ 国际站与国内站**协议同形**，「两站只差 6 个字段、共用实现」成立。
+
+⚠️ **但有一条判据必须记牢**：国际站的**目录端点当前是公开的**（无 token、垃圾 token
+都返回 200，与国内站不同）⇒ **「能看到模型列表」不构成凭据有效的证据**。
+凭据证据看**签到 / 积分 / 推理**三处。本 PR 的 e2e 探针把这一条写成了显式告警。
+
+---
+
+## 四、测试
+
+### 新增单测（37 条）
 
 | 文件 | 条数 | 覆盖 |
 |---|---|---|
-| `tests/unit/backup.spec.ts` | 46 | 选择性导出 / 三层判重 / `merge` 不回写其余凭据 / `replace` 兼容旧行为；其中 7 条专管身份字段覆盖度 |
-| `tests/unit/backup-payload.spec.ts` | 13 | 载荷裁剪（含「不修改入参」）与账号摘要 |
-| `tests/unit/backup-convert.spec.ts` | 28 | 第三方识别、iss 分派、确定性 id、字段对齐、坏条目降级 |
-| `tests/unit/account-pool.spec.ts` | +6 | `mergeAccounts`：只追加 / 跳过同 id / 不改黑名单与锁定 / 归一化坏条目 / 文件内重复只加一次 |
+| `tests/unit/minimax-intl.spec.ts` | 23 | 两站产品常量差异（含「除 6 个字段外逐字段相同」）、ref 前缀反查（含**超串前缀**经典坑）、登录 / 续期 / 目录 / 积分 / 推理**各自打对主机**、跨站实例隔离（「各刷各的实例」） |
+| `tests/unit/minimax-transport-retry.spec.ts` | 14 | 重试策略与**四条边界**（含 3 条反向断言：非传输错误不重试 / abort 不重试 / 认 `cause` 链） |
 
-已做反向验证（文件副本回拷 + `Get-FileHash` 比对还原）：禁用第 2 层身份判重 → 1 条变红；让 `merge` 回写 `payload.credentials` 全表 → 3 条变红；`mergeAccounts` 去掉文件内重复 id 去重 → 1 条变红；身份字段表退回只认 `user_id`/`uid` → 2 条变红；去掉匿名槽排除 → 1 条变红。
+### 扩展既有守卫（18 个文件，逐键点名国际版）
 
----
+⚠️ 光加新用例**守不住**上面那张接线表 —— 那些守卫是**既有的**「逐 provider 点名」
+型用例，本 PR 把国际版**加进它们的期望集合**：
 
-## 提交 2 / 2：`feat(account-pool): 限额账号自动沉底 —— 撞限额的号让位给额度未用完的号`
+`provider-registry` / `provider-registry-consumers` / `provider-runtime-wiring` /
+`refresh-bootstrap-wiring` / `jet-hub-rpc-auth-wiring` / `jet-hub-rpc-signature` /
+`credits-runtime-parity` / `claim-runtime-parity` / `credits-balance-self-heal` /
+`model-catalog-parity` / `credential-resolver` / `minimax-adapter` / `minimax-rpc` /
+`buddy-ratelimit-misreport` / `lobsterai-rpc-dispatch` / `zcode-wiring`
+＋ 两个 helper（`tests/helpers/provider-sets.ts` / `rpc-refresh.ts`）。
 
-### 为什么做
+**判别力说明**：这些用例的期望集合**从 `PROVIDER_REGISTRY` 派生或逐键枚举** ——
+少加一站的登记，它们会**变红**（这正是它们存在的意义）。本 PR 只改期望值、
+不改被测源码，故「全绿」在这里是**有意义的**（不是把断言放宽换来的）。
 
-每个账号的额度都有**使用期限**（资源包的 `DeductionEndTime`），而实际使用中「每次都轮不完」：
+### 新增 e2e 探针（有闸门，默认跳过）
 
-> 每个号的额度都有使用期限包，每次都轮不完。等限额号好了，因为排在前面又开始用刚好的限额号了，后面的号的额度就白白过期了。
+| 文件 | 说明 |
+|---|---|
+| `tests/e2e/minimaxintl-probe.e2e.spec.ts` | **只读**：目录 + 签到状态 + 积分余额（**不领取**） |
+| `tests/e2e/minimaxintl-claim-probe.e2e.spec.ts` | 真实领取签到积分（状态先行，已领则跳过，不白烧当天机会） |
 
-**根因**是取号逻辑与限额标记的交互。取号恒取「顺序里第一个可用账号」，于是：
+⚠️ 两个探针**刻意不硬断言**「恰好 4 个模型」：国际站远端模型集与国内站不同，
+硬断言会在上游调整模型时假红；判据只到「请求发出去了、并拿到了可解读的响应」，
+实际内容**打印**给人核对。
 
-1. 只要 1 号没撞限额，**全部流量压在它身上**；
-2. 等它撞了限额，才轮到 2 号顶上；
-3. 而等 1 号**解禁**，它仍排在最前，于是**立刻被捡回去**，2 号重新闲置。
+### 反向验证（变异必须变红）
 
-结果：2 号之后的账号可能一次都轮不到，额度直接作废。这不是「额度不够用」，而是**调度顺序**让额度用不出去。
-
-### 做了什么
-
-新增 `sinkAccountToProviderEnd()`：撞限额时把该号移到**本 provider 的末尾**，并写进权威顺序（与用户拖拽的 `reorderAccounts` 同一份）持久化。
-
-语义四条：
-
-1. **命中限额即沉到本 provider 末尾**；
-2. 下一个号撞限额时同样落到底部，原先被顶上来的号因此**自然整体上移一位**；
-3. **解禁只影响「是否被选号过滤」，没有任何回弹代码** —— 解禁账号留在末尾，不再抢回首位。这是本改动**真正的价值所在**：不在受限期间（受限号本来就被选号过滤掉，沉底对当下毫无影响），而在**解禁之后**；
-4. 由此形成**被动轮换**：靠「下沉 + 顺序上顶」自然让所有账号都轮到一遍。
-
-⚠️ **这是有意的取舍**：未实现真正的 round-robin 游标，也没有 `lastUsedAt` 字段。一个余额充足的号仍会一直霸占首位直到撞限额。若要改成主动轮转：① 别写 `reorderAccounts`（会覆盖用户手动顺序），应在选号时动态排序；② 并发取号要有游标；③ 需要一个持久化的 `lastUsedAt` 字段。
-
-### 三处必须记住的守卫（请重点审阅）
-
-- **沉底与「是否覆盖限流标记」解耦**：已有更长标记时标记不用改，但账号仍然受限、仍然该沉底。若只在覆盖分支里沉底，同一账号第二次撞限流就不沉底，行为变得难以解释。
-- ⚠️ **但必须确认「写完之后它真的处于受限态」**：调用方可能传来**已经过去**的解禁时刻（provider 的兜底值可能落在过去）。那时账号此刻是**可用**的，沉底就是错的 —— 用户会看到一个完全正常的号莫名掉到末尾，且 `getAvailableAccount`（已判它可用）与顺序（判它受限）互相矛盾。判据取**生效后的标记**（现值与新值中的较长者）是否仍在未来。
-- **跨 provider 隔离**：账号存在一个全局数组里（各 provider 混排）。沉底只在该 provider 原本占用的下标内重排，**其它 provider 的账号绝对位置完全不变** —— 否则整体挪到数组尾部会让「拖 buddy」顺带改变 CodeArts 账号的位置。
-
-### 开关
-
-`DSH_RATE_LIMIT_SINK`，**默认开启**。留这道逃生门是因为它改变了账号顺序的语义：用户手拖出来的顺序会被系统改写。设为 `0` 退回纯手动顺序。
-
-⚠️ **判据不能写成 `Boolean(env[...])`**：「未设置」与「显式关 `0`」必须区分开，否则会把默认开启变成默认关闭（与本项目 Qoder 排队超时等几处同型坑）。
-
-UI：账号卡片对受限账号显示「限额中」标记（说明「为什么它在下面」），面板说明文案补上沉底语义。
-
-### 测试
-
-`tests/unit/account-pool.spec.ts` 新增「限额账号自动沉底」一组（277 行）：
-
-- ★ 命中限额的账号被移到本 provider 末尾
-- ★ **解禁之后仍留在末尾（不回弹，后续账号才轮得到）**
-- ★ 连续限额形成轮转：a 受限沉底、接着 b 受限，a 才有机会被用
-- ★ 已有更长标记时标记不覆盖，但仍然沉底
-- ★ 解禁时刻已在过去时不沉底（该账号此刻其实是可用的）
-- ★ 现值更长且仍有效时，传入过期新值不得解除沉底
-- `sinkAccountToProviderEnd` 限定 provider 内沉底
-- `rateLimitSinkEnabled` 默认开启、显式关才关
-
-另：`tests/unit/trae-model-id-selection.spec.ts` 显式关掉沉底（`DSH_RATE_LIMIT_SINK=0`）。该文件两条用例靠「acct-A 排在首位」区分「传空串 = 忽略限流标记」与「传模型 = 过滤限流账号」；沉底会改写顺序使两条都选到 acct-B，于是两者无法区分、退化成同义反复。沉底与模型过滤是正交的两件事，已由上面那组单独覆盖，故在此隔离以保住该契约的判别力。
+| 变异 | 结果 |
+|---|---|
+| 去掉「只重试传输错误」闸门 | 1 条变红 |
+| 删掉 abort 判断 | 1 条变红 |
+| 判据改为只读顶层 `message`（不走 `cause` 链） | **4 条变红** |
 
 ---
 
-## 验证
-
-基于 `e73cd2f`（当前 `origin/master`）分支，本机实测：
+## 五、验证
 
 | 项 | 结果 |
 |---|---|
-| `npx tsc -p tsconfig.json --noEmit` | 通过 |
-| `pnpm build:all` | 通过（tsc / copy-assets / client 打包） |
-| 两个功能相关 5 个测试文件 | **260 条全绿** |
-| `pnpm test` 全量 | **6213 passed / 2 failed / 7 skipped** |
+| `tsc -p tsconfig.json --noEmit` | 通过 |
+| `tsc -p tsconfig.tests.json` | 通过 |
+| `pnpm test` 全量 | **8401 passed / 0 failed / 21 skipped** |
+| 国际版 e2e 探针（真机） | **4/4 通过** |
+| `pnpm build:all`（tsc + copy-assets + client 打包） | 通过 |
 
-⚠️ 那 **2 条失败与本 PR 无关**，且**在未合入本 PR 的 `origin/master`（`e73cd2f`）上同样失败、错误逐字相同**：`tests/unit/opencode-proxy-live.spec.ts` 的「HTTP 代理 / SOCKS5 真联通」两条，报 `TypeError: fetch failed ← InvalidArgumentError: invalid onRequestStart method` —— 本仓库装外部 `undici@8.11.2`，而 `fetch` 走 Node 24 内置 undici，该 spec 文件头「风险 R2」断言的正是这条跨实例 dispatcher 契约。属**环境性问题，非代码回归**（该 spec 文件与被测源码在本 PR 中均未改动）。
+⚠️ 全量测试的 `21 skipped` 是本仓库**既有的**按 provider 分列的 e2e 闸门（默认跳过），
+不是本 PR 引入的。
 
-## 说明
+---
 
-- 本 PR **不含**任何上游同步提交，只含这两个功能的净改动。
-- 未包含 `docs/agent-notes/` 里属于本地 fork 维护痕迹的「上游同步记录」等章节。
+## 六、说明
+
+- 本 PR 基于最新的 `origin/master`（已合并全部 13 个上游提交，无冲突遗留）。
+- 不含任何本机路径、用户名、凭据或 token —— 文档里出现的 `~/.minimax/auth/...`
+  一类均为**通用 Home 相对路径**。
+- `docs/agent-notes/providers-loomy-raccoon-minimax.md` 里同时登记了
+  本次的**误判与教训**（上面第三节），供后来者不要再走同一条弯路。

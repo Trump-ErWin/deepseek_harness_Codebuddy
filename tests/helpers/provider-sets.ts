@@ -263,6 +263,11 @@ export const WRITES_RATE_LIMIT_PROVIDERS: readonly string[] = Object.freeze([
   'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'cline',
   'zcode', 'trae', 'gemini', 'codearts', 'loomy', 'raccoon', 'opencode',
   'minimax',
+  // ⚠️ minimaxintl（MiniMax Code 国际版，2026-10-15）：与 `minimax` **共用同一个
+  //    `MinimaxAdapter` 类** ⇒ 它同样会写 `modelRateLimits`（额度 24h / 限流 1h）
+  //    ⇒ 必须同时进 `probeById` 与 `WRITES_RATE_LIMIT_PROVIDERS`，否则该站的
+  //    限流标记**写进去却永远清不掉**（用户点「重测」报「没有探测适配器」）。
+  'minimaxintl',
 ])
 
 /** **期望**注册进 `probeById` 的 provider id（会写标记 − {@link PROBE_EXEMPT}）。 */
