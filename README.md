@@ -1,4 +1,9 @@
-# dsh-codearts-auth
+# dsh-providers-hub
+
+> **本包原名 `dsh-codearts-auth`**（`0.2.0-rc.11` 起改名）。老用户的 DSH profile 里
+> 还锁着旧名时，**插件会加载失败并被自动禁用**（宿主报 `N entry did not activate`，
+> 界面里也就看不到它）—— 升级前先看
+> [⚠️ 从旧包名 `dsh-codearts-auth` 升级](#️-从旧包名-dsh-codearts-auth-升级)。
 
 > **使用声明**：本项目仅供学习研究使用，请遵守各服务提供方的服务条款。
 
@@ -38,10 +43,63 @@ deepseek-harness 插件：统一管理多个 AI 编程服务的账号，并把�
 
 该包尚未发布到 npm registry。提供两种安装方式。
 
+### ⚠️ 从旧包名 `dsh-codearts-auth` 升级
+
+本包在 `0.2.0-rc.11` 把包名从 `dsh-codearts-auth` 改成了 `dsh-providers-hub`。
+**仓库里改完了不代表你的机器上改完了** —— DSH 是在 **profile** 里按**包名字符串**
+寻址 bundle 的，而老 profile 两处都还写着旧名：
+
+```jsonc
+// ~/.dsh/profiles/<name>/package.json
+{
+  "dependencies": { "dsh-codearts-auth": "link:…" },   // ← 旧键
+  "dsh": { "profile": { "bundles": [ …, "dsh-codearts-auth" ] } }  // ← 旧项
+}
+```
+
+**两处必须一起改**，缺一处就是静默失效 —— 而且**「两处都不改」同样会坏**，
+只是坏的位置不同：
+
+| profile 里的状态 | 后果 |
+|---|---|
+| **两处都是旧名**（老 profile 的现状） | bundle 目录**解析得到**（`node_modules/dsh-codearts-auth` 这个旧名别名还在），但包里 patch 的加载行写的是**新包名**，而宿主把加载行的解析基准设成 **profile 目录** ⇒ 新名在那里解析不到（本机实测 `MODULE_NOT_FOUND`）⇒ **该加载行 import 失败** ⇒ 宿主报 `N entry did not activate`，桌面端落进恢复模式并把插件**自动禁用**（Jet Hub 界面自然也不出现，即 issue IKLUME 的症状） |
+| **只改 `dependencies`** | `dsh.profile.bundles[]` 里的旧名在 profile 里解析不到 ⇒ `resolveBundleDir()` 抛错 ⇒ 该 bundle 进 `skippedBundles` ⇒ **整个插件（连宿主侧）都不加载**，只在 stderr 留一行：无异常、无 UI 提示 |
+| **只改 `dsh.profile.bundles`** | 与上一格同因：`node_modules/` 里只有旧名，`bundles[]` 里的新名解析不到 ⇒ 同样进 `skippedBundles` |
+
+> **实测**（本机 `~/.dsh/profiles/web`）：`require.resolve('dsh-codearts-auth/package.json')`
+> 成功解析到仓库根，而 `require.resolve('dsh-providers-hub/package.json')` 报
+> `MODULE_NOT_FOUND`。宿主把加载行的解析基准设成 **profile 目录**
+> （`dsh-app-boot` 对 patch 行调 `prepareProfilePatches(…, pathToFileURL(dirname(absoluteConfigPath))…)`，
+> 同一个值也是 `boot()` 里 `ctx.baseUrl` 的来源），所以「旧名能解析」与「新名解析不到」
+> 会**同时**成立 —— 这正是第一格的判断依据是**按名字解析**、而不是「目录在不在」的原因。
+>
+> ⚠️ 第一格的落点**不在客户端**：宿主**不会**替用户把这种行摘掉 —— `preflight()`
+> 只在「兼容性冲突」时 deny 一行，其余失败**保留 cordis Loader 自己的诊断**
+> （源码注释：*every other failure keeps the Loader's own diagnosis*），于是该行走进
+> Loader 并**在宿主这一侧导入失败**。所以排障的第一现场是宿主日志里的
+> `N entry did not activate` 与「插件已被禁用」，不是「宿主一切照常、只是客户端
+> entry 没建立」——后者会让排查方向整个偏到前端产物上去。
+
+推荐做法是**不要手改**，直接用 `dsh plugin --profile <name>` 的 `remove` / `add`
+各走一遍，让工具自己写这两处：
+
+```sh
+dsh plugin --profile <name> remove dsh-codearts-auth
+dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codearts.git"
+```
+
+⚠️ `<name>` 要**逐个 profile 走一遍**：本机 `~/.dsh/profiles/` 下的 `desktop` /
+`headless` / `tui` / `web` 四个 profile 的 `package.json` **都**还锁着旧名，且
+`dsh.profile.bundles` 里也都有它。只有既无依赖项也无 `node_modules` 的 profile
+（如 `default` / `rescue`）可以跳过。
+
+⚠️ 老版本可能残留 `node_modules/dsh-codearts-auth` 与 `pnpm-lock.yaml` 里的同名
+依赖项；`add` 之后确认 profile 里不再有旧名的依赖键。
+
 ### 方式一：从 git 仓库安装（推荐）
 
-`add` 以 `git+https` 方式安装，pnpm 会运行本包的 `prepare` 脚本自动构建 `lib/`，
-无需手动 `pnpm build`。
+`add` 以 git 仓库方式安装（pnpm 内部走 `git+https:` 协议），会运行本包的 `prepare`
+脚本自动构建 `lib/`，无需手动 `pnpm build`。
 
 ⚠️ pnpm 10 起会拦截依赖的构建脚本，必须先在 profile 的 `pnpm-workspace.yaml`
 （路径形如 `~/.dsh/profiles/<name>/pnpm-workspace.yaml`）里放行；而**放行键的写法
