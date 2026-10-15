@@ -774,6 +774,10 @@ describe('★ 接线层：apply() 出来的真实闭包（替代源码文本断�
     // 的**纯池选号**分支、无余额分档），故账本分支**可达**，必须进名单 ——
     // 漏了它，「删掉 accio 注册项里的 `reportAccount`」不会让任何用例变红。
     'accio',
+    // ⚠️ minimaxintl（2026-10-15）：与 `minimax` 同形（同一工厂、同一分支），
+    // 故账本分支**可达**，必须进名单 —— 漏了它，删掉它注册项里的
+    // `reportAccount` 不会让任何用例变红。
+    'minimaxintl',
   ] as const
 
   /** 有 `reportAccount` 注册项、但账本分支结构上不可达的两家（见上）。 */
@@ -797,6 +801,9 @@ describe('★ 接线层：apply() 出来的真实闭包（替代源码文本断�
     loomy: 'LOOMY',
     raccoon: 'RACCOON',
     minimax: 'MINIMAX',
+    // ⚠️ 国际站的常量名带下划线（`MINIMAX_INTL`），与 id `minimaxintl` 不同形 ——
+    //    与本表其余项同因，不能靠 `p.toUpperCase()` 推。
+    minimaxintl: 'MINIMAX_INTL',
     gemini: 'GEMINI',
     officeace: {} as never,
     zcode: 'ZCODE',
@@ -805,7 +812,8 @@ describe('★ 接线层：apply() 出来的真实闭包（替代源码文本断�
 
   it('⚠️ 账本名单自检：覆盖全部可驱动的 provider，且不可达的那两家被显式登记', () => {
     // 名单为空时 `it.each` 一条都不跑 ⇒ 整组恒绿。这条把该形态钉死。
-    expect(LEDGER_PROVIDERS.length).toBe(11)
+    // ⚠️ 2026-10-15 加 minimaxintl：11 → 12。
+    expect(LEDGER_PROVIDERS.length).toBe(12)
     for (const p of LEDGER_UNREACHABLE) {
       expect(LEDGER_PROVIDERS, `${p} 已可达 ⇒ 应把它补进账本名单`).not.toContain(p as never)
     }

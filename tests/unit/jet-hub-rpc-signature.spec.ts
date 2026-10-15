@@ -83,6 +83,9 @@ describe('registerJetHubRpc：auths 是命名对象（类型层守卫）', () =>
       loomy: stub,
       raccoon: stub,
       minimax: stub,
+      // ⚠️ MiniMax Code 国际版：与 `minimax` 共用同一个 auth 类，是两个 provider
+      //（账号不互通、API 主机不同）⇒ `JetHubAuths` 必须各占一个键。
+      minimaxintl: stub,
       zcode: stub,
       gemini: stub,
       officeace: {} as never,

@@ -485,6 +485,10 @@ const BALANCE_PATH_OF: Readonly<Record<string, string>> = {
   loomy: '/points/records',
   raccoon: '/balance',
   minimax: MINIMAX_CREDIT_DETAILS_PATH,
+  // ⚠️ minimaxintl 与 `minimax` **同一条路径片段**（两站端点同形、只差主机）——
+  //    本清单守的是「请求发到了这家自己的余额端点」，路径相同不影响判别力
+  //    （主机由 `MINIMAX_INTL.apiHost` 决定，由 `minimax-intl.spec.ts` 专门断言）。
+  minimaxintl: MINIMAX_CREDIT_DETAILS_PATH,
   zcode: '/api/v1/zcode-plan/billing/balance',
   gemini: GEMINI_QUOTA_PATH,
   // ⚠️ accio 的**必需**端点是 currentSubscription（三类积分桶）；
@@ -568,7 +572,7 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     ).toEqual(expected)
     // 反向：确认上面那圈里真的既有 true 也有特例，否则断言可能恒真。
     expect(PROVIDER_REGISTRY.some((d) => d.credits.balance !== true)).toBe(true)
-    expect(expected.length).toBe(12)
+    expect(expected.length).toBe(13)
     // ⚠️ **关键集合判据必须对「生产真正调用的那种形态」也成立**（2026-10-08 复审 C1）：
     //    上面那次是 `createProviderCredits()`（无 deps），而端点与 `index.ts` 调的
     //    都是 `createProviderCredits({ loomy, raccoon, zcode })`。deps 只应影响**实现**，
@@ -595,18 +599,20 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     }
   })
 
-  it('★ fetchStatus 只登记在**真有**同构状态端点的渠道上（buddy 系 + minimax）', () => {
-    // ⚠️ 写死这三家是**有意**的：其余渠道（codearts / lobsterai / trae / cline /
+  it('★ fetchStatus 只登记在**真有**同构状态端点的渠道上（buddy 系 + minimax 两站）', () => {
+    // ⚠️ 写死这几家是**有意**的：其余渠道（codearts / lobsterai / trae / cline /
     //    loomy）**没有**与 `CheckinStatus` 同构的状态端点 —— 给它们补一个
     //    `fetchStatus` 会让 `credits.status` 从「如实 null」变成「臆造
     //    `{streakDays: 0}`」，面板于是显示「连续 0 天」这种**看起来像真实读数**
     //    的假数据。故本清单变更时必须人工复核。
+    // ⚠️ 2026-10-15：minimaxintl 与 `minimax` **共用同一个状态端点形状**
+    //    （只差主机），故它同样登记（漏了它 ⇒ 国际站面板的签到状态恒 null）。
     const table = createProviderCredits()
     const withStatus = Object.entries(table)
       .filter(([, impl]) => impl.fetchStatus !== undefined)
       .map(([id]) => id)
       .sort()
-    expect(withStatus).toEqual(['buddy', 'minimax', 'workbuddy'])
+    expect(withStatus).toEqual(['buddy', 'minimax', 'minimaxintl', 'workbuddy'])
   })
 
   it('★ 余额查询优先走**传入的 auth 实例**（它可能带注入的 fetchImpl）', async () => {

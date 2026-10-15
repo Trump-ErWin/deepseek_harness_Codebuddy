@@ -1278,7 +1278,11 @@ function UsageBadgeActive(props) {
           type: 'button',
           className: 'dim-jh-badgeAction',
           disabled: claiming !== null,
-          title: `串行签到全部支持签到的渠道（9 个；WorkBuddy 国际版 / Cline / Raccoon 后端没有签到接口）${auto?.enabled === true ? '；自动签到已开启，每天首次启动 DSH 时会自动执行一次' : ''}`,
+          // ⚠️ 渠道数是**从能力表数出来的快照**（`registry.credits.dailyCheckin === true`
+          // 的家数）—— 加一个支持签到的渠道就必须改这里。
+          // 2026-10-16 合并审计发现：加 `minimaxintl` 后能力表已 9 → **10**，
+          // 而此处仍写 9（**零守卫**：全仓没有断言这个数字的用例）。
+          title: `串行签到全部支持签到的渠道（10 个；WorkBuddy 国际版 / Cline / Raccoon 后端没有签到接口）${auto?.enabled === true ? '；自动签到已开启，每天首次启动 DSH 时会自动执行一次' : ''}`,
           onClick: () => { void onClaimAll(); },
         }, allBusy
           ? (claimProgress === null ? '签到中…' : `签到中 ${claimProgress.done}/${claimProgress.total}…`)

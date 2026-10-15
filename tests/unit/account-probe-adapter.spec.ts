@@ -756,32 +756,56 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline / zcode 不�
    * `Object.keys(entry.modelRateLimits)`，没有标记时它**根本不构造适配器**
    * ⇒ 用例会变成假绿。
    */
-  it('minimax 账号走 MinimaxAdapter，而非 CodeArtsAdapter', async () => {
-    const calls = stubFetch()
-    const { retestAccount } = await import('../../src/account-probe.js')
-    const id = 'minimax-1'
-    const credentialRef = 'MINIMAX_ACCOUNT_TEST'
-    const result = await retestAccount(makePool([makeEntry({
-      id,
-      provider: 'minimax',
-      credentialRef,
-      // ⚠️ 没标记 ⇒ 不构造适配器 ⇒ 用例假绿。
-      modelRateLimits: { 'some-model': Date.now() + 3_600_000 },
-    })]), id)
+  /**
+   * ★★ **MiniMax 两站：各自都要走自己的产品配置**（2026-10-16 合并审计补齐）。
+   *
+   * ⚠️ 本用例原先**只覆盖 `minimax`**，而两站共用同一个 `MinimaxAdapter` 类 ——
+   * `probeById` 里的两个条目只差 `product`。合并审计**实测**：把
+   * `probeById.minimaxintl` 的 `product: MINIMAX_INTL` 改成 `MINIMAX`，
+   * **全量 8416 条测试仍然全绿** ⇒ 「用错主机发探测请求」这个失效形态**零守卫**。
+   * 后果与 issue IKJW32 同型且**完全静默**：国际站账号点「重测」会把凭据发到
+   * `agent.minimax.cn` ⇒ 必然 401 ⇒ 该账号的限流/额度标记**永远清不掉**，
+   * 用户只看到「重测」没反应。
+   *
+   * ⚠️ 判据必须是 `product.id`，不能只断言「构造了一个适配器」——
+   * 两个条目差的就是这个字段，只断言「构造了」会让 `it.each` 的两格**都绿**。
+   */
+  it.each([
+    { provider: 'minimax', credentialRef: 'MINIMAX_ACCOUNT_TEST', label: '中国版' },
+    { provider: 'minimaxintl', credentialRef: 'MINIMAXINTL_ACCOUNT_TEST', label: '国际版' },
+  ])('$provider（MiniMax Code $label）账号走自己的适配器**与自己的产品配置**，而非 CodeArtsAdapter',
+    async ({ provider, credentialRef }) => {
+      const calls = stubFetch()
+      const { retestAccount } = await import('../../src/account-probe.js')
+      const id = `${provider}-1`
+      // ⚠️ 桩的 `instances` 是**跨用例累积**的静态数组（本文件不在用例间清空它）
+      //    ⇒ 只统计本格**新增**的那条。否则 `it.each` 的第二格会看到第一格留下的
+      //    实例，`toHaveLength(1)` 变成假红。
+      const seenBefore = (await minimaxInstances()).length
 
-    expect(result.tested).toBe(1)
-    expect(result.stillLimited).toHaveLength(1)
+      const result = await retestAccount(makePool([makeEntry({
+        id,
+        provider,
+        credentialRef,
+        // ⚠️ 没标记 ⇒ 不构造适配器 ⇒ 用例假绿。
+        modelRateLimits: { 'some-model': Date.now() + 3_600_000 },
+      })]), id)
 
-    const instances = await minimaxInstances()
-    expect(instances, 'minimax 没有构造自己的适配器').toHaveLength(1)
-    expect(instances[0]?.product?.id).toBe('minimax')
-    // ⚠️ 凭据 ref 必须被**原样透传**（取错 ref 会让适配器去读别家凭据）。
-    expect(instances[0]?.credentialRef).toBe(credentialRef)
-    // 核心断言：**没有**构造 CodeArtsAdapter（否则就是用华为云签名发 minimax 凭据）。
-    expect(await codeartsInstances()).toHaveLength(0)
-    // 桩适配器在构造后立刻抛错，故不该有任何真实请求发出。
-    expect(calls).toHaveLength(0)
-  })
+      expect(result.tested).toBe(1)
+      expect(result.stillLimited).toHaveLength(1)
+
+      const instances = (await minimaxInstances()).slice(seenBefore)
+      expect(instances, `${provider} 没有构造自己的适配器`).toHaveLength(1)
+      // ⚠️⚠️ **本用例的核心断言**：产品配置必须是它**自己那一站**。
+      //    写成另一站 ⇒ 探测请求打错主机 ⇒ 必然 401 ⇒ 标记永不清除（静默失效）。
+      expect(instances[0]?.product?.id).toBe(provider)
+      // ⚠️ 凭据 ref 必须被**原样透传**（取错 ref 会让适配器去读别家凭据）。
+      expect(instances[0]?.credentialRef).toBe(credentialRef)
+      // 核心断言：**没有**构造 CodeArtsAdapter（否则就是用华为云签名发 minimax 凭据）。
+      expect(await codeartsInstances()).toHaveLength(0)
+      // 桩适配器在构造后立刻抛错，故不该有任何真实请求发出。
+      expect(calls).toHaveLength(0)
+    })
 
   /**
    * ★★ **opencode：第 6 次同型缺陷的事主**（2026-10-08 第二轮补齐）。

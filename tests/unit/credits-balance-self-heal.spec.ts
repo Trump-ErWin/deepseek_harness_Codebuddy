@@ -645,6 +645,9 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     CLINE: 'cline', RACCOON: 'raccoon', MINIMAX: 'minimax', GEMINI: 'gemini',
     OFFICEACE: 'officeace',
     ACCIO: 'accio',
+    // ⚠️ MiniMax Code 国际版（2026-10-15）：常量名带下划线，与 id 不同形 ——
+    //    与本表其余项同因（不能靠 `p.toUpperCase()` 推）。
+    MINIMAX_INTL: 'minimaxintl',
   }
 
   /**
@@ -664,13 +667,13 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     expect(literals.slice().sort()).toEqual(['buddy', 'codearts', 'workbuddy'])
   })
 
-  it('★ Set 里的 `.id` 常量恰好是那十家（逐家点名，不写魔数阈值）', () => {
+  it('★ Set 里的 `.id` 常量恰好是那十一家（逐家点名，不写魔数阈值）', () => {
     // ⚠️ 逐家列举而不是 `expect(constants.length).toBeGreaterThanOrEqual(10)` ——
     // 后者在「删掉 trae、加上一个假的」时**仍然通过**，正是审计实测的漏报形态。
     const { constants } = selfHealSetParts()
     expect(constants.slice().sort()).toEqual([
-      'ACCIO', 'CLINE', 'GEMINI', 'LOBSTERAI', 'MINIMAX', 'OFFICEACE', 'QODER', 'QODER_CN',
-      'RACCOON', 'TRAE',
+      'ACCIO', 'CLINE', 'GEMINI', 'LOBSTERAI', 'MINIMAX', 'MINIMAX_INTL',
+      'OFFICEACE', 'QODER', 'QODER_CN', 'RACCOON', 'TRAE',
     ])
   })
 
@@ -679,7 +682,7 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
     expect([...inSet].sort()).toEqual([
       'accio', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'minimax',
-      'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy',
+      'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy',
     ])
     // 反向：两家没有 refresh 端点，必须**静默跳过**而非尝试续期。
     expect(inSet.has('loomy')).toBe(false)
