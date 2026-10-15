@@ -258,9 +258,9 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
       install()
       expect(styleTags(), '应恰好注入 1 条样式标签').toHaveLength(1)
       // ⚠️ 核心断言：无主标签会被 claimStyles 认领给**当前物化的那个插件**。
-      expect(owners(), 'data-plugin 必须是自己，不能是 null（无主）').toEqual(['dsh-codearts-auth'])
+      expect(owners(), 'data-plugin 必须是自己，不能是 null（无主）').toEqual(['dsh-providers-hub'])
       // 资源标识（供宿主 claimStyles 回读做 inventory）
-      expect(styleTags()[0]!.getAttribute('data-plugin-css')).toBe('dsh-codearts-auth/jet-hub.css')
+      expect(styleTags()[0]!.getAttribute('data-plugin-css')).toBe('dsh-providers-hub/jet-hub.css')
       // 内容确实是那张全套 .dim-jh-* 样式表
       expect(styleTags()[0]!.textContent).toContain('.dim-jh-page')
     })
@@ -283,6 +283,33 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
     expect(bundle).toContain(`id: ${JSON.stringify(loaderId)}`)
   })
 
+  it('⚠️ 注册 id 必须等于包名 —— 宿主按「加载行名 = 包名」建 client entry', () => {
+    // 上面那条只锁住「PLUGIN_ID ⇄ loaderId 两边一致」，锁不住**它们是什么**。
+    // 上游把包名从 `dsh-codearts-auth` 改成 `dsh-providers-hub`（0.2.0-rc.11）
+    // 时正是从这个缝里漏过去的：两边一起留在旧名上，16 条用例全绿，而宿主侧
+    // `ClientModuleRegistry` 仍按包名建 entry（`compose()` 的 entry.id 取自加载
+    // 行的包名）—— 于是前端产物注册 `dsh-codearts-auth`、宿主找 `dsh-providers-hub`，
+    // 该 entry 永远 import 不到，启动即 `N entry did not activate`，桌面端直接
+    // 落进恢复模式并把插件自动禁用。
+    //
+    // 判据取**包名**而不是写死某个字面量：这样再改名时，这条用例会强制两边一起改。
+    const manifest = JSON.parse(readFileSync(resolve(REPO_ROOT, 'package.json'), 'utf8')) as { name?: unknown }
+    const packageName = manifest.name
+    expect(packageName, '未能从 package.json 读到包名').toBeTruthy()
+
+    const build = readFileSync(resolve(REPO_ROOT, 'plugin-src/client/build.mjs'), 'utf8')
+    const styles = readFileSync(resolve(REPO_ROOT, 'plugin-src/client/jet-hub-styles.js'), 'utf8')
+    const loaderId = /const loaderId = '([^']+)'/.exec(build)?.[1]
+    const pluginId = /const PLUGIN_ID = '([^']+)'/.exec(styles)?.[1]
+    expect(loaderId, 'build.mjs 的 loaderId 必须等于 package.json 的包名').toBe(packageName)
+    expect(pluginId, 'jet-hub-styles.js 的 PLUGIN_ID 必须等于 package.json 的包名').toBe(packageName)
+
+    // 产物是「已构建」的那一份；对不上就说明忘了重跑 build:client。
+    const bundle = readFileSync(resolve(REPO_ROOT, 'lib/client/jet-hub.js'), 'utf8')
+    expect(bundle, 'lib/client/jet-hub.js 的注册 id 必须等于包名（改完要重跑 pnpm build:client）')
+      .toContain(`id: ${JSON.stringify(packageName)}`)
+  })
+
   it('⚠️ 别的插件认领时认不到它、回收时也删不掉它（缺陷本体）', async () => {
     for (const { label, host } of hosts) {
       await withDom(async () => {
@@ -290,7 +317,7 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
         install()
         // 别的插件物化：宿主 materialize 里 factory 之后的 claimStyles
         host.claimStyles('dsh-better-sidebar')
-        expect(owners(), `[${label}] 别的插件不得把它认领走`).toEqual(['dsh-codearts-auth'])
+        expect(owners(), `[${label}] 别的插件不得把它认领走`).toEqual(['dsh-providers-hub'])
         // 那个插件 revision 变化 / 被 prune / 被禁用 ⇒ removeOwnedStyles
         host.removeOwnedStyles('dsh-better-sidebar')
         expect(styleTags(), `[${label}] 别的插件回收后样式必须幸存`).toHaveLength(1)
@@ -309,7 +336,7 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
       // 宿主 reconcile 再次 apply —— **同一个模块实例**（真实运行时 factory 不重跑）
       install()
       expect(styleTags(), '再次 apply 必须补注（旧实现的模块级 injected 布尔会在此失败）').toHaveLength(1)
-      expect(owners()).toEqual(['dsh-codearts-auth'])
+      expect(owners()).toEqual(['dsh-providers-hub'])
     })
   })
 
@@ -325,7 +352,7 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
       other.dataset.plugin = 'dsh-better-sidebar'
       document.head.appendChild(other)
       noopDispose()
-      expect(owners(), '空 disposer 不得误删任何已存在的样式').toEqual(['dsh-codearts-auth', 'dsh-better-sidebar'])
+      expect(owners(), '空 disposer 不得误删任何已存在的样式').toEqual(['dsh-providers-hub', 'dsh-better-sidebar'])
     })
   })
 
@@ -339,20 +366,20 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
       other.dataset.plugin = 'dsh-better-sidebar'
       other.textContent = '.dim-sb{}'
       document.head.appendChild(other)
-      expect(owners()).toEqual(['dsh-codearts-auth', 'dsh-better-sidebar'])
+      expect(owners()).toEqual(['dsh-providers-hub', 'dsh-better-sidebar'])
 
       dispose()
       // ⚠️ 核心：只能删自己那张（改成「删所有 style[data-plugin]」的实现在此失败）
       expect(owners(), 'disposer 不得误删别的插件的样式').toEqual(['dsh-better-sidebar'])
 
       install()
-      expect(owners(), 'dispose 后再 install 应能重新注入，且不干扰别人的').toEqual(['dsh-better-sidebar', 'dsh-codearts-auth'])
+      expect(owners(), 'dispose 后再 install 应能重新注入，且不干扰别人的').toEqual(['dsh-better-sidebar', 'dsh-providers-hub'])
     })
   })
 
   it('本插件自身热重载（宿主 replace 顺序）不引入回归', async () => {
     await withDom(async () => {
-      const OWN = 'dsh-codearts-auth'
+      const OWN = 'dsh-providers-hub'
       let install = await loadInstaller()
       install()
       // replace(自己)：tearDownEntryFiber → removeOwnedStyles(自己) → import（factory 重跑）→ apply
@@ -473,7 +500,7 @@ describe('Jet Hub 样式表：引用计数与渲染期自愈（IKKGYN）', () =>
       expect(styleTags()).toHaveLength(1)
 
       // 宿主 replace 时序：removeOwnedStyles(自己) → 新 factory 重跑 → 新 apply
-      inlineBehavior.removeOwnedStyles('dsh-codearts-auth')
+      inlineBehavior.removeOwnedStyles('dsh-providers-hub')
       expect(styleTags()).toHaveLength(0)
       install() // 新实例注入了一张**新**标签
       expect(styleTags(), '新实例应注入一张新标签').toHaveLength(1)
@@ -541,7 +568,7 @@ describe('Jet Hub 样式表：引用计数与渲染期自愈（IKKGYN）', () =>
 
       expect(ensure(), 'ensure 必须报告「补了一次」').toBe(true)
       expect(styleTags(), '渲染期自愈必须补回样式表').toHaveLength(1)
-      expect(owners(), '补回的表仍须署名（否则又会被认领走）').toEqual(['dsh-codearts-auth'])
+      expect(owners(), '补回的表仍须署名（否则又会被认领走）').toEqual(['dsh-providers-hub'])
 
       // 幂等：已在场时不得重复注入
       expect(ensure(), '已在场时必须返回 false（不重复注入）').toBe(false)
@@ -553,20 +580,20 @@ describe('Jet Hub 样式表：引用计数与渲染期自愈（IKKGYN）', () =>
     await withDom(async () => {
       // 精确复刻 IKK764 旧 disposer 的语义
       const install = () => {
-        const existing = document.head.querySelector('style[data-plugin-css="dsh-codearts-auth/jet-hub.css"]')
+        const existing = document.head.querySelector('style[data-plugin-css="dsh-providers-hub/jet-hub.css"]')
         if (existing !== null) return () => {}
         const style = document.createElement('style')
-        style.dataset.plugin = 'dsh-codearts-auth'
-        style.dataset.pluginCss = 'dsh-codearts-auth/jet-hub.css'
+        style.dataset.plugin = 'dsh-providers-hub'
+        style.dataset.pluginCss = 'dsh-providers-hub/jet-hub.css'
         style.textContent = '.dim-jh-page{}'
         document.head.appendChild(style)
         return () => {
-          document.head.querySelector('style[data-plugin-css="dsh-codearts-auth/jet-hub.css"]')?.remove()
+          document.head.querySelector('style[data-plugin-css="dsh-providers-hub/jet-hub.css"]')?.remove()
         }
       }
       const oldDispose = install()
       const oldTag = styleTags()[0]!
-      inlineBehavior.removeOwnedStyles('dsh-codearts-auth')
+      inlineBehavior.removeOwnedStyles('dsh-providers-hub')
       install()
       const newTag = styleTags()[0]!
       expect(newTag).not.toBe(oldTag)

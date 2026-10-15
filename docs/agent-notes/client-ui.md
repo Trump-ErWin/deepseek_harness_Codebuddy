@@ -2671,7 +2671,7 @@ fallback**（宁可取不到值时背景异常、能一眼看出，也不要一�
 本机实测 `dshmarket` / `dsh-rewind-plugin` 都写了 `tag.dataset.plugin`）：
 
 ```js
-const PLUGIN_ID = 'dsh-codearts-auth'          // = build.mjs 的 loaderId
+const PLUGIN_ID = 'dsh-providers-hub'          // = build.mjs 的 loaderId（必须等于包名）
 const STYLE_TAG_ID = PLUGIN_ID + '/jet-hub.css'
 const STYLE_SELECTOR = 'style[data-plugin-css=' + JSON.stringify(STYLE_TAG_ID) + ']'
 
@@ -2688,7 +2688,7 @@ export function installJetHubStyles() {
 
 ⚠️⚠️ **`PLUGIN_ID` 必须等于 `build.mjs` 的 `loaderId`**：宿主用的 `ownerId` 是
 `stripClientSuffix(registration.id)`，而 `registration.id` 就是构建脚本注入的 `loaderId`
-（本插件产物顶部 `window.__ModuleLoader__.load({ id: "dsh-codearts-auth", ... })`）。
+（本插件产物顶部 `window.__ModuleLoader__.load({ id: "dsh-providers-hub", ... })`）。
 两边不一致时署名等于没署（`removeOwnedStyles('真实 id')` 删不到我们、
 `claimStyles` 也认不走）——代价是**它永远无主，缺陷原样复发**。
 `tests/unit/jet-hub-styles-ownership.spec.ts` 有一条用例逐字比对这两处。
@@ -2698,7 +2698,7 @@ export function installJetHubStyles() {
 接线，一次触发 3 条红）。故 `STYLE_TAG_ID` / `STYLE_SELECTOR` 一律用 `+` 拼接。
 
 ⚠️ **不需要 MutationObserver**：署名之后，唯一还能删掉这条标签的是
-`removeOwnedStyles('dsh-codearts-auth')`，它只出现在两条路径 ——
+`removeOwnedStyles('dsh-providers-hub')`，它只出现在两条路径 ——
 `replace(自己)`（factory **必然重跑**，DOM 存在性判断随之复位）与
 `prune`（此时本插件已不在模块图里，删样式是**正确**行为）。「DOM 存在性判断」已覆盖。
 
