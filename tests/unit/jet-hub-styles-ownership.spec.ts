@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { locateHostClient } from './dsh-host-client.js'
 
 /**
  * Jet Hub 样式表**归属与自愈**的回归测试（Gitee issue IKK764）。
@@ -43,44 +44,15 @@ const REPO_ROOT = resolve(HERE, '../..')
 const require = createRequire(import.meta.url)
 
 /**
- * 定位宿主的 `@deepseek-ai/dsh-client-modules/lib/client.js`。
+ * 包名 = 插件身份的唯一真源（issue IKLUME）。
  *
- * 搜索顺序（命中即返回）：
- * ① 本仓库的依赖树（`require.resolve`）—— DSH 被装成依赖时的常规路径；
- * ② **运行本测试的那个 node 的全局 `node_modules`**（`dirname(process.execPath)/node_modules`）
- *    —— DSH 以 `npm i -g @deepseek-ai/dsh` 安装时它是 `@deepseek-ai/dsh` 的嵌套依赖；
- * ③ 用户 profile 里随 DSH 装进来的那一份。
- *
- * 顺带说明：**不要**把它写成静态 import —— 依赖不存在时会在收集阶段变成
- * Failed Suite（`cline-icon.spec.ts` 的文件头记过这个教训）。
+ * ⚠️ 本文件的断言一律以它为准，**不要再写死字面量**：原先这里有 14 处硬编码
+ * 包名，它们与 `package.json` **同值** ⇒ 在「包名改了、源码停在旧名」这类失效里
+ * 一条都帮不上忙（只证明测试与 `package.json` 一致），真正有牙的判据被淹没在
+ * 噪声里。判据从包名派生后，「再次改名」会强制所有断言一起跟着走。
+ * ⚠️ 但这只是**约定**：把它改回字面量不会被任何用例发现（2026-10 审计 F7）。
  */
-function locateHostClient(): string | null {
-  const candidates: string[] = []
-  const nested = 'node_modules/@deepseek-ai/dsh-client-modules/lib/client.js'
-  // ① 本仓库依赖树
-  for (const spec of ['@deepseek-ai/dsh-client-modules/package.json', '@deepseek-ai/dsh/package.json']) {
-    try {
-      const pkg = require.resolve(spec)
-      candidates.push(resolve(dirname(pkg), 'lib/client.js'))
-      candidates.push(resolve(dirname(pkg), nested))
-    } catch {
-      // 未安装，继续找别的位置
-    }
-  }
-  // ② 全局安装（DSH 的常见形态：npm i -g @deepseek-ai/dsh）
-  const globalRoot = resolve(dirname(process.execPath), 'node_modules')
-  candidates.push(resolve(globalRoot, '@deepseek-ai/dsh-client-modules/lib/client.js'))
-  candidates.push(resolve(globalRoot, '@deepseek-ai/dsh', nested))
-  // ③ 用户 profile（本插件实际运行时的邻居）
-  const home = process.env.USERPROFILE ?? process.env.HOME
-  if (home) {
-    const dshHome = process.env.DSH_HOME ?? resolve(home, '.dsh')
-    for (const profile of ['web', 'desktop', 'tui', 'headless', 'default']) {
-      candidates.push(resolve(dshHome, `profiles/${profile}/${nested}`))
-    }
-  }
-  return candidates.find(p => existsSync(p)) ?? null
-}
+const PACKAGE_ID = (JSON.parse(readFileSync(resolve(REPO_ROOT, 'package.json'), 'utf8')) as { name: string }).name
 
 interface StyleHost {
   claimStyles: (id: string) => string[]
@@ -258,58 +230,40 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
       install()
       expect(styleTags(), '应恰好注入 1 条样式标签').toHaveLength(1)
       // ⚠️ 核心断言：无主标签会被 claimStyles 认领给**当前物化的那个插件**。
-      expect(owners(), 'data-plugin 必须是自己，不能是 null（无主）').toEqual(['dsh-providers-hub'])
+      expect(owners(), 'data-plugin 必须是自己，不能是 null（无主）').toEqual([PACKAGE_ID])
       // 资源标识（供宿主 claimStyles 回读做 inventory）
-      expect(styleTags()[0]!.getAttribute('data-plugin-css')).toBe('dsh-providers-hub/jet-hub.css')
+      expect(styleTags()[0]!.getAttribute('data-plugin-css')).toBe(`${PACKAGE_ID}/jet-hub.css`)
       // 内容确实是那张全套 .dim-jh-* 样式表
       expect(styleTags()[0]!.textContent).toContain('.dim-jh-page')
+      // ⚠️ PLUGIN_ID 的正确定义 = 「宿主拿**包名**当 ownerId 时认得出它」。
+      // 判据只打在这里（注入结果 + 宿主回读），不打在源码里的那个字面量上 ——
+      // 否则改写成从别处派生就会被误判为红（见下方被删正则用例的说明）。
+      expect(hosts[0]!.host.claimStyles(PACKAGE_ID), '宿主按包名认领时 inventory 必须非空')
+        .toEqual([`${PACKAGE_ID}/jet-hub.css`])
     })
   })
 
-  it('注入的包 id 必须与构建脚本的 loaderId 一致（宿主 ownerId 同源）', () => {
-    // ⚠️ `data-plugin` 的取值必须 == `stripClientSuffix(registration.id)`，
-    // 而 registration.id 就是 build.mjs 的 loaderId。两边不一致时署名等于没署
-    // （宿主 removeOwnedStyles('真实 id') 删不到我们，claimStyles 也认不走）
-    // —— 代价是它永远无主，缺陷原样复发。
-    const source = readFileSync(resolve(REPO_ROOT, 'plugin-src/client/jet-hub-styles.js'), 'utf8')
-    const build = readFileSync(resolve(REPO_ROOT, 'plugin-src/client/build.mjs'), 'utf8')
-    const loaderId = /const loaderId = '([^']+)'/.exec(build)?.[1]
-    const pluginId = /const PLUGIN_ID = '([^']+)'/.exec(source)?.[1]
-    expect(loaderId, '未能从 build.mjs 读到 loaderId').toBeTruthy()
-    expect(pluginId, '未能从 jet-hub-styles.js 读到 PLUGIN_ID').toBeTruthy()
-    expect(pluginId, 'PLUGIN_ID 必须与 build.mjs 的 loaderId 逐字一致').toBe(loaderId)
-    // 构建产物的注册 id 也必须同源（防止手改产物）
-    const bundle = readFileSync(resolve(REPO_ROOT, 'lib/client/jet-hub.js'), 'utf8')
-    expect(bundle).toContain(`id: ${JSON.stringify(loaderId)}`)
-  })
-
-  it('⚠️ 注册 id 必须等于包名 —— 宿主按「加载行名 = 包名」建 client entry', () => {
-    // 上面那条只锁住「PLUGIN_ID ⇄ loaderId 两边一致」，锁不住**它们是什么**。
-    // 上游把包名从 `dsh-codearts-auth` 改成 `dsh-providers-hub`（0.2.0-rc.11）
-    // 时正是从这个缝里漏过去的：两边一起留在旧名上，16 条用例全绿，而宿主侧
-    // `ClientModuleRegistry` 仍按包名建 entry（`compose()` 的 entry.id 取自加载
-    // 行的包名）—— 于是前端产物注册 `dsh-codearts-auth`、宿主找 `dsh-providers-hub`，
-    // 该 entry 永远 import 不到，启动即 `N entry did not activate`，桌面端直接
-    // 落进恢复模式并把插件自动禁用。
-    //
-    // 判据取**包名**而不是写死某个字面量：这样再改名时，这条用例会强制两边一起改。
-    const manifest = JSON.parse(readFileSync(resolve(REPO_ROOT, 'package.json'), 'utf8')) as { name?: unknown }
-    const packageName = manifest.name
-    expect(packageName, '未能从 package.json 读到包名').toBeTruthy()
-
-    const build = readFileSync(resolve(REPO_ROOT, 'plugin-src/client/build.mjs'), 'utf8')
-    const styles = readFileSync(resolve(REPO_ROOT, 'plugin-src/client/jet-hub-styles.js'), 'utf8')
-    const loaderId = /const loaderId = '([^']+)'/.exec(build)?.[1]
-    const pluginId = /const PLUGIN_ID = '([^']+)'/.exec(styles)?.[1]
-    expect(loaderId, 'build.mjs 的 loaderId 必须等于 package.json 的包名').toBe(packageName)
-    expect(pluginId, 'jet-hub-styles.js 的 PLUGIN_ID 必须等于 package.json 的包名').toBe(packageName)
-
-    // 产物是「已构建」的那一份；对不上就说明忘了重跑 build:client。
-    const bundle = readFileSync(resolve(REPO_ROOT, 'lib/client/jet-hub.js'), 'utf8')
-    expect(bundle, 'lib/client/jet-hub.js 的注册 id 必须等于包名（改完要重跑 pnpm build:client）')
-      .toContain(`id: ${JSON.stringify(packageName)}`)
-  })
-
+  /**
+   * ⚠️ 「注册 id == 包名」与「PLUGIN_ID == 包名」这两条不变式**已搬到
+   * `tests/unit/client-registration-id.spec.ts`**（行为判据）。
+   *
+   * 原先这里有两条**读源码正则**的用例 —— 本 PR 之前一条、本 PR 新增一条。
+   * 变异验证实测它们同时具备三类假红与两类假绿，故整组删除：
+   *
+   * - 假红（写法合法、产物逐字节不变，用例却红）：`build.mjs` 改从 `package.json`
+   *   读包名（即 issue 自己推荐的修法）、或把单引号换成双引号；
+   * - 假红：真定义上方多一行**写着旧名**的注释
+   *   （`// const loaderId = 'dsh-codearts-auth'`）—— 正则取到注释里的值，产物其实是对的。
+   *   ⚠️ 注释放**新名**时不会红（读到的就是正确值）：2026-10 第二轮审计实测了这一格，
+   *   所以这里必须写「旧名」，否则这一行自相矛盾。
+   * - 假绿：注释诱饵写在新名上、真定义留在旧名且不重建 ⇒ 断言的**真定义**根本不生效，全绿；
+   * - 假绿：产物断言是裸子串 `toContain('id: "…"')`，把产物第 2 行改成
+   *   `id: "wrong-id", // was id: "…"` 即真实注册 id 已错、用例仍全绿。
+   *
+   * 新判据不看源码文本：把**真实的** `lib/client/jet-hub.js` 交给**真实的**宿主
+   * 加载器按包名装载，装载不上就红 —— 对引号形态、注释诱饵、产物陈旧免疫；
+   * 头部**形态**重构（多行改单行）同样免疫（回读用正则，不逐字节锚定）。
+   */
   it('⚠️ 别的插件认领时认不到它、回收时也删不掉它（缺陷本体）', async () => {
     for (const { label, host } of hosts) {
       await withDom(async () => {
@@ -317,7 +271,7 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
         install()
         // 别的插件物化：宿主 materialize 里 factory 之后的 claimStyles
         host.claimStyles('dsh-better-sidebar')
-        expect(owners(), `[${label}] 别的插件不得把它认领走`).toEqual(['dsh-providers-hub'])
+        expect(owners(), `[${label}] 别的插件不得把它认领走`).toEqual([PACKAGE_ID])
         // 那个插件 revision 变化 / 被 prune / 被禁用 ⇒ removeOwnedStyles
         host.removeOwnedStyles('dsh-better-sidebar')
         expect(styleTags(), `[${label}] 别的插件回收后样式必须幸存`).toHaveLength(1)
@@ -336,7 +290,7 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
       // 宿主 reconcile 再次 apply —— **同一个模块实例**（真实运行时 factory 不重跑）
       install()
       expect(styleTags(), '再次 apply 必须补注（旧实现的模块级 injected 布尔会在此失败）').toHaveLength(1)
-      expect(owners()).toEqual(['dsh-providers-hub'])
+      expect(owners()).toEqual([PACKAGE_ID])
     })
   })
 
@@ -352,7 +306,7 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
       other.dataset.plugin = 'dsh-better-sidebar'
       document.head.appendChild(other)
       noopDispose()
-      expect(owners(), '空 disposer 不得误删任何已存在的样式').toEqual(['dsh-providers-hub', 'dsh-better-sidebar'])
+      expect(owners(), '空 disposer 不得误删任何已存在的样式').toEqual([PACKAGE_ID, 'dsh-better-sidebar'])
     })
   })
 
@@ -366,20 +320,20 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
       other.dataset.plugin = 'dsh-better-sidebar'
       other.textContent = '.dim-sb{}'
       document.head.appendChild(other)
-      expect(owners()).toEqual(['dsh-providers-hub', 'dsh-better-sidebar'])
+      expect(owners()).toEqual([PACKAGE_ID, 'dsh-better-sidebar'])
 
       dispose()
       // ⚠️ 核心：只能删自己那张（改成「删所有 style[data-plugin]」的实现在此失败）
       expect(owners(), 'disposer 不得误删别的插件的样式').toEqual(['dsh-better-sidebar'])
 
       install()
-      expect(owners(), 'dispose 后再 install 应能重新注入，且不干扰别人的').toEqual(['dsh-better-sidebar', 'dsh-providers-hub'])
+      expect(owners(), 'dispose 后再 install 应能重新注入，且不干扰别人的').toEqual(['dsh-better-sidebar', PACKAGE_ID])
     })
   })
 
   it('本插件自身热重载（宿主 replace 顺序）不引入回归', async () => {
     await withDom(async () => {
-      const OWN = 'dsh-providers-hub'
+      const OWN = PACKAGE_ID
       let install = await loadInstaller()
       install()
       // replace(自己)：tearDownEntryFiber → removeOwnedStyles(自己) → import（factory 重跑）→ apply
@@ -500,7 +454,7 @@ describe('Jet Hub 样式表：引用计数与渲染期自愈（IKKGYN）', () =>
       expect(styleTags()).toHaveLength(1)
 
       // 宿主 replace 时序：removeOwnedStyles(自己) → 新 factory 重跑 → 新 apply
-      inlineBehavior.removeOwnedStyles('dsh-providers-hub')
+      inlineBehavior.removeOwnedStyles(PACKAGE_ID)
       expect(styleTags()).toHaveLength(0)
       install() // 新实例注入了一张**新**标签
       expect(styleTags(), '新实例应注入一张新标签').toHaveLength(1)
@@ -568,7 +522,7 @@ describe('Jet Hub 样式表：引用计数与渲染期自愈（IKKGYN）', () =>
 
       expect(ensure(), 'ensure 必须报告「补了一次」').toBe(true)
       expect(styleTags(), '渲染期自愈必须补回样式表').toHaveLength(1)
-      expect(owners(), '补回的表仍须署名（否则又会被认领走）').toEqual(['dsh-providers-hub'])
+      expect(owners(), '补回的表仍须署名（否则又会被认领走）').toEqual([PACKAGE_ID])
 
       // 幂等：已在场时不得重复注入
       expect(ensure(), '已在场时必须返回 false（不重复注入）').toBe(false)
@@ -580,20 +534,20 @@ describe('Jet Hub 样式表：引用计数与渲染期自愈（IKKGYN）', () =>
     await withDom(async () => {
       // 精确复刻 IKK764 旧 disposer 的语义
       const install = () => {
-        const existing = document.head.querySelector('style[data-plugin-css="dsh-providers-hub/jet-hub.css"]')
+        const existing = document.head.querySelector('style[data-plugin-css="' + PACKAGE_ID + '/jet-hub.css"]')
         if (existing !== null) return () => {}
         const style = document.createElement('style')
-        style.dataset.plugin = 'dsh-providers-hub'
-        style.dataset.pluginCss = 'dsh-providers-hub/jet-hub.css'
+        style.dataset.plugin = PACKAGE_ID
+        style.dataset.pluginCss = `${PACKAGE_ID}/jet-hub.css`
         style.textContent = '.dim-jh-page{}'
         document.head.appendChild(style)
         return () => {
-          document.head.querySelector('style[data-plugin-css="dsh-providers-hub/jet-hub.css"]')?.remove()
+          document.head.querySelector('style[data-plugin-css="' + PACKAGE_ID + '/jet-hub.css"]')?.remove()
         }
       }
       const oldDispose = install()
       const oldTag = styleTags()[0]!
-      inlineBehavior.removeOwnedStyles('dsh-providers-hub')
+      inlineBehavior.removeOwnedStyles(PACKAGE_ID)
       install()
       const newTag = styleTags()[0]!
       expect(newTag).not.toBe(oldTag)

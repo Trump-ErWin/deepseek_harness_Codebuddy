@@ -6,7 +6,8 @@ allowBuilds:
 # 本文件此前有一行
 #   dsh-codearts-auth@git+https://gitee.com/iJetLi/deepseek-harness-codearts.git: true
 # 它既无意义、又有害：
-#   · 本仓库依赖里没有 `dsh-codearts-auth`（它就是本包自己），该键永远匹配不上；
+#   · 本仓库依赖里没有 `dsh-codearts-auth`（那是本包的**旧名**，现已改名为
+#     `dsh-providers-hub`），该键永远匹配不上；
 #   · 从 git 安装本插件时，pnpm 会在 clone 目录里执行本文件（`pnpm install` /
 #     `prepare`），而 pnpm 10.x **解析这行键时就抛**
 #     `ERR_PNPM_INVALID_VERSION_UNION`，install 直接失败 → `pnpm build:all` 起不来；
