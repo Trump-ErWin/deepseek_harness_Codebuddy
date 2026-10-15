@@ -65,6 +65,10 @@ const STYLES = `
 /* MiniMax Code（中国版）：官方 logo **自带浅蓝底** #7DC6FF，白底容器中显示清晰。
    ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
 .dim-jh-providerIcon.minimax { background: white; }
+/* MiniMax Code（国际版）：与上面中国版**共用同一个 logo**，故同样给白底容器。
+   ⚠️ 每个 logoClass 都必须各自声明背景（本文件没有兜底规则），漏了会让该行容器
+      没有底色、与其它行视觉不一致 —— 与 officeace 那次「注释失实且无守卫」同型。 */
+.dim-jh-providerIcon.minimaxintl { background: white; }
 /*
  * ZCode（智谱）：图标自带深色圆角底 + 青色 Z，本身即完整图形，
  * 故容器保持透明（加白底反而会出现一圈突兀的方块）。
@@ -1136,11 +1140,22 @@ const STYLES = `
 `
 
 /**
- * 本插件的**包 id** —— 必须与 plugin-src/client/build.mjs 的 loaderId 逐字一致。
+ * 本插件的**包 id** —— 必须等于 package.json 的 name（当前 dsh-providers-hub）。
  *
  * ⚠️ 它同时是宿主 claimStyles / removeOwnedStyles 用的 ownerId
  * （dsh-client-modules 的 stripClientSuffix(registration.id)），
- * 也就是样式标签 data-plugin 的**正确取值**。改名必须两边一起改。
+ * 也就是样式标签 data-plugin 的**正确取值**。
+ *
+ * ⚠️ 本文件被 esbuild 打进 bundle，**运行时读不到 package.json**，故这里是字面量。
+ * 它与包名的一致性由 tests/unit/jet-hub-styles-ownership.spec.ts 对拍锁住
+ * —— 那个用例直接从 package.json 取 name，两边不一致即红。
+ *
+ * ⚠️⚠️ 改名时必须同时改 package.json 的 name：bundle 的注册 id 取自它
+ * （见 build.mjs），而 DSH 按包名物化客户端条目 —— 不一致会让**整个插件加载失败**
+ * （2026-10-15 真实事故，桌面端反复把插件隔离进恢复模式）。
+ *
+ * ⚠️ 上面这段注释**刻意不写反引号**：紧邻其上的 STYLES 是模板字符串，
+ * 注释里出现反引号会提前闭合它（AGENTS.md 明令禁止；本文件已有四个用例在守）。
  */
 const PLUGIN_ID = 'dsh-providers-hub'
 

@@ -26,6 +26,7 @@ import {
   fallbackToEntry,
   isMinimaxRefreshable,
   minimaxCredentialExpiresAtMs,
+  minimaxFetchWithRetry,
   minimaxHeaders,
   normalizeMinimaxModel,
   type MinimaxCredential,
@@ -377,10 +378,23 @@ export class MinimaxAuth extends Service {
       const url = new URL(`${this.product.apiHost}${MINIMAX_MODELS_PATH}`)
       url.searchParams.set('region', this.product.region)
       url.searchParams.set('buildEnv', this.product.buildEnv)
-      const response = await this.fetchImpl(url.toString(), {
-        headers: minimaxHeaders(credential),
-        signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
-      })
+      /**
+       * ⚠️ **带传输级重试**（2026-10-15 真实缺陷）。
+       *
+       * 用户报障：「模型连接测试失败，显示 `fetch failed`」。本机实测环境里的
+       * HTTPS 检查代理约 **50%** 概率打断到本家的请求
+       *（`fetch failed ← SELF_SIGNED_CERT_IN_CHAIN`）⇒ 一次偶发中断就整轮失败。
+       *
+       * ⚠️ 重试实现与推理路径**共用同一份** `minimaxFetchWithRetry`
+       *（`src/minimax.ts`）—— 那个文件同时持有判据与退避，本文件不再另写一份
+       *（同义判据分两处必然漂移，AGENTS.md 明列）。
+       */
+      const response = await minimaxFetchWithRetry(
+        () => this.fetchImpl(url.toString(), {
+          headers: minimaxHeaders(credential),
+          signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
+        }),
+      )
       if (!response.ok) return undefined
       const body: unknown = await response.json().catch(() => undefined)
       const entries = parseMinimaxModelsPayload(body)

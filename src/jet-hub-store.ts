@@ -598,8 +598,8 @@ class MemoryStore implements JetHubStore {
  *
  * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
  * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
- * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `zcode`
- * / `opencode` / `gemini` / `officeace` / `accio`。
+ * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `minimaxintl`
+ * / `zcode` / `opencode` / `gemini` / `officeace` / `accio`。
  * ⚠️ 这行清单必须与**下面那张表的实际项数**一致（2026-10-13 合并审计：
  *    此前它漏了 `officeace` —— 表里有、清单里没有，属注释失实）。
  */
@@ -616,6 +616,14 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   ['RACCOON', 'raccoon'],
   // ⚠️ 第 12 个 provider（上游 2026-10-02 合并）—— 曾漏加，见上方注释 ②。
   ['MINIMAX', 'minimax'],
+  // ⚠️ 第 17 个 provider（minimaxintl，2026-10-15）—— 同款坑第 **六** 次。
+  // MiniMax Code 国际版与本表里的 `minimax` **是两个 provider**（账号不互通、
+  // 凭据 ref 前缀不同），故必须各占一行。
+  // 漏加 = `MINIMAXINTL_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
+  // ⚠️ 它与 `MINIMAX` 是**超串关系**（`MINIMAXINTL` 以 `MINIMAX` 开头）——
+  //    顺序由 `ACCOUNT_REF_RE` 内部的**长度降序排序**保证，与本数组的书写顺序无关。
+  ['MINIMAXINTL', 'minimaxintl'],
   ['ZCODE', 'zcode'],
   // ⚠️ 第 13 个 provider（opencode，2026-10-01）—— 与上面 minimax 同款坑：
   // 漏加会让「恢复备份」认不出 opencode 账号（见上方注释 ②）。

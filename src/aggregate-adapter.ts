@@ -778,6 +778,17 @@ export class AggregateAdapter extends LlmAdapter {
     'loomy',
     'raccoon',
     'minimax',
+    // ⚠️ MiniMax Code 国际版（2026-10-15）：与 `minimax` 是**两个 provider**
+    //    （账号不互通、API 主机不同）⇒ 必须各自登记，否则它的模型
+    //    **永不进聚合目录、静默不可见**（同款陷阱已复发三次：cline → accio → officeace）。
+    //
+    //    ⚠️⚠️ **但本行只是第 ① 层（模型层归并）**：决定候选表可见性的还有第二道
+    //    闸门 —— `WIRED_EXPIRY_PROVIDERS`（`aggregate-expiry.ts`）。minimax 系
+    //    （含国际版）**未接入临期折算**（`ProviderRuntime.expiry` 为 `undefined`）
+    //    ⇒ 折算恒 `UNUSABLE` ⇒ 它们的候选**仍被本文件那 4 处
+    //    `WIRED_EXPIRY_PROVIDERS` 过滤剔掉**。这与国内站**行为一致**（既有设计），
+    //    本次不改变它 —— 登记本数组只是让「目录层」两站都在，与国内站同款。
+    'minimaxintl',
     'gemini',
     'zcode',
     'opencode',

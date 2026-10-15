@@ -76,7 +76,7 @@ import { RaccoonAdapter } from '../../src/raccoon-adapter.js'
 import { TraeAdapter } from '../../src/trae-adapter.js'
 import { ZcodeAdapter } from '../../src/zcode-adapter.js'
 import { fallbackToEntry } from '../../src/minimax.js'
-import { MINIMAX } from '../../src/minimax-product.js'
+import { MINIMAX, MINIMAX_INTL } from '../../src/minimax-product.js'
 import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
 import { QODER, QODER_CN } from '../../src/qoder-product.js'
 
@@ -577,6 +577,13 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
     { id: 'loomy', make: () => new LoomyAdapter({ ...NO_CRED } as never) },
     { id: 'raccoon', make: () => new RaccoonAdapter({ ...NO_CRED } as never) },
     { id: 'minimax', make: () => new MinimaxAdapter({ ...NO_CRED } as never) },
+    // ⚠️ minimaxintl（2026-10-15）：与 `minimax` **共用同一个适配器类**，只换
+    //    product 配置（主机 / region / ref 前缀）。本段守的是「所有对外注册为
+    //    LLM provider 的家，其目录行为的跨家契约一致」⇒ 它必须在列。
+    {
+      id: 'minimaxintl',
+      make: () => new MinimaxAdapter({ ...NO_CRED, product: MINIMAX_INTL } as never),
+    },
     { id: 'qoder', make: () => new QoderAdapter({ ...NO_CRED, product: QODER } as never) },
     { id: 'qodercn', make: () => new QoderAdapter({ ...NO_CRED, product: QODER_CN } as never) },
     { id: 'lobsterai', make: () => new LobsteraiAdapter({ ...NO_CRED } as never) },
@@ -646,13 +653,14 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
 
   it('⚠️ 表的家数 == 全部对外注册的 LLM provider（漏一家 ⇒ 它不过本段任何断言）', async () => {
     // ⚠️ 判据来自 **PROVIDER_REGISTRY**（唯一的 provider 真源），不手抄。
-    //    实测：`channel: true` 的 16 家正好是上面 16 家（`aggregate` 是
+    //    实测：`channel: true` 的 17 家正好是上面 17 家（`aggregate` 是
     //    `channel: false` 的聚合器，不在此列）。
     //    ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 14 → 16。
+    //    ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：16 → 17。
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    expect(CASES).toHaveLength(16)
+    expect(CASES).toHaveLength(17)
   })
 
   /**

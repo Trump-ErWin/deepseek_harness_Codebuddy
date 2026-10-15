@@ -69,6 +69,11 @@ export const REFRESH_PROVIDERS = [
   // accio（2026-10-13）：有真实 refresh 端点（`accio-auth.ts` 的
   // `refreshCredential`），`refreshAccountCredential` 续期并回写池内 `expiresAt`。
   'accio',
+  // minimaxintl（2026-10-15）：MiniMax Code 国际版，与 `minimax` 共用同一个
+  // `MinimaxAuth` 类，有真实 refresh 端点（`account.minimax.io/oauth2/token`）。
+  // ⚠️ 它与 `minimax` 是**两个 provider**（账号不互通、凭据 ref 前缀不同），
+  // 故**必须各占一项** —— 漏了它，国际站账号的 `account.refresh` 行为覆盖为零。
+  'minimaxintl',
 ] as const
 
 /**
