@@ -186,20 +186,26 @@ export const PERMANENT_LOCK_EXPIRING_WINDOW_DAYS = 15;
 /**
  * 该 provider 是否支持「锁定永久积分」（只消耗会近期作废的积分）。
  *
- * ⚠️ 目前五家具备，**依据分两类**：
+ * ⚠️ 目前六家具备，**依据分两类**：
  *
  * **服务端直接给两个命名池**：
  * - `loomy`：`dailyBalance`（**当日**到期，次日重发）与 `balance`（注册奖励 + 新手任务，不过期）。
  *
- * **按逐包到期时间现算**（同一个 `splitBuddyCreditsByExpiry`，与 provider 无关）：
+ * **按逐包到期时间现算**（同一个 `splitBuddyCreditsByExpiry` / `splitOfficeAceCreditsByExpiry`，
+ * 判据与 provider 无关）：
  * - `buddy` / `workbuddy`：一个账号常同时有多个资源包，按包的 `DeductionEndTime`
  *   距今是否满 {@link PERMANENT_LOCK_EXPIRING_WINDOW_DAYS} 天现算（实测国际版是
  *   「Bonus Pack 14 天 + Free Plan 扣费截止 8 年后」，中国版是「体验版套餐 +
  *   30/365 天的拉新与裂变包」）。
  * - `trae`：条目级 `expire_time`（秒级 Unix 时间戳，见 `src/trae-credits.ts` 的取证注释）。
  * - `lobsterai`：`expiresAt`（ISO 8601，已归一化到 `deductionEndTime`）。
+ * - `officeace`（2026-10-15 接入）：订阅响应的每个积分桶都带到期时间
+ *   （套餐包**没有**到期字段 = 永久桶，签到/活动包有）⇒ 判据同 buddy 系。
+ *   ⚠️ **它此前是个哑锁**：登记了 `permanentLock` 却没有任何执行代码，
+ *   且文案落到 Loomy 那一套（Gitee issue IKLTHB）—— 现已由 `src/officeace-lock.ts`
+ *   执行，见 `tests/unit/permanent-lock-execution.spec.ts` 的普查。
  *
- * ⚠️ 后两家**没有「每日额度 / 永久积分」两个命名池**，但同样能按到期时间分桶 ——
+ * ⚠️ 后三家**没有「每日额度 / 永久积分」两个命名池**，但同样能按到期时间分桶 ——
  * 对锁定功能而言，判据只需「会不会马上作废」，与池的名字无关。它们的余额面板
  * 也早已用同一个窗口分「长期 / 临时」（见 `src/jet-hub-rpc.ts` 的 `credits.balances`）。
  *
@@ -260,12 +266,19 @@ export function supportsCreditPackageList(provider) {
  *          锁定成功提示 / 解锁成功提示。
  */
 export function permanentLockCopy(provider, windowDays) {
-  // ⚠️ 判据是「**是否按到期时间分桶**」，不是「是不是 buddy」：trae / lobsterai 与
-  // buddy 系走同一套 `splitBuddyCreditsByExpiry`，窗口天数对它们同样有意义，
+  // ⚠️ 判据是「**是否按到期时间分桶**」（= registry 的 `usesExpiryWindow`），
+  // 不是「是不是 buddy」：trae / lobsterai / officeace 与 buddy 系走的是同一套
+  // 「按 `expiresAt` 距今天数分桶」的判据，窗口天数对它们同样有意义，
   // 故必须共用这套带天数的文案（否则会错误地落到下面 Loomy 那套「每日赠送额度」文案，
-  // 而它们根本没有「每日额度」这个概念）。
-  if (provider === 'buddy' || provider === 'workbuddy'
-    || provider === 'trae' || provider === 'lobsterai') {
+  // 而它们根本没有「每日额度」这个概念 —— officeace 的每日签到额度只是**其中一个
+  // 当日作废的积分桶**，锁定的判据是「桶的到期时间」，不是「哪个桶」）。
+  //
+  // ⚠️ 2026-10-15：原先这里是一份**硬编码名单**（`buddy`/`workbuddy`/`trae`/
+  // `lobsterai`），officeace 加进 `permanentLock` 时被漏掉 ⇒ 它拿到了 Loomy 的文案
+  // （「今日额度用尽后将没有可用账号」），而它真实的判据是 N 天窗口。
+  // 已改为**与后端同出一个字段**（与 `supportsPermanentLock` 同款），
+  // 新增渠道时不再需要改这里。
+  if (descriptorOf(provider)?.usesExpiryWindow === true) {
     const days = normalizeWindowDays(windowDays);
     return Object.freeze({
       days,
