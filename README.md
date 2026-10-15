@@ -289,8 +289,18 @@ codearts、cline 等都有）。聚合路由把「同一个真实模型」在各
 时才切换（已输出的内容收不回来，拼接会产生畸形回答）。
 
 **参与轮换的渠道**：`buddy` / `workbuddy` / `loomy` / `codearts` / `zcode` /
-`lobsterai` / `trae` 七家。其余渠道**暂不参与**（插件对它们的额度到期时刻没有
-可靠信息，宁可少一个候选，不可把未知当可用）—— 它们仍可**直连**正常使用。
+`lobsterai` / `trae` / `accio` / `officeace` 九家。其余渠道**暂不参与**（插件对
+它们的额度到期时刻没有可靠信息，宁可少一个候选，不可把未知当可用）—— 它们仍可
+**直连**正常使用。
+
+⚠️ **真正决定「某渠道在不在轮换里」的是一张编译期清单**
+（`src/aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`），**不是**
+`src/aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS`。上面这份名单就是按前者列的。
+只加 `AGGREGATE_CHANNELS` 是**无效接线**：渠道会进聚合目录（模型层归并），
+但**候选表**仍被那道闸门剔掉 ⇒ 轮换列表里看不到它，且**零报错、零日志**。
+该陷阱已复发三次（`cline` → `accio` → `officeace`），接新渠道时**两处必须同改**，
+另有第三处 `src/provider-expiry.ts` 的 `createProviderExpiry()` 一并跟进 ——
+后两者的运行期一致性由 `tests/unit/expiry-runtime-parity.spec.ts` 锁住。
 
 ⚠️ **`zcode` 的额度是「按模型」分桶的**，故它的可用性是**逐模型**判定的：
 赠送的 8M 实测分成 `GLM-5.3` 3M 与 `GLM-5.3-Flash` 5M 两个**专属桶**
@@ -310,6 +320,37 @@ codearts 上都是 1M，那么 `aggregate` 下选它也声明 1M（与直连一�
 
 聚合有**自己的**设置面板（Jet Hub 左侧 rail 的「聚合」项），可逐条开关
 「参与轮换」。它没有账号与凭据（复用各渠道的账号）。
+
+### ⚠️ 模型选择器里为什么有**两个**「Auto」
+
+选到「不挑模型」这一档时，选择器里会出现**两条**看起来同义的项：
+
+| 选择器里显示为 | 真实路由 | 代码 |
+|---|---|---|
+| **`聚合（跨渠道临期优先）`** 组下的 `Auto（聚合 · 跨渠道）` | `aggregate` / `auto` | `src/aggregate-adapter.ts` |
+| **`Jet Hub 自动（临期优先）`** 组下的 `Auto（临期优先 · 整池）` | `jet-hub-auto` / `auto` | `src/auto-adapter.ts` |
+
+后者是**上一代实现**（2026-10-06），前者是随后的重写（2026-10-07，`ba10f4f`）
+并**泛化**成「规范模型名 + 渠道候选 + auto」三者共用一套排序
+（`aggregate-core.ts`）。重写时旧 auto 的接线被一并删掉过，后来又补回，
+**两代因此并存至今**。`src/index.ts` 的接线注释里直接称它为「**旧 auto**」。
+
+⚠️ **日常请优先用 `聚合（跨渠道临期优先）`** —— 它是活跃维护线，两者有三处实质差异：
+
+| | `aggregate/auto` | `jet-hub-auto/auto` |
+|---|---|---|
+| 候选渠道 | **9 家**（`WIRED_EXPIRY_PROVIDERS`） | **5 家**（`AUTO_PROVIDERS` 硬编码：`codearts` / `loomy` / `zcode` / `buddy` / `workbuddy`） |
+| 尊重「拒绝轮换」开关 | ✅ | ❌ 不读拒绝表 |
+| 「收下请求却零输出」目标级冷却 | ❌ 无 | ✅ 有（`zero-output-guard.ts`，issue IKJW31） |
+
+⚠️ **旧 auto 无法隐藏**：它的 `listModels()` 无条件返回这一个模型、不套用户黑名单
+（黑名单针对的是各渠道的真实模型），且 `jet-hub-auto` **不在** `provider-registry.ts`
+里 ⇒ 设置页里连它的面板都没有。**忽略它即可**，选聚合那条。
+
+（按自身注释，两者在「候选来源 = 所有渠道的所有模型」「渠道内按倍率挑最便宜」
+「用途 = 不挑模型，谁临期烧谁」三格上定义相同；真正的差别就是上表这三条。
+是否合并/下线旧 auto 涉及把 `zero-output-guard.ts` 移植过去，**属行为变更**，
+留待维护者定夺。）
 
 ---
 
