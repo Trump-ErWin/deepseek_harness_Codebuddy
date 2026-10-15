@@ -33,6 +33,10 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { NEVER, UNUSABLE } from '../../src/aggregate-core.js'
 import { WIRED_EXPIRY_PROVIDERS } from '../../src/aggregate-expiry.js'
+import {
+  noteOfficeaceRejection,
+  resetOfficeaceBreakerForTest,
+} from '../../src/officeace-credential-health.js'
 
 // ⚠️ mock 掉余额入口（它内部会打云侧 V11 签名请求 + 可能触发自动签到）。
 vi.mock('../../src/officeace-auth.js', async (importOriginal) => {
@@ -159,5 +163,45 @@ describe('接线：三处必须同改（少一处都是静默失效）', () => {
       credentialRef: 'OFFICEACE_ACCOUNT_FROM_CONTEXT',
     })
     expect(mocked.mock.calls[0]?.[1]).toBe('OFFICEACE_ACCOUNT_FROM_CONTEXT')
+  })
+})
+
+/**
+ * ## 凭据熔断 ⇒ 候选表里**没有**它（Gitee issue IKLTHB 第 ③ 条）
+ *
+ * ⚠️ 这是熔断真正起作用的地方：适配器里的快速失败只救「用户显式选了 officeace」
+ * 那一格，而**自动路由每一轮都先撞一次墙**这件事，只能在这里解决 —— 折算判
+ * `UNUSABLE` ⇒ 候选表剔除 ⇒ 连试都不试。
+ *
+ * ⚠️ 判据刻意包含「**没有再打余额请求**」：熔断期还去读余额除了白花时间，
+ *    还会让 `EXPIRY_CACHE_TTL_MS` 的 60 秒缓存反复写入新值（掩盖熔断）。
+ */
+describe('熔断：熔断期内 officeaceExpiry 判 UNUSABLE 且不再请求余额', () => {
+  beforeEach(() => {
+    resetOfficeaceBreakerForTest()
+  })
+
+  /** 真机 401 报文（issue 取证原文）。 */
+  const REAL_401 = '{"error_msg":"AppKey or AppSecret is invalid","error_code":"APIG.1009"}'
+
+  it('★ ⑬ 两次确定的凭据拒绝 ⇒ UNUSABLE，且余额入口调用次数不再增长', async () => {
+    mocked.mockResolvedValue(summary([{ remaining: 6500 }]) as never)
+    // 未熔断：正常折算（有额度但无到期时间 ⇒ NEVER，与用例 ② 同判）。
+    expect(await officeaceExpiry(CREDENTIAL, 'REF')).toBe(NEVER)
+    expect(mocked).toHaveBeenCalledTimes(1)
+    // 两次连续拒绝 ⇒ 熔断。
+    noteOfficeaceRejection(CREDENTIAL, REAL_401)
+    noteOfficeaceRejection(CREDENTIAL, REAL_401)
+    expect(await officeaceExpiry(CREDENTIAL, 'REF')).toBe(UNUSABLE)
+    expect(mocked, '熔断期不得再去读余额').toHaveBeenCalledTimes(1)
+  })
+
+  it('★ ⑭ 熔断只影响那对 Basic 凭据（换了 key 立刻恢复折算）', async () => {
+    mocked.mockResolvedValue(summary([{ remaining: 100 }]) as never)
+    noteOfficeaceRejection(CREDENTIAL, REAL_401)
+    noteOfficeaceRejection(CREDENTIAL, REAL_401)
+    expect(await officeaceExpiry(CREDENTIAL, 'REF')).toBe(UNUSABLE)
+    const rotated = { ...CREDENTIAL, modelAppKey: 'k2' } as never
+    expect(await officeaceExpiry(rotated, 'REF')).toBe(NEVER)
   })
 })

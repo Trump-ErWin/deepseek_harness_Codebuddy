@@ -22,6 +22,33 @@ import { basicAuthorization, fetchModelTokenRates, isExpiring, readOfficeAceCred
 import { collectImages, consumeOpenAiSse, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
 import { buildDsmlSystemPrompt, needsDsmlToolMode, type DsmlToolSpec } from './dsml.js'
+import {
+  isBasicCredentialRejection,
+  noteOfficeaceRejection,
+  noteOfficeaceSuccess,
+  officeaceBreakerState,
+} from './officeace-credential-health.js'
+
+/**
+ * 「重发一次有没有意义」的指纹：**决定 Basic 鉴权与目标 host 的三个字段**。
+ *
+ * ⚠️ 它**不是**「同一对已被拒绝的 key」那个指纹（`officeaceCredentialFingerprint`
+ * 只含 Basic 二元组）：本函数要多含 `maasBaseUrl`，因为 2026-10-13 那个真实缺陷里
+ * **只有网关变了**（华为按账号下发专属网关 `modelgw-0004.…`，打错硬编码 host 恒 401，
+ * 而 Basic 二元组完全正确）⇒ 换 host 后重发**是**有意义的。
+ * 两个问题不同，故两份判据并存，且各自注释说明为什么不能合并。
+ */
+function basicAuthFingerprint(credential: OfficeAceCredential): string {
+  return `${credential.modelAppKey}\u0000${credential.modelAppSecret}\u0000${maasBaseUrlOf(credential)}`
+}
+
+/**
+ * 401 时「续期这一次到底发生了什么」的**四态**。
+ *
+ * ⚠️ 刻意不用布尔：`unreadable`（续期后读不到凭据）与 `unchanged`（读到了但逐字节
+ *    没变）指向**完全不同的下一步动作**，混成一个布尔必然给错指引。
+ */
+type RenewalOutcome = 'not-attempted' | 'unchanged' | 'changed' | 'unreadable'
 
 /**
  * 推理/探测该用哪个 host —— **必须优先用凭据里按账号下发的 `maasBaseUrl`**。
@@ -64,6 +91,30 @@ export function maasBaseUrlOf(credential: OfficeAceCredential): string {
 export interface OfficeAceAdapterOptions {
   /** 凭据（测试注入）；缺省每次从本机读取。 */
   credentialProvider?: () => Promise<OfficeAceCredential | undefined>
+  /**
+   * **只读目录探测**专用凭据（`listModels` 的 `/v2/models` 探测与倍率读取）。
+   *
+   * ⚠️⚠️ **它刻意不走 `credentialProvider`**（Gitee issue IKLTHB 第 ① 条的连带
+   *    缺陷，2026-10-15 自查发现）：`credentialProvider` 在「锁定永久积分且只剩
+   *    永久桶」时**抛错**，而 `listModels` 的调用方**全都不接**这个错 ——
+   *    `dsh-llm` 的 `llm.listModels()` 直接 `await` 适配器方法（无 try/catch），
+   *    后果是一串与「锁定」毫不相干的症状：
+   *
+   *    | 调用方 | 症状 |
+   *    |---|---|
+   *    | `jet-hub-rpc.ts` 的 `model.list` | 面板报「读取模型列表失败：…锁定…」|
+   *    | `jet-hub-rpc.ts` 的 `readableCatalogIds` | 「关闭供应商 / 关闭全部」被拒（`remoteError`）|
+   *    | `aggregate-adapter.refreshCatalog` | 记一条 warn 后**跳过该渠道**（静默少一个候选）|
+   *    | DSH 模型选择器 | 分组消失（与「目录门控」的空分组同形）|
+   *
+   *    ⇒ 判定写得很清楚：**锁定约束的是「推理取号」，不是「能不能读目录」**。
+   *    `/v2/models` 与 `/v1/model-token-rates` 都是**只读、不扣积分**的，
+   *    没有理由因为锁定而把它们也一起关掉（buddy 系就是这样的：锁定后模型
+   *    照常列在目录里，发消息才报「没有可用账号」）。
+   *
+   * 缺省（未注入）时回落到 `credentialProvider` —— 保持既有嵌入方与单测行为不变。
+   */
+  probeCredential?: () => Promise<OfficeAceCredential | undefined>
   /** 覆盖默认的 fetch（测试注入）。 */
   fetchImpl?: typeof fetch
   /**
@@ -132,6 +183,18 @@ export class OfficeAceAdapter extends LlmAdapter {
     return credential
   }
 
+  /**
+   * 目录专用凭据：**锁定永久积分也必须能读目录**（见 `probeCredential` 的注释）。
+   *
+   * ⚠️ 未注入 `probeCredential` 时回落 `resolveCredential()`：既有嵌入方与单测
+   *    的行为逐字不变（只有宿主装配层会注入它）。
+   */
+  private async probeCredential(): Promise<OfficeAceCredential | undefined> {
+    return this.options.probeCredential !== undefined
+      ? this.options.probeCredential()
+      : this.resolveCredential()
+  }
+
   providerInfo(provider: string): LlmProviderInfo {
     const id = typeof provider === 'string' && provider.length > 0 ? provider : OFFICEACE.id
     return { id, name: OFFICEACE.displayName }
@@ -148,7 +211,10 @@ export class OfficeAceAdapter extends LlmAdapter {
    */
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     const disabled = this.options.disabledModels?.() ?? new Set<string>()
-    const credential = await this.resolveCredential()
+    // ⚠️ 目录用**只读探测凭据**（见 `probeCredential` 的长注释）：恒不抛「锁定」错。
+    //    `/v2/models` 与倍率都是只读端点，不扣积分，锁定它们只会得到一串
+    //    与锁定毫不相干的症状（面板「读取模型列表失败」、关不掉供应商、分组消失）。
+    const credential = await this.probeCredential()
     if (credential === undefined) return []
     try {
       const probe = await this.probe(credential)
@@ -249,6 +315,29 @@ export class OfficeAceAdapter extends LlmAdapter {
       )
     }
     const f = this.options.fetchImpl ?? fetch
+
+    // ── 熔断快速失败（Gitee issue IKLTHB 第 ③ 条）──
+    //
+    // ⚠️ **为什么要在这里拦，而不只是靠聚合折算剔除**：
+    //
+    // 折算层（`officeaceExpiry`）把熔断中的凭据判成 `UNUSABLE`，于是**自动路由**
+    // 不会再选它；但用户**显式**选中 officeace 的模型、或聚合在别处兜底时，
+    // 请求仍会落到这里 —— 那时再发一个已经知道结果的请求，白白等一个网络往返，
+    // 还会把「暂时不可用」表现成一个像服务端错误的 401。
+    //
+    // ⚠️ 快速失败**不会**让熔断永不解除：`until` 到期即自动放行（半开），
+    //    届时这次真请求就是探针。文案里带上剩余时间，用户不必猜「为什么立刻失败」。
+    const breaker = officeaceBreakerState(credential)
+    if (breaker.open) {
+      const minutes = Math.max(1, Math.ceil(breaker.remainingMs / 60000))
+      throw new Error(
+        `OfficeAce：该账号的 Basic 凭据已被华为 MaaS 连续拒绝 ${breaker.consecutive} 次`
+        + `（最近一次：${breaker.lastReason.slice(0, 120)}），`
+        + `已临时跳过本渠道，约 ${minutes} 分钟后自动重试。`
+        + '⚠️ 这与额度无关，**不要**去解锁永久积分；重新登录也改变不了'
+        + '（云侧下发的 `modelAppKey`/`modelAppSecret` 不会变）。',
+      )
+    }
 
     const controller = new AbortController()
     const onAbort = () => controller.abort()
@@ -440,13 +529,58 @@ export class OfficeAceAdapter extends LlmAdapter {
 
       if (!response.ok) {
         const text = await response.text().catch(() => '')
-        // ⚠️ 401 = Basic 凭据失效。MaaS 的凭据与 STS 生命周期不同步，**STS 也快到期**
-        //    是常见成因 —— 这里续期一次再重发，与 trae / gemini 同款模式。
-        //    不接 `options.refresh` 时静默失败（接线层漏接的症状即此）。
-        if (response.status === 401 && this.options.refresh !== undefined) {
+        // ── 401：先判断「续期一次再重发」这件事**有没有意义** ──
+        //
+        // ⚠️⚠️ 这是一个**真实缺陷**的现场（Gitee issue IKLTHB 第 ② 条，2026-10-14
+        //    起 264+ 次连续失败）。改前的代码是：
+        //
+        //     ```ts
+        //     await this.options.refresh().catch(() => undefined)
+        //     const renewed = await this.resolveCredential()
+        //     if (renewed !== undefined && renewed !== credential) { /* 重发 */ }
+        //     ```
+        //
+        //    那句 `renewed !== credential` **恒为真**：`resolveCredential()` 每次都
+        //    `JSON.parse` 出一份**新对象**，对象身份永远不同 ⇒ 这个守卫一个都拦不住，
+        //    401 恒被重发一次。于是真实报障里的每一轮都是「白撞一次 + 重新登录一次」
+        //    —— 而取证证明重新登录**换掉了账号与 credentialRef
+        //    （`OFFICEACE_ACCOUNT_651558E5` → `F1557964`）、换掉了整条 STS 三元组，
+        //    却让 `modelAppKey`/`modelAppSecret` 逐字节不变**（`ffff8ba7…c476` /
+        //    `bd4da972…d76b`，`accountId` 也没变）⇒ 重发注定得到同一个 401。
+        //
+        // ⇒ 判据必须落在**能修好 401 的那几个字段**上（见 `basicAuthFingerprint`），
+        //    而不是对象身份。这样「没变」这一事实本身就成了诊断依据：
+        //    报文里会**明确写出**「已续期但凭据一个字节都没变」，
+        //    用户不必再去重复一次无效的重新登录。
+        let finalStatus = response.status
+        let finalText = text
+        // ⚠️ 续期闸门必须是**超集**：`401` **照旧一律**尝试续期（形状未知的网关 401
+        //    也可能是凭据陈旧，旧行为能救回来的不能丢），**另外**把「4xx + 报文点名
+        //    这对 Basic 凭据」也算进来 —— 华为文档把 APIG.1009 定义为 400、真机回
+        //    401，只认 401 就会漏掉文档那一侧（第二轮对抗性审计查出的真实缺口：
+        //    判据只认状态码，而它自己的注释写着「不得依赖状态码」）。
+        const credentialRejected = isBasicCredentialRejection(response.status, text)
+        /**
+         * 产生**最终**那次拒绝的凭据。
+         *
+         * ⚠️ 续期真的换掉了 Basic 三元组时，下一轮请求用的会是**新**那份
+         *    （续期已就地更新凭据库）⇒ 熔断记账必须落在**它**身上，否则熔断器
+         *    永远追不上实际在用的凭据，每轮仍白撞一次（正是 issue 第 ③ 条）。
+         */
+        let rejected: OfficeAceCredential = credential
+        // ⚠️ **四态**，不是布尔：`renewed === undefined`（续期后读不到凭据）与
+        //    「读到了但一个字节没变」是**两件不同的事**，文案必须分开说 ——
+        //    用布尔会把前者说成后者（或反之），而这两种指引指向完全不同的动作。
+        let renewal: RenewalOutcome = 'not-attempted'
+        if ((response.status === 401 || credentialRejected) && this.options.refresh !== undefined) {
+          const before = basicAuthFingerprint(credential)
           await this.options.refresh().catch(() => undefined)
           const renewed = await this.resolveCredential()
-          if (renewed !== undefined && renewed !== credential) {
+          if (renewed === undefined) {
+            renewal = 'unreadable'
+          } else if (basicAuthFingerprint(renewed) !== before) {
+            renewal = 'changed'
+            rejected = renewed
             const retry = await f(`${maasBaseUrlOf(renewed)}${OFFICEACE.chatPath}`, {
               method: 'POST',
               headers: {
@@ -458,6 +592,8 @@ export class OfficeAceAdapter extends LlmAdapter {
               signal: controller.signal,
             })
             if (retry.ok) {
+              // 续期真的换掉了 Basic 三元组且重发通了 ⇒ 成功，顺带解除熔断记录。
+              noteOfficeaceSuccess(renewed)
               yield* consumeOpenAiSse(
                 retry,
                 { signal: controller.signal },
@@ -471,14 +607,27 @@ export class OfficeAceAdapter extends LlmAdapter {
               )
               return
             }
+            finalStatus = retry.status
+            finalText = await retry.text().catch(() => '')
+          } else {
+            renewal = 'unchanged'
           }
         }
+        // ── 熔断记账：**只认确定的凭据拒绝形状**（见 `isBasicCredentialRejection`）──
+        //
+        // ⚠️ 不能「凡 401 都记」：网关/代理层的 401（HTML / 空体）形状未知，
+        //    据此熔断等于把一次基础设施抖动放大成「渠道消失 10 分钟」。
+        if (isBasicCredentialRejection(finalStatus, finalText)) {
+          noteOfficeaceRejection(rejected, finalText)
+        }
         throw new Error(
-          `OfficeAce (华为MaaS) 返回 HTTP ${response.status}：${text.slice(0, 200)}`
-          + `（${this.diagnose(response.status)}）`,
+          `OfficeAce (华为MaaS) 返回 HTTP ${finalStatus}：${finalText.slice(0, 200)}`
+          + `（${this.diagnose(finalStatus, finalText, renewal)}）`,
         )
       }
 
+      // ⚠️ 成功即解除熔断（**唯一**的正常出口）：这证明这对 Basic 凭据是好的。
+      noteOfficeaceSuccess(credential)
       yield* consumeOpenAiSse(
         response,
         { signal: controller.signal },
@@ -496,8 +645,78 @@ export class OfficeAceAdapter extends LlmAdapter {
     }
   }
 
-  private diagnose(status: number): string {
-    if (status === 401) return 'Basic 凭据失效：OfficeAce 会话已过期，请重新登录 OfficeAce 客户端'
+  /**
+   * 把 HTTP 失败翻译成「用户下一步该做什么」。
+   *
+   * ## ⚠️ 401 那一格曾经**写死了被证伪的指引**（Gitee issue IKLTHB 第 ② 条）
+   *
+   * 改前的实现是一句无条件的断言：
+   *
+   * > `Basic 凭据失效：OfficeAce 会话已过期，请重新登录 OfficeAce 客户端`
+   *
+   * 那句在真实报障里**是错的**，而且**有反证**：用户按它去重新登录，
+   * 结果 `modelAppKey`/`modelAppSecret` **逐字节不变**（取证见 `stream()` 里
+   * `basicAuthFingerprint` 的注释）⇒ 重新登录在结构上就不可能修好这个 401，
+   * 却被指引去做了一遍又一遍（264+ 次失败里有相当一部分是这么来的）。
+   *
+   * 现在改为**按报文与续期结果分派**：
+   *
+   * | 情形 | 文案指向 |
+   * |---|---|
+   * | 报文是 `APIG.1009` 且**续期没换掉 Basic 三元组** | 华为侧认定的 key 与本地不一致，**重新登录改变不了**；去华为云控制台/订阅处核对 |
+   * | 报文是 `APIG.1009` 且**刚换过**凭据 | 新凭据也被拒 ⇒ 权限/订阅面 |
+   * | 其它 401 形状 | 形状未知 ⇒ 如实说「不是已知的凭据失效形状」，提示核对 endpoint 与出口 |
+   *
+   * ⚠️ **分派必须先判形状、再判状态码**：`APIG.1009` 那几行的条件里**不得**出现
+   *    `status === 401` —— 华为官方文档把它定义为 **400**、真机回 **401**，
+   *    钉死 401 会让「文档那一侧」的报障彻底拿不到归因（第二轮审计实测缺口）。
+   *    状态码只用于**兜底文案**（403 未订阅 / 404 / 429 / 5xx）。
+   *
+   * ⚠️ 与 `diagnose` 的调用方约定：本方法的返回值会被**拼进错误 message**，
+   *    故错误本身**不得**带 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA` 这类会被 DSH 客户端
+   *    整段替换的码（`stream()` 抛的是**裸 `Error`**，无 `code`）。
+   *
+   * @param status - 终态 HTTP 状态（重发过的话是重发的那个）。
+   * @param body - 终态响应正文。
+   * @param refreshedUnchanged - 本次已续期，但 Basic 三元组**一个字节都没变**。
+   */
+  private diagnose(status: number, body = '', renewal: RenewalOutcome = 'not-attempted'): string {
+    // ⚠️⚠️ 这里原先整个 APIG.1009 分支都嵌在 `if (status === 401)` **里面** ——
+    //    所以只把 `isBasicCredentialRejection` 放宽到 4xx 是**不够的**：华为官方
+    //    文档把 APIG.1009 定义为 **400**，按文档回 400 时这段归因**一个字都用不上**
+    //    （第二轮对抗性审计查出的真实缺口；同一处「注释说不依赖状态码、代码却钉死
+    //    401」的自相矛盾在两个文件里各有一份）。改为**先判形状、再判 401**。
+    if (isBasicCredentialRejection(status, body)) {
+      // ⚠️ 四态**各说各的**：把「续期后读不到凭据」说成「凭据没变」会让用户
+      //    去华为云控制台查一个根本不存在的问题；反之会让他重复一次无效重登。
+      if (renewal === 'unreadable') {
+        return '华为 APIG.1009：MaaS 侧不认这对 AppKey/AppSecret。'
+          + '本次已发起续期，但**续期后读不到新凭据**（凭据库/登录态异常）⇒ 请先确认'
+          + '账号的凭据能正常读出（Jet Hub 的 OfficeAce 账号卡片），再判断是否需要重新登录。'
+      }
+      if (renewal === 'changed') {
+        return '华为 APIG.1009：MaaS 侧不认这对 AppKey/AppSecret（本次凭据刚续期且已变化，'
+          + '仍被拒）⇒ 更可能是该账号的 MaaS 应用凭据或模型订阅在华为云侧被撤销，'
+          + '请在华为云控制台核对。'
+      }
+      if (renewal === 'unchanged') {
+        return '华为 APIG.1009：MaaS 侧不认这对 AppKey/AppSecret。'
+          + '本次**已经发起过续期**，但凭据里的 `modelAppKey`/`modelAppSecret`/推理网关'
+          + '**一个都没变** —— 所以**重新登录 OfficeAce 改不了这个结果**'
+          + '（重新登录只会换掉账号与 STS，Basic 这对 key 由云侧按账号下发）。'
+          + '请到华为云控制台核对这个账号的 MaaS 应用凭据/模型订阅，或在 Jet Hub 里'
+          + '删除该账号后用另一个华为云账号重新登录。'
+      }
+      return '华为 APIG.1009：MaaS 侧不认这对 AppKey/AppSecret。'
+        + `本次**没有续期**（未接入续期，或 ${status} 不是续期重试路径）⇒ 可先在 Jet Hub 的`
+        + 'OfficeAce 账号卡片点一次「刷新」看凭据是否会变；若不变，重新登录同样无效'
+        + '（Basic 这对 key 由云侧按账号下发）。'
+    }
+    if (status === 401) {
+      return 'HTTP 401，但报文不是已知的「AppKey/AppSecret 无效」形状 —— '
+        + '可能是网关/代理层的鉴权或登录态问题：请核对凭据里的推理网关地址（`maasBaseUrl`）'
+        + '与网络出口，而不是直接重新登录。'
+    }
     if (status === 403) return '该账号未订阅此模型（ModelArts.81004）：请在 OfficeAce 或华为云控制台订阅'
     if (status === 404) return '模型不存在：检查模型 id 是否在目录中'
     if (status === 429) return '限流：稍后重试'
