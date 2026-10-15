@@ -2934,3 +2934,81 @@ Error: 内部错误：产物里注册的 id 是 "dsh-codearts-auth"，与 packag
 **只有 `BACKUP_FORMAT` 是兼容读取点**，其余是「写点无读点」的落盘标记
 （真实用户的 `~/.dsh/jet-hub/*.json` 里确实躺着这 5 个旧值）。
 ⚠️ 把整组说成「跟着改名会让用户读不出已落盘状态」是**过度陈述**（2026-10 审计）。
+
+## ⚠️⚠️ 聚合的三态门控与手工排序（2026-10-15，issue IKL7F9 + IKLQR2）
+
+> 规格：`docs/superpowers/specs/2026-10-15-aggregate-gating-manual-order-design.md`
+> 计划：`docs/superpowers/plans/2026-10-15-aggregate-gating-manual-order.md`（均**不入库**：`docs/superpowers` 被 gitignore）
+
+### 1. 三态判据**只留一份**（客户端只渲染、不判定）
+
+权威实现是 `src/aggregate-core.ts` 的 `resolveCandidateGate`（零 import 纯函数），
+优先级 **显式拒绝 > 显式允许 > 默认**（已接入折算 ⇒ 参与；未接入 ⇒ 默认不参与）。
+宿主在 `aggregate.catalog` 里把结果**直接下发**（每个候选带 `state` 与 `expiryWired`）
+⇒ 客户端**不得**自己重算（「同一语义两套判据」是本仓库首条红线）。
+
+⚠️ 两个字段的**分工**不要混：
+- `state` = 三态**判定结果**（`allowed` / `rejected` / `default-rejected`）；
+- `expiryWired` = **渠道级事实**（该渠道接不接入折算），**只**用来回答一个问题：
+  「关掉这条候选时该写**拒绝表**还是**白名单**」—— 见 `candidateToggleAction` 的四行表。
+
+### 2. ⚠️⚠️ 未接入渠道的候选必须赋 `NEVER`，**不能**落到 probe 的 `UNUSABLE`
+
+`src/aggregate-adapter.ts` 的 `candidatesFor` 里有一段**看起来可以删掉**的分支：
+
+```ts
+if (!WIRED_EXPIRY_PROVIDERS.includes(candidate.provider)) {
+  candidate.expiry = NEVER    // 可用、只是没有临期信息
+  continue
+}
+```
+
+**为什么不能让它走 probe**：`credentialExpiry` 对未接入渠道**恒返回 `UNUSABLE`**
+（`aggregate-expiry.ts` 的短路）⇒ `rankCandidates` 会把它剔除 ⇒ 症状是
+「我明明在面板上打开了，它还是不参与」，**零报错、零日志**。
+
+⚠️ **它的前提是「门控已经跑过」**：能走到这里的未接入候选必然是白名单里**显式放行**的
+那几条。⇒ 用例必须**两个方向都覆盖**，否则把门控整段删掉用例仍然全绿
+（本任务变异验证实测：第一版「未放行 ⇒ 不在池里」那条用例**无牙**，因为
+buddy 先成功、永远走不到 raccoon）。
+
+### 3. ⚠️ 目录身份与用户门控**无关**（`:636` 的过滤为什么删、为什么不能再加回来）
+
+`refreshCatalog` 里**曾经**有一条 `WIRED_EXPIRY_PROVIDERS` 过滤，2026-10-15 **整条删除**：
+
+1. **判据已恒真**：`providerIds()` = `AGGREGATE_CHANNELS ∩ 存活路由` ⇒ 每条候选的
+   `provider` 必然在 `AGGREGATE_CHANNELS` 内 ⇒ 换成渠道全集即恒 `true`；
+2. **它让用户点不动**：未接入渠道的**独有模型**会被整条剔掉 ⇒ 用户在面板里手工打开后，
+   选择器里**仍然看不到它**（打开白做）。
+
+⚠️⚠️ **不得改成「至少一个候选当前参与轮换」**：那会让「用户把某模型的候选全部拒绝」
+把该模型**从选择器里移除**，而仓库有**两处成文不变式**明文禁止：
+`jet-hub-store.ts` 的 `AggregateRejectionMap` 上方（「候选全被拒 ≠ 关闭模型」）与
+面板的 `isAllCandidatesRejected`（「面板需对候选全被拒给出显式提示」）。
+附带好处：`this.catalog` 保持稳定 ⇒ `provider.status` 的 `total` **不随用户点击漂移**。
+
+### 4. ⚠️ 面板显示顺序 = 真实轮换顺序（跨层一致性用例）
+
+客户端 bundle 是**独立 entry、不 import 宿主模块**（`build.mjs`）⇒ 比较器无法复用，
+只能在 `plugin-src/client/aggregate-panel-logic.js` 里写第二份
+（`rankCandidatesForPanel`）。**唯一守卫**是一条**跨层一致性用例**
+（`tests/unit/aggregate-panel-logic.spec.ts` 的「与宿主 rankCandidates 同序」）：
+同一份 fixture 过两个实现、逐项相等。**改动任一侧先跑它。**
+
+⚠️ 两处都必须保留 `expiryA !== expiryB` 这一格：两个 `Infinity` 相减得 `NaN`
+（非法比较器返回值，`sort` 会当 `0` ⇒ 顺序随引擎漂移）。
+
+### 5. 两张表**各有各的域，不做互斥归一**（用户 2026-10-15 的修正）
+
+| 渠道类型 | 默认态 | 例外靠哪张表 |
+|---|---|---|
+| **已接入**折算 | 参与 | **拒绝表**（黑名单语义：只有「不参与」需要显式记录） |
+| **未接入**折算 | 不参与 | **白名单**（只有「参与」需要显式记录） |
+
+两表的键域由 `expiryWired`（渠道级编译期事实）划分 ⇒ **天然不相交** ⇒
+写一侧**不得**改另一侧（顺手清另一侧会静默改掉**属于别的操作**的用户状态：
+拒绝一条候选不该顺手关掉同渠道其它手工打开的候选）。
+判定优先级 `rejected > allowed > 默认` 保留为**纵深防御**。
+
+⚠️ 但**落笔时我第一版按「互斥归一」实现**（写一侧清另一侧），用户看过设计后推翻 ——
+「同一枚开关的两个方向」听起来对称，但两表的**语义域**不对称。设计文档 §5.1 有留档。

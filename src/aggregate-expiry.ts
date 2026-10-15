@@ -236,6 +236,16 @@ export type ExpiryProbeWithCache = ExpiryProbe & { clear: () => void }
    * 这让既有装配与几十处测试桩**零改动**即可工作 —— 见下方调用点。
    */
   catalogIdsOf?: (provider: string) => Promise<readonly string[]>
+  /**
+   * 共享余额读数（**装配层注入**；省略 ⇒ 各实现方自己发请求，行为与升级前一致）。
+   *
+   * ⚠️ 返回 `undefined` 表示**本次没有共享读数可用**（未命中且取数失败）⇒
+   *    实现方必须回落到自己发请求。**不得**用「抛错」表达「没有读数」：
+   *    那会让折算把「缓存不可用」与「上游查询失败」混为一谈。
+   * ⚠️ `credential` 由本工厂从**账号池条目**配对后回调（缓存按 `(provider, accountId)`
+   *    去重，而取数原语需要凭据）。
+   */
+  balanceOf?: (provider: string, accountId: string, credential: unknown) => Promise<unknown>
 }
 
 export function createExpiryProbe(
@@ -498,6 +508,16 @@ export function createExpiryProbe(
     }
     const markModelsExhausted = pool.markModelsExhaustedForExpiry?.bind(pool)
     const clearModelsExhausted = pool.clearModelsExhaustedForExpiry?.bind(pool)
+    /**
+     * 共享余额读数入口（装配层注入；未注入 ⇒ 全部实现方走自己的回落路径）。
+     *
+     * ⚠️ 签名里的 `credential` 是**本次折算的那个账号的凭据**：缓存按
+     * `(provider, accountId)` 去重，而**取数原语需要凭据** ⇒ 由本层把两者配对后
+     * 传给缓存（`balanceCache.readOne`）。
+     * ⚠️ 不注入时**不传**该字段（而不是传一个恒 `undefined` 的函数）：
+     * 后者会让实现方白走一次「查缓存 → 未命中」的分支（行为相同，但多一层间接）。
+     */
+    const cachedBalanceOf = options.balanceOf
     for (const item of credentials) {
       signal?.throwIfAborted()
       const credential = item.credential
@@ -521,6 +541,16 @@ export function createExpiryProbe(
           catalogIds,
           ...markModelsExhausted === undefined ? {} : { markModelsExhausted },
           ...clearModelsExhausted === undefined ? {} : { clearModelsExhausted },
+          // ⚠️ 共享读数入口（2026-10-15，规格 §5.7）：只对**声明了它**的渠道生效 ——
+          //    buddy 系四家吃同一份读数，其余家忽略（与本上下文里 `catalogIds`
+          //    同一模式：可选能力由实现自己声明）。
+          //    ⚠️ 只在装配层真的注入了缓存时给（`options.balanceOf`），否则**不传**
+          //    ⇒ 实现方走自己的回落路径（那正是「未接线 = 行为不变」）。
+          ...cachedBalanceOf === undefined || item.entry.id === undefined
+            ? {}
+            : {
+                cachedBalance: () => cachedBalanceOf(provider, item.entry.id as string, credential),
+              },
         })
       } catch (error) {
         // 中止仍必须逃逸（与上面的 `try` 同一口径）。
@@ -647,8 +677,44 @@ function isAbortError(error: unknown): boolean {
 export async function buddyExpiry(
   product: typeof CODEBUDDY,
   credential: BuddyCredential,
+  /**
+   * 共享读数入口（2026-10-15，规格 §5.7 的「buddy 系四家吃同一份读数」）。
+   *
+   * ⚠️ 返回 `undefined` ⇒ **回落到自己发请求**（`fetchCreditBalance`）。
+   *    折算的可用性**不得**依赖它 —— 否则「未接线」会变成「该渠道折算恒 UNUSABLE」
+   *（静默少一个候选，本仓库复发过三次的形态）。
+   */
+  cached?: () => Promise<CreditBalance | null | undefined>,
 ): Promise<number> {
-  return sharedPackageExpiry(() => fetchCreditBalance(credential, product))
+  return sharedPackageExpiry(() => fetchBalanceWithCache(
+    cached,
+    () => fetchCreditBalance(credential, product),
+  ))
+}
+
+/**
+ * 「优先吃共享读数、缺席则自己取」的**唯一一份**实现（buddy 系四家共用）。
+ *
+ * ⚠️⚠️ **必须共享**：四家各写一遍这个「先看缓存、没有就自己发请求」的分支，
+ * 任何一侧漏掉回落（或回落时用错原语）都会**静默分叉** —— 正是
+ * `sharedPackageExpiry` 那条注释记录的事故类型（`classifyRaccoonFailure` 与
+ * `classifyLoomyFailure` 的四格判据不一致）。
+ *
+ * ⚠️ 缓存命中的**证明责任在缓存**（`src/balance-cache.ts`）：`undefined` 严格表示
+ * 「本次没有共享读数」，与「读数是 `null`（查询失败）」是两件事 ——
+ * 后者要按既有口径折算成 `UNUSABLE`（`sharedPackageExpiry` 对 `null` 的处理）。
+ */
+async function fetchBalanceWithCache(
+  cached: (() => Promise<CreditBalance | null | undefined>) | undefined,
+  fallback: () => Promise<CreditBalance | null>,
+): Promise<CreditBalance | null> {
+  if (cached !== undefined) {
+    const shared = await cached()
+    // ⚠️ 只认**非 undefined**：`null` 是「共享读数说查询失败」，那是**结论**，
+    //    不该转头再自己发一次请求（那会让「失败」变成双倍上游请求）。
+    if (shared !== undefined) return shared
+  }
+  return await fallback()
 }
 
 /**
@@ -753,8 +819,13 @@ async function sharedPackageExpiry(
 export async function lobsteraiExpiry(
   credential: LobsteraiCredential,
   product: LobsteraiProduct,
+  /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+  cached?: () => Promise<CreditBalance | null | undefined>,
 ): Promise<number> {
-  return sharedPackageExpiry(() => fetchLobsteraiCreditBalance(credential, product))
+  return sharedPackageExpiry(() => fetchBalanceWithCache(
+    cached,
+    () => fetchLobsteraiCreditBalance(credential, product),
+  ))
 }
 
 /**
@@ -766,8 +837,13 @@ export async function lobsteraiExpiry(
 export async function traeExpiry(
   credential: TraeCredential,
   product: TraeProduct,
+  /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+  cached?: () => Promise<CreditBalance | null | undefined>,
 ): Promise<number> {
-  return sharedPackageExpiry(() => fetchTraeCreditBalance(credential, product))
+  return sharedPackageExpiry(() => fetchBalanceWithCache(
+    cached,
+    () => fetchTraeCreditBalance(credential, product),
+  ))
 }
 
 /** loomy：有今日赠送 → 当日 24:00；只剩永久 → NEVER。 */

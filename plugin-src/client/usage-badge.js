@@ -275,6 +275,14 @@ export function UsageBadge(props) {
   //    `typeof provider !== 'string' || provider.length === 0` 失配而变红（实测撞过）。
   let provider = state?.current?.provider;
   /**
+   * 当前选中的**模型 id**（聚合时 = 虚拟模型键，如 `glm-5-3`）。
+   *
+   * ⚠️ 用途**只有一个**：查 `aggregate.activeProvider` 时告诉宿主「问的是哪个模型」
+   *（不传就退回「任意模型的最近一次」⇒ 徽标显示别的模型走过的渠道，见下面的报障）。
+   * ⚠️ 其余 15 家的徽标不用它（它们只有一份余额，与模型无关）。
+   */
+  const modelId = state?.current?.model;
+  /**
    * 聚合 provider 的**重定向**（P3）：把 `aggregate` 解析成它上次**实际**转发成功的渠道。
    *
    * ## ⚠️⚠️ 为什么必须在门控**之前**
@@ -333,6 +341,23 @@ export function UsageBadge(props) {
    * 而**外层只有重新取数才会拿到新的 `provider`**；停了定时器，
    * 渠道就永远停在第一次那个值上（用户看到的会是「徽标不跟着变」）。
    * ⇒ 定时器**常驻**（与 `UsageBadgeActive` 自己的 60 秒轮询同节奏、同生命周期）。
+   *
+   * ## ⚠️⚠️ 2026-10-16：必须把**当前模型 id** 传给端点（真实缺陷，用户报障）
+   *
+   * 用户报障原话：「我们用 glm5.3 后徽标显示的 provider 是腾讯 codebuddy（图1）
+   * 不是排序的第一个（图2）OfficeAce」。
+   *
+   * 根因：本处原先调 `readActiveProvider()` **不传参数**，而宿主
+   * `aggregate.activeProvider` 在**无参**时回的是 `lastActiveProvider` ——
+   * 「**任意虚拟模型**最近一次成功」的渠道，**不是你当前选中的那个模型**。
+   * ⇒ 你用 GLM-5.3（手工序第一位 officeace）时，徽标显示的是**别的模型**
+   *（如 DeepSeek V4.1 Flash）上次走成功的 buddy（腾讯）。
+   *
+   * ⚠️ 宿主**本来就**按模型分开记录（`activeProviderByModel`，且
+   *  `activeProvider(canonicalId)` 一直支持这个用法、端点的 `canonicalId`
+   *  参数也一直存在）—— 只是客户端从来没传。
+   * ⚠️ `current.model` 对聚合来说就是**虚拟模型键**（`glm-5-3`），
+   *  与 `activeProviderByModel` 的键**同源**（都来自 `resolveModel` 的入参）。
    */
   React.useEffect(() => {
     if (!isAggregate || typeof readActiveProvider !== 'function') return undefined;
@@ -340,7 +365,10 @@ export function UsageBadge(props) {
     let timer = null;
     const refresh = () => {
       Promise.resolve()
-        .then(() => readActiveProvider())
+        // ⚠️ 传当前模型的 id：不传就拿不到「这个模型」的渠道（见上面的报障）。
+        //    ⚠️ `model` 缺失时传 `undefined` ⇒ 端点回 `{}` ⇒ 退回旧的全局语义
+        //   （客户端降级，不是崩溃）。
+        .then(() => readActiveProvider(modelId))
         .then((value) => {
           if (!alive) return;
           setActiveProvider(value?.provider ?? null);
@@ -358,7 +386,9 @@ export function UsageBadge(props) {
       if (timer !== null) clearInterval(timer);
     };
     // ⚠️ 依赖 `isAggregate`：非聚合时不该发这个请求（其余 15 家的行为逐字不变）。
-  }, [isAggregate, readActiveProvider]);
+    // ⚠️ **依赖必须含 `modelId`**：用户切换模型时徽标要立刻按**新模型**重查，
+    //    否则它会一直显示旧模型的渠道（与「定时器常驻」那条需求同因）。
+  }, [isAggregate, readActiveProvider, modelId]);
 
   // ⚠️ 重定向结果可能是 `null`（聚合且无历史）⇒ 下面**既有的**空 provider 门控
   //    天然拦掉它 —— 复用同一形态，不另造判据（规格 §6.6）。
