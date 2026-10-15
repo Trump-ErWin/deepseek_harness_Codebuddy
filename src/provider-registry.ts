@@ -352,7 +352,20 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     // ⚠️ 余额响应里每个积分包都带到期时间（订阅套餐包无固定到期 = 永久桶，
     //    签到 / 活动包有明确到期）⇒ 可按 `deductionEndTime` 分「永久 / 长期 / 临期」三档。
     creditPackages: true,
+    // ⚠️⚠️ **2026-10-15 之前这是一个哑锁**（Gitee issue IKLTHB 第 ① 条）：
+    //    登记成 true 让面板渲染出开关、并逐字承诺「这类积分用尽后将没有可用账号」，
+    //    而全仓**只有** `credential-resolver.ts` 的 buddy / loomy 两个分支读过
+    //    `permanentLocked()` ⇒ 开关写进 `permanent-locks.json` 后行为与关闭**完全一致**
+    //    （用户照旧烧永久套餐包）。现已由 `officeace-lock.ts` 补齐执行路径
+    //    （锁定 + 只剩不会近期作废的桶 ⇒ 抛错，**绝不回落池**），
+    //    并由 `permanent-lock-execution.spec.ts` 守住「凡 permanentLock: true 的渠道
+    //    都必须有一条真的会读锁定表的执行路径」。
     permanentLock: true,
+    // ⚠️ 判据是「逐包到期时间是否距今天数 < 窗口」，与 buddy 系**同口径**
+    //    （`splitOfficeAceCreditsByExpiry` 与 `splitBuddyCreditsByExpiry` 逐格同构）；
+    //    窗口复用 `DSH_BUDDY_EXPIRING_WINDOW_DAYS`（默认 15 天），
+    //    与 `credits.permanentLock` RPC 回传给面板的 `windowDays` **同源**
+    //    （面板文案与实际筛号必须是同一个数）。
     usesExpiryWindow: true,
     // ⚠️ `rateLimit: false` 的**真实理由**（2026-10-13 合并审计实测订正）：
     //    本适配器**根本不写** `modelRateLimits`（`officeace-adapter.ts` 里

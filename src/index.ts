@@ -117,6 +117,9 @@ import { GEMINI } from './gemini.js'
 import { registerOfficeAceLlm } from './officeace-adapter.js'
 import { OFFICEACE } from './officeace-product.js'
 import * as officeaceAuth from './officeace-auth.js'
+// 「锁定永久积分」在 officeace 上的**唯一执行实现**（issue IKLTHB 第 ① 条：
+// 该渠道登记了 `permanentLock: true`，而原先全仓没有任何代码读这张锁定表）。
+import { createOfficeAceCredentialProvider } from './officeace-lock.js'
 import type { GeminiCredential } from './gemini.js'
 import { createGeminiSigStore } from './gemini-sigstore.js'
 import { OpencodeAdapter, registerOpencodeLlm } from './opencode-adapter.js'
@@ -2433,18 +2436,76 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // `model_app_key:secret` 的 Basic 鉴权，STS 用 refresh_token 续期（30 天），
   // 积分余额与倍率经 V11 签名直读云侧。全程**不经过 OfficeAce 客户端**
   //（协议逆向见 `officeace-auth.ts` 模块头）。
+  /**
+   * 「启用中的 OfficeAce 账号」清单（**顺序 = 用户拖拽的手动优先级**，与
+   * `getAvailableAccount` 的候选序同一份）。
+   *
+   * ⚠️ 锁定判定（逐账号看余额）与未锁定取号（取第一个）**必须共用这一份**：
+   *    各写一遍会让「锁定遍历了谁」与「未锁定用了谁」悄悄漂移 —— 而
+   *    `officeace-refresh-all.spec.ts` 的调用点普查刻意「新增即红」，正是要求
+   *    每新增一处取池都要先证明它**不是第二份遍历**。这里抽成一处即为此
+   *    （纯重构 ⇒ 那个普查的调用点计数**保持不变**）。
+   */
+  const enabledOfficeAceAccounts = () => pool.listAccountsByProvider(OFFICEACE.id)
+    .filter((entry) => entry.enabled !== false)
+
+  /**
+   * 「不理会锁定」的取号路径 = **锁定前的那条原路径，逐字保留**。
+   *
+   * 两个用途（**同一份实现**，刻意不写第二份）：
+   * 1. 未锁定态的推理取号 —— 即 `credentialProvider` 的 `resolveUnlocked`；
+   * 2. **只读目录探测**（`/v2/models` + 倍率）—— 它们不扣积分，**绝不能被锁定
+   *    牵连**（否则面板报「读取模型列表失败」、供应商关不掉、分组消失）。
+   */
+  const resolveOfficeAceCredential = async () => {
+    const available = await pool.getAvailableAccount(OFFICEACE.id, '')
+    const ref = available?.entry?.credentialRef
+      ?? enabledOfficeAceAccounts()[0]?.credentialRef
+    if (ref === undefined) return officeaceAuth.readStoredCredential()
+    return officeaceAuth.readCredential(ref, ctx.credentials as never)
+  }
+
   const officeAceAdapter = registerOfficeAceLlm(ctx, {
     disabledModels: () => pool.disabledModelsFor(OFFICEACE.id),
     // ⚠️ **按当前选中账号的 ref 取凭据**（2026-10-13）：凭据存在 DSH 凭据库里
     //    按 `credentialRef` 索引（与 gemini / raccoon 同款）。缺省会读兼容文件
     //    `session.json`，那份是**所有账号共用**的 ⇒ 号池轮换形同虚设。
-    credentialProvider: async () => {
-      const available = await pool.getAvailableAccount(OFFICEACE.id, '')
-      const ref = available?.entry?.credentialRef
-        ?? pool.listAccountsByProvider(OFFICEACE.id).find((e) => e.enabled !== false)?.credentialRef
-      if (ref === undefined) return officeaceAuth.readStoredCredential()
-      return officeaceAuth.readCredential(ref, ctx.credentials as never)
-    },
+    //
+    // ⚠️⚠️ **锁定态必须在这里分道**（Gitee issue IKLTHB 第 ① 条，2026-10-12 起
+    //     一直是哑锁）：`permanentLocked()` 在全仓只有 `credential-resolver.ts`
+    //     的 buddy / loomy 两个分支读过，而 officeace 走的是**适配器自己的**
+    //     `credentialProvider` ⇒ 面板上那个开关写进了 `permanent-locks.json`
+    //     却没有任何执行代码。判定逻辑全部在 `officeace-lock.ts`（纯函数 + 注入），
+    //     这里只负责装配：**未锁定态逐字保留原路径**（即上面那份
+    //     `resolveOfficeAceCredential`），锁定态**绝不回落池**。
+    credentialProvider: createOfficeAceCredentialProvider({
+      permanentLocked: () => pool.permanentLocked(OFFICEACE.id),
+      // 锁定判定要**逐账号**看余额 ⇒ 取全部启用账号（与未锁定取号同一份清单）。
+      accounts: () => enabledOfficeAceAccounts()
+        .map((entry) => ({ id: entry.id, credentialRef: entry.credentialRef })),
+      resolveUnlocked: resolveOfficeAceCredential,
+      readCredential: (ref) => officeaceAuth.readCredential(ref, ctx.credentials as never),
+      readStoredCredential: () => officeaceAuth.readStoredCredential(),
+      // ⚠️ **必须带 ref**（云侧 V11 直读；缺了会回落果办客户端的全局单 cookie
+      //    ⇒ 多账号判成同一份余额 ⇒ 按错误的余额决定「能不能烧永久积分」）。
+      summaryOf: async (credential, ref) => {
+        try {
+          const summary = await officeaceAuth.fetchSubscriptionSummary(48, ref, credential)
+          return summary === undefined
+            ? { ok: false, error: '读不到订阅摘要（未登录 / 云侧查询失败）' }
+            : { ok: true, summary }
+        } catch (error) {
+          return { ok: false, error: `订阅摘要查询失败：${String(error)}` }
+        }
+      },
+    }),
+    // ⚠️ **目录探测必须绕开锁定**（Gitee issue IKLTHB 第 ① 条的自查连带发现）：
+    //    `credentialProvider` 在「锁定 + 只剩永久桶」时会抛错，而
+    //    `listModels` 的调用方全都不接这个错（`dsh-llm` 直接 `await`）⇒
+    //    症状是一串与锁定无关的：面板「读取模型列表失败」、`关闭供应商` 被
+    //    `remoteError` 拒、聚合静默少一个候选、模型选择器分组消失。
+    //    只读端点不扣积分，没有理由被锁定牵连；见适配器 `probeCredential` 的表。
+    probeCredential: resolveOfficeAceCredential,
     // ⚠️ **图片输入桥**（2026-10-13）：deepseek-v4.1-flash / kimi-k2.6 实测支持
     //    多模态（1×1 PNG 探针通过）。漏接 = 用户发图后适配器报
     //    「需要附件服务」—— 图根本到不了模型。
