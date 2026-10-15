@@ -784,15 +784,22 @@ export class AggregateAdapter extends LlmAdapter {
     // officeace（2026-10-12）：华为 MaaS 云端直连渠道，`channel: true`
     // ⇒ 必须进聚合目录，否则它的模型**永不进聚合、静默不可见**。
     // ⚠️ 本数组**只是第一道门**（模型层归并）。真正决定「在不在候选表里」的是
-    //    `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS` —— 本文件 4 处按它过滤
-    //    （探测/候选/虚拟模型/价格），只加本数组是**无效接线**，症状静默。
+    //    `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`：
+    //      ① **轮换候选**的闸门 = `aggregate-expiry.ts` 的「未接入 ⇒ `UNUSABLE`」短路
+    //         （下面 `candidatesFor` 的建池处**不**按它过滤 —— 未接入渠道由那条短路
+    //          折算成 `UNUSABLE`，再由 `rankCandidates` 剔除）；
+    //      ② 本文件另有 **4 处**按它过滤（探测排序 / 面板候选 / 虚拟模型播报 /
+    //         选择器价格后缀），管的是面板与元数据面。
+    //    只加本数组是**无效接线**，症状静默；且「渠道会进聚合目录」**只在它的模型
+    //    与已接入渠道共用规范名时成立** —— **独有模型**会被 `refreshCatalog` 的
+    //    `.some(...)` 过滤整个剔掉，连目录都进不去。
     // ✅ officeace 白名单**已于 2026-10-13 补齐**（`026a7db` "feat(officeace):
     //    接入聚合轮换"）：折算原语 `officeaceExpiry`（与 buddy 系同形，逐包
     //    `expiresAt`）+ `WIRED_EXPIRY_PROVIDERS` + `provider-expiry.ts` 的
     //    `createProviderExpiry()` 三处同改，后两者的一致性由
     //    `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁住。
     //    ⚠️ 本注释此前写着「officeace **未接入**……可接而未接」，那句在
-    //    2026-10-13 之后**已过期**（同一陷阱的第三次复发，见 accio 那条）——
+    //    2026-10-13 之后**已过期**（同类陷阱再次出现，见 accio 那条）——
     //    留着它会让人以为聚合里看不到 officeace，故更正。
     'officeace',
     // ⚠️⚠️ accio（阿里 Accio Work，2026-10-13）—— 两件事**都要**做，缺一即静默：
