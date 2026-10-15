@@ -466,8 +466,12 @@ export function createProviderCredits(
      * 会让国际站账号的签到/余额打到 `agent.minimax.cn`，而两站**账号不互通**
      * ⇒ 必然 401，症状是「国际站账号的积分永远查询失败」，且**不报错到面板以外**。
      *
-     * ⚠️ 三项**未真机验证**（本机无国际站账号）：签到端点形状假设与中国版同形，
-     * 见 `src/minimax-product.ts` 文件头的未实测清单。
+     * ⚠️ **验证状态如实标注**（2026-10-16 合并审计修正 —— 原文写「三项未真机验证」
+     * 并指向一个**并不存在**的「未实测清单」，与 `src/minimax-product.ts`
+     * 文件头的「✅ 已真机验证」互相否定）：**签到 / 积分三个入口已真机验证通过**
+     * （2026-10-15，真实国际站账号返回 200；见 `src/minimax-product.ts` 文件头与
+     * `tests/e2e/minimaxintl-probe.e2e.spec.ts`）。**未验证的只有兜底模型表**
+     * （与国内站共用同一份，仅远端失败时兜底）。
      */
     minimaxintl: {
       fetchBalance: (credential) =>

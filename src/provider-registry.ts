@@ -306,8 +306,12 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
      *    `true` 是**正确**的，且必须同时进 `probeById` 与
      *    `WRITES_RATE_LIMIT_PROVIDERS`（否则标记写进去却永远清不掉）。
      *
-     * ⚠️ 三项**未真机验证**（无国际站账号）：推理路径、签到端点形状、兜底模型表
-     *    —— 见 `src/minimax-product.ts` 文件头的未实测清单。
+     * ⚠️ **验证状态如实标注**（2026-10-16 合并审计修正 —— 原文写「三项未真机验证」
+     *    并指向一个**并不存在**的「未实测清单」，与 `src/minimax-product.ts`
+     *    文件头的「✅ 已真机验证」互相否定）：推理路径与签到/积分端点形状
+     *    **已真机验证通过**（2026-10-15，真实国际站账号；见该文件头的实测表与
+     *    `tests/e2e/minimaxintl-probe.e2e.spec.ts`）。**只有兜底模型表**未按国际站
+     *    远端采集（与国内站共用同一份，仅远端失败时兜底）。
      */
     id: 'minimaxintl',
     label: 'MiniMax Code (国际版)',
