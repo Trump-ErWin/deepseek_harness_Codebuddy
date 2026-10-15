@@ -77,7 +77,15 @@ export function deriveRequestId(): string {
   return `req_${randomBytes(16).toString('hex')}`
 }
 
-/** V2 UA 为 opencode/<channel>/<version>/<client>；本机旧 CLI 不得降级协议。 */
+/**
+ * V2 UA 外形为 `opencode/<channel>/<version>/<client>`。
+ *
+ * ⚠️ 实测（2026-10-15，逐变量对照 2×2×2，每格 2 次）：UA **不参与**聊天门禁 ——
+ * `user-agent: opencode/1.18.22`（本机 1.x CLI 的真实值）在其余两项正确时照样
+ * HTTP 200。故这里把 2.x 覆盖成 `latest/<v>/cli`、把 1.x 回落成默认 V2 串，
+ * 只是**外形一致**，不是过门禁的必要条件；别再把它写成「不换就 403」。
+ * （真正必需的是 `x-opencode-session-id` 与降序 session 算法。）
+ */
 export function opencodeUserAgent(override?: string): string {
   const value = override?.trim() ?? ''
   if (/^opencode\/[A-Za-z0-9_-]+\/2\.\d+\.\d+\/cli$/.test(value)) return value
@@ -85,14 +93,19 @@ export function opencodeUserAgent(override?: string): string {
   return version === undefined ? OPENCODE.defaultUserAgent : `opencode/latest/${version}/cli`
 }
 
-/** 构造发往 Zen 的完整指纹头集。 */
+/** 构造发往 V2（`/inference`）的完整指纹头集。 */
 export function opencodeHeaders(
   fingerprint: OpencodeFingerprint,
   sessionId: string,
   _requestId: string,
   userAgent: string,
 ): Record<string, string> {
-  // 保留旧调用签名但不发送 x-opencode-request：V2 不接受旧版非标准 request ID。
+  // 保留旧调用签名但**绝不**发送 x-opencode-request。逐头实测（2026-10-15，每格 2 次）：
+  // - 只带 project/session/client 三头（无 request、无 affinity）→ 403；
+  // - 只加 `x-opencode-session-id` → **200**（唯一必需的那一个）；
+  // - 只加 `x-session-affinity` 或只加 `X-Session-Id` → 403；
+  // - 带上 `x-opencode-request`（即使三个 affinity 头都在）→ 403（旧客户端标记即毒药）。
+  // 三个 affinity 头保留冗余只为贴合真实 CLI 外形，判定依据是上面这组对照。
   return {
     'x-opencode-project': fingerprint.projectId,
     'x-opencode-session': sessionId,

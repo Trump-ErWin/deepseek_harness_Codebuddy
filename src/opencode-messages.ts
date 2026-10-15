@@ -109,6 +109,15 @@ export interface OpencodeRequestShape {
   toolsDisabled: boolean
 }
 
+/**
+ * 客户端工具的上游别名前缀。
+ *
+ * ⚠️ **唯一定义处**：响应层的剔除判据要用它区分「我们自己的产物」（`dsh_` 开头 ⇒
+ * 别名表或历史重命名可能有缺陷）与「模型幻觉的名字」—— 两处各写一份字面量
+ * 会在改前缀时静默漂移（本仓库已登记「一文件两套同义判据」这条判据）。
+ */
+export const ALIAS_PREFIX = 'dsh_'
+
 /** 不修改调用者对象；每个请求仅调用一次，响应层必须使用返回的同一份映射。 */
 function adaptPayload(payload: RecordValue): OpencodeRequestShape {
   const toolsDisabled = payload.tool_choice === 'none' || !Array.isArray(payload.tools) || payload.tools.length === 0
@@ -121,7 +130,7 @@ function adaptPayload(payload: RecordValue): OpencodeRequestShape {
   for (const tool of tools) {
     const name = tool.function.name
     if (names.has(name)) continue
-    const base = `dsh_${name.replace(/[^A-Za-z0-9_-]/g, '_')}`.slice(0, 60)
+    const base = `${ALIAS_PREFIX}${name.replace(/[^A-Za-z0-9_-]/g, '_')}`.slice(0, 60)
     let alias = base
     let suffix = 1
     while (present.has(alias)) {
@@ -145,7 +154,11 @@ function adaptPayload(payload: RecordValue): OpencodeRequestShape {
     stream: true,
     stream_options: { include_usage: true },
   } as RecordValue
-  // V2 拒绝显式 none；禁用与保留工具隔离必须由响应层强制执行，不能只靠描述。
+  // ⚠️ 实测（2026-10-15，匿名通道 big-pickle/mimo/longcat）：V2 **接受**显式
+  // `tool_choice:none`（HTTP 200），但后端**不执行**它 —— 同一句「读取 /tmp/a.txt」
+  // 在 `tool_choice:none` 下照样产出 `read` 调用。故「不发 none」不是为了过门禁
+  // （门禁只看 body 里 tools 的形状），而是因为发了也没有约束力、徒增一处分歧；
+  // 禁用与保留工具的隔离**必须**由响应层逐调用强制（见 `opencode-stream.ts`）。
   if (toolsDisabled || payload.tool_choice == null) delete body.tool_choice
   else body.tool_choice = renameChoice(payload.tool_choice, names)
   if (names.size > 0 && Array.isArray(payload.messages)) {

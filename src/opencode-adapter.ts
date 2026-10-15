@@ -616,7 +616,9 @@ export class OpencodeAdapter extends LlmAdapter {
         },
       )
     }
-    const normalized = normalizeOpencodeResponse(response, request)
+    // ⚠️ 传 `warn`：响应层剔除未知/保留/残缺工具名时必须在宿主日志留痕，
+    // 否则「模型不再调工具」会变成一条查不出原因的静默退化。
+    const normalized = normalizeOpencodeResponse(response, request, this.options.warn)
     try {
       yield* consumeOpenAiSse(normalized, options.signal !== undefined ? { signal: options.signal } : {}, {
         label: 'opencode',
