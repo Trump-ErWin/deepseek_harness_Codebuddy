@@ -21,23 +21,22 @@ describe('buildOpencodeTools', () => {
 })
 
 describe('OpenCode V2 门禁', () => {
-  it('补 shell/read，不再发 bash 或显式 tool_choice:none', () => {
+  it('只补 read 门禁，不注入 shell/bash 或显式 tool_choice:none', () => {
     const payload = buildOpencodePayload(base)
-    expect(namesOf(payload)).toEqual(['shell', 'read'])
+    expect(namesOf(payload)).toEqual(['read'])
     expect(payload.tool_choice).toBeUndefined()
     expect(payload.stream).toBe(true)
     expect(payload.stream_options).toEqual({ include_usage: true })
   })
-  it.each([
-    ['shell', 'command', 'Execute a shell command and return its output.'],
-    ['read', 'path', 'Read the contents of a file or directory.'],
-  ])('%s 门禁具有真实描述前缀、必填参数与非空 schema', (name, required, prefix) => {
-    const tools = buildOpencodePayload(base).tools as Array<{ function: { name: string; description: string; strict: boolean; parameters: { required: string[]; properties: Record<string, { type: string }>; additionalProperties: boolean } } }>
-    const fn = tools.find((tool) => tool.function.name === name)!.function
-    expect(fn.description.startsWith(prefix)).toBe(true)
-    expect(fn.description).toMatch(/do not call/i)
-    expect(fn.parameters.required).toEqual([required])
-    expect(fn.parameters.properties[required]!.type).toBe('string')
+  it('read 门禁保留参数 schema，描述只提示禁止调用', () => {
+    const tools = buildOpencodePayload(base).tools as Array<{ function: { name: string; description: string; strict: boolean; parameters: { required: string[]; properties: Record<string, { type: string; minimum?: number }>; additionalProperties: boolean } } }>
+    const fn = tools.find((tool) => tool.function.name === 'read')!.function
+    expect(fn.description).toBe('Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead.')
+    expect(fn.parameters.required).toEqual(['path'])
+    expect(fn.parameters.properties.path!.type).toBe('string')
+    expect(fn.parameters.properties.offset).toMatchObject({ type: 'integer', minimum: 0 })
+    expect(fn.parameters.properties.limit).toMatchObject({ type: 'integer', minimum: 0 })
+    expect(Object.keys(fn.parameters.properties)).toEqual(['path', 'offset', 'limit'])
     expect(fn.parameters.additionalProperties).toBe(false)
     expect(fn.strict).toBe(false)
   })
@@ -46,7 +45,7 @@ describe('OpenCode V2 门禁', () => {
     const tools = ['read', 'shell', 'edit', 'write', 'glob', 'grep'].map((name) => ({ name, description: '客户端工具', parameters }))
     const payload = buildOpencodePayload({ ...base, tools })
     const wire = payload.tools as Array<{ function: { name: string; parameters: unknown; description: string } }>
-    expect(namesOf(payload)).toEqual([...tools.map((tool) => `dsh_${tool.name}`), 'shell', 'read'])
+    expect(namesOf(payload)).toEqual([...tools.map((tool) => `dsh_${tool.name}`), 'read'])
     for (const fn of wire.slice(0, tools.length).map((tool) => tool.function)) {
       expect(fn.parameters).toBe(parameters)
       expect(fn.description).toContain('客户端工具')
@@ -90,7 +89,7 @@ describe('OpenCode V2 门禁', () => {
   })
   it('显式 none 移除客户端工具，不透传 none，响应层负责禁用语义', () => {
     const payload = ensureFreeLaneShape({ messages: [], tools: [{ type: 'function', function: { name: 'read' } }], tool_choice: 'none' })
-    expect(namesOf(payload)).toEqual(['shell', 'read'])
+    expect(namesOf(payload)).toEqual(['read'])
     expect(payload.tool_choice).toBeUndefined()
   })
   it('非 chat body 不改写', () => {

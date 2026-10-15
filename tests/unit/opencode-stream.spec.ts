@@ -33,7 +33,7 @@ describe('OpenCode 专用响应归一', () => {
     expect(fetchSpy.mock.calls[0]![0]).toBe('https://opencode.ai/inference/v1/chat/completions')
     const init = fetchSpy.mock.calls[0]![1] as RequestInit
     const body = JSON.parse(String(init.body))
-    expect(body.tools.map((tool: { function: { name: string } }) => tool.function.name)).toEqual([...toolNames.map((name) => `dsh_${name}`), 'shell', 'read'])
+    expect(body.tools.map((tool: { function: { name: string } }) => tool.function.name)).toEqual([...toolNames.map((name) => `dsh_${name}`), 'read'])
     const deltas = chunks.filter((chunk) => chunk.type === 'tool-call-delta')
     expect(deltas.map((chunk) => chunk.argumentsDelta).join('')).toBe('{"path":"文件"}')
     expect(deltas.every((chunk) => chunk.name === 'read')).toBe(true)

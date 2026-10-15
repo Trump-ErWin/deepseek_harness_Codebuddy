@@ -42,6 +42,9 @@ async function ask(model: string, text: string): Promise<string> {
 suite('opencode 匿名通道 e2e', () => {
   it('完整客户端工具集通过 V2 门禁，调用还原原名，回传历史可继续对话', async () => {
     // 只检查模型产出的调用并回传模拟结果，不执行真实读文件/命令等操作。
+    // ⚠️ 上游首字节实测在 3~25 秒之间波动（同一台机器同一天），故每个请求给 90 秒预算；
+    // 预算太紧会把「上游慢」误报成协议回归。
+    const budget = (): AbortSignal => AbortSignal.timeout(90_000)
     const tools = ['read', 'shell', 'edit', 'write', 'glob', 'grep'].map((name) => ({
       name,
       description: `客户端 ${name} 工具；read 用 file_path 读取模拟文件`,
@@ -52,7 +55,7 @@ suite('opencode 匿名通道 e2e', () => {
     })
     const messages: Array<{ role: string; content: unknown[] }> = [{ role: 'user', content: [{ type: 'text', text: '请调用客户端 read 工具读取文件 /virtual/probe.txt，只调用工具，不直接回答。不要调用保留工具。' }] }]
     const chunks: StreamChunk[] = []
-    for await (const chunk of adapter.stream({ provider: 'opencode', model: 'big-pickle', messages, tools, maxTokens: 1024, signal: AbortSignal.timeout(45_000) } as unknown as GenerateOptions)) chunks.push(chunk)
+    for await (const chunk of adapter.stream({ provider: 'opencode', model: 'big-pickle', messages, tools, maxTokens: 1024, signal: budget() } as unknown as GenerateOptions)) chunks.push(chunk)
     const calls = chunks.filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call').map((chunk) => chunk.block)
     expect(calls).toHaveLength(1)
     expect(calls[0]).toMatchObject({ name: 'read' })
@@ -62,11 +65,13 @@ suite('opencode 匿名通道 e2e', () => {
     messages.push({ role: 'user', content: [{ type: 'tool-result', toolCallId: id, content: [{ type: 'text', text: 'OPENCODE_V2_HISTORY_OK' }] }] })
     messages.push({ role: 'user', content: [{ type: 'text', text: '读取已成功，别再调用工具，只原样回复刚才的文件内容。' }] })
     let text = ''
-    for await (const chunk of adapter.stream({ provider: 'opencode', model: 'big-pickle', messages, tools, maxTokens: 256, signal: AbortSignal.timeout(45_000) } as unknown as GenerateOptions)) {
+    for await (const chunk of adapter.stream({ provider: 'opencode', model: 'big-pickle', messages, tools, maxTokens: 256, signal: budget() } as unknown as GenerateOptions)) {
       if (chunk.type === 'text-delta') text += chunk.text
     }
     expect(text).toContain('OPENCODE_V2_HISTORY_OK')
-  }, 120_000)
+    // eslint-disable-next-line no-console
+    console.log('[opencode e2e] 两轮真实请求均完成，工具调用还原为 read，历史回传后续对话正常')
+  }, 240_000)
 
   it('目录可拉到（只含免费模型）', async () => {
     clearOpencodeCatalogCache()
