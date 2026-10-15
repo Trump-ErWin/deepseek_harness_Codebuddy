@@ -1,6 +1,18 @@
 <!-- 搬自 AGENTS.md 的「深细节索引」惯例：事故史与逐项规则放本文件，按需阅读，
      不进每轮注入。内容与 src/opencode-proxy.ts 的 proxyFetch 注释互为对照。 -->
 
+## OpenCode V2 协议更新
+
+- 推理/目录端点改为 `https://opencode.ai/inference/v1`；默认 UA 为 `opencode/latest/2.0.29/cli`，本机 1.x CLI 不得把请求降级回旧协议。
+- session 外形仍是 `ses_ + 12hex + 14base62`，但首段必须按 `~(timestamp * 0x1000 + 1)` 的低 48 位生成，不能使用裸时间戳或随机 hex。
+- V2 不发送旧 `x-opencode-request`；`x-opencode-session`、`x-opencode-session-id`、`x-session-affinity`、`X-Session-Id` 复用同一 session。
+- 门禁工具**只保留 `read`**（名字与 `path/offset/limit` 参数 schema 必须保持上游形态，改名或空 properties 会 403）；不再注入 `shell`，也不再发显式 `tool_choice:none`。描述不参与校验，用最直白的禁止调用文案。无客户端工具时由响应层拦截工具调用，不能只靠描述。
+- **客户端工具别名统一使用 `dsh_` 前缀**。所有客户端工具（包括 edit/write）都映射；定义、历史调用、指定工具选择同步改名，调用 id、参数 schema、结果正文不变。响应名字跨帧拼接后还原，缺失 index 按调用身份归并，保留/未知/不完整名字不交给宿主执行。
+- 归一只在 `src/opencode-stream.ts` 的 OpenCode 专用前置流中完成，**不修改共享 `src/openai-compat.ts`**；不新增 SSE 单事件大小上限。取消/提前结束须释放前置流及上游连接。
+- 保留账号池的指纹代次、代理同源 fetch、额度分类/换槽与思考档位。不擅自设置默认输出预算；DSH `system` 转成标准 chat system 消息，不注入 OpenCode 身份提示词。
+
+验证：原匿名 E2E 夹具传空池，先修夹具后得到目录成功、两次真实聊天均 `FreeTierError` 的基线；V2 修复后目录、两条最小聊天、完整客户端工具集与工具历史回传均通过。付费 API key 通道未做真实额度测试。
+
 ## ⚠️⚠️ OpenCode 出口代理：dispatcher 与 fetch **必须同源**（Issue IKK4BY）
 
 **用户报障**（2026-10-08，Gitee issue IKK4BY）：「OpenCode 账号的代理按钮，
