@@ -251,8 +251,18 @@ export function sortCandidatesByExpiry(rows) {
     return typeof value === 'number' && Number.isFinite(value) ? value : Number.POSITIVE_INFINITY
   }
   return [...rows].sort((a, b) => {
-    const byExpiry = of(a) - of(b)
-    if (byExpiry !== 0) return byExpiry
+    const expiryA = of(a)
+    const expiryB = of(b)
+    // ⚠️⚠️ **必须先判 `!==` 再相减**（真实缺陷，2026-10-16 对抗审计实测）：
+    //    原先写的是 `const byExpiry = of(a) - of(b); if (byExpiry !== 0) return byExpiry`，
+    //    而两个 `Infinity`（「长期」）或两个 `-1`（「查不到」）相减得 **`NaN`** ——
+    //    `NaN !== 0` 为 **真** ⇒ 直接把 `NaN` 当比较器返回值 ⇒ 引擎按 `0` 处理
+    //    ⇒ **第二档 `localeCompare` 永不执行** ⇒ 同档内顺序退化成**输入顺序**
+    //    （随目录返回顺序漂移），与函数头写下的「相同 expiry 按 provider 升序」不符。
+    //    实测：`[officeace(-1), accio(-1)]` 输出 `officeace, accio`（应为 `accio, officeace`）；
+    //    两个 `Infinity` 同样失效（那一格早于本 PR 存在）。
+    //    ⇒ 判据与同文件的 `rankCandidatesForPanel`（:573 一带）**逐格同构**。
+    if (expiryA !== expiryB) return expiryA - expiryB
     return String(a?.provider ?? '').localeCompare(String(b?.provider ?? ''))
   })
 }
@@ -562,6 +572,16 @@ export function rankCandidatesForPanel(candidates, rankMap, expiryOf) {
   }
   const expiryOfCandidate = (candidate) => {
     const value = expiryOf?.(candidate?.provider)
+    // ⚠️⚠️ **必须显式排除哨兵 `UNUSABLE = -1`**（真实缺陷，2026-10-16 审计实测）：
+    //    本行原先是 `typeof value === 'number' && !Number.isNaN(value)`，而
+    //    **`-1` 满足那个条件** ⇒ 它算出的排序键是 `-1`，比任何真实毫秒时间戳
+    //   （约 1.7e12）都小 ⇒ 「**查不到**」的候选排到**最前**
+    //   ⇒ 面板显示「第 1 名」而宿主 `rankCandidates` **根本不会用它**（它对
+    //    `UNUSABLE` 是**剔除**）—— 面板与真实轮换序分叉（本仓库红线）。
+    //
+    // ⚠️ 同文件的 `sortCandidatesByExpiry` **有**这一支（且它的注释记录了同一个
+    //    真缺陷）—— 本函数是后来新增的，**漏抄了那一格**。⇒ 两处必须逐格同构。
+    if (value === -1) return Number.POSITIVE_INFINITY
     return typeof value === 'number' && !Number.isNaN(value) ? value : Number.POSITIVE_INFINITY
   }
   return [...candidates].sort((a, b) => {

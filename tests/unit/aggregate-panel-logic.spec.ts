@@ -390,6 +390,30 @@ describe('★ 面板「按临期排序」（零探测为默认，点了才探测
     expect(sortCandidatesByExpiry(rows).map((r) => r.provider)).toEqual(['real', 'unknown'])
   })
 
+  it('★★ 「同档」的 tiebreak 必须**真的生效**（`NaN` 陷阱：2026-10-16 对抗审计实测）', () => {
+    // ⚠️⚠️ **真实缺陷**（对抗审计独立复现，我逐条复跑确认）：
+    //    原实现是 `const byExpiry = of(a) - of(b); if (byExpiry !== 0) return byExpiry`，
+    //    而两个 `Infinity`（「长期」）或两个 `-1`（「查不到」，`of()` 把它映射成 `Infinity`）
+    //    相减得 **`NaN`** —— 而 **`NaN !== 0` 为真** ⇒ 直接把 `NaN` 返回给 `sort`
+    //    ⇒ 引擎按 `0` 处理 ⇒ **第二档 `localeCompare` 永不执行**
+    //    ⇒ 同档内部顺序退化成**输入顺序**（随目录返回顺序漂移）。
+    //
+    //    ⚠️ 这一格**早于本 PR 存在**（两个 `Infinity` 那种），不是本 PR 引入；
+    //    但本 PR 让它的**可见面变大**（新增了「查不到」档）。
+    //    ⚠️ 判据必须**逐个同档形态**覆盖 —— 只测「两个有限且相等」那格会漏掉这里的
+    //    两个分支（`Infinity` 对 / `-1` 对 / 混排），那正是原用例的盲区。
+    const cases = [
+      ['两个 -1（查不到）', [{ provider: 'officeace', expiry: -1 }, { provider: 'accio', expiry: -1 }], ['accio', 'officeace']],
+      ['两个 Infinity（长期）', [{ provider: 'zcode', expiry: Infinity }, { provider: 'buddy', expiry: Infinity }], ['buddy', 'zcode']],
+      ['-1 与 Infinity 混排', [{ provider: 'zcode', expiry: Infinity }, { provider: 'accio', expiry: -1 }], ['accio', 'zcode']],
+      ['两个 undefined（缺值）', [{ provider: 'zcode' }, { provider: 'buddy' }], ['buddy', 'zcode']],
+    ]
+    for (const [label, rows, expected] of cases) {
+      expect(sortCandidatesByExpiry(rows).map((r) => r.provider), `★ ${label} 必须按 provider 升序`)
+        .toEqual(expected)
+    }
+  })
+
   it('★ 纯函数：不得改动入参（expiry 排序）', () => {
     const rows = [
       { provider: 'b', expiry: 2 },
@@ -523,6 +547,33 @@ describe('★ 面板接线：默认零探测，点了才探测（防「面板没
     // ★ 且必须有 onDragEnd 清引用（拖到无效区 / 按 Esc 不会有 drop ⇒ 残留会让
     //   下一次 hover 被当成「正在拖」而 preventDefault）。
     expect(aggBody, '★ 必须有 onDragEnd 清 dragKeyRef').toMatch(/onDragEnd/)
+
+    // ⚠️⚠️ **必须同时排除「死分支」写法**（2026-10-16 对抗审计实测的共同弱点）：
+    //    这批源码断言都是**文本存在性**判据，而把命中行包进 `if (false) { … }`
+    //    （短路禁用）后**字面量仍在** ⇒ 断言照样通过，而那行代码**永不执行**。
+    //    实测四条全绿：`setData` / `commitOrder` / `onSortByExpiry` / `onDragEnd`。
+    //    ⇒ 单测环境无 react / 无 DOM（`environment: 'node'`）⇒ 组件内部逻辑
+    //    **无法行为测试**，只能用「结构性判据」补强。这里做两件事：
+    //    ① 该行**不得**出现在 `if (false)` / `if (0)` / `while (false)` 这类
+    //       常量假条件块里（用**行级**检查：命中行往上找最近的条件语句）；
+    //    ② 该行必须**不以注释形态**存在（`codeOf` 已剥注释，这里是双保险）。
+    const deadBranchAround = (text, needle) => {
+      const lines = text.split('\n')
+      const hit = lines.findIndex((l) => l.includes(needle))
+      if (hit < 0) return false
+      // 往上最多找 12 行，遇到常量假条件的 `if (` 就判为死分支。
+      for (let i = hit; i >= Math.max(0, hit - 12); i -= 1) {
+        if (/if\s*\(\s*(false|0)\s*\)/.test(lines[i])) return true
+        if (/while\s*\(\s*(false|0)\s*\)/.test(lines[i])) return true
+        // 遇到函数/属性的起始（说明已跨出本语句）就停。
+        if (/\b(onDrop|onDragStart|onDragEnd|onDragOver):/.test(lines[i]) && i !== hit) break
+      }
+      return false
+    }
+    expect(deadBranchAround(aggBody, "dataTransfer.setData('text/plain'"),
+      '★★ `setData` 不得被包进 `if (false)` 死分支（那等于拖动永远不生效）').toBe(false)
+    expect(deadBranchAround(aggBody, 'void commitOrder('),
+      '★★ `commitOrder` 不得被包进死分支（那等于拖动永不落盘）').toBe(false)
   })
 
   it('★ 候选行不再重复渲染「无临期积分 · 未参与」文字（用户要求）', () => {
@@ -650,6 +701,28 @@ describe('★ 面板接线：默认零探测，点了才探测（防「面板没
     // ★ 反向：不得出现「无条件探测」那两行的残留（`load(true)` 后直接 `await onSortByExpiry()`）。
     expect(body, '★ 不得无条件探测')
       .not.toMatch(/await load\(true\);\s*\n\s*await onSortByExpiry\(\);/)
+    // ⚠️⚠️ **同时排除「死分支 + 无条件」组合**（2026-10-16 对抗审计实测）：
+    //    保留 `if (mode === 'expiry') await onSortByExpiry()` 这行字面量、
+    //    再在下面加一句**无条件**的 `await onSortByExpiry()`，上面两条断言**全绿**。
+    //    ⇒ 判据：**数出** `onSortByExpiry()` 的调用点，再要求「每一个都被条件包着」。
+    //    ⚠️ 我第一版用「往上找 6 行内有无 `if (`」—— **抓不到**（它找到了**相邻**那条
+    //    `if` 语句的 `if`，于是把无条件调用误判成有条件的）。改用**缩进**：
+    //    无条件调用的缩进与它上面那条 `if (...)` 语句**同级**（都是语句层），
+    //    而有条件调用会**更深**（在 `if` 体内）。
+    const calls = [...body.matchAll(/(\n[ \t]*)(await )?onSortByExpiry\(\)(?!\s*=>)/g)]
+    const unconditional = calls.filter((m) => {
+      const indent = m[1].replace('\n', '').length
+      const upper = body.slice(0, m.index).split('\n').filter((l) => l.trim().length > 0)
+      const last = upper[upper.length - 1] ?? ''
+      const lastIndent = last.length - last.trimStart().length
+      // 上一条非空语句若以 `if (` 开头且**缩进同级**（或更浅），它就是本调用的守卫。
+      const guarded = /if\s*\(/.test(last.trim()) && lastIndent <= indent
+      return !guarded
+    })
+    expect(unconditional.length, '★★ 每个 `onSortByExpiry()` 调用点都必须被条件包住')
+      .toBe(0)
+    // ★ 判据自检：必须**真的**数到了调用点（否则上面那条因「一个都没匹配到」而恒真）。
+    expect(calls.length, '★ 判据自检：必须数到 onSortByExpiry 的调用点').toBeGreaterThan(0)
   })
 
   it('★ 空态提示必须引用那份渠道清单（清单**内容**由下方 ★★ 守卫锁）', () => {
@@ -1056,13 +1129,20 @@ describe('★★ 手工排序纯函数（拖动 / 上移下移 / 提交数组）
     // ⚠️⚠️ 这是本组**最重要**的一条：面板显示顺序与真实轮换顺序分叉正是本仓库红线
     //    （「拖了排序却按别的顺序走」）。判据 = 同一份 fixture 过两个实现、逐项相等。
     //    ⚠️ fixture 必须含：两个 NEVER（倍率不同）、一个手工排过的晚临期候选、一个未排过的候补。
-    const { rankCandidates, NEVER } = await import('../../src/aggregate-core.js')
+    //    ⚠️⚠️ **还必须含一个 `UNUSABLE`（-1）候选**（2026-10-16 审计实测的漏网）：
+    //    原来的 fixture **全是有限值或 `NEVER`** ⇒ `rankCandidatesForPanel` 漏掉
+    //    `-1` 哨兵分支（把「查不到」排到最前）时**这条恒绿**，我自己注入变异验证过。
+    //    ⇒ 加这一格后，宿主（对 `UNUSABLE` 是**剔除**）与面板（**排最后**）的差异
+    //    会被这条用例看见 —— 两者的**共同不变量**是「`UNUSABLE` 绝不出现在有限临期之前」。
+    const { rankCandidates, NEVER, UNUSABLE } = await import('../../src/aggregate-core.js')
     const candidates = [
       c('tail-b', 'r', { expiry: 500, price: 1 }),
       c('ranked', 'r', { expiry: NEVER, price: 9 }),
       c('never-cheap', 'r', { expiry: NEVER, price: 2 }),
       c('never-pricey', 'r', { expiry: NEVER, price: 7 }),
       c('tail-a', 'r', { expiry: 100, price: 5 }),
+      // ★ 「查不到」的候选：宿主会**剔除**它，面板保留可见但必须**排最后**。
+      c('unusable', 'r', { expiry: UNUSABLE, price: 1 }),
     ]
     const rankMap = new Map([['ranked\u0000r', 0]])
     const expiryOf = (provider) => candidates.find((x) => x.provider === provider).expiry
@@ -1070,7 +1150,28 @@ describe('★★ 手工排序纯函数（拖动 / 上移下移 / 提交数组）
     const host = rankCandidates(candidates, (x) => rankMap.get(`${x.provider}\u0000${x.realId}`))
       .map((x) => x.provider)
     const panel = rankCandidatesForPanel(candidates, rankMap, expiryOf).map((x) => x.provider)
-    expect(panel, '★ 面板顺序必须与宿主逐项相同').toEqual(host)
+
+    // ⚠️ 不能直接 `toEqual`：宿主**剔除** `UNUSABLE` 而面板**保留**它（那是刻意的 ——
+    //    用户要在面板里看得到它、以及为什么没参与）。⇒ 判据是**共同不变量**：
+    //    ① 面板顺序去掉 unusable 后，必须与宿主**逐项相同**；
+    //    ② unusable 必须排在**所有**有有限临期的候选**之后**（绝不出现在最前）。
+    expect(panel.filter((p) => p !== 'unusable'), '★ 面板顺序（剔除 unusable）必须与宿主逐项相同')
+      .toEqual(host)
+    expect(host, '★ 宿主必须剔除 UNUSABLE（前置：证明上面那条不是恒真）').not.toContain('unusable')
+    // ⚠️⚠️ 判据必须**直接打在 `-1` 的排序位置上**（我第一版写成「排在有限临期之后」，
+    //    实测**抓不到**：`ranked` 的手工位次是 0（严格优先），故去掉 `-1` 分支后
+    //    `unusable` 只排到第 1 位、仍然「在某个有限临期之后」⇒ 断言通过。
+    //    ⇒ 改为与 `sortCandidatesByExpiry` 那条守卫**同型**的判据：
+    //    在**没有手工位次**的对照世界里，`-1` 必须排在一个**极小有限值**（如 1）之后。
+    const plain = [
+      c('unknown', 'r', { expiry: UNUSABLE }),
+      c('real', 'r', { expiry: 1 }),
+    ]
+    expect(
+      rankCandidatesForPanel(plain, null, (p) => plain.find((x) => x.provider === p).expiry)
+        .map((x) => x.provider),
+      '★ UNUSABLE(-1) 必须排在极小有限临期(1) **之后** —— 去掉 -1 分支时这里会变红',
+    ).toEqual(['real', 'unknown'])
     // 防「两边都空/都原序」让上面那条恒真：
     expect(host[0], '手工排过的必须第一').toBe('ranked')
     expect(host).toContain('never-cheap')
@@ -1348,32 +1449,48 @@ describe('★★ 按临期重探定时器（第 5 条判据，此前零覆盖）
     //    漏改的症状正是本项目反复处理的「面板没说真话」：界面写着「每 5 分钟」，
     //    实际每 2 分钟打一次上游。
     //    ⇒ 判据：从常量里**读出**真实分钟数，再去核对所有复述它的文案。
+    //
+    // ⚠️⚠️ **判据必须「全体一致」，不能只判「存在 + 若干黑名单」**
+    //（2026-10-16 对抗审计实测的真实守卫缺口）：
+    //    原实现是 `stale = ['每 5 分钟','每 10 分钟','每 3 分钟','每 1 分钟']` 的
+    //    **硬编码黑名单** + 一条 `toContain(当前值)`。实测把 5 处文案**全改成「每 9 分钟」**
+    //    再插入**一句**「每 2 分钟」⇒ 守卫**照样通过**（黑名单不含 9、存在性也被那一句满足）
+    //    —— 而真实文案全错。删掉 5 处中的 1 处它也绿（`toContain` 不数个数）。
+    //    ⇒ 改为：用 `matchAll(/每\s*\d+\s*分钟/g)` **枚举所有出现**，逐个断言必须等于当前值。
+    //    这样任何「改了常量但漏改某处」「文案写成别的分钟数」都会立刻变红。
     const panel = readFileSync(resolve(here, '../..', 'plugin-src/client/jet-hub.js'), 'utf8')
     const m = /const AGG_EXPIRY_REPROBE_MS = (\d+) \* 60 \* 1000/.exec(panel)
     expect(m, '常量必须是 `<N> * 60 * 1000` 形态（否则本条读不出分钟数）').not.toBeNull()
     const minutes = Number(m?.[1])
     expect(Number.isFinite(minutes) && minutes > 0, '分钟数必须为正').toBe(true)
-    // ⚠️ 只在 `jet-hub.js` 的非注释文本里判「过时文案」：注释里会**讨论**这个值
-    //（例如「否则面板会说自己『每 5 分钟』而实际不是」）—— 那是留档说明，不是过时文案。
+    // ⚠️ 只在 `jet-hub.js` 的**非注释**文本里判：注释里会**讨论**这个值
+    //（例如「否则面板会说自己『每 5 分钟』而实际不是）—— 那是留档说明，不是过时文案。
     const panelCodeOnly = panel
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .replace(/^[ \t]*\/\/.*$/gm, '')
-    // ⚠️ 若将来改成非整分钟（如 90 秒），本条会**主动失败**提醒改判据 —— 那是刻意的：
-    //    复述「每 N 分钟」的文案在那种情况下必须重写成「每 N 秒」。
-    const stale = ['每 5 分钟', '每 10 分钟', '每 3 分钟', '每 1 分钟']
-      .filter((t) => t !== `每 ${minutes} 分钟`)
-    for (const t of stale) {
-      expect(panelCodeOnly, `★ jet-hub.js 代码里不得残留过时间隔文案「${t}」（当前是每 ${minutes} 分钟）`)
-        .not.toContain(t)
-    }
-    // ★ 必须真的复述当前值（否则「改了常量但一处文案都没提」也会被漏掉）。
-    expect(panelCodeOnly, `★ jet-hub.js 代码里必须复述当前间隔「每 ${minutes} 分钟」`)
-      .toContain(`每 ${minutes} 分钟`)
-    // ★ README 的表格与说明也必须同步（它是最外层用户文档）。
     const readme = readFileSync(resolve(here, '../..', 'README.md'), 'utf8')
-    for (const t of stale) {
-      expect(readme, `★ README 里不得残留过时间隔文案「${t}」`).not.toContain(t)
+
+    /** 枚举一段文本里所有「每 N 分钟」并逐个核对（返回出现次数）。 */
+    const assertAllMention = (text, label) => {
+      const found = [...text.matchAll(/每\s*(\d+)\s*分钟/g)].map((x) => x[0])
+      for (const hit of found) {
+        expect(hit.replace(/\s/g, ''), `★ ${label} 里的「${hit}」必须等于当前间隔（每 ${minutes} 分钟）`)
+          .toBe(`每${minutes}分钟`)
+      }
+      return found.length
     }
-    expect(readme, `★ README 必须复述当前间隔「每 ${minutes} 分钟」`).toContain(`每 ${minutes} 分钟`)
+
+    const panelHits = assertAllMention(panelCodeOnly, 'jet-hub.js')
+    const readmeHits = assertAllMention(readme, 'README.md')
+    // ⚠️ **判据自检**：两处都必须**真的复述**过（否则本条退化成恒真 ——
+    //    把文案全删光也会通过）。这也是原实现缺的那半：它只 `toContain` 一次。
+    // ⚠️ 阈值按**实测**给（2026-10-16 核实：`jet-hub.js` 2 处 = 工具行按钮的 title
+    //    各一句；README 2 处 = 表格一列 + 说明段）。别把它写成「越多越好」——
+    //    那会在合理删减文案时假失败；只要 ≥2/≥1 就足以证伪「一句都没有」。
+    expect(panelHits, '★ jet-hub.js 必须复述间隔（至少两处：工具行 title 与说明）')
+      .toBeGreaterThanOrEqual(2)
+    expect(readmeHits, '★ README 必须复述间隔').toBeGreaterThanOrEqual(1)
+    // ⚠️ 若将来改成非整分钟（如 90 秒），上面两条自检会因「枚举不到」而主动失败
+    //    提醒改判据 —— 那是刻意的：复述文案在那种情况下必须重写成「每 N 秒」。
   })
 })

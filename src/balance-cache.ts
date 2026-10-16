@@ -165,7 +165,19 @@ export interface BalanceCache {
    * ⚠️ `error !== undefined` 的读数**不要**写（失败是瞬时的，写进去会污染折算侧的判据）。
    */
   write(provider: string, accountId: string, reading: BalanceReading): void
-  /** 清缓存：传 `provider` 只清该渠道，省略则清全部（关停时用）。 */
+  /**
+   * 清缓存：传 `provider` 只清该渠道，省略则清全部（关停时用）。
+   *
+   * ⚠️ **如实登记：当前没有任何生产调用者**（2026-10-16 审计实测，全仓 grep 只有
+   * 测试调它）。这不是缺陷，而是**刻意**的取舍：正确性**不依赖**调用方记得清 ——
+   * 折算序的正确性由 `aggregate-adapter.ts` 的 `routingFingerprint()`（拒绝表 +
+   * 白名单 + 顺序表 + 模式**四项**）保证，拒绝/放行/顺序任何一项变化都会让
+   * `choiceCache` 失效重算；而余额读数本身有 TTL（成功 120s / 失败 15s）自愈。
+   *
+   * ⇒ 保留它是为了两件事：① 关停时清理（若将来加 `dispose`）；② 测试隔离。
+   * ⚠️ 若将来有人接上它，注意它是**共享**缓存 —— 清掉会连带作废徽标正在用的读数
+   * （那正是本模块存在的意义），别当成「按渠道刷新」的顺手动作。
+   */
   clear(provider?: string): void
 }
 

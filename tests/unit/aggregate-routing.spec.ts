@@ -155,7 +155,33 @@ describe('白名单读写（只认显式 true；false 删键）', () => {
 })
 
 describe('★ 两表各有各的域：互不干涉（用户 2026-10-15 修正）', () => {
-  it('setAggregateAllowed(true) 不动拒绝表', async () => {
+  it('setAggregateAllowed(true) 不动拒绝表（**同键**——防「按同键归一」）', async () => {
+    // ⚠️⚠️ **必须是同一个 `realId`**（2026-10-16 审计实测：原用例用 `r1`/`r2` **不同键**，
+    //    于是任何「写白名单时顺手清同键拒绝记录」的实现都不会被发现 —— 我注入那
+    //    种「真归一」变异后 **29 条用例全绿，零牙**）。
+    //    用户要求 1「两表不归一」是本 PR 的核心约定 ⇒ 判据必须打在**同键**上：
+    //    同键同时出现在两张表里是**合法状态**（域不相交是「写入侧按渠道划分」，
+    //    不是「同一候选不得同时出现在两表」—— 拒绝优先会在判定时兜住）。
+    const { pool } = await makePool()
+    await pool.setAggregateRejected('m', 'minimax', 'r1', true)
+    await pool.setAggregateAllowed('m', 'minimax', 'r1', true)
+    // ★ 拒绝表**逐字节不变**（不是「被清掉」也不是「被归一」）
+    expect(pool.listAggregateRejections(), '★ 同键的拒绝记录不得被白名单写入清掉')
+      .toEqual({ m: { minimax: { r1: true } } })
+    expect(pool.listAggregateAllowed()).toEqual({ m: { minimax: { r1: true } } })
+  })
+
+  it('setAggregateRejected(true) 不动白名单（**同键**）', async () => {
+    // ⚠️ 与上一条对称：同一 `realId` 同时写两张表，两边都必须各自保留。
+    const { pool } = await makePool()
+    await pool.setAggregateAllowed('m', 'minimax', 'r1', true)
+    await pool.setAggregateRejected('m', 'minimax', 'r1', true)
+    expect(pool.listAggregateAllowed(), '★ 同键的白名单记录不得被拒绝写入清掉')
+      .toEqual({ m: { minimax: { r1: true } } })
+    expect(pool.listAggregateRejections()).toEqual({ m: { minimax: { r1: true } } })
+  })
+
+  it('setAggregateAllowed(true) 不动**同渠道其它**候选的拒绝记录', async () => {
     const { pool } = await makePool()
     await pool.setAggregateRejected('m', 'minimax', 'r1', true)
     await pool.setAggregateAllowed('m', 'minimax', 'r2', true)
