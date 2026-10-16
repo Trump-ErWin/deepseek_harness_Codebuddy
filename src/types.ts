@@ -723,6 +723,45 @@ export interface RpcCreditsBalancesResponse {
  */
 
 /** RPC: 查询某 provider 的**订阅额度窗口**（当前只有 Cline 支持）。 */
+/** RPC: 查询某账号的 **CodeBuddy 限时补偿积分**状态（2026-10-16 新增）。
+ *
+ * ⚠️ 这是**一次性限时活动**，不是每日签到能力 ⇒ **不接 `credits.claimAll`**。
+ * 端点只在 `www.codebuddy.cn`（`webBase`）可达，见 `src/buddy-compensation.ts`。
+ */
+export interface RpcBuddyCompensationStatusRequest {
+  /** 目前只有 `'buddy'`（CodeBuddy 中国版）。 */
+  provider: string
+  /** 目标账号 id（补偿是**按账号**的，不是全局）。 */
+  accountId: string
+}
+
+/** RPC: CodeBuddy 补偿状态响应。字段名**逐字对应上游**，不做重命名。 */
+export interface RpcBuddyCompensationStatusResponse {
+  /** 本账号是否已领取。 */
+  claimed: boolean
+  /** 活动是否仍在进行。 */
+  active: boolean
+  /** 可领取的积分数（上游 `credit_num`）。 */
+  creditNum: number
+  /** 上游 `validity_period`，含义未说明，**原样透传**。 */
+  validityPeriod?: number
+  /** 截止时间（上游原样字符串，如 `"2026-10-22 23:59:59"`）。 */
+  endTime?: string
+}
+
+/** RPC: 领取某账号的 CodeBuddy 补偿积分（**写操作，只能成功一次**）。
+ *
+ * ⚠️ **只由面板按钮显式触发**，不得接进定时器 / 自动签到（见模块头）。
+ */
+export interface RpcBuddyClaimCompensationRequest {
+  provider: string
+  accountId: string
+}
+
+/** RPC: 领取响应。成功即空对象（领取后由调用方重新查询状态刷新展示）。 */
+export interface RpcBuddyClaimCompensationResponse {}
+
+/** RPC: 查询某 provider 的**订阅额度窗口**（当前只有 Cline 支持）。 */
 export interface RpcClineQuotaRequest {
   provider: string
 }
