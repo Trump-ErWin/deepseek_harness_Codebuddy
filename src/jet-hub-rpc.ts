@@ -64,8 +64,12 @@ import type * as OfficeAceAuthModule from './officeace-auth.js'
 /** 以模块命名空间为类型（`startLogin` / `pollLoginCode` / `fetchSubscriptionSummary` 等纯函数）。 */
 type OfficeAceAuth = typeof OfficeAceAuthModule
 import type { AccioAuth } from './accio-auth.js'
+// ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+import type { ModelscopeAuth } from './modelscope-auth.js'
 import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
 import { ACCIO } from './accio-product.js'
+// ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+import { MODELSCOPE } from './modelscope-product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -1073,6 +1077,12 @@ export interface JetHubAuths {
    */
   readonly officeace: OfficeAceAuth
   readonly accio: AccioAuth
+  /**
+   * ModelScope（魔搭）—— **本 fork 独有**（上游 rc.11 仍无此 provider）。
+   *
+   * ⚠️ 值是 `ModelscopeAuth` **Service 实例**（与 accio 同款），不是命名空间。
+   */
+  readonly modelscope: ModelscopeAuth
 }
 
 /**
@@ -1770,6 +1780,13 @@ function registerJetHubEndpoints(
     // 池内 `expiresAt` 确实会被写 ⇒ 不属 loomy / zcode 那类豁免。
     // 漏登记的后果是「凭据明明能续，面板却报未登录」（2026-10-12 复审发现）。
     ACCIO.id,
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-16）**刻意不在本表里**：
+    //    准入判据是 `channel && credits.balance === true`，而它是 `balance: false`
+    //    —— 魔搭没有额度 API，积分端点压根不会为它走这条链。
+    //    且它的凭据是**长期有效的 API Key**（`expires_at` 可选），没有「快过期」可言。
+    //    ⚠️ 显式豁免登记在 `credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT`
+    //    （与 loomy / zcode 同款「无 refresh 端点」形态，但理由更根本）。
+    //    ⚠️ 别把它当成「忘了登记」—— 那正是 accio 当初漏掉的缺陷形态。
   ])
 
   /**
