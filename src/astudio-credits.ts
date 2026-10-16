@@ -38,7 +38,7 @@ import {
 } from './astudio.js'
 import type { AstudioCredential } from './astudio.js'
 import type { ProviderBalanceDetail } from './provider-runtime.js'
-import type { CreditBalance, CreditPackage } from './credits.js'
+import type { ClaimOutcome, CreditBalance, CreditPackage } from './credits.js'
 
 /** 额度端点的相对路径（账号后端，接在 `product.authBaseUrl` 之后）。 */
 const ASTUDIO_POINTS_BALANCE_PATH = '/points/balance'
@@ -254,3 +254,245 @@ export async function fetchAstudioBalanceDetailed(
   }
   return { balance }
 }
+
+// ── 每日奖励 / 签到能力 ──
+
+/** 待处理弹窗查询端点（每日奖励等）。 */
+export const ASTUDIO_CLIENT_POPUPS_PENDING_PATH = '/client-popups/pending'
+/** 弹窗完成/领取端点。 */
+export const ASTUDIO_CLIENT_POPUPS_COMPLETE_PATH = '/client-popups/complete'
+/** 每日奖励弹窗类型标识。 */
+export const ASTUDIO_POPUP_TYPE_DAILY_REWARD = 'DAILY_REWARD_DIALOG'
+
+/** 每日签到弹窗数据结构。 */
+export interface AstudioDailyRewardPopup {
+  popupId: number
+  instanceKey: string
+  type: string
+  payload?: {
+    points?: string | number
+    [key: string]: unknown
+  }
+}
+
+/**
+ * 解析弹窗或完成响应中的积分数值。
+ * 支持字符串数字 "10"、数值 10 等形式。
+ */
+export function parseAstudioPopupPoints(payload: unknown): number {
+  if (typeof payload === 'number' && Number.isFinite(payload) && payload >= 0) {
+    return Math.floor(payload)
+  }
+  if (typeof payload === 'string') {
+    const parsed = parseInt(payload.trim(), 10)
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+  }
+  if (typeof payload === 'object' && payload !== null) {
+    const record = payload as Record<string, unknown>
+    if ('points' in record) {
+      return parseAstudioPopupPoints(record.points)
+    }
+    if ('credit' in record) {
+      return parseAstudioPopupPoints(record.credit)
+    }
+  }
+  return 0
+}
+
+/**
+ * 解析待领取每日签到弹窗列表中的目标项。
+ */
+export function extractAstudioDailyRewardPopup(data: unknown): AstudioDailyRewardPopup | undefined {
+  if (!Array.isArray(data)) return undefined
+  for (const item of data) {
+    if (typeof item !== 'object' || item === null) continue
+    const record = item as Record<string, unknown>
+    if (record.type === ASTUDIO_POPUP_TYPE_DAILY_REWARD) {
+      const rawId = record.popupId
+      const popupId = typeof rawId === 'number' ? rawId : parseInt(String(rawId), 10)
+      if (Number.isFinite(popupId)) {
+        return {
+          popupId,
+          instanceKey: typeof record.instanceKey === 'string' ? record.instanceKey : '',
+          type: ASTUDIO_POPUP_TYPE_DAILY_REWARD,
+          payload: typeof record.payload === 'object' && record.payload !== null ? record.payload as Record<string, unknown> : undefined,
+        }
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * 执行 AStudio 每日签到领取（claimDaily）。
+ *
+ * 对接：
+ * 1. GET /client-popups/pending 查询待领取的 DAILY_REWARD_DIALOG 弹窗；
+ *    若无弹窗或无 DAILY_REWARD_DIALOG，返回 already-claimed；
+ * 2. POST /client-popups/complete 提交 popupId 与 instanceKey 领取积分；
+ * 3. 终态鉴权失败（code 80000）返回 failed 并提示人工重登。
+ */
+export async function claimAstudioDailyReward(
+  credential: AstudioCredential,
+  options: AstudioCreditsOptions = {},
+): Promise<ClaimOutcome> {
+  const fetcher = options.fetcher ?? fetch
+  const timeoutMs = options.timeoutMs ?? ASTUDIO_CREDITS_TIMEOUT_MS
+  const baseUrl = (options.product ?? ASTUDIO).authBaseUrl.replace(/\/+$/, '')
+
+  const cookie = astudioCookieHeader(credential)
+  if (cookie.length === 0) {
+    return {
+      kind: 'failed',
+      code: 80000,
+      message: '未登录 AStudio（缺少登录会话 Cookie），请在 AStudio 客户端重新登录',
+    }
+  }
+
+  // ① 查询 pending 弹窗
+  let pendingResponse: Response
+  let pendingText: string
+  try {
+    pendingResponse = await fetcher(`${baseUrl}${ASTUDIO_CLIENT_POPUPS_PENDING_PATH}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json', Cookie: cookie },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    pendingText = await pendingResponse.text()
+  } catch (error) {
+    return {
+      kind: 'failed',
+      code: -1,
+      message: `每日签到查询失败（网络异常）：${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+
+  if (!pendingResponse.ok) {
+    return {
+      kind: 'failed',
+      code: pendingResponse.status,
+      message: `每日签到查询失败（HTTP ${pendingResponse.status}）`,
+    }
+  }
+
+  let pendingBody: unknown
+  try {
+    pendingBody = JSON.parse(pendingText) as unknown
+  } catch {
+    return {
+      kind: 'failed',
+      code: -1,
+      message: '每日签到查询失败（响应不是 JSON）',
+    }
+  }
+
+  const pendingRecord = (typeof pendingBody === 'object' && pendingBody !== null ? pendingBody : {}) as Record<string, unknown>
+  const pendingCode = typeof pendingRecord.code === 'number' ? pendingRecord.code : parseInt(String(pendingRecord.code ?? ''), 10)
+  const pendingMsg = typeof pendingRecord.message === 'string' ? pendingRecord.message : String(pendingRecord.desc ?? '')
+
+  if (pendingCode === 80000 || isAstudioSessionDeadError(pendingCode, pendingMsg)) {
+    return {
+      kind: 'failed',
+      code: 80000,
+      message: 'AStudio 登录会话已失效，需在 AStudio 客户端人工重新登录（微信扫码）',
+    }
+  }
+
+  if (Number.isFinite(pendingCode) && pendingCode !== 0) {
+    return {
+      kind: 'failed',
+      code: pendingCode,
+      message: `每日签到查询失败：${pendingMsg || `code=${pendingCode}`}`,
+    }
+  }
+
+  // 若 pending 为空数组或无 DAILY_REWARD_DIALOG 弹窗，即为今日已领取（实测已领取时返回 code=0 data=[]）
+  const popup = extractAstudioDailyRewardPopup(pendingRecord.data)
+  if (popup === undefined) {
+    return {
+      kind: 'already-claimed',
+      message: '今天已领取每日签到奖励',
+    }
+  }
+
+  // ② 调用 complete 完成领取
+  let completeResponse: Response
+  let completeText: string
+  try {
+    completeResponse = await fetcher(`${baseUrl}${ASTUDIO_CLIENT_POPUPS_COMPLETE_PATH}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Cookie: cookie,
+      },
+      body: JSON.stringify({
+        popupId: popup.popupId,
+        instanceKey: popup.instanceKey,
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    completeText = await completeResponse.text()
+  } catch (error) {
+    return {
+      kind: 'failed',
+      code: -1,
+      message: `领取每日签到奖励失败（网络异常）：${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+
+  if (!completeResponse.ok) {
+    return {
+      kind: 'failed',
+      code: completeResponse.status,
+      message: `领取每日签到奖励失败（HTTP ${completeResponse.status}）`,
+    }
+  }
+
+  let completeBody: unknown
+  try {
+    completeBody = JSON.parse(completeText) as unknown
+  } catch {
+    return {
+      kind: 'failed',
+      code: -1,
+      message: '领取每日签到奖励失败（响应不是 JSON）',
+    }
+  }
+
+  const completeRecord = (typeof completeBody === 'object' && completeBody !== null ? completeBody : {}) as Record<string, unknown>
+  const completeCode = typeof completeRecord.code === 'number' ? completeRecord.code : parseInt(String(completeRecord.code ?? ''), 10)
+  const completeMsg = typeof completeRecord.message === 'string' ? completeRecord.message : String(completeRecord.desc ?? '')
+
+  if (completeCode === 80000 || isAstudioSessionDeadError(completeCode, completeMsg)) {
+    return {
+      kind: 'failed',
+      code: 80000,
+      message: 'AStudio 登录会话已失效，需在 AStudio 客户端人工重新登录（微信扫码）',
+    }
+  }
+
+  if (Number.isFinite(completeCode) && completeCode !== 0) {
+    return {
+      kind: 'failed',
+      code: completeCode,
+      message: `领取每日签到奖励失败：${completeMsg || `code=${completeCode}`}`,
+    }
+  }
+
+  // 解析领取到的积分值，优先 complete 响应，若无则取弹窗 payload
+  const creditFromComplete = parseAstudioPopupPoints(completeRecord.data)
+  const creditFromPayload = parseAstudioPopupPoints(popup.payload)
+  const credit = creditFromComplete > 0 ? creditFromComplete : creditFromPayload
+
+  return {
+    kind: 'claimed',
+    credit,
+    streakDays: 1,
+    isStreakDay: false,
+    unit: 'credit',
+  }
+}
+
+/** 规范签到别名（对齐 claimDaily 规范）。 */
+export const claimDaily = claimAstudioDailyReward

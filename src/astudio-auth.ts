@@ -1,3 +1,4 @@
+import { completeAstudioLogin, type AstudioWechatAccount } from './astudio-oauth.js';
 /**
  * AStudio 认证服务 —— **凭据双路径**（全部判据来自 2026-10-15 真机实测，
  * 见探索事实 372 / 374 / 377 / 380 / 383）。
@@ -403,7 +404,7 @@ export class AstudioAuth extends Service {
   }
 
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */
-  private get fetchImpl(): typeof fetch {
+  get fetchImpl(): typeof fetch {
     return this.options.fetcher ?? fetch
   }
 
@@ -824,6 +825,38 @@ export class AstudioAuth extends Service {
     return credential
   }
 
+  /**
+   * 微信扫码登录凭据兑换与会话持久化（completeLogin）。
+   *
+   * 对接微信扫码授权后拿到的 { uid, ssoSessionId, username }：
+   * 1. 走 completeAstudioLogin 兑换完整推理凭据；
+   * 2. 持久化写入凭据库。
+   */
+  async completeLogin(
+    account: AstudioWechatAccount,
+    refName?: string,
+  ): Promise<AstudioCredential> {
+    const credential = await completeAstudioLogin(account, {
+      fetcher: this.fetchImpl,
+      authBaseUrl: this.product.authBaseUrl,
+    });
+    const targetRef = refName ?? this.credentialRefName;
+    const stored = await this.readStoredCredential(targetRef);
+    const merged = mergeAstudioRefreshSeed(credential, stored) ?? credential;
+    await this.store.set(
+      credentialRef(this.product.defaultCredentialRef),
+      JSON.stringify(merged),
+    );
+    if (targetRef && targetRef !== this.product.defaultCredentialRef) {
+      await this.store.set(
+        credentialRef(targetRef),
+        JSON.stringify(merged),
+      );
+    }
+    return merged;
+  }
+
+
   /** 移除已存储的凭据（账号条目由调用方决定是否删除）。**不碰客户端文件**。 */
   async logout(): Promise<void> {
     this.active = false
@@ -839,3 +872,5 @@ export class AstudioAuth extends Service {
     this.active = false
   }
 }
+
+export { completeAstudioLogin, type AstudioWechatAccount } from './astudio-oauth.js';

@@ -62,6 +62,12 @@ describe('积分能力矩阵', () => {
     expect(supportsDailyCheckin('buddy')).toBe(true)
   })
 
+  it('AStudio 余额与签到都支持（微信扫码登录与每日奖励弹窗签到）', () => {
+    expect(CREDITS_CAPABILITIES.astudio).toEqual({ balance: true, dailyCheckin: true })
+    expect(supportsCreditBalance('astudio')).toBe(true)
+    expect(supportsDailyCheckin('astudio')).toBe(true)
+  })
+
   it('WorkBuddy 国际版支持余额但不支持签到（余额与签到是彼此独立的能力）', () => {
     // 这条断言专治「因为国际版没有签到，就推断也查不到余额」的错误推断。
     expect(supportsCreditBalance('workbuddy')).toBe(true)

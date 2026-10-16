@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 /**
  * AStudio（讯飞 AstronStudio / `cn.xfyun.acode`）—— 登录与会话态展示层。
  *
@@ -38,6 +39,7 @@
  * `ctx`，展示层无权自建服务实例，故这里用最小接口而不是 `new AstudioAuth(...)`）。
  */
 
+import { ASTUDIO } from './astudio-product.js';
 import { maskLobsteraiPhoneTail } from './lobsterai.js';
 import {
   astudioCredentialExpiresAtMs,
@@ -51,6 +53,8 @@ import {
   isAstudioTerminalRefreshError,
   readAstudioDiskCredential,
   readAstudioSessionFile,
+  extractAstudioApiKey,
+  AstudioRefreshTokenExpiredError,
   type AstudioRefreshOutcome,
 } from './astudio-auth.js';
 
@@ -404,4 +408,360 @@ export async function checkAstudioSession(
   } catch (error) {
     return astudioSessionViewFromError(error, status) as AstudioSessionStatus;
   }
+}
+
+// ── 微信扫码登录与凭据交换 ──
+
+export const ASTUDIO_SSO_BASE_URL = 'https://sso.xfyun.cn';
+export const ASTUDIO_SSO_QRCODE_PATH = '/SSOService/wx/scanlogin/qrcode';
+export const ASTUDIO_SSO_UIDS_PATH = '/SSOService/wx/scanlogin/uids';
+export const ASTUDIO_SSO_BIND_PATH = '/SSOService/wx/scanlogin/bind';
+
+export const ASTUDIO_INIT_APP_PATH = '/tenant-app/v2/init-app';
+export const ASTUDIO_USER_INFO_PATH = '/userInfo';
+export const ASTUDIO_BOT_CONFIGS_PATH = '/bot/models/configs';
+
+export const ASTUDIO_WECHAT_FD_ALPHABET = 'ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678';
+
+/** 生成 8 字符的随机 fd 串（官方微信扫码唯一凭证）。 */
+export function generateAstudioWechatFd(): string {
+  const bytes = randomBytes(8);
+  return Array.from(bytes, (byte) => ASTUDIO_WECHAT_FD_ALPHABET[byte % ASTUDIO_WECHAT_FD_ALPHABET.length]).join('');
+}
+
+export interface AstudioWechatQrCode {
+  fd: string;
+  qrUrl: string;
+  expiresInMs: number;
+}
+
+/**
+ * 申请微信扫码登录二维码。
+ * 对接 GET https://sso.xfyun.cn/SSOService/wx/scanlogin/qrcode?fd={fd}
+ */
+export async function createAstudioWechatQrCode(options: {
+  ssoBaseUrl?: string;
+  fetcher?: typeof fetch;
+  timeoutMs?: number;
+  fd?: string;
+} = {}): Promise<AstudioWechatQrCode> {
+  const ssoBaseUrl = (options.ssoBaseUrl ?? ASTUDIO_SSO_BASE_URL).replace(/\/+$/, '');
+  const fetcher = options.fetcher ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const fd = options.fd ?? generateAstudioWechatFd();
+
+  const url = `${ssoBaseUrl}${ASTUDIO_SSO_QRCODE_PATH}?fd=${encodeURIComponent(fd)}`;
+  const response = await fetcher(url, {
+    method: 'GET',
+    headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    throw new Error(`获取微信扫码二维码失败（HTTP ${response.status}）`);
+  }
+  const text = await response.text();
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new Error('获取微信扫码二维码失败（响应不是 JSON）');
+  }
+  const record = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>;
+  const code = record.code;
+  if (code !== 0 && code !== '0') {
+    throw new Error(`获取微信扫码二维码失败：${String(record.desc ?? record.message ?? code)}`);
+  }
+  const qrUrl = typeof record.data === 'string' ? record.data : '';
+  if (!qrUrl) {
+    throw new Error('获取微信扫码二维码失败：未返回二维码 URL');
+  }
+  return {
+    fd,
+    qrUrl,
+    expiresInMs: 300_000,
+  };
+}
+
+export interface AstudioWechatAccount {
+  uid: string;
+  ssoSessionId: string;
+  username?: string;
+}
+
+export type AstudioWechatPollResult =
+  | { status: 'pending'; message?: string }
+  | { status: 'scanned'; account: AstudioWechatAccount; accounts: AstudioWechatAccount[] }
+  | { status: 'unbound'; message?: string }
+  | { status: 'error'; code: number | string; message: string };
+
+/**
+ * 轮询微信扫码状态。
+ * 对接 GET https://sso.xfyun.cn/SSOService/wx/scanlogin/uids?fd={fd}
+ * - code = -1: 未扫码
+ * - code = 0: 已扫码，返回关联账号信息
+ */
+export async function pollAstudioWechatScan(
+  fd: string,
+  options: {
+    ssoBaseUrl?: string;
+    fetcher?: typeof fetch;
+    timeoutMs?: number;
+  } = {},
+): Promise<AstudioWechatPollResult> {
+  const ssoBaseUrl = (options.ssoBaseUrl ?? ASTUDIO_SSO_BASE_URL).replace(/\/+$/, '');
+  const fetcher = options.fetcher ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 10_000;
+
+  const url = `${ssoBaseUrl}${ASTUDIO_SSO_UIDS_PATH}?fd=${encodeURIComponent(fd)}`;
+  let response: Response;
+  let text: string;
+  try {
+    response = await fetcher(url, {
+      method: 'GET',
+      headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    text = await response.text();
+  } catch (error) {
+    return {
+      status: 'error',
+      code: -1,
+      message: `轮询微信扫码状态网络异常：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  if (!response.ok) {
+    return {
+      status: 'error',
+      code: response.status,
+      message: `轮询微信扫码状态失败（HTTP ${response.status}）`,
+    };
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return {
+      status: 'error',
+      code: -1,
+      message: '轮询微信扫码状态失败（响应不是 JSON）',
+    };
+  }
+
+  const record = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>;
+  const rawCode = record.code;
+
+  if (rawCode === -1 || rawCode === '-1') {
+    return {
+      status: 'pending',
+      message: typeof record.desc === 'string' ? record.desc : '未扫码',
+    };
+  }
+
+  if (rawCode === 0 || rawCode === '0') {
+    const accounts: AstudioWechatAccount[] = [];
+    const data = record.data;
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        if (typeof item === 'object' && item !== null) {
+          const it = item as Record<string, unknown>;
+          const uid = String(it.uid ?? it.accountId ?? '').trim();
+          const ssoSessionId = String(it.ssoSessionId ?? it.sso_session_id ?? '').trim();
+          const username = typeof it.username === 'string' ? it.username : undefined;
+          if (uid && ssoSessionId) {
+            accounts.push({ uid, ssoSessionId, username });
+          }
+        }
+      }
+    } else if (typeof data === 'object' && data !== null) {
+      const obj = data as Record<string, unknown>;
+      if (Array.isArray(obj.infoList)) {
+        for (const item of obj.infoList) {
+          if (typeof item === 'object' && item !== null) {
+            const it = item as Record<string, unknown>;
+            const uid = String(it.uid ?? it.accountId ?? '').trim();
+            const ssoSessionId = String(it.ssoSessionId ?? it.sso_session_id ?? '').trim();
+            const username = typeof it.username === 'string' ? it.username : undefined;
+            if (uid && ssoSessionId) {
+              accounts.push({ uid, ssoSessionId, username });
+            }
+          }
+        }
+      }
+    }
+    if (accounts.length === 0) {
+      return {
+        status: 'unbound',
+        message: typeof record.desc === 'string' ? record.desc : '已扫码但未关联账号',
+      };
+    }
+    return {
+      status: 'scanned',
+      account: accounts[0],
+      accounts,
+    };
+  }
+
+  return {
+    status: 'error',
+    code: (typeof rawCode === 'number' || typeof rawCode === 'string') ? rawCode : -1,
+    message: typeof record.desc === 'string' ? record.desc : String(rawCode),
+  };
+}
+
+/**
+ * 确认绑定微信登录会话。
+ * 对接 POST https://sso.xfyun.cn/SSOService/wx/scanlogin/bind
+ */
+export async function bindAstudioWechatSession(
+  fd: string,
+  account: AstudioWechatAccount,
+  options: {
+    ssoBaseUrl?: string;
+    fetcher?: typeof fetch;
+    timeoutMs?: number;
+  } = {},
+): Promise<{ ok: boolean; message?: string }> {
+  const ssoBaseUrl = (options.ssoBaseUrl ?? ASTUDIO_SSO_BASE_URL).replace(/\/+$/, '');
+  const fetcher = options.fetcher ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 10_000;
+
+  const params = new URLSearchParams({
+    fd,
+    accountId: account.uid,
+    ...(account.ssoSessionId ? { ssoSessionId: account.ssoSessionId } : {}),
+    isNew: 'false',
+  });
+  const url = `${ssoBaseUrl}${ASTUDIO_SSO_BIND_PATH}`;
+  let response: Response;
+  let text: string;
+  try {
+    response = await fetcher(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: params.toString(),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    text = await response.text();
+  } catch (error) {
+    return {
+      ok: false,
+      message: `绑定微信登录会话网络异常：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      message: `绑定微信登录会话失败（HTTP ${response.status}）`,
+    };
+  }
+
+  try {
+    const body = JSON.parse(text) as Record<string, unknown>;
+    if (body.code === 0 || body.code === '0' || body.flag === true) {
+      return { ok: true };
+    }
+    return { ok: false, message: String(body.desc ?? body.message ?? body.code) };
+  } catch {
+    return { ok: true };
+  }
+}
+
+export interface CompleteAstudioLoginOptions {
+  fetcher?: typeof fetch;
+  authBaseUrl?: string;
+  timeoutMs?: number;
+}
+
+/**
+ * 凭据交换与会话初始化（completeLogin）。
+ * 使用微信扫码获得的 ssoSessionId 依次完成：
+ * 1. POST /tenant-app/v2/init-app 会话初始化；
+ * 2. GET /userInfo 获取用户信息与昵称；
+ * 3. GET /bot/models/configs 换取模型推理 access_token（modelBearerToken）；
+ * 组装并返回完整的 AstudioCredential。
+ */
+export async function completeAstudioLogin(
+  account: AstudioWechatAccount,
+  options: CompleteAstudioLoginOptions = {},
+): Promise<AstudioCredential> {
+  const fetcher = options.fetcher ?? fetch;
+  const authBaseUrl = (options.authBaseUrl ?? ASTUDIO.authBaseUrl).replace(/\/+$/, '');
+  const timeoutMs = options.timeoutMs ?? 15_000;
+  const cookie = `ssoSessionId=${account.ssoSessionId}; sso_sessionid=${account.ssoSessionId}; account_id=${account.uid}; token=${account.ssoSessionId}`;
+
+  // ① init-app
+  try {
+    await fetcher(`${authBaseUrl}${ASTUDIO_INIT_APP_PATH}`, {
+      method: 'POST',
+      headers: { Accept: 'application/json', Cookie: cookie },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    // 忽略 init-app 非阻塞异常
+  }
+
+  // ② userInfo
+  let nickname: string | undefined = account.username;
+  try {
+    const userRes = await fetcher(`${authBaseUrl}${ASTUDIO_USER_INFO_PATH}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json', Cookie: cookie },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (userRes.ok) {
+      const userBody = await userRes.json() as Record<string, unknown>;
+      const userData = (typeof userBody.data === 'object' && userBody.data !== null ? userBody.data : userBody) as Record<string, unknown>;
+      const candidate = String(userData.nickname ?? userData.mobile ?? userData.username ?? '').trim();
+      if (candidate) {
+        nickname = candidate;
+      }
+    }
+  } catch {
+    // userInfo 降级
+  }
+
+  // ③ bot/models/configs 换取模型推理 api_key (modelBearerToken)
+  const configsRes = await fetcher(`${authBaseUrl}${ASTUDIO_BOT_CONFIGS_PATH}`, {
+    method: 'GET',
+    headers: { Accept: 'application/json', Cookie: cookie },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!configsRes.ok) {
+    throw new Error(`获取模型配置与推理凭据失败（HTTP ${configsRes.status}）`);
+  }
+  const configsText = await configsRes.text();
+  let configsBody: unknown;
+  try {
+    configsBody = JSON.parse(configsText);
+  } catch {
+    throw new Error('获取模型配置与推理凭据失败（响应不是 JSON）');
+  }
+
+  const pick = extractAstudioApiKey(configsBody);
+  if (!pick.apiKey) {
+    throw new AstudioRefreshTokenExpiredError(
+      `无法从 AStudio 账号后端获取推理凭据：${pick.reason || '无可用 api_key'}`,
+    );
+  }
+
+  const credential: AstudioCredential = {
+    access_token: pick.apiKey,
+    account_id: account.uid,
+    uid: account.uid,
+    nickname: nickname || account.uid,
+    sso_session_id: account.ssoSessionId,
+    token: account.ssoSessionId,
+    login_method: 'wechat',
+    logged_in_at: new Date().toISOString(),
+    source: 'account-backend',
+  };
+
+  return credential;
 }
