@@ -2,8 +2,8 @@ import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
-import { createJetHubStore, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizePermanentLocks } from './jet-hub-store.js'
-import type { AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PermanentLockMap } from './jet-hub-store.js'
+import { createJetHubStore, clearRejectionLayer, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateAllowed, sanitizeAggregateOrder, sanitizeAggregateOrderMode, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizePermanentLocks, withAllowed, withoutAllowed } from './jet-hub-store.js'
+import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PermanentLockMap } from './jet-hub-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
 import type { PermanentLockStore } from './permanent-lock-store.js'
 import { normalizeOpencodeGeneration } from './opencode-auth.js'
@@ -251,6 +251,30 @@ export class AccountPool {
    */
   private aggregateRejectionCache: AggregateRejectionMap = {}
   /**
+   * 聚合「**显式允许**参与轮换」白名单的权威进程内副本。
+   *
+   * ⚠️ 与 {@link aggregateRejectionCache} **各有各的域、不做归一**（用户 2026-10-15 的修正）：
+   * 已接入临期折算的候选只归**拒绝表**（黑名单语义：默认参与），未接入的只归**白名单**
+   *（默认不参与，「参与」才需显式记录）。两表的键域由渠道级的「是否接入折算」划分 ⇒
+   * **天然不相交** ⇒ 写一侧**不得**改另一侧。
+   * 详见 `jet-hub-store.ts` 的 `AggregateAllowedMap` 注释。
+   */
+  private aggregateAllowedCache: AggregateAllowedMap = {}
+  /**
+   * 聚合「手工排序」表的权威进程内副本。
+   *
+   * ⚠️ 缺键 / 空数组 = 未自定义（与 {@link providerOrderCache} 同语义）：
+   * 展示与轮换都回落临期序。
+   */
+  private aggregateOrderCache: AggregateOrderMap = {}
+  /**
+   * 聚合候选的排序模式（缺省 `'expiry'` = 升级前行为）。
+   *
+   * ⚠️ 它不是「有没有手工顺序表」的派生量：用户可能切到手工模式但一条都没拖过
+   *（此时行为与临期模式相同，但面板要显示「按手工」）。
+   */
+  private aggregateOrderModeCache: AggregateOrderMode = 'expiry'
+  /**
    * 「锁定永久积分」开关表的**权威进程内副本**（与 {@link cache} 同理）。
    *
    * ⚠️ 每个 provider 一项（Loomy / CodeBuddy / WorkBuddy 各自独立），
@@ -375,6 +399,11 @@ export class AccountPool {
       this.modelCache = state.disabledModels
       // 聚合拒绝表同理：老文档没有该键 → 保持空表（没有任何拒绝）。
       this.aggregateRejectionCache = state.aggregateRejections ?? {}
+      // 门控白名单 / 手工顺序表 / 排序模式同理：老文档没有这些键 → 缺省值
+      //（空白名单 = 未接入渠道仍不参与、空顺序表 = 未自定义、临期序 = 升级前行为）。
+      this.aggregateAllowedCache = state.aggregateAllowed ?? {}
+      this.aggregateOrderCache = state.aggregateOrder ?? {}
+      this.aggregateOrderModeCache = state.aggregateOrderMode === 'manual' ? 'manual' : 'expiry'
       // 网关开关同理：老文档没有该键 → 保持默认启用。
       this.gatewayEnabledCache = state.gatewayEnabled !== false
       // 原生搜索总开关同理：老文档没有该键 → 保持默认启用。
@@ -461,6 +490,12 @@ export class AccountPool {
         disabledModels: this.modelCache,
         // 与上面两份同源快照（见本方法注释：分两次快照会让同一份文档里的字段互相矛盾）。
         aggregateRejections: this.aggregateRejectionCache,
+        // ⚠️⚠️ 三个新键**必须**与上面取自**同一时刻**的快照（`replace` 是整体替换语义）：
+        //    漏一个 ⇒ 该键永不落盘，且**任何**账号/黑名单写入都会顺带把它抹掉。
+        //    其中白名单丢失属「静默改路由」（用户手工打开的无临期渠道悄悄回到不参与）。
+        aggregateAllowed: this.aggregateAllowedCache,
+        aggregateOrder: this.aggregateOrderCache,
+        aggregateOrderMode: this.aggregateOrderModeCache,
         ...this.lockFields(),
         // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
         // 分两次快照会让同一份文档里的字段互相矛盾。
@@ -579,12 +614,7 @@ export class AccountPool {
     rejected: boolean,
   ): Promise<void> {
     this.ensureLoaded()
-    const next: AggregateRejectionMap = { ...this.aggregateRejectionCache }
-    const perProvider = { ...(next[canonicalId] ?? {}) }
-    const perRealId = { ...(perProvider[provider] ?? {}) }
-    if (rejected) perRealId[realId] = true
-    else {
-      delete perRealId[realId]
+    if (!rejected) {
       // ⚠️⚠️ **「重新打开」必须一并清掉该渠道的「漂移兄弟键」**（真实缺陷，
       //    独立审计实测证伪 —— D4 的降级会让拒绝**不可恢复**）。
       //
@@ -592,42 +622,163 @@ export class AccountPool {
       // D4 规定：`(虚拟模型, 渠道)` 下有 `true` 记录、但那些 `realId` **都不在**
       // 当前候选中（id 漂移）⇒ **降级为渠道级拒绝**（该渠道全部候选都被拒）。
       // 而漂移的**旧键会一直留在表里** ⇒ 用户按降级 warn 的指引来面板
-      // 「重新打开」**当前**候选时，上面那行 `delete perRealId[realId]` 删的是
-      // **当前**键，**旧键仍在** ⇒ 降级判据依然成立 ⇒ **降级继续生效**：
+      // 「重新打开」**当前**候选时，只删**当前**键 ⇒ **旧键仍在** ⇒ 降级判据依然
+      // 成立 ⇒ **降级继续生效**：
       //   - 面板用 `isRejected(表, 当前 realId)` 判断显示 ⇒ 显示「参与轮换」；
       //   - 宿主实际**仍拒绝** ⇒ **显示与行为分叉**；
       //   - 于是 warn 指引的那条恢复路径**走不通**（用户怎么点都没用）。
       //
       // ## 修法与判据
       // 用户在面板上「重新打开」某条候选，其**意图**是「让这个渠道在这个模型下
-      // 重新参与轮换」。而 D4 的降级语义本就是**渠道级**的（要么整渠道拒、
-      // 要么整渠道参与）⇒ 故「打开一条」在该渠道处于降级态时，唯一自洽的结果
-      // 就是**整渠道恢复**。保留漂移旧键会让拒绝永远无法撤销，那不是规格要的
-      //（§5.2 与 `jet-hub-store.ts`：「拒绝 ≠ 关闭，可重新打开」）。
+      // 重新参与轮换」。而 D4 的降级语义本就是**渠道级**的 ⇒ 故唯一自洽的结果
+      // 就是**整渠道恢复**。
+      //
+      // ⚠️⚠️ 语义与理由**只留一份实现**：搬到 `jet-hub-store.ts` 的
+      //    `clearRejectionLayer()`（纯函数），本方法与 `setAggregateAllowed` 之外的
+      //    写入路径共用 —— 别在这里再手写一遍（初版曾把 `delete perProvider[provider]`
+      //    与写回的顺序写反 ⇒ 删除被自己覆盖，降级不解除）。
       //
       // ⚠️ 与 `clearAggregateRejected(canonicalId, provider)` 的区别：本分支只在
       //    用户**显式打开某一条**时触发（且只清本渠道，不碰其它渠道）；
       //    那个方法支持按虚拟模型/按渠道批量清（含从未拒绝过的）。语义不同故并存。
-      //
-      // ⚠️ 方向取「清整渠道层」而不是「只删漂移的那几个键」：后者要求这里知道
-      //    **当前候选表**（本层拿不到，它属于适配器），且「用户的意图是让整渠道
-      //    恢复」这一语义判断与删几个键无关 —— 见上方判据。
-      //
-      // ⚠️⚠️ **必须直接 `return`，不能让下面的写回把 `perRealId` 又挂回去**
-      //   （我自己第一版正是如此：`delete perProvider[provider]` 之后紧跟
-      //    `perProvider[provider] = perRealId` ⇒ **删除被自己覆盖**，
-      //    于是旧键仍在、降级不解除 —— 独立审计用真实池实测证伪了这一点）。
-      delete perProvider[provider]
-      if (Object.keys(perProvider).length === 0) delete next[canonicalId]
-      else next[canonicalId] = perProvider
-      await this.writeAggregateRejections(next)
+      this.aggregateRejectionCache = clearRejectionLayer(this.aggregateRejectionCache, canonicalId, provider)
+      await this.writeAggregateRouting('聚合拒绝表')
       return
     }
-    if (Object.keys(perRealId).length === 0) delete perProvider[provider]
-    else perProvider[provider] = perRealId
-    if (Object.keys(perProvider).length === 0) delete next[canonicalId]
-    else next[canonicalId] = perProvider
-    await this.writeAggregateRejections(next)
+    const next: AggregateRejectionMap = { ...this.aggregateRejectionCache }
+    const perProvider = { ...(next[canonicalId] ?? {}) }
+    const perRealId = { ...(perProvider[provider] ?? {}) }
+    perRealId[realId] = true
+    // ⚠️ **不动白名单**（用户 2026-10-15 的修正）：写拒绝是**已接入渠道**这条域上的操作，
+    //    白名单是另一条域。初版曾在此「顺手清同键白名单」，那是把「归一」当成了目的 ——
+    //    它会静默改掉另一张表里属于别的操作的用户状态。跨域残留（同键双命中）由
+    //    `resolveCandidateGate` 的优先级兜住（拒绝优先），属纵深防御。
+    perProvider[provider] = perRealId
+    next[canonicalId] = perProvider
+    this.aggregateRejectionCache = next
+    await this.writeAggregateRouting('聚合拒绝表')
+  }
+
+  /**
+   * 聚合「显式允许」白名单的只读快照（与 {@link listAggregateRejections} 同口径：
+   * 顶层浅拷贝、内层仍共享引用，调用方**只读**）。
+   */
+  listAggregateAllowed(): AggregateAllowedMap {
+    this.ensureLoaded()
+    return this.aggregateAllowedCache
+  }
+
+  /**
+   * 设置某条候选是否**显式允许**参与轮换（用户手工打开 / 关闭）。
+   *
+   * ⚠️ **只动白名单、不碰拒绝表**（见 {@link aggregateAllowedCache} 的说明）：
+   * 白名单服务的是未接入折算的候选（默认不参与），拒绝表服务的是已接入的候选
+   *（默认参与）—— 两表的键域天然不相交。
+   *
+   * ⚠️ `allowed === false` 走**删键**（不留 `false` 噪音，与 `setAggregateRejected` 同口径）：
+   * 表里一旦被 `false` 污染，下次读取就有人按 truthy 判成「允许」= 静默放行一个
+   * 我们没有余额信息的渠道。
+   */
+  async setAggregateAllowed(
+    canonicalId: string,
+    provider: string,
+    realId: string,
+    allowed: boolean,
+  ): Promise<void> {
+    this.ensureLoaded()
+    this.aggregateAllowedCache = allowed
+      ? withAllowed(this.aggregateAllowedCache, canonicalId, provider, realId)
+      : withoutAllowed(this.aggregateAllowedCache, canonicalId, provider, realId)
+    await this.writeAggregateRouting('聚合允许表')
+  }
+
+  /**
+   * 一键「拒绝非临期」：把 `keepProviders`（= **已接入**临期折算的渠道）**之外**的白名单
+   * 条目全部清掉，让那些渠道回到「默认不参与」的初始态（用户后续仍可逐条手工打开）。
+   *
+   * ⚠️ 池**不知道**「接入临期折算」是什么语义：它只收到一份「要保留哪些 provider」的清单，
+   *    该清单由调用方（RPC 层）从权威常量 `WIRED_EXPIRY_PROVIDERS` 取。这样「谁是未接入渠道」
+   *    的权威仍然只有那一个常量（本仓库「同一事实两处判据」的红线）。
+   *
+   * @returns `cleared` = 清掉的**候选条数**（面板提示要用它）；`aggregateAllowed` = 清后的白名单。
+   * ⚠️ `cleared === 0` 时**不写盘**（幂等；也避免把一次空点击变成一次整体替换）。
+   */
+  async clearAggregateAllowedExcept(
+    keepProviders: readonly string[],
+  ): Promise<{ cleared: number; aggregateAllowed: AggregateAllowedMap }> {
+    this.ensureLoaded()
+    const keep = new Set(keepProviders)
+    const next: AggregateAllowedMap = {}
+    let cleared = 0
+    for (const [canonicalId, byProvider] of Object.entries(this.aggregateAllowedCache)) {
+      const keptProviders: Record<string, Record<string, boolean>> = {}
+      for (const [provider, byRealId] of Object.entries(byProvider)) {
+        if (keep.has(provider)) keptProviders[provider] = byRealId
+        else cleared += Object.keys(byRealId).length
+      }
+      if (Object.keys(keptProviders).length > 0) next[canonicalId] = keptProviders
+    }
+    if (cleared > 0) {
+      this.aggregateAllowedCache = next
+      await this.writeAggregateRouting('聚合允许表')
+    }
+    return { cleared, aggregateAllowed: this.aggregateAllowedCache }
+  }
+
+  /** 聚合手工顺序表的只读快照（缺键 = 未自定义）。 */
+  listAggregateOrder(): AggregateOrderMap {
+    this.ensureLoaded()
+    return this.aggregateOrderCache
+  }
+
+  /**
+   * 写入某虚拟模型的**手工顺序**。
+   *
+   * ⚠️ **过滤与去重必须在这里做**（服务端是权威）：入参是客户端拖动后拼出来的数组，
+   *    可能含「不含 NUL 分隔符的畸形元素」与「重复元素」。重复会让比较器**非确定**
+   *   （同一候选有两个位次）；畸形元素在适配器里解析不出 `(provider, realId)`
+   *    ⇒ 静默失效（顺序表看着有内容却全不生效）。
+   *
+   * ⚠️ 返回**落盘后的权威数组**（不是入参回声）—— 客户端据此校正本地状态，
+   *    否则「客户端以为排好了、服务端丢了一半」会长期分叉。
+   * ⚠️ 空数组 = 未自定义（删键，回落临期序）。
+   */
+  async setAggregateOrder(canonicalId: string, entries: readonly string[]): Promise<string[]> {
+    this.ensureLoaded()
+    const seen = new Set<string>()
+    const kept: string[] = []
+    for (const entry of entries) {
+      if (typeof entry !== 'string' || !entry.includes('\u0000')) continue
+      if (seen.has(entry)) continue
+      seen.add(entry)
+      kept.push(entry)
+    }
+    const next: AggregateOrderMap = { ...this.aggregateOrderCache }
+    if (kept.length === 0) delete next[canonicalId]
+    else next[canonicalId] = kept
+    // ⚠️ 必须在写盘**之前**更新缓存：`queueStoreSave` 读的是缓存字段（不是入参），
+    //    顺序反了会让返回值与落盘内容都是旧值（本仓库「写回被自己覆盖」的同型缺陷）。
+    this.aggregateOrderCache = next
+    await this.writeAggregateRouting('聚合手工顺序')
+    return this.aggregateOrderCache[canonicalId] ?? []
+  }
+
+  /** 排序模式（`'expiry'` = 升级前行为）。 */
+  listAggregateOrderMode(): AggregateOrderMode {
+    this.ensureLoaded()
+    return this.aggregateOrderModeCache
+  }
+
+  /**
+   * 切换排序模式并落盘。
+   *
+   * ⚠️ 幂等：写同一个值**不落盘**（一次空点击不该触发一次整体替换）。
+   */
+  async setAggregateOrderMode(mode: AggregateOrderMode): Promise<void> {
+    this.ensureLoaded()
+    if (this.aggregateOrderModeCache === mode) return
+    this.aggregateOrderModeCache = mode === 'manual' ? 'manual' : 'expiry'
+    await this.writeAggregateRouting('聚合排序模式')
   }
 
   /**
@@ -644,7 +795,8 @@ export class AccountPool {
   async clearAggregateRejected(canonicalId?: string, provider?: string): Promise<void> {
     this.ensureLoaded()
     if (canonicalId === undefined && provider === undefined) {
-      await this.writeAggregateRejections({})
+      this.aggregateRejectionCache = {}
+      await this.writeAggregateRouting('聚合拒绝表')
       return
     }
     const next: AggregateRejectionMap = {}
@@ -659,15 +811,24 @@ export class AccountPool {
       }
       if (Object.keys(kept).length > 0) next[key] = kept
     }
-    await this.writeAggregateRejections(next)
+    this.aggregateRejectionCache = next
+    await this.writeAggregateRouting('聚合拒绝表')
   }
 
-  /** 落盘拒绝表（与 {@link writeModels} 对称）。 */
-  private async writeAggregateRejections(rejections: AggregateRejectionMap): Promise<void> {
-    this.aggregateRejectionCache = rejections
+  /**
+   * 落盘**聚合路由族**的全部状态（拒绝表 / 白名单 / 手工顺序表 / 排序模式）。
+   *
+   * ⚠️ 四份状态**共用一个写方法**：它们是同一份文档里的同一族状态，分开写会让
+   *    「一次用户操作」产生两次整体替换，中间那一刻的快照自相矛盾
+   *   （本仓库已有「分两次快照让同一份文档里的字段互相矛盾」的缺陷史）。
+   * ⚠️ 调用方**必须先把 `this.xxxCache` 换成新值**再调本方法 ——
+   *    `queueStoreSave` 读的是缓存字段，不是入参。
+   * ⚠️ `label` 只用于日志，便于排障时区分是哪张表触发的落盘。
+   */
+  private async writeAggregateRouting(label: string): Promise<void> {
     this.loaded = true
     if (this.store.kind === 'memory') {
-      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，聚合拒绝表变更未落盘')
+      this.ctx.logger?.warn?.(`[jet-hub] 无持久化后端，${label}变更未落盘`)
       return
     }
     await this.queueStoreSave()

@@ -41,6 +41,13 @@ import type { TraeAuth } from './trae-auth.js'
 import type { ClineAuth } from './cline-auth.js'
 import { LOOMY } from './loomy-product.js'
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
+// ⚠️ **值导入**（不是类型）：一键「拒绝非临期」要把这份清单传给账号池。
+//    它是一份**冻结的静态数组**（`Object.freeze([...])`），模块级求值安全 ——
+//    与 `WIRED_EXPIRY_PROVIDERS` 自己那条注释里说的「不要读 runtime 注册表」不矛盾
+//    （本文件只读它是为了让「谁是未接入渠道」的权威**只有一处**）。
+//    ⚠️ 每一次调用都**重新读**这个导出（而不是在模块级拷成另一个常量），以后者为准会
+//    在接入新渠道时静默漂移：一键按钮会开始清掉**已接入**渠道的白名单。
+import { WIRED_EXPIRY_PROVIDERS } from './aggregate-expiry.js'
 import type { LoomyAuth } from './loomy-auth.js'
 import type { LoomyCredential } from './loomy.js'
 import { RACCOON } from './raccoon-product.js'
@@ -69,6 +76,9 @@ import { ACCIO } from './accio-product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
+// ⚠️ 共享余额读数缓存（2026-10-15，规格 §5.7）：经**进程级注册位**取，不给
+//    `registerJetHubRpc` 加第 5 个形参（那会重开「位置错位复发 6 次」的门）。
+import { balanceCacheOf } from './provider-runtime.js'
 import { createProviderOnboarding, onboardingOf } from './provider-onboarding.js'
 import type { ProviderCallContext, ProviderCredits, ProviderOnboarding } from './provider-runtime.js'
 import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
@@ -236,6 +246,12 @@ import type {
   RpcAggregateSetRejectedRequest,
   RpcAggregateClearRejectedRequest,
   RpcAggregateRejectionsResponse,
+  RpcAggregateSetAllowedRequest,
+  RpcAggregateSetOrderRequest,
+  RpcAggregateSetOrderResponse,
+  RpcAggregateSetOrderModeRequest,
+  RpcAggregateSetOrderModeResponse,
+  RpcAggregateRejectNonExpiringResponse,
   RpcAggregateActiveProviderResponse,
   RpcAggregateExpiryOrderResponse,
   RpcModelSetAllDisabledRequest,
@@ -639,6 +655,19 @@ export interface CreditsEndpointDeps<
   /** 单账号异常时的告警出口（不参与控制流）。 */
   warn?: (message: string) => void
   /**
+   * **共享余额读数缓存**的回写出口（2026-10-15，规格 §5.7）。
+   *
+   * ## ⚠️ 为什么是「回写」而不是「改读」（本端点的响应形状约束）
+   *
+   * 本端点的响应是 `{ balance, error?, extra? }`，比折算路径要的 `CreditBalance`
+   * **多两个字段**（Gemini 的 `extra` 来自另一个端点）⇒ 让本端点「读」缓存会**丢字段**。
+   * ⇒ 本端点继续用自己的取数（**响应逐字节不变**），但把拿到的 `balance`
+   * **写回**缓存 —— 于是聚合折算能命中面板刚查过的那一条。
+   *
+   * ⚠️ 省略时本端点行为与升级前**逐字节相同**（未接线 = 无回写）。
+   */
+  writeBalance?: (accountId: string, balance: CreditBalance) => void
+  /**
    * 领取前是否先查一次签到状态（默认 `true`）。
    *
    * CodeBuddy 系拆成「查状态 + 领取」两个独立端点，先查可以省掉一次无效的
@@ -898,6 +927,11 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
       ...error === undefined ? {} : { error },
       ...extra === undefined ? {} : { extra },
     })
+    // ⚠️ **回写共享读数**（规格 §5.7）：只写**成功**的余额 —— 于是聚合折算能命中
+    //    面板刚查过的那一条（同一个 `(provider, accountId)` 键）。
+    //    ⚠️ 失败**不写**：失败是瞬时的，写进去会让折算侧把「刚失败过一次」当结论
+    //    （`balance-cache.ts` 的 `write` 也自带这道守卫，两处一致）。
+    if (balance !== null) deps.writeBalance?.(entry.id, balance)
   }
   return results
 }
@@ -1167,24 +1201,34 @@ export interface ModelCatalogSource {
    * ⚠️ 必须是**只读且零余额查询**的（规格 §8.3）：面板挂载时会调它。
    * 其余 14 家不实现本方法，故这里声明为可选（结构化类型，不影响它们）。
    */
-  describeCatalog?(force?: boolean, signal?: AbortSignal): Promise<Array<{
-    canonicalId: string
-    name: string
-    candidates: Array<{
-      provider: string
-      realId: string
-      realName: string
-      price: number
-      viaPatch: boolean
-      rejected: boolean
+  describeCatalog?(force?: boolean, signal?: AbortSignal): Promise<{
+    models: Array<{
+      canonicalId: string
+      name: string
+      candidates: Array<{
+        provider: string
+        realId: string
+        realName: string
+        price: number
+        viaPatch: boolean
+        rejected: boolean
+        /** 三态门控（宿主判定的**权威**结果，客户端只渲染）。 */
+        state: 'allowed' | 'rejected' | 'default-rejected'
+        /** 该渠道是否已接入临期折算（客户端据此决定「关掉时写哪张表」）。 */
+        expiryWired: boolean
+      }>
+      /** 该模型的**手工顺序**（宿主已按当前候选集过滤）。 */
+      order: string[]
     }>
-  }>>
+    orderMode: 'expiry' | 'manual'
+  }>
   /**
    * 清空选型缓存（**可选** —— 只有聚合适配器实现它）。
    *
    * ⚠️ 改了拒绝表之后调它可立即释放内存。但**正确性不依赖它**：
    * 聚合适配器的缓存键含拒绝表指纹，故改了表就自动不命中旧条目
-   *（见 `AggregateAdapter.rejectionFingerprint`）。
+   *（见 `AggregateAdapter.routingFingerprint` —— 2026-10-15 起为四项：拒绝表 + 白名单
+   *  + 手工顺序表 + 排序模式）。
    */
   clearChoiceCache?(): void
   /**
@@ -1238,8 +1282,10 @@ export interface ModelCatalogSource {
    *
    * ⚠️ 这是**唯一**会做余额探测的面板方法，**只在用户显式点「按临期排序」时**调用
    *（`describeCatalog` 的零查询契约不受影响，见那里的注释）。
+   *
+   * @param force - `true` 绕过探针的 60 秒折算缓存（面板每 5 分钟自动重探 / 手动点击时用）。
    */
-  describeExpiryOrder?(signal?: AbortSignal): Promise<Record<string, number>>
+  describeExpiryOrder?(signal?: AbortSignal, force?: boolean): Promise<Record<string, number>>
   /**
    * auto 的**实际转发历史**与选型入口（**可选** —— 只有 `jet-hub-auto` 实现它）。
    *
@@ -2457,8 +2503,15 @@ function registerJetHubEndpoints(
    * 「哪个渠道有窗口」的判断留在装配层，`usage-badge.ts` 因此不认识任何具体渠道。
    */
   const usageBadge = createUsageBadge({
-    collectBalances: (provider) =>
-      handleMethod('credits.balances', { provider }) as Promise<BadgeRpcResult<RpcCreditsBalancesResponse>>,
+    // ⚠️ `accountIds` 原样透传（2026-10-15，规格 §7-8）：徽标只要启用账号的读数。
+    //    ⚠️ **省略时不得传 `undefined` 之外的键**：端点以「键存在与否」区分
+    //    「查全部」与「查空集」—— `accountIds: undefined` 会被 JSON 丢掉，
+    //    故两种写法在这里等价（但显式展开更安全，见下面那行）。
+    collectBalances: (provider, accountIds) =>
+      handleMethod('credits.balances', {
+        provider,
+        ...accountIds === undefined ? {} : { accountIds: [...accountIds] },
+      }) as Promise<BadgeRpcResult<RpcCreditsBalancesResponse>>,
     collectQuota: (provider) =>
       provider === CLINE.id
         ? handleMethod('cline.quota', { provider }) as Promise<BadgeRpcResult<RpcClineQuotaResponse>>
@@ -4286,7 +4339,16 @@ function registerJetHubEndpoints(
       //   （「顺序查询避免并发触发风控」「单账号失败不中断」都是实测结论）。
       case 'credits.balances': {
         const req = payload as RpcCreditsBalancesRequest
-        const accounts = await pool.listAccounts(req.provider)
+        // ⚠️ 载荷里的 `accountIds` 是**可选裁剪**（用量徽标只要启用账号，见 types.ts
+        //    的那段注释）。⚠️ 必须在**自愈之前**读它、但只用于**余额查询**那一段：
+        //    自愈仍对**全部**账号跑（AGENTS.md：「续期不得按 enabled 过滤」）。
+        const requestedIds = Array.isArray(req?.accountIds)
+          ? new Set(req.accountIds.filter((id): id is string => typeof id === 'string'))
+          : undefined
+        const allAccounts = await pool.listAccounts(req.provider)
+        const accounts = requestedIds === undefined
+          ? allAccounts
+          : allAccounts.filter((entry) => requestedIds.has(entry.id))
         // ⚠⚠ **先按需自愈、再查余额**（Gitee issue IKKHL5 建议 C）。
         //
         // 缺陷：系统睡眠/挂起数小时后恢复，**宿主进程全程没退出** ⇒
@@ -4303,7 +4365,15 @@ function registerJetHubEndpoints(
         //
         // ⚠️ **顺序执行**且失败不上抛（见该函数）：积分查询是逐账号顺序
         // 查询（避免并发触发风控），这里保持同一形状。
-        await healExpiredAccounts(accounts)
+        //
+        // ⚠️⚠️ **自愈用 `allAccounts`（全部账号），不是被 `accountIds` 裁剪过的
+        //    `accounts`**（2026-10-15 加裁剪时同步加这条注释）：
+        //    本仓库有成文铁律「**续期不得按 `enabled` 过滤**」—— 停用只影响自动选号，
+        //    与「凭据是否需要保持新鲜」无关。用量徽标为了省几个余额请求而传
+        //    `accountIds`（只含启用账号）时，**停用账号的凭据仍必须被续期** ——
+        //    否则它们会在停用期间一路放到失效，用户重新启用后拿到死凭据、
+        //    只能重新登录（真实缺陷，见 AGENTS.md 的那一节）。
+        await healExpiredAccounts(allAccounts)
 
         // ⚠️ **两个形态与骨架不匹配的特例，先于查表短路**：
         //    - `opencode`：余额是**本地派生的通道可用性**（读账号池的
@@ -4520,6 +4590,14 @@ function registerJetHubEndpoints(
           ...impl.fetchBalance === undefined
             ? {}
             : { fetchBalance: (credential) => impl.fetchBalance!(credential, callContext) },
+          // ⚠️ 回写共享读数（规格 §5.7）：`provider` 由本端点提供 —— 
+          //    `collectCreditBalances` 自己不知道 provider（它的入参是账号数组）。
+          ...balanceCacheOf() === undefined
+            ? {}
+            : {
+                writeBalance: (accountId, balance) =>
+                  balanceCacheOf()!.write(req.provider, accountId, { at: Date.now(), value: balance }),
+              },
           warn: (msg) => ctx.logger?.warn?.(msg),
         })
         // ⚠️ 只有**按到期时间分桶**的渠道才回传窗口天数（判据是 registry 的
@@ -5258,8 +5336,11 @@ function registerJetHubEndpoints(
         //    缓存」，用户在渠道侧改了模型后点刷新看不到变化）。
         //    只有显式刷新才绕缓存；其余调用方（含 `listModels`）继续走缓存。
         const force = (payload as { force?: unknown } | undefined)?.force === true
-        const models = await source.describeCatalog(force, _signal)
-        const value: RpcAggregateCatalogResponse = { models }
+        const catalog = await source.describeCatalog(force, _signal)
+        // ⚠️ `orderMode` 与每个模型的 `order` **由 `describeCatalog` 从池里读**（不是这里读）：
+        //    两处都读会让「面板显示的排序方式」与「实际用的」在某个时刻分叉。
+        //    客户端**不得**重算这两项（红线：同一语义两套判据）。
+        const value: RpcAggregateCatalogResponse = catalog
         return { ok: true, value }
       }
 
@@ -5283,6 +5364,9 @@ function registerJetHubEndpoints(
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
         const value: RpcAggregateRejectionsResponse = {
           aggregateRejections: pool.listAggregateRejections(),
+          // ⚠️ 必须同时回白名单：面板的逐条开关要按三态显示，只回拒绝表会让白名单条目
+          //    在下一次点击前一直是陈旧值（与 `rejectionsFromCatalog()` 的回填机制同款）。
+          aggregateAllowed: pool.listAggregateAllowed(),
         }
         return { ok: true, value }
       }
@@ -5308,7 +5392,109 @@ function registerJetHubEndpoints(
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
         const value: RpcAggregateRejectionsResponse = {
           aggregateRejections: pool.listAggregateRejections(),
+          aggregateAllowed: pool.listAggregateAllowed(),
         }
+        return { ok: true, value }
+      }
+
+      /**
+       * 手工「打开 / 关闭」某条候选是否参与轮换（用户 2026-10-15）。
+       *
+       * ⚠️ 与 `aggregate.setRejected` 是**同一枚开关的两个方向**，但落在**两张不同的表**上
+       *（未接入临期折算的候选归白名单、已接入的归拒绝表 —— 见 `AggregateAllowedMap` 的说明）：
+       * 故两个 case 的体例、日志、`clearChoiceCache` 必须**逐条对齐** ——
+       * 漏掉任一处的 `clearChoiceCache`/指纹会让改动最多 60 秒后才生效（静默）。
+       *
+       * ⚠️ **本端点不做两表归一**（用户 2026-10-15 的修正）：写白名单**不得**顺手清拒绝表。
+       */
+      case 'aggregate.setAllowed': {
+        const req = payload as RpcAggregateSetAllowedRequest
+        if (typeof req?.canonicalId !== 'string' || req.canonicalId.length === 0
+          || typeof req.provider !== 'string' || req.provider.length === 0
+          || typeof req.realId !== 'string' || req.realId.length === 0) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'canonicalId / provider / realId 必填' },
+          }
+        }
+        await pool.setAggregateAllowed(req.canonicalId, req.provider, req.realId, req.allowed === true)
+        ctx.logger.info(
+          `[jet-hub] 聚合：${req.allowed === true ? '手工打开' : '取消手工打开'} `
+          + `${req.canonicalId} 的候选 ${req.provider}/${req.realId}`,
+        )
+        modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        const value: RpcAggregateRejectionsResponse = {
+          aggregateRejections: pool.listAggregateRejections(),
+          aggregateAllowed: pool.listAggregateAllowed(),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 写入某虚拟模型的**手工排序**（面板拖动结束时调用，整体提交）。
+       *
+       * ⚠️ `order` 必须是**字符串数组**：传字符串会被逐字符处理（`String(undefined)` 的同类形态，
+       *    本仓库有专门判据）。**不得**接受畸形后静默清空顺序 —— 那等于用户拖完一次顺序就没了
+       *   （比报错更糟）。
+       * ⚠️ 返回的是**服务端过滤去重后**的权威数组（不是入参回声）⇒ 客户端据此校正本地状态。
+       */
+      case 'aggregate.setOrder': {
+        const req = payload as RpcAggregateSetOrderRequest
+        if (typeof req?.canonicalId !== 'string' || req.canonicalId.length === 0
+          || !Array.isArray(req.order)
+          || req.order.some((entry) => typeof entry !== 'string')) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'canonicalId 必填且 order 必须是字符串数组' },
+          }
+        }
+        const order = await pool.setAggregateOrder(req.canonicalId, req.order)
+        ctx.logger.info(`[jet-hub] 聚合：写入 ${req.canonicalId} 的手工顺序（${order.length} 条）`)
+        // ⚠️ 顺序**参与**候选排序 ⇒ 顺序变了缓存里的候选序就失效了（指纹也含它，双保险）。
+        modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        const value: RpcAggregateSetOrderResponse = { canonicalId: req.canonicalId, order }
+        return { ok: true, value }
+      }
+
+      /**
+       * 切换排序模式（顶部 toggle：按临期 / 按手工）。
+       *
+       * ⚠️ 只接受两个字面量：畸形值若被静默接受，面板会显示「按手工」而宿主按临期路由
+       *（显示与行为分叉）。
+       */
+      case 'aggregate.setOrderMode': {
+        const req = payload as RpcAggregateSetOrderModeRequest
+        if (req?.mode !== 'expiry' && req?.mode !== 'manual') {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: "mode 必须是 'expiry' 或 'manual'" },
+          }
+        }
+        await pool.setAggregateOrderMode(req.mode)
+        ctx.logger.info(`[jet-hub] 聚合：排序模式切换为「${req.mode === 'manual' ? '按手工' : '按临期'}」`)
+        modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        const value: RpcAggregateSetOrderModeResponse = { orderMode: pool.listAggregateOrderMode() }
+        return { ok: true, value }
+      }
+
+      /**
+       * 一键「拒绝非临期」：把所有**未接入临期折算**渠道上的候选恢复成
+       * 「默认不参与轮换」的初始态（用户后续仍可逐条手工打开）。
+       *
+       * ⚠️⚠️ `keepProviders` 必须从 `WIRED_EXPIRY_PROVIDERS` **取引用**，不得在这里写死一份副本：
+       *    写死会随「新接入一个渠道」静默漂移 —— 那一键按钮会开始清掉**已接入**渠道的白名单，
+       *    而它们的白名单是**有意义**的（用户可能手工打开了某条已接入候选）。
+       *
+       * ⚠️ 账号池**不该知道**「接入折算」是什么语义：它只收到「保留哪些 provider」的清单
+       *   ⇒ 依赖方向仍是「上层知道下层」。这样「谁是未接入渠道」的权威只有那一个常量。
+       *
+       * ⚠️ `cleared === 0` 也回 `ok: true`：幂等点击**不是错误**（面板据计数决定文案）。
+       */
+      case 'aggregate.rejectNonExpiring': {
+        const { cleared, aggregateAllowed } = await pool.clearAggregateAllowedExcept(WIRED_EXPIRY_PROVIDERS)
+        ctx.logger.info(`[jet-hub] 聚合：一键拒绝非临期，恢复 ${cleared} 条候选为默认不参与`)
+        modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        const value: RpcAggregateRejectNonExpiringResponse = { cleared, aggregateAllowed }
         return { ok: true, value }
       }
 
@@ -5348,12 +5534,20 @@ function registerJetHubEndpoints(
        *
        * ⚠️ 未注册时回**空表**而不是报错：面板据此保持字母序并提示，
        * 不影响其余功能（与 `aggregate.activeProvider` 的安静降级同取向）。
+       *
+       * ⚠️ `force`（可选，默认 false，2026-10-15 加）：`true` 时绕过**探针自己的**
+       * 折算缓存（{@link EXPIRY_CACHE_TTL_MS} 60 秒）。面板的按临期模式每 5 分钟
+       * 自动重探一次、用户手动点也算重探 ⇒ 那两种情形都该拿**新鲜**值，
+       * 否则「每 5 分钟刷新」实际是「每 5 分钟读一次 60 秒缓存」（近似无差别，
+       * 但用户点「刷新」时期待的是真重查）。
+       * 只有显式重探才传 `true`；进入模式时那次传 `false`（省钱）。
        */
       case 'aggregate.expiryOrder': {
         const source = modelAdapters?.['aggregate']
+        const force = (payload as { force?: unknown } | undefined)?.force === true
         const order = source?.describeExpiryOrder === undefined
           ? {}
-          : await source.describeExpiryOrder(_signal)
+          : await source.describeExpiryOrder(_signal, force)
         const value: RpcAggregateExpiryOrderResponse = { order }
         return { ok: true, value }
       }
