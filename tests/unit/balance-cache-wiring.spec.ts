@@ -13,7 +13,7 @@
  * ⚠️ 本文件**不**重复 `balance-cache.spec.ts` 的缓存行为（TTL / 串行 / abort）——
  *    那些已在那里逐格覆盖。这里只测**装配接线**。
  */
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import { createBalanceCache } from '../../src/balance-cache.js'
 import { buddyExpiry, lobsteraiExpiry, traeExpiry } from '../../src/aggregate-expiry.js'
 import type { CreditBalance } from '../../src/credits.js'
@@ -311,5 +311,307 @@ describe('★★ 两条消费路径共用同一份缓存（回写 → 折算命�
     const cache = createBalanceCache({ ttlMs: 120_000, fetch: async () => { throw new Error('x') } })
     await cache.readOne('buddy', 'a1', { credential })
     expect(cache.peek('buddy', 'a1')?.error).toBeDefined()
+  })
+})
+
+/**
+ * ★★ `credits.balances` 端点**先吃共享读数**（2026-10-16，issue IKMCOO 缺陷 1）。
+ *
+ * 用户原话：「打开 jet hub 的 loomy 页面加载账号就需要很长时间，我们使用底层
+ * 缓存的时候加载如果得不到新数据应该读出旧数据不能直接返回错误」。
+ *
+ * ⚠️ 本文件此前**零守卫**：`balance-cache.ts` 模块自己登记过「零生产调用者」，
+ *    而端点只有 `writeBalance`（回写给别人用）、**自己每次仍打上游** ——
+ *    面板渲染 + 徽标分钟级轮询会各发一遍 N 个请求。
+ */
+describe('★★ 端点先吃共享读数（打开面板不该每次都打上游）', () => {
+  const accounts = [
+    { id: 'a1', provider: 'loomy', nickname: '甲', enabled: true, credentialRef: 'LOOMY_ACCOUNT_A1', createdAt: 1, refreshable: false },
+    { id: 'a2', provider: 'loomy', nickname: '乙', enabled: true, credentialRef: 'LOOMY_ACCOUNT_A2', createdAt: 2, refreshable: false },
+  ] as never
+
+  /** 一个「有余额」的读数（与端点要的 `CreditBalance` 同形）。 */
+  const balanceOf = (total: number): CreditBalance => ({
+    total,
+    packages: [{ name: 'p', unit: '积分', remaining: total, total, used: 0, active: true,
+      cycleStartTime: '', cycleEndTime: '', expiredTime: '' }],
+  } as unknown as CreditBalance)
+
+  it('★★ 缓存命中 ⇒ **一次上游请求都不发**，且逐账号取到各自的值', async () => {
+    const { collectCreditBalances } = await import('../../src/jet-hub-rpc.js')
+    const upstream: string[] = []
+    const cache = createBalanceCache({
+      ttlMs: 120_000,
+      fetch: async (provider, entry) => {
+        upstream.push(`${provider}:${entry.id}`)
+        return balanceOf(entry.id === 'a1' ? 100 : 200)
+      },
+    })
+    // ① 先让缓存有读数（模拟上一次面板已查过）
+    await cache.read('loomy', [{ id: 'a1' }, { id: 'a2' }])
+    expect(upstream).toHaveLength(2)
+
+    // ② 端点再跑一次 ⇒ 必须**全部命中**，零上游
+    upstream.length = 0
+    const rows = await collectCreditBalances(accounts, undefined, {
+      resolve: async () => ({ value: JSON.stringify({ access_token: 't' }) }),
+      readCachedBalance: async (accountId) => {
+        const reading = await cache.readStale('loomy', accountId, { credential: {} })
+        if (reading.value === undefined) return undefined
+        return { balance: reading.value as CreditBalance, stale: reading.stale, at: reading.at }
+      },
+      // ⚠️ 这个桩**绝不该被调用**（缓存已命中）；真被调用即说明没接线。
+      fetchBalance: async () => { upstream.push('FALLBACK'); return null },
+    } as never)
+
+    expect(upstream, '★★ 命中共享读数时不得再发上游').toEqual([])
+    expect(rows.map((r) => r.balance?.total), '必须逐账号取到各自的读数').toEqual([100, 200])
+  })
+
+  it('★★ 缓存缺席 ⇒ 照常回落自己发请求（不得把「未接线」变成全不可用）', async () => {
+    const { collectCreditBalances } = await import('../../src/jet-hub-rpc.js')
+    const upstream: string[] = []
+    const rows = await collectCreditBalances([accounts[0] as never], undefined, {
+      resolve: async () => ({ value: JSON.stringify({ access_token: 't' }) }),
+      // 缓存恒返回 undefined（未命中且无旧值）
+      readCachedBalance: async () => undefined,
+      fetchBalance: async () => {
+        upstream.push('FALLBACK')
+        return balanceOf(7)
+      },
+    } as never)
+    expect(upstream, '★ 必须回落').toEqual(['FALLBACK'])
+    expect(rows[0]!.balance?.total).toBe(7)
+    expect(rows[0]!.error, '★ 回落成功不该带错误').toBeUndefined()
+  })
+
+  it('★★ 兼顶读数 ⇒ 回传旧值**且**带上「本次失败」说明（用户要看到数据有多旧）', async () => {
+    const { collectCreditBalances } = await import('../../src/jet-hub-rpc.js')
+    let clock = 1_000_000
+    let broken = false
+    const cache = createBalanceCache({
+      ttlMs: 1000,
+      staleTtlMs: 600_000,
+      now: () => clock,
+      fetch: async () => {
+        if (broken) throw new Error('上游超时')
+        return balanceOf(100)
+      },
+    })
+    // 先成功一次（此刻 1_000_000）
+    await cache.read('loomy', [{ id: 'a1' }])
+    // 过期 + 上游挂掉
+    clock += 60_000
+    broken = true
+    const rows = await collectCreditBalances([accounts[0] as never], undefined, {
+      resolve: async () => ({ value: JSON.stringify({ access_token: 't' }) }),
+      readCachedBalance: async (accountId) => {
+        const reading = await cache.readStale('loomy', accountId, { credential: {} })
+        if (reading.value === undefined) return undefined
+        return {
+          balance: reading.value as CreditBalance,
+          stale: reading.stale,
+          at: reading.at,
+          ...reading.error === undefined ? {} : { error: reading.error },
+        }
+      },
+      fetchBalance: async () => { throw new Error('不该走到这里') },
+    } as never)
+
+    // ★ 核心：拿到的是**旧值**而不是错误
+    expect(rows[0]!.balance?.total, '★★ 取数失败必须显示旧值而不是报错').toBe(100)
+    expect(rows[0]!.error, '★★ 必须说明本次查询失败').toContain('本次查询失败')
+    expect(rows[0]!.error, '★ 必须带上次成功的时间').toMatch(/\d{4}\/\d/)
+  })
+
+  it('★★ 端点**真的**先吃共享读数（行为级：第二次打开面板零上游请求）', async () => {
+    // ⚠️⚠️⚠️ **为什么不能用源码正则**（2026-10-16 变异验证实测打穿）：
+    //   我第一版断言端点 case 里存在字面量 `readCachedBalance:`。实测把它
+    //   的**值**改成 `undefined as never`（键仍在）⇒ **19 条全绿**，
+    //   而生产后果是「面板每次都打上游」—— 本功能价值归零。
+    //   这正是 AGENTS.md 登记的「源码文本断言的共同弱点：字面量在死分支里
+    //   照样存在」。⇒ 这里必须**跑真实端点**、数真实上游调用。
+    const { registerJetHubRpc, JET_HUB_API_PATH } = await import('../../src/jet-hub-rpc.js')
+    const runtimeModule = await import('../../src/provider-runtime.js')
+
+    const upstream: string[] = []
+    const cache = createBalanceCache({
+      ttlMs: 120_000,
+      fetch: async (provider, entry) => {
+        upstream.push(`${provider}:${entry.id}`)
+        return balanceOf(entry.id === 'a1' ? 100 : 200)
+      },
+    })
+    runtimeModule.registerBalanceCache(cache)
+
+    // 让端点查得到 runtime（`fetchBalanceReading` 靠它拿取数实现）
+    runtimeModule.registerProviderRuntime({
+      descriptor: { id: 'loomy' } as never,
+      credits: { fetchBalance: async () => balanceOf(999) },
+    } as never)
+
+    const loomyAccounts = accounts as unknown as Array<{ id: string }>
+    const pool = {
+      addAccount: async () => {},
+      updateAccount: async () => {},
+      removeAccount: async () => {},
+      listAccounts: async (provider: string) =>
+        (provider === 'loomy' ? loomyAccounts : []),
+      listAccountsByProvider: async (provider: string) =>
+        (provider === 'loomy' ? loomyAccounts : []),
+    }
+    let handler: ((request: Request) => Promise<Response>) | undefined
+    const ctx = {
+      get: (key: string) => key === 'connection'
+        ? { fetch: { register: (cfg: { path: string; fetch: (r: Request) => Promise<Response> }) => { if (cfg.path === JET_HUB_API_PATH) handler = cfg.fetch } } }
+        : undefined,
+      inject: (_deps: string[], callback: (injected: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        resolve: async () => ({ value: JSON.stringify({ access_token: 't' }) }),
+        set: async () => {},
+        unset: async () => {},
+      },
+    }
+    const emptyAuths = {
+      codearts: {}, buddy: {}, workbuddy: {}, lobsterai: {}, qoder: {}, qodercn: {},
+      trae: {}, cline: {}, loomy: {}, raccoon: {}, minimax: {}, zcode: {}, gemini: {}, officeace: {},
+    }
+    registerJetHubRpc(ctx as never, pool as never, emptyAuths as never)
+
+    const callBalances = async (force = false) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+          payload: {
+            method: 'credits.balances',
+            // ⚠️ `force` 只在显式为真时出现 —— JSON 里带 `force: false` 与不带是
+            //    **同一语义**，客户端省略它就是吃缓存（见 types.ts 的字段注释）。
+            payload: force ? { provider: 'loomy', force: true } : { provider: 'loomy' },
+          },
+        }),
+      }))
+      // ⚠️ 响应裹在 `{ type, rpcId, result }` 信封里（`reply()` 的形状）——
+      //   断言必须剥到 `result`，否则 `first.ok` 恒 undefined。
+      const body = await response.json() as {
+        result: { ok: boolean; value?: { accounts?: Array<{ balance?: { total?: number } }> } }
+      }
+      return body.result
+    }
+
+    // ① 第一次：必然回源（缓存是空的）
+    const first = await callBalances()
+    expect(first.ok).toBe(true)
+    expect(upstream.length, '★ 首次必须真的取数（缓存空）').toBeGreaterThan(0)
+
+    // ② 第二次（= 用户重新打开面板 / 徽标下一轮轮询）：必须**零上游**
+    upstream.length = 0
+    const second = await callBalances()
+    expect(second.ok).toBe(true)
+    expect(
+      upstream,
+      '★★ 第二次打开面板不得再发上游请求（缺陷 1：两条路径各打一遍）',
+    ).toEqual([])
+    expect(
+      second.value?.accounts?.map((a) => a.balance?.total),
+      '★★ 命中共享读数时必须仍返回真实余额（不是空、不是 0）',
+    ).toEqual([100, 200])
+  })
+
+  /**
+   * ★★ **`force: true` 必须真的强制回源**（2026-10-16 审计 P1-1，实测确认的回归）。
+   *
+   * ## 缺陷形态
+   *
+   * 引入共享缓存后 `credits.balances` 有了 120 秒 TTL，而面板「刷新积分」按钮
+   * 在 TTL 内点了**等于没点** —— 而它的 `title` 写着「余额由服务端实时计算，
+   * 点此可刷新」。
+   *
+   * ⚠️ **为什么上面那条用例抓不到**：它只断言「不带 force ⇒ 零上游」，
+   *   **从不断言「带 force ⇒ 会回源」** ⇒ `force` 那一整条通路可以是死代码而全绿。
+   *   这正是本次审计实测的形态：`collectCreditBalances` 里传的是**硬编码 `{}`**
+   *   ⇒ `readOptions.force` 恒 `undefined` ⇒ 端点读了 `payload.force` 也传不到。
+   */
+  it('★★ force: true ⇒ 强制回源（哪怕缓存里有新鲜值）', async () => {
+    const { registerJetHubRpc, JET_HUB_API_PATH } = await import('../../src/jet-hub-rpc.js')
+    const runtimeModule = await import('../../src/provider-runtime.js')
+
+    const upstream: string[] = []
+    const cache = createBalanceCache({
+      ttlMs: 120_000,
+      fetch: async (provider, entry) => {
+        upstream.push(`${provider}:${entry.id}`)
+        return balanceOf(entry.id === 'a1' ? 100 : 200)
+      },
+    })
+    runtimeModule.registerBalanceCache(cache)
+    runtimeModule.registerProviderRuntime({
+      descriptor: { id: 'loomy' } as never,
+      credits: { fetchBalance: async () => balanceOf(999) },
+    } as never)
+
+    const loomyAccounts = accounts as unknown as Array<{ id: string }>
+    const pool = {
+      addAccount: async () => {}, updateAccount: async () => {}, removeAccount: async () => {},
+      listAccounts: async (p: string) => (p === 'loomy' ? loomyAccounts : []),
+      listAccountsByProvider: async (p: string) => (p === 'loomy' ? loomyAccounts : []),
+    }
+    let handler: ((request: Request) => Promise<Response>) | undefined
+    const ctx = {
+      get: (key: string) => key === 'connection'
+        ? { fetch: { register: (cfg: { path: string; fetch: (r: Request) => Promise<Response> }) => { if (cfg.path === JET_HUB_API_PATH) handler = cfg.fetch } } }
+        : undefined,
+      inject: (_deps: string[], callback: (injected: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        resolve: async () => ({ value: JSON.stringify({ access_token: 't' }) }),
+        set: async () => {}, unset: async () => {},
+      },
+    }
+    registerJetHubRpc(ctx as never, pool as never, {
+      codearts: {}, buddy: {}, workbuddy: {}, lobsterai: {}, qoder: {}, qodercn: {},
+      trae: {}, cline: {}, loomy: {}, raccoon: {}, minimax: {}, zcode: {}, gemini: {}, officeace: {},
+    } as never)
+
+    const call = async (force: boolean) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'r', method: 'jet-hub',
+          payload: {
+            method: 'credits.balances',
+            payload: force ? { provider: 'loomy', force: true } : { provider: 'loomy' },
+          },
+        }),
+      }))
+      return (await response.json() as { result: { ok: boolean } }).result
+    }
+
+    // ① 先填满缓存
+    await call(false)
+    // ② 不带 force ⇒ 命中（零上游）
+    upstream.length = 0
+    await call(false)
+    expect(upstream, '★ 前提：不带 force 时命中缓存').toEqual([])
+    // ③ ★ 带 force ⇒ **必须回源**（缓存里有新鲜值也要打）
+    upstream.length = 0
+    const forced = await call(true)
+    expect(forced.ok).toBe(true)
+    expect(
+      upstream,
+      '★★ force:true 必须强制回源（否则「刷新积分」按钮是假的 —— 审计 P1-1）',
+    ).not.toEqual([])
+  })
+
+  // ⚠️⚠️ **全局注册位必须清**（`provider-runtime.ts:803` 登记过这个陷阱）：
+  //   `registerBalanceCache` / `registerProviderRuntime` 都写在**进程级**表上，
+  //   留着会让后续用例命中本例的缓存 —— 症状是「余额读数莫名命中」，
+  //   且**与本例完全无关**（假红极难定位）。
+  afterEach(async () => {
+    const runtimeModule = await import('../../src/provider-runtime.js')
+    runtimeModule.clearProviderRuntimes()
   })
 })

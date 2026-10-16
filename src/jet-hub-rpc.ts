@@ -128,6 +128,14 @@ import {
   type CreditBalance,
 } from './credits.js'
 import { CODEBUDDY, productById, type BuddyProduct } from './product.js'
+// ⚠️ CodeBuddy 限时补偿积分（2026-10-16）：一次性活动，**不接自动签到**。
+// 端点走 buddy 的 `webBase`（`src/product.ts` 里是 `www.workbuddy.cn`；三个 host
+// 实测均可达，见该模块头）。
+import {
+  claimCompensation,
+  describeCompensationFailure,
+  fetchCompensationStatus,
+} from './buddy-compensation.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
 /**
  * ⚠️ **`collectBuddyGrowth` 已搬到 `src/buddy-growth.ts`**（2026-10-08 Task 4），
@@ -223,6 +231,10 @@ import type {
   RpcCreditsBalancesRequest,
   RpcCreditsBalanceExtra,
   RpcCreditsBalancesResponse,
+  RpcBuddyClaimCompensationRequest,
+  RpcBuddyClaimCompensationResponse,
+  RpcBuddyCompensationStatusRequest,
+  RpcBuddyCompensationStatusResponse,
   RpcClineQuotaRequest,
   RpcClineQuotaResponse,
   RpcClineRequestLogRequest,
@@ -731,6 +743,40 @@ export interface CreditsEndpointDeps<
    */
   writeBalance?: (accountId: string, balance: CreditBalance) => void
   /**
+   * ★ **共享余额读数缓存**的**读**出口（2026-10-16，issue IKMCOO 缺陷 1 + 用户要求）。
+   *
+   * ## 为什么需要它（与上面 `writeBalance` 互补）
+   *
+   * `writeBalance` 只让**别的消费者**命中本端点的读数；本端点自己**每次调用
+   * 仍逐账号打上游**。而本端点有**多个调用方**（面板渲染、用量徽标的分钟级
+   * 轮询——见 `usage.badge` 内部直接调 `credits.balances`），于是同一个账号在
+   * 一分钟里被查 N 次：上游抖动时一失败就整批拖住，用户看到「面板加载很久」。
+   *
+   * ⇒ 本钩子让端点**先吃共享读数**（含陈旧兼顶），命中即零网络请求。
+   *
+   * ## ⚠️ 形状约束与 `writeBalance` 同源（端点响应有 `extra` 等额外字段）
+   *
+   * 本钩子返回的是**折叠后的** `CreditBalance`（缓存里那份），**不含** `extra`
+   * ⇒ 命中时**不得**同时回传 `extra`，否则那是编造。
+   *
+   * @param accountId - 账号池条目 id。
+   * @param force - `true` 时跳过缓存（含兼顶），强制回源 —— 面板「刷新」按钮。
+   * @returns 读数（成功/兼顶旧值都可能）；`undefined` ⇒ **本次没有可用的缓存读数**，
+   *   调用方**照常发请求**（折叠的可用性不得依赖缓存是否接线）。
+   */
+  readCachedBalance?: (
+    accountId: string,
+    options: { force?: boolean },
+  ) => Promise<{ balance: CreditBalance; stale: boolean; at: number; error?: string } | undefined>
+  /**
+   * 载荷里的 `force`（面板「刷新积分」按钮）。
+   *
+   * ⚠️ **必须透传给 {@link CreditsEndpointDeps.readCachedBalance}**（审计 P1-1）：
+   *   不传 ⇒ 「刷新」退化成「再读一次缓存」，且在兼顶场景下**看起来成功**
+   *   （返回旧值 + 一句「本次查询失败」），比报错更误导。
+   */
+  force?: boolean
+  /**
    * 领取前是否先查一次签到状态（默认 `true`）。
    *
    * CodeBuddy 系拆成「查状态 + 领取」两个独立端点，先查可以省掉一次无效的
@@ -959,29 +1005,55 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
     let balance: CreditBalance | null = null
     let error: string | undefined
     let extra: RpcCreditsBalanceExtra | undefined
-    try {
-      const resolved = await deps.resolve(credentialRef(entry.credentialRef))
-      if (resolved === undefined) {
-        error = '凭据未配置'
-      } else {
-        const credential = JSON.parse(resolved.value) as TCredential
-        if (fetchDetailed !== undefined) {
-          // 带原因的查询：实现自己决定「非积分账户」等业务状态的文案。
-          const detailed = await fetchDetailed(credential, product)
-          balance = detailed.balance
-          error = detailed.error
-          extra = detailed.extra
-          if (balance === null && error === undefined) error = '余额查询失败'
-        } else {
-          balance = await fetchBalance(credential, product)
-          // 查询函数以 null 表示"查不到"（网络/业务码异常），与"余额为 0"不同
-          if (balance === null) error = '余额查询失败'
+    /**
+     * ★ 先吃共享读数（2026-10-16）：命中即**零网络请求**。
+     *
+     * ⚠️ **必须排在解析凭据之前**：缓存命中时我们压根不需要凭据 ——
+     * 而「凭据读不到」正是最该显示旧值的那种失败（凭据可能被并发续期覆盖）。
+     * ⚠️ 命中时**不设 `extra`**（缓存里那份没有该字段，见 `readCachedBalance` 注释）。
+     * ⚠️ 兼顶读数（`stale: true`）**照样回传**，并带上 `error` 让 UI 标注
+     *    「本次查询失败，显示的是 HH:MM 的数据」—— 这正是用户 2026-10-16 的要求：
+     *    拿不到新数据就读旧数据，而不是直接返回错误。
+     */
+    if (deps.readCachedBalance !== undefined && entry.id !== undefined) {
+      // ⚠️⚠️ **`force` 必须透传下去**（2026-10-16 审计 P1-1 实测确认的回归）：
+      //   这里原写死 `{}` ⇒ `readOptions.force` 恒 `undefined` ⇒ 端点虽然读了
+      //   `payload.force`，但**这一腿永远传不到** ⇒ 面板「刷新积分」按钮在
+      //   120 秒 TTL 内点了等于没点，而按钮 title 写着「点此可刷新」—— 假的。
+      //   ⇒ 载荷的 `force` 经 `collectCreditBalances` 的 deps 一路透到这里。
+      const cached = await deps.readCachedBalance(entry.id, { force: deps.force === true })
+      if (cached !== undefined) {
+        balance = cached.balance
+        if (cached.stale) {
+          error = `本次查询失败，显示的是 ${new Date(cached.at).toLocaleString('zh-CN')} 的数据（${cached.error ?? '上游不可达'}）`
         }
       }
-    } catch (caught) {
-      deps.warn?.(`[jet-hub] credits.balances 账号 ${entry.id} 失败: ${String(caught)}`)
-      error = caught instanceof Error ? caught.message : String(caught)
-      balance = null
+    }
+    if (balance === null) {
+      try {
+        const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined) {
+          error = '凭据未配置'
+        } else {
+          const credential = JSON.parse(resolved.value) as TCredential
+          if (fetchDetailed !== undefined) {
+            // 带原因的查询：实现自己决定「非积分账户」等业务状态的文案。
+            const detailed = await fetchDetailed(credential, product)
+            balance = detailed.balance
+            error = detailed.error
+            extra = detailed.extra
+            if (balance === null && error === undefined) error = '余额查询失败'
+          } else {
+            balance = await fetchBalance(credential, product)
+            // 查询函数以 null 表示"查不到"（网络/业务码异常），与"余额为 0"不同
+            if (balance === null) error = '余额查询失败'
+          }
+        }
+      } catch (caught) {
+        deps.warn?.(`[jet-hub] credits.balances 账号 ${entry.id} 失败: ${String(caught)}`)
+        error = caught instanceof Error ? caught.message : String(caught)
+        balance = null
+      }
     }
     results.push({
       accountId: entry.id,
@@ -4679,6 +4751,26 @@ function registerJetHubEndpoints(
       //   （「顺序查询避免并发触发风控」「单账号失败不中断」都是实测结论）。
       case 'credits.balances': {
         const req = payload as RpcCreditsBalancesRequest
+        /**
+         * ★ 共享读数槽要用的**凭据**（2026-10-16）。
+         *
+         * ⚠️ 为什么不能直接用 `accounts` 里现成的：那些条目只有 `credentialRef`，
+         *    而 `fetchBalanceReading` 需要**已解析**的凭据（`JSON.parse` 之后）。
+         * ⚠️ **解析失败返回 `undefined`**：缓存命中时压根不发请求（不需要凭据），
+         *    未命中时 `fetchBalanceReading` 会抛「凭据未提供」⇒ 被记成失败读数 ⇒
+         *    面板照常显示「凭据未配置」的错误路径。**不会**把凭据问题伪装成余额。
+         */
+        const resolveCredentialForCache = async (accountId: string): Promise<unknown> => {
+          const entry = accounts.find((a) => a.id === accountId)
+          if (entry === undefined) return undefined
+          const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+          if (resolved === undefined) return undefined
+          try {
+            return JSON.parse(resolved.value)
+          } catch {
+            return undefined
+          }
+        }
         // ⚠️ 载荷里的 `accountIds` 是**可选裁剪**（用量徽标只要启用账号，见 types.ts
         //    的那段注释）。⚠️ 必须在**自愈之前**读它、但只用于**余额查询**那一段：
         //    自愈仍对**全部**账号跑（AGENTS.md：「续期不得按 enabled 过滤」）。
@@ -4937,6 +5029,50 @@ function registerJetHubEndpoints(
             : {
                 writeBalance: (accountId, balance) =>
                   balanceCacheOf()!.write(req.provider, accountId, { at: Date.now(), value: balance }),
+                /**
+                 * ★ 载荷的 `force`（面板「刷新积分」按钮，2026-10-16 审计 P1-1）。
+                 *
+                 * ⚠️ 类型已补进 `RpcCreditsBalancesRequest`（`src/types.ts`），
+                 *   故这里**按类型读**而不是 `(payload as {force?: unknown})` 强转 ——
+                 *   强转会让「客户端根本没传」这件事在编译期完全看不出来。
+                 */
+                force: req.force === true,
+                /**
+                 * ★ **先吃共享读数**（2026-10-16，issue IKMCOO 缺陷 1 + 用户
+                 * 「打开面板要很久，加载拿不到新数据应该读旧数据」）。
+                 *
+                 * ⚠️ `readStale` 内部会**真的取数**（命中则零网络），故此处是
+                 *    「读一次共享读数（含兼顶）」，不是「只 peek」。
+                 * ⚠️ **`force` 必须透传**：面板「刷新」按钮要绕过缓存（含兼顶）
+                 *    强制回源 —— 漏传会让「刷新」退化成「读旧值」，用户点了没反应。
+                 *    ⚠️ 该载荷此前**没有** `force` 字段（只有 `accountIds`），
+                 *    这里按既有可选字段的同款读法解析，不改响应形状。
+                 */
+                readCachedBalance: async (accountId, readOptions) => {
+                  // ⚠️ 判据**只用** `readOptions.force`（2026-10-16 审计 P1-1）：
+                  //   原先这里 `|| payload.force === true` 兜底，看起来两条腿都通，
+                  //   但上一行 `collectCreditBalances` 传的是**硬编码 `{}`**
+                  //   ⇒ `readOptions.force` 恒 undefined ⇒ 那一腿恒假。
+                  //   现在 `collectCreditBalances` 会透传 `deps.force`（见其定义），
+                  //   而 `deps.force` 由下方 `force:` 注入 ⇒ 只有**一条**来源，
+                  //   避免「两处判 force」再次漂移。
+                  const forced = readOptions.force === true
+                  const reading = await balanceCacheOf()!.readStale(
+                    req.provider,
+                    accountId,
+                    // ⚠️ 槽里必须带凭据：`fetchBalanceReading` 靠它发请求
+                    //    （`entry.credential === undefined` ⇒ 直接抛「凭据未提供」）。
+                    { credential: await resolveCredentialForCache(accountId) },
+                    { force: forced },
+                  )
+                  if (reading.value === undefined) return undefined
+                  return {
+                    balance: reading.value as CreditBalance,
+                    stale: reading.stale,
+                    at: reading.at,
+                    ...reading.error === undefined ? {} : { error: reading.error },
+                  }
+                },
               },
           warn: (msg) => ctx.logger?.warn?.(msg),
         })
@@ -5051,6 +5187,104 @@ function registerJetHubEndpoints(
             })),
           } satisfies RpcClineRequestLogResponse,
         }
+      }
+
+      // ── CodeBuddy 限时补偿积分（2026-10-16 新增）──
+      //
+      // ⚠️ **不是签到**：这是一次性的限时活动（`end_time` 到期即作废）。
+      //    本仓库对「一次性 / 有代价动作」的既有铁律是**默认不自动执行**
+      //    （见 `buddy-growth.ts` 的 `runExotic`）。故这里只开两条**用户显式
+      //    触发**的 RPC：
+      //      ① `buddy.compensationStatus` —— 只读，面板挂载/刷新时调用；
+      //      ② `buddy.claimCompensation` —— 写操作，**只由面板按钮触发**。
+      //    **刻意不接进 `credits.claimAll` / auto-checkin**：那会把一次性动作
+      //    变成每日自动执行，违反上面的约定（且收益只有一次）。
+      //
+      // ⚠️ 端点走 `webBase`（buddy = `www.workbuddy.cn`），不是推理站
+      //    `copilot.tencent.com`（= `endpoint`）。三个 host 实测**均可达**，
+      //    故这是**取舍**不是「只有一个能通」。见 `src/buddy-compensation.ts` 模块头。
+      case 'buddy.compensationStatus': {
+        const req = payload as RpcBuddyCompensationStatusRequest
+        if (req.provider !== CODEBUDDY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
+        }
+        const accounts = await pool.listAccounts(CODEBUDDY.id)
+        const account = accounts.find((entry) => entry.id === req.accountId)
+        if (account === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `账号不存在：${req.accountId}` } }
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (resolved === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: '凭据不可用，请先重新登录该账号' } }
+        }
+        let credential: BuddyCredential
+        try {
+          credential = JSON.parse(resolved.value) as BuddyCredential
+        } catch {
+          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
+        }
+        const result = await fetchCompensationStatus(credential, CODEBUDDY)
+        if (!result.ok) {
+          // ⚠️ 失败**不包成 ok:true**（Issue IKJOZA 的铁律），且原文随行给出。
+          return { ok: false, error: { code: 'bad-request', message: describeCompensationFailure(result.failure) } }
+        }
+        return {
+          ok: true,
+          value: {
+            claimed: result.status.claimed,
+            active: result.status.active,
+            creditNum: result.status.creditNum,
+            ...result.status.validityPeriod === undefined ? {} : { validityPeriod: result.status.validityPeriod },
+            ...result.status.endTime === undefined ? {} : { endTime: result.status.endTime },
+          } satisfies RpcBuddyCompensationStatusResponse,
+        }
+      }
+      case 'buddy.claimCompensation': {
+        const req = payload as RpcBuddyClaimCompensationRequest
+        if (req.provider !== CODEBUDDY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
+        }
+        const accounts = await pool.listAccounts(CODEBUDDY.id)
+        const account = accounts.find((entry) => entry.id === req.accountId)
+        if (account === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `账号不存在：${req.accountId}` } }
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (resolved === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: '凭据不可用，请先重新登录该账号' } }
+        }
+        let claimCredential: BuddyCredential
+        try {
+          claimCredential = JSON.parse(resolved.value) as BuddyCredential
+        } catch {
+          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
+        }
+        const claimResult = await claimCompensation(claimCredential, CODEBUDDY)
+        if (!claimResult.ok) {
+          return { ok: false, error: { code: 'bad-request', message: describeCompensationFailure(claimResult.failure) } }
+        }
+        // ⚠️⚠️ **领取成功后必须让折算缓存失效**（2026-10-16 审计 P2-3）。
+        //
+        // 补偿领取改变的是**账号积分余额**，而聚合折算与 buddy 系共用
+        // `src/aggregate-expiry.ts` 的折算缓存（TTL 60 秒、`UNUSABLE` 会被
+        // 缓存更久）。不清的话用户点完「立即领取」会看到「领了但积分没涨」。
+        //
+        // ⚠️ 与 `credits.claimAll` 之后那次 `clearExpiryCache()`（见本函数的
+        //    `fetch` 处理器，`jet-hub-rpc.ts:2634`）是**同一条铁律的两个入口**：
+        //    任何让积分增加的写操作都必须让下游折算失效。
+        //
+        // ⚠️ **刻意不复用 `balanceCache.clear()`**：那是**整渠道**清空，会连带
+        //    作废该渠道其它账号正在被徽标/面板用的读数（`balance-cache.ts:274`
+        //    明确警告「别当成按渠道刷新的顺手动作」）。折算缓存才是这里真正
+        //    会骗人的那一层，按既有入口清它足够。
+        modelAdapters?.['aggregate']?.clearExpiryCache?.()
+        return { ok: true, value: {} satisfies RpcBuddyClaimCompensationResponse }
       }
 
       // ── 模型列表可见性（黑名单开关）──

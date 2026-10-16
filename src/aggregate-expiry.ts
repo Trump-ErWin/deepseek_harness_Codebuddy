@@ -877,7 +877,10 @@ export async function loomyExpiry(credential: LoomyCredential): Promise<number> 
   }
   if (detail === null) return UNUSABLE
   if (detail.daily > 0) return nextUtc8DayStartMs()
-  return detail.permanent > 0 ? NEVER : UNUSABLE
+  // ⚠️ `permanent` 可能是 `undefined`（上游没给该字段，issue IKMCOO 缺陷 4）。
+  //   **判「大于 0」而不是「非 0」**：`undefined > 0` 为假 ⇒ 落入 `UNUSABLE`
+  //   —— 那正是「有今日额度却被判不可用」的同型故障。
+  return detail.permanent !== undefined && detail.permanent > 0 ? NEVER : UNUSABLE
 }
 
 /**
