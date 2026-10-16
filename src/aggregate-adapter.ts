@@ -43,16 +43,20 @@ import type {
 import type { AccountPool } from './account-pool.js'
 // ⚠️ 只导入**类型**（拒绝表的结构）—— 运行时读写由装配层注入的 `rejections()` 承担，
 // 适配器不直接碰 `state.json`（保持「适配器不持有持久化」的分层）。
-import type { AggregateRejectionMap } from './jet-hub-store.js'
+import type { AggregateAllowedMap, AggregateOrderMap, AggregateRejectionMap } from './jet-hub-store.js'
 import { buildVirtualModels, type VirtualModel } from './aggregate-catalog.js'
 // ⚠️ `NEVER` / `UNUSABLE` **必须**从这里导入（Task 3 的共享底座）。它们从不在
 // `auto-adapter.ts` 里 `export` —— 从那里导入会编译失败（Task 3 复审已确认）。
 // ⚠️ `ExpiryProbe` 也在这里：它是**纯类型**，而 `aggregate-expiry.ts`（探针实现）
 // 与 `auto-adapter.ts` 都要引用它 ⇒ 放底座才能让两者都依赖底座而**不互相依赖**。
+// ⚠️ `resolveCandidateGate` / `CandidateGate` 也在这里：三态判据**只留这一份实现**
+//（面板渲染、选型报价、建池过滤都读它的结果，客户端读宿主下发的 `state`）。
 import {
   NEVER,
   UNUSABLE,
   rankCandidates,
+  resolveCandidateGate,
+  type CandidateGate,
   type ExpiryProbe,
   type RankedCandidate,
 } from './aggregate-core.js'
@@ -182,6 +186,27 @@ export interface AggregateAdapterOptions {
    *（RPC 端点负责这件事，见 `aggregate.setRejected`）。
    */
   rejections?: () => AggregateRejectionMap
+  /**
+   * 读取「**显式允许**参与轮换」白名单（虚拟模型 id → provider → realId → true）。
+   *
+   * ⚠️ 与 {@link rejections} 同为**函数**（不是快照）且理由相同：面板改完开关，
+   * **下一次请求**就要生效。
+   * 省略时视为「没有任何手工打开」⇒ 未接入临期折算的渠道**全部默认不参与**
+   *（这是用户 2026-10-15 选定的默认态；已接入渠道不受影响）。
+   */
+  allowed?: () => AggregateAllowedMap
+  /**
+   * 读取**手工顺序**表（虚拟模型 id → 候选键数组）。
+   *
+   * ⚠️ 省略时视为「未自定义任何顺序」⇒ 全部按临期序（升级前行为）。
+   */
+  order?: () => AggregateOrderMap
+  /**
+   * 读取**排序模式**（`'expiry'` / `'manual'`）。
+   *
+   * ⚠️ 省略时视为 `'expiry'`（升级前行为）。
+   */
+  orderMode?: () => 'expiry' | 'manual'
 }
 
 /** 聚合适配器。 */
@@ -454,15 +479,31 @@ export class AggregateAdapter extends LlmAdapter {
    *（`sortCandidatesByExpiry` 把非有限值排最后）。
    *
    * ⚠️ **只读**：不改拒绝表、不写缓存、不落盘。
+   *
+   * @param force - `true` 时绕过探针自己的折算缓存（`EXPIRY_CACHE_TTL_MS` 60 秒）。
+   *   面板的「每 5 分钟自动重探」与用户手动点击都传 `true`（那两种情形要的是**新鲜**值）；
+   *   进入模式时那次传 `false`（省一次上游请求）。
    */
-  async describeExpiryOrder(signal?: AbortSignal): Promise<Record<string, number>> {
+  async describeExpiryOrder(signal?: AbortSignal, force = false): Promise<Record<string, number>> {
     await this.ensureCatalog()
     signal?.throwIfAborted()
     const probe = this.expiryProbe()
+    // ⚠️ 探针的缓存失效入口是**可选**的（`ExpiryProbeWithCache.clear`）：单测注入的替身
+    //    没有它 ⇒ 用可选链。⚠️ 缺 `clear` 时**静默不生效**而不是报错：`force` 只是
+    //    「尽量拿新鲜值」的优化，不该因为替身没有缓存而让面板报错。
+    if (force) (probe as { clear?: () => void }).clear?.()
     const out: Record<string, number> = {}
     // ⚠️ 按渠道去重：同一渠道在多个虚拟模型下重复出现，只探一次。
     for (const virtual of this.catalog) {
       for (const candidate of virtual.candidates) {
+        // ⚠️ **只探「已接入临期折算」的渠道** —— 这是**刻意**的，不是漏改（2026-10-15 复核）：
+        //    未接入的渠道**没有折算原语可调**，探测它只会白打一次上游请求，而结果
+        //    必然是 `UNUSABLE`（`credentialExpiry` 对未接入渠道短路返回 `UNUSABLE`）。
+        //
+        // ⚠️ 它**不是**「第 4 个漏改的可见性过滤点」：本方法只影响面板的**排序展示**
+        //   （「按临期排序」模式下给候选算位次），不决定任何东西的**可见性** ——
+        //    手工打开的未接入候选在**手工模式**下由手工位次排序，**不需要**临期值
+        //   （见 `manualRankOf`：未排过的尾巴回落 `NEVER`，与这里的跳过自洽）。
         if (!WIRED_EXPIRY_PROVIDERS.includes(candidate.provider)) continue
         if (Object.hasOwn(out, candidate.provider)) continue
         signal?.throwIfAborted()
@@ -500,80 +541,164 @@ export class AggregateAdapter extends LlmAdapter {
    *   ⚠️ 只有**用户显式点刷新**时才传 `true`：`listModels` 等高频路径必须继续走缓存，
    *   否则每次打开模型选择器都会重推整个目录。
    */
-  async describeCatalog(force = false, signal?: AbortSignal): Promise<Array<{
-    canonicalId: string
-    name: string
-    candidates: Array<{
-      provider: string
-      realId: string
-      realName: string
-      price: number
-      viaPatch: boolean
-      rejected: boolean
+  async describeCatalog(force = false, signal?: AbortSignal): Promise<{
+    models: Array<{
+      canonicalId: string
+      name: string
+      candidates: Array<{
+        provider: string
+        realId: string
+        realName: string
+        price: number
+        viaPatch: boolean
+        rejected: boolean
+        state: CandidateGate
+        expiryWired: boolean
+      }>
+      order: string[]
     }>
-  }>> {
+    orderMode: 'expiry' | 'manual'
+  }> {
     const catalog = await this.refreshCatalog(force, signal)
-    return catalog.map((virtual) => {
-      // ⚠️ 用 `rejectedFor`（含 D4 的 id 漂移降级），不是 `rejectedIn` ——
-      //    面板显示的拒绝状态必须与**轮换实际用的**判据一致（否则面板会显示
-      //    「参与轮换」而实际被降级拒掉，或反之）。
+    const models = catalog.map((virtual) => {
+      // ⚠️ 用 `rejectedFor`（含 D4 的 id 漂移降级）的**信息**，但三态判定统一走
+      //    `gateOf`（唯一判据）—— 两者读的是同一张拒绝表，`gateOf` 内部用
+      //    「该键在不在降级后的集合里」表达，故不会出现第二套判据。
       const rejected = this.rejectedFor(virtual)
+      // ⚠️⚠️ **不得过滤掉「未接入临期折算」的候选**（用户 2026-10-15 的诉求 IKL7F9）。
+      //
+      // ## 这条过滤曾经存在，为什么删掉
+      // 升级前这里有一条 `WIRED_EXPIRY_PROVIDERS.includes(candidate.provider)` 的过滤，
+      // 理由是「面板不该显示一个永远不会被用的渠道」（2026-10-07 用户报障）。
+      // 现在**语义变了**：那些候选**可以**被手工打开并真的参与轮换（赋 `NEVER`，
+      // 见 `candidatesFor`）⇒ 把它们藏起来会让用户在面板里**找不到它们**，
+      // 「手工打开」这个功能就无从操作（issue IKL7F9 的诉求本身就是「让它们进聚合」）。
+      //
+      // ⚠️ 那条「面板在撒谎」的顾虑由**三态**承担：每条候选带 `state`，未接入且未打开的
+      //    候选显示为「无临期积分 · 默认不参与」—— 面板依然**说真话**，只是把选择权交给用户。
+      const candidates = virtual.candidates.map((candidate) => {
+        const state = this.gateOf(virtual.key, candidate.provider, candidate.realId, rejected)
+        return {
+          provider: candidate.provider,
+          realId: candidate.realId,
+          realName: candidate.realName,
+          price: candidate.price,
+          // ⚠️ 面板据此标 `⚠️补丁`（规格 §7.1）—— 补丁条目是人工核查的重点。
+          viaPatch: candidate.via === 'patch',
+          // ⚠️ 语义收窄：本字段现在等于「当前不参与轮换」（含默认不参与）。
+          rejected: state !== 'allowed',
+          state,
+          expiryWired: WIRED_EXPIRY_PROVIDERS.includes(candidate.provider),
+        }
+      })
+      // ⚠️ 手工顺序**按当前候选集过滤**后下发：顺序表里可能留着 id 漂移的脏键
+      //（该渠道的模型改了名/下架了），把它发给客户端会让拖拽列表出现幽灵条目。
+      const currentKeys = new Set(candidates.map((c) => `${c.provider}\u0000${c.realId}`))
+      const order = (this.options.order?.() ?? {})[virtual.key]?.filter((key) => currentKeys.has(key)) ?? []
       return {
         canonicalId: virtual.key,
         name: this.nameOf(virtual),
-        // ⚠️⚠️ **必须过滤掉「未接入临期折算」的候选**（真实缺陷，用户报障 2026-10-07）。
-        //
-        // 用户截图：面板的候选子列表里出现了 **lobsterai**（还有 raccoon / trae），
-        // 而它们**不在** `WIRED_EXPIRY_PROVIDERS` 里。
-        //
-        // 探针实测（真实链路）：
-        // - **轮换**只发往 buddy ✅（未接入渠道经 `expiryProbe` 得 `UNUSABLE`、被排除）
-        // - **面板**却列出 `buddy, lobsterai` ❌
-        //
-        // ⇒ 面板在**撒谎**：显示一个永远不会被用的渠道，用户看到后去关它
-        //   （点「参与轮换」）也毫无作用，还会以为聚合真的会用 lobsterai。
-        //
-        // ⚠️ 为什么之前漏了：`refreshCatalog` 里那条过滤是**模型层**的
-        //   （「虚拟模型只要有一个已接入候选就保留」），它**不过滤候选本身**。
-        //   我只在模型层做了过滤，忘了候选层。规格 §9.2.1 的精神（只广告可路由的
-        //   东西）对**候选**同样适用。
-        //
-        // ⚠️ 过滤后模型**不会**变成空候选：模型层已保证至少有一个已接入候选
-        //   （否则整条不会进 `this.catalog`）。有一条用例锁住这一点。
-        candidates: virtual.candidates
-          .filter((candidate) => WIRED_EXPIRY_PROVIDERS.includes(candidate.provider))
-          .map((candidate) => ({
-            provider: candidate.provider,
-            realId: candidate.realId,
-            realName: candidate.realName,
-            price: candidate.price,
-            // ⚠️ 面板据此标 `⚠️补丁`（规格 §7.1）—— 补丁条目是人工核查的重点。
-            viaPatch: candidate.via === 'patch',
-            rejected: rejected.has(`${candidate.provider}\u0000${candidate.realId}`),
-          })),
+        candidates,
+        order,
       }
+    })
+    // ⚠️ `orderMode` **由宿主下发**（不是让客户端从「顺序表非空」推导：用户可以切到
+    //    手工模式却一条都没拖过 ⇒ 面板会显示成「按临期」，与宿主实际用的一致但**不是
+    //    用户选的那个**，下次切换就会「跳」）。
+    return { models, orderMode: this.options.orderMode?.() === 'manual' ? 'manual' : 'expiry' }
+  }
+
+  /**
+   * 某条候选当前的三态门控（**唯一判据**，同步、零网络：只读注入的三张表）。
+   *
+   * ⚠️⚠️ **只有这一处实现**：`describeCatalog` 下发 `state`、`pickerNameOf` 统计
+   * 「当前参与」的价格，都调它。两处各写一遍判据必然漂移（本仓库有过「同一文件
+   * 两套同义判据」的缺陷史）。
+   *
+   * ⚠️ `WIRED_EXPIRY_PROVIDERS` 的引用也**只在此一处**（`candidatesFor` 的建池过滤
+   * 同样走本方法）⇒ 「谁的默认态是什么」这个问题全仓只有一个答案。
+   *
+   * @param degraded - 省略时内部算（`rejectedFor`）。传入可让调用方在循环里复用
+   *   同一次降级计算（`describeCatalog` 对每个虚拟模型算一次，避免每候选重算）。
+   */
+  private gateOf(
+    canonicalId: string,
+    provider: string,
+    realId: string,
+    degraded?: ReadonlySet<string>,
+  ): CandidateGate {
+    const rejectedSet = degraded
+      ?? this.rejectedFor({
+        key: canonicalId,
+        candidates: [{ provider, realId }],
+      })
+    return resolveCandidateGate({
+      // ⚠️ 用**降级后**的集合（D4：渠道级拒绝也算该候选被拒）。
+      rejected: rejectedSet.has(`${provider}\u0000${realId}`),
+      allowed: (this.options.allowed?.() ?? {})[canonicalId]?.[provider]?.[realId] === true,
+      expiryWired: WIRED_EXPIRY_PROVIDERS.includes(provider),
     })
   }
 
   /**
-   * 拒绝表的**内容指纹**（参与缓存键，见 `candidatesFor`）。
+   * 聚合路由状态的**内容指纹**（参与 `choiceCache` 的键，见 `candidatesFor`）。
    *
-   * 只对「哪些候选被拒」这件事取指纹 —— 与键的**顺序**无关（同一集合的不同书写
-   * 顺序是同一张表，不该导致缓存失效）。用排序后的拼接而非 JSON.stringify，
-   * 正是为了避开键顺序的影响。
+   * ⚠️ **四项缺一不可**（用户 2026-10-15 起：拒绝表 + 白名单 + 手工顺序表 + 排序模式）：
+   * 任何一项变了，缓存里的候选序（含**次序**）都不再成立。漏一项的症状是
+   * 「用户改了门控/顺序，随后最多 60 秒内仍按旧的走」—— **静默**（用户会以为开关坏了）。
+   *
+   * ⚠️ 拒绝表与白名单用**排序后的拼接**（与键的书写顺序无关：同一集合的不同书写顺序
+   * 是同一张表，不该导致缓存失效）；顺序表**不能**排序（它的**顺序本身就是语义**）；
+   * 模式直接拼接。
+   *
+   * ⚠️ 不要改成「条目数」之类的摘要：本仓库有过「缓存失效判据按数组长度」被实测证伪的
+   * 教训（两条不同内容长度相同 ⇒ 恒不失效）。
    */
-  private rejectionFingerprint(): string {
-    const table = this.options.rejections?.() ?? {}
-    const parts: string[] = []
-    for (const [canonicalId, byProvider] of Object.entries(table)) {
-      for (const [provider, byRealId] of Object.entries(byProvider)) {
-        for (const [realId, flag] of Object.entries(byRealId)) {
-          if (flag === true) parts.push(`${canonicalId}\u0000${provider}\u0000${realId}`)
+  private routingFingerprint(): string {
+    const enabledKeys = (table: Record<string, Record<string, Record<string, boolean>>>): string[] => {
+      const parts: string[] = []
+      for (const [canonicalId, byProvider] of Object.entries(table)) {
+        for (const [provider, byRealId] of Object.entries(byProvider)) {
+          for (const [realId, flag] of Object.entries(byRealId)) {
+            if (flag === true) parts.push(`${canonicalId}\u0000${provider}\u0000${realId}`)
+          }
         }
       }
+      return parts.sort()
     }
-    parts.sort()
-    return parts.join('\u0001')
+    const order = this.options.order?.() ?? {}
+    // ⚠️ 顺序表按**键**排序后拼接（不同模型的书写顺序无关），但**每个模型的数组保持原序**
+    //   （那才是语义）。
+    const orderParts = Object.keys(order).sort().map((key) => `${key}=${order[key]!.join(',')}`)
+    return [
+      enabledKeys(this.options.rejections?.() ?? {}).join('\u0001'),
+      enabledKeys(this.options.allowed?.() ?? {}).join('\u0001'),
+      orderParts.join('\u0002'),
+      this.options.orderMode?.() === 'manual' ? 'manual' : 'expiry',
+    ].join('\u0003')
+  }
+
+  /**
+   * 手工位次函数：`orderMode === 'manual'` 且该模型**有**顺序表时给出，否则 `undefined`
+   *（⇒ `rankCandidates` 走临期序）。
+   *
+   * ⚠️ `auto` **恒为 `undefined`**（用户 2026-10-15 的取舍 Q6=C）：`auto` 的池是跨全部渠道的
+   *    巨池，「手工顺序」在那里没有可解释的含义 —— 用户拖的是**某个虚拟模型**的候选。
+   *
+   * ⚠️ 未排在数组里的候选返回 `undefined` ⇒ `rankCandidates` 把它们按
+   *    **临期↑ → 倍率↑** 追加在已排过的**之后**（新增候补因此不会消失）。
+   */
+  private manualRankOf(model: string): ((candidate: RankedCandidate) => number | undefined) | undefined {
+    if (model === AGGREGATE_AUTO_MODEL) return undefined
+    if (this.options.orderMode?.() !== 'manual') return undefined
+    const order = (this.options.order?.() ?? {})[model]
+    if (order === undefined || order.length === 0) return undefined
+    const rank = new Map<string, number>()
+    // ⚠️ 只认**第一次**出现：数组理论上已由服务端去重（`sanitizeAggregateOrder` 与
+    //    `AccountPool.setAggregateOrder` 都去重），这里是**纵深防御** —— 重复位次会让
+    //    比较器非确定（同一候选有两个名次），而 `sort` 的非确定行为极难复现。
+    for (const [index, key] of order.entries()) if (!rank.has(key)) rank.set(key, index)
+    return (candidate) => rank.get(`${candidate.provider}\u0000${candidate.realId}`)
   }
 
   /**
@@ -617,23 +742,38 @@ export class AggregateAdapter extends LlmAdapter {
       }
       signal?.throwIfAborted()
     }
-    // ⚠️ **只播报「至少有一个已接入候选」的虚拟模型**（审计轮次二实测证伪的缺陷）。
+    // ⚠️⚠️ 这里**曾经**有一条 `WIRED_EXPIRY_PROVIDERS` 过滤，已于 2026-10-15 **删除**
+    //（本 PR，用户诉求 IKL7F9）。**不要再加回来**，理由如下：
     //
-    // 聚合目录会广告出所有能推导出规范名的模型 —— 包括**候选全来自未接入临期
-    // 折算的渠道**那些。但那些候选一律被折算成 `UNUSABLE`（正确），于是用户选中
-    // 它拿到的报错是：
-    //   `MISSING_CREDENTIAL | 「xxx」当前没有任何可用候选（渠道被关闭、模型被关、
-    //    或所有渠道都无可用账号）`
-    // ⇒ 把「该渠道的折算尚未实现」**谎报成**「你没登录 / 渠道被关」，正是本仓库
-    //    反复修的那类误导性报错。实测（探针）：只接 `cline`（未接入）时目录仍含
-    //    `deepseek-v4-1-flash` 与 `muse-spark-1-3`。
+    // ## 它原来在挡什么
+    // 目录会推导出「候选全来自未接入临期折算渠道」的虚拟模型，而那些候选一律被折算成
+    // `UNUSABLE` ⇒ 用户选中它拿到的是
+    //   `MISSING_CREDENTIAL | 「xxx」当前没有任何可用候选…`
+    // 即把「该渠道的折算尚未实现」**谎报成**「你没登录 / 渠道被关」。
     //
-    // ⚠️ `auto` **不参与**该过滤（它由 `listModels` / `listAllModels` 单独合成，
-    //    不在 `this.catalog` 里）—— 它的池跨全部渠道，任一已接入渠道有账号就能路由。
+    // ## 为什么现在可以删
+    // ① **判据已恒真**：`providerIds()`（见其注释）返回 `AGGREGATE_CHANNELS ∩ 存活路由`
+    //    ⇒ 每条候选的 `provider` 必然在 `AGGREGATE_CHANNELS` 内 ⇒ 换成渠道全集即恒 `true`
+    //   （即「按渠道全集过滤」= 什么都不做）。
+    // ② **它让用户点不动**：未接入渠道的**独有模型**会被这条过滤**整条剔掉** ⇒
+    //    用户在面板里手工打开候选后，模型选择器里**仍然看不到它**，「打开」看起来毫无效果。
+    // ③ **误导性报错已由两条正路解决**（此时更该让用户看见它）：
+    //    - 面板对「全部候选未参与轮换」给出**显式提示**（含「无临期积分 · 默认不参与」这一新原因）；
+    //    - 请求失败文案补上第 4 种原因，并指向**真实存在**的面板（见 `stream` 的
+    //      `targets.length === 0` 分支）。
+    //
+    // ⚠️⚠️ **不得改成「至少一个候选当前参与轮换」**：那会让「用户把某模型的候选全部拒绝」
+    //    把该模型**从选择器里移除**，而 `jet-hub-store.ts`（`AggregateRejectionMap` 上方那段）
+    //    与面板的 `isAllCandidatesRejected` 都**明文要求**「候选全被拒 ≠ 关闭模型，
+    //    它仍在目录里，请求时如实报错」。⇒ **目录身份必须与用户门控无关**
+    //   （`this.catalog` 也因此保持稳定，`provider.status` 的 `total` 不随用户点击漂移）。
+    //
+    // ⚠️ `auto` **不参与**任何过滤（它不在 `this.catalog` 里，由 `listModels` /
+    //    `listAllModels` 单独合成）。
+    //
     // ⚠️ 先记下**上一次**推导出的全量目录（下面的判据要用它判断「用户关的是整个 provider」）。
     const previousIds = [AGGREGATE_AUTO_MODEL, ...this.catalog.map((m) => m.key)]
     this.catalog = buildVirtualModels(catalogs)
-      .filter((virtual) => virtual.candidates.some((c) => WIRED_EXPIRY_PROVIDERS.includes(c.provider)))
     this.catalogAt = now
     // ⚠️⚠️ **目录变了 ⇒ 能力缓存与窗口缓存必须一起失效**（与目录同生命周期）。
     //
@@ -845,7 +985,32 @@ export class AggregateAdapter extends LlmAdapter {
       .filter((id) => alive.has(id) && id !== AGGREGATE_PROVIDER && id !== 'jet-hub-auto')
   }
 
-  /** 对外播报虚拟模型（含 `auto`），**套用户黑名单**。 */
+  /**
+   * 对外播报虚拟模型（含 `auto`），**套用户黑名单**。
+   *
+   * ## ⚠️⚠️ 2026-10-16：另加一条「**全部候选都是「无临期积分且没打开」**⇒ 不播报」
+   *
+   * 用户验收反馈原话：「默认不参与轮换的无临期模型（没有一个打开轮换）则**不显示在
+   * 选择模型的列表中的聚合模型下属的列表中**」。
+   *
+   * ### 为什么这条**不违反**「候选全被拒 ≠ 关闭模型」的成文不变式（判据是**分档**）
+   *
+   * 两种「没有任何候选在轮换」必须分开对待 —— 这是本次改动的**全部要害**：
+   *
+   * | 情形 | 选择器 | 理由 |
+   * |---|---|---|
+   * | 用户**主动**把候选全拒（`rejected`） | **仍播报** | 那是既有成文不变式（`jet-hub-store.ts` 的「候选全被拒 ≠ 关闭模型」）。模型留在选择器里，用户选中它拿到**如实**报错，回面板重新打开即恢复 —— 若藏起来，恢复入口就消失了 |
+   * | 候选**全是**「无临期积分且用户没打开」（`default-rejected`） | **不播报** | 用户**从未**对该模型做过任何决定，它进选择器只会得到「没有任何可用候选」（第 4 种原因的报错）。⚠️ 它**仍在聚合面板里**（那才是唯一的打开入口），故**恢复路径没有丢** |
+   * | 混合（一部分被拒、一部分默认） | **仍播报** | 里面含用户**主动**做的决定 ⇒ 归第一档 |
+   *
+   * ⇒ 判据是「**所有**候选都 `default-rejected`」，**不是**「没有候选在轮换」。
+   * ⚠️ 别把它简化成后者 —— 那会把「用户主动全拒」的模型也藏掉，正是上面那张表第一行禁止的。
+   *
+   * ⚠️ **只作用于本方法（模型选择器）**：
+   *   - `describeCatalog`（聚合面板）**不受影响** —— 面板必须能看到并打开它们；
+   *   - `listAllModels`（设置页的开关清单）与 `provider.status` 的 `total` **不受影响**
+   *     —— 目录身份保持稳定（`this.catalog` 不随门控漂移，这是上面那份不变式的另一半）。
+   */
   async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
     const models = await this.refreshCatalog()
     const disabled = this.options.accountPool.disabledModelsFor(AGGREGATE_PROVIDER)
@@ -853,9 +1018,26 @@ export class AggregateAdapter extends LlmAdapter {
     if (!disabled.has(AGGREGATE_AUTO_MODEL)) entries.push(this.autoModelInfo())
     for (const model of models) {
       if (disabled.has(model.key)) continue
+      // ⚠️ 见方法头那张表：**只有**「所有候选都 default-rejected」才跳过。
+      if (this.isAllDefaultsUnopened(model)) continue
       entries.push({ provider, id: model.key, name: this.pickerNameOf(model), inputModalities: ['text', 'image'] })
     }
     return entries
+  }
+
+  /**
+   * 该虚拟模型的候选是否**全部**是「无临期积分且用户没打开」（`default-rejected`）。
+   *
+   * ⚠️ **判据必须逐条看三态**，不能写成「没有 allowed」—— 后者会把
+   * 「用户主动全拒」（`rejected`）也算进来，而那**必须仍播报**（见 `listModels` 的表）。
+   *
+   * ⚠️ 无候选 ⇒ `false`（「无候选」是另一回事：那是该渠道模型下架，不是用户的选择）。
+   */
+  private isAllDefaultsUnopened(model: VirtualModel): boolean {
+    if (model.candidates.length === 0) return false
+    const rejected = this.rejectedFor(model)
+    return model.candidates.every((candidate) =>
+      this.gateOf(model.key, candidate.provider, candidate.realId, rejected) === 'default-rejected')
   }
 
   /**
@@ -961,12 +1143,20 @@ export class AggregateAdapter extends LlmAdapter {
    * **不得**用于 `resolveModel` / `describeCatalog` —— 见 {@link nameOf} 的注释。
    */
   private pickerNameOf(model: VirtualModel): string {
+    // ⚠️ 降级集合**算一次**（`rejectedFor` 含 D4 的 id 漂移降级，逐候选重算纯属浪费）。
+    const rejected = this.rejectedFor(model)
     const prices = model.candidates
-      // ⚠️ 只取**已接入临期折算**的候选（与 `describeCatalog` 的过滤同一口径）：
-      //    未接入的渠道经 `expiryProbe` 得 `UNUSABLE`、**永远不会被路由到**，
-      //    把它的价格显示出来等于替一个用不上的候选报价（规格 §9.2.1：
-      //    只广告可路由的东西）。
-      .filter((candidate) => WIRED_EXPIRY_PROVIDERS.includes(candidate.provider))
+      // ⚠️ 只取**当前参与轮换**的候选（`gateOf(...) === 'allowed'`）—— 判据已从
+      //    「已接入折算」升级为完整三态（用户 2026-10-15）：未接入渠道的候选**未手工打开时**
+      //    永远不会被路由到，把它的价格显示出来等于替一个用不上的候选报价；而**手工打开的**
+      //    未接入候选**真的会参与**（赋 `NEVER`），它的价格该算进去。
+      //
+      // ⚠️ 若这里保留「已接入」判据：用户手工打开一个更便宜的未接入候选后，选择器里的
+      //    「· 最低 x0.03」会**说谎** —— 正是本方法头警告的那类误导。
+      //
+      // ⚠️ `gateOf` 是同步、零网络的（只读注入的三张表）⇒ 本方法「同步 + 零网络」的
+      //    契约不变（`listModels` / `listAllModels` 的渲染路径不能打网络）。
+      .filter((candidate) => this.gateOf(model.key, candidate.provider, candidate.realId, rejected) === 'allowed')
       .map((candidate) => candidate.price)
       .filter((price) => Number.isFinite(price))
     if (prices.length === 0) return model.name
@@ -1111,13 +1301,22 @@ export class AggregateAdapter extends LlmAdapter {
     const targets = await this.candidatesFor(model, signal)
     if (targets.length === 0) {
       // ⚠️ **不要指向不存在的 UI**（第 3 轮审计实测）：初版说「请在 Jet Hub 设置页的
-      // 「聚合」面板检查」，但那个面板**不存在**（P2 才做）。⇒ 改为指向真实可操作的位置，
-      // 并把「未接入临期折算」这一最常见原因**说清楚**（它此前被谎报成「你没登录」）。
+      //  「聚合」面板检查」，但那个面板当时**不存在** ⇒ 那样写是骗用户。
+      //  ⚠️ 2026-10-15 更新：那个面板**现在真的存在**了（标题逐字是「聚合」，
+      //  见 `plugin-src/client/jet-hub.js` 的 `AggregatePanel`）⇒ 可以（也应该）指向它。
+      //
+      // ⚠️⚠️ **必须列出第 4 种原因**「候选在聚合面板里未参与轮换」（用户 2026-10-15 的新功能）：
+      //    未接入临期折算渠道的候选**默认不参与**，而它们现在**会出现在目录里** ⇒
+      //    用户能选中一个「没有任何候选在轮换」的模型。若文案不提这一种，
+      //    用户会把它读成「我明明登录了渠道却报没账号」（本仓库反复修的误导性报错）。
+      //    ⚠️ 错误码保持 `MISSING_CREDENTIAL` **不变**：改码会翻转宿主的错误分类与既有用例，
+      //    本处要的只是让 message 说真话。
       throw new LlmError(
         `aggregate: 「${model}」当前没有任何可用候选（渠道被关闭、模型被关、`
-        + '或所有渠道都无可用账号）。'
-        + '请在模型选择器里换用「聚合（跨渠道临期优先）」分组下的其它模型，'
-        + '或直连对应渠道使用该模型。',
+        + '所有渠道都无可用账号，或该模型的候选在聚合面板里未参与轮换）。'
+        + '请在 Jet Hub 设置页的「聚合」面板里检查各候选是否参与轮换'
+        + '（无临期积分的候选默认不参与，可逐条打开），'
+        + '或换用「聚合（跨渠道临期优先）」分组下的其它模型、或直连对应渠道使用该模型。',
         'MISSING_CREDENTIAL',
       )
     }
@@ -1187,7 +1386,7 @@ export class AggregateAdapter extends LlmAdapter {
     //    为什么不让调用方负责清：忘了清 = 用户在面板上关掉的候选在 60 秒内仍被尝试
     //    = 用户以为开关坏了，而这类「依赖调用方记得」的约定在本仓库已多次静默失效。
     //    `clearChoiceCache()` 仍保留（RPC 调它可立即释放内存），但**正确性不依赖它**。
-    const cacheKey = `${model}\u0000${this.rejectionFingerprint()}`
+    const cacheKey = `${model}\u0000${this.routingFingerprint()}`
     const cached = this.choiceCache.get(cacheKey)
     // ⚠️ 命中缓存**不查 signal**（与旧 auto 的注释同因）：`prepareCall` 每次都会
     // 调本方法，若命中分支也查 signal，同一个取消事件在 60 秒窗口的不同位置会产出
@@ -1207,7 +1406,12 @@ export class AggregateAdapter extends LlmAdapter {
       for (const virtual of this.catalog) {
         const rejected = this.rejectedFor(virtual)
         for (const candidate of virtual.candidates) {
-          if (rejected.has(`${candidate.provider}\u0000${candidate.realId}`)) continue
+          // ⚠️⚠️ **门控必须在建池阶段**（早于 `availableByModel` 与探针）：
+          //    ① 被排除的候选不该触发账号池查询与上游余额请求（纯浪费）；
+          //    ② 与既有「显式拒绝」的过滤位置**同处**，避免出现两套时序。
+          //    判据 = `resolveCandidateGate`（显式拒绝 > 显式允许 > 默认；
+          //    未接入临期折算的渠道**默认不参与**，可手工打开）。
+          if (this.gateOf(virtual.key, candidate.provider, candidate.realId, rejected) !== 'allowed') continue
           pool.push({ provider: candidate.provider, realId: candidate.realId, expiry: NEVER, price: candidate.price })
         }
       }
@@ -1217,7 +1421,7 @@ export class AggregateAdapter extends LlmAdapter {
       // ⚠️ `rejectedFor`（含 D4 漂移降级）—— 这是**建池**路径，用户拒绝的候选必须真的不进池。
       const rejected = this.rejectedFor(virtual)
       for (const candidate of virtual.candidates) {
-        if (rejected.has(`${candidate.provider}\u0000${candidate.realId}`)) continue
+        if (this.gateOf(virtual.key, candidate.provider, candidate.realId, rejected) !== 'allowed') continue
         pool.push({ provider: candidate.provider, realId: candidate.realId, expiry: NEVER, price: candidate.price })
       }
     }
@@ -1251,6 +1455,25 @@ export class AggregateAdapter extends LlmAdapter {
     // 逐候选折算临期（同一渠道只探一次）。
     const seen = new Map<string, number>()
     for (const candidate of usable) {
+      // ⚠️⚠️ **未接入临期折算的渠道：不探针，直接 `NEVER`**（本功能最容易做错、
+      //    做错了**完全静默**的一处）。
+      //
+      // ## 为什么不能让它走 probe
+      // `credentialExpiry` 对未接入渠道**恒返回 `UNUSABLE`**（`aggregate-expiry.ts` 的短路）
+      // ⇒ `rankCandidates` 会再次把它剔除 ⇒ 症状是「我明明在面板上打开了，它还是不参与」，
+      //   **零报错、零日志**。而它恰好是 issue IKL7F9 要解决的场景。
+      //
+      // ## 为什么这个分支成立
+      // 能走到这里的未接入候选，必然是白名单里**显式放行**的那几条
+      //（未放行的已在上面 `gateOf` 的建池过滤里剔除）⇒ 它们是「可用、只是没有临期信息」，
+      //  正是 `NEVER` 的定义。
+      //
+      // ⚠️ **用例必须两个方向都覆盖**（未放行 ⇒ 不在池里且**零探针**；放行 ⇒ 在池里且
+      //    探针**没被调用**），否则把门控整段删掉那些用例仍然全绿（本任务实测过这一点）。
+      if (!WIRED_EXPIRY_PROVIDERS.includes(candidate.provider)) {
+        candidate.expiry = NEVER
+        continue
+      }
       let expiry = seen.get(candidate.provider)
       if (expiry === undefined) {
         try {
@@ -1281,7 +1504,7 @@ export class AggregateAdapter extends LlmAdapter {
     }
     signal?.throwIfAborted()
 
-    const ranked = rankCandidates(pool)
+    const ranked = rankCandidates(pool, this.manualRankOf(model))
     // 尝试上限 = **所有虚拟模型里最长候选表的长度**。
     //
     // ## 为什么这个值同时满足两个看似矛盾的要求
@@ -2099,8 +2322,11 @@ function abortError(): Error {
  *   三条旧判据全不命中 ⇒ 被归成「本轮运行失败」⇒ 消费者看到误导性的 provider
  *   故障，而真相是「请求没跑完，重发即可」。归 aborted 的语义收益：终端不再
  *   显示「运行失败」，且外层不把它当「候选坏了」去改道（重发是新请求，不是换候选）。
+ * ⚠️ **本函数是共享判据**（2026-10-15 导出）：装配层与 `balance-cache` 都应当用它，
+ *    而不是各写一份 —— 本仓库此前已有 **4 份**同义实现（本文件、`aggregate-expiry.ts`
+ *    的简化版、`auto-adapter.ts`、`raccoon-adapter.ts` 的内联），别再添第五份。
  */
-function isAbortLike(error: unknown, signal?: AbortSignal): boolean {
+export function isAbortLike(error: unknown, signal?: AbortSignal): boolean {
   if (signal?.aborted === true) return true
   if (error === null || typeof error !== 'object') return false
   const candidate = error as { name?: unknown; code?: unknown; message?: unknown }
