@@ -822,6 +822,12 @@ export class AstudioAuth extends Service {
       credentialRef(this.product.defaultCredentialRef),
       JSON.stringify(credential),
     )
+    if (refName && refName !== this.product.defaultCredentialRef) {
+      await this.store.set(
+        credentialRef(refName),
+        JSON.stringify(credential),
+      )
+    }
     return credential
   }
 

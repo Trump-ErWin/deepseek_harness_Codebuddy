@@ -882,7 +882,10 @@ export async function collectCreditsStatus<TCredential = BuddyCredential, TProdu
   for (const entry of accounts) {
     let status: CheckinStatus | null = null
     try {
-      const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+      let resolved = await deps.resolve(credentialRef(entry.credentialRef))
+      if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+        resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+      }
       if (resolved !== undefined) {
         const credential = JSON.parse(resolved.value) as TCredential
         status = await fetchStatus(credential, product)
@@ -1070,7 +1073,10 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
     }
     if (balance === null) {
       try {
-        const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        let resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+          resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+        }
         if (resolved === undefined) {
           error = '凭据未配置'
         } else {
@@ -4268,22 +4274,30 @@ function registerJetHubEndpoints(
             createdAt: Date.now(),
           })
 
-          let imported: AstudioCredential | undefined
-          try {
-            // 优先尝试导入本机已登录会话（读盘 + 写 DSH 凭据库都在里面；零网络请求）
-            imported = await astudio.importLocalSession(refName)
-          } catch {
-            // 本地无会话或导入失败，回退到微信扫码登录流程
-            imported = undefined
-          }
+          const reqAstudio = req as { astudioLoginMethod?: string }
+          const loginMethod = reqAstudio.astudioLoginMethod
 
-          if (imported !== undefined) {
-            await pool.updateAccount(id, {
-              nickname: astudioAccountNickname(imported, id),
-              expiresAt: undefined,
-              refreshable: isAstudioRefreshable(imported),
-            })
-            return { ok: true, value: { accountId: id, loginUrl: '', reused: true } }
+          if (loginMethod !== 'web') {
+            let imported: AstudioCredential | undefined
+            try {
+              imported = await astudio.importLocalSession(refName)
+            } catch (error) {
+              if (loginMethod === 'local') {
+                void pool.removeAccount(id).catch(() => {})
+                const reason = error instanceof Error ? error.message : String(error)
+                throw new Error(`导入本机 AStudio 会话失败：${reason}`)
+              }
+              imported = undefined
+            }
+
+            if (imported !== undefined) {
+              await pool.updateAccount(id, {
+                nickname: astudioAccountNickname(imported, id),
+                expiresAt: undefined,
+                refreshable: isAstudioRefreshable(imported),
+              })
+              return { ok: true, value: { accountId: id, loginUrl: '', reused: true } }
+            }
           }
 
           // 本地无会话：启动微信扫码登录流程，对接 SSOService/wx/scanlogin/qrcode

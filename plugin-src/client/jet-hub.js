@@ -2584,6 +2584,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 缺省 `cn`，与宿主 `normalizeAccioRegion` 的回落值一致（未知值也回落 `cn`）。
    */
   const [accioRegion, setAccioRegion] = React.useState('cn');
+  const [astudioLoginMethod, setAstudioLoginMethod] = React.useState('local');
   /**
    * ★ 弹窗是否开着（`false` = 关着）。
    *
@@ -2751,6 +2752,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 两者都必须由 `provider` 驱动，任一处漏改都会得到「弹窗内容与判据不匹配」。
    */
   const accioDialog = provider === 'accio';
+  const astudioDialog = provider === 'astudio';
   // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
   // 有成长中心的 provider 才传 runTasks（见 GROWTH_TASK_PROVIDERS 的注释：
@@ -3323,7 +3325,7 @@ function ProviderPanel({ provider, rpcCall }) {
       //   （`buildCreateAccountPayload` 内部分支），
       //   其余 provider 的载荷与接入预选弹窗前**逐字节相同**。
       const res = await rpcCall('account.create',
-        buildCreateAccountPayload(provider, zcodeProvider, accioRegion));      accountId = res.accountId;
+        buildCreateAccountPayload(provider, zcodeProvider, accioRegion, astudioLoginMethod));      accountId = res.accountId;
       loginUrl = res.loginUrl;
       console.log('[jet-hub] account.create ok, provider =', provider, ', accountId =', accountId);
       // ⚠ **`reused` 分支必判**：后端若声明「复用了池里已有条目、新建条目与登录 URL」，
@@ -3926,35 +3928,43 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: (event) => event.stopPropagation(),
             },
               React.createElement('h3', { className: 'dim-jh-zcDialogTitle' },
-                accioDialog ? '添加 Accio 账号' : '添加 ZCode 账号'),
+                astudioDialog ? '添加 AStudio 账号' : accioDialog ? '添加 Accio 账号' : '添加 ZCode 账号'),
               React.createElement('p', { className: 'dim-jh-zcDialogHint' },
-                accioDialog
-                  // ⚠ 必须说清「区域不可事后推断、选错就登不进去」：
-                  //   它不是偏好设置，而是登录页域名本身（见 accioRegion 的注释）。
-                  ? 'Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前'
-                    + '无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。'
-                  : '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，'),
-              accioDialog
+                astudioDialog
+                  ? '支持导入本机桌面端已登录会话，或在浏览器中打开微信扫码进行网页授权登录。'
+                  : accioDialog
+                    ? 'Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前'
+                      + '无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。'
+                    : '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，'),
+              accioDialog || astudioDialog
                 ? null
                 : React.createElement('p', { className: 'dim-jh-zcDialogHint' },
                     '可用 z.ai（国际）登录另一个账号。'),
               React.createElement('label', { className: 'dim-jh-zcProvider' },
-                accioDialog ? '登录区域' : '登录渠道',
-                accioDialog
+                astudioDialog ? '登录方式' : accioDialog ? '登录区域' : '登录渠道',
+                astudioDialog
                   ? React.createElement('select', {
                       className: 'dim-jh-zcSelect',
-                      value: accioRegion,
-                      onChange: (event) => setAccioRegion(event.target.value),
+                      value: astudioLoginMethod,
+                      onChange: (event) => setAstudioLoginMethod(event.target.value),
                     },
-                      React.createElement('option', { value: 'cn' }, '中国版（www.accio-ai.com）'),
-                      React.createElement('option', { value: 'global' }, '国际版（zh.accio.com）'))
-                  : React.createElement('select', {
-                      className: 'dim-jh-zcSelect',
-                      value: zcodeProvider,
-                      onChange: (event) => setZcodeProvider(event.target.value),
-                    },
-                      React.createElement('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
-                      React.createElement('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）'))),
+                      React.createElement('option', { value: 'local' }, '导入本机凭证（读取本地 AStudio 客户端）'),
+                      React.createElement('option', { value: 'web' }, '网页/微信扫码登录（在浏览器中扫码）'))
+                  : accioDialog
+                    ? React.createElement('select', {
+                        className: 'dim-jh-zcSelect',
+                        value: accioRegion,
+                        onChange: (event) => setAccioRegion(event.target.value),
+                      },
+                        React.createElement('option', { value: 'cn' }, '中国版（www.accio-ai.com）'),
+                        React.createElement('option', { value: 'global' }, '国际版（zh.accio.com）'))
+                    : React.createElement('select', {
+                        className: 'dim-jh-zcSelect',
+                        value: zcodeProvider,
+                        onChange: (event) => setZcodeProvider(event.target.value),
+                      },
+                        React.createElement('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
+                        React.createElement('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）'))),
               React.createElement('div', { className: 'dim-jh-zcDialogActions' },
                 React.createElement('button', {
                   className: 'dim-jh-btn',
@@ -3967,7 +3977,7 @@ function ProviderPanel({ provider, rpcCall }) {
                     setPendingLogin(undefined)
                     void createAccount()
                   },
-                }, '确定并打开认证页'))),
+                }, astudioDialog && astudioLoginMethod === 'local' ? '确定并导入' : '确定并打开认证页'))),
         )),
     probeNotice
       ? React.createElement('div', {

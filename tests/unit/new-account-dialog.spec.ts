@@ -91,7 +91,7 @@ const PROVIDER_IDS = readProviderIds()
  * 它同样是「必须同步」的第三处。漏了它，下面那条不变式会**退化成**
  * 只检查旧字段，新 provider 的载荷字段无人守（正是本组要防的形态）。
  */
-const EXCLUSIVE_FIELDS = ['zcodeProvider', 'accioRegion']
+const EXCLUSIVE_FIELDS = ['zcodeProvider', 'accioRegion', 'astudioLoginMethod']
 
 /**
  * 载荷里带了哪些专属字段（0 个 / 1 个 / 多个）。
@@ -152,15 +152,16 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
     }
   })
 
-  it('★ 只有 zcode 与 accio 需要先问一句，其余 provider 点按钮即登录', () => {
+  it('★ 只有 zcode 与 accio 与 astudio 需要先问一句，其余 provider 点按钮即登录', () => {
     expect(newAccountAsksChannel('zcode')).toBe(true)
     // ⚠ accio 的预选项是**登录区域**：区域决定登录页域名，而区域由服务端按账号
     //   下发、登录前无从推断 ⇒ 选错就登不进去（国际用户拿中国版登录页）。
     expect(newAccountAsksChannel('accio')).toBe(true)
+    expect(newAccountAsksChannel('astudio')).toBe(true)
     // ⚠ 这条对**全部** provider 取一遍：A1 的形态是「弹窗对 provider 零分支」，
     //   只抽查两三个 provider 的话，新增一个 provider 漏判就会静默溜过去。
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode' || id === 'accio') continue
+      if (id === 'zcode' || id === 'accio' || id === 'astudio') continue
       expect(newAccountAsksChannel(id), `${id} 不该弹预选窗`).toBe(false)
     }
   })
@@ -180,7 +181,7 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
 
   it('★ 不需要预选的 provider 载荷里**不许**出现任何专属字段（A2：选择被静默丢弃）', () => {
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode' || id === 'accio') continue
+      if (id === 'zcode' || id === 'accio' || id === 'astudio') continue
       const payload = buildCreateAccountPayload(id, 'zai', 'global')
       expect(payload).toEqual({ provider: id })
       expect(exclusiveFieldsOf(payload as Record<string, unknown>)).toEqual([])
@@ -212,7 +213,7 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
     // ⚠️ 三个实参都要传：只传两个会让 accio 的区域**恒为 undefined** ⇒ 宿主
     //    回落到 `cn` ⇒ 国际用户静默登不进去（正是本任务要修的功能缺口）。
     expect(jetHubCode, '调用点必须把 accioRegion 一起传给载荷构造器')
-      .toMatch(/buildCreateAccountPayload\(provider,\s*zcodeProvider,\s*accioRegion\)/)
+      .toMatch(/buildCreateAccountPayload\(provider,\s*zcodeProvider,\s*accioRegion(?:,\s*astudioLoginMethod)?\)/)
   })
 })
 
