@@ -4357,6 +4357,24 @@ describe('渠道校验（11128 conversation id missing）：按账号生效，�
         code: 11128,
         msg: 'conversationIdMissing',
       }],
+      // ⚠️⚠️ **结构化的非 `msg` 字段 / 请求体回声**（2026-10-16 第三轮自查实测
+      // 三处**已实测可达**的误命中）。它们的共同点：报文**是结构化 JSON**（有
+      // `code`），却因为「没有 `msg` 键」而被当成 HTML 兜底腿 ⇒ 误命中烧整池。
+      // ⚠️ 这三格**必须走「无 `msg` 键」形态**：上面那些带 `msg` 键的格子会被
+      // 腿①先接住，**根本打不到腿②**（实测：把腿②的 `+` 改成 `*`，上面两格
+      // 不红 = 零牙；本组补齐后才覆盖到腿②）。
+      ['该句只在 `tips` 字段（结构化 JSON、无 msg 键）', {
+        code: 11128,
+        tips: 'conversation id missing',
+      }],
+      ['`error` 是字符串且含该句（结构化 JSON、无 msg 键）', {
+        code: 11128,
+        error: 'conversation id missing',
+      }],
+      ['echo 了请求体且正文含该句（结构化 JSON、无 msg 键）', {
+        code: 400,
+        request: { content: 'what is conversation id missing?' },
+      }],
     ])('%s ⇒ 只发一次、不换号', async (_label, body) => {
       const sentTokens: string[] = []
       const adapter = makeAdapter({
@@ -4383,6 +4401,91 @@ describe('渠道校验（11128 conversation id missing）：按账号生效，�
     })
   })
 
+  /**
+   * ★★ **状态码闸门**：腿② 只在「该错误实际可能出现的码域」启用
+   *（2026-10-16 第三轮审计 P1，本轮修）。
+   *
+   * ## 真实缺陷（已实测可达）
+   *
+   * 前三轮只治「报文体长什么样」，**没治「哪个状态码才可能出这个错」**。
+   * 于是**网关 5xx 故障页**只要日志文字里恰好含该句（例：
+   * `<html>502 Bad Gateway<br>upstream log: conversation id missing header</html>`
+   * —— 它没有 `msg`/`code` 键，故走腿②），就会：
+   *
+   * | 观测 | 修复前 | 修复后 |
+   * |---|---|---|
+   * | 请求序列 | **烧满整池** | 只发一次 |
+   * | 错误码 | `PERMISSION_DENIED`「未通过渠道校验」 | `SERVER`（5xx 既有分类） |
+   * | 用户被指引 | **「在 Jet Hub 停用或调整该账号的顺序」** | — |
+   *
+   * ⇒ 让用户为一次网关抖动**去停用一批好账号**，且 `PERMISSION_DENIED` 不在
+   * harness 可重试集合里 ⇒ 瞬时故障被报成确定性结论。
+   *
+   * ⚠️ 腿①（`msg`/`message` 值位）**不受**此闸门约束：它要求精确命中值位，是
+   * 强证据，出现在任何状态码上都应认。
+   */
+  describe('状态码闸门：5xx / 429 的故障页不得被劫持成渠道校验', () => {
+    it.each([
+      ['502 HTML（日志含该句、无 msg 键）', '<html><body>502 Bad Gateway<br>upstream log: conversation id missing header</body></html>', 502],
+      ['500 纯文本（含该句）', 'upstream error: conversation id missing header', 500],
+      ['504 HTML（含该句）', '<html>504 Gateway Timeout: conversation id missing</html>', 504],
+    ] as Array<[string, string, number]>)('%s ⇒ 只发一次，且码为 SERVER', async (_label, raw, status) => {
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([
+          { id: 'acct-1', token: 'AT1' },
+          { id: 'acct-2', token: 'AT2' },
+        ]),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          sentTokens.push(auth.replace('Bearer ', ''))
+          return new Response(raw, { status })
+        },
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      // 核心判据①：不得白烧整池（网关抖动与账号无关）。
+      expect(sentTokens).toEqual(['AT1'])
+      // 核心判据②：不得报「渠道校验 / 按账号」而误导用户停用好账号。
+      expect((error as LlmError).code).not.toBe('PERMISSION_DENIED')
+      expect((error as LlmError).message).not.toContain('渠道校验')
+    })
+
+    it('★ 对照：同一句出现在 `msg` 值位（腿①）时，任何状态码都仍须认', async () => {
+      // 腿① 是强证据（上游确实用它报这个错）⇒ 不受状态码闸门约束。
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([
+          { id: 'acct-1', token: 'AT1' },
+          { id: 'acct-2', token: 'AT2' },
+        ]),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          const token = auth.replace('Bearer ', '')
+          sentTokens.push(token)
+          return token === 'AT1'
+            ? new Response(conversationIdMissingBody(), { status: 400 })
+            : sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      const chunks = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never)
+      expect(sentTokens).toEqual(['AT1', 'AT2'])
+      expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    })
+  })
+
   it('★ 键名 `message` 形态：判据命中后，出口也必须提出该 msg（可诊断性不降级）', async () => {
     // ⚠️ 判据认 `m(?:sg|essage)`，出口提取器若只读 `msg`，就会出现
     // 「判据认了、出口提不出」⇒ 用户只看到 `code 11128`，那句唯一的定位文本丢失。
@@ -4406,9 +4509,61 @@ describe('渠道校验（11128 conversation id missing）：按账号生效，�
     expect((error as LlmError).message).toContain('conversation id missing')
   })
 
+  /**
+   * ★★ **腿②（非结构化兜底腿）的两个方向都要锁**（2026-10-16 第三轮自查）。
+   *
+   * ## 为什么必须单独立组
+   *
+   * 腿①（锚定 `msg`/`message` 值位）与结构化守卫会**先**接住绝大多数形态
+   * ⇒ 上面那些带 `msg` 键的用例**根本走不到腿②**。实测代价：把腿②的 `+` 改成
+   * `*`（允许零分隔）后，**全量 221 条仍绿** ⇒ 腿②**零牙**。
+   * 本组喂「**既没有 `msg`/`message` 键、也不是结构化 JSON 对象**」的报文体
+   * ⇒ 只有腿②能接住，两个方向才测得动。
+   */
+  describe('腿②（非结构化兜底腿）：零分隔必须不命中、含该句必须命中', () => {
+    /** 喂一份裸文本报文体，返回请求序列。 */
+    async function sentTokensFor(raw: string): Promise<string[]> {
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([
+          { id: 'acct-1', token: 'AT1' },
+          { id: 'acct-2', token: 'AT2' },
+        ]),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          const token = auth.replace('Bearer ', '')
+          sentTokens.push(token)
+          return token === 'AT1'
+            ? new Response(raw, { status: 400 })
+            : sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch(() => undefined)
+      return sentTokens
+    }
+
+    it.each([
+      // ⚠️ 收紧方向：分隔符必须**存在**（粘连词不得命中）。
+      ['裸文本粘连写法 conversationidmissing', 'conversationidmissing', false],
+      ['裸文本 camelCase conversationIdMissing', 'conversationIdMissing', false],
+      // ⚠️ 放宽方向：真实 HTML / 纯文本网关页必须**仍被接住**（否则整族漏认）。
+      ['HTML 页含该句', '<html><body>gateway: conversation id missing</body></html>', true],
+      ['纯文本含该句', 'error: conversation id missing', true],
+      ['HTML 页含连字符变体', '<html>conversation-id missing</html>', true],
+    ])('%s ⇒ %s', async (_label, raw, shouldRotate) => {
+      const sent = await sentTokensFor(raw)
+      expect(sent).toEqual(shouldRotate ? ['AT1', 'AT2'] : ['AT1'])
+    })
+  })
+
   /** 非 JSON 报文体：判据仍须命中（无结构化字段可锚 ⇒ 走裸子串兜底腿）。 */
-  it('★ 非 JSON（HTML）报文里含该句 ⇒ 仍须换号；且文案须标注「非 JSON 报文」', async () => {
-    const sentTokens: string[] = []
+  it('★ 非 JSON（HTML）报文里含该句 ⇒ 仍须换号；且文案须标注「非 JSON 报文」', async () => {    const sentTokens: string[] = []
     const html = '<html><body>gateway error: conversation id missing</body></html>'
     const adapter = makeAdapter({
       credential: makeCredential({ access_token: 'AT1' }),
@@ -4449,13 +4604,31 @@ describe('渠道校验（11128 conversation id missing）：按账号生效，�
    * 手段」这条纪律的载体），只抹**行动指引**。故判据是「含该句 + 仍能看到标识」。
    */
   describe('兜底腿：抹掉行动指引但保留报错标识', () => {
+    // ⚠️⚠️ **必须喂真实上游原句**（2026-10-16 第三轮审计实测，本轮修）：前一轮这
+    // 5 格全用**合成串**（都含字面「请重新发送」）⇒ 真实报文的两句**全都漏网**：
+    // | 来源 | 真实原句 | 前一轮 | 现版 |
+    // |---|---|---|---|
+    // | `displayMsg.zh` | `请求被拦截，请重新发送` | ✅ | ✅ |
+    // | `displayTips.zh` | `…请用官方版本重新发送。` | ❌（`请` 后紧跟 `用`） | ✅ |
+    // | `displayTips.en` | `…Please resend from the official client.` | ❌（**无 `again`**） | ✅ |
+    // ⇒ **用例喂合成串锁不住真实文案**，这是本仓「判据必须打在行为上」的又一形态。
+    const displayMsgZh = '请求被拦截，请重新发送'
+    const displayTipsZh = '这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。'
+    const displayTipsEn = 'This call failed channel verification, possibly because it was not sent from an official client. Please resend from the official client.'
+
     it.each([
-      ['HTML 报文体', '<html>conversation id missing —— 请求被拦截，请重新发送</html>'],
-      ['纯文本报文体', 'conversation id missing; console: 请重新发送'],
-      ['JSON 数组形态', '[{"code":11128,"conversation id missing":"请重新发送"}]'],
-      ['JSON 字符串形态', '"conversation id missing 请求被拦截，请重新发送"'],
-      ['仅 message 键（非字符串 JSON 体）', '{code:11128,message:conversation id missing,请重新发送}'],
-    ])('%s ⇒ 不得带出「请重新发送」，且仍保留定位信息', async (_label, raw) => {
+      ['HTML + 真实 displayMsg.zh', `<html>conversation id missing ${displayMsgZh}</html>`, '请重新发送'],
+      ['HTML + 真实 displayTips.zh', `<html>conversation id missing ${displayTipsZh}</html>`, '重新发送'],
+      // ⚠️ 真实 displayTips.en 里「official client」出现**两次**：前一处
+      //（`not sent from an official client`）是**描述性**的（说明为什么被拒），
+      // 后一处（`Please resend from the official client`）才是**行动指引**。
+      // ⇒ 断言必须锚**行动指引**那一句，而不是「文件里有没有这个词」。
+      ['HTML + 真实 displayTips.en', `<html>conversation id missing. ${displayTipsEn}</html>`, 'Please resend from the official client'],
+      // 下面两格保留：它们覆盖的是**非 JSON 结构**（数组 / 非字符串 JSON），
+      // 与上面的「真实原句」是**两个正交维度**，都要锁。
+      ['JSON 数组形态（合成串）', '[{"code":11128,"conversation id missing":"请重新发送"}]', '请重新发送'],
+      ['非字符串 JSON 体（合成串）', '{code:11128,message:conversation id missing,请重新发送}', '请重新发送'],
+    ])('%s ⇒ 不得带出上游的行动指引，且仍保留定位信息', async (_label, raw, forbidden) => {
       const adapter = makeAdapter({
         credential: makeCredential({ access_token: 'AT1' }),
         refresh: async () => {},
@@ -4470,11 +4643,51 @@ describe('渠道校验（11128 conversation id missing）：按账号生效，�
 
       const message = (error as LlmError).message
       // ① 不得原样带出上游那句行动指引（实测重发必然继续失败）。
-      expect(message).not.toContain('请重新发送')
+      expect(message).not.toContain(forbidden)
       // ② 仍必须保留**定位信息**：报文原文里那句标识必须还在
       //   （否则「先取失败会话的完整报文」这条既有排障纪律就失效了）。
       expect(message).toContain('conversation id missing')
       expect(message).toContain('非 JSON 报文')
+    })
+
+    it('★ 收紧方向：`请稍后重试` **不得**被抹（那是有效指引，服务端可能真会恢复）', async () => {
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([{ id: 'acct-1', token: 'AT1' }]),
+        fetchImpl: async () => new Response(
+          '<html>conversation id missing 请稍后重试</html>', { status: 400 },
+        ),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+      expect((error as LlmError).message).toContain('请稍后重试')
+    })
+
+    it('★★ JSON 路径必须带出 `requestId`（文档四处把它称为唯一定位手段）', async () => {
+      // ⚠️ 实测缺陷：此前实现只取 `code`/`msg`，**一个字都没取 `requestId`** ——
+      // 而本文件与 `docs/agent-notes/providers-buddy.md` 共**四处**告诉用户
+      // 「先取 `requestId` 去取证」⇒ 那句纪律对用户**不可执行**。
+      const requestId = '72937bd4-3557-429e-9d71-220927f823dd'
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([{ id: 'acct-1', token: 'AT1' }]),
+        fetchImpl: async () => new Response(
+          JSON.stringify({ code: 11128, msg: 'conversation id missing', requestId }),
+          { status: 400 },
+        ),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect((error as LlmError).message).toContain(requestId)
     })
   })
 
