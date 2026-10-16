@@ -128,6 +128,14 @@ import {
   type CreditBalance,
 } from './credits.js'
 import { CODEBUDDY, productById, type BuddyProduct } from './product.js'
+// ⚠️ CodeBuddy 限时补偿积分（2026-10-16）：一次性活动，**不接自动签到**。
+// 端点走 buddy 的 `webBase`（`src/product.ts` 里是 `www.workbuddy.cn`；三个 host
+// 实测均可达，见该模块头）。
+import {
+  claimCompensation,
+  describeCompensationFailure,
+  fetchCompensationStatus,
+} from './buddy-compensation.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
 /**
  * ⚠️ **`collectBuddyGrowth` 已搬到 `src/buddy-growth.ts`**（2026-10-08 Task 4），
@@ -223,6 +231,10 @@ import type {
   RpcCreditsBalancesRequest,
   RpcCreditsBalanceExtra,
   RpcCreditsBalancesResponse,
+  RpcBuddyClaimCompensationRequest,
+  RpcBuddyClaimCompensationResponse,
+  RpcBuddyCompensationStatusRequest,
+  RpcBuddyCompensationStatusResponse,
   RpcClineQuotaRequest,
   RpcClineQuotaResponse,
   RpcClineRequestLogRequest,
@@ -4835,6 +4847,104 @@ function registerJetHubEndpoints(
             })),
           } satisfies RpcClineRequestLogResponse,
         }
+      }
+
+      // ── CodeBuddy 限时补偿积分（2026-10-16 新增）──
+      //
+      // ⚠️ **不是签到**：这是一次性的限时活动（`end_time` 到期即作废）。
+      //    本仓库对「一次性 / 有代价动作」的既有铁律是**默认不自动执行**
+      //    （见 `buddy-growth.ts` 的 `runExotic`）。故这里只开两条**用户显式
+      //    触发**的 RPC：
+      //      ① `buddy.compensationStatus` —— 只读，面板挂载/刷新时调用；
+      //      ② `buddy.claimCompensation` —— 写操作，**只由面板按钮触发**。
+      //    **刻意不接进 `credits.claimAll` / auto-checkin**：那会把一次性动作
+      //    变成每日自动执行，违反上面的约定（且收益只有一次）。
+      //
+      // ⚠️ 端点走 `webBase`（buddy = `www.workbuddy.cn`），不是推理站
+      //    `copilot.tencent.com`（= `endpoint`）。三个 host 实测**均可达**，
+      //    故这是**取舍**不是「只有一个能通」。见 `src/buddy-compensation.ts` 模块头。
+      case 'buddy.compensationStatus': {
+        const req = payload as RpcBuddyCompensationStatusRequest
+        if (req.provider !== CODEBUDDY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
+        }
+        const accounts = await pool.listAccounts(CODEBUDDY.id)
+        const account = accounts.find((entry) => entry.id === req.accountId)
+        if (account === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `账号不存在：${req.accountId}` } }
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (resolved === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: '凭据不可用，请先重新登录该账号' } }
+        }
+        let credential: BuddyCredential
+        try {
+          credential = JSON.parse(resolved.value) as BuddyCredential
+        } catch {
+          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
+        }
+        const result = await fetchCompensationStatus(credential, CODEBUDDY)
+        if (!result.ok) {
+          // ⚠️ 失败**不包成 ok:true**（Issue IKJOZA 的铁律），且原文随行给出。
+          return { ok: false, error: { code: 'bad-request', message: describeCompensationFailure(result.failure) } }
+        }
+        return {
+          ok: true,
+          value: {
+            claimed: result.status.claimed,
+            active: result.status.active,
+            creditNum: result.status.creditNum,
+            ...result.status.validityPeriod === undefined ? {} : { validityPeriod: result.status.validityPeriod },
+            ...result.status.endTime === undefined ? {} : { endTime: result.status.endTime },
+          } satisfies RpcBuddyCompensationStatusResponse,
+        }
+      }
+      case 'buddy.claimCompensation': {
+        const req = payload as RpcBuddyClaimCompensationRequest
+        if (req.provider !== CODEBUDDY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
+        }
+        const accounts = await pool.listAccounts(CODEBUDDY.id)
+        const account = accounts.find((entry) => entry.id === req.accountId)
+        if (account === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `账号不存在：${req.accountId}` } }
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (resolved === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: '凭据不可用，请先重新登录该账号' } }
+        }
+        let claimCredential: BuddyCredential
+        try {
+          claimCredential = JSON.parse(resolved.value) as BuddyCredential
+        } catch {
+          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
+        }
+        const claimResult = await claimCompensation(claimCredential, CODEBUDDY)
+        if (!claimResult.ok) {
+          return { ok: false, error: { code: 'bad-request', message: describeCompensationFailure(claimResult.failure) } }
+        }
+        // ⚠️⚠️ **领取成功后必须让折算缓存失效**（2026-10-16 审计 P2-3）。
+        //
+        // 补偿领取改变的是**账号积分余额**，而聚合折算与 buddy 系共用
+        // `src/aggregate-expiry.ts` 的折算缓存（TTL 60 秒、`UNUSABLE` 会被
+        // 缓存更久）。不清的话用户点完「立即领取」会看到「领了但积分没涨」。
+        //
+        // ⚠️ 与 `credits.claimAll` 之后那次 `clearExpiryCache()`（见本函数的
+        //    `fetch` 处理器，`jet-hub-rpc.ts:2634`）是**同一条铁律的两个入口**：
+        //    任何让积分增加的写操作都必须让下游折算失效。
+        //
+        // ⚠️ **刻意不复用 `balanceCache.clear()`**：那是**整渠道**清空，会连带
+        //    作废该渠道其它账号正在被徽标/面板用的读数（`balance-cache.ts:274`
+        //    明确警告「别当成按渠道刷新的顺手动作」）。折算缓存才是这里真正
+        //    会骗人的那一层，按既有入口清它足够。
+        modelAdapters?.['aggregate']?.clearExpiryCache?.()
+        return { ok: true, value: {} satisfies RpcBuddyClaimCompensationResponse }
       }
 
       // ── 模型列表可见性（黑名单开关）──
