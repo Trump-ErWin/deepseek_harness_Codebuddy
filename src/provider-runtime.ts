@@ -49,6 +49,9 @@
  */
 
 import type { ProviderDescriptor } from './provider-registry.js'
+// ⚠️ 只导入**类型**：本模块是运行时注册表的宿主，不该把缓存的实现拉进来
+//（实现由 `src/index.ts` 建好后注册，见 `registerBalanceCache`）。
+import type { BalanceCache } from './balance-cache.js'
 import type { AccountPool } from './account-pool.js'
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { CheckinStatus, ClaimOutcome, CreditBalance } from './credits.js'
@@ -169,6 +172,30 @@ export interface ProviderExpiryContext {
    * ⚠️ 缺席时实现方照常返回折算值，只是清不掉旧标记。
    */
   readonly clearModelsExhausted?: (accountId: string, modelIds: readonly string[]) => Promise<void>
+  /**
+   * **共享余额读数**入口（2026-10-15，`src/balance-cache.ts` 的消费者之一）。
+   *
+   * ## ⚠️ 为什么需要它（规格 §5.7 的分层）
+   *
+   * 「账号积分缓存是更底层基础设施，取号逻辑只是在调用缓存时的取舍」——
+   * ⇒ buddy 系四家的折算原语原先**自己发一次余额请求**（`fetchCreditBalance`），
+   * 而积分面板 / 用量徽标也各发一次 ⇒ 同一个账号在一分钟内被查 2~3 次。
+   * 本字段让折算**吃同一份读数**（`balance-cache` 按 `(provider, accountId)` 去重）。
+   *
+   * ## 契约
+   *
+   * - 返回 `undefined` ⇒ **本次没有共享读数可用**（未注入 / 未命中且取数失败）。
+   *   实现方必须**回落到自己发请求**（`fallback`）：折算的可用性**不得**依赖本字段
+   *   —— 否则「未接线」会变成「该渠道折算恒 UNUSABLE」（静默少一个候选，正是本仓库
+   *   复发过三次的形态）。
+   * - 抛错 ⇒ 由实现方按自己的既有口径处理（buddy 系是「折算成 `UNUSABLE`」）。
+   *   ⚠️ **但中止必须逃逸**：本入口可能网络取数。
+   *
+   * ⚠️ 只有**形态匹配**的渠道该用（buddy 系四家的 `CreditBalance`）；其余渠道
+   * （officeace 的套餐摘要、zcode 的分桶、loomy 的命名池）**形态不同**，接入前
+   * 要先把原语拆成「取数」与「折算」两段（规格 §5.7.3 的「登记待接」）。
+   */
+  readonly cachedBalance?: (accountId: string | undefined) => Promise<unknown>
 }
 
 /**
@@ -719,6 +746,38 @@ export function runtimeOf(provider: string): ProviderRuntime | undefined {
 }
 
 /**
+ * **共享余额读数缓存**的进程级注册位（2026-10-15，规格 §5.7）。
+ *
+ * ## ⚠️ 为什么走全局注册表而不是给 `registerJetHubRpc` 加形参
+ *
+ * 那个函数的签名有**成文不变式**：只剩 **4 个形参**（`ctx, pool, auths, modelAdapters`），
+ * 且 `tests/unit/zcode-wiring.spec.ts` 有一组「不占形参位的是谁」的守卫。
+ * 加第 5 个可选形参正是那条注释记录的**复发 6 次**的错位形态（在它之前插入任何
+ * 可选形参都会让调用点静默错位）。
+ *
+ * ⇒ 与本文件既有的 `runtimeOf` / 全局注册表同一取向：「拿不到形参的跨模块消费点」
+ * 走注册表（`ProviderRuntime.credits` 的先例就在本文件）。
+ *
+ * ## 生命周期
+ *
+ * ⚠️ 由 `src/index.ts` 的 `apply()` 在建缓存后**立即**注册；`dispose` 时清空
+ *（与 `clearProviderRuntimes` 同处调用，避免用例之间串味）。
+ * ⚠️ 未注册 ⇒ 消费方（`credits.balances`）**走自己的原路径**，行为与升级前一致 ——
+ * 那是刻意保留的降级路径（本仓库对「可选接线缺失」的一贯取向：不得静默改变行为）。
+ */
+let sharedBalanceCache: BalanceCache | undefined
+
+/** 注册共享余额缓存（`src/index.ts` 的 `apply()` 调用）。 */
+export function registerBalanceCache(cache: BalanceCache): void {
+  sharedBalanceCache = cache
+}
+
+/** 取共享余额缓存；未注册返回 `undefined`（调用方回退到自己的原路径）。 */
+export function balanceCacheOf(): BalanceCache | undefined {
+  return sharedBalanceCache
+}
+
+/**
  * 按 provider id 从一张 `expiry` 表里取实现。
  *
  * ⚠️ 用 `Object.hasOwn` 而非 `in` 或下标：`in`/下标会命中**原型链**上的键
@@ -741,6 +800,9 @@ export function expiryOf(
  */
 export function clearProviderRuntimes(): void {
   runtimes.clear()
+  // ⚠️ 共享缓存注册位也要清：它挂在同一张进程级表上，留着会让**下一个用例**
+  //    读到上一个用例的缓存实例（串味，且症状是「余额读数莫名命中」）。
+  sharedBalanceCache = undefined
 }
 
 /**

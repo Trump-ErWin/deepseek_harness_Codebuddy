@@ -222,4 +222,28 @@ describe('★ P3：重定向取数必须能**反复**刷新（真实缺陷回归
         .not.toMatch(/clearInterval/)
     }
   })
+
+  it('★★ 必须把**当前模型 id** 传给端点（否则徽标显示别的模型走过的渠道）', () => {
+    // ⚠️⚠️ **真实缺陷**（用户报障 2026-10-16）：「我们用 glm5.3 后徽标显示的 provider
+    //    是腾讯 codebuddy，不是排序的第一个 OfficeAce」。
+    //
+    // 根因：本处原先调 `readActiveProvider()` **不传参数**，而宿主
+    // `aggregate.activeProvider` 在**无参**时回 `lastActiveProvider` ——
+    // 「**任意虚拟模型**最近一次成功」的渠道，**不是你当前选中的那个模型**。
+    // ⇒ 用 GLM-5.3（手工序第一位 officeace）时，徽标显示的是**别的模型**
+    //（如 DeepSeek V4.1 Flash）上次走成功的 buddy（腾讯）。
+    //
+    // ⚠️ 宿主**本来就**按模型分开记录（`activeProviderByModel`），端点的
+    //   `canonicalId` 参数也一直存在 —— 只是客户端从来没传。
+    expect(redirectBlock, '★ 取数必须传模型 id').toMatch(/readActiveProvider\(modelId\)/)
+    expect(redirectBlock, '★ 不得退回无参调用（那正是本缺陷）')
+      .not.toMatch(/readActiveProvider\(\)/)
+    // ★ 且模型 id 必须真的来自目录快照的 `current.model`（不是另造一份来源）。
+    expect(badge, 'modelId 必须取自 current.model')
+      .toMatch(/const modelId = state\?\.current\?\.model/)
+    // ★ effect 依赖必须含 `modelId`：用户切模型时要立刻按新模型重查，
+    //   否则会一直显示旧模型的渠道（与「定时器常驻」那条需求同因）。
+    expect(redirectBlock, '★ 依赖数组必须含 modelId')
+      .toMatch(/\}, \[isAggregate, readActiveProvider, modelId\]\)/)
+  })
 })
