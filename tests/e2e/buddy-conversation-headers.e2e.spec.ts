@@ -35,6 +35,19 @@
  * - `WB_REF` —— 凭据 ref（默认读账号池里第一个 workbuddy 账号）
  * - `WB_MODEL` —— 模型（默认 `fast-model`；⚠️ 别用 `deep-model` —— 实测 11102
  *   `service info not found`，会掩盖判据）
+ *
+ * ## ⚠️ 换账号会把结果翻过来 —— 别只看一次
+ *
+ * 实测（2026-10-16）**同一时刻、同一份请求体**：
+ *
+ * | `WB_REF` | 删任一枚 Conv 头 / 三枚全删 |
+ * |---|---|
+ * | `…D87606B1` | ✅ **200** |
+ * | `…66E05E7C` | ❌ **400 / 11128 `conversation id missing`** |
+ *
+ * ⇒ 本用例的判据**按账号而异**，而默认只跑 `firstWorkbuddyRef()`（池里第一个）——
+ * 结果取决于本机池顺序。**判红灯前请先用另一个 `WB_REF` 复跑一次**；
+ * 只有「换账号后仍同样失败」才说明上游整体收紧。详见 issue IKM7SG。
  */
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -156,12 +169,24 @@ suite('IKM73W：X-Conversation-* 三头的真机对照（消耗真实额度，�
     // 这条断言就是 2026-10-16 证伪结论的可复核凭据。
     // ⚠️ 若上游将来**真的**收紧了校验（如灰度要求三头），本用例会红 ——
     // 那正是它存在的意义：把「三头是不是必需」从一次性观测变成**持续可回归**的判据。
+    //
+    // ⚠️⚠️ **红灯不必然等于「上游变了」** —— 先排除「账号差异」这一解释。
+    //    实测（2026-10-16）：同一时刻、同一份请求体，
+    //      `WB_REF=WORKBUDDY_ACCOUNT_D87606B1` ⇒ 删任一枚 / 三枚全删 **全部 200**；
+    //      `WB_REF=WORKBUDDY_ACCOUNT_66E05E7C` ⇒ 删任一枚 / 三枚全删 **全部 400/11128**。
+    //    即该判据**按账号而异**，而本用例默认只跑 `firstWorkbuddyRef()`（池里第一个）⇒
+    //    结果取决于本机池顺序。**先换 `WB_REF` 对照，再判断是否真是上游整体收紧**；
+    //    否则会去改注释与文档，而真正该做的是看一眼账号。
+    const RED_HINT = `先别改文档：请用另一个账号复核 —— 重跑时加 WB_REF=<另一个 workbuddy 账号 ref>。`
+      + `实测该判据按账号而异（同一刻一个账号缺任一枚即 400、另一个账号三枚全删仍 200），`
+      + `故红灯可能只是「本机池首账号恰好是被校验的那个」。`
+      + `若换账号后**仍**出现同样的 400，才说明上游整体收紧，届时再更新注释与 docs/agent-notes/providers-buddy.md。`
     for (const [i, name] of CONV.entries()) {
       const r = await viaAdapter(credential, ref, [name])
-      expect(r.status, `删掉 ${name} 后上游开始拒绝 ⇒ 「三头非准入必需」这条结论已失效，请更新注释与 docs/agent-notes/providers-buddy.md`).toBe(200)
+      expect(r.status, `账号 ${ref}：删掉 ${name} 后上游开始拒绝。${RED_HINT}`).toBe(200)
       void i
     }
-    expect(allThree.status, '三枚全删后上游开始拒绝 ⇒ 同上，请更新注释与文档').toBe(200)
+    expect(allThree.status, `账号 ${ref}：三枚全删后上游开始拒绝。${RED_HINT}`).toBe(200)
   }, 600_000)
 
   it('回显：X-Conversation-ID 的值会出现在回包 id 里', async () => {
