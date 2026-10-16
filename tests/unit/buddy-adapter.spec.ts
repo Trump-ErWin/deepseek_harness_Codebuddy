@@ -1554,6 +1554,92 @@ describe('BuddyAdapter credential handling', () => {
   })
 
   /**
+   * ⚠️⚠️ `X-Conversation-*` 三头**必须同时发出**（2026-10-16 真实报障）。
+   *
+   * ## 症状
+   * workbuddy 渠道**整条不可用**：任何模型 / 账号 / 会话都报
+   * `workbuddy: 请求被拦截，请重新发送 conversation id missing`（INVALID_REQUEST）。
+   * 新开会话同样复现、换回旧版插件同样复现 —— 与版本无关，是请求头缺失。
+   *
+   * 上游原始报文（HTTP 400）：
+   * `{"code":11128,"msg":"conversation id missing", ...}`，其 `displayTips` 写着
+   * 「这次调用没通过渠道校验，可能不是官方客户端发出的」。
+   *
+   * ## 本用例能锁什么、不能锁什么
+   * ⚠️ **锁不住**「上游要求三头齐全」这条**外部事实** —— 那是实测结论，写在
+   * `src/buddy-adapter.ts` 的注释里。本用例锁的是**我们发出的报文**：三头都在、
+   * 都非空。变异验证的判据即「删掉任一条 `headers.set` ⇒ 本用例变红」。
+   *
+   * ⚠️ 逐头 `it.each` 而不是只断言「某串里含某名」：后者删掉另两个头仍可能绿。
+   */
+  it.each([
+    'X-Conversation-ID',
+    'X-Conversation-Request-ID',
+    'X-Conversation-Message-ID',
+  ])('stream 必发 %s（缺任一即上游 400/11128）', async (headerName) => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    const value = seen!.get(headerName)
+    // 必须存在且非空：空串同样过不了渠道校验（与本文件 `X-Domain` 那条空串缺陷同型）。
+    expect(value, `${headerName} 未发出或为空`).toBeTruthy()
+    expect(value!.length).toBeGreaterThan(0)
+  })
+
+  /**
+   * workbuddy 路径同样发齐三头 —— 且**不需要**按产品分支。
+   *
+   * 实测：buddy 带上这三头仍 200（无害），故实现里刻意**无条件**发送。
+   * 本用例确认 workbuddy 这条产品路径上三头齐备；与上一条合起来锁住
+   * 「两条产品路径都不缺头」。
+   */
+  it('workbuddy 路径同样发齐 X-Conversation-* 三头', async () => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      product: WORKBUDDY,
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    expect(seen!.get('X-Conversation-ID')).toBeTruthy()
+    expect(seen!.get('X-Conversation-Request-ID')).toBeTruthy()
+    expect(seen!.get('X-Conversation-Message-ID')).toBeTruthy()
+  })
+
+  /**
+   * 三头**同值**，且**不得**复用 `prompt_cache_key` 的 `sessionId`。
+   *
+   * 理由（防「顺手复用」型改动）：`sessionId` 是前缀缓存的分桶键，与会话身份是
+   * 两件事。实测上游不校验 conversation id 的值，但把两个语义不同的值绑死会让
+   * 将来单独调整任一侧变得危险；本仓库登记过多次「两处语义不同的东西共用一个值」
+   * 导致的漂移缺陷。
+   */
+  it('X-Conversation-* 三头同值，且不复用 prompt_cache_key 的 sessionId', async () => {
+    let seen: Headers | undefined
+    let body: Record<string, unknown> | undefined
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    const id = seen!.get('X-Conversation-ID')
+    expect(seen!.get('X-Conversation-Request-ID')).toBe(id)
+    expect(seen!.get('X-Conversation-Message-ID')).toBe(id)
+    // 语义分离：不得等于 prompt_cache_key。
+    expect(body!.prompt_cache_key).not.toBe(id)
+  })
+
+  /**
    * 回归：凭据 domain 为**空串**时 X-Domain 必须回退到产品域名。
    *
    * `parseTokenData` → `readStringField` 在字段缺失时返回空串，故这是真实可达
