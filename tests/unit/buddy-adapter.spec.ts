@@ -1305,6 +1305,53 @@ describe('BuddyAdapter credential handling', () => {
     expect(calls).toBeGreaterThanOrEqual(2)
   })
 
+  it('安全策略拦截（11140）回 HTTP 400 时同样换号（2026-10-16 后端行为变更）', async () => {
+    // 之前 11140 回 403，在 401/403 分支处理。2026-10-16 实测后端改成回 400，
+    // 400 不进入 401/403 分支 → 修复前直接抛 INVALID_REQUEST 不换号。
+    const body = JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      displayMsg: { zh: '请求被拦截，请重新发送' },
+    })
+    let calls = 0
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async () => { calls++; return new Response(body, { status: 400 }) },
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
+    expect((error as LlmError).message).toContain('安全策略')
+    expect((error as LlmError).message).toContain('HTTP 400')
+    // 必须换号：两个账号各试一次。
+    expect(calls).toBeGreaterThanOrEqual(2)
+  })
+
+  it('11140 回 400 时换到可用账号即成功', async () => {
+    const safety = JSON.stringify({ code: 11140, msg: 'request illegal' })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) =>
+        (init.headers.get('Authorization') ?? '').includes('AT1')
+          ? new Response(safety, { status: 400 })
+          : new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+              status: 200,
+              headers: { 'content-type': 'text/event-stream' },
+            }),
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    expect(chunks.length).toBeGreaterThan(0)
+  })
+
   it('安全策略拦截在换号途中被剔除：换到可用账号即成功', async () => {
     // 本用例对应真实故障场景：池首账号被安全策略拦下，池尾账号可用。
     // 修复前「不换号」会让这次请求必然失败（正是用户连续多轮失败的原因）。
