@@ -694,6 +694,14 @@ export interface CreditsEndpointDeps<
     options: { force?: boolean },
   ) => Promise<{ balance: CreditBalance; stale: boolean; at: number; error?: string } | undefined>
   /**
+   * 载荷里的 `force`（面板「刷新积分」按钮）。
+   *
+   * ⚠️ **必须透传给 {@link CreditsEndpointDeps.readCachedBalance}**（审计 P1-1）：
+   *   不传 ⇒ 「刷新」退化成「再读一次缓存」，且在兼顶场景下**看起来成功**
+   *   （返回旧值 + 一句「本次查询失败」），比报错更误导。
+   */
+  force?: boolean
+  /**
    * 领取前是否先查一次签到状态（默认 `true`）。
    *
    * CodeBuddy 系拆成「查状态 + 领取」两个独立端点，先查可以省掉一次无效的
@@ -933,7 +941,12 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
      *    拿不到新数据就读旧数据，而不是直接返回错误。
      */
     if (deps.readCachedBalance !== undefined && entry.id !== undefined) {
-      const cached = await deps.readCachedBalance(entry.id, {})
+      // ⚠️⚠️ **`force` 必须透传下去**（2026-10-16 审计 P1-1 实测确认的回归）：
+      //   这里原写死 `{}` ⇒ `readOptions.force` 恒 `undefined` ⇒ 端点虽然读了
+      //   `payload.force`，但**这一腿永远传不到** ⇒ 面板「刷新积分」按钮在
+      //   120 秒 TTL 内点了等于没点，而按钮 title 写着「点此可刷新」—— 假的。
+      //   ⇒ 载荷的 `force` 经 `collectCreditBalances` 的 deps 一路透到这里。
+      const cached = await deps.readCachedBalance(entry.id, { force: deps.force === true })
       if (cached !== undefined) {
         balance = cached.balance
         if (cached.stale) {
@@ -4665,6 +4678,14 @@ function registerJetHubEndpoints(
                 writeBalance: (accountId, balance) =>
                   balanceCacheOf()!.write(req.provider, accountId, { at: Date.now(), value: balance }),
                 /**
+                 * ★ 载荷的 `force`（面板「刷新积分」按钮，2026-10-16 审计 P1-1）。
+                 *
+                 * ⚠️ 类型已补进 `RpcCreditsBalancesRequest`（`src/types.ts`），
+                 *   故这里**按类型读**而不是 `(payload as {force?: unknown})` 强转 ——
+                 *   强转会让「客户端根本没传」这件事在编译期完全看不出来。
+                 */
+                force: req.force === true,
+                /**
                  * ★ **先吃共享读数**（2026-10-16，issue IKMCOO 缺陷 1 + 用户
                  * 「打开面板要很久，加载拿不到新数据应该读旧数据」）。
                  *
@@ -4676,8 +4697,14 @@ function registerJetHubEndpoints(
                  *    这里按既有可选字段的同款读法解析，不改响应形状。
                  */
                 readCachedBalance: async (accountId, readOptions) => {
+                  // ⚠️ 判据**只用** `readOptions.force`（2026-10-16 审计 P1-1）：
+                  //   原先这里 `|| payload.force === true` 兜底，看起来两条腿都通，
+                  //   但上一行 `collectCreditBalances` 传的是**硬编码 `{}`**
+                  //   ⇒ `readOptions.force` 恒 undefined ⇒ 那一腿恒假。
+                  //   现在 `collectCreditBalances` 会透传 `deps.force`（见其定义），
+                  //   而 `deps.force` 由下方 `force:` 注入 ⇒ 只有**一条**来源，
+                  //   避免「两处判 force」再次漂移。
                   const forced = readOptions.force === true
-                    || (payload as { force?: unknown } | undefined)?.force === true
                   const reading = await balanceCacheOf()!.readStale(
                     req.provider,
                     accountId,
