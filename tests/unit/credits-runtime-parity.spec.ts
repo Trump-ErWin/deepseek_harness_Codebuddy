@@ -494,6 +494,7 @@ const BALANCE_PATH_OF: Readonly<Record<string, string>> = {
   // ⚠️ accio 的**必需**端点是 currentSubscription（三类积分桶）；
   //    quota 与 userinfo 都是可容忍的补充（失败不影响余额）。
   accio: ACCIO_SUBSCRIPTION_PATH,
+  autoclaw: '/agent-assetmgr/api/v2/wallets',
 }
 
 /**

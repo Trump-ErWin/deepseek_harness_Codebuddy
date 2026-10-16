@@ -102,6 +102,10 @@ import { RaccoonAdapter } from './raccoon-adapter.js'
 //    它的信封是 Gemini 风格（snake_case）、token 在 **body**（放 Authorization
 //    头恒流内 402）、且**不需要** SecurityGuard 签名（实测不带 `pctb-x-*` 同样 200）。
 //    详见 `docs/agent-notes/providers-accio.md`。
+import { AutoclawAuth } from './autoclaw-auth.js'
+import { registerAutoclawLlm } from './autoclaw-adapter.js'
+import { AUTOCLAW } from './autoclaw-product.js'
+import type { AutoclawCredential } from './autoclaw.js'
 import { AccioAuth } from './accio-auth.js'
 import { registerAccioLlm } from './accio-adapter.js'
 import { ACCIO } from './accio-product.js'
@@ -2071,6 +2075,28 @@ export function apply(ctx: Context): void {
   //
   // 服务名由 AccioAuth 依 product.id 派生，注册为 ctx.accioAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 Accio 面板。
+  // ===== AutoClaw（智谱清言）=====
+  const autoclaw = new AutoclawAuth(ctx)
+  const autoclawAdapter = registerAutoclawLlm(ctx, {
+    resolveCredential: createCredentialResolver<AutoclawCredential>(
+      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(AUTOCLAW.id, id) } },
+      {
+        product: AUTOCLAW,
+        readCredential: async (refName) => {
+          const resolved = await ctx.credentials.resolve(credentialRef(refName))
+          if (!resolved) return undefined
+          try {
+            return JSON.parse(resolved.value) as unknown as AutoclawCredential
+          } catch {
+            return undefined
+          }
+        },
+        fallback: { kind: 'ref', refName: AUTOCLAW.defaultCredentialRef },
+      },
+    ),
+    product: AUTOCLAW,
+  })
+
   const accio = new AccioAuth(ctx)
   const accioAdapter = registerAccioLlm(ctx, {
     // ⚠️ **不传 `credentialRef`**：`AccioAdapterOptions` 里没有这一项 —— 该适配器
@@ -3140,6 +3166,7 @@ async function fetchBalanceReading(
     raccoon: pruned(RACCOON.id, raccoonAdapter),
     minimax: pruned(MINIMAX.id, minimaxAdapter),
     minimaxintl: pruned(MINIMAX_INTL.id, minimaxIntlAdapter),
+    autoclaw: pruned(AUTOCLAW.id, autoclawAdapter),
     accio: pruned(ACCIO.id, accioAdapter),
     gemini: pruned(GEMINI.id, geminiAdapter),
     zcode: pruned(ZCODE.id, zcodeAdapter),
@@ -3390,6 +3417,7 @@ async function fetchBalanceReading(
       // `auths.officeace` 是**同一个对象**，否则守卫用例布在 ctx 上的 spy
       // 收不到本循环的调用（实测症状：`续期没有分派到它自己的实例（实际：无）`）。
       ['officeace', officeaceAuthService as unknown as JetHubAuthLike],
+      ['autoclaw', autoclaw],
       ['accio', accio],
     ]
     for (const [id, auth] of registry) {
@@ -3496,6 +3524,7 @@ async function fetchBalanceReading(
     // OfficeAce（华为 ModelArts MaaS 云端直连）：值是 **auth 服务形状的包装对象**
     //（纯函数集合 + 统一 auth 契约），不是 Service 实例。
     officeace: officeaceAuthService as never,
+    autoclaw,
     accio,
   }, modelAdapters)
 

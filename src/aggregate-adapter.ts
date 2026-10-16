@@ -964,6 +964,7 @@ export class AggregateAdapter extends LlmAdapter {
     //    但候选层被那道闸门剔掉 ⇒ **用户要的「轮换列表里要有 accio」并没有实现**，
     //    且症状静默（无报错、无日志）。现两处都补齐。
     'accio',
+    'autoclaw',
   ])
 
   /**
