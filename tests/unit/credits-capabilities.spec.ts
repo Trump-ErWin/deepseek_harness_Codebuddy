@@ -369,7 +369,12 @@ describe('客户端积分请求门控（源码级回归）', () => {
   it('loadCredits 在发起 credits.balances 之前先判能力', () => {
     const start = source.indexOf('const loadCredits = React.useCallback')
     expect(start).toBeGreaterThan(-1)
-    const body = source.slice(start, start + 1200)
+    // ⚠️⚠️ **窗口跟随函数体，不写死字符数**（2026-10-16 审计暴露）：
+    //   原为 `slice(start, start + 1200)`；`loadCredits` 补了 `force` 的说明后
+    //   `rpcCall('credits.balances'` 被挤出窗口 ⇒ `callIndex` 变 -1 ⇒ **假红**。
+    //   固定长度窗口 = 注释一变就假失败，正是本仓库记录的「源码文本断言」弱点。
+    const next = source.indexOf('\n  const ', start + 10)
+    const body = source.slice(start, next === -1 ? start + 20000 : next)
     const guardIndex = body.indexOf('if (!canLoadCredits) return;')
     const callIndex = body.indexOf("rpcCall('credits.balances'")
     expect(guardIndex, 'loadCredits 缺少能力守卫').toBeGreaterThan(-1)
@@ -503,6 +508,37 @@ describe('客户端积分请求门控（源码级回归）', () => {
     expect(source).toMatch(/await reloadAccountsQuietly\(\)/)
   })
 
+  it('★★ 「刷新积分」按钮必须传 force（2026-10-16 审计 P1-1）', () => {
+    // ⚠️⚠️ 这条是**客户端侧**的端到端接线守卫。宿主侧后端已修（P1-1 的
+    //   行为级用例在 `balance-cache-wiring.spec.ts`），但若客户端仍恒不传
+    //   `force`，按钮照样失效 —— 而两处都绿（各自只测自己那半）。
+    //   ⚠️ **三个调用点语义不同**，不能一刀切：
+    //   - 「刷新积分」按钮、签到后补读、新手任务补读 ⇒ **必须 force**；
+    //   - 面板挂载时那一次 ⇒ **必须不 force**（否则每次打开都强刷，缓存白做）。
+    const start = source.indexOf('const loadCredits = React.useCallback')
+    const next = source.indexOf('\n  const ', start + 10)
+    const body = source.slice(start, next === -1 ? start + 20000 : next)
+
+    // ① loadCredits 必须按参数决定传不传，而不是恒传或恒不传
+    expect(
+      body,
+      '★★ loadCredits 必须把 force 透传给 credits.balances（否则「刷新」是假的）',
+    ).toMatch(/rpcCall\('credits\.balances',\s*force\s*\?[^)]*:\s*\{[^}]*\}\)/)
+
+    // ② 「刷新积分」按钮
+    const button = /onClick: \(\) => void loadCredits\(([^)]*)\)/.exec(source)
+    expect(button, '★ 找不到「刷新积分」按钮的 onClick').not.toBeNull()
+    expect(button![1], '★★ 「刷新积分」必须传 force=true').toContain('true')
+
+    // ③ 签到 / 新手任务领取后补读（余额刚变，必须绕过缓存）
+    expect(source, '★★ 领取积分后补读必须 force').toContain('await loadCredits(true);')
+
+    // ④ 挂载那一次**不得** force（否则每次打开面板都强刷，缓存形同虚设）
+    const effect = /if \(canLoadCredits\) void loadCredits\(([^)]*)\);/.exec(source)
+    expect(effect, '★ 找不到挂载时的 loadCredits 调用').not.toBeNull()
+    expect(effect![1], '★ 挂载时不得 force（要吃缓存）').toBe('')
+  })
+
   it('loadCredits 的 useCallback deps 含补读函数（避免陈旧闭包）', () => {
     // 补读是**本函数新增的调用**：deps 不带它会让 React 持有旧闭包
     //（陈旧 provider / rpcCall），补读打到错误的面板上。
@@ -510,8 +546,14 @@ describe('客户端积分请求门控（源码级回归）', () => {
     // ⚠️ **不写死整串 deps**（本仓 AGENTS.md 明令「接线断言一律容忍重构与
     // 签名扩展」；初版写死了 `[provider, rpcCall, canLoadCredits, loadAccounts]`
     // 整串，加一个依赖就假失败）。这里只断言「补读函数出现在 deps 数组里」。
+    // ⚠️⚠️ **窗口必须跟随函数体，不能写死字符数**（2026-10-16 审计暴露）：
+    //   原为 `source.slice(start, start + 3200)`。`loadCredits` 的注释一加长
+    //   （本次给它补了 `force` 的说明，约 +300 字符），deps 数组就被挤出窗口
+    //   ⇒ `depsMatch` 变 `null` ⇒ 本条**假红**。
+    //   ⇒ 改为「切到下一个 `\n  const ` 顶层声明为止」，与注释长度无关。
     const start = source.indexOf('const loadCredits = React.useCallback')
-    const body = source.slice(start, start + 3200)
+    const next = source.indexOf('\n  const ', start + 10)
+    const body = source.slice(start, next === -1 ? start + 20000 : next)
     const depsMatch = /\}, \[([^\]]*)\]\)/.exec(body)
     expect(depsMatch, '未解析到 loadCredits 的 deps 数组').not.toBeNull()
     expect(depsMatch![1], 'deps 必须含 reloadAccountsQuietly').toContain('reloadAccountsQuietly')

@@ -1554,6 +1554,166 @@ describe('BuddyAdapter credential handling', () => {
   })
 
   /**
+   * ⚠️ `X-Conversation-*` 三头**三枚都发**（issue IKM73W 2026-10-16）。
+   *
+   * ## 背景
+   * workbuddy 渠道曾整条报 `conversation id missing`（上游 HTTP 400 /
+   * code 11128），当时据此认为「缺三头即被渠道校验拒绝」。
+   *
+   * ## 🔴⚠️ 那条外部事实**已被同账号真机复测推翻**（2026-10-16，约 90 次请求）
+   * - 逐枚消融适配器构造的 **14 枚头，全部仍 200**（含这三枚）；
+   * - 逐级剥到「连 UA / 鉴权头 / 身份头都不发」仍 200；
+   * - 6 模型 × 4 请求形状 = 48 格，三头与响应状态**零关联**；
+   * - `conversation id missing` **零次复现**（同批复现了另两句 11128）。
+   * 上游对三头的真实用法是**回显**成 completion id 的种子（回包 `"id"` 前缀
+   * 3/3 命中所发值），**不作准入判据**。
+   *
+   * ## 本组用例能锁什么、不能锁什么
+   * ✅ 锁：我们确实发出三枚头、都非空、形态正确、逐请求唯一。
+   * ❌ **锁不住**：三头是否**功能必需**（那是外部事实，已被证伪）。
+   * ⇒ 本组用例是**防误删 / 防形态退化**的护栏，**不是**功能回归防线。
+   * 变异验证的判据即「删掉任一条 `headers.set` ⇒ 三条用例变红」。
+   *
+   * ⚠️ 逐头 `it.each` 而不是只断言「某串里含某名」：后者删掉另两个头仍可能绿。
+   */
+  it.each([
+    'X-Conversation-ID',
+    'X-Conversation-Request-ID',
+    'X-Conversation-Message-ID',
+  ])('stream 必发 %s（三枚都发，防误删）', async (headerName) => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    const value = seen!.get(headerName)
+    // 必须存在且非空：与本文件 `X-Domain` 那条空串缺陷同型（空值等于没发）。
+    expect(value, `${headerName} 未发出或为空`).toBeTruthy()
+    expect(value!.length).toBeGreaterThan(0)
+  })
+
+  /**
+   * workbuddy 路径同样发齐三头 —— 且**不需要**按产品分支。
+   *
+   * 实测（2026-10-16 复核）：buddy 中国站带上这三头仍 200（无害），故实现里
+   * 刻意**无条件**发送。本用例确认 workbuddy 这条产品路径上三头齐备；与上一条
+   * 合起来锁住「两条产品路径都不缺头」（若有人日后加 `product.id` 分支，两条
+   * 里必有一条变红）。
+   */
+  it('workbuddy 路径同样发齐 X-Conversation-* 三头', async () => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      product: WORKBUDDY,
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    expect(seen!.get('X-Conversation-ID')).toBeTruthy()
+    expect(seen!.get('X-Conversation-Request-ID')).toBeTruthy()
+    expect(seen!.get('X-Conversation-Message-ID')).toBeTruthy()
+  })
+
+  /**
+   * 三头**同值**，且**不得**复用 `prompt_cache_key` 的 `sessionId`。
+   *
+   * 理由（防「顺手复用」型改动）：`sessionId` 是前缀缓存的分桶键，其真实生命周期
+   * 是**插件进程 / fiber 级**（`registerBuddyLlm` 每次 `apply()` 造一个 adapter，
+   * 它服务所有会话、所有账号）—— 与三头这种**逐请求一次性 id** 是两件事。
+   * 本仓库登记过多次「两处语义不同的东西共用一个值」导致的漂移缺陷。
+   *
+   * ⚠️ 本用例**锁不住「三头是准入必需」那条外部事实** —— 该结论已被 2026-10-16
+   * 真机复测推翻（逐枚消融 14 枚头全部仍 200）。本组用例锁的是「我们确实发出
+   * 三头且形态正确」，目的是**防误删**与**防形态退化**，不是防功能回退。
+   */
+  it('X-Conversation-* 三头同值，且不复用 prompt_cache_key 的 sessionId', async () => {
+    let seen: Headers | undefined
+    let body: Record<string, unknown> | undefined
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    const id = seen!.get('X-Conversation-ID')
+    expect(seen!.get('X-Conversation-Request-ID')).toBe(id)
+    expect(seen!.get('X-Conversation-Message-ID')).toBe(id)
+    // ⚠️ 先断言 `prompt_cache_key` **确实是个非空字符串**，否则 `not.toBe` 会
+    // 退化成「随机串 vs undefined」那种概率性恒真（对抗审计实测：删掉 body 的
+    // prompt_cache_key 后本用例仍全绿）。
+    // ⚠️ 刻意**不**断言它的格式：`sessionId` 与官方 `X-Conversation-*` 形态
+    // 毫无关系（它是本地前缀缓存的分桶键），将来有人把它改成带横线 UUID
+    // 完全合理 —— 在这里锁 32 位会**假红**。格式归三头那条形态守卫管。
+    expect(typeof body!.prompt_cache_key).toBe('string')
+    expect(String(body!.prompt_cache_key).length).toBeGreaterThan(0)
+    expect(id).not.toBe(body!.prompt_cache_key)
+  })
+
+  /**
+   * 三头取值的**形态**：32 位无横线小写十六进制。
+   *
+   * 为什么锁形态（实测里上游并不校验值）：上游把三头**回显**成 completion id 的
+   * 种子（实测回包 `"id"` 前缀 3/3 命中，填 `abc-123` 则直接回 `"id":"abc-123"`）
+   * ⇒ 形态脏值会**直接流进上游的 id 字段与后台归因**，故按官方客户端形态
+   * （`docs/workbuddy-native-search-research.md` §4.4 的「32 位无横线 uuid」）取。
+   *
+   * ⚠️ 变异验证：把值改成常量 `'fixed-conversation-id-0000'` 或 `String(undefined)`
+   * ⇒ 本用例变红（这两条在补本用例前是**无牙**的，177 全绿）。
+   */
+  it('三头取值为 32 位无横线十六进制（脏值会流进上游回显的 id）', async () => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    expect(seen!.get('X-Conversation-ID')).toMatch(/^[0-9a-f]{32}$/)
+  })
+
+  /**
+   * 三头是**逐请求**一次性 id —— **同一个 adapter** 连调两次 `stream()` 必须拿到**不同**值。
+   *
+   * ## ⚠️ 为什么必须是同一个 adapter（第二轮对抗审计打穿过我上一版）
+   * 上一版这条用例**每轮新建一个 adapter**（`for` 里 `makeAdapter(...)`），
+   * 于是它实际锁的是「**每 adapter** 一个值」而不是「逐请求」：
+   * 实测把实现改成「构造器里生成一次、存成实例字段」⇒ 上一版**179 全绿（无牙）**。
+   * 它只能区分「全局单例 vs 非全局」，分不出「逐 adapter」与「逐请求」。
+   * ⇒ 现在固定成**一个 adapter**，两次调用共用它。
+   *
+   * ⚠️ 它锁的是**现状**（逐请求），而**上游当前的真实语义是会话稳定**
+   * （官方 `X-Conversation-ID = context.id`），本实现与之**相反**。实测上游
+   * **不做**跨轮状态机（同一 `prompt_cache_key` 连发三轮、每轮换三头值，3/3 接受），
+   * 故当前无害。若将来要按官方对齐改成会话级常量，**这条用例会被迫改**（它会红）
+   * —— 那正是本仓库期望的「改语义必须显式面对守卫」。
+   *
+   * 变异验证：① 改成模块级固定常量 ⇒ 红；② 改成 adapter 实例字段 ⇒ 红（上一版漏的）。
+   */
+  it('三头是逐请求一次性 id：同一 adapter 两次调用取到不同值', async () => {
+    const seenIds: (string | null)[] = []
+    // ⚠️ **只建一个** adapter —— 见上方注释（两个 adapter 会让这条守卫无牙）。
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        seenIds.push(new Headers(init?.headers as HeadersInit).get('X-Conversation-ID'))
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    await collectChunks(adapter, streamOptions)
+    expect(seenIds).toHaveLength(2)
+    expect(seenIds[0]).toMatch(/^[0-9a-f]{32}$/)
+    expect(seenIds[1]).toMatch(/^[0-9a-f]{32}$/)
+    expect(seenIds[0]).not.toBe(seenIds[1])
+  })
+
+  /**
    * 回归：凭据 domain 为**空串**时 X-Domain 必须回退到产品域名。
    *
    * `parseTokenData` → `readStringField` 在字段缺失时返回空串，故这是真实可达
@@ -3790,6 +3950,976 @@ describe('内容级风控（11128）：不得当成账号级拦截换号/冷却'
     expect(unapprovedChannelBody).not.toContain('request illegal')
     // 措辞确实与 11140 高度相似 —— 这正是判据必须按 code 而非按文案收窄的原因。
     expect(unapprovedChannelBody).toMatch(/security policy/i)
+  })
+})
+
+/**
+ * ★★ `11128 conversation id missing` 是**按账号**生效的渠道校验，
+ * 必须像 11140 一样**继续换号**（2026-10-16 真实报障）。
+ *
+ * ## 真实缺陷
+ * workbuddy 用户看到「整条渠道全灭」。根因链：
+ *
+ * 1. 网关对**特定账号**在 `/v2/chat/completions` 上做渠道校验，回
+ *    `HTTP 400 {"code":11128,"msg":"conversation id missing"}`；
+ * 2. 该报文**不满足** `isRateLimited`（实测：对真实报文返回 `false`，与 429 对照）；
+ * 3. 于是走到「其余非限流错误 ⇒ 换号无益 ⇒ 直接抛」那一支，
+ *    池里其余**完全可用**的账号一个都试不到；
+ * 4. 被拒账号恰是池里 workbuddy **首位** ⇒ 每轮都撞它 ⇒ 表现为「整条渠道不可用」。
+ *
+ * ## 实测依据（同账号 / 同网络 / 同模型，唯一变量是账号）
+ * | 账号 | 不带会话头 |
+ * |---|---|
+ * | `66E05E7C` | ❌ 0/3（且跨约 19 分钟共 10 次全 400，`isRateLimited=false`） |
+ * | `D87606B1` | ✅ 3/3 |
+ * | `D3238B4E` | ✅ 3/3 |
+ *
+ * 三项补充实测，每一项都对应下面一条判据：
+ * - 失败**只限聊天端点**（同刻 search 200 / v3-config 200）⇒ 只按码+msg 收窄，不扩大；
+ * - 同一账号**带三头立刻 200** ⇒ 该账号**不是坏账号**，故**不得**写 30 分钟冷却；
+ * - 拒绝持续 ≥19 分钟 ⇒ 换号是必要出路（不是「重发一次就好」）。
+ *
+ * ## 与 11140 的**关键差异**（决定了两个判据不同）
+ * 11140 是账号级「策略拦截」，无解除时间，故写 30 分钟冷却避免每轮重撞；
+ * 而本档的账号**换个请求形态就能用**（实测），写冷却会把可用账号凭空封禁 30 分钟。
+ * ⇒ 换号 + **不写冷却**。
+ */
+describe('渠道校验（11128 conversation id missing）：按账号生效，必须换号', () => {
+  /**
+   * 真实上游报文（2026-10-16 本机实测，逐字取自响应体）。
+   * ⚠️ 与上面 `unapprovedChannelBody`（`Illegal API invocation from an
+   * unapproved channel`）是**同一 code 的不同子原因** —— 判据必须看 `msg`。
+   */
+  function conversationIdMissingBody(): string {
+    return JSON.stringify({
+      code: 11128,
+      msg: 'conversation id missing',
+      requestId: '72937bd4-3557-429e-9d71-220927f823dd',
+      displayMsg: {
+        en: 'Request blocked. Please send it again',
+        zh: '请求被拦截，请重新发送',
+        'zh-hant': '請求已被攔截，請重新傳送',
+      },
+      displayTips: {
+        en: 'This call failed channel verification, possibly because it was not sent from an official client. Please resend from the official client.',
+        zh: '这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。',
+      },
+    })
+  }
+
+  /** 同 11140 那组：记录冷却标记的账号池替身。 */
+  function recordingPool(accounts: Array<{ id: string; token: string }>) {
+    const recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    return {
+      recorded,
+      async findAccountIdByCredential(_provider: string, identity: string) {
+        return accounts.find((a) => a.token === identity)?.id ?? ''
+      },
+      async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number) {
+        recorded.push({ accountId, modelId, resetAtMs })
+      },
+      // ⚠️ **必须尊重 `exclude`**：适配器的换号循环靠它排除已试过的账号。
+      // 替身若忽略它，会立刻把刚失败的那个账号再返回一次，命中
+      // `tried.has(next.entry.id)` 后**立即 break**，于是「换号」根本没发生 ——
+      // 用例会以「只发一次」的形式假红（误判成实现没修）。
+      async getAvailableAccount(
+        _provider: string,
+        _modelId: string,
+        exclude?: ReadonlySet<string>,
+      ) {
+        const next = accounts.find((a) => exclude === undefined || !exclude.has(a.id))
+        if (next === undefined) return null
+        return { entry: { id: next.id }, credential: makeCredential({ access_token: next.token }) }
+      },
+      disabledModelsFor: () => new Set<string>(),
+    }
+  }
+
+  it('★★ 首个账号被拒时继续换号，换到可用账号即成功（修复前只发一次就抛）', async () => {
+    // 复刻真实池顺序：acct-1 被渠道校验拒（该账号在池里排第一）、acct-2 完全可用。
+    const pool = recordingPool([
+      { id: 'acct-1', token: 'AT1' },
+      { id: 'acct-2', token: 'AT2' },
+    ])
+    const sentTokens: string[] = []
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        sentTokens.push(token)
+        if (token === 'AT1') return new Response(conversationIdMissingBody(), { status: 400 })
+        return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    // 核心判据：两个账号都被试过 —— 第 1 个被拒**没有**中断换号。
+    // 修复前这里是 `['AT1']`（只发一次就抛 INVALID_REQUEST）。
+    expect(sentTokens).toEqual(['AT1', 'AT2'])
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+  })
+
+  it('★ 不得为该账号写 30 分钟冷却（它不是坏账号，写冷却等于凭空封禁）', async () => {
+    // 实测：该账号**带上三头立刻 200** ⇒ 它可用，只是请求形态没过校验。
+    // 若照抄 11140 的 `markPolicyBlockedAccount`，会把一个可用账号封 30 分钟，
+    // 且 UI 会把它显示成「限额重置」—— 完全误导。
+    //
+    // ⚠️⚠️ **本用例的池必须让「换号取回的那个账号」也失败**（2026-10-16 审计整改）。
+    // 初版写的是 `[acct-1 被拒, acct-2 可用]` ⇒ 循环第一跳 `send(AT2)` 就 **200
+    // → return**，循环内那一档（③）**一次都没执行**，`recorded` 为空是**平凡成立**。
+    // 实测：把 `markPolicyBlockedAccount` 加回 ③ 档后，初版用例**仍然全绿**
+    //（零牙）。现在两个账号都回同一份拒报文 ⇒ ③ 档真的被执行，判据才有牙。
+    const pool = recordingPool([
+      { id: 'acct-1', token: 'AT1' },
+      { id: 'acct-2', token: 'AT2' },
+    ])
+    const sentTokens: string[] = []
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        sentTokens.push(auth.replace('Bearer ', ''))
+        // **两个账号都被拒**：第二个走的是循环内那一档（③）。
+        return new Response(conversationIdMissingBody(), { status: 400 })
+      },
+    })
+
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch(() => undefined)
+
+    // 前置条件：③ 档确实被执行过（否则本用例又退化成零牙）。
+    // 判据：acct-1 走入口、acct-2 走循环内那一档 ⇒ 两个都被发过。
+    expect(sentTokens).toEqual(['AT1', 'AT2'])
+    // 一个冷却标记都不许写。
+    expect(pool.recorded).toEqual([])
+  })
+
+  it('★ 全部账号都被拒时：报「按账号」的提示，而非「所有账号均受限」', async () => {
+    // 换号试完全部候选仍失败 ⇒ 报错必须指向账号（与 11140 同口径），
+    // 不得吞成 QUOTA_EXCEEDED（那会让用户以为在限额、白等）。
+    const pool = recordingPool([
+      { id: 'acct-1', token: 'AT1' },
+      { id: 'acct-2', token: 'AT2' },
+    ])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool,
+      fetchImpl: async () => new Response(conversationIdMissingBody(), { status: 400 }),
+    })
+
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    const code = (error as LlmError).code
+    // 不得冒充额度/限流类（那两类 UI 会弹全局 Toast 并引导用户等待）。
+    expect(code).not.toBe('QUOTA_EXCEEDED')
+    expect(code).not.toBe('RATE_LIMIT')
+    // 文案必须给出**可行动**的出路。上游 displayMsg 那句「请重新发送」是误导的：
+    // 实测重发必然继续失败（跨 19 分钟 10 次全 400）。
+    const message = (error as LlmError).message
+    expect(message).toContain('账号')
+    expect(message).not.toBe('')
+  })
+
+  it('★ 判据必须收窄到该 msg：别的 11128 子原因**不**参与换号', async () => {
+    // 本 describe 的修复只新增一档，**不得**把 11128 整体放宽成「可换号」——
+    // `Illegal API invocation from an unapproved channel` 由腾讯指纹改写链路处理，
+    // 与账号轮换无关。
+    //
+    // ⚠️⚠️ **判据必须打在行为上**（2026-10-16 审计整改）。初版这条只对两个本地
+    // `JSON.stringify` 字符串做 `toContain` —— 它**不 import 任何被测函数**
+    //（`isChannelVerificationRejection` 也未导出，物理上无法调用），无论把判据
+    // 改成恒真、恒假还是按 `code`，它**都不会红**，属恒真断言。实测：把判据放宽成
+    // `/"code"\s*:\s*11128/` 时，红的是**隔壁**那条 400 用例，本条**仍绿**。
+    // 现在改为真起 adapter，断言**请求序列**（唯一无法伪装的观测量）。
+    async function sentTokensFor(body: string): Promise<string[]> {
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([
+          { id: 'acct-1', token: 'AT1' },
+          { id: 'acct-2', token: 'AT2' },
+        ]),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          sentTokens.push(auth.replace('Bearer ', ''))
+          return new Response(body, { status: 400 })
+        },
+      })
+      await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch(() => undefined)
+      return sentTokens
+    }
+
+    // 本档（渠道校验）⇒ **换号**：两个账号都被试。
+    expect(await sentTokensFor(conversationIdMissingBody())).toEqual(['AT1', 'AT2'])
+    // 同 code 的另一子原因 ⇒ **只发一次**（不换号，也不写冷却）。
+    expect(await sentTokensFor(JSON.stringify({
+      code: 11128,
+      msg: 'Illegal API invocation from an unapproved channel',
+      displayMsg: { zh: '请求被安全策略拦截，请稍后重试或联系支持。' },
+    }))).toEqual(['AT1'])
+  })
+
+  /**
+   * ★★ **单账号池 / 候选全被排除**：首发即被拒时也必须走本档出口。
+   *
+   * ## 真实缺陷（2026-10-16 审计实测）
+   *
+   * `sawChannelVerification` 初版从 `false` 起算，只在「**换到下一个账号**后又被拒」
+   * 时置位 ⇒ **首发**那一次失败从未被记账。池里没有第二个候选时循环第一跳就
+   * `break`，两个专用出口都不命中，直接落到「所有账号均受限，请稍后再试」
+   * + `QUOTA_EXCEEDED` —— 把渠道校验**误报成额度受限**，正是本档存在的理由
+   * 被自己的实现推翻（作者在同文件的出口注释里亲手写下「必须先于 QUOTA_EXCEEDED」）。
+   *
+   * ## 为什么必须单独立组
+   *
+   * 上面那条「全部账号都被拒」用的是 **N=2** 池，第二个账号的被拒会走循环内那一档
+   * ⇒ 恰好绕开了本缺陷。实测：把 `sawChannelVerification` 改回 `false` 初始化后，
+   * 全量 183 条**依然全绿** ⇒ 本形态此前**零守卫**。
+   *
+   * ⚠️ 用户侧这不是罕见配置：Jet Hub 里只登录了一个 workbuddy 账号时池就是 N=1；
+   * 用户按本档文案「停用该账号」操作到只剩一个时也会落到这里。
+   */
+  describe('单账号池 / 候选全被排除：首发被拒也必须报本档', () => {
+    it('★★ N=1 池被拒 ⇒ 报本档，不得是 QUOTA_EXCEEDED', async () => {
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([{ id: 'acct-1', token: 'AT1' }]),
+        fetchImpl: async () => new Response(conversationIdMissingBody(), { status: 400 }),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(LlmError)
+      // 核心判据：不得吞成「所有账号均受限」（那会让用户白等一个重置时刻）。
+      expect((error as LlmError).code).not.toBe('QUOTA_EXCEEDED')
+      expect((error as LlmError).code).toBe('PERMISSION_DENIED')
+      expect((error as LlmError).message).toContain('渠道校验')
+    })
+
+    it('★ 池里候选全被排除（getAvailableAccount 恒 null）⇒ 同样报本档', async () => {
+      // 等价形态：池里有账号但都被 `enabled=false` / 限流标记挡掉。
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: {
+          async findAccountIdByCredential() { return 'acct-1' },
+          async updateModelRateLimit() {},
+          async getAvailableAccount() { return null },
+          disabledModelsFor: () => new Set<string>(),
+        },
+        fetchImpl: async () => new Response(conversationIdMissingBody(), { status: 400 }),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(LlmError)
+      expect((error as LlmError).code).toBe('PERMISSION_DENIED')
+    })
+  })
+
+  /**
+   * ★★ **判据的书写变体容错**（2026-10-16 审计整改）。
+   *
+   * 初版判据是 `/"msg"\s*:\s*"conversation id missing"/i` —— 只认**完整 JSON 片段**。
+   * 下面任一上游改字都会让它**静默漏认**，退回「只试一个账号就抛」
+   *（症状与本 PR 声称修好的完全同形，只是更难查：没有任何日志）。
+   *
+   * ⚠️ 放宽的**只是同一句 msg 的书写变体**，不是放宽成按 `code`：
+   * 隔壁那条 `Illegal API invocation from an unapproved channel` 仍必须**不**命中
+   *（由上面「判据必须收窄到该 msg」那条锁住）。
+   */
+  describe('判据容错：同一句 msg 的书写变体仍须换号', () => {
+    it.each([
+      ['键名写成 message', { code: 11128, message: 'conversation id missing' }],
+      ['值尾部带句点', { code: 11128, msg: 'conversation id missing.' }],
+      ['值前缀带空格', { code: 11128, msg: ' conversation id missing' }],
+      ['内部多空格', { code: 11128, msg: 'conversation  id  missing' }],
+      ['内部连字符', { code: 11128, msg: 'conversation-id missing' }],
+      ['内部冒号', { code: 11128, msg: 'conversation id: missing' }],
+      ['内部换行（JSON 转义 \\n）', { code: 11128, msg: 'conversation\nid missing' }],
+      ['内部下划线', { code: 11128, msg: 'conversation_id missing' }],
+      // ⚠️ 不可见字符按 **Unicode 类别 `\p{Cf}`** 覆盖，不枚举码点
+      //（本仓在网关通配判据上已有一课：枚举码点必漏）。下面四枚是**代表性**取样。
+      ['零宽空格 U+200B', { code: 11128, msg: 'conversation\u200bid missing' }],
+      ['零宽非连接 U+200C', { code: 11128, msg: 'conversation\u200cid missing' }],
+      ['word joiner U+2060', { code: 11128, msg: 'conversation\u2060id missing' }],
+      ['BOM U+FEFF', { code: 11128, msg: 'conversation\ufeffid missing' }],
+      ['软连字符 U+00AD', { code: 11128, msg: 'conversation\u00adid missing' }],
+      ['全大写', { code: 11128, msg: 'Conversation ID Missing' }],
+      ['error 包装形态', { error: { code: 11128, msg: 'conversation id missing' } }],
+    ])('%s ⇒ 仍须换号', async (_label, body) => {
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([
+          { id: 'acct-1', token: 'AT1' },
+          { id: 'acct-2', token: 'AT2' },
+        ]),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          const token = auth.replace('Bearer ', '')
+          sentTokens.push(token)
+          return token === 'AT1'
+            ? new Response(JSON.stringify(body), { status: 400 })
+            : sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      const chunks = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never)
+
+      // 换号真的发生了（不是「只发一次就抛」）。
+      expect(sentTokens).toEqual(['AT1', 'AT2'])
+      expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    })
+  })
+
+  /**
+   * ★★ **假阳性防护**：别的 11128 子原因**引用**了这句话时，不得被当成本档。
+   *
+   * ## 真实回归（2026-10-16 自查实测，我**自己引入**的）
+   *
+   * 第一版整改把判据换成「**整份报文**裸子串」。于是只要**别的**子原因在
+   * `displayTips` 里**引用**了这句话（英文提示写成
+   * `If you see "conversation id missing", please resend…`），就会被判成
+   * 「按账号生效」⇒ 危害是**双向**的：
+   * ① 本该只发一次，变成**白烧整池往返**；
+   * ② 报「全部账号均未通过渠道校验」，**误导用户去停用一个好账号**
+   *   （真实原因是渠道级/消息形状级，换号毫无用处）。
+   * 报文 echo 了请求体（用户消息里正好写了这句话）同型。
+   *
+   * ⇒ 修法：判据**优先**要求该句出现在 `msg` / `message` 的**值**里；
+   * 只有当整份报文**没有**这两个键时（HTML / 纯文本网关页）才退回裸子串。
+   * 对照：PR 原始判据（`/"msg"\s*:\s*"conversation id missing"/i`）在本组
+   * 三格里同样是「只发一次」⇒ 本组锁的是**不得因放宽而退化**。
+   */
+  describe('假阳性防护：别的子原因「引用」该句时不得换号', () => {
+    it.each([
+      ['displayTips 引用该句', {
+        code: 11128,
+        msg: 'Illegal API invocation from an unapproved channel',
+        displayMsg: { zh: '请求被安全策略拦截，请稍后重试或联系支持。' },
+        displayTips: { en: 'If you see "conversation id missing", please resend from the official client.' },
+      }],
+      ['displayMsg 里带该句而 msg 是别族', {
+        code: 11128,
+        msg: 'first message is not system prompt',
+        displayMsg: { zh: 'conversation id missing 相关的提示请忽略' },
+      }],
+      ['报文 echo 了请求体（用户消息里正好写了这句）', {
+        code: 11128,
+        msg: 'Illegal API invocation from an unapproved channel',
+        echo: { user: 'what does conversation id missing mean?' },
+      }],
+      // ⚠️ **粘连词（零分隔符）**：分隔符语义是「形式可变但**必须存在**」。
+      // 初版用 `\s*` ⇒ 允许零个 ⇒ `conversationidmissing` 这类**粘连标识符**
+      // 也命中（2026-10-16 对抗性审计实测，`conversationIdMissing` 这种
+      // camelCase 同样命中）⇒ 白烧整池。它们与上游那句错**不是同一件事**。
+      ['粘连写法 conversationidmissing（零分隔符）', {
+        code: 11128,
+        msg: 'conversationidmissing',
+      }],
+      ['camelCase conversationIdMissing（零分隔符）', {
+        code: 11128,
+        msg: 'conversationIdMissing',
+      }],
+      // ⚠️⚠️ **结构化的非 `msg` 字段 / 请求体回声**（2026-10-16 第三轮自查实测
+      // 三处**已实测可达**的误命中）。它们的共同点：报文**是结构化 JSON**（有
+      // `code`），却因为「没有 `msg` 键」而被当成 HTML 兜底腿 ⇒ 误命中烧整池。
+      // ⚠️ 这三格**必须走「无 `msg` 键」形态**：上面那些带 `msg` 键的格子会被
+      // 腿①先接住，**根本打不到腿②**（实测：把腿②的 `+` 改成 `*`，上面两格
+      // 不红 = 零牙；本组补齐后才覆盖到腿②）。
+      ['该句只在 `tips` 字段（结构化 JSON、无 msg 键）', {
+        code: 11128,
+        tips: 'conversation id missing',
+      }],
+      ['`error` 是字符串且含该句（结构化 JSON、无 msg 键）', {
+        code: 11128,
+        error: 'conversation id missing',
+      }],
+      ['echo 了请求体且正文含该句（结构化 JSON、无 msg 键）', {
+        code: 400,
+        request: { content: 'what is conversation id missing?' },
+      }],
+    ])('%s ⇒ 只发一次、不换号', async (_label, body) => {
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([
+          { id: 'acct-1', token: 'AT1' },
+          { id: 'acct-2', token: 'AT2' },
+        ]),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          sentTokens.push(auth.replace('Bearer ', ''))
+          return new Response(JSON.stringify(body), { status: 400 })
+        },
+      })
+      await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch(() => undefined)
+
+      // 核心判据：**没有**换号（否则就是白烧整池 + 误导用户停用好账号）。
+      expect(sentTokens).toEqual(['AT1'])
+    })
+  })
+
+  /**
+   * ★★ **状态码闸门**：腿② 只在「该错误实际可能出现的码域」启用
+   *（2026-10-16 第三轮审计 P1，本轮修）。
+   *
+   * ## 真实缺陷（已实测可达）
+   *
+   * 前三轮只治「报文体长什么样」，**没治「哪个状态码才可能出这个错」**。
+   * 于是**网关 5xx 故障页**只要日志文字里恰好含该句（例：
+   * `<html>502 Bad Gateway<br>upstream log: conversation id missing header</html>`
+   * —— 它没有 `msg`/`code` 键，故走腿②），就会：
+   *
+   * | 观测 | 修复前 | 修复后 |
+   * |---|---|---|
+   * | 请求序列 | **烧满整池** | 只发一次 |
+   * | 错误码 | `PERMISSION_DENIED`「未通过渠道校验」 | `SERVER`（5xx 既有分类） |
+   * | 用户被指引 | **「在 Jet Hub 停用或调整该账号的顺序」** | — |
+   *
+   * ⇒ 让用户为一次网关抖动**去停用一批好账号**，且 `PERMISSION_DENIED` 不在
+   * harness 可重试集合里 ⇒ 瞬时故障被报成确定性结论。
+   *
+   * ⚠️ 腿①（`msg`/`message` 值位）**不受**此闸门约束：它要求精确命中值位，是
+   * 强证据，出现在任何状态码上都应认。
+   */
+  describe('状态码闸门：5xx / 429 的故障页不得被劫持成渠道校验', () => {
+    it.each([
+      ['502 HTML（日志含该句、无 msg 键）', '<html><body>502 Bad Gateway<br>upstream log: conversation id missing header</body></html>', 502],
+      ['500 纯文本（含该句）', 'upstream error: conversation id missing header', 500],
+      ['504 HTML（含该句）', '<html>504 Gateway Timeout: conversation id missing</html>', 504],
+    ] as Array<[string, string, number]>)('%s ⇒ 只发一次，且码为 SERVER', async (_label, raw, status) => {
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([
+          { id: 'acct-1', token: 'AT1' },
+          { id: 'acct-2', token: 'AT2' },
+        ]),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          sentTokens.push(auth.replace('Bearer ', ''))
+          return new Response(raw, { status })
+        },
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      // 核心判据①：不得白烧整池（网关抖动与账号无关）。
+      expect(sentTokens).toEqual(['AT1'])
+      // 核心判据②：不得报「渠道校验 / 按账号」而误导用户停用好账号。
+      expect((error as LlmError).code).not.toBe('PERMISSION_DENIED')
+      expect((error as LlmError).message).not.toContain('渠道校验')
+    })
+
+    it('★ 对照：同一句出现在 `msg` 值位（腿①）时，任何状态码都仍须认', async () => {
+      // 腿① 是强证据（上游确实用它报这个错）⇒ 不受状态码闸门约束。
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([
+          { id: 'acct-1', token: 'AT1' },
+          { id: 'acct-2', token: 'AT2' },
+        ]),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          const token = auth.replace('Bearer ', '')
+          sentTokens.push(token)
+          return token === 'AT1'
+            ? new Response(conversationIdMissingBody(), { status: 400 })
+            : sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      const chunks = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never)
+      expect(sentTokens).toEqual(['AT1', 'AT2'])
+      expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    })
+  })
+
+  it('★ 键名 `message` 形态：判据命中后，出口也必须提出该 msg（可诊断性不降级）', async () => {
+    // ⚠️ 判据认 `m(?:sg|essage)`，出口提取器若只读 `msg`，就会出现
+    // 「判据认了、出口提不出」⇒ 用户只看到 `code 11128`，那句唯一的定位文本丢失。
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: recordingPool([{ id: 'acct-1', token: 'AT1' }]),
+      fetchImpl: async () => new Response(
+        JSON.stringify({ code: 11128, message: 'conversation id missing' }),
+        { status: 400 },
+      ),
+    })
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect((error as LlmError).code).toBe('PERMISSION_DENIED')
+    // 判据命中的那句 msg 必须能在文案里看到（否则排查时无从下手）。
+    expect((error as LlmError).message).toContain('conversation id missing')
+  })
+
+  /**
+   * ★★ **腿②（非结构化兜底腿）的两个方向都要锁**（2026-10-16 第三轮自查）。
+   *
+   * ## 为什么必须单独立组
+   *
+   * 腿①（锚定 `msg`/`message` 值位）与结构化守卫会**先**接住绝大多数形态
+   * ⇒ 上面那些带 `msg` 键的用例**根本走不到腿②**。实测代价：把腿②的 `+` 改成
+   * `*`（允许零分隔）后，**全量 221 条仍绿** ⇒ 腿②**零牙**。
+   * 本组喂「**既没有 `msg`/`message` 键、也不是结构化 JSON 对象**」的报文体
+   * ⇒ 只有腿②能接住，两个方向才测得动。
+   */
+  describe('腿②（非结构化兜底腿）：零分隔必须不命中、含该句必须命中', () => {
+    /** 喂一份裸文本报文体，返回请求序列。 */
+    async function sentTokensFor(raw: string): Promise<string[]> {
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([
+          { id: 'acct-1', token: 'AT1' },
+          { id: 'acct-2', token: 'AT2' },
+        ]),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          const token = auth.replace('Bearer ', '')
+          sentTokens.push(token)
+          return token === 'AT1'
+            ? new Response(raw, { status: 400 })
+            : sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch(() => undefined)
+      return sentTokens
+    }
+
+    it.each([
+      // ⚠️ 收紧方向：分隔符必须**存在**（粘连词不得命中）。
+      ['裸文本粘连写法 conversationidmissing', 'conversationidmissing', false],
+      ['裸文本 camelCase conversationIdMissing', 'conversationIdMissing', false],
+      // ⚠️ 放宽方向：真实 HTML / 纯文本网关页必须**仍被接住**（否则整族漏认）。
+      ['HTML 页含该句', '<html><body>gateway: conversation id missing</body></html>', true],
+      ['纯文本含该句', 'error: conversation id missing', true],
+      ['HTML 页含连字符变体', '<html>conversation-id missing</html>', true],
+    ])('%s ⇒ %s', async (_label, raw, shouldRotate) => {
+      const sent = await sentTokensFor(raw)
+      expect(sent).toEqual(shouldRotate ? ['AT1', 'AT2'] : ['AT1'])
+    })
+  })
+
+  /** 非 JSON 报文体：判据仍须命中（无结构化字段可锚 ⇒ 走裸子串兜底腿）。 */
+  it('★ 非 JSON（HTML）报文里含该句 ⇒ 仍须换号；且文案须标注「非 JSON 报文」', async () => {    const sentTokens: string[] = []
+    const html = '<html><body>gateway error: conversation id missing</body></html>'
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: recordingPool([
+        { id: 'acct-1', token: 'AT1' },
+        { id: 'acct-2', token: 'AT2' },
+      ]),
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        sentTokens.push(auth.replace('Bearer ', ''))
+        return new Response(html, { status: 400 })
+      },
+    })
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    // 两个账号都被试过 ⇒ 兜底腿生效。
+    expect(sentTokens).toEqual(['AT1', 'AT2'])
+    // ⚠️ 非 JSON 报文**无法**定位 `displayMsg` ⇒ 只能原样引用，但必须
+    // ① **标注**它是网关原样输出（而不是上游的结构化错误说明）、
+    // ② **抹掉**上游那句会诱导无效动作的行动指引（见下一条用例）。
+    expect((error as LlmError).message).toContain('非 JSON 报文')
+  })
+
+  /**
+   * ★★ **兜底腿不得把上游「请重新发送」带出来**（2026-10-16 对抗性审计实测）。
+   *
+   * 初版兜底腿是 `body.slice(0, 200)` **原样引用** ⇒ 审计在 5 种非 JSON / 边缘
+   * 形态（仅 `message` 键 / `error` 是字符串 / JSON 数组 / HTML / 纯文本）实测
+   * 都把「请重新发送」拼回了 message，**推翻了本档「文案必须自己写、不透传
+   * displayMsg」这条立论**（该立论正是 `channelVerificationUpstreamId` 存在的理由）。
+   *
+   * ⚠️ 取舍：保留报错**标识**（code / msg / requestId —— 那是「报文是唯一定位
+   * 手段」这条纪律的载体），只抹**行动指引**。故判据是「含该句 + 仍能看到标识」。
+   */
+  describe('兜底腿：抹掉行动指引但保留报错标识', () => {
+    // ⚠️⚠️ **必须喂真实上游原句**（2026-10-16 第三轮审计实测，本轮修）：前一轮这
+    // 5 格全用**合成串**（都含字面「请重新发送」）⇒ 真实报文的两句**全都漏网**：
+    // | 来源 | 真实原句 | 前一轮 | 现版 |
+    // |---|---|---|---|
+    // | `displayMsg.zh` | `请求被拦截，请重新发送` | ✅ | ✅ |
+    // | `displayTips.zh` | `…请用官方版本重新发送。` | ❌（`请` 后紧跟 `用`） | ✅ |
+    // | `displayTips.en` | `…Please resend from the official client.` | ❌（**无 `again`**） | ✅ |
+    // ⇒ **用例喂合成串锁不住真实文案**，这是本仓「判据必须打在行为上」的又一形态。
+    const displayMsgZh = '请求被拦截，请重新发送'
+    const displayTipsZh = '这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。'
+    const displayTipsEn = 'This call failed channel verification, possibly because it was not sent from an official client. Please resend from the official client.'
+
+    it.each([
+      ['HTML + 真实 displayMsg.zh', `<html>conversation id missing ${displayMsgZh}</html>`, '请重新发送'],
+      ['HTML + 真实 displayTips.zh', `<html>conversation id missing ${displayTipsZh}</html>`, '重新发送'],
+      // ⚠️ 真实 displayTips.en 里「official client」出现**两次**：前一处
+      //（`not sent from an official client`）是**描述性**的（说明为什么被拒），
+      // 后一处（`Please resend from the official client`）才是**行动指引**。
+      // ⇒ 断言必须锚**行动指引**那一句，而不是「文件里有没有这个词」。
+      ['HTML + 真实 displayTips.en', `<html>conversation id missing. ${displayTipsEn}</html>`, 'Please resend from the official client'],
+      // 下面两格保留：它们覆盖的是**非 JSON 结构**（数组 / 非字符串 JSON），
+      // 与上面的「真实原句」是**两个正交维度**，都要锁。
+      ['JSON 数组形态（合成串）', '[{"code":11128,"conversation id missing":"请重新发送"}]', '请重新发送'],
+      ['非字符串 JSON 体（合成串）', '{code:11128,message:conversation id missing,请重新发送}', '请重新发送'],
+    ])('%s ⇒ 不得带出上游的行动指引，且仍保留定位信息', async (_label, raw, forbidden) => {
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([{ id: 'acct-1', token: 'AT1' }]),
+        fetchImpl: async () => new Response(raw, { status: 400 }),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      const message = (error as LlmError).message
+      // ① 不得原样带出上游那句行动指引（实测重发必然继续失败）。
+      expect(message).not.toContain(forbidden)
+      // ② 仍必须保留**定位信息**：报文原文里那句标识必须还在
+      //   （否则「先取失败会话的完整报文」这条既有排障纪律就失效了）。
+      expect(message).toContain('conversation id missing')
+      expect(message).toContain('非 JSON 报文')
+    })
+
+    it('★ 收紧方向：`请稍后重试` **不得**被抹（那是有效指引，服务端可能真会恢复）', async () => {
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([{ id: 'acct-1', token: 'AT1' }]),
+        fetchImpl: async () => new Response(
+          '<html>conversation id missing 请稍后重试</html>', { status: 400 },
+        ),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+      expect((error as LlmError).message).toContain('请稍后重试')
+    })
+
+    it('★★ JSON 路径必须带出 `requestId`（文档四处把它称为唯一定位手段）', async () => {
+      // ⚠️ 实测缺陷：此前实现只取 `code`/`msg`，**一个字都没取 `requestId`** ——
+      // 而本文件与 `docs/agent-notes/providers-buddy.md` 共**四处**告诉用户
+      // 「先取 `requestId` 去取证」⇒ 那句纪律对用户**不可执行**。
+      const requestId = '72937bd4-3557-429e-9d71-220927f823dd'
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([{ id: 'acct-1', token: 'AT1' }]),
+        fetchImpl: async () => new Response(
+          JSON.stringify({ code: 11128, msg: 'conversation id missing', requestId }),
+          { status: 400 },
+        ),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect((error as LlmError).message).toContain(requestId)
+    })
+  })
+
+  /**
+   * ★★ **HTTP 403 形态**：同一个渠道校验拒绝也会以 403 出现（2026-10-16 审计实测）。
+   *
+   * ## 为什么必须单独立组
+   *
+   * 上游同一族拒绝**同时用 400 与 403 两种状态码**（本文件 `isContentRejection`
+   * 的注释就有成文记录：11140「也回 HTTP 403」）。整改第一版只接了 400 与流内
+   * 200 ⇒ 403 落到 `所有账号均被拒绝（HTTP 403）` 分支，码为
+   * `httpErrorCode(403)` = **`AUTH`**。
+   *
+   * ⚠️ `AUTH` 是本仓库的**红线码**（`docs/agent-notes/client-ui.md` 的 IKLBSH）：
+   * DSH 客户端会把 message **整个换成「API 密钥无效」** ⇒ 本档精心写的
+   * 「重发无效 / 停用该账号」一个字都到不了用户眼前，而实测 token 全部有效。
+   * 故断言**必须**同时锁「码不是 AUTH」与「文案是渠道校验文案」。
+   */
+  describe('HTTP 403 形态：同样不得报成 AUTH', () => {
+    it('★★ 403 + 渠道校验拒绝 ⇒ 报本档文案（码不得是 AUTH）', async () => {
+      const pool = recordingPool([{ id: 'acct-1', token: 'AT1' }])
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        fetchImpl: async () => new Response(conversationIdMissingBody(), { status: 403 }),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(LlmError)
+      // 核心判据①：`AUTH` 会吞掉整条 message（客户端换成「API 密钥无效」）。
+      expect((error as LlmError).code).not.toBe('AUTH')
+      expect((error as LlmError).code).toBe('PERMISSION_DENIED')
+      // 核心判据②：文案必须真的到得了用户眼前，且不得带上游那句误导。
+      expect((error as LlmError).message).toContain('渠道校验')
+      expect((error as LlmError).message).not.toContain('请重新发送')
+      // 该账号并非坏账号 ⇒ 不得写冷却。
+      expect(pool.recorded).toEqual([])
+    })
+
+    it('★ 403 + 400 混池：两次都被拒仍报本档，且不写冷却', async () => {
+      const pool = recordingPool([
+        { id: 'acct-1', token: 'AT1' },
+        { id: 'acct-2', token: 'AT2' },
+      ])
+      const sent: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        // ⚠️ 401/403 路径的**既有语义**：先刷新当前账号并重发一次，才进入换号。
+        // 故固定刷新后的凭据仍是 AT1，序列才是可预期的（否则 `makeAdapter` 默认
+        // 返回 token `AT`，序列里会多出一个与池无关的值 —— 那是**测试替身**造成的，
+        // 不是被测行为；别把它误读成「多发一次」的缺陷）。
+        postRefreshCredential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          const token = auth.replace('Bearer ', '')
+          sent.push(token)
+          // 首发 403、换号后 400 —— 两种状态码都要被同一档接住。
+          return new Response(conversationIdMissingBody(), { status: token === 'AT1' ? 403 : 400 })
+        },
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      // ⚠️ 不锁精确请求序列（如实登记一处**既有**结构边界）：401/403 段与 400 段
+      // 各有自己的 `triedAuth` / `tried` 局部集合，**两者不共享** ⇒ 「首发 403、
+      // 换号后 400」会跨段重复试一次已试过的账号（实测序列
+      // `["AT1","AT1","AT2","AT1"]`，末位即跨段重复）。该重复是**两段式结构的
+      // 既有代价**，非本次改动引入；本次改动只是让 403 形态也走到这里
+      //（此前它直接抛 `AUTH`，代价是**码错误**——远比一次多余往返严重）。
+      // 登记在案，不在本 PR 范围内重构。
+      expect(sent).toContain('AT2')          // 换号真的发生了
+      expect((error as LlmError).code).toBe('PERMISSION_DENIED')
+      expect(pool.recorded).toEqual([])
+    })
+  })
+
+  /**
+   * ★★ **流内通道**（HTTP 200 + SSE 内嵌 11128 `conversation id missing` 帧）。
+   *
+   * ## 真实缺陷（2026-10-16 审计实测）
+   *
+   * 本文件 `isContentRejection` 的注释早就记着「同一报文在 CodeArts 侧就以
+   * HTTP 200 + 内嵌错误帧的形式出现」，而本档第一版**只改了 HTTP 通道**
+   * ⇒ 该形态下：① 不换号；② 帧无 `choices` 也无 `error` ⇒ 零内容块 ⇒
+   * 被改写成 `EMPTY_RESPONSE`；③ 而 `EMPTY_RESPONSE` **在** harness 的
+   * `DEFAULT_RETRYABLE_CODES` 里（`retry-policy.js`，`DEFAULT_MAX_RETRIES = 5`）
+   * ⇒ **白退避重试至多 5 次**，每次重撞同一个被拒账号，用户看到的还是
+   * 「模型没返回内容」—— 原因完全错位。
+   *
+   * 实测（修复前）：`sent=["AT1"]`、下发 `finish(error)` 帧、code `EMPTY_RESPONSE`。
+   */
+  describe('流内 200 + 内嵌错误帧：同样不得静默/误报', () => {
+    it('★★ 内嵌 conversation id missing 帧 ⇒ 报本档，不得是 EMPTY_RESPONSE', async () => {
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([
+          { id: 'acct-1', token: 'AT1' },
+          { id: 'acct-2', token: 'AT2' },
+        ]),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          sentTokens.push(auth.replace('Bearer ', ''))
+          // 两站均下发 200 + 内嵌错误帧（无 choices、无 error）。
+          return sseResponse(`data: ${conversationIdMissingBody()}\n\n`)
+        },
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(LlmError)
+      // 核心判据：不得落进**可重试**的 `EMPTY_RESPONSE`（那会白退避至多 5 次）。
+      expect((error as LlmError).code).not.toBe('EMPTY_RESPONSE')
+      expect((error as LlmError).code).toBe('PERMISSION_DENIED')
+      // 流内档**刻意不重发**（重发需要「尚未产出内容」的判据 + 外层循环）：
+      // 请求序列必须仍是只发一次，文案也必须如实说「当前账号」而不是「全部账号」。
+      expect(sentTokens).toEqual(['AT1'])
+      expect((error as LlmError).message).toContain('流内')
+    })
+
+    it('★★ 门禁：正文里出现该措辞的正常回答**不得**被判成拒绝', async () => {
+      // ⚠️⚠️ **本条锁的是 `data.choices === undefined &&` 这道门禁**
+      //（2026-10-16 对抗性审计实测：删掉该门禁后**全量用例仍绿** ⇒ 零守卫）。
+      //
+      // 门禁的必要性：模型完全可以**在正常回答里复述这个措辞**
+      //（用户问「conversation id missing 是什么意思」时必然如此——本仓库自己的
+      // 测试夹具里就装满这句话）。没有门禁 ⇒ 整轮回答被判成渠道校验拒绝：
+      // 实测变异态 `chunks=[]` + `PERMISSION_DENIED`，用户看到的是
+      // 「当前账号未通过渠道校验」而**答案整段丢失**。
+      //
+      // 与 11140 侧同款保护（那条有守卫），本档此前**没有** ⇒ 本组补齐。
+      const pool = recordingPool([{ id: 'acct-1', token: 'AT1' }])
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        // 有效内容帧：**带 choices**，正文里含该措辞。
+        fetchImpl: async () => sseResponse(
+          'data: {"choices":[{"delta":{"content":"conversation id missing 是腾讯网关的错误码"},"finish_reason":null}]}\n\n'
+          + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+          + 'data: [DONE]\n\n',
+        ),
+      })
+      const chunks = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never)
+
+      // 核心判据：正文必须**完整产出**，不得被当成拒绝（那会丢掉整轮回答）。
+      expect(chunks.some((c) => c.type === 'text-delta'
+        && String((c as { text?: string }).text).includes('conversation id missing'))).toBe(true)
+      // 也不得写账号冷却（这个账号没问题）。
+      expect(pool.recorded).toEqual([])
+    })
+
+    it('★ 流内报文的「安全审核」子原因仍走 11140 档（不得被本档抢走）', async () => {
+      // 顺序锁：`isContentRejection` 与 `isChannelVerificationRejection` 在流内是
+      // 两个并列分支，11140 必须**先**判（它要写账号冷却，语义更强）。
+      const pool = recordingPool([{ id: 'acct-1', token: 'AT1' }])
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        fetchImpl: async () => sseResponse(`data: ${JSON.stringify({
+          code: 11140,
+          msg: 'request illegal',
+          displayMsg: { zh: '内容未通过安全审核，请调整后重试。' },
+        })}\n\n`),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect((error as LlmError).code).toBe('PERMISSION_DENIED')
+      expect((error as LlmError).message).toContain('安全策略拦截')
+      // 11140 档必须**写冷却**（与上面 11128 档刻意不写形成对照）。
+      expect(pool.recorded).toHaveLength(1)
+    })
+  })
+
+  /**
+   * ★★ **文案不得诱导用户做无效动作**（2026-10-16 审计整改）。
+   *
+   * 作者在 `channelVerificationError` 的注释里花整段论证「文案必须自己写，
+   * 不能透传上游 `displayMsg`」—— 因为上游那句是「请求被拦截，**请重新发送**」，
+   * 而实测重发必然继续失败。
+   *
+   * ⚠️ 但初版实现末尾用 `errorDetail(body)` 拼「上游原文」，而 `errorDetail` 的
+   * **第一优先级正是 `displayMsg.zh`** ⇒ 同一条 message 里前半说「重发无效」、
+   * 后半说「请重新发送」，自相矛盾（审计实测到该产物）。
+   */
+  describe('出口文案：不得把上游「请重新发送」拼回来', () => {
+    it('★★ 文案不得含上游 displayMsg 的「请重新发送」，也不得含字面 Markdown 星号', async () => {
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: recordingPool([{ id: 'acct-1', token: 'AT1' }]),
+        fetchImpl: async () => new Response(conversationIdMissingBody(), { status: 400 }),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      const message = (error as LlmError).message
+      // 上游 displayMsg.zh 逐字为「请求被拦截，请重新发送」——不得出现。
+      expect(message).not.toContain('请重新发送')
+      expect(message).not.toContain('请求被拦截')
+      // 仍必须**保留可诊断性**：上游 code / msg 要能看到（报文是唯一排查手段）。
+      expect(message).toContain('11128')
+      expect(message).toContain('conversation id missing')
+      // 错误 message 是**纯文本**渲染：字面 `**` 会原样显示成星号。
+      expect(message).not.toContain('**')
+    })
   })
 })
 

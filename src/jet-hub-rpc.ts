@@ -41,6 +41,13 @@ import type { TraeAuth } from './trae-auth.js'
 import type { ClineAuth } from './cline-auth.js'
 import { LOOMY } from './loomy-product.js'
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
+// ⚠️ **值导入**（不是类型）：一键「拒绝非临期」要把这份清单传给账号池。
+//    它是一份**冻结的静态数组**（`Object.freeze([...])`），模块级求值安全 ——
+//    与 `WIRED_EXPIRY_PROVIDERS` 自己那条注释里说的「不要读 runtime 注册表」不矛盾
+//    （本文件只读它是为了让「谁是未接入渠道」的权威**只有一处**）。
+//    ⚠️ 每一次调用都**重新读**这个导出（而不是在模块级拷成另一个常量），以后者为准会
+//    在接入新渠道时静默漂移：一键按钮会开始清掉**已接入**渠道的白名单。
+import { WIRED_EXPIRY_PROVIDERS } from './aggregate-expiry.js'
 import type { LoomyAuth } from './loomy-auth.js'
 import type { LoomyCredential } from './loomy.js'
 import { RACCOON } from './raccoon-product.js'
@@ -52,7 +59,7 @@ import { phoneFromUserId, isUsableZcodeCredential } from './zcode.js'
 import { ZCODE_LOGIN_PROVIDER, type ZcodeLoginProvider } from './zcode-login.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
-import { MINIMAX } from './minimax-product.js'
+import { MINIMAX, MINIMAX_INTL, type MinimaxProduct } from './minimax-product.js'
 import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
@@ -69,6 +76,9 @@ import { ACCIO } from './accio-product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
+// ⚠️ 共享余额读数缓存（2026-10-15，规格 §5.7）：经**进程级注册位**取，不给
+//    `registerJetHubRpc` 加第 5 个形参（那会重开「位置错位复发 6 次」的门）。
+import { balanceCacheOf } from './provider-runtime.js'
 import { createProviderOnboarding, onboardingOf } from './provider-onboarding.js'
 import type { ProviderCallContext, ProviderCredits, ProviderOnboarding } from './provider-runtime.js'
 import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
@@ -247,6 +257,12 @@ import type {
   RpcAggregateSetRejectedRequest,
   RpcAggregateClearRejectedRequest,
   RpcAggregateRejectionsResponse,
+  RpcAggregateSetAllowedRequest,
+  RpcAggregateSetOrderRequest,
+  RpcAggregateSetOrderResponse,
+  RpcAggregateSetOrderModeRequest,
+  RpcAggregateSetOrderModeResponse,
+  RpcAggregateRejectNonExpiringResponse,
   RpcAggregateActiveProviderResponse,
   RpcAggregateExpiryOrderResponse,
   RpcModelSetAllDisabledRequest,
@@ -650,6 +666,53 @@ export interface CreditsEndpointDeps<
   /** 单账号异常时的告警出口（不参与控制流）。 */
   warn?: (message: string) => void
   /**
+   * **共享余额读数缓存**的回写出口（2026-10-15，规格 §5.7）。
+   *
+   * ## ⚠️ 为什么是「回写」而不是「改读」（本端点的响应形状约束）
+   *
+   * 本端点的响应是 `{ balance, error?, extra? }`，比折算路径要的 `CreditBalance`
+   * **多两个字段**（Gemini 的 `extra` 来自另一个端点）⇒ 让本端点「读」缓存会**丢字段**。
+   * ⇒ 本端点继续用自己的取数（**响应逐字节不变**），但把拿到的 `balance`
+   * **写回**缓存 —— 于是聚合折算能命中面板刚查过的那一条。
+   *
+   * ⚠️ 省略时本端点行为与升级前**逐字节相同**（未接线 = 无回写）。
+   */
+  writeBalance?: (accountId: string, balance: CreditBalance) => void
+  /**
+   * ★ **共享余额读数缓存**的**读**出口（2026-10-16，issue IKMCOO 缺陷 1 + 用户要求）。
+   *
+   * ## 为什么需要它（与上面 `writeBalance` 互补）
+   *
+   * `writeBalance` 只让**别的消费者**命中本端点的读数；本端点自己**每次调用
+   * 仍逐账号打上游**。而本端点有**多个调用方**（面板渲染、用量徽标的分钟级
+   * 轮询——见 `usage.badge` 内部直接调 `credits.balances`），于是同一个账号在
+   * 一分钟里被查 N 次：上游抖动时一失败就整批拖住，用户看到「面板加载很久」。
+   *
+   * ⇒ 本钩子让端点**先吃共享读数**（含陈旧兼顶），命中即零网络请求。
+   *
+   * ## ⚠️ 形状约束与 `writeBalance` 同源（端点响应有 `extra` 等额外字段）
+   *
+   * 本钩子返回的是**折叠后的** `CreditBalance`（缓存里那份），**不含** `extra`
+   * ⇒ 命中时**不得**同时回传 `extra`，否则那是编造。
+   *
+   * @param accountId - 账号池条目 id。
+   * @param force - `true` 时跳过缓存（含兼顶），强制回源 —— 面板「刷新」按钮。
+   * @returns 读数（成功/兼顶旧值都可能）；`undefined` ⇒ **本次没有可用的缓存读数**，
+   *   调用方**照常发请求**（折叠的可用性不得依赖缓存是否接线）。
+   */
+  readCachedBalance?: (
+    accountId: string,
+    options: { force?: boolean },
+  ) => Promise<{ balance: CreditBalance; stale: boolean; at: number; error?: string } | undefined>
+  /**
+   * 载荷里的 `force`（面板「刷新积分」按钮）。
+   *
+   * ⚠️ **必须透传给 {@link CreditsEndpointDeps.readCachedBalance}**（审计 P1-1）：
+   *   不传 ⇒ 「刷新」退化成「再读一次缓存」，且在兼顶场景下**看起来成功**
+   *   （返回旧值 + 一句「本次查询失败」），比报错更误导。
+   */
+  force?: boolean
+  /**
    * 领取前是否先查一次签到状态（默认 `true`）。
    *
    * CodeBuddy 系拆成「查状态 + 领取」两个独立端点，先查可以省掉一次无效的
@@ -878,29 +941,55 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
     let balance: CreditBalance | null = null
     let error: string | undefined
     let extra: RpcCreditsBalanceExtra | undefined
-    try {
-      const resolved = await deps.resolve(credentialRef(entry.credentialRef))
-      if (resolved === undefined) {
-        error = '凭据未配置'
-      } else {
-        const credential = JSON.parse(resolved.value) as TCredential
-        if (fetchDetailed !== undefined) {
-          // 带原因的查询：实现自己决定「非积分账户」等业务状态的文案。
-          const detailed = await fetchDetailed(credential, product)
-          balance = detailed.balance
-          error = detailed.error
-          extra = detailed.extra
-          if (balance === null && error === undefined) error = '余额查询失败'
-        } else {
-          balance = await fetchBalance(credential, product)
-          // 查询函数以 null 表示"查不到"（网络/业务码异常），与"余额为 0"不同
-          if (balance === null) error = '余额查询失败'
+    /**
+     * ★ 先吃共享读数（2026-10-16）：命中即**零网络请求**。
+     *
+     * ⚠️ **必须排在解析凭据之前**：缓存命中时我们压根不需要凭据 ——
+     * 而「凭据读不到」正是最该显示旧值的那种失败（凭据可能被并发续期覆盖）。
+     * ⚠️ 命中时**不设 `extra`**（缓存里那份没有该字段，见 `readCachedBalance` 注释）。
+     * ⚠️ 兼顶读数（`stale: true`）**照样回传**，并带上 `error` 让 UI 标注
+     *    「本次查询失败，显示的是 HH:MM 的数据」—— 这正是用户 2026-10-16 的要求：
+     *    拿不到新数据就读旧数据，而不是直接返回错误。
+     */
+    if (deps.readCachedBalance !== undefined && entry.id !== undefined) {
+      // ⚠️⚠️ **`force` 必须透传下去**（2026-10-16 审计 P1-1 实测确认的回归）：
+      //   这里原写死 `{}` ⇒ `readOptions.force` 恒 `undefined` ⇒ 端点虽然读了
+      //   `payload.force`，但**这一腿永远传不到** ⇒ 面板「刷新积分」按钮在
+      //   120 秒 TTL 内点了等于没点，而按钮 title 写着「点此可刷新」—— 假的。
+      //   ⇒ 载荷的 `force` 经 `collectCreditBalances` 的 deps 一路透到这里。
+      const cached = await deps.readCachedBalance(entry.id, { force: deps.force === true })
+      if (cached !== undefined) {
+        balance = cached.balance
+        if (cached.stale) {
+          error = `本次查询失败，显示的是 ${new Date(cached.at).toLocaleString('zh-CN')} 的数据（${cached.error ?? '上游不可达'}）`
         }
       }
-    } catch (caught) {
-      deps.warn?.(`[jet-hub] credits.balances 账号 ${entry.id} 失败: ${String(caught)}`)
-      error = caught instanceof Error ? caught.message : String(caught)
-      balance = null
+    }
+    if (balance === null) {
+      try {
+        const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined) {
+          error = '凭据未配置'
+        } else {
+          const credential = JSON.parse(resolved.value) as TCredential
+          if (fetchDetailed !== undefined) {
+            // 带原因的查询：实现自己决定「非积分账户」等业务状态的文案。
+            const detailed = await fetchDetailed(credential, product)
+            balance = detailed.balance
+            error = detailed.error
+            extra = detailed.extra
+            if (balance === null && error === undefined) error = '余额查询失败'
+          } else {
+            balance = await fetchBalance(credential, product)
+            // 查询函数以 null 表示"查不到"（网络/业务码异常），与"余额为 0"不同
+            if (balance === null) error = '余额查询失败'
+          }
+        }
+      } catch (caught) {
+        deps.warn?.(`[jet-hub] credits.balances 账号 ${entry.id} 失败: ${String(caught)}`)
+        error = caught instanceof Error ? caught.message : String(caught)
+        balance = null
+      }
     }
     results.push({
       accountId: entry.id,
@@ -909,6 +998,11 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
       ...error === undefined ? {} : { error },
       ...extra === undefined ? {} : { extra },
     })
+    // ⚠️ **回写共享读数**（规格 §5.7）：只写**成功**的余额 —— 于是聚合折算能命中
+    //    面板刚查过的那一条（同一个 `(provider, accountId)` 键）。
+    //    ⚠️ 失败**不写**：失败是瞬时的，写进去会让折算侧把「刚失败过一次」当结论
+    //    （`balance-cache.ts` 的 `write` 也自带这道守卫，两处一致）。
+    if (balance !== null) deps.writeBalance?.(entry.id, balance)
   }
   return results
 }
@@ -1073,6 +1167,16 @@ export interface JetHubAuths {
   readonly loomy: LoomyAuth
   readonly raccoon: RaccoonAuth
   readonly minimax: MinimaxAuth
+  /**
+   * MiniMax Code **国际版**（key 是 provider id `minimaxintl`）。
+   *
+   * ⚠️ 与 `minimax` **共用同一个 `MinimaxAuth` 类**（两站只差产品配置），故这里
+   * 的类型相同、只是**另一个实例** —— 与 `qoder` / `qodercn` 同型。
+   * 两站账号不互通、凭据 ref 前缀不同（`MINIMAX_*` / `MINIMAXINTL_*`），
+   * 若这里的**键与值接错**，症状是「国际站账号的续期去刷了国内站凭据」，
+   * 而按 id 查表（`authOf`）会把国际站账号分派到**国内站实例**上。
+   */
+  readonly minimaxintl: MinimaxAuth
   readonly zcode: ZcodeAuth
   readonly gemini: GeminiAuth
   /**
@@ -1168,24 +1272,34 @@ export interface ModelCatalogSource {
    * ⚠️ 必须是**只读且零余额查询**的（规格 §8.3）：面板挂载时会调它。
    * 其余 14 家不实现本方法，故这里声明为可选（结构化类型，不影响它们）。
    */
-  describeCatalog?(force?: boolean, signal?: AbortSignal): Promise<Array<{
-    canonicalId: string
-    name: string
-    candidates: Array<{
-      provider: string
-      realId: string
-      realName: string
-      price: number
-      viaPatch: boolean
-      rejected: boolean
+  describeCatalog?(force?: boolean, signal?: AbortSignal): Promise<{
+    models: Array<{
+      canonicalId: string
+      name: string
+      candidates: Array<{
+        provider: string
+        realId: string
+        realName: string
+        price: number
+        viaPatch: boolean
+        rejected: boolean
+        /** 三态门控（宿主判定的**权威**结果，客户端只渲染）。 */
+        state: 'allowed' | 'rejected' | 'default-rejected'
+        /** 该渠道是否已接入临期折算（客户端据此决定「关掉时写哪张表」）。 */
+        expiryWired: boolean
+      }>
+      /** 该模型的**手工顺序**（宿主已按当前候选集过滤）。 */
+      order: string[]
     }>
-  }>>
+    orderMode: 'expiry' | 'manual'
+  }>
   /**
    * 清空选型缓存（**可选** —— 只有聚合适配器实现它）。
    *
    * ⚠️ 改了拒绝表之后调它可立即释放内存。但**正确性不依赖它**：
    * 聚合适配器的缓存键含拒绝表指纹，故改了表就自动不命中旧条目
-   *（见 `AggregateAdapter.rejectionFingerprint`）。
+   *（见 `AggregateAdapter.routingFingerprint` —— 2026-10-15 起为四项：拒绝表 + 白名单
+   *  + 手工顺序表 + 排序模式）。
    */
   clearChoiceCache?(): void
   /**
@@ -1239,8 +1353,10 @@ export interface ModelCatalogSource {
    *
    * ⚠️ 这是**唯一**会做余额探测的面板方法，**只在用户显式点「按临期排序」时**调用
    *（`describeCatalog` 的零查询契约不受影响，见那里的注释）。
+   *
+   * @param force - `true` 绕过探针的 60 秒折算缓存（面板每 5 分钟自动重探 / 手动点击时用）。
    */
-  describeExpiryOrder?(signal?: AbortSignal): Promise<Record<string, number>>
+  describeExpiryOrder?(signal?: AbortSignal, force?: boolean): Promise<Record<string, number>>
   /**
    * auto 的**实际转发历史**与选型入口（**可选** —— 只有 `jet-hub-auto` 实现它）。
    *
@@ -1636,7 +1752,10 @@ function registerJetHubEndpoints(
   const {
     codearts, buddy, workbuddy, lobsterai, qoder,
     qodercn: qoderCn,
-    trae, cline, loomy, raccoon, minimax, zcode, gemini, accio,
+    trae, cline, loomy, raccoon, minimax,
+    // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
+    minimaxintl,
+    zcode, gemini, accio,
   } = auths
   /**
    * 积分能力表。
@@ -1728,6 +1847,33 @@ function registerJetHubEndpoints(
   }
 
   /**
+   * MiniMax Code **同族**成员：中国版与国际版共用同一组 RPC 实现，只换
+   * `product` 与 `auth` 实例。
+   *
+   * ⚠️ 与 `qoderFamily` **同因**（见上方注释）：本文件里 MiniMax 相关分支有
+   * 三处（`account.create` / 逐家积分表 / 逐家续期表），平行 case 越多、
+   * 「漏接一处」的概率越高。收成一个表，加第三个站点只改这一处。
+   *
+   * ⚠️ **为什么不是「一个 provider 加一个站点参数」**：两站账号不互通，
+   * 且**凭据 ref 前缀与 API 主机都不同** ⇒ 是两个 provider（理由见
+   * `src/minimax-product.ts` 文件头的双站点对照表）。
+   */
+  interface MinimaxFamilyMember {
+    readonly product: MinimaxProduct
+    readonly auth: MinimaxAuth
+  }
+  const minimaxFamily: readonly MinimaxFamilyMember[] = [
+    { product: MINIMAX, auth: minimax },
+    { product: MINIMAX_INTL, auth: minimaxintl },
+  ]
+  /** 取同族成员；不存在时抛错（调用方须先判定，理由同 `requireQoderFamily`）。 */
+  const requireMinimaxFamily = (provider: string): MinimaxFamilyMember => {
+    const member = minimaxFamily.find((item) => item.product.id === provider)
+    if (member === undefined) throw new Error(`Unknown MiniMax family provider: ${provider}`)
+    return member
+  }
+
+  /**
    * **真正支持按需续期**的 provider 集合（有 refresh 端点的）。
    *
    * ⚠️ 这是「跳过」与「报错」的分界线，两者的区别是**本质的**：
@@ -1768,6 +1914,12 @@ function registerJetHubEndpoints(
     CLINE.id,
     RACCOON.id,
     MINIMAX.id,
+    // ⚠️ minimaxintl（MiniMax Code 国际版，2026-10-15）：与 `minimax` 共用同一个
+    //    auth 类，**有**真实 refresh 端点（`/oauth2/token` 的 refresh_token 授权）
+    //    ⇒ 不属 loomy / zcode 那类「设计上没有 refresh 端点」的豁免。
+    //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
+    //    只需一次 refresh，且**日志零字**。
+    MINIMAX_INTL.id,
     GEMINI.id,
     // ⚠️ officeace（2026-10-13 审计补）：STS 寿命**约 2 小时**，正落在
     // 「睡眠/挂起恢复后到定时器补触发那一轮之间」这个窗口内 ⇒ 漏登记的症状
@@ -2422,8 +2574,15 @@ function registerJetHubEndpoints(
    * 「哪个渠道有窗口」的判断留在装配层，`usage-badge.ts` 因此不认识任何具体渠道。
    */
   const usageBadge = createUsageBadge({
-    collectBalances: (provider) =>
-      handleMethod('credits.balances', { provider }) as Promise<BadgeRpcResult<RpcCreditsBalancesResponse>>,
+    // ⚠️ `accountIds` 原样透传（2026-10-15，规格 §7-8）：徽标只要启用账号的读数。
+    //    ⚠️ **省略时不得传 `undefined` 之外的键**：端点以「键存在与否」区分
+    //    「查全部」与「查空集」—— `accountIds: undefined` 会被 JSON 丢掉，
+    //    故两种写法在这里等价（但显式展开更安全，见下面那行）。
+    collectBalances: (provider, accountIds) =>
+      handleMethod('credits.balances', {
+        provider,
+        ...accountIds === undefined ? {} : { accountIds: [...accountIds] },
+      }) as Promise<BadgeRpcResult<RpcCreditsBalancesResponse>>,
     collectQuota: (provider) =>
       provider === CLINE.id
         ? handleMethod('cline.quota', { provider }) as Promise<BadgeRpcResult<RpcClineQuotaResponse>>
@@ -3028,10 +3187,23 @@ function registerJetHubEndpoints(
           })
 
           return { ok: true, value: { accountId: id, loginUrl: raccoonStarted.loginUrl } }
-        } else if (provider === MINIMAX.id) {
-          // MiniMax Code（中国版）走 **OAuth 设备码 + PKCE**（与 Qoder 同型：
-          // 不起本地监听端口，`startLogin` 立即返回指向 `agent.minimax.cn` 的
-          // `verification_uri_complete`，后台轮询换 token）。
+        } else if (provider === MINIMAX.id || provider === MINIMAX_INTL.id) {
+          /**
+           * MiniMax Code 走 **OAuth 设备码 + PKCE**（与 Qoder 同型：不起本地监听
+           * 端口，`startLogin` 立即返回 `verification_uri_complete`，后台轮询换
+           * token）。
+           *
+           * ## ⚠️ 两个站点合用一个分支（表驱动）
+           *
+           * 国内站（`minimax`）与国际站（`minimaxintl`）**账号不互通、主机不同**，
+           * 但登录流程逐步骤相同（只差 product 配置）⇒ 照 `qoderFamily` 的做法
+           * 收成一张表，**不复制**第二个分支体。
+           * 复制会让「登录成功后要回填哪些字段」「失败要删占位条目」这类约定
+           * 修一处漏一处（本仓库在 workbuddy / qodercn 上各踩过一次）。
+           */
+          // 分支内一律用 `product` / `auth`，**不要**出现 `MINIMAX` 字面量 ——
+          // 否则国际站会拿中国版的域名与凭据 ref 前缀发请求（与上面 Qoder 分支同因）。
+          const { product: minimaxProduct, auth: minimaxAuth } = requireMinimaxFamily(provider)
           //
           // ⚠️ 绝不能在用户授权完成后才返回 loginUrl —— `window.open` 只在
           //    用户手势窗口内有效，那时手势早已过期、弹窗必被拦截。
@@ -3041,7 +3213,7 @@ function registerJetHubEndpoints(
           //    写法照 `RACCOON.id` 分支（那是已验证的形态）。
           await pool.addAccount({
             id,
-            provider: MINIMAX.id,
+            provider: minimaxProduct.id,
             nickname: id,
             enabled: true,
             credentialRef: refName,
@@ -3051,7 +3223,7 @@ function registerJetHubEndpoints(
 
           let minimaxStarted: StartedMinimaxLoginFlow
           try {
-            minimaxStarted = await minimax.startLogin()
+            minimaxStarted = await minimaxAuth.startLogin()
           } catch (error) {
             // 设备码申请失败：删掉占位条目，不留幽灵账号。
             void pool.removeAccount(id).catch(() => {})
@@ -3060,14 +3232,25 @@ function registerJetHubEndpoints(
           }
 
           minimaxStarted.result.then(async (credential) => {
-            const result = await minimax.persistLogin(credential, { refName })
+            const result = await minimaxAuth.persistLogin(credential, { refName })
+            /**
+             * 昵称：两站必须可区分（同一面板左右没有，但**账号列表与用量徽标**
+             * 都会显示它，而两站账号可能出现在同一个聚合候选里）。
+             *
+             * ⚠️ **国内站逐字节保持原行为**（`result.accountId` 对真实凭据恒
+             * `undefined` ⇒ 退化为 `id`）：改它会让存量用户的账号名变化。
+             * 国际站是**新增**的，加标记不构成行为回退。
+             */
+            const nickname = result.accountId === undefined
+              ? (provider === MINIMAX_INTL.id ? `MiniMax 国际版 ${id}` : id)
+              : `MiniMax ${result.accountId.slice(0, 8)}`
             await pool.updateAccount(id, {
               // ⚠️ `persistLogin` 的 `accountId` 对真实凭据**恒为 `undefined`** ——
               // MiniMax 的 `access_token` **不是 JWT**（`mmoat_` 前缀、60 字符、
               // 0 个点），故 `decodeJwtSub` 恒不命中、`account_id` 不会被写入。
               // 这是**预期行为**（账号 id 由本层生成），不是缺陷：此时退化为 `id`。
               // 一旦上游改发 JWT，这里会自动用上服务端的 account_id。
-              nickname: result.accountId === undefined ? id : `MiniMax ${result.accountId.slice(0, 8)}`,
+              nickname,
               // ⚠️ **必须用 `minimaxCredentialExpiresAtMs`**（优先 `expires_at`，
               // 它由 OAuth 响应的 `expires_in` 自算）—— 不能指望从 token 解 JWT，
               // 那样会得到 `undefined`，UI 永远显示「未知」。
@@ -3076,7 +3259,7 @@ function registerJetHubEndpoints(
               refreshable: isMinimaxRefreshable(credential),
             })
           }).catch((error: unknown) => {
-            ctx.logger.warn(`[jet-hub] background ${MINIMAX.id} login failed for ${id}: ${String(error)}`)
+            ctx.logger.warn(`[jet-hub] background ${minimaxProduct.id} login failed for ${id}: ${String(error)}`)
             // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
             void failLogin(id, error)
           })
@@ -4227,7 +4410,36 @@ function registerJetHubEndpoints(
       //   （「顺序查询避免并发触发风控」「单账号失败不中断」都是实测结论）。
       case 'credits.balances': {
         const req = payload as RpcCreditsBalancesRequest
-        const accounts = await pool.listAccounts(req.provider)
+        /**
+         * ★ 共享读数槽要用的**凭据**（2026-10-16）。
+         *
+         * ⚠️ 为什么不能直接用 `accounts` 里现成的：那些条目只有 `credentialRef`，
+         *    而 `fetchBalanceReading` 需要**已解析**的凭据（`JSON.parse` 之后）。
+         * ⚠️ **解析失败返回 `undefined`**：缓存命中时压根不发请求（不需要凭据），
+         *    未命中时 `fetchBalanceReading` 会抛「凭据未提供」⇒ 被记成失败读数 ⇒
+         *    面板照常显示「凭据未配置」的错误路径。**不会**把凭据问题伪装成余额。
+         */
+        const resolveCredentialForCache = async (accountId: string): Promise<unknown> => {
+          const entry = accounts.find((a) => a.id === accountId)
+          if (entry === undefined) return undefined
+          const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+          if (resolved === undefined) return undefined
+          try {
+            return JSON.parse(resolved.value)
+          } catch {
+            return undefined
+          }
+        }
+        // ⚠️ 载荷里的 `accountIds` 是**可选裁剪**（用量徽标只要启用账号，见 types.ts
+        //    的那段注释）。⚠️ 必须在**自愈之前**读它、但只用于**余额查询**那一段：
+        //    自愈仍对**全部**账号跑（AGENTS.md：「续期不得按 enabled 过滤」）。
+        const requestedIds = Array.isArray(req?.accountIds)
+          ? new Set(req.accountIds.filter((id): id is string => typeof id === 'string'))
+          : undefined
+        const allAccounts = await pool.listAccounts(req.provider)
+        const accounts = requestedIds === undefined
+          ? allAccounts
+          : allAccounts.filter((entry) => requestedIds.has(entry.id))
         // ⚠⚠ **先按需自愈、再查余额**（Gitee issue IKKHL5 建议 C）。
         //
         // 缺陷：系统睡眠/挂起数小时后恢复，**宿主进程全程没退出** ⇒
@@ -4244,7 +4456,15 @@ function registerJetHubEndpoints(
         //
         // ⚠️ **顺序执行**且失败不上抛（见该函数）：积分查询是逐账号顺序
         // 查询（避免并发触发风控），这里保持同一形状。
-        await healExpiredAccounts(accounts)
+        //
+        // ⚠️⚠️ **自愈用 `allAccounts`（全部账号），不是被 `accountIds` 裁剪过的
+        //    `accounts`**（2026-10-15 加裁剪时同步加这条注释）：
+        //    本仓库有成文铁律「**续期不得按 `enabled` 过滤**」—— 停用只影响自动选号，
+        //    与「凭据是否需要保持新鲜」无关。用量徽标为了省几个余额请求而传
+        //    `accountIds`（只含启用账号）时，**停用账号的凭据仍必须被续期** ——
+        //    否则它们会在停用期间一路放到失效，用户重新启用后拿到死凭据、
+        //    只能重新登录（真实缺陷，见 AGENTS.md 的那一节）。
+        await healExpiredAccounts(allAccounts)
 
         // ⚠️ **两个形态与骨架不匹配的特例，先于查表短路**：
         //    - `opencode`：余额是**本地派生的通道可用性**（读账号池的
@@ -4461,6 +4681,58 @@ function registerJetHubEndpoints(
           ...impl.fetchBalance === undefined
             ? {}
             : { fetchBalance: (credential) => impl.fetchBalance!(credential, callContext) },
+          // ⚠️ 回写共享读数（规格 §5.7）：`provider` 由本端点提供 —— 
+          //    `collectCreditBalances` 自己不知道 provider（它的入参是账号数组）。
+          ...balanceCacheOf() === undefined
+            ? {}
+            : {
+                writeBalance: (accountId, balance) =>
+                  balanceCacheOf()!.write(req.provider, accountId, { at: Date.now(), value: balance }),
+                /**
+                 * ★ 载荷的 `force`（面板「刷新积分」按钮，2026-10-16 审计 P1-1）。
+                 *
+                 * ⚠️ 类型已补进 `RpcCreditsBalancesRequest`（`src/types.ts`），
+                 *   故这里**按类型读**而不是 `(payload as {force?: unknown})` 强转 ——
+                 *   强转会让「客户端根本没传」这件事在编译期完全看不出来。
+                 */
+                force: req.force === true,
+                /**
+                 * ★ **先吃共享读数**（2026-10-16，issue IKMCOO 缺陷 1 + 用户
+                 * 「打开面板要很久，加载拿不到新数据应该读旧数据」）。
+                 *
+                 * ⚠️ `readStale` 内部会**真的取数**（命中则零网络），故此处是
+                 *    「读一次共享读数（含兼顶）」，不是「只 peek」。
+                 * ⚠️ **`force` 必须透传**：面板「刷新」按钮要绕过缓存（含兼顶）
+                 *    强制回源 —— 漏传会让「刷新」退化成「读旧值」，用户点了没反应。
+                 *    ⚠️ 该载荷此前**没有** `force` 字段（只有 `accountIds`），
+                 *    这里按既有可选字段的同款读法解析，不改响应形状。
+                 */
+                readCachedBalance: async (accountId, readOptions) => {
+                  // ⚠️ 判据**只用** `readOptions.force`（2026-10-16 审计 P1-1）：
+                  //   原先这里 `|| payload.force === true` 兜底，看起来两条腿都通，
+                  //   但上一行 `collectCreditBalances` 传的是**硬编码 `{}`**
+                  //   ⇒ `readOptions.force` 恒 undefined ⇒ 那一腿恒假。
+                  //   现在 `collectCreditBalances` 会透传 `deps.force`（见其定义），
+                  //   而 `deps.force` 由下方 `force:` 注入 ⇒ 只有**一条**来源，
+                  //   避免「两处判 force」再次漂移。
+                  const forced = readOptions.force === true
+                  const reading = await balanceCacheOf()!.readStale(
+                    req.provider,
+                    accountId,
+                    // ⚠️ 槽里必须带凭据：`fetchBalanceReading` 靠它发请求
+                    //    （`entry.credential === undefined` ⇒ 直接抛「凭据未提供」）。
+                    { credential: await resolveCredentialForCache(accountId) },
+                    { force: forced },
+                  )
+                  if (reading.value === undefined) return undefined
+                  return {
+                    balance: reading.value as CreditBalance,
+                    stale: reading.stale,
+                    at: reading.at,
+                    ...reading.error === undefined ? {} : { error: reading.error },
+                  }
+                },
+              },
           warn: (msg) => ctx.logger?.warn?.(msg),
         })
         // ⚠️ 只有**按到期时间分桶**的渠道才回传窗口天数（判据是 registry 的
@@ -5282,8 +5554,11 @@ function registerJetHubEndpoints(
         //    缓存」，用户在渠道侧改了模型后点刷新看不到变化）。
         //    只有显式刷新才绕缓存；其余调用方（含 `listModels`）继续走缓存。
         const force = (payload as { force?: unknown } | undefined)?.force === true
-        const models = await source.describeCatalog(force, _signal)
-        const value: RpcAggregateCatalogResponse = { models }
+        const catalog = await source.describeCatalog(force, _signal)
+        // ⚠️ `orderMode` 与每个模型的 `order` **由 `describeCatalog` 从池里读**（不是这里读）：
+        //    两处都读会让「面板显示的排序方式」与「实际用的」在某个时刻分叉。
+        //    客户端**不得**重算这两项（红线：同一语义两套判据）。
+        const value: RpcAggregateCatalogResponse = catalog
         return { ok: true, value }
       }
 
@@ -5307,6 +5582,9 @@ function registerJetHubEndpoints(
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
         const value: RpcAggregateRejectionsResponse = {
           aggregateRejections: pool.listAggregateRejections(),
+          // ⚠️ 必须同时回白名单：面板的逐条开关要按三态显示，只回拒绝表会让白名单条目
+          //    在下一次点击前一直是陈旧值（与 `rejectionsFromCatalog()` 的回填机制同款）。
+          aggregateAllowed: pool.listAggregateAllowed(),
         }
         return { ok: true, value }
       }
@@ -5332,7 +5610,109 @@ function registerJetHubEndpoints(
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
         const value: RpcAggregateRejectionsResponse = {
           aggregateRejections: pool.listAggregateRejections(),
+          aggregateAllowed: pool.listAggregateAllowed(),
         }
+        return { ok: true, value }
+      }
+
+      /**
+       * 手工「打开 / 关闭」某条候选是否参与轮换（用户 2026-10-15）。
+       *
+       * ⚠️ 与 `aggregate.setRejected` 是**同一枚开关的两个方向**，但落在**两张不同的表**上
+       *（未接入临期折算的候选归白名单、已接入的归拒绝表 —— 见 `AggregateAllowedMap` 的说明）：
+       * 故两个 case 的体例、日志、`clearChoiceCache` 必须**逐条对齐** ——
+       * 漏掉任一处的 `clearChoiceCache`/指纹会让改动最多 60 秒后才生效（静默）。
+       *
+       * ⚠️ **本端点不做两表归一**（用户 2026-10-15 的修正）：写白名单**不得**顺手清拒绝表。
+       */
+      case 'aggregate.setAllowed': {
+        const req = payload as RpcAggregateSetAllowedRequest
+        if (typeof req?.canonicalId !== 'string' || req.canonicalId.length === 0
+          || typeof req.provider !== 'string' || req.provider.length === 0
+          || typeof req.realId !== 'string' || req.realId.length === 0) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'canonicalId / provider / realId 必填' },
+          }
+        }
+        await pool.setAggregateAllowed(req.canonicalId, req.provider, req.realId, req.allowed === true)
+        ctx.logger.info(
+          `[jet-hub] 聚合：${req.allowed === true ? '手工打开' : '取消手工打开'} `
+          + `${req.canonicalId} 的候选 ${req.provider}/${req.realId}`,
+        )
+        modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        const value: RpcAggregateRejectionsResponse = {
+          aggregateRejections: pool.listAggregateRejections(),
+          aggregateAllowed: pool.listAggregateAllowed(),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 写入某虚拟模型的**手工排序**（面板拖动结束时调用，整体提交）。
+       *
+       * ⚠️ `order` 必须是**字符串数组**：传字符串会被逐字符处理（`String(undefined)` 的同类形态，
+       *    本仓库有专门判据）。**不得**接受畸形后静默清空顺序 —— 那等于用户拖完一次顺序就没了
+       *   （比报错更糟）。
+       * ⚠️ 返回的是**服务端过滤去重后**的权威数组（不是入参回声）⇒ 客户端据此校正本地状态。
+       */
+      case 'aggregate.setOrder': {
+        const req = payload as RpcAggregateSetOrderRequest
+        if (typeof req?.canonicalId !== 'string' || req.canonicalId.length === 0
+          || !Array.isArray(req.order)
+          || req.order.some((entry) => typeof entry !== 'string')) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'canonicalId 必填且 order 必须是字符串数组' },
+          }
+        }
+        const order = await pool.setAggregateOrder(req.canonicalId, req.order)
+        ctx.logger.info(`[jet-hub] 聚合：写入 ${req.canonicalId} 的手工顺序（${order.length} 条）`)
+        // ⚠️ 顺序**参与**候选排序 ⇒ 顺序变了缓存里的候选序就失效了（指纹也含它，双保险）。
+        modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        const value: RpcAggregateSetOrderResponse = { canonicalId: req.canonicalId, order }
+        return { ok: true, value }
+      }
+
+      /**
+       * 切换排序模式（顶部 toggle：按临期 / 按手工）。
+       *
+       * ⚠️ 只接受两个字面量：畸形值若被静默接受，面板会显示「按手工」而宿主按临期路由
+       *（显示与行为分叉）。
+       */
+      case 'aggregate.setOrderMode': {
+        const req = payload as RpcAggregateSetOrderModeRequest
+        if (req?.mode !== 'expiry' && req?.mode !== 'manual') {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: "mode 必须是 'expiry' 或 'manual'" },
+          }
+        }
+        await pool.setAggregateOrderMode(req.mode)
+        ctx.logger.info(`[jet-hub] 聚合：排序模式切换为「${req.mode === 'manual' ? '按手工' : '按临期'}」`)
+        modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        const value: RpcAggregateSetOrderModeResponse = { orderMode: pool.listAggregateOrderMode() }
+        return { ok: true, value }
+      }
+
+      /**
+       * 一键「拒绝非临期」：把所有**未接入临期折算**渠道上的候选恢复成
+       * 「默认不参与轮换」的初始态（用户后续仍可逐条手工打开）。
+       *
+       * ⚠️⚠️ `keepProviders` 必须从 `WIRED_EXPIRY_PROVIDERS` **取引用**，不得在这里写死一份副本：
+       *    写死会随「新接入一个渠道」静默漂移 —— 那一键按钮会开始清掉**已接入**渠道的白名单，
+       *    而它们的白名单是**有意义**的（用户可能手工打开了某条已接入候选）。
+       *
+       * ⚠️ 账号池**不该知道**「接入折算」是什么语义：它只收到「保留哪些 provider」的清单
+       *   ⇒ 依赖方向仍是「上层知道下层」。这样「谁是未接入渠道」的权威只有那一个常量。
+       *
+       * ⚠️ `cleared === 0` 也回 `ok: true`：幂等点击**不是错误**（面板据计数决定文案）。
+       */
+      case 'aggregate.rejectNonExpiring': {
+        const { cleared, aggregateAllowed } = await pool.clearAggregateAllowedExcept(WIRED_EXPIRY_PROVIDERS)
+        ctx.logger.info(`[jet-hub] 聚合：一键拒绝非临期，恢复 ${cleared} 条候选为默认不参与`)
+        modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        const value: RpcAggregateRejectNonExpiringResponse = { cleared, aggregateAllowed }
         return { ok: true, value }
       }
 
@@ -5372,12 +5752,20 @@ function registerJetHubEndpoints(
        *
        * ⚠️ 未注册时回**空表**而不是报错：面板据此保持字母序并提示，
        * 不影响其余功能（与 `aggregate.activeProvider` 的安静降级同取向）。
+       *
+       * ⚠️ `force`（可选，默认 false，2026-10-15 加）：`true` 时绕过**探针自己的**
+       * 折算缓存（{@link EXPIRY_CACHE_TTL_MS} 60 秒）。面板的按临期模式每 5 分钟
+       * 自动重探一次、用户手动点也算重探 ⇒ 那两种情形都该拿**新鲜**值，
+       * 否则「每 5 分钟刷新」实际是「每 5 分钟读一次 60 秒缓存」（近似无差别，
+       * 但用户点「刷新」时期待的是真重查）。
+       * 只有显式重探才传 `true`；进入模式时那次传 `false`（省钱）。
        */
       case 'aggregate.expiryOrder': {
         const source = modelAdapters?.['aggregate']
+        const force = (payload as { force?: unknown } | undefined)?.force === true
         const order = source?.describeExpiryOrder === undefined
           ? {}
-          : await source.describeExpiryOrder(_signal)
+          : await source.describeExpiryOrder(_signal, force)
         const value: RpcAggregateExpiryOrderResponse = { order }
         return { ok: true, value }
       }

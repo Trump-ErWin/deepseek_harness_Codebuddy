@@ -65,6 +65,10 @@ const STYLES = `
 /* MiniMax Code（中国版）：官方 logo **自带浅蓝底** #7DC6FF，白底容器中显示清晰。
    ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止）。 */
 .dim-jh-providerIcon.minimax { background: white; }
+/* MiniMax Code（国际版）：与上面中国版**共用同一个 logo**，故同样给白底容器。
+   ⚠️ 每个 logoClass 都必须各自声明背景（本文件没有兜底规则），漏了会让该行容器
+      没有底色、与其它行视觉不一致 —— 与 officeace 那次「注释失实且无守卫」同型。 */
+.dim-jh-providerIcon.minimaxintl { background: white; }
 /*
  * ZCode（智谱）：图标自带深色圆角底 + 青色 Z，本身即完整图形，
  * 故容器保持透明（加白底反而会出现一圈突兀的方块）。
@@ -1010,9 +1014,10 @@ const STYLES = `
 .dim-jh-badgeAutoClose:hover { border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-brand-primary); }
 .dim-jh-badgeAutoStatusHead { font-size: 10.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
 .dim-jh-badgeAutoChannels { display: flex; flex-wrap: wrap; gap: 2px 5px; margin-top: 3px; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-label-tertiary); }
-/* 分隔符跟在条目**后面**（不是用 ::before 加在下一个前面）：9 个渠道在 280px 里必然
+/* 分隔符跟在条目**后面**（不是用 ::before 加在下一个前面）：十余个渠道在 280px 里必然
    换行，::before 的写法会让换行处那一行**以孤立的点开头**（预览里实测到了）；
-   ::after 则表现为行尾的「·」，与行内文本的分隔习惯一致。 */
+   ::after 则表现为行尾的「·」，与行内文本的分隔习惯一致。
+   ⚠️ 刻意不写死渠道数：原文写「9 个」，加 minimaxintl 后已是 10 个（2026-10-16 审计）。 */
 .dim-jh-badgeAutoChannel:not(:last-child)::after { content: " ·"; opacity: .6; }
 /* 偏好：分段控件（未选中透明、选中浮起），比三个独立胶囊更紧凑整齐 */
 .dim-jh-badgePref { display: flex; gap: 2px; padding: 2px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 7px; background: var(--dsw-alias-bg-layer-2); }
@@ -1086,10 +1091,28 @@ const STYLES = `
 .dim-jh-aggTitle { margin: 0; font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary, #1a1a1a); }
 .dim-jh-aggIntroLine { margin: 0; font-size: 12px; line-height: 1.7; color: var(--dsw-alias-label-secondary); }
 .dim-jh-aggIntroWarn { margin: 0; font-size: 12px; line-height: 1.7; color: var(--dsw-alias-label-tertiary); }
-.dim-jh-aggToolbar { display: flex; align-items: center; gap: 10px; }
-.dim-jh-aggCount { font-size: 12px; color: var(--dsw-alias-label-secondary); }
-.dim-jh-aggRefresh { padding: 3px 10px; border: 1px solid var(--dsw-alias-border-secondary); border-radius: 6px; background: none; font: inherit; font-size: 12px; color: var(--dsw-alias-label-primary); cursor: pointer; }
-.dim-jh-aggRefresh:disabled { opacity: 0.6; cursor: default; }
+/* ⚠️⚠️ 工具行必须**允许换行**（真实缺陷，用户 2026-10-16 验收截图）：
+   原本是 display: flex 且默认 nowrap ⇒ 面板一窄，「排序：按临期」/「拒绝非临期」
+   这些多字按钮被压到只剩几个字符宽，**文字竖排**逐字折行（截图里正是那样）。
+   ⇒ flex-wrap: wrap 让它们换行，而不是被压扁。
+   ⚠️ 本文件是模板字符串：注释里**绝不能出现反引号**（会提前闭合模板，报错却指向
+   注释那一行，看起来像 CSS 写错了 —— AGENTS.md 有专条记录，我这次又踩了一次）。 */
+.dim-jh-aggToolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+/* ⚠️ 计数**独占一行**（用户 2026-10-16：「43 个聚合模型应该显示在按钮下面」）。
+   两道措施：
+   ① HTML 里它排在全部按钮**之后**（见 jet-hub.js 的工具行注释）；
+   ② 这里给 flex-basis: 100% —— 强制换行到下一行，而不是「面板够宽时又跑到按钮右侧」。
+      用户要的是**位置**（在按钮下面），不是「窄的时候才换行」。
+   order: 1 是纵深防御：即使将来有人把它的 HTML 顺序挪回前面，它仍排在按钮之后。 */
+.dim-jh-aggCount { flex-basis: 100%; order: 1; font-size: 12px; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
+/* ⚠️⚠️ 工具栏的按钮**不再有自己的样式类**（2026-10-16，用户第二次验收）。
+   原先这里是自造的 .dim-jh-aggRefresh / .dim-jh-aggBtn（圆角 6px、无背景色、
+   primary 只是描边变蓝），与全站标准按钮 .dim-jh-btn（圆角 8px、有底色、
+   hover 变蓝、primary = 实心蓝底白字）**形态不一致** ⇒ 用户看到的是
+   「拒绝非临期和切换排序为什么还是没有按按钮样式（图2）显示」。
+   ⇒ 聚合工具栏与「保存顺序」现已统一用 .dim-jh-btn（那里自带 nowrap 与 :disabled），
+     本处两个自造类**已删除**（零使用者的死样式是本仓库红线）。
+   ⚠️ 唯一保留的自定义：工具行本身的 .dim-jh-aggToolbar（flex-wrap）与计数样式。 */
 .dim-jh-aggNotice { padding: 6px 10px; border-radius: 6px; font-size: 12px; color: var(--dsw-alias-label-error, #c0392b); background: var(--dsw-alias-bg-error, rgba(192, 57, 43, 0.08)); }
 .dim-jh-aggEmpty { padding: 12px; font-size: 12px; line-height: 1.7; color: var(--dsw-alias-label-secondary); }
 /* ⚠️ 原先这里还有 .dim-jh-aggGroup / .dim-jh-aggGroupTitle（厂商分组标题），
@@ -1104,10 +1127,14 @@ const STYLES = `
 .dim-jh-aggModelHead { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 10px; border: 0; background: none; font: inherit; font-size: 13px; text-align: left; color: var(--dsw-alias-label-primary); cursor: pointer; }
 .dim-jh-aggModelHead:hover { background: var(--dsw-alias-bg-secondary, rgba(0, 0, 0, 0.03)); }
 .dim-jh-aggModelName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dim-jh-aggModelMeta { font-size: 11px; color: var(--dsw-alias-label-tertiary); }
-/* 「候选全部被拒」提示（规格 §5.2 要求显式提示，避免用户以为模型坏了）。
-   ⚠️ 用 warning 色与上面那格的中性灰区分开（它是**需要注意**的状态，不是说明文字）。 */
-.dim-jh-aggAllRejected { flex: none; padding: 1px 6px; border-radius: 4px; font-size: 11px; color: var(--dsw-alias-state-warn-primary, #b45309); background: var(--dsw-alias-bg-warn, rgba(180, 83, 9, 0.10)); }
+/* 「候选全部未参与轮换」提示（规格 §5.2 要求显式提示，避免用户以为模型坏了）。
+   ⚠️ 用 warning 色与说明文字区分开（它是**需要注意**的状态）。
+   ⚠️⚠️ 2026-10-16（用户验收：「占太宽了把模型名字都挤没了」）三道防线：
+   - 文案已缩到 ≤5 个汉字（解释性文字移进 title）；
+   - white-space: nowrap 让帽子**不换行**（换行会变两行高、且吃掉模型名宽度）；
+   - max-width: 40% + 省略号，帽子不得无限撑开。
+   模型名那一格是 flex: 1 / min-width: 0，故剩余宽度全归它（超长才省略号）。 */
+.dim-jh-aggAllRejected { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 6px; border-radius: 4px; font-size: 11px; color: var(--dsw-alias-state-warn-primary, #b45309); background: var(--dsw-alias-bg-warn, rgba(180, 83, 9, 0.10)); }
 .dim-jh-aggChevron { font-size: 11px; color: var(--dsw-alias-label-tertiary); }
 .dim-jh-aggCandidates { display: flex; flex-direction: column; border-top: 1px solid var(--dsw-alias-border-secondary); }
 .dim-jh-aggCandidate { display: flex; align-items: center; gap: 8px; padding: 5px 10px 5px 20px; font-size: 12px; }
@@ -1119,6 +1146,29 @@ const STYLES = `
 .dim-jh-aggCandidateExpiry { flex: none; font-size: 11px; color: var(--dsw-alias-label-tertiary); }
 .dim-jh-aggToggle { flex: none; padding: 2px 8px; border: 1px solid var(--dsw-alias-border-secondary); border-radius: 5px; background: none; font: inherit; font-size: 11px; color: var(--dsw-alias-link); cursor: pointer; }
 .dim-jh-aggToggleOff { color: var(--dsw-alias-label-tertiary); text-decoration: line-through; }
+/* ⚠️⚠️ 下面三组样式已**删除**（用户 2026-10-16 验收要求，别再写回来）：
+   - .dim-jh-aggSegmented / .dim-jh-aggSeg / .dim-jh-aggSegOn：两段式排序 toggle
+     ⇒ 改成**单个切换按钮**（照「锁定永久积分」的形态，激活态用 data-kind="primary"）。
+     两段在窄面板下各占一列，会把工具行挤成**竖排文字**（同一个验收截图里的现象）。
+   - .dim-jh-aggMove / .dim-jh-aggMove:disabled：上移/下移按钮
+     ⇒ 用户明确要求「我们不应该有上下箭头就是应该鼠标拖动」。
+     ⚠️ 拖动本身在此前是**坏的**（onDragStart 漏了 dataTransfer.setData ⇒
+     浏览器不触发拖拽），所以那时只有箭头能用 —— 修好拖动后才删箭头。
+   - .dim-jh-aggModelMeta：模型头的「N 个渠道 · 按渠道名/按临期」
+     ⇒ 当前排序模式由顶部按钮表达，模型头不再重复（用户要求「可以不用显示」）。
+   拖动相关样式保留：手柄与落点高亮仍是拖拽的**可发现性**信号。
+   ⚠️ 本文件是模板字符串：注释里**绝不能出现反引号**（AGENTS.md 专条记录）。 */
+/* 拖动手柄（只有「按手工」模式下的参与候选才有）。
+   ⚠️ cursor: grab 是主要的可发现性信号（整行可拖时用户不知道能拖）。 */
+.dim-jh-aggDragHandle { flex: none; cursor: grab; color: var(--dsw-alias-label-tertiary); font-size: 12px; user-select: none; }
+.dim-jh-aggDragOver { outline: 1px dashed var(--dsw-alias-border-secondary); outline-offset: -1px; }
+/* 未参与轮换的候选段（手工模式）：与参与段视觉分开，但仍留在同一个模型块里
+   —— 用户要能一眼看到「还有哪些没打开」。 */
+.dim-jh-aggInactiveSection { display: flex; flex-direction: column; border-top: 1px dashed var(--dsw-alias-border-secondary); }
+.dim-jh-aggInactiveTitle { padding: 5px 10px 2px 20px; font-size: 11px; color: var(--dsw-alias-label-tertiary); }
+.dim-jh-aggOrderActions { display: flex; justify-content: flex-end; gap: 6px; padding: 6px 10px; border-top: 1px solid var(--dsw-alias-border-secondary); }
+/* ⚠️ 原先这里还有 .dim-jh-aggBtn（「保存顺序」按钮），已删除 —— 改用全站标准
+   .dim-jh-btn（理由见上面工具栏那段注释）。零使用者的死样式是本仓库红线。 */
 .dim-jh-aggFooter { display: flex; flex-direction: column; gap: 2px; padding-top: 8px; border-top: 1px solid var(--dsw-alias-border-secondary); }
 .dim-jh-aggFooter p { margin: 0; font-size: 11px; line-height: 1.7; color: var(--dsw-alias-label-tertiary); }
 
@@ -1136,11 +1186,22 @@ const STYLES = `
 `
 
 /**
- * 本插件的**包 id** —— 必须与 plugin-src/client/build.mjs 的 loaderId 逐字一致。
+ * 本插件的**包 id** —— 必须等于 package.json 的 name（当前 dsh-providers-hub）。
  *
  * ⚠️ 它同时是宿主 claimStyles / removeOwnedStyles 用的 ownerId
  * （dsh-client-modules 的 stripClientSuffix(registration.id)），
- * 也就是样式标签 data-plugin 的**正确取值**。改名必须两边一起改。
+ * 也就是样式标签 data-plugin 的**正确取值**。
+ *
+ * ⚠️ 本文件被 esbuild 打进 bundle，**运行时读不到 package.json**，故这里是字面量。
+ * 它与包名的一致性由 tests/unit/jet-hub-styles-ownership.spec.ts 对拍锁住
+ * —— 那个用例直接从 package.json 取 name，两边不一致即红。
+ *
+ * ⚠️⚠️ 改名时必须同时改 package.json 的 name：bundle 的注册 id 取自它
+ * （见 build.mjs），而 DSH 按包名物化客户端条目 —— 不一致会让**整个插件加载失败**
+ * （2026-10-15 真实事故，桌面端反复把插件隔离进恢复模式）。
+ *
+ * ⚠️ 上面这段注释**刻意不写反引号**：紧邻其上的 STYLES 是模板字符串，
+ * 注释里出现反引号会提前闭合它（AGENTS.md 明令禁止；本文件已有四个用例在守）。
  */
 const PLUGIN_ID = 'dsh-providers-hub'
 

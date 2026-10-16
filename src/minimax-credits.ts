@@ -30,7 +30,7 @@ import {
   MINIMAX_SIGNIN_STATUS_PATH,
   type MinimaxProduct,
 } from './minimax-product.js'
-import { minimaxHeaders, type MinimaxCredential } from './minimax.js'
+import { minimaxFetchWithRetry, minimaxHeaders, type MinimaxCredential } from './minimax.js'
 import { roundCredits, type CheckinStatus, type ClaimOutcome, type CreditBalance } from './credits.js'
 
 /** 单日状态（asar `SigninDayStatus`）。 */
@@ -286,12 +286,23 @@ async function requestEnvelope(
     // `.get()`，任何「断言某个头没被误设」的检查都会崩（写用例时实测到了）。
     const headers = minimaxHeaders(credential)
     if (init.body !== undefined) headers.set('Content-Type', 'application/json')
-    const response = await fetcher(url, {
-      method: init.method,
-      headers,
-      ...init.body === undefined ? {} : { body: init.body },
-      signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
-    })
+    /**
+     * ⚠️ **带传输级重试**（2026-10-15 真实缺陷：「积分查询及领取失败」）。
+     *
+     * 本机实测环境里的 HTTPS 检查代理约 **50%** 概率打断到本家的请求
+     *（`fetch failed ← SELF_SIGNED_CERT_IN_CHAIN`）——签到端实测 10 次里失败 5 次。
+     *
+     * ⚠️ 重试实现与推理 / 目录路径**共用同一份** `minimaxFetchWithRetry`
+     *（`src/minimax.ts`），本文件不另写判据。
+     */
+    const response = await minimaxFetchWithRetry(
+      () => fetcher(url, {
+        method: init.method,
+        headers,
+        ...init.body === undefined ? {} : { body: init.body },
+        signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
+      }),
+    )
     const text = await response.text()
     let payload: unknown
     try {
