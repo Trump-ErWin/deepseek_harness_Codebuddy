@@ -129,7 +129,8 @@ import {
 } from './credits.js'
 import { CODEBUDDY, productById, type BuddyProduct } from './product.js'
 // ⚠️ CodeBuddy 限时补偿积分（2026-10-16）：一次性活动，**不接自动签到**。
-// 端点只在 `webBase`（www.codebuddy.cn）可达，见该模块头。
+// 端点走 buddy 的 `webBase`（`src/product.ts` 里是 `www.workbuddy.cn`；三个 host
+// 实测均可达，见该模块头）。
 import {
   claimCompensation,
   describeCompensationFailure,
@@ -4859,9 +4860,9 @@ function registerJetHubEndpoints(
       //    **刻意不接进 `credits.claimAll` / auto-checkin**：那会把一次性动作
       //    变成每日自动执行，违反上面的约定（且收益只有一次）。
       //
-      // ⚠️ 端点只在 `www.codebuddy.cn`（= `webBase`）可达，不是推理站
-      //    `copilot.tencent.com`（= `endpoint`）。三 host 实测见
-      //    `src/buddy-compensation.ts` 的模块头。
+      // ⚠️ 端点走 `webBase`（buddy = `www.workbuddy.cn`），不是推理站
+      //    `copilot.tencent.com`（= `endpoint`）。三个 host 实测**均可达**，
+      //    故这是**取舍**不是「只有一个能通」。见 `src/buddy-compensation.ts` 模块头。
       case 'buddy.compensationStatus': {
         const req = payload as RpcBuddyCompensationStatusRequest
         if (req.provider !== CODEBUDDY.id) {
@@ -4928,6 +4929,21 @@ function registerJetHubEndpoints(
         if (!claimResult.ok) {
           return { ok: false, error: { code: 'bad-request', message: describeCompensationFailure(claimResult.failure) } }
         }
+        // ⚠️⚠️ **领取成功后必须让折算缓存失效**（2026-10-16 审计 P2-3）。
+        //
+        // 补偿领取改变的是**账号积分余额**，而聚合折算与 buddy 系共用
+        // `src/aggregate-expiry.ts` 的折算缓存（TTL 60 秒、`UNUSABLE` 会被
+        // 缓存更久）。不清的话用户点完「立即领取」会看到「领了但积分没涨」。
+        //
+        // ⚠️ 与 `credits.claimAll` 之后那次 `clearExpiryCache()`（见本函数的
+        //    `fetch` 处理器，`jet-hub-rpc.ts:2634`）是**同一条铁律的两个入口**：
+        //    任何让积分增加的写操作都必须让下游折算失效。
+        //
+        // ⚠️ **刻意不复用 `balanceCache.clear()`**：那是**整渠道**清空，会连带
+        //    作废该渠道其它账号正在被徽标/面板用的读数（`balance-cache.ts:274`
+        //    明确警告「别当成按渠道刷新的顺手动作」）。折算缓存才是这里真正
+        //    会骗人的那一层，按既有入口清它足够。
+        modelAdapters?.['aggregate']?.clearExpiryCache?.()
         return { ok: true, value: {} satisfies RpcBuddyClaimCompensationResponse }
       }
 

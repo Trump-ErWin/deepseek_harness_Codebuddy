@@ -146,6 +146,13 @@ import { trimBackupPayload, describeBackupAccounts } from './backup-payload.js';
 import { convertForeignAccounts, looksLikeForeignAccountList } from './backup-convert.js';
 import { PROVIDER_ICONS } from './provider-icons.js';
 import { PROVIDER_REGISTRY } from '../../src/provider-registry.js';
+import {
+  scanCompensation,
+  toCompensationState,
+  claimAllCompensation,
+  compensationHeadline,
+  compensationHint,
+} from './compensation-panel-logic.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -2537,13 +2544,27 @@ function ProviderPanel({ provider, rpcCall }) {
   /**
    * CodeBuddy 限时补偿积分的**汇总**（仅 `provider === 'buddy'` 时用）。
    *
-   * 形状：`{ scanned, claimableCount, claimedCount, total, endTime, busy, error }`。
-   * `null` = 尚未查询或非 buddy（此时卡片不渲染）。
+   * 形状：`{ scanned, claimableCount, claimedCount, total, endTime, error,
+   *         errorCount, busy }`。`null` = 尚未查询或非 buddy（此时卡片不渲染）。
    *
    * ⚠️ **不接自动签到**：一次性限时活动，只在面板挂载/点击后查询与领取。
    * 理由与端点证据见 `src/buddy-compensation.ts` 模块头。
+   *
+   * ⚠️ **判据一律走 `./compensation-panel-logic.js` 的纯函数**，不在本文件里
+   *    手写 `res.ok` 之类的判断 —— `rpcCall` 成功时返回的是**解包后的值**
+   *    （**没有 `ok` 字段**）、失败时**抛错**，详见该模块头的 P0 说明。
    */
   const [compensation, setCompensation] = React.useState(null);
+  /**
+   * 补偿领取的**重入闸门**。
+   *
+   * ⚠️ **必须用 ref 而不是 `compensation.busy`**：`setState` 是异步的，
+   *    同一 tick 内连点两次时第二次读到的仍是 `false`，而按钮的 `disabled`
+   *    也要等 re-render 才生效 —— 于是两轮全量领取并发跑，对同一批账号
+   *    并发发一次性写操作。与本文件既有的 `claimInFlightRef`（一键领取积分）
+   *    同款理由，闸门必须在第一个 `await` **之前**生效。
+   */
+  const compensationClaimRef = React.useRef(false);
   /**
    * ZCode 登录渠道（仅 `provider === 'zcode'` 时用）。
    *
@@ -2847,44 +2868,26 @@ function ProviderPanel({ provider, rpcCall }) {
     try {
       const list = await rpcCall('account.list', { provider });
       const entries = Array.isArray(list?.accounts) ? list.accounts : [];
-      let total = 0;
-      let claimableCount = 0;
-      let claimedCount = 0;
-      let endTime = null;
-      let firstError = null;
-      for (const entry of entries) {
-        const res = await rpcCall('buddy.compensationStatus', { provider, accountId: entry.id });
-        if (res && res.ok === true) {
-          if (res.active === true && res.claimed !== true && Number(res.creditNum) > 0) {
-            claimableCount += 1;
-            total += Number(res.creditNum);
-            if (endTime === null && typeof res.endTime === 'string') endTime = res.endTime;
-          } else if (res.claimed === true) {
-            claimedCount += 1;
-          }
-        } else if (firstError === null) {
-          firstError = (res && res.message) || '未知错误';
-        }
-      }
+      // ⚠️⚠️ 逐账号容错**必须在纯函数里**（`scanCompensation` 逐个 try/catch）：
+      //    `rpcCall` 失败是**抛错**而非返回 `{ok:false}`，若把 await 裸在循环里，
+      //    一个账号凭据失效就会掀掉整批 —— 其余账号一条都查不到。
+      //    这正是 PR !106 初版的缺陷：它按「失败返回 {ok:false}」写，
+      //    于是注释宣称的「任一条失败不影响其余账号」与实现逐字相反。
+      const scan = await scanCompensation(
+        entries,
+        (accountId) => rpcCall('buddy.compensationStatus', { provider, accountId }),
+      );
       if (!mounted.current) return;
-      setCompensation({
-        scanned: entries.length,
-        claimableCount,
-        claimedCount,
-        total,
-        endTime,
-        busy: false,
-        error: entries.length > 0 && claimableCount === 0 && firstError !== null ? firstError : null,
-      });
+      setCompensation({ ...toCompensationState(scan), busy: false });
     } catch (caught) {
       console.error('[jet-hub] compensation status failed:', caught);
       if (!mounted.current) return;
       setCompensation({
         scanned: 0, claimableCount: 0, claimedCount: 0, total: 0, endTime: null,
-        busy: false, error: (caught && caught.message) || '未知错误',
+        busy: false, errorCount: 0,
+        error: (caught && caught.message) || '未知错误',
       });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider, rpcCall]);
 
   /**
@@ -2895,24 +2898,24 @@ function ProviderPanel({ provider, rpcCall }) {
    * ⚠️ 领完**重新查询**而不是本地乐观更新：领取是写操作，真实结果只有上游知道。
    */
   const claimCompensation = async () => {
-    if (provider !== 'buddy' || compensation === null || compensation.busy === true) return;
-    setCompensation({ ...compensation, busy: true });
+    // ⚠️ 闸门读 ref 而非 `compensation.busy`（见 `compensationClaimRef` 的注释）。
+    if (provider !== 'buddy' || compensation === null || compensationClaimRef.current === true) return;
+    compensationClaimRef.current = true;
+    setCompensation((prev) => (prev === null ? prev : { ...prev, busy: true }));
     try {
       const list = await rpcCall('account.list', { provider });
       const entries = Array.isArray(list?.accounts) ? list.accounts : [];
-      const failures = [];
-      for (const entry of entries) {
-        const status = await rpcCall('buddy.compensationStatus', { provider, accountId: entry.id });
-        if (!status || status.ok !== true) continue;
-        if (status.active !== true || status.claimed === true) continue;
-        if (!(Number(status.creditNum) > 0)) continue;
-        const res = await rpcCall('buddy.claimCompensation', { provider, accountId: entry.id });
-        if (!res || res.ok !== true) failures.push(`${entry.nickname || entry.id}：${res?.message || '未知错误'}`);
-      }
+      const { claimed, failures } = await claimAllCompensation(
+        entries,
+        (accountId) => rpcCall('buddy.compensationStatus', { provider, accountId }),
+        (accountId) => rpcCall('buddy.claimCompensation', { provider, accountId }),
+      );
       await loadAccounts();
       await loadCompensation();
       if (failures.length > 0) {
         setProbeNotice({ tone: 'warn', text: `部分账号领取失败（${failures.length} 个）`, details: failures });
+      } else if (claimed.length > 0) {
+        setProbeNotice({ tone: 'ok', text: `已为 ${claimed.length} 个账号领取补偿积分。`, details: [] });
       }
     } catch (caught) {
       console.error('[jet-hub] compensation claim failed:', caught);
@@ -2920,11 +2923,13 @@ function ProviderPanel({ provider, rpcCall }) {
         setProbeNotice({ tone: 'error', text: `领取失败：${(caught && caught.message) || '未知错误'}`, details: [] });
       }
     } finally {
+      compensationClaimRef.current = false;
       if (mounted.current) setCompensation((prev) => (prev === null ? prev : { ...prev, busy: false }));
     }
   };
 
-  React.useEffect(() => {    mounted.current = true;
+  React.useEffect(() => {
+    mounted.current = true;
     void loadAccounts();
     void loadCompensation();
     // 只有支持余额查询的 provider 才在挂载时拉积分（loadCredits 内部也有一道
@@ -2939,6 +2944,9 @@ function ProviderPanel({ provider, rpcCall }) {
       // 面板上的首次点击会被误判成「上一次仍在进行中」而永远点不动。
       // 在途的那一轮仍会跑完（无法取消 RPC），其结果由 mounted 判定是否上屏。
       claimInFlightRef.current = false;
+      // ⚠️ 同款理由，补偿领取闸门也要清：否则切回 buddy 面板时首次点击会被
+      // 误判成「上一次仍在进行中」而永远点不动。
+      compensationClaimRef.current = false;
     };
     // loadCredits 依赖 accounts，但这里只想在挂载/provider 变化时各跑一次；
     // 账号刷新后由操作方显式再调 loadCredits（见 claimCredits）。
@@ -3748,18 +3756,10 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   /**
-   * CodeBuddy 限时补偿积分卡片（仅 buddy 且已查询时渲染）。
-   *
-   * ⚠️ **抽成变量而不是内联在三元里**：内联时它嵌在 `section(...)` 的参数表中，
-   *    括号层级达 3 层，改一处极易数错括号（本次实现实测踩到）。
-   * ⚠️ **刻意不接自动签到**：一次性限时活动，只在面板展示 + 用户点击领取。
-   *    理由与端点证据见 `src/buddy-compensation.ts` 模块头。
-   */
-  /**
    * CodeBuddy 限时补偿积分卡片（仅 buddy 且已查询到状态时渲染）。
    *
    * ⚠️ **抽成变量而不是内联在 section(...) 的参数表里**：内联时它嵌在三元中，
-   *    括号层级深、改一处极易数错（本次实现实测踩到，浪费了一轮）。
+   *    括号层级深、改一处极易数错（PR !106 初版实测踩到，浪费了一轮）。
    *
    * ⚠️ **刻意不接自动签到**：这是一次性的限时活动，本仓库对「一次性 / 有代价
    *    动作」的既有铁律是默认不自动执行（见 buddy-growth.ts 的 runExotic）。
@@ -3768,27 +3768,17 @@ function ProviderPanel({ provider, rpcCall }) {
    *
    * ⚠️ **只对 buddy 渲染**（AGENTS.md：「通用面板里的按钮与弹窗必须按 provider
    *    分支」）。workbuddy 虽有同款端点，但那是另一个产品面，未验证不予展示。
+   *
+   * ⚠️ 文案一律走纯函数（`compensation-panel-logic.js`），不在 JSX 里内联三元 ——
+   *    内联文案无法被单测覆盖（无 react ⇒ 组件不渲染），初版正是这样漏掉了 P0。
    */
   const compensationCard = provider === 'buddy' && compensation !== null
     ? React.createElement('div', {
         className: 'dim-jh-probeNotice',
         'data-tone': compensation.error ? 'warn' : (compensation.total > 0 ? 'ok' : 'idle'),
       },
-      React.createElement('div', null,
-        compensation.error
-          ? `补偿积分状态查询失败：${compensation.error}`
-          : compensation.total > 0
-            ? `DeepSeek 模型服务异常补偿：${compensation.total} 积分待领取`
-              + (compensation.endTime ? `（${compensation.endTime} 截止）` : '')
-            : compensation.claimedCount > 0
-              ? '补偿积分已领取'
-              : '当前没有可领取的补偿积分'),
-      React.createElement('div', { className: 'dim-jh-hint' },
-        compensation.total > 0
-          ? `可领取账号 ${compensation.claimableCount} / ${compensation.scanned} 个（按账号独立，每账号限领一次）`
-          : compensation.error
-            ? '该能力为附加信息，不影响账号列表的使用。'
-            : '限时活动，过期后上游会返回「活动已结束」。'),
+      React.createElement('div', null, compensationHeadline(compensation)),
+      React.createElement('div', { className: 'dim-jh-hint' }, compensationHint(compensation)),
       compensation.total > 0
         ? React.createElement('button', {
             className: 'dim-jh-btn',

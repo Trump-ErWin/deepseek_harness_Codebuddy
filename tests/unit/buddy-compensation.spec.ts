@@ -234,4 +234,92 @@ describe('buddy-compensation：接线守卫（源码级）', () => {
     const guardCount = (source.match(/req\.provider !== CODEBUDDY\.id/g) ?? []).length
     expect(guardCount, '两条补偿 RPC 都应有 provider 硬门控').toBeGreaterThanOrEqual(2)
   })
+
+  /**
+   * ⚠️ 领取成功后必须让**折算缓存失效**（2026-10-16 审计 P2-3）。
+   *
+   * 补偿领取改变的是账号积分余额，而聚合折算吃的是带 TTL 的折算缓存 ⇒
+   * 不清的话用户点完「立即领取」看到的是「领了但积分没涨」。
+   *
+   * ⚠️ 与 `credits.claimAll` 的那条清理（`aggregate-wiring.spec.ts` 已守）是
+   * **同一条铁律的两个入口**，故这里必须单独守一次 —— 只守 claimAll 那条会漏。
+   *
+   * ⚠️⚠️ **判据必须剥注释**（2026-10-16 审计实测）：初版这条守卫写成
+   *   `case 'buddy.claimCompensation'[\s\S]{0,3000}clearExpiryCache`，
+   *   变异验证时**实测无牙** —— 撤掉真正的调用后用例仍全绿，因为
+   *   **注释里也写着 `clearExpiryCache` 这个词**，正则匹配到了注释。
+   *   ⇒ 这正是 AGENTS.md 登记的「一行注释诱饵」形态。
+   * ⇒ 修法：先把块注释整段剥掉，再在**裸代码**里找调用。
+   */
+  it('⚠️ 领取成功后清折算缓存（否则「领了但积分没涨」）', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { resolve } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    const here = resolve(fileURLToPath(import.meta.url), '..')
+    const raw = readFileSync(resolve(here, '../../src/jet-hub-rpc.ts'), 'utf8')
+    // ⚠️ 先剥注释（块注释 + 行注释），再判 —— 否则注释里的同名函数会喂饱正则。
+    const code = raw
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '')
+    const start = code.indexOf("case 'buddy.claimCompensation'")
+    expect(start, 'buddy.claimCompensation 分支必须存在').toBeGreaterThan(-1)
+    const segment = code.slice(start, start + 3000)
+    expect(
+      segment,
+      'buddy.claimCompensation 成功后必须调 clearExpiryCache（与 credits.claimAll 同款铁律）',
+    ).toMatch(/clearExpiryCache\?\.\(\)|clearExpiryCache\(\)/)
+  })
+})
+
+describe('buddy-compensation：客户端接线守卫', () => {
+  /**
+   * ⚠️ **重入闸门必须用 ref**（2026-10-16 审计 P2-5）。
+   *
+   * 这是一次性写操作；`setState` 是异步的，同一 tick 内连点两次会起两轮全量领取，
+   * 对同一批账号并发发写操作。本仓库的 `claimInFlightRef`（一键领取积分）已为
+   * 同一原因踩过坑并在注释里写明「守卫必须在第一个 await 之前生效」。
+   */
+  it('⚠️ 领取重入闸门用 ref，不是 useState', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { resolve } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    const here = resolve(fileURLToPath(import.meta.url), '..')
+    const raw = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+    // ⚠️ 同样剥注释：否则注释里写一句「不能用 compensation.busy」就会喂饱反向断言。
+    const code = raw
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '')
+    expect(code).toContain('const compensationClaimRef = React.useRef(false)')
+    expect(
+      code,
+      '闸门必须在第一个 await 之前生效（读 ref，不是读 state）',
+    ).toMatch(/compensationClaimRef\.current = true;\s*\n\s*setCompensation/)
+    // ⚠️ 反向：不得读 compensation.busy 当守卫（那是 useState，同 tick 连点会漏）
+    expect(
+      /compensation\.busy === true\) return/.test(code),
+      '不得用 compensation.busy 当重入守卫',
+    ).toBe(false)
+  })
+
+  /**
+   * ⚠️⚠️ **判据必须走纯函数模块**（2026-10-16 审计 P0 的结构性修法）。
+   *
+   * `rpcCall` 成功时返回**解包后的 value**（没有 `ok` 字段）、失败时**抛错**。
+   * 本 PR 初版把两处都按 `{ok, value}` 写 ⇒ 功能整体失效而测试全绿。
+   *
+   * ⇒ 结构性防复发：组件里**不得**再出现对补偿响应的 `.ok` 判据，
+   *    判据与文案一律住在 `compensation-panel-logic.js`（那份有行为测试覆盖）。
+   */
+  it('⚠️⚠️ 组件不得判补偿响应的 `.ok`（解包后无此字段）', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { resolve } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    const here = resolve(fileURLToPath(import.meta.url), '..')
+    const raw = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+    const code = raw
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '')
+    const matches = code.match(/buddy\.compensationStatus[\s\S]{0,400}?\.ok\s*[!=]==?/g)
+    expect(matches ?? [], '组件里出现对补偿响应的 .ok 判据 ⇒ 与 unwrapRpcResult 契约冲突').toEqual([])
+  })
 })
