@@ -863,6 +863,7 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   // 漏加 = `ACCIO_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
   ['ACCIO', 'accio'],
+  ['AUTOCLAW', 'autoclaw'],
 ]
 
 /** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */

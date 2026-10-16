@@ -451,6 +451,16 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
+    id: 'autoclaw',
+    label: 'AutoClaw (智谱)',
+    displayName: 'AutoClaw (智谱)',
+    logoClass: 'autoclaw',
+    credits: { balance: true, dailyCheckin: true },
+    rateLimit: false,
+    settingsNamespace: 'llm-autoclaw',
+    channel: true,
+  },
+  {
     id: 'aggregate',
     label: '聚合 (跨渠道)',
     displayName: '聚合 (跨渠道)',

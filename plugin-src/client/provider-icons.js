@@ -255,6 +255,8 @@ const ACCIO_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My
  * `provider-registry.spec.ts` 有一条断言锁住两边相等，漏加图标会**变红**
  *（而不是渲染出一个空白图标）。
  */
+const AUTOCLAW_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0Ij48cmVjdCB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHJ4PSI1IiBmaWxsPSIjNDM2MWVlIi8+PHBhdGggZD0iTTcgOGwzIDNsLTItNG00IDBsMyA0bC0yLTNtNCAwbDMgNWwtMi00IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PC9zdmc+';
+
 export const PROVIDER_ICONS = {
   codearts: CODEARTS_ICON,
   buddy: CODEBUDDY_ICON,
@@ -276,5 +278,6 @@ export const PROVIDER_ICONS = {
   gemini: GEMINI_ICON,
   officeace: OFFICEACE_ICON,
   accio: ACCIO_ICON,
+  autoclaw: AUTOCLAW_ICON,
   aggregate: AGGREGATE_ICON,
 };
