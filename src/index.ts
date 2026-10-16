@@ -74,7 +74,7 @@ import { MINIMAX, MINIMAX_INTL } from './minimax-product.js'
 //    brief 原稿称「Task 1 已加过 `descriptorOf`，合并进同一行」，实测**没有** ——
 //    故 Task 2 才把它并进本行。
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
-import { registerProviderRuntime, expiryOf, wiredRefreshTargets, type ProviderRuntime } from './provider-runtime.js'
+import { registerProviderRuntime, registerBalanceCache, expiryOf, runtimeOf, wiredRefreshTargets, type ProviderRuntime } from './provider-runtime.js'
 // ⚠️ Task 8：探测适配器的**构造**从 `account-probe.ts` 搬到本文件（注册处）——
 //    那里已改为查注册表，未登记则抛错（不再有 `else` 兜底交给 CodeArtsAdapter）。
 //    ⇒ 这里需要**全部**会写 `modelRateLimits` 的适配器类（含 loomy / raccoon，
@@ -128,6 +128,12 @@ import { AGGREGATE_PROVIDER, registerAggregateLlm } from './aggregate-adapter.js
 // ⚠️ `createExpiryProbe` 从**底座**导入，不是从 `aggregate-adapter.js`
 //（它定义在 `aggregate-expiry.ts`，理由见该文件与 Task 7 的 Files 说明）。
 import { createExpiryProbe } from './aggregate-expiry.js'
+// ⚠️ 共享余额读数缓存（2026-10-15，规格 §5.7）：装配层建**一个**实例，
+//    `credits.balances` 端点与 buddy 系四家的折算共用它（见下面 `balanceCache` 的长注释）。
+import { createBalanceCache, type BalanceCacheEntry } from './balance-cache.js'
+// ⚠️ 中止判据复用适配器的**共享实现**（`aggregate-adapter.ts` 的 `isAbortLike`）：
+//    本仓库已有 4 份同义实现，装配层不该再添第五份。
+import { isAbortLike as isAbortLikeError } from './aggregate-adapter.js'
 import { createProviderExpiry } from './provider-expiry.js'
 // ⚠️ opencode 的 RPC 由 `jet-hub-rpc.ts` 的 handleMethod 统一分派
 // （它调 handleOpencodeRpc），本文件**不再**单独注册端点 —— 详见
@@ -2797,6 +2803,86 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
    *    ⚠️ 若将来有人让折算逻辑**依赖** `probeModel` 的**具体取值**
    *   （如「按最便宜的模型查额度」），仍需让两个消费者各自传自己的实现。
    */
+/**
+ * 共享缓存的**取数原语**（从 `credits.balances` 的查表分派里抽出的那一半）。
+ *
+ * ## ⚠️ 为什么必须与 `credits.balances` 用同一个函数（规格 §11-1 的核实结论）
+ *
+ * 两条路径（面板端点 / 聚合折算）取的是**同一个数**：只有共用同一份取数实现，
+ * 「面板显示的余额」与「折算据此排序的余额」才不可能分叉。若各写一份，两边
+ * 对同一份报文可能得出不同的 `error` / `extra` 口径（本仓库首条红线）。
+ *
+ * ⚠️ 取数**不含 self-heal**：续期留在 `credits.balances` / `credits.claimAll` 的
+ * **端点入口**（规格 §5.7.1 末行）—— 折算路径触发填充时不该把续期开销带进发消息路径。
+ * ⚠️ opencode / qoder 族 / officeace 的**特例短路仍在端点里**（它们不走本原语）：
+ * 本函数只处理「查表分派」那一段（`creditsOf` + `fetchBalance(Detailed)`）。
+ *
+ * @returns 解析出的 `CreditBalance`（失败时抛错 ⇒ 缓存记成 `error` 读数）。
+ */
+async function fetchBalanceReading(
+  pool: AccountPool,
+  provider: string,
+  entry: BalanceCacheEntry,
+): Promise<unknown> {
+  const runtime = runtimeOf(provider)
+  const impl = runtime?.credits
+  if (impl === undefined) throw new Error(`unsupported provider: ${provider}`)
+  if (entry.credential === undefined) throw new Error('凭据未提供')
+  // ⚠️ `ProviderCallContext` 的三个字段与 `jet-hub-rpc.ts` 里那份**同形**
+  //（那里是端点闭包内的注册实例，这里是装配层的实例；实现侧只需一个形状）。
+  // ⚠️ 必须与端点那份**指向同一个池**，否则折算拿到的账号集合与面板看到的不一致。
+  const callContext = {
+    resolveCredential: (refName: string) => ctx.credentials.resolve(credentialRef(refName)),
+    warn: (message: string) => ctx.logger?.warn?.(message),
+    accountPool: pool,
+  }
+  // ⚠️ `fetchBalanceDetailed` 优先（它带 `error` / `extra`，是既有端点的口径）。
+  if (impl.fetchBalanceDetailed !== undefined) {
+    const detailed = await impl.fetchBalanceDetailed(entry.credential, callContext)
+    if (detailed.balance === null) throw new Error(detailed.error ?? '余额查询失败')
+    return detailed.balance
+  }
+  if (impl.fetchBalance === undefined) throw new Error(`unsupported provider: ${provider}`)
+  const balance = await impl.fetchBalance(entry.credential, callContext)
+  if (balance === null) throw new Error('余额查询失败')
+  return balance
+}
+
+/**
+ * ★★ **共享余额读数缓存**（2026-10-15，规格 §5.7）—— 本进程**唯一**的一份。
+ *
+ * ## 谁在用它（两条消费路径，各有各的取舍）
+   *
+   * | 消费者 | 传哪些账号 | 为什么 |
+   * |---|---|---|
+   * | `credits.balances` 端点（积分面板） | **全部**账号（含停用 —— 既有语义） | 用户要在同一个列表里看到每个账号还剩多少 |
+   * | 聚合折算（buddy 系四家） | **可用**账号（`listAvailableCredentials` 的既有取号逻辑） | 不可用的账号本来就不该参与候选 |
+   *
+   * ⇒ 「谁该被读」是**调用方的取舍**，「同一账号的读数在 TTL 内复用」才是本缓存
+   * 提供的**基础设施**（用户 2026-10-15 的更正原话见 `balance-cache.ts` 模块头）。
+   *
+   * ⚠️⚠️ **必须是同一个实例**：两次 `createBalanceCache` 会让同一个账号被查两次
+   *（那正是本模块要消除的），且 `clear` 也得分两次 —— 与 `sharedExpiryProbe` 那条
+   * 「初版内联导致两份缓存」的真实缺陷**同型**（见上方长注释）。
+   *
+ * ⚠️ TTL 120 秒（规格 §5.7.4-3 的诚实登记：原先折算侧是 60 秒）：聚合是**多候选
+ * 回落**结构，陈旧 60 秒的代价是「多一次失败尝试后回落」（用户看不到失败），
+ * 换来上游请求不翻倍；面板侧有 5 分钟重探与手动 `force` 兜底。
+ */
+const balanceCache = createBalanceCache({
+  ttlMs: 120_000,
+  failureTtlMs: 15_000,
+  // ⚠️ 中止判据**复用**适配器导出的共享实现（它含 `code: 'ABORTED'` 与 499 报文
+  //    两条腿）—— 不要在装配层再写一份（本仓库已有 4 份同义实现，别再添第五份）。
+  isAbort: (error) => isAbortLikeError(error),
+  fetch: (provider, entry) => fetchBalanceReading(pool, provider, entry),
+})
+// ⚠️ 注册到**进程级**注册位：`credits.balances` 端点拿不到本函数的局部变量
+//   （`registerJetHubRpc` 的 4 形参不变式不许加第 5 个），故走与
+//   `ProviderRuntime.credits` 同一张表（见 `provider-runtime.ts` 的说明）。
+//   ⚠️ 未注册 ⇒ 端点回退到自己的原路径（行为与升级前一致）—— 那是刻意的降级。
+registerBalanceCache(balanceCache)
+
   const sharedExpiryProbe = createExpiryProbe(pool, async (provider) => {
     const models = await ctx.llm.listModels(provider)
     return models[0]?.id
@@ -2826,6 +2912,27 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
       const models = await ctx.llm.listModels(provider)
       return models.map((model) => model.id)
     },
+    /**
+     * ★★ **共享余额读数**（2026-10-15，规格 §5.7）。
+     *
+     * ## 用户原话（本模块存在的理由）
+     *
+     * 「为什么不能更新账号积分用共享缓存，取号逻辑只是在调用缓存的时候取舍的问题，
+     * 不影响刷新账号积分缓存呢，账号积分缓存是更底层基础设置，计算怎么取号是
+     * 基础设施上的使用逻辑」
+     *
+     * ⇒ 这里注入的是**同一个** `balanceCache` 实例（`credits.balances` 端点用的是
+     * 它）—— 于是 buddy 系四家的折算**吃同一份读数**，而不是各自再打一次上游。
+     * 「只给可用账号」这一取舍由 `createExpiryProbe` 自己的取号逻辑决定
+     *（它本来就只遍历可用账号），与缓存无关。
+     *
+     * ⚠️ 返回 `undefined` ⇒ 取数失败 ⇒ 实现方回落到自己发请求：折算的**可用性**
+     * 不得依赖本缓存（否则缓存不可用会静默变成「该渠道折算恒 UNUSABLE」）。
+     */
+    balanceOf: async (provider, accountId, credential) => {
+      const reading = await balanceCache.readOne(provider, accountId, { credential })
+      return reading.error === undefined ? reading.value : undefined
+    },
   })
   // ⚠️ 赋给上面的可变引用 ⇒ 账号入库时清空折算缓存（见那里的注释）。
   sharedExpiryProbeRef = sharedExpiryProbe
@@ -2837,6 +2944,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     //    传快照会让用户以为开关坏了（要重启插件才生效）。
     //    `pool.listAggregateRejections()` 返回进程内权威副本（与 state.json 同步）。
     rejections: () => pool.listAggregateRejections(),
+    // ⚠️ 同样是**函数**（不是快照），理由与 `rejections` 完全相同：面板改完开关，
+    //    下一次请求就要生效。三张表都是「同一枚开关的不同域」，故接线必须一起给
+    //   （漏一个 ⇒ 该功能整个不生效，且**完全静默**：例如漏 `allowed` 时，
+    //   用户手工打开的未接入候选仍会被判成「默认不参与」）。
+    allowed: () => pool.listAggregateAllowed(),
+    order: () => pool.listAggregateOrder(),
+    orderMode: () => pool.listAggregateOrderMode(),
   })
   // ⚠️ 赋给上面的可变引用 ⇒ 账号入库时**也**清候选序缓存（见那里的长注释：
   //    两个缓存不同，只清折算缓存会让「刚登录的账号」在 60 秒内仍不进候选序）。
