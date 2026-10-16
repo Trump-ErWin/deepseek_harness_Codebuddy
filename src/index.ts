@@ -65,6 +65,8 @@ import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
 import type { ClineCredential } from './cline.js'
 import type { LoomyCredential } from './loomy.js'
+// ⚠️ 2026-10-16：loomy 选号吃共享读数时需要 `CreditBalance` 形状（两池）。
+import type { CreditBalance } from './credits.js'
 import type { RaccoonCredential } from './raccoon.js'
 import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
@@ -661,6 +663,58 @@ export function apply(ctx: Context): void {
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
 
+  /**
+   * ★★ **共享余额读数缓存**（2026-10-15 规格 §5.7；2026-10-16 起 loomy 也接入）——
+   * 本进程**唯一**的一份。
+   *
+   * ## ⚠️⚠️ 为什么必须建在**这里**（位置不变式）
+   *
+   * 消费者有三处，定义顺序不能变：
+   * ① loomy 选号器（`loomyBalanceSelector`，约在本段之后）—— 2026-10-16 新增；
+   * ② `credits.balances` 端点（经 `registerBalanceCache` 的进程级注册位）；
+   * ③ 聚合折算（`sharedExpiryProbe` 的 `balanceOf`）。
+   *
+   * ⚠️ 我第一版把它留在文件后段（`sharedExpiryProbe` 旁边）⇒ ① 会读到
+   *   **尚未初始化的 `const`**（TDZ）—— `tsc` 不报错（`const` 在模块作用域
+   *   有块级作用域，闭包里引用合法），只在 loomy 首次选号时抛
+   *   `ReferenceError`。⇒ 位置本身就是一条不变式，登记在此。
+   *
+   * ## 谁在用它（各有各的取舍）
+   *
+   * | 消费者 | 传哪些账号 | 为什么 |
+   * |---|---|---|
+   * | `credits.balances` 端点（积分面板 / 徽标） | **全部**账号（含停用 —— 既有语义） | 用户要在同一个列表里看到每个账号还剩多少 |
+   * | loomy 选号（余额分档） | **候选**账号（已过滤 enabled/限流） | 不该用没资格的号去推断整体 |
+   * | 聚合折算（buddy 系四家） | **可用**账号 | 不可用的账号本来就不该参与候选 |
+   *
+   * ⇒ 「谁该被读」是**调用方的取舍**，「同一账号的读数在 TTL 内复用」才是本缓存
+   * 提供的**基础设施**（用户 2026-10-15 的更正原话见 `balance-cache.ts` 模块头）。
+   *
+   * ⚠️⚠️ **必须是同一个实例**：两次 `createBalanceCache` 会让同一个账号被查两次
+   *（那正是本模块要消除的），且 `clear` 也得分两次 —— 与 `sharedExpiryProbe` 那条
+   * 「初版内联导致两份缓存」的真实缺陷**同型**。
+   *
+   * ⚠️ TTL 120 秒（规格 §5.7.4-3 的诚实登记）：聚合是**多候选回落**结构，
+   *   陈旧 60 秒的代价是「多一次失败尝试后回落」（用户看不到失败），换来上游
+   *   请求不翻倍；面板侧有 5 分钟重探与手动 `force` 兜底。
+   *
+   * ⚠️ 陈旧兼顶上界 15 分钟（`staleTtlMs`）：用户 2026-10-16 要求
+   *   「拿不到新数据就读旧数据」，但必须有上界 —— 见 `balance-cache.ts` 的注释。
+   */
+  const balanceCache = createBalanceCache({
+    ttlMs: 120_000,
+    failureTtlMs: 15_000,
+    // ⚠️ 中止判据**复用**适配器导出的共享实现（它含 `code: 'ABORTED'` 与 499 报文
+    //    两条腿）—— 不要在装配层再写一份（本仓库已有 4 份同义实现，别再添第五份）。
+    isAbort: (error) => isAbortLikeError(error),
+    fetch: (provider, entry) => fetchBalanceReading(pool, provider, entry),
+  })
+  // ⚠️ 注册到**进程级**注册位：`credits.balances` 端点拿不到本函数的局部变量
+  //   （`registerJetHubRpc` 的 4 形参不变式不许加第 5 个），故走与
+  //   `ProviderRuntime.credits` 同一张表（见 `provider-runtime.ts` 的说明）。
+  //   ⚠️ 未注册 ⇒ 端点回退到自己的原路径（行为与升级前一致）—— 那是刻意的降级。
+  registerBalanceCache(balanceCache)
+
   // CodeArts 目录的**各来源成败**出参（issue IKJVTF 复审，审计 I3）：
   // `service.refreshModels` 每轮原地写入，适配器的 `catalogComplete` 读它。
   // 初值两个 false —— 在首轮真正拉取之前，**没有**任何来源可算「取到」。
@@ -936,21 +990,60 @@ export function apply(ctx: Context): void {
     }
 
   /**
-   * Loomy 的「锁定永久积分 + 无可用账号」报错文案。
+   * Loomy 的「锁定永久积分 + 无可用账号」报错文案（issue IKMCOO 缺陷 2/3）。
    *
    * ⚠️ **与 buddy 那份分开**（不是漏抽）：Loomy 的口径是「**今日赠送额度**」
    * （服务端每日刷新的那个池），而 buddy 系是「N 天内到期的资源包」——
    * 两者是不同的业务概念，合并成一句会让用户按错误的判据去排查。
-   * 同样必须分「真的用尽」与「查不到」两种原因（真实缺陷，用户报障 2026-09-29）。
+   *
+   * ⚠️⚠️ **必须分「全部查不到」与「部分查不到」**（issue IKMCOO 缺陷 2，
+   *   2026-10-16）：原实现只有一档 `unknown`，判据是「有任一候选失败」，
+   *   于是 **3 个号全查不到**也被报成「**部分**账号的余额查询失败」，
+   *   并建议「检查凭据是否失效」—— 而本机实测（4 个账号 `/points/records`
+   *   全部 200、字段完整）凭据**全部有效**，照着做完全无效。
+   *
+   * ⚠️⚠️ **错误码用 `TRANSPORT`，不用自定义码**（issue IKMCOO 缺陷 3，
+   *   2026-10-16 实测修正）：原判据里我先写的是新增码 `BALANCE_UNAVAILABLE`，
+   *   实读宿主 `@deepseek-ai/dsh-llm/lib/types/retry-policy.js` 的
+   *   `DEFAULT_RETRYABLE_CODES` 发现它是
+   *   `['EMPTY_RESPONSE','RATE_LIMIT','SERVER','TIMEOUT','TRANSPORT']`
+   *   —— **自定义码不在其中** ⇒ 宿主照样不重试，缺陷 3 **根本没被修好**
+   *   （症状与原来逐字相同：整轮被打断）。
+   *   ⇒ 语义最贴近且**确在**默认可重试集合里的是 `TRANSPORT`
+   *   （本故障就是「一次取数往返没能完成」），具体分类靠 message 表达。
+   *
+   * ⚠️ **刻意不用 `AUTH` / `QUOTA`**：那两类在部分客户端会连 message 一起
+   *   吞掉（见 AGENTS.md 的 IKLBSH 复发形态），而本故障**需要**用户看到
+   *   「换渠道 / 稍后再试」这句指路文案。
    */
   const loomyLockedError = (reason: LoomyNoAccountReason): Error => {
-    if (reason.kind === 'unknown') {
-      return new Error(
-        'Loomy：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败'
-        + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**今日额度 —— `
-        + '请重试，或在 Jet Hub 的 Loomy 面板检查凭据是否失效。',
+    const details = reason.kind === 'exhausted' ? '' : `（${reason.errors.slice(0, 2).join('；')}）`
+    if (reason.kind === 'all-unknown') {
+      return new LlmError(
+        'Loomy：无法确认是否有可用账号。已锁定永久积分，而**所有**账号的余额查询都失败了'
+        + `${details}。这通常是上游限流 / 风控 / 网络中断，**不是**凭据失效 —— `
+        + '无需重新登录。可稍后重试，或改用其它 provider / 模型；'
+        + '若急于继续，可在 Jet Hub 的 Loomy 面板**临时解锁永久积分**（会消耗永久积分）。',
+        'TRANSPORT',
       )
     }
+    if (reason.kind === 'partial') {
+      return new LlmError(
+        'Loomy：无法确认是否有可用账号。已锁定永久积分，而**部分**账号的余额查询失败'
+        + `${details}。其余账号的今日额度已确认用尽；这些账号**可能仍有**今日额度 —— `
+        + '请稍后重试，或在 Jet Hub 的 Loomy 面板核对这些账号的凭据。',
+        'TRANSPORT',
+      )
+    }
+    /**
+     * ⚠️⚠️ **穷尽性守卫**（与 buddy 那份同型，2026-10-14 审计引入）：
+     * 走到这里**只允许**是 `{ kind: 'exhausted' }` —— 它是唯一有事实依据
+     * 可以说「今日额度已用尽」的一档（余额分档真的查过，且每个候选的今日
+     * 额度确实都是 0）。把 `reason` 赋给单成员类型，将来加了新档位却
+     * 忘了写文案时，`tsc` 当场报 `TS2322`，而不是静默落进「已用尽」。
+     */
+    const exhaustedOnly: { kind: 'exhausted' } = reason
+    void exhaustedOnly
     return new Error(
       'Loomy：没有可用账号。已锁定永久积分，而所有账号的今日赠送额度都已用尽。'
       + '请在 Jet Hub 的 Loomy 面板解锁永久积分，或等待明日额度刷新。',
@@ -1503,6 +1596,41 @@ export function apply(ctx: Context): void {
   }
 
   /**
+   * 把共享读数里的 `CreditBalance` 拆成 loomy 选号要的两个数。
+   *
+   * ⚠️⚠️ **按包名映射，只此一处**：`provider-credits.ts` 的 `makePackage` 写的
+   *   包名是「永久积分」/「每日赠送」，共享缓存里存的就是那个形状。
+   *   ⚠️ **判据用 `includes` 而非 `===`**：包名带「（陈旧）」之类后缀时
+   *   仍要认得出来 —— 用等值会在文案微调后静默变成「读不到余额」，
+   *   那正是本 issue 的症状形态。
+   * ⚠️ 两池都认不出时返回 `{}`（**不编造 0**）：上层据此判「没有可用读数」。
+   */
+  const loomyPoolsOf = (balance: CreditBalance): { daily?: number; permanent?: number } => {
+    let daily: number | undefined
+    let permanent: number | undefined
+    for (const pkg of balance.packages ?? []) {
+      if (pkg.name.includes('每日')) daily = pkg.remaining
+      else if (pkg.name.includes('永久')) permanent = pkg.remaining
+    }
+    return {
+      ...daily === undefined ? {} : { daily },
+      ...permanent === undefined ? {} : { permanent },
+    }
+  }
+
+  /**
+   * 按账号池 id 取一份已解析的 loomy 凭据（共享读数的槽需要它）。
+   *
+   * ⚠️ 读不到（账号已删 / 凭据损坏）返回 `undefined` ⇒ 缓存记成失败读数 ⇒
+   *   选号器照常回落自己取数（并得到它自己的「凭据未配置或已失效」结论）。
+   */
+  const readLoomyCredentialFor = async (accountId: string): Promise<LoomyCredential | undefined> => {
+    const entry = pool.listAccountsByProvider(LOOMY.id).find((a) => a.id === accountId)
+    if (entry === undefined) return undefined
+    return await resolveLoomyCredentialByRef(entry.credentialRef)
+  }
+
+  /**
    * Loomy 的**按余额优先选号器**（负载均衡）。
    *
    * ⚠️ **为什么需要它**（真实缺陷）：实测 Loomy 的今日赠送额度（每天 5000）
@@ -1516,6 +1644,38 @@ export function apply(ctx: Context): void {
   const loomyBalanceSelector = new LoomyBalanceSelector({
     product: LOOMY,
     resolveCredential: resolveLoomyCredentialByRef,
+    /**
+     * ★ 吃**共享余额读数**（2026-10-16，issue IKMCOO 缺陷 1）。
+     *
+     * ## 为什么必须接（用户报障的核心矛盾）
+     *
+     * 「面板显示三个账号都有余额，但对话一直报『余额查询失败』」—— 两条路径
+     * 各发各的请求、各存各的缓存，于是**可以同时成立且互相矛盾**。
+     * ⇒ 这里让选号与面板**看同一份读数**，矛盾从根上消失。
+     *
+     * ⚠️ **`LOOMY_CREDIT_DETAIL` 从共享读数里取**：`CreditBalance` 有两池
+     *   （`packages`），而选号器要的是 `permanent` / `daily` 两个数 ——
+     *   由**包名**映射（`provider-credits.ts` 造包时写的就是「永久积分」/
+     *   「每日赠送」）。⚠️ 这层映射**只此一处**，不得在别处再写一份。
+     *
+     * ⚠️ **陈旧读数按成功处理**：兼顶值确实可用（`ok: true`），只是标了
+     *   `error` 让 UI 能显示数据时间。标成失败会把「有今日额度的号」踢出候选 ——
+     *   那正是本 issue 的症状。
+     *
+     * ⚠️ 共享缓存**未注册**时返回 `undefined` ⇒ 选号器照常自己取数（逐字节同旧）。
+     */
+    sharedReading: async (accountId) => {
+      const reading = await balanceCache.readStale(LOOMY.id, accountId, {
+        credential: await readLoomyCredentialFor(accountId),
+      })
+      if (reading.value === undefined) return undefined
+      return {
+        ...loomyPoolsOf(reading.value as CreditBalance),
+        stale: reading.stale,
+        at: reading.at,
+        ...reading.error === undefined ? {} : { error: reading.error },
+      }
+    },
   })
 
   const loomyAdapter = registerLoomyLlm(ctx, {
@@ -2848,40 +3008,6 @@ async function fetchBalanceReading(
   return balance
 }
 
-/**
- * ★★ **共享余额读数缓存**（2026-10-15，规格 §5.7）—— 本进程**唯一**的一份。
- *
- * ## 谁在用它（两条消费路径，各有各的取舍）
-   *
-   * | 消费者 | 传哪些账号 | 为什么 |
-   * |---|---|---|
-   * | `credits.balances` 端点（积分面板） | **全部**账号（含停用 —— 既有语义） | 用户要在同一个列表里看到每个账号还剩多少 |
-   * | 聚合折算（buddy 系四家） | **可用**账号（`listAvailableCredentials` 的既有取号逻辑） | 不可用的账号本来就不该参与候选 |
-   *
-   * ⇒ 「谁该被读」是**调用方的取舍**，「同一账号的读数在 TTL 内复用」才是本缓存
-   * 提供的**基础设施**（用户 2026-10-15 的更正原话见 `balance-cache.ts` 模块头）。
-   *
-   * ⚠️⚠️ **必须是同一个实例**：两次 `createBalanceCache` 会让同一个账号被查两次
-   *（那正是本模块要消除的），且 `clear` 也得分两次 —— 与 `sharedExpiryProbe` 那条
-   * 「初版内联导致两份缓存」的真实缺陷**同型**（见上方长注释）。
-   *
- * ⚠️ TTL 120 秒（规格 §5.7.4-3 的诚实登记：原先折算侧是 60 秒）：聚合是**多候选
- * 回落**结构，陈旧 60 秒的代价是「多一次失败尝试后回落」（用户看不到失败），
- * 换来上游请求不翻倍；面板侧有 5 分钟重探与手动 `force` 兜底。
- */
-const balanceCache = createBalanceCache({
-  ttlMs: 120_000,
-  failureTtlMs: 15_000,
-  // ⚠️ 中止判据**复用**适配器导出的共享实现（它含 `code: 'ABORTED'` 与 499 报文
-  //    两条腿）—— 不要在装配层再写一份（本仓库已有 4 份同义实现，别再添第五份）。
-  isAbort: (error) => isAbortLikeError(error),
-  fetch: (provider, entry) => fetchBalanceReading(pool, provider, entry),
-})
-// ⚠️ 注册到**进程级**注册位：`credits.balances` 端点拿不到本函数的局部变量
-//   （`registerJetHubRpc` 的 4 形参不变式不许加第 5 个），故走与
-//   `ProviderRuntime.credits` 同一张表（见 `provider-runtime.ts` 的说明）。
-//   ⚠️ 未注册 ⇒ 端点回退到自己的原路径（行为与升级前一致）—— 那是刻意的降级。
-registerBalanceCache(balanceCache)
 
   const sharedExpiryProbe = createExpiryProbe(pool, async (provider) => {
     const models = await ctx.llm.listModels(provider)

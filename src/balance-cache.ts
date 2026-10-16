@@ -58,6 +58,13 @@ import { TtlCache } from './ttl-cache.js'
  * ⚠️ `value` 是**上游原样形状**（本模块不解释它）—— 各消费者按自己渠道的协议读它
  *（buddy 系是 `CreditBalance`、officeace 是套餐摘要、…）。
  * ⚠️ `error` 存在 ⇒ 这是**失败读数**（短 TTL）；`value` 此时为 `undefined`。
+ *
+ * ⚠️⚠️ **例外：兼顶读数（`StaleBalanceReading`）允许两者同时存在** ——
+ * 「本次取数失败」与「上次读到的值仍然可用」是两件同时为真的事。
+ * ⇒ **判「这条读数能不能用」不能只看 `error`**：
+ *   - 只吃 `read`/`readOne` 的消费者（如聚合折算）：`error === undefined` 才可用，
+ *     且它们**永远拿不到**兼顶读数（那是 `readStale` 的独有形状）；
+ *   - 吃 `readStale` 的消费者：按 `stale` 判断，并把 `error` 当「本次失败原因」展示。
  */
 export interface BalanceReading {
   /** 取到该读数的时刻（毫秒）。 */
@@ -66,6 +73,52 @@ export interface BalanceReading {
   value: unknown
   /** 失败原因（人话）；成功时为 `undefined`。 */
   error?: string
+  /**
+   * ★ 这条读数**是不是上一次的成功值**（陈旧兼顶，2026-10-16 审计 P1-2 修正）。
+   *
+   * ## 为什么需要它（实测复现的缺陷）
+   *
+   * `readStale` 兼顶成功时会**回滚写入** `{ at: 旧时刻, value: 旧值 }` 以保住
+   * 兼顶能力。那条读数**不带 `error`** ⇒ 被 `ttlFor` 判成**成功读数** ⇒
+   * 落盘 120 秒 TTL ⇒ 紧接着再打开一次面板时 `get()` 在 TTL 内**直接命中、
+   * 不回源** ⇒ 返回 `{ stale: false }`。
+   *
+   * ⇒ 用户第一次看到「本次查询失败，显示的是 HH:MM 的数据」，第二次看到的是
+   * **一条看起来完全正常的余额**，会据此认为「上游已恢复」—— 恰恰相反，
+   * 上游还在挂着。**这比报错更糟**（它看起来成功了）。
+   *
+   * ## 为什么用字段而不用「改 TTL」来表达
+   *
+   * 另一条思路是把回滚条目的 TTL 设成 `failureTtlMs`（短档），让下一轮必定
+   * 回源。但那会让「上游刚恢复」也要等满一个短 TTL 才被发现，且**不能**告诉
+   * 用户「你现在看到的仍是旧值」—— 用户要的正是这个标注。
+   *
+   * ⚠️ **判据只在 `readStale` 内读**：其它消费者（`read` / `readOne`）拿到的
+   *   仍是 `BalanceReading`，它们判的是 `error === undefined`，不受此字段影响
+   *   （兼顶值对它们而言就是一条「有值的读数」，与既有行为一致）。
+   */
+  stale?: boolean
+}
+
+/**
+ * ★ 兼顶读数（{@link BalanceCache.readStale} 的返回值）。
+ *
+ * ⚠️ `value` **可能**有值（陈旧兼顶）也可能是 `undefined`（连旧值都没有）——
+ *    「能不能用」看 `value !== undefined`，**不看** `error`。
+ */
+export interface StaleBalanceReading {
+  /**
+   * 值本身是**什么时候**取到的（毫秒）—— 即陈旧值的年龄。
+   *
+   * ⚠️ 与兼顶无关（即本次取数成功）时，它就是本次取数的时刻。
+   */
+  at: number
+  /** 上游原样返回值；**兼顶失败且无旧值**时为 `undefined`。 */
+  value: unknown
+  /** 本次取数的失败原因；成功时为 `undefined`。**兼顶时它仍然有值**。 */
+  error?: string
+  /** 该值是否来自上一次的缓存（`true` = 陈旧）。 */
+  stale: boolean
 }
 
 /** 一条要读的账号条目（**最少**只有 `id`；取数原语需要什么由调用方附带）。 */
@@ -100,6 +153,17 @@ export interface BalanceCacheOptions {
    * 都有同款注释与同款修复）。
    */
   failureTtlMs?: number
+  /**
+   * ★ **陈旧值最长兼顶**时长（毫秒，默认 15 分钟）。
+   *
+   * 用户 2026-10-16：「加载如果得不到新数据，应该读出旧数据，不能直接返回错误
+   *（除非旧数据也没有）」。⚠️ 必须有上界 —— 无界兼顶会让一次读数命中后永久生效，
+   * 用户看到的余额可能是一天前的，而 UI 只写「数据来自 HH:MM」。
+   *
+   * ⚠️ 这**不是** `failureTtlMs`：后者决定「一条**失败读数**缓存多久」，
+   *   本项决定「**成功读数过期后**还能兼顶多久」。两者量级差 1~2 个数量级。
+   */
+  staleTtlMs?: number
   /**
    * 单账号取数原语（**由装配层按渠道注入**）。
    *
@@ -153,6 +217,38 @@ export interface BalanceCache {
     options?: { force?: boolean },
   ): Promise<BalanceReading>
   /**
+   * ★ **兼顶读数**（用户 2026-10-16 的要求）。
+   *
+   * 「用底层缓存；加载如果得不到新数据，应该读出旧数据，不能直接返回错误
+   *（除非旧数据也没有）」—— {@link read} / {@link readOne} 在取数失败时
+   * 返回的是 `error` 读数，**没有任何一条会回落到上一次的成功值**。
+   *
+   * ## 三条语义（逐条对应用户那句话）
+   *
+   * | 情形 | 返回 |
+   * |---|---|
+   * | 取数成功 | 新读数，`stale: false` |
+   * | 取数失败，**有**旧的成功值 | **旧值** + `error`（本次失败原因）+ `stale: true` |
+   * | 取数失败，**没有**旧值 | `error` 读数 + `stale: true`（无值可兼顶） |
+   *
+   * ⚠️ **`error` 与 `value` 同时存在**是这条路径独有的组合：`BalanceReading`
+   *    的原注释说「`error` 存在 ⇒ 失败读数，`value` 为 `undefined`」——
+   *    这里**刻意破例**，否则调用方无法区分「彻底查不到」与「拿旧值顶上」，
+   *    而这两种的 UI 表现必须不同（后者要显示数据时间）。
+   * ⇒ 因此**原有消费者不能直接吃这条读数**（它们的判据是
+   *    `error === undefined` ⇒ 可用），见 {@link BalanceReading} 的新注释。
+   *
+   * @param staleTtlMs - 陈旧值**最长兼顶**时长（毫秒，默认 15 分钟）。
+   *   ⚠️ 必须有上界：否则一次读数命中后就永久兼顶，用户看到的余额可能是一天前的，
+   *   而 UI 只会写「数据来自 HH:MM」。
+   */
+  readStale(
+    provider: string,
+    accountId: string,
+    entry: { credential?: unknown },
+    options?: { force?: boolean; staleTtlMs?: number },
+  ): Promise<StaleBalanceReading>
+  /**
    * **写入**一个已知读数（不触发取数）。
    *
    * ## ⚠️ 为什么需要它（而不是让消费者都走 `read`）
@@ -191,6 +287,9 @@ function defaultIsAbort(error: unknown): boolean {
  */
 export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
   const failureTtlMs = options.failureTtlMs ?? 15_000
+  // ⚠️ 陈旧兼顶的**上界**必须有（见 `staleTtlMs` 的注释）：无界兼顶会让一次
+  //   读数命中后永久生效，用户看到一天前的余额而 UI 只写「来自 HH:MM」。
+  const staleTtlMs = options.staleTtlMs ?? 900_000
   const isAbort = options.isAbort ?? defaultIsAbort
   const now = options.now ?? (() => Date.now())
   /** `provider\0accountId` → 该账号的缓存实例（懒建，与 `usage-badge.ts:180-191` 同款）。 */
@@ -201,6 +300,35 @@ export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
    *（`TtlCache.get` 的去重），而它们传的条目是同一个账号 ⇒ 内容相同。
    */
   const slots = new Map<string, { provider: string; entry: BalanceCacheEntry }>()
+  /**
+   * ★ `key` → **最后一次成功读数**（兼顶的权威来源，2026-10-16 审计 P2 修正）。
+   *
+   * ## 为什么不能用 `TtlCache` 的槽位当兼顶来源（实测复现的缺陷）
+   *
+   * 初版在 `readStale` 里 `peekStale()` 取旧值、失败后**回滚写入**槽位。
+   * 那在**顺序**调用下能工作，但**并发**下会失效：
+   *
+   * ```
+   * A: peekStale() → 旧值 ✓      B: peekStale() → undefined ✗
+   * A: get() 失败 → 写失败读数
+   * B: get() 命中那条失败读数     ⇒ B 的 previous 已经是 undefined
+   * ```
+   *
+   * 实测（两个并发 `readStale`、上游失败）：**两个都拿不到兼顶值** ——
+   * 比「只有一个拿不到」更糟，因为先到的那个也会被后到的覆盖掉。
+   *
+   * ⇒ 生产路径复刻显示：面板轮询与对话请求并发时，**面板显示有余额、
+   *   选号器同时报「余额查询失败」** —— 正是 IKMCOO 要消灭的那个矛盾，
+   *   在并发下原样复现。
+   *
+   * ## 为什么这张表能解决
+   *
+   * 它**只写成功读数**（`fresh.error === undefined` 时才 `set`），与失败无关
+   * ⇒ 任何并发时序下都不会被覆盖掉。且写入时机在 `get()` **之后**，
+   * 并发的两个 `get()` 共用同一次在飞 load（`TtlCache` 的去重），
+   * 因此也只会写一次相同的内容。
+   */
+  const lastSuccess = new Map<string, BalanceReading>()
   const keyOf = (provider: string, accountId: string) => `${provider}\u0000${accountId}`
 
   /**
@@ -209,7 +337,19 @@ export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
   const fetchReading = async (provider: string, entry: BalanceCacheEntry): Promise<BalanceReading> => {
     const at = now()
     try {
-      return { at, value: await options.fetch(provider, entry) }
+      const value = await options.fetch(provider, entry)
+      /**
+       * ⚠️⚠️ **成功读数统一在这里记账**（2026-10-16 对抗审计 P2 修正）。
+       *
+       * 三条取数路径都经过本函数（`read` / `readOne` / `readStale` 的回源），
+       * 在这里记一次即可**覆盖全部**入口；而 `write`（端点回写）是唯一的旁路，
+       * 它自己补一次。
+       *
+       * ⚠️ 为什么必须独立于 `TtlCache` 的槽位：槽位会被**并发**下的另一条
+       *   `get()` 覆盖成失败读数（实测两个并发 `readStale` 都拿不到兼顶值）。
+       */
+      lastSuccess.set(keyOf(provider, entry.id), { at, value })
+      return { at, value }
     } catch (error) {
       // ⚠️⚠️ **中止必须原样上抛**（铁律的第四种形态）：
       //    它不是「读不到余额」，而是「这次请求被取消了」—— 记成 `error` 读数会让
@@ -272,11 +412,91 @@ export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
       return await cacheOf(key).get({ force: readOptions.force === true })
     },
 
+    /**
+     * ★ 兼顶读取：成功用新值，失败回落**上一次的成功值**。
+     *
+     * ## ⚠️ 为什么不复用 `readOne` + 外面判 `error`
+     *
+     * 那样做需要调用方自己再查一次「旧值还在不在」，而旧值在 `readOne` 内部
+     * 已经被 `get()` 用 `write()` **覆盖成失败读数**了 ⇒ 旧值在那一刻就丢了。
+     * ⇒ 兼顶必须发生在**写入失败读数之前**，这是本方法存在的全部理由。
+     *
+     * ## ⚠️ 为什么失败读数**仍然写进缓存**
+     *
+     * 缓存里此刻既有失败读数、又有（更旧的）成功读数，两者不能共存于同一个
+     * `entry` —— 故 `readStale` **不**把兼顶结果写回：`TtlCache` 只有一个槽位，
+     * 让失败读数占住它会**毁掉兼顶的能力**（下一轮再来时旧值已经没了）。
+     * ⇒ 代价：紧接着的 `readOne` 会再打一次上游。那正是「兼顶与严格读取不可兼得」
+     *   的诚实登记，不是缺陷。
+     */
+    async readStale(provider, accountId, entry, readOptions = {}) {
+      const key = keyOf(provider, accountId)
+      const cache = cacheOf(key)
+      const limit = readOptions.staleTtlMs ?? staleTtlMs
+      const force = readOptions.force === true
+      slots.set(key, { provider, entry: { id: accountId, ...entry } })
+      const fresh = await cache.get({ force })
+
+      /**
+       * ⚠️⚠️ **成功 ⇒ 立刻记进「最后成功值」表**（2026-10-16 审计 P2）。
+       *
+       * 写入时机在 `get()` **之后**且**只在成功时**：并发���个 `get()` 共用同一次
+       * 在飞 load（`TtlCache` 去重）⇒ 只会写一次相同内容 ⇒ 表不会被覆盖。
+       */
+      if (fresh.error === undefined) {
+        // ⚠️ **兼顶回滚的值不算「成功」**：它是上一轮的成功值 + 本轮的失败，
+        //   若把它当新鲜成功写进表，就会**刷新兼顶上界的计时起点** ⇒ 上界永不到期。
+        if (fresh.stale !== true) lastSuccess.set(key, fresh)
+        return { at: fresh.at, value: fresh.value, stale: false }
+      }
+
+      // ⚠️ 兼顶来源是**独立的最后成功值表**，不是 `TtlCache` 的槽位
+      //   （槽位在并发下会被失败读数覆盖，实测两个并发都拿不到兼顶值 ——
+      //   见上面 `lastSuccess` 的注释）。
+      const previous = lastSuccess.get(key)
+      // ⚠️ **没有旧值可兼顶**（含「旧值已被 `write`/`clear` 丢弃」）⇒ 如实报错。
+      if (previous?.value === undefined) {
+        cache.set({ at: fresh.at, value: undefined, error: fresh.error })
+        return { at: fresh.at, value: undefined, error: fresh.error, stale: true }
+      }
+      // ⚠️ **兼顶有上界**：超龄的旧值不再使用 —— 否则一次读数命中后就永久生效。
+      // ⚠️⚠️ 判据读 `previous.at`（`BalanceReading` 的字段名，**不是** `atMs`
+      //    —— 那是 `TtlCache.Entry` 的字段名，两层结构不同）。我第一版写成
+      //    `previous!.atMs` ⇒ `NaN >= limit` 恒假 ⇒ **上界形同虚设**，
+      //    任何陈旧值都会被无限兼顶（守卫用例实测打穿）。
+      // ⚠️ **`force` 下不兼顶**：用户点了面板「刷新」就是要看真实结果，
+      //   「刷新后仍显示旧值」比报错更难解释。
+      if (force || now() - previous.at >= limit) {
+        cache.set({ at: fresh.at, value: undefined, error: fresh.error })
+        return { at: fresh.at, value: undefined, error: fresh.error, stale: true }
+      }
+      /**
+       * ⚠️ **兼顶值必须标 `stale`**（2026-10-16 审计 P1-2，实测复现）。
+       *
+       * 不标的后果：下次 `get()` 在 TTL 内直接命中 ⇒ 返回 `{ stale: false }` ⇒
+       * 「本次查询失败」的标注凭空消失，用户误以为上游已恢复（而上游还挂着）。
+       * **比报错更糟**（它看起来成功了）。
+       *
+       * ⚠️ 而它**不能**写进 `lastSuccess`（见上面成功分支的注释）。
+       */
+      return {
+        at: previous.at,
+        value: previous.value,
+        error: fresh.error,
+        stale: true,
+      }
+    },
+
     write(provider, accountId, reading) {
       // ⚠️ 失败读数**不写**：见 `BalanceCache.write` 的注释（失败是瞬时的，
       //    写进去会让折算侧把「刚失败过一次」当成当前结论）。
       if (reading.error !== undefined) return
       cacheOf(keyOf(provider, accountId)).set(reading)
+      // ⚠️⚠️ **同时更新「最后成功值」表**（2026-10-16 审计 P2）：
+      //   `credits.balances` 端点走的是 `write` 而**不是** `readStale`
+      //   （它自己取数后回写）⇒ 不更新这张表的话，**只有面板查过的账号**
+      //   才可能兼顶，选号器/聚合侧的 `readStale` 会读到 `undefined`。
+      lastSuccess.set(keyOf(provider, accountId), reading)
     },
 
     clear(provider) {
@@ -284,6 +504,9 @@ export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
         for (const cache of perAccount.values()) cache.clear()
         perAccount.clear()
         slots.clear()
+        // ⚠️⚠️ **兼顶表也必须清**（2026-10-16 审计 P2）：留着会让「已 clear 的账号」
+        //   仍能拿到陈旧值 —— 症状是「账号删了还能显示余额」，且**零报错**。
+        lastSuccess.clear()
         return
       }
       const prefix = `${provider}\u0000`
@@ -292,6 +515,7 @@ export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
         cache.clear()
         perAccount.delete(key)
         slots.delete(key)
+        lastSuccess.delete(key)
       }
     },
   }
