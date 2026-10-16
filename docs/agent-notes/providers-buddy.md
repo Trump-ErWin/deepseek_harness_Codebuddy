@@ -541,17 +541,43 @@ DSH 直连同一模型正常 ⇒ 差别只在**外部客户端往 system 里注�
 ### ⚠️⚠️ 千万不要把 `11128` 加进 `isContentRejection`
 
 `buddy-adapter.ts` 的 `isContentRejection`（11140 / `request illegal` /
-`安全审核|safety review`）**维持现状是正确的**。11128 是**内容级**拦截 ——
-同一账号换掉那一句就 200。认成账号级会走
+`安全审核|safety review`）**维持现状是正确的**：认成账号级会走
 `markPolicyBlockedAccount` → **30 分钟账号冷却**（`policyBlockResetAtMs`），
-而池里每个账号都会在同一句上被拦 ⇒ 把「一句话被拦」放大成「整个账号池半小时
-不可用」。
+把一次请求级拒绝放大成「整个账号池半小时不可用」。
+
+#### ⚠️ 但「11128 = 内容级拦截」这个定性**不准确**，别照着它判断原因
+
+`11128` 是**一个共用业务码**，至少四族成因，`msg` 字段各不相同 —— **只有看 `msg`
+才能定位**。写死成「内容级」会把排查引向「找哪句话触发了风控」，方向完全错：
+
+| `msg` | 族 | 换账号/换模型有用？ | 正确出路 |
+|---|---|---|---|
+| `Illegal API invocation from an unapproved channel` | 渠道级 | ❌ | 走网关的指纹改写链路（见本节上文） |
+| `first message is not system prompt` | 消息形状级 | ❌ | 补首位 system（`LEADING_SYSTEM_PLACEHOLDER`） |
+| 含风控指纹字面量（`displayMsg.zh`=「请求被安全策略拦截」） | **内容级** | ⚠️ 换账号无效（同句在每个号上都被拦） | 改写 `system` / `assistant` 正文 |
+| **`conversation id missing`** | **请求头级** | ❌ | 补 `X-Conversation-*` 三头（2026-10-16） |
+
+⚠️ 前三族「改内容就 200」成立，但**第四族与内容完全无关** —— 它连 `displayTips`
+都在说「这次调用没通过渠道校验，**可能不是官方客户端发出的**」。把它当成内容级
+去改提示词，永远修不好。
+
+**为什么这仍然支持「不加进 `isContentRejection`」**：四族**全部**是请求级
+（换账号无用，因为同一份请求在池里每个号上同样被拒），30 分钟账号冷却对哪一族
+都是误伤。结论不变，只是**理由从「因为它是内容级」改成「因为它全部是请求级」**。
+
+#### 回归用例现状
 
 ⚠️ **实测的 HTTP 400 形态根本走不到那个判据**（400 在适配器里是「非法请求」早退），
 所以这层保护真正生效的地方是**流内**那条通道（HTTP 200 + 无 `choices` 的错误帧，
-`buddy-adapter.ts:1855`）。回归用例按此设计：`buddy-adapter.spec.ts` 的
-「内容级风控（11128）」段，**流内那条才会红**（已做反向验证：把 `11128` 加进
-`isContentRejection` → 该用例红；400 那条不红，别拿它当判据）。
+`buddy-adapter.ts` 里 `data.choices === undefined && isContentRejection(payload)`
+那一处 —— ⚠️ 刻意不写行号，本文件历史上记的行号已多次因改动漂移）。
+`buddy-adapter.spec.ts` 的「内容级风控（11128）」段**流内那条才会红**（已做反向
+验证：把 `11128` 加进 `isContentRejection` → 该用例红；400 那条不红，别拿它当判据）。
+
+⚠️ 该段的 `unapprovedChannelBody` 报文用的是 `Illegal API invocation from an
+unapproved channel`（**渠道级**那条），不是内容指纹那条 —— 引用它论证「内容级」
+是错位的。第四族（`conversation id missing`）的守卫在 `buddy-adapter.spec.ts` 的
+`X-Conversation-*` 三头用例组。
 
 ### 端到端实发验证（已通过）
 
