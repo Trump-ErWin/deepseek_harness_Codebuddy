@@ -2339,6 +2339,99 @@ export class BuddyAdapter extends LlmAdapter {
     // 注意 X-Product 是**归属名**（产品名），不是部署类型 —— 历史实现发成
     // `SaaS` 导致后台归因不到产品。
     headers.set('X-Agent-Purpose', 'conversation')
+    // ⚠️ `X-Conversation-*` 三头 —— **这组头的准入必要性已被实测证伪**（2026-10-16）。
+    //
+    // ## 背景（真实报障 issue IKM73W）
+    // workbuddy 渠道曾**整条不可用**，每轮报
+    // `workbuddy: 请求被拦截，请重新发送 conversation id missing`（INVALID_REQUEST）。
+    // 上游原始报文（HTTP 400）：
+    // ```json
+    // {"code":11128,"msg":"conversation id missing",
+    //  "displayMsg":{"zh":"请求被拦截，请重新发送"},
+    //  "displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}
+    // ```
+    //
+    // ## ⚠️⚠️ 三头**不是**准入必需 —— 本注释原先写的是相反的结论，已撤回
+    //
+    // 原注释断言「三头必须同时存在，缺任一即 400/11128」，并附了一张对照表。
+    // **该表已被 2026-10-16 的同账号真机复测推翻**（真实凭据，约 90 次请求）：
+    //
+    // | 实验 | 规模 | 结果 |
+    // |---|---|---|
+    // | 适配器 A/B（剥三头 vs 带三头） | 5 模型 × 各 5 次 | 剥三头 **15/15 成功**，两组**完全一致** |
+    // | **逐枚消融 14 枚头** | 每枚单独删一次 | **14/14 全部仍 200**（含这三枚） |
+    // | 裸 fetch 头形态矩阵 | 5 种头形态 × 2 种 system × 3 次 | 干净 system **全 200**；带指纹 system **全 400** ⇒ **变量是 system，不是头** |
+    // | 真模型线 × 请求形状 | 6 模型 × 4 形状 = 48 格 | 三头与响应状态**零关联** |
+    // | 逐级剥头阶梯（连 UA/鉴权/身份头都删） | 8 级 | **全 200** |
+    //
+    // ⇒ **同一份请求连鉴权头、身份头、UA 全删掉，上游照样回 200。**
+    // `conversation id missing` 这句 msg 在上述全部实验里**零次复现**
+    // （同批实测复现了另两句：`first message is not system prompt`、
+    // `Illegal API invocation from an unapproved channel` —— 见
+    // `src/openai-gateway/tencent-fingerprint.ts` 与 `src/account-probe.ts`）。
+    //
+    // ## 上游究竟怎么用这三枚头
+    // **回显**。实测三轮连发，回包 `"id"` 的前缀 **3/3 命中**所发的三头值；
+    // 另一次把三头填 `abc-123`，上游直接回 `"id":"abc-123"`。
+    // ⇒ 上游认得这三枚头，但只拿它当 **completion id 的种子**，**不作准入判据**
+    // —— 这从机制上就说明它不可能是「过不了就 400」的闸门。
+    //
+    // ## ⇒ 为什么仍然保留这三行
+    // 1. **无害且已被两站实测**：无三头也 200，补上不改变任何判定结果；
+    //    buddy（中国站）实测两组均 200。
+    // 2. **贴近官方客户端形态**：官方客户端确实带这三枚
+    //    （`docs/workbuddy-native-search-research.md` §4.4 有真值表；§4.5 只是
+    //    常量名表、不含取值），
+    //    补上让后台归因与上游行为对齐。
+    // 3. **修掉报错文案的误导性**：见下方「⚠️ 未解决的报障」。
+    //
+    // ## ⚠️ 未解决的报障 —— 本改动**没有**证据能修好它
+    // `conversation id missing` 至今未能复现，因此**不能**声称本改动解决了
+    // IKM73W。若用户再次看到这句：真实触发条件仍未知，**先取失败会话的完整
+    // 报文**（上游报文带 `requestId`，是唯一定位手段），不要按「补头」方向排查。
+    //
+    // ## ⚠️⚠️ 语义：三头是**逐请求一次性 id**，不是「会话身份」
+    // 本实现的 `conversationId` 在**每次 `send()` 调用时新生成**
+    // （`send()` 有 5 个调用点，含换号重试与饱和退避重试）⇒ **零轮稳定性**。
+    // 官方真值对照（§4.4）：
+    // | 头 | 官方取值 | 本实现 | 是否对齐 |
+    // |---|---|---|---|
+    // | `X-Conversation-ID` | `context.id`（**会话稳定**） | 逐请求新 UUID | ❌ **语义相反** |
+    // | `X-Conversation-Request-ID` | `context.conversationRequestId \|\| ""`（**官方默认空串**） | 逐请求新 UUID | ❌ 不一致 |
+    // | `X-Conversation-Message-ID` | 32 位无横线 uuid（**逐消息**） | 逐请求新 UUID | ✅ 同型 |
+    // 只有 Message-ID 对得上。**一个每轮都变的值在语义上不是会话身份** ——
+    // 原注释那句「混用会把缓存分桶与会话身份绑死」因此不成立（复用 `sessionId`
+    // 绑死的其实是「缓存分桶」与「一次性 id」，同样是两件事，但轻重不同）。
+    // ⚠️ 实测上游**不做**跨轮状态机（同一 `prompt_cache_key` 连发三轮、每轮换
+    // 三头值，上游 3/3 接受），故当前**无害**；若上游将来按 conversation id 做
+    // 跨轮归并，本实现会让每轮成为新会话。真要对齐官方需另派生会话级常量。
+    //
+    // ## ⚠️ 刻意不复用 `this.sessionId`
+    // 那是 `prompt_cache_key` 的语义（**前缀缓存的分桶键**）。本仓库登记过多次
+    // 「两处语义不同的东西共用一个值」导致的漂移缺陷，故分开。
+    // ⚠️ `sessionId` 的作用域（本仓**代码可证**的部分）：`this.sessionId =
+    // options.sessionId ?? crypto.randomUUID()...` 在**构造器**里赋值，而
+    // `registerBuddyLlm` 在 `index.ts` 的 `apply()` 内**每个产品造一个 adapter**
+    // ⇒ 它是**每产品一个值、该产品的所有会话与账号共用**，既不是每轮也不是每会话。
+    // ⚠️ **另有一条路径**：`index.ts` 的 `probeById.createProbeAdapter` **每次探测
+    // 另建一个 adapter** ⇒ 探测路径的 `sessionId` 是每次新的（同样非每轮）。
+    // ⚠️ 刻意**不断言**它「是插件进程级」—— 宿主何时重建插件实例，本仓无任何
+    // 证据，属推断，不写成断言句。
+    //
+    // ## ⚠️ 刻意不按 `product.id` 分支
+    // buddy（CodeBuddy 中国站）带上这三头实测**仍 200**（2026-10-16 复核），
+    // 即无害。加分支会制造两条出站路径，而两者在本项上并无真实差异 ——
+    // 未来只改一条就会静默漂移。
+    //
+    // ## 两条旁路（`src/buddy-growth.ts`）也打同一端点
+    // 原注释称「`buddy-growth.ts` 早已携带 `X-Conversation-ID` ⇒ 属补一致性缺口」，
+    // 这条论证**已随上面的证伪一并撤回**（它恰恰是「一枚就够」的反证）。
+    // 现状（2026-10-16 起）：两条旁路已同步补齐三头，**理由不是「准入必需」，
+    // 而是「与主链路形态一致」** —— 与本处同源，见该文件内的对应注释。
+    const conversationId = crypto.randomUUID().replace(/-/g, '')
+    headers.set('X-Conversation-ID', conversationId)
+    headers.set('X-Conversation-Request-ID', conversationId)
+    headers.set('X-Conversation-Message-ID', conversationId)
     headers.set('X-IDE-Name', this.product.attributionName)
     headers.set('X-IDE-Type', this.product.attributionName)
     headers.set('X-IDE-Version', this.product.clientVersion)
