@@ -329,3 +329,140 @@ describe('createBalanceCache：在飞去重（并发读取同一账号只回源�
     expect(calls, '★ 在飞去重：并发只发一次').toHaveLength(1)
   })
 })
+
+/**
+ * ★★ 陈旧兼顶（`readStale`）—— 用户 2026-10-16 的明确要求：
+ * 「用底层缓存；加载如果得不到新数据，应该读出旧数据，不能直接返回错误
+ * （除非旧数据也没有）」。
+ *
+ * ⚠️ 判据打在**返回值**上（value / stale / error / 复取次数），不打内部字段。
+ */
+describe('★★ readStale：拿不到新数据就回落旧数据（用户 2026-10-16）', () => {
+  /** 建一个「先成功、后失败」的世界。 */
+  function flakyWorld(overrides: { staleTtlMs?: number } = {}) {
+    let clock = 1_000_000
+    const calls: string[] = []
+    let fail = false
+    const cache = createBalanceCache({
+      ttlMs: 120_000,
+      failureTtlMs: 15_000,
+      ...overrides.staleTtlMs === undefined ? {} : { staleTtlMs: overrides.staleTtlMs },
+      now: () => clock,
+      fetch: async (provider: string, entry: { id: string }) => {
+        calls.push(`${provider}:${entry.id}`)
+        if (fail) throw new Error('上游超时')
+        return { provider, id: entry.id, balance: 42 }
+      },
+    })
+    return {
+      cache,
+      calls,
+      advance: (ms: number) => { clock += ms },
+      now: () => clock,
+      breakIt: () => { fail = true },
+    }
+  }
+
+  it('★★ 首次取数成功 ⇒ 原样返回，`stale` 为 false', async () => {
+    const { cache } = flakyWorld()
+    const reading = await cache.readStale('loomy', 'a1', { credential: {} })
+    expect(reading.value, '★ 本次成功就用新值').toEqual({ provider: 'loomy', id: 'a1', balance: 42 })
+    expect(reading.stale, '★ 本次成功不得标陈旧').toBe(false)
+    expect(reading.error).toBeUndefined()
+  })
+
+  it('★★ 过期后取数失败 ⇒ 返回**旧值** + stale:true + 本次失败原因', async () => {
+    const world = flakyWorld()
+    const first = await world.cache.readStale('loomy', 'a1', { credential: {} })
+    expect(first.stale).toBe(false)
+
+    // 过期（跨过 120s TTL）且上游开始失败
+    world.advance(130_000)
+    world.breakIt()
+    const second = await world.cache.readStale('loomy', 'a1', { credential: {} })
+
+    // ★ 核心断言：拿回的是**旧值**，不是错误
+    expect(second.value, '★★ 取数失败必须回落旧值而不是报错').toEqual(first.value)
+    expect(second.stale, '★★ 回落值必须标陈旧').toBe(true)
+    // 失败原因**仍然如实带回**（供 UI 显示「本次查询失败」）
+    expect(second.error, '★ 本次失败原因不得丢').toContain('上游超时')
+    // 陈旧值的时间戳是**当初**取到的时刻，不是现在
+    expect(second.at, '★ 陈旧值的 at 是当初取数的时刻').toBe(first.at)
+  })
+
+  it('★★ 没有旧数据可回落 ⇒ 仍如实报错（用户原话的「除非旧数据也没有」）', async () => {
+    const world = flakyWorld()
+    world.breakIt()
+    const reading = await world.cache.readStale('loomy', 'a1', { credential: {} })
+    expect(reading.value, '★ 无旧值可兼顶 ⇒ 不得编造').toBeUndefined()
+    expect(reading.error).toBeDefined()
+    expect(reading.stale).toBe(true)
+  })
+
+  it('★★ 兼顶失败**不得**让旧值消失（下一轮还能顶）', async () => {
+    // ⚠⚠️ 这是本实现最容易写错的一格：`get()` 失败时会把失败读数写进唯一的槽位
+    //    ⇒ 若不回滚，下一轮兼顶时 `previous` 已经是失败读数 ⇒ 兼顶能力**只活一轮**。
+    const world = flakyWorld()
+    await world.cache.readStale('loomy', 'a1', { credential: {} })
+    world.advance(130_000)
+    world.breakIt()
+
+    const second = await world.cache.readStale('loomy', 'a1', { credential: {} })
+    expect(second.value, '第一轮兼顶').toBeDefined()
+    // ⚠️ 必须**再**推进时间，让失败读数的短 TTL 也过期——否则第二轮会命中
+    //    失败读数的缓存，测不到「回滚是否真的保住了旧值」。
+    world.advance(130_000)
+    const third = await world.cache.readStale('loomy', 'a1', { credential: {} })
+    expect(third.value, '★★ 兼顶能力必须持续有效，不得只活一轮').toBeDefined()
+    expect(third.stale).toBe(true)
+    // 时间戳仍是**最初**那次成功的时刻（旧值一直没被覆盖）
+    expect(third.at, '★ 旧值没被失败读数顶掉').toBe(second.at)
+  })
+
+  it('★★ 兼顶**有上界**：超龄的旧值不再使用（否则一次命中就永久生效）', async () => {
+    // ⚠️⚠️ 时间轴必须同时跨过**两个**阈值，缺一个测的就不是兼顶：
+    //   - `ttlMs`（120s）—— 不跨过它就**根本不会回源**，拿到的是新鲜缓存值，
+    //     判据会假绿（我第一版只 advance 90s，实测打穿：拿到的是新鲜值而非旧值）；
+    //   - `staleTtlMs`（60s）—— 这是本条真正要验的上界。
+    const world = flakyWorld({ staleTtlMs: 60_000 })
+    await world.cache.readStale('loomy', 'a1', { credential: {} })
+    world.breakIt()
+    world.advance(130_000)   // > 120s TTL（触发回源）且 > 60s 兼顶上界（触发超龄）
+    const reading = await world.cache.readStale('loomy', 'a1', { credential: {} })
+    expect(reading.value, '★★ 超过兼顶上界后不得再用旧值').toBeUndefined()
+    expect(reading.error, '★ 无值可兼顶 ⇒ 如实报错').toBeDefined()
+  })
+
+  it('★★ 兼顶**上界之内**仍可回落（证明上一条不是「永远不兼顶」）', async () => {
+    // ⚠️ 这是上一条的**反向对照**：没有它，「兼顶上界」那条可能是因为
+    //    兼顶功能压根没实现而全绿（恒真风险，见 AGENTS.md 的变异验证纪律）。
+    const world = flakyWorld({ staleTtlMs: 600_000 })
+    await world.cache.readStale('loomy', 'a1', { credential: {} })
+    world.breakIt()
+    world.advance(130_000)   // 跨过成功 TTL，但远未到 10 分钟兼顶上界
+    const reading = await world.cache.readStale('loomy', 'a1', { credential: {} })
+    expect(reading.value, '★ 上界内必须兼顶').toBeDefined()
+    expect(reading.stale).toBe(true)
+  })
+
+  it('★ 兼顶**不重复打上游**：TTL 内再次 readStale 直接命中、不回源', async () => {
+    const world = flakyWorld()
+    await world.cache.readStale('loomy', 'a1', { credential: {} })
+    const before = world.calls.length
+    await world.cache.readStale('loomy', 'a1', { credential: {} })
+    expect(world.calls.length, '★ TTL 内命中不得回源').toBe(before)
+  })
+
+  it('★★ 中止**不得**被兼顶吞掉（它不是「查不到」，是「被取消了」）', async () => {
+    // ⚠️ 铁律（`balance-cache.ts` 模块头约束 1）：中止必须原样上抛。
+    //   若 readStale 把中止也当成普通失败去顶旧值，用户点「取消」会看到
+    //   一条「数据陈旧」的提示，而真正的取消信号消失。
+    const cache = createBalanceCache({
+      ttlMs: 120_000,
+      isAbort: (error) => (error as { name?: unknown })?.name === 'AbortError',
+      fetch: async () => { const e = new Error('取消'); e.name = 'AbortError'; throw e },
+    })
+    await expect(cache.readStale('loomy', 'a1', { credential: {} }))
+      .rejects.toThrow('取消')
+  })
+})
