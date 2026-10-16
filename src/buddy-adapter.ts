@@ -2339,6 +2339,55 @@ export class BuddyAdapter extends LlmAdapter {
     // 注意 X-Product 是**归属名**（产品名），不是部署类型 —— 历史实现发成
     // `SaaS` 导致后台归因不到产品。
     headers.set('X-Agent-Purpose', 'conversation')
+    // ⚠️⚠️ `X-Conversation-*` 三头**必须同时存在**，缺任一即 400/11128
+    //    `conversation id missing`（2026-10-16 对照实测，原始报文见下）。
+    //
+    // ## 症状（真实报障）
+    // workbuddy 渠道**整条不可用**：任何模型、任何账号、任何会话都报
+    // `workbuddy: 请求被拦截，请重新发送 conversation id missing`（INVALID_REQUEST）。
+    // 新开会话同样复现，换回旧版插件同样复现 —— 因为它与版本无关，是请求头缺失。
+    //
+    // ## 原始报文（HTTP 400）
+    // ```json
+    // {"code":11128,"msg":"conversation id missing",
+    //  "displayMsg":{"zh":"请求被拦截，请重新发送"},
+    //  "displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}
+    // ```
+    //
+    // ## 对照实验（同账号 / 同网络 / 同模型，唯一变量是头）
+    // | 形态 | 结果 |
+    // |---|---|
+    // | 不发（本次修复前的行为） | ❌ 400/11128 |
+    // | 仅 `X-Conversation-ID` / 仅 Request / 仅 Message | ❌ 400/11128 |
+    // | 任意**两头**组合 | ❌ 400/11128 |
+    // | **三头齐全** | ✅ 200 |
+    // | 补 `X-Session-ID`（另一枚会话头，三头仍缺） | ❌ 400/11128 ⇒ 不是「随便补个会话头」 |
+    //
+    // ⇒ 判据是「三头**同时**存在」，故**绝不可**把其中任一行当冗余删除。
+    //
+    // ## 值与格式（实测）
+    // - 服务端**不校验值**：三头填 `abc-123` 同样 200；
+    // - 取 uuid 只是贴近官方客户端 `context.id` 的形态，**不是**被校验的要求；
+    // - 同一组值连发 3 轮（模拟同会话多轮）稳定 200；
+    // - 带横线 UUID 与 32 位无横线均放行（本处取无横线，与 `sessionId` 形态一致）。
+    //
+    // ## ⚠️ 刻意不复用 `this.sessionId`
+    // 那是 `prompt_cache_key` 的语义（前缀缓存的分桶键）。两者**语义不同**，
+    // 混用会把「缓存分桶」与「会话身份」绑死 —— 本仓库登记过多次
+    // 「两处语义不同的东西共用一个值」导致的漂移缺陷，故刻意分开。
+    //
+    // ## ⚠️ 刻意不按 `product.id` 分支
+    // buddy（CodeBuddy 中国版）带上这三头实测**仍 200**，即无害。加分支会制造
+    // 两条出站路径，而两者在本项上并无真实差异 —— 未来只改一条就会静默漂移。
+    //
+    // ## 同仓先例
+    // `src/buddy-growth.ts` 对**同一个** `/v2/chat/completions` 端点早已携带
+    // `X-Conversation-ID`（成长中心任务链路），仅聊天主链路漏了 —— 属补一致性缺口，
+    // 不是新开的行为。
+    const conversationId = crypto.randomUUID().replace(/-/g, '')
+    headers.set('X-Conversation-ID', conversationId)
+    headers.set('X-Conversation-Request-ID', conversationId)
+    headers.set('X-Conversation-Message-ID', conversationId)
     headers.set('X-IDE-Name', this.product.attributionName)
     headers.set('X-IDE-Type', this.product.attributionName)
     headers.set('X-IDE-Version', this.product.clientVersion)
