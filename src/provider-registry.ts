@@ -431,6 +431,41 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     credits: { balance: false, dailyCheckin: false },
     channel: false,
   },
+  {
+    id: 'modelscope',
+    label: 'ModelScope (魔搭)',
+    displayName: 'ModelScope (魔搭)',
+    logoClass: 'modelscope',
+    // ⚠️ 与 opencode 同款取舍：balance: false 是**如实登记**，不是偷懒。
+    //
+    // 魔搭**没有额度查询 API**：实测 12 个候选路径（users/quota、quota、usage、
+    // free-quota、billing/usage、magic/quota、points/balance …）除 /api/v1/users/{name}
+    // 外**全部 404**；而那个唯一 200 的 /api/v1/users/credit 是把 URL 段**原样回显**的
+    // 公开主页接口（users/credit → UserName:"credit"，无 Authorization 也 200），
+    // **不是**余额接口。api-inference 域名下同样只有 /v1/models 与 /v1/chat/completions，
+    // 响应头也无额度字段。
+    //
+    // ⇒ 既然后台读不到任何数字，就不该渲染「刷新积分」与徽章读数。
+    //
+    // ⚠️ 与 opencode 的**关键差异**（别把两者当同一格）：opencode 能展示
+    // 「通道可用性」（本地状态，零网络），而**我们连本地都没有可展示的量** ——
+    // 账号池里没有逐日用量计数器（ProviderAccountEntry 只有 modelRateLimits，
+    // 语义是「该模型冷却到何时」）。凭空推算「今日已用」会给出**重启即失真**的假读数
+    // （AGENTS.md：「绝不编造数字」）。故如实为 false。
+    credits: { balance: false, dailyCheckin: false },
+    // ⚠️ 无签到：额度是**每日自动刷新**（每账号 250 魔粒、UTC+8 零点重置，
+    //    旗舰档每次扣 2），**没有「领取」动作、也没有签到 API**。
+    //    宿主侧 credits.claimAll 仍要显式回一句可读错误（见 jet-hub-rpc.ts），
+    //    否则自动签到会把它记成 **failed** 而不是 **inactive**。
+    //
+    // ⚠️ 不登记 rateLimit：魔搭确实会回 429，且本适配器**会写** modelRateLimits
+    //    （见 modelscope-adapter.ts 的 modelscopeRetryAfterMs），故省略 = true
+    //    才是正确语义（省略表示「会写标记、按钮该管」）。
+    // ⚠️ 不登记 accountTest / creditPackages / permanentLock / usesExpiryWindow
+    //    —— 全部省略 = false，与能力实情一致。
+    // ⚠️ 不登记 settingsNamespace：它不在老契约（≤0.1.6）的 namespace 清单里。
+    channel: true,
+  },
 ])
 
 /** 按 id 取声明；未知返回 `undefined`（调用方决定报错措辞）。 */

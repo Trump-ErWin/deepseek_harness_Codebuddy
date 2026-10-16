@@ -114,6 +114,10 @@ function setup(options: HarnessOptions) {
     //（少一个键本应编译不过，但调用处是 `as never` 转型，故由下面那条
     //「JetHubAuths 的每个键都在 Set 里」的守卫在**源码层**兜）。
     accio: a('accio'),
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-16）：同 accio，本 harness 的 auths
+    //    必须与 `JetHubAuths` **逐键同形**（否则上面那条「每个键都在 Set 里」的
+    //    源码层守卫会红，而 `as never` 转型挡不住）。
+    modelscope: a('modelscope'),
   }
   registerJetHubRpc(
     ctx as never,
@@ -657,6 +661,14 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
   const SELF_HEAL_EXEMPT: ReadonlyMap<string, string> = new Map([
     ['loomy', 'Loomy 没有 refresh 端点，refreshAccountCredential 只是有效性探测'],
     ['zcode', 'ZCode 同上：没有 refresh 端点，探测当续期用只会白发请求'],
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。理由比上面两家**更根本**：
+    //    ① 它 `credits.balance === false`（平台没有额度 API）⇒ 自愈链的触发点
+    //       （`credits.balances` 端点）压根不会为它走到续期那一步；
+    //    ② 它的凭据是**长期有效的 API Key**（`expires_at` 可选，实测魔搭的 Key
+    //       默认不过期）⇒ 没有「快过期」这回事。
+    //    `refreshAccountCredential` 仍按统一接口做有效性对账（回写池内 `expiresAt`），
+    //    但那不发任何网络请求，也不该被自愈端点调用。
+    ['modelscope', '无 refresh 端点（静态 API Key，无过期）且 credits.balance === false（平台无额度 API）'],
   ])
 
   it('★ Set 里的字面量恰好是 codearts / buddy / workbuddy（多一个少一个都红）', () => {

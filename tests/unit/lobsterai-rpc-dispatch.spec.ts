@@ -110,7 +110,7 @@ describe('account.refresh 分派（T7 回归）', () => {
     expect(
       EXPECTED_REFRESH_PROVIDER_IDS,
       'channel 集合变了，请复核 opencode 豁免是否仍成立（见 AUTH_EXEMPT）',
-    ).toHaveLength(15)
+    ).toHaveLength(16)
   })
 
   it('buddy 账号刷新**自己的** credentialRef，而不是默认单凭据 ref', async () => {

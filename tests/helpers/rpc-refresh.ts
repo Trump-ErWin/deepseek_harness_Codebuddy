@@ -69,6 +69,10 @@ export const REFRESH_PROVIDERS = [
   // accio（2026-10-13）：有真实 refresh 端点（`accio-auth.ts` 的
   // `refreshCredential`），`refreshAccountCredential` 续期并回写池内 `expiresAt`。
   'accio',
+  // ⚠️ **本 fork 独有**（modelscope，2026-10-16）：它**在**表里（与 loomy 同款理由
+  //    —— 没有 refresh 端点，但 `refreshAccountCredential` 仍按统一接口做
+  //    有效性对账并回写池内 `expiresAt`）。
+  'modelscope',
 ] as const
 
 /**

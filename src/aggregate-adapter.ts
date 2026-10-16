@@ -781,6 +781,11 @@ export class AggregateAdapter extends LlmAdapter {
     'gemini',
     'zcode',
     'opencode',
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-16）：`channel: true` ⇒ 必须进聚合目录，
+    //    否则它的模型**永不进聚合、静默不可见**。
+    //    ⚠️ 但**不**接入 `WIRED_EXPIRY_PROVIDERS` —— 魔搭没有额度 API，折算恒为
+    //    `UNUSABLE`，登记过去只会让每次折算白打一轮探测（见 `aggregate-expiry.ts`）。
+    'modelscope',
     // officeace（2026-10-12）：华为 MaaS 云端直连渠道，`channel: true`
     // ⇒ 必须进聚合目录，否则它的模型**永不进聚合、静默不可见**。
     // ⚠️ 本数组**只是第一道门**（模型层归并）。真正决定「在不在候选表里」的是

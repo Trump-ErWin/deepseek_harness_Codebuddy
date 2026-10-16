@@ -135,6 +135,12 @@ export const CREDITS_TABLE_EXEMPT: ReadonlyMap<string, string> = new Map([
   ['qoder', 'fetchQoderCreditBalance 只吃 QoderCredential，与共享骨架的泛型不兼容'],
   ['qodercn', '同 qoder（两者复用同一个 QoderAuth，余额原语同形）'],
   ['officeace', '余额是云侧 V11 签名直读（STS 凭据 + 签名在 auth 模块内），没有 fetchBalance 注入点'],
+  // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。理由与上面四条**都不同**：
+  //    它们各自有可读的余额来源（本地派生 / 泛型不兼容 / 签名直读），而魔搭是
+  //    **平台根本没有额度查询 API** —— 实测 12 个候选路径除 `/api/v1/users/{name}`
+  //    外全部 404，而那一个是把 URL 段原样回显的公开主页接口。
+  //    ⇒ 既没有 fetchBalance 可实现，也不该渲染积分读数。
+  ['modelscope', '平台没有额度查询 API（12 个候选路径全 404）；本地亦无逐日用量计数器可派生'],
 ])
 
 /**
@@ -263,6 +269,10 @@ export const WRITES_RATE_LIMIT_PROVIDERS: readonly string[] = Object.freeze([
   'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'cline',
   'zcode', 'trae', 'gemini', 'codearts', 'loomy', 'raccoon', 'opencode',
   'minimax',
+  // ⚠️ **本 fork 独有**（modelscope，2026-10-16）：它**会写** `modelRateLimits`
+  //    （见 `modelscope-adapter.ts` 的 `modelscopeRetryAfterMs`）。漏登记 =
+  //    标记写进去却在 `probeById` 里查不到 ⇒ 「重测 / 重置」清不掉（该陷阱已复发过）。
+  'modelscope',
 ])
 
 /** **期望**注册进 `probeById` 的 provider id（会写标记 − {@link PROBE_EXEMPT}）。 */

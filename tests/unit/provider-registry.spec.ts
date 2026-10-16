@@ -27,11 +27,14 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-  it('共 17 条（16 个真渠道 + aggregate）', () => {
+  it('共 18 条（17 个真渠道 + aggregate）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
-    expect(PROVIDER_REGISTRY).toHaveLength(17)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(16)
+    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（第 17 个真渠道）：它是上游没有的
+    //    provider，故本 fork 的条数恒比上游多 1。合并上游时**不要**把这里改回 17
+    //    —— 改回去会让 modelscope 的声明失去守卫（条数断言是「注册表没被误删」的唯一防线）。
+    expect(PROVIDER_REGISTRY).toHaveLength(18)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(17)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
   })
 
