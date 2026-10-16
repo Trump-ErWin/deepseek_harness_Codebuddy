@@ -3,7 +3,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-providers-hub`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）、`raccoon`（商汤 **Raccoon Work** / 小浣熊）与 `minimax`（**MiniMax Code 中国版**，首个 **Anthropic Messages** 协议族）十个 LLM provider 路由。
+本项目是 DeepSeek Harness 的一个插件（`dsh-providers-hub`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）、`raccoon`（商汤 **Raccoon Work** / 小浣熊）、`minimax`（**MiniMax Code 中国版**，首个 **Anthropic Messages** 协议族）与 `minimaxintl`（**MiniMax Code 国际版**，与 `minimax` 同协议族、共用同一份实现，差异只在 `src/minimax-product.ts`）等 LLM provider 路由。
 
 `buddy` 与 `workbuddy` 同源：共用同一 CLI 内核与同一认证协议，差异全部收敛在 `src/product.ts` 的产品配置中。关键差异是 **`endpoint`**：中国版为 `copilot.tencent.com`，国际版为 `www.workbuddy.ai`，两者返回不同模型池，因此 endpoint 必须随产品切换、不可当作全局常量。此外 `platform` 分别为 `ide` 与 `workbuddy-ai`，国际版登录 URL 还追加 `version` / `loginSessionId`。
 
@@ -892,7 +892,7 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
   否则前端 `login.poll` 查不到该账号、永远 `done:false`
 - 前端**不得**再出现 `window.location.href = loginUrl`：弹窗被拦截时改为展示
   可点击链接（`loginUrlForManual`）。`tests/unit/jet-hub-rpc.spec.ts` 有源码级
-  断言锁死这条（剔除注释行后匹配，因注释里保留了该缺陷的叙述）
+  断言锁死这条（剔除注释行后匹配，因注释里保留了该缺陷的叙述）
 
 ## ⚠️ 两条通用判据：一文件两套同义判据 / `String(undefined)`（PR !62 复审，2026-10-06）
 

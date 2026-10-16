@@ -583,6 +583,41 @@ export interface RpcBuddyGrowthTasksResponse {
 /** RPC: 查询某 provider 下全部账号的积分余额请求 */
 export interface RpcCreditsBalancesRequest {
   provider: string
+  /**
+   * 只查这些账号（**可选**；省略 = 全部账号，即积分面板的语义）。
+   *
+   * ## ⚠️ 存在的理由（用户 2026-10-15 的性能诉求）
+   *
+   * 用量徽标只需要**启用账号**的读数（停用账号既不进合计、也不渲染明细）⇒
+   * 让它传启用账号的 id 列表，能**少查**几个号（每次渲染省 N 个顺序上游请求）。
+   *
+   * ⚠️ **它不影响自愈**：`credits.balances` 入口的 `healExpiredAccounts` 仍对
+   * **全部**账号跑（AGENTS.md 的成文铁律：「续期不得按 `enabled` 过滤」——
+   * 停用只影响自动选号，与凭据是否需要保持新鲜无关）。本字段只裁剪**余额查询**
+   * 那一批。
+   * ⚠️ 省略时**逐字节**保持既有行为（含停用账号 —— 积分面板的现状语义）。
+   * ⚠️ 传空数组 = 一条都不查（而不是「查全部」）：那是最容易被写成反义的一格，
+   * 故有一条用例专门锁它。
+   */
+  accountIds?: string[]
+  /**
+   * `true` = **绕过共享读数缓存**（含陈旧兼顶），强制回源（面板「刷新积分」按钮）。
+   *
+   * ## ⚠️ 为什么必须有它（2026-10-16 审计 P1-1，实测确认的回归）
+   *
+   * 引入共享缓存（`balance-cache`）后 `credits.balances` 会吃缓存，于是面板的
+   * 「刷新积分」按钮**在 120 秒内点了等于没点** —— 而该按钮的 `title` 写着
+   * 「余额由服务端实时计算，点此可刷新」，此时是**假的**。
+   *
+   * ⚠️ 更隐蔽的一档是**陈旧兼顶**：上游已挂 10 分钟时，点「刷新」仍返回
+   * 15 分钟兼顶上限内的旧值 +「本次查询失败」。用户的诉求是「给我新数据」，
+   * 实现给「再读一次旧数据」—— **比报错更糟**，因为它看起来成功了。
+   *
+   * ⚠️ **省略时行为不变**（吃缓存，与引入缓存前一致）。
+   *
+   * @see BalanceCache.readStale 的 `force` 语义（`force` 下**不兼顶**）
+   */
+  force?: boolean
 }
 
 /**
@@ -1053,8 +1088,29 @@ export interface RpcAggregateCandidate {
   price: number
   /** 是否靠**显式补丁**归一（面板标 `⚠️补丁` 供人工核查）。 */
   viaPatch: boolean
-  /** 是否被用户拒绝参与该模型的轮换。 */
+  /**
+   * 该候选当前**是否参与轮换**（= `state === 'allowed'`）。
+   *
+   * ⚠️ 语义已**收窄**（用户 2026-10-15）：升级前它等于「用户显式拒绝」，现在等于
+   * 「当前不参与轮换」—— 含**新增的**「未接入临期折算 ⇒ 默认不参与」这一态。
+   * 保留本字段是为了不动既有客户端渲染与既有用例；新代码一律读 `state`。
+   */
   rejected: boolean
+  /**
+   * 三态门控结果（**权威**，由宿主 `resolveCandidateGate` 判定）：
+   * `'allowed'` 参与 / `'rejected'` 用户显式拒绝 / `'default-rejected'` 未接入折算的默认不参与。
+   *
+   * ⚠️ 客户端**只渲染、不判定**（本仓库「同一语义两套判据」的红线）。
+   */
+  state: 'allowed' | 'rejected' | 'default-rejected'
+  /**
+   * 该渠道是否**已接入临期折算**（`WIRED_EXPIRY_PROVIDERS`）。
+   *
+   * ⚠️ 客户端读它是「读宿主下发的**事实**」，不是「自己重算接入状态」⇒ 不违反红线。
+   * 它唯一的用途是决定「关掉一条候选时该写拒绝表还是白名单」（未接入渠道的「不参与」
+   * 与「拒绝」同义 ⇒ 写白名单回到默认态，而不是往拒绝表里堆无作用的条目）。
+   */
+  expiryWired: boolean
 }
 
 /** 聚合设置面板的一个虚拟模型（`aggregate.catalog` 的条目）。 */
@@ -1062,11 +1118,25 @@ export interface RpcAggregateModel {
   canonicalId: string
   name: string
   candidates: RpcAggregateCandidate[]
+  /**
+   * 该模型的**手工顺序**（元素 = `` `${provider}\u0000${realId}` ``）。
+   *
+   * ⚠️ 宿主已**按当前候选集过滤**（id 漂移的脏键不会下发）⇒ 客户端渲染与拖拽
+   * **不需要第二个读端点**。空数组 = 未自定义（展示与轮换都回落临期序）。
+   */
+  order: string[]
 }
 
-/** RPC: 列出聚合目录（虚拟模型 + 各自候选 + 拒绝状态）响应 */
+/** RPC: 列出聚合目录（虚拟模型 + 各自候选 + 三态门控）响应 */
 export interface RpcAggregateCatalogResponse {
   models: RpcAggregateModel[]
+  /**
+   * 当前排序模式（`'expiry'` = 按临期，升级前行为；`'manual'` = 按手工顺序）。
+   *
+   * ⚠️ 权威在宿主：客户端进入面板时用它初始化，**不得**自己推导（例如「顺序表非空就是手工」——
+   * 用户可以切到手工模式却一条都没拖过）。
+   */
+  orderMode: 'expiry' | 'manual'
 }
 
 /** RPC: 设置某条候选是否拒绝参与轮换请求 */
@@ -1077,15 +1147,69 @@ export interface RpcAggregateSetRejectedRequest {
   rejected: boolean
 }
 
+/**
+ * RPC: 设置某条候选是否**显式允许**参与轮换（用户 2026-10-15 的「手工打开」）。
+ *
+ * ⚠️ 与 {@link RpcAggregateSetRejectedRequest} 是**同一枚开关的两个方向**，但落在
+ * **两张不同的表**上：本端点的目标域是「未接入临期折算」的候选（默认不参与），
+ * 那个端点的目标域是「已接入」的候选（默认参与）。**两表不做互斥归一**
+ *（用户 2026-10-15 的修正：键域天然不相交，写一侧不得改另一侧）。
+ */
+export interface RpcAggregateSetAllowedRequest {
+  canonicalId: string
+  provider: string
+  realId: string
+  allowed: boolean
+}
+
+/** RPC: 写入某虚拟模型的**手工顺序**（`order` 必须整体提交，碎片化追加不在设计内） */
+export interface RpcAggregateSetOrderRequest {
+  canonicalId: string
+  order: string[]
+}
+
+/** RPC: 手工顺序写入后的响应（回传**服务端过滤后**的权威数组，客户端据此校正本地状态） */
+export interface RpcAggregateSetOrderResponse {
+  canonicalId: string
+  order: string[]
+}
+
+/** RPC: 切换排序模式请求 */
+export interface RpcAggregateSetOrderModeRequest {
+  mode: 'expiry' | 'manual'
+}
+
+/** RPC: 排序模式切换后的响应 */
+export interface RpcAggregateSetOrderModeResponse {
+  orderMode: 'expiry' | 'manual'
+}
+
+/**
+ * RPC: 一键「拒绝非临期」响应（把所有**未接入**折算渠道的手工打开恢复为默认不参与）。
+ *
+ * ⚠️ `cleared === 0` 也要回 `ok: true`（幂等点击不是错误），面板据计数决定文案：
+ * 0 ⇒ 「没有需要恢复的候选」，>0 ⇒ 「已把 N 条候选恢复为…」。
+ */
+export interface RpcAggregateRejectNonExpiringResponse {
+  cleared: number
+  aggregateAllowed: Record<string, Record<string, Record<string, boolean>>>
+}
+
 /** RPC: 清空拒绝表请求（`canonicalId` / `provider` 都可省略；都省略 = 清空全部） */
 export interface RpcAggregateClearRejectedRequest {
   canonicalId?: string
   provider?: string
 }
 
-/** RPC: 拒绝表变更后的统一响应（回传写入后的完整拒绝表，便于前端校验） */
+/**
+ * RPC: 聚合路由表变更后的统一响应（回传写入后的**两张表**，便于前端一次校正）。
+ *
+ * ⚠️ 必须同时回两张表：面板的逐条开关要按三态显示，只回拒绝表会让白名单条目
+ * 在下一次点击前一直是陈旧值（与 `rejectionsFromCatalog()` 的既有回填机制同款）。
+ */
 export interface RpcAggregateRejectionsResponse {
   aggregateRejections: Record<string, Record<string, Record<string, boolean>>>
+  aggregateAllowed: Record<string, Record<string, Record<string, boolean>>>
 }
 
 /**

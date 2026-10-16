@@ -27,11 +27,13 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-  it('共 17 条（16 个真渠道 + aggregate）', () => {
+  it('共 18 条（17 个真渠道 + aggregate）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
-    expect(PROVIDER_REGISTRY).toHaveLength(17)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(16)
+    // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
+    //    它与 `minimax` 账号不互通、API 主机不同 ⇒ 是两个 provider。
+    expect(PROVIDER_REGISTRY).toHaveLength(18)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(17)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
   })
 
@@ -138,12 +140,12 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(x).toEqual(['zcode'])
   })
 
-  it('channel === true 的 15 家都有 settingsNamespace 除了 opencode', () => {
+  it('channel === true 的 16 家都有 settingsNamespace 除了 opencode', () => {
     const withNs = PROVIDER_REGISTRY.filter((d) => d.settingsNamespace !== undefined)
       .map((d) => d.id).sort()
     expect(withNs).toEqual([
       'accio', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy', 'minimax',
-      'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
   })
 })
