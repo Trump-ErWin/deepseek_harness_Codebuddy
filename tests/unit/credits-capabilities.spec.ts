@@ -273,18 +273,23 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     expect(supportsRateLimit('不存在的 provider')).toBe(true)
   })
 
-  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好四个）', () => {
+  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好五个）', () => {
     const disabled = Object.entries(RATE_LIMIT_CAPABILITIES)
       .filter(([, caps]) => caps.rateLimit === false)
       .map(([id]) => id)
       .sort()
-    // 四家 rationale 各不相同（registry 里各有字段注释）：
+    // 五家 rationale 各不相同（registry 里各有字段注释）：
     // - accio：**不写 modelRateLimits 且不在 probeById 里** ⇒ 两个按钮恒为惰性
     //   （点了零请求、零清除，用户会以为按钮坏了）；
+    // - astudio：与 accio **同判据**（registry 的 astudio descriptor 写明
+    //   `rateLimit: false`：astudio-adapter 不写 modelRateLimits，且刻意不进
+    //   src/index.ts 的 probeById —— 那张表被守卫锁成「恰好是会写标记的家」，
+    //   硬塞进去会让守卫红 ⇒ 两个按钮恒为惰性；将来接上请求级换号+冷却时，
+    //   必须同时改回 true 并进 probeById + WRITES_RATE_LIMIT_PROVIDERS）；
     // - gemini / officeace：限流由服务端配额管理，本地标记清掉 / 重测通过
     //   都恢复不了配额；
     // - loomy：根本不返回限流错误。
-    expect(disabled).toEqual(['accio', 'gemini', 'loomy', 'officeace'])
+    expect(disabled).toEqual(['accio', 'astudio', 'gemini', 'loomy', 'officeace'])
   })
 
   it('客户端源码里按钮仍走 supportsRateLimit 门控（不是在本文件另写白名单）', () => {

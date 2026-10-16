@@ -55,15 +55,16 @@ describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry
 })
 
 describe('settingsNamespace：registerProviderSettings 的清单取决于 registry', () => {
-  it('16 家声明了 namespace，且 opencode 没有', () => {
+  it('17 家声明了 namespace，且 opencode 没有', () => {
     // ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 13 → 15。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：15 → 16。
+    // ⚠️ 2026-10-16 并入 astudio ⇒ 16 → 17。
     const withNs = PROVIDER_REGISTRY
       .filter((d) => d.settingsNamespace !== undefined)
       .map((d) => d.id).sort()
     expect(withNs).toEqual([
-      'accio', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy', 'minimax',
-      'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'accio', 'astudio', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
     expect(descriptorOf('opencode')?.settingsNamespace).toBeUndefined()
     expect(descriptorOf('aggregate')?.settingsNamespace).toBeUndefined()
@@ -88,6 +89,7 @@ describe('settingsNamespace：registerProviderSettings 的清单取决于 regist
     expect(descriptorOf('gemini')?.settingsNamespace).toBe('llm-gemini')
     expect(descriptorOf('officeace')?.settingsNamespace).toBe('llm-officeace')
     expect(descriptorOf('accio')?.settingsNamespace).toBe('llm-accio')
+    expect(descriptorOf('astudio')?.settingsNamespace).toBe('llm-astudio')
   })
 })
 
@@ -142,7 +144,7 @@ describe('registerProviderSettings：index.ts 真的按 registry 注册（行为
     const want = PROVIDER_REGISTRY
       .map((d) => d.settingsNamespace)
       .filter((ns): ns is string => ns !== undefined)
-    expect(want).toHaveLength(16)
+    expect(want).toHaveLength(17)
     // 只取 `llm-*`：settings 里还有本插件自己的 `jet-hub` 条目，与 provider 无关。
     const got = registeredNamespaces().filter((ns) => ns.startsWith('llm-')).sort()
     // ⚠️ 断言**集合相等**而非顺序：注册顺序不影响 `describe()` 的语义（它按 ns 查、

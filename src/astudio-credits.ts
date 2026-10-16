@@ -1,0 +1,256 @@
+/**
+ * AStudio（讯飞 AstronStudio）**额度面**：`GET /xingchen-studio/points/balance`。
+ *
+ * ## 为什么单独一个文件
+ *
+ * 额度端点在**账号后端**（`agent.xfyun.cn/xingchen-studio`），与推理网关
+ *（`astronstudio-api-volces-prod.xf-yun.com/model-gateway/v1`）**不同域、不同鉴权**：
+ * 推理用 `Authorization: Bearer <modelBearerToken>`，额度只认 **Cookie 的
+ * `ssoSessionId`**。⇒ 凭据里那一份 `access_token` 在这里**用不上**，
+ * 本文件读的是 `sso_session_id`（缺失时如实报「未登录」，不发必然 80000 的请求）。
+ *
+ * ## ⚠️ 三条失败路径的用户动作**完全不同**（故必须用 `fetchBalanceDetailed`）
+ *
+ * 1. **会话失效**：HTTP 恒 **200** + `code=80000`「登录异常，请重新登录」⇒
+ *    用户要做的是**去客户端人工重登**（唯一终态，实测无程序化续期接口，
+ *    服务端 Set-Cookie 的 Max-Age=31536000 意味着一年内不会自然到期）。
+ * 2. **服务不可用**：HTTP 4xx/5xx、非 JSON、其它 `flag=false` 业务码 ⇒
+ *    可重试，**不得**报成「需重登」（那会让用户白重登一次）。
+ * 3. **形状不认识**：`code=0` 但响应里没有 `totalBalance`（上游改了 Schema）⇒
+ *    明说「未包含余额字段」。
+ *
+ * ⚠️ **绝不允许把「查不到」写成 0**（0 是「已用光」的语义，本仓库反复记录的
+ * 缺陷形态；provider-credits.ts 文件头同样写着这条红线）。
+ *
+ * ## ⚠️ 为什么**不**按 HTTP 码判失效
+ *
+ * 实测该端点无论成功还是「未登录」都回 **200**（22 例消融），故判据只能是
+ * `flag`/`code` 本体。这与上游 MAAS 的 `HTTP 502 + error.code` 是两套形态，
+ * 不要复用 `classifyAstudioError` 那条推理侧的映射。
+ */
+
+import { ASTUDIO } from './astudio-product.js'
+import type { AstudioProduct } from './astudio-product.js'
+import {
+  astudioCookieHeader,
+  isAstudioSessionDeadError,
+  parseAstudioEnvelope,
+} from './astudio.js'
+import type { AstudioCredential } from './astudio.js'
+import type { ProviderBalanceDetail } from './provider-runtime.js'
+import type { CreditBalance, CreditPackage } from './credits.js'
+
+/** 额度端点的相对路径（账号后端，接在 `product.authBaseUrl` 之后）。 */
+const ASTUDIO_POINTS_BALANCE_PATH = '/points/balance'
+
+/**
+ * 积分单位：量纲是**整数积分**（不是元、不是 token）。
+ *
+ * ⚠️ 上游所有数字都是**积分点**（实测 totalAmount=1200 / totalBalance=1192），
+ * 展示侧不得除 100、不得做浮点折算 —— 与 accio 同为 'credit'，与 zcode 的
+ * 'token' **不同**（那是刻意指明的单位，见 provider-credits.ts 的 zcode 条目）。
+ */
+const ASTUDIO_CREDIT_UNIT = 'credit'
+
+/**
+ * 纯读的超时兜底。
+ *
+ * ⚠️ 不用 `product.requestTimeoutMs`（30s 是给推理首包的）：额度是面板上的
+ * 逐账号串行读数（`collectCreditBalances` 注释明确「顺序查询，避免并发触发风控」），
+ * 30s 会把整轮面板拖死。8s 足够（实测该端点为轻量 GET）。
+ */
+const ASTUDIO_CREDITS_TIMEOUT_MS = 8_000
+
+/** 注入替身用（单测不碰真实凭据与网络）。 */
+export interface AstudioCreditsOptions {
+  fetcher?: typeof fetch
+  product?: AstudioProduct
+  timeoutMs?: number
+}
+
+/** 安全读整数：非有限数 / 非数字一律 `undefined`（**不回落 0**）。 */
+function readAstudioInt(source: Record<string, unknown>, key: string): number | undefined {
+  const value = source[key]
+  return typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : undefined
+}
+
+/** 安全读「本地时间字符串」；空串与非字符串都算「没有」。 */
+function readAstudioLocalTime(source: Record<string, unknown>, key: string): string {
+  const value = source[key]
+  return typeof value === 'string' ? value : ''
+}
+
+/** 上游文案可能不在 `message` 而在 `desc` —— 由 parseAstudioEnvelope 归一，这里只兜底。 */
+function failDetail(error: string): ProviderBalanceDetail {
+  return { balance: null, error }
+}
+
+/**
+ * 把 `points/balance` 的 data 映射成 `CreditBalance`。
+ *
+ * ## 口径（与客户端一致，用户可与官方面板逐数核对）
+ *
+ * - `total` = 上游**权威**字段 `totalBalance`（主池可用合计），**不是**逐包求和。
+ *   实测 `totalBalance === activityBalance`（1192），而 `totalAmount - totalBalance = 8`
+ *   正是已消耗 —— 用求和会在星火池在场时凭空多出 5000。
+ * - `packages` 按**来源四分法**分桶（member / buy / activity，均为**主池**），
+ *   星火池作为**最后一个**条目并如实标注「独立池，不参与主池合计」。
+ *   ⚠️ 这是刻意与 zcode 的「`total` 必须等于逐包之和」**不同**的口径：本渠道
+ *   服务端本身就给了两个互不相通的池，压成一个数才是撒谎。
+ *   ⇒ 面板若按「逐包之和」显示总额会偏大；接线时若需要严格自洽，可以把星火条目
+ *     移出 `packages` 并在 `extra` 里给短标签，但那需要扩 `RpcCreditsBalanceExtra`
+ *     （现只有 `accountTier`），属接口扩张，**本轮不做**。
+ * - `expiredTotal` = 0：上游**不下发**失效额度（无独立 frozen 字段、也不回已失效桶），
+ *   如实为 0 并在此注明「不是估算出来的 0」。
+ *
+ * ⚠️ `spark*` 六项在官方 Schema 里是 **optional** ⇒ 老响应可能整个缺席，
+ * 缺席时**不生成**该条目（生成一个 `remaining: 0` 的星火包会让用户以为星火没了）。
+ */
+export function buildAstudioBalance(data: Record<string, unknown>): CreditBalance | null {
+  const total = readAstudioInt(data, 'totalBalance')
+  if (total === undefined) return null // 形状不认识 ⇒ 调用侧报「未包含余额字段」，不编造 0
+  const totalAmount = readAstudioInt(data, 'totalAmount')
+
+  const packages: CreditPackage[] = []
+  const used = totalAmount !== undefined ? Math.max(0, totalAmount - total) : 0
+
+  const pushPool = (
+    name: string,
+    totalKey: string,
+    balanceKey: string,
+    expireKey: string,
+  ): void => {
+    const remaining = readAstudioInt(data, balanceKey)
+    if (remaining === undefined) return // 该池不下发 ⇒ 不臆造条目
+    const poolTotal = readAstudioInt(data, totalKey) ?? remaining
+    const expiredTime = readAstudioLocalTime(data, expireKey)
+    packages.push({
+      name,
+      unit: ASTUDIO_CREDIT_UNIT,
+      remaining,
+      total: poolTotal,
+      used: Math.max(0, poolTotal - remaining),
+      active: remaining > 0,
+      // 上游不给周期概念（额度按来源发放、按活动到期），起止留空而不是编造。
+      cycleStartTime: '',
+      cycleEndTime: '',
+      // ⚠️ `*NextExpireTime` **不在官方 Schema 内**（Effect.Struct 会裁未知字段），
+      // 且是**不带时区的本地时间串** ⇒ 原样透出、不 Date.parse、不做数学比较。
+      expiredTime,
+    })
+  }
+
+  pushPool('会员积分', 'memberTotal', 'memberBalance', 'memberNextExpireTime')
+  pushPool('购买积分', 'buyTotal', 'buyBalance', 'buyNextExpireTime')
+  pushPool('赠送积分', 'activityTotal', 'activityBalance', 'activityNextExpireTime')
+
+  const sparkBalance = readAstudioInt(data, 'sparkTotalBalance')
+  if (sparkBalance !== undefined) {
+    const sparkTotal = readAstudioInt(data, 'sparkTotalAmount') ?? sparkBalance
+    packages.push({
+      name: '星火积分（独立池，不参与主池合计）',
+      unit: ASTUDIO_CREDIT_UNIT,
+      remaining: sparkBalance,
+      total: sparkTotal,
+      used: Math.max(0, sparkTotal - sparkBalance),
+      active: sparkBalance > 0,
+      cycleStartTime: '',
+      cycleEndTime: '',
+      expiredTime: readAstudioLocalTime(data, 'sparkNextExpireTime'),
+    })
+  }
+
+  // 上游只给了合计、一个池都没下发时补一个条目，否则面板拿到空列表连总额都不显示
+  //（与 accio / raccoon 同取舍）。
+  if (packages.length === 0) {
+    packages.push({
+      name: '可用积分',
+      unit: ASTUDIO_CREDIT_UNIT,
+      remaining: total,
+      total: totalAmount ?? total,
+      used,
+      active: total > 0,
+      cycleStartTime: '',
+      cycleEndTime: '',
+      expiredTime: '',
+    })
+  }
+
+  return { total, packages, expiredTotal: 0 }
+}
+
+/**
+ * 查一次 AStudio 积分余额（**带原因**）。
+ *
+ * 判据阶梯（顺序**不可**调换，理由逐条）：
+ * ① 本地就能判定的「没有会话 Cookie」⇒ 直接报未登录，**不发**一个必然 80000 的请求；
+ * ② 传输层失败 / 非 2xx / 非 JSON ⇒ 「额度服务不可用（可重试）」；
+ * ③ `flag=false`（HTTP 仍是 200）⇒ 用 `isAstudioSessionDeadError(code, 文案)` 分流
+ *    「需人工重新登录」与「可重试」；
+ * ④ `code=0` 但没有 `totalBalance` ⇒ 「响应未包含余额字段」。
+ *
+ * ⚠️ ③ 的终态判据**只此一份**（复用 `astudio.ts` 的 `isAstudioSessionDeadError`），
+ * 本文件**不再抄一份业务码集合** —— 同一语义两套判据是本仓库的红线。
+ * 该判据依赖 `src/astudio-product.ts` 的 `ASTUDIO_SESSION_DEAD_CODES` **含 80000**
+ *（本轮实测已在盘：`new Set([1002, 1005, 80000])`）；否则「需重登」会退化成
+ * 只靠服务端中文文案正则兜底、每轮白撞一次的可重试。
+ */
+export async function fetchAstudioBalanceDetailed(
+  credential: AstudioCredential,
+  options: AstudioCreditsOptions = {},
+): Promise<ProviderBalanceDetail> {
+  const fetcher = options.fetcher ?? fetch
+  const product = options.product ?? ASTUDIO
+  const timeoutMs = options.timeoutMs ?? ASTUDIO_CREDITS_TIMEOUT_MS
+
+  const baseUrl = (product.authBaseUrl ?? '').replace(/\/+$/, '')
+  if (baseUrl.length === 0) return failDetail('额度服务不可用（未配置账号后端地址）')
+
+  // ① 额度面只认 Cookie 的 ssoSessionId；没有它就没有任何可发的请求。
+  const cookie = astudioCookieHeader(credential)
+  if (cookie.length === 0) {
+    return failDetail('未登录 AStudio（缺少登录会话 Cookie），请在 AStudio 客户端重新登录')
+  }
+
+  let response: Response
+  let text: string
+  try {
+    response = await fetcher(`${baseUrl}${ASTUDIO_POINTS_BALANCE_PATH}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json', Cookie: cookie },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    text = await response.text()
+  } catch (error) {
+    return failDetail(`额度服务不可用（网络异常）：${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  // ② 实测正常与「未登录」都回 200；非 2xx 只可能是网关/服务端故障 ⇒ 可重试，
+  //    **不得**报成需重登。
+  if (!response.ok) {
+    return failDetail(`额度服务不可用（HTTP ${String(response.status)}）`)
+  }
+
+  let body: unknown
+  try {
+    body = JSON.parse(text) as unknown
+  } catch {
+    return failDetail('额度服务不可用（响应不是 JSON）')
+  }
+
+  const envelope = parseAstudioEnvelope(body)
+  if (!envelope.ok) {
+    // ③ 终态 vs 可重试 —— 全部走那**一份**判据。
+    if (isAstudioSessionDeadError(envelope.code, envelope.message)) {
+      return failDetail('AStudio 登录会话已失效，需在 AStudio 客户端人工重新登录（微信扫码）')
+    }
+    return failDetail(`积分查询失败：${envelope.message}`)
+  }
+
+  const balance = buildAstudioBalance(envelope.data)
+  if (balance === null) {
+    // ④ 查询「成功」但形状不认识 ⇒ 仍然不编造 0。
+    return failDetail('积分查询失败：响应未包含余额字段')
+  }
+  return { balance }
+}

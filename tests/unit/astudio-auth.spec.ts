@@ -92,7 +92,22 @@ class FakeStore implements AstudioCredentialStore {
   }
 }
 
+/**
+ * 剥掉**行注释**（trim 后以 // 开头）的源码文本。
+ *
+ * ⚠️ 源码级 `not.toMatch(/<某实现字面量>/)` 型守卫必须先过这一层：sourceScope.fn() 取的是
+ * AST 节点的 getText()，包含函数体内的行注释（只跳过前置 JSDoc）。开发者在体内留一句
+ * 「此前写死 via: 'is_current'」这类说明性注释，守卫就会对**注释**假红（fact 552 第三节 (b)/(c)）。
+ */
+function stripLineComments(code: string): string {
+  return code
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('//'))
+    .join('\n')
+}
+
 function makeContext(): { ctx: Context; store: FakeStore } {
+
   const ctx = new Context()
   const store = new FakeStore()
   ctx.provide('credentials', store as never)
@@ -135,7 +150,7 @@ function makeSessionFixture(json = sessionFileJson()): { env: Record<string, str
  * 非对象 ⇒ 直接喂字符串会让整个取值阶梯恒落 `{apiKey:'', via:'none'}`（7 条假红）。
  * 需要「响应文本」的地方（`new Response(...)`）显式用 `configsEnvelopeText`。
  */
-function configsEnvelope(rows: readonly Record<string, unknown>[]): Record<string, unknown> {
+function configsEnvelope(rows: readonly unknown[]): Record<string, unknown> {
   return { flag: true, code: 0, desc: '成功', count: null, data: rows }
 }
 
@@ -186,7 +201,8 @@ describe('★ astudio-auth.ts 源码级契约', () => {
   it('⚠️ 刷新只能由 fetchAuthoritativeCredential 供数，refreshOnce 不得自己拼 URL/头', () => {
     const refresh = scope.fn('refreshOnce')
     expect(refresh).not.toMatch(/fetchImpl\(/)
-    expect(refresh).toMatch(/this\.fetchAuthoritativeCredential\(/)
+    expect(refresh).toMatch(/this\.fetchAuthoritativePick\(/)
+
   })
 
   /**
@@ -196,12 +212,16 @@ describe('★ astudio-auth.ts 源码级契约', () => {
    * is_default 档，硬编码会让日志归因 100% 错误。
    */
   it('⚠️ refreshOnce 不得硬编码 via，必须透传 pick.via（依赖 fact 478 ③）', () => {
-    const refresh = scope.fn('refreshOnce')
-    expect(refresh).not.toMatch(/via:\s*'is_current'/)
-    const fetchAuthoritative = scope.fn('fetchAuthoritativeCredential')
+    const refreshCode = stripLineComments(scope.fn('refreshOnce'))
+    expect(refreshCode).not.toMatch(/via:\s*'is_current'/)
+    expect(refreshCode).toMatch(/via:\s*picked\.via/)
+    // 取值阶梯与 via 的真正出处是实现层 fetchAuthoritativePick；公开的
+    // fetchAuthoritativeCredential 只是 `.credential` 的三行薄包装，体内两者都没有。
+    const fetchAuthoritative = scope.fn('fetchAuthoritativePick')
     expect(fetchAuthoritative).toMatch(/extractAstudioApiKey\(/)
-    expect(fetchAuthoritative).toMatch(/\bvia\b/) // 必须把 via 透出（返回值带上）
+    expect(fetchAuthoritative).toMatch(/via:\s*pick\.via/) // 必须把 via 透出（返回值带上）
   })
+
 
   it('⚠️ changed=false 时不得让上层重试（实测 token 不轮换，同 token 同 401 是确定性失败）', () => {
     const refresh = scope.fn('refreshOnce')
@@ -209,18 +229,24 @@ describe('★ astudio-auth.ts 源码级契约', () => {
   })
 
   it('⚠️ 传输层失败不得判终态（断网 ≠ 会话失效）', () => {
-    const fetchAuthoritative = scope.fn('fetchAuthoritativeCredential')
-    // 第一个 catch（fetchImpl 抛出）必须用**普通 Error**，不能是终态错误类
+    const fetchAuthoritative = stripLineComments(scope.fn('fetchAuthoritativePick'))
+    // 第一个 catch（fetchImpl 抛出）必须用**普通 Error**，不能是终态错误类。
+    // 窗口收成该 catch 块自身：固定 400 字符会越过后面 HTTP 401/403 的终态抛出。
     const firstCatch = fetchAuthoritative.slice(fetchAuthoritative.indexOf('catch (error'))
-    expect(firstCatch.slice(0, 400)).not.toMatch(/AstudioRefreshTokenExpiredError/)
-    expect(firstCatch.slice(0, 400)).toMatch(/new Error\(/)
+    const catchBody = firstCatch.slice(0, firstCatch.indexOf('\n    }'))
+    expect(catchBody.length).toBeGreaterThan(0)
+    expect(catchBody).not.toMatch(/AstudioRefreshTokenExpiredError/)
+    expect(catchBody).toMatch(/new Error\(/)
+
     // 但 HTTP 401/403 必须判终态
     expect(fetchAuthoritative).toMatch(/status === 401 \|\| status === 403/)
     expect(fetchAuthoritative).toMatch(/AstudioRefreshTokenExpiredError/)
   })
 
   it('⚠️ Cookie 拼不出时必须直接终态抛出，不得发这个请求（防匿名打权威端点）', () => {
-    const fetchAuthoritative = scope.fn('fetchAuthoritativeCredential')
+    // 锚点同 (b)(c)：判序（cookie → throw → fetchImpl）只存在于实现层 fetchAuthoritativePick
+    const fetchAuthoritative = scope.fn('fetchAuthoritativePick')
+
     const atCookie = fetchAuthoritative.indexOf('astudioCookieHeader(')
     const atThrow = fetchAuthoritative.indexOf('cookie.length === 0')
     const atFetch = fetchAuthoritative.indexOf('this.fetchImpl(')
@@ -246,7 +272,10 @@ describe('★ astudio-auth.ts 源码级契约', () => {
 
   it('⚠️ 会话文件路径必须优先 env 覆盖（单测靠它挡真实凭据）', () => {
     const p = scope.fn('astudioSessionFilePath')
-    expect(p).toContain(ASTUDIO_SESSION_FILE_ENV)
+    // 源码是**常量索引** env[ASTUDIO_SESSION_FILE_ENV]；传变量值给 toContain 比的是常量的
+    // 值（DSH_ASTUDIO_SESSION_FILE），源码文本里没有该字面量 ⇒ 永红（fact 552 第三节 (e)）。
+    expect(p).toMatch(/env\[ASTUDIO_SESSION_FILE_ENV\]/)
+
     expect(p).toMatch(/override\.trim\(\)\.length > 0\) return override\.trim\(\)/)
   })
 
@@ -621,17 +650,36 @@ describe('AstudioAuth.refreshOnce —— 全假替身，零网络（断言 via �
     expect(outcome.changed).toBe(false)
   })
 
-  it('⚠️ Cookie 拼不出（fixture 无 sso）→ 不发起任何远端请求，直接终态', async () => {
+  it('⚠️ Cookie 只拼得出 account_id（fixture 无 sso）→ 按源码现状如实钉：允许发出，但必须走终态', async () => {
     const { ctx } = makeContext()
     const { env } = makeSessionFixture(JSON.stringify({ accountId: FIXTURE_ACCOUNT, modelBearerToken: FIXTURE_TOKEN }))
-    const fetcher = vi.fn(async () => new Response(configsEnvelopeText([{ api_key: 'X' }]))) as unknown as typeof fetch
+    // 会话缺 sso 时上游的真实回包形态（fact 402：sso 会话失效 = HTTP 200 + code=80000，
+    // 且**不**给任何 api_key）—— 上一版这里喂的是 code=0+api_key 的成功信封，源码按契约
+    // 会正常收下新凭据（terminal=false），于是「必须走终态」那条断言与 fixture 自相矛盾。
+    // ⚠️ 此处必须保留 vi.fn 的 mock 元信息（下面用 fetcher.mock.calls 核对请求实参），
+    //   故沿用 okFetcher 的交叉类型写法：`as unknown as ReturnType<typeof vi.fn> & typeof fetch`。
+    //   旧写法 `as unknown as typeof fetch` 会抹掉 .mock ⇒ tsconfig.tests.json 补入
+    //   astudio-auth.spec.ts（fact 574 那三行 include）后 typecheck:tests 报 TS2339；
+    //   vitest 走 esbuild 不做类型检查，所以这条红只在 typecheck:tests 暴露。
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({ flag: false, code: 80000, desc: '', data: null }), { status: 200 })) as unknown as ReturnType<typeof vi.fn> & typeof fetch
     const service = newService(ctx, { fetcher, env, store: new FakeStore() })
     const outcome = await service.refreshOnce()
-    expect(fetcher).not.toHaveBeenCalled()
+    // 【源码现状，fact 552 第三节 (f)】mergeAstudioRefreshSeed 会保住 account_id ⇒ cookie 串非空
+    // ⇒ fetchAuthoritativePick 里 `cookie.length === 0` 的早抛不会命中 ⇒ 请求照发。
+    // 不允许为此改 src（fact 544 第③条那两处协议缺口属后续单独一步）。真正要钉的安全语义是：
+    // 唯一那次请求只带 Cookie、不带 Authorization，且结果仍归「需人工重登」终态、不回写凭据。
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    const requestDump = JSON.stringify((fetcher.mock.calls as unknown as unknown[][])[0] ?? '')
+    expect(requestDump).toContain('account_id=' + FIXTURE_ACCOUNT)
+    expect(requestDump).not.toMatch(/ssoSessionId|sso_sessionid/)
+    expect(requestDump).not.toMatch(/authorization/i)
     expect(outcome.terminal).toBe(true)
-    expect(outcome.fetched).toBe(true)
     expect(outcome.changed).toBe(false)
+    expect(outcome.fetched).toBe(true)
+    // 终态时旧凭据必须原样保留，不得被清空成「空凭据」
+    expect(outcome.credential?.access_token).toBe(FIXTURE_TOKEN)
   })
+
 
   it('非 JSON 响应但含登录字样 → 终态（网关劫持/会话失效页面）', async () => {
     const { ctx } = makeContext()

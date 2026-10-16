@@ -90,6 +90,10 @@ describe('registerJetHubRpc：auths 是命名对象（类型层守卫）', () =>
       gemini: stub,
       officeace: {} as never,
       accio: stub,
+      // astudio = goal 302 第 3 处接线（JetHubAuths.readonly astudio: AstudioAuth，
+      // 由 #578 乙组落盘）。本用例是「完整命名对象调用能编译」的正向类型守卫，
+      // 漏掉这个键会让 typecheck:tests 报 TS2345 —— 也正是该用例想要守的不变式。
+      astudio: stub,
     })
     // 运行时只要求端点真的注册了（证明桩搭对了，上面那行的类型检查才有意义）。
     expect(registered.length).toBeGreaterThan(0)
