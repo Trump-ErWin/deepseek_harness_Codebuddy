@@ -1554,21 +1554,25 @@ describe('BuddyAdapter credential handling', () => {
   })
 
   /**
-   * ⚠️⚠️ `X-Conversation-*` 三头**必须同时发出**（2026-10-16 真实报障）。
+   * ⚠️ `X-Conversation-*` 三头**三枚都发**（issue IKM73W 2026-10-16）。
    *
-   * ## 症状
-   * workbuddy 渠道**整条不可用**：任何模型 / 账号 / 会话都报
-   * `workbuddy: 请求被拦截，请重新发送 conversation id missing`（INVALID_REQUEST）。
-   * 新开会话同样复现、换回旧版插件同样复现 —— 与版本无关，是请求头缺失。
+   * ## 背景
+   * workbuddy 渠道曾整条报 `conversation id missing`（上游 HTTP 400 /
+   * code 11128），当时据此认为「缺三头即被渠道校验拒绝」。
    *
-   * 上游原始报文（HTTP 400）：
-   * `{"code":11128,"msg":"conversation id missing", ...}`，其 `displayTips` 写着
-   * 「这次调用没通过渠道校验，可能不是官方客户端发出的」。
+   * ## 🔴⚠️ 那条外部事实**已被同账号真机复测推翻**（2026-10-16，约 90 次请求）
+   * - 逐枚消融适配器构造的 **14 枚头，全部仍 200**（含这三枚）；
+   * - 逐级剥到「连 UA / 鉴权头 / 身份头都不发」仍 200；
+   * - 6 模型 × 4 请求形状 = 48 格，三头与响应状态**零关联**；
+   * - `conversation id missing` **零次复现**（同批复现了另两句 11128）。
+   * 上游对三头的真实用法是**回显**成 completion id 的种子（回包 `"id"` 前缀
+   * 3/3 命中所发值），**不作准入判据**。
    *
-   * ## 本用例能锁什么、不能锁什么
-   * ⚠️ **锁不住**「上游要求三头齐全」这条**外部事实** —— 那是实测结论，写在
-   * `src/buddy-adapter.ts` 的注释里。本用例锁的是**我们发出的报文**：三头都在、
-   * 都非空。变异验证的判据即「删掉任一条 `headers.set` ⇒ 本用例变红」。
+   * ## 本组用例能锁什么、不能锁什么
+   * ✅ 锁：我们确实发出三枚头、都非空、形态正确、逐请求唯一。
+   * ❌ **锁不住**：三头是否**功能必需**（那是外部事实，已被证伪）。
+   * ⇒ 本组用例是**防误删 / 防形态退化**的护栏，**不是**功能回归防线。
+   * 变异验证的判据即「删掉任一条 `headers.set` ⇒ 三条用例变红」。
    *
    * ⚠️ 逐头 `it.each` 而不是只断言「某串里含某名」：后者删掉另两个头仍可能绿。
    */
@@ -1576,7 +1580,7 @@ describe('BuddyAdapter credential handling', () => {
     'X-Conversation-ID',
     'X-Conversation-Request-ID',
     'X-Conversation-Message-ID',
-  ])('stream 必发 %s（缺任一即上游 400/11128）', async (headerName) => {
+  ])('stream 必发 %s（三枚都发，防误删）', async (headerName) => {
     let seen: Headers | undefined
     const adapter = makeAdapter({
       fetchImpl: async (_url, init) => {
@@ -1586,7 +1590,7 @@ describe('BuddyAdapter credential handling', () => {
     })
     await collectChunks(adapter, streamOptions)
     const value = seen!.get(headerName)
-    // 必须存在且非空：空串同样过不了渠道校验（与本文件 `X-Domain` 那条空串缺陷同型）。
+    // 必须存在且非空：与本文件 `X-Domain` 那条空串缺陷同型（空值等于没发）。
     expect(value, `${headerName} 未发出或为空`).toBeTruthy()
     expect(value!.length).toBeGreaterThan(0)
   })
@@ -1594,9 +1598,10 @@ describe('BuddyAdapter credential handling', () => {
   /**
    * workbuddy 路径同样发齐三头 —— 且**不需要**按产品分支。
    *
-   * 实测：buddy 带上这三头仍 200（无害），故实现里刻意**无条件**发送。
-   * 本用例确认 workbuddy 这条产品路径上三头齐备；与上一条合起来锁住
-   * 「两条产品路径都不缺头」。
+   * 实测（2026-10-16 复核）：buddy 中国站带上这三头仍 200（无害），故实现里
+   * 刻意**无条件**发送。本用例确认 workbuddy 这条产品路径上三头齐备；与上一条
+   * 合起来锁住「两条产品路径都不缺头」（若有人日后加 `product.id` 分支，两条
+   * 里必有一条变红）。
    */
   it('workbuddy 路径同样发齐 X-Conversation-* 三头', async () => {
     let seen: Headers | undefined
@@ -1616,10 +1621,14 @@ describe('BuddyAdapter credential handling', () => {
   /**
    * 三头**同值**，且**不得**复用 `prompt_cache_key` 的 `sessionId`。
    *
-   * 理由（防「顺手复用」型改动）：`sessionId` 是前缀缓存的分桶键，与会话身份是
-   * 两件事。实测上游不校验 conversation id 的值，但把两个语义不同的值绑死会让
-   * 将来单独调整任一侧变得危险；本仓库登记过多次「两处语义不同的东西共用一个值」
-   * 导致的漂移缺陷。
+   * 理由（防「顺手复用」型改动）：`sessionId` 是前缀缓存的分桶键，其真实生命周期
+   * 是**插件进程 / fiber 级**（`registerBuddyLlm` 每次 `apply()` 造一个 adapter，
+   * 它服务所有会话、所有账号）—— 与三头这种**逐请求一次性 id** 是两件事。
+   * 本仓库登记过多次「两处语义不同的东西共用一个值」导致的漂移缺陷。
+   *
+   * ⚠️ 本用例**锁不住「三头是准入必需」那条外部事实** —— 该结论已被 2026-10-16
+   * 真机复测推翻（逐枚消融 14 枚头全部仍 200）。本组用例锁的是「我们确实发出
+   * 三头且形态正确」，目的是**防误删**与**防形态退化**，不是防功能回退。
    */
   it('X-Conversation-* 三头同值，且不复用 prompt_cache_key 的 sessionId', async () => {
     let seen: Headers | undefined
@@ -1635,8 +1644,73 @@ describe('BuddyAdapter credential handling', () => {
     const id = seen!.get('X-Conversation-ID')
     expect(seen!.get('X-Conversation-Request-ID')).toBe(id)
     expect(seen!.get('X-Conversation-Message-ID')).toBe(id)
-    // 语义分离：不得等于 prompt_cache_key。
-    expect(body!.prompt_cache_key).not.toBe(id)
+    // ⚠️ 先断言 `prompt_cache_key` **确实是个非空字符串**，否则 `not.toBe` 会
+    // 退化成「随机串 vs undefined」那种概率性恒真（对抗审计实测：删掉 body 的
+    // prompt_cache_key 后本用例仍全绿）。
+    // ⚠️ 刻意**不**断言它的格式：`sessionId` 与官方 `X-Conversation-*` 形态
+    // 毫无关系（它是本地前缀缓存的分桶键），将来有人把它改成带横线 UUID
+    // 完全合理 —— 在这里锁 32 位会**假红**。格式归三头那条形态守卫管。
+    expect(typeof body!.prompt_cache_key).toBe('string')
+    expect(String(body!.prompt_cache_key).length).toBeGreaterThan(0)
+    expect(id).not.toBe(body!.prompt_cache_key)
+  })
+
+  /**
+   * 三头取值的**形态**：32 位无横线小写十六进制。
+   *
+   * 为什么锁形态（实测里上游并不校验值）：上游把三头**回显**成 completion id 的
+   * 种子（实测回包 `"id"` 前缀 3/3 命中，填 `abc-123` 则直接回 `"id":"abc-123"`）
+   * ⇒ 形态脏值会**直接流进上游的 id 字段与后台归因**，故按官方客户端形态
+   * （`docs/workbuddy-native-search-research.md` §4.4 的「32 位无横线 uuid」）取。
+   *
+   * ⚠️ 变异验证：把值改成常量 `'fixed-conversation-id-0000'` 或 `String(undefined)`
+   * ⇒ 本用例变红（这两条在补本用例前是**无牙**的，177 全绿）。
+   */
+  it('三头取值为 32 位无横线十六进制（脏值会流进上游回显的 id）', async () => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    expect(seen!.get('X-Conversation-ID')).toMatch(/^[0-9a-f]{32}$/)
+  })
+
+  /**
+   * 三头是**逐请求**一次性 id —— **同一个 adapter** 连调两次 `stream()` 必须拿到**不同**值。
+   *
+   * ## ⚠️ 为什么必须是同一个 adapter（第二轮对抗审计打穿过我上一版）
+   * 上一版这条用例**每轮新建一个 adapter**（`for` 里 `makeAdapter(...)`），
+   * 于是它实际锁的是「**每 adapter** 一个值」而不是「逐请求」：
+   * 实测把实现改成「构造器里生成一次、存成实例字段」⇒ 上一版**179 全绿（无牙）**。
+   * 它只能区分「全局单例 vs 非全局」，分不出「逐 adapter」与「逐请求」。
+   * ⇒ 现在固定成**一个 adapter**，两次调用共用它。
+   *
+   * ⚠️ 它锁的是**现状**（逐请求），而**上游当前的真实语义是会话稳定**
+   * （官方 `X-Conversation-ID = context.id`），本实现与之**相反**。实测上游
+   * **不做**跨轮状态机（同一 `prompt_cache_key` 连发三轮、每轮换三头值，3/3 接受），
+   * 故当前无害。若将来要按官方对齐改成会话级常量，**这条用例会被迫改**（它会红）
+   * —— 那正是本仓库期望的「改语义必须显式面对守卫」。
+   *
+   * 变异验证：① 改成模块级固定常量 ⇒ 红；② 改成 adapter 实例字段 ⇒ 红（上一版漏的）。
+   */
+  it('三头是逐请求一次性 id：同一 adapter 两次调用取到不同值', async () => {
+    const seenIds: (string | null)[] = []
+    // ⚠️ **只建一个** adapter —— 见上方注释（两个 adapter 会让这条守卫无牙）。
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        seenIds.push(new Headers(init?.headers as HeadersInit).get('X-Conversation-ID'))
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    await collectChunks(adapter, streamOptions)
+    expect(seenIds).toHaveLength(2)
+    expect(seenIds[0]).toMatch(/^[0-9a-f]{32}$/)
+    expect(seenIds[1]).toMatch(/^[0-9a-f]{32}$/)
+    expect(seenIds[0]).not.toBe(seenIds[1])
   })
 
   /**
