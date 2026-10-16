@@ -3954,6 +3954,203 @@ describe('内容级风控（11128）：不得当成账号级拦截换号/冷却'
 })
 
 /**
+ * ★★ `11128 conversation id missing` 是**按账号**生效的渠道校验，
+ * 必须像 11140 一样**继续换号**（2026-10-16 真实报障）。
+ *
+ * ## 真实缺陷
+ * workbuddy 用户看到「整条渠道全灭」。根因链：
+ *
+ * 1. 网关对**特定账号**在 `/v2/chat/completions` 上做渠道校验，回
+ *    `HTTP 400 {"code":11128,"msg":"conversation id missing"}`；
+ * 2. 该报文**不满足** `isRateLimited`（实测：对真实报文返回 `false`，与 429 对照）；
+ * 3. 于是走到「其余非限流错误 ⇒ 换号无益 ⇒ 直接抛」那一支，
+ *    池里其余**完全可用**的账号一个都试不到；
+ * 4. 被拒账号恰是池里 workbuddy **首位** ⇒ 每轮都撞它 ⇒ 表现为「整条渠道不可用」。
+ *
+ * ## 实测依据（同账号 / 同网络 / 同模型，唯一变量是账号）
+ * | 账号 | 不带会话头 |
+ * |---|---|
+ * | `66E05E7C` | ❌ 0/3（且跨约 19 分钟共 10 次全 400，`isRateLimited=false`） |
+ * | `D87606B1` | ✅ 3/3 |
+ * | `D3238B4E` | ✅ 3/3 |
+ *
+ * 三项补充实测，每一项都对应下面一条判据：
+ * - 失败**只限聊天端点**（同刻 search 200 / v3-config 200）⇒ 只按码+msg 收窄，不扩大；
+ * - 同一账号**带三头立刻 200** ⇒ 该账号**不是坏账号**，故**不得**写 30 分钟冷却；
+ * - 拒绝持续 ≥19 分钟 ⇒ 换号是必要出路（不是「重发一次就好」）。
+ *
+ * ## 与 11140 的**关键差异**（决定了两个判据不同）
+ * 11140 是账号级「策略拦截」，无解除时间，故写 30 分钟冷却避免每轮重撞；
+ * 而本档的账号**换个请求形态就能用**（实测），写冷却会把可用账号凭空封禁 30 分钟。
+ * ⇒ 换号 + **不写冷却**。
+ */
+describe('渠道校验（11128 conversation id missing）：按账号生效，必须换号', () => {
+  /**
+   * 真实上游报文（2026-10-16 本机实测，逐字取自响应体）。
+   * ⚠️ 与上面 `unapprovedChannelBody`（`Illegal API invocation from an
+   * unapproved channel`）是**同一 code 的不同子原因** —— 判据必须看 `msg`。
+   */
+  function conversationIdMissingBody(): string {
+    return JSON.stringify({
+      code: 11128,
+      msg: 'conversation id missing',
+      requestId: '72937bd4-3557-429e-9d71-220927f823dd',
+      displayMsg: {
+        en: 'Request blocked. Please send it again',
+        zh: '请求被拦截，请重新发送',
+        'zh-hant': '請求已被攔截，請重新傳送',
+      },
+      displayTips: {
+        en: 'This call failed channel verification, possibly because it was not sent from an official client. Please resend from the official client.',
+        zh: '这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。',
+      },
+    })
+  }
+
+  /** 同 11140 那组：记录冷却标记的账号池替身。 */
+  function recordingPool(accounts: Array<{ id: string; token: string }>) {
+    const recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    return {
+      recorded,
+      async findAccountIdByCredential(_provider: string, identity: string) {
+        return accounts.find((a) => a.token === identity)?.id ?? ''
+      },
+      async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number) {
+        recorded.push({ accountId, modelId, resetAtMs })
+      },
+      // ⚠️ **必须尊重 `exclude`**：适配器的换号循环靠它排除已试过的账号。
+      // 替身若忽略它，会立刻把刚失败的那个账号再返回一次，命中
+      // `tried.has(next.entry.id)` 后**立即 break**，于是「换号」根本没发生 ——
+      // 用例会以「只发一次」的形式假红（误判成实现没修）。
+      async getAvailableAccount(
+        _provider: string,
+        _modelId: string,
+        exclude?: ReadonlySet<string>,
+      ) {
+        const next = accounts.find((a) => exclude === undefined || !exclude.has(a.id))
+        if (next === undefined) return null
+        return { entry: { id: next.id }, credential: makeCredential({ access_token: next.token }) }
+      },
+      disabledModelsFor: () => new Set<string>(),
+    }
+  }
+
+  it('★★ 首个账号被拒时继续换号，换到可用账号即成功（修复前只发一次就抛）', async () => {
+    // 复刻真实池顺序：acct-1 被渠道校验拒（该账号在池里排第一）、acct-2 完全可用。
+    const pool = recordingPool([
+      { id: 'acct-1', token: 'AT1' },
+      { id: 'acct-2', token: 'AT2' },
+    ])
+    const sentTokens: string[] = []
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        sentTokens.push(token)
+        if (token === 'AT1') return new Response(conversationIdMissingBody(), { status: 400 })
+        return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    // 核心判据：两个账号都被试过 —— 第 1 个被拒**没有**中断换号。
+    // 修复前这里是 `['AT1']`（只发一次就抛 INVALID_REQUEST）。
+    expect(sentTokens).toEqual(['AT1', 'AT2'])
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+  })
+
+  it('★ 不得为该账号写 30 分钟冷却（它不是坏账号，写冷却等于凭空封禁）', async () => {
+    // 实测：同一账号**带上三头立刻 200** ⇒ 该账号可用，只是请求形态不对。
+    // 若照抄 11140 的 `markPolicyBlockedAccount`，会把一个可用账号封 30 分钟，
+    // 且 UI 会把它显示成「限额重置」—— 完全误导。
+    const pool = recordingPool([
+      { id: 'acct-1', token: 'AT1' },
+      { id: 'acct-2', token: 'AT2' },
+    ])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        return auth.includes('AT1')
+          ? new Response(conversationIdMissingBody(), { status: 400 })
+          : sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    // 一个冷却标记都不许写。
+    expect(pool.recorded).toEqual([])
+  })
+
+  it('★ 全部账号都被拒时：报「按账号」的提示，而非「所有账号均受限」', async () => {
+    // 换号试完全部候选仍失败 ⇒ 报错必须指向账号（与 11140 同口径），
+    // 不得吞成 QUOTA_EXCEEDED（那会让用户以为在限额、白等）。
+    const pool = recordingPool([
+      { id: 'acct-1', token: 'AT1' },
+      { id: 'acct-2', token: 'AT2' },
+    ])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool,
+      fetchImpl: async () => new Response(conversationIdMissingBody(), { status: 400 }),
+    })
+
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    const code = (error as LlmError).code
+    // 不得冒充额度/限流类（那两类 UI 会弹全局 Toast 并引导用户等待）。
+    expect(code).not.toBe('QUOTA_EXCEEDED')
+    expect(code).not.toBe('RATE_LIMIT')
+    // 文案必须给出**可行动**的出路。上游 displayMsg 那句「请重新发送」是误导的：
+    // 实测重发必然继续失败（跨 19 分钟 10 次全 400）。
+    const message = (error as LlmError).message
+    expect(message).toContain('账号')
+    expect(message).not.toBe('')
+  })
+
+  it('★ 判据必须收窄到该 msg：别的 11128 子原因**不**参与换号', () => {
+    // 本 describe 的修复只新增一档，**不得**把 11128 整体放宽成「可换号」——
+    // 上面 `unapprovedChannelBody` 那条（`Illegal API invocation from an
+    // unapproved channel`）由腾讯指纹改写链路处理，与账号轮换无关。
+    // 这条用例锁住「两个子原因共用 code 但处置不同」这一事实，
+    // 防止后人图省事把判据改成 `code === 11128`。
+    const convBody = conversationIdMissingBody()
+    const otherBody = JSON.stringify({
+      code: 11128,
+      msg: 'Illegal API invocation from an unapproved channel',
+      displayMsg: { zh: '请求被安全策略拦截，请稍后重试或联系支持。' },
+    })
+    // 两者 code 相同 —— 这正是必须按 msg 区分的原因。
+    expect(/"code"\s*:\s*11128/.test(convBody)).toBe(true)
+    expect(/"code"\s*:\s*11128/.test(otherBody)).toBe(true)
+    // 但 msg 不同，且各自可被独立识别。
+    expect(convBody).toContain('conversation id missing')
+    expect(otherBody).not.toContain('conversation id missing')
+  })
+})
+
+/**
  * ★★ **残缺目录必须能补齐**（issue IKJVTF 复审，审计 I3）。
  *
  * buddy 是**双端点** provider：`/console/enterprises/{scope}/models`（scoped）

@@ -647,6 +647,43 @@ function isContentRejection(body: string): boolean {
 }
 
 /**
+ * ★★ 「渠道校验」拒绝：`11128 conversation id missing`（2026-10-16 实测）。
+ *
+ * ## 为什么必须与 `isContentRejection` 分开
+ *
+ * 两者**共用同一个业务码 `11128`**，但成因与处置都不同：
+ *
+ * | | `isContentRejection`（11140 系） | 本档（11128 conversation id missing） |
+ * |---|---|---|
+ * | 成因 | 账号级安全策略拦截 | 网关对**特定账号**的渠道校验 |
+ * | 换号 | ✅（唯一出路） | ✅（唯一出路） |
+ * | 写 30 分钟冷却 | ✅ 否则每轮重撞 | ❌ **不可**（见下） |
+ *
+ * ⚠️ 判据**只能看 `msg`**，绝不能写成 `code === 11128` —— 同码至少四族子原因
+ * （渠道级 / 消息形状级 / 内容指纹级 / 本档），`msg` 各不相同，处置也不同。
+ * 放宽成按 code 会把 `Illegal API invocation from an unapproved channel`
+ * （由腾讯指纹改写链路处理、与账号轮换无关）也拖进换号，属误伤。
+ *
+ * ## ⚠️ 为什么不写账号冷却（与 11140 的关键差异）
+ *
+ * 实测：同一账号**带上 `X-Conversation-*` 三头立刻 200** —— 该账号**不是坏账号**，
+ * 只是这一形态的请求没过校验。若照抄 11140 的 `markPolicyBlockedAccount`，
+ * 会把一个**实际可用**的账号封 30 分钟，且 UI 会把它显示成「限额重置」——
+ * 完全误导。故本档**只换号、不记冷却**。
+ *
+ * ## 实测依据（同账号 / 同网络 / 同模型）
+ * - `66E05E7C` 不带三头：跨约 19 分钟共 10 次**全部 400**，`isRateLimited` 实测为 `false`；
+ * - `D87606B1` / `D3238B4E` 同样不带三头：**全部 200** ⇒ 该拒绝**按账号**生效；
+ * - 失败**只限聊天端点**（同刻 `/agenttool/v1/search` 200、`/v3/config` 200）；
+ * - `66E05E7C` 带上三头：立刻 200。
+ */
+function isChannelVerificationRejection(body: string): boolean {
+  if (body.length === 0) return false
+  // 只认 `msg` 字段字面值（不看 `code`，理由见上）。
+  return /"msg"\s*:\s*"conversation id missing"/i.test(body)
+}
+
+/**
  * 安全策略拦截的**账号冷却时长**（30 分钟）。
  *
  * ## 为什么必须自己定一个时长
@@ -724,6 +761,45 @@ function contentRejectionError(
   return new LlmError(
     `${productId}: ${scope}。该拦截按账号生效（同一请求在其他账号可正常返回），`
     + `请在 Jet Hub 停用或更换被拦账号：${errorDetail(body)}`,
+    'PERMISSION_DENIED',
+    { status },
+  )
+}
+
+/**
+ * 「渠道校验」全部换完仍失败时的错误出口（见 `isChannelVerificationRejection`）。
+ *
+ * ## 为什么文案必须自己写，不能透传上游 `displayMsg`
+ *
+ * 上游那句是「**请求被拦截，请重新发送**」，而实测**重发必然继续失败**
+ * （同一账号不带三头跨 19 分钟共 10 次全 400），且上游自己的 `actions` 里
+ * **根本没有 `RETRY`**。原样透传等于**诱导用户做无效动作** —— 用户会不断重发，
+ * 而这正是原始报障里的行为。
+ *
+ * ## 文案要素（都对应一条实测）
+ * - **指向账号**（实测按账号生效：一个号 0/3、另两个号 3/3）；
+ * - **说明重发无效**（跨 19 分钟 10 次全败）；
+ * - **给出真正可行的出路**：换号（Jet Hub 里停用该账号 / 调序）或切 provider。
+ *
+ * ⚠️ 错误码取 `PERMISSION_DENIED`，与 `contentRejectionError` 同口径：
+ * - 它**不在** harness 的 `DEFAULT_RETRYABLE_CODES`
+ *   （`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`）⇒ 不让 harness
+ *   白退避重试同一个坏形态的请求；
+ * - 它**在** `dead-model-store` 的 `IGNORED_CODES` 里 ⇒ 不会被误记成
+ *   「该模型已失效」而把可用模型藏起来（本档与模型无关，实测只与账号/请求形态有关）；
+ * - 也不取 `AUTH`（UI 会说「API 密钥无效」，实测 3 个 token 全部有效）/
+ *   `QUOTA*`（会弹全局额度 Toast，实际与额度无关）/ `RATE_LIMIT`（会引导用户等待）。
+ */
+function channelVerificationError(
+  productId: string,
+  status: number,
+  body: string,
+): LlmError {
+  return new LlmError(
+    `${productId}: 全部账号均未通过渠道校验（HTTP ${status}，已逐个换号重试）。`
+    + `该拒绝按账号生效（同一请求在其他账号可正常返回），且**重发无效** —— `
+    + `请在 Jet Hub 停用或调整被拒账号的顺序后重试，或改用其它 provider。`
+    + `上游原文：${errorDetail(body)}`,
     'PERMISSION_DENIED',
     { status },
   )
@@ -2196,7 +2272,14 @@ export class BuddyAdapter extends LlmAdapter {
       // ⚠️ 必须把 `response.status` 一并传入：服务端可能返回**空体**的 429，
       // 而只按正文判定时对空体恒为 false → 整段换号逻辑被跳过，本可自愈的限流
       // 被直接抛给用户（表现为「池里明明还有可用账号，插件却报错且不换号」）。
-      if (this.options.accountPool && isRateLimited(errorText, response.status)) {
+      // ⚠️⚠️ 「渠道校验」拒绝（`11128 conversation id missing`）**也按账号生效**，
+      // 必须与限流一样进入本换号循环（2026-10-16 真实报障：整条渠道全灭）。
+      //
+      // 它**不满足** `isRateLimited`（实测对真实报文返回 `false`），故修复前落到
+      // 下面「其余非限流错误 ⇒ 换号无益 ⇒ 直接抛」那一支，池里其余可用账号
+      // 一个都试不到；而被拒账号恰是池里 workbuddy 首位 ⇒ 每轮都撞它。
+      const channelRejected = isChannelVerificationRejection(errorText)
+      if (this.options.accountPool && (isRateLimited(errorText, response.status) || channelRejected)) {
         const tried = new Set<string>()
         if (currentAccountId) tried.add(currentAccountId)
 
@@ -2216,6 +2299,15 @@ export class BuddyAdapter extends LlmAdapter {
         let sawContentRejection = false
         let contentRejectionStatus = 0
         let contentRejectionBody = ''
+        /**
+         * 换号途中是否撞到过「渠道校验」拒绝（`11128 conversation id missing`）。
+         *
+         * 与 `sawContentRejection` **分开计**：两者虽然都是「全部试完要报专门提示」，
+         * 但文案、冷却语义都不同（本档不写冷却），合并会让报错口径漂移。
+         */
+        let sawChannelVerification = false
+        let channelVerificationStatus = 0
+        let channelVerificationBody = ''
         /**
          * 已经写过限流标记的账号：避免同一个账号被重复记账（换号途中可能取回它）。
          * 标记是「账号 × 模型」的快照，写两次没有意义，日志也会重复。
@@ -2286,19 +2378,43 @@ export class BuddyAdapter extends LlmAdapter {
           }
           // ② 认证类失败：该账号凭据不可用，与路径 A 一致继续换号。
           if (response.status === 401 || response.status === 403) continue
-          // ③ 其余非限流错误：请求本身有问题，换号无益，按原错误分类抛出。
+          // ③ 「渠道校验」拒绝（11128 conversation id missing）：同样按账号生效，
+          //    继续换号。⚠️ **刻意不写账号冷却** —— 实测该账号带上三头立刻 200，
+          //    即它**不是坏账号**；写 30 分钟冷却会把可用账号凭空封禁（见
+          //    `isChannelVerificationRejection` 的完整理由）。
+          //    判据必须**先于**下面的「非限流即抛」，否则换号在这里就中断。
+          if (isChannelVerificationRejection(errorText)) {
+            sawChannelVerification = true
+            channelVerificationStatus = response.status
+            channelVerificationBody = errorText
+            console.warn(
+              `[${this.product.id}] 账号 ${currentAccountId || '(current)'} 未通过渠道校验`
+              + `（HTTP ${response.status}，code 11128 conversation id missing），继续换号`
+              + `（不写冷却：该账号并非坏账号）：${errorDetail(errorText).slice(0, 200)}`,
+            )
+            continue
+          }
+          // ④ 其余非限流错误：请求本身有问题，换号无益，按原错误分类抛出。
           //    ⚠️ 同样必须传状态码：否则空体 429 会被当成「非限流」而在换号
           //    途中**中断**，池里其余可用账号一个都试不到。
           if (!isRateLimited(errorText, response.status)) {
             // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
             throw new LlmError(`${this.product.id}: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
           }
-          // ④ 仍是限流 → 继续下一轮（重置时间已在上方记录）。
+          // ⑤ 仍是限流 → 继续下一轮（重置时间已在上方记录）。
         }
         // 全部候选试完：若途中撞过安全策略拦截，报专门的提示（指向账号而非内容）。
         if (sawContentRejection) {
           throw contentRejectionError(
             this.product.id, contentRejectionStatus || 403, contentRejectionBody, true,
+          )
+        }
+        // 全部候选都未通过渠道校验：报专门的「按账号 + 重发无效」提示。
+        // ⚠️ 必须先于下面的 QUOTA_EXCEEDED —— 否则会把渠道校验误报成「全部账号受限」，
+        // 让用户以为在限额、白等一个重置时刻。
+        if (sawChannelVerification) {
+          throw channelVerificationError(
+            this.product.id, channelVerificationStatus || 400, channelVerificationBody,
           )
         }
         throw new LlmError(`${this.product.id}: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED')
