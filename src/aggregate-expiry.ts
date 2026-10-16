@@ -980,6 +980,34 @@ export async function officeaceExpiry(
     return UNUSABLE
   }
   if (summary === undefined) return UNUSABLE
+  /**
+   * ⚠️⚠️ **只拿到陈旧缓存 ⇒ `UNUSABLE`，不得用历史快照参与排序**
+   * （Gitee issue IKM741 连带修正，2026-10-16 实测确证「注释说一套、实现做另一套」）。
+   *
+   * 本函数上方的判据表（以及 `docs/agent-notes/providers-officeace.md` §5.8 的同表）
+   * **逐字写着**「查询失败 / 未登录 / **只拿到缓存** ⇒ `UNUSABLE`（读不到就不猜）」，
+   * 而修前的实现**没有这一支**：`fetchSubscriptionSummary` 在云侧直读失败时会
+   * 返回 `{ ...readSubscriptionCache(ref), stale: true }`（`officeace-auth.ts`
+   * 的兜底腿），于是**几十小时前的快照**会被折算成一个正常的到期时刻、
+   * 堂堂正正地参与「临期优先」排序。
+   *
+   * 实测（本机探针，隔离目录）：凭据在、云侧不可达、该 ref 有一份
+   * `cachedAt` 为两天前的缓存 ⇒ `officeaceExpiry` 返回
+   * `1792165834998`（一个真实时刻）而**不是** `UNUSABLE(-1)`。
+   *
+   * 危害方向与 issue IKM741 的 C 档**同族**：`stale: true` 的语义就是
+   * 「这不是本次读数，是历史快照」——
+   * - 快照里的桶可能**早已被烧完**（真实余额 0）⇒ 折算成临期 ⇒ 候选排到**最前**，
+   *   抢走本该先用掉的别的渠道额度（正是 `codeartsExpiry` 那节记录的同型缺陷）；
+   * - 也可能**恰好多出**一份已作废的签到桶 ⇒ 让一个实际没额度的账号留在候选表里。
+   *
+   * ⇒ 判据：**只认本次云侧读数**（`stale !== true`）。理由是 `stale` 标记本身
+   * 就是本仓库为「这是缓存」专门加的字段，把它当实时读数用属于**丢字段**。
+   * ⚠️ 代价如实登记：云侧抖动时该渠道会从候选表消失，最长持续
+   * `EXPIRY_CACHE_TTL_MS`（60 秒）—— 这与「读不到就不猜」的既有原则一致，
+   * 也与 IKLTHB 的熔断短路同方向（宁可不用，不可用错）。
+   */
+  if (summary.stale === true) return UNUSABLE
   let earliest = NEVER
   // ⚠️ 与 `sharedPackageExpiry` 同因：`earliest` 的初值 `NEVER` 无法区分
   //    「一个有效包都没有」（⇒ 剔除）与「有余额但不下发到期时间」（⇒ 长期）。

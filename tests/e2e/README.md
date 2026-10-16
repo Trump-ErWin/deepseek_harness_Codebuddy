@@ -114,6 +114,7 @@
 | `minimax-chat-probe.e2e.spec.ts` | `DSH_MINIMAX_CHAT_E2E=1` + `DSH_MINIMAX_CHAT_E2E_CONFIRM=yes` | 发一次 Anthropic Messages 推理请求。⚠️ **本轮该链路未端到端验证**：本机账号 `insufficient_balance_error`（HTTP 402）。保留探针是为了充值后一条命令验证，并把「未验证」留在代码里。⚠️ 该文件头如实标注了 `thinking.type=adaptive` 的**证据强度**（客户端取证支持 adaptive 形态，但「非 adaptive 会 400」目前只有计划文档声称、无服务端证据） |
 | `minimaxintl-probe.e2e.spec.ts` | `DSH_MINIMAXINTL_E2E=1` | **只读**：MiniMax Code **国际版**（`minimaxintl`）的模型目录（`region=en`）、签到状态、积分余额。**绝不领取**。⚠️ 与国内站探针**不同**：它读的是**插件自己的** `MINIMAXINTL_*` 凭据（国际站没有可读的本机客户端）⇒ 前置条件是先在 Jet Hub「MiniMax Code (国际版)」面板登录一个账号。⚠️⚠️ **2026-10-15 真机验证通过**：模型目录（4 条）、签到状态、积分余额、推理（200 + 真实 SSE）**全部可用**，认证只需 `Authorization: Bearer`。⚠️ **本行曾一度写着「国际站端点要求阿里云 ALB 网关签名、不可用」—— 那是把一次上游故障窗口当成了设计，已被证伪**（决定性证据：官方 mcode 客户端自己也连不上，`Code: 50112` = 官方枚举 `LLM_AUTH_ERROR`；故障恢复后同样的请求全部 200）。**仍然成立**的判据只有一条：目录端点**当前是公开的**（无 token 也 200）⇒「目录能读到」**不构成**凭据有效的证据（这是最易误判的一格），凭据证据看签到/积分/推理三处。详见 `src/minimax-product.ts` 文件头。本探针的判据只到「请求发出去了、拿到可解读响应」，实际内容**打印**给人核对 |
 | `minimaxintl-claim-probe.e2e.spec.ts` | `DSH_MINIMAXINTL_E2E=1` + `DSH_MINIMAXINTL_CLAIM_E2E_CONFIRM=yes` | ⚠️ **真实领取** MiniMax 国际站当日积分（消耗账号当天唯一一次机会）。先查状态：`todayCheckedIn` 为真则**跳过 claim**；`claim_result` 是幂等判据（1=真领、2=已领过），**不是** HTTP 状态码。⚠️ 签到状态读到 `null` 时**不执行 claim**（先确认凭据有效、再怀疑上游故障）—— 该端点形态**已实测可用**（2026-10-15），别把一次查询失败读成「端点不可用」而白烧当天机会 |
+| `officeace-abandoned-login.e2e.spec.ts`（`pnpm test:e2e:officeace-abandoned`） | `DSH_OFFICEACE_E2E=1` | **IKM741：新登录账号的完整生命周期**（⚠️ **会真开无痕窗口**）。① `account.create` 后占位条目就位 + **零凭据** + 无痕窗口真拉起（人工确认落在华为云登录页）；② 用户**没完成授权就关窗** ⇒ 刷新账号列表时幽灵占位条目被**收口**；③ 收口**不波及**其它渠道；④ ⚠️ **成功登录后即使 TTL 已过也绝不能被收口**（删除不可逆 —— 这条是安全闸）；⑤ 无痕窗口独立验证；⑥ 落库途中删卡片 ⇒ **孤儿凭据被回收**（B 档）；⑦ ⑥ 的对照组（不删卡片 ⇒ 凭据保留）。②③④ 用 `DSH_OFFICEACE_PENDING_TTL_MS=0` + 假造时钟把「已中止」变成**确定事实**，无需等真实 20 分钟 |
 | `accio-probe.e2e.spec.ts` | `DSH_ACCIO_E2E=1` | **只读**：登录（池里有凭据则直接用，否则现场 PKCE 登录，**人工在浏览器授权**）→ 模型目录（倍率来自 `effectiveMultiple` 且按升序；兜底表**不许腐坏**）→ 账号身份（`userinfo`，token 在 **body**）→ 三类积分桶 + 重置倒计时（`currentSubscription` / `quota`，token 在 **query**）。**不发模型请求、不续期、不写任何存储**（登录产物只进内存凭据提供者） |
 | `accio-refresh-probe.e2e.spec.ts` | `DSH_ACCIO_REFRESH_E2E=1` + `DSH_ACCIO_REFRESH_E2E_CONFIRM=yes` | ⚠️⚠️ **续期端点的轮换语义**（`docs/agent-notes/providers-accio.md` §10 U-A）。回答三问：①是否轮换 `refresh_token`；②旧的轮换后是否**立即失效**；③是否顺带触发当日额度发放。**只读订阅**（不发模型请求），但**真实消费一次 `refresh_token`** |
 
@@ -128,6 +129,9 @@
 ```bash
 # 只做认证（安全）
 pnpm test:e2e:login
+
+# ⚠️ 会真开无痕窗口：OfficeAce 换账号登录 + IKM741 的登录中止收口（人工确认登录页）
+pnpm test:e2e:officeace-abandoned
 
 # 登录流程原始响应探针（安全，不发模型请求）
 pnpm test:e2e:buddy-probe

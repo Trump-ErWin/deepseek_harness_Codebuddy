@@ -247,7 +247,25 @@ const OFFICEACE_CREDENTIAL = {
   expiresAt: new Date(Date.now() + 7_200_000).toISOString(),
   refreshToken: 'refresh',
   dpopPrivateJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y', d: 'd' },
-  accountId: 'stub-account',
+} as const
+
+/** 每次登录的云侧身份序号 —— 见 {@link nextOfficeAceCredential} 的说明。 */
+let officeAceCredentialSeq = 0
+
+/**
+ * 造一份**云侧身份各不相同**的 OfficeAce 凭据。
+ *
+ * ⚠️⚠️ **必须每次不同**（2026-10-17 起；此前是常量 `accountId: 'stub-account'`）。
+ *
+ * `login.poll` 落库后新增了「**同一 `accountId` 重复登录 ⇒ 停用新条目**」的查重
+ *（见 `officeace-rpc-multi-account.spec.ts` 的 ④⑤）。若本文件的桩让每次登录都返回
+ * 同一个固定身份，那些「两次登录」的用例就会被**正确地**判成重复 ⇒ `login.poll`
+ * 走「停用 + 改名」分支而**不再回填展示字段** ⇒ 用例断言的东西失效，
+ * 但**红的原因不在被测代码**（是桩在撒谎：说两次登录是同一个号）。
+ */
+function nextOfficeAceCredential(): Record<string, unknown> {
+  officeAceCredentialSeq += 1
+  return { ...OFFICEACE_CREDENTIAL, accountId: `stub-account-${officeAceCredentialSeq}` }
 }
 
 /**
@@ -277,7 +295,7 @@ function officeaceStub(options: {
     pollLoginCode: async () => code,
     completeLogin: async () => {
       if (completeLoginThrow !== undefined) throw new Error(completeLoginThrow)
-      return { ...OFFICEACE_CREDENTIAL }
+      return nextOfficeAceCredential()
     },
     persistLogin: async (
       credential: Record<string, unknown>,
@@ -540,7 +558,7 @@ describe('IKLI7J 审计修正：已落盘的登录绝不能被「失败收尾」
       officeace: exchangingStub(async () => {
         seq += 1
         // 第一拍换成功；重叠的第二拍拿到的必然是**同一条已被消费的** code。
-        if (seq === 1) return { ...OFFICEACE_CREDENTIAL }
+        if (seq === 1) return nextOfficeAceCredential()
         throw new Error('授权 code 已被使用（交换失败）')
       }),
     })
@@ -574,7 +592,7 @@ describe('IKLI7J 审计修正：已落盘的登录绝不能被「失败收尾」
 
   it('★ 落库成功但回填 updateAccount 抛错：必须报成功，账号与凭据都不得被删', async () => {
     const h = makeRealHarness(
-      { officeace: exchangingStub(async () => ({ ...OFFICEACE_CREDENTIAL })) },
+      { officeace: exchangingStub(async () => nextOfficeAceCredential()) },
       (pool) => {
         const original = pool.updateAccount.bind(pool)
         let first = true
