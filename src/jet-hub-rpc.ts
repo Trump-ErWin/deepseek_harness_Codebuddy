@@ -128,6 +128,13 @@ import {
   type CreditBalance,
 } from './credits.js'
 import { CODEBUDDY, productById, type BuddyProduct } from './product.js'
+// ⚠️ CodeBuddy 限时补偿积分（2026-10-16）：一次性活动，**不接自动签到**。
+// 端点只在 `webBase`（www.codebuddy.cn）可达，见该模块头。
+import {
+  claimCompensation,
+  describeCompensationFailure,
+  fetchCompensationStatus,
+} from './buddy-compensation.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
 /**
  * ⚠️ **`collectBuddyGrowth` 已搬到 `src/buddy-growth.ts`**（2026-10-08 Task 4），
@@ -223,6 +230,10 @@ import type {
   RpcCreditsBalancesRequest,
   RpcCreditsBalanceExtra,
   RpcCreditsBalancesResponse,
+  RpcBuddyClaimCompensationRequest,
+  RpcBuddyClaimCompensationResponse,
+  RpcBuddyCompensationStatusRequest,
+  RpcBuddyCompensationStatusResponse,
   RpcClineQuotaRequest,
   RpcClineQuotaResponse,
   RpcClineRequestLogRequest,
@@ -4835,6 +4846,89 @@ function registerJetHubEndpoints(
             })),
           } satisfies RpcClineRequestLogResponse,
         }
+      }
+
+      // ── CodeBuddy 限时补偿积分（2026-10-16 新增）──
+      //
+      // ⚠️ **不是签到**：这是一次性的限时活动（`end_time` 到期即作废）。
+      //    本仓库对「一次性 / 有代价动作」的既有铁律是**默认不自动执行**
+      //    （见 `buddy-growth.ts` 的 `runExotic`）。故这里只开两条**用户显式
+      //    触发**的 RPC：
+      //      ① `buddy.compensationStatus` —— 只读，面板挂载/刷新时调用；
+      //      ② `buddy.claimCompensation` —— 写操作，**只由面板按钮触发**。
+      //    **刻意不接进 `credits.claimAll` / auto-checkin**：那会把一次性动作
+      //    变成每日自动执行，违反上面的约定（且收益只有一次）。
+      //
+      // ⚠️ 端点只在 `www.codebuddy.cn`（= `webBase`）可达，不是推理站
+      //    `copilot.tencent.com`（= `endpoint`）。三 host 实测见
+      //    `src/buddy-compensation.ts` 的模块头。
+      case 'buddy.compensationStatus': {
+        const req = payload as RpcBuddyCompensationStatusRequest
+        if (req.provider !== CODEBUDDY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
+        }
+        const accounts = await pool.listAccounts(CODEBUDDY.id)
+        const account = accounts.find((entry) => entry.id === req.accountId)
+        if (account === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `账号不存在：${req.accountId}` } }
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (resolved === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: '凭据不可用，请先重新登录该账号' } }
+        }
+        let credential: BuddyCredential
+        try {
+          credential = JSON.parse(resolved.value) as BuddyCredential
+        } catch {
+          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
+        }
+        const result = await fetchCompensationStatus(credential, CODEBUDDY)
+        if (!result.ok) {
+          // ⚠️ 失败**不包成 ok:true**（Issue IKJOZA 的铁律），且原文随行给出。
+          return { ok: false, error: { code: 'bad-request', message: describeCompensationFailure(result.failure) } }
+        }
+        return {
+          ok: true,
+          value: {
+            claimed: result.status.claimed,
+            active: result.status.active,
+            creditNum: result.status.creditNum,
+            ...result.status.validityPeriod === undefined ? {} : { validityPeriod: result.status.validityPeriod },
+            ...result.status.endTime === undefined ? {} : { endTime: result.status.endTime },
+          } satisfies RpcBuddyCompensationStatusResponse,
+        }
+      }
+      case 'buddy.claimCompensation': {
+        const req = payload as RpcBuddyClaimCompensationRequest
+        if (req.provider !== CODEBUDDY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
+        }
+        const accounts = await pool.listAccounts(CODEBUDDY.id)
+        const account = accounts.find((entry) => entry.id === req.accountId)
+        if (account === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `账号不存在：${req.accountId}` } }
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (resolved === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: '凭据不可用，请先重新登录该账号' } }
+        }
+        let claimCredential: BuddyCredential
+        try {
+          claimCredential = JSON.parse(resolved.value) as BuddyCredential
+        } catch {
+          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
+        }
+        const claimResult = await claimCompensation(claimCredential, CODEBUDDY)
+        if (!claimResult.ok) {
+          return { ok: false, error: { code: 'bad-request', message: describeCompensationFailure(claimResult.failure) } }
+        }
+        return { ok: true, value: {} satisfies RpcBuddyClaimCompensationResponse }
       }
 
       // ── 模型列表可见性（黑名单开关）──
