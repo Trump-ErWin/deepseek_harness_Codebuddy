@@ -2746,7 +2746,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 这是刻意放在函数内部而不是只靠调用点判断——`claimCredits` / 「刷新积分」
    * 按钮等多个入口都调它，门控收在这里才不会被将来新增的调用点绕过。
    */
-  const loadCredits = React.useCallback(async () => {
+  const loadCredits = React.useCallback(async (force = false) => {
     if (!canLoadCredits) return;
     // ⚠️ **自愈后要补一次账号重读**（issue IKKHL5 的客户端残留）。
     //
@@ -2772,7 +2772,17 @@ function ProviderPanel({ provider, rpcCall }) {
     // 不是上游请求，见 `pool.listAccounts` 的实现）。
     setCreditsLoading(true);
     try {
-      const res = await rpcCall('credits.balances', { provider });
+      // ⚠️⚠️ `force` 必须透传（2026-10-16 审计 P1-1 实测确认的回归）。
+      //
+      // 宿主侧 `credits.balances` 自 0fcf83a 起会吃**共享余额读数缓存**
+      // （TTL 120 秒，失败时还能陈旧兼顶 15 分钟）。若本调用恒不传 `force`，
+      // 「刷新积分」按钮在 120 秒内点了**等于没点**，而按钮 title 写着
+      // 「余额由服务端实时计算，点此可刷新」—— 那时它是假的。
+      //
+      // ⚠️ 更隐蔽的一档是兼顶：上游已挂 10 分钟时，点「刷新」仍返回旧值 +
+      //「本次查询失败」。用户诉求是「给我新数据」，实现给「再读一次旧数据」，
+      // **比报错更糟**（它看起来成功了）。
+      const res = await rpcCall('credits.balances', force ? { provider, force: true } : { provider });
       if (!mounted.current) return;
       const next = {};
       for (const item of res.accounts || []) {
@@ -2935,7 +2945,8 @@ function ProviderPanel({ provider, rpcCall }) {
         ],
       });
       setOnboarding({ earned: res.earned, total: res.total, skipped: res.skipped });
-      if (canLoadCredits) await loadCredits();
+      // ⚠️ 同上：新手任务领取会改变余额，必须 force 绕过共享缓存（审计 P1-1）。
+      if (canLoadCredits) await loadCredits(true);
     } catch (caught) {
       setOnboardingNotice({ tone: 'error', text: caught?.message || '领取新手任务失败' });
     } finally {
@@ -3095,8 +3106,11 @@ function ProviderPanel({ provider, rpcCall }) {
         details,
       });
       await loadAccounts();
-      // 领取会改变余额，顺带刷新一次，免得卡片还显示领取前的数字
-      await loadCredits();
+      // ⚠️ 领取会改变余额，顺带刷新一次，免得卡片还显示领取前的数字。
+      //   ⚠️⚠️ **必须 force = true**（2026-10-16 审计 P1-1）：宿主侧现在吃共享
+      //   缓存（120s TTL），不绕过的话这里会把**领取前**的读数重新显示出来 ——
+      //   正是本行注释想避免的现象，只是换了个成因（审计实测确认）。
+      await loadCredits(true);
     } catch (caught) {
       console.error('[jet-hub] claim credits failed:', caught);
       if (!mounted.current) return;
@@ -3663,7 +3677,7 @@ function ProviderPanel({ provider, rpcCall }) {
               className: 'dim-jh-btn',
               title: '重新查询本页全部账号的剩余积分（Credits Balance）。余额由服务端实时计算，点此可刷新。',
               disabled: creditsLoading,
-              onClick: () => void loadCredits(),
+              onClick: () => void loadCredits(true),
             }, creditsLoading ? '查询中…' : '刷新积分')
           : null,
         supportsCredits

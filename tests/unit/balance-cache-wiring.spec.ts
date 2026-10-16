@@ -479,13 +479,18 @@ describe('★★ 端点先吃共享读数（打开面板不该每次都打上游
     }
     registerJetHubRpc(ctx as never, pool as never, emptyAuths as never)
 
-    const callBalances = async () => {
+    const callBalances = async (force = false) => {
       const response = await handler!(new Request('http://localhost/api/jet-hub', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
-          payload: { method: 'credits.balances', payload: { provider: 'loomy' } },
+          payload: {
+            method: 'credits.balances',
+            // ⚠️ `force` 只在显式为真时出现 —— JSON 里带 `force: false` 与不带是
+            //    **同一语义**，客户端省略它就是吃缓存（见 types.ts 的字段注释）。
+            payload: force ? { provider: 'loomy', force: true } : { provider: 'loomy' },
+          },
         }),
       }))
       // ⚠️ 响应裹在 `{ type, rpcId, result }` 信封里（`reply()` 的形状）——
@@ -513,6 +518,92 @@ describe('★★ 端点先吃共享读数（打开面板不该每次都打上游
       second.value?.accounts?.map((a) => a.balance?.total),
       '★★ 命中共享读数时必须仍返回真实余额（不是空、不是 0）',
     ).toEqual([100, 200])
+  })
+
+  /**
+   * ★★ **`force: true` 必须真的强制回源**（2026-10-16 审计 P1-1，实测确认的回归）。
+   *
+   * ## 缺陷形态
+   *
+   * 引入共享缓存后 `credits.balances` 有了 120 秒 TTL，而面板「刷新积分」按钮
+   * 在 TTL 内点了**等于没点** —— 而它的 `title` 写着「余额由服务端实时计算，
+   * 点此可刷新」。
+   *
+   * ⚠️ **为什么上面那条用例抓不到**：它只断言「不带 force ⇒ 零上游」，
+   *   **从不断言「带 force ⇒ 会回源」** ⇒ `force` 那一整条通路可以是死代码而全绿。
+   *   这正是本次审计实测的形态：`collectCreditBalances` 里传的是**硬编码 `{}`**
+   *   ⇒ `readOptions.force` 恒 `undefined` ⇒ 端点读了 `payload.force` 也传不到。
+   */
+  it('★★ force: true ⇒ 强制回源（哪怕缓存里有新鲜值）', async () => {
+    const { registerJetHubRpc, JET_HUB_API_PATH } = await import('../../src/jet-hub-rpc.js')
+    const runtimeModule = await import('../../src/provider-runtime.js')
+
+    const upstream: string[] = []
+    const cache = createBalanceCache({
+      ttlMs: 120_000,
+      fetch: async (provider, entry) => {
+        upstream.push(`${provider}:${entry.id}`)
+        return balanceOf(entry.id === 'a1' ? 100 : 200)
+      },
+    })
+    runtimeModule.registerBalanceCache(cache)
+    runtimeModule.registerProviderRuntime({
+      descriptor: { id: 'loomy' } as never,
+      credits: { fetchBalance: async () => balanceOf(999) },
+    } as never)
+
+    const loomyAccounts = accounts as unknown as Array<{ id: string }>
+    const pool = {
+      addAccount: async () => {}, updateAccount: async () => {}, removeAccount: async () => {},
+      listAccounts: async (p: string) => (p === 'loomy' ? loomyAccounts : []),
+      listAccountsByProvider: async (p: string) => (p === 'loomy' ? loomyAccounts : []),
+    }
+    let handler: ((request: Request) => Promise<Response>) | undefined
+    const ctx = {
+      get: (key: string) => key === 'connection'
+        ? { fetch: { register: (cfg: { path: string; fetch: (r: Request) => Promise<Response> }) => { if (cfg.path === JET_HUB_API_PATH) handler = cfg.fetch } } }
+        : undefined,
+      inject: (_deps: string[], callback: (injected: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        resolve: async () => ({ value: JSON.stringify({ access_token: 't' }) }),
+        set: async () => {}, unset: async () => {},
+      },
+    }
+    registerJetHubRpc(ctx as never, pool as never, {
+      codearts: {}, buddy: {}, workbuddy: {}, lobsterai: {}, qoder: {}, qodercn: {},
+      trae: {}, cline: {}, loomy: {}, raccoon: {}, minimax: {}, zcode: {}, gemini: {}, officeace: {},
+    } as never)
+
+    const call = async (force: boolean) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'r', method: 'jet-hub',
+          payload: {
+            method: 'credits.balances',
+            payload: force ? { provider: 'loomy', force: true } : { provider: 'loomy' },
+          },
+        }),
+      }))
+      return (await response.json() as { result: { ok: boolean } }).result
+    }
+
+    // ① 先填满缓存
+    await call(false)
+    // ② 不带 force ⇒ 命中（零上游）
+    upstream.length = 0
+    await call(false)
+    expect(upstream, '★ 前提：不带 force 时命中缓存').toEqual([])
+    // ③ ★ 带 force ⇒ **必须回源**（缓存里有新鲜值也要打）
+    upstream.length = 0
+    const forced = await call(true)
+    expect(forced.ok).toBe(true)
+    expect(
+      upstream,
+      '★★ force:true 必须强制回源（否则「刷新积分」按钮是假的 —— 审计 P1-1）',
+    ).not.toEqual([])
   })
 
   // ⚠️⚠️ **全局注册位必须清**（`provider-runtime.ts:803` 登记过这个陷阱）：
