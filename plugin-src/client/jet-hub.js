@@ -2584,6 +2584,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 缺省 `cn`，与宿主 `normalizeAccioRegion` 的回落值一致（未知值也回落 `cn`）。
    */
   const [accioRegion, setAccioRegion] = React.useState('cn');
+  const [autoclawMode, setAutoclawMode] = React.useState('local');
   /**
    * ★ 弹窗是否开着（`false` = 关着）。
    *
@@ -2751,6 +2752,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 两者都必须由 `provider` 驱动，任一处漏改都会得到「弹窗内容与判据不匹配」。
    */
   const accioDialog = provider === 'accio';
+  const autoclawDialog = provider === 'autoclaw';
   // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
   // 有成长中心的 provider 才传 runTasks（见 GROWTH_TASK_PROVIDERS 的注释：
@@ -3323,7 +3325,7 @@ function ProviderPanel({ provider, rpcCall }) {
       //   （`buildCreateAccountPayload` 内部分支），
       //   其余 provider 的载荷与接入预选弹窗前**逐字节相同**。
       const res = await rpcCall('account.create',
-        buildCreateAccountPayload(provider, zcodeProvider, accioRegion));      accountId = res.accountId;
+        buildCreateAccountPayload(provider, zcodeProvider, accioRegion, autoclawMode));      accountId = res.accountId;
       loginUrl = res.loginUrl;
       console.log('[jet-hub] account.create ok, provider =', provider, ', accountId =', accountId);
       // ⚠ **`reused` 分支必判**：后端若声明「复用了池里已有条目、新建条目与登录 URL」，
@@ -3347,6 +3349,11 @@ function ProviderPanel({ provider, rpcCall }) {
       // 早期这里为 Loomy 分出一个「短信表单」分支，而表单要等 `account.create`
       // 返回才渲染、`account.create` 又要求先有手机号 —— **顺序死锁**，
       // 表单永远出不来。改用微信扫码后该分支已删除。
+      if (!loginUrl) {
+        await loadAccounts();
+        setProbeNotice({ tone: 'ok', text: '已成功导入账号凭据。', details: [] });
+        return;
+      }
       if (loginUrl) {
         // ⚠️⚠️ **OfficeAce：宿主已用无痕窗口打开，客户端不要再开一个**（2026-10-13）。
         //
@@ -3926,35 +3933,225 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: (event) => event.stopPropagation(),
             },
               React.createElement('h3', { className: 'dim-jh-zcDialogTitle' },
-                accioDialog ? '添加 Accio 账号' : '添加 ZCode 账号'),
+                autoclawDialog ? '添加 AutoClaw 账号' : (accioDialog ? '添加 Accio 账号' : '添加 ZCode 账号')),
               React.createElement('p', { className: 'dim-jh-zcDialogHint' },
-                accioDialog
-                  // ⚠ 必须说清「区域不可事后推断、选错就登不进去」：
-                  //   它不是偏好设置，而是登录页域名本身（见 accioRegion 的注释）。
-                  ? 'Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前'
-                    + '无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。'
-                  : '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，'),
-              accioDialog
+                autoclawDialog
+                  ? '请选择登录方式：可直接读取本机已安装并登录的桌面端凭据，或使用手机短信验证码快速登录。'
+                  : (accioDialog
+                      ? 'Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前'
+                        + '无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。'
+                      : '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，')),
+              (accioDialog || autoclawDialog)
                 ? null
                 : React.createElement('p', { className: 'dim-jh-zcDialogHint' },
                     '可用 z.ai（国际）登录另一个账号。'),
               React.createElement('label', { className: 'dim-jh-zcProvider' },
-                accioDialog ? '登录区域' : '登录渠道',
-                accioDialog
+                autoclawDialog ? '登录方式' : (accioDialog ? '登录区域' : '登录渠道'),
+                autoclawDialog
                   ? React.createElement('select', {
                       className: 'dim-jh-zcSelect',
-                      value: accioRegion,
-                      onChange: (event) => setAccioRegion(event.target.value),
+                      style: { display: 'none' },
+                      value: autoclawMode,
+                      onChange: (event) => setAutoclawMode(event.target.value),
                     },
-                      React.createElement('option', { value: 'cn' }, '中国版（www.accio-ai.com）'),
-                      React.createElement('option', { value: 'global' }, '国际版（zh.accio.com）'))
-                  : React.createElement('select', {
-                      className: 'dim-jh-zcSelect',
-                      value: zcodeProvider,
-                      onChange: (event) => setZcodeProvider(event.target.value),
-                    },
-                      React.createElement('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
-                      React.createElement('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）'))),
+                      React.createElement('option', { value: 'local' }, '一键导入本机桌面端凭据'),
+                      React.createElement('option', { value: 'sms' }, '手机验证码快速登录'))
+                  : (accioDialog
+                      ? React.createElement('select', {
+                          className: 'dim-jh-zcSelect',
+                          style: { display: 'none' },
+                          value: accioRegion,
+                          onChange: (event) => setAccioRegion(event.target.value),
+                        },
+                          React.createElement('option', { value: 'cn' }, '中国版（www.accio-ai.com）'),
+                          React.createElement('option', { value: 'global' }, '国际版（zh.accio.com）'))
+                      : React.createElement('select', {
+                          className: 'dim-jh-zcSelect',
+                          style: { display: 'none' },
+                          value: zcodeProvider,
+                          onChange: (event) => setZcodeProvider(event.target.value),
+                        },
+                          React.createElement('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
+                          React.createElement('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）')))),
+              // 彻底解决 Windows/Electron 下原生 <select> 下拉框经常点不开的恶心 bug：使用 100% 可靠的 DOM 单选卡片组
+              React.createElement('div', {
+                style: {
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '8px',
+                  margin: '8px 0 16px',
+                },
+              },
+                (autoclawDialog
+                  ? [
+                      { value: 'local', label: '⚡ 一键导入本机桌面端凭据', desc: '需已在 AutoClaw 桌面端登录，自动秒级解密' },
+                      { value: 'sms', label: '📱 手机验证码快速登录', desc: '免安装桌面端，支持输入任意手机号登录' },
+                    ].map((opt) => {
+                      const active = autoclawMode === opt.value;
+                      return React.createElement('div', {
+                        key: opt.value,
+                        onClick: () => setAutoclawMode(opt.value),
+                        style: {
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '10px',
+                          padding: '10px 14px',
+                          borderRadius: '6px',
+                          border: active
+                            ? '1.5px solid var(--dsw-alias-primary, #0284c7)'
+                            : '1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.25))',
+                          background: active
+                            ? 'var(--dsw-alias-primary-tint, rgba(2, 132, 199, 0.1))'
+                            : 'var(--dsw-alias-bg-layer-2, transparent)',
+                          cursor: 'pointer',
+                          transition: 'all 0.15s ease',
+                          userSelect: 'none',
+                        },
+                      },
+                        React.createElement('div', {
+                          style: {
+                            width: '14px',
+                            height: '14px',
+                            borderRadius: '50%',
+                            border: active
+                              ? '4px solid var(--dsw-alias-primary, #0284c7)'
+                              : '1.5px solid var(--dsw-alias-border-l2, #8b949e)',
+                            boxSizing: 'border-box',
+                            flexShrink: 0,
+                            background: active ? '#fff' : 'transparent',
+                          },
+                        }),
+                        React.createElement('div', { style: { display: 'flex', flexDirection: 'column' } },
+                          React.createElement('span', {
+                            style: {
+                              fontSize: '13px',
+                              fontWeight: active ? 600 : 400,
+                              color: 'var(--dsw-alias-label-primary, inherit)',
+                            },
+                          }, opt.label),
+                          React.createElement('span', {
+                            style: {
+                              fontSize: '11px',
+                              color: 'var(--dsw-alias-label-tertiary, #888)',
+                              marginTop: '2px',
+                            },
+                          }, opt.desc)
+                        )
+                      );
+                    })
+                  : (accioDialog
+                      ? [
+                          { value: 'cn', label: '🇨🇳 中国版（www.accio-ai.com）', desc: '适用于 Accio 国内站点账号' },
+                          { value: 'global', label: '🌐 国际版（zh.accio.com）', desc: '适用于 Accio 国际站点账号' },
+                        ].map((opt) => {
+                          const active = accioRegion === opt.value;
+                          return React.createElement('div', {
+                            key: opt.value,
+                            onClick: () => setAccioRegion(opt.value),
+                            style: {
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '10px',
+                              padding: '10px 14px',
+                              borderRadius: '6px',
+                              border: active
+                                ? '1.5px solid var(--dsw-alias-primary, #0284c7)'
+                                : '1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.25))',
+                              background: active
+                                ? 'var(--dsw-alias-primary-tint, rgba(2, 132, 199, 0.1))'
+                                : 'var(--dsw-alias-bg-layer-2, transparent)',
+                              cursor: 'pointer',
+                              transition: 'all 0.15s ease',
+                              userSelect: 'none',
+                            },
+                          },
+                            React.createElement('div', {
+                              style: {
+                                width: '14px',
+                                height: '14px',
+                                borderRadius: '50%',
+                                border: active
+                                  ? '4px solid var(--dsw-alias-primary, #0284c7)'
+                                  : '1.5px solid var(--dsw-alias-border-l2, #8b949e)',
+                                boxSizing: 'border-box',
+                                flexShrink: 0,
+                                background: active ? '#fff' : 'transparent',
+                              },
+                            }),
+                            React.createElement('div', { style: { display: 'flex', flexDirection: 'column' } },
+                              React.createElement('span', {
+                                style: {
+                                  fontSize: '13px',
+                                  fontWeight: active ? 600 : 400,
+                                  color: 'var(--dsw-alias-label-primary, inherit)',
+                                },
+                              }, opt.label),
+                              React.createElement('span', {
+                                style: {
+                                  fontSize: '11px',
+                                  color: 'var(--dsw-alias-label-tertiary, #888)',
+                                  marginTop: '2px',
+                                },
+                              }, opt.desc)
+                            )
+                          );
+                        })
+                      : [
+                          { value: 'bigmodel', label: '🇨🇳 BigModel（智谱开放平台，国内）', desc: '适用于 open.bigmodel.cn 国内平台账号' },
+                          { value: 'zai', label: '🌐 z.ai（chat.z.ai，国际版）', desc: '适用于 z.ai 国际版账号' },
+                        ].map((opt) => {
+                          const active = zcodeProvider === opt.value;
+                          return React.createElement('div', {
+                            key: opt.value,
+                            onClick: () => setZcodeProvider(opt.value),
+                            style: {
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '10px',
+                              padding: '10px 14px',
+                              borderRadius: '6px',
+                              border: active
+                                ? '1.5px solid var(--dsw-alias-primary, #0284c7)'
+                                : '1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.25))',
+                              background: active
+                                ? 'var(--dsw-alias-primary-tint, rgba(2, 132, 199, 0.1))'
+                                : 'var(--dsw-alias-bg-layer-2, transparent)',
+                              cursor: 'pointer',
+                              transition: 'all 0.15s ease',
+                              userSelect: 'none',
+                            },
+                          },
+                            React.createElement('div', {
+                              style: {
+                                width: '14px',
+                                height: '14px',
+                                borderRadius: '50%',
+                                border: active
+                                  ? '4px solid var(--dsw-alias-primary, #0284c7)'
+                                  : '1.5px solid var(--dsw-alias-border-l2, #8b949e)',
+                                boxSizing: 'border-box',
+                                flexShrink: 0,
+                                background: active ? '#fff' : 'transparent',
+                              },
+                            }),
+                            React.createElement('div', { style: { display: 'flex', flexDirection: 'column' } },
+                              React.createElement('span', {
+                                style: {
+                                  fontSize: '13px',
+                                  fontWeight: active ? 600 : 400,
+                                  color: 'var(--dsw-alias-label-primary, inherit)',
+                                },
+                              }, opt.label),
+                              React.createElement('span', {
+                                style: {
+                                  fontSize: '11px',
+                                  color: 'var(--dsw-alias-label-tertiary, #888)',
+                                  marginTop: '2px',
+                                },
+                              }, opt.desc)
+                            )
+                          );
+                        })))),
               React.createElement('div', { className: 'dim-jh-zcDialogActions' },
                 React.createElement('button', {
                   className: 'dim-jh-btn',
@@ -3967,7 +4164,7 @@ function ProviderPanel({ provider, rpcCall }) {
                     setPendingLogin(undefined)
                     void createAccount()
                   },
-                }, '确定并打开认证页'))),
+                }, (autoclawDialog && autoclawMode === 'local') ? '确定并导入本地账号' : '确定并打开认证页'))),
         )),
     probeNotice
       ? React.createElement('div', {

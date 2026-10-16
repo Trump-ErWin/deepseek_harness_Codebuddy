@@ -91,7 +91,7 @@ const PROVIDER_IDS = readProviderIds()
  * 它同样是「必须同步」的第三处。漏了它，下面那条不变式会**退化成**
  * 只检查旧字段，新 provider 的载荷字段无人守（正是本组要防的形态）。
  */
-const EXCLUSIVE_FIELDS = ['zcodeProvider', 'accioRegion']
+const EXCLUSIVE_FIELDS = ['zcodeProvider', 'accioRegion', 'autoclawMode']
 
 /**
  * 载荷里带了哪些专属字段（0 个 / 1 个 / 多个）。
@@ -160,7 +160,7 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
     // ⚠ 这条对**全部** provider 取一遍：A1 的形态是「弹窗对 provider 零分支」，
     //   只抽查两三个 provider 的话，新增一个 provider 漏判就会静默溜过去。
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode' || id === 'accio') continue
+      if (id === 'zcode' || id === 'accio' || id === 'autoclaw') continue
       expect(newAccountAsksChannel(id), `${id} 不该弹预选窗`).toBe(false)
     }
   })
@@ -180,11 +180,16 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
 
   it('★ 不需要预选的 provider 载荷里**不许**出现任何专属字段（A2：选择被静默丢弃）', () => {
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode' || id === 'accio') continue
+      if (id === 'zcode' || id === 'accio' || id === 'autoclaw') continue
       const payload = buildCreateAccountPayload(id, 'zai', 'global')
       expect(payload).toEqual({ provider: id })
       expect(exclusiveFieldsOf(payload as Record<string, unknown>)).toEqual([])
     }
+  })
+
+  it('★ autoclaw 的载荷带上登录模式', () => {
+    expect(buildCreateAccountPayload('autoclaw', undefined, undefined, 'local')).toEqual({ provider: 'autoclaw', autoclawMode: 'local' })
+    expect(buildCreateAccountPayload('autoclaw', undefined, undefined, 'sms')).toEqual({ provider: 'autoclaw', autoclawMode: 'sms' })
   })
 
   it('★ zcode 的载荷带上渠道（这是它唯一一次选择的落点）', () => {
@@ -212,7 +217,7 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
     // ⚠️ 三个实参都要传：只传两个会让 accio 的区域**恒为 undefined** ⇒ 宿主
     //    回落到 `cn` ⇒ 国际用户静默登不进去（正是本任务要修的功能缺口）。
     expect(jetHubCode, '调用点必须把 accioRegion 一起传给载荷构造器')
-      .toMatch(/buildCreateAccountPayload\(provider,\s*zcodeProvider,\s*accioRegion\)/)
+      .toMatch(/buildCreateAccountPayload\(provider,\s*zcodeProvider,\s*accioRegion(?:,\s*autoclawMode)?\)/)
   })
 })
 
