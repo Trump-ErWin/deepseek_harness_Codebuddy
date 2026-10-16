@@ -761,7 +761,15 @@ export interface RpcCreditsBalancesResponse {
 /** RPC: 查询某账号的 **CodeBuddy 限时补偿积分**状态（2026-10-16 新增）。
  *
  * ⚠️ 这是**一次性限时活动**，不是每日签到能力 ⇒ **不接 `credits.claimAll`**。
- * 端点只在 `www.codebuddy.cn`（`webBase`）可达，见 `src/buddy-compensation.ts`。
+ * ⚠️ 端点走 buddy 的 **`webBase`** —— `src/product.ts` 里该值是
+ * `https://www.workbuddy.cn`；`www.codebuddy.cn` 只是三个实测可达 host 之一，
+ * **不是 `webBase` 本身**（PR !106 初版把两者混为一谈，2026-10-16 审计更正）。
+ * 三个 host 均可达这件事见 `src/buddy-compensation.ts` 模块头。
+ *
+ * ⚠️⚠️ **客户端契约**：`rpcCall` 成功时返回的是**解包后的 `value`**（**没有
+ * `ok` 字段**），失败时**抛错**（`plugin-src/management-rpc.mjs` 的
+ * `unwrapRpcResult`）⇒ 消费方**判 `res.ok` 恒假**，必须走字段判据 + try/catch。
+ * 见 `plugin-src/client/compensation-panel-logic.js` 模块头。
  */
 export interface RpcBuddyCompensationStatusRequest {
   /** 目前只有 `'buddy'`（CodeBuddy 中国版）。 */
