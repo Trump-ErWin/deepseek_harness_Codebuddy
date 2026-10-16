@@ -214,8 +214,27 @@ export function rejectionsFromCatalog(models) {
  * ## 判据
  *
  * - `expiry` 越小越前；`Infinity`（长期/无到期）排最后；
+ * - `UNUSABLE`（`-1`，**查不到**）也排**最后**（⚠️ 见下）；
  * - 相同 `expiry` 按 `provider` 升序（结果稳定，便于断言与面板顺序稳定）；
  * - 缺 `expiry` 视为 `Infinity`（畸形数据不抛错、也不抢到前面）。
+ *
+ * ## ⚠️⚠️ `UNUSABLE`（`-1`）必须排最后（真实缺陷，用户验收 2026-10-16）
+ *
+ * 用户报障原话：「有 2 个模型显示**查不到**排前面了，为什么查不到，查不到应该
+ * 当做没临期不会放在前面」。
+ *
+ * 根因：本函数原先用 `Number.isFinite(value)` 判「是不是有效到期时刻」，而
+ * **`Number.isFinite(-1) === true`** ⇒ `UNUSABLE` 算出的排序键是 **`-1`**，
+ * 比任何真实毫秒时间戳（约 1.7e12）都小 ⇒ **排到最前面**。用户看到的正是
+ * accio / officeace 两个「查不到」的候选被排到了 buddy（`4 天`）之前。
+ *
+ * ⚠️ `-1` 是**哨兵**，不是时间戳：语义是「**这次查不到**」（无启用账号 / 探测失败），
+ * 与「明天过期」完全是两件事。宿主的 `rankCandidates` 对它是**直接剔除**
+ *（`filter(c => c.expiry !== UNUSABLE)`）；面板这边**保留可见**（用户要看得到它们、
+ * 以及为什么没参与），但**必须排最后** —— 与「长期（`Infinity`）」同一位置。
+ *
+ * ⚠️ 判据只留一份：这里用**显式哨兵判定**，**不得**退回 `Number.isFinite`
+ *（那正是本缺陷）。两处（宿主剔除 / 面板排尾）语义一致：`UNUSABLE` 绝不排前面。
  *
  * ⚠️ **纯函数**：返回新数组，不改入参（React 靠引用变化重渲染）。
  *
@@ -226,6 +245,9 @@ export function sortCandidatesByExpiry(rows) {
   if (!Array.isArray(rows)) return []
   const of = (row) => {
     const value = row?.expiry
+    // ⚠️⚠️ 先排除**哨兵** `UNUSABLE = -1`（见上方长注释：`Number.isFinite(-1)` 为真，
+    //    照原写法它会算出 -1 并排到最前 —— 那正是用户报障的现象）。
+    if (value === -1) return Number.POSITIVE_INFINITY
     return typeof value === 'number' && Number.isFinite(value) ? value : Number.POSITIVE_INFINITY
   }
   return [...rows].sort((a, b) => {
@@ -646,4 +668,94 @@ export function moveCandidateTo(order, key, targetIndex) {
 export function pendingOrderFromRoster(participating) {
   if (!Array.isArray(participating)) return []
   return participating.map(candidateKeyOf)
+}
+
+/**
+ * 「按临期」模式的重探定时器：**该不该在这一轮发探测**。
+ *
+ * ## 为什么要有这个纯函数（而不是内联在 `React.useEffect` 里）
+ *
+ * 本文件顶部的模块注释写着：「单测环境没有 react ⇒ 必须抽成纯函数才能覆盖」。
+ * 而这段定时器原先**内联在 `jet-hub.js` 的 `AggregatePanel` 里**，测试够不到它
+ * ⇒ 「按临期每 5 分钟重探」这条**长期零用例**（2026-10-16 核实：全仓库对
+ * `AGG_EXPIRY_REPROBE_MS` 的断言数为 **0**）。而那三条约束（只在按临期 /
+ * 隐藏时跳过 / 卸载清定时器）都是**真实会打上游请求**的行为，正是最该有守卫的地方。
+ *
+ * ## 判据（与 `jet-hub.js` 的 effect 逐格同构）
+ *
+ * | 情形 | 返回值 | 依据 |
+ * |---|---|---|
+ * | 不是「按临期」模式 | `false` | 手工模式下用户已定的位次不受临期影响，轮询纯属浪费上游请求 |
+ * | 页面隐藏（`document.hidden === true`） | `false` | 后台标签页持续打上游不可接受；且 `setInterval` 在后台被节流、恢复时会**补跑一串** |
+ * | 其余 | `true` | 正常轮询 |
+ *
+ * ⚠️ `hidden` 用**真值判断**（`=== true`）：缺失/`undefined`（非浏览器环境）视为
+ * **不隐藏** —— 与内联版的 `typeof document !== 'undefined' && document.hidden === true`
+ * 同语义（没有 document 时不该拦住探测）。
+ *
+ * ⚠️ **纯函数**：零副作用、不读全局，便于假定时器用例直接驱动。
+ *
+ * @param {{ orderMode?: string, hidden?: boolean }} [input]
+ * @returns {boolean}
+ */
+export function shouldReprobeExpiry(input) {
+  const orderMode = input?.orderMode
+  if (orderMode !== 'expiry') return false
+  if (input?.hidden === true) return false
+  return true
+}
+
+/**
+ * 挂上「按临期重探」定时器，返回**清理函数**。
+ *
+ * ## 为什么把 `schedule` / `cancel` 做成参数（而不是直接调 `setInterval`）
+ *
+ * 这样单测能用 vitest 的**假定时器**真跑「5 分钟」而**不真等**，
+ * 且能断言最要紧的一条：**清理函数真的把定时器停了**
+ *（真实缺陷形态：面板反复进出会叠加 N 个定时器 ⇒ 上游请求量 ×N，
+ * 且只在长时间挂着时才看得出来 —— 这是本函数存在的核心理由）。
+ *
+ * ⚠️ 生产调用点必须传**真的** `setInterval` / `clearInterval`
+ *（`jet-hub.js` 的 effect 如此），否则定时器永不触发。
+ *
+ * ⚠️ `isHidden` 是**取值函数**而非布尔快照：隐藏状态会在两轮之间变化，
+ * 快照会让「切到后台再切回来」判错。
+ *
+ * ⚠️ **非「按临期」模式返回 no-op 清理函数**（而不是 `undefined`）：
+ * 调用方（React effect 的 cleanup）可以无条件调用它，不必再判一次模式
+ * —— 少一个判据分叉点。
+ *
+ * @param {{
+ *   orderMode?: string,
+ *   intervalMs: number,
+ *   isHidden?: () => boolean,
+ *   probe: () => unknown,
+ *   schedule?: (fn: () => void, ms: number) => unknown,
+ *   cancel?: (handle: unknown) => void,
+ * }} options
+ * @returns {() => void} 清理函数（幂等，可重复调用）
+ */
+export function startExpiryReprobe(options) {
+  const {
+    orderMode,
+    intervalMs,
+    isHidden = () => false,
+    probe,
+    schedule = (fn, ms) => setInterval(fn, ms),
+    cancel = (handle) => clearInterval(handle),
+  } = options ?? {}
+  // ⚠️ 非按临期模式：**不挂定时器**（这正是「切手工即停」那条判据的实现处）。
+  if (orderMode !== 'expiry') return () => {}
+  if (typeof probe !== 'function') return () => {}
+  const handle = schedule(() => {
+    if (!shouldReprobeExpiry({ orderMode, hidden: isHidden() === true })) return
+    probe()
+  }, intervalMs)
+  let stopped = false
+  // ⚠️ 幂等：React 严格模式下 cleanup 可能被调用多次，重复 cancel 不得抛错。
+  return () => {
+    if (stopped) return
+    stopped = true
+    cancel(handle)
+  }
 }

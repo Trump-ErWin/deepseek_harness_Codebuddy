@@ -4857,7 +4857,7 @@ describe('★★ 聚合门控 / 手工排序端点', () => {
     expect(seen).toEqual([false, true])
   })
 
-  it('★ aggregate.expiryOrder 透传 force（每 5 分钟自动重探 / 手动点击要新鲜值）', async () => {
+  it('★ aggregate.expiryOrder 透传 force（定时自动重探 / 手动点击都要新鲜值）', async () => {
     const seen: Array<boolean | undefined> = []
     const { call } = setup({
       aggregate: {

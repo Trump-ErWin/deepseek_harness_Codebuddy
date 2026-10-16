@@ -78,8 +78,10 @@ import {
   rejectionsFromCatalog,
   rotationBlockerOf,
   rotationRosterOf,
+  shouldReprobeExpiry,
   sortCandidatesByExpiry,
   sortModelsForPanel,
+  startExpiryReprobe,
   toggleRejection,
 } from './aggregate-panel-logic.js';
 import {
@@ -5438,7 +5440,7 @@ const AGG_WIRED_CHANNEL_LABELS =
   'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace';
 
 /**
- * 「按临期排序」模式下面板**自动重探**临期顺序的间隔（用户 2026-10-15 选定 5 分钟）。
+ * 「按临期排序」模式下面板**自动重探**临期顺序的间隔（用户 2026-10-16 从 5 分钟改为 **2 分钟**）。
  *
  * ⚠️ 用户原话追问是「按临期排序的顺序应该后台定时刷新现在有吗？」—— 实测答复是
  * **宿主侧没有**任何定时刷新（`src/refresh-scheduler.ts` 只管凭据续期，
@@ -5446,8 +5448,12 @@ const AGG_WIRED_CHANNEL_LABELS =
  * （见 `AggregatePanel` 里那段 `setInterval` 的三条约束）。
  * ⚠️ 别把它写成「后台定时刷新」：面板关掉就不轮询了（这是**刻意**的 ——
  * 我们没有常驻的宿主定时器，也不该为一个排序展示加一个）。
+ *
+ * ⚠️ 改动本值时要**同步**：`AggregatePanel` 里的两处说明文案、工具行两个按钮的
+ * `title`、以及 `README.md` 的聚合表格（否则面板会说自己「每 5 分钟」而实际不是 —— 那
+ * 正是本项目反复处理过的「面板没说真话」）。
  */
-const AGG_EXPIRY_REPROBE_MS = 5 * 60 * 1000;
+const AGG_EXPIRY_REPROBE_MS = 2 * 60 * 1000;
 
 /**
  * 聚合 provider 的设置面板。
@@ -5508,8 +5514,17 @@ function AggregatePanel({ rpcCall }) {
    *   ⚠️ 真实缺陷（对抗审计实测证伪）：初版**恒不传 force** ⇒ 「刷新」按钮实际是
    *   「读缓存」，用户在渠道侧新增/关闭模型后点刷新**看不到任何变化**，会以为
    *   聚合坏了。⇒ 挂载时走缓存（`false`），**用户显式点刷新**时传 `true`。
+   * @param {{ keepNotice?: boolean }} [options]
+   *   `keepNotice: true` ⇒ **成功时不清空 notice**。
+   *   ⚠️⚠️ 真实缺陷（用户验收 2026-10-16：「拒绝后给出的提示信息不到 1 秒就消失了
+   *   基本不会看清内容」）：调用方先 `setNotice('已把 N 条…恢复为…')`，紧接着
+   *   `await load(true)`，而本函数成功分支里那行 `setNotice(null)` **把刚写的提示
+   *   清掉了** ⇒ 用户只看到不到 1 秒（甚至看不到）。
+   *   ⇒ 凡「先写提示、再刷新」的调用方都必须传 `keepNotice: true`。
+   *   ⚠️ 默认（省略）仍是**清空** —— 那是「用户主动点刷新」的既有语义
+   *   （刷新后旧的错误提示该消失），不改它以免影响既有行为。
    */
-  const load = React.useCallback(async (force = false) => {
+  const load = React.useCallback(async (force = false, options = {}) => {
     setBusy(true);
     try {
       // ⚠️⚠️ **必须传对象而非省略 payload**（真实缺陷，用户报障
@@ -5551,7 +5566,8 @@ function AggregatePanel({ rpcCall }) {
       // ⚠️ 重拉目录后**丢弃**拖动中的临时顺序：宿主刚下发的 `model.order` 才是权威
       //    （保留临时值会让「刷新」看起来没生效）。
       setPendingOrder({});
-      setNotice(null);
+      // ⚠️ `keepNotice` 时**保留**调用方刚写的提示（见 options 的注释）。
+      if (options.keepNotice !== true) setNotice(null);
     } catch (caught) {
       // ⚠️ `caught.message` 才是服务端给的**真实原因**（如
       //    「聚合 provider 未注册或未提供目录」）—— 不要吞掉它只显示兜底文案。
@@ -5604,12 +5620,16 @@ function AggregatePanel({ rpcCall }) {
       //   故不必在这里再摊平一次。
       // ⚠️ 必须 force = true：load() 默认走宿主侧目录 TTL 缓存（60 秒），
       //    那样拿到的仍是**写之前**的候选表 ⇒ 开关会「点了不动」。
-      await load(true);
+      await load(true, { keepNotice: true });
+      // ⚠️ 这里**已经**在 load 之后写了「成功」的语义（`load` 内部会清 notice），
+      //    故不传 `keepNotice` —— 本路径没有「先写提示再刷新」的时序问题。
       setNotice(null);
     } catch (caught) {
       // ⚠️ 失败时用服务端状态**纠正**乐观更新（否则界面显示已改、实际没改）。
       setNotice(`保存失败：${caught?.message ?? String(caught)}`);
-      await load();
+      // ⚠️ 失败路径**必须** keepNotice（否则 load() 会把刚写的失败原因清掉，
+      //    用户看到的是「点了没反应」而不是「保存失败：…」）。
+      await load(false, { keepNotice: true });
     }
   }, [rpcCall, load]);
 
@@ -5618,7 +5638,7 @@ function AggregatePanel({ rpcCall }) {
    *
    * ⚠️ 默认**不探测**：临期顺序要逐渠道打一次上游余额请求，而面板一打开就探测
    * 是不可接受的（规格 §8.3 要求 `aggregate.catalog` 零余额查询）。
-   * ⇒ 挂载时不探；用户切/点「按临期」才探，且该模式下每 5 分钟自动重探一次。
+   * ⇒ 挂载时不探；用户切/点「按临期」才探，且该模式下每 2 分钟自动重探一次。
    *
    * ⚠️ **声明位置在 `onSelectOrderMode` 之前**：那个回调的依赖数组引用了本函数
    *（`const` 的 TDZ 会让「声明在后」在**首次渲染**就抛 `Cannot access before initialization`
@@ -5632,7 +5652,7 @@ function AggregatePanel({ rpcCall }) {
       // ⚠️ 与 `load` 同款：`rpcCall` 成功返回**解包后的值**（`{ order }`），失败抛错。
       //    不写 `res.ok` 判断（它永远为假，会丢掉真实原因）。
       // ⚠️ `force: true`：**绕过探针自己的 60 秒折算缓存**。用户点「刷新临期顺序」
-      //    期待的是真重查；传 false 会让「每 5 分钟自动重探」实际读 60 秒缓存
+      //    期待的是真重查；传 false 会让「每 2 分钟自动重探」实际读 60 秒缓存
       //    （用户改了渠道侧配置后要等更久）。
       const res = await rpcCall('aggregate.expiryOrder', { force: true });
       setExpiryOrder(res?.order ?? {});
@@ -5651,29 +5671,51 @@ function AggregatePanel({ rpcCall }) {
    *
    * ⚠️ **先发 RPC 再改本地 state**：反过来会让落盘失败时面板显示新模式、宿主仍用旧模式
    *（用户下次打开才发现，且中间这段时间「拖了排序不生效」）。
-   * ⚠️ 切换后**顺带探测一次**（两种模式都要）：按临期模式本来就该显示临期序；
-   *    手工模式下**未拖过的尾巴**仍按临期排序 —— 不探就会用「目录顺序」兜底，
-   *    与宿主不一致（跨层一致性用例锁的是同一比较器，但输入数据必须齐）。
+   *
+   * ## ⚠️⚠️ 只有切到「按临期」才探测（真实缺陷，用户验收 2026-10-16）
+   *
+   * 用户原话：「4C 是不覆盖但是有 2 个问题，切换会手工还在查询中等很长时间，
+   * **手工排序不用查询吧**？」
+   *
+   * 根因：本函数原先**无条件** `await onSortByExpiry()` —— 那是**逐渠道上游余额
+   * 请求**（十几个 GET），于是切到手工模式也要干等一轮探测。而手工模式的价值恰恰
+   * 是「按用户拖的顺序」—— 切过去的那一刻**不需要**任何临期值。
+   *
+   * ⚠️ 那为什么原来要探？因为手工模式下**没拖过的尾巴**仍按临期排序
+   *（`manualRankOf` 对未排过的返回 `undefined` ⇒ 回落临期↓倍率）。但那是
+   * **尾部次序的精细度**问题，不是「切模式能不能用」的问题：
+   *   - 未探测时 `expiryOf` 返回 `undefined` ⇒ 尾部按**目录序**（与「按渠道名」
+   *     那个已删的口径同源）—— 仍然是一个稳定的顺序；
+   *   - 用户真正拖过的位次**完全不受影响**（手工位次是严格序，不看临期）。
+   * ⇒ 探针留给「按临期」模式（那个模式的存在意义就是它），以及用户**手动**点按钮。
+   *   顺带省掉十几个上游请求。
    */
   const onSelectOrderMode = React.useCallback(async (mode) => {
     if (mode === orderMode) {
       // 已经是该模式：再点就是「重新探测」（用户在按临期模式下想刷新顺序）。
-      if (mode === 'expiry') await onSortByExpiry();
+      await onSortByExpiry();
       return;
     }
     try {
       const res = await rpcCall('aggregate.setOrderMode', { mode });
       setOrderMode(res?.orderMode === 'manual' ? 'manual' : 'expiry');
+      // ⚠️ 这里**刻意清空**（不是 keepNotice）：本路径没有「先写提示再刷新」的时序
+      //    问题 —— `setNotice(null)` 在 `load` **之前**，语义是「切模式时丢掉旧提示」。
+      //    ⚠️ 我修「提示被清」那个缺陷时曾误给这一处也加了 `keepNotice`，
+      //    那会让**上一次操作**的无关提示被保留下来（改成「保留 null」等于没清）。
       setNotice(null);
       await load(true);
-      await onSortByExpiry();
+      // ⚠️⚠️ **只在切到「按临期」时探测**（见上方长注释）：手工模式不查上游。
+      //    切到手工时若已有临期数据（用户从按临期切过来）就继续用，不清空 ——
+      //    那能让「未拖过的尾巴」仍按真实临期排，且零额外请求。
+      if (mode === 'expiry') await onSortByExpiry();
     } catch (caught) {
       setNotice(`切换排序方式失败：${caught?.message ?? String(caught)}`);
     }
   }, [orderMode, rpcCall, load, onSortByExpiry]);
 
   /**
-   * 「按临期」模式下每 5 分钟自动重探一次（用户 2026-10-15 的追问：
+   * 「按临期」模式下每 2 分钟自动重探一次（用户 2026-10-15 的追问：
    * 「按临期排序的顺序应该后台定时刷新现在有吗？」—— 答复是**没有**，这里补上）。
    *
    * ⚠️ 三条约束缺一不可：
@@ -5683,17 +5725,25 @@ function AggregatePanel({ rpcCall }) {
    *  ③ **卸载时 clearInterval**：面板是设置页的组件，反复进出会叠加定时器
    *    （叠加 N 个 ⇒ 上游请求量 ×N，且只在长时间挂着时才看得出来）。
    * ⚠️ 与手动点击**共用** `expiryBusy` 闸门：并发探测会把上游打爆。
+   *
+   * ## ⚠️ 2026-10-16：三条判据**搬到纯函数**里（本条原先长期零用例）
+   *
+   * 用户追问「重探怎么测」时核实：全仓库对这条的断言数为 **0**，因为实现
+   * 内联在组件里、单测环境没有 react ⇒ **够不到**。
+   * ⇒ 抽到 `aggregate-panel-logic.js` 的 {@link startExpiryReprobe}（挂定时器 +
+   * 返回 cleanup）与 {@link shouldReprobeExpiry}（该不该发这一轮）。本处只留接线，
+   * **判据全部在那两个纯函数里**（`schedule`/`cancel` 注入 ⇒ 单测能用假定时器真跑
+   * 「到点轮询」并断言 cleanup 真的停了定时器）。
+   *
+   * ⚠️ 接线必须传**真的** `setInterval` / `clearInterval`，且 `isHidden` 传
+   * **取值函数**（隐藏状态会在两轮之间变化，传快照会判错）。
    */
-  React.useEffect(() => {
-    if (orderMode !== 'expiry') return undefined;
-    const timer = setInterval(() => {
-      // ⚠️ 用 `document.visibilityState` 而不是「上次探测时刻」判：后者在标签页
-      //    长时间隐藏后会「补跑」一串请求（setInterval 在后台被节流，恢复时集中触发）。
-      if (typeof document !== 'undefined' && document.hidden === true) return;
-      void onSortByExpiry();
-    }, AGG_EXPIRY_REPROBE_MS);
-    return () => clearInterval(timer);
-  }, [orderMode, onSortByExpiry]);
+  React.useEffect(() => startExpiryReprobe({
+    orderMode,
+    intervalMs: AGG_EXPIRY_REPROBE_MS,
+    isHidden: () => typeof document !== 'undefined' && document.hidden === true,
+    probe: () => { void onSortByExpiry(); },
+  }), [orderMode, onSortByExpiry]);
 
   /**
    * 一键「拒绝非临期」：把所有未接入折算渠道的手工打开恢复为「默认不参与」。
@@ -5709,7 +5759,10 @@ function AggregatePanel({ rpcCall }) {
       setNotice(cleared === 0
         ? '没有需要恢复的候选：无临期积分的渠道本来就都在「默认不参与」状态。'
         : `已把 ${cleared} 条候选恢复为「默认不参与轮换」。`);
-      await load(true);
+      // ⚠️⚠️ **必须 `keepNotice: true`**（真实缺陷，用户验收 2026-10-16：
+      //    「拒绝后给出的提示信息不到 1 秒就消失了基本不会看清内容」）：
+      //    上面刚写了提示，而 `load()` 成功分支里的 `setNotice(null)` 会把它清掉。
+      await load(true, { keepNotice: true });
     } catch (caught) {
       setNotice(`恢复默认失败：${caught?.message ?? String(caught)}`);
     } finally {
@@ -5799,10 +5852,36 @@ function AggregatePanel({ rpcCall }) {
             const from = dragKeyRef.current;
             dragKeyRef.current = null;
             if (from === null) return;
-            // ⚠️ 拖动结果先落**本地临时顺序**、松手后统一提交一次：
-            //    每次 dragover 都发 RPC 会在一次拖动里打出几十个请求。
+            // ⚠️ 拖动结果先落**本地临时顺序**（立即重渲染），**紧接着就提交**。
+            //
+            // ⚠️⚠️ **必须在 `onDrop` 里直接提交**（真实缺陷，用户验收 2026-10-16：
+            //    「把 codearts 拉到第一个，关闭设置窗口再打开又跑最后一个了」）。
+            //
+            // 我原先只在 `onDrop` 里 `setPendingOrder(...)`、把落盘交给一个
+            // **「保存顺序」按钮**，于是：拖动**只改了界面**，宿主的
+            // `state.json.aggregateOrder` 一个字都没变 ⇒ 关窗再打开（重新 `load`）
+            // 就回到宿主的旧顺序 —— 用户看到的正是「白拖了」。
+            //
+            // ⚠️ 本仓库另两处拖动（账号卡片 `:3555`、渠道开关 `:4746`）都是
+            // **松手即提交**（`onDrop` 里直接 `void commit(...)`）⇒ 我那个
+            // 「先预览、再点保存」的设计与全站交互不一致，**是本缺陷的根源**。
+            // ⇒ 改为同一形态：松手即落盘（一次拖动只发**一个**请求 —— 每次
+            //    `dragover` 都发才会打出几十个）。
             const next = moveCandidateTo(orderOf(model), from, options.index);
             setPendingOrder((prev) => ({ ...prev, [canonicalId]: next }));
+            // ⚠️ 提交用**拖后顺序对应的候选对象**（`commitOrder` 要参与候选的完整顺序）。
+            const byKey = new Map((model.candidates ?? []).map((c) => [candidateKeyOf(c), c]));
+            const participatingNext = next
+              .map((key) => byKey.get(key))
+              .filter((c) => c !== undefined)
+            // ⚠️ 补上「顺序表里没出现但确实参与」的候补（与 `commitOrder` 的前置一致）：
+            //    漏掉会让服务端把未出现的候选按临期兜底追加 ⇒ 用户刚排好的相对位置被改。
+            for (const candidate of model.candidates ?? []) {
+              if (candidateStateOf(canonicalId, candidate, rejections) !== 'allowed') continue
+              const key = candidateKeyOf(candidate)
+              if (!next.includes(key)) participatingNext.push(candidate)
+            }
+            void commitOrder(model, participatingNext);
           }
         : undefined,
     },
@@ -5912,25 +5991,16 @@ function AggregatePanel({ rpcCall }) {
               index: index,
               last: index === candidates.length - 1,
             })),
-            // ── 未参与段（仅手工模式）+ 提交按钮 ──
+            // ── 未参与段（仅手工模式）──
+            // ⚠️ **「保存顺序」按钮已删除**（用户验收 2026-10-16）：拖动现在
+            //    **松手即提交**（见 `onDrop`），那个按钮既多余、又会让人以为
+            //    「不点就不会保存」（真实缺陷：原先不点就真的不保存 ⇒
+            //     关窗再开顺序就丢了）。交互与本仓库另两处拖动统一。
             manual && inactive.length > 0
               ? React.createElement('div', { className: 'dim-jh-aggInactiveSection' },
                   React.createElement('span', { className: 'dim-jh-aggInactiveTitle' },
                     `未参与轮换（${inactive.length}）`),
                   inactive.map((candidate) => renderCandidate(model, candidate)))
-              : null,
-            manual && participating.length > 1
-              ? React.createElement('div', { className: 'dim-jh-aggOrderActions' },
-                  React.createElement('button', {
-                    type: 'button',
-                    // ⚠️ 与工具栏统一用 `.dim-jh-btn`（见那里的注释：自造类会让按钮
-                    //    看起来不像按钮 —— 用户已就此反馈过一次）。
-                    className: 'dim-jh-btn',
-                    disabled: orderBusy[model.canonicalId] === true,
-                    title: '把拖动排序的结果保存下来（不保存则只是预览）。'
-                      + '两种排序模式的顺序分别保存，切换模式不会互相覆盖。',
-                    onClick: () => { void commitOrder(model, participating); },
-                  }, orderBusy[model.canonicalId] === true ? '保存中…' : '保存顺序'))
               : null)
         : null);
   };
@@ -6006,8 +6076,8 @@ function AggregatePanel({ rpcCall }) {
       'aria-pressed': String(orderMode === 'manual'),
       title: orderMode === 'manual'
         ? '当前按**你手工拖动的顺序**轮换。点此切回「按临期」——'
-          + '临期序每 5 分钟自动重查一次（会打上游请求）；手工序不受影响、仍各自保存。'
-        : '当前按**积分最快作废**的顺序轮换（每 5 分钟自动重查一次，会打上游请求）。'
+          + '临期序每 2 分钟自动重查一次（会打上游请求）；手工序不受影响、仍各自保存。'
+        : '当前按**积分最快作废**的顺序轮换（每 2 分钟自动重查一次，会打上游请求）。'
           + '点此切到「按手工」——展开模型后可拖动候选调整顺序，两种顺序分别保存、互不覆盖。',
       onClick: () => { void onSelectOrderMode(orderMode === 'manual' ? 'expiry' : 'manual'); },
     }, expiryBusy

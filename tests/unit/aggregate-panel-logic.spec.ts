@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -19,8 +19,10 @@ import {
   rejectionKey,
   rotationBlockerOf,
   rotationRosterOf,
+  shouldReprobeExpiry,
   sortCandidatesByExpiry,
   sortModelsForPanel,
+  startExpiryReprobe,
   toggleRejection,
 } from '../../plugin-src/client/aggregate-panel-logic.js'
 // ⚠️ **值导入**宿主常量（测试里读宿主模块是本仓库既有做法，见 `expiry-runtime-parity.spec.ts`）：
@@ -354,7 +356,41 @@ describe('★ 面板「按临期排序」（零探测为默认，点了才探测
     expect(sortCandidatesByExpiry(rows).map((r) => r.provider)).toEqual(['buddy', 'trae'])
   })
 
-  it('★ 纯函数：不得改动入参', () => {
+  it('★★ `UNUSABLE`（-1，「查不到」）必须排**最后**，绝不排前面（真实缺陷）', () => {
+    // ⚠️⚠️ **真实缺陷**（用户验收 2026-10-16）：「有 2 个模型显示**查不到**排前面了，
+    //    为什么查不到，查不到应该当做没临期不会放在前面」。
+    //
+    // 根因：`of()` 原先用 `Number.isFinite(value)` 判有效到期时刻，而
+    // **`Number.isFinite(-1) === true`** ⇒ `UNUSABLE` 的排序键是 **-1**，
+    // 比任何真实毫秒时间戳（约 1.7e12）都小 ⇒ **排到最前面**。
+    const rows = [
+      { provider: 'accio', expiry: -1 },                          // UNUSABLE（查不到）
+      { provider: 'officeace', expiry: -1 },                      // UNUSABLE（查不到）
+      { provider: 'buddy', expiry: Date.now() + 4 * 86_400_000 }, // 4 天后（真实值）
+      { provider: 'zcode', expiry: Number.POSITIVE_INFINITY },    // 长期
+    ]
+    const sorted = sortCandidatesByExpiry(rows).map((r) => r.provider)
+    // ★ 核心：buddy（真实临期）必须在两个「查不到」**之前**。
+    expect(sorted.indexOf('buddy'), '★ 有临期值的必须在「查不到」之前')
+      .toBeLessThan(sorted.indexOf('accio'))
+    expect(sorted.indexOf('buddy')).toBeLessThan(sorted.indexOf('officeace'))
+    // ★ 「查不到」与「长期」同档（都排最后），档内按渠道名升序。
+    expect(sorted, '★ 查不到与长期同档排最后').toEqual([
+      'buddy', 'accio', 'officeace', 'zcode',
+    ])
+  })
+
+  it('★ `UNUSABLE` 排最后**不是**靠「-1 恰好比时间戳小」的巧合（防退回 isFinite）', () => {
+    // ⚠️ 反向判据：若有人把 `-1` 的显式判定删掉、退回 `Number.isFinite`，
+    //    下面这条会立刻变红（-1 < 1 ⇒ 排最前）。
+    const rows = [
+      { provider: 'unknown', expiry: -1 },
+      { provider: 'real', expiry: 1 },
+    ]
+    expect(sortCandidatesByExpiry(rows).map((r) => r.provider)).toEqual(['real', 'unknown'])
+  })
+
+  it('★ 纯函数：不得改动入参（expiry 排序）', () => {
     const rows = [
       { provider: 'b', expiry: 2 },
       { provider: 'a', expiry: 1 },
@@ -546,6 +582,74 @@ describe('★ 面板接线：默认零探测，点了才探测（防「面板没
     expect(rejectAt).toBeGreaterThan(toolbarAt)
     expect(countAt, '★ 计数必须在排序按钮**之后**').toBeGreaterThan(sortAt)
     expect(countAt, '★ 计数必须在「拒绝非临期」**之后**').toBeGreaterThan(rejectAt)
+  })
+
+  it('★★ 拖动必须**松手即提交**（真实缺陷：只改界面 ⇒ 关窗再开顺序就丢了）', () => {
+    // ⚠️⚠️ **真实缺陷**（用户验收 2026-10-16）：「把 glm 5.3 的 codearts 拉到第一个，
+    //    关闭设置窗口再打开又跑最后一个了」。
+    //
+    // 根因：我原先在 `onDrop` 里**只** `setPendingOrder(...)`（改本地 state），
+    // 把落盘交给一个「保存顺序」按钮 ⇒ 拖动**只改了界面**，宿主的
+    // `state.json.aggregateOrder` 一个字都没变 ⇒ 关窗再开（重新 load）就回到旧顺序。
+    //
+    // ⚠️ 本仓库另两处拖动（账号卡片、渠道开关）都是**松手即提交**
+    //（`onDrop` 里直接 `void commit(...)`）⇒ 我那个「先预览、再点保存」的设计
+    //    与全站交互不一致，**是本缺陷的根源**。
+    const panelStart = panelCode.indexOf('function AggregatePanel(')
+    const nextTop = panelCode.indexOf('\nexport function ', panelStart)
+    const aggBody = panelCode.slice(panelStart, nextTop > 0 ? nextTop : undefined)
+    const dropAt = aggBody.indexOf('onDrop: draggable')
+    expect(dropAt, '必须存在聚合候选的 onDrop').toBeGreaterThan(0)
+    const dropEnd = aggBody.indexOf(': undefined,', dropAt)
+    const dropBody = aggBody.slice(dropAt, dropEnd > 0 ? dropEnd : dropAt + 3000)
+    expect(dropBody, '★ onDrop 里必须调 commitOrder（松手即落盘）')
+      .toMatch(/void commitOrder\(/)
+    // ★ 反向：「保存顺序」按钮必须已删除（它让用户以为「不点就不会保存」）。
+    //   ⚠️ 判据必须看**按钮文案的位置**（`}, '保存顺序'`），不能只搜「保存顺序」三个字 ——
+    //   删除处的注释里仍然提到它（说明为什么删），纯字面搜索会恒红（我第一版就是这样）。
+    expect(aggBody, '★ 「保存顺序」按钮必须已删除（拖动已自动提交）')
+      .not.toMatch(/\},\s*'保存顺序'\)/)
+  })
+
+  it('★★ 「先写提示再刷新」的调用必须传 keepNotice（真实缺陷：提示不到 1 秒就消失）', () => {
+    // ⚠️⚠️ **真实缺陷**（用户验收 2026-10-16）：「拒绝后给出的提示信息不到 1 秒就
+    //    消失了基本不会看清内容」。
+    //
+    // 根因：`onRejectNonExpiring` 先 `setNotice('已把 N 条…')`，紧接着
+    // `await load(true)`，而 load 成功分支里的 `setNotice(null)` 把刚写的提示清掉。
+    const panelStart = panelCode.indexOf('function AggregatePanel(')
+    const nextTop = panelCode.indexOf('\nexport function ', panelStart)
+    const aggBody = panelCode.slice(panelStart, nextTop > 0 ? nextTop : undefined)
+    // ⚠️ 判据锚定到**具体函数体**，而不是全文件搜 keepNotice（后者在别处出现即恒真）。
+    const rejectAt = aggBody.indexOf('const onRejectNonExpiring')
+    expect(rejectAt, '必须存在 onRejectNonExpiring').toBeGreaterThan(0)
+    const rejectBody = aggBody.slice(rejectAt, rejectAt + 2500)
+    expect(rejectBody, '★ 一键恢复的刷新必须保留提示')
+      .toMatch(/await load\(true, \{ keepNotice: true \}\)/)
+    // ★ 且 `load` 本身必须支持该选项（不是只有调用方一厢情愿）。
+    expect(aggBody, '★ load 必须实现 keepNotice')
+      .toMatch(/if \(options\.keepNotice !== true\) setNotice\(null\)/)
+  })
+
+  it('★★ 切到「按手工」**不得**触发上游探测（真实缺陷：切模式干等一轮余额请求）', () => {
+    // ⚠️⚠️ **真实缺陷**（用户验收 2026-10-16）：「切换会手工还在查询中等很长时间，
+    //    **手工排序不用查询吧**？」
+    //
+    // 根因：`onSelectOrderMode` 原先**无条件** `await onSortByExpiry()` ——
+    // 那是**逐渠道上游余额请求**（十几个 GET），于是切到手工模式也要干等一轮探测。
+    // 而手工模式的价值恰恰是「按用户拖的顺序」，切过去那一刻**不需要**任何临期值。
+    const panelStart = panelCode.indexOf('function AggregatePanel(')
+    const nextTop = panelCode.indexOf('\nexport function ', panelStart)
+    const aggBody = panelCode.slice(panelStart, nextTop > 0 ? nextTop : undefined)
+    const at = aggBody.indexOf('const onSelectOrderMode')
+    expect(at, '必须存在 onSelectOrderMode').toBeGreaterThan(0)
+    const body = aggBody.slice(at, at + 2500)
+    // ★ 探测必须**在 `mode === 'expiry'` 的条件下**（不是无条件）。
+    expect(body, '★ 探测必须只在切到「按临期」时发生')
+      .toMatch(/if \(mode === 'expiry'\) await onSortByExpiry\(\)/)
+    // ★ 反向：不得出现「无条件探测」那两行的残留（`load(true)` 后直接 `await onSortByExpiry()`）。
+    expect(body, '★ 不得无条件探测')
+      .not.toMatch(/await load\(true\);\s*\n\s*await onSortByExpiry\(\);/)
   })
 
   it('★ 空态提示必须引用那份渠道清单（清单**内容**由下方 ★★ 守卫锁）', () => {
@@ -1078,5 +1182,198 @@ describe('★★ 空态文案的渠道名单 == WIRED_EXPIRY_PROVIDERS', () => {
       .toBeGreaterThan(0)
     expect(WIRED_EXPIRY_PROVIDERS.length, '白名单为空 ⇒ 上面那条是同义反复')
       .toBeGreaterThan(0)
+  })
+})
+
+/**
+ * 「按临期」模式的重探定时器（当前间隔 2 分钟，见 `AGG_EXPIRY_REPROBE_MS`）。
+ *
+ * ## ⚠️ 为什么新增这一组（2026-10-16）
+ *
+ * 用户追问「第 5 条（重探）怎么测」时核实：**这条此前零用例** ——
+ * 全仓库对 `AGG_EXPIRY_REPROBE_MS` 的断言数为 0，因为实现**内联在
+ * `AggregatePanel` 的 `useEffect` 里**，而单测环境没有 react（`environment: 'node'`）
+ * ⇒ 测试**够不到**它。
+ *
+ * 而它守的是三条**会真的打上游请求**的行为（一次探测 = 十几个余额 GET）：
+ * 切模式要停、页面隐藏要跳过、卸载要清定时器（残留会让请求量 ×N）。
+ *
+ * ⇒ 把判据抽成纯函数 `shouldReprobeExpiry` / `startExpiryReprobe` 后，
+ * 本组用 **vitest 假定时器** 真跑 —— 不需要 react、不需要 DOM、也不真等真实间隔。
+ */
+describe('★★ 按临期重探定时器（第 5 条判据，此前零覆盖）', () => {
+  it('★ 判据①：只有「按临期」模式才重探（切手工即停）', () => {
+    expect(shouldReprobeExpiry({ orderMode: 'expiry', hidden: false })).toBe(true)
+    expect(shouldReprobeExpiry({ orderMode: 'manual', hidden: false }), '★ 手工模式必须停').toBe(false)
+    // ⚠️ 缺省/畸形也**不得**放行（否则报错状态会变成「一直打上游」）。
+    expect(shouldReprobeExpiry({ orderMode: undefined, hidden: false })).toBe(false)
+    expect(shouldReprobeExpiry(undefined)).toBe(false)
+    expect(shouldReprobeExpiry({ orderMode: 'EXPIRY', hidden: false }), '大小写不宽恕').toBe(false)
+  })
+
+  it('★ 判据②：页面隐藏时跳过这一轮', () => {
+    expect(shouldReprobeExpiry({ orderMode: 'expiry', hidden: true }), '★ 隐藏必须跳过').toBe(false)
+    // ⚠️ `hidden` 缺失（非浏览器环境）视为**不隐藏** —— 与内联版
+    //    `typeof document !== 'undefined' && document.hidden === true` 同语义。
+    expect(shouldReprobeExpiry({ orderMode: 'expiry' })).toBe(true)
+    expect(shouldReprobeExpiry({ orderMode: 'expiry', hidden: undefined })).toBe(true)
+    // ⚠️ 只有**严格 true** 才算隐藏（恒真值会让「隐藏」判据形同虚设）。
+    expect(shouldReprobeExpiry({ orderMode: 'expiry', hidden: 1 as never })).toBe(true)
+  })
+
+  it('★★ 判据③：到点**真的**发探测，且间隔就是传入的 intervalMs（假定时器真跑）', () => {
+    vi.useFakeTimers()
+    try {
+      let probes = 0
+      const stop = startExpiryReprobe({
+        orderMode: 'expiry',
+        intervalMs: 30_000,
+        isHidden: () => false,
+        probe: () => { probes += 1 },
+      })
+      // ⚠️ 差 1 毫秒不得触发（证明是「到点才发」而不是「挂上就发」）。
+      vi.advanceTimersByTime(29_999)
+      expect(probes, '未到点不得探测').toBe(0)
+      vi.advanceTimersByTime(1)
+      expect(probes, '★ 到点必须恰好一次').toBe(1)
+      vi.advanceTimersByTime(30_000)
+      expect(probes, '★ 第二轮再 +1').toBe(2)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('★★★ 判据④：cleanup **真的**停掉定时器（残留定时器是本条的核心风险）', () => {
+    // ⚠️⚠️ 这是本组最重要的一条：真实缺陷形态是「面板反复进出叠加 N 个定时器
+    //    ⇒ 上游请求量 ×N，且只在长时间挂着时才看得出来」。
+    //    判据必须**先证明它在跑**、再证明**停了之后不再跑** —— 只断言「不调用」
+    //    会被「压根没挂上定时器」的变异体蒙混过去（那是恒真的假用例）。
+    vi.useFakeTimers()
+    try {
+      let probes = 0
+      const stop = startExpiryReprobe({
+        orderMode: 'expiry',
+        intervalMs: 30_000,
+        isHidden: () => false,
+        probe: () => { probes += 1 },
+      })
+      vi.advanceTimersByTime(30_000)
+      expect(probes, '★ 前置：清理前必须确实在轮询（否则下面的断言恒真）').toBe(1)
+      stop()
+      vi.advanceTimersByTime(300_000) // 再跑 10 轮的时间
+      expect(probes, '★★ 清理后绝不能再发探测').toBe(1)
+      // ⚠️ 幂等：React 严格模式会重复调用 cleanup，重复 cancel 不得抛错。
+      expect(() => stop(), 'cleanup 必须幂等').not.toThrow()
+      expect(probes, '重复 cleanup 后仍不得发探测').toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('★★ 判据⑤：非「按临期」模式**根本不挂定时器**（不是挂了再跳过）', () => {
+    // ⚠️ 与上面「跳过」区分：手工模式下连 `schedule` 都不该被调用 ——
+    //    否则「切手工即停」只是靠回调里 return 实现的，定时器仍在空转。
+    vi.useFakeTimers()
+    try {
+      let schedules = 0
+      let probes = 0
+      const stop = startExpiryReprobe({
+        orderMode: 'manual',
+        intervalMs: 30_000,
+        isHidden: () => false,
+        probe: () => { probes += 1 },
+        schedule: (fn, ms) => { schedules += 1; return setInterval(fn, ms) },
+      })
+      expect(schedules, '★ 手工模式不得挂定时器').toBe(0)
+      vi.advanceTimersByTime(300_000)
+      expect(probes).toBe(0)
+      expect(() => stop()).not.toThrow()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('★★ 判据⑥：`isHidden` 必须**每轮现读**（传快照会让「切后台再切回」判错）', () => {
+    // ⚠️ 这是把 `isHidden` 设计成**函数**的理由，必须有用例锁住：
+    //    若调用方传的是一个布尔快照，隐藏状态变化后判据就永远错了。
+    vi.useFakeTimers()
+    try {
+      let hidden = false
+      let probes = 0
+      startExpiryReprobe({
+        orderMode: 'expiry',
+        intervalMs: 30_000,
+        isHidden: () => hidden,
+        probe: () => { probes += 1 },
+      })
+      vi.advanceTimersByTime(30_000)
+      expect(probes, '第 1 轮：可见 ⇒ 探测').toBe(1)
+      hidden = true
+      vi.advanceTimersByTime(90_000) // 3 轮，全部隐藏
+      expect(probes, '★ 隐藏期间的 3 轮全部跳过（现值生效）').toBe(1)
+      hidden = false
+      vi.advanceTimersByTime(30_000)
+      expect(probes, '★ 恢复可见后立刻恢复轮询').toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('★ 接线守卫：`jet-hub.js` 必须把**真的** setInterval 传下去，且传取值函数', () => {
+    // ⚠️ 纯函数对了、接线错了也一样坏（本仓库的经典形态）。三条都要锁：
+    //    ① 用 `startExpiryReprobe`（不是退回内联 setInterval）；
+    //    ② `isHidden` 是**箭头函数**（传快照会让判据⑥失效）；
+    //    ③ 依赖数组含 `orderMode`（切模式要重挂/清理）。
+    // ⚠️ 本块**自己读文件**（上面那些 `describe` 的 `panelCode` / `read` / `codeOf`
+    //    都是各自块内的局部 const，跨块引用会 `ReferenceError` —— 我第一版就这么错了）。
+    const panelText = readFileSync(resolve(here, '../..', 'plugin-src/client/jet-hub.js'), 'utf8')
+    const code = panelText
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '')
+    const panelStart = code.indexOf('function AggregatePanel(')
+    const nextTop = code.indexOf('\nexport function ', panelStart)
+    const aggBody = code.slice(panelStart, nextTop > 0 ? nextTop : undefined)
+    expect(aggBody, '★ 必须用抽出的纯函数').toContain('startExpiryReprobe({')
+    expect(aggBody, '★ isHidden 必须是取值函数').toMatch(/isHidden:\s*\(\)\s*=>/)
+    expect(aggBody, '★ effect 依赖必须含 orderMode（切模式要清定时器）')
+      .toMatch(/\}\), \[orderMode, onSortByExpiry\]\)/)
+    // ⚠️ 反向：不得残留内联的 `setInterval(...AGG_EXPIRY_REPROBE_MS)`（那会叠加两份）。
+    expect(aggBody, '★ 不得残留内联定时器').not.toMatch(/setInterval\([\s\S]{0,200}AGG_EXPIRY_REPROBE_MS/)
+  })
+
+  it('★★ 重探间隔的**文案**必须与常量一致（防「面板说自己每 N 分钟」而与实际不符）', () => {
+    // ⚠️ 这个值 2026-10-16 从 5 分钟改成 2 分钟，而它被**多处文案**复述
+    //（工具行两个按钮的 title、面板两段说明、README 表格）。
+    //    漏改的症状正是本项目反复处理的「面板没说真话」：界面写着「每 5 分钟」，
+    //    实际每 2 分钟打一次上游。
+    //    ⇒ 判据：从常量里**读出**真实分钟数，再去核对所有复述它的文案。
+    const panel = readFileSync(resolve(here, '../..', 'plugin-src/client/jet-hub.js'), 'utf8')
+    const m = /const AGG_EXPIRY_REPROBE_MS = (\d+) \* 60 \* 1000/.exec(panel)
+    expect(m, '常量必须是 `<N> * 60 * 1000` 形态（否则本条读不出分钟数）').not.toBeNull()
+    const minutes = Number(m?.[1])
+    expect(Number.isFinite(minutes) && minutes > 0, '分钟数必须为正').toBe(true)
+    // ⚠️ 只在 `jet-hub.js` 的非注释文本里判「过时文案」：注释里会**讨论**这个值
+    //（例如「否则面板会说自己『每 5 分钟』而实际不是」）—— 那是留档说明，不是过时文案。
+    const panelCodeOnly = panel
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '')
+    // ⚠️ 若将来改成非整分钟（如 90 秒），本条会**主动失败**提醒改判据 —— 那是刻意的：
+    //    复述「每 N 分钟」的文案在那种情况下必须重写成「每 N 秒」。
+    const stale = ['每 5 分钟', '每 10 分钟', '每 3 分钟', '每 1 分钟']
+      .filter((t) => t !== `每 ${minutes} 分钟`)
+    for (const t of stale) {
+      expect(panelCodeOnly, `★ jet-hub.js 代码里不得残留过时间隔文案「${t}」（当前是每 ${minutes} 分钟）`)
+        .not.toContain(t)
+    }
+    // ★ 必须真的复述当前值（否则「改了常量但一处文案都没提」也会被漏掉）。
+    expect(panelCodeOnly, `★ jet-hub.js 代码里必须复述当前间隔「每 ${minutes} 分钟」`)
+      .toContain(`每 ${minutes} 分钟`)
+    // ★ README 的表格与说明也必须同步（它是最外层用户文档）。
+    const readme = readFileSync(resolve(here, '../..', 'README.md'), 'utf8')
+    for (const t of stale) {
+      expect(readme, `★ README 里不得残留过时间隔文案「${t}」`).not.toContain(t)
+    }
+    expect(readme, `★ README 必须复述当前间隔「每 ${minutes} 分钟」`).toContain(`每 ${minutes} 分钟`)
   })
 })
