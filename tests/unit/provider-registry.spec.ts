@@ -27,13 +27,14 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-  it('共 18 条（17 个真渠道 + aggregate）', () => {
+  it('共 19 条（18 个真渠道 + aggregate）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
     //    它与 `minimax` 账号不互通、API 主机不同 ⇒ 是两个 provider。
-    expect(PROVIDER_REGISTRY).toHaveLength(18)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(17)
+    // ⚠️ 2026-10-16 并入 astudio（第 18 个真渠道）⇒ 19 条 / 18 个真渠道。
+    expect(PROVIDER_REGISTRY).toHaveLength(19)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(18)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
   })
 
@@ -44,7 +45,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
 })
 
 describe('从 registry 派生的能力表与既有断言逐条相等', () => {
-  it('CREDITS 派生结果与既有 6 条 toEqual 断言一致', () => {
+  it('CREDITS 派生结果与既有 7 条 toEqual 断言一致（astudio 2026-10-16 加入）', () => {
     const caps = creditCapabilitiesOf()
     expect(caps.codearts).toEqual({ balance: true, dailyCheckin: true })
     expect(caps.buddy).toEqual({ balance: true, dailyCheckin: true })
@@ -52,6 +53,9 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(caps.qoder).toEqual({ balance: true, dailyCheckin: true })
     expect(caps.qodercn).toEqual({ balance: true, dailyCheckin: true })
     expect(caps.loomy).toEqual({ balance: true, dailyCheckin: true, onboardingTasks: true })
+    // ⚠️ 2026-10-16 并入 astudio：逐家 toEqual，漏写这一条则「registry 加了
+    //    而客户端能力表没派生出来」这种漂移不会被本用例发现。
+    expect(caps.astudio).toEqual({ balance: true, dailyCheckin: false })
   })
 
   it('只有 cline 有 subscriptionQuota（既有断言 toEqual([\'cline\'])）', () => {
@@ -111,17 +115,19 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(win).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('rateLimit === false 恰好是 4 家（officeace 2026-10-12、accio 2026-10-13 加入）', () => {
+  it('rateLimit === false 恰好是 5 家（officeace 2026-10-12、accio 2026-10-13、astudio 2026-10-16 加入）', () => {
     const off = PROVIDER_REGISTRY.filter((d) => d.rateLimit === false)
       .map((d) => d.id).sort()
-    // ⚠️ 四家**理由各不相同**（见 registry 里各自的字段注释）：
+    // ⚠️ 五家**理由各不相同**（见 registry 里各自的字段注释）：
     // - loomy：根本不返回限流错误（静默降级扣永久积分）；
     // - gemini / officeace：限流是服务端配额窗口制，本地标记与重测都不改变配额；
     // - accio：**不写 `modelRateLimits` 且不在 `probeById` 里** ⇒
     //   两个按钮恒为惰性（零请求、零清除）。
+    // - astudio：**与 accio 同判据**（`astudio-adapter.ts` 不写 `modelRateLimits`，
+    //   且不在 `probeById` 里）⇒ 两个按钮同样恒为惰性。
     // 新增一家时**不要**只改这里：判据是 registry 的落地问法
     //「这个按钮点下去，能不能让用户少受限一次？」
-    expect(off).toEqual(['accio', 'gemini', 'loomy', 'officeace'])
+    expect(off).toEqual(['accio', 'astudio', 'gemini', 'loomy', 'officeace'])
   })
 
   it('accountTest === true 恰好是 gemini', () => {
@@ -144,8 +150,8 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     const withNs = PROVIDER_REGISTRY.filter((d) => d.settingsNamespace !== undefined)
       .map((d) => d.id).sort()
     expect(withNs).toEqual([
-      'accio', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy', 'minimax',
-      'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'accio', 'astudio', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
   })
 })

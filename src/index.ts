@@ -106,6 +106,13 @@ import { AccioAuth } from './accio-auth.js'
 import { registerAccioLlm } from './accio-adapter.js'
 import { ACCIO } from './accio-product.js'
 import type { AccioCredential } from './accio.js'
+// AStudio（讯飞 AstronStudio）：直连上游 MAAS。**没有 OAuth 授权页** —— 推理凭据是
+// 本机客户端登录后明文落盘会话的一份拷贝（见 astudio-auth.ts 模块头）。
+// 本家符号分属四个模块：auth 服务在 astudio-auth.ts、适配器注册在 astudio-adapter.ts、
+// 产品常量在 astudio-product.ts、纯函数与凭据类型在 astudio.ts。
+import { AstudioAuth } from './astudio-auth.js'
+import { registerAstudioLlm } from './astudio-adapter.js'
+import { ASTUDIO } from './astudio-product.js'
 import type { ZcodeCredential } from './zcode.js'
 import { GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -2145,6 +2152,43 @@ export function apply(ctx: Context): void {
     readImageRequest: makeReadImageRequest(ctx),
   })
 
+  // ===== AStudio（讯飞 AstronStudio，云端直连上游 MAAS）=====
+  //
+  // 形态与 OfficeAce / Accio 同类：进程内 LlmAdapter 直发远端，无子进程、无端口。
+  // 独有语义：**没有 OAuth 授权页**，凭据来自本机 AStudio 客户端的明文会话文件；
+  // Jet Hub 的 account.create 因此走 importLocalSession（见 jet-hub-rpc.ts）。
+  //
+  // 服务名由 AstudioAuth 依 product.id 派生（astudioAuth）并在构造时自注册，
+  // 故这里**不需要**再 ctx.provide('astudioAuth' / 'astudioLlm')。
+  // 不注册斜杠命令：入口在 Jet Hub 的 AStudio 面板。
+  const astudio = new AstudioAuth(ctx)
+  const astudioAdapter = registerAstudioLlm(ctx, {
+    // ⚠️ AstudioAdapterOptions 只有 product / fetchImpl / auth / resolveCredential /
+    //    refresh / fetchRemoteModels / onCatalogLoaded / warn 八项 —— **没有**
+    //    accountPool 与 readImage（与上面 accio 那两处不同，多传必 TS2353：
+    //    本家适配器刻意不做请求级换号，且实测六个模型的 input_modalities 全是
+    //    text，图片通路不成立）。
+    // ⚠️ **不传 onCatalogLoaded**：registerAstudioLlm 内部已注入唯一的
+    //    broadcastCatalogChanged(ctx)，这里再传就是第二份广播。
+    // ⚠️ 传 auth 即可拿到三个默认回调（currentCredential / refreshOnce /
+    //    fetchCatalogModels），下面只覆盖确实需要定制的那一个。
+    auth: astudio,
+    product: ASTUDIO,
+    refresh: async () => {
+      // ⚠️ 必须返回 AstudioRefreshOutcome：本家 401 的唯一入口是 refreshOnce
+      //    （**不抛**，以 credential/terminal/reason 回传），**不是**返回
+      //    Promise<void> 的 refreshAccountCredential —— 后者的签名与语义都不匹配
+      //    该形参（TS2322），且它会把终态错误抛进适配器。
+      // ⚠️ 刷的必须是「解析凭据时所用的那一个」账号（同上面 accio 处说明）；
+      //    池里没有账号时退到默认单凭据 ref。
+      const available = await pool.getAvailableAccount(ASTUDIO.id, '')
+      return await astudio.refreshOnce(
+        available?.entry.credentialRef ?? ASTUDIO.defaultCredentialRef,
+      )
+    },
+    warn: (message: string) => { ctx.logger?.warn?.(message) },
+  })
+
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
   //
   // 早期实现把服务端的 `name` 直接当昵称用，而实测它是**自动生成的默认名**
@@ -2646,6 +2690,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     // ⚠ 必须 dispose captcha 浏览器 —— 否则会留下孤儿 chromium
     //（约 200-400 MB，且用户没有界面能关掉它）。
     zcodeAdapter.stop()
+    // AStudio（讯飞）的 stop() 置 active=false，阻止在途刷新回写凭据。
+    astudio.stop()
   }, 'jet-hub: multi-account refresh scheduler')
 
   // 保留旧的 stop scheduler（兼容旧命令）
@@ -2662,6 +2708,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     zcode.stop()
     // 同上：captcha 浏览器必须随插件一起回收。
     zcodeAdapter.stop()
+    // 同上：AStudio 的在途刷新必须随插件一起回收。
+    astudio.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== OfficeAce（华为 ModelArts MaaS，云端直连）=====
@@ -3146,6 +3194,8 @@ async function fetchBalanceReading(
     opencode: pruned(OPENCODE.id, opencodeAdapter),
     // OfficeAce（华为 MaaS 云端直连）：目录静态 + 平台侧可用性，同其余渠道。
     officeace: pruned(OFFICEACE.id, officeAceAdapter),
+    // AStudio（上游 MAAS 云端直连）：目录来自 model-manager 远端 + 兜底表，同其余渠道。
+    astudio: pruned(ASTUDIO.id, astudioAdapter),
     // ⚠️ 聚合 provider 也必须进这张表（设计文档 §5.2 的必改点）：`jet-hub-rpc.ts` 的
     // `fullCatalogIds` **优先**用本表的 `listAllModels()`（不套黑名单的全量目录），
     // 缺失时才退化到 `llm.listModels(provider)` —— 后者已被适配器按黑名单过滤。
@@ -3391,6 +3441,13 @@ async function fetchBalanceReading(
       // 收不到本循环的调用（实测症状：`续期没有分派到它自己的实例（实际：无）`）。
       ['officeace', officeaceAuthService as unknown as JetHubAuthLike],
       ['accio', accio],
+      // AStudio（讯飞 AstronStudio）：值是 AstudioAuth 服务实例 —— 它已在构造时
+      // provide 自己（服务名 astudioAuth），必须与 registerJetHubRpc 的 auths.astudio
+      // 是**同一个对象**，否则守卫用例布在该实例上的 spy 收不到本循环的调用。
+      // 实测签名可结构化匹配 JetHubAuthLike（refreshAccountCredential(refName, pool?,
+      // accountId?) 的可选形参可接收必填实参；refreshAll(pool) 完全一致），
+      // 故**不需要**上面 officeace 那样的 as unknown as JetHubAuthLike 包装。
+      ['astudio', astudio],
     ]
     for (const [id, auth] of registry) {
       const descriptor = descriptorOf(id)
@@ -3497,6 +3554,7 @@ async function fetchBalanceReading(
     //（纯函数集合 + 统一 auth 契约），不是 Service 实例。
     officeace: officeaceAuthService as never,
     accio,
+    astudio,
   }, modelAdapters)
 
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已

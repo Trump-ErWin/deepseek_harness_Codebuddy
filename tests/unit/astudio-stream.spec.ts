@@ -94,16 +94,20 @@ function joinedContent(sse: string): string {
 describe('★ astudio.ts 流式层源码级契约', () => {
   it('⚠️ 包装器不得吞掉 `[DONE]`（吞了 ⇒ 下游永远等不到终态、连接挂死）', () => {
     const line = scope.fn('rewriteLine')
-    expect(line).toMatch(/payload === '\[DONE'\]'\s*\)\s*return line/)
+    expect(line).toMatch(/payload === '\[DONE\]'\) return line/)
+
     // 空 payload（空行/心跳）也必须原样返回
     expect(line).toMatch(/payload\.length === 0/)
     // 非 `data:` 行（event:/id:/注释/: 心跳）必须原样，不能被 JSON.parse 吞
-    expect(line).toMatch(/startsWith\('data:'\) return line/)
+    expect(line).toMatch(/startsWith\('data:'\)\)\s*return line/)
+
   })
 
   it('⚠️ 无 body 的 Response 必须原样返回（别构造出 null body 把流断掉）', () => {
     const wrap = scope.fn('astudioWrapIncremental')
-    expect(wrap).toMatch(/response\.body === null \| \| response\.body === undefined\)\s*return response/)
+    // 源码 src/astudio.ts L999 是一行内的 `null || undefined` 两段判空（fact 552 (h)：
+    // 正则里写成 `\| \|` 会去匹配 `| |`，永远不中；跨行字面量更是直接语法错）。
+    expect(wrap).toMatch(/response\.body === null \|\| response\.body === undefined\)\s*return response/)
   })
 
   it('⚠️ 包装器必须保留上游 status/statusText，且只在缺 Content-Type 时补 text/event-stream', () => {
@@ -138,9 +142,11 @@ describe('★ astudio.ts 流式层源码级契约', () => {
   /** 【D4｜fact 478 ④】长上下文模型可能 >45s，官方 stream_idle_timeout_ms=300000。 */
   it('⚠️ chunkTimeoutMs 必须 ≥300_000（当前 product 是 120_000，依赖 fact 478 ④ 的改动）', () => {
     const product = readFileSync(join(SRC_DIR, 'astudio-product.ts'), 'utf8')
-    const at = product.indexOf('chunkTimeoutMs:')
-    expect(at).toBeGreaterThan(-1)
-    const value = Number((product.slice(at, at + 60).match(/chunkTimeoutMs:\s*([0-9_]+)/) ?? [])[1]?.replace(/_/g, ''))
+    // ⚠️ 不能用 indexOf('chunkTimeoutMs:') 定位：第一个命中的是**接口字段声明**
+    // `chunkTimeoutMs: number`（无数字字面量）⇒ 取值落空变 NaN（fact 552 第三节 (i)）。
+    // 直接对全文要求「数字开头」的那一处赋值。
+    const value = Number((product.match(/chunkTimeoutMs:\s*(\d[\d_]*)/)?.[1] ?? '').replace(/_/g, ''))
+
     expect(value).toBeGreaterThanOrEqual(300_000)
   })
 })
@@ -329,7 +335,13 @@ describe('astudioRewriteSsePayload —— 幂等透传 / 累积改写 / 丢弃 /
       expect(r.payload, `payload 不该被改写：${payload.slice(0, 40)}`).toBe(payload)
       expect(r.changed).toBe(false)
     }
-    expect(state.size).toBe(0)
+    // 【源码现状，fact 552 第三节 (j)】changed=false 也会登记空 sent：
+    // src/astudio.ts 的 content 分支对 `typeof content === 'string'` 一律
+    // state.set(key, { sent: before + after })，即便没产生新增量 ⇒ 键 'A:c:0' 以 sent=''
+    // 入表（对后续 diff 无害，对首帧无害）。因此如实钉「最多一个空槽位」，不允许为此改 src。
+    expect(state.size).toBeLessThanOrEqual(1)
+    expect(state.get('A:c:0')?.sent).toBe('')
+
   })
 
   it('⚠️ 缺 id 的帧也照样能被 diff（兜底键稳定，不退化成「永远当首帧」）', () => {

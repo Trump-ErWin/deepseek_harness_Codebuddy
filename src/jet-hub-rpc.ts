@@ -73,6 +73,14 @@ type OfficeAceAuth = typeof OfficeAceAuthModule
 import type { AccioAuth } from './accio-auth.js'
 import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
 import { ACCIO } from './accio-product.js'
+// AStudio（讯飞 AstronStudio）：直连上游 MAAS。**没有 OAuth 授权页** —— 凭据是客户端登录后
+// **明文落盘**会话的拷贝（见 `astudio-auth.ts` 模块头），故 `account.create` 走
+// `importLocalSession`（导入即完成，没有可用的 loginUrl，见该分支的 `reused`）。
+// ⚠️ 本家符号**分属两个模块**：`astudioAccountNickname` 在 `astudio-auth.ts`，
+//    `isAstudioRefreshable` 与凭据类型在 `astudio.ts`（产品常量在 `astudio-product.ts`）。
+import { ASTUDIO } from './astudio-product.js'
+import { astudioAccountNickname, type AstudioAuth } from './astudio-auth.js'
+import { isAstudioRefreshable, type AstudioCredential } from './astudio.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -1277,6 +1285,15 @@ export interface JetHubAuths {
    */
   readonly officeace: OfficeAceAuth
   readonly accio: AccioAuth
+  /**
+   * AStudio（讯飞 AstronStudio，2026-10-16）。
+   *
+   * ⚠️ 与其余各家**不同**：本家没有 `startLogin`、不开回调服务器、没有
+   * `authorizeUrl`。`account.create` 用 `importLocalSession(refName)` 把**本机 AStudio
+   * 客户端已登录的会话**（磁盘明文 `modelBearerToken`，fact 399/402）读进 DSH 凭据库
+   * —— 一次做完的同步路径 ⇒ 返回体靠 `reused: true` 走前端的成功出口。
+   */
+  readonly astudio: AstudioAuth
 }
 
 /**
@@ -1845,6 +1862,7 @@ function registerJetHubEndpoints(
     // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
     minimaxintl,
     zcode, gemini, accio,
+    astudio,
   } = auths
   /**
    * 积分能力表。
@@ -2022,6 +2040,19 @@ function registerJetHubEndpoints(
     // 池内 `expiresAt` 确实会被写 ⇒ 不属 loomy / zcode 那类豁免。
     // 漏登记的后果是「凭据明明能续，面板却报未登录」（2026-10-12 复审发现）。
     ACCIO.id,
+    // ⚠️ astudio（讯飞 AstronStudio，2026-10-16）**有**可用的续期链，故不属于
+    // loomy / zcode 那类「设计上没有 refresh 端点」的显式豁免：
+    // · 触发点唯一 = 上游 MAAS 返回 **HTTP 401**（fact 401：客户端的
+    //   `refreshAstronSessionCredentialAfterUnauthorized` 也仅挂这一点）；流内
+    //   1002/1005 与 502 model_not_found / no_valid_authorization **不得**挂自愈，
+    //   否则对确定性失败白刷。
+    // · `AstudioAuth.refreshAccountCredential` 内部幂等重跑纯读端点
+    //   `GET /xingchen-studio/bot/models/configs`（api_key 不轮换，fact 399），
+    //   只重取一次、并发去重，且**绝不回写**客户端的 astron-session.json。
+    // · 会话真失效 = HTTP 200 + code=80000 ⇒ 走 `AstudioRefreshTokenExpiredError`
+    //   一次性终态「需人工重新登录」，不进重试循环。
+    // 漏登记的后果与 accio 同款：凭据其实只需一次重取，面板却永报「未登录」。
+    ASTUDIO.id,
   ])
 
   /**
@@ -4126,6 +4157,59 @@ function registerJetHubEndpoints(
           })
 
           return { ok: true, value: { accountId: id, loginUrl: accioStarted.loginUrl } }
+        } else if (provider === ASTUDIO.id) {
+          /**
+           * AStudio（讯飞 AstronStudio）**没有 OAuth 授权页**：推理凭据是**本机客户端
+           * 已登录会话的明文拷贝**（磁盘 `astron-session.json` 的 `modelBearerToken`，
+           * fact 399/402；服务端 `Set-Cookie Max-Age=31536000`，bundle 内**不存在任何
+           * 程序化续期接口**）⇒ 没有「授权页 + 回调」这一步可返回 URL。
+           *
+           * ⚠️⚠️ 与其余各家一致、与**上面的 Accio 分支相反**：本分支**必须自己**
+           * `pool.addAccount` 登记条目、失败时**必须自己** `pool.removeAccount` 清掉。
+           * Accio 那段「刻意不调 addAccount」成立的前提是 `AccioAuth.startLogin`
+           * 内部自己登记占位条目；而 `AstudioAuth` **没有** `startLogin` ⇒ 照抄 Accio
+           * 会一个账号都建不出来（gemini L3195-3203 / officeace L3256-3264 是范式）。
+           *
+           * ⚠️ 返回值靠 `reused: true` + 空 `loginUrl` 命中前端的成功出口
+           *（`jet-hub.js` 的 `if (res.reused)`：接受空 loginUrl、直接 loadAccounts）。
+           * `RpcCreateAccountResponse.loginUrl` 是**必填 string**，故空串是唯一能同时满足
+           * 类型契约与「不弹窗」的做法；代价是提示文案对本家略失真（写「复用已有账号」
+           * 而实际是「导入本机会话」）—— 已知偏离，本轮刻意不改 types.ts / jet-hub.js
+           * 以缩小热点面。新增的 `loginMode: 'url'` 缺省行为不受影响。
+           */
+          await pool.addAccount({
+            id,
+            provider: ASTUDIO.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let imported: AstudioCredential
+          try {
+            // 读盘 + 写 DSH 凭据库都在里面；零网络请求（不在建号时做探测）。
+            imported = await astudio.importLocalSession(refName)
+          } catch (error) {
+            // 导入失败：删掉刚登记的条目，不留幽灵账号（同 gemini 失败路径）。
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法导入本机 AStudio 会话（客户端未登录或会话文件不可读）：${reason}`)
+          }
+
+          await pool.updateAccount(id, {
+            // ⚠️ 必须走 `astudioAccountNickname`：会话文件里的 `mobile` 是**完整手机号**，
+            // 原样当昵称会把手机号显示在卡片上（该函数掩码到末 2 位，fact 463）。
+            nickname: astudioAccountNickname(imported, id),
+            // ⚠️ 恒 `undefined`：磁盘会话没有 TTL/expiresAt（fact 374）⇒ 传 `undefined`
+            // 是「不知道」，**不得**写 0（那会让卡片显示「已过期」）。
+            expiresAt: undefined,
+            // 如实按凭据本体判定（有 access_token 才可续），不写死 true。
+            refreshable: isAstudioRefreshable(imported),
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: '', reused: true } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }

@@ -778,6 +778,52 @@ export class AstudioAuth extends Service {
     }
   }
 
+  /**
+   * 导入**本机 AStudio 客户端已有的登录会话**（纯本地读盘 + 写 DSH 凭据库，**零网络请求**）。
+   *
+   * ## 为什么本家没有 `startLogin`
+   *
+   * AStudio 不走 OAuth：推理凭据是客户端登录后**明文落盘**的 `modelBearerToken`
+   * （`ASTUDIO.sessionFilePath`，fact 399/402），服务端 `Set-Cookie` 恒
+   * `Max-Age=31536000`、bundle 内**不存在任何程序化续期接口** ⇒ 没有「授权页 +
+   * 回调」这一步可返回 URL。用户动作是「在 AStudio 客户端里登录」，本函数只负责
+   * 把那份会话**读进来** —— 它是 `jet-hub-rpc.ts` 的 `account.create` astudio
+   * 分支的唯一取数入口（fact 472 缺口 B）。
+   *
+   * ⚠️ **磁盘优先，但绝不回写磁盘**：客户端是 `modelBearerToken` 的唯一权威写者
+   * （fact 401 挂点约束），本函数只写 DSH 凭据库，与 `refreshOnce` 行为一致
+   * （单测已断言磁盘 fixture 一字未改）。
+   *
+   * ⚠️ 读不到 ⇒ **抛** `AstudioRefreshTokenExpiredError`，不得返回 `undefined`
+   * 让调用侧写出一个没有凭据的账号条目（那会被自愈/探测链当成「已登录但坏了」）。
+   *
+   * ⚠️ 写库**刻意不走 `saveCredential`**（那条吞错误只留日志）：导入失败必须让
+   * 调用方看见，它才能 `pool.removeAccount` 清掉刚登记的幽灵条目。
+   *
+   * @param refName 账号池条目的 `credentialRef`（由 `account.create` 生成）。
+   *                只用于并入库里既有值；凭据本身固定写在 `defaultCredentialRef`
+   *                —— 本家是「单账号一份会话文件」的形态（fact 374），且与
+   *                `currentCredential()` 缺省读取的 ref 对齐，避免读盘值与库里值分裂。
+   */
+  async importLocalSession(refName: string): Promise<AstudioCredential> {
+    const disk = readAstudioDiskCredential(this.env, this.product)
+    if (disk === undefined) {
+      throw new AstudioRefreshTokenExpiredError(
+        '未在本机找到可用的 AStudio 登录会话（astron-session.json 不存在、不可读，或缺少 modelBearerToken）。' +
+          '请先启动 AStudio 客户端并登录，再新建该账号。',
+      )
+    }
+    // 与刷新链同构：磁盘给新值，库里那份补齐磁盘上没有的字段（如历史 nickname/uid）。
+    // `disk !== undefined` 时 `mergeAstudioRefreshSeed` 必返回非空，`?? disk` 只是给 TS 的收窄。
+    const stored = await this.readStoredCredential(refName)
+    const credential = mergeAstudioRefreshSeed(disk, stored) ?? disk
+    await this.store.set(
+      credentialRef(this.product.defaultCredentialRef),
+      JSON.stringify(credential),
+    )
+    return credential
+  }
+
   /** 移除已存储的凭据（账号条目由调用方决定是否删除）。**不碰客户端文件**。 */
   async logout(): Promise<void> {
     this.active = false
