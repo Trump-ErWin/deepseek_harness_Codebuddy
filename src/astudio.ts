@@ -192,11 +192,18 @@ export function astudioDisplayNickname(
  * 缺失的字段**跳过键**而不是发空值（空 Cookie 项会让部分网关直接判未登录）。
  */
 export function astudioCookieHeader(credential: AstudioCredential): string {
+  const credRecord = credential as unknown as Record<string, unknown>
+  const ssoId = credential.sso_session_id
+    ?? (typeof credRecord.ssoSessionId === 'string' ? credRecord.ssoSessionId : undefined)
+  const accId = credential.account_id
+    ?? (typeof credRecord.accountId === 'string' ? credRecord.accountId : undefined)
+  const tok = credential.token
+    ?? (typeof credRecord.token === 'string' ? credRecord.token : undefined)
   const pairs: Array<[string, string | undefined]> = [
-    ['ssoSessionId', credential.sso_session_id],
-    ['sso_sessionid', credential.sso_session_id],
-    ['account_id', credential.account_id],
-    ['token', credential.token],
+    ['ssoSessionId', ssoId],
+    ['sso_sessionid', ssoId],
+    ['account_id', accId],
+    ['token', tok ?? ssoId],
   ]
   return pairs
     .filter((entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].length > 0)
