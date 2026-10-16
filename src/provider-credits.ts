@@ -70,7 +70,7 @@ import {
 } from './minimax-credits.js'
 import { fetchRaccoonCreditBalance } from './raccoon-credits.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
-import { fetchAstudioBalanceDetailed } from './astudio-credits.js'
+import { fetchAstudioBalanceDetailed, claimDaily } from './astudio-credits.js'
 import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
 import { fetchZcodeBalance, type ZcodeBalanceResult } from './zcode-upstream.js'
@@ -420,6 +420,9 @@ export function createProviderCredits(
     astudio: {
       fetchBalanceDetailed: async (credential) =>
         await fetchAstudioBalanceDetailed(credential as AstudioCredential),
+      claim: async (credential) =>
+        await claimDaily(credential as AstudioCredential),
+      precheckStatus: false,
     },
 
     /**

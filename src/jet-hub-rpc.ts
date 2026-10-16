@@ -81,6 +81,12 @@ import { ACCIO } from './accio-product.js'
 import { ASTUDIO } from './astudio-product.js'
 import { astudioAccountNickname, type AstudioAuth } from './astudio-auth.js'
 import { isAstudioRefreshable, type AstudioCredential } from './astudio.js'
+import {
+  createAstudioWechatQrCode,
+  pollAstudioWechatScan,
+  bindAstudioWechatSession,
+  type AstudioWechatQrCode,
+} from './astudio-oauth.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -2489,6 +2495,18 @@ function registerJetHubEndpoints(
     Promise<{ done: boolean; success?: boolean; error?: string }>
   >()
 
+  interface PendingAstudioScanState {
+    fd: string
+    credentialRef: string
+  }
+
+  const pendingAstudioScanState = new Map<string, PendingAstudioScanState>()
+
+  const astudioExchangeInFlight = new Map<
+    string,
+    Promise<{ done: boolean; success?: boolean; error?: string }>
+  >()
+
   /**
    * 登录**终态失败**记录（账号 id → `{ message, at }`；`message` 即下发给前端的原文）。
    *
@@ -2675,6 +2693,8 @@ function registerJetHubEndpoints(
     //（正常路径同值；改造期存量数据可能只有其一）。
     const pending = pendingOfficeAceState.get(accountId)
     if (pending !== undefined) refs.add(pending.credentialRef)
+    const pendingAstudio = pendingAstudioScanState.get(accountId)
+    if (pendingAstudio !== undefined) refs.add(pendingAstudio.credentialRef)
     let readFailed = false
     for (const name of refs) {
       if (name.length === 0) continue
@@ -3095,6 +3115,67 @@ function registerJetHubEndpoints(
     //    在此之前任何一次 `account.list` 都必须能看出这次登录"在途"。
     pendingOfficeAceState.delete(accountId)
     return { done: true, success: true }
+  }
+
+  /**
+   * 执行一次 AStudio 微信扫码登录轮询与凭据交换。
+   */
+  async function exchangeAstudioScanLogin(
+    accountId: string,
+    entry: { credentialRef: string },
+    pending: PendingAstudioScanState,
+  ): Promise<{ done: boolean; success?: boolean; error?: string }> {
+    const scanResult = await pollAstudioWechatScan(pending.fd, {
+      fetcher: auths.astudio.fetchImpl,
+    }).catch(() => ({ status: 'pending' as const }))
+    if (scanResult.status === 'pending') {
+      return { done: false }
+    }
+
+    if (scanResult.status === 'unbound' || scanResult.status === 'error') {
+      const msg = scanResult.message || '微信扫码登录已失效或失败，请重新发起登录'
+      const failure = await failLogin(accountId, new Error(msg))
+      pendingAstudioScanState.delete(accountId)
+      return { done: true, success: false, error: failure ?? msg }
+    }
+
+    if (scanResult.status === 'scanned') {
+      const bound = await bindAstudioWechatSession(pending.fd, scanResult.account, {
+        fetcher: auths.astudio.fetchImpl,
+      })
+        .then(() => true)
+        .catch(() => false)
+      if (!bound) {
+        ctx.logger.warn(`[jet-hub] AStudio wechat session bind returned non-ok for ${accountId}`)
+      }
+
+      let credential: AstudioCredential
+      try {
+        credential = await auths.astudio.completeLogin(
+          scanResult.account,
+          pending.credentialRef ?? entry.credentialRef,
+        )
+      } catch (error) {
+        const failure = await failLogin(accountId, error)
+        pendingAstudioScanState.delete(accountId)
+        if (failure === undefined) return { done: true, success: true }
+        return { done: true, success: false, error: failure }
+      }
+
+      pendingAstudioScanState.delete(accountId)
+      try {
+        await pool.updateAccount(accountId, {
+          nickname: astudioAccountNickname(credential, accountId),
+          expiresAt: undefined,
+          refreshable: isAstudioRefreshable(credential),
+        })
+      } catch (error) {
+        ctx.logger.warn(`[jet-hub] astudio 回填账号条目失败：${String(error)}`)
+      }
+      return { done: true, success: true }
+    }
+
+    return { done: false }
   }
 
   /**
@@ -4187,29 +4268,42 @@ function registerJetHubEndpoints(
             createdAt: Date.now(),
           })
 
-          let imported: AstudioCredential
+          let imported: AstudioCredential | undefined
           try {
-            // 读盘 + 写 DSH 凭据库都在里面；零网络请求（不在建号时做探测）。
+            // 优先尝试导入本机已登录会话（读盘 + 写 DSH 凭据库都在里面；零网络请求）
             imported = await astudio.importLocalSession(refName)
-          } catch (error) {
-            // 导入失败：删掉刚登记的条目，不留幽灵账号（同 gemini 失败路径）。
-            void pool.removeAccount(id).catch(() => {})
-            const reason = error instanceof Error ? error.message : String(error)
-            throw new Error(`无法导入本机 AStudio 会话（客户端未登录或会话文件不可读）：${reason}`)
+          } catch {
+            // 本地无会话或导入失败，回退到微信扫码登录流程
+            imported = undefined
           }
 
-          await pool.updateAccount(id, {
-            // ⚠️ 必须走 `astudioAccountNickname`：会话文件里的 `mobile` 是**完整手机号**，
-            // 原样当昵称会把手机号显示在卡片上（该函数掩码到末 2 位，fact 463）。
-            nickname: astudioAccountNickname(imported, id),
-            // ⚠️ 恒 `undefined`：磁盘会话没有 TTL/expiresAt（fact 374）⇒ 传 `undefined`
-            // 是「不知道」，**不得**写 0（那会让卡片显示「已过期」）。
-            expiresAt: undefined,
-            // 如实按凭据本体判定（有 access_token 才可续），不写死 true。
-            refreshable: isAstudioRefreshable(imported),
+          if (imported !== undefined) {
+            await pool.updateAccount(id, {
+              nickname: astudioAccountNickname(imported, id),
+              expiresAt: undefined,
+              refreshable: isAstudioRefreshable(imported),
+            })
+            return { ok: true, value: { accountId: id, loginUrl: '', reused: true } }
+          }
+
+          // 本地无会话：启动微信扫码登录流程，对接 SSOService/wx/scanlogin/qrcode
+          let qr: AstudioWechatQrCode
+          try {
+            qr = await createAstudioWechatQrCode({
+              fetcher: astudio.fetchImpl,
+            })
+          } catch (error) {
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 AStudio 微信扫码登录（获取二维码失败）：${reason}`)
+          }
+
+          pendingAstudioScanState.set(id, {
+            fd: qr.fd,
+            credentialRef: refName,
           })
 
-          return { ok: true, value: { accountId: id, loginUrl: '', reused: true } }
+          return { ok: true, value: { accountId: id, loginUrl: qr.qrUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -4434,6 +4528,23 @@ function registerJetHubEndpoints(
                   // 这里仍要兜住，否则一次未捕获拒绝会连带跳过后面那行 `delete`。
                 }
                 officeAceExchangeInFlight.delete(req.accountId)
+              })()
+              return { ok: true, value: await task }
+            }
+          }
+          if (entry.provider === ASTUDIO.id) {
+            const pending = pendingAstudioScanState.get(req.accountId)
+            if (pending !== undefined) {
+              const shared = astudioExchangeInFlight.get(req.accountId)
+              if (shared !== undefined) return { ok: true, value: await shared }
+              const task = exchangeAstudioScanLogin(req.accountId, entry, pending)
+              astudioExchangeInFlight.set(req.accountId, task)
+              void (async () => {
+                try {
+                  await task
+                } catch {
+                }
+                astudioExchangeInFlight.delete(req.accountId)
               })()
               return { ok: true, value: await task }
             }

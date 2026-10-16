@@ -55,7 +55,7 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(caps.loomy).toEqual({ balance: true, dailyCheckin: true, onboardingTasks: true })
     // ⚠️ 2026-10-16 并入 astudio：逐家 toEqual，漏写这一条则「registry 加了
     //    而客户端能力表没派生出来」这种漂移不会被本用例发现。
-    expect(caps.astudio).toEqual({ balance: true, dailyCheckin: false })
+    expect(caps.astudio).toEqual({ balance: true, dailyCheckin: true })
   })
 
   it('只有 cline 有 subscriptionQuota（既有断言 toEqual([\'cline\'])）', () => {

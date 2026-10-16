@@ -455,9 +455,9 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     label: 'AStudio (讯飞)',
     displayName: 'AStudio',
     logoClass: 'astudio',
-    // ⚠️ 如实登记：无签到端点（fact 403：bundle 全量扫描 checkin|dailyLogin|claim 后
-    //    不存在任何领取端点，每日登录积分由服务端自动发放）⇒ dailyCheckin 显式 false。
-    credits: { balance: true, dailyCheckin: false },
+    // AStudio 每日奖励签到对接 client-popups/pending（DAILY_REWARD_DIALOG）与
+    // client-popups/complete 领取流程 ⇒ dailyCheckin 启用为 true。
+    credits: { balance: true, dailyCheckin: true },
     // ⚠️ rateLimit: false —— 判据同 accio（registry 落地问法「点下去能不能让用户少受限一次？」）：
     //    astudio-adapter 不写 modelRateLimits，且刻意不进 src/index.ts 的 probeById
     //    （probeById 被守卫锁成「恰好是会写标记的家」）⇒ 两个按钮恒为惰性。
