@@ -786,6 +786,27 @@ async function sharedPackageExpiry(
   try {
     balance = await fetchBalance()
   } catch {
+    // ⚠️⚠️ **潜在脆弱点（2026-10-16 审计实测，当前生产不可达）**：
+    //    这个裸 `catch` 会把**中止（abort）**也折算成 `UNUSABLE`，违反本仓库
+    //    「abort 必须抛出、绝不成 `UNUSABLE`」的铁律；而本 PR 新增的
+    //    `fetchBalanceWithCache` 让**共享缓存那条腿**的中止第一次能走到这里
+    //   （`balance-cache.ts` 的 `isAbort` 会原样上抛）。
+    //
+    //    **为什么当前不可达**（审计逐级核实，我独立复核过每一环）：
+    //    buddy / workbuddy / lobsterai / trae 四家在 `provider-credits.ts`
+    //    只注册 `fetchBalance`（**不是** `fetchBalanceDetailed`），而它们的原语
+    //   （`fetchCreditBalance` / `fetchLobsteraiCreditBalance` / `fetchTraeCreditBalance`）
+    //    内部经 `postJson` / `requestJson`，那两个助手的 `catch` 把**一切**错误
+    //   （含 `AbortError` 与 `AbortSignal.timeout` 的 `TimeoutError`）压成
+    //    `{ ok: false, message }` ⇒ 这三份实现**从不向上抛中止**（裸 `throw` 零命中）。
+    //
+    //    ⇒ **不属本 PR 的验收阻断项**（该 catch 早于本 PR 存在）。但若将来
+    //    ①某家改用 `fetchBalanceDetailed`、或 ②`postJson` 改为抛出、或
+    //    ③新增走 `fetchBalanceWithCache` 的渠道 —— 这里会立刻把中止吃掉
+    //   （症状：用户取消后看到「没有任何可用候选」而不是中止）。
+    //    ⇒ **加固方式**：与本文件 `createExpiryProbe` 同口径，先判中止再兜底：
+    //      catch (error) { if (isAbortLike(error, signal)) throw error; return UNUSABLE }
+    //    ⚠️ 别在无实测的情况下改它 —— 需要先确认真有一条腿会抛中止。
     return UNUSABLE
   }
   if (balance === null) return UNUSABLE

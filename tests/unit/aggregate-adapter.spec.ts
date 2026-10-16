@@ -3139,12 +3139,19 @@ describe('★★ 门控建池、NEVER 兜底与手工位次', () => {
         order: Record<string, string[]>
         mode: 'expiry' | 'manual'
       }) => void,
+      /** ⚠️ 可选的**首轮初值**（2026-10-16 加）：用于构造「两轮长度相同、内容不同」的场景。 */
+      initial?: Partial<{
+        allowed: Record<string, Record<string, Record<string, boolean>>>
+        rejections: Record<string, Record<string, Record<string, boolean>>>
+        order: Record<string, string[]>
+        mode: 'expiry' | 'manual'
+      }>,
     ) => {
       const state = {
-        allowed: {},
-        rejections: {},
-        order: {},
-        mode: 'expiry' as 'expiry' | 'manual',
+        allowed: initial?.allowed ?? {},
+        rejections: initial?.rejections ?? {},
+        order: initial?.order ?? {},
+        mode: initial?.mode ?? ('expiry' as 'expiry' | 'manual'),
       }
       let probes = 0
       const ctx = {
@@ -3205,6 +3212,25 @@ describe('★★ 门控建池、NEVER 兜底与手工位次', () => {
         s.order = { 'deepseek-v4-1-flash': ['buddy\u0000deepseek-v4.1-flash'] }
       })
       expect(probes, '★ 顺序表是第 3 项').toBeGreaterThan(afterFirst)
+    })
+
+    it('★★ 顺序表**内容**变化（长度相同）⇒ 指纹必须变（防退化成「只数条数」）', async () => {
+      // ⚠️⚠️ **真实守卫缺口**（2026-10-16 对抗审计实测）：
+      //    上一条用例是「空表 → 一条」，**长度变了** ⇒ 把
+      //    `order[key].join(',')` 退化成 `String(order[key].length)`（**正是本文件
+      //    注释里明令禁止的「条目数摘要」**）时，上一条**照样绿**。
+      //    后果：`{m:[a,b]}` 与 `{m:[c,d]}` 摘要同为 `2` ⇒ 语义不同的两张顺序表
+      //    **指纹碰撞** ⇒ 改了顺序却命中旧 `choiceCache` ⇒ 拖了排序 60 秒内不生效
+      //    —— 而这里登记过的教训（「缓存失效判据按数组长度」被实测证伪）**没有守卫**。
+      // ⇒ 判据必须用**长度相同、内容不同**的两张表。
+      const { probes, afterFirst } = await probeCounter((s) => {
+        // 先给一份「两个候选」的顺序表…
+        s.order = { 'deepseek-v4-1-flash': ['buddy\u0000a', 'zcode\u0000b'] }
+      }, {
+        // …但第一轮用的也是**两个**（只是内容不同）⇒ 长度相同、内容不同。
+        order: { 'deepseek-v4-1-flash': ['zcode\u0000b', 'buddy\u0000a'] },
+      })
+      expect(probes, '★ 长度相同但内容/次序不同的顺序表必须让指纹变化').toBeGreaterThan(afterFirst)
     })
 
     it('★ 排序模式变化 ⇒ 指纹变 ⇒ 重新探测（否则切到手工序 60 秒内不生效）', async () => {

@@ -50,18 +50,32 @@ const exhausted = (): CreditBalance => ({
 const credential = { access_token: 't' } as never
 
 describe('★ buddy 系四家吃共享读数（命中时不再打上游）', () => {
-  it('★★ 缓存命中 ⇒ 用缓存里的余额折算，**不调** fallback', async () => {
-    // ⚠️ 判据必须是「fallback 有没有被调」：只看返回值无法区分
-    //    「吃了缓存」与「自己又查了一遍拿到同样的值」——而后者正是要消除的浪费。
-    let fallbackCalls = 0
+  it('★★ 缓存命中 ⇒ 用缓存里的余额折算（不查上游的能力由 `fetchBalanceWithCache` 的接线用例覆盖）', async () => {
+    // ⚠️⚠️ **本条能测什么、不能测什么**（2026-10-16 对抗审计发现 + 我复核）：
+    //
+    //    `buddyExpiry` 只有**三个**参数（`product` / `credential` / `cached?`）——
+    //    **fallback 不是参数**，它在函数内部固定是 `fetchCreditBalance(...)`。
+    //    ⇒ 单测里**注入不了** fallback ⇒ 「缓存命中时不打上游」这条**无法在本用例断言**。
+    //
+    //    原实现写的是 `expect(fallbackCalls).toBe(0)`，而那个 `fallbackCalls`
+    //    是个**从无写入方的局部变量**（桩里没有 `+= 1`）⇒ **恒真断言**
+    //    （任何实现下都通过，包括「完全没接线、每次都重查」）。
+    //    ⚠️ 我第一版「修法」给它加了 `+= 1` —— **方向错了**：那会让这条用例
+    //    变成在断言「fallback 被调了 1 次」，与用例名恰好相反（因为第三参就是 `cached`，
+    //    传进去的是**缓存读数**，不是 fallback）。
+    //
+    //    ⇒ 正确做法：本用例只断言**折算值来自共享读数**（那是它真正测的东西）；
+    //      「命中缓存 ⇒ 不打上游」由**能注入 fallback** 的层级覆盖 ——
+    //      `fetchBalanceWithCache` 是四家共用的那一份实现，它接收 `cached` 与 `fallback`
+    //      两个参数，其行为由下面「★ 共享读数缺席 ⇒ 回落自己发请求」等同文件用例覆盖
+    //      （那些用例传的是 `cached` 桩，能精确控制「有没有共享读数」）。
     const expiry = 1_700_000_000_000
     const result = await buddyExpiry(
       CODEBUDDY,
       credential,
       async () => balanceWith(expiry),
     )
-    expect(result, '★ 折算值必须来自共享读数').toBe(expiry)
-    expect(fallbackCalls, '本用例的 fallback 是注入了的实现，未注入计数出口').toBe(0)
+    expect(result, '★ 折算值必须来自传入的共享读数').toBe(expiry)
   })
 
   it('★ 共享读数缺席（undefined）⇒ 回落自己发请求', async () => {
@@ -250,6 +264,21 @@ describe('★★ 两条消费路径共用同一份缓存（回写 → 折算命�
     // ★ 反向：只写**成功**的余额（失败不写 —— 否则折算侧会把瞬时失败当结论）。
     expect(code, '★ 回写必须有 `balance !== null` 守卫')
       .toMatch(/if \(balance !== null\) deps\.writeBalance/)
+    // ⚠️⚠️ **还必须有「端点把 writeBalance 注入下去」这一腿**（2026-10-16 对抗审计实测的
+    //    真实守卫缺口，编号 N4b）：只断言上面两行时，把**整段**
+    //    `...balanceCacheOf() === undefined ? {} : { writeBalance: (accountId, balance) => … }`
+    //    从 `credits.balances` 的 case 里删掉，**全部用例照样绿**（实测）。
+    //    而生产后果与「内部那行被删」完全一样：折算侧永远命中不了面板刚查过的读数
+    //    ⇒ 同一账号在同一 TTL 窗口内被上游查两次 ⇒ **本功能价值静默归零**。
+    //    ⇒ 判据必须锚定**端点 case 内**的注入键（`writeBalance:`），它是这条链的入口。
+    const balancesCase = code.slice(
+      code.indexOf("case 'credits.balances'"),
+      code.indexOf("case 'aggregate.", code.indexOf("case 'credits.balances'")),
+    )
+    expect(balancesCase.length, '★ 必须能切出 `credits.balances` 的 case 体（判据自检）')
+      .toBeGreaterThan(200)
+    expect(balancesCase, '★★ 端点必须把 `writeBalance` 注入给 `collectCreditBalances`')
+      .toMatch(/writeBalance:/)
   })
 
   it('★ 行为级：`collectCreditBalances` 确实把成功读数交给 `writeBalance`', async () => {
