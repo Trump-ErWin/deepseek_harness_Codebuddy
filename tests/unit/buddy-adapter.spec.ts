@@ -1305,6 +1305,339 @@ describe('BuddyAdapter credential handling', () => {
     expect(calls).toBeGreaterThanOrEqual(2)
   })
 
+  it('安全策略拦截（11140）回 HTTP 400 时同样换号（2026-10-16 后端行为变更）', async () => {
+    // 之前 11140 回 403，在 401/403 分支处理。2026-10-16 实测后端改成回 400，
+    // 400 不进入 401/403 分支 → 修复前直接抛 INVALID_REQUEST 不换号。
+    const body = JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      displayMsg: { zh: '请求被拦截，请重新发送' },
+    })
+    let calls = 0
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async () => { calls++; return new Response(body, { status: 400 }) },
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
+    expect((error as LlmError).message).toContain('安全策略')
+    expect((error as LlmError).message).toContain('HTTP 400')
+    // 必须换号：两个账号各试一次。
+    expect(calls).toBeGreaterThanOrEqual(2)
+  })
+
+  it('11140 回 400 时换到可用账号即成功', async () => {
+    const safety = JSON.stringify({ code: 11140, msg: 'request illegal' })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) =>
+        (init.headers.get('Authorization') ?? '').includes('AT1')
+          ? new Response(safety, { status: 400 })
+          : new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+              status: 200,
+              headers: { 'content-type': 'text/event-stream' },
+            }),
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    expect(chunks.length).toBeGreaterThan(0)
+  })
+
+  /**
+   * 与真实 `AccountPool` 同形的账号池替身（用于 400 换号块的回归用例）。
+   *
+   * ⚠️⚠️ 为什么**不能**复用上面的 `makePool`：那个替身只实现了
+   * 401/403 换号路径用到的方法，**不实现 `modelRateLimits` 的过滤腿**。而真实池
+   * （`src/account-pool.ts:1758`）在取号时会「过滤掉仍处于冷却期的账号 + 按
+   * `Date.now() >= resetAt` 比较」。
+   *
+   * ⇒ 缺了这一腿的替身会**高估**「刚被 11140 拦下的账号会不会被拿回来」，
+   * 从而把「拿回刚失败的账号」这类缺陷误判成生产里不可达（2026-10-17 审计实测：
+   * 前两轮探针正是被这一点误导，结论要靠换成同形替身才定得下来）。
+   */
+  function makeCooldownAwarePool(accounts: Array<{ id: string; credential: BuddyCredential }>) {
+    /** `账号 id → (模型 id → 冷却到期时刻)`，与真实池的 `modelRateLimits` 同形。 */
+    const limits = new Map<string, Record<string, number>>()
+    const recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    return {
+      recorded,
+      findAccountIdByCredential: async (_provider: string, token: string) =>
+        accounts.find(a => a.credential.access_token === token)?.id ?? '',
+      getAvailableAccount: async (
+        _provider: string,
+        modelId: string,
+        exclude?: ReadonlySet<string>,
+      ) => {
+        // 逐条对齐真实池的三个 filter：provider / 排除集 / 冷却期。
+        const entry = accounts.find(a => {
+          if (exclude !== undefined && exclude.has(a.id)) return false
+          const resetAt = limits.get(a.id)?.[modelId]
+          return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
+        })
+        return entry === undefined ? null : { entry, credential: entry.credential }
+      },
+      updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+        recorded.push({ accountId, modelId, resetAtMs })
+        limits.set(accountId, { ...limits.get(accountId), [modelId]: resetAtMs })
+      },
+      disabledModelsFor: () => new Set<string>(),
+    }
+  }
+
+  const POLICY_BODY = JSON.stringify({ code: 11140, msg: 'request illegal' })
+  const OK_SSE_400 = 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+
+  it('400 换号途中撞到 403 形态的 11140 仍继续换号（判据不得绑状态码，2026-10-17 审计）', async () => {
+    // ⚠️⚠️ 真实缺陷（2026-10-17 审计实测）。上游这一族拒绝**同时用 400 与 403**，
+    // 而 PR 109 的换号循环把「继续换号」判据写死成 `status === 400` ⇒
+    // 「400 起 → 403 形态拦截」会在此 break，后面**完全可用**的账号一个都试不到。
+    //
+    // 池：AT1 = 400/11140、AT2 = 403/11140、AT3 = 可用。
+    // 修复前：只发 2 次即报 `AUTH` 失败，AT3 从未被试（症状 = 池里有可用账号却用不上）。
+    const used: string[] = []
+    const pool = makeCooldownAwarePool([
+      { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+      { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      { id: 'acc-3', credential: makeCredential({ access_token: 'AT3' }) },
+    ])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: pool,
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) => {
+        const token = init.headers.get('Authorization') ?? ''
+        used.push(token.replace(/[^A-Z0-9]/g, ''))
+        if (token.includes('AT1')) return new Response(POLICY_BODY, { status: 400 })
+        if (token.includes('AT2')) return new Response(POLICY_BODY, { status: 403 })
+        return new Response(OK_SSE_400, {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        })
+      },
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    expect(used).toEqual(['BAT1', 'BAT2', 'BAT3'])
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    // ⚠️⚠️ **冷却标记是这条断言真正有牙的地方**（2026-10-17 变异验证实测）。
+    //
+    // 只断言「AT3 被用上」是**不够的**：即使把循环内判据重新绑死成
+    // `status === 400`，AT2 的 403 仍会被下面的「401/403 → 继续换号」腿接住、
+    // AT3 照样被用上 ⇒ 那条断言全绿、**对原缺陷零牙**。
+    //
+    // 两种写法真正分叉的地方是**冷却标记**：判据不绑状态码时，403 形态的
+    // 11140 走「拦截」腿 ⇒ AT2 被写 30 分钟策略冷却；绑死 400 时它只走
+    // 「认证失败」腿 ⇒ AT2 **没有**冷却标记 ⇒ 下一轮它仍是第一候选，
+    // 重新被试一遍再撞同一堵墙（`markPolicyBlockedAccount` 的存在理由）。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acc-1', 'acc-2'])
+  })
+
+  it('400 换号途中撞到 401 仍继续换号（认证失败按账号生效，2026-10-17 审计）', async () => {
+    // 同款缺陷的另一格：换号途中撞到凭据失效（账号级问题）时也必须继续换号。
+    // 修复前：AT1 400/11140 → AT2 401 即 break，只发 2 次报 `AUTH`，AT3 从未被试。
+    const used: string[] = []
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: makeCooldownAwarePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+        { id: 'acc-3', credential: makeCredential({ access_token: 'AT3' }) },
+      ]),
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) => {
+        const token = init.headers.get('Authorization') ?? ''
+        used.push(token.replace(/[^A-Z0-9]/g, ''))
+        if (token.includes('AT1')) return new Response(POLICY_BODY, { status: 400 })
+        if (token.includes('AT2')) return new Response('unauthorized', { status: 401 })
+        return new Response(OK_SSE_400, {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        })
+      },
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    expect(used).toEqual(['BAT1', 'BAT2', 'BAT3'])
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+  })
+
+  it('400/403 混合形态全部被拦时报出**最后一次**拦截的 HTTP 状态（2026-10-17 审计）', async () => {
+    // 首发恒为 400，最后一次拦截可能是 403 ⇒ 报「HTTP 400」与实际对不上。
+    // 与 401/403 路径的 `rejectionStatus` 纪律一致：报错取**最后一次**拦截。
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: makeCooldownAwarePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) =>
+        (init.headers.get('Authorization') ?? '').includes('AT1')
+          ? new Response(POLICY_BODY, { status: 400 })
+          : new Response(POLICY_BODY, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
+    // 最后一次拦截是 403 ⇒ 必须报 403（报 400 即为「与实际对不上」）。
+    expect((error as LlmError).message).toContain('HTTP 403')
+    expect((error as LlmError).message).not.toContain('HTTP 400')
+    expect((error as LlmError).message).toContain('已逐个换号重试')
+  })
+
+  it('单凭据（无账号池）+ 400/11140 报「当前账号」而非谎称「全部账号已换号」', async () => {
+    // 没有池就**没有换号发生过**：文案必须走单凭据出口，否则会对用户谎报
+    // 「已逐个换号重试」—— 用户去 Jet Hub 检查池状态会被误导。
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      fetchImpl: async () => new Response(POLICY_BODY, { status: 400 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
+    expect((error as LlmError).message).toContain('当前账号')
+    expect((error as LlmError).message).not.toContain('已逐个换号重试')
+    // ⚠️⚠️ 也不能自称「流内错误帧下发」（2026-10-17 第一轮审计实测的真缺陷）：
+    // 这一格是 **HTTP 响应体**（状态 400），不是流内帧。那句措辞原本只为流内路径
+    // 设计，被 HTTP 单凭据路径复用 `rotated:false` 时一并带了出来 ⇒ 对用户谎报了
+    // 错误的失败通道，会把人引向「流式解析有问题」这个完全错误的方向。
+    expect((error as LlmError).message).not.toContain('流内错误帧下发')
+    expect((error as LlmError).message).toContain('没有其他账号可换')
+  })
+
+  it('400 换号途中撞到 14003 模型饱和也继续换号（2026-10-17 第一轮审计 P1）',
+    // ⚠️ 必须放宽超时：该格会真的走一次饱和退避（`buddySaturationDelayMs` 的 sleep），
+    // 默认 5s 超时会在**断言之前**把用例判红 —— 那与被测行为无关，是测试自身的问题。
+    { timeout: 60000 }, async () => {
+    // ⚠️⚠️ 真缺陷（第一轮独立审计实测，我已独立复现）。
+    //
+    // 饱和分支的既定处置是「留在本账号退避重试、绝不换号」，其前提是
+    // 「饱和是模型级，池里其它账号会撞同一堵墙」。但上游若按账号做过负载均衡，
+    // 该前提不成立 —— 而 11140 本身已被证明是**按账号**生效的。
+    //
+    // 实测（AT1 `400/11140` → AT2 `429/14003` → AT3 完全可用）：
+    //   修复前发过的凭据 = `AT1, AT2, AT2, AT2` —— **AT3 从未被试**，
+    //   且报出「换账号无效，请改用其它模型」这条**与事实相反**的指引。
+    const used: string[] = []
+    const pool = makeCooldownAwarePool([
+      { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+      { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      { id: 'acc-3', credential: makeCredential({ access_token: 'AT3' }) },
+    ])
+    const saturation = JSON.stringify({ code: 14003, msg: 'model busy, please switch model' })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: pool,
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) => {
+        const token = init.headers.get('Authorization') ?? ''
+        used.push(token.replace(/[^A-Z0-9]/g, ''))
+        if (token.includes('AT1')) return new Response(POLICY_BODY, { status: 400 })
+        if (token.includes('AT2')) return new Response(saturation, { status: 429 })
+        return new Response(OK_SSE_400, {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        })
+      },
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    // 关键：AT3 那个**完全可用**的账号必须被用上。
+    expect(used).toContain('BAT3')
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    // ⚠️ **刻意不写冷却**：饱和是模型级的，写 30 分钟账号级冷却会封死好账号
+    // （饱和分支的注释正是为此反对复用限流标记）。只 acc-1（11140）该被标记。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acc-1'])
+  })
+
+  it('400 换号途中末位撞 401/403 也不丢 11140 根因（2026-10-17 对抗审计阻断项）', async () => {
+    // ⚠️⚠️ 阻断级真缺陷。出口判据原先只读循环结束后**最后一次**的 `errorText`，
+    // 而 401/403 腿会把它刷成认证失败的报文 ⇒ 已记账的 11140 变成死变量。
+    //
+    // 实测（AT1 `400/11140` → AT2 `403 forbidden quota`，池耗尽）：
+    //   修复前 code=`AUTH`、message「buddy: forbidden quota」—— **11140 完全消失**。
+    // 而 AUTH 是 IKLBSH 红线：DSH 客户端把 message 整个换成「API 密钥无效」，
+    // 用户看不到「该去 Jet Hub 停用被拦账号」这句唯一出路（实测 token 全部有效）。
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: makeCooldownAwarePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) =>
+        (init.headers.get('Authorization') ?? '').includes('AT1')
+          ? new Response(POLICY_BODY, { status: 400 })
+          : new Response('forbidden quota', { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    // ⚠️ 绝不能是 AUTH（那会被客户端吞成「API 密钥无效」）。
+    expect((error as LlmError).failure.code).not.toBe('AUTH')
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
+    expect((error as LlmError).message).toContain('安全策略')
+  })
+
+  it('额度限流（6004）不因文案含「请求量饱和」被误判为模型饱和（2026-10-17 对抗审计）', async () => {
+    // ⚠️ `isModelSaturationError` 带文案兜底（模型繁忙|请求量饱和|model busy），
+    // 而上游额度限流 `6004` 的 msg 完全可能用同样的措辞 ⇒ 被判成**模型级**饱和。
+    // 危害是行为分叉：饱和路径「不换号、不写标记」，额度限流必须「换号 + 写标记」。
+    //
+    // 实测修复前（AT1 400/11140 → AT2 429/6004「请求量饱和」→ AT3 可用）：
+    //   发过的凭据 = AT1,AT2,AT2,AT2（AT3 从未被试），最终报「换账号无效」，
+    //   且 AT2 的额度限流标记**丢失**。
+    const used: string[] = []
+    const pool = makeCooldownAwarePool([
+      { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+      { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      { id: 'acc-3', credential: makeCredential({ access_token: 'AT3' }) },
+    ])
+    const quota = JSON.stringify({ code: 6004, msg: '请求量饱和，请稍后再试' })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: pool,
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) => {
+        const token = init.headers.get('Authorization') ?? ''
+        used.push(token.replace(/[^A-Z0-9]/g, ''))
+        if (token.includes('AT1')) return new Response(POLICY_BODY, { status: 400 })
+        if (token.includes('AT2')) return new Response(quota, { status: 429 })
+        return new Response(OK_SSE_400, {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        })
+      },
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    expect(used).toContain('BAT3')
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    // ⚠️ 额度限流**必须**留下标记（UI「限额重置」徽章与「重测/重置」的唯一依据）。
+    // 断言含 acc-2 才锁得住这条 —— 只断言成功的话，误判成饱和同样能成功。
+    expect(pool.recorded.map((r) => r.accountId)).toContain('acc-2')
+  })
+
+  it('限流换号途中撞 14003 饱和不给该账号写 1 小时限流标记（2026-10-17 对抗审计）', async () => {
+    // ⚠️ 与 400 路径那处**同型**的对偶缺陷：限流分支的循环**每轮开头**都给当前
+    // 账号记限流标记，而 `isRateLimited` 对 429 无条件返回 true ⇒ 换号途中新撞到
+    // 的 14003 饱和会被写成整 1 小时「限额重置」。
+    //
+    // 本文件下方那条「饱和必须先于限流判定，否则整池锁死」的守卫只在**循环外**生效，
+    // 换号途中的饱和会从记账腿漏过去 —— 同一缺陷的限流路径版本。
+    const pool = makeCooldownAwarePool([
+      { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+      { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      { id: 'acc-3', credential: makeCredential({ access_token: 'AT3' }) },
+    ])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: pool,
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) => {
+        const token = init.headers.get('Authorization') ?? ''
+        if (token.includes('AT1')) return new Response(JSON.stringify({ code: 14002, msg: 'rate limited' }), { status: 429 })
+        if (token.includes('AT2')) return new Response(JSON.stringify({ code: 14003, msg: 'model busy' }), { status: 429 })
+        return new Response(OK_SSE_400, {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        })
+      },
+    })
+    await collectChunks(adapter, streamOptions).catch(() => undefined)
+    // acc-1 是真额度限流（该有标记）；acc-2 是模型饱和（**绝不该有**）。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acc-1'])
+  })
+
   it('安全策略拦截在换号途中被剔除：换到可用账号即成功', async () => {
     // 本用例对应真实故障场景：池首账号被安全策略拦下，池尾账号可用。
     // 修复前「不换号」会让这次请求必然失败（正是用户连续多轮失败的原因）。
