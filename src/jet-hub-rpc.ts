@@ -77,6 +77,7 @@ import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
 import { ACCIO } from './accio-product.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import { MODELSCOPE } from './modelscope-product.js'
+import { maskModelscopeKey } from './modelscope.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -3320,7 +3321,36 @@ function registerJetHubEndpoints(
     accounts: readonly ProviderAccountStatus[],
     provider: string,
   ): Promise<ProviderAccountStatus[]> {
-    if (provider !== ZCODE.id) return [...accounts]
+    if (provider === ZCODE.id) return enrichZcodeIdentity(accounts)
+    // ⚠️⚠️ **本 fork 独有**（modelscope，2026-10-17）：卡片要显示**打码**的
+    //    API Key 并提供「编辑」入口（`modelscope.setApiKey`）。
+    //    ⚠️ **只下发打码串，绝不下发明文** —— 凭据经 RPC 明文下发等于把它
+    //    摊到客户端的 devtools / 日志 / 崩溃上报里（本仓库对凭据一贯的要求）。
+    //    ⚠️ 打码在**宿主**做完（`maskModelscopeKey`）而不是客户端：
+    //    两端各写一份打码必然漂移，且客户端那份一旦漏判形状就会回显原文。
+    if (provider === MODELSCOPE.id) {
+      const out: ProviderAccountStatus[] = []
+      for (const account of accounts) {
+        try {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) { out.push(account); continue }
+          const parsed = JSON.parse(resolved.value) as { access_token?: unknown }
+          const masked = typeof parsed.access_token === 'string'
+            ? maskModelscopeKey(parsed.access_token)
+            : ''
+          out.push({ ...account, ...(masked === '' ? {} : { modelscopeKeyMask: masked }) })
+        } catch {
+          // 凭据损坏/未配置：保留原条目（卡片的「积分」栏会自行报错说明）。
+          out.push(account)
+        }
+      }
+      return out
+    }
+    return [...accounts]
+  }
+
+  /** ZCode 专有的身份补全（自 `enrichAccountIdentity` 原样搬出，见其文档）。 */
+  async function enrichZcodeIdentity(accounts: readonly ProviderAccountStatus[]): Promise<ProviderAccountStatus[]> {
     const out: ProviderAccountStatus[] = []
     for (const account of accounts) {
       try {

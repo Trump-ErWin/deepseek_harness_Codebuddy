@@ -122,6 +122,25 @@ export function modelscopeIdentityOf(credential: ModelscopeCredential | undefine
 }
 
 /**
+ * 把 API Key 打码成 `ms-…尾 4 位`（UI 一律用它，**绝不**展示明文）。
+ *
+ * ## ⚠️ 为什么取**尾 4** 位
+ *
+ * 与 `modelscopeSlotNamesOf`（账号 id 由**尾 8 位**派生）同一口径 ⇒ 用户在
+ * 「账号 id」「凭据 ref」「卡片上的打码」三处看到的是同一段指纹，能互相核对。
+ *
+ * ⚠️ 形状不合法的**返回空串**而不是回显原文 —— 打码函数绝不能成为「把任意
+ * 输入原样显示」的通道（否则用户粘贴了一段错误文本时会被整串上屏）。
+ */
+export function maskModelscopeKey(key: string | undefined | null): string {
+  if (typeof key !== 'string') return ''
+  const trimmed = key.trim()
+  // ⚠️ 与 `KEY_PATTERN`（modelscope-rpc.ts）同款形状：前缀 + 至少 16 位。
+  if (!/^ms-[A-Za-z0-9_-]{16,}$/.test(trimmed)) return ''
+  return `${trimmed.slice(0, 3)}…${trimmed.slice(-4)}`
+}
+
+/**
  * 构造发往魔搭的请求头。
  *
  * 逐字对齐旧 fork `src/proxy/remote-upstream.ts:234-241`：

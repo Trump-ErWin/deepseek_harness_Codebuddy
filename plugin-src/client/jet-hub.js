@@ -18,7 +18,7 @@ import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js'
 //    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
 //    ⚠️ 本 import 此前**不存在** ⇒ `modelscope-key-modal.js` 整份 140 行从未进 bundle，
 //    面板点「添加账号」无任何反应入口（症状零日志）。
-import { ModelscopeKeyModal } from './modelscope-key-modal.js';
+import { ModelscopeKeyModal, ModelscopeKeyEditModal } from './modelscope-key-modal.js';
 import {
   formatExpirySplitLine,
   formatNamedPoolLine,
@@ -625,7 +625,9 @@ function isAnonymousAccountId(accountId) {
 function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onTest, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
   // ⚠️ opencode 专属：传了才渲染「代理」「指纹」两个按钮（见按钮区注释）。
   // 前者额外需要 current 代理串，故签名与 onRetest 略有不同。
-  onOpenProxy, onRotateFingerprint }) {
+  // ⚠️ **本 fork 独有**：modelscope 的「令牌」按钮同理（传了才渲染），
+  // 第二参是宿主算好的**打码**串。
+  onOpenProxy, onRotateFingerprint, onEditModelscopeKey }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -885,6 +887,23 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
             disabled: busy,
             onClick: () => onRotateFingerprint(account.id),
           }, '指纹')
+        : null,
+      // ⚠️ **本 fork 独有**（魔搭，2026-10-17）：编辑访问令牌。
+      //    账号 id 与 credentialRef 都由 Key 尾段派生 ⇒ 换 Key 等于换一条账号，
+      //    没有这个入口时用户只能删除重建（会丢昵称与停用状态）。
+      //    ⚠️ 同样用 **props 存在性**开关（与上面 opencode 代理/指纹同款），
+      //    而非 `provider === 'modelscope'` 硬判断。
+      //    ⚠️ tooltip 里给的是**宿主算好的打码串**（`modelscopeKeyMask`）——
+      //    客户端不自己打码，避免与 `maskModelscopeKey` 两份实现漂移。
+      onEditModelscopeKey
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: account.modelscopeKeyMask
+              ? '访问令牌：' + account.modelscopeKeyMask + '（点击修改）'
+              : '设置该账号的访问令牌（ms-…）',
+            disabled: busy,
+            onClick: () => onEditModelscopeKey(account.id, account.modelscopeKeyMask || ''),
+          }, '令牌')
         : null,
       React.createElement('button', {
         className: 'dim-jh-btn',
@@ -2637,11 +2656,21 @@ function ProviderPanel({ provider, rpcCall }) {
    * 共用一个 state 会让开代理弹窗把登录链接顶掉（表现为链接凭空消失）。
    */
   const [proxyModal, setProxyModal] = React.useState(null);
+  // ⚠️ **本 fork 独有**（modelscope，2026-10-17）：「编辑访问令牌」弹窗状态
+  // { accountId, currentMasked, error } 或 null。
+  // ⚠️ **独立于** `keyModal`（添加账号用）：两者语义不同（新增 vs 替换），
+  // 共用一个 state 会互相顶掉（同 `proxyModal` 与 `loginUrlForManual` 的教训）。
+  // ⚠️ 同样**不放明文 Key 进 state**（ref + DOM 读值），理由见下方 keyModal 注释。
+  const [keyEditModal, setKeyEditModal] = React.useState(null);
   // 「添加 opencode 账号」弹窗：null（关闭）或 { error }。
   // ⚠️ 输入框内容**不放 state**（用 ref + DOM 读值）：API key 是凭据，
   // 进 state 会随每次重渲染经过整棵组件树，也会被 devtools 组件树检查器读到。
   const [keyModal, setKeyModal] = React.useState(null);
   const keyInputRef = React.useRef(null);
+  // ⚠️ **本 fork 独有**（modelscope 编辑令牌）：**独立** ref ——
+  // 与添加弹窗共用一个的话，打开编辑弹窗时若添加弹窗还挂着（理论上互斥，
+  // 但 ref 是 DOM 级的），两个 input 会指向同一个节点。
+  const keyEditInputRef = React.useRef(null);
 
   /**
    * 拖拽排序状态：正在拖的账号 id 与当前悬停的目标账号 id。
@@ -3291,6 +3320,37 @@ function ProviderPanel({ provider, rpcCall }) {
     // 空串 = 没填就点确认：静默关弹窗，不报错（与 opencode 同款，不制造无谓报错）。
     if (key === '') return;
     await submitOpencodeEntry('modelscope.addAccount', { apiKey: key });
+  };
+
+  /**
+   * 提交「编辑访问令牌」（**本 fork 独有**，2026-10-17）。
+   *
+   * ⚠️ **刻意不复用 {@link submitOpencodeEntry}**：它的收尾是「关弹窗 + 刷新 +
+   * `existed` 提示」，而这里多一格 —— 宿主可能在换 Key 时**换了账号 id**
+   * （id 由 Key 尾段派生），必须据此明确告诉用户「这条账号的标识变了」，
+   * 否则用户会以为账号凭空消失。
+   */
+  const submitModelscopeKeyEdit = async (rawKey) => {
+    const key = String(rawKey == null ? '' : rawKey).trim();
+    if (key === '') return;
+    const accountId = keyEditModal?.accountId;
+    if (!accountId) return;
+    setCreating(true);
+    try {
+      const res = await rpcCall('modelscope.setApiKey', { accountId, apiKey: key });
+      setKeyEditModal(null);
+      await loadAccounts();
+      // ⚠️ `renamed` = 账号 id 变了（宿主已把旧条目移除、新条目建好）。
+      //    提示里**不**显示明文 Key，只说变了 —— 与卡片上的打码口径一致。
+      setProbeNotice(res?.renamed
+        ? '已更新访问令牌。该账号的标识随 Key 尾段一并更新（昵称与停用状态已保留）。'
+        : '已更新访问令牌。');
+    } catch (caught) {
+      // ⚠️ 错误留在弹窗内（同 submitOpencodeEntry 的理由）。
+      setKeyEditModal((prev) => (prev ? { ...prev, error: caught?.message ? caught.message : '未知错误' } : prev));
+    } finally {
+      setCreating(false);
+    }
   };
 
   /** 两个添加入口的公共收尾（成功关弹窗并刷新；失败把错误留在弹窗里）。 */
@@ -4163,6 +4223,15 @@ function ProviderPanel({ provider, rpcCall }) {
                       onRotateFingerprint: (id) => void rotateFingerprint(id),
                     }
                   : {}),
+                // ⚠️ **本 fork 独有**（modelscope，2026-10-17）：编辑访问令牌。
+                // 同样只在该 provider 下传，靠「props 存在性」决定是否渲染按钮。
+                ...(provider === 'modelscope'
+                  ? {
+                      onEditModelscopeKey: (id, masked) => setKeyEditModal({
+                        accountId: id, currentMasked: masked,
+                      }),
+                    }
+                  : {}),
                 // 新手任务（仅 Loomy）：一次性 10000 分，每号只能领一次。
                 // 与「一键领取积分」（每日签到）是**不同**的操作，故独立按钮。
                 onClaimOnboarding: canClaimOnboarding
@@ -4234,6 +4303,19 @@ function ProviderPanel({ provider, rpcCall }) {
           inputRef: keyInputRef,
           onSubmit: (value) => void submitModelscopeKey(value),
           onClose: () => setKeyModal(null),
+        })
+      : null,
+    // ⚠️ **本 fork 独有**（魔搭）：「编辑访问令牌」弹窗（独立 state + 独立 ref）。
+    // ⚠️ 必须用 `React.createElement` 而非直接调用组件函数：直接调用会把组件的
+    // hook 算进 ProviderPanel（该文件头记录过 hook #310 事故，整个设置页白屏）。
+    keyEditModal
+      ? React.createElement(ModelscopeKeyEditModal, {
+          error: keyEditModal.error || '',
+          busy: creating,
+          currentMasked: keyEditModal.currentMasked || '',
+          inputRef: keyEditInputRef,
+          onSubmit: (value) => void submitModelscopeKeyEdit(value),
+          onClose: () => setKeyEditModal(null),
         })
       : null));
 }

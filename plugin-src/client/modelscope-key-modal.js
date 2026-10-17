@@ -138,3 +138,100 @@ export function ModelscopeKeyModal({ error, busy, inputRef, onSubmit, onClose })
     ),
   )
 }
+
+/**
+ * 「编辑 ModelScope 账号的 API Key」弹窗（2026-10-17 新增）。
+ *
+ * ## 为什么需要它（不能靠「删除后重建」）
+ *
+ * 账号 id 与 credentialRef 都由 **Key 尾段派生**（`modelscopeSlotNamesOf`）
+ * ⇒ 换一把 Key 就等于**换一条账号**。若没有这个弹窗，用户填错 Key 或想换
+ * 令牌时只能删掉重建，**会丢失昵称与停用状态**。
+ *
+ * ⚠️ 也正因如此，本弹窗**必须提示**「Key 变了账号标识也会变」—— 否则用户
+ * 改完发现账号「不见了」，会以为数据丢了（本仓库记过多起同型报障）。
+ *
+ * ## ⚠️ 与上面「添加」弹窗**刻意不合并**
+ *
+ * 两者动作语义不同（新增 vs 替换）、按钮文案不同、成功后的处理也不同
+ * （替换可能要刷新面板）。合并就要在内部按 mode 分支——而这正是本文件
+ * 模块头反对的「同一个组件里按 provider/模式分支，容易只改一处」。
+ *
+ * ## ⚠️ 明文 Key 绝不整串上屏
+ *
+ * 输入框 `type: 'password'`；卡片上只显示**宿主算好的打码串**
+ * （`ms-…62f3`）—— ⚠️ 客户端**不自己**打码，避免与宿主两份实现漂移。
+ *
+ * @param props `{ error, busy, currentMasked, inputRef, onSubmit(value), onClose }`
+ */
+export function ModelscopeKeyEditModal({ error, busy, currentMasked, inputRef, onSubmit, onClose }) {
+  const submit = () => {
+    const value = inputRef && inputRef.current ? inputRef.current.value : ''
+    // 空串 = 没填就点确认：静默关弹窗，不报错（不制造无谓的失败提示）。
+    if (String(value).trim() === '') {
+      if (onClose) onClose()
+      return
+    }
+    onSubmit(value)
+  }
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    onClick: (e) => { if (e.target === e.currentTarget && !busy && onClose) onClose() },
+  },
+    React.createElement('div', {
+      className: 'dim-jh-modal',
+      role: 'dialog',
+      'aria-modal': 'true',
+      style: { maxWidth: '520px' },
+    },
+      React.createElement('div', { className: 'dim-jh-modalHead' },
+        React.createElement('div', { className: 'dim-jh-modalTitle' }, '编辑 API Key'),
+      ),
+      React.createElement('div', { className: 'dim-jh-modalBody' },
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '在 ' + TOKEN_URL + ' 生成访问令牌（形如 ms-…）后粘贴到下方。'
+          + (currentMasked ? '当前：' + currentMasked : '当前：尚未设置')),
+        React.createElement('div', { className: 'dim-jh-formRows' },
+          React.createElement('input', {
+            ref: inputRef,
+            className: 'dim-jh-input',
+            // ⚠️ password 类型：API Key 是凭据，不该在屏幕上裸显。
+            type: 'password',
+            placeholder: 'ms-…',
+            autoFocus: true,
+            disabled: !!busy,
+            // Enter 直接提交：粘贴 Key 后最自然的动作就是回车。
+            onKeyDown: (e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                submit()
+              }
+            },
+          }),
+        ),
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '注意：换一把 Key 会同时更换该账号的标识（它由 Key 尾段派生），'
+          + '昵称与停用状态会保留。同一把 Key 只对应一个账号。'),
+        // ⚠️ 错误留在弹窗内：把账号列表切成错误态会让用户刚填的 Key
+        // 与错误信息一起消失，只能刷新重试。
+        error
+          ? React.createElement('p', { className: 'dim-jh-error', role: 'alert' }, '保存失败：' + error)
+          : null,
+      ),
+      React.createElement('div', { className: 'dim-jh-modalActions' },
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn dim-jh-btnPrimary',
+          disabled: !!busy,
+          onClick: submit,
+        }, busy ? '保存中…' : '保存'),
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn',
+          disabled: !!busy,
+          onClick: () => { if (onClose) onClose() },
+        }, '取消'),
+      ),
+    ),
+  )
+}
