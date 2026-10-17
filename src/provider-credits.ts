@@ -70,6 +70,7 @@ import {
 } from './minimax-credits.js'
 import { fetchRaccoonCreditBalance } from './raccoon-credits.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
+import { fetchAutoclawBalanceDetailed, claimAutoclawDailyQuota } from './autoclaw-credits.js'
 import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
 import { fetchZcodeBalance, type ZcodeBalanceResult } from './zcode-upstream.js'
@@ -85,6 +86,7 @@ import {
 import type { ProviderCredits } from './provider-runtime.js'
 import type { CodeArtsCredential, RpcCreditsBalanceExtra } from './types.js'
 import type { AccioCredential } from './accio.js'
+import type { AutoclawCredential } from './autoclaw.js'
 import type { ClineCredential } from './cline.js'
 import type { GeminiCredential } from './gemini.js'
 import type { LobsteraiCredential } from './lobsterai.js'
@@ -396,6 +398,13 @@ export function createProviderCredits(
      *    客户端按能力矩阵（`dailyCheckin: false`）根本不会渲染「一键领取积分」，
      *    与 raccoon 同形。给它一句文案反而会让面板多出一个永远点不动的入口。
      */
+    autoclaw: {
+      fetchBalanceDetailed: async (credential) =>
+        await fetchAutoclawBalanceDetailed(credential as AutoclawCredential),
+      claim: async (credential) =>
+        await claimAutoclawDailyQuota(credential as AutoclawCredential),
+      precheckStatus: false,
+    },
     accio: {
       fetchBalanceDetailed: async (credential) =>
         await fetchAccioBalanceDetailed(credential as AccioCredential),

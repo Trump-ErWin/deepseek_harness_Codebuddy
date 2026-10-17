@@ -71,6 +71,9 @@ import type * as OfficeAceAuthModule from './officeace-auth.js'
 /** 以模块命名空间为类型（`startLogin` / `pollLoginCode` / `fetchSubscriptionSummary` 等纯函数）。 */
 type OfficeAceAuth = typeof OfficeAceAuthModule
 import type { AccioAuth } from './accio-auth.js'
+import type { AutoclawAuth } from './autoclaw-auth.js'
+import { AUTOCLAW } from './autoclaw-product.js'
+import { parseAutoclawCredential, isAutoclawRefreshable, autoclawDisplayNickname } from './autoclaw.js'
 import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
 import { ACCIO } from './accio-product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -1277,6 +1280,7 @@ export interface JetHubAuths {
    */
   readonly officeace: OfficeAceAuth
   readonly accio: AccioAuth
+  readonly autoclaw: AutoclawAuth
 }
 
 /**
@@ -1841,10 +1845,10 @@ function registerJetHubEndpoints(
   const {
     codearts, buddy, workbuddy, lobsterai, qoder,
     qodercn: qoderCn,
-    trae, cline, loomy, raccoon, minimax,
+trae, cline, loomy, raccoon, minimax,
     // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
     minimaxintl,
-    zcode, gemini, accio,
+    zcode, gemini, accio, autoclaw,
   } = auths
   /**
    * 积分能力表。
@@ -2022,6 +2026,7 @@ function registerJetHubEndpoints(
     // 池内 `expiresAt` 确实会被写 ⇒ 不属 loomy / zcode 那类豁免。
     // 漏登记的后果是「凭据明明能续，面板却报未登录」（2026-10-12 复审发现）。
     ACCIO.id,
+    AUTOCLAW.id,
   ])
 
   /**
@@ -4064,6 +4069,62 @@ function registerJetHubEndpoints(
             ok: true,
             value: { accountId: id, loginUrl: started.authorizeUrl, incognitoOpened },
           }
+        } else if (provider === AUTOCLAW.id) {
+          const id = `autoclaw-${shortId()}`
+          const refName = `AUTOCLAW_ACCOUNT_${shortId().toUpperCase()}`
+          const autoclawMode = (payload as { autoclawMode?: string })?.autoclawMode
+
+          // 1. 如果用户显式选择“一键导入本机桌面端凭据”（autoclawMode === 'local'）：
+          if (autoclawMode === 'local') {
+            const localCred = await autoclaw.probeLocal()
+            if (!localCred) {
+              return { ok: false, error: '未检测到本地 AutoClaw 桌面端有效登录凭据，请先在 AutoClaw 中登录' }
+            }
+            try {
+              await autoclaw.importLocalAccount(pool, { accountId: id, refName })
+              return { ok: true, value: { accountId: id } }
+            } catch (err) {
+              const reason = err instanceof Error ? err.message : String(err)
+              return { ok: false, error: reason }
+            }
+          }
+
+          // 2. 其它情况（用户选择手机验证码登录，或弹窗页自由选择）：
+          // 登记占位条目
+          await pool.addAccount({
+            id,
+            provider: AUTOCLAW.id,
+            nickname: 'AutoClaw (登录中...)',
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let started
+          try {
+            started = await autoclaw.startLogin({ refName })
+          } catch (error) {
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 AutoClaw 登录服务：${reason}`)
+          }
+
+          started.result.then(async ({ credential }) => {
+            const ref = credentialRef(refName)
+            await ctx.credentials.set(ref, JSON.stringify(credential))
+            const nickname = autoclawDisplayNickname(credential, id)
+            await pool.updateAccount(id, {
+              nickname,
+              expiresAt: credential.expires_at,
+              refreshable: isAutoclawRefreshable(credential),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${AUTOCLAW.id} login failed for ${id}: ${String(error)}`)
+            void failLogin(id, error)
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else if (provider === ACCIO.id) {
           /**
            * Accio（阿里）走**浏览器回调式 OAuth 2.0 + PKCE**（本地
@@ -4380,12 +4441,20 @@ function registerJetHubEndpoints(
        */
       case 'login.sendSms': {
         const req = payload as RpcSendSmsRequest
-        if (req.provider !== LOOMY.id) {
+        if (req.provider !== LOOMY.id && req.provider !== AUTOCLAW.id) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const phone = typeof req.phone === 'string' ? req.phone.trim() : ''
         if (!/^1[3-9]\d{9}$/.test(phone)) {
           return { ok: false, error: { code: 'bad-request', message: '需要 11 位有效手机号（phone）' } }
+        }
+        if (req.provider === AUTOCLAW.id) {
+          const sendRes = await autoclaw.sendVerificationCode(phone)
+          if (!sendRes.ok) {
+            return { ok: false, error: { code: 'send-failed', message: sendRes.error ?? '验证码发送失败' } }
+          }
+          pendingSmsMsgid.set(req.accountId, { phone, msgid: 'autoclaw-sms' })
+          return { ok: true, value: { msgid: 'autoclaw-sms' } satisfies RpcSendSmsResponse }
         }
         const msgid = await loomy.sendSmsCode(phone)
         // 暂存在内存，供 submitSms 取用（一次性中间态，不写凭据存储）。
@@ -4400,7 +4469,7 @@ function registerJetHubEndpoints(
        */
       case 'login.submitSms': {
         const req = payload as RpcSubmitSmsRequest
-        if (req.provider !== LOOMY.id) {
+        if (req.provider !== LOOMY.id && req.provider !== AUTOCLAW.id) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const pending = pendingSmsMsgid.get(req.accountId)
@@ -4415,6 +4484,35 @@ function registerJetHubEndpoints(
           return {
             ok: true,
             value: { done: false, error: '账号不存在（可能已被删除）' } satisfies RpcSubmitSmsResponse,
+          }
+        }
+        if (req.provider === AUTOCLAW.id) {
+          try {
+            const loginRes = await autoclaw.loginWithCode(pending.phone, req.code, account.credentialRef)
+            if (!loginRes.ok || !loginRes.credential) {
+              return {
+                ok: true,
+                value: { done: false, error: loginRes.error ?? 'AutoClaw 验证码登录失败' } satisfies RpcSubmitSmsResponse,
+              }
+            }
+            const cred = loginRes.credential
+            const nickname = autoclawDisplayNickname(cred, req.accountId)
+
+            await pool.updateAccount(req.accountId, {
+              nickname,
+              expiresAt: cred.expires_at,
+              refreshable: isAutoclawRefreshable(cred),
+            })
+            pendingSmsMsgid.delete(req.accountId)
+            return { ok: true, value: { done: true } satisfies RpcSubmitSmsResponse }
+          } catch (error) {
+            return {
+              ok: true,
+              value: {
+                done: false,
+                error: error instanceof Error ? error.message : String(error),
+              } satisfies RpcSubmitSmsResponse,
+            }
           }
         }
         try {

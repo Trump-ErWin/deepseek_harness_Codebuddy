@@ -63,6 +63,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { createModelCatalog, type CatalogEntry } from '../../src/model-catalog.js'
 import { BuddyAdapter } from '../../src/buddy-adapter.js'
 import { AccioAdapter } from '../../src/accio-adapter.js'
+import { AutoclawAdapter } from '../../src/autoclaw-adapter.js'
 import { ClineAdapter } from '../../src/cline-adapter.js'
 import { CodeArtsAdapter } from '../../src/llm-adapter.js'
 import { GeminiAdapter } from '../../src/gemini-adapter.js'
@@ -600,6 +601,19 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
       } as never),
     },
     {
+      id: 'autoclaw',
+      // ⚠️ autoclaw 的目录来自编译期兜底表（`AUTOCLAW.fallbackModels`），不发网络；
+      //    但 `listModels` 有「凭据可读」门控，未就绪返回 `[]`。
+      //    这里注入一个**恒有凭据**的 provider 让它真正列出目录（否则本段对它
+      //    退化成恒真 = FALSE COVERAGE）。探测失败被适配器内部 try/catch 吞掉，
+      //    不阻断兜底目录 ⇒ 无需注入 `fetchImpl`。
+      make: () => new AutoclawAdapter({
+        credentialProvider: async () => ({
+          access_token: 'at', refresh_token: 'rt', expires_at: 4102444800000,
+        }),
+      } as never),
+    },
+    {
       id: 'opencode',
       make: () => new OpencodeAdapter({
         ...NO_CRED,
@@ -653,14 +667,15 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
 
   it('⚠️ 表的家数 == 全部对外注册的 LLM provider（漏一家 ⇒ 它不过本段任何断言）', async () => {
     // ⚠️ 判据来自 **PROVIDER_REGISTRY**（唯一的 provider 真源），不手抄。
-    //    实测：`channel: true` 的 17 家正好是上面 17 家（`aggregate` 是
+    //    实测：`channel: true` 的 18 家正好是上面 18 家（`aggregate` 是
     //    `channel: false` 的聚合器，不在此列）。
     //    ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 14 → 16。
     //    ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：16 → 17。
+    //    ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：17 → 18。
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    expect(CASES).toHaveLength(17)
+    expect(CASES).toHaveLength(18)
   })
 
   /**

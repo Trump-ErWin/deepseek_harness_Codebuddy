@@ -51,7 +51,7 @@
  * 路径**——那是**降级**（少一次确认）而非**破坏**（错误的参数根本不会被发出去，
  * 见 `buildCreateAccountPayload`），失败方向是安全的。
  */
-const PROVIDERS_ASKING_OPTIONS = Object.freeze(['zcode', 'accio']);
+const PROVIDERS_ASKING_OPTIONS = Object.freeze(['zcode', 'accio', 'autoclaw']);
 
 /**
  * 该 provider 的「新建账号」是否**需要先问一句**（即是否弹预选窗）。
@@ -99,9 +99,10 @@ export function newAccountAsksChannel(provider) {
  * @param {string} [accioRegion] 弹窗里选的 Accio 登录区域（`'cn'` / `'global'`）
  * @returns {{ provider: string, zcodeProvider?: string, accioRegion?: string }}
  */
-export function buildCreateAccountPayload(provider, zcodeProvider, accioRegion) {
+export function buildCreateAccountPayload(provider, zcodeProvider, accioRegion, autoclawMode) {
   // 排除法：先把「载荷里没有任何专属字段」的 provider 早退掉（方向与白名单相反）。
-  if (provider !== 'zcode' && provider !== 'accio') return { provider };
+  if (provider !== 'zcode' && provider !== 'accio' && provider !== 'autoclaw') return { provider };
   if (provider === 'zcode') return { provider, zcodeProvider };
-  return { provider, accioRegion };
+  if (provider === 'accio') return { provider, accioRegion };
+  return { provider, autoclawMode: autoclawMode ?? 'local' };
 }

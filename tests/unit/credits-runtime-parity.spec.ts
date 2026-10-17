@@ -494,6 +494,7 @@ const BALANCE_PATH_OF: Readonly<Record<string, string>> = {
   // ⚠️ accio 的**必需**端点是 currentSubscription（三类积分桶）；
   //    quota 与 userinfo 都是可容忍的补充（失败不影响余额）。
   accio: ACCIO_SUBSCRIPTION_PATH,
+  autoclaw: '/agent-assetmgr/api/v2/wallets',
 }
 
 /**
@@ -572,7 +573,7 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     ).toEqual(expected)
     // 反向：确认上面那圈里真的既有 true 也有特例，否则断言可能恒真。
     expect(PROVIDER_REGISTRY.some((d) => d.credits.balance !== true)).toBe(true)
-    expect(expected.length).toBe(13)
+    expect(expected.length).toBe(14)
     // ⚠️ **关键集合判据必须对「生产真正调用的那种形态」也成立**（2026-10-08 复审 C1）：
     //    上面那次是 `createProviderCredits()`（无 deps），而端点与 `index.ts` 调的
     //    都是 `createProviderCredits({ loomy, raccoon, zcode })`。deps 只应影响**实现**，

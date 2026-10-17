@@ -284,7 +284,7 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     // - gemini / officeace：限流由服务端配额管理，本地标记清掉 / 重测通过
     //   都恢复不了配额；
     // - loomy：根本不返回限流错误。
-    expect(disabled).toEqual(['accio', 'gemini', 'loomy', 'officeace'])
+    expect(disabled).toEqual(['accio', 'autoclaw', 'gemini', 'loomy', 'officeace'])
   })
 
   it('客户端源码里按钮仍走 supportsRateLimit 门控（不是在本文件另写白名单）', () => {

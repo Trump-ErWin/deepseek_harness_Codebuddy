@@ -93,13 +93,14 @@ class FakeCredentials {
   async unset(ref: string) { this.store.delete(ref) }
 }
 
-/** 13 个 auth 键的**空桩**（本文件只走 credits / onboarding 端点）。 */
+/** 17 个 auth 键的**空桩**（本文件只走 credits / onboarding 端点）。 */
 function emptyAuths(): Record<string, unknown> {
   const stub = {} as never
   return {
     codearts: stub, buddy: stub, workbuddy: stub, lobsterai: stub,
     qoder: stub, qodercn: stub, trae: stub, cline: stub, loomy: stub,
     raccoon: stub, minimax: stub, minimaxintl: stub, zcode: stub, gemini: stub,
+    officeace: stub, accio: stub, autoclaw: stub,
   }
 }
 
@@ -230,7 +231,8 @@ describe('签到能力：registry 声明与 runtime 实现必须一致', () => {
     // ⚠️ 阈值 = 声明可签到的渠道数减去特例数。写死它是有意的：
     //    若有人删掉表里某家的 `claim`，这里会**先**红（而不是让循环少转一圈）。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，声明可签到）⇒ 6 → 7。
-    expect(checked.length, '没有任何渠道被检查 = 本用例什么都没守').toBe(7)
+    // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱，声明可签到）⇒ 7 → 8。
+    expect(checked.length, '没有任何渠道被检查 = 本用例什么都没守').toBe(8)
   })
 
   /**
@@ -434,6 +436,8 @@ describe('★ credits.afterClaim：只有 buddy 提供（成长中心，漏了�
       'loomy', 'raccoon', 'minimax', 'zcode', 'gemini', 'codearts',
       // ⚠️ minimaxintl 同样**没有** afterClaim（成长中心只有 buddy 提供）。
       'minimaxintl',
+      // ⚠️ autoclaw 同样**没有** afterClaim（成长中心只有 buddy 提供）。
+      'autoclaw',
     ]) {
       expect(runtimeOf(id)?.credits?.afterClaim, `${id} 不该有 afterClaim`).toBeUndefined()
     }
