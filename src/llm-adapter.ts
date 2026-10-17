@@ -2372,6 +2372,28 @@ export function isModelSaturationError(status: number | undefined, body: string)
     const code = (JSON.parse(body) as Record<string, unknown>).code
     if (code === MODEL_SATURATION_BUSINESS_CODE
       || code === String(MODEL_SATURATION_BUSINESS_CODE)) return true
+    // ⚠️⚠️ **结构化降级：报文自带「额度限流」业务码时，一律不判模型饱和**
+    // （2026-10-17 对抗审计实测的真缺陷）。
+    //
+    // 本函数的**码值腿是权威的**，文案腿只是「上游可能改用别的码值」的兜底；
+    // 因此当报文**明确给出了另一个已知业务码**时，那才是权威信号。
+    //
+    // 实测（buddy 额度限流）：`{"code":6004,"msg":"请求量饱和，请稍后再试"}`
+    // → `MODEL_SATURATION_PATTERN` 的「请求量饱和」命中 ⇒ 判成**模型级**饱和。
+    // 后果不是措辞问题，而是**行为分叉**（见上表）：
+    // | | 额度限流 6004 | 误判成模型饱和 |
+    // |---|---|---|
+    // | 换号 | 有效 | 退化成「原账号退避重试」 |
+    // | 写限流标记 | 必须 | **绝对不许** |
+    // ⇒ 一个**额度已耗尽**的账号会被判成「换账号无效、换模型吧」，
+    // 而池里其它账号的额度是独立的、可用。
+    //
+    // ⚠️ 为什么要**降级而不是直接 return false**：6004 之外的码还可能是别的语义
+    // （上游新码 / 未知码），此时文案兜底仍有价值。故只在**已知对立法**（额度限流）
+    // 成立时降级，未知码仍走文案腿。
+    if (code === RATE_LIMIT_BUSINESS_CODE || code === String(RATE_LIMIT_BUSINESS_CODE)) {
+      return false
+    }
   } catch {
     // 非 JSON：交给文案兜底。
   }
