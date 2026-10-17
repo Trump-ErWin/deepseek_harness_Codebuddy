@@ -78,6 +78,9 @@ import type { LobsteraiCredential } from './lobsterai.js'
 import type { TraeCredential } from './trae.js'
 import type { ZcodeCredential } from './zcode.js'
 import type { ProviderRuntime } from './provider-runtime.js'
+// ⚠️ 只导入**类型**（`CreditBalance` 是取数原语的返回形状）：本表只是「选哪个原语」，
+//    不解释余额内容（那个判据在 `aggregate-expiry.ts` 的各家原语里）。
+import type { CreditBalance } from './credits.js'
 
 /** 一个渠道的临期折算实现（`ProviderRuntime.expiry` 的非空形态）。 */
 export type ProviderExpiry = NonNullable<ProviderRuntime['expiry']>
@@ -87,9 +90,21 @@ export type ProviderExpiry = NonNullable<ProviderRuntime['expiry']>
  *
  * ⚠️ 单独抽出来是为了让下面两条一眼看出「它们只差一个 product」——
  * 若将来有人给其中一家写一份自己的判据，那正是「同族分叉」的开始。
+ *
+ * ⚠️ `context.cachedBalance` 原样透给原语（2026-10-15，规格 §5.7）：
+ * 那样「吃共享读数」这条能力**只在这一处**声明，四家自动一致
+ *（各写一遍必然有一家漏掉 ⇒ 静默多发一次上游请求）。
  */
 function buddyFamilyExpiry(product: BuddyProduct): ProviderExpiry {
-  return { credentialExpiry: (c) => buddyExpiry(product, c as BuddyCredential) }
+  return {
+    credentialExpiry: (c, context) => buddyExpiry(
+      product,
+      c as BuddyCredential,
+      context?.cachedBalance === undefined
+        ? undefined
+        : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+    ),
+  }
 }
 
 /**
@@ -106,8 +121,24 @@ export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>>
     loomy: { credentialExpiry: (c) => loomyExpiry(c as LoomyCredential) },
     codearts: { credentialExpiry: (c) => codeArtsExpiry(c as CodeArtsCredential) },
     zcode: { credentialExpiry: (c, context) => zcodeExpiry(c as ZcodeCredential, context) },
-    lobsterai: { credentialExpiry: (c) => lobsteraiExpiry(c as LobsteraiCredential, LOBSTERAI) },
-    trae: { credentialExpiry: (c) => traeExpiry(c as TraeCredential, TRAE) },
+    lobsterai: {
+      credentialExpiry: (c, context) => lobsteraiExpiry(
+        c as LobsteraiCredential,
+        LOBSTERAI,
+        context?.cachedBalance === undefined
+          ? undefined
+          : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      ),
+    },
+    trae: {
+      credentialExpiry: (c, context) => traeExpiry(
+        c as TraeCredential,
+        TRAE,
+        context?.cachedBalance === undefined
+          ? undefined
+          : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      ),
+    },
     // ⚠️ accio：与 loomy **同形**（命名池、无逐包时间戳）⇒ 单独一条原语。
     //    加它时必须**同时**进 `WIRED_EXPIRY_PROVIDERS`（`expiry-runtime-parity.spec.ts`
     //    真跑 `apply()` 锁这两者一致；只改一处会红）。

@@ -1350,7 +1350,7 @@ describe('★ M23：只产出元数据帧（block-start / usage）时仍可切�
   })
 })
 
-describe('★ 审计轮次二：未接入临期折算的渠道，其虚拟模型不得被播报', () => {
+describe('★ 未接入临期折算的渠道：模型**仍然可见**（用户 2026-10-15 的诉求 IKL7F9）', () => {
   /** 造一个 ctx：listProviders 与 listModels 都按给定渠道表。 */
   const makeCtx = (catalogByProvider: Record<string, Array<{ id: string, name: string }>>) => ({
     logger: { warn: () => {}, info: () => {}, error: () => {} },
@@ -1366,21 +1366,102 @@ describe('★ 审计轮次二：未接入临期折算的渠道，其虚拟模型
     getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
   } as never
 
-  it('候选**全部**来自未接入渠道 ⇒ 该虚拟模型不出现在目录里', async () => {
-    // ⚠️ 真实缺陷（审计轮次二实测证伪）：初版会把 cline（未接入临期折算）的模型
-    //    也播报出来，用户选中后拿到的是
-    //    `MISSING_CREDENTIAL | 没有任何可用候选（渠道被关闭、模型被关、或所有渠道
-    //     都无可用账号）` —— 把「未接入」谎报成「你没登录」。
+  it('★★ 候选**全部**是「无临期且未打开」⇒ 模型**从选择器消失，但仍在聚合面板里**（2026-10-16）', async () => {
+    // ⚠️⚠️ **本用例的方向在 2026-10-16 第二次反转**（用户验收反馈）：
+    //    用户原话：「默认不参与轮换的无临期模型（**没有一个打开轮换**）则**不显示在
+    //    选择模型的列表中的聚合模型下属的列表中**」。
+    //
+    //    演进留档（三次）：
+    //     ① 2026-10-07：未接入渠道的独有模型**整条不播报**（当时理由是报错会谎报）；
+    //     ② 2026-10-15：改为**必须播报**（否则「手工打开」之后选择器里仍看不到它）；
+    //     ③ 2026-10-16（现行）：**一个都没打开时**不播报；**打开任意一条后**才播报。
+    //    ⇒ ③ 兼顾了 ① 的意图（不广告一个必然失败的模型）与 ② 的意图（打开后必须可见）。
+    //
+    // ⚠️⚠️ **恢复路径没有丢**（这正是与「候选全被拒」的区别）：
+    //    它**仍在聚合面板**里（`describeCatalog` 不受本过滤影响），
+    //    用户在那里展开、逐条打开后它就回到选择器。
     const adapter = new AggregateAdapter(
       makeCtx({ cline: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }] }),
       { accountPool: pool, expiryProbe: async () => 100 },
     )
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
-    // 只剩 auto（它不参与该过滤）
-    expect(models.map((m) => m.id)).toEqual(['auto'])
+    expect(models.map((m) => m.id), '★ 一个都没打开 ⇒ 不进选择器')
+      .toEqual(['auto'])
+    // ★ 但设置页的开关清单（`listAllModels`）**必须仍能看到它** —— 目录身份不随门控漂移
+    //   （`provider.status` 的 `total` 取自它，藏起来会让「整个 provider 已关闭」的
+    //   判据 `disabled === total` 抖动）。
+    expect(adapter.listAllModels().map((m) => m.id), '★ 目录身份必须稳定')
+      .toEqual(['auto', 'deepseek-v4-1-flash'])
+    // ★ 且聚合面板必须仍列出它（那是唯一的打开入口）。
+    const catalog = await adapter.describeCatalog()
+    expect(catalog.models.map((m) => m.canonicalId), '★ 面板必须仍能看到（打开入口）')
+      .toContain('deepseek-v4-1-flash')
   })
 
-  it('候选里**有任一**已接入渠道 ⇒ 该虚拟模型仍被播报', async () => {
+  it('★★ 打开任意一条未接入候选 ⇒ 该模型**回到**选择器（恢复路径可用）', async () => {
+    // ⚠️ 这条与上一条构成**一对**：只测「没打开时不显示」会让「打开后也不显示」
+    //    的缺陷全绿（那是本仓库反复出现的「只测一个方向」形态）。
+    const adapter = new AggregateAdapter(
+      makeCtx({ cline: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }] }),
+      {
+        accountPool: pool,
+        expiryProbe: async () => 100,
+        allowed: () => ({ 'deepseek-v4-1-flash': { cline: { 'cline-free/deepseek-v4.1-flash': true } } }),
+      },
+    )
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    expect(models.map((m) => m.id), '★ 打开后必须回到选择器')
+      .toEqual(['auto', 'deepseek-v4-1-flash'])
+  })
+
+  it('★★ 对照：**用户主动全部拒绝**的模型仍留在选择器里（成文不变式，不得被上一条误伤）', async () => {
+    // ⚠️⚠️ 这是本对改动**最重要的反向守卫**：判据必须是「所有候选都 `default-rejected`」，
+    //    **不是**「没有候选在轮换」。后者会把「用户主动全拒」的模型也藏掉 ——
+    //    而那条有成文不变式保护（`jet-hub-store.ts` 的「候选全被拒 ≠ 关闭模型」）：
+    //    模型留在选择器里 ⇒ 用户选中它拿到**如实**报错 ⇒ 回面板重新打开即恢复。
+    //    若藏起来，用户连「我拒过这个模型」都看不到了。
+    const adapter = new AggregateAdapter(
+      makeCtx({ buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }] }),
+      {
+        accountPool: pool,
+        expiryProbe: async () => 100,
+        rejections: () => ({ 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }),
+      },
+    )
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    expect(models.map((m) => m.id), '★ 主动全拒 ≠ 无临期全未打开：必须仍播报')
+      .toContain('deepseek-v4-1-flash')
+  })
+
+  it('★★ 把某模型的候选**全部**拒绝 ⇒ 模型**仍在**目录里（锁住「全拒 ≠ 关闭模型」的成文不变式）', async () => {
+    // ⚠️⚠️ 这条是**防后人加回过滤**的守卫：若有人把 `:636` 改回「至少一个候选当前参与」
+    //   （或按三态过滤），用户把某模型候选全拒后会**再也看不到它**，
+    //    连「在面板里重新打开」的机会都没有。
+    //
+    // 仓库里有**两处成文不变式**明文禁止该语义：
+    //  ① `jet-hub-store.ts` 的 `AggregateRejectionMap` 上方：「把某虚拟模型的候选
+    //     **全部**拒绝 ≠ 关闭该虚拟模型：前者它仍在目录里（只是无候选可用，请求时
+    //     如实报错），后者从目录消失」；
+    //  ② `aggregate-panel-logic.js` 的 `isAllCandidatesRejected`：「面板需对『候选全部
+    //     被拒』给出显式提示，避免用户以为模型坏了」。
+    const adapter = new AggregateAdapter(
+      makeCtx({ buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }] }),
+      {
+        accountPool: pool,
+        expiryProbe: async () => 100,
+        rejections: () => ({ 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }),
+      },
+    )
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    expect(models.map((m) => m.id), '全部被拒**不得**让模型从目录消失').toContain('deepseek-v4-1-flash')
+    // ⚠️ 同时确认三态判据真的把它判成「不参与」—— 否则上面那条断言会掩盖过滤失效。
+    const catalog = await adapter.describeCatalog()
+    const entry = catalog.models.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
+    expect(entry!.candidates[0]!.state, '显式拒绝 ⇒ rejected 态').toBe('rejected')
+    expect(entry!.candidates[0]!.rejected).toBe(true)
+  })
+
+  it('候选里有任一已接入渠道 ⇒ 该虚拟模型仍被播报，且两渠道都在候选表里', async () => {
     const adapter = new AggregateAdapter(
       makeCtx({
         buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
@@ -1390,14 +1471,42 @@ describe('★ 审计轮次二：未接入临期折算的渠道，其虚拟模型
     )
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     expect(models.some((m) => m.id === 'deepseek-v4-1-flash')).toBe(true)
-    // 该虚拟模型的候选仍包含两个渠道（播报与否只看「有没有已接入的」，
-    // 不影响候选表本身 —— 未接入的候选会在折算阶段被剔除）
     const virtual = (adapter as unknown as { catalog: Array<{ key: string, candidates: Array<{ provider: string }> }> })
       .catalog.find((v) => v.key === 'deepseek-v4-1-flash')
     expect(virtual?.candidates.map((c) => c.provider).sort()).toEqual(['buddy', 'cline'])
+    // ⚠️ 候选表里有 cline **不等于**它会参与轮换：默认态下它是 `default-rejected`。
+    const catalog = await adapter.describeCatalog()
+    const entry = catalog.models.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
+    const byProvider = Object.fromEntries(entry!.candidates.map((c) => [c.provider, c.state]))
+    expect(byProvider.buddy, '已接入 ⇒ 默认参与').toBe('allowed')
+    expect(byProvider.cline, '未接入 ⇒ 默认不参与').toBe('default-rejected')
   })
 
-  it('`auto` 始终在目录里（它不参与该过滤，池跨全部渠道）', async () => {
+  it('★ 手工打开未接入候选 ⇒ 它变成 allowed 且价格进入「最低」报价', async () => {
+    // ⚠️ 两个方向都要测：只测「默认不参与」时，把白名单接线整段删掉用例仍然全绿。
+    const adapter = new AggregateAdapter(
+      makeCtx({
+        buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
+        cline: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash · x0.01' }],
+      }),
+      {
+        accountPool: pool,
+        expiryProbe: async () => 100,
+        allowed: () => ({ 'deepseek-v4-1-flash': { cline: { 'cline-free/deepseek-v4.1-flash': true } } }),
+      },
+    )
+    const catalog = await adapter.describeCatalog()
+    const entry = catalog.models.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
+    const cline = entry!.candidates.find((c) => c.provider === 'cline')
+    expect(cline!.state).toBe('allowed')
+    expect(cline!.expiryWired, '客户端据此决定「关掉时写哪张表」').toBe(false)
+    // 手工打开后它的价格该算进「最低」—— 否则选择器会说谎（更便宜的候选被用上却没报）。
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    expect(models.find((m) => m.id === 'deepseek-v4-1-flash')!.name)
+      .toBe('DeepSeek V4.1 Flash · 最低 x0.01')
+  })
+
+  it('`auto` 始终在目录里（它不参与任何过滤，池跨全部渠道）', async () => {
     const adapter = new AggregateAdapter(
       makeCtx({ raccoon: [{ id: 'sn-glm-5-3', name: 'GLM-5-3 · x0.75' }] }),
       { accountPool: pool, expiryProbe: async () => 100 },
@@ -1406,9 +1515,24 @@ describe('★ 审计轮次二：未接入临期折算的渠道，其虚拟模型
     expect(models.some((m) => m.id === 'auto')).toBe(true)
     expect(adapter.listAllModels().some((m) => m.id === 'auto')).toBe(true)
   })
+
+  it('★ 手工顺序按当前候选过滤后下发（漂移的脏键不得变成幽灵条目）', async () => {
+    const adapter = new AggregateAdapter(
+      makeCtx({ buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }] }),
+      {
+        accountPool: pool,
+        expiryProbe: async () => 100,
+        order: () => ({ 'deepseek-v4-1-flash': ['buddy\u0000drifted-away', 'buddy\u0000deepseek-v4.1-flash'] }),
+        orderMode: () => 'manual',
+      },
+    )
+    const catalog = await adapter.describeCatalog()
+    expect(catalog.orderMode).toBe('manual')
+    expect(catalog.models[0]!.order, '只留仍然是候选的那个键').toEqual(['buddy\u0000deepseek-v4.1-flash'])
+  })
 })
 
-describe('★ 第 3 轮审计：报错文案不得把用户指向**不存在**的 UI', () => {
+describe('★ 报错文案：面板现在**真的存在**了，必须指向它并列出第 4 种原因', () => {
   const makeCtx = (models: Array<{ id: string, name: string }>) => ({
     logger: { warn: () => {}, info: () => {}, error: () => {} },
     llm: {
@@ -1423,21 +1547,27 @@ describe('★ 第 3 轮审计：报错文案不得把用户指向**不存在**�
     getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
   } as never
 
-  it('未知模型的报错不得提到「设置页的『聚合』面板」（该面板不存在）', async () => {
-    // ⚠️ 实测缺陷：客户端 PROVIDERS 里没有 `aggregate`（逐候选拒绝的子列表属 P2）
-    //    ⇒ 设置页**没有**聚合面板。初版文案却让用户去那里看完整清单，
-    //    用户按提示去找会找不到 —— 误导性指引。
+  /**
+   * ⚠️ 本节的方向在 2026-10-15 **反转**（原用例名：「报错文案不得把用户指向**不存在**的 UI」）。
+   *
+   * 原判据当时是对的：客户端 `PROVIDERS` 里没有 `aggregate` ⇒ 设置页**没有**聚合面板，
+   * 而初版文案却让用户去那里看 —— 误导性指引。
+   * 现在那个面板**已经存在**（`plugin-src/client/jet-hub.js` 的 `AggregatePanel`，
+   * `<h2>` 逐字是「聚合」）⇒ **指向它是正确的**，而**不**指向它才是缺陷
+   *（用户拿着「没有任何可用候选」却不知道去哪打开候选）。
+   *
+   * ⚠️ 但原用例的**内核**仍然要守：文案必须给出**真实可操作**的指引（不是空话），
+   *    且必须列出**全部**原因 —— 尤其新增的第 4 种「候选在聚合面板里未参与轮换」。
+   */
+  it('未知模型的报错给出可操作指引（模型选择器 / 直连）', async () => {
     const adapter = new AggregateAdapter(makeCtx([{ id: 'glm-5.3', name: 'GLM-5.3' }]), {
       accountPool: pool, expiryProbe: async () => 100,
     })
     await expect(adapter.resolveModel(AGGREGATE_PROVIDER, 'nope'))
       .rejects.toThrow(/模型选择器/)
-    await expect(adapter.resolveModel(AGGREGATE_PROVIDER, 'nope'))
-      .rejects.not.toThrow(/设置页/)
   })
 
-  it('无可用候选的报错不得提到「设置页的『聚合』面板」，且要给出可操作指引', async () => {
-    // ⚠️ 同一处缺陷的第二实例（`prepareCall` 的零候选分支）。
+  it('★★ 零候选的报错必须提到第 4 种原因「未参与轮换」，并指向真实存在的「聚合」面板', async () => {
     const adapter = new AggregateAdapter(makeCtx([{ id: 'glm-5.3', name: 'GLM-5.3' }]), {
       accountPool: pool,
       // 全部候选都 UNUSABLE ⇒ 零候选
@@ -1445,20 +1575,26 @@ describe('★ 第 3 轮审计：报错文案不得把用户指向**不存在**�
     })
     const err = await adapter.prepareCall(AGGREGATE_PROVIDER, 'glm-5-3').catch((e: Error) => e)
     expect(err).toBeInstanceOf(Error)
-    expect((err as Error).message).not.toMatch(/设置页/)
-    // 必须给出**真实可操作**的指引
-    expect((err as Error).message).toMatch(/模型选择器|直连/)
+    const message = (err as Error).message
+    // 第 4 种原因必须写明：未接入渠道的候选**默认不参与**是本功能新引入的零候选来源。
+    expect(message, '★ 必须提到「未参与轮换」这第 4 种原因').toMatch(/未参与轮换/)
+    // 面板真实存在（`AggregatePanel`，标题逐字「聚合」）⇒ 可以也应该指向它。
+    expect(message, '必须指向真实存在的设置页面板').toMatch(/设置页的「聚合」面板/)
+    // 且保留原有那两条可操作出路。
+    expect(message).toMatch(/模型选择器|直连/)
   })
 
-  it('源码级：报错文案里不得再出现「设置页的『聚合』面板」这一指引', async () => {
-    // 源码守卫：防止将来有人把这条不存在的指引写回来。
+  it('源码级：零候选的文案必须列出四种原因（防「漏掉第 4 种」回归）', async () => {
     // ⚠️ 必须**剥离注释**再断言（与 `auto-adapter.spec.ts` 的源码守卫同一手法）：
-    //    本文件的注释里**故意**引用了旧文案来说明它是错的，不剥离会误报。
+    //    本文件与源码的注释里**故意**引用了旧文案来说明它是错的，不剥离会误报。
     const raw = await import('node:fs/promises').then((fs) => fs.readFile(
       new URL('../../src/aggregate-adapter.ts', import.meta.url), 'utf8',
     ))
     const code = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
-    expect(code).not.toMatch(/设置页的「聚合」面板/)
+    // 四种原因**逐个点名**（计数式断言：只断言「含其中一个」会让漏掉其余三个仍然绿）。
+    for (const cause of ['渠道被关闭', '模型被关', '无可用账号', '未参与轮换']) {
+      expect(code, `零候选文案必须列出原因「${cause}」`).toContain(cause)
+    }
   })
 })
 
@@ -2692,5 +2828,416 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
     // 常量定义那一处是合法的；其余任何 `contextWindow: 200_000` / `200_000` 都不许。
     expect(code).not.toMatch(/contextWindow:\s*200_000/)
     expect(code).not.toMatch(/contextWindow:\s*AGGREGATE_FALLBACK_CONTEXT_WINDOW/)
+  })
+})
+
+/**
+ * ★★ 门控建池 + `NEVER` 兜底 + 手工位次（用户 2026-10-15）。
+ *
+ * 规格 §5.4。这三件事都在 `candidatesFor` 里，且**顺序**是关键：
+ * 门控（早于余额探测）→ `NEVER` 兜底（未接入渠道不探针）→ 排序（手工位次）。
+ */
+describe('★★ 门控建池、NEVER 兜底与手工位次', () => {
+  /** 造一个双渠道世界：`buddy` 已接入折算，`raccoon` 未接入（`WIRED_EXPIRY_PROVIDERS` 里没有）。 */
+  const makeWorld = (options: {
+    allowed?: () => Record<string, Record<string, Record<string, boolean>>>
+    rejections?: () => Record<string, Record<string, Record<string, boolean>>>
+    order?: () => Record<string, string[]>
+    orderMode?: () => 'expiry' | 'manual'
+  } = {}) => {
+    const probed: string[] = []
+    const sent: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy' }, { id: 'raccoon' }],
+        listModels: async (provider: string) => [
+          { id: 'deepseek-v4.1-flash', name: `Deepseek-V4.1-Flash · ${provider}` },
+        ],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string; model: string }) => {
+          sent.push(`${o.provider}/${o.model}`)
+          return (async function* () { yield { type: 'text', text: 'ok' } })()
+        },
+      },
+    } as never
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: pool,
+      // ⚠️ 探针**记录调用**：门控必须在探针之前生效（被排除的候选不该打上游）。
+      //    ⚠️ 未接入渠道的探针若被调用会返回 UNUSABLE（模拟 `credentialExpiry` 的短路）
+      //    —— 这正是「NEVER 兜底」用例要抓的形态。
+      expiryProbe: async (provider: string) => {
+        probed.push(provider)
+        return provider === 'raccoon' ? -1 : 100
+      },
+      ...options,
+    })
+    return { adapter, probed, sent }
+  }
+
+  const drain = async (call: { stream: (o: unknown) => AsyncIterable<unknown> }) => {
+    for await (const _chunk of call.stream({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })) {
+      // 必须真正 drain，否则 stream 从未被调用（既有用例的注释已记过这个坑）
+    }
+  }
+
+  it('★ 未接入渠道的候选**未放行** ⇒ 不在池里，且**一次探针都不该被调**（它不该打上游）', async () => {
+    // ⚠️⚠️ 本用例的世界**只有 raccoon 一个渠道**（全未接入）—— 这一点是刻意的。
+    //    第一版用「buddy + raccoon」的世界，且断言 `probed === ['buddy']`：
+    //    **变异验证实测它无牙** —— 把门控整段换成旧的「只过滤显式拒绝」后，
+    //    `raccoon` 会进池并被探针折算成 `UNUSABLE` ⇒ 它照样不进候选序、
+    //    `sent` 照样只有 buddy ⇒ **用例仍绿**（差异只在 `probed` 里多了个 raccoon，
+    //    而那正是它该抓的 —— 但我第一版把它写成了「buddy 先成功所以探针只到 buddy」）。
+    //    ⇒ 现在世界只有未接入渠道：门控缺失 ⇒ 它在池里、**甚至可能被发往**
+    //    （探针返回 UNUSABLE 才会拦它，而那是另一道闸门、不是门控）。
+    const probed: string[] = []
+    const sent: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'raccoon' }],
+        listModels: async () => [{ id: 'sn-glm-5-3', name: 'GLM-5-3 · x0.75' }],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string }) => {
+          sent.push(o.provider)
+          return (async function* () { yield { type: 'text', text: 'ok' } })()
+        },
+      },
+    } as never
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: pool,
+      expiryProbe: async (provider: string) => { probed.push(provider); return 100 },
+    })
+    // ⚠️ 零候选 ⇒ `prepareCall` **直接抛**（它在建池后、返回 call 之前就查了候选数）
+    //    —— 这就是未放行的**如实**结果：不静默成功，也不发往任何渠道。
+    await expect(adapter.prepareCall(AGGREGATE_PROVIDER, 'glm-5-3'))
+      .rejects.toThrow(/没有任何可用候选/)
+    expect(probed, '★ 未放行的未接入候选不得触发探针（门控在建池阶段）').toEqual([])
+    expect(sent, '★ 更不得被发往').toEqual([])
+  })
+
+  it('★★ 未接入渠道的候选**已放行** ⇒ 在池里且参与路由（不探针，直接 NEVER）', async () => {
+    // ⚠️⚠️ **两个方向都要测**：只测「未放行不在池里」时，把门控整段删掉用例仍然全绿
+    //   （因为 `raccoon` 的探针恰好返回 UNUSABLE，会被折算掉）⇒ 那条用例**没有牙**。
+    //    本用例才是抓「门控 + NEVER 兜底」的那一条：放行后 `raccoon` 的探针
+    //    **返回 UNUSABLE**，若没有 NEVER 兜底它就会被剔除、请求永不发往它。
+    const { adapter, probed, sent } = makeWorld({
+      allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+    })
+    const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    await drain(call as never)
+    // ⚠️ 关键断言：探针**没有被 raccoon 调用**（未接入渠道不探测）—— 它的 `expiry` 直接是 NEVER。
+    expect(probed, '★ 未接入渠道不得被探针折算（否则会被 UNUSABLE 剔除）').toEqual(['buddy'])
+    // 且它真的在候选序里（buddy 临期 100 先发；raccoon 是 NEVER 排最后，但**在池里**）。
+    const catalog = await adapter.describeCatalog()
+    expect(catalog.models[0]!.candidates.find((c) => c.provider === 'raccoon')!.state).toBe('allowed')
+  })
+
+  it('★★ 已放行的未接入候选在 buddy 失败时**真的被回落到**（不是只留在候选表里）', async () => {
+    // ⚠️ 这条才是「用户手工打开**真的有用**」的端到端判据：上一条只证明它在 `state` 上
+    //    是 allowed，而 `state` 由**目录**路径算出来；**建池**路径是另一条代码路径
+    //    （`candidatesFor`）—— 两者分叉正是本仓库反复出现的缺陷形态。
+    const sent: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy' }, { id: 'raccoon' }],
+        listModels: async (provider: string) => [
+          { id: 'deepseek-v4.1-flash', name: `Deepseek-V4.1-Flash · ${provider}` },
+        ],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string }) => {
+          sent.push(o.provider)
+          return (async function* () {
+            if (o.provider === 'buddy') throw new Error('上游挂了')
+            yield { type: 'text', text: 'ok' }
+          })()
+        },
+      },
+    } as never
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: pool,
+      expiryProbe: async (provider: string) => (provider === 'raccoon' ? -1 : 100),
+      allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+    })
+    const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    await drain(call as never)
+    expect(sent, '★ buddy 失败后必须回落到手工打开的 raccoon').toEqual(['buddy', 'raccoon'])
+  })
+
+  it('★ 对照：**未放行**时 buddy 失败 ⇒ 不回落（raccoon 不在池里）', async () => {
+    const sent: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy' }, { id: 'raccoon' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'M' }],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: (o: { provider: string }) => {
+          sent.push(o.provider)
+          return (async function* () {
+            if (o.provider === 'buddy') throw new Error('上游挂了')
+            yield { type: 'text', text: 'ok' }
+          })()
+        },
+      },
+    } as never
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: pool,
+      expiryProbe: async (provider: string) => (provider === 'raccoon' ? -1 : 100),
+    })
+    const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    await expect(drain(call as never)).rejects.toThrow()
+    expect(sent, '未放行 ⇒ 只尝试 buddy，失败即失败（不得静默发往未放行的渠道）').toEqual(['buddy'])
+  })
+
+  it('★ 已接入渠道照旧走探针（NEVER 兜底不得顺手把它们也跳过）', async () => {
+    const { adapter, probed } = makeWorld({
+      allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+    })
+    const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    await drain(call as never)
+    expect(probed, 'buddy（已接入）必须仍被探针折算').toContain('buddy')
+  })
+
+  it('★ abort 仍原样逃逸（探针抛 AbortError ⇒ 抛 AbortError，不是空池）', async () => {
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'M' }],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => { throw new Error('不该走到 stream') },
+      },
+    } as never
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+    } as never
+    const abort = new Error('aborted')
+    abort.name = 'AbortError'
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: pool,
+      expiryProbe: async () => { throw abort },
+    })
+    await expect(adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash'))
+      .rejects.toThrow(/aborted/)
+  })
+
+  describe('手工位次接线', () => {
+    it('★ mode=manual + 有顺序 ⇒ 严格按手工位次（即使临期更晚）', async () => {
+      const { adapter, sent } = makeWorld({
+        orderMode: () => 'manual',
+        // buddy 临期 100（更早），raccoon 未接入 ⇒ NEVER。手工序把 raccoon 排第一
+        // ⇒ **必须先发 raccoon**，否则「拖动排序」被临期值静默覆盖。
+        order: () => ({ 'deepseek-v4-1-flash': ['raccoon\u0000deepseek-v4.1-flash', 'buddy\u0000deepseek-v4.1-flash'] }),
+        allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+      })
+      const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      await drain(call as never)
+      expect(sent, '★ 手工位次必须严格优先（不被临期覆盖）').toEqual(['raccoon/deepseek-v4.1-flash'])
+    })
+
+    it('★ mode=manual 但该模型**没有**顺序 ⇒ 回落临期序（缺键 = 未自定义）', async () => {
+      const { adapter, sent } = makeWorld({
+        orderMode: () => 'manual',
+        order: () => ({}),
+        allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+      })
+      const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      await drain(call as never)
+      expect(sent, '没有顺序 ⇒ 按临期（buddy 100 先）').toEqual(['buddy/deepseek-v4.1-flash'])
+    })
+
+    it('★ mode=expiry ⇒ 忽略顺序表（即便有内容）', async () => {
+      const { adapter, sent } = makeWorld({
+        orderMode: () => 'expiry',
+        order: () => ({ 'deepseek-v4-1-flash': ['raccoon\u0000deepseek-v4.1-flash', 'buddy\u0000deepseek-v4.1-flash'] }),
+        allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+      })
+      const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      await drain(call as never)
+      expect(sent, '临期模式下顺序表被忽略').toEqual(['buddy/deepseek-v4.1-flash'])
+    })
+
+    it('★ `auto` 在 manual 模式下**仍按临期**（用户 Q6=C 的取舍）', async () => {
+      const { adapter, sent } = makeWorld({
+        orderMode: () => 'manual',
+        order: () => ({ auto: ['raccoon\u0000deepseek-v4.1-flash'] }),
+        allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+      })
+      const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'auto')
+      await drain(call as never)
+      expect(sent, 'auto 恒按临期（手工序只作用于具体虚拟模型）').toEqual(['buddy/deepseek-v4.1-flash'])
+    })
+
+    it('★ 顺序表里全是**畸形/过期**元素 ⇒ 不报错，且等于「全都未排过」⇒ 落临期序', async () => {
+      // ⚠️ 顺序表的元素是 `provider\0realId`，而渠道侧的模型 id 会漂移
+      //   （上游改名/换兜底表）⇒ 表里可能留着**匹配不到任何候选**的旧键。
+      //    它**不得**让整次路由报错，也不得改变其它候选的位次：
+      //    匹配不到 ⇒ `manualRankOf` 返回 `undefined` ⇒ 视为「未排过」。
+      const { adapter, sent } = makeWorld({
+        orderMode: () => 'manual',
+        order: () => ({ 'deepseek-v4-1-flash': ['raccoon\u0000drifted-away'] }),
+        allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+      })
+      const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      await drain(call as never)
+      // 两条候选**都未排过**（漂移键匹配不到）⇒ 按临期：buddy 100 先于 raccoon 的 NEVER。
+      expect(sent, '漂移键不得报错；全都未排过 ⇒ 落临期序').toEqual(['buddy/deepseek-v4.1-flash'])
+    })
+
+    it('★ 对照：把漂移键换成**正确键** ⇒ 手工位次立刻生效（证明上一条不是恒真）', async () => {
+      // ⚠️ 没有这一条时，「漂移键 ⇒ 落临期序」与「手工序根本没接线」**无法区分**
+      //   （两者都给 buddy 先发）。
+      const { adapter, sent } = makeWorld({
+        orderMode: () => 'manual',
+        order: () => ({ 'deepseek-v4-1-flash': ['raccoon\u0000deepseek-v4.1-flash'] }),
+        allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+      })
+      const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      await drain(call as never)
+      expect(sent, '★ 正确键 ⇒ 手工序把 raccoon 提到 buddy 之前').toEqual(['raccoon/deepseek-v4.1-flash'])
+    })
+
+    it('★ 未排过的候选按临期**追加在已排过的之后**（新增候补不得因没有位次而消失）', async () => {
+      // 手工序只排了 raccoon（NEVER，临期最晚）⇒ buddy（临期 100，更早）**未排过**，
+      // 但按 Q3=A 的语义它必须**排在被排过的之后**，而不是按临期插到前面。
+      const { adapter, sent } = makeWorld({
+        orderMode: () => 'manual',
+        order: () => ({ 'deepseek-v4-1-flash': ['raccoon\u0000deepseek-v4.1-flash'] }),
+        allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+      })
+      const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      await drain(call as never)
+      expect(sent, '已排过的严格优先（即便它临期最晚）').toEqual(['raccoon/deepseek-v4.1-flash'])
+    })
+  })
+
+  describe('routingFingerprint：四项各自变化都必须让 choiceCache 失效', () => {
+    /** 造一个「探测次数可数」的世界 —— 命中缓存时第二轮不该再探测。 */
+    const probeCounter = async (
+      mutate: (state: {
+        allowed: Record<string, Record<string, Record<string, boolean>>>
+        rejections: Record<string, Record<string, Record<string, boolean>>>
+        order: Record<string, string[]>
+        mode: 'expiry' | 'manual'
+      }) => void,
+      /** ⚠️ 可选的**首轮初值**（2026-10-16 加）：用于构造「两轮长度相同、内容不同」的场景。 */
+      initial?: Partial<{
+        allowed: Record<string, Record<string, Record<string, boolean>>>
+        rejections: Record<string, Record<string, Record<string, boolean>>>
+        order: Record<string, string[]>
+        mode: 'expiry' | 'manual'
+      }>,
+    ) => {
+      const state = {
+        allowed: initial?.allowed ?? {},
+        rejections: initial?.rejections ?? {},
+        order: initial?.order ?? {},
+        mode: initial?.mode ?? ('expiry' as 'expiry' | 'manual'),
+      }
+      let probes = 0
+      const ctx = {
+        logger: { warn: () => {}, info: () => {}, error: () => {} },
+        llm: {
+          listProviders: () => [{ id: 'buddy' }],
+          listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'M' }],
+          resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+          stream: () => (async function* () { yield { type: 'text', text: 'ok' } })(),
+        },
+      } as never
+      const pool = {
+        disabledModelsFor: () => new Set<string>(),
+        getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+      } as never
+      const adapter = new AggregateAdapter(ctx, {
+        accountPool: pool,
+        expiryProbe: async () => { probes += 1; return 100 },
+        allowed: () => state.allowed,
+        rejections: () => state.rejections,
+        order: () => state.order,
+        orderMode: () => state.mode,
+      })
+      const run = async () => {
+        const call = await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+        await drain(call as never)
+      }
+      await run()
+      const afterFirst = probes
+      mutate(state)
+      await run()
+      // ⚠️ 挂钟 TTL 是 60 秒，用例不可能等它 ⇒ 第二轮若再探测，只可能是因为**指纹变了**。
+      //    （若指纹没变，第二轮会命中缓存、`probes` 不变。）
+      return { probes, afterFirst }
+    }
+
+    it('基线：什么都不改 ⇒ 第二轮命中缓存（不重复探测）', async () => {
+      const { probes, afterFirst } = await probeCounter(() => {})
+      expect(probes, '第二次必须命中缓存').toBe(afterFirst)
+    })
+
+    it('拒绝表变化 ⇒ 指纹变 ⇒ 重新探测', async () => {
+      const { probes, afterFirst } = await probeCounter((s) => {
+        s.rejections = { 'other-model': { buddy: { 'x-1': true } } }
+      })
+      expect(probes, '拒绝表变了就必须重算候选序').toBeGreaterThan(afterFirst)
+    })
+
+    it('★ 白名单变化 ⇒ 指纹变 ⇒ 重新探测（漏这一项 = 手工打开 60 秒内不生效）', async () => {
+      const { probes, afterFirst } = await probeCounter((s) => {
+        s.allowed = { 'other-model': { raccoon: { 'y-1': true } } }
+      })
+      expect(probes, '★ 白名单是第 2 项，漏了它「手工打开」会静默延迟').toBeGreaterThan(afterFirst)
+    })
+
+    it('★ 顺序表变化 ⇒ 指纹变 ⇒ 重新探测（否则拖了排序 60 秒内不生效）', async () => {
+      const { probes, afterFirst } = await probeCounter((s) => {
+        s.order = { 'deepseek-v4-1-flash': ['buddy\u0000deepseek-v4.1-flash'] }
+      })
+      expect(probes, '★ 顺序表是第 3 项').toBeGreaterThan(afterFirst)
+    })
+
+    it('★★ 顺序表**内容**变化（长度相同）⇒ 指纹必须变（防退化成「只数条数」）', async () => {
+      // ⚠️⚠️ **真实守卫缺口**（2026-10-16 对抗审计实测）：
+      //    上一条用例是「空表 → 一条」，**长度变了** ⇒ 把
+      //    `order[key].join(',')` 退化成 `String(order[key].length)`（**正是本文件
+      //    注释里明令禁止的「条目数摘要」**）时，上一条**照样绿**。
+      //    后果：`{m:[a,b]}` 与 `{m:[c,d]}` 摘要同为 `2` ⇒ 语义不同的两张顺序表
+      //    **指纹碰撞** ⇒ 改了顺序却命中旧 `choiceCache` ⇒ 拖了排序 60 秒内不生效
+      //    —— 而这里登记过的教训（「缓存失效判据按数组长度」被实测证伪）**没有守卫**。
+      // ⇒ 判据必须用**长度相同、内容不同**的两张表。
+      const { probes, afterFirst } = await probeCounter((s) => {
+        // 先给一份「两个候选」的顺序表…
+        s.order = { 'deepseek-v4-1-flash': ['buddy\u0000a', 'zcode\u0000b'] }
+      }, {
+        // …但第一轮用的也是**两个**（只是内容不同）⇒ 长度相同、内容不同。
+        order: { 'deepseek-v4-1-flash': ['zcode\u0000b', 'buddy\u0000a'] },
+      })
+      expect(probes, '★ 长度相同但内容/次序不同的顺序表必须让指纹变化').toBeGreaterThan(afterFirst)
+    })
+
+    it('★ 排序模式变化 ⇒ 指纹变 ⇒ 重新探测（否则切到手工序 60 秒内不生效）', async () => {
+      const { probes, afterFirst } = await probeCounter((s) => {
+        s.mode = 'manual'
+      })
+      expect(probes, '★ 模式是第 4 项').toBeGreaterThan(afterFirst)
+    })
   })
 })

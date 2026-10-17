@@ -74,6 +74,10 @@ const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   ['loomy', 'loomyAuth'],
   ['raccoon', 'raccoonAuth'],
   ['minimax', 'minimaxAuth'],
+  // ⚠️ 键是 **provider id** `minimaxintl`（全小写、不带连字符），值是变量
+  //    `minimaxIntl` —— 服务名由 `${product.id}Auth` 派生，故 `ctx.minimaxintlAuth`
+  //    才是真实服务名（按驼峰惯例拼成 `minimaxIntlAuth` 会恒 undefined）。
+  ['minimaxintl', 'minimaxintlAuth'],
   ['zcode', 'zcodeAuth'],
   ['gemini', 'geminiAuth'],
   // ⚠️ officeace 的值是 **auth 服务形状的包装对象**（`src/index.ts` 的
@@ -227,7 +231,7 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     expect(intlSpy, '中国版账号串到了国际版 qoderAuth').not.toHaveBeenCalled()
   })
 
-  it('注册表覆盖 15 个可续期 provider，且**不含** opencode / aggregate / auto', () => {
+  it('注册表覆盖全部可续期 provider，且**不含** opencode / aggregate / auto', () => {
     applyOnce()
     const ids = registeredRuntimeIds().sort()
     expect(ids).toEqual(AUTH_SERVICE_OF.map(([id]) => id).sort())
@@ -356,8 +360,8 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     // ⚠️ 判据本体由 `expectedProviderIdsWithAuth()` 单一持有（Task 11-F）。
     const shouldRegister = expectedProviderIdsWithAuth().sort()
     // ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 13 → 15。
-    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（第 16）⇒ 15 → 16。
-    //    合并上游时**不要**改回 15：那会让 modelscope 的注册失去守卫。
+    // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：15 → 16。
+    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（第 17）：16 → 17。
     expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(16)
     expect(
       registeredRuntimeIds().sort(),
@@ -410,7 +414,9 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     // ⚠️ minimax **曾经**登记为空（不写标记）—— 2026-10-11 的 issue IKJW32 给它
     //    接上请求级换号 + 冷却后，它会写 `modelRateLimits`（额度 24h / 限流 1h）。
     //    下面那条「登记为不写标记的确实没有写点」用例就是靠这个变化**红**出来的。
-    ['minimax-adapter.ts', ['minimax']],
+    //    ⚠️ 2026-10-15：国际版与它**共用同一个适配器类** ⇒ 同样会写标记，
+    //    故两个 id 并列在这一行（漏一个都会让该站的限流标记清不掉）。
+    ['minimax-adapter.ts', ['minimax', 'minimaxintl']],
     // ↓ 实测不写标记的（登记它们是为了让「每个 *-adapter.ts 都要登记」成立）。
     ['aggregate-adapter.ts', []],
     ['auto-adapter.ts', []],

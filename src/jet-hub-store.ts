@@ -67,6 +67,49 @@ export type ModelDisableMap = Record<string, Record<string, boolean>>
  */
 export type AggregateRejectionMap = Record<string, Record<string, Record<string, boolean>>>
 
+/**
+ * 聚合 provider 的「**显式允许**参与轮换」白名单：虚拟模型 id → provider → 被允许的 realId → true。
+ *
+ * 形状与 {@link AggregateRejectionMap} **逐格相同**，但语义相反：本表只记录「用户**手工打开**」的候选。
+ *
+ * ⚠️⚠️ **为什么需要白名单，而不是「拒绝表里没有就是允许」**：
+ *    未接入临期折算的渠道（7 家）的默认态是**不参与**（见 `aggregate-core.ts` 的
+ *    `CandidateGate`）。若用「拒绝表里没有 = 允许」表达这个例外，老用户升级后这 7 家的
+ *    全部候选会**立刻参与轮换** —— 配额未知的渠道被静默放行，请求打到用户没打算用的渠道。
+ *    ⇒ 默认态必须由「该渠道是否接入折算」（渠道级编译期事实）**推导**，而**例外**（手工打开）
+ *    需要本表才能表达。
+ *
+ * ⚠️ **两张表各有各的域、不做互斥归一**（用户 2026-10-15 的修正，规格 §5.1）：
+ *    已接入折算的候选只归**拒绝表**（黑名单语义：默认参与），未接入的只归**白名单** ——
+ *    两表的键域由「渠道是否接入折算」划分，**天然不相交** ⇒ 写一侧**不得**改另一侧
+ *    （顺手清另一侧会静默改掉另一张表里**属于别的操作**的用户状态：拒绝一条候选不该顺手
+ *    关掉同渠道其它手工打开的候选）。
+ *
+ * ⚠️ 只记录 `true`（缺键 = 未显式允许），与拒绝表同口径。
+ */
+export type AggregateAllowedMap = Record<string, Record<string, Record<string, boolean>>>
+
+/**
+ * 聚合 provider 的**手工排序**表：虚拟模型 id → 有序候选键数组。
+ *
+ * 元素 = `` `${provider}\u0000${realId}` ``（与本文件外的候选键约定**逐字相同**：分隔符是
+ * **NUL**，不是 `:` 或 `|` —— 本仓库有过「两套同义分隔符」的缺陷史）。
+ *
+ * ⚠️ **缺键 / 空数组 = 未自定义**（与 `providerOrder` 同语义）：展示与轮换都回落到临期序。
+ * ⚠️ **未出现在数组里的候选不是被排除**，而是「排在已排过的之后，按 临期↑ → 倍率↑」——
+ *    这样新增候补（渠道新登录、目录新增模型）不会因为没有位次而消失。
+ */
+export type AggregateOrderMap = Record<string, string[]>
+
+/**
+ * 聚合候选的排序模式：`'expiry'`（默认，按临期）或 `'manual'`（按手工顺序）。
+ *
+ * ⚠️ 缺键 / 任何非法值的语义都是 `'expiry'` = **升级前行为**（老用户读到旧文档时
+ * 不会突然变成手工序 —— 那时手工序表是空的，切过去等于「全都未排过」，行为其实一样，
+ * 但显式回落能让面板文案不说谎）。
+ */
+export type AggregateOrderMode = 'expiry' | 'manual'
+
 /** 各 provider 的「锁定永久积分」开关：provider id → 已锁定。 */
 export type PermanentLockMap = Record<string, boolean>
 
@@ -85,6 +128,26 @@ export interface JetHubState {
    * 老文档没有这个键 → 空表（没有任何拒绝），与升级前行为一致。
    */
   aggregateRejections?: AggregateRejectionMap
+  /**
+   * 聚合 provider 的「**显式允许**参与轮换」白名单（见 {@link AggregateAllowedMap}）。
+   *
+   * ⚠️ 住 `state.json` 的理由与拒绝表完全同级：丢失后果**可逆且方向安全** ——
+   * 白名单丢了 ⇒ 那些未接入折算的渠道回到「默认不参与」，用户再逐条打开即可
+   *（对比 `loomyPermanentLocked`：丢了会真烧掉永久积分，故它住独立文档）。
+   *
+   * 老文档没有这个键 → 空表（没有任何手工打开），与升级前行为一致。
+   */
+  aggregateAllowed?: AggregateAllowedMap
+  /**
+   * 聚合候选的**手工排序**表（见 {@link AggregateOrderMap}）。
+   *
+   * ⚠️ 丢失后果**可逆**：顺序回到临期序，用户重拖一次即恢复。缺键 / 空数组 = 未自定义。
+   */
+  aggregateOrder?: AggregateOrderMap
+  /**
+   * 聚合候选的**排序模式**（见 {@link AggregateOrderMode}）。缺键 = `'expiry'`（升级前行为）。
+   */
+  aggregateOrderMode?: AggregateOrderMode
   /**
    * Loomy「锁定永久积分」开关 —— **镜像字段，不是权威**。
    *
@@ -320,6 +383,146 @@ export function sanitizeAggregateRejections(raw: unknown): AggregateRejectionMap
 }
 
 /**
+ * 归一化聚合「显式允许」白名单。
+ *
+ * 判据与 {@link sanitizeAggregateRejections} **逐格同构**（只认显式 `true`、空层不保留、
+ * 畸形退化空表、`Object.entries` 遍历自有键）—— 两张表口径一致才能让上层用同一套读法。
+ *
+ * ⚠️ 判据**不能宽松接受 truthy**：表里一旦被 `1` / `'true'` 污染，下次读取就有人按 truthy
+ * 判成「允许」= 静默放行一个我们没有余额信息的渠道。
+ */
+export function sanitizeAggregateAllowed(raw: unknown): AggregateAllowedMap {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const result: AggregateAllowedMap = {}
+  for (const [canonicalId, byProvider] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof byProvider !== 'object' || byProvider === null || Array.isArray(byProvider)) continue
+    const perProvider: Record<string, Record<string, boolean>> = {}
+    for (const [provider, byRealId] of Object.entries(byProvider as Record<string, unknown>)) {
+      if (typeof byRealId !== 'object' || byRealId === null || Array.isArray(byRealId)) continue
+      const perRealId: Record<string, boolean> = {}
+      for (const [realId, flag] of Object.entries(byRealId as Record<string, unknown>)) {
+        if (flag === true) perRealId[realId] = true
+      }
+      if (Object.keys(perRealId).length > 0) perProvider[provider] = perRealId
+    }
+    if (Object.keys(perProvider).length > 0) result[canonicalId] = perProvider
+  }
+  return result
+}
+
+/**
+ * 归一化聚合**手工顺序**表。
+ *
+ * 判据（三条都必须，缺一条就是静默失效）：
+ *
+ * - 元素必须是**字符串且含 NUL 分隔符** —— 否则它在适配器里解析不出 `(provider, realId)`，
+ *   会被静默忽略 ⇒「顺序表看着有内容、实际全不生效」；
+ * - **去重**（保留首次出现）—— 重复元素会让比较器**非确定**（同一候选有两个位次）；
+ * - 空数组 **丢键**（= 未自定义，与 `providerOrder` 同语义）。
+ */
+export function sanitizeAggregateOrder(raw: unknown): AggregateOrderMap {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const result: AggregateOrderMap = {}
+  for (const [canonicalId, entries] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(entries)) continue
+    const seen = new Set<string>()
+    const kept: string[] = []
+    for (const entry of entries) {
+      if (typeof entry !== 'string' || !entry.includes('\u0000')) continue
+      if (seen.has(entry)) continue
+      seen.add(entry)
+      kept.push(entry)
+    }
+    if (kept.length > 0) result[canonicalId] = kept
+  }
+  return result
+}
+
+/**
+ * 归一化排序模式：**只有字面量 `'manual'`** 认作手工序，其余（含缺键 / 畸形 / 大小写不同）
+ * 一律回落到 `'expiry'` = 升级前行为。
+ */
+export function sanitizeAggregateOrderMode(raw: unknown): AggregateOrderMode {
+  return raw === 'manual' ? 'manual' : 'expiry'
+}
+
+/**
+ * 从拒绝表里移除「该渠道在该虚拟模型下」的**整层**。
+ *
+ * ⚠️⚠️ 这是 **D4 降级语义**的恢复路径，**只留这一份实现**：`AccountPool.setAggregateRejected`
+ * 的 `false` 分支调它（`setAggregateAllowed` **不调** —— 两表各有各的域，见
+ * {@link AggregateAllowedMap} 的说明）。
+ *
+ * ## 为什么是「整渠道层」而不是「只删这一个 realId」
+ *
+ * D4 规定：`(虚拟模型, 渠道)` 下有 `true` 记录、但那些 `realId` **都不在**当前候选中
+ *（id 漂移）⇒ **降级为渠道级拒绝**。而漂移的**旧键会一直留在表里** ⇒ 用户按降级告警的
+ * 指引来面板「重新打开」**当前**候选时，若只删**当前**键，**旧键仍在** ⇒ 降级判据依然成立：
+ *
+ * - 面板用「该 realId 在不在表里」判断显示 ⇒ 显示「参与轮换」；
+ * - 宿主实际**仍拒绝** ⇒ **显示与行为分叉**，告警指引的那条恢复路径**走不通**。
+ *
+ * 用户「重新打开」的意图是「让这个渠道在这个模型下重新参与」，而 D4 本就是**渠道级**语义
+ * ⇒ 唯一自洽的结果就是**整渠道恢复**。
+ *
+ * ⚠️ 调用方**不得**在清层后再把 `perProvider[provider] = perRealId` 挂回去
+ *（初版正是如此：删除被自己覆盖，降级不解除；独立审计用真实池实测证伪）。
+ */
+export function clearRejectionLayer(
+  rejections: AggregateRejectionMap,
+  canonicalId: string,
+  provider: string,
+): AggregateRejectionMap {
+  const next: AggregateRejectionMap = { ...rejections }
+  const perProvider = { ...(next[canonicalId] ?? {}) }
+  delete perProvider[provider]
+  if (Object.keys(perProvider).length === 0) delete next[canonicalId]
+  else next[canonicalId] = perProvider
+  return next
+}
+
+/**
+ * 白名单侧写入（不可变；空层不保留）。
+ *
+ * 唯一调用方是 `AccountPool.setAggregateAllowed(..., true)`。
+ */
+export function withAllowed(
+  allowed: AggregateAllowedMap,
+  canonicalId: string,
+  provider: string,
+  realId: string,
+): AggregateAllowedMap {
+  const next: AggregateAllowedMap = { ...allowed }
+  const perProvider = { ...(next[canonicalId] ?? {}) }
+  perProvider[provider] = { ...(perProvider[provider] ?? {}), [realId]: true }
+  next[canonicalId] = perProvider
+  return next
+}
+
+/**
+ * 白名单侧**单键**删除（不可变；空层逐级清理）。
+ *
+ * ⚠️ 唯一调用方是 `AccountPool.setAggregateAllowed(..., false)` —— **只删同键**：
+ * 同渠道其它被手工打开的候选必须保留（用户逐条打开的是**候选**，不是渠道）。
+ */
+export function withoutAllowed(
+  allowed: AggregateAllowedMap,
+  canonicalId: string,
+  provider: string,
+  realId: string,
+): AggregateAllowedMap {
+  const perProvider = { ...(allowed[canonicalId] ?? {}) }
+  const perRealId = { ...(perProvider[provider] ?? {}) }
+  delete perRealId[realId]
+  if (Object.keys(perRealId).length === 0) delete perProvider[provider]
+  else perProvider[provider] = perRealId
+  const next: AggregateAllowedMap = { ...allowed }
+  if (Object.keys(perProvider).length === 0) delete next[canonicalId]
+  else next[canonicalId] = perProvider
+  return next
+}
+
+/**
  * 归一化账号条目数组。
  *
  * 判据刻意保守：只保留同时具备 `id` / `provider` / `credentialRef` 三个非空
@@ -497,6 +700,9 @@ class SettingsStore implements JetHubStore {
         accounts?: unknown
         disabledModels?: unknown
         aggregateRejections?: unknown
+        aggregateAllowed?: unknown
+        aggregateOrder?: unknown
+        aggregateOrderMode?: unknown
         loomyPermanentLocked?: unknown
         gatewayEnabled?: unknown
         nativeWebSearchEnabled?: unknown
@@ -509,6 +715,10 @@ class SettingsStore implements JetHubStore {
       disabledModels: sanitizeDisabledModels(value.disabledModels),
       // 老文档没这个键 → 空表（没有任何拒绝），与升级前行为一致。
       aggregateRejections: sanitizeAggregateRejections(value.aggregateRejections),
+      // 老文档没这三个键 → 空白名单 / 空顺序表 / 临期序，与升级前行为一致（未接入渠道仍不参与）。
+      aggregateAllowed: sanitizeAggregateAllowed(value.aggregateAllowed),
+      aggregateOrder: sanitizeAggregateOrder(value.aggregateOrder),
+      aggregateOrderMode: sanitizeAggregateOrderMode(value.aggregateOrderMode),
       // 只是**镜像**（权威表在 permanent-locks.json）；老文档没这个键 → false。
       loomyPermanentLocked: value.loomyPermanentLocked === true,
       // 老文档没这个键 → 启用，与升级前行为一致。
@@ -534,6 +744,15 @@ class SettingsStore implements JetHubStore {
       //    ⚠️ 与下面三个「接受丢失」的键**不同**：那三个丢失后果**可逆且用户可见**
       //    （网关回默认、顺序回声明序），而拒绝表丢失是**静默误路由**。
       aggregateRejections: state.aggregateRejections ?? {},
+      // ⚠️⚠️ **三个新键同样必须带上**（与拒绝表逐条同因）：
+      //    `replace` 是**整体替换**语义 ⇒ 漏键 = 永不落盘 + 被任何写入抹掉。
+      //    其中白名单丢失的后果**不是**「可逆即可接受」那一档：它会让用户手工打开的
+      //    无临期渠道**静默回到不参与**（用户下次发消息时发现请求不走那个渠道，
+      //    却看不到任何提示 —— 与拒绝表丢失同属「静默改路由」）。
+      //    ⚠️ 探针实测的既有形态：漏键时 section 里根本没有该键，新实例读回缺省值。
+      aggregateAllowed: state.aggregateAllowed ?? {},
+      aggregateOrder: state.aggregateOrder ?? {},
+      aggregateOrderMode: state.aggregateOrderMode === 'manual' ? 'manual' : 'expiry',
       // 镜像字段由 AccountPool 与独立文档**同源写出**：同机上只认这个字段的
       // 旧版本代码（其它 profile）读它、也会原样写回它，故两边不会脱节。
       loomyPermanentLocked: state.loomyPermanentLocked === true,
@@ -598,8 +817,8 @@ class MemoryStore implements JetHubStore {
  *
  * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
  * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
- * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `zcode`
- * / `opencode` / `gemini` / `officeace` / `accio`。
+ * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `minimaxintl`
+ * / `zcode` / `opencode` / `gemini` / `officeace` / `accio`。
  * ⚠️ 这行清单必须与**下面那张表的实际项数**一致（2026-10-13 合并审计：
  *    此前它漏了 `officeace` —— 表里有、清单里没有，属注释失实）。
  */
@@ -616,6 +835,14 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   ['RACCOON', 'raccoon'],
   // ⚠️ 第 12 个 provider（上游 2026-10-02 合并）—— 曾漏加，见上方注释 ②。
   ['MINIMAX', 'minimax'],
+  // ⚠️ 第 17 个 provider（minimaxintl，2026-10-15）—— 同款坑第 **六** 次。
+  // MiniMax Code 国际版与本表里的 `minimax` **是两个 provider**（账号不互通、
+  // 凭据 ref 前缀不同），故必须各占一行。
+  // 漏加 = `MINIMAXINTL_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
+  // ⚠️ 它与 `MINIMAX` 是**超串关系**（`MINIMAXINTL` 以 `MINIMAX` 开头）——
+  //    顺序由 `ACCOUNT_REF_RE` 内部的**长度降序排序**保证，与本数组的书写顺序无关。
+  ['MINIMAXINTL', 'minimaxintl'],
   ['ZCODE', 'zcode'],
   // ⚠️ 第 13 个 provider（opencode，2026-10-01）—— 与上面 minimax 同款坑：
   // 漏加会让「恢复备份」认不出 opencode 账号（见上方注释 ②）。
@@ -747,6 +974,9 @@ class FileStore implements JetHubStore {
         accounts?: unknown
         disabledModels?: unknown
         aggregateRejections?: unknown
+        aggregateAllowed?: unknown
+        aggregateOrder?: unknown
+        aggregateOrderMode?: unknown
         loomyPermanentLocked?: unknown
         gatewayEnabled?: unknown
         nativeWebSearchEnabled?: unknown
@@ -757,6 +987,10 @@ class FileStore implements JetHubStore {
         disabledModels: sanitizeDisabledModels(value.disabledModels),
         // 老文档没这个键 → 空表（没有任何拒绝），与升级前行为一致。
         aggregateRejections: sanitizeAggregateRejections(value.aggregateRejections),
+        // 老文档没这三个键 → 空白名单 / 空顺序表 / 临期序，与升级前行为一致。
+        aggregateAllowed: sanitizeAggregateAllowed(value.aggregateAllowed),
+        aggregateOrder: sanitizeAggregateOrder(value.aggregateOrder),
+        aggregateOrderMode: sanitizeAggregateOrderMode(value.aggregateOrderMode),
         // 只是镜像（权威表在 permanent-locks.json）；老文档没这个键 → false。
         loomyPermanentLocked: value.loomyPermanentLocked === true,
         // 老文档没这个键 → 启用，与升级前行为一致。
@@ -808,6 +1042,10 @@ class FileStore implements JetHubStore {
         disabledModels: {},
         // 凭据文件里没有任何拒绝信息 → 空表（与全新安装一致）。
         aggregateRejections: {},
+        // 凭据文件里也没有白名单/顺序/模式信息 → 全部缺省（与全新安装一致）。
+        aggregateAllowed: {},
+        aggregateOrder: {},
+        aggregateOrderMode: 'expiry',
         // 凭据文件里没有任何锁定信息 → 镜像写 false（权威表另有其文档）。
         loomyPermanentLocked: false,
         // 恢复出的文档本来就不含任何开关信息 → 启用（与全新安装一致）。

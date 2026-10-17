@@ -434,9 +434,11 @@ describe('listModels（判别力与门控）', () => {
 describe('providerInfo / prepareCall / registerMinimaxLlm', () => {
   it('providerInfo 回填产品 id 与展示名', () => {
     const adapter = makeAdapter()
-    expect(adapter.providerInfo('minimax')).toEqual({ id: 'minimax', name: 'MiniMax Code' })
+    // ⚠️ 2026-10-15：展示名加了「(中国版)」括注 —— 加国际站后两站并列，
+    //    不带括注用户分不清哪个是国内站（与 `Qoder (中国版)` 同风格）。
+    expect(adapter.providerInfo('minimax')).toEqual({ id: 'minimax', name: 'MiniMax Code (中国版)' })
     // 空串回填产品 id（照实现）
-    expect(adapter.providerInfo('')).toEqual({ id: 'minimax', name: 'MiniMax Code' })
+    expect(adapter.providerInfo('')).toEqual({ id: 'minimax', name: 'MiniMax Code (中国版)' })
   })
 
   it('prepareCall 的 stream 走同一条推理路径（不能只锁 stream() 本身）', async () => {
