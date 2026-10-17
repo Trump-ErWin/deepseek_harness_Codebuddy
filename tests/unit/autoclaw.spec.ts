@@ -229,8 +229,10 @@ describe('AutoClaw 纯函数与核心协议', () => {
     })
 
     it('autoclawDisplayNickname 格式化手机号与昵称', () => {
-      expect(autoclawDisplayNickname({ access_token: 'a', refresh_token: 'r', user_phone: '17373574993' })).toBe('173****4993')
-      expect(autoclawDisplayNickname({ access_token: 'a', refresh_token: 'r', user_phone: '173****4993' })).toBe('173****4993')
+      // ⚠️ 用例里的号码是**编造的假号**（`13800000000` 属工信部测试号段），
+      //    切勿换成真号 —— 测试断言与代码注释都会把它带进仓库历史。
+      expect(autoclawDisplayNickname({ access_token: 'a', refresh_token: 'r', user_phone: '13800000000' })).toBe('138****0000')
+      expect(autoclawDisplayNickname({ access_token: 'a', refresh_token: 'r', user_phone: '138****0000' })).toBe('138****0000')
       expect(autoclawDisplayNickname({ access_token: 'a', refresh_token: 'r', user_name: '张三' })).toBe('张三')
       expect(autoclawDisplayNickname({ access_token: 'a', refresh_token: 'r', user_id: 878541 })).toBe('用户878541')
       expect(autoclawDisplayNickname(undefined, 'fallback_id')).toBe('fallback_id')

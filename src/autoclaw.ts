@@ -170,7 +170,10 @@ export function parseAutoclawCredential(raw: unknown): AutoclawCredential | unde
 }
 
 /**
- * 账号显示昵称：优先显示脱敏手机号（如 173****4993），无手机号时显示用户名，兜底 fallbackId。
+ * 账号显示昵称：优先显示脱敏手机号（如 138****0000），无手机号时显示用户名，兜底 fallbackId。
+ *
+ * ⚠️ 注释与用例里的号码一律用**编造的假号**（`13800000000` 属工信部测试号段）——
+ *    真号会随代码进仓库历史，不可撤回。
  */
 export function autoclawDisplayNickname(
   credential?: AutoclawCredential,
