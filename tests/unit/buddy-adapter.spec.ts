@@ -4737,6 +4737,140 @@ describe('内容级风控（11128）：不得当成账号级拦截换号/冷却'
           void error
         })
       })
+
+      /**
+       * ★★★★ **P0 复发：腿①/腿②（`conversation id missing` 形态）的排除从未被修**（2026-10-18 审计）
+       *
+       * ## 这是 2026-10-17 那个 P0 的**同型未修**，不是同一处
+       *
+       * 那次 P0 的结论是「排除必须覆盖 `isContentRejection` 的**全部**腿」，修法是
+       * 在函数开头做**一次早退排除**。⚠️ 但那次排除用的判据是
+       * `isChannelVerificationIllegalBody` —— 它只认**腿③**（`code==11128` 且
+       * `msg` 含 `request illegal`）。而渠道校验档有**三条腿**：腿①/腿② 认的是
+       * **`conversation id missing`** 形态（IKM7SG 原文措辞），**完全没被排除**。
+       *
+       * ## 触发形态（真实可达，仓库自己就是证据）
+       *
+       * ```json
+       * {"code":11128,"msg":"conversation id missing",
+       *  "displayMsg":{"zh":"内容未通过安全审核，请调整后重试。"}}
+       * ```
+       *
+       * `displayMsg.zh` 那句正是**本文件上方记录的 11140 真报文**（L623-625），
+       * 而「11128 各子原因共用/漂移 `displayMsg`」本仓**已有先例**（同文件注释
+       * 与 `buddy-adapter.ts` 腿③ 的注释都把它列为可达形态）⇒ 不是假想报文。
+       *
+       * ## 后果（与本档注释明确写「不可」的那件事逐字相同）
+       *
+       * `isContentRejection` 认领 ⇒ 走 11140 档 ⇒ **换号 + 写 30 分钟账号冷却**
+       * + 出口文案「全部账号均被服务端安全策略拦截…请停用或更换被拦账号」。
+       * 而该账号**带上三头立刻 200**（IKM7SG 实测）⇒ 正是「逐请求判定、
+       * 不该写账号级冷却」那一档。症状：可用账号被凭空封 30 分钟、UI 显示
+       * 「限额重置」、并建议用户停用它。
+       *
+       * ## 为什么第一版的守卫抓不到
+       *
+       * 上面那条 P0 用例构造的全是 `msg:"request illegal"`（腿③形态）⇒ 早退排除
+       * 生效 ⇒ 本缺陷**完全不在它们的观测范围内**。必须另造腿①形态的夹具。
+       */
+      describe('P0 复发：腿①/腿②（`conversation id missing` 形态）的排除', () => {
+        it.each([
+          ['displayMsg.zh 漂成 11140 真报文的 zh 安全审核措辞', {
+            zh: '内容未通过安全审核，请调整后重试。',
+          }],
+          ['displayMsg.en 漂成 11140 真报文的 en safety review 措辞', {
+            en: 'The content did not pass the safety review. Please retry.',
+          }],
+          ['displayTips 里提到安全审核（腿② 的排除同样缺失）', undefined, {
+            zh: '安全审核未通过',
+          }],
+        ])('%s ⇒ 归渠道校验档、零冷却标记', async (_label, displayMsg, displayTips) => {
+          const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+          const adapter = makeAdapter({
+            credential: makeCredential({ access_token: 'AT1' }),
+            refresh: async () => {},
+            accountPool: pool,
+            fetchImpl: async () => new Response(JSON.stringify({
+              code: 11128,
+              // ⚠️ IKM7SG **原文**措辞（腿①），不是本机实测的 `request illegal`。
+              msg: 'conversation id missing',
+              requestId: 'r-leg1',
+              ...(displayMsg !== undefined ? { displayMsg } : {}),
+              ...(displayTips !== undefined ? { displayTips } : {}),
+            }), { status: 400 }),
+          })
+          const error = await collectChunks(adapter, {
+            model: DEFAULT_MODEL,
+            messages: [{ role: 'user', content: 'hi' }] as never,
+            signal: new AbortController().signal,
+          } as never).catch((e: unknown) => e)
+
+          // 核心判据：腿①形态**同样不许**写 30 分钟账号冷却。
+          expect(pool.recorded).toEqual([])
+          // 且必须归到本档出口（否则「零标记」可能来自别的路径）。
+          expect((error as LlmError).message).toContain('渠道校验')
+          expect((error as LlmError).message).not.toContain('安全策略拦截')
+        })
+
+        it('★ 反向守卫：真实 11140 报文**仍被三条腿全部命中**（不得被这次排除削弱）', async () => {
+          // ⚠️ 与腿③ 那组的反向守卫同款：排除若写得太宽（例如「有 code 键就排除」），
+          //   11140 会掉进渠道校验档 ⇒ 不写冷却 ⇒ 每轮都重撞该账号。
+          const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+          const adapter = makeAdapter({
+            credential: makeCredential({ access_token: 'AT1' }),
+            refresh: async () => {},
+            accountPool: pool,
+            fetchImpl: async () => new Response(JSON.stringify({
+              code: 11140,
+              msg: 'conversation id missing',
+              displayMsg: { zh: '内容未通过安全审核，请调整后重试。' },
+            }), { status: 400 }),
+          })
+          const error = await collectChunks(adapter, {
+            model: DEFAULT_MODEL,
+            messages: [{ role: 'user', content: 'hi' }] as never,
+            signal: new AbortController().signal,
+          } as never).catch((e: unknown) => e)
+
+          // ⚠️ `code` 是 **11140** ⇒ 必须是 11140 档（写冷却），哪怕 `msg` 里
+          //   恰好含渠道校验档的措辞 —— 这正是 code 闸门的意义。
+          expect(pool.recorded.length).toBeGreaterThan(0)
+          expect((error as LlmError).message).toContain('安全策略拦截')
+        })
+
+        it('★ 流内通道（HTTP 200 + SSE 错误帧）腿①形态同样归本档、零冷却', async () => {
+          // ⚠️⚠️ **必须有这一格**：`consumeSse` 那条通道（L3610）也调
+          // `isContentRejection`，所以同一个缺陷在流内**同样成立** ——
+          // 而本文件脚注明确记录「真实的流内 11128 错误帧就是
+          // `{"code":11128,"msg":"conversation id missing"}`」，**正是腿①形态**。
+          //
+          // ⇒ 上一组只覆盖 HTTP 400 路径时会漏掉这一半。流内的后果比 400 更重：
+          // 若落进 11140 档，除了写冷却，还会把「未通过渠道校验」这条唯一出路
+          // 换成「请停用该账号」。
+          const pool = pool2([{ id: 'acct-1', token: 'AT1' }])
+          const adapter = makeAdapter({
+            credential: makeCredential({ access_token: 'AT1' }),
+            refresh: async () => {},
+            accountPool: pool,
+            fetchImpl: async () => sseResponse(`data: ${JSON.stringify({
+              code: 11128,
+              msg: 'conversation id missing',
+              displayMsg: { zh: '内容未通过安全审核，请调整后重试。' },
+            })}\n\n`),
+          })
+          const error = await collectChunks(adapter, {
+            model: DEFAULT_MODEL,
+            messages: [{ role: 'user', content: 'hi' }] as never,
+            signal: new AbortController().signal,
+          } as never).catch((e: unknown) => e)
+
+          expect(pool.recorded).toEqual([])
+          expect(error).toBeInstanceOf(LlmError)
+          // ⚠️ 流内 `rotated: false` ⇒ 文案是「当前账号…」，不得说「已逐个换号重试」。
+          expect((error as LlmError).message).toContain('渠道校验')
+          expect((error as LlmError).message).not.toContain('安全策略拦截')
+        })
+      })
     })
 
     /**
@@ -4795,6 +4929,57 @@ describe('内容级风控（11128）：不得当成账号级拦截换号/冷却'
 
         // 必须落 11140 档 ⇒ 有冷却标记（渠道校验档是零标记）。
         expect(pool.recorded.length).toBeGreaterThan(0)
+      })
+    })
+
+    /**
+     * ★★★★ **P1-1：排除的值位窗口必须与归属判据腿① 同宽**（2026-10-18 对抗审计实测，本轮修）
+     *
+     * ## 缺陷（**我自己引入的**，方向与修复目的相反）
+     *
+     * 排除判据 `CHANNEL_VERIFICATION_PHRASE` 初版用 `[^"]{0,200}?`（有界，对齐腿③），
+     * 而归属判据**腿①** `CHANNEL_VERIFICATION_MSG_FIELD` 用 `[^"]*`（**无界**）⇒
+     * 「属不属于渠道校验」判得比「要不要写冷却」**更宽** ⇒ 两者**不再互斥**。
+     *
+     * 实测（措辞距 `msg` 值开头的距离）：
+     * | 距离 | 排除 | 归属 | |
+     * |---|---|---|---|
+     * | 0 / 180 / 195 / 199 | ✅ | ✅ | 互斥，正确 |
+     * | **205 / 260 / 500** | ❌ | ✅ | 🔴 落 **11140 档 ⇒ 写 30 分钟冷却** |
+     *
+     * ⚠️ 即：修复 A 是为消灭「可用账号被凭空封 30 分钟」，这个不对称**制造了一条
+     * 同类的新触发面**（端到端实测：403 与流内 200 两条通道都写冷却）。
+     *
+     * ## 为什么这一组同时是「M2 零牙」的补全
+     *
+     * 上面记录的 M2（`{0,200}` → `*`）之所以**零牙**，正是因为既有夹具的 `msg`
+     * **全是短句**。⚠️ **零牙源于夹具没覆盖边界，不是该变异无害** ——
+     * 补上这组长 `msg` 夹具后，该变异即刻有牙。
+     */
+    describe('P1-1：排除窗口与腿① 同宽（长 msg 不得被 11140 档抢走）', () => {
+      it.each([199, 205, 260, 500])('msg 前缀 %i 字符 ⇒ 归渠道校验档、零冷却标记', async (pad) => {
+        const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+        const adapter = makeAdapter({
+          credential: makeCredential({ access_token: 'AT1' }),
+          refresh: async () => {},
+          accountPool: pool,
+          fetchImpl: async () => new Response(JSON.stringify({
+            code: 11128,
+            // ⚠️ 措辞距值开头 `pad` 个字符；腿① 是无界的，故它在**任何** pad 下都认领。
+            msg: `${'x'.repeat(pad)} conversation id missing`,
+            displayMsg: { zh: '内容未通过安全审核，请调整后重试。' },
+          }), { status: 400 }),
+        })
+        const error = await collectChunks(adapter, {
+          model: DEFAULT_MODEL,
+          messages: [{ role: 'user', content: 'hi' }] as never,
+          signal: new AbortController().signal,
+        } as never).catch((e: unknown) => e)
+
+        // 腿① 认领 ⇒ 排除**必须**也认领，否则这份报文会落 11140 档写冷却。
+        expect(pool.recorded).toEqual([])
+        expect((error as LlmError).message).toContain('渠道校验')
+        expect((error as LlmError).message).not.toContain('安全策略拦截')
       })
     })
 
@@ -4859,6 +5044,96 @@ describe('内容级风控（11128）：不得当成账号级拦截换号/冷却'
       await expect(sentTokensFor(JSON.stringify({
         code: 11128, msg: 'Request-Illegal',
       }))).resolves.toEqual(['AT1', 'AT2'])
+    })
+
+    /**
+     * ★★★★ **P1：限流换号循环里「②认证类 continue」排在「③渠道校验」之前**（2026-10-18 独立审计实测）
+     *
+     * ## 触发条件（我第一版复现**搞错了**，这里记准）
+     *
+     * 必须**从限流进来**：只有入口 `isRateLimited || channelRejected` 为真才进这个
+     * 换号循环。若入口就是渠道校验（400/403），`channelRejected` 入口值为 `true` ⇒
+     * `sawChannelVerification` **已由入口值初始化** ⇒ `③` 一次不跑也照样出口正确。
+     * ⚠️ 我第一版按「混合 400/403 池」复现**全部通过**，就是这个原因。
+     *
+     * 真实触发：**入口 429 限流**（`channelRejected=false`）→ 循环内某账号返回
+     * **403 形态**的渠道校验 → 被 ② 短路 → ③ 零次执行 → 出口判据为 false。
+     *
+     * | 入口 429，循环内 | 实测出口 |
+     * |---|---|
+     * | AT2/AT3 = **403** 渠道校验 | ❌ **`QUOTA_EXCEEDED`**「所有账号均受限，请稍后再试」 |
+     * | AT2/AT3 = **400** 渠道校验 | ✅ `PERMISSION_DENIED`「未通过渠道校验」 |
+     *
+     * ## 后果（正是本组注释写「必须消灭」的那个形态）
+     *
+     * 用户看到「模型 X 所有账号均受限，请稍后再试」⇒ 以为在限额、**白等一个
+     * 根本不存在的重置时刻**；而真实出路是「换号 / 停用该账号 / 换 provider」。
+     *
+     * ## 顺序纪律：**400 路径的换号循环已经落实**，限流路径是唯一漏的
+     *
+     * 400 路径那处把 `isContentRejection` 放在 401/403 腿**之前**（可观察的
+     * 顺序纪律），本循环却把 ② 排在 ③ 之前 ⇒ 两条路径**判据同型、顺序相反**。
+     */
+    it('★ 入口限流 + 循环内 403 形态渠道校验：不得误报「所有账号均受限」', async () => {
+      const convBody = illegalChannelBody()
+      // ⚠️ 状态码**按 token** 返回：入口 429 触发进入限流循环，后续账号回 403 渠道校验。
+      const byToken: Record<string, number> = { AT1: 429, AT2: 403, AT3: 403 }
+      const pool = recordingPool([
+        { id: 'acct-1', token: 'AT1' },
+        { id: 'acct-2', token: 'AT2' },
+        { id: 'acct-3', token: 'AT3' },
+      ])
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        fetchImpl: async (_url: unknown, init: RequestInit) => {
+          const token = (new Headers((init as RequestInit).headers as HeadersInit)
+            .get('Authorization') ?? '').replace('Bearer ', '')
+          const status = byToken[token] ?? 403
+          // ⚠️ 入口那一发必须是**限流**（429），否则进不了这个换号循环。
+          return new Response(status === 429 ? '{"code":6004,"msg":"rate limited"}' : convBody, { status })
+        },
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(LlmError)
+      // 核心判据：不得谎报成额度/限流语义（那会让用户白等一个重置时刻）。
+      expect((error as LlmError).code).toBe('PERMISSION_DENIED')
+      expect((error as LlmError).code).not.toBe('QUOTA_EXCEEDED')
+      expect((error as LlmError).message).toContain('渠道校验')
+    })
+
+    it('★★ 对照：同一场景但循环内是 400 形态（③ 能执行）—— 证明变量是状态码', async () => {
+      const convBody = illegalChannelBody()
+      const byToken: Record<string, number> = { AT1: 429, AT2: 400, AT3: 400 }
+      const pool = recordingPool([
+        { id: 'acct-1', token: 'AT1' },
+        { id: 'acct-2', token: 'AT2' },
+        { id: 'acct-3', token: 'AT3' },
+      ])
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        fetchImpl: async (_url: unknown, init: RequestInit) => {
+          const token = (new Headers((init as RequestInit).headers as HeadersInit)
+            .get('Authorization') ?? '').replace('Bearer ', '')
+          const status = byToken[token] ?? 400
+          return new Response(status === 429 ? '{"code":6004,"msg":"rate limited"}' : convBody, { status })
+        },
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect((error as LlmError).code).toBe('PERMISSION_DENIED')
     })
   })
 })
