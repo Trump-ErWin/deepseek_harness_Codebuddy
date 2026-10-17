@@ -45,7 +45,7 @@ import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import type { AccountPool } from './account-pool.js'
 import { httpErrorCode, collectImages } from './openai-compat.js'
 import { MINIMAX, MINIMAX_INFER_PATH, type MinimaxProduct } from './minimax-product.js'
-import { minimaxInferHeaders } from './minimax.js'
+import { describeMinimaxGeoRoute, minimaxInferHeadersFor } from './minimax.js'
 import { planSessionTitleThinking } from './session-title.js'
 import {
   registerAdapterIdempotent,
@@ -58,7 +58,7 @@ import {
 import {
   isMinimaxExpired,
   minimaxFallbackEntries,
-  minimaxFetchWithRetry,
+  minimaxFetch,
   type MinimaxCredential,
   type MinimaxModelEntry,
 } from './minimax.js'
@@ -533,6 +533,14 @@ export class MinimaxAdapter extends LlmAdapter {
    * ⚠️ **错误必须抛错**，不静默返回空流（Qoder 早期同型缺陷）。
    */
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    /**
+     * 本次请求是否**在跟随之前**观测到「国际站被地理路由」（issue IKMEVG）。
+     *
+     * ⚠️ 必须在这里声明、由 `send()` 的 `onGeoRoute` 置位：一旦跟到中国站，
+     * 国际站 token 得到的 `401 invalid access token` 与「凭据真失效」**逐字同形**
+     * （本机实测），事后无法区分。故判定的时机只能卡在 307 那一跳。
+     */
+    let geoRouted = false
     let credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || isMinimaxExpired(credential)) {
       await this.options.refresh()
@@ -682,14 +690,41 @@ export class MinimaxAdapter extends LlmAdapter {
       if (current === undefined) {
         throw new LlmError('minimax: no usable credential; log in first', 'MISSING_CREDENTIAL')
       }
-      return minimaxFetchWithRetry(
-        () => fetch(`${this.product.apiHost}${MINIMAX_INFER_PATH}`, {
+      /**
+       * ⚠️⚠️ 必须走 `minimaxFetch`（重试 + **保凭据跟随重定向**），不能裸 `fetch`。
+       *
+       * 真实缺陷（2026-10-17，issue IKMEVG）：`agent.minimax.io` 对所有路径恒返
+       * `307 → agent.minimaxi.com`，而 fetch **跨 origin 跟随会剥掉
+       * `Authorization`** ⇒ 第二跳无凭据 ⇒ `401 {"message":"token is required"}`。
+       * 用户看到的是「模型连接测试失败」，真因却是重定向丢头。
+       *
+       * ⚠️ 头必须由 `buildInit` **每跳重新构造**（这里每次现读 `current`，
+       * 换号后连第一跳也会带上新 token）。
+       *
+       * ⚠️ 国际站另需附用户设置的 `X-Forwarded-For`（绕开 Akamai 按出口 IP
+       * 的地理分流）。**每次现读**池里的设置，不缓存 —— 用户随时可能在面板里改。
+       *
+       * ⚠️ **必须用 `typeof` 判一下**：`accountPool` 是结构化类型（`AccountPool`），
+       * 而单测/旧接线可能传**只实现了一部分方法**的替身 —— 直接
+       * `this.options.accountPool?.minimaxXff()` 会在那种替身上抛 `TypeError`
+       * （`?.` 只挡 `null`/`undefined`，挡不住「对象上没有这个方法」）。
+       * 实测后果：`minimax-adapter.spec.ts` 的轮换组 16 条用例全红。
+       */
+      const pool = this.options.accountPool
+      const xff = typeof pool?.minimaxXff === 'function' ? pool.minimaxXff() : undefined
+      return minimaxFetch(
+        `${this.product.apiHost}${MINIMAX_INFER_PATH}`,
+        () => ({
           method: 'POST',
-          headers: minimaxInferHeaders(current),
+          headers: minimaxInferHeadersFor(current, xff, this.product.id),
           body: JSON.stringify(payload),
           signal: options.signal,
         }),
-        options.signal,
+        {
+          signal: options.signal,
+          // 记下「地理路由」：跟随后 401 与「凭据失效」同形，只能在此刻判。
+          onGeoRoute: () => { geoRouted = true },
+        },
       )
     }
 
@@ -736,7 +771,21 @@ export class MinimaxAdapter extends LlmAdapter {
         return {
           error: new LlmError(
             `minimax: 推理端点返回了非 SSE 响应（HTTP 200）${text === '' ? '' : ` — ${text.slice(0, 500)}`}`,
-            'SERVER',
+            /**
+             * ⚠️⚠️ **不能用 `SERVER`**（2026-10-17 审计发现的真缺陷，本行是既有代码）。
+             *
+             * 本对象会被 `attempt()` 原样当作 `streamError`，**不经过**
+             * `httpErrorCode()` 重新归类（实测最终 `error.code === 'SERVER'`）。
+             * 而 DSH 的 `DEFAULT_RETRYABLE_CODES` 含 `'SERVER'`、
+             * `DEFAULT_MAX_RETRIES = 5` ⇒ 这条**确定性失败**（网关就是没给 SSE，
+             * 同一请求重发大概率还是同样结果）会被 `dsh-llm-retry` 自动重试 5 次，
+             * 每次都重跑整条换号循环。
+             *
+             * 用 `INVALID_REQUEST` 的理由与地理路由处同源：它**不在**默认可重试集合、
+             * 也**不会**被 harness 替换文案（只用 `QUOTA` / `AUTH` 替换）。
+             * 语义也对位 ——「这次响应格式不可用」是请求层面的确定性拒绝。
+             */
+            'INVALID_REQUEST',
           ),
           text,
         }
@@ -859,6 +908,59 @@ export class MinimaxAdapter extends LlmAdapter {
     /** 抛出「不该换号」时的原错误（HTTP 形状逐字保留既有文案与错误码）。 */
     const throwCurrent = (): never => {
       if (streamError !== undefined) throw streamError
+      /**
+       * ⚠️⚠️ **地理路由要解释背景，但不能吞掉真实错误**（issue IKMEVG，自查修正）。
+       *
+       * 判据是 `geoRouted`（跟随**之前**看到的 307→minimaxi.com），不是状态码：
+       * 跟到中国站后国际站 token 得到的 `401` 与「凭据真失效」逐字同形，
+       * 拿它判会把「换个网络就能用」误报成「请重新登录」。
+       *
+       * ⚠️⚠️ **但 `geoRouted` 只说明「经历过 307」，不说明失败原因就是它**
+       * （真实反例：`307 → 402 insufficient_balance_error`）。初版在此
+       * **无条件**把错误码改成 `SERVER`，于是 402 的 `QUOTA_EXCEEDED` 被覆盖
+       * ⇒ 用户看到「去填 IP / 走代理」，而**「去充值」这个唯一有效动作消失**。
+       *
+       * ⇒ 现在的口径：**错误码优先保留真实语义**（402 仍是 `QUOTA_EXCEEDED`），
+       * 地理路由只作为**文案附加说明**。
+       *
+       * ⚠️⚠️ **地理路由用 `INVALID_CREDENTIAL` 而不是 `SERVER`**（自查发现的真缺陷）：
+       *
+       * DSH 的 `dsh-llm/lib/types/retry-policy.js` 里
+       * `DEFAULT_RETRYABLE_CODES = [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`，
+       * `DEFAULT_MAX_RETRIES = 5` ⇒ 用 `SERVER` 会被 `dsh-llm-retry` **自动重试 5 次**。
+       * 而地理路由是**确定性失败**（出口 IP 不会因重试而变）⇒ 每次重试都会重新选号、
+       * 重新 307、重新跟到中国站、重新 401，用户白等约 15s 退避、日志凭空多一串失败。
+       *
+       * `INVALID_CREDENTIAL` 的官方注释恰好是同一理由
+       *（"Deliberately outside the default retryable set — a malformed credential
+       * fails identically on every attempt"），且它不会被文案替换
+       *（DSH 只在 `QUOTA` / `AUTH` 上替换 message）。
+       * ⇒ 语义对位：**确定性、不可重试、文案必须保留**。
+       */
+      if (geoRouted) {
+        const geoDetail = errorText === '' ? undefined : errorText.slice(0, 200)
+        // 402 = 余额不足，语义比「地理路由」更具体，必须保住 QUOTA_EXCEEDED。
+        if (status === 402) {
+          throw new LlmError(
+            `minimax: ${describeMinimaxGeoRoute(geoDetail)}`,
+            'QUOTA_EXCEEDED',
+            { status },
+          )
+        }
+        const code = httpErrorCode(status)
+        /**
+         * 只有「真实状态没有更具体语义」的档位才让地理路由接管错误码。
+         * ⚠️ 接管时一律用 `INVALID_CREDENTIAL`（不可重试，见上）；
+         * 若直接沿用 `AUTH` 会被 harness 的文案替换吞掉 message
+         *（本仓库 IKLBSH 记过的复发形态），沿用 `SERVER` 则会触发 5 次自动重试。
+         */
+        const geoOwnsCode = code === 'SERVER' || code === 'AUTH'
+        throw new LlmError(
+          `minimax: ${describeMinimaxGeoRoute(geoDetail)}`,
+          geoOwnsCode ? 'INVALID_CREDENTIAL' : code,
+          status === 0 ? {} : { status },
+        )
+      }
       // ⚠️ 402 是**余额不足**，必须原样透出 —— 它是最常见的真实失败，
       // 归成 SERVER/AUTH 会让用户看不到「去充值」这个唯一有效动作。
       const code = status === 402 ? 'QUOTA_EXCEEDED' : httpErrorCode(status)
