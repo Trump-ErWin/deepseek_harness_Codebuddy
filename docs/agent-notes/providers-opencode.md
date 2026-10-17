@@ -434,3 +434,181 @@ SSE 逐块到达（0/43/89ms 三片）、并发 5 全 200。⇒ **Node 26 上工
 该 spec 的 2 条「代理不可用」用例**因为错误的原因通过**（见上文假绿）。
 ⇒ **教训**：看到「基线同红 / 环境性问题」时，要么查清根因，要么**留一条会持续报警的闸**；
 把红用例当背景噪音放过，等于让一个「provider 完全不可用」的缺陷安静地留在主干里。
+
+## ⚠️⚠️ Issue IKM9LR：可达性判据从「本地硬编码表」改为「远端 `provider.api`」
+
+**用户报障**（2026-10-16）：OpenCode 官方公告 GLM 5.3 Flash 与 DeepSeek V4.1 Flash
+已免费提供（附官方推文截图），而本插件的 OpenCode 渠道**选择不了这两个模型**；
+用户在 scoop 装的 opencode TUI 里**能看到**。
+
+### 根因：一个常量吃了两份职责
+
+`OPENCODE_FALLBACK_MODELS` 同时是「网络失败的兜底目录」**与**「协议可达性白名单」，
+而后者是**硬编码**的。`loadOpencodeCatalog` 拉到远端 85 条后逐条过
+`isReachableOpencodeModel`（`opencode-adapter.ts`）⇒ 远端**明明下发**的新模型
+被本地表挡掉，症状与「上游没这个模型」**完全同形**。
+
+实测被挡掉的 5 条：`beam-free`、`nemotron-3.5-super-vl-free`、`jev-1.13-free`、
+**`deepseek-v4.1-flash-free`**、**`glm-5.3-flash-free`**。
+
+⚠️ 这不是「数据没更新」而是**设计缺陷**：每上一个新模型都要手工加一行代码。
+
+### 修法：`provider.api` 才是协议端点的权威字段
+
+models.dev 每个条目带 `provider.api`。实测（2026-10-17）按它分组与
+「本插件实现了哪些协议」**逐格吻合**：
+
+| `provider.api` | 条数 | 本插件 |
+|---|---|---|
+| `https://opencode.ai/inference/openai/v1` | 56 | ✅ 已实现（`OPENCODE_CHAT_PROTOCOL_API`） |
+| `…/inference/anthropic/v1` | 17 | ❌ 未实现（实测 `/v1/messages` 恒 500） |
+| `…/inference/google/v1beta` | 8 | ❌ 未实现（Gemini 原生协议） |
+| （无该字段） | 4 | ⚠️ 不知道 ⇒ **退回本地表** |
+
+⚠️ 改前那 14 条本地表条目**全部**落在 `openai/v1` 内、**零反例**。
+
+**三格语义（缺一不可）**：`true` ⇒ 可达；`false` ⇒ 不可达；**缺条目 ⇒ 退回本地表**。
+第三格是刻意的 —— `jev-1.13-free` 无条目且实测回 `400 ModelProtocolUnsupported`，
+但那条实测**只属于那个模型**，推广成「无条目即不可达」会让未来所有新模型凭空消失。
+
+⚠️ **比较必须逐字相等**（用 `endsWith` 也会过，但会让未来同后缀的第三方端点被误判）。
+
+### ⚠️ 这道闸管不了的三样（只能靠运行时错误分类兜）
+
+① **地域封锁**：`beam-free` 的 `api` 就是 `openai/v1`，实测 403 `RegionError`
+（按出口 IP 判，目录层无从预知）；② **上游不稳定**：`glm-5.3-flash-free`
+实测约 2/5 概率 429；③ **废弃**：`mimo-v2.5-free` 回 410
+`ModelDeprecated`（上游点名改用 `mimo-v2.6-flash-free`），
+`nemotron-3-ultra-free` 远端已不下发且实测 503 —— 这两条**已从兜底表移除**，
+移除理由留在 `opencode-product.ts` 的注释里（别顺手加回来）。
+
+### ⚠️⚠️ 两个**同源但独立**的判据 bug（都靠硬编码表）
+
+1. **免费判定也只看本地表**（`isFreeOpencodeModel`）⇒ 远端 `cost: {input:0,output:0}`
+   的新免费模型被判成**收费** ⇒ 匿名用户看不到（与可达性那个症状同形、但独立）。
+   现已改为**远端 cost 优先、本地表兜底**。
+2. **`listModels` 的调用顺序**：`catalog()` 内部会逐条过滤，而两张远端表是
+   **读能力表那一刻才注入**的 ⇒ 原先「先取目录、后读能力表」在冷启动首帧
+   **必然**退化成纯本地表。**守卫用例实测抓到的真缺陷**，修法是先读能力表。
+   ⚠️ `loadOpencodeCatalog` 里也加了一次同样的前置读（它也过滤）。
+
+### 实测结果
+
+匿名可见模型 **7 条 → 9 条**，issue 报的两个都在列；
+`deepseek-v4.1-flash-free` 另测得工具调用正确还原 `read`、`effort=low`/`max` 上游均 200。
+
+⚠️ **图片能力仍是零实测**：models.dev 标这两个为 `text+image`，但实测窗口内
+`FreeTierError` 拒绝率升到 8/8，取不到证 ⇒ 按惯例**不写进实测校准表**，
+记「结构上可达、零实测」。
+
+### ⚠️⚠️ 判「某个模型可用」时**单次探测不作数**
+
+实测 `FreeTierError` 是**逐请求随机**的（3 轮 × 4 模型并列，`big-pickle` 这种
+老模型也在 OK 与 403 间交替）⇒ 单次请求判不了任何模型能力。
+我据此作废过一轮图片结论（先拿到「白色」，解码后发现那张 PNG 其实是
+`R0G0B0A0` **全透明**，纯幻觉）。⇒ 每格必须多采样，且只统计「过了门禁的那些」。
+
+### ⚠️ 三次实测暴露的上游形态（供下次判读报障参考）
+
+| 现象 | 含义 |
+|---|---|
+| `403 FreeTierError`「can only be used from within OpenCode」 | 形状门禁失败（缺 session 头/门禁工具），**不是**额度 |
+| `429 …Endpoint is unavailable` | 上游该端点不稳定，**可重试**（`glm-5.3-flash-free` 常见） |
+| `400 ModelProtocolUnsupported` | 模型级，与端点无关（`jev-1.13-free`） |
+| `410 ModelDeprecated` | 上游废弃，报文带 `replacement` 字段 |
+| `403 RegionError` | 出口 IP 地域封锁，本地判不了 |
+| 空正文 + `finish=stop` | 上游抽风（2026-10-15 记录，约 1/3 概率），**与协议适配无关** |
+
+## ⚠️⚠️ models.dev 直读收敛到全仓唯一直读点（2026-10-17）
+
+**用户要求**：「定期读取 models.dev 应该成功就保存本地文件，冷启动就读本地文件缓存，
+读不到就 fallback 不会直读 models.dev（可能卡很久）；opencode 或者 cline 等 provider
+读取 models.dev 的直读操作都变成读取本地缓存，只有 1 处定期更新本地缓存可以直读」。
+
+### 改前：两处各直连一次（5 MB 的外部站点）
+
+`opencode-capability.ts` 与 `cline-models-dev.ts` **各自**一套
+直连 + TTL + 在飞去重 + ETag。既是「一文件两套同义判据」，
+也让这 5 MB 的请求在插件里发生**两次**。实测那份数据
+**解压后 5.05~5.39 MB**，且「要么 ~2 秒、要么整段挂死」
+（本机三取：`20010ms 超时` / `20010ms 超时` / `1908ms 成功`；
+2026-10-17 再测仍复现 `200` / `45s 超时` / `200` 交替）。
+
+### 改后：`src/models-dev-cache.ts` 唯一直读点
+
+降级链**三级，任何一级都不回退到网络**：
+
+```
+内存 → $DSH_HOME/cache/models-dev.json → undefined（调用方各自的本地兜底表）
+```
+
+| 常量 | 值 | 依据 |
+|---|---|---|
+| `MODELS_DEV_TIMEOUT_MS` | 90s | 成功只需 ~2s、失败能挂满窗口 ⇒ 调大几乎零成本 |
+| `MODELS_DEV_MAX_ATTEMPTS` | 3 | 用户要求「3 次都失败才放弃」 |
+| 退避 | 指数 2s → 4s | 固定间隔可能整体落在同一抖动窗口 |
+| `MODELS_DEV_TTL_MS` | 6h | 发布节奏的数据 |
+| 周期刷新 | TTL/2 = 3h | 比 TTL 短才能保证最坏只落后半个 TTL |
+| `MODELS_DEV_DEADLOCK_MS` | 480s | ⚠️ **必须 > 单轮最坏耗时**，见下 |
+| `MODELS_DEV_CACHED_PROVIDERS` | `['opencode','cline-pass']` | 见下 |
+
+### ⚠️⚠️ 三个「加长超时 / 加重试」引入的耦合点（各自都有守卫）
+
+1. **死锁阈值必须 > 单轮最坏耗时**：单轮 = 3×90s + 6s ≈ **276s**，而旧判据
+   `TIMEOUT × 2` 只有 180s ⇒ **一个正在正常重试的刷新会被误判成「已死」而再起一个**
+   ⇒ 并发请求翻倍，正好加剧上游压力。守卫是**双向**的：
+   `DEADLOCK > WORST_CASE` 且 `DEADLOCK < WORST_CASE × 4`
+   （后者防阈值大到让真卡死的刷新永久占住去重位）。
+2. **只缓存白名单里的 provider**：整份落盘实测 **2.6 MB / 8993 条**，而
+   `loadDiskCacheSync()` 是 `readFileSync`、跑在**启动路径**上 ⇒ 与本模块
+   自己写的「代价可忽略」矛盾，也与 2026-10-02 那次事故同型。
+   白名单后降到 **50.4 KB**（原始 5.49 MB 的 0.90%）。
+   ⚠️ 新增消费方必须往白名单加一条，否则它永远读到空块；守卫会扫描消费方逐个点名。
+3. **失败日志必须说明重试过几次**（`已重试 3 次`），否则用户看到一条
+   「沿用上一次读数」却不知道后台已经等过。
+
+### 失败永不覆盖既有缓存（核心不变式）
+
+失败（超时/网络/**解析为空**）一律**保留旧值**，只记日志。
+⚠️ 「解析为空」也必须算失败：否则会把磁盘上的好数据覆盖成空文件，
+下次冷启动真的什么都没有。守卫用例逐条锁住。
+
+### ⚠️ OpenRouter **不能**当 models.dev 的备份源（实测核对，用户提议）
+
+用户提议用 `https://openrouter.ai/api/v1/models` 作备份。实测
+**HTTP 200 / 2.3s / 470 条**（国内可达），但**接不得**：
+
+| 问题 | 实测 |
+|---|---|
+| **没有 `provider.api` 字段** | 470 条里 **0 条**有 ⇒ 协议可达性无从判定 |
+| **id 命名空间不重叠** | 前缀全是 `openai:`/`deepseek:`/`z-ai:`…；`*opencode*` / `*zen*` 匹配 **0 条** |
+
+⇒ 并进来会让 `chatProtocol` 变 `undefined` ⇒ 退回本地表 ⇒ **等于没修 issue**。
+它的 `context_length` / `architecture.input_modalities` 在 models.dev 也有
+⇒ 属**冗余而非补充**。⇒ **决定不接入**（2026-10-17）。
+
+## ⚠️ 连带修掉的一个 pre-existing flaky：`officeace-inflight-guard` 用例③
+
+**与 OpenCode 无关**，但它污染全量信号（实测 12 次里红 4 次）⇒ 一并根除。
+
+**根因（探针实测，非推断）**：`DSH_OFFICEACE_PENDING_TTL_MS = '0'` 把判据
+`nowMs - pending.at > TTL` 退化成 `> 0`，即「**跨过 1 毫秒**才算中止」
+（`isAbandonedOfficeAceLogin` 用**严格大于**）。而用例③在 `account.create`
+之后**紧接着**调 `account.list`，两者常落在**同一毫秒** ⇒ `delta === 0`
+⇒ 判「进行中」⇒ 幽灵条目没被收掉 ⇒ 断言要 0 拿到 1。
+
+探针输出：`delta=0 ⇒ 已中止=false`、`delta=1 ⇒ 已中止=true`。
+
+**修法**：断言前确定性推进时钟 2ms。
+
+⚠️ **验证方式本身值得记**：先做负向对照（把 2ms 改回 0ms）却 8/8 全绿，
+差点把巧合当结论；是 `git stash` 严格对照才确认有效 ——
+**机器状态会漂，单次观测不可信**。
+
+| 版本 | 20 次对照 |
+|---|---|
+| 原始 | 11 绿 / **9 红** |
+| 修复后 | **20 绿 / 0 红** |
+
+⚠️ 这是 `isAbandonedOfficeAceLogin` 注释里记的同型事故（「20 次只有 10 次变红」）
+的**复发** —— 当年没被根治。教训：断言必须是**确定时刻**可驱动的。
