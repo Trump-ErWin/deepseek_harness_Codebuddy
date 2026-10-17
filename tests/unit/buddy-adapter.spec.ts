@@ -1497,6 +1497,51 @@ describe('BuddyAdapter credential handling', () => {
     expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
     expect((error as LlmError).message).toContain('当前账号')
     expect((error as LlmError).message).not.toContain('已逐个换号重试')
+    // ⚠️⚠️ 也不能自称「流内错误帧下发」（2026-10-17 第一轮审计实测的真缺陷）：
+    // 这一格是 **HTTP 响应体**（状态 400），不是流内帧。那句措辞原本只为流内路径
+    // 设计，被 HTTP 单凭据路径复用 `rotated:false` 时一并带了出来 ⇒ 对用户谎报了
+    // 错误的失败通道，会把人引向「流式解析有问题」这个完全错误的方向。
+    expect((error as LlmError).message).not.toContain('流内错误帧下发')
+    expect((error as LlmError).message).toContain('没有其他账号可换')
+  })
+
+  it('400 换号途中撞到 14003 模型饱和也继续换号（2026-10-17 第一轮审计 P1）', async () => {
+    // ⚠️⚠️ 真缺陷（第一轮独立审计实测，我已独立复现）。
+    //
+    // 饱和分支的既定处置是「留在本账号退避重试、绝不换号」，其前提是
+    // 「饱和是模型级，池里其它账号会撞同一堵墙」。但上游若按账号做过负载均衡，
+    // 该前提不成立 —— 而 11140 本身已被证明是**按账号**生效的。
+    //
+    // 实测（AT1 `400/11140` → AT2 `429/14003` → AT3 完全可用）：
+    //   修复前发过的凭据 = `AT1, AT2, AT2, AT2` —— **AT3 从未被试**，
+    //   且报出「换账号无效，请改用其它模型」这条**与事实相反**的指引。
+    const used: string[] = []
+    const pool = makeCooldownAwarePool([
+      { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+      { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      { id: 'acc-3', credential: makeCredential({ access_token: 'AT3' }) },
+    ])
+    const saturation = JSON.stringify({ code: 14003, msg: 'model busy, please switch model' })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: pool,
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) => {
+        const token = init.headers.get('Authorization') ?? ''
+        used.push(token.replace(/[^A-Z0-9]/g, ''))
+        if (token.includes('AT1')) return new Response(POLICY_BODY, { status: 400 })
+        if (token.includes('AT2')) return new Response(saturation, { status: 429 })
+        return new Response(OK_SSE_400, {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        })
+      },
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    // 关键：AT3 那个**完全可用**的账号必须被用上。
+    expect(used).toContain('BAT3')
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    // ⚠️ **刻意不写冷却**：饱和是模型级的，写 30 分钟账号级冷却会封死好账号
+    // （饱和分支的注释正是为此反对复用限流标记）。只 acc-1（11140）该被标记。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acc-1'])
   })
 
   it('安全策略拦截在换号途中被剔除：换到可用账号即成功', async () => {
