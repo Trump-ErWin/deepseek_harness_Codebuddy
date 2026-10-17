@@ -331,6 +331,94 @@ function shortId(): string {
 }
 
 /**
+ * OfficeAce 登录中间态的有效期（毫秒）—— **判据的唯一实现处**。
+ *
+ * ## 为什么必须有（Gitee issue IKM741 的 A 档：登录中止留幽灵占位账号）
+ *
+ * `account.create` **先** `pool.addAccount` 登记占位条目、**再**返回 `loginUrl`，
+ * 此后由 `login.poll` 轮询取 code。用户**打开授权页但没完成授权就关掉**时
+ * （issue 原话「好像是没回调 callback」），云侧永远不会给出 code ⇒ 占位条目
+ * **永久残留**成一张「凭据未配置」的幽灵卡片，而它没有任何入口会被清理
+ * （issue 原话「还要手动删一次」）。
+ *
+ * ⚠️ **不能判成「失败」来清理**：「用户还没授权完」与「正在轮询」必须同形 ——
+ * 判成失败会**删掉正在进行的正常登录**。故判据只能是**时间**。
+ *
+ * 客户端自己的轮询上限是 5 分钟（`plugin-src/client/jet-hub.js` 的
+ * `deadline = Date.now() + 300000`），超时后它停表并关窗 —— 那之后这个中间态
+ * 在结构上已经**不可能**再拿到 code。这里取 **4 倍余量**（20 分钟），让
+ * 「慢网络 / 用户在多个窗口间切换」都还有救，而残留最多存活 20 分钟。
+ *
+ * `DSH_OFFICEACE_PENDING_TTL_MS` 可覆盖（**测试与 e2e 用**：判据必须是
+ * 「确定时刻」可驱动的，见 `healExpiredAccounts` 的 `now` 注入点那条教训）。
+ * ⚠️ 非法值（NaN / ≤0）回落默认值：`parseInt(x) || default` 那种写法会把
+ * **显式传 0** 也吃掉，而 0 在这里是合法且有意义的值（「立即收口」）。
+ */
+export function officeacePendingTtlMs(): number {
+  const raw = process.env.DSH_OFFICEACE_PENDING_TTL_MS
+  if (raw === undefined || raw.trim().length === 0) return OFFICEACE_PENDING_TTL_MS_DEFAULT
+  const parsed = Number(raw.trim())
+  if (!Number.isFinite(parsed) || parsed < 0) return OFFICEACE_PENDING_TTL_MS_DEFAULT
+  return parsed
+}
+
+/** {@link officeacePendingTtlMs} 的默认值（20 分钟 = 客户端轮询上限的 4 倍）。 */
+export const OFFICEACE_PENDING_TTL_MS_DEFAULT = 20 * 60_000
+
+/**
+ * 判「这份 OfficeAce 登录中间态是否已被用户中止」—— **判据的唯一实现处**。
+ *
+ * 抽成纯函数（而不是内联在收口循环里）的理由与 `officeacePendingTtlMs` 同源：
+ * 边界（恰好 TTL、TTL 前 1ms）必须能被**确定地**测到 —— 内联时判据隐含在
+ * 一次 `Date.now()` 调用里，用例只能靠跨毫秒的运气命中（本仓库已实测过
+ * 「20 次只有 10 次变红」的同型事故）。
+ *
+ * ⚠️ **中间态缺失 ⇒ 判定为「已中止」**（`pending === undefined` 返回 true）：
+ * 那种形态是「宿主重启过，中间态（内存 Map）丢了，而池里的占位条目还在盘上」
+ * —— 它同样拿不到 code（state 已随进程消失），属于**必须收口**的残留。
+ * ⚠️ 但收口**仍要过凭据那道闸**（见 `sweepAbandonedOfficeAceLogins`）：重启后
+ * 若凭据早已落库，条目必须保留。
+ *
+ * ## ⚠️⚠️ 「在途」是**显式状态**，不是时间推断（2026-10-17 红队 P2 + P4 两轮打穿）
+ *
+ * 判据演化（每一步都由可复现探针推动）：
+ *
+ * | 版本 | 判据 | 红队打穿的形态 |
+ * |---|---|---|
+ * | 初版 | `now - pending.at > TTL`，且落库**前**就删 pending | **P2**：落库中任何 `account.list` 都删号（不需要 TTL 到期） |
+ * | 二版 | 把 `delete` 挪到落库**之后** | **P4**：落库**耗时 > TTL** 时，`pending` 虽在仍判「已中止」⇒ 同样删号 |
+ * | 三版（本版） | **`settling` 显式在途标记**：为真时**无条件**返回 false | —— |
+ *
+ * ⚠️ 我一度想用「`login.poll` 每次刷新 `at`」这个更省的替代（红队也提了）：
+ *    它对**真机**有效（客户端每 1 秒轮询），但**结构上仍不严密** ——
+ *    只要 `account.list` 在两次轮询之间到达、且 `at` 恰好已过 TTL，判据仍会误判。
+ *    红队探针（只调 `account.list`、不调 `login.poll`）正是这样打穿它的。
+ *    ⇒ 「在途」必须是**离散可分**的状态，**不能靠任何时间判据近似**。
+ *
+ * @param pending - 该账号的中间态（`undefined` = 没有 / 已随重启丢失）。
+ * @param nowMs - 「现在」的毫秒时刻（**入参化**，不在这里读时钟）。
+ */
+export function isAbandonedOfficeAceLogin(
+  pending: { at: number; settling?: boolean } | undefined,
+  nowMs: number,
+): boolean {
+  if (pending === undefined) return true
+  /**
+   * ⚠️⚠️ **落库进行中 ⇒ 绝不判「已中止」**（与 TTL 无关）。
+   *
+   * 这一格是「不可逆删除必须建立在**确证**上」的最后一道：该账号此刻正把凭据
+   * 写进库，删掉它就是**销毁用户刚完成授权的登录**（`removeAccount` 连带
+   * `credentials.unset`，不可逆且用户零提示）。
+   * ⚠️ 判据放在 TTL 之前 —— 顺序即语义：**在途优先于超时**。
+   */
+  if (pending.settling === true) return false
+  // ⚠️ 用 `>`（严格大于）：恰好等于 TTL 时**仍算进行中** —— 边界方向与
+  //    `healExpiredAccounts` 的 `now() >= deadlineAt`（反向）刻意不同，
+  //    因为这里的「收口」是不可逆的删除，宁可多留一轮。
+  return nowMs - pending.at > officeacePendingTtlMs()
+}
+
+/**
  * ZCode 登录渠道的白名单归一。
  *
  * ## 为什么要有这道
@@ -2173,9 +2261,181 @@ function registerJetHubEndpoints(
     codeVerifier: string
     dpopPrivateJwk: import('./officeace-auth.js').DpopPrivateJwk
     credentialRef: string
+    /**
+     * 本次登录的**发起时刻**（Gitee issue IKM741 修法，2026-10-16）。
+     *
+     * 用途：判定一份中间态是否已经**远超登录窗口**（见 {@link OFFICEACE_PENDING_TTL_MS}），
+     * 从而把「用户中途关掉授权页」的残留占位条目收口。**只用于判定过期**，
+     * 不参与任何凭据/状态判定。
+     */
+    at: number
+    /**
+     * ⚠️⚠️ **「落库进行中」的显式标记**（2026-10-17 红队 P2 + P4 两轮打穿后新增）。
+     *
+     * 为 `true` 时 {@link isAbandonedOfficeAceLogin} **无条件**返回 `false`
+     * ⇒ 并发的 `account.list` **不可能**把这次登录判成「已中止」而删号。
+     *
+     * ## 为什么必须是**显式状态**而不是时间判据
+     *
+     * 判据演化史（每一步都由可复现探针推动，登记在 `isAbandonedOfficeAceLogin`）：
+     * - 初版：落库**前**就删 pending ⇒ **P2**（落库中任何 `account.list` 都删号，不需要 TTL 到期）；
+     * - 二版：把删挪到落库**后** ⇒ **P4**（落库**耗时 > TTL** 时仍判「已中止」⇒ 同样删号）；
+     * - 三版（本字段）：在途 = **离散状态**，与任何时间判据无关。
+     *
+     * ⚠️ 别退回「靠 `login.poll` 刷新 `at`」那种近似（我试过、红队当场证伪）：
+     *    只要 `account.list` 落在两次轮询之间且 `at` 恰好过期，误判照旧。
+     *    「在途」这件事**只有落库代码自己知道**，所以标记也必须由它来打。
+     */
+    settling?: boolean
   }
 
   const pendingOfficeAceState = new Map<string, PendingOfficeAceState>()
+
+  /**
+   * OfficeAce 登录中间态的有效期（毫秒）。
+   *
+   * ## 为什么必须有（Gitee issue IKM741 的 A 档：登录中止留幽灵占位账号）
+   *
+   * 现状（本机实测复现）：`account.create` **先** `pool.addAccount` 登记占位条目、
+   * **再**返回 `loginUrl`，此后由 `login.poll` 轮询取 code。用户**打开授权页但没
+   * 完成授权就关掉**时（issue 原话「好像是没回调 callback」），云侧永远不会给出
+   * code ⇒ 占位条目**永久残留**：卡片显示「凭据未配置」，而它没有任何入口会被清理
+   * （`failLogin` 只在**失败终态**触发，而「用户还没授权完」与「进行中」必须同形
+   * —— 不能判成失败，否则正在轮询的正常登录会被删号）。
+   *
+   * ⇒ 判据只能是**时间**：客户端自己的轮询上限是 5 分钟（`jet-hub.js` 的
+   * `deadline = Date.now() + 300000`），超时后它会停表并关窗 —— 那之后这个
+   * 中间态在结构上已经**不可能**再拿到 code。这里取 **4 倍余量**（20 分钟），
+   * 让「慢网络 / 用户在两三个窗口间切换」都还有救，而残留最多存活 20 分钟。
+   *
+   * ⚠️ **收口时机刻意选在 `account.list`**（面板每次刷新账号列表都调它），
+   * 而不是加一个新的定时器：本仓库已有「启动首轮 + 30 分钟定时器」的续期调度器，
+   * 再加一条独立后台链会多一个需要隔离的生命周期（见 `setup-isolation.ts` 的
+   * 教训：后台链会在用例结束后继续跑，抢不过 env 覆盖）。`account.list` 恰好是
+   * 「用户能看见那张幽灵卡片」的唯一入口，在这里顺手收口最省且必然被执行。
+   *
+   * ⚠️⚠️ **绝不能按「有没有凭据」收口**（那是 `failLogin` 的判据）：
+   * 用户的授权可能刚好在超时后才完成落库 —— 那时凭据在、条目也必须在。
+   * 故本收口**先判凭据是否已落库，在 ⇒ 只更新中间态/保留条目，绝不删**。
+   */
+  const OFFICEACE_PENDING_TTL_MS = officeacePendingTtlMs()
+
+  /**
+   * 收口「登录已中止」的 OfficeAce 占位条目（Gitee issue IKM741 修法 A）。
+   *
+   * 判据三条**必须同时**（少任何一条都会误杀正在进行的登录）：
+   *
+   * | # | 判据 | 漏掉的后果 |
+   * |---|---|---|
+   * | 1 | 该账号在池里**且该 provider 是 `officeace`** | 不去动别的渠道的条目 |
+   * | 2 | 中间态缺失**或**已超过 {@link OFFICEACE_PENDING_TTL_MS} | 把正在轮询的登录删掉（用户正常授权反而失败） |
+   * | 3 | 该账号的凭据**确实未落库** | 把**刚登好**的账号连凭据一起删掉（不可逆） |
+   *
+   * ⚠️ **第 3 条是方向性的安全闸**：删除不可逆（`removeAccount` 会连带
+   * `credentials.unset`），而「超时」只是**推断**「用户不会再来」—— 若他其实
+   * 完成了授权，凭据就在库里。故先查凭据，在就不删（这正是 `failLogin` 里
+   * `loginCredentialLanded` 的同一条判据，**不另写一份**）。
+   *
+   * ## ⚠️⚠️ 判据 2 的**跨进程**分支（2026-10-17 红队 **P5**，结构必然、零实测）
+   *
+   * `pendingOfficeAceState` 是**本进程的** Map，而 `state.json` 与凭据库是**同机共享**的
+   *（AGENTS.md 明确记着「dsh web 与 desktop 两个实例各自持锁」⇒ 两进程并存是**声明支持**的形态）。
+   * ⇒ 进程 A 看到进程 B 刚建的占位条目时，`pending` 必然缺失 ⇒ 旧判据 2 **恒判「已中止」**，
+   * 窗口是**整个登录等待期**（分钟级，不是毫秒）：用户还在授权页上填密码，另一进程
+   * 一次 `account.list` 就把占位条目删掉 ⇒ 本进程 `login.poll` 报 `{done:false}` ⇒
+   * 用户干等 5 分钟超时；若恰好压在落库那几秒 ⇒ 与 P2 同样的数据丢失。
+   *
+   * 修法（**不新增持久化字段**，复用池条目自带的、**跨进程可见**的 `createdAt`）：
+   * 条目**太新**（建了不到 TTL）就不动它 —— 一个刚创建的占位条目，无论属于哪个进程，
+   * 都更可能是「正在登录」而不是「重启残留」。
+   * ⚠️ 代价如实登记：另一进程崩溃留下的、**年轻时**的残留要多等一个 TTL 才被收口
+   *（原来立刻）。方向与既有语义一致：`createdAt` 早于重启点的残留照样立刻收。
+   *
+   * ⚠️ 与既有 `failLogin` 的分工：`failLogin` 处理**显式失败**（交换被拒、
+   * 账号未订阅等），它在**失败那一刻**就删；本收口处理**没有失败、也没有成功**
+   * 的静默中止（用户关窗），它只能靠时间判定。两者判据不同、互不重叠。
+   *
+   * @param now - 「现在」的注入点（**只供测试**；生产不传即 `Date.now()`）。
+   *   ⚠️ 存在的理由与 `healExpiredAccounts` 的 `now` 参数**同因**（AGENTS.md
+   *   记过：边界用例在自己体内取 `Date.now()` 而实现内部再取一次 ⇒ 跨毫秒
+   *   才检出，单文件 20 次只有 10 次变红）。注入后边界判定是确定的。
+   * @returns 被收口的账号 id 列表（供日志与用例观测）。
+   */
+  async function sweepAbandonedOfficeAceLogins(now: () => number = Date.now): Promise<string[]> {
+    const swept: string[] = []
+    let accounts: readonly ProviderAccountEntry[]
+    try {
+      accounts = await pool.listAllAccounts()
+    } catch {
+      // 读不到池 ⇒ **什么都不做**（不可逆的删除不该建立在一次失败的读上）。
+      return swept
+    }
+    for (const entry of accounts) {
+      if (entry.provider !== OFFICEACE.id) continue
+      const pending = pendingOfficeAceState.get(entry.id)
+      /**
+       * ⚠️⚠️ **跨进程兜底：条目太新就不动它**（2026-10-17 红队 **P5**）。
+       *
+       * `pendingOfficeAceState` 是**本进程的** Map，而池/凭据是**同机共享**的
+       *（AGENTS.md 明确记着「dsh web 与 desktop 两个实例各自持锁」⇒ 两进程并存
+       * 是**声明支持**的形态）。⇒ 本进程看到**另一个进程**刚建的占位条目时，
+       * `pending` 必然缺失 ⇒ 判据 2 旧逻辑**恒判「已中止」**，窗口是**整个登录
+       * 等待期**（分钟级）：用户还在授权页填密码，另一进程一次 `account.list`
+       * 就把他的占位条目删掉 ⇒ 本进程 `login.poll` 报 `{done:false}` ⇒ 干等 5 分钟；
+       * 若恰好压在落库那几秒 ⇒ 与 P2 同样的数据丢失。
+       *
+       * 判据用池条目自带的 `createdAt`（**跨进程可见**、无需新增持久化字段）：
+       * 一个**刚建出来**的占位条目，无论它属于哪个进程，都更可能是「正在登录」
+       * 而不是「宿主重启后的残留」。
+       * ⚠️ 代价如实登记：另一进程崩溃留下的、**年轻时**的残留要多等一个 TTL 才收
+       *（原来立刻）。方向与既有语义一致 —— `createdAt` 早于重启点的残留照样立刻收。
+       */
+      if (pending === undefined && now() - entry.createdAt <= OFFICEACE_PENDING_TTL_MS) continue
+      // 判据 2：中间态还在且未超时 ⇒ 这是**正在轮询**的正常登录，绝不碰。
+      if (!isAbandonedOfficeAceLogin(pending, now())) continue
+      // 判据 3：凭据已落库 ⇒ 这次登录其实成了，保留条目（并继续保留中间态）。
+      // ⚠️ 复用 `loginCredentialLanded`：**不另写一份同义判据**（本仓库已记过
+      //    「一文件两套同义判据必然漂移」）。
+      //
+      // ⚠️⚠️ **`'unknown'` 必须 `continue`，不能继续往下删**（2026-10-17 红队打穿的 P0）：
+      //    原实现只有一个布尔，**读凭据失败**与**确证没有凭据**同样为 `false`
+      //    ⇒ 库里其实有凭据（只是 `resolve` 抛错）时，这个**静默的定时收口**会把
+      //    一个**健康账号连凭据一起删掉**（`removeAccount` 连带 `credentials.unset`），
+      //    不可逆、且用户没有任何提示。红队探针实测：条目 0、凭据键 `[]`。
+      //    取向与上面「读不到池 ⇒ 什么都不做」**同一条**：不可逆的删除必须建立在**确证**上。
+      const landed = await loginCredentialLanded(entry.id)
+      if (landed === 'yes' || landed === 'unknown') {
+        if (landed === 'unknown') {
+          ctx.logger?.warn?.(
+            `[jet-hub] OfficeAce 收口跳过 ${entry.id}：读凭据失败（无法确证"没有凭据"）`
+            + ' ⇒ 不做不可逆的删除（宁可留一张卡片）',
+          )
+        }
+        continue
+      }
+      // 三条判据齐备 ⇒ 静默中止的残留：删占位条目（`removeAccount` 同时 unset 凭据，
+      // 而这里已确认该账号本来就没有凭据 ⇒ 不会销毁任何可用数据）。
+      try {
+        await pool.removeAccount(entry.id)
+        swept.push(entry.id)
+      } catch (error) {
+        ctx.logger?.warn?.(
+          `[jet-hub] 收口 OfficeAce 中止登录的占位条目失败（${entry.id}）：${String(error)}`,
+        )
+        continue
+      }
+      // ⚠️ 删条目后**必须清中间态**：否则同一 id 的残留会让下一次登录的
+      //    `login.poll` 读到**旧的** state（云侧已失效）而永远拿不到 code。
+      pendingOfficeAceState.delete(entry.id)
+    }
+    if (swept.length > 0) {
+      ctx.logger?.info?.(
+        `[jet-hub] 已收口 ${swept.length} 个 OfficeAce 中止登录留下的占位账号：`
+        + `${swept.join(', ')}（用户未完成授权即关闭授权页；这些条目没有凭据）`,
+      )
+    }
+    return swept
+  }
 
   /**
    * OfficeAce 交换的**单飞表**（accountId → 正在进行的交换结果）。
@@ -2342,21 +2602,87 @@ function registerJetHubEndpoints(
    *
    * ⚠️ 这个判据**只此一处实现**：OfficeAce 那条一度另写了一份同义判据 ——
    * 一个文件两套同义判据必然漂移（`docs/agent-notes/misc.md` §1）。
+   *
+   * ## ⚠️⚠️ 返回 `'unknown'` 的那一格是**为了不误删**（2026-10-17 红队打穿的 P0）
+   *
+   * 本函数原先只有一个 `boolean`：**读凭据失败**（`resolve` 抛错 / 后端抖动）与
+   * **确证没有凭据**都返回 `false` ⇒ 调用方把「读不到」当成「没有」。
+   * 对 `failLogin` 那类"删号"收尾，这会**误删健康账号**；对
+   * `sweepAbandonedOfficeAceLogins` 更糟 —— 它是**静默的定时收口**，
+   * 红队探针实测：凭据**确实在**库里但 `resolve` 抛错 ⇒ 账号被删、凭据被 unset
+   *（不可逆，且用户没有任何提示）。
+   *
+   * ⇒ 三态（与 `poolEntryOf` 的 `'unknown'` **同一取向**：读不到 ≠ 没有）：
+   * - `'yes'`：**确证**凭据在；
+   * - `'no'`：**确证**读完所有候选 ref 都没有凭据；
+   * - `'unknown'`：**中途读失败** ⇒ 无法确证 ⇒ 调用方**不得**据此做不可逆操作。
+   *
+   * ⚠️ 只有「一次都没读失败」才允许回 `'no'`：候选 ref 有多个（entry + pending），
+   *    其中一个成功读到「没有」、另一个读失败时，仍是 `'unknown'`
+   *   （"确证"必须是全部确证）。
    */
-  async function loginCredentialLanded(accountId: string): Promise<boolean> {
+  async function loginCredentialLanded(accountId: string): Promise<'yes' | 'no' | 'unknown'> {
     const refs = new Set<string>()
     const entry = poolEntryOf(accountId)
-    if (entry !== undefined && entry !== 'unknown') refs.add(entry.credentialRef)
+    /**
+     * ⚠️⚠️ **`'unknown'`（读不到池）必须直接判「无法确证」**（2026-10-17 独立审计打穿的 **P0-3**）。
+     *
+     * 原先只是「不把它加进 `refs`」，于是 `refs` 可能**一个都没有** ⇒ 下面的循环
+     * 一次都不跑 ⇒ `readFailed` 保持 `false` ⇒ 返回 `'no'`（=「确证没有凭据」）
+     * ⇒ 收口走 `removeAccount`（连带 `unset`，不可逆）。
+     *
+     * ⚠️ 这与本文件 `poolEntryOf` 自己的契约**直接矛盾**（它的注释逐字写着
+     * 「读不到时不删（宁可留一张卡片）」），也与 `failLogin` 里**单独**处理
+     * `entry === 'unknown'` 的做法自相矛盾 —— 同一文件两套取向。
+     *
+     * ⇒ 判据：**一次凭据都没能读**（池读不到 ⇒ 连该查哪个 ref 都不知道）
+     *    就不是「确证没有」，而是「无法确证」。这与 `'no'` 的语义必须分开。
+     */
+    if (entry === 'unknown') return 'unknown'
+    if (entry !== undefined) refs.add(entry.credentialRef)
     // OfficeAce 的凭据按 `pending.credentialRef ?? entry.credentialRef` 落库 ⇒ 两个都查
     //（正常路径同值；改造期存量数据可能只有其一）。
     const pending = pendingOfficeAceState.get(accountId)
     if (pending !== undefined) refs.add(pending.credentialRef)
+    let readFailed = false
     for (const name of refs) {
       if (name.length === 0) continue
-      const resolved = await ctx.credentials.resolve(credentialRef(name)).catch(() => undefined)
-      if (resolved !== undefined && resolved.value.length > 0) return true
+      /**
+       * ⚠️⚠️ **凭据库之外，还要认「本 ref 的兼容文件」**
+       *（2026-10-17 红队打穿的 P1b）。
+       *
+       * `readCredential(ref, credentials)` 的兜底腿会读 `session-<ref>.json`
+       *（`officeace-auth.ts` 的兼容路径）⇒ **只有兼容文件的账号照样可用**。
+       * 而本函数原先只看凭据库 ⇒ 那个账号被判成「没有凭据」⇒ 静默收口把它删掉
+       *（红队探针实测：条目 0）。⇒ 判据必须与 `readCredential` **同源**：
+       * 直接调它（它自己会先查库、再回落兼容文件），避免"两套同义判据漂移"。
+       */
+      const own = await (async () => {
+        // ⚠️ 用 try/catch 而不是 `.catch()`：替身 / 老实现可能**没有** `readCredential`
+        //    方法，那时 `undefined(...)` 是**同步** TypeError，`.catch()` 接不住
+        //   （本仓库记过同型：`pool.listAccountsByProvider` 被当 Promise 用 ⇒
+        //    同步 throw 逃逸成一条 warn）。
+        try {
+          const fn = (auths.officeace as { readCredential?: unknown }).readCredential
+          if (typeof fn !== 'function') return undefined
+          return await (fn as (r: string, c: unknown) => Promise<unknown | undefined>)(
+            name,
+            ctx.credentials as never,
+          )
+        } catch {
+          readFailed = true
+          return undefined
+        }
+      })()
+      if (own !== undefined) return 'yes'
+      const resolved = await ctx.credentials.resolve(credentialRef(name)).catch(() => {
+        // ⚠️ **不要**把失败并进 `undefined`（那样就退化成"没有凭据"）。
+        readFailed = true
+        return undefined
+      })
+      if (resolved !== undefined && resolved.value.length > 0) return 'yes'
     }
-    return false
+    return readFailed ? 'unknown' : 'no'
   }
 
   /**
@@ -2370,7 +2696,8 @@ function registerJetHubEndpoints(
    *（凭据已落库，只是后续记账失败）—— 调用方**不得**把它当作失败。
    */
   async function failLogin(accountId: string, error: unknown): Promise<string | undefined> {
-    if (await loginCredentialLanded(accountId)) {
+    const landed = await loginCredentialLanded(accountId)
+    if (landed === 'yes') {
       ctx.logger.warn(
         `[jet-hub] ${accountId} 登录已拿到凭据、后续记账失败（按成功处理：不记失败、不删账号）：`
         + `${loginReasonText(error)}`,
@@ -2378,11 +2705,11 @@ function registerJetHubEndpoints(
       return undefined
     }
     const entry = poolEntryOf(accountId)
-    if (entry === 'unknown') {
-      // 读不到池（实现抛错 / 替身缺方法）：**不当成失败去删**（不可逆）。
+    if (entry === 'unknown' || landed === 'unknown') {
+      // 读不到池 / 读不到凭据库（实现抛错 / 替身缺方法）：**不当成失败去删**（不可逆）。
       ctx.logger.warn(
-        `[jet-hub] ${accountId} 登录收尾时读不到账号池，已记终态但**不删账号**（宁可留卡片）：`
-        + `${loginReasonText(error)}`,
+        `[jet-hub] ${accountId} 登录收尾时读不到${entry === 'unknown' ? '账号池' : '凭据库'}，`
+        + `已记终态但**不删账号**（宁可留卡片）：${loginReasonText(error)}`,
       )
       return recordLoginFailure(accountId, error)
     }
@@ -2467,7 +2794,21 @@ function registerJetHubEndpoints(
       return { done: true, success: false, error: failure }
     }
     const credential = exchanged.credential
-    pendingOfficeAceState.delete(accountId)
+    /**
+     * ⚠️⚠️ **标记「落库进行中」**（红队 P2 修法 + P4 修法的落点）。
+     *
+     * 从这一刻起、到落库阶段彻底结束（四个返回点各清一次）为止，
+     * `isAbandonedOfficeAceLogin` 会**无条件**返回 false ⇒ 并发的
+     * `account.list` **不可能**把这次登录判成「已中止」而删号。
+     *
+     * ⚠️ 为什么还需要 `pending` 本身（而不是只靠 `settling`）：`settling` 是
+     *    `pending` 上的字段；若把 pending 删掉，收口会走「中间态缺失 ⇒ 已中止」
+     *    那条腿。故 pending 必须活到落库结束 —— 两者是**一件事的两面**。
+     *
+     * ⚠️ 只翻转**现有对象**的字段（`pending` 是 `pendingOfficeAceState` 里的值，
+     *    引用同一对象）⇒ 不引入第二份状态、也不需要重新 `set`。
+     */
+    pending.settling = true
     /**
      * ⚠️ **落库走 DSH 凭据库（标准范式）**：与 gemini / raccoon /
      *    minimax 的 `persistLogin(credential, { refName })` 同款 ——
@@ -2490,8 +2831,214 @@ function registerJetHubEndpoints(
       //    `failLogin` 的通用判据（它先看凭据是否已落库）；返回 `undefined`
       //    就说明凭据在 ⇒ 按成功继续。
       const failure = await failLogin(accountId, error)
+      // ⚠️ **落库阶段结束**才允许清 pending（P2/P4 修法）：失败收尾也要清，
+      //    否则 `failLogin` 删掉条目后这条 pending 会一直挂着（内存泄漏 +
+      //    让同 id 的后续登录读到旧 state）。
+      pendingOfficeAceState.delete(accountId)
       if (failure !== undefined) return { done: true, success: false, error: failure }
     }
+    /**
+     * ⚠️⚠️ **落库之后若账号条目已被删除 ⇒ 立刻 unset 这份刚写下的凭据**
+     * （Gitee issue IKM741 修法 B「有凭据、无账号」，2026-10-16 探针实测确证）。
+     *
+     * ## 为什么必须在**这里**收口（而不是像 A 档那样扫描全池）
+     *
+     * B 档的产生路径**精确且只有一个**（探针实测复现）：
+     *
+     * ```
+     * 用户点「+ 新建账号」→ 占位条目就位 → 授权 → 宿主开始 persistLogin 落库
+     *   ⇒ 用户**恰好在此刻**点了「删除」那张卡片
+     *   ⇒ removeAccount 先 unset（此刻凭据还没写，是空操作）再删条目
+     *   ⇒ persistLogin 随后才把凭据写进去
+     *   ⇒ 结果：凭据在库里、而**没有任何账号条目引用它**
+     * ```
+     *
+     * 探针实测的三个时点：落库开始时条目 = 1、删卡片后键 = `[]`、
+     * 落库完成时条目 = **0** 而键 = `["OFFICEACE_ACCOUNT_…"]` —— 孤儿就此诞生，
+     * 且**没有任何入口**会清理它（`removeAccount` 只 unset 有账号条目的 ref）。
+     *
+     * ## ⚠️ 为什么**不做**「启动时扫描全池清理孤儿凭据」
+     *
+     * 那样做会**误伤备份合并导入**：`importBackup` 是**先写凭据、后合并账号**
+     * （`src/backup.ts` 的 `credentials.set` 循环 → `pool.mergeAccounts`），
+     * 两者之间的窗口里，即将被合并进来的账号凭据**恰好长得和孤儿一模一样**。
+     * 一个启动期的全量扫描会把它们删掉 ⇒ 用户导入备份后账号在、凭据没了。
+     * ⇒ 「删除不可逆」这条铁律下，只在**孤儿刚产生的那一刻**按**本次登录的 ref**
+     *    精确收口；存量孤儿不自动删（见下方「存量孤儿」注释）。
+     *
+     * ## ⚠️ 安全闸（与 `failLogin` 同源，**不另写一份判据**）
+     *
+     * 只有**确证**条目不存在（`poolEntryOf` 返回 `undefined`，**不是** `'unknown'`）
+     * 才 unset。读不到池时什么都不做 —— 否则一次读池抖动就会把用户刚登好、
+     * 账号也还在的凭据删掉。
+     */
+    const landedRef = pending.credentialRef ?? entry.credentialRef
+    if (poolEntryOf(accountId) === undefined) {
+      // ⚠️ **落库已结束** ⇒ 清 pending（P2 修法：这次登录不再"在途"）。
+      pendingOfficeAceState.delete(accountId)
+      try {
+        await ctx.credentials.unset(credentialRef(landedRef))
+        ctx.logger.info(
+          `[jet-hub] officeace 登录完成时账号条目 ${accountId} 已被删除，`
+          + `已回收刚写入的凭据 ${landedRef}（否则它会成为永不清理的孤儿凭据）`,
+        )
+      } catch (error) {
+        ctx.logger.warn(
+          `[jet-hub] officeace 回收孤儿凭据失败（${landedRef}）：${String(error)}`,
+        )
+      }
+      // 条目已不存在 ⇒ 回填与 `login.poll` 的「账号已在」语义都不成立，
+      // 如实回成功（凭据确实换到了），前端会刷新列表并看到该卡片已不在。
+      return { done: true, success: true }
+    }
+    /**
+     * ⚠️⚠️ **按云侧身份查重**（IKM741 追补，2026-10-16 **真机复现的真实缺陷**）。
+     *
+     * ## 症状（实测三条）
+     *
+     * 同一个华为号连登两次 ⇒ 号池出现**两张同账号卡片**，`accountId` / `modelAppKey` /
+     * MaaS 网关**三项逐字符完全相同**（真实值**不入库**：`accountId` 是用户的**稳定身份标识**，
+     * 哪怕截断也是泄露 —— 用 `acct-A…`/`acct-B…` 这类**纯代称**记录即可），
+     * 只有 `credentialRef` 与 `refreshToken` 不同。
+     *
+     * ## 为什么必须治（不只是「多一张卡」）
+     *
+     * OfficeAce 的 `refresh_token` 是**一次性**的（模块头的 `STS5.1806 has been used` 教训）。
+     * 两张同账号的卡各持一份 token，而**两者都会参与批量续期**
+     *（`refreshAll` / `refreshAccountList` 只看 `refreshable`、**不看 `enabled`**，
+     * 见 AGENTS.md 明令）⇒ 谁先续期谁赢，后到的那张 token **立刻作废**；
+     * 若「重复卡」先跑，被废掉的恰恰是**那张可用卡** ⇒ 面板上表现为
+     * 「账号突然凭证过期 / 积分查询失败」。用户 2026-10-16 截图里的第 3 张卡正是这一格。
+     *
+     * ## 处置（照 **zcode 范式**，三件事都要做）
+     *
+     * 1. **不删条目**：`login.poll` 靠「条目还在 + 凭据已写」判成功，删了会让它显示成
+     *    「登录失败」，与事实**相反**（登录成功了，只是这个账号已存在）⇒ 只**停用 + 改名**，
+     *    用户一眼能看出发生了什么、可自行删除；原来那条（`existingDuplicateId`）不动；
+     * 2. **把新凭据转写到已有条目的 ref**：新凭据更新鲜，让那张**可用卡**保持最新
+     *   （顺带回填它的 `expiresAt`）；
+     * 3. **清掉重复条目自己的凭据**：否则两份一次性 token 会互相作废（上面那条危害）。
+     *    ⚠️ 只有第 2 步**确认成功**才清 —— 否则宁可留着（凭据比「干净」重要，
+     *    且 unset **不可逆**）。
+     *
+     * ⚠️ 判重字段是凭据里的 `accountId`（云侧下发的账号身份）。缺失 ⇒ **放弃去重**
+     *    （`findAccountIdByIdentityField` 对空值直接返回 `''`），**不猜**。
+     * ⚠️ 该方法返回的**可能是自己**（新条目是追加的；老条目若缺该字段会被跳过）——
+     *    「返回自己」即「无重复」，与 zcode 同一读法。
+     *
+     * ⚠️⚠️ **读池失败必须与「无重复」分开**（我第一版把它 `.catch(() => '')` 吞了，
+     *    当场被 `login-poll-terminal-failure.spec.ts` 的替身池打红 —— 那正是这行的价值）：
+     *    - 「**确证**无重复」(`''`) ⇒ 正常回填；
+     *    - 「**读不到**」(抛错 / 替身池没这个方法) ⇒ 记 warn 后**照常回填**，
+     *      不当成重复 —— 依赖不可用不该改变登录结论（与 `poolEntryOf` 的
+     *      `'unknown'` 同一条取向：读不到 ≠ 没有）。
+     *
+     * ⚠️ **这条语义由「初值 + 只在成功时赋值」承担，刻意不加 `duplicateLookupFailed`
+     *    之类的额外闸门**（2026-10-17 变异验证实测）：我第一版加过，它**与没有它
+     *    逐字节等价**（catch 里不赋值 ⇒ 变量仍是 `''` ⇒ 后面 `length > 0` 本就为假）
+     *    —— 独立审计会把这种"看着像防御、实际无牙"的码记为**死代码**。
+     *    可观测性交给下面 catch 里的 warn（用例 ⑧ 锁「登录结论不受影响」）。
+     */
+    const cloudId = typeof credential.accountId === 'string' ? credential.accountId : ''
+    let existingDuplicateId = ''
+    if (cloudId.length > 0) {
+      try {
+        existingDuplicateId = await pool.findAccountIdByIdentityField(OFFICEACE.id, 'accountId', cloudId)
+      } catch (error) {
+        ctx.logger.warn(
+          `[jet-hub] officeace 查重失败（按 accountId 读账号池）⇒ 本次**不做去重**、照常回填：${String(error)}`,
+        )
+      }
+    }
+    if (existingDuplicateId.length > 0 && existingDuplicateId !== accountId) {
+      const existingEntry = pool.findAccount(existingDuplicateId)
+      const existingDuplicateRef = existingEntry?.credentialRef ?? ''
+      /**
+       * ⚠️⚠️ **命中一张「已停用」的原卡时，不能让新卡也停用**（2026-10-17 独立审计的 P2）。
+       *
+       * 症状（两个提交都复现）：用户**手动停用**某张 OfficeAce 卡片（既有语义：
+       * 不参与自动选号）之后，用**同一个华为号**重新登录 ⇒ 查重命中那张停用卡
+       * ⇒ 新条目也被置 `enabled: false` ⇒ 池里**零可用卡**，而 `login.poll` 报
+       * `{done:true, success:true}`（用户以为登好了，实际该渠道没有可用账号 ——
+       * 若它是唯一账号，模型选择器会因门控整组消失）。
+       *
+       * ⚠️ `findAccountIdByIdentityField` **刻意不看 `enabled`**（那是 zcode 的正确性
+       * 要求：停用账号仍占位、重复添加仍是重复）⇒ **不能改那个方法**，判据补在这里。
+       *
+       * 处置（采纳审计推荐的方案 ①，语义 =「用户想要这个号可用」）：
+       * 反转为「**新卡可用、老卡标重复并停用**」；凭据仍转写到新卡（它是本次登录
+       * 刚换的、最新鲜的那份）。
+       */
+      const existingDisabled = existingEntry !== undefined && existingEntry.enabled === false
+      let handedOver = false
+      const handoverRef = existingDisabled ? landedRef : existingDuplicateRef
+      if (handoverRef.length > 0) {
+        try {
+          await auths.officeace.persistLogin(credential, {
+            refName: handoverRef,
+            credentials: ctx.credentials as never,
+          })
+          handedOver = true
+          await pool.updateAccount(existingDisabled ? accountId : existingDuplicateId, {
+            refreshable: true,
+            expiresAt: new Date(credential.expiresAt).getTime(),
+          })
+        } catch (error) {
+          ctx.logger.warn(
+            `[jet-hub] officeace 重复账号：新凭据转写回 ${handoverRef} 失败`
+            + `（保留重复条目自己的凭据，不做不可逆清理）：${String(error)}`,
+          )
+        }
+      }
+      // ⚠️ 只有「把凭据交给**另一张**卡」时才清本卡的凭据；反转形态下凭据
+      //    本来就留在本卡（`handoverRef === landedRef`），**不能 unset 自己**。
+      if (handedOver && handoverRef !== landedRef) {
+        try {
+          await ctx.credentials.unset(credentialRef(landedRef))
+        } catch (error) {
+          ctx.logger.warn(
+            `[jet-hub] officeace 重复账号：清重复凭据 ${landedRef} 失败`
+            + `（无害：那张卡已停用、不参与选号；只是它若被续期会白失败一次）：${String(error)}`,
+          )
+        }
+      }
+      if (existingDisabled) {
+        /** 反转：老卡退位（标重复 + 停用），新卡承接可用性。 */
+        ctx.logger.warn(
+          `[jet-hub] officeace 该账号（accountId=${cloudId.slice(0, 8)}…）的原卡片 ${existingDuplicateId}`
+          + `**已被用户停用** ⇒ 改为「新卡 ${accountId} 可用、原卡标重复并停用」`
+          + '（否则会出现「登录报成功但该渠道零可用卡」）',
+        )
+        await pool.updateAccount(existingDuplicateId, {
+          nickname: `OfficeAce ${accountLabel.slice(0, 8)}（重复，已停用）`,
+          enabled: false,
+        }).catch((error: unknown) => {
+          ctx.logger.warn(`[jet-hub] officeace 原卡片改标失败（${existingDuplicateId}）：${String(error)}`)
+        })
+        await pool.updateAccount(accountId, {
+          nickname: `OfficeAce ${accountLabel.slice(0, 8)}`,
+          enabled: true,
+        }).catch((error: unknown) => {
+          ctx.logger.warn(`[jet-hub] officeace 新卡片启用失败（${accountId}）：${String(error)}`)
+        })
+        pendingOfficeAceState.delete(accountId)
+        return { done: true, success: true }
+      }
+      ctx.logger.warn(
+        `[jet-hub] officeace 该账号（accountId=${cloudId.slice(0, 8)}…）已存在于 ${existingDuplicateId}：`
+        + `新条目 ${accountId} 已停用${handedOver ? '、新凭据已转写回原账号' : ''}（不参与选号）`,
+      )
+      await pool.updateAccount(accountId, {
+        nickname: `OfficeAce ${accountLabel.slice(0, 8)}（重复，已停用）`,
+        enabled: false,
+      }).catch((error: unknown) => {
+        ctx.logger.warn(`[jet-hub] officeace 重复条目停用失败（${accountId}）：${String(error)}`)
+      })
+      // ⚠️ **落库已结束** ⇒ 清 pending（P2 修法）。
+      pendingOfficeAceState.delete(accountId)
+      return { done: true, success: true }
+    }
+
     /**
      * **回填展示字段**：失败**不改变登录结论**（凭据已落盘），只记日志。
      *
@@ -2513,6 +3060,9 @@ function registerJetHubEndpoints(
         `[jet-hub] officeace 登录成功但回填账号条目失败（凭据已在，不判失败）：${String(error)}`,
       )
     }
+    // ⚠️ **落库已结束** ⇒ 清 pending（P2 修法）。放在最后而不是最初：
+    //    在此之前任何一次 `account.list` 都必须能看出这次登录"在途"。
+    pendingOfficeAceState.delete(accountId)
     return { done: true, success: true }
   }
 
@@ -2804,6 +3354,20 @@ function registerJetHubEndpoints(
     switch (method) {
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
+        // ⚠️ **先收口「登录中止」的 OfficeAce 占位条目**（Gitee issue IKM741 修法 A）：
+        //    用户打开授权页却没完成授权就关掉时，占位条目会永久残留成一张
+        //    「凭据未配置」的幽灵卡片（用户可以看见、却没有任何入口清理它，
+        //    issue 原话「还要手动删一次」）。判据与安全闸见
+        //    `sweepAbandonedOfficeAceLogins`。
+        //
+        // ⚠️ 放在 `pool.listAccounts` **之前**是刻意的：这里要读的是「收口后」的
+        //    列表 —— 否则用户刷新一次仍会看到那张刚被删掉的卡片（观感是「没生效」，
+        //    必须再刷新一次）。
+        // ⚠️ 只在查 officeace 时才跑：别的面板不该为它付代价，也避免无关路径上
+        //    出现一次全池读（`listAllAccounts`）。
+        if (req.provider === OFFICEACE.id) {
+          await sweepAbandonedOfficeAceLogins()
+        }
         const accounts = await pool.listAccounts(req.provider)
         // ⚠️ OfficeAce 自愈回填（2026-10-13 修正）：`expiresAt` 回填是后加的
         //    （`6fb110f`），修复前登录留下的池条目缺这个字段 ⇒ 卡片恒显示
@@ -3474,6 +4038,10 @@ function registerJetHubEndpoints(
             //    新账号的凭据写进公共 `session.json`，覆盖其他账号的凭据
             //    （多账号共存的前提，2026-10-13 改造）。
             credentialRef: refName,
+            // ⚠️ **必须记发起时刻**（Gitee issue IKM741）：它是
+            //    `sweepAbandonedOfficeAceLogins` 判定「用户已中止」的唯一依据。
+            //    漏写 ⇒ 收口判据永远拿不到时间 ⇒ 幽灵条目照样永久残留。
+            at: Date.now(),
           })
 
           // ⚠️ **宿主侧直接拉起无痕窗口**（2026-10-13，用户要求）：
@@ -3755,6 +4323,16 @@ function registerJetHubEndpoints(
           if (entry.provider === OFFICEACE.id) {
             const pending = pendingOfficeAceState.get(req.accountId)
             if (pending !== undefined) {
+              /**
+               * ⚠️⚠️ **每次轮询都把 `at` 刷新成「最近一次活动时刻」**（P4 修法，见
+               * `isAbandonedOfficeAceLogin` 的注释）。这一行是「在途」与「已中止」
+               * 的**唯一区分来源**：客户端每 1 秒摸一次 ⇒ 只要登录在被轮询，
+               * 收口的 TTL 判据就永远放行；用户关掉页面后 `at` 停止刷新，TTL 照常生效。
+               *
+               * ⚠️ 必须写在**取到 `pending` 之后、任何 await 之前**的同步段里，
+               *    否则单飞复用那条返回（下面 `shared !== undefined`）会跳过它。
+               */
+              pending.at = Date.now()
               /**
                * ⚠️ **单飞**：客户端 `setInterval` 没有 in-flight 闸门，而一次交换含多次
                * 网络往返（通常 > 1 秒）⇒ 两拍重叠几乎必然。同一个 `code` 只能换一次，
@@ -4643,6 +5221,22 @@ function registerJetHubEndpoints(
                 })),
                 expiredTotal: subscription.creditGroups.filter((g) => g.expired).length,
               },
+              /**
+               * ⚠️⚠️ **陈旧读数必须标注**（2026-10-17 独立审计的 P2，两层口径不一致）。
+               *
+               * 同一 PR 在 `src/aggregate-expiry.ts` 新增了
+               * `if (summary.stale === true) return UNUSABLE`（理由：陈旧快照不得当
+               * 实时读数参与排序）；**而面板这条出口**原先把一个**两天前的快照**
+               * 当实时余额显示、且**不标注** ⇒ 同一份数据两层结论相反。
+               *
+               * 范式取自 buddy 系（`jet-hub-rpc.ts` 上方同款）：**`stale` 照样回传**
+               *（用户宁可看到「昨天 12:00 的 6493」也不要空白），但**必须带 `error`
+               * 说明这是历史数据** —— `officeace-auth.ts` 里那条注释的正当性前提
+               * （「这是『数据截至 hh:mm』的正当用法」）正是**展示层会标注**。
+               */
+              ...(subscription.stale === true
+                ? { error: '本次查询失败，显示的是上一次成功读到的数据（可能已过期）' }
+                : {}),
             })
           }
           return {

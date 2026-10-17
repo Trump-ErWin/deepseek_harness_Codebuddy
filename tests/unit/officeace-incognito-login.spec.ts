@@ -180,4 +180,57 @@ describe('RPC 接线：宿主开窗结果必须回传，客户端据此决定是
       '缺少 e2e 版本 —— 真开窗行为应验证在 tests/e2e/ 下',
     ).toBe(true)
   })
+
+  /**
+   * ⚠️⚠️ **元守卫：e2e 必须能与单测区分开**（Gitee issue IKM741 期间实测查出的
+   * **既有结构性缺陷**，2026-10-16）。
+   *
+   * ⑩ 的断路器是「`NODE_ENV === 'test'` ⇒ 返回 `false`」，而 Vitest **默认**
+   * 把 `NODE_ENV` 设成 `'test'` —— **对 `vitest.e2e.config.ts` 也一样**
+   * （已实测打印确认）。两个各自正确的东西叠在一起，产生一个**静默失效**：
+   *
+   * ```
+   * officeace-incognito-login.e2e.spec.ts 断言 openIncognitoWindow(...) === true
+   *   ⇒ 在 NODE_ENV=test 下恒拿到 false
+   *   ⇒ 那条 e2e 从写下的那天起就不可能通过（2026-10-16 实测确认；
+   *      同文件的对照用例走 openBrowser（无断路器）⇒ 恒绿，对比极不明显）
+   * ```
+   *
+   * ⇒ 修法在**配置层**：`vitest.e2e.config.ts` 用 `test.env` 把 e2e 标成 `'e2e'`。
+   * 断路器的**判据方向逐字不变**（仍按运行环境一刀切断、仍不按 URL 特征打补丁），
+   * 只是给「e2e 是另一种运行环境」这个既有事实一个名字。
+   *
+   * 本用例锁三件事，缺一即红：
+   * 1. e2e config 真的设了 `NODE_ENV`（且**不是** `'test'`）；
+   * 2. 单测 config **不得**设它（否则单测也会真开窗 —— 那正是 ⑩ 要防的污染）；
+   * 3. 断路器仍在（⑩ 已锁，这里只交叉确认它认的仍是 `'test'`）。
+   */
+  it('⑫ e2e 必须与单测区分运行环境，否则真开窗的 e2e 永远不可能通过', () => {
+    const e2eConfig = readFileSync(resolve(here, '../../vitest.e2e.config.ts'), 'utf8')
+    const unitConfig = readFileSync(resolve(here, '../../vitest.config.ts'), 'utf8')
+
+    // 1. e2e 必须显式声明自己的运行环境，且不是 `'test'`。
+    const e2eEnv = /NODE_ENV\s*:\s*['"]([^'"]+)['"]/.exec(e2eConfig)
+    expect(
+      e2eEnv?.[1],
+      'vitest.e2e.config.ts 未设 NODE_ENV ⇒ 它默认是 `test` ⇒ `openIncognitoWindow` '
+      + '的断路器恒返回 false ⇒ 无痕窗口的 e2e **永远不可能通过**（静默失效）',
+    ).toBeDefined()
+    expect(
+      e2eEnv?.[1],
+      'e2e 的 NODE_ENV 不得是 `test` —— 那正是断路器的判据，会让 e2e 恒短路由 false',
+    ).not.toBe('test')
+
+    // 2. 单测 config 不得设它：单测必须留在 `test`（Vitest 默认），
+    //    否则「跑单测弹用户桌面窗口」那次真实污染会复发。
+    expect(
+      unitConfig,
+      'vitest.config.ts 设了 NODE_ENV ⇒ 单测可能不再落在断路器的 `test` 分支，'
+      + '真开窗污染（2026-10-13 事故）就会复发',
+    ).not.toMatch(/NODE_ENV\s*:/)
+
+    // 3. 交叉确认断路器仍在（⑩ 锁的是它，这里确认它认的字面量没被改成 e2e 的值）。
+    expect(loginSource, '断路器不得被改成认 e2e 的值（那会让 e2e 的断言失去意义）')
+      .toMatch(/NODE_ENV\s*===\s*['"]test['"]/)
+  })
 })
