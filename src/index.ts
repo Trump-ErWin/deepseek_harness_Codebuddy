@@ -2235,6 +2235,14 @@ export function apply(ctx: Context): void {
     //    （它按「像素预算发请求版本」的形态只在 opencode / accio 那几家实现）。
     //    魔搭的图片走 `readImage` 单一路径，逐模型按 `supportsImage` 声明模态。
     readImage: makeReadImage(ctx),
+    // ⚠️⚠️ **必须接 `disabledModels`**（2026-10-17 审计发现）：模型黑名单是
+    //    「设置页 → 显示列表」逐 id 开关的产物，而**模型选择器读的正是这份黑名单**
+    //    （`ModelscopeAdapter.listModels` 读 `options.disabledModels?.()`）。
+    //    ⚠️ 本回调此前**没有传** ⇒ 黑名单完全失效 ⇒ 用户在「显示列表」里关掉的模型
+    //    **照样出现在模型选择器里**（实测：只开了 V4.1 Flash，选择器仍列全部 36 个）。
+    //    ⚠️ 典型形态：适配器**支持**该能力（字段与消费点都在），只是**接线层漏了实参**
+    //    ⇒ 无报错、无日志，纯静默。
+    disabledModels: () => pool.disabledModelsFor(MODELSCOPE.id),
   })
 
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
