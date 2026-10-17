@@ -437,7 +437,7 @@ async function exchangeToken(
  * 云侧从 `subscription: null` 变成 `model_auth_info` 齐全（20:57 vs 21:16 实测）。
  * 而修前插件只回一句「账号可能未订阅 ModelArts MaaS」——**没有告诉用户怎么办**，
  * 用户为此在客户端里摸索了半天。故本条文案的**出路信息**是判据的一部分
- * （守卫见 `tests/unit/officeace-auto-activate.spec.ts`）。
+ * （守卫见 `tests/unit/officeace-unsubscribed-guidance.spec.ts`）。
  *
  * ## ⚠️⚠️ 「自动开通」**刻意不做**（2026-10-16 真机证伪 + 用户明确否决依赖 ide）
  *
