@@ -14,6 +14,11 @@ import {
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
+// ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
+//    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
+//    ⚠️ 本 import 此前**不存在** ⇒ `modelscope-key-modal.js` 整份 140 行从未进 bundle，
+//    面板点「添加账号」无任何反应入口（症状零日志）。
+import { ModelscopeKeyModal } from './modelscope-key-modal.js';
 import {
   formatExpirySplitLine,
   formatNamedPoolLine,
@@ -3270,6 +3275,24 @@ function ProviderPanel({ provider, rpcCall }) {
     await submitOpencodeEntry('opencode.addAnonymous', {});
   };
 
+  /**
+   * 提交一个 modelscope（魔搭）账号。
+   *
+   * ⚠️ **本 fork 独有**（2026-10-17 审计 P0 修复）：此前本函数与
+   *    `createAccount` 里的 `provider === 'modelscope'` 分支**都不存在** ⇒
+   *    面板里点「添加账号」落到通用 `account.create`，而宿主那条 switch 没有
+   *    modelscope 分支 ⇒ 回 `unknown provider: modelscope`。
+   *    ⚠️ **刻意复用 {@link submitOpencodeEntry} 而不另写一份收尾**：两者的
+   *    收尾语义逐字节相同（关弹窗 / 刷新 / `existed` 提示 / 错误留在弹窗内），
+   *    本仓库红线是「同一份语义不许有两套实现」。
+   */
+  const submitModelscopeKey = async (rawKey) => {
+    const key = String(rawKey == null ? '' : rawKey).trim();
+    // 空串 = 没填就点确认：静默关弹窗，不报错（与 opencode 同款，不制造无谓报错）。
+    if (key === '') return;
+    await submitOpencodeEntry('modelscope.addAccount', { apiKey: key });
+  };
+
   /** 两个添加入口的公共收尾（成功关弹窗并刷新；失败把错误留在弹窗里）。 */
   const submitOpencodeEntry = async (method, payload) => {
     setCreating(true);
@@ -3306,7 +3329,13 @@ function ProviderPanel({ provider, rpcCall }) {
     // 走 `setKeyModal` 而不是下面的 `account.create` 流程。
     // 弹窗里另有两个入口：粘贴 key（submitOpencodeKey）与添加匿名通道（submitAnonymous）。
     if (provider === 'opencode') {
-      setKeyModal({ error: '' });
+      setKeyModal({ provider, error: '' });
+      return;
+    }
+    // ⚠️ **本 fork 独有**（魔搭）：凭据是用户手工粘贴的 `ms-` API Key，
+    //    没有 OAuth 授权页 ⇒ 两步式 `account.create` 对它不适用，与 opencode 同款改道。
+    if (provider === 'modelscope') {
+      setKeyModal({ provider, error: '' });
       return;
     }
 
@@ -4183,13 +4212,27 @@ function ProviderPanel({ provider, rpcCall }) {
       : null,
     // 「添加 opencode 账号」弹窗：自绘而非 window.prompt ——
     // DSH 客户端沙箱里 prompt() 直接抛 `prompt() is not supported`（真机报障）。
-    keyModal
+    keyModal && keyModal.provider !== 'modelscope'
       ? React.createElement(OpencodeKeyModal, {
           error: keyModal.error,
           busy: creating,
           inputRef: keyInputRef,
           onSubmit: (value) => void submitOpencodeKey(value),
           onSubmitAnonymous: () => void submitAnonymous(),
+          onClose: () => setKeyModal(null),
+        })
+      : null,
+    // ⚠️ **本 fork 独有**（魔搭）：与上面共用 `keyModal` 状态与 `keyInputRef`
+    //    （两个弹窗都是单例、互斥显示），但**按 provider 分派** —— 本仓库约定
+    //    「通用面板里的按钮与弹窗必须按 provider 分支」，两家的表单字段不同。
+    //    ⚠️ 必须用 `React.createElement` 而非直接调用组件函数：直接调用会把
+    //    组件的 hook 算进 ProviderPanel（该文件头记录过 hook #310 事故）。
+    keyModal && keyModal.provider === 'modelscope'
+      ? React.createElement(ModelscopeKeyModal, {
+          error: keyModal.error,
+          busy: creating,
+          inputRef: keyInputRef,
+          onSubmit: (value) => void submitModelscopeKey(value),
           onClose: () => setKeyModal(null),
         })
       : null));

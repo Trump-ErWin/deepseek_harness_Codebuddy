@@ -69,6 +69,9 @@ import {
 import { modelscopeChatUrl, modelscopeHeaders, modelscopeModelsUrl, normalizeModelscopeModelId } from './modelscope.js'
 import { buildModelscopePayload } from './modelscope-messages.js'
 import { collectImages, consumeOpenAiSse, httpErrorCode, serializeMessages } from './openai-compat.js'
+// ⚠️ 复用**共享** abort 判据，不自写第二份（该函数自己的注释记载：仓库此前已有
+//    4 份同义实现，明令「别再添第五份」）。
+import { isAbortLike } from './aggregate-adapter.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
 import { retryAfterMsFromResponse } from './retry-after.js'
@@ -538,6 +541,17 @@ export class ModelscopeAdapter extends LlmAdapter {
       } catch (error) {
         if (delivered) throw error
         if (error instanceof LlmError && error.code === 'QUOTA_EXCEEDED') throw error
+        // ⚠️⚠️ **取消 / 超时必须在此立刻抛出，且排在所有分类之前**
+        //    （2026-10-17 审计 P2 修复）。此前轮换循环**从不检查中止**：取消产生的
+        //    `AbortError` 消息不命中任何分类关键词 ⇒ 落到兜底 `server` 分支 ⇒ 被当成
+        //    「换个号再试」⇒ 取消之后**继续发请求**（实测取消后仍多打 2 次），且全池
+        //    耗尽后抛 `QUOTA_EXCEEDED`「所有账号对该模型均受限」—— 用户明明点了取消，
+        //    看到的却是「额度用尽」。
+        //    ⚠️ 用**共享** `isAbortLike`（`aggregate-adapter.ts` 导出，仓库唯一一份）：
+        //    它覆盖 `signal.aborted`、`AbortError`、`code === 'ABORTED'` 与上游 499 报文。
+        if (isAbortLike(error, options.signal)) {
+          throw error
+        }
 
         const info = classifyModelscopeFailure(error)
         if (info.kind === 'invalid_request') {
@@ -559,7 +573,27 @@ export class ModelscopeAdapter extends LlmAdapter {
         if (info.kind === 'server' || info.kind === 'transport') {
           // 上游故障/网络问题：**不写标记**（不是配额问题），只换下一个。
           this.options.warn?.(`modelscope: 账号 ${slot.id} ${info.kind}，换下一个：${info.detail}`)
+          // ⚠️⚠️ **换号有意义只在「故障是账号级」时**（2026-10-17 审计 P1 修复）。
+          //    本分支此前无条件 `continue` ⇒ 换号直到槽耗尽 ⇒ 兜底那段抛
+          //    `QUOTA_EXCEEDED`「所有账号对该模型均受限」。⇒ ① **单账号用户**
+          //    （绝大多数）看到的是「额度用尽」而真因是上游 5xx / 风控页，
+          //    排障方向完全错；② 每换一个号白发一次请求。
+          //    ⇒ 判据：**槽已耗尽**时把**原始错误**抛出去（保留真因与错误码）。
+          if (tried.size >= slots.length) throw error
           continue
+        }
+        if (info.kind === 'context_window') {
+          // ⚠️ **本 fork 独有**（2026-10-17 审计 P1 修复）：上下文超限**换账号也没用**
+          // —— 它是**请求本身**太大，与哪个账号无关（同一长会话换 10 个号一样报错）。
+          //    ⇒ 不写冷却标记、不换号，直接把原文抛出去，让宿主走溢出压缩。
+          //    ⚠️ 若漏这一格会落进下面「限流/额度」默认分支 ⇒ 给账号写一个到次日
+          //    UTC+8 零点的标记 ⇒ 用户只是消息太长却被封账号一整天
+          //    （与 loomy 的滑动窗口缺陷同族）。
+          //    ⚠️ 真机取证（2026-10-17）：模型 id 去掉组织前缀会得到
+          //    **HTTP 400 `Invalid model id: DeepSeek-V4-Flash-0731`**，且该校验
+          //    **发生在鉴权之前**（带合法前缀时同一请求先回 401）⇒ 这类报文是
+          //    `invalid_request`（上游已有分支直接抛），不该被当成额度去换号。
+          throw error
         }
         // 限流 / 额度：标记该槽后换下一个。
         const resetAtMs = Date.now() + modelscopeRetryAfterMs(info.kind, info.retryAfterMs, tried.size)
@@ -599,13 +633,60 @@ export class ModelscopeAdapter extends LlmAdapter {
       const text = await response.text().catch(() => '')
       // ⚠️ 只解析一次：头值是 HTTP 日期时，两次调用会算出毫秒级不同的值。
       const retryAfterMs = retryAfterMsFromResponse(response.headers)
+      // ⚠️⚠️ **额度必须用字面量 `'QUOTA_EXCEEDED'`，不能交给 `httpErrorCode`**
+      // （2026-10-17 审计 P2 修复）。两条理由：
+      //   ① `classifyModelscopeError` 的注释明确指出魔搭「额度耗尽时可能回
+      //      **401/403** 而不是 429」—— 即**这正是本分支预期会遇到的形态**，
+      //      而 `httpErrorCode(401)` = `'AUTH'`。而 `AUTH` 码会把 message 一起吞掉
+      //      （`docs/agent-notes/client-ui.md` 记的复发形态：用户只看到
+      //      「API 密钥无效」，真实原因那句指路文案连同报文一起消失）；
+      //   ② harness 的 `QUOTA_EXCEEDED_CODE` 字面值就是 `'QUOTA'`，客户端会丢掉
+      //      message 换成「当前请求的额度已用尽」⇒ 额度必须用字面量。
+      // ⇒ 故先跑一次语义分类：额度/限流各自产出**字面量**码，认证才用 `'AUTH'`。
+      // ⚠️ 语义判对而错误码判错，比两者都判错更危险 —— 它会让正确的分类
+      //    在传输途中被换掉，用户看到的是误导性的文案。
+      const info = classifyModelscopeError(response.status, text, {
+        // ⚠️ `Headers` 无索引签名、不是 `Record<string,string>` ⇒ 必须显式转。
+        //    只取 `retry-after` 一格：`classifyModelscopeError` 内部只读它。
+        ...(response.headers.get('retry-after') === null
+          ? {}
+          : { 'retry-after': response.headers.get('retry-after') as string }),
+      })
+      const code = info.kind === 'quota'
+        ? 'QUOTA_EXCEEDED'
+        : info.kind === 'rate_limit'
+          ? 'RATE_LIMIT'
+          : info.kind === 'auth'
+            ? 'AUTH'
+            : httpErrorCode(response.status)
       throw new LlmError(
         `modelscope: HTTP ${response.status} — ${text.slice(0, 300)}`,
-        httpErrorCode(response.status),
+        code,
         {
           status: response.status,
           ...retryAfterMs === undefined ? {} : { providerRetryAfterMs: retryAfterMs },
         },
+      )
+    }
+    // ⚠️⚠️ **content-type 闸门**（2026-10-17 审计 P1 修复）。此前本文件只有
+    //    `!response.ok` 一个闸门 ⇒ 网关返回 **HTTP 200 + `text/html`**（风控拦截页 /
+    //    登录墙）时被当成正常响应喂给 `consumeOpenAiSse` ⇒ 解析不出任何帧 ⇒ 抛
+    //    `EMPTY_RESPONSE` ⇒ `classifyModelscopeFailure` 读到 `status = 0` ⇒ 命中
+    //    「传输错误」分支 ⇒ **轮换把整个账号池白打一遍**，最后抛
+    //    `QUOTA_EXCEEDED`「所有账号对该模型均受限」。
+    //    ⇒ 用户看到的是「额度用尽」而真因是风控，且唯一有效动作（换网络环境）
+    //    被完全掩盖。这与 `accio-adapter.ts:1481-1492`（2026-10-13 真机踩过）是
+    //    同一个坑，此处复刻。
+    //    ⚠️ 归类 `SERVER`（**不重试**）：风控是身份/环境问题，原样重发只会再被拦。
+    const contentType = response.headers.get('content-type') ?? ''
+    if (!contentType.includes('text/event-stream')) {
+      const peek = await response.text().catch(() => '')
+      throw new LlmError(
+        `modelscope: 上游未返回事件流（content-type: ${contentType || '(空)'}）——`
+        + `通常是被风控拦截（网关返回 200 + HTML 拦截页）。`
+        + `${peek === '' ? '' : ` 服务端原文：${peek.slice(0, 200)}`}`,
+        'SERVER',
+        { status: response.status },
       )
     }
     yield* consumeOpenAiSse(
