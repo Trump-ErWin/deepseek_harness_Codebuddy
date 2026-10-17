@@ -934,8 +934,15 @@ export class AggregateAdapter extends LlmAdapter {
     'opencode',
     // ⚠️ **本 fork 独有**（modelscope，2026-10-16）：`channel: true` ⇒ 必须进聚合目录，
     //    否则它的模型**永不进聚合、静默不可见**。
-    //    ⚠️ 但**不**接入 `WIRED_EXPIRY_PROVIDERS` —— 魔搭没有额度 API，折算恒为
-    //    `UNUSABLE`，登记过去只会让每次折算白打一轮探测（见 `aggregate-expiry.ts`）。
+    //    ⚠️ 2026-10-17（用户明确要求）**已接入 `WIRED_EXPIRY_PROVIDERS`**（折算原语
+    //    `modelscopeExpiry`）：此前那句「不接，因没有额度 API ⇒ 折算恒 UNUSABLE」
+    //    **已被证伪** —— 真端点是 `/openapi/v1/magicubes/balance`（带 API Key 返
+    //    200、随消耗下降）。它属「有余额但不下发到期时间」那一类：有余额即
+    //    `NEVER`、烧光即 `UNUSABLE`。
+    //    ⚠️⚠️ **代价（用户已知并接受）**：魔粒烧光时**不会被提前剔出轮换**
+    //    （平台既不下发重置时刻，也没有别的额度端点）⇒ 耗尽后仍会被选中、失败一次。
+    //    ⚠️ **不许用「猜一个每日 UTC+8 零点」消除它** —— 那是凭空造一个上游从未
+    //    承诺的重置时刻（本仓库红线「绝不编造数字」）。
     'modelscope',
     // officeace（2026-10-12）：华为 MaaS 云端直连渠道，`channel: true`
     // ⇒ 必须进聚合目录，否则它的模型**永不进聚合、静默不可见**。

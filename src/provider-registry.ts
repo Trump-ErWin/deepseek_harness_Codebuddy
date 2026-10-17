@@ -487,9 +487,21 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    宿主侧 credits.claimAll 仍要显式回一句可读错误（见 jet-hub-rpc.ts），
     //    否则自动签到会把它记成 **failed** 而不是 **inactive**。
     //
-    // ⚠️ 不登记 rateLimit：魔搭确实会回 429，且本适配器**会写** modelRateLimits
-    //    （见 modelscope-adapter.ts 的 modelscopeRetryAfterMs），故省略 = true
-    //    才是正确语义（省略表示「会写标记、按钮该管」）。
+    // ⚠️⚠️ **登记 `rateLimit: false`（用户要求，2026-10-17）** —— 这**不是**能力缺失，
+    //    是**产品取舍**，两者的区别必须留在注释里：
+    //
+    //    - 能力上：魔搭确实会回 429，本适配器**确实会写** `modelRateLimits`
+    //      （`modelscope-adapter.ts` 的 `modelscopeRetryAfterMs`），接线层也注入了
+    //      `markLimited`（`index.ts`）；
+    //    - 取舍上：用户不要「重测 / 重置」两个按钮，故关掉入口。
+    //
+    //    ⚠️⚠️ **代价（必须如实记录）**：冷却标记**仍会写进池**，只是用户**没法用按钮
+    //    清除它** ⇒ 遇到 429 后只能等它自然过期，或删掉该账号重加。
+    //    ⚠️ 与 loomy / gemini / officeace / accio 的 `rateLimit: false` **不同源**：
+    //    那几家是「拿不到探测材料」（点了必然报「没有探测适配器」），魔搭是
+    //    「探测材料齐全但入口刻意关闭」。**别把它当成漏登记**。
+    //    ⚠️ 前两行那条「不登记 rateLimit：魔搭确实会回 429…」的旧注释已被本条取代。
+    rateLimit: false,
     // ⚠️ 不登记 accountTest / creditPackages / permanentLock / usesExpiryWindow
     //    —— 全部省略 = false，与能力实情一致。
     // ⚠️ 不登记 settingsNamespace：它不在老契约（≤0.1.6）的 namespace 清单里。

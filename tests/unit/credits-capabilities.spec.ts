@@ -260,6 +260,29 @@ describe('积分能力矩阵', () => {
  * 不写 `modelRateLimits`、也不在 `probeById` 里 ⇒ 两个按钮恒为惰性）。
  */
 describe('模型限流按钮门控（重测 / 重置）', () => {
+  /**
+   * ⚠️⚠️ **「产品取舍」型 `rateLimit: false` 的名单**（2026-10-17 新增）。
+   *
+   * `rateLimit: false` 实际有**两种**不同源，混在一起会让「为什么关」的**理由**失真：
+   *
+   * | 类型 | 含义 | 后果 |
+   * |---|---|---|
+   * | **① 语义管辖不到** | 按钮点了也没用（无探测材料 / 配额在服务端 / 根本不返回限流） | 恒惰性 |
+   * | **② 产品取舍（本表）** | 能力齐全，**用户要求关掉入口** | 标记仍写进池，但**无法用按钮清除** |
+   *
+   * ⚠️ 两者**代价完全不同** ⇒ 排障方向也不同（① 是「按钮坏了」的报障、
+   *    ② 是「我明明加了限流却不给按钮」的产品反馈），故必须分开记。
+   *
+   * ⚠️ 下方两条用例会**双向**校验本表：既不许有家「登记了 false 却没登记理由」
+   *（会被算成①），也不许有家「在本表里却没登记 false」（僵尸条目）。
+   */
+  const RATE_LIMIT_OFF_BY_CHOICE: ReadonlyMap<string, string> = new Map([
+    [
+      'modelscope',
+      '会写 modelRateLimits 且注入了 markLimited（能力齐全）；用户 2026-10-17 要求关掉入口 '
+      + '⇒ 冷却标记仍写进池但无法用按钮清除，只能等自然过期或删号重加',
+    ],
+  ])
   it('gemini 显式登记为「限流不由这组按钮管辖」', () => {
     expect(RATE_LIMIT_CAPABILITIES.gemini?.rateLimit).toBe(false)
     expect(supportsRateLimit('gemini')).toBe(false)
@@ -276,6 +299,13 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
   it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好四个）', () => {
     const disabled = Object.entries(RATE_LIMIT_CAPABILITIES)
       .filter(([, caps]) => caps.rateLimit === false)
+      // ⚠️⚠️ **必须减去「产品取舍」那一类**（2026-10-17）：`rateLimit: false` 有
+      //    **两种**不同源，混在一起数会把不变式变成「四个」这个必然腐坏的快照：
+      //      ① 「按钮语义管辖不到」（本条断言的对象）—— 点了也没用；
+      //      ② 「用户刻意不要这个按钮」（能力齐全、入口关闭，见下）。
+    //    ⚠️ 魔搭属第 ② 类：它**确实会写** `modelRateLimits`、也**确实**注入了
+    //    `markLimited`，但用户要求关掉入口。把它算进① 会让本条的**理由**失真。
+      .filter(([id]) => !RATE_LIMIT_OFF_BY_CHOICE.has(id))
       .map(([id]) => id)
       .sort()
     // 四家 rationale 各不相同（registry 里各有字段注释）：
@@ -285,6 +315,24 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     //   都恢复不了配额；
     // - loomy：根本不返回限流错误。
     expect(disabled).toEqual(['accio', 'gemini', 'loomy', 'officeace'])
+  })
+
+  it('★ 「产品取舍」那一类也必须被点名（不得悄悄混进「管辖不到」里）', () => {
+    // ⚠️ 这条断言的是**取舍表本身**存在且内容正确：若有人给某家登记
+    //    `rateLimit: false` 却没登记它的取舍理由，上一条会把它算成「管辖不到」
+    //    ⇒ 理由失真（而两者的**代价完全不同**，排查方向也不同）。
+    //
+    //    ⚠️ 代价必须逐个写清：取舍类的「按钮没了，但限流标记**仍会写进池**」，
+    //    用户只能等它自然过期或删号重加。
+    expect([...RATE_LIMIT_OFF_BY_CHOICE.entries()].sort()).toEqual([
+      ['modelscope', '会写 modelRateLimits 且注入了 markLimited（能力齐全）；用户 2026-10-17 要求关掉入口 ⇒ 冷却标记仍写进池但无法用按钮清除，只能等自然过期或删号重加'],
+    ])
+    // 反向：取舍表里的家**必须真的**登记了 false，否则这条表会变成僵尸条目。
+    for (const [id] of RATE_LIMIT_OFF_BY_CHOICE) {
+      expect(RATE_LIMIT_CAPABILITIES[id]?.rateLimit,
+        `${id} 在「产品取舍」表里，但 registry 没有 rateLimit:false ⇒ 两者表漂移`)
+        .toBe(false)
+    }
   })
 
   it('客户端源码里按钮仍走 supportsRateLimit 门控（不是在本文件另写白名单）', () => {
