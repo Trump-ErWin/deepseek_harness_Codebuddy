@@ -878,11 +878,27 @@ function contentRejectionError(
   body: string,
   rotated: boolean,
 ): LlmError {
-  // 两条通道的如实描述不同：HTTP 路径试完了全部候选，流内路径只撞到当前账号
-  // （那里不重发，避免「已吐了一半再重放」的重复计费与重复执行工具风险）。
+  /**
+   * 两条通道的如实描述不同：HTTP 路径试完了全部候选，流内路径只撞到当前账号
+   * （那里不重发，避免「已吐了一半再重放」的重复计费与重复执行工具风险）。
+   *
+   * ⚠️⚠️ `rotated: false` 这一格**必须按 `status` 再分一次**（2026-10-17 审计实测）。
+   *
+   * 该参数原本**只为流内路径设计**，`false` 的唯一含义是「流内错误帧下发」。
+   * 后来 HTTP 单凭据路径（无账号池 ⇒ 没有换号发生过）也复用了 `false`，于是
+   * 那一条 **HTTP 响应体**被文案说成「流内错误帧下发」—— 实测产物：
+   * 「当前账号被服务端安全策略拦截（HTTP 400，**流内错误帧下发**）」。
+   *
+   * ⚠️ 判据用 `status === 200` 而不是「是否 HTTP 形态」：本仓既有约定就是
+   * **流内错误帧的 HTTP 状态恒为 200**（下游 `consumeSse` 的流内出口也传 200，
+   * 见 `contentRejectionError(this.product.id, 200, payload, false)`），
+   * 而任何真正的 HTTP 错误响应都带 4xx/5xx ⇒ 该判据可判定、无重叠。
+   */
   const scope = rotated
     ? `全部账号均被服务端安全策略拦截（HTTP ${status}，已逐个换号重试）`
-    : `当前账号被服务端安全策略拦截（HTTP ${status}，流内错误帧下发）`
+    : status === 200
+      ? `当前账号被服务端安全策略拦截（HTTP ${status}，流内错误帧下发）`
+      : `当前账号被服务端安全策略拦截（HTTP ${status}，没有其他账号可换）`
   return new LlmError(
     `${productId}: ${scope}。该拦截按账号生效（同一请求在其他账号可正常返回），`
     + `请在 Jet Hub 停用或更换被拦账号：${errorDetail(body)}`,
@@ -2504,6 +2520,201 @@ export class BuddyAdapter extends LlmAdapter {
     }
     if (!response.ok) {
       let errorText = await response.text().catch(() => '')
+      // ⚠️ 11140 安全策略拦截可能回 HTTP 400（2026-10-16 实测后端行为变更，
+      // 之前回 403）。403 在上面的 401/403 分支已处理；400 走到这里。
+      // 拦截按账号生效（同一请求在其他账号可 200），与 403 路径同一语义：
+      // 标记冷却 + 逐个换号，全部被拦才报 PERMISSION_DENIED。
+      if (response.status === 400 && isContentRejection(errorText)) {
+        console.warn(
+          `[${this.product.id}] 账号 ${currentAccountId || '(current)'} 被安全策略拦截`
+          + `（HTTP 400，code 11140），换号重试`,
+        )
+        await markPolicyBlockedAccount(
+          this.options.accountPool, this.product.id, currentAccountId, options.model,
+        )
+        if (this.options.accountPool !== undefined) {
+          const triedPolicy = new Set<string>()
+          if (currentAccountId) triedPolicy.add(currentAccountId)
+          /**
+           * 换号途中**最后一次**撞到的拦截与其响应体（报错时的 HTTP 状态与报文都取它）。
+           *
+           * ⚠️ 与 401/403 路径的 `rejectionStatus` / `rejectionBody` 是**同一纪律**：
+           * 首发恒为 400，而换号后可能是 403 形态（上游两种都发），报「HTTP 400」
+           * 与实际被拦的那一次对不上，排查时会被引向错误的方向。
+           */
+          let policyStatus = response.status
+          let policyBody = errorText
+          /**
+           * 本轮是否撞到过安全策略拦截。**用入口值 `true` 初始化**（首发那一发
+           * 本块已经判过 `isContentRejection`，它就是拦截）。
+           *
+           * ⚠️⚠️ 这条是**阻断级真缺陷**的修法（2026-10-17 对抗审计实测）：
+           * 出口判据原先只读**循环结束后最后一次**的 `errorText`，而循环里的
+           * 401/403/饱和 `continue` 腿都会把 `errorText` 刷成别的内容 ⇒ 已记账的
+           * `policyStatus` / `policyBody` 变成死变量，11140 这个真因被整段丢弃。
+           *
+           * 实测（AT1 `400/11140` → AT2 `403 forbidden quota`，池耗尽）：
+           * | | 修复前 | 修复后 |
+           * |---|---|---|
+           * | 错误码 | `AUTH` | `PERMISSION_DENIED` |
+           * | message | 「buddy: forbidden quota」 | 「buddy: 全部账号均被服务端安全策略拦截…」 |
+           *
+           * ⚠️ `AUTH` 正是本仓 IKLBSH 红线：**DSH 客户端会把 message 整个换成
+           * 「API 密钥无效」** ⇒ 用户既看不到「根因是账号被安全策略拦截、该去
+           * Jet Hub 停用它」这句唯一出路，也会被引向重新登录（实测 token 全有效）。
+           *
+           * ⚠️ 与 401/403 路径的 `sawContentRejection` 是**完全同型**的写法 ——
+           * 那条同样是用入口值初始化，目的就是堵这个洞；本块先前漏了这腿。
+           */
+          let sawPolicyRejection = true
+          for (;;) {
+            const next = await this.options.accountPool.getAvailableAccount<BuddyCredential>(
+              this.product.id, options.model, triedPolicy,
+            )
+            if (!next || triedPolicy.has(next.entry.id)) break
+            triedPolicy.add(next.entry.id)
+            credential = next.credential
+            currentAccountId = next.entry.id
+            response = await this.send(credential, body, options)
+            if (response.ok) {
+              yield* this.consumeSse(response, options, currentAccountId)
+              return
+            }
+            errorText = await response.text().catch(() => '')
+            // ⚠️⚠️ 判据**不能**绑状态码（2026-10-17 审计实测的真缺陷）。
+            //
+            // 上游这一族拒绝**同时用 400 与 403 两种状态码**（本文件 401/403 分支的
+            // 注释就记录着「11140 也回 HTTP 403」）。原实现写死 `status === 400`，
+            // 于是「400 起 → 换号撞到 403 形态拦截」会在此 `break`，把池里
+            // **后面那些完全可用的账号**直接判死。
+            //
+            // 实测（真实池同形替身，池 = 3 个账号）：
+            // | 账号 | 响应 | 修复前 | 修复后 |
+            // |---|---|---|---|
+            // | AT1 | `400` + 11140 | 发起 | 发起 |
+            // | AT2 | `403` + 11140 | **break，不试** | 继续换号 |
+            // | AT3 | `200` 可用 | ❌ **从未被试**，报 `AUTH` 失败 | ✅ 成功 |
+            //
+            // ⇒ 这正是本块要修的那类故障（池里有可用账号却用不上）的**镜像版**：
+            // 它自己又造了一遍，且错误码 `AUTH` 会被 DSH 客户端换成「API 密钥无效」
+            // （`docs/agent-notes/client-ui.md` 的 IKLBSH 红线）⇒ 实测 token 全有效
+            // 却把用户引向重新登录。
+            if (isContentRejection(errorText)) {
+              policyStatus = response.status
+              policyBody = errorText
+              sawPolicyRejection = true
+              console.warn(
+                `[${this.product.id}] 换号后账号 ${currentAccountId || '(current)'} 被安全策略拦截`
+                + `（HTTP ${response.status}，code 11140），继续换号：`
+                + `${errorDetail(errorText).slice(0, 200)}`,
+              )
+              // 刚换到就被拦：同样要冷却，否则下一轮它还是第一候选。
+              await markPolicyBlockedAccount(
+                this.options.accountPool, this.product.id, currentAccountId, options.model,
+              )
+              continue
+            }
+            // ⚠️⚠️ 换号途中撞到 **401/403**（凭据真失效）**必须继续换号**：
+            // 它按账号生效，与 11140 无关；而池里后面的账号完全可用，break 会把
+            // 整轮判死。与 401/403 路径的换号循环、以及限流路径的「② 认证类失败」
+            // 分支**保持同一语义**（三处都只把「非账号级错误」当 break 理由）。
+            //
+            // 实测同上：AT1 `400/11140` → AT2 `401` → AT3 `200`，
+            // 修复前只发 2 次即报 `AUTH`，AT3 从未被试。
+            if (response.status === 401 || response.status === 403) {
+              console.warn(
+                `[${this.product.id}] 换号后账号 ${currentAccountId || '(current)'} 认证失败`
+                + `（HTTP ${response.status}），继续换号`,
+              )
+              continue
+            }
+            // ⚠️⚠️ **模型饱和（14003 / 429）也必须换号**，且**刻意不写冷却**
+            //（2026-10-17 第一轮独立审计实测的真缺陷）。
+            //
+            // 下方那条饱和分支的处置是「留在本账号退避重试、绝不换号」，它的
+            // 前提写在饱和分支的注释里：「饱和是模型级，池里其它账号会撞同一堵墙」。
+            // ⚠️ 但那个前提在**上游按账号做过负载均衡**时未必成立，而本块恰恰证明
+            // 11140 是**按账号**生效的 ⇒ 同一模型下不同账号的繁忙度可以不同。
+            //
+            // 实测（AT1 `400/11140` → AT2 `429/14003` → AT3 完全可用）：
+            // | 观测 | 走饱和分支（修复前） | 换号（修复后） |
+            // |---|---|---|
+            // | 发过的凭据 | `AT1, AT2, AT2, AT2`（**AT3 从未被试**） | 逐个换号 |
+            // | 结果 | ❌ `RATE_LIMIT`「换账号无效」 | ✅ 用上 AT3 |
+            //
+            // ⇒ 修复前会给用户一条**错误的行动指引**（「换账号无效，请改用其它模型」），
+            // 而池里明明有可用账号 —— 正是本块要消灭的那类故障。
+            //
+            // ⚠️ **不写冷却**：饱和与 11140 不同，它是**模型级**的，写 30 分钟账号级
+            // 冷却会把一批好账号封死（饱和分支的注释正是为此反对复用限流标记）。
+            // 「换个号也许能用」只需 try 一次，不必留下持久痕迹。
+            //
+            // ⚠️⚠️ **判据本体已做结构化降级，这里不得再加 `!isRateLimited` 护栏**
+            //（2026-10-17 对抗审计实测的教训，两次都踩过）。
+            //
+            // 上游的**账号额度限流**（`code: 6004`）正文里可能带「请求量饱和」
+            // 一类措辞，与模型饱和 `14003` 在**文案兜底**上无法区分。
+            // 曾在这里加 `&& !isRateLimited(...)` 想把它们分开，结果：
+            // | 报文 | `isRateLimited` | 结果 |
+            // |---|---|---|
+            // | `429/14003`（真饱和） | **恒真**（判据对 429 无条件返回 true） | ❌ 被护栏挡掉，退回下方饱和分支 ⇒ 上一轮修的「饱和也换号」**完全失效** |
+            // | `429/6004`（额度限流） | 恒真 | ✅ 被挡住（这本是对的方向） |
+            // ⇒ 一条护栏想拦两件事，实际只拦对了那个**本来就不该走这条腿**的，
+            // 反而把**该走的**也拦了 —— 判据太宽时，正确的修法是**收窄判据**
+            // （`isModelSaturationError` 本体的结构化降级），不是在调用点打补丁。
+            if (isModelSaturationError(response.status, errorText)) {
+              console.warn(
+                `[${this.product.id}] 换号后模型 ${options.model} 请求量饱和（14003），`
+                + `换号重试（不写冷却：饱和是模型级的，换号只是「也许这个号不忙」）`,
+              )
+              continue
+            }
+            // 其余（限流 / 上下文超限 / 渠道校验 …）：交给下面的既有分类逻辑，
+            // 那里的换号循环与错误码各自有正确语义（不重复换号，见下方注释）。
+            break
+          }
+          // ⚠️⚠️ 出口判据（2026-10-17 对抗审计实测的阻断级缺陷的修法）。
+          //
+          // 循环里的 401/403/饱和 `continue` 腿都会把 `errorText` 刷成别的内容，
+          // 于是出口若只读最后一次响应，已记账的 11140 根因会被整段丢弃。
+          // 实测（`AT1 400/11140 → AT2 403 forbidden quota`，池耗尽）：
+          //   错误码 `AUTH`、message「buddy: forbidden quota」—— **11140 消失**。
+          // 而 `AUTH` 正是本仓 IKLBSH 红线：**DSH 客户端把 message 整个换成
+          // 「API 密钥无效」** ⇒ 用户看不到「根因是账号被安全策略拦截、该去 Jet Hub
+          // 停用它」这句唯一出路（实测 token 全部有效）。
+          //
+          // ⚠️⚠️ 但判据**不能**只看 `sawPolicyRejection`（那是另一个方向的错）：
+          // 末位若是**限流**，它有各自正确的下游语义（写标记 + 换号 + 「所有账号均受限」），
+          // 此时误报成「全部账号均被安全策略拦截」反而是说谎。实测（修复过程中的回归）：
+          // `AT1 400/11140 → AT2 429/6004 额度限流` 误报「全部账号均被拦截」，
+          // 且额度标记丢失。
+          //
+          // ⇒ 判据是「**撞过拦截，且末位属于「message 会被客户端吞掉」的那一档**」：
+          // | 末位 | 处理 | 理由 |
+          // |---|---|---|
+          // | 仍是拦截 | 报拦截 | 原语义 |
+          // | `401` / `403` | **报拦截**（保留 11140 根因） | 它们的码会被客户端吞成「API 密钥无效」 |
+          // | 限流 / 饱和 / 上下文超限 / 渠道校验 | 交给下方既有逻辑 | 各有正确语义与换号循环 |
+          //
+          // ⚠️ 与 401/403 路径的 `sawContentRejection` 同源：那条同样是用入口值
+          // 初始化、且同样优先于 AUTH 出口，目的就是不让 11140 被认证类错误吞掉。
+          const lastIsAuthFailure = response.status === 401 || response.status === 403
+          if (!response.ok && sawPolicyRejection
+            && (isContentRejection(errorText) || lastIsAuthFailure)) {
+            throw contentRejectionError(this.product.id, policyStatus, policyBody, true)
+          }
+        }
+        // 单凭据路径（无账号池可换）：如实报「当前账号」。
+        //
+        // ⚠️ 必须走**单凭据出口**（`rotated: false` ⇒ 文案是「当前账号被…」）而不是
+        // 谎称「全部账号均…（已逐个换号重试）」—— 没有池就没有换号发生过，
+        // 旧写法把 `rotated` 绑成「池是否配置」，在「有池但换号后变成非拦截错误」
+        // 那条路径上也会谎报（该路径已由上面的出口覆盖，但两出口并存时必须各自诚实）。
+        if (!response.ok && response.status === 400 && isContentRejection(errorText)) {
+          throw contentRejectionError(this.product.id, 400, errorText, false)
+        }
+        // 换号后变成其他错误（限流 / 饱和 / 认证）：继续走下面的既有逻辑
+      }
       // ⚠️⚠️ **模型饱和必须**先于**限流分支判定**（真实缺陷，2026-10-05）
       //
       // `14003 model busy` **也是 HTTP 429**，而 `isRateLimited` 对 429
@@ -2638,7 +2849,23 @@ export class BuddyAdapter extends LlmAdapter {
           // ⚠️ `parseRateLimitError` 仍然优先：它能把**服务端声明的**真实重置
           // 时刻抠出来（有就绝不用兜底的 1 小时）。换号后 `errorText` 可能是
           // 11140 等非限流体 —— 那种情况下面①的分支会先 continue，走不到这里。
+          //
+          // ⚠️⚠️ **饱和必须排除在记账之外**（2026-10-17 对抗审计实测的真缺陷）。
+          //
+          // 本循环**每轮开头**都给当前账号记限流标记，而 `isRateLimited` 对 429
+          // **无条件返回 true** —— 于是「换号途中撞到 14003 模型饱和」的账号会被
+          // 写上**整 1 小时**的「限额重置」标记。
+          //
+          // 实测（AT1 `429/14002` 额度限流 → AT2 `429/14003 模型饱和` → AT3 `200`）：
+          // 标记 = `[acc-1: 60 分钟, acc-2: 60 分钟]` —— 而 acc-2 是**模型级**饱和，
+          // 一次瞬时繁忙不该让账号被藏一小时。
+          //
+          // ⚠️ 这与本文件下方那条「饱和必须先于限流分支判定，否则整池锁死」的守卫
+          // **直接矛盾**：那道守卫只在**循环外**生效（决定是否进入限流分支），
+          // 而换号**途中**新撞到的饱和会从这条记账腿漏过去 —— 同一缺陷的
+          // 「限流路径版本」。`8294b0b` 修了 400 路径那一处，本条是它的对偶。
           if (currentAccountId !== '' && isRateLimited(errorText, response.status)
+            && !isModelSaturationError(response.status, errorText)
             && !rateLimitMarked.has(currentAccountId)) {
             rateLimitMarked.add(currentAccountId)
             const parsed = parseRateLimitError(errorText, options.model, response.status)
