@@ -58,6 +58,7 @@ const TOKEN_URL = 'https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens'
 const CLIENT_ID = 'pdp5_for_agentarts'
 const REDIRECT_URI = `${CLAW_BASE}/v1/claw/auth/callback`
 
+
 /**
  * 本模块所有**用户级**路径的根（凭据 + OfficeAce 客户端遗留物）。
  *
@@ -429,6 +430,32 @@ async function exchangeToken(
 
 /**
  * 步骤 5：用 STS 凭据调 permission-validate，拿 modelInfo（推理凭据）。
+ *
+ * ## ⚠️ 未开通时**必须给出路**（IKM741 追补，2026-10-16 真机取证）
+ *
+ * 同一个华为号（手机号注册的根账号）在果办客户端点「开通」**前后**：
+ * 云侧从 `subscription: null` 变成 `model_auth_info` 齐全（20:57 vs 21:16 实测）。
+ * 而修前插件只回一句「账号可能未订阅 ModelArts MaaS」——**没有告诉用户怎么办**，
+ * 用户为此在客户端里摸索了半天。故本条文案的**出路信息**是判据的一部分
+ * （守卫见 `tests/unit/officeace-unsubscribed-guidance.spec.ts`）。
+ *
+ * ## ⚠️⚠️ 「自动开通」**刻意不做**（2026-10-16 真机证伪 + 用户明确否决依赖 ide）
+ *
+ * 曾经实现过一版自动开通（读果办客户端 CAS 落盘 profile、调 versatile 的
+ * `/v1/agreement` + `/v1/claw/client-subscription`），真机三处请求全部
+ * `401 APIGW.0301 invalid x-security-token` —— **根因是凭据来源**：versatile 只认
+ * **CAS** 凭据，不认插件 OAuth（`client_id=pdp5_for_agentarts`）从 `sts.cn-north-4`
+ * 换来的 STS。而三条可能的替代路径**没有一条能脱离果办客户端**：
+ *
+ * | 路径 | 卡在哪 |
+ * |---|---|
+ * | 借用客户端落盘的 CAS 凭据 + `client-subscription` | 能打通（HTTP 400 而非 401），但**新订阅要邀请码**（`AgentArts.11000008`） |
+ * | `create-order` / `claim-bonus`（用户实际走的那条，**不要邀请码**） | 只有**客户端本地 API**（`127.0.0.1:3003/api/subscription/*`）暴露，需客户端进程与其会话 |
+ * | 复刻 CAS 登录拿 ticket | ticket 只有客户端的**内嵌浏览器拦截导航**才拿得到，插件的系统浏览器拿不到 |
+ *
+ * ⇒ 插件**不读**果办客户端的落盘数据、**不调**它的本地 API、**不**碰 CAS 链条：
+ * 开通这一步留在客户端（或华为云控制台）侧。完整证据链见
+ * `docs/agent-notes/providers-officeace.md` 的「真机实测」一节。
  */
 async function fetchModelInfo(credential: OfficeAceCredential): Promise<void> {
   const url = `${CLAW_BASE}/v1/claw/client-permission-validate`
@@ -447,7 +474,12 @@ async function fetchModelInfo(credential: OfficeAceCredential): Promise<void> {
   const modelInfo = j.subscription?.model_info
   const auth = modelInfo?.model_auth_info
   if (typeof auth?.model_app_key !== 'string' || typeof auth?.model_app_secret !== 'string') {
-    throw new Error('华为云未返回 MaaS 凭据（账号可能未订阅 ModelArts MaaS）')
+    // ⚠️ 判据：**半截凭据**（只有 key 没有 secret）也算「未开通」——不许写半截凭据进号池。
+    // ⚠️ 文案里的出路信息是**被测行为**，别删（守卫会红）。
+    throw new Error(
+      '华为云未返回 MaaS 凭据：该账号尚未开通 ModelArts MaaS。'
+      + '请先用该账号在果办客户端里点「开通」并同意授权，再回来重试。',
+    )
   }
   credential.modelAppKey = auth.model_app_key
   credential.modelAppSecret = auth.model_app_secret
@@ -610,10 +642,44 @@ export interface CredentialStore {
 }
 
 /**
- * 按 ref 读凭据（**优先 DSH 凭据库**，回落默认文件）。
+ * 按 ref 读凭据（**优先 DSH 凭据库**，再回落**本 ref** 的兼容文件）。
  *
  * ⚠️ 这个次序不能反：多账号下每个账号的凭据在凭据库里按 ref 索引，
  *    `session.json` 只是老数据的兼容兜底 —— 先读文件会串号。
+ *
+ * ## ⚠️⚠️ 兜底**必须带 `ref`**（Gitee issue IKM741，2026-10-16 实测确证）
+ *
+ * 这里原先写的是 `readStoredCredential()` —— **漏传了 `ref`**，于是它读的是那份
+ * **全局唯一**的 `session.json`（语义 =「最后一次登录的那个账号」）。而本函数
+ * 的**每一个**调用方都传了 ref（`refreshAccountCredential` / `latestAfterFailedRefresh`
+ * / `fetchSubscriptionSummary` / `index.ts` 的两处）⇒ 这个「不带 ref 的兜底」
+ * 没有任何调用方需要它，纯粹是串号源。这正是 AGENTS.md 记的
+ * 「位置/键错位」那一类缺陷的又一次复发（把 ref 丢在调用边上）。
+ *
+ * 实测后果（`~/.dsh` 四个账号三条已无凭据的真实机器）：
+ *
+ * | 情形 | 修前 | 修后 |
+ * |---|---|---|
+ * | 库里**有**该 ref | 用它 | 用它（不变） |
+ * | 库里**无**该 ref，但有 `session-<ref>.json` | 读它（不变） | 读它（不变） |
+ * | 库里**无**该 ref，也没有该 ref 的兼容文件 | **读全局 `session.json`** ⇒ 把**别的账号**的凭据当成本账号的 | `undefined`（如实报「本账号无凭据」） |
+ *
+ * 第三格是三条真实故障的**同一个根因**：
+ *
+ * 1. **跨账号烧一次性 `refresh_token`**：`refresh_token` 是一次性的，而
+ *    `session.json` 是全局单份 ⇒ N 个「有账号无凭据」的账号各自回落到**同一份**
+ *    token、各自拿它去续期 ⇒ 第一个消费掉，其余全部收到
+ *    `STS5.1806 has been used`（issue 补充评论里的三条日志逐字如此）。
+ *    危害是**跨账号**的：一份坏账号能把别的健康账号的路堵掉。
+ * 2. **读数串号**：`fetchSubscriptionSummary(48, ref, …)` 拿全局凭据走云侧直读
+ *    ⇒ 把最后一个登录账号的余额显示成本账号的余额（正是
+ *    `ProviderExpiryContext.credentialRef` 那段注释记录的形态）。
+ * 3. **`expiresAt` 串号**：`account.list` 的逐账号回填读到的是全局那份。
+ *
+ * ⚠️ 兼容性：改成按 ref 后，**单凭据老用户零行为变化** —— 那条路径本来就
+ *    不经过本函数（它由 `readStoredCredential()` 无参调用点承担，如
+ *    `probeOfficeAce` / `readOfficeAceCredential` / `fetchModelTokenRates`）。
+ *    本函数只服务多账号路径，而多账号路径**必须**按 ref。
  */
 export async function readCredential(
   ref: string,
@@ -626,9 +692,9 @@ export async function readCredential(
         const parsed = JSON.parse(resolved.value) as OfficeAceCredential
         if (typeof parsed.modelAppKey === 'string' && parsed.modelAppKey.length > 0) return parsed
       }
-    } catch { /* 解析失败 → 回落文件 */ }
+    } catch { /* 解析失败 → 回落**本 ref** 的兼容文件（见上方注释） */ }
   }
-  return readStoredCredential()
+  return readStoredCredential(ref)
 }
 
 // ────────────────────────── 刷新 ──────────────────────────
@@ -1114,22 +1180,42 @@ export async function fetchSubscriptionSummary(
   // 0. **多账号路径**：有 ref 时先走云侧直读（本地 cookie 无法区分账号）。
   //    成功即返回，不落到下面的本地 API —— 那会串号。
   if (ref !== undefined && ref.length > 0) {
+    /**
+     * ⚠️⚠️ **凭据不存在 ⇒ 如实报「未登录」，绝不用陈旧缓存充数**
+     * （Gitee issue IKM741 修法 C，2026-10-16 实测确证）。
+     *
+     * 修前这里是一个 `try{}catch{}` 罩住「读凭据 + 云侧直读」，catch 之后
+     * **无条件**落到该 ref 的缓存兜底 ⇒ 三种失败被混成一件事：
+     *
+     * | 情形 | 修前读数 | 修后 |
+     * |---|---|---|
+     * | 凭据在、云侧临时不可达 | 该 ref 的缓存（`stale:true`，合理） | 不变（**保留**，这是「数据截至 hh:mm」的正当用法）|
+     * | **凭据已不存在**（孤儿账号） | **仍报出一个数字** | `undefined` ⇒ 面板显示「未登录」|
+     *
+     * 第二格正是 issue 的核心误导（实测复现）：那 3 条「有账号无凭据」的账号
+     * 面板照样显示 6493.32 / 6500 这类数字，用户据此认为「账号正常、还有额度」，
+     * 而它**已经没有任何凭据**、在聚合里恒 `UNUSABLE`。数字来源是登录时写下的
+     * **快照**（`subscription-cache-<ref>.json`，本机那几份的 `cachedAt` 是
+     * 10-13 / 10-14，而凭据早就没了）。
+     *
+     * ⇒ 判据：**读数必须与凭据绑定** —— 凭据在，读数才有意义（含它的陈旧缓存）；
+     * 凭据不在，唯一诚实的答案是「未登录」，宁可显示失败也不显示一个假数字。
+     */
+    const own = credential ?? await readCredential(ref, credentials).catch(() => undefined)
+    if (own === undefined) return undefined
     try {
-      const own = credential ?? await readCredential(ref, credentials)
-      if (own !== undefined) {
-        // ⚠️ **先自动签到再查余额**（顺序不能反）：签到会把当日 1000 分打进
-        //    `bonus_skus`，先查就永远少显示那一份 —— 用户会以为没领到。
-        //    `maybeClaimBonus` 内部按小时去重，不会重复打服务端。
-        await maybeClaimBonus(own, ref)
-        const cloud = await fetchCloudSubscriptionFor(own)
-        if (cloud !== undefined) {
-          writeSubscriptionCache(cloud, ref)
-          return cloud
-        }
+      // ⚠️ **先自动签到再查余额**（顺序不能反）：签到会把当日 1000 分打进
+      //    `bonus_skus`，先查就永远少显示那一份 —— 用户会以为没领到。
+      //    `maybeClaimBonus` 内部按小时去重，不会重复打服务端。
+      await maybeClaimBonus(own, ref)
+      const cloud = await fetchCloudSubscriptionFor(own)
+      if (cloud !== undefined) {
+        writeSubscriptionCache(cloud, ref)
+        return cloud
       }
-    } catch { /* 掉到该账号的缓存兜底 */ }
-    const own = readSubscriptionCache(ref)
-    if (own !== undefined) return { ...own, stale: true }
+    } catch { /* 凭据在、只是云侧暂时读不到 ⇒ 掉到「本 ref」的缓存兜底 */ }
+    const cached = readSubscriptionCache(ref)
+    if (cached !== undefined) return { ...cached, stale: true }
     return undefined
   }
 

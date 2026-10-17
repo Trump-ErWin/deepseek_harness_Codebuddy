@@ -1818,7 +1818,7 @@ JS，里面的 JSDoc 写反引号没问题 —— 但**从它们复制片段进 
 
 ⚠️ 实测数值（无头浏览器，比较 `getBoundingClientRect` 的渲染宽度与自然宽度 ——
 不能用 clientWidth / scrollWidth，两者会四舍五入）：带角标后 193.56px → **202.19px**，
-名字与读数都不出省略号，仍在 216px 上限内。
+名字与读数都不出省略号，仍在 216px 上限内。
 
 ## ⚠️⚠️ 一键签到的汇总**必须按单位分列**，不得跨单位求和（2026-10-04 真实报障）
 
@@ -2024,7 +2024,7 @@ CRLF=725 / LoneLF=0），而脚本里的锚点是用 `\n` 写的。不做归一�
 ⚠️ **教训的普遍性**：这是本仓库第二次栽在「**跨量纲求和**」上（第一次是胶囊把
 `credit`/`credits` 拆成两组，见上一节）。凡是把**带单位的量**累加成**裸数字**，
 单位就一定会在那一层丢掉；正确做法是让单位**跟着数字一起走**（分桶 / 分组），
-把「怎么显示」推迟到最后一层。
+把「怎么显示」推迟到最后一层。
 
 ## 账号池与多账号
 
@@ -2253,7 +2253,7 @@ QUOTA_EXCEEDED
 
 ⚠️ 本缺陷与 Cline 那条（下面「429 有**三种**语义」）、qoder `10605`/`110`、
 zcode `3009`/`1005` 是**同一个病根**：**用状态码的默认归类代替了对业务语义的判断**。
-接新的 429/限流分支时，先把「这个码的正确动作是什么」问清楚再写。
+接新的 429/限流分支时，先把「这个码的正确动作是什么」问清楚再写。
 
 ## 模型黑名单（Jet Hub「显示列表」开关）
 
@@ -2332,7 +2332,7 @@ ctx.remote.$on('credentials/reference-updated', () => this.catalog.refresh())
 
 ⚠️ **同名消歧必须基于未过滤的全量集合**（`displayNameFor(model, source)` 而非
 `listed`）：用过滤后的集合会让「关掉其中一个同名模型」改变另一个的变体标记，
-名字随开关跳变。
+名字随开关跳变。
 
 ## 目录门控：没有已登录账号就隐藏整个 provider
 
@@ -2396,7 +2396,7 @@ ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs
   否则用户关掉模型后连开关都看不到，更无法重新打开（这是此前修过的真实缺陷）。
 - 六个适配器的 `listModels` 都要加（`llm-adapter` / `buddy` / `lobsterai` /
   `qoder` / `trae`）。`buddy` 与 `workbuddy` 共用同一个适配器类，但
-  `this.product.id` 不同 → 两者按各自 provider 独立判定，互不影响。
+  `this.product.id` 不同 → 两者按各自 provider 独立判定，互不影响。
 
 ## ⚠️ 停用账号时可选「同时停用该 provider 的模型」
 
@@ -2456,7 +2456,7 @@ ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs
 回归用例：`tests/unit/model-filter.spec.ts`（27 条）、
 `tests/unit/account-model-link.spec.ts`（18 条）、
 `tests/unit/jet-hub-rpc.spec.ts` 的 `model.setDisabledBulk` 段（14 条）、
-`tests/unit/account-pool.spec.ts` 的 `setModelsDisabledState` 段（8 条）。
+`tests/unit/account-pool.spec.ts` 的 `setModelsDisabledState` 段（8 条）。
 
 ## ⚠️ 模型行布局：长 id 会把开关挤出可视区（真实缺陷）
 
@@ -2519,7 +2519,7 @@ body 横向滚动 = 否
 
 该文件整体是 **JS 模板字符串**（`const STYLES = \`...\``），注释里的反引号会
 **提前终止字符串**、导致 esbuild 报 `Expected ";" but found "..."`。
-本次就因此构建失败过一次 —— 说明 CSS 属性时一律不加反引号。
+本次就因此构建失败过一次 —— 说明 CSS 属性时一律不加反引号。
 
 ## 模型面板的搜索与筛选（**不含多选、不含渲染上限**）
 
@@ -2934,3 +2934,124 @@ Error: 内部错误：产物里注册的 id 是 "dsh-codearts-auth"，与 packag
 **只有 `BACKUP_FORMAT` 是兼容读取点**，其余是「写点无读点」的落盘标记
 （真实用户的 `~/.dsh/jet-hub/*.json` 里确实躺着这 5 个旧值）。
 ⚠️ 把整组说成「跟着改名会让用户读不出已落盘状态」是**过度陈述**（2026-10 审计）。
+
+## ⚠️⚠️ 聚合的三态门控与手工排序（2026-10-15，issue IKL7F9 + IKLQR2）
+
+> 规格：`docs/superpowers/specs/2026-10-15-aggregate-gating-manual-order-design.md`
+> 计划：`docs/superpowers/plans/2026-10-15-aggregate-gating-manual-order.md`（均**不入库**：`docs/superpowers` 被 gitignore）
+
+### 1. 三态判据**只留一份**（客户端只渲染、不判定）
+
+权威实现是 `src/aggregate-core.ts` 的 `resolveCandidateGate`（零 import 纯函数），
+优先级 **显式拒绝 > 显式允许 > 默认**（已接入折算 ⇒ 参与；未接入 ⇒ 默认不参与）。
+宿主在 `aggregate.catalog` 里把结果**直接下发**（每个候选带 `state` 与 `expiryWired`）
+⇒ 客户端**不得**自己重算（「同一语义两套判据」是本仓库首条红线）。
+
+⚠️ 两个字段的**分工**不要混：
+- `state` = 三态**判定结果**（`allowed` / `rejected` / `default-rejected`）；
+- `expiryWired` = **渠道级事实**（该渠道接不接入折算），**只**用来回答一个问题：
+  「关掉这条候选时该写**拒绝表**还是**白名单**」—— 见 `candidateToggleAction` 的四行表。
+
+### 2. ⚠️⚠️ 未接入渠道的候选必须赋 `NEVER`，**不能**落到 probe 的 `UNUSABLE`
+
+`src/aggregate-adapter.ts` 的 `candidatesFor` 里有一段**看起来可以删掉**的分支：
+
+```ts
+if (!WIRED_EXPIRY_PROVIDERS.includes(candidate.provider)) {
+  candidate.expiry = NEVER    // 可用、只是没有临期信息
+  continue
+}
+```
+
+**为什么不能让它走 probe**：`credentialExpiry` 对未接入渠道**恒返回 `UNUSABLE`**
+（`aggregate-expiry.ts` 的短路）⇒ `rankCandidates` 会把它剔除 ⇒ 症状是
+「我明明在面板上打开了，它还是不参与」，**零报错、零日志**。
+
+⚠️ **它的前提是「门控已经跑过」**：能走到这里的未接入候选必然是白名单里**显式放行**的
+那几条。⇒ 用例必须**两个方向都覆盖**，否则把门控整段删掉用例仍然全绿
+（本任务变异验证实测：第一版「未放行 ⇒ 不在池里」那条用例**无牙**，因为
+buddy 先成功、永远走不到 raccoon）。
+
+### 3. ⚠️ 目录身份与用户门控**无关**（`:636` 的过滤为什么删、为什么不能再加回来）
+
+`refreshCatalog` 里**曾经**有一条 `WIRED_EXPIRY_PROVIDERS` 过滤，2026-10-15 **整条删除**：
+
+1. **判据已恒真**：`providerIds()` = `AGGREGATE_CHANNELS ∩ 存活路由` ⇒ 每条候选的
+   `provider` 必然在 `AGGREGATE_CHANNELS` 内 ⇒ 换成渠道全集即恒 `true`；
+2. **它让用户点不动**：未接入渠道的**独有模型**会被整条剔掉 ⇒ 用户在面板里手工打开后，
+   选择器里**仍然看不到它**（打开白做）。
+
+⚠️⚠️ **不得改成「至少一个候选当前参与轮换」**：那会让「用户把某模型的候选全部拒绝」
+把该模型**从选择器里移除**，而仓库有**两处成文不变式**明文禁止：
+`jet-hub-store.ts` 的 `AggregateRejectionMap` 上方（「候选全被拒 ≠ 关闭模型」）与
+面板的 `isAllCandidatesRejected`（「面板需对候选全被拒给出显式提示」）。
+附带好处：`this.catalog` 保持稳定 ⇒ `provider.status` 的 `total` **不随用户点击漂移**。
+
+### 4. ⚠️ 面板显示顺序 = 真实轮换顺序（跨层一致性用例）
+
+客户端 bundle 是**独立 entry、不 import 宿主模块**（`build.mjs`）⇒ 比较器无法复用，
+只能在 `plugin-src/client/aggregate-panel-logic.js` 里写第二份
+（`rankCandidatesForPanel`）。**唯一守卫**是一条**跨层一致性用例**
+（`tests/unit/aggregate-panel-logic.spec.ts` 的「与宿主 rankCandidates 同序」）：
+同一份 fixture 过两个实现、逐项相等。**改动任一侧先跑它。**
+
+⚠️ 两处都必须保留 `expiryA !== expiryB` 这一格：两个 `Infinity` 相减得 `NaN`
+（非法比较器返回值，`sort` 会当 `0` ⇒ 顺序随引擎漂移）。
+
+### 5. 两张表**各有各的域，不做互斥归一**（用户 2026-10-15 的修正）
+
+| 渠道类型 | 默认态 | 例外靠哪张表 |
+|---|---|---|
+| **已接入**折算 | 参与 | **拒绝表**（黑名单语义：只有「不参与」需要显式记录） |
+| **未接入**折算 | 不参与 | **白名单**（只有「参与」需要显式记录） |
+
+两表的键域由 `expiryWired`（渠道级编译期事实）划分 ⇒ **天然不相交** ⇒
+写一侧**不得**改另一侧（顺手清另一侧会静默改掉**属于别的操作**的用户状态：
+拒绝一条候选不该顺手关掉同渠道其它手工打开的候选）。
+判定优先级 `rejected > allowed > 默认` 保留为**纵深防御**。
+
+⚠️ 但**落笔时我第一版按「互斥归一」实现**（写一侧清另一侧），用户看过设计后推翻 ——
+「同一枚开关的两个方向」听起来对称，但两表的**语义域**不对称。设计文档 §5.1 有留档。
+
+---
+
+## ⚠️⚠️ 源码文本断言的**共同弱点**：`if (false)` 短路禁用（2026-10-16 对抗审计）
+
+PR #102 合并后跑了对抗性审计，它用 **5 条 `if (false)` 型变异**打穿了本仓库一批
+**源码文本断言**（`toMatch(/字面量/)` / `toContain('字面量')`）：
+
+| 变异写法 | 原判据 | 结果 |
+|---|---|---|
+| `if (false) { event.dataTransfer.setData('text/plain', …) }` | `/dataTransfer\.setData\('text\/plain'/` | 🟡 **绿**（无牙）|
+| `if (false) { void commitOrder(…) }` | `/void commitOrder\(/` | 🟡 **绿** |
+| 保留条件行 + 加一句**无条件** `await onSortByExpiry()` | 字面量存在性 | 🟡 **绿** |
+| `onDragEnd: draggable ? () => {} : undefined`（保留方法名） | `/onDragEnd/` | 🟡 **绿** |
+
+**根因**：判据打在**文本存在性**上，而字面量在死分支里**照样存在**、代码却永不执行。
+⇒ 这类断言能防「整行被删」，但防不住「今天能跑、明天被包进死分支」。
+
+**为什么不能改成行为判据**：客户端单测环境**没有 react、`environment: 'node'`（无 DOM）**
+⇒ 组件内部逻辑（`AggregatePanel` 的 effect / 事件处理器）**够不到**。
+本仓库的既有做法是「把判据抽成纯函数」（`aggregate-panel-logic.js` 的模块注释），
+但**接线本身**（谁调谁、有没有被条件包住）仍然只能靠源码断言。
+
+**已落地的补强**（`tests/unit/aggregate-panel-logic.spec.ts`）：
+1. **常量假条件检测**：命中行往上找最近的 `if (false)` / `if (0)` / `while (false)`，
+   遇到属性起始（`onDrop:` 等）就停 ⇒ 判「不得被包进死分支」；
+2. **无条件调用检测**：用**缩进级别**判「每个 `onSortByExpiry()` 都被条件包住」
+   —— 无条件调用的缩进与其上那条 `if` **同级**，有条件的会**更深**。
+
+⚠️ **两条过程教训（比结论更重要）**：
+1. **判据没抓住，先怀疑判据本身，别先怀疑被测代码。** 我第一版「往上找 6 行内有无
+   `if (`」的启发式**抓不到** —— 它找到了**相邻**那条语句的 `if`，把无条件调用
+   误判成有条件的。改成缩进比对才成立。
+2. **变异「全绿」不等于「守卫无牙」——也可能是变异根本没注入。**
+   我第一次注入 M4 时用单行精确匹配，而文件里是 `\r\n` ⇒ `replace` **静默不生效**
+   ⇒ 我据此以为判据无牙，其实**什么也没改**。对抗审计方也在同一处误报过
+   （多行正则锚点在 CRLF 上不匹配）。
+   ⇒ **变异脚本必须区分「锚点未命中」与「无牙」**：注入后**打印实际片段**确认，
+   锚点未命中要单独报 `PATCH-NOT-APPLIED`（不算结论）。这条已写进本仓库的变异纪律。
+
+**仍未覆盖（如实登记）**：`onDragEnd` 那类「保留方法名、函数体改成 no-op」的变异
+**无法用文本判据区分**（`onDragEnd: ` 后面接 `() => {}` 与接真实现，正则都命中）
+—— 要覆盖它需要 AST 或真 react 渲染，本期不做。

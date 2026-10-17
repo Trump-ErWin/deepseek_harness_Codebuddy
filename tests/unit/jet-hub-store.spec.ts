@@ -10,14 +10,20 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  clearRejectionLayer,
   createJetHubStore,
   mergeLegacyLoomyLock,
   sanitizeAccounts,
+  sanitizeAggregateAllowed,
+  sanitizeAggregateOrder,
+  sanitizeAggregateOrderMode,
   sanitizeDisabledModels,
   sanitizeGatewayEnabled,
   sanitizeNativeWebSearchEnabled,
   sanitizePermanentLocks,
   sanitizeProviderOrder,
+  withAllowed,
+  withoutAllowed,
 } from '../../src/jet-hub-store.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 import { PROVIDER_REGISTRY } from '../../src/provider-registry.js'
@@ -124,6 +130,10 @@ describe('老契约后端（SettingsStore）', () => {
       disabledModels: { buddy: { 'glm-5.2': true } },
       // save 未携带拒绝表 → 写出空表，读回同值（老文档没这个键时的默认）。
       aggregateRejections: {},
+      // 三个新键（聚合门控 + 手工排序）同样缺省即写出：空白名单 / 空顺序表 / 临期序。
+      aggregateAllowed: {},
+      aggregateOrder: {},
+      aggregateOrderMode: 'expiry',
       loomyPermanentLocked: false,
       gatewayEnabled: true,
       // save 未携带原生搜索开关 → 写出启用（缺省），读回同值。
@@ -240,6 +250,12 @@ describe('文件后端（FileStore）', () => {
       disabledModels: { buddy: { 'glm-5.2': true } },
       // 拒绝表缺省空表（没有任何拒绝）—— 与升级前行为一致
       aggregateRejections: {},
+      // 门控白名单缺省空表（没有手工打开的候选）—— 未接入渠道因此回到「默认不参与」
+      aggregateAllowed: {},
+      // 手工顺序表缺省空表（未自定义任何模型的顺序）
+      aggregateOrder: {},
+      // 排序模式缺省临期序 —— 与升级前行为一致
+      aggregateOrderMode: 'expiry',
       // 镜像字段缺省 false（解锁）—— 与既有行为一致
       loomyPermanentLocked: false,
       // 网关开关缺省启用 —— 与升级前行为一致
@@ -536,6 +552,10 @@ describe('文件后端（FileStore）', () => {
       disabledModels: {},
       // 拒绝表缺省空表（没有任何拒绝）：读回同值。
       aggregateRejections: {},
+      // 三个新键同理：写盘时缺省，读回应如实带回这些默认值。
+      aggregateAllowed: {},
+      aggregateOrder: {},
+      aggregateOrderMode: 'expiry',
       loomyPermanentLocked: false,
       // 写盘时缺省即启用：读回应如实带回这个默认值。
       gatewayEnabled: true,
@@ -758,5 +778,150 @@ describe('归一化', () => {
     expect(isValidResetAtMs('123')).toBe(false)
     expect(isValidResetAtMs(null)).toBe(false)
     expect(isValidResetAtMs(undefined)).toBe(false)
+  })
+})
+
+/**
+ * 聚合门控白名单 / 手工顺序表 / 排序模式（用户 2026-10-15 的新功能）。
+ *
+ * ⚠️ 判据的写法照本文件的既有纪律：`sanitize*` 的返回值断言是**必要但不足**的
+ *    （`:304` 那条教训：7 条 sanitize 单测全绿、生产零调用者）——
+ *    真正的守卫是**跨实例读回**与**载荷逐键在**，见下面两组。
+ */
+describe('sanitizeAggregateAllowed（只认显式 true；空层不保留；畸形退化空表）', () => {
+  it("只留 true，false / 1 / 字符串 true 一律丢弃", () => {
+    expect(sanitizeAggregateAllowed({
+      m: { minimax: { r1: true, r2: false, r3: 1, r4: 'true' } },
+    })).toEqual({ m: { minimax: { r1: true } } })
+  })
+
+  it('空层逐级不保留（不留 { m: {} } / { m: { minimax: {} } }）', () => {
+    expect(sanitizeAggregateAllowed({ m: { minimax: {}, empty: { r: false } } })).toEqual({})
+  })
+
+  it('畸形输入一律退化空表（含数组 —— typeof [] === object）', () => {
+    expect(sanitizeAggregateAllowed([])).toEqual({})
+    expect(sanitizeAggregateAllowed('x')).toEqual({})
+    expect(sanitizeAggregateAllowed(null)).toEqual({})
+    expect(sanitizeAggregateAllowed({ m: [] })).toEqual({})
+    expect(sanitizeAggregateAllowed({ m: { minimax: [] } })).toEqual({})
+  })
+})
+
+describe('sanitizeAggregateOrder（只留含 NUL 的非空字符串，去重保序）', () => {
+  it('丢掉不含分隔符的元素、空串、非字符串与重复项', () => {
+    expect(sanitizeAggregateOrder({
+      m: ['buddy\u0000r1', 'buddy\u0000r1', 'no-separator', '', 42, 'trae\u0000r2'],
+    })).toEqual({ m: ['buddy\u0000r1', 'trae\u0000r2'] })
+  })
+
+  it('空数组 / 非数组 / 畸形一律丢键（= 未自定义）', () => {
+    expect(sanitizeAggregateOrder({ empty: [], bad: 'not-an-array' })).toEqual({})
+    expect(sanitizeAggregateOrder([])).toEqual({})
+    expect(sanitizeAggregateOrder('x')).toEqual({})
+  })
+})
+
+describe('sanitizeAggregateOrderMode（只有字面量 manual 才算手工）', () => {
+  it('逐格', () => {
+    expect(sanitizeAggregateOrderMode('manual')).toBe('manual')
+    expect(sanitizeAggregateOrderMode('expiry')).toBe('expiry')
+    expect(sanitizeAggregateOrderMode(undefined)).toBe('expiry')
+    expect(sanitizeAggregateOrderMode(null)).toBe('expiry')
+    expect(sanitizeAggregateOrderMode('MANUAL')).toBe('expiry')
+    expect(sanitizeAggregateOrderMode(1)).toBe('expiry')
+  })
+})
+
+describe('清层/白名单纯函数（`clearRejectionLayer` 只服务 D4 那一条既有路径）', () => {
+  const REJECTIONS = { m: { buddy: { driftOld: true, other: true }, trae: { a: true } } }
+
+  it('clearRejectionLayer 清的是**整渠道层**（D4：重新打开一条 = 整渠道恢复）', () => {
+    expect(clearRejectionLayer(REJECTIONS, 'm', 'buddy')).toEqual({ m: { trae: { a: true } } })
+  })
+
+  it('clearRejectionLayer 逐级删层，且**不改入参**', () => {
+    expect(clearRejectionLayer({ m: { buddy: { a: true } } }, 'm', 'buddy')).toEqual({})
+    expect(clearRejectionLayer(REJECTIONS, 'm', 'buddy')).not.toBe(REJECTIONS)
+    expect(REJECTIONS.m.buddy).toEqual({ driftOld: true, other: true })
+  })
+
+  it('clearRejectionLayer 对不存在的键是恒等（不抛错、不造空层）', () => {
+    expect(clearRejectionLayer({}, 'm', 'buddy')).toEqual({})
+    expect(clearRejectionLayer({ m: {} }, 'm', 'buddy')).toEqual({})
+  })
+
+  it('withoutAllowed 只删同键（同渠道其它候选的手工打开状态必须保留）', () => {
+    const before = { m: { minimax: { r1: true, r2: true } } }
+    expect(withoutAllowed(before, 'm', 'minimax', 'r1')).toEqual({ m: { minimax: { r2: true } } })
+    expect(withoutAllowed({ m: { minimax: { r1: true } } }, 'm', 'minimax', 'r1')).toEqual({})
+    expect(before).toEqual({ m: { minimax: { r1: true, r2: true } } })
+  })
+
+  it('withAllowed 幂等、不改入参，并能合并进已有渠道层', () => {
+    expect(withAllowed({}, 'm', 'minimax', 'r1')).toEqual({ m: { minimax: { r1: true } } })
+    expect(withAllowed(withAllowed({}, 'm', 'minimax', 'r1'), 'm', 'minimax', 'r1'))
+      .toEqual({ m: { minimax: { r1: true } } })
+    expect(withAllowed({ m: { minimax: { r1: true } } }, 'm', 'minimax', 'r2'))
+      .toEqual({ m: { minimax: { r1: true, r2: true } } })
+  })
+})
+
+describe('★ 三个新键必须在两个后端都能跨实例读回（不是只断言 sanitize）', () => {
+  const ALLOWED = { 'deepseek-v4-1-flash': { minimax: { 'MiniMax-M3': true } } }
+  const ORDER = { 'deepseek-v4-1-flash': ['minimax\u0000MiniMax-M3'] }
+
+  it('老契约后端：载荷逐键在 + 能读回', async () => {
+    let saved: Record<string, unknown> | undefined
+    const scope = {
+      get: () => saved,
+      replace: async (section: object) => { saved = section as Record<string, unknown> },
+    }
+    const store = createJetHubStore(makeCtx({ register: () => scope, describe: () => [] }))
+    await store.save({
+      accounts: [],
+      disabledModels: {},
+      aggregateAllowed: ALLOWED,
+      aggregateOrder: ORDER,
+      aggregateOrderMode: 'manual',
+    })
+
+    // ① `replace` 是整体替换语义 ⇒ 载荷漏键 = 永不落盘 + 任何写入都抹掉它
+    expect(saved?.aggregateAllowed).toEqual(ALLOWED)
+    expect(saved?.aggregateOrder).toEqual(ORDER)
+    expect(saved?.aggregateOrderMode).toBe('manual')
+    // ② 且能读回（不是只写进载荷、读时又丢掉）
+    expect(store.load()?.aggregateAllowed).toEqual(ALLOWED)
+    expect(store.load()?.aggregateOrder).toEqual(ORDER)
+    expect(store.load()?.aggregateOrderMode).toBe('manual')
+  })
+
+  it('文件后端：新实例能读回（跨重启持久化）', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({
+      accounts: [],
+      disabledModels: {},
+      aggregateAllowed: ALLOWED,
+      aggregateOrder: ORDER,
+      aggregateOrderMode: 'manual',
+    })
+
+    const reader = createJetHubStore(makeCtx(undefined))
+    expect(reader.load()?.aggregateAllowed).toEqual(ALLOWED)
+    expect(reader.load()?.aggregateOrder).toEqual(ORDER)
+    expect(reader.load()?.aggregateOrderMode).toBe('manual')
+  })
+
+  it('老文档没有这三个键时缺省为空/临期序（= 升级前行为）', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {} }),
+      'utf-8',
+    )
+    const state = createJetHubStore(makeCtx(undefined)).load()
+    expect(state?.aggregateAllowed).toEqual({})
+    expect(state?.aggregateOrder).toEqual({})
+    expect(state?.aggregateOrderMode).toBe('expiry')
   })
 })

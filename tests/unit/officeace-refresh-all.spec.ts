@@ -365,33 +365,51 @@ describe('★ IKLPTZ 回归：批量续期对**同步**账号池（真实 apply(
    *
    * ⚠️ 模块导出的 `refreshAll` 给 `refreshAccountCredential` 只传 3 个实参
    * （**没有 `credentials`**）⇒ 内部 `readCredential(ref, undefined)` 走的是
-   * 「兼容文件」腿：读 `storeDir()` 下**默认的** `session.json`（这正是它
-   * 与 `index.ts` 那份的语义差异，也是必须保留它的理由）。
+   * 「兼容文件」腿：读 `storeDir()` 下**该 ref 自己的** `session-<ref>.json`
+   * （这正是它与 `index.ts` 那份的语义差异，也是必须保留它的理由）。
    * ⇒ 传 `credentials` 桩**观测不到任何东西**（第一版就是这么写的）。
    *
-   * 故本条改为在**隔离后的** `DSH_OFFICEACE_HOME` 下放一份「距过期还远」的
-   * `session.json`：
+   * 故本条改为在**隔离后的** `DSH_OFFICEACE_HOME` 下，给**每个账号各放一份**
+   * 「距过期还远」的 `session-<ref>.json`：
    * - lead-time 判据命中「无需续期」⇒ **一个网络请求都不发**；
    * - 但「本轮不刷」分支**仍必须对账池值**（AGENTS.md 铁律）⇒ 每个账号各调一次
    *   `pool.updateAccount(accountId, …)`。
    *
    * 「每账号一次 updateAccount」因此是**无网络、可观测**的续期证据。
+   *
+   * ## ⚠️⚠️ 桩数据必须**逐账号一份**（Gitee issue IKM741 连带修正，2026-10-16）
+   *
+   * 本条原先只在目录里放**一份全局** `session.json`，两个账号（C/D）都靠它兜底
+   * —— 那正是 issue IKM741 的缺陷形态本身：`readCredential` 的兜底**漏传 `ref`**
+   * ⇒ 所有「库里没有凭据」的账号都读到**同一份**别人的凭据（读数串号；
+   * 遇到 `refresh_token` 还会跨账号烧掉一次性 token）。
+   * 修好兜底后本条立刻变红 —— **红因是桩依赖了缺陷**，不是判据变弱。
+   * ⇒ 改为逐账号写 `session-<ref>.json`，判据一字未改。
    */
   it('② 模块导出的 refreshAll 不得抛错，**且逐个账号都走到续期**（比对账池值观测）', async () => {
     const dir = process.env.DSH_OFFICEACE_HOME
     expect(dir, 'DSH_OFFICEACE_HOME 未隔离，本条会去碰用户真实凭据，拒绝执行').toBeDefined()
 
     // 距过期 2 小时 ⇒ 落在 lead-time 窗口外 ⇒ 不续期、但仍对账（零网络）。
-    const credential = {
-      modelAppKey: 'probe-key',
-      modelAppSecret: 'probe-secret',
+    // ⚠️ **逐账号一份**（见上方 IKM741 说明）：共用一份会让两个账号读到同一个
+    //    凭据 —— 那既是串号形态，也会让本条的观测点变成「全局兜底在工作」。
+    const credentialOf = (ref: string) => ({
+      modelAppKey: `probe-key-${ref}`,
+      modelAppSecret: `probe-secret-${ref}`,
       maasBaseUrl: 'https://example.invalid',
       access: 'a', secret: 's', securityToken: 't', projectId: 'p',
       expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
-      refreshToken: 'probe-refresh',
+      refreshToken: `probe-refresh-${ref}`,
       dpopPrivateJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y', d: 'd' },
-    }
-    writeFileSync(join(dir, 'session.json'), JSON.stringify(credential), 'utf8')
+    })
+    writeFileSync(
+      join(dir, 'session-OFFICEACE_ACCOUNT_C.json'),
+      JSON.stringify(credentialOf('OFFICEACE_ACCOUNT_C')), 'utf8',
+    )
+    writeFileSync(
+      join(dir, 'session-OFFICEACE_ACCOUNT_D.json'),
+      JSON.stringify(credentialOf('OFFICEACE_ACCOUNT_D')), 'utf8',
+    )
 
     const updated: Array<string | undefined> = []
     const listAccountsByProvider = vi.fn(() => [
