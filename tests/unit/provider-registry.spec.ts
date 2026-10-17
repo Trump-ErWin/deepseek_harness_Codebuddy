@@ -144,10 +144,12 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(locked).toEqual(['buddy', 'lobsterai', 'loomy', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('usesExpiryWindow 恰好是既有的 5 家（loomy 不在内，它没有窗口概念）', () => {
+  it('usesExpiryWindow 恰好是既有的 6 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17 加入）', () => {
     const win = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
-    expect(win).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`，未过期批次
+    //    之和 == total_balance（守恒实测）⇒ 批次包带 `deductionEndTime` 可分三档。
+    expect(win).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
   it('rateLimit === false 恰好是 5 家（modelscope 2026-10-17 加入，理由与前四家不同）', () => {
@@ -177,10 +179,10 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(t).toEqual(['gemini'])
   })
 
-  it('creditPackages 恰好是既有的 7 家（officeace 2026-10-12 加入）', () => {
+  it('creditPackages 恰好是既有的 8 家（officeace 2026-10-12、autoclaw 2026-10-17 加入）', () => {
     const p = PROVIDER_REGISTRY.filter((d) => d.creditPackages === true)
       .map((d) => d.id).sort()
-    expect(p).toEqual(['buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy'])
+    expect(p).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy'])
   })
 
   it('autoCheckinExcluded 恰好是 zcode', () => {

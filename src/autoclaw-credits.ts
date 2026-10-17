@@ -5,9 +5,18 @@
  *
  * 1. 积分钱包余额查询（只读）：
  *    `GET /agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw`
- *    响应包含 total_balance 与各钱包明细（reward, daily, subscription, fuel_pack, other）
+ *    响应包含 total_balance 与各钱包明细（reward, daily, subscription, fuel_pack, other）。
+ *    ⚠️ **无任何到期字段**（桌面端 Zod schema `.strict()` 五字段）——
+ *    且服务端用 `display` 标记哪些池可展示（官方客户端据此过滤）。
  *
- * 2. 每日签到领额度（写，幂等判据）：
+ * 2. 积分流水（只读，**临期桶的数据源**）：
+ *    `GET /agent-assetmgr/api/v1/ledgers_std?asset_type=point&wallet_type=all`
+ *    每笔发放（`mutation_type === "credit"`）带 `wallet_expires_at`（unix 秒）
+ *    —— 该渠道**唯一**的每批次到期数据源。实测 28/28 全带值，且未过期批次
+ *    之和 == `total_balance`（守恒，2026-10-17 取证）⇒ 批次包可**替换**钱包包，
+ *    客户端按 `deductionEndTime` 分「永久 / 长期 / 临期」三档（buddy / officeace 同构）。
+ *
+ * 3. 每日签到领额度（写，幂等判据）：
  *    `POST /userapi/v1/user-info`
  *    Body: `{ source_id: 'autoclaw', device_id }`
  *    响应体中 `daily_check_in_completed_on_request`:
@@ -29,9 +38,19 @@ import {
 } from './autoclaw.js'
 
 export const AUTOCLAW_WALLETS_PATH = '/agent-assetmgr/api/v2/wallets'
+export const AUTOCLAW_LEDGERS_PATH = '/agent-assetmgr/api/v1/ledgers_std'
 export const AUTOCLAW_DAILY_CLAIM_PATH = '/userapi/v1/user-info'
 export const AUTOCLAW_CREDITS_TIMEOUT_MS = 15_000
 export const AUTOCLAW_CREDIT_UNIT = '积分'
+
+/**
+ * 流水翻页上限（页 × 100 条）。
+ *
+ * ⚠️ **必须有界**：余额徽标每 60 秒轮询一次，无界翻页会把徽标变成无限循环请求。
+ * 实测该账号全部发放历史 = 28 条（1 页）。到达上限仍没对平时，走守恒回退
+ *（见 `fetchAutoclawBalanceDetailed`）—— 宁可没有临期桶，也不给错数。
+ */
+export const AUTOCLAW_LEDGER_MAX_PAGES = 5
 
 /** 钱包类型与默认展示名映射。 */
 export const AUTOCLAW_WALLET_TYPE_LABELS: Readonly<Record<string, string>> = {
@@ -123,6 +142,15 @@ function makePackage(
 /**
  * 解析并转换钱包明细列表为 CreditPackage 数组。
  * 按照 priority 排序（小者优先），若 display_name 存在则使用，否则回退映射类型名。
+ *
+ * ⚠️ **`display === false` 的钱包必须丢弃**（2026-10-17 用户报障「每日 0」红字）。
+ * 官方桌面端同款过滤（main.cjs `readWallets`：`wallet.display === true`）——
+ * 服务端用这个标记表达「该池不该展示」（实测 `daily/subscription/fuel_pack/other`
+ * 四池全为 `display:false` 且余额 0）。此前本解析器**忽略**了该标记，
+ * 把 4 个隐藏的 0 余额池也发了出去 ⇒ 客户端按池名匹配「每日积分」命中
+ * `DAILY_POOL_NAMES`，渲染出红色的「每日 0」——而「每日红 + 刷新倒计时」
+ * 是 Loomy 那种**当日重置池**的语义（未用完随重置作废），AutoClaw 的
+ * 每日签到积分是发放进余额、按**批次到期**作废的，两码事。
  */
 export function parseAutoclawWallets(walletsRaw: unknown): CreditPackage[] {
   if (!Array.isArray(walletsRaw)) return []
@@ -141,15 +169,100 @@ export function parseAutoclawWallets(walletsRaw: unknown): CreditPackage[] {
     })
   }
 
-  items.sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100))
+  // ⚠️ 服务端 `display === false` = 「不该展示」（官方客户端同款过滤），
+  //    不是「余额为 0」——两者都为假时才回退为 true。
+  const visible = items.filter((item) => item.display !== false)
+  visible.sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100))
 
-  return items.map((item) => {
+  return visible.map((item) => {
     const type = item.public_wallet_type ?? 'other'
     const defaultLabel = AUTOCLAW_WALLET_TYPE_LABELS[type] ?? (type ? `${type}积分` : '其他积分')
     const name = (item.display_name && item.display_name.trim()) || defaultLabel
     const remaining = item.balance ?? 0
-    return makePackage(name, remaining, item.display ?? true)
+    return makePackage(name, remaining, true)
   })
+}
+
+/** 流水条目里与本功能相关的原始字段（`toLedgerEntry` 的输入侧，见模块头）。 */
+export interface AutoclawLedgerEntry {
+  readonly amount?: unknown
+  readonly mutation_type?: unknown
+  readonly wallet_expires_at?: unknown
+  readonly description?: unknown
+  readonly source?: unknown
+  readonly metadata?: unknown
+}
+
+/**
+ * 解析流水 → **按到期批次分组的积分包**。
+ *
+ * ## 为什么不用钱包、改用流水
+ *
+ * v2 钱包接口**没有任何到期字段**（桌面端 Zod schema `CreditsWalletSchema`
+ * `.strict()` 只认 `key/type/displayName/balance/balanceView` 五个字段）；
+ * 而流水（`/agent-assetmgr/api/v1/ledgers_std`）的每笔发放都带
+ * `wallet_expires_at`（unix 秒）—— 这是该渠道**唯一**的每批次到期数据源。
+ * 真机取证（2026-10-17，本账号 28 笔发放）：**28/28 全带到期值**，且
+ * 未过期批次之和 == `total_balance`（20700，分毫不差）⇒ 用批次包**替换**
+ * 钱包包后，三档分桶（永久 / 长期 / 临期）与 buddy / officeace 同构。
+ *
+ * ## 分组与字段映射
+ *
+ * - 只取 `mutation_type === 'credit'`（发放；消费行没有到期语义）；
+ * - `wallet_expires_at` 为**秒**级 unix 时间戳 ⇒ 乘 1000 归一成毫秒
+ *   （`deductionEndTime` 与 officeace / buddy 同单位）；
+ * - **无到期字段的发放**（活动赠送的永久分）⇒ 不带 `deductionEndTime`
+ *   （= 永久桶，客户端判据对 `undefined` 的约定是「到期未知」）；
+ * - **已过期**（`wallet_expires_at <= now`）的批次**直接丢弃**：那批积分
+ *   已经不在钱包余额里了（守恒核对实测成立），发出去会凭空多出一笔死数；
+ * - 包名取服务端的人话描述（「每日签到」「AutoClaw 用户登录奖励积分，7天有效」）。
+ *
+ * @param entries - 流水原始条目（一页或多页拼接）。
+ * @param nowMs - 当前时刻（毫秒）；测试注入用。
+ */
+export function parseAutoclawLedgerBatches(
+  entriesRaw: unknown,
+  nowMs: number = Date.now(),
+): CreditPackage[] {
+  if (!Array.isArray(entriesRaw)) return []
+  const nowSec = nowMs / 1000
+
+  // 按到期时刻分组（同刻并列 = 同一批）；无到期的单独走永久桶。
+  const byExpiry = new Map<number, { amount: number; label: string }>()
+  let permanent = 0
+  let permanentLabel = '其他积分'
+  for (const raw of entriesRaw) {
+    if (!raw || typeof raw !== 'object') continue
+    const entry = raw as AutoclawLedgerEntry
+    if (entry.mutation_type !== 'credit') continue
+    const amount = typeof entry.amount === 'number' && Number.isFinite(entry.amount) ? entry.amount : 0
+    if (amount === 0) continue
+    const label = (typeof entry.metadata === 'object' && entry.metadata !== null
+      ? (entry.metadata as { description?: unknown }).description
+      : undefined) ?? entry.description ?? entry.source ?? '积分发放'
+    const name = typeof label === 'string' && label.trim().length > 0 ? label.trim() : '积分发放'
+    const exp = typeof entry.wallet_expires_at === 'number' && Number.isFinite(entry.wallet_expires_at)
+      ? entry.wallet_expires_at
+      : undefined
+    if (exp === undefined || exp <= 0) {
+      permanent += amount
+      if (permanentLabel === '其他积分') permanentLabel = name
+      continue
+    }
+    if (exp <= nowSec) continue // 已过期：余额里已经没有这批了，丢弃。
+    const bucket = byExpiry.get(exp) ?? { amount: 0, label: name }
+    bucket.amount += amount
+    byExpiry.set(exp, bucket)
+  }
+
+  const packages: CreditPackage[] = [...byExpiry.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([expSec, batch]) => ({
+      ...makePackage(batch.label, batch.amount, true),
+      deductionEndTime: expSec * 1000,
+    }))
+  if (permanent > 0) packages.push(makePackage(permanentLabel, permanent, true))
+  return packages
 }
 
 /**
@@ -210,9 +323,30 @@ export async function fetchAutoclawBalanceDetailed(
         ? data.total_balance
         : 0
 
-    const packages = parseAutoclawWallets(data?.wallets)
+    // ⚠️ display=false 的隐藏池在这里已被滤掉（见 parseAutoclawWallets）——
+    //    官方客户端同款行为，红色「每日 0」由此消失。
+    const walletPackages = parseAutoclawWallets(data?.wallets)
+
+    // ── 临期桶的数据源：流水批次 ──
+    // 钱包接口没有到期字段；流水的每笔发放带 wallet_expires_at（unix 秒）。
+    // 守恒校验通过才采用批次包（未过期批次之和 == total_balance，实测 20700）；
+    // 不守恒（翻页到顶 / 接口变化）⇒ 回退钱包包 —— 宁可没有临期桶，不给错数。
+    let packages = walletPackages
+    if (total > 0) {
+      try {
+        const entries = await fetchAutoclawLedgerEntries(credential, options)
+        const batches = parseAutoclawLedgerBatches(entries)
+        const batchSum = batches.reduce((sum, pkg) => sum + pkg.remaining, 0)
+        if (batches.length > 0 && batchSum === total) {
+          packages = batches
+        }
+      } catch {
+        // 流水不可达：静默回退钱包包（临期桶缺失，但总额与长期数仍正确）。
+      }
+    }
+
     if (packages.length === 0) {
-      packages.push(makePackage('奖励积分', total, true))
+      packages = [makePackage('奖励积分', total, true)]
     }
 
     const balance: CreditBalance = {
@@ -227,6 +361,52 @@ export async function fetchAutoclawBalanceDetailed(
       error: `AutoClaw 钱包网络请求异常：${error instanceof Error ? error.message : String(error)}`,
     }
   }
+}
+
+/**
+ * 拉取积分流水的**全部发放条目**（有界翻页）。
+ *
+ * ⚠️ 只发 GET、只翻到 {@link AUTOCLAW_LEDGER_MAX_PAGES} 页；中途任何一页失败
+ * 都把**已拿到的**条目返回（上游守恒校验会兜住不完整的页序列 —— 不完整 ⇒
+ * 批次之和不等于钱包总额 ⇒ 回退钱包包，绝不给错数）。
+ */
+export async function fetchAutoclawLedgerEntries(
+  credential: AutoclawCredential,
+  options?: AutoclawCreditsOptions,
+): Promise<AutoclawLedgerEntry[]> {
+  const token = cleanToken(credential.access_token)
+  if (!token) return []
+
+  const product = options?.product ?? AUTOCLAW
+  const fetcher = options?.fetcher ?? fetch
+  const all: AutoclawLedgerEntry[] = []
+  let cursor: string | undefined
+
+  for (let page = 0; page < AUTOCLAW_LEDGER_MAX_PAGES; page++) {
+    const query = new URLSearchParams({
+      asset_type: 'point',
+      wallet_type: 'all',
+      page_size: '100',
+      flow_direction: 'income',
+    })
+    if (cursor !== undefined) query.set('cursor', cursor)
+    const resp = await fetcher(`${product.apiBase}${AUTOCLAW_LEDGERS_PATH}?${query.toString()}`, {
+      method: 'GET',
+      headers: buildAutoclawCreditsHeaders(product, token),
+      signal: AbortSignal.timeout(AUTOCLAW_CREDITS_TIMEOUT_MS),
+    })
+    if (!resp.ok) return all
+    const json = (await resp.json()) as {
+      code?: number
+      data?: { entries?: unknown; next_cursor?: unknown; nextCursor?: unknown }
+    }
+    if (json.code !== 0 || !Array.isArray(json.data?.entries)) return all
+    all.push(...(json.data.entries as AutoclawLedgerEntry[]))
+    const next = json.data.next_cursor ?? json.data.nextCursor
+    cursor = typeof next === 'string' && next.length > 0 ? next : undefined
+    if (cursor === undefined) break
+  }
+  return all
 }
 
 /**
