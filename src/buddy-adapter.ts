@@ -638,30 +638,70 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  *
  * 判据用三个独立信号（任一命中即可）：业务码、`msg` 措辞、`displayMsg` 文案。
  * 只看状态码无法区分 —— 403 同时覆盖「真认证失败 / 额度 / 权限 / 安全策略」。
+ *
+ * ⚠️⚠️ **第二腿 `/request illegal/` 与 11128 渠道校验是同一句 msg**（2026-10-17 实测）
+ *
+ * `msg:"request illegal"` 并不是 11140 独占的措辞：`11128` 的「渠道校验」子原因
+ * **实测也用这一句**（同端点、同一天、两个账号上稳定复现，且那一句在本机从未
+ * 以 `conversation id missing` 的形态出现）。两者的处置**完全不同**：
+ *
+ * | | 11140（本档） | 11128 渠道校验 |
+ * |---|---|---|
+ * | 换个请求形态能否绕过 | ❌ 不能 | ✅ **能**（带上三枚 Conv 头即 200） |
+ * | 换号是否有效 | ✅ | ✅ |
+ * | 写 30 分钟冷却 | ✅ | ❌ **不可**（会把可用账号凭空封禁） |
+ *
+ * ⇒ 本档**必须先排除**渠道校验形态，否则：一份「带三头就能用」的报文会被判成
+ * 账号级拦截 → 换号 + 写 30 分钟冷却 + 出口文案建议用户**停用该账号** ——
+ * 而用户停用后少了账号，整条渠道更不可用。这是 IKM7SG 复验实测到的生产缺陷。
+ *
+ * ⚠️ 排除用的判据**只认结构化报文里 `code` 精确等于 11128 的那种**（理由与
+ * 书写变体见 `CHANNEL_VERIFICATION_ILLEGAL_MSG_FIELD` 的注释）；**刻意不复用**
+ * `isChannelVerificationRejection` 整个函数：它还认 `conversation id missing`
+ * 与 HTML 裸子串兜底，那两条腿**不该**参与本档的排除（它们与 11140 无歧义，
+ * 且一旦在这里排除，将来上游若给 11140 也带上那两句，会凭空多出一条免冷却路径）。
  */
 function isContentRejection(body: string): boolean {
   if (body.length === 0) return false
   return /"code"\s*:\s*11140/.test(body)
-    || /request illegal/i.test(body)
+    || (/request illegal/i.test(body) && !CHANNEL_VERIFICATION_ILLEGAL_MSG_FIELD.test(body))
     || /安全审核|safety review/i.test(body)
 }
 
 /**
- * ★★ 「渠道校验」拒绝：`11128 conversation id missing`（2026-10-16 实测）。
+ * ★★ 「渠道校验」拒绝：`11128`，**按账号生效**（2026-10-16 实测，2026-10-17 复验）。
+ *
+ * ## ⚠️⚠️ `msg` 有**两种**实测形态，判据必须**都**认（2026-10-17 真机复验）
+ *
+ * | 形态 | 出处 |
+ * |---|---|
+ * | `conversation id missing` | IKM7SG 记录；本机**从未复现**（5 账号 × 数十次零命中） |
+ * | **`request illegal`** | **本机实测稳定拿到**（两个不同账号、跨多次、逐字稳定） |
+ *
+ * ⚠️ **只认前者会让真实报文整条链路走错档** —— 实测后果：
+ * `isChannelVerificationRejection` 恒不命中 ⇒ 落进 `isContentRejection` 的
+ * `/request illegal/i` 腿（11140 档）⇒ 换号 + **写 30 分钟冷却** + 出口建议
+ * 用户「停用该账号」—— 而该账号**带上三头立刻 200**，正是本档明确写「不可写冷却」
+ * 的那一档。
+ *
+ * ⚠️⚠️ 而 `request illegal` **与 11140 共用**（11140 实测就是这句）⇒ 本档与
+ * `isContentRejection` **必须同时**按 `code` 精确值收窄，只改一侧都无效。
+ * 详见 `CHANNEL_VERIFICATION_ILLEGAL_MSG_FIELD` 与本文件末尾的变异验证记录。
  *
  * ## 为什么必须与 `isContentRejection` 分开
  *
- * 两者**共用同一个业务码 `11128`**，但成因与处置都不同：
+ * 两者**共用同一个业务码 `11128`**（前者）或相邻码（11140），但成因与处置都不同：
  *
- * | | `isContentRejection`（11140 系） | 本档（11128 conversation id missing） |
+ * | | `isContentRejection`（11140 系） | 本档（11128 渠道校验） |
  * |---|---|---|
  * | 成因 | 账号级安全策略拦截 | 网关对**特定账号**的渠道校验 |
+ * | 换个请求形态能否绕过 | ❌ 不能 | ✅ **能**（带上三枚 Conv 头即 200） |
  * | 换号 | ✅（唯一出路） | ✅（唯一出路） |
  * | 写 30 分钟冷却 | ✅ 否则每轮重撞 | ❌ **不可**（见下） |
  *
- * ⚠️ 判据**看的是这句 `msg` 的文本**，绝不能写成 `code === 11128` —— 同码至少四族
- * 子原因（渠道级 / 消息形状级 / 内容指纹级 / 本档），`msg` 各不相同，处置也不同。
- * 放宽成按 code 会把 `Illegal API invocation from an unapproved channel`
+ * ⚠️ 判据**看的是这句 `msg` 的文本 + `code` 精确值**，绝不能只看 `code === 11128`
+ * —— 同码至少四族子原因（渠道级 / 消息形状级 / 内容指纹级 / 本档），`msg` 各不相同，
+ * 处置也不同。放宽成按 code 会把 `Illegal API invocation from an unapproved channel`
  * （由腾讯指纹改写链路处理、与账号轮换无关）也拖进换号，属误伤。
  * ⚠️ 但「看 msg」不等于「要求完整 JSON 片段」：见下方判据体内的书写变体表。
  *
@@ -699,6 +739,16 @@ function isContentRejection(body: string): boolean {
  * - `D87606B1` / `D3238B4E` 同样不带三头：**全部 200** ⇒ 该拒绝**按账号**生效；
  * - 失败**只限聊天端点**（同刻 `/agenttool/v1/search` 200、`/v3/config` 200）；
  * - `66E05E7C` 带上三头：立刻 200。
+ *
+ * ## ⚠️ 2026-10-17 独立复验（维护者本机，5 个 workbuddy 账号）
+ *
+ * 判据**完整复现**（三枚同值/异值/`abc-123` 全 200、空串 400、删任一枚 400、
+ * 补 `X-User-Id`/`X-Session-ID`/`X-Trace-Id`/`X-Request-Id` 全 400、
+ * `200→400→200` 逐请求可切、换 system 仍 400 ⇒ 内容无关），
+ * **按账号生效**复现为 **2/5**（两个受限账号、三个不受限）。
+ * ⚠️ 但 `msg` 复现成 **`request illegal`** 而非 `conversation id missing`
+ * —— 这正是上面新增腿③ 的由来，也是本档判据在 PR #104/#105 上恒不命中的原因。
+ * 完整报文、claim 对照、变异验证表见 `docs/agent-notes/providers-buddy.md`。
  */
 /**
  * 腿①：`msg` / `message` 键的**值**里含该句（容忍分词符与 JSON 转义）。
@@ -731,6 +781,68 @@ const CHANNEL_VERIFICATION_MSG_FIELD =
 /** 腿②：无结构化字段时的裸子串腿（HTML / 纯文本网关页）。同理要求分隔符存在。 */
 const CHANNEL_VERIFICATION_BARE =
   /conversation(?:[\s:_\-\p{Cf}]|\\[nrt])+id(?:[\s:_\-\p{Cf}]|\\[nrt])+missing/iu
+
+/**
+ * ⚠️⚠️ 腿③：**上游实际用的那句 `msg` 是 `request illegal`，不是 `conversation id missing`**。
+ *
+ * ## 为什么必须加这条腿（2026-10-17 真机复现，Gitee issue IKM7SG 复验）
+ *
+ * IKM7SG 记录的真实报文是 `{"code":11128,"msg":"conversation id missing",…}`，
+ * 而本机**独立复现**到的报文（两个不同账号、跨多次、逐字稳定）是：
+ *
+ * ```json
+ * {"code":11128,"msg":"request illegal","requestId":"…",
+ *  "displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送"},
+ *  "displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client. …",
+ *                 "zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。"}}
+ * ```
+ *
+ * ⇒ **`conversation id missing` 这句在这台机器上从未出现过**（跨 5 账号 × 数十次
+ * 请求零命中）；本档腿①/腿② 对它**恒不命中**，于是这份报文整条链路走不进本档。
+ * 实测后果（生产链路，见 `docs/agent-notes/providers-buddy.md`）：
+ * | 环节 | 修复前 |
+ * |---|---|
+ * | 归属 | 落进 `isContentRejection`（它的 `/request illegal/i` 腿命中） |
+ * | 处置 | 当成 11140 账号级拦截 → 换号 + **写 30 分钟冷却** |
+ * | 出口文案 | 「全部账号均被服务端安全策略拦截…请在 Jet Hub 停用或更换被拦账号」 |
+ * 而该账号**带上三头立刻 200** ⇒ 正是本档注释里明确写「**不可**写冷却」的那一档。
+ * 症状与 PR #105 想避免的失败形态**逐字同形**（可用账号被凭空封 30 分钟、
+ * UI 显示「限额重置」、建议用户停用它），只是入口判据认错了报文。
+ *
+ * ## ⚠️⚠️⚠️ 为什么**不能**只按 `request illegal` 判（这是本条最易踩的坑）
+ *
+ * **`request illegal` 是 11140 与 11128 渠道校验「共用」的 msg** —— 本仓
+ * `isContentRejection` 的注释与全部单测都把它写成 11140 的报文（实测 11140 就是
+ * `{"code":11140,"msg":"request illegal"}`）。所以本条必须**同时**锚定：
+ *
+ * 1. `code` 键**存在**（结构化报文），且
+ * 2. 其值**精确等于 11128**（不是 11140、不是别的码）。
+ *
+ * ⚠️ 用 `/11128/` 子串匹配**不够**：`111280` / `11128x` 这类码会误命中，而它们
+ * 的处置未知。⇒ 必须写**带右边界**的形式。
+ * ⚠️ 右边界是 `(?![\d.])`、**不是** `(?![0-9])`（2026-10-17 单测实测出的自引入缺陷）：
+ * JSON 允许非整数码，`JSON.stringify({code:11128.5})` 写出的是 `11128.5`，
+ * 而 `.` 不在 `[0-9]` 里 ⇒ 只挡数字的写法会**放行小数**并误命中。
+ * 实测：只挡数字时 `{"code":11128.5,"msg":"request illegal"}` 被判成渠道校验。
+ * ⇒ `.` 必须一并挡掉（它也顺带挡掉了 `1.1128e4` 这类科学计数法里的歧义形态）。
+ * ⚠️ 也不写 `code` 腿的「存在性」判断就够了：只判「有 code 键」会把
+ * `{"code":11140,"msg":"request illegal"}` 一起吃掉 ⇒ 那正是 11140，必须放行。
+ *
+ * ## ⚠️ 为什么**不**用 `displayTips` 的「渠道校验 / channel verification」作判据
+ *
+ *  tempting 的做法是认那句提示，因为它字面就是「渠道校验」。**实测它不可用**：
+ * 11128 的**各个子原因共用逐字相同的 `displayTips`**（本机同时抓到
+ * `msg:"request illegal"` 与 `msg:"Illegal API invocation from an unapproved channel"`
+ * 两份报文，二者的 `displayTips` **逐字节相同**），且它与本仓库测试夹具里
+ * 11140 族那句「安全策略拦截 / blocked by security policy」也高度相近。
+ * ⇒ 用它会把**内容级**的 `Illegal API invocation…` 也拖进换号，
+ * 而那一句换号**完全无效**（由腾讯指纹改写链路处理、每个账号都会被拦在同一句上），
+ * 后果是整池被白烧 —— 与隔壁 describe 锁死的「别族不换号」直接冲突。
+ *
+ * ⇒ 判据只锚 `code` + `msg` 两处**都在结构化字段里**，不扫任何提示文案。
+ */
+const CHANNEL_VERIFICATION_ILLEGAL_MSG_FIELD =
+  /"code"\s*:\s*11128(?![\d.])[^{}]*"m(?:sg|essage)"\s*:\s*"[^"]*request(?:[\s:_\-\p{Cf}]|\\[nrt])+illegal/iu
 
 function isChannelVerificationRejection(body: string, status?: number): boolean {
   if (body.length === 0) return false
@@ -802,6 +914,7 @@ function isChannelVerificationRejection(body: string, status?: number): boolean 
   // ⚠️ 腿① **不受**此闸门约束：它要求 `msg`/`message` 的值位精确命中，是**强证据**
   //（上游确实用它报这个错），出现在任何状态码上都应认。
   if (CHANNEL_VERIFICATION_MSG_FIELD.test(body)) return true
+  if (CHANNEL_VERIFICATION_ILLEGAL_MSG_FIELD.test(body)) return true
   if (status !== undefined && status !== 400 && status !== 403) return false
   if (/"m(?:sg|essage)"\s*:/.test(body)) return false
   if (/^\s*\{/.test(body) && /"code"\s*:/.test(body)) return false
@@ -2925,9 +3038,12 @@ export class BuddyAdapter extends LlmAdapter {
             sawChannelVerification = true
             channelVerificationStatus = response.status
             channelVerificationBody = errorText
+            // ⚠️ 日志**不写死** `msg` 那句措辞：实测它在同一 code 下有多种形态
+            //（`conversation id missing` / `request illegal` / …），写死会让日志
+            // 与上游实际回报不符、误导排查。原始报文在后面的 detail 里。
             console.warn(
               `[${this.product.id}] 账号 ${currentAccountId || '(current)'} 未通过渠道校验`
-              + `（HTTP ${response.status}，code 11128 conversation id missing），继续换号`
+              + `（HTTP ${response.status}，code 11128），继续换号`
               + `（不写冷却）：${errorDetail(errorText).slice(0, 200)}`,
             )
             continue
@@ -3021,12 +3137,18 @@ export class BuddyAdapter extends LlmAdapter {
     //
     // | `WB_REF` | 基线（全头） | 删任一枚 | 三枚全删 |
     // |---|---|---|---|
-    // | `D87606B1` | ✅ 200 | ✅ 200 | ✅ 200 |
-    // | **`66E05E7C`** | ✅ 200 | ❌ **400/11128** | ❌ **400/11128** |
+    // | `D87606B1`（IKM7SG） | ✅ 200 | ✅ 200 | ✅ 200 |
+    // | **`66E05E7C`（IKM7SG）** | ✅ 200 | ❌ **400/11128** | ❌ **400/11128** |
+    // | 3 个 workbuddy 账号（2026-10-17 复验） | ✅ 200 | ✅ 200 | ✅ 200 |
+    // | **另 2 个 workbuddy 账号（2026-10-17 复验）** | ✅ 200 | ❌ **400/11128** | ❌ **400/11128** |
     //
     // ⇒ **下面那张 14/14 消融表与 IKM7SG 的分叉表都对，差的是账号。**
-    //    准确表述是：**「在多数账号上不是；在特定账号上是」**。
+    //    准确表述是：**「在多数账号上不是；在特定账号上是」**（2026-10-17 复验为 3/5 与 2/5）。
     //    ⚠️ 下表的结果**只在参与实验的那个账号上成立** —— 别再加「全局」二字。
+    // ⚠️⚠️ **2026-10-17 复验的重大修正**：这些被拒格子的 `msg` 实测是
+    // **`request illegal`**，不是 `conversation id missing`（后者本机零命中）。
+    //   而 `request illegal` **与 11140 共用** ⇒ 本档与 `isContentRejection`
+    //   必须**同时**按 `code` 精确值收窄，详见 `isChannelVerificationRejection`。
     //
     // | 实验 | 规模 | 结果（**在参与实验的那个账号上**） |
     // |---|---|---|
@@ -3078,14 +3200,17 @@ export class BuddyAdapter extends LlmAdapter {
     //    「要求三头」的账号整条渠道不可用（IKM7SG 的 14/14 消融数据**不能**用来
     //    证明「可以删」，那批数据只在**不要求三头**的账号上取得）。
     //
-    // ## ⚠️ 触发条件的现状（本条已按 IKM7SG 重写）
-    // `conversation id missing` 的触发条件**已定位到字段级**：
-    // 「三枚 Conv 头同时存在且非空」，**但仅对特定账号生效**（IKM7SG）。
+    // ## ⚠️ 触发条件的现状（本条已按 2026-10-17 独立复验重写）
+    // 该拒绝的**成因**已定位到字段级：「三枚 Conv 头同时存在且非空」，
+    // **但仅对特定账号生效**（IKM7SG；本机复现为 2/5）。
     // - 对**多数账号**：三头非必需，缺了也 200；
     // - 对**特定账号**：三头**必需**，缺任一枚即 400/11128。
-    // ⚠️ **为何只有该账号、生效范围如何演进，IKM7SG 明确未定论**（仅登记一条
-    // 线索：该账号 token 缺 `name` 系列 claim，n=1、无因果证据）。
-    // 若用户再次看到这句：**先取失败报文的 `requestId`**（本档出口已带上它），
+    // ⚠️ **为何只有那些账号、生效范围如何演进，IKM7SG 明确未定论**；本轮复验
+    // **未获支持**那条「缺 `name` 系列 claim」的线索（本机 5 个账号 claim 键集
+    // 完全相同，两个受限账号互不相同）⇒ 别据此写断言。
+    // ⚠️⚠️ **报文里的 `msg` 其实是 `request illegal`**（2026-10-17 实测），
+    // `conversation id missing` 本机零命中 ⇒ 见文件头 `isChannelVerificationRejection`。
+    // 若用户再次看到这类报错：**先取失败报文的 `requestId`**（本档出口已带上它），
     // 并**优先核对「那个账号」**——不要按「内容」方向排查（实测内容无关）。
     //
     // ## ⚠️⚠️ 语义：三头是**逐请求一次性 id**，不是「会话身份」
