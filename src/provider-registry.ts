@@ -456,20 +456,34 @@ id: 'autoclaw',
     displayName: 'AutoClaw (智谱)',
     logoClass: 'autoclaw',
     credits: { balance: true, dailyCheckin: true },
-    // ⚠️ 余额响应里每个积分包都带到期时间（2026-10-17 真机取证）：
-    //    钱包接口本身**没有**到期字段，但流水的每笔发放带 `wallet_expires_at`
-    //    （unix 秒），且未过期批次之和 == total_balance（守恒实测 20700）⇒
-    //    `autoclaw-credits.ts` 用**批次包**替换钱包包，逐包带 `deductionEndTime`
-    //    （毫秒，与 officeace / buddy 同单位）⇒ 通用判据分「永久 / 长期 / 临期」三档。
+    // ⚠️⚠️ **2026-10-17 审计修正：本渠道「按批次分档」是尽力而为，不是保证**。
+    //
+    // 事实链（三条缺一，结论就反了）：
+    // ① `autoclaw-credits.ts` 用**流水批次包**替换钱包包，逐包带 `deductionEndTime`
+    //    （毫秒，与 officeace / buddy 同单位）—— 钱包接口本身没有任何到期字段；
+    // ② ⚠️ **流水的 `amount` 是「历史发放额」，不是「该批次当前剩余额」** ——
+    //    上游**没有**「该批次已消耗多少」这一腿（对照 `trae-credits.ts` 的
+    //    `remaining = creditsLimit - used`：两腿都在才算得出剩余；本渠道只有发放那一腿）。
+    //    ⇒ 用户**消耗过积分后**，未过期批次之和 ≠ `total_balance`；
+    // ③ 因此下游以「批次和 == `total_balance`」为**守恒安全网**，不守恒即回退钱包包
+    //    （总额与长期数仍正确，只是**没有**临期档）⇒ 临期档只在恰好守恒的那次轮询出现。
+    //
+    // ⇒ 本行是「把 `windowDays` 回传给客户端，使分档行在有批次包时能渲染」的
+    //    **能力开关**，不是数据保证。
+    // ⚠️ 与 `src/aggregate-expiry.ts` 的 `autoclawExpiry` 注释口径一致：
+    //    聚合折算恒为 `NEVER`（钱包包无 `deductionEndTime`），两处不冲突。
     creditPackages: true,
     // ⚠️ 与 buddy / officeace 同口径（按到期时间分桶，窗口复用
     //    `DSH_BUDDY_EXPIRING_WINDOW_DAYS`）。**必须登记**：查表分派只认这个
     //    标记回传 `windowDays`，漏登记的症状是「胶囊只有合计、没有三档带色行」
     //    —— 与 officeace 当初（`officeace 必须回传 windowDays`）同一根因。
-    //    ⚠️ 「每日红 + 刷新倒计时」**不适用于本渠道**：那套语义（`DAILY_POOL_NAMES`
-    //    按池名匹配）是 Loomy / Raccoon 那种**当日重置池**（未用完随重置作废）；
-    //    AutoClaw 的每日签到积分是发放进余额、按批次各自到期 —— 隐藏池
-    //    （服务端 `display:false`）已在解析器滤掉，不会出现「每日 0」红字。
+    // ⚠️ 「每日红 + 刷新倒计时」**不适用于本渠道**：那套语义
+    //    （`DAILY_POOL_NAMES = ['每日赠送','每日积分']`，**精确相等**匹配，见
+    //    `plugin-src/client/credit-expiry.js`）是 Loomy / Raccoon 那种
+    //    **当日重置池**（未用完随重置作废）；AutoClaw 的每日签到积分是发放进余额、
+    //    按批次各自到期 —— 隐藏池（服务端 `display:false`）已在解析器滤掉，
+    //    流水批次的包名取服务端描述（实测「每日签到」**不等于**「每日积分」）
+    //    ⇒ 两条路径都不再命中那份名单，「每日 0」红字消失。
     usesExpiryWindow: true,
     rateLimit: false,
     settingsNamespace: 'llm-autoclaw',
