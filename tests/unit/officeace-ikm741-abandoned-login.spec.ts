@@ -38,6 +38,8 @@ import { AccountPool } from '../../src/account-pool.js'
 import { isAbandonedOfficeAceLogin, officeacePendingTtlMs, registerJetHubRpc, JET_HUB_API_PATH }
   from '../../src/jet-hub-rpc.js'
 import { fetchSubscriptionSummary, readCredential } from '../../src/officeace-auth.js'
+// ⚠️ 命名空间导入：④e 需要**真实** auth 模块（兼容文件那条腿在它里面）。
+import * as officeaceAuth from '../../src/officeace-auth.js'
 import { officeaceExpiry } from '../../src/aggregate-expiry.js'
 
 /** 隔离后的 OfficeAce home（`tests/setup-isolation.ts` 进程级设定）。 */
@@ -229,7 +231,12 @@ describe('IKM741 ②：读数必须与凭据绑定（不得用历史快照充数
 // ────────────────────────── ③④ 登录中止的收口 ──────────────────────────
 
 /** 造一个能注册 RPC 的最小 ctx（凭据用**可观测**的内存 Map）。 */
-function makeCtx(): {
+/**
+ * @param failResolve - 可选：让 `credentials.resolve` **抛错**（模拟凭据库抖动）。
+ *   ⚠️ 2026-10-17 红队打穿的 P0 就是靠它复现的：**读凭据失败**曾被当成
+ *   「确证没有凭据」⇒ 静默收口把健康账号连凭据一起删掉。
+ */
+function makeCtx(failResolve: () => boolean = () => false): {
   ctx: Context
   credentials: Map<string, string>
   handler: () => ((req: Request) => Promise<Response>) | undefined
@@ -238,6 +245,7 @@ function makeCtx(): {
   const store = new Map<string, string>()
   ctx.provide('credentials', {
     resolve: async (ref: string) => {
+      if (failResolve()) throw new Error('凭据库读取失败（模拟磁盘/后端抖动）')
       const value = store.get(ref)
       return value === undefined ? undefined : { value, source: 'fake' }
     },
@@ -309,8 +317,8 @@ function autoCompleteStub(): Record<string, unknown> {
   }
 }
 
-function makeRpc(officeace: Record<string, unknown>) {
-  const { ctx, credentials, handler } = makeCtx()
+function makeRpc(officeace: Record<string, unknown>, failResolve: () => boolean = () => false) {
+  const { ctx, credentials, handler } = makeCtx(failResolve)
   const pool = new AccountPool(ctx)
   registerJetHubRpc(ctx, pool, {
     codearts: {} as never, buddy: {} as never, workbuddy: {} as never,
@@ -461,6 +469,92 @@ describe('IKM741 ④：收口的安全闸 —— 正在轮询的登录与已落�
     expect(
       pool.listAccountsByProvider('officeace'),
       '读池失败时删了账号 ⇒ 一次磁盘抖动就会销毁用户数据',
+    ).toHaveLength(1)
+  })
+
+  /**
+   * ⚠️⚠️ **④d / ④e 是 2026-10-17 红队打穿的两个 P0**（不是作者自查发现的，登记在此）。
+   *
+   * ④c 已经守住「**读池**失败」。但判据 3 还有**第二条读**：`loginCredentialLanded`
+   * 去读**凭据**。那条腿原先用 `await ctx.credentials.resolve(...).catch(() => undefined)`
+   * 把「读失败」与「确实没有」**同一个 `false`** 返回 ⇒
+   * **读凭据失败 ⇒ 当成没有凭据 ⇒ 静默收口删掉一个健康账号**（连带 unset 凭据，不可逆）。
+   *
+   * 红队探针实测（修前）：凭据**确实在**库里但 `resolve` 抛错 ⇒ 条目 0、凭据键 `[]`。
+   */
+  it('④d 凭据库**读失败** ⇒ 不得删账号（读不到 ≠ 没有；不可逆操作必须建立在确证上）', async () => {
+    process.env.DSH_OFFICEACE_PENDING_TTL_MS = '0'
+    let failing = true
+    const { call, pool, credentials } = makeRpc(neverAuthorizedStub(), () => failing)
+
+    const created = await call('account.create', { provider: 'officeace' })
+    const accountId = created.value?.accountId as string
+    // ⚠️ **刻意写成「先读成功、再开始失败」**：若一开始就失败，本用例会被
+    //    `loginCredentialLanded` 里更早的那条提前返回（`'yes'`）覆盖，
+    //    从而**测不到三态判据本身**（2026-10-17 变异验证实测：M2 因此全绿）。
+    //    这里先用一份**不可解析**的值占位，让 `resolve` 能成功返回、但三态判据
+    //    必须靠 `readCredential` 兜底才可能认出来。
+    const ref = pool.findAccount(accountId)?.credentialRef as string
+    credentials.set(ref, JSON.stringify(credentialOf()))
+
+    await call('account.list', { provider: 'officeace' })
+
+    expect(
+      pool.listAccountsByProvider('officeace'),
+      '凭据库读失败 ≠ 没有凭据。这是一次**静默的定时收口**，'
+      + '误删用户不会收到任何提示 —— 与 ④c 的「读池失败」是同一条取向',
+    ).toHaveLength(1)
+    failing = false
+    expect(credentials.get(ref), '凭据也绝不能被连带 unset（不可逆）').toBeDefined()
+  })
+
+  /**
+   * ⚠️ **④d2 专门打 `'unknown'` 这一格**（2026-10-17 变异验证发现的守卫缺口）。
+   *
+   * ④d 走的是「`resolve` **抛错**」⇒ `loginCredentialLanded` 里 `readFailed = true`
+   * ⇒ 返回 `'unknown'`。但变异「把收口处退回 `if (landed === 'yes')`」时
+   * **④d 仍然全绿** —— 因为那条路径的账号**本来就该保留**（凭据在库里、只是读失败），
+   * 退回布尔后 `landed === false` 仍会往下走……等等，那样它**应该**红。
+   * 实测全绿说明 ④d 实际命中的是**另一条**提前返回（`landed` 已经是 `'yes'`）⇒
+   * 「`'unknown'` 也要 continue」这条腿**没有任何用例覆盖**。
+   * ⇒ 本用例把它单独钉住：**只让读取失败、不让它读到凭据**（空库 + resolve 抛错）。
+   */
+  it('④d2 凭据库读失败且**库里确实没有**凭据 ⇒ 仍不得删（unknown 必须 continue）', async () => {
+    process.env.DSH_OFFICEACE_PENDING_TTL_MS = '0'
+    const { call, pool } = makeRpc(neverAuthorizedStub(), () => true)  // 恒抛错、且库是空的
+
+    await call('account.create', { provider: 'officeace' })
+    expect(pool.listAccountsByProvider('officeace'), '占位条目应当已登记').toHaveLength(1)
+
+    await call('account.list', { provider: 'officeace' })
+
+    expect(
+      pool.listAccountsByProvider('officeace'),
+      '「读不到」与「确证没有」必须分开：读失败时**无法确证**没有凭据，'
+      + '不可逆的删除只能建立在确证上（哪怕这次它真的是个幽灵条目 —— 宁可留一张卡）',
+    ).toHaveLength(1)
+  })
+
+  it('④e 凭据只在本 ref 的**兼容文件** `session-<ref>.json` ⇒ 账号可用 ⇒ 不得删', async () => {    process.env.DSH_OFFICEACE_PENDING_TTL_MS = '0'
+    // ⚠️ 必须用**真实** auth 模块：兼容文件那条腿在 `officeace-auth.readCredential` 里，
+    //    空桩（`{}`）会把它短路掉、让这条用例假绿（红队复核时实测踩到）。
+    const { call, pool } = makeRpc(officeaceAuth as never)
+
+    const created = await call('account.create', { provider: 'officeace' })
+    const accountId = created.value?.accountId as string
+    const ref = pool.findAccount(accountId)?.credentialRef as string
+    // 只写兼容文件，**不写**凭据库
+    writeFileSync(join(home, `session-${ref}.json`), JSON.stringify(credentialOf()), 'utf8')
+    const usable = await readCredential(ref, {
+      resolve: async () => undefined, set: async () => {}, unset: async () => {},
+    } as never)
+    expect(usable?.modelAppKey, '前置：兼容文件是 readCredential 的正当兜底').toBe('K')
+
+    await call('account.list', { provider: 'officeace' })
+
+    expect(
+      pool.listAccountsByProvider('officeace'),
+      '凭据在兼容文件里 ⇒ 该账号**可用** ⇒ 静默收口不得删它（判据必须与 readCredential 同源）',
     ).toHaveLength(1)
   })
 })
