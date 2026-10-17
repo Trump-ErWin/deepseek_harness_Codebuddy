@@ -2519,6 +2519,15 @@ export class BuddyAdapter extends LlmAdapter {
         if (this.options.accountPool !== undefined) {
           const triedPolicy = new Set<string>()
           if (currentAccountId) triedPolicy.add(currentAccountId)
+          /**
+           * 换号途中**最后一次**撞到的拦截与其响应体（报错时的 HTTP 状态与报文都取它）。
+           *
+           * ⚠️ 与 401/403 路径的 `rejectionStatus` / `rejectionBody` 是**同一纪律**：
+           * 首发恒为 400，而换号后可能是 403 形态（上游两种都发），报「HTTP 400」
+           * 与实际被拦的那一次对不上，排查时会被引向错误的方向。
+           */
+          let policyStatus = response.status
+          let policyBody = errorText
           for (;;) {
             const next = await this.options.accountPool.getAvailableAccount<BuddyCredential>(
               this.product.id, options.model, triedPolicy,
@@ -2533,20 +2542,70 @@ export class BuddyAdapter extends LlmAdapter {
               return
             }
             errorText = await response.text().catch(() => '')
-            if (response.status === 400 && isContentRejection(errorText)) {
+            // ⚠️⚠️ 判据**不能**绑状态码（2026-10-17 审计实测的真缺陷）。
+            //
+            // 上游这一族拒绝**同时用 400 与 403 两种状态码**（本文件 401/403 分支的
+            // 注释就记录着「11140 也回 HTTP 403」）。原实现写死 `status === 400`，
+            // 于是「400 起 → 换号撞到 403 形态拦截」会在此 `break`，把池里
+            // **后面那些完全可用的账号**直接判死。
+            //
+            // 实测（真实池同形替身，池 = 3 个账号）：
+            // | 账号 | 响应 | 修复前 | 修复后 |
+            // |---|---|---|---|
+            // | AT1 | `400` + 11140 | 发起 | 发起 |
+            // | AT2 | `403` + 11140 | **break，不试** | 继续换号 |
+            // | AT3 | `200` 可用 | ❌ **从未被试**，报 `AUTH` 失败 | ✅ 成功 |
+            //
+            // ⇒ 这正是本块要修的那类故障（池里有可用账号却用不上）的**镜像版**：
+            // 它自己又造了一遍，且错误码 `AUTH` 会被 DSH 客户端换成「API 密钥无效」
+            // （`docs/agent-notes/client-ui.md` 的 IKLBSH 红线）⇒ 实测 token 全有效
+            // 却把用户引向重新登录。
+            if (isContentRejection(errorText)) {
+              policyStatus = response.status
+              policyBody = errorText
+              console.warn(
+                `[${this.product.id}] 换号后账号 ${currentAccountId || '(current)'} 被安全策略拦截`
+                + `（HTTP ${response.status}，code 11140），继续换号：`
+                + `${errorDetail(errorText).slice(0, 200)}`,
+              )
+              // 刚换到就被拦：同样要冷却，否则下一轮它还是第一候选。
               await markPolicyBlockedAccount(
                 this.options.accountPool, this.product.id, currentAccountId, options.model,
               )
               continue
             }
+            // ⚠️⚠️ 换号途中撞到 **401/403**（凭据真失效）**必须继续换号**：
+            // 它按账号生效，与 11140 无关；而池里后面的账号完全可用，break 会把
+            // 整轮判死。与 401/403 路径的换号循环、以及限流路径的「② 认证类失败」
+            // 分支**保持同一语义**（三处都只把「非账号级错误」当 break 理由）。
+            //
+            // 实测同上：AT1 `400/11140` → AT2 `401` → AT3 `200`，
+            // 修复前只发 2 次即报 `AUTH`，AT3 从未被试。
+            if (response.status === 401 || response.status === 403) {
+              console.warn(
+                `[${this.product.id}] 换号后账号 ${currentAccountId || '(current)'} 认证失败`
+                + `（HTTP ${response.status}），继续换号`,
+              )
+              continue
+            }
+            // 其余（限流 / 饱和 / 上下文超限 / 渠道校验 …）：交给下面的既有分类逻辑，
+            // 那里的换号循环与错误码各自有正确语义（不重复换号，见下方注释）。
             break
           }
+          // ⚠️ 报错前**必须重新读一次**当前响应：换号途中可能已把 `errorText`
+          // 刷成别的错误的内容，直接用会误报出口。
+          if (!response.ok && isContentRejection(errorText)) {
+            throw contentRejectionError(this.product.id, policyStatus, policyBody, true)
+          }
         }
-        // 换号后仍是被策略拦截（或单凭据无法换号）：报专门的提示
+        // 单凭据路径（无账号池可换）：如实报「当前账号」。
+        //
+        // ⚠️ 必须走**单凭据出口**（`rotated: false` ⇒ 文案是「当前账号被…」）而不是
+        // 谎称「全部账号均…（已逐个换号重试）」—— 没有池就没有换号发生过，
+        // 旧写法把 `rotated` 绑成「池是否配置」，在「有池但换号后变成非拦截错误」
+        // 那条路径上也会谎报（该路径已由上面的出口覆盖，但两出口并存时必须各自诚实）。
         if (!response.ok && response.status === 400 && isContentRejection(errorText)) {
-          throw contentRejectionError(
-            this.product.id, 400, errorText, this.options.accountPool !== undefined,
-          )
+          throw contentRejectionError(this.product.id, 400, errorText, false)
         }
         // 换号后变成其他错误（限流 / 饱和 / 认证）：继续走下面的既有逻辑
       }
