@@ -62,6 +62,10 @@ import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
 import { MINIMAX, MINIMAX_INTL, type MinimaxProduct } from './minimax-product.js'
 import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
+// ⚠️ `sanitizeMinimaxXff` 与存储层**同一份判据**：RPC 层必须在写盘**之前**用它
+//    判合法性（非法即不写），否则「先写后判」会静默清掉用户原有的有效设置。
+//    ⚠️ 不要在这里另写一份 IP 校验（同义判据分两处必然漂移）。
+import { sanitizeMinimaxXff } from './jet-hub-store.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
 // OfficeAce（华为 MaaS 云端直连）：面板状态探测 / 登录流程 / 余额查询所需的
@@ -287,6 +291,8 @@ import type {
   RpcProviderSetEnabledResponse,
   RpcGatewayStatusResponse,
   RpcGatewaySetEnabledRequest,
+  RpcMinimaxXffRequest,
+  RpcMinimaxXffResponse,
   RpcNativeSearchGetEnabledResponse,
   RpcNativeSearchSetEnabledRequest,
   RpcNativeSearchSetEnabledResponse,
@@ -1883,6 +1889,12 @@ trae, cline, loomy, raccoon, minimax,
     //    而兜底值可能已过期（那正是「集中在此避免三处各自拉取」要防的）。
     //    用惰性调用（不能先 await 成常量：缓存过期后拿到新版本这件事会失效）。
     lobsteraiClientVersion: () => lobsterai.resolveClientVersion(),
+    // ⚠️ **MiniMax 国际站的 XFF 必须在这里接上**（issue IKMEVG）：
+    //    `credits.*` 三个入口（余额 / 签到状态 / 领取）都走这张表，漏掉它
+    //    会让「面板里设了 XFF，但积分行仍然查询失败」—— 而推理/目录路径
+    //    直接读池、照常生效 ⇒ 症状只出现在积分，极难对应。
+    //    惰性读（用户随时可能改设置），不能固化成字符串。
+    minimaxXff: () => pool.minimaxXff(),
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -6680,6 +6692,75 @@ AUTOCLAW.id,
           + `${req.enabled ? '' : '（所有渠道改用 DeepSeek 官方搜索）'}`,
         )
         const value: RpcNativeSearchSetEnabledResponse = { enabled: pool.nativeWebSearchEnabled() }
+        return { ok: true, value }
+      }
+
+      /**
+       * ── MiniMax 国际站的 `X-Forwarded-For` 设置（issue IKMEVG，2026-10-17）──
+       *
+       * 背景：`agent.minimax.io` 按**出口 IP 国别**把中国大陆来源 307 到中国站，
+       * 于是国际站账号在大陆网络下**永远**拿不到数据面（与 token 有效性无关）。
+       * 面板上给一个输入框让用户填海外 IP 绕开这个分流。
+       *
+       * ⚠️ **读了就回传归一后的实际值**（`sanitizeMinimaxXff` 的结果），而不是
+       * 用户填的原文：非法值会被归一成 `undefined`（= 不附头），UI 照返回值
+       * 渲染，用户能立刻看出「我填的没生效」—— 静默保存一个坏值最糟。
+       */
+      case 'minimax.getXff': {
+        const value: RpcMinimaxXffResponse = { xff: pool.minimaxXff() ?? '' }
+        return { ok: true, value }
+      }
+
+      case 'minimax.setXff': {
+        const req = payload as RpcMinimaxXffRequest
+        // ⚠️ 与 `nativeSearch.setEnabled` 同约定：**不做默认值猜测**。
+        //    但这里允许空串（语义 = 清除），故判据是「必须是字符串」而不是「非空」。
+        if (typeof req.xff !== 'string') {
+          return { ok: false, error: { code: 'bad-request', message: '字符串 xff 必填（空串表示清除）' } }
+        }
+        /**
+         * ⚠️⚠️ **归一必须前移到这里，非法值绝不落盘**（真实缺陷，2026-10-17 审计打穿）。
+         *
+         * ## 修前是什么样
+         *
+         * 初版是「先 `await pool.setMinimaxXff(req.xff)`，再判 `after === undefined`」。
+         * 而 `setMinimaxXff` 内部会 `sanitizeMinimaxXff` 后**无条件写缓存并落盘**。
+         * ⇒ 用户已经设好 `8.8.8.8`，之后手滑填了 `my.proxy.example`：
+         *
+         * ```
+         * 设置有效值后： "8.8.8.8"
+         * 填入非法值后： undefined      ← 原有的有效设置被静默清掉
+         * ```
+         *
+         * 而 UI 的 catch 只 `setNotice`、不重置 draft ⇒ 面板**仍显示旧值**，
+         * 用户下次重启才发现「又开始 307」，全程零提示。
+         *
+         * ## 现在的口径
+         *
+         * 先归一；**非法就原样返回 `bad-request`，一个字节都不写**（内存与磁盘都不动）。
+         * 空串是合法输入（= 清除），会被归一成 `undefined` 并真的清掉。
+         */
+        const trimmed = req.xff.trim()
+        const normalized = sanitizeMinimaxXff(req.xff)
+        if (trimmed.length > 0 && normalized === undefined) {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: '只接受 IPv4 / IPv6 字面量（例如 8.8.8.8），不接受主机名或逗号分隔的链'
+                + '；原有设置未改动',
+            },
+          }
+        }
+        const before = pool.minimaxXff()
+        await pool.setMinimaxXff(req.xff)
+        const after = pool.minimaxXff()
+        ctx.logger.info(
+          after === undefined
+            ? '[jet-hub] 已清除 MiniMax 国际站 X-Forwarded-For（不再绕过分流）'
+            : `[jet-hub] 已设置 MiniMax 国际站 X-Forwarded-For（${before === after ? '未变' : '已更新'}）`,
+        )
+        const value: RpcMinimaxXffResponse = { xff: after ?? '' }
         return { ok: true, value }
       }
 

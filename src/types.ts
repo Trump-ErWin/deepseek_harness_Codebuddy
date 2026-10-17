@@ -1583,6 +1583,27 @@ export interface RpcNativeSearchSetEnabledResponse {
 }
 
 /**
+ * RPC: MiniMax 国际站 `X-Forwarded-For` 设置的读取响应（issue IKMEVG）。
+ *
+ * ⚠️ `xff` 是**归一后的实际值**，空串表示「未设置 / 不附头」。
+ * 客户端照它渲染输入框 —— 不要用用户输入的原文（非法值会被归一成空）。
+ */
+export interface RpcMinimaxXffResponse {
+  /** 当前生效的 `X-Forwarded-For`；`''` = 不附头（走真实出口 IP）。 */
+  xff: string
+}
+
+/**
+ * RPC: MiniMax 国际站 `X-Forwarded-For` 设置的写入请求。
+ *
+ * ⚠️ **空串表示清除**（回到「不附头」），不是「设成空值头」——
+ * 空值的 `X-Forwarded-For` 在 Akamai 侧与不附头等价，但会污染上游日志。
+ */
+export interface RpcMinimaxXffRequest {
+  xff: string
+}
+
+/**
  * RPC: 网关凭据信息。
  *
  * ⚠️ 这是**明文凭据**，只应回传给调用方用于展示/复制，**不得**写进日志。

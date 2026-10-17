@@ -3407,6 +3407,19 @@ async function fetchBalanceReading(
     //    —— 故传**惰性**解析器，不能先 await 成一个常量（那会让「缓存过期后拿到
     //    新版本」失效）。见 `ProviderCreditsDeps.lobsteraiClientVersion`。
     lobsteraiClientVersion: () => lobsterai.resolveClientVersion(),
+    // ⚠️⚠️ **MiniMax 国际站的 XFF 必须在这里也接上**（真实缺陷，2026-10-17 审计打穿）。
+    //
+    // 本文件与 `jet-hub-rpc.ts` 是**两个独立的 `createProviderCredits` 调用**
+    //（上面那段注释正是为此而写），而 `ProviderRuntime.credits` 被
+    // `fetchBalanceReading`（本文件 L≈3136）消费 —— 后者是 `balanceCache` 的
+    // **取数原语**：`collectCreditBalances` 命中缓存前会先走它，失败才回落到端点表。
+    //
+    // ⇒ 只接端点表的话，**面板第一次查国际站余额走的正是这条无 XFF 的路径**，
+    //   失败后还要吃满 failureTtl（15s）才可能重试 —— 症状就是「设了 XFF，
+    //   积分行仍然查询失败」。本次只改了一处，正是那份注释警告的形态。
+    //
+    // ⚠️ 惰性读（用户随时可能改设置），不能固化成字符串。
+    minimaxXff: () => pool.minimaxXff(),
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
