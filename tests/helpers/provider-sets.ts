@@ -135,6 +135,14 @@ export const CREDITS_TABLE_EXEMPT: ReadonlyMap<string, string> = new Map([
   ['qoder', 'fetchQoderCreditBalance 只吃 QoderCredential，与共享骨架的泛型不兼容'],
   ['qodercn', '同 qoder（两者复用同一个 QoderAuth，余额原语同形）'],
   ['officeace', '余额是云侧 V11 签名直读（STS 凭据 + 签名在 auth 模块内），没有 fetchBalance 注入点'],
+  // ⚠️⚠️ **2026-10-17：modelscope 已从本表移除**（本 fork 独有）。
+  //    它原先登记的理由是「平台没有额度查询 API（12 个候选路径全 404）」——
+  //    **那条结论是错的**，错在**前缀**：真端点在 `/openapi/v1/`（不是 `/api/`、
+  //    也不是 `/v1/`）⇒ `GET https://www.modelscope.cn/openapi/v1/magicubes/balance`
+  //    带 API Key 返 200，且实测**随推理消耗下降**（281 → 发 2 次推理 → 277）。
+  //    ⇒ 它现在有真实的 `fetchBalanceDetailed`，**必须**进生产积分表。
+  //    ⚠️ 留这段墓碑注释是因为：本表曾收录过它，若后人只看 git blame 会以为
+  //    「当初就该收进来」，而真实经过是「收进来又移出、现在又收回来」。
 ])
 
 /**
@@ -263,11 +271,15 @@ export const WRITES_RATE_LIMIT_PROVIDERS: readonly string[] = Object.freeze([
   'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'cline',
   'zcode', 'trae', 'gemini', 'codearts', 'loomy', 'raccoon', 'opencode',
   'minimax',
-  // ⚠️ minimaxintl（MiniMax Code 国际版，2026-10-15）：与 `minimax` **共用同一个
+// ⚠️ minimaxintl（MiniMax Code 国际版，2026-10-15）：与 `minimax` **共用同一个
   //    `MinimaxAdapter` 类** ⇒ 它同样会写 `modelRateLimits`（额度 24h / 限流 1h）
   //    ⇒ 必须同时进 `probeById` 与 `WRITES_RATE_LIMIT_PROVIDERS`，否则该站的
   //    限流标记**写进去却永远清不掉**（用户点「重测」报「没有探测适配器」）。
   'minimaxintl',
+  // ⚠️ **本 fork 独有**（modelscope，2026-10-16）：它**会写** `modelRateLimits`
+  //    （见 `modelscope-adapter.ts` 的 `modelscopeRetryAfterMs`）。漏登记 =
+  //    标记写进去却在 `probeById` 里查不到 ⇒ 「重测 / 重置」清不掉（该陷阱已复发过）。
+  'modelscope',
 ])
 
 /** **期望**注册进 `probeById` 的 provider id（会写标记 − {@link PROBE_EXEMPT}）。 */

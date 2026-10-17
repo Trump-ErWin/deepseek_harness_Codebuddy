@@ -46,8 +46,13 @@ import { descriptorOf } from '../../src/provider-registry.js'
 //    只把它加进 AGGREGATE_CHANNELS 是无效接线（模型层归并了，候选层被剔除）。
 // ⚠️ 2026-10-13 加入 officeace：用户要求「officeace 加入聚合轮换」。它与 buddy 系
 //    **同形**（订阅的每个积分桶都带 `expiresAt`），折算原语见 `officeaceExpiry`。
+// ⚠️ 2026-10-17 **本 fork** 加入 modelscope：用户要求「魔塔加入无临期积分的那类轮换」。
+//    它属「有余额但不下发到期时间」那一类（有余额即 `NEVER`、烧光即 `UNUSABLE`）。
+//    ⚠️ 已知代价：魔粒烧光时不会被提前剔出轮换（平台既不下发重置时刻、也没有别的
+//    额度端点）⇒ 耗尽后仍会被选中、失败一次。**这是用户知情接受的取舍**，
+//    不许用「猜一个每日 UTC+8 零点」消除它（凭空造上游从未承诺的时刻）。
 const EXPECTED_WIRED = [
-  'accio', 'buddy', 'codearts', 'lobsterai', 'loomy', 'officeace', 'trae', 'workbuddy', 'zcode',
+  'accio', 'buddy', 'codearts', 'lobsterai', 'loomy', 'modelscope', 'officeace', 'trae', 'workbuddy', 'zcode',
 ]
 
 class FakeCredentials {

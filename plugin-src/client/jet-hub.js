@@ -14,6 +14,11 @@ import {
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
+// ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
+//    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
+//    ⚠️ 本 import 此前**不存在** ⇒ `modelscope-key-modal.js` 整份 140 行从未进 bundle，
+//    面板点「添加账号」无任何反应入口（症状零日志）。
+import { ModelscopeKeyModal, ModelscopeKeyEditModal } from './modelscope-key-modal.js';
 import {
   formatExpirySplitLine,
   formatNamedPoolLine,
@@ -620,7 +625,9 @@ function isAnonymousAccountId(accountId) {
 function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onTest, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
   // ⚠️ opencode 专属：传了才渲染「代理」「指纹」两个按钮（见按钮区注释）。
   // 前者额外需要 current 代理串，故签名与 onRetest 略有不同。
-  onOpenProxy, onRotateFingerprint }) {
+  // ⚠️ **本 fork 独有**：modelscope 的「令牌」按钮同理（传了才渲染），
+  // 第二参是宿主算好的**打码**串。
+  onOpenProxy, onRotateFingerprint, onEditModelscopeKey }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -880,6 +887,23 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
             disabled: busy,
             onClick: () => onRotateFingerprint(account.id),
           }, '指纹')
+        : null,
+      // ⚠️ **本 fork 独有**（魔搭，2026-10-17）：编辑访问令牌。
+      //    账号 id 与 credentialRef 都由 Key 尾段派生 ⇒ 换 Key 等于换一条账号，
+      //    没有这个入口时用户只能删除重建（会丢昵称与停用状态）。
+      //    ⚠️ 同样用 **props 存在性**开关（与上面 opencode 代理/指纹同款），
+      //    而非 `provider === 'modelscope'` 硬判断。
+      //    ⚠️ tooltip 里给的是**宿主算好的打码串**（`modelscopeKeyMask`）——
+      //    客户端不自己打码，避免与 `maskModelscopeKey` 两份实现漂移。
+      onEditModelscopeKey
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: account.modelscopeKeyMask
+              ? '访问令牌：' + account.modelscopeKeyMask + '（点击修改）'
+              : '设置该账号的访问令牌（ms-…）',
+            disabled: busy,
+            onClick: () => onEditModelscopeKey(account.id, account.modelscopeKeyMask || ''),
+          }, '令牌')
         : null,
       React.createElement('button', {
         className: 'dim-jh-btn',
@@ -2632,11 +2656,21 @@ function ProviderPanel({ provider, rpcCall }) {
    * 共用一个 state 会让开代理弹窗把登录链接顶掉（表现为链接凭空消失）。
    */
   const [proxyModal, setProxyModal] = React.useState(null);
+  // ⚠️ **本 fork 独有**（modelscope，2026-10-17）：「编辑访问令牌」弹窗状态
+  // { accountId, currentMasked, error } 或 null。
+  // ⚠️ **独立于** `keyModal`（添加账号用）：两者语义不同（新增 vs 替换），
+  // 共用一个 state 会互相顶掉（同 `proxyModal` 与 `loginUrlForManual` 的教训）。
+  // ⚠️ 同样**不放明文 Key 进 state**（ref + DOM 读值），理由见下方 keyModal 注释。
+  const [keyEditModal, setKeyEditModal] = React.useState(null);
   // 「添加 opencode 账号」弹窗：null（关闭）或 { error }。
   // ⚠️ 输入框内容**不放 state**（用 ref + DOM 读值）：API key 是凭据，
   // 进 state 会随每次重渲染经过整棵组件树，也会被 devtools 组件树检查器读到。
   const [keyModal, setKeyModal] = React.useState(null);
   const keyInputRef = React.useRef(null);
+  // ⚠️ **本 fork 独有**（modelscope 编辑令牌）：**独立** ref ——
+  // 与添加弹窗共用一个的话，打开编辑弹窗时若添加弹窗还挂着（理论上互斥，
+  // 但 ref 是 DOM 级的），两个 input 会指向同一个节点。
+  const keyEditInputRef = React.useRef(null);
 
   /**
    * 拖拽排序状态：正在拖的账号 id 与当前悬停的目标账号 id。
@@ -3270,6 +3304,55 @@ function ProviderPanel({ provider, rpcCall }) {
     await submitOpencodeEntry('opencode.addAnonymous', {});
   };
 
+  /**
+   * 提交一个 modelscope（魔搭）账号。
+   *
+   * ⚠️ **本 fork 独有**（2026-10-17 审计 P0 修复）：此前本函数与
+   *    `createAccount` 里的 `provider === 'modelscope'` 分支**都不存在** ⇒
+   *    面板里点「添加账号」落到通用 `account.create`，而宿主那条 switch 没有
+   *    modelscope 分支 ⇒ 回 `unknown provider: modelscope`。
+   *    ⚠️ **刻意复用 {@link submitOpencodeEntry} 而不另写一份收尾**：两者的
+   *    收尾语义逐字节相同（关弹窗 / 刷新 / `existed` 提示 / 错误留在弹窗内），
+   *    本仓库红线是「同一份语义不许有两套实现」。
+   */
+  const submitModelscopeKey = async (rawKey) => {
+    const key = String(rawKey == null ? '' : rawKey).trim();
+    // 空串 = 没填就点确认：静默关弹窗，不报错（与 opencode 同款，不制造无谓报错）。
+    if (key === '') return;
+    await submitOpencodeEntry('modelscope.addAccount', { apiKey: key });
+  };
+
+  /**
+   * 提交「编辑访问令牌」（**本 fork 独有**，2026-10-17）。
+   *
+   * ⚠️ **刻意不复用 {@link submitOpencodeEntry}**：它的收尾是「关弹窗 + 刷新 +
+   * `existed` 提示」，而这里多一格 —— 宿主可能在换 Key 时**换了账号 id**
+   * （id 由 Key 尾段派生），必须据此明确告诉用户「这条账号的标识变了」，
+   * 否则用户会以为账号凭空消失。
+   */
+  const submitModelscopeKeyEdit = async (rawKey) => {
+    const key = String(rawKey == null ? '' : rawKey).trim();
+    if (key === '') return;
+    const accountId = keyEditModal?.accountId;
+    if (!accountId) return;
+    setCreating(true);
+    try {
+      const res = await rpcCall('modelscope.setApiKey', { accountId, apiKey: key });
+      setKeyEditModal(null);
+      await loadAccounts();
+      // ⚠️ `renamed` = 账号 id 变了（宿主已把旧条目移除、新条目建好）。
+      //    提示里**不**显示明文 Key，只说变了 —— 与卡片上的打码口径一致。
+      setProbeNotice(res?.renamed
+        ? '已更新访问令牌。该账号的标识随 Key 尾段一并更新（昵称与停用状态已保留）。'
+        : '已更新访问令牌。');
+    } catch (caught) {
+      // ⚠️ 错误留在弹窗内（同 submitOpencodeEntry 的理由）。
+      setKeyEditModal((prev) => (prev ? { ...prev, error: caught?.message ? caught.message : '未知错误' } : prev));
+    } finally {
+      setCreating(false);
+    }
+  };
+
   /** 两个添加入口的公共收尾（成功关弹窗并刷新；失败把错误留在弹窗里）。 */
   const submitOpencodeEntry = async (method, payload) => {
     setCreating(true);
@@ -3306,7 +3389,13 @@ function ProviderPanel({ provider, rpcCall }) {
     // 走 `setKeyModal` 而不是下面的 `account.create` 流程。
     // 弹窗里另有两个入口：粘贴 key（submitOpencodeKey）与添加匿名通道（submitAnonymous）。
     if (provider === 'opencode') {
-      setKeyModal({ error: '' });
+      setKeyModal({ provider, error: '' });
+      return;
+    }
+    // ⚠️ **本 fork 独有**（魔搭）：凭据是用户手工粘贴的 `ms-` API Key，
+    //    没有 OAuth 授权页 ⇒ 两步式 `account.create` 对它不适用，与 opencode 同款改道。
+    if (provider === 'modelscope') {
+      setKeyModal({ provider, error: '' });
       return;
     }
 
@@ -4134,6 +4223,15 @@ function ProviderPanel({ provider, rpcCall }) {
                       onRotateFingerprint: (id) => void rotateFingerprint(id),
                     }
                   : {}),
+                // ⚠️ **本 fork 独有**（modelscope，2026-10-17）：编辑访问令牌。
+                // 同样只在该 provider 下传，靠「props 存在性」决定是否渲染按钮。
+                ...(provider === 'modelscope'
+                  ? {
+                      onEditModelscopeKey: (id, masked) => setKeyEditModal({
+                        accountId: id, currentMasked: masked,
+                      }),
+                    }
+                  : {}),
                 // 新手任务（仅 Loomy）：一次性 10000 分，每号只能领一次。
                 // 与「一键领取积分」（每日签到）是**不同**的操作，故独立按钮。
                 onClaimOnboarding: canClaimOnboarding
@@ -4183,7 +4281,7 @@ function ProviderPanel({ provider, rpcCall }) {
       : null,
     // 「添加 opencode 账号」弹窗：自绘而非 window.prompt ——
     // DSH 客户端沙箱里 prompt() 直接抛 `prompt() is not supported`（真机报障）。
-    keyModal
+    keyModal && keyModal.provider !== 'modelscope'
       ? React.createElement(OpencodeKeyModal, {
           error: keyModal.error,
           busy: creating,
@@ -4191,6 +4289,33 @@ function ProviderPanel({ provider, rpcCall }) {
           onSubmit: (value) => void submitOpencodeKey(value),
           onSubmitAnonymous: () => void submitAnonymous(),
           onClose: () => setKeyModal(null),
+        })
+      : null,
+    // ⚠️ **本 fork 独有**（魔搭）：与上面共用 `keyModal` 状态与 `keyInputRef`
+    //    （两个弹窗都是单例、互斥显示），但**按 provider 分派** —— 本仓库约定
+    //    「通用面板里的按钮与弹窗必须按 provider 分支」，两家的表单字段不同。
+    //    ⚠️ 必须用 `React.createElement` 而非直接调用组件函数：直接调用会把
+    //    组件的 hook 算进 ProviderPanel（该文件头记录过 hook #310 事故）。
+    keyModal && keyModal.provider === 'modelscope'
+      ? React.createElement(ModelscopeKeyModal, {
+          error: keyModal.error,
+          busy: creating,
+          inputRef: keyInputRef,
+          onSubmit: (value) => void submitModelscopeKey(value),
+          onClose: () => setKeyModal(null),
+        })
+      : null,
+    // ⚠️ **本 fork 独有**（魔搭）：「编辑访问令牌」弹窗（独立 state + 独立 ref）。
+    // ⚠️ 必须用 `React.createElement` 而非直接调用组件函数：直接调用会把组件的
+    // hook 算进 ProviderPanel（该文件头记录过 hook #310 事故，整个设置页白屏）。
+    keyEditModal
+      ? React.createElement(ModelscopeKeyEditModal, {
+          error: keyEditModal.error || '',
+          busy: creating,
+          currentMasked: keyEditModal.currentMasked || '',
+          inputRef: keyEditInputRef,
+          onSubmit: (value) => void submitModelscopeKeyEdit(value),
+          onClose: () => setKeyEditModal(null),
         })
       : null));
 }
@@ -5595,9 +5720,19 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
  *
  * 两边的一致性由 `tests/unit/aggregate-panel-logic.spec.ts` 末尾的 ★★ 守卫锁成
  * **集合相等**（判据 fail-closed：抽不到这份名单就报红，改名/重构不会让它静默失效）。
+ *
+ * ⚠️⚠️ **字面量必须紧跟在 `=` 之后（中间不得插注释/空行以外的东西）**：
+ * 那条守卫用正则 `const AGG_WIRED_CHANNEL_LABELS =\s*\n?\s*'([^']*)'`
+ * 抽取名单 —— 在 `=` 与字面量之间插多行注释会让它**抽不到**从而报红。
+ * ⚠️ 曾因此踩过一次（把 modelscope 的说明写在 `=` 与字符串之间）。
+ * ⇒ 渠道相关的说明写在这段 JSDoc 里，别写到常量正上方。
+ *
+ * ⚠️ **本 fork 独有**（魔搭，2026-10-17 用户明确要求加入聚合轮换）：
+ * `modelscope` 已进 `WIRED_EXPIRY_PROVIDERS` ⇒ 这里**必须**同改，否则只登了
+ * 魔搭的用户会看到「请先在……登录账号」这句错话（他们其实已经登录了）。
  */
 const AGG_WIRED_CHANNEL_LABELS =
-  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace';
+  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace / modelscope';
 
 /**
  * 「按临期排序」模式下面板**自动重探**临期顺序的间隔（用户 2026-10-16 从 5 分钟改为 **2 分钟**）。
