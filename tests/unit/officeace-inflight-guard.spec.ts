@@ -256,22 +256,39 @@ describe('OfficeAce 在途登录：并发的 `account.list` 不得收口它（�
       expect(pool.listAccountsByProvider('officeace'), '占位条目已登记').toHaveLength(1)
       expect(created.value.accountId.length).toBeGreaterThan(0)
 
-      /**
+/**
        * ⚠️⚠️ **确定性地把时钟推过占位条目的 `createdAt`**（本用例唯一的脆弱点）。
        *
-       * 收口里的跨进程兜底判据是闭区间：
-       * ```
-       * if (pending === undefined && now() - entry.createdAt <= OFFICEACE_PENDING_TTL_MS) continue
-       * ```
-       * TTL = 0 时它要求 `now() - createdAt >= 1` 才会继续收口。而 `Date.now()`
-       * 的分辨率是 **1ms** —— 若 `account.create` 与下面 `account.list` 落在
-       * **同一毫秒**，差值就是 0 ⇒ `0 <= 0` 为真 ⇒ 跳过收口 ⇒ **本用例假红**。
+       * ## 根因（探针实测，非推断）
        *
-       * 实测该形态确实是时红时绿（同一份代码连跑 8 次：5 红 3 绿），且它曾因
-       * 一次**无关**改动的导入图变化而开始大面积变红，被误判成那次改动的回归。
+       * `DSH_OFFICEACE_PENDING_TTL_MS = '0'` 让判据退化成「**跨过 1 毫秒**」。
+       * ⚠️ 这里有**两条**判据都会因此失效，合并时必须都记住：
+       *
+       * ① `isAbandonedOfficeAceLogin`（pending 判据，`pending.at`）：
+       *    ```ts
+       *    return nowMs - pending.at > officeacePendingTtlMs()   // 严格大于
+       *    ```
+       *    TTL=0 时要求 `now - at >= 1` 才判「已中止」；同毫秒时 `delta === 0`
+       *    ⇒ 判「进行中」⇒ 幽灵条目**没被收掉** ⇒ 断言要 0 拿到 1。
+       *    探针实测：`delta=0 ⇒ 已中止=false`、`delta=1 ⇒ 已中止=true`。
+       *
+       * ② 收口里的**跨进程兜底**判据（`entry.createdAt`，闭区间）：
+       *    ```ts
+       *    if (pending === undefined && now() - entry.createdAt <= OFFICEACE_PENDING_TTL_MS) continue
+       *    ```
+       *    TTL=0 时它要求 `now() - createdAt >= 1` 才会继续收口；同毫秒时
+       *    `0 <= 0` 为真 ⇒ 跳过收口 ⇒ **同样假红**。
+       *
+       * `Date.now()` 的分辨率是 1ms，而 `account.create` 与 `account.list`
+       * 常落在同一毫秒 ⇒ 该形态实测时红时绿（同一份代码连跑 8 次：5 红 3 绿），
+       * 且它曾因一次**无关**改动的导入图变化而开始大面积变红，被误判成那次改动的回归。
        *
        * ⚠️ 用 `setTimeout(2)` 而不是裸 `await Promise.resolve()`：后者是微任务，
        * **不保证**时钟刻度前进（Node 里微任务不 yield 给事件循环）。
+       *
+       * ⚠️ 为什么不能靠「重跑几次总会绿」：那是把随机性当通过，而本仓库已
+       * 为同型事故付出过代价（`isAbandonedOfficeAceLogin` 的注释里记着
+       * 「20 次只有 10 次变红」）。断言必须是**确定时刻**可驱动的。
        */
       await new Promise((resolve) => { setTimeout(resolve, 2) })
 
@@ -285,3 +302,4 @@ describe('OfficeAce 在途登录：并发的 `account.list` 不得收口它（�
     }
   })
 })
+

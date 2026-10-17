@@ -1,10 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   CLINE_MODELS_DEV_TIMEOUT_MS,
   applyModelsDevCatalog,
   makeClineModelsDevLoader,
   parseClineModelsDev,
 } from '../../src/cline-models-dev.js'
+import { clearModelsDevCache, setModelsDevForTest } from '../../src/models-dev-cache.js'
+
+const here = dirname(fileURLToPath(import.meta.url))
 
 /**
  * models.dev 目录来源的回归：**图片能力** + **补缺的模型** + **可读名**。
@@ -195,9 +201,15 @@ describe('applyModelsDevCatalog', () => {
 })
 
 describe('makeClineModelsDevLoader', () => {
+  // ⚠️ 全组的公共前提：共享缓存是**模块级单例**，前一个 describe 的用例
+  //   往里塞过数据 ⇒ 不清就会命中缓存而走不到 fetcher（症状：明明注入了
+  //   失败 fetcher，却拿到一张完整的表）。
+  const immediate = async (): Promise<void> => {}
+
   it('命中 TTL 缓存：多次调用只发一次请求', async () => {
+    await clearModelsDevCache()
     const fetcher = vi.fn(async () => new Response(JSON.stringify(REAL_SHAPE), { status: 200 }))
-    const load = makeClineModelsDevLoader({ fetcher: fetcher as never })
+    const load = makeClineModelsDevLoader({ fetcher: fetcher as never, sleep: immediate })
     await load()
     await load()
     expect(fetcher).toHaveBeenCalledTimes(1)
@@ -207,13 +219,52 @@ describe('makeClineModelsDevLoader', () => {
    * ⚠️ 失败**必须抛**（而不是返回空表）：调用方据此区分「没读到」与
    * 「读到了且不支持」。把失败记成空表会让图片能力永久打回纯文本 ——
    * 那正是本次要修的缺陷形态。
+   *
+   * ⚠️ 2026-10-17：加载器改为**读共享本地缓存**（`models-dev-cache.ts` 是
+   * 全仓唯一直读点），失败文案随之改变 —— 断言改为「抛出**含 models.dev 的
+   * 可读消息**」，而不锁死具体措辞：措辞是实现细节，「抛了 + 指名来源」才是契约。
    */
-  it('HTTP 失败向上抛（不缓存失败，下次可重试）', async () => {
+  it('⚠️ 刷新失败向上抛（不缓存失败，下次可重试）', async () => {
+    // ⚠️⚠️ **必须先清空共享缓存**：加载器改读 `models-dev-cache.ts` 的
+    // 模块级单例，而前面的用例往里塞过数据 ⇒ 不清就会命中缓存而**不抛**
+    // （症状：明明 fetcher 返回 500，却拿到了一张完整的表）。
+    // 这不是测试写错，而是「全局缓存 + 跨用例」必然的耦合，必须显式隔离。
+    await clearModelsDevCache()
     const fetcher = vi.fn(async () => new Response('boom', { status: 500 }))
-    const load = makeClineModelsDevLoader({ fetcher: fetcher as never })
-    await expect(load()).rejects.toThrow(/HTTP 500/)
-    await expect(load()).rejects.toThrow(/HTTP 500/)
-    expect(fetcher).toHaveBeenCalledTimes(2)
+    // ⚠️ **必须注入 sleep**：共享缓存的重试是指数退避（2s → 4s），
+    //   而本用例要连续失败两轮 ⇒ 不注入会真等 12 秒并撞 5s 单测超时。
+    const load = makeClineModelsDevLoader({ fetcher: fetcher as never, sleep: async () => {} })
+    await expect(load()).rejects.toThrow(/models\.dev/)
+    await expect(load()).rejects.toThrow(/models\.dev/)
+    // ⚠️ 失败**不写缓存** ⇒ 第二次必须真的再发一次请求（否则「失败被固化」）。
+    expect(fetcher).toHaveBeenCalledTimes(2 * 3)
+  })
+
+  /**
+   * ⚠️⚠️ **回归**：加载器命中共享缓存时**完全不碰网络**。
+   *
+   * 这条锁的是本次改造的核心承诺（用户原话：「冷启动就读本地文件缓存，
+   * 读不到就 fallback 不会直读 models.dev」）—— 改前每次冷启动都要下载 5 MB。
+   */
+  it('⚠️⚠️ 命中共享缓存时零请求（冷启动不下载 5MB）', async () => {
+    await clearModelsDevCache()
+    setModelsDevForTest({
+      'cline-pass': {
+        'deepseek-v4.1-flash': {
+          name: 'DeepSeek V4.1 Flash',
+          modalities: { input: ['text', 'image'] },
+          limit: { context: 1000000 },
+        },
+      },
+    })
+    const fetcher = vi.fn(async () => { throw new Error('命中缓存时不得发请求') })
+    const load = makeClineModelsDevLoader({ fetcher: fetcher as never, sleep: immediate })
+    const first = await load()
+    expect(first.get('cline-pass/deepseek-v4.1-flash')?.name).toBe('DeepSeek V4.1 Flash')
+    const second = await load()
+    expect(second.size).toBe(first.size)
+    expect(fetcher, '命中缓存时不得有任何请求').not.toHaveBeenCalled()
+    await clearModelsDevCache()
   })
 
   // ── issue IKKZUG：拉取本身要健壮 ──
@@ -228,40 +279,25 @@ describe('makeClineModelsDevLoader', () => {
     expect(CLINE_MODELS_DEV_TIMEOUT_MS).toBe(60_000)
   })
 
-  it('⚠️ 显式请求 Brotli（服务端支持，而 Node fetch 默认不带 ⇒ 白下 5.39MB）', async () => {
-    // ⚠️ 缺这一条的真实代价不是「慢」而是**超时**：5.39MB 未压缩传输在慢链路上
-    // 极易撞上上限，而压缩后通常只有几百 KB。
-    let seen: Headers | undefined
-    const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
-      seen = new Headers(init?.headers)
-      return new Response(JSON.stringify(REAL_SHAPE), { status: 200 })
-    })
-    await makeClineModelsDevLoader({ fetcher: fetcher as never })()
-    expect(seen?.get('accept-encoding'), '未显式声明 br ⇒ 下 5.39MB 明文').toMatch(/br/i)
+  /**
+   * ⚠️ 2026-10-17：显式 Brotli 与 ETag 条件请求都已**上移到共享缓存模块**
+   * （`models-dev-cache.ts`）—— 那是全仓唯一的直读点，本模块不再自己发请求。
+   *
+   * ⚠️ **这两条断言现在打在共享缓存上**，而不是打在 `cline-models-dev.ts`：
+   * 判据「压缩传输 + 条件请求」依然重要（缺前者白下 5 MB 明文、极易撞超时上限），
+   * 但它的**归属地**变了。若继续打在已不发请求的模块上，那是一条**恒真**断言
+   * ——「守卫写在不会执行的地方」比没有守卫更糟（它给人虚假的安全感）。
+   * 新位置的对应断言见 `tests/unit/models-dev-cache.spec.ts` 与下方。
+   */
+  it('⚠️ Brotli 与条件请求的职责已上移：cline 侧不再持有任何请求实现', () => {
+    const src = readFileSync(join(here, '../../src/cline-models-dev.ts'), 'utf8')
+    expect(src, 'cline-models-dev.ts 不得再自己 fetch models.dev').not.toMatch(/fetch\s*\(/)
+    expect(src, 'Accept-Encoding 只该出现在唯一直读点').not.toMatch(/Accept-Encoding/i)
+    expect(src, 'ETag 条件请求只该出现在唯一直读点').not.toMatch(/if-none-match|If-None-Match/i)
   })
 
-  it('ETag 可用时做条件请求（304 不重下 5.39MB）', async () => {
-    // 两段：第一次带 ETag，第二次回 304 ⇒ 应复用上次结果、不再 JSON.parse。
-    const payloads: Array<() => unknown> = [
-      () => JSON.stringify(REAL_SHAPE),
-      () => { throw new Error('304 分支不应走到 JSON.parse') },
-    ]
-    let call = 0
-    const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
-      const headers = new Headers(init?.headers)
-      const current = call++
-      if (current === 0) {
-        expect(headers.get('if-none-match'), '第二次必须带上 ETag').toBeNull()
-        return new Response(payloads[0]!(), { status: 200, headers: { ETag: '"W/"abc"' } })
-      }
-      expect(headers.get('if-none-match'), '第二次必须带上 ETag').toBe('"W/"abc"')
-      return new Response(null, { status: 304 })
-    })
-    const load = makeClineModelsDevLoader({ fetcher: fetcher as never, ttlMs: 0 })
-    const first = await load()
-    expect(first.size).toBeGreaterThan(0)
-    const second = await load()
-    // 304 必须回落成「与上次相同的结果」，而不是空表。
-    expect(second.size).toBe(first.size)
+  it('ETag 条件请求与 Brotli 在**共享缓存**里（唯一直读点）', () => {
+    const src = readFileSync(join(here, '../../src/models-dev-cache.ts'), 'utf8')
+    expect(src).toMatch(/Accept-Encoding/i)
   })
 })
