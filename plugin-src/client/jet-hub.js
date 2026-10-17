@@ -5720,9 +5720,19 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
  *
  * 两边的一致性由 `tests/unit/aggregate-panel-logic.spec.ts` 末尾的 ★★ 守卫锁成
  * **集合相等**（判据 fail-closed：抽不到这份名单就报红，改名/重构不会让它静默失效）。
+ *
+ * ⚠️⚠️ **字面量必须紧跟在 `=` 之后（中间不得插注释/空行以外的东西）**：
+ * 那条守卫用正则 `const AGG_WIRED_CHANNEL_LABELS =\s*\n?\s*'([^']*)'`
+ * 抽取名单 —— 在 `=` 与字面量之间插多行注释会让它**抽不到**从而报红。
+ * ⚠️ 曾因此踩过一次（把 modelscope 的说明写在 `=` 与字符串之间）。
+ * ⇒ 渠道相关的说明写在这段 JSDoc 里，别写到常量正上方。
+ *
+ * ⚠️ **本 fork 独有**（魔搭，2026-10-17 用户明确要求加入聚合轮换）：
+ * `modelscope` 已进 `WIRED_EXPIRY_PROVIDERS` ⇒ 这里**必须**同改，否则只登了
+ * 魔搭的用户会看到「请先在……登录账号」这句错话（他们其实已经登录了）。
  */
 const AGG_WIRED_CHANNEL_LABELS =
-  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace';
+  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace / modelscope';
 
 /**
  * 「按临期排序」模式下面板**自动重探**临期顺序的间隔（用户 2026-10-16 从 5 分钟改为 **2 分钟**）。
