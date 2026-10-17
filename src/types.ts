@@ -155,6 +155,16 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
    * `src/zcode.ts` 的 `phoneFromUserId`。
    */
   phone?: string
+  /**
+   * ⚠️ **本 fork 独有**（modelscope，2026-10-17）：**打码后**的访问令牌
+   * （`ms-…62f3`），供账号卡片展示与「编辑」入口。
+   *
+   * ⚠️⚠️ **绝不下发明文**：凭据经 RPC 明文下发等于把它摊到客户端 devtools、
+   * 日志与崩溃上报里。取不到合法打码时**不设该字段**（宁可不显示）。
+   * 打码由**宿主**的 `maskModelscopeKey()` 完成 —— 两端各写一份必然漂移，
+   * 且客户端那份一旦漏判形状就会回显原文。
+   */
+  modelscopeKeyMask?: string
 }
 
 /** Jet Hub 在 ctx.settings 中的 schema */

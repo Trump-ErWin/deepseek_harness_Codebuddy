@@ -43,6 +43,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ProviderAccountEntry } from './types.js'
 import { MODELSCOPE } from './modelscope-product.js'
 import { parseModelscopeCredential } from './modelscope-auth.js'
+import { maskModelscopeKey } from './modelscope.js'
 
 export interface RpcModelscopeAddAccountRequest {
   apiKey: string
@@ -55,13 +56,31 @@ export interface RpcModelscopeAddAccountResponse {
   existed: boolean
 }
 
+export interface RpcModelscopeSetApiKeyRequest {
+  accountId: string
+  apiKey: string
+}
+
+export interface RpcModelscopeSetApiKeyResponse {
+  accountId: string
+  /** 打码后的新 Key（`ms-…尾4`）—— **刻意不回传明文**，理由见方法实现。 */
+  masked: string
+  /**
+   * true = Key 变了 ⇒ 账号 id 也随尾段变了，账号被**重建**在新的 id 下。
+   * ⚠️ 客户端据此必须**关闭并重开**面板（旧的 id 已不存在）。
+   */
+  renamed: boolean
+}
+
 /** 账号池的最小依赖面（结构化类型，避免绑定具体类）。 */
 export interface ModelscopePoolLike {
-  listAccountsByProvider(provider: string): Array<{ id: string; enabled: boolean; credentialRef: string }>
+  listAccountsByProvider(provider: string): Array<{ id: string; enabled: boolean; credentialRef: string; nickname?: string }>
   // ⚠️ 入参用 `ProviderAccountEntry`（而不是 `Record<string, unknown>`）：
   // 后者与 `AccountPool.addAccount(entry: ProviderAccountEntry)` **不可赋值**
   // （参数逆变，tsc 直接报 TS2345），接线处就得写断言或 any。
   addAccount(entry: ProviderAccountEntry): Promise<void>
+  /** 改 Key 时要移除**旧**账号（id 随尾段变）—— 见 {@link RpcModelscopeSetApiKeyResponse.renamed}。 */
+  removeAccount(accountId: string): Promise<void>
 }
 
 /**
@@ -146,6 +165,68 @@ export async function handleModelscopeRpc(
           createdAt: Date.now(),
         })
         return done({ accountId: id, existed: false } satisfies RpcModelscopeAddAccountResponse)
+      }
+
+      case 'modelscope.setApiKey': {
+        const req = (payload ?? {}) as RpcModelscopeSetApiKeyRequest
+        if (typeof req.accountId !== 'string' || req.accountId.length === 0) {
+          return fail('缺少 accountId')
+        }
+        const apiKey = typeof req.apiKey === 'string' ? req.apiKey.trim() : ''
+        if (!KEY_PATTERN.test(apiKey)) {
+          return fail(
+            'API Key 形状不对（应以 ms- 开头、至少 20 位；'
+            + '可在 https://www.modelscope.cn/my/myaccesstoken 生成）',
+          )
+        }
+        const old = pool.listAccountsByProvider(MODELSCOPE.id).find((a) => a.id === req.accountId)
+        if (!old) return fail(`未找到账号 ${req.accountId}`)
+
+        const { id, refName } = modelscopeSlotNamesOf(apiKey)
+        if (id === req.accountId) {
+          // ⚠️ 同一条 Key：只刷新凭据内容，**不动**账号（否则会先删后建、
+          //    期间面板上的这条账号会短暂消失，用户可能重复点击）。
+          await ctx.credentials.set(credentialRef(refName), JSON.stringify({
+            access_token: apiKey,
+            // ⚠️ 昵称**沿用旧的**：改 Key 不该顺手把用户起的名字冲掉。
+            nickname: typeof old.nickname === 'string' && old.nickname.length > 0
+              ? old.nickname
+              : `ModelScope ${apiKey.slice(-6)}`,
+          }))
+          return done({ accountId: id, masked: maskModelscopeKey(apiKey), renamed: false } satisfies RpcModelscopeSetApiKeyResponse)
+        }
+
+        // ⚠️⚠️ **Key 变了 ⇒ 账号 id 随尾段变**（`id` 由 Key 尾 8 位派生，见
+        //    `modelscopeSlotNamesOf`）⇒ 这不是「改一个字段」，而是**换一条账号**。
+        //    必须显式新建 + 移除旧的，否则会出现两个账号共用一份凭据的错象。
+        //    ⚠️ 顺序刻意是「先建后删」：反过来的话，若新建失败（磁盘/权限）
+        //    用户就**连旧账号一起丢了** —— 删除不可逆（本仓库记过多起同类事故）。
+        const target = pool.listAccountsByProvider(MODELSCOPE.id).find((a) => a.id === id)
+        if (target) {
+          return fail(`该 API Key 已对应另一个账号（${id}），请直接编辑那个账号，避免同一 Key 出现两次`)
+        }
+        await ctx.credentials.set(credentialRef(refName), JSON.stringify({
+          access_token: apiKey,
+          // ⚠️ 昵称**继承旧的**（含用户手改过的），别让改 Key 顺手改名。
+          nickname: typeof old.nickname === 'string' && old.nickname.length > 0
+            ? old.nickname
+            : `ModelScope ${apiKey.slice(-6)}`,
+        }))
+        await pool.addAccount({
+          id,
+          provider: MODELSCOPE.id,
+          nickname: typeof old.nickname === 'string' && old.nickname.length > 0
+            ? old.nickname
+            : `ModelScope ${apiKey.slice(-6)}`,
+          // ⚠️ 停用状态**继承**旧的：用户特意关掉的账号不该被改 Key 顺手启用。
+          enabled: old.enabled,
+          credentialRef: refName,
+          // ⚠️ 同 `addAccount`：静态 API Key，没有 refresh 端点 ⇒ 诚实记 false。
+          refreshable: false,
+          createdAt: Date.now(),
+        })
+        await pool.removeAccount(req.accountId)
+        return done({ accountId: id, masked: maskModelscopeKey(apiKey), renamed: true } satisfies RpcModelscopeSetApiKeyResponse)
       }
 
       default:
