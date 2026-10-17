@@ -1312,12 +1312,20 @@ export async function fetchSubscriptionSummary(
  * （那正是当初 GET 反复 401 的成因）。
  *
  * @param body - 请求体文本；`undefined`（无 body）时按空串计哈希。
+ * @param statusOut - 可选：写入终态 HTTP 状态码。
+ *
+ * ⚠️ **返回值对「失败」是有歧义的**：非 2xx 与「2xx 但响应体为空」都给出空串
+ *    （`r.ok ? await r.text() : ''`）。余额查询可以容忍（空串 ⇒ 解析失败 ⇒
+ *    走缓存兜底），但**签到不能** —— 401 会被读成「今天没有可领的」，
+ *    于是每天白丢 1000 分且日志无痕（2026-10-18 真实报障）。需要区分的调用方
+ *    传 `statusOut` 自行判定。
  */
 async function signAndRequest(
   url: string,
   credential: OfficeAceCredential,
   method: 'GET' | 'POST',
   body?: string,
+  statusOut?: { status: number },
 ): Promise<string> {
   const region = 'cn-southwest-2'
   const service = 'apic'
@@ -1380,6 +1388,7 @@ async function signAndRequest(
     ...body === undefined ? {} : { body },
     signal: AbortSignal.timeout(30_000),
   })
+  if (statusOut !== undefined) statusOut.status = r.status
   return r.ok ? await r.text() : ''
 }
 
@@ -1494,24 +1503,40 @@ async function fetchCloudSubscriptionFor(
  * ⚠️ **积分当日作废**（实测 2026-10-13）：`expired_time` 是当天 23:59:59。
  *    当天不领就永久失去那 1000 分 —— 这正是自动领取的价值所在。
  *
- * @returns 领取到的活动桶；失败返回空数组（**不抛错**：签到失败不该阻断余额展示）。
+ * ⚠️ **失败的错误文本必须带出来**（2026-10-18 真实报障）：原先这里是一个裸
+ *    `catch { return [] }`，尽管上一行的注释就写着「记日志而不是静默吞」。
+ *    实测后果：凭据过期后**连续三天**每日签到 401 全失败、每天白丢 1000 分，
+ *    而日志与面板**一个字都没有** —— 用户只能从「临期桶不见了」反推。
+ *    ⇒ 本函数改为返回**结果对象**：调用方据此决定记日志与是否重试。
+ *
+ * @returns 领取结果。`ok: true` 时为领到的活动桶；`ok: false` 时带错误原因
+ *（**不抛错**：签到失败绝不阻断余额展示）。
  */
 export async function claimDailyBonus(
   credential: OfficeAceCredential,
-): Promise<Array<{ activityId: string; activityName: string; points: number }>> {
+): Promise<ClaimBonusResult> {
   if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
-    return []
+    return { ok: false, reason: '凭据缺失（access 或 securityToken 为空），未发起签到请求' }
   }
   try {
     // ⚠️ **POST 必须带 `Content-Type`**（规则 1 的另一面）：实测不带会得到
     //    HTTP 500 `OfficeAce.11020001 内部服务器错误`；带了才是 200。
     //    body 为空即可 —— 该端点不需要入参（果办也是 `void 0`）。
+    const statusOut = { status: 0 }
     const body = await signAndRequest(
       `${OFFICEACE.defaultBaseUrl.replace(/\/+$/, '')}/v1/subscription/bonus/claim`,
       credential,
       'POST',
+      undefined,
+      statusOut,
     )
-    if (body.length === 0) return []
+    // ⚠️⚠️ **非 2xx 必须显式判状态码**（2026-10-18）：`signAndRequest` 对失败
+    //    与「空响应体」都返回空串 ⇒ 401 会被读成「今天没有可领的」，于是每天
+    //    白丢 1000 分且日志无痕。这里按状态码如实报失败。
+    if (!Number.isFinite(statusOut.status) || statusOut.status < 200 || statusOut.status >= 300) {
+      return { ok: false, reason: `HTTP ${statusOut.status === 0 ? '（未发出/无响应）' : statusOut.status}：${body.slice(0, 120)}` }
+    }
+    if (body.length === 0) return { ok: true, skus: [] }
     const j = JSON.parse(body) as {
       bonus_skus?: Array<{
         activity_id?: unknown
@@ -1519,16 +1544,26 @@ export async function claimDailyBonus(
         points?: unknown
       }>
     }
-    return (j.bonus_skus ?? []).map((s) => ({
-      activityId: String(s.activity_id ?? ''),
-      activityName: typeof s.activity_name === 'string' ? s.activity_name : '活动奖励',
-      points: Number(s.points) || 0,
-    }))
-  } catch {
-    // ⚠️ 签到失败**绝不阻断**余额查询（还有 LOGGER 约定：记日志而不是静默吞）。
-    return []
+    return {
+      ok: true,
+      skus: (j.bonus_skus ?? []).map((s) => ({
+        activityId: String(s.activity_id ?? ''),
+        activityName: typeof s.activity_name === 'string' ? s.activity_name : '活动奖励',
+        points: Number(s.points) || 0,
+      })),
+    }
+  } catch (error) {
+    // ⚠️ 签到失败**绝不阻断**余额查询，但**必须留痕**（仓库约定：不允许静默吞）。
+    return {
+      ok: false,
+      reason: error instanceof Error ? error.message : String(error),
+    }
   }
 }
+
+/** 每日签到的领取结果。**失败带原因** —— 静默失败会让用户每天白丢 1000 分。 */
+export type ClaimBonusResult = { ok: true; skus: Array<{ activityId: string; activityName: string; points: number }> }
+  | { ok: false; reason: string }
 
 /**
  * 「够了就不要再领」的节流：同一 ref **每小时最多领一次**（与果办客户端同款
@@ -1538,6 +1573,16 @@ export async function claimDailyBonus(
  *    请求，且服务端若对重复领取返回异常，日志会被刷屏。
  * ⚠️ 按 ref 而非全局：多账号下每个账号**各自**都要领，共用一把锁会让
  *    第二个账号永远领不到（它的签到分当日作废）。
+ *
+ * ⚠️⚠️ **失败必须撤销占坑**（2026-10-18 真实报障）：原实现是「先 `set` 占坑、
+ *    再领取」，且 `.catch(() => [])` —— 于是**失败那一次也把这一小时钉死了**。
+ *    实测形态：登录是**异步**写凭据库的，面板刷新与 `login.poll` 会赛跑；
+ *    若刷新抢在落盘之前拿到旧/空凭据 ⇒ 401 ⇒ 静默失败 ⇒ 该小时内后续所有
+ *    刷新**全部跳过、不再重试**，直到下一小时才可能领到 —— 而当日积分
+ *    23:59:59 作废，一次钉死就可能是当天 1000 分的永久损失。
+ *
+ *    ⇒ 失败时 `delete` 掉占位，让下一次刷新重试。服务端对重复领取幂等
+ *    （「每日签到有礼」一天只有一份），重试无害。
  */
 const lastClaimAt = new Map<string, string>()
 function maybeClaimBonus(credential: OfficeAceCredential, ref: string): Promise<unknown> {
@@ -1545,7 +1590,13 @@ function maybeClaimBonus(credential: OfficeAceCredential, ref: string): Promise<
   const hourKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}`
   if (lastClaimAt.get(ref) === hourKey) return Promise.resolve([])
   lastClaimAt.set(ref, hourKey)
-  return claimDailyBonus(credential).catch(() => [])
+  return claimDailyBonus(credential).then((result) => {
+    if (result.ok) return result.skus
+    // ⚠️ 撤销占坑：让本小时内的下一次刷新重试（见上方长注释）。
+    lastClaimAt.delete(ref)
+    console.warn(`[officeace] 每日签到失败（ref=${ref}）：${result.reason}`)
+    return []
+  })
 }
 
 /** Basic 授权头值（推理用）。 */
