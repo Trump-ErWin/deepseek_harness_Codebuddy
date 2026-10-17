@@ -317,6 +317,15 @@ let diskTried = false
 /** 后台刷新是否已在途（去重，避免并发重复下载 5 MB）。 */
 let refreshing: Promise<boolean> | undefined
 
+/**
+ * ⚠️ 在途轮的**身份哨兵**（独立审计 P4）。
+ *
+ * `refreshing` 是 promise，没法回答「清槽的这一轮是不是发起它的那一轮」——
+ * 而 `finally` 里必须能回答（否则会清掉别人的槽，见 P4）。
+ * 故另设一个与本轮一一对应的对象，`refreshing` 发起时同步赋值。
+ */
+let refreshingToken: object | undefined
+
 /** 在途刷新的开始时刻（用于识别「卡死」的那一次）。 */
 let refreshingStartedAt = 0
 
@@ -441,10 +450,20 @@ async function fetchOnce(fetcher: typeof fetch = fetch): Promise<boolean> {
  * 抖动窗口内。2s → 4s 的形状足以跨过典型瞬时抖动，且把「三次全败」的最坏
  * 等待控制在 {@link MODELS_DEV_WORST_CASE_MS}。
  *
- * ## ⚠️ 中断（进程退出 / 调用方 abort）**不重试**
+ * ## ⚠️⚠️ **超时重试、主动中断不重试**（2026-10-17 独立审计 P5 澄清）
  *
- * `signal.aborted` 是「有人要求停止」，不是「网络失败」—— 重试它会让卸载
- * 流程被拖住最多 {@link MODELS_DEV_WORST_CASE_MS}。
+ * 改前的注释写「中断不重试」，而实现只把 `TimeoutError` / `AbortError`
+ * 合流成一个 `aborted` 标志、**只用来挑日志文案**，两者都照常重试
+ * （实测 `AbortError` 也会打满 3 次）⇒ **注释是错的**。
+ *
+ * 拆开后的口径（这才是本意）：
+ * - **`TimeoutError`** = 本模块自己的 `AbortSignal.timeout` 到期
+ *   ⇒ 这是**网络慢**，正是重试要解决的情形 ⇒ **重试**；
+ * - **`AbortError`** = **调用方**中断（signal aborted）⇒ 「有人要求停止」
+ *   ⇒ **不重试**（重试会把卸载流程拖住最多 {@link MODELS_DEV_WORST_CASE_MS}）。
+ *
+ * ⚠️ 生产上当前**没有**调用方 signal 入口（`fetchOnce` 用的是自己的超时信号），
+ *   所以这条区分目前主要是**契约正确性**：别让注释继续骗人。
  */
 async function fetchWithRetry(
   fetcher: typeof fetch,
@@ -456,21 +475,41 @@ async function fetchWithRetry(
       return await fetchOnce(fetcher)
     } catch (error) {
       lastError = error
-      const aborted = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
+      // ⚠️ **主动中断不重试**（见上方 P5 澄清）：调用方 abort 是「要求停止」，
+      //   不是网络故障；重试只会把卸载流程拖住。
+      if (isCallerAbort(error)) throw error
+      const timedOut = error instanceof Error && error.name === 'TimeoutError'
       // ⚠️ 最后一轮不必再等：等下来也没有下一次尝试了，白等一个退避间隔。
-      if (aborted && attempt === MODELS_DEV_MAX_ATTEMPTS) break
-      if (aborted) {
-        options.warn?.(`[jet-hub] models.dev 刷新超时（第 ${attempt}/${MODELS_DEV_MAX_ATTEMPTS} 次），${RETRY_BASE_DELAY_MS * 2 ** (attempt - 1)}ms 后重试`)
+      if (attempt === MODELS_DEV_MAX_ATTEMPTS) break
+      const wait = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1)
+      if (timedOut) {
+        options.warn?.(`[jet-hub] models.dev 刷新超时（第 ${attempt}/${MODELS_DEV_MAX_ATTEMPTS} 次），${wait}ms 后重试`)
       } else {
         options.warn?.(`[jet-hub] models.dev 刷新失败（第 ${attempt}/${MODELS_DEV_MAX_ATTEMPTS} 次）：${error instanceof Error ? error.message : String(error)}`)
       }
-      if (attempt === MODELS_DEV_MAX_ATTEMPTS) break
-      await delay(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), options.sleep)
+      await delay(wait, options.sleep)
     }
   }
   throw lastError instanceof Error
     ? lastError
     : new Error(`models.dev 刷新失败：${String(lastError)}`)
+}
+
+/**
+ * 该错误是否是**调用方主动中断**（而非网络故障/超时）。
+ *
+ * ⚠️ 与 `TimeoutError` 严格分开：`AbortSignal.timeout()` 到期抛的是前者，
+ *   而「调用方 abort」抛的是 `AbortError` —— 两者都叫「被中止」但语义相反
+ *   （一个该重试、一个不该），混淆会让注释与实现长期互相骗（独立审计 P5）。
+ */
+function isCallerAbort(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  if (error.name !== 'AbortError') return false
+  // ⚠️ Node 的 `AbortSignal.timeout` 产出的错误 name 也是 `AbortError`
+  //   （旧版本）或 `TimeoutError`（新版本）。用 `code` 进一步区分：
+  //   `ABORT_ERR` 才是真正的调用方中断。
+  const code = (error as { code?: unknown }).code
+  return code === 'ABORT_ERR' || code === 20
 }
 
 /** 可中断的 sleep。`sleep` 可注入，使单测不必真等退避（见 {@link RefreshModelsDevOptions}）。 */
@@ -536,8 +575,31 @@ export function refreshModelsDev(
  * @returns 是否成功。失败时**保留旧缓存**（`readModelsDevSync` 仍可用）。
  */
 export function refreshModelsDevAsync(options: RefreshModelsDevOptions = {}): Promise<boolean> {
-  return runRefresh(options, undefined)
+  return runRefresh(options)
 }
+
+/**
+ * ⚠️⚠️ **本轮刷新成功后的订阅者**（独立审计 P2 的根治）。
+ *
+ * ## 为什么不能是「单个回调」
+ *
+ * 改前 `runRefresh(options, onUpdated)` 把回调存在局部变量里，而去重的做法是
+ * `if (refreshing !== undefined) return refreshing` —— **后到者的回调被整个丢弃**。
+ *
+ * 实测触发形态（`index.ts` 里两行相隔 8 行、同步相邻、中间无 await）：
+ * ```ts
+ * primeModelsDev()                      // ← 不带回调，先占住 refreshing
+ * refreshModelsDev(broadcast, {onUpdated})  // ← 命中 return refreshing，回调被丢
+ * ```
+ * ⇒ **每次冷启动且缓存超 6h TTL，`llm/adapters-updated` 永不发出**
+ * （实测：fetch 1 次、广播 0 次、`onUpdated` 0 次）。
+ *
+ * ⚠️ 能力表本身能自愈（memory 换新对象身份 ⇒ 归一缓存失效），**真正丢的是广播**
+ * ⇒ 首帧那套「text-only / 兜底表」渲染会一直保持到下次交互。
+ *
+ * ⇒ 改成**订阅者列表**：在途期间到来的每个回调都会被登记，成功后逐个兑现。
+ */
+let refreshSubscribers: Array<() => void> = []
 
 /** 刷新实现（**唯一一份**，两个公开入口都走它）。 */
 function runRefresh(options: RefreshModelsDevOptions, onUpdated?: () => void): Promise<boolean> {
@@ -552,12 +614,30 @@ function runRefresh(options: RefreshModelsDevOptions, onUpdated?: () => void): P
   const now = options.now ?? (() => Date.now())
   if (refreshing !== undefined && now() - refreshingStartedAt > MODELS_DEV_DEADLOCK_MS) {
     refreshing = undefined
+    refreshingToken = undefined
   }
-  if (refreshing !== undefined) return refreshing
+  if (refreshing !== undefined) {
+    // ⚠️⚠️ **登记订阅者而不是丢弃它**（独立审计 P2）。
+    //   `index.ts` 的 `primeModelsDev()` 会先占住槽（它不带回调），8 行后的
+    //   `refreshModelsDev(broadcast, …)` 就会走到这里 —— 改前直接
+    //   `return refreshing`，那个广播回调**被整个丢掉** ⇒ 冷启动首刷的
+    //   `llm/adapters-updated` 永不发出（实测 fetch 1 次 / 广播 0 次）。
+    if (onUpdated !== undefined) refreshSubscribers.push(onUpdated)
+    if (options.onUpdated !== undefined) refreshSubscribers.push(options.onUpdated)
+    return refreshing
+  }
   const fresh = cacheFileAt > 0 && now() - cacheFileAt < MODELS_DEV_TTL_MS
   if (!options.force && fresh) return Promise.resolve(true)
   refreshingStartedAt = now()
-  const task = (async () => {
+  // ⚠️ 本轮**自己**的订阅者也进列表，保证兑现路径只有一处。
+  if (onUpdated !== undefined) refreshSubscribers.push(onUpdated)
+  if (options.onUpdated !== undefined) refreshSubscribers.push(options.onUpdated)
+  // ⚠️ `mine` 是**本轮的身份哨兵**，声明在 async IIFE **之前**。
+  //   它存进 {@link refreshingToken}（不是 `refreshing`）⇒ `finally` 里能安全
+  //   比对「当前在途是不是本轮」。⚠️ **不能**读 `task` 来比对（TDZ：fetcher
+  //   立刻抛错时 IIFE 会在赋值前同步走到 `finally`）。见 P4 的注释。
+  const mine = {}
+  const task: Promise<boolean> = (async () => {
     try {
       // ⚠️ 走带重试的那条：3 次都失败才算「放弃这次更新」。
       const ok = await fetchWithRetry(options.fetcher ?? fetch, options)
@@ -565,8 +645,22 @@ function runRefresh(options: RefreshModelsDevOptions, onUpdated?: () => void): P
         // ⚠️ 归一层的缓存也必须一起作废（消费方按 provider 块的对象身份记忆化，
         // 而成功刷新会**整体换掉**那块对象，所以它们靠身份变化自动失效；
         // 这里再显式给一个钩子，供「不靠身份」的订阅方使用）。
-        options.onUpdated?.()
-        onUpdated?.()
+        //
+        // ⚠️ 兑现顺序：**先取快照再清空**。若某个订阅者回调里又调了
+        //   `refreshModelsDev`（理论上不该，但接线层是外部代码），
+        //   在途去重会把它登记进**下一轮**的列表，而不是本轮的 —— 
+        //   那样它会被**再兑现一次**。先清空则不会。
+        const subscribers = refreshSubscribers
+        refreshSubscribers = []
+        for (const notify of subscribers) {
+          try {
+            notify()
+          } catch (error) {
+            // ⚠️ 一个订阅者抛错**不得**影响其余订阅者、更不得让本轮失败
+            // （与仓库既有约定一致：告警出口必须被隔离）。
+            options.warn?.(`[jet-hub] models.dev 刷新成功但某个订阅回调抛错：${error instanceof Error ? error.message : String(error)}`)
+          }
+        }
         return true
       }
       return false
@@ -576,9 +670,24 @@ function runRefresh(options: RefreshModelsDevOptions, onUpdated?: () => void): P
       options.warn?.(`[jet-hub] models.dev 缓存刷新失败（已重试 ${MODELS_DEV_MAX_ATTEMPTS} 次，沿用上一次读数）：${error instanceof Error ? error.message : String(error)}`)
       return false
     } finally {
-      refreshing = undefined
+      // ⚠️⚠️ **只清属于自己的那个槽**（独立审计 P4）。
+      //   改前是无条件 `refreshing = undefined`：若本轮已因「死锁超时」被判定为
+      //   过期（`refreshing` 被另一次调用清空并重新赋值），而本轮稍后才 settle，
+      //   它的 `finally` 会把**别人那轮的在途槽也清掉** ⇒ 第三次调用 C 又发一次
+      //   请求 ⇒ 并发翻倍，正好加剧我们要避免的上游压力（实测 B 完成后 A 的
+      //   finally 清空了 B 的槽）。
+      //
+      //   ⚠️ **不能**读 `task` 来比对（TDZ）：async IIFE 可能在本轮被赋给
+      //   `refreshing` **之前**就同步走到 `finally`（fetcher 立刻抛错时），
+      //   那时读 `task` 是 TDZ ⇒ 与**先声明**的身份哨兵 `mine` 比对。
+      if (refreshingToken === mine) {
+        refreshingToken = undefined
+        refreshing = undefined
+      }
     }
   })()
+  // ⚠️ 两个变量**同步**赋值：promise 供调用方 await，哨兵供 `finally` 辨身（P4）。
+  refreshingToken = mine
   refreshing = task
   return task
 }

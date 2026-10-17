@@ -52,7 +52,26 @@ import {
   readProviderModelsSync,
   refreshModelsDev,
 } from './models-dev-cache.js'
-import { OPENCODE_CHAT_PROTOCOL_API, setRemoteOpencodeFreeFlags, setRemoteOpencodeReachability } from './opencode-product.js'
+import {
+  OPENCODE_CHAT_PROTOCOL_API,
+  setOpencodeCapabilityHook,
+  setRemoteOpencodeFreeFlags,
+  setRemoteOpencodeReachability,
+} from './opencode-product.js'
+
+// ⚠️⚠️ **模块加载期**注册「读能力表」钩子（独立审计 P1 的根治）。
+//
+// `opencode-product.ts` 的两个判据（`isFreeOpencodeModel` /
+// `isReachableOpencodeModel`）在表为 `undefined` 时会回调它，就地完成注入 ——
+// 于是判据**自给自足**，不再依赖「每个调用点都先读一次能力表」这种跨文件的
+// 隐式顺序约定。
+//
+// ⚠️ **必须是模块加载期**（不是首次归一后）：冷启动首帧能力表还没被任何
+//   路径读过，若那时钩子未注册，判据就会退回本地表。
+//
+// ⚠️ 回调里**不缓存**结果：`readNormalized()` 自身按共享缓存的 provider 块
+//   身份记忆化，重复调用极廉价，而缓存一份反而会在后台刷新后读到旧值。
+setOpencodeCapabilityHook(() => { readNormalized() })
 
 /** 归一后的模型能力条目。 */
 export interface OpencodeModelCapability {
