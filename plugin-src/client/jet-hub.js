@@ -7380,7 +7380,15 @@ export function JetHubPage({ rpcCall }) {
       React.createElement('div', { className: 'dim-jh-railGroupTitle' }, title),
       list.map(p => renderProviderRow(p)));
     return [
-      group(`已打开 (${open.length})`, sortOpenProvidersByOrder(open, providerOrder), 'open'),
+      // ⚠️ 第三个实参 = **声明顺序**（注册表全量 id）。传它才能让
+      // `providerOrder` 里缺失的**新增** provider 落回它该在的位置，
+      // 而不是被缀到末尾（真实缺陷，2026-10-17 用户报障
+      // 「minimax 国际版的顺序应该在中国版下面」）。
+      group(
+        `已打开 (${open.length})`,
+        sortOpenProvidersByOrder(open, providerOrder, PROVIDERS.map(p => p.id)),
+        'open',
+      ),
       group(`已关闭 (${closed.length})`, closed, 'closed'),
     ];
   };
