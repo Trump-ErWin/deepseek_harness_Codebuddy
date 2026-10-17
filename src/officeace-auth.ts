@@ -171,6 +171,33 @@ function storeFileFor(ref?: string): string {
   return path.join(officeaceHome(), `session-${safe}.json`)
 }
 
+/**
+ * 凭据是否**足以发起云侧签名请求**（`access` + `securityToken` 都在且非空）。
+ *
+ * ⚠️⚠️ **必须用可选链判「缺失」，不能只判「空串」**（2026-10-18 审计实测的 P0）。
+ *
+ * 修前是三处一模一样的 `credential.access.length === 0`（`fetchModelTokenRates`
+ * / `fetchCloudSubscriptionFor` / `claimDailyBonus`），而 `readStoredCredential`
+ * **只校验 `modelAppKey`** ⇒ 一份 `access` 字段**缺失**（`undefined`）的凭据
+ * 能一路读到这里，于是 `.length` 在 `try` 之外抛
+ * `TypeError: Cannot read properties of undefined (reading 'length')`：
+ *
+ * - 在 `claimDailyBonus` 里它 escape 出函数 ⇒ 调用方拿到的不是 `{ok:false}`
+ *   而是 reject ⇒ 异常被 L1206/L1271 的空 `catch` 静默吞掉 ⇒
+ *   **既没有留痕、余额查询也一并被跳过**（面板该次刷新零网络请求）；
+ * - 那正是本 PR 要消灭的「静默 + 阻断」形态，在另一条支路上被原样复现。
+ *
+ * ⚠️ 同义判据只留**这一份**：三处各自写一遍必然漂移（本仓库明列的坑），
+ *   新增第四处时也必须走它。
+ */
+function credentialUsable(credential: OfficeAceCredential | undefined): credential is OfficeAceCredential {
+  return (
+    credential !== undefined
+    && typeof credential.access === 'string' && credential.access.length > 0
+    && typeof credential.securityToken === 'string' && credential.securityToken.length > 0
+  )
+}
+
 /** 读当前凭据；不存在/损坏返回 undefined。 */
 export function readStoredCredential(ref?: string): OfficeAceCredential | undefined {
   try {
@@ -515,7 +542,7 @@ export async function fetchModelTokenRates(): Promise<Map<string, number>> {
   const out = new Map<string, number>()
   try {
     const credential = readStoredCredential()
-    if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
+    if (!credentialUsable(credential)) {
       return out
     }
     const raw = await signAndGet(
@@ -1313,12 +1340,22 @@ export async function fetchSubscriptionSummary(
  *
  * @param body - 请求体文本；`undefined`（无 body）时按空串计哈希。
  * @param statusOut - 可选：写入终态 HTTP 状态码。
+ * @param errorBodyOut - 可选：写入**失败响应体原文**（供调用方带出唯一出路信息）。
  *
  * ⚠️ **返回值对「失败」是有歧义的**：非 2xx 与「2xx 但响应体为空」都给出空串
  *    （`r.ok ? await r.text() : ''`）。余额查询可以容忍（空串 ⇒ 解析失败 ⇒
  *    走缓存兜底），但**签到不能** —— 401 会被读成「今天没有可领的」，
  *    于是每天白丢 1000 分且日志无痕（2026-10-18 真实报障）。需要区分的调用方
  *    传 `statusOut` 自行判定。
+ *
+ * ⚠️⚠️ **`errorBodyOut` 不是冗余**（2026-10-18 审计实测的 P1）：
+ *    失败时返回值恒为空串，于是上游那行 `body.slice(0, 120)` **永远切出空串** ——
+ *    实测 401 + `{"error":"IAM_TOKEN_EXPIRED_XYZ"}` 得到的是
+ *    `reason: "HTTP 401："`，**服务端报文全丢**。
+ *    而「报文本身指路」正是本 PR 立论所依赖的东西（同理 IKLBSH 记录的
+ *    `AUTH` 码吞 message：文案就是出路，丢了就无从处置）。
+ *    本文件另有两处**既有先例**是「先 `await r.text()` 再判 `!r.ok`、把报文带进
+ *    错误/日志」（`exchangeIamToken` 与 STS 续期失败）—— 此处照同一口径补齐。
  */
 async function signAndRequest(
   url: string,
@@ -1326,6 +1363,7 @@ async function signAndRequest(
   method: 'GET' | 'POST',
   body?: string,
   statusOut?: { status: number },
+  errorBodyOut?: { text: string },
 ): Promise<string> {
   const region = 'cn-southwest-2'
   const service = 'apic'
@@ -1389,6 +1427,14 @@ async function signAndRequest(
     signal: AbortSignal.timeout(30_000),
   })
   if (statusOut !== undefined) statusOut.status = r.status
+  /**
+   * ⚠️ 失败时**必须把报文读出来**（P1）：返回值对失败恒为空串，
+   * 报文是调用方能拿到的**唯一**失败原因。读失败也不能抛（否则吞掉状态码判据），
+   * 故 `.catch(() => '')`。
+   */
+  if (errorBodyOut !== undefined && !r.ok) {
+    errorBodyOut.text = await r.text().catch(() => '')
+  }
   return r.ok ? await r.text() : ''
 }
 
@@ -1428,7 +1474,7 @@ async function fetchCloudSubscription(ref?: string): Promise<OfficeAceSubscripti
 async function fetchCloudSubscriptionFor(
   credential: OfficeAceCredential | undefined,
 ): Promise<OfficeAceSubscriptionSummary | undefined> {
-  if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
+  if (!credentialUsable(credential)) {
     return undefined
   }
   const body = await signAndGet(
@@ -1515,26 +1561,36 @@ async function fetchCloudSubscriptionFor(
 export async function claimDailyBonus(
   credential: OfficeAceCredential,
 ): Promise<ClaimBonusResult> {
-  if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
-    return { ok: false, reason: '凭据缺失（access 或 securityToken 为空），未发起签到请求' }
+  if (!credentialUsable(credential)) {
+    return { ok: false, reason: '凭据缺失（access 或 securityToken 缺失或为空），未发起签到请求' }
   }
   try {
     // ⚠️ **POST 必须带 `Content-Type`**（规则 1 的另一面）：实测不带会得到
     //    HTTP 500 `OfficeAce.11020001 内部服务器错误`；带了才是 200。
     //    body 为空即可 —— 该端点不需要入参（果办也是 `void 0`）。
     const statusOut = { status: 0 }
+    const errorBodyOut = { text: '' }
     const body = await signAndRequest(
       `${OFFICEACE.defaultBaseUrl.replace(/\/+$/, '')}/v1/subscription/bonus/claim`,
       credential,
       'POST',
       undefined,
       statusOut,
+      errorBodyOut,
     )
     // ⚠️⚠️ **非 2xx 必须显式判状态码**（2026-10-18）：`signAndRequest` 对失败
     //    与「空响应体」都返回空串 ⇒ 401 会被读成「今天没有可领的」，于是每天
     //    白丢 1000 分且日志无痕。这里按状态码如实报失败。
+    //
+    // ⚠️⚠️ **失败原因必须带出服务端报文**（P1）：`body` 在非 2xx 时恒为空串，
+    //    拿它拼 reason 只会得到 `HTTP 401：` —— 而报文往往是**唯一指路信息**
+    //    （`token expired` / `IAM.0011` / 签名过期），丢了就退回「无从处置」。
     if (!Number.isFinite(statusOut.status) || statusOut.status < 200 || statusOut.status >= 300) {
-      return { ok: false, reason: `HTTP ${statusOut.status === 0 ? '（未发出/无响应）' : statusOut.status}：${body.slice(0, 120)}` }
+      const detail = errorBodyOut.text.trim().slice(0, 200)
+      return {
+        ok: false,
+        reason: `HTTP ${statusOut.status === 0 ? '（未发出/无响应）' : statusOut.status}${detail === '' ? '' : `：${detail}`}`,
+      }
     }
     if (body.length === 0) return { ok: true, skus: [] }
     const j = JSON.parse(body) as {
@@ -1581,8 +1637,20 @@ export type ClaimBonusResult = { ok: true; skus: Array<{ activityId: string; act
  *    刷新**全部跳过、不再重试**，直到下一小时才可能领到 —— 而当日积分
  *    23:59:59 作废，一次钉死就可能是当天 1000 分的永久损失。
  *
- *    ⇒ 失败时 `delete` 掉占位，让下一次刷新重试。服务端对重复领取幂等
+ *    ⇒ 失败时**撤销**占位，让下一次刷新重试。服务端对重复领取幂等
  *    （「每日签到有礼」一天只有一份），重试无害。
+ *
+ * ⚠️⚠️ **撤销必须与 `.catch()` 兜底成对出现**（2026-10-18 审计实测的 P0）：
+ *    原实现是 `.then(...)` 而**没有** `.catch` —— 而 `claimDailyBonus` 确实会
+ *    reject（凭据字段缺失时的前置判断抛错）。那条 rejection 路径
+ *    **既进不了 `result.ok` 分支、也拿不到 `.catch(() => [])` 的兜底**，
+ *    异常一路冒到调用方的空 `catch` ⇒ 零留痕 + 余额查询一并被跳过。
+ *    ⇒ 拒绝路径必须与失败路径**同等对待**：撤销占坑 + 留痕。
+ *
+ * ⚠️ **占坑撤销必须按 hourKey 条件删**（P3）：`hourKey` 在**进入时**算，
+ *    而响应回来时可能已跨整点。若那时新一轮刷新已用**新** hourKey 重建了占坑，
+ *    无条件 `delete(ref)` 会把**别人的**占坑删掉 ⇒ 节流失效（多打一次请求）。
+ *    形态轻（多打的仍是幂等签到），但白搭一次往返与一条 warn。
  */
 const lastClaimAt = new Map<string, string>()
 function maybeClaimBonus(credential: OfficeAceCredential, ref: string): Promise<unknown> {
@@ -1590,11 +1658,27 @@ function maybeClaimBonus(credential: OfficeAceCredential, ref: string): Promise<
   const hourKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}`
   if (lastClaimAt.get(ref) === hourKey) return Promise.resolve([])
   lastClaimAt.set(ref, hourKey)
+  /**
+   * ⚠️ **撤销占坑只删「自己那一格」**（P3，跨整点时别删掉新一轮的占坑）。
+   */
+  const releaseSlot = (): void => {
+    if (lastClaimAt.get(ref) === hourKey) lastClaimAt.delete(ref)
+  }
   return claimDailyBonus(credential).then((result) => {
     if (result.ok) return result.skus
-    // ⚠️ 撤销占坑：让本小时内的下一次刷新重试（见上方长注释）。
-    lastClaimAt.delete(ref)
+    releaseSlot()
     console.warn(`[officeace] 每日签到失败（ref=${ref}）：${result.reason}`)
+    return []
+  }).catch((error: unknown) => {
+    /**
+     * ⚠️⚠️ **拒绝路径与失败路径同等对待**（P0，见上方长注释）。
+     * 少了这一条：reject 既不留痕、也不撤销占坑 ⇒ 该小时仍被钉死，
+     * 且异常被调用方的空 `catch` 静默吞掉 ⇒ 零留痕 + 余额查询被跳过。
+     */
+    releaseSlot()
+    console.warn(
+      `[officeace] 每日签到异常（ref=${ref}）：${error instanceof Error ? error.message : String(error)}`,
+    )
     return []
   })
 }
