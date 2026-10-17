@@ -55,16 +55,32 @@
  *    说明服务端认的是**逐字符的字面量**，**不能**把它泛化成正则/关键词。
  *
  * ⚠️⚠️ **但「逐字符的精确字面量」不等于「每条指纹的锚点相同」**（2026-10-14，
- * 登记 Claude Code 那条时实测出来）。两条已登记指纹的**位置语义是相反的**：
+ * 登记 Claude Code 那条时实测出来）。三条已登记指纹的**位置语义并不一致**：
  *
- * | 指纹 | 位置语义 | 依据 |
+ * | 指纹 | 位置语义 | 依据（**探针实测**，不是推断） |
  * |---|---|---|
  * | ZCode gitStatus 句 | **位置无关**（句中/段中被夹住仍拦） | 上表「句中 / 段中被别的句子夹住」 |
- * | Claude Code 身份句 | **行首锚定**（前接任意一个字符即放行） | 见 {@link CONTENT_FINGERPRINTS} 第二条 |
+ * | Claude Code 身份句 | **行首锚定**（前接任意一个字符即放行） | 前接空格 / 换行 / 中文前言 / 双换行**均 200**；裸串、后接句点均 400 |
+ * | Claude Code 反馈句 | **位置无关**（前接前言仍拦） | 裸串、前接 `Note: `、前接行首 `  - `、后接换行正文**均 400/11128** |
+ *
+ * ⚠️ 三行里第 2、3 行**互为反面** ⇒ 「位置语义」这张表**必须逐条实测**，
+ * 拿任一条的结论推给新指纹就是踩中本文件下面那条纪律。
+ *
+ * ⚠️ 而「`find` 该写多长」**也不统一** —— 那取决于**该条指纹的最小充分串**，
+ * 而最小充分串**只能逐条实测**（IKLYCT 那条实测：砍掉前半或后半都放行 ⇒ 必须写整句；
+ * 身份句那条实测：少一个字母即放行 ⇒ 恰好写全）。**照抄别条的 find 长度是错的**。
  *
  * ⇒ **绝不能把任一条的锚点结论推给新指纹**。新增一条时的探针必须**两侧都测**
  * （既测句首也测非句首），否则会把「锚点不吃这一口」误读成「这条指纹已失效」
  * —— 那是**假阴性**，比没有探针更危险（会让人据此删掉一条仍然必需的登记）。
+ *
+ * ⚠️⚠️ **探针必须先把账号筛一遍（2026-10-18 新增的纪律）**：`11128` **有两种**，
+ * `msg` 分别是 `Illegal API invocation from an unapproved channel`（**内容级**，
+ * 本文件要治的那一种）与 `request illegal`（**渠道校验**，按账号要求三头，IKM7SG）。
+ * 两者都回 `code 11128` ⇒ 若像本轮第一版探针那样**轮换账号**，会把账户特定的
+ * 通道门控读成内容指纹的匹配语义 ⇒ 实测出「51 字符前缀被拦、69 字符超集放行」
+ * 这种**非单调**的假结论。故：**先筛出基线放行的账号，再固定用它**，并**逐格打印 `msg`**。
+ * 判据分离的写法见 `tests/e2e/buddy-fingerprint-roles.e2e.spec.ts` 顶部的说明。
  *
  * ⚠️ **可复核凭据已入库**（2026-10-12 审计补齐）：`tests/e2e/buddy-fingerprint-roles.e2e.spec.ts`。
  * 上面那四行 ★ **不是**本文件的自我声明 —— 它们各有一次真实发请求的用例。
@@ -108,8 +124,18 @@
  * 那是**内容级**拦截：同一账号换掉这一句就通（上面「改写该句」一行）。
  * 认成「账号被策略拦」会触发换号 + 30 分钟账号冷却（`CONTENT_REJECTION_COOLDOWN_MS`），
  * 把整个账号池白锁 30 分钟，而真正该做的是改写那一句。
- * 维持现状（`isContentRejection` 只认 11140 / `request illegal` / 安全审核文案）
- * **是正确**的。
+ * `isContentRejection` 只认 11140 / `request illegal` / 安全审核文案**是对的**，
+ * **但「不认它」不等于「不会被误判」** ——
+ *
+ * ⚠️⚠️ **2026-10-18 实测出的一处真实缺陷（本条曾被它反噬，已修）**：
+ * `isContentRejection` 的腿③ `/安全审核|safety review/i` **扫整份报文**（含
+ * `displayMsg` / `displayTips`），而 `buddy-adapter.ts` 自己就记着「`11128` 各子原因
+ * **共用/漂移 `displayMsg`**」⇒ 上游哪天把内容级 11128 的 `displayMsg` 漂成
+ * `The content did not pass the safety review.`，这份**换句即通**的报文就会落进
+ * 「账号级拦截」档 ⇒ **烧完整池 + 锁 30 分钟**，把本文件的修复效果**完全抵消**。
+ * 修法与全部实测格见 `buddy-adapter.ts` 的 `CONTENT_BLOCKED_MSG` 注释。
+ * ⚠️ 教训可推广：**「不该把 X 加进判据」≠「判据不会因为 X 的报文而误判」** ——
+ * 一条扫全文案的腿会绕过你精心写的排除逻辑。
  *
  * ## 表驱动，而不是写死一处
  *
@@ -176,6 +202,49 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
     replace: "You are Claude Code, Anthropic's CLI for Claude",
     note: 'Gitee IKLS2L；本机 2026-10-14 对 workbuddy / CodeBuddy 双端点实测：'
       + 'system 与 assistant 正文位置均 400/11128，改写后两端点均 200（含 SDK 变体）',
+  },
+  {
+    // Claude Code system prompt 的「帮助 / 反馈」段默认句（Gitee issue IKLYCT）：
+    // `To give feedback, users should report the issue at
+    //  https://github.com/anthropics/claude-code/issues`
+    //
+    // ## 与上一条（身份句）不同：这一条**每轮必带**，不是概率性泄漏
+    //
+    // 身份句只有 cc-switch 的 `mrt()` 探测路径漏传 `skipSystemPromptPrefix` 时才注入
+    // （实测约 34%）；本句属于 Claude Code system prompt 的**固定段落**，
+    // 只要客户端把默认 system 整份发过来就必然带上 ⇒ **漏登记 = 必然命中**。
+    // 用户侧实测：单日 buddy/workbuddy 因它白撞 647 次。
+    //
+    // ## ⚠️ 匹配语义：**位置无关**（与身份句的「行首锚定」相反）
+    //
+    // 2026-10-18 本机对 `www.workbuddy.ai` + `copilot.tencent.com` 双端点逐格实测：
+    //   | 形态 | 结果 |
+    //   |---|---|
+    //   | 裸串 / 前接 `Note: ` / 前接行首 `  - ` | ❌ 400/11128 ⇒ 位置无关 |
+    //   | 后接换行 + 其他文本 | ❌ 400/11128 |
+    //   | 全大写 | ❌ 400/11128 ⇒ 与另两条同型（大小写不敏感） |
+    //   | 换 org/repo、换域名、改一个词、只留 URL | ✅ 200 ⇒ **逐字符** |
+    //   | **砍掉前半 / 砍掉后半** | ✅ 200 ⇒ **`find` 必须写整句** |
+    //
+    // ⚠️ 最后那一格是本条的**要害**：子串本身不触发，写短了等于空跑 ——
+    // 而空跑的症状是「登记了却仍每轮 400」，极难归因。
+    //
+    // ⚠️ 本条的 `find`（整句 99 字符）已经**贴着**上游屏蔽名单的粒度，
+    // 不要再按 ZCode 那条的思路去「缩短 find 覆盖更多变体」：实测换域名即放行。
+    // ⚠️⚠️ **「缩短/删字」这类变异只有实发能验，单测锁不住**：
+    //   单测能证明「砍掉半句时我们**不**改写」（那是真事实），但证明不了
+    //   「砍掉半句后上游**仍会拦**」—— 那只有 e2e 能验（见上面那两格）。
+    //   ⇒ 改本行时**必须**跑一遍 `DSH_BUDDY_FINGERPRINT_E2E=1` 那节。
+    //
+    // ⚠️ 与身份句同理**不做行首锚定**：改写宁可略宽（漏改 = 整轮 400，
+    // 多改 = 语义等价的措辞变化）。
+    find: 'To give feedback, users should report the issue at '
+      + 'https://github.com/anthropics/claude-code/issues',
+    // 实测两端点均 200（buddy / workbuddy，2026-10-18）。措辞与原文等义。
+    replace: 'To give feedback, users should report the issue at the project issue tracker',
+    note: 'Gitee IKLYCT；本机 2026-10-18 对 workbuddy / CodeBuddy 双端点实测：'
+      + 'system（含非首位）与 assistant 正文均 400/11128，user / reasoning_content / '
+      + 'tool 结果放行，改写后两端点均 200',
   },
 ]
 

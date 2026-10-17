@@ -727,14 +727,23 @@ function isContentRejection(body: string): boolean {
   // ⚠️ 先把渠道校验形态摘出来，下面三条腿共用它 —— 「排除一次、三条腿都干净」
   // 比在每条腿里各写一遍判据更难漂移（少写一处就是本节记的那个 P0）。
   //
-  // ⚠️⚠️ 排除必须覆盖渠道校验档**所有「带 msg 措辞」的形态**（2026-10-18 审计实测，本轮修）：
-  // 初版只调 `isChannelVerificationIllegalBody`，它只认**腿③**（`request illegal`
-  // 形态）。腿① 的 `conversation id missing` 形态（**IKM7SG 原文措辞**）
-  // 从未被排除 ⇒ 那份报文只要 `displayMsg` 漂成 11140 的安全审核措辞（本仓记录的
-  // 11140 真报文原句，且「11128 各子原因共用/漂移 displayMsg」已有先例），
-  // 就落进 11140 档 ⇒ 换号 + **写 30 分钟账号冷却** ⇒ 可用账号被凭空封禁。
+  // ⚠️⚠️ 排除必须覆盖渠道校验档**所有「带 msg 措辞」的形态**（2026-10-18 审计实测）：
+  // 只调 `isChannelVerificationIllegalBody` 会漏掉**腿①** 的
+  // `conversation id missing` 形态（**IKM7SG 原文措辞**）⇒ 那份报文只要
+  // `displayMsg` 漂成 11140 的安全审核措辞（本仓记录的 11140 真报文原句，
+  // 且「11128 各子原因共用/漂移 displayMsg」已有先例），就落进 11140 档 ⇒
+  // 换号 + **写 30 分钟账号冷却** ⇒ 可用账号被凭空封禁。
   // ⚠️ 腿②（裸子串兜底）**刻意不覆盖**，理由见本函数文档注释的「覆盖范围」一节。
   if (isChannelVerificationBody(body)) return false
+  // ⚠️⚠️ 内容级 `Illegal API invocation…`（IKLYCT）**同样必须早退**，理由与证据见
+  // {@link CONTENT_BLOCKED_MSG} 的注释：`11128` 各子原因共用/漂移 `displayMsg`，
+  // 上游一漂成安全审核措辞，腿③ 就会把「换句即通」的内容级拦截误判成账号级 ⇒
+  // 烧完整池 + 锁 30 分钟。
+  // ⚠️⚠️ **与上面那条排除是两个独立子原因、共用同一个 `code`**：渠道校验
+  // （`request illegal` / `conversation id missing`）**按账号**生效、该换号；
+  // 内容级（`Illegal API invocation…`）**换句即通**，换号与冷却**全是误伤**
+  // ⇒ **两条排除各管一个，少一条即复发**（本轮两条都在）。
+  if (isContentBlockedIllegalBody(body)) return false
   return /"code"\s*:\s*11140/.test(body)
     || /request illegal/i.test(body)
     || /安全审核|safety review/i.test(body)
@@ -982,6 +991,61 @@ const CHANNEL_VERIFICATION_BARE =
 const ILLEGAL_CODE = /"code"\s*:\s*"?11128(?![\d.])/iu
 const ILLEGAL_MSG =
   /"m(?:sg|essage)"\s*:\s*"[^"]{0,200}?request(?:[\s:_\-\p{Cf}]|\\[nrt])+illegal/iu
+/**
+ * ⚠️⚠️ **内容级** `11128`（`Illegal API invocation from an unapproved channel`）的判定，
+ * 2026-10-18 为 IKLYCT 加。
+ *
+ * ## 为什么它必须在 `isContentRejection` 里被**排除**（这条注释就是那个缺陷的事故史）
+ *
+ * 腾讯系内容级风控的报文长这样（Gitee IKJNA1 / IKLS2L / **IKLYCT**，两端点一致）：
+ * ```json
+ * {"code":11128,"msg":"Illegal API invocation from an unapproved channel",
+ *  "displayMsg":{"en":"blocked by security policy","zh":"请求被拦截，请重新发送"}}
+ * ```
+ * 它是**内容级**拦截：同一账号换掉那一句就通 ⇒ **换号无效、写 30 分钟冷却纯属误伤**
+ * （会把可用账号凭空封禁，出口文案还建议用户去停用账号）。
+ *
+ * ⚠️⚠️ **本条原先是漏的，而漏的方式恰好被本文件自己记录过、却没落到这条腿上**：
+ * 上面那段「这不是假想形态」的注释已经指出——`11128` 各子原因**共用/漂移 `displayMsg`**
+ * （`displayMsg.en` 漂成 `The content did not pass the safety review.` **本仓已有先例**）。
+ * 于是当上游把这份 11128 的 `displayMsg` 漂成安全审核措辞时：
+ * - 腿① `"code":11140` —— **不命中**（code 是 11128）；
+ * - 腿② `/request illegal/i` —— **不命中**（msg 是 `Illegal API invocation…`）；
+ * - 早退 `isChannelVerificationIllegalBody` —— **不命中**（它要 `request illegal`）；
+ * - ⚠️⚠️ **腿③ `/安全审核|safety review/i` 扫整份报文（含 `displayMsg`/`displayTips`）⇒ 命中**
+ *   ⇒ 整份报文落进「账号级拦截」档 ⇒ **烧完整池 + 每个账号锁 30 分钟**。
+ *
+ * 实测（从 `lib/` 编译产物抠出判据实跑，2026-10-18；输入是本仓记录的**真实**报文措辞）：
+ * | 报文 | 判定 | 命中腿 |
+ * |---|---|---|
+ * | 真实 11128 渠道校验 | ✅ false | 早退排除 |
+ * | 真实 11128 内容级（本轮实测文案） | ✅ false | 无 |
+ * | ⚠️ 11128 内容级 + `displayMsg.en` 漂成 safety review | ❌ **true（错）** | **腿③** |
+ * | ⚠️ 11128 内容级 + `displayMsg.zh` 含「安全审核」 | ❌ **true（错）** | **腿③** |
+ * | ⚠️ 11128 内容级 + `displayTips` 含 safety review | ❌ **true（错）** | **腿③** |
+ * | 真实 11140 | ✅ true | 腿①②③（**未被削弱**） |
+ *
+ * ## 写法上刻意与 `isChannelVerificationIllegalBody` **同型**（三处都不可省）
+ *
+ * 1. **只认结构化 `code` + `msg` 两个键**，**绝不扫** `displayMsg` / `displayTips` /
+ *    正文 —— 腿③ 之所以出错，正是因为它扫了报文里**所有**地方。
+ * 2. `code` 用**精确值** `11128`（负向前瞻挡 `111280` / `11128.5`），不是子串。
+ * 3. 与渠道校验那档一样**各自排除**（早退各写一条），因为它们是**两个**不同的
+ *    子原因、同一个 `code`；少一条就回到「同码不同族被混为一谈」那个老问题上。
+ *
+ * ⚠️ **判窄不是为了放行真拦截**：`code:11140` 与内容级 11128 的处置**本来就不同**
+ * （前者是账号级、该冷却；后者换句即通、绝不能冷却）。排掉它之后，
+ * 腿③ 只对**真正的 11140 / 安全审核**报文生效 —— 这正是腿③ 的本意。
+ */
+const CONTENT_BLOCKED_CODE = /"code"\s*:\s*"?11128(?![\d.])/iu
+const CONTENT_BLOCKED_MSG =
+  /"m(?:sg|essage)"\s*:\s*"[^"]{0,200}?illegal\s+api\s+invocation/iu
+
+/** 内容级 `11128` 的判定（见 {@link CONTENT_BLOCKED_MSG} 的事故史）。 */
+function isContentBlockedIllegalBody(body: string): boolean {
+  return CONTENT_BLOCKED_CODE.test(body) && CONTENT_BLOCKED_MSG.test(body)
+}
+
 /**
  * 渠道校验（11128）+ `request illegal` 形态的判定。
  *

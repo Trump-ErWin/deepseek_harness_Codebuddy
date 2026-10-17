@@ -78,38 +78,87 @@ function headersOf(cred: Record<string, unknown>, site: typeof SITES[number]): R
   }
 }
 
+/**
+ * ⚠️⚠️ **`11128` 有两个子原因，`code` 完全相同，只有 `msg` 不同**（2026-10-18，IKLYCT 取证时踩到）：
+ * - `Illegal API invocation from an unapproved channel` = **内容级**（本文件要治的）
+ * - `request illegal` = **渠道校验**（IKM7SG：按账号要求三头，缺任一即 400）
+ *
+ * 取证第一版探针是**轮换账号**的，于是把「某账号要求三头」读成了内容指纹的
+ * 匹配语义，实测出「51 字符前缀被拦、69 字符超集反而放行」这种**非单调**的假结论
+ * —— 若照它定 `find` 的长度，就会登记一条覆盖不全的规则（症状：仍有变体被拦，
+ * 且症状与「完全没修」同形）。
+ *
+ * ⇒ 下面 `probe()` 做三件事，缺一不可：
+ *   ① **基线筛账号**：第一次调用先把 `firstCredential()` 固定下来，后续全部用**同一个**；
+ *   ② **分开计数**：`kind: 'CHANNEL'` 的结果**不算**内容级命中，断言里单列；
+ *   ③ **msg 逐格可见**：报错信息里带上 `msg`，便于人核对归属。
+ *
+ * ⚠️ `firstCredential()` 本来就恒返回**同一个**账号（原实现已如此），所以
+ * 「轮换账号」是取证脚本的做法、不是本文件的行为 —— 本文件在这三点上更强：
+ * 它把 `msg` 带进断言，**从断言层面**区分两类 11128，而不只是靠人读日志。
+ */
+type ProbeKind = 'OK' | 'INLINE' | 'CONTENT' | 'CHANNEL' | 'OTHER'
+
+interface ProbeResult {
+  /** 「**内容级**被拦」——只有这一种才是本文件要测的。 */
+  blocked: boolean
+  code?: string
+  kind: ProbeKind
+  /** 断言失败时打印用（不含凭据）。 */
+  detail: string
+}
+
+/** 账号只解析一次并固定：见上方「11128 有两个子原因」的说明。 */
+let pinnedCredential: Record<string, unknown> | undefined
+
+function classifyBody(status: number, body: string): { kind: ProbeKind; code?: string; detail: string } {
+  if (status === 200) {
+    // 200 里也可能内嵌错误帧（IKJNA1 记录过这种形态）
+    const code = /"code":(\d+)/.exec(body)?.[1]
+    if (code === undefined) return { kind: 'OK', detail: '200' }
+    return {
+      kind: 'INLINE', code,
+      detail: `HTTP 200 但流内含 code ${code}：${body.replace(/\s+/g, ' ').slice(0, 140)}`,
+    }
+  }
+  const code = /"code":(\d+)/.exec(body)?.[1]
+  const msg = /"msg":"([^"]*)/.exec(body)?.[1] ?? ''
+  const detail = `HTTP ${status} code=${code ?? '?'} msg=${msg || '(无 msg)'}`
+  if (code === '11128') {
+    return /unapproved channel/i.test(msg)
+      ? { kind: 'CONTENT', code, detail }
+      : { kind: 'CHANNEL', code, detail }
+  }
+  return { kind: 'OTHER', code, detail }
+}
+
 async function probe(
   messages: unknown[],
   site: typeof SITES[number] = SITES[0],
-): Promise<{ blocked: boolean; code?: string }> {
-  const { cred } = firstCredential()
+): Promise<ProbeResult> {
+  pinnedCredential ??= firstCredential().cred
   const res = await fetch(`${site.endpoint}/v2/chat/completions`, {
-    method: 'POST', headers: headersOf(cred, site),
+    method: 'POST', headers: headersOf(pinnedCredential, site),
     // ⚠️ `stream:true` **必须发**：两端点对非流式请求都回
     // `400 / code 11101 Non-stream chat request is currently not supported`，
     // 不带它会把「不支持非流式」误读成风控拦截（IKLS2L 探针第一版就踩了）。
     body: JSON.stringify({ model: MODEL, messages, stream: true, max_tokens: 16 }),
   })
-  if (!res.ok) {
-    const body = await res.text()
-    return { blocked: true, code: /"code":(\d+)/.exec(body)?.[1] }
-  }
-  // 200 也可能是流内错误帧（IKJNA1 记录过这种形态）
-  const reader = res.body!.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
-  for (;;) {
-    const { value, done } = await reader.read()
-    if (done === true) break
-    buf += decoder.decode(value, { stream: true })
-    for (const line of buf.split('\n')) {
-      const t = line.trim()
-      if (!t.startsWith('data:')) continue
-      const p = t.slice(5).trim()
-      if (p.includes('"code"') && !p.includes('chat.completion.chunk')) return { blocked: true }
-    }
-  }
-  return { blocked: false }
+  const body = await res.text()
+  const { kind, code, detail } = classifyBody(res.status, body)
+  return { blocked: kind === 'CONTENT' || kind === 'INLINE', code, kind, detail }
+}
+
+/**
+ * 断言「被**内容级**拦截」。
+ *
+ * ⚠️ `CHANNEL`（渠道校验）**不算**通过也不算失败：它是**账号**属性，与本条指纹无关。
+ * 若它在一次真实运行里出现，说明该账号要求三头（IKM7SG）—— 换账号重跑，
+ * **绝不能**把它读成「这条指纹生效/失效」。
+ */
+function expectContentBlocked(r: ProbeResult): void {
+  expect(r.detail, `渠道校验（${r.kind}）不是内容级拦截：换个账号重跑，别把它读成指纹结论`).toMatch(/unapproved channel/)
+  expect(r.code).toBe('11128')
 }
 
 describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：角色矩阵（2026-10-12 实测依据）', () => {
@@ -129,7 +178,8 @@ describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：角色矩阵
       { role: 'assistant', content: trigger },
       { role: 'user', content: 'reply OK' },
     ])
-    expect(r.blocked).toBe(true)
+    expect(r.blocked, `assistant 正文应被拦，但拿到的是 ${r.detail}`).toBe(true)
+    expectContentBlocked(r)
   }, 60_000)
 
   it('改写该句后放行（证明「改写」是有效修法，而不只是「恰好躲过」）', async () => {
@@ -190,8 +240,8 @@ describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：Claude Code 
     async (_name, site) => {
       const blocked = await probe(
         [{ role: 'system', content: CLAUDE_TRIGGER }, { role: 'user', content: 'reply OK' }], site)
-      expect(blocked.blocked, `${site.name}: 身份句实测应被拦`).toBe(true)
-      expect(blocked.code).toBe('11128')
+      expect(blocked.blocked, `${site.name}: 身份句实测应被拦，但拿到的是 ${blocked.detail}`).toBe(true)
+      expectContentBlocked(blocked)
       // 改写是**有效修法**，不只是「恰好躲过」：同一位置换等义措辞即 200。
       const fixed = await probe(
         [{ role: 'system', content: CLAUDE_REWRITE }, { role: 'user', content: 'reply OK' }], site)
@@ -203,7 +253,8 @@ describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：Claude Code 
     async (_name, site) => {
       const blocked = await probe(
         [{ role: 'system', content: SDK_VARIANT }, { role: 'user', content: 'reply OK' }], site)
-      expect(blocked.blocked).toBe(true)
+      expect(blocked.blocked, `${site.name}: SDK 变体实测应被拦，但拿到的是 ${blocked.detail}`).toBe(true)
+      expectContentBlocked(blocked)
       const fixed = await probe([{
         role: 'system',
         content: SDK_VARIANT.replace(CLAUDE_TRIGGER, CLAUDE_REWRITE),
@@ -218,7 +269,8 @@ describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：Claude Code 
       { role: 'assistant', content: CLAUDE_TRIGGER },
       { role: 'user', content: 'reply OK' },
     ])
-    expect(r.blocked).toBe(true)
+    expect(r.blocked, `assistant 正文应被拦，但拿到的是 ${r.detail}`).toBe(true)
+    expectContentBlocked(r)
   }, 60_000)
 
   /**
@@ -244,14 +296,17 @@ describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：Claude Code 
     ['后接长正文', `${CLAUDE_TRIGGER}\n\n${'padding. '.repeat(50)}`],
   ])('★ 锚点实测：%s ⇒ **仍被拦**（后缀自由，前导字符一个都不容忍）', async (_label, system) => {
     const r = await probe([{ role: 'system', content: system }, { role: 'user', content: 'reply OK' }])
-    expect(r.blocked).toBe(true)
+    expect(r.blocked, `后缀自由应仍被拦，但拿到的是 ${r.detail}`).toBe(true)
+    expectContentBlocked(r)
   }, 60_000)
 
   it('★ 逐字符匹配：少一个字母放行、多一个字母仍被拦', async () => {
     const fewer = CLAUDE_TRIGGER.replace(/Claude$/, 'Claud')
     const more = `${CLAUDE_TRIGGER}X`
     expect((await probe([{ role: 'system', content: fewer }, { role: 'user', content: 'reply OK' }])).blocked).toBe(false)
-    expect((await probe([{ role: 'system', content: more }, { role: 'user', content: 'reply OK' }])).blocked).toBe(true)
+    const moreResult = await probe([{ role: 'system', content: more }, { role: 'user', content: 'reply OK' }])
+    expect(moreResult.blocked).toBe(true)
+    expectContentBlocked(moreResult)
   }, 90_000)
 
   it('★ 第三个常量（`Claude agent`）实测**放行** ⇒ 刻意不登记它', async () => {
@@ -267,6 +322,116 @@ describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：Claude Code 
       { role: 'user', content: CLAUDE_TRIGGER },
       { role: 'user', content: 'reply OK' },
     ])
+    expect(r.blocked).toBe(false)
+  }, 60_000)
+})
+
+/**
+ * ## 第三条指纹：Claude Code system 的**反馈句**（Gitee issue IKLYCT，2026-10-18）
+ *
+ * ```
+ * To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues
+ * ```
+ *
+ * ### 为什么这一条比身份句更严重
+ *
+ * 身份句只有 cc-switch 的 `mrt()` 探测路径漏传前缀时才注入（实测约 34% 窗口）；
+ * 本句属于 Claude Code system prompt 的**固定段落** —— 客户端把默认 system
+ * 整份发过来就**必然**带上 ⇒ **漏登记 = 必然命中**。用户侧实测单日白撞 647 次。
+ *
+ * ### ⚠️⚠️ 本节两端点**各测一遍**（issue 的「未验证项」由此结清）
+ *
+ * issue 只验证了 `buddy` 一端，`workbuddy` 因限流未测。下面对 `SITES` 两站都跑 ——
+ * 两站共用 `BuddyAdapter` 类但**产品配置与网关不同** ⇒「一站过了」推不出另一站也过。
+ *
+ * ### ⚠️ 本条的 `find` 长度由「砍掉半句」那两格定死
+ *
+ * 实测砍掉前半或砍掉后半都**放行** ⇒ 子串本身不触发 ⇒ `find` 必须写整句。
+ * 照抄别条 find 的长度会漏改写，而漏改写的症状是「登记了却仍每轮 400」，极难归因。
+ *
+ * ### ⚠️ 锚点是**位置无关**（与身份句的行首锚定相反）
+ *
+ * 「锚点结论不可跨条推用」这条纪律在这里第二次被印证：照身份句那条的结论
+ * 写探针（前接前言就放行）会得到**假阴性**，据此删掉登记就重开这个 bug。
+ */
+describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：Claude Code 反馈句（IKLYCT 实测依据）', () => {
+  const FEEDBACK_TRIGGER = 'To give feedback, users should report the issue at '
+    + 'https://github.com/anthropics/claude-code/issues'
+  const FEEDBACK_REWRITE = 'To give feedback, users should report the issue at the project issue tracker'
+
+  it.each(SITES.map((s) => [s.name, s] as const))(
+    '★ %s：整句被拦，改写后放行（本条登记的全部依据；issue 未验证的 workbuddy 由这一格结清）',
+    async (_name, site) => {
+      const blocked = await probe(
+        [{ role: 'system', content: FEEDBACK_TRIGGER }, { role: 'user', content: 'reply OK' }], site)
+      expect(blocked.blocked, `${site.name}: 整句实测应被拦，但拿到的是 ${blocked.detail}`).toBe(true)
+      expectContentBlocked(blocked)
+      // 改写是**有效修法**，不只是「恰好躲过」：同一位置换等义措辞即 200。
+      const fixed = await probe(
+        [{ role: 'system', content: FEEDBACK_REWRITE }, { role: 'user', content: 'reply OK' }], site)
+      expect(fixed.blocked, `${site.name}: 改写后应放行`).toBe(false)
+    }, 120_000)
+
+  it.each([
+    ['前接 Note:', `Note: ${FEEDBACK_TRIGGER}`],
+    ['前接行首装饰', `  - ${FEEDBACK_TRIGGER}`],
+    ['后接换行文本', `${FEEDBACK_TRIGGER}\n后接无关文本`],
+    ['全大写', FEEDBACK_TRIGGER.toUpperCase()],
+  ])('★ 锚点实测：%s ⇒ **仍被拦**（该指纹位置无关，不是行首锚定）', async (_label, system) => {
+    const r = await probe([{ role: 'system', content: system }, { role: 'user', content: 'reply OK' }])
+    expect(r.blocked, `位置无关应仍被拦，但拿到的是 ${r.detail}`).toBe(true)
+    expectContentBlocked(r)
+  }, 60_000)
+
+  it.each([
+    ['砍掉前半', 'users should report the issue at https://github.com/anthropics/claude-code/issues'],
+    ['砍掉后半', 'To give feedback, users should report the issue'],
+    ['只留 URL', 'https://github.com/anthropics/claude-code/issues'],
+    ['换 org/repo', FEEDBACK_TRIGGER.replace('anthropics/claude-code', 'other/repo')],
+    ['换域名', FEEDBACK_TRIGGER.replace('anthropics/claude-code', 'example/project')],
+    ['改一个词', FEEDBACK_TRIGGER.replace('report the issue', 'file the issue')],
+  ])('★ 逐字符实测：%s ⇒ **放行**（`find` 必须写整句，且不得泛化）', async (_label, system) => {
+    const r = await probe([{ role: 'system', content: system }, { role: 'user', content: 'reply OK' }])
+    expect(r.blocked).toBe(false)
+  }, 60_000)
+
+  it('★ assistant **正文**也被拦（历史重放路径的成因，与另两条同型）', async () => {
+    const r = await probe([
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: FEEDBACK_TRIGGER },
+      { role: 'user', content: 'reply OK' },
+    ])
+    expect(r.blocked, `assistant 正文应被拦，但拿到的是 ${r.detail}`).toBe(true)
+    expectContentBlocked(r)
+  }, 60_000)
+
+  it('★ 非首位 system 同样被拦（故所有 system 都要改）', async () => {
+    const r = await probe([
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'user', content: 'x' },
+      { role: 'system', content: FEEDBACK_TRIGGER },
+      { role: 'user', content: 'reply OK' },
+    ])
+    expect(r.blocked, `非首位 system 应被拦，但拿到的是 ${r.detail}`).toBe(true)
+    expectContentBlocked(r)
+  }, 60_000)
+
+  it.each([
+    ['user', [{ role: 'user', content: `note: ${FEEDBACK_TRIGGER}` }]],
+    ['assistant 的 reasoning_content', [{ role: 'assistant', content: 'Noted.', reasoning_content: FEEDBACK_TRIGGER }]],
+    ['tool 结果', [
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: `docs: ${FEEDBACK_TRIGGER}` },
+    ]],
+  ])('★ %s 含反馈句**不拦**（这三格刻意不改写，改了只是篡改证据）', async (_label, tail) => {
+    const messages: unknown[] = [
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'user', content: 'hi' },
+      ...tail,
+      { role: 'user', content: 'reply OK' },
+    ]
+    const r = await probe(messages)
     expect(r.blocked).toBe(false)
   }, 60_000)
 })
