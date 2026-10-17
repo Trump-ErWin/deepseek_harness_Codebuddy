@@ -398,13 +398,13 @@ describe('★ aggregate.catalog 的组装（只读、零余额查询）', () => 
     })
   }
 
-  it('每个候选都带 provider / realId / realName / 倍率 / 是否补丁 / 是否被拒', async () => {
+  it('每个候选都带 provider / realId / realName / 倍率 / 是否补丁 / 三态 / 是否接入折算', async () => {
     const adapter = makeAdapter(
       () => ({ 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }),
       () => {},
     )
     const catalog = await adapter.describeCatalog()
-    const entry = catalog.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
+    const entry = catalog.models.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
     expect(entry).toBeDefined()
     expect(entry!.name).toBe('DeepSeek V4.1 Flash')
     expect(entry!.candidates).toEqual([
@@ -414,7 +414,11 @@ describe('★ aggregate.catalog 的组装（只读、零余额查询）', () => 
         realName: 'Deepseek-V4.1-Flash · x0.15',
         price: 0.15,
         viaPatch: false,
+        // ⚠️ 2026-10-15 起 `rejected` 的语义**收窄**为「当前不参与轮换」，且新增
+        //    `state`（三态权威）与 `expiryWired`（客户端据此决定「关掉时写哪张表」）。
         rejected: true,
+        state: 'rejected',
+        expiryWired: true,
       },
     ])
   })
@@ -428,10 +432,13 @@ describe('★ aggregate.catalog 的组装（只读、零余额查询）', () => 
     expect(probeCalls).toBe(0)
   })
 
-  it('未被拒的候选 rejected 为 false', async () => {
+  it('未被拒的候选 rejected 为 false、state 为 allowed', async () => {
     const adapter = makeAdapter(() => ({}), () => {})
     const catalog = await adapter.describeCatalog()
-    expect(catalog[0]!.candidates[0]!.rejected).toBe(false)
+    expect(catalog.models[0]!.candidates[0]!.rejected).toBe(false)
+    expect(catalog.models[0]!.candidates[0]!.state).toBe('allowed')
+    // ⚠️ 缺省排序模式 = 临期序（升级前行为）。
+    expect(catalog.orderMode).toBe('expiry')
   })
 
   it('补丁来源的候选 viaPatch 为 true', async () => {
@@ -506,36 +513,27 @@ describe('★ aggregate.catalog 的组装（只读、零余额查询）', () => 
     phase = 2
     const cached = await adapter.describeCatalog()
     expect(listModelsCalls).toBe(afterFirst)
-    expect(cached.some((m) => m.canonicalId === 'm2')).toBe(false)
+    expect(cached.models.some((m) => m.canonicalId === 'm2')).toBe(false)
 
     // ★ 带 force 的调用（= 用户点「刷新」）必须**重推目录**并看到 m2
     const forced = await adapter.describeCatalog(true)
     expect(listModelsCalls).toBeGreaterThan(afterFirst)
-    expect(forced.some((m) => m.canonicalId === 'm2')).toBe(true)
+    expect(forced.models.some((m) => m.canonicalId === 'm2')).toBe(true)
   })
 })
 
-describe('★ 面板不得列出「未接入临期折算」的候选（用户报障 2026-10-07）', () => {
-  /**
-   * 造一个「已接入 + 未接入」混合目录的适配器。
-   *
-   * ⚠️ 用户报障（截图）：聚合面板的候选子列表里出现了 **lobsterai**（还有 raccoon、
-   * trae）—— 而它们**当时不在** `WIRED_EXPIRY_PROVIDERS` 里。
-   *
-   * 探针实测（真实链路）：
-   * - **轮换**：只发往 buddy ✅（未接入渠道经 `expiryProbe` 得 `UNUSABLE`、被排除）
-   * - **面板**：却列出 `buddy, lobsterai` ❌
-   *
-   * ⇒ 面板在**撒谎**：显示一个永远不会被用的渠道，用户看到后去关它
-   *（点「参与轮换」）也毫无作用。
-   *
-   * ## ⚠️ 用户后续质疑导致白名单**扩大**（2026-10-07 晚）
-   *
-   * 用户：「如果有临期积分却进不去，那么应该考虑白名单是否排除了有临期积分的 provider」。
-   * 核实后确认 `lobsterai` / `trae` **都有** `deductionEndTime` ⇒ 已加入白名单。
-   * ⇒ 本段用例的「应被过滤」例子改用 **`raccoon`**（它确实没有到期字段，
-   * `raccoon-credits.ts` 的 `makePackage` 三个时间字段全空）。
-   */
+/**
+ * ★★ 未接入临期折算的渠道：候选**可见**、默认不参与、可手工打开（用户 2026-10-15，issue IKL7F9）。
+ *
+ * ⚠️⚠️ **本节的方向与 2026-10-07 那版相反**。当时用户报障「面板里出现了永远不会被用的
+ * 渠道」，于是加了「只列已接入候选」的过滤。现在用户要的是「让它们进聚合、默认拒绝、
+ * 手工打开则允许」⇒ 那条过滤**必须删掉**，否则用户在面板里**根本看不到**要打开的候选
+ *（「手工打开」这个功能无从操作）。
+ *
+ * ⚠️ 那条「面板在撒谎」的顾虑改由**三态**承担：未接入且未打开的候选显示为
+ * 「无临期积分 · 默认不参与」 ⇒ 面板依然说真话，只是把选择权交给用户。
+ */
+describe('★★ 未接入渠道的候选：可见、默认不参与、可手工打开（2026-10-15）', () => {
   const makeMixed = () => {
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
@@ -555,26 +553,69 @@ describe('★ 面板不得列出「未接入临期折算」的候选（用户报
     return new AggregateAdapter(ctx, { accountPool: pool, expiryProbe: async () => 100 })
   }
 
-  it('★ 只列已接入的候选（raccoon 不得出现；lobsterai 现在**应该**出现）', async () => {
+  it('★ 候选**全部**列出（含未接入的 raccoon），并逐条带三态', async () => {
     const catalog = await makeMixed().describeCatalog()
-    const entry = catalog.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
-    expect(entry, '该模型应存在（它有 buddy 这个已接入候选）').toBeDefined()
+    const entry = catalog.models.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
+    expect(entry, '该模型应存在（buddy 已接入）').toBeDefined()
     const providers = entry!.candidates.map((c) => c.provider)
     expect(providers).toContain('buddy')
-    expect(providers, 'raccoon 无到期字段 ⇒ 不得出现在面板里').not.toContain('raccoon')
-    // ⚠️ lobsterai 已接入折算（`deductionEndTime`）⇒ **应该**出现。
-    //    这条断言在用户质疑后的修正里**方向反转了**（原先断言它不得出现）。
-    expect(providers, 'lobsterai 有 deductionEndTime ⇒ 应参与轮换').toContain('lobsterai')
+    expect(providers, '★ raccoon 未接入折算，但**仍要列出来**（用户要手工打开它）').toContain('raccoon')
+    expect(providers).toContain('lobsterai')
+    // 逐条三态：已接入 ⇒ allowed；未接入 ⇒ default-rejected（**默认不参与**）
+    // ⚠️ `lobsterai` **已接入**折算（`aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`，
+    //    2026-10-07 用户质疑后核实加入）⇒ 它是 `allowed`，别按「未接入」写期望值。
+    //    本节真正要举的「未接入」例子是 `raccoon`（无到期字段）。
+    expect(WIRED_EXPIRY_PROVIDERS, '前置事实：lobsterai 已接入').toContain('lobsterai')
+    expect(WIRED_EXPIRY_PROVIDERS, '前置事实：raccoon 未接入').not.toContain('raccoon')
+    const byProvider = Object.fromEntries(entry!.candidates.map((c) => [c.provider, c.state]))
+    expect(byProvider.buddy).toBe('allowed')
+    expect(byProvider.lobsterai).toBe('allowed')
+    expect(byProvider.raccoon).toBe('default-rejected')
   })
 
-  it('★ 过滤后仍保留已接入的候选（不能把整条候选删光）', async () => {
+  it('★ 未接入且未打开 ⇒ `rejected` 为 true（语义 = 当前不参与），`expiryWired` 为 false', async () => {
     const catalog = await makeMixed().describeCatalog()
-    const entry = catalog.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
-    expect(entry!.candidates.map((c) => c.provider).sort()).toEqual(['buddy', 'lobsterai'])
+    const entry = catalog.models.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
+    const raccoon = entry!.candidates.find((c) => c.provider === 'raccoon')!
+    expect(raccoon.rejected).toBe(true)
+    expect(raccoon.expiryWired).toBe(false)
+    // 已接入的候选相反：参与、且标为已接入。
+    const buddy = entry!.candidates.find((c) => c.provider === 'buddy')!
+    expect(buddy.rejected).toBe(false)
+    expect(buddy.expiryWired).toBe(true)
   })
 
-  it('★ 只有未接入候选的模型**整条不出现**（与既有模型层过滤一致）', async () => {
-    // 构造一个只有 lobsterai 的模型（如 `sn-deepseek-*`）—— 它不该出现在面板里。
+  it('★ 手工打开某条未接入候选 ⇒ 它变成 allowed（白名单真的被读）', async () => {
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy' }, { id: 'raccoon' }],
+        listModels: async (provider: string) => [
+          { id: 'deepseek-v4.1-flash', name: `Deepseek-V4.1-Flash · ${provider}` },
+        ],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => (async function* () { /* noop */ })(),
+      },
+    } as never
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: pool,
+      expiryProbe: async () => 100,
+      allowed: () => ({ 'deepseek-v4-1-flash': { raccoon: { 'deepseek-v4.1-flash': true } } }),
+    })
+    const catalog = await adapter.describeCatalog()
+    const entry = catalog.models.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
+    const raccoon = entry!.candidates.find((c) => c.provider === 'raccoon')!
+    expect(raccoon.state, '白名单命中 ⇒ 参与轮换').toBe('allowed')
+    expect(raccoon.rejected).toBe(false)
+  })
+
+  it('★ 只有未接入候选的模型**也在**目录里（`:636` 的过滤已删）', async () => {
+    // ⚠️ 方向反转：升级前它「整条不该出现」，现在它**必须**出现 —— 否则用户在面板里
+    //    打开候选之后，选择器里仍然看不到这个模型（手工打开白做）。
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
@@ -592,22 +633,28 @@ describe('★ 面板不得列出「未接入临期折算」的候选（用户报
     } as never
     const adapter = new AggregateAdapter(ctx, { accountPool: pool, expiryProbe: async () => 100 })
     const catalog = await adapter.describeCatalog()
-    const ids = catalog.map((m) => m.canonicalId)
+    const ids = catalog.models.map((m) => m.canonicalId)
     expect(ids).toContain('glm-5-3')
-    expect(ids, '只有未接入候选的模型整条不该出现').not.toContain('sn-only-model')
+    // ⚠️ 规范键由 `canonicalKeyFor` 归一（`SN Only` → 连字符化），故这里**按前缀**断言
+    //    而不是写死我猜的那个字符串 —— 写死会变成一条看起来像「功能没做」的假失败。
+    expect(ids.some((id) => id.includes('only')), '★ 只有未接入候选的模型现在**也**要出现')
+      .toBe(true)
   })
 
   it('★ 面板与真实轮换的候选集必须一致（不能一个说会用一个说不用）', async () => {
-    // ⚠️ 这条是**不变式**：面板列出的候选必须恰好是「目录里有 **且** 已接入折算」的那些。
-    //    两者用同一份判据（`WIRED_EXPIRY_PROVIDERS`），否则就是「面板撒谎」。
-    // ⚠️ 期望值**从白名单派生**而不是硬编码渠道名 —— 硬编码会让「新增一个已接入渠道」
-    //    变成假失败（本仓库有专门教训：接线类断言写死整串会随每次扩展假失败）。
+    // ⚠️ 这条仍是**不变式**，但判据换了：面板列出的候选现在 = **目录里的全部候选**
+    //   （不再按「已接入」过滤）。「哪一个真的会参与」由每条候选自己的 `state` 表达 ——
+    //    故本用例同时锁住「候选集一致」与「参与集 = state === allowed」这两件事。
     const adapter = makeMixed()
     const catalog = await adapter.describeCatalog()
-    const listed = new Set(catalog.flatMap((m) => m.candidates.map((c) => c.provider)))
-    const inCatalog = ['buddy', 'lobsterai', 'raccoon']
-    const expected = inCatalog.filter((p) => WIRED_EXPIRY_PROVIDERS.includes(p))
-    expect([...listed].sort()).toEqual(expected.sort())
+    const listed = new Set(catalog.models.flatMap((m) => m.candidates.map((c) => c.provider)))
+    expect([...listed].sort()).toEqual(['buddy', 'lobsterai', 'raccoon'])
+    // 参与集必须恰好是已接入的那些（未接入的默认不参与）。
+    const participating = new Set(
+      catalog.models.flatMap((m) => m.candidates.filter((c) => c.state === 'allowed').map((c) => c.provider)),
+    )
+    const expected = ['buddy', 'lobsterai', 'raccoon'].filter((p) => WIRED_EXPIRY_PROVIDERS.includes(p))
+    expect([...participating].sort()).toEqual(expected.sort())
     // 防「白名单把三个都收了」让这条变成恒真：raccoon 必须**不在**白名单里。
     expect(WIRED_EXPIRY_PROVIDERS).not.toContain('raccoon')
   })

@@ -654,13 +654,13 @@ officeace 的订阅**每个积分桶都带 `expiresAt`**（ISO 8601）⇒ 走「
 
 **根因**：适配器一律打硬编码的 `OFFICEACE.defaultBaseUrl`
 （`https://officeace.cn-southwest-2.huaweicloud-agentarts.com`），
-而华为**按账号下发专属网关**（本机是 `modelgw-0004.officeace.cn-southwest-2...`）。
+而华为**按账号下发专属网关**（本机是 `modelgw-00xx.officeace.cn-southwest-2...`）。
 同一个 Basic 凭据实测：
 
 | host | `/v2/models` | `/v2/chat/completions` |
 |---|---|---|
 | `officeace…`（硬编码，修复前）| **401** `APIG.1009 AppKey or AppSecret is invalid` | **401** |
-| `modelgw-0004.officeace…`（凭据里）| **200** | **200** |
+| `modelgw-00xx.officeace…`（凭据里）| **200** | **200** |
 
 **后果链（全程零日志）**：`probe` 401 ⇒ `listModels` 返回 `[]` ⇒ 选择器空分组；
 而空返回与「无账号」**同形** ⇒ 目录门控把**整个 provider 隐藏**。
@@ -940,6 +940,159 @@ assistant 消息只有 `reasoning` + `text` 两块、**没有任何 `tool/call` 
 ⚠️ 余额**读不到实时值**：`/v1/subscription` 仍要求 IAM/V11 签名（当前 `APIG.0301`）
 ⇒ `fetchSubscriptionSummary` 回落到本地缓存（`stale: true`），**无法据此核对扣费**。
 
+## 5.10 ⚠️⚠️ Gitee issue IKM741（2026-10-16）：账号池与凭据**双向脱节** + 面板读数说谎
+
+**用户报障**：OfficeAce 的账号池与凭据文件**双向脱节**，面板显示的**积分与实际
+凭据状态无关**。本机实测 4 条账号 + 4 份凭据 ⇒ **两个方向同时存在**：
+
+| 方向 | 含义 | 后果 |
+|---|---|---|
+| **A** 有账号、无凭据（3 条） | 登录中止留下占位条目 | 面板显示「凭据未配置」的幽灵卡片；聚合折算恒 `UNUSABLE`（**静默失效**）；**回落路径拿共享的一次性 token 去续期 ⇒ 跨账号烧掉它** |
+| **B** 有凭据、无账号（3 条） | 登录中止留下孤儿凭据 | **永不清理**（没有账号条目 ⇒ 没有任何入口会 unset 它） |
+
+### 复现（用户原话）
+
+> 「**打开认证页面了但是没完成授权就把授权页关了的**，好像是没回调 callback，
+> 关闭设置页面再打开那种账号会出现在列表**还要手动删一次**」
+
+### 根因（本机逐条探针实测确证，**不是**照 issue 推断改代码）
+
+| # | 缺陷 | 实测确证 | 严重度 |
+|---|---|---|---|
+| 1 | `readCredential(ref, credentials)` 的兜底写成 `readStoredCredential()`（**漏传 `ref`**）⇒ 回落到**全局** `session.json` | 库里没有该 ref ⇒ 读到别的账号的 `GLOBAL-KEY` | ⚠️⚠️ **跨账号烧一次性 refresh_token** |
+| 2 | 同一条回落也用在续期路径 ⇒ **每个坏账号都拿同一个 token**去续 | 探针抓到发往 STS 的 `refresh_token` = `GLOBAL-REFRESH`（= 别人的） | ⚠️⚠️ 一个坏号堵掉好号的路 |
+| 3 | `fetchSubscriptionSummary` 的 `try/catch` 之后**无条件**落到该 ref 的缓存 | 凭据不存在仍报出 `6493.32`（**两天前的快照**） | ⚠️⚠️ **面板会说谎** |
+| 4 | `officeaceExpiry` **不判 `stale`** ⇒ 陈旧快照被当实时读数参与排序 | 返回 `1792165834998`（真实时刻）而**注释逐字写着**「只拿到缓存 ⇒ `UNUSABLE`」 | ⚠️ 临期序被污染 |
+| 5 | 登录中止 ⇒ 占位条目**永久残留**，没有任何入口清理 | `account.create` 后 5 次 `login.poll`、凭据键 `[]`、条目仍在 | ⚠️ 用户要手动删 |
+| 6 | **B 档孤儿凭据**（有凭据、无账号）**永无入口清理** | 探针：落库开始时条目 = 1、删卡片后键 = `[]`、**落库完成时条目 = 0 而键 = `[OFFICEACE_ACCOUNT_…]`** | ⚠️ issue 影响第 3 条（本机 3 条 × 2.4 KB） |
+| 7 | **`NODE_ENV` 让 officeace 的 e2e 恒不可能通过** | e2e config 下 `NODE_ENV` 也是 `test` ⇒ 断路器恒 `false` | ⚠️ 守卫**从未生效**过 |
+
+⚠️ 缺陷 1 与 2 **同一个根因**（AGENTS.md 的「位置/键错位」防线复发）；
+缺陷 3 与 4 也**同一个根因**（`stale` 这个判据字段被丢在半路）；
+缺陷 5 与 6 正是 issue 标题说的**「双向残留」的两向**。
+
+### 修法（五处，每条都有会红的判据 + 变异验证）
+
+| # | 修法 | 落点 |
+|---|---|---|
+| 1+2 | 兜底改为 `readStoredCredential(ref)`（**按 ref**）。单凭据老用户零行为变化 —— 那条腿由无参调用点承担 | `officeace-auth.ts` 的 `readCredential` |
+| 3 | **读数与凭据绑定**：凭据不存在 ⇒ `undefined`（如实报「未登录」），**不得**用历史快照充数 | `officeace-auth.ts` 的 `fetchSubscriptionSummary` |
+| 4 | 折算层补 `if (summary.stale === true) return UNUSABLE`（让实现追上它自己的注释） | `aggregate-expiry.ts` 的 `officeaceExpiry` |
+| 5 | 新增**收口**：`sweepAbandonedOfficeAceLogins()`，在 `account.list`（用户能看见那张卡片的唯一入口）时跑 | `jet-hub-rpc.ts` |
+| 6 | **B 档孤儿凭据**：落库**之后**立刻判「账号条目是否已被删除」，是则 unset 刚写下的那份凭据 | `jet-hub-rpc.ts` 的 `exchangeOfficeAceLogin` |
+| 7 | e2e 运行环境与单测区分（配置层） | `vitest.e2e.config.ts` |
+
+### ⚠️⚠️ 缺陷 6 的修法：**刻意不做「启动时全量扫描孤儿凭据」**
+
+B 档的**唯一产生路径**是探针实测出来的（不是推测）：
+
+```
+用户点「+ 新建账号」→ 占位条目就位 → 授权 → 宿主开始 persistLogin 落库
+  ⇒ 用户**恰好在此刻**点了「删除」那张卡片
+  ⇒ removeAccount 先 unset（此刻凭据还没写 ⇒ 空操作）再删条目
+  ⇒ persistLogin 随后才把凭据写进去
+  ⇒ 结果：凭据在库里，而没有任何账号条目引用它
+```
+
+⇒ 修法是**在孤儿刚产生的那一刻**按**本次登录的 ref** 精确 unset。
+
+⚠️ **为什么不顺手做个「启动时扫描 `.credentials.yaml`、删掉所有无账号条目的
+`*_ACCOUNT_*` 凭据」**（那看起来更彻底）：它会**误伤备份合并导入** ——
+`importBackup` 是**先写凭据、后合并账号**（`src/backup.ts`：603 的
+`credentials.set` 循环 → 612 的 `pool.mergeAccounts`），两者之间的窗口里，
+即将被合并进来的账号凭据**恰好长得和孤儿一模一样**。一个启动期的全量扫描会把
+它们删掉 ⇒ 用户导入备份后**账号在、凭据没了**。
+⇒ 在「删除不可逆」这条铁律下，**存量孤儿刻意不自动删**（它们只占磁盘、
+不影响功能 —— 对比 A 档的幽灵卡片会误导用户，两者代价不同）。
+
+⚠️ **安全闸**（与 `failLogin` 同源，**不另写一份判据**）：只有 `poolEntryOf`
+返回 `undefined`（**确证**条目不存在）才 unset；返回 `'unknown'`（读池抛错 /
+替身缺方法）时**什么都不做** —— 否则一次读池抖动就会删掉用户刚登好、
+账号也还在的凭据（不可逆）。判据：⑥c。
+
+### ⚠️⚠️ 缺陷 5 的收口判据三条**缺一不可**（第 3 条是安全闸）
+
+| # | 判据 | 漏掉的后果 |
+|---|---|---|
+| 1 | 该条目 provider 是 `officeace` | 动到别的渠道的占位条目 |
+| 2 | 中间态缺失**或**已超过 `DSH_OFFICEACE_PENDING_TTL_MS`（默认 20 分钟 = 客户端 5 分钟轮询上限的 4 倍） | **误杀正在轮询的登录**（用户正常授权反而失败，比原缺陷更糟） |
+| 3 | 该账号的凭据**确实未落库**（复用 `loginCredentialLanded`，**不另写一份**） | **把刚登好的账号连凭据一起删掉**（不可逆；正是 issue 正文点名要防的那条） |
+
+⚠️ **判据只能靠时间**：「用户还没授权完」与「正在轮询」**必须同形** ——
+判成「失败」去清理会删掉正在进行的正常登录（`failLogin` 只在**显式失败**时触发，
+两者分工不重叠）。
+
+⚠️ **收口时机选 `account.list` 而不是新定时器**：本仓库已有「启动首轮 + 30 分钟
+定时器」的续期链，再加一条独立后台链会多一个需要隔离的生命周期
+（`setup-isolation.ts` 记过：后台链在用例结束后继续跑，抢不过 env 覆盖）。
+且 `account.list` 正是「用户能看见幽灵卡片」的唯一路径。**必须放在
+`pool.listAccounts` 之前** —— 否则用户刷新一次仍看到刚删掉的卡片，得再刷一次。
+
+⚠️ 读不到账号池 ⇒ **什么都不做**（不可逆的删除不建立在一次失败的读上）。
+
+### 缺陷 6：e2e 的结构性失效（**「守卫写好了」≠「守卫能跑」**）
+
+`vitest.e2e.config.ts` 下 `NODE_ENV` **也是 `test`**（Vitest 默认，已实测打印），
+而 `src/login.ts` 的 `openIncognitoWindow` 开头有断路器
+`if (process.env.NODE_ENV === 'test') return false`（2026-10-13 为真实污染加的）。
+
+⇒ 两个各自正确的东西叠在一起：`officeace-incognito-login.e2e.spec.ts` 断言
+`openIncognitoWindow(...) === true`，**从写下的那天起就不可能通过**。
+⚠️ **同文件的对照用例走 `openBrowser`（无断路器）⇒ 恒绿**，对比极不明显
+（本机实测：修前无痕那条恒红、对照那条恒绿）。
+
+修法在**配置层**：e2e config 用 `test.env` 把 `NODE_ENV` 标成 `'e2e'`。
+断路器判据**逐字不变**（仍按运行环境一刀切断、仍**不**按 URL 特征打补丁），
+只是给「e2e 是另一种运行环境」这个既有事实一个名字。
+单测侧保护**完全不变**（`vitest.config.ts` 不设它）。
+守卫：`officeace-incognito-login.spec.ts` 的 ⑫（锁三件事：e2e 设了且≠`test`、
+单测**不得**设、断路器仍认 `'test'`）。
+
+⚠️ **该缺陷是「登记了一处守卫」≠「这处守卫有牙」的又一形态** ——
+这次连**能不能跑到**都没人验证过。教训可推广：**加了闸门之后必须真跑一次它**。
+
+### 守卫与验证
+
+- `tests/unit/officeace-ikm741-abandoned-login.spec.ts`（19 条）：①a–①d 兜底按 ref
+  （含 ①d 反面对照：单凭据兼容**不得**被误伤）、②a–②c 读数与凭据绑定
+  （②b 反面：凭据在 ⇒ 陈旧缓存是**正当**离线兜底，不得误伤）、③a–③b 收口、
+  ④a–④c 三条安全闸、⑤a–⑤d 判据边界（**`now` 入参化**，边界确定可测）、
+  **⑥a–⑥c B 档孤儿凭据**（⑥a 回收、⑥b 账号仍在 ⇒ 绝不回收、
+  ⑥c 读池抛错 ⇒ 绝不回收）。
+- `tests/e2e/officeace-abandoned-login.e2e.spec.ts`（7 条，`pnpm test:e2e:officeace-abandoned`）：
+  ① `account.create` 后占位条目就位 + 零凭据 + **真开无痕窗口**（人工判据）；
+  ② 未完成授权 ⇒ 收口；③ 不波及其它渠道；④ **成功登录后 TTL 已过也不得删**；
+  ⑤ 无痕窗口独立验证；⑥ 落库途中删卡片 ⇒ 孤儿凭据被回收；⑦ ⑥ 的对照组。
+  ⚠️ ②③④ 用 `DSH_OFFICEACE_PENDING_TTL_MS=0` + `vi.useFakeTimers({toFake:['Date']})`
+  把「已中止」变成**确定事实**（判据是 `now - at > ttl`，同一毫秒内会算出 `0 > 0 === false`
+  ⇒ 靠 await 走过一毫秒是**不可靠的**，本仓库已实测过同型假绿）。
+
+**变异验证（8 条，逐条 RED + RESTORE-OK）**：
+
+| 变异 | 注入 | 变红 |
+|---|---|---|
+| M1 | 兜底改回 `readStoredCredential()`（缺陷原状） | ①a / ①b / ①c **3 条同时** |
+| M2 | 折算层删掉 `stale` 短路 | ②c 精确 |
+| M3 | 删掉「凭据不存在 ⇒ return undefined」 | ②a 精确 |
+| M4 | 收口删掉「凭据已落库」安全闸 | ④b 精确 |
+| M5 | 收口删掉 TTL 判据 | ④a 精确 |
+| M6 | e2e config 删掉 `NODE_ENV` | ⑫（incognito spec）精确 |
+| M7 | 删掉 B 档孤儿回收 | ⑥a 精确 |
+| M8b | 把「确证不存在」放宽成**连 `unknown` 也回收** | ⑥c 精确 |
+
+⚠️ 变异纪律（本仓库既有教训，本轮各踩一次）：① **CRLF 上 `String.replace` 会静默不生效**
+⇒ M3 首轮报 `ANCHOR-NOT-FOUND`，必须用 `\r\n` 锚点或 `ReadAllText` 重试；
+② **工具摘要被吞会把「有牙」误报成「无输出」** ⇒ M2 首轮无输出，人工复核后确认变红；
+③ ⚠️ **变异「全绿」可能是变异根本没改变行为** —— M8 第一版把判据改成 `!poolEntryOf(...)`，
+而 `'unknown'` 是**真值字符串** ⇒ `!('unknown') === false`，那一格的**行为逐字节未变**，
+19 条全绿是**正确结果**而不是守卫无牙。改用真正改变行为的写法（`|| === 'unknown'`）
+后 ⑥c 立刻精确变红。⇒ 与仓库记的「变异全绿先怀疑变异本身」同一条。
+
+⚠️ **本机取证时已清理的残留**（issue 报告方在报告前已做，本机复核确认）：
+孤儿凭据 3 份、孤儿缓存 6 份已清理；`5F7CAAA2`（唯一账号凭据齐全的那条）保留。
+⚠️ 如实登记：那 3 条账号的 `refresh_token` **已被消费**、凭据**不可恢复**，
+只能删除后重新登录。
+
 ## 6. 待办 / 已知缺口
 
 - ✅ ~~**`glm-5.3` 的上下文窗口未取证**~~ —— **2026-10-15 已取证**：夹逼定在
@@ -968,3 +1121,228 @@ assistant 消息只有 `reasoning` + `text` 两块、**没有任何 `tool/call` 
   判 `ready: true`，与锁定表无关 ⇒ 锁定期间面板显示「就绪」而推理侧抛
   「没有可用账号」。**不是绕过**（不烧积分），是**诚实性**缺口；修它要同时改
   RPC 响应与客户端文案（含 bundle 重建），建议与「每日额度刷新入口」一起做。
+
+### ⚠️ 2026-10-15 更正：上面那份「四处过滤」清单**已过期**（别再照抄）
+
+用户 2026-10-15 的 issue IKL7F9 改变了口径：
+
+| 项 | 2026-10-13 的写法 | 2026-10-15 起 |
+|---|---|---|
+| 未接入渠道的模型**可见性** | 被 `:636` 的模型层过滤**整条剔掉**（连聚合目录都进不去） | **仍然可见**（过滤已删）—— 否则用户在面板里手工打开候选之后，选择器里仍看不到它（打开白做） |
+| 未接入渠道的候选**参不参与轮换** | 折算恒 `UNUSABLE` ⇒ 永不参与 | **默认不参与，但可在聚合面板逐条手工打开**；打开后赋 `NEVER`（参与、排最后） |
+| 过滤点数量 | 「4 处」 | 探测排序（**保留**，它是排序展示不是可见性）、面板候选（**保留**，但改为逐条标三态）、虚拟模型播报（**已删**）、价格后缀（改为「当前参与」三态判据） |
+
+⚠️ **仍然成立的那半句**：「决定某渠道**能否真的被路由到**的，是
+`WIRED_EXPIRY_PROVIDERS`（以及 `credentialExpiry` 的未接入短路），不是
+`AGGREGATE_CHANNELS`」—— 接新渠道仍然要**三处同改**（折算原语 + 白名单 +
+`createProviderExpiry()`）。
+
+⚠️ 但**「候选表里永远没有它」这句已经不对了**：未接入渠道若被用户显式打开
+（白名单），它的候选**真的进候选表**（`expiry = NEVER`）。
+「永远没有它」只对**未打开**的候选成立。
+
+详见 `docs/agent-notes/client-ui.md` 的「聚合的三态门控与手工排序」一节。
+
+
+## ⚠️⚠️ 「未订阅 ModelArts MaaS」的真相：账号没在果办里**开通**；插件给出路文案、**不**自动开通（IKM741 追补，2026-10-16）
+
+### 因果链（**同一身份、同一台机器、同一份代码**，只差一次客户端操作）
+
+| 时刻 | 状态 | `client-permission-validate` 实测 |
+|---|---|---|
+| 20:57 | 用户在果办客户端点「开通/同意」**之前** | `subscription: null` ❌ |
+| 21:16 | 在客户端里操作**之后** | `model_auth_info` 齐全（`model_app_key`/`model_app_secret`/`maas_api_key`），网关从无变成 `modelgw-00xx…` ✅ |
+
+⇒ 「未开通」是**可自动跨过的前置步骤**，不是终态。而修前插件只会回一句
+「账号可能未订阅 ModelArts MaaS」——**那句话没告诉用户怎么办**，用户为此在客户端里摸索了半天。
+
+### 客户端「同意 / 开通」的真实形状（**读客户端源码**取证，非猜测）
+
+- 主机：**`versatile.cn-north-4.myhuaweicloud.com`**，与鉴权/推理凭据用的
+  `agentarts.cn-southwest-2.myhuaweicloud.com` **不是同一台**（混用只会 404）。
+  - 出处：`packages/api/dist/index.js` 的 `iVt()` = `process.env.HUAWEI_CLAW_URL || 'https://versatile.cn-north-4.myhuaweicloud.com'`；
+    `packages/green-package/api/dist/auth/huawei-cas.js` 的 `DEFAULT_SUBSCRIPTION_URL`。
+- **同意**：`GET /v1/agreement?biz_type=officeclaw`（读状态）；未签则
+  `POST /v1/agreement?biz_type=officeclaw`，体逐字来自客户端渲染层
+  （`main-*.js`）：`{ agreement_list: [{ privacy_statement, version, agree_declaration: 1 }] }`。
+  - 客户端同义字段表（`index.js` 的 `V2()`）：`agree_declaration` → `agreement_list` →
+    `signed/is_signed/isSigned/agreement_status/agree_status/accepted/isAccepted/agree_flag`
+    → 下钻 `data/result/agreement/payload`；`WFe` 对 URL 是「先带 `biz_type`、失败再不带」两试。
+- **开通**：`POST /v1/claw/client-subscription`，头
+  `Content-Type: application/json;charset=utf8` + **`x-subscription-type: v2`** +
+  `X-Security-Token`，body `{}`（`promotion_code` 是可选邀请码）；响应
+  `data.model_info ?? data.subscription?.model_info` **就是** MaaS 推理凭据（与 permission-validate 同形状）。
+
+### 插件的实现（`src/officeace-auth.ts`）
+
+`fetchModelInfo` 拿不到 `model_auth_info` 时**不再直接失败**，改走
+`activateOfficeAceSubscription()`：读协议状态 →（未签且有清单）代签 → 开通 → 用响应里的
+`model_info` 填凭据。**成功即结束**，不再打 permission-validate。
+
+三条安全取向（都不是装饰）：
+
+1. **主路径零额外请求**：云侧已给凭据 ⇒ 一个开通请求都不发（`hasModelAuthInfo` 是**唯一致判据**）。
+2. **「认不出来」≠「未签」**：协议状态解析失败时 `signed === undefined`，**绝不代签** ——
+   一次读取失败不该升级成一次代用户同意的写操作。
+3. **代签必须可见**：它是写操作，成功时 `console.warn` 明示，失败原因**进用户可见的登录失败文案**
+   （吞掉原因正是 IKM741 的原始症状）。
+
+⚠️ **本节描述的实现已于 `4dbafa9` 整体撤出**（真机 401 证伪 + 用户否决依赖 ide）。
+以下守卫文件**已随实现删除**，不要再引用它：
+
+- ~~`tests/unit/officeace-auto-activate.spec.ts`~~（13 条，桩 `fetch` 跑真实 `completeLogin`）
+- 现存替代：`tests/unit/officeace-unsubscribed-guidance.spec.ts`（**只留出路文案 + 零依赖**）
+
+### ⚠️ 如实登记：**未经真机实测**的项
+
+- **协议状态的响应体形状**：本轮只拿到**过期 STS 的 401**（`APIGW.0301 invalid x-security-token`）
+  —— 它证明**路径与 V11 签名都被网关接受**（否则是 404/签名错），但 200 的形状没验过。
+- **`POST /v1/agreement` 是否要求带 `biz_type` 查询**：实现按「与 GET 同 URL」并用客户端那套两试退路。
+- **`promotion_code` 未使用**（客户端只在邀请场景带）。
+- **已开通账号不会走开通链路** ⇒ 「重复开通是否幂等」**未验证**（也刻意不测：那会真的打写接口）。
+- 子用户无签署权限时的处置：沿用客户端那句「请检查是否使用管理员账号进行签署」的方向，
+  **未实测**。
+- 端到端真机验证（拿一个**没开通过**的号跑通「自动开通」）**待做**。
+
+### 顺带一条**版本漂移**（独立缺陷，**本次未修**）
+
+这一版客户端的 `~/.office-claw` 里**没有 `session.cookie`、也没有 `certs/`**
+（实测：顶层只有 `users/`、`user-catalogs/`、`provider-profiles*.json`、`.jiuwenclaw/` 等）。
+⇒ 插件「本地 API 主路径」（`readSessionCookie()` + `https://127.0.0.1:3004/api/subscription/current`）
+在**当前版本上恒不可达**，`fetchSubscriptionSummary` 只能掉到缓存；
+而客户端实际监听的端口是**动态的**（实测 `127.0.0.1:27201`，日志里还出现 `https://127.0.0.1:3003/`）。
+⇒ **积分读数的「本地主路径」需要按版本重新对齐**（改用动态端口 + 新版会话载体）。**未做。**
+
+### 真机验收记录（2026-10-16，本仓库，PR108 分支）
+
+- `pnpm test:e2e:officeace-switch` **1 passed**（157.7s）：两次人工登录各 **60s / 88s**；
+  云侧 `accountId`（两条 32 位账号 id **已隐去**）、`modelAppKey`、MaaS 网关
+  （`modelgw-00xx` vs `modelgw-00yy`）**三项全不同**；`credentialRef` 各一份、凭据 2 条；
+  TTL 归零后两条账号都存活（安全闸）；用户真实 `~/.dsh-officeace/session.json` 哈希未变。
+- **桌面端**：desktop profile 原用旧包名 `dsh-codearts-auth` ⇒ `require.resolve('dsh-providers-hub')`
+  在 desktop profile 下 `MODULE_NOT_FOUND`，**插件根本加载不到**（PR108 正文里「本次未修 desktop」
+  那一条）。已改为 `dsh-providers-hub` + junction（备份 `package.json.bak-pr108-20261016-200912`）。
+- 桌面端开窗的**进程级铁证**：`2026-10-16T20:40:14 360ChromeX.exe pid=2060 parent=5608
+  (DeepSeek Harness.exe = dsh-desktop-host) profileDir=dsh-officeace-login-<随机 16 位>`
+  ⇒ 无痕窗口确由桌面宿主发起，且**每窗一份独立 profile**。
+- ⚠️ 桌面端「新建账号」失败时**收尾干净**：失败后 90s 复查 = 账号 0 条、凭据 0 条、幽灵 0、孤儿 0。
+
+### ⚠️⚠️ 真机实测（2026-10-16 22:40 / 22:45，未开通账号）：上一节第 1 条的「形状未实测」已被**证伪**，而且根因不是形状
+
+两次真机（探针跑**构建后的真实 `completeLogin`**，外面套 fetch 记录器）拿到同一结果：
+
+```
+POST {versatile}/v1/claw/client-subscription        → HTTP 401 {"error_code":"APIGW.0301",
+GET  {versatile}/v1/agreement?biz_type=officeclaw   →      "error_msg":"Incorrect IAM authentication
+GET  {versatile}/v1/agreement                       →       information: invalid x-security-token"}
+```
+
+而**同一组凭据**在 `agentarts` 主机上的 `GET /v1/claw/client-permission-validate` 是 **HTTP 200**（它只是没给 `model_auth_info`）。
+
+⇒ **根因是凭据来源，不是 URL/签名/形状**：`versatile` 只认 **CAS ticket 换来的那一套凭据**，
+不认插件 OAuth（`client_id=pdp5_for_agentarts`）从 `sts.cn-north-4` 换来的 STS。
+OAuth 的 STS 是**面向 agentarts 这个 client** 的，跨到 versatile 的 APIGW 就是
+`invalid x-security-token`（三处全 401，报文逐字如上）。
+
+**客户端的真实凭据链（源码级，`packages/green-package/api/dist/auth/huawei-cas.js`）**：
+
+1. `validateCasTicket(fetchImpl, ticketValidateUrl, ticket, serviceCallbackUrl, …)`
+   —— `GET {versatile}/v1/claw/cas/login/ticket-validate?ticket=…&service=…`，头 `x-subscription-type: v2`
+   ⇒ 返回 **profile**（`access` / `secret` / `securitytoken`，见 `toProfile` 的
+   `readString(credential, 'securitytoken', 'security_token', 'securityToken')`）；
+2. （可选）`refreshTemporaryCredential` —— `POST https://iam.myhuaweicloud.com/v3.0/OS-CREDENTIAL/securitytokens`，
+   体 `{auth:{identity:{methods:['token'],token:{duration_seconds}}}}`，头 `X-Security-Token`；
+3. `subscribeWithPromotionCode` —— `POST {versatile}/v1/claw/client-subscription`（V11 签名 + `x-subscription-type: v2`）。
+
+⇒ **要真做「自动开通」，必须再实现一条 CAS 登录链**（拿 ticket → ticket-validate → profile），
+插件现有的 OAuth 链路**不可能**跨过去。该链条**尚未实现**。
+
+**当时那版实现（`activateOfficeAceSubscription`）在真机上被证伪** —— 它复刻的请求形状没问题
+（三处请求都发出去了、V11 签名也被网关读到），但**凭据不对**，所以恒 401。
+真机同时暴露并已修掉两个次生缺陷（都在本次会话内）：① 协议状态读不到就整次放弃开通；
+② 失败文案把状态码与报文整个丢掉。**该实现最终被整体撤出**（见下）。
+
+### ✅ 处置（2026-10-16 深夜，用户决策）：**撤出自动开通，只留出路文案**
+
+用户看过上文的真机证据后明确两点：① 他开通那个账号时**没有输过邀请码**；
+② **不接受**「开通/授权链路依赖果办客户端或它保存的用户数据」。⇒ 决策 A：撤出。
+
+撤出后**保留**的收益（这才是这一轮真正落地的）：
+
+- `fetchModelInfo` 拿不到 `model_auth_info` 时的文案从
+  「华为云未返回 MaaS 凭据（账号可能未订阅 ModelArts MaaS）」（**没有出路**）改为
+  「华为云未返回 MaaS 凭据：该账号尚未开通 ModelArts MaaS。**请先用该账号在果办客户端里
+  点「开通」并同意授权**，再回来重试。」—— 这正是当天用户解决问题的唯一路径，把他摸索的
+  那半小时省掉。
+- 守卫：`tests/unit/officeace-unsubscribed-guidance.spec.ts`（5 条）**同时**锁两件事：
+  ① 文案的三要素（未开通 / 果办客户端 / 开通）；② **零依赖**——未开通时**只允许**发
+  `token 交换 + client-permission-validate` 两个请求，且剥掉注释后的源码**不得**再出现
+  读客户端落盘（`secure-config-nodejs` / `oauth-profile-encryption-key`）、客户端本地 API
+  （`127.0.0.1:3003` / `create-order` / `claim-bonus`）、versatile 开通端点
+  （`client-subscription` / `/v1/agreement`）、CAS `ticket-validate` 等字样。
+  变异验证 5 条逐条 RED（含「把读客户端落盘塞回来」「多打一个开通端点请求」两种回归形态）。
+
+⚠️ **仍然存在的一处既有 ide 依赖（本次刻意不撤，如实登记）**：
+`readSessionCookie()` 读 `~/.office-claw/session.cookie`（DPAPI）—— 它只服务**积分读数**
+的本地 API 路径，**不在**开通/授权链路上；且在当前客户端版本上该文件已不存在
+⇒ 那条腿**恒失效**、读数落缓存兜底。是否撤掉它属独立议题（要动积分读数链路）。
+
+⚠️ **「新账号自动开通」= 已知边界，做不到**（三条路都要果办客户端或邀请码，见上表）。
+
+**⚠️ 一条立刻可用的产品结论**（不依赖任何客户端数据）：未开通账号的正确出路就是
+**「先用该账号在果办客户端里走一次开通/同意，再回来重试」** —— 2026-10-16 当天用户实际
+解决问题的唯一路径。它现在**就在**失败文案里。
+
+### ⚠️⚠️ 同一云侧账号重复登录**必须查重**（IKM741 追补，2026-10-16 用户真机报障）
+
+**症状**：同一个华为号连登两次 ⇒ 号池两张卡，`accountId` / `modelAppKey` / MaaS 网关
+**三项完全相同**（实测 `id=41` 与 `id=43`；两条 32 位 id/账号名已隐去），只有 `credentialRef`
+与 `refreshToken` 不同；面板上后建的那张显示「查询失败」。
+
+**为什么必须治**：OfficeAce 的 `refresh_token` 是**一次性**的，而两张同账号的卡**都会参与批量续期**
+（`refreshAll` / `refreshAccountList` 只看 `refreshable`、**不看 `enabled`**，AGENTS.md 明令）
+⇒ 谁先续期谁赢、后到的那张 token **立刻作废**；若「重复卡」先跑，被废掉的恰恰是
+**那张可用卡** ⇒ 面板上表现为「账号突然凭证过期 / 积分查询失败」。
+
+**处置（照 zcode 范式，三件事都要做）**：
+① **不删条目** —— `login.poll` 靠「条目还在 + 凭据已写」判成功，删了会让它显示成
+「登录失败」，与事实**相反**（登录是成功的，只是这个账号已存在）⇒ 只**停用 + 改名**
+「（重复，已停用）」，用户一眼能看出、可自行删除；原来那条**不动**；
+② **把新凭据转写回已有条目的 ref**（新凭据更新鲜 ⇒ 让那张**可用卡**保持最新，并回填 `expiresAt`）；
+③ **清掉重复条目自己的凭据** ⇒ 消灭「两份一次性 token」——⚠️ 只有 ② **确认成功**才清
+（`unset` **不可逆**；失败时宁可留着凭据）。
+
+**判据**：`pool.findAccountIdByIdentityField(OFFICEACE.id, 'accountId', credential.accountId)`
+（通用去重口：**含停用账号**、字段缺失则跳过）。云侧未下发 `accountId` ⇒ **放弃去重**（不猜）。
+
+**守卫**：`tests/unit/officeace-rpc-multi-account.spec.ts` 的 ④⑤⑥⑦；
+**变异 5 条逐条 RED + 逐字节 RESTORE**（其中「去掉『排除自己』」那条一次打穿 5 个用例 ——
+它是"防误杀真实多账号"的关键一腿）。
+
+⚠️ **存量重复卡刻意不自愈**：修复只防"以后"；已存在的重复卡要**用户手动删一张**
+（删除不可逆，插件不擅自替用户删账号）。
+
+### 脱敏（2026-10-16 同轮）：PR 内不得出现真实账号标识
+
+- e2e `officeace-real-account-switch` 原先会把**云侧 `accountId` 原值**打进终端 / CI 日志
+  （同文件里 `modelAppKey` / `refreshToken` 早就走 `sha16`，账号 id 漏了 —— **同一文件两套口径**）。
+  现改为**只打 sha256 前 16 位指纹**；**断言消息**里也不带原值（失败时会进 CI 日志）；
+  判据本身仍用原值比对（最严读法）。
+- 笔记与源码注释里的**真实账号 id / 账号名（含手机号）/ 客户端 profile 文件名 /
+  本机绝对路径 / 无痕临时目录名 / 账号专属网关实例号**一律换成占位。
+- **保留**：sha256 前 16 位**指纹**（不可逆、且是判据的一部分）、`secure-config-nodejs`
+  这类**公开实现细节**（守卫与技术描述需要）。
+
+### 变异验证如实登记（2026-10-17，查重那一轮踩的坑）
+
+查重守卫做了**三轮**变异验证，其中**两条初始无牙、已补**——登记在此，避免下次误以为"写了用例就等于有守卫"：
+
+| 变异 | 首轮 | 处置 |
+|---|---|---|
+| 查重**静默退化**（不抛错、直接返回空串）时把空串当成命中 | ❌ GREEN | 新增用例 ⑨（与 ⑧ 的「抛错」是**两条不同退化路径**） |
+| 读池失败**不记 warn**（降级无痕） | ❌ GREEN | 用例 ⑧ 加 `warns` 断言 —— 降级唯一可观测出口就是 warn，没有 `ctx.logger` 替身时它是无牙的 |
+| 云侧不下发身份时**仍去查重**（空串进查重口） | ❌ GREEN | 用例 ⑦ 加 `vi.spyOn` 直接观测「有没有把空串送进去」——纯行为断言看不出（空串会被池内部守卫挡掉，结果一样） |
+
+⚠️ 另有一条 `duplicateLookupFailed` 闸门被**实测证明无牙**（与不写它逐字节等价：catch 里不赋值 ⇒ 变量仍是 `''` ⇒ `length > 0` 本就为假）⇒ **已删**，不留"看着像防御、实际无效果"的码（独立审计会把这类记为死代码）。
+
+⚠️ 同样如实登记两处**变异锚点失配**（`PATCH-NOT-APPLIED`，未当成「无牙」）：`M1`/`M5`/`M6`/`M7` 首轮因单行锚点在文件中**同形多处**而失配，改用「多行 + 唯一性检查」后才真正注入。
