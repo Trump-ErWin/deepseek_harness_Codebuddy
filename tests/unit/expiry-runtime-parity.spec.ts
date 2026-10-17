@@ -39,6 +39,7 @@ import { WIRED_EXPIRY_PROVIDERS, createExpiryProbe } from '../../src/aggregate-e
 import { apply } from '../../src/index.js'
 import { clearProviderRuntimes, registerProviderRuntime, registeredRuntimeIds, runtimeOf } from '../../src/provider-runtime.js'
 import { descriptorOf } from '../../src/provider-registry.js'
+import { readFileSync } from 'node:fs'
 
 /** 已接入临期折算的渠道（**期望值** —— 真相源是下面两个不变式）。 */
 // ⚠️ 2026-10-13 合并审计加入 accio：用户要求「聚合的 qwen3.8-flash 轮换列表里要有
@@ -51,8 +52,17 @@ import { descriptorOf } from '../../src/provider-registry.js'
 //    ⚠️ 已知代价：魔粒烧光时不会被提前剔出轮换（平台既不下发重置时刻、也没有别的
 //    额度端点）⇒ 耗尽后仍会被选中、失败一次。**这是用户知情接受的取舍**，
 //    不许用「猜一个每日 UTC+8 零点」消除它（凭空造上游从未承诺的时刻）。
+// ⚠️ 2026-10-17 审计 P0 修复加入 autoclaw：它与 modelscope **同格**
+//    （钱包余额报文里没有任何时间字段 ⇒ 有余额即 `NEVER`、烧光即 `UNUSABLE`），
+//    折算原语见 `autoclawExpiry`，代价与魔搭**同型**。
+//    ⚠️ 这是「三处必须同改」陷阱的**第 4 次复发**（cline → accio → officeace
+//    → autoclaw）：PR 只加了 `AGGREGATE_CHANNELS` 而漏了本清单与
+//    `createProviderExpiry()`，症状恒定**静默**。
+//    ⚠️ 而**本不变式结构上抓不到那种漏法**（两处同步缺失 ⇒ 差集皆空 ⇒ 绿）——
+//    真正的防线是「`AGGREGATE_CHANNELS` 的 channel 成员必须在清单里」那条，
+//    见本文件末尾的 ★★ 显式豁免表守卫。
 const EXPECTED_WIRED = [
-  'accio', 'buddy', 'codearts', 'lobsterai', 'loomy', 'modelscope', 'officeace', 'trae', 'workbuddy', 'zcode',
+  'accio', 'autoclaw', 'buddy', 'codearts', 'lobsterai', 'loomy', 'modelscope', 'officeace', 'trae', 'workbuddy', 'zcode',
 ]
 
 class FakeCredentials {
@@ -155,6 +165,109 @@ describe('★ 不变式一：清单 == runtime 里挂了 expiry 域的渠道（�
     expect(await probe('raccoon')).toBe(UNUSABLE)
     expect(await probe('not-a-channel')).toBe(UNUSABLE)
     expect(UNUSABLE).not.toBe(NEVER)
+  })
+})
+
+/**
+ * ★★ **不变式三（本 PR 新增，补上一个结构性的守卫盲区）**
+ *
+ * ## 它补的是什么洞
+ *
+ * 不变式一锁的是「`WIRED_EXPIRY_PROVIDERS` == runtime 里挂了 expiry 域的集合」。
+ * 它**双向**都抓，但**抓不到**「某渠道的折算压根没做」这种漏法 ——
+ * 因为那种漏法的形态是**清单里没有 + runtime 里也没有** ⇒ **差集为空 ⇒ 全绿**。
+ *
+ * ⚠️ 这不是假想：本 PR（autoclaw）就踩了 —— 只把 `'autoclaw'` 加进
+ * `aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS`（模型层归并会发生、
+ * **看起来**接好了），而清单与 `createProviderExpiry()` 两处都漏了。
+ * 实测症状：折算恒 `UNUSABLE` ⇒ 用户在聚合轮换列表里**永远看不到 autoclaw**，
+ * 且**无报错、无日志**。这是该陷阱的**第 4 次复发**
+ * （cline → accio → officeace → autoclaw）。
+ *
+ * ## 判据
+ *
+ * 凡进了 `AGGREGATE_CHANNELS` 的**真渠道**（`channel: true`），就**必须**在
+ * `WIRED_EXPIRY_PROVIDERS` 里 —— 否则它在候选层被那道闸门剔掉，
+ * 「模型层配得再对也没用」。
+ *
+ * ⚠️ 豁免走**显式、带理由**的表（本仓库红线：不许用静默缺席当豁免）。
+ *   真正该豁免的是「余额形态套不进折算骨架」那类（如 opencode 的本地派生余额），
+ *   它们**不该**同时出现在 `AGGREGATE_CHANNELS` 里；一旦出现，必须在这里写明理由。
+ */
+describe('★★ 不变式三：AGGREGATE_CHANNELS 的真渠道都已接入临期折算', () => {
+  /**
+ * **显式豁免**（key = 渠道 id，value = **可核对的**理由）。
+ *
+ * ⚠️ 这些**不是**「忘了接线」，而是 `aggregate-expiry.ts` 模块头的逐渠道判据表
+ * （`:76-82`）里**明文登记为「本插件未接入 → `UNUSABLE`」**的那一批。
+ *   核对方式：读 `src/aggregate-expiry.ts` 的「逐渠道判据」表，或跑
+ *   `pnpm vitest run tests/unit/expiry-runtime-parity.spec.ts` 看
+ *   「未接入的渠道（清单外）在 runtime 里也**没有** expiry 域」那条用例 ——
+ *   它逐个点名断言这些渠道的 `runtime.expiry` 恒 `undefined`。
+ *
+ * ⚠️⚠️ **为什么必须显式列出，而不能靠「不在清单里就算豁免」**
+ *   正是因为那样会让本守卫**恒真**：清单外的渠道天然全部「不在清单里」，
+ *   守卫就抓不到任何新增漏接。本表把「已知的、未接入的」固定下来，
+ *   任何**新增**的 AGGREGATE_CHANNELS 成员若没同步接线，仍会红。
+ *
+ * ⚠️ 若将来真接入了某一家，**从本表删掉它**并补上清单 + 原语 + runtime 三处。
+ */
+const NOT_EXPIRY_WIRED = new Map<string, string>([
+  ['qoder', '余额原语只吃 QoderCredential、与共享骨架泛型不兼容；aggregate-expiry.ts:82 登记为未接入'],
+  ['qodercn', '同 qoder（两者复用同一个 QoderAuth，余额原语同形）'],
+  ['cline', '余额报文无跨账号到期口径；aggregate-expiry.ts:82 登记为未接入'],
+  ['raccoon', '同上（aggregate-expiry.ts:82）'],
+  ['minimax', '同上（aggregate-expiry.ts:82）'],
+  ['minimaxintl', '同 minimax（共用同一个 MinimaxAuth 类，余额原语同形）'],
+  ['gemini', '同上（aggregate-expiry.ts:82）'],
+  ['opencode', '「余额」是本地派生的通道可用性、零网络，套折算骨架会发不存在的请求'],
+])
+
+  it('每个进了 AGGREGATE_CHANNELS 的真渠道都在 WIRED_EXPIRY_PROVIDERS 里（或已显式豁免）', () => {
+    // ⚠️ 必须先真跑 `apply()`：下面的 `registeredRuntimeIds()` 读的是
+    //   **运行时**注册表，没跑 apply 时它恒为空 ⇒ 交集恒空 ⇒ 本用例恒绿
+    //   （这正是「断言前置条件不成立时退化成恒真」的形态）。
+    applyOnce()
+    // ⚠️ `AGGREGATE_CHANNELS` 是 `AggregateAdapter` 的**私有静态**成员
+    // （`aggregate-adapter.ts:909`），对外只有走存活路由交集的那个访问器
+    // （`:997`，它会 `listProviders()` 过滤掉宿主没装载的渠道）。
+    // ⇒ 这里**读源码字面量**：本守卫要判的是「**编译期事实**（作者有没有把它
+    // 写进那张表）」，用运行时会退化成「宿主当前恰好装载了谁」。
+    //   判据抽不到字面量时**必须报红**（fail-closed），不能静默放行 ——
+    //   否则改名/重构会让本守卫恒真而无人察觉。
+    const source = readFileSync(
+      new URL('../../src/aggregate-adapter.ts', import.meta.url),
+      'utf8',
+    )
+    const start = source.indexOf('private static readonly AGGREGATE_CHANNELS')
+    expect(start, '抽不到 AGGREGATE_CHANNELS 定义（改名/重构会让本守卫恒真）').toBeGreaterThan(-1)
+    const block = source.slice(start, source.indexOf('])', start))
+    const candidates = [...block.matchAll(/'([a-z][a-z0-9]*)'/gi)].map((m) => m[1]!)
+      // 排除虚拟 provider 自身与 auto（它们没有自己的账号与余额）。
+      .filter((id) => id !== 'aggregate' && id !== 'auto')
+
+    const registered = new Set(registeredRuntimeIds())
+    // ⚠️ 反向自检防恒真：若这一步取不到真渠道，用例会退化成「空集合全部通过」。
+    const live = candidates.filter((id) => registered.has(id))
+    expect(live.length, '前置条件：AGGREGATE_CHANNELS 与 runtime 的交集应非空').toBeGreaterThan(0)
+
+    const missing = live.filter(
+      (id) => !WIRED_EXPIRY_PROVIDERS.includes(id) && !NOT_EXPIRY_WIRED.has(id),
+    )
+    expect(
+      missing,
+      '以下渠道进了 AGGREGATE_CHANNELS 却**不在** WIRED_EXPIRY_PROVIDERS ⇒ '
+      + '模型层归并会发生，但候选层被那道闸门剔掉 ⇒ 用户在聚合轮换列表里'
+      + '永远看不到它们，且无报错无日志。修法是三处同改：'
+      + '① WIRED_EXPIRY_PROVIDERS ② createProviderExpiry() ③ 折算原语。'
+      + `缺的是：${missing.join(', ')}`,
+    ).toEqual([])
+  })
+
+  it('⚠️ 豁免表本身不得与清单重叠（重叠 = 豁免是假的，清单才是真的）', () => {
+    for (const id of NOT_EXPIRY_WIRED.keys()) {
+      expect(WIRED_EXPIRY_PROVIDERS, `${id} 同时在清单与豁免表里，语义矛盾`).not.toContain(id)
+    }
   })
 })
 

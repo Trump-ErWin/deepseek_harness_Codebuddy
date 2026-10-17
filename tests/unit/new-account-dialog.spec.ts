@@ -294,10 +294,23 @@ describe('F. accio 区域选择入口（终审 I2）', () => {
     // zcode 的两个渠道选项**不得**被这次改动弄丢。
     expect(jetHubCode).toContain("value: 'bigmodel'")
     expect(jetHubCode).toContain("value: 'zai'")
-    // 区域 state 与它的 setter 必须真的接在 select 上（不是定义了不用）。
+    // 区域 state 与它的 setter 必须真的接在**卡片组**上（不是定义了不用）。
+    // ⚠️⚠️ 2026-10-17 审计 P2 修复：原实现把功能挂在 `<select>` 上，而那里
+    //   的三个 `<select>` 全部带 `style:{display:'none'}`（原生下拉在
+    //   Windows/Electron 下点不开，功能已由**单选卡片组**接管）⇒ 那三个是
+    //   纯**死 DOM**：不可见、`onChange` 永不触发，却仍渲染 `<option>`。
+    //   现已整体删除，故守卫必须改锁**卡片组**的真实形态 ——
+    //   否则它会变成「保护一个不存在的东西」，删除后仍然全绿。
     expect(jetHubCode).toMatch(/const \[accioRegion, setAccioRegion\] = React\.useState\('cn'\)/)
-    expect(jetHubCode).toMatch(/onChange: \(event\) => setAccioRegion\(event\.target\.value\)/)
-    expect(jetHubCode).toMatch(/value: accioRegion/)
+    expect(jetHubCode, '卡片组必须真的把 accioRegion 的 setter 接上')
+      .toMatch(/onClick: \(\) => setAccioRegion\(opt\.value\)/)
+    expect(jetHubCode, '卡片组必须真的把 zcodeProvider 的 setter 接上')
+      .toMatch(/onClick: \(\) => setZcodeProvider\(opt\.value\)/)
+    expect(jetHubCode, '卡片组必须真的把 autoclawMode 的 setter 接上')
+      .toMatch(/onClick: \(\) => setAutoclawMode\(opt\.value\)/)
+    // ⚠️ **反向守卫**：隐藏的死 `<select>` 不得复活（它正是本次删掉的东西）。
+    expect(jetHubCode, '不得残留 display:none 的隐藏 select（纯死 DOM）')
+      .not.toMatch(/className: 'dim-jh-zcSelect',\s*\n\s*style: \{ display: 'none' \}/)
   })
 
   it('⚠️ 区域不是「偏好」而是登录前提 —— 弹窗文案必须说清「选错会打开打不开的登录页」', () => {
