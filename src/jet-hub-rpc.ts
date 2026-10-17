@@ -2033,13 +2033,18 @@ function registerJetHubEndpoints(
     // 池内 `expiresAt` 确实会被写 ⇒ 不属 loomy / zcode 那类豁免。
     // 漏登记的后果是「凭据明明能续，面板却报未登录」（2026-10-12 复审发现）。
     ACCIO.id,
-    // ⚠️ **本 fork 独有**（modelscope，2026-10-16）**刻意不在本表里**：
-    //    准入判据是 `channel && credits.balance === true`，而它是 `balance: false`
-    //    —— 魔搭没有额度 API，积分端点压根不会为它走这条链。
-    //    且它的凭据是**长期有效的 API Key**（`expires_at` 可选），没有「快过期」可言。
-    //    ⚠️ 显式豁免登记在 `credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT`
-    //    （与 loomy / zcode 同款「无 refresh 端点」形态，但理由更根本）。
-    //    ⚠️ 别把它当成「忘了登记」—— 那正是 accio 当初漏掉的缺陷形态。
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
+    //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
+    //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
+    //    （`/openapi/v1/magicubes/balance`，带 API Key 返 200，实测随消耗下降），
+    //    `balance` 已改为 `true` ⇒ **积分端点现在确实会为它触发**。
+    //    ⇒ 仍豁免的依据只剩一条，且比 loomy / zcode 更根本：它的凭据是**长期有效的
+    //    静态 API Key**（`expires_at` 可选、实测默认不过期）⇒ 没有「快过期」，
+    //    自愈链对它无事可做；`refreshAccountCredential` 只做本地有效性对账、
+    //    不发网络请求，调它等于白跑一趟。
+    //    ⚠️ **「余额能读」与「凭据能续」是两件事** —— 正因为余额现在能读了，
+    //    才更需要显式留下这条豁免，否则后人会当成「忘了登记」而补进去。
+    //    显式豁免登记在 `credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT`。
   ])
 
   /**

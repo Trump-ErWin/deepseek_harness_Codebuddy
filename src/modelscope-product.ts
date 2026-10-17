@@ -72,6 +72,30 @@ export interface ModelscopeProduct {
   /** 模型目录请求超时（毫秒）。 */
   readonly catalogTimeoutMs: number
   /**
+   * **魔粒余额**端点的完整 URL（2026-10-17 带真实 Key 实测）。
+   *
+   * ⚠️⚠️ **刻意是完整 URL 而非「拼在 baseUrl 之后」的 path**：它**不在**
+   *    `baseUrl`（`api-inference.modelscope.cn/v1`）那个 host 上，而在
+   *    `www.modelscope.cn` 的 **`/openapi/v1/`** 前缀下 ⇒ 用 path 拼装会得到
+   *    一个 404 的错误地址。
+   *
+   * 实测（三条认证形态各验一次，这是本仓库「目录能读 ≠ 凭据有效」纪律的同款要求）：
+   * | 认证 | 结果 |
+   * |---|---|
+   * | `Authorization: Bearer <ms-key>` | **200**，返回 `total_balance` |
+   * | 网页会话 cookie | 200，同一数值 |
+   * | 无凭据 | **401 `InvalidAuthentication`** |
+   * ⇒ 它**真的在校验凭据**（不是公开端点），且**API Key 就够**。
+   *
+   * ⚠️ 找它的过程值得留档：本仓库与 PR 作者都曾判定「魔搭没有额度查询 API」，
+   *    那批探测只试过 `/api/` 与 `/v1/` 两个前缀，而真端点在 **`/openapi/`**；
+   *    它还**不在**前端主 bundle 的静态路径表里（藏在按需 chunk）⇒ 只能靠
+   *    抓真实网络请求（CDP）定位。详见 `docs/agent-notes/providers-modelscope.md`。
+   */
+  readonly balanceUrl: string
+  /** 余额请求超时（毫秒）。 */
+  readonly balanceTimeoutMs: number
+  /**
    * 单凭据回退 ref。
    *
    * ⚠️ **不再是旧 fork 的 `PROXY_UPSTREAM_MODELSCOPE`**。那个前缀属于旧 fork 的
@@ -96,6 +120,10 @@ export const MODELSCOPE: ModelscopeProduct = {
   chatHeaderTimeoutMs: 60_000,
   chunkTimeoutMs: 120_000,
   catalogTimeoutMs: 15_000,
+  // ⚠️ 余额端点在**另一个 host**且前缀是 `/openapi/`（不是 `/api/`、也不是 `/v1/`）——
+  //    见字段注释里的实测矩阵与「怎么找到它」的留档。
+  balanceUrl: 'https://www.modelscope.cn/openapi/v1/magicubes/balance',
+  balanceTimeoutMs: 15_000,
   defaultCredentialRef: 'MODELSCOPE_ACCESS_TOKEN',
 }
 

@@ -664,14 +664,23 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
   const SELF_HEAL_EXEMPT: ReadonlyMap<string, string> = new Map([
     ['loomy', 'Loomy 没有 refresh 端点，refreshAccountCredential 只是有效性探测'],
     ['zcode', 'ZCode 同上：没有 refresh 端点，探测当续期用只会白发请求'],
-    // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。理由比上面两家**更根本**：
-    //    ① 它 `credits.balance === false`（平台没有额度 API）⇒ 自愈链的触发点
-    //       （`credits.balances` 端点）压根不会为它走到续期那一步；
-    //    ② 它的凭据是**长期有效的 API Key**（`expires_at` 可选，实测魔搭的 Key
-    //       默认不过期）⇒ 没有「快过期」这回事。
-    //    `refreshAccountCredential` 仍按统一接口做有效性对账（回写池内 `expiresAt`），
-    //    但那不发任何网络请求，也不该被自愈端点调用。
-    ['modelscope', '无 refresh 端点（静态 API Key，无过期）且 credits.balance === false（平台无额度 API）'],
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-16 登记；2026-10-17 **改判**）。
+    //
+    // ⚠️⚠️ **原理由①已作废**：它写的是「`credits.balance === false`（平台没有
+    //    额度 API）⇒ 自愈链的触发点压根不会为它走到续期那一步」。
+    //    **那条已被证伪**：魔搭**有**魔粒余额端点（`/openapi/v1/magicubes/balance`，
+    //    带 API Key 返 200），`balance` 已改为 `true` ⇒ **积分端点现在确实会为它触发**。
+    //    若只把①删掉而不写清②，会让后人以为「漏登记 = 忘了补」⇒ 可能真把它塞进 Set。
+    //
+    // ⇒ **仍然豁免的依据只剩②**，且它比 loomy / zcode 更根本：
+    //    魔搭的凭据是**长期有效的静态 API Key**（`expires_at` 可选，实测 Key 默认
+    //    不过期）⇒ **没有「快过期」这回事**，自愈链对它无事可做。
+    //    `refreshAccountCredential` 按统一接口做有效性对账（回写池内 `expiresAt`），
+    //    但它不发任何网络请求 ⇒ 调它等于白发一次本地读。
+    //
+    // ⚠️ 判据「有没有 refresh 端点」与「余额能不能读」是**两件事**：
+    //    正因为余额现在能读了，才更需要显式说明「仍不进 Set」的理由。
+    ['modelscope', '无 refresh 端点：凭据是长期有效的静态 API Key（expires_at 可选、实测默认不过期）⇒ 没有「快过期」，自愈链无事可做（余额能读不等于能续期，两件事）'],
   ])
 
   it('★ Set 里的字面量恰好是 codearts / buddy / workbuddy（多一个少一个都红）', () => {
@@ -730,6 +739,12 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
       ['opencode', '匿名通道，无凭据可续'],
       ['aggregate', '虚拟渠道，无自有凭据'],
       ['auto', '虚拟渠道（auto-adapter 聚合），无自有凭据'],
+      // ⚠️ **本 fork 独有**（魔搭，2026-10-17）。与 zcode **同型**：静态 API Key
+      //    凭据、无 OAuth 续期、`expires_at` 可选且实测默认不过期 ⇒ 没有「快过期」。
+      //    ⚠️ 别被它的 `credits.balance === true` 误导：**余额能读**（魔粒端点
+      //    `/openapi/v1/magicubes/balance` 带 API Key 返 200）与**凭据能续**是两件
+      //    独立的事；前者为真不推出后者。自愈链对它无事可做 ⇒ 必须豁免。
+      ['modelscope', '静态 API Key 凭据、无 refresh 端点（余额能读 ≠ 凭据能续）'],
     ])
     const { literals, constants } = selfHealSetParts()
     const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
