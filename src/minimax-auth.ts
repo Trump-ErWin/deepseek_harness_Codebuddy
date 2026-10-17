@@ -26,8 +26,10 @@ import {
   fallbackToEntry,
   isMinimaxRefreshable,
   minimaxCredentialExpiresAtMs,
-  minimaxFetchWithRetry,
+  describeMinimaxGeoRoute,
+  minimaxFetch,
   minimaxHeaders,
+  minimaxHeadersFor,
   normalizeMinimaxModel,
   type MinimaxCredential,
   type MinimaxModelEntry,
@@ -379,23 +381,48 @@ export class MinimaxAuth extends Service {
       url.searchParams.set('region', this.product.region)
       url.searchParams.set('buildEnv', this.product.buildEnv)
       /**
-       * ⚠️ **带传输级重试**（2026-10-15 真实缺陷）。
+       * ⚠️ **带传输级重试 + 保凭据跟随重定向**（两个真实缺陷的修法）。
        *
-       * 用户报障：「模型连接测试失败，显示 `fetch failed`」。本机实测环境里的
-       * HTTPS 检查代理约 **50%** 概率打断到本家的请求
+       * 传输级重试（2026-10-15）：「模型连接测试失败，显示 `fetch failed`」。
+       * 本机实测环境里的 HTTPS 检查代理约 **50%** 概率打断到本家的请求
        *（`fetch failed ← SELF_SIGNED_CERT_IN_CHAIN`）⇒ 一次偶发中断就整轮失败。
        *
-       * ⚠️ 重试实现与推理路径**共用同一份** `minimaxFetchWithRetry`
-       *（`src/minimax.ts`）—— 那个文件同时持有判据与退避，本文件不再另写一份
-       *（同义判据分两处必然漂移，AGENTS.md 明列）。
+       * 保凭据跟随 3xx（2026-10-17，issue IKMEVG）：`agent.minimax.io` 恒 307 到
+       * `agent.minimaxi.com`，而 fetch 跨 origin 跟随会**剥掉 `Authorization`**
+       * ⇒ 第二跳无凭据 ⇒ 目录也拿不到（连带让 provider 在模型选择器里消失）。
+       *
+       * ⚠️ 两者合并在 `minimaxFetch` 一处，与推理 / 签到积分路径**共用同一份**
+       *（`src/minimax.ts`）—— 本文件不另写判据（同义判据分两处必然漂移）。
+       * `buildInit` 每跳重建头，保证跟随后的请求仍带凭据。
+       *
+       * ⚠️ 国际站另需附用户设置的 `X-Forwarded-For`（绕开 Akamai 按出口 IP
+       * 的地理分流）。没有它，大陆出口的用户连目录都拿不到 ⇒ provider 在模型
+       * 选择器里整个消失（这是本 issue 的另一个症状面）。
        */
-      const response = await minimaxFetchWithRetry(
-        () => this.fetchImpl(url.toString(), {
-          headers: minimaxHeaders(credential),
+      // ⚠️ 用 `typeof` 判一下：单测/旧接线可能传只实现部分方法的池替身，
+      //    直接 `.minimaxXff()` 会在那种替身上抛 `TypeError`（`?.` 挡不住）。
+      const pool = this.ctx.accountPool
+      const xff = typeof pool?.minimaxXff === 'function' ? pool.minimaxXff() : undefined
+      let geoRouted = false
+      const response = await minimaxFetch(
+        url.toString(),
+        () => ({
+          headers: minimaxHeadersFor(credential, xff, this.product.id),
           signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
         }),
+        {
+          fetcher: this.fetchImpl,
+          onGeoRoute: () => { geoRouted = true },
+        },
       )
-      if (!response.ok) return undefined
+      if (!response.ok) {
+        // ⚠️ 地理路由必须留**可操作**的日志：否则用户只看到「模型列表变空」，
+        //    而真因（出口 IP 被判定为中国大陆）完全不可见。
+        if (geoRouted) {
+          this.ctx.logger?.warn?.(`[${this.product.id}] ${describeMinimaxGeoRoute()}`)
+        }
+        return undefined
+      }
       const body: unknown = await response.json().catch(() => undefined)
       const entries = parseMinimaxModelsPayload(body)
       // ⚠️ 远端成功但解析出 0 条时也回退兜底表（避免空列表让整个 provider 消失）
