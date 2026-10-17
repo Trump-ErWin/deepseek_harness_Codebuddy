@@ -58,6 +58,7 @@ import {
 import {
   isMinimaxExpired,
   minimaxFallbackEntries,
+  minimaxFetchWithRetry,
   type MinimaxCredential,
   type MinimaxModelEntry,
 } from './minimax.js'
@@ -647,10 +648,32 @@ export class MinimaxAdapter extends LlmAdapter {
     })
 
     /**
-     * 发送一次推理请求。
+     * 发送一次推理请求（**含传输级重试**）。
      *
      * ⚠️ 头取**闭包里的当前** `credential`（换号后只需改这个变量）—— 与
      * raccoon 的 `send()` 同款，避免把 token 当参数传来传去而漏传一处。
+     *
+     * ## ⚠️⚠️ 为什么必须有传输级重试（2026-10-15 真实缺陷）
+     *
+     * 用户报障：「模型连接测试失败，显示 `fetch failed`」。
+     *
+     * 本机取证（同一凭据、同一端点、连打 10 次）：
+     * ```
+     * 签到 (signin/status): 成功 5/10 —— 失败全是
+     *   fetch failed ← self-signed certificate in certificate chain [SELF_SIGNED_CERT_IN_CHAIN]
+     * 目录 (models)       : 成功 10/10
+     * ```
+     * ⇒ 约 **50%** 概率被**环境里的 HTTPS 检查代理**（企业/杀软/Clash 的 MITM 证书）
+     * 打断。这是**环境问题**，但症状落在插件上：一次偶发中断 = 整轮请求失败，
+     * 用户看到 `fetch failed`，而重试一次几乎必然成功。
+     *
+     * ⚠️ **只重试传输错误，绝不重试 HTTP 状态错误**：4xx/5xx 是**服务端的明确答复**
+     *（401 要续期、402 要充值、429 要冷却），重发只会原样再失败，还会掩盖真实原因、
+     * 浪费时间。判据与退避都在 `minimaxFetchWithRetry`（`src/minimax.ts`）里，
+     * **与目录路径共用同一份实现** —— 本文件不再另写一份（同义判据分两处必然漂移）。
+     *
+     * ⚠️ **abort 绝不重试**：用户点了停止还继续发 3 次是**不可接受**的行为
+     *（本仓库 `llm-adapter.ts` 记过同型缺陷）。
      */
     const send = async (): Promise<Response> => {
       // ⚠️ 每次现读闭包变量：`credential` 是 `let`（换号会替换它），TS 不会把
@@ -659,13 +682,17 @@ export class MinimaxAdapter extends LlmAdapter {
       if (current === undefined) {
         throw new LlmError('minimax: no usable credential; log in first', 'MISSING_CREDENTIAL')
       }
-      return fetch(`${this.product.apiHost}${MINIMAX_INFER_PATH}`, {
-        method: 'POST',
-        headers: minimaxInferHeaders(current),
-        body: JSON.stringify(payload),
-        signal: options.signal,
-      })
+      return minimaxFetchWithRetry(
+        () => fetch(`${this.product.apiHost}${MINIMAX_INFER_PATH}`, {
+          method: 'POST',
+          headers: minimaxInferHeaders(current),
+          body: JSON.stringify(payload),
+          signal: options.signal,
+        }),
+        options.signal,
+      )
     }
+
 
     /**
      * 该响应体是否**明确不是** SSE。

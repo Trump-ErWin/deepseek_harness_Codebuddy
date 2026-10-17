@@ -62,6 +62,10 @@ const AUTH_SERVICE: Readonly<Record<string, string>> = {
   loomy: 'loomyAuth',
   raccoon: 'raccoonAuth',
   minimax: 'minimaxAuth',
+  // ⚠️ MiniMax Code 国际版：服务名同样是 `${product.id}Auth` ⇒ **`minimaxintlAuth`**
+  //    （全小写、不带连字符）。**不是** `minimaxIntlAuth`（按变量名驼峰惯例拼会恒
+  //    undefined）—— 与上面 `qodercnAuth` 同款的坑，本表就是为它存在的。
+  minimaxintl: 'minimaxintlAuth',
   zcode: 'zcodeAuth',
   gemini: 'geminiAuth',
   // ⚠️ OfficeAce 的值是 **auth 模块命名空间**，不是 `ctx.*Auth` 服务实例 ——
@@ -263,7 +267,7 @@ function entry(provider: string, credentialRef: string): ProviderAccountEntry {
 }
 
 describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.refresh）', () => {
-  it('registry 里占 auth 键位的恰好 15 家（opencode / aggregate 豁免；2026-10-16 本 fork 并入 modelscope）', () => {
+  it('registry 里占 auth 键位的恰好 16 家（opencode / aggregate 豁免）', () => {
     // ★ **方向性**：以 `PROVIDER_REGISTRY` 为权威，`AUTH_SERVICE` 是被测对象。
     //   「registry 里有、表里没有」⇒ 红，且 `toEqual` 的差异**点名那个 id**
     //   （而不是让下面的逐 provider 用例静默少跑一家）。
@@ -274,6 +278,10 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
       'registry 里有而本表漏登记（该 provider 的续期会零行为覆盖）',
     ).toEqual([...EXPECTED_AUTH_PROVIDER_IDS].sort())
     // ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 13 → 15。
+    // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：15 → 16。
+    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（魔搭）：16 → 17；
+    //    但上游同日另加了 minimaxintl，两侧增量恰好抵消 ⇒ **合并后仍是 16**。
+    //    ⚠️ 别被「本 fork 比上游多一家」的直觉误导：判据是 registry 的实测条数。
     expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(16)
     // 另一方向（原断言的**全部**证明力都在这条上，单独留着免得它随上面那条一起消失）：
     // 表里的每个键都必须是 registry 里真实存在的 provider id（防拼写错误造成的僵尸项）。

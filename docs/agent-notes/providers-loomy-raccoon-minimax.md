@@ -813,11 +813,151 @@ raccoon 在 `51ded6a` 修了这处，**loomy 当时未同步**（同一次审计
 
 ---
 
-## ⚠️ MiniMax Code（中国版）provider：不能凭直觉改的点
+## ⚠️ MiniMax Code（中国版 + 国际版）provider：不能凭直觉改的点
 
 `minimax` 是**第 10 个、也是首个 `Anthropic Messages` 协议族**的 provider
 （其余九个都是 OpenAI 兼容族或各自的自定义协议）。生产环境
 `https://agent.minimax.cn`。实现是独立一套 `src/minimax*.ts`。
+
+### 0. ⚠️ 双站点：`minimax`（中国版）+ `minimaxintl`（国际版）
+
+2026-10-15 加入国际版。**两个站点是两个 provider id**（不是「一个 provider 加一个
+区域参数」），与 `qoder`/`qodercn` 同型：
+
+| 字段 | `minimax`（中国版） | `minimaxintl`（国际版） |
+|---|---|---|
+| `displayName` | `MiniMax Code (中国版)` | `MiniMax Code (国际版)` |
+| `accountHost` | `account.minimax.cn` | `account.minimax.io` |
+| `apiHost` | `agent.minimax.cn` | `agent.minimax.io` |
+| `region`（目录参数） | `cn` | `en` |
+| `defaultCredentialRef` | `MINIMAX_ACCESS_TOKEN` | `MINIMAXINTL_ACCESS_TOKEN` |
+
+**只有这 6 个字段不同**（OAuth 常量、全部端点路径、兜底模型表逐字段相同）⇒
+**不复制任何** `src/minimax*.ts` 实现文件，差异全在
+`src/minimax-product.ts` 的两个常量里。`tests/unit/minimax-intl.spec.ts` 有一条
+「除这 6 个字段外两站配置逐字段相同」的断言锁住这件事（要分叉必须先加白名单并写明理由）。
+
+**为什么不用「单 id + 站点落凭据」**（zcode / accio 那种）：
+- 那两家的两站**共用同一个推理网关**，站点只决定登录页域名；而 MiniMax 两站的
+  **API 主机也不同**，且**账号不互通**；
+- 更关键的是**模型目录是按 provider 缓存一份的**（`MinimaxAdapter.loadModels` 的
+  `this.remoteModels`）⇒ 单 id 下两台只有一个适配器实例、目录来源是
+  `getAvailableAccount('minimax','')` 取到的**那一个**账号所属的站 ⇒ 另一站的模型
+  根本不进列表；若改成合并两站目录，用户选中仅 A 站有的模型而选号器选了 B 站账号时，
+  请求会发到 B 站主机 —— 而 **MiniMax 对不存在的模型名是 HTTP 200 + `message_start`
+  里静默回退成 `MiniMax-M3`**（见本文件 §8.7 的实测表）⇒ **用户完全看不出打错了模型**。
+  双 id 下这个错误结构上不可能发生。
+
+⚠️ **两站共用同一个 `MinimaxAdapter` / `MinimaxAuth` 类** ⇒ 改动任何一处实现都会
+**同时影响两站**（这是刻意的：同源协议修一遍就够）。但也意味着**接线必须两处都到位**：
+`probeById`、`WRITES_RATE_LIMIT_PROVIDERS`、`SELF_HEAL_REFRESHABLE_PROVIDERS`、
+`jet-hub-store` 的 ref 前缀表、`provider-credits` 的两条表项 —— 漏一处都是
+**静默失效**（症状是「国际站那个面板的某项功能永远不工作」）。
+
+⚠️ **验证状态**（2026-10-16 合并审计修正 —— 原文写「三项未真机取证（本机无国际站
+账号）」，与下文 §「✅ 2026-10-15 真机验证：上面 1、2 两项已确认同形，全部可用」
+**同文件自相矛盾**；本机**确实**用真实国际站账号登录并逐端点实测过）：
+1. **推理路径**（`POST /mavis/api/v1/llm/v1/messages`）—— ✅ **已真机验证**
+   （HTTP 200 + 真实 SSE，认证只需 `Authorization: Bearer`）；
+2. **签到端点形状**（`/minimax-cloud/api/v1/signin/{status,claim}` + `timezone_id`）
+   —— ✅ **已真机验证**（签到状态与积分返回 200）；
+3. **兜底模型表** —— ❌ **仍未按国际站远端采集**（两站共用同一份国内站快照）。
+   ⇒ **只有这一项**不该读成「已实现」；上面两项已经是实测事实，别再重复劳动。
+
+### ⚠️⚠️ 传输级重试：`fetch failed` 的真实缺陷（2026-10-15，已修）
+
+**用户报障**：「模型连接测试失败，显示 `fetch failed`」「积分查询及领取失败」。
+
+**本机取证**（同一凭据、同一端点、连打 10 次）：
+```
+签到 (signin/status): 成功 5/10 —— 失败全是
+  fetch failed ← self-signed certificate in certificate chain [SELF_SIGNED_CERT_IN_CHAIN]
+目录 (models)       : 成功 10/10
+```
+
+⇒ 环境里的 **HTTPS 检查代理**（企业 / 杀软 / **Clash 的 MITM 证书**）约 **50%**
+概率打断到本家的请求。**这是环境问题，但症状落在插件上**：一次偶发中断 = 整轮请求
+失败，用户看到 `fetch failed`。
+
+**修法**：`src/minimax.ts` 新增 `minimaxFetchWithRetry` + `isMinimaxTransportError`，
+**三处共用同一份**（不各写一份 —— 同义判据分两处必然漂移）：
+- 推理（`src/minimax-adapter.ts` 的 `send()`）
+- 目录（`src/minimax-auth.ts` 的 `fetchRawModels`）
+- 签到 / 积分（`src/minimax-credits.ts` 的 `requestEnvelope`）
+
+**效果实测**：裸 `fetch` **5/10** → 走本函数（插件真实代码路径）**10/10**。
+
+**四条边界**（`tests/unit/minimax-transport-retry.spec.ts` 逐条锁住，且都做过变异验证）：
+1. **只重试传输错误，绝不重试 HTTP 状态错误** —— 4xx/5xx 是服务端的**明确答复**
+   （401 要续期、402 要充值、429 要冷却），重发只会原样失败且掩盖真因；
+2. **abort 绝不重试** —— 用户点了停止还继续发是**不可接受**的行为；
+3. **真因在 `cause` 里** —— undici 把底层错误包成一句 `TypeError: fetch failed`，
+   判据必须**沿 `cause` 链**找（本仓库 `providers-opencode.md` 记过这一点）；
+   只读 `message` 会漏掉 `SELF_SIGNED_CERT_IN_CHAIN` / `UND_ERR_*` / `ECONNRESET`
+   （变异验证：改成只读 message ⇒ **4 条用例变红**）；
+4. **重试耗尽时抛最后一次的原错误对象** —— 保住 `cause` 链，真因仍可见
+   （换成自定义文案会让用户再也看不到「自签证书」这类唯一出路）。
+
+⚠️ 另一条**环境侧**线索（本次未改动，留作排查指引）：用户环境是 **Clash TUN +
+fake-IP**（`agent.minimax.io` 被判给 `198.18.0.14`），而 `fetch failed` 的真因正是
+Clash 的 MITM 证书。**若重试仍不够**，可把该域名加进 Clash 的 `fake-ip-filter`
+或关掉 TUN —— 但插件侧不应依赖它（重试才是正解）。
+
+### ✅ 2026-10-15 真机验证：上面 1、2 两项**已确认同形，全部可用**
+
+用真实国际站账号（经本插件登录）逐端点实测，并与官方开源实现
+`MiniMax-AI/minimax-code`（v0.6.11 打包产物 + 源码）逐字对拍：
+
+| 端点 | 实测结果 |
+|---|---|
+| `POST /mavis/api/v1/llm/v1/messages` | ✅ 200 + 真实 SSE（**`Bearer` 即可**，与国内站一致） |
+| `GET /minimax-cloud/api/v1/signin/status` | ✅ 200（真实签到面板） |
+| `GET /minimax-cloud/api/v1/credit/details` | ✅ 200（真实余额） |
+| `GET /mavis/api/v1/models?region=en&buildEnv=prod` | ✅ 200（4 个模型） |
+
+**主机与常量也全部核对正确**（官方源码逐字确认）：`account.minimax.io`
+（`oauth-core/src/endpoint-config.ts` 的 `ACCOUNT_ORIGINS.en.prod`；且官方
+`mcode login --region global` 打开的**就是**该主机）、推理基址
+`agent.minimax.io/mavis/api/v1/llm/v1`（`config/src/config.ts` 的
+`PRESET_BASE_URLS['en-prod']`）、OAuth 三常量（`contracts.ts` 的
+`mcode-public` / `agent.default` / `agent-backend`）。
+
+⇒ **两站协议同形**，「两站只差 6 个字段、共用全部实现」成立。
+
+### ⚠️⚠️ 一段**已被证伪**的中间结论（2026-10-15，留作教训，勿再采信）
+
+同一天中途，我曾据一次**上游故障窗口**内的探测写下如下结论并写进代码/文档：
+
+> ❌ 「国际站要求**阿里云 ALB 网关签名**；`/minimax-cloud/*` 回
+> `400 {"error":"invalid signature"}`、推理 `Bearer` 回 `401 token is required`；
+> 已穷举认证位置与主机均不通；推理与签到/积分**当前不可用**。」
+
+**该结论是错的。** 故障恢复后同样的请求全部 200。当时的三个错因：
+
+1. **把瞬时故障当成设计**：`invalid signature` / `token is required` 是上游网关在
+   故障期返回的**通用错误**，恢复后即消失 —— 我当时还拿
+   「不存在路径回 404、真实路径回 400」去论证「端点存在、只是要签名」，
+   那个推理本身成立，但**它无法区分「要签名」与「网关故障」**；
+2. **对照组选错**：我用「国内站通、国际站不通」推断「两站协议不同形」，却**没有
+   先让官方客户端复现**。后来跑 `mcode` 才发现**官方自己也连不上**（截图
+   `Code: 50112` = 官方枚举 `LLM_AUTH_ERROR`）—— 那才是决定性证据；
+   官方 mcode 探针抓到的推理请求头**也只有 `Authorization: Bearer`**
+   （另有 `x-api-key: sk-xxx` 占位与 `x-mavis-*`，缺之亦通），与我实现逐字相同；
+3. **烧掉了用户凭据**：为判断凭据归属，我对两个真实账号调了 `refresh_token`
+   却**没有写回**，服务端轮换后旧 token 作废，用户被迫重登。
+   ⇒ **诊断脚本绝不该对真实凭据发起 refresh，无论是否写回。**
+
+**可推广的教训**：区分「客户端 bug」与「服务端故障」时，**第一步就让官方/参考
+实现复现** —— 成本最低、结论最硬；不要拿一个失败面的组合去反推协议差异。
+
+**⚠️ 另有一条仍然成立的判据**：国际站的**目录端点当前是公开的**（无 token、垃圾
+token 都返回 200，与国内站不同）⇒ **「模型目录能读到」不构成凭据有效的证据**。
+凭据证据看推理 / 签到 / 积分三处。
+
+核验入口：`pnpm test:e2e:minimaxintl`（只读，实测 4/4 通过）/
+`pnpm test:e2e:minimaxintl-claim`（真实领取）。探针**刻意不硬断言**「恰好 4 个
+模型」—— 国际站远端模型集与国内站不同（实测 4 条），硬断言会在上游调整时假红；
+探针只断言「请求发出去了、拿到了可解读的响应」，实际内容打印给人核对。
 
 ### 1. ⚠️ `pending` 是 **HTTP 200**，不是 OAuth 标准的 400
 

@@ -132,6 +132,110 @@ export function isMinimaxRefreshable(credential: MinimaxCredential): boolean {
 }
 
 /**
+ * 传输级重试次数（**不含首次**；共发 `1 + N` 次）。
+ *
+ * ⚠️ 取 2 的依据：2026-10-15 本机实测，环境里的 **HTTPS 检查代理**
+ *（企业 / 杀软 / Clash 的 MITM 证书）约 **50%** 概率打断到本家的请求：
+ * ```
+ * 签到 (signin/status): 成功 5/10 —— 失败全是
+ *   fetch failed ← self-signed certificate in certificate chain [SELF_SIGNED_CERT_IN_CHAIN]
+ * 目录 (models)       : 成功 10/10
+ * ```
+ * 失败独立同分布 ⇒ 3 次全败约 12.5%，已足够把用户可见的 `fetch failed` 压得很低；
+ * 再加只会拖长真正的失败路径。
+ *
+ * ⚠️ **修复效果已实测**（同一端点、同一凭据、各 10 次）：
+ * 裸 `fetch` **5/10** → 走本函数（插件真实代码路径）**10/10**。
+ */
+export const MINIMAX_TRANSPORT_RETRIES = 2
+
+/** 传输级重试的基础退避（指数：base × 2^attempt）。 */
+export const MINIMAX_TRANSPORT_RETRY_BASE_MS = 400
+
+/**
+ * 该错误是否为**传输级**（值得原样重发的瞬时故障）。
+ *
+ * ## ⚠️ 与 `classifyMinimaxFailure` 的分工（不要合并）
+ *
+ * - 本函数判「**要不要重发**」——只看**没拿到 HTTP 响应**的错误；
+ * - `classifyMinimaxFailure` 判「**要不要换号 / 写冷却**」——那要看服务端的
+ *   **明确答复**（状态码或报文）。
+ *
+ * 合并会让「4xx 也重发」（浪费且掩盖真因），或「传输错误被当成额度」（误封账号）。
+ *
+ * ## ⚠️ 必须沿 `cause` 链找真因
+ *
+ * undici 把底层错误包成一句 `TypeError: fetch failed`，**真因在 `cause` 里**
+ *（本仓库 `docs/agent-notes/providers-opencode.md` 记过这一点）。
+ * 只读 `error.message` 会漏掉 `SELF_SIGNED_CERT_IN_CHAIN` / `UND_ERR_SOCKET` 等。
+ */
+export function isMinimaxTransportError(error: unknown): boolean {
+  const seen = new Set<unknown>()
+  let current: unknown = error
+  for (let depth = 0; current !== null && current !== undefined && depth < 6; depth += 1) {
+    if (seen.has(current)) break
+    seen.add(current)
+    if (typeof current !== 'object') break
+    const record = current as { name?: unknown; message?: unknown; code?: unknown; cause?: unknown }
+    const name = typeof record.name === 'string' ? record.name : ''
+    const message = typeof record.message === 'string' ? record.message.toLowerCase() : ''
+    const code = typeof record.code === 'string' ? record.code : ''
+    // undici 的传输类错误码族。
+    if (name.startsWith('UND_ERR_') || code.startsWith('UND_ERR_')) return true
+    // TLS / 证书类（本机 HTTPS 检查代理的典型形态）。
+    if (code.startsWith('SELF_SIGNED_CERT') || code.startsWith('CERT_')
+      || code === 'DEPTH_ZERO_SELF_SIGNED_CERT' || code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') return true
+    // 连接类。
+    if (code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'EPIPE'
+      || code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'EAI_AGAIN') return true
+    // undici 把上面这些都包在这一句里。
+    if (message.includes('fetch failed')) return true
+    if (message.includes('socket hang up') || message.includes('terminated')
+      || message.includes('other side closed')) return true
+    current = record.cause
+  }
+  return false
+}
+
+/** 退避等待（本文件内联一份，避免为一次退避引入跨模块依赖）。 */
+export function minimaxRetrySleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve()
+  return new Promise((resolve) => { setTimeout(resolve, ms) })
+}
+
+/**
+ * 带**传输级重试**地发一次请求。
+ *
+ * ⚠️ **只重试传输错误，绝不重试 HTTP 状态错误**：4xx / 5xx 是服务端的明确答复
+ *（401 要续期、402 要充值、429 要冷却），重发只会原样失败且掩盖真因。
+ *
+ * ⚠️ **abort 绝不重试**：用户点了停止还继续发是**不可接受**的行为。
+ *
+ * ⚠️ 重试耗尽时抛**最后一次**的错误对象（保住 `cause` 链，真因仍可见）。
+ *
+ * @param fetchOnce 只负责发一次；判据与退避都在这里，调用方不用管。
+ */
+export async function minimaxFetchWithRetry(
+  fetchOnce: () => Promise<Response>,
+  signal?: AbortSignal,
+  retries: number = MINIMAX_TRANSPORT_RETRIES,
+): Promise<Response> {
+  let lastError: unknown
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fetchOnce()
+    } catch (error) {
+      lastError = error
+      if (signal?.aborted === true) throw error
+      if (!isMinimaxTransportError(error)) throw error
+      if (attempt === retries) break
+      await minimaxRetrySleep(MINIMAX_TRANSPORT_RETRY_BASE_MS * 2 ** attempt)
+    }
+  }
+  throw lastError
+}
+
+/**
  * 构造业务请求头。
  *
  * ⚠️ MiniMax 的业务端点**只需 Bearer**（实测签到 / 积分 / 目录均如此），
