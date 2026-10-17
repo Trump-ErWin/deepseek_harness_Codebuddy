@@ -74,6 +74,9 @@ const AUTH_SERVICE: Readonly<Record<string, string>> = {
   officeace: 'officeaceAuth',
   // ⚠️ 服务名由 `${product.id}Auth` 派生 ⇒ `accioAuth`（全小写，与 provider id 同形）。
   accio: 'accioAuth',
+  // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。服务名同理由派生 ⇒ `modelscopeAuth`。
+  //    该名字由 `provider-runtime-wiring.spec.ts` 的真跑 `apply()` 探针独立验证过。
+  modelscope: 'modelscopeAuth',
 }
 
 /**
@@ -276,7 +279,10 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     ).toEqual([...EXPECTED_AUTH_PROVIDER_IDS].sort())
     // ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 13 → 15。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：15 → 16。
-    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(16)
+    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（魔搭）：16 → 17；
+    //    但上游同日另加了 minimaxintl，两侧增量恰好抵消 ⇒ **合并后仍是 16**。
+    //    ⚠️ 别被「本 fork 比上游多一家」的直觉误导：判据是 registry 的实测条数。
+    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(17)
     // 另一方向（原断言的**全部**证明力都在这条上，单独留着免得它随上面那条一起消失）：
     // 表里的每个键都必须是 registry 里真实存在的 provider id（防拼写错误造成的僵尸项）。
     for (const id of Object.keys(AUTH_SERVICE)) {

@@ -71,8 +71,13 @@ import type * as OfficeAceAuthModule from './officeace-auth.js'
 /** 以模块命名空间为类型（`startLogin` / `pollLoginCode` / `fetchSubscriptionSummary` 等纯函数）。 */
 type OfficeAceAuth = typeof OfficeAceAuthModule
 import type { AccioAuth } from './accio-auth.js'
+// ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+import type { ModelscopeAuth } from './modelscope-auth.js'
 import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
 import { ACCIO } from './accio-product.js'
+// ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+import { MODELSCOPE } from './modelscope-product.js'
+import { maskModelscopeKey } from './modelscope.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -196,6 +201,7 @@ import { pickTestModel,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
+import { handleModelscopeRpc } from './modelscope-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
 import type {
@@ -1277,6 +1283,12 @@ export interface JetHubAuths {
    */
   readonly officeace: OfficeAceAuth
   readonly accio: AccioAuth
+  /**
+   * ModelScope（魔搭）—— **本 fork 独有**（上游 rc.11 仍无此 provider）。
+   *
+   * ⚠️ 值是 `ModelscopeAuth` **Service 实例**（与 accio 同款），不是命名空间。
+   */
+  readonly modelscope: ModelscopeAuth
 }
 
 /**
@@ -2022,6 +2034,18 @@ function registerJetHubEndpoints(
     // 池内 `expiresAt` 确实会被写 ⇒ 不属 loomy / zcode 那类豁免。
     // 漏登记的后果是「凭据明明能续，面板却报未登录」（2026-10-12 复审发现）。
     ACCIO.id,
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
+    //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
+    //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
+    //    （`/openapi/v1/magicubes/balance`，带 API Key 返 200，实测随消耗下降），
+    //    `balance` 已改为 `true` ⇒ **积分端点现在确实会为它触发**。
+    //    ⇒ 仍豁免的依据只剩一条，且比 loomy / zcode 更根本：它的凭据是**长期有效的
+    //    静态 API Key**（`expires_at` 可选、实测默认不过期）⇒ 没有「快过期」，
+    //    自愈链对它无事可做；`refreshAccountCredential` 只做本地有效性对账、
+    //    不发网络请求，调它等于白跑一趟。
+    //    ⚠️ **「余额能读」与「凭据能续」是两件事** —— 正因为余额现在能读了，
+    //    才更需要显式留下这条豁免，否则后人会当成「忘了登记」而补进去。
+    //    显式豁免登记在 `credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT`。
   ])
 
   /**
@@ -3297,7 +3321,36 @@ function registerJetHubEndpoints(
     accounts: readonly ProviderAccountStatus[],
     provider: string,
   ): Promise<ProviderAccountStatus[]> {
-    if (provider !== ZCODE.id) return [...accounts]
+    if (provider === ZCODE.id) return enrichZcodeIdentity(accounts)
+    // ⚠️⚠️ **本 fork 独有**（modelscope，2026-10-17）：卡片要显示**打码**的
+    //    API Key 并提供「编辑」入口（`modelscope.setApiKey`）。
+    //    ⚠️ **只下发打码串，绝不下发明文** —— 凭据经 RPC 明文下发等于把它
+    //    摊到客户端的 devtools / 日志 / 崩溃上报里（本仓库对凭据一贯的要求）。
+    //    ⚠️ 打码在**宿主**做完（`maskModelscopeKey`）而不是客户端：
+    //    两端各写一份打码必然漂移，且客户端那份一旦漏判形状就会回显原文。
+    if (provider === MODELSCOPE.id) {
+      const out: ProviderAccountStatus[] = []
+      for (const account of accounts) {
+        try {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) { out.push(account); continue }
+          const parsed = JSON.parse(resolved.value) as { access_token?: unknown }
+          const masked = typeof parsed.access_token === 'string'
+            ? maskModelscopeKey(parsed.access_token)
+            : ''
+          out.push({ ...account, ...(masked === '' ? {} : { modelscopeKeyMask: masked }) })
+        } catch {
+          // 凭据损坏/未配置：保留原条目（卡片的「积分」栏会自行报错说明）。
+          out.push(account)
+        }
+      }
+      return out
+    }
+    return [...accounts]
+  }
+
+  /** ZCode 专有的身份补全（自 `enrichAccountIdentity` 原样搬出，见其文档）。 */
+  async function enrichZcodeIdentity(accounts: readonly ProviderAccountStatus[]): Promise<ProviderAccountStatus[]> {
     const out: ProviderAccountStatus[] = []
     for (const account of accounts) {
       try {
@@ -3349,6 +3402,19 @@ function registerJetHubEndpoints(
   async function handleMethod(method: string, payload: unknown, _signal?: AbortSignal): Promise<unknown> {
     if (method.startsWith('opencode.')) {
       const handled = await handleOpencodeRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-17 审计 P0 修复）：魔搭与 opencode
+    //    同属「不跳浏览器、手工粘贴 API Key」的 provider ⇒ 走各自的前缀改道分支。
+    //    ⚠️ 本分支此前**不存在**，而 `handleModelscopeRpc` 已导出却零调用点 ⇒
+    //    `modelscope.addAccount` 落进 `default` 回 `unknown method`，
+    //    而客户端 `account.create` 也无 modelscope 分支 ⇒ 报 `unknown provider:
+    //    modelscope`。**症状是「面板出现但永远加不了账号、零日志」** ——
+    //    即 `docs/agent-notes/providers-accio.md` 记的「接线陷阱（新 provider 通用）」
+    //    复发。判定依据同上面 opencode：必须在 `switch` 之前、且对不认识的方法
+    //    返回 `undefined` 让主 switch 继续匹配。
+    if (method.startsWith('modelscope.')) {
+      const handled = await handleModelscopeRpc(ctx, pool as never, method, payload)
       if (handled !== undefined) return handled
     }
     switch (method) {
