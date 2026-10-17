@@ -234,6 +234,22 @@ describe('OfficeAce 在途登录：并发的 `account.list` 不得收口它（�
       expect(pool.listAccountsByProvider('officeace'), '占位条目已登记').toHaveLength(1)
       expect(created.value.accountId.length).toBeGreaterThan(0)
 
+      // ⚠️⚠️ **必须确定性推进时钟**（实测修复：本用例红/绿约 1/3 随机）。
+      //
+      // ## 根因（探针实测，不是推断）
+      //
+      // `DSH_OFFICEACE_PENDING_TTL_MS = '0'` 让判据退化成
+      // `nowMs - pending.at > 0`（`isAbandonedOfficeAceLogin` 用的是**严格大于**），
+      // 即「**跨过 1 毫秒**才算中止」。而本用例在 `account.create` 之后**紧接着**
+      // 调 `account.list`，两者通常落在**同一毫秒** ⇒ `delta === 0` ⇒ 判「进行中」
+      // ⇒ 幽灵条目**没被收掉** ⇒ `toHaveLength(0)` 拿到 1 而变红。
+      // 探针实测：`delta=0 ⇒ 已中止=false`、`delta=1 ⇒ 已中止=true`。
+      //
+      // ⚠️ 为什么不能靠「重跑几次总会绿」：那是把随机性当通过，而本仓库已
+      //   为同型事故付出过代价（`isAbandonedOfficeAceLogin` 的注释里记着
+      //   「20 次只有 10 次变红」）。断言必须是**确定时刻**可驱动的。
+      await new Promise((r) => setTimeout(r, 2))
+
       await call('account.list', { provider: 'officeace' })
       expect(
         pool.listAccountsByProvider('officeace'),
@@ -244,3 +260,4 @@ describe('OfficeAce 在途登录：并发的 `account.list` 不得收口它（�
     }
   })
 })
+
