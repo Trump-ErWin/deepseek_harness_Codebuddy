@@ -332,13 +332,30 @@ describe('协议可达性与免费判定：远端优先、本地兜底（IKM9LR 
   it('⚠️⚠️ 端到端：远端目录里的新模型能出现在 listModels 里', async () => {
     // 这条是**本 issue 的形状**（不是断言某个函数，而是断言用户看到的列表）：
     // 远端 `/v1/models` 下发了本地表没有的模型 ⇒ 它必须出现在目录里。
+    //
+    // ⚠️⚠️ **模型 id 必须是本地兜底表里没有的**（2026-10-17 对抗审计实测打穿）。
+    //
+    // 本用例原先用 `deepseek-v4.1-flash-free` / `glm-5.3-flash-free`，
+    // 而它们**已被实测收录进 `OPENCODE_FALLBACK_MODELS`**（2026-10-17 那次修复
+    // 顺手加的）⇒ 断言对「远端表是否生效」**不敏感** ⇒ 实测把
+    // `listModels` 里的 `getOpencodeCapabilitiesSync()` 与 `await this.catalog()`
+    // 顺序颠倒（**那正是本 issue 的真缺陷**），本用例**仍然 27/27 全绿**，
+    // 全仓 9084 条单测也全绿 —— 一条假装在守护的守卫比没有守卫更糟。
+    //
+    // ⇒ 改用 `zzz-brand-new-x`（刻意不像任何真实模型名，且**不在本地表**）：
+    //    它可见**当且仅当**远端可达性表已注入 ⇒ 顺序颠倒时它必然消失。
     const { OpencodeAdapter } = await import('../../src/opencode-adapter.js')
     const { listIdentitySlots } = await import('../../src/opencode-auth.js')
-    const { OPENCODE } = await import('../../src/opencode-product.js')
+    const { OPENCODE, OPENCODE_FALLBACK_MODELS } = await import('../../src/opencode-product.js')
+    // ⚠️ 先钉住前提：这个 id 绝不能出现在本地兜底表里，否则本用例又会退化成恒真。
+    expect(
+      OPENCODE_FALLBACK_MODELS.map((m) => m.id),
+      '⚠️ 本用例选的模型 id 被加进本地兜底表了 ⇒ 断言会失去敏感性，请换一个',
+    ).not.toContain('zzz-brand-new-x')
     setModelsDevForTest({
       opencode: {
-        'deepseek-v4.1-flash-free': {
-          name: 'DeepSeek V4.1 Flash Free',
+        'zzz-brand-new-x': {
+          name: 'Zzz Brand New X',
           cost: { input: 0, output: 0 },
           provider: { api: 'https://opencode.ai/inference/openai/v1' },
         },
@@ -352,16 +369,17 @@ describe('协议可达性与免费判定：远端优先、本地兜底（IKM9LR 
       ),
       fetchRemoteCatalog: async () => new Response(JSON.stringify({
         data: [
-          { id: 'deepseek-v4.1-flash-free' },
+          { id: 'zzz-brand-new-x' },
+          // 远端有条目但**缺 provider.api** ⇒ 必须退回本地表（不判死）
           { id: 'glm-5.3-flash-free' },
           { id: 'claude-opus-4-5' },
         ],
       }), { status: 200 }),
     })
     const ids = (await adapter.listModels('opencode')).map((m) => m.id)
-    expect(ids).toContain('deepseek-v4.1-flash-free')
-    // 无条目的（glm-5.3-flash-free 没在能力表里）⇒ 退回本地表，而本地表里
-    // 它已被实测收录（2026-10-17），所以也该在。
+    // ⚠️ **核心断言**：它可见**当且仅当**远端表已注入（顺序颠倒时本条即红）。
+    expect(ids, '远端判定可达的模型必须可见 —— 顺序颠倒会让它消失').toContain('zzz-brand-new-x')
+    // 远端有条目但缺 provider.api ⇒ 退回本地表；本地表收录了它 ⇒ 仍可见。
     expect(ids).toContain('glm-5.3-flash-free')
     // anthropic 协议的必须挡掉。
     expect(ids).not.toContain('claude-opus-4-5')
@@ -381,6 +399,33 @@ describe('协议可达性与免费判定：远端优先、本地兜底（IKM9LR 
     setModelsDevForTest({ opencode: {} })
     expect(isReachableOpencodeModel('big-pickle'), '本地表里的仍在').toBe(true)
     expect(isReachableOpencodeModel('never-heard-of-it'), '未知 id 回退本地表').toBe(false)
+  })
+
+  it('⚠️⚠️ 远端**有条目但缺 provider.api** ⇒ 同样退回本地表（对抗审计补的第三格）', () => {
+    // ⚠️ 这一格原先**缺**，导致 `publishRemoteTables` 里三行判据恒真
+    // （2026-10-17 对抗审计实测打穿）：
+    //   把 `if (entry.chatProtocol !== undefined) reachability.set(...)` 改成
+    //   `reachability.set(entry.id, entry.chatProtocol === true)` ⇒ 全部守卫仍全绿，
+    //   而 `big-pickle`（远端有条目、无 provider.api）的 isReachable 真的
+    //   从 true 变成了 false（本地兜底被旁路）。
+    //
+    // 根因：上一条只测「远端**完全空**」这一格，而那格与本格在
+    // `setModelsDevForTest({ opencode: {} })` 下塌成了同一格 ⇒ 分辨不出。
+    setModelsDevForTest({
+      opencode: {
+        // ⚠️ **有**条目（证明不是「读不到」），但**没有** provider.api。
+        'big-pickle': { name: 'Big Pickle', cost: { input: 0, output: 0 } },
+      },
+    })
+    getOpencodeCapabilitiesSync()
+    // 前提钉死：这条必须真的缺 provider.api，否则本用例会测成「有 api 的那格」。
+    const cap = getOpencodeCapabilitiesSync().find((c) => c.id === 'big-pickle')
+    expect(cap, '前置：本用例需要 big-pickle 有条目').toBeDefined()
+    expect(cap!.chatProtocol, '前置：本用例需要 chatProtocol 为 undefined').toBeUndefined()
+    // ⚠️ **核心断言**：缺 provider.api 是「不知道」⇒ **必须**退回本地表（true），
+    //   而不是被判死（false）。
+    expect(isReachableOpencodeModel('big-pickle'),
+      '远端有条目但缺 provider.api ⇒ 判「不知道」⇒ 退回本地表，不得判死').toBe(true)
   })
 
   it('远端显式判免费时以远端为准（覆盖本地的错误标记）', () => {
