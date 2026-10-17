@@ -90,10 +90,20 @@ describe('分派归属（真实事故 2026-10-02）', () => {
   it('⚠️ 主 handleMethod 在 switch 之前先试 opencode 分支', () => {
     // Jet Hub 只有一条通道（connection.fetch.register → handleMethod），
     // 若不并入它的 switch，所有 opencode.* 方法都落在 default → unknown method。
+    //
+    // ⚠️⚠️ **不得用固定字符窗口切片**（2026-10-17 修）：原判据是
+    //    `slice(at, at + 900)`，而本 fork 在同一函数里新增了 `modelscope.` 改道分支
+    //    及其注释 ⇒ `switch (method)` 被挤出那 900 字符 ⇒
+    //    `body.indexOf('switch (method)')` 变成 -1，而 `177 < -1` 为假 ⇒ 假红。
+    //    ⚠️ **判据没抓住先怀疑判据本身**（本仓库反复记录的教训）：
+    //    魔数窗口对本文件里「任何新增分支/注释」都是定时炸弹，与被测行为无关。
+    // ⇒ 改为**锚点式**：从 `handleMethod` 起，取到**第一个** `switch (method)` 为止。
     const at = hubRpc.indexOf('async function handleMethod(')
-    const body = hubRpc.slice(at, at + 900)
+    expect(at, 'handleMethod 不存在').toBeGreaterThan(-1)
+    const sw = hubRpc.indexOf('switch (method)', at)
+    expect(sw, 'handleMethod 里没有 switch (method)').toBeGreaterThan(at)
+    const body = hubRpc.slice(at, sw)
     expect(body).toMatch(/handleOpencodeRpc\(/)
-    expect(body.indexOf('handleOpencodeRpc(')).toBeLessThan(body.indexOf('switch (method)'))
   })
 })
 

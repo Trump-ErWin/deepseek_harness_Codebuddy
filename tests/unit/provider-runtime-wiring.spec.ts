@@ -88,6 +88,12 @@ const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   // astudio 的服务名 = `${product.id}Auth` = `astudioAuth`（与 `src/astudio-auth.ts`
   // 里 `declare module Context { astudioAuth }` 逐字一致）。
   ['astudio', 'astudioAuth'],
+  // ⚠️ AutoClaw（智谱）：服务名由 `${product.id}Auth` 派生 ⇒ 全小写 `autoclawAuth`。
+  ['autoclaw', 'autoclawAuth'],
+  // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。服务名由 `${product.id}Auth`
+  //    派生 ⇒ `modelscopeAuth`。同款坑：本表由**真跑 apply() 的探针**验证过，
+  //    不凭注释推断。
+  ['modelscope', 'modelscopeAuth'],
 ]
 
 /**
@@ -176,7 +182,7 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
   })
 
   it('★ 14 家都挂上了 `auth.refreshAll`（Task 10：漏一家 ⇒ 该家永不自动续期且日志零字）', async () => {
-    // ⚠️ **为什么必须在这里断言**：`refreshTargets` 已从「手抄 14 行」改为
+    // ⚠️ **为什么必须在这里断言**：`refreshTargets` 已从「手抄固定行数」改为
     //    由 `wiredRefreshTargets()` **从注册表派生**。派生函数本身由
     //    `refresh-targets-derived.spec.ts` 测；**「注册循环真的把 14 家都接上了」
     //    只能靠真跑 `apply()` 才能证明** —— 这正是本文件的职责。
@@ -360,8 +366,12 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     const shouldRegister = expectedProviderIdsWithAuth().sort()
     // ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 13 → 15。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：15 → 16。
-    // ⚠️ 2026-10-16 并入 astudio ⇒ 16 → 17。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(17)
+    // ⚠️ 2026-10-16 并入 astudio：16 → 17。
+    // ⚠️ 2026-10-17 加 autoclaw（第 18）：17 → 18；
+    //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19；
+    //    再加 astudio（本 fork 与上游各登记一次）⇒ 19 → 20 个真渠道，
+    //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(19)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
@@ -406,6 +416,10 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     // opencode 的写点是**注入式**的：`index.ts` 把 `markLimited` 传给
     // `registerOpencodeLlm`，适配器内部 3 处调它（不是自己调 `updateModelRateLimit`）。
     ['opencode-adapter.ts', ['opencode']],
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-16）：它**会写** `modelRateLimits`
+    //    —— 见 `modelscope-adapter.ts` 的 `modelscopeRetryAfterMs`（429 指数退避 /
+    //    额度耗尽对齐 UTC+8 零点），与 registry 里**省略 `rateLimit`（= true）** 自洽。
+    ['modelscope-adapter.ts', ['modelscope']],
     // ⚠️ minimax **曾经**登记为空（不写标记）—— 2026-10-11 的 issue IKJW32 给它
     //    接上请求级换号 + 冷却后，它会写 `modelRateLimits`（额度 24h / 限流 1h）。
     //    下面那条「登记为不写标记的确实没有写点」用例就是靠这个变化**红**出来的。
@@ -419,6 +433,11 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     //    限流由华为云 MaaS 侧按账号配额管理，本地标记清掉、重测通过也恢复不了配额
     //    （与 gemini / loomy 同因）。登记为空是**被验证的声明**，不是「忘了接」。
     ['officeace-adapter.ts', []],
+    // ⚠️ autoclaw（AutoClaw 智谱）**同样不写** `modelRateLimits`：本 PR 只实现
+    // 目录 / 解析 / 流式，请求级换号与冷却不在范围内（registry 里
+    // `rateLimit: false`，与 accio 同形）。登记为空是**被验证的声明**，不是
+    // 「忘了接」—— 下面那条用例会真去 grep 源码确认确实没有写点。
+    ['autoclaw-adapter.ts', []],
     // accio（Accio 阿里）**不写** `modelRateLimits`：本任务（Task 6）只实现
     // 目录 / 解析 / 流式，请求级换号与冷却不在范围内。留空是**被验证的声明**
     // （见下面「登记为不写标记的文件确实没有写点」那条用例）。

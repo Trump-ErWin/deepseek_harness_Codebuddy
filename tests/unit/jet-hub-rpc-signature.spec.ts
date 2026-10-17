@@ -94,6 +94,9 @@ describe('registerJetHubRpc：auths 是命名对象（类型层守卫）', () =>
       // 由 #578 乙组落盘）。本用例是「完整命名对象调用能编译」的正向类型守卫，
       // 漏掉这个键会让 typecheck:tests 报 TS2345 —— 也正是该用例想要守的不变式。
       astudio: stub,
+      autoclaw: stub,
+      // ⚠️ **本 fork 独有**（魔搭，2026-10-16）：键同样是 provider id。
+      modelscope: stub,
     })
     // 运行时只要求端点真的注册了（证明桩搭对了，上面那行的类型检查才有意义）。
     expect(registered.length).toBeGreaterThan(0)

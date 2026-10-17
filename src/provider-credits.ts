@@ -69,8 +69,13 @@ import {
   fetchMinimaxSigninStatus,
 } from './minimax-credits.js'
 import { fetchRaccoonCreditBalance } from './raccoon-credits.js'
+// ⚠️ **本 fork 独有**（魔搭，2026-10-17）：魔粒余额原语。
+import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js'
+import type { ModelscopeCredential } from './modelscope.js'
+import { MODELSCOPE } from './modelscope-product.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
 import { fetchAstudioBalanceDetailed, claimDaily } from './astudio-credits.js'
+import { fetchAutoclawBalanceDetailed, claimAutoclawDailyQuota } from './autoclaw-credits.js'
 import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
 import { fetchZcodeBalance, type ZcodeBalanceResult } from './zcode-upstream.js'
@@ -87,6 +92,7 @@ import type { ProviderCredits } from './provider-runtime.js'
 import type { CodeArtsCredential, RpcCreditsBalanceExtra } from './types.js'
 import type { AccioCredential } from './accio.js'
 import type { AstudioCredential } from './astudio.js'
+import type { AutoclawCredential } from './autoclaw.js'
 import type { ClineCredential } from './cline.js'
 import type { GeminiCredential } from './gemini.js'
 import type { LobsteraiCredential } from './lobsterai.js'
@@ -302,6 +308,24 @@ export function createProviderCredits(
     },
 
     /**
+     * ModelScope（魔搭）：**本 fork 独有**（2026-10-17 接入魔粒余额）。
+     *
+     * ⚠️⚠️ **这一条推翻了 PR 的核心前提**。PR（及本仓库一度）判定「魔搭没有额度
+     * 查询 API」并把 `credits.balance` 登记为 `false`、还写进了豁免表。**那是错的**：
+     * 真端点是 `GET https://www.modelscope.cn/openapi/v1/magicubes/balance`，
+     * **带 API Key 直接返 200**（实测 281 → 发 2 次推理 → 277，恰好 -4）。
+     * ⇒ 不需要网页登录态、不需要 cookie、不需要起浏览器。
+     *
+     * ⚠️ 用 {@link ProviderCredits.fetchBalanceDetailed}：三种失败的**用户动作**
+     * 完全不同（Key 失效 → 重生成；端点侧拒绝 → 多半是账号未实名，换 Key 无用；
+     * 缺字段 → 上游改版该报「读数格式变了」），压成笼统的「查询失败」会误导。
+     */
+    modelscope: {
+      fetchBalanceDetailed: async (credential) =>
+        fetchModelscopeBalanceDetailed(credential as ModelscopeCredential, MODELSCOPE),
+    },
+
+    /**
      * Cline：协议原语自带**具体**原因（含 HTTP 状态码与错误体摘要），
      * 压成「余额查询失败」会丢掉唯一有用的线索。
      *
@@ -398,6 +422,13 @@ export function createProviderCredits(
      *    客户端按能力矩阵（`dailyCheckin: false`）根本不会渲染「一键领取积分」，
      *    与 raccoon 同形。给它一句文案反而会让面板多出一个永远点不动的入口。
      */
+    autoclaw: {
+      fetchBalanceDetailed: async (credential) =>
+        await fetchAutoclawBalanceDetailed(credential as AutoclawCredential),
+      claim: async (credential) =>
+        await claimAutoclawDailyQuota(credential as AutoclawCredential),
+      precheckStatus: false,
+    },
     accio: {
       fetchBalanceDetailed: async (credential) =>
         await fetchAccioBalanceDetailed(credential as AccioCredential),

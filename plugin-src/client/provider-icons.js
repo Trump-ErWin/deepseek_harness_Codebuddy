@@ -201,6 +201,15 @@ const MINIMAX_ICON = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0i
 const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgklEQVR42u3XsRGAIAyF4UxgYe0g7j+FpZtgRwN36stLAhruqP+v4ICIdNaybsViy92yCj+CeMW7CO94gwgFRMUrIgFTAPbzgPe/Aa5nAInTAGicAtDE1QBtXAVgxGEAeuIpAFYYArDj81xEoQDLd+A1ID8k3wTkXDDEaDbEcBo1nl/XXoK4yMqvMgAAAABJRU5ErkJggg==';
 
 /**
+ * ModelScope（魔搭）面板图标（内联 SVG data URL，手绘）。
+ *
+ * ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
+ * 与 Qoder / LobsterAI / TRAE / OpenCode 同款做法：走内联 SVG（体积小、无色差）。
+ * 图形：紫色圆角方块 + 白色 M 字形（ModelScope 首字母）。
+ */
+const MODELSCOPE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzYyNEFGRiIvPjxwYXRoIGQ9Ik02IDE3VjdoMi42bDMuNCA1LjJMMTUuNCA3SDE4djEwaC0yLjR2LTZsLTMgNC42aC0uMmwtMy00LjZ2Nkg2eiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg==';
+
+/**
  * OpenCode 面板图标（内联 SVG data URL，手绘）。
  *
  * ⚠️ 与 Qoder / LobsterAI / TRAE 同款做法：opencode 没有可取的小图标资源，
@@ -261,6 +270,8 @@ const ASTUDIO_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53
  * `provider-registry.spec.ts` 有一条断言锁住两边相等，漏加图标会**变红**
  *（而不是渲染出一个空白图标）。
  */
+const AUTOCLAW_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0Ij48cmVjdCB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHJ4PSI1IiBmaWxsPSIjNDM2MWVlIi8+PHBhdGggZD0iTTcgOGwzIDNsLTItNG00IDBsMyA0bC0yLTNtNCAwbDMgNWwtMi00IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PC9zdmc+';
+
 export const PROVIDER_ICONS = {
   codearts: CODEARTS_ICON,
   buddy: CODEBUDDY_ICON,
@@ -283,5 +294,7 @@ export const PROVIDER_ICONS = {
   officeace: OFFICEACE_ICON,
   accio: ACCIO_ICON,
   astudio: ASTUDIO_ICON,
+  autoclaw: AUTOCLAW_ICON,
+  modelscope: MODELSCOPE_ICON,
   aggregate: AGGREGATE_ICON,
 };
