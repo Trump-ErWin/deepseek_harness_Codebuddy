@@ -2504,6 +2504,52 @@ export class BuddyAdapter extends LlmAdapter {
     }
     if (!response.ok) {
       let errorText = await response.text().catch(() => '')
+      // ⚠️ 11140 安全策略拦截可能回 HTTP 400（2026-10-16 实测后端行为变更，
+      // 之前回 403）。403 在上面的 401/403 分支已处理；400 走到这里。
+      // 拦截按账号生效（同一请求在其他账号可 200），与 403 路径同一语义：
+      // 标记冷却 + 逐个换号，全部被拦才报 PERMISSION_DENIED。
+      if (response.status === 400 && isContentRejection(errorText)) {
+        console.warn(
+          `[${this.product.id}] 账号 ${currentAccountId || '(current)'} 被安全策略拦截`
+          + `（HTTP 400，code 11140），换号重试`,
+        )
+        await markPolicyBlockedAccount(
+          this.options.accountPool, this.product.id, currentAccountId, options.model,
+        )
+        if (this.options.accountPool !== undefined) {
+          const triedPolicy = new Set<string>()
+          if (currentAccountId) triedPolicy.add(currentAccountId)
+          for (;;) {
+            const next = await this.options.accountPool.getAvailableAccount<BuddyCredential>(
+              this.product.id, options.model, triedPolicy,
+            )
+            if (!next || triedPolicy.has(next.entry.id)) break
+            triedPolicy.add(next.entry.id)
+            credential = next.credential
+            currentAccountId = next.entry.id
+            response = await this.send(credential, body, options)
+            if (response.ok) {
+              yield* this.consumeSse(response, options, currentAccountId)
+              return
+            }
+            errorText = await response.text().catch(() => '')
+            if (response.status === 400 && isContentRejection(errorText)) {
+              await markPolicyBlockedAccount(
+                this.options.accountPool, this.product.id, currentAccountId, options.model,
+              )
+              continue
+            }
+            break
+          }
+        }
+        // 换号后仍是被策略拦截（或单凭据无法换号）：报专门的提示
+        if (!response.ok && response.status === 400 && isContentRejection(errorText)) {
+          throw contentRejectionError(
+            this.product.id, 400, errorText, this.options.accountPool !== undefined,
+          )
+        }
+        // 换号后变成其他错误（限流 / 饱和 / 认证）：继续走下面的既有逻辑
+      }
       // ⚠️⚠️ **模型饱和必须**先于**限流分支判定**（真实缺陷，2026-10-05）
       //
       // `14003 model busy` **也是 HTTP 429**，而 `isRateLimited` 对 429
