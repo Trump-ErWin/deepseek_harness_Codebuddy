@@ -247,7 +247,15 @@ function judge(c: Case): Verdict {
   if (c.code === '11102' || /service info not found/i.test(c.msg)) return 'no-verdict'
   // ⚠️ 这一格正是 IKM7SG 的发现：该账号**确实**要求三头 ⇒ 不是上游行为变更，
   //    而是「本文件的结论在**该账号**上不成立」。断言文案必须区分（见下方用例）。
-  if (c.status === 400 && c.code === '11128' && /conversation id missing/i.test(c.msg)) return 'account-gated'
+  //
+  // ⚠️⚠️ `msg` 必须**同时**认两句（2026-10-17 真机复现，master 上的独立复验）：
+  // IKM7SG 记的是 `conversation id missing`，而本机实测稳定拿到的是
+  // **`request illegal`** —— 两句都对应「该账号要求三头」这一形态，
+  // 只认一句会让另一半真实报文落进 `other` 而假红。
+  // ⚠️ 这里**必须带 code 闸门**：`request illegal` 也是 11140 族在用的措辞，
+  // 只按 msg 判会把 11140 也算成 account-gated（与实现侧的收窄口径一致）。
+  if (c.status === 400 && c.code === '11128'
+    && /conversation id missing|request illegal/i.test(c.msg)) return 'account-gated'
   return 'other'
 }
 
@@ -360,8 +368,8 @@ suite('IKM73W / IKM7SG：X-Conversation-* 三头的真机对照（消耗真实�
         // ⚠️ 这正是 IKM7SG 的分叉：**该账号**确实要求三头。**不是**上游行为变更，
         //    也不与「多数账号上三头非必需」矛盾 —— 两个结论范围不同。
         console.warn(
-          `⚠️ 账号 ${ref} 要求三头（${gated.length}/${results.length} 格为 400/11128 `
-          + `conversation id missing）—— 这不是上游行为变更，而是 IKM7SG 记录的`
+          `⚠️ 账号 ${ref} 要求三头（${gated.length}/${results.length} 格为 400/11128，`
+          + `实测 msg 为 \`request illegal\`）—— 这不是上游行为变更，而是 IKM7SG 记录的`
           + `「按账号生效」：本用例在该账号上不适用。请勿据此改动实现或注释。`,
         )
         summary.push(`  ${ref}: account-gated（${gated.length}/${results.length} 格被拒）`)

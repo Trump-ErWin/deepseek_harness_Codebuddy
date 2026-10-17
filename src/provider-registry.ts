@@ -451,13 +451,70 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
-    id: 'autoclaw',
+id: 'autoclaw',
     label: 'AutoClaw (智谱)',
     displayName: 'AutoClaw (智谱)',
     logoClass: 'autoclaw',
     credits: { balance: true, dailyCheckin: true },
     rateLimit: false,
     settingsNamespace: 'llm-autoclaw',
+    channel: true,
+  },
+  {
+    id: 'modelscope',
+    label: 'ModelScope (魔搭)',
+    displayName: 'ModelScope (魔搭)',
+    logoClass: 'modelscope',
+    // ⚠️⚠️ **2026-10-17 更正：本条已从 `false` 改为 `true`**（带真实 Key 实测）。
+    //
+    // 上面那段「12 条候选路径全 404 ⇒ 没有额度查询 API」的结论**是错的**，
+    // 错在**前缀**：那批探测只试过 `/api/v1/*` 与 `/v1/*`，而真端点在
+    // **`/openapi/v1/`** ——
+    //
+    //     GET https://www.modelscope.cn/openapi/v1/magicubes/balance
+    //     Authorization: Bearer <ms-…>
+    //     → {"success":true,"data":{"total_balance":281,"available_balance":281,
+    //        "frozen_amount":0}}
+    //
+    // ⚠️ 用错前缀时它落在 SPA catch-all 上（SPA 对**任何**路径都回 200 HTML ——
+    //    本仓库在 accio 记过同款「假 200」），两种表现都会让人误判成「不存在」。
+    //
+    // ⚠️⚠️ **「它是真余额」的判据是实测会随消耗下降**，不是字段名像余额：
+    //    实测 281 → 发 2 次推理（旗舰档每次扣 2 魔粒）→ 277，**恰好 -4**。
+    //    对照组 `/api/v1/quota/status`（API Key 也能读）实测发 3 次推理后
+    //    **逐字节不变** ⇒ 那是**任务奖励**（点赞/分享/绑定云账号），不是余额。
+    //
+    // ⇒ 不需要网页登录态、不需要采集 cookie、不需要起浏览器（三种认证实测：
+    //    API Key 200 / 网页 cookie 200 / 无凭据 401 `InvalidAuthentication`，
+    //    即它**确实在校验凭据**，符合仓库「目录能读 ≠ 凭据有效」的纪律）。
+    //
+    // ⚠️ **与 opencode 的关键差异**（别把两者当同一格）：opencode 的「余额」是
+    // 本地派生的**通道可用性**（零网络）；魔搭是**云侧真读数**，走 `credits` 域的
+    // `fetchBalanceDetailed`（三种失败的用户动作不同，故不用笼统的 `fetchBalance`）。
+    credits: { balance: true, dailyCheckin: false },
+    // ⚠️ 无签到：额度是**每日自动刷新**（每账号 250 魔粒、UTC+8 零点重置，
+    //    旗舰档每次扣 2），**没有「领取」动作、也没有签到 API**。
+    //    宿主侧 credits.claimAll 仍要显式回一句可读错误（见 jet-hub-rpc.ts），
+    //    否则自动签到会把它记成 **failed** 而不是 **inactive**。
+    //
+    // ⚠️⚠️ **登记 `rateLimit: false`（用户要求，2026-10-17）** —— 这**不是**能力缺失，
+    //    是**产品取舍**，两者的区别必须留在注释里：
+    //
+    //    - 能力上：魔搭确实会回 429，本适配器**确实会写** `modelRateLimits`
+    //      （`modelscope-adapter.ts` 的 `modelscopeRetryAfterMs`），接线层也注入了
+    //      `markLimited`（`index.ts`）；
+    //    - 取舍上：用户不要「重测 / 重置」两个按钮，故关掉入口。
+    //
+    //    ⚠️⚠️ **代价（必须如实记录）**：冷却标记**仍会写进池**，只是用户**没法用按钮
+    //    清除它** ⇒ 遇到 429 后只能等它自然过期，或删掉该账号重加。
+    //    ⚠️ 与 loomy / gemini / officeace / accio 的 `rateLimit: false` **不同源**：
+    //    那几家是「拿不到探测材料」（点了必然报「没有探测适配器」），魔搭是
+    //    「探测材料齐全但入口刻意关闭」。**别把它当成漏登记**。
+    //    ⚠️ 前两行那条「不登记 rateLimit：魔搭确实会回 429…」的旧注释已被本条取代。
+    rateLimit: false,
+    // ⚠️ 不登记 accountTest / creditPackages / permanentLock / usesExpiryWindow
+    //    —— 全部省略 = false，与能力实情一致。
+    // ⚠️ 不登记 settingsNamespace：它不在老契约（≤0.1.6）的 namespace 清单里。
     channel: true,
   },
   {

@@ -27,15 +27,53 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-it('共 19 条（18 个真渠道 + aggregate）', () => {
+it('共 20 条（19 个真渠道 + aggregate）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
     //    它与 `minimax` 账号不互通、API 主机不同 ⇒ 是两个 provider。
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱，第 18 个真渠道）。
-    expect(PROVIDER_REGISTRY).toHaveLength(19)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(18)
+    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（魔搭，第 19 个真渠道）：上游没有它。
+    //    ⚠️ 合并上游时**不要**把这里改回上游数字 —— 那会让两个声明都失去守卫
+    //    （条数断言是「注册表没被误删」的唯一防线）。
+    expect(PROVIDER_REGISTRY).toHaveLength(20)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(19)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
+  })
+
+  /**
+   * ⚠️⚠️ **声明序 = 设置页左栏的默认渲染序**（2026-10-17，用户报障）。
+   *
+   * 未自定义 `providerOrder` 时，左栏完全按 `PROVIDER_REGISTRY` 的**声明序**
+   * 渲染（`sortOpenProvidersByOrder` 对空序是恒等函数）；而已关闭组**恒按声明序
+   * 沉底**、永不被自定义序覆盖。
+   *
+   * ⚠️ 本条守的是**相对位置**而非绝对下标：新增 provider 时下标必然漂移，
+   * 钉死数字会变成「必然过期」的快照（仓库对这类魔数断言有明确教训）。
+   *
+   * 需求：ModelScope 的设置标签应排在**聚合之上**。
+   */
+  it('★ modelscope 的声明序在 aggregate 之前（设置页左栏的默认渲染序）', () => {
+    const ids = PROVIDER_REGISTRY.map((d) => d.id)
+    const im = ids.indexOf('modelscope')
+    const ia = ids.indexOf('aggregate')
+    expect(im, 'registry 里找不到 modelscope').toBeGreaterThan(-1)
+    expect(ia, 'registry 里找不到 aggregate').toBeGreaterThan(-1)
+    expect(im, 'ModelScope 必须排在聚合之上，否则它在左栏会被排到聚合下面')
+      .toBeLessThan(ia)
+  })
+
+  it('★ 真实排出的左栏顺序与声明序一致（复刻客户端排序口径，非源码断言）', async () => {
+    // ⚠️ 真跑客户端的排序纯函数：只测 registry 的相对位置不足以覆盖
+    //    「用户已自定义过 providerOrder」这条路径（未出现在序里的项按声明序补后）。
+    const { sortOpenProvidersByOrder } = await import('../../plugin-src/client/provider-toggle.js')
+    const ids = PROVIDER_REGISTRY.map((d) => ({ id: d.id }))
+    // 复刻本机实测的 providerOrder：自定义但**不含** aggregate / modelscope
+    const order = ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'trae', 'cline',
+      'loomy', 'raccoon', 'minimax', 'zcode', 'opencode', 'gemini', 'qoder', 'qodercn']
+    const sorted = sortOpenProvidersByOrder(ids, order).map((p) => p.id)
+    expect(sorted.indexOf('modelscope'),
+      `实际左栏顺序：${sorted.join(' → ')}`).toBeLessThan(sorted.indexOf('aggregate'))
   })
 
   it('descriptorOf 按 id 取；未知返回 undefined', () => {
@@ -112,17 +150,26 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(win).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('rateLimit === false 恰好是 4 家（officeace 2026-10-12、accio 2026-10-13 加入）', () => {
+  it('rateLimit === false 恰好是 5 家（modelscope 2026-10-17 加入，理由与前四家不同）', () => {
     const off = PROVIDER_REGISTRY.filter((d) => d.rateLimit === false)
       .map((d) => d.id).sort()
-    // ⚠️ 四家**理由各不相同**（见 registry 里各自的字段注释）：
+    // ⚠️ **五种理由各不相同**（见 registry 里各自的字段注释）：
     // - loomy：根本不返回限流错误（静默降级扣永久积分）；
     // - gemini / officeace：限流是服务端配额窗口制，本地标记与重测都不改变配额；
     // - accio：**不写 `modelRateLimits` 且不在 `probeById` 里** ⇒
     //   两个按钮恒为惰性（零请求、零清除）。
+    // - modelscope（**本 fork**，2026-10-17 用户要求）：**能力齐全但刻意关入口** ——
+    //   它确实会写 `modelRateLimits`、也确实注入了 `markLimited`。
+    //   ⚠️ 与前四家**不同源**：代价是「冷却标记仍写进池，但用户没法用按钮清除」
+    //   （只能等自然过期或删号重加），而不是「按钮点了没用」。
+    //   ⚠️ 它在 `credits-capabilities.spec.ts` 的 `RATE_LIMIT_OFF_BY_CHOICE`
+    //   里有独立登记（那张表专门区分「产品取舍」与「语义管辖不到」两类）。
+    //
     // 新增一家时**不要**只改这里：判据是 registry 的落地问法
-    //「这个按钮点下去，能不能让用户少受限一次？」
-    expect(off).toEqual(['accio', 'autoclaw', 'gemini', 'loomy', 'officeace'])
+//「这个按钮点下去，能不能让用户少受限一次？」——
+    // ⚠️ 而 modelscope 打破的正是这条问法的前提（它**能**，只是不要）。
+    //    ⇒ 所以「能」不再是必要条件，「用户是否要这个按钮」才是。
+    expect(off).toEqual(['accio', 'autoclaw', 'gemini', 'loomy', 'modelscope', 'officeace'])
   })
 
   it('accountTest === true 恰好是 gemini', () => {
