@@ -192,6 +192,55 @@ describe('buddy-compensation：领取（写操作）', () => {
     if (result.ok) return
     expect(describeCompensationFailure(result.failure)).toContain('已领取过')
   })
+
+  /**
+   * ⚠️⚠️ 这条锁的是**真实报障**（2026-10-17）：领取成功响应**没有 `data`**。
+   *
+   * 当时的实现要求 `data` 是对象，于是把「已经领到 500 分」判成
+   * 「响应格式不认识：响应缺 data 对象」，面板显示「5 个账号领取失败」，
+   * 而复查 status 时 5/5 都是 `claimed:true`。
+   *
+   * ⇒ 写操作的成败只由 `code` 决定，**不许**再对 `data` 做形状要求。
+   */
+  it('★ 成功信封没有 data（真实形态）⇒ 必须判成功，不能报「响应格式不认识」', async () => {
+    const { fetcher } = fakeFetcher(JSON.stringify({ code: 0, msg: 'OK', requestId: '858fa602-b002' }))
+    const result = await claimCompensation(CREDENTIAL, CODEBUDDY, fetcher)
+    expect(result.ok).toBe(true)
+  })
+
+  it('★ data 为 null + code 0 ⇒ 同样是成功（不因 null 翻成 shape）', async () => {
+    const { fetcher } = fakeFetcher(JSON.stringify({ code: 0, msg: 'OK', data: null }))
+    const result = await claimCompensation(CREDENTIAL, CODEBUDDY, fetcher)
+    expect(result.ok).toBe(true)
+  })
+
+  it('⚠️ 没有业务码又缺 data ⇒ 仍判 shape（无法区分网关 JSON 错误体，不许猜成功）', async () => {
+    const { fetcher } = fakeFetcher(JSON.stringify({ msg: 'OK' }))
+    const result = await claimCompensation(CREDENTIAL, CODEBUDDY, fetcher)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.failure.kind).toBe('shape')
+    // 排障线索要带上：旧文案只有六个字，看不出信封里到底有什么
+    expect(describeCompensationFailure(result.failure)).toContain('code=缺失')
+    expect(describeCompensationFailure(result.failure)).toContain('顶层字段=')
+  })
+})
+
+describe('buddy-compensation：状态查询与领取的判据刻意不同', () => {
+  /**
+   * 状态查询的返回值**就是** `data` 里的字段 ⇒ 缺 `data` 说明接口形态变了，
+   * 必须让用户看见（不能像写操作那样放行）。这条防止有人「顺手统一」两处判据。
+   */
+  it('状态查询缺 data ⇒ 仍是 shape，且文案带 requestId/msg 便于排障', async () => {
+    const { fetcher } = fakeFetcher(JSON.stringify({ code: 0, msg: 'OK', requestId: 'b01d5abe' }))
+    const result = await fetchCompensationStatus(CREDENTIAL, CODEBUDDY, fetcher)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.failure.kind).toBe('shape')
+    const text = describeCompensationFailure(result.failure)
+    expect(text).toContain('requestId=b01d5abe')
+    expect(text).toContain('msg=OK')
+  })
 })
 
 describe('buddy-compensation：产品隔离', () => {
