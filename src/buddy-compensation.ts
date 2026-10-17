@@ -54,6 +54,22 @@
  * cookie** —— 已用 Node `fetch`（无任何浏览器上下文）实测 200。这是本功能
  * 能脱离「网页点按钮」实现自动化的前提。
  *
+ * ## 真实报文（2026-10-17，领取端点 —— **成功时没有 `data`**）
+ *
+ * `POST /billing/meter/claim-compensation`（空 body）→ HTTP 200：
+ *
+ * ```json
+ * {"code":0,"msg":"OK","requestId":"…"}
+ * ```
+ *
+ * **没有 `data` 字段。** 当时本机 5 个账号批量领取，5/5 都是这个形态：
+ * 面板按「缺 `data` ⇒ shape」判成「响应格式不认识：响应缺 data 对象」，
+ * 于是报「5 个账号领取失败」；而随后用同一批 token 查 status，5/5 都是
+ * `claimed:true, active:true, credit_num:500` —— **积分其实早就到账了**。
+ *
+ * ⇒ 写操作的成败**只看 `code`**（见 `parseEnvelope` 的 `requireData`）；
+ *   状态查询仍然要求 `data`，两者判据刻意不同。
+ *
  * ## ⚠️ 为什么**不**接进自动签到（本模块的实现约定）
  *
  * 这是一次性的**限时**补偿（`end_time` 到期即作废），不是每日可领的能力。
@@ -213,10 +229,24 @@ function readStr(source: Record<string, unknown>, key: string): string | undefin
  * ⚠️ **判据分三层，不合并**：① 不是对象 / 缺 `data` ⇒ `shape`；
  * ② `code` 非 0 ⇒ `upstream`（带上游 `msg` 原文，那是排障的唯一线索）；
  * ③ 通过 ⇒ 交给各自的字段映射。
+ *
+ * ## ⚠️ `requireData: false` 是给**写操作**（领取）的，别对状态查询用
+ *
+ * 上游的领取端点成功时**只回 `{code:0,msg:"OK",requestId}`，压根没有 `data` 字段**
+ * （2026-10-17 本机 5 个账号实测：5/5 领取成功、余额已到账，却被这里判成
+ * 「响应缺 data 对象」⇒ 面板报「响应格式不认识」，用户看到「5 个领取失败」）。
+ *
+ * ⇒ 写操作的成败**只由 `code` 决定**；缺 `data` 不等于失败。
+ * 但**仍然要求 `code === 0`**：没有业务码的响应无法与「网关回了个 JSON 错误体」
+ * 区分，宁可继续报 `shape`，也不要把未知形态当成功（一次性写操作尤其不能猜）。
+ *
+ * 状态查询必须保留 `requireData`（默认 true）：它的返回值就是 `data` 里的字段，
+ * 缺 `data` 说明接口形态变了，必须让用户看见。
  */
 function parseEnvelope(
   text: string,
   status: number,
+  options: { requireData?: boolean } = {},
 ): { ok: true; data: Record<string, unknown> } | { ok: false; failure: CompensationFailure } {
   let parsed: unknown
   try {
@@ -241,9 +271,28 @@ function parseEnvelope(
   }
   const data = env['data']
   if (typeof data !== 'object' || data === null) {
-    return { ok: false, failure: { kind: 'shape', message: '响应缺 data 对象' } }
+    // 写操作：`code === 0` 即成功，缺 `data` 是**上游成功信封的常态**（见上）。
+    if (options.requireData === false && code === 0) return { ok: true, data: {} }
+    return { ok: false, failure: { kind: 'shape', message: describeMissingData(env, code) } }
   }
   return { ok: true, data: data as Record<string, unknown> }
+}
+
+/**
+ * 缺 `data` 时的可读原因。
+ *
+ * ⚠️ 旧文案只有「响应缺 data 对象」六个字，排障时**无法判断**是接口换形态、
+ * 还是响应里其实带了 `code/msg` 却没被展示。这里把信封自身的线索一并带出来
+ * （**不含凭据**：响应体里没有 token）。
+ */
+function describeMissingData(env: Record<string, unknown>, code: number | undefined): string {
+  const parts = [`code=${code === undefined ? '缺失' : String(code)}`]
+  const msg = readStr(env, 'msg') ?? readStr(env, 'message')
+  if (msg !== undefined) parts.push(`msg=${msg}`)
+  const requestId = readStr(env, 'requestId') ?? readStr(env, 'request_id')
+  if (requestId !== undefined) parts.push(`requestId=${requestId}`)
+  parts.push(`顶层字段=[${Object.keys(env).join(',')}]`)
+  return `响应缺 data 对象（${parts.join('，')}）`
 }
 
 /**
@@ -297,6 +346,11 @@ export async function fetchCompensationStatus(
  * ⚠️ **不做重试**：这是一次性写操作，超时后服务端可能已经成功。盲目重试会有两种
  * 坏结果：① 若上游幂等则白打一次请求；② 若上游返回「已领取」的业务码，调用方
  * 会把「其实成功了」误报成失败。故这里**最多发一次**，失败就把上游原文交给用户。
+ *
+ * ⚠️⚠️ **成功响应没有 `data`**（2026-10-17 实测，见 `parseEnvelope` 的说明）：
+ * 上游回的是 `{"code":0,"msg":"OK","requestId":"…"}`。这里必须传
+ * `requireData: false`，否则「已领到 500 分」会被判成「响应格式不认识」
+ * ——本机 5 个账号 5/5 命中过这个假失败。
  */
 export async function claimCompensation(
   credential: BuddyCredential,
@@ -315,7 +369,7 @@ export async function claimCompensation(
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
     const text = await response.text()
-    const env = parseEnvelope(text, response.status)
+    const env = parseEnvelope(text, response.status, { requireData: false })
     if (!env.ok) return { ok: false, failure: env.failure }
     return { ok: true }
   } catch (error) {
