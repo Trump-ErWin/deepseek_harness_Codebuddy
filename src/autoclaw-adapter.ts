@@ -154,15 +154,20 @@ export class AutoclawAdapter extends LlmAdapter {
           contextWindow: known.contextWindow,
           ...(known.maxOutputTokens !== undefined ? { maxOutputTokens: known.maxOutputTokens } : {}),
         },
+        // ⚠️ **只在已知模型上声明档位**（跨家契约，见
+        //    `tests/unit/model-catalog-parity.spec.ts` 的 `DECLARE_UNKNOWN_REASONING`）：
+        //    档位是**该模型**的能力，上游随时可能新增/下线模型，对未知 id 声明
+        //    等于凭空捏造。同文件里的 `context` 本来就是条件给的，两处必须同向 ——
+        //    否则「未知模型」这一格会在 `context` 上诚实、在 `reasoning` 上撒谎。
+        reasoning: {
+          efforts: [
+            { id: ReasoningEffortId('low'), name: '快速思考 (Low)' },
+            { id: ReasoningEffortId('high'), name: '深度思考 (High)' },
+            { id: ReasoningEffortId('max'), name: '极限推理 (Max)' },
+          ],
+          defaultEffort: ReasoningEffortId('high'),
+        },
       }),
-      reasoning: {
-        efforts: [
-          { id: ReasoningEffortId('low'), name: '快速思考 (Low)' },
-          { id: ReasoningEffortId('high'), name: '深度思考 (High)' },
-          { id: ReasoningEffortId('max'), name: '极限推理 (Max)' },
-        ],
-        defaultEffort: ReasoningEffortId('high'),
-      },
     }
   }
 

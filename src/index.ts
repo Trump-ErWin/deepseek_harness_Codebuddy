@@ -2092,6 +2092,16 @@ export function apply(ctx: Context): void {
           }
         },
         fallback: { kind: 'ref', refName: AUTOCLAW.defaultCredentialRef },
+        // ⚠️ **必须接**（与 accio 同因）：本工厂的兜底是**固定 ref**
+        //    （`AUTOCLAW_ACCESS_TOKEN`），而 Jet Hub 登录只写
+        //    `AUTOCLAW_ACCOUNT_XXX` ⇒ 池被筛空时它会退到那个**从不被写入**的
+        //    ref，报出误导性的「请先登录」（issue IKJOZ9 的形态）。
+        //    ⚠️ 今天它是**恒不命中的死代码**（`autoclaw-adapter.ts` 不写
+        //    `modelRateLimits` —— `provider-runtime-wiring.spec.ts` 的
+        //    `WRITE_SITE_FILES` 把这一点登记为空并**验证**了「确实没有写点」）。
+        //    保留它是有意的：判据是「兜底形态是否会让池被筛空时报错」，
+        //    而不是「今天有没有标记」。
+        throwIfAllRateLimited: throwIfAllAccountsRateLimited,
       },
     ),
     product: AUTOCLAW,
