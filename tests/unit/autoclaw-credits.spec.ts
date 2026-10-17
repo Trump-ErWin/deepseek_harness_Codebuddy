@@ -2,10 +2,12 @@ import { describe, expect, it, vi } from 'vitest'
 import { AUTOCLAW } from '../../src/autoclaw-product.js'
 import {
   AUTOCLAW_DAILY_CLAIM_PATH,
+  AUTOCLAW_LEDGERS_PATH,
   AUTOCLAW_WALLETS_PATH,
   claimAutoclawDailyQuota,
   fetchAutoclawBalanceDetailed,
   fetchAutoclawCreditBalance,
+  parseAutoclawLedgerBatches,
   parseAutoclawWallets,
 } from '../../src/autoclaw-credits.js'
 import { createProviderCredits } from '../../src/provider-credits.js'
@@ -81,9 +83,11 @@ const MOCK_WALLETS_PAYLOAD = {
 }
 
 describe('parseAutoclawWallets', () => {
-  it('正确解析各类型钱包明细并按 priority 升序排序', () => {
+  it('只保留服务端 display=true 的可见池，其余（display=false）按官方客户端同款过滤', () => {
     const packages = parseAutoclawWallets(MOCK_WALLETS_PAYLOAD.data.wallets)
-    expect(packages).toHaveLength(5)
+    // ⚠️ 夹具是真实响应：4 个隐藏池 display=false（官方 main.cjs readWallets
+    //    只保留 display === true）。旧断言期望 5 个全出 ⇒ 正是「每日 0」红字的根源。
+    expect(packages).toHaveLength(1)
 
     expect(packages[0]).toMatchObject({
       name: '奖励积分',
@@ -92,23 +96,10 @@ describe('parseAutoclawWallets', () => {
       active: true,
       unit: '积分',
     })
-    expect(packages[1]).toMatchObject({
-      name: '每日积分',
-      remaining: 0,
-      active: false,
-    })
-    expect(packages[2]).toMatchObject({
-      name: '签约积分',
-      remaining: 0,
-    })
-    expect(packages[3]).toMatchObject({
-      name: '加油包积分',
-      remaining: 0,
-    })
-    expect(packages[4]).toMatchObject({
-      name: '其他积分',
-      remaining: 0,
-    })
+    // ⚠️ 「每日红 + 刷新倒计时」按池名匹配（DAILY_POOL_NAMES 含「每日积分」），
+    //    是 Loomy 当日重置池的语义；AutoClaw 的每日签到积分按批次到期（见流水批次
+    //    分组），隐藏池被滤掉后不再渲染红色「每日 0」。
+    expect(packages.some((p) => p.name === '每日积分')).toBe(false)
   })
 
   it('缺失 display_name 时按 public_wallet_type 回退默认中文标签', () => {
@@ -141,10 +132,14 @@ describe('fetchAutoclawBalanceDetailed & fetchAutoclawCreditBalance', () => {
     expect(result.error).toBeUndefined()
     expect(result.balance).not.toBeNull()
     expect(result.balance!.total).toBe(32365)
-    expect(result.balance!.packages).toHaveLength(5)
+    // ⚠️ display=false 的隐藏池被滤掉（见 parseAutoclawWallets 的守卫），
+    //    且本桩对流水 URL 回钱包载荷（无 entries）⇒ 批次为空 ⇒ 回退钱包包。
+    expect(result.balance!.packages).toHaveLength(1)
     expect(result.balance!.expiredTotal).toBe(0)
 
-    expect(fetcher).toHaveBeenCalledTimes(1)
+    // ⚠️ 两次调用：先钱包、再流水（临期桶数据源）。流水响应没有 entries
+    //    （本桩对所有 URL 回同一载荷）⇒ 批次为空 ⇒ 回退钱包包，形状不变。
+    expect(fetcher).toHaveBeenCalledTimes(2)
     const [url, init] = fetcher.mock.calls[0] as [string, RequestInit]
     expect(url).toBe(`${AUTOCLAW.apiBase}${AUTOCLAW_WALLETS_PATH}?biz_app_id=autoclaw`)
     expect(init.method).toBe('GET')
@@ -329,6 +324,130 @@ describe('claimAutoclawDailyQuota', () => {
     if (netOutcome.kind === 'failed') {
       expect(netOutcome.message).toContain('Connection abort')
     }
+  })
+})
+
+describe('临期桶：display 过滤与流水批次（2026-10-17 用户要求「像 buddy 一样红临期加倒计时」）', () => {
+  /** 真实取证（scripts/probe-autoclaw-expiry.mjs）：发放带 wallet_expires_at（秒）。 */
+  const LEDGER_PAGE = {
+    code: 0,
+    msg: 'SUCCESS',
+    data: {
+      entries: [
+        {
+          id: '1', asset_type: 'point', wallet_type: 'earned', wallet_scope: 'campaign',
+          mutation_type: 'credit', amount: 20000, source: 'campaign',
+          description: 'AutoClaw 用户登录奖励积分，7天有效',
+          metadata: { description: 'AutoClaw 用户登录奖励积分，7天有效' },
+          occurred_at: '2026-10-15T13:44:21Z', wallet_expires_at: 1_798_885_461,
+        },
+        {
+          id: '2', asset_type: 'point', wallet_type: 'earned', wallet_scope: 'annual',
+          mutation_type: 'credit', amount: 200, source: 'manual',
+          description: '每日签到',
+          metadata: { description: '每日签到' },
+          occurred_at: '2026-10-17T13:44:43Z', wallet_expires_at: 1_798_885_483,
+        },
+        {
+          id: '3', asset_type: 'point', wallet_type: 'earned', wallet_scope: 'campaign',
+          mutation_type: 'credit', amount: 500, source: 'campaign',
+          description: '已过期批次', occurred_at: '2026-10-01T00:00:00Z',
+          wallet_expires_at: 1_700_000_000,
+        },
+      ],
+    },
+  }
+
+  it('① 服务端 display=false 的隐藏池被丢弃（红色「每日 0」的根源）', () => {
+    const raw = {
+      total_balance: 20700,
+      wallets: [
+        { public_wallet_type: 'reward', display_name: '奖励积分', balance: 20700, display: true, priority: 10 },
+        { public_wallet_type: 'daily', display_name: '每日积分', balance: 0, display: false, priority: 20 },
+        { public_wallet_type: 'other', display_name: '其他积分', balance: 0, display: false, priority: 50 },
+      ],
+    }
+    const packages = parseAutoclawWallets(raw.wallets)
+    expect(packages, '官方客户端同款过滤（main.cjs readWallets）').toHaveLength(1)
+    expect(packages[0]!.name).toBe('奖励积分')
+    // ⚠️ 「每日红 + 刷新倒计时」按池名匹配（DAILY_POOL_NAMES），滤掉隐藏池后不再命中。
+    expect(packages.some((p) => p.name === '每日积分')).toBe(false)
+  })
+
+  it('② 流水批次 → 逐包 deductionEndTime（毫秒），已过期批次丢弃，守恒口径', () => {
+    const batches = parseAutoclawLedgerBatches(LEDGER_PAGE.data.entries, 1_798_800_000_000)
+    // 已过期（第 3 条）丢弃；两条未过期按到期时刻各自成包，升序。
+    expect(batches).toHaveLength(2)
+    expect(batches[0]!.name).toContain('登录奖励')
+    expect(batches[0]!.remaining).toBe(20000)
+    expect(batches[0]!.deductionEndTime).toBe(1_798_885_461_000)
+    expect(batches[1]!.name).toBe('每日签到')
+    expect(batches[1]!.remaining).toBe(200)
+    expect(batches[1]!.deductionEndTime).toBe(1_798_885_483_000)
+    // 守恒：批次之和 == 钱包总额（fetch 层以此决定采用批次还是回退）。
+    expect(batches.reduce((s, p) => s + p.remaining, 0)).toBe(20200)
+  })
+
+  it('③ 无到期字段的发放归永久桶（不带 deductionEndTime）', () => {
+    const batches = parseAutoclawLedgerBatches([
+      { mutation_type: 'credit', amount: 300, description: '永久赠送' },
+      { mutation_type: 'credit', amount: 100, wallet_expires_at: 1_798_885_461, description: '限时' },
+    ], 1_798_800_000_000)
+    expect(batches).toHaveLength(2)
+    const perm = batches.find((p) => p.deductionEndTime === undefined)
+    expect(perm?.remaining).toBe(300)
+    expect(batches.find((p) => p.deductionEndTime !== undefined)?.remaining).toBe(100)
+  })
+
+  it('④ 守恒成立 ⇒ 用批次包（临期桶可渲染）；不守恒 ⇒ 回退钱包包（不给错数）', async () => {
+    const walletsPayload = {
+      code: 0, msg: 'SUCCESS',
+      data: {
+        total_balance: 20200,
+        wallets: [{ public_wallet_type: 'reward', display_name: '奖励积分', balance: 20200, display: true, priority: 10 }],
+      },
+    }
+    // 守恒：批次之和 20200 == total_balance ⇒ 采用批次包。
+    const okFetcher = vi.fn((url: string | URL) => {
+      const u = String(url)
+      if (u.includes(AUTOCLAW_LEDGERS_PATH)) return jsonResponse(LEDGER_PAGE)
+      return jsonResponse(walletsPayload)
+    })
+    const ok = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, { fetcher: okFetcher as unknown as typeof fetch })
+    expect(ok.balance!.total).toBe(20200)
+    expect(ok.balance!.packages).toHaveLength(2)
+    expect(ok.balance!.packages.every((p) => p.deductionEndTime !== undefined)).toBe(true)
+
+    // 不守恒（钱包报 99999）⇒ 回退钱包包：宁缺临期，不错数。
+    const mismatchPayload = { ...walletsPayload, data: { ...walletsPayload.data, total_balance: 99999 } }
+    const badFetcher = vi.fn((url: string | URL) => {
+      const u = String(url)
+      if (u.includes(AUTOCLAW_LEDGERS_PATH)) return jsonResponse(LEDGER_PAGE)
+      return jsonResponse(mismatchPayload)
+    })
+    const bad = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, { fetcher: badFetcher as unknown as typeof fetch })
+    expect(bad.balance!.total).toBe(99999)
+    expect(bad.balance!.packages).toHaveLength(1)
+    expect(bad.balance!.packages[0]!.name).toBe('奖励积分')
+  })
+
+  it('⑤ 流水接口失败 ⇒ 回退钱包包（总额与长期数仍正确，只是没有临期桶）', async () => {
+    const walletsPayload = {
+      code: 0, msg: 'SUCCESS',
+      data: {
+        total_balance: 20700,
+        wallets: [{ public_wallet_type: 'reward', display_name: '奖励积分', balance: 20700, display: true, priority: 10 }],
+      },
+    }
+    const fetcher = vi.fn((url: string | URL) => {
+      const u = String(url)
+      if (u.includes(AUTOCLAW_LEDGERS_PATH)) return jsonResponse({ code: 500, msg: 'boom' })
+      return jsonResponse(walletsPayload)
+    })
+    const result = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, { fetcher: fetcher as unknown as typeof fetch })
+    expect(result.error).toBeUndefined()
+    expect(result.balance!.total).toBe(20700)
+    expect(result.balance!.packages).toHaveLength(1)
   })
 })
 
