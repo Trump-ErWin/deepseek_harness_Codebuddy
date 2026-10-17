@@ -385,6 +385,84 @@ describe('协议可达性与免费判定：远端优先、本地兜底（IKM9LR 
     expect(ids).not.toContain('claude-opus-4-5')
   })
 
+  it('⚠️⚠️ 判据**自给自足**：不依赖调用点先读能力表（独立审计 P1 回归守卫）', async () => {
+    // 背景：801522c 把顺序约束押在 `loadOpencodeCatalog` 里（删掉了 listModels
+    // 那句冗余的前置读）。独立审计实测打穿：**`stream()` → `pickSlot()` →
+    // `isFreeOpencodeModel()` 不经过 `loadOpencodeCatalog`**，于是冷启动首帧对一个
+    // 「远端标免费但本地表没有」的模型（实测 `glm-5-free`，models.dev 真实存在）
+    // 判成收费 ⇒ 匿名槽被跳过 ⇒ 抛 `MISSING_CREDENTIAL`「请先添加账号」，
+    // **而同一个模型在目录里明明可见**。实测这类模型有 **37 个**
+    // （远端免费 46 − 本地表免费 9）；issue 报的两个恰好已在本地表，表面看不出来。
+    //
+    // 修法：判据读到表为 `undefined` 时**就地**读一次能力表（钩子），
+    // 于是「有没有读过」是判据自身的事实，而非跨文件的隐式顺序约定。
+    //
+    // ⚠️ 本用例的判据是**注入被清空后直接问判据**，刻意不手动读能力表 ——
+    //   那样才是冷启动首帧的真实形态。
+    const MODEL = 'glm-5-free'
+    const { OPENCODE_FALLBACK_MODELS, setRemoteOpencodeFreeFlags, setRemoteOpencodeReachability,
+      isFreeOpencodeModel, isReachableOpencodeModel } =
+      await import('../../src/opencode-product.js')
+    // 前提钉死：该模型必须在本地兜底表之外，否则本用例会测不出差异。
+    expect(
+      OPENCODE_FALLBACK_MODELS.map((m) => m.id),
+      '⚠️ glm-5-free 被加进本地兜底表了 ⇒ 本用例会退化，请换一个远端独有的模型 id',
+    ).not.toContain(MODEL)
+
+    setModelsDevForTest({
+      opencode: {
+        [MODEL]: {
+          name: 'GLM 5 Free',
+          cost: { input: 0, output: 0 },
+          provider: { api: 'https://opencode.ai/inference/openai/v1' },
+        },
+      },
+    })
+    // ⚠️ 模拟「没人读过能力表」：把两张注入表清空。
+    setRemoteOpencodeReachability(undefined)
+    setRemoteOpencodeFreeFlags(undefined)
+    // ⚠️ **不调** getOpencodeCapabilitiesSync() —— 直接问判据。
+    expect(isFreeOpencodeModel(MODEL),
+      '判据必须自给自足：读到表为空时应就地补读，而不是退回本地表把模型判成收费').toBe(true)
+    expect(isReachableOpencodeModel(MODEL)).toBe(true)
+  })
+
+  it('⚠️ 刷新成功后订阅回调**必须**被兑现（独立审计 P3/P2 回归守卫）', async () => {
+    // P3：`onUpdated` 原先零守卫 —— 改成 `void options.onUpdated` 仍全量全绿。
+    // P2：在途去重把**后到者**的回调整个丢弃 ⇒ 冷启动首刷的广播永不发出。
+    // 本用例同时锁住两件事：① 回调会被调用；② **后到**的回调也会被调用。
+    await clearModelsDevCache()
+    const good = vi.fn(async () => new Response(JSON.stringify({
+      opencode: { models: { notified: { name: 'Notified' } } },
+    }), { status: 200 }))
+    const first = vi.fn()
+    const late = vi.fn()
+    const p = refreshModelsDevAsync({ fetcher: good as unknown as typeof fetch, force: true, sleep: async () => {} })
+    // ⚠️ 在途期间到来的第二个回调 —— 改前会被丢弃。
+    refreshModelsDev(late, { fetcher: good as unknown as typeof fetch, force: true, sleep: async () => {} })
+    void first
+    await p
+    await vi.waitFor(() => {
+      expect(late, '⚠️ 在途期间到来的回调不得被丢弃（这正是 P2）').toHaveBeenCalled()
+    })
+  })
+
+  it('⚠️ 一个订阅回调抛错**不得**影响其余订阅者', async () => {
+    await clearModelsDevCache()
+    const good = vi.fn(async () => new Response(JSON.stringify({
+      opencode: { models: { ok: { name: 'OK' } } },
+    }), { status: 200 }))
+    const boom = vi.fn(() => { throw new Error('订阅者炸了') })
+    const after = vi.fn()
+    const p = refreshModelsDevAsync({ fetcher: good as unknown as typeof fetch, force: true, sleep: async () => {} })
+    refreshModelsDev(boom, { fetcher: good as unknown as typeof fetch, force: true, sleep: async () => {} })
+    refreshModelsDev(after, { fetcher: good as unknown as typeof fetch, force: true, sleep: async () => {} })
+    await p
+    await vi.waitFor(() => {
+      expect(after, '前一个订阅者抛错不得连坐后面的').toHaveBeenCalled()
+    })
+  })
+
   it('远端说走未实现的协议 ⇒ 不可达（claude/gemini 靠这条挡掉）', () => {
     setModelsDevForTest({
       opencode: {
@@ -444,16 +522,30 @@ describe('协议可达性与免费判定：远端优先、本地兜底（IKM9LR 
     expect(isFreeOpencodeModel('big-pickle')).toBe(false)
   })
 
-  it('⚠️⚠️ 未读能力表时，远端表是空的（= 本地表兜底）—— 这就是顺序缺陷的机制', () => {
+  it('⚠️⚠️ 未读能力表时判据**自动补读**（不再是「顺序缺陷的机制」）', () => {
+    // ⚠️⚠️ 本用例在 2026-10-17 被**反转过一次**，反转本身是那次修复的一部分。
+    //
+    // 原断言：「不调 `getOpencodeCapabilitiesSync()` ⇒ 远端表为空 ⇒ 判据 false」，
+    //           并把它当作「顺序缺陷的机制」固化下来。
+    // ⚠️ 那个固化是**错的**：它把「判据依赖调用顺序」当成契约，于是
+    //   独立审计 P1 才能顺着它打穿 —— `stream()` 路径不读能力表就误报
+    //   MISSING_CREDENTIAL（37 个模型受影响）。
+    //
+    // ⇒ 现契约已改为「**判据自给自足**」：不依赖任何调用顺序。
+    //   故此处断言「**不调**读取入口，直接问判据 ⇒ 仍应得到远端结论」。
+    //   若哪天有人把自给自足删掉（还原成顺序约束），本条即红。
     setModelsDevForTest({
-      opencode: { 'brand-new-free': { cost: { input: 0, output: 0 } } },
+      opencode: {
+        'brand-new-free': { cost: { input: 0, output: 0 }, provider: { api: 'https://opencode.ai/inference/openai/v1' } },
+      },
     })
-    // 刻意**不**调用 getOpencodeCapabilitiesSync()。
-    expect(isFreeOpencodeModel('brand-new-free')).toBe(false)
-    expect(isReachableOpencodeModel('brand-new-free')).toBe(false)
-    // 读一次之后才成立 ⇒ 判据的成立时机被锁住。
-    getOpencodeCapabilitiesSync()
-    expect(isFreeOpencodeModel('brand-new-free')).toBe(true)
+    setRemoteOpencodeReachability(undefined)
+    setRemoteOpencodeFreeFlags(undefined)
+    // ⚠️ 刻意**不**调用 getOpencodeCapabilitiesSync()。
+    expect(isFreeOpencodeModel('brand-new-free'),
+      '不依赖调用顺序：判据应自给自足地补读能力表').toBe(true)
+    expect(isReachableOpencodeModel('brand-new-free'),
+      '同上').toBe(true)
   })
 })
 

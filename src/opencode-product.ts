@@ -194,6 +194,60 @@ const REACHABLE_IDS = new Set(OPENCODE_FALLBACK_MODELS.map((m) => m.id))
 let remoteReachability: ReadonlyMap<string, boolean> | undefined
 
 /**
+ * ⚠️⚠️ **「能力表已被读过」的钩子**（2026-10-17 独立审计 P1 的根治）。
+ *
+ * ## 为什么需要它：判据曾依赖**调用顺序**，而顺序不可靠
+ *
+ * 两张远端表由 `opencode-capability.ts` 归一时注入，而注入发生在
+ * **读能力表**的那一刻。于是判据的正确性依赖「每个调用点都先读一次能力表」。
+ *
+ * ⚠️ 实测这条依赖**被打破过**（我自己的修复引入的回归，审计独立发现）：
+ *  `OpencodeAdapter.stream()` → `pickSlot()` → `isFreeOpencodeModel()`
+ *   **不经过** `loadOpencodeCatalog`（那只在目录路径上），而当时顺序约束
+ *   被押在 `loadOpencodeCatalog` 里 ⇒ 冷启动首帧对一个
+ *   「远端标免费但本地表没有」的模型（实测 `glm-5-free`，models.dev 真实存在）
+ *   判成收费 ⇒ 匿名槽被跳过 ⇒ 抛
+ *   `MISSING_CREDENTIAL`「请先添加账号」，**而同一个模型在目录里明明可见**
+ *   （实测：目录 1 条含该模型，stream 抛 MISSING_CREDENTIAL）。
+ *   实测这类模型有 **37 个**（远端免费 46 − 本地表免费 9）。
+ *   issue 报的那两个恰好已在本地表里，所以表面看不出来。
+ *
+ * ## 修法：把「有没有读过」变成**判据自身的事实**，而不是顺序约束
+ *
+ * 读判据时若两张表还是 `undefined`，就地读一次能力表（同步、零网络），
+ * 由 {@link OPENCODE_CAPABILITY_HOOK} 回调完成注入。
+ *
+ * ⇒ 判据**自给自足**：任何调用点、任何顺序都得到同一答案，
+ *   不再依赖「谁先谁后」这种跨文件的隐式约定。
+ *
+ * ⚠️ 为什么不在每个调用点补一句前置读：那就是我上一版的做法，
+ *   实测证明它（a）漏了 `stream` 这条路径，（b）让两处同款代码看起来
+ *   「都需要」而其实一处冗余。（c) 守卫只能钉住其中一处。
+ */
+let OPENCODE_CAPABILITY_HOOK: (() => void) | undefined
+
+/**
+ * 注册「读能力表」的动作（由 `opencode-capability.ts` 在模块加载时调用）。
+ *
+ * ⚠️ **必须是模块加载期注册**，不能等到第一次归一 —— 否则冷启动首帧
+ * （能力表尚未被任何路径读过）钩子还没注册，判据会退回本地表。
+ */
+export function setOpencodeCapabilityHook(hook: () => void): void {
+  OPENCODE_CAPABILITY_HOOK = hook
+}
+
+/**
+ * 确保两张远端表已注入（幂等；读判据时自动调用）。
+ *
+ * ⚠️ 只在表为 `undefined` 时触发 —— 已注入时**零开销**，
+ * 不会让热路径（`listModels` 逐条过滤）反复读能力表。
+ */
+function ensureRemoteTables(): void {
+  if (remoteReachability !== undefined && remoteFreeOverride !== undefined) return
+  OPENCODE_CAPABILITY_HOOK?.()
+}
+
+/**
  * 注入远端可达性表（**唯一定义处**在 `opencode-capability.ts`）。
  *
  * ⚠️ 传 `undefined` 表示「远端不可用」，调用方会退回本地表 —— 这是**刻意的**：
@@ -218,6 +272,7 @@ export function setRemoteOpencodeReachability(table: ReadonlyMap<string, boolean
  * 那是保守方向，宁可要求用户加一个付费账号，也不能给一个必然 403 的模型。
  */
 export function isFreeOpencodeModel(id: string): boolean {
+  ensureRemoteTables()
   const remote = remoteFreeOverride?.get(id)
   if (remote !== undefined) return remote
   return FREE_IDS.has(id)
@@ -266,6 +321,7 @@ export function isFreeOpencodeModel(id: string): boolean {
  * ③ 废弃：`mimo-v2.5-free` 回 410，只要远端还下发就挡不住。
  */
 export function isReachableOpencodeModel(id: string): boolean {
+  ensureRemoteTables()
   const remote = remoteReachability?.get(id)
   if (remote !== undefined) return remote
   return REACHABLE_IDS.has(id)
