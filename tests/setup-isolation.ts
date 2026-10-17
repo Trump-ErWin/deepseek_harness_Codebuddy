@@ -92,3 +92,29 @@ if (process.env.DSH_OFFICEACE_HOME === undefined) {
 if (process.env.QODER_RUNTIME_INFO === undefined) {
   process.env.QODER_RUNTIME_INFO = join(stateDir, 'no-such-runtime-info')
 }
+
+/**
+ * AutoClaw（智谱）：**桌面端凭据读取的进程级隔离**（2026-10-17 审计 P0 修复）。
+ *
+ * ## 它防的是什么
+ *
+ * `probeAutoclawLocalCredential()` 会真读 `%APPDATA%\AutoClaw-official\` 并
+ * **真跑 powershell 解 DPAPI**（约 1s）—— 读到的是用户**真实**的
+ * access/refresh token。`resolveDeviceId()` 同款（读真实设备号，而它会进
+ * 登录/签到请求体 ⇒ 断言结果随开发机状态漂移）。
+ *
+ * ⚠️ 与上面 OfficeAce 那次事故**同型**：`apply()` 内部有 fire-and-forget 的
+ * 后台链，用例的 `afterEach` 恢复环境变量**之后**那条链才跑到本分支 ⇒
+ * 「在用例里改 `APPDATA`」不可靠，**只能进程级**。
+ *
+ * ## ⚠️ 为什么修复前这条缺失却仍然「全绿」
+ *
+ * 当时唯一的用例显式传了 `customAppData: 'F:/non_existent_path_test'`
+ * ⇒ 恰好绕开了 env 读取。**那是脆弱的绿**：任何新用例走「不传参读 env」
+ * 就会真读用户凭据 + 真跑 powershell（本仓库吃过两次亏，故在此显式登记）。
+ *
+ * 守卫见 `tests/unit/autoclaw-isolation.spec.ts`。
+ */
+if (process.env.DSH_AUTOCLAW_APPDATA === undefined) {
+  process.env.DSH_AUTOCLAW_APPDATA = mkdtempSync(join(tmpdir(), 'dsh-autoclaw-'))
+}

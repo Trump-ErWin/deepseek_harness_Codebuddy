@@ -136,6 +136,14 @@ export class AutoclawAuth extends Service {
     if (!resolved) throw new Error('凭据未配置')
     const credential = parseAutoclawCredential(resolved.value)
     if (!credential) throw new Error('凭据解析失败')
+    // ⚠️⚠️ **空 `refresh_token` 必须走到这里，而不是上一行**
+    // （2026-10-17 审计 P1 修复）。上游不下发 refresh_token 时
+    // `loginAutoclawWithCode` 会产出 `refresh_token: ''`，而解析过去把它
+    // 判成「解析失败」⇒ 用户点「刷新」看到的是**误导文案**，
+    // 真实原因（必须重新登录）就在下一行却永远不可达。
+    // ⚠️ 这类「文案本身就是出路」的错误必须给准 —— 它告诉用户**去做什么**
+    //   （重新登录），说错会让用户反复点刷新却始终找不到出路
+    //   （本仓库 client-ui 笔记记载的复发形态）。
     if (!isAutoclawRefreshable(credential)) {
       throw new RefreshTokenExpiredError('无 refresh_token，请重新登录')
     }

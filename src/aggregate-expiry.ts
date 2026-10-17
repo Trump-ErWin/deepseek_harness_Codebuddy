@@ -57,6 +57,10 @@ import { fetchTraeCreditBalance } from './trae-credits.js'
 import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js'
 import { MODELSCOPE } from './modelscope-product.js'
 import type { ModelscopeCredential } from './modelscope.js'
+// ⚠️ AutoClaw（智谱）：钱包余额折算（2026-10-17 审计 P0 修复新增）。
+import { fetchAutoclawBalanceDetailed } from './autoclaw-credits.js'
+import { AUTOCLAW } from './autoclaw-product.js'
+import type { AutoclawCredential } from './autoclaw.js'
 import type { AccioCredential } from './accio.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
@@ -193,6 +197,19 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   //    ⚠️ 与 accio / officeace 同款陷阱：**决定候选表可见性的是这张表、
   //    不是 `AGGREGATE_CHANNELS`** —— 只加后者等于没接。
   'modelscope',
+  // ⚠️ **AutoClaw**（智谱，2026-10-17 审计 P0 修复）：折算原语见 `autoclawExpiry`，
+  //    属「**有余额但不下发到期时间**」那一类（钱包报文里没有任何时间字段）
+  //    ⇒ 有余额即 `NEVER`、烧光即 `UNUSABLE`。
+  //    ⚠️⚠️ **这是该陷阱的第 4 次复发**（cline → accio → officeace → autoclaw），
+  //    症状恒定**静默**：PR 只加了 `aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS`
+  //    （模型层归并会发生、看起来接好了），而**决定候选表可见性的是本表**
+  //    —— 漏加它 ⇒ 折算恒 `UNUSABLE`（`aggregate-expiry.ts` 的 `createExpiryProbe`
+  //    与 `aggregate-adapter.ts` 的 4 处过滤都按本表），用户在聚合轮换列表里
+  //    **永远看不到 autoclaw**，且**无报错、无日志**。
+  //    ⚠️ 三处必须同改：本表 + `provider-expiry.ts` 的 `createProviderExpiry()`
+  //    + 折算原语（后两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑
+  //    `apply()` 锁一致）。
+  'autoclaw',
 ])
 
 /**
@@ -931,6 +948,48 @@ export async function modelscopeExpiry(
       // ⚠️ `fetchBalanceDetailed` 用 `balance: null + error` 表达失败
       //    （见 `ProviderBalanceDetail` 的注释），而 `sharedPackageExpiry`
       //    认的是「`null` ⇒ UNUSABLE」⇒ 取 `balance` 即可。
+      return result.balance
+    },
+  ))
+}
+
+/**
+ * AutoClaw（智谱）：**本 fork 独有**（2026-10-17 审计 P0 修复）。
+ *
+ * ## 它属哪一类
+ *
+ * 与 {@link modelscopeExpiry} **同格**：「**有余额但不下发到期时间**」——
+ * `/agent-assetmgr/api/v2/wallets` 的 `wallets[]` 只有 `balance` /
+ * `balance_view` / `priority` / `display`，**没有任何时间字段**
+ * （见 `autoclaw-credits.ts` 的 `AutoclawWalletItem`）。
+ * ⇒ 判据直接复用 `sharedPackageExpiry`（逐格同构，不另写一套）：
+ * 有 `active === true && remaining > 0` 的包 ⇒ `NEVER`；一个都没有 ⇒ `UNUSABLE`。
+ *
+ * ## ⚠️⚠️ 已知且刻意接受的代价
+ *
+ * 积分烧光时**不会被提前剔出轮换** —— 平台既不下发「配额何时重置」，
+ * 也没有别的额度端点可查 ⇒ 耗尽后仍会被选中并失败一次（报额度用尽）。
+ * 与 modelscope 的代价**同型**（用户在 2026-10-17 已就魔搭明确接受这个取舍）。
+ * ⚠️ **不许用「猜一个每日 UTC+8 零点」消除它** —— 那是凭空造一个上游从未
+ * 承诺的重置时刻（本仓库红线「绝不编造数字」）。
+ *
+ * ## 为什么必须走 `cachedBalance`
+ *
+ * 聚合每轮折算会对同一账号反复提问；没有共享读数就会白发大量重复请求
+ * （与 buddy / trae / modelscope 同款理由）。
+ */
+export async function autoclawExpiry(
+  credential: AutoclawCredential,
+  product: typeof AUTOCLAW,
+  /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+  cached?: () => Promise<CreditBalance | null | undefined>,
+): Promise<number> {
+  return sharedPackageExpiry(() => fetchBalanceWithCache(
+    cached,
+    async () => {
+      const result = await fetchAutoclawBalanceDetailed(credential, { product })
+      // ⚠️ 同上：`fetchBalanceDetailed` 的失败形态是 `balance: null + error`，
+      //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
       return result.balance
     },
   ))

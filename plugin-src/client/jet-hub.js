@@ -4036,32 +4036,27 @@ function ProviderPanel({ provider, rpcCall }) {
                     '可用 z.ai（国际）登录另一个账号。'),
               React.createElement('label', { className: 'dim-jh-zcProvider' },
                 autoclawDialog ? '登录方式' : (accioDialog ? '登录区域' : '登录渠道'),
-                autoclawDialog
-                  ? React.createElement('select', {
-                      className: 'dim-jh-zcSelect',
-                      style: { display: 'none' },
-                      value: autoclawMode,
-                      onChange: (event) => setAutoclawMode(event.target.value),
-                    },
-                      React.createElement('option', { value: 'local' }, '一键导入本机桌面端凭据'),
-                      React.createElement('option', { value: 'sms' }, '手机验证码快速登录'))
-                  : (accioDialog
-                      ? React.createElement('select', {
-                          className: 'dim-jh-zcSelect',
-                          style: { display: 'none' },
-                          value: accioRegion,
-                          onChange: (event) => setAccioRegion(event.target.value),
-                        },
-                          React.createElement('option', { value: 'cn' }, '中国版（www.accio-ai.com）'),
-                          React.createElement('option', { value: 'global' }, '国际版（zh.accio.com）'))
-                      : React.createElement('select', {
-                          className: 'dim-jh-zcSelect',
-                          style: { display: 'none' },
-                          value: zcodeProvider,
-                          onChange: (event) => setZcodeProvider(event.target.value),
-                        },
-                          React.createElement('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
-                          React.createElement('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）')))),
+                // ⚠️⚠️ **原生 `<select>` 已整体删除**（2026-10-17 审计 P2 修复）。
+                //   原先此处有**三个**各自带 `style:{display:'none'}` 的 `<select>`
+                //   （autoclawMode / accioRegion / zcodeProvider），功能已由下方
+                //   **单选卡片组**接管（Windows/Electron 下原生下拉经常点不开）。
+                //   ⇒ 那三个是纯**死 DOM**：不可见、其 `onChange` 永不触发，
+                //     却仍渲染出 `<option>` 并把 state 挂在上面 ——
+                //     既是维护陷阱（改 options 会让人误以为生效），
+                //     也是「一份状态两套 UI 判据」这种本仓库红线形态。
+                //   ⚠️ 守卫已同步改写：`tests/unit/new-account-dialog.spec.ts`
+                //     里原先断言 `value: accioRegion` / `onChange: …target.value`
+                //     （原生 select 专属形态）的那几条，现在锁的是**卡片组**的
+                //     `onClick: () => setXxx(opt.value)` —— 否则删掉死 DOM
+                //     会让守卫变成「保护一个不存在的东西」。
+              // ⚠️ **label 自身到此闭合**（2026-10-17 审计 P2 修复）：
+              //   删掉原先那个 `<select>`（第三个子参数）后，`label` 的
+              //   `createElement(` 只剩两个参数 ⇒ 必须补这个右括号，
+              //   否则 esbuild 报 `Expected ")" but found ";"`。
+              //   ⚠️ 这类语法错误**单测查不出来**（本仓库 client 守卫多为
+              //   源码文本断言，不做解析）⇒ 改完本文件**必须**跑
+              //   `pnpm build:client`，见 AGENTS.md 的「单测只读源码文本」那条。
+              ),
               // 彻底解决 Windows/Electron 下原生 <select> 下拉框经常点不开的恶心 bug：使用 100% 可靠的 DOM 单选卡片组
               React.createElement('div', {
                 style: {
@@ -5927,9 +5922,12 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
  * ⚠️ **本 fork 独有**（魔搭，2026-10-17 用户明确要求加入聚合轮换）：
  * `modelscope` 已进 `WIRED_EXPIRY_PROVIDERS` ⇒ 这里**必须**同改，否则只登了
  * 魔搭的用户会看到「请先在……登录账号」这句错话（他们其实已经登录了）。
+ *
+ * ⚠️ **AutoClaw**（智谱，2026-10-17 审计 P0 修复）：同样已进
+ * `WIRED_EXPIRY_PROVIDERS` ⇒ 同改，理由同上。
  */
 const AGG_WIRED_CHANNEL_LABELS =
-  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace / modelscope';
+  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace / modelscope / autoclaw';
 
 /**
  * 「按临期排序」模式下面板**自动重探**临期顺序的间隔（用户 2026-10-16 从 5 分钟改为 **2 分钟**）。

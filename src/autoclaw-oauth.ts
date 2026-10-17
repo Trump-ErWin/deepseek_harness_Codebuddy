@@ -31,15 +31,31 @@ export const PHONE_NUMBER_RE = /^1[3-9]\d{9}$/
 
 /**
  * 从本地 Windows DPAPI 及 AES-256-GCM 探测 AutoClaw 桌面端保存的有效凭据（一键导入模式）。
+ *
+ * ## ⚠️⚠️ 凭据来源是**用户真实凭据**，故必须可隔离（2026-10-17 审计 P0 修复）
+ *
+ * 本函数会真读 `%APPDATA%\AutoClaw-official\` 并**真跑 powershell 解 DPAPI**
+ * （约 1s）⇒ 单测里若不隔离，用户装了 AutoClaw 桌面端时就会读到**他的真实
+ * access/refresh token**（本仓库 `.office-claw` 未隔离事故的同型，见
+ * `tests/setup-isolation.ts` 的长注释）。
+ *
+ * ⇒ 新增 `DSH_AUTOCLAW_APPDATA` 覆盖：**优先级高于 `APPDATA`**，
+ *   `tests/setup-isolation.ts` 在**进程级**把它指向临时目录
+ *   （与 `DSH_OFFICEACE_HOME` / `DSH_JET_HUB_STATE_DIR` 同型）。
+ * ⚠️ 为什么不用「在用例里改 `APPDATA`」：`apply()` 内部有 fire-and-forget 的
+ *   后台链，用例的 `afterEach` 恢复环境变量**之后**那条链才跑到本分支 ⇒
+ *   与 officeace 那次事故同型，唯一可靠做法是进程级。
  */
 export async function probeAutoclawLocalCredential(options?: {
   customAppData?: string
 }): Promise<AutoclawCredential | undefined> {
   try {
     const appData =
-      options?.customAppData ??
-      process.env.APPDATA ??
-      (process.env.USERPROFILE ? path.join(process.env.USERPROFILE, 'AppData', 'Roaming') : undefined)
+      options?.customAppData
+      // ⚠️ 测试隔离口必须**排在 `APPDATA` 之前**，否则隔离形同虚设。
+      ?? process.env.DSH_AUTOCLAW_APPDATA
+      ?? process.env.APPDATA
+      ?? (process.env.USERPROFILE ? path.join(process.env.USERPROFILE, 'AppData', 'Roaming') : undefined)
 
     if (!appData) return undefined
 
@@ -318,8 +334,14 @@ export interface LoginAutoclawWithCodeResult {
 function resolveDeviceId(explicitId?: string): string {
   if (explicitId && explicitId.trim().length > 0) return explicitId.trim()
   try {
+    // ⚠️⚠️ 同样必须走隔离口（2026-10-17 审计 P0 修复）：这里读的是用户**真实**
+    //   桌面端设备号。测试里读到它会让断言依赖开发机状态（本仓库 `QODER_RUNTIME_INFO`
+    //   隔离的正是同款问题），而设备号会进登录/签到请求体 ⇒ 结果不可复现。
+    //   ⚠️ 隔离口优先级必须与 `probeAutoclawLocalCredential` **一致**。
     const p = path.join(
-      process.env.APPDATA ?? path.join(process.env.USERPROFILE ?? '', 'AppData', 'Roaming'),
+      process.env.DSH_AUTOCLAW_APPDATA
+        ?? process.env.APPDATA
+        ?? path.join(process.env.USERPROFILE ?? '', 'AppData', 'Roaming'),
       'AutoClaw-official',
       'device',
       'device-id.json',

@@ -2126,6 +2126,18 @@ export function apply(ctx: Context): void {
       },
     ),
     product: AUTOCLAW,
+    // ⚠️⚠️ **必须接 `readImage`**（2026-10-17 审计 P0 修复）。
+    //    `zai_auto-fast` 的 `supportsImage: true` 有实测依据
+    //    （`docs/autoclaw-models.md:42`：AutoClaw 体系内唯一支持图文多模态
+    //    的通道），`resolveModel` 已据此向宿主声明 `['text','image']`
+    //    ⇒ 宿主**不投影**图片、**原样**下发（`dsh-llm/lib/index.js:2311`）。
+    //    ⚠️ **漏了它这条路径恒抛 `UNSUPPORTED_CONTENT`**：声明支持图片却
+    //    必然失败，正是「声明即承诺」被破坏的形态（与 modelscope / opencode
+    //    同约定：不传 `readImage` 时带图请求抛 `UNSUPPORTED_CONTENT`，而不是
+    //    静默丢图让用户以为模型看到了图）。
+    //    ⚠️ 刻意**不接** `readImageRequest` 缩放桥接：智谱侧对单图字节上限
+    //    无实测依据，编一个预算是凭空造数字（同 modelscope 的取舍）。
+    readImage: makeReadImage(ctx),
   })
 
   const accio = new AccioAuth(ctx)
