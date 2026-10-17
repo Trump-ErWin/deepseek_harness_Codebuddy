@@ -23,6 +23,15 @@ import {
   generateAstudioWechatFd,
   ASTUDIO_WECHAT_FD_ALPHABET,
   type AstudioWechatAccount,
+  getAstudioGeeTestConfig,
+  sendAstudioSmsCode,
+  loginAstudioWithSms,
+  loginAstudioWithPassword,
+  renderAstudioLoginPage,
+  startAstudioLoginFlow,
+  ASTUDIO_CARRIER_PATHS,
+  type AstudioGeeTestResult,
+  type AstudioLoginIdentity,
 } from '../../src/astudio-oauth.js'
 import { ASTUDIO } from '../../src/astudio-product.js'
 import type { AstudioCredential } from '../../src/astudio.js'
@@ -600,3 +609,387 @@ describe('AStudio Provider Credits & Jet Hub RPC 接线验证', () => {
     expect(accountEntry?.nickname).toBe('PollDev')
   })
 })
+
+describe('AStudio 三合一登录体系 (Goal 755: 短信验证码 / 密码 / Carrier 载体页)', () => {
+  const dummyGeeTestResult: AstudioGeeTestResult = {
+    geetestChallenge: 'challenge-xyz',
+    geetestValidate: 'validate-xyz',
+    geetestSeccode: 'validate-xyz|jordan',
+  }
+
+  describe('极验初始化 (getAstudioGeeTestConfig)', () => {
+    it('正常获取极验配置', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          code: 0,
+          data: {
+            gt: 'test-gt-key',
+            challenge: 'test-challenge',
+            success: 1,
+            new_captcha: true,
+          },
+        }),
+      } as Response)
+
+      const cfg = await getAstudioGeeTestConfig({ fetcher: mockFetch })
+      expect(cfg.gt).toBe('test-gt-key')
+      expect(cfg.challenge).toBe('test-challenge')
+      expect(cfg.success).toBe(1)
+      expect(cfg.new_captcha).toBe(true)
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/chat/gee-captcha'),
+        expect.anything(),
+      )
+    })
+
+    it('服务端返回非 0 错误码时抛出异常', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          code: 50001,
+          desc: '极验服务暂时不可用',
+        }),
+      } as Response)
+
+      await expect(getAstudioGeeTestConfig({ fetcher: mockFetch })).rejects.toThrow('极验服务暂时不可用')
+    })
+
+    it('HTTP 状态异常时抛出错误', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+      } as Response)
+
+      await expect(getAstudioGeeTestConfig({ fetcher: mockFetch })).rejects.toThrow('HTTP 502')
+    })
+  })
+
+  describe('短信验证码发送 (sendAstudioSmsCode)', () => {
+    it('手机号为空时抛错', async () => {
+      await expect(sendAstudioSmsCode('', dummyGeeTestResult)).rejects.toThrow('手机号不能为空')
+    })
+
+    it('未传极验验证结果时抛错', async () => {
+      await expect(sendAstudioSmsCode('13800000000', {} as never)).rejects.toThrow('缺少极验验证参数')
+    })
+
+    it('正常发送验证码，正确构造表单并返回结果', async () => {
+      let reqBody: FormData | undefined
+      const mockFetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+        reqBody = init?.body as FormData
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            code: 0,
+            desc: '验证码发送成功',
+            data: { expire: 60 },
+          }),
+        } as Response
+      })
+
+      const res = await sendAstudioSmsCode('13800000000', dummyGeeTestResult, { fetcher: mockFetch })
+      expect(res.ok).toBe(true)
+      expect(res.message).toBe('验证码发送成功')
+      expect(reqBody).toBeDefined()
+      expect(reqBody?.get('mobile')).toBe('13800000000')
+      expect(reqBody?.get('countryCode')).toBe('86')
+      expect(reqBody?.get('geetest_challenge')).toBe('challenge-xyz')
+      expect(reqBody?.get('geetest_validate')).toBe('validate-xyz')
+      expect(reqBody?.get('geetest_seccode')).toBe(Buffer.from('validate-xyz|jordan').toString('base64'))
+    })
+
+    it('服务端返回错误提示时抛出异常', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          code: 10001,
+          desc: '短信发送过于频繁，请稍后再试',
+        }),
+      } as Response)
+
+      await expect(
+        sendAstudioSmsCode('13800000000', dummyGeeTestResult, { fetcher: mockFetch }),
+      ).rejects.toThrow('短信发送过于频繁，请稍后再试')
+    })
+  })
+
+  describe('手机验证码登录 (loginAstudioWithSms)', () => {
+    it('参数校验：空手机号或空验证码抛错', async () => {
+      await expect(loginAstudioWithSms('', '123456')).rejects.toThrow('手机号和验证码不能为空')
+      await expect(loginAstudioWithSms('13800000000', '')).rejects.toThrow('手机号和验证码不能为空')
+    })
+
+    it('正常登录并解析账号会话标识', async () => {
+      let reqBody: FormData | undefined
+      const mockFetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+        reqBody = init?.body as FormData
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            code: 0,
+            data: {
+              uid: 'user-sms-888',
+              ssoSessionId: 'sso-sms-val',
+              token: 'token-sms-val',
+              accountId: 'account-sms-888',
+              mobile: '13800000000',
+            },
+          }),
+        } as Response
+      })
+
+      const res = await loginAstudioWithSms('13800000000', '654321', { fetcher: mockFetch })
+      expect(res.uid).toBe('user-sms-888')
+      expect(res.ssoSessionId).toBe('sso-sms-val')
+      expect(res.token).toBe('token-sms-val')
+      expect(res.accountId).toBe('account-sms-888')
+      expect(res.mobile).toBe('13800000000')
+      expect(res.loginMethod).toBe('sms')
+      expect(reqBody?.get('mobile')).toBe('13800000000')
+      expect(reqBody?.get('verifyCode')).toBe('654321')
+    })
+
+    it('登录失败或缺少凭据标识时抛出异常', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          code: 10002,
+          desc: '验证码错误或已过期',
+        }),
+      } as Response)
+
+      await expect(
+        loginAstudioWithSms('13800000000', '999999', { fetcher: mockFetch }),
+      ).rejects.toThrow('验证码错误或已过期')
+    })
+  })
+
+  describe('账号密码登录 (loginAstudioWithPassword)', () => {
+    it('参数校验：空账号、空密码或缺少极验参数抛错', async () => {
+      await expect(loginAstudioWithPassword('', 'pwd123', dummyGeeTestResult)).rejects.toThrow('账号与密码不能为空')
+      await expect(loginAstudioWithPassword('user123', '', dummyGeeTestResult)).rejects.toThrow('账号与密码不能为空')
+      await expect(loginAstudioWithPassword('user123', 'pwd123', {} as never)).rejects.toThrow('缺少极验验证参数')
+    })
+
+    it('正常密码登录并解析账号信息', async () => {
+      let reqBody: FormData | undefined
+      const mockFetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+        reqBody = init?.body as FormData
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            code: 0,
+            data: {
+              uid: 'user-pwd-999',
+              ssoSessionId: 'sso-pwd-val',
+              token: 'token-pwd-val',
+              accountId: 'account-pwd-999',
+              username: 'developer999',
+              nickname: 'DevNick',
+              mobile: '13900000000',
+            },
+          }),
+        } as Response
+      })
+
+      const res = await loginAstudioWithPassword('developer999', 'P@ssw0rd', dummyGeeTestResult, { fetcher: mockFetch })
+      expect(res.uid).toBe('user-pwd-999')
+      expect(res.ssoSessionId).toBe('sso-pwd-val')
+      expect(res.token).toBe('token-pwd-val')
+      expect(res.accountId).toBe('account-pwd-999')
+      expect(res.username).toBe('developer999')
+      expect(res.nickname).toBe('DevNick')
+      expect(res.loginMethod).toBe('password')
+      expect(reqBody?.get('accountName')).toBe('developer999')
+      expect(reqBody?.get('accountPwd')).toBe('P@ssw0rd')
+      expect(reqBody?.get('geetest_challenge')).toBe('challenge-xyz')
+      expect(reqBody?.get('geetest_seccode')).toBe(Buffer.from('validate-xyz|jordan').toString('base64'))
+    })
+
+    it('密码错误或业务失败抛错', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          code: 10003,
+          desc: '账号或密码不匹配',
+        }),
+      } as Response)
+
+      await expect(
+        loginAstudioWithPassword('developer999', 'wrong', dummyGeeTestResult, { fetcher: mockFetch }),
+      ).rejects.toThrow('账号或密码不匹配')
+    })
+  })
+
+  describe('Carrier 载体页纯函数与 Server (renderAstudioLoginPage & startAstudioLoginFlow)', () => {
+    it('renderAstudioLoginPage 输出包含三合一 Tab 与极验脚本', () => {
+      const html = renderAstudioLoginPage()
+      expect(html).toContain('tab-sms')
+      expect(html).toContain('tab-password')
+      expect(html).toContain('tab-wechat')
+      expect(html).toContain('gt.js')
+      expect(html).toContain('sms-mobile')
+      expect(html).toContain('sms-code')
+      expect(html).toContain('pwd-account')
+      expect(html).toContain('pwd-password')
+      expect(html).toContain('qr-box')
+    })
+
+    it('startAstudioLoginFlow 启动并服务载体页及三合一登录代理接口', async () => {
+      const mockFetch = vi.fn()
+        // 1. gee-captcha
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({ code: 0, data: { gt: 'gt-flow', challenge: 'ch-flow', success: 1 } }),
+        } as Response)
+        // 2. send sms
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({ code: 0, desc: '短信已发送' }),
+        } as Response)
+        // 3. quick login
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            code: 0,
+            data: { uid: 'flow-uid', ssoSessionId: 'flow-sso', token: 'flow-tok', accountId: 'flow-acc' },
+          }),
+        } as Response)
+        // 4. completeAstudioLogin 换取凭据 (bot/models/configs)
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            code: 0,
+            data: [{ model: 'xopglm52', api_key: 'flow-model-key', is_default: true }],
+          }),
+        } as Response)
+
+      let successCredential: AstudioCredential | undefined
+      const flow = await startAstudioLoginFlow({
+        fetcher: mockFetch,
+        onSuccess: async (cred) => {
+          successCredential = cred
+        },
+      })
+
+      const port = new URL(flow.loginUrl).port
+      expect(flow.loginUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/astudio\/login$/)
+
+      try {
+        // 测试 GET /astudio/login 返回 HTML
+        const pageRes = await fetch(flow.loginUrl)
+        expect(pageRes.status).toBe(200)
+        const html = await pageRes.text()
+        expect(html).toContain('<!DOCTYPE html>')
+        expect(html).toContain('tab-sms')
+
+        // 测试 GET /astudio/gee-captcha
+        const geeRes = await fetch(`http://127.0.0.1:${port}${ASTUDIO_CARRIER_PATHS.geeCaptcha}`)
+        expect(geeRes.status).toBe(200)
+        const geeBody = (await geeRes.json()) as { ok: boolean; data?: { gt?: string } }
+        expect(geeBody.ok).toBe(true)
+        expect(geeBody.data?.gt).toBe('gt-flow')
+
+        // 测试 POST /astudio/sms/send
+        const sendRes = await fetch(`http://127.0.0.1:${port}${ASTUDIO_CARRIER_PATHS.sendSms}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            mobile: '13812345678',
+            geetestChallenge: 'challenge-xyz',
+            geetestValidate: 'validate-xyz',
+            geetestSeccode: 'validate-xyz|jordan',
+          }),
+        })
+        expect(sendRes.status).toBe(200)
+        const sendBody = (await sendRes.json()) as { ok: boolean }
+        expect(sendBody.ok).toBe(true)
+
+        // 测试 POST /astudio/sms/login
+        const loginRes = await fetch(`http://127.0.0.1:${port}${ASTUDIO_CARRIER_PATHS.smsLogin}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            mobile: '13812345678',
+            verifyCode: '123456',
+          }),
+        })
+        expect(loginRes.status).toBe(200)
+        const loginBody = (await loginRes.json()) as { ok: boolean; message?: string }
+        expect(loginBody.ok).toBe(true)
+        expect(loginBody.message).toBe('登录成功')
+
+        // 等待 flow.result 就绪
+        const resCred = await flow.result
+        expect(resCred?.uid).toBe('flow-uid')
+        expect(resCred?.access_token).toBe('flow-model-key')
+        expect(successCredential?.uid).toBe('flow-uid')
+      } finally {
+        await flow.close()
+      }
+    })
+  })
+
+  describe('completeAstudioLogin 与 AstudioAuth 对 AstudioLoginIdentity 的凭据交换', () => {
+    it('对短信/密码登录生成的 identity 成功换取 modelBearerToken 并入库', async () => {
+      const mockFetch = vi.fn()
+        // 1. bot/models/configs
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            code: 0,
+            data: [{ model: 'xopglm52', api_key: 'identity-exchange-token', is_default: true }],
+          }),
+        } as Response)
+
+      const fakeStore: AstudioCredentialStore = {
+        resolve: vi.fn().mockResolvedValue(undefined),
+        set: vi.fn().mockResolvedValue(undefined),
+        unset: vi.fn().mockResolvedValue(undefined),
+      }
+
+      const ctx = new Context()
+      const auth = new AstudioAuth(ctx, {
+        store: fakeStore,
+        fetcher: mockFetch,
+        env: { DSH_ASTUDIO_SESSION_FILE: 'F:/project/ARTEX/data/tasks/4/not-exist.json' },
+      })
+
+      const identity: AstudioLoginIdentity = {
+        uid: 'user-identity-123',
+        ssoSessionId: 'sso-identity-val',
+        token: 'token-identity-val',
+        accountId: 'acc-identity-123',
+        mobile: '13899998888',
+        loginMethod: 'sms',
+      }
+
+      const saved = await auth.completeLogin(identity)
+      expect(saved.access_token).toBe('identity-exchange-token')
+      expect(saved.uid).toBe('user-identity-123')
+      expect(saved.login_method).toBe('sms')
+      expect(saved.account_id).toBe('acc-identity-123')
+      expect(saved.sso_session_id).toBe('sso-identity-val')
+
+      expect(fakeStore.set).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining('identity-exchange-token'),
+      )
+    })
+  })
+})
+
