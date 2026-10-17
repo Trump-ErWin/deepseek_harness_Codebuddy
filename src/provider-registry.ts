@@ -451,39 +451,37 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
-    id: 'aggregate',
-    label: '聚合 (跨渠道)',
-    displayName: '聚合 (跨渠道)',
-    logoClass: 'aggregate',
-    // ⚠️ 如实登记为 false：它**没有自己的账号与余额** —— 复用各渠道的账号，
-    //    积分与限流由各渠道自己管理。
-    // ⚠️ 这不影响用量徽标：徽标对聚合的处理是「重定向到实际选中的渠道」，
-    //    重定向发生在 `supportsCreditBalance` 门控**之前**。
-    credits: { balance: false, dailyCheckin: false },
-    channel: false,
-  },
-  {
     id: 'modelscope',
     label: 'ModelScope (魔搭)',
     displayName: 'ModelScope (魔搭)',
     logoClass: 'modelscope',
-    // ⚠️ 与 opencode 同款取舍：balance: false 是**如实登记**，不是偷懒。
+    // ⚠️⚠️ **2026-10-17 更正：本条已从 `false` 改为 `true`**（带真实 Key 实测）。
     //
-    // 魔搭**没有额度查询 API**：实测 12 个候选路径（users/quota、quota、usage、
-    // free-quota、billing/usage、magic/quota、points/balance …）除 /api/v1/users/{name}
-    // 外**全部 404**；而那个唯一 200 的 /api/v1/users/credit 是把 URL 段**原样回显**的
-    // 公开主页接口（users/credit → UserName:"credit"，无 Authorization 也 200），
-    // **不是**余额接口。api-inference 域名下同样只有 /v1/models 与 /v1/chat/completions，
-    // 响应头也无额度字段。
+    // 上面那段「12 条候选路径全 404 ⇒ 没有额度查询 API」的结论**是错的**，
+    // 错在**前缀**：那批探测只试过 `/api/v1/*` 与 `/v1/*`，而真端点在
+    // **`/openapi/v1/`** ——
     //
-    // ⇒ 既然后台读不到任何数字，就不该渲染「刷新积分」与徽章读数。
+    //     GET https://www.modelscope.cn/openapi/v1/magicubes/balance
+    //     Authorization: Bearer <ms-…>
+    //     → {"success":true,"data":{"total_balance":281,"available_balance":281,
+    //        "frozen_amount":0}}
     //
-    // ⚠️ 与 opencode 的**关键差异**（别把两者当同一格）：opencode 能展示
-    // 「通道可用性」（本地状态，零网络），而**我们连本地都没有可展示的量** ——
-    // 账号池里没有逐日用量计数器（ProviderAccountEntry 只有 modelRateLimits，
-    // 语义是「该模型冷却到何时」）。凭空推算「今日已用」会给出**重启即失真**的假读数
-    // （AGENTS.md：「绝不编造数字」）。故如实为 false。
-    credits: { balance: false, dailyCheckin: false },
+    // ⚠️ 用错前缀时它落在 SPA catch-all 上（SPA 对**任何**路径都回 200 HTML ——
+    //    本仓库在 accio 记过同款「假 200」），两种表现都会让人误判成「不存在」。
+    //
+    // ⚠️⚠️ **「它是真余额」的判据是实测会随消耗下降**，不是字段名像余额：
+    //    实测 281 → 发 2 次推理（旗舰档每次扣 2 魔粒）→ 277，**恰好 -4**。
+    //    对照组 `/api/v1/quota/status`（API Key 也能读）实测发 3 次推理后
+    //    **逐字节不变** ⇒ 那是**任务奖励**（点赞/分享/绑定云账号），不是余额。
+    //
+    // ⇒ 不需要网页登录态、不需要采集 cookie、不需要起浏览器（三种认证实测：
+    //    API Key 200 / 网页 cookie 200 / 无凭据 401 `InvalidAuthentication`，
+    //    即它**确实在校验凭据**，符合仓库「目录能读 ≠ 凭据有效」的纪律）。
+    //
+    // ⚠️ **与 opencode 的关键差异**（别把两者当同一格）：opencode 的「余额」是
+    // 本地派生的**通道可用性**（零网络）；魔搭是**云侧真读数**，走 `credits` 域的
+    // `fetchBalanceDetailed`（三种失败的用户动作不同，故不用笼统的 `fetchBalance`）。
+    credits: { balance: true, dailyCheckin: false },
     // ⚠️ 无签到：额度是**每日自动刷新**（每账号 250 魔粒、UTC+8 零点重置，
     //    旗舰档每次扣 2），**没有「领取」动作、也没有签到 API**。
     //    宿主侧 credits.claimAll 仍要显式回一句可读错误（见 jet-hub-rpc.ts），
@@ -496,6 +494,18 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    —— 全部省略 = false，与能力实情一致。
     // ⚠️ 不登记 settingsNamespace：它不在老契约（≤0.1.6）的 namespace 清单里。
     channel: true,
+  },
+  {
+    id: 'aggregate',
+    label: '聚合 (跨渠道)',
+    displayName: '聚合 (跨渠道)',
+    logoClass: 'aggregate',
+    // ⚠️ 如实登记为 false：它**没有自己的账号与余额** —— 复用各渠道的账号，
+    //    积分与限流由各渠道自己管理。
+    // ⚠️ 这不影响用量徽标：徽标对聚合的处理是「重定向到实际选中的渠道」，
+    //    重定向发生在 `supportsCreditBalance` 门控**之前**。
+    credits: { balance: false, dailyCheckin: false },
+    channel: false,
   },
 ])
 

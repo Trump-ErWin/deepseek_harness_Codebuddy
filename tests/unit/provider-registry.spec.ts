@@ -41,6 +41,41 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
   })
 
+  /**
+   * ⚠️⚠️ **声明序 = 设置页左栏的默认渲染序**（2026-10-17，用户报障）。
+   *
+   * 未自定义 `providerOrder` 时，左栏完全按 `PROVIDER_REGISTRY` 的**声明序**
+   * 渲染（`sortOpenProvidersByOrder` 对空序是恒等函数）；而已关闭组**恒按声明序
+   * 沉底**、永不被自定义序覆盖。
+   *
+   * ⚠️ 本条守的是**相对位置**而非绝对下标：新增 provider 时下标必然漂移，
+   * 钉死数字会变成「必然过期」的快照（仓库对这类魔数断言有明确教训）。
+   *
+   * 需求：ModelScope 的设置标签应排在**聚合之上**。
+   */
+  it('★ modelscope 的声明序在 aggregate 之前（设置页左栏的默认渲染序）', () => {
+    const ids = PROVIDER_REGISTRY.map((d) => d.id)
+    const im = ids.indexOf('modelscope')
+    const ia = ids.indexOf('aggregate')
+    expect(im, 'registry 里找不到 modelscope').toBeGreaterThan(-1)
+    expect(ia, 'registry 里找不到 aggregate').toBeGreaterThan(-1)
+    expect(im, 'ModelScope 必须排在聚合之上，否则它在左栏会被排到聚合下面')
+      .toBeLessThan(ia)
+  })
+
+  it('★ 真实排出的左栏顺序与声明序一致（复刻客户端排序口径，非源码断言）', async () => {
+    // ⚠️ 真跑客户端的排序纯函数：只测 registry 的相对位置不足以覆盖
+    //    「用户已自定义过 providerOrder」这条路径（未出现在序里的项按声明序补后）。
+    const { sortOpenProvidersByOrder } = await import('../../plugin-src/client/provider-toggle.js')
+    const ids = PROVIDER_REGISTRY.map((d) => ({ id: d.id }))
+    // 复刻本机实测的 providerOrder：自定义但**不含** aggregate / modelscope
+    const order = ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'trae', 'cline',
+      'loomy', 'raccoon', 'minimax', 'zcode', 'opencode', 'gemini', 'qoder', 'qodercn']
+    const sorted = sortOpenProvidersByOrder(ids, order).map((p) => p.id)
+    expect(sorted.indexOf('modelscope'),
+      `实际左栏顺序：${sorted.join(' → ')}`).toBeLessThan(sorted.indexOf('aggregate'))
+  })
+
   it('descriptorOf 按 id 取；未知返回 undefined', () => {
     expect(descriptorOf('buddy')?.label).toBe('CodeBuddy (腾讯)')
     expect(descriptorOf('nope')).toBeUndefined()
