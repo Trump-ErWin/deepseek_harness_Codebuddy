@@ -1505,7 +1505,10 @@ describe('BuddyAdapter credential handling', () => {
     expect((error as LlmError).message).toContain('没有其他账号可换')
   })
 
-  it('400 换号途中撞到 14003 模型饱和也继续换号（2026-10-17 第一轮审计 P1）', async () => {
+  it('400 换号途中撞到 14003 模型饱和也继续换号（2026-10-17 第一轮审计 P1）',
+    // ⚠️ 必须放宽超时：该格会真的走一次饱和退避（`buddySaturationDelayMs` 的 sleep），
+    // 默认 5s 超时会在**断言之前**把用例判红 —— 那与被测行为无关，是测试自身的问题。
+    { timeout: 60000 }, async () => {
     // ⚠️⚠️ 真缺陷（第一轮独立审计实测，我已独立复现）。
     //
     // 饱和分支的既定处置是「留在本账号退避重试、绝不换号」，其前提是
@@ -1541,6 +1544,97 @@ describe('BuddyAdapter credential handling', () => {
     expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
     // ⚠️ **刻意不写冷却**：饱和是模型级的，写 30 分钟账号级冷却会封死好账号
     // （饱和分支的注释正是为此反对复用限流标记）。只 acc-1（11140）该被标记。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acc-1'])
+  })
+
+  it('400 换号途中末位撞 401/403 也不丢 11140 根因（2026-10-17 对抗审计阻断项）', async () => {
+    // ⚠️⚠️ 阻断级真缺陷。出口判据原先只读循环结束后**最后一次**的 `errorText`，
+    // 而 401/403 腿会把它刷成认证失败的报文 ⇒ 已记账的 11140 变成死变量。
+    //
+    // 实测（AT1 `400/11140` → AT2 `403 forbidden quota`，池耗尽）：
+    //   修复前 code=`AUTH`、message「buddy: forbidden quota」—— **11140 完全消失**。
+    // 而 AUTH 是 IKLBSH 红线：DSH 客户端把 message 整个换成「API 密钥无效」，
+    // 用户看不到「该去 Jet Hub 停用被拦账号」这句唯一出路（实测 token 全部有效）。
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: makeCooldownAwarePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) =>
+        (init.headers.get('Authorization') ?? '').includes('AT1')
+          ? new Response(POLICY_BODY, { status: 400 })
+          : new Response('forbidden quota', { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    // ⚠️ 绝不能是 AUTH（那会被客户端吞成「API 密钥无效」）。
+    expect((error as LlmError).failure.code).not.toBe('AUTH')
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
+    expect((error as LlmError).message).toContain('安全策略')
+  })
+
+  it('额度限流（6004）不因文案含「请求量饱和」被误判为模型饱和（2026-10-17 对抗审计）', async () => {
+    // ⚠️ `isModelSaturationError` 带文案兜底（模型繁忙|请求量饱和|model busy），
+    // 而上游额度限流 `6004` 的 msg 完全可能用同样的措辞 ⇒ 被判成**模型级**饱和。
+    // 危害是行为分叉：饱和路径「不换号、不写标记」，额度限流必须「换号 + 写标记」。
+    //
+    // 实测修复前（AT1 400/11140 → AT2 429/6004「请求量饱和」→ AT3 可用）：
+    //   发过的凭据 = AT1,AT2,AT2,AT2（AT3 从未被试），最终报「换账号无效」，
+    //   且 AT2 的额度限流标记**丢失**。
+    const used: string[] = []
+    const pool = makeCooldownAwarePool([
+      { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+      { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      { id: 'acc-3', credential: makeCredential({ access_token: 'AT3' }) },
+    ])
+    const quota = JSON.stringify({ code: 6004, msg: '请求量饱和，请稍后再试' })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: pool,
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) => {
+        const token = init.headers.get('Authorization') ?? ''
+        used.push(token.replace(/[^A-Z0-9]/g, ''))
+        if (token.includes('AT1')) return new Response(POLICY_BODY, { status: 400 })
+        if (token.includes('AT2')) return new Response(quota, { status: 429 })
+        return new Response(OK_SSE_400, {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        })
+      },
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    expect(used).toContain('BAT3')
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    // ⚠️ 额度限流**必须**留下标记（UI「限额重置」徽章与「重测/重置」的唯一依据）。
+    // 断言含 acc-2 才锁得住这条 —— 只断言成功的话，误判成饱和同样能成功。
+    expect(pool.recorded.map((r) => r.accountId)).toContain('acc-2')
+  })
+
+  it('限流换号途中撞 14003 饱和不给该账号写 1 小时限流标记（2026-10-17 对抗审计）', async () => {
+    // ⚠️ 与 400 路径那处**同型**的对偶缺陷：限流分支的循环**每轮开头**都给当前
+    // 账号记限流标记，而 `isRateLimited` 对 429 无条件返回 true ⇒ 换号途中新撞到
+    // 的 14003 饱和会被写成整 1 小时「限额重置」。
+    //
+    // 本文件下方那条「饱和必须先于限流判定，否则整池锁死」的守卫只在**循环外**生效，
+    // 换号途中的饱和会从记账腿漏过去 —— 同一缺陷的限流路径版本。
+    const pool = makeCooldownAwarePool([
+      { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+      { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      { id: 'acc-3', credential: makeCredential({ access_token: 'AT3' }) },
+    ])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: pool,
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) => {
+        const token = init.headers.get('Authorization') ?? ''
+        if (token.includes('AT1')) return new Response(JSON.stringify({ code: 14002, msg: 'rate limited' }), { status: 429 })
+        if (token.includes('AT2')) return new Response(JSON.stringify({ code: 14003, msg: 'model busy' }), { status: 429 })
+        return new Response(OK_SSE_400, {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        })
+      },
+    })
+    await collectChunks(adapter, streamOptions).catch(() => undefined)
+    // acc-1 是真额度限流（该有标记）；acc-2 是模型饱和（**绝不该有**）。
     expect(pool.recorded.map((r) => r.accountId)).toEqual(['acc-1'])
   })
 
