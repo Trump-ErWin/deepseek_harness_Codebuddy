@@ -504,6 +504,11 @@ describe('AStudio Provider Credits & Jet Hub RPC 接线验证', () => {
       officeace: blank(),
       minimaxintl: blank(),
       accio: blank(),
+      // ⚠️ 2026-10-17 合并上游后新增的两个键（autoclaw / modelscope）。
+      //    本用例只验 astudio 那条链，故给空桩即可 —— 但**不能省**：
+      //    `JetHubAuths` 是全字段必填的结构化类型，漏一个即 TS2739。
+      autoclaw: blank(),
+      modelscope: blank(),
       astudio: astudioAuth,
     }
 

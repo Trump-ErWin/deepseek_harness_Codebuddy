@@ -91,7 +91,9 @@ const PROVIDER_IDS = readProviderIds()
  * 它同样是「必须同步」的第三处。漏了它，下面那条不变式会**退化成**
  * 只检查旧字段，新 provider 的载荷字段无人守（正是本组要防的形态）。
  */
-const EXCLUSIVE_FIELDS = ['zcodeProvider', 'accioRegion', 'astudioLoginMethod']
+// ⚠️ 2026-10-17 合并后有**四个**专属字段（astudio 与 autoclaw 各一）——
+//    判据「恰好一个」正是「两家的字段不得互相串台」的那道闸门。
+const EXCLUSIVE_FIELDS = ['zcodeProvider', 'accioRegion', 'astudioLoginMethod', 'autoclawMode']
 
 /**
  * 载荷里带了哪些专属字段（0 个 / 1 个 / 多个）。
@@ -158,10 +160,11 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
     //   下发、登录前无从推断 ⇒ 选错就登不进去（国际用户拿中国版登录页）。
     expect(newAccountAsksChannel('accio')).toBe(true)
     expect(newAccountAsksChannel('astudio')).toBe(true)
+    expect(newAccountAsksChannel('autoclaw')).toBe(true)
     // ⚠ 这条对**全部** provider 取一遍：A1 的形态是「弹窗对 provider 零分支」，
     //   只抽查两三个 provider 的话，新增一个 provider 漏判就会静默溜过去。
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode' || id === 'accio' || id === 'astudio') continue
+      if (id === 'zcode' || id === 'accio' || id === 'astudio' || id === 'autoclaw') continue
       expect(newAccountAsksChannel(id), `${id} 不该弹预选窗`).toBe(false)
     }
   })
@@ -181,10 +184,42 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
 
   it('★ 不需要预选的 provider 载荷里**不许**出现任何专属字段（A2：选择被静默丢弃）', () => {
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode' || id === 'accio' || id === 'astudio') continue
+      if (id === 'zcode' || id === 'accio' || id === 'astudio' || id === 'autoclaw') continue
       const payload = buildCreateAccountPayload(id, 'zai', 'global')
       expect(payload).toEqual({ provider: id })
       expect(exclusiveFieldsOf(payload as Record<string, unknown>)).toEqual([])
+    }
+  })
+
+  it('★ autoclaw 的载荷带上登录模式', () => {
+    expect(buildCreateAccountPayload('autoclaw', undefined, undefined, undefined, 'local')).toEqual({ provider: 'autoclaw', autoclawMode: 'local' })
+    expect(buildCreateAccountPayload('autoclaw', undefined, undefined, undefined, 'sms')).toEqual({ provider: 'autoclaw', autoclawMode: 'sms' })
+  })
+
+  it('★ astudio 与 autoclaw 的登录方式**互不串台**（2026-10-17 合并引入的真实风险）', () => {
+    // 合并前两侧各自给同一位置参数（都是第 4 位）起了名：astudio 叫
+    // `astudioLoginMethod`、autoclaw 叫 `autoclawMode`。若把两者并成一个形参，
+    // 「A 家选了本机导入」的值会被发给 B 家 —— **两家各自都看起来传对了**，
+    // 且载荷里只多/少一个键，肉眼极难发现。
+    // ⚠️ 宿主 `account.create` 分别读 `payload.astudioLoginMethod` 与
+    //    `payload.autoclawMode`，串台后拿到的是**对方不认识的键** ⇒ 静默回落默认值。
+    expect(buildCreateAccountPayload('astudio', undefined, undefined, 'web'))
+      .toEqual({ provider: 'astudio', astudioLoginMethod: 'web' })
+    expect(buildCreateAccountPayload('astudio', undefined, undefined, 'local'))
+      .toEqual({ provider: 'astudio', astudioLoginMethod: 'local' })
+    // 反向：把 autoclaw 的值塞进 astudio 的位置，不得影响 astudio 的载荷。
+    expect(buildCreateAccountPayload('astudio', undefined, undefined, undefined, 'sms'))
+      .toEqual({ provider: 'astudio', astudioLoginMethod: 'local' })
+    // 反向：把 astudio 的值塞进 autoclaw 的位置，不得影响 autoclaw 的载荷。
+    expect(buildCreateAccountPayload('autoclaw', undefined, undefined, 'web'))
+      .toEqual({ provider: 'autoclaw', autoclawMode: 'local' })
+    // 「恰好一个专属字段」这条不变式本身就覆盖串台：两个都发出去即红。
+    for (const [p, a, m] of [
+      ['astudio', 'web', 'sms'],
+      ['autoclaw', 'web', 'sms'],
+    ] as const) {
+      const payload = buildCreateAccountPayload(p, undefined, undefined, a, m)
+      expect(exclusiveFieldsOf(payload as Record<string, unknown>)).toHaveLength(1)
     }
   })
 
@@ -213,7 +248,9 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
     // ⚠️ 三个实参都要传：只传两个会让 accio 的区域**恒为 undefined** ⇒ 宿主
     //    回落到 `cn` ⇒ 国际用户静默登不进去（正是本任务要修的功能缺口）。
     expect(jetHubCode, '调用点必须把 accioRegion 一起传给载荷构造器')
-      .toMatch(/buildCreateAccountPayload\(provider,\s*zcodeProvider,\s*accioRegion(?:,\s*astudioLoginMethod)?\)/)
+      // ⚠️ 2026-10-17 合并后调用点传**五个**实参（astudioLoginMethod 与 autoclawMode
+      //    各占一位）。少传任一个 ⇒ 那家的选择**恒为 undefined**、宿主静默回落默认值。
+      .toMatch(/buildCreateAccountPayload\(\s*provider,\s*zcodeProvider,\s*accioRegion,\s*astudioLoginMethod,\s*autoclawMode\s*\)/)
   })
 })
 
@@ -290,10 +327,23 @@ describe('F. accio 区域选择入口（终审 I2）', () => {
     // zcode 的两个渠道选项**不得**被这次改动弄丢。
     expect(jetHubCode).toContain("value: 'bigmodel'")
     expect(jetHubCode).toContain("value: 'zai'")
-    // 区域 state 与它的 setter 必须真的接在 select 上（不是定义了不用）。
+    // 区域 state 与它的 setter 必须真的接在**卡片组**上（不是定义了不用）。
+    // ⚠️⚠️ 2026-10-17 审计 P2 修复：原实现把功能挂在 `<select>` 上，而那里
+    //   的三个 `<select>` 全部带 `style:{display:'none'}`（原生下拉在
+    //   Windows/Electron 下点不开，功能已由**单选卡片组**接管）⇒ 那三个是
+    //   纯**死 DOM**：不可见、`onChange` 永不触发，却仍渲染 `<option>`。
+    //   现已整体删除，故守卫必须改锁**卡片组**的真实形态 ——
+    //   否则它会变成「保护一个不存在的东西」，删除后仍然全绿。
     expect(jetHubCode).toMatch(/const \[accioRegion, setAccioRegion\] = React\.useState\('cn'\)/)
-    expect(jetHubCode).toMatch(/onChange: \(event\) => setAccioRegion\(event\.target\.value\)/)
-    expect(jetHubCode).toMatch(/value: accioRegion/)
+    expect(jetHubCode, '卡片组必须真的把 accioRegion 的 setter 接上')
+      .toMatch(/onClick: \(\) => setAccioRegion\(opt\.value\)/)
+    expect(jetHubCode, '卡片组必须真的把 zcodeProvider 的 setter 接上')
+      .toMatch(/onClick: \(\) => setZcodeProvider\(opt\.value\)/)
+    expect(jetHubCode, '卡片组必须真的把 autoclawMode 的 setter 接上')
+      .toMatch(/onClick: \(\) => setAutoclawMode\(opt\.value\)/)
+    // ⚠️ **反向守卫**：隐藏的死 `<select>` 不得复活（它正是本次删掉的东西）。
+    expect(jetHubCode, '不得残留 display:none 的隐藏 select（纯死 DOM）')
+      .not.toMatch(/className: 'dim-jh-zcSelect',\s*\n\s*style: \{ display: 'none' \}/)
   })
 
   it('⚠️ 区域不是「偏好」而是登录前提 —— 弹窗文案必须说清「选错会打开打不开的登录页」', () => {

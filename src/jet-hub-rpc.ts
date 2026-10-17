@@ -71,6 +71,11 @@ import type * as OfficeAceAuthModule from './officeace-auth.js'
 /** 以模块命名空间为类型（`startLogin` / `pollLoginCode` / `fetchSubscriptionSummary` 等纯函数）。 */
 type OfficeAceAuth = typeof OfficeAceAuthModule
 import type { AccioAuth } from './accio-auth.js'
+import type { AutoclawAuth } from './autoclaw-auth.js'
+import { AUTOCLAW } from './autoclaw-product.js'
+import { parseAutoclawCredential, isAutoclawRefreshable, autoclawDisplayNickname } from './autoclaw.js'
+// ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+import type { ModelscopeAuth } from './modelscope-auth.js'
 import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
 import { ACCIO } from './accio-product.js'
 // AStudio（讯飞 AstronStudio）：直连上游 MAAS。**没有 OAuth 授权页** —— 凭据是客户端登录后
@@ -89,6 +94,9 @@ import {
   type AstudioWechatQrCode,
   type StartedAstudioLoginFlow,
 } from './astudio-oauth.js'
+// ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+import { MODELSCOPE } from './modelscope-product.js'
+import { maskModelscopeKey } from './modelscope.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -212,6 +220,7 @@ import { pickTestModel,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
+import { handleModelscopeRpc } from './modelscope-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
 import type {
@@ -1308,6 +1317,13 @@ export interface JetHubAuths {
    * —— 一次做完的同步路径 ⇒ 返回体靠 `reused: true` 走前端的成功出口。
    */
   readonly astudio: AstudioAuth
+  readonly autoclaw: AutoclawAuth
+  /**
+   * ModelScope（魔搭）—— **本 fork 独有**（上游 rc.11 仍无此 provider）。
+   *
+   * ⚠️ 值是 `ModelscopeAuth` **Service 实例**（与 accio 同款），不是命名空间。
+   */
+  readonly modelscope: ModelscopeAuth
 }
 
 /**
@@ -1872,10 +1888,10 @@ function registerJetHubEndpoints(
   const {
     codearts, buddy, workbuddy, lobsterai, qoder,
     qodercn: qoderCn,
-    trae, cline, loomy, raccoon, minimax,
+trae, cline, loomy, raccoon, minimax,
     // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
     minimaxintl,
-    zcode, gemini, accio,
+    zcode, gemini, accio, autoclaw,
     astudio,
   } = auths
   /**
@@ -2067,6 +2083,19 @@ function registerJetHubEndpoints(
     //   一次性终态「需人工重新登录」，不进重试循环。
     // 漏登记的后果与 accio 同款：凭据其实只需一次重取，面板却永报「未登录」。
     ASTUDIO.id,
+    AUTOCLAW.id,
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
+    //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
+    //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
+    //    （`/openapi/v1/magicubes/balance`，带 API Key 返 200，实测随消耗下降），
+    //    `balance` 已改为 `true` ⇒ **积分端点现在确实会为它触发**。
+    //    ⇒ 仍豁免的依据只剩一条，且比 loomy / zcode 更根本：它的凭据是**长期有效的
+    //    静态 API Key**（`expires_at` 可选、实测默认不过期）⇒ 没有「快过期」，
+    //    自愈链对它无事可做；`refreshAccountCredential` 只做本地有效性对账、
+    //    不发网络请求，调它等于白跑一趟。
+    //    ⚠️ **「余额能读」与「凭据能续」是两件事** —— 正因为余额现在能读了，
+    //    才更需要显式留下这条豁免，否则后人会当成「忘了登记」而补进去。
+    //    显式豁免登记在 `credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT`。
   ])
 
   /**
@@ -3423,7 +3452,36 @@ function registerJetHubEndpoints(
     accounts: readonly ProviderAccountStatus[],
     provider: string,
   ): Promise<ProviderAccountStatus[]> {
-    if (provider !== ZCODE.id) return [...accounts]
+    if (provider === ZCODE.id) return enrichZcodeIdentity(accounts)
+    // ⚠️⚠️ **本 fork 独有**（modelscope，2026-10-17）：卡片要显示**打码**的
+    //    API Key 并提供「编辑」入口（`modelscope.setApiKey`）。
+    //    ⚠️ **只下发打码串，绝不下发明文** —— 凭据经 RPC 明文下发等于把它
+    //    摊到客户端的 devtools / 日志 / 崩溃上报里（本仓库对凭据一贯的要求）。
+    //    ⚠️ 打码在**宿主**做完（`maskModelscopeKey`）而不是客户端：
+    //    两端各写一份打码必然漂移，且客户端那份一旦漏判形状就会回显原文。
+    if (provider === MODELSCOPE.id) {
+      const out: ProviderAccountStatus[] = []
+      for (const account of accounts) {
+        try {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) { out.push(account); continue }
+          const parsed = JSON.parse(resolved.value) as { access_token?: unknown }
+          const masked = typeof parsed.access_token === 'string'
+            ? maskModelscopeKey(parsed.access_token)
+            : ''
+          out.push({ ...account, ...(masked === '' ? {} : { modelscopeKeyMask: masked }) })
+        } catch {
+          // 凭据损坏/未配置：保留原条目（卡片的「积分」栏会自行报错说明）。
+          out.push(account)
+        }
+      }
+      return out
+    }
+    return [...accounts]
+  }
+
+  /** ZCode 专有的身份补全（自 `enrichAccountIdentity` 原样搬出，见其文档）。 */
+  async function enrichZcodeIdentity(accounts: readonly ProviderAccountStatus[]): Promise<ProviderAccountStatus[]> {
     const out: ProviderAccountStatus[] = []
     for (const account of accounts) {
       try {
@@ -3475,6 +3533,19 @@ function registerJetHubEndpoints(
   async function handleMethod(method: string, payload: unknown, _signal?: AbortSignal): Promise<unknown> {
     if (method.startsWith('opencode.')) {
       const handled = await handleOpencodeRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-17 审计 P0 修复）：魔搭与 opencode
+    //    同属「不跳浏览器、手工粘贴 API Key」的 provider ⇒ 走各自的前缀改道分支。
+    //    ⚠️ 本分支此前**不存在**，而 `handleModelscopeRpc` 已导出却零调用点 ⇒
+    //    `modelscope.addAccount` 落进 `default` 回 `unknown method`，
+    //    而客户端 `account.create` 也无 modelscope 分支 ⇒ 报 `unknown provider:
+    //    modelscope`。**症状是「面板出现但永远加不了账号、零日志」** ——
+    //    即 `docs/agent-notes/providers-accio.md` 记的「接线陷阱（新 provider 通用）」
+    //    复发。判定依据同上面 opencode：必须在 `switch` 之前、且对不认识的方法
+    //    返回 `undefined` 让主 switch 继续匹配。
+    if (method.startsWith('modelscope.')) {
+      const handled = await handleModelscopeRpc(ctx, pool as never, method, payload)
       if (handled !== undefined) return handled
     }
     switch (method) {
@@ -4190,6 +4261,62 @@ function registerJetHubEndpoints(
             ok: true,
             value: { accountId: id, loginUrl: started.authorizeUrl, incognitoOpened },
           }
+        } else if (provider === AUTOCLAW.id) {
+          const id = `autoclaw-${shortId()}`
+          const refName = `AUTOCLAW_ACCOUNT_${shortId().toUpperCase()}`
+          const autoclawMode = (payload as { autoclawMode?: string })?.autoclawMode
+
+          // 1. 如果用户显式选择“一键导入本机桌面端凭据”（autoclawMode === 'local'）：
+          if (autoclawMode === 'local') {
+            const localCred = await autoclaw.probeLocal()
+            if (!localCred) {
+              return { ok: false, error: '未检测到本地 AutoClaw 桌面端有效登录凭据，请先在 AutoClaw 中登录' }
+            }
+            try {
+              await autoclaw.importLocalAccount(pool, { accountId: id, refName })
+              return { ok: true, value: { accountId: id } }
+            } catch (err) {
+              const reason = err instanceof Error ? err.message : String(err)
+              return { ok: false, error: reason }
+            }
+          }
+
+          // 2. 其它情况（用户选择手机验证码登录，或弹窗页自由选择）：
+          // 登记占位条目
+          await pool.addAccount({
+            id,
+            provider: AUTOCLAW.id,
+            nickname: 'AutoClaw (登录中...)',
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let started
+          try {
+            started = await autoclaw.startLogin({ refName })
+          } catch (error) {
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 AutoClaw 登录服务：${reason}`)
+          }
+
+          started.result.then(async ({ credential }) => {
+            const ref = credentialRef(refName)
+            await ctx.credentials.set(ref, JSON.stringify(credential))
+            const nickname = autoclawDisplayNickname(credential, id)
+            await pool.updateAccount(id, {
+              nickname,
+              expiresAt: credential.expires_at,
+              refreshable: isAutoclawRefreshable(credential),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${AUTOCLAW.id} login failed for ${id}: ${String(error)}`)
+            void failLogin(id, error)
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else if (provider === ACCIO.id) {
           /**
            * Accio（阿里）走**浏览器回调式 OAuth 2.0 + PKCE**（本地
@@ -4630,12 +4757,20 @@ function registerJetHubEndpoints(
        */
       case 'login.sendSms': {
         const req = payload as RpcSendSmsRequest
-        if (req.provider !== LOOMY.id) {
+        if (req.provider !== LOOMY.id && req.provider !== AUTOCLAW.id) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const phone = typeof req.phone === 'string' ? req.phone.trim() : ''
         if (!/^1[3-9]\d{9}$/.test(phone)) {
           return { ok: false, error: { code: 'bad-request', message: '需要 11 位有效手机号（phone）' } }
+        }
+        if (req.provider === AUTOCLAW.id) {
+          const sendRes = await autoclaw.sendVerificationCode(phone)
+          if (!sendRes.ok) {
+            return { ok: false, error: { code: 'send-failed', message: sendRes.error ?? '验证码发送失败' } }
+          }
+          pendingSmsMsgid.set(req.accountId, { phone, msgid: 'autoclaw-sms' })
+          return { ok: true, value: { msgid: 'autoclaw-sms' } satisfies RpcSendSmsResponse }
         }
         const msgid = await loomy.sendSmsCode(phone)
         // 暂存在内存，供 submitSms 取用（一次性中间态，不写凭据存储）。
@@ -4650,7 +4785,7 @@ function registerJetHubEndpoints(
        */
       case 'login.submitSms': {
         const req = payload as RpcSubmitSmsRequest
-        if (req.provider !== LOOMY.id) {
+        if (req.provider !== LOOMY.id && req.provider !== AUTOCLAW.id) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const pending = pendingSmsMsgid.get(req.accountId)
@@ -4665,6 +4800,35 @@ function registerJetHubEndpoints(
           return {
             ok: true,
             value: { done: false, error: '账号不存在（可能已被删除）' } satisfies RpcSubmitSmsResponse,
+          }
+        }
+        if (req.provider === AUTOCLAW.id) {
+          try {
+            const loginRes = await autoclaw.loginWithCode(pending.phone, req.code, account.credentialRef)
+            if (!loginRes.ok || !loginRes.credential) {
+              return {
+                ok: true,
+                value: { done: false, error: loginRes.error ?? 'AutoClaw 验证码登录失败' } satisfies RpcSubmitSmsResponse,
+              }
+            }
+            const cred = loginRes.credential
+            const nickname = autoclawDisplayNickname(cred, req.accountId)
+
+            await pool.updateAccount(req.accountId, {
+              nickname,
+              expiresAt: cred.expires_at,
+              refreshable: isAutoclawRefreshable(cred),
+            })
+            pendingSmsMsgid.delete(req.accountId)
+            return { ok: true, value: { done: true } satisfies RpcSubmitSmsResponse }
+          } catch (error) {
+            return {
+              ok: true,
+              value: {
+                done: false,
+                error: error instanceof Error ? error.message : String(error),
+              } satisfies RpcSubmitSmsResponse,
+            }
           }
         }
         try {

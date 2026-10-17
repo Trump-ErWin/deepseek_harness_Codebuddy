@@ -498,6 +498,11 @@ const BALANCE_PATH_OF: Readonly<Record<string, string>> = {
   //   points/balance（src/astudio-credits.ts 的 ASTUDIO_POINTS_BALANCE_PATH，
   //   baseUrl 来自 src/astudio-product.ts 的 authBaseUrl）。
   astudio: '/points/balance',
+  autoclaw: '/agent-assetmgr/api/v2/wallets',
+  // ⚠️ **本 fork 独有**（魔搭，2026-10-17）：魔粒余额端点。
+  //    ⚠️ 只写**路径片段**（与本表其余项同口径）：域名在 product 的 `balanceUrl`
+  //    里，而它**刻意不是** `baseUrl` 那个 host（见 modelscope-product.ts 的字段注释）。
+  modelscope: '/openapi/v1/magicubes/balance',
 }
 
 /**
@@ -578,7 +583,12 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     expect(PROVIDER_REGISTRY.some((d) => d.credits.balance !== true)).toBe(true)
     // ⚠️ 2026-10-15 加 minimaxintl：12 → 13。
     // ⚠️ 2026-10-16 astudio 并入（credits.balance:true 且不在 CREDITS_TABLE_EXEMPT）：13 → 14。
-    expect(expected.length).toBe(14)
+    // ⚠️ 2026-10-17 autoclaw（AutoClaw 智谱，wallet 余额）：14 → 15。
+    // ⚠️ 2026-10-17 **本 fork** 并入 modelscope（魔搭）：15 → 16。
+    //    modelscope 原先被豁免（理由「平台没有额度 API」）已作废：真端点是
+    //    `/openapi/v1/magicubes/balance`（带 API Key 返 200、随消耗下降）。
+    //    ⚠️ 合并上游时**不要**改回 13。
+    expect(expected.length).toBe(16)
     // ⚠️ **关键集合判据必须对「生产真正调用的那种形态」也成立**（2026-10-08 复审 C1）：
     //    上面那次是 `createProviderCredits()`（无 deps），而端点与 `index.ts` 调的
     //    都是 `createProviderCredits({ loomy, raccoon, zcode })`。deps 只应影响**实现**，

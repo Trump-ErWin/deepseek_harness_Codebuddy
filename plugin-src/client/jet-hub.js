@@ -14,6 +14,11 @@ import {
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
+// ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
+//    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
+//    ⚠️ 本 import 此前**不存在** ⇒ `modelscope-key-modal.js` 整份 140 行从未进 bundle，
+//    面板点「添加账号」无任何反应入口（症状零日志）。
+import { ModelscopeKeyModal, ModelscopeKeyEditModal } from './modelscope-key-modal.js';
 import {
   formatExpirySplitLine,
   formatNamedPoolLine,
@@ -620,7 +625,9 @@ function isAnonymousAccountId(accountId) {
 function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onTest, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
   // ⚠️ opencode 专属：传了才渲染「代理」「指纹」两个按钮（见按钮区注释）。
   // 前者额外需要 current 代理串，故签名与 onRetest 略有不同。
-  onOpenProxy, onRotateFingerprint }) {
+  // ⚠️ **本 fork 独有**：modelscope 的「令牌」按钮同理（传了才渲染），
+  // 第二参是宿主算好的**打码**串。
+  onOpenProxy, onRotateFingerprint, onEditModelscopeKey }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -880,6 +887,23 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
             disabled: busy,
             onClick: () => onRotateFingerprint(account.id),
           }, '指纹')
+        : null,
+      // ⚠️ **本 fork 独有**（魔搭，2026-10-17）：编辑访问令牌。
+      //    账号 id 与 credentialRef 都由 Key 尾段派生 ⇒ 换 Key 等于换一条账号，
+      //    没有这个入口时用户只能删除重建（会丢昵称与停用状态）。
+      //    ⚠️ 同样用 **props 存在性**开关（与上面 opencode 代理/指纹同款），
+      //    而非 `provider === 'modelscope'` 硬判断。
+      //    ⚠️ tooltip 里给的是**宿主算好的打码串**（`modelscopeKeyMask`）——
+      //    客户端不自己打码，避免与 `maskModelscopeKey` 两份实现漂移。
+      onEditModelscopeKey
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: account.modelscopeKeyMask
+              ? '访问令牌：' + account.modelscopeKeyMask + '（点击修改）'
+              : '设置该账号的访问令牌（ms-…）',
+            disabled: busy,
+            onClick: () => onEditModelscopeKey(account.id, account.modelscopeKeyMask || ''),
+          }, '令牌')
         : null,
       React.createElement('button', {
         className: 'dim-jh-btn',
@@ -2585,6 +2609,7 @@ function ProviderPanel({ provider, rpcCall }) {
    */
   const [accioRegion, setAccioRegion] = React.useState('cn');
   const [astudioLoginMethod, setAstudioLoginMethod] = React.useState('local');
+  const [autoclawMode, setAutoclawMode] = React.useState('local');
   /**
    * ★ 弹窗是否开着（`false` = 关着）。
    *
@@ -2633,11 +2658,21 @@ function ProviderPanel({ provider, rpcCall }) {
    * 共用一个 state 会让开代理弹窗把登录链接顶掉（表现为链接凭空消失）。
    */
   const [proxyModal, setProxyModal] = React.useState(null);
+  // ⚠️ **本 fork 独有**（modelscope，2026-10-17）：「编辑访问令牌」弹窗状态
+  // { accountId, currentMasked, error } 或 null。
+  // ⚠️ **独立于** `keyModal`（添加账号用）：两者语义不同（新增 vs 替换），
+  // 共用一个 state 会互相顶掉（同 `proxyModal` 与 `loginUrlForManual` 的教训）。
+  // ⚠️ 同样**不放明文 Key 进 state**（ref + DOM 读值），理由见下方 keyModal 注释。
+  const [keyEditModal, setKeyEditModal] = React.useState(null);
   // 「添加 opencode 账号」弹窗：null（关闭）或 { error }。
   // ⚠️ 输入框内容**不放 state**（用 ref + DOM 读值）：API key 是凭据，
   // 进 state 会随每次重渲染经过整棵组件树，也会被 devtools 组件树检查器读到。
   const [keyModal, setKeyModal] = React.useState(null);
   const keyInputRef = React.useRef(null);
+  // ⚠️ **本 fork 独有**（modelscope 编辑令牌）：**独立** ref ——
+  // 与添加弹窗共用一个的话，打开编辑弹窗时若添加弹窗还挂着（理论上互斥，
+  // 但 ref 是 DOM 级的），两个 input 会指向同一个节点。
+  const keyEditInputRef = React.useRef(null);
 
   /**
    * 拖拽排序状态：正在拖的账号 id 与当前悬停的目标账号 id。
@@ -2753,6 +2788,7 @@ function ProviderPanel({ provider, rpcCall }) {
    */
   const accioDialog = provider === 'accio';
   const astudioDialog = provider === 'astudio';
+  const autoclawDialog = provider === 'autoclaw';
   // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
   // 有成长中心的 provider 才传 runTasks（见 GROWTH_TASK_PROVIDERS 的注释：
@@ -3272,6 +3308,55 @@ function ProviderPanel({ provider, rpcCall }) {
     await submitOpencodeEntry('opencode.addAnonymous', {});
   };
 
+  /**
+   * 提交一个 modelscope（魔搭）账号。
+   *
+   * ⚠️ **本 fork 独有**（2026-10-17 审计 P0 修复）：此前本函数与
+   *    `createAccount` 里的 `provider === 'modelscope'` 分支**都不存在** ⇒
+   *    面板里点「添加账号」落到通用 `account.create`，而宿主那条 switch 没有
+   *    modelscope 分支 ⇒ 回 `unknown provider: modelscope`。
+   *    ⚠️ **刻意复用 {@link submitOpencodeEntry} 而不另写一份收尾**：两者的
+   *    收尾语义逐字节相同（关弹窗 / 刷新 / `existed` 提示 / 错误留在弹窗内），
+   *    本仓库红线是「同一份语义不许有两套实现」。
+   */
+  const submitModelscopeKey = async (rawKey) => {
+    const key = String(rawKey == null ? '' : rawKey).trim();
+    // 空串 = 没填就点确认：静默关弹窗，不报错（与 opencode 同款，不制造无谓报错）。
+    if (key === '') return;
+    await submitOpencodeEntry('modelscope.addAccount', { apiKey: key });
+  };
+
+  /**
+   * 提交「编辑访问令牌」（**本 fork 独有**，2026-10-17）。
+   *
+   * ⚠️ **刻意不复用 {@link submitOpencodeEntry}**：它的收尾是「关弹窗 + 刷新 +
+   * `existed` 提示」，而这里多一格 —— 宿主可能在换 Key 时**换了账号 id**
+   * （id 由 Key 尾段派生），必须据此明确告诉用户「这条账号的标识变了」，
+   * 否则用户会以为账号凭空消失。
+   */
+  const submitModelscopeKeyEdit = async (rawKey) => {
+    const key = String(rawKey == null ? '' : rawKey).trim();
+    if (key === '') return;
+    const accountId = keyEditModal?.accountId;
+    if (!accountId) return;
+    setCreating(true);
+    try {
+      const res = await rpcCall('modelscope.setApiKey', { accountId, apiKey: key });
+      setKeyEditModal(null);
+      await loadAccounts();
+      // ⚠️ `renamed` = 账号 id 变了（宿主已把旧条目移除、新条目建好）。
+      //    提示里**不**显示明文 Key，只说变了 —— 与卡片上的打码口径一致。
+      setProbeNotice(res?.renamed
+        ? '已更新访问令牌。该账号的标识随 Key 尾段一并更新（昵称与停用状态已保留）。'
+        : '已更新访问令牌。');
+    } catch (caught) {
+      // ⚠️ 错误留在弹窗内（同 submitOpencodeEntry 的理由）。
+      setKeyEditModal((prev) => (prev ? { ...prev, error: caught?.message ? caught.message : '未知错误' } : prev));
+    } finally {
+      setCreating(false);
+    }
+  };
+
   /** 两个添加入口的公共收尾（成功关弹窗并刷新；失败把错误留在弹窗里）。 */
   const submitOpencodeEntry = async (method, payload) => {
     setCreating(true);
@@ -3308,7 +3393,13 @@ function ProviderPanel({ provider, rpcCall }) {
     // 走 `setKeyModal` 而不是下面的 `account.create` 流程。
     // 弹窗里另有两个入口：粘贴 key（submitOpencodeKey）与添加匿名通道（submitAnonymous）。
     if (provider === 'opencode') {
-      setKeyModal({ error: '' });
+      setKeyModal({ provider, error: '' });
+      return;
+    }
+    // ⚠️ **本 fork 独有**（魔搭）：凭据是用户手工粘贴的 `ms-` API Key，
+    //    没有 OAuth 授权页 ⇒ 两步式 `account.create` 对它不适用，与 opencode 同款改道。
+    if (provider === 'modelscope') {
+      setKeyModal({ provider, error: '' });
       return;
     }
 
@@ -3325,7 +3416,10 @@ function ProviderPanel({ provider, rpcCall }) {
       //   （`buildCreateAccountPayload` 内部分支），
       //   其余 provider 的载荷与接入预选弹窗前**逐字节相同**。
       const res = await rpcCall('account.create',
-        buildCreateAccountPayload(provider, zcodeProvider, accioRegion, astudioLoginMethod));      accountId = res.accountId;
+        // ⚠ 两个 provider 各占一个位置参数（astudio 第 4 位、autoclaw 第 5 位），
+        //    不可合并成一个 —— 载荷字段不同，合并会静默串台（见 new-account.js）。
+        buildCreateAccountPayload(provider, zcodeProvider, accioRegion, astudioLoginMethod, autoclawMode));
+      accountId = res.accountId;
       loginUrl = res.loginUrl;
       console.log('[jet-hub] account.create ok, provider =', provider, ', accountId =', accountId);
       // ⚠ **`reused` 分支必判**：后端若声明「复用了池里已有条目、新建条目与登录 URL」，
@@ -3349,6 +3443,11 @@ function ProviderPanel({ provider, rpcCall }) {
       // 早期这里为 Loomy 分出一个「短信表单」分支，而表单要等 `account.create`
       // 返回才渲染、`account.create` 又要求先有手机号 —— **顺序死锁**，
       // 表单永远出不来。改用微信扫码后该分支已删除。
+      if (!loginUrl) {
+        await loadAccounts();
+        setProbeNotice({ tone: 'ok', text: '已成功导入账号凭据。', details: [] });
+        return;
+      }
       if (loginUrl) {
         // ⚠️⚠️ **OfficeAce：宿主已用无痕窗口打开，客户端不要再开一个**（2026-10-13）。
         //
@@ -3928,46 +4027,49 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: (event) => event.stopPropagation(),
             },
               React.createElement('h3', { className: 'dim-jh-zcDialogTitle' },
-                astudioDialog ? '添加 AStudio 账号' : accioDialog ? '添加 Accio 账号' : '添加 ZCode 账号'),
+                // ⚠ 弹窗服务四个 provider（zcode / accio / astudio / autoclaw），
+                //   各问各的东西：渠道 / 区域 / AStudio 登录方式 / AutoClaw 登录方式。
+                astudioDialog ? '添加 AStudio 账号'
+                  : autoclawDialog ? '添加 AutoClaw 账号'
+                    : (accioDialog ? '添加 Accio 账号' : '添加 ZCode 账号')),
               React.createElement('p', { className: 'dim-jh-zcDialogHint' },
                 astudioDialog
                   ? '支持导入本机桌面端已登录会话，或在浏览器中打开三合一登录页（支持手机短信/账号密码/微信扫码）。'
-                  : accioDialog
-                    ? 'Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前'
-                      + '无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。'
-                    : '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，'),
-              accioDialog || astudioDialog
+                  : autoclawDialog
+                    ? '请选择登录方式：可直接读取本机已安装并登录的桌面端凭据，或使用手机短信验证码快速登录。'
+                    : (accioDialog
+                        ? 'Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前'
+                          + '无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。'
+                        : '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，')),
+              (accioDialog || astudioDialog || autoclawDialog)
                 ? null
                 : React.createElement('p', { className: 'dim-jh-zcDialogHint' },
                     '可用 z.ai（国际）登录另一个账号。'),
               React.createElement('label', { className: 'dim-jh-zcProvider' },
-                astudioDialog ? '登录方式' : accioDialog ? '登录区域' : '登录渠道',
-                astudioDialog
-                  ? React.createElement('select', {
-                      className: 'dim-jh-zcSelect',
-                      style: { display: 'none' },
-                      value: astudioLoginMethod,
-                      onChange: (event) => setAstudioLoginMethod(event.target.value),
-                    },
-                      React.createElement('option', { value: 'local' }, '导入本机凭证（读取本地 AStudio 客户端）'),
-                      React.createElement('option', { value: 'web' }, '网页三合一登录（支持手机短信/账号密码/微信扫码）'))
-                  : (accioDialog
-                      ? React.createElement('select', {
-                          className: 'dim-jh-zcSelect',
-                          style: { display: 'none' },
-                          value: accioRegion,
-                          onChange: (event) => setAccioRegion(event.target.value),
-                        },
-                          React.createElement('option', { value: 'cn' }, '中国版（www.accio-ai.com）'),
-                          React.createElement('option', { value: 'global' }, '国际版（zh.accio.com）'))
-                      : React.createElement('select', {
-                          className: 'dim-jh-zcSelect',
-                          style: { display: 'none' },
-                          value: zcodeProvider,
-                          onChange: (event) => setZcodeProvider(event.target.value),
-                        },
-                          React.createElement('option', { value: 'bigmodel' }, 'BigModel（智谱开放平台，国内）'),
-                          React.createElement('option', { value: 'zai' }, 'z.ai（chat.z.ai，国际版）')))),
+                astudioDialog ? '登录方式'
+                  : autoclawDialog ? '登录方式' : (accioDialog ? '登录区域' : '登录渠道'),
+                // ⚠️⚠️ **原生 `<select>` 已整体删除**（2026-10-17 审计 P2 修复，
+                //    本次合并 astudio 侧时一并采纳 —— astudio 侧原本还留着第四个死 select）。
+                //   原先此处有**四个**各自带 `style:{display:'none'}` 的 `<select>`
+                //   （astudioLoginMethod / autoclawMode / accioRegion / zcodeProvider），
+                //   功能已由下方**单选卡片组**接管（Windows/Electron 下原生下拉经常点不开）。
+                //   ⇒ 那四个是纯**死 DOM**：不可见、其 `onChange` 永不触发，
+                //     却仍渲染出 `<option>` 并把 state 挂在上面 ——
+                //     既是维护陷阱（改 options 会让人误以为生效），
+                //     也是「一份状态两套 UI 判据」这种本仓库红线形态。
+                //   ⚠️ 守卫已同步改写：`tests/unit/new-account-dialog.spec.ts`
+                //     里原先断言 `value: accioRegion` / `onChange: …target.value`
+                //     （原生 select 专属形态）的那几条，现在锁的是**卡片组**的
+                //     `onClick: () => setXxx(opt.value)` —— 否则删掉死 DOM
+                //     会让守卫变成「保护一个不存在的东西」。
+              // ⚠️ **label 自身到此闭合**（2026-10-17 审计 P2 修复）：
+              //   删掉原先那个 `<select>`（第三个子参数）后，`label` 的
+              //   `createElement(` 只剩两个参数 ⇒ 必须补这个右括号，
+              //   否则 esbuild 报 `Expected ")" but found ";"`。
+              //   ⚠️ 这类语法错误**单测查不出来**（本仓库 client 守卫多为
+              //   源码文本断言，不做解析）⇒ 改完本文件**必须**跑
+              //   `pnpm build:client`，见 AGENTS.md 的「单测只读源码文本」那条。
+              ),
               // 彻底解决 Windows/Electron 下原生 <select> 下拉框经常点不开的恶心 bug：使用 100% 可靠的 DOM 单选卡片组
               React.createElement('div', {
                 style: {
@@ -4091,6 +4193,62 @@ function ProviderPanel({ provider, rpcCall }) {
                             )
                           );
                         })
+                  : (autoclawDialog
+                      ? [
+                          { value: 'local', label: '⚡ 一键导入本机桌面端凭据', desc: '需已在 AutoClaw 桌面端登录，自动秒级解密' },
+                          { value: 'sms', label: '📱 手机验证码快速登录', desc: '免安装桌面端，支持输入任意手机号登录' },
+                        ].map((opt) => {                          const active = autoclawMode === opt.value;
+                          return React.createElement('div', {
+                            key: opt.value,
+                            onClick: () => setAutoclawMode(opt.value),
+                            style: {
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '10px',
+                              padding: '10px 14px',
+                              borderRadius: '6px',
+                              border: active
+                                ? '1.5px solid var(--dsw-alias-primary, #0284c7)'
+                                : '1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.25))',
+                              background: active
+                                ? 'var(--dsw-alias-primary-tint, rgba(2, 132, 199, 0.1))'
+                                : 'var(--dsw-alias-bg-layer-2, transparent)',
+                              cursor: 'pointer',
+                              transition: 'all 0.15s ease',
+                              userSelect: 'none',
+                            },
+                          },
+                            React.createElement('div', {
+                              style: {
+                                width: '14px',
+                                height: '14px',
+                                borderRadius: '50%',
+                                border: active
+                                  ? '4px solid var(--dsw-alias-primary, #0284c7)'
+                                  : '1.5px solid var(--dsw-alias-border-l2, #8b949e)',
+                                boxSizing: 'border-box',
+                                flexShrink: 0,
+                                background: active ? '#fff' : 'transparent',
+                              },
+                            }),
+                            React.createElement('div', { style: { display: 'flex', flexDirection: 'column' } },
+                              React.createElement('span', {
+                                style: {
+                                  fontSize: '13px',
+                                  fontWeight: active ? 600 : 400,
+                                  color: 'var(--dsw-alias-label-primary, inherit)',
+                                },
+                              }, opt.label),
+                              React.createElement('span', {
+                                style: {
+                                  fontSize: '11px',
+                                  color: 'var(--dsw-alias-label-tertiary, #888)',
+                                  marginTop: '2px',
+                                },
+                              }, opt.desc)
+                            )
+                          );
+                        })
                       : [
                           { value: 'bigmodel', label: '🇨🇳 BigModel（智谱开放平台，国内）', desc: '适用于 open.bigmodel.cn 国内平台账号' },
                           { value: 'zai', label: '🌐 z.ai（chat.z.ai，国际版）', desc: '适用于 z.ai 国际版账号' },
@@ -4146,7 +4304,7 @@ function ProviderPanel({ provider, rpcCall }) {
                               }, opt.desc)
                             )
                           );
-                        })))),
+                        }))))),
               React.createElement('div', { className: 'dim-jh-zcDialogActions' },
                 React.createElement('button', {
                   className: 'dim-jh-btn',
@@ -4159,7 +4317,12 @@ function ProviderPanel({ provider, rpcCall }) {
                     setPendingLogin(undefined)
                     void createAccount()
                   },
-                }, astudioDialog && astudioLoginMethod === 'local' ? '确定并导入' : '确定并打开认证页'))),
+                // ⚠ 两家（astudio / autoclaw）都在「本机导入」档时改成导入语义文案，
+                //    其余档都是打开认证页。两个 provider 各判各的，不可合并。
+                },
+                (astudioDialog && astudioLoginMethod === 'local') || (autoclawDialog && autoclawMode === 'local')
+                  ? '确定并导入本地账号'
+                  : '确定并打开认证页'))),
         )),
     probeNotice
       ? React.createElement('div', {
@@ -4326,6 +4489,15 @@ function ProviderPanel({ provider, rpcCall }) {
                       onRotateFingerprint: (id) => void rotateFingerprint(id),
                     }
                   : {}),
+                // ⚠️ **本 fork 独有**（modelscope，2026-10-17）：编辑访问令牌。
+                // 同样只在该 provider 下传，靠「props 存在性」决定是否渲染按钮。
+                ...(provider === 'modelscope'
+                  ? {
+                      onEditModelscopeKey: (id, masked) => setKeyEditModal({
+                        accountId: id, currentMasked: masked,
+                      }),
+                    }
+                  : {}),
                 // 新手任务（仅 Loomy）：一次性 10000 分，每号只能领一次。
                 // 与「一键领取积分」（每日签到）是**不同**的操作，故独立按钮。
                 onClaimOnboarding: canClaimOnboarding
@@ -4375,7 +4547,7 @@ function ProviderPanel({ provider, rpcCall }) {
       : null,
     // 「添加 opencode 账号」弹窗：自绘而非 window.prompt ——
     // DSH 客户端沙箱里 prompt() 直接抛 `prompt() is not supported`（真机报障）。
-    keyModal
+    keyModal && keyModal.provider !== 'modelscope'
       ? React.createElement(OpencodeKeyModal, {
           error: keyModal.error,
           busy: creating,
@@ -4383,6 +4555,33 @@ function ProviderPanel({ provider, rpcCall }) {
           onSubmit: (value) => void submitOpencodeKey(value),
           onSubmitAnonymous: () => void submitAnonymous(),
           onClose: () => setKeyModal(null),
+        })
+      : null,
+    // ⚠️ **本 fork 独有**（魔搭）：与上面共用 `keyModal` 状态与 `keyInputRef`
+    //    （两个弹窗都是单例、互斥显示），但**按 provider 分派** —— 本仓库约定
+    //    「通用面板里的按钮与弹窗必须按 provider 分支」，两家的表单字段不同。
+    //    ⚠️ 必须用 `React.createElement` 而非直接调用组件函数：直接调用会把
+    //    组件的 hook 算进 ProviderPanel（该文件头记录过 hook #310 事故）。
+    keyModal && keyModal.provider === 'modelscope'
+      ? React.createElement(ModelscopeKeyModal, {
+          error: keyModal.error,
+          busy: creating,
+          inputRef: keyInputRef,
+          onSubmit: (value) => void submitModelscopeKey(value),
+          onClose: () => setKeyModal(null),
+        })
+      : null,
+    // ⚠️ **本 fork 独有**（魔搭）：「编辑访问令牌」弹窗（独立 state + 独立 ref）。
+    // ⚠️ 必须用 `React.createElement` 而非直接调用组件函数：直接调用会把组件的
+    // hook 算进 ProviderPanel（该文件头记录过 hook #310 事故，整个设置页白屏）。
+    keyEditModal
+      ? React.createElement(ModelscopeKeyEditModal, {
+          error: keyEditModal.error || '',
+          busy: creating,
+          currentMasked: keyEditModal.currentMasked || '',
+          inputRef: keyEditInputRef,
+          onSubmit: (value) => void submitModelscopeKeyEdit(value),
+          onClose: () => setKeyEditModal(null),
         })
       : null));
 }
@@ -5787,9 +5986,22 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
  *
  * 两边的一致性由 `tests/unit/aggregate-panel-logic.spec.ts` 末尾的 ★★ 守卫锁成
  * **集合相等**（判据 fail-closed：抽不到这份名单就报红，改名/重构不会让它静默失效）。
+ *
+ * ⚠️⚠️ **字面量必须紧跟在 `=` 之后（中间不得插注释/空行以外的东西）**：
+ * 那条守卫用正则 `const AGG_WIRED_CHANNEL_LABELS =\s*\n?\s*'([^']*)'`
+ * 抽取名单 —— 在 `=` 与字面量之间插多行注释会让它**抽不到**从而报红。
+ * ⚠️ 曾因此踩过一次（把 modelscope 的说明写在 `=` 与字符串之间）。
+ * ⇒ 渠道相关的说明写在这段 JSDoc 里，别写到常量正上方。
+ *
+ * ⚠️ **本 fork 独有**（魔搭，2026-10-17 用户明确要求加入聚合轮换）：
+ * `modelscope` 已进 `WIRED_EXPIRY_PROVIDERS` ⇒ 这里**必须**同改，否则只登了
+ * 魔搭的用户会看到「请先在……登录账号」这句错话（他们其实已经登录了）。
+ *
+ * ⚠️ **AutoClaw**（智谱，2026-10-17 审计 P0 修复）：同样已进
+ * `WIRED_EXPIRY_PROVIDERS` ⇒ 同改，理由同上。
  */
 const AGG_WIRED_CHANNEL_LABELS =
-  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace';
+  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace / modelscope / autoclaw';
 
 /**
  * 「按临期排序」模式下面板**自动重探**临期顺序的间隔（用户 2026-10-16 从 5 分钟改为 **2 分钟**）。

@@ -64,8 +64,18 @@ import {
   loomyExpiry,
   officeaceExpiry,
   traeExpiry,
+  // ⚠️ **本 fork 独有**（魔搭，2026-10-17）
+  modelscopeExpiry,
+  // ⚠️ AutoClaw（智谱，2026-10-17 审计 P0 修复新增）
+  autoclawExpiry,
   zcodeExpiry,
 } from './aggregate-expiry.js'
+// ⚠️ **本 fork 独有**（魔搭，2026-10-17）
+import { MODELSCOPE } from './modelscope-product.js'
+import type { ModelscopeCredential } from './modelscope.js'
+// ⚠️ AutoClaw（智谱，2026-10-17 审计 P0 修复新增）
+import { AUTOCLAW } from './autoclaw-product.js'
+import type { AutoclawCredential } from './autoclaw.js'
 import type { AccioCredential } from './accio.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
@@ -151,6 +161,37 @@ export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>>
     officeace: {
       credentialExpiry: (c, context) =>
         officeaceExpiry(c as OfficeAceCredential, context?.credentialRef),
+    },
+    // ⚠️ **本 fork 独有**（魔搭，2026-10-17，用户明确要求加入聚合轮换）：
+    //    属「有余额但不下发到期时间」那一类 ⇒ 有余额即 `NEVER`、烧光即 `UNUSABLE`。
+    //    ⚠️ **必须走 `cachedBalance`**：与 buddy / trae 同款 —— 聚合每轮折算会对
+    //    同一账号反复提问，没有共享读数就会白发大量重复请求。
+    //    同 accio / officeace：两处（本表 + `WIRED_EXPIRY_PROVIDERS`）必须同改，
+    //    由 `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁一致。
+    modelscope: {
+      credentialExpiry: (c, context) => modelscopeExpiry(
+        c as ModelscopeCredential,
+        MODELSCOPE,
+        context?.cachedBalance === undefined
+          ? undefined
+          : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      ),
+    },
+    // ⚠️ **AutoClaw**（智谱，2026-10-17 审计 P0 修复）：与 modelscope **同格**
+    //    （钱包余额不下发到期时间 ⇒ 有余额即 `NEVER`、烧光即 `UNUSABLE`）。
+    //    ⚠️ 三处必须同改（本表 + `WIRED_EXPIRY_PROVIDERS` + 折算原语）——
+    //    这是该陷阱的第 4 次复发，漏任何一处的症状都是**静默**的
+    //    （用户在聚合轮换列表里看不到该渠道，零报错零日志）。
+    //    ⚠️ **必须走 `cachedBalance`**：与 buddy / trae / modelscope 同款 ——
+    //    聚合每轮折算会对同一账号反复提问，没有共享读数就白发大量重复请求。
+    autoclaw: {
+      credentialExpiry: (c, context) => autoclawExpiry(
+        c as AutoclawCredential,
+        AUTOCLAW,
+        context?.cachedBalance === undefined
+          ? undefined
+          : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      ),
     },
   }
 }
