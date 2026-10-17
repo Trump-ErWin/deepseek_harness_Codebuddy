@@ -189,7 +189,16 @@ type Verdict = 'ok' | 'account-gated' | 'no-verdict' | 'other'
  *
  * ⇒ 本组把它的每一格都固定住（用 `describe` 而非 `suite`，即**不需要** e2e 闸门）。
  * ⚠️ 与 `image-limit-bisect.e2e.spec.ts` 的「图片边界判据（离线，不消耗额度）」
- * 同款做法；跑法见 `tests/e2e/README.md`（`--config vitest.e2e.config.ts`）。
+ * 同款做法。
+ *
+ * ⚠️⚠️ **但「不需要闸门」≠「被 `pnpm test` 跑到」**（2026-10-17 审计实测更正）：
+ * 本文件在 `tests/e2e/` 下，而 `vitest.config.ts` 只收 `tests/unit/**`
+ * ⇒ **`pnpm test` 根本不执行本组**，只有 `--config vitest.e2e.config.ts` 才跑。
+ * 本组标注「零额度、不需要闸门」是对的，但**实际覆盖它的是 e2e 那条命令**，
+ * 不是默认的单测命令 —— 而 `judge()` 是本次三处修复之一，把它放在默认跑不到的
+ * 通道里，等于该修复**在 CI/本地默认流程中无守卫**。
+ * ⚠️ 处理：见 `tests/unit/` 下 `buddy-conv-judge.spec.ts`（本组逻辑的**单测侧镜像**，
+ * 断言同一张归类表）—— 两处刻意并存，因为 e2e 侧那组必须与真机报文同源演进。
  */
 describe('judge() 归因：把「上游行为」与「本机账号/额度」分开（离线，零额度）', () => {
   const c = (status: number, code = '-', msg = ''): Case => ({
@@ -204,6 +213,10 @@ describe('judge() 归因：把「上游行为」与「本机账号/额度」分�
     // ⚠️ 这一格是**本文件的立命之本**：`66E05E7C` 类账号确实要求三头。
     //    若把它错判成「上游行为变更」，就会按旧结论去改实现/注释。
     ['400/11128 conversation id missing（该账号要求三头）', 400, '11128', 'conversation id missing'],
+    // ⚠️⚠️ 这一格是**本机真机实测的措辞**（2026-10-17 复现 + 报障者独立复现）：
+    //    真实报文稳定是 `request illegal`，`conversation id missing` 在两台
+    //    机器、两批账号上**零命中**。少这一格 ⇒ master 上那个红就是从这里来的。
+    ['400/11128 request illegal（真机实测措辞，本账号要求三头）', 400, '11128', 'request illegal'],
   ])('%s ⇒ account-gated', (_l, status, code, msg) => {
     expect(judge(c(status, code, msg))).toBe('account-gated')
   })
