@@ -493,6 +493,7 @@ describe('AStudio Provider Credits & Jet Hub RPC 接线验证', () => {
       zcode: blank(),
       gemini: blank(),
       officeace: blank(),
+      minimaxintl: blank(),
       accio: blank(),
       astudio: astudioAuth,
     }
