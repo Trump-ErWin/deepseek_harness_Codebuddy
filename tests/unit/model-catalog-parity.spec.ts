@@ -64,6 +64,8 @@ import { createModelCatalog, type CatalogEntry } from '../../src/model-catalog.j
 import { BuddyAdapter } from '../../src/buddy-adapter.js'
 import { AccioAdapter } from '../../src/accio-adapter.js'
 import { AutoclawAdapter } from '../../src/autoclaw-adapter.js'
+// ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+import { ModelscopeAdapter } from '../../src/modelscope-adapter.js'
 import { ClineAdapter } from '../../src/cline-adapter.js'
 import { CodeArtsAdapter } from '../../src/llm-adapter.js'
 import { GeminiAdapter } from '../../src/gemini-adapter.js'
@@ -497,7 +499,7 @@ describe('端到端对拍：loomy（同构组，模态恒为数组）', () => {
   })
 })
 
-describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复审补齐 I-1）', () => {
+describe('端到端对拍：**全 provider 表驱动**（15 家，2026-10-08 复审补齐 I-1；2026-10-16 本 fork 并入 modelscope）', () => {
   /**
    * ## ⚠️ 为什么补这一段（补之前这里的覆盖是 3/14）
    *
@@ -601,7 +603,7 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
       } as never),
     },
     {
-      id: 'autoclaw',
+id: 'autoclaw',
       // ⚠️ autoclaw 的目录来自编译期兜底表（`AUTOCLAW.fallbackModels`），不发网络；
       //    但 `listModels` 有「凭据可读」门控，未就绪返回 `[]`。
       //    这里注入一个**恒有凭据**的 provider 让它真正列出目录（否则本段对它
@@ -611,6 +613,22 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
         credentialProvider: async () => ({
           access_token: 'at', refresh_token: 'rt', expires_at: 4102444800000,
         }),
+      } as never),
+    },
+    {
+      // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+      // ⚠️ **不注入 `fetchRemoteCatalog`**：那会走远端拉取（真发网络）。
+      //    不注入时 `loadModelscopeCatalog` 回退 `MODELSCOPE_FALLBACK_MODELS`，
+      //    本段因此是零网络的。
+      // ⚠️ **不注入 `accountPool`**：同上，且它同时保证 `providerCatalogVisible`
+      //    不因「没有已登录账号」把目录挡空。
+      // ⚠️ `slots` 必须返回**至少一个**条目：`listModels` 的门控是
+      //    「`slots.length === 0` ⇒ 返回 `[]`」（空槽与「无账号」同形）。
+      //    这里给一个**假 key**：本段不对拍鉴权，只对拍跨家目录契约。
+      id: 'modelscope',
+      make: () => new ModelscopeAdapter({
+        ...NO_CRED,
+        slots: async () => [{ id: 'modelscope', apiKey: 'ms-wire-test-key' }],
       } as never),
     },
     {
@@ -675,7 +693,10 @@ describe('端到端对拍：**全 provider 表驱动**（14 家，2026-10-08 复
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    expect(CASES).toHaveLength(18)
+    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope ⇒ 17 → 18；
+    //    2026-10-17 加 autoclaw（AutoClaw/智谱）⇒ 18 → 19。
+    //    合并上游时**不要**改回 17（那会让 modelscope 失去本段全部对拍）。
+    expect(CASES).toHaveLength(19)
   })
 
   /**

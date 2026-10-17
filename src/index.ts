@@ -110,6 +110,12 @@ import { AccioAuth } from './accio-auth.js'
 import { registerAccioLlm } from './accio-adapter.js'
 import { ACCIO } from './accio-product.js'
 import type { AccioCredential } from './accio.js'
+// ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
+// 见 `docs/agent-notes/providers-modelscope.md` 与 `src/modelscope-product.ts` 模块头的逐条出处表。
+import { ModelscopeAuth } from './modelscope-auth.js'
+import { ModelscopeAdapter, registerModelscopeLlm } from './modelscope-adapter.js'
+import { MODELSCOPE } from './modelscope-product.js'
+import { modelscopeModelsUrl, modelscopeHeaders, type ModelscopeCredential } from './modelscope.js'
 import type { ZcodeCredential } from './zcode.js'
 import { GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -448,6 +454,21 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
       resolveCredential: async () => credential as ClineCredential,
       refresh: async () => {},
       product: CLINE,
+    }),
+  },
+  // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+  //
+  // 探测只发一次最小请求（`probe` 走适配器的 `listModels` / 一次最小补全），
+  // 故只需把**这一份凭据**喂进 `slots`（单槽），不需要池 —— 与 cline 同款。
+  // ⚠️ `fetchRemoteCatalog` 留空：目录探测不是「探活」的职责，
+  //    且它会在 `listModels` 里回退兜底表（不会抛）。
+  modelscope: {
+    createProbeAdapter: (ref, credential) => new ModelscopeAdapter({
+      credentialRef: credentialRef(ref),
+      slots: async () => [{ id: MODELSCOPE.id, apiKey: (credential as ModelscopeCredential).access_token }],
+      product: MODELSCOPE,
+      // ⚠️ 不传 `warn`：`probeById` 是**模块级**常量（在 `apply()` 之前求值），
+      //    此处**没有 `ctx`**。与 cline / lobsterai 的 probe 条目同款。
     }),
   },
   // ZCode（智谱）→ Anthropic Messages 体 + 阿里云 captcha 参数。
@@ -2181,6 +2202,85 @@ export function apply(ctx: Context): void {
     readImageRequest: makeReadImageRequest(ctx),
   })
 
+  // ===== ModelScope（魔搭）—— **本 fork 独有** =====
+  //
+  // ⚠️ 迁移说明（2026-10-16）：本 provider 在 rc.3 时代按「槽制 + 自建反代」形态实现，
+  //    rc.11 引入 `provider-registry` / `provider-runtime` / `credential-resolver`
+  //    三套抽象后，接入点收敛到「注册表声明 + 一次 `registerProviderRuntime`」。
+  //    ⚠️ **`ModelscopeAdapterOptions` 仍是槽制（`slots`）**，与 accio 的
+  //    `resolveCredential` 形态不同 —— 那是有意的：魔搭的凭据是**多枚 key 轮转**
+  //    （旧 fork 的 `PROXY_UPSTREAM_MODELSCOPE` 存的就是 JSON 数组），
+  //    而 `createCredentialResolver` 的契约是「一个 ref 一份凭据」。
+  //    详见 `src/modelscope-rpc.ts` 的 `modelscopeSlotNamesOf`。
+  //
+  // 服务名由 ModelscopeAuth 依 product.id 派生，注册为 ctx.modelscopeAuth。
+  const modelscope = new ModelscopeAuth(ctx)
+  const modelscopeAdapter = registerModelscopeLlm(ctx, {
+    // 单凭据回退 ref：池里没有 modelscope 账号时用它（与其余 provider 同约定）。
+    credentialRef: credentialRef(MODELSCOPE.defaultCredentialRef),
+    // ⚠️ 槽序列由**接线层**解析好传进来（适配器不直接读凭据）。
+    //    `modelId` 透传：接线层据此过滤「该模型正处于限流窗口」的账号
+    //    （与其余 provider 的 `getAvailableAccount` 同语义）。
+    slots: async (modelId?: string) => {
+      const entries = await pool.listAccounts(MODELSCOPE.id)
+      const usable = await Promise.all(entries.map(async (entry) => {
+        // 与其余 provider 同款：停用账号不参与自动选号。
+        if (!entry.enabled) return undefined
+        // ⚠️ 模型级限流标记：`modelId` 缺省时**不查**（目录路径刻意不传，
+        //    见适配器的模块头说明 —— 传了会让被限流的账号把整个目录拖空）。
+        if (modelId !== undefined && modelId.length > 0) {
+          const resetAt = entry.modelRateLimits?.[modelId]
+          if (typeof resetAt === 'number' && resetAt > Date.now()) return undefined
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+        if (!resolved) return undefined
+        try {
+          const parsed = JSON.parse(resolved.value) as ModelscopeCredential
+          if (typeof parsed.access_token !== 'string' || parsed.access_token.length === 0) return undefined
+          return { id: entry.id, apiKey: parsed.access_token }
+        } catch {
+          return undefined
+        }
+      }))
+      return usable.filter((s): s is { id: string; apiKey: string } => s !== undefined)
+    },
+    accountPool: pool,
+    product: MODELSCOPE,
+    // ⚠️ **本 fork 独有**（2026-10-17 审计 P1 修复）：限流标记的**写入端**。
+    //    ⚠️ 本回调此前**没有注入**，而上面 `slots()` 里却在**主动读**
+    //    `entry.modelRateLimits?.[modelId]` 来跳过受限账号 —— 读端存在、写端缺失
+    //    ⇒ 那段判据恒不命中（死代码），适配器里的 `this.options.markLimited?.()`
+    //    也恒为 no-op ⇒ **限流标记永远写不进池**。
+    //    守卫为什么没抓住：`provider-runtime-wiring.spec.ts` 只检查**适配器文件里
+    //    有没有调用形**（`.markLimited?.(` 确实存在 ⇒ 绿），**从不检查接线层有没有
+    //    注入该回调** ⇒ 「适配器写了调用、接线层没注入」这一形态打不穿。
+    //    与 opencode（`index.ts:2940`）同款实现。
+    markLimited: async (slotId, modelId, resetAtMs) => {
+      await pool.updateModelRateLimit(slotId, modelId, resetAtMs)
+    },
+    // 远端目录：`GET {base}/v1/models`。失败回退 `MODELSCOPE_FALLBACK_MODELS`
+    // （适配器的 `loadModelscopeCatalog` 内部兜底，不会抛）。
+    // ⚠️ **必须带超时**：桌面版到外部域名的 fetch 可能永不 settle
+    //（opencode 的真机事故 2026-10-02：没有超时 ⇒ listModels 永不返回 ⇒
+    //  模型列表与徽标同时空白）。超时后回退兜底表，UI 立刻可用。
+    fetchRemoteCatalog: (apiKey: string, signal?: AbortSignal) => fetch(modelscopeModelsUrl(MODELSCOPE), {
+      headers: modelscopeHeaders(apiKey),
+      signal: signal ?? AbortSignal.timeout(10_000),
+    }),
+    // ⚠️ **刻意不接 `readImageRequest`**：`ModelscopeAdapterOptions` 没有该字段
+    //    （它按「像素预算发请求版本」的形态只在 opencode / accio 那几家实现）。
+    //    魔搭的图片走 `readImage` 单一路径，逐模型按 `supportsImage` 声明模态。
+    readImage: makeReadImage(ctx),
+    // ⚠️⚠️ **必须接 `disabledModels`**（2026-10-17 审计发现）：模型黑名单是
+    //    「设置页 → 显示列表」逐 id 开关的产物，而**模型选择器读的正是这份黑名单**
+    //    （`ModelscopeAdapter.listModels` 读 `options.disabledModels?.()`）。
+    //    ⚠️ 本回调此前**没有传** ⇒ 黑名单完全失效 ⇒ 用户在「显示列表」里关掉的模型
+    //    **照样出现在模型选择器里**（实测：只开了 V4.1 Flash，选择器仍列全部 36 个）。
+    //    ⚠️ 典型形态：适配器**支持**该能力（字段与消费点都在），只是**接线层漏了实参**
+    //    ⇒ 无报错、无日志，纯静默。
+    disabledModels: () => pool.disabledModelsFor(MODELSCOPE.id),
+  })
+
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
   //
   // 早期实现把服务端的 `name` 直接当昵称用，而实测它是**自动生成的默认名**
@@ -3181,6 +3281,12 @@ async function fetchBalanceReading(
     gemini: pruned(GEMINI.id, geminiAdapter),
     zcode: pruned(ZCODE.id, zcodeAdapter),
     opencode: pruned(OPENCODE.id, opencodeAdapter),
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。必须进这张表：
+    //    `provider.status` 的「已关闭」判据是 `total > 0 && disabled === total`，
+    //    它读的是 `listAllModels()` 那份**不套黑名单**的全量目录。表里缺它 ⇒
+    //    退化到 `llm.listModels`（已按黑名单过滤）⇒ 「关闭整个 provider」时
+    //    漏写黑名单 ⇒ 出现「provider 显示已关闭、模型却仍可选用」的矛盾态。
+    modelscope: pruned(MODELSCOPE.id, modelscopeAdapter),
     // OfficeAce（华为 MaaS 云端直连）：目录静态 + 平台侧可用性，同其余渠道。
     officeace: pruned(OFFICEACE.id, officeAceAdapter),
     // ⚠️ 聚合 provider 也必须进这张表（设计文档 §5.2 的必改点）：`jet-hub-rpc.ts` 的
@@ -3429,6 +3535,9 @@ async function fetchBalanceReading(
       ['officeace', officeaceAuthService as unknown as JetHubAuthLike],
       ['autoclaw', autoclaw],
       ['accio', accio],
+      // ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
+      //    漏加这一行 = 它不出现在注册表里 ⇒ 续期/积分/探测三条链路全部静默失效。
+      ['modelscope', modelscope],
     ]
     for (const [id, auth] of registry) {
       const descriptor = descriptorOf(id)
@@ -3536,6 +3645,10 @@ async function fetchBalanceReading(
     officeace: officeaceAuthService as never,
     autoclaw,
     accio,
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。漏加 = 客户端把它当
+    //    「客户端已登记但宿主没有同名键」⇒ zcode-wiring 的守卫会红，
+    //    且 Jet Hub 的 modelscope 面板所有 RPC 全部 `unknown provider`。
+    modelscope,
   }, modelAdapters)
 
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
@@ -3576,4 +3689,7 @@ async function fetchBalanceReading(
   //（理由见上面 `officeaceAuthService` 的注释：两处各建一个会让守卫用例的
   //  spy 收不到调用）。
   ctx.provide('officeaceAuth', officeaceAuthService as never)
+  // ⚠️ **本 fork 独有**（modelscope）：`ModelscopeAuth extends Service`，
+  //    构造时已由 cordis 自动注册为 `ctx.modelscopeAuth`（`super(ctx, `${product.id}Auth`)`），
+  //    故这里**不需要**再 provide —— 与 accio 同款（它也没有 provide 行）。
 }

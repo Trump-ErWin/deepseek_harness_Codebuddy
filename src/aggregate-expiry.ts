@@ -53,6 +53,10 @@ import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
 import type { TraeProduct } from './trae-product.js'
 import type { TraeCredential } from './trae.js'
 import { fetchTraeCreditBalance } from './trae-credits.js'
+// ⚠️ **本 fork 独有**（魔搭，2026-10-17）：魔粒余额折算。
+import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js'
+import { MODELSCOPE } from './modelscope-product.js'
+import type { ModelscopeCredential } from './modelscope.js'
 import type { AccioCredential } from './accio.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
@@ -177,6 +181,18 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   //    ⚠️ 与 accio 同款陷阱：**决定候选表可见性的是这张表、不是
   //    `AGGREGATE_CHANNELS`** —— 只加后者 ⇒ 归一化再对也没用，症状静默。
   'officeace',
+  // ⚠️ **本 fork 独有**（魔搭，2026-10-17，用户明确要求加入）：
+  //    折算原语见 `modelscopeExpiry`，属「**有余额但不下发到期时间**」那一类
+  //    （魔搭余额报文里没有任何时间字段）⇒ 有余额即 `NEVER`、烧光即 `UNUSABLE`。
+  //
+  //    ⚠️⚠️ **代价（用户已知并接受）**：魔粒烧光时**不会被提前剔出轮换** ——
+  //    平台既不下发「配额何时重置」，也没有别的额度端点（`/api/v1/quota/status`
+  //    经实测是**任务奖励**、不是额度）。⇒ 耗尽后仍会被选中并失败一次。
+  //    ⚠️ **不许用「猜一个每日 UTC+8 零点」消除它**：那是凭空造一个上游从未
+  //    承诺的重置时刻（本仓库红线「绝不编造数字」）。
+  //    ⚠️ 与 accio / officeace 同款陷阱：**决定候选表可见性的是这张表、
+  //    不是 `AGGREGATE_CHANNELS`** —— 只加后者等于没接。
+  'modelscope',
 ])
 
 /**
@@ -864,6 +880,59 @@ export async function traeExpiry(
   return sharedPackageExpiry(() => fetchBalanceWithCache(
     cached,
     () => fetchTraeCreditBalance(credential, product),
+  ))
+}
+
+/**
+ * ModelScope（魔搭）：**本 fork 独有**（2026-10-17）。
+ *
+ * ## 它属哪一类
+ *
+ * 「**有余额但不下发到期时间**」那一类 —— 判据直接复用
+ * {@link sharedPackageExpiry}（逐格同构，不另写一套）：
+ *
+ * - `balance.packages` 里存在 `active === true && remaining > 0` 的包
+ *   ⇒ 返回 `NEVER`（**长期可用，排最后，不剔除**）；
+ * - 一个都没有（`available_balance === 0`）⇒ 返回 `UNUSABLE`（**剔除**）。
+ *
+ * ⚠️ 魔搭的 `/openapi/v1/magicubes/balance` 报文里**没有任何时间字段**
+ * （实测：`{"total_balance":277,"available_balance":277,"frozen_amount":0}`）
+ * ⇒ 必然走「有余额但无到期时间」这条，落到 `NEVER`。
+ *
+ * ## ⚠️⚠️ 与其它家的**根本差异**：额度耗尽**不会被自动跳过**
+ *
+ * buddy 系能折算出临期时刻、从而在耗尽前把账号剔出轮换；魔搭**做不到** ——
+ * 它既没有「配额何时重置」字段（每日发放是平台侧行为，实测报文字段里没有），
+ * 也无法查询余额之外的东西（`/api/v1/quota/status` 经实测是**任务奖励**、
+ * 不是额度，详见 `modelscope-credits.ts`）。
+ *
+ * ⇒ **魔粒烧光时，聚合仍会把它排进轮换候选**，用户选中后才失败一次
+ * （报额度用尽）。这是**已知且刻意接受**的代价，由用户在 2026-10-17 明确选择
+ * （选项 B）：宁可在极端情况下多失败一次，也要让魔粒充足时能进轮换。
+ * ⚠️ **不许用「猜一个每日 UTC+8 零点」来消除这个代价** —— 那会凭空造出一个
+ * 上游从未承诺的重置时刻（本仓库红线「绝不编造数字」）。
+ *
+ * ## ⚠️ 为什么**不**直接复用 `fetchTraeCreditBalance` 那套的 `fetchBalance`
+ *
+ * 本家走 `fetchBalanceDetailed`（三种失败的用户动作不同，见
+ * `modelscope-credits.ts`）⇒ 这里必须吃 `balance: null` 的那一支，
+ * **不是** `fetchBalance` 的 `null`。
+ */
+export async function modelscopeExpiry(
+  credential: ModelscopeCredential,
+  product: typeof MODELSCOPE,
+  /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+  cached?: () => Promise<CreditBalance | null | undefined>,
+): Promise<number> {
+  return sharedPackageExpiry(() => fetchBalanceWithCache(
+    cached,
+    async () => {
+      const result = await fetchModelscopeBalanceDetailed(credential, product)
+      // ⚠️ `fetchBalanceDetailed` 用 `balance: null + error` 表达失败
+      //    （见 `ProviderBalanceDetail` 的注释），而 `sharedPackageExpiry`
+      //    认的是「`null` ⇒ UNUSABLE」⇒ 取 `balance` 即可。
+      return result.balance
+    },
   ))
 }
 

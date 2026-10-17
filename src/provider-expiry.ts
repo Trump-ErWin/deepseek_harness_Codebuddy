@@ -64,8 +64,13 @@ import {
   loomyExpiry,
   officeaceExpiry,
   traeExpiry,
+  // ⚠️ **本 fork 独有**（魔搭，2026-10-17）
+  modelscopeExpiry,
   zcodeExpiry,
 } from './aggregate-expiry.js'
+// ⚠️ **本 fork 独有**（魔搭，2026-10-17）
+import { MODELSCOPE } from './modelscope-product.js'
+import type { ModelscopeCredential } from './modelscope.js'
 import type { AccioCredential } from './accio.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
@@ -151,6 +156,21 @@ export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>>
     officeace: {
       credentialExpiry: (c, context) =>
         officeaceExpiry(c as OfficeAceCredential, context?.credentialRef),
+    },
+    // ⚠️ **本 fork 独有**（魔搭，2026-10-17，用户明确要求加入聚合轮换）：
+    //    属「有余额但不下发到期时间」那一类 ⇒ 有余额即 `NEVER`、烧光即 `UNUSABLE`。
+    //    ⚠️ **必须走 `cachedBalance`**：与 buddy / trae 同款 —— 聚合每轮折算会对
+    //    同一账号反复提问，没有共享读数就会白发大量重复请求。
+    //    同 accio / officeace：两处（本表 + `WIRED_EXPIRY_PROVIDERS`）必须同改，
+    //    由 `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁一致。
+    modelscope: {
+      credentialExpiry: (c, context) => modelscopeExpiry(
+        c as ModelscopeCredential,
+        MODELSCOPE,
+        context?.cachedBalance === undefined
+          ? undefined
+          : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      ),
     },
   }
 }
