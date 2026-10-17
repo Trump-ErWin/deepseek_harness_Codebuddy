@@ -456,6 +456,21 @@ id: 'autoclaw',
     displayName: 'AutoClaw (智谱)',
     logoClass: 'autoclaw',
     credits: { balance: true, dailyCheckin: true },
+    // ⚠️ 余额响应里每个积分包都带到期时间（2026-10-17 真机取证）：
+    //    钱包接口本身**没有**到期字段，但流水的每笔发放带 `wallet_expires_at`
+    //    （unix 秒），且未过期批次之和 == total_balance（守恒实测 20700）⇒
+    //    `autoclaw-credits.ts` 用**批次包**替换钱包包，逐包带 `deductionEndTime`
+    //    （毫秒，与 officeace / buddy 同单位）⇒ 通用判据分「永久 / 长期 / 临期」三档。
+    creditPackages: true,
+    // ⚠️ 与 buddy / officeace 同口径（按到期时间分桶，窗口复用
+    //    `DSH_BUDDY_EXPIRING_WINDOW_DAYS`）。**必须登记**：查表分派只认这个
+    //    标记回传 `windowDays`，漏登记的症状是「胶囊只有合计、没有三档带色行」
+    //    —— 与 officeace 当初（`officeace 必须回传 windowDays`）同一根因。
+    //    ⚠️ 「每日红 + 刷新倒计时」**不适用于本渠道**：那套语义（`DAILY_POOL_NAMES`
+    //    按池名匹配）是 Loomy / Raccoon 那种**当日重置池**（未用完随重置作废）；
+    //    AutoClaw 的每日签到积分是发放进余额、按批次各自到期 —— 隐藏池
+    //    （服务端 `display:false`）已在解析器滤掉，不会出现「每日 0」红字。
+    usesExpiryWindow: true,
     rateLimit: false,
     settingsNamespace: 'llm-autoclaw',
     channel: true,
