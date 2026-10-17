@@ -155,7 +155,8 @@ import {
 } from './opencode-auth.js'
 import { OPENCODE } from './opencode-product.js'
 import type { OpencodeCredential } from './opencode.js'
-import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './opencode-capability.js'
+import { MODELS_DEV_TTL_MS, primeModelsDev, refreshModelsDev } from './models-dev-cache.js'
+import { invalidateOpencodeCapabilities } from './opencode-capability.js'
 import { closeAllProxyDispatchers } from './opencode-proxy.js'
 import { execFile } from 'node:child_process'
 
@@ -3038,23 +3039,47 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     ctx.logger.warn(`[codearts-auth] 创建默认 OpenCode 匿名通道失败：${String(error)}`)
   })
 
-  // 预热模型能力表（models.dev）。
+  // models.dev 本地缓存：启动预热 + **定期刷新**（用户 2026-10-17）。
   //
-  // ⚠️⚠️ **两条硬约定**（真机事故 2026-10-02）：
+  // ⚠️⚠️ 三条硬约定（第一条是 2026-10-02 的真机事故）：
   // 1. 渲染路径上**只读同步缓存**，永不 await 网络 —— 我最初在 `listModels`
   //    里 await 这个拉取，而它 5 MB / 慢则 1.4s、宿主网络异常时**永不返回**，
   //    于是模型选择器一直空白（用户报障「一直卡着」）。
   // 2. 拉取完成要**广播目录变更**：能力表是能力判定的来源，DSH 已经用
   //    「纯文本」渲染过一帧，不广播它不会重算（免费模型会一直显示不支持图片）。
+  // 3. **全仓唯一直读点**是 `src/models-dev-cache.ts`：opencode 的能力表与
+  //    cline 的目录补全都只读它那份磁盘缓存，不再各自直连（此前两处各一套
+  //    直连 + TTL + ETag，既重复又让 5 MB 的请求在插件里发生两次）。
   //
-  // 首次运行磁盘没缓存时，本次刷新可能晚于首帧几十秒；那段时间能力按纯文本
-  // 保守处理（见 opencode-capability.ts 的模块头）。
-  primeOpencodeCapabilities()
+  // 首次运行磁盘没缓存时，本次刷新可能晚于首帧几十秒；那段时间能力按纯文本、
+  // 目录按本地兜底表保守处理（见各模块的降级注释）。
+  primeModelsDev()
   // ⚠️ 走**唯一**的广播实现（`src/catalog-broadcast.ts`）：能力表是能力判定的
   // 来源，它一变就必须让客户端重读目录 —— 与十个适配器的「目录落地」同一语义，
   // 不该各写一份 emit（审计指出此处曾是内联实现，且 `ctx.logger.warn` 缺两级
   // 可选链：logger 缺席时会抛、仅被 catch 吞）。
-  refreshOpencodeCapabilities(() => { broadcastCatalogChanged(ctx) })
+  //
+  // ⚠️ 归一缓存（`opencode-capability.ts` 的 `normalized`）必须在刷新后作废，
+  // 否则它会继续用旧的归一结果 —— 那是「改了没用，重启才好」的形态。
+  refreshModelsDev(() => { broadcastCatalogChanged(ctx) }, {
+    onUpdated: () => { invalidateOpencodeCapabilities() },
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // ⚠️⚠️ **定期刷新**（用户要求「定期读取 models.dev」）：改前只有启动时那一次，
+  //   上游新增模型后**必须重启进程**才看得见（`TtlCache` 模块头记的就是这条
+  //   缺陷的同型）。周期取 TTL 的一半（3 小时）—— 比 TTL 短才能保证「最坏
+  //   情况下也只落后半个 TTL」，比 TTL 长则会让每次刷新都撞在 TTL 判据上而
+  //   **真的发出请求**前就返回（那样等于没有周期刷新）。
+  const modelsDevTimer = setInterval(() => {
+    refreshModelsDev(() => { broadcastCatalogChanged(ctx) }, {
+      onUpdated: () => { invalidateOpencodeCapabilities() },
+      warn: (message) => ctx.logger?.warn?.(message),
+    })
+  }, Math.floor(MODELS_DEV_TTL_MS / 2))
+  ;(modelsDevTimer as unknown as { unref?: () => void }).unref?.()
+  // ⚠️ 回收：定时器必须随插件卸载而停，否则进程退出会被它挂住
+  //   （与上面 `closeAllProxyDispatchers` 的回收并列，同款约定）。
+  ctx.effect(() => () => { clearInterval(modelsDevTimer) })
   // ⚠️ 这里**不再**调 `registerOpencodeRpc`：opencode 的端点已并入
   // `registerJetHubRpc` 内部的 handleMethod（见 `opencode-rpc.ts` 模块头）。
   // 代理 dispatcher 是常驻连接池：插件卸载必须回收，否则进程退出会挂住。
