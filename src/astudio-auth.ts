@@ -1,4 +1,19 @@
-import { completeAstudioLogin, type AstudioWechatAccount } from './astudio-oauth.js';
+import {
+  completeAstudioLogin,
+  getAstudioGeeTestConfig,
+  sendAstudioSmsCode,
+  loginAstudioWithSms,
+  loginAstudioWithPassword,
+  startAstudioLoginFlow,
+  type AstudioWechatAccount,
+  type AstudioLoginIdentity,
+  type AstudioLoginInput,
+  type AstudioGeeTestConfig,
+  type AstudioGeeTestResult,
+  type AstudioSmsSendResult,
+  type AstudioLoginFlowOptions,
+  type StartedAstudioLoginFlow,
+} from './astudio-oauth.js';
 /**
  * AStudio 认证服务 —— **凭据双路径**（全部判据来自 2026-10-15 真机实测，
  * 见探索事实 372 / 374 / 377 / 380 / 383）。
@@ -879,4 +894,19 @@ export class AstudioAuth extends Service {
   }
 }
 
-export { completeAstudioLogin, type AstudioWechatAccount } from './astudio-oauth.js';
+export {
+  completeAstudioLogin,
+  getAstudioGeeTestConfig,
+  sendAstudioSmsCode,
+  loginAstudioWithSms,
+  loginAstudioWithPassword,
+  startAstudioLoginFlow,
+  type AstudioWechatAccount,
+  type AstudioLoginIdentity,
+  type AstudioLoginInput,
+  type AstudioGeeTestConfig,
+  type AstudioGeeTestResult,
+  type AstudioSmsSendResult,
+  type AstudioLoginFlowOptions,
+  type StartedAstudioLoginFlow,
+} from './astudio-oauth.js';
