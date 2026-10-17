@@ -91,45 +91,80 @@ export const AUTOCLAW_THINKING_LEVELS = Object.freeze([
  * ⚠️ 但**必须如实登记**它与目录不一致 —— 否则后人看代码会以为目录里也有它。
  * ⚠️ 若将来它真的下线（调用返回 `400 非法模型`），本表要一并删掉它。
  *
- * ### 名称差异（保留本表写法）
+ * ### 名称策略：**保留远端 name，只加品牌后缀**（2026-10-17 用户核对后修正）
  *
- * 远端 `name` 是 `Auto` / `Auto-Fast` / `GLM-5.3`（**不含品牌前缀**），本表加了
- * `AutoClaw` / `(AutoClaw)` 后缀。这是**刻意的**：DSH 的模型选择器是跨渠道
- * 平铺的，不带前缀会与别的渠道的 `Auto` / `GLM-5.3` 混淆（本仓库
- * `providers-buddy` 笔记记载过「同名模型必须把品牌写进 name」的要求）。
+ * 远端 `name` 是 `Auto` / `Auto-Fast` / `GLM-5.3`（**不含品牌前缀**）。
+ *
+ * ⚠️⚠️ **本表曾把 `zaicoding_glm-5.3` 写成 `"GLM-5.3 Coding (AutoClaw)"`，
+ * 那是误导**：用户对照 IDE 内置列表（`Auto` / `Auto-Fast` / `GLM-5.3` /
+ * `GLM-5.3-Flash`）会以为「Coding」是**另一个模型**，而它**就是** IDE 里那个
+ * `GLM-5.3` —— 远端 `name` 逐字为 `"GLM-5.3"`，消耗等级「高」也与 IDE 一致。
+ *
+ * ⇒ **id 里的 `coding` 只是通道标识，不是给用户看的名字**。
+ *   凡是「id 与 name 语义不一致」时，**以远端 `name` 为准**：用户在 IDE 里
+ *   看到什么，我们这里就该显示什么，否则两边对不上号（用户会问「哪个是哪个」）。
+ *
+ * ✅ 只做一件事：**加 `AutoClaw` 品牌标记**。理由是 DSH 的模型选择器**跨渠道
+ * 平铺**，不加前缀会与别的渠道的 `Auto` / `GLM-5.3` 混淆（本仓库
+ * `providers-buddy` 笔记记载过「同名模型必须把品牌写进 name」）。
+ * ⇒ 用后缀 `(AutoClaw)` 保留**原名的可识别性**，而不是自己造一个名字。
  */
 export const AUTOCLAW_FALLBACK_MODELS: readonly AutoclawFallbackModel[] = [
   {
     // ⚠️ 远端目录里**没有**这一条，但实测**直接调用仍可用**（见上方说明）。
     //   它是唯一的 `isFree: true` 模型 ⇒ 删掉会让「免费额度」分栏变空。
     id: 'zai_glm-5.3-flash',
+    // ⚠️ 远端目录里没有这一条（故无权威 `name`），但 IDE 内置列表里显示为
+    //   `GLM-5.3-Flash` ⇒ 这里跟 IDE 对齐成 `GLM-5.3 Flash`（空格版，
+    //   与本表其余条目风格一致），仅加 `(AutoClaw)` 品牌后缀。
     name: 'GLM-5.3 Flash (AutoClaw)',
     contextWindow: 1048576,
     maxOutputTokens: 131072,
-    supportsImage: false,
+    // ⚠️⚠️ **`true`，实测确认**（2026-10-17 用户反馈后重测，见
+    //   `docs/autoclaw-login-and-effort.md` 的「图片能力」一节）。
+    //   原值 `false` 是**错的**，错因值得记住：
+    //   我用「远端 `autoclaw-model-config` 目录里没有这个模型」推断它不支持，
+    //   那是**能力推断而非证据**。而第一版视觉探针又用了 64×64、笔画极细的
+    //   测试图（base64 仅 236 字符）⇒ 模型读不出 ⇒ 我误判成「不支持」。
+    //   ⇒ 换成 256×256、笔画粗、双判据（数字 7 + 红色横线）后，
+    //     **四个 `zai_*` 模型全部答对**。
+    supportsImage: true,
     isFree: true,
   },
   {
     id: 'zaicoding_glm-5.3',
-    name: 'GLM-5.3 Coding (AutoClaw)',
+    // ⚠️⚠️ **远端 `name` 逐字就是 `"GLM-5.3"`**（2026-10-17 实测）。
+    //   ⇒ 它**就是** IDE 内置列表里那个 `GLM-5.3`（消耗等级「高」也对得上）。
+    //   ⚠️ 本表曾写作 `"GLM-5.3 Coding (AutoClaw)"` —— 那是**误导**：
+    //   用户会以为「Coding」是另一个模型。id 里的 `coding` 只是通道标识。
+    //   ⇒ 名字一律**以远端 `name` 为准**，只加 `(AutoClaw)` 品牌后缀。
+    name: 'GLM-5.3 (AutoClaw)',
     contextWindow: 1048576,
     maxOutputTokens: 307200,
-    supportsImage: false,
+    // ⚠️ **`true`，实测确认**（同上）。原值 `false` 同为误判。
+    supportsImage: true,
     isFree: false,
   },
   {
     id: 'zai_auto',
-    name: 'AutoClaw Auto',
+    // ⚠️ 远端 `name` 是 `"Auto"`（不含品牌）⇒ 加后缀以跨渠道区分。
+    name: 'Auto (AutoClaw)',
     contextWindow: 1048576,
     maxOutputTokens: 393216,
-    supportsImage: false,
+    // ⚠️ **`true`，实测确认**（同上）。原值 `false` 同为误判。
+    //   注：远端 `autoclaw-model-config` 对 `zai_auto` 声明的是
+    //   `input: ["text"]` —— 但**实测它能正确读图** ⇒ 远端声明**不完整**，
+    //   这正是本仓库记过的「远端漏报 input_modalities」形态（loomy 同款）。
+    supportsImage: true,
     isFree: false,
   },
   {
     id: 'zai_auto-fast',
-    name: 'AutoClaw Auto Fast',
+    // ⚠️ 远端 `name` 是 `"Auto-Fast"`（连字符，与 id 的 `auto-fast` 同形）。
+    name: 'Auto-Fast (AutoClaw)',
     contextWindow: 1048576,
     maxOutputTokens: 131072,
+    // ⚠️ 远端唯一**明确声明** `input: ["text","image"]` 的模型（与实测一致）。
     supportsImage: true,
     isFree: false,
   },
