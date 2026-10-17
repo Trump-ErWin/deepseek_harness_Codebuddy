@@ -91,6 +91,15 @@ export async function loadOpencodeCatalog(
   //   不先读 ⇒ 冷启动首帧那张表是空的 ⇒ filter 退化成硬编码本地表 ⇒
   //   远端明明下发了的新模型被挡掉（本 issue 的原症状，**完全静默**）。
   //   代价只是一次同步读（内存或磁盘文件），不引入任何等待。
+  //
+  // ⚠️⚠️ **这一句是顺序约束的唯一起作用点**（2026-10-17 对抗审计实测澄清）。
+  //   `OpencodeAdapter.listModels` 原本也有一句同款前置读，实测证明那是**冗余**的
+  //   （单独删掉它，全仓 9078+ 条单测仍全绿）⇒ 已删除，避免「两处同款前缀」
+  //   且误导后来人以为改上面那处就够。
+  //   **守卫**（`tests/unit/models-dev-cache.spec.ts` 的端到端用例）正是靠
+  //   删掉**这一句**才变红 —— 它用本地表里没有的 `zzz-brand-new-x` 作断言，
+  //   对「远端表是否生效」敏感（⚠️ 早先那版用 `deepseek-v4.1-flash-free`
+  //   是**恒真**的：那个 id 已被收录进本地兜底表 ⇒ 顺序颠倒也照样绿）。
   getOpencodeCapabilitiesSync()
   const cached = catalogCache.get(slot.id)
   if (cached !== undefined && ttlMs > 0 && Date.now() - cached.at < ttlMs) return cached.entries
@@ -256,19 +265,28 @@ export class OpencodeAdapter extends LlmAdapter {
     // 无任何槽 = 连匿名槽都没了（异常态）：返回空数组隐藏 provider 分组，
     // **不抛错**（抛错会多一条 provider 级报错，UI 表现为「供应商加载失败」）。
     if (slots.length === 0) return []
-    // ⚠️⚠️ **顺序不能颠倒**（Issue IKM9LR 的守卫实测抓到的真缺陷）：
-    //   远端的「协议可达性」与「免费判定」两张表是由 `opencode-capability.ts`
-    //   归一 models.dev 时**注入**给 `opencode-product.ts` 的（见
-    //   `publishRemoteTables`），而注入发生在**读能力表**的那一刻。
-    //   而下面 `catalog()` 内部会逐条调 `isReachableOpencodeModel` /
-    //   `isFreeOpencodeModel` 过滤远端目录 ⇒ 若先取目录，这两张表**还没注入**
-    //   （冷启动首帧必是空的），于是 filter 退化成纯本地表 —— 正是本 issue 的
-    //   原症状。⇒ **先读能力表，再取目录。**
+    // ⚠️⚠️ **这里的顺序约束在下一行，不在本函数**（2026-10-17 对抗审计实测澄清）。
+    //
+    // 远端的「协议可达性」与「免费判定」两张表是由 `opencode-capability.ts`
+    // 归一 models.dev 时注入的（见 `publishRemoteTables`），而注入发生在
+    // **读能力表**的那一刻；`catalog()` 内部会逐条调
+    // `isReachableOpencodeModel` / `isFreeOpencodeModel` 过滤远端目录。
+    //
+    // ⚠️ **本函数原本也有一句前置读**，注释写着「顺序不能颠倒」。实测
+    //   （对抗审计 + 我复现）：**那句是冗余的** —— 真正兜住顺序约束的是
+    //   `loadOpencodeCatalog` 里更靠前的那次读（它在 `catalog()` 被调用的
+    //   更内层，必然先执行）。证据：单独去掉本函数那句，全仓 27+9084 条
+    //   单测**仍全绿**；两处同时去掉，端到端守卫立刻变红。
+    //
+    // ⇒ 已删掉本函数那句（避免两处同款前缀、且让人误以为改这里就够了）。
+    //    若将来 `catalog()` 出现**不经过 `loadOpencodeCatalog`** 的路径
+    //    （例如直接用兜底表、或新增别的目录源），顺序约束会**重新失效** ——
+    //    那时必须在这里补回，并**同时**补一条能抓住它的守卫。
     //
     // ⚠️ **同步**读（不 await）：渲染路径上等网络会让模型选择器一直空白
-    // （真机事故 2026-10-02）。拿不到就按本地兜底表保守处理，后台补齐后重渲染。
-    const capabilities = getOpencodeCapabilitiesSync()
+    // （真机事故 2026-10-02）。能力表在下面 map 时用到。
     const all = await this.catalog()
+    const capabilities = getOpencodeCapabilitiesSync()
     // ⚠️ 可见性口径（用户定稿）：只有匿名身份时**只给免费模型**。
     // 免费判定以**远端 models.dev 的 cost** 为准（由上面那次读取注入）。
     const hasAccountSlot = slots.some((s) => s.kind === 'account')
