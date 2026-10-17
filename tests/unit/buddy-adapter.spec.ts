@@ -4284,6 +4284,583 @@ describe('内容级风控（11128）：不得当成账号级拦截换号/冷却'
     // 措辞确实与 11140 高度相似 —— 这正是判据必须按 code 而非按文案收窄的原因。
     expect(unapprovedChannelBody).toMatch(/security policy/i)
   })
+
+  /**
+   * ★★★ **IKM7SG 复验（2026-10-17 真机）：上游实际用的 `msg` 是 `request illegal`**。
+   *
+   * ## 为什么这组不可省（PR #104/#105 漏掉的真实边界）
+   *
+   * IKM7SG 记录的报文是 `{"code":11128,"msg":"conversation id missing"}`，
+   * 本机**独立复现**到的却是 `msg:"request illegal"` —— 且这句在本机
+   * **从未**以 `conversation id missing` 的形态出现过（5 账号 × 数十次，零命中）。
+   * ⇒ 渠道校验那一档（腿①/腿②）对真实报文**恒不命中**。
+   *
+   * ## 实测到的生产后果（本组逐条锁住）
+   *
+   * | 环节 | 修复前 |
+   * |---|---|
+   * | 归属 | 落进 `isContentRejection`（其 `/request illegal/i` 腿命中） |
+   * | 处置 | 当 11140 账号级拦截 → 换号 + **写 30 分钟冷却** |
+   * | 出口 | 「全部账号均被服务端安全策略拦截…请停用或更换被拦账号」 |
+   *
+   * 而该账号**带上三枚 Conv 头立刻 200** ⇒ 正是「不可写冷却」那一档。
+   * 用户照提示停用它 → 账号更少 → 渠道更不可用。
+   *
+   * ⚠️⚠️ `request illegal` **不是** 11140 独占的措辞（11128 渠道校验在用同一句），
+   * 所以两条判据**都必须**以 `code` 精确值收窄 —— 缺任何一侧都会误判：
+   * 只放宽渠道校验档 ⇒ 被 11140 档先吃掉；只收窄 11140 档 ⇒ 没人认领、直接抛。
+   */
+  describe('IKM7SG 复验：`msg:"request illegal"` 的 11128 渠道校验（真机实测报文）', () => {
+    /** 真实上游报文，2026-10-17 本机逐字取自响应体（两个账号、多次稳定）。 */
+    function illegalChannelBody(): string {
+      return JSON.stringify({
+        code: 11128,
+        msg: 'request illegal',
+        requestId: '82a03481-ec74-4752-bae5-5ab5697b4285',
+        displayMsg: {
+          en: 'Request blocked. Please send it again',
+          zh: '请求被拦截，请重新发送',
+          'zh-hant': '請求已被攔截，請重新傳送',
+        },
+        displayTips: {
+          en: 'This call failed channel verification, possibly because it was not sent from an official client. Please resend from the official client.',
+          zh: '这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。',
+          'zh-hant': '本次呼叫未通過通路驗證，可能不是官方用戶端發出。請使用官方版本重新傳送。',
+        },
+        actions: ['EDIT_INPUT', 'SUBMIT_FEEDBACK'],
+      })
+    }
+
+    /** 同上：记录冷却标记的账号池替身。 */
+    function pool2(accounts: Array<{ id: string; token: string }>) {
+      const recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+      return {
+        recorded,
+        async findAccountIdByCredential(_provider: string, identity: string) {
+          return accounts.find((a) => a.token === identity)?.id ?? ''
+        },
+        async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number) {
+          recorded.push({ accountId, modelId, resetAtMs })
+        },
+        async getAvailableAccount(
+          _provider: string,
+          _modelId: string,
+          exclude?: ReadonlySet<string>,
+        ) {
+          const next = accounts.find((a) => exclude === undefined || !exclude.has(a.id))
+          if (next === undefined) return null
+          return { entry: { id: next.id }, credential: makeCredential({ access_token: next.token }) }
+        },
+        disabledModelsFor: () => new Set<string>(),
+      }
+    }
+
+    /** 起一个 adapter，返回「实际发出的 token 序列」。 */
+    async function sentTokensFor(body: string, accounts = ['AT1', 'AT2']): Promise<string[]> {
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: accounts[0] }),
+        refresh: async () => {},
+        accountPool: pool2(accounts.map((token, i) => ({ id: `acct-${i + 1}`, token }))),
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          sentTokens.push(auth.replace('Bearer ', ''))
+          return new Response(body, { status: 400 })
+        },
+      })
+      await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch(() => undefined)
+      return sentTokens
+    }
+
+    it('★★ 必须换号（修复前只发一次就抛，池里其余可用账号永远试不到）', async () => {
+      expect(await sentTokensFor(illegalChannelBody())).toEqual(['AT1', 'AT2'])
+    })
+
+    it('★★ 绝不可写 30 分钟冷却：它带上三头就是 200，写冷却等于凭空封禁好账号', async () => {
+      // ⚠️ 池必须让「换号取回的那个账号」也失败，否则循环内那一档一次都没执行、
+      //    `recorded` 为空是**平凡成立**（2026-10-16 审计踩过，正是零牙的由来）。
+      const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          sentTokens.push(auth.replace('Bearer ', ''))
+          return new Response(illegalChannelBody(), { status: 400 })
+        },
+      })
+      await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch(() => undefined)
+
+      // 前置条件：循环内那一档（③）确实被执行过 —— 否则本条又退化成零牙。
+      expect(sentTokens).toEqual(['AT1', 'AT2'])
+      // 核心判据：一个冷却标记都不许写。
+      expect(pool.recorded).toEqual([])
+    })
+
+    it('★★ 全部账号被拒时不得谎称「所有账号均受限」（那是额度/限流语义）', async () => {
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool2([{ id: 'acct-1', token: 'AT1' }]),
+        fetchImpl: async () => new Response(illegalChannelBody(), { status: 400 }),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(LlmError)
+      expect((error as LlmError).code).toBe('PERMISSION_DENIED')
+      expect((error as LlmError).code).not.toBe('QUOTA_EXCEEDED')
+    })
+
+    it('★ 出口文案必须与 11140 档可区分：不得断言「安全策略拦截」', async () => {
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool2([{ id: 'acct-1', token: 'AT1' }]),
+        fetchImpl: async () => new Response(illegalChannelBody(), { status: 400 }),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      // 11140 那档的文案是「全部账号均被服务端安全策略拦截」；渠道校验档必须说
+      // 「未通过渠道校验」⇒ 否则用户会去停用一个其实可用的账号。
+      expect((error as LlmError).message).toContain('渠道校验')
+      expect((error as LlmError).message).not.toContain('安全策略拦截')
+    })
+
+    it('★ 流内（HTTP 200 + SSE 错误帧）同一形态：走本档出口', async () => {
+      // 同一报文在 CodeArts 侧会以 HTTP 200 + 内嵌错误帧出现；workbuddy 侧实测为 400。
+      // ⚠️ 流内那条通道**不换号**（它没有换号循环），因此这里断言的是「归到本档出口
+      //    且不写冷却」，而不是请求序列 —— 换号语义由上面那几条 HTTP 400 的用例锁。
+      const pool = pool2([{ id: 'acct-1', token: 'AT1' }])
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        fetchImpl: async () => sseResponse(`data: ${illegalChannelBody()}\n\n`),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      // ⚠️⚠️ 关键差异：走本档 ⇒ **不写** 30 分钟冷却。
+      // 若它被 11140 档抢走，`recorded` 会有一项 —— 那正是本 PR 要修的缺陷。
+      expect(pool.recorded).toEqual([])
+      expect(error).toBeInstanceOf(LlmError)
+      expect((error as LlmError).message).not.toContain('安全策略拦截')
+    })
+
+    /**
+     * ★★★ **「code 精确等于 11128」这一半的唯一可观测分界**（补 M4 的零牙）。
+     *
+     * ## 为什么上面那几条收窄用例抓不住「判据被放宽成只按 msg」
+     *
+     * 变异实测（M4：把腿③ 换成 `/request…illegal/`、丢掉 `"code":…11128` 那一半）：
+     * **全量 256 条依然全绿**。原因是能区分两档的报文（都含 `request illegal`）
+     * **同时**被 `isContentRejection` 的裸腿 `/request illegal/i` 认领 ——
+     * 两条判据都命中时，落哪一档由**调用顺序**决定，而两档的外部观测量
+     * （都换号、都写冷却）在这些格子上**完全相同** ⇒ 差异不可观测。
+     *
+     * ⇒ 要让差异可观测，必须构造一份**只有渠道校验会认领**的报文：
+     * **裸文本**（既没有 `"code":11128` 也没有结构化 `msg` 键）⇒
+     * - 严格判据（要求 `code` + `msg` 都在结构化字段里）⇒ **不认领** ⇒ 直接抛；
+     * - 放宽判据（只扫正文里的 `request illegal`）⇒ 认领 ⇒ 走本档出口。
+     *
+     * 两条路的**错误文案与错误码都不同**（`PERMISSION_DENIED`/「渠道校验」vs
+     * 兜底分类），所以判据一旦放宽本条立刻红。
+     */
+    it('★★ 裸文本报文（无 code/msg 键）⇒ 严格判据不认领，放宽成只按 msg 就会红', async () => {
+      const pool = pool2([{ id: 'acct-1', token: 'AT1' }])
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        // HTML 形态的网关页：正文含该措辞，但**没有任何结构化字段**。
+        // 这正是腿② 那类「非结构化兜底」的存在理由 —— 而腿③ **刻意不做**这个兜底，
+        // 因为 `request illegal` 与 11140 共用，单看正文无法区分两族。
+        fetchImpl: async () => new Response(
+          '<html><body>400 Bad Request<br>upstream log: request illegal</body></html>',
+          { status: 400 },
+        ),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      // 严格判据下：既不认领渠道校验、也不认领 11140（`/request illegal/i` 会命中裸腿
+      // ⇒ 实际落 11140 档）⇒ 出口必须是 11140 那句「安全策略拦截」。
+      expect((error as LlmError).message).toContain('安全策略拦截')
+      expect((error as LlmError).message).not.toContain('渠道校验')
+      // 11140 档写冷却（这正是「两档观测量不同」的可观测锚点）。
+      expect(pool.recorded.length).toBeGreaterThan(0)
+    })
+
+    it('★ 判据必须收窄到 code 精确等于 11128：11140 走它自己的档（要写冷却）', async () => {
+      // ⚠️ 这是本组**最关键**的一格：`request illegal` 两族共用，若不按 code 收窄，
+      //   会出现两种反向故障 ——（a）渠道校验被 11140 档抢走（写冷却）；
+      //   （b）11140 被渠道校验档抢走（**不**写冷却，每轮重撞，好账号被反复试）。
+      // (b) 同样致命：11140 是账号级拦截，不写冷却 ⇒ 每轮都白撞一次。
+      const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          sentTokens.push(auth.replace('Bearer ', ''))
+          return new Response(
+            JSON.stringify({ code: 11140, msg: 'request illegal', requestId: 'r-1' }),
+            { status: 400 },
+          )
+        },
+      })
+      await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch(() => undefined)
+
+      // 11140 仍换号（这档的既有语义不得被本次改动破坏）。
+      expect(sentTokens).toEqual(['AT1', 'AT2'])
+      // ⚠️ 核心差异：11140 **要**写 30 分钟冷却 —— **两个账号各写一次**
+      // （换号途中撞到的那次也写，见 `markPolicyBlockedAccount` 在 ① 档的调用）。
+      // 与渠道校验档的零标记形成对照，这就是两档不可混同的可观测证据。
+      expect(pool.recorded).toHaveLength(2)
+      expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1', 'acct-2'])
+    })
+
+    /**
+     * ⚠️ 下面这组锁的是「**渠道校验判据**的收窄」，而不是「整个请求只发一次」。
+     *
+     * `request illegal` 也是 11140 族在用的措辞，所以带这句的报文大多会落进
+     * `isContentRejection`（账号级拦截 → 换号 + 写冷却）—— 那是**既有行为**，
+     * 本 PR 不改它（11140 族确实要换号）。
+     *
+     * ⇒ 断言必须区分「谁认领了它」：判据对了但 11140 档照样会换号，
+     * 因此这里只锁**不写冷却**（渠道校验档的标志性处置），换号与否由上面
+     * 那几条真实报文用例覆盖。
+     */
+    it.each([
+      ['code 是 111280（子串误命中）', { code: 111280, msg: 'request illegal' }],
+      ['code 是 11128.5（小数，右边界必须一并挡住）', { code: 11128.5, msg: 'request illegal' }],
+      ['code 是 11128 但 msg 在别的字段（无 msg 键）', { code: 11128, tips: 'request illegal' }],
+      ['request illegal 出现在 displayTips 而 msg 是内容级子原因', {
+        code: 11128,
+        msg: 'Illegal API invocation from an unapproved channel',
+        displayTips: { en: 'rejected because request illegal' },
+      }],
+    ])('%s ⇒ 不写 30 分钟冷却（不得走渠道校验档）', async (_label, body) => {
+      const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        fetchImpl: async () => new Response(JSON.stringify(body), { status: 400 }),
+      })
+      await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch(() => undefined)
+
+      // ⚠️ 这些格子都带 `request illegal` ⇒ 落 **11140** 档（既有行为，本 PR 不动）
+      //⇒ **有**冷却标记。判据若被误写成「只按 msg 判」，它们会改走渠道校验档
+      //   ⇒ 标记归零 ⇒ 本条立刻红。这就是「谁认领了它」的可观测分界。
+      expect(pool.recorded.length).toBeGreaterThan(0)
+    })
+
+    /**
+     * ★★★ **P0：排除必须覆盖 `isContentRejection` 的**全部**腿**（对抗审计证伪）
+     *
+     * 初版只给 `/request illegal/i` 那条加了排除，于是本组这条仍然认领 B 族报文：
+     * ```json
+     * {"code":11128,"msg":"request illegal","requestId":"r",
+     *  "displayMsg":{"en":"The content did not pass the safety review. Please retry."}}
+     * ```
+     * ⚠️ `displayMsg.en` 那句正是**本仓库 `buddy-adapter.ts` 上方记录的 11140 真报文措辞**
+     * （zh=「内容未通过安全审核」），而 11128 各子原因**共用/漂移 `displayMsg`** 本仓已有
+     * 先例 ⇒ 不是假想形态。实测：它命中的是**第三条**腿 ⇒ 落 11140 档 ⇒ 写 30 分钟冷却
+     * ⇒ **本次要修的缺陷原样复现**。
+     */
+    describe('P0：`displayMsg` 漂到安全审核措辞时也不得落 11140 档', () => {
+      it.each([
+        ['英文 safety review（与 11140 真报文逐字同句）', {
+          en: 'The content did not pass the safety review. Please retry.',
+        }],
+        ['中文「安全审核」（11140 真报文的 zh）', {
+          zh: '内容未通过安全审核，请调整后重试。',
+        }],
+        ['中英混排', {
+          en: 'Failed the safety review.', zh: '安全审核未通过',
+        }],
+      ])('%s ⇒ 归渠道校验档、零冷却标记', async (_label, displayMsg) => {
+        const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+        const adapter = makeAdapter({
+          credential: makeCredential({ access_token: 'AT1' }),
+          refresh: async () => {},
+          accountPool: pool,
+          fetchImpl: async () => new Response(JSON.stringify({
+            code: 11128,
+            msg: 'request illegal',
+            requestId: 'r-1',
+            displayMsg,
+          }), { status: 400 }),
+        })
+        const error = await collectChunks(adapter, {
+          model: DEFAULT_MODEL,
+          messages: [{ role: 'user', content: 'hi' }] as never,
+          signal: new AbortController().signal,
+        } as never).catch((e: unknown) => e)
+
+        // 核心判据：一个冷却标记都不许写。
+        expect(pool.recorded).toEqual([])
+        // 且必须归到本档出口（否则「零标记」可能来自别的路径）。
+        expect((error as LlmError).message).toContain('渠道校验')
+        expect((error as LlmError).message).not.toContain('安全策略拦截')
+      })
+
+      it('★ 对照：真实 11140 报文**仍被全部三条腿命中**（排除不得削弱它）', async () => {
+        // ⚠️ 这是本组的**反向守卫**：排除若写得太宽（例如改成「有 code 键就排除」），
+        //   11140 会掉进渠道校验档 ⇒ 不写冷却 ⇒ 每轮都重撞该账号。
+        const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+        const adapter = makeAdapter({
+          credential: makeCredential({ access_token: 'AT1' }),
+          refresh: async () => {},
+          accountPool: pool,
+          fetchImpl: async () => new Response(JSON.stringify({
+            code: 11140,
+            msg: 'request illegal',
+            displayMsg: {
+              en: 'The content did not pass the safety review. Please retry later.',
+              zh: '内容未通过安全审核，请调整后重试。',
+            },
+          }), { status: 400 }),
+        })
+        const error = await collectChunks(adapter, {
+          model: DEFAULT_MODEL,
+          messages: [{ role: 'user', content: 'hi' }] as never,
+          signal: new AbortController().signal,
+        } as never).catch((e: unknown) => e)
+
+        // ⚠️ 11140 **要**写冷却，且必须落在 11140 档出口。
+        expect(pool.recorded.length).toBeGreaterThan(0)
+        expect((error as LlmError).message).toContain('安全策略拦截')
+      })
+
+      /**
+       * ★★★ **第三条腿（`安全审核|safety review`）自己的守卫**（对抗审计指出此处零牙）
+       *
+       * 上面那条 P0 用例**抓不到**「删掉第三条腿」这个变异：因为
+       * `isContentRejection` 开头已**早退排除** B 族报文 ⇒ 删掉第三条腿后，
+       * 那条报文**根本走不到**第三条腿，结论不变 ⇒ 全绿。
+       *
+       * ⇒ 要让这条腿有牙，必须构造**只有它能认领**的报文：`code` 不是 11140、
+       * 且 `msg` **不含** `request illegal`（否则被第二条腿认领）。
+       * 下面三格正是那三种形态（`code` 是别的码 / 没有 `code` 键 / `code` 是字符串）。
+       */
+      describe('第三条腿自身的守卫：只有「安全审核」措辞能认领的报文', () => {
+        it.each([
+          ['code 是别的码（11100）', { code: 11100, msg: 'blocked', displayMsg: { zh: '内容未通过安全审核，请调整后重试。' } }],
+          ['没有 code 键', { msg: 'blocked', displayMsg: { zh: '内容未通过安全审核' } }],
+          ['code 是字符串 11140', { code: '11140', msg: 'blocked', displayMsg: { zh: '内容未通过安全审核' } }],
+          ['英文 safety review 且无 code', { msg: 'nope', displayMsg: { en: 'The content did not pass the safety review.' } }],
+        ])('%s ⇒ 仍须落 11140 档（写冷却）', async (_label, body) => {
+          // ⚠️ 反证方向：删掉第三条腿 ⇒ 这些格子全部不再被认领 ⇒ 零冷却标记 ⇒ 红。
+          const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+          const adapter = makeAdapter({
+            credential: makeCredential({ access_token: 'AT1' }),
+            refresh: async () => {},
+            accountPool: pool,
+            fetchImpl: async () => new Response(JSON.stringify(body), { status: 400 }),
+          })
+          const error = await collectChunks(adapter, {
+            model: DEFAULT_MODEL,
+            messages: [{ role: 'user', content: 'hi' }] as never,
+            signal: new AbortController().signal,
+          } as never).catch((e: unknown) => e)
+
+          expect(pool.recorded.length).toBeGreaterThan(0)
+          expect((error as LlmError).message).toContain('安全策略拦截')
+        })
+
+        /**
+         * ★★ **第一条腿（`"code":11140`）自身的守卫**（对抗审计指出此处零牙）。
+         *
+         * 同样地，上面那些格子都被第二/第三条腿兜着 ⇒ 删掉第一条腿不会让它们变。
+         * 要让第一条腿有牙，必须构造**只有它能认领**的报文：`code` 是 11140、
+         * 而 `msg` 既不含 `request illegal`、报文里也没有任何安全审核措辞。
+         *
+         * ⚠️ 这条腿**不是本次改动引入的**（master 就有），但本次既然在同一个函数里
+         * 动过（加了早退排除），就该顺手把它锁上 —— 否则将来有人删它会静默绿。
+         */
+        it.each([
+          ['code=11140 + msg 是中性措辞', '{"code":11140,"msg":"upstream refused"}'],
+          ['code=11140 + 空 msg', '{"code":11140,"msg":""}'],
+          ['code=11140 + 换行/制表等空白变体', '{"code" : 11140 , "msg" : "blocked"}'],
+        ])('%s ⇒ 仍须落 11140 档（写冷却）', async (_label, rawBody) => {
+          // ⚠️ 反证方向：删掉 `"code":11140` 那条腿 ⇒ 这些格子不再被认领 ⇒ 零标记 ⇒ 红。
+          const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+          const adapter = makeAdapter({
+            credential: makeCredential({ access_token: 'AT1' }),
+            refresh: async () => {},
+            accountPool: pool,
+            fetchImpl: async () => new Response(rawBody, { status: 400 }),
+          })
+          const error = await collectChunks(adapter, {
+            model: DEFAULT_MODEL,
+            messages: [{ role: 'user', content: 'hi' }] as never,
+            signal: new AbortController().signal,
+          } as never).catch(() => undefined)
+
+          expect(pool.recorded.length).toBeGreaterThan(0)
+          void error
+        })
+      })
+    })
+
+    /**
+     * ★★★ **P1：`code` 与 `msg` 两个条件必须彼此独立**（对抗审计证伪）
+     *
+     * 初版用 `[^{}]*` 把两个条件串起来 ⇒ 引入了**JSON 字段顺序依赖**，四格漏判：
+     * `msg` 排在 `code` 之前 / 中间夹嵌套对象 / `code` 是字符串 / `msg` 前有对象。
+     * ⚠️ 现网报文的键序恰好是 `code` → `msg` → `displayMsg`（`msg` 紧跟 `code`），
+     * 所以**当前碰不到**；但 **JSON 对象键序无任何保证**，网关重排字段就会静默漏判，
+     * 漏判方向 = 回落 11140 档 = **本次要修的缺陷原样复现**。
+     */
+    describe('P1：字段顺序 / 嵌套 / code 类型变体同样须认', () => {
+      it.each([
+        ['msg 排在 code 之前', '{"msg":"request illegal","code":11128}'],
+        ['code 与 msg 之间夹嵌套对象（displayMsg 前置）',
+          '{"code":11128,"displayMsg":{"zh":"请求被拦截，请重新发送"},"msg":"request illegal"}'],
+        ['code 是字符串', '{"code":"11128","msg":"request illegal"}'],
+        ['msg 前有嵌套对象', '{"code":11128,"displayMsg":{"zh":"x"},"actions":["A"],"msg":"request illegal"}'],
+      ])('%s ⇒ 仍归渠道校验档、零冷却标记', async (_label, rawBody) => {
+        const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+        const adapter = makeAdapter({
+          credential: makeCredential({ access_token: 'AT1' }),
+          refresh: async () => {},
+          accountPool: pool,
+          fetchImpl: async () => new Response(rawBody, { status: 400 }),
+        })
+        const error = await collectChunks(adapter, {
+          model: DEFAULT_MODEL,
+          messages: [{ role: 'user', content: 'hi' }] as never,
+          signal: new AbortController().signal,
+        } as never).catch((e: unknown) => e)
+
+        expect(pool.recorded).toEqual([])
+        expect((error as LlmError).message).toContain('渠道校验')
+      })
+
+      it('★ 反向守卫：窗口有界，跨族报文**不得**被误判进本档', async () => {
+        // ⚠️ 若把「code」与「msg」两个条件的距离改成无界，`{"code":11140,…}` 里
+        //   任意位置出现 `request illegal` 都会被误判成渠道校验档 ⇒ 11140 不写冷却
+        //   ⇒ 每轮都重撞该账号（另一方向的回归）。
+        const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+        const adapter = makeAdapter({
+          credential: makeCredential({ access_token: 'AT1' }),
+          refresh: async () => {},
+          accountPool: pool,
+          fetchImpl: async () => new Response(
+            `{"code":11140,"msg":"blocked","echo":"${'x'.repeat(300)} request illegal"}`,
+            { status: 400 },
+          ),
+        })
+        await collectChunks(adapter, {
+          model: DEFAULT_MODEL,
+          messages: [{ role: 'user', content: 'hi' }] as never,
+          signal: new AbortController().signal,
+        } as never).catch(() => undefined)
+
+        // 必须落 11140 档 ⇒ 有冷却标记（渠道校验档是零标记）。
+        expect(pool.recorded.length).toBeGreaterThan(0)
+      })
+    })
+
+    it('★★ 无 code 键、只有 msg 字段：HTML/纯文本腿不认它（code 存在性是硬要求）', async () => {
+      // ⚠️ 这一格是**「按 code 收窄」的唯一可观测分界**：判据若被写成只按 msg 判
+      //（丢掉 `"code":…11128` 那一半），本请求会走渠道校验档 ⇒ 换号 + **零冷却**；
+      // 而现状（`isContentRejection` 认裸 `request illegal`）⇒ 落 11140 档 ⇒ **有**冷却。
+      // ⚠️⚠️ **本条在「M4」变异下是零牙的**，如实登记（2026-10-17 常规审计纠正）：
+      // M4 = **只**把腿③ 放宽成只按 `msg` 判，而 `isContentRejection` 的排除**保持严格**。
+      // 此时这份报文在严格/放宽两种判据下**都不被渠道校验认领** ⇒ 都落11140 档 ⇒
+      // 都写冷却 ⇒ 观测量相同 ⇒ 本条仍绿（见 `docs/agent-notes/providers-buddy.md` 的 M4 行）。
+      // **只有腿③ 与该处排除「同时」放宽**时本条才会红 —— 那不是 M4 的定义。
+      // ⇒ 保留本条的价值在于：它是「code 存在性是硬要求」这条规则的**行为锚点**
+      // （将来有人把 `ILLEGAL_CODE` 整个删掉时它会红），而不是 M4 的守卫。
+      const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+      const sentTokens: string[] = []
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: pool,
+        fetchImpl: async (_url, init) => {
+          const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+          sentTokens.push(auth.replace('Bearer ', ''))
+          return new Response(JSON.stringify({ msg: 'request illegal' }), { status: 400 })
+        },
+      })
+      await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch(() => undefined)
+
+      // 落 11140 档 ⇒ 有冷却标记（渠道校验档是零标记）。
+      expect(pool.recorded.length).toBeGreaterThan(0)
+      // 顺带锁「确实换号了」（既有 11140 语义，本 PR 不改它）。
+      expect(sentTokens).toEqual(['AT1', 'AT2'])
+    })
+
+    it('★ 粘连写法（零分隔符 requestillegal）⇒ 完全不认领，只发一次', async () => {
+      // 分隔符语义与 `conversation id missing` 那组一致：形式可变但**必须存在**。
+      // `requestillegal` 是 camelCase 标识符，与上游那句错**不是同一件事**。
+      expect(await sentTokensFor(JSON.stringify({ code: 11128, msg: 'requestillegal' })))
+        .toEqual(['AT1'])
+    })
+
+    it('★ 11128 的内容级子原因换号对它无效 ⇒ 不得被渠道校验档认领', async () => {
+      // `Illegal API invocation…` 由腾讯指纹改写链路处理，每个账号都会在同一句上被拦
+      // ⇒ 换号只是白烧整池（这正是隔壁 describe 锁死的那条边界）。
+      const sentTokens = await sentTokensFor(JSON.stringify({
+        code: 11128,
+        msg: 'Illegal API invocation from an unapproved channel',
+        displayMsg: { zh: '请求被安全策略拦截，请稍后重试或联系支持。' },
+      }))
+      expect(sentTokens).toEqual(['AT1'])
+    })
+
+    it('★ 书写变体容错：`message` 键、多空格、连字符、大写同样须换号', async () => {
+      // 与 `conversation id missing` 那组同款要求：上游改一个分隔符不该让判据静默漏认。
+      await expect(sentTokensFor(JSON.stringify({
+        code: 11128, message: 'request  illegal',
+      }))).resolves.toEqual(['AT1', 'AT2'])
+      await expect(sentTokensFor(JSON.stringify({
+        code: 11128, msg: 'Request-Illegal',
+      }))).resolves.toEqual(['AT1', 'AT2'])
+    })
+  })
 })
 
 /**
