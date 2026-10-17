@@ -4170,23 +4170,6 @@ function ProviderPanel({ provider, rpcCall }) {
               ? '处理中…'
               : (permanentLocked ? '解锁永久积分' : '锁定永久积分'))
           : null,
-        // ⚠️ **只给 MiniMax 国际版**（issue IKMEVG）：它的数据面
-        //    `agent.minimax.io` 按**出口 IP 国别**把中国大陆来源 307 到中国站，
-        //    于是大陆网络下国际站账号永远拿不到数据面（与 token 有效性无关）。
-        //    这里给一个入口让用户填海外 IP 绕开该分流。
-        //    ⚠️ 其它 provider 一律不渲染（多一个永远无效的按钮只会让用户困惑）。
-        provider === 'minimaxintl'
-          ? React.createElement('button', {
-              className: 'dim-jh-btn',
-              'data-kind': minimaxXff !== '' ? 'primary' : undefined,
-              title: 'MiniMax 国际站的服务器会按**出口 IP 所在国家**决定把你路由到哪个站：'
-                + '中国大陆 IP 会被 307 重定向到中国站，表现为「余额查询失败 / 模型不可用」。'
-                + '\n\n在此填写一个**海外 IP**（如 8.8.8.8）即可让请求被判为海外来源、留在国际站。'
-                + '\n留空 = 不伪造来源（推荐先用代理改变出口 IP，那是更正当的方式）。'
-                + `\n\n当前：${minimaxXff === '' ? '未设置' : minimaxXff}`,
-              onClick: () => setShowMinimaxXff(true),
-            }, minimaxXff !== '' ? '国际站分流：已绕过' : '国际站分流设置')
-          : null,
         // ⚠️ 渠道弹窗**只服务 ZCode**：非 zcode 直接发起登录，与「搬进弹窗」
         //   之前逐字等价。上游 15ccae5 把渠道选择搬进弹窗时丢了这层门控，
         //   于是全部 14 个 provider 点「+ 新建账号」都弹出一个「添加 ZCode 账号」。
@@ -4208,6 +4191,31 @@ function ProviderPanel({ provider, rpcCall }) {
           },
           disabled: creating,
         }, creating ? '正在登录…' : '+ 新建账号'),
+        /**
+         * ⚠️ **只给 MiniMax 国际版**（issue IKMEVG）：它的数据面
+         * `agent.minimax.io` 按**出口 IP 国别**把中国大陆来源 307 到中国站，
+         * 于是大陆网络下国际站账号永远拿不到数据面（与 token 有效性无关）。
+         * 这里给一个入口让用户填海外 IP 绕开该分流。
+         *
+         * ⚠️ 其它 provider 一律不渲染（多一个永远无效的按钮只会让用户困惑）。
+         *
+         * ⚠️ **位置必须在「+ 新建账号」之后**（2026-10-17 用户要求
+         * 「minimax国际版的新建账号放在国际站分流之前」）：新建账号是**主操作**，
+         * 分流设置是**排障用的次要入口** —— 次要项排在主操作前面会让用户
+         * 先看到「分流设置」而不是「怎么加账号」。
+         */
+        provider === 'minimaxintl'
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              'data-kind': minimaxXff !== '' ? 'primary' : undefined,
+              title: 'MiniMax 国际站的服务器会按**出口 IP 所在国家**决定把你路由到哪个站：'
+                + '中国大陆 IP 会被 307 重定向到中国站，表现为「余额查询失败 / 模型不可用」。'
+                + '\n\n在此填写一个**海外 IP**（如 8.8.8.8）即可让请求被判为海外来源、留在国际站。'
+                + '\n留空 = 不伪造来源（推荐先用代理改变出口 IP，那是更正当的方式）。'
+                + `\n\n当前：${minimaxXff === '' ? '未设置' : minimaxXff}`,
+              onClick: () => setShowMinimaxXff(true),
+            }, minimaxXff !== '' ? '国际站分流：已绕过' : '国际站分流设置')
+          : null,
         // ★ 预选对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
         //
         // ⚠ 内容按 provider 分支：zcode 问**登录渠道**，accio 问**登录区域**
