@@ -200,6 +200,7 @@ import { pickTestModel,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
+import { handleModelscopeRpc } from './modelscope-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
 import type {
@@ -3366,6 +3367,19 @@ function registerJetHubEndpoints(
   async function handleMethod(method: string, payload: unknown, _signal?: AbortSignal): Promise<unknown> {
     if (method.startsWith('opencode.')) {
       const handled = await handleOpencodeRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
+    // ⚠️ **本 fork 独有**（modelscope，2026-10-17 审计 P0 修复）：魔搭与 opencode
+    //    同属「不跳浏览器、手工粘贴 API Key」的 provider ⇒ 走各自的前缀改道分支。
+    //    ⚠️ 本分支此前**不存在**，而 `handleModelscopeRpc` 已导出却零调用点 ⇒
+    //    `modelscope.addAccount` 落进 `default` 回 `unknown method`，
+    //    而客户端 `account.create` 也无 modelscope 分支 ⇒ 报 `unknown provider:
+    //    modelscope`。**症状是「面板出现但永远加不了账号、零日志」** ——
+    //    即 `docs/agent-notes/providers-accio.md` 记的「接线陷阱（新 provider 通用）」
+    //    复发。判定依据同上面 opencode：必须在 `switch` 之前、且对不认识的方法
+    //    返回 `undefined` 让主 switch 继续匹配。
+    if (method.startsWith('modelscope.')) {
+      const handled = await handleModelscopeRpc(ctx, pool as never, method, payload)
       if (handled !== undefined) return handled
     }
     switch (method) {

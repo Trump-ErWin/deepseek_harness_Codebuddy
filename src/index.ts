@@ -2210,6 +2210,18 @@ export function apply(ctx: Context): void {
     },
     accountPool: pool,
     product: MODELSCOPE,
+    // ⚠️ **本 fork 独有**（2026-10-17 审计 P1 修复）：限流标记的**写入端**。
+    //    ⚠️ 本回调此前**没有注入**，而上面 `slots()` 里却在**主动读**
+    //    `entry.modelRateLimits?.[modelId]` 来跳过受限账号 —— 读端存在、写端缺失
+    //    ⇒ 那段判据恒不命中（死代码），适配器里的 `this.options.markLimited?.()`
+    //    也恒为 no-op ⇒ **限流标记永远写不进池**。
+    //    守卫为什么没抓住：`provider-runtime-wiring.spec.ts` 只检查**适配器文件里
+    //    有没有调用形**（`.markLimited?.(` 确实存在 ⇒ 绿），**从不检查接线层有没有
+    //    注入该回调** ⇒ 「适配器写了调用、接线层没注入」这一形态打不穿。
+    //    与 opencode（`index.ts:2940`）同款实现。
+    markLimited: async (slotId, modelId, resetAtMs) => {
+      await pool.updateModelRateLimit(slotId, modelId, resetAtMs)
+    },
     // 远端目录：`GET {base}/v1/models`。失败回退 `MODELSCOPE_FALLBACK_MODELS`
     // （适配器的 `loadModelscopeCatalog` 内部兜底，不会抛）。
     // ⚠️ **必须带超时**：桌面版到外部域名的 fetch 可能永不 settle

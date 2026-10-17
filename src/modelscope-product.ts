@@ -167,6 +167,10 @@ export type ModelscopeErrorKind =
   | 'server'
   | 'transport'
   | 'invalid_request'
+  // ⚠️ **本 fork 独有**（2026-10-17 审计 P1 修复）：上下文窗口超限。
+  //    此前缺这一类 ⇒ 超限报文被 `exceed` 关键词判成 quota ⇒ 账号被封到次日零点。
+  //    语义上它既不是配额、也不是限流：**不该写任何冷却标记**。
+  | 'context_window'
 
 export interface ModelscopeErrorInfo {
   kind: ModelscopeErrorKind
@@ -223,6 +227,44 @@ export function classifyModelscopeError(
   const detail = readableDetail(body)
   const lower = body.toLowerCase()
 
+  // ⚠️⚠️ **上下文超限必须排在 `rate_limit` / `quota` 之前**
+  // （2026-10-17 审计 P1 修复）。此前本函数**根本没有 `context_window` 这一类**，
+  // 而 rate_limit 判据含 `throttl`、quota 判据含 `exceed` ⇒
+  // 「maximum context length is 8192 tokens, prompt exceeds limit」被 quota 抢走、
+  // 「context window exceeded」被 quota 抢走、「context limit throttling policy
+  // exceeded」连 rate_limit 都抢走（实测三种报文各自被抢）。
+  // ⚠️ **危害不是分类难看，而是账号被封**：quota ⇒ 轮换层调 `markLimited` ⇒
+  // `modelscopeRetryAfterMs('quota', …)` ⇒ `nextUtc8DayStartMs()` ⇒ 给该账号的该
+  // 模型写一个**到次日 UTC+8 零点**的冷却标记。用户只是发了一条超长消息
+  // （长会话中途上下文涨过头极常见），却**丢掉一整个账号到第二天** ——
+  // 与 `docs/agent-notes/providers-loomy-raccoon-minimax.md` 记的 loomy
+  // 「23:50 烧光被封到次日 23:50」同族。
+  // ⚠️ 另：归 `context_window` 同时**兼得「不重试」与「触发溢出压缩」**
+  // （见 `docs/agent-notes/providers-trae.md`：超限必须归 CONTEXT_WINDOW_EXCEEDED，
+  // 归 SERVER 会把巨型请求原样重发 5 次）。
+  //
+  // ⚠️⚠️ **必须排在 `status === 429` 之前吗？——不必，且刻意不这么做**：
+  //    真发 429 时那一定是真的限流，必须让 rate_limit 生效。所以本判据**只认
+  //    报文文本**、不含 `status` 条件；真 429 且文本含 context 措辞是**不可能**的
+  //    组合（超限不会用 429 + context 文案），故文本优先是安全的。
+  if (
+    lower.includes('maximum context length')
+    || lower.includes('context length')
+    || lower.includes('context window')
+    // ⚠️ `context limit` 这一格覆盖实测到的第三种措辞
+    //（「context limit throttling policy exceeded」）：它既不含 `context length`
+    // 也不含 `context window`，但**含 `throttl`** ⇒ 修复前会被 rate_limit 抢走。
+    // ⚠️ 判据是 `context` 与 `limit` **同时**出现（不是单看 `limit`）——
+    //    否则「rate limit」这类真限流报文会被误吞成 context_window。
+    || (lower.includes('context') && lower.includes('limit'))
+    || lower.includes('context_length_exceeded')
+    || lower.includes('reduce the length')
+    || lower.includes('too many tokens')
+    || lower.includes('input tokens exceed')
+  ) {
+    // ⚠️ `retryAfterMs` **刻意不给**：超限不是配额问题，重试无意义、也无处可退。
+    return { kind: 'context_window', detail }
+  }
   if (
     status === 429
     || lower.includes('too many requests')
