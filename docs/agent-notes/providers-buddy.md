@@ -1194,6 +1194,152 @@ issue 描述的一格（issue 按 IKJNA1 同构写成了「子串精确匹配、
 ⚠️ 已做**反向验证**：正则去掉 `i` → 大小写用例红；`instructions` 那处改回原样 →
 Responses 端用例红。
 
+### ⚠️⚠️ 第三条指纹：Claude Code 的**反馈句**（Issue IKLYCT，2026-10-18）
+
+```text
+To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues
+```
+
+**用户报障**（Gitee issue IKLYCT）：Claude Desktop → CC Switch（`openai_responses`）→
+本机网关 `127.0.0.1:8326/v1/responses`（`model=hub/hub-deepseek-v4.1-flash`）→ 聚合器 →
+`buddy/deepseek-v4.1-flash`，稳定 `HTTP 400 / code 11128 / Illegal API invocation from an
+unapproved channel`。可用性不坏（切下一候选即成功），但每次白撞约 1 秒，且连续三次触发
+调用方 10 分钟熔断。本机统计：**10-14 单日因此白撞 647 次**。
+
+**为什么这一条比身份句更严重**：身份句只有 cc-switch 的 `mrt()` 探测路径漏传
+`skipSystemPromptPrefix` 时才注入（实测约 34% 的窗口）；**本句属于 Claude Code system
+prompt 的固定段落** —— 客户端把默认 system 整份发过来就**必然**带上
+⇒ **漏登记 = 必然命中**，不是概率性泄漏。
+
+**取证方法**：从 Claude Desktop Code 会话的 `prompt_snapshot.systemPrompt`（**19,056 字符**、
+112 行）原样发往腾讯端点 ⇒ 400/11128；再**逐行**单独送检 ⇒ **唯一触发行**就是上面那句
+（第 28–112 行整段 200）。
+
+**本仓库的修法**：`CONTENT_FINGERPRINTS` 补第三行。
+
+#### 本机 2026-10-18 逐格实测（两端点**各测一遍**）
+
+| 探针（`max_tokens=16`；必须 `stream:true`） | workbuddy | buddy |
+|---|---|---|
+| 中性 system（基线） | ✅ 200 | ✅ 200 |
+| **整句裸串** | ❌ 400/11128 | ❌ 400/11128 |
+| 前接 `Note: ` | ❌ 400/11128 | ❌ 400/11128 |
+| 前接行首 `  - ` | ❌ 400/11128 | ❌ 400/11128 |
+| 后接换行 + 无关文本 | ❌ 400/11128 | — |
+| **全大写** | ❌ 400/11128 | ❌ 400/11128 |
+| **第二条 system**（非 `messages[0]`） | ❌ 400/11128 | ❌ 400/11128 |
+| **assistant 正文** | ❌ 400/11128 | ❌ 400/11128 |
+| 同一句放 `user` | ✅ 200 | ✅ 200 |
+| 只放 `reasoning_content` | ✅ 200 | ✅ 200 |
+| 只放 tool 结果 | ✅ 200 | ✅ 200 |
+| **砍掉前半**（`users should report the issue at …`） | ✅ 200 | ✅ 200 |
+| **砍掉后半**（`To give feedback, users should report the issue`） | ✅ 200 | ✅ 200 |
+| 只留 URL | ✅ 200 | ✅ 200 |
+| 换 org/repo · 换域名 · 改一个词 | ✅ 200 | ✅ 200 |
+| **改写后**（`… at the project issue tracker`） | ✅ 200 | ✅ 200 |
+
+⇒ **锚点是「位置无关」**（与身份句的**行首锚定相反**，与 ZCode 那条同型）；
+⇒ **逐字符 + 大小写不敏感**（三条同型）；
+⇒ **`find` 必须写整句 99 字符** —— 砍掉任一半都放行 ⇒ 子串本身不触发，
+**写短了等于空跑**，而空跑的症状是「登记了却仍每轮 400」，极难归因。
+
+⚠️ **`find` 的长度不可跨条照抄**：身份句那条实测「少一个字母即放行」⇒ 恰好写全；
+本条实测「砍掉半句仍放行」⇒ 必须写全。**只能逐条实测**。
+⚠️ 本条的 `find`（99 字符）已经**贴着**上游屏蔽名单的粒度，不要再按 ZCode 那条的思路
+去「缩短 find 覆盖更多变体」——实测换域名即放行。
+
+**两处刻意不做的事**（与文件头既有约束一致）：
+① **不加行首锚定**（实测位置无关，加了反而漏改）；
+② **不加进 `isContentRejection`** —— 它是内容级拦截，换句即通，
+认成「账号被策略拦」会白锁账号池 30 分钟。
+
+#### ⚠️⚠️ 本轮实测出的**新纪律**：`11128` 有两个同码子原因，探针必须先筛账号
+
+| `msg` | 含义 | 归类 |
+|---|---|---|
+| `Illegal API invocation from an unapproved channel` | **内容级**（本文件要治的） | 内容 |
+| `request illegal` | **渠道校验**（按账号要求三头，IKM7SG） | **换号，不冷却** |
+
+两者 `code` **都是** `11128`。⚠️ 取证第一版探针**轮换账号**，于是把账户特定的通道门控
+读成了内容指纹的匹配语义，实测出「**51 字符前缀被拦、69 字符超集反而放行**」这种
+**非单调**的假结论 —— 照它定 `find` 长度就会登记一条覆盖不全的规则（症状：仍有变体被拦）。
+
+⇒ **纪律：① 先筛出基线放行的账号，之后固定用它；② 逐格打印 `msg`；③ 两类 11128 分开计数。**
+本机 workbuddy 8 个凭据条目里 **2 个**（5 个 `WORKBUDDY_ACCOUNT_*`）基线就报
+`request illegal`；buddy 8 个条目里 **2 个** 401、**2 个**限流 6004 ⇒ 只有 1 个可用
+—— 比例不低，轮换账号几乎必然踩到。
+
+**可复核凭据**：`tests/e2e/buddy-fingerprint-roles.e2e.spec.ts` 的
+「Claude Code 反馈句（IKLYCT 实测依据）」一节 —— **两端点各跑一遍**（结清 issue 的
+「workbuddy 未验证」项）、锚点两侧都测、「砍掉半句放行」那六格（定 `find` 长度）、
+以及 `user` / `reasoning_content` / tool 结果三格放行（不该改写的反向断言）。
+⚠️ 本句字面量**可以**写进源码与用例：改写已覆盖 `system` 与 `assistant` 正文两处，
+排查这个 bug 的会话不会再拦死自己。
+
+回归用例：`tests/unit/openai-gateway-tencent-fingerprint.spec.ts` 的
+「IKLYCT：Claude Code 反馈句」一节（纯函数 9 条 + 网关 Chat 2 条 + Responses 3 条）
+与 `tests/unit/buddy-adapter.spec.ts` 的直连一条（`system` 与 assistant 两处，
+且断言 `user` **逐字保留**）。
+
+#### 变异验证结论（2026-10-18，审计实测 19 条）
+
+13 条确认有牙，覆盖 4 个接入点（`options.system` / `serializeMessages` 两处 /
+网关 Chat 两处 / 网关 Responses 三处）与 provider 判断。**一处如实登记为无牙**：
+把 `escapeRegExp` 对**本条**短路（只跳过第三条）⇒ **313 条全绿**，真因是本条 `find`
+**零正则元字符** ⇒ 变异态与修复态**逐字节等价**，不是守卫失效。
+（完整短路 `escapeRegExp` 仍红 16 条，红因全在前两条。）
+
+⚠️⚠️ **一条变异方法论（审计踩到，已记）**：「把 `find` 置空」看起来是最干净的
+「漏登记」模拟，实际**最脏** —— `new RegExp('', 'gi')` 匹配**每个空位**，
+会连带把**前两条**也炸掉（43 条红），红因与被测变异无关。**必须**换成
+「永不可能命中的假指纹」才是干净证据（此时 10 条红）。与本仓已有的教训同型：
+「用例变红」**不自动等于**「红因是被测变异」。
+
+⚠️⚠️ **`find` 的长度只有实发能验**：单测能证明「砍掉半句时我们**不**改写」（真事实），
+但证明不了「砍掉半句后上游**仍会拦**」—— 单测对「上游屏蔽名单的粒度」无能为力。
+改本条 `find` 时**必须**跑 `DSH_BUDDY_FINGERPRINT_E2E=1` + `_CONFIRM=yes`。
+
+#### ⚠️⚠️ 对抗审计打穿的一条**阻断级**缺陷：改写修好了，分类判据却在背后拆台
+
+本条**每轮必带** ⇒ 一定命中 400/11128 ⇒ 若那一刻分类判据把它当成「账号级拦截」，
+用户看到的就是「整池账号被锁 30 分钟、还被建议去停用账号」，而不是「一次白撞」。
+本轮实测：**这条路径当时真的通着**（2026-10-18，对抗审计打穿，已修）。
+
+| 腿（`isContentRejection`） | 内容级 11128 报文 | 命中？ |
+|---|---|---|
+| 腿① `"code":11140` | code 是 11128 | ❌ |
+| 腿② `/request illegal/i` | msg 是 `Illegal API invocation…` | ❌ |
+| 早退（渠道校验排除） | 它要 `request illegal` | ❌ |
+| ⚠️ **腿③ `/安全审核\|safety review/i`** | **扫整份报文（含 `displayMsg`/`displayTips`）** | ✅ **命中** |
+
+⇒ 上游只要把这份 11128 的 `displayMsg` 漂成 `The content did not pass the safety
+review.`（**11128 各子原因共用/漂移 `displayMsg` 本仓已有先例**，见 `buddy-adapter.ts`
+的既有注释），就落进「账号级拦截」档 ⇒ **烧完整池 + 每账号锁 30 分钟**。
+
+**修法**：`isContentRejection` 里再加**一条同型早退** `isContentBlockedIllegalBody`
+（只认结构化 `code` 精确 `11128` + `msg` 是内容级那一句，**绝不扫** `displayMsg`/
+`displayTips`/正文），与既有的渠道校验排除**各管一个子原因**。真实 11140 **仍被三条腿
+全部命中**，未被削弱。
+
+⚠️⚠️ **一条可推广的教训**：**「不该把 X 加进判据」≠「判据不会因为 X 的报文而误判」** ——
+一条扫**全文案**的腿会**绕过**你精心写的排除逻辑。`tencent-fingerprint.ts` 的文件头
+那句「维持现状是正确的」因此是**错的**，已改成事故史。
+
+⚠️ **原守卫是空断言**：既有用例 `★ 11128 报文里出现「安全审核 / safety review」字样`
+只对**夹具字面量**做 `toContain`/`toMatch`，**根本没调用判据** ⇒ `displayMsg` 一漂照样绿。
+新守卫改为**真发请求**（HTTP 400 与流内 SSE 两条通道 × 三种漂移形态）。
+
+⚠️ **反向护栏的一个实测坑（变异验证）**：只写「真实 11140 必须写冷却」**锁不住**
+「排除写得太宽」—— 把 `isContentBlockedIllegalBody` 改成「只按 code 11128」时，
+11140 的 code 是 11140（根本不匹配）⇒ 排除不触发 ⇒ 腿① 照常命中 ⇒ **本条仍绿**。
+真正的分界是「**同码 11128 但 msg 是第三种子原因**（`first message is not system prompt`）
+的报文不得被顺手放跑」—— 补上那一格后该变异**确实变红**。
+
+⚠️⚠️ **随之而来的一处行为变更（已登记）**：既有 IKM7SG 复验组里有一格
+「`request illegal` 出现在 displayTips 而 msg 是内容级子原因」**原先断言「有冷却」**
+—— 它锁的恰恰是缺陷本身。已改为断言**零冷却**，并补一格「msg 是其它 11128 子原因」
+来保住该组原本要验的「渠道校验判据不得靠 `displayTips` 认领」。
+
 ## 模型计费倍率与同名模型（必须写进 `name`，不是 `description`）
 
 **倍率必须拼进 `name`。** 这是被用户报障纠正过的结论：

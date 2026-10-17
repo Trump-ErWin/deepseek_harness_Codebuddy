@@ -4286,6 +4286,145 @@ describe('内容级风控（11128）：不得当成账号级拦截换号/冷却'
   })
 
   /**
+   * ⚠️⚠️ IKLYCT 引入的**真实缺陷**（2026-10-18 对抗审计打穿，已修）。
+   *
+   * ## 上面那条用例是**空断言** —— 本条审计的起因
+   *
+   * 它只对**夹具字面量**做 `toMatch`/`not.toContain`，**根本没有调用判据**
+   * ⇒ `displayMsg` 一漂它照样绿。而下面是**真跑**的格子。
+   *
+   * ## 缺陷形态（实测，从 `lib/` 编译产物抠出判据实跑）
+   *
+   * `isContentRejection` 的腿③ `/安全审核|safety review/i` **扫整份报文**
+   * （含 `displayMsg` / `displayTips`），而本文件自己就记着
+   * 「`11128` 各子原因**共用/漂移 `displayMsg`**」⇒ 当上游把**内容级**那条
+   * 11128 的 `displayMsg` 漂成安全审核措辞时：
+   *
+   * | 腿 | 命中？ |
+   * |---|---|
+   * | 腿① `"code":11140` | ❌ code 是 11128 |
+   * | 腿② `/request illegal/i` | ❌ msg 是 `Illegal API invocation…` |
+   * | 早退 `isChannelVerificationIllegalBody` | ❌ 它要 `request illegal` |
+   * | ⚠️ **腿③**（扫全文案） | ✅ **命中** |
+   *
+   * ⇒ 这份「**换句即通**」的报文落进账号级档 ⇒ **烧完整池 + 每个账号锁 30 分钟**，
+   * 出口文案还建议用户去停用账号 —— 把 `tencent-fingerprint.ts` 的修复完全抵消。
+   *
+   * ⚠️ IKLYCT 那条反馈句**每轮必带**（客户端默认 system 的固定段落）⇒ 一定命中
+   * ⇒ 上游一漂 `displayMsg`，用户侧就是「整池被锁 30 分钟」，而不是「一次白撞」。
+   */
+  describe('★ IKLYCT：内容级 11128 × displayMsg 漂移 ⇒ 绝不得落进账号级档', () => {
+    /** 内容级 11128 的真实报文（2026-10-18 两端点实测，buddy + workbuddy 一致）。 */
+    const contentBlocked = (extra: Record<string, unknown>): string => JSON.stringify({
+      code: 11128,
+      msg: 'Illegal API invocation from an unapproved channel',
+      requestId: 'r-iklyct',
+      ...extra,
+    })
+
+    /** 真发一次 HTTP 400，回报「送出了几次」与「冷却标记」。 */
+    async function runHttp400(body: string, accountCount = 2): Promise<{
+      recorded: Array<{ accountId: string }>
+      calls: number
+      error: unknown
+    }> {
+      const pool = recordingPool(Array.from({ length: accountCount }, (_, i) => ({
+        id: `acct-${i + 1}`, token: `AT${i + 1}`,
+      })))
+      let calls = 0
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        refresh: async () => { throw new Error('不该走到续期') },
+        accountPool: pool,
+        fetchImpl: async () => {
+          calls += 1
+          return new Response(body, { status: 400 })
+        },
+      })
+      const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+      return { recorded: pool.recorded, calls, error }
+    }
+
+    /** 真发一次流内错误帧（HTTP 200 + SSE），回报冷却标记。 */
+    async function runInline(body: string, accountCount = 2): Promise<{
+      recorded: Array<{ accountId: string }>
+      calls: number
+    }> {
+      const pool = recordingPool(Array.from({ length: accountCount }, (_, i) => ({
+        id: `acct-${i + 1}`, token: `AT${i + 1}`,
+      })))
+      let calls = 0
+      const adapter = makeAdapter({
+        credential: makeCredential({ access_token: 'AT1' }),
+        accountPool: pool,
+        fetchImpl: async () => {
+          calls += 1
+          return sseResponse(`data: ${body}\n\n`)
+        },
+      })
+      await collectChunks(adapter, streamOptions).catch(() => undefined)
+      return { recorded: pool.recorded, calls }
+    }
+
+    const DRIFT_CASES = [
+      ['displayMsg.en 漂成 safety review', { displayMsg: { en: 'The content did not pass the safety review. Please retry.' } }],
+      ['displayMsg.zh 含「安全审核」', { displayMsg: { en: 'blocked by security policy', zh: '内容未通过安全审核' } }],
+      ['displayTips 含 safety review', {
+        displayMsg: { en: 'blocked by security policy' },
+        displayTips: { en: 'This call failed the safety review.' },
+      }],
+    ] as const
+
+    it.each(DRIFT_CASES)('★ 流内通道（判据真会被用到的地方）：%s ⇒ 零冷却、不换号', async (_label, extra) => {
+      const { recorded, calls } = await runInline(contentBlocked(extra))
+      expect(recorded, '内容级 11128 不得写账号冷却（换句即通，冷却纯属误伤）').toEqual([])
+      // 换号对内容级拦截完全无效 ⇒ 整个池只试一次
+      expect(calls, '不应换号重试（只会白烧往返）').toBe(1)
+    }, 60_000)
+
+    it.each(DRIFT_CASES)('★ HTTP 400 通道：%s ⇒ 零冷却', async (_label, extra) => {
+      const { recorded } = await runHttp400(contentBlocked(extra))
+      expect(recorded).toEqual([])
+    }, 60_000)
+
+    it('★ 对照组：真实 11140 仍**必须**被认成账号级拦截（本次修复不得削弱的档）', async () => {
+      // ⚠️ 这一格是**反向护栏**：若把内容级排除写得太宽（例如只按 `code:11128` 排除），
+      // 就会把真 11140 一起放跑 ⇒ 账号该冷却时没冷却，是**另一个**方向的误伤。
+      // ⚠️⚠️ 但**只锁「有冷却」是锁不住的**（实测变异验证）：
+      //   把 `isContentBlockedIllegalBody` 改成「只按 code 11128」时，本条**仍然绿** ——
+      //   因为 11140 的 `code` 是 11140（不匹配），排除压根不触发 ⇒ 腿① 照常命中。
+      //   ⇒ 真正的分界是「**排除判据认不认一个 msg 不是内容级、但同码 11128 的报文**」：
+      //   那份报文若被误排除，就会从「落 11140 档（有冷却）」变成「零冷却」。
+      const { recorded } = await runHttp400(JSON.stringify({
+        code: 11140,
+        msg: 'request illegal',
+        displayMsg: { en: 'The content did not pass the safety review. Please retry.', zh: '内容未通过安全审核' },
+      }))
+      expect(recorded.length, '真实 11140 必须写 30 分钟冷却').toBeGreaterThan(0)
+    }, 60_000)
+
+    /**
+     * ⚠️⚠️ **这才是能区分「判据写窄 / 写宽」的那一格**（变异验证实测发现）。
+     *
+     * 报文：`code:11128` + `msg` **既不是**内容级、**也不是**渠道校验（第三种子原因）。
+     * - 排除判据**写得太宽**（只按 code 11128）⇒ 它被误排除 ⇒ 零冷却 ⇒ 本条红；
+     * - 排除判据**恰好写窄**（code + 内容级 msg）⇒ 不排除 ⇒ 落 11140 档 ⇒ 有冷却 ⇒ 本条绿。
+     *
+     * ⇒ 上面那条 11140 对照组测的是「11140 不被削弱」，本条测的是
+     * 「排除**没有**顺手把同码的其它子原因一起放跑」——**两个方向都要守**。
+     */
+    it('★ 反向护栏：同码 11128 但 msg 是**第三种子原因** ⇒ 排除不得顺手放跑它', async () => {
+      const { recorded } = await runHttp400(JSON.stringify({
+        code: 11128,
+        msg: 'first message is not system prompt',
+        requestId: 'r-other',
+        displayMsg: { en: 'The content did not pass the safety review. Please retry.', zh: '内容未通过安全审核' },
+      }))
+      expect(recorded.length, '非内容级、非渠道校验的 11128 仍须落 11140 档（既有行为）').toBeGreaterThan(0)
+    }, 60_000)
+  })
+
+  /**
    * ★★★ **IKM7SG 复验（2026-10-17 真机）：上游实际用的 `msg` 是 `request illegal`**。
    *
    * ## 为什么这组不可省（PR #104/#105 漏掉的真实边界）
@@ -4569,14 +4708,29 @@ describe('内容级风控（11128）：不得当成账号级拦截换号/冷却'
         code: 11128,
         msg: 'Illegal API invocation from an unapproved channel',
         displayTips: { en: 'rejected because request illegal' },
+        __expect: 'content',
       }],
-    ])('%s ⇒ 不写 30 分钟冷却（不得走渠道校验档）', async (_label, body) => {
+      ['request illegal 出现在 displayTips 而 msg 是其它 11128 子原因', {
+        code: 11128,
+        msg: 'first message is not system prompt',
+        displayTips: { en: 'rejected because request illegal' },
+      }],
+    ])('%s ⇒ 不走渠道校验档', async (_label, body) => {
       const pool = pool2([{ id: 'acct-1', token: 'AT1' }, { id: 'acct-2', token: 'AT2' }])
+      // ⚠️⚠️ 2026-10-18（IKLYCT）：标注 `content` 的那一格**原先断言「有冷却」**，
+      // 现已**随行为修正而改写** —— 它锁的恰恰是缺陷本身：
+      // `msg` 是内容级子原因（换句即通）却落 11140 档写 30 分钟冷却，纯属误伤；
+      // 而 IKLYCT 的反馈句**每轮必带** ⇒ 一定命中 ⇒ 整池被锁 30 分钟。
+      // ⇒ 现在它归**内容级**档（零冷却）。仍留在本组：它验的是**同一件事**
+      // —— 渠道校验判据不得靠 `displayTips` 认领。
+      const isContentLevel = (body as { __expect?: string }).__expect === 'content'
+      const payload = { ...(body as Record<string, unknown>) }
+      delete payload.__expect
       const adapter = makeAdapter({
         credential: makeCredential({ access_token: 'AT1' }),
         refresh: async () => {},
         accountPool: pool,
-        fetchImpl: async () => new Response(JSON.stringify(body), { status: 400 }),
+        fetchImpl: async () => new Response(JSON.stringify(payload), { status: 400 }),
       })
       await collectChunks(adapter, {
         model: DEFAULT_MODEL,
@@ -4584,6 +4738,10 @@ describe('内容级风控（11128）：不得当成账号级拦截换号/冷却'
         signal: new AbortController().signal,
       } as never).catch(() => undefined)
 
+      if (isContentLevel) {
+        expect(pool.recorded, '内容级 11128 不得写账号冷却').toEqual([])
+        return
+      }
       // ⚠️ 这些格子都带 `request illegal` ⇒ 落 **11140** 档（既有行为，本 PR 不动）
       //⇒ **有**冷却标记。判据若被误写成「只按 msg 判」，它们会改走渠道校验档
       //   ⇒ 标记归零 ⇒ 本条立刻红。这就是「谁认领了它」的可观测分界。
@@ -6378,6 +6536,33 @@ describe('BuddyAdapter 直连路径的腾讯风控指纹改写', () => {
     // user 不碰（实测该角色放行）。
     expect(texts).toContain('继续')
     expect(texts.some((value) => value.includes(C_TRIGGER))).toBe(false)
+  })
+
+  it('★ IKLYCT：Claude Code 反馈句在**直连**路径也被改写（system 与 assistant 两处）', async () => {
+    // 这一条比 IKLS2L 那条更严重：反馈句属于 Claude Code system 的**固定段落**，
+    // 客户端把默认 system 整份发过来就必然带上 ⇒ 漏改写 = 每轮 400/11128。
+    // 直连方向同样必须过这一层：只在网关补 = 换一个入口又被拦（IKJNA1 的教训）。
+    const F_TRIGGER = 'To give feedback, users should report the issue at '
+      + 'https://github.com/anthropics/claude-code/issues'
+    const F_REWRITE = 'To give feedback, users should report the issue at the project issue tracker'
+    // ① options.system（第四个产出点）
+    const viaSystem = await wireOf([{ role: 'user', content: text('hi') }], { system: `  - ${F_TRIGGER}` })
+    expect(viaSystem[0]?.role).toBe('system')
+    expect(String(viaSystem[0]?.content)).toBe(`  - ${F_REWRITE}`)
+    // ② serializeMessages 的 system 与 assistant 正文两处
+    const wire = await wireOf([
+      { role: 'system', content: text(`S: ${F_TRIGGER}`) },
+      { role: 'user', content: text(`U: ${F_TRIGGER}`) },
+      { role: 'assistant', content: text(`A: ${F_TRIGGER}`) },
+      { role: 'user', content: text('再说一次') },
+    ])
+    const texts = textsOfWire(wire)
+    expect(texts).toContain(`S: ${F_REWRITE}`)
+    expect(texts).toContain(`A: ${F_REWRITE}`)
+    // ⚠️ **user 必须逐字保留**：实测该角色放行 ⇒ 改它换不来放行，只是篡改用户原话。
+    // 这条不是「顺便断言」—— 若把 user 也过一遍改写，下面 `some(...)` 会红。
+    expect(texts).toContain(`U: ${F_TRIGGER}`)
+    expect(texts.filter((value) => value.includes(F_TRIGGER))).toHaveLength(1)
   })
 
   /**
