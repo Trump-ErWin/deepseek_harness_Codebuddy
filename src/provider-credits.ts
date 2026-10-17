@@ -65,7 +65,7 @@ import { claimLobsteraiDailyCheckin, fetchLobsteraiCreditBalance } from './lobst
 import { claimLoomyDailyQuota, fetchLoomyCreditBalance } from './loomy-credits.js'
 import {
   claimMinimaxDailyCheckin,
-  fetchMinimaxCreditBalance,
+  fetchMinimaxCreditBalanceDetailed,
   fetchMinimaxSigninStatus,
 } from './minimax-credits.js'
 import { fetchRaccoonCreditBalance } from './raccoon-credits.js'
@@ -129,6 +129,16 @@ export interface ProviderCreditsDeps {
    * 里的常量会让「缓存过期后拿到新版本」失效 —— 而它是签到接口的**必填** query 参数。
    */
   readonly lobsteraiClientVersion?: () => Promise<string>
+  /**
+   * MiniMax **国际站**绕地理分流用的 `X-Forwarded-For` 值（issue IKMEVG）。
+   *
+   * ⚠️ 必须**惰性**读（`() => pool.minimaxXff()`），不能注册时固化成字符串：
+   * 用户随时可能在面板里改这个设置，固化会让「改了却不生效」变成静默失效。
+   *
+   * ⚠️ 省略等价于「不附头」（与修复前行为逐字节一致）。**只对
+   * `minimaxintl` 生效** —— 判据在 `minimaxHeadersFor` 里按 product id 分流。
+   */
+  readonly minimaxXff?: () => string | undefined
 }
 
 /**
@@ -464,8 +474,21 @@ export function createProviderCredits(
      * 同一个默认参数 ⇒ 与「不传」逐字节等价，只把**站点**显式钉住。
      */
     minimax: {
-      fetchBalance: (credential) =>
-        fetchMinimaxCreditBalance(credential as MinimaxCredential, undefined, MINIMAX),
+      /**
+       * ⚠️⚠️ **必须走 `fetchBalanceDetailed`**（真实缺陷，2026-10-17 审计打穿）。
+       *
+       * `fetchBalance` 的 `null` 会被共享骨架统一补一句写死的「余额查询失败」，
+       * 于是 `requestEnvelope` 辛苦构造的地理路由两条出路 / `invalid signature` /
+       * `凭据已失效` **一行都到不了 UI** —— 用户报障的那句话修复后逐字未变。
+       * ⇒ 本家正式加入 `fetchBalanceDetailed` 那一批（codearts / gemini / cline…），
+       * 原因由实现自己给。
+       */
+      fetchBalanceDetailed: async (credential) => {
+        const { balance, error } = await fetchMinimaxCreditBalanceDetailed(
+          credential as MinimaxCredential, undefined, MINIMAX,
+        )
+        return { balance, ...error === undefined ? {} : { error } }
+      },
       // ⚠️ **有**独立的签到状态端点，与「如实返回 null」的那几家不同。
       // 判据是 `is_today && status===3`（见 `minimaxPanelToCheckinStatus`），
       // 不是「没有 Claimable」。`active` 恒 true（拿到响应即 true）。
@@ -473,6 +496,8 @@ export function createProviderCredits(
       // ⚠️ 它同时是**领取预检**的数据源（`precheckStatus` 缺省 true，见下）——
       //    预检与面板读数是同一个端点，故**只声明一次**（不再写 `claimStatus`：
       //    两处声明同一实现会漂移）。
+      //
+      // ⚠️ 预检只需要「能不能判」，不需要原因 ⇒ 用无原因的简单变体即可。
       fetchStatus: (credential) =>
         fetchMinimaxSigninStatus(credential as MinimaxCredential, undefined, MINIMAX),
       /**
@@ -503,15 +528,33 @@ export function createProviderCredits(
      * （2026-10-15，真实国际站账号返回 200；见 `src/minimax-product.ts` 文件头与
      * `tests/e2e/minimaxintl-probe.e2e.spec.ts`）。**未验证的只有兜底模型表**
      * （与国内站共用同一份，仅远端失败时兜底）。
+     *
+     * ⚠️ **`X-Forwarded-For` 必须传**（issue IKMEVG，2026-10-17 真机实测）：
+     * `agent.minimax.io` 按**出口 IP 国别**把中国大陆来源 307 到中国站，而
+     * 跟到中国站后国际站 token 只会得到 `401 invalid access token`
+     *（与「凭据失效」逐字同形）。用户可在面板里填一个海外 IP 绕开这个分流；
+     * 不填则行为与修复前完全一致（不附该头）。
+     *
+     * ⚠️ 每次调用**现读** `deps.minimaxXff()`（用户随时可能改设置）。
      */
     minimaxintl: {
-      fetchBalance: (credential) =>
-        fetchMinimaxCreditBalance(credential as MinimaxCredential, undefined, MINIMAX_INTL),
+      // ⚠️ 走 Detailed（理由同中国版）：否则「地理分流 / 凭据失效 / 网关签名」
+      //    这些**唯一能指路**的原因会被压成一句「余额查询失败」。
+      fetchBalanceDetailed: async (credential) => {
+        const { balance, error } = await fetchMinimaxCreditBalanceDetailed(
+          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+        )
+        return { balance, ...error === undefined ? {} : { error } }
+      },
       fetchStatus: (credential) =>
-        fetchMinimaxSigninStatus(credential as MinimaxCredential, undefined, MINIMAX_INTL),
+        fetchMinimaxSigninStatus(
+          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+        ),
       // 预检与幂等理由同中国版（见上）。
       claim: (credential) =>
-        claimMinimaxDailyCheckin(credential as MinimaxCredential, undefined, MINIMAX_INTL),
+        claimMinimaxDailyCheckin(
+          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+        ),
     },
 
     /**

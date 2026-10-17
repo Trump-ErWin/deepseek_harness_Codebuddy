@@ -2,7 +2,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
-import { createJetHubStore, clearRejectionLayer, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateAllowed, sanitizeAggregateOrder, sanitizeAggregateOrderMode, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizePermanentLocks, withAllowed, withoutAllowed } from './jet-hub-store.js'
+import { createJetHubStore, clearRejectionLayer, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateAllowed, sanitizeAggregateOrder, sanitizeAggregateOrderMode, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizeMinimaxXff, sanitizePermanentLocks, withAllowed, withoutAllowed } from './jet-hub-store.js'
 import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PermanentLockMap } from './jet-hub-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
 import type { PermanentLockStore } from './permanent-lock-store.js'
@@ -317,6 +317,20 @@ export class AccountPool {
    */
   private providerOrderCache: string[] = []
   /**
+   * MiniMax **国际站**绕过分流用的 `X-Forwarded-For` 值（进程内副本）。
+   *
+   * 语义与校验见 `jet-hub-store.ts` 的 `JetHubState.minimaxXff` 与
+   * `sanitizeMinimaxXff`（**同一份判据**，本文件不另写一份）。
+   *
+   * ⚠️ `undefined` / 空串 = **不附头**（行为与修复前逐字节一致）。这是刻意的
+   * 缺省：附 `X-Forwarded-For` 等于声明一个并非本机的来源 IP，不能是默认行为。
+   *
+   * ⚠️ 与 {@link providerOrderCache} 同级、**可以**住在这里：丢失本键的唯一后果
+   * 是国际站用户重新遇到 307（可逆，重填一次即可）。但它**必须**被带进
+   * `queueStoreSave` 的整体写入（否则「任何一次改账号都会静默清掉它」）。
+   */
+  private minimaxXffCache: string | undefined
+  /**
    * ★ **由折算观测写下的** `modelRateLimits` 标记集合（键 = `accountId\u0000modelId`）。
    *
    * ## ⚠️⚠️ 为什么必须有它（真实缺陷，两个独立审计共同命中 2026-10-12）
@@ -410,6 +424,9 @@ export class AccountPool {
       this.nativeWebSearchCache = state.nativeWebSearchEnabled !== false
       // 供应商顺序同理：老文档没有该键 → 空数组（未自定义）。
       this.providerOrderCache = state.providerOrder ?? []
+      // MiniMax 国际站 XFF 同理：老文档没有该键 → `undefined`（不附头，
+      // 与修复前行为逐字节一致）。**过一遍 sanitize**：老文档里可能有脏值。
+      this.minimaxXffCache = sanitizeMinimaxXff(state.minimaxXff)
     }
     this.loadLocks(state)
   }
@@ -502,6 +519,11 @@ export class AccountPool {
         gatewayEnabled: this.gatewayEnabledCache,
         nativeWebSearchEnabled: this.nativeWebSearchCache,
         providerOrder: this.providerOrderCache,
+        // ⚠️ **必须带上本键**（同 `nativeWebSearchEnabled` 的坑）：
+        //    `write` 是整体替换语义 ⇒ 漏键会让用户设的 XFF 在**任何**一次
+        //    改账号 / 改黑名单 / 改网关 / 拖顺序时被静默清掉，
+        //    症状是「国际站明明设好了 XFF，过一阵又开始 307」。
+        minimaxXff: this.minimaxXffCache,
       })
     })
     this.storeChain = next.catch(() => {})
@@ -923,6 +945,41 @@ export class AccountPool {
     this.loaded = true
     if (this.store.kind === 'memory') {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，供应商顺序仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
+  }
+
+  /**
+   * 当前设置的 MiniMax 国际站 `X-Forwarded-For` 值；`undefined` = 不附头。
+   *
+   * ⚠️ 请求侧（`minimax.ts` 的 `minimaxHeadersFor`）**必须每次现读**，不能缓存：
+   * 用户随时可能在面板里改这个设置。
+   */
+  minimaxXff(): string | undefined {
+    this.ensureLoaded()
+    return this.minimaxXffCache
+  }
+
+  /**
+   * 设置（或清除）MiniMax 国际站的 `X-Forwarded-For` 并落盘。
+   *
+   * 传空串 / `undefined` = **清除**（不附头）。校验由 `sanitizeMinimaxXff` 统一做：
+   * 非法值（主机名、XFF 链、含换行等）**不会**被写进缓存 —— 于是「填了个坏值」
+   * 与「没填」等价，不会让请求带上一个可能触发头注入的串。
+   *
+   * ⚠️ 非法值**静默归一为 `undefined`** 而不是抛错：本设置是可选逃生口，
+   * 用户输错一个字符就报错阻断保存只会更糟。但 RPC 层会把**归一后的实际值**
+   * 回给客户端，UI 照它渲染，用户能立刻看出「没生效」。
+   */
+  async setMinimaxXff(value: string | undefined): Promise<void> {
+    this.ensureLoaded()
+    const next = sanitizeMinimaxXff(value)
+    if (this.minimaxXffCache === next) return
+    this.minimaxXffCache = next
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，MiniMax XFF 设置仅本次会话有效')
       return
     }
     await this.queueStoreSave()

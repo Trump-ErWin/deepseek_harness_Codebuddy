@@ -206,6 +206,36 @@ export interface JetHubState {
    * 故插件跨版本增删 provider 时不需要任何迁移。
    */
   providerOrder?: string[]
+  /**
+   * MiniMax **国际站**请求要附带的 `X-Forwarded-For` 值（Gitee issue IKMEVG，2026-10-17）。
+   *
+   * ## 它解决什么
+   *
+   * `agent.minimax.io` 对所有路径恒返 `307 → agent.minimaxi.com`，而**是否 307
+   * 由 Akamai 按请求来源 IP 的国别决定**（本机实测：美国 `8.8.8.8`、日本
+   * `133.130.0.1`、新加坡、香港的 IP ⇒ 留在国际站；中国 `114.114.114.114`、
+   * `223.5.5.5`、`180.76.76.76` ⇒ 307；内网/非法/空值 ⇒ 视为无此头，同样 307）。
+   *
+   * ⇒ 中国大陆出口的用户**永远**拿不到国际站数据面，无论 token 多有效。
+   * 设置本字段后，国际站请求会附带 `X-Forwarded-For: <该值>`，从而被判定为
+   * 海外来源、留在国际站。
+   *
+   * ## ⚠️ 为什么是「用户显式开启」而不是默认行为
+   *
+   * 附 `X-Forwarded-For` 本质是**声明一个并非本机的来源 IP**。Akamai 这条规则
+   * 是上游的区域路由策略（账单、内容合规都基于它），默认伪造来源**不该是产品的
+   * 默认行为**。故：缺键 / 空串 = **不附任何头**，行为与修复前逐字节一致。
+   *
+   * ⚠️ 它还可能**随时失效**：很多 CDN 已默认不信任客户端提供的 `X-Forwarded-For`。
+   * 上游一旦改策略，本设置会**静默无效** —— 所以「设置后仍然 307」必须如实报错，
+   * 不能假装成功（`minimax.ts` 的 `describeMinimaxGeoRoute` 守这一条）。
+   *
+   * ⚠️ 取值校验在 {@link sanitizeMinimaxXff}：**只接受 IP 字面量**（IPv4/IPv6），
+   * 不接受主机名、不接受任意头注入字符（`,` / 换行 / 冒号在 IPv6 之外一律拒绝）。
+   *
+   * ⚠️ **只对 `minimaxintl` 生效**，中国站不受影响（它不需要绕过）。
+   */
+  minimaxXff?: string
 }
 
 /** 持久化后端的能力标识，供调用方决定要不要告警。 */
@@ -234,6 +264,11 @@ const jetHubSchema = Schema.object({
   gatewayEnabled: Schema.boolean().default(true),
   nativeWebSearchEnabled: Schema.boolean().default(true),
   providerOrder: Schema.array(Schema.string()).default([]),
+  // ⚠️ 用 `Schema.string()` 而不是自定义 IP 校验：schema 只负责类型，
+  // 取值合法性由 `sanitizeMinimaxXff` 在**读写两侧**统一判（老契约后端不经过
+  // schema，只靠那个函数；两处用同一份判据才不会漂移）。
+  // 缺键 = 不附 XFF（行为与修复前逐字节一致）。
+  minimaxXff: Schema.string().default(''),
 })
 
 /**
@@ -275,6 +310,93 @@ export function sanitizeNativeWebSearchEnabled(raw: unknown): boolean {
  * 代码重写文档」场景下的顺序无法保留 —— 展示层对数组中不认识 / 缺失的
  * id 自带稳定兜底，脏条目天然无害。
  */
+/**
+ * 归一化 MiniMax 国际站绕过分流用的 `X-Forwarded-For` 值。
+ *
+ * ## ⚠️ 为什么必须校验，而不是「用户填什么就发什么」
+ *
+ * 这个值会被**原样拼进 HTTP 请求头**。不校验的话，用户（或一份被篡改的
+ * `state.json`）填入 `1.2.3.4\r\nX-Evil: 1` 就能向**上游**注入任意请求头
+ * —— 那是典型的头注入（CRLF injection）。故判据必须**白名单字符集**，
+ * 而不是「挡掉已知坏字符」。
+ *
+ * ## 取值口径
+ *
+ * - **只接受 IP 字面量**：IPv4（`a.b.c.d`，四段 0-255）与 IPv6
+ *  （含 `::` 压缩、`%zone` 允许但**原样保留**——本机链路本地地址确实带它）；
+ * - 主机名、`1.2.3.4, 5.6.7.8`（XFF 链）、前后空白以外的任何字符 ⇒ `undefined`；
+ * - **空串 / 仅空白 ⇒ `undefined`**（语义 = 不附头，与缺键一致）；
+ * - 超长（>128）⇒ `undefined`（最长合法 IPv6 也只有 45 字符）。
+ *
+ * ⚠️ 归一化只做 `trim()`，**不改大小写、不改缩写**：这个值是用户从自己的
+ * 代理/VPN 那里抄来的，改写它只会让「为什么我填对了却不生效」更难查。
+ *
+ * ⚠️ 返回 `undefined` 表示「不附头」。**绝不能**把它变成空串头
+ * （`X-Forwarded-For: `）—— 空值在 Akamai 侧会被当成非法并回退真实 IP，
+ * 行为与不附头相同，但会污染上游日志。
+ */
+export function sanitizeMinimaxXff(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  // ⚠️⚠️ **必须在 `trim()` 之前查 CR/LF**（本函数初版就栽在这里）：
+  //    `'1.2.3.4\r'` 被 `trim()` 去掉 `\r` 后变成合法 IPv4 并**通过**校验 ——
+  //    于是「以换行结尾的值」在 store 层被洗干净、看不出问题，而一旦有别的
+  //    写入路径没走本函数，那个 `\r` 就会被拼进请求头（头注入）。
+  //    ⇒ 判据必须是「**原始串里不含控制字符**」，而不是「trim 后形状合法」。
+  if (/[\r\n]/.test(raw)) return undefined
+  const value = raw.trim()
+  if (value.length === 0 || value.length > 128) return undefined
+  // 白名单字符集：十六进制数字、点、冒号、百分号（IPv6 zone）、连字符。
+  // ⚠️ zone 名（`fe80::1%eth0`）是**字母**组成的，故还要放行 a-z/A-Z；
+  //    但仅当存在 `%` 时才允许字母（纯字母串如 `localhost` 必须被拒）。
+  const hasZone = value.includes('%')
+  const allowed = hasZone ? /^[0-9A-Za-z.:%-]+$/ : /^[0-9A-Fa-f.:]+$/
+  if (!allowed.test(value)) return undefined
+  // IPv4：四段十进制，每段 0-255。
+  const isIpv4 = (() => {
+    const parts = value.split('.')
+    if (parts.length !== 4) return false
+    return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255)
+  })()
+  if (isIpv4) return value
+  /**
+   * IPv6：要求**段数合法**（≤ 8 段，且 `::` 压缩最多一次）。
+   *
+   * ⚠️ **初版只做形状校验、不数段数**（2026-10-17 审计指出的真实缺口）：
+   * `1:2:3:4:5:6:7:8:9:10`（10 段）当时被**放行**，而 IPv6 最多 8 段。
+   * 后果不是安全漏洞（它只是个非法字符串），但「只接受 IP 字面量」这条
+   * 契约就名不副实 —— 用户填错也得不到纠正，请求带上一个必然无效的头。
+   *
+   * ⚠️ 判据按「**冒号切分后的组数**」，并显式处理 `::` 压缩：
+   * - 无 `::` ⇒ 必须**恰好 8 组**；
+   * - 有 `::` ⇒ 两侧合计**少于 8 组**（`::` 至少要顶替 1 组）。
+   * 组内允许 1~4 位十六进制。
+   *
+   * ⚠️ 仍**刻意不支持** IPv4-mapped（`::ffff:1.2.3.4`）：本设置用不到，
+   * 少一个分支就少一处判定误差（这一点写进契约，见下）。
+   */
+  if (value.includes(':')) {
+    if (/:::/.test(value)) return undefined
+    if (value.startsWith(':') && !value.startsWith('::')) return undefined
+    if (value.endsWith(':') && !value.endsWith('::')) return undefined
+    // zone id 不参与段数计算（`fe80::1%eth0` 的 `%eth0` 是链路作用域，不是一组）。
+    const addressPart = value.split('%')[0] ?? ''
+    if (addressPart.length === 0) return undefined
+    const hasCompression = addressPart.includes('::')
+    if (hasCompression && addressPart.split('::').length > 2) return undefined
+    const groups = addressPart.split(':').filter((g) => g.length > 0)
+    // 组内必须是 1~4 位十六进制。
+    if (!groups.every((g) => /^[0-9A-Fa-f]{1,4}$/.test(g))) return undefined
+    if (hasCompression) {
+      // `::` 至少顶替一组 ⇒ 显式组数必须 < 8。
+      if (groups.length >= 8) return undefined
+    } else if (groups.length !== 8) {
+      return undefined
+    }
+    return value
+  }
+  return undefined
+}
+
 export function sanitizeProviderOrder(raw: unknown): string[] {
   if (!Array.isArray(raw)) return []
   const seen = new Set<string>()
@@ -707,6 +829,7 @@ class SettingsStore implements JetHubStore {
         gatewayEnabled?: unknown
         nativeWebSearchEnabled?: unknown
         providerOrder?: unknown
+        minimaxXff?: unknown
       }
       | undefined
     if (value === undefined || value === null) return undefined
@@ -727,6 +850,8 @@ class SettingsStore implements JetHubStore {
       nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
       // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
       providerOrder: sanitizeProviderOrder(value.providerOrder),
+      // 老文档没这个键 ⇒ `undefined` ⇒ 不附 XFF（与修复前行为逐字节一致）。
+      minimaxXff: sanitizeMinimaxXff(value.minimaxXff),
     }
   }
 
@@ -768,6 +893,11 @@ class SettingsStore implements JetHubStore {
       nativeWebSearchEnabled: state.nativeWebSearchEnabled !== false,
       // 顺序丢失只会回到声明顺序（可逆，重拖一次即恢复），同理接受丢失。
       providerOrder: state.providerOrder ?? [],
+      // ⚠️ **必须带上本键**：`replace` 是整体替换语义 ⇒ 漏键会让用户设置的
+      //    XFF 在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
+      //    进而「国际站明明能用却突然又开始 307」—— 症状极难对应到本键。
+      //    缺键/空串一律写 `''`（= 不附头），不会写出 `undefined` 空洞。
+      minimaxXff: sanitizeMinimaxXff(state.minimaxXff) ?? '',
     })
   }
 }
@@ -982,6 +1112,7 @@ class FileStore implements JetHubStore {
         gatewayEnabled?: unknown
         nativeWebSearchEnabled?: unknown
         providerOrder?: unknown
+        minimaxXff?: unknown
       }
       return {
         accounts: sanitizeAccounts(value.accounts),
@@ -1000,6 +1131,8 @@ class FileStore implements JetHubStore {
         nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
         // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
         providerOrder: sanitizeProviderOrder(value.providerOrder),
+        // 老文档没这个键 ⇒ `undefined` ⇒ 不附 XFF（与修复前行为逐字节一致）。
+        minimaxXff: sanitizeMinimaxXff(value.minimaxXff),
       }
     } catch (error) {
       this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，本次以空列表启动: ${String(error)}`)
@@ -1055,6 +1188,8 @@ class FileStore implements JetHubStore {
         nativeWebSearchEnabled: true,
         // 凭据文件里也没有顺序信息 → 空数组（未自定义，与全新安装一致）。
         providerOrder: [],
+        // 凭据文件里没有 XFF 设置 → 不附头（与全新安装一致）。
+        minimaxXff: undefined,
       }
       try {
         this.write(state)
