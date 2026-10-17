@@ -864,6 +864,277 @@ raccoon 在 `51ded6a` 修了这处，**loomy 当时未同步**（同一次审计
 3. **兜底模型表** —— ❌ **仍未按国际站远端采集**（两站共用同一份国内站快照）。
    ⇒ **只有这一项**不该读成「已实现」；上面两项已经是实测事实，别再重复劳动。
 
+### ⚠️⚠️ 「登录成功但余额/签到全失败」= 跨 origin 307 剥掉了 `Authorization`（issue IKMEVG，2026-10-17 已修）
+
+**用户报障**：「minimax 国际版登录无法查询余额，领取积分失败，**疑似授权不成功**」。
+面板三条症状：积分行「余额查询失败」、「一键领取积分」报
+`失败 —— 签到响应缺少有效的 claim_result`、账号卡片却显示「已启用」。
+
+#### 根因（与「授权」无关，凭据其实是有效的）
+
+`agent.minimax.io` 现对**所有**路径恒返 `307 → https://agent.minimaxi.com/...`
+（两个 Akamai 边缘 IP、连打 15 次全部一致；curl 独立复核同结果；响应头
+`X-From: ak` 表明是 Akamai 边缘规则）。
+
+而按 fetch 规范，**跨 origin 重定向会移除 `Authorization` 头**（本机双端口实验
+实测：`Authorization` 被剥、`x-api-key` 反而保留）。于是：
+
+```
+带 Bearer 发 → 307 → fetch 自动跟到 minimaxi.com（Authorization 已被剥）→ 400
+```
+
+那个 `400 {"error":"invalid signature"}` 与「**完全不发 token**」**同形**
+（对照矩阵印证），所以看起来像凭据无效。
+
+**决定性反证**：手动跟随 307 并在每一跳重附 `Authorization` 后，签到面板 /
+积分明细 / 推理 SSE **全部 200**（修复后用真实活凭据跑插件代码路径实测：
+签到「今日已领=true 额度=400」、余额 `9845.75`）。
+
+⚠️ 补 `x-api-key` **不解决问题**：它虽不被剥，但 MiniMax 业务端点**只认
+`Authorization`**（实测仅 x-api-key → 同样 400 invalid signature）。
+
+#### 两个必须记住的结论
+
+1. **「登录跳转到中国版」是客户端的 region 自动检测，不是插件 bug**：
+   本机国际版客户端（`MiniMax Code` 3.1.1，`app.asar`）的 `.env.local` 写死
+   `NEXT_PUBLIC_LOCALE="zh"`，而 `@mavis/config` 的 `getRuntimeRegion()`
+   按 `locale === 'zh' ⇒ 'cn'` 判定 ⇒ 它打开的就是 `account.minimax.cn`，
+   落库路径也是 `~/.minimax/auth/prod/**cn**/mcode-public/`。
+   ⇒ **装了「国际版」安装包，拿到的仍可能是中国站账号**（两站账号在**数据面
+   互通**：同一 token 打 `agent.minimax.cn` 与 `agent.minimaxi.com` 都 200）。
+2. **`minimaxintl` 的 `apiHost: 'https://agent.minimax.io'` 目前不可用**：它必被
+   307 到 `.com`。保凭据跟随后能通，但那是「借道」—— 若哪天上游不再 307，
+   这里要重新核对（**第 3 项待定，用户正在实测真实国际版能否登录**）。
+
+#### 第二道缺陷：`requestEnvelope` 从不检查 HTTP 状态码
+
+`src/minimax-credits.ts` 原实现只解析 JSON 体、**没有** `if (!response.ok)`
+（全文件唯一的 `response.status` 只出现在「非 JSON」文案里）。于是
+`400 {"error":"invalid signature"}` 这种**没有 `base_resp`** 的体走到
+`statusCode === undefined` ⇒ 被判 **`ok: true`**，然后三个入口各自把真因翻译成
+**与真因无关**的话：
+
+| 入口 | 拿到 `ok:true` 之后 | 面板文案 |
+|---|---|---|
+| `claim` | `claim_result` 缺失 | 「签到响应缺少有效的 claim_result」（**正是报障原文**） |
+| `signin/status` | 形状不认 ⇒ `null` | 签到状态不可用 |
+| `credit/details` | `details`/`total_count` 缺失 ⇒ `null` | 「余额查询失败」 |
+
+⚠️ **这一格此前零覆盖**：反向验证实测，注入 `if (!response.ok) return {ok:false…}`
+后跑 **62 条** minimax 用例**全绿**（既有用例构造的响应全是 200 + 合法业务码，
+结构上抓不到该分支）。
+
+⚠️ **文案必须如实透出错误体原文**：`invalid signature`（网关/重定向）与
+`invalid access token`（凭据）指向**完全不同**的处置动作，压成一句
+「查询失败」会让用户照着错的指引去重新登录。
+
+#### 修法与守卫
+
+- `src/minimax.ts` 的 `minimaxFetch` = **重试（外层）+ 保凭据跟随重定向（内层）**，
+  **四处调用点共用**（推理 `send` / 目录 `fetchRawModels` / 签到积分
+  `requestEnvelope`）。⚠️ 重试必须在**外层**：传输错误在**任何**一跳都可能发生。
+- 跟随有**三条硬边界**：① `redirect: 'manual'` 后**每跳重新构造头**（`buildInit`
+  传函数而非对象，让「漏带头」在结构上做不到）；② 只跟**可信主机**
+  （`minimax.io`/`minimax.cn`/`minimaxi.com`/`xaminim.com`，后缀匹配防
+  `evil-minimax.io` 仿冒）且只跟 `https`；③ abort 不继续跟、跳数上限 3、
+  不可信/超限时**原样返回 3xx**（绝不假装成功）。
+- 守卫：`tests/unit/minimax-redirect-follow.spec.ts`（17 条）+
+  `minimax-credits.spec.ts` 的「HTTP 非 2xx 不得被当成成功」（10 条）。
+  ⚠️ 其中有一条**事实基线**用**真 Node http server** 起两个端口、用**全局真 fetch**
+  走一次自动跟随，断言第二跳**收到的 `Authorization` 为 null** —— 因为本修复的
+  全部价值建立在「fetch 会剥头」之上，若某天 undici 改了这条行为，那些用手写
+  fetcher 的用例**全部仍会绿**（它们根本没走真 fetch）。
+
+**变异验证（7 条，逐条实测有牙）**：只给第一跳带头 ⇒ 1 红；去掉
+`redirect:'manual'` ⇒ 2 红；可信闸门改 fail-open ⇒ 2 红；删 HTTP 状态检查 ⇒
+7 红；跟随丢 method/body ⇒ 1 红；去 abort 守卫 ⇒ 1 红；`MAX_HOPS=0` ⇒ 5 红。
+
+⚠️ **本节是「第一、二缺陷」那轮的 7 条**；加上地理分流（第三缺陷）之后新增的
+5 条共 **12 条**，完整清单见本节末尾「守卫与变异验证」（以那一处为**唯一权威**）。
+
+⚠️ **连带修掉一个既有脆弱用例**：`officeace-inflight-guard.spec.ts` 的 ③ 号
+用例在 `DSH_OFFICEACE_PENDING_TTL_MS='0'` 下依赖「`createdAt` 与稍后的 `now()`
+**跨毫秒**」（收口判据是闭区间 `<=`，同毫秒时 `0 <= 0` 为真 ⇒ 跳过收口 ⇒ 假红）。
+实测同一份代码连跑 8 次 **5 红 3 绿**，且它曾因一次**无关**改动的导入图变化而
+开始大面积变红，极易被误判成该改动的回归。修法是插入 `setTimeout(2)` 让时钟
+**确定性**前进（不能用微任务），连跑 10 次 10/10 绿；并做过反向验证（把收口
+判据改成 `if (true) continue` ⇒ 该用例仍变红，判别力未丢）。
+
+### ⚠️⚠️⚠️ 决定性根因：Akamai 按**出口 IP** 把大陆流量分流到中国站（同一 issue 的第三层）
+
+上两节修掉「丢凭据」与「谎报成功」后，用户实测**仍然余额查询失败**（这次凭据是
+新登录的、有效期 60 分钟）。继续深挖得到决定性结论 —— **40 个变体穷举实测**：
+
+| 随请求附带的 `X-Forwarded-For` | `agent.minimax.io` 的结果 |
+|---|---|
+| 美国 `8.8.8.8` / `1.1.1.1`、日本 `133.130.0.1`、新加坡、香港 | **留在国际站（200，真实数据）** |
+| 中国 `114.114.114.114` / `223.5.5.5` / `180.76.76.76` | **307 → 中国站** |
+| 内网 `127.0.0.1` / `10.0.0.1` / `::1`、空值、非法串 | 视为无此头 ⇒ **307** |
+| `Accept-Language` / `x-mavis-region` / `X-Region` / `region` / `?lang=` / `?region=` / UA / Origin / Referer / Cookie | **全部 307（完全无效）** |
+
+⚠️ **不是 lang/region 头的问题**：`minimaxHeaders()` 本来就只发
+`Authorization` + `Accept`，**从没带过任何中文标识**。是**出口 IP 的地理位置**。
+
+⚠️ **跟到中国站后无法事后区分**：「国际站账号被导到中国站」与「凭据真失效」
+返回的 `401 {"error":"invalid access token"}` **逐字同形**（本机实测）⇒
+拿它判会把「换个网络就能用」误报成「请重新登录」。故判别**必须卡在 307 那一跳**
+（`minimaxFetch` 的 `onGeoRoute` 回调）。错误码刻意用 `SERVER` 而非 `AUTH`
+（本仓库 IKLBSH 记过「`AUTH` 码会连 message 一起吞」）。
+
+#### 解法：面板可设 `X-Forwarded-For`（默认关闭）
+
+`state.json` 新增 `minimaxXff` → 面板按钮「国际站分流设置」（**只对
+`minimaxintl` 渲染**）→ RPC `minimax.getXff` / `minimax.setXff`。
+
+三条纪律：
+
+1. **只对 `minimaxintl` 生效**（`minimaxHeadersFor` 按 `product.id` 分流）；
+   给中国站附这个头纯属伪造来源、无收益。
+2. **未设置 ⇒ 一个头都不加**（老用户行为逐字节不变）。
+3. **非法值绝不进请求头**：`sanitizeMinimaxXff` 只放行 IP 字面量，且
+   **CR/LF 判定必须在 `trim()` 之前** —— 初版栽在这里：`'1.2.3.4\r'` 被 `trim()`
+   去掉 `\r` 后变成合法 IPv4 并**通过**校验，那个 `\r` 就看不出来了（头注入）。
+   请求侧 `withMinimaxXff` 独立再挡一次（纵深防御）。
+
+⚠️ **该键必须进 `queueStoreSave` 的整体写入 + 两处 load**（`SettingsStore` /
+`FileStore`）：漏一处 = 任何一次改账号都静默清掉它 ⇒「设好了，过一阵又开始 307」。
+
+⚠️ **读池设置必须 `typeof` 判**：`pool?.minimaxXff()` 在**只实现部分方法的池替身**
+上会抛 `TypeError`（`?.` 只挡 `null`/`undefined`，挡不住「对象上没有这个方法」）
+—— 实测让 `minimax-adapter.spec.ts` 的**轮换组 16 条全红**。adapter 与 auth 两处
+都已改成 `typeof pool?.minimaxXff === 'function'`。
+
+#### 端到端实测（真实国际站 token，不是中国站 token）
+
+```
+不传 XFF：签到 → null、余额 → null          （面板「余额查询失败」）
+传 XFF  ：签到 → ✅ 额度 400、余额 → ✅ 0   （该账号余额确实是 0）
+```
+
+#### ⚠️⚠️ 一条假阳性教训（值得单独记）
+
+我曾用 `~/.minimax/auth/prod/**cn**/mcode-public/auth.json` 里的凭据去打 `.io`，
+读到 200 与「9845.75」，并据此宣布「两站都通了」。真相是：那是**中国站 token**，
+被 307 到中国站后读到的是**中国站数据**；打 `.cn` 读到的也是同一份 ⇒
+**两边同值恰恰证明是同一个账号读了两遍**。用户一句
+「国际版和国内版不可能是同一个积分，是哪里走错了」直接戳破了它。
+
+⇒ 两条硬纪律：
+1. **验证国际站必须用国际站自己签发的 token**（`account.minimax.io` 的 device code）；
+2. **「两站结果相同」不是成功证据，而是「可能读了两遍同一个站」的信号**。
+
+#### 顺带查清：为什么「国际版客户端登录后跳转中国版」
+
+解包本机 `MiniMax Code` 3.1.1（`app.asar`）：`.env.local` 写死
+`NEXT_PUBLIC_LOCALE="zh"`，而 `@mavis/config` 的 `getRuntimeRegion()` 按
+`locale === 'zh' ⇒ 'cn'` 判定 ⇒ 它打开 `account.minimax.cn`，落库到
+`~/.minimax/auth/prod/**cn**/`。**装「国际版」安装包也可能拿到中国站账号。**
+
+数据面归属实测（同一台主机、同一个 URL）：
+```
+agent.minimaxi.com/minimax-cloud/api/v1/signin/status
+  国内站 token → 200       真国际站 token → 401
+```
+⇒ `.minimaxi.com` 与 `.minimax.cn` 都是**中国站数据面**，它不认识国际站 token。
+
+#### 为什么不默认开启 XFF
+
+附 `X-Forwarded-For` 本质是**声明一个并非本机的来源 IP**。Akamai 那条规则是上游的
+区域路由策略（账单/合规都基于它），默认伪造来源不该是产品的默认行为。故缺省为空，
+且 UI 文案**先给「用代理改出口 IP」这条更正当的路**。
+⚠️ 它还可能**随时失效**（很多 CDN 已默认不信任客户端提供的 XFF）——届时必须
+**如实报错**，不能假装成功。
+
+#### 守卫与变异验证
+
+`tests/unit/minimax-redirect-follow.spec.ts`（17 条，含一条用**真 Node http server**
++ **全局真 fetch** 锁住「fetch 确实会跨 origin 剥 Authorization」的事实基线 ——
+本修复的全部价值建立在这条行为上，若 undici 改了它，只用手写 fetcher 的用例会
+**全绿但修法已失效**）+ `tests/unit/minimax-xff-geo.spec.ts`（31 条）+
+`minimax-credits.spec.ts` 的「HTTP 非 2xx 不得被当成成功」（10 条）。
+
+**12 条变异逐条有牙**：只给第一跳带头 ⇒ 1 红；去 `redirect:'manual'` ⇒ 2 红；
+可信闸门 fail-open ⇒ 2 红；删 HTTP 状态检查 ⇒ **7 红**；跟随丢 method/body ⇒ 1 红；
+去 abort 守卫 ⇒ 1 红；`MAX_HOPS=0` ⇒ 5 红；去 CRLF 原始串检查 ⇒ 1 红；
+XFF 对中国站也生效 ⇒ 2 红；地理路由判据只判后缀（`account.*` 也算）⇒ 1 红；
+**credits 不传业务错误原文 ⇒ 2 红**；**adapter 去掉 402 特判 ⇒ 1 红**。
+
+#### ⚠️⚠️ 提交后自查发现的两个真缺陷（都已修）
+
+1. **`geoRouted` 吞掉 402 的余额语义**（P0）。`geoRouted` 只表示「这次请求
+   **经历过** 307」，**不表示失败原因就是它**。实测反例 `307 → 402
+   insufficient_balance_error`：初版把文案整段换成地理路由说明、并把错误码
+   无条件改成 `SERVER` ⇒ **「去充值」这个唯一有效动作彻底消失**，用户会一直
+   折腾网络。修法：`describeMinimaxGeoRoute(detail)` 接收业务错误原文并放在
+   文案**最前面**；adapter 里 402 仍保 `QUOTA_EXCEEDED`，只有会落到
+   `SERVER`/`AUTH` 的档位才让地理路由接管错误码。
+2. **UI「清空输入」只改草稿、不落盘**（P1）。用户点完看到输入框空了，会以为
+   已关掉绕过分流，实际请求**仍带 XFF**。改为「清除设置」并真正调
+   `minimax.setXff({xff:''})`（`save(override)` 显式传值，绕开 React 状态异步）。
+
+⚠️ **一条方法论教训**：这两个缺陷都是我用**纯函数用例**测不出来的 ——
+`describeMinimaxGeoRoute` 的纯函数用例在「credits 不传原文」这个变异下**全绿**，
+因为判据没打在**业务入口**上。补了 `★★★ 接线` 组（4 条）后该变异才 2 红。
+这正是本仓库反复记录的「函数对 ≠ 被用上」。
+
+#### ⚠️⚠️ 子代理审计又打穿三处（2026-10-17，全部已修）
+
+用户要求「提交 + 脱敏审计 + 一轮 subagent 审计 + 对抗性审计」。审计子代理打穿了
+三处**我自己没发现的真问题**，我逐条复核后确认全部属实：
+
+**① `SERVER` 错误码会被 DSH 自动重试 5 次（P0，影响两处）**
+
+`@deepseek-ai/dsh-llm` 的 `retry-policy.js`：
+```js
+DEFAULT_RETRYABLE_CODES = [EMPTY_RESPONSE, RATE_LIMIT, 'SERVER', TIMEOUT, TRANSPORT]
+DEFAULT_MAX_RETRIES = 5
+```
+而 minimax 适配器**没有覆写** `providerRetryPolicy`（`src/` 全仓零命中）⇒ 走默认。
+两处都中招：
+- **地理路由**（本次新增）—— 确定性失败，重试毫无意义，且每次重试会重跑
+  `MINIMAX_MAX_ROTATE=8` 的换号循环 + 重定向跟随 ⇒ 最坏 5×8 次无谓请求；
+- **`200` 非 SSE**（`isDefinitelyNotSse` 分支，**既有代码**）—— 实测最终
+  `error.code === 'SERVER'`（该对象被原样当 `streamError`，**不经过**
+  `httpErrorCode()` 重新归类）。
+
+修法：两处都改用**不在默认可重试集合、且不会被 harness 替换文案**的码 ——
+地理路由用 `INVALID_CREDENTIAL`（官方注释恰好同理由："a malformed credential
+fails identically on every attempt"），非 SSE 用 `INVALID_REQUEST`。
+守卫：`★★★ 地理路由的错误码不可重试` + 更新既有非 SSE 用例为
+「`code` 不在可重试集合里」（把它从「顺带记录实现」变成有意义的守卫）。
+
+⚠️ 本仓库已记过同型事故（`providers-trae.md`：4006 落 `SERVER` ⇒ 巨型请求体
+被原样重发 5 次），这是**同一个坑的第二次**。
+
+**② 文案写死「中国大陆」，与同函数注释自相矛盾（P1）**
+
+`describeMinimaxGeoRoute` 上方注释明写「文案里**不写死"中国大陆"**…写死会误导
+走 VPN 但出口仍被判中国的用户」，而实现里就写着「判为中国大陆来源」。
+且实测**内网 IP 同样 307** ⇒ 对公司内网出口的用户，这是**事实错误**。
+修法：改「被判成中国区（内网或无法解析的地址也会被判成中国区）」，
+并**增加第三条指引**「先确认本机出口 IP（如打开 ifconfig.me）」——
+否则用户会先怀疑插件坏了。
+
+**③ 两条用例无牙（P1/P2，已实测证实）**
+
+- 「`307 → 402` 不静默当成 0」只断言 `balance === null`，而 402 体无
+  `details`/`total_count` ⇒ **删掉 `!response.ok` 整块也照样 null**（两条路都
+  返回 null，不可区分）。
+- 「超长值被拒绝（>128）」用的输入 `'8.8.8.8'.repeat(30)` 会先被「IPv4 必须四段」
+  拒掉 ⇒ 删掉长度判据仍通过。实测改用 `'fe80::1%' + 'a'.repeat(130)` 后才变红
+  （该串含 `%` ⇒ 字符集放宽、IPv6 形状也合法 ⇒ **只有**长度判据能拦）。
+
+顺带补了 `sanitizeMinimaxXff` 的 **IPv6 段数校验**（初版只做形状校验不数段数，
+`1:2:3:4:5:6:7:8:9:10` 被放行，与「只接受 IP 字面量」的契约名不副实）。
+
+**审计未打穿的**：`isMinimaxTrustedHost` 以**真实入参**（`new URL().hostname`）
+计 18 条攻击形态全部安全（零宽/全角/CGJ 会被 URL 规范化成真域、西里尔 o →
+punycode、userinfo → `evil.com`、尾部点/表意句号/NUL → 拒）；
+UI↔RPC 契约正确（`unwrapRpcResult` 对 `ok:false` 是**抛** `Error(message)`，
+故 `catch` 能接住）；持久化覆盖完整（接口/schema/两处 load/save/queueStoreSave/
+getter/setter 全在）。
+
+
 ### ⚠️⚠️ 传输级重试：`fetch failed` 的真实缺陷（2026-10-15，已修）
 
 **用户报障**：「模型连接测试失败，显示 `fetch failed`」「积分查询及领取失败」。
