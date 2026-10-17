@@ -9,6 +9,8 @@ import {
   parseAutoclawWallets,
 } from '../../src/autoclaw-credits.js'
 import { createProviderCredits } from '../../src/provider-credits.js'
+import { AutoclawAuth } from '../../src/autoclaw-auth.js'
+import { Context } from '@deepseek-ai/cordis'
 import type { AutoclawCredential } from '../../src/autoclaw.js'
 
 const MOCK_CREDENTIAL: AutoclawCredential = {
@@ -205,28 +207,57 @@ describe('fetchAutoclawBalanceDetailed & fetchAutoclawCreditBalance', () => {
 })
 
 describe('claimAutoclawDailyQuota', () => {
-  it('daily_check_in_completed_on_request 为 true 时返回 claimed', async () => {
-    const fetcher = vi.fn().mockResolvedValue(jsonResponse({
-      code: 0,
-      msg: 'SUCCESS',
-      data: {
-        uid: 'user_123',
-        daily_check_in_completed_on_request: true,
-      },
-    }))
+  /** 造一个按 URL 分流的 fetcher（领取接口 / 钱包接口各返回不同响应）。 */
+  function makeFetcher(opts: {
+    claimData: Record<string, unknown>
+    walletTotal?: number
+  }) {
+    return vi.fn().mockImplementation((url: string) => {
+      if (String(url).includes(AUTOCLAW_WALLETS_PATH)) {
+        const total = opts.walletTotal ?? 100
+        return Promise.resolve(jsonResponse({
+          code: 0,
+          msg: 'SUCCESS',
+          data: {
+            schema_version: 'wallets.v2',
+            total_balance: total,
+            wallets: [{
+              public_wallet_type: 'reward',
+              display_name: '奖励积分',
+              balance: total,
+              display: true,
+              priority: 10,
+            }],
+          },
+        }))
+      }
+      return Promise.resolve(jsonResponse({ code: 0, msg: 'SUCCESS', data: opts.claimData }))
+    })
+  }
+
+  it('daily_check_in_completed_on_request 为 true 时返回 claimed，并带说明文案', async () => {
+    // ⚠️⚠️ 上游**不返回**领到多少（2026-10-17 真机取证：data 只有
+    //   `{ uid, daily_check_in_completed_on_request }`）。
+    //   ⇒ `credit` 只能是 0，但**必须**附说明文案，
+    //     否则界面显示「签到成功，+0 积分」会被读成「白签了一次」。
+    // ⚠️ 为什么不在 claim 内部量余额差：那要在领取**前**多读一次钱包，
+    //   而 `already-claimed`（最常见的日常路径）也会白付这次请求。
+    //   取舍见 `autoclaw-credits.ts` 的注释。
+    const fetcher = makeFetcher({
+      claimData: { uid: 'user_123', daily_check_in_completed_on_request: true },
+    })
 
     const outcome = await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
       product: AUTOCLAW,
       fetcher: fetcher as unknown as typeof fetch,
     })
 
-    expect(outcome).toEqual({
-      kind: 'claimed',
-      credit: 0,
-      streakDays: 0,
-      isStreakDay: false,
-    })
+    expect(outcome.kind).toBe('claimed')
+    expect(outcome.kind === 'claimed' && outcome.credit).toBe(0)
+    // ⚠️ 这条才是防「+0 被误解」的判据。
+    expect((outcome as { delayedMessage?: string }).delayedMessage).toContain('上游不返回积分数量')
 
+    // ⚠️ **只发一次请求**（只有领取接口，不读钱包）。
     expect(fetcher).toHaveBeenCalledTimes(1)
     const [url, init] = fetcher.mock.calls[0] as [string, RequestInit]
     expect(url).toBe(`${AUTOCLAW.apiBase}${AUTOCLAW_DAILY_CLAIM_PATH}`)
@@ -237,24 +268,42 @@ describe('claimAutoclawDailyQuota', () => {
     })
   })
 
-  it('daily_check_in_completed_on_request 为 false 时返回 already-claimed', async () => {
-    const fetcher = vi.fn().mockResolvedValue(jsonResponse({
-      code: 0,
-      msg: 'SUCCESS',
-      data: {
-        uid: 'user_123',
-        daily_check_in_completed_on_request: false,
-      },
-    }))
-
-    const outcome = await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
+  it('⚠️ 凭据没有 device_id 时**不得**回落到固定常量（会共用假设备号）', async () => {
+    // 修复前回落到 `'dsh-autoclaw-device-001'` —— 所有调用方共用同一个假设备号，
+    // 上游风控会把不同用户识别成同一台设备刷接口。
+    const fetcher = makeFetcher({
+      claimData: { uid: 'user_123', daily_check_in_completed_on_request: false },
+    })
+    const noDevice: AutoclawCredential = {
+      access_token: 'test_access_token_1234567890',
+      refresh_token: 'test_refresh_token_1234567890',
+    }
+    await claimAutoclawDailyQuota(noDevice, {
+      product: AUTOCLAW,
       fetcher: fetcher as unknown as typeof fetch,
     })
+    const body = JSON.parse((fetcher.mock.calls[0]![1] as RequestInit).body as string)
+    expect(body.device_id, '不该是那个固定常量').not.toBe('dsh-autoclaw-device-001')
+    // ⚠️ 必须是 UUID 形态（随机造的），不是写死的字符串。
+    expect(body.device_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
+  })
 
+  it('daily_check_in_completed_on_request 为 false 时返回 already-claimed', async () => {
+    const fetcher = makeFetcher({
+      claimData: { uid: 'user_123', daily_check_in_completed_on_request: false },
+    })
+
+    const outcome = await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+    })
     expect(outcome).toEqual({
       kind: 'already-claimed',
       message: '今日已完成签到',
     })
+    // ⚠️ 这条路径**不该**读钱包（省请求）。
+    const urls = fetcher.mock.calls.map((c) => String(c[0]))
+    expect(urls.filter((u) => u.includes(AUTOCLAW_WALLETS_PATH))).toHaveLength(0)
   })
 
   it('请求失败或网络异常时不抛错，返回 failed 状态', async () => {
@@ -292,5 +341,146 @@ describe('src/provider-credits.ts autoclaw 接线注册', () => {
     expect(autoclawCredits?.fetchBalanceDetailed).toBeTypeOf('function')
     expect(autoclawCredits?.claim).toBeTypeOf('function')
     expect(autoclawCredits?.precheckStatus).toBe(false)
+  })
+})
+
+/**
+ * ★★ **登录后自动领取每日积分**（2026-10-17 新增）
+ *
+ * ## 为什么需要这组守卫
+ *
+ * 桌面端源码里有 `claimDailyCreditsOnSignIn(account, dailyCredits)`：
+ * 账号状态刚变为 `authenticated` 时触发 `dailyCredits.claim()`。
+ * ⇒ 这就是「登录即领」的**真实机制** —— 不是登录的副作用，而是登录后紧跟
+ * 一次 `POST /userapi/v1/user-info`。
+ *
+ * ⚠️ 用户实测过的症状：纯插件登录后新账号**没有积分**（推理回 402
+ * 「积分不足,请充值」），而在 IDE 里登录同一账号就有 —— 差别正是这一次调用。
+ */
+describe('★★ 登录后自动领取每日积分（对齐桌面端 claimDailyCreditsOnSignIn）', () => {
+  class FakeCredentials {
+    readonly store = new Map<string, string>()
+    async resolve(ref: string) {
+      const value = this.store.get(ref)
+      return value === undefined ? undefined : { value }
+    }
+    async describe(ref: string) {
+      return { configured: this.store.has(ref), writable: true }
+    }
+    async set(ref: string, value: string) { this.store.set(ref, value) }
+    async unset(ref: string) { this.store.delete(ref) }
+  }
+
+  /** 造 ctx + 记录调用顺序的 fetcher。 */
+  function setup(opts: { claimData?: Record<string, unknown>; claimFails?: boolean } = {}) {
+    const ctx = new Context()
+    const credentials = new FakeCredentials()
+    ctx.provide('credentials', credentials as never)
+    ctx.provide('commands', { register: () => () => {} } as never)
+    const calls: string[] = []
+    const fetcher = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+      const u = String(url)
+      if (u.includes(AUTOCLAW_DAILY_CLAIM_PATH)) {
+        calls.push('claim')
+        if (opts.claimFails) return Promise.reject(new Error('claim network down'))
+        return Promise.resolve(jsonResponse({
+          code: 0,
+          msg: 'SUCCESS',
+          data: opts.claimData ?? { uid: 'u1', daily_check_in_completed_on_request: true },
+        }))
+      }
+      if (u.includes('/userapi/v1/agent-login')) {
+        calls.push('login')
+        return Promise.resolve(jsonResponse({
+          code: 0,
+          msg: 'SUCCESS',
+          data: {
+            user_id: 'u1',
+            user_name: 'tester',
+            access_token: 'AT_123',
+            refresh_token: 'RT_456',
+            account_type: 'personal',
+          },
+        }))
+      }
+      calls.push('other')
+      return Promise.resolve(jsonResponse({ code: 0, data: {} }))
+    })
+    const service = new AutoclawAuth(ctx, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+    return { service, credentials, calls, fetcher }
+  }
+
+  it('★ 登录成功后**自动**调一次领取接口（这是「登录即领」的机制）', async () => {
+    const { service, calls } = setup()
+    const res = await service.loginWithCode('13015225433', '123456', 'AUTOCLAW_ACCOUNT_TEST')
+    expect(res.ok).toBe(true)
+    // ⚠️ 顺序必须是 login → claim（先拿凭据才能领）。
+    expect(calls.filter((c) => c === 'login' || c === 'claim')).toEqual(['login', 'claim'])
+  })
+
+  it('★ 凭据必须在领取**之前**落盘（领取要用刚写入的凭据）', async () => {
+    const { service, credentials } = setup()
+    await service.loginWithCode('13015225433', '123456', 'AUTOCLAW_ACCOUNT_TEST')
+    // ⚠️ 若顺序反了，领取时读不到凭据 ⇒ 线上恒失败但单测可能仍绿。
+    expect(credentials.store.has('AUTOCLAW_ACCOUNT_TEST')).toBe(true)
+    const written = JSON.parse(credentials.store.get('AUTOCLAW_ACCOUNT_TEST')!)
+    expect(written.access_token).toBe('AT_123')
+  })
+
+  it('⚠️⚠️ 领取失败**绝不反噬登录**（凭据已落盘且可用）', async () => {
+    // ⚠️ 这是本组最重要的一条：若把领取失败上抛，用户会以为「登录失败」
+    //   而反复重新登录 —— 比「没领到积分」更糟。
+    const { service, credentials } = setup({ claimFails: true })
+    const res = await service.loginWithCode('13015225433', '123456', 'AUTOCLAW_ACCOUNT_TEST')
+    expect(res.ok, '领取失败时登录仍须成功').toBe(true)
+    expect(credentials.store.has('AUTOCLAW_ACCOUNT_TEST'), '凭据仍须落盘').toBe(true)
+  })
+
+  it('⚠️ 领取返回业务错误（code!=0）也不反噬登录', async () => {
+    const ctx = new Context()
+    const credentials = new FakeCredentials()
+    ctx.provide('credentials', credentials as never)
+    ctx.provide('commands', { register: () => () => {} } as never)
+    const fetcher = vi.fn().mockImplementation((url: string) => {
+      const u = String(url)
+      if (u.includes(AUTOCLAW_DAILY_CLAIM_PATH)) {
+        return Promise.resolve(jsonResponse({ code: 400001, msg: '请求数据有问题' }))
+      }
+      return Promise.resolve(jsonResponse({
+        code: 0,
+        data: { user_id: 'u1', access_token: 'AT', refresh_token: 'RT' },
+      }))
+    })
+    const service = new AutoclawAuth(ctx, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+    const res = await service.loginWithCode('13015225433', '123456', 'AUTOCLAW_ACCOUNT_TEST')
+    expect(res.ok).toBe(true)
+  })
+
+  it('⚠️ 登录失败时**不得**调领取（没有凭据可领）', async () => {
+    const ctx = new Context()
+    const credentials = new FakeCredentials()
+    ctx.provide('credentials', credentials as never)
+    ctx.provide('commands', { register: () => () => {} } as never)
+    const calls: string[] = []
+    const fetcher = vi.fn().mockImplementation((url: string) => {
+      const u = String(url)
+      if (u.includes(AUTOCLAW_DAILY_CLAIM_PATH)) { calls.push('claim'); return Promise.resolve(jsonResponse({ code: 0, data: {} })) }
+      calls.push('login')
+      return Promise.resolve(jsonResponse({ code: 10001, msg: '验证码错误' }))
+    })
+    const service = new AutoclawAuth(ctx, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+    const res = await service.loginWithCode('13015225433', '000000', 'AUTOCLAW_ACCOUNT_TEST')
+    expect(res.ok).toBe(false)
+    expect(calls, '登录失败时不该调领取').not.toContain('claim')
+    expect(credentials.store.size).toBe(0)
   })
 })

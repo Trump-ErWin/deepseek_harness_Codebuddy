@@ -762,14 +762,60 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
         { id: 'zaicoding_glm-5.3', contextWindow: 1048576, maxTokens: 307200, input: ['text'], reasoningLevel: ['low', 'high', 'max'] },
       ] as const
 
+      /**
+       * ⚠️⚠️ **实测覆盖的图片能力**（2026-10-17，真实凭据 + 真实图片）。
+       *
+       * ## 为什么远端 `input` 不能当能力真值
+       *
+       * 远端对 `zai_auto` / `zaicoding_glm-5.3` 只声明 `input: ["text"]`，
+       * 但**实测两者都能正确读图**（答对了「数字 7 + 红色横线」双判据）。
+       * ⇒ 远端 `input` 声明**不完整** —— 这正是本仓库记过的
+       * 「远端漏报 `input_modalities`」形态（`loomy` 的 `qwen-3.8-max` 同款）。
+       *
+       * ## 实测方法（可靠版本）
+       *
+       * 图：256×256、深蓝底 + 粗白字「7」+ 底部红横线；
+       * 问：「数字是几？横线什么颜色？」⇒ 四个 `zai_*` 模型**全部答对**。
+       *
+       * ⚠️ **第一版探针是错的**：用了 64×64、笔画极细的图（base64 仅 236
+       * 字符）⇒ 模型读不出 ⇒ 我误判「不支持图片」。用户反馈 IDE 里能发图后
+       * 才复查出这一点。教训：**视觉探针的图必须足够大、判据必须有二义性防护**
+       * （只问「数字是几」时答错还能狡辩；加一条「横线什么颜色」就把
+       * 「真读图」与「瞎猜」分开了）。
+       */
+      const VISION_MEASURED: Readonly<Record<string, boolean>> = {
+        'zai_glm-5.3-flash': true,
+        'zaicoding_glm-5.3': true,
+        'zai_auto': true,
+        'zai_auto-fast': true,
+      }
+
       it.each(REMOTE.map((r) => [r.id, r] as const))(
-        '%s：兜底表的三项能力必须与远端逐格一致',
+        '%s：contextWindow / maxTokens 必须与远端逐格一致',
         (_id, remote) => {
           const entry = AUTOCLAW.fallbackModels.find((m) => m.id === remote.id)
           expect(entry, `${remote.id} 应在本表里（它在远端目录内）`).toBeDefined()
+          // ⚠️ 这两项**可以**与远端对拍（它们是纯数值，远端声明可信）。
           expect(entry!.contextWindow).toBe(remote.contextWindow)
           expect(entry!.maxOutputTokens).toBe(remote.maxTokens)
-          expect(entry!.supportsImage).toBe(remote.input.includes('image' as never))
+        },
+      )
+
+      it.each(REMOTE.map((r) => [r.id, r] as const))(
+        '%s：图片能力以**实测**为准，不以远端 input 声明为准',
+        (_id, remote) => {
+          const entry = AUTOCLAW.fallbackModels.find((m) => m.id === remote.id)!
+          // ⚠️ 判据是 VISION_MEASURED（实测），**不是** remote.input。
+          expect(entry.supportsImage).toBe(VISION_MEASURED[remote.id])
+          // ⚠️ 反向登记「远端漏报」这件事本身：若将来远端补上了 image，
+          //   本断言会红，提醒把这条登记删除（而不是静默保留一句过时的话）。
+          if (VISION_MEASURED[remote.id] === true && !remote.input.includes('image' as never)) {
+            expect(
+              remote.input.includes('image' as never),
+              `${remote.id}: 实测支持图片，但远端 input 尚未包含 image`
+              + '（这正是「远端漏报」的登记点；若远端已修正，请更新本用例）',
+            ).toBe(false)
+          }
         },
       )
 
@@ -792,8 +838,7 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
         for (const m of AUTOCLAW.fallbackModels) {
           const resolved = await adapter.resolveModel('autoclaw', m.id)
           expect(resolved.reasoning, `${m.id} 未声明档位`).toBeDefined()
-          expect(resolved.reasoning!.efforts.length).toBe(3)
-        }
+          expect(resolved.reasoning!.efforts.length).toBe(3)        }
       })
 
       it('⚠️ 目录里没有 zai_glm-5.3-flash，但本表**刻意保留**（实测仍可调用）', () => {
@@ -806,6 +851,44 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
         const kept = AUTOCLAW.fallbackModels.find((m) => m.id === 'zai_glm-5.3-flash')
         expect(kept, '刻意保留，见 autoclaw-product.ts 的说明').toBeDefined()
         expect(kept!.isFree, '它是唯一的免费模型，删掉会让免费分栏变空').toBe(true)
+      })
+
+      // ═══════════════════════════════════════════════════════════════
+      // **展示名必须与 IDE 显示的一致**（2026-10-17 用户核对后修正）
+      //
+      // 用户对照 IDE 内置列表（Auto / Auto-Fast / GLM-5.3 / GLM-5.3-Flash）
+      // 问「我们的 GLM-5.3 Coding 是 IDE 的 GLM-5.3 吗」——
+      // **是**。远端 `name` 逐字为 `"GLM-5.3"`，而我们曾写作
+      // `"GLM-5.3 Coding (AutoClaw)"`，让人以为是两个模型。
+      // ⇒ 名称一律**以远端 `name` 为准**，只加 `(AutoClaw)` 品牌后缀。
+      // ═══════════════════════════════════════════════════════════════
+      it('★★ 展示名必须等于「远端 name + (AutoClaw)」，不得自己造名字', () => {
+        // ⚠️ 这是远端权威 name（2026-10-17 实测，逐字照抄）。
+        const REMOTE_NAME: Readonly<Record<string, string>> = {
+          'zai_auto': 'Auto',
+          'zai_auto-fast': 'Auto-Fast',
+          'zaicoding_glm-5.3': 'GLM-5.3',
+        }
+        // 反向自检：表非空，否则循环恒真。
+        expect(Object.keys(REMOTE_NAME).length).toBe(3)
+        for (const [id, remoteName] of Object.entries(REMOTE_NAME)) {
+          const entry = AUTOCLAW.fallbackModels.find((m) => m.id === id)
+          expect(entry, `${id} 应在本表里`).toBeDefined()
+          // ⚠️ 判据是「**包含**远端原名 + 带品牌后缀」，不要求逐字相等 ——
+          //   因为我们必须加品牌（跨渠道同名混淆），但**不得改动原名本身**。
+          expect(entry!.name, `${id}: 必须保留远端原名 "${remoteName}"`)
+            .toContain(remoteName)
+          expect(entry!.name, `${id}: 必须带 (AutoClaw) 品牌后缀`)
+            .toContain('(AutoClaw)')
+        }
+        // ⚠️ **反向守卫**：`zaicoding_glm-5.3` 的名字里**不得**出现 `Coding`
+        //   （那正是造成「以为它是另一个模型」的误导词）。
+        const coding = AUTOCLAW.fallbackModels.find((m) => m.id === 'zaicoding_glm-5.3')!
+        expect(
+          coding.name,
+          'id 里的 coding 只是通道标识，不是给用户看的名字 —— '
+          + '写进 name 会让用户以为它是 IDE 里 GLM-5.3 之外的另一个模型',
+        ).not.toContain('Coding')
       })
     })
 
@@ -878,6 +961,43 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
     }
 
     it('⚠️ 支持图片的模型：带图请求必须**发出去**（修复前恒抛「仅支持文本」）', async () => {
+      // ⚠️ 2026-10-17 起**四个模型全部支持图片**（实测），故逐个验证。
+      for (const model of ['zai_auto-fast', 'zai_glm-5.3-flash', 'zai_auto', 'zaicoding_glm-5.3']) {
+        const { adapter, calls } = adapterWithImage()
+        let ok = false
+        for await (const _chunk of adapter.stream({
+          provider: 'autoclaw',
+          model,
+          messages: [{ ...imageMessage()[0]!, content: [
+            { type: 'text', text: '看图' },
+            // ⚠️ 形态取自 `openai-compat` 的 `collectImages`（附件引用）。
+            { type: 'image', attachment: { attachmentId: 'a1' } },
+          ] } as never],
+        } as GenerateOptions)) { ok = true }
+        expect(ok, `${model}: 带图请求应当成功跑通`).toBe(true)
+        // ⚠️ 关键断言：**真的发了网络请求**，且请求体里带 data URL。
+        expect(calls.length, `${model}: 应发出请求`).toBeGreaterThan(0)
+        const wire = JSON.stringify(JSON.parse(String(calls[0]!.init?.body)).messages)
+        expect(wire, `${model}: 图片应内联为 data URL`).toContain('data:image/')
+      }
+    })
+
+    it('★★ 四个已知模型都必须声明支持图片（2026-10-17 实测锁死）', async () => {
+      // ⚠️ 这条锁的是**实测结论**，不是远端声明：远端对 zai_auto /
+      //   zaicoding_glm-5.3 只写 input:["text"]，但实测两者都能正确读图
+      //   （答对「数字 7 + 红色横线」双判据）⇒ 远端漏报。
+      //   ⚠️ 我曾经据「远端目录没有 flash」误判它不支持图片，用户反馈 IDE
+      //   里能发图后才复查出 64×64 测试图太小。这条守卫防止再退化回去。
+      const { adapter } = makeMockAdapter()
+      // 反向自检：兜底表非空，否则下面的循环一条都不跑（恒真）。
+      expect(AUTOCLAW.fallbackModels.length).toBe(4)
+      for (const m of AUTOCLAW.fallbackModels) {
+        const resolved = await adapter.resolveModel('autoclaw', m.id)
+        expect(resolved.inputModalities, `${m.id} 应声明支持图片`).toContain('image')
+      }
+    })
+
+    it('⚠️ 保留一条「发请求」的原始断言（防止上面循环被改成永真）', async () => {
       const { adapter, calls } = adapterWithImage()
       let ok = false
       for await (const _chunk of adapter.stream({
@@ -885,7 +1005,6 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
         model: 'zai_auto-fast',
         messages: [{ ...imageMessage()[0]!, content: [
           { type: 'text', text: '看图' },
-          // ⚠️ 形态取自 `openai-compat` 的 `collectImages`（附件引用）。
           { type: 'image', attachment: { attachmentId: 'a1' } },
         ] } as never],
       } as GenerateOptions)) { ok = true }
@@ -897,13 +1016,18 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
       expect(wire, '图片应被内联为 data URL 发往上游').toContain('data:image/png;base64,')
     })
 
-    it('⚠️ 不支持图片的模型：抛 UNSUPPORTED_CONTENT 且**零网络请求**', async () => {
+    it('⚠️ 未知模型带图：抛 UNSUPPORTED_CONTENT 且**零网络请求**', async () => {
+      // ⚠️ 2026-10-17 起**四个已知模型全部支持图片**（实测），所以这个分支
+      //   只能由**未知模型**触发 —— 而「未知按不支持处理」正是本仓库的口径
+      //   （`inputModalitiesOf(undefined)` 给 `['text']`，理由见该函数注释：
+      //   省略 = 未知 = 放行 ⇒ 会静默忽略图片并幻觉）。
+      //   ⇒ 本用例守卫的是「未知模型的保守行为」，仍然有牙。
       const { adapter, calls } = adapterWithImage()
       let caught: unknown
       try {
         for await (const _chunk of adapter.stream({
           provider: 'autoclaw',
-          model: 'zai_glm-5.3-flash',
+          model: 'zai_not_a_real_model',
           messages: [{ ...imageMessage()[0]!, content: [
             { type: 'text', text: '看图' },
             { type: 'image', attachment: { attachmentId: 'a1' } },
@@ -912,7 +1036,7 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
       } catch (error) { caught = error }
       expect(caught).toBeInstanceOf(LlmError)
       expect((caught as LlmError).code).toBe('UNSUPPORTED_CONTENT')
-      // ⚠️ 「零调用」这条才有牙：否则实现可能先发请求再抛。
+      // ⚠️ 「零调用」这条才有牙：否则实现可能先发请求再抛（那用户已经付了钱）。
       expect(calls.length, '拒绝图片时不应发出任何网络请求').toBe(0)
     })
   })

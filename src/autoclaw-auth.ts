@@ -27,6 +27,7 @@ import {
   type StartedAutoclawSmsLoginFlow,
 } from './autoclaw-oauth.js'
 import { RefreshScheduler } from './refresh.js'
+import { claimAutoclawDailyQuota } from './autoclaw-credits.js'
 import { AccountPool } from './account-pool.js'
 import {
   refreshAccountWithReconcile,
@@ -328,6 +329,38 @@ export class AutoclawAuth extends Service {
     if (res.ok && res.credential && refName) {
       const ref = credentialRef(refName)
       await this.ctx.credentials.set(ref, JSON.stringify(res.credential))
+      // ⚠️⚠️ **登录成功后立刻领取每日积分**（2026-10-17，对齐桌面端）。
+      //
+      // 桌面端源码里有 `claimDailyCreditsOnSignIn(account, dailyCredits)`：
+      // 它在账号状态**刚变为 `authenticated`** 时触发
+      // `dailyCredits.claim()`（即 `POST /userapi/v1/user-info`）。
+      // ⇒ 这就是「登录即领」的真实机制：**不是**登录的副作用，
+      //   而是登录后**紧跟一次领取调用**。
+      //
+      // ⚠️ 用户实测过的症状：纯插件登录后新账号**没有积分**（推理回 402
+      //   「积分不足,请充值」），而在 IDE 里登录同一账号就有 ——
+      //   差别正是桌面端替用户调了这一次。
+      //
+      // ⚠️ **失败绝不反噬登录**：领取是附加动作，凭据已经落盘且可用
+      //   ⇒ 这里吞掉一切错误（包括网络异常），只记一条 warn。
+      //   若把领取失败上抛，用户会以为「登录失败」而重新登录，更糟。
+      // ⚠️ 时机：必须在 `credentials.set` **之后** —— 领取要用刚写入的凭据，
+      //   且此时 `resolveCredential` 才读得到。
+      try {
+        const outcome = await claimAutoclawDailyQuota(res.credential, {
+          product: this.product,
+          ...(this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher }),
+        })
+        if (outcome.kind === 'claimed') {
+          this.ctx.logger?.info?.(
+            `[autoclaw] 登录后自动领取每日积分：${outcome.credit > 0 ? `+${outcome.credit}` : '已领取（数量以上游为准）'}`,
+          )
+        }
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          `[autoclaw] 登录后自动领取每日积分失败（不影响登录）：${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
     }
     return res
   }
