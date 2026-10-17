@@ -529,67 +529,53 @@ describe('AStudio Provider Credits & Jet Hub RPC 接线验证', () => {
     return { callRpc, pool, credentialsMap, astudioAuth }
   }
 
-  it('account.create 在无本地会话时自动生成微信扫码登录二维码 loginUrl', async () => {
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify({
-        code: 0,
-        flag: true,
-        data: 'https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=ticket-rpc-test',
-      }),
-    } as Response)
-
+  it('account.create 在无本地会话或明确选 web 时启动 Carrier 载体页服务 (startAstudioLoginFlow)', async () => {
+    const mockFetch = vi.fn()
     const { callRpc } = makeTestRpc(mockFetch)
 
-    const createRes = await callRpc('account.create', { provider: 'astudio' })
+    const createRes = await callRpc('account.create', { provider: 'astudio', astudioLoginMethod: 'web' })
     expect(createRes.ok).toBe(true)
-    expect(createRes.value?.loginUrl).toContain('showqrcode?ticket=ticket-rpc-test')
+    expect(createRes.value?.loginUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/astudio\/login$/)
     expect(createRes.value?.accountId).toMatch(/^astudio-/)
+
+    // 访问 Carrier 载体页返回 200 并包含三合一登录元素
+    const res = await fetch(createRes.value.loginUrl)
+    expect(res.status).toBe(200)
+    const html = await res.text()
+    expect(html).toContain('tab-sms')
+    expect(html).toContain('tab-password')
+    expect(html).toContain('tab-wechat')
   })
 
-  it('login.poll 扫码成功时自动完成绑定并换取凭据落库', async () => {
+  it('Carrier 载体页完成登录后，凭据自动回填持久化并更新账号池', async () => {
     const mockFetch = vi.fn()
-      // 1. qrcode 生成
+      // 1. sms login
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
-        text: async () => JSON.stringify({ code: 0, data: 'https://mp.weixin.qq.com/qrcode' }),
-      } as Response)
-      // 2. poll scan -> scanned
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
+        headers: new Headers({
+          'set-cookie': 'ssoSessionId=sso-carrier-val; Path=/',
+        }),
+        json: async () => ({
+          code: 0,
+          data: { uid: '17488888888', token: 'token-carrier', username: 'CarrierDev' },
+        }),
         text: async () => JSON.stringify({
           code: 0,
-          data: [{ uid: '17499999999', ssoSessionId: 'sso-poll-val', username: 'PollDev' }],
+          data: { uid: '17488888888', token: 'token-carrier', username: 'CarrierDev' },
         }),
       } as Response)
-      // 3. bind session
+      // 2. bot/models/configs (completeAstudioLogin)
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
-        text: async () => JSON.stringify({ code: 0 }),
-      } as Response)
-      // 4. init-app
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        text: async () => JSON.stringify({ code: 0 }),
-      } as Response)
-      // 5. userInfo
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ code: 0, data: { nickname: 'PollDev', mobile: '17499999999' } }),
-      } as Response)
-      // 6. bot/models/configs
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
+        json: async () => ({
+          code: 0,
+          data: [{ model: 'xopglm52', api_key: 'carrier-exchange-token', is_default: true }],
+        }),
         text: async () => JSON.stringify({
           code: 0,
-          data: [{ model: 'xopglm52', api_key: 'poll-exchange-token', is_default: true }],
+          data: [{ model: 'xopglm52', api_key: 'carrier-exchange-token', is_default: true }],
         }),
       } as Response)
 
@@ -597,16 +583,46 @@ describe('AStudio Provider Credits & Jet Hub RPC 接线验证', () => {
 
     const createRes = await callRpc('account.create', { provider: 'astudio' })
     const accountId = createRes.value.accountId
+    const loginUrl = createRes.value.loginUrl
 
+    const urlObj = new URL(loginUrl)
+    const baseUrl = `http://127.0.0.1:${urlObj.port}`
+
+    // 模拟用户在 Carrier 载体页完成短信登录
+    const loginRes = await fetch(`${baseUrl}/astudio/sms/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mobile: '17488888888', verifyCode: '123456' }),
+    })
+    expect(loginRes.status).toBe(200)
+
+    // 等待凭据回填落地
+    await new Promise((resolve) => setTimeout(resolve, 80))
+
+    // 前端轮询 account.exchange / login.poll，此时凭据已落库
     const pollRes = await callRpc('login.poll', { accountId })
     expect(pollRes.ok).toBe(true)
     expect(pollRes.value?.done).toBe(true)
     expect(pollRes.value?.success).toBe(true)
 
-    // 账号在池中已就绪
+    // 账号池已更新对应昵称
     const accountEntry = await pool.findAccount(accountId)
     expect(accountEntry).toBeDefined()
-    expect(accountEntry?.nickname).toBe('PollDev')
+    expect(accountEntry?.nickname).toBe('174******88')
+  })
+
+  it('account.create 在指定 local 登录但无本地会话时返回明确错误并清理占位账号', async () => {
+    const mockFetch = vi.fn()
+    const { callRpc, pool } = makeTestRpc(mockFetch)
+
+    const beforeAccounts = await pool.listAccountsByProvider('astudio')
+    const createRes = await callRpc('account.create', { provider: 'astudio', astudioLoginMethod: 'local' })
+    expect(createRes.ok).toBe(false)
+    expect(createRes.error?.message).toContain('导入本机 AStudio 会话失败')
+
+    // 池中不应新增残留该账号
+    const afterAccounts = await pool.listAccountsByProvider('astudio')
+    expect(afterAccounts).toHaveLength(beforeAccounts.length)
   })
 })
 

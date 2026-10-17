@@ -3931,7 +3931,7 @@ function ProviderPanel({ provider, rpcCall }) {
                 astudioDialog ? '添加 AStudio 账号' : accioDialog ? '添加 Accio 账号' : '添加 ZCode 账号'),
               React.createElement('p', { className: 'dim-jh-zcDialogHint' },
                 astudioDialog
-                  ? '支持导入本机桌面端已登录会话，或在浏览器中打开微信扫码进行网页授权登录。'
+                  ? '支持导入本机桌面端已登录会话，或在浏览器中打开三合一登录页（支持手机短信/账号密码/微信扫码）。'
                   : accioDialog
                     ? 'Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前'
                       + '无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。'
@@ -3950,7 +3950,7 @@ function ProviderPanel({ provider, rpcCall }) {
                       onChange: (event) => setAstudioLoginMethod(event.target.value),
                     },
                       React.createElement('option', { value: 'local' }, '导入本机凭证（读取本地 AStudio 客户端）'),
-                      React.createElement('option', { value: 'web' }, '网页/微信扫码登录（在浏览器中扫码）'))
+                      React.createElement('option', { value: 'web' }, '网页三合一登录（支持手机短信/账号密码/微信扫码）'))
                   : (accioDialog
                       ? React.createElement('select', {
                           className: 'dim-jh-zcSelect',
@@ -3980,7 +3980,7 @@ function ProviderPanel({ provider, rpcCall }) {
                 (astudioDialog
                   ? [
                       { value: 'local', label: '⚡ 一键导入本机桌面端凭据', desc: '需已在 AStudio 桌面端登录，自动读取本地会话' },
-                      { value: 'web', label: '🌐 网页/微信扫码快速登录', desc: '在浏览器中打开微信扫码授权，免依赖桌面端' },
+                      { value: 'web', label: '🌐 网页三合一快捷登录', desc: '在浏览器载体页中登录，支持手机短信/账号密码/微信扫码，免依赖桌面端' },
                     ].map((opt) => {
                       const active = astudioLoginMethod === opt.value;
                       return React.createElement('div', {

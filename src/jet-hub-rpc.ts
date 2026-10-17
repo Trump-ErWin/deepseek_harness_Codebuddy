@@ -85,7 +85,9 @@ import {
   createAstudioWechatQrCode,
   pollAstudioWechatScan,
   bindAstudioWechatSession,
+  startAstudioLoginFlow,
   type AstudioWechatQrCode,
+  type StartedAstudioLoginFlow,
 } from './astudio-oauth.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
@@ -2507,6 +2509,7 @@ function registerJetHubEndpoints(
   }
 
   const pendingAstudioScanState = new Map<string, PendingAstudioScanState>()
+  const pendingAstudioFlowState = new Map<string, StartedAstudioLoginFlow>()
 
   const astudioExchangeInFlight = new Map<
     string,
@@ -2775,6 +2778,11 @@ function registerJetHubEndpoints(
       return recordLoginFailure(accountId, new Error('该账号条目已被删除（可能是你手动删掉了它）'))
     }
     const message = recordLoginFailure(accountId, error)
+    const pendingFlow = pendingAstudioFlowState.get(accountId)
+    if (pendingFlow !== undefined) {
+      pendingAstudioFlowState.delete(accountId)
+      void pendingFlow.close().catch(() => {})
+    }
     void pool.removeAccount(accountId).catch(() => {})
     return message
   }
@@ -4300,24 +4308,52 @@ function registerJetHubEndpoints(
             }
           }
 
-          // 本地无会话：启动微信扫码登录流程，对接 SSOService/wx/scanlogin/qrcode
-          let qr: AstudioWechatQrCode
+          // 本地无会话或选择网页登录：启动 AStudio Carrier 载体页服务（三合一：手机短信/账号密码/微信扫码）
+          let astudioStarted: StartedAstudioLoginFlow
           try {
-            qr = await createAstudioWechatQrCode({
+            astudioStarted = await startAstudioLoginFlow({
+              product: ASTUDIO,
               fetcher: astudio.fetchImpl,
             })
           } catch (error) {
             void pool.removeAccount(id).catch(() => {})
             const reason = error instanceof Error ? error.message : String(error)
-            throw new Error(`无法启动 AStudio 微信扫码登录（获取二维码失败）：${reason}`)
+            throw new Error(`无法启动 AStudio 网页登录（本地 Carrier Server 启动失败）：${reason}`)
           }
 
-          pendingAstudioScanState.set(id, {
-            fd: qr.fd,
-            credentialRef: refName,
-          })
+          pendingAstudioFlowState.set(id, astudioStarted)
 
-          return { ok: true, value: { accountId: id, loginUrl: qr.qrUrl } }
+          astudioStarted.result
+            .then(async (credential) => {
+              pendingAstudioFlowState.delete(id)
+              try {
+                await astudio.persistLogin(credential, { refName })
+              } catch (error) {
+                const failure = await failLogin(id, error instanceof Error ? error : new Error(String(error)))
+                if (failure !== undefined) {
+                  ctx.logger.warn(`[jet-hub] astudio 凭据回填写入凭据库失败已清理占位账号：${failure}`)
+                }
+                return
+              }
+              try {
+                await pool.updateAccount(id, {
+                  nickname: astudioAccountNickname(credential, id),
+                  expiresAt: undefined,
+                  refreshable: isAstudioRefreshable(credential),
+                })
+              } catch (error) {
+                ctx.logger.warn(`[jet-hub] astudio 回填账号条目失败：${String(error)}`)
+              }
+            })
+            .catch(async (error) => {
+              pendingAstudioFlowState.delete(id)
+              const failure = await failLogin(id, error)
+              if (failure !== undefined) {
+                ctx.logger.warn(`[jet-hub] astudio 本地 Carrier 登录流程异常终止：${failure}`)
+              }
+            })
+
+          return { ok: true, value: { accountId: id, loginUrl: astudioStarted.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -4331,6 +4367,11 @@ function registerJetHubEndpoints(
 
       case 'account.delete': {
         const req = payload as RpcDeleteAccountRequest
+        const pendingFlow = pendingAstudioFlowState.get(req.accountId)
+        if (pendingFlow !== undefined) {
+          pendingAstudioFlowState.delete(req.accountId)
+          void pendingFlow.close().catch(() => {})
+        }
         await pool.removeAccount(req.accountId)
         return { ok: true, value: undefined }
       }

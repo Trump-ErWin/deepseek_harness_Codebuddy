@@ -853,6 +853,31 @@ export class AstudioAuth extends Service {
    * 1. 走 completeAstudioLogin 兑换完整推理凭据；
    * 2. 持久化写入凭据库。
    */
+  /**
+   * 将登录凭据回填并持久化写入凭据库（persistLogin）。
+   *
+   * 供 Carrier 载体页（startAstudioLoginFlow）或外部登录流程在拿到完整凭据后统一回填持久化。
+   */
+  async persistLogin(
+    credential: AstudioCredential,
+    options: { refName?: string } = {},
+  ): Promise<AstudioCredential> {
+    const targetRef = options.refName ?? this.credentialRefName
+    const stored = await this.readStoredCredential(targetRef)
+    const merged = mergeAstudioRefreshSeed(credential, stored) ?? credential
+    await this.store.set(
+      credentialRef(this.product.defaultCredentialRef),
+      JSON.stringify(merged),
+    )
+    if (targetRef && targetRef !== this.product.defaultCredentialRef) {
+      await this.store.set(
+        credentialRef(targetRef),
+        JSON.stringify(merged),
+      )
+    }
+    return merged
+  }
+
   async completeLogin(
     account: AstudioWechatAccount,
     refName?: string,
