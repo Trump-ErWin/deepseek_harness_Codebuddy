@@ -655,16 +655,36 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  * 账号级拦截 → 换号 + 写 30 分钟冷却 + 出口文案建议用户**停用该账号** ——
  * 而用户停用后少了账号，整条渠道更不可用。这是 IKM7SG 复验实测到的生产缺陷。
  *
+ * ⚠️⚠️ **排除必须施加到「全部」可能命中渠道校验报文的腿，不止中间那条**（P0，
+ * 2026-10-17 对抗审计证伪）。第一版只给 `/request illegal/i` 那条加了排除，
+ * 于是下面这条仍然认领渠道校验报文：
+ * ```json
+ * {"code":11128,"msg":"request illegal","requestId":"…",
+ *  "displayMsg":{"en":"The content did not pass the safety review. Please retry."}}
+ * ```
+ * ⚠️ **这不是假想形态**：`displayMsg.en` 那句`The content did not pass the
+ * safety review.` 正是**本文件上方**记录的 11140 真报文措辞（zh=「内容未通过安全审核」），
+ * 而 11128 各子原因**共用/漂移 `displayMsg`** 本仓已有先例（见
+ * `tests/unit/buddy-adapter.spec.ts`「内容级风控」组里那条断言）⇒ 上游哪天把
+ * 渠道校验的 `displayMsg` 改成这句，缺陷原样复现。
+ * 实测（审计沙盒 + 本仓自查复现）：该报文三条腿里**命中的是第三条** ⇒ 落 11140 档
+ * ⇒ 写 30 分钟冷却 ⇒ 出口文案「全部账号均被服务端安全策略拦截…请停用被拦账号」。
+ * ⇒ **两条腿都必须排除**（下方实现用一次早退覆盖全部）。真实 11140 报文**仍被
+ * 全部三条腿命中**，未被削弱（审计实测 + 本仓回归用例各锁一遍）。
+ *
  * ⚠️ 排除用的判据**只认结构化报文里 `code` 精确等于 11128 的那种**（理由与
- * 书写变体见 `CHANNEL_VERIFICATION_ILLEGAL_MSG_FIELD` 的注释）；**刻意不复用**
+ * 书写变体见下方 `isChannelVerificationIllegalBody` 的注释）；**刻意不复用**
  * `isChannelVerificationRejection` 整个函数：它还认 `conversation id missing`
  * 与 HTML 裸子串兜底，那两条腿**不该**参与本档的排除（它们与 11140 无歧义，
  * 且一旦在这里排除，将来上游若给 11140 也带上那两句，会凭空多出一条免冷却路径）。
  */
 function isContentRejection(body: string): boolean {
   if (body.length === 0) return false
+  // ⚠️ 先把渠道校验形态摘出来，下面两条腿共用它 —— 「排除一次、两条腿都干净」
+  // 比在每条腿里各写一遍判据更难漂移（少写一处就是本节记的那个 P0）。
+  if (isChannelVerificationIllegalBody(body)) return false
   return /"code"\s*:\s*11140/.test(body)
-    || (/request illegal/i.test(body) && !CHANNEL_VERIFICATION_ILLEGAL_MSG_FIELD.test(body))
+    || /request illegal/i.test(body)
     || /安全审核|safety review/i.test(body)
 }
 
@@ -686,7 +706,7 @@ function isContentRejection(body: string): boolean {
  *
  * ⚠️⚠️ 而 `request illegal` **与 11140 共用**（11140 实测就是这句）⇒ 本档与
  * `isContentRejection` **必须同时**按 `code` 精确值收窄，只改一侧都无效。
- * 详见 `CHANNEL_VERIFICATION_ILLEGAL_MSG_FIELD` 与本文件末尾的变异验证记录。
+ * 详见 `isChannelVerificationIllegalBody` 与本文件末尾的变异验证记录。
  *
  * ## 为什么必须与 `isContentRejection` 分开
  *
@@ -719,6 +739,27 @@ function isContentRejection(body: string): boolean {
  *
  * ⚠️ 原先那句「据 PR 作者的记录（**未独立复核**）」**已更正**：该记录现已被
  * **独立复核**（复核者用本仓库自己的 e2e、只换 `WB_REF` 即复现分叉，见 IKM7SG）。
+ *
+ * ## ⚠️ 逐请求判定这条依据的**边界**（2026-10-17 对抗审计补登记）
+ *
+ * `200→400→200` 来回可切足以排除「**账号封禁**」，但**排除不了**
+ * 「**同一账号 + 同一个 Conv 头值重复使用**时被拒」这类**状态粘性** ——
+ * 实测每轮的 `200→400→200` 里，三枚头都是**新值**，从未复用过同一个值。
+ * ⇒ 本档「不写冷却」的结论**依赖**「每次 `send()` 都 `crypto.randomUUID()` 生成
+ * 新的三头」（见 `send()` 里那三行）。⚠️ **若有人改成会话级复用同一个 Conv 头值**，
+ * 该结论的前提就没了，而症状（每轮 400、换号也无益）**与账号封禁同形** ⇒
+ * 届时应重新评估本档，并补一组「同值连发 N 次」的 e2e 断言。
+ * 本轮**不**补该e2e：它是「上游行为」的未知面，且现状（逐请求换新值）恒不触发。
+ *
+ * ## ⚠️ 单账号 + **不注册 accountPool** + HTTP 400 时，本档**不生效**（既有旧洞）
+ *
+ * `stream()` 的 400 早退分支在**无账号池**时直接抛 `INVALID_REQUEST`
+ * （原始 detail 透传），既不换号也不给本档文案。实测（审计沙盒）：
+ * `INVALID_REQUEST` +「请求被拦截，请重新发送 request illegal」。
+ * ⚠️ **这不是本次修复引入的** —— master 的 `conversation id missing` 同形态**同样**
+ * 如此（那是上游在无池时唯一的文案）；有池时（本插件的正常形态）走换号循环，
+ * 本档生效。故**如实登记、不在本 PR 修**：修它要改的是 400 早退分支的整体口径，
+ * 超出本 PR 范围，且「无池」是插件正常用法之外的形态。
  *
  * ## ⚠️⚠️ 实测依据（**已按 IKM7SG 结清**：差的是**账号**，不是「互相否证」）
  *
@@ -818,13 +859,28 @@ const CHANNEL_VERIFICATION_BARE =
  * 1. `code` 键**存在**（结构化报文），且
  * 2. 其值**精确等于 11128**（不是 11140、不是别的码）。
  *
- * ⚠️ 用 `/11128/` 子串匹配**不够**：`111280` / `11128x` 这类码会误命中，而它们
- * 的处置未知。⇒ 必须写**带右边界**的形式。
+ * ⚠️ 用 `/11128/` 子串匹配**不够**：裸子串会把 `111280` 这类码一起命中，而它们的
+ * 处置未知。⇒ 必须写**带右边界**的形式。
  * ⚠️ 右边界是 `(?![\d.])`、**不是** `(?![0-9])`（2026-10-17 单测实测出的自引入缺陷）：
  * JSON 允许非整数码，`JSON.stringify({code:11128.5})` 写出的是 `11128.5`，
  * 而 `.` 不在 `[0-9]` 里 ⇒ 只挡数字的写法会**放行小数**并误命中。
  * 实测：只挡数字时 `{"code":11128.5,"msg":"request illegal"}` 被判成渠道校验。
- * ⇒ `.` 必须一并挡掉（它也顺带挡掉了 `1.1128e4` 这类科学计数法里的歧义形态）。
+ * ⇒ `.` 必须一并挡掉。
+ * ⚠️⚠️ **残留缺口（如实登记，不声称已挡）**（2026-10-17 常规审计实测）：
+ * 右边界只挡数字与小数点，**挡不住字母后缀与科学计数法**：
+ * | 报文 | 现状 | 说明 |
+ * |---|---|---|
+ * | `{"code":11128x}` | **命中** | `x` 不在 `[\d.]` 里 |
+ * | `{"code":11128e3}` | **命中** | 科学计数法；`e3` 不在 `[\d.]` 里 |
+ * | `{"code":11128e0}` | **命中** | 等价于 `11128` |
+ * | `{"code":111280}` / `{"code":11128.5}` | ✅ 已挡 | |
+ * | `{"code":1.1128e4}` | ✅ 已挡（无 `11128` 字面） | |
+ * ⚠️ 收紧到 `(?![\w.])` 可挡掉这些，但会一并挡掉**合法**的 `11128` 后接引号/逗号
+ * 之类边界 —— 实测 `\w` 已含数字与下划线，故 `(?![\w.])` 与 `(?![\d.])` 在真实报文
+ * 上**等价**，收益仅在字母后缀那几格。⚠️ **当前不收紧**：腾讯侧 `code` 是**业务整数码**
+ * （实测恒为 `11128`/`11140` 五位整数），这些形态**不会从上游出现**；而收紧会
+ * 引入「`code` 后紧跟一个字母标识符」这类**假想报文**上的新差异，收益不足。
+ * ⚠️ 若将来上游真的下发非整数 `code`，本条须重新评估（先看它到底想表达什么）。
  * ⚠️ 也不写 `code` 腿的「存在性」判断就够了：只判「有 code 键」会把
  * `{"code":11140,"msg":"request illegal"}` 一起吃掉 ⇒ 那正是 11140，必须放行。
  *
@@ -840,13 +896,46 @@ const CHANNEL_VERIFICATION_BARE =
  * 后果是整池被白烧 —— 与隔壁 describe 锁死的「别族不换号」直接冲突。
  *
  * ⇒ 判据只锚 `code` + `msg` 两处**都在结构化字段里**，不扫任何提示文案。
+ *
+ * ## ⚠️⚠️ **两个条件必须彼此独立，不许用 `[^{}]*` 串起来**（P1，2026-10-17 对抗审计）
+ *
+ * 初版写成 `/"code"\s*:\s*11128(?![\d.])[^{}]*"m(?:sg|essage)"\s*:…/`
+ * —— 两个条件之间夹了 `[^{}]*`，于是**引入了 JSON 字段顺序依赖**，实测三格漏判：
+ *
+ * | 报文 | 首版 | 现版 |
+ * |---|---|---|
+ * | `{"msg":"request illegal","code":11128}`（`msg` 在前） | ❌ | ✅ |
+ * | `{"code":11128,"displayMsg":{…},"msg":"request illegal"}`（中间夹对象） | ❌ | ✅ |
+ * | `{"code":"11128","msg":"request illegal"}`（`code` 是字符串） | ❌ | ✅ |
+ *
+ * ⚠️ 前两格**不是理论风险**：现网报文的字段顺序恰好是 `code` → `msg` → `displayMsg`
+ * （`msg` 紧跟 `code`），所以当前碰不到；但**JSON 对象键序无任何保证**，网关重排字段、
+ * 或在 `code` 与 `msg` 之间新增一个对象（如把 `displayMsg` 前置）就会**静默漏判** ——
+ * 漏判方向是「回落 11140 档」，即**本次要修的那个缺陷原样复现**。
+ *
+ * ⇒ 改成 `code` 与 `msg` 两条**独立**的前瞻断言（各用一个 `[^\n]{0,N}?` 的有界窗口
+ * 只做「同层级邻近」的兜底，不是串联）：键序变了也各自命中。
+ * ⚠️ 窗口**必须有界**（`{0,200}`）：无界会让「报文里任意位置有 code、任意位置有
+ * msg」也命中 ⇒ `{"code":11140,…前面…,"msg":"… request illegal"}` 这类跨族报文会误判。
  */
-const CHANNEL_VERIFICATION_ILLEGAL_MSG_FIELD =
-  /"code"\s*:\s*11128(?![\d.])[^{}]*"m(?:sg|essage)"\s*:\s*"[^"]*request(?:[\s:_\-\p{Cf}]|\\[nrt])+illegal/iu
+const ILLEGAL_CODE = /"code"\s*:\s*"?11128(?![\d.])/iu
+const ILLEGAL_MSG =
+  /"m(?:sg|essage)"\s*:\s*"[^"]{0,200}?request(?:[\s:_\-\p{Cf}]|\\[nrt])+illegal/iu
+/**
+ * 渠道校验（11128）+ `request illegal` 形态的判定。
+ *
+ * ⚠️ 刻意**不是**单条正则：两个条件**独立**匹配（见上方「不许用 `[^{}]*` 串起来」）。
+ * ⚠️⚠️ 同码不同族时**必须**靠它排除（`isContentRejection` 里两处调用）——
+ * 少一处就是「可用账号被封 30 分钟」那个 P0（2026-10-17 对抗审计证伪）。
+ */
+function isChannelVerificationIllegalBody(body: string): boolean {
+  return ILLEGAL_CODE.test(body) && ILLEGAL_MSG.test(body)
+}
 
 function isChannelVerificationRejection(body: string, status?: number): boolean {
   if (body.length === 0) return false
-  // ⚠️⚠️ 判据有**两条腿，且顺序不可颠倒**（2026-10-16 两轮整改的结果）。
+  // ⚠️⚠️ 判据有**三条腿，且顺序不可颠倒**（腿①② 是 2026-10-16 两轮整改的结果，
+  // 腿③ 是 2026-10-17 为 `request illegal` 形态加的）。
   //
   // ## 腿①（结构化，优先）：必须落在 `msg` / `message` 的**值**里
   //
@@ -914,7 +1003,7 @@ function isChannelVerificationRejection(body: string, status?: number): boolean 
   // ⚠️ 腿① **不受**此闸门约束：它要求 `msg`/`message` 的值位精确命中，是**强证据**
   //（上游确实用它报这个错），出现在任何状态码上都应认。
   if (CHANNEL_VERIFICATION_MSG_FIELD.test(body)) return true
-  if (CHANNEL_VERIFICATION_ILLEGAL_MSG_FIELD.test(body)) return true
+  if (isChannelVerificationIllegalBody(body)) return true
   if (status !== undefined && status !== 400 && status !== 403) return false
   if (/"m(?:sg|essage)"\s*:/.test(body)) return false
   if (/^\s*\{/.test(body) && /"code"\s*:/.test(body)) return false
@@ -3029,7 +3118,7 @@ export class BuddyAdapter extends LlmAdapter {
           }
           // ② 认证类失败：该账号凭据不可用，与路径 A 一致继续换号。
           if (response.status === 401 || response.status === 403) continue
-          // ③ 「渠道校验」拒绝（11128 conversation id missing）：同样按账号生效，
+          // ③ 「渠道校验」拒绝（11128，msg 实测为 `request illegal`）：同样按账号生效，
           //    继续换号。⚠️ **刻意不写账号冷却** —— 写 30 分钟账号级冷却会把
           //    一份「换请求形态就能用」的账号凭空封禁（见
           //    `isChannelVerificationRejection` 的完整理由）。
