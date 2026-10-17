@@ -2,17 +2,21 @@ import { describe, expect, it, vi } from 'vitest'
 import { AUTOCLAW } from '../../src/autoclaw-product.js'
 import {
   AUTOCLAW_DAILY_CLAIM_PATH,
+  AUTOCLAW_LEDGER_MAX_PAGES,
   AUTOCLAW_LEDGERS_PATH,
   AUTOCLAW_WALLETS_PATH,
   claimAutoclawDailyQuota,
   fetchAutoclawBalanceDetailed,
   fetchAutoclawCreditBalance,
+  fetchAutoclawLedgerEntries,
   parseAutoclawLedgerBatches,
   parseAutoclawWallets,
 } from '../../src/autoclaw-credits.js'
 import { createProviderCredits } from '../../src/provider-credits.js'
 import { AutoclawAuth } from '../../src/autoclaw-auth.js'
 import { Context } from '@deepseek-ai/cordis'
+import { DAILY_POOL_NAMES, findDailyPool, splitCreditsByExpiry } from '../../plugin-src/client/credit-expiry.js'
+import { readFileSync } from 'node:fs'
 import type { AutoclawCredential } from '../../src/autoclaw.js'
 
 const MOCK_CREDENTIAL: AutoclawCredential = {
@@ -104,8 +108,11 @@ describe('parseAutoclawWallets', () => {
 
   it('缺失 display_name 时按 public_wallet_type 回退默认中文标签', () => {
     const raw = [
-      { public_wallet_type: 'fuel_pack', balance: 500, priority: 1 },
-      { public_wallet_type: 'daily', balance: 100, priority: 2 },
+      // ⚠️ 夹具必须显式带 `display: true`：现在解析器按官方口径
+      //    `wallet.display === true` **严格**判断，缺字段即不可见
+      //    （本用例考的是 `display_name` 回退，不是 `display`）。
+      { public_wallet_type: 'fuel_pack', display_name: '', balance: 500, display: true, priority: 1 },
+      { public_wallet_type: 'daily', display_name: '', balance: 100, display: true, priority: 2 },
     ]
     const packages = parseAutoclawWallets(raw)
     expect(packages[0]!.name).toBe('加油包积分')
@@ -328,7 +335,15 @@ describe('claimAutoclawDailyQuota', () => {
 })
 
 describe('临期桶：display 过滤与流水批次（2026-10-17 用户要求「像 buddy 一样红临期加倒计时」）', () => {
-  /** 真实取证（scripts/probe-autoclaw-expiry.mjs）：发放带 wallet_expires_at（秒）。 */
+  /**
+   * ⚠️⚠️ **PR 原文声称的取证来源 `scripts/probe-autoclaw-expiry.mjs` 在本仓库不存在**，
+   *   且 `docs/audit/pr111-autoclaw-audit.md` 明确记载钱包接口
+   *   `/agent-assetmgr/api/v2/wallets` 的 `wallets[]` **没有任何时间字段**。
+   *   ⇒ 下面这份夹具是**形状示例**，不是可复核的真机取证，不得当作实测证据。
+   *   ⚠️ 更要紧的是：夹具里 `amount` 是**历史发放额**，而 P0 缺陷正是
+   *   「拿发放额当剩余额」⇒ 用户消耗过积分后批次和必然 ≠ `total_balance`
+   *   ⇒ 用例④ 之所以能守恒，靠的是「这个账号从未消耗过积分」这一偶然条件。
+   */
   const LEDGER_PAGE = {
     code: 0,
     msg: 'SUCCESS',
@@ -363,15 +378,33 @@ describe('临期桶：display 过滤与流水批次（2026-10-17 用户要求「
       total_balance: 20700,
       wallets: [
         { public_wallet_type: 'reward', display_name: '奖励积分', balance: 20700, display: true, priority: 10 },
-        { public_wallet_type: 'daily', display_name: '每日积分', balance: 0, display: false, priority: 20 },
-        { public_wallet_type: 'other', display_name: '其他积分', balance: 0, display: false, priority: 50 },
+        // ⚠️⚠️ **隐藏池余额刻意取非 0（8888）**：这是本用例「有牙」的唯一原因。
+        //   原先夹具里隐藏池余额恰好全是 0 ⇒ 把过滤器换成「按 balance === 0 剔除」
+        //   （一个同样合理、同样让隐藏池不出现在输出里的实现）**依然全绿** ⇒
+        //   该断言对「判据是 display」零判别力。
+        //   余额非 0 时，「按余额过滤」立刻变红 ⇒ 判据被真正钉在 display 上。
+        { public_wallet_type: 'daily', display_name: '每日积分', balance: 8888, display: false, priority: 20 },
+        { public_wallet_type: 'other', display_name: '其他积分', balance: 7777, display: false, priority: 50 },
       ],
     }
     const packages = parseAutoclawWallets(raw.wallets)
-    expect(packages, '官方客户端同款过滤（main.cjs readWallets）').toHaveLength(1)
+    expect(packages, '官方客户端同款过滤（main.cjs readWallets：wallet.display === true）').toHaveLength(1)
     expect(packages[0]!.name).toBe('奖励积分')
-    // ⚠️ 「每日红 + 刷新倒计时」按池名匹配（DAILY_POOL_NAMES），滤掉隐藏池后不再命中。
+    // ⚠️ 隐藏池余额非 0 仍被丢弃 ⇒ 判据是 display，不是余额。
     expect(packages.some((p) => p.name === '每日积分')).toBe(false)
+    expect(packages.some((p) => p.name === '其他积分')).toBe(false)
+  })
+
+  it('①b display 字段**缺失**必须判为不可见（官方是严格 `=== true`）', () => {
+    // ⚠️ 原实现 `typeof cast.display === 'boolean' ? cast.display : true` 在字段缺失时
+    //   fail-open ⇒「每日积分」池原样回归 ⇒ **原报障症状（红色「每日 0」）逐字复现**。
+    const raw = [
+      { public_wallet_type: 'reward', display_name: '奖励积分', balance: 20700, display: true, priority: 10 },
+      { public_wallet_type: 'daily', display_name: '每日积分', balance: 0, priority: 20 },
+    ]
+    const packages = parseAutoclawWallets(raw)
+    expect(packages.map((p) => p.name)).toEqual(['奖励积分'])
+    expect(packages.some((p) => p.name === '每日积分'), '缺字段不得 fail-open').toBe(false)
   })
 
   it('② 流水批次 → 逐包 deductionEndTime（毫秒），已过期批次丢弃，守恒口径', () => {
@@ -431,7 +464,12 @@ describe('临期桶：display 过滤与流水批次（2026-10-17 用户要求「
     expect(bad.balance!.packages[0]!.name).toBe('奖励积分')
   })
 
-  it('⑤ 流水接口失败 ⇒ 回退钱包包（总额与长期数仍正确，只是没有临期桶）', async () => {
+  it('⑤ 流水不可达 ⇒ 回退钱包包，且**真被问过**流水端点（三条失败腿各自独立）', async () => {
+    // ⚠️⚠️ 原用例只断言「packages 长度为 1」—— 而「守恒不成立」同样产出长度 1，
+    //   两条路径**不可区分** ⇒ 该断言对「流水是否真失败」零判别力
+    //   （它唯一有牙的是 `total === 20700`，而那与「守恒」「流水失败」都无关）。
+    //   现拆成三条**可区分**的腿，并额外断言「回退时一个带到期时间的包都没有」
+    //   （防「半批次」漏红档）。
     const walletsPayload = {
       code: 0, msg: 'SUCCESS',
       data: {
@@ -439,15 +477,357 @@ describe('临期桶：display 过滤与流水批次（2026-10-17 用户要求「
         wallets: [{ public_wallet_type: 'reward', display_name: '奖励积分', balance: 20700, display: true, priority: 10 }],
       },
     }
-    const fetcher = vi.fn((url: string | URL) => {
-      const u = String(url)
-      if (u.includes(AUTOCLAW_LEDGERS_PATH)) return jsonResponse({ code: 500, msg: 'boom' })
-      return jsonResponse(walletsPayload)
+    const build = (ledgerResponse: () => unknown) => {
+      const fetcher = vi.fn((url: string | URL) =>
+        String(url).includes(AUTOCLAW_LEDGERS_PATH)
+          ? ledgerResponse()
+          : jsonResponse(walletsPayload),
+      )
+      return fetcher
+    }
+    const assertFallback = async (fetcher: ReturnType<typeof build>, why: string) => {
+      const result = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, {
+        fetcher: fetcher as unknown as typeof fetch,
+      })
+      expect(result.error, why).toBeUndefined()
+      expect(result.balance!.total, why).toBe(20700)
+      expect(result.balance!.packages, why).toHaveLength(1)
+      // ⚠️ 有牙：回退必须是**纯钱包包**（无任何 deductionEndTime），
+      //   否则「半批次」会静默漏出红色临期档。
+      expect(result.balance!.packages.every((p) => p.deductionEndTime === undefined), why).toBe(true)
+      // ⚠️ 有牙：必须**真被问过**流水端点（原用例完全没断言这条链首）。
+      expect(
+        fetcher.mock.calls.some((c) => String(c[0]).includes(AUTOCLAW_LEDGERS_PATH)),
+        `流水端点必须真被请求：${why}`,
+      ).toBe(true)
+    }
+
+    // 腿①：HTTP 200 但业务 code ≠ 0
+    await assertFallback(build(() => jsonResponse({ code: 500, msg: 'boom' })), '腿① 业务失败')
+    // 腿②：HTTP 非 2xx（`if (!resp.ok) return all`）
+    await assertFallback(
+      build(() => ({ ok: false, status: 503, json: async () => ({}), text: async () => '' }) as unknown as Response),
+      '腿② HTTP 失败',
+    )
+    // 腿③：传输异常 / 预算耗尽（fetcher reject）
+    const rejectFetcher = vi.fn((url: string | URL) =>
+      String(url).includes(AUTOCLAW_LEDGERS_PATH)
+        ? Promise.reject(new Error('Connection abort'))
+        : Promise.resolve(jsonResponse(walletsPayload)),
+    )
+    const rejected = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, {
+      fetcher: rejectFetcher as unknown as typeof fetch,
     })
-    const result = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, { fetcher: fetcher as unknown as typeof fetch })
-    expect(result.error).toBeUndefined()
-    expect(result.balance!.total).toBe(20700)
+    expect(rejected.error, '腿③ 网络异常不得让整份余额失败').toBeUndefined()
+    expect(rejected.balance!.total, '腿③ 网络异常').toBe(20700)
+    expect(rejected.balance!.packages.every((p) => p.deductionEndTime === undefined), '腿③ 网络异常').toBe(true)
+  })
+})
+
+/**
+ * ★★ **PR 115 审计守卫**（本仓库两轮独立审计 + inline 变异验证后新增）。
+ *
+ * ## 为什么单独成块
+ *
+ * PR 原有的 5 条用例存在**两类问题**，本块逐条补上「有牙」的写法：
+ * ① 部分断言对被测判据**零判别力**（换成同样合理的另一套实现仍全绿）；
+ * ② 本 PR 引入的新行为**零守卫**（翻页上界、部分页失败、批次包落档…）。
+ *
+ * ⚠️ 本仓库反复踩过的坑：**「用例全绿」不等于「守卫有牙」**。
+ *   每条下方都写明「什么样的变异能让它变红」，无牙的写法一律不写进去。
+ */
+describe('★ PR115 审计守卫：审计发现的七处缺陷逐条钉死', () => {
+  const NOW_MS = 1_798_800_000_000
+  const NOW_SEC = 1_798_800_000
+  /** 距 NOW 7 天后到期的秒（用于构造真正的**临期**批次）。 */
+  const SOON_SEC = NOW_SEC + 7 * 86400
+
+  function jsonResponse(payload: unknown): Response {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => payload,
+      text: async () => JSON.stringify(payload),
+    } as unknown as Response
+  }
+
+  /** 只有一个可见池的钱包载荷。 */
+  function walletsOf(total: number, wallets?: unknown[]): unknown {
+    return {
+      code: 0,
+      msg: 'SUCCESS',
+      data: {
+        total_balance: total,
+        wallets: wallets ?? [
+          { public_wallet_type: 'reward', display_name: '奖励积分', balance: total, display: true, priority: 10 },
+        ],
+      },
+    }
+  }
+
+  // ── P0：amount 是「历史发放额」，不是「剩余额」 ──────────────────────
+  it('P0 消耗过积分后批次和 ≠ 总额 ⇒ 必须回退钱包包（不得输出错误分档）', async () => {
+    // 上游事实：领 20000，之后消耗 19500（走独立 debit 行）。钱包剩 500。
+    // 「拿发放额当剩余额」的实现会算出批次和 20000 ⇒ 若它**恰好**被当守恒通过
+    // （例如被改成无条件采用批次包），就会给用户报「20000 积分，其中 20000 临期」
+    // —— 而真实只剩 500。本用例锁死「必须回退」。
+    const ledger = {
+      code: 0,
+      data: {
+        entries: [
+          { mutation_type: 'credit', amount: 20000, wallet_expires_at: SOON_SEC, description: '登录奖励' },
+          { mutation_type: 'debit', amount: 19500, description: '模型调用' },
+        ],
+      },
+    }
+    const fetcher = vi.fn((url: string | URL) =>
+      String(url).includes(AUTOCLAW_LEDGERS_PATH) ? jsonResponse(ledger) : jsonResponse(walletsOf(500)),
+    )
+    const result = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, {
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+    expect(result.balance!.total).toBe(500)
+    // ⚠️ 守恒不成立 ⇒ 必须回退钱包包，且**不得**出现任何带到期时间的包。
+    expect(result.balance!.packages.every((p) => p.deductionEndTime === undefined)).toBe(true)
+    expect(result.balance!.packages[0]!.remaining).toBe(500)
+  })
+
+  // ── P0 补强：真正的临期批次必须能渲染成红色临期 + 倒计时 ────────────
+  it('P0-b 守恒成立且批次真在窗口内 ⇒ 必落「临期」档并带出倒计时时刻', () => {
+    // ⚠️⚠️ **这是 PR 完全缺失的那条守卫**：原用例只断言 `deductionEndTime`
+    //   被算出来，**从不把它喂给客户端的 `splitCreditsByExpiry`**。
+    //   而 PR 的验收夹具到期时刻距**真实当前** ~76.7 天 ⇒ 落在 15 天窗口外 ⇒
+    //   即便 PR 全绿，实际也只会渲染黄色「长期」，永远不是红色「临期+倒计时」
+    //   —— 而那正是用户诉求本体。
+    const batches = parseAutoclawLedgerBatches(
+      [{ mutation_type: 'credit', amount: 8888, wallet_expires_at: SOON_SEC, description: '7天有效奖励' }],
+      NOW_MS,
+    )
+    expect(batches).toHaveLength(1)
+    expect(batches[0]!.deductionEndTime).toBe(SOON_SEC * 1000)
+
+    // 真正喂给客户端判据（唯一权威的三档分桶实现）。
+    const split = splitCreditsByExpiry(batches, 15, NOW_MS)
+    expect(split).not.toBeNull()
+    expect(split!.expiring, '7 天内到期必须落红色临期桶').toBe(8888)
+    expect(split!.longTerm).toBe(0)
+    expect(split!.permanent).toBe(0)
+    // 倒计时时刻就是这一批的到期时刻。
+    expect(split!.earliestExpiringAt).toBe(SOON_SEC * 1000)
+  })
+
+  it('P0-c 长期批次（超出窗口）必须落「长期」档而不是「临期」', () => {
+    // 守恒口径下的对称格：防止「什么批次都算临期」这种更糙的实现蒙混过关。
+    const batches = parseAutoclawLedgerBatches(
+      [{ mutation_type: 'credit', amount: 8888, wallet_expires_at: NOW_SEC + 90 * 86400, description: '90天' }],
+      NOW_MS,
+    )
+    const split = splitCreditsByExpiry(batches, 15, NOW_MS)
+    expect(split!.expiring).toBe(0)
+    expect(split!.longTerm).toBe(8888)
+    expect(split!.earliestExpiringAt, '长期桶不得产出倒计时').toBeNull()
+  })
+
+  // ── P1：批次包名不得命中「当日池」名单（否则整段三档被短路） ──────────
+  it('P1 批次包名命中当日池名单时被加后缀，绕开 formatPoolSplitLine 的抢先 return', () => {
+    // 客户端链路：usage-badge.js 先算 formatPoolSplitLine，非 null 就**直接返回**，
+    // 根本走不到 splitCreditsByExpiry ⇒ 红色临期 + 倒计时整段消失。
+    for (const name of DAILY_POOL_NAMES) {
+      const batches = parseAutoclawLedgerBatches(
+        [
+          { mutation_type: 'credit', amount: 20000, wallet_expires_at: SOON_SEC, description: '常规奖励' },
+          { mutation_type: 'credit', amount: 200, wallet_expires_at: SOON_SEC + 86400, description: name },
+        ],
+        NOW_MS,
+      )
+      expect(batches.length, `${name} 那一笔必须独立成包`).toBe(2)
+      const hit = batches.find((p) => p.name.includes(name))
+      expect(hit, '该包必须存在').toBeDefined()
+      expect(hit!.name, `批次包名必须与当日池「${name}」区分开`).not.toBe(name)
+      // ⚠️ 决定性断言：整份 packages **不得**被 findDailyPool 命中。
+      expect(findDailyPool(batches), `批次包命中 DAILY_POOL_NAMES（${name}）`).toBeNull()
+      // 且仍能正常落三档（未被短路）。
+      const split = splitCreditsByExpiry(batches, 15, NOW_MS)
+      expect(split!.expiring, '不得因池名被短路掉临期档').toBe(20200)
+    }
+  })
+
+  it('P1-b 宿主侧当日池名单副本与客户端权威定义逐字一致', () => {
+    // ⚠️ 宿主侧 `src/**`（TS）与客户端 `plugin-src/client/**`（JS）**不共享模块图**
+    //   ⇒ 只能各存一份。这条守卫就是那份副本的同步锁：
+    //   改客户端 `DAILY_POOL_NAMES` 而忘了改宿主侧 ⇒ 本条变红。
+    const src = readFileSync(
+      new URL('../../src/autoclaw-credits.ts', import.meta.url),
+      'utf8',
+    )
+    const m = src.match(/DAILY_POOL_NAMES_HOST_COPY[^=]*=\s*\[([^\]]*)\]/)
+    expect(m, '未找到宿主侧 DAILY_POOL_NAMES_HOST_COPY').not.toBeNull()
+    const hostCopy = (m![1].match(/'([^']+)'/g) ?? []).map((s) => s.slice(1, -1))
+    expect(hostCopy, '宿主侧副本必须与客户端 DAILY_POOL_NAMES 逐字相同').toEqual([...DAILY_POOL_NAMES])
+  })
+
+  // ── P1：所有钱包都隐藏时不得凭空造包 ────────────────────────────────
+  it('P1-c 全部钱包 display=false 且 total=0 ⇒ 不得凭空造出「奖励积分」包', async () => {
+    const fetcher = vi.fn((url: string | URL) =>
+      String(url).includes(AUTOCLAW_LEDGERS_PATH)
+        ? jsonResponse({ code: 500 })
+        : jsonResponse(walletsOf(0, [
+            { public_wallet_type: 'daily', display_name: '每日积分', balance: 0, display: false, priority: 20 },
+            { public_wallet_type: 'other', display_name: '其他积分', balance: 0, display: false, priority: 50 },
+          ])),
+    )
+    const result = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, {
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+    expect(result.balance!.total).toBe(0)
+    expect(result.balance!.packages, '零余额不得凭空造包').toHaveLength(0)
+  })
+
+  it('P1-d 全部钱包 display=false 但 total>0 ⇒ 兜底包保留总额信息', async () => {
+    // 有余额却一个可见池都没有：总额读数是对的，兜底包是合理的
+    //（否则合计行会空着）。这两格必须分开判，不能一刀切。
+    const fetcher = vi.fn((url: string | URL) =>
+      String(url).includes(AUTOCLAW_LEDGERS_PATH)
+        ? jsonResponse({ code: 500 })
+        : jsonResponse(walletsOf(9000, [
+            { public_wallet_type: 'daily', display_name: '每日积分', balance: 0, display: false, priority: 20 },
+          ])),
+    )
+    const result = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, {
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+    expect(result.balance!.total).toBe(9000)
     expect(result.balance!.packages).toHaveLength(1)
+    expect(result.balance!.packages[0]!.remaining).toBe(9000)
+  })
+
+  // ── P2：永久桶包名哨兵 ────────────────────────────────────────────
+  it('P2 永久桶按描述分列（首条真名恰为默认名时不得被下一条顶掉）', () => {
+    // 原实现：单一累加器 + `if (permanentLabel === '其他积分') permanentLabel = name`
+    // 哨兵判据退化 ⇒ 第一条真名恰为「其他积分」时哨兵不被替换，被下一条顶掉。
+    const batches = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 100, description: '其他积分' },
+        { mutation_type: 'credit', amount: 700, description: '活动永久赠送' },
+      ],
+      NOW_MS,
+    )
+    expect(batches.length, '两种来源必须分成两包').toBe(2)
+    const byName = Object.fromEntries(batches.map((p) => [p.name, p.remaining]))
+    expect(byName['其他积分'], '第一笔 100 不得被并进第二笔').toBe(100)
+    expect(byName['活动永久赠送']).toBe(700)
+  })
+
+  it('P2-b 同名永久发放仍合并（同来源不该被拆成一堆包）', () => {
+    const batches = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 100, description: '注册奖励' },
+        { mutation_type: 'credit', amount: 50, description: '注册奖励' },
+      ],
+      NOW_MS,
+    )
+    expect(batches).toHaveLength(1)
+    expect(batches[0]!.remaining).toBe(150)
+  })
+
+  // ── P2：负数（冲正/退款）不得并入批次 ───────────────────────────────
+  it('P2-c 负数 amount（冲正/退款）一律丢弃，不得产出负 remaining', () => {
+    const batches = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 1000, wallet_expires_at: SOON_SEC, description: '奖励' },
+        { mutation_type: 'credit', amount: -300, wallet_expires_at: SOON_SEC, description: '冲正' },
+      ],
+      NOW_MS,
+    )
+    expect(batches).toHaveLength(1)
+    expect(batches[0]!.remaining, '负数不得把批次压低').toBe(1000)
+    expect(batches.every((p) => p.remaining > 0), '不得产出 remaining <= 0 的包').toBe(true)
+    // ⚠️ 客户端会静默 skip `remaining <= 0` ⇒ 若放行，合计与总额就悄悄脱钩。
+    const split = splitCreditsByExpiry(batches, 15, NOW_MS)
+    expect(split!.expiring, '客户端侧合计必须与批次和一致').toBe(1000)
+  })
+
+  // ── P2：metadata.description 为空串 ───────────────────────────────
+  it('P2-d metadata.description 为空串时回退到顶层 description（不是通用兜底名）', () => {
+    // `??` 不落空串 ⇒ 原实现会把 name 打成「积分发放」，白白丢掉真实描述。
+    const batches = parseAutoclawLedgerBatches(
+      [
+        {
+          mutation_type: 'credit',
+          amount: 500,
+          metadata: { description: '   ' },
+          description: '真实描述',
+          source: 'campaign',
+        },
+      ],
+      NOW_MS,
+    )
+    expect(batches[0]!.name).toBe('真实描述')
+  })
+
+  // ── P2：翻页上界 + 部分页失败 ─────────────────────────────────────
+  it('P2-e 翻页被钳在 AUTOCLAW_LEDGER_MAX_PAGES 上界内', async () => {
+    // 上游永远返回 next_cursor ⇒ 无界实现会无限翻页。
+    const fetcher = vi.fn(() =>
+      jsonResponse({
+        code: 0,
+        data: {
+          entries: [{ mutation_type: 'credit', amount: 1, wallet_expires_at: SOON_SEC, description: 'x' }],
+          next_cursor: 'more',
+        },
+      }),
+    )
+    await fetchAutoclawLedgerEntries(MOCK_CREDENTIAL, { fetcher: fetcher as unknown as typeof fetch })
+    expect(fetcher).toHaveBeenCalledTimes(AUTOCLAW_LEDGER_MAX_PAGES)
+  })
+
+  it('P2-f 中途某页失败 ⇒ 返回已拿到的部分（不抛错、不吞掉整份余额）', async () => {
+    let calls = 0
+    const fetcher = vi.fn(() => {
+      calls += 1
+      if (calls === 1) {
+        return jsonResponse({
+          code: 0,
+          data: {
+            entries: [{ mutation_type: 'credit', amount: 42, wallet_expires_at: SOON_SEC, description: '第一页' }],
+            next_cursor: 'p2',
+          },
+        })
+      }
+      // 第 2 页 HTTP 500 ⇒ 必须返回已拿到的第 1 页，而不是抛错。
+      return { ok: false, status: 500, json: async () => ({}), text: async () => '' } as unknown as Response
+    })
+    const entries = await fetchAutoclawLedgerEntries(MOCK_CREDENTIAL, {
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.amount).toBe(42)
+  })
+
+  it('P2-g 整段翻页共用一份时间预算（不得每页各自 arm 一次）', async () => {
+    // 原实现每页各 arm 一次 15s ⇒ 钱包 1 + 流水 5 = 最坏 90s，超过徽标 60s 轮询周期。
+    const signals: (AbortSignal | null | undefined)[] = []
+    const fetcher = vi.fn((_url: string | URL, init?: RequestInit) => {
+      signals.push(init?.signal)
+      return jsonResponse({
+        code: 0,
+        data: { entries: [], next_cursor: 'more' },
+      })
+    })
+    await fetchAutoclawLedgerEntries(MOCK_CREDENTIAL, { fetcher: fetcher as unknown as typeof fetch })
+    const real = signals.filter((s): s is AbortSignal => s instanceof AbortSignal)
+    expect(real.length).toBeGreaterThan(1)
+    expect(new Set(real).size, '整段翻页必须共用同一个 signal').toBe(1)
+  })
+
+  // ── P2：total === 0 时不必去拉流水 ─────────────────────────────────
+  it('P2-h 总额为 0 时不请求流水端点', async () => {
+    const fetcher = vi.fn(() => jsonResponse(walletsOf(0)))
+    await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, { fetcher: fetcher as unknown as typeof fetch })
+    expect(
+      fetcher.mock.calls.some((c) => String(c[0]).includes(AUTOCLAW_LEDGERS_PATH)),
+      '零余额时不该发流水请求',
+    ).toBe(false)
   })
 })
 

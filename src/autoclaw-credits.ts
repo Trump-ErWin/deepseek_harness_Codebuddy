@@ -9,12 +9,15 @@
  *    ⚠️ **无任何到期字段**（桌面端 Zod schema `.strict()` 五字段）——
  *    且服务端用 `display` 标记哪些池可展示（官方客户端据此过滤）。
  *
- * 2. 积分流水（只读，**临期桶的数据源**）：
+ * 2. 积分流水（只读，**唯一**的逐批次到期数据源）：
  *    `GET /agent-assetmgr/api/v1/ledgers_std?asset_type=point&wallet_type=all`
- *    每笔发放（`mutation_type === "credit"`）带 `wallet_expires_at`（unix 秒）
- *    —— 该渠道**唯一**的每批次到期数据源。实测 28/28 全带值，且未过期批次
- *    之和 == `total_balance`（守恒，2026-10-17 取证）⇒ 批次包可**替换**钱包包，
- *    客户端按 `deductionEndTime` 分「永久 / 长期 / 临期」三档（buddy / officeace 同构）。
+ *    每笔发放（`mutation_type === "credit"`）带 `wallet_expires_at`（unix 秒）。
+ *    ⚠️⚠️ **但它是「历史发放额」，不是该批次的「当前剩余额」**（见
+ *    `parseAutoclawLedgerBatches` 的说明与对照）⇒ 用户消耗过积分后，
+ *    未过期批次之和 ≠ `total_balance` ⇒ **本渠道的逐批次分档目前无法稳定生效**。
+ *    下游用「批次和 == `total_balance`」当守恒安全网，不守恒就回退钱包包
+ *    （总额与长期数仍正确，只是没有临期档）。**未解决项已如实登记，不得声称
+ *    本渠道已支持按批次分档。**
  *
  * 3. 每日签到领额度（写，幂等判据）：
  *    `POST /userapi/v1/user-info`
@@ -49,6 +52,13 @@ export const AUTOCLAW_CREDIT_UNIT = '积分'
  * ⚠️ **必须有界**：余额徽标每 60 秒轮询一次，无界翻页会把徽标变成无限循环请求。
  * 实测该账号全部发放历史 = 28 条（1 页）。到达上限仍没对平时，走守恒回退
  *（见 `fetchAutoclawBalanceDetailed`）—— 宁可没有临期桶，也不给错数。
+ *
+ * ⚠️⚠️ **单次余额查询的总时间预算**（P2 修正）：翻页是**串行 await** 的，
+ * 原先每页各自 arm 一份 `AUTOCLAW_CREDITS_TIMEOUT_MS`（15s）⇒ 钱包 1 页 +
+ * 流水 5 页的最坏耗时 = **90 秒**，已经**超过徽标 60 秒的轮询周期**
+ * ⇒ 请求叠加，上游一慢就把面板拖住（实测 6 次请求）。
+ * ⇒ 翻页**共用一份总预算**（`AbortSignal.timeout` 只 arm 一次），
+ *   把最坏耗时钉回单次请求的量级；预算耗尽即中止，靠守恒校验回退钱包包。
  */
 export const AUTOCLAW_LEDGER_MAX_PAGES = 5
 
@@ -164,13 +174,19 @@ export function parseAutoclawWallets(walletsRaw: unknown): CreditPackage[] {
       display_name: typeof cast.display_name === 'string' ? cast.display_name : undefined,
       balance: typeof cast.balance === 'number' && Number.isFinite(cast.balance) ? cast.balance : 0,
       balance_view: typeof cast.balance_view === 'string' ? cast.balance_view : undefined,
-      display: typeof cast.display === 'boolean' ? cast.display : true,
+      // ⚠️⚠️ **缺字段必须判为「不可见」**，不是回退成可见（P2 修正）。
+      //   官方桌面端是 `wallet.display === true` 的**严格**判断；
+      //   原写法 `typeof cast.display === 'boolean' ? cast.display : true`
+      //   在字段缺失时 fail-open ⇒ 「每日积分」池原样回归 ⇒ **原报障症状
+      //   （红色「每日 0」）逐字复现**。过滤器的契约是「显式 `false` 才丢」，
+      //   与官方判据必须逐格一致，否则同一份响应在两端得到不同的池集合。
+      display: cast.display === true,
       priority: typeof cast.priority === 'number' && Number.isFinite(cast.priority) ? cast.priority : 100,
     })
   }
 
-  // ⚠️ 服务端 `display === false` = 「不该展示」（官方客户端同款过滤），
-  //    不是「余额为 0」——两者都为假时才回退为 true。
+  // ⚠️ 与上面 `display` 的严格口径配套：只有**显式** `display === false` 才丢
+  //    （`item.display !== false` 在严格归一后已等价于「display 为 true」）。
   const visible = items.filter((item) => item.display !== false)
   visible.sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100))
 
@@ -206,16 +222,51 @@ export interface AutoclawLedgerEntry {
  * 未过期批次之和 == `total_balance`（20700，分毫不差）⇒ 用批次包**替换**
  * 钱包包后，三档分桶（永久 / 长期 / 临期）与 buddy / officeace 同构。
  *
+ * ## ⚠️⚠️ **`amount` 是「发放额」，不是「该批次当前剩余额」**（P0，本仓库审计修正）
+ *
+ * 流水是**历史账变**：一笔 `credit` 记的是「某时刻发放了 N 分」，此后消耗走
+ * 独立的 `debit` 行。**上游没有下发任何「该批次已消耗多少」的字段**
+ * ⇒ 把 `amount` 直接当 `remaining` 求和，得到的是**历史累计发放额**，
+ * 不是钱包里还剩多少。
+ *
+ * 对照 `src/trae-credits.ts` 的同款「条目级到期」问题：那边服务端给的是
+ * `quota.credits_limit`（上限）**与** `usage.credits_amount`（已用），
+ * 折算 `remaining = creditsLimit - used`（`:378`）—— **两腿都在**才算得出剩余。
+ * 本渠道**只有发放那一腿**，按同款写法直接取 `amount` 就是拿上限当剩余。
+ *
+ * ⇒ **用户一旦消耗过积分，批次和就 ≠ `total_balance`**，下方的守恒校验恒不成立
+ * ⇒ 永远回退钱包包 ⇒ **逐批次分档（含临期红 + 倒计时）永不出现**，
+ *   表现为「刚登录那会儿对、用一段时间后静默失效」，且**无报错、无日志**。
+ *
+ * ✅ **当前取舍**：保留守恒校验当**安全网**（不守恒就不用批次包，绝不给错数）。
+ * ⚠️ **未解决项（如实登记，不得当作已完成）**：要做到「消耗后仍能正确分档」，
+ *   必须由上游下发批次剩余（`wallet_remaining` 之类）。在那之前**不能声称
+ *   本渠道已支持按批次分档** —— registry 的 `usesExpiryWindow: true` 只是
+ *   「把 `windowDays` 回传下去」的能力开关，不是数据保证。
+ *
  * ## 分组与字段映射
  *
  * - 只取 `mutation_type === 'credit'`（发放；消费行没有到期语义）；
+ * - ⚠️ **`amount <= 0` 一律丢弃**（不只 `=== 0`，P2 修正）：上游的冲正 /
+ *   退款会下发负数 `credit`，并进批次会让 `remaining` 变负 —— 而客户端
+ *   `splitCreditsByExpiry` 会**静默 skip** `remaining <= 0` 的包
+ *   （`plugin-src/client/credit-expiry.js:99`）⇒ 合计与总额悄悄脱钩，
+ *   且它携带的 `wallet_expires_at` 属于被冲正的那一批；
  * - `wallet_expires_at` 为**秒**级 unix 时间戳 ⇒ 乘 1000 归一成毫秒
  *   （`deductionEndTime` 与 officeace / buddy 同单位）；
+ *   ⚠️ **只认 number**：上游若改下发字符串 / ISO 串，这一格会被判成
+ *   「无到期」⇒ 整批落进永久桶**而守恒仍可能成立** ⇒ 带到期信息的额度
+ *   被渲染成绿色「永久」、临期档静默丢失、零告警（实测缺陷，见下）。
+ *   **不做猜测式归一**（本仓库红线：不编造上游没承诺的格式）；
  * - **无到期字段的发放**（活动赠送的永久分）⇒ 不带 `deductionEndTime`
  *   （= 永久桶，客户端判据对 `undefined` 的约定是「到期未知」）；
  * - **已过期**（`wallet_expires_at <= now`）的批次**直接丢弃**：那批积分
  *   已经不在钱包余额里了（守恒核对实测成立），发出去会凭空多出一笔死数；
- * - 包名取服务端的人话描述（「每日签到」「AutoClaw 用户登录奖励积分，7天有效」）。
+ * - ⚠️ **永久桶按描述分组，不再混成一桶**（P2 修正）：原先只有一个
+ *   `permanent` 累加器 + 一个「取第一条描述当名」的哨兵，而哨兵初值恰好等于
+ *   默认名 `'其他积分'` ⇒ 判据退化成「第一条描述是不是别的名字」——
+ *   **首条真名恰为「其他积分」时哨兵不会被替换，会被下一条顶掉**，
+ *   活动赠送与注册奖励被混为一谈。现按 `label` 分组，各来源各成一包。
  *
  * @param entries - 流水原始条目（一页或多页拼接）。
  * @param nowMs - 当前时刻（毫秒）；测试注入用。
@@ -227,26 +278,31 @@ export function parseAutoclawLedgerBatches(
   if (!Array.isArray(entriesRaw)) return []
   const nowSec = nowMs / 1000
 
-  // 按到期时刻分组（同刻并列 = 同一批）；无到期的单独走永久桶。
+  // 按到期时刻分组（同刻并列 = 同一批）；无到期的按**描述**分别成包。
   const byExpiry = new Map<number, { amount: number; label: string }>()
-  let permanent = 0
-  let permanentLabel = '其他积分'
+  const permanentByLabel = new Map<string, number>()
   for (const raw of entriesRaw) {
     if (!raw || typeof raw !== 'object') continue
     const entry = raw as AutoclawLedgerEntry
     if (entry.mutation_type !== 'credit') continue
     const amount = typeof entry.amount === 'number' && Number.isFinite(entry.amount) ? entry.amount : 0
-    if (amount === 0) continue
-    const label = (typeof entry.metadata === 'object' && entry.metadata !== null
+    // ⚠️ `<= 0` 而非 `=== 0`：冲正 / 退款类负数发放并进批次会让 `remaining`
+    //   变负（客户端 `splitCreditsByExpiry` 静默 skip `<= 0` ⇒ 合计与总额脱钩）。
+    if (amount <= 0) continue
+    // ⚠️ `metadata.description` 可能是**空串**：空串不是 null/undefined，
+    //   `??` 不会落下去 ⇒ name 会退化成通用兜底「积分发放」，
+    //   明明 `description` / `source` 里有可读的名字。空串要当「没有」。
+    const metaDesc = typeof entry.metadata === 'object' && entry.metadata !== null
       ? (entry.metadata as { description?: unknown }).description
-      : undefined) ?? entry.description ?? entry.source ?? '积分发放'
-    const name = typeof label === 'string' && label.trim().length > 0 ? label.trim() : '积分发放'
+      : undefined
+    const candidates = [metaDesc, entry.description, entry.source]
+    const label = candidates.find((v) => typeof v === 'string' && v.trim().length > 0)
+    const name = typeof label === 'string' ? label.trim() : '积分发放'
     const exp = typeof entry.wallet_expires_at === 'number' && Number.isFinite(entry.wallet_expires_at)
       ? entry.wallet_expires_at
       : undefined
     if (exp === undefined || exp <= 0) {
-      permanent += amount
-      if (permanentLabel === '其他积分') permanentLabel = name
+      permanentByLabel.set(name, (permanentByLabel.get(name) ?? 0) + amount)
       continue
     }
     if (exp <= nowSec) continue // 已过期：余额里已经没有这批了，丢弃。
@@ -258,11 +314,51 @@ export function parseAutoclawLedgerBatches(
   const packages: CreditPackage[] = [...byExpiry.entries()]
     .sort((a, b) => a[0] - b[0])
     .map(([expSec, batch]) => ({
-      ...makePackage(batch.label, batch.amount, true),
+      ...makePackage(disambiguateBatchName(batch.label), batch.amount, true),
       deductionEndTime: expSec * 1000,
     }))
-  if (permanent > 0) packages.push(makePackage(permanentLabel, permanent, true))
+  // 永久桶：按描述分列（⚠️ 不再用一个累加器 + 「取第一条名」的哨兵 ——
+  //   那个哨兵与默认名同值，首条真名恰为「其他积分」时会被下一条顶掉）。
+  for (const [label, amount] of permanentByLabel) {
+    packages.push(makePackage(disambiguateBatchName(label), amount, true))
+  }
   return packages
+}
+
+/**
+ * ⚠️ 客户端「当日池」名单（`DAILY_POOL_NAMES`）在**宿主侧**的同名副本。
+ *
+ * 权威定义在 `plugin-src/client/credit-expiry.js:257`
+ * （`export const DAILY_POOL_NAMES = ['每日赠送', '每日积分']`）。
+ * ⚠️ **为什么必须是副本而不是 import**：宿主侧 `src/**` 是 TypeScript、
+ *   客户端 `plugin-src/client/**` 是 esbuild 打包的 JS，两侧**不共享模块图**
+ *   （仓库既有先例：`src/index.ts` 也只在注释里引用客户端的池名）。
+ *   ⇒ 这里必须逐字同步；改客户端那份时**必须**同时改这里。
+ *   ⚠️ 守卫见 `tests/unit/autoclaw-credits.spec.ts` 的「与客户端名单逐字一致」。
+ */
+const DAILY_POOL_NAMES_HOST_COPY: readonly string[] = ['每日赠送', '每日积分']
+
+/**
+ * ⚠️⚠️ 批次包名**不得**命中客户端的「当日池」名单（P1 修正）。
+ *
+ * `plugin-src/client/credit-expiry.js` 的 `findDailyPool` 按
+ * {@link DAILY_POOL_NAMES_HOST_COPY} 做**精确相等**匹配，而
+ * `plugin-src/client/usage-badge.js:1459-1463` 是**先判先 return**：
+ * `formatPoolSplitLine(...)` 非 null 就直接单段返回，**根本走不到**
+ * `splitCreditsByExpiry` 的三档 + 倒计时。
+ *
+ * ⇒ 上游只要下发一条描述为「每日积分」的发放，本渠道就会被误判成
+ * Loomy / Raccoon 那种**当日重置池**，渲染出无色的「长期 X · 每日 Y」，
+ * **恰恰把 PR 想要的红色临期 + 倒计时整段短路掉**，还把批次到期语义说反
+ * （本渠道的每日签到分是发放进余额、按批次到期，不是当日重置）。
+ *
+ * 修法：批次包名命中名单时统一加「（批次）」后缀做区分。选它而不是
+ * 「改客户端名单」的理由：① 名单是**共享**判据，为一个渠道改它会影响其余五家；
+ * ② 名单的语义是「服务端按语义分开的当日池」，本渠道的池是**按到期时刻
+ * 聚合出来的**，两者本就不该共用同一份名字表。
+ */
+function disambiguateBatchName(label: string): string {
+  return DAILY_POOL_NAMES_HOST_COPY.includes(label) ? `${label}（批次）` : label
 }
 
 /**
@@ -323,14 +419,20 @@ export async function fetchAutoclawBalanceDetailed(
         ? data.total_balance
         : 0
 
-    // ⚠️ display=false 的隐藏池在这里已被滤掉（见 parseAutoclawWallets）——
-    //    官方客户端同款行为，红色「每日 0」由此消失。
+    // ⚠️ `display !== true` 的隐藏池在这里已被滤掉（见 `parseAutoclawWallets`）——
+    //    与官方桌面端 `wallet.display === true` 的**严格**判断同口径，
+    //    红色「每日 0」由此消失。
     const walletPackages = parseAutoclawWallets(data?.wallets)
 
-    // ── 临期桶的数据源：流水批次 ──
+    // ── 逐批次到期的数据源：流水 ──
     // 钱包接口没有到期字段；流水的每笔发放带 wallet_expires_at（unix 秒）。
-    // 守恒校验通过才采用批次包（未过期批次之和 == total_balance，实测 20700）；
-    // 不守恒（翻页到顶 / 接口变化）⇒ 回退钱包包 —— 宁可没有临期桶，不给错数。
+    // ⚠️⚠️ **守恒校验是「安全网」，不是「通行证」**（P0 修正，见
+    //   `parseAutoclawLedgerBatches`）：流水的 `amount` 是**历史发放额**，
+    //   不是该批次**剩余额** ⇒ 用户**消耗过积分后**批次和必然 ≠ 总额 ⇒
+    //   这里恒不成立 ⇒ **回退钱包包，逐批次分档（含临期红 + 倒计时）不出现**。
+    //   它只在「从未消耗过积分」这类窄条件下偶然成立。
+    //   不守恒时回退钱包包是对的（宁可没有临期档，也不给错数）——
+    //   但**不得**据此声称本渠道已支持按批次分档。
     let packages = walletPackages
     if (total > 0) {
       try {
@@ -341,12 +443,22 @@ export async function fetchAutoclawBalanceDetailed(
           packages = batches
         }
       } catch {
-        // 流水不可达：静默回退钱包包（临期桶缺失，但总额与长期数仍正确）。
+        // 流水不可达：静默回退钱包包（总额与长期数仍正确，只是没有临期档）。
       }
     }
 
     if (packages.length === 0) {
-      packages = [makePackage('奖励积分', total, true)]
+      // ⚠️⚠️ **兜底造包只在「有余额」时做**（P1 修正）。
+      //   上游把**所有**钱包都标成 `display:false`（或整份 `wallets` 为空）时，
+      //   原先无条件造出 `makePackage('奖励积分', total, true)` ⇒ 凭空多出
+      //   一个「奖励积分」包。
+      //   - `total === 0` ⇒ 造出来的是 `remaining: 0` 的死包，纯噪声，
+      //     还会让下游 `splitBuddyCreditsByExpiry` / `sharedPackageExpiry`
+      //     多走一轮无效遍历；
+      //   - `total > 0` 但一个可见池都没有 ⇒ 余额读数本身是对的，兜底包
+      //     保留「总额可见」这一信息（`packages` 为空会让合计行空着）。
+      //   ⇒ 判据取「有余额才兜底」，两种情形都不再凭空造数。
+      if (total > 0) packages = [makePackage('奖励积分', total, true)]
     }
 
     const balance: CreditBalance = {
@@ -366,9 +478,18 @@ export async function fetchAutoclawBalanceDetailed(
 /**
  * 拉取积分流水的**全部发放条目**（有界翻页）。
  *
- * ⚠️ 只发 GET、只翻到 {@link AUTOCLAW_LEDGER_MAX_PAGES} 页；中途任何一页失败
- * 都把**已拿到的**条目返回（上游守恒校验会兜住不完整的页序列 —— 不完整 ⇒
- * 批次之和不等于钱包总额 ⇒ 回退钱包包，绝不给错数）。
+ * ⚠️ 只发 GET、只翻到 {@link AUTOCLAW_LEDGER_MAX_PAGES} 页，且**整段翻页共用
+ * 一份时间预算**（见该常量注释：原先每页各自 arm 一次 15s，最坏 90s 会
+ * 超过徽标 60s 轮询周期）。中途任何一页失败（HTTP 非 2xx / `code !== 0` /
+ * 传输异常 / 预算耗尽）都把**已拿到的**条目返回。
+ *
+ * ⚠️⚠️ **「守恒校验会兜住不完整」这个说法已被实测证伪**（P0 修正）：
+ * 不完整的页序列**完全可能恰好与 `total_balance` 守恒** —— 例如第 2 页 500
+ * 且第 1 页之和恰好等于总额。此时会**静默采用缺页的批次包**，给出错误分档，
+ * 且没有任何报错。真正的兜底是「守恒成立才用」+「不成立就回退钱包包」，
+ * 它**只能挡住偏大的批次和，挡不住偏小而恰好相等的**。
+ * ⇒ 要真正封死这一条，需要上游提供「本页之后是否还有」的权威信号
+ *   （`has_more` / 总条数），当前**未解决，已如实登记**。
  */
 export async function fetchAutoclawLedgerEntries(
   credential: AutoclawCredential,
@@ -382,6 +503,11 @@ export async function fetchAutoclawLedgerEntries(
   const all: AutoclawLedgerEntry[] = []
   let cursor: string | undefined
 
+  // ⚠️ **整段翻页共用一份时间预算**（P2 修正）：原先每页各自 arm 一次 15s，
+  //   5 页最坏 75s（加上钱包那次共 90s）⇒ 超过徽标 60s 轮询周期，请求叠加。
+  //   只 arm 一次即把最坏耗时钉回单次请求的量级。
+  const deadline = AbortSignal.timeout(AUTOCLAW_CREDITS_TIMEOUT_MS)
+
   for (let page = 0; page < AUTOCLAW_LEDGER_MAX_PAGES; page++) {
     const query = new URLSearchParams({
       asset_type: 'point',
@@ -390,11 +516,19 @@ export async function fetchAutoclawLedgerEntries(
       flow_direction: 'income',
     })
     if (cursor !== undefined) query.set('cursor', cursor)
-    const resp = await fetcher(`${product.apiBase}${AUTOCLAW_LEDGERS_PATH}?${query.toString()}`, {
-      method: 'GET',
-      headers: buildAutoclawCreditsHeaders(product, token),
-      signal: AbortSignal.timeout(AUTOCLAW_CREDITS_TIMEOUT_MS),
-    })
+    let resp: Response
+    try {
+      resp = await fetcher(`${product.apiBase}${AUTOCLAW_LEDGERS_PATH}?${query.toString()}`, {
+        method: 'GET',
+        headers: buildAutoclawCreditsHeaders(product, token),
+        signal: deadline,
+      })
+    } catch {
+      // ⚠️ 超时 / 传输失败走同一条「返回已拿到的部分」的路：上游的守恒校验
+      //   会兜住不完整的页序列（不完整 ⇒ 批次和 ≠ 钱包总额 ⇒ 回退钱包包）。
+      //   直接抛出反而会被 `fetchAutoclawBalanceDetailed` 的 catch 吞成整份失败。
+      return all
+    }
     if (!resp.ok) return all
     const json = (await resp.json()) as {
       code?: number
