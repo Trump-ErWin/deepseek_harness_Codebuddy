@@ -362,7 +362,7 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     // ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 13 → 15。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：15 → 16。
     // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（第 17）：16 → 17。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(16)
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(17)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +

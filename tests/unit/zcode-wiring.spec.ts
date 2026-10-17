@@ -411,7 +411,7 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     // 2026-10-13 加 accio：16 → 17；2026-10-15 加 minimaxintl：17 → 18）。
     // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
     // 上面的具体 id；若将来再加 provider，记得同步这里。
-    expect(ids).toHaveLength(18)
+    expect(ids).toHaveLength(19)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -651,9 +651,9 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     // ⚠️ 2026-10-16 **本 fork** 加 modelscope（魔搭）：18 → 19；
     //    ⚠️ 但 clientProviderIds() 是**客户端图标表**的 id 数，与 registry 口径不同 ——
     //    权威值以断言实测为准，注释里的加减号只是**历史沿革**，不要拿来推当前数字。
-    expect(clientIds.length).toBe(18)
-    // ⚠️ 16 个 auth 键（18 个客户端 id − opencode − aggregate）。
-    expect(keys).toHaveLength(16)
+    expect(clientIds.length).toBe(19)
+    // ⚠️ 17 个 auth 键（19 个客户端 id − opencode − aggregate）。
+    expect(keys).toHaveLength(17)
     const withoutKey = clientIds.filter((id) => !keys.includes(id))
     expect([...withoutKey].sort()).toEqual(['aggregate', 'opencode'])
   })
