@@ -98,6 +98,15 @@ export interface ProviderCallContext {
   readonly warn: (message: string) => void
   /** 账号池（少数实现需要，如 TRAE 的设备指纹代次读写）。 */
   readonly accountPool: AccountPool
+  /**
+   * 本次查询所属的**账号池条目 id**（Gitee issue IKLTZ2 起）。
+   *
+   * ⚠️ **刻意新增**而不是让各家自己按 ref 反查：账号 id 与 `credentialRef`
+   * 之间**没有可逆映射**（ref 由 RPC 随机生成），而「按账号取出口代理」
+   * （Gemini）必须知道 id。空串/未提供 = 「不知道是谁」⇒ 实现应当直连，
+   * **不得**猜一个账号去用它的出口（那是把请求发到错误的出口上）。
+   */
+  readonly accountId?: string
 }
 
 /**

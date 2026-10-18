@@ -19,7 +19,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { openIncognitoWindow } from './login.js'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, asProxyText } from './account-pool.js'
 import { AUTO_PROVIDER as AUTO_PROVIDER_ID } from './auto-adapter.js'
 import { resolveAutoBadgeRewrite, type AutoBadgeState } from './auto-badge.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
@@ -208,6 +208,8 @@ import { pickTestModel,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
+import { geminiFetchForAccount } from './gemini-proxy.js'
+import { handleGeminiRpc } from './gemini-rpc.js'
 import { handleModelscopeRpc } from './modelscope-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
@@ -759,6 +761,7 @@ export interface CreditsEndpointDeps<
   fetchBalanceDetailed?: (
     credential: TCredential,
     product: TProduct,
+    accountId?: string,
   ) => Promise<{ balance: CreditBalance | null; error?: string; extra?: RpcCreditsBalanceExtra }>
   /**
    * 整轮（全部账号）的时间预算（毫秒）。缺省 30 分钟。
@@ -1078,7 +1081,9 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
           const credential = JSON.parse(resolved.value) as TCredential
           if (fetchDetailed !== undefined) {
             // 带原因的查询：实现自己决定「非积分账户」等业务状态的文案。
-            const detailed = await fetchDetailed(credential, product)
+            // ⚠️ `entry.id` 必须透传（Gitee issue IKLTZ2）：Gemini 要按**账号**
+            // 取出口代理，而账号 id 无法由 `credentialRef` 反查。
+            const detailed = await fetchDetailed(credential, product, entry.id)
             balance = detailed.balance
             error = detailed.error
             extra = detailed.extra
@@ -1895,6 +1900,10 @@ trae, cline, loomy, raccoon, minimax,
     //    直接读池、照常生效 ⇒ 症状只出现在积分，极难对应。
     //    惰性读（用户随时可能改设置），不能固化成字符串。
     minimaxXff: () => pool.minimaxXff(),
+    // ⚠️ Gemini 的按账号 fetcher（Gitee issue IKLTZ2）：`credits.balances`
+    // 是**用户点一下就等**的主路径，配了账号代理却不接 ⇒ 积分行恒报
+    // 「配额查询网络失败」，而推理路径却正常 —— 症状割裂、极难对应。
+    geminiFetchFor: (accountId) => geminiFetchForAccount(accountId),
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -3421,6 +3430,12 @@ AUTOCLAW.id,
       const handled = await handleOpencodeRpc(ctx, pool, method, payload)
       if (handled !== undefined) return handled
     }
+    // ⚠️ Gitee issue IKLTZ2：`gemini.*` 走**同样的前缀改道**（理由见上面
+    // opencode 那一段：Jet Hub 只有一条 RPC 通道，主 switch 的 `default` 不让路）。
+    if (method.startsWith('gemini.')) {
+      const handled = await handleGeminiRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 审计 P0 修复）：魔搭与 opencode
     //    同属「不跳浏览器、手工粘贴 API Key」的 provider ⇒ 走各自的前缀改道分支。
     //    ⚠️ 本分支此前**不存在**，而 `handleModelscopeRpc` 已导出却零调用点 ⇒
@@ -4033,7 +4048,48 @@ AUTOCLAW.id,
            * ⚠️ 先登记**占位条目**（无凭据），使前端 `login.poll` 能立即看到
            * 该账号；登录成功后再回填昵称与 `expiresAt`。失败则删除占位条目，
            * 不留幽灵账号（照 MINIMAX.id 分支的已验证形态）。
+           *
+           * ⚠️⚠️ **必须带上客户端传来的代理**（IKLTZ2 审计 P2-1，真实死锁）：
+           * 换 token 那一次请求（下一步）发生在凭据落盘**之前**，此时**只有这条
+           * 占位条目**认得这个账号 ⇒ 代理只能从这里读。不带 ⇒ 墙外环境下
+           * **登录恒失败**，而用户**没法给一个还不存在的账号配代理**（面板的
+           * 「代理」按钮按 `accountId` 打开）⇒ 只能导出 `HTTPS_PROXY` 绕过。
+           * 触发路径很常见：refresh_token 失效的既定动作就是「删号重登」，
+           * 而重登造的是**全新 id** ⇒ 旧号上的代理配置必然丢失。
+           *
+           * ⚠️ 走 `setGeminiProxy` 而不是直接塞字段：那里有「空串删键」与
+           * 形状校验的既有口径，直接塞会绕过它们。
+           * ⚠️ `raw.trim()` 是**防御**（载荷无 schema 校验，见 `accioRegion`
+           * 的同款注释）；不传时 `req.geminiProxy` 是 `undefined` ⇒ 直连。
            */
+          // ⚠️ 走 `setGeminiProxy`（而不是直接往 addAccount 塞字段）：那里有
+          // 「空串删键 + 最新快照合并」的既有口径，直接塞会绕过它们。
+          //
+          // ⚠️⚠️ **代理来源有两级**（IKLTZ2 审计 P2-1 的死锁修复）：
+          // ① 载荷显式带（将来 UI 提供输入时用）；
+          // ② **从同 provider 的已有账号继承** —— 这是当前的实际生效路径，
+          //    因为「refresh_token 失效 ⇒ 删号重登」是面板明示的既定动作
+          //    （见 `plugin-src/client/jet-hub.js`），而重登造的是**全新 id**
+          //    ⇒ 旧号上的代理必然丢失 ⇒ 换 token 那一步恒直连 ⇒ 墙外环境下
+          //    **登录恒失败**；用户又**没法给还不存在的账号配代理**（面板的
+          //    「代理」按钮按 `accountId` 打开）⇒ 死锁。
+          //    继承只在**恰好一个账号带代理**时生效（多账号时无法判断该继承
+          //    哪个，宁可直连也不要猜错出口把凭据发到错误的代理上）。
+          //
+          // ⚠️ `typeof` 与 `trim()` 是**防御**：载荷无 schema 校验
+          // （同 `accioRegion` 的注释）。
+          const existingGeminiProxies = new Set(
+            (await pool.listAccountsByProvider(GEMINI.id))
+              .map((e) => asProxyText(e.geminiProxy))
+              .filter((p) => p.trim() !== ''),
+          )
+          const requestedGeminiProxy = typeof req.geminiProxy === 'string' ? req.geminiProxy.trim() : ''
+          const inheritedGeminiProxy = existingGeminiProxies.size === 1
+            ? [...existingGeminiProxies][0]!
+            : ''
+          const geminiProxyInput = requestedGeminiProxy !== ''
+            ? requestedGeminiProxy
+            : inheritedGeminiProxy
           await pool.addAccount({
             id,
             provider: GEMINI.id,
@@ -4043,10 +4099,15 @@ AUTOCLAW.id,
             refreshable: false,
             createdAt: Date.now(),
           })
+          if (geminiProxyInput !== '') await pool.setGeminiProxy(id, geminiProxyInput)
 
           let geminiStarted: StartedGeminiLoginFlow
           try {
-            geminiStarted = await gemini.startLogin()
+            // ⚠️ **必须传 `accountId`**（Gitee issue IKLTZ2）：换 token 那一次
+            // 请求发生在凭据落盘**之前**，此时只有池里的占位条目认得这个账号 ——
+            // 不传就拿不到它的代理 ⇒ 墙外环境下**登录恒失败**，症状与
+            // 「client_secret / redirect_uri 配错」同形，极易误判。
+            geminiStarted = await gemini.startLogin({ accountId: id })
           } catch (error) {
             // 回调端口占用/网络失败：删掉占位条目，不留幽灵账号。
             void pool.removeAccount(id).catch(() => {})
@@ -5441,13 +5502,19 @@ AUTOCLAW.id,
         }
         // ⚠️ 包一层适配：runtime 的签名是 `(credential, call)`，
         //    `collectCreditBalances` 的入参签名是 `(credential, product)`。
+        // ⚠️ `accountId` 经**逐账号**包装传入（Gitee issue IKLTZ2）：Gemini 要按
+        //    账号取出口代理，故 `callContext` 必须是**每账号一份**而不是端点级
+        //    单例 —— 共享单例会让所有账号都查到「最后一个」账号的代理。
         const values = await collectCreditBalances(accounts, undefined, {
           resolve: (ref) => ctx.credentials.resolve(ref),
           ...impl.fetchBalanceDetailed === undefined
             ? {}
             : {
-                fetchBalanceDetailed: (credential) =>
-                  impl.fetchBalanceDetailed!(credential, callContext),
+                fetchBalanceDetailed: (credential, _product, accountId) =>
+                  impl.fetchBalanceDetailed!(
+                    credential,
+                    accountId === undefined ? callContext : { ...callContext, accountId },
+                  ),
               },
           ...impl.fetchBalance === undefined
             ? {}
