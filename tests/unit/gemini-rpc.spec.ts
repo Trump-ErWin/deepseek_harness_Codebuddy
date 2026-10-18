@@ -249,10 +249,12 @@ async function waitForGone(
   }, `占位账号被清理（${accountId}）`)
 }
 
-/** 剥掉注释：接线断言不该因为「注释里提到了某个符号」而通过。 */
-function stripComments(source: string): string {
-  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
-}
+/**
+ * ⚠️ 实现已迁到 `tests/helpers/strip-comments.ts`（两个 spec 共用一份 ——
+ * IKLZ2 对抗审计实测：不剥注释时，「把接线删掉、只留注释里的字面量」这类
+ * 变异能让判据全绿）。
+ */
+import { stripComments } from '../helpers/strip-comments.js'
 
 describe('Gemini Jet Hub 登录接入', () => {
   it('★ account.create 立刻返回真实 Google 授权 URL，并登记一个不可续期的占位账号', async () => {

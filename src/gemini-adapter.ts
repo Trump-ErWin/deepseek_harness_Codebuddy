@@ -267,6 +267,33 @@ export interface GeminiAdapterOptions {
    */
   fetchFor?: (accountId: string) => typeof fetch
   /**
+   * **显式**指定本适配器代表的账号池条目 id（Gitee issue IKLTZ2 审计 P1-1）。
+   *
+   * ## ⚠️ 为什么必须有它（真实缺陷，独立审计实测）
+   *
+   * 出口代理是**账号维度**的，而「本适配器正在替哪个账号发请求」有两个来源：
+   *
+   * - 主推理路径：有 `accountPool` ⇒ 按 `access_token` 反查（既有逻辑）；
+   * - **探测路径**（账号卡片上的「测试」/「重测」）：`account-probe.ts` **刻意
+   *   不传 `accountPool`**（见其 L213 的注释：探测只测这一个账号、且不写标记）
+   *   ⇒ 反查那一条路**根本不存在** ⇒ `currentAccountId` 恒为 `''`
+   *   ⇒ 解析器按「空 id = 直连」处理 ⇒ **该账号的代理被完全绕过**。
+   *
+   * 症状与 issue 原话同形：墙外环境下「测试 / 重测」**恒失败**，而这个失败
+   * 与「账号已失效」在 UI 上**完全同形** ⇒ 用户会去误删好号。
+   *
+   * ## ⚠️ 为什么是「显式传入」而不是「探测时也传 accountPool」
+   *
+   * 传池会把探测接进换号/写标记的整套编排，而探测的**既定语义**就是不写任何
+   * 东西、只测这一个账号。改 `account-probe.ts` 会破坏那套语义并波及十家适配器。
+   *
+   * ## ⚠️ 为什么**优先于**反查
+   *
+   * 探测时反查恰恰是拿不到的那条路；即便将来有人给探测也挂了池，显式值也是
+   * 更权威的（调用方明确说了「我代表这个账号」）。
+   */
+  accountIdOverride?: string
+  /**
    * 把探测到的项目号回写凭据（跨启动缓存，best-effort）。
    *
    * ⚠️ 只回写**探测到的真值**，不回写兜底串 —— 理由见 `persistGeminiProject`。
@@ -550,8 +577,13 @@ export class GeminiAdapter extends LlmAdapter {
 
     // ⚠️ 起点账号：**局部可变**。不能每次问回调 —— 回调返回的是池的当前
     // 默认账号，换号后不跟着变，会让「换号」变成在两个账号间无限来回。
-    let currentAccountId = ''
-    if (pool !== undefined && credential.access_token !== '') {
+    //
+    // ⚠️ `accountIdOverride` **优先于**反查（IKLTZ2 审计 P1-1）：探测路径
+    // 刻意不挂 `accountPool` ⇒ 反查那条路不存在 ⇒ 没有这个覆盖值时
+    // `currentAccountId` 恒为 `''` ⇒ 账号代理被完全绕过（且症状与
+    // 「账号已失效」同形，用户会去误删好号）。
+    let currentAccountId = this.options.accountIdOverride ?? ''
+    if (currentAccountId === '' && pool !== undefined && credential.access_token !== '') {
       currentAccountId = await pool
         .findAccountIdByCredential(this.product.id, credential.access_token)
         .catch(() => '')
@@ -701,10 +733,12 @@ export class GeminiAdapter extends LlmAdapter {
           // 网络层失败：**如实抛 TRANSPORT**，让 harness 的退避去处理
           // （本适配器不自己重试网络错误 —— 那会与 harness 的退避叠加）。
           if (error instanceof LlmError) throw error
-          // ⚠️ **点名代理**（IKLTZ2 修法 3）：「连不上 Google」与「Google 报错」
-          // 在 TRANSPORT 这一格同形，而前者唯一出路是配代理。不点名的话，用户
-          // 只会看到「请求发送失败 — fetch failed」并以为是网络抖动。
-          const hint = geminiNetworkHint(error, false)
+          // ⚠️ **点名代理**（IKLTZ2 修法 3 / 审计 P2-2）：「连不上 Google」与
+          // 「Google 报错」在 TRANSPORT 这一格同形，而前者唯一出路是配代理。
+          // ⚠️ `aborted` 必须**真读调用方的 signal**（原先恒传字面量 `false`）：
+          // harness 给的 deadline 到期时，报文是 `AbortError`、**不带**
+          // `UND_ERR_*` 码 ⇒ 恒 false 会让「调用方超时」这类墙外症状拿不到提示。
+          const hint = geminiNetworkHint(error, options.signal?.aborted === true)
           throw new LlmError(
             `gemini: 请求发送失败 — ${error instanceof Error ? error.message : String(error)}`
             + (hint === undefined ? '' : `；${hint}`),

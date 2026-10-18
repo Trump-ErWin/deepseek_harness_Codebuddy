@@ -755,6 +755,59 @@ DSH 启动器在**第一个插件加载前**调 `installProxyFromEnvironment`
 两者语义不同：opencode 的代理是「多账号要分份额度」，Gemini 的是「单账号能不能
 连通」。共用一个字段 ⇒ 「清掉 Gemini 的代理」连带清掉 opencode 的出口配置。
 
+### ⚠⚠️⚠️ 代理字段来自**用户可编辑的备份文件** ⇒ 读取侧必须过 `asProxyText`
+
+**实测的真缺陷**（独立于两轮审计，由实现者自查发现）：
+`sanitizeAccounts`（`src/jet-hub-store.ts`）对未知字段用 `{ ...candidate }`
+**原样透传**、**不校验形状**（对照 `modelRateLimits`：那个已由 `isValidResetAtMs`
+加固）。于是手编备份里的 `"geminiProxy": 12345` 会**原样进池**，而
+`normalizeProxy` 第一句是 `input.trim()` ⇒ 抛
+`TypeError: raw.trim is not a function` ⇒ **该账号永久不可用且无自愈**
+（症状与「代理配错了」同形，排障者会去查代理配置，而真因是备份脏数据）。
+
+⚠️ **opencode 同样中招**（`poolEntrySnapshot` 把 `proxy` 原样透传 →
+`buildProxyDispatcher` 读 `proxy.url`）—— 这正是 `src/types.ts` 里 `expiresAt`
+注释记的那句「**补了 A 格、漏了同族 B 格**」的又一次实例。
+
+⇒ 修法 = `asProxyText(value)`（`account-pool.ts` 导出，**两个**读方法共用）：
+只放行字符串，其余（数字/对象/数组/布尔/null/undefined）一律降级为空串（= 直连）。
+⚠️ 刻意**不删键、不改盘**：读侧只保证「不崩、行为确定」，用户仍可在面板里
+重新配一次覆盖掉它。
+⚠️ 守卫必须**两个读方法都断**（只断 `setGeminiProxy` 的函数体是「改了一半」的
+形态 —— 读取侧串成别的字段时写入侧完全看不出来；对抗审计 M21 实测过这条）。
+
+### ⚠⚠️ 诊断函数的 `aborted` 形参一度是**死参数**（恒传字面量 `false`）
+
+`geminiNetworkHint(error, aborted)` 的三处调用点**全传 `false`**，而其中两处
+**恰恰自己 arm 了** `AbortSignal.timeout(GEMINI_OAUTH_TIMEOUT_MS)` ⇒ 墙外连接
+超时（**不带** `UND_ERR_*` 码，正是 IKLTZ2 的主症状）反而拿不到提示。
+
+⚠️ 这是「**写进去却没人读**」的形态，也是本仓库反复记的那类：形参存在、签名正确、
+tsc 全绿，**没有任何机制**提醒它没被真正使用。
+⇒ 三处改为真读 `signal.aborted`；`refreshCredential` 因此多一个 `onSignal`
+回调把 signal 透给 catch（⚠️ **每账号各一个局部量**，共享会让 B 的日志引用
+A 的 signal）。
+
+⚠️ 可推广：**给函数加形参时，「所有调用点都传了值」不等于「那个值有意义」** ——
+要问的是「调用点**为什么**该传这个值」，而不是「它有没有传」。
+
+### ⚠⚠️ 重登 = 新造 id ⇒ 代理配置必然丢失（**死锁**，已修）
+
+「refresh_token 失效 ⇒ 删号重登」是面板明示的既定动作，而 `account.create`
+的 `id` 是**每次新造**的（`jet-hub-rpc.ts` 里**全仓仅此一处**生成）⇒ 旧号上的
+代理配置必然丢。而换 token 那一步恰好发生在**凭据落盘之前**（只有池里的占位条目
+认得这个账号）⇒ 不带代理就**登录恒失败**；用户又**没法给一个还不存在的账号配
+代理**（面板的「代理」按钮按 `accountId` 打开）⇒ **死锁**，唯一出路是导出
+`HTTPS_PROXY`。
+
+⇒ 修法 = 占位条目落地时带代理，两级来源：① 载荷显式带（`RpcCreateAccountRequest
+.geminiProxy`，为将来 UI 提供输入留口）；② **从同 provider 的已有账号继承** ——
+只在**恰好一个**账号带代理时生效（多账号时无法判断该继承哪个，**宁可直连也不要
+猜错出口**把凭据发到错误的代理上）。
+
+⚠️ 全仓 0 处 `account.relogin` ⇒ 「保留 id 原地重登」这条路当时确实不存在
+（审计实测 grep 确认），不是漏搜。
+
 ### ⚠️ 「测试连接」必须打 Google，**不能**打出口 IP 服务
 
 opencode 的测试打 `ip-api.com`（能显示出口 IP 与地区）。Gemini 这里照抄会产生
@@ -771,11 +824,56 @@ opencode 的测试打 `ip-api.com`（能显示出口 IP 与地区）。Gemini �
 `refresh.ts` 原先的正则把它一律归成「1 分钟后重试的瞬时抖动」⇒
 「墙外出不去」被当成抖动 ⇒ **永远静默重试**，面板零线索（issue 原话）。
 
-修法 = `isUnreachableNetworkError` 读 `UND_ERR_CONNECT_TIMEOUT` /
-`UND_ERR_SOCKET` / `EHOSTUNREACH` 等**码**，把间隔从 1 分钟拉到
-`REFRESH_UNREACHABLE_RETRY_MS`（30 分钟）。
-⚠️ **刻意不归终态**（`RefreshTokenExpiredError` 那种停调度）：凭据没坏，
-代理一恢复就该自动复活 ⇒ 停调度会把「临时出不去」固化成「永久失效」。
+⇒ **诊断**侧修法 = `isUnreachableNetworkError`（`src/refresh.ts`）读
+`UND_ERR_CONNECT_TIMEOUT` / `EHOSTUNREACH` 等**码**（不读 message），供
+`geminiNetworkHint` 给出带根因的指路文案。
+
+### ⚠⚠️⚠️ 「拉长重试间隔」那一版已被推翻：它是净损害（两次独立审计）
+
+第一版把 `refresh.ts` 的退避三元链改成三格（新增 `REFRESH_UNREACHABLE_RETRY_MS`
+= 30 分钟）。**两次独立审计各自确认这是错的**，理由是**两条独立**的：
+
+1. **对 gemini 自身零作用**：gemini **不使用** `RefreshScheduler`（全仓 7 处
+   `new RefreshScheduler` 在 buddy / workbuddy / cline / qoder / trae /
+   lobsterai / autoclaw，`gemini-auth.ts` **没有**）。gemini 走账号池 `refreshAll`，
+   由 `MultiAccountRefreshScheduler` 驱动，那里间隔是**固定 30 分钟**、
+   **没有任何错误分类** ⇒ 「1 分钟 → 30 分钟」对 gemini 一行都不生效
+   （它本来就是 30 分钟），commit message 的说法与实现不符。
+2. **误伤另外七个 provider**：它们与墙无关，把一次 DNS 抖动（`ENOTFOUND`，
+   典型临时故障）从 60 秒拉长到 30 分钟，代价是「代理抽风一次，用户 30 分钟
+   不能用」。
+
+⇒ **判据仍有用（诊断），间隔不该动**。若将来 gemini 真要独立退避策略，该加在
+`MultiAccountRefreshScheduler` 上（它目前无错误分类能力），**不能**在
+`RefreshScheduler` 这条**七家共享**的链上动。
+
+⚠️ 方法论可推广：**「给某个 provider 加一条全局策略」时，必须先确认它用的是
+哪条策略链**。gemini 与其余十家走的根本不是同一个调度器 —— 而 commit message
+里那句「1 分钟 → 30 分钟」读起来完全合理，正是因为**没人核对过 gemini 走哪条链**。
+
+### ⚠⚠️⚠️ 探测路径刻意不挂 `accountPool` ⇒ 账号代理在探测上是**空接线**
+
+**真实缺陷**（两轮独立审计各自查出，第一版「已修复」的说法是假的）：
+
+- `account-probe.ts` **刻意不传 `accountPool`**（它的既定语义：只测这一个账号、
+  且**不写**任何标记）⇒ `GeminiAdapter` 内「按 `access_token` 反查账号 id」
+  那条路**根本不存在** ⇒ `currentAccountId` 恒为 `''` ⇒
+- `gemini-proxy.ts` 的解析器按「空 id = 直连」处理 ⇒ **该账号的代理被完全绕过**。
+- 症状与 issue 原话**同形**：墙外环境下「测试 / 重测」**恒失败**，而这个失败与
+  「账号已失效」在 UI 上**完全同形** ⇒ 用户会去**误删好号**。
+
+⇒ 修法 = 给 `GeminiAdapterOptions` 加 `accountIdOverride?: string`（**优先于**
+反查），并让 `probeById.gemini` 的 `createProbeAdapter` **接下第三个形参 `entry`**
+（原先形参只有 `(ref, credential)`，`entry` 被**直接丢弃** —— 对照 opencode 的
+`(ref, credential, entry)`）。
+
+⚠️ **为什么不给探测也挂池**：那会把探测接进换号/写标记的整套编排，而探测的既定
+语义恰恰是「不写任何东西、只测这一个账号」。改 `account-probe.ts` 会破坏那套语义
+并**波及十家适配器**。
+
+⚠️ 这条同时暴露了原守卫的假绿：判据是
+`/gemini: \{[\s\S]{0,600}fetchFor:\s*geminiFetchForAccount/` —— 它只证明**字面量在**，
+不证明**那个 id 是对的**。两次审计实测的「删掉接线、字面量留在注释里」全绿。
 
 ## ⚠⚠️ 客户端**不得**注册 `settings.models.provider-card` 槽（Issue IKJLHQ）
 
