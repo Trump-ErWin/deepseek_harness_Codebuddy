@@ -8,7 +8,7 @@ import {
   shouldRotateMinimaxAccount,
 } from '../../src/minimax-adapter.js'
 import { fallbackToEntry, type MinimaxCredential, type MinimaxModelEntry } from '../../src/minimax.js'
-import { MINIMAX } from '../../src/minimax-product.js'
+import { MINIMAX, MINIMAX_INTL } from '../../src/minimax-product.js'
 
 const [M31, M3, HS, M27] = MINIMAX.fallbackModels.map(fallbackToEntry)
 
@@ -249,6 +249,107 @@ describe('stream', () => {
       })
       await expect(adapter.stream({ model: 'MiniMax-M3', messages: [] } as never).next())
         .rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  /**
+   * ⚠️⚠️ **地理路由不得吞掉 402 的语义**（2026-10-17 自查发现的真实缺陷）。
+   *
+   * 实测反例链路：`307 → 402 insufficient_balance_error`。
+   *
+   * 初版在 `throwCurrent` 里对 `geoRouted` **无条件**改错误码为 `SERVER`
+   * ⇒ 402 的 `QUOTA_EXCEEDED` 被覆盖 ⇒ 用户看到「去填 IP / 走代理」，
+   * 而**「去充值」这个唯一有效动作消失**（他会一直折腾网络）。
+   *
+   * 判据：**错误码**必须仍是 `QUOTA_EXCEEDED`，同时**文案**要能解释地理路由。
+   */
+  it('★★★ 307 → 402 时错误码仍是 QUOTA_EXCEEDED（地理路由不得覆盖余额语义）', async () => {
+    const originalFetch = globalThis.fetch
+    let calls = 0
+    globalThis.fetch = (async () => {
+      calls += 1
+      if (calls === 1) {
+        return new Response(null, {
+          status: 307,
+          headers: { location: 'https://agent.minimaxi.com/mavis/api/v1/llm/v1/messages' },
+        })
+      }
+      return new Response(
+        '{"type":"error","error":{"type":"insufficient_balance_error"}}',
+        { status: 402 },
+      )
+    }) as typeof fetch
+    try {
+      const adapter = new MinimaxAdapter({
+        credentialRef: 'MINIMAXINTL_ACCESS_TOKEN' as never,
+        resolveCredential: async () => ({
+          access_token: 'a'.repeat(60), token_type: 'Bearer',
+        }),
+        refresh: async () => {},
+        fetchRemoteModels: async () => [M31, M3, HS, M27],
+        product: MINIMAX_INTL,
+      })
+      const error = await adapter.stream({ model: 'MiniMax-M3', messages: [] } as never)
+        .next().catch((e: unknown) => e as { code?: string; message?: string })
+      expect(error?.code, '402 必须仍是 QUOTA_EXCEEDED —— 否则用户不知道要去充值')
+        .toBe('QUOTA_EXCEEDED')
+      // 文案仍要解释地理路由（两者共存，不是互相覆盖）
+      expect(error?.message).toContain('X-Forwarded-For')
+      // 且必须带上真实业务错误原文
+      expect(error?.message).toContain('insufficient_balance_error')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  /**
+   * ⚠️⚠️ **地理路由不得用 `SERVER` 码**（自查发现的真缺陷）。
+   *
+   * DSH 的 `dsh-llm/lib/types/retry-policy.js`：
+   * `DEFAULT_RETRYABLE_CODES` 含 `'SERVER'`，`DEFAULT_MAX_RETRIES = 5`
+   * ⇒ `dsh-llm-retry` 会把 `SERVER` **自动重试 5 次**（指数退避 ≈ 15s）。
+   *
+   * 而地理路由是**确定性失败**：出口 IP 不会因重试而变 ⇒ 每次重试都重新选号、
+   * 重新 307、重新 401。用户白等，日志凭空多一串失败请求。
+   *
+   * ⇒ 判据：地理路由的错误码**不得**出现在 DSH 默认可重试集合里，
+   * 且不得是会被文案替换的 `QUOTA` / `AUTH`。
+   */
+  it('★★★ 地理路由的错误码不可重试（SERVER 会被 DSH 自动重试 5 次）', async () => {
+    const originalFetch = globalThis.fetch
+    // 一直 307 → 中国站 → 401（确定性失败，没有 XFF 或 XFF 被忽略）
+    globalThis.fetch = (async (_url: unknown, init?: { redirect?: string }) => {
+      if (init?.redirect === 'manual') {
+        return new Response(null, {
+          status: 307,
+          headers: { location: 'https://agent.minimaxi.com/mavis/api/v1/llm/v1/messages' },
+        })
+      }
+      return new Response('{"error":"invalid access token"}', { status: 401 })
+    }) as typeof fetch
+    try {
+      const adapter = new MinimaxAdapter({
+        credentialRef: 'MINIMAXINTL_ACCESS_TOKEN' as never,
+        resolveCredential: async () => ({
+          access_token: 'a'.repeat(60), token_type: 'Bearer',
+        }),
+        refresh: async () => {},
+        fetchRemoteModels: async () => [M31, M3, HS, M27],
+        product: MINIMAX_INTL,
+      })
+      const error = await adapter.stream({ model: 'MiniMax-M3', messages: [] } as never)
+        .next().catch((e: unknown) => e as { code?: string; message?: string })
+
+      // ★★★ DSH 默认可重试集合（retry-policy.js）：EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT
+      const RETRYABLE = ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']
+      expect(RETRYABLE, `地理路由用了可重试码 ${error?.code} ⇒ 会被自动重试 5 次`)
+        .not.toContain(error?.code)
+      // 也不能是被 harness 替换文案的档（会吞掉唯一指路的说明）
+      expect(['QUOTA', 'AUTH']).not.toContain(error?.code)
+      // 文案仍要给出两条出路
+      expect(error?.message).toContain('X-Forwarded-For')
     } finally {
       globalThis.fetch = originalFetch
     }
@@ -1159,6 +1260,17 @@ describe('MinimaxAdapter 请求级账号轮换（余额耗尽无感切号）', (
 
     expect((error as Error).message).toContain('非 SSE 响应')
     expect((error as Error).message).toContain('request rejected')
-    expect(error).toMatchObject({ code: 'SERVER' })
+    /**
+     * ⚠️ 这条断言原先写的是 `code: 'SERVER'` —— 它只是**顺带记录当时的实现**，
+     * 不是本用例要守的东西（本用例的判据是上面那两条 message 断言：错误形状）。
+     *
+     * 2026-10-17 审计发现 `SERVER` 在 DSH 侧**可重试**
+     *（`DEFAULT_RETRYABLE_CODES` 含 `'SERVER'`，`maxRetries=5`），
+     * 而「网关给了非 SSE 的 200」是**确定性失败** ⇒ 已改为 `INVALID_REQUEST`。
+     * 故这里同步更新为「**不在**可重试集合里」，把它变成一条**有意义的守卫**。
+     */
+    const RETRYABLE = ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']
+    expect(RETRYABLE, '非 SSE 是确定性失败，用可重试码会被自动重试 5 次')
+      .not.toContain((error as { code?: string }).code)
   })
 })

@@ -148,23 +148,23 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(locked).toEqual(['buddy', 'lobsterai', 'loomy', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('usesExpiryWindow 恰好是既有的 5 家（loomy 不在内，它没有窗口概念）', () => {
+  it('usesExpiryWindow 恰好是既有的 6 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17 加入）', () => {
     const win = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
-    expect(win).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`，未过期批次
+    //    之和 == total_balance（守恒实测）⇒ 批次包带 `deductionEndTime` 可分三档。
+    expect(win).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('rateLimit === false 恰好是 7 家（officeace/accio/astudio/autoclaw/modelscope 五种理由）', () => {
+  it('rateLimit === false 恰好是 6 家（astudio 2026-10-18 加入；accio 2026-10-18 退出）', () => {
     const off = PROVIDER_REGISTRY.filter((d) => d.rateLimit === false)
       .map((d) => d.id).sort()
-    // ⚠️ **七家理由分两类**（见 registry 里各自的字段注释）：
+    // ⚠️ **六家理由分两类**（见 registry 里各自的字段注释）：
     // - loomy：根本不返回限流错误（静默降级扣永久积分）；
     // - gemini / officeace：限流是服务端配额窗口制，本地标记与重测都不改变配额；
-    // - accio：**不写 `modelRateLimits` 且不在 `probeById` 里** ⇒
-    //   两个按钮恒为惰性（零请求、零清除）。
-    // - astudio：**与 accio 同判据**（`astudio-adapter.ts` 不写 `modelRateLimits`，
-    //   且不在 `probeById` 里）⇒ 两个按钮同样恒为惰性。
-    // - autoclaw：**与 accio 同族**（刻意不做请求级换号 + 冷却，不进 `probeById`）。
+    // - astudio（**本 fork**）：**不写 `modelRateLimits` 且不在 `probeById` 里**
+    //   （`astudio-adapter.ts` 同款）⇒ 两个按钮恒为惰性（零请求、零清除）。
+    // - autoclaw：**与 astudio 同族**（刻意不做请求级换号 + 冷却，不进 `probeById`）。
     // - modelscope（**本 fork**，2026-10-17 用户要求）：**能力齐全但刻意关入口** ——
     //   它确实会写 `modelRateLimits`、也确实注入了 `markLimited`。
     //   ⚠️ 与前几家**不同源**：代价是「冷却标记仍写进池，但用户没法用按钮清除」
@@ -172,11 +172,21 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     //   ⚠️ 它在 `credits-capabilities.spec.ts` 的 `RATE_LIMIT_OFF_BY_CHOICE`
     //   里有独立登记（那张表专门区分「产品取舍」与「语义管辖不到」两类）。
     //
+    // ⚠️⚠️ **accio 曾在这张表里，2026-10-18 因 issue IKM3ZV 退出**（7 家 → 6 家）：
+    //   当时它的理由是「不写 `modelRateLimits` 且不在 `probeById` 里 ⇒ 按钮恒惰性」。
+    //   接上请求级换号 + 冷却（`accio-adapter.ts` 的 `markCurrentAccount`，
+    //   额度至 UTC+8 当日 24:00 / 限流 1h）后，① 真的写标记了、② `probeById`
+    //   也登记了 ⇒ 那个理由**已不成立**，`rateLimit: true` 是**实打实可用**的入口
+    //   （与 modelscope 的「能力齐全但刻意关」相反）。
+    //   ⚠️ **三处必须同改**（registry 本行 / `src/index.ts` 的 `probeById` /
+    //   `tests/helpers/provider-sets.ts` 的 `WRITES_RATE_LIMIT_PROVIDERS`），
+    //   由 `provider-runtime-wiring.spec.ts` 双向比对锁死 —— 本表是**第四道**闸。
+    //
     // 新增一家时**不要**只改这里：判据是 registry 的落地问法
     //「这个按钮点下去，能不能让用户少受限一次？」——
     // ⚠️ 而 modelscope 打破的正是这条问法的前提（它**能**，只是不要）。
     //    ⇒ 所以「能」不再是必要条件，「用户是否要这个按钮」才是。
-    expect(off).toEqual(['accio', 'astudio', 'autoclaw', 'gemini', 'loomy', 'modelscope', 'officeace'])
+    expect(off).toEqual(['astudio', 'autoclaw', 'gemini', 'loomy', 'modelscope', 'officeace'])
   })
 
   it('accountTest === true 恰好是 gemini', () => {
@@ -184,10 +194,10 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(t).toEqual(['gemini'])
   })
 
-  it('creditPackages 恰好是既有的 7 家（officeace 2026-10-12 加入）', () => {
+  it('creditPackages 恰好是既有的 8 家（officeace 2026-10-12、autoclaw 2026-10-17 加入）', () => {
     const p = PROVIDER_REGISTRY.filter((d) => d.creditPackages === true)
       .map((d) => d.id).sort()
-    expect(p).toEqual(['buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy'])
+    expect(p).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy'])
   })
 
   it('autoCheckinExcluded 恰好是 zcode', () => {

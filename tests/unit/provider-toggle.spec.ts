@@ -263,6 +263,27 @@ describe('供应商开关的接线（源码级回归）', () => {
   })
 
   /**
+   * ⚠️ **按钮顺序：新建账号必须排在「国际站分流」之前**
+   * （2026-10-17 用户要求「minimax国际版的新建账号放在国际站分流之前」）。
+   *
+   * 理由：新建账号是**主操作**，分流设置是**排障用的次要入口**。
+   * 次要项排在主操作前面，会让用户先看到「分流设置」而不是「怎么加账号」。
+   *
+   * ⚠️ 判据用**位置先后**而不是「字符串包含」——后者对顺序完全不敏感，
+   * 把两个按钮调换位置它照样绿（本仓库记过「源码级断言必须锚定片段」）。
+   */
+  it('★★ minimaxintl 面板里「+ 新建账号」排在「国际站分流设置」之前', () => {
+    const newAccountAt = source.indexOf("'+ 新建账号'")
+    const xffAt = source.indexOf("'国际站分流设置'")
+    expect(newAccountAt, '找不到「+ 新建账号」的渲染点').toBeGreaterThan(-1)
+    expect(xffAt, '找不到「国际站分流设置」的渲染点').toBeGreaterThan(-1)
+    expect(
+      newAccountAt,
+      '「+ 新建账号」必须排在「国际站分流设置」之前（主操作在前、排障入口在后）',
+    ).toBeLessThan(xffAt)
+  })
+
+  /**
    * ⚠️ 这条锁的是本次改动的**核心要求**：开关不得再挂在左侧供应商行尾。
    * 它曾与「选择要看哪个供应商」这个高频无害动作挤在同一行 —— 一个破坏性批量
    * 操作挂在导航栏上，既容易误点，也让窄栏长出了控件。
@@ -456,6 +477,68 @@ describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () =>
       const open = [P('a'), P('b'), P('c')]
       sortOpenProvidersByOrder(open, ['c', 'a'])
       expect(open.map(p => p.id)).toEqual(['a', 'b', 'c'])
+    })
+
+    /**
+     * ⚠️⚠️ **新增 provider 不能被缀到末尾**（真实缺陷，2026-10-17 用户报障
+     * 「minimax 国际版的顺序应该在中国版下面」）。
+     *
+     * `providerOrder` 是用户拖拽时快照的**全量 id 数组**；插件后来新增 provider
+     * 时老用户的数组里没有新 id ⇒ 新 provider 一直排在末位，而它在注册表里的
+     * 声明位置可能紧挨着某个相关项。老用户**不重新拖一次就永远好不了**。
+     *
+     * 实测本机 `state.json`：那份顺序缺 6 个新增 provider
+     *（`minimaxintl` / `officeace` / `accio` / `autoclaw` / `modelscope` / `aggregate`）。
+     */
+    it('★★ 传声明序时，缺失的新增 provider 落回「声明位置」而不是缀尾', () => {
+      // 声明序：… a, b, NEW, c, d …
+      const declared = ['a', 'b', 'new', 'c', 'd']
+      const open = declared.map(P)
+      // 老用户的顺序表里**没有** 'new'
+      const order = ['a', 'b', 'c', 'd']
+      expect(sortOpenProvidersByOrder(open, order, declared).map(p => p.id))
+        .toEqual(['a', 'b', 'new', 'c', 'd'])
+    })
+
+    it('★★ minimaxintl 必须紧跟 minimax（用户报障的具体形态）', () => {
+      const declared = ['codearts', 'minimax', 'minimaxintl', 'zcode', 'gemini']
+      const open = declared.map(P)
+      // 真实形态：老顺序表里有 minimax，但**没有** minimaxintl
+      const order = ['codearts', 'minimax', 'zcode', 'gemini']
+      const got = sortOpenProvidersByOrder(open, order, declared).map(p => p.id)
+      expect(got, 'minimaxintl 被缀到末尾了').toEqual([
+        'codearts', 'minimax', 'minimaxintl', 'zcode', 'gemini',
+      ])
+      expect(got.indexOf('minimaxintl')).toBe(got.indexOf('minimax') + 1)
+    })
+
+    it('★ 声明在最前的缺失项排到最前（锚点为 null 的分支）', () => {
+      const declared = ['new', 'a', 'b']
+      const open = declared.map(P)
+      expect(sortOpenProvidersByOrder(open, ['a', 'b'], declared).map(p => p.id))
+        .toEqual(['new', 'a', 'b'])
+    })
+
+    it('★ 连续多个缺失项保持声明相对顺序', () => {
+      const declared = ['a', 'x', 'y', 'z', 'b']
+      const open = declared.map(P)
+      expect(sortOpenProvidersByOrder(open, ['a', 'b'], declared).map(p => p.id))
+        .toEqual(['a', 'x', 'y', 'z', 'b'])
+    })
+
+    it('★ 未传声明序时退化为旧行为（缺失项缀尾，保持向后兼容）', () => {
+      const open = [P('a'), P('b'), P('c'), P('d')]
+      // 与第一条例同口径：不传第三参 ⇒ 未列出的按传入顺序补后
+      expect(sortOpenProvidersByOrder(open, ['a', 'b']).map(p => p.id))
+        .toEqual(['a', 'b', 'c', 'd'])
+    })
+
+    it('★★ 用户已自定义的相对顺序**不允许**被声明序覆盖', () => {
+      // 用户把 d 拖到了 a 前面 —— 声明序里 d 在后，但必须尊重用户。
+      const declared = ['a', 'b', 'c', 'd']
+      const open = declared.map(P)
+      expect(sortOpenProvidersByOrder(open, ['d', 'a', 'b', 'c'], declared).map(p => p.id))
+        .toEqual(['d', 'a', 'b', 'c'])
     })
   })
 
@@ -715,9 +798,22 @@ describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () =>
     it('主页 rail 的已打开组按 providerOrder 排序（closed 组恒声明序沉底）', () => {
       // ⚠️ renderRail 在 JetHubPage 里（ProviderSwitchPanel 之后），panelBody()
       // 的结束锚切不到它 —— 用整份 source 断言。
-      expect(source).toContain('sortOpenProvidersByOrder(open, providerOrder)')
+      //
+      // ⚠️ 2026-10-17：调用点**多传了第三个实参**（声明顺序），用于把
+      // `providerOrder` 里缺失的新增 provider 补回声明位置
+      //（否则 `minimaxintl` 会被缀到末尾）。故判据不能写死旧的两参形态 ——
+      // 用正则在「已打开组」那段里找调用，允许任意实参列表。
+      expect(source).toMatch(/sortOpenProvidersByOrder\(\s*open,\s*providerOrder\b/)
       // 关闭组不参与自定义排序（用户口径：「这个逻辑不变」）。
       expect(source).toContain("group(`已关闭 (${closed.length})`, closed, 'closed')")
+      /**
+       * ⚠️ **第三个实参必须真的传**（否则修复静默失效）：
+       * `sortOpenProvidersByOrder` 在缺省第三参时会退化为「缺失项缀尾」的旧行为 ——
+       * 那正是用户报障的形态。这条断言是本修复的**唯一源码级闸门**。
+       */
+      expect(source).toMatch(
+        /sortOpenProvidersByOrder\(\s*open,\s*providerOrder,\s*PROVIDERS\.map\(p => p\.id\)/,
+      )
     })
 
     it('默认选中卡片 = 自定义序第一位（providerTouchedRef 一次性纠偏）', () => {

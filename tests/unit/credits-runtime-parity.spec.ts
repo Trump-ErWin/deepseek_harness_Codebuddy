@@ -410,11 +410,13 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
   })
 
   it('usesExpiryWindow 的登记值与「按到期时间分桶」的实测集合一致', () => {
-    // 这四家是余额里带逐包到期时间、走 splitBuddyCreditsByExpiry 的渠道。
+    // 这些是余额里带逐包到期时间、走按到期分桶的渠道。
     // 写死它是**有意**的：若有人改 registry，这条会红并要求他复核，
     // 而不是让 windowDays 静默地多出/少掉一家。
+    // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`（唯一到期
+    //    数据源，真机取证 28/28 带值且守恒），批次包归一化到 `deductionEndTime`。
     const withWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true).map((d) => d.id).sort()
-    expect(withWindow).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    expect(withWindow).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 })
 

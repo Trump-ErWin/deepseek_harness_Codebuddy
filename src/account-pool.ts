@@ -2,7 +2,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
-import { createJetHubStore, clearRejectionLayer, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateAllowed, sanitizeAggregateOrder, sanitizeAggregateOrderMode, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizePermanentLocks, withAllowed, withoutAllowed } from './jet-hub-store.js'
+import { createJetHubStore, clearRejectionLayer, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateAllowed, sanitizeAggregateOrder, sanitizeAggregateOrderMode, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizeMinimaxXff, sanitizePermanentLocks, withAllowed, withoutAllowed } from './jet-hub-store.js'
 import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PermanentLockMap } from './jet-hub-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
 import type { PermanentLockStore } from './permanent-lock-store.js'
@@ -224,6 +224,41 @@ export function sinkAccountToProviderEnd(
  * `ctx.settings` 不再允许插件注册 namespace，故改用插件自有状态文档；
  * 两者都不可用时退化为内存态，保证不抛错。
  */
+/**
+ * 把池里的代理字段读成**字符串**（**读取侧的唯一收口**）。
+ *
+ * ## ⚠️ 为什么必须有它（实测的真缺陷，独立于 IKLTZ2 审计发现）
+ *
+ * `opencodeProxy` / `geminiProxy` 都来自**用户可编辑的备份文件**，而
+ * `sanitizeAccounts`（`src/jet-hub-store.ts`）用 `{ ...candidate }` 原样透传、
+ * **不校验这两个字段的形状**（对照 `modelRateLimits`：那个已由 `isValidResetAtMs`
+ * 加固）。于是池里可能存在 `"geminiProxy": 12345`。
+ *
+ * 下游 `normalizeProxy`（`src/opencode.ts`）第一句就是 `input.trim()` ⇒
+ * 非字符串会在那里抛 `TypeError: raw.trim is not a function`：
+ *
+ * - 该账号**永久不可用**（每次请求都抛，且没有自愈路径）；
+ * - 症状与「代理配错了」同形，排障者会去看代理配置，而真因是备份里的脏数据。
+ *
+ * 实测（本机，IKLTZ2 修复期间）：`sanitizeAccounts` 原样透传 `12345`，
+ * 解析器随即抛 `raw.trim is not a function`。
+ *
+ * ## ⚠️ 为什么「读侧兜底」而不是「写侧过滤」
+ *
+ * 写侧过滤（`sanitizeAccounts` 里丢弃非法值）更彻底，但它是**全仓共享**的清洗
+ * 函数，改动会影响十家 provider 的条目落库形态。本函数是**代理专属**的收口，
+ * 影响面精确到两个读方法。
+ *
+ * ⚠️ **刻意不删键、不改盘**：读侧只保证「不崩、行为确定」—— 脏值视为「未配置」
+ * （= 直连）是最保守的降级，用户仍可在面板里重新配一次把它覆盖掉。
+ *
+ * @param value 池字段原始值（可能是任意 JSON 值）。
+ * @returns 字符串原值；非字符串（含 `undefined` / 数字 / 对象 / 数组）一律回退空串。
+ */
+export function asProxyText(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
 export class AccountPool {
   /** 持久化后端；两个后端都不可用时是仅内存实现。 */
   private readonly store: JetHubStore
@@ -316,6 +351,20 @@ export class AccountPool {
    * 数组语义见 `jet-hub-store.ts` 的 `JetHubState.providerOrder`。
    */
   private providerOrderCache: string[] = []
+  /**
+   * MiniMax **国际站**绕过分流用的 `X-Forwarded-For` 值（进程内副本）。
+   *
+   * 语义与校验见 `jet-hub-store.ts` 的 `JetHubState.minimaxXff` 与
+   * `sanitizeMinimaxXff`（**同一份判据**，本文件不另写一份）。
+   *
+   * ⚠️ `undefined` / 空串 = **不附头**（行为与修复前逐字节一致）。这是刻意的
+   * 缺省：附 `X-Forwarded-For` 等于声明一个并非本机的来源 IP，不能是默认行为。
+   *
+   * ⚠️ 与 {@link providerOrderCache} 同级、**可以**住在这里：丢失本键的唯一后果
+   * 是国际站用户重新遇到 307（可逆，重填一次即可）。但它**必须**被带进
+   * `queueStoreSave` 的整体写入（否则「任何一次改账号都会静默清掉它」）。
+   */
+  private minimaxXffCache: string | undefined
   /**
    * ★ **由折算观测写下的** `modelRateLimits` 标记集合（键 = `accountId\u0000modelId`）。
    *
@@ -410,6 +459,9 @@ export class AccountPool {
       this.nativeWebSearchCache = state.nativeWebSearchEnabled !== false
       // 供应商顺序同理：老文档没有该键 → 空数组（未自定义）。
       this.providerOrderCache = state.providerOrder ?? []
+      // MiniMax 国际站 XFF 同理：老文档没有该键 → `undefined`（不附头，
+      // 与修复前行为逐字节一致）。**过一遍 sanitize**：老文档里可能有脏值。
+      this.minimaxXffCache = sanitizeMinimaxXff(state.minimaxXff)
     }
     this.loadLocks(state)
   }
@@ -502,6 +554,11 @@ export class AccountPool {
         gatewayEnabled: this.gatewayEnabledCache,
         nativeWebSearchEnabled: this.nativeWebSearchCache,
         providerOrder: this.providerOrderCache,
+        // ⚠️ **必须带上本键**（同 `nativeWebSearchEnabled` 的坑）：
+        //    `write` 是整体替换语义 ⇒ 漏键会让用户设的 XFF 在**任何**一次
+        //    改账号 / 改黑名单 / 改网关 / 拖顺序时被静默清掉，
+        //    症状是「国际站明明设好了 XFF，过一阵又开始 307」。
+        minimaxXff: this.minimaxXffCache,
       })
     })
     this.storeChain = next.catch(() => {})
@@ -923,6 +980,41 @@ export class AccountPool {
     this.loaded = true
     if (this.store.kind === 'memory') {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，供应商顺序仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
+  }
+
+  /**
+   * 当前设置的 MiniMax 国际站 `X-Forwarded-For` 值；`undefined` = 不附头。
+   *
+   * ⚠️ 请求侧（`minimax.ts` 的 `minimaxHeadersFor`）**必须每次现读**，不能缓存：
+   * 用户随时可能在面板里改这个设置。
+   */
+  minimaxXff(): string | undefined {
+    this.ensureLoaded()
+    return this.minimaxXffCache
+  }
+
+  /**
+   * 设置（或清除）MiniMax 国际站的 `X-Forwarded-For` 并落盘。
+   *
+   * 传空串 / `undefined` = **清除**（不附头）。校验由 `sanitizeMinimaxXff` 统一做：
+   * 非法值（主机名、XFF 链、含换行等）**不会**被写进缓存 —— 于是「填了个坏值」
+   * 与「没填」等价，不会让请求带上一个可能触发头注入的串。
+   *
+   * ⚠️ 非法值**静默归一为 `undefined`** 而不是抛错：本设置是可选逃生口，
+   * 用户输错一个字符就报错阻断保存只会更糟。但 RPC 层会把**归一后的实际值**
+   * 回给客户端，UI 照它渲染，用户能立刻看出「没生效」。
+   */
+  async setMinimaxXff(value: string | undefined): Promise<void> {
+    this.ensureLoaded()
+    const next = sanitizeMinimaxXff(value)
+    if (this.minimaxXffCache === next) return
+    this.minimaxXffCache = next
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，MiniMax XFF 设置仅本次会话有效')
       return
     }
     await this.queueStoreSave()
@@ -2233,8 +2325,7 @@ export class AccountPool {
    *
    * 与 `updateModelRateLimit` 同款：在**最新快照**上做局部合并后整体写回，
    * 避免与并发的账号操作互相覆盖。
-   */
-  async setOpencodeProxy(accountId: string, proxy: string): Promise<void> {
+   */  async setOpencodeProxy(accountId: string, proxy: string): Promise<void> {
     const accounts = this.readAccounts()
     const idx = accounts.findIndex(a => a.id === accountId)
     if (idx === -1) {
@@ -2257,7 +2348,52 @@ export class AccountPool {
   /** 读取某 opencode 账号的代理（未设置时为空串）。 */
   opencodeProxyFor(accountId: string): string {
     const entry = this.readAccounts().find(a => a.id === accountId)
-    return entry?.opencodeProxy ?? ''
+    return asProxyText(entry?.opencodeProxy)
+  }
+
+  /**
+   * 设置/清除某 **gemini** 账号的出口代理（Gitee issue IKLTZ2）。
+   *
+   * ⚠️ **刻意与 `setOpencodeProxy` 分开成两份实现**，理由与字段同款：两者的
+   * **语义不同**（opencode = 分份额度 / Gemini = 能不能连通）。共用一份会让
+   * 「清掉 Gemini 的代理」连带清掉 opencode 的出口配置，且日志/判据也会漂移。
+   *
+   * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+   * 早退（与 `setOpencodeProxy` 同款，见其注释）。清除时删键而非写空串。
+   */
+  async setGeminiProxy(accountId: string, proxy: string): Promise<void> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] setGeminiProxy: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const next = [...accounts]
+    const entry = { ...next[idx]! }
+    if (proxy.trim().length === 0) delete entry.geminiProxy
+    else entry.geminiProxy = proxy
+    next[idx] = entry
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 账号 ${accountId} Gemini 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+    )
+  }
+
+  /**
+   * 读取某 gemini 账号的代理（未设置时为空串 = 直连）。
+   *
+   * ⚠️ **必须过 `asProxyText`**（实测的同族缺陷，独立于 IKLTZ2 审计发现）：
+   * 该字段来自**用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}`
+   * 原样透传、不校验形状 ⇒ 池里可能存在 `"geminiProxy": 12345`。下游
+   * `normalizeProxy` 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛
+   * `TypeError: raw.trim is not a function`，该账号**永久不可用且无自愈**
+   * （症状与「代理配置坏了」同形，日志只有一句 TypeError）。
+   */
+  geminiProxyFor(accountId: string): string {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    return asProxyText(entry?.geminiProxy)
   }
 
   /**
