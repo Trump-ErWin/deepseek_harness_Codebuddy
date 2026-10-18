@@ -263,9 +263,17 @@ export const ASTUDIO_CLIENT_POPUPS_PENDING_PATH = '/client-popups/pending'
 export const ASTUDIO_CLIENT_POPUPS_COMPLETE_PATH = '/client-popups/complete'
 /** 每日奖励弹窗类型标识。 */
 export const ASTUDIO_POPUP_TYPE_DAILY_REWARD = 'DAILY_REWARD_DIALOG'
+/** 新用户礼包弹窗类型标识。 */
+export const ASTUDIO_POPUP_TYPE_NEW_USER = 'NEW_USER_DIALOG'
 
-/** 每日签到弹窗数据结构。 */
-export interface AstudioDailyRewardPopup {
+/** 可领取的福利弹窗类型列表。 */
+export const ASTUDIO_CLAIMABLE_POPUP_TYPES = [
+  ASTUDIO_POPUP_TYPE_DAILY_REWARD,
+  ASTUDIO_POPUP_TYPE_NEW_USER,
+] as const
+
+/** 领取弹窗数据结构（每日奖励或新用户礼包）。 */
+export interface AstudioClaimablePopup {
   popupId: number
   instanceKey: string
   type: string
@@ -273,6 +281,29 @@ export interface AstudioDailyRewardPopup {
     points?: string | number
     [key: string]: unknown
   }
+}
+
+/** 每日签到弹窗数据结构（兼容别名）。 */
+export type AstudioDailyRewardPopup = AstudioClaimablePopup
+
+function extractRecordPayload(record: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (typeof record.payload === 'object' && record.payload !== null) {
+    return record.payload as Record<string, unknown>
+  }
+  if (typeof record.content === 'object' && record.content !== null) {
+    return record.content as Record<string, unknown>
+  }
+  if (typeof record.content === 'string') {
+    try {
+      const parsed = JSON.parse(record.content)
+      if (typeof parsed === 'object' && parsed !== null) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      // 忽略非 JSON
+    }
+  }
+  return undefined
 }
 
 /**
@@ -284,7 +315,17 @@ export function parseAstudioPopupPoints(payload: unknown): number {
     return Math.floor(payload)
   }
   if (typeof payload === 'string') {
-    const parsed = parseInt(payload.trim(), 10)
+    const trimmed = payload.trim()
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed)
+        const pts = parseAstudioPopupPoints(parsed)
+        if (pts > 0) return pts
+      } catch {
+        // 回退
+      }
+    }
+    const parsed = parseInt(trimmed, 10)
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
   }
   if (typeof payload === 'object' && payload !== null) {
@@ -294,6 +335,12 @@ export function parseAstudioPopupPoints(payload: unknown): number {
     }
     if ('credit' in record) {
       return parseAstudioPopupPoints(record.credit)
+    }
+    if ('rewardPoints' in record) {
+      return parseAstudioPopupPoints(record.rewardPoints)
+    }
+    if ('reward_points' in record) {
+      return parseAstudioPopupPoints(record.reward_points)
     }
   }
   return 0
@@ -315,12 +362,64 @@ export function extractAstudioDailyRewardPopup(data: unknown): AstudioDailyRewar
           popupId,
           instanceKey: typeof record.instanceKey === 'string' ? record.instanceKey : '',
           type: ASTUDIO_POPUP_TYPE_DAILY_REWARD,
-          payload: typeof record.payload === 'object' && record.payload !== null ? record.payload as Record<string, unknown> : undefined,
+          payload: extractRecordPayload(record),
         }
       }
     }
   }
   return undefined
+}
+
+/**
+ * 解析待领取新用户礼包弹窗（NEW_USER_DIALOG）。
+ */
+export function extractAstudioNewUserPopup(data: unknown): AstudioClaimablePopup | undefined {
+  if (!Array.isArray(data)) return undefined
+  for (const item of data) {
+    if (typeof item !== 'object' || item === null) continue
+    const record = item as Record<string, unknown>
+    if (record.type === ASTUDIO_POPUP_TYPE_NEW_USER) {
+      const rawId = record.popupId
+      const popupId = typeof rawId === 'number' ? rawId : parseInt(String(rawId), 10)
+      if (Number.isFinite(popupId)) {
+        return {
+          popupId,
+          instanceKey: typeof record.instanceKey === 'string' ? record.instanceKey : '',
+          type: ASTUDIO_POPUP_TYPE_NEW_USER,
+          payload: extractRecordPayload(record),
+        }
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * 提取所有可领取的福利弹窗（包含每日签到与新用户礼包）。
+ */
+export function extractAstudioClaimablePopups(data: unknown): AstudioClaimablePopup[] {
+  if (!Array.isArray(data)) return []
+  const result: AstudioClaimablePopup[] = []
+  const seenIds = new Set<number>()
+  for (const item of data) {
+    if (typeof item !== 'object' || item === null) continue
+    const record = item as Record<string, unknown>
+    const type = String(record.type ?? '')
+    if (type === ASTUDIO_POPUP_TYPE_DAILY_REWARD || type === ASTUDIO_POPUP_TYPE_NEW_USER) {
+      const rawId = record.popupId
+      const popupId = typeof rawId === 'number' ? rawId : parseInt(String(rawId), 10)
+      if (Number.isFinite(popupId) && !seenIds.has(popupId)) {
+        seenIds.add(popupId)
+        result.push({
+          popupId,
+          instanceKey: typeof record.instanceKey === 'string' ? record.instanceKey : '',
+          type,
+          payload: extractRecordPayload(record),
+        })
+      }
+    }
+  }
+  return result
 }
 
 /**
@@ -412,16 +511,190 @@ export async function claimAstudioDailyReward(
     }
   }
 
-  // 若 pending 为空数组或无 DAILY_REWARD_DIALOG 弹窗，即为今日已领取（实测已领取时返回 code=0 data=[]）
-  const popup = extractAstudioDailyRewardPopup(pendingRecord.data)
-  if (popup === undefined) {
+  // 若 pending 为空数组或无可领取的弹窗，即为今日已领取（实测已领取时返回 code=0 data=[]）
+  const popups = extractAstudioClaimablePopups(pendingRecord.data)
+  if (popups.length === 0) {
     return {
       kind: 'already-claimed',
-      message: '今天已领取每日签到奖励',
+      message: '今天已领取每日签到奖励及福利礼包',
     }
   }
 
-  // ② 调用 complete 完成领取
+  // ② 依次调用 complete 完成领取（支持每日签到与新用户礼包）
+  let totalCredit = 0
+  for (const popup of popups) {
+    let completeResponse: Response
+    let completeText: string
+    try {
+      completeResponse = await fetcher(`${baseUrl}${ASTUDIO_CLIENT_POPUPS_COMPLETE_PATH}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Cookie: cookie,
+          clientType: product.clientType,
+          studioVersion: product.studioVersion,
+        },
+        body: JSON.stringify({
+          popupId: popup.popupId,
+          instanceKey: popup.instanceKey,
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      completeText = await completeResponse.text()
+    } catch (error) {
+      return {
+        kind: 'failed',
+        code: -1,
+        message: `领取每日签到及福利礼包失败（网络异常）：${error instanceof Error ? error.message : String(error)}`,
+      }
+    }
+
+    if (!completeResponse.ok) {
+      return {
+        kind: 'failed',
+        code: completeResponse.status,
+        message: `领取每日签到及福利礼包失败（HTTP ${completeResponse.status}）`,
+      }
+    }
+
+    let completeBody: unknown
+    try {
+      completeBody = JSON.parse(completeText) as unknown
+    } catch {
+      return {
+        kind: 'failed',
+        code: -1,
+        message: '领取每日签到及福利礼包失败（响应不是 JSON）',
+      }
+    }
+
+    const completeRecord = (typeof completeBody === 'object' && completeBody !== null ? completeBody : {}) as Record<string, unknown>
+    const completeCode = typeof completeRecord.code === 'number' ? completeRecord.code : parseInt(String(completeRecord.code ?? ''), 10)
+    const completeMsg = typeof completeRecord.message === 'string' ? completeRecord.message : String(completeRecord.desc ?? '')
+
+    if (completeCode === 80000 || isAstudioSessionDeadError(completeCode, completeMsg)) {
+      return {
+        kind: 'failed',
+        code: 80000,
+        message: 'AStudio 登录会话已失效，需在 AStudio 客户端人工重新登录（微信扫码）',
+      }
+    }
+
+    if (Number.isFinite(completeCode) && completeCode !== 0) {
+      return {
+        kind: 'failed',
+        code: completeCode,
+        message: `领取每日签到及福利礼包失败：${completeMsg || `code=${completeCode}`}`,
+      }
+    }
+
+    // 解析领取到的积分值，优先 complete 响应，若无则取弹窗 payload
+    const creditFromComplete = parseAstudioPopupPoints(completeRecord.data)
+    const creditFromPayload = parseAstudioPopupPoints(popup.payload)
+    const credit = creditFromComplete > 0 ? creditFromComplete : creditFromPayload
+    totalCredit += credit
+  }
+
+  return {
+    kind: 'claimed',
+    credit: totalCredit,
+    streakDays: 1,
+    isStreakDay: false,
+    unit: 'credit',
+  }
+}
+
+/**
+ * 单独领取新用户礼包（NEW_USER_DIALOG）。
+ */
+export async function claimAstudioNewUserGift(
+  credential: AstudioCredential,
+  options: AstudioCreditsOptions = {},
+): Promise<ClaimOutcome> {
+  const fetcher = options.fetcher ?? fetch
+  const product = options.product ?? ASTUDIO
+  const timeoutMs = options.timeoutMs ?? ASTUDIO_CREDITS_TIMEOUT_MS
+
+  const baseUrl = (product.authBaseUrl ?? '').replace(/\/+$/, '')
+  if (baseUrl.length === 0) {
+    return { kind: 'failed', code: -1, message: '额度服务不可用（未配置账号后端地址）' }
+  }
+
+  const ssoSessionId = typeof credential.sso_session_id === 'string' ? credential.sso_session_id.trim() : ''
+  if (!ssoSessionId) {
+    return { kind: 'failed', code: 401, message: '缺少 sso_session_id，无法领取新用户礼包' }
+  }
+
+  const accountId = credential.account_id || credential.uid || ''
+  const token = credential.token || ssoSessionId
+  const cookie = `ssoSessionId=${ssoSessionId}; sso_sessionid=${ssoSessionId}; account_id=${accountId}; token=${token}`
+
+  let pendingResponse: Response
+  let pendingText: string
+  try {
+    pendingResponse = await fetcher(`${baseUrl}${ASTUDIO_CLIENT_POPUPS_PENDING_PATH}`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Cookie: cookie,
+        clientType: product.clientType,
+        studioVersion: product.studioVersion,
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    pendingText = await pendingResponse.text()
+  } catch (error) {
+    return {
+      kind: 'failed',
+      code: -1,
+      message: `查询新用户礼包失败（网络异常）：${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+
+  if (!pendingResponse.ok) {
+    return {
+      kind: 'failed',
+      code: pendingResponse.status,
+      message: `查询新用户礼包失败（HTTP ${pendingResponse.status}）`,
+    }
+  }
+
+  let pendingBody: unknown
+  try {
+    pendingBody = JSON.parse(pendingText) as unknown
+  } catch {
+    return { kind: 'failed', code: -1, message: '查询新用户礼包失败（响应不是 JSON）' }
+  }
+
+  const pendingRecord = (typeof pendingBody === 'object' && pendingBody !== null ? pendingBody : {}) as Record<string, unknown>
+  const pendingCode = typeof pendingRecord.code === 'number' ? pendingRecord.code : parseInt(String(pendingRecord.code ?? ''), 10)
+  const pendingMsg = typeof pendingRecord.message === 'string' ? pendingRecord.message : String(pendingRecord.desc ?? '')
+
+  if (pendingCode === 80000 || isAstudioSessionDeadError(pendingCode, pendingMsg)) {
+    return {
+      kind: 'failed',
+      code: 80000,
+      message: 'AStudio 登录会话已失效，需在 AStudio 客户端人工重新登录（微信扫码）',
+    }
+  }
+
+  if (Number.isFinite(pendingCode) && pendingCode !== 0) {
+    return {
+      kind: 'failed',
+      code: pendingCode,
+      message: `新用户礼包查询失败：${pendingMsg || `code=${pendingCode}`}`,
+    }
+  }
+
+  const popup = extractAstudioNewUserPopup(pendingRecord.data)
+  if (popup === undefined) {
+    return {
+      kind: 'already-claimed',
+      message: '无待领取的新用户礼包或已领取',
+    }
+  }
+
   let completeResponse: Response
   let completeText: string
   try {
@@ -445,7 +718,7 @@ export async function claimAstudioDailyReward(
     return {
       kind: 'failed',
       code: -1,
-      message: `领取每日签到奖励失败（网络异常）：${error instanceof Error ? error.message : String(error)}`,
+      message: `领取新用户礼包失败（网络异常）：${error instanceof Error ? error.message : String(error)}`,
     }
   }
 
@@ -453,7 +726,7 @@ export async function claimAstudioDailyReward(
     return {
       kind: 'failed',
       code: completeResponse.status,
-      message: `领取每日签到奖励失败（HTTP ${completeResponse.status}）`,
+      message: `领取新用户礼包失败（HTTP ${completeResponse.status}）`,
     }
   }
 
@@ -461,11 +734,7 @@ export async function claimAstudioDailyReward(
   try {
     completeBody = JSON.parse(completeText) as unknown
   } catch {
-    return {
-      kind: 'failed',
-      code: -1,
-      message: '领取每日签到奖励失败（响应不是 JSON）',
-    }
+    return { kind: 'failed', code: -1, message: '领取新用户礼包失败（响应不是 JSON）' }
   }
 
   const completeRecord = (typeof completeBody === 'object' && completeBody !== null ? completeBody : {}) as Record<string, unknown>
@@ -484,11 +753,10 @@ export async function claimAstudioDailyReward(
     return {
       kind: 'failed',
       code: completeCode,
-      message: `领取每日签到奖励失败：${completeMsg || `code=${completeCode}`}`,
+      message: `领取新用户礼包失败：${completeMsg || `code=${completeCode}`}`,
     }
   }
 
-  // 解析领取到的积分值，优先 complete 响应，若无则取弹窗 payload
   const creditFromComplete = parseAstudioPopupPoints(completeRecord.data)
   const creditFromPayload = parseAstudioPopupPoints(popup.payload)
   const credit = creditFromComplete > 0 ? creditFromComplete : creditFromPayload
