@@ -17,6 +17,7 @@ import {
   isAutoclawRefreshable,
   isAutoclawTokenExpired,
   autoclawDisplayNickname,
+  autoclawEffortForRequest,
   type AutoclawCredential,
   type ChatMessage,
 } from '../../src/autoclaw.js'
@@ -1087,6 +1088,84 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
       //   但绕过宿主直接调适配器时就是它 —— 断言「不发」而非「发 16384」。
       const sent = await maxTokensFor('zai_auto', undefined)
       expect(sent).toBeUndefined()
+    })
+  })
+
+  describe('★★ 思考档位本地拦截（2026-10-18 审计 P0）', () => {
+    // ⚠️ 这组断言的是**行为**（真正发出去什么），不是源码文本 ——
+    //   「源码里出现过某个调用」会被 `if (false)` 短路写法骗过（AGENTS.md 记载）。
+    async function effortFor(requested: string | undefined) {
+      const calls: Array<{ init?: RequestInit }> = []
+      const warns: string[] = []
+      const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+        calls.push({ init })
+        return new Response('data: [DONE]\n\n', {
+          status: 200, headers: { 'Content-Type': 'text/event-stream' },
+        })
+      }) as unknown as typeof fetch
+      const adapter = new AutoclawAdapter({
+        resolveCredential: async () => ({
+          access_token: 'at', refresh_token: 'rt', expires_at: 4102444800000,
+        }),
+        fetchImpl: fetcher,
+        product: AUTOCLAW,
+        warn: (m) => { warns.push(m) },
+      })
+      for await (const _c of adapter.stream({
+        provider: 'autoclaw', model: 'zai_auto',
+        messages: [createUserMessage({
+          content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' },
+        })],
+        ...(requested === undefined ? {} : { reasoningEffort: requested as never }),
+      } as GenerateOptions)) { /* no-op */ }
+      const body = JSON.parse(String(calls[0]!.init?.body))
+      return { sent: body.reasoning_effort as string | undefined, warns }
+    }
+
+    it('集合内的档位原样发（low/high/max 三档都要走通）', async () => {
+      for (const effort of ['low', 'high', 'max']) {
+        const { sent } = await effortFor(effort)
+        expect(sent, `${effort} 应当原样上行`).toBe(effort)
+      }
+    })
+
+    it('★★ 集合外的档位**不发该字段**（上游回 200 并按最贵档跑，不拦就是烧钱）', async () => {
+      // ⚠️ 实测依据：`turbo` / `ultra` / `off` 三个非法值上游**全部回 200**
+      //   并正常跑完（`docs/audit/pr111-autoclaw-audit.md` 的取证表）⇒
+      //   症状是「变慢 / 变贵」而非报错，事后无从归因。
+      for (const bogus of ['turbo', 'ultra', 'off', 'medium', 'none', ' ']) {
+        const { sent } = await effortFor(bogus)
+        expect(sent, `非法档位 ${JSON.stringify(bogus)} 绝不能上行`).toBeUndefined()
+      }
+    })
+
+    it('⚠️ 丢弃必须**留痕**（否则用户付了 max 的钱却无从归因）', async () => {
+      const { warns } = await effortFor('turbo')
+      expect(warns.some((w) => w.includes('turbo')),
+        '丢弃档位时必须有告警，且要指名丢的是什么').toBe(true)
+    })
+
+    it('合法档位不得产生任何丢弃告警（防「无脑 warn」把日志刷满）', async () => {
+      const { warns } = await effortFor('high')
+      expect(warns).toEqual([])
+    })
+
+    it('⚠️ 用户未指定档位时不发该字段（走网关默认）', async () => {
+      const { sent, warns } = await effortFor(undefined)
+      expect(sent).toBeUndefined()
+      expect(warns).toEqual([])
+    })
+
+    it('判据本身：集合外的值必须回报 dropped + 可读的丢弃原因', () => {
+      const d = autoclawEffortForRequest('turbo', ['low', 'high', 'max'])
+      expect(d.effort).toBeUndefined()
+      expect(d.dropped).toBe('turbo')
+      expect(d.reason).toContain('low/high/max')
+
+      // ⚠️ 「未声明任何档位」也必须拦 —— 不能因为集合为空就当全都合法。
+      const none = autoclawEffortForRequest('high', [])
+      expect(none.effort).toBeUndefined()
+      expect(none.dropped).toBe('high')
     })
   })
 

@@ -311,6 +311,58 @@ export function autoclawMaxTokens(
     : floored
 }
 
+/** {@link autoclawEffortForRequest} 的结果。 */
+export interface AutoclawEffortDecision {
+  /** 已通过校验、**可以原样上行**的档位；`undefined` = 不发该字段。 */
+  effort?: string;
+  /** 被丢弃的档位（原样，便于日志指认用户选了什么）。 */
+  dropped?: string;
+  /** 丢弃原因（`dropped` 存在时给出）。 */
+  reason?: string;
+}
+
+/**
+ * 校验用户选的思考档位能不能发给上游。
+ *
+ * ## 为什么必须本地拦截（2026-10-18 审计 P0，实测依据见下）
+ *
+ * 上游对**非法档位不报错**：`reasoning_effort` 发 `turbo` / `ultra` / `off`
+ * 三值实测**全部回 HTTP 200** 并正常跑完（`docs/audit/pr111-autoclaw-audit.md`
+ * 的取证表「非法档位值是否被拒 → ❌ 不被拒」）。而 `off` 尤其危险：宿主把
+ * 我们的「快速思考 / 深度思考 / 极限推理」三档翻译成 DSH 的**规范档位名**再回传
+ * （`low`/`high`/`max` 之外的形态都可能出现），一旦原样发出，上游**按最贵的那档**
+ * 计费与延迟 ⇒ 症状是「模型变慢了 / 变贵了」而**不是报错**，事后无从归因。
+ *
+ * ⇒ 判据：档位 ∈ 本家已声明集合 ⇒ 原样发；否则**不发** `reasoning_effort`
+ * （退回上游自己的默认档）并回报 `dropped`，由适配器打日志。
+ *
+ * ⚠️ 刻意**不「就近映射」**（把 `medium` 悄悄改成 `low`）：那是替用户决定语义，
+ * 而档位直接关联计费倍率与是否思考。
+ * ⚠️ 也刻意**不抛错**：`UNSUPPORTED_REASONING_EFFORT` 会让整轮对话失败，
+ * 而「不发这个字段」是完全可用的降级。
+ * ⚠️ 与 `astudioEffortForRequest`（`astudio.ts`）**同型同构**：两家都是
+ * 「非法值静默按最大档跑」，所以判据必须都在本地，不能指望上游拒绝。
+ *
+ * @param requested 宿主请求的档位（`undefined` = 用户未指定）。
+ * @param declared 该模型已声明的档位集合（`undefined` = 未声明任何档位）。
+ */
+export function autoclawEffortForRequest(
+  requested: string | undefined,
+  declared: readonly string[] | undefined,
+): AutoclawEffortDecision {
+  if (requested === undefined) return {}
+  const effort = requested.trim()
+  if (effort.length === 0) return {}
+  const set = declared ?? []
+  if (set.includes(effort)) return { effort }
+  return {
+    dropped: effort,
+    reason: set.length === 0
+      ? '本模型未声明任何思考档位'
+      : `本模型只声明 ${set.join('/')}`,
+  }
+}
+
 /**
  * 判断上游错误报文是否为**额度耗尽**（归 `QUOTA_EXCEEDED`，2026-10-17 新增）。
  *
