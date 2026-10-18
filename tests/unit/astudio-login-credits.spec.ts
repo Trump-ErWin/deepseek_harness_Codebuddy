@@ -194,9 +194,68 @@ describe('AStudio 每日签到（Credits & Claim）', () => {
         expect(outcome.unit).toBe('credit')
       }
       expect(mockFetch).toHaveBeenCalledTimes(2)
+      const pendingCall = mockFetch.mock.calls[0]
+      expect(pendingCall[0]).toContain('/client-popups/pending')
+      expect(pendingCall[1].headers).toMatchObject({
+        Accept: 'application/json',
+        clientType: '21',
+        studioVersion: '3.5.2',
+      })
+
       const completeCall = mockFetch.mock.calls[1]
       expect(completeCall[0]).toContain('/client-popups/complete')
+      expect(completeCall[1].headers).toMatchObject({
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        clientType: '21',
+        studioVersion: '3.5.2',
+      })
       expect(JSON.parse(completeCall[1].body)).toEqual({ popupId: 1234, instanceKey: 'inst-abc' })
+    })
+
+    it('官方 11001001 客户端平台/版本无效时正确向外传递 failed', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          code: 11001001,
+          desc: '客户端平台、版本或构建号无效',
+        }),
+      } as Response)
+
+      const outcome = await claimAstudioDailyReward(validCred, { fetcher: mockFetch })
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe(11001001)
+        expect(outcome.message).toContain('客户端平台、版本或构建号无效')
+      }
+      expect(mockFetch).toHaveBeenCalledTimes(1)
+      const call = mockFetch.mock.calls[0]
+      expect(call[1].headers).toMatchObject({
+        clientType: '21',
+        studioVersion: '3.5.2',
+      })
+    })
+
+    it('支持通过 options.product 自定义 clientType 与 studioVersion', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ code: 0, flag: true, data: [] }),
+      } as Response)
+
+      const customProduct = {
+        ...ASTUDIO,
+        clientType: '99',
+        studioVersion: '9.9.9',
+      }
+      await claimAstudioDailyReward(validCred, { fetcher: mockFetch, product: customProduct })
+      expect(mockFetch).toHaveBeenCalledTimes(1)
+      const call = mockFetch.mock.calls[0]
+      expect(call[1].headers).toMatchObject({
+        clientType: '99',
+        studioVersion: '9.9.9',
+      })
     })
 
     it('complete 失败时正确向外传递 failed', async () => {

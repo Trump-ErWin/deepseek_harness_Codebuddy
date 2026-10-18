@@ -338,7 +338,8 @@ export async function claimAstudioDailyReward(
 ): Promise<ClaimOutcome> {
   const fetcher = options.fetcher ?? fetch
   const timeoutMs = options.timeoutMs ?? ASTUDIO_CREDITS_TIMEOUT_MS
-  const baseUrl = (options.product ?? ASTUDIO).authBaseUrl.replace(/\/+$/, '')
+  const product = options.product ?? ASTUDIO
+  const baseUrl = (product.authBaseUrl ?? '').replace(/\/+$/, '')
 
   const cookie = astudioCookieHeader(credential)
   if (cookie.length === 0) {
@@ -355,7 +356,12 @@ export async function claimAstudioDailyReward(
   try {
     pendingResponse = await fetcher(`${baseUrl}${ASTUDIO_CLIENT_POPUPS_PENDING_PATH}`, {
       method: 'GET',
-      headers: { Accept: 'application/json', Cookie: cookie },
+      headers: {
+        Accept: 'application/json',
+        Cookie: cookie,
+        clientType: product.clientType,
+        studioVersion: product.studioVersion,
+      },
       signal: AbortSignal.timeout(timeoutMs),
     })
     pendingText = await pendingResponse.text()
@@ -425,6 +431,8 @@ export async function claimAstudioDailyReward(
         'Content-Type': 'application/json',
         Accept: 'application/json',
         Cookie: cookie,
+        clientType: product.clientType,
+        studioVersion: product.studioVersion,
       },
       body: JSON.stringify({
         popupId: popup.popupId,
