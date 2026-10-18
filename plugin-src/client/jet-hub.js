@@ -13,7 +13,7 @@ import {
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
-import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
+import { OpencodeKeyModal, OpencodeProxyModal, GeminiProxyModal } from './opencode-proxy-modal.js';
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
 //    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
 //    ⚠️ 本 import 此前**不存在** ⇒ `modelscope-key-modal.js` 整份 140 行从未进 bundle，
@@ -863,8 +863,8 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         className: 'dim-jh-btn',
         onClick: () => onToggle(account.id, !account.enabled),
       }, account.enabled ? '停用' : '启用'),
-      // ⚠️ 仅 opencode：出口代理与指纹轮换是该 provider **独有**的账号维度
-      // （其余 provider 没有这两项）。用 props 存在性开关而非
+      // ⚠️ 仅 opencode / gemini：出口代理是该 provider 独有的**账号维度**能力
+      // （其余 provider 没有这一项）。用 props 存在性开关而非
       // `provider === 'opencode'` 硬判断 —— 前者让 AccountCard 无需知道
       // provider 列表，也避免以后新增同类 provider 时漏改。
       // 位置在「停用」之后、「删除」之前：删除按钮带 data-kind='danger'，
@@ -872,12 +872,18 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
       onOpenProxy
         ? React.createElement('button', {
             className: 'dim-jh-btn',
-            // ⚠️ tooltip 必须解释「不设置会怎样」：看到「代理」按钮很容易
-            // 当成锦上添花，实际不设 = 与其它账号共用同一出口（同一份额度）。
+            // ⚠️ tooltip 必须解释「不设置会怎样」。两家语义不同，故按
+            // `account.geminiProxy !== undefined` 分流文案：opencode 是
+            // 「共用出口 = 共用额度」，gemini 是「出不去 = 恒连不上」。
             title: account.opencodeProxy
               ? '出口代理：' + account.opencodeProxy + '（点击修改）'
-              : '设置该账号的出口代理；不设置则与其它未设代理的账号共享本机出口 IP',
-            onClick: () => onOpenProxy(account.id, account.opencodeProxy || ''),
+              : account.geminiProxy !== undefined
+                ? '出口代理：' + (account.geminiProxy || '直连') + '（点击修改）'
+                : '设置该账号的出口代理；'
+                  + (account.geminiProxy !== undefined
+                    ? '不设置则直连本机（出不去墙外服务）'
+                    : '不设置则与其它未设代理的账号共享本机出口 IP'),
+            onClick: () => onOpenProxy(account.id, account.opencodeProxy || account.geminiProxy || ''),
           }, '代理')
         : null,
       onRotateFingerprint
@@ -1622,6 +1628,172 @@ function StatusDot({ ok, title }) {
  * - **请求记录**（`cline.requestLog`）：失败以 RPC 错误抛出（本地流水不会
  *   部分失败），故 catch 后显示原因并保留空表。
  */
+/**
+ * MiniMax 国际站「绕过分流」设置弹窗（Gitee issue IKMEVG，2026-10-17）。
+ *
+ * ## 它解决什么
+ *
+ * `agent.minimax.io`（国际站数据面）会按**出口 IP 所在国家**把中国大陆来源
+ * `307` 重定向到 `agent.minimaxi.com`（中国站）。于是大陆网络下：
+ *
+ * - 国际站账号的**签到 / 积分**请求被导到中国站 ⇒ 中国站不认国际站 token
+ *   ⇒ `401 {"error":"invalid access token"}` ⇒ 面板显示「余额查询失败」；
+ * - 同一现象也发生在**推理**上（模型「连接测试失败」）。
+ *
+ * ⇒ 用户看到的是「授权不成功」，实际凭据完全正常，只是**地理位置被分流**。
+ *
+ * ## 本弹窗给什么
+ *
+ * 一个输入框填**海外 IP**（如 `8.8.8.8`），后端会把它作为
+ * `X-Forwarded-For` 附到国际站请求上，让上游判定为海外来源。
+ *
+ * ## ⚠️ 三条刻意的产品取舍
+ *
+ * 1. **默认不填**（空串 = 不附头）。附 `X-Forwarded-For` 本质是**声明一个并非
+ *    本机的来源 IP**；上游那条规则是区域路由策略（账单/合规都基于它），
+ *    默认伪造来源不该是产品的默认行为。
+ * 2. **文案里先给「代理」这条更正当的路**。改出口 IP 是真话；
+ *    伪造头是应急手段。文案不藏这一点。
+ * 3. **保存后回读后端归一值**：非法输入（主机名 / 逗号链 / 含换行）会被后端
+ *    归一成空，UI 立刻显示「未设置」—— 静默保存一个坏值是最糟的形态。
+ */
+function MinimaxXffPanel({ rpcCall, value, onSaved, onClose }) {
+  const mounted = React.useRef(true);
+  React.useEffect(() => () => { mounted.current = false; }, []);
+
+  const [draft, setDraft] = React.useState(value ?? '');
+  const [busy, setBusy] = React.useState(false);
+  const [notice, setNotice] = React.useState(null); // { kind: 'ok' | 'bad', text }
+
+  /**
+   * 保存：后端会校验 + 归一，回传**实际生效值**。
+   *
+   * ⚠️ 不能用 `draft` 直接当生效值显示：用户可能填了 `my.proxy.example`，
+   * 后端归一成空串（只接受 IP 字面量）。那时必须让用户**当场看见**没生效。
+   *
+   * @param override 显式要保存的值（「清除设置」按钮传空串）。
+   *   ⚠️ 存在理由是**避开 React 状态异步**：`setDraft('')` 之后立刻读 `draft`
+   *   仍是旧值，只靠状态会让「清除」把旧值又存回去。
+   */
+  const save = async (override) => {
+    const payloadValue = typeof override === 'string' ? override : draft
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await rpcCall('minimax.setXff', { xff: payloadValue });
+      if (!mounted.current) return;
+      const next = typeof res?.xff === 'string' ? res.xff : '';
+      setDraft(next);
+      onSaved(next);
+      setNotice(next === ''
+        ? { kind: 'ok', text: '已清除：后续请求不附 X-Forwarded-For（将按真实出口 IP 分流）。' }
+        : { kind: 'ok', text: `已保存并生效：${next}` });
+    } catch (caught) {
+      if (!mounted.current) return;
+      // ⚠️ 后端对非法值返回 `bad-request`（含原因），**原样显示** —— 那句原因
+      //    （「只接受 IPv4 / IPv6 字面量」）就是用户唯一能自救的线索。
+      //
+      // ⚠️⚠️ **必须把 draft 回滚到后端真值 `value`**（真实缺陷，2026-10-17 审计打穿）：
+      //    后端现在是「非法即不写」，故 `value` 仍是**上次成功保存的值**。
+      //    若不回滚，「清除设置」失败（或任何保存失败）后输入框停在空/错的值，
+      //    而实际生效值没变 ⇒ 用户看到界面与真实状态不一致，
+      //    正是这次修复要消灭的那个症状（从「不清后端」缩小到「失败分支不清 UI」）。
+      setDraft(value ?? '');
+      setNotice({
+        kind: 'bad',
+        text: (caught instanceof Error ? caught.message : String(caught))
+          + `（当前生效值未改动：${value === '' ? '未设置' : value}）`,
+      });
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
+  },
+  React.createElement('div', {
+    className: 'dim-jh-modal',
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': 'MiniMax 国际站分流设置',
+  },
+  React.createElement('div', { className: 'dim-jh-modalHead' },
+    React.createElement('div', { className: 'dim-jh-modalTitle' },
+      React.createElement('strong', null, 'MiniMax 国际站分流设置')),
+    React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        onClick: onClose,
+      }, '关闭'))),
+  React.createElement('div', { className: 'dim-jh-modalBody' },
+    // ── 原因说明 ──
+    React.createElement('div', { className: 'dim-jh-hint' },
+      'MiniMax 国际站的服务器按**出口 IP 所在国家**分流：中国大陆 IP 会被'
+      + '重定向到中国站，从而出现「余额查询失败」「模型不可用」，'
+      + '而凭据本身是好的。'),
+    // ── 两条出路（先给更正当的那条）──
+    React.createElement('div', { className: 'dim-jh-hint' },
+      '① 推荐：用代理把出口 IP 改到海外（此时无需本设置）；'
+      + '② 应急：在下面填一个海外 IP，让请求被判为海外来源。'),
+    // ── 输入 ──
+    React.createElement('div', { className: 'dim-jh-field' },
+      React.createElement('label', { className: 'dim-jh-fieldLabel', htmlFor: 'dim-jh-minimax-xff' },
+        'X-Forwarded-For（留空 = 不伪造来源）'),
+      React.createElement('input', {
+        id: 'dim-jh-minimax-xff',
+        className: 'dim-jh-input',
+        type: 'text',
+        value: draft,
+        spellCheck: false,
+        autoComplete: 'off',
+        placeholder: '例如 8.8.8.8（只接受 IPv4 / IPv6）',
+        disabled: busy,
+        onChange: (event) => setDraft(event.target.value),
+        onKeyDown: (event) => { if (event.key === 'Enter' && !busy) void save(); },
+      })),
+    // ── 结果 / 错误 ──
+    notice !== null
+      ? React.createElement('div', {
+          className: 'dim-jh-hint',
+          style: notice.kind === 'bad' ? { color: 'var(--dim-danger, #e5534b)' } : undefined,
+        }, notice.text)
+      : null,
+    // ── 风险说明（必须显式写出来）──
+    React.createElement('div', { className: 'dim-jh-hint' },
+      '⚠️ 该值是**声明一个并非本机的来源 IP**，仅在应急时使用；'
+      + '上游若改为不信任该头，本设置会失效（届时仍会如实报错，不会假装成功）。'),
+    // ── 操作 ──
+    React.createElement('div', { className: 'dim-jh-modalActions' },
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'data-kind': 'primary',
+        disabled: busy,
+        onClick: () => void save(),
+      }, busy ? '保存中…' : '保存'),
+      /**
+       * ⚠️ 「清除设置」**必须真的落盘**，不能只清输入框。
+       *
+       * 初版写的是 `onClick: () => setDraft('')` —— 只改了本地草稿，
+       * 后端仍是旧值。用户点完看到输入框空了，会以为已经关掉绕过分流，
+       * 而实际请求**仍在带 XFF**（症状：他以为改回了正常行为，其实没有）。
+       * ⇒ 这里直接调后端清空并回读，语义与「保存空值」完全一致。
+       */
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        disabled: busy || (draft === '' && value === ''),
+        /**
+         * ⚠️ **不要在这里 `setDraft('')`**（2026-10-17 审计指出的细节）：
+         * `save('')` 成功后会回读 `next` 并 `setDraft(next)`；失败时 catch 会把
+         * draft 回滚到真值 `value`。若这里先清空，一旦失败就会出现
+         * 「输入框空、实际仍带 XFF」的不一致。
+         */
+        onClick: () => { void save(''); },
+      }, '清除设置'),
+    ))));
+}
+
 function ClineQuotaPanel({ rpcCall, onClose }) {
   const mounted = React.useRef(true);
   React.useEffect(() => () => { mounted.current = false; }, []);
@@ -3038,6 +3210,28 @@ function ProviderPanel({ provider, rpcCall }) {
     return () => { alive = false; };
   }, [canLockPermanent, provider]);
 
+  /**
+   * 读取 MiniMax 国际站的 `X-Forwarded-For` 设置（issue IKMEVG）。
+   *
+   * ⚠️ **只在 `minimaxintl` 面板读**：其它 provider 的后端分支没有这个能力，
+   * 无条件请求会在控制台留下必然失败的报错（与积分能力矩阵同一教训）。
+   */
+  React.useEffect(() => {
+    if (provider !== 'minimaxintl') return undefined;
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await rpcCall('minimax.getXff', {});
+        if (!alive) return;
+        setMinimaxXff(typeof res?.xff === 'string' ? res.xff : '');
+      } catch (caught) {
+        // 读失败不阻塞面板：保持空串（= 不附头，与后端缺省一致）。
+        console.error('[jet-hub] load minimax xff failed:', caught);
+      }
+    })();
+    return () => { alive = false; };
+  }, [provider]);
+
   /** 切换锁定状态（持久化）。 */
   const togglePermanentLock = async () => {
     if (!canLockPermanent) return;
@@ -3106,6 +3300,15 @@ function ProviderPanel({ provider, rpcCall }) {
   // 避免每次进入面板都发 cline.quota / cline.requestLog（那两发在非 Cline
   // 渠道会直接 bad-request）。
   const [showQuota, setShowQuota] = React.useState(false);
+  /**
+   * MiniMax 国际站绕地理分流用的 `X-Forwarded-For`（issue IKMEVG）。
+   *
+   * ⚠️ 只有 `minimaxintl` 面板读它。空串 = 未设置（不附头）。
+   * ⚠️ 挂载时读一次即可：它是**面板级配置**，不会因账号变化而变化；
+   *    但保存后会立即用后端回传的归一值刷新（非法输入会被归一成空）。
+   */
+  const [minimaxXff, setMinimaxXff] = React.useState('');
+  const [showMinimaxXff, setShowMinimaxXff] = React.useState(false);
 
   /**
    * 一键领取当前 provider 下全部已启用账号的每日签到积分。
@@ -3999,6 +4202,31 @@ function ProviderPanel({ provider, rpcCall }) {
           },
           disabled: creating,
         }, creating ? '正在登录…' : '+ 新建账号'),
+        /**
+         * ⚠️ **只给 MiniMax 国际版**（issue IKMEVG）：它的数据面
+         * `agent.minimax.io` 按**出口 IP 国别**把中国大陆来源 307 到中国站，
+         * 于是大陆网络下国际站账号永远拿不到数据面（与 token 有效性无关）。
+         * 这里给一个入口让用户填海外 IP 绕开该分流。
+         *
+         * ⚠️ 其它 provider 一律不渲染（多一个永远无效的按钮只会让用户困惑）。
+         *
+         * ⚠️ **位置必须在「+ 新建账号」之后**（2026-10-17 用户要求
+         * 「minimax国际版的新建账号放在国际站分流之前」）：新建账号是**主操作**，
+         * 分流设置是**排障用的次要入口** —— 次要项排在主操作前面会让用户
+         * 先看到「分流设置」而不是「怎么加账号」。
+         */
+        provider === 'minimaxintl'
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              'data-kind': minimaxXff !== '' ? 'primary' : undefined,
+              title: 'MiniMax 国际站的服务器会按**出口 IP 所在国家**决定把你路由到哪个站：'
+                + '中国大陆 IP 会被 307 重定向到中国站，表现为「余额查询失败 / 模型不可用」。'
+                + '\n\n在此填写一个**海外 IP**（如 8.8.8.8）即可让请求被判为海外来源、留在国际站。'
+                + '\n留空 = 不伪造来源（推荐先用代理改变出口 IP，那是更正当的方式）。'
+                + `\n\n当前：${minimaxXff === '' ? '未设置' : minimaxXff}`,
+              onClick: () => setShowMinimaxXff(true),
+            }, minimaxXff !== '' ? '国际站分流：已绕过' : '国际站分流设置')
+          : null,
         // ★ 预选对话框（用户 2026-10-03：从按钮旁搬到弹窗里）
         //
         // ⚠ 内容按 provider 分支：zcode 问**登录渠道**，accio 问**登录区域**
@@ -4485,8 +4713,18 @@ function ProviderPanel({ provider, rpcCall }) {
                 // AccountCard 靠「props 存在性」决定是否渲染按钮。
                 ...(provider === 'opencode'
                   ? {
-                      onOpenProxy: (id, current) => setProxyModal({ accountId: id, current }),
+                      onOpenProxy: (id, current) => setProxyModal({ provider, accountId: id, current }),
                       onRotateFingerprint: (id) => void rotateFingerprint(id),
+                    }
+                  : {}),
+                // ⚠️ **Gemini 也要「代理」按钮**（Gitee issue IKLTZ2）：它的全部端点
+                // 都在墙外，而插件进程**不读系统代理** ⇒ 没出口就恒连不上。
+                // ⚠️ 与 opencode **刻意分成两个回调**而不是共用：两者读不同的池字段
+                //（`geminiProxy` / `opencodeProxy`）、调不同的端点前缀、共用会让
+                // 「清掉 Gemini 的代理」连带清掉 opencode 的出口配置。
+                ...(provider === 'gemini'
+                  ? {
+                      onOpenProxy: (id, current) => setProxyModal({ provider, accountId: id, current }),
                     }
                   : {}),
                 // ⚠️ **本 fork 独有**（modelscope，2026-10-17）：编辑访问令牌。
@@ -4525,6 +4763,15 @@ function ProviderPanel({ provider, rpcCall }) {
           onClose: () => setShowQuota(false),
         })
       : null,
+    // MiniMax 国际站分流设置弹窗（issue IKMEVG）：覆盖层，独立 state。
+    showMinimaxXff
+      ? React.createElement(MinimaxXffPanel, {
+          rpcCall,
+          value: minimaxXff,
+          onSaved: (next) => setMinimaxXff(next),
+          onClose: () => setShowMinimaxXff(false),
+        })
+      : null,
     // 出口代理弹窗（仅 opencode）：覆盖层，与上面两个弹窗各自独立 state，
     // 同时打开也只是叠加，不会互相顶掉。
     //
@@ -4536,7 +4783,7 @@ function ProviderPanel({ provider, rpcCall }) {
     // 整个设置页崩成白屏。仓库其它弹窗（ModelListPanel / BackupPanel /
     // ClineQuotaPanel）都是 `createElement` 形式，正是这个原因。
     proxyModal
-      ? React.createElement(OpencodeProxyModal, {
+      ? React.createElement(proxyModal.provider === 'gemini' ? GeminiProxyModal : OpencodeProxyModal, {
           // ⚠️ 传最小 ctx 门面而不是整个面板：弹窗只需要 rpc，
           // 这样它在单测/复用时不必拖上整个 ProviderPanel 的依赖。
           ctx: { rpc: (payload) => rpcCall(payload.method, payload.payload) },
@@ -7231,7 +7478,15 @@ export function JetHubPage({ rpcCall }) {
       React.createElement('div', { className: 'dim-jh-railGroupTitle' }, title),
       list.map(p => renderProviderRow(p)));
     return [
-      group(`已打开 (${open.length})`, sortOpenProvidersByOrder(open, providerOrder), 'open'),
+      // ⚠️ 第三个实参 = **声明顺序**（注册表全量 id）。传它才能让
+      // `providerOrder` 里缺失的**新增** provider 落回它该在的位置，
+      // 而不是被缀到末尾（真实缺陷，2026-10-17 用户报障
+      // 「minimax 国际版的顺序应该在中国版下面」）。
+      group(
+        `已打开 (${open.length})`,
+        sortOpenProvidersByOrder(open, providerOrder, PROVIDERS.map(p => p.id)),
+        'open',
+      ),
       group(`已关闭 (${closed.length})`, closed, 'closed'),
     ];
   };

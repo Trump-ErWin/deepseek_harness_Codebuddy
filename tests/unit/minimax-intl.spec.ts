@@ -361,7 +361,11 @@ describe('★ 积分：三个入口都要按站点选主机', () => {
     expect(table.minimaxintl, 'minimaxintl 没进积分表 —— 国际站面板的积分会恒回 unsupported provider')
       .toBeDefined()
     // 三个入口都必须有（漏一个 = 该功能对国际站不可用）。
-    expect(table.minimaxintl?.fetchBalance).toBeTypeOf('function')
+    // ⚠️ 余额入口允许是 `fetchBalance` 或 `fetchBalanceDetailed`（见下方行为判据说明）。
+    const hasBalance = typeof table.minimaxintl?.fetchBalance === 'function'
+      || typeof table.minimaxintl?.fetchBalanceDetailed === 'function'
+    expect(hasBalance, 'minimaxintl 缺余额能力（fetchBalance / fetchBalanceDetailed 都没有）')
+      .toBe(true)
     expect(table.minimaxintl?.fetchStatus).toBeTypeOf('function')
     expect(table.minimaxintl?.claim).toBeTypeOf('function')
     // ⚠️ 不另立 `claimStatus`：预检与面板读数是同一个端点，只声明一次。
@@ -374,8 +378,27 @@ describe('★ 积分：三个入口都要按站点选主机', () => {
       return json({ base_resp: { status_code: 0 }, total_count: 0 })
     }) as typeof fetch)
     try {
-      await table.minimaxintl!.fetchBalance!(credential(), {} as never)
-      await table.minimax!.fetchBalance!(credential(), {} as never)
+      /**
+       * ⚠️ 余额入口现在声明的是 **`fetchBalanceDetailed`**（不是 `fetchBalance`），
+       * 理由见 `src/provider-credits.ts` 的 minimax 表项：`fetchBalance` 的 `null`
+       * 会被共享骨架补一句写死的「余额查询失败」，把地理分流 / 凭据失效 /
+       * 网关签名这些**唯一能指路**的原因全丢掉（2026-10-17 审计打穿）。
+       *
+       * ⚠️ 这里**优先用 Detailed**，保证测的是**真实被 UI 调用的那个入口**，
+       * 而不是一个已不再被调用的旧入口（否则守卫会绿着失去意义）。
+       */
+      const intl = table.minimaxintl
+      const cn = table.minimax
+      if (intl?.fetchBalanceDetailed !== undefined) {
+        await intl.fetchBalanceDetailed(credential(), {} as never)
+      } else {
+        await intl!.fetchBalance!(credential(), {} as never)
+      }
+      if (cn?.fetchBalanceDetailed !== undefined) {
+        await cn.fetchBalanceDetailed(credential(), {} as never)
+      } else {
+        await cn!.fetchBalance!(credential(), {} as never)
+      }
     } finally {
       vi.unstubAllGlobals()
     }
@@ -701,8 +724,18 @@ describe('★★ 两站账号各刷各的实例（同族串接的核心风险）
  * ⚠️ 判据必须打在**业务入口**上（`fetchMinimaxSigninStatus` / `claimMinimaxDailyCheckin` /
  * `fetchMinimaxCreditBalance` / `fetchModelsWith` / `adapter.stream`），不能只打
  * `minimaxFetchWithRetry` 本身 —— 后者证明不了「调用点接上了」。
+ *
+ * ## ⚠️ 2026-10-17 更新（issue IKMEVG）：三处调用点改走 `minimaxFetch`
+ *
+ * 三处不再各自组合「重试 + 跟随重定向」，而是统一走 `minimaxFetch`
+ *（`src/minimax.ts`，重试包住整条重定向链）。
+ *
+ * ⚠️ **本组用例刻意不改判据、也不改标题以外的断言** —— 它测的是
+ * 「业务入口在首次传输失败后**总调用次数 == 2**」这个**行为**，
+ * 与底层函数叫什么名字无关，故换了实现仍逐条有效（实测 6 条全绿）。
+ * 跟随重定向那一层另有专门的守卫（`minimax-redirect-follow.spec.ts`）。
  */
-describe('★★ 重试接线：业务路径真的走了 minimaxFetchWithRetry（不是只测了函数本体）', () => {
+describe('★★ 重试接线：业务路径真的走了带重试的发送入口（不是只测了函数本体）', () => {
   /** undici 形状的 `fetch failed`：真因挂在 `cause` 上（本机实测的失败形态）。 */
   function fetchFailed(): TypeError {
     const cause = new Error('self-signed certificate in certificate chain') as NodeJS.ErrnoException

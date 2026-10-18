@@ -31,6 +31,7 @@ import { ZCODE } from './zcode-product.js'
 import { ZCODE_CAPTCHA_FALLBACK, type ZcodeCaptchaConfig } from './zcode-captcha.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
 import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
+import { geminiFetchForAccount, setGeminiProxyPool } from './gemini-proxy.js'
 import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES, type ImageRequestTarget } from './image-budget.js'
@@ -107,7 +108,7 @@ import { registerAutoclawLlm } from './autoclaw-adapter.js'
 import { AUTOCLAW } from './autoclaw-product.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import { AccioAuth } from './accio-auth.js'
-import { registerAccioLlm } from './accio-adapter.js'
+import { AccioAdapter, registerAccioLlm } from './accio-adapter.js'
 import { ACCIO } from './accio-product.js'
 import type { AccioCredential } from './accio.js'
 // AStudio（讯飞 AstronStudio）：直连上游 MAAS。**没有 OAuth 授权页** —— 推理凭据是
@@ -162,7 +163,8 @@ import {
 } from './opencode-auth.js'
 import { OPENCODE } from './opencode-product.js'
 import type { OpencodeCredential } from './opencode.js'
-import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './opencode-capability.js'
+import { MODELS_DEV_TTL_MS, primeModelsDev, refreshModelsDev } from './models-dev-cache.js'
+import { invalidateOpencodeCapabilities } from './opencode-capability.js'
 import { closeAllProxyDispatchers } from './opencode-proxy.js'
 import { execFile } from 'node:child_process'
 
@@ -522,13 +524,27 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
   // 会让探测报「项目号探测失败」而不是它真正要报的「账号仍受限」—— 反而掩盖
   // 了用户点「重测」想知道的答案。探测**不写**任何东西（不传 persistProject）。
   gemini: {
-    createProbeAdapter: (ref, credential) => new GeminiAdapter({
+    // ⚠️ **第三个形参 `entry` 不能丢**（IKLTZ2 审计 P1-1，真实缺陷）：
+    // 探测路径**刻意不传 `accountPool`**（`account-probe.ts` 的既定语义：
+    // 只测这一个账号、且不写任何标记）⇒ 适配器内那条「按 access_token 反查
+    // 账号 id」的路**根本不存在** ⇒ 出口解析器拿到空 id、按「直连」处理
+    // ⇒ **该账号的代理被完全绕过**。
+    // 症状与 issue 原话同形：墙外环境下「测试 / 重测」**恒失败**，而这个失败
+    // 与「账号已失效」在 UI 上完全同形 ⇒ 用户会去误删好号。
+    //
+    // ⚠️ 对照 opencode 的 `(ref, credential, entry)`（下方 L649）：它接下了
+    // entry 并把 `entry.opencodeProxy` 喂进槽里，本家原先漏了这一步。
+    createProbeAdapter: (ref, credential, entry) => new GeminiAdapter({
       credentialRef: credentialRef(ref),
       resolveCredential: async () => credential as GeminiCredential,
       refresh: async () => {},
       sessionLane: GEMINI_SESSION_LANE_SMOKE,
       project: GEMINI_DEFAULT_PROJECT,
       product: GEMINI,
+      // ⚠️ **探测必须走该账号的代理**：账号卡片上的「测试 / 重测」按钮打的是
+      // 真实推理端点，而 Gemini 全部端点都在墙外。
+      fetchFor: geminiFetchForAccount,
+      accountIdOverride: entry?.id ?? '',
     }),
   },
   // CodeArts → 华为云 HMAC 签名（**它自己的**签名方案，不是「兜底」）。
@@ -585,6 +601,23 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
       resolveCredential: async () => credential as MinimaxCredential,
       refresh: async () => {},
       product: MINIMAX_INTL,
+    }),
+  },
+  // Accio（阿里）→ 自己的网关端点。
+  //
+  // ⚠️ 它**曾经**不必在这里（issue IKM3ZV 之前：适配器不写 `modelRateLimits`，
+  // `provider-registry.ts` 的 `rateLimit: false` 与 `WRITES_RATE_LIMIT_PROVIDERS`
+  // 都据此把它排除）。2026-10-18 接上请求级换号 + 冷却后它**会写**标记
+  // （额度至 UTC+8 当日 24:00 / 限流 1h）⇒ 必须登记，否则标记写进去却清不掉。
+  //
+  // ⚠️ 刻意**不传** `accountPool`（与 minimax 同一理由）：那会让 `stream()` 的
+  // 反查与轮换在探测路径上复活（探测失败若写回限流标记，会把「重测 A 账号」
+  // 变成污染池的副作用）。也**不传** `fetchRemoteModels` / `readImage`。
+  accio: {
+    createProbeAdapter: (ref, credential) => new AccioAdapter({
+      resolveCredential: async () => credential as AccioCredential,
+      refresh: async () => {},
+      product: ACCIO,
     }),
   },
   // OpenCode Zen。
@@ -2017,7 +2050,12 @@ export function apply(ctx: Context): void {
   //
   // 服务名由 GeminiAuth 依 product.id 派生，注册为 ctx.geminiAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 Gemini 面板。
-  const gemini = new GeminiAuth(ctx)
+  //
+  // ⚠️ Gitee issue IKLTZ2：Gemini 全部端点都在墙外，而 undici 既不读 Windows
+  // 系统代理、也不读 `HTTP(S)_PROXY` ⇒ 「浏览器授权成功、面板里账号一直不出现」。
+  // 这里接上**按账号取 fetcher** 的解析器（与 `probeById` 共用同一份）。
+  setGeminiProxyPool(pool)
+  const gemini = new GeminiAuth(ctx, { fetchFor: geminiFetchForAccount })
   const geminiSigStore = createGeminiSigStore(ctx)
   // ⚠️ 项目号探测缓存必须**在这里建一次、长期复用** —— 每次 `stream()` 现造
   // 等于没有跨请求缓存，每轮推理都会多打一次 `loadCodeAssist`。
@@ -2078,6 +2116,8 @@ export function apply(ctx: Context): void {
     // 项目号：缺省**自动探测**（`loadCodeAssist` 的 `cloudaicompanionProject`），
     // 不是恒为 `aicode-consumers`（那只是探测为空时的兜底）。
     projectCache: geminiProjectCache,
+    // ⚠️ **推理主路径的出口**（IKLTZ2）：此前这里只有裸 `fetch`（连 seam 都没有）。
+    fetchFor: geminiFetchForAccount,
     persistProject: async (value: string) => {
       // ⚠️ 回写到**解析凭据时所用的那个账号**，不是默认单凭据 ref ——
       // 写错对象会让另一个账号的凭据被污染。
@@ -3086,23 +3126,47 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     ctx.logger.warn(`[codearts-auth] 创建默认 OpenCode 匿名通道失败：${String(error)}`)
   })
 
-  // 预热模型能力表（models.dev）。
+  // models.dev 本地缓存：启动预热 + **定期刷新**（用户 2026-10-17）。
   //
-  // ⚠️⚠️ **两条硬约定**（真机事故 2026-10-02）：
+  // ⚠️⚠️ 三条硬约定（第一条是 2026-10-02 的真机事故）：
   // 1. 渲染路径上**只读同步缓存**，永不 await 网络 —— 我最初在 `listModels`
   //    里 await 这个拉取，而它 5 MB / 慢则 1.4s、宿主网络异常时**永不返回**，
   //    于是模型选择器一直空白（用户报障「一直卡着」）。
   // 2. 拉取完成要**广播目录变更**：能力表是能力判定的来源，DSH 已经用
   //    「纯文本」渲染过一帧，不广播它不会重算（免费模型会一直显示不支持图片）。
+  // 3. **全仓唯一直读点**是 `src/models-dev-cache.ts`：opencode 的能力表与
+  //    cline 的目录补全都只读它那份磁盘缓存，不再各自直连（此前两处各一套
+  //    直连 + TTL + ETag，既重复又让 5 MB 的请求在插件里发生两次）。
   //
-  // 首次运行磁盘没缓存时，本次刷新可能晚于首帧几十秒；那段时间能力按纯文本
-  // 保守处理（见 opencode-capability.ts 的模块头）。
-  primeOpencodeCapabilities()
+  // 首次运行磁盘没缓存时，本次刷新可能晚于首帧几十秒；那段时间能力按纯文本、
+  // 目录按本地兜底表保守处理（见各模块的降级注释）。
+  primeModelsDev()
   // ⚠️ 走**唯一**的广播实现（`src/catalog-broadcast.ts`）：能力表是能力判定的
   // 来源，它一变就必须让客户端重读目录 —— 与十个适配器的「目录落地」同一语义，
   // 不该各写一份 emit（审计指出此处曾是内联实现，且 `ctx.logger.warn` 缺两级
   // 可选链：logger 缺席时会抛、仅被 catch 吞）。
-  refreshOpencodeCapabilities(() => { broadcastCatalogChanged(ctx) })
+  //
+  // ⚠️ 归一缓存（`opencode-capability.ts` 的 `normalized`）必须在刷新后作废，
+  // 否则它会继续用旧的归一结果 —— 那是「改了没用，重启才好」的形态。
+  refreshModelsDev(() => { broadcastCatalogChanged(ctx) }, {
+    onUpdated: () => { invalidateOpencodeCapabilities() },
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // ⚠️⚠️ **定期刷新**（用户要求「定期读取 models.dev」）：改前只有启动时那一次，
+  //   上游新增模型后**必须重启进程**才看得见（`TtlCache` 模块头记的就是这条
+  //   缺陷的同型）。周期取 TTL 的一半（3 小时）—— 比 TTL 短才能保证「最坏
+  //   情况下也只落后半个 TTL」，比 TTL 长则会让每次刷新都撞在 TTL 判据上而
+  //   **真的发出请求**前就返回（那样等于没有周期刷新）。
+  const modelsDevTimer = setInterval(() => {
+    refreshModelsDev(() => { broadcastCatalogChanged(ctx) }, {
+      onUpdated: () => { invalidateOpencodeCapabilities() },
+      warn: (message) => ctx.logger?.warn?.(message),
+    })
+  }, Math.floor(MODELS_DEV_TTL_MS / 2))
+  ;(modelsDevTimer as unknown as { unref?: () => void }).unref?.()
+  // ⚠️ 回收：定时器必须随插件卸载而停，否则进程退出会被它挂住
+  //   （与上面 `closeAllProxyDispatchers` 的回收并列，同款约定）。
+  ctx.effect(() => () => { clearInterval(modelsDevTimer) })
   // ⚠️ 这里**不再**调 `registerOpencodeRpc`：opencode 的端点已并入
   // `registerJetHubRpc` 内部的 handleMethod（见 `opencode-rpc.ts` 模块头）。
   // 代理 dispatcher 是常驻连接池：插件卸载必须回收，否则进程退出会挂住。
@@ -3187,10 +3251,13 @@ async function fetchBalanceReading(
   // ⚠️ `ProviderCallContext` 的三个字段与 `jet-hub-rpc.ts` 里那份**同形**
   //（那里是端点闭包内的注册实例，这里是装配层的实例；实现侧只需一个形状）。
   // ⚠️ 必须与端点那份**指向同一个池**，否则折算拿到的账号集合与面板看到的不一致。
+  // ⚠️ `accountId` **必须带上**（Gitee issue IKLTZ2）：Gemini 折算路径要按账号
+  // 取出口代理；漏了它 ⇒ 这条路径恒直连，症状是「面板能刷新、聚合折算却失败」。
   const callContext = {
     resolveCredential: (refName: string) => ctx.credentials.resolve(credentialRef(refName)),
     warn: (message: string) => ctx.logger?.warn?.(message),
     accountPool: pool,
+    accountId: entry.id,
   }
   // ⚠️ `fetchBalanceDetailed` 优先（它带 `error` / `extra`，是既有端点的口径）。
   if (impl.fetchBalanceDetailed !== undefined) {
@@ -3457,6 +3524,23 @@ async function fetchBalanceReading(
     //    —— 故传**惰性**解析器，不能先 await 成一个常量（那会让「缓存过期后拿到
     //    新版本」失效）。见 `ProviderCreditsDeps.lobsteraiClientVersion`。
     lobsteraiClientVersion: () => lobsterai.resolveClientVersion(),
+    // ⚠️⚠️ **MiniMax 国际站的 XFF 必须在这里也接上**（真实缺陷，2026-10-17 审计打穿）。
+    //
+    // 本文件与 `jet-hub-rpc.ts` 是**两个独立的 `createProviderCredits` 调用**
+    //（上面那段注释正是为此而写），而 `ProviderRuntime.credits` 被
+    // `fetchBalanceReading`（本文件 L≈3136）消费 —— 后者是 `balanceCache` 的
+    // **取数原语**：`collectCreditBalances` 命中缓存前会先走它，失败才回落到端点表。
+    //
+    // ⇒ 只接端点表的话，**面板第一次查国际站余额走的正是这条无 XFF 的路径**，
+    //   失败后还要吃满 failureTtl（15s）才可能重试 —— 症状就是「设了 XFF，
+    //   积分行仍然查询失败」。本次只改了一处，正是那份注释警告的形态。
+    //
+    // ⚠️ 惰性读（用户随时可能改设置），不能固化成字符串。
+    minimaxXff: () => pool.minimaxXff(),
+    // ⚠️ Gemini 的按账号 fetcher（Gitee issue IKLTZ2）：**折算路径**也要走代理，
+    // 否则「面板能刷新、聚合候选却恒折算失败」—— 与上面 minimaxXff 同型陷阱
+    // （这里也正是它第一次被引入的同一个 `createProviderCredits` 调用）。
+    geminiFetchFor: geminiFetchForAccount,
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。

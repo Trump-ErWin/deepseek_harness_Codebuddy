@@ -324,6 +324,127 @@ describe('腾讯系内容级风控指纹改写（IKLS2L）：Claude Code 身份�
   })
 })
 
+/**
+ * 第三条指纹：Claude Code system prompt 的**反馈句**（Gitee issue IKLYCT，2026-10-18 本机实测）。
+ *
+ * ## 为什么它比身份句（第二条）更严重
+ *
+ * 身份句只有 cc-switch 的 `mrt()` 探测路径漏传前缀时才注入（实测约 34% 的窗口）；
+ * 而本句属于 Claude Code system prompt 的**固定段落** —— 客户端把默认 system 整份
+ * 过来就**必然**带上 ⇒ **漏登记 = 必然命中**。用户侧实测单日白撞 647 次。
+ *
+ * ## ⚠️ 本条的锚点语义与身份句**相反**：它**位置无关**
+ *
+ * 前接 `Note: ` / 前接行首 `  - ` 都仍被拦 —— 与 ZCode 那条同型，与身份句（行首锚定）相反。
+ * 「锚点结论不可跨条推用」那条纪律在这里又得到一次印证。
+ *
+ * ## ⚠️ `find` 必须写**整句**：砍掉前半或砍掉后半都放行
+ *
+ * 这一格决定 `find` 的长度。照抄别条的 find 长度（更短/更长）都会漏改写，
+ * 而漏改写的症状是「登记了却仍每轮 400」，极难归因。
+ */
+const FEEDBACK_TRIGGER = 'To give feedback, users should report the issue at '
+  + 'https://github.com/anthropics/claude-code/issues'
+const FEEDBACK_REWRITE = 'To give feedback, users should report the issue at the project issue tracker'
+
+describe('腾讯系内容级风控指纹改写（IKLYCT）：Claude Code 反馈句', () => {
+  it('★ 整句被改写为等义形态（实测两端点均 200）', () => {
+    expect(rewriteTencentContentFingerprints(FEEDBACK_TRIGGER, 'workbuddy')).toBe(FEEDBACK_REWRITE)
+    // CodeBuddy 中国版同一套（实测两端点表现一致）
+    expect(rewriteTencentContentFingerprints(FEEDBACK_TRIGGER, 'buddy')).toBe(FEEDBACK_REWRITE)
+  })
+
+  it('★ 位置无关：前接前言 / 前接行首装饰**仍要改**（锚点与身份句相反）', () => {
+    // 实测这三格都 400/11128。若照身份句那条「只在文本开头触发」的结论，
+    // 就会在这里留下漏改写 ⇒ 整轮 400。
+    for (const text of [`Note: ${FEEDBACK_TRIGGER}`, `  - ${FEEDBACK_TRIGGER}`, `${FEEDBACK_TRIGGER}\n后接文本`]) {
+      expect(rewriteTencentContentFingerprints(text, 'workbuddy'))
+        .not.toContain(FEEDBACK_TRIGGER)
+      expect(rewriteTencentContentFingerprints(text, 'workbuddy')).toContain(FEEDBACK_REWRITE)
+    }
+  })
+
+  it('★ `find` 必须写整句：砍掉前半 / 砍掉后一半**实测放行** ⇒ 不触发，故只登记整句', () => {
+    // 这一格是 `find` 长度的判据。若有人「顺手缩短」或「拆成两条」，
+    // 这里会红 —— 因为缩短/拆分之后，这些子串本来就不触发，改写它们是多余的。
+    const halves = [
+      'users should report the issue at https://github.com/anthropics/claude-code/issues',
+      'To give feedback, users should report the issue',
+    ]
+    for (const half of halves) {
+      expect(rewriteTencentContentFingerprints(half, 'workbuddy')).toBe(half)
+      expect(rewriteTencentContentFingerprints(half, 'buddy')).toBe(half)
+    }
+    // 反向：整句必须真的被改掉（否则上面的「不动」就是空跑）
+    expect(rewriteTencentContentFingerprints(FEEDBACK_TRIGGER, 'workbuddy'))
+      .not.toContain('github.com/anthropics/claude-code/issues')
+  })
+
+  it('★ 逐字符：换域名 / 换 org / 改一个词**不动**（实测放行，别泛化）', () => {
+    // 照抄 ZCode 那条「分支值无关」的思路去泛化这条是错的：实测换域名即放行。
+    // 多改 = 替上游无谓改写用户提示词，并破坏前缀缓存。
+    const cases = [
+      FEEDBACK_TRIGGER.replace('anthropics/claude-code', 'other/repo'),
+      FEEDBACK_TRIGGER.replace('anthropics/claude-code', 'example/project'),
+      FEEDBACK_TRIGGER.replace('report the issue', 'file the issue'),
+      'https://github.com/anthropics/claude-code/issues',
+    ]
+    for (const text of cases) {
+      expect(rewriteTencentContentFingerprints(text, 'workbuddy')).toBe(text)
+      expect(rewriteTencentContentFingerprints(text, 'buddy')).toBe(text)
+    }
+  })
+
+  it('★ 一次出现多处时全部改写（客户端可能把同一句注入多段）', () => {
+    const twice = `${FEEDBACK_TRIGGER}\n${FEEDBACK_TRIGGER}`
+    expect(rewriteTencentContentFingerprints(twice, 'workbuddy'))
+      .toBe(`${FEEDBACK_REWRITE}\n${FEEDBACK_REWRITE}`)
+  })
+
+  it('★ 大小写不敏感（实测全大写同样被拦）', () => {
+    expect(rewriteTencentContentFingerprints(FEEDBACK_TRIGGER.toUpperCase(), 'workbuddy'))
+      .toBe(FEEDBACK_REWRITE)
+    expect(rewriteTencentContentFingerprints(FEEDBACK_TRIGGER.toLowerCase(), 'workbuddy'))
+      .toBe(FEEDBACK_REWRITE)
+  })
+
+  it('★ 非腾讯系：逐字节不变（别替别家上游改写用户提示词）', () => {
+    for (const provider of ['qoder', 'qodercn', 'trae', 'codearts', 'lobsterai', '']) {
+      expect(rewriteTencentContentFingerprints(FEEDBACK_TRIGGER, provider)).toBe(FEEDBACK_TRIGGER)
+    }
+  })
+
+  it('★ 三条指纹互不干扰（任一条的 find 变更都会在这里露出来）', () => {
+    const all = `${TRIGGER}: master\n${CLAUDE_TRIGGER}\n${FEEDBACK_TRIGGER}`
+    const out = rewriteTencentContentFingerprints(all, 'workbuddy')
+    expect(out).toBe(`${REWRITE}: master\n${CLAUDE_REWRITE}\n${FEEDBACK_REWRITE}`)
+    // 无状态残留：连续两次调用结果一致
+    expect(rewriteTencentContentFingerprints(all, 'workbuddy')).toBe(out)
+  })
+
+  it('★ 真实 Claude Code system：只改反馈句那一行，其余段落与行数逐字节不变', () => {
+    // 现场形状（issue 的 19,056 字符 system 形态）：反馈句前带 `  - ` 列表装饰，
+    // 后面跟着真正有用的帮助段落 —— 这些**不能**被碰。
+    const realSystem = [
+      '# Tone and style',
+      '- Be concise and direct.',
+      '',
+      '# Help',
+      '  - /help: show help',
+      `  - ${FEEDBACK_TRIGGER}`,
+      '',
+      '# Executing actions with care',
+      'Do not take destructive actions without confirmation.',
+    ].join('\n')
+    const out = rewriteTencentContentFingerprints(realSystem, 'workbuddy')
+    expect(out).not.toContain(FEEDBACK_TRIGGER)
+    expect(out).toContain(`  - ${FEEDBACK_REWRITE}`)
+    expect(out).toContain('# Executing actions with care')
+    expect(out).toContain('- /help: show help')
+    expect(out.split('\n')).toHaveLength(realSystem.split('\n').length)
+  })
+})
+
 describe('OpenAI 网关 Chat 路径：改 system 与 assistant 正文，其余角色一概不碰', () => {
   it('★ workbuddy：system 被改写', async () => {
     const options = await toGenerateOptions({
@@ -422,6 +543,26 @@ describe('OpenAI 网关 Chat 路径：改 system 与 assistant 正文，其余�
     }, abort())
     expect(textsOf(other.messages)[0]).toBe(`${CLAUDE_TRIGGER}.`)
   })
+
+  it('★ IKLYCT：反馈句在 Chat 网关路径被改写（system 与 assistant 正文两处）', async () => {
+    const options = await toGenerateOptions({
+      model: 'workbuddy/deepseek-v4.1-flash',
+      messages: [
+        { role: 'system', content: `  - ${FEEDBACK_TRIGGER}` },
+        { role: 'user', content: '看这句：' + FEEDBACK_TRIGGER },
+        { role: 'assistant', content: `我记下：${FEEDBACK_TRIGGER}` },
+        { role: 'user', content: 'OK' },
+      ],
+    }, abort())
+    const all = textsOf(options.messages)
+    // system 与 assistant 正文：已改写
+    expect(all).toContain(`  - ${FEEDBACK_REWRITE}`)
+    expect(all).toContain(`我记下：${FEEDBACK_REWRITE}`)
+    // user 原话：实测放行 ⇒ 刻意不碰（改了就是篡改用户输入）
+    expect(all).toContain('看这句：' + FEEDBACK_TRIGGER)
+    // 全文只剩 user 一处含原句
+    expect(all.filter((text) => text.includes(FEEDBACK_TRIGGER))).toHaveLength(1)
+  })
 })
 
 describe('OpenAI 网关 Responses 路径：与 Chat 同一判据', () => {
@@ -503,5 +644,52 @@ describe('OpenAI 网关 Responses 路径：与 Chat 同一判据', () => {
     expect(texts).toContain(`我记录到这一句：${CLAUDE_REWRITE}`)
     // user 不碰（实测该角色放行，改它只是篡改用户原话）。
     expect(texts).toContain(`这是用户原话：${CLAUDE_TRIGGER}`)
+  })
+
+  it('★ IKLYCT：`instructions` 里的反馈句被改写（issue 的现场端点就是 `/v1/responses`）', async () => {
+    // IKLYCT 的复现入径明确是 `/v1/responses`：cc-switch 把 Claude Desktop 的
+    // system 整份转成 `instructions` ⇒ 这条句**每轮必带**（不像身份句那样靠漏传前缀）。
+    // 漏掉这一格 = 该端点根本没修。
+    const options = await toResponsesGenerateOptions({
+      model: 'workbuddy/deepseek-v4.1-flash',
+      instructions: `# Help\n  - ${FEEDBACK_TRIGGER}\n\n# Tone\nBe concise.`,
+      input: 'hi',
+    }, abort())
+    const text = textsOf(options.messages)[0]
+    expect(text).not.toContain(FEEDBACK_TRIGGER)
+    expect(text).toContain(`  - ${FEEDBACK_REWRITE}`)
+    expect(text).toContain('# Tone')
+  })
+
+  it('★ IKLYCT：input 里的 assistant 正文放反馈句也走改写（历史重放路径）', async () => {
+    const options = await toResponsesGenerateOptions({
+      model: 'workbuddy/deepseek-v4.1-flash',
+      input: [
+        { type: 'message', role: 'assistant', content: `我记录到这一句：${FEEDBACK_TRIGGER}` },
+        { type: 'message', role: 'user', content: `这是用户原话：${FEEDBACK_TRIGGER}` },
+      ],
+    }, abort())
+    const texts = textsOf(options.messages)
+    expect(texts).toContain(`我记录到这一句：${FEEDBACK_REWRITE}`)
+    expect(texts).toContain(`这是用户原话：${FEEDBACK_TRIGGER}`)
+  })
+
+  it('★ IKLYCT：input 里的 system / developer 消息也走改写（与 `instructions` 是**两处**）', async () => {
+    // ⚠️ 这条守的是 `responses.ts` 里**另一处**调用点（input 的 system/developer），
+    // 与上面 `instructions` 那条**不是同一格** —— 只测 `instructions` 时，
+    // 把这一处改掉是**改坏不红**的。
+    const options = await toResponsesGenerateOptions({
+      model: 'workbuddy/deepseek-v4.1-flash',
+      input: [
+        { type: 'message', role: 'system', content: FEEDBACK_TRIGGER },
+        { type: 'message', role: 'developer', content: `also ${FEEDBACK_TRIGGER}` },
+        { type: 'message', role: 'user', content: `keep ${FEEDBACK_TRIGGER}` },
+      ],
+    }, abort())
+    const texts = textsOf(options.messages)
+    expect(texts).toContain(FEEDBACK_REWRITE)
+    expect(texts).toContain(`also ${FEEDBACK_REWRITE}`)
+    // user 不碰
+    expect(texts).toContain(`keep ${FEEDBACK_TRIGGER}`)
   })
 })

@@ -105,8 +105,16 @@ describe('档位必须真的发出去（否则只是 UI 装饰）', () => {
 })
 
 describe('磁盘缓存版本', () => {
-  it('⚠️ 缓存版本升到 2（旧缓存缺 efforts，不升会持续用旧数据最长 60 分钟）', () => {
-    expect(capability).toMatch(/version: 2/)
-    expect(capability).not.toMatch(/version === 1/)
+  it('⚠️ 缓存文件有版本号，且格式变化时必须升版', () => {
+    // ⚠️ 2026-10-17：能力表的磁盘缓存已**上移并改名**为共享的
+    // `models-dev.json`（`src/models-dev-cache.ts` 是全仓唯一直读点）。
+    // 这条不变式**本身没变** —— 旧版本缓存必须被识别出来，否则字段缺失会被
+    // 静默当成「没有该字段」，症状是「改了没用，重启才好」（issue IKJJ0V）。
+    // ⇒ 判据跟着职责走，打在共享缓存模块上。
+    const cache = readFileSync(join(here, '../../src/models-dev-cache.ts'), 'utf8')
+    expect(cache, '共享缓存必须带版本号').toMatch(/const CACHE_VERSION = \d+/)
+    expect(cache, '读缓存时必须比对版本号（否则旧文件被当成有效数据）').toMatch(/version === CACHE_VERSION/)
+    // ⚠️ 旧实现是 `version: 2` 的字面量；新实现不得退回「不带版本」。
+    expect(capability).not.toMatch(/version: 2/)
   })
 })
