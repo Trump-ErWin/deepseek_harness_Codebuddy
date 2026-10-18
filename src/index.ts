@@ -108,7 +108,7 @@ import { registerAutoclawLlm } from './autoclaw-adapter.js'
 import { AUTOCLAW } from './autoclaw-product.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import { AccioAuth } from './accio-auth.js'
-import { registerAccioLlm } from './accio-adapter.js'
+import { AccioAdapter, registerAccioLlm } from './accio-adapter.js'
 import { ACCIO } from './accio-product.js'
 import type { AccioCredential } from './accio.js'
 // ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
@@ -594,6 +594,23 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
       resolveCredential: async () => credential as MinimaxCredential,
       refresh: async () => {},
       product: MINIMAX_INTL,
+    }),
+  },
+  // Accio（阿里）→ 自己的网关端点。
+  //
+  // ⚠️ 它**曾经**不必在这里（issue IKM3ZV 之前：适配器不写 `modelRateLimits`，
+  // `provider-registry.ts` 的 `rateLimit: false` 与 `WRITES_RATE_LIMIT_PROVIDERS`
+  // 都据此把它排除）。2026-10-18 接上请求级换号 + 冷却后它**会写**标记
+  // （额度至 UTC+8 当日 24:00 / 限流 1h）⇒ 必须登记，否则标记写进去却清不掉。
+  //
+  // ⚠️ 刻意**不传** `accountPool`（与 minimax 同一理由）：那会让 `stream()` 的
+  // 反查与轮换在探测路径上复活（探测失败若写回限流标记，会把「重测 A 账号」
+  // 变成污染池的副作用）。也**不传** `fetchRemoteModels` / `readImage`。
+  accio: {
+    createProbeAdapter: (ref, credential) => new AccioAdapter({
+      resolveCredential: async () => credential as AccioCredential,
+      refresh: async () => {},
+      product: ACCIO,
     }),
   },
   // OpenCode Zen。
