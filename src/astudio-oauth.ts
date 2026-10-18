@@ -1070,7 +1070,7 @@ export function renderAstudioLoginPage(options: AstudioLoginPageOptions = {}): s
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AStudio 登录</title>
-<script src="https://static.geetest.com/static/js/gt.js"></script>
+<script src="https://static.geetest.com/static/tools/gt.js"></script>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -1235,27 +1235,122 @@ export function renderAstudioLoginPage(options: AstudioLoginPageOptions = {}): s
         });
       });
 
-      // 极验人机验证触发
+      // 动态载入官方 gt.js SDK
+      var gtScriptPromise = null;
+      function ensureGeetestSdk() {
+        if (typeof window.initGeetest === 'function') {
+          return Promise.resolve();
+        }
+        if (gtScriptPromise) {
+          return gtScriptPromise;
+        }
+        gtScriptPromise = new Promise(function(resolve, reject) {
+          var script = document.createElement('script');
+          script.src = 'https://static.geetest.com/static/tools/gt.js';
+          script.async = true;
+          script.dataset.astronGeetest = 'true';
+          script.addEventListener('load', function() { resolve(); }, { once: true });
+          script.addEventListener('error', function() {
+            script.remove();
+            gtScriptPromise = null;
+            reject(new Error('安全验证组件加载失败，请检查网络后重试。'));
+          }, { once: true });
+          document.head.appendChild(script);
+        });
+        return gtScriptPromise;
+      }
+
+      // 拉起极验滑块弹窗并捕获 validate / seccode 回调
+      async function triggerGeetestCaptcha() {
+        await ensureGeetestSdk();
+        if (typeof window.initGeetest !== 'function') {
+          throw new Error('安全验证组件不可用，请稍后重试。');
+        }
+        var res = await fetch('/astudio/gee-captcha');
+        var json = await res.json();
+        if (!json.ok || !json.data) throw new Error(json.message || '获取验证码配置失败');
+        var config = json.data;
+
+        return new Promise(function(resolve, reject) {
+          var finished = false;
+          var captchaInstance = null;
+          function finish(result) {
+            if (!finished) {
+              finished = true;
+              window.clearTimeout(timer);
+              try {
+                if (captchaInstance && typeof captchaInstance.destroy === 'function') {
+                  captchaInstance.destroy();
+                }
+              } catch (_) {}
+              if ('payload' in result) {
+                resolve(result.payload);
+              } else {
+                reject(result.error);
+              }
+            }
+          }
+          var timer = window.setTimeout(function() {
+            finish({ error: new Error('安全验证超时，请重试。') });
+          }, 30000);
+
+          try {
+            window.initGeetest(Object.assign({}, config, {
+              https: true,
+              offline: !config.success,
+              product: 'bind',
+              width: '100%'
+            }), function(captchaObj) {
+              captchaInstance = captchaObj;
+              captchaObj.onReady(function() {
+                try {
+                  captchaObj.verify();
+                } catch (verifyErr) {
+                  finish({ error: new Error('安全验证启动失败，请重试。') });
+                }
+              });
+              captchaObj.onError(function() {
+                finish({ error: new Error('安全验证网络异常，请稍后重试。') });
+              });
+              if (typeof captchaObj.onClose === 'function') {
+                captchaObj.onClose(function() {
+                  finish({ error: new Error('安全验证已取消。') });
+                });
+              }
+              captchaObj.onSuccess(function() {
+                var val = captchaObj.getValidate();
+                if (!val || !val.geetest_challenge || !val.geetest_validate || !val.geetest_seccode) {
+                  finish({ error: new Error('安全验证结果无效，请重试。') });
+                  return;
+                }
+                finish({
+                  payload: {
+                    geetestChallenge: val.geetest_challenge,
+                    geetestValidate: val.geetest_validate,
+                    geetestSeccode: val.geetest_seccode
+                  }
+                });
+              });
+            });
+          } catch (initErr) {
+            finish({ error: initErr instanceof Error ? initErr : new Error(String(initErr)) });
+          }
+        });
+      }
+
+      // 极验人机验证触发绑定
       function setupCaptcha(triggerBtn, boxElem, onVerified) {
         triggerBtn.addEventListener('click', async function() {
           triggerBtn.disabled = true;
-          triggerBtn.textContent = '正在获取验证...';
+          triggerBtn.textContent = '正在拉起验证...';
           try {
-            var res = await fetch('/astudio/gee-captcha');
-            var json = await res.json();
-            if (!json.ok) throw new Error(json.message || '获取验证码配置失败');
-            // 模拟验证结果或真实极验回调
-            var captcha = {
-              geetestChallenge: json.data.challenge || 'mock-challenge-' + Date.now(),
-              geetestValidate: 'mock-validate-' + Date.now(),
-              geetestSeccode: 'mock-seccode-' + Date.now() + '|jordan'
-            };
+            var captcha = await triggerGeetestCaptcha();
             onVerified(captcha);
             boxElem.innerHTML = '<span class="captcha-ready">✓ 已完成安全验证</span>';
           } catch (e) {
             triggerBtn.disabled = false;
             triggerBtn.textContent = '验证失败，重试';
-            showStatus(e.message, 'err');
+            showStatus(e.message || '安全验证失败', 'err');
           }
         });
       }

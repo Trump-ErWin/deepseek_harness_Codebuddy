@@ -865,6 +865,32 @@ describe('AStudio 三合一登录体系 (Goal 755: 短信验证码 / 密码 / Ca
       expect(html).toContain('qr-box')
     })
 
+    it('renderAstudioLoginPage 落地真实极验契约并彻底剔除 mock-validate 假数据', () => {
+      const html = renderAstudioLoginPage()
+      // 官方 SDK 引入与动态加载
+      expect(html).toContain('https://static.geetest.com/static/tools/gt.js')
+      expect(html).toContain('ensureGeetestSdk')
+      // window.initGeetest 调用与官方参数契约
+      expect(html).toContain('window.initGeetest')
+      expect(html).toContain("product: 'bind'")
+      expect(html).toContain("width: '100%'")
+      expect(html).toContain('offline: !config.success')
+      expect(html).toContain('https: true')
+      // 极验生命周期监听与凭证回调捕获
+      expect(html).toContain('captchaObj.verify')
+      expect(html).toContain('captchaObj.onReady')
+      expect(html).toContain('captchaObj.onSuccess')
+      expect(html).toContain('captchaObj.onError')
+      expect(html).toContain('captchaObj.getValidate')
+      expect(html).toContain('val.geetest_challenge')
+      expect(html).toContain('val.geetest_validate')
+      expect(html).toContain('val.geetest_seccode')
+      // 彻底消除 mock 假数据
+      expect(html).not.toContain('mock-validate')
+      expect(html).not.toContain('mock-challenge')
+      expect(html).not.toContain('mock-seccode')
+    })
+
     it('startAstudioLoginFlow 启动并服务载体页及三合一登录代理接口', async () => {
       const mockFetch = vi.fn()
         // 1. gee-captcha
