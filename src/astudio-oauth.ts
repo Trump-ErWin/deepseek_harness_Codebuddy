@@ -713,8 +713,9 @@ export interface AstudioGeeTestResult {
 }
 
 export interface AstudioLoginIdentity {
-  uid: string;
-  ssoSessionId: string;
+  uid?: string;
+  ssoSessionId?: string;
+  sso_session_id?: string;
   token?: string;
   accountId?: string;
   account_id?: string;
@@ -723,6 +724,7 @@ export interface AstudioLoginIdentity {
   mobile?: string;
   avatar?: string;
   loginMethod?: 'wechat' | 'sms' | 'password' | string;
+  login_method?: 'wechat' | 'sms' | 'password' | string;
 }
 
 export interface AstudioSmsSendResult {
@@ -749,30 +751,27 @@ export async function completeAstudioLogin(
   const authBaseUrl = (options.authBaseUrl ?? ASTUDIO.authBaseUrl).replace(/\/+$/, '');
   const timeoutMs = options.timeoutMs ?? 15_000;
 
-  const uid = account.uid;
-  const ssoSessionId = account.ssoSessionId;
-  const token = ('token' in account && account.token) ? account.token : ssoSessionId;
-  const accountId = ('accountId' in account && account.accountId)
-    ? account.accountId
-    : (('account_id' in account && account.account_id) ? account.account_id : uid);
-  const loginMethod = ('loginMethod' in account && account.loginMethod) ? account.loginMethod : 'wechat';
+  const rawRecord = (typeof account === 'object' && account !== null ? account : {}) as Record<string, unknown>;
+  const uid = String(account.uid ?? rawRecord.uid ?? rawRecord.accountId ?? rawRecord.account_id ?? '').trim();
+  const ssoSessionId = String(account.ssoSessionId ?? rawRecord.ssoSessionId ?? rawRecord.sso_session_id ?? '').trim();
+  const token = String(rawRecord.token ?? ssoSessionId).trim();
+  const accountId = String(rawRecord.accountId ?? rawRecord.account_id ?? uid).trim();
+  const loginMethod = String(rawRecord.loginMethod ?? rawRecord.login_method ?? 'wechat').trim();
 
   const cookie = `ssoSessionId=${ssoSessionId}; sso_sessionid=${ssoSessionId}; account_id=${accountId}; token=${token}`;
 
-  // ① init-app（仅微信登录调用）
-  if (loginMethod === 'wechat') {
-    try {
-      await fetcher(`${authBaseUrl}${ASTUDIO_INIT_APP_PATH}`, {
-        method: 'POST',
-        headers: { Accept: 'application/json', Cookie: cookie },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-    } catch {
-      // 忽略 init-app 非阻塞异常
-    }
+  // ① init-app（无条件执行租户开户初始化，使未注册手机号通过短信验证码等方式可自动开户并成功换取凭据）
+  try {
+    await fetcher(`${authBaseUrl}${ASTUDIO_INIT_APP_PATH}`, {
+      method: 'POST',
+      headers: { Accept: 'application/json', Cookie: cookie },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    // 忽略 init-app 非阻塞异常
   }
 
-  // ② userInfo（仅微信登录调用）
+  // ② userInfo（仅微信登录调用以获取昵称等）
   let nickname: string | undefined = ('nickname' in account && account.nickname) ? account.nickname : account.username;
   if (loginMethod === 'wechat') {
     try {
@@ -1096,6 +1095,7 @@ export function renderAstudioLoginPage(options: AstudioLoginPageOptions = {}): s
   }
   .pane { display: none; text-align: left; }
   .pane.active { display: block; }
+  .login-guide-tip { font-size: 12px; color: #86909c; text-align: center; margin-top: 10px; line-height: 1.4; }
   .form-group { margin-bottom: 14px; }
   label { display: block; font-size: 12px; color: #4e5969; margin-bottom: 6px; }
   input {
@@ -1165,6 +1165,7 @@ export function renderAstudioLoginPage(options: AstudioLoginPageOptions = {}): s
         </div>
       </div>
       <button class="btn-primary" id="btnLoginSms" type="button">登 录</button>
+      <div class="login-guide-tip">未注册手机号验证通过后将自动完成注册开户</div>
     </div>
 
     <!-- Tab 2: 账号密码 -->
@@ -1184,6 +1185,7 @@ export function renderAstudioLoginPage(options: AstudioLoginPageOptions = {}): s
         </div>
       </div>
       <button class="btn-primary" id="btnLoginPwd" type="button">登 录</button>
+      <div class="login-guide-tip">未注册账号请使用手机验证码快捷登录开户</div>
     </div>
 
     <!-- Tab 3: 微信扫码 -->

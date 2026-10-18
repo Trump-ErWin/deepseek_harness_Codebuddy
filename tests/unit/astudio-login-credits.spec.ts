@@ -7,9 +7,13 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   claimAstudioDailyReward,
   claimDaily,
+  claimAstudioNewUserGift,
   extractAstudioDailyRewardPopup,
+  extractAstudioNewUserPopup,
+  extractAstudioClaimablePopups,
   parseAstudioPopupPoints,
   ASTUDIO_POPUP_TYPE_DAILY_REWARD,
+  ASTUDIO_POPUP_TYPE_NEW_USER,
 } from '../../src/astudio-credits.js'
 import {
   AstudioAuth,
@@ -90,6 +94,30 @@ describe('AStudio 每日签到（Credits & Claim）', () => {
       expect(extractAstudioDailyRewardPopup(null)).toBeUndefined()
       expect(extractAstudioDailyRewardPopup([])).toBeUndefined()
       expect(extractAstudioDailyRewardPopup([{ type: 'OTHER_DIALOG', popupId: 1 }])).toBeUndefined()
+    })
+  })
+
+  describe('extractAstudioNewUserPopup & extractAstudioClaimablePopups (Goal 829)', () => {
+    it('从列表中正确识别 NEW_USER_DIALOG 弹窗', () => {
+      const popup = extractAstudioNewUserPopup([
+        { type: 'SOME_PROMO', popupId: 10 },
+        { type: ASTUDIO_POPUP_TYPE_NEW_USER, popupId: 99, instanceKey: 'inst-new' },
+      ])
+      expect(popup).toBeDefined()
+      expect(popup?.popupId).toBe(99)
+      expect(popup?.instanceKey).toBe('inst-new')
+    })
+
+    it('extractAstudioClaimablePopups 同时提取每日签到与新用户弹窗，并支持去重', () => {
+      const list = [
+        { type: ASTUDIO_POPUP_TYPE_DAILY_REWARD, popupId: 1, instanceKey: 'd1' },
+        { type: 'IRRELEVANT', popupId: 2, instanceKey: 'i1' },
+        { type: ASTUDIO_POPUP_TYPE_NEW_USER, popupId: 3, instanceKey: 'u1' },
+        { type: ASTUDIO_POPUP_TYPE_DAILY_REWARD, popupId: 1, instanceKey: 'd1' }, // 重复
+      ]
+      const claimable = extractAstudioClaimablePopups(list)
+      expect(claimable).toHaveLength(2)
+      expect(claimable.map((p) => p.popupId)).toEqual([1, 3])
     })
   })
 
@@ -282,6 +310,104 @@ describe('AStudio 每日签到（Credits & Claim）', () => {
       }
     })
   })
+
+  describe('claimAstudioDailyReward 多礼包与 claimAstudioNewUserGift (Goal 829)', () => {
+    const validCred: AstudioCredential = {
+      access_token: 'fake-token',
+      sso_session_id: 'sso-12345',
+      account_id: '17400000000',
+    }
+
+    it('自动识别并领取所有可领礼包（同时包含每日签到与新用户礼包，累加积分）', async () => {
+      const mockFetch = vi.fn()
+        // 1. pending 查询返回 2 个弹窗
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            code: 0,
+            flag: true,
+            data: [
+              {
+                type: ASTUDIO_POPUP_TYPE_DAILY_REWARD,
+                popupId: 101,
+                instanceKey: 'inst-101',
+                content: JSON.stringify({ rewardPoints: 100 }),
+              },
+              {
+                type: ASTUDIO_POPUP_TYPE_NEW_USER,
+                popupId: 102,
+                instanceKey: 'inst-102',
+                content: JSON.stringify({ rewardPoints: 200 }),
+              },
+            ],
+          }),
+        } as Response)
+        // 2. complete 弹窗 101
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            code: 0,
+            flag: true,
+            data: { result: true },
+          }),
+        } as Response)
+        // 3. complete 弹窗 102
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            code: 0,
+            flag: true,
+            data: { result: true },
+          }),
+        } as Response)
+
+      const outcome = await claimAstudioDailyReward(validCred, { fetcher: mockFetch })
+      expect(outcome.kind).toBe('claimed')
+      if (outcome.kind === 'claimed') {
+        expect(outcome.credit).toBe(300)
+      }
+      expect(mockFetch).toHaveBeenCalledTimes(3)
+    })
+
+    it('claimAstudioNewUserGift: 缺少 sso_session_id 时返回失败', async () => {
+      const outcome = await claimAstudioNewUserGift({ access_token: 'foo' })
+      expect(outcome.kind).toBe('failed')
+    })
+
+    it('claimAstudioNewUserGift: 成功识别并完成新用户礼包领取', async () => {
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            code: 0,
+            flag: true,
+            data: [
+              {
+                type: ASTUDIO_POPUP_TYPE_NEW_USER,
+                popupId: 201,
+                instanceKey: 'inst-new-201',
+                content: JSON.stringify({ points: 500 }),
+              },
+            ],
+          }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ code: 0, flag: true }),
+        } as Response)
+
+      const outcome = await claimAstudioNewUserGift(validCred, { fetcher: mockFetch })
+      expect(outcome.kind).toBe('claimed')
+      if (outcome.kind === 'claimed') {
+        expect(outcome.credit).toBe(500)
+      }
+    })
+  })
 })
 
 describe('AStudio 微信扫码登录与凭据交换（Wechat Scan & completeLogin）', () => {
@@ -420,6 +546,66 @@ describe('AStudio 微信扫码登录与凭据交换（Wechat Scan & completeLogi
     expect(cred.login_method).toBe('wechat')
     expect(cred.source).toBe('account-backend')
     expect(mockFetch).toHaveBeenCalledTimes(3)
+  })
+
+  it('completeAstudioLogin: 针对手机验证码/密码等非微信登录，同样无条件执行 init-app 租户初始化开户 (Goal 829)', async () => {
+    const mockFetch = vi.fn()
+      // 1. init-app (无条件开户初始化)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ code: 0, flag: true }),
+      } as Response)
+      // 2. bot/models/configs
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          code: 0,
+          data: [{ model: 'xopglm52', api_key: 'sms-model-token', is_default: true }],
+        }),
+      } as Response)
+
+    const smsIdentity: AstudioLoginIdentity = {
+      sso_session_id: 'sms-sso-token',
+      account_id: '17499999999',
+      login_method: 'sms',
+    }
+    const cred = await completeAstudioLogin(smsIdentity, { fetcher: mockFetch })
+    expect(cred.access_token).toBe('sms-model-token')
+    expect(cred.account_id).toBe('17499999999')
+    expect(cred.login_method).toBe('sms')
+    // 验证调用了 2 次：init-app -> configs
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+    const initAppCall = mockFetch.mock.calls[0]
+    expect(initAppCall[0]).toContain('/tenant-app/v2/init-app')
+    expect(initAppCall[1].headers).toMatchObject({
+      Cookie: 'ssoSessionId=sms-sso-token; sso_sessionid=sms-sso-token; account_id=17499999999; token=sms-sso-token',
+    })
+  })
+
+  it('completeAstudioLogin: init-app 即使遇到非 200/网络异常也安全降级，继续执行 configs 获取凭据', async () => {
+    const mockFetch = vi.fn()
+      // 1. init-app 网络或业务报错
+      .mockRejectedValueOnce(new Error('Network timeout'))
+      // 2. bot/models/configs 仍可继续
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          code: 0,
+          data: [{ model: 'xopglm52', api_key: 'fallback-token', is_default: true }],
+        }),
+      } as Response)
+
+    const account: AstudioLoginIdentity = {
+      sso_session_id: 'degraded-sso',
+      account_id: '17499999999',
+      login_method: 'password',
+    }
+    const cred = await completeAstudioLogin(account, { fetcher: mockFetch })
+    expect(cred.access_token).toBe('fallback-token')
+    expect(mockFetch).toHaveBeenCalledTimes(2)
   })
 
   it('AstudioAuth.completeLogin 集成兑换并写入凭据库', async () => {
@@ -629,7 +815,13 @@ describe('AStudio Provider Credits & Jet Hub RPC 接线验证', () => {
           data: { uid: '17488888888', token: 'token-carrier', username: 'CarrierDev' },
         }),
       } as Response)
-      // 2. bot/models/configs (completeAstudioLogin)
+      // 2. tenant/init-app (无条件开户初始化 Goal 829)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ code: 0, flag: true }),
+      } as Response)
+      // 3. bot/models/configs (completeAstudioLogin)
       .mockResolvedValueOnce({
         ok: true,
         status: 200,
@@ -950,6 +1142,12 @@ describe('AStudio 三合一登录体系 (Goal 755: 短信验证码 / 密码 / Ca
       expect(html).not.toContain('mock-seccode')
     })
 
+    it('renderAstudioLoginPage 包含手机号未注册开户引导与密码登录开户提示文案 (Goal 829)', () => {
+      const html = renderAstudioLoginPage()
+      expect(html).toContain('未注册手机号验证通过后将自动完成注册开户')
+      expect(html).toContain('未注册账号请使用手机验证码快捷登录开户')
+    })
+
     it('startAstudioLoginFlow 启动并服务载体页及三合一登录代理接口', async () => {
       const mockFetch = vi.fn()
         // 1. gee-captcha
@@ -973,7 +1171,13 @@ describe('AStudio 三合一登录体系 (Goal 755: 短信验证码 / 密码 / Ca
             data: { uid: 'flow-uid', ssoSessionId: 'flow-sso', token: 'flow-tok', accountId: 'flow-acc' },
           }),
         } as Response)
-        // 4. completeAstudioLogin 换取凭据 (bot/models/configs)
+        // 4. tenant/init-app (无条件开户初始化 Goal 829)
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ code: 0, flag: true }),
+        } as Response)
+        // 5. completeAstudioLogin 换取凭据 (bot/models/configs)
         .mockResolvedValueOnce({
           ok: true,
           status: 200,
@@ -1052,7 +1256,13 @@ describe('AStudio 三合一登录体系 (Goal 755: 短信验证码 / 密码 / Ca
   describe('completeAstudioLogin 与 AstudioAuth 对 AstudioLoginIdentity 的凭据交换', () => {
     it('对短信/密码登录生成的 identity 成功换取 modelBearerToken 并入库', async () => {
       const mockFetch = vi.fn()
-        // 1. bot/models/configs
+        // 1. tenant/init-app (无条件开户初始化 Goal 829)
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ code: 0, flag: true }),
+        } as Response)
+        // 2. bot/models/configs
         .mockResolvedValueOnce({
           ok: true,
           status: 200,

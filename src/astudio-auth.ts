@@ -879,7 +879,7 @@ export class AstudioAuth extends Service {
   }
 
   async completeLogin(
-    account: AstudioWechatAccount,
+    account: AstudioLoginInput,
     refName?: string,
   ): Promise<AstudioCredential> {
     const credential = await completeAstudioLogin(account, {
