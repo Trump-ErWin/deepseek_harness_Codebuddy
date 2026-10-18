@@ -2318,6 +2318,42 @@ export class AccountPool {
   }
 
   /**
+   * 设置/清除某 **gemini** 账号的出口代理（Gitee issue IKLTZ2）。
+   *
+   * ⚠️ **刻意与 `setOpencodeProxy` 分开成两份实现**，理由与字段同款：两者的
+   * **语义不同**（opencode = 分份额度 / Gemini = 能不能连通）。共用一份会让
+   * 「清掉 Gemini 的代理」连带清掉 opencode 的出口配置，且日志/判据也会漂移。
+   *
+   * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+   * 早退（与 `setOpencodeProxy` 同款，见其注释）。清除时删键而非写空串。
+   */
+  async setGeminiProxy(accountId: string, proxy: string): Promise<void> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] setGeminiProxy: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const next = [...accounts]
+    const entry = { ...next[idx]! }
+    if (proxy.trim().length === 0) delete entry.geminiProxy
+    else entry.geminiProxy = proxy
+    next[idx] = entry
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 账号 ${accountId} Gemini 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+    )
+  }
+
+  /** 读取某 gemini 账号的代理（未设置时为空串 = 直连）。 */
+  geminiProxyFor(accountId: string): string {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    return entry?.geminiProxy ?? ''
+  }
+
+  /**
    * 记录 opencode 指纹轮换代次。
    *
    * ⚠️ 只接受**比现值更大**的代次：乱序/重复回调把代次写回小值会让用户

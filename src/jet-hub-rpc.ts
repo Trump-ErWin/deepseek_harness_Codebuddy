@@ -208,6 +208,8 @@ import { pickTestModel,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
+import { geminiFetchForAccount } from './gemini-proxy.js'
+import { handleGeminiRpc } from './gemini-rpc.js'
 import { handleModelscopeRpc } from './modelscope-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
@@ -759,6 +761,7 @@ export interface CreditsEndpointDeps<
   fetchBalanceDetailed?: (
     credential: TCredential,
     product: TProduct,
+    accountId?: string,
   ) => Promise<{ balance: CreditBalance | null; error?: string; extra?: RpcCreditsBalanceExtra }>
   /**
    * 整轮（全部账号）的时间预算（毫秒）。缺省 30 分钟。
@@ -1078,7 +1081,9 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
           const credential = JSON.parse(resolved.value) as TCredential
           if (fetchDetailed !== undefined) {
             // 带原因的查询：实现自己决定「非积分账户」等业务状态的文案。
-            const detailed = await fetchDetailed(credential, product)
+            // ⚠️ `entry.id` 必须透传（Gitee issue IKLTZ2）：Gemini 要按**账号**
+            // 取出口代理，而账号 id 无法由 `credentialRef` 反查。
+            const detailed = await fetchDetailed(credential, product, entry.id)
             balance = detailed.balance
             error = detailed.error
             extra = detailed.extra
@@ -1895,6 +1900,10 @@ trae, cline, loomy, raccoon, minimax,
     //    直接读池、照常生效 ⇒ 症状只出现在积分，极难对应。
     //    惰性读（用户随时可能改设置），不能固化成字符串。
     minimaxXff: () => pool.minimaxXff(),
+    // ⚠️ Gemini 的按账号 fetcher（Gitee issue IKLTZ2）：`credits.balances`
+    // 是**用户点一下就等**的主路径，配了账号代理却不接 ⇒ 积分行恒报
+    // 「配额查询网络失败」，而推理路径却正常 —— 症状割裂、极难对应。
+    geminiFetchFor: (accountId) => geminiFetchForAccount(accountId),
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -3421,6 +3430,12 @@ AUTOCLAW.id,
       const handled = await handleOpencodeRpc(ctx, pool, method, payload)
       if (handled !== undefined) return handled
     }
+    // ⚠️ Gitee issue IKLTZ2：`gemini.*` 走**同样的前缀改道**（理由见上面
+    // opencode 那一段：Jet Hub 只有一条 RPC 通道，主 switch 的 `default` 不让路）。
+    if (method.startsWith('gemini.')) {
+      const handled = await handleGeminiRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 审计 P0 修复）：魔搭与 opencode
     //    同属「不跳浏览器、手工粘贴 API Key」的 provider ⇒ 走各自的前缀改道分支。
     //    ⚠️ 本分支此前**不存在**，而 `handleModelscopeRpc` 已导出却零调用点 ⇒
@@ -4046,7 +4061,11 @@ AUTOCLAW.id,
 
           let geminiStarted: StartedGeminiLoginFlow
           try {
-            geminiStarted = await gemini.startLogin()
+            // ⚠️ **必须传 `accountId`**（Gitee issue IKLTZ2）：换 token 那一次
+            // 请求发生在凭据落盘**之前**，此时只有池里的占位条目认得这个账号 ——
+            // 不传就拿不到它的代理 ⇒ 墙外环境下**登录恒失败**，症状与
+            // 「client_secret / redirect_uri 配错」同形，极易误判。
+            geminiStarted = await gemini.startLogin({ accountId: id })
           } catch (error) {
             // 回调端口占用/网络失败：删掉占位条目，不留幽灵账号。
             void pool.removeAccount(id).catch(() => {})
@@ -5441,13 +5460,19 @@ AUTOCLAW.id,
         }
         // ⚠️ 包一层适配：runtime 的签名是 `(credential, call)`，
         //    `collectCreditBalances` 的入参签名是 `(credential, product)`。
+        // ⚠️ `accountId` 经**逐账号**包装传入（Gitee issue IKLTZ2）：Gemini 要按
+        //    账号取出口代理，故 `callContext` 必须是**每账号一份**而不是端点级
+        //    单例 —— 共享单例会让所有账号都查到「最后一个」账号的代理。
         const values = await collectCreditBalances(accounts, undefined, {
           resolve: (ref) => ctx.credentials.resolve(ref),
           ...impl.fetchBalanceDetailed === undefined
             ? {}
             : {
-                fetchBalanceDetailed: (credential) =>
-                  impl.fetchBalanceDetailed!(credential, callContext),
+                fetchBalanceDetailed: (credential, _product, accountId) =>
+                  impl.fetchBalanceDetailed!(
+                    credential,
+                    accountId === undefined ? callContext : { ...callContext, accountId },
+                  ),
               },
           ...impl.fetchBalance === undefined
             ? {}

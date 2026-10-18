@@ -680,6 +680,103 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - **语言**：TypeScript
 - **许可**：MIT
 
+## ⚠⚠️ Gemini 必须过墙而插件不读系统代理（Issue IKLTZ2，2026-10-18 修）
+
+**症状**（用户报障形态）：浏览器**能**打开 Google 授权页并点「同意」，回到面板却
+报授权失败、账号列表里始终没有 `gemini`。**极易被误判成 `client_secret` /
+`redirect_uri` 问题** —— `gemini-oauth.ts` 文件头第 1 条注释描述的正是同一种现象，
+而那个 bug 早已被修掉。
+
+**根因**：`gemini` 全部端点（`oauth2.googleapis.com/token`、userinfo、
+`cloudcode-pa.googleapis.com` 的 `loadCodeAssist` / `retrieveQuotaSummary` /
+`streamGenerateContent`）都在墙外；插件走 Node 内置 `fetch`（undici），而它
+**既不读 Windows WinINET 系统代理（浏览器读，所以浏览器能用）、也不读
+`HTTP(S)_PROXY`**。
+
+### 本机实测（Node 22.19 / 24.21 / 26.10，用假代理记录 CONNECT）
+
+| Node | 仅设 `HTTPS_PROXY` | 再加 `NODE_USE_ENV_PROXY=1` |
+|---|---|---|
+| 22.19 | ❌ 不读 | ❌ 不读 |
+| 24.21 | ❌ 不读 | ⚠️ 读，但失败后**无限重试**（假代理收到成千上万条 CONNECT），界面长时间无响应 |
+| 26.10 | ❌ 不读 | ✅ `UND_ERR_PRX_CONN`（20ms，CONNECT 已命中） |
+
+⚠️ 「Node 22 完全不读」这条**修正了 issue 原文**（它只测了 24 与自己的版本）。
+
+### ⚠⚠️ 宿主已有一层全局代理，但它**不读系统代理**（决定了这不能算「issue 无效」）
+
+DSH 启动器在**第一个插件加载前**调 `installProxyFromEnvironment`
+（`@deepseek-ai/dsh` 的 `lib/profile-boot-*.js`），内部
+`setGlobalDispatcher(agent)` 装一个按策略路由的 Agent ⇒ **Node 内置 fetch 解析的
+正是它**。实测：调用它之后发**裸 fetch**，`CONNECT oauth2.googleapis.com:443`
+确实命中假代理；`127.0.0.1` 被 loopback bypass 放行（未进代理）。
+
+**但它只读环境变量**（`resolveProxyPolicy` 只查 `all_proxy` / `http_proxy` /
+`https_proxy` / `no_proxy`，**全仓无 `winreg` / 注册表读取**）⇒
+「只开了系统代理开关、没导出变量」的用户仍然 `source === 'none'`、全局直连，
+**issue 原样复现**。本机实测正是这一格（`ProxyEnable=0`、`ProxyServer` 是残留键、
+端口无监听、环境变量为空）。
+
+⇒ 结论：宿主那层覆盖了「导出了变量」这一格，插件补的是**剩下那一格**（per-账号）。
+
+### 修法与取舍
+
+| 方案 | 评价 |
+|---|---|
+| **文档 + 可诊断性** | 性价比最高，已落地（README「出不去墙外服务」一节 + 四条腿的指路文案） |
+| **per-账号代理** | 已落地。复用 `opencode-proxy.ts` 的 `proxyFetch`（**不**自己写第二份） |
+| **插件装全局 dispatcher** | **不建议**：`opencode-proxy.ts` 模块头记着 opencode2dsh 的 R1 教训（抢全局槽位会互相短路整个路由层），且宿主已占用该职责 |
+
+### ⚠⚠️ 四个极易漏的接线点（本次实做时踩全了）
+
+1. **`gemini-adapter.ts` 的推理腿此前连 seam 都没有** —— `stream()` 里
+   `streamGenerateContent` 是**写死的裸 `fetch`**。issue 建议说「接上已有的 seam」，
+   **照字面实现会让推理主路径漏掉代理**，而它恰恰是用户唯一会卡住的那条路。
+   ⇒ 新增 `fetchImpl`（推理）与既有的 `projectFetcher`（探测）**两个**字段，
+   合成一个会让「只拦探测」的测试用例意外拦到推理。
+2. **登录时凭据还没落盘**，只有池里的**占位条目**认得那个账号 ⇒
+   `startLogin` 必须显式收 `accountId` 并传进 fetcher 解析器。
+3. **适配器会换号**（限流 / 401 时 `getAvailableAccount`）⇒ fetcher 解析器
+   **必须在循环内按 `currentAccountId` 现取**。固化在循环外的症状是
+   「换了号还是超时」，且**零报错**。
+4. **积分路径有两份表**（`src/index.ts` 的 `creditsTable` 与 `src/jet-hub-rpc.ts`
+   的 `credits`），只接一处 ⇒ 「面板能刷新、聚合折算却失败」。这与 `minimaxXff`
+   （issue IKMEVG）是**完全同型**的坑。
+
+⚠️ `ProviderCallContext` 新增 `accountId` 的理由：账号 id 与 `credentialRef`
+**没有可逆映射**（ref 由 RPC 随机生成），而按账号取出口必须知道 id。
+⚠️ **两处消费点必须都透传**：`jet-hub-rpc.ts` 的 `collectCreditBalances`
+（逐账号包装成**每账号一份** callContext —— 共享单例会让所有账号都查到
+「最后一个」账号的代理）与 `index.ts` 的 `fetchBalanceReading`
+（`entry.id` 就是 `accountId`）。
+
+### ⚠️ 池字段**刻意分成两个**而不是复用 `opencodeProxy`
+
+两者语义不同：opencode 的代理是「多账号要分份额度」，Gemini 的是「单账号能不能
+连通」。共用一个字段 ⇒ 「清掉 Gemini 的代理」连带清掉 opencode 的出口配置。
+
+### ⚠️ 「测试连接」必须打 Google，**不能**打出口 IP 服务
+
+opencode 的测试打 `ip-api.com`（能显示出口 IP 与地区）。Gemini 这里照抄会产生
+**假阳性**：代理能通 `ip-api` 却被 Google 拒（DNS 污染 / 分流规则 / Google 侧封禁），
+用户看到绿色以为配好了，面板依然失败。
+⚠️ 也不能用 `https://www.google.com/` —— 它 302 跳地区域名、undici 会自动跟随，
+「通」与「被墙」的响应差异不干净。选 `oauth2.googleapis.com/token`：`POST` 无参数
+回 `400`，**拿到任何 HTTP 状态码即证明 TCP + TLS + 代理握手全通**，
+且**不能判 `response.ok`**（400 也是通的，判了会让正确配置报红）。
+
+### ⚠⚠️ 判据必须读 `cause` 链上的**错误码**，不能读 message
+
+`fetch failed` 是 undici 把**所有**传输层失败压成的同一句话，真因只在 `cause`。
+`refresh.ts` 原先的正则把它一律归成「1 分钟后重试的瞬时抖动」⇒
+「墙外出不去」被当成抖动 ⇒ **永远静默重试**，面板零线索（issue 原话）。
+
+修法 = `isUnreachableNetworkError` 读 `UND_ERR_CONNECT_TIMEOUT` /
+`UND_ERR_SOCKET` / `EHOSTUNREACH` 等**码**，把间隔从 1 分钟拉到
+`REFRESH_UNREACHABLE_RETRY_MS`（30 分钟）。
+⚠️ **刻意不归终态**（`RefreshTokenExpiredError` 那种停调度）：凭据没坏，
+代理一恢复就该自动复活 ⇒ 停调度会把「临时出不去」固化成「永久失效」。
+
 ## ⚠⚠️ 客户端**不得**注册 `settings.models.provider-card` 槽（Issue IKJLHQ）
 
 **真实缺陷**（用户报障，Gitee issue IKJLHQ，2026-10-03）：本插件曾以

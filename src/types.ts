@@ -125,6 +125,22 @@ export interface ProviderAccountEntry {
    * 缺省/0 = 用凭据里派生的初始指纹。
    */
   opencodeFingerprintGeneration?: number
+  /**
+   * **Gemini** 账号的出口代理（空/缺省 = 直连，Gitee issue IKLTZ2）。
+   *
+   * ⚠️ Gemini 全部端点（`oauth2.googleapis.com/token`、userinfo、
+   * `cloudcode-pa.googleapis.com`）都在墙外，而 undici **既不读 Windows WinINET
+   * 系统代理、也不读 `HTTP(S)_PROXY`**（除非额外开 `NODE_USE_ENV_PROXY`）⇒
+   * 「浏览器能授权、面板里账号一直不出现」正是本字段存在的理由。
+   *
+   * ⚠️ 与 `opencodeProxy` **刻意分成两个字段**而不是共用一个：两者的
+   * **语义不同**（opencode 是「多账号要分份额度」，Gemini 是「单账号能不能连通」），
+   * 共用会让「清掉 Gemini 的代理」连带清掉 opencode 的出口配置。
+   *
+   * 空串是合法值（= 用户显式清除，回到直连），**不可**用 falsy 判据把它与
+   * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
+   */
+  geminiProxy?: string
 }
 
 /** 账号详细状态（返回给 Client 展示） */
