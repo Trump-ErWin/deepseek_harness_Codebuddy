@@ -30,6 +30,7 @@
  * 补的是**宿主管不到的那一格**：只有环境变量、没有插件内出口时的 per-账号配置。
  */
 
+import { asProxyText } from './account-pool.js'
 import { normalizeProxy, type NormalizedProxy } from './opencode.js'
 import { proxyFetch } from './opencode-proxy.js'
 
@@ -62,7 +63,8 @@ export function createGeminiFetcherResolver(
   lookup: GeminiProxyLookup,
 ): GeminiFetcherResolver {
   return (accountId: string): typeof fetch => {
-    const raw = accountId === '' ? '' : lookup(accountId)
+    // ⚠️ 空账号 id ⇒ **根本不查池**：查了会把「不知道是谁」变成「用某人的出口」。
+    const raw = accountId === '' ? '' : asProxyText(lookup(accountId))
     if (raw.trim().length === 0) {
       // ⚠️ **退回全局 `fetch`**（而不是无脑用 undici fetch）：Node 24+ 的
       // `NODE_USE_ENV_PROXY` 等**宿主能力由内置 fetch 提供**，换成外部 undici
@@ -141,6 +143,10 @@ export const geminiFetchForAccount: GeminiFetcherResolver = createGeminiFetcherR
  *
  * @param error 原始异常。
  * @param aborted 是否是**自己 arm 的超时**触发（与真正的连接失败区分）。
+ *   ⚠️ **调用方必须真的读 signal.aborted**，不能恒传 `false`
+ *   （IKLTZ2 审计 P2-2：原三处调用点全是字面量 `false`，于是
+ *   `AbortSignal.timeout()` 触发的墙外连接超时 —— 恰恰是 IKLTZ2 的主症状 ——
+ *   因为没有 `UND_ERR_*` 错误码而拿不到任何提示；这形同「写进去却没人读」）。
  * @returns 有代理嫌疑时返回提示语，否则返回 `undefined`（调用方用原措辞）。
  */
 export function geminiNetworkHint(error: unknown, aborted: boolean): string | undefined {

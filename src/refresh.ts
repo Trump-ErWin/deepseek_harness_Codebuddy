@@ -4,8 +4,6 @@ export const REFRESH_LEAD_MS = 3_600_000
 export const REFRESH_RETRY_MS = 600_000
 /** 异常网络（fetch failed 等）后的重试间隔（1 分钟；对齐 …_BY_ABNORMAL_NETWORK）。 */
 export const REFRESH_ABNORMAL_NETWORK_RETRY_MS = 60_000
-/** 「**连不上**」（而非连上了但失败）后的重试间隔（30 分钟）。 */
-export const REFRESH_UNREACHABLE_RETRY_MS = 1_800_000
 
 /** 判定是否为「异常网络」类错误（对齐真实插件的 isAbnormalNetwork）。 */
 function isAbnormalNetworkError(error: unknown): boolean {
@@ -137,9 +135,28 @@ export class RefreshScheduler {
       if (this.timer !== undefined) {
         clearTimeout(this.timer)
       }
-      const retry = isUnreachableNetworkError(error)
-        ? REFRESH_UNREACHABLE_RETRY_MS
-        : isAbnormalNetworkError(error) ? REFRESH_ABNORMAL_NETWORK_RETRY_MS : REFRESH_RETRY_MS
+      // ⚠️⚠️ **刻意只有两格**：原提交在这里加了第三格
+      //（`isUnreachableNetworkError ? REFRESH_UNREACHABLE_RETRY_MS`），
+      // 而它是**净损害**，独立审计实测确认了两个原因：
+      //
+      // 1. **对 gemini 自身零作用** —— gemini **不使用** `RefreshScheduler`
+      //    （全仓 7 处 `new RefreshScheduler` 在 buddy / workbuddy / cline /
+      //    qoder / trae / lobsterai / autoclaw，**gemini-auth.ts 没有**）。
+      //    gemini 走账号池 `refreshAll`，由 `MultiAccountRefreshScheduler`
+      //    驱动，那里的间隔是**固定 30 分钟**、**没有任何错误分类** ⇒
+      //    「1 分钟 → 30 分钟」这层改动对 gemini 一行都不生效（它本来就是
+      //    30 分钟），commit message 的说法与实现不符。
+      // 2. **误伤了另外七个 provider** —— 它们与墙无关，把一次 DNS 抖动
+      //    （`ENOTFOUND`，典型的临时故障）从 60 秒拉长到 30 分钟，
+      //    代价是「代理抽风一次，用户 30 分钟不能用」。
+      //
+      // ⇒ 「连不上」这个判据**仍然有用**（它被 `geminiNetworkHint` 用于给出
+      //   指路文案，见 `src/gemini-proxy.ts`），但**重试间隔**不该动：
+      //   静默重试 60 秒一次不伤任何人，而拉长间隔才是净损失。
+      //   若将来 gemini 真要独立的退避策略，该加在
+      //   `MultiAccountRefreshScheduler` 上（它目前无错误分类能力），而不是
+      //   在这条**七家共享**的链上动。
+      const retry = isAbnormalNetworkError(error) ? REFRESH_ABNORMAL_NETWORK_RETRY_MS : REFRESH_RETRY_MS
       this.timer = setTimeout(() => {
         void this.run()
       }, retry)

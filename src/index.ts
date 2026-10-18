@@ -517,17 +517,27 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
   // 会让探测报「项目号探测失败」而不是它真正要报的「账号仍受限」—— 反而掩盖
   // 了用户点「重测」想知道的答案。探测**不写**任何东西（不传 persistProject）。
   gemini: {
-    createProbeAdapter: (ref, credential) => new GeminiAdapter({
+    // ⚠️ **第三个形参 `entry` 不能丢**（IKLTZ2 审计 P1-1，真实缺陷）：
+    // 探测路径**刻意不传 `accountPool`**（`account-probe.ts` 的既定语义：
+    // 只测这一个账号、且不写任何标记）⇒ 适配器内那条「按 access_token 反查
+    // 账号 id」的路**根本不存在** ⇒ 出口解析器拿到空 id、按「直连」处理
+    // ⇒ **该账号的代理被完全绕过**。
+    // 症状与 issue 原话同形：墙外环境下「测试 / 重测」**恒失败**，而这个失败
+    // 与「账号已失效」在 UI 上完全同形 ⇒ 用户会去误删好号。
+    //
+    // ⚠️ 对照 opencode 的 `(ref, credential, entry)`（下方 L649）：它接下了
+    // entry 并把 `entry.opencodeProxy` 喂进槽里，本家原先漏了这一步。
+    createProbeAdapter: (ref, credential, entry) => new GeminiAdapter({
       credentialRef: credentialRef(ref),
       resolveCredential: async () => credential as GeminiCredential,
       refresh: async () => {},
       sessionLane: GEMINI_SESSION_LANE_SMOKE,
       project: GEMINI_DEFAULT_PROJECT,
       product: GEMINI,
-      // ⚠️ **探测必须走该账号的代理**（Gitee issue IKLTZ2）：账号卡片上的
-      // 「测试」按钮打的是真实推理端点，而 Gemini 全部端点都在墙外 ——
-      // 不接代理时该按钮**恒失败**（表现与「账号已失效」同形，用户会去误删好号）。
+      // ⚠️ **探测必须走该账号的代理**：账号卡片上的「测试 / 重测」按钮打的是
+      // 真实推理端点，而 Gemini 全部端点都在墙外。
       fetchFor: geminiFetchForAccount,
+      accountIdOverride: entry?.id ?? '',
     }),
   },
   // CodeArts → 华为云 HMAC 签名（**它自己的**签名方案，不是「兜底」）。
