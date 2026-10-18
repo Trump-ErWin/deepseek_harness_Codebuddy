@@ -113,13 +113,9 @@ const QODER_CREDITS_TIMEOUT_MS = 15_000
  *
  * 实测证明**不是设备身份问题**（4 个 uid 经 `runtime-info.exe` 产出**完全相同**
  * 的 token/type，即身份是设备级），而是**该账号在 Qoder 侧确实没有每日领取
- * 活动**。对照数据（2026-09-26，同机同时刻）：
- *
- * | 账号 | 来源 | `~/.qoder/.models/<uid>` | `addOnQuota` | `CLAIM_BENEFIT` |
- * |---|---|---|---|---|
- *
- * **判据取服务端信号**（不读本机文件）：本机目录信号虽也 4/4 命中，但用户
- * 清过 `~/.qoder` 缓存、或在另一台机器上跑时会误报。
+ * 活动**。这类账号的活动列表里**只有 `VIEW_DETAILS`、没有 `CLAIM_BENEFIT`**
+ * —— 这正是 {@link isQoderNotActivated} 现在的唯一判据（详见该函数的注释；
+ * 早先用的 `addOnQuota` 缺失判据已在 IKJSHK 中作废）。
  *
  * 该文案要**可操作** —— 用户看完应知道「去 IDE 登录一次」，而不是面对
  * 「没有可领取的活动」无从下手。
@@ -142,58 +138,52 @@ const NOT_REFRESHED_YET_HINT =
 /**
  * 判断账号是否「尚未开通每日领取」。
  *
- * 判据（两条**同时**满足才算，避免误报）：
- * 1. 活动列表里**没有** `CLAIM_BENEFIT`（连已领的都没有）；
- * 2. 用量响应里 `addOnQuota` 字段**不存在**（注意是缺失，不是 0 ——
- *    已开通账号即使额度用尽也会有该字段，如 `{total:100, remaining:0}`）。
+ * ## 判据只用**服务端活动列表**（`/sash/api/v1/me/campaigns` 的响应）
  *
- * ⚠️ 第 2 条用「字段是否存在」而非「remaining 是否为 0」：后者对
- * 「额度用光」与「从未开通」不可区分，会把用光额度的老账号误报成未开通。
+ * 旧判据是「无 `CLAIM_BENEFIT` **且** 用量响应里 `addOnQuota` 字段缺失」。
+ * 后者**实测不可靠**（用户报障 IKJSHK，2026-10-07）：已开通账号也常常没有
+ * `addOnQuota`（只有 `userQuota`），11 个账号里 7 个被误判「未开通」。
+ * 维护者复核确认「`addOnQuota` 不是『是否登录过官方客户端 / 是否开通』的可靠
+ * 代理」——同一份响应形状在 `349569d`（2026-09-26）被判「真未开通」、在
+ * 2026-10-07 被判「误报」，说明**字段形状本身分不开这两类账号**。
  *
- * @param campaigns 活动列表（undefined 表示未取到，此时不判定）
- * @param usageBody 用量响应体（undefined 表示未取到，此时不判定）
+ * ## 新判据（仅凭活动列表，全部是服务端信号）
+ *
+ * | 活动列表形态 | 判定 | 依据 |
+ * |---|---|---|
+ * | 含任意 `CLAIM_BENEFIT`（`CLAIMABLE` 或 `CLAIMED`） | **已开通** → false | 服务端给该账号下发了「领积分」活动（真实抓包 `qoder-claim.spec.ts` 的 `CAMPAIGNS_BODY` / `CAMPAIGNS_AFTER_CLAIM`） |
+ * | `showCampaign:true` 且**无** `CLAIM_BENEFIT`（只剩 `VIEW_DETAILS`） | **未开通** → true | 服务端认识该账号、给它看了活动页，但**没有下发任何可领福利** —— 正是「账号在 Qoder 侧没有每日领取」的形态（2026-09-26 实测，`CAMPAIGNS_ONLY_VIEW`） |
+ * | 列表为空 / `showCampaign:false` / 未取到 | **无法判定** → false | 该形态由**请求头不完整**（缺 `Cosy-MachineToken`/`Cosy-MachineType`）或瞬时故障产生，与「未开通」不可区分；宁可少提示，不可误报（`CAMPAIGNS_EMPTY`） |
+ *
+ * ⚠️ **为什么不用「尝试领取、服务端拒绝」作为判据**（曾考虑，IKJSHK 建议的
+ * 修法 1）：走到「未开通」判定这条路径时，活动列表里本就**没有可领的
+ * `CLAIM_BENEFIT`**（只有 `VIEW_DETAILS`），手上**没有可领的 `campaignId`**；
+ * 对一个 `VIEW_DETAILS` 活动发 claim 的响应形状**从未被抓包实测过**，据此判定
+ * 等于凭空发明线上协议 —— 这正是本缺陷反复踩坑的根源（用未经验证的信号代替
+ * 服务端语义）。故判据取**已被抓包实证**的活动列表三态。
+ *
+ * ⚠️ **必须与「今天已领」「还没刷新」「请求头不完整」区分开**：本函数只在
+ * 列表**非空且 `showCampaign` 为真却又无 `CLAIM_BENEFIT`** 时才返回 true；
+ * 其余「拿不到 CLAIM_BENEFIT」的情况（空列表 / 未取到）一律 false，把
+ * 「说成已领 / 说成未开通」这两个代价更高的方向都留给上游按 `refreshed` 处理。
+ *
+ * @param campaigns 活动列表（undefined 表示未取到，此时无法判定 → false）
  */
-export function isQoderNotActivated(
-  campaigns: QoderCampaigns | undefined,
-  usageBody: unknown,
-): boolean {
+export function isQoderNotActivated(campaigns: QoderCampaigns | undefined): boolean {
   // 取不到活动列表时无法判定 —— 保守返回 false（宁可少提示，不可误报）
   if (campaigns === undefined) return false
+
+  // 含任意 CLAIM_BENEFIT（无论可领还是已领）⇒ 服务端下发了福利活动 ⇒ 已开通。
   const hasBenefit = campaigns.campaigns.some((c) => c.actionType === 'CLAIM_BENEFIT')
   if (hasBenefit) return false
 
-  // 用量响应不可用时无法判定
-  if (typeof usageBody !== 'object' || usageBody === null) return false
-  const usage = (usageBody as Record<string, unknown>).qoderUsage
-  if (typeof usage !== 'object' || usage === null) return false
-  const record = usage as Record<string, unknown>
-  // `addOnQuota` 存在（哪怕是 0）即说明账号已开通 → 不是「未开通」
-  return record.addOnQuota === undefined
-}
+  // 空列表 / showCampaign:false ⇒ 请求头不完整或瞬时故障，与「未开通」不可区分。
+  // ⚠️ 不能判成未开通：否则缺 machine 头时会把所有账号误报成「未开通」。
+  if (!campaigns.showCampaign || campaigns.campaigns.length === 0) return false
 
-/**
- * 拉取用量响应体（只读，失败返回 undefined）。
- *
- * 单独抽出来是给 `isQoderNotActivated` 喂判据用 —— 它需要一个**原始**响应，
- * 而 `fetchQoderCreditBalance` 会把结果归一化成 `CreditBalance`
- * （其中「查不到」与「余额 0」都可能变成 null，不足以区分开通与否）。
- */
-export async function fetchQoderUsageRaw(
-  credential: QoderCredential,
-  product: QoderProduct,
-  fetcher: typeof fetch = fetch,
-): Promise<unknown> {
-  try {
-    const response = await fetcher(`${product.openApiBase}${QODER_USAGE_PATH}`, {
-      method: 'GET',
-      headers: await creditsHeaders(credential, product),
-      signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS),
-    })
-    if (!response.ok) return undefined
-    return await response.json()
-  } catch {
-    return undefined
-  }
+  // 非空、showCampaign 为真、却没有任何 CLAIM_BENEFIT ⇒ 只有 VIEW_DETAILS 之类
+  // ⇒ 该账号在服务端没有「每日领取」活动 ⇒ 未开通（需用户去官方客户端登录开通）。
+  return true
 }
 
 /**
@@ -544,8 +534,9 @@ export async function fetchQoderCheckinStatus(
   const todayCheckedIn = refreshed && claimedBenefit.length > 0 && claimable.length === 0
   let actionRequired = false
   if (!todayCheckedIn && claimable.length === 0) {
-    const usage = await fetchQoderUsageRaw(credential, product, fetcher)
-    actionRequired = isQoderNotActivated(parsed, usage)
+    // 判据只读活动列表（服务端信号），不再额外拉一次用量响应 —— 见
+    // `isQoderNotActivated` 的注释（`addOnQuota` 不是可靠的开通信号）。
+    actionRequired = isQoderNotActivated(parsed)
   }
 
   return {
@@ -701,10 +692,11 @@ export async function claimQoderDailyCheckin(
       return { kind: 'already-claimed', message: '今天已领取' }
     }
 
-    // 未开通时额外查一次用量（只读）以确认 —— 两条判据同时满足才提示，
-    // 避免把「活动刚好刷新中」误报成「未开通」。
-    const usage = await fetchQoderUsageRaw(credential, product, fetcher)
-    if (isQoderNotActivated(parsed, usage)) {
+    // 走到这里说明服务端**下发了非空活动列表、却没有任何 CLAIM_BENEFIT**
+    // （只剩 VIEW_DETAILS 之类）。据此判「未开通」—— 判据只读活动列表，
+    // 与 `fetchQoderCheckinStatus` 同源（见 `isQoderNotActivated` 的注释：
+    // `addOnQuota` 不是可靠的开通信号，故不再额外拉用量响应）。
+    if (isQoderNotActivated(parsed)) {
       // ⚠️ `actionRequired: true` 是给 UI 的**显式信号**（而非让它去猜文案）：
       // 这条 inactive 需要用户去官方客户端登录一次，必须单独醒目展示。
       // 理由与前端约定见 `credits.ts` 的 `ClaimOutcome.actionRequired`。
