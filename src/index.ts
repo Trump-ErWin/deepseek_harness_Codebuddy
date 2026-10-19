@@ -1137,18 +1137,19 @@ export function apply(ctx: Context): void {
    * ⚠️ 若将来 `astudio-credits.ts` 的池分类变了（例如会员池也开始下发改期），
    * 本函数里的池名要跟着改 —— 它是**唯一**被用户看到的池名清单。
    *
-   * ⚠️⚠️ **本函数必须放在 `loomyLockedError` 之前**：`tests/unit/
-   *    loomy-balance-error-contract.spec.ts` 的 `lockedErrorBody()` 用
-   *    `indexSource.slice(indexOf('const loomyLockedError'), indexOf('const buddy = new BuddyAuth'))`
-   *    截取「Loomy 那份」并把其中出现的**每一个** `new LlmError(...,'CODE')` 的码
-   *    都断言在宿主 `DEFAULT_RETRYABLE_CODES` 内（Loomy 用 `TRANSPORT`，
-   *    而本家必须用 `QUOTA_EXCEEDED` —— 后者不在可重试集合里）。
-   *    把它放在两者之间会让该用例把我家的 `QUOTA_EXCEEDED` 也当 Loomy 的码去核对，
-   *    必然变红（2026-10-20 实测踩到）。
-   *    放在前面则天然落在截取区间之外，且语义分组更清楚（buddy 系三份在一起）。
-   *
    * ⚠️ 错误码取 `QUOTA_EXCEEDED`（与 buddy 系一致：这确实是额度问题，
    * 且不会像 `AUTH` 那样在部分客户端把 message 吞掉）。
+   *
+   * ⚠️ **本函数放在这里（`buddyLockedError` 之后、`loomyLockedError` 之前）是
+   *    历史的偶然，不是约束**：它只用 `BuddyNoAccountReason`，与 buddy 三份同族，
+   *    放哪都不影响正确性。**不要**为了让某个按位置切片做断言的既有用例通过而
+   *    调整本函数的声明顺序 —— 2026-10-20 我一度这么做（那时
+   *    `loomy-balance-error-contract.spec.ts` 的 `lockedErrorBody()` 用
+   *    `indexOf('const buddy = new BuddyAuth')` 当切片终点，恰好把本函数圈了进去，
+   *    于是本家 `QUOTA_EXCEEDED` 被当成 Loomy 的码核对而变红）。
+   *    正确修法是**把那条断言的切片终点改精确**（改成「下一个同级 `const`」），
+   *    已在该 spec 里改并写明理由。断言描述的是「这个函数用了哪些码」，
+   *    不是「这个函数后面跟着谁」。
    */
   const astudioLockedError =
     (displayName: string) =>

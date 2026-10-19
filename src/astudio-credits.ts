@@ -86,10 +86,13 @@ function readAstudioLocalTime(source: Record<string, unknown>, key: string): str
  * ## 为什么必须是 `日期 + T` 而不是 `Date.parse(原串)`
  *
  * 实测上游下发的是 `"2026-11-20T01:50:14"`（无 `Z`、无 `+08:00`）。ES 规范对这种
- * **仅日期时间**形式的解析是「按**本地时区**解释」（`date-time` 形式无偏移时取本地），
- * 而 `Date.parse("2026-11-20 01:50:14")`（空格分隔）在部分引擎里按 UTC 解释。
- * ⇒ 统一先 `replace(' ', 'T')` 再 `Date.parse`，两条形态走同一条判据
- *（与 `plugin-src/client/credit-expiry.ts` 的 `packageExpiryMs` 逐字同口径）。
+ * **仅日期时间**形式（`date-time`，无偏移）的解析是「按**本地时区**解释」。
+ * 但空格分隔的 `"2026-11-20 01:50:14"` **不是**规范认可的 ISO 形式，属于
+ * 实现自定义（`Date.parse` 允许返回 `NaN`）⇒ 不能依赖任一引擎的既有行为。
+ * ⇒ 统一先 `replace(' ', 'T')` 收进规范形式再 `Date.parse`，两条输入形态
+ *   走同一条判据（与 `plugin-src/client/credit-expiry.js` 的 `packageExpiryMs`
+ *   逐字同口径 —— 该函数是「显示」与「排序」唯一的到期时刻来源，
+ *   两处口径分叉会出现「显示说 11-20 到期、分档却按别的时刻算」）。
  *
  * ⚠️ **解析不出来就返回 `undefined`，绝不编造一个时刻**（本仓库红线）。
  *   上游若改成带偏移的 ISO（`...Z`），`Date.parse` 同样能认，无需改动。
