@@ -322,22 +322,71 @@ const catalogInvalidations = new Map<string, number>()
 /**
  * 把某 provider 的目录读数置为**陈旧**（下一次读取会重新拉取远端）。
  *
- * ## 调用点（`src/jet-hub-rpc.ts` 的**七处**写入端点）
+ * ## ⚠️⚠️⚠️ 接线规则（本函数所有调用点的**唯一**判据）
  *
- * | # | 端点 | 失效的 provider |
- * |---|---|---|
- * | 1 | `model.setDisabled` | `req.provider` |
- * | 2 | `model.clearDead` | `req.provider` |
- * | 3 | `model.setAllDisabled` | `req.provider` |
- * | 4 | `model.setDisabledMany` | `req.provider` |
- * | 5 | `aggregate.setRejected` | `aggregate` |
- * | 6 | `aggregate.setAllowed` | `aggregate` |
- * | 7 | `aggregate.setOrder` | `aggregate` |
+ * > **凡是写入「目录或门控相关表」的端点，成功之后都要
+ * > `invalidateCatalogCache(req.provider)`**
+ * > （聚合那几处写 `AGGREGATE_PROVIDER` —— 只失效聚合**自己**）。
  *
- * ⚠️ 4 是 brief 那 6 处之外的**同类**写入端点（同一张黑名单，只是按分组批量）：
- * 不接线的症状与单条开关**逐字相同**，故一并接上。
- * ⚠️ 5/6/7 **只**失效 `aggregate` 自己的目录缓存；**不得**顺手失效全部渠道
- * （那会让「改一个开关」连带作废其余几家的目录 ⇒ 下次打开面板打十几个上游）。
+ * 「目录或门控相关表」= 模型黑名单 `disabledModels`、模型失效表（dead models）、
+ * 聚合拒绝表、聚合白名单、聚合手工顺序表、聚合排序模式 `orderMode`。
+ * 成对条件：① 端点真的写了其中之一；② 调用点在**写盘成功之后**（校验 `return`、
+ * 写入抛错、目录核实不过而拒绝 ⇒ 一个字都没改，失效只是白打一次上游）。
+ *
+ * ⚠️⚠️ **`provider.setEnabled` 曾被漏掉过一次**（2026-10-19 复审发现的真实漏网）：
+ *   它是 Jet Hub 里**最显眼**的供应商级开关（左栏每行尾），写的正是**同一张模型
+ *   黑名单**（`clearDisabledModels` / `setModelsDisabled`），症状与单条
+ *   `model.setDisabled` 逐字相同 —— 却一度没接线。
+ *   ⇒ **按「已核实到的行号清单」接线必然漏**（清单是抽样，不是全集）；
+ *     必须按上面那条规则逐个端点自查。规则原文另见 `src/jet-hub-rpc.ts` 的
+ *   `invalidateCatalogCache` import 上方。
+ *
+ * ## 调用点（`src/jet-hub-rpc.ts` 的**十一处**写入端点，2026-10-19 由 7 补齐到 11）
+ *
+ * | # | 端点 | 失效的 provider | 为什么必接线（写的那张表） |
+ * |---|---|---|---|
+ * | 1 | `model.setDisabled` | `req.provider` | 模型黑名单 |
+ * | 2 | `model.clearDead` | `req.provider` | 模型失效表（dead models） |
+ * | 3 | `model.setAllDisabled` | `req.provider` | 模型黑名单 |
+ * | 4 | `model.setDisabledMany` | `req.provider` | 模型黑名单（按分组批量） |
+ * | 5 | `aggregate.setRejected` | `aggregate` | 聚合拒绝表 |
+ * | 6 | `aggregate.setAllowed` | `aggregate` | 聚合白名单 |
+ * | 7 | `aggregate.setOrder` | `aggregate` | 聚合手工顺序表 |
+ * | 8 | **`provider.setEnabled`** | `req.provider` | 模型黑名单（供应商级一次写全；**曾漏**） |
+ * | 9 | **`aggregate.clearRejected`** | `aggregate` | 聚合拒绝表（批量清空；兄弟端点 5 已接线） |
+ * | 10 | **`aggregate.setOrderMode`** | `aggregate` | `orderMode`（`routingFingerprint()` 的四项输入之一） |
+ * | 11 | **`aggregate.rejectNonExpiring`** | `aggregate` | 聚合白名单（批量清；与 6 同表） |
+ *
+ * ⚠️ 4 是 brief 那 6 处之外的**同类**写入端点（同一张黑名单，只是按分组批量）；
+ *   8~11 是 2026-10-19 复审按上面那条**规则**补齐的 —— 原实现只按已核实到的行号
+ *   接线，规则同样指向这 4 处却没接，属**选择性应用判据**。
+ * ⚠️ 8~11 都排在**写盘成功之后**：8 排在 `setAccountsEnabled` 之后（关闭方向的
+ *   `remoteError` / `notReady` / `ids.length === 0` 三条拒绝分支一个字都没改；
+ *   那段 `fullCatalogIds` 远端核实（Task 7 为「只关 auto 却返回成功」的 IKJW33
+ *   形态加的守卫）**不**因失效调用而改变行为 —— 失效只置陈旧、**不删条目**）。
+ * ⚠️ 5~11 **只**失效 `aggregate` 自己的目录缓存；**不得**顺手失效全部渠道
+ *   （那会让「改一个开关」连带作废其余几家的目录 ⇒ 下次打开面板打十几个上游）。
+ *
+ * ## ⚠️⚠️ **这几处失效并不是为了让聚合目录重算**（2026-10-19 复审核实的订正）
+ *
+ * 复审逐行核实了推导链并**证伪**了初版注释里的因果陈述。真实链路是：
+ * `refreshCatalog` 的 `catalogs[provider] = await ctx.llm.listModels(provider)`
+ * ⇒ `buildVirtualModels(catalogs)`（`aggregate-catalog.ts`），而
+ * `buildVirtualModels` **只读各渠道目录的 `id` / `name` 与归一映射** ——
+ * **完全不读拒绝表、白名单、顺序表、排序模式**。
+ *
+ * ⇒ 5~11 这几处失效的**真实**目的：**语义对齐 / 兜底** —— 保持上面那条规则
+ *   不破例（万一将来 `buildVirtualModels` 真的依赖了它们，这里**已经**是对的），
+ *   而**不是**为了让当前实现下的聚合目录重算（改这三张表，推导结果逐字节相同）。
+ * ⇒ 那三张表**真实**影响的是：`gateOf` / `rejectedFor`（每次现算、无缓存）、
+ *   `pickerNameOf` / `isAllDefaultsUnopened`（每次 `listModels` 现算、无缓存）、
+ *   以及 `routingFingerprint()` 的键。
+ * ⇒ 「改这三张表 ⇒ 候选序缓存失效」的**真实**机制是 **`clearChoiceCache()`**
+ *   （`choiceCache`，60 秒 TTL）；正确性另有 `routingFingerprint()` 兜底
+ *   （缓存键含这三张表的指纹），故 `clearChoiceCache` 是「立刻生效 + 释放内存」。
+ *
+ * ⚠️ **本仓库红线：注释必须与实现相符** —— 在**判据权威文件**里写一段假因果，
+ *   比不写更危险（它会被后续改动当作依据）。因此这段订正是成文要求，不是可选润色。
  *
  * ## ⚠️⚠️ **只置陈旧，不删内容**
  *
@@ -354,6 +403,13 @@ const catalogInvalidations = new Map<string, number>()
  *   （不抛错：RPC 端点不该因为一个陌生 provider id 让已落盘的开关变成失败）
  * @param at - 失效时刻。**必须与写 `catalogAt` 的那个时钟同源**；缺省 `Date.now()`
  *   （生产口径）。单测注入假时钟时必须显式传它 —— 否则两边的数值不可比。
+ *   ⚠️⚠️ **fail-open 方向（刻意）**：传 `0` / `NaN` / `±Infinity` / 任何非正的值
+ *   ⇒ 判据里 `invalidatedAt > 0` 为假 ⇒ 本次调用**静默不失效**，行为退回本次改动
+ *   之前的样子（只受 20 分钟 TTL 约束）。这是**安全**方向：误用最多让效果「晚一点」，
+ *   而不会把用户**刚改完**的开关变成异常。
+ *   ⚠️ **刻意不改成抛错**：一个参数校验异常会让「设置已落盘、但 RPC 回失败」，
+ *   用户看到的是「开关没生效」并去重复点击 —— 那比静默退回 TTL 坏得多。
+ *   （守卫那一格在 {@link isCatalogFresh} 的 `invalidatedAt > 0`，两者必须同向。）
  */
 export function invalidateCatalogCache(provider: string, at: number = Date.now()): void {
   // ⚠️ 取 `max` 而不是直接覆盖：同一毫秒内的两次失效不能把标记**往回**拨
@@ -373,9 +429,23 @@ export function catalogInvalidatedAt(provider: string): number {
 }
 
 /**
- * 清空失效表（**只给单测**：进程级全局状态会在用例之间串味）。
+ * ⚠️⚠️⚠️ **测试专用逃生门 —— 生产路径不得调用。**
  *
- * ⚠️ 生产路径**不得**调用 —— 清了之后「用户刚改的开关」就退回等 20 分钟。
+ * 清空失效表（**只给单测**）。
+ *
+ * ⚠️ 本函数清空的是**整张**失效表（不是某一个 provider）⇒ 任何生产调用方误调
+ * **一次**，就把「用户改完设置 ⇒ 目录立即失效」这**整个功能静默关闭**，且
+ * **零日志、无法自愈**（要等到下一次有写入端点被调用才恢复）。
+ * 症状是「开关明明点了，最坏要等 20 分钟才生效」—— 与「功能压根没接线」同形。
+ *
+ * ⚠️ 为什么**只**靠注释约束不够、但仍**不加机制**：本文件是**判据权威**，
+ *   加运行时守卫（如 `NODE_ENV !== 'test'` 时抛错）会在生产 bundle 里留一条
+ *   永远走不到的分支，且让本仓库最忌讳的「死分支恒绿」判据重新有地方可长。
+ *   ⇒ 处置：把约束**写在函数头正上方**（而不是行尾，避免被滚动吞掉），
+ *   并由 `catalog-invalidation.spec.ts` 在注释所指的唯一位置使用它。
+ *
+ * ⚠️ 用它的**唯一**理由：进程级全局状态会在用例之间串味（上一条把 `loomy`
+ *   置失效后，下一条的「周期内不得重拉」会假失败）。
  */
 export function clearCatalogInvalidations(): void {
   catalogInvalidations.clear()

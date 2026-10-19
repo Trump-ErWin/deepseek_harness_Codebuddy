@@ -56,6 +56,27 @@ import { WIRED_EXPIRY_PROVIDERS } from './aggregate-expiry.js'
 // ⚠️ `invalidateCatalogCache`：用户主动改设置 ⇒ 该 provider 的目录读数**立即**失效
 //    （规格 §6 的正确性要求，不是优化）。实现在 `model-catalog.ts`（与
 //    `isCatalogFresh` 同一处，保证「多久算新鲜」只有一份判据）。
+//
+// ⚠️⚠️⚠️ **接线规则（2026-10-19 复审补齐，务必照此逐条自查）**
+//
+//   「凡是写入**目录或门控相关表**的端点，**成功之后**都要
+//     `invalidateCatalogCache(req.provider)`」
+//     （聚合那几处写的是 `invalidateCatalogCache(AGGREGATE_PROVIDER)` —— 只失效
+//     聚合**自己**一个 provider，绝不顺手失效其余渠道，那是「改一个开关打十几个
+//     上游」）。
+//
+//   这条规则**必须成对**满足两个条件才算接线正确：
+//   ① 端点**真的写**了下面这些表之一：模型黑名单（`disabledModels`）、失效表
+//      （dead models）、聚合拒绝表、聚合白名单、聚合手工顺序表、聚合排序模式；
+//   ② 调用点在**写盘成功之后**（参数校验 `return`、写入抛错、目录核实不过而拒绝的
+//      路径一个字都没改，失效只会白打一次上游）。
+//
+//   ⚠️⚠️ **`provider.setEnabled` 曾被漏掉过一次**（真实的漏网教训，2026-10-19 复审
+//   发现）：它是 Jet Hub 里**最显眼**的供应商级开关（左栏每行尾的那个），写的
+//   正是**同一张模型黑名单**（`clearDisabledModels` / `setModelsDisabled`），
+//   症状与单条 `model.setDisabled` 逐字相同 —— 而它当时没接线。
+//   ⇒ 只按「已核实的行号清单」接线必然漏；**必须按上面那条规则**逐个端点自查。
+//   接线清单与理由见 `src/model-catalog.ts` 的 `invalidateCatalogCache` 注释。
 import { AGGREGATE_PROVIDER } from './aggregate-adapter.js'
 import { invalidateCatalogCache } from './model-catalog.js'
 import type { LoomyAuth } from './loomy-auth.js'
@@ -6505,6 +6526,17 @@ AUTOCLAW.id,
         // 账号状态**在模型之后**处理（顺序理由见上）。返回实际变更数，
         // 已是目标状态的账号不计入，避免提示夸大成「已停用 N 个」。
         const accountCount = await pool.setAccountsEnabled(req.provider, req.enabled)
+        // ⚠️⚠️ **第 8 处**（2026-10-19 复审补齐）：本端点写的是**同一张模型黑名单**
+        //   （关闭方向 `setModelsDisabled`、打开方向 `clearDisabledModels`），
+        //   症状与单条 `model.setDisabled` 逐字相同 —— 而它此前**漏接线**。
+        //   它是 Jet Hub 最显眼的供应商级开关，漏它的代价最大。
+        // ⚠️ **必须排在真正写盘成功之后**：上面关闭方向的四条拒绝分支
+        //   （`remoteError` / `notReady` / `ids.length === 0` / 参数校验）都**一个
+        //   字都没改**，此时失效只会白打一次上游；而那段 `fullCatalogIds` 远端核实
+        //   （Task 7 为「只关 auto 却返回成功」的 IKJW33 形态加的守卫）也**不**因
+        //   本行而改变行为 —— 失效只发生在成功路径、且只置陈旧不删内容。
+        // ⚠️ 放在 `setAccountsEnabled` 之后 ⇒ 连账号侧也一并生效。
+        invalidateCatalogCache(req.provider)
         // 两个方向都改变 listModels 的结果（关/开黑名单），**必须广播**，
         // 否则对话框的模型选择器要重启才更新（成因见 broadcastCatalogChanged）。
         broadcastCatalogChanged(ctx)
@@ -6592,9 +6624,28 @@ AUTOCLAW.id,
         // ⚠️ 清选型缓存：让改动**立刻**生效（虽然缓存键含拒绝表指纹、正确性不依赖
         //    它，但清掉可立即释放内存，并让语义更直白）。
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
-        // ⚠️⚠️ **额外失效 `aggregate` 自己的目录缓存**（`catalogAt`）——
-        // 拒绝表变了 ⇒ 候选门控变了 ⇒ 聚合目录的推导结果要立刻重算，否则最坏
-        // 还是等满它自己的 TTL（`AGGREGATE_CATALOG_TTL_MS`，60 秒）。
+        // ⚠️ **额外失效 `aggregate` 自己的目录缓存**（`catalogAt`）——
+        //
+        // ⚠️⚠️⚠️ **准确的因果（2026-10-19 复审订正 —— 原文那段是错的）**：
+        // 复审核实 `refreshCatalog` 的推导链是
+        //   `catalogs[provider] = await ctx.llm.listModels(provider)` ⇒
+        //   `buildVirtualModels(catalogs)`，
+        // 而 `buildVirtualModels`（`aggregate-catalog.ts`）**只读各渠道目录的
+        // `id` / `name` 与归一映射** ⇒ **完全不读拒绝表、白名单、顺序表、排序模式**。
+        //
+        // ⇒ 所以**这一处失效并不是为了让聚合目录重算**（改这三张表，当前实现下
+        //   推导结果逐字节相同）。它是为了**语义对齐 / 兜底**：保持
+        //   「凡是写入目录或门控相关表的端点都失效」这条规则不破例，万一将来
+        //   `buildVirtualModels` 真的开始依赖它们，这里**已经**是对的。
+        //
+        // ⇒ 那三张表**真实**影响的是：`gateOf` / `rejectedFor`（每次现算、无缓存）、
+        //   `pickerNameOf` / `isAllDefaultsUnopened`（每次 `listModels` 现算、无缓存），
+        //   以及 `routingFingerprint()` 的键。
+        // ⚠️ **而「改这三张表 ⇒ 候选序缓存失效」的**真实**机制是上一行那句
+        //   `clearChoiceCache()`**（候选序缓存 = `choiceCache`，60 秒 TTL）——
+        //   正确性其实由 `routingFingerprint()` 兜底（缓存键含这三张表的指纹），
+        //   `clearChoiceCache` 只是立即释放内存 + 语义更直白。
+        //
         // ⚠️ **只失效 `aggregate` 一个**：失效全部渠道会让「改一个开关」连带作废
         // 其余 11 家的目录缓存 ⇒ 用户改一个开关却付出十几个上游请求。
         invalidateCatalogCache(AGGREGATE_PROVIDER)
@@ -6626,6 +6677,12 @@ AUTOCLAW.id,
         await pool.clearAggregateRejected(req?.canonicalId, req?.provider)
         ctx.logger.info('[jet-hub] 聚合：已清空拒绝表（按传入的维度）')
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ **第 9 处**（2026-10-19 复审补齐）：兄弟端点 `aggregate.setRejected`
+        //   **已**接线，本端点写的是**同一张拒绝表**（只是按维度批量清空）⇒ 按接线
+        //   规则属必接线。上一行那句「漏掉任一处的 `clearChoiceCache`」说的正是它。
+        // ⚠️ 只失效 `aggregate` 自己（理由见 `setRejected` 那边）。
+        // ⚠️ 排在写入之后：上面的 `return` 是 bad-request，一个字都没改。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateRejectionsResponse = {
           aggregateRejections: pool.listAggregateRejections(),
           aggregateAllowed: pool.listAggregateAllowed(),
@@ -6714,6 +6771,11 @@ AUTOCLAW.id,
         await pool.setAggregateOrderMode(req.mode)
         ctx.logger.info(`[jet-hub] 聚合：排序模式切换为「${req.mode === 'manual' ? '按手工' : '按临期'}」`)
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ **第 10 处**（2026-10-19 复审补齐）：`orderMode` 是
+        //   `routingFingerprint()` 的**四项输入之一**（`aggregate-adapter.ts`），
+        //   即「改这三张表 ⇒ 候选序缓存失效」的真实机制的一环 ⇒ 按接线规则属必接线。
+        // ⚠️ 只失效 `aggregate` 自己（理由见 `setRejected` 那边）。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateSetOrderModeResponse = { orderMode: pool.listAggregateOrderMode() }
         return { ok: true, value }
       }
@@ -6735,6 +6797,12 @@ AUTOCLAW.id,
         const { cleared, aggregateAllowed } = await pool.clearAggregateAllowedExcept(WIRED_EXPIRY_PROVIDERS)
         ctx.logger.info(`[jet-hub] 聚合：一键拒绝非临期，恢复 ${cleared} 条候选为默认不参与`)
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ **第 11 处**（2026-10-19 复审补齐）：本端点写的是**聚合白名单**
+        //   （`clearAggregateAllowedExcept`）⇒ 与 `setAllowed` 同一张表，按接线
+        //   规则属必接线（`cleared === 0` 也算一次写入：幂等点击同样是「用户刚
+        //   要求过那个状态」，目录该重读一次）。
+        // ⚠️ 只失效 `aggregate` 自己（理由见 `setRejected` 那边）。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateRejectNonExpiringResponse = { cleared, aggregateAllowed }
         return { ok: true, value }
       }
