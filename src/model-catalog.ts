@@ -200,6 +200,16 @@ export interface ModelCatalogConfig {
    * 实现的回调」，那一条在同步契约下不成立 —— 本文件是更正后的口径。）
    */
   syncCatalog(): readonly CatalogEntry[]
+  /**
+   * ★ **强制重拉远端目录**（可选；供后台 20 分钟刷新器与「用户改设置」调用）。
+   *
+   * ⚠️ **与 `loadCatalog` 的差别**：`loadCatalog` 是「取一份目录」，各家的实现
+   * 内部**自带新鲜度判据**（`isCatalogFresh`）⇒ 新鲜时它**不拉远端**。
+   * 而本回调的语义是「**无视新鲜度，强制拉一次**」。
+   *
+   * ⚠️ 省略 ⇒ 该 provider 不参与后台刷新（`opencode` 这类本地派生渠道本来就零网络）。
+   */
+  refresh?(): void | Promise<void>
 }
 
 /**
@@ -261,6 +271,23 @@ export interface ModelCatalog {
   ): Promise<LlmResolvedModelInfo>
   /** 「显示列表」要的全量目录（**不套黑名单**）。 */
   listAllModels(): readonly { id: string; name: string; isFree?: boolean }[]
+  /**
+   * ★ **强制重拉远端目录**（后台 20 分钟刷新器与「用户改设置」共用）。
+   *
+   * ## ⚠️ 为什么是**可选**成员
+   *
+   * `createModelCatalog` 有 12 家在用，加**必选**成员会一次性打破所有实现
+   * （本仓库铁律：不得改 12 家依赖的既有形状）。可选成员则「实现了就生效、
+   * 没实现就跳过」—— `opencode` 那类本地派生渠道（零网络）本来就是空转。
+   *
+   * ## ⚠️ 与 `listModels` 的差别
+   *
+   * `listModels` 是**读驱动**：过期才拉（`isCatalogFresh` 判）。
+   * 本方法**无视新鲜度**，无条件拉一次 —— 这正是「定时保鲜」与「用户主动刷新」需要的语义。
+   *
+   * @returns 无；失败由实现自己消化（后台刷新没有调用方可通知）
+   */
+  refresh?(): Promise<void>
 }
 
 export function createModelCatalog(
@@ -307,6 +334,31 @@ export function createModelCatalog(
         ? all
         : all.filter((entry) => !disabled.has(entry.id))
       return listed.map(toModelInfo)
+    },
+
+    /**
+     * ★ **强制重拉**（无视新鲜度）。
+     *
+     * ⚠️ **未提供 `config.refresh` 时整个成员不出现**（返回 `undefined`）——
+     * 这是刻意的：调用方据此判「这家参不参与后台刷新」，比一个「调了什么都不做」
+     * 的假函数更容易发现接线错误（后者会让「刷新器说跑了 9 家、实际只刷了 3 家」
+     * 完全静默）。
+     */
+    ...config.refresh === undefined ? {} : {
+      async refresh(): Promise<void> {
+        await config.refresh!()
+        // ⚠️ 同步视图必须跟着失效：`syncCatalog()` 供**同步**的 `listAllModels()` 用，
+        //    而它在 `cached` 未设置时回落到兜底表。刷新后不更新 `cached` 的话，
+        //    `listAllModels` 会在下一次 `listModels` 之前一直看到旧目录。
+        //    ⚠️ 不清成 `undefined`（那会退回兜底表 —— 兜底表是**子集**，
+        //    用户会以为「刷新后模型反而变少了」）。
+        try {
+          cached = await config.loadCatalog()
+        } catch {
+          // ⚠️ 刷新失败**保留旧值**：后台刷新没有调用方可通知，清空只会让
+          //    UI 从「完整列表」退化成「兜底子集」，比不刷新更糟。
+        }
+      },
     },
 
     async resolveModel(
@@ -386,8 +438,115 @@ export function createModelCatalog(
       return source.map((entry) => ({
         id: entry.id,
         name: entry.name,
-        ...(entry.isFree !== undefined ? { isFree: entry.isFree } : {}),
+        ...(entry.isFree === undefined ? {} : { isFree: entry.isFree }),
       }))
     },
+  }
+}
+
+/**
+ * ★ 模型目录的**后台刷新器**：每 20 分钟叫醒所有「实现了 `refresh`」的 provider。
+ *
+ * ## 为什么需要它（用户 2026-10-18 的原话）
+ *
+ * 「各个模型的模型列表缓存也要带定时更新，20 分钟更新一次，如果不更新随高峰低谷
+ * 变化的积分消耗倍率是更新不到实际的倍率」
+ *
+ * ⚠️ 前序 Task 加的 `isCatalogFresh` 是**读驱动**的判据：只有有人读、且发现过期，
+ * 才会真去拉。没人读时缓存永远是旧的 —— 本类补上「没人读也要保鲜」那一半。
+ *
+ * ## ⚠️⚠️ 三条必须遵守的约束
+ *
+ * 1. **逐 provider 顺序执行**，不得 `Promise.all` —— 并发打上游会触发风控
+ *    （`collectCreditBalances` 的既有实测结论）。
+ * 2. **单家失败不得中断其余** —— 一个渠道的凭据坏了不该让另外 8 家停止保鲜。
+ * 3. **单飞**：一轮含真实网络请求、可达数十秒；上一轮未结束时跳过本轮。
+ */
+export interface CatalogRefresherOptions {
+  /** 当前注册的 provider id（顺序即刷新顺序）。 */
+  listProviders(): readonly string[]
+  /**
+   * 强制刷新一家。
+   *
+   * ⚠️ **未实现 `refresh` 的 provider 必须由调用方过滤掉**（返回 `undefined` 即跳过），
+   * 否则刷新器会静默地对它们空转，日志里看不出「实际只刷了 3 家」。
+   */
+  refreshOf(provider: string): void | Promise<void> | undefined
+  /** 定时器工厂（注入以便单测用假定时器）。缺省用全局 `setInterval`。 */
+  setInterval?: (fn: () => void, ms: number) => { unref?: () => void }
+  /** 刷新周期（毫秒）。缺省 {@link CATALOG_REFRESH_INTERVAL_MS}。 */
+  intervalMs?: number
+  /** 日志出口。 */
+  info?(message: string): void
+  warn?(message: string): void
+}
+
+export interface CatalogRefresher {
+  /** 武装定时器（**幂等**：重复调用不会叠加 interval）。 */
+  start(): void
+  /** 立即跑一轮（不 await 的入口由 `start` 用；单测直接 await 它）。 */
+  tick(): Promise<void>
+  stop(): void
+  isArmed(): boolean
+}
+
+export function createCatalogRefresher(options: CatalogRefresherOptions): CatalogRefresher {
+  const intervalMs = options.intervalMs ?? CATALOG_REFRESH_INTERVAL_MS
+  const setIntervalImpl = options.setInterval
+    ?? ((fn: () => void, ms: number) => setInterval(fn, ms))
+  /**
+   * ⚠️ 注入假定时器时**不得**用全局 `clearInterval` 去停它（句柄对不上）⇒ 自己分流。
+   * 宁可少一个能力，也不要留一个「看起来停了、实际还在跑」的定时器。
+   */
+  const clearImpl = options.setInterval === undefined
+    ? (handle: unknown) => { clearInterval(handle as ReturnType<typeof setInterval>) }
+    : () => {}
+  let timer: { unref?: () => void } | undefined
+  /** ⚠️ 防重入闸门**必须有**：一轮含真实网络请求，可达数十秒。 */
+  let running = false
+
+  const tick = async (): Promise<void> => {
+    if (running) {
+      options.warn?.('[jet-hub] 上一轮目录刷新尚未结束，跳过本轮')
+      return
+    }
+    running = true
+    try {
+      // ⚠️ **逐 provider 顺序**（约束 1）：并发打上游会触发风控。
+      for (const provider of options.listProviders()) {
+        try {
+          await options.refreshOf(provider)
+        } catch (error) {
+          // ⚠️ 绝不上抛（约束 2）：单家失败不得让刷新器停摆、也不得中断其余家。
+          options.warn?.(
+            `[jet-hub] ${provider} 目录刷新失败（照常继续）：`
+            + `${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+      }
+    } finally {
+      running = false
+    }
+  }
+
+  return {
+    start() {
+      // ⚠️ **幂等**（约束 3 的配套）：重复武装会叠加 interval，刷新频率翻倍。
+      if (timer !== undefined) return
+      timer = setIntervalImpl(() => { void tick() }, intervalMs)
+      timer.unref?.()   // 不拦进程退出（与既有定时器同款）
+      options.info?.(
+        `[jet-hub] 模型目录刷新器已武装（每 ${Math.round(intervalMs / 60_000)} 分钟一轮）`,
+      )
+    },
+    tick,
+    stop() {
+      if (timer === undefined) return
+      // ⚠️ **必须真的停表**：只置 `undefined` 会让 interval 继续跑（看起来停了、实际没停，
+      //    且症状是「插件已卸载但仍在打上游」—— 零报错）。
+      clearImpl(timer)
+      timer = undefined
+    },
+    isArmed: () => timer !== undefined,
   }
 }
