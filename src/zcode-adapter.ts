@@ -553,7 +553,10 @@ export class ZcodeAdapter extends LlmAdapter {
     // ⚠️⚠️ **两处判据都要改**（方法入口 + gate 后复查）。只改入口的话，
     //    第二次复查会把「刚拉到的」当成陈旧而再拉一次（放大成每轮两次上游请求）。
     //
-    // ⚠️ 边界与范本逐字同构：`aggregate-adapter.ts:715` 已用同一判据。
+    // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）；聚合
+    //    那条缓存短路（`aggregate-adapter.ts` 的 `refreshCatalog`）也走它。
+    //    ⚠️ **不是「逐字相同」**：那边另有两处本家没有的前提（`force` 与
+    //    `options.catalogTtlMs` 覆盖的 60s TTL），本家用的是 20 分钟默认周期。
     //
     // ⚠️⚠️ **结构与另三家不同**：本家已有 `this.nowImpl`（构造时从 `options.now`
     //    归一而来，`options.now ?? (() => Date.now())`）⇒ 这里**复用 `nowImpl()`**

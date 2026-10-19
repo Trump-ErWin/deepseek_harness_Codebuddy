@@ -62,6 +62,10 @@ import {
 } from './aggregate-core.js'
 import { CANONICAL_REASONING_EFFORTS, translateReasoningEffort } from './reasoning-ladder.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
+// ⚠️ 「目录够不够新」只留**一份实现**（`model-catalog.ts` 的 `isCatalogFresh`）。
+//    本文件原先自己内联 `now - this.catalogAt < ttl`，与 9 个适配器里的同一判据
+//    构成「同一语义两套判据」（仓库红线，`docs/agent-notes/misc.md`）。
+import { isCatalogFresh } from './model-catalog.js'
 // ⚠️ 只导入**常量**（不导入 `createExpiryProbe`）⇒ 依赖方向仍是
 // `aggregate-adapter → aggregate-expiry → aggregate-core`，无环。
 import { WIRED_EXPIRY_PROVIDERS } from './aggregate-expiry.js'
@@ -711,8 +715,14 @@ export class AggregateAdapter extends LlmAdapter {
    */
   async refreshCatalog(force = false, signal?: AbortSignal): Promise<VirtualModel[]> {
     const now = this.options.now?.() ?? Date.now()
-    const ttl = this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS
-    if (!force && this.catalogAt !== 0 && now - this.catalogAt < ttl) return this.catalog
+    // ⚠️ TTL **是 aggregate 自己的既有配置**（默认 {@link AGGREGATE_CATALOG_TTL_MS}
+    //    = 60s，`options.catalogTtlMs` 可覆盖），**不是**各渠道的 20 分钟
+    //    （`CATALOG_REFRESH_INTERVAL_MS`）—— 两者是不同的量，不要顺手改。
+    //    `catalogAt === 0`（从未成功推导过）由 `isCatalogFresh` 恒判陈旧，
+    //    与原先的 `this.catalogAt !== 0` 一格等价。
+    if (!force && isCatalogFresh(this.catalogAt, now, this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS)) {
+      return this.catalog
+    }
 
     // ⚠️ **中止必须在最前面查**（真实缺陷，对抗审计实测证伪 —— 这是同型缺陷的**第四处**）：
     //    本函数原先**没有 `signal` 形参**，逐渠道 `catch` 吞掉**一切**错误
