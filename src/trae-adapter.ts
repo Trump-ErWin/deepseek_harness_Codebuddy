@@ -318,6 +318,8 @@ export interface TraeAdapterOptions {
    *
    * ⚠️ 只用于**目录新鲜度**（`ensureRemoteModels` 的 `isCatalogFresh`），
    *    不用于超时/退避计时 —— 那些仍走真实时钟。
+   *    ⚠️ **buddy 是例外**：它的 `catalogGate` 也吃这个时钟（冷却与
+   *    「距上次尝试 ≥10 秒」判定都走它），所以别把本行当成全仓库通用口径。
    */
   now?: () => number
   /**

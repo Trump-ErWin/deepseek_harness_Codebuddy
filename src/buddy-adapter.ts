@@ -2176,14 +2176,23 @@ export class BuddyAdapter extends LlmAdapter {
     //    `remoteComplete && isCatalogFresh(catalogAt, now)` —— 本方法要**无视**
     //    这两条中**任意一条**成立时的短路，故两条都不判，改清这两个字段。
     //
-    // ⚠️⚠️ **实测：这两行互为冗余，删掉任一行该用例仍全绿**（反向验证 2026-10-18）。
-    //    因为任一行单独置位都足以让短路判据为假。**两行都保留**的理由不是
-    //    「需要」，而是它们各自守护**不同的未来改动**：
-    //    - `catalogAt = 0` 守「`ensureRemoteModels` 的新鲜度腿」；
-    //    - `remoteComplete = false` 守「完整性腿」——
-    //      ⚠️ 若将来有人把完整性判据从短路里摘掉（比如改成 `||`），
-    //        只留 `catalogAt` 的写法就会立刻让「完整目录」被当成要重拉的，
-    //        反之亦然。删掉任一行前请先跑反向验证确认用例真的会红。
+    // ⚠️⚠️ **当前形态下 `remoteComplete = false` 是「严格冗余」**（2026-10-18 复审核实）：
+    //    `ensureRemoteModels` 的短路是
+    //    `if (this.remoteComplete && isCatalogFresh(this.catalogAt, now)) return`
+    //    —— `&&` 要求**两腿同时为真**才 return，而 `catalogAt = 0` 时
+    //    `isCatalogFresh(0, …)` 第一行就 `return false` ⇒ **整条合取恒为假**
+    //    ⇒ 完整性腿为 true 也拦不住任何东西。
+    //    ⇒ 「只清 `catalogAt` 不够」或「前半腿会独立短路」这类说法**是错的**，
+    //    早期版本的注释就是这么写的，现已更正。
+    //
+    //    **两行都保留的理由不是「当前需要」，而是给假想的未来改动兜底**：
+    //    将来若有人把完整性判据从 `&&` 改成 `||`
+    //    （`if (isCatalogFresh(...) || this.remoteComplete) return`），
+    //    只清 `catalogAt` 时 `false || true` ⇒ 直接 return ⇒ 重测变哑。
+    //    ⚠️⚠️ **实测（反向验证 2026-10-18）：当前形态下删掉任一行该用例仍全绿**
+    //    —— 这是冗余的**已知代价**，不是疏漏。
+    //    ⇒ **删任一行前先跑反向验证**确认那条假想改动确实会发生，
+    //    并同步更新本注释（否则注释会开始描述一个不存在的必要性）。
     this.catalogAt = 0
     this.remoteComplete = false
     // ⚠️ **冷却顺序与原实现保持等价**（原代码：**判冷却 → `reset()` → 拉取**）。
