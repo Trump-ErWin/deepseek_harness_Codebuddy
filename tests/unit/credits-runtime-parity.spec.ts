@@ -418,8 +418,15 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     // ⚠️ astudio 2026-10-20 加入：`/points/balance` 的 member / buy / activity
     //    三池各带 `*NextExpireTime`（不带时区的本地时间串），由
     //    `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到 `deductionEndTime`。
+    // ⚠️ minimax / minimaxintl 2026-10-20 加入：`/minimax-cloud/api/v1/credit/details`
+    //    的每条 `details[]` 带 `expire_at_ms`（**毫秒时间戳**，无需换算），
+    //    直接写进 `deductionEndTime` —— 与 astudio 那条的形态差异是本条的价值所在
+    //    （两种输入形态都能落进同一个分桶判据）。
     const withWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true).map((d) => d.id).sort()
-    expect(withWindow).toEqual(['astudio', 'autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    expect(withWindow).toEqual([
+      'astudio', 'autoclaw', 'buddy', 'lobsterai', 'minimax', 'minimaxintl',
+      'officeace', 'trae', 'workbuddy',
+    ])
   })
 })
 

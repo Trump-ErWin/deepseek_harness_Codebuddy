@@ -200,7 +200,10 @@ describe('前后端能力声明一致（trae / lobsterai）', () => {
       expect(supportsPermanentLock(id), id).toBe(true)
     }
     // 反向：后端没登记的，前端也不得渲染按钮
-    for (const id of ['qoder', 'qodercn', 'cline', 'raccoon', 'minimax', 'zcode', 'codearts']) {
+    // ⚠️ minimax / minimaxintl 已于 2026-10-20 **移出**本名单（它们已登记
+    //    `permanentLock: true`）；留着会让本用例红 —— 这是正确的红灯，
+    //    不许靠放宽断言绕过。
+    for (const id of ['qoder', 'qodercn', 'cline', 'raccoon', 'zcode', 'codearts']) {
       expect(supportsPermanentLock(id), id).toBe(false)
     }
   })

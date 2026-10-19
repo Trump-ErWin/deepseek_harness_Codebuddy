@@ -102,7 +102,13 @@ describe('index.ts 的接线（源码级，仅守纯文本形态的约定）', (
    * 与列表长度联动 —— 加一家时只需在这张列表里加一行，两处不会漂移。
    */
   /** 直接 new `BuddyBalanceSelector` 的渠道（= 走 `kind: 'buddy'` 分档的）。 */
-  const BUDDY_SELECTOR_PROVIDERS = ['CODEBUDDY', 'WORKBUDDY', 'TRAE', 'LOBSTERAI', 'ASTUDIO'] as const
+  // ⚠️ minimax / minimaxintl 2026-10-20 加入：与 AStudio 同一条路径
+  //    （`MinimaxAdapter` 只是 `MinimaxProductType` 不同的同一个类，但
+  //    **是两个渠道 id** ⇒ 必须各建一个选号器，否则国际站的到期分档不生效）。
+  const BUDDY_SELECTOR_PROVIDERS = [
+    'CODEBUDDY', 'WORKBUDDY', 'TRAE', 'LOBSTERAI', 'ASTUDIO',
+    'MINIMAX', 'MINIMAX_INTL',
+  ] as const
   it('每个支持锁定的 provider 各建一个选号器', () => {
     const expected = [
       ['buddyBalanceSelector', 'CODEBUDDY'],
@@ -110,6 +116,8 @@ describe('index.ts 的接线（源码级，仅守纯文本形态的约定）', (
       ['traeBalanceSelector', 'TRAE'],
       ['lobsteraiBalanceSelector', 'LOBSTERAI'],
       ['astudioBalanceSelector', 'ASTUDIO'],
+      ['minimaxBalanceSelector', 'MINIMAX'],
+      ['minimaxIntlBalanceSelector', 'MINIMAX_INTL'],
     ] as const
     for (const [name, product] of expected) {
       // ⚠️ `new ` 前面要留出空格边界：`astudioBalanceSelector` 与
