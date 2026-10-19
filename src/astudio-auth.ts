@@ -65,6 +65,7 @@ import {
   defaultAstudioSessionFilePath,
   type AstudioProduct,
 } from './astudio-product.js'
+import { markLoginNeedsExternalAction } from './login-failure.js'
 import {
   astudioControlHeaders,
   astudioCookieHeader,
@@ -94,6 +95,14 @@ export class AstudioRefreshTokenExpiredError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'RefreshTokenExpiredError'
+    // ⚠️ **本类的语义就是「只能人工重新登录，静默重试无意义」**（见下方
+    //    `isAstudioTerminalRefreshError` 的说明与 `astudio.ts` 的
+    //    `ASTUDIO_SESSION_DEAD_CODES`）⇒ 出路在 **AStudio 桌面端**（微信重新扫码），
+    //    重新点「+ 新建账号」无用 ⇒ 在这里**一处**打标记，覆盖该类全部抛错点
+    //    （判据依附**类型**，不逐个调用点抄 —— 8 处抄 8 遍必然漏）。
+    //    ⚠️ 它只影响**登录失败**文案（`jet-hub-rpc.ts` 的 `loginFailureMessage`）；
+    //    续期链路抛这个类时**不走**那条路径 ⇒ 行为不变。
+    markLoginNeedsExternalAction(this)
   }
 }
 

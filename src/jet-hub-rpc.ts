@@ -121,6 +121,7 @@ import { ACCIO } from './accio-product.js'
 import { ASTUDIO } from './astudio-product.js'
 import { astudioAccountNickname, type AstudioAuth } from './astudio-auth.js'
 import { isAstudioRefreshable, type AstudioCredential } from './astudio.js'
+import { loginNeedsExternalAction } from './login-failure.js'
 import {
   createAstudioWechatQrCode,
   pollAstudioWechatScan,
@@ -2747,7 +2748,21 @@ trae, cline, loomy, raccoon, minimax,
    * 用户会看到「第一次说 A、再点一次说 B」。
    */
   function loginFailureMessage(reason: unknown): string {
-    return `登录失败：${loginReasonText(reason)}。请重新点击「+ 新建账号」。`
+    const text = loginReasonText(reason)
+    // ⚠️⚠️ **「请重新点击「+ 新建账号」」只在重试可能有意义时才加**（2026-10-20 用户报障）。
+    //
+    // 有一类失败的**出路在外部**：OfficeAce「尚未开通 ModelArts MaaS」⇒ 去**果办客户端**
+    // 点开通并同意授权；AStudio 会话失效 ⇒ 去 **AStudio 桌面端**重新微信扫码。
+    // 那些情形重新点「+ 新建账号」只会重走一遍授权、然后**再失败一次** ⇒ 那半句是
+    // **假出路**：它把用户锚在一个永远不会成功的动作上，还把内层那句唯一有用的指路
+    // 冲淡了（与 `docs/agent-notes/client-ui.md` 的 IKLBSH 同向：文案本身就是出路）。
+    //
+    // ⚠️ 判据是**抛错方打的标记**（`src/login-failure.ts`），**不是**匹配文案 ——
+    //    后者一改就失效，且属本仓库明令的「一文件两套同义判据」形态。
+    // ⚠️ fail-closed 方向：**未标记一律照旧加后缀** —— 误留后缀只是不精确，
+    //    误删后缀会让用户不知道该做什么。
+    if (loginNeedsExternalAction(reason)) return `登录失败：${text}`
+    return `登录失败：${text}。请重新点击「+ 新建账号」。`
   }
 
   /**
