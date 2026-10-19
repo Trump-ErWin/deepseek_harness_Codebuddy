@@ -30,7 +30,7 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFresh, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { isRaccoonExpired, type RaccoonCredential } from './raccoon.js'
@@ -213,6 +213,13 @@ export interface RaccoonAdapterOptions {
   refresh: () => Promise<void>
   /** 拉取远端模型目录；失败时适配器回退兜底表。 */
   fetchRemoteModels?: () => Promise<RaccoonRemoteModel[]>
+  /**
+   * 「现在」的注入点（**只供单测**推进 TTL；生产缺省 `Date.now()`）。
+   *
+   * ⚠️ 为何要注入：TTL 是本 Task 的核心判据，而真实时间无法在用例里推进 ——
+   *    只能靠 `sleep` 的用例会 flaky 且慢。既有同形态先例：`auto-adapter` 的 `now`。
+   */
+  now?(): number
   /** 读取图片附件的原始字节（内联为 data URL 用）。 */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /**
@@ -406,6 +413,14 @@ export class RaccoonAdapter extends LlmAdapter {
   private readonly fallbackIndex: ReadonlyMap<string, RaccoonFallbackModel>
   /** 远端模型缓存；未拉取时为 undefined。 */
   private remoteModels: RaccoonRemoteModel[] | undefined
+  /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。两者缺一都会坏：只有 `remoteModels` 则目录永不更新
+   *    （现状）；只有 `catalogAt` 则无内容可展示。
+   */
+  private catalogAt = 0
   /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
   private readonly catalogGate: RemoteCatalogGate
   /**
@@ -510,16 +525,29 @@ export class RaccoonAdapter extends LlmAdapter {
    * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
    */
   private async loadModels(): Promise<RaccoonRemoteModel[]> {
-    if (this.remoteModels !== undefined) return this.remoteModels
+    // ⚠️⚠️ **两处判据都要改**（方法入口 + gate 后复查）。只改入口的话，
+    //    第二次复查会把「刚拉到的」当成陈旧而再拉一次（放大成每轮两次上游请求）。
+    //
+    // ⚠️ 边界与范本逐字同构：`aggregate-adapter.ts:715` 已用同一判据。
+    if (this.remoteModels !== undefined
+      && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return this.remoteModels
+    }
     const fetchRemote = this.options.fetchRemoteModels
     if (fetchRemote !== undefined) {
       await this.catalogGate.run(async () => {
         const fetched = await fetchRemote()
         if (fetched.length === 0) return false
         this.remoteModels = fetched
+        // ⚠️ **只在成功时**记时刻：失败不写，否则一次抖动会把上界刷新掉、
+        //    下轮还要等满 20 分钟才发现上游没恢复。
+        this.catalogAt = this.options.now?.() ?? Date.now()
         return true
       })
-      if (this.remoteModels !== undefined) return this.remoteModels
+      if (this.remoteModels !== undefined
+        && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+        return this.remoteModels
+      }
     }
     return this.product.fallbackModels.map(fallbackToRemote)
   }
