@@ -25,6 +25,27 @@ function makePool() {
 }
 
 /**
+ * 把目录预热到「已折算」状态，**之后**再断言 `listModels` 的过滤/命名行为。
+ *
+ * ## ⚠️ 为什么本文件里多数 `listModels` 用例都必须先调它（2026-10-18）
+ *
+ * Task 7 改了 `listModels` 的口径：**缓存不新鲜时不再同步等上游**，而是先返回
+ * **已知**目录（冷启动时可能就是空的）、把折算转后台（见 `catalogForListModels`
+ * 的长注释，实测 `provider=aggregate` 因逐渠道读远端目录而花了 7028ms）。
+ *
+ * ⇒ 「首次冷调 `listModels` 只该看到 `auto`」现在是**正确**行为（有专门用例钉住），
+ *    因此本文件的其余用例（它们测的是**过滤 / 命名 / 白名单**，不是加载时机）
+ *    必须先让目录落地，否则测的就是「空目录上的过滤」—— 那种用例会**恒绿**，
+ *    属本仓库明令禁止的假用例形态。
+ *
+ * ⚠️ 用公开的 `refreshCatalog()`（它正是「折算 + 落目录」的既有唯一入口），
+ *    不要改私有字段。
+ */
+async function warmCatalog(adapter: AggregateAdapter): Promise<void> {
+  await adapter.refreshCatalog()
+}
+
+/**
  * ★★ 聚合层的渠道白名单必须覆盖 registry 里**全部** `channel: true` 的渠道。
  *
  * ## ⚠️ 为什么要有这一条（真实缺口，2026-10-12 对抗性审计实测）
@@ -71,6 +92,9 @@ describe('★★ 聚合渠道白名单与 registry 对齐（漏一家即红并�
     } as never
 
     const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+    // ⚠️ Task 7 之后 `listModels` 冷调**不再同步扇出**（见 `catalogForListModels`）⇒
+    //    这条用例要看「哪些渠道真的被读过」，必须先让那一轮读取落地。
+    await warmCatalog(adapter)
     await adapter.listModels(AGGREGATE_PROVIDER)
 
     expect(
@@ -91,6 +115,7 @@ describe('AggregateAdapter：目录播报', () => {
     const adapter = new AggregateAdapter(makeCtx({
       buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
     }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     expect(models.map((m) => m.id)).toEqual(['auto', 'deepseek-v4-1-flash'])
     for (const model of models) expect(model.provider).toBe(AGGREGATE_PROVIDER)
@@ -100,6 +125,7 @@ describe('AggregateAdapter：目录播报', () => {
     const adapter = new AggregateAdapter(makeCtx({
       buddy: [{ id: 'glm-5.3', name: 'GLM-5.3' }, { id: 'kimi-k3-1', name: 'Kimi-K3-1' }],
     }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     expect(new Set(models.map((m) => m.id)).size).toBe(models.length)
   })
@@ -114,6 +140,7 @@ describe('AggregateAdapter：目录播报', () => {
     const adapter = new AggregateAdapter(makeCtx({
       buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
     }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
     expect(entry!.name).toBe('DeepSeek V4.1 Flash · 最低 x0.15')
@@ -124,6 +151,7 @@ describe('AggregateAdapter：目录播报', () => {
       buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.29' }],
       codearts: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.03' }],
     }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
     // 最便宜的是 codearts 的 x0.03 —— 那才是最可能被路由到的那个价。
@@ -134,6 +162,7 @@ describe('AggregateAdapter：目录播报', () => {
     const adapter = new AggregateAdapter(makeCtx({
       buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
     }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
     expect(entry!.name).toBe('DeepSeek V4.1 Flash')
@@ -146,6 +175,7 @@ describe('AggregateAdapter：目录播报', () => {
     const adapter = new AggregateAdapter(makeCtx({
       buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · 免费' }],
     }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
     expect(entry!.name).toBe('DeepSeek V4.1 Flash · 最低 免费')
@@ -169,6 +199,7 @@ describe('AggregateAdapter：目录播报', () => {
       buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.29' }],
       codearts: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.03' }],
     }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
     expect(entry, '虚拟模型必须存在').toBeDefined()
@@ -203,6 +234,7 @@ describe('AggregateAdapter：目录播报', () => {
       buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
       cline: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.01' }],
     }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     const entry = models.find((m) => m.id === 'deepseek-v4-1-flash')
     // 前置断言：模型确实在（否则下面那条断言会因 undefined 而**假通过**的变体）。
@@ -218,6 +250,7 @@ describe('AggregateAdapter：目录播报', () => {
     const adapter = new AggregateAdapter(makeCtx({
       buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
     }), { accountPool: pool })
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     expect(models.map((m) => m.id)).toEqual(['auto'])
   })
@@ -230,7 +263,8 @@ describe('AggregateAdapter：目录播报', () => {
     }), { accountPool: pool })
     // ⚠️ 必须先热缓存：`listAllModels` 是**同步**方法，契约上只读上一次推导结果
     //（`ModelCatalogSource`；`model.list` 的真实调用序也是先 listModels 再 listAllModels）。
-    await adapter.listModels(AGGREGATE_PROVIDER)
+    // ⚠️ Task 7 之后 `listModels` 冷调不再同步扇出 ⇒ 用 `warmCatalog` 显式落地目录。
+    await warmCatalog(adapter)
     const all = adapter.listAllModels()
     // 对照：同一个模型在 listModels 里被黑名单挡掉…
     const listed = await adapter.listModels(AGGREGATE_PROVIDER)
@@ -1384,6 +1418,7 @@ describe('★ 未接入临期折算的渠道：模型**仍然可见**（用户 2
       makeCtx({ cline: [{ id: 'cline-free/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }] }),
       { accountPool: pool, expiryProbe: async () => 100 },
     )
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     expect(models.map((m) => m.id), '★ 一个都没打开 ⇒ 不进选择器')
       .toEqual(['auto'])
@@ -1409,6 +1444,7 @@ describe('★ 未接入临期折算的渠道：模型**仍然可见**（用户 2
         allowed: () => ({ 'deepseek-v4-1-flash': { cline: { 'cline-free/deepseek-v4.1-flash': true } } }),
       },
     )
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     expect(models.map((m) => m.id), '★ 打开后必须回到选择器')
       .toEqual(['auto', 'deepseek-v4-1-flash'])
@@ -1428,6 +1464,7 @@ describe('★ 未接入临期折算的渠道：模型**仍然可见**（用户 2
         rejections: () => ({ 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }),
       },
     )
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     expect(models.map((m) => m.id), '★ 主动全拒 ≠ 无临期全未打开：必须仍播报')
       .toContain('deepseek-v4-1-flash')
@@ -1452,6 +1489,7 @@ describe('★ 未接入临期折算的渠道：模型**仍然可见**（用户 2
         rejections: () => ({ 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }),
       },
     )
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     expect(models.map((m) => m.id), '全部被拒**不得**让模型从目录消失').toContain('deepseek-v4-1-flash')
     // ⚠️ 同时确认三态判据真的把它判成「不参与」—— 否则上面那条断言会掩盖过滤失效。
@@ -1469,6 +1507,7 @@ describe('★ 未接入临期折算的渠道：模型**仍然可见**（用户 2
       }),
       { accountPool: pool, expiryProbe: async () => 100 },
     )
+    await warmCatalog(adapter)
     const models = await adapter.listModels(AGGREGATE_PROVIDER)
     expect(models.some((m) => m.id === 'deepseek-v4-1-flash')).toBe(true)
     const virtual = (adapter as unknown as { catalog: Array<{ key: string, candidates: Array<{ provider: string }> }> })
@@ -3239,5 +3278,91 @@ describe('★★ 门控建池、NEVER 兜底与手工位次', () => {
       })
       expect(probes, '★ 模式是第 4 项').toBeGreaterThan(afterFirst)
     })
+  })
+})
+
+/**
+ * ★★ 目录加载**不得**同步等上游（2026-10-18，实测 `provider=aggregate 总耗时=7028ms`）。
+ *
+ * ## 实测证据与它真正的机制（实施时核对代码后订正过一次）
+ *
+ * 排障日志里 `aggregate` 的 7028ms 与 `loomy` 的 6852ms **同步出现且数值相近**，
+ * 说明二者卡在**同一个下游**。核对代码后的真实机制是：
+ *
+ * `listModels` → `refreshCatalog` → 逐渠道 `ctx.llm.listModels(provider)`（每个渠道
+ * 一次**远端目录读取**）。`loomy` 的 `listModels` → `catalog.listModels` →
+ * `loadModels()` → `fetchRemoteModels()`（真发网络请求）。⇒ 聚合的总耗时里装的就是
+ * 各渠道目录读取之和（loomy 那 6852ms 是其中最大的一项，聚合 7028ms 差额是本机开销）。
+ *
+ * ⚠️ 因此**判据必须打在上游目录读取上**（让 `ctx.llm.listModels` 永不返回），
+ *    而不是 `expiryProbe`：`refreshCatalog` 的代码里**完全没有** `expiryProbe`
+ *    （临期折算发生在 `candidatesFor`，即**发消息**路径）。若把 `expiryProbe` 做成
+ *    永不返回，这两条用例会**恒绿**（改回 `await` 也照样绿）—— 那正是本仓库
+ *    反复踩过的「无判别力判据」。
+ */
+describe('aggregate：目录加载不得同步折算余额（实测 7 秒）', () => {
+  /** 造一个「上游目录永不返回」的 ctx —— 判据的杠杆就在这里。 */
+  const makeStuckCtx = () => ({
+    logger: { warn: () => {}, info: () => {}, error: () => {} },
+    llm: {
+      listProviders: () => [{ id: 'buddy', name: 'buddy' }],
+      // ⚠️ **永不 resolve**：任何 `await` 它的调用方都会永远挂住。
+      listModels: () => new Promise<Array<{ id: string; name?: string }>>(() => {}),
+      resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+      stream: () => { throw new Error('本用例不应调用 stream') },
+    },
+  }) as never
+
+  it('★★ listModels 不等待上游目录（上游永不返回也照样出目录）', async () => {
+    const adapter = new AggregateAdapter(makeStuckCtx(), {
+      accountPool: makePool(),
+      // 临期探针也做成永不返回：即便有人误把它拉进目录路径，这条也会红。
+      expiryProbe: () => new Promise<number>(() => {}),
+    })
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const models = await Promise.race([
+      adapter.listModels(AGGREGATE_PROVIDER),
+      new Promise((resolve) => { timer = setTimeout(() => { resolve('TIMEOUT') }, 50) }),
+    ]).finally(() => { if (timer !== undefined) clearTimeout(timer) })
+    expect(models, '★★ listModels 必须不等上游目录就返回（否则选择器要等满上游超时）')
+      .not.toBe('TIMEOUT')
+    // 反向对照的下界：目录**至少要播报 `auto`**（「什么都不返回」不算通过）。
+    expect((models as Array<{ id: string }>).map((m) => m.id)).toContain('auto')
+  })
+
+  it('★ 后台折算落地后，再调能看到它（异步补算真的会落地，不是永远空目录）', async () => {
+    // ⚠️ **反向对照**：没有这条，「listModels 永远只返回 auto」也会全绿。
+    // 判据落在**可观测的落地点**上 —— 本适配器**没有**事件/广播回调，
+    // 「广播」的实体就是目录本身：后台补算完成后，目录在三个宿主可读面上同时可见
+    // （`listModels` 再次播报 / `listAllModels` 同步视图 / `describeCatalog` 的候选表）。
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
+    }), { accountPool: makePool() })
+
+    // 冷缓存首调：**先返回已知目录**（此刻为空 ⇒ 只有 auto），不等上游。
+    const first = await adapter.listModels(AGGREGATE_PROVIDER)
+    expect(
+      first.map((m) => m.id),
+      '★ 首调必须立刻返回（已知目录此时是空的 ⇒ 只有 auto）',
+    ).toEqual(['auto'])
+
+    // 让后台补算落地：排空微任务 + 一轮宏任务（不依赖挂钟，避免 flaky）。
+    for (let i = 0; i < 10; i += 1) await Promise.resolve()
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+
+    // 落地点 ①：再次 listModels 能看到折算出来的虚拟模型（含倍率后缀）。
+    const second = await adapter.listModels(AGGREGATE_PROVIDER)
+    expect(second.map((m) => m.id), '★ 后台补算完成后必须能被再次播报').toContain('deepseek-v4-1-flash')
+    expect(
+      second.find((m) => m.id === 'deepseek-v4-1-flash')?.name,
+      '★ 且是**折算过**的那一份（倍率来自真实目录）',
+    ).toBe('DeepSeek V4.1 Flash · 最低 x0.15')
+
+    // 落地点 ②：同步视图（设置页开关清单的来源）也立刻可见。
+    expect(adapter.listAllModels().map((m) => m.id)).toContain('deepseek-v4-1-flash')
+
+    // 落地点 ③：面板路径的候选表也已建好（证明补算产出的是**完整目录**）。
+    const described = await adapter.describeCatalog()
+    expect(described.models.map((m) => m.canonicalId)).toContain('deepseek-v4-1-flash')
   })
 })

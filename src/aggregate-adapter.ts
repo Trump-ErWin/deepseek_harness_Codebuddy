@@ -220,6 +220,16 @@ export class AggregateAdapter extends LlmAdapter {
   /** 上次推导时刻（目录缓存的判据）。 */
   private catalogAt = 0
   /**
+   * 「已有一轮后台目录刷新在飞」标记（{@link startBackgroundCatalogRefresh} 的单飞闸门）。
+   *
+   * ⚠️ **不合并就会扇出**：宿主对目录的调用是高频的（选择器一开就一轮），
+   * 而每次「缓存不新鲜」都会起一轮 ⇒ 十几家渠道被反复并发读取，正是
+   * {@link AGGREGATE_CATALOG_TTL_MS} 注释里要防的形态。
+   * ⚠️ 与 `catalogAt` 的区别：那个记「上次**成功**的时刻」，本标记记「此刻有没有人在跑」
+   * ——两者不可互相推导（在飞期间 `catalogAt` 仍是旧值）。
+   */
+  private catalogRefreshInFlight = false
+  /**
    * **按虚拟模型**缓存的候选序（键 = 虚拟模型 id）。
    *
    * ## 为什么需要它（规格 §9 要求，初版漏实现 ⇒ 死配置）
@@ -1035,7 +1045,7 @@ export class AggregateAdapter extends LlmAdapter {
    *     —— 目录身份保持稳定（`this.catalog` 不随门控漂移，这是上面那份不变式的另一半）。
    */
   async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    const models = await this.refreshCatalog()
+    const models = await this.catalogForListModels()
     const disabled = this.options.accountPool.disabledModelsFor(AGGREGATE_PROVIDER)
     const entries: LlmModelInfo[] = []
     if (!disabled.has(AGGREGATE_AUTO_MODEL)) entries.push(this.autoModelInfo())
@@ -1046,6 +1056,88 @@ export class AggregateAdapter extends LlmAdapter {
       entries.push({ provider, id: model.key, name: this.pickerNameOf(model), inputModalities: ['text', 'image'] })
     }
     return entries
+  }
+
+  /**
+   * 模型选择器用的目录：**缓存新鲜就同步返回；不新鲜就先返旧目录、后台补算**。
+   *
+   * ## ⚠️⚠️ 为什么不能在这里 `await refreshCatalog()`（2026-10-18，实测 7 秒）
+   *
+   * 实测排障日志：
+   * ```
+   * [buildModelCatalog] provider=aggregate 全部完成：listModels=…ms，总耗时=7028ms
+   * [buildModelCatalog] provider=loomy     全部完成：…              总耗时=6852ms
+   * ```
+   * 两者**同步出现且数值相近** ⇒ 共享同一个下游。真实机制（核对代码得出）：
+   * `refreshCatalog` 会**逐渠道 `await ctx.llm.listModels(provider)`**，即每个渠道
+   * 一次**远端目录读取**（`loomy` 的 `listModels` → `loadModels()` →
+   * `fetchRemoteModels()` 真发网络请求）。聚合的总耗时 = 各渠道目录读取之和，
+   * loomy 那 6852ms 是其中最大的一项 ⇒ 宿主 `buildModelCatalog` 里
+   * `provider=aggregate` 这一个分组就把它的选择器拖住整 7 秒，而 `auto` 这类
+   * 不需要目录的东西也被一起拖住。
+   *
+   * ⇒ `listModels` **不再等**：先播报**已知**目录（冷启动时可能只有 `auto`），
+   * 折算/读取交给后台，落地后下一次 `listModels` 自然带上它。
+   *
+   * ## 三条口径（缺一条都会让某条既有行为漂移）
+   *
+   * 1. **缓存新鲜 ⇒ 完全同步返回**（`isCatalogFresh`，与 `refreshCatalog` 的短路
+   *    **是同一个判据**）—— 常见路径（60 秒内重复打开选择器）行为与改前逐字相同；
+   * 2. **不新鲜 ⇒ 返回已知目录 + 起一次后台刷新**，**不 await**；
+   * 3. ⚠️ **后台任务必须复用 {@link refreshCatalog}**，不另写折算+读取逻辑 ——
+   *    它已经是「重新推导 + 清缓存 + 补写关闭态」的**唯一**入口，另写一份会让两条路
+   *    的上游行为分叉。
+   *
+   * ## ⚠️ 为什么**不传 signal**
+   *
+   * 后台任务没有调用方要通知（`listModels(provider)` 的契约里根本没有 signal 通道），
+   * 传了反而是错的。而不传**不会**破坏 `refreshCatalog` 里那段 abort 铁律：
+   * 那段逻辑由 `signal?.throwIfAborted()` 与 `isAbortLike(error, signal)` 组成，
+   * `signal` 为 `undefined` 时两者都**静默不做任何事** ⇒ 逐渠道真实的读取失败仍照旧
+   * 只记 warn 并跳过（既有语义），AbortError 也不会被误吞成目录缓存 —— 因为**没有**
+   * AbortError 可言（没有 signal 就没有取消源）。
+   *
+   * ## ⚠️ 单飞（不得并发两次）
+   *
+   * 选择器可能在后台那一轮还没跑完时被再开一次（宿主对目录的调用是高频的）。
+   * 若每次不新鲜都起一轮，就会对**十几个渠道**并发扇出（正是
+   * `AGGREGATE_CATALOG_TTL_MS` 注释里要防的形态）⇒ 必须靠 {@link catalogRefreshInFlight}
+   * 合并成一轮。
+   *
+   * ## 行为代价（如实登记）
+   *
+   * 冷启动（或距上次成功读取超过 60 秒）后的**第一次**打开选择器，聚合分组里
+   * 可能**只有 `auto`**，虚拟模型会在后台读取完成后出现（用户再开一次即见）。
+   * 这是「目录不再同步等上游」的必然代价，与 `auto-adapter.ts` 的
+   * `resolveModel` 那次修复（实测 70 秒）同一取舍。
+   */
+  private async catalogForListModels(): Promise<readonly VirtualModel[]> {
+    const now = this.options.now?.() ?? Date.now()
+    if (isCatalogFresh(this.catalogAt, now, this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS)) {
+      return this.catalog
+    }
+    this.startBackgroundCatalogRefresh()
+    return this.catalog
+  }
+
+  /**
+   * 起一轮后台目录刷新（幂等：已有在跑的一轮就**不**再起）。
+   *
+   * ⚠️ 见 {@link catalogForListModels}：**必须复用** {@link refreshCatalog}。
+   * ⚠️ **必须 `.catch()`**：这是 fire-and-forget，未捕获的 rejection 会变成
+   *    unhandled rejection 并可能打崩进程（与注册预热同一口径）。
+   * ⚠️ `finally` 里清在飞标记：失败后下一轮 `listModels` 必须仍能再试一次
+   *    （否则一次瞬时失败会把目录**永久**冻在空目录上 —— 那是本仓库反复修过的
+   *    「单向门」形态）。
+   */
+  private startBackgroundCatalogRefresh(): void {
+    if (this.catalogRefreshInFlight) return
+    this.catalogRefreshInFlight = true
+    void this.refreshCatalog().catch((error: unknown) => {
+      this.ctx.logger?.warn?.(`[aggregate] 后台刷新目录失败（不影响本次目录播报）：${String(error)}`)
+    }).finally(() => {
+      this.catalogRefreshInFlight = false
+    })
   }
 
   /**
