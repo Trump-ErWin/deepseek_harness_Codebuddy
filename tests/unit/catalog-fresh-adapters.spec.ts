@@ -4,7 +4,9 @@
  * ⚠️ 判据打在**行为**上：`fetchRemoteModels` 的调用次数 + 返回的目录内容，
  *    不锁内部字段（`remoteModels` / `catalogAt` 是实现细节）。
  *
- * 范本是既有的 `aggregate-adapter.ts:715`（它已带 catalogAt + TTL）。
+ * 范本是聚合的目录缓存短路（`aggregate-adapter.ts` 的 `refreshCatalog`，
+ * 它同样带 `catalogAt` + TTL，**且同样调 {@link isCatalogFresh}** —— 但它用的是
+ * 自己的 60s `AGGREGATE_CATALOG_TTL_MS`，不是这里的 20 分钟，故本文件不锁它）。
  */
 import { describe, expect, it, vi } from 'vitest'
 import { LoomyAdapter } from '../../src/loomy-adapter.js'

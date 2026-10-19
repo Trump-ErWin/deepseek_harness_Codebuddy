@@ -438,7 +438,10 @@ export class MinimaxAdapter extends LlmAdapter {
     // ⚠️⚠️ **两处判据都要改**（方法入口 + gate 后复查）。只改入口的话，
     //    第二次复查会把「刚拉到的」当成陈旧而再拉一次（放大成每轮两次上游请求）。
     //
-    // ⚠️ 边界与范本逐字同构：`aggregate-adapter.ts:715` 已用同一判据。
+    // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）；聚合
+    //    那条缓存短路（`aggregate-adapter.ts` 的 `refreshCatalog`）也走它。
+    //    ⚠️ **不是「逐字相同」**：那边另有两处本家没有的前提（`force` 与
+    //    `options.catalogTtlMs` 覆盖的 60s TTL），本家用的是 20 分钟默认周期。
     if (this.remoteModels !== undefined
       && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
       return this.remoteModels
