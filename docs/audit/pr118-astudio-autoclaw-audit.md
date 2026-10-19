@@ -189,3 +189,82 @@ git worktree remove --force D:\jet\code\js\dh-wt-adv
 ```
 
 合并结果落在分支 `pr118-astudio` 的提交 `8b1ef43`（本地，未推送）。
+
+---
+
+# 第二部分：本地修复与变异验证（2026-10-18）
+
+修复提交 **`f09a2e7`**（在 `8b1ef43` 之上），随后追加注释订正提交。
+`pnpm test`：**9653 passed / 6 skipped / 0 failed**（修前 9640，差额 = 新增守卫 13 例）；`pnpm typecheck` 0 error；`pnpm build:client` 通过。
+
+## 9. 修复清单
+
+| # | 项 | 改动 | 位置 |
+|---|---|---|---|
+| 1 | **目录 20 分钟 TTL 未接入**（用户关注的"模型列表定期更新缓存"） | 入口加 `isCatalogFreshFor` gate；**仅成功时**写新字段 `catalogAt`；`now` 可注入（与其余 11 家同款约定）；失败冷却与 TTL 统一到同一份可注入时钟（原冷却用 `Date.now()`） | `src/astudio-adapter.ts` |
+| 2 | **后台目录刷新器未接入** | `createModelCatalog` 补 `refresh` 回调；适配器新增 `refresh()` 实例成员转发 `this.catalog.refresh?.()`（`index.ts:3566` 的 `refreshOf` 唯一入口） | 同上 |
+| 3 | **硬编码开发机 session 路径**（P1-1） | 新增 `defaultAstudioSessionFilePath(env)` 按 `LOCALAPPDATA` 推导（缺失回落 `homedir()`）；`ASTUDIO.sessionFilePath` 改为**可选**且不再持有字面量；`astudioSessionFilePath` 的回落改为**按传入 env 推导**（原为读静态字段 ⇒ 两个输入不同源、默认值那一腿测不动） | `src/astudio-product.ts`、`src/astudio-auth.ts` |
+| 4 | **门禁档位与播报档位不同源**（P1-3） | 门禁改用 `astudioReasoningOf()` 的输出（含"只有 `defaultEffort` ⇒ 单档"腿），不再读原始 `efforts` | `src/astudio-adapter.ts` |
+| 5 | **守卫补齐** | 新建 `tests/unit/astudio-catalog-effort.spec.ts`（12 例：目录 TTL 4 + 强制重拉/刷新入口 2 + 档位拦截 6）；`astudio-auth.spec.ts` 补 session 路径**行为**断言（原断言是对常量的同义反复） | tests |
+| 6 | 注释失实（P2-4） | `provider-credits.ts` 的 astudio 段订正（原文称"刻意不提供 claim / dailyCheckin: false"，而同段就实现了 claim、registry 也是 true） | `src/provider-credits.ts` |
+| 7 | 豁免守卫恒真（P2-1） | `aggregate-adapter.spec.ts` 用例③补 `await warmCatalog(adapter)`（Task 7 后冷调不再扇出 ⇒ 原断言恒真） | tests |
+
+## 10. 变异验证（每项独立注入，跑完还原）
+
+判据：把守卫**删腿/改坏**后，其声称会红的用例必须真红。按**行号**替换（规避 CRLF 静默不生效与子串歧义），每次替换后**重读该行**确认落地（无 `PATCH-NOT-APPLIED`）。
+
+| 变异 | 目标 | 期望红的用例 | 实测 |
+|---|---|---|---|
+| M1 | 禁用目录 TTL gate（`&& false`） | 满 20 分钟必须重拉 | **3 failed / 9 passed** ✅ 有牙 |
+| M2 | `refresh()` 改名（去掉刷新器入口） | 必须暴露 `refresh()` | **1 failed / 11 passed** ✅ 有牙 |
+| M3 | 档位判据短路（`true \|\| set.includes(...)`） | 集合外不发该字段 | **2 failed / 10 passed** ✅ 有牙 |
+| M4 | 门禁改回读**原始** `efforts`（P1-3 回归） | 单档模型必须放行 | **1 failed / 11 passed** ✅ 有牙 |
+| M5 | session 路径改回硬编码（P1-1 回归） | 默认路径必须按当前用户推导 | **2 failed / 52 passed** ✅ 有牙 |
+| M6 | `refreshCatalog` 只删 `catalogAt = 0` | 必须无视 TTL 真重拉 | **0 failed / 12 passed** ⚪ **无牙**（见下） |
+| M6' | `refreshCatalog` **两条清腿都删** | 同上 | **1 failed / 11 passed** ✅ 有牙 |
+| M6'' | `refreshCatalog` 只删 `remoteModels = undefined` | 同上 | **0 failed / 12 passed** ⚪ **无牙**（见下） |
+| M7 | 把 `astudio` 塞进 `AGGREGATE_CHANNELS` | 豁免用例③点名 | **22 failed / 110 passed** ✅ 有牙（P2-1 修复生效） |
+
+### 如实登记：M6 / M6'' 是**互为冗余的两条腿**，不是漏判据
+
+`loadModels` 的 gate 是**合取** `remoteModels !== undefined && isCatalogFreshFor(…)`，
+而 `isCatalogFresh` 对 `at === 0` **恒判陈旧**（`model-catalog.ts:255`）
+⇒ 清掉任一条都足以让 gate 失效，故**单独删任一条行为逐例不变**；**两条都删**才退化。
+⇒ `refreshCatalog` 的不变式是「**至少清一条**」而非「必须清某一条」。
+两条都保留是防御（与新增的 `catalog.refresh` 回调同款写法），但**已在代码注释与用例注释里
+订正为"不得把任一条单独说成承重腿"** —— 初版注释把 `catalogAt = 0` 写成承重腿，
+那是**假因果**（本仓库明令的失效形态），已由本轮的变异实测推翻并订正。
+
+## 11. 本次修复**未**覆盖、需要单独决策的项（如实登记）
+
+1. **master 侧的目录刷新器对全部 12 家都是空转**：`src/index.ts:3566` 调
+   `adapter.refresh?.()`，而实测 12 家适配器**原型上都没有 `refresh` 成员**
+   （`model-catalog.ts:509` 的 `ModelCatalog.refresh` 只在 **catalog 实例**上，
+   不会自动变成适配器成员）；`catalog-refresher-wiring.spec.ts` 的 2 条用例
+   **只断言"武装日志"**，没有任何一条断言"真的刷了某家"。
+   本次只给 **astudio** 补了该成员 ⇒ astudio 成了**唯一**真正接入的家。
+   ⚠️ 一并修 11 家会改动 master 侧 11 个适配器，超出本 PR 范围，建议单独开 PR
+   （并同时补一条"至少一家真的被刷"的行为守卫）。
+2. **P2-5（auth 格用 `AUTH` 吞掉指路文案）未改**：改动错误码会影响 harness 的
+   重试语义（`AUTH` 不在 `DEFAULT_RETRYABLE_CODES`），需要与产品取舍一并决定；
+   报告里给了建议（改用 `INVALID_CREDENTIAL`）。
+3. **P2-6（`providers-astudio.md` 未登记进 AGENTS.md 索引）未改**：AGENTS.md 有
+   111 KB 的并发编辑风险，建议由维护者手工插入一行。
+4. **P3-1（`inputModalities` 会随远端变 `['text','image']` 而本家无 `readImage`）未改**：
+   当前不可达（远端六模型全 `text`、兜底表 `supportsImage` 全 false）。
+   若要修，方向是"无图片上行通路时恒报 `['text']`"或补 `readImage` 注入。
+5. **P3-3 / P3-4 未改**（`displayName ≠ label`、纯函数非字符串输入无防御）：
+   前者是产品观感取舍，后者当前不可达。
+
+## 12. 用户问题的直接回答（"新 provider 是否接入公用缓存"）
+
+| 机制 | astudio 修前 | 修后 |
+|---|---|---|
+| 目录 20 分钟 **TTL 缓存**（`isCatalogFresh` / `isCatalogFreshFor`） | ❌ **未接入**（`loadModels` 只判 `remoteModels !== undefined` ⇒ 拉到一次永不重拉；`invalidateCatalogCache` 对本家完全无效） | ✅ 已接入 |
+| 后台 **20 分钟目录刷新器**（`createCatalogRefresher`） | ❌ 未接入（且 master 侧 12 家全都没接，见 §11.1） | ✅ astudio 已接入（其余 11 家待单独修） |
+| 用户改设置**立即失效**目录（`invalidateCatalogCache`） | ❌ 名义接入、实际无效（因为不读 `isCatalogFresh`） | ✅ 生效 |
+| **账号/余额信息缓存**（`balanceCache`） | ✅ 已接入（`fetchBalanceReading` 经 `runtimeOf(provider).credits` 通用分派，astudio 在 `provider-credits` 表里） | ✅ 不变 |
+| 失效模型剔除（`withDeadModelPruning`） | ✅ 自动（`pruned()` 包装） | ✅ 不变 |
+| 目录共享骨架（`createModelCatalog` / `prepareCall` / 三态） | ⚠️ 用了骨架但缺 `refresh` 回调与 TTL 判据 | ✅ 补齐 |
+| 聚合临期折算（`WIRED_EXPIRY_PROVIDERS`） | ✅ 有意不接且已登记（有行为守卫） | ✅ 不变 |
+| 凭据续期调度（`refresh-scheduler`） | N/A（本家凭据磁盘无 TTL、无 `expiresAt`） | N/A |
