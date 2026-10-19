@@ -732,9 +732,27 @@ export function createCatalogRefresher(options: CatalogRefresherOptions): Catalo
     running = true
     try {
       // ⚠️ **逐 provider 顺序**（约束 1）：并发打上游会触发风控。
+      //
+      // ⚠️⚠️ **必须统计「本轮有几家真的参与」**（2026-10-20 修正）：
+      //    `refreshOf` 返回 `undefined` 是「这家不参与后台刷新」的**合法**表达，
+      //    但此前**没有任何东西**区分「有意不参与」与「忘了接线」——
+      //    而 `be42b25` 实测正是后者：13 家适配器**都没有**把 `catalog.refresh`
+      //    转发成自己的 `refresh` 成员（它们只给了 `createModelCatalog` 的 config
+      //    回调），于是每一轮都是 **0 家**，而 `start()` 的「已武装」日志照打 ⇒
+      //    功能整体失效却**一行日志都没有**。
+      //    ⚠️ `be42b25` 的原注释声称「返回 undefined 比一个『调了什么都不做』的
+      //    假函数更容易发现接线错误」—— **实测恰好相反**：假函数至少会真发请求。
+      //    ⇒ 零参与必须 warn（强信号：几乎可断定是接线缺口）。
+      let total = 0
+      let participated = 0
       for (const provider of options.listProviders()) {
+        total += 1
         try {
-          await options.refreshOf(provider)
+          const outcome = options.refreshOf(provider)
+          // ⚠️ 判据是「**是否返回了东西**」：`index.ts` 的实现保证「适配器有
+          //    `refresh` 成员 ⇒ 返回 Promise；没有 ⇒ 返回 undefined」。
+          if (outcome !== undefined) participated += 1
+          await outcome
         } catch (error) {
           // ⚠️ 绝不上抛（约束 2）：单家失败不得让刷新器停摆、也不得中断其余家。
           options.warn?.(
@@ -742,6 +760,20 @@ export function createCatalogRefresher(options: CatalogRefresherOptions): Catalo
             + `${error instanceof Error ? error.message : String(error)}`,
           )
         }
+      }
+      if (total > 0 && participated === 0) {
+        options.warn?.(
+          `[jet-hub] 模型目录刷新器本轮**无一家参与**（共 ${total} 家）—— `
+          + '刷新器已武装却形同空转，几乎可断定是接线缺口：'
+          + '各家适配器必须把 `catalog.refresh` 转发为自己的 `refresh` 成员'
+          + '（`pruned()` 的 Proxy 只透传适配器**自己的**成员）。',
+        )
+      } else if (participated < total) {
+        // ⚠️ 部分参与不 warn（有些家有意不参与），但必须留痕 ——
+        //    否则「说跑了 N 家、实际只刷了 M 家」仍然是静默的。
+        options.info?.(
+          `[jet-hub] 模型目录刷新器本轮参与 ${participated}/${total} 家`,
+        )
       }
     } finally {
       running = false
