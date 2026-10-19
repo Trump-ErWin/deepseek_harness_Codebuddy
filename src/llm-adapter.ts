@@ -7,7 +7,7 @@ import {
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFresh, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
@@ -237,6 +237,13 @@ export interface CodeArtsAdapterOptions {
    * 向后兼容口径一致（`complete = got`）。
    */
   catalogComplete?: () => boolean | undefined
+  /**
+   * 时钟（注入以便单测推进目录 TTL；缺省 `Date.now`）。
+   *
+   * ⚠️ 只用于**目录新鲜度**（`ensureRemoteModels` 的 `isCatalogFresh`），
+   *    不用于超时/退避计时 —— 那些仍走真实时钟。
+   */
+  now?: () => number
   fetchImpl?: typeof fetch
   chatId?: string
   sessionId?: string
@@ -1014,6 +1021,14 @@ export class CodeArtsAdapter extends LlmAdapter {
   private remoteComplete = false
 
   /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+   */
+  private catalogAt = 0
+
+  /**
    * 目录加载闸门：并发去重 + 失败冷却。
    *
    * ⚠ **不能省**：DSH 的 `buildModelCatalog` 对每个 provider `await listModels()`
@@ -1024,26 +1039,43 @@ export class CodeArtsAdapter extends LlmAdapter {
   private readonly catalogGate: RemoteCatalogGate
 
   /**
-   * 懒加载远端模型目录。resolveModel 可能先于 listModels 被调用
-   * （如直接进入会话），此时同样触发远端拉取。
+   * 懒加载远端模型目录（**每 20 分钟**重新拉一次，用户 2026-10-18 的要求）。
+   *
+   * resolveModel 可能先于 listModels 被调用（如直接进入会话），此时同样触发远端拉取。
    */
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
+    // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+    //    可拉」（无凭据/无接线），与新鲜度是两件事。
     if (fetchRemote === undefined) return
-    // ⚠️⚠️ **短路判据是「已完整」，不是「已定义」**（issue IKJVTF 复审，审计 I3）。
+    // ⚠️⚠️ **短路判据是「已完整」+「未超 20 分钟」，不是「已定义」**
+    //    （issue IKJVTF 复审，审计 I3；TTL 由 `isCatalogFresh` 给出）。
     //
     // CodeArts 有两个独立目录端点，残缺目录**也**要落 `remoteModels`
     //（展示需要 —— 目录服务抖动时用户的模型列表不该整个消失），但那时**不能**
     // 短路：`RemoteCatalogGate` 的冷却（`retryAt` / `cooling()`）在生产里只有
     // 闸门自己那一处调用点，而它排在短路**之后** ⇒ 残缺目录一旦落缓存，
     // 冷却永远读不到、残缺永远补不齐（与 Cline 的缺陷② 完全同构）。
-    if (this.remoteComplete) return
+    //
+    // ⚠️⚠️ **加 TTL 为什么不会破坏残缺恢复**（加 TTL 前逐行核实）：
+    // TTL 那一腿是 `&&` 的**后半截**，前半截 `remoteComplete` 未变。残缺时
+    // `remoteComplete === false` ⇒ 短路判据恒为假 ⇒ **残缺目录不会被判为
+    // 「新鲜」，闸门冷却与补齐逻辑原样生效**。TTL 只让「重新拉取」变得可发生
+    // （完整目录满 20 分钟会被重新拉，倍率/目录变化能跟上），不改变残缺的纠正路径。
+    // ⇒ **未改任何合并逻辑**（两个端点各自成败仍由接线层经 `catalogComplete` 上报）。
+    if (this.remoteComplete
+      && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return
+    }
     await this.catalogGate.run(async () => {
       const models = await fetchRemote()
       // 空目录同样算「没拿到」：既不应落缓存（否则再也拉不回来），
       // 也不应立刻重试（否则每个模型都打一次空请求）。
       if (models.length === 0) return false
       this.remoteModels = models
+      // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+      //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+      this.catalogAt = this.options.now?.() ?? Date.now()
       // ⚠️ 完整性由接线层桥接的数据源上报（两来源各自的成败）。
       // 拿不到判定时退回 `got`（= 旧行为），避免把「判不出」当成「残缺」
       // 而让每个 provider 都反复重拉。
