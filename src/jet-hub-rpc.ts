@@ -795,6 +795,34 @@ export interface CreditsEndpointDeps<
      */
     roundDeadlineAt: number | undefined,
   ) => Promise<RpcBuddyGrowthAccountResult | undefined>
+  /**
+   * 签到收尾的**附加提示**（可选；对 `claimed` 与 `already-claimed` **都会跑**）。
+   *
+   * ## 为什么需要它（2026-10-20 用户报障，真机截图）
+   *
+   * TRAE 的「1024 打卡抽奖」应该在**点签到按钮**时触发。第一版把抽奖挂在
+   * `claimTraeDailyCheckin` 内部 ⇒ **几乎永不触发**：本家 `precheckStatus: true`，
+   * `credits.claimAll` 会先查状态，今天已签到就直接回 `already-claimed`、
+   * **根本不调 `claim`**（见上面 `precheck` 那段）。而「已签到」恰恰是最该抽奖的
+   * 时机（签到后才解锁抽奖）⇒ 用户实测 4 个账号全显示「今天已签到」、
+   * 一条抽奖信息都没有。
+   *
+   * ## 契约
+   *
+   * - 返回**字符串** ⇒ 追加到该账号的 `outcome.message`（客户端已经渲染这一行）；
+   * - 返回 `undefined` ⇒ 什么都不加（**不该抽的情形必须回 undefined**，
+   *   报「今天本来就不该抽」只会制造噪声）；
+   * - **永不抛**：抽奖是不可逆写操作且会因「今日已参与 / 窗口外 / 无资格」失败，
+   *   那些都**不是**签到失败（本仓库有两轮「登录成功却因记账失败被报成失败」事故史）。
+   *
+   * ⚠️ 只有 trae 注入；其余 provider 不传 ⇒ 行为逐字不变。
+   */
+  afterClaimNote?: (
+    credential: TCredential,
+    product: TProduct,
+    entry: ProviderAccountEntry,
+    outcome: ClaimOutcome,
+  ) => Promise<string | undefined>
   /** 查询积分余额；默认使用真实的 fetchCreditBalance。 */
   fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
   /**
@@ -1039,6 +1067,34 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
     }
     outcomes.push(outcome)
     results.push({ accountId: entry.id, nickname: entry.nickname, outcome })
+    // ★ **签到收尾的附加提示**（2026-10-20）：本条对 `claimed` 与 `already-claimed`
+    //   **都会跑** —— 后者正是「今天已签到」的账号（本家 precheck 直接回它、
+    //   连 `claim` 都不调），而它恰恰最该抽奖。见 `afterClaimNote` 的契约说明。
+    //   ⚠️ 必须在 `results.push` **之后**改写（改的是同一对象引用）——
+    //      放到之前也行，但那时 `outcome` 还没定稿，语义容易读错。
+    if (deps.afterClaimNote !== undefined) {
+      try {
+        const resolvedForNote = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolvedForNote !== undefined) {
+          const credentialForNote = JSON.parse(resolvedForNote.value) as TCredential
+          const note = await deps.afterClaimNote(
+            credentialForNote, product, entry, outcome,
+          )
+          if (typeof note === 'string' && note.length > 0) {
+            // ⚠️ 只改**这一条** outcome 的 message（客户端渲染的就是它）。
+            //    `claimed` 结局原本没有 message 字段 ⇒ 这里补上；
+            //    `already-claimed` / `inactive` / `failed` 则是追加在原文案之后。
+            const target = results[results.length - 1]!.outcome as { message?: string }
+            target.message = typeof target.message === 'string' && target.message.length > 0
+              ? `${target.message} · ${note}`
+              : note
+          }
+        }
+      } catch (error) {
+        // ⚠️ 抽奖的任何异常都不得影响签到结果（契约见 `afterClaimNote`）。
+        deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 收尾提示失败: ${String(error)}`)
+      }
+    }
     // 成长中心等「领取之后」的下钻：与签到共用这一趟循环，避免把凭据解析做两遍。
     // 它的异常只让该项自己失败，不影响已定稿的签到 outcome。
     if (deps.afterClaim !== undefined) {
@@ -5559,6 +5615,19 @@ trae, cline, loomy, raccoon, minimax,
           claim: (credential, _product, entry) => impl.claim!(credential, entry, callContext),
           // ⚠️ 由能力表驱动，不再散落 provider 字面量。
           ...impl.precheckStatus === undefined ? {} : { precheckStatus: impl.precheckStatus },
+          // ★ 签到收尾的附加提示（TRAE 的 1024 打卡抽奖走这里）。
+          //   ⚠️ **必须透传**：漏了它症状是「抽奖永远不触发」且**日志零字**
+          //   —— 与 `afterClaim` 漏接线同型（那格已复发过一次）。
+          ...impl.afterClaimNote === undefined
+            ? {}
+            : {
+                afterClaimNote: (credential: unknown, _product: unknown, entry: unknown) =>
+                  impl.afterClaimNote!(
+                    credential,
+                    entry as never,
+                    undefined as never,
+                  ),
+              },
           // ⚠️ 预检优先用 `claimStatus`，缺席时回落到 `fetchStatus`
           //（buddy / minimax 的预检与面板读数是同一个端点，只声明一次）。
           ...(impl.claimStatus ?? impl.fetchStatus) === undefined
