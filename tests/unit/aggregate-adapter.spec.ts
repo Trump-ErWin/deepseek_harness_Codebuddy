@@ -1,5 +1,33 @@
 import { describe, expect, it } from 'vitest'
-import { AggregateAdapter, AGGREGATE_PROVIDER, maxAttemptsFor, registerAggregateLlm } from '../../src/aggregate-adapter.js'
+import {
+  AggregateAdapter,
+  AGGREGATE_COLD_CONTEXT_WINDOW,
+  AGGREGATE_FALLBACK_CONTEXT_WINDOW,
+  AGGREGATE_PROVIDER,
+  maxAttemptsFor,
+  registerAggregateLlm,
+} from '../../src/aggregate-adapter.js'
+
+/**
+ * 把一次异步调用**限定在预算内**跑完：超时返回 `'TIMEOUT'`（而不是 reject）。
+ *
+ * ⚠️ 返回哨兵字符串而不是抛错，是为了让断言能写出「期望**不是** TIMEOUT」这句
+ * 可读的话（如果直接 reject，Vitest 会先打印超时错误、判别信息被淹没）。
+ * ⚠️ 定时器必须清掉：不清会让测试进程多挂几百毫秒（本文件有 20+ 处这种用法）。
+ */
+async function raceIn<T>(ms: number, work: () => Promise<T>): Promise<T | 'TIMEOUT'> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      work(),
+      new Promise<'TIMEOUT'>((resolve) => {
+        timer = setTimeout(() => { resolve('TIMEOUT') }, ms)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
 
 /** 造一个最小 ctx：llm.listModels 播报给定目录。 */
 function makeCtx(catalogs: Record<string, Array<{ id: string; name?: string }>>) {
@@ -296,6 +324,10 @@ describe('AggregateAdapter：resolveModel 必须按入参回填', () => {
     const adapter = new AggregateAdapter(makeCtx({
       buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
     }), { accountPool: makePool() })
+    // ⚠️ 必须先让目录落地：2026-10-18 起目录为空时 `resolveModel` **不等待**
+    //    （立刻回保守元数据，见 `coldModelInfo`）⇒ 冷帧下**任何** id 都不会抛
+    //    INVALID_REQUEST，本用例会因测的是「冷帧」而失去判别力。
+    await warmCatalog(adapter)
     await expect(adapter.resolveModel(AGGREGATE_PROVIDER, 'no-such-model'))
       .rejects.toMatchObject({ code: 'INVALID_REQUEST' })
   })
@@ -316,6 +348,9 @@ describe('AggregateAdapter：resolveModel 必须按入参回填', () => {
     const adapter = new AggregateAdapter(makeCtx({
       buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
     }), { accountPool: makePool() })
+    // ⚠️ 目录必须先落地：冷帧（`this.catalog` 为空）时刻意**不声明**档位
+    //    （见 `coldModelInfo`：编一份档位等于替用户承诺可能不存在的档位）。
+    await warmCatalog(adapter)
     const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
     expect(info.reasoning).toBeDefined()
     expect(info.reasoning!.efforts.length).toBeGreaterThan(0)
@@ -335,6 +370,7 @@ describe('AggregateAdapter：resolveModel 必须按入参回填', () => {
       // 这里就会得到 on/off 两个渠道私有档，而不是规范化并集。
       codearts: [{ id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash' }],
     }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
     const ids = info.reasoning!.efforts.map((effort) => String(effort.id))
     // 规范化并集应含 medium / high 这类规范名，且**不含** on/off 这类渠道私有档。
@@ -349,6 +385,7 @@ describe('AggregateAdapter：resolveModel 必须按入参回填', () => {
     const adapter = new AggregateAdapter(makeCtx({
       codearts: [{ id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash' }],
     }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
     const efforts = info.reasoning!.efforts
     const nameOf = (id: string): string | undefined =>
@@ -363,7 +400,14 @@ describe('AggregateAdapter：resolveModel 必须按入参回填', () => {
   })
 
   it('`auto` 也声明档位（不能因走了特殊分支而漏掉）', async () => {
-    const adapter = new AggregateAdapter(makeCtx({}), { accountPool: makePool() })
+    // ⚠️ 必须给**至少一个渠道**：2026-10-18 起「目录为空 ⇒ `resolveModel` 立刻回
+    //    保守元数据」（`coldModelInfo`，**刻意不声明档位** —— 编一份等于替用户承诺
+    //    可能不存在的档位）。用空目录的 `makeCtx({})` 会让本用例测到冷帧那条分支，
+    //    从而**测不到**它真正要守的「`auto` 走热路径时也声明档位」。
+    const adapter = new AggregateAdapter(makeCtx({
+      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+    }), { accountPool: makePool() })
+    await warmCatalog(adapter)
     const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'auto')
     expect(info.reasoning).toBeDefined()
     expect(info.reasoning!.efforts.length).toBeGreaterThan(0)
@@ -1602,6 +1646,8 @@ describe('★ 报错文案：面板现在**真的存在**了，必须指向它�
     const adapter = new AggregateAdapter(makeCtx([{ id: 'glm-5.3', name: 'GLM-5.3' }]), {
       accountPool: pool, expiryProbe: async () => 100,
     })
+    // ⚠️ 目录必须先落地（冷帧下 `resolveModel` 不等待、不抛未知模型错，见其方法头）。
+    await adapter.refreshCatalog()
     await expect(adapter.resolveModel(AGGREGATE_PROVIDER, 'nope'))
       .rejects.toThrow(/模型选择器/)
   })
@@ -2660,6 +2706,10 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
       infoCalls,
     ), { accountPool: makePool() })
 
+    // ⚠️ 目录必须先落地：2026-10-18 起「目录为空 ⇒ `resolveModel` 立刻回保守元数据」
+    //    （`coldModelInfo`，窗口是 `AGGREGATE_COLD_CONTEXT_WINDOW`）⇒ 冷帧下本组
+    //    用例测的会是「兜底常量」而不是「候选集取大」，全部失去判别力。
+    await warmCatalog(adapter)
     const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
     expect(info.context?.contextWindow).toBe(1_000_000)
     // 对照：候选确实有三条（否则上面那条断言可能只是「只有一个候选」的巧合）。
@@ -2680,6 +2730,7 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
       infoCalls,
     ), { accountPool: makePool() })
 
+    await warmCatalog(adapter)
     const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
     expect(info.context?.contextWindow).toBe(200_000)
     // 必须是**正整数**（DSH 的 `normalizeModelInfo` 逐字校验，非法即 INVALID_MODEL_CONTEXT）。
@@ -2701,6 +2752,7 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
       infoCalls,
     ), { accountPool: makePool() })
 
+    await warmCatalog(adapter)
     const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'auto')
     expect(info.context?.contextWindow).toBe(1_000_000)
   })
@@ -2728,6 +2780,9 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
     ), { accountPool: makePool() })
 
     // 模拟 `buildModelCatalog`：先 listModels，再对每个模型 resolveModel。
+    // ⚠️ Task 7 之后 `listModels` 冷调**不再同步扇出** ⇒ 必须先让目录落地，
+    //    否则下面逐模型 `resolveModel` 全走冷帧、`infoCalls` 恒为 0（用例恒绿/恒红）。
+    await warmCatalog(adapter)
     const listed = await adapter.listModels(AGGREGATE_PROVIDER)
     for (const model of listed) await adapter.resolveModel(AGGREGATE_PROVIDER, model.id)
 
@@ -2767,6 +2822,7 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
     } as never
     const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
 
+    await warmCatalog(adapter)
     // ① 只有 buddy（200K）⇒ 声明 200K。
     expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
       .toBe(200_000)
@@ -2801,6 +2857,7 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
     } as never
     const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
 
+    await warmCatalog(adapter)
     // ① 抖动期间 ⇒ 兜底值。
     expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
       .toBe(200_000)
@@ -2845,6 +2902,7 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
     } as never
     const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
 
+    await warmCatalog(adapter)
     // ① codearts 抖动 ⇒ 用可用候选里的最大值（buddy 的 1M），不是兜底的 200K。
     expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
       .toBe(1_000_000)
@@ -3364,5 +3422,283 @@ describe('aggregate：目录加载不得同步折算余额（实测 7 秒）', (
     // 落地点 ③：面板路径的候选表也已建好（证明补算产出的是**完整目录**）。
     const described = await adapter.describeCatalog()
     expect(described.models.map((m) => m.canonicalId)).toContain('deepseek-v4-1-flash')
+  })
+
+  /**
+   * ★★ **DSH 的真实形状**：`listModels()` 之后**逐模型** `resolveModel()`。
+   *
+   * ## 为什么单测 `listModels` 非阻塞是**不够**的（控制方实测，Task 7 没达成目标）
+   *
+   * `dsh-api-session-controller/lib/index.js` 的 `buildModelCatalog` 是：
+   *
+   * ```js
+   * const models = await ctx.llm.listModels(provider.id)     // 1ms —— Task 7 修的就是这里
+   * const entries = await Promise.all(models.map(async (model) =>
+   *   ctx.llm.resolveModelInfo(provider.id, model.id)))      // ← 7 秒全在这里
+   * ```
+   *
+   * Task 7 之后排障日志的 `listModels=` 那格确实降到 1ms，但**总耗时仍在 7 秒级** ——
+   * 因为 `resolveModel` 的首行还是 `await this.ensureCatalog(signal)`。⇒ 耗时只是从
+   * 一格**搬到了另一格**，用户感知零改善。
+   *
+   * ## ⚠️⚠️ 判据为什么必须是「**两段都**在预算内」
+   *
+   * 只断言 `listModels` 快 → 改前也绿（Task 7 已经做到了），**恒绿**。
+   * 只断言 `resolveModel` 快 → 会漏掉 `listModels` 的回归。
+   * ⇒ 两段都要，且**必须按 DSH 的真实顺序串起来**（先 listModels，再对它播报的
+   *   每个 id 调 resolveModel）—— 否则测的不是生产路径。
+   */
+  it('★★ DSH 真实形状：listModels 之后逐模型 resolveModel，上游永挂时两段都在预算内', async () => {
+    const adapter = new AggregateAdapter(makeStuckCtx(), {
+      accountPool: makePool(),
+      expiryProbe: () => new Promise<number>(() => {}),
+    })
+    const models = await raceIn(500, async () => await adapter.listModels(AGGREGATE_PROVIDER))
+    expect(models, '★ 前置：listModels 必须立刻返回（Task 7 已修，用作对照）').not.toBe('TIMEOUT')
+    const ids = (models as Array<{ id: string }>).map((model) => model.id)
+    expect(ids, '★ 冷帧至少播报 auto').toContain('auto')
+
+    // ★ 核心判据：**逐模型** resolveModel 也必须立刻返回（不是 TIMEOUT）。
+    const resolved = await raceIn(500, async () => {
+      const out: unknown[] = []
+      for (const id of ids) out.push(await adapter.resolveModel(AGGREGATE_PROVIDER, id))
+      return out
+    })
+    expect(
+      resolved,
+      '★★ resolveModel 不得等待目录（否则 DSH 的 buildModelCatalog 仍要等满上游超时 —— '
+      + 'Task 7 只是把耗时从 listModels 那格搬到了总耗时那格）',
+    ).not.toBe('TIMEOUT')
+    // 反向对照的下界：不能「什么都不返回」——每一条都必须是可用的元数据。
+    expect((resolved as Array<{ provider: string; id: string; name: string }>).length).toBe(ids.length)
+  })
+
+  it('★★ 冷帧的保守元数据必须**可辨识且不撒谎**（明确常量 / 不声明档位）', async () => {
+    // ⚠️ 这条防的是「为了让守卫绿而编一份看起来正常的元数据」：
+    //    编造 reasoning 等于替用户承诺一个可能不存在的档位，
+    //    而「声称目标是 xxx 的描述」正是本仓库明文禁止的编造。
+    const adapter = new AggregateAdapter(makeStuckCtx(), {
+      accountPool: makePool(),
+      expiryProbe: () => new Promise<number>(() => {}),
+    })
+    const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'auto')
+    // ① 身份按入参回填（DSH 的 `normalizeModelInfo` 逐字校验，不符即 INVALID_MODEL_INFO）。
+    expect(info.provider).toBe(AGGREGATE_PROVIDER)
+    expect(info.id).toBe('auto')
+    expect(info.name.length).toBeGreaterThan(0)
+    // ② 窗口是**具名保守常量**（不是候选集的最大值，也不是编造的 1M）。
+    expect(info.context?.contextWindow).toBe(AGGREGATE_COLD_CONTEXT_WINDOW)
+    // ③ **不声明档位**（冷帧不知道候选集，编一份就是撒谎）。
+    expect(info.reasoning, '★ 冷帧不得声明 reasoning（那是编造）').toBeUndefined()
+    // ④ **不编造描述**（不得出现「已选好目标」这类冷帧不可能知道的信息）。
+    expect(info.description, '★ 冷帧不得编造 description').toBeUndefined()
+    // ⑤ 可辨识：它必须**不等于**热路径会给的值（否则排障者分不清冷帧与热帧）。
+    expect(AGGREGATE_COLD_CONTEXT_WINDOW).not.toBe(AGGREGATE_FALLBACK_CONTEXT_WINDOW)
+  })
+
+  it('★★ 冷帧**必须**触发后台读取（否则目录永远补不回来，是一扇单向门）', async () => {
+    // ⚠️ **反向对照**：没有这条，「resolveModel 立刻返回一份元数据」也可以靠
+    //    「压根不读目录」实现 —— 那会让聚合目录**永远**只有 auto。
+    let reads = 0
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        listModels: async () => {
+          reads += 1
+          await gate
+          return [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }]
+        },
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: makePool(),
+      // ⚠️ 预算给足：本条只验「真的起了一轮读取」，不验超时（那条另有专门用例）。
+      backgroundRefreshTimeoutMs: 60_000,
+    })
+    // 冷帧解析（此刻目录为空）。
+    await adapter.resolveModel(AGGREGATE_PROVIDER, 'auto')
+    release!()
+    for (let i = 0; i < 10; i += 1) await Promise.resolve()
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+    expect(reads, '★ 冷帧必须真的起了一轮后台目录读取').toBeGreaterThan(0)
+    // 且那一轮真的落地了（否则「起了」也可以是空转）。
+    expect(adapter.listAllModels().map((m) => m.id)).toContain('deepseek-v4-1-flash')
+  })
+
+  it('★★ 目录为空时 resolveModel **不得** await 目录（反向验证的靶点）', async () => {
+    // ⚠️ 这条与上面那条 DSH 形状用例**互补**：那条走「逐模型」的真实顺序，
+    //    这条直接把「有没有 await」钉在**单次调用**上 —— 把
+    //    `resolveModel` 改回 `await this.ensureCatalog(signal)` 时，
+    //    上面那条与这条都必须在预算内**变红**（实测见报告）。
+    //
+    // 杠杆：`ctx.llm.listModels` **永不 resolve** ⇒ 任何 await 它的调用方都永远挂住。
+    const adapter = new AggregateAdapter(makeStuckCtx(), {
+      accountPool: makePool(),
+      // ⚠️ 预算给很小：真起了后台读取也会「放弃等待」，不会让本用例挂住。
+      backgroundRefreshTimeoutMs: 20,
+    })
+    const info = await raceIn(500, async () => await adapter.resolveModel(AGGREGATE_PROVIDER, 'auto'))
+    expect(info, '★★ resolveModel 不得等待目录（上游永挂时也必须立刻返回）').not.toBe('TIMEOUT')
+    // ⚠️ 且它必须是**冷帧那份**（可辨识），不是「等到了目录之后的那份」。
+    expect((info as { context?: { contextWindow?: number } }).context?.contextWindow)
+      .toBe(AGGREGATE_COLD_CONTEXT_WINDOW)
+  })
+
+  /**
+   * ★★ **上游永挂时「在飞」标记必须能过期**（Important 2：单向门）。
+   *
+   * `startBackgroundCatalogRefresh` 初版只在 `.finally` 里清 `catalogRefreshInFlight`，
+   * 而 `.finally` 只在「那一轮**结束**」时执行。上游**永不 resolve** ⇒ 永不结束 ⇒
+   * 标记永不清 ⇒ 此后**所有** `listModels` 都因单飞闸门直接返回、不再起后台刷新
+   * ⇒ 目录**永久冻在冷帧**，且**零报错**。
+   *
+   * ⚠️ 注释当时自称「防住了一次瞬时失败把目录永久冻在空目录」——它防住了
+   * `reject`，**没防住 `hang`**。本条就是那个缺口的守卫。
+   */
+  it('★★ 上游永挂 ⇒ 预算到期后必须清在飞标记（否则目录永久冻在冷帧）', async () => {
+    let reads = 0
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        // ⚠️ 永挂：既不 resolve 也不 reject —— 这正是实测到的形态。
+        listModels: () => {
+          reads += 1
+          return new Promise<Array<{ id: string; name?: string }>>(() => {})
+        },
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: makePool(),
+      // ⚠️ 必须可注入：真的等 60 秒会让这条用例变成 flaky 的超时测试。
+      backgroundRefreshTimeoutMs: 20,
+    })
+    // 第一轮：冷帧解析 ⇒ 起一轮后台读取（会永挂）。
+    await adapter.resolveModel(AGGREGATE_PROVIDER, 'auto')
+    await new Promise((resolve) => { setTimeout(resolve, 60) })
+    const afterFirst = reads
+    expect(afterFirst, '前置：第一轮读取必须真的起了').toBeGreaterThan(0)
+
+    // ★ 关键：预算到期后，再触发一次冷帧解析 —— 必须能**再起一轮**读取。
+    //   若标记没有过期，单飞闸门会直接 return ⇒ `reads` 不再增长（单向门）。
+    await adapter.resolveModel(AGGREGATE_PROVIDER, 'auto')
+    await new Promise((resolve) => { setTimeout(resolve, 60) })
+    expect(
+      reads,
+      '★★ 上游永挂时「在飞」标记必须由预算到期清掉（否则后续永不重启读取 = 单向门）',
+    ).toBeGreaterThan(afterFirst)
+  })
+
+  it('★ 预算到期必须**保留旧目录**（不得清空）', async () => {
+    // ⚠️ 失败/放弃时**保留旧值**是本适配器的既有口径（见 `startBackgroundCatalogRefresh`）。
+    //    清空会让「上游抖一下」变成「用户的所有模型突然消失」。
+    let hang = false
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        listModels: async () => {
+          if (hang) return await new Promise<Array<{ id: string; name?: string }>>(() => {})
+          return [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }]
+        },
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: makePool(),
+      // ⚠️ 目录 TTL 设 0 ⇒ 每次 listModels 都判「不新鲜」⇒ 都会起后台刷新，
+      //    这样才测得到「挂在半路时旧目录还在不在」。
+      catalogTtlMs: 0,
+      backgroundRefreshTimeoutMs: 20,
+    })
+    // 先落地一份真实目录。
+    await adapter.refreshCatalog()
+    const before = adapter.listAllModels().map((m) => m.id)
+    expect(before).toContain('deepseek-v4-1-flash')
+
+    // 上游开始永挂 ⇒ 后台那一轮到期被放弃。
+    hang = true
+    await adapter.listModels(AGGREGATE_PROVIDER)
+    await new Promise((resolve) => { setTimeout(resolve, 60) })
+
+    expect(
+      adapter.listAllModels().map((m) => m.id),
+      '★ 放弃等待不得清空旧目录（否则上游抖一下 = 用户所有模型消失）',
+    ).toContain('deepseek-v4-1-flash')
+  })
+
+  /**
+   * ★★ **后台那一轮落地后必须广播**（Important 1）。
+   *
+   * 其余 12 家适配器的 `onCatalogLoaded` 全都注入了 `broadcastCatalogChanged(ctx)`，
+   * 只有聚合没有 ⇒ 后台这一轮无论多久落地，客户端**不会**自动重读（它在
+   * `status === 'ready'` 时短路，只认四个宿主事件）⇒ 用户必须自己再开一次选择器。
+   *
+   * ⚠️ 判据打在**行为**上（`ctx.emit` 真的收到事件），不是读源码找那行注入 ——
+   *    本仓库实测过 5 条源码文本判据在 `if (false)` 死分支里恒绿。
+   */
+  it('★★ 后台目录落地必须广播 llm/adapters-updated（否则客户端永不重读）', async () => {
+    const emitted: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      emit: (event: string) => { emitted.push(event) },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        // `registerAdapterIdempotent` 需要它（本用例只关心广播，不做路由断言）。
+        registerAdapter: () => {},
+        stream: () => (async function* () { /* noop */ })(),
+      },
+    } as never
+    // ⚠️ 走**真实装配**（`registerAggregateLlm` 才会注入广播），不手工传回调。
+    const adapter = registerAggregateLlm(ctx, { accountPool: makePool() })
+    // 让注册时那次预热跑完（fire-and-forget）。
+    for (let i = 0; i < 10; i += 1) await Promise.resolve()
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+    expect(adapter.listAllModels().map((m) => m.id)).toContain('deepseek-v4-1-flash')
+    expect(
+      emitted,
+      '★★ 目录落地后必须广播（与其余 12 家适配器的 onCatalogLoaded 同一口径）',
+    ).toContain('llm/adapters-updated')
+  })
+
+  it('★ 目录**没变**时不得重复广播（否则每次 listModels 都让客户端重读一次）', async () => {
+    // ⚠️ **反向对照**：没有这条，「无条件广播」也能让上一条全绿 —— 而它会形成
+    //    广播风暴（`refreshCatalog` 在 TTL 过期时也会重推同一份目录）。
+    const emitted: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      emit: (event: string) => { emitted.push(event) },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        registerAdapter: () => {},
+        stream: () => (async function* () { /* noop */ })(),
+      },
+    } as never
+    const adapter = registerAggregateLlm(ctx, { accountPool: makePool() })
+    for (let i = 0; i < 10; i += 1) await Promise.resolve()
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+    const afterPrewarm = emitted.filter((e) => e === 'llm/adapters-updated').length
+    expect(afterPrewarm, '前置：预热落地时应广播一次').toBeGreaterThan(0)
+
+    // 强制重推**同一份**目录（`force = true` 会真的再读一遍上游，但结果相同）。
+    await adapter.refreshCatalog(true)
+    for (let i = 0; i < 10; i += 1) await Promise.resolve()
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+    expect(
+      emitted.filter((e) => e === 'llm/adapters-updated').length,
+      '★ 目录内容未变 ⇒ 不得再广播（否则是广播风暴）',
+    ).toBe(afterPrewarm)
   })
 })

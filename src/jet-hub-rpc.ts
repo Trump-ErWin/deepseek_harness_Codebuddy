@@ -1430,6 +1430,27 @@ export interface ModelCatalogSource {
    */
   describeCatalogHealth?(): CatalogHealth
   /**
+   * 「**目录是否已可用于批量写操作**」的本地探测（**可选** —— 目前只有聚合适配器实现它）。
+   *
+   * ## ⚠️⚠️ 为什么需要它（Critical：Task 7 的目录非阻塞把 IKJW33 缺陷重新打开了）
+   *
+   * `fullCatalogIds` 的判据是「**远端读到即可**」（`remoteError` 为空 ⇒ 认为成功）。
+   * 对**其余 19 家**，目录是**固定 / 编译期兜底表 + 远端覆盖**，「读到」与「读全」
+   * 基本等价。而聚合的目录是**逐渠道动态推导**的，且 Task 7 之后它的 `listModels`
+   * **不再同步等上游** ⇒ 冷启动时它**立刻**返回 `['auto']` ⇒ 远端那一半「读成功」
+   * 但只含 1 条 ⇒ 用户点「关闭聚合供应商」只关掉 `auto`，
+   * `provider.setEnabled` 却返回 `ok:true` / `changedCount:1`，另外两个虚拟模型
+   * **仍然可选**（`provider.status` 则把这帧错判成 `closed:true`）。
+   *
+   * ⇒ 有实现时，**两个端点都先问它**；`ready === false` 时按「目录不完整」处理
+   *（`setEnabled` 拒绝、`status` 报安全方向 `closed:false`）。
+   *
+   * ⚠️ 必须**同步且零 IO**：`provider.status` 在设置页挂载时对每个供应商都调，
+   *    一旦它触发网络请求会拖慢首屏（本接口其它成员的同一约束）。
+   * ⚠️ 抛错会被调用点吞掉（按「不可用」处理，即安全方向），故实现方可以放心报。
+   */
+  catalogReadyForBulkWrite?(): { ready: boolean; reason?: string }
+  /**
    * 清空**临期折算缓存**（**可选** —— 只有聚合适配器实现它）。
    *
    * ## ⚠️⚠️ 为什么领取（claim）之后必须调它（真实缺陷，对抗审计实测证伪，2026-10-07）
@@ -1534,7 +1555,8 @@ export interface ModelCatalogSource {
  * | 调用点 | 需求 | 对「远端那一半缺失」的动作 |
  * |---|---|---|
  * | `model.setAllDisabled` | **必须完整**（要写黑名单） | 判 `complete`：**拒绝且不落盘** |
- * | `provider.setEnabled` | **远端读成功即可**（要写黑名单） | 判 `remoteError`：读失败**拒绝**；读到但为空**照常关闭** |
+ * | `provider.setEnabled` | **远端读成功即可**（要写黑名单） | 判 `remoteError`：读失败**拒绝**；读到但为空**照常关闭**；**适配器自报未就绪（`notReady`）拒绝** |
+ * | `provider.status` | 只要「能否证明已关闭」 | `remoteError` 或 `notReady` ⇒ **保守报未关闭**（安全方向） |
  * | `account.test` | **尽力而为**（只要一个 id 就能测） | 用拿到的那些照常测 |
  *
  * ⚠️ `provider.setEnabled` 刻意**不**与 `model.setAllDisabled` 同判据：
@@ -1578,8 +1600,29 @@ interface FullCatalogResult {
    * ⚠️ 为 `undefined` 而 `complete === false` ⇒ 就是上面第 2 种形态
    *（远端读到但为空）。`provider.setEnabled` 据此决定「照常关闭」，
    * 提示层据此放弃核对。
+   * ⚠️ **它不承载第 3 种形态**（适配器自报「目录尚未就绪」）—— 那一种见
+   * {@link notReady}，因为两者的**用户动作不同**（那个要等 / 重试，这个要登录）。
    */
   remoteError?: string
+  /**
+   * **适配器自报「目录尚未就绪」**（只有实现 `catalogReadyForBulkWrite` 的适配器
+   * 会给出值，目前只有聚合）。
+   *
+   * ## ⚠️⚠️ 这是第 3 种「目录不完整」形态，**判据与处置都与前两种不同**
+   *
+   * | 形态 | `remoteError` | `notReady` | `provider.setEnabled` 的动作 |
+   * |---|---|---|---|
+   * | 远端读失败（超时/抛错） | 有值 | 无 | **拒绝**（既有守卫） |
+   * | 远端读到但为空（无账号门控） | 无 | 无 | **照常关闭**（既有取舍，否则无账号供应商永远关不掉） |
+   * | **适配器说「我这份目录还不是全的」** | 无 | **有值** | **拒绝**（本字段引入的原因） |
+   *
+   * 为什么第 3 种**不能**塞进 `remoteError`：那个字段的语义是「远端**读失败**」，
+   * 而这里远端**读成功了**（`listModels` 正常返回了 `['auto']`）—— 把它记成读失败
+   * 会让排障者去查网络，而真相是「聚合目录的逐渠道推导还没跑完」。
+   * 为什么**不能**塞进 `complete === false`：那会让它落进第 2 种形态的「照常关闭」，
+   * 正是本次要修的缺陷（只关掉 `auto` 却返回成功）。
+   */
+  notReady?: string
 }
 
 /**
@@ -1659,6 +1702,41 @@ async function fullCatalogIds(
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     return { ids: adapterIds, complete: false, remoteError: `读取模型列表失败：${reason}` }
+  }
+
+  // ⚠️⚠️ **第 3 种形态：适配器自报「我这份目录还不是全的」**（Critcal，Task 7 引入）。
+  //
+  // 上面那一步「远端读到」对**动态目录**的 provider（目前只有聚合）**不再等价于
+  // 读全**：Task 7 之后聚合的 `listModels` 立刻返回**已知**目录（冷启动时只有
+  // `auto`），逐渠道推导转后台 ⇒ 这里会看到「读成功、但只有 1 条」。
+  //
+  // 不拦的后果（控制方实测）：
+  // ```
+  // setEnabled(false) 结果 = {"written":["auto"],"changedCount":1}   ← 只关了 auto！
+  // 稳态对照       = {"written":["auto","deepseek-v4-1-flash","glm-5-3"],"changedCount":3}
+  // ```
+  // 用户点「关闭聚合供应商」→ 提示「已关闭 1 个模型」、返回 `ok:true`，而另外两个
+  // 虚拟模型**仍可选** —— 正是本文件 `provider.setEnabled` 注释里明文禁止的缺陷形态。
+  //
+  // ⚠️ **必须排在「远端读到但为空」那一步之前**判：冷帧下聚合的远端也会是
+  // `['auto']`（非空）⇒ 不加这一步会一路落到下面「成功」分支。
+  // ⚠️ 探测**抛错按「不可用」处理**（保守方向：宁可拒绝一次关闭，也不要写出残缺
+  // 黑名单后仍报成功）。
+  try {
+    const readiness = modelAdapters?.[provider]?.catalogReadyForBulkWrite?.()
+    if (readiness !== undefined && readiness.ready !== true) {
+      return {
+        ids: [...new Set([...adapterIds, ...remoteIds])],
+        complete: false,
+        notReady: readiness.reason ?? '目录尚未就绪',
+      }
+    }
+  } catch {
+    return {
+      ids: [...new Set([...adapterIds, ...remoteIds])],
+      complete: false,
+      notReady: '目录就绪状态探测失败',
+    }
   }
 
   // ⚠️⚠️ **远端读到但为空 ⇒ 同样不可用于写黑名单**（`complete: false`，且**无**
@@ -1802,7 +1880,10 @@ async function readableCatalogIds(
 ): Promise<ReadonlySet<string> | undefined> {
   const catalog = await fullCatalogIds(ctx, modelAdapters, provider)
   // ⚠️⚠️ **目录不可用 ⇒ 整体放弃核对**（判 `complete`，它同时覆盖
-  // 「远端读失败」与「远端读到但为空」两种形态 —— 见该字段的长注释）。
+  // 「远端读失败」「远端读到但为空」「**适配器自报未就绪**（`notReady`）」三种形态
+  // —— 见该字段的长注释）。第三种是 Task 7 引入的（聚合的 `listModels` 不再同步
+  // 等上游 ⇒ 冷帧只有 `auto`）：那时并集是残缺的，拿它核对会**大面积误报**
+  // 「该模型可能已被上游下架」。
   // 不得退化成「只用 listAllModels 兜底表」：那会退回第一版的大面积误报。
   // 提示层错了不如不说。
   if (!catalog.complete) return undefined
@@ -6203,7 +6284,26 @@ AUTOCLAW.id,
             // 此时并集只剩适配器兜底表，`disabled` 会按它算 —— 因为
             // `closed` 的判据是「子集里全部命中」，若兜底表全命中就仍报已关闭。
             // 这是可接受的：兜底表全关 + 远端看不到 ⇒ 用户确实没有可选模型。
-            if (full.remoteError === undefined) {
+            if (full.notReady !== undefined) {
+              // ⚠️⚠️ **适配器自报「目录还没读全」⇒ 报安全方向**（Critical）。
+              //
+              // 与 `provider.setEnabled` 同一个根因（`fullCatalogIds` 的第 3 种形态），
+              // 但**用户后果不同**：那边是「只关掉一部分却报成功」，这边是
+              // 「只关掉 `auto`，整个『聚合』在设置页被标成**已关闭**」。
+              // 控制方实测（Task 7 之后）：
+              // ```
+              // provider.status = {"total":1,"disabled":1,"closed":true,"verified":"ok（远端 0 条）"}
+              // 改前形态        = {"total":1,"disabled":1,"closed":false,"verified":"remoteError：超时"}
+              // ```
+              // 改前该路径必然 2000ms 超时 ⇒ `remoteError` ⇒ `closed=false`（**安全方向**）；
+              // 改后核实「成功」但只见到 `auto` ⇒ `closed=true`（**危险方向**），
+              // 而另外两个虚拟模型仍可选 —— 界面与事实相反。
+              //
+              // ⇒ 这里把 `notReady` 与「核实不了（远端读失败）」**并列**处理：
+              // 两者都说明「我这份合并目录不足以证明已关闭」，都报 `closed:false`。
+              // 报 false 是安全的（用户可再点一次开关，点了会得到上面那条明确拒绝）。
+              closed = false
+            } else if (full.remoteError === undefined) {
               total = full.ids.length
               disabled = full.ids.filter((id) => disabledMap[id] === true).length
               closed = total > 0 && disabled === total
@@ -6313,6 +6413,33 @@ AUTOCLAW.id,
               error: {
                 code: 'bad-request',
                 message: `没有可关闭的模型：${catalog.remoteError}`,
+              },
+            }
+          }
+          // ⚠️⚠️ **第 3 种形态：适配器自报「目录还没读全」⇒ 必须拒绝**（Critical）。
+          //
+          // 判据是 `notReady`（**不是** `complete`、**不是** `remoteError`），理由与
+          // 三段判据的对应关系见 `FullCatalogResult.notReady` 的长注释。
+          //
+          // 这里修的缺陷（Task 7 重新打开，控制方实测）：
+          // ```
+          // setEnabled(false) 结果 = {"written":["auto"],"changedCount":1}   ← 只关了 auto！
+          // 稳态对照       = {"written":["auto","deepseek-v4-1-flash","glm-5-3"],"changedCount":3}
+          // ```
+          // 用户点「关闭聚合供应商」后界面提示「已关闭 1 个模型」并返回 `ok:true`，
+          // 而另外两个虚拟模型**仍可选** —— 该文件 `:6298` 的注释明文禁止这一形态。
+          //
+          // ⚠️ 与「无账号门控照常关闭」**不冲突**：那条针对的是**目录已读全、只是
+          // 里面没有模型**（`remoteIds` 为空但推导跑过了）；这里是「推导压根还没跑
+          // 完」⇒ 拒绝是唯一不撒谎的选择。用户等目录落地后再点一次即可，
+          // 文案如实说明这一点。
+          if (catalog.notReady !== undefined) {
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message: `聚合目录尚未读取完成（${catalog.notReady}），`
+                  + '为避免只关闭一部分模型，本次未做任何变更。请稍后重试。',
               },
             }
           }
