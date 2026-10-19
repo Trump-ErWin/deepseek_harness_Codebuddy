@@ -144,6 +144,10 @@ import { createExpiryProbe } from './aggregate-expiry.js'
 // ⚠️ 共享余额读数缓存（2026-10-15，规格 §5.7）：装配层建**一个**实例，
 //    `credits.balances` 端点与 buddy 系四家的折算共用它（见下面 `balanceCache` 的长注释）。
 import { createBalanceCache, createBalanceRefresher, REFRESH_PERIOD_FALLBACK_MS, type BalanceCacheEntry } from './balance-cache.js'
+// ⚠️ 模型目录的后台刷新器（用户 2026-10-18 要求：20 分钟定时更新）。
+//    与余额刷新器**共用同一套骨架**（武装 + 单飞 + 幂等），但**不复用实例** ——
+//    余额缓存 key 是 `(provider, accountId)`、目录的 key 是 provider，语义不同。
+import { createCatalogRefresher } from './model-catalog.js'
 // ⚠️ 中止判据复用适配器的**共享实现**（`aggregate-adapter.ts` 的 `isAbortLike`）：
 //    本仓库已有 4 份同义实现，装配层不该再添第五份。
 import { isAbortLike as isAbortLikeError } from './aggregate-adapter.js'
@@ -3483,6 +3487,45 @@ async function fetchBalanceReading(
     //    「编译期兜底快照跟不上上游下架」那套记录/过滤机制对它没有意义。
     'jet-hub-auto': pruned(AUTO_PROVIDER, autoAdapter, { enabled: false }),
   }
+
+  /**
+   * ★ **模型目录的后台刷新器**（用户 2026-10-18 的要求）。
+   *
+   * 「各个模型的模型列表缓存也要带定时更新，20 分钟更新一次，如果不更新随高峰低谷
+   * 变化的积分消耗倍率是更新不到实际的倍率」
+   *
+   * ## ⚠️ 为什么必须建在 `modelAdapters` **之后**（位置不变式）
+   *
+   * 它要读那张表拿实例。早于建表 ⇒ 空表 ⇒ **目录永不刷新、且零日志**
+   * （与 `wiredRefreshTargets()` 前身在 2026-10-15 踩的坑同型）。
+   *
+   * ## ⚠️ 为什么走 `modelAdapters` 而不是 `ctx.llm`
+   *
+   * `ctx.llm` 是 DSH 的公开面，**不认识** `refresh()`（那是本插件给目录契约加的可选成员）。
+   * 而 `modelAdapters` 的每一项都是 `pruned()` 的 Proxy —— 它对**其余成员原样透传并绑定
+   * `this`**（`src/dead-model-store.ts:748-749`），故新加的 `refresh()` 能自动透出来。
+   *
+   * ## ⚠️ 未实现 `refresh` 的 provider 必须跳过
+   *
+   * `opencode` 这类本地派生渠道（零网络）本就没有远端可拉。对它们空转会让
+   * 「刷新器说跑了 9 家、实际只刷了 3 家」**完全静默**。
+   */
+  const catalogRefresher = createCatalogRefresher({
+    listProviders: () => Object.keys(modelAdapters),
+    refreshOf: (provider) => {
+      const adapter = modelAdapters[provider] as { refresh?: () => Promise<void> } | undefined
+      // ⚠️ 返回 `undefined` ⇒ 刷新器跳过（不 await、不记日志）—— 见上注。
+      return adapter?.refresh?.()
+    },
+    info: (message) => ctx.logger?.info?.(message),
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // ⚠️ 生命周期挂 `ctx.effect`，与插件一致（释放后停手）——
+  //    与既有 `modelsDevTimer`、余额刷新器同款约定。
+  ctx.effect(() => {
+    catalogRefresher.start()
+    return () => { catalogRefresher.stop() }
+  })
 
   // 插件卸载前把签名缓存落盘：`stream()` 每次结束都 flush，但用户可能
   // 直接关掉 DSH 而上一轮的 flush 还在排队 —— 落一次盘几乎零成本，
