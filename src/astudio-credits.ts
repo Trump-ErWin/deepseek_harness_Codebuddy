@@ -206,6 +206,18 @@ export async function fetchAstudioBalanceDetailed(
   const baseUrl = (product.authBaseUrl ?? '').replace(/\/+$/, '')
   if (baseUrl.length === 0) return failDetail('额度服务不可用（未配置账号后端地址）')
 
+  // ⚠️⚠️ **先判凭据本身**（2026-10-20 用户报障）：账号条目在、但凭据读不到时
+  //    `credential` 会是 `undefined`（调用方用 `as AstudioCredential` 硬转，运行时不拦）
+  //    ⇒ `astudioCookieHeader(undefined)` **解引用崩**，而 TypeError 的消息
+  //    （`Cannot read properties of undefined (reading '…')`）会被上层当成
+  //    **余额文案**原样展示给用户（图 2 实测症状：积分行显示 `Cannot read properties of unde…`）。
+  //    ⇒ 这里必须归成**可读失败**。判据放在本函数入口（一处）而不是各调用点 ——
+  //    调用点只知道「要查余额」，不知道凭据该长什么样。
+  const raw = credential as AstudioCredential | null | undefined
+  if (raw === null || raw === undefined || typeof raw !== 'object') {
+    return failDetail('未登录 AStudio（账号凭据缺失或读不到），请删除该账号后重新登录')
+  }
+
   // ① 额度面只认 Cookie 的 ssoSessionId；没有它就没有任何可发的请求。
   const cookie = astudioCookieHeader(credential)
   if (cookie.length === 0) {
@@ -271,6 +283,32 @@ export const ASTUDIO_CLAIMABLE_POPUP_TYPES = [
   ASTUDIO_POPUP_TYPE_DAILY_REWARD,
   ASTUDIO_POPUP_TYPE_NEW_USER,
 ] as const
+
+/**
+ * 取弹窗的**类型**标识（`ASTUDIO_CLAIMABLE_POPUP_TYPES` 的判据入口）。
+ *
+ * ## ⚠️⚠️ 真实字段是 `componentType`，**不是** `type`（2026-10-20 真机取证）
+ *
+ * 实测响应（`tests/e2e/astudio-popups-probe.e2e.spec.ts` 只读探针）：
+ * ```
+ * data: [{ popupId: 3, popupCode: 'DAILY_LOGIN_REWARD_V1', popupType: 'BANNER',
+ *          componentType: 'DAILY_REWARD_DIALOG', priority: 100, instanceKey: '…',
+ *          payload: { confirmText, title, content } }]
+ * ```
+ * 客户端自己也读 `componentType`（asar 证据：`Mc[popup.componentType]` 用于排序）。
+ *
+ * ⇒ 原实现读 `record.type`，而**响应里没有这个键** ⇒ `String(record.type ?? '')`
+ *    恒为 `''` ⇒ **一个可领弹窗都识别不出来** ⇒ 直接走 `already-claimed`
+ *    ⇒ 界面显示「今天已领取」而**积分一动不动**（用户 2026-10-20 报障的根因：
+ *    客户端里明明写着「限时每日福利 · 今日可领 100 积分」，插件却说已领过）。
+ *
+ * ⚠️ 仍**兼容** `type`（防御上游换字段名或存在第二种形态），但**优先** `componentType`。
+ * ⚠️ 只此一份实现：三个调用点（`extractAstudioClaimablePopups` 的两个分支 +
+ *    `astudioClaimablePopups`）原先各写一遍 `record.type`，抄三遍就是三处一起错。
+ */
+function astudioPopupTypeOf(record: Record<string, unknown>): string {
+  return String(record.componentType ?? record.type ?? '')
+}
 
 /** 领取弹窗数据结构（每日奖励或新用户礼包）。 */
 export interface AstudioClaimablePopup {
@@ -354,7 +392,7 @@ export function extractAstudioDailyRewardPopup(data: unknown): AstudioDailyRewar
   for (const item of data) {
     if (typeof item !== 'object' || item === null) continue
     const record = item as Record<string, unknown>
-    if (record.type === ASTUDIO_POPUP_TYPE_DAILY_REWARD) {
+    if (astudioPopupTypeOf(record) === ASTUDIO_POPUP_TYPE_DAILY_REWARD) {
       const rawId = record.popupId
       const popupId = typeof rawId === 'number' ? rawId : parseInt(String(rawId), 10)
       if (Number.isFinite(popupId)) {
@@ -378,7 +416,7 @@ export function extractAstudioNewUserPopup(data: unknown): AstudioClaimablePopup
   for (const item of data) {
     if (typeof item !== 'object' || item === null) continue
     const record = item as Record<string, unknown>
-    if (record.type === ASTUDIO_POPUP_TYPE_NEW_USER) {
+    if (astudioPopupTypeOf(record) === ASTUDIO_POPUP_TYPE_NEW_USER) {
       const rawId = record.popupId
       const popupId = typeof rawId === 'number' ? rawId : parseInt(String(rawId), 10)
       if (Number.isFinite(popupId)) {
@@ -404,7 +442,7 @@ export function extractAstudioClaimablePopups(data: unknown): AstudioClaimablePo
   for (const item of data) {
     if (typeof item !== 'object' || item === null) continue
     const record = item as Record<string, unknown>
-    const type = String(record.type ?? '')
+    const type = astudioPopupTypeOf(record)
     if (type === ASTUDIO_POPUP_TYPE_DAILY_REWARD || type === ASTUDIO_POPUP_TYPE_NEW_USER) {
       const rawId = record.popupId
       const popupId = typeof rawId === 'number' ? rawId : parseInt(String(rawId), 10)

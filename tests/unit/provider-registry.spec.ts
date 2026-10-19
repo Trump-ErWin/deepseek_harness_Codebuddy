@@ -194,10 +194,16 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(t).toEqual(['gemini'])
   })
 
-  it('creditPackages 恰好是既有的 8 家（officeace 2026-10-12、autoclaw 2026-10-17 加入）', () => {
+  it('creditPackages 恰好是既有的 9 家（officeace 2026-10-12、autoclaw 2026-10-17、astudio 2026-10-20 加入）', () => {
+    // ⚠️ `creditPackages` 决定**账号名 hover 是否列资源包**。astudio 是 2026-10-20
+    //    用户报障补上的：它的 `buildAstudioBalance` **本来就**把四个池逐包解析出了
+    //    到期时间（`member`/`buy`/`activity`/`spark` 的 `*NextExpireTime`），
+    //    缺的只是这条声明 ⇒ hover 看不到「没过期的资源包」。
     const p = PROVIDER_REGISTRY.filter((d) => d.creditPackages === true)
       .map((d) => d.id).sort()
-    expect(p).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy'])
+    expect(p).toEqual([
+      'astudio', 'autoclaw', 'buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
+    ])
   })
 
   it('autoCheckinExcluded 恰好是 zcode', () => {

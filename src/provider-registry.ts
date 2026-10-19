@@ -463,6 +463,15 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    （probeById 被守卫锁成「恰好是会写标记的家」）⇒ 两个按钮恒为惰性。
     //    将来接上请求级换号+冷却时必须同时改回 true 并进 probeById + WRITES_RATE_LIMIT_PROVIDERS。
     rateLimit: false,
+    // ⚠️ **`creditPackages: true`**（2026-10-20 用户报障补）：本字段决定**账号名 hover
+    //    是否列出资源包**（`plugin-src/client/credits-capabilities.js` 的
+    //    `supportsCreditPackageList` 直接读它）。缺它 ⇒ 积分行只显示
+    //    「1/4 个资源包有效」而 **hover 看不到每个包与到期时间**，与其它 provider 不一致
+    //    （用户报障原文：「hover 应该能看到没过期的资源包」）。
+    //    依据：`buildAstudioBalance`（`astudio-credits.ts`）**已经**把四个池逐包解析出了
+    //    到期时间（`member` / `buy` / `activity` / `spark` 各自的 `*NextExpireTime`）
+    //    ⇒ 数据本来就齐，此前只是没声明。
+    creditPackages: true,
     settingsNamespace: 'llm-astudio',
     channel: true,
   },
