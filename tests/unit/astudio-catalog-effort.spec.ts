@@ -158,7 +158,14 @@ describe('★★ AStudio 目录缓存的 20 分钟 TTL（规范对齐：其余 1
 
 // ════════════════════════════════════════════════════════════════════════
 describe('★★ AStudio 的强制重拉与后台刷新器入口', () => {
-  it('★ refreshCatalog() 必须**无视 TTL** 真重拉（清 catalogAt，否则点同步看不到变化）', async () => {
+  it('★ refreshCatalog() 必须**无视 TTL** 真重拉（两条清腿至少清一条）', async () => {
+    // ⚠️ 本用例锁的是 `refreshCatalog` 的**整体语义**，不是某一条清腿：
+    //    实测（2026-10-18 变异）单独删 `catalogAt = 0` 或单独删
+    //    `remoteModels = undefined` **都无牙**（12 例全绿）—— 因为 `loadModels`
+    //    的 gate 是合取、且 `isCatalogFresh` 对 `at === 0` 恒判陈旧
+    //    ⇒ 任一条都足以让 gate 失效。**两条都删**才红（1 failed）。
+    //    ⇒ 这是**如实登记的无牙腿**，不是「忘了一条判据」；
+    //      详见 `astudio-adapter.ts` 的 `refreshCatalog` 注释里的实测表。
     let fetched = 0
     const clock = makeClock()
     const { adapter } = makeAdapter({

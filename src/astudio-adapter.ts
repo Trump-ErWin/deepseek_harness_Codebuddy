@@ -208,6 +208,8 @@ export class AstudioAdapter extends LlmAdapter {
          * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
          *    本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再走**同一份**拉取逻辑
          *    —— 不另写一份（那会让两条路的上游行为分叉）。
+         *    ⚠️ 下面两条清腿**互为冗余**（任一条都足以让 gate 失效），
+         *    实测数据见 `refreshCatalog` 注释里的变异表 —— 不要把任一条说成承重腿。
          */
         refresh: async () => {
           this.catalogAt = 0
@@ -379,11 +381,24 @@ export class AstudioAdapter extends LlmAdapter {
   /**
    * 强制重读远端目录（接线里的「同步模型」按钮用；失败回兜底表）。
    *
-   * ⚠️ **必须连 `catalogAt` 一起清**（2026-10-18 审计修复）：只清 `remoteModels`
-   *    而 TTL 仍判新鲜的话，下面的 `loadModels` 会走上面那条 gate 直接返回旧值
-   *    ⇒ **点「同步模型」看不到任何变化**，用户会以为按钮坏了。
-   *    `aggregate-adapter.ts` 的 `refreshCatalog` 有同型的真实缺陷记录
-   *    （「初版不传 force ⇒ 点刷新看不到任何变化」）。
+   * ## ⚠️ 下面两条清腿**互为冗余**（2026-10-18 变异实测，如实登记）
+   *
+   * `loadModels` 的 gate 是**合取**：`remoteModels !== undefined &&
+   * isCatalogFreshFor(…)`，而 `isCatalogFresh` 对 `at === 0` **恒判陈旧**
+   * （`model-catalog.ts:255`）⇒ 两条清腿**任一条**都足以让 gate 失效：
+   *
+   * | 注入的变异 | 实测结果（`astudio-catalog-effort.spec.ts`） |
+   * |---|---|
+   * | 只删 `catalogAt = 0` | **12 passed**（行为逐例不变） |
+   * | 只删 `remoteModels = undefined` | **12 passed**（行为逐例不变） |
+   * | **两条都删** | **1 failed**（点「同步模型」看不到变化 —— 真回归） |
+   *
+   * ⇒ 本方法的**不变式是「至少清一条」**，而不是「必须清某一条」。
+   *    两条都留着是**防御**（与新加的 `createModelCatalog` 的 `refresh` 回调同款写法），
+   *    但**不得把任一条单独说成承重腿** —— 那是假因果（本仓库明令的失效形态）。
+   *    ⚠️ 同型但**结构不同**的真实缺陷在 `aggregate-adapter.ts` 的 `refreshCatalog`：
+   *    那边的 gate 只判 TTL（无「remoteModels 已置空」这一腿），
+   *    故「不传 force ⇒ 点刷新看不到任何变化」在那里是真缺陷。
    */
   async refreshCatalog(): Promise<readonly LlmModelInfo[]> {
     this.catalogAt = 0
