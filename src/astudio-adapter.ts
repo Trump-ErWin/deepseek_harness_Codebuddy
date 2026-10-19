@@ -44,7 +44,13 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import {
+  createModelCatalog,
+  isCatalogFresh,
+  isCatalogFreshFor,
+  type CatalogEntry,
+  type ModelCatalog,
+} from './model-catalog.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
 import {
@@ -133,6 +139,14 @@ export interface AstudioAdapterOptions {
   onCatalogLoaded?: () => void
   /** 告警出口；缺省 `console.warn`。**丢弃档位等副作用必须留痕**。 */
   warn?: (message: string) => void
+  /**
+   * 目录新鲜度用的时钟（**只**用于 `isCatalogFresh`，不参与任何业务判定）。
+   *
+   * ⚠️ 判据只有一份：`model-catalog.ts` 的 `isCatalogFresh`（周期 20 分钟）。
+   *    注入点存在的唯一理由是**单测要能推进 TTL**，不必真等 20 分钟
+   *    （与 loomy / minimax / raccoon / zcode 的 `now` 同款约定）。
+   */
+  now?: () => number
 }
 
 /** AStudio 适配器：Chat Completions 通道（实测上游原生兼容 OpenAI）。 */
@@ -148,8 +162,17 @@ export class AstudioAdapter extends LlmAdapter {
   private remoteModels: readonly AstudioFallbackModel[] | undefined
   /** 在途目录请求（并发去重：多个入口同时 `listModels` 只发一次）。 */
   private catalogInFlight: Promise<readonly AstudioFallbackModel[]> | undefined
-  /** 失败冷却截止时刻（`Date.now()` 口径）。 */
+  /** 失败冷却截止时刻（与目录 TTL **同一份**可注入时钟，见 {@link AstudioAdapterOptions.now}）。 */
   private catalogCooldownUntil = 0
+  /**
+   * 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ **只在成功时写**：失败写时刻会把「上游没恢复」这件事掩盖整整 20 分钟。
+   *    判据由 `model-catalog.ts` 的 `isCatalogFresh` **唯一**持有。
+   */
+  private catalogAt = 0
+  /** 目录新鲜度用的时钟（可注入，见 {@link AstudioAdapterOptions.now}）。 */
+  private readonly nowImpl: () => number
 
   private readonly catalog: ModelCatalog
 
@@ -158,6 +181,7 @@ export class AstudioAdapter extends LlmAdapter {
     this.product = options.product ?? ASTUDIO
     this.fetchImpl = options.fetchImpl ?? fetch
     this.warnImpl = options.warn ?? ((message: string) => { console.warn(message) })
+    this.nowImpl = options.now ?? (() => Date.now())
     this.resolveCredentialImpl = options.resolveCredential
       ?? ((): Promise<AstudioCredential | undefined> =>
         this.options.auth === undefined ? Promise.resolve(undefined) : this.options.auth.currentCredential())
@@ -178,6 +202,18 @@ export class AstudioAdapter extends LlmAdapter {
         // 实测六个模型的 `input_modalities` 全是 `['text']` ⇒ 未知 id 保守报 text。
         unknownModelInputModalities: () => ['text'] as const,
         syncCatalog: () => this.syncCatalogEntries(),
+        /**
+         * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+         *    本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再走**同一份**拉取逻辑
+         *    —— 不另写一份（那会让两条路的上游行为分叉）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          this.remoteModels = undefined
+          await this.loadModels()
+        },
       },
     )
   }
@@ -288,7 +324,19 @@ export class AstudioAdapter extends LlmAdapter {
   }
 
   private async loadModels(): Promise<readonly AstudioFallbackModel[]> {
-    if (this.remoteModels !== undefined) return this.remoteModels
+    // ⚠️⚠️ **读驱动 TTL（20 分钟）**（2026-10-18 审计修复）：
+    //    修前本方法只判 `remoteModels !== undefined` ⇒ 一旦成功拉到远端，
+    //    **整个进程生命周期内永不再拉** —— 上游上线/下架模型后，用户的模型列表
+    //    一直冻结在首次拉到的那份。而本仓库其余 **11 家**都有这条 20 分钟 TTL
+    //    （`isCatalogFresh` / `isCatalogFreshFor`）⇒ 这是一处**规范偏差**，
+    //    也让 `invalidateCatalogCache`（用户改设置立即失效）对本家**完全无效**。
+    // ⚠️ 判据来源：`model-catalog.ts` 的 `isCatalogFresh`（**唯一**实现）。
+    //    入口这一处用 `isCatalogFreshFor`（多一条**正交**的「用户主动失效」腿）：
+    //    用户刚在 Jet Hub 改了开关就该立刻重拉，哪怕还在 20 分钟内。
+    if (this.remoteModels !== undefined
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.nowImpl())) {
+      return this.remoteModels
+    }
     if (this.catalogInFlight !== undefined) return await this.catalogInFlight
     const fetcher = this.fetchRemoteModelsImpl
     if (fetcher === undefined) {
@@ -296,22 +344,28 @@ export class AstudioAdapter extends LlmAdapter {
       this.warnImpl('[astudio] 未注入凭据/目录来源，模型列表退用内置兜底表')
       return this.product.fallbackModels
     }
-    if (Date.now() < this.catalogCooldownUntil) return this.product.fallbackModels
+    // ⚠️ 冷却与 TTL **必须走同一份可注入时钟**（2026-10-18 审计规范化）：
+    //    修前冷却用 `Date.now()`、TTL 用 `now` 注入点 ⇒ 两个时钟分叉，
+    //    单测推进 `now` 也推不动冷却窗口（其余 11 家统一用 `now`）。
+    if (this.nowImpl() < this.catalogCooldownUntil) return this.product.fallbackModels
     const inFlight = (async (): Promise<readonly AstudioFallbackModel[]> => {
       try {
         // ⚠️ 上游 39 字段的全量 `raw` 在 `parseAstudioCatalog` 里保留（内核逐字段强
         // 校验），**这里不能裁**；对外展示的裁剪由 `CatalogEntry` 视图天然完成。
         const visible = astudioVisibleModels(await fetcher())
         if (visible.length === 0) {
-          this.catalogCooldownUntil = Date.now() + REMOTE_CATALOG_COOLDOWN_MS
+          this.catalogCooldownUntil = this.nowImpl() + REMOTE_CATALOG_COOLDOWN_MS
           return this.product.fallbackModels
         }
         const converted = visible.map((model) => astudioCatalogToFallback(model))
         this.remoteModels = converted
+        // ⚠️ **只在成功时**记时刻（失败不写）：否则一次网络抖动会把 TTL 上界
+        //    刷新掉，下轮还要等满 20 分钟才发现上游其实没恢复。
+        this.catalogAt = this.nowImpl()
         this.options.onCatalogLoaded?.()
         return converted
       } catch (error) {
-        this.catalogCooldownUntil = Date.now() + REMOTE_CATALOG_COOLDOWN_MS
+        this.catalogCooldownUntil = this.nowImpl() + REMOTE_CATALOG_COOLDOWN_MS
         this.warnImpl(`[astudio] 模型目录读取失败，退用兜底表：${error instanceof Error ? error.message : String(error)}`)
         return this.product.fallbackModels
       } finally {
@@ -322,12 +376,41 @@ export class AstudioAdapter extends LlmAdapter {
     return await inFlight
   }
 
-  /** 强制重读远端目录（接线里的「同步模型」按钮用；失败回兜底表）。 */
+  /**
+   * 强制重读远端目录（接线里的「同步模型」按钮用；失败回兜底表）。
+   *
+   * ⚠️ **必须连 `catalogAt` 一起清**（2026-10-18 审计修复）：只清 `remoteModels`
+   *    而 TTL 仍判新鲜的话，下面的 `loadModels` 会走上面那条 gate 直接返回旧值
+   *    ⇒ **点「同步模型」看不到任何变化**，用户会以为按钮坏了。
+   *    `aggregate-adapter.ts` 的 `refreshCatalog` 有同型的真实缺陷记录
+   *    （「初版不传 force ⇒ 点刷新看不到任何变化」）。
+   */
   async refreshCatalog(): Promise<readonly LlmModelInfo[]> {
+    this.catalogAt = 0
     this.remoteModels = undefined
     this.catalogCooldownUntil = 0
     await this.loadModels()
     return await this.listModels(this.product.id)
+  }
+
+  /**
+   * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`，
+   * 每 20 分钟一轮；用户改设置时的立即失效走 `invalidateCatalogCache`）。
+   *
+   * ⚠️⚠️ 存在的理由（2026-10-18 审计发现）：`createCatalogRefresher` 遍历
+   * `modelAdapters` 并调 `adapter.refresh?.()`，**返回 `undefined` 即静默跳过**。
+   * 而 `refresh` 是 `createModelCatalog` 返回的 **catalog 实例**上的成员
+   * （`model-catalog.ts` 的 `ModelCatalog.refresh`），**不会自动变成适配器的成员**
+   * ⇒ 不在类上显式转发的话，「模型目录刷新器已武装」的日志为真、实际**一家都不刷**。
+   *    （该缺口已实测：本仓库 12 家适配器的原型上**都没有** `refresh` 成员，
+   *    而 `catalog-refresher-wiring.spec.ts` 只断言了武装日志、
+   *    没有任何一条断言「真的刷了某家」。）
+   *
+   * ⚠️ 与 `options.refresh` **不是同一件事**：那个是 HTTP 401 之后的**凭据**重取，
+   * 本方法是**目录**强制重拉。两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
   }
 
   // ── 推理 ──
@@ -353,9 +436,23 @@ export class AstudioAdapter extends LlmAdapter {
     // 档位声明取自**当前目录条目**（裸 slug 比对，兼容传入 builtin/ 别名形态）。
     const modelId = astudioBareSlugOf(options.model)
     const declared = this.catalogSource().find((entry) => entry.id === modelId)
+    // ⚠️⚠️ **门禁的集合必须与「播报给宿主的集合」同源**（2026-10-18 审计 P1）。
+    //    宿主被告知的是 `astudioReasoningOf()` 的输出（见上面的 `reasoningFor`），
+    //    它比原始字段多一条腿：「远端只给 `default_reasoning_level`（没有
+    //    `supported_reasoning_levels`）⇒ **单档**」。而修前这里直接读**原始**
+    //    `entry.efforts` ⇒ 那种模型播报 `['high']`、门禁却算出空集合 ⇒ 用户
+    //    **唯一可选**的档位被静默丢弃，且 warn 文案是**假的**（「上游目录未对该
+    //    模型声明任何思考档位」——可它明明声明了）。
+    //    端到端实测（审计探针）：播报 `["high"]` / 实际上行 `undefined` / warn 如上。
+    //    ⚠️ 同一函数里两份同义判据 = 本仓库明令的失效形态（与 accio 的
+    //    「两张远端表顺序颠倒」同族）。
+    const declaredEfforts = astudioReasoningOf({
+      efforts: declared?.efforts,
+      defaultEffort: declared?.defaultEffort,
+    })
     const decision = astudioEffortForRequest(
       options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
-      declared?.efforts,
+      declaredEfforts?.efforts.map((effort) => effort.id),
     )
     if (decision.dropped !== undefined) {
       // ⚠️ 静默丢弃是明令禁止的：上游对非法档位**不报错、按最大档跑**，不留痕就等于

@@ -62,6 +62,7 @@ import {
   ASTUDIO,
   ASTUDIO_API_KEY_CONFIG_PATH,
   ASTUDIO_SESSION_FILE_ENV,
+  defaultAstudioSessionFilePath,
   type AstudioProduct,
 } from './astudio-product.js'
 import {
@@ -122,7 +123,16 @@ export function astudioSessionFilePath(
 ): string {
   const override = env[ASTUDIO_SESSION_FILE_ENV]
   if (typeof override === 'string' && override.trim().length > 0) return override.trim()
-  return product.sessionFilePath
+  // ⚠️⚠️ **显式值优先，否则按传入的 `env` 推导**（2026-10-18 审计 P1 修复）。
+  //    修前这里是 `return product.sessionFilePath`，而 `ASTUDIO.sessionFilePath`
+  //    是写死的开发机绝对路径 ⇒ 除该机外**所有**用户的「一键导入本机凭据」
+  //    必然失败（那是客户端的默认档）。
+  //    ⚠️ 推导必须用**传入的 `env`**（而不是 `process.env`）：同一函数的两个输入
+  //    要同源，否则「传 env 进来测」只能覆盖 override 那一腿，
+  //    默认值那一腿永远测不动（守卫会退化成对常量的同义反复 —— 修前正是如此）。
+  const explicit = product.sessionFilePath
+  if (typeof explicit === 'string' && explicit.trim().length > 0) return explicit.trim()
+  return defaultAstudioSessionFilePath(env)
 }
 
 /** 读会话文件原文（不存在 / 无权限 / 读失败一律 `undefined`，**绝不抛**）。 */
