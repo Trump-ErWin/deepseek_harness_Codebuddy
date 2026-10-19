@@ -23,7 +23,7 @@ import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmAdapter, LlmError, ReasoningEffortId }
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFresh, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { reasoningRankOf } from './reasoning-ladder.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
@@ -313,6 +313,13 @@ export interface TraeAdapterOptions {
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；默认 {@link TRAE}。 */
   product?: TraeProduct
+  /**
+   * 时钟（注入以便单测推进目录 TTL；缺省 `Date.now`）。
+   *
+   * ⚠️ 只用于**目录新鲜度**（`ensureRemoteModels` 的 `isCatalogFresh`），
+   *    不用于超时/退避计时 —— 那些仍走真实时钟。
+   */
+  now?: () => number
   /**
    * 远端目录**落地后**的通知回调（issue IKJVTF）。
    *
@@ -696,6 +703,13 @@ export class TraeAdapter extends LlmAdapter {
   /** 动态模型缓存。 */
   private remoteModels: TraeRemoteModel[] | undefined
   /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+   */
+  private catalogAt = 0
+  /**
    * 目录加载闸门：并发去重 + 失败/空结果冷却。
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
@@ -745,10 +759,21 @@ export class TraeAdapter extends LlmAdapter {
     return { id, name: this.product.displayName }
   }
 
-  /** 懒加载远端模型目录（仅拉取一次）。 */
+  /**
+   * 懒加载远端模型目录（**每 20 分钟**重新拉一次，用户 2026-10-18 的要求）。
+   */
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
-    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+    //    可拉」（无凭据/无接线），与新鲜度是两件事。
+    if (fetchRemote === undefined) return
+    // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）。
+    // ⚠️ **不是**照抄 aggregate-adapter.ts 那条 —— 那边另有两处本家没有的前提
+    //    （`force` 与 `options.catalogTtlMs` 覆盖的 60s TTL），本家用 20 分钟默认周期。
+    if (this.remoteModels !== undefined
+      && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return
+    }
     // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
     // Trae 的目录超时上限 30s（src/trae.ts），失败不冷却会被 buildModelCatalog
     // 放大成「每模型一次」。
@@ -757,6 +782,9 @@ export class TraeAdapter extends LlmAdapter {
       if (models.length === 0) return false
       this.remoteModels = models
       this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+      // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+      //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+      this.catalogAt = this.options.now?.() ?? Date.now()
       return true
     })
   }

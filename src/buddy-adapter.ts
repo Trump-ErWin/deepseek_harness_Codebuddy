@@ -18,7 +18,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFresh, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate, REMOTE_CATALOG_COOLDOWN_MS } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import {
@@ -1859,6 +1859,16 @@ export class BuddyAdapter extends LlmAdapter {
    */
   private remoteComplete = false
   /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过 / 被 `refreshCatalog` 强制清零）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+   *
+   * ⚠️⚠️ **`refreshCatalog()` 会把它置 0** —— 那不是「作废数据」，而是
+   *    **强制下一次 `ensureRemoteModels` 重新拉取**的手段（见该方法）。
+   */
+  private catalogAt = 0
+  /**
    * 目录加载闸门：并发去重 + 失败/空结果冷却。
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
@@ -2072,14 +2082,26 @@ export class BuddyAdapter extends LlmAdapter {
 
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
+    // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+    //    可拉」（无凭据/无接线），与新鲜度是两件事。
     if (fetchRemote === undefined) return
-    // ⚠️⚠️ **短路判据是「已完整」，不是「已定义」**（issue IKJVTF 复审，审计 I3）。
+    // ⚠️⚠️ **短路判据是「已完整」+「未超 20 分钟」，不是「已定义」**
+    //    （issue IKJVTF 复审，审计 I3；TTL 由 `isCatalogFresh` 给出）。
     //
     // buddy 是**双端点** provider（scoped + `/v3/config`，id 集合不同、必须取并集），
     // 残缺目录**也**要落 `remoteModels`（展示需要），但那时**不能**短路 ——
     // `RemoteCatalogGate` 的冷却在生产里只有闸门自己那一处调用点，而它排在
     // 短路**之后** ⇒ 残缺一旦落缓存，冷却永远读不到、残缺永远补不齐。
-    if (this.remoteComplete) return
+    //
+    // ⚠️⚠️ **加 TTL 为什么不会破坏残缺恢复**（加 TTL 前逐行核实）：
+    // TTL 那一腿是 `&&` 的**后半截**，前半截 `remoteComplete` 未变。残缺时
+    // `remoteComplete === false` ⇒ 短路判据恒为假 ⇒ **残缺目录不会被判为
+    // 「新鲜」，闸门冷却与补齐逻辑原样生效**。
+    // ⇒ 两条路径的分工见 `refreshCatalog` 的注释。
+    if (this.remoteComplete
+      && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return
+    }
     // 闸门：并发去重 + 失败/空结果冷却（详见 src/remote-catalog-gate.ts 的
     // 实测依据）。Buddy 的目录端点超时上限 60s，失败不冷却会让首屏在
     // 「每个模型重试一次」的放大下长时间空转。
@@ -2091,6 +2113,9 @@ export class BuddyAdapter extends LlmAdapter {
       // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
       const reconciled = this.reconcileWithFallback(models)
       this.remoteModels = reconciled
+      // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+      //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+      this.catalogAt = this.options.now?.() ?? Date.now()
       this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]))
       this.remoteContextWindows = new Map(
         reconciled
@@ -2126,12 +2151,46 @@ export class BuddyAdapter extends LlmAdapter {
    * ⚠️ **只放宽冷却、不清 `remoteModels`**：目录已成功时 `ensureRemoteModels`
    * 本就直接返回，无需也不能重拉（重拉会把成功结果丢掉）。
    *
+   * ⚠️⚠️ **2026-10-18：上一条已改** —— 目录 TTL（`isCatalogFresh`）上线后，
+   *    本方法**不再复用「已定义就不重拉」那条判据**，而是**无视 TTL 强制重拉**。
+   *    理由：这里的语义是「用户/贴图门禁主动**重测图片能力**」，与
+   *    `ensureRemoteModels` 的「日常保鲜」是两条不同的路。实现是「置
+   *    `catalogAt = 0` + 复用既有取数路径」，**不是**另写一份拉取逻辑。
+   *    上面那条「只放宽冷却」的旧约束**仅对冷却期本身**仍然成立。
+   *
    * ⚠️ 冷却期整体仍以 `cooldownMs`（30s）为准 —— 放宽的是**图片门禁这一次**
    * 的评估，不是把闸门的冷却期改短，故其他调用方仍受 30 秒保护。
    */
   async refreshCatalog(): Promise<void> {
     if (this.options.fetchRemoteModels === undefined) return
-    if (this.remoteModels !== undefined) return
+    // ⚠️⚠️ **这里必须无视 TTL**（2026-10-18）：本方法的语义是「**用户主动重测
+    //    图片能力**」⇒ **强制重拉目录**，与 `ensureRemoteModels` 的「日常保鲜」
+    //    是**两条不同的路**。若也给它加 TTL，用户点「重测」会因 `remoteModels`
+    //    已定义而直接 return ⇒ **按钮变哑、零日志**（实测症状）。
+    //
+    // ⚠️ 强制重拉的实现是「**清时刻 + 复用既有取数路径**」，**不是**另写一份
+    //    拉取逻辑（那会让两条路的上游行为分叉）。
+    //
+    // ⚠️ **判据的等价性**：原判据是 `if (this.remoteModels !== undefined) return`
+    //    （有值就不重拉）。加 TTL 后「有值」的等价条件是
+    //    `remoteComplete && isCatalogFresh(catalogAt, now)` —— 本方法要**无视**
+    //    这两条中**任意一条**成立时的短路，故两条都不判，改清这两个字段。
+    //
+    // ⚠️⚠️ **实测：这两行互为冗余，删掉任一行该用例仍全绿**（反向验证 2026-10-18）。
+    //    因为任一行单独置位都足以让短路判据为假。**两行都保留**的理由不是
+    //    「需要」，而是它们各自守护**不同的未来改动**：
+    //    - `catalogAt = 0` 守「`ensureRemoteModels` 的新鲜度腿」；
+    //    - `remoteComplete = false` 守「完整性腿」——
+    //      ⚠️ 若将来有人把完整性判据从短路里摘掉（比如改成 `||`），
+    //        只留 `catalogAt` 的写法就会立刻让「完整目录」被当成要重拉的，
+    //        反之亦然。删掉任一行前请先跑反向验证确认用例真的会红。
+    this.catalogAt = 0
+    this.remoteComplete = false
+    // ⚠️ **冷却顺序与原实现保持等价**（原代码：**判冷却 → `reset()` → 拉取**）。
+    //    距上次尝试不足 `BUDDY_IMAGE_CAPABILITY_RETRY_MS` 时**照样直接 return**
+    //    —— 这条 10 秒节流是用户定的规则（issue IKJQ3M），不能被「重测」绕过：
+    //    目录端点超时上限 60s，无节流的「贴图就重拉」会把每次带图请求都放大成
+    //    一次远端拉取，那正是 `RemoteCatalogGate` 当初要挡的放大。
     const since = this.catalogGate.sinceLastAttemptMs()
     if (since !== undefined && since < BUDDY_IMAGE_CAPABILITY_RETRY_MS) return
     // 放宽本次冷却，让 ensureRemoteModels 里的 run() 真正发起一次拉取。

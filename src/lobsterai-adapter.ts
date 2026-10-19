@@ -30,7 +30,7 @@ import {
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFresh, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { parseRateLimitError } from './llm-adapter.js'
@@ -357,6 +357,13 @@ export interface LobsteraiAdapterOptions {
   ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；默认 {@link LOBSTERAI}。 */
   product?: LobsteraiProduct
+  /**
+   * 时钟（注入以便单测推进目录 TTL；缺省 `Date.now`）。
+   *
+   * ⚠️ 只用于**目录新鲜度**（`ensureRemoteModels` 的 `isCatalogFresh`），
+   *    不用于超时/退避计时 —— 那些仍走真实时钟。
+   */
+  now?: () => number
   /**
    * 远端目录**落地后**的通知回调（issue IKJVTF）。
    *
@@ -795,6 +802,13 @@ export class LobsteraiAdapter extends LlmAdapter {
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: LobsteraiRemoteModel[] | undefined
   /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+   */
+  private catalogAt = 0
+  /**
    * 目录加载闸门：并发去重 + 失败/空结果冷却。
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
@@ -849,20 +863,30 @@ export class LobsteraiAdapter extends LlmAdapter {
   }
 
   /**
-   * 懒加载远端模型目录（仅拉取一次）。
+   * 懒加载远端模型目录（**每 20 分钟**重新拉一次，用户 2026-10-18 的要求）。
    *
    * `listModels` 与 `resolveModel` 共用：`resolveModel` 可能先于 `listModels`
    * 被调用（如直接从历史会话进入），此时同样需要触发一次拉取。
    */
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
-    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+    //    可拉」（无凭据/无接线），与新鲜度是两件事。
+    if (fetchRemote === undefined) return
+    // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）。
+    if (this.remoteModels !== undefined
+      && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return
+    }
     // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
     await this.catalogGate.run(async () => {
       const models = await fetchRemote()
       if (models.length === 0) return false
       this.remoteModels = models
       this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+      // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+      //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+      this.catalogAt = this.options.now?.() ?? Date.now()
       return true
     })
   }
