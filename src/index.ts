@@ -150,7 +150,11 @@ import { AGGREGATE_PROVIDER, registerAggregateLlm } from './aggregate-adapter.js
 import { createExpiryProbe } from './aggregate-expiry.js'
 // ⚠️ 共享余额读数缓存（2026-10-15，规格 §5.7）：装配层建**一个**实例，
 //    `credits.balances` 端点与 buddy 系四家的折算共用它（见下面 `balanceCache` 的长注释）。
-import { createBalanceCache, type BalanceCacheEntry } from './balance-cache.js'
+import { createBalanceCache, createBalanceRefresher, REFRESH_PERIOD_FALLBACK_MS, type BalanceCacheEntry } from './balance-cache.js'
+// ⚠️ 模型目录的后台刷新器（用户 2026-10-18 要求：20 分钟定时更新）。
+//    与余额刷新器**共用同一套骨架**（武装 + 单飞 + 幂等），但**不复用实例** ——
+//    余额缓存 key 是 `(provider, accountId)`、目录的 key 是 provider，语义不同。
+import { createCatalogRefresher } from './model-catalog.js'
 // ⚠️ 中止判据复用适配器的**共享实现**（`aggregate-adapter.ts` 的 `isAbortLike`）：
 //    本仓库已有 4 份同义实现，装配层不该再添第五份。
 import { isAbortLike as isAbortLikeError } from './aggregate-adapter.js'
@@ -779,6 +783,63 @@ export function apply(ctx: Context): void {
   //   `ProviderRuntime.credits` 同一张表（见 `provider-runtime.ts` 的说明）。
   //   ⚠️ 未注册 ⇒ 端点回退到自己的原路径（行为与升级前一致）—— 那是刻意的降级。
   registerBalanceCache(balanceCache)
+
+  /**
+   * ★★ **余额缓存的后台刷新器**（2026-10-18，Task 2）。
+   *
+   * ## 为什么必须有它（用户原话）
+   *
+   * 「这个 2 分钟是 interval 不是 timeout」—— 原实现是 cache-aside（读驱动），
+   * 而读路径在提交 `a725101` 之后陈旧命中**一个请求都不发** ⇒ 没有任何东西会再取
+   * 新数据 ⇒ 缓存会永远陈旧。本刷新器补上「后台保鲜」那一半。
+   *
+   * ## ⚠️ 位置不变式
+   *
+   * 必须建在 `balanceCache` **之后**：它要拿缓存实例（与上面那条位置不变式同源）。
+   *
+   * ## ⚠️ 凭据必须**在装配层解析**
+   *
+   * `fetchBalanceReading`（本文件下方）在 `entry.credential === undefined` 时
+   * 直接抛「凭据未提供」⇒ 刷新器若传空 entry，**每一轮都被记成失败读数**
+   * （外面看「刷新器在跑」，实则永远拿不到新值 —— 零报错的恒绿形态）。
+   * ⇒ 这里按 `credentialRef` 解析（与 `jet-hub-rpc.ts` 的
+   *   `resolveCredentialForCache` **同款**口径）；解析失败返回 undefined，
+   *   刷新器据此**跳过**该账号（那一枪必然失败，纯浪费）。
+   */
+  const balanceRefresher = createBalanceRefresher(balanceCache, {
+    // ⚠️ `listAllAccounts()` 实测是 **async**（`src/account-pool.ts:1308`）；
+    //    刷新器内部一律 `await`，直接传引用即可。
+    // ⚠️ 传**全部**账号（含停用）：停用只影响自动选号（仓库铁律「续期不得按
+    //    `enabled` 过滤」），凭据仍需保鲜 —— 由刷新器自己判低频节奏。
+    listAccounts: () => pool.listAllAccounts(),
+    resolveCredential: async (refName) => {
+      const resolved = await ctx.credentials.resolve(credentialRef(refName))
+      if (resolved === undefined) return undefined
+      try {
+        return JSON.parse(resolved.value)
+      } catch {
+        return undefined
+      }
+    },
+    // ⚠️ **引用常量、不要重打 `60_000`**（2026-10-18 复审 Minor 修正）：
+    //    装配层与 `createBalanceRefresher` 各写一份同一个字面量，等于把
+    //    `DEFAULT_STALE_TTL_MS` 刚消灭掉的那类重复又引入了一次。
+    //    ⚠️ **理由（别丢）**：周期 = 共享缓存 `ttlMs`(120s) 的**一半** ——
+    //    周期恰等于 `ttlMs` 时条目在刚过期那一刻才被刷，读路径仍会频繁撞上
+    //    「陈旧且后台刚开始刷」，常新目标落空；取一半 ⇒ 任何时刻至少有半个周期余量。
+    intervalMs: REFRESH_PERIOD_FALLBACK_MS,
+    // ⚠️⚠️ **日志必须接上**：刷新器把失败吞掉并记日志（后台没有调用方可通知）
+    //    ⇒ 不接 logger 就是**完全静默**：面板只显示「查询失败」，用户与维护者
+    //    都看不到「后台刷新器压根没在刷」。这两行同时是接线守卫的判据落点。
+    info: (message) => ctx.logger?.info?.(message),
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // 生命周期挂 `ctx.effect`，与插件一致（释放后停手）—— 与既有 `modelsDevTimer`、
+  // `startCatalogPrewarm` 同款约定。
+  ctx.effect(() => {
+    balanceRefresher.start()
+    return () => { balanceRefresher.stop() }
+  })
 
   // CodeArts 目录的**各来源成败**出参（issue IKJVTF 复审，审计 I3）：
   // `service.refreshModels` 每轮原地写入，适配器的 `catalogComplete` 读它。
@@ -3315,11 +3376,39 @@ async function fetchBalanceReading(
      * 「只给可用账号」这一取舍由 `createExpiryProbe` 自己的取号逻辑决定
      *（它本来就只遍历可用账号），与缓存无关。
      *
-     * ⚠️ 返回 `undefined` ⇒ 取数失败 ⇒ 实现方回落到自己发请求：折算的**可用性**
-     * 不得依赖本缓存（否则缓存不可用会静默变成「该渠道折算恒 UNUSABLE」）。
+     * ⚠️ 返回 `undefined` ⇒ **本次没有共享读数** ⇒ 实现方回落到自己发请求
+     * （`fetchBalanceWithCache`，见 `aggregate-expiry.ts:275` 的契约）：
+     * 折算的**可用性**不得依赖本缓存（否则缓存不可用会静默变成「该渠道折算恒 UNUSABLE」）。
+     * ⇒ 而返回 **`null`** 是「结论：这个账号现在不可用」（`sharedPackageExpiry`
+     * 对 `null` 判 `UNUSABLE`，且**不**回落重查）—— 下面那条正是这一格。
      */
     balanceOf: async (provider, accountId, credential) => {
       const reading = await balanceCache.readOne(provider, accountId, { credential })
+      // ★★ **陈旧读数不得参与折算**（2026-10-18）。
+      //
+      // 读路径改成 stale-while-revalidate 后，缓存陈旧时折算会拿到**旧值**，
+      // 而 `stale` 字段原先只在 `readStale` 里判（`balance-cache.ts` 的注释记着
+      // 那个限制）⇒ 折算会**静默地长期用 10 分钟前的数字排序**。
+      //
+      // ⚠️⚠️ **必须返回 `null` 而不是 `undefined`**（实测确证，2026-10-18）：
+      //   契约（`aggregate-expiry.ts:275`）与实现（`fetchBalanceWithCache`）都规定
+      //   `undefined` = 「**本次没有共享读数**⇒ 回落到自己发请求」，`null` 才是
+      //   「结论：不可用」。实测（mock `fetchCreditBalance` 成功）：
+      //     - 返回 `undefined` ⇒ fallback **被调用 1 次**，折算返回**上游的值**（≠ UNUSABLE）
+      //     - 返回 `null`      ⇒ fallback **0 次**，折算返回 `-1`（UNUSABLE）
+      //   ⇒ 写 `undefined` 会得到「陈旧账号每次折算**多打一次上游请求**」，
+      //     恰恰是本条要消灭的行为（且与「读路径一个请求都不发」相悖）。
+      //
+      // ⚠️ 与 officeace 分支的既有约定同构（`aggregate-expiry.ts:1141`：
+      // 「`summary.stale === true` ⇒ 判 `UNUSABLE`」）。同一次改动在别处新增了
+      // 这条、而面板出口把两天前的快照当实时余额显示，被审计记为
+      // 「**同一份数据两层结论相反**」（`jet-hub-rpc.ts:5462`）——
+      // 本行就是避免复发的那一腿。
+      //
+      // ⚠️ **有意的行为代价（如实登记）**：折算可能因陈旧读数而少一个候选渠道，
+      // 用户表现为**聚合轮换里某个渠道暂时不出现**。这比「用 10 分钟前的数字
+      // 排序」安全，且与 officeace 既有行为一致（用户 2026-10-18 明确接受）。
+      if (reading.stale === true) return null
       return reading.error === undefined ? reading.value : undefined
     },
   })
@@ -3448,6 +3537,45 @@ async function fetchBalanceReading(
     //    「编译期兜底快照跟不上上游下架」那套记录/过滤机制对它没有意义。
     'jet-hub-auto': pruned(AUTO_PROVIDER, autoAdapter, { enabled: false }),
   }
+
+  /**
+   * ★ **模型目录的后台刷新器**（用户 2026-10-18 的要求）。
+   *
+   * 「各个模型的模型列表缓存也要带定时更新，20 分钟更新一次，如果不更新随高峰低谷
+   * 变化的积分消耗倍率是更新不到实际的倍率」
+   *
+   * ## ⚠️ 为什么必须建在 `modelAdapters` **之后**（位置不变式）
+   *
+   * 它要读那张表拿实例。早于建表 ⇒ 空表 ⇒ **目录永不刷新、且零日志**
+   * （与 `wiredRefreshTargets()` 前身在 2026-10-15 踩的坑同型）。
+   *
+   * ## ⚠️ 为什么走 `modelAdapters` 而不是 `ctx.llm`
+   *
+   * `ctx.llm` 是 DSH 的公开面，**不认识** `refresh()`（那是本插件给目录契约加的可选成员）。
+   * 而 `modelAdapters` 的每一项都是 `pruned()` 的 Proxy —— 它对**其余成员原样透传并绑定
+   * `this`**（`src/dead-model-store.ts:748-749`），故新加的 `refresh()` 能自动透出来。
+   *
+   * ## ⚠️ 未实现 `refresh` 的 provider 必须跳过
+   *
+   * `opencode` 这类本地派生渠道（零网络）本就没有远端可拉。对它们空转会让
+   * 「刷新器说跑了 9 家、实际只刷了 3 家」**完全静默**。
+   */
+  const catalogRefresher = createCatalogRefresher({
+    listProviders: () => Object.keys(modelAdapters),
+    refreshOf: (provider) => {
+      const adapter = modelAdapters[provider] as { refresh?: () => Promise<void> } | undefined
+      // ⚠️ 返回 `undefined` ⇒ 刷新器跳过（不 await、不记日志）—— 见上注。
+      return adapter?.refresh?.()
+    },
+    info: (message) => ctx.logger?.info?.(message),
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // ⚠️ 生命周期挂 `ctx.effect`，与插件一致（释放后停手）——
+  //    与既有 `modelsDevTimer`、余额刷新器同款约定。
+  ctx.effect(() => {
+    catalogRefresher.start()
+    return () => { catalogRefresher.stop() }
+  })
 
   // 插件卸载前把签名缓存落盘：`stream()` 每次结束都 flush，但用户可能
   // 直接关掉 DSH 而上一轮的 flush 还在排队 —— 落一次盘几乎零成本，
