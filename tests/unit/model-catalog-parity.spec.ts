@@ -710,6 +710,52 @@ id: 'autoclaw',
     expect(CASES).toHaveLength(20)
   })
 
+  it('★★ `catalog` 具备 `refresh` 的家必须把它**转发成适配器成员**（否则后台刷新器对这家空转）', () => {
+    // ⚠️⚠️ 2026-10-20 修正的实测缺陷形态：`be42b25`（「装配 20 分钟模型目录刷新器」）
+    //    给 `createModelCatalog` 的 **config** 加了 `refresh` 回调，但**各家适配器
+    //    都没有**把它转发成自己的 `refresh` 成员；而 `index.ts` 的刷新器调的是
+    //    `adapter.refresh?.()` —— `pruned()` 的 Proxy 只透传适配器**自己的**成员，
+    //    catalog 实例上的成员不会自动出现 ⇒ 每一轮都是「0 家参与」，
+    //    而 `start()` 的「模型目录刷新器已武装」照打、**零日志**、整整一天无感。
+    //
+    // ⚠️ 判据是**行为**（构造真实适配器、看实例成员），**不是**源码文本断言 ——
+    //    后者会被 `if (false)` 短路骗过（本仓库已实测 5 条这类判据恒绿）。
+    // ⚠️ 从 `CASES` 遍历 ⇒ 新增 provider 自动纳入（漏一家即被点名）。
+    // ⚠️ `catalog` 无 `refresh` 的家自动跳过：那表示它的目录不走共享骨架
+    //    （opencode / autoclaw / officeace / modelscope / aggregate），
+    //    或它的 `createModelCatalog` 没给 config 回调（cline / gemini / qoder）
+    //    —— 后者是**已知的、已如实登记的**独立缺口，不在本条判据的范围内。
+    const missing: string[] = []
+    const forwarding: string[] = []
+    for (const c of CASES) {
+      const adapter = c.make() as {
+        catalog?: { refresh?: unknown }
+        refresh?: unknown
+      }
+      if (typeof adapter.catalog?.refresh !== 'function') continue
+      if (typeof adapter.refresh === 'function') forwarding.push(c.id)
+      else missing.push(c.id)
+    }
+    expect(
+      missing,
+      '这些家的 catalog 有 refresh 却没转发成适配器成员 ⇒ 后台目录刷新器对它们空转且零日志',
+    ).toEqual([])
+    // ⚠️⚠️ **反向护栏必须「逐家点名」，不能只写 `length >= N`**（2026-10-20）：
+    //    上面那条 `missing` 判据有个**盲区** —— 若某人把某家的 `config.refresh`
+    //    也删掉，该家的 `catalog.refresh` 就不存在 ⇒ 被 `continue` 跳过 ⇒
+    //    **静默放过**。逐家点名把「漏转发」与「连 config 都没给」两个方向一起堵住。
+    //    ⚠️ 用精确集合而不是下界：下界会漏掉「删一家、加一家」的配平。
+    //    ⚠️ `minimaxintl` 与 `workbuddy` 也在列：它们分别与 `minimax` / `buddy`
+    //       **共用适配器类**，因此同样继承了 config 回调与转发（实测由本断言自己找出）。
+    expect(
+      forwarding.sort(),
+      '这 12 家必须都接入后台刷新（改这条名单前请先读 be42b25 与本轮修正的注释）',
+    ).toEqual([
+      'accio', 'astudio', 'buddy', 'codearts', 'lobsterai', 'loomy',
+      'minimax', 'minimaxintl', 'raccoon', 'trae', 'workbuddy', 'zcode',
+    ])
+  })
+
   /**
    * ⚠️ 每家一个 `it`（`it.each` 而非循环）：失败时**点名是哪一家**。
    * 用 `for` 循环包全部家会让第一个失败就中断，后面的家**根本没跑**

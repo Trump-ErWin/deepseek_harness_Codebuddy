@@ -994,6 +994,20 @@ export class CodeArtsAdapter extends LlmAdapter {
           efforts: [...CODEARTS_REASONING_EFFORTS],
           defaultEffort: ReasoningEffortId(CODEARTS_DEFAULT_EFFORT),
         }),
+        /**
+         * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFreshFor` 判据
+         *    ⇒ 新鲜时**不拉**。本回调要的是「无视新鲜度，强制拉一次」，
+         *    故先清 `catalogAt` 再调**同一个** `ensureRemoteModels()` ——
+         *    **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+         *    ⚠️ `ensureRemoteModels` 的入口就是 TTL gate ⇒ 清掉 `catalogAt`
+         *    正是让它失效的承重动作（与 loomy / zcode 等家同型）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          await this.ensureRemoteModels()
+        },
       },
     )
   }
@@ -1107,6 +1121,21 @@ export class CodeArtsAdapter extends LlmAdapter {
    * 它在 `listModels` 与 `listAllModels` **两条路径上都要生效** ——
    * 故放在 `toCatalogEntry` 之前的取数回调里（`catalogEntries()`）。
    */
+  /**
+   * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+   *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+   *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+   *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+   *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+   *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+   *    两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
+  }
+
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }

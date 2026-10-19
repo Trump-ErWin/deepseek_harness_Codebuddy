@@ -3564,8 +3564,18 @@ async function fetchBalanceReading(
     listProviders: () => Object.keys(modelAdapters),
     refreshOf: (provider) => {
       const adapter = modelAdapters[provider] as { refresh?: () => Promise<void> } | undefined
-      // ⚠️ 返回 `undefined` ⇒ 刷新器跳过（不 await、不记日志）—— 见上注。
-      return adapter?.refresh?.()
+      const refresh = adapter?.refresh
+      // ⚠️⚠️ **`undefined` 只能表示「这家没有该成员」**（2026-10-20 修正）：
+      //    刷新器据此统计「本轮几家真的参与」，**零参与即 warn**
+      //    （见 `createCatalogRefresher` 的注释）。故**不要**写成
+      //    `return adapter?.refresh?.()` —— 那会让「成员存在但同步返回 void」
+      //    与「成员根本不存在」不可区分，统计随之失真。
+      //    ⚠️ 而本仓库实测的失效形态恰恰是「成员根本不存在」：`be42b25` 给
+      //    `createModelCatalog` 的 config 加了 `refresh` 回调，却**没有**把它
+      //    转发成适配器实例的成员，而该提交的注释误以为 `pruned()` 的 Proxy
+      //    会把它透出来（Proxy 只透传适配器**自己的**成员）。
+      if (typeof refresh !== 'function') return undefined
+      return Promise.resolve(refresh.call(adapter)).then(() => undefined)
     },
     info: (message) => ctx.logger?.info?.(message),
     warn: (message) => ctx.logger?.warn?.(message),

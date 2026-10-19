@@ -1321,6 +1321,21 @@ export class AccioAdapter extends LlmAdapter {
    * 会按黑名单过滤掉它们 ⇒ RPC 层只能凭裸 id 补回、展示名与倍率随之丢失
    * （用户报障：「关闭的就没有显示倍率」）。
    */
+  /**
+   * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+   *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+   *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+   *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+   *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+   *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+   *    两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
+  }
+
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }

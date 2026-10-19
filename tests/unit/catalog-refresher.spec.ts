@@ -94,7 +94,13 @@ describe('★★ 刷新器：后台定时保鲜', () => {
       listProviders: () => providers,
       refreshOf: (provider) => {
         calls.push(provider)
-        return options.refresh?.(provider)
+        // ⚠️ **默认必须返回非 `undefined`**：在本刷新器的契约里 `undefined` 意为
+        //    「这家不参与后台刷新」（`index.ts` 的 `refreshOf` 据此统计参与度，
+        //    零参与会 warn —— 见 `createCatalogRefresher` 的注释）。
+        //    本夹具测的是刷新器**自身逻辑**，故默认模拟「全部参与」；
+        //    `options.refresh` 仍可显式覆盖（含故意返回 undefined 的场景）。
+        if (options.refresh === undefined) return Promise.resolve()
+        return options.refresh(provider)
       },
       setInterval: ((fn: () => void) => { armed = fn; return { unref: () => {} } }) as never,
       intervalMs: CATALOG_REFRESH_INTERVAL_MS,
@@ -147,7 +153,10 @@ describe('★★ 刷新器：后台定时保鲜', () => {
   it('★★ 单家失败不得中断其余（与 refreshAllCredentials 同款）', async () => {
     const world = makeWorld({
       providers: ['bad', 'good'],
-      refresh: (provider) => { if (provider === 'bad') throw new Error('上游 503') },
+      // ⚠️ 用 **async** 而非同步 throw：同步抛会让 `refreshOf` 连「返回了东西」
+      //    都做不到 ⇒ 参与度统计把它算成「未参与」，与本用例要测的「失败」
+      //    混为一谈（判据失焦）。
+      refresh: async (provider) => { if (provider === 'bad') throw new Error('上游 503') },
     })
     await expect(world.refresher.tick()).resolves.toBeUndefined()
     expect(world.calls, '★★ 坏的那家失败后，好的那家仍必须被刷').toEqual(['bad', 'good'])
@@ -173,6 +182,56 @@ describe('★★ 刷新器：后台定时保鲜', () => {
     refresher.start()
     refresher.start()
     expect(armedCount, '★★ 只能武装一次').toBe(1)
+  })
+
+  it('★★ 本轮**零参与**必须 warn（否则「已武装」的日志会说谎）', async () => {
+    // ⚠️⚠️ 这是 2026-10-20 修的实测缺陷形态：`be42b25` 给 13 家适配器只加了
+    //    `createModelCatalog` 的 **config 回调**，**没有**把它转发成适配器实例的
+    //    `refresh` 成员 ⇒ `index.ts` 的 `refreshOf` 恒返回 `undefined` ⇒
+    //    每一轮都是「0 家参与」，而 `start()` 的「模型目录刷新器已武装」照打 ⇒
+    //    功能整体失效却**一行日志都没有**。
+    //    ⚠️ `be42b25` 当时的注释还声称「返回 undefined 比假函数更容易发现接线错误」
+    //    —— 实测恰好相反（假函数至少会真发请求、日志里能看出动静）。
+    const warns: string[] = []
+    const refresher = createCatalogRefresher({
+      listProviders: () => ['a', 'b'],
+      refreshOf: () => undefined,
+      setInterval: (() => ({ unref: () => {} })) as never,
+      intervalMs: CATALOG_REFRESH_INTERVAL_MS,
+      warn: (m) => { warns.push(m) },
+    })
+    await refresher.tick()
+    expect(
+      warns.some((w) => w.includes('无一家参与')),
+      '零参与必须 warn 并点名（这是接线缺口的唯一强信号）',
+    ).toBe(true)
+  })
+
+  it('★ 部分参与必须**留痕**（「说跑了 N 家、实际只刷了 M 家」不得静默）', async () => {
+    const infos: string[] = []
+    const refresher = createCatalogRefresher({
+      listProviders: () => ['a', 'b', 'c'],
+      // 只有 a 参与 —— 正是「有人漏转发」在生产里的形状。
+      refreshOf: (provider) => (provider === 'a' ? Promise.resolve() : undefined),
+      setInterval: (() => ({ unref: () => {} })) as never,
+      intervalMs: CATALOG_REFRESH_INTERVAL_MS,
+      info: (m) => { infos.push(m) },
+    })
+    await refresher.tick()
+    expect(infos.some((i) => i.includes('参与 1/3')), '部分参与要记明参与数').toBe(true)
+  })
+
+  it('★ 全部参与时**不得**产生告警（防「无脑 warn」把日志刷满）', async () => {
+    const warns: string[] = []
+    const refresher = createCatalogRefresher({
+      listProviders: () => ['a', 'b'],
+      refreshOf: async () => {},
+      setInterval: (() => ({ unref: () => {} })) as never,
+      intervalMs: CATALOG_REFRESH_INTERVAL_MS,
+      warn: (m) => { warns.push(m) },
+    })
+    await refresher.tick()
+    expect(warns, '全部参与时不该有任何告警').toEqual([])
   })
 })
 
