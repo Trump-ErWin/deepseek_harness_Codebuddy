@@ -747,6 +747,69 @@ describe('★ PR115 审计守卫：审计发现的七处缺陷逐条钉死', () 
     expect(split!.expiring, '客户端侧合计必须与批次和一致').toBe(1000)
   })
 
+  // ── 2026-10-20 净额口径：debit / expire 必须参与扣减 ───────────────
+  //
+  // ⚠️⚠️ 用户报障「积分全显示成永久」的根因：原实现只累加 `credit`
+  //    ⇒ 批次和恒 = **历史发放额**，用户一有消耗就不守恒
+  //    ⇒ `fetchAutoclawBalanceDetailed` 的守恒校验恒不成立
+  //    ⇒ 永远回退钱包包 ⇒ **逐批次分档（临期红 + 倒计时）永不出现**。
+  //    实测 `debit` 条目同样携带 `wallet_expires_at`，可精确归入批次。
+  it('★ debit（消耗）按 wallet_expires_at 精确扣减所属批次', () => {
+    const batches = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 1000, wallet_expires_at: SOON_SEC, description: '签到' },
+        { mutation_type: 'debit', amount: -300, wallet_expires_at: SOON_SEC, description: '模型消耗' },
+      ],
+      NOW_MS,
+    )
+    expect(batches).toHaveLength(1)
+    expect(batches[0]!.remaining, '★ 不扣消耗 ⇒ 批次和永远是历史发放额，分档永不出现').toBe(700)
+    expect(batches[0]!.deductionEndTime).toBe(SOON_SEC * 1000)
+  })
+
+  it('★ expire（过期）同样按批次扣减', () => {
+    const batches = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 1000, wallet_expires_at: SOON_SEC, description: '签到' },
+        { mutation_type: 'expire', amount: -400, wallet_expires_at: SOON_SEC, description: '过期回收' },
+      ],
+      NOW_MS,
+    )
+    expect(batches[0]!.remaining).toBe(600)
+  })
+
+  it('★ 批次被消耗完（净额 ≤ 0）⇒ 整包丢弃，不产出死包', () => {
+    const batches = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 500, wallet_expires_at: SOON_SEC, description: '签到' },
+        { mutation_type: 'debit', amount: -500, wallet_expires_at: SOON_SEC, description: '用光' },
+      ],
+      NOW_MS,
+    )
+    // ⚠️ 客户端会静默 skip `remaining <= 0` ⇒ 留着它会让合计与总额脱钩。
+    expect(batches, '★ 净额 ≤ 0 的批次不得发出').toHaveLength(0)
+  })
+
+  it('★ 负数 debit 是消耗（要扣），负数 credit 是冲正（不扣）—— 两者语义相反', () => {
+    // ⚠️ 这条钉住精确的边界：不能一刀切丢掉所有负数。
+    const withDebit = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 1000, wallet_expires_at: SOON_SEC },
+        { mutation_type: 'debit', amount: -200, wallet_expires_at: SOON_SEC },
+      ],
+      NOW_MS,
+    )
+    const withNegativeCredit = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 1000, wallet_expires_at: SOON_SEC },
+        { mutation_type: 'credit', amount: -200, wallet_expires_at: SOON_SEC },
+      ],
+      NOW_MS,
+    )
+    expect(withDebit[0]!.remaining, 'debit 要扣').toBe(800)
+    expect(withNegativeCredit[0]!.remaining, '负 credit 是冲正，不扣').toBe(1000)
+  })
+
   // ── P2：metadata.description 为空串 ───────────────────────────────
   it('P2-d metadata.description 为空串时回退到顶层 description（不是通用兜底名）', () => {
     // `??` 不落空串 ⇒ 原实现会把 name 打成「积分发放」，白白丢掉真实描述。

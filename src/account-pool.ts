@@ -1544,6 +1544,96 @@ export class AccountPool {
   }
 
   /**
+   * **启动自愈**：按「身份字段」清理同一账号的重复条目（只留一条）。
+   *
+   * ## 为什么需要它（2026-10-19 真机报障）
+   *
+   * AutoClaw 的 `access_token` 是 JWT、**每次登录/续期都轮换**，而早期实现
+   * 拿它当身份判据 ⇒ 同一账号每续一次就被当成新账号。用户面板里同一个手机号
+   * 出现了 **3 次**，积分被**重复累加**：
+   *
+   * ```
+   * 合计 62416 积分
+   *   187****9406  20838
+   *   187****9406  20789
+   *   187****9406  20789
+   * ```
+   *
+   * 判据侧已修（改用稳定的 `user_id`，见 `autoclawIdentityOf`），但**池里已有的
+   * 重复条目不会自己消失** ⇒ 用户仍看到 62416。本方法负责一次性清掉存量。
+   *
+   * ## 保留哪一条
+   *
+   * 保留**凭据最新**的那一条（`expiresAt` 最大者）；`expiresAt` 相同则保留
+   * **先出现**的（与 `writeAccounts` 的「保留首次」同口径，保证确定性）。
+   * ⚠️ 不按 `id` 字典序 —— 那与「哪个账号能续期」无关。
+   *
+   * ## 边界
+   *
+   * - 身份字段缺失的条目**跳过**（无法判断，不误删）；
+   * - 只处理传入的 `provider`，绝不跨渠道合并；
+   * - 每次只删「确认同身份且非保留项」的条目，删除走 {@link removeAccount}
+   *   （它会一并 `credentials.unset`，不留孤儿凭据）；
+   * - 失败不抛：自愈是**尽力而为**，不能因此让插件启动失败。
+   *
+   * @param provider - provider id（如 `autoclaw`）。
+   * @param field - 凭据里作身份判据的字段名（如 `user_id`）。
+   * @returns 实际删除的条目数。
+   */
+  async dedupeByCredentialField(provider: string, field: string): Promise<number> {
+    try {
+      const entries = this.readAccounts().filter((a) => a.provider === provider)
+      if (entries.length < 2) return 0
+
+      // identity → 该身份下所有条目（按池顺序）
+      const byIdentity = new Map<string, ProviderAccountEntry[]>()
+      for (const entry of entries) {
+        const resolved = await this.resolveCredentialByRef(entry.credentialRef)
+        if (resolved === undefined) continue
+        const raw = resolved[field]
+        // ⚠️ 缺失/空值 ⇒ 无法判断，**跳过**（不是「不匹配」）。
+        const identity = typeof raw === 'string'
+          ? raw.trim()
+          : typeof raw === 'number' && Number.isFinite(raw) ? String(raw) : ''
+        if (identity === '') continue
+        const list = byIdentity.get(identity)
+        if (list === undefined) byIdentity.set(identity, [entry])
+        else list.push(entry)
+      }
+
+      const toRemove: string[] = []
+      for (const [identity, list] of byIdentity) {
+        if (list.length < 2) continue
+        // 保留 expiresAt 最大者；相同则保留先出现的。
+        let keep = list[0]!
+        for (const candidate of list.slice(1)) {
+          const keepAt = keep.expiresAt ?? 0
+          const candAt = candidate.expiresAt ?? 0
+          if (candAt > keepAt) keep = candidate
+        }
+        for (const entry of list) {
+          if (entry.id !== keep.id) toRemove.push(entry.id)
+        }
+        this.ctx.logger?.warn?.(
+          `[jet-hub] ${provider} 账号去重：${field}=${identity} 有 ${list.length} 条，`
+          + `保留 ${keep.id}，删除 ${list.length - 1} 条`,
+        )
+      }
+
+      for (const id of toRemove) {
+        await this.removeAccount(id)
+      }
+      return toRemove.length
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] ${provider} 账号自愈失败（不影响启动）：`
+        + (error instanceof Error ? error.message : String(error)),
+      )
+      return 0
+    }
+  }
+
+  /**
    * 重排某 provider 下账号的顺序（Jet Hub 拖拽排序）。
    *
    * ## 为什么顺序有实际意义

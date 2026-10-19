@@ -1,4 +1,4 @@
-/**
+﻿/**
  * AutoClaw 协议常量、凭据结构与纯函数。
  *
  * 本模块只放常量与无副作用的纯函数（签名计算、System Prompt 前缀拼接、凭据解析等）。
@@ -88,6 +88,75 @@ export function calculateAutoclawSign(
 export function cleanBearerToken(rawToken: string): string {
   if (!rawToken || typeof rawToken !== 'string') return ''
   return rawToken.trim().replace(/^Bearer\s+/i, '').trim()
+}
+
+/**
+ * 从 AutoClaw 的 `access_token`（JWT）里读**稳定身份字段**。
+ *
+ * ## 字段实况（2026-10-19 逐字节取证）
+ *
+ * 三条同一手机号（尾号 9406，已脱敏）凭据的 JWT payload 实测：
+ *
+ * ```json
+ * {
+ *   "user_id":   839684,                       // ← 非空、三条一致（= numericUserId）
+ *   "guid":      "",                            // ← 空串！不能作判据
+ *   "jti":       "1878……3406",                 // 三条一致（= 手机号，脱敏）
+ *   "device_id": "278d7ca6-2978-44d6-9b68-95c428ddc4ae",
+ *   "exp":       1792509875,                    // 会变
+ *   "iat":       1792423475                     // 会变
+ * }
+ * ```
+ *
+ * ⇒ JWT 里**唯一可用**的稳定身份是 `user_id`（数字形态的 `numericUserId`）。
+ *
+ * ## ⚠️ 它为什么能与「凭据字段 user_id」对上
+ *
+ * 那是**两个不同的 id 空间**：
+ *
+ * | 来源 | 值 | 形态 |
+ * |---|---|---|
+ * | JWT `user_id` | `839684` | 数字 = `numericUserId` |
+ * | 凭据字段 `user_id` / 服务端 `user-profile.user_id` | `7c54a9acc64092b06aa32cc8b1a48fef` | UUID = 主键 |
+ *
+ * ⚠️ **两者不能混用**：老凭据只落 UUID（第三条），新凭据两个都没有（前两条）。
+ *    所以判据必须**按 ref 固定取一种**，不能「字段优先、JWT 兜底」——
+ *    那会让前两条落到 `839684`、第三条落到 UUID，**分裂成两组、去重白做**
+ *    （用户二次报障「怎么还是在啊」的直接原因）。
+ *
+ * ## 结论：本函数给「两条都没有 UUID」的场景兜底
+ *
+ * - 有 `user_id` 字段（UUID）⇒ 用 UUID；
+ * - 没有（前两条那种）⇒ 用 JWT 的 `numericUserId`。
+ *
+ * 但**同一个池里不能同时存在两种**。彻底的做法是启动时把所有 ref 的
+ * UUID 补齐（见 `dedupe` 的调用方注释）；本函数只保证「不会没有身份」。
+ *
+ * ⚠️ 解析失败一律返回 `undefined`（调用方退化），**绝不抛**。
+ *
+ * @param accessToken - 已剥 Bearer 前缀的 access_token（裸 JWT）。
+ * @returns `user_id`（= numericUserId）字符串；取不到返回 `undefined`。
+ */
+export function readUserIdFromJwt(accessToken: string): string | undefined {
+  const token = cleanBearerToken(accessToken)
+  if (token === '') return undefined
+  try {
+    const parts = token.split('.')
+    if (parts.length < 2) return undefined
+    const payload = parts[1]!.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = payload + '='.repeat((4 - (payload.length % 4)) % 4)
+    const parsed = JSON.parse(Buffer.from(padded, 'base64').toString('utf8')) as {
+      user_id?: unknown
+      // ⚠️ `guid` 实测是空串（见上方注释），**不采用**。
+      // guid?: unknown
+    }
+    const raw = parsed?.user_id
+    if (typeof raw === 'string' && raw.trim() !== '') return raw.trim()
+    if (typeof raw === 'number' && Number.isFinite(raw)) return String(raw)
+    return undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -748,3 +817,4 @@ export function buildAutoclawHeaders(options: {
 
   return headers
 }
+

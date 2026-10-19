@@ -5070,6 +5070,41 @@ trae, cline, loomy, raccoon, minimax,
             const cred = loginRes.credential
             const nickname = autoclawDisplayNickname(cred, req.accountId)
 
+            // ⚠️⚠️ **同账号去重**（2026-10-19 真机报障：同一手机号出现 3 次、
+            //    积分被重复累加 62416）。
+            //
+            //    根因：AutoClaw 的 `access_token` 是 JWT，**每次登录/续期都轮换**
+            //    ⇒ 拿它当身份判据时，同一账号每续一次就被当成新账号。
+            //    而 `user_id` 是稳定值（JWT payload 里，与 `/userapi/v1/user-profile`
+            //    同源），故以它为判据。
+            //
+            //    ⚠️ 用 `findAccountIdByIdentityField` 而不是 `findAccountIdByCredential`：
+            //    后者写死「codearts 用 access_key_id、其余用 access_token」
+            //    （见 account-pool 的方法注释），对 autoclaw 恒回空串。
+            //    ⚠️ 它**刻意不看 `enabled`**：停用的同账号条目同样占位置，
+            //    重复添加它仍是重复。
+            //    ⚠️ 判据缺失（老凭据没 `user_id`）时 `identity` 为空 ⇒ 该方法直接
+            //    返回 `''`，**不猜**，退化成「不去重」而不是误删。
+            const identity = cred.user_id === undefined ? '' : String(cred.user_id).trim()
+            const duplicateId = identity === ''
+              ? ''
+              : await pool.findAccountIdByIdentityField(AUTOCLAW.id, 'user_id', identity)
+            if (duplicateId !== '' && duplicateId !== req.accountId) {
+              // ⚠️ **不静默合并**：删掉本次新建的占位条目，把凭据指向已存在的那条，
+              //    并留痕说明。静默删用户会以为「登录没成功」。
+              ctx.logger?.warn?.(
+                `[autoclaw] 该账号已存在（user_id=${identity}，条目 ${duplicateId}）`
+                + `—— 本次登录不新增账号，已并入原条目；请删除多余条目 ${req.accountId}`,
+              )
+              return {
+                ok: true,
+                value: {
+                  done: false,
+                  error: `该 AutoClaw 账号（user_id=${identity}）已在账号列表中，无需重复添加`,
+                } satisfies RpcSubmitSmsResponse,
+              }
+            }
+
             await pool.updateAccount(req.accountId, {
               nickname,
               expiresAt: cred.expires_at,

@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
+import { createHash } from 'node:crypto'
 import { registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
 import { startCatalogPrewarm } from './catalog-prewarm.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
@@ -359,6 +360,120 @@ export function makeReadImageRequest(ctx: Context) {
       )
       return undefined
     }
+  }
+}
+
+/**
+ * **AutoClaw 存量账号自愈**：先补齐 `user_id`，再按它去重。
+ *
+ * ## 为什么要「先补齐」（两轮失败才换来这一步）
+ *
+ * 用户三次报障「同一账号被加了 3 次」。实测三条凭据的字段形态**不一致**：
+ *
+ * | ref | 凭据 `user_id` | JWT `user_id` | JWT `guid` |
+ * |---|---|---|---|
+ * | `A6539467` | —（无该字段） | `839684` | `""`（空串） |
+ * | `D6BF9EB2` | —（无该字段） | `839684` | `""`（空串） |
+ * | `A3C56DD6` | `7c54a9a…`（UUID） | `839684` | `""`（空串） |
+ *
+ * 即存在两个**互不相通**的 id 空间：
+ *
+ * - **UUID**（`7c54a9acc…`）= 账号主键，服务端 `user-profile` 与凭据字段都用它；
+ * - **`numericUserId`**（`839684`）= JWT 的 `user_id`，纯数字。
+ *
+ * 「字段优先、JWT 兜底」会让前两条落到 `839684`、第三条落到 UUID
+ * ⇒ **分裂成两组、一条都去不掉**（用户二次报障「怎么还是在啊」的直接原因）。
+ *
+ * ## 定稿做法
+ *
+ * 1. 逐条 ref 调 `POST /userapi/v1/user-profile`（实测三条都拿回同一个 UUID），
+ *    把 `user_id` **写回凭据**；
+ * 2. 补齐后全池统一按 `user_id` 分组去重（`dedupeByCredentialField`）。
+ *
+ * ⚠️ 全程**尽力而为**：单条补齐失败只跳过该条、记 warn，绝不让启动失败。
+ * ⚠️ 网络请求按 8s 超时，N 条串行最坏 N×8s —— 但它是 `void` 起的，
+ *    不阻塞插件启动，也不阻塞用户第一条消息。
+ */
+async function autoclawSelfHeal(
+  pool: AccountPool,
+  ctx: Context,
+): Promise<void> {
+  const entries = pool.listAccountsByProvider('autoclaw')
+  if (entries.length < 2) return
+
+  // ── ① 补齐 user_id（只补缺的那条）──
+  for (const entry of entries) {
+    try {
+      const raw = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+      if (raw === undefined || raw.value.length === 0) continue
+      const cred = JSON.parse(raw.value) as {
+        access_token?: unknown
+        device_id?: unknown
+        user_id?: unknown
+      }
+      // 已有 user_id 就不用补（少一次网络往返）。
+      if (typeof cred.user_id === 'string' && cred.user_id.trim() !== '') continue
+
+      const token = typeof cred.access_token === 'string' ? cred.access_token : ''
+      const device = typeof cred.device_id === 'string' ? cred.device_id : ''
+      if (token === '' || device === '') continue
+
+      const ts = Math.floor(Date.now() / 1000).toString()
+      const sign = createHash('md5').update(`${AUTOCLAW.appId}&${ts}&${AUTOCLAW.appKey}`).digest('hex')
+      const resp = await fetch(`${AUTOCLAW.apiBase}/userapi/v1/user-profile`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Auth-Appid': AUTOCLAW.appId,
+          'X-Auth-TimeStamp': ts,
+          'X-Auth-Sign': sign,
+          'X-Lang': 'zh-CN',
+          'X-Channel': 'official',
+          'Authorization': `Bearer ${token}`,
+          'X-Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ source_id: 'autoclaw', device_id: device }),
+        signal: AbortSignal.timeout(8000),
+      })
+      if (!resp.ok) {
+        ctx.logger?.warn?.(
+          `[autoclaw] 账号 ${entry.id} 补齐 user_id 失败（HTTP ${resp.status}），跳过该条`,
+        )
+        continue
+      }
+      const json = (await resp.json()) as { code?: number; data?: { user_id?: unknown } }
+      const userId = json.data?.user_id
+      if (json.code !== 0 || typeof userId !== 'string' || userId.trim() === '') {
+        ctx.logger?.warn?.(
+          `[autoclaw] 账号 ${entry.id} 补齐 user_id 失败（code=${json.code}），跳过该条`,
+        )
+        continue
+      }
+      // ⚠️ 只改 `user_id` 一个键，其余凭据字段原样保留
+      //    （access_token/refresh_token/device_id 一个字节都不能动）。
+      await ctx.credentials.set(
+        credentialRef(entry.credentialRef),
+        JSON.stringify({ ...cred, user_id: userId.trim() }),
+      )
+      ctx.logger?.info?.(
+        `[autoclaw] 账号 ${entry.id} 已补齐 user_id（${userId.trim().slice(0, 8)}…）`,
+      )
+    } catch (error) {
+      ctx.logger?.warn?.(
+        `[autoclaw] 账号 ${entry.id} 自愈异常（不影响启动）：`
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
+  // ── ② 按补齐后的 user_id 去重 ──
+  // ⚠️ **不再给兜底解析器**：此时所有 ref 都应当有 UUID，
+  //    若有（网络全失败），跳过总比误删好。
+  const removed = await pool.dedupeByCredentialField('autoclaw', 'user_id')
+  if (removed > 0) {
+    ctx.logger?.warn?.(
+      `[autoclaw] 已清理 ${removed} 条重复账号（同一账号被重复添加导致积分累加翻倍）`,
+    )
   }
 }
 
@@ -731,6 +846,40 @@ export function apply(ctx: Context): void {
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
+
+  /**
+   * **AutoClaw 存量账号去重自愈**（2026-10-19 用户三次报障后定稿）。
+   *
+   * 用户形态：面板里同一个手机号出现 **3 次**，积分被重复累加
+   *（20842 + 20842 + 20842 = 62526，真实余额只有 20842）。
+   *
+   * ## 为什么不能只按凭据字段 `user_id` 去重（两轮失败的原因）
+   *
+   * 实测三条凭据的字段形态**不一致**：
+   *
+   * | ref | 凭据 `user_id` | JWT `user_id` | JWT `guid` |
+   * |---|---|---|---|
+   * | `A6539467` | —（无） | `839684` | `""`（空） |
+   * | `D6BF9EB2` | —（无） | `839684` | `""`（空） |
+   * | `A3C56DD6` | `7c54a9a…`（UUID） | `839684` | `""`（空） |
+   *
+   * ⇒ 有两个**互不相通**的 id 空间：UUID（账号主键，服务端 `user-profile`
+   *    也用它）与 `numericUserId`（JWT 的 `user_id`，纯数字）。
+   *    「字段优先、JWT 兜底」会让前两条落到 `839684`、第三条落到 UUID
+   *    ⇒ **分裂成两组，一条都去不掉**（用户二次报障「怎么还是在啊」）。
+   *
+   * ## 定稿做法：先用服务端把 UUID **补齐**，再按 UUID 去重
+   *
+   * 1. 逐条 ref 调 `user-profile`（实测三条都能拿回同一个 UUID）把
+   *    `user_id` 字段**写回凭据** —— 这一步同时修好了「老凭据缺字段」；
+   * 2. 补齐后全池统一按 `user_id`（UUID）分组去重。
+   *
+   * ⚠️ **异步、不阻塞启动**：`void` 而非 `await`。补齐要走 N 次网络，
+   *    等它会让插件启动慢一拍；失败也只记 warn（自愈是尽力而为）。
+   * ⚠️ **只对 autoclaw 启用**：其他渠道的 `access_token` 会轮换，
+   *    拿它去重会把**不同账号误合并**。这是按渠道逐个放开的白名单。
+   */
+  void autoclawSelfHeal(pool, ctx)
 
   /**
    * ★★ **共享余额读数缓存**（2026-10-15 规格 §5.7；2026-10-16 起 loomy 也接入）——
@@ -3985,3 +4134,5 @@ async function fetchBalanceReading(
   //    构造时已由 cordis 自动注册为 `ctx.modelscopeAuth`（`super(ctx, `${product.id}Auth`)`），
   //    故这里**不需要**再 provide —— 与 accio 同款（它也没有 provide 行）。
 }
+
+
