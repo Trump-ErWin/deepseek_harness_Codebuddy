@@ -1,6 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { apply } from '../../src/index.js'
+import { CATALOG_REFRESH_INTERVAL_MS } from '../../src/model-catalog.js'
 
 /**
  * ★★ **模型目录刷新器的接线守卫**（走**真实 `apply()`**，不是源码文本断言）。
@@ -97,5 +98,34 @@ describe('★★ 目录刷新器接线：真 apply() 之后确实武装', () => 
       infos.some((s) => s.includes('模型目录刷新器已武装') && s.includes('20 分钟')),
       '★★ 周期文案必须来自 CATALOG_REFRESH_INTERVAL_MS（20 分钟）',
     ).toBe(true)
+  })
+
+  it('★★ apply() 后刷新器**真的**拿得到各家的 refresh（「无一家参与」警告不得出现）', async () => {
+    // ⚠️⚠️ 本条补的是本组与相邻守卫的**最后一个盲区**（2026-10-20 变异实测）：
+    //    上面两条只证明「刷新器被 `start()` 武装」，而 **`refreshOf` 的实际行为**
+    //    （`index.ts` 里那几行）此前**零守卫** —— 实测把它改成恒返回 `undefined`
+    //    （**与 `be42b25` 的缺陷态等价**）后，本文件 2 条 + `model-catalog-parity`
+    //    的 49 条**全绿**。⇒ 必须真跑一轮 `tick()`，看刷新器有没有报「无一家参与」。
+    //
+    // ⚠️ 判据是**行为**，不是源码文本：`createCatalogRefresher` 在「本轮 0 家参与」
+    //    时会打那条 warn，故「**它不出现**」正是「接线通了」的可观测证据。
+    // ⚠️ 必须桩住全局 `fetch`：`tick()` 会真调 12 家的目录拉取。空凭据下多数家会
+    //    早退，但桩住才能**彻底**排除真实网络（本仓库有过「单测真发请求」的事故）。
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 200 })))
+    try {
+      const { ctx, warns } = makeCtxWithLogs()
+      apply(ctx)
+      await settle()
+      // 推进一个周期 ⇒ 触发 tick（`start()` 挂的是 `setInterval(tick, intervalMs)`）。
+      await vi.advanceTimersByTimeAsync(CATALOG_REFRESH_INTERVAL_MS)
+      await settle(8)
+      expect(
+        warns.some((w) => w.includes('无一家参与')),
+        '★★ 零参与 = 接线缺口：适配器没有把 `catalog.refresh` 转发成自己的'
+        + ' `refresh` 成员（`pruned()` 的 Proxy 只透传适配器**自己的**成员）',
+      ).toBe(false)
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })
