@@ -1,4 +1,4 @@
-import { createServer, request } from 'node:http'
+import { createServer, request, Agent } from 'node:http'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createOpenAiGateway } from '../../src/openai-gateway/server.js'
 import { disposeGatewayRuntime } from '../../src/openai-gateway/runtime.js'
@@ -43,11 +43,25 @@ async function freePort(): Promise<number> {
   })
 }
 
+/**
+ * ⚠️ **必须显式传 agent**（Issue IKM3UI）：`node:http` 的 `request()` 在
+ * `NODE_USE_ENV_PROXY=1` 时会按 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 决定是否
+ * 走代理。`NO_PROXY` 通常含 `127.0.0.1`/`::1` 但**不含** `127.0.0.2` ⇒ 阴性对照
+ * `probe('127.0.0.2')` 被送去本机代理、拿到代理的 `HTTP 503` 而非内核的
+ * `ECONNREFUSED`（实测 `proxy-connection` 头即代理签名）⇒ 判据退化成「代理转不到」，
+ * 与「内核是否绑定」不再等价。
+ *
+ * 显式 agent 只作用于这条探针、不改全局环境：**不要**改用「往 `NO_PROXY` 里加地址」
+ * 或「关掉 `NODE_USE_ENV_PROXY`」来绕（前者是开发者机器上的隐性前置条件、后者会把
+ * 同进程里其它本该走代理的请求一起改掉）。
+ */
+const directAgent = new Agent()
+
 /** 从指定 host 连过去，返回 'ok' 或错误码（用来观察**内核**的绑定面）。 */
 function probe(host: string, port: number): Promise<string> {
   return new Promise((resolve) => {
     const req = request(
-      { host, port, path: '/v1/models', method: 'GET', timeout: 2000 },
+      { host, port, path: '/v1/models', method: 'GET', timeout: 2000, agent: directAgent },
       (response) => {
         response.resume()
         resolve(`HTTP ${response.statusCode ?? 0}`)

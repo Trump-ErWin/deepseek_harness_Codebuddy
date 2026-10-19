@@ -1524,8 +1524,32 @@ export class CodeArtsAdapter extends LlmAdapter {
               await this.options.accountPool.updateModelRateLimit(
                 currentAccountId, parsed.modelId, parsed.resetTimeMs,
               )
+              /**
+               * ⚠️⚠️ **必须把首号加进 `rateLimitTried`**（2026-10-18 审计补齐）。
+               *
+               * 这一格原先**既没加首号、也没把 `rateLimitTried` 传给池** —— 两处都漏。
+               * 加首号是**承重**的：它是「本轮已试过」的记账，
+               * 漏了它 ⇒ 首次 429 换号时排除集为空 ⇒ 池按手动顺序**把刚失败的
+               * 首号再返回一次** ⇒ `rateLimitTried.has` 命中 → **换号立即终止**
+               * ⇒ 报「所有账号均受限」而池里其实有可用账号。
+               *
+               * ⚠️ 与同文件 `:1323`（SSE 额度格）、`:1393`（HTTP 额度格）**同型** ——
+               * 那两格一直都有这一行，只有本格漏了。
+               */
+              rateLimitTried.add(currentAccountId)
             }
-            const next = await this.options.accountPool.getAvailableAccount<CodeArtsCredential>('codearts', options.model)
+            // ⚠️ 必须传 `rateLimitTried`（⚠️⚠️ **2026-10-18 修复：这一行原先漏传**）
+            // —— 池按用户手动顺序返回候选，**刚被标记的账号可能仍排第一**
+            // （模型级过滤命中时不会，但 `parsed.resetTimeMs` 若落在
+            // `modelIds` 之外、或标记与本模型键不一致时就挡不住）⇒ 拿回同一个
+            // ⇒ 命中下面的 `rateLimitTried.has` 而立即放弃换号，报
+            // 「所有账号均受限」而池里其实有可用账号。
+            // 与同文件 `:1331`（额度耗尽换号）、`:1395` 两处**同型同修**。
+            // 该缺陷与 2026-09-17 的 `81706da`（`excludeAccountIds` 的引入
+            // 动机）逐字同构，只是那一次漏在了这一格。
+            const next = await this.options.accountPool.getAvailableAccount<CodeArtsCredential>(
+              'codearts', options.model, rateLimitTried,
+            )
             if (next && !rateLimitTried.has(next.entry.id)) {
               rateLimitTried.add(next.entry.id)
               credential = next.credential

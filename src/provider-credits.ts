@@ -60,7 +60,7 @@ import { RACCOON } from './raccoon-product.js'
 import { TRAE } from './trae-product.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
 import { claimCodeArtsDailyCheckin, fetchCodeArtsAccountInfoDetailed } from './codearts-credits.js'
-import { fetchGeminiCreditBalance } from './gemini-credits.js'
+import { fetchGeminiCreditBalance, type GeminiCreditOptions } from './gemini-credits.js'
 import { claimLobsteraiDailyCheckin, fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
 import { claimLoomyDailyQuota, fetchLoomyCreditBalance } from './loomy-credits.js'
 import {
@@ -139,6 +139,17 @@ export interface ProviderCreditsDeps {
    * `minimaxintl` 生效** —— 判据在 `minimaxHeadersFor` 里按 product id 分流。
    */
   readonly minimaxXff?: () => string | undefined
+  /**
+   * Gemini 的**按账号 fetcher**（Gitee issue IKLTZ2）。
+   *
+   * ⚠️ Gemini 的配额端点（`retrieveQuotaSummary`）在墙外，而积分行是**用户
+   * 点一下就等**的主路径：不接代理时它恒报「配额查询网络失败：fetch failed」，
+   * 且**零线索**指向代理。
+   *
+   * ⚠️ 与其余各家同理，必须**惰性**调用（按 `accountId` 现取），不能在注册时
+   * 固化成一份 fetcher —— 账号可能随时在面板里改代理。
+   */
+  readonly geminiFetchFor?: (accountId: string) => typeof fetch
 }
 
 /**
@@ -568,9 +579,20 @@ export function createProviderCredits(
      * 面板不渲染那一行（**不是错误**）。
      */
     gemini: {
-      fetchBalanceDetailed: async (credential) => {
+      fetchBalanceDetailed: async (credential, call) => {
+        const accountId = call?.accountId
+        // ⚠️ **省略 fetcher 时恒直连**（缺 `geminiFetchFor` 的单测与兜底），
+        // 这里只在解析器在场且拿到了账号 id 时传 —— 保持「三者都没传时逐字
+        // 等价」的既有约定（不少单测只注入 credential）。
+        // ⚠️ 必须**先建对象再展开**：三元里的条件表达式直接展开会得到
+        // `{} | {fetcher}` 联合类型，tsc 判它不可迭代（TS2488）。
+        const creditOptions: GeminiCreditOptions = (
+          deps.geminiFetchFor === undefined || accountId === undefined || accountId === ''
+            ? {}
+            : { fetcher: deps.geminiFetchFor(accountId) }
+        )
         const { balance, error, tier } = await fetchGeminiCreditBalance(
-          credential as GeminiCredential, GEMINI,
+          credential as GeminiCredential, GEMINI, creditOptions,
         )
         const extra: RpcCreditsBalanceExtra | undefined = tier === undefined
           ? undefined

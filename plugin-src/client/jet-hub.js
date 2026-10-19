@@ -13,7 +13,7 @@ import {
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
-import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
+import { OpencodeKeyModal, OpencodeProxyModal, GeminiProxyModal } from './opencode-proxy-modal.js';
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
 //    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
 //    ⚠️ 本 import 此前**不存在** ⇒ `modelscope-key-modal.js` 整份 140 行从未进 bundle，
@@ -863,8 +863,8 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         className: 'dim-jh-btn',
         onClick: () => onToggle(account.id, !account.enabled),
       }, account.enabled ? '停用' : '启用'),
-      // ⚠️ 仅 opencode：出口代理与指纹轮换是该 provider **独有**的账号维度
-      // （其余 provider 没有这两项）。用 props 存在性开关而非
+      // ⚠️ 仅 opencode / gemini：出口代理是该 provider 独有的**账号维度**能力
+      // （其余 provider 没有这一项）。用 props 存在性开关而非
       // `provider === 'opencode'` 硬判断 —— 前者让 AccountCard 无需知道
       // provider 列表，也避免以后新增同类 provider 时漏改。
       // 位置在「停用」之后、「删除」之前：删除按钮带 data-kind='danger'，
@@ -872,12 +872,18 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
       onOpenProxy
         ? React.createElement('button', {
             className: 'dim-jh-btn',
-            // ⚠️ tooltip 必须解释「不设置会怎样」：看到「代理」按钮很容易
-            // 当成锦上添花，实际不设 = 与其它账号共用同一出口（同一份额度）。
+            // ⚠️ tooltip 必须解释「不设置会怎样」。两家语义不同，故按
+            // `account.geminiProxy !== undefined` 分流文案：opencode 是
+            // 「共用出口 = 共用额度」，gemini 是「出不去 = 恒连不上」。
             title: account.opencodeProxy
               ? '出口代理：' + account.opencodeProxy + '（点击修改）'
-              : '设置该账号的出口代理；不设置则与其它未设代理的账号共享本机出口 IP',
-            onClick: () => onOpenProxy(account.id, account.opencodeProxy || ''),
+              : account.geminiProxy !== undefined
+                ? '出口代理：' + (account.geminiProxy || '直连') + '（点击修改）'
+                : '设置该账号的出口代理；'
+                  + (account.geminiProxy !== undefined
+                    ? '不设置则直连本机（出不去墙外服务）'
+                    : '不设置则与其它未设代理的账号共享本机出口 IP'),
+            onClick: () => onOpenProxy(account.id, account.opencodeProxy || account.geminiProxy || ''),
           }, '代理')
         : null,
       onRotateFingerprint
@@ -4633,8 +4639,18 @@ function ProviderPanel({ provider, rpcCall }) {
                 // AccountCard 靠「props 存在性」决定是否渲染按钮。
                 ...(provider === 'opencode'
                   ? {
-                      onOpenProxy: (id, current) => setProxyModal({ accountId: id, current }),
+                      onOpenProxy: (id, current) => setProxyModal({ provider, accountId: id, current }),
                       onRotateFingerprint: (id) => void rotateFingerprint(id),
+                    }
+                  : {}),
+                // ⚠️ **Gemini 也要「代理」按钮**（Gitee issue IKLTZ2）：它的全部端点
+                // 都在墙外，而插件进程**不读系统代理** ⇒ 没出口就恒连不上。
+                // ⚠️ 与 opencode **刻意分成两个回调**而不是共用：两者读不同的池字段
+                //（`geminiProxy` / `opencodeProxy`）、调不同的端点前缀、共用会让
+                // 「清掉 Gemini 的代理」连带清掉 opencode 的出口配置。
+                ...(provider === 'gemini'
+                  ? {
+                      onOpenProxy: (id, current) => setProxyModal({ provider, accountId: id, current }),
                     }
                   : {}),
                 // ⚠️ **本 fork 独有**（modelscope，2026-10-17）：编辑访问令牌。
@@ -4693,7 +4709,7 @@ function ProviderPanel({ provider, rpcCall }) {
     // 整个设置页崩成白屏。仓库其它弹窗（ModelListPanel / BackupPanel /
     // ClineQuotaPanel）都是 `createElement` 形式，正是这个原因。
     proxyModal
-      ? React.createElement(OpencodeProxyModal, {
+      ? React.createElement(proxyModal.provider === 'gemini' ? GeminiProxyModal : OpencodeProxyModal, {
           // ⚠️ 传最小 ctx 门面而不是整个面板：弹窗只需要 rpc，
           // 这样它在单测/复用时不必拖上整个 ProviderPanel 的依赖。
           ctx: { rpc: (payload) => rpcCall(payload.method, payload.payload) },

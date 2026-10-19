@@ -433,10 +433,11 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     // `rateLimit: false`，与 accio 同形）。登记为空是**被验证的声明**，不是
     // 「忘了接」—— 下面那条用例会真去 grep 源码确认确实没有写点。
     ['autoclaw-adapter.ts', []],
-    // accio（Accio 阿里）**不写** `modelRateLimits`：本任务（Task 6）只实现
-    // 目录 / 解析 / 流式，请求级换号与冷却不在范围内。留空是**被验证的声明**
-    // （见下面「登记为不写标记的文件确实没有写点」那条用例）。
-    ['accio-adapter.ts', []],
+    // accio（Accio 阿里）**会写** `modelRateLimits`：2026-10-18 的 issue IKM3ZV
+    //    给它接上请求级换号 + 冷却后（额度至 UTC+8 当日 24:00 / 限流 1h）。
+    //    ⚠️ 它**曾**登记为 `[]`（不写标记）—— 下面那条「登记为不写标记的确实没有
+    //    写点」用例就是靠这个变化**红**出来的，与 minimax 2026-10-11 那次同型。
+    ['accio-adapter.ts', ['accio']],
   ]
 
   /**
@@ -617,6 +618,72 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
       expect(calls[0]?.auth).toBe('Bearer tok-probe-minimax')
       expect(calls[0]?.url).toBe(`${MINIMAX.apiHost}/mavis/api/v1/llm/v1/messages`)
       // ② 402 原样透出（探测靠它判「额度类失败」并决定是否保留标记）
+      expect(error).toMatchObject({ code: 'QUOTA_EXCEEDED' })
+    } finally {
+      globalThis.fetch = originalFetch
+      vi.unstubAllGlobals()
+    }
+  })
+
+  /**
+   * ★★ **probeById.accio 的同款守卫**（2026-10-18 审计补齐，Issue IKM3ZV）。
+   *
+   * ## 为什么必须补（同一个坑的第二家）
+   *
+   * minimax 那条上面已写明：`account-probe-adapter.spec.ts` 用的是 `vi.mock` 的
+   * **桩**适配器（`stream()` 直接抛错、**完全不读凭据**）⇒ 「工厂把传入的凭据
+   * 真的接到了请求上」这件事**零覆盖**。
+   *
+   * ⚠️⚠️ **实测（2026-10-18 对抗审计变异验证）：把 accio 那条工厂的
+   * `resolveCredential: async () => credential as AccioCredential` 改成恒返
+   * `undefined`，全套测试**仍然全绿**。** 生产症状：用户在 Jet Hub 点 accio 账号的
+   * 「重测 / 重测所有」⇒ 探测恒抛 `accio: no usable credential; log in first`
+   * ⇒ **本渠道写进去的 24h / 1h 限流标记永远清不掉**（与 minimax 补测前逐字相同）。
+   *
+   * ⚠️ 第二条更危险：给探测适配器**误加** `accountPool` 也是全绿 —— 探测路径上
+   * 失败会**把被测账号封 24h**，而探测没有任何回滚 ⇒ 点一次「重测」就污染账号池。
+   *
+   * ⇒ 本用例锁三格：① 凭据真的进了 **`body.token`**（⚠️ 本家的令牌走 body、
+   *   **不是** `Authorization` 头 —— 这是 accio 最易错的一条，桩适配器读不出）；
+   *   ② `options.accountPool` 为 `undefined`；③ 402 原样透出 `QUOTA_EXCEEDED`。
+   */
+  it('★★ probeById.accio 用真实适配器：凭据进 body.token、且无池时不换号不写标记', async () => {
+    const calls: Array<{ url: string; token: string | undefined; auth: string | null }> = []
+    const originalFetch = globalThis.fetch
+    vi.stubGlobal('fetch', (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const raw = String(init?.body ?? '{}')
+      let token: string | undefined
+      try { token = (JSON.parse(raw) as { token?: string }).token } catch { /* 非 JSON */ }
+      calls.push({
+        url: String(input),
+        token,
+        auth: new Headers(init?.headers).get('Authorization'),
+      })
+      return new Response('{"error":"insufficient balance"}', {
+        status: 402, headers: { 'content-type': 'application/json' },
+      })
+    }) as typeof fetch)
+    try {
+      const credential = { access_token: 'tok-probe-accio', refresh_token: 'r' }
+      const adapter = probeById['accio']!.createProbeAdapter(
+        'ACCIO_ACCOUNT_TEST', credential as never,
+      )
+      const options = (adapter as unknown as {
+        options: { accountPool?: unknown; fetchRemoteModels?: unknown }
+      }).options
+      expect(options.accountPool, '探测不得持有账号池（否则失败会写回限流标记 → 点一次重测就封账号 24h）')
+        .toBeUndefined()
+      expect(options.fetchRemoteModels, '探测不得为一次存活检查额外拉远端目录').toBeUndefined()
+
+      const error = await adapter.stream({ model: '1Drift-N8kP2Q7wR5mX', messages: [] } as never)
+        .next().then(() => null).catch((e: unknown) => e)
+
+      // ① 凭据真的进了 **body.token**（本家的令牌走 body，放 Authorization 头恒流内 402）
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.token, '凭据必须进 body.token，否则生产上「重测」恒报未登录')
+        .toBe('tok-probe-accio')
+      expect(calls[0]?.auth, '本家不走 Authorization 头（实测恒流内 402）').toBeNull()
+      // ② 402 原样透出（探测靠它判「额度类失败」）
       expect(error).toMatchObject({ code: 'QUOTA_EXCEEDED' })
     } finally {
       globalThis.fetch = originalFetch
