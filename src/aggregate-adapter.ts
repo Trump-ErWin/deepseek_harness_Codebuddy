@@ -821,9 +821,18 @@ export class AggregateAdapter extends LlmAdapter {
     //    与原先的 `this.catalogAt !== 0` 一格等价。
     //
     // ⚠️ 用 `isCatalogFreshFor(AGGREGATE_PROVIDER, …)`（多一个**正交**的「用户主动
-    //    失效」输入）：用户在面板改拒绝表 / 白名单 / 手工顺序后，**这个**聚合目录
-    //    也要立刻重推（规格 §6 的正确性要求，见 `model-catalog.ts` 的
-    //    `invalidateCatalogCache`）。
+    //    失效」输入）。⚠️⚠️ **准确的因果（2026-10-19 复审订正 —— 别在这里写
+    //    「用户在面板改拒绝表 ⇒ 这个聚合目录要立刻重推」**不成立**，那句话是错的：
+    //    本函数下游只有 `buildVirtualModels(catalogs)`（`aggregate-catalog.ts`），
+    //    而它**只读各渠道目录的 `id` / `name` 与归一映射** ⇒ **完全不读拒绝表、
+    //    白名单、顺序表、排序模式** ⇒ 当前实现下改这三张表，推导结果逐字节相同。
+    //    这一腿是**语义对齐 / 兜底**：保持「凡是写入目录或门控相关表的端点都失效」
+    //    这条规则不破例（见 `jet-hub-rpc.ts` import 处的规则注释），万一将来
+    //    `buildVirtualModels` 真的依赖了它们，这里**已经**是对的。
+    //    ⇒ 那三张表**真实**影响的是 `gateOf` / `rejectedFor`、`pickerNameOf` /
+    //      `isAllDefaultsUnopened`（都每次现算、无缓存）与 `routingFingerprint()`；
+    //      「改表 ⇒ 候选序缓存失效」的**真实**机制是 `clearChoiceCache()`
+    //      （正确性另有 `routingFingerprint()` 兜底，见 `candidatesFor`）。
     //    ⚠️ **不得**改成「失效全部渠道」：那会让改一个开关连带作废其余 11 家的
     //    目录缓存（用户改一个开关却付出十几个上游请求）。
     //    ⚠️ 刻意**不**把 `this.catalogAt` 置 0：那个字段另有第三个读者
