@@ -100,6 +100,7 @@ import type { LoomyCredential } from './loomy.js'
 import type { MinimaxCredential } from './minimax.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { TraeCredential } from './trae.js'
+import { participateTraeLottery } from './trae-lottery.js'
 import type { ZcodeCredential } from './zcode.js'
 
 /**
@@ -227,6 +228,41 @@ function fail(error: string): { balance: null; error: string } {
 }
 
 /**
+ * TRAE：在**签到收尾**参与 1024 打卡抽奖，并把结果压成**一句话提示**。
+ *
+ * ## ⚠️⚠️ 三条纪律（每条对应一次真实事故或实测）
+ *
+ * 1. **绝不影响签到成败**：抽奖是不可逆写操作，且会因「今日已参与」「不在活动期」
+ *    「无资格」失败 —— 那些都**不是**签到失败。故本函数**永不抛**，只回提示或 `undefined`。
+ *    （本仓库有两轮「登录成功却因记账失败被报成失败」的事故史。）
+ * 2. **不该抽时零请求、零提示**：判定为 `skipped`（已抽过 / 窗口外 / 无资格）时
+ *    返回 `undefined` ⇒ 调用方不追加任何文案（那是「本来就不该抽」，报出来是噪声）。
+ * 3. **奖品如实转述**：真机抽到的是**券**（`prize_text: "AI Build 专属抵扣券"`
+ *    + `coupon_face_amount_fen: 1000`），**没有** `credits` 字段 ⇒ 只用积分数会让
+ *    「抽到券」退化成「所得未知」，把已知信息白丢。
+ *
+ * ⚠️ 内部三道闸门见 `trae-lottery.ts`（先读状态 → 只对 `participate` 发请求 → **不重试**）。
+ */
+async function runTraeLotteryForUi(credential: TraeCredential): Promise<string | undefined> {
+  try {
+    const result = await participateTraeLottery(credential, TRAE)
+    if (result.kind === 'ok') {
+      if (result.prizeText !== undefined) return `1024 打卡抽奖：${result.prizeText}`
+      if (result.credits !== undefined) return `1024 打卡抽奖：${result.credits} 积分`
+      return '1024 打卡抽奖：已参与（所得以 IDE 面板为准）'
+    }
+    if (result.kind === 'failed') {
+      // ⚠️ 服务端文案如实透传（「今日已参与」之类是唯一线索，不得替换成通用话术）。
+      return `1024 打卡抽奖未成功：${result.message ?? result.reason ?? '未知原因'}`
+    }
+    return undefined
+  } catch {
+    // 抽奖的任何异常都不得上抛（见纪律 1）。
+    return undefined
+  }
+}
+
+/**
  * 构造「id → 积分能力」的表。
  *
  * ⚠️ **只覆盖余额查得到资源包的渠道**。`opencode` 与 `qoder` 系刻意缺席
@@ -325,6 +361,21 @@ export function createProviderCredits(
           call.accountPool.traeCheckinDeviceGenerationFor(entry.id),
           (next) => call.accountPool.updateTraeCheckinDeviceGeneration(entry.id, next),
         ),
+      /**
+       * ★★ **签到收尾顺带参与 1024 打卡抽奖**（2026-10-20 用户指定：
+       *    「点签到按钮时触发」）。
+       *
+       * ## ⚠️⚠️ 为什么**不能**挂在 `claim` 里（第一版就是这么写的，实测失效）
+       *
+       * 本家 `precheckStatus: true` ⇒ `credits.claimAll` 会**先查状态**，
+       * 今天已签到就直接回 `already-claimed`、**根本不调 `claim`**。
+       * 而「已签到」恰恰是最该抽奖的时机（签到后才解锁抽奖）
+       * ⇒ 挂在 claim 内等于**几乎永不触发**。
+       * 用户实测：4 个账号全显示「今天已签到」，一条抽奖信息都没有。
+       *
+       * ⇒ 改挂 `afterClaimNote`：它对 `claimed` **与** `already-claimed` 都会跑。
+       */
+      afterClaimNote: (credential) => runTraeLotteryForUi(credential as TraeCredential),
       precheckStatus: true,
     },
 
