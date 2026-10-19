@@ -357,7 +357,24 @@ export class AutoAdapter extends LlmAdapter {
    * reasoningEffort 都会被 harness 判为不支持 —— 故这里连 reasoning 字段都不带）。
    */
   async resolveModel(): Promise<LlmResolvedModelInfo> {
-    const resolved = await this.ensureChoice()
+    // ⚠️⚠️ **目录加载路径不得 await 全池选型**（2026-10-18 用户报障「模型选择列表
+    // 加载了 1 分多钟」，实测证据）：
+    //
+    // ```
+    // [buildModelCatalog] provider=jet-hub-auto 全部完成：listModels=1ms，总耗时=70770ms，模型数=1
+    // ```
+    //
+    // `listModels` 只花 1ms —— **70 秒全在 `resolveModelInfo`**，因为原实现
+    // `await this.ensureChoice()` → `selectProvider()` → 遍历全池调 `expiryOf`
+    // → **每渠道一次余额查询**。而目录加载时选型缓存**必空** ⇒ 每一轮都全池重算。
+    //
+    // ⇒ 只有**缓存命中**才同步用（常见情况，零成本）；未命中立刻返回既有的
+    // 「保守通用元数据」，选型**不在本方法里触发**。
+    //
+    // ⚠️ **发消息路径不受影响**：`prepareCall` 仍 `await this.ensureChoice(signal)`
+    //    （见该方法），所以**实际路由行为完全不变**，只是选择器首次不显示档位与
+    //    倒计时（那正是原实现用 70 秒换来的两个小号信息）。
+    const resolved = this.cachedChoiceFresh()
     if (resolved?.info !== undefined) {
       // ⚠️ 身份必须改写回 auto（真实缺陷修复）：DSH 的 normalizeModelInfo 拒绝
       // provider/id 与请求路由不符的元数据 —— 直接返回目标的 info 会让目录加载报
@@ -776,6 +793,38 @@ export class AutoAdapter extends LlmAdapter {
   /** auto 从不直接被 stream（总是先经 prepareCall）；兜底抛错而非静默。 */
   async *stream(): AsyncIterable<StreamChunk> {
     throw new LlmError('jet-hub-auto: 请通过模型选择器使用 auto', 'INVALID_REQUEST')
+  }
+
+  /**
+   * 同步读「新鲜的选型缓存」，**绝不触发任何网络**。
+   *
+   * ## 与 `ensureChoice` 的差别是决定性的
+   *
+   * `ensureChoice` 在缓存未命中时会**同步探测全池**（实测 70 秒：每个渠道一次
+   * 余额查询），而本方法在未命中时一律返回 `undefined` —— 让调用方走
+   * 「保守元数据」，把选型留给真正需要它的 `prepareCall`。
+   *
+   * ## ⚠️ 冷却中的缓存项视为过期（复用同款判据）
+   *
+   * 判据与 `ensureChoice` 的缓存分支**逐格同构**：选型缓存 60 秒，而目标级冷却
+   * 10 分钟 —— 不复核则冷却形同虚设（`resolveModel` 会把一个**已确认撞墙**的目标
+   * 当成正常目标播报给宿主）。
+   *
+   * ⚠️ 判据复用 `isTargetCoolingDown`（**唯一权威**在 `zero-output-guard.ts`），
+   *    不在这里另写一份时刻比较（本仓库红线：同一语义不得两套实现）。
+   *
+   * ⚠️ 时刻取 `this.options.now?.()`（与 `ensureChoice` / `dispatch` 同一注入时钟），
+   *    否则单测无法精确控制 TTL 与冷却的边界。
+   */
+  private cachedChoiceFresh(): { choice: AutoChoice; info?: LlmResolvedModelInfo } | undefined {
+    const cached = this.cached
+    if (cached === undefined) return undefined
+    const now = this.options.now?.() ?? Date.now()
+    if (isTargetCoolingDown(
+      this.zeroOutputCooldowns, cached.choice.provider, cached.choice.model, now,
+    )) return undefined
+    if (now - cached.at >= (this.options.ttlMs ?? AUTO_CHOICE_TTL_MS)) return undefined
+    return { choice: cached.choice, info: this.cachedInfo }
   }
 
   /**
