@@ -74,6 +74,7 @@ import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js'
 import type { ModelscopeCredential } from './modelscope.js'
 import { MODELSCOPE } from './modelscope-product.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
+import { fetchAstudioBalanceDetailed, claimDaily } from './astudio-credits.js'
 import { fetchAutoclawBalanceDetailed, claimAutoclawDailyQuota } from './autoclaw-credits.js'
 import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
@@ -90,6 +91,7 @@ import {
 import type { ProviderCredits } from './provider-runtime.js'
 import type { CodeArtsCredential, RpcCreditsBalanceExtra } from './types.js'
 import type { AccioCredential } from './accio.js'
+import type { AstudioCredential } from './astudio.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import type { ClineCredential } from './cline.js'
 import type { GeminiCredential } from './gemini.js'
@@ -451,6 +453,35 @@ export function createProviderCredits(
     accio: {
       fetchBalanceDetailed: async (credential) =>
         await fetchAccioBalanceDetailed(credential as AccioCredential),
+    },
+
+    /**
+     * AStudio（讯飞 AstronStudio）：额度来自账号后端
+     * `GET /xingchen-studio/points/balance`，只认 Cookie 的 ssoSessionId。
+     *
+     * ⚠️ 同样**必须用 `fetchBalanceDetailed`**（不是 `fetchBalance`）：三类失败的
+     * 用户动作完全不同 —— 会话失效（HTTP 恒 **200** + `code=80000`，唯一出路是去
+     * 客户端**人工重登**，实测无程序化续期接口）/ 服务不可用（可重试，**不得**报成
+     * 需重登，那会让用户白重登一次）/ 响应里没有 `totalBalance`（上游形状变了）。
+     * 查不到时由 `astudio-credits.ts` 返回 `null` + 原因，**绝不写成 0**。
+     *
+     * ⚠️ **签到已接入**（2026-10-16 推翻早期「AStudio 无签到端点」的推论）：
+     * `client-popups/pending` 取待领弹窗（`DAILY_REWARD_DIALOG` / `NEW_USER_DIALOG`）
+     * → `client-popups/complete` 领取，实现在 `astudio-credits.ts` 的 `claimDaily`，
+     * 事实登记见 `docs/agent-notes/providers-astudio.md` §3。
+     * 能力矩阵因此是 `dailyCheckin: true`（`provider-registry.ts:460`），
+     * 客户端**会**渲染「一键领取积分」。
+     *
+     * ⚠️ 本条曾写作「**刻意不提供 `claim`**……能力矩阵里 `dailyCheckin: false`
+     * ⇒ 客户端根本不渲染」——那是被本 PR 自己的文档 §3 推翻的**旧结论残留**，
+     * 与紧邻的实现（下面的 `claim`）**逐字相反**。2026-10-18 审计订正。
+     */
+    astudio: {
+      fetchBalanceDetailed: async (credential) =>
+        await fetchAstudioBalanceDetailed(credential as AstudioCredential),
+      claim: async (credential) =>
+        await claimDaily(credential as AstudioCredential),
+      precheckStatus: false,
     },
 
     /**
