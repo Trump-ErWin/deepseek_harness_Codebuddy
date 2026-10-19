@@ -259,6 +259,39 @@ export interface CreditBalance {
    * UI 可以据此提示「另有 N 已失效」，既不误导也不丢信息。
    */
   expiredTotal: number
+  /**
+   * `total` 中**即将到期**的额度（可选；`undefined` = 上游未下发该口径）。
+   *
+   * ## 为什么需要这个字段（而不是复用 `packages[].deductionEndTime`）
+   *
+   * 绝大多数 provider 的到期信息是**逐包**的（CodeBuddy 的 `DeductionEndTime`、
+   * AStudio 的 `*NextExpireTime`、MiniMax 的 `expire_at_ms`），故分档
+   * （永久 / 长期 / 临期）只需读 `packages` 即可。
+   *
+   * **CodeArts 是唯一的例外**：`statistics/plugin` 只下发一个聚合标量
+   * `package_credit_expiring_amount`（实测 2026-10-20，两个真实账号），
+   * 告诉你「有 N 分即将到期」，但**不说**是哪几笔、**不说**哪天到期。
+   * 逐包/逐笔明细端点在上游不存在（探了 85+ 个候选全 404，且解包
+   * `D:\CodeArts\resources\app.asar` 后全量枚举只有 27 条 `/v1/*` 路径，
+   * 其中唯一的积分端点是 `/v1/ops/credit/usage`，返回的是**单次对话消耗**
+   * `{credits, cacheHitRatio}`，不是余额明细）。
+   *
+   * ⇒ 这一家做不出三档分档，只能如实显示「其中 N 即将到期」。
+   * **不要**为了让它看起来和别家一样而臆造 `deductionEndTime`
+   * —— 那会让「永久锁」按一个编造的日期做决策。
+   *
+   * ## ⚠️ 时间窗口未知
+   *
+   * 华为**没有**定义「即将到期」是未来多少天内（字段名里没有、官方计费文档
+   * 也没有）。故 UI 文案必须原样说「即将到期」，**不得**写成「30 天内到期」
+   * 之类 —— 那是编造。
+   *
+   * ## ⚠️ 与 `expiredTotal` 的方向相反
+   *
+   * `expiredTotal` 是「已经失效、不可用」；本字段是「仍然可用、但快失效」。
+   * 两者互斥，不会同时有值。
+   */
+  expiringTotal?: number
 }
 
 /**

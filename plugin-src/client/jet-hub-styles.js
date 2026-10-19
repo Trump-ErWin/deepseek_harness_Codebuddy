@@ -177,6 +177,10 @@ const STYLES = `
 .dim-jh-creditPoolSep { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 /* 已失效额度：弱化的橙色提示，与主数值的蓝色明确区分 */
 .dim-jh-creditExpired { font-size: 11px; color: #b45309; }
+/* 「其中 N 即将到期」（仅 CodeArts）：与「已失效」方向相反 —— 额度仍可用。
+   ⚠️ 用 warn 黄而不是 error 红：这不是异常状态，只是提醒尽快用掉。
+   ⚠️ 与 .dim-jh-creditPoolPart[data-tone="warn"] 同一套颜色变量，深浅主题各自定义。 */
+.dim-jh-creditExpiring { font-size: 11px; color: var(--dsw-alias-state-warn-primary, #b45309); }
 
 /* 限额重置徽章行 */
 .dim-jh-rateLimits { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
