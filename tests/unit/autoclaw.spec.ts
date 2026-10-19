@@ -740,14 +740,19 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
           .toBe(crypto.createHash('md5').update('100003&1720000000&38d2391985e2369a5fb8227d8e6cd5e5').digest('hex'))
       })
 
-      it('⚠️ 请求头名与桌面端一致（X-Auth-* 三件套）', () => {
+      it('⚠️ 请求头名与桌面端一致（X-Auth-* 三件套 + X-Version）', () => {
         const h = buildAutoclawHeaders({
           product: AUTOCLAW, accessToken: 'at', modelId: 'm', timestamp: '1720000000',
         })
         expect(Object.keys(h).sort()).toEqual([
           'Content-Type', 'X-Auth-Appid', 'X-Auth-Sign', 'X-Auth-TimeStamp',
-          'X-Authorization', 'X-Product', 'X-Request-Model',
+          'X-Authorization', 'X-Product', 'X-Request-Model', 'X-Version',
         ])
+        // ⚠️ `X-Version` 是 2026-10-20 补的：国际站推理**硬校验**它，
+        //    缺它 → `HTTP 500` 且响应体为空（真机二分实测，见 buildAutoclawHeaders）。
+        //    桌面端本来就发这个头，本清单是「与桌面端一致」的锁，故它必须在列。
+        // ★ 行为级：不只「有这个名字」，值必须非空 —— 空串同样被网关判 500。
+        expect(h['X-Version'] && h['X-Version'].length > 0, 'X-Version 必须带非空版本号').toBe(true)
       })
     })
 

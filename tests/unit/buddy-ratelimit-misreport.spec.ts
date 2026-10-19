@@ -479,6 +479,13 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       // 固定 ref（`AUTOCLAW_ACCESS_TOKEN`），而 Jet Hub 登录只写
       // `AUTOCLAW_ACCOUNT_XXX` ⇒ 池被筛空时会误报「请先登录」。
       'AUTOCLAW',
+      // ⚠️ **AUTOCLAW_INTL 必须在内**（2026-10-20）：它是 AutoClaw 国际版，
+      // 与 `AUTOCLAW` **同一形态**（同一份适配器工厂、固定 ref 兜底
+      // `AUTOCLAWINTL_ACCESS_TOKEN`、池被筛空时会误报「请先登录」）。
+      // ⚠️ 常量名带下划线，与 `src/index.ts` 里的 `product: AUTOCLAW_INTL,`
+      //    **逐字相同**（本用例按该字段匹配工厂配置块，写成 `AUTOCLAWINTL`
+      //    会「找不到块」而不是「少一家」—— 两种红的原因不同，别混淆）。
+      'AUTOCLAW_INTL',
       // ⚠️ **刻意不含 ZCODE** —— 它是唯一「不接判定也算对」的一家，
       // 见下方「zcode 同型缺陷判定」段。
     ]
