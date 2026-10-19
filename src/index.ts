@@ -62,6 +62,12 @@ import type { LobsteraiCredential } from './lobsterai.js'
 // deductionEndTime}`，故把各家的 fetch 指给同一个选择器即可（见各自接线处）。
 import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
 import { fetchTraeCreditBalance } from './trae-credits.js'
+// ⚠️ astudio 的 `fetchAstudioCreditBalance` 是 2026-10-20 为「永久积分锁定」新增的
+//    薄封装（压平 `fetchAstudioBalanceDetailed` 的 `{balance, error?}` 成
+//    `CreditBalance | null`，因为 `BuddyBalanceSelector` 的 `fetchBalance` 契约
+//    只要余额、不要原因）。**不要**在选号路径上直接调 Detailed —— 那会丢掉
+//    「为什么查不到」的分流（会话失效 / 服务不可用 / 形状不认识）。
+import { fetchAstudioCreditBalance } from './astudio-credits.js'
 import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
 import type { ClineCredential } from './cline.js'
@@ -118,6 +124,9 @@ import type { AccioCredential } from './accio.js'
 import { AstudioAuth } from './astudio-auth.js'
 import { registerAstudioLlm } from './astudio-adapter.js'
 import { ASTUDIO } from './astudio-product.js'
+// ⚠️ 类型必须在**类型位置**导入：`verbatimModuleSyntax` 下漏了它会在
+//    `resolveAstudioCredentialByRef` 的返回标注处报 TS2552（2026-10-20 实测）。
+import type { AstudioCredential } from './astudio.js'
 // ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
 // 见 `docs/agent-notes/providers-modelscope.md` 与 `src/modelscope-product.ts` 模块头的逐条出处表。
 import { ModelscopeAuth } from './modelscope-auth.js'
@@ -1112,6 +1121,83 @@ export function apply(ctx: Context): void {
         `${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
         + '积分都已用尽。请在 Jet Hub 的 '
         + `${displayName} 面板解锁永久积分，或等待资源包到期后重新发放额度。`,
+      )
+    }
+
+  /**
+   * AStudio 的「锁定永久积分 + 无可用账号」报错文案。
+   *
+   * ⚠️ **不是漏抽 `buddyLockedError`**，而是本家口径**必须**不同：
+   * buddy 系的「临期」指「服务端资源包 `DeductionEndTime` 距今 < 15 天」，
+   * 而 AStudio 的三个池语义是**会员 / 购买 / 赠送（活动）积分**，
+   * 只有「赠送积分」实测带 `activityNextExpireTime`（会员与购买两池实测
+   * 为 `null`，即长期有效）。用户按 buddy 那句「等待资源包到期后重新发放额度」
+   * 去排查会找不到对应的东西。
+   *
+   * ⚠️ 若将来 `astudio-credits.ts` 的池分类变了（例如会员池也开始下发改期），
+   * 本函数里的池名要跟着改 —— 它是**唯一**被用户看到的池名清单。
+   *
+   * ⚠️⚠️ **本函数必须放在 `loomyLockedError` 之前**：`tests/unit/
+   *    loomy-balance-error-contract.spec.ts` 的 `lockedErrorBody()` 用
+   *    `indexSource.slice(indexOf('const loomyLockedError'), indexOf('const buddy = new BuddyAuth'))`
+   *    截取「Loomy 那份」并把其中出现的**每一个** `new LlmError(...,'CODE')` 的码
+   *    都断言在宿主 `DEFAULT_RETRYABLE_CODES` 内（Loomy 用 `TRANSPORT`，
+   *    而本家必须用 `QUOTA_EXCEEDED` —— 后者不在可重试集合里）。
+   *    把它放在两者之间会让该用例把我家的 `QUOTA_EXCEEDED` 也当 Loomy 的码去核对，
+   *    必然变红（2026-10-20 实测踩到）。
+   *    放在前面则天然落在截取区间之外，且语义分组更清楚（buddy 系三份在一起）。
+   *
+   * ⚠️ 错误码取 `QUOTA_EXCEEDED`（与 buddy 系一致：这确实是额度问题，
+   * 且不会像 `AUTH` 那样在部分客户端把 message 吞掉）。
+   */
+  const astudioLockedError =
+    (displayName: string) =>
+    (reason: BuddyNoAccountReason): Error => {
+      const days = buddyExpiringWindowDays()
+      if (reason.kind === 'unknown') {
+        return new LlmError(
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
+          + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
+          + '的积分 —— 请重试，或在 Jet Hub 的 AStudio 面板检查凭据是否失效'
+          + '（AStudio 的凭据是本机客户端会话的拷贝，客户端退出登录会让它失效）。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'no-candidates') {
+        return new LlmError(
+          `${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+          + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+          + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+          + '或改用其它 provider / 模型，或解锁永久积分后重试。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'credential-only') {
+        // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+        //    撤回地烧掉永久积分，而本情形的根因在凭据、与积分无关。
+        return new LlmError(
+          `${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+          + '有可用积分的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+          + '⚠️ 这与「积分用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地烧掉它们）。'
+          + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据；AStudio 没有 OAuth 授权页，`
+          + '需要在 AStudio 客户端登录后用「导入本机会话」重建凭据。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      /**
+       * ⚠️⚠️ **穷尽性守卫**（与 buddy / Loomy 两份同型）：走到这里**只允许**是
+       * `{ kind: 'exhausted' }`。把 `reason` 赋给单成员类型，将来
+       * `BuddyNoAccountReason` 加了新档位却忘写文案时，`tsc` 当场报 `TS2322`，
+       * 而不是静默落进「积分都已用尽」—— 那句会把用户推向不可撤回的解锁操作。
+       */
+      const exhaustedOnly: { kind: 'exhausted' } = reason
+      void exhaustedOnly
+      return new LlmError(
+        `${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
+        + '积分（AStudio 的**赠送/活动积分**池）都已用尽。'
+        + '会员积分与购买积分通常是长期有效的，锁定状态下动不到它们。'
+        + `请在 Jet Hub 的 ${displayName} 面板解锁永久积分，或等待活动积分到期后重新发放。`,
+        'QUOTA_EXCEEDED',
       )
     }
 
@@ -2332,12 +2418,118 @@ export function apply(ctx: Context): void {
   // 故这里**不需要**再 ctx.provide('astudioAuth' / 'astudioLlm')。
   // 不注册斜杠命令：入口在 Jet Hub 的 AStudio 面板。
   const astudio = new AstudioAuth(ctx)
+  /**
+   * 按凭据 ref 解析 AStudio 凭据（供**选号器查余额**与最终取凭据共用）。
+   *
+   * ⚠️ 形状校验必须与 `astudio-auth.ts` 的 `parseAstudioCredential` 对齐
+   *（判 `typeof access_token === 'string'`）。裸 `JSON.parse` 会让
+   * `{"foo":1}` 这种损坏凭据被当成有效凭据返回，随后适配器的
+   * `credential.access_token.length` 抛 **TypeError**（不可诊断），
+   * 且发生在选号之后 —— 不在余额查询的 try/catch 覆盖范围内。
+   * 这条注释与 LobsterAI / TRAE 那两处同因（写两遍、强度不一致 = 改一处漏一处）。
+   *
+   * 实测凭据字段（两个账号，2026-10-20）：`access_token`(65 字符) /
+   * `account_id` / `uid` / `nickname` / `sso_session_id` / `token` /
+   * `login_method` / `logged_in_at` / `source`。分档判据只用到
+   * `access_token`（作为 `Cookie: ssoSessionId=` 的值去查 `/points/balance`）。
+   */
+  const resolveAstudioCredentialByRef = async (
+    refName: string,
+  ): Promise<AstudioCredential | undefined> => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      const parsed = JSON.parse(resolved.value)
+      return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+        ? (parsed as AstudioCredential)
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * AStudio 的**按「积分何时作废」分档选号器**（为「锁定永久积分」提供依据）。
+   *
+   * ⚠️ 复用 `BuddyBalanceSelector` 而不是新写一个：分档判据
+   * （`splitBuddyCreditsByExpiry`）只读通用的
+   * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
+   * AStudio 的 `buildAstudioBalance` 自 2026-10-20 起把
+   * `{member,buy,activity}NextExpireTime`（不带时区的本地时间串，实测形如
+   * `"2026-11-20T01:50:14"`）归一化到 `deductionEndTime`（毫秒），故结构一致。
+   *
+   * ⚠️ **缓存不能跨站共用**（选择器内含按账号 id 的缓存），故每家一个实例。
+   *
+   * ⚠️ 到期时间缺失的包归入**永久桶**（`splitBuddyCreditsByExpiry` 的保守方向）：
+   * 宁用锁定时少用一个号，也不要把长期积分误当快到期烧掉。
+   */
+  const astudioBalanceSelector = new BuddyBalanceSelector({
+    product: ASTUDIO,
+    resolveCredential: resolveAstudioCredentialByRef,
+    fetchBalance: (credential, product) => fetchAstudioCreditBalance(credential, product),
+  })
+  /**
+   * AStudio 的凭据编排（候选筛选 → 余额分档 → 取凭据 → 回退）。
+   *
+   * ⚠️ 单独取名而不是内联，因为下面 `registerAstudioLlm` 的 `resolveCredential`
+   * 是**零参**签名，必须先拿到这个带参函数再包一层（见那处注释）。
+   */
+  const astudioCredentialPlan = createCredentialResolver<AstudioCredential>(
+    {
+      pool,
+      reportAccount: (id) => {
+        if (id !== undefined) reportLedgerAccount(ASTUDIO.id, id)
+      },
+    },
+    {
+      product: ASTUDIO,
+      // ⚠️ 必须传 ASTUDIO 自己的解析器（buddy 系那份虽然形状恰好兼容 ——
+      //    同样判 `access_token` 是字符串 —— 但两家凭据字段不同：astudio 带
+      //    `sso_session_id` / `login_method` / `source`，且将来任一方加校验就会分叉）。
+      readCredential: resolveAstudioCredentialByRef,
+      balance: {
+        kind: 'buddy',
+        selector: astudioBalanceSelector,
+        // ⚠️ 本家**没有**免费模型概念（`AstudioAdapter` 不实现 `isFreeModel`），
+        //    故不传该字段 —— 缺省 `undefined` 会让 `createCredentialResolver`
+        //    走「免费模型短路」之外的常规分档路径（正确行为）。
+        lockedError: astudioLockedError('AStudio'),
+        // 与 buddy 系一致：分档选中时**不**回报账本（本家旧闭包也没有回报）。
+        reportPickedAccount: false,
+      },
+      fallback: { kind: 'ref', refName: ASTUDIO.defaultCredentialRef },
+      // 退到单凭据 ref 之前先证明失败原因：全被模型限流时报明确的限流错误，
+      // 而不是降级成误导性的 MISSING_CREDENTIAL（见 throwIfAllAccountsRateLimited）。
+      throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+    },
+  )
   const astudioAdapter = registerAstudioLlm(ctx, {
+    // ⚠️ **2026-10-20 新增**：此前本家不传 `resolveCredential`，适配器走
+    //    `auth.currentCredential()` ⇒ **单凭据、无选号**，于是：
+    //    · 「锁定永久积分」开关即使打开也**毫无作用**（没有选号层可拦）；
+    //    · 多账号时永远只用池里「第一个可用」的那个，第二个号的临期额度用不上。
+    //    接上 `createCredentialResolver`（与 buddy/lobsterai/trae 同一套编排）后，
+    //    候选先按 `enabled` + 模型限流筛，再按「15 天内到期优先」分档。
+    //
+    // ⚠️⚠️ **必须包一层转成零参签名**：`createCredentialResolver` 返回的是
+    //    `(modelId?: string) => Promise<TCredential | undefined>`，而
+    //    `AstudioAdapterOptions.resolveCredential` 声明的是
+    //    `() => Promise<AstudioCredential | undefined>`（**零参**）。
+    //    直接把带参函数传过去会 TS2322（参数个数不兼容）。
+    //    ⚠️ 传 `''` 而不是省参数：空串意味着「不按模型筛候选」——
+    //    `candidatesOf` 对空 `modelId` 跳过 `modelRateLimits` 过滤，
+    //    这与本家适配器（`requestLevelRotation` 关闭、不按模型换号）的语义一致；
+    //    若将来接上请求级换号，这里应改为透传真实 modelId。
+    resolveCredential: () => astudioCredentialPlan(''),
     // ⚠️ AstudioAdapterOptions 只有 product / fetchImpl / auth / resolveCredential /
     //    refresh / fetchRemoteModels / onCatalogLoaded / warn 八项 —— **没有**
     //    accountPool 与 readImage（与上面 accio 那两处不同，多传必 TS2353：
     //    本家适配器刻意不做请求级换号，且实测六个模型的 input_modalities 全是
     //    text，图片通路不成立）。
+    //    ⚠️ 同样**没有** `credentialRef`：`registerAstudioLlm` 内部会用
+    //    `auth.currentCredential()` 作为「池里无账号」时的回退，不需要外部传 ref
+    //    （传了必 TS2353，2026-10-20 实测踩到）。
+    //    ⚠️ 但「请求级换号」与「按余额分档选号」是**两件事**：前者是 429 后换号
+    //    （本家确实没有），后者是「该用哪个号」（上面刚接上）。两者互不依赖。
     // ⚠️ **不传 onCatalogLoaded**：registerAstudioLlm 内部已注入唯一的
     //    broadcastCatalogChanged(ctx)，这里再传就是第二份广播。
     // ⚠️ 传 auth 即可拿到三个默认回调（currentCredential / refreshOnce /

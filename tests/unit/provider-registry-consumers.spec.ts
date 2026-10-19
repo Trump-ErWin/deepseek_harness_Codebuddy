@@ -35,11 +35,11 @@ describe('autoCheckinExcluded：宿主消费取决于 registry', () => {
 })
 
 describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry', () => {
-  it('恰好是 registry 里 usesExpiryWindow === true 的 6 家（officeace 2026-10-12、autoclaw 2026-10-17 加入）', () => {
+  it('恰好是 registry 里 usesExpiryWindow === true 的 7 家（officeace 2026-10-12、autoclaw 2026-10-17、astudio 2026-10-20 加入）', () => {
     const withWindow = PROVIDER_REGISTRY
       .filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
-    expect(withWindow).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    expect(withWindow).toEqual(['astudio', 'autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
   it('支持锁定的渠道 ⊆ usesExpiryWindow ∪ {loomy}（loomy 无窗口概念）', () => {
@@ -49,7 +49,7 @@ describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry
     const viaWindow = PROVIDER_REGISTRY
       .filter((d) => d.permanentLock === true && d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
-    expect(viaWindow).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    expect(viaWindow).toEqual(['astudio', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
     expect(locked).toEqual([...viaWindow, 'loomy'].sort())
   })
 })

@@ -68,6 +68,8 @@ import {
   modelscopeExpiry,
   // ⚠️ AutoClaw（智谱，2026-10-17 审计 P0 修复新增）
   autoclawExpiry,
+  // ⚠️ AStudio（讯飞 AstronStudio，2026-10-20 新增）
+  astudioExpiry,
   zcodeExpiry,
 } from './aggregate-expiry.js'
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17）
@@ -76,6 +78,9 @@ import type { ModelscopeCredential } from './modelscope.js'
 // ⚠️ AutoClaw（智谱，2026-10-17 审计 P0 修复新增）
 import { AUTOCLAW } from './autoclaw-product.js'
 import type { AutoclawCredential } from './autoclaw.js'
+// ⚠️ AStudio（讯飞 AstronStudio，2026-10-20 新增）
+import { ASTUDIO } from './astudio-product.js'
+import type { AstudioCredential } from './astudio.js'
 import type { AccioCredential } from './accio.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
@@ -188,6 +193,24 @@ export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>>
       credentialExpiry: (c, context) => autoclawExpiry(
         c as AutoclawCredential,
         AUTOCLAW,
+        context?.cachedBalance === undefined
+          ? undefined
+          : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      ),
+    },
+    // ⚠️ **AStudio**（讯飞 AstronStudio，2026-10-20）：与 **buddy 系同形**
+    //    （三池各带 `*NextExpireTime` ⇒ 逐包真实到期时刻，`astudioExpiry` 走
+    //    `sharedPackageExpiry` 取最早那包）。
+    //    ⚠️ 三处必须同改（本表 + `WIRED_EXPIRY_PROVIDERS` + 折算原语）——
+    //    这是该陷阱的第 **5** 次复发（cline → accio → officeace → autoclaw → astudio），
+    //    漏任何一处的症状都是**静默**的（用户在聚合轮换列表里看不到该渠道，
+    //    零报错零日志）。
+    //    ⚠️ **必须走 `cachedBalance`**：与 buddy / trae / modelscope 同款 ——
+    //    聚合每轮折算会对同一账号反复提问，没有共享读数就白发大量重复请求。
+    astudio: {
+      credentialExpiry: (c, context) => astudioExpiry(
+        c as AstudioCredential,
+        ASTUDIO,
         context?.cachedBalance === undefined
           ? undefined
           : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,

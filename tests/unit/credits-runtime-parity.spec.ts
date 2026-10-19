@@ -415,8 +415,11 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     // 而不是让 windowDays 静默地多出/少掉一家。
     // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`（唯一到期
     //    数据源，真机取证 28/28 带值且守恒），批次包归一化到 `deductionEndTime`。
+    // ⚠️ astudio 2026-10-20 加入：`/points/balance` 的 member / buy / activity
+    //    三池各带 `*NextExpireTime`（不带时区的本地时间串），由
+    //    `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到 `deductionEndTime`。
     const withWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true).map((d) => d.id).sort()
-    expect(withWindow).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    expect(withWindow).toEqual(['astudio', 'autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 })
 

@@ -62,7 +62,10 @@ import { readFileSync } from 'node:fs'
 //    真正的防线是「`AGGREGATE_CHANNELS` 的 channel 成员必须在清单里」那条，
 //    见本文件末尾的 ★★ 显式豁免表守卫。
 const EXPECTED_WIRED = [
-  'accio', 'autoclaw', 'buddy', 'codearts', 'lobsterai', 'loomy', 'modelscope', 'officeace', 'trae', 'workbuddy', 'zcode',
+  // ⚠️ astudio 2026-10-20 加入：`/points/balance` 三池各带 `*NextExpireTime`，
+  //    由 `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到 `deductionEndTime`。
+  //    这是「只加 AGGREGATE_CHANNELS 而漏本清单」的第 5 次复发。
+  'accio', 'astudio', 'autoclaw', 'buddy', 'codearts', 'lobsterai', 'loomy', 'modelscope', 'officeace', 'trae', 'workbuddy', 'zcode',
 ]
 
 class FakeCredentials {
