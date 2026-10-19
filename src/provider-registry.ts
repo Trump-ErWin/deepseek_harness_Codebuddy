@@ -290,6 +290,29 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     displayName: 'MiniMax Code (中国版)',
     logoClass: 'minimax',
     credits: { balance: true, dailyCheckin: true },
+    /**
+     * ⚠️ **2026-10-20 补登记**（用户报障：「MiniMax Code 积分也有到期时间，
+     * 也应当有相同功能」，并附 AStudio 面板截图作参照）。
+     *
+     * 这两项此前**空缺导致两个静默故障**：
+     * - 缺 `usesExpiryWindow` ⇒ `jet-hub-rpc.ts` 的 `usesWindow` 为 false ⇒
+     *   响应里没有 `windowDays` ⇒ 客户端 `splitCreditsByExpiry` 收 `null` ⇒
+     *   面板上「永久 X · 长期 Y · 临期 Z」那整行**不渲染**。
+     * - 缺 `permanentLock` ⇒ 客户端 `supportsPermanentLock()` 为 false ⇒
+     *   「锁定永久积分」按钮**整个不渲染**（不是灰掉，是不存在）。
+     *
+     * ⚠️ 补登记的前提是**上游确实下发到期时间**：`/minimax-cloud/api/v1/credit/details`
+     * 的每条 `details[]` 都带 `expire_at_ms`（毫秒时间戳，无需换算）。
+     * 此前 `fetchMinimaxCreditBalance` 把 `packages` 硬编码成 `[]`，聚合侧据此
+     * 把本家归为「查不到到期时间」—— **那是「我们没解析」，不是「上游不下发」**。
+     * 该函数已于同日补齐解析。
+     *
+     * ⚠️ 三处必须同改（本文件 + `provider-expiry.ts` + `aggregate-expiry.ts` 的
+     * `WIRED_EXPIRY_PROVIDERS`），由 `expiry-runtime-parity.spec.ts` 真跑
+     * `apply()` 锁一致。
+     */
+    usesExpiryWindow: true,
+    permanentLock: true,
     settingsNamespace: 'llm-minimax',
     channel: true,
   },
@@ -318,6 +341,15 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     displayName: 'MiniMax Code (国际版)',
     logoClass: 'minimaxintl',
     credits: { balance: true, dailyCheckin: true },
+    // ⚠️ 与中国版**同因同日**补登记（2026-10-20）：两站共用同一个
+    //    `fetchMinimaxCreditBalanceDetailed`，后端解析补齐后两边都该亮分档与锁定。
+    //    ⚠️ 国际站另有**地理分流**风险：`agent.minimax.io` 会 307 到中国站，
+    //    而中国站不认国际站 token ⇒ 余额查询恒失败。故折算原语 `minimaxExpiry`
+    //    必须透传 `xff`（见 `aggregate-expiry.ts` 该函数的注释与
+    //    `src/index.ts` 的 `minimaxXff: () => pool.minimaxXff()`）——
+    //    漏传的后果正是「面板能刷新、聚合候选却恒折算失败」。
+    usesExpiryWindow: true,
+    permanentLock: true,
     settingsNamespace: 'llm-minimaxintl',
     channel: true,
   },

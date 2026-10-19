@@ -123,6 +123,23 @@ const LOCK_EXECUTION_PATHS: Record<
     spec: 'tests/unit/astudio-lock-wiring.spec.ts',
     drives: 'astudioLockedError',
   },
+  // ⚠️ minimax / minimaxintl（2026-10-20）：与 astudio **同一条**执行路径
+  //    （`createCredentialResolver` 的 `kind: 'buddy'` 分支），但判别符号必须
+  //    取 `minimaxLockedError` —— 两家共用它，写在 `src/index.ts` 里可出现两次，
+  //    但至少证明本家的接线在（`buddyLockedError` 那种共用符号等于没点名）。
+  //    ⚠️ 两家的 `lockedError` 参数不同（`'MiniMax Code (中国版)'` /
+  //    `'MiniMax Code (国际版)'`）—— 但本表只查符号存在，参数差异由
+  //    `tests/unit/minimax-lock-wiring.spec.ts` 的源码级断言锁。
+  minimax: {
+    module: 'src/index.ts',
+    spec: 'tests/unit/minimax-lock-wiring.spec.ts',
+    drives: 'minimaxLockedError',
+  },
+  minimaxintl: {
+    module: 'src/index.ts',
+    spec: 'tests/unit/minimax-lock-wiring.spec.ts',
+    drives: 'minimaxLockedError',
+  },
 }
 
 describe('★ 普查：凡登记 permanentLock 的渠道，都必须有一条执行路径', () => {
