@@ -420,6 +420,16 @@ const QUEUE_RETRY_DELAY_MS = 10_000
 const QUEUE_MAX_ATTEMPTS = 180
 
 /**
+ * APIG「正文哈希对不上」时**直接重发**的次数上限。
+ *
+ * 取 2：该故障是上游网关侧的瞬时状态，实测两次连续失败后第三次即可成功；
+ * 再多只是把真正的持续故障拖长，反而掩盖问题。
+ */
+const SIGNATURE_RETRY_MAX = 2
+/** 重发的退避基数：第 n 次等 n × 该值（500ms、1000ms）。 */
+const SIGNATURE_RETRY_DELAY_MS = 500
+
+/**
  * SSE 流空闲超时。CodeArts 后端 / APIG 网关对 SSE 连接有 ~60 秒无数据即
  * 断开的策略：当模型生成超长推理或大工具调用参数时，两次 chunk 之间可能
  * 静默数十秒，连接被服务端掐断后 Node undici 的 reader.read() 抛
@@ -586,7 +596,13 @@ function isQueueError(status: number, body: string): boolean {
  * 才抛 AUTH，避免把可自愈的瞬时鉴权失败暴露给用户。
  */
 function isAuthError(status: number, body: string): boolean {
-  if (status === 401 || status === 403) return true
+  if (status === 401 || status === 403) {
+    // ⚠️ 先排除「网关瞬时签名故障」（`body hash mismatch`），否则会白跑一次
+    // 凭据续期：它与 AK/SK、security_token 都无关，重发就能过（见
+    // {@link isTransientSignatureFailure} 的实测依据）。
+    if (isTransientSignatureFailure(status, body)) return false
+    return true
+  }
   return body.includes('APIG.0602') || /invalid\s+token|token\s+expired|token\s+is\s+invalid/i.test(body)
 }
 
@@ -829,6 +845,37 @@ function httpErrorCode(status: number, body: string): string {
   }
   if (status >= 500) return 'SERVER'
   return `HTTP_${status}`
+}
+
+/**
+ * 华为 API 网关（APIG）**瞬时**签名故障的判据。
+ *
+ * 报文形态（用户报障 2026-10-03 的会话日志原文）：
+ * `401 APIG.0301 Incorrect IAM authentication information: calc ak sk
+ *  signature fail:body hash mismatch x-sdk-content-sha256 header`
+ *
+ * 为什么必须单独判它：这句说的是「网关收到的正文哈希 ≠ 我方
+ * `x-sdk-content-sha256` 头」，**与 AK/SK、security_token 都无关**。
+ * 本模块的签名实现（`sign.ts`）用**同一份字节**算哈希与发请求
+ * （`signRequestHuawei(…, new TextEncoder().encode(body), …)` 的入参与
+ * 传给 `fetch` 的 `body` 是同一个字符串）⇒ 本方不存在能把两者算岔的路径。
+ * ⚠️ 这一点是**读码推导**，不是逐请求实测：仓库里没有对应的探针脚本。
+ * 2026-10-19 审计已复核该不变量本身成立（空串 / 中文 / emoji /
+ * 20 万字符 / 组合字符 5 组样本的 `sha256(body)` 与头恒等），但当时引用的
+ * 「已用探针逐请求核对过」在本仓库**不存在** —— 按证据强度如实标注。
+ *
+ * 处置：直接重发（见 `SIGNATURE_RETRY_MAX`），**不要**刷新凭据 ——
+ * 凭据与此故障无关，刷新只是白跑一次网络往返；
+ * 也就不能让它落入 {@link isAuthError} 的「静默 refresh + 重发」分支。
+ *
+ * ⚠️ 判据刻意只认 `body hash mismatch`：`APIG.0301` 的另一半
+ * （`verify ak sk signature fail`）**同时覆盖真实的 AK/SK 错误**
+ * （`AGENTS.md` 记录了把 `Agent-Type` 误当签名头传入也会得到它），
+ * 按它放宽会把真凭据问题误判成瞬时故障、让用户永远等不到「请重新登录」。
+ */
+export function isTransientSignatureFailure(status: number, body: string): boolean {
+  if (status !== 401 && status !== 403) return false
+  return typeof body === 'string' && /body hash mismatch/i.test(body)
 }
 
 /** 可中止的休眠；当信号中止时立即 resolve。 */
@@ -1249,6 +1296,9 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 鉴权失败（APIG.0602 / 401 / 403）后已刷新过凭据：避免死循环，
     // 同一次 stream() 调用最多 refresh 一次。
     let authRefreshed = false
+    // 上游网关瞬时签名故障（正文哈希对不上）已重发的次数：
+    // 与 `authRefreshed` 分开计，它**不是**鉴权失败，不该消耗续期名额。
+    let signatureRetries = 0
     // 该账号不带 benefit 包时去掉 `maas_type: benefit` 头重试一次：
     // 只试一次，避免与真实失败互相掩盖。
     let benefitHeaderDropped = false
@@ -1359,6 +1409,28 @@ export class CodeArtsAdapter extends LlmAdapter {
         }
       } else {
         const errorText = await response.text().catch(() => '')
+        // 上游网关瞬时签名故障（`APIG.0301 … body hash mismatch`）：直接重发。
+        //
+        // 为什么值得自动重发：这是用户可见的一次性失败 —— 2026-10-03 用户报障
+        // 「华为的还是用不了」，会话日志里两次 401（13:55、15:23）都带着
+        // `APIG.0301 … body hash mismatch`，而此前同一会话的 135 轮调用全部正常、
+        // 事后同一凭据重放也立刻成功。也就是说这一次失败**本来重发就能过去**，
+        // 原实现却把它当凭据问题（先白刷一次凭据、再报「API 密钥无效」）。
+        if (isTransientSignatureFailure(response.status, errorText) && signatureRetries < SIGNATURE_RETRY_MAX) {
+          // ⚠️ **abort 后必须立刻停手**（2026-10-19 审计 I1）。`delay()` 在信号
+          // 中止时是**静默 resolve**（不是 reject），若不判就直接 `continue`，
+          // 循环会回到顶部**再发一次完整请求** —— 用户已经按了「停止」，网关
+          // 却还在收请求（实测：基线 abort 后恒 2 次，加了这条重发后涨到 3 次）。
+          //
+          // ⚠️ 与下方排队路径 L1571 的 `if (options.signal?.aborted) throw` 是
+          // **同一处置**，不是两份判据：排队与签名重发都要在退避后复检信号。
+          if (options.signal?.aborted) {
+            throw new LlmError('codearts: request aborted while retrying after a transient gateway signature failure', 'ABORTED')
+          }
+          signatureRetries += 1
+          await delay(SIGNATURE_RETRY_DELAY_MS * signatureRetries, options.signal)
+          continue
+        }
         // 鉴权失败（SecurityToken 过期/被吊销/APIG.0602）：刷新一次凭据后
         // 重试整个 chat 请求。入口的 expires_at 预判无法覆盖后端提前吊销
         // 或时钟偏差场景，这里做兜底，避免把可自愈的鉴权失败抛给用户。
