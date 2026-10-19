@@ -23,7 +23,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
-import { createModelCatalog, isCatalogFresh, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFresh, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import {
@@ -507,8 +507,15 @@ export class LoomyAdapter extends LlmAdapter {
     //    那条缓存短路（`aggregate-adapter.ts` 的 `refreshCatalog`）也走它。
     //    ⚠️ **不是「逐字相同」**：那边另有两处本家没有的前提（`force` 与
     //    `options.catalogTtlMs` 覆盖的 60s TTL），本家用的是 20 分钟默认周期。
+    //
+    // ⚠️ **入口这一处用 `isCatalogFreshFor`（带「用户主动失效」）**：用户刚在
+    //    Jet Hub 改了开关 ⇒ 即使还在 20 分钟内也要去拉一次（规格 §6 的正确性要求，
+    //    见 `model-catalog.ts` 的 `invalidateCatalogCache`）。
+    //    ⚠️ 下面 gate 之后那一处**刻意仍用 `isCatalogFresh`**（不带失效）：那处
+    //    问的是「手上这份旧读数还能不能用」，若也判失效，一次失败的拉取就会把
+    //    **完整旧目录**判成不可用 ⇒ 回落兜底表（子集）⇒ 用户看到「模型反而变少」。
     if (this.remoteModels !== undefined
-      && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
       return this.remoteModels
     }
     const fetchRemote = this.options.fetchRemoteModels

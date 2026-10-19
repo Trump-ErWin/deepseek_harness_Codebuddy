@@ -54,7 +54,7 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, isCatalogFresh, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 // ⚠️ 对外 id 的归一规则**必须与聚合共用**（见 `accioModelIdOf` 的注释）。
 import { normalizeNameKey } from './canonical-models.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
@@ -1204,8 +1204,11 @@ export class AccioAdapter extends LlmAdapter {
     //    可拉」（无凭据/无接线），与新鲜度是两件事。
     if (fetchRemote === undefined) return
     // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）。
+    // ⚠️ **入口用 `isCatalogFreshFor`**：用户在 Jet Hub 改开关后要**立即**重拉
+    //    （规格 §6 的正确性要求，见 `invalidateCatalogCache`）。gate 之后**不再**
+    //    判失效 —— 那里问的是「手上这份旧读数还能不能用」。
     if (this.remoteModels !== undefined
-      && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
       return
     }
     await this.catalogGate.run(async () => {

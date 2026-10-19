@@ -21,7 +21,7 @@ import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js'
 import { basicAuthorization, fetchModelTokenRates, isExpiring, readOfficeAceCredential, refreshStoredCredential, type OfficeAceCredential } from './officeace-auth.js'
 import { collectImages, consumeOpenAiSse, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
-import { isCatalogFresh } from './model-catalog.js'
+import { isCatalogFreshFor } from './model-catalog.js'
 import { buildDsmlSystemPrompt, needsDsmlToolMode, type DsmlToolSpec } from './dsml.js'
 import {
   isBasicCredentialRejection,
@@ -241,12 +241,17 @@ export class OfficeAceAdapter extends LlmAdapter {
     //
     // ⚠️ **判据只有一份**：`isCatalogFresh`（`model-catalog.ts`，周期 20 分钟）。
     //    本家不得自己写第二份「多久算新鲜」。
+    // ⚠️ 这里用 `isCatalogFreshFor`（多一个**正交**的「用户主动失效」输入）：
+    //    用户在 Jet Hub 改开关后要**立即**重拉目录（规格 §6 的正确性要求，
+    //    见 `invalidateCatalogCache`）。本家**不需要**「拉失败时别用失效判据」
+    //    那一条：它下面失败分支走的是 `this.catalogAt === 0` 而不是新鲜度判据
+    //    ⇒ 旧读数照常保留，不会退化。
     // ⚠️ **两个端点共用这一个时刻**：单独缓存其一时，另一处仍每轮打上游 ——
     //    而倍率恰恰是用户要求「20 分钟更新一次」的那一半（不更新就拿不到实际倍率）。
     //
     // ⚠️ **凭据仍每轮现取**：本地读凭据不花钱，而「换了账号/换了 `maasBaseUrl`」
     //    只有在每次探测时才知道 —— 缓存住凭据会让新账号的目录迟迟不生效。
-    const catalogFresh = isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())
+    const catalogFresh = isCatalogFreshFor(OFFICEACE.id, this.catalogAt, this.options.now?.() ?? Date.now())
     if (!catalogFresh) {
       let probed = false
       try {

@@ -250,8 +250,28 @@ export function isCatalogFresh(
   at: number | undefined,
   now: number,
   ttlMs: number = CATALOG_REFRESH_INTERVAL_MS,
+  invalidatedAt?: number,
 ): boolean {
   if (at === undefined || at === 0) return false
+  // ⚠️⚠️ **正交输入：被用户主动失效**（Task 9，见 {@link invalidateCatalogCache}）。
+  //
+  // 判据是「这份读数**不晚于**失效时刻」⇒ 它是在用户改设置**之前**读到的 ⇒ 陈旧。
+  //
+  // ⚠️ **默认 `undefined` ⇒ 本函数逐字等价于加入本参数之前的行为** ——
+  //    这是刻意的：本函数是各家共用的**唯一**判据（仓库红线），
+  //    「多久算新鲜」这一半**一个字都没动**（下面的 `age < ttlMs` 原样保留），
+  //    新加的只是「用户刚要求过失效」这个**与 TTL 无关的**正交输入。
+  //    不传它的调用点（含全部既有单测、以及各适配器 gate **之后**的复查）
+  //    行为逐字不变 —— 由 `catalog-invalidation.spec.ts` 的
+  //    「既有语义逐字不变」一组用例钉住。
+  //
+  // ⚠️ 边界用 `<=`：失效与上次读取落在**同一毫秒**时宁可多拉一次上游，
+  //    也不要让「用户点完开关、目录纹丝不动」成为可能（那正是本 Task 要修的
+  //    症状）。代价是「一次成功重拉恰好也落在同一毫秒」时会**再**多拉一次 ——
+  //    生产里 Web 请求的往返必然 ≥ 1ms，故这个代价实际观测不到；
+  //    单测用冻结时钟时它会表现为「多一次」，由 `catalog-invalidation.spec.ts`
+  //    的「失效会自愈」那一条显式钉住（推进 1ms 后即不再重拉）。
+  if (invalidatedAt !== undefined && invalidatedAt > 0 && at <= invalidatedAt) return false
   // ⚠️ 边界用 `<`：与 `TtlCache.peek()` 的 `now - atMs >= ttlMs` 判陈旧**同口径**
   //    （`src/ttl-cache.ts`），两处不一致会让「缓存多久算新鲜」在运行时才确定。
   const age = now - at
@@ -260,6 +280,135 @@ export function isCatalogFresh(
   //    （此处不写 `age >= 0 &&`：那一条会与上面这句注释、与 `isCatalogFresh` 的
   //     时钟回拨用例**互相矛盾** —— `at` 在未来时 age 为负，必须放行。）
   return age < ttlMs
+}
+
+/**
+ * provider → 「用户主动要求目录立即失效」的时刻（毫秒）。
+ *
+ * ## ⚠️⚠️ 为什么是「一张按 provider 分键的表」而不是「把各家的 `catalogAt` 置 0」
+ *
+ * 需求（规格 §6）是「用户在 Jet Hub 改完开关 ⇒ 该渠道的目录**立即**失效，
+ * 不要等满 20 分钟的 TTL」，且**只**作用于被改的那一个 provider。
+ *
+ * 三种落点方案，核实后**只取第三种**：
+ *
+ * | 方案 | 为什么不取 |
+ * |---|---|
+ * | 各适配器**构造时**登记 `provider → 闭包`（brief 的 Step 3） | 「**最后构造者赢**」：`src/index.ts` 的 `probeById` 每次「重测 / 测试」都会 `new` 一个**临时**适配器（`createProbeAdapter`），它构造时会把生产实例的登记**挤掉** ⇒ 此后 `invalidateCatalogCache` 作用在一个用完即弃的实例上，生产实例**完全不受影响**。症状是「点过一次重测之后，改开关就再也不生效了」，且**零日志、无法自愈**（只能重启插件）。`qoder`/`qodercn` 与 `buddy`/`workbuddy` 共用类、`codearts` 走 `LlmAdapter` 基类，登记表还要靠各自的 `options.product.id` 自己报 —— 而 `probeById` 里那些临时实例同样会报同一个 id，冲突不可避免 |
+ * | 直接把各家的 `catalogAt = 0` | 那个字段在**两家**上另兼第三个用途：`aggregate-adapter` 的 `catalogReadyForBulkWrite` 判 `catalogAt === 0` 为「从未成功推导过（冷帧）」，`officeace-adapter` 判它为「冷启动无旧读数可留」⇒ 置 0 会让「改完聚合面板的开关后马上点『关闭聚合供应商』」被误拒、并让 officeace 的目录分组在刷新失败时**整个消失** |
+ * | **本表（provider → 失效时刻）** | ✅ 不碰任何适配器的字段语义；按 provider 分键天然满足「不连带作废其余几家」；未登记的 provider 静默 |
+ *
+ * ## ⚠️ **两个时刻必须来自同一个时钟**
+ *
+ * 判据是「`catalogAt <= invalidatedAt`」，而 `catalogAt` 由**各适配器自己的**
+ * 时钟写入（生产 = `Date.now()`；单测常注入假时钟）。⇒ 失效时刻**必须**取自
+ * 同一个时钟，否则比较毫无意义。
+ * 生产路径（`src/jet-hub-rpc.ts`）两家都用 `Date.now()` ⇒ 默认值即正确；
+ * 单测若要覆盖「失效」这一腿，必须把假时钟的值显式传进来（见
+ * `catalog-invalidation.spec.ts`）。
+ *
+ * ## ⚠️ 失效标记**不需要清理**（自愈）
+ *
+ * 适配器一旦成功读到新目录就会把 `catalogAt` 写成**此刻**（晚于失效时刻）
+ * ⇒ 下一次判据自然回到 TTL 那一半。表里最多留 `providers` 个数字，无泄漏面。
+ * ⚠️ 拉取**失败**时 `catalogAt` 不推进 ⇒ 标记继续生效、下一次再试
+ * —— 这正是我们要的（「用户改了设置」这件事在成功读到新目录之前一直成立）。
+ *
+ * ⚠️ **时钟回拨**会让旧标记重新生效（`at` 变小）⇒ 多拉一次上游。那与
+ * `isCatalogFresh` 对回拨的既有取舍同族：宁可多打一次，也不要让目录冻住。
+ */
+const catalogInvalidations = new Map<string, number>()
+
+/**
+ * 把某 provider 的目录读数置为**陈旧**（下一次读取会重新拉取远端）。
+ *
+ * ## 调用点（`src/jet-hub-rpc.ts` 的**七处**写入端点）
+ *
+ * | # | 端点 | 失效的 provider |
+ * |---|---|---|
+ * | 1 | `model.setDisabled` | `req.provider` |
+ * | 2 | `model.clearDead` | `req.provider` |
+ * | 3 | `model.setAllDisabled` | `req.provider` |
+ * | 4 | `model.setDisabledMany` | `req.provider` |
+ * | 5 | `aggregate.setRejected` | `aggregate` |
+ * | 6 | `aggregate.setAllowed` | `aggregate` |
+ * | 7 | `aggregate.setOrder` | `aggregate` |
+ *
+ * ⚠️ 4 是 brief 那 6 处之外的**同类**写入端点（同一张黑名单，只是按分组批量）：
+ * 不接线的症状与单条开关**逐字相同**，故一并接上。
+ * ⚠️ 5/6/7 **只**失效 `aggregate` 自己的目录缓存；**不得**顺手失效全部渠道
+ * （那会让「改一个开关」连带作废其余几家的目录 ⇒ 下次打开面板打十几个上游）。
+ *
+ * ## ⚠️⚠️ **只置陈旧，不删内容**
+ *
+ * 本函数**不**触碰任何适配器的 `remoteModels`。删掉已缓存的目录会让用户读到
+ * **编译期兜底表**，而它是远端的**子集**（`docs/agent-notes/client-ui.md`：
+ * cline 实测 3/460）⇒ 用户会看到「刚关掉一个开关，模型反而少了几十个」。
+ * 置陈旧则「下一次读取先去拉一遍；拉不到就沿用上次那份完整列表」。
+ *
+ * ⚠️ 「拉不到时沿用旧读数」是各家**既有**实现（A 类四家的第二处复查
+ * `isCatalogFresh(this.catalogAt, …)`、其余家的 `this.remoteModels ?? 兜底表`）
+ * ⇒ 本函数不需要、也**不得**在这里复制一份内容。
+ *
+ * @param provider - 渠道 id（与 `modelAdapters` 的键同源）；**未登记时静默无操作**
+ *   （不抛错：RPC 端点不该因为一个陌生 provider id 让已落盘的开关变成失败）
+ * @param at - 失效时刻。**必须与写 `catalogAt` 的那个时钟同源**；缺省 `Date.now()`
+ *   （生产口径）。单测注入假时钟时必须显式传它 —— 否则两边的数值不可比。
+ */
+export function invalidateCatalogCache(provider: string, at: number = Date.now()): void {
+  // ⚠️ 取 `max` 而不是直接覆盖：同一毫秒内的两次失效不能把标记**往回**拨
+  //    （回拨会让「更早那次失效」之前的读数被误判成新鲜）。
+  const previous = catalogInvalidations.get(provider)
+  catalogInvalidations.set(provider, previous === undefined ? at : Math.max(previous, at))
+}
+
+/**
+ * 该 provider 的「用户主动失效」时刻；从未失效过时为 `0`。
+ *
+ * ⚠️ **只给判据与单测用**，生产消费点一律走 {@link isCatalogFreshFor}
+ * （避免「有的地方比时刻、有的地方比布尔」这种两套判据）。
+ */
+export function catalogInvalidatedAt(provider: string): number {
+  return catalogInvalidations.get(provider) ?? 0
+}
+
+/**
+ * 清空失效表（**只给单测**：进程级全局状态会在用例之间串味）。
+ *
+ * ⚠️ 生产路径**不得**调用 —— 清了之后「用户刚改的开关」就退回等 20 分钟。
+ */
+export function clearCatalogInvalidations(): void {
+  catalogInvalidations.clear()
+}
+
+/**
+ * 「该 provider 这份目录读数还能不能用」—— **入口短路**的判据。
+ *
+ * ## ⚠️ 它**不是**第二份「多久算新鲜」的实现
+ *
+ * 本函数体里**没有任何时间算术**：查一次失效表，然后把两样东西原样交给
+ * {@link isCatalogFresh}。语义（TTL、边界、时钟回拨）仍然只由那一个函数持有 ——
+ * 这是本仓库红线（「同一语义两套判据」）。
+ *
+ * ## ⚠️⚠️ 只能用在**「要不要去拉远端」那一处**，不得用于「拉完之后要不要用旧值」
+ *
+ * 用例：`loomy-adapter.ts` 的 `loadModels` 有**两处**判据 —— 方法入口（要不要拉）
+ * 与 `catalogGate` 之后的复查（拉完了有没有新数据可用）。**只有入口该用它**：
+ *
+ * | 位置 | 该用哪个 | 理由 |
+ * |---|---|---|
+ * | 入口 | 本函数 | 用户改过设置 ⇒ 即使 TTL 内也要去拉一次 |
+ * | gate 后复查 | **`isCatalogFresh`（不带失效）** | 拉取**失败**时 `catalogAt` 仍是旧值；此处若也判「被失效」，就会把手上那份**完整的旧目录**判成不可用 ⇒ 回落兜底表（**子集**）⇒ 用户看到「模型反而变少」，正是规格 §7 要避免的形态 |
+ *
+ * 换言之：失效的语义是「**去拉一次**」，不是「**把已有内容丢掉**」。
+ */
+export function isCatalogFreshFor(
+  provider: string,
+  at: number | undefined,
+  now: number,
+  ttlMs: number = CATALOG_REFRESH_INTERVAL_MS,
+): boolean {
+  return isCatalogFresh(at, now, ttlMs, catalogInvalidatedAt(provider))
 }
 
 export interface ModelCatalog {
