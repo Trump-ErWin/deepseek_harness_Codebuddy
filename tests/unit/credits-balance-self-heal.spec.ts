@@ -655,6 +655,8 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     ASTUDIO: 'astudio',
     // ⚠️ AutoClaw（智谱，2026-10-17）：与本表其余项同因。
     AUTOCLAW: 'autoclaw',
+    // ⚠️ AutoClaw 国际版（2026-10-20）：常量名带下划线，与 id 不同形（同 MINIMAX_INTL）。
+    AUTOCLAW_INTL: 'autoclawintl',
   }
 
   /**
@@ -691,13 +693,15 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     expect(literals.slice().sort()).toEqual(['buddy', 'codearts', 'workbuddy'])
   })
 
-  it('★ Set 里的 `.id` 常量恰好是那十二家（逐家点名，不写魔数阈值）', () => {
+  it('★ Set 里的 `.id` 常量恰好是登记的那些家（逐家点名，不写魔数阈值）', () => {
     // ⚠️ 逐家列举而不是 `expect(constants.length).toBeGreaterThanOrEqual(10)` ——
     // 后者在「删掉 trae、加上一个假的」时**仍然通过**，正是审计实测的漏报形态。
+    // ⚠️ 标题刻意**不写家数**：原写「十二家」时实际已是 13 项（astudio 加入后没人
+    //    回头改数字）—— 快照式数字必然腐坏（本仓库既有教训）。
     const { constants } = selfHealSetParts()
     expect(constants.slice().sort()).toEqual([
-      'ACCIO', 'ASTUDIO', 'AUTOCLAW', 'CLINE', 'GEMINI', 'LOBSTERAI', 'MINIMAX', 'MINIMAX_INTL',
-      'OFFICEACE', 'QODER', 'QODER_CN', 'RACCOON', 'TRAE',
+      'ACCIO', 'ASTUDIO', 'AUTOCLAW', 'AUTOCLAW_INTL', 'CLINE', 'GEMINI', 'LOBSTERAI',
+      'MINIMAX', 'MINIMAX_INTL', 'OFFICEACE', 'QODER', 'QODER_CN', 'RACCOON', 'TRAE',
     ])
   })
 
@@ -705,8 +709,9 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     const { literals, constants } = selfHealSetParts()
     const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
     expect([...inSet].sort()).toEqual([
-      'accio', 'astudio', 'autoclaw', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'minimax',
-      'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy',
+      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'cline', 'codearts', 'gemini',
+      'lobsterai', 'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon',
+      'trae', 'workbuddy',
     ])
     // 反向：两家没有 refresh 端点，必须**静默跳过**而非尝试续期。
     expect(inSet.has('loomy')).toBe(false)

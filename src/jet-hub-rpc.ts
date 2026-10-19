@@ -107,7 +107,7 @@ import type * as OfficeAceAuthModule from './officeace-auth.js'
 type OfficeAceAuth = typeof OfficeAceAuthModule
 import type { AccioAuth } from './accio-auth.js'
 import type { AutoclawAuth } from './autoclaw-auth.js'
-import { AUTOCLAW } from './autoclaw-product.js'
+import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js'
 import { parseAutoclawCredential, isAutoclawRefreshable, autoclawDisplayNickname } from './autoclaw.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import type { ModelscopeAuth } from './modelscope-auth.js'
@@ -1418,6 +1418,20 @@ export interface JetHubAuths {
   readonly astudio: AstudioAuth
   readonly autoclaw: AutoclawAuth
   /**
+   * **AutoClaw 国际版**（`autoclawintl`）。
+   *
+   * ⚠️⚠️ **键与值必须严格对应**：它的值是 `index.ts` 里那个用
+   * `product: AUTOCLAW_INTL` 构造的 `AutoclawAuth` 实例。
+   * ⚠️ 本段注释**不得出现右花括号字符**：`credits-balance-self-heal.spec.ts` 的
+   *    `jetHubAuthsKeys()` 用「找第一个右花括号」的方式截取接口体，注释里出现
+   *    该字符会让它**提前截断** ⇒ 后续所有键被判为「不存在」（实测踩过两次）。
+   * 若写成 `autoclawintl: autoclaw`（指向国内实例），症状是
+   * 「国际站账号的续期去刷了国内站凭据」—— 因为续期用的是**实例上的 product**，
+   * 而按 id 查表（`authOf`）会把国际站账号分派到国内站实例上。
+   * 这与 `minimaxintl` 的同类风险完全一样（见上方注释）。
+   */
+  readonly autoclawintl: AutoclawAuth
+  /**
    * ModelScope（魔搭）—— **本 fork 独有**（上游 rc.11 仍无此 provider）。
    *
    * ⚠️ 值是 `ModelscopeAuth` **Service 实例**（与 accio 同款），不是命名空间。
@@ -2068,11 +2082,13 @@ function registerJetHubEndpoints(
   const {
     codearts, buddy, workbuddy, lobsterai, qoder,
     qodercn: qoderCn,
-trae, cline, loomy, raccoon, minimax,
+    trae, cline, loomy, raccoon, minimax,
     // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
     minimaxintl,
     zcode, gemini, accio, autoclaw,
     astudio,
+    // ⚠️ AutoClaw 国际版（`autoclawintl`）—— 与 `autoclaw` 是**两个实例**。
+    autoclawintl,
   } = auths
   /**
    * 积分能力表。
@@ -2274,6 +2290,12 @@ trae, cline, loomy, raccoon, minimax,
     // 漏登记的后果与 accio 同款：凭据其实只需一次重取，面板却永报「未登录」。
     ASTUDIO.id,
     AUTOCLAW.id,
+    // ⚠️ autoclawintl（AutoClaw 国际版，2026-10-20）：与 `autoclaw` 共用同一个
+    //    auth 类，**有**真实 refresh 端点（`/userapi/v1/refresh`，实测国际站
+    //    续期成功）⇒ 不属 loomy / zcode 那类「设计上没有 refresh 端点」的豁免。
+    //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
+    //    只需一次 refresh，且**日志零字**。
+    AUTOCLAW_INTL.id,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
     //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
     //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
@@ -4517,19 +4539,29 @@ trae, cline, loomy, raccoon, minimax,
             ok: true,
             value: { accountId: id, loginUrl: started.authorizeUrl, incognitoOpened },
           }
-        } else if (provider === AUTOCLAW.id) {
-          const id = `autoclaw-${shortId()}`
-          const refName = `AUTOCLAW_ACCOUNT_${shortId().toUpperCase()}`
+        } else if (provider === AUTOCLAW.id || provider === AUTOCLAW_INTL.id) {
+          // ⚠️⚠️ **按 provider 取对应实例**（2026-10-20）：国际版与国内版是
+          //    两个实例，写死 `autoclaw` 会让国际版的「一键导入」去读
+          //    **国内版的 userData 目录** ⇒ 读不到（国际版在
+          //    `AutoClaw-oversea-official`）⇒ 报「请先登录」。
+          const isIntl = provider === AUTOCLAW_INTL.id
+          const autoclawAuthForProvider = isIntl ? autoclawintl : autoclaw
+          const autoclawProduct = isIntl ? AUTOCLAW_INTL : AUTOCLAW
+          const id = `${provider}-${shortId()}`
+          // ⚠️ refName 前缀必须按产品派生（与 `importLocalAccount` 同口径）：
+          //    国际版写 `AUTOCLAWINTL_ACCOUNT_*`，否则会被
+          //    `REF_PREFIX_TO_PROVIDER` 判成国内账号。
+          const refName = `${autoclawProduct.defaultCredentialRef.replace(/_DEFAULT$/, '_')}${shortId().toUpperCase()}`
           const autoclawMode = (payload as { autoclawMode?: string })?.autoclawMode
 
           // 1. 如果用户显式选择“一键导入本机桌面端凭据”（autoclawMode === 'local'）：
           if (autoclawMode === 'local') {
-            const localCred = await autoclaw.probeLocal()
+            const localCred = await autoclawAuthForProvider.probeLocal()
             if (!localCred) {
               return { ok: false, error: '未检测到本地 AutoClaw 桌面端有效登录凭据，请先在 AutoClaw 中登录' }
             }
             try {
-              await autoclaw.importLocalAccount(pool, { accountId: id, refName })
+              await autoclawAuthForProvider.importLocalAccount(pool, { accountId: id, refName })
               return { ok: true, value: { accountId: id } }
             } catch (err) {
               const reason = err instanceof Error ? err.message : String(err)
@@ -4541,7 +4573,7 @@ trae, cline, loomy, raccoon, minimax,
           // 登记占位条目
           await pool.addAccount({
             id,
-            provider: AUTOCLAW.id,
+            provider: autoclawProduct.id,
             nickname: 'AutoClaw (登录中...)',
             enabled: true,
             credentialRef: refName,
@@ -4551,7 +4583,7 @@ trae, cline, loomy, raccoon, minimax,
 
           let started
           try {
-            started = await autoclaw.startLogin({ refName })
+            started = await autoclawAuthForProvider.startLogin({ refName })
           } catch (error) {
             void pool.removeAccount(id).catch(() => {})
             const reason = error instanceof Error ? error.message : String(error)
@@ -4568,7 +4600,7 @@ trae, cline, loomy, raccoon, minimax,
               refreshable: isAutoclawRefreshable(credential),
             })
           }).catch((error: unknown) => {
-            ctx.logger.warn(`[jet-hub] background ${AUTOCLAW.id} login failed for ${id}: ${String(error)}`)
+            ctx.logger.warn(`[jet-hub] background ${autoclawProduct.id} login failed for ${id}: ${String(error)}`)
             void failLogin(id, error)
           })
 
@@ -7810,3 +7842,5 @@ function reply(rpcId: string, result: unknown): Response {
     : result
   return Response.json({ type: 'server-response', rpcId, result: value })
 }
+
+

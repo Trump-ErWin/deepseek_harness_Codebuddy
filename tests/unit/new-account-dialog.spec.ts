@@ -154,17 +154,21 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
     }
   })
 
-  it('★ 只有 zcode 与 accio 与 astudio 需要先问一句，其余 provider 点按钮即登录', () => {
+  it('★ 只有 zcode / accio / astudio / autoclaw 两家需要先问一句，其余点按钮即登录', () => {
     expect(newAccountAsksChannel('zcode')).toBe(true)
     // ⚠ accio 的预选项是**登录区域**：区域决定登录页域名，而区域由服务端按账号
     //   下发、登录前无从推断 ⇒ 选错就登不进去（国际用户拿中国版登录页）。
     expect(newAccountAsksChannel('accio')).toBe(true)
     expect(newAccountAsksChannel('astudio')).toBe(true)
     expect(newAccountAsksChannel('autoclaw')).toBe(true)
+    // ⚠️ autoclawintl（2026-10-20）：与国内版**同样需要预选**（一键导入 / 短信），
+    //    且它读的是**不同的 userData 目录** ⇒ 漏判会让它静默走短信分支。
+    expect(newAccountAsksChannel('autoclawintl')).toBe(true)
     // ⚠ 这条对**全部** provider 取一遍：A1 的形态是「弹窗对 provider 零分支」，
     //   只抽查两三个 provider 的话，新增一个 provider 漏判就会静默溜过去。
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode' || id === 'accio' || id === 'astudio' || id === 'autoclaw') continue
+      if (id === 'zcode' || id === 'accio' || id === 'astudio'
+        || id === 'autoclaw' || id === 'autoclawintl') continue
       expect(newAccountAsksChannel(id), `${id} 不该弹预选窗`).toBe(false)
     }
   })
@@ -184,7 +188,8 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
 
   it('★ 不需要预选的 provider 载荷里**不许**出现任何专属字段（A2：选择被静默丢弃）', () => {
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode' || id === 'accio' || id === 'astudio' || id === 'autoclaw') continue
+      if (id === 'zcode' || id === 'accio' || id === 'astudio'
+        || id === 'autoclaw' || id === 'autoclawintl') continue
       const payload = buildCreateAccountPayload(id, 'zai', 'global')
       expect(payload).toEqual({ provider: id })
       expect(exclusiveFieldsOf(payload as Record<string, unknown>)).toEqual([])
@@ -194,6 +199,13 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
   it('★ autoclaw 的载荷带上登录模式', () => {
     expect(buildCreateAccountPayload('autoclaw', undefined, undefined, undefined, 'local')).toEqual({ provider: 'autoclaw', autoclawMode: 'local' })
     expect(buildCreateAccountPayload('autoclaw', undefined, undefined, undefined, 'sms')).toEqual({ provider: 'autoclaw', autoclawMode: 'sms' })
+    // ⚠️ 2026-10-20 加 autoclawintl：与 autoclaw **同一归一逻辑**，载荷必须同样带
+    //    `autoclawMode`，否则国际版会丢掉导入模式并静默走短信分支
+    //    （读国内目录 ⇒ 国内凭据进国际槽位，用户重演两次的事故）。
+    expect(buildCreateAccountPayload('autoclawintl', undefined, undefined, undefined, 'local'))
+      .toEqual({ provider: 'autoclawintl', autoclawMode: 'local' })
+    expect(buildCreateAccountPayload('autoclawintl', undefined, undefined, undefined, 'sms'))
+      .toEqual({ provider: 'autoclawintl', autoclawMode: 'sms' })
   })
 
   it('★ astudio 与 autoclaw 的登录方式**互不串台**（2026-10-17 合并引入的真实风险）', () => {

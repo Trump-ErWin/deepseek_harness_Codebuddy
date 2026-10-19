@@ -210,6 +210,15 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   //    + 折算原语（后两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑
   //    `apply()` 锁一致）。
   'autoclaw',
+  // ⚠️ AutoClaw **国际版**（`autoclawintl`，2026-10-20）：与 `autoclaw` 同格
+  //    （同一份 `autoclawExpiry` 折算原语，实测批次带 `deductionEndTime`）。
+  //    ⚠️ 它也是**陷阱复发**的一次：只加 `AGGREGATE_CHANNELS` 而不加本表，
+  //    症状是「模型层归并发生了、看起来接好了，但候选层被这道闸门剔掉」，
+  //    用户在聚合轮换列表里**永远看不到国际版**，且**零报错、零日志**。
+  //    ⚠️ 三处同改：本表 + `provider-expiry.ts` 的 `autoclawintl` 条目
+  //    （⚠️ 那里必须传 `AUTOCLAW_INTL`，否则会用国内基址查国际账号余额）
+  //    + 折算原语（`autoclawExpiry` 本身产品无关，无需改）。
+  'autoclawintl',
 ])
 
 /**
