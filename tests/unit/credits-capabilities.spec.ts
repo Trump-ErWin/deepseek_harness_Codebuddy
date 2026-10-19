@@ -296,7 +296,7 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     expect(supportsRateLimit('不存在的 provider')).toBe(true)
   })
 
-  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好四个）', () => {
+  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好四个；accio 2026-10-18 退出）', () => {
     const disabled = Object.entries(RATE_LIMIT_CAPABILITIES)
       .filter(([, caps]) => caps.rateLimit === false)
       // ⚠️⚠️ **必须减去「产品取舍」那一类**（2026-10-17）：`rateLimit: false` 有
@@ -309,12 +309,18 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
       .map(([id]) => id)
       .sort()
     // 四家 rationale 各不相同（registry 里各有字段注释）：
-    // - accio：**不写 modelRateLimits 且不在 probeById 里** ⇒ 两个按钮恒为惰性
-    //   （点了零请求、零清除，用户会以为按钮坏了）；
     // - gemini / officeace：限流由服务端配额管理，本地标记清掉 / 重测通过
     //   都恢复不了配额；
-    // - loomy：根本不返回限流错误。
-    expect(disabled).toEqual(['accio', 'autoclaw', 'gemini', 'loomy', 'officeace'])
+    // - loomy：根本不返回限流错误；
+    // - autoclaw：本 fork 2026-10-17 只做目录 / 解析 / 流式，未接换号与冷却。
+    //
+    // ⚠️⚠️ **accio 曾在这条断言里，2026-10-18 因 issue IKM3ZV 退出**：
+    //   它当时的归类是「不写 modelRateLimits 且不在 probeById 里 ⇒ 按钮恒为惰性」
+    //   —— 即第 ① 类「管辖不到」。接上请求级换号 + 冷却（真的会写标记）且
+    //   `probeById` 已登记后，那条理由**不再成立**，故它整体移出
+    //   `rateLimit: false`（既不在①、也不在② 的「产品取舍」表里 ——
+    //   它是**真的可用**，不是「不要这个按钮」）。
+    expect(disabled).toEqual(['autoclaw', 'gemini', 'loomy', 'officeace'])
   })
 
   it('★ 「产品取舍」那一类也必须被点名（不得悄悄混进「管辖不到」里）', () => {
