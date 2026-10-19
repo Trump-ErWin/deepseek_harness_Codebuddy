@@ -3160,6 +3160,25 @@ describe('provider.status / provider.setEnabled 端点', () => {
     catalogHealth?: { total: number; complete: boolean; note?: string }
     /** 让诊断钩子抛错（验证「诊断不得反噬主流程」）。 */
     catalogHealthThrows?: boolean
+    /**
+     * 适配器的**目录就绪探测**（`catalogReadyForBulkWrite`，可选）。
+     *
+     * ⚠️ 只有聚合适配器实现它。`ready: false` 模拟「冷帧」——Task 7 之后聚合的
+     * `listModels` 不再同步等上游，冷启动时立刻返回 `['auto']`，于是
+     * `fullCatalogIds` 会看到「远端读成功、但只有 1 条」。
+     * 这是 Critical 缺陷（`setEnabled` 只关 auto 却返回成功 / `provider.status`
+     * 把安全方向翻成危险方向）的**生产形态**。
+     */
+    catalogReadiness?: { ready: boolean; reason?: string } | (() => { ready: boolean; reason?: string })
+    /** 让就绪探测抛错（验证「探测不得反噬，按不可用处理」）。 */
+    catalogReadinessThrows?: boolean
+    /**
+     * 适配器注册到哪个 provider 键下（默认 `buddy`）。
+     *
+     * ⚠️ 现有用例全都在 `buddy` 上做（`authsStub` 也只覆盖常规渠道）。聚合相关的
+     * 用例需要把适配器挂到 `aggregate` 键下才能命中 `aggregate` 的那套判据。
+     */
+    providerId?: string
   } = {}) {
     let stored: Record<string, unknown> = {
       // ⚠️ 账号条目必须补齐 `credentialRef`（非空）与 `createdAt`/`refreshable`：
@@ -3218,6 +3237,17 @@ describe('provider.status / provider.setEnabled 端点', () => {
                   return options.catalogHealth!
                 },
               },
+          // ⚠️ `catalogReadyForBulkWrite` 只在显式要求时挂上：大多数既有用例测的是
+          //    「目录已就绪」的稳态，不该被这个可选探测影响。
+          ...(options.catalogReadiness === undefined && options.catalogReadinessThrows !== true)
+            ? {}
+            : {
+                catalogReadyForBulkWrite: () => {
+                  if (options.catalogReadinessThrows === true) throw new Error('就绪探测内部炸了')
+                  const value = options.catalogReadiness
+                  return typeof value === 'function' ? value() : value!
+                },
+              },
         }
       : undefined
 
@@ -3261,7 +3291,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
       // 再也挤不掉它 —— 这正是本次改签名要消除的缺陷。
       ctx as never, pool,
       authsStub(),
-      (adapter !== undefined ? { buddy: adapter } : undefined) as never,
+      (adapter !== undefined ? { [options.providerId ?? 'buddy']: adapter } : undefined) as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -3818,6 +3848,110 @@ describe('provider.status / provider.setEnabled 端点', () => {
       expect(writeOrder).toEqual([])
       expect(emitted).toEqual([])
       expect(storedAccounts()[0].enabled).toBe(true)
+    })
+  })
+
+  /**
+   * ★★ **C2/C3 的共同根因**：适配器自报「目录尚未就绪」时的两个端点行为。
+   *
+   * ## 同一个根因，两种用户后果（所以两个端点都要有守卫）
+   *
+   * Task 7 之后聚合的 `listModels` **不再同步等上游** ⇒ 冷启动立刻返回 `['auto']`：
+   *
+   * | 端点 | 改前（必然 2000ms 超时） | Task 7 之后 | 用户看到 |
+   * |---|---|---|---|
+   * | `provider.setEnabled(false)` | `remoteError` ⇒ **拒绝** | `ok:true` + `changedCount:1` | 「已关闭 1 个模型」，而另外两个**仍可选** |
+   * | `provider.status` | `remoteError` ⇒ `closed:false`（**安全方向**） | `closed:true`（**危险方向**） | 只关了 `auto`，整个「聚合」被标成**已关闭** |
+   *
+   * ⚠️ 判据必须打在**返回值**上（`ok` 与 `closed`），不是「有没有调探测」——
+   *    本仓库实测过 5 条源码文本判据在 `if (false)` 死分支里恒绿。
+   */
+  describe('★★ cold-frame：适配器自报「目录未就绪」', () => {
+    /** 冷帧的真实形态：远端只读到 1 条（`auto`），适配器自报未就绪。 */
+    const COLD = {
+      providerId: 'aggregate',
+      catalog: [{ id: 'auto', name: 'Auto（聚合 · 跨渠道）' }],
+      catalogReadiness: { ready: false, reason: '聚合目录尚未成功推导过（冷启动）' },
+    } as const
+
+    it('★★ C2：未就绪时 provider.setEnabled(false) 必须**拒绝**且不落盘（不得只关 auto 却成功）', async () => {
+      const { call, emitted, writeOrder, storedDisabled, storedAccounts } = setup({
+        ...COLD,
+        accounts: [{ id: 'a1', provider: 'aggregate', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'aggregate', enabled: false })
+      expect(
+        result.ok,
+        '★★ 冷帧下必须拒绝（否则只关掉 auto 却返回成功，另外两个模型仍可选）',
+      ).toBe(false)
+      // 文案必须说清「目录没读全」这个真因，而不是笼统的失败。
+      expect(result.error?.message ?? '').toMatch(/尚未读取完成|目录/)
+      // ★ 关键后果断言：黑名单里**不得**出现「只关了 auto」这种残缺写入。
+      expect(storedDisabled().aggregate ?? {}, '★★ 不得落盘残缺黑名单').not.toHaveProperty('auto', true)
+      // 不落盘（模型与账号都不动）、不广播。
+      expect(writeOrder).toEqual([])
+      expect(emitted).toEqual([])
+      expect(storedAccounts()[0].enabled).toBe(true)
+    })
+
+    it('★★ C3：未就绪时 provider.status 必须报 closed:false（安全方向，不得翻成 true）', async () => {
+      // 冷帧里唯一的模型 auto 已在黑名单 ⇒ 子集判据说「已关闭」⇒ 触发核实。
+      const { call } = setup({
+        ...COLD,
+        disabledModels: { aggregate: { auto: true } },
+      })
+      const result = await call('provider.status', { providers: ['aggregate'] })
+      expect(result.ok).toBe(true)
+      const s = (result.value as {
+        statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }>
+      }).statuses.aggregate
+      expect(
+        s.closed,
+        '★★ 冷帧下必须报未关闭（危险方向会让界面显示「已关闭」而模型仍可选）',
+      ).toBe(false)
+    })
+
+    it('★ 对照：目录**已就绪**时关闭照常成功（证明上两条不是恒假拒绝）', async () => {
+      // ⚠️ **反向对照**：没有这条，「一律拒绝/一律 closed:false」也能让上面两条全绿。
+      const { call, storedDisabled } = setup({
+        providerId: 'aggregate',
+        catalog: [
+          { id: 'auto', name: 'Auto（聚合 · 跨渠道）' },
+          { id: 'deepseek-v4-1-flash', name: 'DeepSeek V4.1 Flash' },
+        ],
+        catalogReadiness: { ready: true },
+      })
+      const result = await call('provider.setEnabled', { provider: 'aggregate', enabled: false })
+      expect(result.ok, '目录已就绪 ⇒ 必须照常关闭').toBe(true)
+      expect((result.value as { models: number }).models).toBe(2)
+      expect(storedDisabled().aggregate).toEqual({ auto: true, 'deepseek-v4-1-flash': true })
+    })
+
+    it('★ 就绪探测抛错 ⇒ 按「不可用」处理（拒绝关闭、closed:false），不得反噬', async () => {
+      const { call } = setup({
+        providerId: 'aggregate',
+        catalog: [{ id: 'auto', name: 'Auto（聚合 · 跨渠道）' }],
+        catalogReadinessThrows: true,
+        disabledModels: { aggregate: { auto: true } },
+      })
+      const close = await call('provider.setEnabled', { provider: 'aggregate', enabled: false })
+      expect(close.ok, '探测抛错 ⇒ 保守拒绝（宁可拒绝一次关闭，也不要写出残缺黑名单）').toBe(false)
+      const status = await call('provider.status', { providers: ['aggregate'] })
+      expect(status.ok, '探测抛错不得让 provider.status 整个失败').toBe(true)
+      const s = (status.value as { statuses: Record<string, { closed: boolean }> }).statuses.aggregate
+      expect(s.closed, '探测抛错 ⇒ 保守报未关闭（安全方向）').toBe(false)
+    })
+
+    it('★ 未实现探测的适配器不受影响（其余 19 家的稳态行为逐字不变）', async () => {
+      // ⚠️ 这条守的是「新增的可选成员不得改变既有 provider 的行为」。
+      const { call, storedDisabled } = setup({
+        catalog: CATALOG,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(true)
+      expect((result.value as { models: number }).models).toBe(3)
+      expect(storedDisabled().buddy).toEqual({ 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true })
     })
   })
 
