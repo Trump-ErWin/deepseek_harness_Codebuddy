@@ -268,3 +268,92 @@ git worktree remove --force D:\jet\code\js\dh-wt-adv
 | 目录共享骨架（`createModelCatalog` / `prepareCall` / 三态） | ⚠️ 用了骨架但缺 `refresh` 回调与 TTL 判据 | ✅ 补齐 |
 | 聚合临期折算（`WIRED_EXPIRY_PROVIDERS`） | ✅ 有意不接且已登记（有行为守卫） | ✅ 不变 |
 | 凭据续期调度（`refresh-scheduler`） | N/A（本家凭据磁盘无 TTL、无 `expiresAt`） | N/A |
+
+---
+
+# 第三部分：master 侧修正 —— 目录刷新器「空转」（`be42b25` 遗留）
+
+> 提交 `3186eaf`（12 家转发 + 参与度检测）+ `6398087`（补 V6 盲区守卫）
+> 触发问题：PR #118 合并后复查"astudio 的 refresh 转发"时发现 **12 家全都没有**。
+
+## 13. 缺陷本体：三环只做了两环
+
+`createCatalogRefresher` 每 20 分钟遍历 `modelAdapters` 并调 **`adapter.refresh?.()`**（`src/index.ts`）。三环缺一不可：
+
+| 环 | 位置 | `be42b25` 状态 |
+|---|---|---|
+| ① 调用侧 | `index.ts` 的 `refreshOf` | ✅ 加了 |
+| ② 能力侧 | `ModelCatalog.refresh?()` + 8 家的 `config.refresh` 回调 | ✅ 加了（8 个文件各 +11 行，就是 `createModelCatalog(config)` 内部那个回调） |
+| ③ **中间转发** | 适配器实例上的 `refresh()` 成员 | ❌ **从未落地** |
+
+③ 的取证：`git log -S 'async refresh(): Promise<void>' -- 'src/*-adapter.ts'` 的唯一命中是
+`f09a2e7`（本 PR 给 astudio 加的）；`git log -S 'this.refresh ='` 历史上**零命中**。
+
+**漏掉的根源是一句错误论证**（提交信息与 `index.ts` 注释都写了）：
+
+> `modelAdapters` 每项都是 `pruned()` 的 Proxy —— 它对**其余成员原样透传并绑定 this**（`dead-model-store.ts:748-749`）⇒ **新加的 `refresh()` 自动透出，无需改那两张表**
+
+Proxy 透传的是**适配器自己的**成员，而 `refresh()` 加在 **`ModelCatalog`（catalog 实例）**
+上 —— 适配器没有转发，Proxy 就无从透出。所以这不是"忘了写代码"，而是**被论证跳过了**。
+
+**为什么完全静默**（三条叠加，缺一条都不会这么久无人察觉）：
+
+1. `refreshOf(provider): void | Promise<void> | undefined` —— 类型**显式允许** `undefined`，
+   `await undefined` 是合法 no-op，`tsc` 不报；
+2. 刷新器**不检测"本轮零参与"**：返回 `undefined` 即静默跳过、**不记日志**；
+3. 两条守卫都结构性抓不到：`catalog-refresher.spec.ts` 的 8 条**全部直接 `new` 刷新器 +
+   自造 `refreshOf` 桩**（绕过装配）；`catalog-refresher-wiring.spec.ts` 的 2 条虽真跑
+   `apply()`，但**只断言武装日志**，而 `start()` 与日志不依赖 `refreshOf` 是否拿到函数。
+
+⚠️ `model-catalog.ts` 的注释当时**已经写下这个风险**（"未提供 `config.refresh` 时整个成员
+不出现……比一个『调了什么都不做』的假函数更容易发现接线错误"），但**没有实现任何检测**
+——实测恰好相反：假函数至少会真发请求。
+
+## 14. 修正内容
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | **12 家补 `refresh()` 转发**（`await this.catalog.refresh?.()`）：accio / astudio / buddy / lobsterai / loomy / minimax / raccoon / trae / zcode + **codearts**（本轮同时补 `config.refresh`）+ `minimaxintl` / `workbuddy`（与 minimax / buddy **共用适配器类**，自动继承） | 10 个 `*-adapter.ts` |
+| 2 | **`createCatalogRefresher` 参与度检测**：本轮**零参与 ⇒ warn**（接线缺口的唯一强信号）；**部分参与 ⇒ info** 记「参与 M/N 家」 | `model-catalog.ts` |
+| 3 | **`index.ts` 的 `refreshOf` 明确化**：只在**拿到函数**时返回 Promise，否则 `undefined` ⇒ 让「成员不存在」与「成员存在但返回 void」可区分 | `index.ts` |
+| 4 | **守卫 A**：`catalog-refresher.spec.ts` +3 条（零参与 ⇒ warn / 部分参与 ⇒ info / **全部参与不得告警**＝反向） | tests |
+| 5 | **守卫 B**：`model-catalog-parity.spec.ts` +1 条 —— **逐家点名** 12 家必须转发，**双向有牙**（漏转发 ⇒ `missing` 红；连 `config.refresh` 都没给 ⇒ 精确集合红，单靠前者会被 `continue` 静默跳过） | tests |
+| 6 | **守卫 C**：`catalog-refresher-wiring.spec.ts` +1 条 —— 真跑 `apply()` + 推进一个周期触发 `tick()`，断言「无一家参与」那条 warn **不出现**（见 §15 的 V6） | tests |
+
+## 15. 变异验证（7 项）
+
+| 变异 | 目标 | 实测 |
+|---|---|---|
+| V1 | 删 zcode 的 `refresh()` 实例成员 | **1 failed** ✅（`missing` 点名 zcode） |
+| V2 | 删 zcode 的 `config.refresh` 回调 | **1 failed** ✅（精确集合漏 zcode） |
+| V3 | 短路「零参与 warn」 | **1 failed** ✅ |
+| V4 | 短路「部分参与 info」 | **1 failed** ✅ |
+| V5 | 让零参与 warn **无条件**触发（反向） | **2 failed** ✅ |
+| V6 | `index.ts` 的 `refreshOf` **恒返回 `undefined`**（= 缺陷态等价物） | **0 failed / 0 failed** ⚪ **无牙** |
+| V6' | 补了守卫 C 之后重跑 V6 | **1 failed** ✅ |
+
+⚠️ **V6 是本次最有价值的发现**：`refreshOf` 的**实际行为**（缺陷本体所在的那一环）当时
+**零守卫** —— 改成缺陷态等价物后，wiring 2 条 + parity 49 条**全绿**。同一个盲区在
+`be42b25` 里出现过一次（"刷新器自身用例绕过装配"），这是**第二次**。补上守卫 C 后 V6'
+变红，盲区闭合。
+
+## 16. ⚠️ 如实登记：**未覆盖** cline / gemini / qoder
+
+这三家**连 `config.refresh` 都没有**，且目录机制与其余 12 家**不同型**，不能照抄一行转发：
+
+| 家 | 拉取入口 | 为何不能直接接 |
+|---|---|---|
+| `cline` | `private async ensureRemoteModels()` | 入口有 `remoteComplete` **短路**（已完整即 return）⇒ 直接调它不会强制重拉 |
+| `gemini` | `private catalogEntries(): readonly CatalogEntry[]` | **同步视图**（`loadCatalog`/`syncCatalog` 都用它），真正的拉取入口在别处 |
+| `qoder` | 同上 | 同上 |
+
+⚠️ 另记：这三家同时也**没有**目录 TTL 判据（`isCatalogFresh` / `isCatalogFreshFor`
+在本家零命中，与 astudio 修复前同型）⇒ 它们的模型列表更新语义需要**单独评估**
+（不是"补一行"，而是先弄清各自的"强制重拉"入口与缓存策略）。
+
+## 17. 验证
+
+- `pnpm test`：**9669 passed / 6 skipped / 0 failed**（修正前 9664，差额 = 新增 5 条守卫）；
+- `pnpm typecheck` 0 error；
+- 变异：按行号注入 + 重读确认落地，全部 `PATCH-APPLIED`（无 `PATCH-NOT-APPLIED`）；
+  worktree 用完即弃，主工作区零污染。
