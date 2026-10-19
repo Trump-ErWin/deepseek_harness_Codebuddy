@@ -526,6 +526,17 @@ export async function pollAstudioWechatScan(
     ssoBaseUrl?: string;
     fetcher?: typeof fetch;
     timeoutMs?: number;
+    /**
+     * **拿到上游原始响应时回调**（可选，2026-10-20 加）。
+     *
+     * 存在理由：这条路径此前**没有任何留痕** —— 扫码失败时用户只看到一句文案，
+     * 而排障需要知道「上游到底下发了什么形状」（字段名变了 / 只给一半）。
+     * 生产可接到 `ctx.logger`；探针（`tests/e2e/astudio-scan-probe.e2e.spec.ts`）
+     * 用它把**结构**（键名 + 类型，不含账号值）打到终端。
+     *
+     * ⚠️ 回调**不得抛**（调用点不包 try，实现方自己消化异常）。
+     */
+    onRaw?: (raw: unknown) => void;
   } = {},
 ): Promise<AstudioWechatPollResult> {
   const ssoBaseUrl = (options.ssoBaseUrl ?? ASTUDIO_SSO_BASE_URL).replace(/\/+$/, '');
@@ -570,6 +581,8 @@ export async function pollAstudioWechatScan(
   }
 
   const record = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>;
+  // ⚠️ 留痕出口（见 `onRaw` 的说明）：**在解析之前**回调，这样「形状不认识」时也有原始结构。
+  try { options.onRaw?.(body); } catch { /* 留痕失败绝不影响登录 */ }
   const rawCode = record.code;
 
   if (rawCode === -1 || rawCode === '-1') {
@@ -587,10 +600,20 @@ export async function pollAstudioWechatScan(
         if (typeof item === 'object' && item !== null) {
           const it = item as Record<string, unknown>;
           const uid = String(it.uid ?? it.accountId ?? '').trim();
-          const ssoSessionId = String(it.ssoSessionId ?? it.sso_session_id ?? '').trim();
+          // ⚠️⚠️ **与短信/密码登录同款容错**（2026-10-20 用户报障）：那两条入口是
+          //    `ssoSessionId = data.ssoSessionId ?? data.token`，且 `uid` 与 `ssoSessionId`
+          //    **互为备选**（`ssoSessionId || uid`，见 `loginAstudioWithSms` / `loginAstudioWithPassword`）。
+          //    扫码这里原先**更严**：要求二者都在、且**不认 `token`** ⇒ 上游只下发其一时，
+          //    三入口里**只有扫码会失败**，界面报「已扫码，但上游未下发账号标识」。
+          //    ⚠️ 同一仓库三套口径正是本仓库明令的失效形态 ⇒ 对齐到同款。
+          //    ⚠️ 但仍**不得**产出一项三项全空的账号（兜底后 `ssoSessionId` 必非空，
+          //    半截凭据进号池会让后续每个请求都以 80000 失败）。
+          const ssoSessionId = String(it.ssoSessionId ?? it.sso_session_id ?? it.token ?? uid).trim() || uid;
           const username = typeof it.username === 'string' ? it.username : undefined;
-          if (uid && ssoSessionId) {
-            accounts.push({ uid, ssoSessionId, username });
+          // ⚠️ 判据与 `loginAstudioWithSms` 同款：**至少一个**标识即可（`uid || ssoSessionId`），
+          //    且两者互为兜底 —— 上游在部分路径下只给其中一个。
+          if (uid || ssoSessionId) {
+            accounts.push({ uid: uid || ssoSessionId, ssoSessionId: ssoSessionId || uid, username });
           }
         }
       }
@@ -601,7 +624,15 @@ export async function pollAstudioWechatScan(
           if (typeof item === 'object' && item !== null) {
             const it = item as Record<string, unknown>;
             const uid = String(it.uid ?? it.accountId ?? '').trim();
-            const ssoSessionId = String(it.ssoSessionId ?? it.sso_session_id ?? '').trim();
+            // ⚠️⚠️ **与短信/密码登录同款容错**（2026-10-20 用户报障）：那两条入口是
+          //    `ssoSessionId = data.ssoSessionId ?? data.token`，且 `uid` 与 `ssoSessionId`
+          //    **互为备选**（`ssoSessionId || uid`，见 `loginAstudioWithSms` / `loginAstudioWithPassword`）。
+          //    扫码这里原先**更严**：要求二者都在、且**不认 `token`** ⇒ 上游只下发其一时，
+          //    三入口里**只有扫码会失败**，界面报「已扫码，但上游未下发账号标识」。
+          //    ⚠️ 同一仓库三套口径正是本仓库明令的失效形态 ⇒ 对齐到同款。
+          //    ⚠️ 但仍**不得**产出一项三项全空的账号（兜底后 `ssoSessionId` 必非空，
+          //    半截凭据进号池会让后续每个请求都以 80000 失败）。
+          const ssoSessionId = String(it.ssoSessionId ?? it.sso_session_id ?? it.token ?? uid).trim() || uid;
             const username = typeof it.username === 'string' ? it.username : undefined;
             if (uid && ssoSessionId) {
               accounts.push({ uid, ssoSessionId, username });
@@ -611,9 +642,25 @@ export async function pollAstudioWechatScan(
       }
     }
     if (accounts.length === 0) {
+      // ⚠️⚠️ **`code === 0` 时 `desc` 是「状态描述」，不是「错误原因」**（2026-10-20 用户报障）：
+      //    实测该字段在成功信封里的值就是 `"成功"`（见 `astudio-auth.ts` 的 fact 记录
+      //    `{flag:true,code:0,desc:"成功",…}`）⇒ 拿它当失败原因会产出**自相矛盾的文案**：
+      //    载体页把 `message` 显示在**红色**状态条里 ⇒ 用户看到红色「成功」，
+      //    以为登好了、其实没拿到账号标识（图 1 实测症状）。
+      //    ⚠️ 判据必须是**结构化的 `code`**（这里已经在上面的 `rawCode === 0` 分支里），
+      //    不能去匹配 `desc` 的文本 —— 那属于本仓库明令的「一改就失效」判据。
+      // ⚠️⚠️ 文案必须指向**有效**动作（2026-10-20 探针实测 + 用户确认的真实流程）：
+      //    `infoList` 为空 = **该微信号尚未开通 AStudio 账号**。
+      //    探针对照证据：已开通的号 `infoList: array(1)`、未开通的号 `array(0)`，
+      //    而两次的**信封逐字相同**（`flag=true code=0 desc="成功"`）⇒
+      //    `desc` 的「成功」只是**信封状态**（请求成功），与「有没有开通」无关。
+      //    ⚠️ 用户的真机流程：**微信扫码第一次需要绑定手机号才能开通**，而那一步
+      //    只能在 **AStudio 客户端（IDE）**里做 ⇒ 叫用户「重新扫码」是**假出路**
+      //    （同一个号再扫还是空，2026-10-20 用户报障时正是被那句误导）。
       return {
         status: 'unbound',
-        message: typeof record.desc === 'string' ? record.desc : '已扫码但未关联账号',
+        message: '该微信号尚未开通 AStudio 账号（上游未返回账号信息）⇒ '
+          + '请先在 AStudio 客户端里用该微信登录并绑定手机号完成开通，再回来扫码',
       };
     }
     return {
