@@ -465,9 +465,16 @@ export function createProviderCredits(
      * 需重登，那会让用户白重登一次）/ 响应里没有 `totalBalance`（上游形状变了）。
      * 查不到时由 `astudio-credits.ts` 返回 `null` + 原因，**绝不写成 0**。
      *
-     * ⚠️ **刻意不提供 `claim`**：AStudio 没有签到端点，能力矩阵里
-     * `dailyCheckin: false` ⇒ 客户端根本不渲染「一键领取积分」，与 accio / raccoon
-     * 同形；给一句 `claimUnavailableReason` 只会多出一个永远点不动的入口。
+     * ⚠️ **签到已接入**（2026-10-16 推翻早期「AStudio 无签到端点」的推论）：
+     * `client-popups/pending` 取待领弹窗（`DAILY_REWARD_DIALOG` / `NEW_USER_DIALOG`）
+     * → `client-popups/complete` 领取，实现在 `astudio-credits.ts` 的 `claimDaily`，
+     * 事实登记见 `docs/agent-notes/providers-astudio.md` §3。
+     * 能力矩阵因此是 `dailyCheckin: true`（`provider-registry.ts:460`），
+     * 客户端**会**渲染「一键领取积分」。
+     *
+     * ⚠️ 本条曾写作「**刻意不提供 `claim`**……能力矩阵里 `dailyCheckin: false`
+     * ⇒ 客户端根本不渲染」——那是被本 PR 自己的文档 §3 推翻的**旧结论残留**，
+     * 与紧邻的实现（下面的 `claim`）**逐字相反**。2026-10-18 审计订正。
      */
     astudio: {
       fetchBalanceDetailed: async (credential) =>

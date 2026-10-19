@@ -203,6 +203,15 @@ describe('★★ 聚合渠道白名单与 registry 对齐（漏一家即红并�
       },
     } as never
     const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+    // ⚠️⚠️ **必须先热身**（2026-10-18 对抗审计实测的恒真缺陷）：
+    //    Task 7（`a80ab4a`「目录加载不同步等上游」）之后 `listModels` 冷调
+    //    **不再同步扇出**（只返回已知目录、把折算转后台）⇒ 不热身时 `seen` 只有
+    //    极少几家（实测 `["codearts","buddy","workbuddy"]`），下面的
+    //    `seenSet.has(id)` 于是**恒为 false**、与白名单内容无关。
+    //    实测证据：把 `'astudio'` 塞进 `AGGREGATE_CHANNELS` 后，本文件
+    //    **132 passed / 0 failed**（本用例自称的「僵尸豁免探测器」完全无牙）。
+    //    ⚠️ 同文件其余用例都已调 `warmCatalog`，本段是唯一漏掉的一处。
+    await warmCatalog(adapter)
     await adapter.listModels(AGGREGATE_PROVIDER)
     const seenSet = new Set(seen)
     for (const id of AGGREGATE_EXEMPT_PROVIDER_IDS) {

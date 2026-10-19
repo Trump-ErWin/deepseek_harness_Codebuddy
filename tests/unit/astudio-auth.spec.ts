@@ -279,6 +279,34 @@ describe('★ astudio-auth.ts 源码级契约', () => {
     expect(p).toMatch(/override\.trim\(\)\.length > 0\) return override\.trim\(\)/)
   })
 
+  it('★★ 默认会话路径必须按**当前用户推导**，不得是某台开发机的字面量（2026-10-18 审计 P1）', () => {
+    // ⚠️⚠️ 缺陷本体：原 `ASTUDIO.sessionFilePath` 是
+    //    `E:\\Users\\lin1\\AppData\\Local\\Programs\\AStudio Data\\userdata\\astron-session.json`
+    //    ⇒ 除该开发机外**所有**用户点「⚡ 一键导入本机桌面端凭据」都必然失败，
+    //    而那是客户端的**默认档**（`jet-hub.js` 的 `useState('local')`、
+    //    `new-account.js` 的 `astudioLoginMethod ?? 'local'`）；且报错文案叫用户
+    //    「请先启动 AStudio 客户端并登录」——用户照做也永远不会成功（代码查的是
+    //    别人机器上的路径），文案把用户引向一个不存在的动作。
+    //
+    // ⚠️ 判据打在**行为**上：断言推导结果随传入的 `LOCALAPPDATA` 变化。
+    //    只断言「源码里没有 E:\\Users」是**没牙**的（换个盘符/用户名即可绕过）。
+    const a = astudioSessionFilePath({ LOCALAPPDATA: 'D:\\AppData\\Local' })
+    const b = astudioSessionFilePath({ LOCALAPPDATA: 'C:\\Other\\Local' })
+    expect(a.startsWith('D:\\AppData\\Local'), `默认路径必须以 LOCALAPPDATA 为根，实际 ${a}`).toBe(true)
+    expect(b.startsWith('C:\\Other\\Local'), `换一个 LOCALAPPDATA 必须跟着变，实际 ${b}`).toBe(true)
+    expect(a, '两个不同的 LOCALAPPDATA 不得得出同一条路径（那说明没在推导）').not.toBe(b)
+    // 尾部固定：安装目录名与文件名是本家的协议事实，不该随环境变。
+    expect(a.endsWith('Programs\\AStudio Data\\userdata\\astron-session.json')).toBe(true)
+    // 反向：`LOCALAPPDATA` 缺失时仍须给出**可预期**的回落路径（不得抛、不得空串）。
+    const bare = astudioSessionFilePath({})
+    expect(bare.endsWith('astron-session.json'), 'LOCALAPPDATA 缺失时仍须有回落').toBe(true)
+    // ⚠️ env 覆盖的**既有语义不许回退**（单测靠它挡真实凭据）。
+    expect(astudioSessionFilePath({
+      LOCALAPPDATA: 'D:\\AppData\\Local',
+      DSH_ASTUDIO_SESSION_FILE: 'X:\\custom\\session.json',
+    })).toBe('X:\\custom\\session.json')
+  })
+
   it('☁️ 端点与 product 一致（不硬编码 URL 字面量）', () => {
     expect(buildAstudioApiKeyConfigUrl()).toBe(`${ASTUDIO.authBaseUrl}${ASTUDIO.apiKeyConfigPath}`)
     expect(buildAstudioApiKeyConfigUrl()).toContain('agent.xfyun.cn')
@@ -364,10 +392,20 @@ describe('readAstudioDiskCredential / astudioSessionFilePath —— 只读 fixtu
     expect(credential?.source).toBe('session-file')
   })
 
-  it('⚠️ 没有 env 覆盖时回落到 product.sessionFilePath —— 单测**禁止**走这条（会读用户真凭据）', () => {
-    expect(astudioSessionFilePath({})).toBe(ASTUDIO.sessionFilePath)
+  it('⚠️ 静态路径字面量必须已移除，回落改为按传入 env 推导（单测要读盘必须显式设 env）', () => {
+    // ⚠️ 2026-10-18 审计 P1 后**语义变更**：`ASTUDIO` 不再持有静态
+    //    `sessionFilePath`（原值是开发机绝对路径 ⇒ 除该机外**所有**用户的
+    //    「一键导入本机凭据」必然失败，而那是客户端默认档）。回落 = 按
+    //    **传入的 env** 推导当前用户路径。
+    // ⚠️ 本函数只**计算**路径、不读盘，故在此断言它安全；真正读盘的是
+    //    `readAstudioDiskCredential`，其单测**必须**设 `DSH_ASTUDIO_SESSION_FILE`
+    //    指向 fixture（否则会读用户真实凭据 —— 见下一个用例）。
+    expect(ASTUDIO.sessionFilePath, '静态字面量路径必须已被移除').toBeUndefined()
     // 空串 / 纯空白的覆盖视为未设置（不能拿 '' 当路径去读）
-    expect(astudioSessionFilePath({ [ASTUDIO_SESSION_FILE_ENV]: '   ' })).toBe(ASTUDIO.sessionFilePath)
+    expect(astudioSessionFilePath({
+      [ASTUDIO_SESSION_FILE_ENV]: '   ',
+      LOCALAPPDATA: 'D:\\AppData\\Local',
+    })).toBe('D:\\AppData\\Local\\Programs\\AStudio Data\\userdata\\astron-session.json')
   })
 
   it('modelBearerToken 缺失或空串 → undefined（磁盘快路径不可用时交给凭据库）', () => {

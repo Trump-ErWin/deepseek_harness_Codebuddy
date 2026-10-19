@@ -33,6 +33,9 @@
  * **导入本机既有会话**，而不是再造一套 PKCE —— 造了也没有能走完它的授权端点。
  */
 
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
 /**
  * 兜底模型条目（远端目录是动态拉取的，本表只作**离线回退**）。
  *
@@ -86,13 +89,18 @@ export interface AstudioProduct {
   /** 活体凭据端点路径（GET，Cookie 鉴权，无请求体）。 */
   apiKeyConfigPath: string
   /**
-   * 桌面端明文凭据文件的默认路径（实测本机安装位置）。
+   * **显式**的会话文件路径（缺省 `undefined` ⇒ 由 `astudioSessionFilePath()`
+   * 按当前用户的 `%LOCALAPPDATA%` 推导）。
    *
-   * ⚠️ 仅作**默认值**：真实路径可被环境变量 `DSH_ASTUDIO_SESSION_FILE` 覆盖
+   * ⚠️⚠️ **不得在这里写死某台机器的绝对路径**（2026-10-18 审计 P1）：那会让除该机
+   * 外**所有**用户的「一键导入本机凭据」永久失败，且报错文案把用户引向一个不存在
+   * 的动作（详见 `defaultAstudioSessionFilePath` 的说明）。
+   *
+   * ⚠️ 覆盖链优先级：env `DSH_ASTUDIO_SESSION_FILE` > 本字段 > 按传入 env 推导
    * （与 `DSH_JET_HUB_STATE_DIR` / `DSH_OFFICEACE_HOME` 同一先例 —— 单测必须
    * 能把它指到 fixture，否则会**读到用户真实凭据**并发出真实请求）。
    */
-  sessionFilePath: string
+  sessionFilePath?: string
   /** 默认凭据 ref（无账号池时的单凭据回退）。 */
   defaultCredentialRef: string
   /**
@@ -210,6 +218,37 @@ const ASTUDIO_FALLBACK_MODELS: readonly AstudioFallbackModel[] = Object.freeze([
   },
 ])
 
+/**
+ * 桌面端明文凭据文件的**默认路径**（按当前用户推导）。
+ *
+ * ⚠️⚠️ **必须是推导值，不得写字面量绝对路径**（2026-10-18 审计 P1）。
+ *
+ * 原实现硬编码了开发机的
+ * `E:\Users\<某人>\AppData\Local\Programs\AStudio Data\userdata\astron-session.json`，
+ * 后果链是**静默且误导**的：
+ * - 客户端的默认登录档就是「⚡ 一键导入本机桌面端凭据」（`jet-hub.js` 的
+ *   `useState('local')`、`new-account.js` 的 `astudioLoginMethod ?? 'local'`）
+ *   ⇒ 除该开发机外**所有**用户点这个按钮都必然失败；
+ * - 而失败文案写「请先启动 AStudio 客户端并登录」（`astudio-auth.ts`）——
+ *   用户的客户端**本来就登录着**，照做**永远不会成功**，因为代码查的是别人机器上
+ *   的路径 ⇒ 文案把用户引向一个不存在的动作，且不提示唯一的自救手段
+ *   （`DSH_ASTUDIO_SESSION_FILE`）。
+ *
+ * 同型先例（照抄其口径）：`src/chromium-session.ts` 用 `env.LOCALAPPDATA` 拼
+ * Chrome 安装路径；`src/zcode.ts` 同法登记 `%LOCALAPPDATA%\Programs\ZCode\…`。
+ *
+ * ⚠️ 非 Windows 或 `LOCALAPPDATA` 缺失时回落到 `<homedir>/AppData/Local`：
+ * AStudio 是 Windows Electron 桌面端（AUMID `cn.xfyun.acode`），该回落只为了让
+ * 单测 / CI 拿到一个**可预期**的路径，不代表本家支持别的平台。
+ */
+export function defaultAstudioSessionFilePath(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  const localAppData = (env['LOCALAPPDATA'] ?? '').trim()
+  const base = localAppData.length > 0 ? localAppData : join(homedir(), 'AppData', 'Local')
+  return join(base, 'Programs', 'AStudio Data', 'userdata', 'astron-session.json')
+}
+
 export const ASTUDIO: AstudioProduct = {
   id: 'astudio',
   // ⚠️ 与客户端 `PROVIDERS` 里的 label 逐字一致（rail 宽度算式依赖它）。
@@ -220,7 +259,6 @@ export const ASTUDIO: AstudioProduct = {
   catalogPath: ASTUDIO_CATALOG_PATH,
   authBaseUrl: 'https://agent.xfyun.cn/xingchen-studio',
   apiKeyConfigPath: ASTUDIO_API_KEY_CONFIG_PATH,
-  sessionFilePath: 'E:\\Users\\lin1\\AppData\\Local\\Programs\\AStudio Data\\userdata\\astron-session.json',
   defaultCredentialRef: 'ASTUDIO_ACCESS_TOKEN',
   clientType: '21',
   studioVersion: '3.5.2',
