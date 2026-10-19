@@ -131,6 +131,99 @@ describe('fetchCodeArtsAccountInfo（账户类型检测）', () => {
     expect(info?.credit).toBeUndefined()
   })
 
+  /**
+   * ## 「即将到期」额度（`package_credit_expiring_amount`）
+   *
+   * 用户 2026-10-20 报障（附华为云「套餐及积分包」网页截图）：
+   * 「CodeArts 积分也有到期时间，也应当有三档分档与永久锁功能」。
+   *
+   * **实测结论：做不出三档分档**。`statistics/plugin` 只下发一个**聚合标量**
+   * `package_credit_expiring_amount`，不说哪几笔、不说哪天到期：
+   *
+   * ```
+   * {"name":"usageTotalPackageCredit","package_credit_amount":25500,
+   *  "package_credit_remain":25500,"package_credit_expiring_amount":2000}
+   * {"name":"usageBonusPackageCredit","package_credit_amount":25000,
+   *  "package_credit_remain":25000,"package_credit_expiring_amount":2000}
+   * ```
+   *
+   * 逐包/逐笔端点在上游**不存在**：探了 85+ 个候选路径全 404，且解包
+   * `D:\CodeArts\resources\app.asar` 后全量枚举只有 27 条 `/v1/*` 路径，
+   * 其中唯一的积分端点是 `/v1/ops/credit/usage?type=msg|session`，
+   * 返回 `{credits, cacheHitRatio}` —— 是**单次对话消耗**，不是余额明细。
+   *
+   * ⇒ 只如实透出这个标量（`expiringTotal`），**不**伪造 `deductionEndTime`
+   * 去凑三档。下面三条用例把这三个边界钉死。
+   */
+  describe('即将到期额度（expiringTotal）', () => {
+    it('取总额 metric 上的标量，不累加分类（否则凭空翻倍）', async () => {
+      // 实测真实响应：总额与赠送**同时**带 2000。累加会得到 4000。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 25500, package_credit_used: 0, package_credit_remain: 25500, package_credit_expiring_amount: 2000 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 25000, package_credit_used: 0, package_credit_remain: 25000, package_credit_expiring_amount: 2000 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      expect(info?.credit?.expiringTotal, '只能取一次总额 metric 上的值').toBe(2000)
+      expect(info?.credit?.total).toBe(25500)
+    })
+
+    it('缺失该字段时 expiringTotal 为 undefined（≠ 0）', async () => {
+      // 基础包/按需包都没有这个键；没有它 = 上游没给这个口径，
+      // 而不是「有 0 分即将到期」。混用会让界面多出一句「0 即将到期」。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      expect(info?.credit?.expiringTotal).toBeUndefined()
+      expect(info?.credit?.total).toBe(500)
+    })
+
+    it('值为 0 时也不写该字段（无临期额度与无此口径等价呈现）', async () => {
+      // 实测第二个账号：expiring=0 且总额/赠送都在。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 6500, package_credit_used: 0, package_credit_remain: 6500, package_credit_expiring_amount: 0 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 6000, package_credit_used: 0, package_credit_remain: 6000, package_credit_expiring_amount: 0 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      expect(info?.credit?.expiringTotal).toBeUndefined()
+    })
+
+    it('★ 绝不伪造 deductionEndTime 去凑三档分档', async () => {
+      // 这是本改动的**核心约束**：三档分档（永久/长期/临期）与「锁定永久积分」
+      // 都读 `packages[].deductionEndTime`。上游不给逐包到期时刻 ⇒ 该字段必须
+      // 保持 undefined（= 到期时间未知 ⇒ 落永久桶），而不是拿套餐 end_date
+      // 或「即将到期」标量去编一个日期。编了会让永久锁按假日期做决策。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 25500, package_credit_used: 0, package_credit_remain: 25500, package_credit_expiring_amount: 2000 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 25000, package_credit_used: 0, package_credit_remain: 25000, package_credit_expiring_amount: 2000 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      const packages = info?.credit?.packages ?? []
+      expect(packages.length).toBeGreaterThan(0)
+      for (const pkg of packages) {
+        expect(pkg.deductionEndTime, `${pkg.name} 不得有编造的到期时间`).toBeUndefined()
+        expect(pkg.expiredTime, `${pkg.name} 的 expiredTime 应为空串`).toBe('')
+      }
+    })
+  })
+
   it('查询失败返回 null（与「非积分账户」严格区分）', async () => {
     const { fetcher } = jsonFetcher(() => ({ status: 500, body: { message: 'boom' } }))
     expect(await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)).toBeNull()

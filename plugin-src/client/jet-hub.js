@@ -608,6 +608,37 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     balance.expiredTotal > 0
       ? React.createElement('span', { className: 'dim-jh-creditExpired' },
           `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)
+      : null,
+    /**
+     * 「其中 N 即将到期」—— 只有 CodeArts 会走到这里（2026-10-20）。
+     *
+     * ## 为什么不是三档分档
+     *
+     * 上面那条 `expiryParts`（永久绿 / 长期黄 / 临期红）要求**逐包**的
+     * `deductionEndTime`。CodeArts 的 `statistics/plugin` 只下发一个**聚合标量**
+     * `package_credit_expiring_amount`，既不说哪几笔、也不说哪天到期
+     * （逐包端点在上游不存在，见 `CreditBalance.expiringTotal` 的注释）。
+     *
+     * ⇒ 这一家只如实说「有 N 即将到期」，**不**伪造 `deductionEndTime`
+     *   去凑三档 —— 那会让「永久锁」按编造的日期做决策。
+     *
+     * ## ⚠️ 文案刻意不写天数
+     *
+     * 华为没定义「即将到期」是未来多少天内（字段名与官方计费文档都没有），
+     * 写「30 天内到期」之类就是编造。故只说「即将到期」。
+     *
+     * ## ⚠️ 与 `expiredTotal` 互斥
+     *
+     * 那个是「已失效、不可用」，这个是「仍可用、但快失效」。
+     * 同时出现会让用户以为额度既失效又快到期。
+     */
+    typeof balance.expiringTotal === 'number' && balance.expiringTotal > 0
+      ? React.createElement('span', {
+          className: 'dim-jh-creditExpiring',
+          title: '该额度仍可使用，但服务端标记为「即将到期」。'
+            + '\nCodeArts 只下发这一项聚合数字，不提供逐笔到期时间，'
+            + '\n故无法像 CodeBuddy 那样按「永久 / 长期 / 临期」分档。',
+        }, `其中 ${formatUnits(balance.expiringTotal, unit)} 即将到期`)
       : null));
 }
 

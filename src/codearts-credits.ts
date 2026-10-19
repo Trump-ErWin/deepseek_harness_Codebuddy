@@ -253,6 +253,25 @@ function readNumber(source: Record<string, unknown>, key: string): number {
   return 0
 }
 
+/**
+ * 从 JSON 安全读取数字，但**区分「缺失」与「0」**（缺失/非法返回 `undefined`）。
+ *
+ * 与 {@link readNumber} 的分工：那个返回 0 是刻意的（`package_credit_amount`
+ * 缺失时按「额度为 0」处理，让「0 额度分类不列为资源包」的判据成立）；
+ * 但 `package_credit_expiring_amount` 缺失表示**上游没给这个口径**，
+ * 与「给了且为 0」是两件事 —— 前者要显示「无此信息」，后者要显示「无临期额度」。
+ * 混用会让没有该字段的账户凭空多出一句「0 即将到期」。
+ */
+function readOptionalNumber(source: Record<string, unknown>, key: string): number | undefined {
+  const value = source[key]
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
 /** 从 JSON 安全读取字符串。 */
 function readString(source: Record<string, unknown>, key: string): string {
   const value = source[key]
@@ -392,6 +411,19 @@ function parseCreditBalance(metrics: unknown): CreditBalance | undefined {
   const packages: CreditPackage[] = []
   let totalRemain: number | undefined
   let sawAnyCreditMetric = false
+  /**
+   * 「即将到期」的额度（`package_credit_expiring_amount`）。
+   *
+   * ⚠️ **只在总额 metric 上取一次**，不累加各分类 —— 分类（基础/按需/赠送）
+   * 是总额的构成明细，实测 `usageTotalPackageCredit` 与
+   * `usageBonusPackageCredit` **同时**带 2000（2026-10-20 真实账号），
+   * 累加会得到 4000，凭空翻倍。
+   *
+   * ⚠️ 缺失该键与值为 0 严格区分：缺失 = 上游没给这个口径（`undefined`），
+   * 0 = 给了且当前没有即将到期的额度。两者都**不**写进 `expiringTotal`
+   * 以外的任何地方 —— 尤其不要据此伪造 `packages[].deductionEndTime`。
+   */
+  let expiringTotal: number | undefined
 
   for (const item of metrics) {
     if (typeof item !== 'object' || item === null) continue
@@ -404,7 +436,12 @@ function parseCreditBalance(metrics: unknown): CreditBalance | undefined {
     const amount = readNumber(record, 'package_credit_amount')
     const used = readNumber(record, 'package_credit_used')
     const remain = readNumber(record, 'package_credit_remain')
-    if (name === TOTAL_CREDIT_METRIC) totalRemain = remain
+    if (name === TOTAL_CREDIT_METRIC) {
+      totalRemain = remain
+      // 只认总额 metric 上的那个标量（见上方注释：分类上也有同名字段）。
+      const expiring = readOptionalNumber(record, 'package_credit_expiring_amount')
+      if (expiring !== undefined && expiring > 0) expiringTotal = expiring
+    }
     // 额度为 0 的分类不列为资源包：列出来只会让「N 个资源包」虚高。
     if (amount <= 0 && remain <= 0) continue
     packages.push({
@@ -413,8 +450,9 @@ function parseCreditBalance(metrics: unknown): CreditBalance | undefined {
       remaining: remain,
       total: amount,
       used,
-      // `statistics/plugin` 不下发资源包的有效性/周期字段（那是腾讯侧的形态）。
-      // 这里如实置为有效、周期留空，而不是臆造一个到期时间。
+      // ⚠️ `statistics/plugin` 只下发**聚合**的「即将到期额度」标量，
+      // 不下发逐包的有效期/周期字段（那是腾讯侧的形态）。这里如实置为有效、
+      // 周期留空 —— 到期口径单独走 `expiringTotal`，见 `CreditBalance` 的注释。
       active: true,
       cycleStartTime: '',
       cycleEndTime: '',
@@ -426,7 +464,12 @@ function parseCreditBalance(metrics: unknown): CreditBalance | undefined {
   const total = roundCredits(
     totalRemain ?? packages.reduce((sum, pkg) => sum + pkg.remaining, 0),
   )
-  return { total, packages, expiredTotal: 0 }
+  return {
+    total,
+    packages,
+    expiredTotal: 0,
+    ...expiringTotal === undefined ? {} : { expiringTotal },
+  }
 }
 
 /**
