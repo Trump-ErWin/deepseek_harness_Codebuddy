@@ -18,7 +18,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, isCatalogFresh, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate, REMOTE_CATALOG_COOLDOWN_MS } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import {
@@ -2109,8 +2109,14 @@ export class BuddyAdapter extends LlmAdapter {
     // `remoteComplete === false` ⇒ 短路判据恒为假 ⇒ **残缺目录不会被判为
     // 「新鲜」，闸门冷却与补齐逻辑原样生效**。
     // ⇒ 两条路径的分工见 `refreshCatalog` 的注释。
+    //
+    // ⚠️ **TTL 那一腿用 `isCatalogFreshFor`**（带「用户主动失效」）：用户在 Jet Hub
+    //    改开关后要**立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+    //    失效腿与完整性腿是 `&&` ⇒ 失效会让整条合取为假、照常进闸门拉取；
+    //    拉取失败时**保留**旧 `remoteModels`（本方法全程不清它）⇒ 用户看到的仍是
+    //    上次那份完整列表，不会退化成兜底**子集**（规格 §7 的核心取舍）。
     if (this.remoteComplete
-      && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
       return
     }
     // 闸门：并发去重 + 失败/空结果冷却（详见 src/remote-catalog-gate.ts 的

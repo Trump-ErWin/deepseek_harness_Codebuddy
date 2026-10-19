@@ -63,7 +63,7 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, isCatalogFresh, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFresh, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { collectImages, serializeMessages } from './openai-compat.js'
@@ -574,8 +574,13 @@ export class ZcodeAdapter extends LlmAdapter {
     //    而不是照抄 loomy 的 `options.now?.() ?? Date.now()`。
     //    两者取值**逐值相同**，但再造一份 `options.now?.() ?? Date.now()` 就是
     //    「同一语义两套写法」，将来改归一方式必漏一处。
+    // ⚠️ 第 ① 处（方法入口）用 `isCatalogFreshFor`：用户在 Jet Hub 改开关后要
+    //    **立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+    //    ⚠️ 第 ② 处（gate 之后复查）**刻意仍用 `isCatalogFresh`**：那里问的是
+    //    「手上这份旧读数还能不能用」—— 若也判失效，一次失败的拉取会把**完整旧
+    //    目录**判成不可用 ⇒ 回落兜底表（子集）⇒ 用户看到「模型反而变少」。
     if (this.remoteModels !== undefined
-      && isCatalogFresh(this.catalogAt, this.nowImpl())) {
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.nowImpl())) {
       return this.remoteModels
     }
     const fetchRemote = this.options.fetchRemoteModels

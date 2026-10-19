@@ -75,7 +75,7 @@ import { canonicalDisplayName } from './canonical-models.js'
 // ⚠️ 「目录够不够新」只留**一份实现**（`model-catalog.ts` 的 `isCatalogFresh`）。
 //    本文件原先自己内联 `now - this.catalogAt < ttl`，与 9 个适配器里的同一判据
 //    构成「同一语义两套判据」（仓库红线，`docs/agent-notes/misc.md`）。
-import { isCatalogFresh } from './model-catalog.js'
+import { isCatalogFreshFor } from './model-catalog.js'
 // ⚠️ 只导入**常量**（不导入 `createExpiryProbe`）⇒ 依赖方向仍是
 // `aggregate-adapter → aggregate-expiry → aggregate-core`，无环。
 import { WIRED_EXPIRY_PROVIDERS } from './aggregate-expiry.js'
@@ -819,7 +819,22 @@ export class AggregateAdapter extends LlmAdapter {
     //    （`CATALOG_REFRESH_INTERVAL_MS`）—— 两者是不同的量，不要顺手改。
     //    `catalogAt === 0`（从未成功推导过）由 `isCatalogFresh` 恒判陈旧，
     //    与原先的 `this.catalogAt !== 0` 一格等价。
-    if (!force && isCatalogFresh(this.catalogAt, now, this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS)) {
+    //
+    // ⚠️ 用 `isCatalogFreshFor(AGGREGATE_PROVIDER, …)`（多一个**正交**的「用户主动
+    //    失效」输入）：用户在面板改拒绝表 / 白名单 / 手工顺序后，**这个**聚合目录
+    //    也要立刻重推（规格 §6 的正确性要求，见 `model-catalog.ts` 的
+    //    `invalidateCatalogCache`）。
+    //    ⚠️ **不得**改成「失效全部渠道」：那会让改一个开关连带作废其余 11 家的
+    //    目录缓存（用户改一个开关却付出十几个上游请求）。
+    //    ⚠️ 刻意**不**把 `this.catalogAt` 置 0：那个字段另有第三个读者
+    //    `catalogReadyForBulkWrite`（判 `catalogAt === 0` 为「从未成功推导过」的冷帧）
+    //    ⇒ 置 0 会让「改完面板开关马上点『关闭聚合供应商』」被误拒。
+    if (!force && isCatalogFreshFor(
+      AGGREGATE_PROVIDER,
+      this.catalogAt,
+      now,
+      this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS,
+    )) {
       return this.catalog
     }
 
@@ -1257,7 +1272,17 @@ export class AggregateAdapter extends LlmAdapter {
    */
   private async catalogForListModels(): Promise<readonly VirtualModel[]> {
     const now = this.options.now?.() ?? Date.now()
-    if (isCatalogFresh(this.catalogAt, now, this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS)) {
+    // ⚠️ 与 `refreshCatalog` **同一个判据**（含 `isCatalogFreshFor` 的失效腿）——
+    //    两处若不一致，用户改完面板开关后 `refreshCatalog` 想去重推、而这里却
+    //    认为「还新鲜、不必起后台那一轮」⇒ 失效形同虚设。
+    //    ⚠️ 本方法**无论新鲜与否都返回旧目录**（`this.catalog`）⇒ 用带失效的判据
+    //    不会让用户看到内容变少，只是多起一次后台推导。
+    if (isCatalogFreshFor(
+      AGGREGATE_PROVIDER,
+      this.catalogAt,
+      now,
+      this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS,
+    )) {
       return this.catalog
     }
     this.startBackgroundCatalogRefresh()

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   recordClineRequest,
   resetClineRequestHistory,
@@ -27,6 +27,8 @@ import type { ProviderAccountEntry } from '../../src/types.js'
 import { probeById } from '../../src/index.js'
 import { clearProviderRuntimes, registerProviderRuntime } from '../../src/provider-runtime.js'
 import { descriptorOf } from '../../src/provider-registry.js'
+// ⚠️ 目录失效表的读写（Task 9 的接线守卫要用它判「端点有没有真的失效目录」）。
+import { catalogInvalidatedAt, clearCatalogInvalidations } from '../../src/model-catalog.js'
 
 /**
  * 注册**生产的那张** `probeById`（Task 8 起探测适配器由能力注册表提供）。
@@ -5012,6 +5014,192 @@ describe('★★ 聚合门控 / 手工排序端点', () => {
     expect((await call('aggregate.expiryOrder', {})).value).toEqual({ order: {} })
     // 写端点不依赖适配器实例（它们只动账号池的两张表）。
     expect((await call('aggregate.setOrderMode', { mode: 'manual' })).ok).toBe(true)
+  })
+})
+
+/**
+ * ★★ **Task 9 的接线守卫：六处写入端点必须**真的**让目录缓存失效。**
+ *
+ * ## ⚠️ 为什么必须测这个（而不是读源码）
+ *
+ * 本仓库实测过 5 条「源码文本断言」在 `if (false)` 的死分支里恒绿 ⇒ 判据必须
+ * 打在行为上。这里的可观测面是 `catalogInvalidatedAt(provider)`：它由
+ * `invalidateCatalogCache` **唯一**写入，故「端点跑完它非 0」等价于
+ * 「端点真的调了失效」。
+ *
+ * ⚠️ 反向的判据同样重要：**参数非法（bad-request）时不得写失效** ——
+ * 那种请求一个字都没改，失效只会白打一次上游。
+ *
+ * ⚠️ 表是**进程级全局状态** ⇒ 每条用例前清空（否则上一条的标记会让
+ * 「bad-request 不得失效」假失败）。
+ */
+describe('★★ 写入端点必须失效目录缓存（Task 9 接线守卫）', () => {
+  type Handler = (request: Request) => Promise<Response>
+
+  beforeEach(() => { clearCatalogInvalidations() })
+  afterEach(() => { clearCatalogInvalidations() })
+
+  /**
+   * 最小夹具：只需要 `settings`（账号池写黑名单）与可选的 `llm`。
+   *
+   * ⚠️ 必须提供 `llm.listModels`：`model.setDisabled` / `model.setAllDisabled`
+   * 的写前目录核对会用它（缺失时它们走「核对不了就照常写」的降级路径，
+   * 那样用例就少覆盖了一条真实路径）。
+   */
+  function setup(options: { models?: Array<{ id: string; name: string }> } = {}) {
+    let handler: Handler | undefined
+    let stored: Record<string, unknown> = { accounts: [] }
+    const models = options.models ?? [{ id: 'm1', name: 'M1' }, { id: 'm2', name: 'M2' }]
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? {
+            register: () => ({
+              get: () => stored,
+              replace: async (value: Record<string, unknown>) => { stored = value },
+            }),
+          }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: false, writable: true }),
+        resolve: async () => undefined,
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+
+    const ctx = {
+      get: (key: string) => {
+        if (key === 'connection') {
+          return {
+            fetch: {
+              register: (config: { path: string; fetch: Handler }) => {
+                if (config.path === JET_HUB_API_PATH) handler = config.fetch
+              },
+            },
+          }
+        }
+        if (key === 'llm') {
+          return { listModels: async (provider: string) => models.map((m) => ({ ...m, provider })) }
+        }
+        return undefined
+      },
+      inject: (_deps: string[], callback: (c: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      emit: () => {},
+    }
+
+    registerJetHubRpc(
+      ctx as never,
+      pool,
+      {
+        codearts: {} as never, buddy: {} as never, workbuddy: {} as never,
+        lobsterai: {} as never, qoder: {} as never, qodercn: {} as never,
+        trae: {} as never, cline: {} as never, loomy: {} as never,
+        raccoon: {} as never, minimax: {} as never, zcode: {} as never,
+        gemini: {} as never, officeace: {} as never,
+      } as never,
+      {
+        buddy: {
+          listAllModels: () => models.map((m) => ({ id: m.id, name: m.name })),
+        },
+      } as never,
+    )
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request',
+          rpcId: 'rpc-1',
+          method: 'jet-hub',
+          payload: { method, payload },
+        }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown } }
+      return body.result
+    }
+    return { call, pool }
+  }
+
+  it('★ model.setDisabled 成功 ⇒ 失效该 provider', async () => {
+    const { call } = setup()
+    expect(catalogInvalidatedAt('buddy'), '⚪️ 前置：本来没失效').toBe(0)
+    expect((await call('model.setDisabled', { provider: 'buddy', modelId: 'm1', disabled: true })).ok).toBe(true)
+    expect(catalogInvalidatedAt('buddy'), '★ 改开关必须立刻失效目录').toBeGreaterThan(0)
+  })
+
+  it('★ model.setDisabled 参数非法 ⇒ **不**失效（一个字都没改）', async () => {
+    const { call } = setup()
+    expect((await call('model.setDisabled', { provider: 'buddy' })).ok).toBe(false)
+    expect(catalogInvalidatedAt('buddy'), '★ bad-request 不该白打一次上游').toBe(0)
+  })
+
+  it('★ model.clearDead 成功 ⇒ 失效该 provider', async () => {
+    const { call } = setup()
+    expect((await call('model.clearDead', { provider: 'buddy' })).ok).toBe(true)
+    expect(catalogInvalidatedAt('buddy'), '★ 「重新显示」也必须立刻生效').toBeGreaterThan(0)
+  })
+
+  it('★ model.setAllDisabled 成功 ⇒ 失效该 provider（两个方向都失效）', async () => {
+    const { call } = setup()
+    expect((await call('model.setAllDisabled', { provider: 'buddy', disabled: true })).ok).toBe(true)
+    expect(catalogInvalidatedAt('buddy'), '★ 关闭全部').toBeGreaterThan(0)
+
+    clearCatalogInvalidations()
+    expect((await call('model.setAllDisabled', { provider: 'buddy', disabled: false })).ok).toBe(true)
+    expect(catalogInvalidatedAt('buddy'), '★ 打开全部（本地操作，但目录同样要重读）').toBeGreaterThan(0)
+  })
+
+  it('★ model.setAllDisabled 参数非法 ⇒ **不**失效', async () => {
+    const { call } = setup()
+    expect((await call('model.setAllDisabled', { provider: 'buddy' })).ok).toBe(false)
+    expect(catalogInvalidatedAt('buddy'), '★ disabled 缺失不是一次写入').toBe(0)
+  })
+
+  it('★ model.setDisabledMany 成功 ⇒ 失效该 provider（同类写入端点，第 7 处）', async () => {
+    const { call } = setup()
+    expect((await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['m1'], disabled: true })).ok).toBe(true)
+    expect(catalogInvalidatedAt('buddy'), '★ 按分组批量关闭同样是改黑名单').toBeGreaterThan(0)
+  })
+
+  it('★★ aggregate.setRejected ⇒ 失效 **aggregate 自己**，且**不**波及别的渠道', async () => {
+    const { call } = setup()
+    expect((await call('aggregate.setRejected', {
+      canonicalId: 'm', provider: 'raccoon', realId: 'r', rejected: true,
+    })).ok).toBe(true)
+    expect(catalogInvalidatedAt('aggregate'), '★★ 聚合自己的目录缓存必须失效').toBeGreaterThan(0)
+    // ⚠️ 这一条是任务的硬约束：失效一个不得连带作废其余。
+    //    在 4/5/6 三处**绝不许**失效 `req.provider`（那会让改一个开关打十几个上游）。
+    expect(catalogInvalidatedAt('raccoon'), '★★ 不得连带失效拒绝表里那个渠道').toBe(0)
+  })
+
+  it('★★ aggregate.setAllowed ⇒ 失效 aggregate 自己，且不波及别的渠道', async () => {
+    const { call } = setup()
+    expect((await call('aggregate.setAllowed', {
+      canonicalId: 'm', provider: 'raccoon', realId: 'r', allowed: true,
+    })).ok).toBe(true)
+    expect(catalogInvalidatedAt('aggregate'), '★★ 白名单同样改变候选门控').toBeGreaterThan(0)
+    expect(catalogInvalidatedAt('raccoon'), '★★ 不得连带失效该渠道').toBe(0)
+  })
+
+  it('★★ aggregate.setOrder ⇒ 失效 aggregate 自己，且不波及别的渠道', async () => {
+    const { call } = setup()
+    expect((await call('aggregate.setOrder', {
+      canonicalId: 'm', order: ['raccoon\u0000r'],
+    })).ok).toBe(true)
+    expect(catalogInvalidatedAt('aggregate'), '★★ 顺序参与候选排序').toBeGreaterThan(0)
+    expect(catalogInvalidatedAt('raccoon'), '★★ 不得连带失效该渠道').toBe(0)
+  })
+
+  it('★ 三处 aggregate 写入的参数非法 ⇒ **不**失效 aggregate', async () => {
+    const { call } = setup()
+    expect((await call('aggregate.setRejected', { canonicalId: 'm' })).ok).toBe(false)
+    expect((await call('aggregate.setAllowed', { canonicalId: 'm' })).ok).toBe(false)
+    expect((await call('aggregate.setOrder', { canonicalId: 'm', order: 'a,b' })).ok).toBe(false)
+    expect(catalogInvalidatedAt('aggregate'), '★ 三次 bad-request 都不该白打上游').toBe(0)
   })
 })
 

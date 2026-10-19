@@ -48,6 +48,16 @@ import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 //    ⚠️ 每一次调用都**重新读**这个导出（而不是在模块级拷成另一个常量），以后者为准会
 //    在接入新渠道时静默漂移：一键按钮会开始清掉**已接入**渠道的白名单。
 import { WIRED_EXPIRY_PROVIDERS } from './aggregate-expiry.js'
+// ⚠️ **值导入**：`AGGREGATE_PROVIDER` 是聚合的 provider id（写入端点在下面三处要用它
+//    作为 `invalidateCatalogCache` 的键）。**不**在本文件再抄一份字面量 `'aggregate'`
+//    —— 那会与常量漂移（本文件另一处 `modelAdapters?.['aggregate']` 是既有写法，
+//    本次只新增消费点，不改既有行）。
+//    ⚠️ 依赖方向：`aggregate-adapter.ts` 不 import 本文件 ⇒ 无环。
+// ⚠️ `invalidateCatalogCache`：用户主动改设置 ⇒ 该 provider 的目录读数**立即**失效
+//    （规格 §6 的正确性要求，不是优化）。实现在 `model-catalog.ts`（与
+//    `isCatalogFresh` 同一处，保证「多久算新鲜」只有一份判据）。
+import { AGGREGATE_PROVIDER } from './aggregate-adapter.js'
+import { invalidateCatalogCache } from './model-catalog.js'
 import type { LoomyAuth } from './loomy-auth.js'
 import type { LoomyCredential } from './loomy.js'
 import { RACCOON } from './raccoon-product.js'
@@ -5983,6 +5993,13 @@ AUTOCLAW.id,
         )
         // 必须广播：否则开关只写进磁盘、界面一直显示旧目录（成因见该函数注释）。
         broadcastCatalogChanged(ctx)
+        // ⚠️⚠️ 用户主动改目录相关的设置 ⇒ 该 provider 的目录读数**立即**失效，
+        // 否则要等满 20 分钟才看到效果（规格 §6 的正确性要求，不是优化）。
+        // ⚠️ 必须排在**写入之后**：失败路径（参数校验 `return`、或上面写入抛错）
+        // 一个字都没改，此时失效只会白打一次上游。
+        // ⚠️ `model.setDisabledMany`（按分组批量开关）**也已接线** —— 它是同一类
+        // 写入端点（同一张黑名单），不接线的症状与单条开关逐字相同。
+        invalidateCatalogCache(req.provider)
         const disabledModels = pool.listDisabledModels(req.provider)
         // ⚠️⚠️ **静默空操作必须留痕**（Issue IKJW33）：对已从上游目录消失的 id
         // 开关时，旧实现返回「成功」却什么都没发生、且零警告。写入语义不变，
@@ -6030,6 +6047,9 @@ AUTOCLAW.id,
         // 必须广播：与三个开关端点同约定，否则客户端目录（`llm/adapters-updated`
         // 三个触发源之一）不复位，用户点了「重新显示」界面却不动。
         broadcastCatalogChanged(ctx)
+        // ⚠️ 用户主动改了目录相关的设置 ⇒ 该 provider 的目录读数**立即**失效
+        //（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。排在写入之后。
+        invalidateCatalogCache(req.provider)
         ctx.logger.info(
           `[jet-hub] 恢复 ${removed} 个失效模型：${req.provider}`
           + `${req.modelId === undefined ? '' : `/${req.modelId}`}`,
@@ -6080,6 +6100,11 @@ AUTOCLAW.id,
         )
         // 与其它开关端点一致：必须广播，否则界面一直显示旧目录。
         broadcastCatalogChanged(ctx)
+        // ⚠️ **本处是 brief 那 6 处之外的同一类写入端点**（第 7 处）：
+        //    它写的是同一张黑名单（只是按分组批量），用户点「本组全关」之后
+        //    同样会撞上「最坏等满 20 分钟」—— 不接线的症状与单条开关**逐字相同**。
+        //    刻意补上（brief 的 6 处是“已核实到行”的清单，不是“只许这 6 处”）。
+        invalidateCatalogCache(req.provider)
         const disabledModels = pool.listDisabledModels(req.provider)
         // 与单条端点同约定：目录外的 id 必须留痕（Issue IKJW33）。
         const warnings = catalogWarnings(known, req.provider, ids, req.disabled)
@@ -6198,6 +6223,13 @@ AUTOCLAW.id,
         }
         // 只广播一次：批量不等于逐条广播。
         broadcastCatalogChanged(ctx)
+        // ⚠️ 用户主动改了目录相关的设置 ⇒ 该 provider 的目录读数**立即**失效
+        //（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+        // ⚠️ 排在**所有失败 `return` 之后**：上面四条拒绝分支一个字都没写，
+        // 那时失效只会白打一次上游。
+        // ⚠️ 命中「本就已全部关闭」的幂等短路时也照样失效一次 —— 那是用户点了一个
+        // 开关、期望看到最新的代价（一次上游目录读取），比「界面纹丝不动」划算。
+        invalidateCatalogCache(req.provider)
         const value: RpcModelSetAllDisabledResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
@@ -6560,6 +6592,12 @@ AUTOCLAW.id,
         // ⚠️ 清选型缓存：让改动**立刻**生效（虽然缓存键含拒绝表指纹、正确性不依赖
         //    它，但清掉可立即释放内存，并让语义更直白）。
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️⚠️ **额外失效 `aggregate` 自己的目录缓存**（`catalogAt`）——
+        // 拒绝表变了 ⇒ 候选门控变了 ⇒ 聚合目录的推导结果要立刻重算，否则最坏
+        // 还是等满它自己的 TTL（`AGGREGATE_CATALOG_TTL_MS`，60 秒）。
+        // ⚠️ **只失效 `aggregate` 一个**：失效全部渠道会让「改一个开关」连带作废
+        // 其余 11 家的目录缓存 ⇒ 用户改一个开关却付出十几个上游请求。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateRejectionsResponse = {
           aggregateRejections: pool.listAggregateRejections(),
           // ⚠️ 必须同时回白名单：面板的逐条开关要按三态显示，只回拒绝表会让白名单条目
@@ -6621,6 +6659,9 @@ AUTOCLAW.id,
           + `${req.canonicalId} 的候选 ${req.provider}/${req.realId}`,
         )
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ 与 `aggregate.setRejected` **逐条对齐**（漏一处两个方向就会不同步）：
+        //    额外失效 `aggregate` 自己的目录缓存，且**只**失效它一个（理由见那边）。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateRejectionsResponse = {
           aggregateRejections: pool.listAggregateRejections(),
           aggregateAllowed: pool.listAggregateAllowed(),
@@ -6650,6 +6691,8 @@ AUTOCLAW.id,
         ctx.logger.info(`[jet-hub] 聚合：写入 ${req.canonicalId} 的手工顺序（${order.length} 条）`)
         // ⚠️ 顺序**参与**候选排序 ⇒ 顺序变了缓存里的候选序就失效了（指纹也含它，双保险）。
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ 同上：额外失效 `aggregate` 自己的目录缓存，且**只**失效它一个。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateSetOrderResponse = { canonicalId: req.canonicalId, order }
         return { ok: true, value }
       }

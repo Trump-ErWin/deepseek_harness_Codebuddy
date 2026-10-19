@@ -7,7 +7,7 @@ import {
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, isCatalogFresh, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
@@ -1065,8 +1065,16 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 「新鲜」，闸门冷却与补齐逻辑原样生效**。TTL 只让「重新拉取」变得可发生
     // （完整目录满 20 分钟会被重新拉，倍率/目录变化能跟上），不改变残缺的纠正路径。
     // ⇒ **未改任何合并逻辑**（两个端点各自成败仍由接线层经 `catalogComplete` 上报）。
+    // ⚠️ **TTL 那一腿用 `isCatalogFreshFor`**（带「用户主动失效」）：用户在 Jet Hub
+    //    改开关后要**立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+    //    ⚠️ 本家走 `LlmAdapter` 基类、`createModelCatalog` 的 `product` 是
+    //    `{ id: PROVIDER }` ⇒ 登记的 provider id 恒为 `PROVIDER`（`codearts`），
+    //    没有「一个类服务两个站」的情况（qoder / buddy 才有）。
+    //    ⚠️ 失效腿与完整性腿是 `&&` ⇒ 失效让整条合取为假、照常进闸门；
+    //    拉取失败时**保留**旧 `remoteModels`（本方法不清它）⇒ 用户看到的仍是
+    //    上次那份完整列表，不会退化成兜底**子集**（规格 §7 的核心取舍）。
     if (this.remoteComplete
-      && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+      && isCatalogFreshFor(PROVIDER, this.catalogAt, this.options.now?.() ?? Date.now())) {
       return
     }
     await this.catalogGate.run(async () => {
