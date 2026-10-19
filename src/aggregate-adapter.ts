@@ -1165,6 +1165,11 @@ export class AggregateAdapter extends LlmAdapter {
     //    且症状静默（无报错、无日志）。现两处都补齐。
     'accio',
     'autoclaw',
+    // ⚠️ astudio 有意**不进** AGGREGATE_CHANNELS（2026-10-16 定案，沿用先前取证结论）：
+    //    本家的模型目录来自上游动态 catalog，额度与失效语义（HTTP 200 + 业务 code 80000
+    //    归「需人工重新登录」终态）与聚合渠道不同；且上方注释已实证「只加本数组而不补
+    //    aggregate-expiry 的 WIRED_EXPIRY_PROVIDERS」是无效接线。两处均未补齐 ⇒ 本轮保持
+    //    不接入聚合渠道，此处不新增成员，仅留此说明防止后人误以为漏接。
   ])
 
   /**
