@@ -202,6 +202,56 @@ export interface ModelCatalogConfig {
   syncCatalog(): readonly CatalogEntry[]
 }
 
+/**
+ * 模型目录的定期刷新周期（毫秒）—— **20 分钟**。
+ *
+ * ## 为什么是 20 分钟（用户 2026-10-18 的要求）
+ *
+ * 「各个模型的模型列表缓存也要带定时更新，20 分钟更新一次，如果不更新随高峰低谷
+ * 变化的积分消耗倍率是更新不到实际的倍率」
+ *
+ * ⚠️ **不按 provider 差异化**：本仓库铁律是「同一语义不得两套判据」，而各家倍率
+ * 的变化频率无法从协议层可靠判定（实测记录多为「结构上可达、零实测」）。
+ * ⇒ 统一一个周期，是唯一不会在将来漂移的写法。
+ */
+export const CATALOG_REFRESH_INTERVAL_MS = 1_200_000
+
+/**
+ * 这一份目录读数是否还够新。
+ *
+ * ## ⚠️⚠️ 本函数是「目录够不够新」的**唯一**实现
+ *
+ * 9 个适配器（loomy / minimax / zcode / raccoon / trae / lobsterai / accio /
+ * codearts 系 / buddy）各自的 `remoteModels` 都要判这个，**各写一份就是
+ * 「同一语义两套判据」** —— 本仓库红线（`docs/agent-notes/misc.md` 记着
+ * 「一条文件两套同义判据」曾被当成 PR 修复项）。
+ *
+ * ## 判据形状
+ *
+ * `at === 0 || undefined` ⇒ **恒不新鲜**。这是刻意的：那表示「从未成功读过」，
+ * 而各家的兜底表是**编译期快照且是子集**（`docs/agent-notes/client-ui.md`：
+ * cline 实测 3/460）⇒ 必须真去拉一次，不能拿兜底表冒充新鲜读数。
+ *
+ * @param at - 上次**成功**读到的时刻（毫秒）
+ * @param now - 当前时刻
+ * @param ttlMs - 允许陈旧的时长；缺省 {@link CATALOG_REFRESH_INTERVAL_MS}
+ */
+export function isCatalogFresh(
+  at: number | undefined,
+  now: number,
+  ttlMs: number = CATALOG_REFRESH_INTERVAL_MS,
+): boolean {
+  if (at === undefined || at === 0) return false
+  // ⚠️ 边界用 `<`：与 `TtlCache.peek()` 的 `now - atMs >= ttlMs` 判陈旧**同口径**
+  //    （`src/ttl-cache.ts`），两处不一致会让「缓存多久算新鲜」在运行时才确定。
+  const age = now - at
+  // ⚠️ `age < 0`（时钟回拨）判**新鲜**：否则一次 NTP 校时会让全部目录同时判陈旧，
+  //    下一轮把 9 个上游一起打一遍。
+  //    （此处不写 `age >= 0 &&`：那一条会与上面这句注释、与 `isCatalogFresh` 的
+  //     时钟回拨用例**互相矛盾** —— `at` 在未来时 age 为负，必须放行。）
+  return age < ttlMs
+}
+
 export interface ModelCatalog {
   listModels(provider: string): Promise<readonly LlmModelInfo[]>
   resolveModel(
