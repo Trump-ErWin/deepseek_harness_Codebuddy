@@ -451,7 +451,23 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
-id: 'autoclaw',
+    id: 'astudio',
+    label: 'AStudio (讯飞)',
+    displayName: 'AStudio',
+    logoClass: 'astudio',
+    // AStudio 每日奖励签到对接 client-popups/pending（DAILY_REWARD_DIALOG）与
+    // client-popups/complete 领取流程 ⇒ dailyCheckin 启用为 true。
+    credits: { balance: true, dailyCheckin: true },
+    // ⚠️ rateLimit: false —— 判据同 accio（registry 落地问法「点下去能不能让用户少受限一次？」）：
+    //    astudio-adapter 不写 modelRateLimits，且刻意不进 src/index.ts 的 probeById
+    //    （probeById 被守卫锁成「恰好是会写标记的家」）⇒ 两个按钮恒为惰性。
+    //    将来接上请求级换号+冷却时必须同时改回 true 并进 probeById + WRITES_RATE_LIMIT_PROVIDERS。
+    rateLimit: false,
+    settingsNamespace: 'llm-astudio',
+    channel: true,
+  },
+  {
+    id: 'autoclaw',
     label: 'AutoClaw (智谱)',
     displayName: 'AutoClaw (智谱)',
     logoClass: 'autoclaw',

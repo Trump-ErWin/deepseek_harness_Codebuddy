@@ -82,6 +82,22 @@ import { parseAutoclawCredential, isAutoclawRefreshable, autoclawDisplayNickname
 import type { ModelscopeAuth } from './modelscope-auth.js'
 import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
 import { ACCIO } from './accio-product.js'
+// AStudio（讯飞 AstronStudio）：直连上游 MAAS。**没有 OAuth 授权页** —— 凭据是客户端登录后
+// **明文落盘**会话的拷贝（见 `astudio-auth.ts` 模块头），故 `account.create` 走
+// `importLocalSession`（导入即完成，没有可用的 loginUrl，见该分支的 `reused`）。
+// ⚠️ 本家符号**分属两个模块**：`astudioAccountNickname` 在 `astudio-auth.ts`，
+//    `isAstudioRefreshable` 与凭据类型在 `astudio.ts`（产品常量在 `astudio-product.ts`）。
+import { ASTUDIO } from './astudio-product.js'
+import { astudioAccountNickname, type AstudioAuth } from './astudio-auth.js'
+import { isAstudioRefreshable, type AstudioCredential } from './astudio.js'
+import {
+  createAstudioWechatQrCode,
+  pollAstudioWechatScan,
+  bindAstudioWechatSession,
+  startAstudioLoginFlow,
+  type AstudioWechatQrCode,
+  type StartedAstudioLoginFlow,
+} from './astudio-oauth.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import { MODELSCOPE } from './modelscope-product.js'
 import { maskModelscopeKey } from './modelscope.js'
@@ -886,7 +902,10 @@ export async function collectCreditsStatus<TCredential = BuddyCredential, TProdu
   for (const entry of accounts) {
     let status: CheckinStatus | null = null
     try {
-      const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+      let resolved = await deps.resolve(credentialRef(entry.credentialRef))
+      if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+        resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+      }
       if (resolved !== undefined) {
         const credential = JSON.parse(resolved.value) as TCredential
         status = await fetchStatus(credential, product)
@@ -1074,7 +1093,10 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
     }
     if (balance === null) {
       try {
-        const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        let resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+          resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+        }
         if (resolved === undefined) {
           error = '凭据未配置'
         } else {
@@ -1297,7 +1319,16 @@ export interface JetHubAuths {
    */
   readonly officeace: OfficeAceAuth
   readonly accio: AccioAuth
-readonly autoclaw: AutoclawAuth
+  /**
+   * AStudio（讯飞 AstronStudio，2026-10-16）。
+   *
+   * ⚠️ 与其余各家**不同**：本家没有 `startLogin`、不开回调服务器、没有
+   * `authorizeUrl`。`account.create` 用 `importLocalSession(refName)` 把**本机 AStudio
+   * 客户端已登录的会话**（磁盘明文 `modelBearerToken`，fact 399/402）读进 DSH 凭据库
+   * —— 一次做完的同步路径 ⇒ 返回体靠 `reused: true` 走前端的成功出口。
+   */
+  readonly astudio: AstudioAuth
+  readonly autoclaw: AutoclawAuth
   /**
    * ModelScope（魔搭）—— **本 fork 独有**（上游 rc.11 仍无此 provider）。
    *
@@ -1872,6 +1903,7 @@ trae, cline, loomy, raccoon, minimax,
     // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
     minimaxintl,
     zcode, gemini, accio, autoclaw,
+    astudio,
   } = auths
   /**
    * 积分能力表。
@@ -2059,7 +2091,20 @@ trae, cline, loomy, raccoon, minimax,
     // 池内 `expiresAt` 确实会被写 ⇒ 不属 loomy / zcode 那类豁免。
     // 漏登记的后果是「凭据明明能续，面板却报未登录」（2026-10-12 复审发现）。
     ACCIO.id,
-AUTOCLAW.id,
+    // ⚠️ astudio（讯飞 AstronStudio，2026-10-16）**有**可用的续期链，故不属于
+    // loomy / zcode 那类「设计上没有 refresh 端点」的显式豁免：
+    // · 触发点唯一 = 上游 MAAS 返回 **HTTP 401**（fact 401：客户端的
+    //   `refreshAstronSessionCredentialAfterUnauthorized` 也仅挂这一点）；流内
+    //   1002/1005 与 502 model_not_found / no_valid_authorization **不得**挂自愈，
+    //   否则对确定性失败白刷。
+    // · `AstudioAuth.refreshAccountCredential` 内部幂等重跑纯读端点
+    //   `GET /xingchen-studio/bot/models/configs`（api_key 不轮换，fact 399），
+    //   只重取一次、并发去重，且**绝不回写**客户端的 astron-session.json。
+    // · 会话真失效 = HTTP 200 + code=80000 ⇒ 走 `AstudioRefreshTokenExpiredError`
+    //   一次性终态「需人工重新登录」，不进重试循环。
+    // 漏登记的后果与 accio 同款：凭据其实只需一次重取，面板却永报「未登录」。
+    ASTUDIO.id,
+    AUTOCLAW.id,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
     //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
     //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
@@ -2508,6 +2553,19 @@ AUTOCLAW.id,
     Promise<{ done: boolean; success?: boolean; error?: string }>
   >()
 
+  interface PendingAstudioScanState {
+    fd: string
+    credentialRef: string
+  }
+
+  const pendingAstudioScanState = new Map<string, PendingAstudioScanState>()
+  const pendingAstudioFlowState = new Map<string, StartedAstudioLoginFlow>()
+
+  const astudioExchangeInFlight = new Map<
+    string,
+    Promise<{ done: boolean; success?: boolean; error?: string }>
+  >()
+
   /**
    * 登录**终态失败**记录（账号 id → `{ message, at }`；`message` 即下发给前端的原文）。
    *
@@ -2694,6 +2752,8 @@ AUTOCLAW.id,
     //（正常路径同值；改造期存量数据可能只有其一）。
     const pending = pendingOfficeAceState.get(accountId)
     if (pending !== undefined) refs.add(pending.credentialRef)
+    const pendingAstudio = pendingAstudioScanState.get(accountId)
+    if (pendingAstudio !== undefined) refs.add(pendingAstudio.credentialRef)
     let readFailed = false
     for (const name of refs) {
       if (name.length === 0) continue
@@ -2768,6 +2828,11 @@ AUTOCLAW.id,
       return recordLoginFailure(accountId, new Error('该账号条目已被删除（可能是你手动删掉了它）'))
     }
     const message = recordLoginFailure(accountId, error)
+    const pendingFlow = pendingAstudioFlowState.get(accountId)
+    if (pendingFlow !== undefined) {
+      pendingAstudioFlowState.delete(accountId)
+      void pendingFlow.close().catch(() => {})
+    }
     void pool.removeAccount(accountId).catch(() => {})
     return message
   }
@@ -3114,6 +3179,67 @@ AUTOCLAW.id,
     //    在此之前任何一次 `account.list` 都必须能看出这次登录"在途"。
     pendingOfficeAceState.delete(accountId)
     return { done: true, success: true }
+  }
+
+  /**
+   * 执行一次 AStudio 微信扫码登录轮询与凭据交换。
+   */
+  async function exchangeAstudioScanLogin(
+    accountId: string,
+    entry: { credentialRef: string },
+    pending: PendingAstudioScanState,
+  ): Promise<{ done: boolean; success?: boolean; error?: string }> {
+    const scanResult = await pollAstudioWechatScan(pending.fd, {
+      fetcher: auths.astudio.fetchImpl,
+    }).catch(() => ({ status: 'pending' as const }))
+    if (scanResult.status === 'pending') {
+      return { done: false }
+    }
+
+    if (scanResult.status === 'unbound' || scanResult.status === 'error') {
+      const msg = scanResult.message || '微信扫码登录已失效或失败，请重新发起登录'
+      const failure = await failLogin(accountId, new Error(msg))
+      pendingAstudioScanState.delete(accountId)
+      return { done: true, success: false, error: failure ?? msg }
+    }
+
+    if (scanResult.status === 'scanned') {
+      const bound = await bindAstudioWechatSession(pending.fd, scanResult.account, {
+        fetcher: auths.astudio.fetchImpl,
+      })
+        .then(() => true)
+        .catch(() => false)
+      if (!bound) {
+        ctx.logger.warn(`[jet-hub] AStudio wechat session bind returned non-ok for ${accountId}`)
+      }
+
+      let credential: AstudioCredential
+      try {
+        credential = await auths.astudio.completeLogin(
+          scanResult.account,
+          pending.credentialRef ?? entry.credentialRef,
+        )
+      } catch (error) {
+        const failure = await failLogin(accountId, error)
+        pendingAstudioScanState.delete(accountId)
+        if (failure === undefined) return { done: true, success: true }
+        return { done: true, success: false, error: failure }
+      }
+
+      pendingAstudioScanState.delete(accountId)
+      try {
+        await pool.updateAccount(accountId, {
+          nickname: astudioAccountNickname(credential, accountId),
+          expiresAt: undefined,
+          refreshable: isAstudioRefreshable(credential),
+        })
+      } catch (error) {
+        ctx.logger.warn(`[jet-hub] astudio 回填账号条目失败：${String(error)}`)
+      }
+      return { done: true, success: true }
+    }
+
+    return { done: false }
   }
 
   /**
@@ -4326,6 +4452,108 @@ AUTOCLAW.id,
           })
 
           return { ok: true, value: { accountId: id, loginUrl: accioStarted.loginUrl } }
+        } else if (provider === ASTUDIO.id) {
+          /**
+           * AStudio（讯飞 AstronStudio）**没有 OAuth 授权页**：推理凭据是**本机客户端
+           * 已登录会话的明文拷贝**（磁盘 `astron-session.json` 的 `modelBearerToken`，
+           * fact 399/402；服务端 `Set-Cookie Max-Age=31536000`，bundle 内**不存在任何
+           * 程序化续期接口**）⇒ 没有「授权页 + 回调」这一步可返回 URL。
+           *
+           * ⚠️⚠️ 与其余各家一致、与**上面的 Accio 分支相反**：本分支**必须自己**
+           * `pool.addAccount` 登记条目、失败时**必须自己** `pool.removeAccount` 清掉。
+           * Accio 那段「刻意不调 addAccount」成立的前提是 `AccioAuth.startLogin`
+           * 内部自己登记占位条目；而 `AstudioAuth` **没有** `startLogin` ⇒ 照抄 Accio
+           * 会一个账号都建不出来（gemini L3195-3203 / officeace L3256-3264 是范式）。
+           *
+           * ⚠️ 返回值靠 `reused: true` + 空 `loginUrl` 命中前端的成功出口
+           *（`jet-hub.js` 的 `if (res.reused)`：接受空 loginUrl、直接 loadAccounts）。
+           * `RpcCreateAccountResponse.loginUrl` 是**必填 string**，故空串是唯一能同时满足
+           * 类型契约与「不弹窗」的做法；代价是提示文案对本家略失真（写「复用已有账号」
+           * 而实际是「导入本机会话」）—— 已知偏离，本轮刻意不改 types.ts / jet-hub.js
+           * 以缩小热点面。新增的 `loginMode: 'url'` 缺省行为不受影响。
+           */
+          await pool.addAccount({
+            id,
+            provider: ASTUDIO.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          const reqAstudio = req as { astudioLoginMethod?: string }
+          const loginMethod = reqAstudio.astudioLoginMethod
+
+          if (loginMethod !== 'web') {
+            let imported: AstudioCredential | undefined
+            try {
+              imported = await astudio.importLocalSession(refName)
+            } catch (error) {
+              if (loginMethod === 'local') {
+                void pool.removeAccount(id).catch(() => {})
+                const reason = error instanceof Error ? error.message : String(error)
+                throw new Error(`导入本机 AStudio 会话失败：${reason}`)
+              }
+              imported = undefined
+            }
+
+            if (imported !== undefined) {
+              await pool.updateAccount(id, {
+                nickname: astudioAccountNickname(imported, id),
+                expiresAt: undefined,
+                refreshable: isAstudioRefreshable(imported),
+              })
+              return { ok: true, value: { accountId: id, loginUrl: '', reused: true } }
+            }
+          }
+
+          // 本地无会话或选择网页登录：启动 AStudio Carrier 载体页服务（三合一：手机短信/账号密码/微信扫码）
+          let astudioStarted: StartedAstudioLoginFlow
+          try {
+            astudioStarted = await startAstudioLoginFlow({
+              product: ASTUDIO,
+              fetcher: astudio.fetchImpl,
+            })
+          } catch (error) {
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 AStudio 网页登录（本地 Carrier Server 启动失败）：${reason}`)
+          }
+
+          pendingAstudioFlowState.set(id, astudioStarted)
+
+          astudioStarted.result
+            .then(async (credential) => {
+              pendingAstudioFlowState.delete(id)
+              try {
+                await astudio.persistLogin(credential, { refName })
+              } catch (error) {
+                const failure = await failLogin(id, error instanceof Error ? error : new Error(String(error)))
+                if (failure !== undefined) {
+                  ctx.logger.warn(`[jet-hub] astudio 凭据回填写入凭据库失败已清理占位账号：${failure}`)
+                }
+                return
+              }
+              try {
+                await pool.updateAccount(id, {
+                  nickname: astudioAccountNickname(credential, id),
+                  expiresAt: undefined,
+                  refreshable: isAstudioRefreshable(credential),
+                })
+              } catch (error) {
+                ctx.logger.warn(`[jet-hub] astudio 回填账号条目失败：${String(error)}`)
+              }
+            })
+            .catch(async (error) => {
+              pendingAstudioFlowState.delete(id)
+              const failure = await failLogin(id, error)
+              if (failure !== undefined) {
+                ctx.logger.warn(`[jet-hub] astudio 本地 Carrier 登录流程异常终止：${failure}`)
+              }
+            })
+
+          return { ok: true, value: { accountId: id, loginUrl: astudioStarted.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -4339,6 +4567,11 @@ AUTOCLAW.id,
 
       case 'account.delete': {
         const req = payload as RpcDeleteAccountRequest
+        const pendingFlow = pendingAstudioFlowState.get(req.accountId)
+        if (pendingFlow !== undefined) {
+          pendingAstudioFlowState.delete(req.accountId)
+          void pendingFlow.close().catch(() => {})
+        }
         await pool.removeAccount(req.accountId)
         return { ok: true, value: undefined }
       }
@@ -4550,6 +4783,23 @@ AUTOCLAW.id,
                   // 这里仍要兜住，否则一次未捕获拒绝会连带跳过后面那行 `delete`。
                 }
                 officeAceExchangeInFlight.delete(req.accountId)
+              })()
+              return { ok: true, value: await task }
+            }
+          }
+          if (entry.provider === ASTUDIO.id) {
+            const pending = pendingAstudioScanState.get(req.accountId)
+            if (pending !== undefined) {
+              const shared = astudioExchangeInFlight.get(req.accountId)
+              if (shared !== undefined) return { ok: true, value: await shared }
+              const task = exchangeAstudioScanLogin(req.accountId, entry, pending)
+              astudioExchangeInFlight.set(req.accountId, task)
+              void (async () => {
+                try {
+                  await task
+                } catch {
+                }
+                astudioExchangeInFlight.delete(req.accountId)
               })()
               return { ok: true, value: await task }
             }

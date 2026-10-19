@@ -23,9 +23,46 @@ function makePool() {
     getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
   } as never
 }
+/**
+ * ★★ 聚合渠道的**显式豁免集**：registry 里 `channel: true` 但**有意不进**
+ *    `AGGREGATE_CHANNELS` 的 provider。
+ *
+ * 「有意不接入」与「漏接」是两回事 —— 前者必须登记**可核实的理由**，并由下面的
+ * 豁免用例逐条**验证**（范式对齐 `tests/helpers/provider-sets.ts` 的 `AUTH_EXEMPT`：
+ * 豁免只能显式列出，不能靠「没登记就算豁免」推定）。
+ *
+ * ## 可测量判据（三条都被下面的豁免验证用例钉住，不是一条口头承诺）
+ *
+ * ① 豁免项必须是 `PROVIDER_REGISTRY` 里真实存在的 id（防拼写错误造成的僵尸豁免）；
+ * ② 它必须确实 `channel: true` —— `channel: false` 的家本来就不进聚合，豁免它
+ *    对这条守卫毫无贡献（那是 `aggregate` 自己的排除方式，不是豁免）；
+ * ③ 行为验证：把 registry 的**全部** channel 都摆成存活路由时，聚合实际拉取的
+ *    那圈里**不得**出现任何豁免项。
+ *
+ * ⚠️ ③ 就是「僵尸豁免」探测器：**将来把某家加进 `AGGREGATE_CHANNELS` 而忘了清空
+ *    本集合 ⇒ 该豁免项变成僵尸 ⇒ 豁免用例立刻变红并点名**，迫使改动者做显式决定，
+ *    而不是让豁免名单越堆越长（那正是本文件要消灭的静默失效形态）。
+ *
+ * ## 当前豁免项
+ *
+ * - `astudio`（2026-10-16 定案，沿用先前四次取证结论）：**有意不进聚合渠道**。
+ *   理由：它的模型目录来自上游动态 catalog，额度/失效语义（HTTP 200 + 业务
+ *   `code=80000` 归「需人工重新登录」终态）与聚合渠道不同；且生产侧已实证
+ *   「只进 `AGGREGATE_CHANNELS` 而不补 `aggregate-expiry.ts` 的
+ *   `WIRED_EXPIRY_PROVIDERS`」是**无效接线**（候选表那道闸门会把它剔掉，症状静默、
+ *   无报错无日志），两处均未补齐 ⇒ 本轮保持不接入。
+ *   留痕位置：`src/aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS` 中 `'accio', 条目
+ *   之后的说明注释（生产侧同步登记了这个决定，两边一致）。
+ *   ⚠️ 将来若要把 astudio 接进聚合，**必须同时**补 `src/aggregate-expiry.ts` 的
+ *   `WIRED_EXPIRY_PROVIDERS`（并同步 `expiry-runtime-parity.spec.ts`），**并清空
+ *   本豁免集** —— 只改一边都会被上面 ③ 拦下。
+ */
+const AGGREGATE_EXEMPT_PROVIDER_IDS: ReadonlySet<string> = new Set(['astudio'])
 
 /**
- * ★★ 聚合层的渠道白名单必须覆盖 registry 里**全部** `channel: true` 的渠道。
+ * ★★ 聚合层的渠道白名单必须覆盖 registry 里 `channel: true` 的**全部**渠道，
+ *    除 {@link AGGREGATE_EXEMPT_PROVIDER_IDS} 里**显式登记、且理由被逐条验证**
+ *    的家（「有意不接入」必须留下可核实的理由，不许靠假设）。
  *
  * ## ⚠️ 为什么要有这一条（真实缺口，2026-10-12 对抗性审计实测）
  *
@@ -50,16 +87,22 @@ function makePool() {
  *（见该常量注释），本用例**只管集合**。
  */
 describe('★★ 聚合渠道白名单与 registry 对齐（漏一家即红并点名）', () => {
-  it('每个 channel 渠道都参与聚合（走真实 listModels 调用记录）', async () => {
+  it('每个 channel 渠道都参与聚合（除显式豁免集；走真实 listModels 调用记录）', async () => {
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
-    const expected = PROVIDER_REGISTRY.filter((d) => d.channel).map((d) => d.id).sort()
+    // ⚠️ 期望集 = registry 的全部 channel **减去**显式豁免集（判据仍是 registry 权威，
+    //    豁免项本身由下面的「豁免理由被验证」用例逐条钉住，不是假设）。
+    const expected = PROVIDER_REGISTRY
+      .filter((d) => d.channel && !AGGREGATE_EXEMPT_PROVIDER_IDS.has(d.id))
+      .map((d) => d.id)
+      .sort()
 
     const seen: string[] = []
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
-        // 让「存活路由」= registry 的全部 channel ⇒ providerIds() 的交集
-        // 就等于 AGGREGATE_CHANNELS 自身，于是调用记录直接暴露该白名单。
+        // 让「存活路由」= 期望集（全部 channel 减豁免）⇒ providerIds() 的交集
+        // 就等于 AGGREGATE_CHANNELS 自身（豁免项本来就不在其中），于是调用记录
+        // 直接暴露该白名单。
         listProviders: () => expected.map((id) => ({ id, name: id })),
         listModels: async (provider: string) => {
           seen.push(provider)
@@ -78,6 +121,52 @@ describe('★★ 聚合渠道白名单与 registry 对齐（漏一家即红并�
       'AGGREGATE_CHANNELS 与 registry 漂移：左侧多出 = 白名单里有僵尸项；'
       + '右侧多出 = registry 里有渠道没进聚合（它的模型永不可见，且**静默**）',
     ).toEqual(expected)
+  })
+  it('★ 豁免项的豁免**理由**被验证（不是被假设）：channel:true 但确实不在聚合里', async () => {
+    const { PROVIDER_REGISTRY, descriptorOf } = await import('../../src/provider-registry.js')
+    const allChannels = PROVIDER_REGISTRY.filter((d) => d.channel).map((d) => d.id)
+    // 判据 ① + ②：豁免项必须真实存在，且确实是 channel:true。
+    for (const id of AGGREGATE_EXEMPT_PROVIDER_IDS) {
+      const descriptor = descriptorOf(id)
+      expect(descriptor, `豁免集里的 ${id} 不在 PROVIDER_REGISTRY 里（僵尸豁免项）`).toBeDefined()
+      expect(
+        descriptor?.channel,
+        `豁免集里的 ${id} 并不是 channel:true ⇒ 「不接入聚合」不需要豁免，本条登记无理由`,
+      ).toBe(true)
+    }
+    // 判据 ③：**行为**验证（和上面那条同一手法，但路由集摆成**全部** channel，
+    //    于是「白名单里悄悄多了豁免项」这一侧会被看见 —— 上面那条把它从期望集
+    //    里减掉了，看不见这个方向）。
+    const seen: string[] = []
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => allChannels.map((id) => ({ id, name: id })),
+        listModels: async (provider: string) => {
+          seen.push(provider)
+          return [{ id: 'm1', name: 'M1' }]
+        },
+        resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+    await adapter.listModels(AGGREGATE_PROVIDER)
+    const seenSet = new Set(seen)
+    for (const id of AGGREGATE_EXEMPT_PROVIDER_IDS) {
+      expect(
+        seenSet.has(id),
+        `${id} 登记为「有意不进聚合」的豁免项，却出现在聚合拉取的渠道里 ⇒ 白名单已` +
+        `接入它、豁免集忘了清空（僵尸豁免项）。接入聚合时请同步补 ` +
+        `src/aggregate-expiry.ts 的 WIRED_EXPIRY_PROVIDERS 并清空本豁免集`,
+      ).toBe(false)
+    }
+    // 反向防恒真：豁免集非空，且必须是 channel 全集的**真子集**。
+    expect(AGGREGATE_EXEMPT_PROVIDER_IDS.size).toBeGreaterThan(0)
+    expect(
+      AGGREGATE_EXEMPT_PROVIDER_IDS.size,
+      '豁免集不应等于 channel 全集 —— 那会让上面两条一起变成恒真断言',
+    ).toBeLessThan(allChannels.length)
   })
 })
 

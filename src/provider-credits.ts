@@ -74,6 +74,7 @@ import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js'
 import type { ModelscopeCredential } from './modelscope.js'
 import { MODELSCOPE } from './modelscope-product.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
+import { fetchAstudioBalanceDetailed, claimDaily } from './astudio-credits.js'
 import { fetchAutoclawBalanceDetailed, claimAutoclawDailyQuota } from './autoclaw-credits.js'
 import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
@@ -90,6 +91,7 @@ import {
 import type { ProviderCredits } from './provider-runtime.js'
 import type { CodeArtsCredential, RpcCreditsBalanceExtra } from './types.js'
 import type { AccioCredential } from './accio.js'
+import type { AstudioCredential } from './astudio.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import type { ClineCredential } from './cline.js'
 import type { GeminiCredential } from './gemini.js'
@@ -451,6 +453,28 @@ export function createProviderCredits(
     accio: {
       fetchBalanceDetailed: async (credential) =>
         await fetchAccioBalanceDetailed(credential as AccioCredential),
+    },
+
+    /**
+     * AStudio（讯飞 AstronStudio）：额度来自账号后端
+     * `GET /xingchen-studio/points/balance`，只认 Cookie 的 ssoSessionId。
+     *
+     * ⚠️ 同样**必须用 `fetchBalanceDetailed`**（不是 `fetchBalance`）：三类失败的
+     * 用户动作完全不同 —— 会话失效（HTTP 恒 **200** + `code=80000`，唯一出路是去
+     * 客户端**人工重登**，实测无程序化续期接口）/ 服务不可用（可重试，**不得**报成
+     * 需重登，那会让用户白重登一次）/ 响应里没有 `totalBalance`（上游形状变了）。
+     * 查不到时由 `astudio-credits.ts` 返回 `null` + 原因，**绝不写成 0**。
+     *
+     * ⚠️ **刻意不提供 `claim`**：AStudio 没有签到端点，能力矩阵里
+     * `dailyCheckin: false` ⇒ 客户端根本不渲染「一键领取积分」，与 accio / raccoon
+     * 同形；给一句 `claimUnavailableReason` 只会多出一个永远点不动的入口。
+     */
+    astudio: {
+      fetchBalanceDetailed: async (credential) =>
+        await fetchAstudioBalanceDetailed(credential as AstudioCredential),
+      claim: async (credential) =>
+        await claimDaily(credential as AstudioCredential),
+      precheckStatus: false,
     },
 
     /**

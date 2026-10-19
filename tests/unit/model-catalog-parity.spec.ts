@@ -78,6 +78,7 @@ import { QoderAdapter } from '../../src/qoder-adapter.js'
 import { RaccoonAdapter } from '../../src/raccoon-adapter.js'
 import { TraeAdapter } from '../../src/trae-adapter.js'
 import { ZcodeAdapter } from '../../src/zcode-adapter.js'
+import { AstudioAdapter } from '../../src/astudio-adapter.js'
 import { fallbackToEntry } from '../../src/minimax.js'
 import { MINIMAX, MINIMAX_INTL } from '../../src/minimax-product.js'
 import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
@@ -641,6 +642,16 @@ id: 'autoclaw',
         accountPool: { opencodeProxyFor: () => undefined } as never,
       } as never),
     },
+    {
+      id: 'astudio',
+      make: () => new AstudioAdapter({
+        ...NO_CRED,
+        // ⚠️ **不注入 fetchRemoteModels、也不注入 auth**：astudio-adapter.ts 的
+        //    loadModels 在 fetcher 为 undefined 时 warn 后**直接**回退
+        //    product.fallbackModels（ASTUDIO 兜底表 6 条），一个请求都不发 ⇒ 本条目
+        //    与上面的 accio 同款是零网络的。
+      } as never),
+    },
   ]
 
   /**
@@ -689,14 +700,14 @@ id: 'autoclaw',
     //    `channel: false` 的聚合器，不在此列）。
     //    ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 14 → 16。
     //    ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：16 → 17。
-    //    ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：17 → 18。
+    //    ⚠️ 2026-10-16 astudio 并入（goal 302 接线）：17 → 18。
+    //    ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：18 → 19；
+    //    同日 **本 fork** 并入 modelscope（魔搭）：19 → 20。
+    //    ⚠️ 合并上游时**不要**改回 17（那会让 modelscope 失去本段全部对拍）。
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope ⇒ 17 → 18；
-    //    2026-10-17 加 autoclaw（AutoClaw/智谱）⇒ 18 → 19。
-    //    合并上游时**不要**改回 17（那会让 modelscope 失去本段全部对拍）。
-    expect(CASES).toHaveLength(19)
+    expect(CASES).toHaveLength(20)
   })
 
   /**
