@@ -6246,9 +6246,14 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
  *
  * ⚠️ **AutoClaw**（智谱，2026-10-17 审计 P0 修复）：同样已进
  * `WIRED_EXPIRY_PROVIDERS` ⇒ 同改，理由同上。
+ *
+ * ⚠️ **AStudio**（讯飞 AstronStudio，2026-10-20）：`/points/balance` 的
+ * member / buy / activity 三池各带 `*NextExpireTime` ⇒ 已进
+ * `WIRED_EXPIRY_PROVIDERS`，这里必须同改（漏改会让只登了 AStudio 的账号在
+ * 聚合面板看到「请先在……登录账号」这句错话）。
  */
 const AGG_WIRED_CHANNEL_LABELS =
-  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace / modelscope / autoclaw';
+  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace / modelscope / autoclaw / astudio';
 
 /**
  * 「按临期排序」模式下面板**自动重探**临期顺序的间隔（用户 2026-10-16 从 5 分钟改为 **2 分钟**）。

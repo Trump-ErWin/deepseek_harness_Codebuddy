@@ -63,6 +63,11 @@ import { AUTOCLAW } from './autoclaw-product.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import type { AccioCredential } from './accio.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
+// ⚠️ AStudio（讯飞 AstronStudio）：三池各带 `*NextExpireTime` ⇒ 可精确折算
+//    （2026-10-20 新增）。判据链与 autoclaw 同形，只是时间字段确实存在。
+import { fetchAstudioBalanceDetailed } from './astudio-credits.js'
+import { ASTUDIO } from './astudio-product.js'
+import type { AstudioCredential } from './astudio.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
 import { fetchSubscriptionSummary } from './officeace-auth.js'
 import { officeaceBreakerOpen } from './officeace-credential-health.js'
@@ -210,6 +215,20 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   //    + 折算原语（后两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑
   //    `apply()` 锁一致）。
   'autoclaw',
+  // ⚠️ **AStudio**（讯飞 AstronStudio，2026-10-20）：折算原语见 `astudioExpiry`。
+  //    三池（会员 / 购买 / 赠送）各下发 `*NextExpireTime`（不带时区的本地时间串），
+  //    已由 `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到
+  //    `packages[].deductionEndTime`（毫秒）⇒ 与 buddy 系同一套
+  //    `sharedPackageExpiry` 折算即可，不需要自写原语。
+  //    ⚠️⚠️ **这是该陷阱的第 5 次复发**（cline → accio → officeace → autoclaw
+  //    → astudio），症状恒定**静默**：PR 只加了 `aggregate-adapter.ts` 的
+  //    `AGGREGATE_CHANNELS`（模型层归并会发生、看起来接好了），而**决定候选表
+  //    可见性的是本表** —— 漏加它 ⇒ 折算恒 `UNUSABLE`，用户在聚合轮换列表里
+  //    **永远看不到 astudio**，且**无报错、无日志**。
+  //    ⚠️ 三处必须同改：本表 + `provider-expiry.ts` 的 `createProviderExpiry()`
+  //    + 折算原语（后两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑
+  //    `apply()` 锁一致）。
+  'astudio',
 ])
 
 /**
@@ -1008,6 +1027,49 @@ export async function autoclawExpiry(
     async () => {
       const result = await fetchAutoclawBalanceDetailed(credential, { product })
       // ⚠️ 同上：`fetchBalanceDetailed` 的失败形态是 `balance: null + error`，
+      //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
+      return result.balance
+    },
+  ))
+}
+
+/**
+ * astudio（讯飞 AstronStudio）：三池各带到期时间 ⇒ **可精确折算**，无已知代价。
+ *
+ * ## 与 autoclaw 的差别（为何这里能算出真实时刻）
+ *
+ * autoclaw 的钱包报文里**没有任何时间字段**（只有流水批次才带 `deductionEndTime`），
+ * 故它只能「有余额即 `NEVER`」。astudio 的 `/points/balance` 实测直接下发
+ * `{member,buy,activity}NextExpireTime`（形如 `"2026-11-20T01:50:14"`，
+ * **不带时区的本地时间串**），已由 `astudio-credits.ts` 的
+ * `astudioLocalTimeMs` 用 `Date.parse(raw.replace(' ', 'T'))` 归一化到
+ * `packages[].deductionEndTime`（毫秒）⇒ 直接复用
+ * `sharedPackageExpiry`（取**最早**到期的那一包 = `Math.min`）。
+ *
+ * ## 为什么走 `sharedPackageExpiry` 而不是自己遍历
+ *
+ * 它把三件容易写错的事收敛在一处：①异常按 `isAbortError` 分流（用户取消要
+ * 继续抛，不能吞成 `UNUSABLE`）；②`null` ⇒ `UNUSABLE`；③**所有**候选都折算
+ * 失败时（`anyConverted === false`）返回 `UNUSABLE` 而不是 `NEVER`
+ * —— `NEVER` 意味着「永不过期」，会被聚合排在最后但仍然**可选中**，
+ * 那是把「查不到」谎报成「长期有效」（本仓库红线）。
+ *
+ * ## 为什么必须走 `cachedBalance`
+ *
+ * 聚合每轮折算会对同一账号反复提问；没有共享读数就会白发大量重复请求
+ * （与 buddy / trae / modelscope / autoclaw 同款理由）。
+ */
+export async function astudioExpiry(
+  credential: AstudioCredential,
+  product: typeof ASTUDIO,
+  /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+  cached?: () => Promise<CreditBalance | null | undefined>,
+): Promise<number> {
+  return sharedPackageExpiry(() => fetchBalanceWithCache(
+    cached,
+    async () => {
+      const result = await fetchAstudioBalanceDetailed(credential, { product })
+      // ⚠️ 同 autoclaw：`fetchBalanceDetailed` 的失败形态是 `balance: null + error`，
       //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
       return result.balance
     },

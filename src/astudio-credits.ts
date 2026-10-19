@@ -80,6 +80,27 @@ function readAstudioLocalTime(source: Record<string, unknown>, key: string): str
   return typeof value === 'string' ? value : ''
 }
 
+/**
+ * 把 `*NextExpireTime` 的**不带时区本地时间串**折算成毫秒时间戳。
+ *
+ * ## 为什么必须是 `日期 + T` 而不是 `Date.parse(原串)`
+ *
+ * 实测上游下发的是 `"2026-11-20T01:50:14"`（无 `Z`、无 `+08:00`）。ES 规范对这种
+ * **仅日期时间**形式的解析是「按**本地时区**解释」（`date-time` 形式无偏移时取本地），
+ * 而 `Date.parse("2026-11-20 01:50:14")`（空格分隔）在部分引擎里按 UTC 解释。
+ * ⇒ 统一先 `replace(' ', 'T')` 再 `Date.parse`，两条形态走同一条判据
+ *（与 `plugin-src/client/credit-expiry.ts` 的 `packageExpiryMs` 逐字同口径）。
+ *
+ * ⚠️ **解析不出来就返回 `undefined`，绝不编造一个时刻**（本仓库红线）。
+ *   上游若改成带偏移的 ISO（`...Z`），`Date.parse` 同样能认，无需改动。
+ */
+function astudioLocalTimeMs(source: Record<string, unknown>, key: string): number | undefined {
+  const raw = readAstudioLocalTime(source, key)
+  if (raw.length === 0) return undefined
+  const ms = Date.parse(raw.replace(' ', 'T'))
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined
+}
+
 /** 上游文案可能不在 `message` 而在 `desc` —— 由 parseAstudioEnvelope 归一，这里只兜底。 */
 function failDetail(error: string): ProviderBalanceDetail {
   return { balance: null, error }
@@ -124,6 +145,10 @@ export function buildAstudioBalance(data: Record<string, unknown>): CreditBalanc
     if (remaining === undefined) return // 该池不下发 ⇒ 不臆造条目
     const poolTotal = readAstudioInt(data, totalKey) ?? remaining
     const expiredTime = readAstudioLocalTime(data, expireKey)
+    // ⚠️ `expiredTime` 是**字符串**，而客户端的 `splitCreditsByExpiry` 只认
+    //    `deductionEndTime`（毫秒数）—— 缺它就会把整个池算成「永久积分」。
+    //    两者都给：`expiredTime` 供 tooltip 原样显示，`deductionEndTime` 供分档。
+    const deductionEndTime = astudioLocalTimeMs(data, expireKey)
     packages.push({
       name,
       unit: ASTUDIO_CREDIT_UNIT,
@@ -135,8 +160,10 @@ export function buildAstudioBalance(data: Record<string, unknown>): CreditBalanc
       cycleStartTime: '',
       cycleEndTime: '',
       // ⚠️ `*NextExpireTime` **不在官方 Schema 内**（Effect.Struct 会裁未知字段），
-      // 且是**不带时区的本地时间串** ⇒ 原样透出、不 Date.parse、不做数学比较。
+      // 且是**不带时区的本地时间串** ⇒ `expiredTime` 原样透出（展示用），
+      // 数学比较统一走 `deductionEndTime`（上面的归一化值）。
       expiredTime,
+      ...(deductionEndTime === undefined ? {} : { deductionEndTime }),
     })
   }
 
@@ -147,6 +174,7 @@ export function buildAstudioBalance(data: Record<string, unknown>): CreditBalanc
   const sparkBalance = readAstudioInt(data, 'sparkTotalBalance')
   if (sparkBalance !== undefined) {
     const sparkTotal = readAstudioInt(data, 'sparkTotalAmount') ?? sparkBalance
+    const sparkDeductionEndTime = astudioLocalTimeMs(data, 'sparkNextExpireTime')
     packages.push({
       name: '星火积分（独立池，不参与主池合计）',
       unit: ASTUDIO_CREDIT_UNIT,
@@ -157,6 +185,7 @@ export function buildAstudioBalance(data: Record<string, unknown>): CreditBalanc
       cycleStartTime: '',
       cycleEndTime: '',
       expiredTime: readAstudioLocalTime(data, 'sparkNextExpireTime'),
+      ...(sparkDeductionEndTime === undefined ? {} : { deductionEndTime: sparkDeductionEndTime }),
     })
   }
 
@@ -265,6 +294,36 @@ export async function fetchAstudioBalanceDetailed(
     return failDetail('积分查询失败：响应未包含余额字段')
   }
   return { balance }
+}
+
+/**
+ * 供 `BuddyBalanceSelector` 用的 `fetchBalance`（**丢失原因**的薄封装）。
+ *
+ * ## 为什么需要它
+ *
+ * `BuddyBalanceSelector` 的 `deps.fetchBalance` 契约是
+ * `(credential, product) => Promise<CreditBalance | null>` —— 只回余额、不回原因
+ * （分档逻辑对「为什么查不到」不感兴趣，一律归入最后一档）。
+ * 而本文件的权威入口 {@link fetchAstudioBalanceDetailed} 回的是
+ * `{ balance, error? }`，故这里把它**压平成 null**。
+ *
+ * ⚠️ **失败原因不要在这里丢掉就完事**：`fetchAstudioBalanceDetailed` 的三条失败
+ * 路径（会话失效 / 服务不可用 / 形状不认识）对用户动作完全不同。选号器这条路上
+ * 确实只需要 null（它会把该号归入「查不到」档，其他号继续用）；但面板上
+ * 直接展示余额时走的仍是 `fetchAstudioBalanceDetailed`，原因在那里保留。
+ *
+ * ⚠️ **不要在本函数里再写一份失败分类**：那是 `fetchAstudioBalanceDetailed` 的职责，
+ * 两处各写一遍必然漂移（本仓库红线）。
+ */
+export async function fetchAstudioCreditBalance(
+  credential: AstudioCredential,
+  product?: AstudioProduct,
+): Promise<CreditBalance | null> {
+  const result = await fetchAstudioBalanceDetailed(
+    credential,
+    product === undefined ? {} : { product },
+  )
+  return result.balance
 }
 
 // ── 每日奖励 / 签到能力 ──

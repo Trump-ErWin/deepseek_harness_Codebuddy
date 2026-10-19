@@ -472,6 +472,31 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    到期时间（`member` / `buy` / `activity` / `spark` 各自的 `*NextExpireTime`）
     //    ⇒ 数据本来就齐，此前只是没声明。
     creditPackages: true,
+    // ⚠️ **2026-10-20 补登记：三档分档（永久/长期/临期）此前完全没生效**。
+    //
+    // `/points/balance` 实测**确实下发**到期时间：`activityNextExpireTime`
+    // = `"2026-11-20T01:50:14"`（会员/购买两池同形，字段名 `*NextExpireTime`）。
+    // 但漏登记本字段会让 `jet-hub-rpc.ts` 不回传 `windowDays`
+    // （判据 `descriptorOf(req.provider)?.usesExpiryWindow === true`），
+    // 客户端 `splitCreditsByExpiry` 拿到 `windowDays === undefined` ⇒
+    // `normalizeWindowDays2` 返回 `null` ⇒ **整个分档返回 `null`**
+    // ⇒ 胶囊只剩「合计」，永久绿/长期黄/临期红三行一个都不渲染。
+    // ⚠️ 漏登记的症状是**静默的**（无报错、无日志），与 officeace / autoclaw
+    //    当初同一根因；新增带到期时间的渠道时必须一并登记本字段。
+    usesExpiryWindow: true,
+    // ⚠️ **2026-10-20 补登记：永久积分锁定**。
+    //
+    // 判据同 buddy 系（`permanentLock` ⇒ Jet Hub 账号卡片出现「锁定永久积分」开关，
+    // 锁后 `credential-resolver.ts` 的 `allowPermanent` 变 false ⇒ 只有「窗口内到期」
+    // 的积分包可消耗，长期/永久积分被保住）。astudio 的三个池**各自带到期时间**
+    // ⇒ 与 buddy 系同形，该语义可如实成立（不是假开关）。
+    // ⚠️ 与 `usesExpiryWindow` / `WIRED_EXPIRY_PROVIDERS` / `createProviderExpiry()`
+    //    的 `astudioExpiry` 是**四件不同的事**，不能互相替代：
+    //    · `usesExpiryWindow` ⇒ 面板三行分档
+    //    · `permanentLock`     ⇒ 锁定开关 + 选号时的 `allowPermanent`
+    //    · `WIRED_EXPIRY_PROVIDERS` ⇒ 聚合候选可见性
+    //    · `astudioExpiry`     ⇒ 聚合时如何折算到期时刻
+    permanentLock: true,
     settingsNamespace: 'llm-astudio',
     channel: true,
   },
