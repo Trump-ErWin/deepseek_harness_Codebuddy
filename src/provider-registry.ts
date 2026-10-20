@@ -472,6 +472,16 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    到期时间（`member` / `buy` / `activity` / `spark` 各自的 `*NextExpireTime`）
     //    ⇒ 数据本来就齐，此前只是没声明。
     creditPackages: true,
+    // ⚠️ **`usesExpiryWindow: true`**（2026-10-21 用户报障「星火 25000 不显示」补）：
+    //    本家四个池**都带到期字段**（`member` / `buy` / `activity` / `spark` 各自的
+    //    `*NextExpireTime`，`buildAstudioBalance` 已逐包解析）⇒ 与「按到期分桶」
+    //    语义天然吻合。此前未登记 ⇒ RPC 不回传 `windowDays` ⇒ 客户端
+    //    `splitCreditsByExpiry` 对 `undefined` 返回 `null` ⇒ **整条分桶行静默不渲染**
+    //    （该坑的判据注释在 `jet-hub-rpc.ts:5919`，当时只覆盖 buddy 系四家）。
+    //    ⚠️ 与 `creditPackages` 是**两件事**：后者决定「hover 是否列包」，
+    //    前者决定「积分行是否按到期分档」—— 缺前者时 astudio 连
+    //    「1/4 个资源包有效」都不显示（`all.length > 1` 那条被 expiryParts 空值短路）。
+    usesExpiryWindow: true,
     settingsNamespace: 'llm-astudio',
     channel: true,
   },

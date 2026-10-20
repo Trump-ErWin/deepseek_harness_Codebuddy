@@ -151,14 +151,15 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(locked).toEqual(['buddy', 'lobsterai', 'loomy', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('usesExpiryWindow 恰好是 7 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17 加入）', () => {
+  it('usesExpiryWindow 恰好是 8 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17、astudio 2026-10-21 加入）', () => {
     const win = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
     // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`，未过期批次
     //    之和 == total_balance（守恒实测）⇒ 批次包带 `deductionEndTime` 可分三档。
     // ⚠️ 2026-10-20 加 autoclawintl：与 autoclaw **同源**（同一份 credits 实现），
     //    实测国际站批次同样带 `deductionEndTime`（3000→10/21、10000→10/27）。
-    expect(win).toEqual(['autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ 2026-10-21 加 astudio：四个池都带 `*NextExpireTime`（详见 registry 该条目）。
+    expect(win).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
   it('rateLimit === false 恰好是 7 家（astudio 2026-10-18 加入；accio 2026-10-18 退出）', () => {
