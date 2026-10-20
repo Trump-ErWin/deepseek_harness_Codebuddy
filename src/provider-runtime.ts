@@ -634,6 +634,32 @@ export interface ProviderCredits {
     run: GrowthRunOptions,
     call: ProviderCallContext,
   ): Promise<RpcBuddyGrowthAccountResult | undefined>
+  /**
+   * 签到收尾的**附加提示**（可选）。
+   *
+   * 与 {@link afterClaim} 的区别：`afterClaim` **只在 `runTasks === true` 时**运行
+   *（成长中心一轮 90~270s，默认关闭）；本钩子**每次签到都会跑**，语义是
+   *「签到之后顺带做一件小事，并给用户一句话说明」。
+   *
+   * ## 为什么需要它（2026-10-20 用户报障）
+   *
+   * TRAE 的「1024 打卡抽奖」应在**点签到按钮**时触发。挂在 `claim` 内部会
+   * **几乎永不触发**：本家 `precheckStatus: true`，今天已签到就直接回
+   * `already-claimed`、根本不调 `claim`（而「已签到」恰恰最该抽奖）。
+   *
+   * ## 契约
+   * - 返回字符串 ⇒ 追加到该账号 `outcome.message`；返回 `undefined` ⇒ 不加任何东西
+   *  （**不该做的事必须回 `undefined`**，报出来是噪声）；
+   * - **永不抛**：失败不得影响签到结果（本仓库有两轮「登录成功却因记账失败被报成
+   *   失败」的事故史）。
+   *
+   * ⚠️ 只有 trae 注入；其余 provider 不传 ⇒ 行为逐字不变。
+   */
+  afterClaimNote?(
+    credential: unknown,
+    entry: ProviderAccountEntry,
+    call: ProviderCallContext,
+  ): Promise<string | undefined>
 }
 
 /**
