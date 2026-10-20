@@ -2958,9 +2958,22 @@ function ProviderPanel({ provider, rpcCall }) {
    * 前者回答「弹窗内容长什么样」，后者回答「要不要弹」。
    * 两者都必须由 `provider` 驱动，任一处漏改都会得到「弹窗内容与判据不匹配」。
    */
+  /**
+   * 「新建账号」弹窗里问的是**登录区域**（accio）而不是**登录渠道**（zcode）。
+   *
+   * ⚠️ 写成**正向**判据，与本仓库「反对排除法」的约定一致；
+   * 且它与 `newAccountAsksChannel(provider)` 是**两件事**：
+   * 前者回答「弹窗内容长什么样」，后者回答「要不要弹」。
+   * 两者都必须由 `provider` 驱动，任一处漏改都会得到「弹窗内容与判据不匹配」。
+   */
   const accioDialog = provider === 'accio';
   const astudioDialog = provider === 'astudio';
-  const autoclawDialog = provider === 'autoclaw';
+  // ⚠️⚠️ **必须同时覆盖国际版**（2026-10-20 修）：原先是 `provider === 'autoclaw'`，
+  //    漏掉 `autoclawintl` ⇒ 国际版点「新建账号」弹的是**「添加 ZCode 账号」**
+  //    窗口（BigModel / z.ai 渠道下拉）—— 与本次要做的「一键导入」毫无关系。
+  //    这是「autoclaw 系按 id 逐个判」的**第 4 次复发**（RPC 分支 / refName /
+  //    new-account 载荷 / 这里），每次症状都不同且都不报错。
+  const autoclawDialog = provider === 'autoclaw' || provider === 'autoclawintl';
   // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
   // 有成长中心的 provider 才传 runTasks（见 GROWTH_TASK_PROVIDERS 的注释：
@@ -6223,20 +6236,28 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
 }
 
 /**
- * 聚合面板空态文案里那句「已接入临期折算的渠道」名单。
+ * 聚合面板空态文案里那句「已接入临期折算的渠道」的 **provider id 名单**。
  *
- * ⚠️ 这是 `src/aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS` 的**手抄副本**
- *（客户端 bundle 是独立 entry、**不** import 宿主模块 —— 见 `build.mjs`）。
+ * ⚠️ 它是 `src/aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS` 的**手抄副本**
+ * （客户端 bundle 是独立 entry、**不** import 宿主模块 —— 见 `build.mjs`）。
  * 加渠道时**必须同改这里**：2026-10-13 接入 `accio` / `officeace` 之后没人回头改，
  * 于是**只登了这两家**的用户会看到「请先在……登录账号」这句**错话** ——
  * 他们其实已经登录了，只是名单里没有那两家。
  *
+ * ⚠️⚠️ **本名单存 id，不存显示名**（2026-10-20 改）：
+ *    旧形态是 `AGG_WIRED_CHANNEL_LABELS = 'buddy / workbuddy / …'`（一份手抄的
+ *    **显示名**），它与后端存 id 的清单**天然不同构** —— 之前靠 11 家的 label
+ *    恰好等于 id 蒙混过关，一遇到 label 与 id 不同的 provider（如 `autoclawintl`
+ *    → 「AutoClaw (国际版)」）就必然分叉，守卫永远对不上。
+ *    ⇒ 现在名单只存 id，**显示名一律经 `providerLabel(id)` 现查**（registry 是
+ *      唯一真相源）⇒ 改名 / 新增 provider 时文案**零改动**自动正确。
+ *
  * 两边的一致性由 `tests/unit/aggregate-panel-logic.spec.ts` 末尾的 ★★ 守卫锁成
  * **集合相等**（判据 fail-closed：抽不到这份名单就报红，改名/重构不会让它静默失效）。
  *
- * ⚠️⚠️ **字面量必须紧跟在 `=` 之后（中间不得插注释/空行以外的东西）**：
- * 那条守卫用正则 `const AGG_WIRED_CHANNEL_LABELS =\s*\n?\s*'([^']*)'`
- * 抽取名单 —— 在 `=` 与字面量之间插多行注释会让它**抽不到**从而报红。
+ * ⚠️⚠️ **数组字面量必须紧跟在 `=` 之后（中间不得插注释/空行以外的东西）**：
+ * 那条守卫用正则 `/const AGG_WIRED_CHANNEL_IDS = \[([^\]]*)\]/` 抽取名单 ——
+ * 在 `=` 与字面量之间插多行注释会让它**抽不到**从而报红。
  * ⚠️ 曾因此踩过一次（把 modelscope 的说明写在 `=` 与字符串之间）。
  * ⇒ 渠道相关的说明写在这段 JSDoc 里，别写到常量正上方。
  *
@@ -6246,9 +6267,20 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
  *
  * ⚠️ **AutoClaw**（智谱，2026-10-17 审计 P0 修复）：同样已进
  * `WIRED_EXPIRY_PROVIDERS` ⇒ 同改，理由同上。
+ *
+ * ⚠️ **AutoClaw 国际版**（`autoclawintl`，2026-10-20）：与国内版一起进了
+ * `WIRED_EXPIRY_PROVIDERS` ⇒ 同改。它的**显示名与国内版不同**
+ * （「AutoClaw (国际版)」），而 `providerLabel()` 会按 id 现查 registry ⇒ 自动取到
+ * 正确的名字，**不需要在这里区分**。
+ *
+ * ⚠️⚠️ **本清单存的是 provider id，不是显示名** —— 显示名一律经
+ * `providerLabel(id)` 现查（L192）。这样「id → label」只有一处真相源
+ * （registry），本名单与自己都不抄名字 ⇒ 改名/新增 provider 时**零改动**。
  */
-const AGG_WIRED_CHANNEL_LABELS =
-  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace / modelscope / autoclaw';
+const AGG_WIRED_CHANNEL_IDS = [
+  'buddy', 'workbuddy', 'loomy', 'codearts', 'zcode', 'lobsterai', 'trae',
+  'accio', 'officeace', 'modelscope', 'autoclaw', 'autoclawintl',
+];
 
 /**
  * 「按临期排序」模式下面板**自动重探**临期顺序的间隔（用户 2026-10-16 从 5 分钟改为 **2 分钟**）。
@@ -6926,13 +6958,14 @@ function AggregatePanel({ rpcCall }) {
   // ── 空态 ──
   // ⚠️ 文案**不得写死渠道数量**（那类快照必然腐坏，仓库既有教训：接入 accio/officeace
   //    后手抄名单没人回头改，只登那两家的用户会看到「请先登录」这句错话）。
-  //    这里继续复用 `AGG_WIRED_CHANNEL_LABELS`（它的集合相等由用例锁死）。
+  //    这里从 `AGG_WIRED_CHANNEL_IDS` 现查 `providerLabel()` —— id 名单的集合相等
+  //    由用例锁死；**名字不抄**（registry 是唯一真相源）⇒ 改名 / 新增均零改动。
   // ⚠️ 2026-10-15 补上「或手工打开」这条出路：未接入渠道的账号**不会**让模型自动
   //    进轮换，用户若只登录了那几家，看到的仍是空态 —— 必须告诉他第二步做什么。
   models !== null && models.length === 0
     ? React.createElement('div', { className: 'dim-jh-aggEmpty' },
         '当前没有可聚合的模型：请先在至少一个已接入临期折算的渠道'
-        + '（' + AGG_WIRED_CHANNEL_LABELS + '）登录账号；'
+        + '（' + AGG_WIRED_CHANNEL_IDS.map(id => providerLabel(id)).join(' / ') + '）登录账号；'
         + '或者登录其它渠道后，在本页展开模型、把候选逐条手工打开。')
     : null,
   // ── 模型列表（**平铺**，全局按候选渠道数降序；不再有厂商分组标题）──

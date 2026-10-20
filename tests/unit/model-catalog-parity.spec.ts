@@ -64,6 +64,8 @@ import { createModelCatalog, type CatalogEntry } from '../../src/model-catalog.j
 import { BuddyAdapter } from '../../src/buddy-adapter.js'
 import { AccioAdapter } from '../../src/accio-adapter.js'
 import { AutoclawAdapter } from '../../src/autoclaw-adapter.js'
+// ⚠️ AutoClaw 国际版（2026-10-20）：与国内同一适配器类，只差 product。
+import { AUTOCLAW_INTL } from '../../src/autoclaw-product.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import { ModelscopeAdapter } from '../../src/modelscope-adapter.js'
 import { ClineAdapter } from '../../src/cline-adapter.js'
@@ -617,6 +619,19 @@ id: 'autoclaw',
       } as never),
     },
     {
+      // ⚠️ AutoClaw **国际版**（2026-10-20）：与国内版**共用同一个适配器类**，
+      //    只有 `product` 不同 ⇒ 目录同样来自编译期兜底表
+      //    （`AUTOCLAW_INTL.fallbackModels`，与国内同一份）。
+      //    同样注入恒有凭据，避免本段对它退化成恒真。
+      id: 'autoclawintl',
+      make: () => new AutoclawAdapter({
+        product: AUTOCLAW_INTL,
+        credentialProvider: async () => ({
+          access_token: 'at', refresh_token: 'rt', expires_at: 4102444800000,
+        }),
+      } as never),
+    },
+    {
       // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
       // ⚠️ **不注入 `fetchRemoteCatalog`**：那会走远端拉取（真发网络）。
       //    不注入时 `loadModelscopeCatalog` 回退 `MODELSCOPE_FALLBACK_MODELS`，
@@ -703,11 +718,12 @@ id: 'autoclaw',
     //    ⚠️ 2026-10-16 astudio 并入（goal 302 接线）：17 → 18。
     //    ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：18 → 19；
     //    同日 **本 fork** 并入 modelscope（魔搭）：19 → 20。
+    // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：20 → 21。
     //    ⚠️ 合并上游时**不要**改回 17（那会让 modelscope 失去本段全部对拍）。
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    expect(CASES).toHaveLength(20)
+    expect(CASES).toHaveLength(21)
   })
 
   it('★★ `catalog` 具备 `refresh` 的家，适配器上必须**存在** `refresh` 成员（转发接线）', () => {

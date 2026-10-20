@@ -10,6 +10,7 @@ import { execFileSync } from 'node:child_process'
 import {
   AUTOCLAW,
   AUTOCLAW_SOURCE_ID,
+  AUTOCLAW_CLIENT_VERSION,
   type AutoclawProduct,
 } from './autoclaw-product.js'
 import {
@@ -19,6 +20,7 @@ import {
   AUTOCLAW_REQUEST_TIMEOUT_MS,
   calculateAutoclawSign,
   cleanBearerToken,
+  readUserIdFromJwt,
   autoclawExpiresAtMs,
   autoclawAccessTokenExpiresAtMs,
   type AutoclawCredential,
@@ -26,6 +28,192 @@ import {
 
 export const AUTOCLAW_SEND_CODE_PATH = '/userapi/v1/agent-send-code'
 export const AUTOCLAW_LOGIN_PATH = '/userapi/v1/agent-login'
+
+// ── Z.ai OAuth（**仅国际版**，2026-10-20 逆向+实测） ─────────────────────
+//
+// 国际版客户端界面只给「使用 Z.ai 继续」/ Google，但**后端照样接受短信登录**
+// （实测 `/userapi/v1/agent-send-code` 在国际基址返回 `code=0 SUCCESS`）。
+// 问题在于**国际版账号是邮箱+OAuth 创建的、没绑手机号**
+// （`account-profile.json`: `phone: null`），且**没有绑手机端点**
+// （`agent-bind-phone` / `bind-phone` 等全 404）⇒ 短信这条路对国际账号不可用。
+//
+// ⇒ 国际版必须走 Z.ai OAuth。三个事实（全部实测/逆向）：
+//
+// | 项 | 值 | 来源 |
+// |---|---|---|
+// | 授权页 | `https://chat.z.ai/auth` | 客户端 `ZAI_OAUTH_HOST_BY_ENVIRONMENT.overseas_release` |
+// | `client_id` | `client_EnD0QI8bLRFT8cciLp389Q` | 两次授权 URL 逐字节相同 ⇒ 固定值 |
+// | 换 token | `POST /userapi/overseasv1/zai-oauth-login` | 客户端 `exchangeOAuth` |
+// | `state.dh` | `SHA256(deviceId)` | **已破解**（实测命中） |
+// | `state.nh` | 未知（64 hex，非 deviceId/硬件标识的简单哈希） | **未解** |
+//
+// ## ⚠️ 关于 `state.nh`：为什么可以先用「不生成 state」的方案
+//
+// 用**瞎编的** `state`（`aosi.fake-state-probe`）打 `zai-oauth-login`，服务端回
+// **`631001 User login error`** —— 这是「进入登录逻辑后 code 无效」，
+// **不是**「state 无效」。⇒ 服务端不硬校验 `state` 的内容。
+//
+// ⇒ 实现采取**最可靠**的形态：`state` **由官方授权页生成并随回调带回**，
+//   插件只做**透传**（不自己拼 `aosi.*`）。这样 `nh` 到底是什么都不影响。
+
+/** Z.ai 授权页（国际版）。 */
+export const AUTOCLAW_ZAI_AUTH_URL = 'https://chat.z.ai/auth'
+/**
+ * Z.ai OAuth 的固定 `client_id`。
+ *
+ * ⚠️ 实测依据：两次独立授权 URL 的 `client_id` 逐字节相同 ⇒ 它是**构建期常量**，
+ * 不是服务端下发（`oauth-url` 端点需要登录态，首次登录拿不到）。
+ */
+export const AUTOCLAW_ZAI_CLIENT_ID = 'client_EnD0QI8bLRFT8cciLp389Q'
+/** OAuth 换 token 端点（`overseasv1` 命名空间，仅国际站有）。 */
+export const AUTOCLAW_ZAI_EXCHANGE_PATH = '/userapi/overseasv1/zai-oauth-login'
+/** Google OAuth 换 token 端点（对照用）。 */
+export const AUTOCLAW_GOOGLE_EXCHANGE_PATH = '/userapi/overseasv1/google-oauth-login'
+
+/** OAuth 回调路径（与客户端同款：`/auth/callback-zai`）。 */
+export const AUTOCLAW_OAUTH_CALLBACK_PATH = '/auth/callback-zai'
+/** OAuth 回调端口候选（与客户端 `OAUTH_CALLBACK_PORTS` 逐字相同）。 */
+export const AUTOCLAW_OAUTH_CALLBACK_PORTS: readonly number[] = [18432, 19654, 19723, 53699]
+
+/**
+ * 构造 Z.ai 授权 URL。
+ *
+ * ⚠️ `state` **不由本函数生成** —— 它留空，由官方授权页在跳转时填充，
+ *    回调时原样带回（见上方「关于 state.nh」）。这避免了逆向 `nh`。
+ *
+ * @param redirectUri - 回调地址（`http://localhost:<port>/auth/callback-zai`）。
+ */
+export function buildAutoclawZaiAuthUrl(redirectUri: string): string {
+  const url = new URL(AUTOCLAW_ZAI_AUTH_URL)
+  url.searchParams.set('response_type', 'code')
+  url.searchParams.set('client_id', AUTOCLAW_ZAI_CLIENT_ID)
+  url.searchParams.set('redirect_uri', redirectUri)
+  return url.toString()
+}
+
+/**
+ * 用授权码换 token（国际版 Z.ai OAuth）。
+ *
+ * ## 与国内版 HTTP 请求的差别：**必须带完整 managed 头**
+ *
+ * 客户端 `createZworkManagedRequestHeaders` 里除了签名头还有三个：
+ * `X-Version`（客户端版本）/ `X-Tm`（平台 `win`）/ `X-Product`（`autoclaw`）。
+ *
+ * ⚠️ **实测对照（2026-10-20）**：缺这三个头时服务端回
+ * `410000 用户未登录`（看起来像「没登录」但其实**压根没进登录逻辑**）；
+ * 补齐后回 `631001 User login error`（= 进了逻辑、code 无效）。
+ * ⇒ 三个头是**必需**的，缺了会被误诊成「凭据问题」。
+ *
+ * @param code - 授权码（回调 URL 的 `code`）。
+ * @param state - 授权页原样带回的 `state`（透传，不解析）。
+ * @param navigateUri - 与授权时**完全相同**的回调地址。
+ */
+export async function exchangeAutoclawZaiCode(
+  code: string,
+  state: string,
+  navigateUri: string,
+  options?: LoginAutoclawWithCodeOptions,
+): Promise<LoginAutoclawWithCodeResult> {
+  const trimmedCode = code.trim()
+  if (trimmedCode === '') return { ok: false, error: '授权码不能为空' }
+
+  const product = options?.product ?? AUTOCLAW
+  const fetcher = options?.fetchImpl ?? fetch
+  const deviceId = resolveDeviceId(options?.deviceId)
+  const ts = Math.floor(Date.now() / 1000).toString()
+  const sign = calculateAutoclawSign(product.appId, ts, product.appKey)
+
+  try {
+    const resp = await fetcher(`${product.apiBase}${AUTOCLAW_ZAI_EXCHANGE_PATH}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        // ⚠️ 这三个头缺一不可（见上面实测对照）。
+        'X-Version': AUTOCLAW_CLIENT_VERSION,
+        'X-Tm': 'win',
+        'X-Product': product.product,
+        'X-Auth-Appid': product.appId,
+        'X-Auth-TimeStamp': ts,
+        'X-Auth-Sign': sign,
+        'X-Lang': 'en-US',
+        'X-Channel': 'official',
+        'User-Agent': `AutoClaw/${AUTOCLAW_CLIENT_VERSION} (win)`,
+      },
+      body: JSON.stringify({
+        code: trimmedCode,
+        // ⚠️ `state` 原样透传（不解析、不重建）—— 见文件头「关于 state.nh」。
+        state,
+        navigate_uri: navigateUri,
+        source_id: AUTOCLAW_SOURCE_ID,
+        device_id: deviceId,
+      }),
+      signal: AbortSignal.timeout(AUTOCLAW_REQUEST_TIMEOUT_MS),
+    })
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '')
+      return { ok: false, error: `Z.ai 授权失败(${resp.status}): ${text}` }
+    }
+
+    const json = (await resp.json()) as {
+      code?: number
+      msg?: string
+      data?: {
+        access_token?: string
+        refresh_token?: string
+        expires_in?: number
+        expires_at?: number
+        user_id?: string | number
+        guid?: string
+      }
+    }
+
+    const data = json.data ?? {}
+    const rawAccess = data.access_token
+    if (json.code !== 0 || rawAccess === undefined || rawAccess === '') {
+      return {
+        ok: false,
+        error: json.msg !== undefined && json.msg !== ''
+          ? `Z.ai 授权失败：${json.msg}（code=${json.code}）`
+          : `Z.ai 授权失败（code=${json.code}）`,
+      }
+    }
+
+    const cleanAccess = cleanBearerToken(rawAccess)
+    const cleanRefresh = data.refresh_token === undefined ? '' : cleanBearerToken(data.refresh_token)
+    const expiresAt = typeof data.expires_at === 'number'
+      ? autoclawExpiresAtMs(data.expires_at)
+      : typeof data.expires_in === 'number'
+        ? Date.now() + data.expires_in * 1000
+        : Date.now() + 7 * 86400_000
+
+    // ⚠️ 身份字段：优先服务端 `user_id`，其次 JWT 的 `user_id`（numericUserId）。
+    //    与国内版同口径（见 `autoclawIdentityOf` 的注释：UUID 与 numericUserId
+    //    是两个 id 空间，统一由自愈补齐，这里只保证「不会没有身份」）。
+    const jwtUserId = readUserIdFromJwt(cleanAccess)
+    const resolvedUserId = data.user_id ?? jwtUserId
+
+    const credential: AutoclawCredential = {
+      access_token: cleanAccess,
+      refresh_token: cleanRefresh,
+      expires_at: expiresAt,
+      device_id: deviceId,
+      account_id: resolvedUserId === undefined ? undefined : String(resolvedUserId),
+      user_id: resolvedUserId,
+    }
+    return { ok: true, credential }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * AutoClaw 客户端版本号（`X-Version` 头用）—— **单一真相源在 `autoclaw-product.ts`**。
+ *
+ * ⚠️ 此处不再重复定义（2026-10-20）：`X-Version` 是国际站推理的硬校验头
+ *    （缺它 → HTTP 500 空响应体），两处各写一份 `'2.1.1'` 必然漂移，
+ *    统一从 `autoclaw-product.js` 导入（见 `AUTOCLAW_CLIENT_VERSION` 的注释）。
+ */
 
 /** 手机号格式正则（中国大陆11位手机号）。 */
 export const PHONE_NUMBER_RE = /^1[3-9]\d{9}$/
@@ -49,6 +237,20 @@ export const PHONE_NUMBER_RE = /^1[3-9]\d{9}$/
  */
 export async function probeAutoclawLocalCredential(options?: {
   customAppData?: string
+  /**
+   * 客户端 userData 目录名。
+   *
+   * ⚠️ **国内版与国际版是同一客户端的两份构建**（`isOversea` 是构建期常量），
+   * 但 userData 目录名不同 —— 实测（2026-10-20）：
+   * - 国内构建：`AutoClaw-official`
+   * - 国际构建：`AutoClaw-oversea-official`
+   *
+   * ⇒ 由调用方按 `product.id` 传入，不写死（原实现硬编码国内目录，
+   *   导致国际版**永远导入不到**自己的凭据）。
+   *
+   * @default 'AutoClaw-official'
+   */
+  appDirName?: string
 }): Promise<AutoclawCredential | undefined> {
   try {
     const appData =
@@ -60,7 +262,8 @@ export async function probeAutoclawLocalCredential(options?: {
 
     if (!appData) return undefined
 
-    const localStatePath = path.join(appData, 'AutoClaw-official', 'Local State')
+    const appDirName = options?.appDirName ?? 'AutoClaw-official'
+    const localStatePath = path.join(appData, appDirName, 'Local State')
     if (!fs.existsSync(localStatePath)) return undefined
 
     const localState = JSON.parse(fs.readFileSync(localStatePath, 'utf8')) as {
@@ -89,7 +292,7 @@ export async function probeAutoclawLocalCredential(options?: {
     }).trim()
     const masterKey = Buffer.from(clearB64, 'base64')
 
-    const accountsDir = path.join(appData, 'AutoClaw-official', 'accounts')
+    const accountsDir = path.join(appData, appDirName, 'accounts')
     if (!fs.existsSync(accountsDir)) return undefined
 
     const entries = fs.readdirSync(accountsDir, { withFileTypes: true })

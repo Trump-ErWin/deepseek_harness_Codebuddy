@@ -62,7 +62,7 @@ import { readFileSync } from 'node:fs'
 //    真正的防线是「`AGGREGATE_CHANNELS` 的 channel 成员必须在清单里」那条，
 //    见本文件末尾的 ★★ 显式豁免表守卫。
 const EXPECTED_WIRED = [
-  'accio', 'autoclaw', 'buddy', 'codearts', 'lobsterai', 'loomy', 'modelscope', 'officeace', 'trae', 'workbuddy', 'zcode',
+  'accio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts', 'lobsterai', 'loomy', 'modelscope', 'officeace', 'trae', 'workbuddy', 'zcode',
 ]
 
 class FakeCredentials {
