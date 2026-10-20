@@ -170,6 +170,51 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     displayName: 'CodeArts (华为云)',
     logoClass: 'codearts',
     credits: { balance: true, dailyCheckin: true },
+    /**
+     * 三档分档覆盖**两个来源**（2026-10-20）：
+     *
+     * - **基础积分包**（`usageBasicPackageCredit`）随套餐周期到期，响应顶层
+     *   给了 `end_date`（纯日期，如 `2026-10-27`）⇒ 有确切时刻，已写进
+     *   `packages[].deductionEndTime`，可正常分档。
+     * - **赠送积分包**（签到/活动，逐笔「发放日 +30 天」）与**按需包**没有
+     *   逐包到期字段，但上游在该分类 metric 上给了
+     *   `package_credit_expiring_amount`（「其中 N 分即将到期」的标量）
+     *   ⇒ 已解析到 `packages[].expiringRemaining`，**拆开**进两个桶：
+     *   临期 += `expiringRemaining`，永久 += 余下部分。
+     *
+     * 于是三档合计恒等于 `credits.total`，不再出现「永久 25000」旁边
+     * 又写「另有 2000 即将到期」这种对不上的数字（用户 2026-10-20 报障）。
+     *
+     * ⚠️ 拆出来的那部分**没有倒计时** —— 上游不给逐笔日期，绝不编造。
+     * ⚠️ 赠送包整体仍是**会到期**的性质，只是其中一段时间窗口内的部分被
+     *   标成「即将到期」；余下部分归入永久桶是**保守方向**（宁可少用）。
+     */
+    usesExpiryWindow: true,
+    /**
+     * ⚠️ 不开 `permanentLock`：CodeArts 的积分**没有「永久」这一档**。
+     *
+     * 依据（官方计费文档 + 实测）：
+     * - 基础积分包随套餐周期作废（体验版虽自动免费续期，但基础包额度按周期重置）；
+     * - 赠送积分包逐笔「发放日 +30 天」；
+     * - 按需包按消费实时结算。
+     *
+     * 三类的共同点是**都会到期**，没有「永不作废」的池。开永久锁会让用户
+     * 误以为「锁住就不会作废」，而实际只是把这批号从选号里摘出去 ——
+     * 语义错位，故不登记。
+     */
+    /**
+     * ⚠️ **必须与 `usesExpiryWindow` 同时登记**（2026-10-20 合并审计发现，
+     * 与 minimax 两站同因）：`provider-registry.spec.ts` 有一条从**能力事实
+     * 派生**的守卫「`usesExpiryWindow` 的家必须有 `creditPackages`（同一份数据）」
+     * —— 两者读的是同一批 `packages[]`。只开前者会让账号卡片**不展示逐包列表**，
+     * 用户看得到「永久 / 长期 / 临期」三档合计，却看不到是**哪几笔**构成的。
+     *
+     * ⚠️ 本家补上是有实据的：`codearts-credits.ts` 已把上游的
+     * `package_credit_expiring_amount` 聚合标量**拆到逐包**
+     * （`packages[].expiringRemaining`），基础包还带 `deductionEndTime`
+     * （取自套餐周期 `end_date`）—— 「N/M 个资源包有效」这句因此有真实内容。
+     */
+    creditPackages: true,
     settingsNamespace: 'llm-codearts',
     channel: true,
   },
