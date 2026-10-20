@@ -197,6 +197,13 @@ describe('★★ 接线的**透传**腿（`provider-expiry.ts` 的 `context.cach
   const CACHED_BALANCE_PROVIDERS = [
     'buddy', 'workbuddy', 'lobsterai', 'trae', 'modelscope',
     'autoclaw', 'autoclawintl', 'qoder', 'qodercn',
+    // ⚠️ PR !119（2026-10-20）新增的三家：astudio 走 `astudioExpiry`、
+    //    minimax / minimaxintl 走 `minimaxFamilyExpiry`，三者在
+    //    `provider-expiry.ts` 里都接了 `context.cachedBalance` 透传。
+    //    ⚠️ 它们**正是被本用例「遍历整张表」那条腿点名报出来的** ——
+    //    那是 PR131 把本表从「四家硬编码」改成「整表比对」的直接收益
+    //    （旧形态下这三家零守卫）。
+    'astudio', 'minimax', 'minimaxintl',
   ] as const
 
   it('★★ 所有接了 `cachedBalance` 透传的渠道都必须真的透传（本表即清单）', async () => {

@@ -35,16 +35,18 @@ describe('autoCheckinExcluded：宿主消费取决于 registry', () => {
 })
 
 describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry', () => {
-  it('恰好是 registry 里 usesExpiryWindow === true 的 9 家（officeace 2026-10-12、autoclaw 2026-10-17、qoder/qodercn 2026-10-20 加入）', () => {
+  it('恰好是 registry 里 usesExpiryWindow === true 的 11 家（officeace 2026-10-12、autoclaw 2026-10-17、qoder/qodercn/astudio/minimax/minimaxintl 2026-10-20 加入）', () => {
     const withWindow = PROVIDER_REGISTRY
       .filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
     // ⚠️ 2026-10-20 加 autoclawintl：与 autoclaw 同源（同一份 credits 实现）。
     // ⚠️ qoder / qodercn 2026-10-20 加入：永久哨兵不写 `deductionEndTime`
     //    ⇒ 落永久桶。与 codearts **不同**，本家同时开 `permanentLock`。
+    // ⚠️ astudio / minimax / minimaxintl 2026-10-20 加入（PR !119）。
     expect(withWindow).toEqual([
-      'autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace',
-      'qoder', 'qodercn', 'trae', 'workbuddy',
+      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae',
+      'workbuddy',
     ])
   })
 
@@ -57,8 +59,12 @@ describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry
       .map((d) => d.id).sort()
     // ⚠️ qoder / qodercn 2026-10-20 加入：两站都**同时**登记两个字段
     //    （半残形态会让锁定按钮在、分档行却不渲染 —— AStudio 首次报障时踩过）。
+    // ⚠️ minimax / minimaxintl / astudio 2026-10-20 加入：与 astudio 同批，
+    //    两处同时登记（只加 permanentLock 不加 usesExpiryWindow ⇒ 分档行不渲染
+    //    但锁按钮在，是 AStudio 首次报障时踩过的半残形态）。
     expect(viaWindow).toEqual([
-      'buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
+      'astudio', 'buddy', 'lobsterai', 'minimax', 'minimaxintl',
+      'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
     ])
     expect(locked).toEqual([...viaWindow, 'loomy'].sort())
   })
