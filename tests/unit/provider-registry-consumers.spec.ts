@@ -35,12 +35,14 @@ describe('autoCheckinExcluded：宿主消费取决于 registry', () => {
 })
 
 describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry', () => {
-  it('恰好是 registry 里 usesExpiryWindow === true 的 7 家（officeace 2026-10-12、autoclaw 2026-10-17 加入）', () => {
+  it('恰好是 registry 里 usesExpiryWindow === true 的 8 家（officeace 2026-10-12、autoclaw 2026-10-17、astudio 2026-10-21 加入）', () => {
     const withWindow = PROVIDER_REGISTRY
       .filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
     // ⚠️ 2026-10-20 加 autoclawintl：与 autoclaw 同源（同一份 credits 实现）。
-    expect(withWindow).toEqual(['autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ 2026-10-21 加 astudio：四个池都带 *NextExpireTime（见 registry 该条目的
+    //    长注释）—— 缺它 ⇒ RPC 不回传 windowDays ⇒ 客户端分桶行整条不渲染。
+    expect(withWindow).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
   it('支持锁定的渠道 ⊆ usesExpiryWindow ∪ {loomy}（loomy 无窗口概念）', () => {
