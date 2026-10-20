@@ -167,7 +167,32 @@ export function splitBuddyCreditsByExpiry(
     if (remaining <= 0) continue
     const endTime = pkg.deductionEndTime
     const known = typeof endTime === 'number' && Number.isFinite(endTime) && endTime > 0
-    if (known && endTime - now < windowMs) expiring += remaining
+    if (!known) {
+      /**
+       * 没有逐包到期时刻 ⇒ 默认算永久（保守：宁可少用，不可误烧长期积分）。
+       *
+       * ⚠️ **但 CodeArts 的赠送/按需包是例外**（2026-10-20）：上游不给逐笔
+       * 日期，只在该分类 metric 上给「其中 N 即将到期」的标量，已被解析成
+       * `pkg.expiringRemaining`。必须与前端 `splitCreditsByExpiry` **同规则**
+       * 拆开，否则前后端漂移：
+       *
+       * - 前端把整包算永久 ⇒ 卡片显示「永久 25000」与新加的「临期 2500」矛盾；
+       * - 后端若也整包算永久 ⇒ **锁定永久积分时该账号被判 `none` 不可用**，
+       *   尽管它其实有 2500 临期积分能撑 —— 直接报「积分已用尽」。
+       *
+       * ⇒ 临期桶 += `expiringRemaining`，永久桶 += 余下部分。
+       */
+      const expiringPart = positiveOrZero(pkg.expiringRemaining)
+      if (expiringPart > 0) {
+        const capped = Math.min(expiringPart, remaining)
+        expiring += capped
+        permanent += remaining - capped
+      } else {
+        permanent += remaining
+      }
+      continue
+    }
+    if (endTime - now < windowMs) expiring += remaining
     else permanent += remaining
   }
   return { expiring, permanent }

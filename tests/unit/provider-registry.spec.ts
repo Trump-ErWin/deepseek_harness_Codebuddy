@@ -148,12 +148,16 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(locked).toEqual(['buddy', 'lobsterai', 'loomy', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('usesExpiryWindow 恰好是既有的 6 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17 加入）', () => {
+  it('usesExpiryWindow 恰好是既有的 7 家（loomy 不在内，它没有窗口概念；codearts 2026-10-20 加入）', () => {
     const win = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
     // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`，未过期批次
     //    之和 == total_balance（守恒实测）⇒ 批次包带 `deductionEndTime` 可分三档。
-    expect(win).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ codearts 2026-10-20 加入：**只有基础积分包**能分档（随套餐周期 `end_date`
+    //    到期）；赠送/按需包没有逐包到期字段，走 `expiringTotal` 单独提示。
+    //    ⚠️ 与其余 6 家**不同**：它不开 `permanentLock` —— CodeArts 没有任何
+    //    「永不作废」的池，开锁会与「锁住就不作废」的语义错位。
+    expect(win).toEqual(['autoclaw', 'buddy', 'codearts', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
   it('rateLimit === false 恰好是 6 家（astudio 2026-10-18 加入；accio 2026-10-18 退出）', () => {
