@@ -45,6 +45,11 @@
  *   `global` → `zh.accio.com`），选错区域的后果是**登录页根本打不开该账号**
  *   （国际用户拿中国版登录页登不进去）。区域由服务端按账号下发、**不能事后推断**，
  *   故必须在登录前由用户指定。
+ * - `autoclaw` / `autoclawintl`：两者都有「一键导入本机桌面端凭据」与
+ *   「手机验证码登录」两条路，且**读的是不同的 userData 目录**
+ *   （`AutoClaw-official` / `AutoClaw-oversea-official`）。
+ *   ⚠️ 不预选会让国际版静默走短信分支 ⇒ 读国内目录 ⇒ 国内凭据进国际槽位
+ *   （2026-10-20 重演两次的真实事故，见 `buildCreateAccountPayload` 的注释）。
  *
  * ⚠️ 写成「**白名单**」而不是「排除法」：将来若新增某个同样需要预选的 provider，
  * 只改这一处即可；反过来，**任何漏判的 provider 都会被放行到「无弹窗」这条默认
@@ -58,7 +63,7 @@
  *   语义不可互换 ⇒ 合并成同一个形参会静默串台（A 家选了「本机导入」发给 B 家）。
  *   故 astudio 占第 4 位、autoclaw 占第 5 位，两个都是可选的。
  */
-const PROVIDERS_ASKING_OPTIONS = Object.freeze(['zcode', 'accio', 'astudio', 'autoclaw']);
+const PROVIDERS_ASKING_OPTIONS = Object.freeze(['zcode', 'accio', 'astudio', 'autoclaw', 'autoclawintl']);
 
 /**
  * 该 provider 的「新建账号」是否**需要先问一句**（即是否弹预选窗）。
@@ -111,8 +116,15 @@ export function newAccountAsksChannel(provider) {
  */
 export function buildCreateAccountPayload(provider, zcodeProvider, accioRegion, astudioLoginMethod, autoclawMode) {
   // 排除法：先把「载荷里没有任何专属字段」的 provider 早退掉（方向与白名单相反）。
+  // ⚠️⚠️ **`autoclawintl` 必须在这里**（2026-10-20 修）：原实现只列了 `autoclaw`
+  //    ⇒ 国际版的载荷被早退成 `{ provider }`，丢掉 `autoclawMode`
+  //    ⇒ 后端 `autoclawMode === undefined`，走**短信登录**分支而不是"一键导入"，
+  //    而那条分支的服务读的是**国内目录** ⇒ 国内凭据被写进国际槽位
+  //    （用户看到「国际版卡片挂着国内手机号、已过期」，重演两次）。
   if (provider !== 'zcode' && provider !== 'accio'
-    && provider !== 'astudio' && provider !== 'autoclaw') return { provider };
+    && provider !== 'astudio' && provider !== 'autoclaw' && provider !== 'autoclawintl') {
+    return { provider };
+  }
   if (provider === 'zcode') return { provider, zcodeProvider };
   if (provider === 'accio') return { provider, accioRegion };
   // ⚠ 两家各返回**自己那一个**字段：绝不合并成一个字段，否则宿主读到的是

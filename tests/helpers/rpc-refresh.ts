@@ -82,6 +82,12 @@ export const REFRESH_PROVIDERS = [
   // 且 `refreshAccountCredential` 续期并回写池内 `expiresAt`
   // ⇒ 不属 loomy / zcode 那类「设计上没有 refresh 端点」的豁免。
   'autoclaw',
+  // ⚠️ autoclawintl（2026-10-20）：AutoClaw 国际版，与 `autoclaw` 共用同一个
+  //   `AutoclawAuth` 类、有真实 refresh 端点（`/userapi/v1/refresh`，国际站
+  //   实测续期成功），且 `refreshAccountCredential` 续期并回写池内 `expiresAt`。
+  //   ⚠️ 与 `autoclaw` 是**两个 provider**（账号不互通、凭据 ref 前缀不同），
+  //   故必须各占一项 —— 漏了它，国际站账号的 `account.refresh` 行为覆盖为零。
+  'autoclawintl',
   // ⚠️ **本 fork 独有**（modelscope，2026-10-16）：它**在**表里（与 loomy 同款理由
   //    —— 没有 refresh 端点，但 `refreshAccountCredential` 仍按统一接口做
   //    有效性对账并回写池内 `expiresAt`）。

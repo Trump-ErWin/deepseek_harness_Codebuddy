@@ -21,6 +21,7 @@ import {
   sanitizeGatewayEnabled,
   sanitizeNativeWebSearchEnabled,
   sanitizePermanentLocks,
+  sanitizeProviderClosed,
   sanitizeProviderOrder,
   withAllowed,
   withoutAllowed,
@@ -142,6 +143,8 @@ describe('老契约后端（SettingsStore）', () => {
       nativeWebSearchEnabled: true,
       // save 未携带顺序 → 写出空数组（未自定义），读回同值。
       providerOrder: [],
+      // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。
+      providerClosed: {},
     })
     // ⚠️ 锁定表**不进**这份文档：它是同机多 profile 共享的，旧版本代码全量重写
     // 时不会携带自己不认识的键 —— 表放这儿会被静默抹掉（详见
@@ -194,6 +197,42 @@ describe('老契约后端（SettingsStore）', () => {
     expect(saved?.aggregateRejections).toEqual(rejections)
     // ② 且能读回（不是只写进载荷、读时又丢掉）
     expect(store.load()?.aggregateRejections).toEqual(rejections)
+  })
+
+  /**
+   * ★★ **「供应商关闭意图」必须能落盘并读回**（Gitee issue IKP8OF）。
+   *
+   * ⚠️⚠️ 本用例存在的理由与上面拒绝表那条**逐字同因**：只断言「不传时写出空表」
+   * 是**恒真**的 —— 把 `save()` 里的 `providerClosed: ...` 整行删掉，那类断言
+   * **照样全绿**（实测：注入 MUTANT-M6 后 56 条全过）。
+   *
+   * 而漏键的后果是本 issue 的**原样复发**：`replace` 是整体替换语义 ⇒ 关闭意图
+   * **永不落盘**，且任何账号 / 黑名单 / 网关 / 顺序写入都会顺带把它抹掉
+   * ⇒ 重启后供应商**静默回到「已打开」**，用户无从察觉自己「又打开过」它。
+   *
+   * ⇒ 判据必须打在「**传了**必须落盘且能读回」这一半。
+   */
+  it('★★ 关闭意图在 settings 后端可落盘并读回（不能只断言「不传时为空」）', async () => {
+    let saved: Record<string, unknown> | undefined
+    const scope = {
+      get: () => saved,
+      replace: async (section: object) => { saved = section as Record<string, unknown> },
+    }
+    const store = createJetHubStore(makeCtx({ register: () => scope, describe: () => [] }))
+    await store.save({ accounts: [], disabledModels: {}, providerClosed: { cline: true } })
+
+    // ① 载荷里**必须**带上它（replace 语义下的唯一保证）。
+    expect(saved?.providerClosed, '★ save 漏了本键 ⇒ 关闭意图永不落盘').toEqual({ cline: true })
+    // ② 且能读回（不是只写进载荷、读时又丢掉）。
+    expect(store.load()?.providerClosed).toEqual({ cline: true })
+  })
+
+  /** 反向：脏值不得被当成「已关闭」（`'false'` 是 truthy，误判会让整家模型消失）。 */
+  it('★ 关闭意图只认显式 true（脏值不得让整家模型静默消失）', () => {
+    expect(sanitizeProviderClosed({ cline: true, buddy: 'false', trae: 1, qoder: null }))
+      .toEqual({ cline: true })
+    expect(sanitizeProviderClosed(['cline'])).toEqual({})
+    expect(sanitizeProviderClosed(null)).toEqual({})
   })
 
   it('★ 拒绝表缺省时写出空表（老文档没有该键的兼容路径）', async () => {
@@ -268,6 +307,8 @@ describe('文件后端（FileStore）', () => {
       nativeWebSearchEnabled: true,
       // 顺序缺省空数组（未自定义）—— 与升级前行为一致
       providerOrder: [],
+      // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。
+      providerClosed: {},
     })
     // 落盘文本里也不该出现锁定表（它属于 permanent-locks.json）
     expect(readFileSync(statePath, 'utf-8')).not.toContain('permanentLocks')
@@ -569,6 +610,8 @@ describe('文件后端（FileStore）', () => {
       nativeWebSearchEnabled: true,
       // 顺序缺省空数组（未自定义）：读回同值。
       providerOrder: [],
+      // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。
+      providerClosed: {},
     })
   })
 })

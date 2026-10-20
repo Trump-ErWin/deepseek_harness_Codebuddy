@@ -415,8 +415,10 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     // 而不是让 windowDays 静默地多出/少掉一家。
     // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`（唯一到期
     //    数据源，真机取证 28/28 带值且守恒），批次包归一化到 `deductionEndTime`。
+    // ⚠️ autoclawintl 2026-10-20 加入：与 autoclaw **同源**（同一份 credits 实现），
+    //    实测国际站批次同样带 `deductionEndTime`（3000→10/21、10000→10/27）。
     const withWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true).map((d) => d.id).sort()
-    expect(withWindow).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    expect(withWindow).toEqual(['autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 })
 
@@ -501,6 +503,11 @@ const BALANCE_PATH_OF: Readonly<Record<string, string>> = {
   //   baseUrl 来自 src/astudio-product.ts 的 authBaseUrl）。
   astudio: '/points/balance',
   autoclaw: '/agent-assetmgr/api/v2/wallets',
+  // ⚠️ autoclawintl 与 `autoclaw` **同一条路径**（两站端点同形、只差主机）——
+  //    本清单守的是「请求发到了这家自己的余额端点」，路径相同不影响判别力
+  //    （主机由 `AUTOCLAW_INTL.apiBase` 决定）。实测 2026-10-20：
+  //    国际站该路径返回 `code=0`、`total_balance=13000`。
+  autoclawintl: '/agent-assetmgr/api/v2/wallets',
   // ⚠️ **本 fork 独有**（魔搭，2026-10-17）：魔粒余额端点。
   //    ⚠️ 只写**路径片段**（与本表其余项同口径）：域名在 product 的 `balanceUrl`
   //    里，而它**刻意不是** `baseUrl` 那个 host（见 modelscope-product.ts 的字段注释）。
@@ -592,12 +599,13 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     // ⚠️ 2026-10-17 **本 fork** 并入 modelscope（魔搭）：15 → 16。
     //    modelscope 原先被豁免（理由「平台没有额度 API」）已作废：真端点是
     //    `/openapi/v1/magicubes/balance`（带 API Key 返 200、随消耗下降）。
+    // ⚠️ 2026-10-20 autoclawintl（AutoClaw 国际版，与国内同端点、只差主机）：16 → 17。
     //    ⚠️ 合并上游时**不要**改回 13。
     // ⚠️ 2026-10-19 **本 fork** 并入 codely（Unity，usage/summary）⇒ 15 → 16。
     //    它是全仓首例 balance:true + channel:false（登录/余额均为自由函数，
     //    无 auth 服务；runtime 守卫只查已注册 runtime，codely 被跳过）。
     expect(expected.length).toBe(16)
-    expect(expected.length).toBe(16)
+    expect(expected.length).toBe(17)
     // ⚠️ **关键集合判据必须对「生产真正调用的那种形态」也成立**（2026-10-08 复审 C1）：
     //    上面那次是 `createProviderCredits()`（无 deps），而端点与 `index.ts` 调的
     //    都是 `createProviderCredits({ loomy, raccoon, zcode })`。deps 只应影响**实现**，

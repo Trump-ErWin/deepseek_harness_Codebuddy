@@ -545,9 +545,40 @@ export function createModelCatalog(
       // 分组隐藏。**必须返回空数组而不能抛错**（抛错会被归入 catalog 的
       // failures，界面上反而多一条 provider 报错）。
       if (!await providerCatalogVisible(deps.accountPool, providerId)) return []
-
+      // ⚠️⚠️ **「供应商整体关闭」必须在这里短路**（Gitee issue IKP8OF）。
+      //
+      // 关闭供应商时只把**当时目录**的 id 写进黑名单；目录随后变长（cline 三源
+      // 异步 + models.dev 可恢复、其余家后台刷新器补进上游新模型）⇒ 新 id 不在
+      // 黑名单里 ⇒ **仍可选**，而 `provider.status` 的 `closed` 同时翻回 false。
+      //
+      // 意图判据（`providerClosedFor`）与目录快照无关，故它是唯一能覆盖
+      // 「关闭之后才出现的模型」的判据。
+      //
+      // ⚠️ **放在这里覆盖的是「经本骨架 `listModels` 的 13 家」**（实测：`src/` 里
+      //    有 14 个文件 `import` 本函数，但 `aggregate-adapter.ts` 只在注释里提到它、
+      //    自己实现了 `listModels`）。另 5 家**手写** `listModels`、必须各自接线：
+      //    `autoclaw`（国内+国际两实例）/ `modelscope` / `officeace` / `opencode` /
+      //    `aggregate`。⚠️ 别在这里写死家数（本仓库的家数注释已腐坏过多次）——
+      //    权威守卫是 `ikp8of-provider-closed.spec.ts` 的**逐家点名**用例。
+      //
+      // ⚠️ 返回值必须是 `[]` 而不是「过滤掉已知 id」：意图为真时目录里**每一条**
+      //    都该消失，而其中可能包含我们**从未见过**的 id（黑名单里没有它们）。
+      //
+      // ⚠️⚠️ **短路不能挡住 `cached` 的写入**（独立审计提出，已实测核对）：
+      //    `listAllModels()` 读的是 `cached ?? syncCatalog()`，而 `cached` 只由
+      //    本方法 / `refresh()` 写入。若这里「提前 return」而不写 `cached`，
+      //    关闭态下的设置页（`model.list` → `listAllModels()`）会退化成各家的
+      //    **编译期兜底子集**（cline 实测 3 条 vs 远端 460+）⇒ 用户**看不到**
+      //    远端模型，也就没有入口逐条打开它们，而 `provider.status` 的 `total`
+      //    也会跟着失真。
+      //    ⇒ 先正常读目录（写 `cached`），**再**决定要不要返回 `[]`。
+      //    ⚠️ 代价：关闭态下多读一次目录。这是**必要**的 —— 设置页必须能列出
+      //      全部模型（含新增的），否则用户无法逐条打开（本文件的设计承诺）。
+      const closedWholeProvider = deps.accountPool?.providerClosedFor?.(providerId) === true
       const all = await config.loadCatalog()
       cached = all
+      if (closedWholeProvider) return []
+
       const disabled = deps.accountPool?.disabledModelsFor(providerId)
       const listed = disabled === undefined || disabled.size === 0
         ? all

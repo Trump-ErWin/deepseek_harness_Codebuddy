@@ -61,6 +61,18 @@ export interface AutoclawAdapterOptions {
   /** 黑名单模型过滤。 */
   disabledModels?: () => ReadonlySet<string>
   /**
+   * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+   *
+   * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
+   * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
+   * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
+   * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+   *
+   * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
+   * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+   */
+  providerClosed?: () => boolean
+  /**
    * 读取图片附件字节（**图片通路必需**，2026-10-17 审计 P0 修复）。
    *
    * ⚠️ `zai_auto-fast` 的 `supportsImage: true` 有实测依据
@@ -193,6 +205,10 @@ export class AutoclawAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️⚠️ 「供应商整体关闭」⇒ 一条都不播（Gitee issue IKP8OF）。
+    // 必须在**任何上游请求之前**：关闭态下没必要再探活/拉目录，
+    // 且此时目录里可能有黑名单从未见过的 id（关闭之后才新增的）。
+    if (this.options.providerClosed?.() === true) return []
     const disabled = this.options.disabledModels?.() ?? new Set<string>()
     const credential = await this.probeCredential()
     if (!credential) return []
@@ -496,7 +512,7 @@ export class AutoclawAdapter extends LlmAdapter {
       model: upstreamModel,
       messages: wireMessages,
       stream: true,
-      // ⚠️⚠️ `max_tokens` **双向夹取**（2026-10-17 审计 P0/P1 修复）。
+      // ⚠️⚠️ `max_tokens` **双向夹取 + 强制保底**（2026-10-20 新增）。
       //   下限 10000：**不是**原先的 16384 —— `docs/autoclaw-models.md:53-55`
       //   明写官方约束是「`>= 10000` **或完全不传递**，传 `< 10000`（如 IDE
       //   默认的 4096）回 406」⇒ 抬到 16384 属**编造上游没承诺的数字**
@@ -505,6 +521,17 @@ export class AutoclawAdapter extends LlmAdapter {
       //   下限，宿主请求 500000 时会原样发出，而 `zai_auto` 声明仅 393216
       //   ⇒ 超上限且宿主不转可读错误。
       //   ⚠️ 两者都取不到时**不发该字段**（网关默认），绝不编造数值。
+      //
+      //   ⚠️⚠️ **国际站对 `max_tokens` 的要求与国内站完全一致**（2026-10-20 实测）。
+      //     本行曾一度被改成「`wireMaxTokens === undefined` 时强制补 10000」，
+      //     依据是「国际站不发该字段会回 406」—— **那条依据是错的**：
+      //     当时手动复现同时加了 10 个客户端头，把真正起决定作用的
+      //     `X-Version`（缺它 → 500）误判成了 `max_tokens` 的问题。
+      //     二分实测（带 `X-Version`、同一 body）：
+      //       不发 max_tokens → 200 / =10000 → 200 / =512 → 406
+      //     ⇒ 国际站同样接受「不发」，保底既**没必要**、又**违反**
+      //       「绝不编造数字」的 P0 红线，已撤销。真修复见 `buildAutoclawHeaders`
+      //       的 `X-Version`。
       ...(wireMaxTokens === undefined ? {} : { max_tokens: wireMaxTokens }),
       ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
       // ⚠️⚠️ **档位必须先过 `autoclawEffortForRequest` 本地校验**（2026-10-18 审计 P0）。

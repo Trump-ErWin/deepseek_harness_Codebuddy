@@ -302,7 +302,7 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     expect(supportsRateLimit('不存在的 provider')).toBe(true)
   })
 
-  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好五个；accio 2026-10-18 退出、astudio 加入、codely 2026-10-20 退出）', () => {
+  it('登记 false 的都是「按钮语义管辖不到」的渠道（accio 2026-10-18 退出、astudio 加入、codely 2026-10-20 退出）', () => {
     const disabled = Object.entries(RATE_LIMIT_CAPABILITIES)
       .filter(([, caps]) => caps.rateLimit === false)
       // ⚠️⚠️ **必须减去「产品取舍」那一类**（2026-10-17）：`rateLimit: false` 有
@@ -318,6 +318,8 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     // - astudio（**本 fork**）：**不写 modelRateLimits 且不在 probeById 里**
     //   ⇒ 两个按钮恒为惰性（点了零请求、零清除，用户会以为按钮坏了）；
     // - autoclaw：与 astudio 同族（刻意不做请求级换号 + 冷却，不进 probeById）；
+    // - autoclawintl（2026-10-20）：与 autoclaw **同一个适配器类、同一份 registry
+    //   字段语义** ⇒ 必然一起为 false（漏登记会让本条理由失真）。
     // - gemini / officeace：限流由服务端配额管理，本地标记清掉 / 重测通过
     //   都恢复不了配额；
     // - loomy：根本不返回限流错误。
@@ -328,7 +330,7 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     //    而 **astudio** 是本 fork 独有、且确实登记了 `rateLimit: false`。
     //    ⇒ 按**注册表事实**更正（不是改注册表去凑这条断言）。
     //    ⚠️ codely 同日退出：它的换号 + 探测已接线（见 provider-registry.spec 同源注释）。
-    expect(disabled).toEqual(['astudio', 'autoclaw', 'gemini', 'loomy', 'officeace'])
+    expect(disabled).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'gemini', 'loomy', 'officeace'])
   })
 
   it('★ 「产品取舍」那一类也必须被点名（不得悄悄混进「管辖不到」里）', () => {

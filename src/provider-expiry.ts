@@ -74,7 +74,7 @@ import {
 import { MODELSCOPE } from './modelscope-product.js'
 import type { ModelscopeCredential } from './modelscope.js'
 // ⚠️ AutoClaw（智谱，2026-10-17 审计 P0 修复新增）
-import { AUTOCLAW } from './autoclaw-product.js'
+import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import type { AccioCredential } from './accio.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
@@ -188,6 +188,27 @@ export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>>
       credentialExpiry: (c, context) => autoclawExpiry(
         c as AutoclawCredential,
         AUTOCLAW,
+        context?.cachedBalance === undefined
+          ? undefined
+          : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      ),
+    },
+    /**
+     * **AutoClaw 国际版**（`autoclawintl`，2026-10-20）。
+     *
+     * ⚠️⚠️ **product 必须传 `AUTOCLAW_INTL`**：`autoclawExpiry` 内部拿它调
+     *    `fetchAutoclawBalanceDetailed(cred, { product })` ⇒ 传国内版会用
+     *    **国内基址**查国际账号的余额 ⇒ `410000 未登录` ⇒ 折算恒 `UNUSABLE`
+     *    ⇒ 国际账号在聚合轮换列表里**静默不可见**。
+     *    这是「同一实现两个实例」最容易踩的一处（与 `provider-credits.ts` 同型）。
+     *
+     * ⚠️ 批次**实测带** `deductionEndTime`（国际站 3000 → 10/21、10000 → 10/27），
+     *    与 buddy 系同形 ⇒ 走 `sharedPackageExpiry` 正确的按到期折算，不是恒 NEVER。
+     */
+    autoclawintl: {
+      credentialExpiry: (c, context) => autoclawExpiry(
+        c as AutoclawCredential,
+        AUTOCLAW_INTL,
         context?.cachedBalance === undefined
           ? undefined
           : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,

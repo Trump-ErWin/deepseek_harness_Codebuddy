@@ -412,10 +412,11 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     // 2026-10-16 加 astudio：18 → 19；
     // 2026-10-17 加 autoclaw：19 → 20；
     // 2026-10-16 **本 fork** 加 modelscope（魔搭）：20 → 21；
-    // 2026-10-19 **本 fork** 加 codely（Unity 团结引擎，UI 先行）：20 → 21）。
+    // 2026-10-19 **本 fork** 加 codely（Unity 团结引擎，UI 先行）：20 → 21；
+    // 2026-10-20 加 autoclawintl（AutoClaw 国际版）：21 → 22）。
     // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
     // 上面的具体 id；若将来再加 provider，记得同步这里。
-    expect(ids).toHaveLength(21)
+    expect(ids).toHaveLength(22)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -654,14 +655,14 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：17 → 18。
     // ⚠️ 2026-10-16 加 astudio（goal 302 接线）：18 → 19。
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：19 → 20；
-    //    同日 **本 fork** 加 modelscope（魔搭）：20 → 21。
+    //    同日 **本 fork** 加 modelscope（魔搭）：20 → 21；
+    //    2026-10-20 加 autoclawintl（AutoClaw 国际版）：21 → 22。
     // ⚠️ 2026-10-19 **本 fork** 加 codely（Unity，UI 先行）：20 → 21。
     //    ⚠️ clientProviderIds() 是**客户端图标表**的 id 数，与 registry 口径不同 ——
     //    权威值以断言实测为准，注释里的加减号只是**历史沿革**，不要拿来推当前数字。
-    expect(clientIds.length).toBe(21)
-    // ⚠️ 18 个 auth 键（21 个客户端 id − opencode − aggregate − codely；
-    //    codely 是 UI 先行过渡态的临时豁免，接线后要移出并把 18 → 19）。
-    expect(keys).toHaveLength(19)
+    expect(clientIds.length).toBe(22)
+    // ⚠️ 20 个 auth 键（22 个客户端 id − opencode − aggregate − codely）。
+    expect(keys).toHaveLength(20)
     const withoutKey = clientIds.filter((id) => !keys.includes(id))
     expect([...withoutKey].sort()).toEqual(['aggregate', 'codely', 'opencode'])
   })

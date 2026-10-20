@@ -154,17 +154,21 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
     }
   })
 
-  it('★ 只有 zcode 与 accio 与 astudio 需要先问一句，其余 provider 点按钮即登录', () => {
+  it('★ 只有 zcode / accio / astudio / autoclaw 两家需要先问一句，其余点按钮即登录', () => {
     expect(newAccountAsksChannel('zcode')).toBe(true)
     // ⚠ accio 的预选项是**登录区域**：区域决定登录页域名，而区域由服务端按账号
     //   下发、登录前无从推断 ⇒ 选错就登不进去（国际用户拿中国版登录页）。
     expect(newAccountAsksChannel('accio')).toBe(true)
     expect(newAccountAsksChannel('astudio')).toBe(true)
     expect(newAccountAsksChannel('autoclaw')).toBe(true)
+    // ⚠️ autoclawintl（2026-10-20）：与国内版**同样需要预选**（一键导入 / 短信），
+    //    且它读的是**不同的 userData 目录** ⇒ 漏判会让它静默走短信分支。
+    expect(newAccountAsksChannel('autoclawintl')).toBe(true)
     // ⚠ 这条对**全部** provider 取一遍：A1 的形态是「弹窗对 provider 零分支」，
     //   只抽查两三个 provider 的话，新增一个 provider 漏判就会静默溜过去。
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode' || id === 'accio' || id === 'astudio' || id === 'autoclaw') continue
+      if (id === 'zcode' || id === 'accio' || id === 'astudio'
+        || id === 'autoclaw' || id === 'autoclawintl') continue
       expect(newAccountAsksChannel(id), `${id} 不该弹预选窗`).toBe(false)
     }
   })
@@ -184,7 +188,8 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
 
   it('★ 不需要预选的 provider 载荷里**不许**出现任何专属字段（A2：选择被静默丢弃）', () => {
     for (const id of PROVIDER_IDS) {
-      if (id === 'zcode' || id === 'accio' || id === 'astudio' || id === 'autoclaw') continue
+      if (id === 'zcode' || id === 'accio' || id === 'astudio'
+        || id === 'autoclaw' || id === 'autoclawintl') continue
       const payload = buildCreateAccountPayload(id, 'zai', 'global')
       expect(payload).toEqual({ provider: id })
       expect(exclusiveFieldsOf(payload as Record<string, unknown>)).toEqual([])
@@ -194,6 +199,13 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
   it('★ autoclaw 的载荷带上登录模式', () => {
     expect(buildCreateAccountPayload('autoclaw', undefined, undefined, undefined, 'local')).toEqual({ provider: 'autoclaw', autoclawMode: 'local' })
     expect(buildCreateAccountPayload('autoclaw', undefined, undefined, undefined, 'sms')).toEqual({ provider: 'autoclaw', autoclawMode: 'sms' })
+    // ⚠️ 2026-10-20 加 autoclawintl：与 autoclaw **同一归一逻辑**，载荷必须同样带
+    //    `autoclawMode`，否则国际版会丢掉导入模式并静默走短信分支
+    //    （读国内目录 ⇒ 国内凭据进国际槽位，用户重演两次的事故）。
+    expect(buildCreateAccountPayload('autoclawintl', undefined, undefined, undefined, 'local'))
+      .toEqual({ provider: 'autoclawintl', autoclawMode: 'local' })
+    expect(buildCreateAccountPayload('autoclawintl', undefined, undefined, undefined, 'sms'))
+      .toEqual({ provider: 'autoclawintl', autoclawMode: 'sms' })
   })
 
   it('★ astudio 与 autoclaw 的登录方式**互不串台**（2026-10-17 合并引入的真实风险）', () => {
@@ -350,6 +362,47 @@ describe('F. accio 区域选择入口（终审 I2）', () => {
     // 缺了这句，用户会以为选错了也能事后纠正；而 region 会写进凭据并决定续期域。
     expect(jetHubCode).toMatch(/区域由服务端按账号下发/)
     expect(jetHubCode).toMatch(/登录页/)
+  })
+
+  /**
+   * ⚠️⚠️ **autoclaw 弹窗判据的源码锁**（2026-10-20 审计补）。
+   *
+   * 审计实测：把 `autoclawDialog` 改回 `provider === 'autoclaw'`（= PR 修之前
+   * 的形态，国际版会弹「添加 ZCode 账号」窗），
+   * `new-account-dialog` + `aggregate-panel-logic` **128 tests 全绿** ——
+   * 而本文件对 `accioDialog` 的赋值是**有**源码锁的（`const accioDialog = false`
+   * 会红 1 条）。⇒ 同一个文件里两条判据的守卫强度不一致，PR121 声称修好的
+   * 「第 4 处漏点」实际上没有任何守卫。
+   *
+   * 判据必须钉**赋值**（不是 `autoclawDialog ?` 的存在）：后者在
+   * `const autoclawDialog = false` 下照样匹配。
+   */
+  it('★ autoclaw 弹窗判据必须同时覆盖国际版（钉住赋值，不是钉三元）', () => {
+    expect(
+      jetHubCode,
+      '★ 判据必须是 `provider === \'autoclaw\' || provider === \'autoclawintl\'`'
+      + '—— 只判国内会让国际版弹「添加 ZCode 账号」窗（审计实测改坏后 128 条全绿）',
+    ).toMatch(/const autoclawDialog = provider === 'autoclaw' \|\| provider === 'autoclawintl';/)
+    // 弹窗内容确实按该判据分支。
+    expect(jetHubCode, '弹窗内容必须按 autoclaw 分支').toMatch(/autoclawDialog\s*\?/)
+  })
+
+  /**
+   * ⚠️ **国际版不得渲染短信登录**（2026-10-20 审计 P1）。
+   *
+   * 国际版账号是邮箱 + Z.ai OAuth 创建的、`phone` 为 null、无绑手机端点
+   * ⇒ 短信必然失败且文案不指向真因。故 `sms` 选项必须受 `autoclawSmsAvailable`
+   * 门控（只对国内版为 true）。
+   */
+  it('★ 国际版不渲染短信登录死路（sms 选项必须被 autoclawSmsAvailable 门控）', () => {
+    expect(
+      jetHubCode,
+      '★ 必须有 autoclawSmsAvailable 且只对国内版为 true',
+    ).toMatch(/const autoclawSmsAvailable = provider === 'autoclaw';/)
+    expect(
+      jetHubCode,
+      '★ sms 选项必须受该门控 —— 否则国际版用户会选到一条必然失败的路',
+    ).toMatch(/autoclawSmsAvailable[\s\S]{0,80}'sms'/)
   })
 })
 

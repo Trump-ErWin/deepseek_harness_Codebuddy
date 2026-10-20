@@ -13,6 +13,7 @@ import {
   isAutoclawRefreshable,
   isAutoclawTokenExpired,
   autoclawDisplayNickname,
+  readUserIdFromJwt,
   type AutoclawCredential,
 } from './autoclaw.js'
 import {
@@ -22,18 +23,53 @@ import {
   sendAutoclawVerificationCode,
   loginAutoclawWithCode,
   startAutoclawSmsLoginFlow,
+  buildAutoclawZaiAuthUrl,
+  exchangeAutoclawZaiCode,
   type SendAutoclawCodeResult,
   type LoginAutoclawWithCodeResult,
   type StartedAutoclawSmsLoginFlow,
 } from './autoclaw-oauth.js'
 import { RefreshScheduler } from './refresh.js'
-import { claimAutoclawDailyQuota } from './autoclaw-credits.js'
+import {
+  claimAutoclawDailyQuota,
+  fetchAutoclawBalanceDetailed,
+} from './autoclaw-credits.js'
 import { AccountPool } from './account-pool.js'
 import {
   refreshAccountWithReconcile,
   syncAccountExpiry,
   type ExpiryAccessors,
 } from './expiry-sync.js'
+
+/**
+ * 计算一条凭据的**账号身份**（同账号判据）。
+ *
+ * ⚠️ 抽成具名导出是为了让守卫能直接钉住它（`autoclawIdentityForTest` 同体）——
+ *    这段逻辑踩过两次真机缺陷（同一账号被重复添加 3 次、积分重复累加），
+ *    必须能被单测独立覆盖，而不是只能通过整条登录链路间接验证。
+ *
+ * ⚠️⚠️ **字段优先级**（2026-10-19 三次真机报障后定稿）：
+ *      1. `credential.user_id` —— 服务端 `user-profile` 的 UUID 主键；
+ *      2. `readUserIdFromJwt(access_token)` —— 老凭据没落该字段时兜底；
+ *      3. `access_token` —— 两者都取不到时退化（宁可退化，不要「无身份」）。
+ *
+ *     ⚠️ 1 与 2 属**两个 id 空间**（UUID ↔ `numericUserId`）：同一账号可能
+ *        一部分 ref 落在 1、另一部分落在 2 ⇒ 分裂成两组、去重白做
+ *        （用户三次报障「怎么还是在啊」的直接原因）。
+ *        彻底统一由 `autoclawSelfHeal` 在启动时调 `user-profile` 补 UUID 完成；
+ *        本函数只在「来不及补齐」的窗口内保证不会没有身份。
+ */
+export function autoclawIdentityOf(credential: AutoclawCredential): string {
+  const userId = credential.user_id ?? readUserIdFromJwt(credential.access_token)
+  if (userId !== undefined && String(userId).trim() !== '') {
+    // ⚠️ 加渠道前缀：不同渠道的 id 空间独立，裸值可能撞车。
+    return `autoclaw:${String(userId).trim()}`
+  }
+  return credential.access_token ?? ''
+}
+
+/** @internal 守卫专用别名（与 {@link autoclawIdentityOf} 同一实现）。 */
+export const autoclawIdentityForTest = autoclawIdentityOf
 
 /**
  * AutoClaw 凭据 → 账号池有效期所需的提取器。
@@ -47,6 +83,31 @@ import {
 const AUTOCLAW_EXPIRY_ACCESSORS: ExpiryAccessors<AutoclawCredential> = {
   expiresAtOf: (credential) => credential.expires_at,
   refreshableOf: isAutoclawRefreshable,
+  /**
+   * **`findAccountIdByCredential` 用的身份**（`syncAccountExpiry` 的池内反查）。
+   *
+   * ⚠️⚠️ **它与上面的 `autoclawIdentityOf` 是两个不同用途，绝不能混用**
+   *    （2026-10-20 审计 P1，真缺陷）：
+   *
+   * | 用途 | 消费者 | 判据 | 口径 |
+   * |---|---|---|---|
+   * | **同账号去重** | `findAccountIdByIdentityField` | `autoclawIdentityOf` | 带渠道前缀 `autoclaw:<id>` |
+   * | **池内按凭据反查** | `findAccountIdByCredential` | **本行** | 裸 `access_token` |
+   *
+   * 原因：`AccountPool.findAccountIdByCredential` 的匹配字段是**写死的**
+   *（`provider === 'codearts' ? 'access_key_id' : 'access_token'`，见该方法注释），
+   * 它拿 `identityOf` 的返回值去和凭据里的 `access_token` **逐字比较**。
+   * ⇒ 把带前缀的 `autoclaw:7c54a9a…` 喂进去**恒不命中**。
+   *
+   * 后果（实测）：`refreshAccountCredential(refName, pool)` 若调用方不传第三参，
+   * 反查失败 ⇒ `syncAccountExpiry` 直接 return ⇒ **池内 `expiresAt` 永不更新**，
+   * UI 一直显示旧有效期。这是 PR122 引入的行为回归
+   *（改前 `identityOf` 返回裸 `access_token`，能命中）。
+   *
+   * ⚠️ 与 `accio-auth.ts` / `cline-auth.ts` / `buddy-auth.ts` 的
+   *    `identityOf: (c) => c.access_token ?? ''` **同一口径** —— 那几家的注释
+   *    都明写「必须是 access_token，因为 `findAccountIdByCredential` 就这么比」。
+   */
   identityOf: (credential) => credential.access_token ?? '',
 }
 
@@ -101,10 +162,22 @@ export class AutoclawAuth extends Service {
   }
 
   /**
-   * 探测本地是否有有效凭据。
+   * 探测本地是否有有效凭据（一键导入）。
+   *
+   * ⚠️ **按产品选 userData 目录**（2026-10-20）：国内版与国际版是同一客户端的
+   * 两份构建（`isOversea` 构建期常量），但 userData 目录名不同：
+   * - 国内：`AutoClaw-official`
+   * - 国际：`AutoClaw-oversea-official`
+   *
+   * 原实现硬编码国内目录 ⇒ **国际版永远导入不到自己的凭据**。
+   *
+   * ⚠️⚠️ 目录名**不再在这里拼**（2026-10-20 审计 P0 后收口）：它已进
+   *    `product.userDataDirName`，因为同一个目录名有**三个读点**
+   *    （本函数 / `resolveDeviceId` / 登录页 `/autoclaw/import-local`），
+   *    原先各写一份 ⇒ PR 只修了本函数，另两处照旧读国内目录。
    */
   async probeLocal(): Promise<AutoclawCredential | undefined> {
-    return probeAutoclawLocalCredential()
+    return probeAutoclawLocalCredential({ product: this.product })
   }
 
   /**
@@ -277,6 +350,57 @@ export class AutoclawAuth extends Service {
   }
 
   /**
+   * **归属校验**：用**本产品自己的**基址探一次余额，确认这份凭据属于本站。
+   *
+   * ## 为什么必须存在（真实事故，2026-10-20）
+   *
+   * 旧代码把 `refName` 写死 `AUTOCLAW_ACCOUNT_*`、且读国内目录 ⇒ 国际版槽位里
+   * 被塞进**国内版凭据**。用户看到的是「国际版卡片显示国内手机号、且已过期」
+   * —— 而凭据本身能解出来、能落盘，**全流程无一处报错**。
+   *
+   * ⇒ 「能读到」不等于「读对了」。国内凭据打国际基址会 `410000 未登录`，
+   *    反之亦然（实测）。
+   *
+   * ## ⚠️⚠️ 为什么抽成 public 方法（审计 P0 的直接产物）
+   *
+   * 凭据落盘有**两条腿**：
+   * 1. `importLocalAccount()` —— 本类内部，原先就调它；
+   * 2. `startLogin()` 的 `started.result` —— 登录页上的「⚡ 一键读取本机凭据」
+   *    （`/autoclaw/import-local`）走这条，结果由 `jet-hub-rpc.ts` **直接
+   *    `credentials.set`** ⇒ 原先把校验留在 `importLocalAccount` 里，
+   *    这条腿**完全绕过**它。
+   *
+   * 审计实测：以 `product: AUTOCLAW_INTL` 起 flow 后请求该端点，被探测的
+   * 路径是 `AutoClaw-official`（国内）⇒ 国内凭据进 `AUTOCLAWINTL_ACCOUNT_*`，
+   * 零报错。
+   *
+   * ⇒ 校验必须**与落盘同址**、且能被两条腿各自调用。
+   *
+   * @param cred - 待落盘的凭据。
+   * @throws 校验失败时抛出**指向性**错误（告诉用户去哪个客户端登录）。
+   */
+  async verifyCredentialSite(cred: AutoclawCredential): Promise<void> {
+    try {
+      const detail = await fetchAutoclawBalanceDetailed(cred, { product: this.product })
+      if (detail.balance === null || detail.balance === undefined) {
+        const site = this.product.id === 'autoclawintl' ? '国际版' : '国内版'
+        throw new Error(
+          `导入的凭据在 AutoClaw${site}校验失败（${detail.error ?? '未知原因'}）`
+          + `——请确认你在 AutoClaw${site}客户端里登录的是${site}账号`,
+        )
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('校验失败')) throw err
+      const reason = err instanceof Error ? err.message : String(err)
+      const site = this.product.id === 'autoclawintl' ? '国际版' : '国内版'
+      throw new Error(
+        `导入的凭据无法通过 AutoClaw${site}校验：${reason}`
+        + `——请确认你在 AutoClaw${site}客户端里登录的是${site}账号`,
+      )
+    }
+  }
+
+  /**
    * 将本地探测到的凭据导入为账号。
    */
   async importLocalAccount(
@@ -288,8 +412,21 @@ export class AutoclawAuth extends Service {
       throw new Error('未检测到本地 AutoClaw 桌面端有效登录凭据，请先在 AutoClaw 中登录')
     }
 
-    const accountId = options?.accountId ?? `autoclaw-${Date.now().toString(36)}`
-    const refName = options?.refName ?? `AUTOCLAW_ACCOUNT_${Date.now().toString(16).toUpperCase()}`
+    // ⚠️⚠️ 归属校验（判据与文案见 {@link verifyCredentialSite} 的类注释）。
+    //    失败即拒绝落盘，而不是把一条「永远查不到余额」的凭据写进去。
+    await this.verifyCredentialSite(cred)
+
+    const accountId = options?.accountId ?? `${this.product.id}-${Date.now().toString(36)}`
+    // ⚠️⚠️ **refName 的前缀必须按产品派生**（2026-10-20 修）：
+    //    原实现写死 `AUTOCLAW_ACCOUNT_${…}` ⇒ 国际版一键导入的凭据会
+    //    **落进国内版命名空间**（`AUTOCLAW_*`），被 `REF_PREFIX_TO_PROVIDER`
+    //    判成 `autoclaw` 账号 —— 用户看到的是「国际版导入后跑到国内面板、
+    //    余额查不到（410000 未登录）」。
+    //    ⇒ 从 `defaultCredentialRef`（`AUTOCLAW_ACCOUNT_DEFAULT` /
+    //      `AUTOCLAWINTL_ACCOUNT_DEFAULT`）截掉 `_DEFAULT` 作为前缀，
+    //      单一真相源，不新增第二份拼写。
+    const refPrefix = this.product.defaultCredentialRef.replace(/_DEFAULT$/, '_')
+    const refName = options?.refName ?? `${refPrefix}${Date.now().toString(16).toUpperCase()}`
 
     const ref = credentialRef(refName)
     await this.ctx.credentials.set(ref, JSON.stringify(cred))
@@ -380,4 +517,72 @@ export class AutoclawAuth extends Service {
       fetchImpl: this.fetchImpl,
     })
   }
+
+  /**
+   * 构造 **Z.ai OAuth** 授权 URL（仅国际版 `autoclawintl` 用）。
+   *
+   * ## 为什么国际版必须走 OAuth 而不是短信
+   *
+   * 国际版**后端也接受短信**（实测 `/userapi/v1/agent-send-code` 在国际基址回
+   * `code=0 SUCCESS`），但国际版账号是**邮箱 + OAuth 创建、没绑手机号**
+   * （`account-profile.json`: `phone: null`），且**没有绑手机的端点**
+   * （`agent-bind-phone` / `bind-phone` 等全 404）⇒ 短信对国际账号不可用。
+   *
+   * ## `state` 的处理：**不生成，透传**
+   *
+   * 官方 `state` 是不透明串（`aosi.<base64url JWT>`，含 `dh` / `nh` 等字段），
+   * 由远端登录页生成。`dh = SHA256(deviceId)` 已破解，但 **`nh` 来源未知**。
+   *
+   * ⚠️ 实测：用**瞎编的** `state` 打 `/userapi/overseasv1/zai-oauth-login`，
+   *    服务端回 `631001 User login error`（= 进了登录逻辑、code 无效），
+   *    **不是**「state 无效」⇒ 服务端不硬校验 `state` 内容。
+   *
+   * ⇒ 本方法**只拼 `client_id` / `redirect_uri` / `response_type`**，
+   *   `state` 留给授权页填，回调时原样透传给 {@link loginWithZaiCode}。
+   *
+   * @param redirectUri - 回调地址（`http://localhost:<port>/auth/callback-zai`）。
+   */
+  buildZaiAuthUrl(redirectUri: string): string {
+    return buildAutoclawZaiAuthUrl(redirectUri)
+  }
+
+  /**
+   * 用 Z.ai 授权码换 token 并落盘（仅国际版）。
+   *
+   * ⚠️ 与 {@link loginWithCode}（短信）并列的**第二条登录腿**：
+   *    - 短信：国内版；国际版短信端点通但账号没绑手机。
+   *    - OAuth：国际版唯一可用路径。
+   *
+   * @param code - 回调 URL 里的 `code`。
+   * @param state - 回调 URL 里的 `state`（**原样透传**，不解析）。
+   * @param navigateUri - 与授权时**完全相同**的回调地址。
+   * @param refName - 凭据 ref 名（登录成功后写它）。
+   */
+  async loginWithZaiCode(
+    code: string,
+    state: string,
+    navigateUri: string,
+    refName: string,
+  ): Promise<LoginAutoclawWithCodeResult> {
+    const res = await exchangeAutoclawZaiCode(code, state, navigateUri, {
+      product: this.product,
+      fetchImpl: this.fetchImpl,
+    })
+    if (res.ok && res.credential) {
+      const ref = credentialRef(refName)
+      await this.ctx.credentials.set(ref, JSON.stringify(res.credential))
+      // 与短信登录同口径：登录后立刻领一次每日积分（失败不反噬登录）。
+      try {
+        await claimAutoclawDailyQuota(res.credential, { product: this.product })
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          `[autoclaw] OAuth 登录后自动领取每日积分失败（不影响登录）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+    return res
+  }
 }
+
+

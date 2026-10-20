@@ -249,7 +249,65 @@ export interface JetHubState {
    * ⚠️ **只对 `minimaxintl` 生效**，中国站不受影响（它不需要绕过）。
    */
   minimaxXff?: string
+  /**
+   * **供应商关闭意图**：provider id → `true`（Gitee issue IKP8OF）。
+   *
+   * ## 它解决什么
+   *
+   * 「关闭供应商」（`provider.setEnabled(false)`）原先**只**把**当时目录里的 id**
+   * 写进模型黑名单，而 `provider.status` 的 `closed` 判据是
+   * `total > 0 && disabled === total`（`total` 取自**当前**全量目录）。
+   * 于是目录**在关闭之后继续变长**（cline 三源异步 + models.dev 可恢复、
+   * 其余家后台刷新器补进上游新模型）⇒ `disabled < total` ⇒ `closed` 从
+   * `true` 翻回 `false` ⇒ 供应商**静默回到「已打开」**，且新模型**仍可选**。
+   * 实测（真实 `ClineAdapter` + 真实 `AccountPool` 走完整 RPC 链路；
+   * 关闭那一刻 models.dev 未就绪 ⇒ 目录 3 条，恢复后补齐到 7 条）：
+   * `{total:3,disabled:3,closed:true}` → `{total:7,disabled:3,closed:false}`。
+   *
+   * ## ⚠️⚠️ 为什么是「意图」而不是「状态」——**不要把它当 `closed` 的权威**
+   *
+   * 本表记的是「用户**要求**它关着」，**不是**「它现在真的全关」。二者必须靠
+   * **双腿取或**才等价（见 `AccountPool.closedProviders` 与 `provider.status`）：
+   *
+   * - 若**只**读本表（issue 原文的第一个建议）⇒ 用户在模型列表里**逐条打开**
+   *   该供应商的模型后，本表仍是 `true` ⇒ 界面显示「已关闭」而模型**全部可选**
+   *   —— 正是 IKJW33 修过的「显示已关闭而模型仍可选」矛盾态；
+   * - 若**只**读派生判据（修复前的形态）⇒ 目录一长就翻回「已打开」（本 issue）。
+   *
+   * ⇒ 判据 = `本表有该 provider` **或** `目录非空且全部已关闭`。
+   * 前者管「目录增长」，后者管「逐条关光也算关闭」（既有语义，有既有用例锁定）。
+   *
+   * ## ⚠️ 为什么它能**同时**修好「新模型仍可选」（这才是真正的危害）
+   *
+   * 本表在 `AccountPool.disabledModelsFor()` 里被读 —— 那是**全部 22 家适配器**
+   * 过滤黑名单的**唯一收口点**（`model-catalog.ts` 的共享骨架、
+   * `autoclaw` / `modelscope` / `officeace` / `opencode` 四个手写实现、
+   * 聚合与 auto 的路由都读它）。故这里**一处实现**就让新增模型在选择器里消失，
+   * 无需在目录落地时异步补写黑名单（那种写法要在 22 家各接一次钩子，
+   * 且读路径写盘、失败还要重试）。
+   *
+   * ⚠️ 但 `listAllModels()`（设置页开关清单）与 `provider.status` 的 `total`
+   * **不套** `disabledModelsFor`（契约要求它们是不套黑名单的全量目录）——
+   * 这正是我们想要的：用户仍能在设置页看到并**逐条打开**这些模型。
+   *
+   * ## ⚠️ 丢失后果**可逆**，故可以住 `state.json`
+   *
+   * 老版本代码整体重写 `state.json` 时会丢掉本键 ⇒ 后果是回到修复前的行为
+   *（目录增长后自动「已打开」），用户再关一次即可 —— 无任何不可逆后果。
+   * 对照 `loomyPermanentLocked`（丢了会真烧永久积分）才需要独立文档。
+   *
+   * 缺键语义 = **没有任何供应商被关闭**，与升级前行为一致。
+   */
+  providerClosed?: ProviderClosedMap
 }
+
+/**
+ * 「供应商关闭意图」表：provider id → `true`。
+ *
+ * ⚠️ 只记 `true`（缺键 = 未关闭），与 {@link ModelDisableMap} 同口径 ——
+ * 不留 `false` 噪音，文档不随开关操作膨胀。
+ */
+export type ProviderClosedMap = Record<string, boolean>
 
 /** 持久化后端的能力标识，供调用方决定要不要告警。 */
 export type JetHubStoreKind = 'settings' | 'file' | 'memory'
@@ -284,6 +342,10 @@ const jetHubSchema = Schema.object({
   // schema，只靠那个函数；两处用同一份判据才不会漂移）。
   // 缺键 = 不附 XFF（行为与修复前逐字节一致）。
   minimaxXff: Schema.string().default(''),
+  // ⚠️ 同 `disabledModels`：用 `Schema.dict(Schema.any())`，取值合法性由
+  // `sanitizeProviderClosed` 在**读写两侧**统一判（老契约后端不经过 schema）。
+  // 缺键 = 没有任何供应商被关闭（与升级前行为一致）。
+  providerClosed: Schema.dict(Schema.any()).default({}),
 })
 
 /**
@@ -493,6 +555,25 @@ export function sanitizeDisabledModels(raw: unknown): ModelDisableMap {
     }
     // 空表不保留：不让文档里留下 `{ provider: {} }` 这类无意义噪音。
     if (Object.keys(perProvider).length > 0) result[provider] = perProvider
+  }
+  return result
+}
+
+/**
+ * 把读到的原始值归一化为 {@link ProviderClosedMap}（Gitee issue IKP8OF）。
+ *
+ * 判据照 {@link sanitizeDisabledModels} 的形态：**只把显式 `true` 视为关闭意图**，
+ * 其余（`false` / `1` / `'true'` / `null` / 对象 / 数组）一律忽略。
+ *
+ * ⚠️ 宽松接受 truthy 是**危险方向**：`'false'` 是非空字符串（truthy），
+ * 被当成关闭意图会让该供应商的**全部模型**静默从选择器消失，用户只看到
+ * 「模型全没了」而无从归因。故必须严格 `=== true`。
+ */
+export function sanitizeProviderClosed(raw: unknown): ProviderClosedMap {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const result: ProviderClosedMap = {}
+  for (const [provider, flag] of Object.entries(raw as Record<string, unknown>)) {
+    if (flag === true) result[provider] = true
   }
   return result
 }
@@ -859,6 +940,7 @@ class SettingsStore implements JetHubStore {
         nativeWebSearchEnabled?: unknown
         providerOrder?: unknown
         minimaxXff?: unknown
+        providerClosed?: unknown
       }
       | undefined
     if (value === undefined || value === null) return undefined
@@ -883,6 +965,8 @@ class SettingsStore implements JetHubStore {
       providerOrder: sanitizeProviderOrder(value.providerOrder),
       // 老文档没这个键 ⇒ `undefined` ⇒ 不附 XFF（与修复前行为逐字节一致）。
       minimaxXff: sanitizeMinimaxXff(value.minimaxXff),
+      // 老文档没这个键 → 空表（没有任何供应商被关闭），与升级前行为一致。
+      providerClosed: sanitizeProviderClosed(value.providerClosed),
     }
   }
 
@@ -933,6 +1017,12 @@ class SettingsStore implements JetHubStore {
       //    进而「国际站明明能用却突然又开始 307」—— 症状极难对应到本键。
       //    缺键/空串一律写 `''`（= 不附头），不会写出 `undefined` 空洞。
       minimaxXff: sanitizeMinimaxXff(state.minimaxXff) ?? '',
+      // ⚠️⚠️ **必须带上本键**（与上面几个新键逐条同因）：`replace` 是**整体替换**
+      //    语义 ⇒ 漏键会让「供应商关闭意图」**永不落盘**，且**任何**账号 / 黑名单 /
+      //    网关 / 顺序写入都会顺带把它抹掉 ⇒ 重启后该供应商**静默回到「已打开」**
+      //    （Gitee issue IKP8OF 原样复发，且用户无从察觉自己「又打开过」它）。
+      //    缺键 / 脏值一律写 `{}`，不会写出 `undefined` 空洞。
+      providerClosed: sanitizeProviderClosed(state.providerClosed),
     })
   }
 }
@@ -1046,6 +1136,13 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   //    —— 漏加会让 `jet-hub-store.spec.ts` 的派生用例变红）。账号 ref 形态沿用
   //    统一规则 `CODELY_ACCOUNT_${suffix}`（`account.create` 的前缀规则）。
   ['CODELY', 'codely'],
+  // ⚠️ 第 19 个 provider（autoclawintl，2026-10-20）—— 同款坑第 **七** 次。
+  // 漏加 = `AUTOCLAWINTL_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
+  // ⚠️ 与 `AUTOCLAW` 是**超串关系**（`AUTOCLAWINTL` 以 `AUTOCLAW` 开头）——
+  //    顺序由 `ACCOUNT_REF_RE` 内部的**长度降序排序**保证，与本数组书写顺序无关
+  //    （与 `MINIMAX` / `MINIMAXINTL` 同型）。
+  ['AUTOCLAWINTL', 'autoclawintl'],
 ]
 
 /** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */
@@ -1158,6 +1255,7 @@ class FileStore implements JetHubStore {
         nativeWebSearchEnabled?: unknown
         providerOrder?: unknown
         minimaxXff?: unknown
+        providerClosed?: unknown
       }
       return {
         accounts: sanitizeAccounts(value.accounts),
@@ -1180,6 +1278,8 @@ class FileStore implements JetHubStore {
         providerOrder: sanitizeProviderOrder(value.providerOrder),
         // 老文档没这个键 ⇒ `undefined` ⇒ 不附 XFF（与修复前行为逐字节一致）。
         minimaxXff: sanitizeMinimaxXff(value.minimaxXff),
+        // 老文档没这个键 → 空表（没有任何供应商被关闭），与升级前行为一致。
+        providerClosed: sanitizeProviderClosed(value.providerClosed),
       }
     } catch (error) {
       this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，本次以空列表启动: ${String(error)}`)
@@ -1239,6 +1339,8 @@ class FileStore implements JetHubStore {
         providerOrder: [],
         // 凭据文件里没有 XFF 设置 → 不附头（与全新安装一致）。
         minimaxXff: undefined,
+        // 凭据文件里也没有关闭意图 → 空表（与全新安装一致）。
+        providerClosed: {},
       }
       try {
         this.write(state)

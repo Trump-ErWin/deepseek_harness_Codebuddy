@@ -515,6 +515,55 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
+    /**
+     * **AutoClaw 国际版**（`autoglm-api.autoglm.ai`）。
+     *
+     * ⚠️⚠️ **为什么是独立 provider 而不是 autoclaw 的站点参数**
+     *    （判据与 `minimaxintl` 完全同款，见 `src/minimax-product.ts` 文件头）：
+     *
+     * | 判据 | 国内 | 国际 |
+     * |---|---|---|
+     * | 账号体系 | 手机号 / `7c54a9ac…`（UUID） | 邮箱 / `2c99dc99…` |
+     * | API 主机 | `autoglm-acceleration-api.zhipuai.cn` | `autoglm-api.autoglm.ai` |
+     * | 登录方式 | 短信验证码 | **Z.ai OAuth** |
+     *
+     *    实测佐证（2026-10-20）：拿国内 token 打国际基址，
+     *    `wallets` / `user-profile` 一律 `410000 用户未登录`、
+     *    推理 `401 Invalid token` ⇒ 用户体系**物理隔离**。
+     *
+     * ⚠️ **实现零复制**：`AutoclawAuth` / `registerAutoclawLlm` / 积分与批次逻辑
+     *    全部复用国内版那一套，只有 `AUTOCLAW_INTL` 配置不同
+     *    （与 `minimaxintl` 同纪律：复制会让同类缺陷修两遍）。
+     *
+     * ⚠️ **当前登录尚未接入**：Z.ai OAuth 的 `state.nh` 来源未知
+     *    （`client_id` 与 `state.dh = SHA256(deviceId)` 已逆向确认）。
+     *    在打通之前本渠道只能手工注入 token 使用。
+     */
+    id: 'autoclawintl',
+    label: 'AutoClaw (国际版)',
+    displayName: 'AutoClaw (国际版)',
+    logoClass: 'autoclaw',
+    credits: { balance: true, dailyCheckin: true },
+    /**
+     * ⚠️ **必须与国内版同格**（2026-10-20 审计 P1 补）。
+     *
+     * 漏它的后果是**用户可见**的：国际版账号卡片 hover 看不到资源包明细
+     * （与 astudio 2026-10-20 那次用户报障同型）。两家共用同一份
+     * `autoclaw-credits.ts`，批次包同样带 `deductionEndTime` ⇒ 能力应当一致。
+     *
+     * ⚠️⚠️ 这个字段曾经**漏了却全绿**：`provider-registry.spec.ts` 把它写成
+     *    **手写名单快照**，于是「漏项」被固化成了期望值 —— 补上它反而变红
+     *    （审计实测：`expected [...(10)] to deeply equal [ Array(9) ]`）。
+     *    ⇒ 同一次整改把那条断言改成**从能力事实派生**（见该 spec 的注释）。
+     */
+    creditPackages: true,
+    // 分档 / 临期逻辑与国内同源（同一份 `autoclaw-credits.ts`）。
+    usesExpiryWindow: true,
+    rateLimit: false,
+    settingsNamespace: 'llm-autoclawintl',
+    channel: true,
+  },
+  {
     id: 'modelscope',
     label: 'ModelScope (魔搭)',
     displayName: 'ModelScope (魔搭)',
