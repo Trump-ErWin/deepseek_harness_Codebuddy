@@ -34,6 +34,28 @@ const codeOf = (text: string) => text
   .replace(/\/\*[\s\S]*?\*\//g, '')
   .replace(/^[ \t]*\/\/.*$/gm, '')
 
+/**
+ * 取**用量浮层的窄屏适配段**（2026-10-17 手机端修复那一段）。
+ *
+ * ⚠️ 为什么要切片而不是对全文断言：`.dim-jh-badgePop` 在样式表里出现多次
+ * （基础规则 + 旧窄屏规则 + 本次新增的视口锚定段），对全文匹配 `left: 8px`
+ * 这类判据可能命中**别的段**而假绿；反向断言（「不得出现 X」）更会被宽屏那份
+ * 干扰成恒假红。
+ *
+ * ⚠️ 锚点用**注释标题**而非规则本身：规则文本在不同段里高度相似，
+ * 而注释标题是这一段唯一的。
+ *
+ * @returns 从该段注释标题起、到 STYLES 模板结束前的规则文本。
+ */
+function narrowPopBlock(styles: string): string {
+  const start = styles.indexOf('── 窄屏：用量浮层')
+  expect(start, '找不到浮层窄屏段的注释标题（可能被改名或删除）').toBeGreaterThan(-1)
+  // ⚠️ 结束锚点：本段是全文件最后一段（其后即为 STYLES 的闭合反引号）。
+  const end = styles.indexOf('\n`', start)
+  expect(end, '找不到 STYLES 模板的闭合位置').toBeGreaterThan(start)
+  return styles.slice(start, end)
+}
+
 describe('用量徽标：槽位接线', () => {
   const index = read('plugin-src/client/index.js')
 
@@ -670,6 +692,93 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
     expect(inline).not.toMatch(/(^|[^\w])maxWidth:/)
     // 窄屏规则必须还留在样式表里
     expect(styles).toMatch(/@media \(max-width: 720px\) \{ \.dim-jh-badgePop \{[^}]*width: 220px/)
+  })
+
+  /**
+   * ⚠️⚠️ 窄屏下浮层必须改**视口锚定**，否则左边缘被裁（报障 2026-10-17，附窄屏截图）。
+   *
+   * ## 缺陷形态（无头 Edge 实测复现）
+   *
+   * 浮层定位走**内联** `right: 0`（以徽标为锚点向左展开）。窄屏下徽标位于
+   * composer 左侧，向左展开 240px 必然越出视口左边界：
+   *
+   * ```
+   * VW=492  badge=134~151  pop=-89~151  w=240  L_OVER=true   ← 左边缘飞出 89px
+   * ```
+   *
+   * 截图里的证据：账号名开头被吃掉、分桶说明只剩右半截（如「长期 1774.82」
+   * 只剩「期 1774.82」）、签到按钮文案被截断。
+   *
+   * ## 为什么**必须** !important
+   *
+   * 内联样式的优先级高于任何非 `!important` 规则（同一教训见上面那条用例：
+   * 内联 width 会压掉 media query）。故窄屏要让浮层改锚定，只能 !important。
+   *
+   * ## ⚠️⚠️ 四条声明缺一不可（每一条都是实测打出来的，不是「顺手写全」）
+   *
+   * | 声明 | 漏掉的后果（均已实测） |
+   * |---|---|
+   * | `left/right: 8px` | 左边缘仍越界 ⇒ 就是本次报障的形态 |
+   * | `bottom` **必须同时覆盖** | 内联是 `bottom: calc(100% + 8px)`：改 fixed 后那个百分比从「composer 高度」变成「视口高度」⇒ 实测 `top=-193`、整块**飞出屏幕上方** |
+   * | `max-width: none` | 被基础规则/旧窄屏规则夹住，与 left/right 同时生效会**互相打架** |
+   * | `z-index` | 宿主侧的窄屏外壳（手机 App 包装层）自带抽屉/详情/遮罩，层级都高于浮层内联的 40 ⇒ 抽屉一拉开就**盖住浮层** |
+   *
+   * ## ⚠️⚠️ z-index 的取值区间是**两头都受限**的，不只「越大越好」
+   *
+   * 这是本用例与同类断言最容易写错的一格：
+   *
+   * - **下限 250**：手机 App 包装层（如 dsh-mobile 的 NATIVE_MOBILE_STYLES）在
+   *   窄屏下把 sidebar/details 抬到 240/241/250 且全带 `!important`。取 100 这类
+   *   「只压过 65~90 那套」的值，在该模式下**照样被盖** —— 症状与没改一样。
+   * - **上限 1000**：本文件的 `.dim-jh-loginOverlay` 是 1000、`.dim-jh-modalOverlay`
+   *   是 3000。浮层若一路加码，就会盖住**自己的**登录页与设置弹窗。
+   *
+   * 故断言写成**区间**而非 `toBeGreaterThan(90)` —— 后者在「取 5000」时也全绿，
+   * 那种值会让浮层盖住设置弹窗，是真实回归。
+   *
+   * ⚠️ 纵向**刻意停在输入区上方**（`bottom: calc(safe-area + 88px)`）而不是贴屏幕底：
+   * 贴底会盖住输入框 —— 那是另一种形态的割裂（原设计本就浮在输入区上方）。
+   */
+  it('⚠️ 窄屏浮层改视口锚定 + 覆盖 bottom/z-index（报障 2026-10-17）', () => {
+    const block = narrowPopBlock(styles)
+    // ① 横向贴视口两侧：无论徽标在哪一侧，浮层都完整落在屏幕内。
+    expect(block, '必须 position: fixed 才能脱离徽标锚点').toMatch(/position: fixed !important/)
+    expect(block).toMatch(/left: 8px !important/)
+    expect(block).toMatch(/right: 8px !important/)
+    // ② 纵向必须一起覆盖：内联的 bottom:calc(100%+8px) 在 fixed 下会按视口高度解析，
+    //    实测把浮层推到 top=-193（整块飞出屏幕上方）。
+    expect(block, '必须覆盖 bottom，否则 fixed 下会飞出屏幕上方').toMatch(/bottom: calc\(env\(safe-area-inset-bottom, 0px\) \+ 88px\) !important/)
+    // ③ 宽度放开：与 left/right 同时生效才能撑满可用宽度（否则两者打架）。
+    expect(block).toMatch(/width: auto !important/)
+    expect(block).toMatch(/max-width: none !important/)
+    // ④ 层级：必须两头都满足（下限压过宿主外壳，上限低于本插件自己的弹窗）。
+    const z = /z-index: (\d+) !important/.exec(block)
+    expect(z, '窄屏浮层必须显式抬 z-index').not.toBeNull()
+    const zValue = Number(z![1])
+    expect(
+      zValue,
+      '必须 > 250：宿主窄屏外壳的 details 是 250 且带 !important，低于它在该模式下照样被盖',
+    ).toBeGreaterThan(250)
+    expect(
+      zValue,
+      '必须 < 1000（.dim-jh-loginOverlay）：否则浮层会盖住本插件自己的登录页',
+    ).toBeLessThan(1000)
+    // 反向断言：不得退回贴屏幕底（那会盖住输入框）。
+    expect(block).not.toMatch(/bottom: 0 !important/)
+  })
+
+  /**
+   * ⚠️ 浮层窄屏块**不得**把内联那几条定位也一起 `!important` 掉 `position: static`
+   * 之类的相反写法 —— 那会让它退化成普通块并撑高宿主输入区（IKKGYN 的老事故）。
+   *
+   * 这条是**反向断言**，理由：本段是全文件唯一用 !important 的地方，
+   * 后来者很容易「顺手」把 overflow/position 一起覆盖掉而看不出问题。
+   */
+  it('窄屏浮层不得把内联定位改回非绝对/非固定（IKKGYN 会复发）', () => {
+    const block = narrowPopBlock(styles)
+    expect(block).not.toMatch(/position: (static|relative)/)
+    // overflow 与最大高度仍要留给「内容超高时自己滚」——不得写 overflow: visible。
+    expect(block).not.toMatch(/overflow[^:]*: visible/)
   })
 
   /**

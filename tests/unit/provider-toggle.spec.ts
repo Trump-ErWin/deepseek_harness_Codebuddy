@@ -38,6 +38,28 @@ function panelBody(): string {
   return offset === -1 ? rest : rest.slice(0, offset + 1)
 }
 
+/**
+ * 取**窄屏（手机适配）那一段** media 查询的规则体。
+ *
+ * ⚠️ 为什么要切片而不是对全文断言：这片样式里 `flex-direction: column` 另有
+ * 17 处（各面板与弹窗自身就是列方向），`width` 更到处都是 —— 对全文匹配
+ * 「有没有 flex-direction: column」是**恒真**的，那种用例没有牙。
+ *
+ * ⚠️ 锚点用**注释标题**（`── 窄屏（手机`），不是 `.dim-jh-layout` 规则本身：
+ * 后者在宽屏区出现一次、窄屏区又一次，按它切会把宽屏那份也吞进来，
+ * 于是「窄屏里不得出现 228px」的反向断言会**恒假红**。
+ *
+ * @returns 从窄屏注释标题起、到该 media 块结束的规则文本（不含宽屏部分）。
+ */
+function narrowScreenBlock(styles: string): string {
+  const start = styles.indexOf('── 窄屏（手机')
+  expect(start, '找不到窄屏主布局的注释标题（可能被改名或删除）').toBeGreaterThan(-1)
+  // 结束锚点取「用量浮层那一段的注释标题」——它紧随其后，是**下一个**独立段落。
+  const end = styles.indexOf('── 窄屏：用量浮层', start)
+  expect(end, '找不到浮层窄屏段的注释标题（用于界定上一段的结束）').toBeGreaterThan(start)
+  return styles.slice(start, end)
+}
+
 describe('groupProviders（左侧分组）', () => {
   it('按 closed 分成两组，且保持传入顺序', () => {
     const providers = [P('a'), P('b'), P('c'), P('d')]
@@ -400,6 +422,69 @@ describe('供应商开关的样式约束（源码级回归）', () => {
     expect(styles).toMatch(/\.dim-jh-rail \{ width: 228px;/)
     // 图标间距与按钮 padding 各收窄 2px 是「用开销换文字宽度」的一部分，别改回去。
     expect(styles).toMatch(/\.dim-jh-provider \{[^}]*gap: 8px; padding: 8px 10px/)
+  })
+
+  /**
+   * ⚠️⚠️ 窄屏（手机 / 远程访问）主布局必须有适配（报障 2026-10-17，附窄屏截图）。
+   *
+   * ## 缺陷形态
+   *
+   * 主布局 `.dim-jh-layout` 是**写死的左右两栏**、`.dim-jh-rail` 固定 228px，
+   * 而文件里原有的 3 处 media 查询**只覆盖弹窗内部**（Token 用量表格、用量徽标），
+   * 一条都没管主布局。窄屏宽度约 400px 时右面板只剩约 76px：
+   *
+   * ```
+   * 400 − 228(rail) − 24×2(宿主 SettingsRoot) − 24×2(面板 padding) ≈ 76px
+   * ```
+   *
+   * 症状是右面板被压成一条窄缝、操作按钮被裁断、中文提示逐字竖排
+   * （截图里「一键领取积分 / 重测所有 / 重置所有」只剩右端露出来）。
+   *
+   * ## 修法与其边界
+   *
+   * 窄屏改为**上下两段**：左栏降级为顶部**横向可滑动**的标签条，右面板获整宽。
+   * 三条判据缺一不可，故逐条点名：
+   * - `flex-direction: column` —— 两栏改两段（只改方向，不动 rail 的 228px 基准，
+   *   故上面那条 228px 断言在宽屏下仍然成立）；
+   * - `overflow-x: auto` —— 标签条必须能横向滑动，否则供应商多了会撑破屏幕；
+   * - `display: contents` —— 分组外壳（railGroup）在横排下必须展平，
+   *   否则每个分组各占一整行（竖排退回）。
+   *
+   * ⚠️ 断言必须锚在**窄屏块内部**，不能对全文匹配：`flex-direction: column`
+   * 在文件里另有 17 处（各面板/弹窗自身），对全文断言会**恒真**（假绿）。
+   */
+  it('⚠️ 窄屏主布局：rail 降级为顶部横滑标签条 + 分组展平（用户报障 2026-10-17）', () => {
+    const block = narrowScreenBlock(styles)
+    expect(block, '窄屏块里必须有 .dim-jh-layout 的列方向切换').toMatch(
+      /\.dim-jh-layout \{ flex-direction: column; \}/,
+    )
+    expect(block, '标签条必须可横向滑动，否则供应商一多就撑破屏幕').toMatch(
+      /\.dim-jh-rail \{[\s\S]*?overflow-x: auto/,
+    )
+    expect(block, 'railGroup 必须 display: contents，否则分组各占一整行').toMatch(
+      /\.dim-jh-railGroup \{ display: contents; \}/,
+    )
+    // 竖排退回的反向断言：分组标题在横排标签条里必须隐藏。
+    expect(block).toMatch(/\.dim-jh-railGroupTitle \{ display: none; \}/)
+  })
+
+  /**
+   * ⚠️ 窄屏块**不得复活**那条 rail 固定宽度：它只该在宽屏生效。
+   *
+   * 反向断言的理由：228px 在窄屏是缺陷的**组成部分**（正是它把右面板压到 76px）。
+   * 若有人「为省事」把 `width: auto` 删掉，窄屏会重新退回固定 228px 的窄缝，
+   * 而宽屏的 228px 断言依然全绿 —— 那种回归只有本用例看得见。
+   *
+   * ⚠️ 判据用「窄屏块内不得出现 width: 228px」而不是「全文不得出现」：
+   * 宽屏那条规则**必须**保留（上面已逐个锁住）。
+   */
+  it('⚠️ 窄屏块内不得把 rail 写回固定宽度（228px 只属于宽屏）', () => {
+    const block = narrowScreenBlock(styles)
+    expect(block).not.toMatch(/\.dim-jh-rail \{[^}]*width: 228px/)
+    // 窄屏必须显式写 width: auto 才能盖掉基础规则的 228px（特异性相同 ⇒ 靠源顺序）。
+    expect(block, '窄屏 rail 必须 width: auto 覆盖基础规则的 228px').toMatch(
+      /\.dim-jh-rail \{[\s\S]*?width: auto/,
+    )
   })
 
   it('弹窗里的开关保持 flex: none（目标控件不参与收缩）', () => {
