@@ -212,8 +212,17 @@ export const AGGREGATE_CAPABILITY_FAILURE_TTL_MS = 30_000
  *
  * ⇒ 改为「退化判决也记忆化，但只记 30 秒」：既不再每轮重试，又比目录 TTL
  * （60 秒）短一半 —— 上游恢复后最迟 30 秒自动拿到完整判决，不需要重启插件。
- * 退化期间声明的窗口是「已成功解析的那部分候选的最大值」，方向上偏**保守**
- * （窗口偏小只是提前触发压缩，偏大才会被上游拒绝）。
+ * ⚠️⚠️ **退化期间声明的窗口方向是「可能偏大」，不是「偏保守」**（2026-10-20 对抗审计实测证伪）：
+ *
+ * | 情形 | 声明值 | 与真实窗口比 | 后果 |
+ * |---|---|---|---|
+ * | 有候选解析成功 | 已成功那部分的最大值 | **≤** 真实最大值 | 保守（提前压缩） |
+ * | **全部候选都失败** | `AGGREGATE_FALLBACK_CONTEXT_WINDOW`（200_000） | 可能 **>** 真实值 | **偏大** ⇒ 压缩阈值推后 ⇒ 上游 `CONTEXT_WINDOW_EXCEEDED` |
+ *
+ * 实测：唯一候选真实窗口 131_072（128K）而解析失败 ⇒ 声明 **200_000**（大 52%）。
+ * 同文件的**冷帧**常量 `AGGREGATE_COLD_CONTEXT_WINDOW`=131_072 才是真保守 ⇒
+ * 两个「保守兜底」方向相反（该取值是**既有行为**，master 上同样是 200_000，
+ * 不是本 PR 引入；本 PR 引入的只是那句写错方向的注释）。
  */
 export const AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS = 30_000
 
@@ -539,6 +548,29 @@ export class AggregateAdapter extends LlmAdapter {
    * ⚠️ 与目录同生命周期：{@link refreshCatalog} 重建目录时一并清空。
    */
   private readonly capabilityFailureCache = new Map<string, number>()
+
+  /**
+   * **在飞**的能力解析（`provider\0realId` → 该次解析的 Promise）。
+   *
+   * ## ⚠️⚠️ 为什么必须有它（2026-10-20 独立审计实测的重复扇出）
+   *
+   * {@link capabilityCache} 只在 `await` **之后**才写 ⇒ 同一拍的重复询问全部穿透：
+   *
+   * - 宿主 `buildModelCatalog` 对**每个虚拟模型**并行调 `resolveModelInfo`，而一个
+   *   候选常常**同时**挂在多个虚拟模型下（同一个 realId 在多渠道归一成一个键）；
+   * - `auto` 的池与具名模型的候选表**重叠**。
+   *
+   * 实测（18 渠道 × 40 模型、41 个虚拟模型并行）：**738** 次 `resolveModelInfo`
+   * 调用、单候选最多被重复解析 **2** 次；改前（无封顶、无在飞合并）峰值 720。
+   *
+   * ⇒ 本表把「同一个候选的并发询问」合并成**一次**底层解析（`Promise` 共享）。
+   * ⚠️ **不得缓存失败的 Promise**：`finally` 里无条件删（成功/失败都删），否则
+   * 一次失败会像「失败短缓存」那样被固化 —— 那只由
+   * {@link capabilityFailureCache} 按 30 秒显式控制。
+   * ⚠️ 与目录同生命周期：{@link refreshCatalog} 一并清空（`Map.clear()` 只丢引用，
+   * 已在飞的 Promise 仍会跑完并各自写 `capabilityCache`，无害）。
+   */
+  private readonly capabilityInFlight = new Map<string, Promise<CandidateCapability>>()
 
   /**
    * 每个虚拟模型（含 `auto`）的**窗口声明值**缓存。
@@ -1086,6 +1118,7 @@ export class AggregateAdapter extends LlmAdapter {
     this.capabilityCache.clear()
     this.contextWindowCache.clear()
     this.capabilityFailureCache.clear()
+    this.capabilityInFlight.clear()
     // ⚠️⚠️ **维持「整个 provider 已关闭」的语义**（真实缺陷，实测复现）。
     //
     // ## 机制（本适配器的**动态目录**与宿主「一键关闭」的**快照**假设相撞）
@@ -2166,14 +2199,42 @@ export class AggregateAdapter extends LlmAdapter {
     // 真实代价：`auto` 全候选失败时会依次尝试 100+ 次（trae 一家就 32 个模型），
     // 每次都可能是网络超时 ⇒ 长时间挂起。
     const limit = maxAttemptsFor(this.catalog)
-    const targets: DispatchTarget[] = []
-    for (const candidate of ranked.slice(0, limit)) {
-      const capability = await this.capabilityOf(candidate.provider, candidate.realId, signal)
+    // ⚠️⚠️ **并发解析，不是串行**（2026-10-20 审计补修 —— PR 的根因分析点名了这条路径
+    //    却没改它）。
+    //
+    // 原实现是 `for (const candidate of ranked.slice(0, limit)) { await this.capabilityOf(...) }`
+    // ⇒ 总耗时是**各候选之和**。而被 `slice` 截断后的长度是 `maxAttemptsFor(catalog)`
+    // = **所有虚拟模型里最长候选表的长度**（实测 14，`auto` 池可达 182+）⇒ 只要其中
+    // 有 k 个候选各自要等满 `AGGREGATE_CAPABILITY_TIMEOUT_MS`（默认 3 秒），
+    // `prepareCall` 就要白等 `k × 3s`。
+    //
+    // 实测（`capabilityTimeoutMs: 120`、3 个挂死候选）：
+    // ```
+    // 串行：prepareCall = 130ms（≈ 1×预算，因为三者中只有一个真挂）
+    //      换成 3 个全挂 ⇒ ≈ 3×预算；候选越多越线性放大
+    // 并发：恒 ≈ 1×预算
+    // ```
+    // `contextWindowFor` 早已并发（同一轮里它先跑，故那条路径的耗时是 1× 预算），
+    // 只改一半时 `prepareCall` 仍被本段拖回 `N×` —— 这正是「修了一半」的形态。
+    //
+    // ⚠️ 并发是安全的：每个候选的 `capabilityOf` 只读 `resolveModelInfo` 并写**自己的**
+    // 缓存键（`provider\0realId`），彼此无依赖、无共享可变状态。
+    // ⚠️ `Promise.all` 而非 `allSettled`：中止（`AbortError`）必须原样逃逸
+    //（与 `contextWindowFor` 同口径）；非中止的失败已被 `capabilityOf` 折算成
+    // `resolved: false` 的保守值，不会让 `Promise.all` reject。
+    // ⚠️ **保序**：`Promise.all` 的结果与输入同序 ⇒ `targets` 的顺序仍是
+    // `rankCandidates` 给出的临期序（派发顺序是这个适配器的核心语义，绝不能乱）。
+    const picked = ranked.slice(0, limit)
+    const capabilities = await Promise.all(
+      picked.map((candidate) => this.capabilityOf(candidate.provider, candidate.realId, signal)),
+    )
+    const targets: DispatchTarget[] = picked.map((candidate, index) => {
+      const capability = capabilities[index]!
       // ⚠️ 只取 `DispatchTarget` 需要的两项：`capability` 上的 `contextWindow` /
       //    `resolved` 是本适配器内部的推导中间量，摊进目标对象只会在日志与
       //    序列化里留下无意义的字段（`resolved` 尤其容易被误读成「这次请求成功了」）。
-      targets.push({ ...candidate, efforts: capability.efforts, imageCapable: capability.imageCapable })
-    }
+      return { ...candidate, efforts: capability.efforts, imageCapable: capability.imageCapable }
+    })
     // ⚠️ 只在**非空**时写缓存：空候选通常意味着「所有渠道都不可用」——那是**瞬时**
     // 状态（如额度刚好用尽、账号正在限流），缓存 60 秒会让用户在这期间即使恢复了
     // 也仍报「没有任何可用候选」。
@@ -2292,6 +2353,36 @@ export class AggregateAdapter extends LlmAdapter {
       // 到期即清（不要留着陈旧时刻，否则下次再看还得重算一遍）。
       this.capabilityFailureCache.delete(key)
     }
+    // ⚠️⚠️ **在飞合并**（{@link capabilityInFlight}）：同一候选的并发询问共享一次
+    //    底层解析。实测宿主对 41 个虚拟模型并行 `resolveModelInfo` 时，同一候选会被
+    //    重复解析 2 次（`capabilityCache` 在 `await` 之后才写，挡不住同一拍）。
+    //    ⚠️ **只共享成功值**：失败不进 `capabilityInFlight`（`finally` 无条件删），
+    //    失败固化只由 `capabilityFailureCache` 按 30 秒显式控制。
+    const inFlight = this.capabilityInFlight.get(key)
+    if (inFlight !== undefined) return await inFlight
+    const task = this.resolveCapability(provider, realId, key, now, signal)
+    this.capabilityInFlight.set(key, task)
+    try {
+      return await task
+    } finally {
+      // ⚠️ 无条件删（成功与失败都删）：失败**不得**在这里被记住 —— 那只由
+      //    {@link capabilityFailureCache} 按 30 秒显式控制。
+      if (this.capabilityInFlight.get(key) === task) this.capabilityInFlight.delete(key)
+    }
+  }
+
+  /**
+   * {@link capabilityOf} 的**单次**解析体（在飞合并的实际执行部分）。
+   *
+   * ⚠️ 抽出来是为了让「在飞合并」只包一层：`capabilityOf` 负责查两张缓存 + 登记/清除在飞表，本方法只做「问一次 + 折算」。
+   */
+  private async resolveCapability(
+    provider: string,
+    realId: string,
+    key: string,
+    now: number,
+    signal?: AbortSignal,
+  ): Promise<CandidateCapability> {
     try {
       const info = await this.resolveWithBudget(provider, realId, signal)
       const efforts = (info.reasoning?.efforts ?? [])
@@ -2374,17 +2465,30 @@ export class AggregateAdapter extends LlmAdapter {
       : AbortSignal.any([signal, controller.signal])
     let timedOut = false
     let timer: ReturnType<typeof setTimeout> | undefined
+    /** 构造「放弃等待」哨兵（**只在这一处构造**，见下方 catch 分支的注释）。 */
+    const deadlineError = (): Error => {
+      const error = new Error(
+        `aggregate: 候选 ${provider}/${realId} 的能力解析超过 ${budgetMs}ms（放弃等待，不取消用户请求）`,
+      )
+      error.name = CAPABILITY_DEADLINE_NAME
+      return error
+    }
     const budget = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
         timedOut = true
-        // ⚠️ 先 abort 再 reject：`resolveModelInfo` 的适配器实现会检查 `signal`，
+        // ⚠️ **顺序是承重件**：先 `reject` 哨兵、再 `abort`。
+        //
+        // 反过来写（先 abort 再 reject）时，`abort` 会**同步**触发底层适配器的
+        // `signal` 监听器 —— 真实实现（fetch / undici）在那里以 `AbortError`
+        // 结算 ⇒ 该 Promise 的 race 反应**先于**哨兵入队 ⇒ `Promise.race` 以
+        // `AbortError` 结算 ⇒ `capabilityOf` 的 `isAbortLike` 把它读成「用户取消」
+        // 原样抛出 ⇒ **整轮请求失败**，而真相只是某个渠道的元数据读慢了
+        // （实测复现：`THREW name=AbortError`，见 `aggregate-adapter.spec.ts` 的
+        // 「预算到期 ≠ 调用方取消」）。
+        reject(deadlineError())
+        // ⚠️ 再 abort：`resolveModelInfo` 的适配器实现会检查 `signal`，
         //    abort 能让**可中断**的部分立刻收尾，避免泄漏在途请求。
         controller.abort()
-        const error = new Error(
-          `aggregate: 候选 ${provider}/${realId} 的能力解析超过 ${budgetMs}ms（放弃等待，不取消用户请求）`,
-        )
-        error.name = CAPABILITY_DEADLINE_NAME
-        reject(error)
       }, budgetMs)
       ;(timer as unknown as { unref?: () => void }).unref?.()
     })
@@ -2396,11 +2500,19 @@ export class AggregateAdapter extends LlmAdapter {
       const pending = this.ctx.llm.resolveModelInfo(provider, realId, composed)
       void pending.catch(() => {})
       return await Promise.race([pending, budget])
+    } catch (error) {
+      // ⚠️⚠️ **兜住「abort 抢赢 race」这条竞态**（真实缺陷，2026-10-20 两轮独立
+      //    审计 + 本轮复核实测）。上面的顺序调整能让哨兵**通常**赢，但胜负取决于
+      //    微任务入队次序，而各适配器的结算形态不同（`async` 包装会多一拍、
+      //    裸 `new Promise` 在 abort 里同步 reject 则少一拍）⇒ **不能只靠顺序**。
+      //    判据用 `timedOut`（我们自己的预算确实到期了）：此时无论谁赢，结论都是
+      //    「放弃等待」而不是「调用方取消」⇒ 一律折算成哨兵。
+      //    ⚠️ 调用方真取消（`signal.aborted`）时 `timedOut` 为 `false`，
+      //    原样抛出 `AbortError` —— 两条语义仍然分得开。
+      if (timedOut) throw deadlineError()
+      throw error
     } finally {
       if (timer !== undefined) clearTimeout(timer)
-      // ⚠️ 无论成败都要把**我们自己的** controller 收掉，否则被放弃的那次解析
-      //    会一直挂着一个已 resolve 的 race 却仍在跑的 Promise。
-      if (timedOut) controller.abort()
     }
   }
 
@@ -2451,8 +2563,18 @@ export class AggregateAdapter extends LlmAdapter {
    * {@link AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS}（30 秒，目录 TTL 的一半）。
    * 这样既不再每轮重试坏候选，又能在上游恢复后最迟 30 秒自动纠正 ——
    * 「不固化瞬时故障」这条**约束**仍然成立，只是把「永不缓存」换成了「缓存很短」。
-   * 退化期间声明的窗口是「已成功解析那部分候选的最大值」，方向上偏**保守**
-   * （窗口偏小只会提前触发压缩；偏大才会被上游拒绝）。
+   * ⚠️⚠️ **退化期间声明的窗口方向是「可能偏大」，不是「偏保守」**（2026-10-20
+   * 对抗审计实测证伪）：
+   *
+   * | 情形 | 声明值 | 与真实窗口比 | 后果 |
+   * |---|---|---|---|
+   * | 有候选解析成功 | 已成功那部分的最大值 | **≤** 真实最大值 | 保守（提前压缩） |
+   * | **全部候选都失败** | `AGGREGATE_FALLBACK_CONTEXT_WINDOW`（200_000） | 可能 **>** 真实值 | **偏大** ⇒ 压缩阈值推后 ⇒ 上游 `CONTEXT_WINDOW_EXCEEDED` |
+   *
+   * 实测：唯一候选真实窗口 131_072（128K）而解析失败 ⇒ 声明 **200_000**（大 52%）。
+   * 同文件的**冷帧**常量 `AGGREGATE_COLD_CONTEXT_WINDOW`=131_072 才是真保守 ⇒
+   * 两个「保守兜底」方向相反（该取值是**既有行为**，master 上同样是 200_000，
+   * 不是本 PR 引入；本 PR 引入的只是那句写错方向的注释）。
    *
    * ⚠️ 完整判决（全部候选都解析成功）的有效期跟目录 TTL 走，因为它由
    * {@link refreshCatalog} 重建目录时统一清空兜住。
@@ -2477,6 +2599,29 @@ export class AggregateAdapter extends LlmAdapter {
       // 到期即清（留着陈旧项只会让下一次命中再算一遍 TTL）。
       this.contextWindowCache.delete(modelKey)
     }
+    // ⚠️⚠️ **必须先去重 + 封顶，再并发**（2026-10-20 独立审计实测的放大面）：
+    //
+    // `auto` 的候选表是 `autoCandidates()` = **全池去重**（实测 1–2 百条），而
+    // `candidatesFor` 那条路径有 `ranked.slice(0, limit)`（`maxAttemptsFor`，实测 14）
+    // 封顶。本方法原先**没有任何封顶** ⇒ 一次 `auto` 的窗口推导会同时发起全池
+    // 条 `resolveModelInfo`；再叠加宿主 `buildModelCatalog` 对**每个模型**的并行
+    // 调用 ⇒ 实测峰值在飞 **364**（14 渠道 × 13 模型）、只解析 `auto` 时 **182**。
+    //
+    // 同时候选表里**重复项**（同一个 `provider\0realId` 出现多次）会被**并发重复**
+    // 解析 —— `capabilityCache` 是在 `await` **之后**才写的，挡不住同一拍的重复
+    // 请求。实测「4 个虚拟模型并发」时 12 个候选各被解析 2 次（`peak=27`）。
+    //
+    // ⇒ 两条腿一起补：① `Map` 按 `provider\0realId` 去重（顺带天然合并在飞请求）；
+    //   ② 与 `candidatesFor` **同一个封顶**（`maxAttemptsFor`）。
+    //   ⚠️ `maxAttemptsFor` 本就等于「最长候选表长度」⇒ 对**具名**虚拟模型不会
+    //   截断任何候选；只有 `auto` 的巨池会被封顶（那正是要防的）。
+    const keyOf = (candidate: { provider: string; realId: string }): string =>
+      `${candidate.provider}\u0000${candidate.realId}`
+    const unique = new Map<string, { provider: string; realId: string }>()
+    for (const candidate of candidates) {
+      if (!unique.has(keyOf(candidate))) unique.set(keyOf(candidate), candidate)
+    }
+    const picked = [...unique.values()].slice(0, maxAttemptsFor(this.catalog))
     // ⚠️⚠️ **并发解析而不是串行**（用户报障 2026-10-20 实测）：
     //    串行时总耗时是「全部候选之和」，而候选可达 13+ 家；其中任何一家慢
     //    （实测 autoclaw 的目录端点在 DNS/TCP 层挂 21.6 秒）都会把整轮拖满。
@@ -2484,7 +2629,7 @@ export class AggregateAdapter extends LlmAdapter {
     //    ⚠️ `Promise.all` 而非 `allSettled`：中止（`AbortError`）必须原样逃逸，
     //    而 `capabilityOf` 已把「非中止的失败」折算成 `resolved: false`。
     const capabilities = await Promise.all(
-      candidates.map((candidate) => this.capabilityOf(candidate.provider, candidate.realId, signal)),
+      picked.map((candidate) => this.capabilityOf(candidate.provider, candidate.realId, signal)),
     )
     let widest: number | undefined
     let allResolved = true
