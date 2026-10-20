@@ -136,6 +136,88 @@ export const AGGREGATE_CATALOG_TTL_MS = 60_000
 export const AGGREGATE_BACKGROUND_REFRESH_TIMEOUT_MS = 60_000
 
 /**
+ * **单个候选**能力解析（`resolveModelInfo`）的超时预算（毫秒）。
+ *
+ * ## ⚠️⚠️ 为什么必须逐候选设预算（用户报障 2026-10-20 实测）
+ *
+ * 报障现象：`aggregate/deepseek-v4-1-flash` 有 **21%** 的请求在**到达上游之前**
+ * 就等了 55–239 秒（同模型**直连** workbuddy 只有 1%）。用严格一对一配对测得：
+ *
+ * ```
+ * aggregate/deepseek-v4-1-flash   n=336  中位=60.3s  p90=83.0s  ≥55s=231 (68.5%)
+ * workbuddy/deepseek-v4.1-flash   n=265  中位= 0.8s  p90= 1.1s  ≥55s=  0 ( 0.0%)
+ * ```
+ *
+ * 根因不是余额折算（43 个账号全串行实测 11.2 秒）、不是目录刷新（20 分钟 TTL），
+ * 而是**候选池里只要有一个渠道的 `resolveModelInfo` 会挂住/失败**，就每轮都要
+ * 重新等它一次 —— 因为失败结果不进 `capabilityCache`（见那里的注释），而
+ * `contextWindowFor` 又要求「全部候选都成功」才记忆化（见那里的注释）。
+ *
+ * 实测复现（`autoclaw` 的目录端点在 DNS/TCP 层 ETIMEDOUT，`AbortController`
+ * 管不到它自己的 8 秒 timer）：
+ * ```
+ * 第1次 prepareCall = 16015 ms   第2次 = 8001 ms   第3次 = 8009 ms
+ * contextWindowCache 命中? ★否 —— 永不记忆化
+ * ```
+ * 而 `buildModelCatalog` 会对目录里**每个虚拟模型**各调一次 `resolveModelInfo`
+ * ⇒ 1/5/10 个虚拟模型 = 508/2551/5102 ms，**严格线性放大**。
+ *
+ * ## 为什么是 3 秒
+ *
+ * 各渠道的 `resolveModelInfo` 绝大多数是**纯本地查表**（`createModelCatalog` 的
+ * `loadCatalog`，实测 1–17ms）；只有少数会在目录未就绪时真发网络，正常也在
+ * 100–800ms 量级。3 秒是「健康路径的 3–30 倍余量、坏候选的 1/7」——
+ * 既不会误伤慢但正常的渠道，也不会让一个挂住的候选吃掉整轮预算。
+ *
+ * ⚠️ **超时不等于取消**：这里放弃的只是一次**能力元数据**解析（窗口/档位/图片），
+ * 不涉及用户请求本身。放弃后按保守方向回落（无档位 / 不支持图片 / 无窗口），
+ * 由 {@link AGGREGATE_FALLBACK_CONTEXT_WINDOW} 兜住窗口，行为与「解析失败」完全一致。
+ */
+export const AGGREGATE_CAPABILITY_TIMEOUT_MS = 3_000
+
+/**
+ * **失败**的能力解析结果的缓存时长（毫秒），远小于目录 TTL（60 秒）。
+ *
+ * ## ⚠️⚠️ 这是「不缓存失败」与「每轮重试坏候选」之间的折中
+ *
+ * `capabilityCache` 的注释明确禁止把失败缓存 60 秒 —— 那会把**瞬时**故障
+ * 固化成单向门（`AGENTS.md` 反复记录的缺陷形态）。但「完全不缓存」在候选池里
+ * 存在**持续**故障的渠道时走向另一个极端：每一轮请求、每一次目录构建都要
+ * 重新等它超时（实测 8–21 秒 × 每轮）。
+ *
+ * ⇒ 取 30 秒：比一次用户交互长（同轮内的多次 `capabilityOf` 调用全部命中缓存，
+ * `buildModelCatalog` 的线性放大随之消失），又比目录 TTL 短一半（上游恢复后
+ * 最迟 30 秒自动重试成功，不需要重启插件）。
+ *
+ * ⚠️ **恢复即清**：解析成功时立刻 `delete` 该键的失败记录，不必等 TTL 到期。
+ */
+export const AGGREGATE_CAPABILITY_FAILURE_TTL_MS = 30_000
+
+/**
+ * **退化**的窗口判决（有候选没解析成功）的缓存时长（毫秒）。
+ *
+ * ## ⚠️⚠️ 为什么退化判决也必须记忆化（用户报障 2026-10-20 实测）
+ *
+ * 原实现是「只有**每一个**候选都解析成功时才记忆化」（见
+ * {@link AggregateAdapter.contextWindowFor} 的长注释）。那条判据的**动机是对的**
+ * （不能把瞬时故障固化成 60 秒的单向门），但**手段过强**：
+ *
+ * ```
+ * 第1次 prepareCall = 16015 ms   第2次 = 8001 ms   第3次 = 8009 ms
+ * contextWindowCache 命中? ★否 —— 永不记忆化
+ * ```
+ *
+ * 候选池里只要有一个渠道持续故障，该虚拟模型的窗口声明就**永不进缓存** ⇒
+ * 每一轮请求、每一次 `buildModelCatalog` 都要把全部候选重新解析一遍。
+ *
+ * ⇒ 改为「退化判决也记忆化，但只记 30 秒」：既不再每轮重试，又比目录 TTL
+ * （60 秒）短一半 —— 上游恢复后最迟 30 秒自动拿到完整判决，不需要重启插件。
+ * 退化期间声明的窗口是「已成功解析的那部分候选的最大值」，方向上偏**保守**
+ * （窗口偏小只是提前触发压缩，偏大才会被上游拒绝）。
+ */
+export const AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS = 30_000
+
+/**
  * **冷帧**（目录尚未推导出来）时 `resolveModel` 声明的上下文窗口。
  *
  * ## ⚠️⚠️ 这不是「聚合模型的窗口」，是「此刻我们还不知道」时的**保守声明**
@@ -223,6 +305,28 @@ interface CandidateCapability {
   resolved: boolean
 }
 
+/**
+ * 一条**窗口判决**缓存项（{@link AggregateAdapter.contextWindowCache} 的值）。
+ *
+ * ⚠️ 为什么不直接存 `number`：判决分两种质量，它们的有效期**必须不同** ——
+ * 全部候选都解析成功的是**完整判决**（有效期 = 目录 TTL，因为它是纯函数），
+ * 有候选没解析成功的是**退化判决**（有效期只有 30 秒，见
+ * {@link AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS}）。只存数字就无法区分这两者。
+ */
+interface ContextWindowEntry {
+  /** 声明的窗口值（`widest ?? AGGREGATE_FALLBACK_CONTEXT_WINDOW`）。 */
+  window: number
+  /** 判决时刻（用于 TTL 判定）。 */
+  at: number
+  /**
+   * 是否**退化**判决：`true` = 当时至少有一个候选没解析成功。
+   *
+   * ⚠️ 退化判决仍然可用（窗口值是「已成功解析那部分的最大值」，偏保守），
+   * 只是有效期短 —— 上游恢复后要尽快拿到完整判决。
+   */
+  degraded: boolean
+}
+
 export interface AggregateAdapterOptions {
   accountPool: AccountPool
   /** 注入的当前时刻（测试用）。 */
@@ -239,6 +343,29 @@ export interface AggregateAdapterOptions {
    * 标记永不清」的守卫用例得跑满 60 秒（本仓库明确禁止这种 flaky 判据）。
    */
   backgroundRefreshTimeoutMs?: number
+  /**
+   * 单个候选能力解析的超时预算（测试用；生产用
+   * {@link AGGREGATE_CAPABILITY_TIMEOUT_MS}）。
+   *
+   * ⚠️ 存在的理由与 `backgroundRefreshTimeoutMs` 同：它必须是**可注入**的，
+   * 否则那条「坏候选不得拖住整轮」的守卫用例得跑满 3 秒 × N，本仓库明确禁止
+   * 这种拖慢全量套件的判据。
+   */
+  capabilityTimeoutMs?: number
+  /**
+   * 失败的能力解析结果的缓存时长（测试用；生产用
+   * {@link AGGREGATE_CAPABILITY_FAILURE_TTL_MS}）。
+   *
+   * ⚠️ 同上：不可注入就无法在单测里验证「TTL 到期后会重试」，只能等 30 秒。
+   */
+  capabilityFailureTtlMs?: number
+  /**
+   * **退化**窗口判决的缓存时长（测试用；生产用
+   * {@link AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS}）。
+   *
+   * ⚠️ 同上：不可注入就只能等 30 秒才能验证「到期后重新解析」。
+   */
+  contextWindowDegradedTtlMs?: number
   /**
    * 目录**落地**（后台那一轮成功写入 `this.catalog`）后的通知钩子。
    *
@@ -375,7 +502,8 @@ export class AggregateAdapter extends LlmAdapter {
    * 失败时 `capabilityOf` 返回保守默认值（无档位 / 不支持图片 / 无窗口）。
    * 把「这一次没问出来」缓存 60 秒会把**瞬时**故障固化成单向门 —— 那正是
    * 本仓库反复修过的缺陷形态（见 `AGENTS.md` 的「`refreshable` 单向门」）。
-   * ⇒ 失败不写缓存，下一次调用照常重试；上游恢复后自动生效。
+   * ⇒ 失败不写本缓存；**失败记录进 {@link capabilityFailureCache}，只有 30 秒**，
+   * 见那里的注释（完全不缓存会让持续故障的候选每轮都被重试一遍）。
    *
    * ⚠️ 与目录同生命周期：{@link refreshCatalog} 重建目录时清空 —— 目录变了，
    *    「哪些候选存在」就变了，缓存必须跟着失效。
@@ -383,13 +511,45 @@ export class AggregateAdapter extends LlmAdapter {
   private readonly capabilityCache = new Map<string, CandidateCapability>()
 
   /**
+   * **失败**的能力解析记录（`provider\0realId` → 失败时刻）。
+   *
+   * ## ⚠️⚠️ 为什么需要它（用户报障 2026-10-20 实测）
+   *
+   * 只有 {@link capabilityCache}（只存成功）时，候选池里**任何一个**持续故障的
+   * 渠道都会让每一轮请求都重新等它超时：
+   *
+   * ```
+   * 第1次 prepareCall = 16015 ms   第2次 = 8001 ms   第3次 = 8009 ms
+   * contextWindowCache 命中? ★否 —— 永不记忆化
+   * ```
+   *
+   * 而 `buildModelCatalog` 对目录里**每个虚拟模型**各调一次 `resolveModelInfo`
+   * ⇒ 坏候选的代价被乘以虚拟模型数（实测 1/5/10 个 = 508/2551/5102 ms）。
+   *
+   * ## 与「不得缓存失败」的关系
+   *
+   * 本表**不是**把失败当成成功缓存：命中时返回的仍是 `resolved: false` 的保守值，
+   * 且 TTL 只有 {@link AGGREGATE_CAPABILITY_FAILURE_TTL_MS}（30 秒，目录 TTL 的一半）。
+   * 它解决的是「同一轮内反复问同一个坏候选」，不是「永远不再问」。
+   *
+   * ⚠️ **解析成功时立刻 `delete` 该键**：上游恢复后不必等 TTL 到期。
+   * ⚠️ **中止（`isAbortLike`）不写本表**：中止不是「候选坏了」，写进去会让用户
+   *    取消一次请求后，该候选在 30 秒内被当成故障候选（真实缺陷形态，见
+   *    `capabilityOf` 的 catch 分支注释）。
+   * ⚠️ 与目录同生命周期：{@link refreshCatalog} 重建目录时一并清空。
+   */
+  private readonly capabilityFailureCache = new Map<string, number>()
+
+  /**
    * 每个虚拟模型（含 `auto`）的**窗口声明值**缓存。
    *
    * ⚠️ 判决结果是「候选集的最大值」，是个**纯函数**（同一份目录 + 同一份能力缓存
    * 必然得到同一个值）⇒ 记忆化不改变语义，只是避免每次 `resolveModel` 都重算。
    * ⚠️ 同样在 {@link refreshCatalog} 里清空（目录变了 ⇒ 候选集变了 ⇒ 最大值可能变）。
+   * ⚠️ 值是 {@link ContextWindowEntry} 而不是裸 `number`：**退化判决**（有候选没解析
+   * 成功）的 TTL 必须比正常判决短得多，见那里的注释。
    */
-  private readonly contextWindowCache = new Map<string, number>()
+  private readonly contextWindowCache = new Map<string, ContextWindowEntry>()
 
   constructor(private readonly ctx: Context, private readonly options: AggregateAdapterOptions) {
     super()
@@ -925,6 +1085,7 @@ export class AggregateAdapter extends LlmAdapter {
     // 用户看到的窗口与压缩阈值**长期错误**（本适配器刚修的就是这类缺陷）。
     this.capabilityCache.clear()
     this.contextWindowCache.clear()
+    this.capabilityFailureCache.clear()
     // ⚠️⚠️ **维持「整个 provider 已关闭」的语义**（真实缺陷，实测复现）。
     //
     // ## 机制（本适配器的**动态目录**与宿主「一键关闭」的**快照**假设相撞）
@@ -2107,6 +2268,11 @@ export class AggregateAdapter extends LlmAdapter {
    * 理由见 {@link DispatchTarget.imageCapable} 与 {@link AGGREGATE_FALLBACK_CONTEXT_WINDOW}。
    *
    * ⚠️ **成功的解析结果进 {@link capabilityCache}**（见那里的长注释：失败**不**缓存）。
+   *
+   * ⚠️⚠️ **每次解析都有独立预算**（{@link AGGREGATE_CAPABILITY_TIMEOUT_MS}，默认 3 秒）。
+   * 没有它时，候选池里一个在 DNS/TCP 层挂住的渠道（实测 `autoclaw` 的目录端点
+   * ETIMEDOUT 21.6 秒，它自己的 8 秒 `AbortController` 管不到）会让**每一轮**请求
+   * 都白等一次；`buildModelCatalog` 又会把它乘以虚拟模型数。见常量处的实测数据。
    */
   private async capabilityOf(
     provider: string,
@@ -2116,8 +2282,18 @@ export class AggregateAdapter extends LlmAdapter {
     const key = `${provider}\u0000${realId}`
     const cached = this.capabilityCache.get(key)
     if (cached !== undefined) return cached
+    // ⚠️ 失败短缓存（{@link capabilityFailureCache}）：TTL 内的重复询问直接回保守值，
+    //    不再等一次超时。命中**不算**成功，返回的仍是 `resolved: false`。
+    const now = this.options.now?.() ?? Date.now()
+    const failedAt = this.capabilityFailureCache.get(key)
+    if (failedAt !== undefined) {
+      const ttl = this.options.capabilityFailureTtlMs ?? AGGREGATE_CAPABILITY_FAILURE_TTL_MS
+      if (now - failedAt < ttl) return { efforts: [], imageCapable: false, resolved: false }
+      // 到期即清（不要留着陈旧时刻，否则下次再看还得重算一遍）。
+      this.capabilityFailureCache.delete(key)
+    }
     try {
-      const info = await this.ctx.llm.resolveModelInfo(provider, realId, signal)
+      const info = await this.resolveWithBudget(provider, realId, signal)
       const efforts = (info.reasoning?.efforts ?? [])
         .map((effort) => String(effort.id))
         .filter((id) => id.length > 0)
@@ -2132,6 +2308,13 @@ export class AggregateAdapter extends LlmAdapter {
         ...info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
       }
       this.capabilityCache.set(key, capability)
+      // ⚠️ 清掉失败记录。**当前这一步没有行为效果**（变异测试实测：删掉它全部用例仍绿）：
+      //    `capabilityCache` 在方法开头就先查，成功写入后失败记录再也不会被读到
+      //    （唯一会清 `capabilityCache` 的 `refreshCatalog` 同时清本表）。
+      //    保留它是**防御性**的：①内存卫生（不留 30 秒的死条目）；
+      //    ②若将来有人调整两个缓存的查询优先级，这里不会变成「成功之后仍被
+      //    30 秒前的失败记录压住」的静默缺陷。
+      this.capabilityFailureCache.delete(key)
       return capability
     } catch (error) {
       // ⚠️⚠️ **中止不得被折算成「无档位 / 不支持图片」**（真实缺陷，全分支终审 I3：
@@ -2150,9 +2333,74 @@ export class AggregateAdapter extends LlmAdapter {
       // 用户看到「候选渠道都不支持图片输入」这类与中止无关的误导性报错。
       signal?.throwIfAborted()
       if (isAbortLike(error, signal)) throw error
-      // ⚠️ 走这里的结果**不入缓存**（见 `capabilityCache` 的注释）——否则一次瞬时
-      //    失败会让该候选在整段 TTL 内恒被当成「无档位 / 不支持图片 / 无窗口」。
+      // ⚠️ 走这里的结果**不进** `capabilityCache`（见那里的注释）——否则一次瞬时
+      //    失败会让该候选在整段目录 TTL 内恒被当成「无档位 / 不支持图片 / 无窗口」。
+      // ⚠️ 但**要进** `capabilityFailureCache`（只有 30 秒）：完全不记会让持续故障的
+      //    候选在每一轮请求、每一次目录构建里都被重新等一次超时（见那里的注释）。
+      this.capabilityFailureCache.set(key, now)
       return { efforts: [], imageCapable: false, resolved: false }
+    }
+  }
+
+  /**
+   * 带**独立预算**的 `resolveModelInfo`。
+   *
+   * ## ⚠️ 为什么不能用 `AbortSignal.timeout` 单独了事
+   *
+   * 超时后必须**区分**「预算用尽」与「调用方中止」：前者按「这个候选暂时问不出来」
+   * 处理（保守回落 + 记失败短缓存），后者必须原样抛出 `AbortError`（否则用户取消
+   * 后整轮还在跑）。故这里自己造一个 `controller`，超时时抛一个**名字可辨识**的
+   * 哨兵错误，由 {@link capabilityOf} 的 catch 分支按 `isAbortLike` 区分。
+   *
+   * ⚠️ 与 {@link withBackgroundDeadline} 同一口径：**放弃等待 ≠ 取消**。
+   * `resolveModelInfo` 会透传 `signal` 给各适配器，故这里额外把预算信号
+   * `AbortSignal.any([signal, budget])` 传下去 —— 预算到期时底层请求能被打断的
+   * 部分会被打断；打不断的（DNS 解析、TCP 建连）由我们这边**不再等**兜住。
+   *
+   * ⚠️ 定时器必须 `unref()`（与 `withBackgroundDeadline` 同约定）：宿主常驻进程里
+   * 一个 pending 的 3 秒定时器不该拖住退出。
+   */
+  private async resolveWithBudget(
+    provider: string,
+    realId: string,
+    signal?: AbortSignal,
+  ): Promise<LlmResolvedModelInfo> {
+    const budgetMs = this.options.capabilityTimeoutMs ?? AGGREGATE_CAPABILITY_TIMEOUT_MS
+    // ⚠️ 预算 ≤ 0 视为「不设预算」（测试里想模拟真实上游挂住时用得到）。
+    if (budgetMs <= 0) return this.ctx.llm.resolveModelInfo(provider, realId, signal)
+    const controller = new AbortController()
+    const composed = signal === undefined
+      ? controller.signal
+      : AbortSignal.any([signal, controller.signal])
+    let timedOut = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const budget = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true
+        // ⚠️ 先 abort 再 reject：`resolveModelInfo` 的适配器实现会检查 `signal`，
+        //    abort 能让**可中断**的部分立刻收尾，避免泄漏在途请求。
+        controller.abort()
+        const error = new Error(
+          `aggregate: 候选 ${provider}/${realId} 的能力解析超过 ${budgetMs}ms（放弃等待，不取消用户请求）`,
+        )
+        error.name = CAPABILITY_DEADLINE_NAME
+        reject(error)
+      }, budgetMs)
+      ;(timer as unknown as { unref?: () => void }).unref?.()
+    })
+    try {
+      // ⚠️ 底层 Promise 必须**自己挂一个 catch**：`Promise.race` 只接管赢家的结算，
+      //    输掉的那条若随后 reject（预算到期我们 abort 了 `composed` ⇒ 底层请求
+      //    抛 `AbortError`）就会变成**未处理拒绝**，在宿主里打出噪音甚至在严格
+      //    运行时直接终止进程。这里吞掉它是有意的：赢家已经把结论交付给调用方了。
+      const pending = this.ctx.llm.resolveModelInfo(provider, realId, composed)
+      void pending.catch(() => {})
+      return await Promise.race([pending, budget])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      // ⚠️ 无论成败都要把**我们自己的** controller 收掉，否则被放弃的那次解析
+      //    会一直挂着一个已 resolve 的 race 却仍在跑的 Promise。
+      if (timedOut) controller.abort()
     }
   }
 
@@ -2182,19 +2430,32 @@ export class AggregateAdapter extends LlmAdapter {
    * ⚠️ **取不到窗口的候选也进入循环**：它不拉低结果，但要为它解析一次能力 ——
    * 解析结果会进缓存，供同一候选在派发路径上复用。
    *
-   * ## ⚠️⚠️ 只有当**每一个候选都解析成功**时才记忆化结果
+   * ## ⚠️⚠️ 退化判决也记忆化，但只活 30 秒（2026-10-20 用户报障后改）
    *
-   * 这是本条实现里最容易写错的一处（本用例第一版就写错了，被自己写的用例抓住）。
-   * 若把「某候选解析失败 ⇒ 用兜底值」的结果也写进 `contextWindowCache`，那么：
+   * 原实现是「只有**每一个**候选都解析成功时才记忆化」。那条判据的**动机是对的**
+   * （不能把瞬时故障固化成持续状态 —— `AGENTS.md` 的「`refreshable` 单向门」），
+   * 但**手段过强**：候选池里只要有一个渠道持续故障，本方法就**永不**写缓存，
+   * 于是每一轮请求、每一次 `buildModelCatalog` 都要把全部候选重新解析一遍。
    *
-   * 1. 目录服务抖动一次 ⇒ 该虚拟模型在 60 秒（目录 TTL）内恒声明兜底值，
-   *    **即使上游早已恢复**；
-   * 2. 更糟的是失效时机也错位 —— 缓存键是虚拟模型，与「哪个候选失败了」无关，
-   *    于是**一个**候选的瞬时故障会污染整个虚拟模型的声明值。
+   * 实测（`aggregate/deepseek-v4-1-flash`，候选 13 家，其中 `autoclaw` 的目录端点
+   * 在 DNS/TCP 层 ETIMEDOUT 21.6 秒）：
    *
-   * 这正是 `AGENTS.md` 记录的「`refreshable` 单向门」同型缺陷：把一次瞬时失败
-   * 固化成持续状态。⇒ 失败时**返回值照给**（调用方需要立即拿到一个可用值），
-   * 但**不写缓存**，下一次调用会重新尝试解析。
+   * ```
+   * 第1次 prepareCall = 16015 ms   第2次 = 8001 ms   第3次 = 8009 ms
+   * contextWindowCache 命中? ★否 —— 永不记忆化
+   * ```
+   *
+   * 用户侧的观感是「每次发消息先白等 60 多秒」，而同模型直连 `workbuddy` 只有 0.8 秒。
+   *
+   * ⇒ 现行口径：**退化判决照样写缓存**，但打上 `degraded` 标记，有效期只有
+   * {@link AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS}（30 秒，目录 TTL 的一半）。
+   * 这样既不再每轮重试坏候选，又能在上游恢复后最迟 30 秒自动纠正 ——
+   * 「不固化瞬时故障」这条**约束**仍然成立，只是把「永不缓存」换成了「缓存很短」。
+   * 退化期间声明的窗口是「已成功解析那部分候选的最大值」，方向上偏**保守**
+   * （窗口偏小只会提前触发压缩；偏大才会被上游拒绝）。
+   *
+   * ⚠️ 完整判决（全部候选都解析成功）的有效期跟目录 TTL 走，因为它由
+   * {@link refreshCatalog} 重建目录时统一清空兜住。
    *
    * @param modelKey - 虚拟模型 id（含 `auto`），仅用于记忆化。
    * @param candidates - 该虚拟模型的候选表（`auto` 传全池候选）。
@@ -2204,12 +2465,30 @@ export class AggregateAdapter extends LlmAdapter {
     candidates: readonly { provider: string; realId: string }[],
     signal?: AbortSignal,
   ): Promise<number> {
+    const now = this.options.now?.() ?? Date.now()
     const remembered = this.contextWindowCache.get(modelKey)
-    if (remembered !== undefined) return remembered
+    if (remembered !== undefined) {
+      // ⚠️ 两种判决的有效期不同：完整判决跟目录 TTL 走（它由目录缓存的重建兜住），
+      //    退化判决只活 30 秒 —— 否则上游恢复后仍要等满整个目录 TTL 才纠正。
+      const ttl = remembered.degraded
+        ? this.options.contextWindowDegradedTtlMs ?? AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS
+        : this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS
+      if (now - remembered.at < ttl) return remembered.window
+      // 到期即清（留着陈旧项只会让下一次命中再算一遍 TTL）。
+      this.contextWindowCache.delete(modelKey)
+    }
+    // ⚠️⚠️ **并发解析而不是串行**（用户报障 2026-10-20 实测）：
+    //    串行时总耗时是「全部候选之和」，而候选可达 13+ 家；其中任何一家慢
+    //    （实测 autoclaw 的目录端点在 DNS/TCP 层挂 21.6 秒）都会把整轮拖满。
+    //    这里要的只是「各自的能力」，彼此无依赖 ⇒ 并发是安全的。
+    //    ⚠️ `Promise.all` 而非 `allSettled`：中止（`AbortError`）必须原样逃逸，
+    //    而 `capabilityOf` 已把「非中止的失败」折算成 `resolved: false`。
+    const capabilities = await Promise.all(
+      candidates.map((candidate) => this.capabilityOf(candidate.provider, candidate.realId, signal)),
+    )
     let widest: number | undefined
     let allResolved = true
-    for (const candidate of candidates) {
-      const capability = await this.capabilityOf(candidate.provider, candidate.realId, signal)
+    for (const capability of capabilities) {
       if (!capability.resolved) allResolved = false
       const window = capability.contextWindow
       // ⚠️ 只用**已声明**的窗口参与取大：把 `undefined` 当成 0 参与比较是错的
@@ -2217,8 +2496,10 @@ export class AggregateAdapter extends LlmAdapter {
       if (window !== undefined && (widest === undefined || window > widest)) widest = window
     }
     const resolved = widest ?? AGGREGATE_FALLBACK_CONTEXT_WINDOW
-    // ⚠️ 有任一候选没解析成功 ⇒ **不记忆化**（见上方长注释）。
-    if (allResolved) this.contextWindowCache.set(modelKey, resolved)
+    // ⚠️ **退化判决也记忆化**，但标记 `degraded` 让它的 TTL 只有 30 秒
+    //（见 {@link AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS} 的实测数据：
+    // 不记忆化会让每一轮请求都重试坏候选）。
+    this.contextWindowCache.set(modelKey, { window: resolved, at: now, degraded: !allResolved })
     return resolved
   }
 
@@ -2796,6 +3077,19 @@ function abortError(): Error {
  * 「上游挂住」误报成「用户取消了请求」—— 本仓库反复修过的归因错误。
  */
 const BACKGROUND_DEADLINE_NAME = 'AggregateCatalogDeadline'
+
+/**
+ * 「**单个候选**的能力解析放弃等待」到期时的专用哨兵名。
+ *
+ * ⚠️ 同样**不得**复用 `AbortError`：那条名字在 `isAbortLike` 里等于「调用方取消」，
+ * 而本情形是**我们**不等了（用户没取消）。混用会让 `capabilityOf` 的 catch 分支
+ * 把「这个候选暂时问不出来」当成「用户取消了整轮请求」原样抛出去 ——
+ * 用户会看到一次莫名其妙的失败，而真相只是某个渠道的元数据读慢了。
+ *
+ * ⚠️ 与 {@link BACKGROUND_DEADLINE_NAME} 也**必须分开**：那条是「后台目录刷新」的
+ * 语义，走的是另一条恢复路径（清在飞标记、保留旧目录），与本处互不相干。
+ */
+const CAPABILITY_DEADLINE_NAME = 'AggregateCapabilityDeadline'
 
 /** 该错误是否是 {@link withBackgroundDeadline} 的「放弃等待」哨兵。 */
 function isBackgroundDeadlineError(error: unknown): boolean {
