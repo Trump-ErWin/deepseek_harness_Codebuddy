@@ -63,6 +63,13 @@ import type { LobsteraiCredential } from './lobsterai.js'
 // deductionEndTime}`，故把各家的 fetch 指给同一个选择器即可（见各自接线处）。
 import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
 import { fetchTraeCreditBalance } from './trae-credits.js'
+// ⚠️ Qoder **两站**的 `fetchQoderCreditBalance`（2026-10-20，同为「永久积分锁定」新增）：
+//    它只吃 `QoderCredential`、且**第三个参数才是 `fetcher`**（与 minimax / astudio
+//    那两份的 `(credential, fetcher, product)` 顺序不同，别照抄）。
+//    ⚠️⚠️ 两站**必须各传自己的 product**：`QODER` 指向 `openapi.qoder.sh`、
+//    `QODER_CN` 指向 `openapi.qoder.com.cn` —— 传错会让选号读到对方站点、
+//    余额恒查不到（未锁定 ⇒ 换号优化静默失效；锁定 ⇒ 永远报「没有可用账号」）。
+import { fetchQoderCreditBalance } from './qoder-credits.js'
 import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
 import type { ClineCredential } from './cline.js'
@@ -1298,6 +1305,133 @@ export function apply(ctx: Context): void {
     }
 
   /**
+   * Qoder（`qoder` 国际版 / `qodercn` 中国版）的
+   * 「锁定永久积分 + 无可用账号」报错文案。
+   *
+   * ⚠️ **不是漏抽 `buddyLockedError`，而是本家口径**必须**不同**：buddy 系的
+   * 「临期」指服务端**资源包**（`DeductionEndTime`），而 Qoder
+   * **逐包到期时刻根本拿不到**（见下）。照抄它会让用户按一个**在本家不存在**
+   * 的判据去排查。
+   *
+   * ## ⚠️⚠️ 本家最关键的事实：**Qoder 的「临期桶」恒为 0**
+   *
+   * 这是本函数每一档文案都必须自洽的前提，先说清机制：
+   *
+   * | 事实 | 取证来源 |
+   * |---|---|
+   * | 上游只下发**聚合标量**（`userQuota` / `addOnQuota` 各一个 `total/used/remaining`），**没有逐包明细** | `/sash/api/v2/me/usage` 真机实测（见 `qoder-credits.ts` 文件头） |
+   * | 逐包明细端点**不可用**：`/api/v1/me/quotas/{key}/histories`、`/api/v1/me/usages/big_model_credits/histories` 在 **qoder.cn 域 401**（只对浏览器登录态开放）、在 **openapi 域 404**；`/sash/*` 逐包端点全 404 | 2026-10-20 端点探测 |
+   * | `usage.expiresAt` 是**永久哨兵**（`253402214400000` = `9999-12-31`），**不是**真实到期时刻 | 真机实测（同上） |
+   * | 本机账号 `dedicatedResourcePackages` = `undefined`（那一路径目前取不到任何带日期的包） | 真机实测 |
+   * | 到期**语义**是「领取后 30 天」（`benefit.validity = {mode:'RELATIVE_DAYS', days:30}`），但那是**活动声明**，不是某个包的**时刻** | `/sash/api/v1/me/campaigns` 真机实测 |
+   *
+   * ⇒ 聚合侧 `toPackage` 对**拿不到时刻**的包**不写 `deductionEndTime`**，
+   * 于是 `splitBuddyCreditsByExpiry` 按**保守方向**把它们全归入**永久桶**：
+   * **expiring 恒为 0**。锁定永久积分时，这样的账号一定被判 `none`（不可用）——
+   * 这是**正确**行为（我们确实只能证明它只有永久积分）。
+   *
+   * ## 由此推出两条**文案纪律**（违反即误导）
+   *
+   * 1. **不得写「N 天内到期」「15 天内」这类绑定天数的说法**。Qoder 拿不到
+   *    逐包时刻，任何天数都是**编造**；宿主的窗口（`buddyExpiringWindowDays()`，
+   *    默认 15 天、可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖）对本家**不产生
+   *    任何筛选效果**，写进文案只会让用户以为「等几天就会有临期额度可用」。
+   *    ⚠️ 注意前端 `permanentLockCopy` 那一侧因为 registry 的
+   *    `usesExpiryWindow: true` 会渲染出**带天数**的通用面板文案 —— 那是面板
+   *    对「按到期分桶」这一能力的统一表述，**与本函数无关**；本函数是**真出
+   *    故障时**用户看到的那句，必须写实际机制。
+   * 2. **必须明说「解锁才能继续用」**。因为本家的临期桶恒为 0，
+   *    「等一会儿就有临期额度」是**不可能发生**的事 —— 用户唯一的下一步是
+   *    解锁（会消耗长期/永久积分，须如实告知）。
+   *
+   * ## 四档（与 buddy 同形，但措辞逐档按本家重写）
+   *
+   * `unknown` / `no-candidates` / `credential-only` / `exhausted`
+   * —— 四者的**必要性**见 `BuddyNoAccountReason` 的定义注释，不在本处重复。
+   *
+   * ⚠️ **两站共用本函数，只换 `displayName`**：两站协议与端点形状逐字相同
+   *（同一个 `QoderAdapter` 类、同一个 `fetchQoderCreditBalance`，差异全在
+   * `QODER` / `QODER_CN` 的主机与 client_id），各写一遍 = 改一处漏一处。
+   * 但 `displayName` **必须**逐站区分：两站账号不互通，用户要知道去哪个面板解锁。
+   *
+   * ⚠️ **本家没有 XFF / 地理分流问题**（与 MiniMax 国际站的关键差异）：
+   * Qoder 两站各自有独立域名且互不 307，故**不要**照抄 minimax 文案里那段
+   * 「填 `X-Forwarded-For`」的指引（照抄会让用户去改一个**不生效**的设置）。
+   *
+   * ⚠️ **错误码取 `QUOTA_EXCEEDED`**（与 buddy / Loomy 一致）：
+   * 这确实是额度问题；且它**不在**宿主 `DEFAULT_RETRYABLE_CODES` 里，
+   * 故不会被白重试 —— 锁定是**确定性**结果，重试无用。
+   */
+  const qoderLockedError = (displayName: string) =>
+    (reason: BuddyNoAccountReason): Error => {
+      if (reason.kind === 'unknown') {
+        return new LlmError(
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
+          + `（${reason.errors.slice(0, 2).join('；')}）。`
+          + '这些账号**可能仍有**可消耗的额度 —— 请重试，'
+          + `或在 Jet Hub 的 ${displayName} 面板检查凭据是否失效`
+          + '（Qoder 的凭据有有效期，失效后需要重新登录该账号）。'
+          + '⚠️ 国际版（`openapi.qoder.sh`）本机网络不通时会**每次都**查不到余额，'
+          + '若你用的是国际版请先确认该域名可达。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'no-candidates') {
+        return new LlmError(
+          `${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+          + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+          + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+          + '或改用其它 provider / 模型，或解锁永久积分后重试。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'credential-only') {
+        // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+        //    撤回地消耗长期积分，而本情形的根因在凭据、与积分无关。
+        return new LlmError(
+          `${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+          + '有可用额度的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+          + '⚠️ 这与「额度用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地消耗它们）。'
+          + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据，必要时重新登录。`,
+          'QUOTA_EXCEEDED',
+        )
+      }
+      /**
+       * ⚠️⚠️ **穷尽性守卫**（与 buddy / Loomy 两份同型）：
+       * 走到这里**只允许**是 `{ kind: 'exhausted' }`。把 `reason` 赋给单成员类型，
+       * 将来 `BuddyNoAccountReason` 加了新档位却忘写文案时，`tsc` 当场报
+       * `TS2322`，而不是静默落进「额度都已用尽」—— 那句会把用户推向
+       * **不可撤回**的解锁操作。
+       */
+      const exhaustedOnly: { kind: 'exhausted' } = reason
+      void exhaustedOnly
+      /**
+       * ⚠️ 本档（`exhausted`）**必须解释「为什么锁定后就一个号都用不了」**，
+       * 而不是照抄 buddy 系的「15 天内到期的临时积分都已用尽」：
+       *
+       * Qoder 上游**只给聚合标量、不给逐包到期时刻**（取证见本函数头注释），
+       * 故聚合侧把所有包保守地归入**长期/永久桶**，本家的「临期桶」**恒为 0**。
+       * 锁定时永久桶不参与分档 ⇒ 账号被判「不可用」—— **这是正确行为**，
+       * 但我们只有长期额度、无法证明它有临期额度。
+       *
+       * ⇒ 文案要**如实说明这一点**，并且**只给「解锁」这一条出路**：
+       * 说「等临期积分到期后重新发放」会让用户白等（本家根本没有那个临期池）。
+       * 也**不得**写「N 天内到期」这类绑定天数的说法（那会是编造 —— 逐包时刻
+       * 拿不到；宿主的窗口对本家不产生任何筛选效果）。
+       */
+      return new LlmError(
+        `${displayName}：没有可用账号。已锁定永久积分，而当前账号的额度都属于`
+        + '**长期 / 永久**那一类。⚠️ Qoder 上游**只下发聚合额度、不给逐包到期时刻**，'
+        + '插件因此**无法确认**哪些额度是临期的 —— 这种不确定下按保守方向处理：'
+        + '锁定永久积分时，无法证明「有临期额度」的账号会被判为不可用'
+        + '（宁可少用一个号，也不要把长期额度误当临期烧掉）。'
+        + `这是锁定的**预期效果**，不是额度异常；请在 Jet Hub 的 ${displayName} 面板`
+        + '**解锁**永久积分后继续使用（解锁会真的消耗那些长期/永久额度）。',
+        'QUOTA_EXCEEDED',
+      )
+    }
+
+  /**
    * Loomy 的「锁定永久积分 + 无可用账号」报错文案（issue IKMCOO 缺陷 2/3）。
    *
    * ⚠️ **与 buddy 那份分开**（不是漏抽）：Loomy 的口径是「**今日赠送额度**」
@@ -1571,6 +1705,52 @@ export function apply(ctx: Context): void {
   // 与其它 provider 一样不注册斜杠命令：入口在 Jet Hub 的 Qoder 面板。
   const qoder = new QoderAuth(ctx)
   /**
+   * 按凭据 ref 解析 Qoder 凭据（供选号器查余额与最终取凭据共用）。
+   *
+   * ⚠️ **两站共用这一份**（`qoder` / `qodercn` 的凭据形状逐字相同：同一套
+   * OAuth 实现，差异只在主机与 ref 前缀）—— 与 minimax 那份同因，
+   * 各写一遍 = 改一处漏一处。
+   *
+   * ⚠️ **逐字保留历史上的裸 `JSON.parse` 形态**（不在此处加形状校验）：
+   * 加校验是一次**行为变更**（此前被接受的损坏凭据会变成被拒），
+   * 不在本 Task 范围内。历史形态见 git 历史里 qoder / qodercn 两段
+   * `readCredential` 里那两份**逐字重复**的内联箭头。
+   */
+  const resolveQoderCredentialByRef = async (refName: string) => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      return JSON.parse(resolved.value)
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * Qoder 两站的**按「额度何时作废」分档选号器**（为「锁定永久积分」提供依据）。
+   *
+   * ⚠️ 复用 `BuddyBalanceSelector` 而不是新写一个：分档判据
+   * （`splitBuddyCreditsByExpiry`）只读通用的
+   * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
+   *
+   * ⚠️ **两家各建一个实例，不得合并**：选择器内含**按账号 id 的缓存**，
+   * 跨站共用会让一站的读数污染另一站（与 minimax 两站同因）。
+   *
+   * ⚠️⚠️ **必须各传自己的 `product`**：`QODER` 指向 `openapi.qoder.sh`、
+   * `QODER_CN` 指向 `openapi.qoder.com.cn` —— 互换的后果**不是报错**而是静默：
+   * 对方站点不认本站 token ⇒ 余额恒 `null` ⇒ 未锁定时换号优化失效、
+   * 锁定时永远报「没有可用账号」。
+   */
+  const qoderBalanceSelector = new BuddyBalanceSelector({
+    product: QODER,
+    resolveCredential: resolveQoderCredentialByRef,
+    fetchBalance: (credential, product) => fetchQoderCreditBalance(credential, product),
+  })
+  const qoderCnBalanceSelector = new BuddyBalanceSelector({
+    product: QODER_CN,
+    resolveCredential: resolveQoderCredentialByRef,
+    fetchBalance: (credential, product) => fetchQoderCreditBalance(credential, product),
+  })
+  /**
    * 「本次实际使用的账号 id」跟踪表（provider id → 账号 id）。
    *
    * ## 为什么需要它
@@ -1615,6 +1795,19 @@ export function apply(ctx: Context): void {
           } catch {
             return undefined
           }
+        },
+        // 优先按「快到期额度」分档选号（锁定永久积分时只挑有快到期额度的号）。
+        // ⚠️ `qoderLockedError` **本家独有**（不共用 buddy 系那份）：buddy 的
+        //    「临期」指资源包 `DeductionEndTime`，而本家逐包到期时刻拿不到 ——
+        //    照抄会让用户按一个不存在的判据去排查（见该函数的长注释）。
+        // ⚠️ `reportPickedAccount: true` 是**必须的**（与 minimax 两站同因）：
+        //    本家的旧闭包是纯池选号、账本**一直在回报**；接上 `balance` 后
+        //    「分档选中」那一支若不回报 ⇒ token 用量记不到本渠道上（静默）。
+        balance: {
+          kind: 'buddy',
+          selector: qoderBalanceSelector,
+          lockedError: qoderLockedError('Qoder'),
+          reportPickedAccount: true,
         },
         fallback: { kind: 'ref', refName: QODER.defaultCredentialRef },
         // 区分「全部限流」与「没登录」（见该助手的说明）—— 否则用户会去
@@ -1688,6 +1881,15 @@ export function apply(ctx: Context): void {
           } catch {
             return undefined
           }
+        },
+        // 同国际版：分档选号 + 本家独有文案 + 回报实际选中的账号。
+        // ⚠️ `displayName` **必须**逐站区分（两站账号不互通，用户要知道去哪个
+        //    面板解锁）；`selector` 也必须是中国版自己那一个（缓存不跨站共用）。
+        balance: {
+          kind: 'buddy',
+          selector: qoderCnBalanceSelector,
+          lockedError: qoderLockedError('Qoder (中国版)'),
+          reportPickedAccount: true,
         },
         fallback: { kind: 'ref', refName: QODER_CN.defaultCredentialRef },
         // 同国际版：区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。

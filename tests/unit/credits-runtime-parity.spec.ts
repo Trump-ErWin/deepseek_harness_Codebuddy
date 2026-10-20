@@ -417,8 +417,15 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     //    数据源，真机取证 28/28 带值且守恒），批次包归一化到 `deductionEndTime`。
     // ⚠️ autoclawintl 2026-10-20 加入：与 autoclaw **同源**（同一份 credits 实现），
     //    实测国际站批次同样带 `deductionEndTime`（3000→10/21、10000→10/27）。
+    // ⚠️ qoder / qodercn 2026-10-20 加入：`/sash/api/v2/me/usage` 的
+    //    `usage.expiresAt` 是**永久哨兵**（`253402214400000` = `9999-12-31`）时
+    //    **不写** `deductionEndTime`（未知到期 ⇒ 落永久桶）；真实时间戳才写。
+    //    ⚠️ `addOnQuota` 只给聚合标量、**任何日期字段都没有** ⇒ 恒落永久桶。
     const withWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true).map((d) => d.id).sort()
-    expect(withWindow).toEqual(['autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    expect(withWindow).toEqual([
+      'autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace',
+      'qoder', 'qodercn', 'trae', 'workbuddy',
+    ])
   })
 })
 

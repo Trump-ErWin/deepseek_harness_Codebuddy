@@ -217,6 +217,61 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     logoClass: 'qoder',
     credits: { balance: true, dailyCheckin: true },
     creditPackages: true,
+    /**
+     * ⚠️ **2026-10-20 补登记：三档分档（永久 / 长期 / 临期）与永久锁此前完全没生效。**
+     *
+     * 这两项此前缺失导致**两个静默故障**（与 minimax / astudio 那两次逐字同因）：
+     * - 缺 `usesExpiryWindow` ⇒ `jet-hub-rpc.ts` 的判据
+     *   `descriptorOf(req.provider)?.usesExpiryWindow === true` 为 false ⇒
+     *   响应里没有 `windowDays` ⇒ 客户端 `splitCreditsByExpiry` 收 `undefined`
+     *   ⇒ 面板上「永久 X · 长期 Y · 临期 Z」那整行**不渲染**；
+     * - 缺 `permanentLock` ⇒ 客户端 `supportsPermanentLock()` 为 false ⇒
+     *   「锁定永久积分」开关**整个不渲染**（不是灰掉，是不存在）。
+     *
+     * ⚠️⚠️ **但这两项对本家是「能力开关」，不是数据保证 —— 逐包到期拿不到。**
+     *
+     * 实测（2026-10-20，两个真实 qodercn 账号）
+     * `GET /sash/api/v2/me/usage` 只下发三个额度块：
+     * - `userQuota`（套餐额度，实测 `{total:0,used:0,remaining:0}`）；
+     * - `addOnQuota`（用户截图里的「个人资源包 1,900」）—— **只给聚合标量**
+     *   （`total` / `used` / `remaining`）加一个 `detailUrl` 网页链接，
+     *   **没有任何日期字段**；
+     * - `dedicatedResourcePackages` —— **唯一**带真实逐包到期（`expiresAt`
+     *   字符串）的那一项，而本机账号实测为 `undefined`。
+     *
+     * ⇒ 当前账号形态下 `packages[]` 里**没有任何真实的逐包到期时刻**，
+     *   `qoder-credits.ts` 的 `toPackage()` 因此**不写** `deductionEndTime`
+     *   ⇒ `splitBuddyCreditsByExpiry` 只得到一个「永久（未知到期）」桶 ⇒
+     *   **临期桶恒为 0**。这**不是缺陷**，是「上游不下发 ⇒ 我们不编造」的如实结果
+     *   （本仓库红线）。只有上游真的给了 `dedicatedResourcePackages` 的账号
+     *   才会出现临期档。
+     *
+     * ⚠️ 顺带澄清一个**反例**：顶层 `qoderUsage.expiresAt` 实测
+     *   `253402214400000`（= `9999-12-31T00:00:00.000Z`）**不是**到期时刻 ——
+     *   它是 Qoder 对 `userQuota`（套餐额度）下发的**永久哨兵**：官方客户端
+     *   asar 的用量面板里只有 `userQuota.expiresAt` 走 `renewson`
+     *   （文案「将于 {{date}} 刷新」，语义是**订阅刷新日**），而
+     *   `addOnQuota` 那一格**只渲染 used/total/remaining、不给任何日期**。
+     *   把它当真实到期写进 `deductionEndTime` 会把整个套餐额度伪造成
+     *   「9999 年到期」的临期档，故 `qoder-credits.ts` 用
+     *   `QODER_PERMANENT_EXPIRY_MS` 显式识别并**不写**。
+     *   （活动的 `validity = {mode:'RELATIVE_DAYS', days:30}` 只描述
+     *   「领取后 30 天有效」的**语义**，同样不是任何一笔已知时刻。）
+     *
+     * ⚠️ **`permanentLock` 因此锁的正是「未知到期」那一桶**：
+     *   `credential-resolver.ts` 的 `allowPermanent` 拦掉永久桶的可消耗性。
+     *   对「上游只给聚合标量」的账号，锁定后确实把该桶保了下来 ——
+     *   语义如实，**不是假开关**（Qoder 的 `dedicatedResourcePackages` 一旦下发，
+     *   其真实临期包与永久桶的分档同样成立）。
+     *
+     * ⚠️ 三处必须同改（本文件 + `provider-expiry.ts` 的 `createProviderExpiry()`
+     * + `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`），由
+     * `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁一致 ——
+     * 这是该陷阱的**第 7 次复发**（cline → accio → officeace → autoclaw
+     * → astudio → minimax → qoder），漏任何一处的症状都是**静默**的。
+     */
+    permanentLock: true,
+    usesExpiryWindow: true,
     settingsNamespace: 'llm-qoder',
     channel: true,
   },
@@ -227,6 +282,22 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     logoClass: 'qodercn',
     credits: { balance: true, dailyCheckin: true },
     creditPackages: true,
+    // ⚠️ 与上面的国际版**同因同日**补登记（2026-10-20）：两站共用全部
+    //    `src/qoder*.ts` 实现（适配器 / 认证 / 积分），余额响应形状逐字段同形，
+    //    差异只在 `src/qoder-product.ts` 的 `QODER_CN` 常量（域名 / client_id /
+    //    模型表）。⇒ 分档与永久锁的理由、以及「逐包到期拿不到」那条限制，
+    //    与国际版**逐字相同**（见上一条的长注释，不重复）。
+    //    ⚠️ 唯一需要单独记一笔的差异：**本次真机取证用的正是中国版账号**
+    //    （`openapi.qoder.com.cn`），而国际版 `openapi.qoder.sh` 在本机
+    //    **网络不可达**（`fetch failed` ~10.7s）⇒ 国际版的实际响应形状
+    //    **未在本次实测覆盖**。实现必须对「取不到」保守：
+    //    `fetchQoderCreditBalance` 网络失败/非 2xx/形状非法一律返回 `null`
+    //    ⇒ 聚合折算得 `UNUSABLE`（剔除该候选），**绝不**退化成「有余额」。
+    //    ⚠️ 两家必须各占一项：`WIRED_EXPIRY_PROVIDERS` 是按 **provider id**
+    //    的清单，漏掉 `qodercn` 会让中国版在聚合候选层被静默剔掉
+    //    （与 minimax / minimaxintl 同因）。
+    permanentLock: true,
+    usesExpiryWindow: true,
     settingsNamespace: 'llm-qodercn',
     channel: true,
   },

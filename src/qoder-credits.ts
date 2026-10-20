@@ -79,6 +79,65 @@ export const QODER_USAGE_PATH = '/sash/api/v2/me/usage'
 export const QODER_CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns'
 
 /**
+ * Qoder 对 `userQuota`（套餐额度）下发的 **永久哨兵** 到期时刻
+ * （毫秒）—— `253402214400000` = `9999-12-31T00:00:00.000Z`。
+ *
+ * ## 取证：**这不是任何东西的真实到期时刻**
+ *
+ * 2026-10-20，两个真实 qodercn 账号，`GET {openApiBase}/sash/api/v2/me/usage`
+ * （`openApiBase` = `https://openapi.qoder.com.cn`）：
+ *
+ * ```json
+ * { "displayMode": "qoder",
+ *   "qoderUsage": {
+ *     "userId": "…", "userType": "personal_standard", "usageType": "credits",
+ *     "totalUsagePercentage": 0, "isQuotaExceeded": false,
+ *     "expiresAt": 253402214400000,
+ *     "upgradeUrl": "https://qoder.cn/pricing?client=qoder",
+ *     "userQuota":  { "total": 0, "used": 0, "remaining": 0,
+ *                     "percentage": 0, "unit": "credits" },
+ *     "addOnQuota": { "total": 2000, "used": 0, "remaining": 2000,
+ *                     "percentage": 0, "unit": "credits",
+ *                     "detailUrl": "https://qoder.cn/account/usage" },
+ *     "isPlanQuotaProrated": false } }
+ * ```
+ *
+ * ⚠️ 三个必须分辨的事实（缺一就会把哨兵当到期时刻）：
+ * - `expiresAt` 的**语义归属是 `userQuota`（套餐额度）**，**不是** `addOnQuota`，
+ *   也**不是**任何一笔逐包到期；
+ * - `addOnQuota`（用户截图里「个人资源包 1,900」）**只给聚合标量**
+ *   （`total` / `used` / `remaining`）+ 一个 `detailUrl` 网页链接，
+ *   **没有任何日期字段**；
+ * - `dedicatedResourcePackages` 是**唯一**带真实逐包到期（`expiresAt` 字符串）
+ *   的字段，而本机账号实测为 `undefined`。
+ *
+ * ## 权威旁证（Qoder 官方客户端 asar，来源同一次审计）
+ *
+ * `D:\Qoder\resources\app.asar` 的 `/out/renderer/assets/index-DDa3WwIe.js`
+ * 与 `/out/main/index.js` 里客户端自己的用量面板 `buildUsageItemGroups()`：
+ * - 对 `addOnQuota` **只渲染 used/total/remaining，不给任何日期**；
+ * - 只有 `userQuota.expiresAt` 走 `renewson`（文案「将于 {{date}} 刷新」，
+ *   语义是**订阅刷新日**，不是积分到期）；
+ * - `dedicatedResourcePackages` 才走 `expiresOn`（文案「有效期至 {{date}}」）。
+ *
+ * ⇒ 官方客户端自己就不把 `expiresAt` 当作「这批积分何时作废」。
+ *
+ * ## ⚠️ 若把它写进 `deductionEndTime` 会发生什么（**可观测后果**）
+ *
+ * 客户端 `plugin-src/client/credit-expiry.js` 的 `formatPackageExpiry` 会把
+ * `253402214400000` 渲染成 **`9999-12-31（约 2900000 天后）`** ——
+ * 用户看到的是荒谬文案。反之，**不写** `deductionEndTime` 时
+ * `packageExpiryMs` 返回 `null` ⇒ 显示**「长期」**，正是三档分档里
+ * 「永久（未知到期）」那一档的展示形态。
+ *
+ * ⇒ 判据：`expiresAt >= 本常量`，**或**解析出的年份 `>= 9999`（兜住
+ *   `9999-01-01`~`9999-12-30` 这类小于常量、但同样是哨兵的取值——
+ *   它们落在 `253370764800000`~`253402214399999` 区间）。命中即
+ *   **不写** `deductionEndTime`（保守方向：未知到期 ⇒ 永久桶）。
+ */
+export const QODER_PERMANENT_EXPIRY_MS = 253402214400000
+
+/**
  * 每日活动**刷新时刻**（UTC+8 的小时）。来源是服务端自己下发的原文：
  * `description: "每日 10:00（UTC+8）刷新，领取后 30 天有效"`（见文件头）。
  *
@@ -333,7 +392,20 @@ export const QODER_PLAN_PACKAGE = '套餐额度'
 function toPackage(
   name: string,
   quota: unknown,
-  options: { active?: boolean; expiredTime?: string } = {},
+  options: {
+    active?: boolean
+    expiredTime?: string
+    /**
+     * `qoderUsage.expiresAt`（**数字毫秒**）。
+     *
+     * ⚠️ **只有 `userQuota` 那一条传它** —— `expiresAt` 的语义归属就是
+     * `userQuota`（套餐额度）：见 {@link QODER_PERMANENT_EXPIRY_MS} 的取证。
+     * `addOnQuota`（只给聚合标量、**任何日期字段都没有**）与
+     * `dedicatedResourcePackages`（逐包自己带 `expiresAt` 字符串，走
+     * `expiredTime` 那条既有路径）都**不传**。
+     */
+    expiresAtMs?: number
+  } = {},
 ): CreditPackage | undefined {
   const total = readNumber(quota, 'total')
   const used = readNumber(quota, 'used')
@@ -344,12 +416,55 @@ function toPackage(
   const remaining = remainingRaw !== undefined
     ? Math.max(0, remainingRaw)
     : Math.max(0, totalValue - usedValue)
-  // 到期时间归一化：Qoder 的专用资源包用 expiredTime 字段（ISO 日期字符串）。
-  // 套餐额度/资源包没有独立到期（统一"领取后 30 天"），不设置 deductionEndTime，
-  // 前端 formatPackageExpiry 对 Qoder 的特定包名走"30 天内有效"的特殊显示。
+  /**
+   * 到期时间归一化 —— **两条互斥判据**。
+   *
+   * ## ⚠️ 2026-10-20 更正：旧注释说「Qoder 没有独立到期，一律不设置
+   * `deductionEndTime`」，那句话对 `userQuota` 一层**不成立**（它在说谎）
+   *
+   * 旧原文（本仓库历史）：
+   * > 到期时间归一化：Qoder 的专用资源包用 expiredTime 字段（ISO 日期字符串）。
+   * > 套餐额度/资源包没有独立到期（统一"领取后 30 天"），不设置 deductionEndTime，
+   * > 前端 formatPackageExpiry 对 Qoder 的特定包名走"30 天内有效"的特殊显示。
+   *
+   * 两处不实：① `userQuota` 那层其实**有** `usage.expiresAt`（数字毫秒），
+   * 只是个人版下发的恒是永久哨兵；② 前端 `formatPackageExpiry`（`credit-expiry.js`）
+   * **没有**、也从来没有「对 Qoder 特定包名走 30 天内有效」的分支 ——
+   * 它只按 `deductionEndTime` 是否有值分流（有 ⇒ 绝对日期 + 天数；无 ⇒ 「长期」）。
+   * ⇒ 本次把它改写成下面这条真实的两分支判据。
+   *
+   * ## 判据（两条**互不重叠**的支路 —— 调用点按 pack 种类各自只走一支）
+   *
+   * | 支路 | 来源与调用点 | 命中条件 | 动作 |
+   * |---|---|---|---|
+   * | A（**本次新增**） | `options.expiresAtMs` = `qoderUsage.expiresAt`，只在 `userQuota` 那一条传 | 非有限值 / `<= 0` | 落到 B |
+   * | A | 同上 | **永久哨兵**（`>= QODER_PERMANENT_EXPIRY_MS`，或解析出的年份 `>= 9999`） | **不写** `deductionEndTime` ⇒ 前端「长期」 |
+   * | A | 同上 | 真实时间戳 | **写** `deductionEndTime` ⇒ 前端显示真实日期 |
+   * | B（**既有，未改动**） | `options.expiredTime` = 逐包 ISO 字符串（`dedicatedResourcePackages[].expiresAt`） | `Date.parse` 有限 | **写** `deductionEndTime` |
+   * | B | 同上 | 缺失 / 解析失败 | **不写** |
+   *
+   * ⚠️ 支路 B 是**既有行为、本次刻意不动**（Lead 2026-10-20 明确：该路径已在工作，
+   * 既不是缺陷也不是本任务的新增能力）。它服务的是 `dedicatedResourcePackages[]`
+   * —— 全上游**唯一**带真实逐包到期的字段，仍照旧精确折算。
+   *
+   * ⚠️ 「不写」是**保守方向**：`splitBuddyCreditsByExpiry` 对缺
+   * `deductionEndTime` 的包按**永久桶**处理 —— 未知到期假定为长期，
+   * 而临期判据宁可漏报也不瞎报（本仓库红线「绝不编造日期」）。
+   */
+  const explicitMs = options.expiresAtMs
+  const explicitUsable = typeof explicitMs === 'number' && Number.isFinite(explicitMs) && explicitMs > 0
+  // ⚠️ 年份判据兜住「小于常量但同样是哨兵」的取值（`9999-01-01`~
+  //    `9999-12-30` ⇒ `253370764800000`~`253402214399999`）。
+  const explicitIsPermanent = explicitUsable && (
+    explicitMs >= QODER_PERMANENT_EXPIRY_MS
+    || new Date(explicitMs).getUTCFullYear() >= 9999
+  )
   const expMs = options.expiredTime && options.expiredTime.length > 0
     ? Date.parse(options.expiredTime.replace(' ', 'T'))
     : Number.NaN
+  const deductionEndTime = explicitUsable && !explicitIsPermanent
+    ? explicitMs
+    : (Number.isFinite(expMs) ? expMs : undefined)
   return {
     name,
     unit: readString(quota, 'unit') ?? 'credits',
@@ -360,7 +475,7 @@ function toPackage(
     cycleStartTime: '',
     cycleEndTime: '',
     expiredTime: options.expiredTime ?? '',
-    ...(Number.isFinite(expMs) ? { deductionEndTime: expMs } : {}),
+    ...(deductionEndTime !== undefined ? { deductionEndTime } : {}),
   }
 }
 
@@ -412,13 +527,26 @@ export async function fetchQoderCreditBalance(
   if (typeof usage !== 'object' || usage === null) return null
 
   const packages: CreditPackage[] = []
-  // 顺序即展示顺序：套餐额度 → 赠送/资源包 → 专用资源包。
-  const userQuota = toPackage(QODER_PLAN_PACKAGE, (usage as Record<string, unknown>).userQuota)
+  // 顺序即展示顺序：套餐额度 → 赠送/资源包 → 专用资源包（⚠️ 顺序与「一个包都
+  // 解析不出来就返回 null」这两条是**既有的、本次不动**）。
+  const qoderUsage = usage as Record<string, unknown>
+  // ⚠️ `usage.expiresAt`（数字毫秒）**只传给 `userQuota` 那一条** ——
+  //    它的语义归属就是套餐额度，不是 `addOnQuota`（那一层只给聚合标量、
+  //    连日期字段都没有），也不是任何逐包到期（那些走各自的 `expiredTime`）。
+  //    传给别处会把哨兵/未知到期挂到错误的包上，分档随之错位。
+  const userQuotaExpiresAtMs = readNumber(qoderUsage, 'expiresAt')
+  const userQuota = toPackage(
+    QODER_PLAN_PACKAGE,
+    qoderUsage.userQuota,
+    { expiresAtMs: userQuotaExpiresAtMs },
+  )
   if (userQuota !== undefined) packages.push(userQuota)
-  const addOnQuota = toPackage('资源包', (usage as Record<string, unknown>).addOnQuota)
+  // ⚠️ 刻意**不传** `expiresAtMs`：`addOnQuota` 没有任何日期字段，
+  //    传了就是把套餐的哨兵按到资源包头上。
+  const addOnQuota = toPackage('资源包', qoderUsage.addOnQuota)
   if (addOnQuota !== undefined) packages.push(addOnQuota)
 
-  const dedicated = (usage as Record<string, unknown>).dedicatedResourcePackages
+  const dedicated = qoderUsage.dedicatedResourcePackages
   if (Array.isArray(dedicated)) {
     for (const item of dedicated) {
       const pkg = toPackage(

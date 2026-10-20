@@ -68,8 +68,15 @@ import {
   modelscopeExpiry,
   // ⚠️ AutoClaw（智谱，2026-10-17 审计 P0 修复新增）
   autoclawExpiry,
+  // ⚠️ Qoder（国际版 / 中国版共用，2026-10-20 新增）
+  qoderExpiry,
   zcodeExpiry,
 } from './aggregate-expiry.js'
+// ⚠️ Qoder（国际版 / 中国版，2026-10-20 新增）：与 minimax 同款 —— 两站共用
+//    同一套 `src/qoder*.ts` 实现，差异全在 `src/qoder-product.ts` 的
+//    `QODER` / `QODER_CN` 常量（域名 / client_id / 模型表）。
+import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
+import type { QoderCredential } from './qoder.js'
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17）
 import { MODELSCOPE } from './modelscope-product.js'
 import type { ModelscopeCredential } from './modelscope.js'
@@ -214,5 +221,56 @@ export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>>
           : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
       ),
     },
+    /**
+     * ⚠️ **Qoder**（国际版 / 中国版，2026-10-20）：与 **buddy 系同形**
+     *    （`CreditPackage` 都带 `deductionEndTime`）⇒ 原语直接复用
+     *    `sharedPackageExpiry`；两站共用同一个原语（只换 product），
+     *    单独抽 `qoderFamilyExpiry` 是为了让「它们只差一个 product」一眼可见。
+     *
+     *    ⚠️⚠️ **与上面所有条目的关键差别：本家是「接入了，但上游不给逐包时刻」。**
+     *    实测（2026-10-20，两个真实 qodercn 账号）：`userQuota` 的顶层
+     *    `expiresAt = 253402214400000` 是**永久哨兵**（`9999-12-31T00:00:00Z`），
+     *    `addOnQuota` **只给聚合标量、零日期字段**，
+     *    `dedicatedResourcePackages`（唯一带真实逐包到期的字段）本机为 `undefined`
+     *    ⇒ `qoder-credits.ts` 对哨兵**不写** `deductionEndTime`
+     *    ⇒ 折算得 `NEVER`（长期）= 三档里「永久（未知到期）」那一桶。
+     *    ⚠️ **无 `dedicatedResourcePackages` 时临期桶恒为 0**，这是如实限制
+     *    （绝不为了凑出一档而编造日期）。
+     *    ⚠️ 国际版 `openapi.qoder.sh` 本机**网络不可达** ⇒ 取不到时
+     *    `fetchQoderCreditBalance` 返回 `null` ⇒ `UNUSABLE`（剔除），保守。
+     *
+     *    ⚠️ 三处必须同改（本表 + `WIRED_EXPIRY_PROVIDERS` + 折算原语）——
+     *    这是该陷阱的第 **7** 次复发（cline → accio → officeace → autoclaw
+     *    → astudio → minimax → qoder），漏任何一处的症状都是**静默**的
+     *    （用户在聚合轮换列表里看不到该渠道，零报错零日志）。
+     *    ⚠️ **必须走 `cachedBalance`**：与 buddy / trae / modelscope / astudio /
+     *    minimax 同款 —— 聚合每轮折算会对同一账号反复提问，没有共享读数就会
+     *    白发大量重复请求。
+     *    ⚠️ **两站各占一项**：`credentialExpiry` 的分派按 provider id，漏
+     *    `qodercn` 会让中国版单独恒 `UNUSABLE`（与 minimaxintl 同因）。
+     */
+    qoder: qoderFamilyExpiry(QODER),
+    qodercn: qoderFamilyExpiry(QODER_CN),
+  }
+}
+
+/**
+ * Qoder 系的折算（**两个产品共用同一个原语**，只换 product 配置）。
+ *
+ * ⚠️ 与 {@link buddyFamilyExpiry} 逐字同形：本家没有 XFF / 地理分流需求
+ *    （两站各自有独立域名且互不 307），故**不**像 minimax 那样多一个透传参数。
+ *
+ * ⚠️ `context.cachedBalance` **在每次折算时现读**（不是建表时固化）：
+ *    与 `createProviderCredits` 的同名字段同一纪律。
+ */
+function qoderFamilyExpiry(product: QoderProduct): ProviderExpiry {
+  return {
+    credentialExpiry: (c, context) => qoderExpiry(
+      c as QoderCredential,
+      product,
+      context?.cachedBalance === undefined
+        ? undefined
+        : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+    ),
   }
 }

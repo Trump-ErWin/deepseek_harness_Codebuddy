@@ -423,8 +423,14 @@ export function packageExpiryMs(pkg) {
  * ⚠️ 到期时间取自 {@link packageExpiryMs}（与排序同一判据）。
  *
  * ⚠️ 「长期」的判据是**服务端没给任何到期字段**。Qoder 的套餐额度/资源包
- * 就没有独立到期（统一"领取后 30 天"是活动规则而非包字段），显示"长期"
- * 比编造一个错误日期好。
+ * 就是这种情形 —— 显示"长期"比编造一个错误日期好。
+ *
+ * ⚠️ **`qoderUsage.expiresAt` 不算「给了到期字段」**（2026-10-20 真机取证订正）：
+ * 那个字段确实在 `userQuota` 那一层存在，但个人版实测恒为永久哨兵
+ * `253402214400000`（= `9999-12-31`）。若把它透出成 `deductionEndTime`，
+ * 本函数会渲染成「9999-12-31（约 2900000 天后）」—— 也就是说**闸门在
+ * `null` 这一侧**：哨兵必须被后端挡掉、不写进 `deductionEndTime`，
+ * 才轮到这里正确地显示「长期」。两条判据缺一不可。
  */
 export function formatPackageExpiry(pkg, now) {
   const end = packageExpiryMs(pkg);
