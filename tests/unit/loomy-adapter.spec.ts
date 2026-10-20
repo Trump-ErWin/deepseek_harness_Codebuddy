@@ -1200,3 +1200,156 @@ describe('★★ 凭据探测失败不得打断本轮（2026-10-20 报障）', (
     expect(captured.auth, '终态失败不该再发业务请求').toHaveLength(0)
   })
 })
+
+/**
+ * ★★★ **401/403 分支**的探测失败同样不得打断整轮（2026-10-20 审计补修）。
+ *
+ * ## 为什么必须单独一组（上一组测不到它）
+ *
+ * 上面那组走的是**前置门禁**（`credential === undefined || isLoomyExpired`）。
+ * 而 `await this.options.refresh()` 在适配器里有**两处**调用点，第二处是
+ * 「业务请求回来 401/403 再探测一次」。PR !124 只修了前置门禁那一处。
+ *
+ * ⚠️ **实测证据**：把 401 分支改坏（降级成静默放过 / 换回裸调用）后，
+ * 上一组那 64 条**全部通过** —— 缺陷就藏在没有用例的路径里。
+ * 本组的作用正是把这条路径钉住。
+ *
+ * ## 401 分支的修法与前置门禁**不同**（别照抄）
+ *
+ * 前置门禁：探测失败 → warn → **继续用现有凭据发请求**（本来就没发出过请求）。
+ * 401 分支：探测失败 → warn → **不重取、不重发**，直接落换号循环。
+ * 理由（对抗审计 D1–D4 实测）：探测失败后重取往往拿到**同一份坏凭据**，
+ * 重发就是白烧一次（无池恒 401 发 2 次、A 坏 B 好发 3 次、8 号全 401 发 9 次）。
+ */
+describe('★★★ 401/403 分支的探测失败也不得打断整轮（审计补修）', () => {
+  const FRESH: LoomyCredential = { ...CRED }
+  const EXPIRED: LoomyCredential = { ...CRED, expires_at: '1' }
+  const SSE = [
+    'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n',
+    'data: [DONE]\n\n',
+  ].join('')
+
+  /** 按调用序列返回状态码；记录每次用的 token。 */
+  function seqFetch(statuses: readonly number[], auths: string[]) {
+    let n = 0
+    return (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      auths.push(String(new Headers(init?.headers).get('Authorization') ?? ''))
+      const status = statuses[Math.min(n, statuses.length - 1)]!
+      n += 1
+      if (status === 200) {
+        return new Response(SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      }
+      return new Response(JSON.stringify({ code: status }), {
+        status,
+        headers: { 'content-type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+  }
+
+  async function drain(adapter: LoomyAdapter) {
+    for await (const _chunk of adapter.stream({
+      provider: 'loomy',
+      model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    } as never)) {
+      // 只为把请求发出去
+    }
+  }
+
+  it('★★ 业务端点 401 + 探测抛非终态错误 ⇒ 不得整轮失败（必须留 warn）', async () => {
+    // ⚠️ 用 **未过期** 的凭据 ⇒ 不进前置门禁，只走 401 分支（这是本组的关键）。
+    const auths: string[] = []
+    const warns: string[] = []
+    const adapter = makeAdapter({
+      resolveCredential: async () => FRESH,
+      refresh: async () => { throw new Error('Loomy 凭据探测失败：系统内部错误') },
+      warn: (message) => warns.push(message),
+      fetchImpl: seqFetch([401], auths),
+    })
+
+    // 无池 ⇒ 换号无从谈起，最终仍会以「所有账号均不可用」失败；
+    // 但那必须是 **LlmError（AUTH）**，而不是探测那层的裸 Error。
+    await expect(drain(adapter)).rejects.toThrow(/所有账号均不可用|4?01/)
+    expect(warns, '非终态探测失败必须留痕（与前置门禁同口径）').toHaveLength(1)
+    expect(warns[0], '文案必须点名是 401/403 之后那一处').toContain('401/403')
+  })
+
+  it('★★★ 决定性判据：A 的 token 401、池里 B 正常 ⇒ 必须换到 B 成功', async () => {
+    // ⚠️⚠️ 这条是本次审计的核心回归 —— 修前实测 `getAvailableAccount` 调用 **0** 次、
+    //    B **从未被尝试**、整轮失败。PR 声称「真失效由换号接住」正是在此处被证伪。
+    const auths: string[] = []
+    const B: LoomyCredential = { ...CRED, access_token: 'tok-B' }
+    let resolveCount = 0
+    const adapter = makeAdapter({
+      // 第一次给 A（401），之后仍给 A（模拟「重取拿到同一份坏凭据」——
+      // 修法要求探测失败时**不重取**，故这条只是让「照抄前置分支」的写法暴露）
+      resolveCredential: async () => { resolveCount += 1; return FRESH },
+      refresh: async () => { throw new Error('Loomy 凭据探测失败：系统内部错误') },
+      warn: () => {},
+      fetchImpl: seqFetch([401, 200], auths),
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-A',
+        getAvailableAccount: async () => ({
+          entry: { id: 'acc-B', credentialRef: 'r' },
+          credential: B,
+        }),
+        updateModelRateLimit: async () => {},
+      } as never,
+    })
+
+    await expect(drain(adapter)).resolves.toBeUndefined()
+    // ① 换号真的发生了：第二个不同的 token 被发出去。
+    expect(auths.length, '必须有第二次请求（换号）').toBeGreaterThanOrEqual(2)
+    expect(auths.some((a) => a.includes('tok-B')), '必须真的换到 B').toBe(true)
+    // ② **不得重发同一个坏 token**（对抗审计 D3 的「白烧一次」）。
+    const aTimes = auths.filter((a) => a.includes(FRESH.access_token)).length
+    expect(aTimes, 'A 的坏 token 只该发一次（探测失败后不重取不重发）').toBe(1)
+  })
+
+  it('★★ 反向对照：401 后探测报**终态** ⇒ 仍必须抛（「请重新登录」是唯一出路）', async () => {
+    const auths: string[] = []
+    const adapter = makeAdapter({
+      resolveCredential: async () => FRESH,
+      refresh: async () => {
+        const error = new Error('Loomy 凭证已失效，请重新登录（缺少 token）')
+        error.name = 'RefreshTokenExpiredError'
+        throw error
+      },
+      warn: () => {},
+      fetchImpl: seqFetch([401], auths),
+    })
+
+    await expect(drain(adapter)).rejects.toThrow('凭证已失效')
+  })
+
+  /**
+   * ★★ 「凭据未配置 / 凭据解析失败」必须是**终态**（否则「请重新登录」被吞）。
+   *
+   * ⚠️ 这两格原先在 `refreshAccountCredential()` 里抛的是**普通 `Error`**，
+   * 而终态判据只认 `name === 'RefreshTokenExpiredError'` ⇒ 被判成非终态。
+   * 生产热路径在**池里有账号时**走的正是那个入口 ⇒ 终态被降级。
+   */
+  it('★★ 按 ref 入口的「凭据未配置 / 解析失败」必须是终态（不得被降级吞掉）', async () => {
+    const { LoomyAuth } = await import('../../src/loomy-auth.js')
+    const { Context } = await import('@deepseek-ai/cordis')
+    const ctx = new Context()
+    // 最小 credentials 替身：resolve 恒返回 undefined ⇒ 走「凭据未配置」那一格
+    ctx.provide('credentials' as never, {
+      resolve: async () => undefined,
+      get: async () => undefined,
+      set: async () => {},
+      unset: async () => {},
+    } as never)
+    const auth = new LoomyAuth(ctx, { ...LOOMY, id: 'loomy' } as never)
+    const error = await auth.refreshAccountCredential('LOOMY_ACCOUNT_TEST').then(
+      () => undefined,
+      (e: unknown) => e,
+    )
+    expect(error, '凭据未配置必须抛错').toBeInstanceOf(Error)
+    expect(
+      (error as Error).name,
+      '必须是终态名 RefreshTokenExpiredError，否则适配器会降级成「继续用现有凭据」',
+    ).toBe('RefreshTokenExpiredError')
+  })
+})
+
