@@ -111,10 +111,11 @@ describe('account.refresh 分派（T7 回归）', () => {
     // ⚠️ 2026-10-16 astudio 并入（goal 302 接线）：16 → 17。
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：17 → 18；
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19。
+    // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
     expect(
       EXPECTED_REFRESH_PROVIDER_IDS,
       'channel 集合变了，请复核 opencode 豁免是否仍成立（见 AUTH_EXEMPT）',
-    ).toHaveLength(19)
+    ).toHaveLength(20)
   })
 
   it('buddy 账号刷新**自己的** credentialRef，而不是默认单凭据 ref', async () => {

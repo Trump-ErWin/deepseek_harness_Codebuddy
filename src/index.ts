@@ -105,7 +105,7 @@ import { RaccoonAdapter } from './raccoon-adapter.js'
 //    详见 `docs/agent-notes/providers-accio.md`。
 import { AutoclawAuth } from './autoclaw-auth.js'
 import { registerAutoclawLlm } from './autoclaw-adapter.js'
-import { AUTOCLAW } from './autoclaw-product.js'
+import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import { AccioAuth } from './accio-auth.js'
 import { AccioAdapter, registerAccioLlm } from './accio-adapter.js'
@@ -2280,6 +2280,50 @@ export function apply(ctx: Context): void {
     readImage: makeReadImage(ctx),
   })
 
+  // ===== AutoClaw 国际版（autoclawintl）=====
+  //
+  // 与国内版是**同一套协议实现**的第二个实例（差异全在 `AUTOCLAW_INTL` 配置里：
+  // 基址 `autoglm-api.autoglm.ai` / 凭据 ref 前缀 `AUTOCLAWINTL_`）。
+  // 刻意**不复制**任何 `src/autoclaw*.ts` 实现文件 —— 协议同源，复制会让同类
+  // 缺陷（净额批次、临期分档、签到判据）修两遍（与 `minimaxintl` 同纪律）。
+  //
+  // ⚠️⚠️ **为什么是独立 provider**（三条判据全中，见 `autoclaw-product.ts`
+  //    `AutoclawProduct` 的注释表）：
+  //    ① 账号体系不互通（国内手机号 `7c54a9ac…` / 国际邮箱 `2c99dc99…`）；
+  //    ② API 主机不同；
+  //    ③ **登录方式不同**（国内短信验证码 / 国际 Z.ai OAuth）。
+  //
+  //    实测佐证：拿国内签发的 token 打国际基址，`wallets` / `user-profile`
+  //    一律 `410000 用户未登录`、推理 `401 Invalid token` ⇒ 用户体系物理隔离。
+  //
+  // ⚠️ **当前登录**：Z.ai OAuth 尚未接入（`state.nh` 来源未知，
+  //    见 `AUTOCLAW_INTL` 的注释）⇒ 本 provider 目前只能手工注入 token 使用。
+  //    接入后它会自己有一条 `login.startOAuth` 分支。
+  const autoclawIntl = new AutoclawAuth(ctx, { product: AUTOCLAW_INTL })
+  const autoclawIntlAdapter = registerAutoclawLlm(ctx, {
+    resolveCredential: createCredentialResolver<AutoclawCredential>(
+      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(AUTOCLAW_INTL.id, id) } },
+      {
+        product: AUTOCLAW_INTL,
+        readCredential: async (refName) => {
+          const resolved = await ctx.credentials.resolve(credentialRef(refName))
+          if (!resolved) return undefined
+          try {
+            return JSON.parse(resolved.value) as unknown as AutoclawCredential
+          } catch {
+            return undefined
+          }
+        },
+        fallback: { kind: 'ref', refName: AUTOCLAW_INTL.defaultCredentialRef },
+        throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+      },
+    ),
+    // ⚠️ provider 实参必须是 AUTOCLAW_INTL：写死 AUTOCLAW 会让国际站永远
+    //    查不到自己的账号（本插件在 workbuddy 上踩过同类坑）。
+    product: AUTOCLAW_INTL,
+    readImage: makeReadImage(ctx),
+  })
+
   const accio = new AccioAuth(ctx)
   const accioAdapter = registerAccioLlm(ctx, {
     // ⚠️ **不传 `credentialRef`**：`AccioAdapterOptions` 里没有这一项 —— 该适配器
@@ -3525,6 +3569,10 @@ async function fetchBalanceReading(
     minimax: pruned(MINIMAX.id, minimaxAdapter),
     minimaxintl: pruned(MINIMAX_INTL.id, minimaxIntlAdapter),
     autoclaw: pruned(AUTOCLAW.id, autoclawAdapter),
+    // ⚠️ 国际版与国内版**同一套实现的两个实例**，但 provider id 不同 ⇒
+    //    必须各自一条（与 minimaxintl 同款）。键是 provider id `autoclawintl`
+    //    （全小写），值是变量 `autoclawIntlAdapter`（驼峰）。
+    autoclawintl: pruned(AUTOCLAW_INTL.id, autoclawIntlAdapter),
     accio: pruned(ACCIO.id, accioAdapter),
     gemini: pruned(GEMINI.id, geminiAdapter),
     zcode: pruned(ZCODE.id, zcodeAdapter),
@@ -3850,6 +3898,12 @@ async function fetchBalanceReading(
       // 收不到本循环的调用（实测症状：`续期没有分派到它自己的实例（实际：无）`）。
       ['officeace', officeaceAuthService as unknown as JetHubAuthLike],
       ['autoclaw', autoclaw],
+      // ⚠️ AutoClaw 国际版：与 `autoclaw` **共用同一个 `AutoclawAuth` 类**，
+      //    故键与值都是它自己那个实例（`autoclawIntl`）。写成 `autoclaw: autoclawIntl`
+      //    这类错位会让国际站账号的续期去刷国内站凭据（同族串接，本仓库复发过 6 次）。
+      //    漏加这一行 = 它不进注册表 ⇒ 续期/积分/探测三条链路**全部静默失效**
+      //    （`provider-runtime-wiring.spec.ts` 会点名 `autoclawintl 未注册`）。
+      ['autoclawintl', autoclawIntl],
       ['accio', accio],
       // AStudio（讯飞 AstronStudio）：值是 AstudioAuth 服务实例 —— 它已在构造时
       // provide 自己（服务名 astudioAuth），必须与 registerJetHubRpc 的 auths.astudio
@@ -3967,6 +4021,11 @@ async function fetchBalanceReading(
     //（纯函数集合 + 统一 auth 契约），不是 Service 实例。
     officeace: officeaceAuthService as never,
     autoclaw,
+    // ⚠️ 键是 **provider id** `autoclawintl`，值是变量 `autoclawIntl` ——
+    //    两者不同名（id 全小写、变量带驼峰），写成简写会引用不存在的变量。
+    //    ⚠️ 值必须是**国际版实例**：写成 `autoclaw` 会让国际站账号的续期
+    //    去刷国内站凭据（与 minimaxintl 的同类风险完全一致）。
+    autoclawintl: autoclawIntl,
     accio,
     astudio,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。漏加 = 客户端把它当

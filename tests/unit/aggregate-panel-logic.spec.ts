@@ -747,12 +747,14 @@ describe('★ 面板接线：默认零探测，点了才探测（防「面板没
     // ⚠️ 2026-10-15（PR#101 复审）：原断言是「snippet 里含 `lobsterai` / `trae`」——
     //    它只**抽查**两个名字。而清单当时被**写死**在这句里，2026-10-13 加
     //    accio / officeace 时没人回头改 ⇒ 提示漏掉两家（只登了那两家的用户看到错话），
-    //    而这个抽查式断言**照样全绿**。现清单抽成具名常量 `AGG_WIRED_CHANNEL_LABELS`：
+    //    而这个抽查式断言**照样全绿**。现清单抽成具名常量（原
+    //    `AGG_WIRED_CHANNEL_LABELS`，2026-10-20 改为只存 id 的
+    //    `AGG_WIRED_CHANNEL_IDS`，显示名经 `providerLabel()` 现查）：
     //    本用例守「提示真的引用了它、且不得再写死一份」，
     //    **内容**由文件末尾的 ★★ 守卫与 `WIRED_EXPIRY_PROVIDERS` 锁成**集合相等**
     //（覆盖全部渠道，比抽查两个名字更强）。
-    expect(snippet, '提示必须引用 AGG_WIRED_CHANNEL_LABELS')
-      .toContain('AGG_WIRED_CHANNEL_LABELS')
+    expect(snippet, '提示必须引用 AGG_WIRED_CHANNEL_IDS')
+      .toContain('AGG_WIRED_CHANNEL_IDS')
     expect(snippet, '不得在提示里再写死一份渠道名单')
       .not.toMatch(/'[^']*buddy[^']*'/)
   })
@@ -1258,31 +1260,64 @@ describe('★★ 手工排序纯函数（拖动 / 上移下移 / 提交数组）
  */
 describe('★★ 空态文案的渠道名单 == WIRED_EXPIRY_PROVIDERS', () => {
   /**
-   * 从客户端源码里抽出那份名单。
+   * 从客户端源码里抽出那份**id** 名单。
    *
-   * @throws 抽不到 `AGG_WIRED_CHANNEL_LABELS` 的字面量时**抛错**（fail-closed）。
+   * ⚠️⚠️ 2026-10-20 改：原先是手抄的**显示名**字符串（`'buddy / workbuddy / …'`），
+   * 与后端 `WIRED_EXPIRY_PROVIDERS`（存 **id**）**天然不同构** —— 之前靠 11 家的
+   * label 恰好等于 id 蒙混过关；一遇到 label 与 id 不同的 provider（如
+   * `autoclawintl` → 「AutoClaw (国际版)」）就必然分叉，守卫永远对不上。
+   *
+   * ⇒ 改为抽 **id 名单**，文案侧经 `providerLabel(id)` 现查：
+   *   - 「id 名单 == 后端清单」才是真正的集合相等；
+   *   - 「id → label」由 registry 单一持有 ⇒ 改名 / 新增 provider 时**零改动**。
+   *
+   * @throws 抽不到 `AGG_WIRED_CHANNEL_IDS` 的数组字面量时**抛错**（fail-closed）。
    */
-  function clientChannelLabels(): string[] {
+  function clientChannelIds(): string[] {
     const source = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
-    const matched = /const AGG_WIRED_CHANNEL_LABELS =\s*\n?\s*'([^']*)'/.exec(source)
+    const matched = /const AGG_WIRED_CHANNEL_IDS = \[([^\]]*)\]/.exec(source)
     if (matched === null) {
       throw new Error(
-        '抽不到 `AGG_WIRED_CHANNEL_LABELS` 的字面量 —— 常量被改名/改写了？'
+        '抽不到 `AGG_WIRED_CHANNEL_IDS` 的数组字面量 —— 常量被改名/改写了？'
         + '本守卫必须跟着改，**不得**让它静默失效（fail-closed）',
       )
     }
-    return matched[1].split('/').map((name) => name.trim()).filter((name) => name.length > 0)
+    return matched[1].split(',').map((id) => id.trim().replace(/^['"]|['"]$/g, ''))
+      .filter((id) => id.length > 0)
   }
 
   it('两边的渠道集合相等（顺序无关）', () => {
-    expect(clientChannelLabels().sort()).toEqual([...WIRED_EXPIRY_PROVIDERS].sort())
+    expect(clientChannelIds().sort()).toEqual([...WIRED_EXPIRY_PROVIDERS].sort())
   })
 
   it('★ 判据自检：两份名单都真的非空（否则上一条会退化成恒真）', () => {
-    expect(clientChannelLabels().length, '客户端名单抽出来是空的 ⇒ 上面那条是同义反复')
+    expect(clientChannelIds().length, '客户端名单抽出来是空的 ⇒ 上面那条是同义反复')
       .toBeGreaterThan(0)
     expect(WIRED_EXPIRY_PROVIDERS.length, '白名单为空 ⇒ 上面那条是同义反复')
       .toBeGreaterThan(0)
+  })
+
+  /**
+   * ⚠️ 文案**不许再手抄显示名**（2026-10-20 新增的一条）。
+   *
+   * 旧形态 `const AGG_WIRED_CHANNEL_LABELS = 'buddy / workbuddy / …'`（**已删除**）
+   * 是一份手抄的显示名，每加一家要同步两处名字（registry + 这里），历史上已经烂过
+   * （接入 accio/officeace 后没人回头改，只登那两家的用户看到「请先登录」错话）。
+   *
+   * ⇒ 锁死「文案侧只存 id，名字经 `providerLabel()` 现查」。
+   */
+  it('★ 文案侧只存 id，显示名经 providerLabel 现查（不再手抄名字）', () => {
+    const source = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+    expect(source).toContain('AGG_WIRED_CHANNEL_IDS')
+    // 旧的手抄显示名常量必须**没有定义**（防止两条路并存、其中一条悄悄腐烂）。
+    // ⚠️ 判据是 `const AGG_WIRED_CHANNEL_LABELS =`（**带定义**）而不是裸名字：
+    //    JSDoc 里保留旧名的历史说明是有价值的（告诉后人为什么改），
+    //    用裸名字会把那段说明判成残留 ⇒ 误红。
+    expect(source, 'AGG_WIRED_CHANNEL_LABELS 的定义应已删除，别让两条路并存')
+      .not.toMatch(/const\s+AGG_WIRED_CHANNEL_LABELS\s*=/)
+    // 渲染处必须走 providerLabel，而不是把裸 id 直接拼进文案。
+    expect(source, '空态文案必须经 providerLabel 现查显示名')
+      .toMatch(/AGG_WIRED_CHANNEL_IDS\.map\(id => providerLabel\(id\)\)/)
   })
 })
 

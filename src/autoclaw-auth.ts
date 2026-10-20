@@ -22,12 +22,17 @@ import {
   sendAutoclawVerificationCode,
   loginAutoclawWithCode,
   startAutoclawSmsLoginFlow,
+  buildAutoclawZaiAuthUrl,
+  exchangeAutoclawZaiCode,
   type SendAutoclawCodeResult,
   type LoginAutoclawWithCodeResult,
   type StartedAutoclawSmsLoginFlow,
 } from './autoclaw-oauth.js'
 import { RefreshScheduler } from './refresh.js'
-import { claimAutoclawDailyQuota } from './autoclaw-credits.js'
+import {
+  claimAutoclawDailyQuota,
+  fetchAutoclawBalanceDetailed,
+} from './autoclaw-credits.js'
 import { AccountPool } from './account-pool.js'
 import {
   refreshAccountWithReconcile,
@@ -101,10 +106,21 @@ export class AutoclawAuth extends Service {
   }
 
   /**
-   * 探测本地是否有有效凭据。
+   * 探测本地是否有有效凭据（一键导入）。
+   *
+   * ⚠️ **按产品选 userData 目录**（2026-10-20）：国内版与国际版是同一客户端的
+   * 两份构建（`isOversea` 构建期常量），但 userData 目录名不同：
+   * - 国内：`AutoClaw-official`
+   * - 国际：`AutoClaw-oversea-official`
+   *
+   * 原实现硬编码国内目录 ⇒ **国际版永远导入不到自己的凭据**。
    */
   async probeLocal(): Promise<AutoclawCredential | undefined> {
-    return probeAutoclawLocalCredential()
+    return probeAutoclawLocalCredential({
+      appDirName: this.product.id === 'autoclawintl'
+        ? 'AutoClaw-oversea-official'
+        : 'AutoClaw-official',
+    })
   }
 
   /**
@@ -288,8 +304,51 @@ export class AutoclawAuth extends Service {
       throw new Error('未检测到本地 AutoClaw 桌面端有效登录凭据，请先在 AutoClaw 中登录')
     }
 
-    const accountId = options?.accountId ?? `autoclaw-${Date.now().toString(36)}`
-    const refName = options?.refName ?? `AUTOCLAW_ACCOUNT_${Date.now().toString(16).toUpperCase()}`
+    /**
+     * ⚠️⚠️ **归属校验：导入前必须用**本产品自己的**基址探一次余额**（2026-10-20）。
+     *
+     * ## 为什么需要它（真实事故）
+     *
+     * 旧代码把 `refName` 写死 `AUTOCLAW_ACCOUNT_*`、且读国内目录 ⇒
+     * 国际版槽位里被塞进**国内版凭据**。用户看到的是「国际版卡片显示国内手机号、
+     * 且已过期」—— 而凭据本身能解出来、能落盘，**全流程无一处报错**。
+     *
+     * ⇒ 「能读到」不等于「读对了」。必须在落盘前用该产品基址实探一次：
+     *    国内凭据打国际基址会 `410000 未登录`，反之亦然（实测）。
+     *
+     * ⚠️ 失败即拒绝落盘，并给出**指向性**错误（告诉用户去哪个客户端登录），
+     *    而不是把一条「永远查不到余额」的凭据写进去。
+     */
+    try {
+      const detail = await fetchAutoclawBalanceDetailed(cred, { product: this.product })
+      if (detail.balance === null || detail.balance === undefined) {
+        const site = this.product.id === 'autoclawintl' ? '国际版' : '国内版'
+        throw new Error(
+          `导入的凭据在 AutoClaw${site}校验失败（${detail.error ?? '未知原因'}）`
+          + `——请确认你在 AutoClaw${site}客户端里登录的是${site}账号`,
+        )
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('校验失败')) throw err
+      const reason = err instanceof Error ? err.message : String(err)
+      const site = this.product.id === 'autoclawintl' ? '国际版' : '国内版'
+      throw new Error(
+        `导入的凭据无法通过 AutoClaw${site}校验：${reason}`
+        + `——请确认你在 AutoClaw${site}客户端里登录的是${site}账号`,
+      )
+    }
+
+    const accountId = options?.accountId ?? `${this.product.id}-${Date.now().toString(36)}`
+    // ⚠️⚠️ **refName 的前缀必须按产品派生**（2026-10-20 修）：
+    //    原实现写死 `AUTOCLAW_ACCOUNT_${…}` ⇒ 国际版一键导入的凭据会
+    //    **落进国内版命名空间**（`AUTOCLAW_*`），被 `REF_PREFIX_TO_PROVIDER`
+    //    判成 `autoclaw` 账号 —— 用户看到的是「国际版导入后跑到国内面板、
+    //    余额查不到（410000 未登录）」。
+    //    ⇒ 从 `defaultCredentialRef`（`AUTOCLAW_ACCOUNT_DEFAULT` /
+    //      `AUTOCLAWINTL_ACCOUNT_DEFAULT`）截掉 `_DEFAULT` 作为前缀，
+    //      单一真相源，不新增第二份拼写。
+    const refPrefix = this.product.defaultCredentialRef.replace(/_DEFAULT$/, '_')
+    const refName = options?.refName ?? `${refPrefix}${Date.now().toString(16).toUpperCase()}`
 
     const ref = credentialRef(refName)
     await this.ctx.credentials.set(ref, JSON.stringify(cred))
@@ -379,5 +438,71 @@ export class AutoclawAuth extends Service {
       product: this.product,
       fetchImpl: this.fetchImpl,
     })
+  }
+
+  /**
+   * 构造 **Z.ai OAuth** 授权 URL（仅国际版 `autoclawintl` 用）。
+   *
+   * ## 为什么国际版必须走 OAuth 而不是短信
+   *
+   * 国际版**后端也接受短信**（实测 `/userapi/v1/agent-send-code` 在国际基址回
+   * `code=0 SUCCESS`），但国际版账号是**邮箱 + OAuth 创建、没绑手机号**
+   * （`account-profile.json`: `phone: null`），且**没有绑手机的端点**
+   * （`agent-bind-phone` / `bind-phone` 等全 404）⇒ 短信对国际账号不可用。
+   *
+   * ## `state` 的处理：**不生成，透传**
+   *
+   * 官方 `state` 是不透明串（`aosi.<base64url JWT>`，含 `dh` / `nh` 等字段），
+   * 由远端登录页生成。`dh = SHA256(deviceId)` 已破解，但 **`nh` 来源未知**。
+   *
+   * ⚠️ 实测：用**瞎编的** `state` 打 `/userapi/overseasv1/zai-oauth-login`，
+   *    服务端回 `631001 User login error`（= 进了登录逻辑、code 无效），
+   *    **不是**「state 无效」⇒ 服务端不硬校验 `state` 内容。
+   *
+   * ⇒ 本方法**只拼 `client_id` / `redirect_uri` / `response_type`**，
+   *   `state` 留给授权页填，回调时原样透传给 {@link loginWithZaiCode}。
+   *
+   * @param redirectUri - 回调地址（`http://localhost:<port>/auth/callback-zai`）。
+   */
+  buildZaiAuthUrl(redirectUri: string): string {
+    return buildAutoclawZaiAuthUrl(redirectUri)
+  }
+
+  /**
+   * 用 Z.ai 授权码换 token 并落盘（仅国际版）。
+   *
+   * ⚠️ 与 {@link loginWithCode}（短信）并列的**第二条登录腿**：
+   *    - 短信：国内版；国际版短信端点通但账号没绑手机。
+   *    - OAuth：国际版唯一可用路径。
+   *
+   * @param code - 回调 URL 里的 `code`。
+   * @param state - 回调 URL 里的 `state`（**原样透传**，不解析）。
+   * @param navigateUri - 与授权时**完全相同**的回调地址。
+   * @param refName - 凭据 ref 名（登录成功后写它）。
+   */
+  async loginWithZaiCode(
+    code: string,
+    state: string,
+    navigateUri: string,
+    refName: string,
+  ): Promise<LoginAutoclawWithCodeResult> {
+    const res = await exchangeAutoclawZaiCode(code, state, navigateUri, {
+      product: this.product,
+      fetchImpl: this.fetchImpl,
+    })
+    if (res.ok && res.credential) {
+      const ref = credentialRef(refName)
+      await this.ctx.credentials.set(ref, JSON.stringify(res.credential))
+      // 与短信登录同口径：登录后立刻领一次每日积分（失败不反噬登录）。
+      try {
+        await claimAutoclawDailyQuota(res.credential, { product: this.product })
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          `[autoclaw] OAuth 登录后自动领取每日积分失败（不影响登录）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+    return res
   }
 }

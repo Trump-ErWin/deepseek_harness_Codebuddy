@@ -496,7 +496,7 @@ export class AutoclawAdapter extends LlmAdapter {
       model: upstreamModel,
       messages: wireMessages,
       stream: true,
-      // ⚠️⚠️ `max_tokens` **双向夹取**（2026-10-17 审计 P0/P1 修复）。
+      // ⚠️⚠️ `max_tokens` **双向夹取 + 强制保底**（2026-10-20 新增）。
       //   下限 10000：**不是**原先的 16384 —— `docs/autoclaw-models.md:53-55`
       //   明写官方约束是「`>= 10000` **或完全不传递**，传 `< 10000`（如 IDE
       //   默认的 4096）回 406」⇒ 抬到 16384 属**编造上游没承诺的数字**
@@ -505,6 +505,17 @@ export class AutoclawAdapter extends LlmAdapter {
       //   下限，宿主请求 500000 时会原样发出，而 `zai_auto` 声明仅 393216
       //   ⇒ 超上限且宿主不转可读错误。
       //   ⚠️ 两者都取不到时**不发该字段**（网关默认），绝不编造数值。
+      //
+      //   ⚠️⚠️ **国际站对 `max_tokens` 的要求与国内站完全一致**（2026-10-20 实测）。
+      //     本行曾一度被改成「`wireMaxTokens === undefined` 时强制补 10000」，
+      //     依据是「国际站不发该字段会回 406」—— **那条依据是错的**：
+      //     当时手动复现同时加了 10 个客户端头，把真正起决定作用的
+      //     `X-Version`（缺它 → 500）误判成了 `max_tokens` 的问题。
+      //     二分实测（带 `X-Version`、同一 body）：
+      //       不发 max_tokens → 200 / =10000 → 200 / =512 → 406
+      //     ⇒ 国际站同样接受「不发」，保底既**没必要**、又**违反**
+      //       「绝不编造数字」的 P0 红线，已撤销。真修复见 `buildAutoclawHeaders`
+      //       的 `X-Version`。
       ...(wireMaxTokens === undefined ? {} : { max_tokens: wireMaxTokens }),
       ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
       // ⚠️⚠️ **档位必须先过 `autoclawEffortForRequest` 本地校验**（2026-10-18 审计 P0）。

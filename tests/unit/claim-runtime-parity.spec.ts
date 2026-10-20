@@ -233,7 +233,8 @@ describe('签到能力：registry 声明与 runtime 实现必须一致', () => {
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，声明可签到）⇒ 6 → 7。
     // ⚠️ 2026-10-16 加 astudio（声明可签到且有 claimDaily 接线）：7 → 8。
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱，声明可签到）：8 → 9。
-    expect(checked.length, '没有任何渠道被检查 = 本用例什么都没守').toBe(9)
+    // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版，与国内同源）：9 → 10。
+    expect(checked.length, '没有任何渠道被检查 = 本用例什么都没守').toBe(10)
   })
 
   /**

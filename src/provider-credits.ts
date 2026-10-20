@@ -76,6 +76,7 @@ import { MODELSCOPE } from './modelscope-product.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
 import { fetchAstudioBalanceDetailed, claimDaily } from './astudio-credits.js'
 import { fetchAutoclawBalanceDetailed, claimAutoclawDailyQuota } from './autoclaw-credits.js'
+import { AUTOCLAW_INTL } from './autoclaw-product.js'
 import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
 import { fetchZcodeBalance, type ZcodeBalanceResult } from './zcode-upstream.js'
@@ -499,6 +500,30 @@ export function createProviderCredits(
         await fetchAutoclawBalanceDetailed(credential as AutoclawCredential),
       claim: async (credential) =>
         await claimAutoclawDailyQuota(credential as AutoclawCredential),
+      precheckStatus: false,
+    },
+    /**
+     * **AutoClaw 国际版**（`autoclawintl`）。
+     *
+     * ⚠️⚠️ **必须显式传 `product: AUTOCLAW_INTL`** —— 不传会走默认的国内基址，
+     *    用户的国际账号余额恒查不到（表现为 `410000 用户未登录`）。
+     *    这是「同一实现两个实例」最容易踩的一处：`fetchAutoclawBalanceDetailed`
+     *    的默认参数是 `AUTOCLAW`（国内），漏传会**静默**查错站。
+     *
+     * 实测（2026-10-20）：国际站返回 `code=0`、`total_balance=13000`，
+     * 两个批次包（`AutoClaw Weekly Perks` 3000 / `New-user credits` 10000）。
+     */
+    autoclawintl: {
+      fetchBalanceDetailed: async (credential) =>
+        await fetchAutoclawBalanceDetailed(
+          credential as AutoclawCredential,
+          { product: AUTOCLAW_INTL },
+        ),
+      claim: async (credential) =>
+        await claimAutoclawDailyQuota(
+          credential as AutoclawCredential,
+          { product: AUTOCLAW_INTL },
+        ),
       precheckStatus: false,
     },
     accio: {

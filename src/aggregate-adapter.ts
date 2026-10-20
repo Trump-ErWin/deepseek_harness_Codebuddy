@@ -1364,6 +1364,14 @@ export class AggregateAdapter extends LlmAdapter {
     //    归「需人工重新登录」终态）与聚合渠道不同；且上方注释已实证「只加本数组而不补
     //    aggregate-expiry 的 WIRED_EXPIRY_PROVIDERS」是无效接线。两处均未补齐 ⇒ 本轮保持
     //    不接入聚合渠道，此处不新增成员，仅留此说明防止后人误以为漏接。
+    // ⚠️ AutoClaw 国际版（2026-10-20）：`channel: true` ⇒ 必须进聚合目录，
+    //    否则它的模型**永不进聚合、静默不可见**（同款陷阱已复发四次：
+    //    cline → accio → officeace → autoclaw）。
+    //    与 `autoclaw` 一样**已接入** `WIRED_EXPIRY_PROVIDERS`（三处同改：
+    //    本数组 + `aggregate-expiry.ts` 的清单 + `provider-expiry.ts` 的条目）。
+    //    ⚠️ `provider-expiry.ts` 里必须传 `AUTOCLAW_INTL` —— 传国内版会用国内
+    //    基址查国际账号余额（410000）⇒ 折算恒 `UNUSABLE` ⇒ 又回到静默不可见。
+    'autoclawintl',
   ])
 
   /**
