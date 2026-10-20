@@ -67,8 +67,19 @@ const EXPECTED_WIRED = [
   //    `qoder-credits.ts` **不写** `deductionEndTime` ⇒ 落永久桶 ⇒ 可分档。
   //    ⚠️ 两站域名不同（`openapi.qoder.sh` / `openapi.qoder.com.cn`），
   //    共用一个 `QoderAuth` 但**是两个渠道 id**，故必须各占一项。
-  'accio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts', 'lobsterai', 'loomy',
-  'modelscope', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy', 'zcode',
+  // ⚠️ astudio 2026-10-20 加入：`/points/balance` 三池各带 `*NextExpireTime`，
+  //    由 `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到 `deductionEndTime`。
+  //    这是「只加 AGGREGATE_CHANNELS 而漏本清单」的第 5 次复发。
+  // ⚠️ minimax / minimaxintl 2026-10-20 加入（**第 6 次复发**，同上成因）：
+  //    `/minimax-cloud/api/v1/credit/details` 的每条 `details[]` 带
+  //    `expire_at_ms`（毫秒时间戳），由 `minimax-credits.ts` 直接写进
+  //    `deductionEndTime`。⚠️ 国际站另有**地理分流**（307 到中国站且不认
+  //    国际站 token）⇒ 折算原语必须透传 `xff`，否则「面板能刷新、聚合候选
+  //    却恒折算失败」。两家共用一个 `MinimaxAuth`，但**是两个渠道 id**，
+  //    故必须各占一项。
+  'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts',
+  'lobsterai', 'loomy', 'minimax', 'minimaxintl', 'modelscope', 'officeace',
+  'qoder', 'qodercn', 'trae', 'workbuddy', 'zcode',
 ]
 
 class FakeCredentials {
@@ -228,8 +239,11 @@ const NOT_EXPIRY_WIRED = new Map<string, string>([
   //    移除本表才是这条红线的正确走法 —— 不许用「改断言」绕过。
   ['cline', '余额报文无跨账号到期口径；aggregate-expiry.ts:82 登记为未接入'],
   ['raccoon', '同上（aggregate-expiry.ts:82）'],
-  ['minimax', '同上（aggregate-expiry.ts:82）'],
-  ['minimaxintl', '同 minimax（共用同一个 MinimaxAuth 类，余额原语同形）'],
+  // ⚠️ minimax / minimaxintl **已于 2026-10-20 从本表移除**（用户报障：「MiniMax
+  //    Code 积分也有到期时间，也应当有相同功能」）。它们已接上
+  //    `WIRED_EXPIRY_PROVIDERS` + `createProviderExpiry()` 的 `minimaxExpiry`
+  //    原语 ⇒ 留在本表会与「豁免表不得与清单重叠」那条用例直接冲突（重叠 =
+  //    豁免是假的）。移除本表才是这条红线的正确走法 —— 不许用「改断言」绕过。
   ['gemini', '同上（aggregate-expiry.ts:82）'],
   ['opencode', '「余额」是本地派生的通道可用性、零网络，套折算骨架会发不存在的请求'],
 ])

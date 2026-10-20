@@ -206,6 +206,7 @@ describe('前后端能力声明一致（trae / lobsterai）', () => {
     // ⚠️ qoder / qodercn **已于 2026-10-20 移出本名单**（它们已登记
     //    `permanentLock: true`）；留着会让本用例红 —— 这是正确的红灯，
     //    不许靠放宽断言绕过。
+    // ⚠️ minimax / minimaxintl / astudio 同理（三家均于 2026-10-20 登记）。
     for (const id of ['cline', 'raccoon', 'zcode', 'codearts']) {
       expect(supportsPermanentLock(id), id).toBe(false)
     }

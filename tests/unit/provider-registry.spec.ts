@@ -145,7 +145,7 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(Object.isFrozen(PROVIDER_REGISTRY), 'registry 数组应冻结').toBe(true)
   })
 
-  it('permanentLock 恰好是既有的 8 家（officeace 2026-10-12、qoder/qodercn 2026-10-20 加入）', () => {
+  it('permanentLock 恰好是 9 家（officeace 2026-10-12、astudio/minimax/minimaxintl 2026-10-20、qoder/qodercn 2026-10-20 加入）', () => {
     const locked = PROVIDER_REGISTRY.filter((d) => d.permanentLock === true)
       .map((d) => d.id).sort()
     // ⚠️ qoder / qodercn 2026-10-20 加入（用户要求补齐三档分档 + 永久锁）。判据见
@@ -154,12 +154,20 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     //    不写 `deductionEndTime` ⇒ 落永久桶 ⇒ 「锁住就不作废」的语义**成立**
     //    （不是拿哨兵当真实到期时刻）。同日接上同一个 `kind: 'buddy'` 选号。
     //    ⚠️ **两站必须各占一项**（共用一个 `QoderAuth` 不等于共用一个 id）。
+    // ⚠️ astudio 2026-10-20 加入：三池（会员/购买/赠送）各下发 `*NextExpireTime`
+    //    ⇒ 与 buddy 系同形，可分三档；且已接上 `createCredentialResolver`
+    //    的 `kind: 'buddy'` 选号（锁定才真能拦），故两处同时登记。
+    // ⚠️ minimax / minimaxintl 2026-10-20 加入（用户报障：「MiniMax Code 积分也有
+    //    到期时间，也应当有相同功能」）：`/minimax-cloud/api/v1/credit/details` 的
+    //    每条 `details[]` 都带 `expire_at_ms`（毫秒时间戳）⇒ 可分三档；同日接上
+    //    `createCredentialResolver` 的 `kind: 'buddy'` 选号，锁定才真能拦。
     expect(locked).toEqual([
-      'buddy', 'lobsterai', 'loomy', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
+      'astudio', 'buddy', 'lobsterai', 'loomy', 'minimax', 'minimaxintl',
+      'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
     ])
   })
 
-  it('usesExpiryWindow 恰好是 9 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17、qoder/qodercn 2026-10-20 加入）', () => {
+  it('usesExpiryWindow 恰好是 11 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17、qoder/qodercn/astudio/minimax/minimaxintl 2026-10-20 加入）', () => {
     const win = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
     // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`，未过期批次
@@ -170,9 +178,16 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     //    `usage.expiresAt` 是永久哨兵时**不写** `deductionEndTime` ⇒ 该包落永久
     //    桶 ⇒ 面板能分「长期 / 临期」、锁定能真拦住。⚠️ 与 codearts 不同（那家
     //    不开 `permanentLock`），**本家同时开**（它有「永不作废」的套餐池）。
+    // ⚠️ astudio 2026-10-20 加入：`/points/balance` 的 `{member,buy,activity}
+    //    NextExpireTime` 是**不带时区的本地时间串**，由
+    //    `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到 `deductionEndTime`。
+    // ⚠️ minimax / minimaxintl 2026-10-20 加入：`expire_at_ms` 是**毫秒时间戳**，
+    //    无需换算，直接写进 `deductionEndTime`（与 astudio 那条的形态差异见
+    //    `aggregate-expiry.ts` 的 `minimaxExpiry` 注释）。
     expect(win).toEqual([
-      'autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace',
-      'qoder', 'qodercn', 'trae', 'workbuddy',
+      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae',
+      'workbuddy',
     ])
   })
 
