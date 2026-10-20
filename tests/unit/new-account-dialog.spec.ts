@@ -363,6 +363,47 @@ describe('F. accio 区域选择入口（终审 I2）', () => {
     expect(jetHubCode).toMatch(/区域由服务端按账号下发/)
     expect(jetHubCode).toMatch(/登录页/)
   })
+
+  /**
+   * ⚠️⚠️ **autoclaw 弹窗判据的源码锁**（2026-10-20 审计补）。
+   *
+   * 审计实测：把 `autoclawDialog` 改回 `provider === 'autoclaw'`（= PR 修之前
+   * 的形态，国际版会弹「添加 ZCode 账号」窗），
+   * `new-account-dialog` + `aggregate-panel-logic` **128 tests 全绿** ——
+   * 而本文件对 `accioDialog` 的赋值是**有**源码锁的（`const accioDialog = false`
+   * 会红 1 条）。⇒ 同一个文件里两条判据的守卫强度不一致，PR121 声称修好的
+   * 「第 4 处漏点」实际上没有任何守卫。
+   *
+   * 判据必须钉**赋值**（不是 `autoclawDialog ?` 的存在）：后者在
+   * `const autoclawDialog = false` 下照样匹配。
+   */
+  it('★ autoclaw 弹窗判据必须同时覆盖国际版（钉住赋值，不是钉三元）', () => {
+    expect(
+      jetHubCode,
+      '★ 判据必须是 `provider === \'autoclaw\' || provider === \'autoclawintl\'`'
+      + '—— 只判国内会让国际版弹「添加 ZCode 账号」窗（审计实测改坏后 128 条全绿）',
+    ).toMatch(/const autoclawDialog = provider === 'autoclaw' \|\| provider === 'autoclawintl';/)
+    // 弹窗内容确实按该判据分支。
+    expect(jetHubCode, '弹窗内容必须按 autoclaw 分支').toMatch(/autoclawDialog\s*\?/)
+  })
+
+  /**
+   * ⚠️ **国际版不得渲染短信登录**（2026-10-20 审计 P1）。
+   *
+   * 国际版账号是邮箱 + Z.ai OAuth 创建的、`phone` 为 null、无绑手机端点
+   * ⇒ 短信必然失败且文案不指向真因。故 `sms` 选项必须受 `autoclawSmsAvailable`
+   * 门控（只对国内版为 true）。
+   */
+  it('★ 国际版不渲染短信登录死路（sms 选项必须被 autoclawSmsAvailable 门控）', () => {
+    expect(
+      jetHubCode,
+      '★ 必须有 autoclawSmsAvailable 且只对国内版为 true',
+    ).toMatch(/const autoclawSmsAvailable = provider === 'autoclaw';/)
+    expect(
+      jetHubCode,
+      '★ sms 选项必须受该门控 —— 否则国际版用户会选到一条必然失败的路',
+    ).toMatch(/autoclawSmsAvailable[\s\S]{0,80}'sms'/)
+  })
 })
 
 describe('B. 登录重入不许静默 return（IKJLK3 B）', () => {

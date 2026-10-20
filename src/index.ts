@@ -107,7 +107,7 @@ import { RaccoonAdapter } from './raccoon-adapter.js'
 import { AutoclawAuth } from './autoclaw-auth.js'
 import { registerAutoclawLlm } from './autoclaw-adapter.js'
 import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js'
-import type { AutoclawCredential } from './autoclaw.js'
+import { isAutoclawUuidUserId, type AutoclawCredential } from './autoclaw.js'
 import { AccioAuth } from './accio-auth.js'
 import { AccioAdapter, registerAccioLlm } from './accio-adapter.js'
 import { ACCIO } from './accio-product.js'
@@ -427,8 +427,17 @@ async function autoclawSelfHeal(
         device_id?: unknown
         user_id?: unknown
       }
-      // 已有 user_id 就不用补（少一次网络往返）。
-      if (typeof cred.user_id === 'string' && cred.user_id.trim() !== '') continue
+      // ⚠️⚠️ **跳过条件必须是「已经是 UUID」，不能是「有值」**
+      //    （2026-10-20 审计 P1，实测真缺陷）。
+      //
+      //    登录路径用 `readUserIdFromJwt()` 写回的 `user_id` 是**字符串形态的
+      //    数字 id**（`String(839684)` ⇒ `"839684"`），原判据
+      //    `typeof === 'string' && trim() !== ''` 对它**恒真** ⇒ 自愈从不为
+      //    PR 之后新登录的账号补 UUID ⇒ 池里永久并存 `autoclaw:839684` 与
+      //    `autoclaw:7c54a9a…` 两组 ⇒ 去重对混合池无效（PR 要修的症状原样存在）。
+      //
+      //    ⇒ 只有「已经是 UUID 主键」才算补齐完成。
+      if (isAutoclawUuidUserId(cred.user_id)) continue
 
       const token = typeof cred.access_token === 'string' ? cred.access_token : ''
       const device = typeof cred.device_id === 'string' ? cred.device_id : ''

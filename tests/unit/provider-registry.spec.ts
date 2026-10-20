@@ -201,16 +201,34 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(t).toEqual(['gemini'])
   })
 
-  it('creditPackages 恰好是既有的 9 家（officeace 2026-10-12、autoclaw 2026-10-17、astudio 2026-10-20 加入）', () => {
-    // ⚠️ `creditPackages` 决定**账号名 hover 是否列资源包**。astudio 是 2026-10-20
-    //    用户报障补上的：它的 `buildAstudioBalance` **本来就**把四个池逐包解析出了
-    //    到期时间（`member`/`buy`/`activity`/`spark` 的 `*NextExpireTime`），
-    //    缺的只是这条声明 ⇒ hover 看不到「没过期的资源包」。
-    const p = PROVIDER_REGISTRY.filter((d) => d.creditPackages === true)
-      .map((d) => d.id).sort()
-    expect(p).toEqual([
-      'astudio', 'autoclaw', 'buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
-    ])
+  it('creditPackages 必须覆盖所有 usesExpiryWindow 的家（判据从能力事实派生，不是手写名单）', () => {
+    // ⚠️⚠️ **本用例原先是一份手写 9 家名单，把「漏项」固化成了期望值**
+    //    （2026-10-20 审计实测）：`autoclawintl` 漏了 `creditPackages`，
+    //    补上它反而**变红**（`expected [...(10)] to deeply equal [ Array(9) ]`）。
+    //    那正是本仓库反复记载的「守卫把 bug 写成期望值」形态 —— 它保护的是
+    //    当时的快照，不是正确性。
+    //
+    // ⇒ 判据改为两条**从能力事实派生**的不变式：
+    //   ① `usesExpiryWindow: true` 的家必须**也有** `creditPackages`
+    //      —— 「按到期分档」与「逐包列明细」消费的是同一份数据
+    //      （`packages[].deductionEndTime`）；声明了前者却不声明后者，
+    //      用户就只看得到分档、看不到是哪几包。
+    //   ② `creditPackages` 的家必须真的能读余额（否则无包可列）。
+    //
+    // ⚠️ 反向不成立（有 `creditPackages` 但无 `usesExpiryWindow`）：astudio /
+    //    qoder / qodercn 三家**有逐包到期时间**但未接入「按到期分档」的窗口
+    //    回传 ⇒ 只列明细、不分档，是合法组合，**不得**被这条判据误伤。
+    const usesExpiryWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
+    const missing = usesExpiryWindow.filter((d) => d.creditPackages !== true).map((d) => d.id)
+    expect(missing, 'usesExpiryWindow 的家必须有 creditPackages（同一份数据）').toEqual([])
+
+    const noBalance = PROVIDER_REGISTRY
+      .filter((d) => d.creditPackages === true && d.credits?.balance !== true)
+      .map((d) => d.id)
+    expect(noBalance, 'creditPackages 的家必须真的能读余额').toEqual([])
+
+    // 至少要有若干家，防止「全表被清空」这种退化仍绿（同义反复的反面）。
+    expect(PROVIDER_REGISTRY.filter((d) => d.creditPackages === true).length).toBeGreaterThan(5)
   })
 
   it('autoCheckinExcluded 恰好是 zcode', () => {
