@@ -418,7 +418,8 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     // ⚠️ autoclawintl 2026-10-20 加入：与 autoclaw **同源**（同一份 credits 实现），
     //    实测国际站批次同样带 `deductionEndTime`（3000→10/21、10000→10/27）。
     const withWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true).map((d) => d.id).sort()
-    expect(withWindow).toEqual(['autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ 2026-10-21 加 astudio：四个池都带 `*NextExpireTime`（详见 registry 该条目）。
+    expect(withWindow).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 })
 

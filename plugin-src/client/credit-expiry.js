@@ -121,8 +121,14 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
     if (!pkg || pkg.active !== true) continue;
     const remaining = Number(pkg.remaining);
     if (!Number.isFinite(remaining) || remaining <= 0) continue;
-    const end = Number(pkg.deductionEndTime);
-    const known = Number.isFinite(end) && end > 0;
+    // ⚠️⚠️ 必须走 {@link packageExpiryMs}（`deductionEndTime` > `expiredTime` 兜底），
+    //    不能直接读 `pkg.deductionEndTime` —— 本仓红线「同一语义不得两套判据」：
+    //    AStudio 的包**只给 `expiredTime`**（字符串，未归一化），直读会让全部包
+    //    落进 `permanent` 桶 ⇒ astudio 的分桶行整条不渲染（用户报障：
+    //    「25000 星火积分不显示」）。而 `formatPackageExpiry` / 包列表**排序**
+    //    早就走 packageExpiryMs，两边不一致会出现「显示说 11/01 到期、分桶说永久」。
+    const end = packageExpiryMs(pkg);
+    const known = end !== null;
     if (!known) {
       // 服务端没给到期时间 ⇒ 真·永久（保守方向：宁可少用，不可误烧长期积分）。
       permanent += remaining;
@@ -137,7 +143,6 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
       //    **整段倒计时消失**，尽管桶里还有一笔钱几天后作废。
       //    ⚠️ 可达性不是假设：TRAE 的 `active` 是**硬编码 true**
       //    （`trae-credits.ts`），压根不反映是否过期。
-      //    `trae-credits.ts`），压根不反映是否过期。
       //    方向：宁可少显示倒计时，不可显示一个错的。
       if (end > at && (earliestExpiringAt === null || end < earliestExpiringAt)) {
         // ⚠️ 出现**更早**的批次 ⇒ 该量取代之前的（两批不是同一批，不能相加）。
