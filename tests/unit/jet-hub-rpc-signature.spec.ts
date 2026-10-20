@@ -95,6 +95,9 @@ describe('registerJetHubRpc：auths 是命名对象（类型层守卫）', () =>
       // 漏掉这个键会让 typecheck:tests 报 TS2345 —— 也正是该用例想要守的不变式。
       astudio: stub,
       autoclaw: stub,
+      // ⚠️ AutoClaw 国际版（PR121）：与 `autoclaw` 是两个实例、两个 provider id，
+      //    `JetHubAuths` 必须各占一个键 —— 漏掉会让本行报 TS2345（正是本用例要守的）。
+      autoclawintl: stub,
       // ⚠️ **本 fork 独有**（魔搭，2026-10-16）：键同样是 provider id。
       modelscope: stub,
     })
