@@ -104,18 +104,29 @@ export const QODER_CATALOG_SCENE = 'chat'
 export const QODER_CATALOG_TIMEOUT_MS = 15_000
 
 /**
- * 思考档位白名单（asar 常量 `Qj`）。
+ * 思考档位白名单（官方产物常量 `k3`）。
  *
- * ⚠️ **必须过滤**：不在白名单里的键会被官方客户端 `ao()` **静默丢弃**，
- * 而我们若把它声明进 `efforts`，DSH 的档位选择器就会把它渲染出来、
- * 用户选中后带着一个上游不认的值发请求（`trae-adapter.ts` 记着这条教训：
- * 给不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`）。
+ * ⚠️ **必须过滤**：不在白名单里的键会被官方客户端静默丢弃
+ * （`xsn()` → `ci()` 逐个判白名单），而我们若把它声明进 `efforts`，
+ * DSH 的档位选择器就会把它渲染出来、用户选中后带着一个上游不认的值发请求
+ * （`trae-adapter.ts` 记着这条教训：给不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`）。
+ *
+ * ⚠️⚠️ **只有 6 个值、没有 `minimal`**（2026-10-20 从本机 IDE 产物逐字复核）：
+ *
+ * ```js
+ * k3 = ["none","low","medium","high","xhigh","max"], yhc = new Set(k3)
+ * ```
+ *
+ * 本文件原先多写了一个 `minimal`，依据是更早一次逆向留下的注释
+ * （`qoder-adapter.ts` 的档位中文名表里也记着它"在白名单 `Qj` 里"）——
+ * 那次快照与当前产物不符。**中文名表保留 `minimal`**（i18n 里确有它的显示名），
+ * 但**线上白名单以本常量为准**：上游真下发它时按官方行为**丢掉**。
  */
 const EFFORT_WHITELIST: ReadonlySet<string> = new Set([
-  'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
+  'none', 'low', 'medium', 'high', 'xhigh', 'max',
 ])
 
-/** 档位别名（asar 常量 `_lc`）。 */
+/** 档位别名（官方常量 `xhc`，与我们逐字一致）。 */
 const EFFORT_ALIASES: ReadonlyMap<string, string> = new Map([
   ['disabled', 'none'],
   ['off', 'none'],
@@ -126,6 +137,13 @@ function readString(source: unknown, key: string): string | undefined {
   if (typeof source !== 'object' || source === null) return undefined
   const value = (source as Record<string, unknown>)[key]
   return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/** 把任意值收窄成记录（数组与非对象都返回 undefined，与官方 `JsA()` 同口径）。 */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
 }
 
 /** 读有限数字字段（容忍数字字符串）。 */
@@ -148,68 +166,160 @@ function normalizeEffort(raw: string): string | undefined {
 }
 
 /**
- * 从 `efforts` 对象取档位（**保持上游键序**）。
+ * 从 `efforts` 字段取档位 —— **三种形态都认**，与官方 `sgi()` 逐格对齐：
  *
- * ⚠️ **不要排序**：上游键序**就是**官方 IDE 的渲染序（客户端用
+ * ```js
+ * function sgi(A) {
+ *   if (Array.isArray(A)) { let e = xsn(A); return e ? { efforts: e, supportsDisabled: false } : undefined }
+ *   if (typeof A === 'string') { let e = xsn(A.split(/[,\s]+/)); … }
+ *   …对象：遍历键，ci() 归一、vhc() 判 is_default/isDefault…
+ * }
+ * ```
+ *
+ * ⚠️ **只认对象是本模块的第一版**（真机两站实测都是对象），对抗审计把
+ * 「数组/字符串」两种形态验成**零覆盖**（变异后 4 个 spec 175 条全绿）——
+ * 上游一改形状，档位选择器会**静默消失**。故按官方实现补齐三形态。
+ *
+ * ⚠️ **不要排序**：对象形态的键序**就是**官方 IDE 的渲染序（客户端用
  * `Object.entries` 遍历），排序会让我们与 IDE 的档位条不一致 ——
  * 完整论证见 `QoderFallbackModel.efforts` 的注释（Issue IKLIDV）。
  */
 function parseEfforts(value: unknown): { efforts: string[]; defaultEffort?: string } {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { efforts: [] }
-  const efforts: string[] = []
-  let defaultEffort: string | undefined
-  for (const [rawKey, rawValue] of Object.entries(value as Record<string, unknown>)) {
-    const key = normalizeEffort(rawKey)
-    if (key === undefined) continue
-    efforts.push(key)
-    if (typeof rawValue === 'object' && rawValue !== null
-      && (rawValue as Record<string, unknown>).is_default === true) {
-      defaultEffort = key
+  const dedupe = (raw: readonly unknown[]): string[] => {
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const item of raw) {
+      if (typeof item !== 'string') continue
+      const key = normalizeEffort(item)
+      if (key === undefined || seen.has(key)) continue
+      seen.add(key)
+      out.push(key)
     }
+    return out
+  }
+
+  if (Array.isArray(value)) return { efforts: dedupe(value) }
+  if (typeof value === 'string') return { efforts: dedupe(value.split(/[,\s]+/)) }
+
+  const record = asRecord(value)
+  if (record === undefined) return { efforts: [] }
+  const efforts: string[] = []
+  const seen = new Set<string>()
+  let defaultEffort: string | undefined
+  for (const [rawKey, rawValue] of Object.entries(record)) {
+    const key = normalizeEffort(rawKey)
+    if (key === undefined || seen.has(key)) continue
+    seen.add(key)
+    efforts.push(key)
+    // 官方 `vhc()`：蛇形与驼峰**都认**。
+    const flag = asRecord(rawValue)
+    if (flag?.is_default === true || flag?.isDefault === true) defaultEffort = key
   }
   return defaultEffort === undefined ? { efforts } : { efforts, defaultEffort }
+}
+
+/** 该条目的思考档位与「能否关闭思考」。 */
+interface QoderThinking {
+  efforts: string[]
+  defaultEffort?: string
+  supportsDisable: boolean
+}
+
+/**
+ * 复刻官方 `R3()`：从**条目**上按固定顺序找档位。
+ *
+ * ```js
+ * function R3(A) {
+ *   let e = bhc(A), t = Psn(A)            // t: A 自身的档位字段（含 thinking_config? 否——见下）
+ *   if (t) return ysn(t, e)
+ *   for (let k of ogi) {                  // ogi = ['thinking_config','thinkingConfig']
+ *     let b = JsA(A[k]); if (!b) continue
+ *     let n = Psn(b); if (n) return ysn(n, e)
+ *     for (let s of Rhc) {                // Rhc = ['enabled','enabledConfig']
+ *       let c = JsA(b[s]); if (!c) continue
+ *       let n = Psn(c); if (n) return ysn(n, e)
+ *     }
+ *   }
+ * }
+ * ```
+ *
+ * ⚠️ `ogi` / `Rhc` 这两个命名空间列表是官方原样，**不要顺手扩**。
+ */
+function effortsFromEntry(entry: Record<string, unknown>): { efforts: string[]; defaultEffort?: string } {
+  const top = parseEfforts(entry.efforts)
+  if (top.efforts.length > 0) return top
+  for (const blockKey of ['thinking_config', 'thinkingConfig']) {
+    const block = asRecord(entry[blockKey])
+    if (block === undefined) continue
+    const direct = parseEfforts(block.efforts)
+    if (direct.efforts.length > 0) return direct
+    for (const enabledKey of ['enabled', 'enabledConfig']) {
+      const enabled = asRecord(block[enabledKey])
+      if (enabled === undefined) continue
+      const nested = parseEfforts(enabled.efforts)
+      if (nested.efforts.length > 0) return nested
+    }
+  }
+  return { efforts: [] }
 }
 
 /**
  * 该条目的思考档位与「能否关闭思考」。
  *
- * 三条口径**逐条对齐官方客户端**（`Cj()` + `gU()`）：
- * 1. 档位取 `thinking_config.enabled.efforts` 的**键**（无该键时退到条目
- *    顶层的 `efforts` / `available_reasoning_effort` —— 后者是服务端模型列表
- *    才有的字段，客户端有一行 `Cj(e) ?? Cj({thinking_config: e.available_reasoning_effort})`）；
- * 2. `defaultEffort` 取该对象里 `is_default: true` 的那个键；
- * 3. `supportsDisable` = 存在 `thinking_config.disabled` 分支。
+ * 四条口径**逐条对齐官方客户端**（`R3()` / `Mhc()` / `vhc()` / 那行
+ * `a = R3(e) ?? R3({thinking_config: e.available_reasoning_effort})`）：
  *
- * ⚠️ 2 与 3 **相互独立**：实测 `gfmodel` 有档位但不能关闭，而
+ * 1. 档位优先取 `thinking_config.enabled.efforts`，其次 `thinking_config.efforts`、
+ *    条目顶层的 `efforts`；
+ * 2. **`available_reasoning_effort` 是「一个 `thinking_config` 对象」**，
+ *    不是档位表本身 —— 必须包一层再解析（见下）；
+ * 3. `defaultEffort`：先取档位对象里的 `is_default`/`isDefault`，
+ *    都没有时才用顶层 `default_effort`/`defaultEffort`；
+ * 4. `supportsDisable` = `thinking_config.disabled` 存在（`Mhc()`）
+ *    **或**顶层 `supports_disabled`/`supportsDisabled` 为真（官方那行 `l = …`）。
+ *
+ * ⚠️ 3 与 4 **相互独立**：实测 `gfmodel` 有档位但不能关闭，而
  * `qmodel` / `qmodel_latest` 没有档位但能关闭（只有 `disabled` + `enabled.is_default`）。
  */
-function parseThinking(entry: Record<string, unknown>): {
-  efforts: string[]
-  defaultEffort?: string
-  supportsDisable: boolean
-} {
-  const block = entry.thinking_config
-  const blockRecord = typeof block === 'object' && block !== null && !Array.isArray(block)
-    ? block as Record<string, unknown>
-    : undefined
-  const disabled = blockRecord?.disabled
-  const supportsDisable = disabled !== undefined && disabled !== null && disabled !== false
+/** `thinking_config` 块里是否存在 `disabled` 分支（官方 `Mhc()`：存在且不为 null/false）。 */
+function hasDisabledBranch(block: Record<string, unknown> | undefined): boolean {
+  if (block === undefined) return false
+  return block.disabled !== undefined && block.disabled !== null && block.disabled !== false
+}
 
-  let parsed: { efforts: string[]; defaultEffort?: string } = { efforts: [] }
-  if (blockRecord !== undefined) {
-    const enabled = blockRecord.enabled
-    const fromEnabled = parseEfforts(
-      typeof enabled === 'object' && enabled !== null && !Array.isArray(enabled)
-        ? (enabled as Record<string, unknown>).efforts
-        : undefined,
-    )
-    parsed = fromEnabled.efforts.length > 0 ? fromEnabled : parseEfforts(blockRecord.efforts)
+function parseThinking(entry: Record<string, unknown>): QoderThinking {
+  let ownDisabled = false
+  for (const blockKey of ['thinking_config', 'thinkingConfig']) {
+    if (hasDisabledBranch(asRecord(entry[blockKey]))) ownDisabled = true
   }
-  if (parsed.efforts.length === 0) {
-    parsed = parseEfforts(entry.efforts)
+
+  let parsed = effortsFromEntry(entry)
+  let sourceDisabled = ownDisabled
+  /**
+   * ⚠️ **只有「条目自身既无档位、也无 `disabled`」时才去看 `available_reasoning_effort`**
+   * —— 这是官方 `a = R3(e) ?? R3({thinking_config: e.available_reasoning_effort})`
+   * 的**短路语义**：`R3(e)` 在「有 disabled 但无档位」时也返回非 undefined
+   * （`{efforts: [], supportsDisabled: true}`），此时包装对象**根本不会被读**。
+   * 同样地，包装对象里的 `disabled` 只在它真被读到时才算数。
+   */
+  if (parsed.efforts.length === 0 && !ownDisabled) {
+    const alt = asRecord(entry.available_reasoning_effort ?? entry.availableReasoningEffort)
+    if (alt !== undefined) {
+      // ⚠️ 官方原样：该字段是 **thinking_config 形状的对象**，故包一层再解析；
+      //    直接当档位表解析只会拿到 `enabled`/`disabled` 两个键（全被白名单丢掉）
+      //    ⇒ 档位选择器静默消失。
+      parsed = effortsFromEntry({ thinking_config: alt })
+      if (hasDisabledBranch(alt)) sourceDisabled = true
+    }
   }
-  if (parsed.efforts.length === 0) {
-    parsed = parseEfforts(entry.available_reasoning_effort ?? entry.availableReasoningEffort)
+
+  let supportsDisable = sourceDisabled
+  if (entry.supports_disabled === true || entry.supportsDisabled === true) supportsDisable = true
+
+  if (parsed.defaultEffort === undefined) {
+    // 官方 `c = ci(e.default_effort ?? e.defaultEffort)`，用作档位对象未给默认时的兜底。
+    const top = entry.default_effort ?? entry.defaultEffort
+    if (typeof top === 'string') parsed = { ...parsed, defaultEffort: normalizeEffort(top) }
   }
   return { ...parsed, supportsDisable }
 }

@@ -146,6 +146,55 @@ describe('QoderAdapter 模型目录', () => {
       expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
     })
 
+    it('⚠️ 远端目录按账号收缩后，静态表里的模型能力/元数据**不得**退化（审计缺陷 1）', async () => {
+      // 实景：国际版有个免费额度号，上游只给它 2 条（qfmodel + dfmodel），
+      // 而目录缓存就是「上次成功那个账号的目录」。改造前 `catalogModel()` 只查
+      // 远端 ⇒ 静态表里其余 15 条全被判成「未知」：图片被硬拒、名字退化成裸 id、
+      // 窗口与档位消失、请求体元数据一并退化。
+      const adapter = makeAdapter({ fetchRemoteModels: async () => [remoteFast] })
+      const resolved = await adapter.resolveModel('qoder', 'dmodel')
+      expect(resolved.name, '名字不得退化成裸 id').toBe('DeepSeek-V4-Pro')
+      expect(resolved.inputModalities).toEqual(['text', 'image'])
+      expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
+      expect(resolved.reasoning?.defaultEffort).toBe('max')
+    })
+
+    it('⚠️ 同一形态下带图请求不得被图片门禁硬拒（能力判据取并集）', async () => {
+      const fetchImpl = vi.fn(async () => envelopeResponse([textFrame('你好'), finishFrame])) as never
+      const adapter = makeAdapter({
+        // 目录里没有 dmodel —— 只有远端时不支持图片，会抛 UNSUPPORTED_CONTENT
+        fetchRemoteModels: async () => [remoteFast],
+        fetchImpl,
+        readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+      })
+      // ⚠️ **必须先把远端目录读进缓存**：`stream()` 自己不拉目录，直接发请求时
+      //    `catalogSource()` 还是静态表 ⇒ 这条用例会**假绿**（变异打不中它）。
+      //    （第一版就漏了这一步，变异验证当场发现。）
+      await adapter.listModels('qoder')
+      const chunks = await collectWith(adapter, {
+        model: 'dmodel',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'hi' },
+            { type: 'image', attachment: { attachmentId: 'a1' } },
+          ],
+        }],
+      })
+      expect(chunks.some((c) => c.type === 'text-delta'), '应走到上游而不是被门禁拒').toBe(true)
+    })
+
+    it('免费标记必须透出到 listAllModels（Jet Hub「免费额度」分组只认 isFree）', async () => {
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [remoteDfmodel, remoteFast],
+      })
+      await adapter.listModels('qoder')
+      const all = adapter.listAllModels()
+      expect(all.find((m) => m.id === 'dfmodel')?.isFree, 'dfmodel 是 is_free 模型').toBe(true)
+      // 反面：非免费模型不得被标成免费（否则整个分组失真）。
+      expect(all.find((m) => m.id === 'fast')?.isFree).toBeUndefined()
+    })
+
     it('20 分钟 TTL：第二次读命中缓存，不再打上游', async () => {
       const fetchRemoteModels = vi.fn(async () => [remoteFast])
       const adapter = makeAdapter({ fetchRemoteModels })
@@ -169,19 +218,27 @@ describe('QoderAdapter 模型目录', () => {
         warn,
       })
       const models = await adapter.listModels('qoder')
-      expect(models.length).toBe(QODER.fallbackModels.length)
+      expect(models.length).toBeGreaterThan(0)
+      // ⚠️ **不得只断言 `toBe(QODER.fallbackModels.length)`**（2026-10-20 对抗审计）：
+      //    那是同义反复 —— 把兜底表置空后它变成 `0 === 0`，**整组 9 条全绿而菜单是空的**。
+      //    判据必须锚在**具体内容**上（空表满足不了 `dmodel` 存在）。
+      expect(models.map((m) => m.id)).toContain('dmodel')
       expect(warn).toHaveBeenCalledTimes(1)
       expect(String(warn.mock.calls[0]?.[0])).toContain('退用内置兜底表')
     })
 
     it('远端读出**空目录**（未登录 / 形状不符）⇒ 回退兜底表，不把菜单变空', async () => {
       const adapter = makeAdapter({ fetchRemoteModels: async () => [] })
-      expect((await adapter.listModels('qoder')).length).toBe(QODER.fallbackModels.length)
+      const models = await adapter.listModels('qoder')
+      expect(models.length).toBeGreaterThan(0)
+      expect(models.map((m) => m.id)).toContain('dmodel')
     })
 
     it('未接线 `fetchRemoteModels` ⇒ 不发任何请求，恒用兜底表', async () => {
       const adapter = makeAdapter()
-      expect((await adapter.listModels('qoder')).length).toBe(QODER.fallbackModels.length)
+      const models = await adapter.listModels('qoder')
+      expect(models.length).toBeGreaterThan(0)
+      expect(models.map((m) => m.id)).toContain('dmodel')
     })
 
     it('远端目录落地后广播（否则客户端永久停在冷启动那份兜底表）', async () => {

@@ -138,7 +138,12 @@ export const PROVIDER = 'qoder'
  *
  * ⚠️ DSH 的档位选择器**直接渲染 `efforts[].name`**（不本地化），
  * 所以这里给中文就是中文界面 —— 与 Qoder IDE 逐字一致。
- * ⚠️ `minimal` 当前目录未下发，但白名单 `Qj` 里有，保留以备上游启用。
+ *
+ * ⚠️ **`minimal` 是「有显示名、但不在线上白名单里」的一格**（2026-10-20 复核）：
+ * 官方产物里 i18n 有 `minimal:最小`，而**档位白名单 `k3` 只有 6 个值、不含它**
+ * （见 `qoder-catalog.ts` 的 `EFFORT_WHITELIST`）。本表保留它只为「万一上游
+ * 真下发时别显示成裸 id」；**不要**据此把它加回白名单 —— 那会让 UI 渲染出一个
+ * 官方客户端会静默丢弃的档位。
  */
 const QODER_EFFORT_NAMES: Readonly<Record<string, string>> = {
   none: '关闭思考',
@@ -534,6 +539,16 @@ export class QoderAdapter extends LlmAdapter {
   private catalogAt = 0
   /** 目录加载闸门：并发去重 + 失败/空结果冷却。 */
   private readonly catalogGate: RemoteCatalogGate
+  /**
+   * **静态兜底表专用**的第二套骨架（只在 `resolveModel` 的并集回退里用）。
+   *
+   * ⚠️ 存在的唯一理由：`resolveModel` 与 `listModels` 共用 `loadCatalog()`，
+   * 而前者要「远端 ∪ 静态表」、后者要「远端独占」。故把静态表也包成一套
+   * `ModelCatalog`，让**骨架自己的装配逻辑**（裸名/context/reasoning）
+   * 复用到回退路径上，而不是在适配器里重写一遍。
+   * `loadCatalog` / `syncCatalog` 都是同步静态表 ⇒ 零网络。
+   */
+  private readonly fallbackCatalog: ModelCatalog
 
   constructor(private readonly options: QoderAdapterOptions) {
     super()
@@ -564,6 +579,15 @@ export class QoderAdapter extends LlmAdapter {
           this.catalogAt = 0
           await this.ensureRemoteModels()
         },
+      },
+    )
+    this.fallbackCatalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.fallbackEntries(),
+        syncCatalog: () => this.fallbackEntries(),
+        unknownModelInputModalities: () => ['text'] as const,
       },
     )
   }
@@ -841,8 +865,33 @@ export class QoderAdapter extends LlmAdapter {
    * 「未知」，而本方法与 `stream()` 都把它当**能力判据**用 —— `accio` 记过同款教训
    * （把「未知」当「明确不支持」会让能力**静默变窄**：图片被拒、档位消失）。
    */
+  /**
+   * 按 id 取条目，供**能力/元数据**判据使用：**远端优先，未命中回退编译期兜底表**。
+   *
+   * ## ⚠️⚠️ 为什么必须是「两份目录的并集」，而不是只用远端
+   *
+   * 第一版把它写成 `catalogSource().find(...)`（远端落地后静态表完全不参与），
+   * 被独立审计打穿（缺陷 1，已复现）：**远端目录是「按账号」下发的**，
+   * 一个免费额度号只拿到 2 条；此时静态表里其它 15 条模型会被判成「未知」
+   * ⇒ `inputModalitiesFor` 报 `['text']` ⇒ `stream()` **硬拒图片**
+   * （`UNSUPPORTED_CONTENT`），同时 `resolveModel` 的 name 退化成裸 id、
+   * `context`/`reasoning` 消失、请求体的 `display_name`/`max_input_tokens`/
+   * `is_reasoning` 一并退化。
+   *
+   * | 场景 | 只查远端（第一版） | 并集（现行） |
+   * |---|---|---|
+   * | `dmodel` + 远端大目录 | ✅ | ✅ 远端优先 |
+   * | `dmodel` + 远端只剩 2 条（免费号） | ❌ 硬拒图片 + 元数据退化 | ✅ 回退静态表 |
+   * | `fast`（只在远端有） | ✅ | ✅ 远端命中 |
+   *
+   * ⚠️ **菜单（`listModels`）仍以远端为准** —— 这条并集只作用于
+   * 「能力/元数据判据」，不改变「有哪些模型可选」。本仓同型铁律见
+   * `docs/agent-notes/client-ui.md` 的「判『某个 id 在不在目录里』时两个目录
+   * 来源必须取并集」（Issue IKJW33）：让**能力**判据取并集，让**可选项**保持单一来源。
+   */
   private catalogModel(id: string): QoderFallbackModel | undefined {
     return this.catalogSource().find((model) => model.id === id)
+      ?? this.product.fallbackModels.find((model) => model.id === id)
   }
 
   /**
@@ -852,8 +901,8 @@ export class QoderAdapter extends LlmAdapter {
    * 未声明时**保守报 text**：宁可少报能力（用户改用文本描述），
    * 也不要报一个服务端不认的模态（请求会失败）。
    *
-   * ⚠️ 判据取自 `catalogModel()`（远端优先）—— 远端下发的能力**不是**本地估计值，
-   * 这一点与 2026-10-20 之前「查本地兜底表」的写法相反。
+   * ⚠️ 判据取自 `catalogModel()`（**远端 ∪ 静态表**）—— 只取远端会让
+   * 「按账号收缩的目录」把静态表里已知的模型判成未知（见该方法的表）。
    */
   private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
     return this.catalogModel(model)?.supportsImage === true ? ['text', 'image'] : ['text']
@@ -905,6 +954,16 @@ export class QoderAdapter extends LlmAdapter {
       inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
       ...model.contextWindow > 0 ? { contextWindow: model.contextWindow } : {},
       ...reasoning !== undefined ? { reasoning } : {},
+      /**
+       * ⚠️ **必须透出**（缺陷 2，2026-10-20 审计）：Jet Hub 的「免费额度」分组
+       * **只**认 `model.isFree === true`（`plugin-src/client/model-groups.js`），
+       * 而 `cline-adapter.ts` 的成文约定也是「`isFree` 必须透出」。
+       *
+       * 改造前本家从未写这个键 ⇒ 免费模型**全被归进「按量计费」**；
+       * 改造后解析层（`qoder-catalog.ts`）已产出 `isFree`，但装配层漏了，
+       * 于是端到端仍只到「展示名里带 `· 免费`」为止。
+       */
+      ...model.isFree === true ? { isFree: true } : {},
     }
   }
 
@@ -952,6 +1011,11 @@ export class QoderAdapter extends LlmAdapter {
   /** 同步视图（`listAllModels()` 与 `CatalogEntry` 转换共用）。 */
   private syncCatalogEntries(): readonly CatalogEntry[] {
     return this.catalogSource().map((model) => this.toCatalogEntry(model))
+  }
+
+  /** 编译期兜底表的条目视图（第二套骨架专用；同步、零网络）。 */
+  private fallbackEntries(): readonly CatalogEntry[] {
+    return this.product.fallbackModels.map((model) => this.toCatalogEntry(model))
   }
 
   private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
@@ -1026,14 +1090,29 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   /**
-   * 解析模型元信息。
+   * 解析模型元信息（**能力/元数据的并集回退**，见 `catalogModel()` 的表）。
    *
-   * ⚠️ **`reasoning` 是「思考强度」选择器出现在模型菜单里的唯一入口**
-   * （composer 读 `resolveModel().reasoning`）—— 该判据现在由
-   * `toCatalogEntry` 提供（见 `reasoningForEntry`）。
+   * ## ⚠️ 为什么这里要路由到两套目录
+   *
+   * `resolveModel` 与 `listModels` **共用** `loadCatalog()`，但两者的正确口径不同：
+   * - `listModels`（**菜单**）必须**只**给当前账号真能用的模型 ⇒ 远端独占；
+   * - `resolveModel`（**元数据**）必须认识「可能正在被使用、但不在当前账号菜单里」
+   *   的模型（会话开着、目录随账号收缩）⇒ 远端 ∪ 静态表。
+   *
+   * 故：远端目录认识该 id 就照旧走它（新值优先）；不认识而静态表有，就交给
+   * **静态表专用的第二个骨架实例** —— 复用骨架自己的装配逻辑（裸名 / context /
+   * reasoning 三态），**不在这里重写一遍**（那会是同一语义的第二套判据）。
    */
   async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    return this.catalog.resolveModel(provider, model, signal)
+    // ⚠️ **必须先把远端目录拉到位再判路由**（TTL 闸门内是 no-op，零额外请求）：
+    //    冷缓存下 `catalogSource()` 还是静态表，此时远端独有的模型（如 `fast`）
+    //    会被误判成「远端不认识」而路由到兜底骨架 ⇒ 名字退化成裸 id。
+    //    （第一版漏了这一步，被既有用例「远端独有的模型…」当场抓住。）
+    await this.ensureRemoteModels()
+    if (this.catalogSource().some((entry) => entry.id === model)) {
+      return this.catalog.resolveModel(provider, model, signal)
+    }
+    return this.fallbackCatalog.resolveModel(provider, model, signal)
   }
 
   /**

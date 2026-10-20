@@ -533,18 +533,26 @@ export class QoderAuth extends Service {
    * - 「没有凭据」**不打日志**（未登录用户每次列模型都会走到这里）；
    * - 真正的失败（HTTP 非 2xx / 网络异常 / WASM trap）必须留痕 ——
    *   否则「倍率不更新」这个症状没有任何可查的证据。
+   *
+   * ⚠️ **整段（含取凭据）都必须在 `try` 内**（缺陷，2026-10-20 对抗审计）：
+   * 原先只有「拉目录」被 `try` 罩住，而 `pool.getAvailableAccount` 的 `await`
+   * 在它**外面** —— 池读一旦 reject（存储损坏 / 并发写坏档），rejection 会
+   * **直接抛穿 `fetchModels`**，绕开「失败即回退兜底表」这条契约，把一次目录
+   * 读取失败升级成 `listModels` 抛错（DSH 侧表现为 provider 报错）。
+   * 变异验证：删掉那一行 `.catch(() => null)` 后 111 条用例**全绿** ⇒ 这条腿
+   * 当时**零守卫**；现已补「池读 reject」用例并把整段收进 `try`。
    */
   async fetchModels(pool?: AccountPool): Promise<QoderFallbackModel[]> {
-    let credential: QoderCredential | undefined
-    if (pool !== undefined) {
-      const available = await pool
-        .getAvailableAccount<QoderCredential>(this.product.id, '')
-        .catch(() => null)
-      if (available !== null) credential = available.credential
-    }
-    credential ??= await this.resolveStoredCredential()
-    if (credential === undefined) return []
     try {
+      let credential: QoderCredential | undefined
+      if (pool !== undefined) {
+        const available = await pool
+          .getAvailableAccount<QoderCredential>(this.product.id, '')
+          .catch(() => null)
+        if (available !== null) credential = available.credential
+      }
+      credential ??= await this.resolveStoredCredential()
+      if (credential === undefined) return []
       return await fetchQoderRemoteModels(credential, this.product, {
         ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
       })

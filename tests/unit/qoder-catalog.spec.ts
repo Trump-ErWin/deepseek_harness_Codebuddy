@@ -163,6 +163,122 @@ describe('parseQoderRemoteModels', () => {
   })
 })
 
+/**
+ * 2026-10-20 审计/对抗审计补的守卫。
+ *
+ * 每一条都对应一处**实测过的假绿**：变异注入后相关 spec 全绿、而语义已错
+ * （见 `docs/agent-notes/providers-qoder.md` 的「审计补记」）。
+ */
+describe('解析层：审计补记的七格', () => {
+  it('⚠️ 没有 disabled 分支 ⇒ supportsDisable 不得为真（不得臆造「关闭思考」）', () => {
+    // 变异「supportsDisable = true 恒真」原先 175 条全绿：所有用例的输入
+    // **都带 disabled** 且都断言 true ⇒ 变异态与修复态在被断言的输入上取值相同。
+    const noDisabled = qoderRemoteModelToFallback({
+      key: 'k', display_name: 'K',
+      thinking_config: { enabled: { efforts: { high: { is_default: true } } } },
+    })
+    expect(noDisabled?.efforts).toEqual(['high'])
+    expect(noDisabled?.supportsDisable).toBeUndefined()
+    // 连 thinking_config 都没有的条目同样不得报「可关闭」。
+    expect(qoderRemoteModelToFallback({ key: 'k2', display_name: 'K2' })?.supportsDisable).toBeUndefined()
+  })
+
+  it('顶层 supports_disabled 也算可关闭（官方 `l = … || e.supports_disabled`）', () => {
+    const model = qoderRemoteModelToFallback({ key: 'k', display_name: 'K', supports_disabled: true })
+    expect(model?.supportsDisable).toBe(true)
+  })
+
+  it('⚠️ 档位顺序**原样保留**（非字典序输入 ⇒ 排序变异必须变红）', () => {
+    const model = qoderRemoteModelToFallback({
+      key: 'k', display_name: 'K',
+      thinking_config: { enabled: { efforts: { max: {}, low: {}, high: {} } } },
+    })
+    // 字典序是 high,low,max —— 与上游键序不同，故 `efforts.sort()` 会被这条抓住。
+    expect(model?.efforts).toEqual(['max', 'low', 'high'])
+  })
+
+  it('⚠️ 空串 key / display_name 必须丢弃（DSH 空 name 会抛 INVALID_CATALOG）', () => {
+    expect(qoderRemoteModelToFallback({ key: '', display_name: 'X' })).toBeUndefined()
+    expect(qoderRemoteModelToFallback({ key: 'x', display_name: '' })).toBeUndefined()
+    expect(parseQoderRemoteModels({
+      chat: [{ key: '', display_name: 'X' }, { key: 'x', display_name: '' }],
+    })).toEqual([])
+  })
+
+  it('⚠️ efforts 三形态都认：数组 / 逗号或空格字符串 / 对象（官方 sgi() 原样）', () => {
+    const viaArray = qoderRemoteModelToFallback({
+      key: 'k', display_name: 'K', thinking_config: { enabled: { efforts: ['low', 'high', 'low', 'bogus'] } },
+    })
+    expect(viaArray?.efforts).toEqual(['low', 'high'])
+
+    const viaString = qoderRemoteModelToFallback({
+      key: 'k', display_name: 'K', thinking_config: { enabled: { efforts: 'low, high  max' } },
+    })
+    expect(viaString?.efforts).toEqual(['low', 'high', 'max'])
+
+    // 对象形态（真机实测形态）仍保持键序与 is_default。
+    const viaObject = qoderRemoteModelToFallback({
+      key: 'k', display_name: 'K',
+      thinking_config: { enabled: { efforts: { max: { is_default: true }, low: {} } } },
+    })
+    expect(viaObject?.efforts).toEqual(['max', 'low'])
+    expect(viaObject?.defaultEffort).toBe('max')
+  })
+
+  it('⚠️ available_reasoning_effort 是**一个 thinking_config 对象**（要包一层解析）', () => {
+    // 官方：`a = R3(e) ?? R3({ thinking_config: e.available_reasoning_effort })`
+    const model = qoderRemoteModelToFallback({
+      key: 'k', display_name: 'K',
+      available_reasoning_effort: {
+        disabled: {},
+        enabled: { efforts: { low: {}, high: { is_default: true } } },
+      },
+    })
+    expect(model?.efforts).toEqual(['low', 'high'])
+    expect(model?.defaultEffort).toBe('high')
+    expect(model?.supportsDisable).toBe(true)
+
+    // 反面：**裸档位表**形态按官方语义**不认**（它必须先包成 thinking_config）。
+    const bare = qoderRemoteModelToFallback({
+      key: 'k', display_name: 'K', available_reasoning_effort: { low: {}, high: {} },
+    })
+    expect(bare?.efforts).toBeUndefined()
+  })
+
+  it('默认档：档位对象没给 is_default 时用顶层 default_effort（官方 ci(...) 兜底）', () => {
+    const model = qoderRemoteModelToFallback({
+      key: 'k', display_name: 'K',
+      thinking_config: { enabled: { efforts: { low: {}, high: {} } } },
+      default_effort: 'high',
+    })
+    expect(model?.efforts).toEqual(['low', 'high'])
+    expect(model?.defaultEffort).toBe('high')
+    // 顶层值不在白名单内 ⇒ 不采用（官方 `Tae()` 同口径）。
+    const bogus = qoderRemoteModelToFallback({
+      key: 'k2', display_name: 'K2',
+      thinking_config: { enabled: { efforts: { low: {} } } }, default_effort: 'bogus',
+    })
+    expect(bogus?.defaultEffort).toBeUndefined()
+  })
+
+  it('is_default / isDefault 两种写法都认（官方 vhc()）', () => {
+    const camel = qoderRemoteModelToFallback({
+      key: 'k', display_name: 'K',
+      thinking_config: { enabled: { efforts: { low: {}, high: { isDefault: true } } } },
+    })
+    expect(camel?.defaultEffort).toBe('high')
+  })
+
+  it('⚠️ 档位白名单与官方 k3 一致：6 个值、**不含 minimal**', () => {
+    const model = qoderRemoteModelToFallback({
+      key: 'k', display_name: 'K',
+      thinking_config: { enabled: { efforts: { minimal: {}, high: {} } } },
+    })
+    // 官方 `k3 = ["none","low","medium","high","xhigh","max"]` ⇒ minimal 被丢弃。
+    expect(model?.efforts).toEqual(['high'])
+  })
+})
+
 describe('fetchQoderRemoteModels', () => {
   it('走 WASM 签名（COSY）+ `/api/v2/model/list?Encode=1`，明文响应也能解析', async () => {
     const fetchImpl = vi.fn(async () => new Response(
