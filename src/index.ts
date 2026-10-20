@@ -1847,6 +1847,9 @@ export function apply(ctx: Context): void {
       if (available) await loomy.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await loomy.refresh()
     },
+    // ⚠️ 必须注入：适配器在热路径上把「非终态探测失败」降级为告警而不是抛错，
+    // 没有这个出口就等于静默（本仓库反复记录过的失败形态）。
+    warn: (message) => ctx.logger?.warn?.(message),
     // 远端模型目录：GET /api/v1/models。
     // ⚠️ 必须用 **token 头**（业务端点），不是 Bearer —— 带错会得到
     // `100002 缺少 token`，表现为「模型列表永远停在兜底表」。
