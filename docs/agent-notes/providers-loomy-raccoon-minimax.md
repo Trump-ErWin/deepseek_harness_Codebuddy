@@ -135,6 +135,40 @@
    必须逐格同构（有对拍用例），**冷却时长**自本条起**刻意分开**（各自取决于额度
    结算周期）。实测取证与变异验证见下文「loomy 的 `quota` 冷却终点」一节。
 
+### 请求热路径上的凭据探测：**只有** `RefreshTokenExpiredError` 是终态（2026-10-20）
+
+`GET /points/records` 是**只读探测**端点，它能不能通 ≠ 凭据能不能用。适配器原先把
+`options.refresh()` 的任何异常都往上抛 ⇒ 探测端点抖一下，**整轮对话失败**。
+
+实测伤情（会话 `session-bfb9b616`，`/auto-study` 任务）：
+
+| 轮次 | 文案 | 类型 |
+|---|---|---|
+| turn 4 | `Loomy 凭据探测失败：系统内部错误` | HTTP 200 信封内的业务错误 |
+| turn 5（+27 分钟） | `Loomy 凭据探测网络失败：The operation was aborted due to timeout` | 60s 超时 |
+
+两轮之间**面板三个账号余额全部读得到**（9521 / 5000 / 3996），渠道是活的。
+且探测超时上限 `LOOMY_REQUEST_TIMEOUT_MS = 60_000` ⇒ 最坏情况下用户先白等一分钟
+才拿到「失败」。
+
+**口径（已落地）**：热路径 `try/catch` 包住探测，
+`isLoomyTerminalRefreshError()` 命中 `name === 'RefreshTokenExpiredError'` 才抛，
+其余降级为 `warn` 并**继续用现有凭据发请求**。理由：
+
+- 该口径**不是新造的** —— `LoomyAuth.refreshAll()` 早已如此（只把终态记 warn、
+  其余记 warn 后继续下一个账号）。热路径与它不一致属「同一仓库两套同义判据」
+  （PR !62 同型）。
+- Loomy **无续期端点**，探测的唯一产出是「要不要提示重新登录」。真正的失效会在
+  业务请求上以 401 / `100002` 暴露，由换号与 `classifyLoomyFailure` 接住。
+- `expires_at` 是**本地按登录时刻 + 14 天推算**的值（服务端不下发），
+  「本地判过期」本就不等于「凭据已死」。
+
+⚠️ 判据按 `name` 而非 `instanceof`：类在 `loomy-auth.ts`，打包/多副本下
+`instanceof` 会假阴性，把「请重新登录」误降级成「继续用」。
+⚠️ 守卫在 `tests/unit/loomy-adapter.spec.ts` 的「凭据探测失败不得打断本轮」三条
+（业务错误 / 超时 / **反向对照**：终态仍必须抛）。变异验证：把 try/catch 换回
+裸 `await refresh()`，前两条**变红**、第三条保持绿。
+
 ### 短信登录：唯一没有 loginUrl 的 provider
 
 其余 7 个都是「`account.create` 返回 `loginUrl` → 前端 `window.open` →
