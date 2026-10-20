@@ -1052,6 +1052,8 @@ export interface RpcOnboardingClaimResponse {
 /** RPC: 列出某 provider 的模型请求 */
 export interface RpcModelListRequest {
   provider: string
+  /** Qoder 两版手动刷新时绕过内存缓存，重新获取远端目录。 */
+  refresh?: boolean
 }
 
 /**

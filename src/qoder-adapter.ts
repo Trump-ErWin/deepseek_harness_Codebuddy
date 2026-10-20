@@ -29,7 +29,10 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
 import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
-import { isQoderExpired, type QoderCredential } from './qoder.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
+import { fetchQoderModels } from './qoder-models.js'
+import { isQoderExpired, qoderBearerToken, type QoderCredential } from './qoder.js'
 import { describeWasmFailure, QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
 // ⚠️ 原生搜索的契约来自**契约文件**（不是工具层 `web-native.ts`）：
 //    避免「渠道层 import 工具层」的反向依赖，见 `native-search-contract.ts` 模块头。
@@ -467,14 +470,20 @@ export interface QoderAdapterOptions {
    * 「等了几次、每次多久」，并在毫秒级完成。
    */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
+  /** 远端目录更新后通知宿主重新读取模型选择器。 */
+  onCatalogLoaded?: () => void
 }
 
 /** Qoder 模型适配器。使用 Bearer access_token 鉴权，仅支持 SSE。 */
 export class QoderAdapter extends LlmAdapter {
   private readonly product: QoderProduct
   private readonly fetchImpl: typeof fetch
-  /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
-  private readonly fallbackIndex: ReadonlyMap<string, QoderFallbackModel>
+  /** 成功拉取后整体替换为远端元数据；未成功时使用产品兜底表。 */
+  private modelIndex: ReadonlyMap<string, QoderFallbackModel>
+  /** 仅实例内缓存；重启或重建适配器后必然重新请求上游。 */
+  private remoteModels: readonly QoderFallbackModel[] | undefined
+  private readonly catalogGate: RemoteCatalogGate
+  private catalogError: unknown
   /**
    * ⚠️ **2026-10-08 Task 7b：三个方法收敛到共享骨架** `createModelCatalog`。
    * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
@@ -486,16 +495,20 @@ export class QoderAdapter extends LlmAdapter {
     super()
     this.product = options.product ?? QODER
     this.fetchImpl = options.fetchImpl ?? fetch
-    this.fallbackIndex = new Map(
+    this.modelIndex = new Map(
       (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
     )
+    this.catalogGate = new RemoteCatalogGate({ onLoaded: options.onCatalogLoaded })
     // ⚠️ 共享骨架（Task 7b）：门控 → 读目录 → 黑名单 → 回填 → 三态。
-    // ⚠️ 本家恒用**本地兜底表**（不发网络请求）⇒ 两个取数回调是同一份。
+    // 异步入口先拉远端；同步入口只读当前内存，不能等待网络。
     this.catalog = createModelCatalog(
       { accountPool: options.accountPool },
       {
         product: this.product,
-        loadCatalog: () => this.catalogEntries(),
+        loadCatalog: async () => {
+          await this.ensureRemoteModels()
+          return this.catalogEntries()
+        },
         // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
         unknownModelInputModalities: () => ['text'] as const,
         syncCatalog: () => this.catalogEntries(),
@@ -772,14 +785,14 @@ export class QoderAdapter extends LlmAdapter {
   /**
    * 模型接受的输入模态。
    *
-   * 按**模型**判定（兜底表的 `supportsImage`），不是按 provider 一刀切。
+   * 按当前模型元数据判定，首次加载失败时使用兜底表。
    * 未声明时**保守报 text**：宁可少报能力（用户改用文本描述），
    * 也不要报一个服务端不认的模态（请求会失败）。
    *
-   * ⚠️ 兜底表是本地估计值，不是远端权威数据 —— 见 `qoder-product.ts` 的说明。
+   * 远端未声明图片能力时，解析层沿用该模型的兜底值。
    */
   private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
-    return this.fallbackIndex.get(model)?.supportsImage === true ? ['text', 'image'] : ['text']
+    return this.modelIndex.get(model)?.supportsImage === true ? ['text', 'image'] : ['text']
   }
 
   /**
@@ -796,18 +809,15 @@ export class QoderAdapter extends LlmAdapter {
    * （以「模型目录。」开头、讲「Qoder 的模型列表端点需要 WASM 签名」）——
    * 它本来是某个已被删掉的方法的文档，删方法时留下了壳。
    * 它与紧邻的本块连在一起看像「同一个方法有两套互相矛盾的文档」。
-   * 已删除；那段内容里仍然有效的部分（恒用产品兜底表、不发网络请求）
-   * 在下面 `toCatalogEntry` 的注释里。
+   * 已删除；当前目录已接入签名远端请求，静态表仅在加载失败时兜底。
    */
-  listAllModels(): readonly { id: string; name: string }[] {
-    return this.catalog.listAllModels()
+  listAllModels(): readonly { id: string; name: string; isFree?: boolean }[] {
+    // 直接读当前目录，避免共享骨架上一轮的展示缓存遮住刷新结果或时段价格。
+    return this.catalogEntries().map(({ id, name, isFree }) => ({ id, name, isFree }))
   }
 
   /**
-   * 把本家兜底表条目转成共享骨架的中间结构。
-   *
-   * ⚠️ 本家**恒用本地兜底表**（不发网络请求，见 `listModels` 的说明），
-   * 故 `loadCatalog` 与 `syncCatalog` 取同一份数据。
+   * 把远端目录或兜底条目转成共享骨架的中间结构。
    */
   private toCatalogEntry(model: QoderFallbackModel): CatalogEntry {
     const reasoning = this.reasoningForEntry(model)
@@ -815,10 +825,12 @@ export class QoderAdapter extends LlmAdapter {
       id: model.id,
       name: qoderDisplayName(model),
       // ⚠️ `resolveModel` 用**裸名**（与 trae/loomy/raccoon 一致）：
-      // 价格只属于选择列表语境。本家原本用 `entry.name`（兜底表的裸名）。
+      // 价格只属于选择列表语境，解析模型时保留上游裸名。
       bareName: model.name,
-      // ⚠️ 模态判据按 **id** 查**静态表**（`inputModalitiesFor(model: string)` 的形态）
-      // —— 这是本家私有的判据，骨架不认识。
+      isFree: model.isFree === true || model.priceFactor === 0
+        || (model.promotion !== undefined && promotionActiveNow(model.promotion, new Date())
+          && model.promotion.discountFactor === 0),
+      // 图片能力沿用该条目的远端声明，缺失时解析层已按兜底表补齐。
       // ⚠️ 三态：本家恒返回数组（未声明时**保守报 `['text']`**，见原注释：
       // 「宁可少报能力，也不要报一个服务端不认的模态」）⇒ 不会是 undefined。
       inputModalities: model.supportsImage === true ? ['text', 'image'] : ['text'],
@@ -858,7 +870,38 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   private catalogEntries(): readonly CatalogEntry[] {
-    return this.product.fallbackModels.map((model) => this.toCatalogEntry(model))
+    return (this.remoteModels ?? this.product.fallbackModels).map((model) => this.toCatalogEntry(model))
+  }
+
+  /** 普通读取只拉一次；手动刷新绕过缓存和失败冷却，但仍合并并发请求。 */
+  private async ensureRemoteModels(force = false): Promise<void> {
+    if (!force && this.remoteModels !== undefined) return
+    if (force) this.catalogGate.reset()
+    await this.catalogGate.run(async () => {
+      try {
+        const stored = await this.options.resolveCredential()
+        if (!stored || !stored.machine_id || !qoderBearerToken(stored)) {
+          throw new Error(`${this.product.id}: 没有可用于拉取模型目录的账号凭据`)
+        }
+        const credential = await this.ensureUid(stored)
+        const models = await fetchQoderModels(credential, this.product, this.fetchImpl)
+        this.remoteModels = models
+        this.modelIndex = new Map(models.map((model) => [model.id, model]))
+        this.catalogError = undefined
+        return true
+      } catch (error) {
+        this.catalogError = error
+        console.warn(`[${this.product.id}] 模型目录拉取失败，保留已有目录：${errorMessage(error)}`)
+        return false
+      }
+    })
+    // 普通启动失败可使用兜底；用户主动刷新失败则必须如实返回错误。
+    if (force && this.catalogError !== undefined) throw this.catalogError
+  }
+
+  /** Jet Hub 手动刷新入口：不清旧目录，成功后才替换内存快照。 */
+  async refreshModels(): Promise<void> {
+    await this.ensureRemoteModels(true)
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
@@ -980,7 +1023,7 @@ export class QoderAdapter extends LlmAdapter {
     // （用户报障「qwen3.8-flash 执行任务出现任务调用 xml 泄露任务终止」）。
     const tools = buildQoderTools(options.tools)
 
-    const fallback = this.fallbackIndex.get(options.model)
+    const fallback = this.modelIndex.get(options.model)
 
     /**
      * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
@@ -1477,7 +1520,10 @@ export function qoderDisplayName(model: QoderFallbackModel, now: Date = new Date
  */
 export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): QoderAdapter {
   const product = options.product ?? QODER
-  const adapter = new QoderAdapter(options)
+  const adapter = new QoderAdapter({
+    ...options,
+    onCatalogLoaded: options.onCatalogLoaded ?? (() => broadcastCatalogChanged(ctx)),
+  })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
