@@ -398,7 +398,23 @@ async function autoclawSelfHeal(
   pool: AccountPool,
   ctx: Context,
 ): Promise<void> {
-  const entries = pool.listAccountsByProvider('autoclaw')
+  // ⚠️⚠️ **读池本身也会抛**（2026-10-20 合并审计补记，实测有牙）：
+  //    `AccountPool.listAccountsByProvider()` → `readAccounts()` → `ensureLoaded()`
+  //    → `SettingsStore.load()` 在 scope 尚未就绪时抛 `TypeError`。原先只有
+  //    **per-条目** 的 try 包住循环体，读池这一句在 try **之外** ⇒ 一抛就是
+  //    **未捕获 rejection**（Node 默认 `--unhandled-rejections=throw`），
+  //    全量单测实测 52 条 `Unhandled Rejection`。
+  //    自愈是**尽力而为**：任何失败都只能记 warn，绝不能让启动失败。
+  let entries: ReturnType<AccountPool['listAccountsByProvider']>
+  try {
+    entries = pool.listAccountsByProvider('autoclaw')
+  } catch (error) {
+    ctx.logger?.warn?.(
+      `[autoclaw] 账号自愈读池失败（不影响启动）：`
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
+    return
+  }
   if (entries.length < 2) return
 
   // ── ① 补齐 user_id（只补缺的那条）──
@@ -878,8 +894,16 @@ export function apply(ctx: Context): void {
    *    等它会让插件启动慢一拍；失败也只记 warn（自愈是尽力而为）。
    * ⚠️ **只对 autoclaw 启用**：其他渠道的 `access_token` 会轮换，
    *    拿它去重会把**不同账号误合并**。这是按渠道逐个放开的白名单。
+   * ⚠️⚠️ `void` 起**必须挂 `.catch`**（双保险）：函数内部已对读池与逐条
+   *    失败各自兜底，但「`void` 一个 async 函数」本身就是未捕获 rejection 的
+   *    入口 —— 将来有人在函数里加一条会抛的新腿，这里仍能兜住并留下日志。
    */
-  void autoclawSelfHeal(pool, ctx)
+  void autoclawSelfHeal(pool, ctx).catch((error: unknown) => {
+    ctx.logger?.warn?.(
+      `[autoclaw] 账号自愈失败（不影响启动）：`
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
+  })
 
   /**
    * ★★ **共享余额读数缓存**（2026-10-15 规格 §5.7；2026-10-16 起 loomy 也接入）——
