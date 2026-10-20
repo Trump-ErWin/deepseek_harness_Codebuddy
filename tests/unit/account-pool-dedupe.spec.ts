@@ -202,4 +202,74 @@ describe('AccountPool.dedupeByCredentialField（存量同账号自愈）', () =>
     ).toBe(1)
     expect(pool.listAccountsByProvider('autoclaw')[0]!.id).toBe('g2')
   })
+
+  /**
+   * ⚠️ 以下三条是 **2026-10-20 审计补的**：原 7 条用例对这三格**零覆盖**，
+   * 实测「变异全绿」（`?? 0` → `?? Infinity`、`>` → `>=` 都打不中）。
+   */
+
+  it('★ expiresAt 相同 ⇒ 保留**先出现**的（方法文档承诺的确定性语义）', async () => {
+    // ⚠️ 原用例的 expiresAt **互不相同**（1000/3000/2000 等）⇒ `>` 与 `>=`
+    //    行为完全一致 ⇒ 「同值保留先出现」这条**零覆盖**（审计实测：
+    //    `candAt > keepAt` → `>=` 后 7 条全绿）。
+    const pool = await makePool([
+      { id: 't1', ref: 'T1', userId: 'SAME', expiresAt: 2000 },
+      { id: 't2', ref: 'T2', userId: 'SAME', expiresAt: 2000 },
+      { id: 't3', ref: 'T3', userId: 'SAME', expiresAt: 2000 },
+    ])
+    expect(await pool.dedupeByCredentialField('autoclaw', 'user_id')).toBe(2)
+    expect(
+      pool.listAccountsByProvider('autoclaw').map((a) => a.id),
+      '★ 三条同 expiresAt ⇒ 必须保留**第一条**（顺序即池的候选优先级，不能随机）',
+    ).toEqual(['t1'])
+  })
+
+  it('★ expiresAt 为 undefined 的条目按 0 处理（不得当成「最大」而留它）', async () => {
+    // ⚠️ 审计实测：`keep.expiresAt ?? 0` 与 `candidate.expiresAt ?? 0` 分别改成
+    //    `?? Infinity` 后 7 条全绿 ⇒ 「undefined 怎么排」零覆盖。
+    //    语义：undefined = 不知道何时过期 ⇒ 比任何已知时刻都**不该**优先。
+    const pool = await makePool([
+      { id: 'u1', ref: 'U1', userId: 'SAME' }, // 不传 expiresAt ⇒ undefined
+      { id: 'u2', ref: 'U2', userId: 'SAME', expiresAt: 1000 },
+    ])
+    // 让 u1 的 expiresAt 真的是 undefined（makeAccount 默认会给一个值）。
+    await pool.updateAccount('u1', { expiresAt: undefined as unknown as number })
+    expect(await pool.dedupeByCredentialField('autoclaw', 'user_id')).toBe(1)
+    expect(
+      pool.listAccountsByProvider('autoclaw').map((a) => a.id),
+      '★ 已知过期时刻(1000) 必须胜过 undefined',
+    ).toEqual(['u2'])
+  })
+
+  it('★ 删除途中某条失败 ⇒ 其余照删，且返回值是**真正删掉的条数**（不谎报 0）', async () => {
+    // ⚠️ 审计实测真缺陷：原实现 `for (const id of toRemove) await this.removeAccount(id)`
+    //    没有逐条 try，外层 catch 直接 `return 0` ⇒ 第 2 次失败会：
+    //      ① 让后面所有条都不再删；
+    //      ② **谎报 0**（实际已删掉 1 条），调用方日志「已清理 N 条」变成「什么都没删」。
+    const pool = await makePool([
+      { id: 'd1', ref: 'D1', userId: 'SAME', expiresAt: 9000 },
+      { id: 'd2', ref: 'D2', userId: 'SAME', expiresAt: 8000 },
+      { id: 'd3', ref: 'D3', userId: 'SAME', expiresAt: 7000 },
+    ])
+    // 让**第二次 `removeAccount` 本身**抛错，模拟「删除中途失败」。
+    // ⚠️ 不能改成让 `credentials.unset` 抛错 —— `removeAccount` 内部对它有
+    //    try/catch（「凭据可能已被删除」），那层故障**到不了**删除循环
+    //    ⇒ 变异会打空（实测：把逐条 try 退回原形态后仍 10 passed）。
+    //    必须打在 `removeAccount` 这一层，才是「删除失败」的真实注入点。
+    const realRemove = pool.removeAccount.bind(pool)
+    let removeCalls = 0
+    pool.removeAccount = async (id: string) => {
+      removeCalls += 1
+      if (removeCalls === 2) throw new Error('模拟删除中途失败')
+      return realRemove(id)
+    }
+
+    const removed = await pool.dedupeByCredentialField('autoclaw', 'user_id')
+    const left = pool.listAccountsByProvider('autoclaw').map((a) => a.id)
+    // 3 条同身份 ⇒ 要删 2 条（d2、d3）；第 2 次删除抛错 ⇒ **只删成 1 条**。
+    // 判据是「如实 = 1」而不是「= 2」：修法承诺的是「不谎报」，不是「保证删完」。
+    // ⚠️ 原实现（无逐条 try）在这一格返回 **0** —— 那才是缺陷形态。
+    expect(removed, '★ 必须如实报告真正删掉的条数（不得因中途失败谎报 0）').toBe(1)
+    expect(left, '★ 保留的仍是 expiresAt 最大的那条').toEqual(['d1', 'd3'])
+  })
 })

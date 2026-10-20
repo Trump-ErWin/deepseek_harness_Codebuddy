@@ -1640,6 +1640,60 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
       expect(id).toBe('opaque-token')
     })
   })
+
+  /**
+   * ⚠️⚠️ **以下三条是 2026-10-20 审计补的真缺陷守卫**。
+   *
+   * 三个缺陷共同特征：**代码读起来对、注释也写了理由，但实际不成立**。
+   * 原 102 条用例对它们零覆盖（改回去全绿）。
+   */
+  describe('★★ 审计补：两个 id 空间与续期持久性', () => {
+    it('★ isAutoclawUuidUserId 只认 UUID 形态（数字 id 必须判 false）', async () => {
+      const { isAutoclawUuidUserId } = await import('../../src/autoclaw.js')
+      // 凭据/服务端下发的 UUID（实测是 32 位无连字符 hex）
+      expect(isAutoclawUuidUserId('7c54a9acc64092b06aa32cc8b1a48fef')).toBe(true)
+      // 规范 8-4-4-4-12 形态也接受
+      expect(isAutoclawUuidUserId('7c54a9ac-c640-92b0-6aa3-2cc8b1a48fef')).toBe(true)
+      // ⚠️ JWT 的 numericUserId（`readUserIdFromJwt` 返回的**字符串**形态）
+      //    必须判 false —— 否则自愈会把它当「已补齐」而跳过，UUID 补齐永不发生。
+      expect(isAutoclawUuidUserId('839684'), '★ 数字 id 不是 UUID').toBe(false)
+      expect(isAutoclawUuidUserId(839684), '非字符串一律 false').toBe(false)
+      expect(isAutoclawUuidUserId('')).toBe(false)
+      expect(isAutoclawUuidUserId(undefined)).toBe(false)
+      expect(isAutoclawUuidUserId('not-a-uuid')).toBe(false)
+    })
+
+    it('★ readUserIdFromJwt 返回**字符串** ⇒ 自愈的跳过判据必须能区分它与 UUID', async () => {
+      // 这条把两个函数钉在一起：登录路径写回的 user_id 是 `readUserIdFromJwt` 的产物
+      //（`String(raw)`），而自愈的跳过判据若只看「是非空字符串」就会命中它。
+      const { readUserIdFromJwt, isAutoclawUuidUserId } = await import('../../src/autoclaw.js')
+      const fromJwt = readUserIdFromJwt(makeJwt({ user_id: 839684 }))
+      expect(typeof fromJwt, '★ 必须是 string（登录路径直接写回它）').toBe('string')
+      expect(fromJwt).toBe('839684')
+      expect(
+        isAutoclawUuidUserId(fromJwt),
+        '★ 自愈据此判断「是否已补齐」—— 判 false 才会去补 UUID',
+      ).toBe(false)
+    })
+
+    it('★ 续期响应不带 user_id 时必须从新 JWT 兜底（否则一次续期就抹掉身份）', async () => {
+      // ⚠️ 上游 `/userapi/v1/refresh` 不下发 user_id（登录端点也不下发）。
+      //    原实现 `user_id: json.data.user_id` ⇒ 恒 undefined ⇒
+      //    JSON.stringify 整键丢弃 ⇒ 自愈能力随续期逐条退化，且日志零字。
+      const newJwt = makeJwt({ user_id: 839684, exp: Math.floor(Date.now() / 1000) + 86400 })
+      const mockFetch = async () => new Response(JSON.stringify({
+        code: 0,
+        data: { access_token: newJwt, refresh_token: 'new-rt' }, // 故意不带 user_id
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+
+      const cred = await refreshAutoclawToken('rt_old', { fetchImpl: mockFetch as never })
+      expect(cred, '续期应成功').not.toBeNull()
+      expect(
+        cred!.user_id,
+        '★ 必须从新 JWT 兜底读到 user_id —— 否则该键被整键丢弃，下一轮去重跳过此条',
+      ).toBe('839684')
+    })
+  })
 })
 
 

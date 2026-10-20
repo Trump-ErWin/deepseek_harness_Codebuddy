@@ -2974,6 +2974,19 @@ function ProviderPanel({ provider, rpcCall }) {
   //    这是「autoclaw 系按 id 逐个判」的**第 4 次复发**（RPC 分支 / refName /
   //    new-account 载荷 / 这里），每次症状都不同且都不报错。
   const autoclawDialog = provider === 'autoclaw' || provider === 'autoclawintl';
+  /**
+   * 国际版**没有可用的短信登录**（2026-10-20 审计 P1）。
+   *
+   * ⚠️ 判据来自宿主侧已实测的事实（`src/autoclaw-auth.ts` 的 `loginWithCode`
+   *    注释）：国际版账号是**邮箱 + Z.ai OAuth** 创建的，`phone` 为 `null`，
+   *    且没有绑手机端点（`agent-bind-phone` / `bind-phone` 全 404）
+   *    ⇒ 短信对国际账号**必然失败**，且失败文案不指向真因。
+   *
+   * ⇒ 国际版只渲染「一键导入」一条路（那是唯一能用的），不再提供短信死路。
+   *    ⚠️ 这与「按钮必须按 provider 分支」同源：同一个弹窗在两家语义不同。
+   *    ⚠️ 将来若 Z.ai OAuth 接上 RPC，这里要换成三条路（导入 / OAuth / —）。
+   */
+  const autoclawSmsAvailable = provider === 'autoclaw';
   // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
   // 有成长中心的 provider 才传 runTasks（见 GROWTH_TASK_PROVIDERS 的注释：
@@ -4437,7 +4450,12 @@ function ProviderPanel({ provider, rpcCall }) {
                   : (autoclawDialog
                       ? [
                           { value: 'local', label: '⚡ 一键导入本机桌面端凭据', desc: '需已在 AutoClaw 桌面端登录，自动秒级解密' },
-                          { value: 'sms', label: '📱 手机验证码快速登录', desc: '免安装桌面端，支持输入任意手机号登录' },
+                          // ⚠️ 国际版**不渲染**这条：它的账号是邮箱 + Z.ai OAuth 创建的、
+                          //    `phone` 为 null、无绑手机端点 ⇒ 短信必然失败（详见
+                          //    `autoclawSmsAvailable` 的注释）。
+                          ...(autoclawSmsAvailable
+                            ? [{ value: 'sms', label: '📱 手机验证码快速登录', desc: '免安装桌面端，支持输入任意手机号登录' }]
+                            : []),
                         ].map((opt) => {                          const active = autoclawMode === opt.value;
                           return React.createElement('div', {
                             key: opt.value,

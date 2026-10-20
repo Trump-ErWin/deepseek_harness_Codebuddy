@@ -1,4 +1,4 @@
-﻿/**
+/**
  * AutoClaw 协议常量、凭据结构与纯函数。
  *
  * 本模块只放常量与无副作用的纯函数（签名计算、System Prompt 前缀拼接、凭据解析等）。
@@ -157,6 +157,41 @@ export function readUserIdFromJwt(accessToken: string): string | undefined {
   } catch {
     return undefined
   }
+}
+
+/**
+ * 判断一个 `user_id` 值是不是**服务端 UUID 主键**（而不是 JWT 的 `numericUserId`）。
+ *
+ * ## 为什么必须区分（2026-10-20 审计 P1，真缺陷）
+ *
+ * AutoClaw 有**两个互不相通**的 id 空间：
+ *
+ * | 来源 | 形态 | 例 |
+ * |---|---|---|
+ * | 服务端 `user-profile.user_id` / 凭据字段 | **UUID**（32 位 hex，或带连字符） | `7c54a9acc64092b06aa32cc8b1a48fef` |
+ * | JWT payload 的 `user_id` | **纯数字** | `839684` |
+ *
+ * 启动自愈的跳过判据原先写成「`user_id` 是非空字符串就跳过」—— 而登录路径
+ * 用 `readUserIdFromJwt()` 写回的正是**字符串形态的数字 id**（`String(raw)`）
+ * ⇒ 判据命中 ⇒ **UUID 补齐永不发生** ⇒ 池里永久并存 `autoclaw:839684` 与
+ * `autoclaw:7c54a9a…` 两组 ⇒ 去重对混合池完全无效（PR 要修的症状原样存在）。
+ *
+ * ⇒ 跳过条件必须收窄成「**已经是 UUID**」，而不是「有值」。
+ *
+ * ⚠️ 判据按**形态**而不是按「长度恰好 32」：上游两种写法都可能出现
+ *    （带连字符的规范 UUID / 不带连字符的 32 位 hex），且实测凭据里是后者。
+ *    数字 id（`839684`）与任何 UUID 形态都不相交，故不会误判。
+ *
+ * @param value - 待判定的 `user_id`（可能来自凭据字段或 JWT）。
+ * @returns 是 UUID 形态返回 `true`。
+ */
+export function isAutoclawUuidUserId(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const trimmed = value.trim()
+  if (trimmed === '') return false
+  // 规范 8-4-4-4-12，或 32 位无连字符 hex（实测凭据里是后者）。
+  return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(trimmed)
+    || /^[0-9a-fA-F]{32}$/.test(trimmed)
 }
 
 /**

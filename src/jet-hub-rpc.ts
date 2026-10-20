@@ -4591,6 +4591,25 @@ function registerJetHubEndpoints(
           }
 
           started.result.then(async ({ credential }) => {
+            /**
+             * ⚠️⚠️ **落盘前必须做归属校验**（2026-10-20 审计 P0 实测复现）。
+             *
+             * 本回调是凭据落盘的**第二条腿**：登录页上的「⚡ 一键读取本机凭据」
+             * 走 `/autoclaw/import-local`，结果经 `started.result` 到这里。
+             * 原先这里**直接 `credentials.set`**，而归属校验只写在
+             * `importLocalAccount()` 里 ⇒ 这条腿完全绕过它。
+             *
+             * 审计实测：以 `AUTOCLAW_INTL` 起 flow 后请求该端点，读到的是
+             * **国内** `AutoClaw-official` 目录里的凭据 ⇒ 国内凭据被写进
+             * `AUTOCLAWINTL_ACCOUNT_*`，界面显示「国际版卡片里是国内手机号」，
+             * 全程零报错（PR 声称已修的那次事故原样复发）。
+             *
+             * ⇒ 判据与文案复用 `AutoclawAuth.verifyCredentialSite()`（与
+             *   `importLocalAccount` **同一份实现**，不写第二份）。
+             *   失败则抛错 → 落到下面的 `.catch` → `failLogin()` 记终态，
+             *   占位条目被清理，用户看到指向性错误而不是一条死凭据。
+             */
+            await autoclawAuthForProvider.verifyCredentialSite(credential)
             const ref = credentialRef(refName)
             await ctx.credentials.set(ref, JSON.stringify(credential))
             const nickname = autoclawDisplayNickname(credential, id)
@@ -5122,11 +5141,60 @@ function registerJetHubEndpoints(
               ? ''
               : await pool.findAccountIdByIdentityField(AUTOCLAW.id, 'user_id', identity)
             if (duplicateId !== '' && duplicateId !== req.accountId) {
-              // ⚠️ **不静默合并**：删掉本次新建的占位条目，把凭据指向已存在的那条，
-              //    并留痕说明。静默删用户会以为「登录没成功」。
+              /**
+               * ⚠️⚠️ **必须真删占位条目，并把新凭据交给已存在的那条**
+               * （2026-10-20 审计 P1，实测真缺陷）。
+               *
+               * 原实现只 `return` 一句错误文案，**什么都没改**，而
+               * `loginWithCode` 早已把这次的新凭据写进 `req.accountId` 的 ref
+               *（`autoclaw-auth.ts` 的 `credentials.set`）。实测后果：
+               *
+               * ```
+               * 条目数 = 2
+               *   autoclaw-old  187****9406            ref = AUTOCLAW_ACCOUNT_OLD  ← 旧凭据（可能已轮换）
+               *   autoclaw-new  AutoClaw (登录中...)    ref = AUTOCLAW_ACCOUNT_NEW  ← 有效凭据
+               * ```
+               *
+               * ⇒ 面板上留一条**「AutoClaw (登录中...)」幽灵条目**，而它持有着
+               *   唯一有效的凭据；老条目反而拿着可能已失效的 token。用户看到
+               *   「登录失败」+ 一个永远转圈的卡片，且**再登一次又是同样结果**
+               *   （占位条目越堆越多）。
+               *
+               * 定稿做法（与注释原本声称的语义一致）：
+               * 1. 把本次的新凭据写到**已存在那条**的 ref 上（它的 token 才是最新的）；
+               * 2. 删掉本次新建的占位条目（`removeAccount` 会一并清掉它那份凭据）；
+               * 3. 返回可读错误，让用户知道「已经加过了，不用重复添加」。
+               */
+              try {
+                const existing = pool.listAccountsByProvider(AUTOCLAW.id)
+                  .find((entry) => entry.id === duplicateId)
+                if (existing !== undefined) {
+                  await ctx.credentials.set(
+                    credentialRef(existing.credentialRef),
+                    JSON.stringify(cred),
+                  )
+                  await pool.updateAccount(existing.id, {
+                    nickname: autoclawDisplayNickname(cred, existing.id),
+                    expiresAt: cred.expires_at,
+                    refreshable: isAutoclawRefreshable(cred),
+                  })
+                }
+              } catch (error) {
+                ctx.logger?.warn?.(
+                  `[autoclaw] 并入已存在条目 ${duplicateId} 失败（不影响本次提示）：`
+                  + (error instanceof Error ? error.message : String(error)),
+                )
+              }
+              // 删占位条目（连带清掉它那份重复凭据）；失败只记 warn。
+              await pool.removeAccount(req.accountId).catch((error: unknown) => {
+                ctx.logger?.warn?.(
+                  `[autoclaw] 清理重复占位条目 ${req.accountId} 失败：${String(error)}`,
+                )
+              })
+              pendingSmsMsgid.delete(req.accountId)
               ctx.logger?.warn?.(
                 `[autoclaw] 该账号已存在（user_id=${identity}，条目 ${duplicateId}）`
-                + `—— 本次登录不新增账号，已并入原条目；请删除多余条目 ${req.accountId}`,
+                + `—— 本次登录已并入原条目并清理占位条目 ${req.accountId}`,
               )
               return {
                 ok: true,

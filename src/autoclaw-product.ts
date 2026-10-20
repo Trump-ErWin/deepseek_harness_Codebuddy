@@ -331,6 +331,34 @@ export interface AutoclawProduct {
   readonly product: string
   readonly defaultCredentialRef: string
   readonly fallbackModels: readonly AutoclawFallbackModel[]
+  /**
+   * 桌面端 **userData 目录名**（`%APPDATA%\<这个名字>\`）。
+   *
+   * ⚠️⚠️ **必须按产品区分，且只能有这一处真相源**（2026-10-20 审计 P0）。
+   *
+   * 国内版与国际版是**同一客户端的两份构建**（`isOversea` 是构建期常量），
+   * userData 目录名不同 —— 实测：
+   * - 国内构建：`AutoClaw-official`
+   * - 国际构建：`AutoClaw-oversea-official`
+   *
+   * ## 为什么它不是「顺手加的一个字段」，而是 P0
+   *
+   * 该目录名有**三个读点**，且原先只有一处按产品判断：
+   * 1. `probeAutoclawLocalCredential()`（一键导入）—— 已按产品传；
+   * 2. `resolveDeviceId()`（登录/签到/续期三处请求体里的 `device_id`）—— 写死国内；
+   * 3. 登录页 `/autoclaw/import-local`（`startAutoclawSmsLoginFlow` 内的本地
+   *    HTTP 端点，用户点「⚡ 一键读取本机凭据」时触发）—— 写死国内。
+   *
+   * 第 3 条是**审计实测复现过的真实事故**：以 `product: AUTOCLAW_INTL` 起 flow 后
+   * 请求该端点，被探测的路径是 `AutoClaw-official\Local State`（国内），而这条
+   * 路径的结果会经 `started.result` **直接落盘**（不经过 `importLocalAccount`
+   * 的归属校验）⇒ 国内凭据被写进 `AUTOCLAWINTL_ACCOUNT_*`，症状是「国际版卡片
+   * 显示国内手机号且已过期」，全程无一处报错。
+   *
+   * ⇒ 收进产品配置后，三个读点都从 `product.userDataDirName` 取，**新增站点
+   * 不可能再漏一处**（漏了是类型错误，不是静默失效）。
+   */
+  readonly userDataDirName: string
 }
 
 export const AUTOCLAW: AutoclawProduct = {
@@ -342,6 +370,7 @@ export const AUTOCLAW: AutoclawProduct = {
   product: AUTOCLAW_PRODUCT_NAME,
   defaultCredentialRef: AUTOCLAW_DEFAULT_CREDENTIAL_REF,
   fallbackModels: AUTOCLAW_FALLBACK_MODELS,
+  userDataDirName: 'AutoClaw-official',
 }
 
 /**
@@ -367,4 +396,7 @@ export const AUTOCLAW_INTL: AutoclawProduct = {
   product: AUTOCLAW_PRODUCT_NAME,
   defaultCredentialRef: AUTOCLAW_INTL_DEFAULT_CREDENTIAL_REF,
   fallbackModels: AUTOCLAW_FALLBACK_MODELS,
+  // ⚠️ 国际构建的 userData 目录（实测）。见 `AutoclawProduct.userDataDirName` 的
+  //    P0 注释：三个读点（一键导入 / device_id / 登录页 import-local）都取这里。
+  userDataDirName: 'AutoClaw-oversea-official',
 }

@@ -119,7 +119,7 @@ export async function exchangeAutoclawZaiCode(
 
   const product = options?.product ?? AUTOCLAW
   const fetcher = options?.fetchImpl ?? fetch
-  const deviceId = resolveDeviceId(options?.deviceId)
+  const deviceId = resolveDeviceId(product, options?.deviceId)
   const ts = Math.floor(Date.now() / 1000).toString()
   const sign = calculateAutoclawSign(product.appId, ts, product.appKey)
 
@@ -238,17 +238,25 @@ export const PHONE_NUMBER_RE = /^1[3-9]\d{9}$/
 export async function probeAutoclawLocalCredential(options?: {
   customAppData?: string
   /**
-   * 客户端 userData 目录名。
+   * **产品配置**（推荐形态）—— 目录名从 `product.userDataDirName` 取。
+   *
+   * ⚠️ 与下面的 `appDirName` 二选一，`product` 优先。新增调用点**必须**用它
+   * （而不是自己拼目录名），否则又会出现「三个读点各写一份」的事故形态。
+   */
+  product?: AutoclawProduct
+  /**
+   * 客户端 userData 目录名（**低层逃生口**，仅测试/特殊场景用）。
    *
    * ⚠️ **国内版与国际版是同一客户端的两份构建**（`isOversea` 是构建期常量），
    * 但 userData 目录名不同 —— 实测（2026-10-20）：
    * - 国内构建：`AutoClaw-official`
    * - 国际构建：`AutoClaw-oversea-official`
    *
-   * ⇒ 由调用方按 `product.id` 传入，不写死（原实现硬编码国内目录，
-   *   导致国际版**永远导入不到**自己的凭据）。
+   * ⇒ 生产调用点一律传 `product`，别在这里写死（原实现硬编码国内目录，
+   *   导致国际版**永远导入不到**自己的凭据；审计 P0 就是漏了本函数的
+   *   `/autoclaw/import-local` 那个调用点）。
    *
-   * @default 'AutoClaw-official'
+   * @default AUTOCLAW.userDataDirName（`'AutoClaw-official'`）
    */
   appDirName?: string
 }): Promise<AutoclawCredential | undefined> {
@@ -262,7 +270,9 @@ export async function probeAutoclawLocalCredential(options?: {
 
     if (!appData) return undefined
 
-    const appDirName = options?.appDirName ?? 'AutoClaw-official'
+    const appDirName = options?.product?.userDataDirName
+      ?? options?.appDirName
+      ?? AUTOCLAW.userDataDirName
     const localStatePath = path.join(appData, appDirName, 'Local State')
     if (!fs.existsSync(localStatePath)) return undefined
 
@@ -471,7 +481,25 @@ export async function refreshAutoclawToken(
         access_token: newAccess,
         refresh_token: newRefresh,
         expires_at: expiresAt,
-        user_id: json.data.user_id,
+        /**
+         * ⚠️⚠️ **`user_id` 必须带 JWT 兜底**（2026-10-20 审计 P1，实测真缺陷）。
+         *
+         * 上游 `/userapi/v1/refresh` **不下发 `user_id`**（登录端点都不下发，
+         * 见下面 `loginAutoclawWithCode` 的同一处兜底）。原先这里写
+         * `user_id: json.data.user_id` ⇒ 恒 `undefined` ⇒ `JSON.stringify`
+         * 把该键**整键丢弃** ⇒ 一次自动续期就把「已补齐的 UUID」抹掉 ⇒
+         * 下一轮 `dedupeByCredentialField` 因身份字段缺失而跳过该条
+         * ⇒ **自愈能力随续期逐条退化**，且日志零字。
+         *
+         * 兜底顺序与登录路径**同源**：声明值优先，取不到就从新 JWT 的
+         * `user_id` 读（`readUserIdFromJwt` 是唯一实现，不写第二份解析）。
+         *
+         * ⚠️ 注意兜底拿到的是 **numericUserId**（数字 id），不是 UUID ——
+         *    那是**比没有好**的退化（`autoclawIdentityOf` 靠它仍能判同账号）；
+         *    UUID 的真正补齐由启动自愈负责，且其跳过判据已改为
+         *    「已经是 UUID 才算补齐」（见 `isAutoclawUuidUserId`）。
+         */
+        user_id: json.data.user_id ?? readUserIdFromJwt(newAccess),
         device_id: deviceId,
       }
     } catch (err) {
@@ -544,7 +572,15 @@ export interface LoginAutoclawWithCodeResult {
   error?: string
 }
 
-function resolveDeviceId(explicitId?: string): string {
+/**
+ * 读桌面端的**设备号**（`%APPDATA%\<userDataDir>\device\device-id.json`）。
+ *
+ * ⚠️⚠️ **必须按产品取目录**（2026-10-20 审计 P1）：国际版的 userData 目录是
+ *    `AutoClaw-oversea-official`，写死国内目录会让国际账号拿到**国内客户端的
+ *    设备号**，读不到时还会静默回落 `crypto.randomUUID()` ⇒ 设备身份与桌面端
+ *    不一致，而 `device_id` 会进登录 / 签到 / 续期**三处**请求体。
+ */
+function resolveDeviceId(product: AutoclawProduct, explicitId?: string): string {
   if (explicitId && explicitId.trim().length > 0) return explicitId.trim()
   try {
     // ⚠️⚠️ 同样必须走隔离口（2026-10-17 审计 P0 修复）：这里读的是用户**真实**
@@ -555,7 +591,7 @@ function resolveDeviceId(explicitId?: string): string {
       process.env.DSH_AUTOCLAW_APPDATA
         ?? process.env.APPDATA
         ?? path.join(process.env.USERPROFILE ?? '', 'AppData', 'Roaming'),
-      'AutoClaw-official',
+      product.userDataDirName,
       'device',
       'device-id.json',
     )
@@ -583,7 +619,7 @@ export async function sendAutoclawVerificationCode(
 
   const product = options?.product ?? AUTOCLAW
   const fetcher = options?.fetchImpl ?? fetch
-  const deviceId = resolveDeviceId(options?.deviceId)
+  const deviceId = resolveDeviceId(product, options?.deviceId)
   const ts = Math.floor(Date.now() / 1000).toString()
   const sign = calculateAutoclawSign(product.appId, ts, product.appKey)
   const url = `${product.apiBase}${AUTOCLAW_SEND_CODE_PATH}`
@@ -652,7 +688,7 @@ export async function loginAutoclawWithCode(
 
   const product = options?.product ?? AUTOCLAW
   const fetcher = options?.fetchImpl ?? fetch
-  const deviceId = resolveDeviceId(options?.deviceId)
+  const deviceId = resolveDeviceId(product, options?.deviceId)
   const ts = Math.floor(Date.now() / 1000).toString()
   const sign = calculateAutoclawSign(product.appId, ts, product.appKey)
   const url = `${product.apiBase}${AUTOCLAW_LOGIN_PATH}`
@@ -976,7 +1012,27 @@ export async function startAutoclawSmsLoginFlow(
         }
 
         if (url.pathname === '/autoclaw/import-local') {
-          const localCred = await probeAutoclawLocalCredential()
+          /**
+           * ⚠️⚠️ **必须传 `product`**（2026-10-20 审计 P0 实测复现）。
+           *
+           * 这是「一键读取本机凭据」的**第二条腿** —— 第一条是
+           * `AutoclawAuth.probeLocal()`（`importLocalAccount` 内部）。
+           * 两条腿原先各写一份目录名，PR 只改了第一条 ⇒ 国际版的登录页按钮
+           * 仍去读**国内** `AutoClaw-official`。
+           *
+           * 复现（审计）：以 `product: AUTOCLAW_INTL` 起 flow、POST 本端点、
+           * 打桩 `fs.existsSync` ⇒ 唯一被探测路径是
+           * `...\AutoClaw-official\Local State`（不是 `AutoClaw-oversea-official`）。
+           *
+           * 危害不只是「读不到」：读到的是**国内凭据**，而这条路径的结果经
+           * `started.result` 在 `jet-hub-rpc.ts` **直接 `credentials.set` 落盘**，
+           * 不经过 `importLocalAccount` 的归属校验 ⇒ 国内凭据进
+           * `AUTOCLAWINTL_ACCOUNT_*`，全程零报错（PR 声称已修的那次事故复发）。
+           *
+           * ⇒ 目录名从 `product.userDataDirName` 取（单一真相源）；
+           *   落盘前的归属校验见 `jet-hub-rpc.ts` 的 `verifyAutoclawCredentialSite`。
+           */
+          const localCred = await probeAutoclawLocalCredential({ product })
           if (localCred) {
             settleOk({ credential: localCred, phone: localCred.user_phone ?? '' })
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })

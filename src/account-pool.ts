@@ -1620,10 +1620,29 @@ export class AccountPool {
         )
       }
 
+      // ⚠️⚠️ **逐条 try**（2026-10-20 审计 P1，实测真缺陷）。
+      //
+      // 原写法 `for (const id of toRemove) await this.removeAccount(id)` 没有内层
+      // 捕获，外层 `catch` 直接 `return 0` ⇒ 中途某条删失败会：
+      //   ① 让**后面所有条都不再删**（自愈半途而废，且下次启动仍会重试，看似无害）；
+      //   ② **谎报**返回值 0 —— 而实际前面已经删掉若干条，调用方的日志
+      //      「已清理 N 条重复账号」会变成「什么都没删」，排查者据此以为自愈没跑。
+      // 实测：3 条同身份、第 2 次 `unset` 抛错 ⇒ 池里剩 3 条、返回 0。
+      //
+      // ⇒ 每条独立兜底，并**如实累计**真正删掉的条数。
+      let removed = 0
       for (const id of toRemove) {
-        await this.removeAccount(id)
+        try {
+          await this.removeAccount(id)
+          removed += 1
+        } catch (error) {
+          this.ctx.logger?.warn?.(
+            `[jet-hub] ${provider} 账号去重：删除 ${id} 失败（继续处理其余条目）：`
+            + (error instanceof Error ? error.message : String(error)),
+          )
+        }
       }
-      return toRemove.length
+      return removed
     } catch (error) {
       this.ctx.logger?.warn?.(
         `[jet-hub] ${provider} 账号自愈失败（不影响启动）：`

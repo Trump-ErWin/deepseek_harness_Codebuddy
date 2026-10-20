@@ -163,6 +163,61 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
   })
 
   /**
+   * ⚠️⚠️ **乱序夹具：最早那批排在数组最后**（2026-10-20 审计补，关键）。
+   *
+   * ## 为什么必须乱序（原用例是夹具盲区型假绿）
+   *
+   * 上一条「临期段数字 = 最早那批的量」的夹具把最早那批排在**第一位**：
+   *
+   * ```
+   * [19656@5d, 500@6d, 700@7d]
+   * ```
+   *
+   * 于是「取第一个临期包的 `remaining`」与「取最早那批的 `remaining`」
+   * 在这个夹具上**逐字节同值** ⇒ 审计实测：把实现改成
+   * `earliestExpiringAmount = expiring`（= 要修的 bug 本身）后 **76 条全绿**。
+   *
+   * 而生产输入来自 `credits.balances` 的 `packages` 数组，顺序**无任何保证**
+   * （`parseAutoclawLedgerBatches` 只对 `byExpiry` 排序，钱包包是上游原序）
+   * ⇒ 那条守卫在真实顺序下会漏掉整整一半的错误实现。
+   *
+   * 审计实测的判别力对照（同一组三批，只改数组顺序）：
+   *
+   * | 顺序 | 修复态 | 变异态 `= expiring` |
+   * |---|---|---|
+   * | asc（最早在前） | 19656 | 19656 ← **不可区分** |
+   * | desc（最早在后） | 19656 | 20856 ← **可区分** |
+   *
+   * ⇒ 本用例取 desc 顺序。
+   */
+  it('★ 乱序输入（最早那批在数组最后）⇒ 仍取最早那批的量，不是总额', () => {
+    const split = splitCreditsByExpiry([
+      pkg({ remaining: 700, deductionEndTime: NOW + 7 * DAY }),
+      pkg({ remaining: 500, deductionEndTime: NOW + 6 * DAY }),
+      pkg({ remaining: 19656, deductionEndTime: NOW + 5 * DAY }), // 最早，但在最后
+    ], WINDOW_DAYS, NOW)
+    expect(split?.expiring).toBe(20856)
+    expect(split?.earliestExpiringAt).toBe(NOW + 5 * DAY)
+    expect(
+      split?.earliestExpiringAmount,
+      '★ 乱序下若实现取「第一个临期包」或「总额」，这里会得 700 / 20856',
+    ).toBe(19656)
+  })
+
+  it('★ 乱序 + 同刻并列：仍按时刻取最早那批，并把同刻的量相加', () => {
+    const split = splitCreditsByExpiry([
+      pkg({ remaining: 700, deductionEndTime: NOW + 7 * DAY }),
+      pkg({ remaining: 120, deductionEndTime: NOW + 5 * DAY }),  // 最早（同刻之一）
+      pkg({ remaining: 880, deductionEndTime: NOW + 5 * DAY }),  // 最早（同刻之二）
+    ], WINDOW_DAYS, NOW)
+    expect(split?.earliestExpiringAt).toBe(NOW + 5 * DAY)
+    expect(
+      split?.earliestExpiringAmount,
+      '★ 最早那批（同刻并列）的量 = 120 + 880，既不是 700 也不是总额 1700',
+    ).toBe(1000)
+  })
+
+  /**
    * ⚠️⚠️ **已过期的包不得当选「最早作废时刻」**（2026-10-13 审计修正）。
    *
    * 取最早时不约束 `> now`，则「一个已过期但 `active` 仍为 true 的包」会
