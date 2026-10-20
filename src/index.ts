@@ -1611,6 +1611,11 @@ export function apply(ctx: Context): void {
     readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: QODER,
+    // 远端模型目录（2026-10-20）：**由 auth 服务取数**，只做池的只读读取。
+    // ⚠️ 刻意**不**走 `resolveCredential` —— 它选中账号时会 reportAccount，
+    //    而目录请求是周期性的（20 分钟刷新器），会把「本次实际使用的账号」
+    //    改写成目录用的账号 ⇒ 额度标记落到无辜账号上（见 `QoderAdapterOptions.fetchRemoteModels`）。
+    fetchRemoteModels: () => qoder.fetchModels(pool),
     // 额度受限时标记「本次实际使用的账号」（理由见 `activeQoderAccountId` 注释）。
     currentAccountId: () => activeQoderAccountId.get(QODER.id),
   })
@@ -1671,6 +1676,8 @@ export function apply(ctx: Context): void {
     readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: QODER_CN,
+    // 远端模型目录：同国际版（两站共用同一套实现，差异只在产品配置）。
+    fetchRemoteModels: () => qoderCn.fetchModels(pool),
     // 额度受限时用它标记「当前账号」（见 `QoderAdapter.switchAccountOnQuota`）。
     // ⚠️ 取「**本次实际使用**的账号」而非池里默认那一个：池的默认账号可能与之
     // 不同（例如本账号被限流、池已切到别的账号），标错就会让标记落在无辜账号上。
@@ -1986,16 +1993,41 @@ export function apply(ctx: Context): void {
         throwIfAllRateLimited: throwIfAllAccountsRateLimited,
       },
     ),
-    refresh: async () => {
+    refresh: async (forCredential) => {
       // ⚠️ Loomy **没有 refresh 端点**，这里的 `refresh` 语义是
       // 「探测凭据是否仍有效」，失效时抛错提示重新登录。
       //
       // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
       // 否则探测的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
+      //
+      // ⚠️⚠️ **优先探测调用方指定的那一份凭据**（2026-10-20 审计 E-2）。
+      //
+      // 适配器在热路径上用它裁决「**本轮要用的那份**凭据还能不能用」，
+      // 而这里原先恒探测 `pool.getAvailableAccount(LOOMY.id, '')` = **池默认号**
+      // ⇒ 二者可能不是同一个号 ⇒ **另一个号的终态会打死本轮**
+      //（实测：本轮号完全可用，仍整轮失败、业务请求 0 次）。
+      //
+      // ⚠️ 反查失败时**退回原行为**（探测默认号）而不是跳过探测：
+      //    「宁可退化成旧行为，也不要凭空少做一次健康检查」。
+      const target = forCredential === undefined
+        ? undefined
+        : await pool.findAccountIdByCredential(LOOMY.id, forCredential.access_token).catch(() => undefined)
+      // ⚠️ 从池里取**该账号自己的** `credentialRef`，不自己拼 `LOOMY_ACCOUNT_` 前缀
+      //    —— 前缀是记账格式，拼错会静默探测到另一份/不存在的凭据。
+      const targetEntry = target === undefined || target.length === 0
+        ? undefined
+        : pool.listAccountsByProvider(LOOMY.id).find((entry) => entry.id === target)
+      if (targetEntry !== undefined) {
+        await loomy.refreshAccountCredential(targetEntry.credentialRef, pool, targetEntry.id)
+        return
+      }
       const available = await pool.getAvailableAccount(LOOMY.id, '')
       if (available) await loomy.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await loomy.refresh()
     },
+    // ⚠️ 必须注入：适配器在热路径上把「非终态探测失败」降级为告警而不是抛错，
+    // 没有这个出口就等于静默（本仓库反复记录过的失败形态）。
+    warn: (message) => ctx.logger?.warn?.(message),
     // 远端模型目录：GET /api/v1/models。
     // ⚠️ 必须用 **token 头**（业务端点），不是 Bearer —— 带错会得到
     // `100002 缺少 token`，表现为「模型列表永远停在兜底表」。
