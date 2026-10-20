@@ -27,6 +27,7 @@ import { LOOMY } from '../../src/loomy-product.js'
 import { TRAE } from '../../src/trae-product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
 import { OFFICEACE } from '../../src/officeace-product.js'
+import { QODER, QODER_CN } from '../../src/qoder-product.js'
 
 /**
  * 积分能力矩阵的回归测试。
@@ -688,10 +689,22 @@ describe('永久积分锁定能力', () => {
    * 归一化到 `deductionEndTime` 后即可用同一个 `splitBuddyCreditsByExpiry` 分桶。
    * ⚠️ 2026-10-12 新增 OfficeAce（华为 MaaS）：creditGroups 自带 expiresAt
    *（订阅套餐包无固定到期 = 永久桶，签到 / 活动包有明确到期），同款判据可分桶。
+   *
+   * ⚠️ 2026-10-20 新增 Qoder 国际版 / 中国版（用户要求补齐三档分档 + 永久锁）：
+   *   `/sash/api/v2/me/usage` 的 `usage.expiresAt` 在个人版下发的恒是**永久哨兵**
+   *   `253402214400000`（`9999-12-31`）—— `qoder-credits.ts` 判定为哨兵时
+   *   **不写** `deductionEndTime`（未知到期 ⇒ 落永久桶），真实时间戳才写。
+   *   ⚠️ 判据是「不写」而非「写一个远期时刻」：后者会让面板渲染出
+   *   `9999-12-31（约 2900000 天后）` 这种荒谬文案（见
+   *   `tests/unit/qoder-lock-wiring.spec.ts` 的 `packageExpiryMs` 断言）。
+   *   ⚠️ **同样必须各占一项**（共用一个 `QoderAuth` 不等于共用一个 id）。
    */
-  const SUPPORTED = [LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id]
+  const SUPPORTED = [
+    LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id,
+    QODER.id, QODER_CN.id,
+  ]
   const UNSUPPORTED = [
-    'codearts', 'qoder', 'qodercn', 'cline', 'raccoon',
+    'codearts', 'cline', 'raccoon',
   ]
 
   it('前后端的支持面完全一致（逐个 provider 对账）', () => {

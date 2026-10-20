@@ -145,20 +145,35 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(Object.isFrozen(PROVIDER_REGISTRY), 'registry 数组应冻结').toBe(true)
   })
 
-  it('permanentLock 恰好是既有的 6 家（officeace 2026-10-12 加入）', () => {
+  it('permanentLock 恰好是既有的 8 家（officeace 2026-10-12、qoder/qodercn 2026-10-20 加入）', () => {
     const locked = PROVIDER_REGISTRY.filter((d) => d.permanentLock === true)
       .map((d) => d.id).sort()
-    expect(locked).toEqual(['buddy', 'lobsterai', 'loomy', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ qoder / qodercn 2026-10-20 加入（用户要求补齐三档分档 + 永久锁）。判据见
+    //    `qoder-credits.ts` 的 `QODER_PERMANENT_EXPIRY_MS`：个人版下发的
+    //    `usage.expiresAt` 恒是**永久哨兵** `253402214400000`（`9999-12-31`）——
+    //    不写 `deductionEndTime` ⇒ 落永久桶 ⇒ 「锁住就不作废」的语义**成立**
+    //    （不是拿哨兵当真实到期时刻）。同日接上同一个 `kind: 'buddy'` 选号。
+    //    ⚠️ **两站必须各占一项**（共用一个 `QoderAuth` 不等于共用一个 id）。
+    expect(locked).toEqual([
+      'buddy', 'lobsterai', 'loomy', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
+    ])
   })
 
-  it('usesExpiryWindow 恰好是 7 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17 加入）', () => {
+  it('usesExpiryWindow 恰好是 9 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17、qoder/qodercn 2026-10-20 加入）', () => {
     const win = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
     // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`，未过期批次
     //    之和 == total_balance（守恒实测）⇒ 批次包带 `deductionEndTime` 可分三档。
     // ⚠️ 2026-10-20 加 autoclawintl：与 autoclaw **同源**（同一份 credits 实现），
     //    实测国际站批次同样带 `deductionEndTime`（3000→10/21、10000→10/27）。
-    expect(win).toEqual(['autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ qoder / qodercn 2026-10-20 加入（**本项的第 7 次复发**，成因同上）：
+    //    `usage.expiresAt` 是永久哨兵时**不写** `deductionEndTime` ⇒ 该包落永久
+    //    桶 ⇒ 面板能分「长期 / 临期」、锁定能真拦住。⚠️ 与 codearts 不同（那家
+    //    不开 `permanentLock`），**本家同时开**（它有「永不作废」的套餐池）。
+    expect(win).toEqual([
+      'autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace',
+      'qoder', 'qodercn', 'trae', 'workbuddy',
+    ])
   })
 
   it('rateLimit === false 恰好是 7 家（astudio 2026-10-18 加入；accio 2026-10-18 退出）', () => {

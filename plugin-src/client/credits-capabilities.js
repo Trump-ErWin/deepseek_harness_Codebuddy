@@ -235,8 +235,19 @@ export function supportsPermanentLock(provider) {
  *   若不加这道门控，loomy 卡片上会出现「每日赠送 4992 / 4992 永久」——而那笔恰恰**当天就作废**，说反了。
  * - `trae` 的有效期为 **31 天**（从起始日期算起）。服务端不返回独立的到期字段，
  *   但规则明确 ⇒ 可以挂（后端已按"起始日期 + 31 天"计算 deductionEndTime）。
- * - `qoder` / `qodercn`：套餐额度/资源包没有独立到期（统一"领取后 30 天"），但专用资源包有
- *   `expiresAt` 字段 ⇒ 可挂（有到期信息的包显示日期，没有的显示"永久"）。
+ * - `qoder` / `qodercn`：**须分两层看**（2026-10-20 真机取证后订正，见下）。
+ *   `qoderUsage.expiresAt` 这个字段**确实存在**（在 `userQuota` 那一层），但个人版
+ *   实测下发的恒是 **永久哨兵** `253402214400000`（= `9999-12-31`）⇒ 它不携带信息，
+ *   后端已刻意不据此写 `deductionEndTime`（否则卡片会渲染成
+ *   「9999-12-31（约 2900000 天后）」）。`addOnQuota` 只给聚合标量（`total/used/remaining`
+ *   + 一个指网页端的 `detailUrl`），上游不逐包下发日期。只有 `dedicatedResourcePackages[]`
+ *   带真实的 `expiresAt` ⇒ 可挂（有到期信息的包显示日期，没有的显示"长期"）。
+ *
+ *   ⚠️ 因此**不要**把这条读成"Qoder 没有任何到期字段" —— 早先的注释就是这么写的，
+ *   已失实（它漏掉了 `userQuota` 那层的 `expiresAt`，也漏掉了"有字段但是哨兵"这个
+ *   第三种形态）。逐包到期明细端点只对**浏览器登录态**开放（`qoder.cn/api/v1/me/...`
+ *   返回 401），插件的 OAuth token 取不到 ⇒ 三档分档里 Qoder 的临期桶在
+ *   无 `dedicatedResourcePackages` 时恒为 0。
  * - LobsterAI：有 `expiresAt` 字段（ISO 日期字符串），已明确过期判据。
  *
  * ⚠️ 2026-10-08 起**从 `src/provider-registry.ts` 的 `creditPackages` 字段派生**，

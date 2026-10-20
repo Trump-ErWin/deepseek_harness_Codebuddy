@@ -66,6 +66,13 @@ import { fetchAccioBalanceDetailed } from './accio-credits.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
 import { fetchSubscriptionSummary } from './officeace-auth.js'
 import { officeaceBreakerOpen } from './officeace-credential-health.js'
+// ⚠️ Qoder（中国版 / 国际版）：与 **buddy 系同形**（`CreditPackage` 都带
+//    `deductionEndTime`）⇒ 本原语直接复用 `sharedPackageExpiry`，不另写判据
+//    （2026-10-20 新增）。用 `QoderProduct` 而不是 `typeof QODER`，因为本原语
+//    **两站共用**、`product` 由调用方传入。
+import { fetchQoderCreditBalance } from './qoder-credits.js'
+import type { QoderProduct } from './qoder-product.js'
+import type { QoderCredential } from './qoder.js'
 import { runtimeOf, type ProviderExpiryContext } from './provider-runtime.js'
 
 /**
@@ -219,6 +226,30 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   //    （⚠️ 那里必须传 `AUTOCLAW_INTL`，否则会用国内基址查国际账号余额）
   //    + 折算原语（`autoclawExpiry` 本身产品无关，无需改）。
   'autoclawintl',
+  // ⚠️ **Qoder**（中国版 / 国际版，2026-10-20，用户要求补齐三档分档 + 永久锁）。
+  //    折算原语见 `qoderExpiry`（两站共用，只换 product）。
+  //
+  //    取证（2026-10-20，两个真实 qodercn 账号，`/sash/api/v2/me/usage`）：
+  //    - `userQuota` 只有顶层 `expiresAt`，且恒为**永久哨兵**（见下）；
+  //    - `addOnQuota` **无任何日期字段，只给聚合标量**；
+  //    - `dedicatedResourcePackages` 是**唯一**带真实逐包 `expiresAt` 的字段，
+  //      但本机账号为 `undefined`。
+  //
+  //    - 顶层 `qoderUsage.expiresAt = 253402214400000`（`9999-12-31T00:00:00Z`），
+  //      是 Qoder 给 `userQuota` 下发的**永久哨兵**、**不是**到期时刻。
+  //    - 实际后果：`qoder-credits.ts` 对哨兵**不写** `deductionEndTime`
+  //      （写进去会让客户端渲染出「9999-12-31（约 2900000 天后）」荒谬文案）
+  //      ⇒ 有余额 ⇒ `NEVER`（长期，排最后但可当选）。
+  //    - ⚠️ 国际站 `openapi.qoder.sh` 本机**网络不可达**（`fetch failed` ~10.7s），
+  //      ⇒ 对「取不到」保守：`fetchQoderCreditBalance` 返回 `null` ⇒ `UNUSABLE`。
+  //
+  //    ⚠️⚠️ **这是该陷阱的第 7 次复发**（cline → accio → officeace → autoclaw
+  //    → astudio → minimax → qoder），症状恒定**静默**：**决定候选表可见性的
+  //    是本表**，只改 `aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS` 等于没接 ——
+  //    折算恒 `UNUSABLE`，用户在聚合轮换列表里**永远看不到 qoder / qodercn**。
+  //    ⚠️ 两家**各占一行**：本表按 provider id，漏 `qodercn` 会让中国版单独被剔。
+  'qoder',
+  'qodercn',
 ])
 
 /**
@@ -1020,6 +1051,70 @@ export async function autoclawExpiry(
       //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
       return result.balance
     },
+  ))
+}
+
+/**
+ * **Qoder**（`qoder` 国际版 / `qodercn` 中国版，**共用**本原语，只换 product）：
+ * 与 **buddy 系同形**（`CreditPackage` 都带 `deductionEndTime`）⇒ 判据直接复用
+ * `sharedPackageExpiry`，**不另写解析逻辑**（两站共用同一个原语，避免同族分叉）。
+ *
+ * ## ⚠️⚠️ **本家与其它「已接入」渠道的本质不同：上游不给逐包到期时刻**
+ *
+ * 2026-10-20 取证（两个真实 qodercn 账号，`GET /sash/api/v2/me/usage`）：
+ *
+ * | 字段 | 实测 | 是否带日期 |
+ * |---|---|---|
+ * | `userQuota`（套餐额度） | `{total:0,used:0,remaining:0}` | 只有顶层 `expiresAt`，且恒为**永久哨兵** |
+ * | `addOnQuota`（资源包） | `{total:2000,…remaining:2000,detailUrl:…}` | **无任何日期字段，只给聚合标量** |
+ * | `dedicatedResourcePackages` | `undefined`（本机账号） | **唯一**带真实逐包 `expiresAt`（字符串）的字段 |
+ *
+ * 顶层 `qoderUsage.expiresAt = 253402214400000`（`9999-12-31T00:00:00Z`）是
+ * Qoder 给 `userQuota` 下发的**永久哨兵**、**不是**到期时刻。权威旁证是官方
+ * 客户端 asar 的 `buildUsageItemGroups()`：`addOnQuota` 那一档**只渲染
+ * used/total/remaining、不给任何日期**；只有 `userQuota.expiresAt` 走
+ * `renewson`（「将于 {{date}} 刷新」= **订阅刷新**），
+ * `dedicatedResourcePackages` 才走 `expiresOn`（「有效期至 {{date}}」）。
+ *
+ * ⇒ `qoder-credits.ts` 的 `toPackage()` 用常量
+ * `QODER_PERMANENT_EXPIRY_MS` 识别哨兵并**不写** `deductionEndTime`
+ * （写进去会让客户端 `formatPackageExpiry` 渲染出
+ * `9999-12-31（约 2900000 天后）` 这种荒谬文案）。
+ *
+ * ## 折算结果（如实，不是打折）
+ *
+ * | 情形 | 折算值 | 依据 |
+ * |---|---|---|
+ * | 有余额但**无**逐包到期（本次实测的账号形态） | `NEVER`（长期：排最后但不剔除） | `sharedPackageExpiry` 的「有余额但无到期时间」那一档 |
+ * | 有余额且有 `dedicatedResourcePackages` 的真实到期 | 该时刻（取最早那包） | 同上（`Math.min`） |
+ * | 一个 `remaining > 0` 的有效包都没有 | `UNUSABLE`（剔除） | 同上 |
+ * | 查询失败（含国际版不可达）/ 未登录 | `UNUSABLE` | 同上（`null` ⇒ 不猜） |
+ *
+ * ⚠️ **已知限制（必须如实标注）**：无 `dedicatedResourcePackages` 时
+ * **临期桶恒为 0** —— 三档分档只剩「永久（未知到期）」一档 + 上游聚合标量。
+ * 这**不是**缺陷，是「上游不下发 ⇒ 我们不编造」的必然结果（本仓库红线）。
+ * 逐包明细端点已穷举失败：`/sash/api/v2/me/*` → 404；
+ * `qoder.cn/api/v1/me/quotas/{key}/histories` →
+ * `/api/v1/me/usages/big_model_credits/histories` → qoder.cn 下 **401**
+ * （需浏览器登录态 cookie，插件 OAuth token 拿不到）、在 openapi 下 **404**。
+ *
+ * ## 为什么必须走 `cachedBalance`
+ *
+ * 聚合每轮折算会对同一账号反复提问；没有共享读数就会白发大量重复请求
+ * （与 buddy / trae / modelscope / autoclaw / astudio / minimax 同款理由）。
+ *
+ * ⚠️ **不加 XFF 需求**：与 minimax 国际站不同，Qoder 没有已知的地理分流，
+ * ⇒ **刻意不加** `minimaxXff` 那类透传参数（凭空多一个参数只会让人以为有分流）。
+ */
+export async function qoderExpiry(
+  credential: QoderCredential,
+  product: QoderProduct,
+  /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+  cached?: () => Promise<CreditBalance | null | undefined>,
+): Promise<number> {
+  return sharedPackageExpiry(() => fetchBalanceWithCache(
+    cached,
+    () => fetchQoderCreditBalance(credential, product),
   ))
 }
 

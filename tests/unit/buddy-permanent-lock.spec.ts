@@ -98,7 +98,13 @@ describe('index.ts 的接线（源码级，仅守纯文本形态的约定）', (
     expect(indexCode).toMatch(/const workbuddyBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: WORKBUDDY,/)
     expect(indexCode).toMatch(/const traeBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: TRAE,/)
     expect(indexCode).toMatch(/const lobsteraiBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: LOBSTERAI,/)
-    expect(indexCode.match(/new BuddyBalanceSelector\(/g)).toHaveLength(4)
+    // ⚠️ QODER / QODER_CN 2026-10-20 加入：`fetchQoderCreditBalance(credential,
+    //    product, fetcher?)` 的 `product` 是**第二**参（minimax 那份是第三参），
+    //    且两站域名不同（`openapi.qoder.sh` / `openapi.qoder.com.cn`）⇒
+    //    同样必须各建一个选号器（传错会让选号读到对方站点）。
+    expect(indexCode).toMatch(/const qoderBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: QODER,/)
+    expect(indexCode).toMatch(/const qoderCnBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: QODER_CN,/)
+    expect(indexCode.match(/new BuddyBalanceSelector\(/g)).toHaveLength(6)
   })
 
   it('凭据解析函数两站共用一份（同协议，差别只在 endpoint）', () => {
