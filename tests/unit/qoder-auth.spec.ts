@@ -366,6 +366,29 @@ describe('QoderAuth.fetchModels（远端模型目录）', () => {
     expect(String(warn.mock.calls[0]?.[0])).toContain('Login expired')
   })
 
+  it('⚠️ 池**读失败**（reject）⇒ 返回空数组、不抛穿（失败不升级成 provider 报错）', async () => {
+    // 对抗审计实测：删掉那一行 `.catch(() => null)` 时 111 条用例**全绿** ⇒
+    // 「池读 reject 不炸」这条腿当时零守卫；且原实现的 `await` 在 `try` **之外**，
+    // rejection 会直接抛穿 fetchModels，绕开「失败即回退兜底表」的契约。
+    const { ctx } = makeCtx([['QODER_ACCESS_TOKEN', credWithUid]])
+    const warn = vi.fn()
+    ;(ctx as unknown as { logger: unknown }).logger = { warn, info: vi.fn(), error: vi.fn() }
+    const fetcher = vi.fn(async () => okResponse()) as unknown as typeof fetch
+    const auth = newService(ctx, fetcher)
+    const brokenPool = {
+      getAvailableAccount: vi.fn(async () => { throw new Error('pool store corrupted') }),
+      updateAccount: vi.fn(),
+      listAccounts: vi.fn(async () => []),
+    } as never
+    // 池坏了但**默认 ref 有凭据** ⇒ 仍应正常出目录（这是"池读失败不致命"的正解）。
+    const models = await auth.fetchModels(brokenPool)
+    expect(models.map((m) => m.id)).toEqual(['dfmodel', 'mmodel'])
+    // 池坏 + 连默认 ref 也没有 ⇒ 返回 []（而不是把 rejection 抛给调用方）。
+    const { ctx: ctx2 } = makeCtx()
+    const auth2 = newService(ctx2, fetcher)
+    await expect(auth2.fetchModels(brokenPool)).resolves.toEqual([])
+  })
+
   it('⚠️ 凭据缺 uid 时**不发请求**（签名必然无效），返回空数组并留痕', async () => {
     const { ctx } = makeCtx([['QODER_ACCESS_TOKEN', credJson]])
     const warn = vi.fn()

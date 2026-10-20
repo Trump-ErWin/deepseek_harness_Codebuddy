@@ -369,3 +369,85 @@ u = { key, …, is_reasoning: s, … }      // → modelConfig.is_reasoning
 - 本机 `~/.qoder{,-cn}/.models/{uid}/catalog-v6` 能离线解出同一份数据
   （只需 uid，`model_cache_decrypt`），但**只对该账号在本机 IDE 打开过时存在**
   ⇒ 纯插件用户恒为空；线上路径不用它，只用于排查对账。
+
+## ⚠️⚠️ 审计补记：一轮 subagent 审计 + 对抗审计（2026-10-20，接入远端目录之后）
+
+用户要求「对这个提交的修改用 subagent 驱动的方式启动一轮审计和对抗性审计」。
+派了**两个独立沙箱**（`git worktree add --detach … 8b41403`，`node_modules` 用目录联接，
+`pnpm build` 在 worktree 里会因联接失败 ⇒ 改用 `npx tsc -p tsconfig.json` +
+`copy-assets` + 客户端 `build.mjs` 补 `lib/`）。主工作区**三次指纹比对零改动**。
+
+### 真缺陷 1 ★★：能力/元数据判据的**取值域**从「编译期超集」变成「按账号变化的子集」
+
+`inputModalitiesFor()` 与 `stream()` 的模型元数据改查「当前目录」后，而 Qoder 的目录是
+**按账号**下发的（实测：一个免费额度号上游只给 2 条）⇒ 目录里没有的模型被当成「未知」：
+
+| 场景 | 只查远端（缺陷态） | 取并集（现行） |
+|---|---|---|
+| `dmodel` + 远端大目录 | ✅ | ✅ 远端优先 |
+| `dmodel` + 远端只剩 2 条 | ❌ **硬拒图片** `UNSUPPORTED_CONTENT`；`name` 退化成裸 id、`context`/`reasoning` 消失、请求体 `display_name`/`max_input_tokens`/`is_reasoning` 一并退化 | ✅ 回退静态表 |
+| `fast`（只在远端有） | ✅ | ✅ 远端命中 |
+
+**修法**：`catalogModel()` = 远端 ∪ 静态表（**能力/元数据**判据取并集）；
+**菜单（`listModels`）仍远端独占**（不能把账号用不了的模型摆出来）。
+`resolveModel` 与 `listModels` 共用 `loadCatalog()`，故用「静态表专用的第二个
+`ModelCatalog` 实例」做回退，复用骨架自己的装配逻辑（原来想在适配器里重写，
+那会是同一语义的第二套判据）。
+
+⚠️ 我复现时的读数（`resolveModel('dmodel')`）：无远端 → `name="DeepSeek-V4-Pro"
+modalities=["text","image"] context={"contextWindow":1000000}`；远端只有 `fast` →
+`name="dmodel" modalities=["text"] context=null reasoning=null` + `stream()` 硬拒。
+
+### 真缺陷 2：`isFree` 端到端未通（Jet Hub「免费额度」分组拿不到）
+
+`plugin-src/client/model-groups.js` 的免费桶**只认** `model.isFree === true`，
+`src/cline-adapter.ts` 的成文约定也是「`isFree` 必须透出」；解析层已产出它，
+但 `toCatalogEntry()` **从不写**这个键（改造前也如此 ⇒ 不是本提交引入的回归，
+但提交信息「免费标记跟随上游」说过了头）。已补一行透出 + 用例。
+
+### 对抗审计：六条**假绿**（我逐条独立复现）
+
+| 变异 | 变异后读数 | 缺口 |
+|---|---|---|
+| `refresh()` 空转（成员在、什么都不做） | `model-catalog-parity` **49 passed** | 该守则只判 `typeof === 'function'` ⇒ 抓不到「转发但空转」，而它引用的 `be42b25` 缺陷恰是空转。**已如实收窄其声明范围**（行为面由各家自己的 refresh 用例承担；该文件多数 CASE 不注入 `fetchRemoteModels`，通用化会真发网络） |
+| `supportsDisable = true` 恒真 | 4 spec **175 passed** | 无用例喂「无 `disabled`」的远端条目 ⇒ 已补（会给所有模型臆造「关闭思考」档位） |
+| `parseEfforts` 末尾 `sort()` | **175 passed** | 「不要排序」铁律无守卫；唯一可观察序的期望值恰是字典序 ⇒ 已补非字典序输入 |
+| `readString` 去掉非空 | **175 passed** | 空串 `key`/`display_name` 零覆盖（放过 ⇒ DSH `INVALID_CATALOG` ⇒ provider 整个消失）⇒ 已补 |
+| 删池读 `.catch(() => null)` | auth+adapter **111 passed** | 「池读 reject 不炸」零守卫；且 `await` 原在 `try` **之外**，reject 会抛穿 ⇒ 已把整段收进 `try` + 补用例 |
+| `fallbackModels` 置空 | 9 条 describe **9 passed** | 断言写成 `toBe(QODER.fallbackModels.length)` 是**同义反复**（`0 === 0`）⇒ 已改成 `>0` + **内容锚定**（`dmodel` 必须存在）。⚠️ 真正抓住「菜单变空」的是 parity 的 (j)（实测 `1 failed`），但那 3 条自己不承重 |
+
+### 解析口径对齐官方客户端（审计发现 + 我的独立发现）
+
+| 项 | 官方（本机产物取证） | 我们（修前 → 修后） |
+|---|---|---|
+| 档位白名单 | `k3 = ["none","low","medium","high","xhigh","max"]`（**6 个，无 `minimal`**） | 7 个（多 `minimal`）→ 对齐 6 个；中文名表保留 `minimal` 但注明「不在线上白名单」 |
+| `efforts` 形态 | `sgi()`：**数组 / 逗号或空格字符串 / 对象** 都认（并去重、过白名单） | 只认对象 → 三形态都认 |
+| `available_reasoning_effort` | `R3({thinking_config: 该字段})` ⇒ 它是**一个 thinking_config 对象** | 直接当档位表解析（恒空）→ 包一层；并按官方短路语义，**只在条目自身既无档位也无 `disabled` 时**才读它 |
+| 顶层 `default_effort` | `c = ci(e.default_effort ?? e.defaultEffort)`，作默认档兜底 | 未读 → 已读 |
+| `is_default` | `vhc()`：**蛇形与驼峰都认** | 只认蛇形 → 都认 |
+| `supports_disabled` | `l = a?.supportsDisabled \|\| e.supports_disabled \|\| e.supportsDisabled` | 只看 `thinking_config.disabled` → 补顶层两条腿 |
+
+### 本轮**未修**（已登记，等真机/用户决策）
+
+- **R4 折扣展示口径**：官方 `yo0()` 是「当前价恒取 `price_factor`；划线原价 =
+  `promotion.active ? beforePromotionPriceFactor ?? originalPriceFactor : originalPriceFactor`」，
+  **从不做 `before×discount` 乘法**。我们的 `qoderDisplayName()` 用**本地时钟推窗口 + 乘法**
+  （既有代码，非本提交引入）。改动会改用户可见文案 ⇒ 待拍板。
+- **R5**：`refresh()` 先清 `catalogAt=0` 再拉，失败后停在 0 ⇒ 冷却（30 s）一过就重打上游
+  （同形态 accio/trae 也有）。
+- **R6**：`decrypt_server_response` 的**真加密**分支零覆盖（两站实测都回明文）；
+  上游真加密时会 `JSON.parse(密文)` 抛错 ⇒ 静默回退兜底表（只留一条 warn）。
+- **R7**：黑名单按 id 写、不随目录收缩而收缩 ⇒ 大目录下点过「关闭全部」后切到
+  2 条目录的免费号，`listModels` = 2 − 黑名单 = `[]` ⇒ **DSH 隐藏整个 provider**
+  （设置页走 `listAllModels()` 仍可逐条恢复）。端到端复现需真实多账号池，**未实测**。
+
+### 三条过程教训（比结论更值钱）
+
+1. **「守卫有牙」与「取值域正确」是两件事**：提交前我做过 4 处变异验证（都变红），
+   但**没有一处**问「我把谁的取值域换掉了」⇒ 缺陷 1 就是从这个缝里漏出去的。
+2. **新写的守卫自己可能是假绿**：我给缺陷 1 写的图片回归用例**直接 `stream()`**，
+   没有先把远端目录读进缓存 ⇒ `catalogSource()` 还是静态表 ⇒ 变异打不中它
+   （变异验证实测：`92 passed`）。**先加载再断言**才是真判据。
+3. **变异脚本的锚点必须先自证**：CRLF 上 `replace` 会静默不生效；本轮另有两条锚点
+   因「把 `await` 移进 `try` 后缩进变了」而失配 ⇒ 必须报 `PATCH-NOT-APPLIED`
+   而不是当成「无牙」。
