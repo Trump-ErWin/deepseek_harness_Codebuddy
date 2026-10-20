@@ -1006,6 +1006,13 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   // 漏加 = `ASTUDIO_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
   ['ASTUDIO', 'astudio'],
+  // ⚠️ 第 19 个 provider（autoclawintl，2026-10-20）—— 同款坑第 **七** 次。
+  // 漏加 = `AUTOCLAWINTL_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
+  // ⚠️ 与 `AUTOCLAW` 是**超串关系**（`AUTOCLAWINTL` 以 `AUTOCLAW` 开头）——
+  //    顺序由 `ACCOUNT_REF_RE` 内部的**长度降序排序**保证，与本数组书写顺序无关
+  //    （与 `MINIMAX` / `MINIMAXINTL` 同型）。
+  ['AUTOCLAWINTL', 'autoclawintl'],
 ]
 
 /** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */

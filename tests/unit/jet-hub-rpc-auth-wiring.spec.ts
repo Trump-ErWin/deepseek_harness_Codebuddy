@@ -80,6 +80,12 @@ const AUTH_SERVICE: Readonly<Record<string, string>> = {
   astudio: 'astudioAuth',
   // ⚠️ AutoClaw（智谱）同款：服务名 = `${product.id}Auth` ⇒ **`autoclawAuth`**（全小写）。
   autoclaw: 'autoclawAuth',
+  // ⚠️ AutoClaw 国际版（2026-10-20）：服务名同理由派生 ⇒ **`autoclawintlAuth`**
+  //    （`AutoclawAuth` 构造：`super(ctx, options.serviceName ?? `${product.id}Auth`)`，
+  //    国际实例的 `product.id` 是 `autoclawintl`）。
+  //    ⚠️ 它必须是**独立实例的服务名** —— 若误写成 `autoclawAuth`，
+  //    按 id 查表会把国际账号分派到国内实例（续期打错基址）。
+  autoclawintl: 'autoclawintlAuth',
   // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。服务名同理由派生 ⇒ `modelscopeAuth`。
   //    该名字由 `provider-runtime-wiring.spec.ts` 的真跑 `apply()` 探针独立验证过。
   modelscope: 'modelscopeAuth',
@@ -288,7 +294,8 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     // ⚠️ 2026-10-16 astudio 并入（goal 302 接线）：16 → 17。
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：17 → 18；
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19。
-    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(19)
+    // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
+    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(20)
     // 另一方向（原断言的**全部**证明力都在这条上，单独留着免得它随上面那条一起消失）：
     // 表里的每个键都必须是 registry 里真实存在的 provider id（防拼写错误造成的僵尸项）。
     for (const id of Object.keys(AUTH_SERVICE)) {

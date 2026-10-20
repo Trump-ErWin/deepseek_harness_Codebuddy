@@ -263,10 +263,67 @@ export const AUTOCLAW_APP_KEY = '38d2391985e2369a5fb8227d8e6cd5e5'
 export const AUTOCLAW_SOURCE_ID = 'autoclaw'
 export const AUTOCLAW_PRODUCT_NAME = 'autoclaw'
 
+/**
+ * AutoClaw 客户端版本号（`X-Version` 头用）。
+ *
+ * ⚠️️ **推理请求必须带它**（2026-10-20 真机二分实测）。
+ *
+ * 国际站网关对 `X-Version` 是**硬校验**：
+ * - 不带 → `HTTP 500 Internal Server Error`，**响应体为空**（无任何原因文案）；
+ * - 带上 → `HTTP 200`。
+ *
+ * 二分定位（同一 body、只逐个加 header）：其余 9 个客户端头
+ * （`X-Tm` / `X-Lang` / `X-Channel` / `User-Agent` / `X-Trace-Id` /
+ * `X-Request-Id` / `X-Client-Type` / `x_trace_id` / `X-Session-Id`）
+ * **单独加都不改变 500**，只有 `X-Version` 是关键项。
+ *
+ * ⚠️ 症状极具误导性：500 + 空响应体 ⇒ 既不像鉴权失败（那会 401/410000）、
+ *    也不像参数错误（那会 400/406），用户与日志都看不出是「缺一个版本号头」。
+ *
+ * 取值自国际版客户端 `AutoClaw2.exe` 的 `ProductVersion`（`2.1.1.262` 取前三段）。
+ */
+export const AUTOCLAW_CLIENT_VERSION = '2.1.1'
+
 export const AUTOCLAW_DEFAULT_CREDENTIAL_REF = 'AUTOCLAW_ACCOUNT_DEFAULT'
 
+/**
+ * 国际版（`autoclawintl`）的 API 基址 —— 从官方国际版客户端
+ * `AutoClaw2\resources\app\dist\main.cjs` 的
+ * `HTTP_ORIGIN_BY_ENVIRONMENT.overseas_release` 逐字节抄出（2026-10-20）。
+ *
+ * ⚠️ 该客户端的运行日志实测确认它在用这个主机：
+ *    `{"redactedUrl":"https://autoglm-api.autoglm.ai","host":"autoglm-api.autoglm.ai","status":200}`
+ */
+export const AUTOCLAW_INTL_API_BASE = 'https://autoglm-api.autoglm.ai'
+export const AUTOCLAW_INTL_DEFAULT_CREDENTIAL_REF = 'AUTOCLAWINTL_ACCOUNT_DEFAULT'
+
+/**
+ * AutoClaw 产品配置（国内 / 国际**两个实例**同一套协议实现）。
+ *
+ * ## ⚠️⚠️ 为什么是**两个 provider** 而不是「一个 provider 加站点参数」
+ *
+ * 与 `minimaxintl`（`src/minimax-product.ts` 文件头）同一条判据，三条全中：
+ *
+ * | 判据 | 国内 | 国际 | 是否分裂 |
+ * |---|---|---|---|
+ * | 账号体系 | 手机号 / `7c54a9ac…`（UUID 主键） | 邮箱 / `2c99dc99…` | **不互通** |
+ * | API 主机 | `autoglm-acceleration-api.zhipuai.cn` | `autoglm-api.autoglm.ai` | 不同 |
+ * | 登录方式 | 短信验证码（`agent-send-code` + `agent-login`） | **Z.ai OAuth** | 不同 |
+ *
+ * 实测佐证（2026-10-20）：拿国内签发的 token 打国际基址，三个端点全部拒绝
+ * （`wallets` / `user-profile` → `410000 用户未登录`；推理 → `401 Invalid token`）
+ * ⇒ **用户体系物理隔离**，不可能靠一个站点参数切换。
+ *
+ * ## 与 `zcode` 的差别（为什么它不拆）
+ *
+ * zcode 的国内（`bigmodel`）/ 国际（`zai`）是**同一套 OAuth 流程**，只是换域名，
+ * 凭据里按渠道存 `bigmodel_access_token` / `zai_access_token` 两个字段。
+ * 那边的「渠道」由 OAuth 提供方在**同一个账号体系内**区分，故一个 provider 足够。
+ * autoclaw 这边连**登录协议都不同**，合并只会让两边逻辑互相污染。
+ */
 export interface AutoclawProduct {
-  readonly id: 'autoclaw'
+  /** provider id。国内 `autoclaw`、国际 `autoclawintl`（全小写、无连字符）。 */
+  readonly id: 'autoclaw' | 'autoclawintl'
   readonly displayName: string
   readonly apiBase: string
   readonly appId: string
@@ -284,5 +341,30 @@ export const AUTOCLAW: AutoclawProduct = {
   appKey: AUTOCLAW_APP_KEY,
   product: AUTOCLAW_PRODUCT_NAME,
   defaultCredentialRef: AUTOCLAW_DEFAULT_CREDENTIAL_REF,
+  fallbackModels: AUTOCLAW_FALLBACK_MODELS,
+}
+
+/**
+ * 国际版实例 —— **只差三个字段**（id / 显示名 / 基址 / 凭据 ref），
+ * `appId` / `appKey` / `product` / 模型表与国内**逐字节相同**（实测两站通用）。
+ *
+ * ⚠️ `appId: '100003'` 与 `appKey` 在国际站同样被接受：
+ *    用它们给 `autoglm-api.autoglm.ai` 签名后，`oauth-captcha-config` 返回
+ *    `code=0 SUCCESS`（与国内站同码），说明签名中间件认同一对凭据。
+ *
+ * ⚠️ **登录方式尚未接入**：国内走短信（`AutoclawAuth.loginWithCode`），
+ *    国际走 **Z.ai OAuth**（浏览器授权 + `POST /userapi/overseasv1/zai-oauth-login`）。
+ *    OAuth 的 `client_id`（`client_EnD0QI8bLRFT8cciLp389Q`）与
+ *    `state.dh = SHA256(deviceId)` 已逆向确认，`state.nh` 来源未知 ——
+ *    在打通之前，本 provider **只能通过手工注入 token 使用**。
+ */
+export const AUTOCLAW_INTL: AutoclawProduct = {
+  id: 'autoclawintl',
+  displayName: 'AutoClaw (国际版)',
+  apiBase: AUTOCLAW_INTL_API_BASE,
+  appId: AUTOCLAW_APP_ID,
+  appKey: AUTOCLAW_APP_KEY,
+  product: AUTOCLAW_PRODUCT_NAME,
+  defaultCredentialRef: AUTOCLAW_INTL_DEFAULT_CREDENTIAL_REF,
   fallbackModels: AUTOCLAW_FALLBACK_MODELS,
 }

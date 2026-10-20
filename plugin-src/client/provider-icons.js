@@ -295,6 +295,10 @@ export const PROVIDER_ICONS = {
   accio: ACCIO_ICON,
   astudio: ASTUDIO_ICON,
   autoclaw: AUTOCLAW_ICON,
+  // ⚠️ 国际版与国内版**共用同一个图标**（同一产品，只是部署区域不同）。
+  //    但键必须存在：`PROVIDER_ICONS` 的键集合与 registry 的 id 集合必须完全相等
+  //    （`provider-registry.spec.ts` 有行为断言）。
+  autoclawintl: AUTOCLAW_ICON,
   modelscope: MODELSCOPE_ICON,
   aggregate: AGGREGATE_ICON,
 };
