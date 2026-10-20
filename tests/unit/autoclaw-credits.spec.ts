@@ -747,6 +747,69 @@ describe('★ PR115 审计守卫：审计发现的七处缺陷逐条钉死', () 
     expect(split!.expiring, '客户端侧合计必须与批次和一致').toBe(1000)
   })
 
+  // ── 2026-10-20 净额口径：debit / expire 必须参与扣减 ───────────────
+  //
+  // ⚠️⚠️ 用户报障「积分全显示成永久」的根因：原实现只累加 `credit`
+  //    ⇒ 批次和恒 = **历史发放额**，用户一有消耗就不守恒
+  //    ⇒ `fetchAutoclawBalanceDetailed` 的守恒校验恒不成立
+  //    ⇒ 永远回退钱包包 ⇒ **逐批次分档（临期红 + 倒计时）永不出现**。
+  //    实测 `debit` 条目同样携带 `wallet_expires_at`，可精确归入批次。
+  it('★ debit（消耗）按 wallet_expires_at 精确扣减所属批次', () => {
+    const batches = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 1000, wallet_expires_at: SOON_SEC, description: '签到' },
+        { mutation_type: 'debit', amount: -300, wallet_expires_at: SOON_SEC, description: '模型消耗' },
+      ],
+      NOW_MS,
+    )
+    expect(batches).toHaveLength(1)
+    expect(batches[0]!.remaining, '★ 不扣消耗 ⇒ 批次和永远是历史发放额，分档永不出现').toBe(700)
+    expect(batches[0]!.deductionEndTime).toBe(SOON_SEC * 1000)
+  })
+
+  it('★ expire（过期）同样按批次扣减', () => {
+    const batches = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 1000, wallet_expires_at: SOON_SEC, description: '签到' },
+        { mutation_type: 'expire', amount: -400, wallet_expires_at: SOON_SEC, description: '过期回收' },
+      ],
+      NOW_MS,
+    )
+    expect(batches[0]!.remaining).toBe(600)
+  })
+
+  it('★ 批次被消耗完（净额 ≤ 0）⇒ 整包丢弃，不产出死包', () => {
+    const batches = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 500, wallet_expires_at: SOON_SEC, description: '签到' },
+        { mutation_type: 'debit', amount: -500, wallet_expires_at: SOON_SEC, description: '用光' },
+      ],
+      NOW_MS,
+    )
+    // ⚠️ 客户端会静默 skip `remaining <= 0` ⇒ 留着它会让合计与总额脱钩。
+    expect(batches, '★ 净额 ≤ 0 的批次不得发出').toHaveLength(0)
+  })
+
+  it('★ 负数 debit 是消耗（要扣），负数 credit 是冲正（不扣）—— 两者语义相反', () => {
+    // ⚠️ 这条钉住精确的边界：不能一刀切丢掉所有负数。
+    const withDebit = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 1000, wallet_expires_at: SOON_SEC },
+        { mutation_type: 'debit', amount: -200, wallet_expires_at: SOON_SEC },
+      ],
+      NOW_MS,
+    )
+    const withNegativeCredit = parseAutoclawLedgerBatches(
+      [
+        { mutation_type: 'credit', amount: 1000, wallet_expires_at: SOON_SEC },
+        { mutation_type: 'credit', amount: -200, wallet_expires_at: SOON_SEC },
+      ],
+      NOW_MS,
+    )
+    expect(withDebit[0]!.remaining, 'debit 要扣').toBe(800)
+    expect(withNegativeCredit[0]!.remaining, '负 credit 是冲正，不扣').toBe(1000)
+  })
+
   // ── P2：metadata.description 为空串 ───────────────────────────────
   it('P2-d metadata.description 为空串时回退到顶层 description（不是通用兜底名）', () => {
     // `??` 不落空串 ⇒ 原实现会把 name 打成「积分发放」，白白丢掉真实描述。
@@ -828,6 +891,85 @@ describe('★ PR115 审计守卫：审计发现的七处缺陷逐条钉死', () 
       fetcher.mock.calls.some((c) => String(c[0]).includes(AUTOCLAW_LEDGERS_PATH)),
       '零余额时不该发流水请求',
     ).toBe(false)
+  })
+
+  // ── ★ 2026-10-20 审计补：净额口径的「取数腿」与「判据腿」 ──────────────
+  //
+  // ⚠️ 原 43 条用例**全部直接喂 entries**（绕过了取数），于是：
+  //    · `flow_direction: 'all'` 改回 `'income'`（= 修前形态）⇒ 43 全绿；
+  //    · 容差改回 `batchSum === total`（= 要修的 bug 本身）⇒ 43 全绿。
+  //    净额解析器有牙，但「取数」与「守恒判据」这两条腿**零覆盖**
+  //    ⇒ 零件有牙、总成无牙。
+
+  it('★ 流水请求必须带 flow_direction=all（否则 debit/expire 根本取不回来）', async () => {
+    const urls: string[] = []
+    const fetcher = vi.fn((url: string | URL) => {
+      const u = String(url)
+      urls.push(u)
+      if (u.includes(AUTOCLAW_LEDGERS_PATH)) return jsonResponse({ code: 0, data: { entries: [] } })
+      return jsonResponse(walletsOf(100))
+    })
+    await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, { fetcher: fetcher as unknown as typeof fetch })
+
+    const ledgerUrl = urls.find((u) => u.includes(AUTOCLAW_LEDGERS_PATH))
+    expect(ledgerUrl, '★ 必须真发过流水请求').toBeDefined()
+    const query = new URL(ledgerUrl!).searchParams
+    expect(
+      query.get('flow_direction'),
+      '★ 必须是 all —— 改回 income 就拿不到 debit/expire ⇒ 批次和恒等于历史发放额 ⇒ 分档永不出现',
+    ).toBe('all')
+  })
+
+  it('★ 守恒容差：差 14 / 20842（0.07%）必须**采用**批次包（原严格相等会回退）', async () => {
+    // 这正是 PR 实测的那组数：批次和 20856 vs 钱包 20842，差 14。
+    // ⚠️ 现有守恒夹具都是**精确相等**（20200 == 20200）⇒ 容差被整条删掉也全绿。
+    const SOON = NOW_SEC + 5 * 86400
+    const ledger = {
+      code: 0,
+      data: {
+        entries: [
+          { mutation_type: 'credit', amount: 20856, wallet_expires_at: SOON, description: '批次' },
+        ],
+      },
+    }
+    const fetcher = vi.fn((url: string | URL) =>
+      String(url).includes(AUTOCLAW_LEDGERS_PATH) ? jsonResponse(ledger) : jsonResponse(walletsOf(20842)))
+    const result = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, {
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+    expect(
+      result.balance!.packages.some((p) => p.deductionEndTime !== undefined),
+      '★ 差 0.07% 必须落在容差内 ⇒ 采用批次包（否则用户看到的「全是永久」原样复现）',
+    ).toBe(true)
+  })
+
+  it('★ 守恒容差的反向：偏差过大必须**回退**钱包包（不得放过真错数）', async () => {
+    // ⚠️ 反向夹具是必须的：只有「采用」那一条的话，把容差改成 `<= total*10`
+    //    也全绿 —— 那等于取消了安全网。
+    //
+    // ⚠️ 量级要选对：容差是 `max(100, total×1%)`，**100 的下限**在小额账户上
+    //    会占很大比例（审计实测：total=200 时容差 100 = 总额 50%）。
+    //    ⇒ 反向夹具必须让「差额 > max(100, 1%)」，用 10000 量级：
+    //    容差 = 100，差额 500（5%）⇒ 必然超。
+    const SOON = NOW_SEC + 5 * 86400
+    const ledger = {
+      code: 0,
+      data: {
+        entries: [
+          { mutation_type: 'credit', amount: 10500, wallet_expires_at: SOON, description: '批次' },
+        ],
+      },
+    }
+    const fetcher = vi.fn((url: string | URL) =>
+      String(url).includes(AUTOCLAW_LEDGERS_PATH) ? jsonResponse(ledger) : jsonResponse(walletsOf(10000)))
+    const result = await fetchAutoclawBalanceDetailed(MOCK_CREDENTIAL, {
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+    expect(
+      result.balance!.packages.every((p) => p.deductionEndTime === undefined),
+      '★ 差 500 > 容差 100 ⇒ 必须回退钱包包（宁可没有临期档，也不给错数）',
+    ).toBe(true)
+    expect(result.balance!.packages[0]!.remaining).toBe(10000)
   })
 })
 

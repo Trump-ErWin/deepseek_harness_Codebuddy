@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
+import { createHash } from 'node:crypto'
 import { registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
 import { startCatalogPrewarm } from './catalog-prewarm.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
@@ -105,8 +106,8 @@ import { RaccoonAdapter } from './raccoon-adapter.js'
 //    详见 `docs/agent-notes/providers-accio.md`。
 import { AutoclawAuth } from './autoclaw-auth.js'
 import { registerAutoclawLlm } from './autoclaw-adapter.js'
-import { AUTOCLAW } from './autoclaw-product.js'
-import type { AutoclawCredential } from './autoclaw.js'
+import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js'
+import { isAutoclawUuidUserId, type AutoclawCredential } from './autoclaw.js'
 import { AccioAuth } from './accio-auth.js'
 import { AccioAdapter, registerAccioLlm } from './accio-adapter.js'
 import { ACCIO } from './accio-product.js'
@@ -359,6 +360,145 @@ export function makeReadImageRequest(ctx: Context) {
       )
       return undefined
     }
+  }
+}
+
+/**
+ * **AutoClaw 存量账号自愈**：先补齐 `user_id`，再按它去重。
+ *
+ * ## 为什么要「先补齐」（两轮失败才换来这一步）
+ *
+ * 用户三次报障「同一账号被加了 3 次」。实测三条凭据的字段形态**不一致**：
+ *
+ * | ref | 凭据 `user_id` | JWT `user_id` | JWT `guid` |
+ * |---|---|---|---|
+ * | `A6539467` | —（无该字段） | `839684` | `""`（空串） |
+ * | `D6BF9EB2` | —（无该字段） | `839684` | `""`（空串） |
+ * | `A3C56DD6` | `7c54a9a…`（UUID） | `839684` | `""`（空串） |
+ *
+ * 即存在两个**互不相通**的 id 空间：
+ *
+ * - **UUID**（`7c54a9acc…`）= 账号主键，服务端 `user-profile` 与凭据字段都用它；
+ * - **`numericUserId`**（`839684`）= JWT 的 `user_id`，纯数字。
+ *
+ * 「字段优先、JWT 兜底」会让前两条落到 `839684`、第三条落到 UUID
+ * ⇒ **分裂成两组、一条都去不掉**（用户二次报障「怎么还是在啊」的直接原因）。
+ *
+ * ## 定稿做法
+ *
+ * 1. 逐条 ref 调 `POST /userapi/v1/user-profile`（实测三条都拿回同一个 UUID），
+ *    把 `user_id` **写回凭据**；
+ * 2. 补齐后全池统一按 `user_id` 分组去重（`dedupeByCredentialField`）。
+ *
+ * ⚠️ 全程**尽力而为**：单条补齐失败只跳过该条、记 warn，绝不让启动失败。
+ * ⚠️ 网络请求按 8s 超时，N 条串行最坏 N×8s —— 但它是 `void` 起的，
+ *    不阻塞插件启动，也不阻塞用户第一条消息。
+ */
+async function autoclawSelfHeal(
+  pool: AccountPool,
+  ctx: Context,
+): Promise<void> {
+  // ⚠️⚠️ **读池本身也会抛**（2026-10-20 合并审计补记，实测有牙）：
+  //    `AccountPool.listAccountsByProvider()` → `readAccounts()` → `ensureLoaded()`
+  //    → `SettingsStore.load()` 在 scope 尚未就绪时抛 `TypeError`。原先只有
+  //    **per-条目** 的 try 包住循环体，读池这一句在 try **之外** ⇒ 一抛就是
+  //    **未捕获 rejection**（Node 默认 `--unhandled-rejections=throw`），
+  //    全量单测实测 52 条 `Unhandled Rejection`。
+  //    自愈是**尽力而为**：任何失败都只能记 warn，绝不能让启动失败。
+  let entries: ReturnType<AccountPool['listAccountsByProvider']>
+  try {
+    entries = pool.listAccountsByProvider('autoclaw')
+  } catch (error) {
+    ctx.logger?.warn?.(
+      `[autoclaw] 账号自愈读池失败（不影响启动）：`
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
+    return
+  }
+  if (entries.length < 2) return
+
+  // ── ① 补齐 user_id（只补缺的那条）──
+  for (const entry of entries) {
+    try {
+      const raw = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+      if (raw === undefined || raw.value.length === 0) continue
+      const cred = JSON.parse(raw.value) as {
+        access_token?: unknown
+        device_id?: unknown
+        user_id?: unknown
+      }
+      // ⚠️⚠️ **跳过条件必须是「已经是 UUID」，不能是「有值」**
+      //    （2026-10-20 审计 P1，实测真缺陷）。
+      //
+      //    登录路径用 `readUserIdFromJwt()` 写回的 `user_id` 是**字符串形态的
+      //    数字 id**（`String(839684)` ⇒ `"839684"`），原判据
+      //    `typeof === 'string' && trim() !== ''` 对它**恒真** ⇒ 自愈从不为
+      //    PR 之后新登录的账号补 UUID ⇒ 池里永久并存 `autoclaw:839684` 与
+      //    `autoclaw:7c54a9a…` 两组 ⇒ 去重对混合池无效（PR 要修的症状原样存在）。
+      //
+      //    ⇒ 只有「已经是 UUID 主键」才算补齐完成。
+      if (isAutoclawUuidUserId(cred.user_id)) continue
+
+      const token = typeof cred.access_token === 'string' ? cred.access_token : ''
+      const device = typeof cred.device_id === 'string' ? cred.device_id : ''
+      if (token === '' || device === '') continue
+
+      const ts = Math.floor(Date.now() / 1000).toString()
+      const sign = createHash('md5').update(`${AUTOCLAW.appId}&${ts}&${AUTOCLAW.appKey}`).digest('hex')
+      const resp = await fetch(`${AUTOCLAW.apiBase}/userapi/v1/user-profile`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Auth-Appid': AUTOCLAW.appId,
+          'X-Auth-TimeStamp': ts,
+          'X-Auth-Sign': sign,
+          'X-Lang': 'zh-CN',
+          'X-Channel': 'official',
+          'Authorization': `Bearer ${token}`,
+          'X-Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ source_id: 'autoclaw', device_id: device }),
+        signal: AbortSignal.timeout(8000),
+      })
+      if (!resp.ok) {
+        ctx.logger?.warn?.(
+          `[autoclaw] 账号 ${entry.id} 补齐 user_id 失败（HTTP ${resp.status}），跳过该条`,
+        )
+        continue
+      }
+      const json = (await resp.json()) as { code?: number; data?: { user_id?: unknown } }
+      const userId = json.data?.user_id
+      if (json.code !== 0 || typeof userId !== 'string' || userId.trim() === '') {
+        ctx.logger?.warn?.(
+          `[autoclaw] 账号 ${entry.id} 补齐 user_id 失败（code=${json.code}），跳过该条`,
+        )
+        continue
+      }
+      // ⚠️ 只改 `user_id` 一个键，其余凭据字段原样保留
+      //    （access_token/refresh_token/device_id 一个字节都不能动）。
+      await ctx.credentials.set(
+        credentialRef(entry.credentialRef),
+        JSON.stringify({ ...cred, user_id: userId.trim() }),
+      )
+      ctx.logger?.info?.(
+        `[autoclaw] 账号 ${entry.id} 已补齐 user_id（${userId.trim().slice(0, 8)}…）`,
+      )
+    } catch (error) {
+      ctx.logger?.warn?.(
+        `[autoclaw] 账号 ${entry.id} 自愈异常（不影响启动）：`
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
+  // ── ② 按补齐后的 user_id 去重 ──
+  // ⚠️ **不再给兜底解析器**：此时所有 ref 都应当有 UUID，
+  //    若有（网络全失败），跳过总比误删好。
+  const removed = await pool.dedupeByCredentialField('autoclaw', 'user_id')
+  if (removed > 0) {
+    ctx.logger?.warn?.(
+      `[autoclaw] 已清理 ${removed} 条重复账号（同一账号被重复添加导致积分累加翻倍）`,
+    )
   }
 }
 
@@ -731,6 +871,48 @@ export function apply(ctx: Context): void {
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
+
+  /**
+   * **AutoClaw 存量账号去重自愈**（2026-10-19 用户三次报障后定稿）。
+   *
+   * 用户形态：面板里同一个手机号出现 **3 次**，积分被重复累加
+   *（20842 + 20842 + 20842 = 62526，真实余额只有 20842）。
+   *
+   * ## 为什么不能只按凭据字段 `user_id` 去重（两轮失败的原因）
+   *
+   * 实测三条凭据的字段形态**不一致**：
+   *
+   * | ref | 凭据 `user_id` | JWT `user_id` | JWT `guid` |
+   * |---|---|---|---|
+   * | `A6539467` | —（无） | `839684` | `""`（空） |
+   * | `D6BF9EB2` | —（无） | `839684` | `""`（空） |
+   * | `A3C56DD6` | `7c54a9a…`（UUID） | `839684` | `""`（空） |
+   *
+   * ⇒ 有两个**互不相通**的 id 空间：UUID（账号主键，服务端 `user-profile`
+   *    也用它）与 `numericUserId`（JWT 的 `user_id`，纯数字）。
+   *    「字段优先、JWT 兜底」会让前两条落到 `839684`、第三条落到 UUID
+   *    ⇒ **分裂成两组，一条都去不掉**（用户二次报障「怎么还是在啊」）。
+   *
+   * ## 定稿做法：先用服务端把 UUID **补齐**，再按 UUID 去重
+   *
+   * 1. 逐条 ref 调 `user-profile`（实测三条都能拿回同一个 UUID）把
+   *    `user_id` 字段**写回凭据** —— 这一步同时修好了「老凭据缺字段」；
+   * 2. 补齐后全池统一按 `user_id`（UUID）分组去重。
+   *
+   * ⚠️ **异步、不阻塞启动**：`void` 而非 `await`。补齐要走 N 次网络，
+   *    等它会让插件启动慢一拍；失败也只记 warn（自愈是尽力而为）。
+   * ⚠️ **只对 autoclaw 启用**：其他渠道的 `access_token` 会轮换，
+   *    拿它去重会把**不同账号误合并**。这是按渠道逐个放开的白名单。
+   * ⚠️⚠️ `void` 起**必须挂 `.catch`**（双保险）：函数内部已对读池与逐条
+   *    失败各自兜底，但「`void` 一个 async 函数」本身就是未捕获 rejection 的
+   *    入口 —— 将来有人在函数里加一条会抛的新腿，这里仍能兜住并留下日志。
+   */
+  void autoclawSelfHeal(pool, ctx).catch((error: unknown) => {
+    ctx.logger?.warn?.(
+      `[autoclaw] 账号自愈失败（不影响启动）：`
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
+  })
 
   /**
    * ★★ **共享余额读数缓存**（2026-10-15 规格 §5.7；2026-10-16 起 loomy 也接入）——
@@ -2280,6 +2462,50 @@ export function apply(ctx: Context): void {
     readImage: makeReadImage(ctx),
   })
 
+  // ===== AutoClaw 国际版（autoclawintl）=====
+  //
+  // 与国内版是**同一套协议实现**的第二个实例（差异全在 `AUTOCLAW_INTL` 配置里：
+  // 基址 `autoglm-api.autoglm.ai` / 凭据 ref 前缀 `AUTOCLAWINTL_`）。
+  // 刻意**不复制**任何 `src/autoclaw*.ts` 实现文件 —— 协议同源，复制会让同类
+  // 缺陷（净额批次、临期分档、签到判据）修两遍（与 `minimaxintl` 同纪律）。
+  //
+  // ⚠️⚠️ **为什么是独立 provider**（三条判据全中，见 `autoclaw-product.ts`
+  //    `AutoclawProduct` 的注释表）：
+  //    ① 账号体系不互通（国内手机号 `7c54a9ac…` / 国际邮箱 `2c99dc99…`）；
+  //    ② API 主机不同；
+  //    ③ **登录方式不同**（国内短信验证码 / 国际 Z.ai OAuth）。
+  //
+  //    实测佐证：拿国内签发的 token 打国际基址，`wallets` / `user-profile`
+  //    一律 `410000 用户未登录`、推理 `401 Invalid token` ⇒ 用户体系物理隔离。
+  //
+  // ⚠️ **当前登录**：Z.ai OAuth 尚未接入（`state.nh` 来源未知，
+  //    见 `AUTOCLAW_INTL` 的注释）⇒ 本 provider 目前只能手工注入 token 使用。
+  //    接入后它会自己有一条 `login.startOAuth` 分支。
+  const autoclawIntl = new AutoclawAuth(ctx, { product: AUTOCLAW_INTL })
+  const autoclawIntlAdapter = registerAutoclawLlm(ctx, {
+    resolveCredential: createCredentialResolver<AutoclawCredential>(
+      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(AUTOCLAW_INTL.id, id) } },
+      {
+        product: AUTOCLAW_INTL,
+        readCredential: async (refName) => {
+          const resolved = await ctx.credentials.resolve(credentialRef(refName))
+          if (!resolved) return undefined
+          try {
+            return JSON.parse(resolved.value) as unknown as AutoclawCredential
+          } catch {
+            return undefined
+          }
+        },
+        fallback: { kind: 'ref', refName: AUTOCLAW_INTL.defaultCredentialRef },
+        throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+      },
+    ),
+    // ⚠️ provider 实参必须是 AUTOCLAW_INTL：写死 AUTOCLAW 会让国际站永远
+    //    查不到自己的账号（本插件在 workbuddy 上踩过同类坑）。
+    product: AUTOCLAW_INTL,
+    readImage: makeReadImage(ctx),
+  })
+
   const accio = new AccioAuth(ctx)
   const accioAdapter = registerAccioLlm(ctx, {
     // ⚠️ **不传 `credentialRef`**：`AccioAdapterOptions` 里没有这一项 —— 该适配器
@@ -3525,6 +3751,10 @@ async function fetchBalanceReading(
     minimax: pruned(MINIMAX.id, minimaxAdapter),
     minimaxintl: pruned(MINIMAX_INTL.id, minimaxIntlAdapter),
     autoclaw: pruned(AUTOCLAW.id, autoclawAdapter),
+    // ⚠️ 国际版与国内版**同一套实现的两个实例**，但 provider id 不同 ⇒
+    //    必须各自一条（与 minimaxintl 同款）。键是 provider id `autoclawintl`
+    //    （全小写），值是变量 `autoclawIntlAdapter`（驼峰）。
+    autoclawintl: pruned(AUTOCLAW_INTL.id, autoclawIntlAdapter),
     accio: pruned(ACCIO.id, accioAdapter),
     gemini: pruned(GEMINI.id, geminiAdapter),
     zcode: pruned(ZCODE.id, zcodeAdapter),
@@ -3850,6 +4080,12 @@ async function fetchBalanceReading(
       // 收不到本循环的调用（实测症状：`续期没有分派到它自己的实例（实际：无）`）。
       ['officeace', officeaceAuthService as unknown as JetHubAuthLike],
       ['autoclaw', autoclaw],
+      // ⚠️ AutoClaw 国际版：与 `autoclaw` **共用同一个 `AutoclawAuth` 类**，
+      //    故键与值都是它自己那个实例（`autoclawIntl`）。写成 `autoclaw: autoclawIntl`
+      //    这类错位会让国际站账号的续期去刷国内站凭据（同族串接，本仓库复发过 6 次）。
+      //    漏加这一行 = 它不进注册表 ⇒ 续期/积分/探测三条链路**全部静默失效**
+      //    （`provider-runtime-wiring.spec.ts` 会点名 `autoclawintl 未注册`）。
+      ['autoclawintl', autoclawIntl],
       ['accio', accio],
       // AStudio（讯飞 AstronStudio）：值是 AstudioAuth 服务实例 —— 它已在构造时
       // provide 自己（服务名 astudioAuth），必须与 registerJetHubRpc 的 auths.astudio
@@ -3967,6 +4203,11 @@ async function fetchBalanceReading(
     //（纯函数集合 + 统一 auth 契约），不是 Service 实例。
     officeace: officeaceAuthService as never,
     autoclaw,
+    // ⚠️ 键是 **provider id** `autoclawintl`，值是变量 `autoclawIntl` ——
+    //    两者不同名（id 全小写、变量带驼峰），写成简写会引用不存在的变量。
+    //    ⚠️ 值必须是**国际版实例**：写成 `autoclaw` 会让国际站账号的续期
+    //    去刷国内站凭据（与 minimaxintl 的同类风险完全一致）。
+    autoclawintl: autoclawIntl,
     accio,
     astudio,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。漏加 = 客户端把它当
@@ -4017,3 +4258,5 @@ async function fetchBalanceReading(
   //    构造时已由 cordis 自动注册为 `ctx.modelscopeAuth`（`super(ctx, `${product.id}Auth`)`），
   //    故这里**不需要**再 provide —— 与 accio 同款（它也没有 provide 行）。
 }
+
+

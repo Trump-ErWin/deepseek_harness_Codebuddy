@@ -90,6 +90,10 @@ const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   ['astudio', 'astudioAuth'],
   // ⚠️ AutoClaw（智谱）：服务名由 `${product.id}Auth` 派生 ⇒ 全小写 `autoclawAuth`。
   ['autoclaw', 'autoclawAuth'],
+  // ⚠️ AutoClaw 国际版（2026-10-20）：服务名同理由派生 ⇒ `autoclawintlAuth`。
+  //    它必须是**独立实例的服务名** —— 若误写成 `autoclawAuth`，按 id 查表会把
+  //    国际账号分派到国内实例（续期打错基址）。
+  ['autoclawintl', 'autoclawintlAuth'],
   // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。服务名由 `${product.id}Auth`
   //    派生 ⇒ `modelscopeAuth`。同款坑：本表由**真跑 apply() 的探针**验证过，
   //    不凭注释推断。
@@ -371,7 +375,8 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19；
     //    再加 astudio（本 fork 与上游各登记一次）⇒ 19 → 20 个真渠道，
     //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(19)
+    // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20 个 auth 键。
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(20)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
