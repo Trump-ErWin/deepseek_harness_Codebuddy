@@ -266,6 +266,16 @@ const ACCIO_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My
  */
 const AUTOCLAW_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0Ij48cmVjdCB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHJ4PSI1IiBmaWxsPSIjNDM2MWVlIi8+PHBhdGggZD0iTTcgOGwzIDNsLTItNG00IDBsMyA0bC0yLTNtNCAwbDMgNWwtMi00IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PC9zdmc+';
 
+/**
+ * Codely（Unity 团结引擎）面板图标（内联 SVG data URL，手绘）。
+ *
+ * ⚠️ **本 fork 独有**的 provider（UI 先行阶段，见 registry 里 codely 条目的注释）。
+ * 与 Qoder / ModelScope 同款做法：走内联 SVG（体积小、无色差、20×20 下清晰）。
+ * 图形：深灰圆角方块 + 白色 U 字形 + 右上一枚 Unity 风格的浅绿点。
+ * ⚠️ 图形自带不透明底 ⇒ `jet-hub-styles.js` 里对应 logoClass 用 transparent 容器。
+ */
+const CODELY_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzI0MjQyNCIvPjxwYXRoIGQ9Ik03IDZ2OGE1IDUgMCAwIDAgMTAgMFY2aC0yLjV2Ny44YTIuNSAyLjUgMCAwIDEtNSAwVjZaIiBmaWxsPSIjZmZmIi8+PGNpcmNsZSBjeD0iMTYuNiIgY3k9IjcuMiIgcj0iMS4zIiBmaWxsPSIjOUFFMjJFIi8+PC9zdmc+';
+
 export const PROVIDER_ICONS = {
   codearts: CODEARTS_ICON,
   buddy: CODEBUDDY_ICON,
@@ -288,6 +298,9 @@ export const PROVIDER_ICONS = {
   officeace: OFFICEACE_ICON,
   accio: ACCIO_ICON,
 autoclaw: AUTOCLAW_ICON,
-  modelscope: MODELSCOPE_ICON,
-  aggregate: AGGREGATE_ICON,
+modelscope: MODELSCOPE_ICON,
+// ⚠️ Codely（Unity）：UI 先行阶段（registry 里 channel:false），但图标键集合
+//    守卫按**全量** registry 比对 —— 漏加这行会红（而非渲染空白图标）。
+codely: CODELY_ICON,
+aggregate: AGGREGATE_ICON,
 };

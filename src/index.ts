@@ -2,6 +2,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
+// Codely 的续期服务对象（2026-10-20：推理已走 HTTP 自签，这里只负责续期）
+import { CodelyAuth } from './codely-auth-service.js'
 import { registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
 import { startCatalogPrewarm } from './catalog-prewarm.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
@@ -130,6 +132,11 @@ import { GEMINI } from './gemini.js'
 import { registerOfficeAceLlm } from './officeace-adapter.js'
 import { OFFICEACE } from './officeace-product.js'
 import * as officeaceAuth from './officeace-auth.js'
+// Codely（Unity 团结引擎）：**只接模型目录**。推理网关要求 HMAC 签名而密钥
+// 未取得（见 `codely-adapter.ts` 模块头），故本渠道目前有目录、无推理。
+import { registerCodelyLlm } from './codely-adapter.js'
+import { CODERLY } from './codely-product.js'
+import { readCodelyCredential } from './codely-auth.js'
 // 「锁定永久积分」在 officeace 上的**唯一执行实现**（issue IKLTHB 第 ① 条：
 // 该渠道登记了 `permanentLock: true`，而原先全仓没有任何代码读这张锁定表）。
 import { createOfficeAceCredentialProvider } from './officeace-lock.js'
@@ -2957,6 +2964,31 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     //    里**看不到分组**（真实症状 2026-10-12）。
     onCatalogLoaded: () => { ctx.emit('llm/adapters-updated') },
   })
+
+  // ── Codely（Unity 团结引擎）──
+  // ⚠️ **只接目录**：推理网关 `codely-litellm.tuanjie.cn` 要求
+  //    `X-Codely-Signature`（HMAC），签名密钥未取得（见 `codely-adapter.ts`
+  //    模块头）⇒ 适配器 `stream()` 显式报错，**不发注定 401 的请求**。
+  //    目录侧不需要签名：`GET /api/model-status`（Bearer）实测 200、8 个模型组。
+  const codelyAdapter = registerCodelyLlm(ctx, {
+    // ⚠️ 门控 + 黑名单都走账号池（共享目录骨架 `createModelCatalog` 读它）：
+    //    没有已登录的 Codely 账号 ⇒ `listModels` 如实返回空目录。
+    accountPool: pool,
+    // ⚠️ 按账号池里第一个启用账号的 ref 取凭据（与 officeace / gemini 同款）：
+    //    凭据按 `credentialRef` 索引存于 DSH 凭据库，多账号时才不会共用一份。
+    //    读不到（未登录 / 解析失败）一律 `undefined` ⇒ 目录回退兜底表，不抛错。
+    credentialProvider: async () => {
+      const entries = pool.listAccountsByProvider(CODERLY.id)
+      const first = entries.find((entry) => entry.enabled !== false) ?? entries[0]
+      if (first === undefined) return undefined
+      return readCodelyCredential(credentialRef(first.credentialRef), ctx.credentials as never)
+    },
+    onCatalogLoaded: () => { ctx.emit('llm/adapters-updated') },
+    // 图片字节桥接：上游**确实收图**（2026-10-20 实测 `codely-basic` 认得出 1×1 PNG
+    // 的颜色）。接上 `readImage` 后带图请求走 `image_url` parts；不接则明确报
+    // `UNSUPPORTED_CONTENT`（不静默丢图）。
+    readImage: makeReadImage(ctx),
+  })
   // 冷启动也广播一次：首次目录在注册后异步就绪，不补这一发就只能等用户重启。
   ctx.emit('llm/adapters-updated')
 
@@ -3159,6 +3191,19 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
    *   （如「按最便宜的模型查额度」），仍需让两个消费者各自传自己的实现。
    */
 /**
+ * **静态回退积分表**（无 deps 版工厂）—— 供 {@link fetchBalanceReading} 在
+ * runtime 缺席时兜底。模块级常量：工厂是纯函数，表在进程内不变。
+ *
+ * ⚠️ 与端点侧（`jet-hub-rpc.ts`）/runtime 侧（下方 `creditsTable`）**同源同构**
+ *（同一个 `createProviderCredits`），差异只在 deps：本表无 deps，loomy /
+ * raccoon / zcode 的条目会退到「自由函数 + 全局 fetch」—— 但这三家**有**
+ * runtime，永远先命中 runtime，实际走不到这里；本表实际服务的只有
+ * 「balance:true 且无 runtime」的渠道（现役仅 codely）。一致性由
+ * `credits-runtime-parity.spec.ts` 的「表键集合 === registry 派生」守卫兜住。
+ */
+const FALLBACK_CREDITS_TABLE = createProviderCredits()
+
+/**
  * 共享缓存的**取数原语**（从 `credits.balances` 的查表分派里抽出的那一半）。
  *
  * ## ⚠️ 为什么必须与 `credits.balances` 用同一个函数（规格 §11-1 的核实结论）
@@ -3180,7 +3225,19 @@ async function fetchBalanceReading(
   entry: BalanceCacheEntry,
 ): Promise<unknown> {
   const runtime = runtimeOf(provider)
-  const impl = runtime?.credits
+  // ⚠️⚠️ **runtime 缺席时回退到静态积分表**（真实缺陷，2026-10-19 实测打穿）：
+  //    codely 是全仓首例「balance:true + 无 runtime」的渠道（channel:false、
+  //    无 auth 服务 ⇒ `src/index.ts` 的注册循环里没有它 ⇒ 没有 ProviderRuntime）。
+  //    本原语原先只认 runtime ⇒ 对 codely 恒抛 `unsupported provider: codely` ⇒
+  //    缓存记成失败读数并**兼顶旧值 15 分钟**，面板积分行显示
+  //    「本次查询失败，显示的是 … 的数据（unsupported provider: codely）」——
+  //    而端点侧的表里明明有它（首次成功的那次读数正是端点表查出来的）。
+  //
+  //    回退表用**无 deps** 的工厂：codely 的原语是纯自由函数，不依赖任何
+  //    auth 实例。⚠️ 有 runtime 的渠道**永远先命中 runtime**（含 loomy /
+  //    raccoon / zcode 的实例 fetchImpl 路径），本回退只在「该声明了余额能力
+  //    却没注册 runtime」的渠道上生效 —— 那正是本函数原本完全无法服务的形态。
+  const impl = runtime?.credits ?? creditsOf(FALLBACK_CREDITS_TABLE, provider)
   if (impl === undefined) throw new Error(`unsupported provider: ${provider}`)
   if (entry.credential === undefined) throw new Error('凭据未提供')
   // ⚠️ `ProviderCallContext` 的三个字段与 `jet-hub-rpc.ts` 里那份**同形**
@@ -3351,6 +3408,19 @@ async function fetchBalanceReading(
     modelscope: pruned(MODELSCOPE.id, modelscopeAdapter),
     // OfficeAce（华为 MaaS 云端直连）：目录静态 + 平台侧可用性，同其余渠道。
     officeace: pruned(OFFICEACE.id, officeAceAdapter),
+    // ⚠️ **codely 进本表但 `channel` 保持 `false`**（2026-10-20 修订，用户报障
+    //    「面板模型 0」后的复核结论）：本表键守卫（`refresh-targets-derived.spec.ts`
+    //    ⑦）允许 `EXTRA_KEYS` 显式例外（`aggregate` 是先例），而本渠道**必须**进表
+    //    —— 与 modelscope 那条同因：`provider.status` 的「模型数 / 已关闭」判据读
+    //    本表的 `listAllModels()`；「关闭整个 provider」也要靠它拿全量目录写黑名单。
+    //    表里缺它 ⇒ 面板恒「模型 0」，且**模型选择器里的 8 个模型关不掉**（矛盾态）。
+    //    进表 ≠ 假桩：适配器是真实的（目录来自实测 200 的 `/api/model-status`，
+    //    `stream()` 显式报「推理通道尚未接通」）——守卫禁的是「用假实现应付判据」，
+    //    不是「有目录没推理」这个真实过渡态本身。
+    //    ① 键守卫侧：已在用例 ⑦ 的 `EXTRA_KEYS` 登记理由（channel:false 例外）；
+    //    ② 推理侧：`channel: true` 会被三张派生守卫当成「应有 auth / 应进聚合
+    //       目录 / 应可续期」，在推理与续期落地前**仍然不翻**（那是真要假桩的地方）。
+    codely: pruned(CODERLY.id, codelyAdapter),
     // ⚠️ 聚合 provider 也必须进这张表（设计文档 §5.2 的必改点）：`jet-hub-rpc.ts` 的
     // `fullCatalogIds` **优先**用本表的 `listAllModels()`（不套黑名单的全量目录），
     // 缺失时才退化到 `llm.listModels(provider)` —— 后者已被适配器按黑名单过滤。
@@ -3722,6 +3792,10 @@ async function fetchBalanceReading(
     // OfficeAce（华为 ModelArts MaaS 云端直连）：值是 **auth 服务形状的包装对象**
     //（纯函数集合 + 统一 auth 契约），不是 Service 实例。
     officeace: officeaceAuthService as never,
+    // ⚠️ Codely 的续期对象**暂未挂**（2026-10-20）：`JetHubAuths.codely` 是
+    //    **可选**键，实现见 `codely-auth-service.ts`（`CodelyAuth`）。
+    //    接线时**必须同时**补齐 `jet-hub-rpc-auth-wiring` 的 17→18 与
+    //    `refreshAll` 14→15 两处计数，否则守卫按「键位恰好 17 家」变红。\n    //    （推理与目录都不依赖它 ⇒ 不挂也不影响使用。）
     autoclaw,
     accio,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。漏加 = 客户端把它当

@@ -437,6 +437,12 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     // 目录 / 解析 / 流式，请求级换号与冷却不在范围内。留空是**被验证的声明**
     // （见下面「登记为不写标记的文件确实没有写点」那条用例）。
     ['accio-adapter.ts', []],
+    // ⚠️ codely（Unity 团结引擎）**不写** `modelRateLimits`（registry 里
+    //    `rateLimit: false`）：本渠道**只接模型目录**——推理网关要求 HMAC 签名
+    //    而密钥未取得（`codely-adapter.ts` 模块头），适配器不发起任何推理请求
+    //    ⇒ 既不会有上游限流响应，也没有可写的标记。留空是**被验证的声明**
+    //    （下面那条用例会真去 grep 源码确认确实没有写点），不是「忘了接」。
+    ['codely-adapter.ts', []],
   ]
 
   /**

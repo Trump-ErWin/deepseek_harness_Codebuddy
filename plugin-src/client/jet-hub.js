@@ -53,6 +53,9 @@ import {
   gatewayModelsHint,
   groupGatewayEntries,
   groupGatewayModels,
+  gatewayAllowLanHint,
+  gatewayAllowLanSwitchDisabled,
+  gatewayAllowLanToggleNotice,
   gatewayStatusLines,
   gatewayLoopbackOnly,
   gatewayFootnote,
@@ -288,7 +291,18 @@ function formatTime(ts) {
   const diff = ts - now;
   if (diff < 3600000) return `${Math.round(diff / 60000)} 分钟后`;
   if (diff < 86400000) return `${Math.round(diff / 3600000)} 小时后`;
-  return d.toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  // ⚠️ **跨年必须带年份**（真实误读，2026-10-19）：Codely 的令牌有效期是一
+  //    整年（JWT exp ≈ iat + 365 天），不带年份时显示「10月19日 21:47」——
+  //    与签发时刻月/日/时刻全同，用户当成「今天」以为刚过期（报障原话
+  //    「为啥一经过了」）。年内保持原样（多数渠道有效期 ≤ 30 天，年份冗余）。
+  const sameYear = d.getFullYear() === new Date(now).getFullYear();
+  return d.toLocaleString('zh-CN', {
+    ...(sameYear ? {} : { year: 'numeric' }),
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 }
 
 // 四个限流标记操作的 hover 帮助文案。抽成常量以便按钮与说明共用同一份措辞。
@@ -5697,7 +5711,7 @@ function GatewayCards({ cards, renderRow, isExpanded, onToggle, onCopy, isCopied
  * 3. **状态全部来自宿主侧**（`gateway.getEnabled`），前端不拿 `enabled` 自行
  *    推导运行态 —— 端口冲突与 env 停用都会让两者不一致。
  */
-function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
+function GatewayPanel({ status, busy, notice, onToggle, onToggleAllowLan, onReload, onClose }) {
   const [copied, setCopied] = React.useState(false);
   const [revealed, setRevealed] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
@@ -5850,6 +5864,10 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
 
   const disabled = gatewaySwitchDisabled(status);
   const action = status?.enabled ? '关闭' : '打开';
+  // 「允许局域网访问」行的禁用与动作词（与主开关同构，判据不同：它只在
+  // env 显式给了 host 时被禁——那一刻翻开关改变不了监听地址）。
+  const allowLanDisabled = gatewayAllowLanSwitchDisabled(status);
+  const allowLanAction = status?.allowLan ? '关闭' : '打开';
   return React.createElement('div', {
     className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
@@ -5905,6 +5923,30 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
           'aria-label': action + '本机网关',
           onChange: () => void onToggle(!(status?.enabled === true)),
         })),
+      // ── 「允许局域网访问」开关（2026-10-20）──
+      // ⚠️ 与主开关同一行结构，但**语义不同**：它改变的是监听地址（127.0.0.1 ↔
+      // 0.0.0.0），翻动会触发服务端关闭旧实例并重建换绑；env 显式给了
+      // DSH_OPENAI_GATEWAY_HOST 时被禁用（那一刻翻动无效，禁用并说明原因）。
+      React.createElement('label', { className: 'dim-jh-modelRow' },
+        React.createElement('span', { className: 'dim-jh-modelInfo' },
+          React.createElement('strong', { className: 'dim-jh-modelName' }, '允许局域网访问'),
+          React.createElement('code', { className: 'dim-jh-modelId' },
+            '打开后监听 0.0.0.0，同一局域网的设备可凭 API Key 访问')),
+        React.createElement('input', {
+          type: 'checkbox',
+          className: 'dim-jh-switch',
+          role: 'switch',
+          checked: status?.allowLan === true,
+          disabled: allowLanDisabled || busy,
+          'aria-label': allowLanAction + '「允许局域网访问」',
+          onChange: () => void onToggleAllowLan(!(status?.allowLan === true)),
+        })),
+      gatewayAllowLanHint(status)
+        ? React.createElement('p', {
+          key: 'allow-lan-hint',
+          className: 'dim-jh-modalHint dim-jh-gatewayLine',
+        }, gatewayAllowLanHint(status))
+        : null,
       gatewayStatusLines(status).map((line, index) =>
         // ⚠️ 顶部三行是同一段话，用更紧的 .dim-jh-gatewayLine（再叠上弹窗级的
         // 6px 会显得像三段互不相干的内容）。
@@ -6986,6 +7028,31 @@ export function JetHubPage({ rpcCall }) {
   React.useEffect(() => { void loadGatewayStatus(); }, [loadGatewayStatus]);
 
   /**
+   * 切换「允许局域网访问」。
+   *
+   * ⚠️ 与 `toggleGateway` 同约定：**不做乐观更新** —— 换绑是否成功（端口、
+   * env host 覆盖、网关总开关状态）只有服务端知道，一律以回传的整份 status 为准。
+   */
+  const toggleGatewayAllowLan = React.useCallback(async (nextAllowLan) => {
+    setGatewayBusy(true);
+    setGatewayNotice(null);
+    try {
+      const res = await rpcCall('gateway.setAllowLan', { allowLan: nextAllowLan });
+      if (!mounted.current) return;
+      setGatewayStatus(res);
+      setGatewayNotice({ tone: 'ok', text: gatewayAllowLanToggleNotice(res, nextAllowLan) });
+    } catch (caught) {
+      console.error('[jet-hub] toggle gateway allowLan failed:', caught);
+      if (!mounted.current) return;
+      // 保留原状态：重新拉一次以确保与服务端一致。
+      setGatewayNotice({ tone: 'error', text: '操作失败：' + (caught?.message || '未知错误') });
+      await loadGatewayStatus();
+    } finally {
+      if (mounted.current) setGatewayBusy(false);
+    }
+  }, [rpcCall, loadGatewayStatus]);
+
+  /**
    * 打开/关闭网关。
    *
    * ⚠️ **不做乐观更新**：网关是否真在监听取决于端口占用与环境变量两件前端看不见
@@ -7641,6 +7708,7 @@ export function JetHubPage({ rpcCall }) {
           busy: gatewayBusy,
           notice: gatewayNotice,
           onToggle: toggleGateway,
+          onToggleAllowLan: toggleGatewayAllowLan,
           onReload: loadGatewayStatus,
           onClose: () => setShowGateway(false),
         })

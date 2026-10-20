@@ -251,3 +251,77 @@ describe('网关的插件接线', () => {
     expect(text).toContain('未启动')
   })
 })
+
+/**
+ * 「允许局域网访问」开关的接线（2026-10-20）。
+ *
+ * ⚠️ 与 IKL7UN 那组的分工：那边锁「env host 必须真绑到网卡」，这边锁
+ * 「设置页开关翻转必须真的换绑」。**listen() 的绑定地址在创建时定格**，
+ * 故翻转的收敛必然是「关旧实例 → 按新期望重建」——这里用真实 HTTP 探测锁住
+ * 换绑的物理效果，而不是只看 `address()` 字符串。
+ */
+describe('「允许局域网访问」开关的接线', () => {
+  it('★ 打开后经插件入口绑 0.0.0.0，且回环上真实可达（不只是配置字符串）', async () => {
+    const { ctx } = makeContext()
+    const port = await freePort()
+    process.env.DSH_OPENAI_GATEWAY_PORT = String(port)
+
+    mountOpenAiGateway(ctx, { gatewayEnabled: () => true, gatewayAllowLan: () => true })
+    await settle()
+
+    const { isGatewayRunning, gatewayAddress } = await import('../../src/openai-gateway/runtime.js')
+    expect(isGatewayRunning()).toBe(true)
+    expect(gatewayAddress()?.host).toBe('0.0.0.0')
+    expect(gatewayAddress()?.port).toBe(port)
+    // 物理判据：0.0.0.0 覆盖回环 ⇒ 127.0.0.1 必然可达（401 = HTTP 往返、未带 key）。
+    expect(await probeHost('127.0.0.1', port)).toBe('HTTP 401')
+  })
+
+  it('★ 运行期翻动开关会关闭旧实例并重建换绑', async () => {
+    const { ctx } = makeContext()
+    const port = await freePort()
+    process.env.DSH_OPENAI_GATEWAY_PORT = String(port)
+
+    mountOpenAiGateway(ctx, { gatewayEnabled: () => true, gatewayAllowLan: () => false })
+    await settle()
+    const runtime = await import('../../src/openai-gateway/runtime.js')
+    expect(runtime.isGatewayRunning()).toBe(true)
+    expect(runtime.gatewayAddress()?.host).toBe('127.0.0.1')
+
+    // 翻 ON：收敛必须关旧实例、按新期望重建（只看 address() 字符串的假实现会在这里露馅）。
+    runtime.setGatewayDesiredAllowLan(true)
+    await runtime.applyGatewayDesiredState()
+    expect(runtime.isGatewayRunning()).toBe(true)
+    expect(runtime.gatewayAddress()?.host).toBe('0.0.0.0')
+    expect(await probeHost('127.0.0.1', port)).toBe('HTTP 401')
+
+    // 翻 OFF：回到回环。
+    runtime.setGatewayDesiredAllowLan(false)
+    await runtime.applyGatewayDesiredState()
+    expect(runtime.isGatewayRunning()).toBe(true)
+    expect(runtime.gatewayAddress()?.host).toBe('127.0.0.1')
+  })
+
+  it('★ env 给了 host 时开关不生效，且反复收敛不得反复重建（失配死循环的回归锁）', async () => {
+    const { ctx } = makeContext()
+    const port = await freePort()
+    process.env.DSH_OPENAI_GATEWAY_PORT = String(port)
+    process.env.DSH_OPENAI_GATEWAY_HOST = '127.0.0.2'
+
+    mountOpenAiGateway(ctx, { gatewayEnabled: () => true, gatewayAllowLan: () => true })
+    await settle()
+    const runtime = await import('../../src/openai-gateway/runtime.js')
+    expect(runtime.isGatewayRunning()).toBe(true)
+    expect(runtime.gatewayAddress()?.host).toBe('127.0.0.2')
+
+    // ⚠️ 回归锁：修复初版拿 desiredAllowLan 裸比较期望通配 —— env host 场景下
+    // 重建后仍绑 env 地址 ⇒ 收敛永远判失配 ⇒ **每次收敛都关掉再重建**（必现
+    // 死循环）。修复后收敛判据与工厂同源（isGatewayHostFromEnv 参与计算），
+    // 连续收敛必须地址稳定、实例存活。
+    for (let round = 0; round < 3; round += 1) await runtime.applyGatewayDesiredState()
+    expect(runtime.isGatewayRunning()).toBe(true)
+    expect(runtime.gatewayAddress()?.host).toBe('127.0.0.2')
+    // 用户的选择照常被记住（runtime 期望态为 true），只是此刻被 env 覆盖。
+    expect(runtime.gatewayDesiredAllowLan()).toBe(true)
+  })
+})

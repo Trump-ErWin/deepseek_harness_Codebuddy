@@ -38,7 +38,11 @@ function adapters(): string[] {
 describe('工具定义下发（防回归：15 个适配器，只有 officeace 曾漏）', () => {
   it('① 除聚合/路由类外，每个适配器都必须处理 tools', () => {
     // aggregate / auto 是路由层（转发给别的适配器），自身不需要 tools。
-    const exempt = new Set(['aggregate-adapter.ts', 'auto-adapter.ts'])
+    // ⚠️ codely（2026-10-20）**只接模型目录**：它不发起任何推理请求（推理网关
+    //    要求 HMAC 签名、密钥未取得，见 `codely-adapter.ts` 模块头）⇒ 不存在
+    //    「发了请求却漏带 tools」这一 2026-10-13 事故的形态，故豁免。
+    //    ⚠️ 该豁免**必须随推理接线一并撤销**：一旦它开始发请求，就要处理 tools。
+    const exempt = new Set(['aggregate-adapter.ts', 'auto-adapter.ts', 'codely-adapter.ts'])
     const missing = adapters().filter((f) => {
       if (exempt.has(f)) return false
       return !/\btools\b/.test(readFileSync(join(SRC_DIR, f), 'utf8'))

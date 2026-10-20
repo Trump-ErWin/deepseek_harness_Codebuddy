@@ -308,13 +308,16 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
       .filter(([id]) => !RATE_LIMIT_OFF_BY_CHOICE.has(id))
       .map(([id]) => id)
       .sort()
-    // 四家 rationale 各不相同（registry 里各有字段注释）：
+    // 五家 rationale 各不相同（registry 里各有字段注释）：
     // - accio：**不写 modelRateLimits 且不在 probeById 里** ⇒ 两个按钮恒为惰性
     //   （点了零请求、零清除，用户会以为按钮坏了）；
     // - gemini / officeace：限流由服务端配额管理，本地标记清掉 / 重测通过
     //   都恢复不了配额；
     // - loomy：根本不返回限流错误。
-    expect(disabled).toEqual(['accio', 'autoclaw', 'gemini', 'loomy', 'officeace'])
+    // - codely（2026-10-19 UI 先行）：探测适配器还没有（无 probeById 登记）⇒
+    //   按钮点了必报「没有探测适配器」。与 accio 同类（语义管辖不到），
+    //   接线完成后随 registry 一起摘掉 rateLimit:false。
+    expect(disabled).toEqual(['accio', 'autoclaw', 'codely', 'gemini', 'loomy', 'officeace'])
   })
 
   it('★ 「产品取舍」那一类也必须被点名（不得悄悄混进「管辖不到」里）', () => {

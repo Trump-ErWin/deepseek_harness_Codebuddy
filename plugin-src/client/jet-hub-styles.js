@@ -90,6 +90,10 @@ const STYLES = `
    ⚠️ 加这一条是必要的 —— 上面每家的 logoClass 都各自声明了背景，
       没有兜底规则，缺了会让聚合的图标容器**没有背景**（与其它行不一致）。 */
 .dim-jh-providerIcon.aggregate { background: white; }
+/* Codely（Unity 团结引擎）：内联 SVG 自带深灰圆角底 + 白色 U，本身即完整图形，
+   故容器保持透明（与 zcode / officeace 同因：图标自己不透明，再叠白底是多余的）。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里不能出现反引号（会提前终止）。 */
+.dim-jh-providerIcon.codely { background: transparent; }
 
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }

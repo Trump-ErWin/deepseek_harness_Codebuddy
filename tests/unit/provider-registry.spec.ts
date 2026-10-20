@@ -27,7 +27,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-it('共 20 条（19 个真渠道 + aggregate）', () => {
+it('共 21 条（20 个真渠道 + aggregate；codely 2026-10-19 UI 先行、暂 channel:false）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
@@ -36,9 +36,13 @@ it('共 20 条（19 个真渠道 + aggregate）', () => {
     // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（魔搭，第 19 个真渠道）：上游没有它。
     //    ⚠️ 合并上游时**不要**把这里改回上游数字 —— 那会让两个声明都失去守卫
     //    （条数断言是「注册表没被误删」的唯一防线）。
-    expect(PROVIDER_REGISTRY).toHaveLength(20)
+    // ⚠️ 2026-10-19 加 codely（Unity 团结引擎，第 20 个真渠道）：**UI 先行过渡态**，
+    //    `channel: false`（账号/凭据链路尚未接线，见 registry 里该条的长注释）。
+    //    接线完成时改为 true —— 本条的 channel 计数要从 19 改回 20。
+    expect(PROVIDER_REGISTRY).toHaveLength(21)
     expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(19)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
+    expect(PROVIDER_REGISTRY.find((d) => d.id === 'codely')?.channel).toBe(false)
   })
 
   /**
@@ -152,10 +156,10 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(win).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('rateLimit === false 恰好是 5 家（modelscope 2026-10-17 加入，理由与前四家不同）', () => {
+  it('rateLimit === false 恰好是 7 家（codely 2026-10-19 UI 先行加入，理由是「材料还没有」）', () => {
     const off = PROVIDER_REGISTRY.filter((d) => d.rateLimit === false)
       .map((d) => d.id).sort()
-    // ⚠️ **五种理由各不相同**（见 registry 里各自的字段注释）：
+    // ⚠️ **理由各不相同**（见 registry 里各自的字段注释）：
     // - loomy：根本不返回限流错误（静默降级扣永久积分）；
     // - gemini / officeace：限流是服务端配额窗口制，本地标记与重测都不改变配额；
     // - accio：**不写 `modelRateLimits` 且不在 `probeById` 里** ⇒
@@ -166,12 +170,15 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     //   （只能等自然过期或删号重加），而不是「按钮点了没用」。
     //   ⚠️ 它在 `credits-capabilities.spec.ts` 的 `RATE_LIMIT_OFF_BY_CHOICE`
     //   里有独立登记（那张表专门区分「产品取舍」与「语义管辖不到」两类）。
+    // - codely（**本 fork**，2026-10-19 UI 先行）：探测适配器还没有 ⇒ 按钮点了必报
+    //   「没有探测适配器」。与 modelscope **不同源**（这里是「材料还没有」，
+    //   不是「用户不要」）；接线后**删除该行**（恢复缺省 true）。
     //
     // 新增一家时**不要**只改这里：判据是 registry 的落地问法
 //「这个按钮点下去，能不能让用户少受限一次？」——
     // ⚠️ 而 modelscope 打破的正是这条问法的前提（它**能**，只是不要）。
     //    ⇒ 所以「能」不再是必要条件，「用户是否要这个按钮」才是。
-    expect(off).toEqual(['accio', 'autoclaw', 'gemini', 'loomy', 'modelscope', 'officeace'])
+    expect(off).toEqual(['accio', 'autoclaw', 'codely', 'gemini', 'loomy', 'modelscope', 'officeace'])
   })
 
   it('accountTest === true 恰好是 gemini', () => {

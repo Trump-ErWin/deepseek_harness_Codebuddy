@@ -5,6 +5,9 @@ import { fileURLToPath } from 'node:url'
 import {
   copyToClipboard,
   formatModelIdList,
+  gatewayAllowLanHint,
+  gatewayAllowLanSwitchDisabled,
+  gatewayAllowLanToggleNotice,
   gatewayApiKeyHint,
   gatewayButtonLabel,
   gatewayButtonTitle,
@@ -1433,5 +1436,90 @@ describe('供应商卡片的折叠', () => {
   it('脏输入退化为展开（宁可多显示，也不要藏起来）', () => {
     expect(gatewayCardExpanded(null)).toBe(true)
     expect(gatewayCardExpanded({})).toBe(true)
+  })
+})
+
+/**
+ * 「允许局域网访问」开关（2026-10-20）的判定与文案。
+ *
+ * ⚠️ 安全文案的两条既有规矩在这里继续生效：
+ * 1. **不得出现 `**`**（React 文本节点会原样显示星号）；
+ * 2. 非回环警告**必须点名宿主**（红队 netns 实测宿主可达，只说「同网络设备」
+ *    会把它漏掉 —— 既有用例守着这条）。
+ */
+describe('「允许局域网访问」开关的判定与文案', () => {
+  const base = { enabled: true, running: true, blockedByEnv: false } as const
+
+  it('★ 只在 env 显式给了 host 时禁用（那一刻翻开关改变不了监听地址）', () => {
+    expect(gatewayAllowLanSwitchDisabled(null)).toBe(true)
+    expect(gatewayAllowLanSwitchDisabled({ ...base, allowLan: false, hostFromEnv: false, address: null })).toBe(false)
+    expect(gatewayAllowLanSwitchDisabled({ ...base, allowLan: false, hostFromEnv: true, address: null })).toBe(true)
+    // ⚠️ 网关总开关关闭时**不禁用**：用户可以先选好，打开总开关时立即生效。
+    expect(gatewayAllowLanSwitchDisabled({
+      ...base, enabled: false, allowLan: false, hostFromEnv: false, address: null,
+    })).toBe(false)
+  })
+
+  it('★ 提示文案按状态分支，且不得出现 markdown 星号', () => {
+    const off = gatewayAllowLanHint({ ...base, allowLan: false, hostFromEnv: false, address: null })
+    const on = gatewayAllowLanHint({ ...base, allowLan: true, hostFromEnv: false, address: null })
+    const overridden = gatewayAllowLanHint({ ...base, allowLan: true, hostFromEnv: true, address: null })
+    expect(off).toContain('127.0.0.1')
+    expect(off).not.toContain('**')
+    expect(on).toContain('0.0.0.0')
+    expect(on).toContain('API Key')
+    expect(on).not.toContain('**')
+    // env 覆盖时必须明说「不生效」——「打开了却没反应」比禁用并解释更让人困惑。
+    expect(overridden).toContain('DSH_OPENAI_GATEWAY_HOST')
+    expect(overridden).toContain('不生效')
+  })
+
+  it('★ 切换通知按结果分支', () => {
+    expect(gatewayAllowLanToggleNotice({ ...base, allowLan: true, hostFromEnv: true, address: null }, true))
+      .toContain('不生效')
+    expect(gatewayAllowLanToggleNotice({
+      ...base, allowLan: true, hostFromEnv: false, address: { host: '0.0.0.0', port: 8326 },
+    }, true)).toContain('局域网 IP')
+    expect(gatewayAllowLanToggleNotice({
+      ...base, allowLan: false, hostFromEnv: false, address: { host: '127.0.0.1', port: 8326 },
+    }, false)).toContain('127.0.0.1')
+    // 网关没在监听时不得谎称「已改绑」。
+    expect(gatewayAllowLanToggleNotice({
+      ...base, running: false, allowLan: true, hostFromEnv: false, address: null,
+    }, true)).toContain('没有在监听')
+  })
+
+  it('★ 绑 0.0.0.0 时状态行必须教用户把地址换成局域网 IP（0.0.0.0 抄走连不上）', () => {
+    const lines = gatewayStatusLines({
+      enabled: true,
+      running: true,
+      blockedByEnv: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: { host: '0.0.0.0', port: 8326 },
+      apiKey: null,
+      models: [],
+      modelsSource: 'none',
+    })
+    const joined = lines.join('\n')
+    expect(joined).toContain('0.0.0.0')
+    expect(joined).toContain('局域网 IP')
+    // 非回环警告必须点名宿主（既有守卫，见脚注用例的同条理由）。
+    expect(joined).toContain('宿主')
+  })
+
+  it('★ 回环部署的状态行不出现局域网指引（避免把精简过的文案重新撑肿）', () => {
+    const lines = gatewayStatusLines({
+      enabled: true,
+      running: true,
+      blockedByEnv: false,
+      allowLan: false,
+      hostFromEnv: false,
+      address: { host: '127.0.0.1', port: 8326 },
+      apiKey: null,
+      models: [],
+      modelsSource: 'none',
+    })
+    expect(lines.join('\n')).not.toContain('局域网 IP')
   })
 })
