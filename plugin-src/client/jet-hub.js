@@ -608,6 +608,15 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     balance.expiredTotal > 0
       ? React.createElement('span', { className: 'dim-jh-creditExpired' },
           `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)
+      : null,
+    /**
+     * 失效额度单独提示：它们仍在服务端响应里，但不计入上面的数字
+     * ⚠️ 配额单位下恒不渲染（`expiredTotal` 就是 0），留着分支只为不改变
+     * 其它 provider 的行为。
+     */
+    balance.expiredTotal > 0
+      ? React.createElement('span', { className: 'dim-jh-creditExpired' },
+          `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)
       : null));
 }
 

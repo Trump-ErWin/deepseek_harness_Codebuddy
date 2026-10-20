@@ -35,7 +35,7 @@ describe('autoCheckinExcluded：宿主消费取决于 registry', () => {
 })
 
 describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry', () => {
-  it('恰好是 registry 里 usesExpiryWindow === true 的 11 家（officeace 2026-10-12、autoclaw 2026-10-17、qoder/qodercn/astudio/minimax/minimaxintl 2026-10-20 加入）', () => {
+  it('恰好是 registry 里 usesExpiryWindow === true 的 12 家（officeace 2026-10-12、autoclaw 2026-10-17、qoder/qodercn/astudio/minimax/minimaxintl/codearts 2026-10-20 加入）', () => {
     const withWindow = PROVIDER_REGISTRY
       .filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
@@ -43,8 +43,11 @@ describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry
     // ⚠️ qoder / qodercn 2026-10-20 加入：永久哨兵不写 `deductionEndTime`
     //    ⇒ 落永久桶。与 codearts **不同**，本家同时开 `permanentLock`。
     // ⚠️ astudio / minimax / minimaxintl 2026-10-20 加入（PR !119）。
+    // ⚠️ codearts 2026-10-20 加入（PR !123）：只有**基础积分包**能分档（随套餐
+    //    `end_date` 到期），赠送/按需包走 `expiringTotal`。它**不**开
+    //    `permanentLock` —— 下面那条「支持锁定的渠道」断言因此不受影响。
     expect(withWindow).toEqual([
-      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai',
+      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts', 'lobsterai',
       'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae',
       'workbuddy',
     ])

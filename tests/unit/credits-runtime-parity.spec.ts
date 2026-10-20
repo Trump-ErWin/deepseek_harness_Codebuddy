@@ -417,6 +417,9 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     //    数据源，真机取证 28/28 带值且守恒），批次包归一化到 `deductionEndTime`。
     // ⚠️ autoclawintl 2026-10-20 加入：与 autoclaw **同源**（同一份 credits 实现），
     //    实测国际站批次同样带 `deductionEndTime`（3000→10/21、10000→10/27）。
+    // ⚠️ codearts 2026-10-20 加入（PR !123）：**只有基础积分包**带
+    //    `deductionEndTime`（取自套餐周期 `end_date`）；赠送/按需包没有逐包到期
+    //    字段，走 `expiringTotal` 聚合提示。它**不**开 `permanentLock`。
     // ⚠️ qoder / qodercn 2026-10-20 加入：`/sash/api/v2/me/usage` 的
     //    `usage.expiresAt` 是**永久哨兵**（`253402214400000` = `9999-12-31`）时
     //    **不写** `deductionEndTime`（未知到期 ⇒ 落永久桶）；真实时间戳才写。
@@ -430,7 +433,7 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     //    直接写进 `deductionEndTime` —— 与 astudio 那条的形态差异是本条的价值所在
     //    （两种输入形态都能落进同一个分桶判据）。
     expect(withWindow).toEqual([
-      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai',
+      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts', 'lobsterai',
       'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
     ])
   })
