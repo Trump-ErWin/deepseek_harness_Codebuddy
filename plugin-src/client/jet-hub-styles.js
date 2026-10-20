@@ -54,7 +54,8 @@ const STYLES = `
 .dim-jh-providerIcon img { display: block; width: 20px; height: 20px; border-radius: 2px; }
 .dim-jh-providerIcon.codearts { background: white; }
 .dim-jh-providerIcon.buddy { background: white; }
-.dim-jh-providerIcon.workbuddy { background: white; }
+.dim-jh-providerIcon.workbuddy,
+.dim-jh-providerIcon.workbuddycn { background: white; }
 .dim-jh-providerIcon.lobsterai { background: white; }
 .dim-jh-providerIcon.qoder { background: white; }
 /* Qoder 中国版：官方 ICO 缩图，白底容器中对比度足够。 */

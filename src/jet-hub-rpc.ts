@@ -1267,6 +1267,8 @@ export interface JetHubAuths {
   readonly codearts: CodeArtsAuth
   readonly buddy: BuddyAuth
   readonly workbuddy: BuddyAuth
+  /** 国内版独立认证实例，旧调用方可省略。 */
+  readonly workbuddycn?: BuddyAuth
   readonly lobsterai: LobsteraiAuth
   readonly qoder: QoderAuth
   /** ⚠️ 键是 **provider id**（`qodercn`），值是 `index.ts` 里的 `qoderCn` 实例。 */
@@ -1381,6 +1383,8 @@ export function registerJetHubRpc(
  * 只声明用到的方法（结构化类型），避免让本模块依赖五个具体适配器类。
  */
 export interface ModelCatalogSource {
+  /** 可选的只读目录加载：关闭模型或尚未登录本渠道时仍能展示实时倍率。 */
+  loadCatalog?(): Promise<void>
   listAllModels(): readonly { id: string; name: string; isFree?: boolean }[]
   /**
    * 聚合目录（**可选** —— 只有聚合适配器实现它）。
@@ -1866,7 +1870,7 @@ function registerJetHubEndpoints(
   //   ⚠️ 若写成 `qoderCn`（键=变量名）会**编译失败**（接口没有该键）——
   //   那正是我们要的：键必须是 id，否则 `authOf(auths, provider)` 查不到中国版。
   const {
-    codearts, buddy, workbuddy, lobsterai, qoder,
+    codearts, lobsterai, qoder,
     qodercn: qoderCn,
 trae, cline, loomy, raccoon, minimax,
     // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
@@ -2033,6 +2037,7 @@ trae, cline, loomy, raccoon, minimax,
     'codearts',
     'buddy',
     'workbuddy',
+    'workbuddycn',
     LOBSTERAI.id,
     QODER.id,
     QODER_CN.id,
@@ -3544,7 +3549,10 @@ AUTOCLAW.id,
           runBuddyLoginFlow({ openBrowser: () => {}, state, product }).then(async (flow) => {
             await ctx.credentials.set(ref, flow.access)
             // 续期定时器归属该产品自己的服务实例
-            ;(product.id === CODEBUDDY.id ? buddy : workbuddy).scheduleRefresh()
+            // 按产品找服务，第三个腾讯系产品不能落入国际版的二选一分支。
+            const auth = authOf(auths, product.id)
+            if (auth === undefined) throw new Error(`缺少 ${product.displayName} 认证服务`)
+            ;(auth as BuddyAuth).scheduleRefresh()
             const credential = parseBuddyCredential(flow.access)
             await pool.updateAccount(id, {
               nickname: credential?.nickname ?? id,
@@ -5796,9 +5804,12 @@ AUTOCLAW.id,
         if (llm === undefined) {
           return { ok: false, error: { code: 'bad-request', message: 'llm 服务不可用' } }
         }
+        const catalogSource = modelAdapters?.[req.provider]
         let models: Array<{ id: string; name: string }>
         try {
           models = await llm.listModels(req.provider)
+          // 设置页仍需远端价格；加载完成后再读取黑名单，避免覆盖用户刚切换的状态。
+          await catalogSource?.loadCatalog?.()
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)
           return { ok: false, error: { code: 'bad-request', message: `读取模型列表失败：${reason}` } }
@@ -5824,7 +5835,6 @@ AUTOCLAW.id,
         // id 可用。适配器实例由 `registerJetHubRpc` 的 `modelAdapters` 传入
         // （DSH 的 `ctx.llm` 只保证 `listModels`，不透传自定义方法）。
         // 对话框模型选择器读的仍是过滤后的 `listModels`，可见性行为完全不变。
-        const catalogSource = modelAdapters?.[req.provider]
         const all = catalogSource?.listAllModels()
         let catalog: Array<{ id: string; name: string; isFree?: boolean }>
         if (all !== undefined) {

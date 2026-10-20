@@ -49,7 +49,7 @@
  *（三者都没传 `fetchImpl`）逐字等价，故生产行为不变。
  */
 
-import { CODEBUDDY, WORKBUDDY } from './product.js'
+import { CODEBUDDY, WORKBUDDY, WORKBUDDY_CN, type BuddyProduct } from './product.js'
 import type { BuddyCredential } from './buddy.js'
 import { CLINE } from './cline-product.js'
 import { GEMINI } from './gemini.js'
@@ -99,6 +99,52 @@ import type { MinimaxCredential } from './minimax.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { TraeCredential } from './trae.js'
 import type { ZcodeCredential } from './zcode.js'
+
+// 国内两产品共享权益；按用户与企业隔离在途写操作，避免跨面板重复领取和计数。
+const domesticClaims = new Map<string, Promise<ClaimOutcome>>()
+const domesticGrowth = new Map<string, ReturnType<typeof collectBuddyGrowth>>()
+
+/** 缺少身份时不猜测关联，避免把不同账号合并。 */
+function domesticCreditKey(credential: BuddyCredential): string | undefined {
+  return credential.user_id?.trim()
+    ? JSON.stringify([credential.user_id, credential.enterprise_id ?? '', credential.account_type ?? 'personal'])
+    : undefined
+}
+
+/** 国内版积分协议共用，模型目录和推理仍按各自产品配置。 */
+function domesticCredits(product: BuddyProduct): ProviderCredits {
+  return {
+    fetchBalance: (credential) => fetchCreditBalance(credential as BuddyCredential, product),
+    fetchStatus: (credential) => fetchCheckinStatus(credential as BuddyCredential, product),
+    claim: async (credential) => {
+      const c = credential as BuddyCredential
+      const key = domesticCreditKey(c)
+      const pending = key === undefined ? undefined : domesticClaims.get(key)
+      if (pending !== undefined) {
+        const outcome = await pending
+        return outcome.kind === 'claimed'
+          ? { kind: 'already-claimed', message: '同一账号已通过国内另一渠道领取' }
+          : outcome
+      }
+      const run = claimDailyCheckin(c, product)
+      if (key !== undefined) domesticClaims.set(key, run)
+      try { return await run } finally { if (key !== undefined) domesticClaims.delete(key) }
+    },
+    afterClaim: async (credential, entry, run) => {
+      const c = credential as BuddyCredential
+      const key = domesticCreditKey(c)
+      const pending = key === undefined ? undefined : domesticGrowth.get(key)
+      if (pending !== undefined) {
+        // 等待同一账号的任务完成，奖励仅计入实际执行它的那一条渠道。
+        await pending
+        return undefined
+      }
+      const task = collectBuddyGrowth(c, product, entry, run.budgetMs, run.roundDeadlineAt)
+      if (key !== undefined) domesticGrowth.set(key, task)
+      try { return await task } finally { if (key !== undefined) domesticGrowth.delete(key) }
+    },
+  }
+}
 
 /**
  * 三家「余额查询挂在 auth 实例上」的渠道所需的最小接口。
@@ -605,30 +651,8 @@ export function createProviderCredits(
       },
     },
 
-    buddy: {
-      fetchBalance: (credential) =>
-        fetchCreditBalance(credential as BuddyCredential, CODEBUDDY),
-      fetchStatus: (credential) =>
-        fetchCheckinStatus(credential as BuddyCredential, CODEBUDDY),
-      // 预检与面板读数是同一个端点 ⇒ 只声明 `fetchStatus`（端点回落到它），
-      // 不再写一份 `claimStatus`（两处声明同一实现必然漂移）。
-      claim: (credential) =>
-        claimDailyCheckin(credential as BuddyCredential, CODEBUDDY),
-      /**
-       * ⚠️ **成长中心（22 项任务）的唯一入口** —— 只有 CodeBuddy 中国版提供。
-       *
-       * ⚠️ 产品配置由**本闭包捕获**（`CODEBUDDY`），不从调用侧转发：通用分支
-       * 拿不到 product（它传 `undefined`），转发过去就是
-       * `collectBuddyGrowth(credential, undefined, …)`，成长中心当场打坏。
-       *
-       * ⚠️ `workbuddy`（国际版）**刻意不提供**：contributor 在 !62 复审中实测确认
-       * `www.workbuddy.ai` 后端**根本没有成长中心**（无任务列表、无 claim 端点）。
-       */
-      afterClaim: (credential, entry, run) =>
-        collectBuddyGrowth(
-          credential as BuddyCredential, CODEBUDDY, entry, run.budgetMs, run.roundDeadlineAt,
-        ),
-    },
+    buddy: domesticCredits(CODEBUDDY),
+    workbuddycn: domesticCredits(WORKBUDDY_CN),
 
     workbuddy: {
       fetchBalance: (credential) =>

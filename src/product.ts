@@ -73,7 +73,11 @@ const WORKBUDDY_UA_CN = 'WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2'
 /** 一个 CodeBuddy 系产品的全部差异配置。 */
 export interface BuddyProduct {
   /** provider 标识：注册到 ctx.llm 的路由名，也是账号列表的 provider 字段值 */
-  id: 'buddy' | 'workbuddy'
+  id: 'buddy' | 'workbuddy' | 'workbuddycn'
+  /** 账号隔离认证在授权后读取当前账号端点。 */
+  accountScoped?: boolean
+  /** 国内版目录以产品配置的 cli agent 为准，避免混入其它产品的目录。 */
+  catalogSource?: 'config'
   /** auth/state 的 platform 查询参数 */
   platform: string
   /**
@@ -550,8 +554,53 @@ export const WORKBUDDY: BuddyProduct = {
   fallbackModels: WORKBUDDY_FALLBACK_MODELS,
 }
 
+/** WorkBuddy 国内版：2026-10-20 本机 5.8.3 产品配置与已登录账号目录快照。 */
+export const WORKBUDDY_CN: BuddyProduct = {
+  id: 'workbuddycn',
+  platform: 'workbuddy',
+  endpoint: 'https://www.workbuddy.cn',
+  apiDomain: 'www.workbuddy.cn',
+  claimBase: 'https://www.workbuddy.cn',
+  webBase: 'https://www.workbuddy.cn',
+  displayName: 'WorkBuddy (国内版)',
+  productCode: 'workbuddy',
+  userAgent: 'WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/5.8.3',
+  attributionName: 'WorkBuddy',
+  clientVersion: '5.8.3',
+  cliVersion: '5.8.3',
+  defaultCredentialRef: 'WORKBUDDYCN_ACCESS_TOKEN',
+  appendSessionParams: true,
+  pluginVersion: '5.8.3',
+  accountScoped: true,
+  catalogSource: 'config',
+  // 国内两产品共用账号和积分；认证域可能是 CodeBuddy，不能据此删除国内版账号。
+  knownDomains: ['www.workbuddy.cn', 'workbuddy.cn', ...(CODEBUDDY.knownDomains ?? [])],
+  // 仅收录 cli agent 的对话模型；倍率和促销必须从各自远端实时读取。
+  fallbackModels: [
+    { id: 'hy3', name: 'Hy3', contextWindow: 192000, maxOutputTokens: 64000, supportsImages: true, reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high' },
+    { id: 'hy3-x', name: 'Hy3', contextWindow: 192000, maxOutputTokens: 64000, supportsImages: true, reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high' },
+    { id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 960000, maxOutputTokens: 64000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high' },
+    { id: 'glm-5v-turbo', name: 'GLM-5v-Turbo', contextWindow: 200000, maxOutputTokens: 64000, supportsImages: true, reasoningEfforts: ['medium'], defaultReasoningEffort: 'medium' },
+    { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1000000, maxOutputTokens: 64000, supportsImages: true, reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high' },
+    { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1000000, maxOutputTokens: 131072, supportsImages: true, reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high' },
+    { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1000000, maxOutputTokens: 64000, supportsImages: true, reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high' },
+    { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200000, maxOutputTokens: 48000, supportsImages: true, reasoningEfforts: ['medium'], defaultReasoningEffort: 'medium' },
+    { id: 'kimi-k3-1', name: 'Kimi-K3', contextWindow: 1000000, maxOutputTokens: 32000, supportsImages: true, reasoningEfforts: ['low', 'high', 'xhigh'], defaultReasoningEffort: 'high' },
+    { id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1000000, maxOutputTokens: 64000, supportsImages: true, reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high' },
+    { id: 'kimi-k2.7', name: 'Kimi-K2.7-Code', contextWindow: 256000, maxOutputTokens: 32000, supportsImages: true, reasoningEfforts: ['medium'], defaultReasoningEffort: 'medium' },
+    { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256000, maxOutputTokens: 32000, supportsImages: true, reasoningEfforts: ['medium'], defaultReasoningEffort: 'medium' },
+    { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512000, maxOutputTokens: 64000, supportsImages: true, reasoningEfforts: ['medium'], defaultReasoningEffort: 'medium' },
+    { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1000000, maxOutputTokens: 128000, supportsImages: true, reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high' },
+    { id: 'deepseek-v4-pro', name: 'Deepseek-V4-Pro', contextWindow: 1000000, maxOutputTokens: 128000, supportsImages: true, reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high' },
+    { id: 'space-bunny', name: 'Space-Bunny', contextWindow: 1000000, maxOutputTokens: 128000, supportsImages: true, reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'max' },
+    { id: 'step-5-preview', name: 'Step-5-Preview', contextWindow: 1000000, maxOutputTokens: 64000, supportsImages: true, reasoningEfforts: ['low', 'medium', 'high'], defaultReasoningEffort: 'high' },
+    { id: 'mimo-v2.6-pro', name: 'Xiaomi MiMo-V2.6-Pro', contextWindow: 1000000, maxOutputTokens: 128000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high' },
+    { id: 'minimax-m3.1-flash', name: 'MiniMax-M3.1-Flash', contextWindow: 1000000, maxOutputTokens: 128000, supportsImages: true, reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'max' },
+  ],
+}
+
 /** 全部产品配置，供按 id 查询与遍历注册使用。 */
-export const ALL_PRODUCTS: readonly BuddyProduct[] = [CODEBUDDY, WORKBUDDY]
+export const ALL_PRODUCTS: readonly BuddyProduct[] = [CODEBUDDY, WORKBUDDY, WORKBUDDY_CN]
 
 /** 按 provider id 取产品配置；未知 id 返回 undefined。 */
 export function productById(id: string): BuddyProduct | undefined {

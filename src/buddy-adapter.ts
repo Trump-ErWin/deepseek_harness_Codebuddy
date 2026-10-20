@@ -2177,6 +2177,8 @@ export class BuddyAdapter extends LlmAdapter {
    * 明确表态了图片能力，丢弃它才是缺陷本身。两条例外的判据不同、互不覆盖。
    */
   private reconcileWithFallback(models: readonly BuddyRemoteModel[]): BuddyRemoteModel[] {
+    // 国内版远端可选目录优先，兜底表只在远端不可用时使用。
+    if (this.product.catalogSource === 'config' && models.length > 0) return [...models]
     const fallback = this.product.fallbackModels
     if (fallback === undefined || fallback.length === 0) return [...models]
     const remoteById = new Map(models.map((model) => [model.id, model]))
@@ -2452,6 +2454,11 @@ export class BuddyAdapter extends LlmAdapter {
    */
   private syncCatalogEntries(): readonly CatalogEntry[] {
     return this.catalogEntries(this.remoteModels ?? this.staticFallbackModels())
+  }
+
+  /** 模型管理读取前加载远端元数据；不受登录可见性和模型黑名单门控。 */
+  async loadCatalog(): Promise<void> {
+    await this.ensureRemoteModels()
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {

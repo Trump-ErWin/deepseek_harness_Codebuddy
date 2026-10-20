@@ -956,6 +956,7 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   ['CODEARTS', 'codearts'],
   ['BUDDY', 'buddy'],
   ['WORKBUDDY', 'workbuddy'],
+  ['WORKBUDDYCN', 'workbuddycn'],
   ['LOBSTERAI', 'lobsterai'],
   ['QODER', 'qoder'],
   ['QODERCN', 'qodercn'],

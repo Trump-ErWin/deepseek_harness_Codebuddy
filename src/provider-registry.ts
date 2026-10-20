@@ -186,6 +186,18 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
+    id: 'workbuddycn',
+    label: 'WorkBuddy (国内版)',
+    displayName: 'WorkBuddy (国内版)',
+    logoClass: 'workbuddycn',
+    credits: { balance: true, dailyCheckin: true },
+    creditPackages: true,
+    permanentLock: true,
+    usesExpiryWindow: true,
+    settingsNamespace: 'llm-workbuddycn',
+    channel: true,
+  },
+  {
     id: 'workbuddy',
     label: 'WorkBuddy (国际版)',
     displayName: 'WorkBuddy (国际版)',

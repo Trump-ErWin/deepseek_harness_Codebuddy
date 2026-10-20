@@ -167,6 +167,7 @@ import { runtimeOf, type ProviderExpiryContext } from './provider-runtime.js'
 export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   'buddy',
   'workbuddy',
+  'workbuddycn',
   'loomy',
   'codearts',
   'zcode',

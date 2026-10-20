@@ -86,6 +86,8 @@ declare module '@deepseek-ai/cordis' {
      * 故两个产品必须各占一个服务名。
      */
     workbuddyAuth: BuddyAuth
+    /** WorkBuddy 国内版独立凭据与续期服务。 */
+    workbuddycnAuth: BuddyAuth
   }
 }
 
@@ -441,7 +443,12 @@ export class BuddyAuth extends Service {
   async fetchModels(pool?: AccountPool): Promise<BuddyRemoteModel[]> {
     // 优先账号池
     if (pool) {
+      // 国内版与 CodeBuddy 共用认证账号；目录只读查询可以借用已有国内凭据。
+      // 仅用于目录，不复制令牌，不改变推理选号与续期归属。
       const available = await pool.getAvailableAccount<BuddyCredential>(this.product.id, '')
+        ?? (this.product.id === 'workbuddycn'
+          ? await pool.getAvailableAccount<BuddyCredential>(CODEBUDDY.id, '')
+          : undefined)
       if (available) {
         return fetchModels(
           available.credential,

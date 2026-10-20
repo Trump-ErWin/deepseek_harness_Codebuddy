@@ -201,6 +201,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 |---|---|---|---|
 | `codearts` | CodeArts（华为云） | 浏览器回调 | 余额 + 每日签到 |
 | `buddy` | CodeBuddy（腾讯） | 浏览器授权 + 轮询 | 余额 + 每日签到 + 成长任务 + 锁定永久积分 |
+| `workbuddycn` | WorkBuddy（国内版） | 浏览器授权 + 轮询 | 与 CodeBuddy 国内版共用积分；模型与倍率独立；共享永久积分锁定 |
 | `workbuddy` | WorkBuddy（国际版） | 同上 | 余额 + 锁定永久积分（**无签到**） |
 | `lobsterai` | LobsterAI（有道） | 浏览器回调 | 余额 + 每日签到 |
 | `qoder` | Qoder（阿里系） | 设备码轮询 | 余额 + 每日领取 |
@@ -786,7 +787,7 @@ CodeBuddy 账号列表，而不是本插件备份。两者结构完全不同：
 | `token_type` / `account_type` | 原值，缺省 `Bearer` / `personal` |
 | `enterprise_id` | 缺省 `''`（个人版为空串，与真实凭据一致） |
 
-⚠️ **provider 按 JWT `iss` 的主机名分派**：含 `workbuddy` → 国际版，否则 → `buddy`。
+⚠️ **provider 按 JWT `iss` 的主机名分派**：`www.workbuddy.cn` / `workbuddy.cn` → 国内版，其他含 `workbuddy` 的域 → 国际版，否则 → `buddy`。若凭据由共用的 CodeBuddy 域签发，仅凭 issuer 无法区分，保留 `buddy` 归属。
 两套 provider 是**不同路由**，认错会让凭据发到错误的端点。
 
 ⚠️ **账号 id 由 uid 经 FNV-1a 哈希确定性生成**（`stableShortId`），与插件自己登录

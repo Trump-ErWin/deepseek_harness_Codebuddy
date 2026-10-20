@@ -229,7 +229,7 @@ export function providerLabel(id) {
  * 原先按「同源产品、将来可能开放」保留，但既然该产品没有这个功能，
  * 留着就是等一个不会到来的能力。
  */
-const GROWTH_TASK_PROVIDERS = new Set(['buddy']);
+const GROWTH_TASK_PROVIDERS = new Set(['buddy', 'workbuddycn']);
 
 /**
  * Accio 的「每日额度」桶名 —— 必须与宿主 `src/accio-credits.ts` 的
@@ -4092,6 +4092,11 @@ function ProviderPanel({ provider, rpcCall }) {
 
 
   return React.createElement('section', { 'aria-label': `${provider} 账号管理` },
+    // 国内两产品的余额是同一份权益，明确提示用户避免相加。
+    provider === 'buddy' || provider === 'workbuddycn'
+      ? React.createElement('p', { className: 'dim-jh-hint' },
+          'CodeBuddy 与 WorkBuddy 国内版的同一账号共用积分，余额不可重复相加；永久积分锁定同步生效，模型与倍率按产品区分。')
+      : null,
     // 标题与按钮分开成两块（而不是同一行的 space-between）：操作按钮多达 5 个，
     // 与面板标题挤在一行时既会被压缩又会溢出。标题独占一行、按钮组另起一行
     // 并允许换行，窄面板下也能完整显示。
@@ -6174,7 +6179,7 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
  * `WIRED_EXPIRY_PROVIDERS` ⇒ 同改，理由同上。
  */
 const AGG_WIRED_CHANNEL_LABELS =
-  'buddy / workbuddy / loomy / codearts / zcode / lobsterai / trae / accio / officeace / modelscope / autoclaw';
+  'buddy / workbuddy / workbuddycn / loomy / codearts / zcode / lobsterai / trae / accio / officeace / modelscope / autoclaw';
 
 /**
  * 「按临期排序」模式下面板**自动重探**临期顺序的间隔（用户 2026-10-16 从 5 分钟改为 **2 分钟**）。

@@ -1215,6 +1215,10 @@ export class AccountPool {
    */
   permanentLocked(provider: string): boolean {
     this.ensureLoaded()
+    // 国内两产品消耗同一积分池，任一已有锁定都必须同时保护两条渠道。
+    if (provider === 'buddy' || provider === 'workbuddycn') {
+      return this.permanentLockCache.buddy === true || this.permanentLockCache.workbuddycn === true
+    }
     return this.permanentLockCache[provider] === true
   }
 
@@ -1229,8 +1233,12 @@ export class AccountPool {
     if (provider.length === 0) return
     this.ensureLoaded()
     const next: PermanentLockMap = { ...this.permanentLockCache }
-    if (locked) next[provider] = true
-    else delete next[provider]
+    const providers = provider === 'buddy' || provider === 'workbuddycn'
+      ? ['buddy', 'workbuddycn'] : [provider]
+    for (const id of providers) {
+      if (locked) next[id] = true
+      else delete next[id]
+    }
     this.permanentLockCache = next
     await this.persistLocks()
   }
@@ -1267,13 +1275,19 @@ export class AccountPool {
   /** 锁定表的当前快照（备份导出用；权威来自独立文档）。 */
   permanentLocksSnapshot(): PermanentLockMap {
     this.ensureLoaded()
-    return { ...this.permanentLockCache }
+    const locks = { ...this.permanentLockCache }
+    if (this.permanentLocked('buddy')) {
+      locks.buddy = true
+      locks.workbuddycn = true
+    }
+    return locks
   }
 
   /** 全部处于锁定态的 provider（供设置页一次性读取）。 */
   listPermanentLocked(): string[] {
     this.ensureLoaded()
-    return Object.keys(this.permanentLockCache).filter(p => this.permanentLockCache[p] === true)
+    const locks = this.permanentLocksSnapshot()
+    return Object.keys(locks).filter(p => locks[p] === true)
   }
 
   /** 列出某个 provider 的所有账号（含状态信息）。

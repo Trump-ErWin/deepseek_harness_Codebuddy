@@ -157,6 +157,8 @@ function pickKnownAccountArray(value) {
 export function providerFromIssuer(issuer) {
   if (typeof issuer !== 'string' || issuer.length === 0) return 'buddy'
   const host = hostOf(issuer)
+  // 国内版与国际版必须按精确域区分；共用 CodeBuddy 签发域的旧凭据仍保留原归属。
+  if (host === 'workbuddy.cn' || host === 'www.workbuddy.cn') return 'workbuddycn'
   return host !== undefined && host.includes('workbuddy') ? 'workbuddy' : 'buddy'
 }
 

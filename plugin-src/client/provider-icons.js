@@ -270,6 +270,7 @@ export const PROVIDER_ICONS = {
   codearts: CODEARTS_ICON,
   buddy: CODEBUDDY_ICON,
   workbuddy: WORKBUDDY_ICON,
+  workbuddycn: WORKBUDDY_ICON,
   lobsterai: LOBSTERAI_ICON,
   qoder: QODER_ICON,
   qodercn: QODERCN_ICON,
