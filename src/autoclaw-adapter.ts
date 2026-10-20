@@ -61,6 +61,18 @@ export interface AutoclawAdapterOptions {
   /** 黑名单模型过滤。 */
   disabledModels?: () => ReadonlySet<string>
   /**
+   * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+   *
+   * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
+   * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
+   * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
+   * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+   *
+   * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
+   * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+   */
+  providerClosed?: () => boolean
+  /**
    * 读取图片附件字节（**图片通路必需**，2026-10-17 审计 P0 修复）。
    *
    * ⚠️ `zai_auto-fast` 的 `supportsImage: true` 有实测依据
@@ -193,6 +205,10 @@ export class AutoclawAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️⚠️ 「供应商整体关闭」⇒ 一条都不播（Gitee issue IKP8OF）。
+    // 必须在**任何上游请求之前**：关闭态下没必要再探活/拉目录，
+    // 且此时目录里可能有黑名单从未见过的 id（关闭之后才新增的）。
+    if (this.options.providerClosed?.() === true) return []
     const disabled = this.options.disabledModels?.() ?? new Set<string>()
     const credential = await this.probeCredential()
     if (!credential) return []

@@ -5454,8 +5454,17 @@ function readFileAsText(file) {
  */
 function providerRowSummary(row) {
   if (row.models === null && row.accounts === null) return '状态尚未读取';
+  // ⚠️⚠️ **已关闭时不得渲染 `模型 0（已关 0）`**（Gitee issue IKP8OF，文案自相矛盾）。
+  //
+  // 真实形态：用户关闭了供应商，随后它的账号被全部删除 / 目录被清空 ⇒
+  // 服务端 `{total:0, disabled:0, closed:true}`。此时按计数渲染会得到
+  // 「模型 0（已关 0）」，而同一行还在「已关闭」分组里 —— 用户看到的是
+  // 「一个没有模型的供应商被标成已关闭」，既不像事实也无法理解。
+  // ⇒ 已关闭时直接说「已全部关闭」，不再报计数（关闭态下计数没有信息量）。
   const models = row.models
-    ? `模型 ${row.models.total ?? 0}（已关 ${row.models.disabled ?? 0}）`
+    ? (row.checked === false
+      ? '模型已全部关闭'
+      : `模型 ${row.models.total ?? 0}（已关 ${row.models.disabled ?? 0}）`)
     : '模型 —';
   const accounts = row.accounts
     ? `账号 ${row.accounts.total ?? 0}（启用 ${row.accounts.enabled ?? 0}）`

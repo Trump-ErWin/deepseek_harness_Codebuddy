@@ -147,6 +147,20 @@ export interface AstudioAdapterOptions {
    *    （与 loomy / minimax / raccoon / zcode 的 `now` 同款约定）。
    */
   now?: () => number
+  /**
+   * 账号池（**黑名单过滤与「供应商整体关闭」的唯一数据源**）。
+   *
+   * ⚠️⚠️ **本字段曾经缺失，是一个静默缺陷**（Gitee issue IKP8OF 审计发现）：
+   * 本家是唯一把 `createModelCatalog` 的 deps 传成 `{}` 的适配器（其余各家都传
+   * `{ accountPool }`）⇒ 骨架里 `deps.accountPool?.disabledModelsFor(...)` 与
+   * `providerClosedFor?.(...)` 全部因 `?.` **静默跳过** ⇒
+   * **用户在 Jet Hub 里关掉的模型照样出现在选择器里**、关闭整个供应商也无效。
+   * 症状与 modelscope 那次「接线层漏实参」逐字相同：字段与消费点都在，只缺实参。
+   *
+   * ⚠️ 省略时（单测 / 嵌入方）行为退回「不过滤」，与修复前逐字节一致 ——
+   *    但**生产接线必须传**（由 `index.ts` 负责，且有守卫用例逐家点名）。
+   */
+  accountPool?: import('./account-pool.js').AccountPool
 }
 
 /** AStudio 适配器：Chat Completions 通道（实测上游原生兼容 OpenAI）。 */
@@ -195,7 +209,10 @@ export class AstudioAdapter extends LlmAdapter {
     // `model-catalog.ts`。`loadCatalog`/`syncCatalog` 两个回调**都必须给**，且
     // `syncCatalog` 不得在冷缓存时返回空数组（`jet-hub-rpc` 不 await 它）。
     this.catalog = createModelCatalog(
-      {},
+      // ⚠️⚠️ **必须传 `accountPool`**（Gitee issue IKP8OF 审计发现）：此前是 `{}`，
+      //    而其余各家都传 `{ accountPool }` ⇒ 本家的黑名单过滤与「整体关闭」
+      //    全部被 `?.` 静默跳过（关闭模型无效、关闭供应商无效）。
+      this.options.accountPool === undefined ? {} : { accountPool: this.options.accountPool },
       {
         product: this.product,
         loadCatalog: () => this.loadCatalogEntries(),

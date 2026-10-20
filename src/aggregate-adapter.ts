@@ -1420,6 +1420,18 @@ export class AggregateAdapter extends LlmAdapter {
    *     —— 目录身份保持稳定（`this.catalog` 不随门控漂移，这是上面那份不变式的另一半）。
    */
   async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️⚠️ **「聚合供应商整体关闭」必须在这里短路**（Gitee issue IKP8OF）。
+    //
+    // 本家手写 `listModels`（不走 `model-catalog.ts` 的共享骨架），故必须显式判一次。
+    // 实测遗漏形态：关闭聚合后登录一个新渠道 ⇒ 目录推导出新虚拟模型 ⇒
+    // 它**不在**旧黑名单里 ⇒ 仍可选。本文件虽有 `maintainProviderClosedState`
+    // 异步补写黑名单，但那条路有**两个前置条件**（黑名单非空 + 覆盖上一次全量目录），
+    // 且补写是 fire-and-forget（落盘失败只记 warn）⇒ 存在「补写落地之前」
+    // 的窗口，窗口内新模型**可被选中**。意图判据没有这个窗口。
+    //
+    // ⚠️ 放在 `catalogForListModels()` **之前**：关闭态下连目录推导都不必等
+    //（冷启动时那次推导要打全部渠道的上游，纯属浪费）。
+    if (this.options.accountPool.providerClosedFor?.(AGGREGATE_PROVIDER) === true) return []
     const models = await this.catalogForListModels()
     const disabled = this.options.accountPool.disabledModelsFor(AGGREGATE_PROVIDER)
     const entries: LlmModelInfo[] = []

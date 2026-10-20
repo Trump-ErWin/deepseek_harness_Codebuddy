@@ -6409,6 +6409,11 @@ function registerJetHubEndpoints(
         // 黑名单直接读账号池的进程内副本：开关写入后无需重建适配器，
         // 下一次 listModels 就会应用新的过滤结果。
         const disabledMap = pool.listDisabledModels(req.provider)
+        // ⚠️⚠️ 「该供应商是否被整体关闭」（Gitee issue IKP8OF）：意图为真时
+        // **每一条**模型都要显示成「已关闭」—— 与 `provider.status` 的 `closed`
+        // 同一判据，否则两处自相矛盾（分组说关了、逐条开关都说开着）。
+        // 纯内存同步读，零 IO（本端点已有同样的性能约束）。
+        const providerClosed = pool.providerClosedFor(req.provider)
         // ⚠️ `llm.listModels()` 返回的目录**已被适配器过滤掉黑名单**：所有适配器
         // 的 listModels 内部都会实时 `filter(m => !disabledModelsFor(provider).has(m.id))`。
         // 若直接对这个结果回填 disabled，就形成闭环矛盾——`disabledMap` 里的键恰好是
@@ -6469,7 +6474,13 @@ function registerJetHubEndpoints(
           models: catalog.map((model) => ({
             id: model.id,
             name: model.name,
-            disabled: disabledMap[model.id] === true,
+            // ⚠️⚠️ **「供应商整体关闭」意图为真 ⇒ 每条都显示为已关闭**（IKP8OF）。
+            // 否则设置页与 `provider.status` 自相矛盾：分组说「已关闭」，
+            // 而这里每条开关都显示「已打开」（意图关闭的模型**不在**黑名单里，
+            // 那正是本 issue 的成因）。用户据此会以为开关坏了。
+            // ⚠️ 打开任意一条即清除意图（见 `AccountPool` 的三个打开入口），
+            //    故这里的「全关」显示是**可操作**的，不是死状态。
+            disabled: providerClosed || disabledMap[model.id] === true,
             // ⚠️ **照实透传**：缺失即 false，**不推导**（黑名单命中也算用户主动关的，
             // 不是失效）。客户端据它灰显并显示「重新显示」按钮。
             dead: dead.has(model.id),
@@ -6725,11 +6736,24 @@ function registerJetHubEndpoints(
               },
             }
           } else {
-            await pool.setModelsDisabled(req.provider, pending)
+            // ⚠️⚠️ **「关闭全部模型」也必须落「关闭意图」**（Gitee issue IKP8OF，
+            // 对抗审计打穿：这是同一症状的**第二个入口**）。
+            //
+            // 判据是**语义同构**：作者已把「逐条关光 ⇒ 算已关闭」列为必须保留的
+            // 既有语义（`provider.status` 的派生腿 + 反向用例）。那么
+            // 「一次性关光全部」是同一语义的**批量形态**，它同样必须抗目录增长 ——
+            // 否则用户点「关闭全部模型」后，目录一变长就翻回「已打开」且新模型可选，
+            // 而点「关闭供应商」不会。**两个按钮给出不同的持久语义**，且无任何提示。
+            //
+            // ⚠️ 与关闭方向同理，**黑名单与意图必须同一次落盘**
+            //   （见 `writeModelsWithProviderClosed` 的注释：分两次会留下半套状态）。
+            await pool.writeModelsWithProviderClosed(req.provider, pending, true)
             ctx.logger.info(`[jet-hub] 关闭 ${req.provider} 的 ${pending.length} 个模型`)
           }
         } else {
           // 打开全部：纯本地操作，不读目录 —— 目录故障时用户仍应能把开关全打开。
+          // ⚠️ `clearDisabledModels` 内部会清「关闭意图」（见 `AccountPool` 的三个
+          // 打开入口收口），故这里不需要额外调用。
           await pool.clearDisabledModels(req.provider)
           ctx.logger.info(`[jet-hub] 打开 ${req.provider} 的全部模型`)
         }
@@ -6764,6 +6788,13 @@ function registerJetHubEndpoints(
        *
        * 适配器缺失（外部/旧适配器）时 `total = 0`、`closed = false`：
        * 保守判为「未关闭」，让用户可以尝试操作，而不是误报成已关闭。
+       *
+       * ⚠️ **唯一的例外是「关闭意图」**（Gitee issue IKP8OF）：用户**确实点过**
+       * 「关闭供应商」时，意图为真 ⇒ `closed: true`，即使适配器已缺失、`total = 0`。
+       * 这不是误报 —— 用户明确关过它，报「已关闭」才是如实。而且这种形态
+       * **可以自救**：前端 `providerSwitchState` 对 `closed === true` 一律允许点击
+       * （见该函数里「已关闭优先于没有模型可关」那条注释），点一下就清意图。
+       * ⇒ 不要按「适配器缺失 ⇒ 恒 false」写用例：那条不变式**已经不再成立**。
        *
        * ## ⚠️⚠️ `closed` 必须只走「安全方向」，故它在必要时**会去核实一次**
        *
@@ -6814,8 +6845,46 @@ function registerJetHubEndpoints(
             }
           }
           let closed = total > 0 && disabled === total
+          // ⚠️⚠️ **双腿取或**（Gitee issue IKP8OF）：上面那条是**派生**判据
+          //（目录里的每一条都在黑名单里），它有一个致命弱点 —— 目录**变长**时
+          // 新 id 不在黑名单里 ⇒ `closed` 翻回 `false` ⇒ 供应商静默回到「已打开」，
+          // 而新模型**仍可选**。
+          //
+          // 实测（真实 `ClineAdapter` + 真实 `AccountPool` 走完整 RPC 链路；
+          // 关闭那一刻 models.dev 未就绪 ⇒ 目录 3 条，恢复后补齐到 7 条）：
+          // ```
+          // 关闭后   {total:3,disabled:3,closed:true}
+          // 补齐后   {total:7,disabled:3,closed:false}   ← 缺陷：开关翻回「已打开」
+          // 而选择器里多出 4 条可选                        ← 真正的危害
+          // ```
+          //
+          // 「关闭**意图**」（`providerClosedFor`）与目录快照无关，故它管住
+          // 「目录增长」这一半；派生判据管住「用户逐条关光也算关闭」这一半
+          //（既有语义，有既有用例锁定，**不能**丢）。
+          //
+          // ⚠️ **不能只用意图**：用户在模型列表里逐条打开该供应商的模型后，
+          //    意图若仍为 `true` ⇒ 界面显示「已关闭」而模型**全部可选**
+          //    —— 正是 IKJW33 修过的矛盾态。故打开方向必须清除意图
+          //（见 `AccountPool` 的三个打开入口，它们在类内收口）。
+          const closedByIntent = pool.providerClosedFor(provider)
+          // ⚠️⚠️ **意图为真 ⇒ 计数也必须按「全部已关闭」报**（不只是 `closed`）。
+          //
+          // 否则设置页会出现自相矛盾的一屏：分组说「已关闭」，而模型列表里
+          // 每一条的开关都显示「已打开」（`disabled` 计数只数了黑名单，
+          // 而意图关闭的模型**不在**黑名单里 —— 那正是本 issue 的成因）。
+          // 用户据此会以为「开关坏了」。
+          //
+          // ⚠️ 但 `total` **不变**：它是目录条数（契约：不套黑名单的全量），
+          //    前端 `providerSwitchState` 的「`total === 0` ⇒ 禁用」判据依赖它。
+          if (closedByIntent) {
+            closed = true
+            disabled = total
+          }
           // ⚠️⚠️ 只有「即将报已关闭」才核实（危险方向，见方法头）。
-          if (closed) {
+          // ⚠️ 意图为真时**跳过核实**：核实是为了「证明目录里每一条都关着」，
+          //    而意图已经把整家关掉了 ⇒ 核实既无必要，还会因一次远端抖动
+          //    把 `closed` 翻回 false（正是本 issue 的形态）。
+          if (closed && !closedByIntent) {
             const full = await fullCatalogIds(ctx, modelAdapters, provider)
             // ⚠️⚠️ **判据是「远端读成功」，不是 `complete`**：`complete` 额外要求
             // 远端**非空**，而这里恰好有一个**正常**的空形态 ——
@@ -6931,7 +7000,17 @@ function registerJetHubEndpoints(
         if (req.enabled) {
           // 打开：清空黑名单（返回被清掉的条目数，供提示）。null 表示本就无关闭项。
           const cleared = pool.listDisabledModels(req.provider)
-          await pool.clearDisabledModels(req.provider)
+          // ⚠️⚠️ **清黑名单 + 清「关闭意图」必须同一次落盘**（Gitee issue IKP8OF，
+          // 对抗审计打穿的真实窗口）。原先走两步（`clearDisabledModels` → save #1，
+          // `setProviderClosed(false)` → save #2），两次之间磁盘上是
+          // 「黑名单空 + 意图真」；若第二次失败/进程被杀 ⇒ **重启后该供应商的
+          // 模型选择器恒空**（意图真 + 黑名单空），而设置页一条关闭项都没有
+          // ⇒ 用户无从归因。实测 `saves=2`。
+          //
+          // ⚠️ 而这条**危险路径恰好最常见**：只有「黑名单本来就空」时
+          // `clearDisabledModels` 才一次写完；黑名单非空（用户真关过东西、现在要
+          // 打开）时必然两次 —— 正是用户点「打开供应商」的典型情形。
+          await pool.clearModelsWithProviderClosed(req.provider)
           modelCount = Object.keys(cleared).length
         } else {
           const catalog = await fullCatalogIds(ctx, modelAdapters, req.provider)
@@ -7011,8 +7090,29 @@ function registerJetHubEndpoints(
           // 对齐后，提示才与用户观察到的结果一致。
           const disabledBefore = pool.listDisabledModels(req.provider)
           const pending = catalog.ids.filter((id) => disabledBefore[id] !== true)
-          await pool.setModelsDisabled(req.provider, catalog.ids)
+          // ⚠️⚠️ **黑名单与「关闭意图」必须同一次落盘**（Gitee issue IKP8OF）。
+          //
+          // 分两次写（先 `setModelsDisabled`、再 `setProviderClosed`）时，第二次失败
+          // 会留下「磁盘上黑名单已写、意图未写」的半套状态，而内存里意图已是 true
+          // ⇒ 本次会话看起来正常、**重启后静默复发**（目录一变长就翻回「已打开」）。
+          // 实测（把第二次 `replace` 改成抛 `disk full`）：
+          // ```
+          // setEnabled => {ok:false, error:{message:'disk full'}}   ← 用户看到了失败
+          // 磁盘: disabledModels={a:true,b:true} / providerClosed={} ← 半套
+          // ```
+          // ⇒ 用合并写入：要么都落盘、要么都不落盘（与 `queueStoreSave` 的
+          // 「同一份快照」约定同源）。
+          await pool.writeModelsWithProviderClosed(req.provider, catalog.ids, true)
           modelCount = pending.length
+          // ⚠️⚠️ **落「关闭意图」**（Gitee issue IKP8OF）：黑名单只是**当时的目录
+          // 快照**，而目录会继续变长（cline 三源异步 + models.dev 可恢复、其余家
+          // 后台刷新器补进上游新模型）⇒ 新 id 不在黑名单里 ⇒ 它们**仍可选**、
+          // 且 `provider.status` 的派生判据翻回「已打开」。
+          //
+          // 本意图与目录快照无关，故它是唯一能覆盖「关闭之后才出现的模型」的判据：
+          // - 选择器：各适配器的 `listModels` 见它即返回 `[]`；
+          // - `provider.status`：见它即报 `closed: true`。
+          //
         }
         // 账号状态**在模型之后**处理（顺序理由见上）。返回实际变更数，
         // 已是目标状态的账号不计入，避免提示夸大成「已停用 N 个」。

@@ -158,6 +158,18 @@ export interface OpencodeAdapterOptions {
   fetchRemoteCatalog?: OpencodeCatalogFetcher
   /** 用户模型黑名单。 */
   disabledModels?: () => ReadonlySet<string>
+  /**
+   * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+   *
+   * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
+   * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
+   * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
+   * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+   *
+   * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
+   * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+   */
+  providerClosed?: () => boolean
   /** 记录受限的副作用（切槽时由接线层提供）。 */
   markLimited?: (slotId: string, modelId: string, resetAtMs: number) => Promise<void>
   /** 诊断日志。 */
@@ -261,6 +273,10 @@ export class OpencodeAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️⚠️ 「供应商整体关闭」⇒ 一条都不播（Gitee issue IKP8OF）。
+    // 排在槽位读取之前：关闭态下不需要任何身份/目录工作，且新模型
+    // （关闭之后才进远端目录的）不在黑名单里，只能靠本判据拦住。
+    if (this.options.providerClosed?.() === true) return []
     const slots = await this.options.identitySlots()
     // 无任何槽 = 连匿名槽都没了（异常态）：返回空数组隐藏 provider 分组，
     // **不抛错**（抛错会多一条 provider 级报错，UI 表现为「供应商加载失败」）。
