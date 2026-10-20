@@ -1185,6 +1185,92 @@ const STYLES = `
    ⚠️ 本文件整体是模板字符串：注释里**绝不能出现反引号**（会提前闭合，
    esbuild 的报错会指向注释行、看起来像 CSS 写错）。本条注释就曾踩过。 */
 
+/* ── 窄屏（手机 / 远程访问，max-width 720px）──
+   POC（2026-10-17）：本插件此前**只有弹窗内部**有 3 处 media 查询，主布局
+   .dim-jh-layout 是写死的左右两栏且 .dim-jh-rail 固定 228px —— 手机宽度约
+   400px 时右面板只剩约 76px 可用，于是面板被压成一条窄缝、操作按钮被裁断、
+   中文提示逐字竖排（用户报障「手机端界面割裂」）。
+   修法：窄屏下改为**上下两段** —— 左栏降级为顶部横向可滑动的标签条，
+   右面板获得整宽。**只新增本块，不改任何既有规则**（故 228px 那条断言不受影响）。
+   ⚠️ 本文件是模板字符串，本注释内不得出现反引号。 */
+@media (max-width: 720px) {
+  .dim-jh-layout { flex-direction: column; }
+  .dim-jh-rail {
+    width: auto; flex: none;
+    display: flex; flex-direction: row; align-items: stretch;
+    gap: 8px; padding: 8px 10px;
+    overflow-x: auto; overflow-y: hidden;
+    border-right: 0;
+    border-bottom: 1px solid var(--dsw-alias-border-default, #e5e5e5);
+  }
+  /* 分组外壳在横向条里不再需要：display: contents 让 provider 按钮
+     直接参与父级 flex，避免每个分组各占一整行。 */
+  .dim-jh-railGroup { display: contents; }
+  .dim-jh-railGroupTitle { display: none; }
+  .dim-jh-providerRow { flex: none; }
+  .dim-jh-provider { width: auto; min-height: 40px; padding: 6px 10px; }
+  .dim-jh-panel { padding: 14px 12px; }
+}
+
+/* ── 窄屏：用量浮层（聊天输入区那枚徽标展开的面板）──
+   POC（2026-10-17，报障「对话框的这里 ui 也需要适配」，附窄屏截图）：
+   现象是浮层**左边缘被裁** —— 账号名首部被吃掉、分桶说明只剩右半截、
+   按钮文案被截断。
+   根因（无头 Edge 实测，徽标靠左时）：
+     VW=492 badge=134~151 pop=-89~151 w=240 L_OVER=true
+   即 .dim-jh-badgePop 的内联定位 right:0 以**徽标**为锚点向左展开
+   （见 usage-badge.js 的 POPOVER_ANCHOR_STYLE），而窄屏下徽标位于 composer
+   左侧 ⇒ 向左展开必然越出视口左边界。
+   ⚠️ 内联样式优先级高于普通规则，故这里**必须**用 !important 才能覆盖它
+   （这也是该浮层唯一一处需要 !important 的地方）。
+   ⚠️⚠️ **必须同时覆盖 bottom** —— 这是实测出来的，不是推理：
+   内联那份是 bottom: calc(100% + 8px)，它相对**定位祖先**计算。一旦改成
+   position: fixed，那个百分比的含义就从「composer 高度」变成「视口高度」，
+   实测浮层被推到 top=-193（OFFSCREEN=true，整块飞出屏幕上方）。
+   ⇒ 窄屏下改为视口锚定：左右各留 8px（横向永不越界），
+   纵向**停在输入区上方**（bottom 留出 composer 高度），而不是贴屏幕底 ——
+   贴底会盖住输入框，那是另一个形态的「割裂」（原设计本就是浮在输入区上方）。
+   88px 是手机端 composer（一行输入 + 工具条）的实测高度量级，
+   再加 safe-area 让全面屏底部手势区不压到浮层。
+   修法后实测（VW=492x808）：
+   pop L=8 R=484 T=525 B=800 z=300，H_CUT=false V_CUT=false，
+   合计读数与账号名两端均完整。
+   ⚠️ 本注释内**不得出现反引号**：本文件整体是模板字符串，反引号会提前闭合它
+   （AGENTS.md 红线；本文件的 usage-badge-client.spec.ts 有专条用例逐块扫描注释）。
+
+   ⚠️⚠️ **z-index 为什么是 300**（不是随手取的数）：
+   本插件常与「把 DSH Web 包成手机 App」的**外壳类插件**同用（不在本仓库，
+   例如 dsh-mobile，其仓库为 github.com/saya-ch/dsh-mobile）。这类外壳在窄屏下
+   会**接管整个页面布局**，并自带两套层级：
+
+     ① 服务端替换 layout 模块那一套（.dshm-shell 体系）：
+        scrim 65 / drawer 70 / details 80 / overlay 90；
+     ② App 适配模式那一套（NATIVE_MOBILE_STYLES，全带 !important）：
+        backdrop 235 / sidebar 240 / sidebar-root 241 / details 250 / toast 330。
+
+   浮层内联只有 40，两套都比它高 ⇒ 抽屉一拉开就把浮层盖住。取 **300** 的判据是
+   **两头都要满足**：
+     - 下限：> 250（压过 ② 里最高的 details），否则 App 适配模式下仍被盖；
+     - 上限：< 1000（本文件的 .dim-jh-loginOverlay 是 1000、.dim-jh-modalOverlay
+       是 3000）—— 浮层绝不能盖住自己的登录页与设置弹窗。
+   区间 (250, 1000) 内的取值即可；300 取在下沿附近，给宿主侧将来插入新层留余量。
+   ⚠️ 证据等级：65/70/80/90 与 235/240/241/250 是**读源码实测**（dsh-mobile 0.6.12）；
+   「在真机上浮层是否真的不被盖」**未在真机量化验证**，只做过无头浏览器视口模拟
+   （页面左侧压一个 z-index 70 的抽屉时 ABOVE=true）。 */
+@media (max-width: 720px) {
+  .dim-jh-badgePop {
+    position: fixed !important;
+    left: 8px !important;
+    right: 8px !important;
+    top: auto !important;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 88px) !important;
+    width: auto !important;
+    max-width: none !important;
+    max-height: calc(100vh - 140px) !important;
+    z-index: 300 !important;
+  }
+}
+
 `
 
 /**
