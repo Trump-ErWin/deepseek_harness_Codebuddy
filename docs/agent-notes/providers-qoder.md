@@ -218,3 +218,154 @@ poe = { prod: { center: `https://${Mme}`, webSearch: `https://${Mme}`, … } }
   本插件**未接入**它 —— 默认走 `qoder` 后端（用户机器上也是默认）。
 - 国际版（`qoder` 非 CN）的搜索 host 官方源码写的是 `center.qoder.sh`，
   实测三个 host 都能通；本插件用 `product.encryptedInferBase`（`api2.qoder.sh`）。
+
+## ⚠️⚠️ 远端模型目录：静态兜底表**必然腐坏**，已改走 `/api/v2/model/list?Encode=1`（2026-10-20）
+
+### 用户报障与根因
+
+「Qoder（含中国版）里 DeepSeek-Flash 上游已经 **0×（免费）** 了，插件列表还显示 **0.1**」。
+
+根因是**结构性的**：本家此前**恒用编译期兜底表**（`QoderProduct.fallbackModels`，
+国际版快照 2026-09-21 / 中国版 2026-09-27），一次远端请求都不发
+（`catalogEntries()` 直接 `product.fallbackModels.map(...)`，`loadCatalog` 与
+`syncCatalog` 是同一份）。上游改价/改免费额度/上下架模型都不会通知任何人。
+
+**真机对账（2026-10-20，两站各自最新的 `catalog-v6`）**：
+
+| 现象 | 兜底表 | 上游实际 |
+|---|---|---|
+| `dfmodel`（DeepSeek-Flash） | `price_factor = 0.1` | **`0` + `is_free` + 原价 0.1**（IDE 显示 `0.1×`划掉`0×`） |
+| `mmodel` | 国际 `MiniMax-M3`/0.2、CN `MiniMax-M2.7`/0.2 | **`MiniMax-M3.1-Flash` / 0.1**（CN 的 `is_vl` 还是 false→true） |
+| `fast` | 无此条 | 有（`price_factor 0.8`，见下面的版本闸门） |
+| `qmodel_38max` / `qmodel_latest` / `qmodel` | 存的是**采集时刻的折后价** | 现在下发**窗口外原价**，且 `qmodel_latest` 的 `promotion` **整块被删**（我们会显示一个不存在的折扣） |
+| 国际 `ultimate` / `efficient` | 无 promotion / 窗口 1M | 新增 promotion(0.2/2) / 最大档 **200K** |
+
+### 协议（取自 IDE 产物 + 真机实测）
+
+客户端 `qoder-worker-runtime` 的 `listModelsFromRemote`：
+
+```js
+let s = "/api/v2/model/list?Encode=1"           // 可再拼 &outerProviders=…
+let A = JqA(g, s, this.authManager)             // ← WASM 签名（prepareRequest）
+await this.fetchWithTrace({ operation:"listModels", endpointType:"infer",
+  method:"GET", path:s, url:A.url, init:{ method:"GET", headers:A.headers } })
+let E = rb(await B.text())                      // ← rb = decrypt_server_response（失败即明文）
+let u = JSON.parse(E)                           // { 场景: [模型…] }
+```
+
+四条**实测边界**（`src/qoder-catalog.ts` 的模块头有完整版）：
+
+1. **host = `encryptedInferBase`**，WASM 自己补 `/algo` 前缀
+   ⇒ 实发 `…/algo/api/v2/model/list?Encode=1`（手写 `/algo` 会 404）。
+2. **只发 GET、无 body**，鉴权是 WASM 生成的 `Bearer COSY.<载荷>.<签名>`（18 个头）。
+3. **`Encode=1` 不保证响应加密** —— 两站实测都回**明文 JSON**
+   （`decrypt_server_response` 失败即明文，与官方 `rb()` 逐字同形）。
+4. **响应是 `{场景: [模型]}`**：`chat / developer / assistant / inline / quest /
+   qwork / experts / qwake / app / byok_teams / byok_enterprise`；本插件取 `chat`。
+
+### ⚠️⚠️ 版本闸门：`fast` 拿不到是**设计如此**，不是缺陷
+
+条目可带 `minimal_version: {app, cli, qoder_wake, vsc}`，服务端按**请求方自称的
+客户端类型**选命名空间比较。同一账号、只改身份与版本的实测：
+
+| 身份 + 声明版本 | `chat` 条数 | `fast` |
+|---|---|---|
+| `client_type=5`（cli，本插件）+ `1.1.49`（= `COSY_VERSION`） | 14 | ✗ |
+| `client_type=5` + `1.1.69` | 14 | ✗ |
+| `client_type=5` + `1.1.70` | 15 | ✓ |
+| `client_type=10`（app，IDE 用它）+ `0.4.8` | 14 | ✗ |
+| `client_type=10` + `1.1.66` | 15 | ✓ |
+| `client_type=10` + `1.1.69`（= IDE 的 SDK 版本常量 `NH`） | 15 | ✓ |
+
+⇒ 闸门是 `{app: 1.1.66, cli: 1.1.70}`，IDE 是 **app 身份 + 1.1.69** 才刚好过。
+本插件用 **cli 身份 + 1.1.49** ⇒ 需要 1.1.70 才够，故**天然拿不到 `fast`**
+（用户 2026-10-20 明确「不需要这种 IDE 融合档位」）⇒ **刻意不动 `COSY_VERSION`**：
+它同时被**推理**签名使用，为一个融合档位抬高声明版本属未经实测的改动。
+**其余 14 个模型不受影响**（1.1.49 下 `dfmodel` 的 `price_factor/is_free/
+original_price_factor` 与 `mmodel` 的改名都已是最新值）。
+
+### ⚠️⚠️ `is_reasoning=false` 不是「不支持思考」—— 两条信号相互独立（2026-10-20 用户追问）
+
+用户追问：「实测 CN 的 DeepSeek-Flash 支持思考、也有档位，为什么列表里
+`is_reasoning=false`？」
+
+**因为上游这两个信号本来就分开，且可以反向**：
+
+| 信号 | 来源 | 决定什么 |
+|---|---|---|
+| 思考档位清单 | 目录 `thinking_config.enabled.efforts` 的键 + `disabled` 分支 | **UI 的档位下拉**（`qoderEffortsFor`；CN `dfmodel` = 高/最大/低 + 关闭思考） |
+| 是否真的思考 | 请求体 `parameters.reasoning_effort` + `enable_thinking` | 服务端行为 |
+| `is_reasoning` | 目录字段 | **只是**写进 `model_config.is_reasoning` / `chat_context.extra.modelConfig.is_reasoning` |
+
+**真机实测**（本插件自己的链路，CN `dfmodel`，其 `is_reasoning` = false，
+免费模型零成本）：`reasoning_effort=max` → **238 字符**思考、`low` → **199**、
+`none` → **0**（关得掉）⇒ 支持思考、档位真实生效、`false` 完全不影响。
+
+**客户端源码同款**（`qoder-worker-runtime` 的 `fal()`）：
+
+```js
+s = r?.is_reasoning ?? false            // 目录值原样取
+u = { key, …, is_reasoning: s, … }      // → modelConfig.is_reasoning
+…
+(0 === o?.thinkingBudget || 'none' === h.reasoning_effort || false === h.enable_thinking)
+  && (l.is_reasoning = false)           // ⚠️ 只会强制成 false，**从不置 true**
+```
+
+⇒ IDE 对同一模型发出去的**也是 `false`**，我们与它逐字一致（`supportsThinking`
+在适配器里**只有一处**用途：`isReasoning: fallback?.supportsThinking ?? false`）。
+⇒ **不要**据此把 `efforts` 丢掉，也**不要**为了「看起来对」把它改成 true
+（那会与 IDE 的请求体分叉，且 `is_reasoning` 的服务端语义**未验证**）。
+
+⚠️ 关联记录：`performance` / `qmodel_latest` / `qmodel` / `kimi` 系等条目
+同样是 `is_reasoning=false` 却有档位（INTL 的 `performance` 早在静态表年代
+就登记过这一格）。
+
+### ⚠️ 目录是**按账号**下发的，且 upsert 语义是「整体替换」
+
+- 实测同一 provider 下不同账号拿到的条数**不同**：国际版 9 个凭据里有一个
+  免费额度号，上游只给它 **2 条**（`qfmodel` + `dfmodel`），其余 17 条。
+- 适配器缓存是「**上一次成功那一个账号的目录**」（20 分钟 TTL）。
+  ⚠️ 导入的后果已如实登记：多账号池下，谁被选中决定菜单宽窄；
+  **不要**把多个账号的目录并集起来（那会宣告当前账号用不了的模型，
+  报错面比菜单短更难排查）。
+
+### 接线三点（缺一即静默失效，与其余 12 家同形）
+
+1. **取数在 auth 服务**：`QoderAuth.fetchModels(pool)` 只做池的**只读**读取
+   （`getAvailableAccount`，不写任何账），池空时回退默认 ref。
+   ⚠️ **不得**改成适配器里的 `resolveCredential` —— 它选中账号时会
+   `reportAccount`（写「本次实际使用的账号」），而目录请求是周期性的
+   （20 分钟刷新器），会把额度标记**改写到目录用的账号**上
+   （`index.ts` 的 `activeQoderAccountId` 注释逐字警告过这个后果）。
+   守卫：`qoder-auth.spec.ts` 的「池必须只读」（`updateAccount` 不得被调用）
+   + `qoder-adapter.spec.ts` 的「目录取数不得走 `resolveCredential`」。
+2. **`refresh()` 必须转发** `catalog.refresh`（否则后台刷新器对本家空转且零日志，
+   `be42b25` 的形态）；已被 `model-catalog-parity.spec.ts` 的逐家点名表覆盖
+   （12 → **14** 家）。
+3. **`onCatalogLoaded` 必须接广播**（`registerQoderLlm` 已注入
+   `broadcastCatalogChanged(ctx)`）：DSH 客户端把目录缓存在 `ready` 即短路的
+   store 里，远端目录异步落地后不广播 ⇒ 选择器**永久**停在冷启动那份兜底表。
+
+### 单测/探针的两个实测教训
+
+- ⚠️⚠️ **该端点对「伪造凭据」也回 200**（返回**真实目录**）。中途一版实现把
+  取数放在适配器内 + 走全局 `fetch` ⇒ **每个单测都真发 HTTPS 并拿到上游真表**，
+  「自定义 product + 单条兜底表」的 4 条用例以 `Auto · x0.5`（而非 `Unknown`）
+  失败。⇒ 适配器**不再自己发请求**（注入式），单测默认不接线即恒走兜底表。
+- ⚠️ 既有的 `qodercn-probe.e2e.spec.ts` **「续期」用例是写操作**
+  （`/device_token/refresh` 会轮换 `refresh_token` 且探针**不落盘**）——
+  文件头原写「全部只读」。已加二次确认闸门
+  （`DSH_QODERCN_E2E_REFRESH_CONFIRM=yes`）。⚠️ 本轮跑过一次，已把轮换后的
+  凭据手工回写该 CN 账号（并同步池的 `expiresAt`），
+  `userinfo` 复验 200。
+
+### ⚠️ 不在这条链路上的东西
+
+- **「1017」这类版本串不在模型列表里**：它是 IDE 的**遥控文案**
+  （`GET {base}/ide-text/latest?namespace=…` → OSS，缓存名 `dynamic-texts.json`，
+  键 `modelSelector.item.dfmodel.markdownDescription`）。模型列表只给
+  `display_name = "DeepSeek-Flash"` ⇒ 我们的列表能反映「已免费」，
+  但**显示不出 `-1017` 这个版本后缀**（不接 `ide-text` 就没有）。
+- 本机 `~/.qoder{,-cn}/.models/{uid}/catalog-v6` 能离线解出同一份数据
+  （只需 uid，`model_cache_decrypt`），但**只对该账号在本机 IDE 打开过时存在**
+  ⇒ 纯插件用户恒为空；线上路径不用它，只用于排查对账。

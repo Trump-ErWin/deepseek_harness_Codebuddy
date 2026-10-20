@@ -723,8 +723,11 @@ id: 'autoclaw',
     // ⚠️ 从 `CASES` 遍历 ⇒ 新增 provider 自动纳入（漏一家即被点名）。
     // ⚠️ `catalog` 无 `refresh` 的家自动跳过：那表示它的目录不走共享骨架
     //    （opencode / autoclaw / officeace / modelscope / aggregate），
-    //    或它的 `createModelCatalog` 没给 config 回调（cline / gemini / qoder）
+    //    或它的 `createModelCatalog` 没给 config 回调（cline / gemini）
     //    —— 后者是**已知的、已如实登记的**独立缺口，不在本条判据的范围内。
+    //    ⚠️ 2026-10-20：**qoder / qodercn 已补齐**（接入远端目录的同时补了
+    //    `refresh` 转发与 `onCatalogLoaded` 广播）⇒ 从「已知缺口」名单移出、
+    //    进下面的正向点名表。12 → 14。
     const missing: string[] = []
     const forwarding: string[] = []
     for (const c of CASES) {
@@ -749,10 +752,10 @@ id: 'autoclaw',
     //       **共用适配器类**，因此同样继承了 config 回调与转发（实测由本断言自己找出）。
     expect(
       forwarding.sort(),
-      '这 12 家必须都接入后台刷新（改这条名单前请先读 be42b25 与本轮修正的注释）',
+      '这 14 家必须都接入后台刷新（改这条名单前请先读 be42b25 与本轮修正的注释）',
     ).toEqual([
       'accio', 'astudio', 'buddy', 'codearts', 'lobsterai', 'loomy',
-      'minimax', 'minimaxintl', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'minimax', 'minimaxintl', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
   })
 

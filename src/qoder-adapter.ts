@@ -28,7 +28,9 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
 import { describeWasmFailure, QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
 // ⚠️ 原生搜索的契约来自**契约文件**（不是工具层 `web-native.ts`）：
@@ -467,38 +469,101 @@ export interface QoderAdapterOptions {
    * 「等了几次、每次多久」，并在毫秒级完成。
    */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
+  /**
+   * 「远端模型目录已落地」的回调。
+   *
+   * ⚠️ **必须由接线层注入 `broadcastCatalogChanged(ctx)`**（`registerQoderLlm`
+   * 已代劳）：DSH 客户端把目录缓存在 `status === 'ready'` 即短路的 store 里，
+   * 只有收到 `llm/adapters-updated` 才重读 ⇒ 远端目录异步落地后不广播，
+   * 模型选择器会**永久**停留在冷启动那份兜底表上（`catalog-broadcast.ts` 记着
+   * 这条真实症状：设置页 5 个模型、对话框只剩 2 个）。
+   */
+  onCatalogLoaded?: () => void
+  /**
+   * 目录读取失败的告警出口（缺省静默）。
+   *
+   * ⚠️ 与「失败即回退兜底表」配套：回退是**静默**的，没有这条日志就没有
+   * 任何证据表明上游目录取不到（只剩「倍率不更新」这种无信息的症状）。
+   */
+  warn?: (message: string) => void
+  /** 注入的时钟（测试用；缺省 `Date.now`）。 */
+  now?: () => number
+  /**
+   * 拉取**远端模型目录**（由接线层注入 `QoderAuth.fetchModels(pool)`）。
+   *
+   * ## ⚠️ 为什么是「注入一个取数函数」而不是适配器自己解析凭据
+   *
+   * 适配器手上的取凭据入口是 `resolveCredential`，而它**有副作用**：
+   * 选中账号时会 `reportAccount(id)`（接线层据此维护「本次实际使用的账号」，
+   * 供额度报错时标记）。目录请求是**周期性**的 —— 20 分钟刷新器可能在一次
+   * 聊天请求选号之后跑到，把那个记录**改写成目录用的账号** ⇒ 额度标记落到
+   * 无辜账号上（真实后果见 `index.ts` 的 `activeQoderAccountId` 注释）。
+   *
+   * 故与其余 11 家同形：由 auth 服务做**只读**取号 + 拉取，适配器只拿结果。
+   *
+   * 省略时**不发远端请求**（恒用兜底表）—— 纯测试/未接线场景的安全默认。
+   */
+  fetchRemoteModels?: () => Promise<readonly QoderFallbackModel[]>
 }
 
 /** Qoder 模型适配器。使用 Bearer access_token 鉴权，仅支持 SSE。 */
 export class QoderAdapter extends LlmAdapter {
   private readonly product: QoderProduct
   private readonly fetchImpl: typeof fetch
-  /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
-  private readonly fallbackIndex: ReadonlyMap<string, QoderFallbackModel>
   /**
    * ⚠️ **2026-10-08 Task 7b：三个方法收敛到共享骨架** `createModelCatalog`。
    * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
    * 现在只剩 `toCatalogEntry`（本家私有形状 + 静态表判据 + 倍率格式）。
    */
   private readonly catalog: ModelCatalog
+  /**
+   * **远端**模型目录缓存（成功拉取后保留 20 分钟）。
+   *
+   * ⚠️ 2026-10-20 前本家**恒用编译期兜底表**（一次远端请求都不发），
+   * 上游改价/改免费额度/上下架模型都不会反映 —— 用户报障
+   * 「DeepSeek-Flash 上游已经 0×（免费）了，插件还显示 0.1」。
+   * 现在远端优先、兜底表只作回退（见 `src/qoder-catalog.ts`）。
+   */
+  private remoteModels: QoderFallbackModel[] | undefined
+  /**
+   * 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：前者存「有哪些模型」，
+   * 本字段存「何时读到的」（只有前者的目录永不刷新）。
+   */
+  private catalogAt = 0
+  /** 目录加载闸门：并发去重 + 失败/空结果冷却。 */
+  private readonly catalogGate: RemoteCatalogGate
 
   constructor(private readonly options: QoderAdapterOptions) {
     super()
     this.product = options.product ?? QODER
     this.fetchImpl = options.fetchImpl ?? fetch
-    this.fallbackIndex = new Map(
-      (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
+    this.catalogGate = new RemoteCatalogGate(
+      options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
     )
     // ⚠️ 共享骨架（Task 7b）：门控 → 读目录 → 黑名单 → 回填 → 三态。
-    // ⚠️ 本家恒用**本地兜底表**（不发网络请求）⇒ 两个取数回调是同一份。
+    // ⚠️ `loadCatalog` 走**远端优先**（内有新鲜度判据），`syncCatalog` 是**同步**
+    //    视图（远端未落地时回退兜底表）—— 两者分工见 `ModelCatalogConfig` 的注释。
     this.catalog = createModelCatalog(
       { accountPool: options.accountPool },
       {
         product: this.product,
-        loadCatalog: () => this.catalogEntries(),
+        loadCatalog: () => this.loadCatalogEntries(),
         // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
         unknownModelInputModalities: () => ['text'] as const,
-        syncCatalog: () => this.catalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        /**
+         * ★ **强制重拉**（后台 20 分钟刷新器 + 「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者自带新鲜度判据 ⇒ 新鲜时**不拉**；
+         * 本回调要的是「无视新鲜度，强制拉一次」。故先清时刻再调同一方法
+         * —— **不另写一份拉取逻辑**（两条路的上游行为才不会分叉）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          await this.ensureRemoteModels()
+        },
       },
     )
   }
@@ -770,16 +835,28 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   /**
+   * 按 id 取**当前**目录条目（远端优先，回退编译期兜底表）。
+   *
+   * ⚠️ **不能用构造期的静态索引**：只存在于远端的模型（如 `fast`）查静态表会得到
+   * 「未知」，而本方法与 `stream()` 都把它当**能力判据**用 —— `accio` 记过同款教训
+   * （把「未知」当「明确不支持」会让能力**静默变窄**：图片被拒、档位消失）。
+   */
+  private catalogModel(id: string): QoderFallbackModel | undefined {
+    return this.catalogSource().find((model) => model.id === id)
+  }
+
+  /**
    * 模型接受的输入模态。
    *
-   * 按**模型**判定（兜底表的 `supportsImage`），不是按 provider 一刀切。
+   * 按**模型**判定（目录条目的 `supportsImage`），不是按 provider 一刀切。
    * 未声明时**保守报 text**：宁可少报能力（用户改用文本描述），
    * 也不要报一个服务端不认的模态（请求会失败）。
    *
-   * ⚠️ 兜底表是本地估计值，不是远端权威数据 —— 见 `qoder-product.ts` 的说明。
+   * ⚠️ 判据取自 `catalogModel()`（远端优先）—— 远端下发的能力**不是**本地估计值，
+   * 这一点与 2026-10-20 之前「查本地兜底表」的写法相反。
    */
   private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
-    return this.fallbackIndex.get(model)?.supportsImage === true ? ['text', 'image'] : ['text']
+    return this.catalogModel(model)?.supportsImage === true ? ['text', 'image'] : ['text']
   }
 
   /**
@@ -796,18 +873,22 @@ export class QoderAdapter extends LlmAdapter {
    * （以「模型目录。」开头、讲「Qoder 的模型列表端点需要 WASM 签名」）——
    * 它本来是某个已被删掉的方法的文档，删方法时留下了壳。
    * 它与紧邻的本块连在一起看像「同一个方法有两套互相矛盾的文档」。
-   * 已删除；那段内容里仍然有效的部分（恒用产品兜底表、不发网络请求）
-   * 在下面 `toCatalogEntry` 的注释里。
+   * 已删除。
+   *
+   * ⚠️ **那段旧文档里「恒用产品兜底表、不发网络请求」这句已于 2026-10-20 作废**：
+   * 本家现在与其余 12 家同形 —— 远端优先（`src/qoder-catalog.ts`）、
+   * 兜底表只作回退。见 `catalogSource()` 的注释。
    */
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }
 
   /**
-   * 把本家兜底表条目转成共享骨架的中间结构。
+   * 把本家目录条目（**远端优先**，回退兜底表）转成共享骨架的中间结构。
    *
-   * ⚠️ 本家**恒用本地兜底表**（不发网络请求，见 `listModels` 的说明），
-   * 故 `loadCatalog` 与 `syncCatalog` 取同一份数据。
+   * ⚠️ 远端条目经 `src/qoder-catalog.ts` 归一成与兜底表**同形**的结构后才到这里
+   * ⇒ 倍率/档位/能力三条判据对两条来源**完全同源**（不会出现「远端少了某个
+   * 字段于是倍率不显示」这类分叉）。
    */
   private toCatalogEntry(model: QoderFallbackModel): CatalogEntry {
     const reasoning = this.reasoningForEntry(model)
@@ -857,8 +938,87 @@ export class QoderAdapter extends LlmAdapter {
     }
   }
 
-  private catalogEntries(): readonly CatalogEntry[] {
-    return this.product.fallbackModels.map((model) => this.toCatalogEntry(model))
+  /**
+   * 目录来源：**远端优先**，未落地时回退编译期兜底表。
+   *
+   * ⚠️ 回退不是「优化」而是**必需**：纯插件用户（或上游目录接口故障时）
+   * 若目录为空，DSH 的 `buildModelCatalog` 会把该 provider 判成「没有模型」
+   * 而**整个隐藏**（`providerCatalogVisible` 之外的第二层门）。
+   */
+  private catalogSource(): readonly QoderFallbackModel[] {
+    return this.remoteModels ?? this.product.fallbackModels
+  }
+
+  /** 同步视图（`listAllModels()` 与 `CatalogEntry` 转换共用）。 */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    return this.catalogSource().map((model) => this.toCatalogEntry(model))
+  }
+
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    await this.ensureRemoteModels()
+    return this.syncCatalogEntries()
+  }
+
+  /**
+   * 懒加载远端模型目录（**每 20 分钟**一次；失败/空结果走闸门冷却）。
+   *
+   * 三条口径与其余 12 家逐字同构：
+   * 1. 入口用 `isCatalogFreshFor`（多一条「用户刚改设置⇒立即失效」的正交腿）；
+   * 2. 并发去重与失败冷却交给 `RemoteCatalogGate`（同一份实现，不自己写判据）；
+   * 3. **只在成功时**记 `catalogAt`（失败也记会让一次网络抖动把 TTL 上界刷掉，
+   *    下一轮要再等满 20 分钟才发现上游没恢复）。
+   */
+  private async ensureRemoteModels(): Promise<void> {
+    if (this.remoteModels !== undefined
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.nowImpl())) {
+      return
+    }
+    await this.catalogGate.run(async () => {
+      const models = await this.loadRemoteModels()
+      if (models.length === 0) return false
+      this.remoteModels = [...models]
+      this.catalogAt = this.nowImpl()
+      return true
+    })
+  }
+
+  /**
+   * 真发一次远端目录请求（失败返回空数组，由闸门记冷却）。
+   *
+   * ⚠️ **不在这里解析凭据**：取数是接线层注入的 `fetchRemoteModels`
+   *（= `QoderAuth.fetchModels(pool)`），它只做池的**只读**读取。
+   * 理由见 `QoderAdapterOptions.fetchRemoteModels` 的长注释
+   *（走 `resolveCredential` 会把「本次实际使用的账号」改写成目录用的账号）。
+   */
+  private async loadRemoteModels(): Promise<readonly QoderFallbackModel[]> {
+    const fetchRemote = this.options.fetchRemoteModels
+    if (fetchRemote === undefined) return []
+    try {
+      return await fetchRemote()
+    } catch (error) {
+      this.options.warn?.(
+        `[qoder] 模型目录读取失败，退用内置兜底表：${errorMessage(error)}`,
+      )
+      return []
+    }
+  }
+
+  private nowImpl(): number {
+    return this.options.now?.() ?? Date.now()
+  }
+
+  /**
+   * ★ **后台目录刷新入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ **必须显式转发** `catalog.refresh`：`ModelCatalog` 上的成员**不会**
+   * 自动变成适配器的成员（`dead-model-store.ts` 的 `pruned()` Proxy 只透传
+   * **适配器自己的**成员）。漏转发 ⇒ 刷新器「已武装」却对本家**空转**，
+   * 且**零日志** —— 这条陷阱在 `accio-adapter.ts` 有逐字记录（`be42b25` 踩过）。
+   * ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**续期）**不是同一件事**，
+   * 两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
@@ -980,7 +1140,7 @@ export class QoderAdapter extends LlmAdapter {
     // （用户报障「qwen3.8-flash 执行任务出现任务调用 xml 泄露任务终止」）。
     const tools = buildQoderTools(options.tools)
 
-    const fallback = this.fallbackIndex.get(options.model)
+    const fallback = this.catalogModel(options.model)
 
     /**
      * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
@@ -1477,7 +1637,15 @@ export function qoderDisplayName(model: QoderFallbackModel, now: Date = new Date
  */
 export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): QoderAdapter {
   const product = options.product ?? QODER
-  const adapter = new QoderAdapter(options)
+  const adapter = new QoderAdapter({
+    ...options,
+    // ⚠️ 两项都**只在调用方没给时**兜底：`onCatalogLoaded` 必须接到广播上
+    //（远端目录异步落地后不广播 ⇒ 模型选择器永久停在冷启动那份兜底表），
+    // `warn` 接 `ctx.logger`（否则「目录读取失败」是一条零日志的静默回退）。
+    onCatalogLoaded: options.onCatalogLoaded ?? (() => { broadcastCatalogChanged(ctx) }),
+    warn: options.warn ?? ((message: string) => { ctx.logger?.warn?.(message) }),
+    product,
+  })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
