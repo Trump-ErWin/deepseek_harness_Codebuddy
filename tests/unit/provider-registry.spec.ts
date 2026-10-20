@@ -27,7 +27,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-it('共 21 条（20 个真渠道 + aggregate；codely 2026-10-19 UI 先行、暂 channel:false）', () => {
+it('共 22 条（20 个真渠道 + aggregate + codely；codely 2026-10-20 仍 channel:false）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
@@ -37,7 +37,10 @@ it('共 21 条（20 个真渠道 + aggregate；codely 2026-10-19 UI 先行、暂
     // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（魔搭，第 20 个真渠道）：上游没有它。
     //    ⚠️ 合并上游时**不要**把这里改回上游数字 —— 那会让两个声明都失去守卫
     //    （条数断言是「注册表没被误删」的唯一防线）。
-    expect(PROVIDER_REGISTRY).toHaveLength(21)
+    // ⚠️ 2026-10-20 合并 remote master 时 astudio 随上游并入（21 → 22 条），而本条
+    //    期望值当时仍是上游的 21 ⇒ 变红。按**注册表事实**更正为 22（这条断言是
+    //    「注册表没被误删」的唯一防线，数字必须跟着注册表走，不能反向改注册表凑数）。
+    expect(PROVIDER_REGISTRY).toHaveLength(22)
     expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(20)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'codely')?.channel).toBe(false)
@@ -157,11 +160,9 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(win).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('rateLimit === false 恰好是 7 家（codely 2026-10-19 UI 先行加入，理由是「材料还没有」）', () => {
-  it('rateLimit === false 恰好是 6 家（astudio 2026-10-18 加入；accio 2026-10-18 退出）', () => {
+  it('rateLimit === false 恰好是 6 家（codely 2026-10-20 接线后退出；astudio 2026-10-18 加入）', () => {
     const off = PROVIDER_REGISTRY.filter((d) => d.rateLimit === false)
       .map((d) => d.id).sort()
-    // ⚠️ **六家理由分两类**（见 registry 里各自的字段注释）：
     // ⚠️ **理由各不相同**（见 registry 里各自的字段注释）：
     // - loomy：根本不返回限流错误（静默降级扣永久积分）；
     // - gemini / officeace：限流是服务端配额窗口制，本地标记与重测都不改变配额；
@@ -184,15 +185,17 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     //   ⚠️ **三处必须同改**（registry 本行 / `src/index.ts` 的 `probeById` /
     //   `tests/helpers/provider-sets.ts` 的 `WRITES_RATE_LIMIT_PROVIDERS`），
     //   由 `provider-runtime-wiring.spec.ts` 双向比对锁死 —— 本表是**第四道**闸。
-    // - codely（**本 fork**，2026-10-19 UI 先行）：探测适配器还没有 ⇒ 按钮点了必报
-    //   「没有探测适配器」。与 modelscope **不同源**（这里是「材料还没有」，
-    //   不是「用户不要」）；接线后**删除该行**（恢复缺省 true）。
+    // ⚠️ **codely 曾在这里，2026-10-20 退出**（7 家 → 6 家）：当初的理由是
+    //   「UI 先行阶段探测适配器还没有 ⇒ 按钮点了必报『没有探测适配器』」。
+    //   同日接上请求级换号 + 冷却（`codely-adapter.ts` 的 `updateModelRateLimit`
+    //   写点）+ `probeById.codely` 探测适配器后，理由已不成立 ⇒ 与 accio 同因退出。
+    //   ⚠️ 同样**三处同改**（registry 本行 / `probeById` / `WRITES_RATE_LIMIT_PROVIDERS`）。
     //
     // 新增一家时**不要**只改这里：判据是 registry 的落地问法
     //「这个按钮点下去，能不能让用户少受限一次？」——
     // ⚠️ 而 modelscope 打破的正是这条问法的前提（它**能**，只是不要）。
     //    ⇒ 所以「能」不再是必要条件，「用户是否要这个按钮」才是。
-    expect(off).toEqual(['astudio', 'autoclaw', 'codely', 'gemini', 'loomy', 'modelscope', 'officeace'])
+    expect(off).toEqual(['astudio', 'autoclaw', 'gemini', 'loomy', 'modelscope', 'officeace'])
   })
 
   it('accountTest === true 恰好是 gemini', () => {

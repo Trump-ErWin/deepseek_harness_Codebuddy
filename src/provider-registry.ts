@@ -612,7 +612,8 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    ⓪ 推理 ✅：**驱动官方 CLI 子进程**（签名密钥未取得，让官方客户端自己
     //       签名 —— 详见 `codely-adapter.ts` / `codely-cli.ts` 模块头）；端到端
     //       实测 4.0s 拿到非空 chunk（`codely-basic` 回复 "hello there"）。
-    //    ① `channel: true` ⏸ **暂缓**（本行，2026-10-20）；`rateLimit` 见下方说明。
+    //    ① `channel: true` ⏸ **暂缓**（本行，2026-10-20）；✅ `rateLimit` 已于同日
+    //       恢复缺省 true（换号 + 探测接线完成，见 `channel: false` 下方的说明）。
     //    ② `/auth/refresh` **端点已实测**（200、`refresh_token` 不轮换），实现待补。
     //    ③④⑤⑥ 见上方清单。
     //
@@ -626,11 +627,12 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    auth 键位 17→18、续期表、descriptor 21→22、modelAdapters 键集合……）。
     //    2026-10-20 实测后**回滚为 false**：先补齐那批登记再一次性翻，避免红仓库。
     channel: false,
-    // ⚠️ **UI 先行阶段刻意关闭限流按钮**：重测 / 重置依赖 `probeById` 里的探测适配器，
-    //    本 provider 还没有 ⇒ 按钮点了必报「没有探测适配器」（可见的死按钮）。
-    //    ⚠️ 与 modelscope 的 `rateLimit: false`（能力齐全、用户不要）**不同源**——
-    //    这里是「材料还没有」，接线后**删除本行**（恢复缺省 true）。
-    rateLimit: false,
+    // ✅ `rateLimit` 恢复缺省 true（2026-10-20 删除显式 false）：请求级换号 + 冷却
+    //    已接（`codely-adapter.ts` 的 `updateModelRateLimit` 写点：402/预算耗尽 →
+    //    UTC+8 次日 0 点、429 → 1h），`probeById.codely` 探测适配器同步挂上 ⇒
+    //    「重测 / 重置」有真实作用对象。旧注释「UI 先行阶段材料还没有」的前提已
+    //    消失 —— 再留着 false = 耗尽账号的冷却标记写进池却永远清不掉
+    //    （`WRITES_RATE_LIMIT_PROVIDERS` 与本行由 wiring 守卫双向锁死）。
     // ✅ `credits.balance: true`（2026-10-19 真凭据实测）：余额端点
     //    `GET /api/user/usage/summary`（Bearer + X-User-Agent）→
     //    `{remaining_points:"2400", is_exhausted:false, details:[{type:'gift_credit',…}]}`

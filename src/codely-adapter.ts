@@ -1,7 +1,14 @@
 /**
- * Codely 适配器：**目录 + 推理**都已接通（推理走官方 CLI 子进程）。
+ * Codely 适配器：**目录 + 推理**都已接通。
  *
- * ## ⚠️⚠️ 推理为什么是「驱动官方 CLI」而不是自己发 HTTP
+ * ## ⚠️ 现状（2026-10-20 修订）：推理默认 **HTTP 自签直连**，CLI 子进程只是测试兜底
+ *
+ * 签名已完全还原（`codely-sign.ts`；与官方 npm 包源码逐字节对拍通过，
+ * `scripts/verify-codely-signature.mjs` 可复现）⇒ 推理走 HTTP + SSE，
+ * **不需要任何客户端**。仅当测试注入 `cliSpawner` 时才走下方描述的 CLI 路径
+ * （保留它是为了 `codely-cli.ts` 的调用点与既有用例）。
+ *
+ * ## 历史存档：当时为什么「驱动官方 CLI」而不是自己发 HTTP
  *
  * 推理网关 `https://codely-litellm.tuanjie.cn/v1/chat/completions` 要求
  * `X-Codely-Signature`（HMAC-SHA256），签名密钥藏在官方客户端的编译产物里 ——
@@ -20,9 +27,10 @@
  *
  * ## 已知代价（用户 2026-10-20 拍板接受）
  *
- * - **依赖本机安装** Tuanjie Cowork CLI（`DSH_CODERLY_CLI_PATH` 可覆盖）；
- * - **凭据是 CLI 自己的登录态**，不是本插件账号池的那份 ⇒ 推理侧**没有**换号
- *   / 多账号（积分与签到仍走插件自己的凭据，不受影响）；
+ * - （仅 CLI 路径）**依赖本机安装** Tuanjie Cowork CLI（`DSH_CODERLY_CLI_PATH` 可覆盖）；
+ * - （仅 CLI 路径）**凭据是 CLI 自己的登录态**，不是本插件账号池的那份 ⇒ 该路径
+ *   没有换号；**HTTP 路径已接上请求级换号 + 冷却**（`streamViaHttp` 的换号循环：
+ *   402/预算耗尽 → UTC+8 次日解冻，429 → 1h；探测适配器已挂 ⇒ 可手动「重测/重置」）；
  * - **每次请求起一个进程**（实测端到端 ~3.1s）；
  * - **`--approval-mode yolo`**：CLI 可读写文件、执行命令（用户选的「更接近
  *   官方 CLI」体验；改成 `ask` 即只读）。
@@ -62,6 +70,9 @@ import {
 } from './codely-auth.js'
 // 推理签名（2026-10-20 起不再需要任何客户端，见 `codely-sign.ts` 模块头）。
 import { signedCodelyHeaders } from './codely-sign.js'
+// 冷却时刻原语（UTC+8 次日 0 点）：积分靠每日「一键签到」发放，预算耗尽按日解冻。
+// `model-queue.ts` 是零依赖叶子模块，无循环引用风险（accio 同款引用）。
+import { nextUtc8DayStartMs } from './model-queue.js'
 import { randomUUID } from 'node:crypto'
 // 推理：驱动官方 CLI 子进程（签名密钥未取得，见模块头）。
 import {
@@ -124,6 +135,42 @@ function abilitySuffix(modelId: string): string {
   const abilities = CODERLY_ABILITIES[modelId]
   if (abilities === undefined) return ''
   return ` · ${abilities.map((ability) => CODERLY_ABILITY_LABEL[ability]).join(' | ')}`
+}
+
+/** 换号预算（含首次请求）：402 在网关校验层就被拒，换号本身不产生推理费用。 */
+const CODERLY_MAX_ROTATE = 5
+
+/** 429 短时限流冷却：1 小时（与 loomy / raccoon / trae soft-rate 同档）。 */
+const CODERLY_RATE_LIMIT_COOLDOWN_MS = 3_600_000
+
+/**
+ * 「换号有用」的失败形态（cline / accio 同语义）：
+ *
+ * - **402** / 报文含 `budget_exceeded`：该账号积分或团队预算耗尽 —— 等待不会恢复，
+ *   换号（或签到 / 充值）才有用；
+ * - **429**：短时限流 —— 换号立即恢复。
+ *
+ * ⚠️ 401/403 **不**换号：Codely 的 401 绝大多数是「团队无权访问该模型」
+ * （换账号也撞同一个团队策略，见 `streamViaHttp` 里的取证表），真凭据失效
+ * 在换发 `cli_api_key` 那一步就已拦下。
+ */
+export function isCodelyRotatableFailure(status: number, body: string): boolean {
+  if (status === 402 || status === 429) return true
+  return isCodelyBudgetExceeded(body)
+}
+
+/** 上游「预算 / 积分耗尽」报文特征（LiteLLM：`type:"budget_exceeded", code:"402"`）。 */
+function isCodelyBudgetExceeded(body: string): boolean {
+  return /budget_exceeded|budget has been exceeded/i.test(body)
+}
+
+/**
+ * 收窄账号池回传的凭据：池的 `getAvailableAccount` 是**裸 `JSON.parse`**
+ * （不做形状校验，`account-pool.ts` 头注记过）⇒ 手工编辑过的备份可能是 `{}`
+ * 之类的坏形状，直接读 `access_token.length` 会抛 `TypeError`（accio 同款教训）。
+ */
+function usableCodelyCredential(c: CodelyCredential | undefined): c is CodelyCredential {
+  return c !== undefined && typeof c.access_token === 'string' && c.access_token.length > 0
 }
 
 /** `/api/model-status` 的原始报文（只取 `models[]`）。 */
@@ -250,22 +297,42 @@ export class CodelyAdapter extends LlmAdapter {
     yield* this.streamViaHttp(options)
   }
 
-  /** HTTP + SSE 真流式（签名见 `codely-sign.ts`；换发见 `codely-auth.ts`）。 */
+  /**
+   * HTTP + SSE 真流式（签名见 `codely-sign.ts`；换发见 `codely-auth.ts`）。
+   *
+   * ## 选号与换号（2026-10-20 接上，与 cline / accio 同款）
+   *
+   * - **有账号池** ⇒ 初始选号走 `getAvailableAccount`（手动顺序 + 自动跳过
+   *   限流中账号），失败后进入下面的换号循环重发；`credentialProvider` 退为
+   *   池缺席时的兜底（旧测试桩路径）。
+   * - **无池** ⇒ 无换号能力（`currentAccountId` 为空 ⇒ 记账 / 换号自然跳过）。
+   *
+   * ⚠️ 池回传的凭据是**裸 `JSON.parse`** ⇒ 使用前必须收窄
+   *    （`usableCodelyCredential`），坏条目不掐断流程。
+   */
   private async *streamViaHttp(options: GenerateOptions, retryBudget = 3): AsyncGenerator<StreamChunk> {
-    const credential = await this.options.credentialProvider?.()
-    if (
-      credential === undefined
-      || typeof credential.access_token !== 'string'
-      || credential.access_token.length === 0
-    ) {
-      // ⚠️ 同样不用 `AUTH`：那会把这条指路文案换成「API 密钥无效」（见下方 `!res.ok` 的取证表）
+    const model = typeof options.model === 'string' ? options.model : ''
+    if (model.length === 0) throw new LlmError('codely: 未指定模型', 'INVALID_REQUEST')
+    const pool = this.options.accountPool
+    let currentAccountId = ''
+    let credential: CodelyCredential | undefined
+    if (pool !== undefined) {
+      const picked = await pool.getAvailableAccount<CodelyCredential>(CODERLY.id, model)
+      if (picked !== null && usableCodelyCredential(picked.credential)) {
+        credential = picked.credential
+        currentAccountId = picked.entry.id
+      }
+    }
+    if (credential === undefined) {
+      credential = await this.options.credentialProvider?.()
+    }
+    if (!usableCodelyCredential(credential)) {
+      // ⚠️ 不用 `AUTH`：那会把这条指路文案换成「API 密钥无效」（见下方取证表）
       throw new LlmError(
         'codely: 没有可用凭据 —— 请先在 Jet Hub 的「账号池」里登录 Codely（推理已不需要安装任何客户端）',
         'PERMISSION_DENIED',
       )
     }
-    const model = typeof options.model === 'string' ? options.model : ''
-    if (model.length === 0) throw new LlmError('codely: 未指定模型', 'INVALID_REQUEST')
 
     /**
      * ⚠️ **前置校验：模型必须在本渠道「团队可访问」的目录内**。
@@ -423,26 +490,6 @@ export class CodelyAdapter extends LlmAdapter {
       throw new LlmError('codely: 输入为空（没有可发送的文本）', 'INVALID_REQUEST')
     }
 
-    // ⚠️ 每个请求换发一次 `cli_api_key`：它与后面 `Bearer` 必须**成对**
-    //    （签名由它派生，用 A 签 B 会 401，见 `codely-auth.ts` 的注释）。
-    const exchanged = await fetchCodelyCliApiKey(credential.access_token, {
-      ...this.options.fetchImpl === undefined ? {} : { fetcher: this.options.fetchImpl },
-      ...options.signal === undefined ? {} : { signal: options.signal },
-    })
-    if (exchanged === undefined) {
-      throw new LlmError(
-        'codely: 换发 cli_api_key 失败（访问令牌可能已过期）'
-        + '。请在 Jet Hub 的「账号池」里对该账号点「续期」；仍失败再重新登录',
-        'PERMISSION_DENIED',
-      )
-    }
-
-    const url = `${CODERLY.chatHost}/chat/completions`
-    const headers = signedCodelyHeaders({
-      cliApiKey: exchanged.cliApiKey,
-      target: url,
-      sessionId: randomUUID(),
-    })
     /**
      * 诊断开关（`DSH_CODERLY_DEBUG=1`）：一行看清「工具到底发出去没有」。
      *
@@ -450,6 +497,8 @@ export class CodelyAdapter extends LlmAdapter {
      * 「先列个计划，然后动手写」，**没有 tool_calls**。要判断是「通道没发 tools」
      * 还是「模型自己选择先说计划」，必须先看这一行——
      * `toolCount > 0` 且 `finish=stop` ⇒ 是**模型行为**；`toolCount === 0` ⇒ 是**接线缺陷**。
+     *
+     * ⚠️ 提到换号循环外：body 与账号无关，循环内重复打印只会淹没日志。
      */
     if (process.env.DSH_CODERLY_DEBUG === '1') {
       console.warn('[codely] 请求诊断', {
@@ -459,90 +508,140 @@ export class CodelyAdapter extends LlmAdapter {
         bodyChars: JSON.stringify(messages).length,
       })
     }
-    const fetcher = this.options.fetchImpl ?? fetch
-    const res = await fetcher(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model,
-        messages,
-        stream: true,
-        /**
-         * ⚠️⚠️ **必须下发 `tools`**（2026-10-20 实测，决定性对照）。
-         *
-         * 同一 prompt、同一 key，唯一差别是带不带 `tools`：
-         *
-         * | 请求 | 结果 |
-         * |---|---|
-         * | 带 `tools` | 200，**13 帧标准 `delta.tool_calls`**（含 id/name/arguments），**零** DSML 文本 |
-         * | 不带 `tools` | 200，模型把调用写进正文：`<|DSML|invoke name="bash"|>` |
-         *
-         * ⇒ 上游**完整支持** OpenAI function calling。DSML 文本不是协议差异，
-         *   而是「没给它工具」时模型按训练习惯的自由发挥。
-         *   缺这一段 = agent 永远无法真正执行工具（真实报障 2026-10-20 13:22）。
-         */
-        ...options.tools === undefined || options.tools.length === 0
-          ? {}
-          : {
-              tools: options.tools.map((tool) => ({
-                type: 'function' as const,
-                function: {
-                  name: tool.name,
-                  ...typeof tool.description === 'string' && tool.description.length > 0
-                    ? { description: tool.description }
-                    : {},
-                  ...tool.parameters === undefined ? {} : { parameters: tool.parameters },
-                },
-              })),
+    const requestBody = JSON.stringify({
+      model,
+      messages,
+      stream: true,
+      /**
+       * ⚠️⚠️ **必须下发 `tools`**（2026-10-20 实测，决定性对照）。
+       *
+       * 同一 prompt、同一 key，唯一差别是带不带 `tools`：
+       *
+       * | 请求 | 结果 |
+       * |---|---|
+       * | 带 `tools` | 200，**13 帧标准 `delta.tool_calls`**（含 id/name/arguments），**零** DSML 文本 |
+       * | 不带 `tools` | 200，模型把调用写进正文：`<|DSML|invoke name="bash"|>` |
+       *
+       * ⇒ 上游**完整支持** OpenAI function calling。DSML 文本不是协议差异，
+       *   而是「没给它工具」时模型按训练习惯的自由发挥。
+       *   缺这一段 = agent 永远无法真正执行工具（真实报障 2026-10-20 13:22）。
+       */
+      ...options.tools === undefined || options.tools.length === 0
+        ? {}
+        : {
+            tools: options.tools.map((tool) => ({
+              type: 'function' as const,
+              function: {
+                name: tool.name,
+                ...typeof tool.description === 'string' && tool.description.length > 0
+                  ? { description: tool.description }
+                  : {},
+                ...tool.parameters === undefined ? {} : { parameters: tool.parameters },
+              },
+            })),
+            /**
+             * ⚠️⚠️ **`tool_choice` 三档策略**（2026-10-20 用户要求"上更强的 required"）。
+             *
+             * 为什么**不常开 `required`**：那会让模型**每一轮**都被强制调工具，
+             * 连「任务已完成、该收尾说话」也不允许 ⇒ 陷入反复调工具的死循环。
+             *
+             * 所以按「**首轮强制 → 后续放开 → 停滞兜底**」三层：
+             *
+             * | 场景 | tool_choice | 理由 |
+             * |---|---|---|
+             * | **首轮**（历史里还没有 `role:'tool'`） | **`required`** | 实测三次都是「首轮只说计划不调工具」，这一档直接掐死 |
+             * | 后续轮（已有工具结果） | `auto` | 让模型能正常总结并结束，不死循环 |
+             * | 停滞被兜底重试 | **`required`**（`forceToolChoice`） | 它在后续轮又"只说不做"时强拉一把 |
+             * | 本次请求没有工具 | 不发该字段 | 纯聊天不该被约束 |
+             *
+             * ⚠️ 逃生阀：`DSH_CODERLY_TOOL_CHOICE=auto` 可整体退回原生行为
+             *    （首轮也不再强制），用于诊断"是不是 required 引起的异常"。
+             */
+            ...(() => {
+              const hasToolHistory = messages.some((message) => message.role === 'tool')
+              const escalated = (options as { forceToolChoice?: boolean }).forceToolChoice === true
+              const envOverride = process.env.DSH_CODERLY_TOOL_CHOICE
               /**
-               * ⚠️⚠️ **`tool_choice` 三档策略**（2026-10-20 用户要求"上更强的 required"）。
+               * ⚠️ **必须识别「这是不是任务型输入」**：实测常开 `required` 时，
+               * 用户说「你好」也会被强制去跑 `pwd && ls -la`（3320ms、白烧积分、
+               * 行为诡异）。所以只在**看起来要做事**时才强拉。
                *
-               * 为什么**不常开 `required`**：那会让模型**每一轮**都被强制调工具，
-               * 连「任务已完成、该收尾说话」也不允许 ⇒ 陷入反复调工具的死循环。
-               *
-               * 所以按「**首轮强制 → 后续放开 → 停滞兜底**」三层：
-               *
-               * | 场景 | tool_choice | 理由 |
-               * |---|---|---|
-               * | **首轮**（历史里还没有 `role:'tool'`） | **`required`** | 实测三次都是「首轮只说计划不调工具」，这一档直接掐死 |
-               * | 后续轮（已有工具结果） | `auto` | 让模型能正常总结并结束，不死循环 |
-               * | 停滞被兜底重试 | **`required`**（`forceToolChoice`） | 它在后续轮又"只说不做"时强拉一把 |
-               * | 本次请求没有工具 | 不发该字段 | 纯聊天不该被约束 |
-               *
-               * ⚠️ 逃生阀：`DSH_CODERLY_TOOL_CHOICE=auto` 可整体退回原生行为
-               *    （首轮也不再强制），用于诊断"是不是 required 引起的异常"。
+               * 判据（任一命中）：含动作动词 / 长度 ≥ 20 字。
+               * 误判的代价不对称：把聊天误判成任务 ⇒ 多跑一次工具（可接受）；
+               * 把任务误判成聊天 ⇒ 模型只说计划不干活（用户已在报障）。
                */
-              ...(() => {
-                const hasToolHistory = messages.some((message) => message.role === 'tool')
-                const escalated = (options as { forceToolChoice?: boolean }).forceToolChoice === true
-                const envOverride = process.env.DSH_CODERLY_TOOL_CHOICE
-                /**
-                 * ⚠️ **必须识别「这是不是任务型输入」**：实测常开 `required` 时，
-                 * 用户说「你好」也会被强制去跑 `pwd && ls -la`（3320ms、白烧积分、
-                 * 行为诡异）。所以只在**看起来要做事**时才强拉。
-                 *
-                 * 判据（任一命中）：含动作动词 / 长度 ≥ 20 字。
-                 * 误判的代价不对称：把聊天误判成任务 ⇒ 多跑一次工具（可接受）；
-                 * 把任务误判成聊天 ⇒ 模型只说计划不干活（用户已在报障）。
-                 */
-                const TASK_HINT = /(写|创建|新建|生成|实现|修改|修复|重构|删除|运行|执行|检查|列出|搜索|安装|部署|测试|添加|优化|排查|分析|做一个|搞一个|继续|接着|动手|改一|试一)/u
-                const lastUser = [...(options.messages ?? [])]
-                  .reverse()
-                  .find((message) => (message as { role?: unknown }).role === 'user')
-                const userText = lastUser === undefined
-                  ? ''
-                  : contentToText((lastUser as { content?: unknown }).content)
-                const looksLikeTask = TASK_HINT.test(userText) || userText.trim().length >= 20
-                const forceRequired = escalated
-                  || (envOverride !== 'auto' && !hasToolHistory && looksLikeTask)
-                return { tool_choice: forceRequired ? 'required' : 'auto' }
-              })(),
-            },
-      }),
-      ...options.signal === undefined ? {} : { signal: options.signal },
+              const TASK_HINT = /(写|创建|新建|生成|实现|修改|修复|重构|删除|运行|执行|检查|列出|搜索|安装|部署|测试|添加|优化|排查|分析|做一个|搞一个|继续|接着|动手|改一|试一)/u
+              const lastUser = [...(options.messages ?? [])]
+                .reverse()
+                .find((message) => (message as { role?: unknown }).role === 'user')
+              const userText = lastUser === undefined
+                ? ''
+                : contentToText((lastUser as { content?: unknown }).content)
+              const looksLikeTask = TASK_HINT.test(userText) || userText.trim().length >= 20
+              const forceRequired = escalated
+                || (envOverride !== 'auto' && !hasToolHistory && looksLikeTask)
+              return { tool_choice: forceRequired ? 'required' : 'auto' }
+            })(),
+          },
     })
-    if (!res.ok) {
-      const detail = await res.text().catch(() => '')
+
+    /**
+     * ⚠️⚠️ **请求级换号循环**（2026-10-20 接上 —— 用户报障「用完积分怎么不自动
+     * 切换账号」的直接对策，与 cline / accio 同款）。
+     *
+     * ## 三条纪律（都是别家踩过的坑）
+     *
+     * ① **只在产出内容之前换**：本循环只包「换发 key → POST → 非 2xx 判类」，
+     *    SSE 消费在循环之外 ⇒ 不存在「吐了一半再重放」的重复计费 / 重复执行风险；
+     * ② **每次失败后立刻记账**（含最后一轮）：挪到下一轮开头会让「预算用尽退出」时
+     *    最后一个失败账号永远漏记 ⇒ 下次又被选中、又撞一次墙（minimax 8 号只记 7）；
+     * ③ **记账失败绝不掐断换号**（磁盘满 / 写失败）：try/catch 隔离，照常换号
+     *    （accio 对抗审计 P2-1 同款）。
+     *
+     * ## 冷却时长
+     *
+     * - **402 / `budget_exceeded`**：积分或团队预算耗尽 —— 积分靠每日「一键签到」
+     *   发放，按 **UTC+8 次日 0 点**解冻（与 accio 当日额度同档）。签到 / 充值后
+     *   可点「重测 / 重置」立即解冻（`probeById.codely` 同步挂上，标记不会清不掉）；
+     * - **429**：短时限流，**1 小时**（与 loomy / raccoon / trae soft-rate 同档）。
+     *
+     * 401/403 与其它 4xx/5xx **不换号**：换账号撞的是同一堵墙（见循环内取证表）。
+     */
+    const tried = new Set<string>()
+    if (currentAccountId !== '') tried.add(currentAccountId)
+    let res: Response | undefined
+    let detail = ''
+    for (let round = 0; ; round += 1) {
+      // ⚠️ 每个请求换发一次 `cli_api_key`：它与后面 `Bearer` 必须**成对**
+      //    （签名由它派生，用 A 签 B 会 401，见 `codely-auth.ts` 的注释）。
+      //    换号后同理 —— 新账号必须用新换的 key 签名。
+      const exchanged = await fetchCodelyCliApiKey(credential.access_token, {
+        ...this.options.fetchImpl === undefined ? {} : { fetcher: this.options.fetchImpl },
+        ...options.signal === undefined ? {} : { signal: options.signal },
+      })
+      if (exchanged === undefined) {
+        throw new LlmError(
+          'codely: 换发 cli_api_key 失败（访问令牌可能已过期）'
+          + '。请在 Jet Hub 的「账号池」里对该账号点「续期」；仍失败再重新登录',
+          'PERMISSION_DENIED',
+        )
+      }
+
+      const url = `${CODERLY.chatHost}/chat/completions`
+      const headers = signedCodelyHeaders({
+        cliApiKey: exchanged.cliApiKey,
+        target: url,
+        sessionId: randomUUID(),
+      })
+      const fetcher = this.options.fetchImpl ?? fetch
+      res = await fetcher(url, {
+        method: 'POST',
+        headers,
+        body: requestBody,
+        ...options.signal === undefined ? {} : { signal: options.signal },
+      })
+      if (res.ok) break
+      detail = await res.text().catch(() => '')
       const body = detail.length === 0 ? '' : `（${detail.slice(0, 240)}）`
       /**
        * ⚠️⚠️ **401/403 一律不得归 `AUTH`**。
@@ -575,6 +674,69 @@ export class CodelyAdapter extends LlmAdapter {
           + '。请改用 codely-basic / codely-core 等 codely-* 模型'
           + '（目录里的 DeepSeek / GLM / KIMI 常被团队策略拒绝）',
           'PERMISSION_DENIED',
+        )
+      }
+      // 非账号级失败（其它 4xx/5xx）⇒ 换号无益，跳出走末尾统一分类。
+      if (!isCodelyRotatableFailure(res.status, detail)) break
+      if (options.signal?.aborted === true) break
+      if (pool === undefined || currentAccountId === '') break
+      // ② 立刻记账（**无条件**，必须在下面的「预算用尽」判断之前 —— 理由见循环头
+      //    注释）：先 break 再记账会让「预算用尽退出」时的最后一个失败账号永远漏记
+      //    ⇒ 它下次仍被选中、又撞一次同样的墙（minimax 的「8 号只记 7」同型缺陷，
+      //    本条由 codely-rotation.spec.ts 的「预算上限」用例钉住）。
+      try {
+        await pool.updateModelRateLimit(
+          currentAccountId,
+          model,
+          res.status === 429 && !isCodelyBudgetExceeded(detail)
+            ? Date.now() + CODERLY_RATE_LIMIT_COOLDOWN_MS
+            : nextUtc8DayStartMs(),
+        )
+      } catch {
+        // ③ 记账失败不中断换号（accio P2-1 同款）：少记一次冷却的代价
+        //    远小于「整池轮换被一次写盘失败掐断」。
+      }
+      // 换号预算用尽 ⇒ 停止轮换，走末尾统一分类（**记账已在上面完成**）。
+      if (round >= CODERLY_MAX_ROTATE - 1) break
+      // 换下一个账号（池按手动序 + 跳过限流中账号 + 排除已试）。
+      // 坏凭据（裸 JSON.parse，如 `{}`）**原地跳过**继续找 —— 不消耗 HTTP 尝试，
+      // 也不把它当成「又一个失败账号」去记账（它没发过请求）。
+      let next = await pool.getAvailableAccount<CodelyCredential>(CODERLY.id, model, tried)
+      while (next !== null && !usableCodelyCredential(next.credential)) {
+        tried.add(next.entry.id)
+        next = await pool.getAvailableAccount<CodelyCredential>(CODERLY.id, model, tried)
+      }
+      if (next === null) break
+      tried.add(next.entry.id)
+      credential = next.credential
+      currentAccountId = next.entry.id
+    }
+
+    // ── 统一分类（循环正常退出只可能携带一次真实响应）──
+    if (res === undefined) {
+      throw new LlmError('codely: 内部错误：未发起任何请求', 'SERVER')
+    }
+    if (!res.ok) {
+      const body = detail.length === 0 ? '' : `（${detail.slice(0, 240)}）`
+      // 402 / 预算耗尽：**绝不归 SERVER** —— 那会让宿主按「可重试」在同一账号上
+      // 退避重试 5 次（全部注定失败，用户看到的就是 5/5 × 7.5s 然后整轮失败）。
+      // QUOTA_EXCEEDED 才能停掉无谓重试，并给到「签到 / 充值」这个唯一有效动作。
+      if (res.status === 402 || isCodelyBudgetExceeded(detail)) {
+        throw new LlmError(
+          (tried.size > 1
+            ? `codely: 已轮换 ${tried.size} 个账号，积分 / 团队预算全部耗尽`
+            : 'codely: 当前账号积分或团队预算已用尽')
+            + `（上游 ${res.status}${body}）。`
+            + '可先在面板「一键签到」领积分；签到 / 充值后点该账号的「重测」立即解冻，'
+            + '或等次日 0 点自动恢复',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (res.status === 429) {
+        throw new LlmError(
+          `codely: 上游限流（429）${body}。稍后自动恢复（1 小时冷却），`
+          + '或点该账号的「重测」立即解冻',
+          'RATE_LIMIT',
         )
       }
       throw new LlmError(

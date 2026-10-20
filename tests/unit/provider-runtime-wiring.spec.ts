@@ -447,12 +447,16 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     //    `markLimited` / `updateModelRateLimit`）：限流与额度由讯飞 MAAS 侧按账号
     //    配额管理，本地标记清不掉配额（与 officeace 同因）。留空是**被验证的声明**。
     ['astudio-adapter.ts', []],
-    // ⚠️ codely（Unity 团结引擎）**不写** `modelRateLimits`（registry 里
-    //    `rateLimit: false`）：本渠道**只接模型目录**——推理网关要求 HMAC 签名
-    //    而密钥未取得（`codely-adapter.ts` 模块头），适配器不发起任何推理请求
-    //    ⇒ 既不会有上游限流响应，也没有可写的标记。留空是**被验证的声明**
-    //    （下面那条用例会真去 grep 源码确认确实没有写点），不是「忘了接」。
-    ['codely-adapter.ts', []],
+    // ⚠️ codely（Unity 团结引擎）**会写** `modelRateLimits`（2026-10-20）：
+    //    ① 推理改为 HTTP 自签直连（签名已还原，`codely-sign.ts`）⇒ 真会收到
+    //       上游的 402 预算耗尽 / 429 限流响应；
+    //    ② 同日接上请求级换号 + 冷却（额度耗尽 → UTC+8 次日 0 点、429 → 1h）
+    //       ⇒ 它**确实是**写点文件，必须登记并与 `WRITES_RATE_LIMIT_PROVIDERS`
+    //       / `probeById` 三处同步（否则标记写进去永远清不掉）。
+    //    ⚠️ 它**曾**登记为 `[]`（不写标记）—— 这个变化正是下面那条
+    //    「登记为不写标记的确实没有写点」用例**红**出来的，与 minimax 2026-10-11、
+    //    accio 2026-10-18 两次同型。用户报障「用完积分怎么不自动切账号」即由此而来。
+    ['codely-adapter.ts', ['codely']],
   ]
 
   /**

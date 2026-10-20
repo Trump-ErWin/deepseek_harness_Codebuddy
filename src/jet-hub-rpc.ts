@@ -3951,7 +3951,49 @@ trae, cline, loomy, raccoon, minimax,
             // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
             void failLogin(id, error)
           })
-          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+
+          // ⚠️⚠️ **宿主侧直接拉起无痕窗口**（2026-10-21，用户报障「新建账号会缓存
+          //    上一个账号的登录信息并自动登录」）：与 OfficeAce（2026-10-13）**完全
+          //    同型** —— CodeArts 的授权页也在华为云 SSO 域（新式 IAM OAuth 是
+          //    `codearts.huaweicloud.com/portal/authorize`，老 ticket 流程则是
+          //    `auth.huaweicloud.com/authui/login.html`），华为 authui 会**静默复用
+          //    浏览器已有会话** ⇒ 客户端 `window.open` 带着上一账号的 cookie 打开
+          //    授权页直接放行、看不到登录框 ⇒「新建账号」永远只能建出同一个号。
+          //
+          //    ## 为什么无痕窗口 = 本需求里的「彻底清除缓存与登录状态」
+          //
+          //    授权页会话的全部载体（cookie、localStorage、sessionStorage、HTTP
+          //    cache）都活在 **cookie jar（profile 目录）**里 ⇒ 换 jar = 清零：
+          //    独立 `--user-data-dir` + `--incognito` 的全新 profile 里这些存储
+          //    **天生为空**（不是「事后删」，是「从未有过」），上一账号的任何信息
+          //    都不可能被复用或自动填充。
+          //
+          //    ## 刻意**不做**的两件事（与 OfficeAce 同款取舍）
+          //
+          //    - **不清账号池/凭据**：已登录的 CodeArts 账号照常可用，本修复只保证
+          //      「新建」这一条流程是全新会话 —— 清凭据会把用户在用的账号一起毁掉；
+          //    - **不走 `authui/logout`**：它的作用域是整个华为云域（实测
+          //      `Set-Cookie` 含 `cloud_verify_ticket` 清除、`IAMIdentity` 重写），
+          //      会**连带登出用户日常浏览器里的华为云控制台**。
+          //
+          //    ## 时机与顺序（两步式不变）
+          //
+          //    `startLogin`（生成 PKCE / 回调端口）→ `addAccount` 占位 → 注册后台
+          //    收口 → **此处同步拉起无痕窗**（仍在用户点击的 transient activation
+          //    窗口内，无额外等待）→ 返回 `loginUrl + incognitoOpened`。客户端按
+          //    `incognitoOpened === true` 跳过自己的 `window.open`、直接进入轮询。
+          //
+          //    ⚠️ 客户端**无法**自己做这件事：`window.open` 不能请求无痕模式（那是
+          //    进程级启动参数），故必须由宿主 `spawn` 浏览器可执行文件。
+          //    ⚠️ 打开失败（读不到默认浏览器 / spawn 失败）时返回 `false`，客户端
+          //    据此回退到自己的 `window.open` —— 不让「换个打开方式」变成
+          //    「开不了窗口」。
+          const incognitoOpened = openIncognitoWindow(started.loginUrl)
+
+          return {
+            ok: true,
+            value: { accountId: id, loginUrl: started.loginUrl, incognitoOpened },
+          }
         } else if (provider === LOBSTERAI.id) {
           // LobsterAI 与 codearts 同款：回调式登录 + 两步式返回，
           // 理由见上面的 codearts 分支（弹窗拦截导致主页面被跳转）。

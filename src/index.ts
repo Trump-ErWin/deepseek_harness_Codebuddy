@@ -139,11 +139,11 @@ import { GEMINI } from './gemini.js'
 import { registerOfficeAceLlm } from './officeace-adapter.js'
 import { OFFICEACE } from './officeace-product.js'
 import * as officeaceAuth from './officeace-auth.js'
-// Codely（Unity 团结引擎）：**只接模型目录**。推理网关要求 HMAC 签名而密钥
-// 未取得（见 `codely-adapter.ts` 模块头），故本渠道目前有目录、无推理。
-import { registerCodelyLlm } from './codely-adapter.js'
+// Codely（Unity 团结引擎）：目录 + 推理都已接通（推理 2026-10-20 起走 HTTP
+// 自签直连，`codely-sign.ts`；`CodelyAdapter` 同时供 `probeById` 探测用）。
+import { CodelyAdapter, registerCodelyLlm } from './codely-adapter.js'
 import { CODERLY } from './codely-product.js'
-import { readCodelyCredential } from './codely-auth.js'
+import { readCodelyCredential, type CodelyCredential } from './codely-auth.js'
 // 「锁定永久积分」在 officeace 上的**唯一执行实现**（issue IKLTHB 第 ① 条：
 // 该渠道登记了 `permanentLock: true`，而原先全仓没有任何代码读这张锁定表）。
 import { createOfficeAceCredentialProvider } from './officeace-lock.js'
@@ -699,6 +699,22 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
         ),
       })
     },
+  },
+  // Codely（Unity 团结引擎）→ **本 fork 独有**（2026-10-20）。
+  //
+  // 适配器接上了请求级换号 + 冷却（`codely-adapter.ts` 的 `updateModelRateLimit`
+  // 写点：402/预算耗尽 → UTC+8 次日 0 点、429 → 1h）⇒ 必须登记探测适配器，
+  // 否则标记写进去永远清不掉（minimax / accio 同型缺陷第 N 次）。
+  //
+  // 探测只发一次最小请求（`/api/model-status`，Bearer 即可、无需签名）⇒ 单槽
+  // 喂这一份凭据即可，不需要池（与 modelscope / accio 同款）。
+  // ⚠️ 刻意**不传** `accountPool`：那会让 `stream()` 的换号在探测路径上复活
+  //（探测失败若写回限流标记，会把「重测 A 账号」变成污染池的副作用）；
+  // 也不传 `readImage`（探测是轻量存活检查，不为它拉图片通道）。
+  codely: {
+    createProbeAdapter: (_ref, credential) => new CodelyAdapter({
+      credentialProvider: async () => credential as CodelyCredential | undefined,
+    }),
   },
 }
 
@@ -3099,17 +3115,20 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   })
 
   // ── Codely（Unity 团结引擎）──
-  // ⚠️ **只接目录**：推理网关 `codely-litellm.tuanjie.cn` 要求
-  //    `X-Codely-Signature`（HMAC），签名密钥未取得（见 `codely-adapter.ts`
-  //    模块头）⇒ 适配器 `stream()` 显式报错，**不发注定 401 的请求**。
-  //    目录侧不需要签名：`GET /api/model-status`（Bearer）实测 200、8 个模型组。
+  // ✅ **目录 + 推理都已接通**（2026-10-20）：推理走 HTTP 自签直连
+  //    （`codely-sign.ts`，与官方 npm 包源码逐字节对拍通过），**不需要任何客户端**。
+  //    目录侧 `GET /api/model-status`（Bearer）实测 200、8 个模型组，同样无需签名。
+  //    ⚠️ 适配器**有账号池** ⇒ 推理初始选号与失败换号都走
+  //    `pool.getAvailableAccount`（手动顺序 + 跳过限流中账号），下面的
+  //    `credentialProvider` 只是池缺席时的兜底（测试桩路径）。
   const codelyAdapter = registerCodelyLlm(ctx, {
     // ⚠️ 门控 + 黑名单都走账号池（共享目录骨架 `createModelCatalog` 读它）：
     //    没有已登录的 Codely 账号 ⇒ `listModels` 如实返回空目录。
     accountPool: pool,
-    // ⚠️ 按账号池里第一个启用账号的 ref 取凭据（与 officeace / gemini 同款）：
-    //    凭据按 `credentialRef` 索引存于 DSH 凭据库，多账号时才不会共用一份。
+    // ⚠️ 兜底凭据源：按账号池里第一个启用账号的 ref 取（与 officeace / gemini
+    //    同款）。凭据按 `credentialRef` 索引存于 DSH 凭据库，多账号才不会共用一份。
     //    读不到（未登录 / 解析失败）一律 `undefined` ⇒ 目录回退兜底表，不抛错。
+    //    ⚠️ 生产路径（推理）走的是适配器内的池选号，这里只服务「无池」场景。
     credentialProvider: async () => {
       const entries = pool.listAccountsByProvider(CODERLY.id)
       const first = entries.find((entry) => entry.enabled !== false) ?? entries[0]
