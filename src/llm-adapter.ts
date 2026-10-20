@@ -220,7 +220,7 @@ export interface CodeArtsAdapterOptions {
   resolveCredential: () => Promise<CodeArtsCredential | undefined>
   refresh: () => Promise<void>
   /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string; rateLabel?: string }>>
   /**
    * 最近一次目录拉取的**各来源成败**（issue IKJVTF，审计 I3）。
    *
@@ -1026,7 +1026,7 @@ export class CodeArtsAdapter extends LlmAdapter {
   }
 
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
-  private remoteModels: Array<{ id: string; name: string }> | undefined
+  private remoteModels: Array<{ id: string; name: string; rateLabel?: string }> | undefined
 
   /**
    * 已落缓存的目录是否**所有来源都取全**（issue IKJVTF，审计 I3）。
@@ -1154,11 +1154,18 @@ export class CodeArtsAdapter extends LlmAdapter {
    *    `reasoning_tokens`，落在基线噪声内；`none` 也照常思考）。
    *    故**不**臆造 low/high/max 强度阶梯。
    */
-  private toCatalogEntry(model: { id: string; name: string }): CatalogEntry {
+  private toCatalogEntry(model: { id: string; name: string; rateLabel?: string }): CatalogEntry {
     const contextWindow = CONTEXT_WINDOWS.get(model.id)
+    // ⚠️ 倍率拼进 `name`（与 officeace / buddy / loomy / raccoon 同款：
+    //    `name` 带倍率、`resolveModel` 用裸名，骨架只认 `name`）。
+    //    ⚠️ 用的是上游 `ratio_display` 原串（`0.7x`），**不**自己拼 `x{n}` ——
+    //    见 `RemoteModel.rateLabel` 的注释：那样会显示上游从未出现过的数。
+    const name = model.rateLabel !== undefined
+      ? `${model.name} · ${model.rateLabel}`
+      : model.name
     return {
       id: model.id,
-      name: model.name,
+      name,
       // ⚠️ 本家恒声明 `['text']`（CodeArts 是纯文本网关；VL 模型上面已滤掉）。
       inputModalities: ['text'] as const,
       ...contextWindow !== undefined ? { contextWindow } : {},
