@@ -217,6 +217,18 @@ Copy-Item tests\unit\xxx.spec.ts "D:\...\wt-a1\tests\unit\"
 cmd /c mklink /J "D:\...\wt-a1\node_modules" "D:\...\主工作区\node_modules"
 ```
 
+⚠️⚠️ **联接是「同一个物理目录」，不是副本** ⇒ **绝不要在 worktree 里跑 `pnpm`（`install` / `build` 都算）**
+（2026-10-20 亲历，主仓库依赖被搞坏一次）：pnpm 会把它自己的虚拟store建在
+`<worktree>/node_modules/.pnpm` —— 而那**就是**主仓库的 `.pnpm` —— 并把**主仓库**的顶层
+链接改写成指向 `<worktree>/...` 的**相对路径**。症状有延迟：worktree 还在时一切正常
+（链接能解析过去），**删掉 worktree 后主仓库的 `node_modules` 立刻全是悬空链接**
+（`ls -la node_modules` 能看到 7 个条目指向 `dsh-audit-a3/...`，`vitest` 报
+`requireStack: []`）。修法：在主仓库跑一次 `pnpm install`（store 有缓存，7.7 s），
+并确认 `ls -la node_modules | grep -c <worktree名>` 归零。
+⇒ **在 worktree 里只跑 `npx vitest` / `npx tsc`**（它们不改依赖树）；
+要构建就用 `npx tsc -p tsconfig.json` + `node scripts/copy-assets.mjs` +
+`node plugin-src/client/build.mjs` 这三条**绕开 pnpm**，或给 worktree 自己的**真** node_modules。
+
 ⚠️ **配套的必要性**：即使隔离了，仍要在主工作区留**指纹**（`Get-FileHash`），
 审计结束后逐一比对 —— 否则「它到底动没动过主工作区」只能靠猜。
 
