@@ -1462,6 +1462,11 @@ export function apply(ctx: Context): void {
     readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: QODER,
+    // 远端模型目录（2026-10-20）：**由 auth 服务取数**，只做池的只读读取。
+    // ⚠️ 刻意**不**走 `resolveCredential` —— 它选中账号时会 reportAccount，
+    //    而目录请求是周期性的（20 分钟刷新器），会把「本次实际使用的账号」
+    //    改写成目录用的账号 ⇒ 额度标记落到无辜账号上（见 `QoderAdapterOptions.fetchRemoteModels`）。
+    fetchRemoteModels: () => qoder.fetchModels(pool),
     // 额度受限时标记「本次实际使用的账号」（理由见 `activeQoderAccountId` 注释）。
     currentAccountId: () => activeQoderAccountId.get(QODER.id),
   })
@@ -1522,6 +1527,8 @@ export function apply(ctx: Context): void {
     readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: QODER_CN,
+    // 远端模型目录：同国际版（两站共用同一套实现，差异只在产品配置）。
+    fetchRemoteModels: () => qoderCn.fetchModels(pool),
     // 额度受限时用它标记「当前账号」（见 `QoderAdapter.switchAccountOnQuota`）。
     // ⚠️ 取「**本次实际使用**的账号」而非池里默认那一个：池的默认账号可能与之
     // 不同（例如本账号被限流、池已切到别的账号），标错就会让标记落在无辜账号上。
