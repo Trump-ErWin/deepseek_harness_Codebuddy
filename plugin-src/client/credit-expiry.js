@@ -62,7 +62,8 @@ export function daysUntilExpiry(pkg, now) {
 }
 
 /**
- * 分成 `{ expiring, longTerm, permanent, earliestExpiringAt }` **三桶**（本计费周期口径）。
+ * 分成 `{ expiring, longTerm, permanent, earliestExpiringAt, earliestExpiringAmount }`
+ * **三桶**（本计费周期口径）。
  *
  * ## 三档语义（用户 2026-10-12 明确要求）
  *
@@ -76,6 +77,14 @@ export function daysUntilExpiry(pkg, now) {
  * 合成一个 `permanent` 桶 —— 那会让「真永久」的积分和「30 天后到期」的积分
  * 显示成同一个颜色，用户无法分辨哪些是永远不会作废的。两桶的**选号行为相同**
  *（都不算临时），但**展示语义不同**。
+ *
+ * ⚠️ **返回里 `expiring` 与 `earliestExpiringAmount` 是两个不同的量**（2026-10-20）：
+ *   - `expiring` = 窗口内**所有**临期批次之和（「共多少会作废」）；
+ *   - `earliestExpiringAmount` = **最早那批**的量（与倒计时 `earliestExpiringAt` 配对）。
+ *
+ *   并排显示时必须用后者，否则「临期 20856（4 天 20 小时）」会被读成
+ *   「这 20856 会在 4 天 20 小时后一起掉」，而实际只有最早那批 19656 会掉
+ *   （用户 2026-10-20 原话：「怎么可能全都同一天到期」）。
  *
  * @param packages - `credits.balances` 带回来的 `balance.packages`。
  * @param windowDays - 后端回传的窗口天数。
@@ -92,6 +101,21 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
   let permanent = 0;
   /** 临期桶里**最早**的作废时刻（倒计时用）；无临期包时 `null`。 */
   let earliestExpiringAt = null;
+  /**
+   * **最早那批到期时刻对应的量**。
+   *
+   * ⚠️ 为什么需要它（2026-10-20 用户报障「怎么可能全都同一天到期」）：
+   *    原实现把**窗口内所有批次**累加成 `expiring`，而倒计时
+   *    `earliestExpiringAt` 只指向**最早**那一批 ⇒ 显示成
+   *    「临期 20856（4 天 20 小时）」会让用户以为**这 20856 会在 4 天 20 小时后
+   *    一起掉**，实际最早那批只有 19656，其余 1200 分别在 6 天 / 7 天后。
+   *
+   *    ⇒ 临期段的数字必须与倒计时**指向同一批**才自洽：
+   *      「临期 19656（4 天 20 小时）」= 这笔会在 4 天 20 小时后作废。
+   *      其余更晚的临期批次仍计入 `expiring`（总量，供 tooltip 用），
+   *      但**不**与倒计时并排显示 —— 那正是误导的来源。
+   */
+  let earliestExpiringAmount = 0;
   for (const pkg of packages) {
     // 失效包跳过：服务端仍会返回它的余额，但那部分扣不到。
     if (!pkg || pkg.active !== true) continue;
@@ -113,13 +137,21 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
       //    **整段倒计时消失**，尽管桶里还有一笔钱几天后作废。
       //    ⚠️ 可达性不是假设：TRAE 的 `active` 是**硬编码 true**
       //    （`trae-credits.ts`），压根不反映是否过期。
+      //    `trae-credits.ts`），压根不反映是否过期。
       //    方向：宁可少显示倒计时，不可显示一个错的。
-      if (end > at && (earliestExpiringAt === null || end < earliestExpiringAt)) earliestExpiringAt = end;
+      if (end > at && (earliestExpiringAt === null || end < earliestExpiringAt)) {
+        // ⚠️ 出现**更早**的批次 ⇒ 该量取代之前的（两批不是同一批，不能相加）。
+        earliestExpiringAt = end;
+        earliestExpiringAmount = remaining;
+      } else if (end > at && end === earliestExpiringAt) {
+        // 同一批次（同刻并列）⇒ 累加。
+        earliestExpiringAmount += remaining;
+      }
     } else {
       longTerm += remaining;
     }
   }
-  return { expiring, longTerm, permanent, earliestExpiringAt };
+  return { expiring, longTerm, permanent, earliestExpiringAt, earliestExpiringAmount };
 }
 
 /** 这个包属于哪一桶的中文标签（tooltip 前缀用）。 */
@@ -168,6 +200,11 @@ export function formatExpirySplitLine(split, format) {
   const expiring = split.expiring > 0 ? format(split.expiring) : null;
   if (permanent !== null) parts.push(`永久 ${permanent}`);
   if (longTerm !== null) parts.push(`长期 ${longTerm}`);
+  // ⚠️ 与 `expirySplitParts` 同口径：临期显示**最早那批**的量
+  //    （这条字符串版本不带倒计时，故仍用窗口内总额更合适 —— 它表达的是
+  //     「窗口内共有多少会作废」，不含「何时」）。
+  //    ⇒ 两者语义刻意不同：字符串版是「总量」（无时间承诺），
+  //      分段版是「最早那批」（与倒计时配对）。见 `expirySplitParts` 的注释。
   if (expiring !== null) parts.push(`临期 ${expiring}`);
   return parts.length === 0 ? null : parts.join(' · ');
 }
@@ -200,9 +237,18 @@ export function expirySplitParts(split, format, now) {
     const countdown = typeof at === 'number' && Number.isFinite(at) && at > 0
       ? expiryCountdown(at, now)
       : '';
+    // ⚠️ **数字与倒计时必须指向同一批**（2026-10-20 用户报障修正）：
+    //    `split.expiring` 是窗口内**所有**临期批次之和，而倒计时指向最早那批
+    //    ⇒ 并排显示会误导成「这 X 会在倒计时后一起掉」。
+    //    故这里取 `earliestExpiringAmount`（最早那批的量）与倒计时配对。
+    // ⚠️ 回退方向：拿不到该量（老后端没回传）时退回 `expiring`（总额），
+    //    宁可数字偏大，不可不显示临期。
+    const shown = Number.isFinite(split.earliestExpiringAmount) && split.earliestExpiringAmount > 0
+      ? split.earliestExpiringAmount
+      : expiring;
     parts.push({
       key: 'expiring',
-      text: `临期 ${expiring}`,
+      text: `临期 ${format(shown)}`,
       tone: 'error',
       ...(countdown.length > 0 ? { countdown } : {}),
     });

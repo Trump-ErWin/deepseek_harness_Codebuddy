@@ -13,6 +13,7 @@ import {
   isAutoclawRefreshable,
   isAutoclawTokenExpired,
   autoclawDisplayNickname,
+  readUserIdFromJwt,
   type AutoclawCredential,
 } from './autoclaw.js'
 import {
@@ -36,6 +37,36 @@ import {
 } from './expiry-sync.js'
 
 /**
+ * 计算一条凭据的**账号身份**（同账号判据）。
+ *
+ * ⚠️ 抽成具名导出是为了让守卫能直接钉住它（`autoclawIdentityForTest` 同体）——
+ *    这段逻辑踩过两次真机缺陷（同一账号被重复添加 3 次、积分重复累加），
+ *    必须能被单测独立覆盖，而不是只能通过整条登录链路间接验证。
+ *
+ * ⚠️⚠️ **字段优先级**（2026-10-19 三次真机报障后定稿）：
+ *      1. `credential.user_id` —— 服务端 `user-profile` 的 UUID 主键；
+ *      2. `readUserIdFromJwt(access_token)` —— 老凭据没落该字段时兜底；
+ *      3. `access_token` —— 两者都取不到时退化（宁可退化，不要「无身份」）。
+ *
+ *     ⚠️ 1 与 2 属**两个 id 空间**（UUID ↔ `numericUserId`）：同一账号可能
+ *        一部分 ref 落在 1、另一部分落在 2 ⇒ 分裂成两组、去重白做
+ *        （用户三次报障「怎么还是在啊」的直接原因）。
+ *        彻底统一由 `autoclawSelfHeal` 在启动时调 `user-profile` 补 UUID 完成；
+ *        本函数只在「来不及补齐」的窗口内保证不会没有身份。
+ */
+export function autoclawIdentityOf(credential: AutoclawCredential): string {
+  const userId = credential.user_id ?? readUserIdFromJwt(credential.access_token)
+  if (userId !== undefined && String(userId).trim() !== '') {
+    // ⚠️ 加渠道前缀：不同渠道的 id 空间独立，裸值可能撞车。
+    return `autoclaw:${String(userId).trim()}`
+  }
+  return credential.access_token ?? ''
+}
+
+/** @internal 守卫专用别名（与 {@link autoclawIdentityOf} 同一实现）。 */
+export const autoclawIdentityForTest = autoclawIdentityOf
+
+/**
  * AutoClaw 凭据 → 账号池有效期所需的提取器。
  *
  * ⚠️ `expiresAtOf` 只读 `credential.expires_at`，而该字段由
@@ -47,7 +78,20 @@ import {
 const AUTOCLAW_EXPIRY_ACCESSORS: ExpiryAccessors<AutoclawCredential> = {
   expiresAtOf: (credential) => credential.expires_at,
   refreshableOf: isAutoclawRefreshable,
-  identityOf: (credential) => credential.access_token ?? '',
+  /**
+   * **账号身份**（同账号判据）。
+   *
+   * ⚠️⚠️ **绝不能用 `access_token`**（2026-10-19 真机取证修复）：
+   *    AutoClaw 的 access_token 是 JWT，**每次登录/续期都轮换**
+   *    （实测同一账号连续两次续期的 token md5 不同）。用它当身份 ⇒
+   *    同一账号每续期一次就被当成**新账号**。
+   *
+   *    用户报障形态：面板里同一个手机号出现 **3 次**，积分被重复累加
+   *    （20838 + 20789 + 20789 = 62416，而真实余额只有 20838 量级）。
+   *
+   * ⇒ 用 JWT 里的 `user_id`（稳定、与 `/userapi/v1/user-profile` 同源）。
+   */
+  identityOf: autoclawIdentityOf,
 }
 
 export class RefreshTokenExpiredError extends Error {
@@ -381,3 +425,5 @@ export class AutoclawAuth extends Service {
     })
   }
 }
+
+

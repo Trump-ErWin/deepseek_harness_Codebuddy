@@ -21,6 +21,7 @@ import {
   autoclawAccessTokenExpiresAtMs,
   autoclawDisplayNickname,
   autoclawEffortForRequest,
+  readUserIdFromJwt,
   type AutoclawCredential,
   type ChatMessage,
 } from '../../src/autoclaw.js'
@@ -1538,4 +1539,102 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
       })
     })
   })
+
+  /**
+   * ⚠️⚠️ **同账号判据**（2026-10-19 三次真机报障后定稿）。
+   *
+   * 用户形态：面板里同一个手机号出现 **3 次**，积分被重复累加
+   *（20842×3 = 62526，真实余额只有 20842）。
+   *
+   * ## 根因链
+   * ① `access_token` 是 JWT、**每次登录/续期都轮换** ⇒ 拿它当身份，
+   *    同一账号每续一次就被当成新账号；
+   * ② JWT payload 有两个易混字段，且实测**都不适合单独作判据**：
+   *    - `guid` 恒为 `""`（空串）；
+   *    - `user_id` = `839684`，是 `numericUserId`，与「服务端 `user-profile`
+   *      返回的 UUID 主键」是**两个 id 空间**。
+   *
+   * ## 定稿策略
+   * - 判据：`credential.user_id`（UUID）→ JWT `user_id` → `access_token`；
+   * - 但 1 与 2 混用会让同一账号**分裂成两组**、去重白做（用户三次报障的教训）
+   *   ⇒ 由 `autoclawSelfHeal` 在启动时调 `user-profile` 把 UUID 补齐，
+   *     让全池统一走 UUID。
+   */
+  describe('★ 同账号判据（identityOf 不得用会轮换的 access_token）', () => {
+    /** 造一个形如真实 AutoClaw 的 JWT（三段、base64url payload）。 */
+    function makeJwt(payload: Record<string, unknown>): string {
+      const b64 = (o: unknown): string => Buffer.from(JSON.stringify(o)).toString('base64url')
+      return `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64(payload)}.sig`
+    }
+
+    it('★ 从 JWT 读出 user_id（登录响应里没有该字段）', () => {
+      // ⚠️ 注意：这是 numericUserId，不是 UUID 主键。
+      const token = makeJwt({ user_id: 839684, device_id: 'd-1', guid: '' })
+      expect(readUserIdFromJwt(token)).toBe('839684')
+      // 带 Bearer 前缀也要能读
+      expect(readUserIdFromJwt(`Bearer ${token}`)).toBe('839684')
+    })
+
+    it('★ guid 是空串 ⇒ 不能当判据（实测三条全为空）', () => {
+      // ⚠️ 这条钉住 2026-10-19 二次尝试的失败：我当时改读 guid，
+      //    但真机上 `guid` 恒为 `""` ⇒ 三条全判不出身份，去重全跳过。
+      const token = makeJwt({ user_id: 839684, guid: '' })
+      expect(readUserIdFromJwt(token)).toBe('839684')
+      expect(readUserIdFromJwt(makeJwt({ guid: '' }))).toBeUndefined()
+    })
+
+    it('★ 解析不出来时返回 undefined（绝不抛，登录不能因此失败）', () => {
+      expect(readUserIdFromJwt('')).toBeUndefined()
+      expect(readUserIdFromJwt('not-a-jwt')).toBeUndefined()
+      expect(readUserIdFromJwt('a.%%%.c')).toBeUndefined()
+      expect(readUserIdFromJwt(makeJwt({ other: 1 }))).toBeUndefined()
+    })
+
+    it('★ 同一账号续期后 token 变了，身份**必须不变**', async () => {
+      // ⚠️ 这条是缺陷①的核心：两个 token 内容不同（模拟续期轮换），
+      //    但 user_id 相同 ⇒ 必须判为同一账号。
+      const { autoclawIdentityForTest } = await import('../../src/autoclaw-auth.js')
+      const a = autoclawIdentityForTest({
+        access_token: makeJwt({ user_id: 839684, iat: 100 }),
+        refresh_token: 'r1',
+      })
+      const b = autoclawIdentityForTest({
+        access_token: makeJwt({ user_id: 839684, iat: 200 }),
+        refresh_token: 'r2',
+      })
+      expect(a, '★ 续期后身份变了 ⇒ 同一账号会被重复添加').toBe(b)
+      expect(a).toBe('autoclaw:839684')
+    })
+
+    it('★ 不同账号身份必须不同（不能过度合并）', async () => {
+      const { autoclawIdentityForTest } = await import('../../src/autoclaw-auth.js')
+      const a = autoclawIdentityForTest({
+        access_token: makeJwt({ user_id: 111 }), refresh_token: 'r',
+      })
+      const b = autoclawIdentityForTest({
+        access_token: makeJwt({ user_id: 222 }), refresh_token: 'r',
+      })
+      expect(a).not.toBe(b)
+    })
+
+    it('★ 凭据里已有 user_id（UUID）时优先用它', async () => {
+      const { autoclawIdentityForTest } = await import('../../src/autoclaw-auth.js')
+      // token 里是 numericUserId 839684，但凭据字段是 UUID 主键 —— 以字段为准。
+      // ⚠️ 这正是自愈补齐后全池统一走的形态。
+      const id = autoclawIdentityForTest({
+        access_token: makeJwt({ user_id: 839684 }),
+        refresh_token: 'r',
+        user_id: '7c54a9acc64092b06aa32cc8b1a48fef',
+      })
+      expect(id).toBe('autoclaw:7c54a9acc64092b06aa32cc8b1a48fef')
+    })
+
+    it('★ 完全取不到时退回 access_token（宁可退化，不要无身份）', async () => {
+      const { autoclawIdentityForTest } = await import('../../src/autoclaw-auth.js')
+      const id = autoclawIdentityForTest({ access_token: 'opaque-token', refresh_token: 'r' })
+      expect(id).toBe('opaque-token')
+    })
+  })
 })
+
+

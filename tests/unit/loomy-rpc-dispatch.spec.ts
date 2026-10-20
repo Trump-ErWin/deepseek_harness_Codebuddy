@@ -266,9 +266,19 @@ describe('Loomy RPC 分派', () => {
   })
 
   it('短信登录成功后不把 refreshable 置 true（Loomy 不可续期）', () => {
+    // ⚠️ 窗口用**下一个 case 标签**界定，不用硬编码字符数。
+    //
+    // 原实现取 `slice(start, start + 3000)` —— 那是脆弱的：`login.submitSms`
+    // 分支里每加一段别的渠道的代码（如 2026-10-19 给 autoclaw 加的同账号去重），
+    // 就会把 loomy 的 `refreshable: false` 挤出窗口，测试变红而**代码其实没错**。
+    // 判据应当表达「这一段分支里没有 true」而不是「第 3000 个字符之前没有 true」。
     const start = rpcSource.indexOf("case 'login.submitSms'")
     expect(start).toBeGreaterThan(-1)
-    const body = rpcSource.slice(start, start + 3000)
+    // 找该分支之后的下一个 `case '...'`（同层或更外层），以它作为分支结尾。
+    const after = rpcSource.slice(start + 1)
+    const nextCase = after.search(/\n\s{0,12}case '[a-z]/i)
+    const body = nextCase === -1 ? after : after.slice(0, nextCase)
+    expect(body.length, '分支体不应为空（判据失效时给出可读失败）').toBeGreaterThan(100)
     expect(body).toContain('refreshable: false')
     expect(body).not.toContain('refreshable: true')
   })

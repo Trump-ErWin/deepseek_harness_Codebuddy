@@ -80,18 +80,18 @@ function reduceFrontendToBackend(frontend: { expiring: number; longTerm: number;
 describe('splitCreditsByExpiry（前端三档分桶）', () => {
   it('15 天内到期算临期，更久算长期，无到期时间算永久', () => {
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 9 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 9 * DAY })
+      .toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 9 * DAY, earliestExpiringAmount: 100 })
     // ⚠️ 3008 天有**明确到期时间** ⇒ 长期（黄），不是永久（绿）。
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 3008 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null })
+      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0 })
     // 只有**服务端没给到期时间**才是真·永久。
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: undefined })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, longTerm: 0, permanent: 100, earliestExpiringAt: null })
+      .toEqual({ expiring: 0, longTerm: 0, permanent: 100, earliestExpiringAt: null, earliestExpiringAmount: 0 })
   })
 
   it('恰好 15 天归长期（判据是"不足 15 天"）', () => {
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 15 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null })
+      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0 })
   })
 
   it('失效包与零余额包不计入', () => {
@@ -99,7 +99,7 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
       pkg({ active: false, remaining: 999, deductionEndTime: NOW + DAY }),
       pkg({ remaining: 0 }),
       pkg({ remaining: 100, deductionEndTime: NOW + 20 * DAY }),
-    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null })
+    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0 })
   })
 
   it('到期时间未知归永久（保守方向）', () => {
@@ -107,7 +107,7 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
       pkg({ deductionEndTime: undefined }),
       pkg({ deductionEndTime: 0 }),
       pkg({ deductionEndTime: Number.NaN }),
-    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 0, permanent: 300, earliestExpiringAt: null })
+    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 0, permanent: 300, earliestExpiringAt: null, earliestExpiringAmount: 0 })
   })
 
   /**
@@ -122,6 +122,44 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
     ], WINDOW_DAYS, NOW)
     expect(split?.expiring).toBe(100)
     expect(split?.earliestExpiringAt).toBe(NOW + 2 * DAY)
+  })
+
+  /**
+   * ⚠️⚠️ **临期段的数字必须与倒计时指向同一批**（2026-10-20 用户报障
+   * 「怎么可能全都同一天到期」）。
+   *
+   * 形态（autoclaw 真机）：窗口内有三批，分别在 5 / 6 / 7 天后到期。
+   * 原实现把三批加总成「临期 20856（4 天 20 小时）」⇒ 用户读成
+   * 「这 20856 会在 4 天 20 小时后一起掉」，而实际只有最早那批 19656 会掉。
+   *
+   * ⇒ `earliestExpiringAmount` 必须是**最早那批的量**（不是窗口内总额），
+   *    它与 `earliestExpiringAt` 配对，才不会把不同批次的时间混成一个。
+   */
+  it('★ 临期段数字 = 最早那批的量（不是窗口内所有批次之和）', () => {
+    const split = splitCreditsByExpiry([
+      pkg({ remaining: 19656, deductionEndTime: NOW + 5 * DAY }),  // 最早那批
+      pkg({ remaining: 500, deductionEndTime: NOW + 6 * DAY }),
+      pkg({ remaining: 700, deductionEndTime: NOW + 7 * DAY }),
+    ], WINDOW_DAYS, NOW)
+    // 窗口内总额：三批都算
+    expect(split?.expiring).toBe(20856)
+    // 倒计时指向最早那批
+    expect(split?.earliestExpiringAt).toBe(NOW + 5 * DAY)
+    // ★ 数字必须只反映最早那批 —— 这才是「4 天 20 小时后会掉多少」
+    expect(split?.earliestExpiringAmount, '★ 用总额会让「N 天后掉 X」读成全部同时到期')
+      .toBe(19656)
+    // 渲染侧：临期文本取 earliestExpiringAmount
+    const parts = expirySplitParts(split, (v) => String(v), NOW)
+    const expiringPart = parts.find((p) => p.key === 'expiring')
+    expect(expiringPart?.text).toBe('临期 19656')
+  })
+
+  it('★ 同一到期时刻的多个包 ⇒ earliestExpiringAmount 累加（同批）', () => {
+    const split = splitCreditsByExpiry([
+      pkg({ remaining: 100, deductionEndTime: NOW + 3 * DAY }),
+      pkg({ remaining: 200, deductionEndTime: NOW + 3 * DAY }),   // 同刻 = 同一批
+    ], WINDOW_DAYS, NOW)
+    expect(split?.earliestExpiringAmount, '同刻并列属于同一批，量要相加').toBe(300)
   })
 
   /**
@@ -221,7 +259,7 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
     // 40 秒后越过 15 天线
     const later = NOW + 40_000
     const after = splitCreditsByExpiry(packages, WINDOW_DAYS, later)
-    expect(after).toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 15 * DAY + 30_000 })
+    expect(after).toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 15 * DAY + 30_000, earliestExpiringAmount: 100 })
     expect(reduceFrontendToBackend(after!)).toEqual(backendSplit(packages, WINDOW_DAYS, later))
   })
 
@@ -249,7 +287,7 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
       pkg({ name: '签到奖励', remaining: 150, deductionEndTime: base + 30 * DAY }),
     ]
     expect(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base))
-      .toEqual({ expiring: 500, longTerm: 450, permanent: 0, earliestExpiringAt: base + 1 * DAY })
+      .toEqual({ expiring: 500, longTerm: 450, permanent: 0, earliestExpiringAt: base + 1 * DAY, earliestExpiringAmount: 500 })
     expect(formatExpirySplitLine(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base), v => String(v)))
       .toBe('长期 450 · 临期 500')
     // 与后端同规则（TRAE 复用 buddy 的分桶判据，不存在第二套标准）——
@@ -839,4 +877,5 @@ describe('包列表排序的覆盖面（源码级）', () => {
     expect(around).not.toMatch(/provider ===/)
   })
 })
+
 
