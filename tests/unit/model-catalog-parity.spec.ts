@@ -710,7 +710,7 @@ id: 'autoclaw',
     expect(CASES).toHaveLength(20)
   })
 
-  it('★★ `catalog` 具备 `refresh` 的家必须把它**转发成适配器成员**（否则后台刷新器对这家空转）', () => {
+  it('★★ `catalog` 具备 `refresh` 的家，适配器上必须**存在** `refresh` 成员（转发接线）', () => {
     // ⚠️⚠️ 2026-10-20 修正的实测缺陷形态：`be42b25`（「装配 20 分钟模型目录刷新器」）
     //    给 `createModelCatalog` 的 **config** 加了 `refresh` 回调，但**各家适配器
     //    都没有**把它转发成自己的 `refresh` 成员；而 `index.ts` 的刷新器调的是
@@ -718,13 +718,26 @@ id: 'autoclaw',
     //    catalog 实例上的成员不会自动出现 ⇒ 每一轮都是「0 家参与」，
     //    而 `start()` 的「模型目录刷新器已武装」照打、**零日志**、整整一天无感。
     //
-    // ⚠️ 判据是**行为**（构造真实适配器、看实例成员），**不是**源码文本断言 ——
+    // ⚠️ 判据是**实例成员**（构造真实适配器、看 `typeof`），**不是**源码文本断言 ——
     //    后者会被 `if (false)` 短路骗过（本仓库已实测 5 条这类判据恒绿）。
     // ⚠️ 从 `CASES` 遍历 ⇒ 新增 provider 自动纳入（漏一家即被点名）。
     // ⚠️ `catalog` 无 `refresh` 的家自动跳过：那表示它的目录不走共享骨架
     //    （opencode / autoclaw / officeace / modelscope / aggregate），
-    //    或它的 `createModelCatalog` 没给 config 回调（cline / gemini / qoder）
+    //    或它的 `createModelCatalog` 没给 config 回调（cline / gemini）
     //    —— 后者是**已知的、已如实登记的**独立缺口，不在本条判据的范围内。
+    //    ⚠️ 2026-10-20：**qoder / qodercn 已补齐**（接入远端目录的同时补了
+    //    `refresh` 转发与 `onCatalogLoaded` 广播）⇒ 从「已知缺口」名单移出、
+    //    进下面的正向点名表。12 → 14。
+    //
+    // ⚠️⚠️ **本条只覆盖「成员存在」，抓不到「成员在但空转」**（2026-10-20 对抗审计
+    //    实测：把 `refresh()` 方法体清空成 no-op 后，本文件 **49 passed 全绿**）——
+    //    而它引用的 `be42b25` 历史缺陷恰恰是「空转 + 零日志」。
+    //    ⇒ **不要**把这条当成「转发语义成立」的证明：行为面（`refresh()` 真的会
+    //    驱动一次目录读取）由**各家自己的** `refresh` 用例承担，例如
+    //    `qoder-adapter.spec.ts` 的「refresh() 强制重拉（无视 TTL）」。
+    //    该行为断言无法在本文件通用化：`CASES` 的多数构造**不注入**
+    //    `fetchRemoteModels`（注入了就会真发网络，见 accio 那行的注释），
+    //    因此没有可观测的取数入口。⇒ 本条**如实收窄为存在性判据**。
     const missing: string[] = []
     const forwarding: string[] = []
     for (const c of CASES) {
@@ -749,10 +762,10 @@ id: 'autoclaw',
     //       **共用适配器类**，因此同样继承了 config 回调与转发（实测由本断言自己找出）。
     expect(
       forwarding.sort(),
-      '这 12 家必须都接入后台刷新（改这条名单前请先读 be42b25 与本轮修正的注释）',
+      '这 14 家必须都接入后台刷新（改这条名单前请先读 be42b25 与本轮修正的注释）',
     ).toEqual([
       'accio', 'astudio', 'buddy', 'codearts', 'lobsterai', 'loomy',
-      'minimax', 'minimaxintl', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'minimax', 'minimaxintl', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
   })
 
