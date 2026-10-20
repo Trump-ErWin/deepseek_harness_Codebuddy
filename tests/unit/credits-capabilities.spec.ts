@@ -28,6 +28,8 @@ import { TRAE } from '../../src/trae-product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
 import { OFFICEACE } from '../../src/officeace-product.js'
 import { QODER, QODER_CN } from '../../src/qoder-product.js'
+import { ASTUDIO } from '../../src/astudio-product.js'
+import { MINIMAX, MINIMAX_INTL } from '../../src/minimax-product.js'
 
 /**
  * 积分能力矩阵的回归测试。
@@ -698,10 +700,22 @@ describe('永久积分锁定能力', () => {
    *   `9999-12-31（约 2900000 天后）` 这种荒谬文案（见
    *   `tests/unit/qoder-lock-wiring.spec.ts` 的 `packageExpiryMs` 断言）。
    *   ⚠️ **同样必须各占一项**（共用一个 `QoderAuth` 不等于共用一个 id）。
+   *
+   * ⚠️ 2026-10-20 新增 AStudio（讯飞 AstronStudio）：`/points/balance` 三池各带
+   *   `*NextExpireTime`（不带时区的本地时间串），已由 `astudio-credits.ts` 的
+   *   `astudioLocalTimeMs` 归一化到 `deductionEndTime`；且已接上
+   *   `createCredentialResolver` 的 `kind: 'buddy'` 选号（锁定才真能拦）。
+   *
+   * ⚠️ 2026-10-20 新增 MiniMax Code 中国版 / 国际版（用户报障：「MiniMax Code
+   *   积分也有到期时间，也应当有相同功能」）：`/minimax-cloud/api/v1/credit/details`
+   *   的每条 `details[]` 带 `expire_at_ms`（毫秒时间戳，无需换算），已直接写进
+   *   `deductionEndTime`；同日接上同一个 `kind: 'buddy'` 选号。
+   *   ⚠️ **是两个渠道 id，必须各占一项**（共用一个 `MinimaxAuth` 不等于共用一个 id）。
    */
   const SUPPORTED = [
     LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id,
     QODER.id, QODER_CN.id,
+    ASTUDIO.id, MINIMAX.id, MINIMAX_INTL.id,
   ]
   const UNSUPPORTED = [
     'codearts', 'cline', 'raccoon',

@@ -6320,11 +6320,22 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
  * 本行的语义是「哪些渠道参与了跨渠道临期优先路由的候选表」，而 Qoder
  * 确实已接入该表（`aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`）。
  * 指「有没有临期积分可排序」是另一回事，由上游给不给逐包日期决定。
+ * ⚠️ **AStudio**（讯飞 AstronStudio，2026-10-20）：`/points/balance` 的
+ * member / buy / activity 三池各带 `*NextExpireTime` ⇒ 已进
+ * `WIRED_EXPIRY_PROVIDERS`，这里必须同改（漏改会让只登了 AStudio 的账号在
+ * 聚合面板看到「请先在……登录账号」这句错话）。
+ *
+ * ⚠️ **MiniMax Code 中国版 / 国际版**（2026-10-20，第 6 次复发）：两家都是
+ * `AGGREGATE_CHANNELS` 的成员，且 `/minimax-cloud/api/v1/credit/details` 的
+ * 每条 `details[]` 带 `expire_at_ms` ⇒ 同日接入 `WIRED_EXPIRY_PROVIDERS`，
+ * 这里必须同改。⚠️ **是两个渠道 id，必须各占一项**（共用一个 `MinimaxAuth`
+ * 不等于共用一个 id）；漏掉国际版 ⇒ 只登国际站的用户仍看到错话。
  */
 const AGG_WIRED_CHANNEL_IDS = [
   'buddy', 'workbuddy', 'loomy', 'codearts', 'zcode', 'lobsterai', 'trae',
   'accio', 'officeace', 'modelscope', 'autoclaw', 'autoclawintl',
   'qoder', 'qodercn',
+  'astudio', 'minimax', 'minimaxintl',
 ];
 
 /**
