@@ -80,6 +80,19 @@ export function providerSwitchState(status) {
     return { checked: true, disabled: true, reason: '状态尚未读取' };
   }
   const total = typeof status.models?.total === 'number' ? status.models.total : 0;
+  // ⚠️⚠️ **「已关闭」优先于「没有模型可关」**（Gitee issue IKP8OF，真实死锁）。
+  //
+  // 顺序不能反。`closed === true` 的供应商**必须永远可点开**，即使 `total === 0`：
+  // 那种形态真实可达 —— 用户关闭了某供应商，随后它的账号被全部删除 / 目录被清空
+  // ⇒ `total` 变成 0。若这里先判 `total <= 0` 而返回 `disabled: true`，
+  // 开关就变成**点不动的「已关闭」**：用户既关不掉也打不开，且没有任何出路
+  //（只能手工编辑 `state.json`）。
+  //
+  // 「`total <= 0` ⇒ 禁用」这条判据的**本意**是「没有模型可关 ⇒ 关闭动作会被
+  // 服务端拒绝，别让用户白点」（见上面的方法头），它约束的是**关闭**方向；
+  // 已关闭时用户要做的恰恰是**打开**，那个方向永远合法（`provider.setEnabled(true)`
+  // 不读目录、纯本地清黑名单 + 清意图）。
+  if (status.closed === true) return { checked: false, disabled: false, reason: null };
   if (total <= 0) {
     return {
       checked: true,
@@ -87,7 +100,7 @@ export function providerSwitchState(status) {
       reason: '该供应商没有可关闭的模型',
     };
   }
-  return { checked: status.closed !== true, disabled: false, reason: null };
+  return { checked: true, disabled: false, reason: null };
 }
 
 /**

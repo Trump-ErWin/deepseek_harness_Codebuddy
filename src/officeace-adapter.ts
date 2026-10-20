@@ -136,6 +136,18 @@ export interface OfficeAceAdapterOptions {
   /** 黑名单模型 id（面板「显示列表」开关）。 */
   disabledModels?: () => ReadonlySet<string>
   /**
+   * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+   *
+   * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
+   * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
+   * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
+   * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+   *
+   * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
+   * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+   */
+  providerClosed?: () => boolean
+  /**
    * 目录新鲜度用的时钟（**只**用于 `isCatalogFresh`，不参与任何业务判定）。
    *
    * ⚠️ 缺省 `Date.now()`；注入它只是为了让「20 分钟 TTL」在单测里可推进，
@@ -229,6 +241,10 @@ export class OfficeAceAdapter extends LlmAdapter {
    * 与 AutoClaw 同一约定：空目录 = 隐藏，而不是报错）。
    */
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️⚠️ 「供应商整体关闭」⇒ 一条都不播（Gitee issue IKP8OF）。
+    // 必须在探测凭据与打上游之前：关闭态下那两次往返（`/v2/models` +
+    // `/v1/model-token-rates`）纯属浪费，且新模型不在黑名单里会被漏掉。
+    if (this.options.providerClosed?.() === true) return []
     const disabled = this.options.disabledModels?.() ?? new Set<string>()
     // ⚠️ 目录用**只读探测凭据**（见 `probeCredential` 的长注释）：恒不抛「锁定」错。
     //    `/v2/models` 与倍率都是只读端点，不扣积分，锁定它们只会得到一串

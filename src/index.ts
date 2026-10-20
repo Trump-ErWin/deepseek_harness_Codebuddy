@@ -2460,6 +2460,13 @@ export function apply(ctx: Context): void {
     //    ⚠️ 刻意**不接** `readImageRequest` 缩放桥接：智谱侧对单图字节上限
     //    无实测依据，编一个预算是凭空造数字（同 modelscope 的取舍）。
     readImage: makeReadImage(ctx),
+    // ⚠️⚠️ **必须接 `disabledModels` 与 `providerClosed`**（2026-10-20，IKP8OF）：
+    //    本家手写 `listModels`、不走共享骨架，而这两条回调此前**一个都没传** ⇒
+    //    用户在 Jet Hub 里关掉的 autoclaw 模型**照样出现在选择器里**（实测形态与
+    //    modelscope 那条「接线层漏实参」逐字相同：字段与消费点都在，只缺实参）。
+    //    `providerClosed` 另外覆盖「关闭之后才新增的模型」（黑名单里没有它们）。
+    disabledModels: () => pool.disabledModelsFor(AUTOCLAW.id),
+    providerClosed: () => pool.providerClosedFor(AUTOCLAW.id),
   })
 
   // ===== AutoClaw 国际版（autoclawintl）=====
@@ -2504,6 +2511,10 @@ export function apply(ctx: Context): void {
     //    查不到自己的账号（本插件在 workbuddy 上踩过同类坑）。
     product: AUTOCLAW_INTL,
     readImage: makeReadImage(ctx),
+    // ⚠️⚠️ 同国内版（IKP8OF）：本家手写 `listModels`，两条回调必须显式接线。
+    //    两个站点各一条，漏一处即该站静默失效（本仓库的既有纪律）。
+    disabledModels: () => pool.disabledModelsFor(AUTOCLAW_INTL.id),
+    providerClosed: () => pool.providerClosedFor(AUTOCLAW_INTL.id),
   })
 
   const accio = new AccioAuth(ctx)
@@ -2591,11 +2602,15 @@ export function apply(ctx: Context): void {
   // 不注册斜杠命令：入口在 Jet Hub 的 AStudio 面板。
   const astudio = new AstudioAuth(ctx)
   const astudioAdapter = registerAstudioLlm(ctx, {
-    // ⚠️ AstudioAdapterOptions 只有 product / fetchImpl / auth / resolveCredential /
-    //    refresh / fetchRemoteModels / onCatalogLoaded / warn 八项 —— **没有**
-    //    accountPool 与 readImage（与上面 accio 那两处不同，多传必 TS2353：
-    //    本家适配器刻意不做请求级换号，且实测六个模型的 input_modalities 全是
-    //    text，图片通路不成立）。
+    // ⚠️⚠️ **`accountPool` 必须传**（Gitee issue IKP8OF 审计发现，真实缺陷）：
+    //    本家此前是**唯一**把 `createModelCatalog` 的 deps 传成 `{}` 的适配器
+    //    （其余各家都传 `{ accountPool }`）⇒ 骨架里 `deps.accountPool?.disabledModelsFor`
+    //    与 `providerClosedFor?.(...)` 全部因 `?.` **静默跳过** ⇒
+    //    **用户在 Jet Hub 里关掉的 astudio 模型照样出现在选择器里**，
+    //    关闭整个供应商也无效。症状与 modelscope 那次「接线层漏实参」逐字相同。
+    // ⚠️ 仍**不传** `readImage`（实测六个模型的 input_modalities 全是 text，
+    //    图片通路不成立），且本家刻意不做请求级换号。
+    accountPool: pool,
     // ⚠️ **不传 onCatalogLoaded**：registerAstudioLlm 内部已注入唯一的
     //    broadcastCatalogChanged(ctx)，这里再传就是第二份广播。
     // ⚠️ 传 auth 即可拿到三个默认回调（currentCredential / refreshOnce /
@@ -2694,6 +2709,10 @@ export function apply(ctx: Context): void {
     //    ⚠️ 典型形态：适配器**支持**该能力（字段与消费点都在），只是**接线层漏了实参**
     //    ⇒ 无报错、无日志，纯静默。
     disabledModels: () => pool.disabledModelsFor(MODELSCOPE.id),
+    // ⚠️⚠️ **必须接 `providerClosed`**（Gitee issue IKP8OF）：本家不走共享骨架
+    //    （`model-catalog.ts`），故「整个供应商关闭」这条判据必须在这里显式接线，
+    //    否则关闭后**新长出来的模型**仍会出现在选择器里（黑名单里没有它们）。
+    providerClosed: () => pool.providerClosedFor(MODELSCOPE.id),
   })
 
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
@@ -3258,6 +3277,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
 
   const officeAceAdapter = registerOfficeAceLlm(ctx, {
     disabledModels: () => pool.disabledModelsFor(OFFICEACE.id),
+    // ⚠️⚠️ 同上（IKP8OF）：本家手写 `listModels`，不走共享骨架。
+    providerClosed: () => pool.providerClosedFor(OFFICEACE.id),
     // ⚠️ **按当前选中账号的 ref 取凭据**（2026-10-13）：凭据存在 DSH 凭据库里
     //    按 `credentialRef` 索引（与 gemini / raccoon 同款）。缺省会读兼容文件
     //    `session.json`，那份是**所有账号共用**的 ⇒ 号池轮换形同虚设。
@@ -3412,6 +3433,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         : AbortSignal.any([signal, AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)]),
     }),
     disabledModels: () => pool.disabledModelsFor(OPENCODE.id),
+    // ⚠️⚠️ 同上（IKP8OF）：本家手写 `listModels`，不走共享骨架。
+    providerClosed: () => pool.providerClosedFor(OPENCODE.id),
     markLimited: async (slotId, modelId, resetAtMs) => {
       // 匿名条目同样落盘：它是池里的一条普通条目，限额标记在面板可见、
       // 可用「重测/清除」恢复（早期把匿名槽当进程内状态，重启即丢）。
