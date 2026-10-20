@@ -3322,8 +3322,47 @@ describe('provider.status / provider.setEnabled 端点', () => {
       writeOrder,
       storedDisabled: () => (stored.disabledModels as Record<string, Record<string, boolean>> | undefined) ?? {},
       storedAccounts: () => (stored.accounts as Array<{ id: string; provider: string; enabled: boolean }> | undefined) ?? [],
+      /**
+       * **模型选择器视角**：用**真实的共享骨架**（`createModelCatalog`）跑一遍
+       * `listModels`，判据打在它实际返回的 id 上。
+       *
+       * ⚠️ 必须共享**同一个** `pool`（关闭意图与黑名单状态都在它里面），且
+       * **不能**用上面 `ctx.llm.listModels` 那个替身 —— 那个替身自己实现了
+       * 黑名单过滤，测它等于测测试自己（本仓库实测过这类「假守卫」）。
+       *
+       * ⚠️⚠️ **必须关掉「无账号就隐藏 provider」门控**
+       *（`DSH_HIDE_MODELS_WITHOUT_ACCOUNT`，默认**开启**）。本 setup 没有账号
+       * ⇒ 不关它则 `listModels` 恒返回 `[]` ⇒ 「关闭态下新模型不得可选」这条
+       * 断言**恒真 = 假绿**（实测踩到：打开供应商后仍返回 `[]` 才暴露）。
+       * 门控本身另有专门的用例覆盖，不该混进本组判据。
+       */
+      listModelsViaSkeleton: async (provider = options.providerId ?? 'buddy'): Promise<string[]> => {
+        const previous = process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT
+        process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT = '0'
+        try {
+          const { createModelCatalog } = await import('../../src/model-catalog.js')
+          const entries = (options.catalog ?? []).map((m) => ({ id: m.id, name: m.name }))
+          const modelCatalog = createModelCatalog(
+            { accountPool: pool },
+            {
+              product: { id: provider },
+              loadCatalog: () => entries,
+              syncCatalog: () => entries,
+              unknownModelInputModalities: () => ['text'] as const,
+            } as never,
+          )
+          const listed = await modelCatalog.listModels(provider)
+          return listed.map((m) => m.id)
+        } finally {
+          if (previous === undefined) delete process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT
+          else process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT = previous
+        }
+      },
     }
   }
+
+  /** 目录在关闭之后「长出来」的模型（黑名单里**没有**它）。 */
+  const LATE_MODEL = { id: 'late-model', name: 'Late Model' }
 
   const CATALOG = [
     { id: 'glm-5.2', name: 'GLM-5.2' },
@@ -3856,6 +3895,376 @@ describe('provider.status / provider.setEnabled 端点', () => {
       expect(writeOrder).toEqual([])
       expect(emitted).toEqual([])
       expect(storedAccounts()[0].enabled).toBe(true)
+    })
+  })
+
+  /**
+   * ★★ **Gitee issue IKP8OF：关闭供应商后目录继续变长 ⇒ 不得自动「已打开」**
+   *
+   * ## 缺陷形态（用户报障，本仓库实测复现）
+   *
+   * 「关闭供应商」只把**当时目录**的 id 写进黑名单；而 `provider.status` 的
+   * `closed` 判据是 `total > 0 && disabled === total`（`total` 取**当前**目录）。
+   * 于是目录**在关闭之后**继续变长（cline 三源异步 + models.dev 可恢复、
+   * 其余家后台刷新器补进上游新模型）⇒ `disabled < total` ⇒ `closed` 翻回 `false`：
+   *
+   * ```
+   * 关闭后   {total:3,disabled:3,closed:true}
+   * 补齐后   {total:7,disabled:3,closed:false}   ← 开关静默翻回「已打开」
+   * 而选择器里多出 4 条可选                        ← 真正的危害（零提示）
+   * ```
+   *
+   * 用户原话：「关闭 Cline 供应商后它仍会时不时回到『已打开』分组」。
+   *
+   * ## 判据（修复后）
+   *
+   * 「关闭**意图**」（`providerClosed`，与目录快照无关）**或**派生判据。
+   * 两条腿各自管一半，**缺一条就有真缺陷**：
+   * - 只有派生 ⇒ 目录一长就翻回「已打开」（本 issue）；
+   * - 只有意图 ⇒ 用户逐条打开全部模型后，界面仍说「已关闭」而模型全可选
+   *   （IKJW33 的矛盾态）。
+   */
+  describe('★★ IKP8OF：关闭供应商后目录变长', () => {
+    /** 目录在关闭之后「长出来」的模型（黑名单里**没有**它）。 */
+    const LATE = { id: 'late-model', name: 'Late Model' }
+
+    it('★★ 关闭后目录变长 ⇒ closed 必须仍为 true（不得翻回「已打开」）', async () => {
+      // `catalog` 是**可变数组**：模拟「关闭之后目录继续补齐」。
+      const catalog = [...CATALOG]
+      const { call } = setup({ catalog })
+
+      expect((await call('provider.setEnabled', { provider: 'buddy', enabled: false })).ok).toBe(true)
+      const before = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }
+      expect(before.statuses.buddy, '关闭当下应报已关闭').toMatchObject({
+        models: { total: 3, disabled: 3 },
+        closed: true,
+      })
+
+      // ★ 目录异步补齐（真实形态：cline 三源异步 + 预热重试）。
+      catalog.push(LATE)
+
+      const after = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }
+      expect(
+        after.statuses.buddy.closed,
+        '★★ 目录变长后 closed 翻回 false ⇒ 供应商静默回到「已打开」（本 issue 的原症状）',
+      ).toBe(true)
+      // ★ 计数也必须自洽：否则设置页「分组说已关闭、每条开关都说已打开」。
+      expect(
+        after.statuses.buddy.models,
+        '★ disabled 必须跟着意图报满（否则设置页自相矛盾）',
+      ).toEqual({ total: 4, disabled: 4 })
+    })
+
+    /**
+     * ★★ **真正的危害**：新模型不得可选。
+     *
+     * 只修 `closed` 不修过滤 ⇒ 界面说「已关闭」而模型**照样能选**，那是
+     * IKJW33 修过的矛盾态的镜像。判据必须打在 `listModels` 的结果上。
+     */
+    it('★★ 关闭后目录变长 ⇒ 新模型不得出现在模型选择器里', async () => {
+      const catalog = [...CATALOG]
+      const { call, listModelsViaSkeleton } = setup({ catalog })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+
+      catalog.push(LATE)
+
+      // 适配器（= 模型选择器的数据源）必须一条都不播。
+      const listed = await listModelsViaSkeleton()
+      expect(
+        listed,
+        '★★ 关闭态下新模型仍可选（界面说已关闭、却仍能选中）',
+      ).toEqual([])
+    })
+
+    it('★ 打开供应商 ⇒ 清除意图，模型恢复可选（不是死状态）', async () => {
+      const catalog = [...CATALOG, LATE]
+      const { call, listModelsViaSkeleton } = setup({ catalog })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const reopen = await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      expect(reopen.ok).toBe(true)
+
+      const s = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { closed: boolean }> }
+      expect(s.statuses.buddy.closed, '打开后不得仍报已关闭').toBe(false)
+      expect(await listModelsViaSkeleton(), '打开后模型必须恢复可选').toHaveLength(4)
+    })
+
+    /**
+     * ★★ **反向守卫（防「只有意图」那半）**：用户逐条打开全部模型 ⇒ 必须不再报已关闭。
+     *
+     * 若不守这一条，一个「`closed` 只读意图」的实现会全绿 —— 而它在用户逐条
+     * 打开模型后会说「已关闭」而模型全部可选（IKJW33 的矛盾态）。
+     */
+    it('★★ 用户逐条打开全部模型 ⇒ 意图被清除，不得仍报已关闭', async () => {
+      const catalog = [...CATALOG]
+      const { call } = setup({ catalog })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+
+      // 用户在模型列表里逐条打开（这是「我确实想让这个供应商可用」的最强信号）。
+      for (const model of catalog) {
+        const r = await call('model.setDisabled', { provider: 'buddy', modelId: model.id, disabled: false })
+        expect(r.ok).toBe(true)
+      }
+
+      const s = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }
+      expect(
+        s.statuses.buddy.closed,
+        '★★ 逐条打开后仍报已关闭 ⇒ 界面与事实相反（模型全可选却说关了）',
+      ).toBe(false)
+      expect(s.statuses.buddy.models).toEqual({ total: 3, disabled: 0 })
+    })
+
+    /**
+     * ★ **设置页的逐条开关也必须跟着意图走**（否则一屏自相矛盾）。
+     *
+     * 意图为真时，被「整体关闭」的模型**不在黑名单里**（目录变长后新增的那些）。
+     * 若 `model.list` 只读黑名单 ⇒ 分组说「已关闭」而每条开关都显示「已打开」，
+     * 用户会以为开关坏了。
+     */
+    it('★ 关闭后目录变长 ⇒ 设置页里新增模型也必须显示为已关闭', async () => {
+      const catalog = [...CATALOG]
+      const { call } = setup({ catalog })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      catalog.push(LATE)
+
+      const r = await call('model.list', { provider: 'buddy' })
+      expect(r.ok).toBe(true)
+      const models = (r.value as { models: Array<{ id: string; disabled: boolean }> }).models
+      const late = models.find((m) => m.id === LATE.id)
+      expect(late, '新增模型必须仍列在设置页（用户要能逐条打开它）').toBeDefined()
+      expect(
+        late!.disabled,
+        '★ 新增模型在设置页显示「已打开」⇒ 与分组「已关闭」自相矛盾',
+      ).toBe(true)
+    })
+
+    /**
+     * ★★ **黑名单与关闭意图必须同一次落盘**（半套状态是真实窗口）。
+     *
+     * 分两次写（先 `setModelsDisabled`、再 `setProviderClosed`）时，第二次失败
+     * 会留下「磁盘上黑名单已写、意图未写」的半套状态，而内存里意图已是 `true`
+     * ⇒ 本次会话看起来正常、**重启后静默复发**（目录一变长就翻回「已打开」，
+     * 正是本 issue 的症状），且用户完全不知道「上次关闭只成了一半」。
+     *
+     * ⚠️ 判据必须断言「**磁盘上两份都没有**」，而不是「RPC 返回 ok:false」——
+     * 后者在分两次写的实现下**也成立**（第一次成功、第二次失败仍然报错）。
+     * 实测（变异前）：`setEnabled` 报 `disk full`，而磁盘上 `disabledModels`
+     * 已含两条、`providerClosed` 为空 ⇒ 正是半套。
+     */
+    it('★★ 落盘失败时磁盘上「黑名单 + 关闭意图」必须同时为空（不得半套）', async () => {
+      // ⚠️⚠️ **必须是「第一次成功、第二次失败」**，不能用「每次都失败」：
+      //    后者在分两次写的实现下**也**会让磁盘保持干净（第一次就挂了）⇒ 恒真、
+      //    抓不到半套状态（实测：把实现退回分两次写，全量 238 条仍全绿）。
+      //    半套状态只在「前一次成功、后一次失败」时才出现。
+      // ⚠️⚠️ **判据必须对「落盘次数」敏感，不能对「第几次」写死**：
+      //    - 合并写入（正确实现）只落盘 **1 次** ⇒ 必须让它**成功**，否则断言
+      //      「磁盘两份都为空」在「唯一那次也失败」时恒真（实测踩到：报的是
+      //      `落盘失败必须如实报错` 变红，说明它压根没走到第 2 次）；
+      //    - 分两次写（缺陷实现）落盘 **2 次** ⇒ 让第 2 次失败，才会留下半套。
+      //    ⇒ 做法：**先成功落盘一次**（预置一个无关状态），从第 2 次起失败。
+      //    这样两种实现下都能走到「第 2 次」：合并实现第 1 次成功即结束（磁盘两份
+      //    都有值 —— 但那不是本用例要断言的分支），分两次写实现第 2 次失败 ⇒ 半套。
+      let stored: Record<string, unknown> = { accounts: [] }
+      let saves = 0
+      const failingPool = new AccountPool({
+        get: (key: string) => key === 'settings'
+          ? {
+              register: () => ({
+                get: () => stored,
+                replace: async (value: Record<string, unknown>) => {
+                  saves++
+                  if (saves >= 2) throw new Error('disk full')
+                  stored = value
+                },
+              }),
+            }
+          : undefined,
+        logger: { warn: () => {}, info: () => {} },
+        credentials: {
+          describe: async () => ({ configured: false, writable: true }),
+          resolve: async () => undefined,
+          set: async () => {},
+          unset: async () => {},
+        },
+      } as never)
+      let failingHandler: Handler | undefined
+      const failingCtx = {
+        get: (key: string) => {
+          if (key === 'connection') {
+            return { fetch: { register: (c: { path: string; fetch: Handler }) => { if (c.path === JET_HUB_API_PATH) failingHandler = c.fetch } } }
+          }
+          if (key === 'llm') return { listModels: async () => CATALOG }
+          return undefined
+        },
+        inject: (_d: string[], callback: (ctx: unknown) => void) => { callback(failingCtx) },
+        logger: { warn: () => {}, info: () => {} },
+        emit: () => {},
+      }
+      registerJetHubRpc(
+        failingCtx as never,
+        failingPool,
+        { buddy: {} as never } as never,
+        { buddy: { listAllModels: () => CATALOG } } as never,
+      )
+      const response = await failingHandler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+          payload: { method: 'provider.setEnabled', payload: { provider: 'buddy', enabled: false } },
+        }),
+      }))
+      const result = (await response.json() as { result: { ok: boolean } }).result
+      const diskDisabled = (stored as { disabledModels?: unknown }).disabledModels
+      const diskClosed = (stored as { providerClosed?: unknown }).providerClosed
+      // ★★ **核心不变式：磁盘上「黑名单」与「关闭意图」必须同生同灭**。
+      // 无论实现落盘几次、失败在第几次，都不允许出现「一个有一个没有」。
+      expect(
+        (diskDisabled === undefined) === (diskClosed === undefined),
+        `★★ 半套状态：disabledModels=${JSON.stringify(diskDisabled)} / providerClosed=${JSON.stringify(diskClosed)}`
+        + ' ⇒ 重启后本 issue 静默复发（意图丢了，只剩派生判据）',
+      ).toBe(true)
+      // 且两者若都存在，必须都是「已关闭」的形态（不能有黑名单却无意图）。
+      if (diskDisabled !== undefined) {
+        expect(result.ok, '两份都落盘成功时 RPC 必须报成功').toBe(true)
+        expect((diskClosed as Record<string, boolean>).buddy).toBe(true)
+      } else {
+        expect(result.ok, '一份都没落盘时 RPC 必须如实报失败').toBe(false)
+      }
+    })
+
+    /**
+     * ★★ **「打开供应商」必须一次落盘**（对抗审计打穿：打开方向漏了合并）。
+     *
+     * 原先走两步（`clearDisabledModels` save #1 → `setProviderClosed(false)` save #2），
+     * 两次之间磁盘是「黑名单空 + 意图真」⇒ 第二次失败/进程被杀则**重启后选择器恒空**
+     * （意图真 + 黑名单空 ⇒ `listModels` 返回 `[]`），而设置页一条关闭项都没有
+     * ⇒ 用户无从归因。
+     *
+     * ⚠️ 这条**恰好是最常见的路径**：只有「黑名单本来就空」时
+     * `clearDisabledModels` 才一次写完；黑名单非空（用户真关过东西、现在要打开）
+     * 时必然两次 —— 正是用户点「打开供应商」的典型情形。
+     *
+     * ⚠️ 判据必须**走真实 RPC 端点并数落盘次数**：只测
+     * `pool.clearModelsWithProviderClosed` 是**假绿** —— 实测把端点退回两步后，
+     * 全量 256 条用例**仍全绿**（用例自己调的就是新方法）。
+     */
+    it('★★ 「打开供应商」必须一次落盘（数落盘次数，走真实端点）', async () => {
+      let saves = 0
+      let stored: Record<string, unknown> = { accounts: [] }
+      let saveHandler: Handler | undefined
+      const savePool = new AccountPool({
+        get: (key: string) => key === 'settings'
+          ? {
+              register: () => ({
+                get: () => stored,
+                replace: async (value: Record<string, unknown>) => {
+                  saves += 1
+                  for (const k of Object.keys(stored)) delete stored[k]
+                  Object.assign(stored, value)
+                },
+              }),
+            }
+          : undefined,
+        logger: { warn: () => {}, info: () => {} },
+        credentials: {
+          describe: async () => ({ configured: false, writable: true }),
+          resolve: async () => undefined,
+          set: async () => {},
+          unset: async () => {},
+        },
+      } as never)
+      const saveCtx = {
+        get: (key: string) => {
+          if (key === 'connection') {
+            return { fetch: { register: (c: { path: string; fetch: Handler }) => { if (c.path === JET_HUB_API_PATH) saveHandler = c.fetch } } }
+          }
+          if (key === 'llm') return { listModels: async () => CATALOG }
+          return undefined
+        },
+        inject: (_d: string[], callback: (ctx: unknown) => void) => { callback(saveCtx) },
+        logger: { warn: () => {}, info: () => {} },
+        emit: () => {},
+      }
+      registerJetHubRpc(
+        saveCtx as never,
+        savePool,
+        { buddy: {} as never } as never,
+        { buddy: { listAllModels: () => CATALOG } } as never,
+      )
+      const post = async (method: string, payload: unknown) => {
+        const response = await saveHandler!(new Request('http://localhost/api/jet-hub', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+            payload: { method, payload },
+          }),
+        }))
+        return (await response.json() as { result: { ok: boolean } }).result
+      }
+      // 进入「已关闭」态（黑名单非空 + 意图真）—— 打开方向最常见的起点。
+      expect((await post('provider.setEnabled', { provider: 'buddy', enabled: false })).ok).toBe(true)
+      saves = 0
+      const reopened = await post('provider.setEnabled', { provider: 'buddy', enabled: true })
+      expect(reopened.ok).toBe(true)
+      expect(
+        saves,
+        '★★ 打开供应商落了 2 次盘 ⇒ 中间态「黑名单空 + 意图真」⇒ 崩溃后重启选择器恒空',
+      ).toBe(1)
+      // 且两份状态都必须已清。
+      expect((stored as { providerClosed?: unknown }).providerClosed).toEqual({})
+      expect((stored as { disabledModels?: unknown }).disabledModels).toEqual({})
+    })
+
+    /**
+     * ★★ **「关闭全部模型」（`model.setAllDisabled(true)`）也必须落意图**
+     *（对抗审计打穿：同一症状的**第二个入口**）。
+     *
+     * ⚠️ 判据必须**走真实 RPC 端点**：只测 `pool.writeModelsWithProviderClosed`
+     * 是**假绿** —— 实测把端点里那行退回 `setModelsDisabled` 后，
+     * 全量 255 条用例**仍全绿**（因为用例自己调的就是新方法）。
+     */
+    it('★★ 「关闭全部模型」后目录变长 ⇒ closed 仍为 true（第二入口不得复发）', async () => {
+      const catalog = [...CATALOG]
+      const { call } = setup({ catalog })
+      // 模型列表顶部的「关闭全部」。
+      const shut = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      expect(shut.ok).toBe(true)
+
+      const before = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { closed: boolean }> }
+      expect(before.statuses.buddy.closed).toBe(true)
+
+      // ★ 目录异步补齐。
+      catalog.push(LATE_MODEL)
+
+      const after = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { closed: boolean }> }
+      expect(
+        after.statuses.buddy.closed,
+        '★★ 「关闭全部模型」没落意图 ⇒ 目录变长后翻回「已打开」（IKP8OF 第二入口）',
+      ).toBe(true)
+    })
+
+    /**
+     * ⚠️ **「逐条关光」这条既有语义不得被新判据挤掉**。
+     *
+     * 反向守卫：用户从未点过「关闭供应商」，只是把每条模型逐个关掉 ⇒
+     * 派生判据必须仍然成立（`closed: true`）。这是修复前就有的行为，
+     * 有既有用例锁定；本用例把它与 IKP8OF 的新判据**并列**钉住。
+     */
+    it('⚠️ 反向：从未点过供应商开关、但逐条关光 ⇒ 仍算已关闭（既有语义）', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+      })
+      const s = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { closed: boolean }> }
+      expect(s.statuses.buddy.closed, '逐条关光必须仍算已关闭（派生判据不得被挤掉）').toBe(true)
     })
   })
 

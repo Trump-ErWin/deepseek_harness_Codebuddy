@@ -167,6 +167,30 @@ describe('providerSwitchState（开关三形态）', () => {
     expect(s.reason).toContain('没有可关闭的模型')
   })
 
+  /**
+   * ★★ **「已关闭」必须永远可点开，即使 `total === 0`**（Gitee issue IKP8OF，真死锁）。
+   *
+   * ## 缺陷形态（真实可达）
+   *
+   * 用户关闭了某供应商，随后它的账号被全部删除 / 目录被清空 ⇒ `total` 变成 0，
+   * 而 `closed` 仍为 `true`（关闭**意图**与目录快照无关，这正是 IKP8OF 的修复点）。
+   * 若判据顺序是「先判 `total <= 0` ⇒ 禁用」，开关就变成**点不动的「已关闭」**：
+   * 用户既关不掉也打不开，**没有任何出路**（只能手工编辑 `state.json`）。
+   *
+   * ## 为什么顺序必须反
+   *
+   * 「`total <= 0` ⇒ 禁用」的本意是「没有模型可关 ⇒ **关闭**动作会被服务端拒绝，
+   * 别让用户白点」（见 `providerSwitchState` 的方法头）。它约束的是**关闭**方向；
+   * 而已关闭时用户要做的恰恰是**打开**，那个方向永远合法
+   *（`provider.setEnabled(true)` 不读目录、纯本地清黑名单 + 清意图）。
+   */
+  it('★★ 已关闭 + total 为 0 → 仍必须可点开（不得变成点不动的死开关）', () => {
+    const s = providerSwitchState({ models: { total: 0, disabled: 0 }, closed: true })
+    expect(s.disabled, '★★ 已关闭却禁用 ⇒ 用户永远打不开它（IKP8OF 的死锁）').toBe(false)
+    expect(s.checked, '已关闭 ⇒ 勾选态必须是 false（点击即打开）').toBe(false)
+    expect(s.reason).toBeNull()
+  })
+
   it('② 状态未知（undefined）→ 禁用并说明原因', () => {
     const s = providerSwitchState(undefined)
     expect(s.disabled).toBe(true)
