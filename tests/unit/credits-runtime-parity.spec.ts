@@ -415,8 +415,11 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     // 而不是让 windowDays 静默地多出/少掉一家。
     // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`（唯一到期
     //    数据源，真机取证 28/28 带值且守恒），批次包归一化到 `deductionEndTime`。
+    // ⚠️ codearts 2026-10-20 加入：**只有基础积分包**带 `deductionEndTime`
+    //    （取自套餐周期 `end_date`）；赠送/按需包没有逐包到期字段，走
+    //    `expiringTotal` 聚合提示。它**不**开 `permanentLock`。
     const withWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true).map((d) => d.id).sort()
-    expect(withWindow).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    expect(withWindow).toEqual(['autoclaw', 'buddy', 'codearts', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 })
 
