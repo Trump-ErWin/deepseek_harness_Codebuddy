@@ -10,6 +10,7 @@ import { execFileSync } from 'node:child_process'
 import {
   AUTOCLAW,
   AUTOCLAW_SOURCE_ID,
+  AUTOCLAW_CLIENT_VERSION,
   type AutoclawProduct,
 } from './autoclaw-product.js'
 import {
@@ -19,6 +20,7 @@ import {
   AUTOCLAW_REQUEST_TIMEOUT_MS,
   calculateAutoclawSign,
   cleanBearerToken,
+  readUserIdFromJwt,
   autoclawExpiresAtMs,
   autoclawAccessTokenExpiresAtMs,
   type AutoclawCredential,
@@ -26,6 +28,192 @@ import {
 
 export const AUTOCLAW_SEND_CODE_PATH = '/userapi/v1/agent-send-code'
 export const AUTOCLAW_LOGIN_PATH = '/userapi/v1/agent-login'
+
+// ── Z.ai OAuth（**仅国际版**，2026-10-20 逆向+实测） ─────────────────────
+//
+// 国际版客户端界面只给「使用 Z.ai 继续」/ Google，但**后端照样接受短信登录**
+// （实测 `/userapi/v1/agent-send-code` 在国际基址返回 `code=0 SUCCESS`）。
+// 问题在于**国际版账号是邮箱+OAuth 创建的、没绑手机号**
+// （`account-profile.json`: `phone: null`），且**没有绑手机端点**
+// （`agent-bind-phone` / `bind-phone` 等全 404）⇒ 短信这条路对国际账号不可用。
+//
+// ⇒ 国际版必须走 Z.ai OAuth。三个事实（全部实测/逆向）：
+//
+// | 项 | 值 | 来源 |
+// |---|---|---|
+// | 授权页 | `https://chat.z.ai/auth` | 客户端 `ZAI_OAUTH_HOST_BY_ENVIRONMENT.overseas_release` |
+// | `client_id` | `client_EnD0QI8bLRFT8cciLp389Q` | 两次授权 URL 逐字节相同 ⇒ 固定值 |
+// | 换 token | `POST /userapi/overseasv1/zai-oauth-login` | 客户端 `exchangeOAuth` |
+// | `state.dh` | `SHA256(deviceId)` | **已破解**（实测命中） |
+// | `state.nh` | 未知（64 hex，非 deviceId/硬件标识的简单哈希） | **未解** |
+//
+// ## ⚠️ 关于 `state.nh`：为什么可以先用「不生成 state」的方案
+//
+// 用**瞎编的** `state`（`aosi.fake-state-probe`）打 `zai-oauth-login`，服务端回
+// **`631001 User login error`** —— 这是「进入登录逻辑后 code 无效」，
+// **不是**「state 无效」。⇒ 服务端不硬校验 `state` 的内容。
+//
+// ⇒ 实现采取**最可靠**的形态：`state` **由官方授权页生成并随回调带回**，
+//   插件只做**透传**（不自己拼 `aosi.*`）。这样 `nh` 到底是什么都不影响。
+
+/** Z.ai 授权页（国际版）。 */
+export const AUTOCLAW_ZAI_AUTH_URL = 'https://chat.z.ai/auth'
+/**
+ * Z.ai OAuth 的固定 `client_id`。
+ *
+ * ⚠️ 实测依据：两次独立授权 URL 的 `client_id` 逐字节相同 ⇒ 它是**构建期常量**，
+ * 不是服务端下发（`oauth-url` 端点需要登录态，首次登录拿不到）。
+ */
+export const AUTOCLAW_ZAI_CLIENT_ID = 'client_EnD0QI8bLRFT8cciLp389Q'
+/** OAuth 换 token 端点（`overseasv1` 命名空间，仅国际站有）。 */
+export const AUTOCLAW_ZAI_EXCHANGE_PATH = '/userapi/overseasv1/zai-oauth-login'
+/** Google OAuth 换 token 端点（对照用）。 */
+export const AUTOCLAW_GOOGLE_EXCHANGE_PATH = '/userapi/overseasv1/google-oauth-login'
+
+/** OAuth 回调路径（与客户端同款：`/auth/callback-zai`）。 */
+export const AUTOCLAW_OAUTH_CALLBACK_PATH = '/auth/callback-zai'
+/** OAuth 回调端口候选（与客户端 `OAUTH_CALLBACK_PORTS` 逐字相同）。 */
+export const AUTOCLAW_OAUTH_CALLBACK_PORTS: readonly number[] = [18432, 19654, 19723, 53699]
+
+/**
+ * 构造 Z.ai 授权 URL。
+ *
+ * ⚠️ `state` **不由本函数生成** —— 它留空，由官方授权页在跳转时填充，
+ *    回调时原样带回（见上方「关于 state.nh」）。这避免了逆向 `nh`。
+ *
+ * @param redirectUri - 回调地址（`http://localhost:<port>/auth/callback-zai`）。
+ */
+export function buildAutoclawZaiAuthUrl(redirectUri: string): string {
+  const url = new URL(AUTOCLAW_ZAI_AUTH_URL)
+  url.searchParams.set('response_type', 'code')
+  url.searchParams.set('client_id', AUTOCLAW_ZAI_CLIENT_ID)
+  url.searchParams.set('redirect_uri', redirectUri)
+  return url.toString()
+}
+
+/**
+ * 用授权码换 token（国际版 Z.ai OAuth）。
+ *
+ * ## 与国内版 HTTP 请求的差别：**必须带完整 managed 头**
+ *
+ * 客户端 `createZworkManagedRequestHeaders` 里除了签名头还有三个：
+ * `X-Version`（客户端版本）/ `X-Tm`（平台 `win`）/ `X-Product`（`autoclaw`）。
+ *
+ * ⚠️ **实测对照（2026-10-20）**：缺这三个头时服务端回
+ * `410000 用户未登录`（看起来像「没登录」但其实**压根没进登录逻辑**）；
+ * 补齐后回 `631001 User login error`（= 进了逻辑、code 无效）。
+ * ⇒ 三个头是**必需**的，缺了会被误诊成「凭据问题」。
+ *
+ * @param code - 授权码（回调 URL 的 `code`）。
+ * @param state - 授权页原样带回的 `state`（透传，不解析）。
+ * @param navigateUri - 与授权时**完全相同**的回调地址。
+ */
+export async function exchangeAutoclawZaiCode(
+  code: string,
+  state: string,
+  navigateUri: string,
+  options?: LoginAutoclawWithCodeOptions,
+): Promise<LoginAutoclawWithCodeResult> {
+  const trimmedCode = code.trim()
+  if (trimmedCode === '') return { ok: false, error: '授权码不能为空' }
+
+  const product = options?.product ?? AUTOCLAW
+  const fetcher = options?.fetchImpl ?? fetch
+  const deviceId = resolveDeviceId(product, options?.deviceId)
+  const ts = Math.floor(Date.now() / 1000).toString()
+  const sign = calculateAutoclawSign(product.appId, ts, product.appKey)
+
+  try {
+    const resp = await fetcher(`${product.apiBase}${AUTOCLAW_ZAI_EXCHANGE_PATH}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        // ⚠️ 这三个头缺一不可（见上面实测对照）。
+        'X-Version': AUTOCLAW_CLIENT_VERSION,
+        'X-Tm': 'win',
+        'X-Product': product.product,
+        'X-Auth-Appid': product.appId,
+        'X-Auth-TimeStamp': ts,
+        'X-Auth-Sign': sign,
+        'X-Lang': 'en-US',
+        'X-Channel': 'official',
+        'User-Agent': `AutoClaw/${AUTOCLAW_CLIENT_VERSION} (win)`,
+      },
+      body: JSON.stringify({
+        code: trimmedCode,
+        // ⚠️ `state` 原样透传（不解析、不重建）—— 见文件头「关于 state.nh」。
+        state,
+        navigate_uri: navigateUri,
+        source_id: AUTOCLAW_SOURCE_ID,
+        device_id: deviceId,
+      }),
+      signal: AbortSignal.timeout(AUTOCLAW_REQUEST_TIMEOUT_MS),
+    })
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '')
+      return { ok: false, error: `Z.ai 授权失败(${resp.status}): ${text}` }
+    }
+
+    const json = (await resp.json()) as {
+      code?: number
+      msg?: string
+      data?: {
+        access_token?: string
+        refresh_token?: string
+        expires_in?: number
+        expires_at?: number
+        user_id?: string | number
+        guid?: string
+      }
+    }
+
+    const data = json.data ?? {}
+    const rawAccess = data.access_token
+    if (json.code !== 0 || rawAccess === undefined || rawAccess === '') {
+      return {
+        ok: false,
+        error: json.msg !== undefined && json.msg !== ''
+          ? `Z.ai 授权失败：${json.msg}（code=${json.code}）`
+          : `Z.ai 授权失败（code=${json.code}）`,
+      }
+    }
+
+    const cleanAccess = cleanBearerToken(rawAccess)
+    const cleanRefresh = data.refresh_token === undefined ? '' : cleanBearerToken(data.refresh_token)
+    const expiresAt = typeof data.expires_at === 'number'
+      ? autoclawExpiresAtMs(data.expires_at)
+      : typeof data.expires_in === 'number'
+        ? Date.now() + data.expires_in * 1000
+        : Date.now() + 7 * 86400_000
+
+    // ⚠️ 身份字段：优先服务端 `user_id`，其次 JWT 的 `user_id`（numericUserId）。
+    //    与国内版同口径（见 `autoclawIdentityOf` 的注释：UUID 与 numericUserId
+    //    是两个 id 空间，统一由自愈补齐，这里只保证「不会没有身份」）。
+    const jwtUserId = readUserIdFromJwt(cleanAccess)
+    const resolvedUserId = data.user_id ?? jwtUserId
+
+    const credential: AutoclawCredential = {
+      access_token: cleanAccess,
+      refresh_token: cleanRefresh,
+      expires_at: expiresAt,
+      device_id: deviceId,
+      account_id: resolvedUserId === undefined ? undefined : String(resolvedUserId),
+      user_id: resolvedUserId,
+    }
+    return { ok: true, credential }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * AutoClaw 客户端版本号（`X-Version` 头用）—— **单一真相源在 `autoclaw-product.ts`**。
+ *
+ * ⚠️ 此处不再重复定义（2026-10-20）：`X-Version` 是国际站推理的硬校验头
+ *    （缺它 → HTTP 500 空响应体），两处各写一份 `'2.1.1'` 必然漂移，
+ *    统一从 `autoclaw-product.js` 导入（见 `AUTOCLAW_CLIENT_VERSION` 的注释）。
+ */
 
 /** 手机号格式正则（中国大陆11位手机号）。 */
 export const PHONE_NUMBER_RE = /^1[3-9]\d{9}$/
@@ -49,6 +237,28 @@ export const PHONE_NUMBER_RE = /^1[3-9]\d{9}$/
  */
 export async function probeAutoclawLocalCredential(options?: {
   customAppData?: string
+  /**
+   * **产品配置**（推荐形态）—— 目录名从 `product.userDataDirName` 取。
+   *
+   * ⚠️ 与下面的 `appDirName` 二选一，`product` 优先。新增调用点**必须**用它
+   * （而不是自己拼目录名），否则又会出现「三个读点各写一份」的事故形态。
+   */
+  product?: AutoclawProduct
+  /**
+   * 客户端 userData 目录名（**低层逃生口**，仅测试/特殊场景用）。
+   *
+   * ⚠️ **国内版与国际版是同一客户端的两份构建**（`isOversea` 是构建期常量），
+   * 但 userData 目录名不同 —— 实测（2026-10-20）：
+   * - 国内构建：`AutoClaw-official`
+   * - 国际构建：`AutoClaw-oversea-official`
+   *
+   * ⇒ 生产调用点一律传 `product`，别在这里写死（原实现硬编码国内目录，
+   *   导致国际版**永远导入不到**自己的凭据；审计 P0 就是漏了本函数的
+   *   `/autoclaw/import-local` 那个调用点）。
+   *
+   * @default AUTOCLAW.userDataDirName（`'AutoClaw-official'`）
+   */
+  appDirName?: string
 }): Promise<AutoclawCredential | undefined> {
   try {
     const appData =
@@ -60,7 +270,10 @@ export async function probeAutoclawLocalCredential(options?: {
 
     if (!appData) return undefined
 
-    const localStatePath = path.join(appData, 'AutoClaw-official', 'Local State')
+    const appDirName = options?.product?.userDataDirName
+      ?? options?.appDirName
+      ?? AUTOCLAW.userDataDirName
+    const localStatePath = path.join(appData, appDirName, 'Local State')
     if (!fs.existsSync(localStatePath)) return undefined
 
     const localState = JSON.parse(fs.readFileSync(localStatePath, 'utf8')) as {
@@ -89,7 +302,7 @@ export async function probeAutoclawLocalCredential(options?: {
     }).trim()
     const masterKey = Buffer.from(clearB64, 'base64')
 
-    const accountsDir = path.join(appData, 'AutoClaw-official', 'accounts')
+    const accountsDir = path.join(appData, appDirName, 'accounts')
     if (!fs.existsSync(accountsDir)) return undefined
 
     const entries = fs.readdirSync(accountsDir, { withFileTypes: true })
@@ -268,7 +481,25 @@ export async function refreshAutoclawToken(
         access_token: newAccess,
         refresh_token: newRefresh,
         expires_at: expiresAt,
-        user_id: json.data.user_id,
+        /**
+         * ⚠️⚠️ **`user_id` 必须带 JWT 兜底**（2026-10-20 审计 P1，实测真缺陷）。
+         *
+         * 上游 `/userapi/v1/refresh` **不下发 `user_id`**（登录端点都不下发，
+         * 见下面 `loginAutoclawWithCode` 的同一处兜底）。原先这里写
+         * `user_id: json.data.user_id` ⇒ 恒 `undefined` ⇒ `JSON.stringify`
+         * 把该键**整键丢弃** ⇒ 一次自动续期就把「已补齐的 UUID」抹掉 ⇒
+         * 下一轮 `dedupeByCredentialField` 因身份字段缺失而跳过该条
+         * ⇒ **自愈能力随续期逐条退化**，且日志零字。
+         *
+         * 兜底顺序与登录路径**同源**：声明值优先，取不到就从新 JWT 的
+         * `user_id` 读（`readUserIdFromJwt` 是唯一实现，不写第二份解析）。
+         *
+         * ⚠️ 注意兜底拿到的是 **numericUserId**（数字 id），不是 UUID ——
+         *    那是**比没有好**的退化（`autoclawIdentityOf` 靠它仍能判同账号）；
+         *    UUID 的真正补齐由启动自愈负责，且其跳过判据已改为
+         *    「已经是 UUID 才算补齐」（见 `isAutoclawUuidUserId`）。
+         */
+        user_id: json.data.user_id ?? readUserIdFromJwt(newAccess),
         device_id: deviceId,
       }
     } catch (err) {
@@ -341,7 +572,15 @@ export interface LoginAutoclawWithCodeResult {
   error?: string
 }
 
-function resolveDeviceId(explicitId?: string): string {
+/**
+ * 读桌面端的**设备号**（`%APPDATA%\<userDataDir>\device\device-id.json`）。
+ *
+ * ⚠️⚠️ **必须按产品取目录**（2026-10-20 审计 P1）：国际版的 userData 目录是
+ *    `AutoClaw-oversea-official`，写死国内目录会让国际账号拿到**国内客户端的
+ *    设备号**，读不到时还会静默回落 `crypto.randomUUID()` ⇒ 设备身份与桌面端
+ *    不一致，而 `device_id` 会进登录 / 签到 / 续期**三处**请求体。
+ */
+function resolveDeviceId(product: AutoclawProduct, explicitId?: string): string {
   if (explicitId && explicitId.trim().length > 0) return explicitId.trim()
   try {
     // ⚠️⚠️ 同样必须走隔离口（2026-10-17 审计 P0 修复）：这里读的是用户**真实**
@@ -352,7 +591,7 @@ function resolveDeviceId(explicitId?: string): string {
       process.env.DSH_AUTOCLAW_APPDATA
         ?? process.env.APPDATA
         ?? path.join(process.env.USERPROFILE ?? '', 'AppData', 'Roaming'),
-      'AutoClaw-official',
+      product.userDataDirName,
       'device',
       'device-id.json',
     )
@@ -380,7 +619,7 @@ export async function sendAutoclawVerificationCode(
 
   const product = options?.product ?? AUTOCLAW
   const fetcher = options?.fetchImpl ?? fetch
-  const deviceId = resolveDeviceId(options?.deviceId)
+  const deviceId = resolveDeviceId(product, options?.deviceId)
   const ts = Math.floor(Date.now() / 1000).toString()
   const sign = calculateAutoclawSign(product.appId, ts, product.appKey)
   const url = `${product.apiBase}${AUTOCLAW_SEND_CODE_PATH}`
@@ -449,7 +688,7 @@ export async function loginAutoclawWithCode(
 
   const product = options?.product ?? AUTOCLAW
   const fetcher = options?.fetchImpl ?? fetch
-  const deviceId = resolveDeviceId(options?.deviceId)
+  const deviceId = resolveDeviceId(product, options?.deviceId)
   const ts = Math.floor(Date.now() / 1000).toString()
   const sign = calculateAutoclawSign(product.appId, ts, product.appKey)
   const url = `${product.apiBase}${AUTOCLAW_LOGIN_PATH}`
@@ -522,13 +761,33 @@ export async function loginAutoclawWithCode(
         : undefined
     const expiresAt = autoclawAccessTokenExpiresAtMs(cleanAccess, declaredExpiresAt)
 
+    // ⚠️⚠️ **`user_id` 必须兜底从 JWT 里取**（2026-10-19 真机取证）：
+    //    实测 `/userapi/v1/agent-login` 的 `data` 里**没有** `user_id`
+    //    （只有 access_token / refresh_token / expires_*），于是这里原先是
+    //    `undefined` ⇒ `JSON.stringify` 时被整键丢弃 ⇒ 凭据里没有 `user_id`。
+    //
+    //    后果（用户报障「同一账号被加了 3 次」）：`identityOf` 只能退化成
+    //    `access_token`，而 access_token **每次登录/续期都轮换**
+    //    ⇒ 同一账号每续期一次就被当成一个新账号，池里堆出多条同 `user_id` 的条目，
+    //    面板把同一份积分**重复累加**（实测 20838×1 + 20789×2 = 62416）。
+    //
+    //    JWT payload 的 `user_id` 是稳定的数字 id（`numericUserId`）。
+    //
+    //    ⚠️ 它与「服务端 `user-profile.user_id`」（UUID）是**两个 id 空间**，
+    //       不能混用：老凭据落 UUID、新凭据两个都没有，「字段优先、JWT 兜底」
+    //       会让同一账号分裂成两组、去重白做（用户三次报障的教训）。
+    //       ⇒ 登录时尽量写这个 JWT 值保底；**真正的统一由
+    //         `autoclawSelfHeal` 启动时调 `user-profile` 补 UUID 完成**。
+    const jwtUserId = readUserIdFromJwt(cleanAccess)
+    const resolvedUserId = data.user_id ?? jwtUserId
+
     const credential: AutoclawCredential = {
       access_token: cleanAccess,
       refresh_token: cleanRefresh ?? '',
       expires_at: expiresAt,
       device_id: deviceId,
-      account_id: data.user_id !== undefined ? String(data.user_id) : undefined,
-      user_id: data.user_id,
+      account_id: resolvedUserId !== undefined ? String(resolvedUserId) : undefined,
+      user_id: resolvedUserId,
       user_name: data.user_name,
       user_phone: data.user_phone ?? trimmedPhone,
     }
@@ -753,7 +1012,27 @@ export async function startAutoclawSmsLoginFlow(
         }
 
         if (url.pathname === '/autoclaw/import-local') {
-          const localCred = await probeAutoclawLocalCredential()
+          /**
+           * ⚠️⚠️ **必须传 `product`**（2026-10-20 审计 P0 实测复现）。
+           *
+           * 这是「一键读取本机凭据」的**第二条腿** —— 第一条是
+           * `AutoclawAuth.probeLocal()`（`importLocalAccount` 内部）。
+           * 两条腿原先各写一份目录名，PR 只改了第一条 ⇒ 国际版的登录页按钮
+           * 仍去读**国内** `AutoClaw-official`。
+           *
+           * 复现（审计）：以 `product: AUTOCLAW_INTL` 起 flow、POST 本端点、
+           * 打桩 `fs.existsSync` ⇒ 唯一被探测路径是
+           * `...\AutoClaw-official\Local State`（不是 `AutoClaw-oversea-official`）。
+           *
+           * 危害不只是「读不到」：读到的是**国内凭据**，而这条路径的结果经
+           * `started.result` 在 `jet-hub-rpc.ts` **直接 `credentials.set` 落盘**，
+           * 不经过 `importLocalAccount` 的归属校验 ⇒ 国内凭据进
+           * `AUTOCLAWINTL_ACCOUNT_*`，全程零报错（PR 声称已修的那次事故复发）。
+           *
+           * ⇒ 目录名从 `product.userDataDirName` 取（单一真相源）；
+           *   落盘前的归属校验见 `jet-hub-rpc.ts` 的 `verifyAutoclawCredentialSite`。
+           */
+          const localCred = await probeAutoclawLocalCredential({ product })
           if (localCred) {
             settleOk({ credential: localCred, phone: localCred.user_phone ?? '' })
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
@@ -800,3 +1079,5 @@ export async function startAutoclawSmsLoginFlow(
 
   return { loginUrl, result, close }
 }
+
+

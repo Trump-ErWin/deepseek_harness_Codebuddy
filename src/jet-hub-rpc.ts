@@ -107,7 +107,7 @@ import type * as OfficeAceAuthModule from './officeace-auth.js'
 type OfficeAceAuth = typeof OfficeAceAuthModule
 import type { AccioAuth } from './accio-auth.js'
 import type { AutoclawAuth } from './autoclaw-auth.js'
-import { AUTOCLAW } from './autoclaw-product.js'
+import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js'
 import { parseAutoclawCredential, isAutoclawRefreshable, autoclawDisplayNickname } from './autoclaw.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import type { ModelscopeAuth } from './modelscope-auth.js'
@@ -1418,6 +1418,20 @@ export interface JetHubAuths {
   readonly astudio: AstudioAuth
   readonly autoclaw: AutoclawAuth
   /**
+   * **AutoClaw 国际版**（`autoclawintl`）。
+   *
+   * ⚠️⚠️ **键与值必须严格对应**：它的值是 `index.ts` 里那个用
+   * `product: AUTOCLAW_INTL` 构造的 `AutoclawAuth` 实例。
+   * ⚠️ 本段注释**不得出现右花括号字符**：`credits-balance-self-heal.spec.ts` 的
+   *    `jetHubAuthsKeys()` 用「找第一个右花括号」的方式截取接口体，注释里出现
+   *    该字符会让它**提前截断** ⇒ 后续所有键被判为「不存在」（实测踩过两次）。
+   * 若写成 `autoclawintl: autoclaw`（指向国内实例），症状是
+   * 「国际站账号的续期去刷了国内站凭据」—— 因为续期用的是**实例上的 product**，
+   * 而按 id 查表（`authOf`）会把国际站账号分派到国内站实例上。
+   * 这与 `minimaxintl` 的同类风险完全一样（见上方注释）。
+   */
+  readonly autoclawintl: AutoclawAuth
+  /**
    * ModelScope（魔搭）—— **本 fork 独有**（上游 rc.11 仍无此 provider）。
    *
    * ⚠️ 值是 `ModelscopeAuth` **Service 实例**（与 accio 同款），不是命名空间。
@@ -2068,11 +2082,13 @@ function registerJetHubEndpoints(
   const {
     codearts, buddy, workbuddy, lobsterai, qoder,
     qodercn: qoderCn,
-trae, cline, loomy, raccoon, minimax,
+    trae, cline, loomy, raccoon, minimax,
     // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
     minimaxintl,
     zcode, gemini, accio, autoclaw,
     astudio,
+    // ⚠️ AutoClaw 国际版（`autoclawintl`）—— 与 `autoclaw` 是**两个实例**。
+    autoclawintl,
   } = auths
   /**
    * 积分能力表。
@@ -2274,6 +2290,12 @@ trae, cline, loomy, raccoon, minimax,
     // 漏登记的后果与 accio 同款：凭据其实只需一次重取，面板却永报「未登录」。
     ASTUDIO.id,
     AUTOCLAW.id,
+    // ⚠️ autoclawintl（AutoClaw 国际版，2026-10-20）：与 `autoclaw` 共用同一个
+    //    auth 类，**有**真实 refresh 端点（`/userapi/v1/refresh`，实测国际站
+    //    续期成功）⇒ 不属 loomy / zcode 那类「设计上没有 refresh 端点」的豁免。
+    //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
+    //    只需一次 refresh，且**日志零字**。
+    AUTOCLAW_INTL.id,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
     //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
     //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
@@ -4517,19 +4539,29 @@ trae, cline, loomy, raccoon, minimax,
             ok: true,
             value: { accountId: id, loginUrl: started.authorizeUrl, incognitoOpened },
           }
-        } else if (provider === AUTOCLAW.id) {
-          const id = `autoclaw-${shortId()}`
-          const refName = `AUTOCLAW_ACCOUNT_${shortId().toUpperCase()}`
+        } else if (provider === AUTOCLAW.id || provider === AUTOCLAW_INTL.id) {
+          // ⚠️⚠️ **按 provider 取对应实例**（2026-10-20）：国际版与国内版是
+          //    两个实例，写死 `autoclaw` 会让国际版的「一键导入」去读
+          //    **国内版的 userData 目录** ⇒ 读不到（国际版在
+          //    `AutoClaw-oversea-official`）⇒ 报「请先登录」。
+          const isIntl = provider === AUTOCLAW_INTL.id
+          const autoclawAuthForProvider = isIntl ? autoclawintl : autoclaw
+          const autoclawProduct = isIntl ? AUTOCLAW_INTL : AUTOCLAW
+          const id = `${provider}-${shortId()}`
+          // ⚠️ refName 前缀必须按产品派生（与 `importLocalAccount` 同口径）：
+          //    国际版写 `AUTOCLAWINTL_ACCOUNT_*`，否则会被
+          //    `REF_PREFIX_TO_PROVIDER` 判成国内账号。
+          const refName = `${autoclawProduct.defaultCredentialRef.replace(/_DEFAULT$/, '_')}${shortId().toUpperCase()}`
           const autoclawMode = (payload as { autoclawMode?: string })?.autoclawMode
 
           // 1. 如果用户显式选择“一键导入本机桌面端凭据”（autoclawMode === 'local'）：
           if (autoclawMode === 'local') {
-            const localCred = await autoclaw.probeLocal()
+            const localCred = await autoclawAuthForProvider.probeLocal()
             if (!localCred) {
               return { ok: false, error: '未检测到本地 AutoClaw 桌面端有效登录凭据，请先在 AutoClaw 中登录' }
             }
             try {
-              await autoclaw.importLocalAccount(pool, { accountId: id, refName })
+              await autoclawAuthForProvider.importLocalAccount(pool, { accountId: id, refName })
               return { ok: true, value: { accountId: id } }
             } catch (err) {
               const reason = err instanceof Error ? err.message : String(err)
@@ -4541,7 +4573,7 @@ trae, cline, loomy, raccoon, minimax,
           // 登记占位条目
           await pool.addAccount({
             id,
-            provider: AUTOCLAW.id,
+            provider: autoclawProduct.id,
             nickname: 'AutoClaw (登录中...)',
             enabled: true,
             credentialRef: refName,
@@ -4551,7 +4583,7 @@ trae, cline, loomy, raccoon, minimax,
 
           let started
           try {
-            started = await autoclaw.startLogin({ refName })
+            started = await autoclawAuthForProvider.startLogin({ refName })
           } catch (error) {
             void pool.removeAccount(id).catch(() => {})
             const reason = error instanceof Error ? error.message : String(error)
@@ -4559,6 +4591,25 @@ trae, cline, loomy, raccoon, minimax,
           }
 
           started.result.then(async ({ credential }) => {
+            /**
+             * ⚠️⚠️ **落盘前必须做归属校验**（2026-10-20 审计 P0 实测复现）。
+             *
+             * 本回调是凭据落盘的**第二条腿**：登录页上的「⚡ 一键读取本机凭据」
+             * 走 `/autoclaw/import-local`，结果经 `started.result` 到这里。
+             * 原先这里**直接 `credentials.set`**，而归属校验只写在
+             * `importLocalAccount()` 里 ⇒ 这条腿完全绕过它。
+             *
+             * 审计实测：以 `AUTOCLAW_INTL` 起 flow 后请求该端点，读到的是
+             * **国内** `AutoClaw-official` 目录里的凭据 ⇒ 国内凭据被写进
+             * `AUTOCLAWINTL_ACCOUNT_*`，界面显示「国际版卡片里是国内手机号」，
+             * 全程零报错（PR 声称已修的那次事故原样复发）。
+             *
+             * ⇒ 判据与文案复用 `AutoclawAuth.verifyCredentialSite()`（与
+             *   `importLocalAccount` **同一份实现**，不写第二份）。
+             *   失败则抛错 → 落到下面的 `.catch` → `failLogin()` 记终态，
+             *   占位条目被清理，用户看到指向性错误而不是一条死凭据。
+             */
+            await autoclawAuthForProvider.verifyCredentialSite(credential)
             const ref = credentialRef(refName)
             await ctx.credentials.set(ref, JSON.stringify(credential))
             const nickname = autoclawDisplayNickname(credential, id)
@@ -4568,7 +4619,7 @@ trae, cline, loomy, raccoon, minimax,
               refreshable: isAutoclawRefreshable(credential),
             })
           }).catch((error: unknown) => {
-            ctx.logger.warn(`[jet-hub] background ${AUTOCLAW.id} login failed for ${id}: ${String(error)}`)
+            ctx.logger.warn(`[jet-hub] background ${autoclawProduct.id} login failed for ${id}: ${String(error)}`)
             void failLogin(id, error)
           })
 
@@ -5069,6 +5120,90 @@ trae, cline, loomy, raccoon, minimax,
             }
             const cred = loginRes.credential
             const nickname = autoclawDisplayNickname(cred, req.accountId)
+
+            // ⚠️⚠️ **同账号去重**（2026-10-19 真机报障：同一手机号出现 3 次、
+            //    积分被重复累加 62416）。
+            //
+            //    根因：AutoClaw 的 `access_token` 是 JWT，**每次登录/续期都轮换**
+            //    ⇒ 拿它当身份判据时，同一账号每续一次就被当成新账号。
+            //    而 `user_id` 是稳定值（JWT payload 里，与 `/userapi/v1/user-profile`
+            //    同源），故以它为判据。
+            //
+            //    ⚠️ 用 `findAccountIdByIdentityField` 而不是 `findAccountIdByCredential`：
+            //    后者写死「codearts 用 access_key_id、其余用 access_token」
+            //    （见 account-pool 的方法注释），对 autoclaw 恒回空串。
+            //    ⚠️ 它**刻意不看 `enabled`**：停用的同账号条目同样占位置，
+            //    重复添加它仍是重复。
+            //    ⚠️ 判据缺失（老凭据没 `user_id`）时 `identity` 为空 ⇒ 该方法直接
+            //    返回 `''`，**不猜**，退化成「不去重」而不是误删。
+            const identity = cred.user_id === undefined ? '' : String(cred.user_id).trim()
+            const duplicateId = identity === ''
+              ? ''
+              : await pool.findAccountIdByIdentityField(AUTOCLAW.id, 'user_id', identity)
+            if (duplicateId !== '' && duplicateId !== req.accountId) {
+              /**
+               * ⚠️⚠️ **必须真删占位条目，并把新凭据交给已存在的那条**
+               * （2026-10-20 审计 P1，实测真缺陷）。
+               *
+               * 原实现只 `return` 一句错误文案，**什么都没改**，而
+               * `loginWithCode` 早已把这次的新凭据写进 `req.accountId` 的 ref
+               *（`autoclaw-auth.ts` 的 `credentials.set`）。实测后果：
+               *
+               * ```
+               * 条目数 = 2
+               *   autoclaw-old  187****9406            ref = AUTOCLAW_ACCOUNT_OLD  ← 旧凭据（可能已轮换）
+               *   autoclaw-new  AutoClaw (登录中...)    ref = AUTOCLAW_ACCOUNT_NEW  ← 有效凭据
+               * ```
+               *
+               * ⇒ 面板上留一条**「AutoClaw (登录中...)」幽灵条目**，而它持有着
+               *   唯一有效的凭据；老条目反而拿着可能已失效的 token。用户看到
+               *   「登录失败」+ 一个永远转圈的卡片，且**再登一次又是同样结果**
+               *   （占位条目越堆越多）。
+               *
+               * 定稿做法（与注释原本声称的语义一致）：
+               * 1. 把本次的新凭据写到**已存在那条**的 ref 上（它的 token 才是最新的）；
+               * 2. 删掉本次新建的占位条目（`removeAccount` 会一并清掉它那份凭据）；
+               * 3. 返回可读错误，让用户知道「已经加过了，不用重复添加」。
+               */
+              try {
+                const existing = pool.listAccountsByProvider(AUTOCLAW.id)
+                  .find((entry) => entry.id === duplicateId)
+                if (existing !== undefined) {
+                  await ctx.credentials.set(
+                    credentialRef(existing.credentialRef),
+                    JSON.stringify(cred),
+                  )
+                  await pool.updateAccount(existing.id, {
+                    nickname: autoclawDisplayNickname(cred, existing.id),
+                    expiresAt: cred.expires_at,
+                    refreshable: isAutoclawRefreshable(cred),
+                  })
+                }
+              } catch (error) {
+                ctx.logger?.warn?.(
+                  `[autoclaw] 并入已存在条目 ${duplicateId} 失败（不影响本次提示）：`
+                  + (error instanceof Error ? error.message : String(error)),
+                )
+              }
+              // 删占位条目（连带清掉它那份重复凭据）；失败只记 warn。
+              await pool.removeAccount(req.accountId).catch((error: unknown) => {
+                ctx.logger?.warn?.(
+                  `[autoclaw] 清理重复占位条目 ${req.accountId} 失败：${String(error)}`,
+                )
+              })
+              pendingSmsMsgid.delete(req.accountId)
+              ctx.logger?.warn?.(
+                `[autoclaw] 该账号已存在（user_id=${identity}，条目 ${duplicateId}）`
+                + `—— 本次登录已并入原条目并清理占位条目 ${req.accountId}`,
+              )
+              return {
+                ok: true,
+                value: {
+                  done: false,
+                  error: `该 AutoClaw 账号（user_id=${identity}）已在账号列表中，无需重复添加`,
+                } satisfies RpcSubmitSmsResponse,
+              }
+            }
 
             await pool.updateAccount(req.accountId, {
               nickname,
@@ -7810,3 +7945,5 @@ function reply(rpcId: string, result: unknown): Response {
     : result
   return Response.json({ type: 'server-response', rpcId, result: value })
 }
+
+

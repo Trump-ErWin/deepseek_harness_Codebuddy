@@ -6,7 +6,7 @@
 
 import crypto from 'node:crypto'
 import type { AutoclawProduct } from './autoclaw-product.js'
-import { AUTOCLAW_THINKING_LEVELS } from './autoclaw-product.js'
+import { AUTOCLAW_THINKING_LEVELS, AUTOCLAW_CLIENT_VERSION } from './autoclaw-product.js'
 
 // ── 端点路径 ──
 export const AUTOCLAW_CHAT_PATH = '/autoclaw-proxy/proxy/autoclaw/chat/completions'
@@ -88,6 +88,110 @@ export function calculateAutoclawSign(
 export function cleanBearerToken(rawToken: string): string {
   if (!rawToken || typeof rawToken !== 'string') return ''
   return rawToken.trim().replace(/^Bearer\s+/i, '').trim()
+}
+
+/**
+ * 从 AutoClaw 的 `access_token`（JWT）里读**稳定身份字段**。
+ *
+ * ## 字段实况（2026-10-19 逐字节取证）
+ *
+ * 三条同一手机号（尾号 9406，已脱敏）凭据的 JWT payload 实测：
+ *
+ * ```json
+ * {
+ *   "user_id":   839684,                       // ← 非空、三条一致（= numericUserId）
+ *   "guid":      "",                            // ← 空串！不能作判据
+ *   "jti":       "1878……3406",                 // 三条一致（= 手机号，脱敏）
+ *   "device_id": "278d7ca6-2978-44d6-9b68-95c428ddc4ae",
+ *   "exp":       1792509875,                    // 会变
+ *   "iat":       1792423475                     // 会变
+ * }
+ * ```
+ *
+ * ⇒ JWT 里**唯一可用**的稳定身份是 `user_id`（数字形态的 `numericUserId`）。
+ *
+ * ## ⚠️ 它为什么能与「凭据字段 user_id」对上
+ *
+ * 那是**两个不同的 id 空间**：
+ *
+ * | 来源 | 值 | 形态 |
+ * |---|---|---|
+ * | JWT `user_id` | `839684` | 数字 = `numericUserId` |
+ * | 凭据字段 `user_id` / 服务端 `user-profile.user_id` | `7c54a9acc64092b06aa32cc8b1a48fef` | UUID = 主键 |
+ *
+ * ⚠️ **两者不能混用**：老凭据只落 UUID（第三条），新凭据两个都没有（前两条）。
+ *    所以判据必须**按 ref 固定取一种**，不能「字段优先、JWT 兜底」——
+ *    那会让前两条落到 `839684`、第三条落到 UUID，**分裂成两组、去重白做**
+ *    （用户二次报障「怎么还是在啊」的直接原因）。
+ *
+ * ## 结论：本函数给「两条都没有 UUID」的场景兜底
+ *
+ * - 有 `user_id` 字段（UUID）⇒ 用 UUID；
+ * - 没有（前两条那种）⇒ 用 JWT 的 `numericUserId`。
+ *
+ * 但**同一个池里不能同时存在两种**。彻底的做法是启动时把所有 ref 的
+ * UUID 补齐（见 `dedupe` 的调用方注释）；本函数只保证「不会没有身份」。
+ *
+ * ⚠️ 解析失败一律返回 `undefined`（调用方退化），**绝不抛**。
+ *
+ * @param accessToken - 已剥 Bearer 前缀的 access_token（裸 JWT）。
+ * @returns `user_id`（= numericUserId）字符串；取不到返回 `undefined`。
+ */
+export function readUserIdFromJwt(accessToken: string): string | undefined {
+  const token = cleanBearerToken(accessToken)
+  if (token === '') return undefined
+  try {
+    const parts = token.split('.')
+    if (parts.length < 2) return undefined
+    const payload = parts[1]!.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = payload + '='.repeat((4 - (payload.length % 4)) % 4)
+    const parsed = JSON.parse(Buffer.from(padded, 'base64').toString('utf8')) as {
+      user_id?: unknown
+      // ⚠️ `guid` 实测是空串（见上方注释），**不采用**。
+      // guid?: unknown
+    }
+    const raw = parsed?.user_id
+    if (typeof raw === 'string' && raw.trim() !== '') return raw.trim()
+    if (typeof raw === 'number' && Number.isFinite(raw)) return String(raw)
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 判断一个 `user_id` 值是不是**服务端 UUID 主键**（而不是 JWT 的 `numericUserId`）。
+ *
+ * ## 为什么必须区分（2026-10-20 审计 P1，真缺陷）
+ *
+ * AutoClaw 有**两个互不相通**的 id 空间：
+ *
+ * | 来源 | 形态 | 例 |
+ * |---|---|---|
+ * | 服务端 `user-profile.user_id` / 凭据字段 | **UUID**（32 位 hex，或带连字符） | `7c54a9acc64092b06aa32cc8b1a48fef` |
+ * | JWT payload 的 `user_id` | **纯数字** | `839684` |
+ *
+ * 启动自愈的跳过判据原先写成「`user_id` 是非空字符串就跳过」—— 而登录路径
+ * 用 `readUserIdFromJwt()` 写回的正是**字符串形态的数字 id**（`String(raw)`）
+ * ⇒ 判据命中 ⇒ **UUID 补齐永不发生** ⇒ 池里永久并存 `autoclaw:839684` 与
+ * `autoclaw:7c54a9a…` 两组 ⇒ 去重对混合池完全无效（PR 要修的症状原样存在）。
+ *
+ * ⇒ 跳过条件必须收窄成「**已经是 UUID**」，而不是「有值」。
+ *
+ * ⚠️ 判据按**形态**而不是按「长度恰好 32」：上游两种写法都可能出现
+ *    （带连字符的规范 UUID / 不带连字符的 32 位 hex），且实测凭据里是后者。
+ *    数字 id（`839684`）与任何 UUID 形态都不相交，故不会误判。
+ *
+ * @param value - 待判定的 `user_id`（可能来自凭据字段或 JWT）。
+ * @returns 是 UUID 形态返回 `true`。
+ */
+export function isAutoclawUuidUserId(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const trimmed = value.trim()
+  if (trimmed === '') return false
+  // 规范 8-4-4-4-12，或 32 位无连字符 hex（实测凭据里是后者）。
+  return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(trimmed)
+    || /^[0-9a-fA-F]{32}$/.test(trimmed)
 }
 
 /**
@@ -734,6 +838,13 @@ export function buildAutoclawHeaders(options: {
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    // ⚠️⚠️ **`X-Version` 是国际站推理的硬校验头**（2026-10-20 真机二分实测）：
+    //    缺它 → `HTTP 500` 且**响应体为空**（不像 401/400/406 那样给原因），
+    //    症状极具误导性。加上即 `HTTP 200`。其余客户端头（X-Tm / X-Lang /
+    //    X-Channel / User-Agent / X-Trace-Id 等 9 个）单独加都不改变 500，
+    //    唯 `X-Version` 是关键项 ⇒ 只补这一个，不堆冗余头。
+    //    详见 `AUTOCLAW_CLIENT_VERSION` 的注释。
+    'X-Version': AUTOCLAW_CLIENT_VERSION,
     'X-Auth-Appid': options.product.appId,
     'X-Auth-TimeStamp': ts,
     'X-Auth-Sign': sign,
@@ -748,3 +859,4 @@ export function buildAutoclawHeaders(options: {
 
   return headers
 }
+

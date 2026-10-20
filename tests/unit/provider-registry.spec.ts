@@ -27,7 +27,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-  it('共 21 条（20 个真渠道 + aggregate）', () => {
+  it('共 22 条（21 个真渠道 + aggregate）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
@@ -35,10 +35,13 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     // ⚠️ 2026-10-16 并入 astudio（第 18 个真渠道）。
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱，第 19 个真渠道）。
     // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（魔搭，第 20 个真渠道）：上游没有它。
+    // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版，第 21 个真渠道）：
+    //    与 autoclaw 账号不互通（手机号 / 邮箱）、API 主机不同、**登录方式也不同**
+    //    ⇒ 与 minimaxintl 同款判据（实测国内 token 打国际基址 → `401 Invalid token`）。
     //    ⚠️ 合并上游时**不要**把这里改回上游数字 —— 那会让两个声明都失去守卫
     //    （条数断言是「注册表没被误删」的唯一防线）。
-    expect(PROVIDER_REGISTRY).toHaveLength(21)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(20)
+    expect(PROVIDER_REGISTRY).toHaveLength(22)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(21)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
   })
 
@@ -148,15 +151,17 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(locked).toEqual(['buddy', 'lobsterai', 'loomy', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('usesExpiryWindow 恰好是既有的 6 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17 加入）', () => {
+  it('usesExpiryWindow 恰好是 7 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17 加入）', () => {
     const win = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
     // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`，未过期批次
     //    之和 == total_balance（守恒实测）⇒ 批次包带 `deductionEndTime` 可分三档。
-    expect(win).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ 2026-10-20 加 autoclawintl：与 autoclaw **同源**（同一份 credits 实现），
+    //    实测国际站批次同样带 `deductionEndTime`（3000→10/21、10000→10/27）。
+    expect(win).toEqual(['autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('rateLimit === false 恰好是 6 家（astudio 2026-10-18 加入；accio 2026-10-18 退出）', () => {
+  it('rateLimit === false 恰好是 7 家（astudio 2026-10-18 加入；accio 2026-10-18 退出）', () => {
     const off = PROVIDER_REGISTRY.filter((d) => d.rateLimit === false)
       .map((d) => d.id).sort()
     // ⚠️ **六家理由分两类**（见 registry 里各自的字段注释）：
@@ -165,6 +170,8 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     // - astudio（**本 fork**）：**不写 `modelRateLimits` 且不在 `probeById` 里**
     //   （`astudio-adapter.ts` 同款）⇒ 两个按钮恒为惰性（零请求、零清除）。
     // - autoclaw：**与 astudio 同族**（刻意不做请求级换号 + 冷却，不进 `probeById`）。
+    // - autoclawintl（2026-10-20）：与 autoclaw **同一个适配器类、同一份 registry
+    //   字段语义** ⇒ 必然一起为 false。
     // - modelscope（**本 fork**，2026-10-17 用户要求）：**能力齐全但刻意关入口** ——
     //   它确实会写 `modelRateLimits`、也确实注入了 `markLimited`。
     //   ⚠️ 与前几家**不同源**：代价是「冷却标记仍写进池，但用户没法用按钮清除」
@@ -186,7 +193,7 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     //「这个按钮点下去，能不能让用户少受限一次？」——
     // ⚠️ 而 modelscope 打破的正是这条问法的前提（它**能**，只是不要）。
     //    ⇒ 所以「能」不再是必要条件，「用户是否要这个按钮」才是。
-    expect(off).toEqual(['astudio', 'autoclaw', 'gemini', 'loomy', 'modelscope', 'officeace'])
+    expect(off).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'gemini', 'loomy', 'modelscope', 'officeace'])
   })
 
   it('accountTest === true 恰好是 gemini', () => {
@@ -194,16 +201,34 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(t).toEqual(['gemini'])
   })
 
-  it('creditPackages 恰好是既有的 9 家（officeace 2026-10-12、autoclaw 2026-10-17、astudio 2026-10-20 加入）', () => {
-    // ⚠️ `creditPackages` 决定**账号名 hover 是否列资源包**。astudio 是 2026-10-20
-    //    用户报障补上的：它的 `buildAstudioBalance` **本来就**把四个池逐包解析出了
-    //    到期时间（`member`/`buy`/`activity`/`spark` 的 `*NextExpireTime`），
-    //    缺的只是这条声明 ⇒ hover 看不到「没过期的资源包」。
-    const p = PROVIDER_REGISTRY.filter((d) => d.creditPackages === true)
-      .map((d) => d.id).sort()
-    expect(p).toEqual([
-      'astudio', 'autoclaw', 'buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
-    ])
+  it('creditPackages 必须覆盖所有 usesExpiryWindow 的家（判据从能力事实派生，不是手写名单）', () => {
+    // ⚠️⚠️ **本用例原先是一份手写 9 家名单，把「漏项」固化成了期望值**
+    //    （2026-10-20 审计实测）：`autoclawintl` 漏了 `creditPackages`，
+    //    补上它反而**变红**（`expected [...(10)] to deeply equal [ Array(9) ]`）。
+    //    那正是本仓库反复记载的「守卫把 bug 写成期望值」形态 —— 它保护的是
+    //    当时的快照，不是正确性。
+    //
+    // ⇒ 判据改为两条**从能力事实派生**的不变式：
+    //   ① `usesExpiryWindow: true` 的家必须**也有** `creditPackages`
+    //      —— 「按到期分档」与「逐包列明细」消费的是同一份数据
+    //      （`packages[].deductionEndTime`）；声明了前者却不声明后者，
+    //      用户就只看得到分档、看不到是哪几包。
+    //   ② `creditPackages` 的家必须真的能读余额（否则无包可列）。
+    //
+    // ⚠️ 反向不成立（有 `creditPackages` 但无 `usesExpiryWindow`）：astudio /
+    //    qoder / qodercn 三家**有逐包到期时间**但未接入「按到期分档」的窗口
+    //    回传 ⇒ 只列明细、不分档，是合法组合，**不得**被这条判据误伤。
+    const usesExpiryWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
+    const missing = usesExpiryWindow.filter((d) => d.creditPackages !== true).map((d) => d.id)
+    expect(missing, 'usesExpiryWindow 的家必须有 creditPackages（同一份数据）').toEqual([])
+
+    const noBalance = PROVIDER_REGISTRY
+      .filter((d) => d.creditPackages === true && d.credits?.balance !== true)
+      .map((d) => d.id)
+    expect(noBalance, 'creditPackages 的家必须真的能读余额').toEqual([])
+
+    // 至少要有若干家，防止「全表被清空」这种退化仍绿（同义反复的反面）。
+    expect(PROVIDER_REGISTRY.filter((d) => d.creditPackages === true).length).toBeGreaterThan(5)
   })
 
   it('autoCheckinExcluded 恰好是 zcode', () => {
@@ -211,11 +236,11 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(x).toEqual(['zcode'])
   })
 
-  it('channel === true 的 16 家都有 settingsNamespace 除了 opencode', () => {
+  it('channel === true 的 19 家都有 settingsNamespace 除了 opencode', () => {
     const withNs = PROVIDER_REGISTRY.filter((d) => d.settingsNamespace !== undefined)
       .map((d) => d.id).sort()
     expect(withNs).toEqual([
-      'accio', 'astudio', 'autoclaw', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy',
+      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy',
       'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
   })
