@@ -246,6 +246,42 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
       + 'system（含非首位）与 assistant 正文均 400/11128，user / reasoning_content / '
       + 'tool 结果放行，改写后两端点均 200',
   },
+  {
+    // **DSH 自己的 system prompt 身份首句**（`base` 段的 `You are an AI agent
+    // powered by DeepSeek Harness.`，app.asar 内 7 处提及，SDK profile 文档原话
+    // "inherits the base system prompt, including the ... identity"）。
+    //
+    // ⚠️⚠️ 本条的匹配语义是**行首锚定**（与 Claude Code 身份句同族，与另两条相反）：
+    // 本机 2026-10-20 对 `copilot.tencent.com` + 账号 15338123620 逐格实测——
+    //
+    //   | 形态 | 结果 |
+    //   |---|---|
+    //   | 裸串作整个 system（绝对行首） | ❌ 400/11128 |
+    //   | 前接任意前缀（`You are a helpful assistant.\n\n` + 裸串） | ✅ 200 |
+    //   | 改写后裸串（无句点 / 带句点 / 后接正文） | ✅ 200 |
+    //   | 整段真实 system（首句改写，8683 字符） | ✅ 200 |
+    //   | 整段真实 system（首句删除，8624 字符） | ✅ 200 |
+    //
+    // ⇒ 与身份句同理**不做行首锚定正则**：改写范围宁可略宽。漏改 = 整轮 400，
+    //    多改 = 语义等价的措辞变化。
+    //
+    // ⚠️ **这不是外部客户端泄漏，而是 DSH 每轮必带的首句** ⇒ 与另三条的本质差别：
+    //    它无法靠「换会话 / 清历史」规避，只能靠本表。上游 2026-10 连续登记
+    //    ZCode(10-05)/Claude 身份句(10-14)/反馈句(10-18) 后，本条是最新一条，
+    //    上游尚未登记（提 Gitee issue 时可引本段作实测凭据）。
+    //
+    // ⚠️ 时序证据（排除「位置被挪到行首」这个竞争假设）：解压同一工作区
+    //    2026-09-28 的会话，其 system 首行即本句且当时可正常使用 ⇒ 该句**一直**
+    //    在行首，是腾讯网关后续才把它纳入拦截名单，不是本机配置变更所致。
+    //
+    // `find` 刻意不带尾句点：一条同时覆盖带句点与不带句点两种形态。
+    find: 'You are an AI agent powered by DeepSeek Harness',
+    // 语义等价：仍是「构建在 DeepSeek Harness 运行时之上的 AI 智能体」，
+    // 只是不再使用被风控逐字符匹配的那个措辞。
+    replace: 'You are an AI agent built on the DeepSeek Harness runtime',
+    note: '本机 2026-10-20 对 copilot.tencent.com 实测：system 绝对行首 400/11128，'
+      + '前接任意字符放行，改写后放行（含整段真实 system 8683 字符）',
+  },
 ]
 
 /** 正则元字符转义：把字面量安全地变成**精确**匹配，而不是模式。 */
