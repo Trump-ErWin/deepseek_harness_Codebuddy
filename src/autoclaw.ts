@@ -1,4 +1,4 @@
-/**
+﻿/**
  * AutoClaw 协议常量、凭据结构与纯函数。
  *
  * 本模块只放常量与无副作用的纯函数（签名计算、System Prompt 前缀拼接、凭据解析等）。
@@ -824,3 +824,4 @@ export function buildAutoclawHeaders(options: {
 
   return headers
 }
+

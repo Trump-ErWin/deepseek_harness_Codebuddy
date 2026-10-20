@@ -725,13 +725,33 @@ export async function loginAutoclawWithCode(
         : undefined
     const expiresAt = autoclawAccessTokenExpiresAtMs(cleanAccess, declaredExpiresAt)
 
+    // ⚠️⚠️ **`user_id` 必须兜底从 JWT 里取**（2026-10-19 真机取证）：
+    //    实测 `/userapi/v1/agent-login` 的 `data` 里**没有** `user_id`
+    //    （只有 access_token / refresh_token / expires_*），于是这里原先是
+    //    `undefined` ⇒ `JSON.stringify` 时被整键丢弃 ⇒ 凭据里没有 `user_id`。
+    //
+    //    后果（用户报障「同一账号被加了 3 次」）：`identityOf` 只能退化成
+    //    `access_token`，而 access_token **每次登录/续期都轮换**
+    //    ⇒ 同一账号每续期一次就被当成一个新账号，池里堆出多条同 `user_id` 的条目，
+    //    面板把同一份积分**重复累加**（实测 20838×1 + 20789×2 = 62416）。
+    //
+    //    JWT payload 的 `user_id` 是稳定的数字 id（`numericUserId`）。
+    //
+    //    ⚠️ 它与「服务端 `user-profile.user_id`」（UUID）是**两个 id 空间**，
+    //       不能混用：老凭据落 UUID、新凭据两个都没有，「字段优先、JWT 兜底」
+    //       会让同一账号分裂成两组、去重白做（用户三次报障的教训）。
+    //       ⇒ 登录时尽量写这个 JWT 值保底；**真正的统一由
+    //         `autoclawSelfHeal` 启动时调 `user-profile` 补 UUID 完成**。
+    const jwtUserId = readUserIdFromJwt(cleanAccess)
+    const resolvedUserId = data.user_id ?? jwtUserId
+
     const credential: AutoclawCredential = {
       access_token: cleanAccess,
       refresh_token: cleanRefresh ?? '',
       expires_at: expiresAt,
       device_id: deviceId,
-      account_id: data.user_id !== undefined ? String(data.user_id) : undefined,
-      user_id: data.user_id,
+      account_id: resolvedUserId !== undefined ? String(resolvedUserId) : undefined,
+      user_id: resolvedUserId,
       user_name: data.user_name,
       user_phone: data.user_phone ?? trimmedPhone,
     }
@@ -1003,3 +1023,5 @@ export async function startAutoclawSmsLoginFlow(
 
   return { loginUrl, result, close }
 }
+
+
