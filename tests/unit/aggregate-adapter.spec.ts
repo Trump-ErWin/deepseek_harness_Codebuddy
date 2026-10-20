@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
   AggregateAdapter,
+  AGGREGATE_CAPABILITY_FAILURE_TTL_MS,
+  AGGREGATE_CAPABILITY_TIMEOUT_MS,
+  AGGREGATE_CATALOG_TTL_MS,
   AGGREGATE_COLD_CONTEXT_WINDOW,
+  AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS,
   AGGREGATE_FALLBACK_CONTEXT_WINDOW,
   AGGREGATE_PROVIDER,
   maxAttemptsFor,
@@ -3067,6 +3071,64 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
     expect(elapsed, '并发时总耗时约等于单个候选的耗时，而不是它们的和').toBeLessThan(DELAY * 4)
   })
 
+  it('★★ `candidatesFor`（发消息那条路径）也必须并发解析候选能力', async () => {
+    // ⚠️⚠️ 上一條只守 `resolveModel → contextWindowFor`。PR 的**根因分析点名了
+    //    `candidatesFor` 也在串行**，但首版只改了 `contextWindowFor` ⇒
+    //    **修了一半**：`prepareCall`（真实发消息路径）仍按「候选数 × 预算」累加。
+    //
+    // 实测（`capabilityTimeoutMs: 100`、13 个候选全挂）：
+    //   串行 `prepareCall` = **761 ms** / 并发 = **101 ms**（7.5 倍差）。
+    //
+    // 本用例用「8 家各 60ms」把两者分开，判据用**峰值在飞数**（不受机器快慢影响）
+    // 而不是耗时 —— 耗时断言在 CI 上会 flaky。
+    const PROVIDERS = ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline']
+    const DELAY = 60
+    let inFlight = 0
+    let peak = 0
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => PROVIDERS.map((id) => ({ id, name: id })),
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async (provider: string, id: string) => {
+          inFlight += 1
+          peak = Math.max(peak, inFlight)
+          await new Promise((resolve) => setTimeout(resolve, DELAY))
+          inFlight -= 1
+          return { provider, id, context: { contextWindow: 1_000_000 } }
+        },
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: makePool(),
+      // ⚠️ 不注入 `expiryProbe` 时全部候选折算成 `UNUSABLE` ⇒ `candidatesFor`
+      //    返回空表、循环一次都不跑 ⇒ 本用例会**恒真**。必须给 `NEVER`（可用）。
+      expiryProbe: async () => Number.POSITIVE_INFINITY,
+    })
+
+    await adapter.refreshCatalog()
+    // ⚠️ 直接测 `candidatesFor`（绕开 `contextWindowFor` 先把 `capabilityCache`
+    //    填满的遮蔽 —— 那会让本用例的峰值恒为 1、无论 `candidatesFor` 是否并发）。
+    const internal = adapter as unknown as {
+      capabilityCache: Map<string, unknown>
+      candidatesFor: (model: string) => Promise<unknown[]>
+    }
+    internal.capabilityCache.clear()
+    peak = 0
+    const startedAt = Date.now()
+    const targets = await internal.candidatesFor('deepseek-v4-1-flash')
+    const elapsed = Date.now() - startedAt
+
+    expect(targets.length, '必须有候选，否则本用例是同义反复').toBeGreaterThan(1)
+    // ⚠️ 判据写成「峰值 == 候选数」而不是「峰值 == PROVIDERS.length」：
+    //    实际候选数受 `gateOf`（未接入临期折算的渠道默认不参与）+ `maxAttemptsFor`
+    //    封顶影响，实测这里是 5 而不是 8。写死 8 会变成一条**与并发无关**的红。
+    //    而「峰值 == 候选数」正好把串行/并发分开：串行时峰值**恒为 1**。
+    expect(peak, '`candidatesFor` 的候选解析必须并发（串行时峰值恒为 1）').toBe(targets.length)
+    expect(elapsed, '并发时总耗时约等于单个候选的耗时').toBeLessThan(DELAY * 4)
+  })
+
   it('★★ 单个候选的解析有独立预算：一家挂住不得拖满整轮', async () => {
     // ⚠️ 用户报障 2026-10-20：autoclaw 的目录端点 ETIMEDOUT 21.6 秒，而它自己的
     //    8 秒 `AbortController` 管不到 DNS/TCP 层 ⇒ 每轮请求都白等。
@@ -3085,9 +3147,10 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
         stream: () => { throw new Error('本用例不应调用 stream') },
       },
     } as never
+    const BUDGET = 40
     const adapter = new AggregateAdapter(ctx, {
       accountPool: makePool(),
-      capabilityTimeoutMs: 40,
+      capabilityTimeoutMs: BUDGET,
     })
 
     await warmCatalog(adapter)
@@ -3096,9 +3159,132 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
     const elapsed = Date.now() - startedAt
 
     // ① 预算内结束（不是无限等待）。
-    expect(elapsed, '挂住的候选必须在预算内被放弃').toBeLessThan(2_000)
+    //
+    // ⚠️⚠️ **阈值必须贴着注入的预算写，不能写成 `toBeLessThan(2_000)`**
+    //    （2026-10-20 变异实测：本用例第一版就是这么写的，把生产默认
+    //    `AGGREGATE_CAPABILITY_TIMEOUT_MS` 从 3_000 改成 **60_000** 之后
+    //    **全部 138 条用例仍绿** —— 因为 stub 的 `new Promise(() => {})` 在
+    //    `controller.abort()` 之后…… 其实**根本不响应 abort**，所以真正让它
+    //    在 2 秒内结束的是**注入的 40ms 预算**；那条断言只是「40ms < 2000ms」
+    //    的同义反复，对**生产默认值**零判别力）。
+    //    ⇒ 判据锚在注入值上（`BUDGET * 4`，留足调度抖动），这条用例才真的
+    //    在「预算被调大」时变红。
+    expect(elapsed, '挂住的候选必须在**注入的预算**量级内被放弃').toBeLessThan(BUDGET * 4)
     // ② 结论仍取**已解析成功**那部分的最大值，不退化成兜底值。
     expect(info.context?.contextWindow).toBe(1_000_000)
+  })
+
+  it('★★ 生产默认预算的值本身必须有守卫（3 秒量级，不是 60 秒）', async () => {
+    // ⚠️ 上一条注入 `capabilityTimeoutMs` ⇒ 它守的是**机制**，不是**取值**。
+    //    而 PR 的变异表写着「单候选预算改 60 秒 ⇒ 1 条红」，实测（138 条 + 142 条）
+    //    **全绿** —— 那句声明当时不成立（阈值是同义反复）。本用例补上**取值**守卫：
+    //    默认预算必须与「一次健康解析的量级」（100–800ms）同数量级，
+    //    且必须远小于目录 TTL（否则一个坏候选就能吃掉整轮）。
+    expect(AGGREGATE_CAPABILITY_TIMEOUT_MS,
+      '单个候选的解析预算必须是 3 秒量级；改成 60 秒会让一个坏候选吃掉整轮请求').toBe(3_000)
+    expect(AGGREGATE_CAPABILITY_TIMEOUT_MS,
+      '预算必须显著小于目录 TTL').toBeLessThan(AGGREGATE_CATALOG_TTL_MS)
+    expect(AGGREGATE_CAPABILITY_FAILURE_TTL_MS,
+      '失败短缓存必须短于目录 TTL（否则瞬时故障被固化成持续状态）')
+      .toBeLessThan(AGGREGATE_CATALOG_TTL_MS)
+    expect(AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS)
+      .toBeLessThan(AGGREGATE_CATALOG_TTL_MS)
+  })
+
+  it('★★ 窗口推导必须**去重 + 封顶**（否则 `auto` 全池扇出、同一候选被重复解析）', async () => {
+    // ⚠️⚠️ 两条独立的放大面（2026-10-20 独立审计实测）：
+    //
+    // ① **无封顶**：`autoCandidates()` 是全池（实测 1–2 百条），而 `candidatesFor`
+    //    有 `ranked.slice(0, limit)`（`maxAttemptsFor`）。窗口路径原先一条都没有
+    //    ⇒ 一次 `auto` 就把全池同时打给 `resolveModelInfo`；
+    // ② **无在飞合并**：`capabilityCache` 在 `await` **之后**才写 ⇒ 同一拍的重复询问
+    //    全部穿透。实测「41 个虚拟模型并行」时单候选被解析 **2** 次。
+    //
+    // 本用例同时钉住两条：
+    // - `peak <= maxAttemptsFor(catalog)`（封顶生效）
+    // - 每个 `provider\0realId` 只被调用一次（去重生效）
+    const PROVIDERS = ['codearts', 'buddy', 'workbuddy', 'qoder', 'trae']
+    const PER_PROVIDER = 30
+    let inFlight = 0
+    let peak = 0
+    const perKey = new Map<string, number>()
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => PROVIDERS.map((id) => ({ id, name: id })),
+        listModels: async () => Array.from({ length: PER_PROVIDER }, (_v, i) => ({ id: `m${i}`, name: `M${i}` })),
+        resolveModelInfo: async (provider: string, id: string) => {
+          const key = `${provider}\u0000${id}`
+          perKey.set(key, (perKey.get(key) ?? 0) + 1)
+          inFlight += 1
+          peak = Math.max(peak, inFlight)
+          await new Promise((resolve) => setTimeout(resolve, 2))
+          inFlight -= 1
+          return { provider, id, context: { contextWindow: 1_000_000 } }
+        },
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+    await adapter.refreshCatalog(true)
+    const catalog = await adapter.refreshCatalog()
+    const cap = maxAttemptsFor(catalog)
+    const poolSize = PROVIDERS.length * PER_PROVIDER
+
+    perKey.clear()
+    peak = 0
+    // ⚠️ 先清能力缓存，否则第一次 `listModels` 可能已把候选解析过（本用例就恒真了）。
+    ;(adapter as unknown as { capabilityCache: Map<string, unknown> }).capabilityCache.clear()
+    await adapter.resolveModel(AGGREGATE_PROVIDER, 'auto')
+
+    expect(poolSize, '前提：全池必须远大于封顶（否则本用例测不到截断）').toBeGreaterThan(cap * 2)
+    expect(peak, `窗口推导必须封顶到 maxAttemptsFor(${cap})，实测 ${peak}`).toBeLessThanOrEqual(cap)
+    const duplicates = [...perKey.values()].filter((count) => count > 1)
+    expect(duplicates, '同一候选在一次窗口推导里不得被重复解析').toHaveLength(0)
+  })
+
+  it('★★ **跨虚拟模型并行**时同一候选也不得被重复解析（在飞合并）', async () => {
+    // ⚠️⚠️ 上一条只能测到「单个虚拟模型内部」的去重（`Map` 已按 key 收敛）。
+    //    而真实放大面在**跨模型**：宿主 `buildModelCatalog` 对每个虚拟模型并行
+    //    `resolveModelInfo`，同一个 realId 常常同时挂在多个虚拟模型下
+    //    ⇒ `capabilityCache` 在 `await` 之后才写、挡不住同一拍。
+    //
+    // 实测：修前「4 个虚拟模型并行 ⇒ 4 个候选重复、最大重复 2」；修后在飞合并
+    //（`capabilityInFlight`）后 ⇒ 重复 0、最大重复 1。
+    // ⚠️ 变异：删掉 `capabilityInFlight` 的「查表复用」两行 ⇒ 本用例必红（上一条仍绿）。
+    const PROVIDERS = ['codearts', 'buddy', 'workbuddy', 'qoder', 'trae']
+    const perKey = new Map<string, number>()
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => PROVIDERS.map((id) => ({ id, name: id })),
+        listModels: async () => [
+          { id: 'shared-a', name: 'A' },
+          { id: 'shared-b', name: 'B' },
+          { id: 'shared-c', name: 'C' },
+        ],
+        resolveModelInfo: async (provider: string, id: string) => {
+          const key = `${provider}\u0000${id}`
+          perKey.set(key, (perKey.get(key) ?? 0) + 1)
+          await new Promise((resolve) => setTimeout(resolve, 20))
+          return { provider, id, context: { contextWindow: 1_000_000 } }
+        },
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+    await adapter.refreshCatalog(true)
+    const models = await adapter.listModels(AGGREGATE_PROVIDER)
+    expect(models.length, '必须有多个虚拟模型，否则测不到跨模型并行').toBeGreaterThan(2)
+
+    perKey.clear()
+    ;(adapter as unknown as { capabilityCache: Map<string, unknown> }).capabilityCache.clear()
+    // 宿主真实形态：并行
+    await Promise.all(models.map((model) =>
+      adapter.resolveModel(AGGREGATE_PROVIDER, model.id).catch(() => undefined)))
+
+    const duplicates = [...perKey.entries()].filter(([, count]) => count > 1)
+    expect(duplicates, `同一候选不得被并发重复解析：${JSON.stringify(duplicates)}`).toHaveLength(0)
   })
 
   it('★★ 坏候选进 30 秒失败短缓存：TTL 内不再重复等它超时', async () => {
@@ -3301,6 +3487,108 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
       fakeNow += 30_001
       expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
         .toBe(2_000_000)
+    })
+  })
+
+  /**
+   * ★★★ 「**预算到期**」不得被读成「**调用方取消**」（真实缺陷，两轮独立审计实测）。
+   *
+   * ## 缺陷本体
+   *
+   * `resolveWithBudget` 初版在预算到期时**先 `controller.abort()`、再 `reject(哨兵)`**。
+   * 而真实适配器（以及 `fetch` / `undici`）在 `signal` 的 `abort` 事件里会**同步**以
+   * `AbortError` 结算那次 `resolveModelInfo` ⇒ 该 Promise 的 race 反应**先于**哨兵入队
+   * ⇒ `Promise.race` 以 `AbortError` 结算 ⇒ `capabilityOf` 的
+   * `if (isAbortLike(error, signal)) throw error` 把它当成「用户取消」**原样抛出**
+   * ⇒ **整轮请求失败**。
+   *
+   * 症状极具误导性：用户没取消，但每轮都失败；而 PR 的注释还写着「超时不等于取消」。
+   *
+   * ## 为什么必须**两条**用例（时序各一半）
+   *
+   * 胜负取决于微任务入队次序，而各适配器结算形态不同：
+   * - `async` 包装（多一拍）⇒ 底下的 `catch { if (timedOut) }` 兜住就够；
+   * - **裸 `new Promise` 在 abort 里同步 reject**（少一拍）⇒ 只有「哨兵先入队」
+   *   或那条 catch 兜底才能救。
+   *
+   * ⚠️ **第一版审计用例用的是 `async` stub ⇒ 打不中**（同步性被 `async` 吞掉、
+   *    多了一拍微任务，哨兵侥幸赢）。必须有一条**不带 `async` 包装**的同步 stub。
+   */
+  describe('★★★ 预算到期 ≠ 调用方取消（哨兵不得被 AbortError 抢赢）', () => {
+    /** 造一个「buddy 正常 + autoclaw 在 abort 事件里按指定时序拒绝」的世界。 */
+    const makeRaceWorld = (style: 'sync' | 'microtask') => {
+      const state = { badAborted: false }
+      const ctx = {
+        logger: { warn: () => {}, info: () => {}, error: () => {} },
+        llm: {
+          listProviders: () => [{ id: 'buddy', name: 'b' }, { id: 'autoclaw', name: 'a' }],
+          listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+          // ⚠️ **刻意不是 `async` 函数**：`async` 会给拒绝多加一拍微任务，
+          //    正好把本缺陷掩盖掉（第一版审计用例就这么漏了）。
+          resolveModelInfo: (provider: string, id: string, signal?: AbortSignal) => {
+            if (provider !== 'autoclaw') {
+              return Promise.resolve({ provider, id, context: { contextWindow: 1_000_000 } })
+            }
+            return new Promise((_resolve, reject) => {
+              const fail = (): void => {
+                const error = new Error('The operation was aborted')
+                error.name = 'AbortError'
+                reject(error)
+              }
+              signal?.addEventListener('abort', () => {
+                state.badAborted = true
+                // `sync` = fetch/undici 的真实形态（在 abort 里同步结算）；
+                // `microtask` = 下一拍才结算。
+                if (style === 'sync') fail()
+                else setTimeout(fail, 0)
+              }, { once: true })
+            })
+          },
+          stream: () => { throw new Error('本用例不应调用 stream') },
+        },
+      } as never
+      return { state, ctx }
+    }
+
+    it('★★ 底层在 abort 里**同步**以 AbortError 拒绝 ⇒ 整轮仍须成功（不得抛 AbortError）', async () => {
+      const { state, ctx } = makeRaceWorld('sync')
+      const adapter = new AggregateAdapter(ctx, { accountPool: makePool(), capabilityTimeoutMs: 30 })
+      await adapter.refreshCatalog()
+      // ⚠️ 断言「整轮成功 + 窗口取健康候选的 1M」：若抛错，vitest 会把
+      //    `AbortError` 的原话打出来，红因一眼可辨。
+      const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      expect(info.context?.contextWindow, '坏候选必须被放弃等待，而不是把整轮带崩').toBe(1_000_000)
+      // ⚠️ 反证预算真的到期了（否则本用例可能只是「buddy 先返回」的巧合绿）。
+      expect(state.badAborted, '预算必须真的 abort 了那个坏候选').toBe(true)
+    })
+
+    it('★★ 底层在 abort 后**下一拍**拒绝 ⇒ 同样不得把整轮带崩（时序对照）', async () => {
+      const { state, ctx } = makeRaceWorld('microtask')
+      const adapter = new AggregateAdapter(ctx, { accountPool: makePool(), capabilityTimeoutMs: 30 })
+      await adapter.refreshCatalog()
+      const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      expect(info.context?.contextWindow).toBe(1_000_000)
+      expect(state.badAborted).toBe(true)
+    })
+
+    it('★★ 反向对照：**调用方**真取消时仍必须原样抛 AbortError（别把两条语义合并）', async () => {
+      // ⚠️ 没有这一条，把 `capabilityOf` 改成「凡错都回落」也能让上面两条绿 ——
+      //    那是把「用户取消」换算成「候选坏了」，会静默烧完整池。
+      const ctx = {
+        logger: { warn: () => {}, info: () => {}, error: () => {} },
+        llm: {
+          listProviders: () => [{ id: 'buddy', name: 'b' }],
+          listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+          resolveModelInfo: async () => { throw new Error('本用例不应走到这里') },
+          stream: () => { throw new Error('本用例不应调用 stream') },
+        },
+      } as never
+      const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+      await adapter.refreshCatalog()
+      const controller = new AbortController()
+      controller.abort()
+      await expect(adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash', controller.signal))
+        .rejects.toThrow(/abort/i)
     })
   })
 })
