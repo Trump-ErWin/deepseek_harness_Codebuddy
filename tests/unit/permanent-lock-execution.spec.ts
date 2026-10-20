@@ -112,6 +112,24 @@ const LOCK_EXECUTION_PATHS: Record<
     spec: 'tests/unit/officeace-lock.spec.ts',
     drives: 'createOfficeAceCredentialProvider',
   },
+  // ⚠️ qoder / qodercn（2026-10-20）：与 buddy 系四家**同一条**执行路径
+  //    （`createCredentialResolver` 的 `kind: 'buddy'` 分支 ⇒
+  //    `pool.permanentLocked(providerId)` ⇒ `pickBuddyAccount({ allowPermanent })`
+  //    ⇒ 落 `plan.lockedError(...)`）。判别符号取 `qoderLockedError` ——
+  //    它本家独有（共用 `buddyLockedError` 等于没点名）。
+  //    ⚠️ 两家**共用**这个构造器（只差 `displayName`），故两行写同一个符号是
+  //    正确的：本表只查「该渠道的接线在、且指向一个本家可点名的实现」，
+  //    两站的 `displayName` 差异由 `qoder-lock-wiring.spec.ts` 的源码级断言锁。
+  qoder: {
+    module: 'src/index.ts',
+    spec: 'tests/unit/qoder-lock-wiring.spec.ts',
+    drives: 'qoderLockedError',
+  },
+  qodercn: {
+    module: 'src/index.ts',
+    spec: 'tests/unit/qoder-lock-wiring.spec.ts',
+    drives: 'qoderLockedError',
+  },
 }
 
 describe('★ 普查：凡登记 permanentLock 的渠道，都必须有一条执行路径', () => {
