@@ -62,7 +62,18 @@ import { readFileSync } from 'node:fs'
 //    真正的防线是「`AGGREGATE_CHANNELS` 的 channel 成员必须在清单里」那条，
 //    见本文件末尾的 ★★ 显式豁免表守卫。
 const EXPECTED_WIRED = [
-  'accio', 'autoclaw', 'buddy', 'codearts', 'lobsterai', 'loomy', 'modelscope', 'officeace', 'trae', 'workbuddy', 'zcode',
+  // ⚠️ astudio 2026-10-20 加入：`/points/balance` 三池各带 `*NextExpireTime`，
+  //    由 `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到 `deductionEndTime`。
+  //    这是「只加 AGGREGATE_CHANNELS 而漏本清单」的第 5 次复发。
+  // ⚠️ minimax / minimaxintl 2026-10-20 加入（**第 6 次复发**，同上成因）：
+  //    `/minimax-cloud/api/v1/credit/details` 的每条 `details[]` 带
+  //    `expire_at_ms`（毫秒时间戳），由 `minimax-credits.ts` 直接写进
+  //    `deductionEndTime`。⚠️ 国际站另有**地理分流**（307 到中国站且不认
+  //    国际站 token）⇒ 折算原语必须透传 `xff`，否则「面板能刷新、聚合候选
+  //    却恒折算失败」。两家共用一个 `MinimaxAuth`，但**是两个渠道 id**，
+  //    故必须各占一项。
+  'accio', 'astudio', 'autoclaw', 'buddy', 'codearts', 'lobsterai', 'loomy',
+  'minimax', 'minimaxintl', 'modelscope', 'officeace', 'trae', 'workbuddy', 'zcode',
 ]
 
 class FakeCredentials {
@@ -148,8 +159,10 @@ describe('★ 不变式一：清单 == runtime 里挂了 expiry 域的渠道（�
 
   it('⚠️ 未接入的渠道（清单外）在 runtime 里也**没有** expiry 域', () => {
     applyOnce()
-    // raccoon / cline 是真实渠道但未接入折算；aggregate / auto 是虚拟 provider。
-    for (const id of ['raccoon', 'cline', 'minimax', 'qoder', 'gemini']) {
+    // raccoon / cline / qoder / gemini 是真实渠道但未接入折算；aggregate / auto 是虚拟 provider。
+    // ⚠️ minimax / minimaxintl **已于 2026-10-20 移出本名单**（它们接入后必须有
+    //    expiry 域）—— 留着会与不变式一互相矛盾。本名单只列**当前确实未接入**的。
+    for (const id of ['raccoon', 'cline', 'qoder', 'gemini']) {
       expect(runtimeOf(id)?.expiry, `${id} 不该有 expiry 域`).toBeUndefined()
     }
     // 清单本身不得含未接入渠道（否则 aggregate-adapter 会广告恒不可用的候选）。
@@ -217,8 +230,11 @@ const NOT_EXPIRY_WIRED = new Map<string, string>([
   ['qodercn', '同 qoder（两者复用同一个 QoderAuth，余额原语同形）'],
   ['cline', '余额报文无跨账号到期口径；aggregate-expiry.ts:82 登记为未接入'],
   ['raccoon', '同上（aggregate-expiry.ts:82）'],
-  ['minimax', '同上（aggregate-expiry.ts:82）'],
-  ['minimaxintl', '同 minimax（共用同一个 MinimaxAuth 类，余额原语同形）'],
+  // ⚠️ minimax / minimaxintl **已于 2026-10-20 从本表移除**（用户报障：「MiniMax
+  //    Code 积分也有到期时间，也应当有相同功能」）。它们已接上
+  //    `WIRED_EXPIRY_PROVIDERS` + `createProviderExpiry()` 的 `minimaxExpiry`
+  //    原语 ⇒ 留在本表会与「豁免表不得与清单重叠」那条用例直接冲突（重叠 =
+  //    豁免是假的）。移除本表才是这条红线的正确走法 —— 不许用「改断言」绕过。
   ['gemini', '同上（aggregate-expiry.ts:82）'],
   ['opencode', '「余额」是本地派生的通道可用性、零网络，套折算骨架会发不存在的请求'],
 ])

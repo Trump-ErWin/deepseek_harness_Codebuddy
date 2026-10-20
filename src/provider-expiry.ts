@@ -68,6 +68,10 @@ import {
   modelscopeExpiry,
   // ⚠️ AutoClaw（智谱，2026-10-17 审计 P0 修复新增）
   autoclawExpiry,
+  // ⚠️ AStudio（讯飞 AstronStudio，2026-10-20 新增）
+  astudioExpiry,
+  // ⚠️ MiniMax Code（中国版 / 国际版共用，2026-10-20 新增）
+  minimaxExpiry,
   zcodeExpiry,
 } from './aggregate-expiry.js'
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17）
@@ -76,6 +80,12 @@ import type { ModelscopeCredential } from './modelscope.js'
 // ⚠️ AutoClaw（智谱，2026-10-17 审计 P0 修复新增）
 import { AUTOCLAW } from './autoclaw-product.js'
 import type { AutoclawCredential } from './autoclaw.js'
+// ⚠️ AStudio（讯飞 AstronStudio，2026-10-20 新增）
+import { ASTUDIO } from './astudio-product.js'
+import type { AstudioCredential } from './astudio.js'
+// ⚠️ MiniMax Code（中国版 / 国际版，2026-10-20 新增）
+import { MINIMAX, MINIMAX_INTL, type MinimaxProduct } from './minimax-product.js'
+import type { MinimaxCredential } from './minimax.js'
 import type { AccioCredential } from './accio.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
@@ -94,6 +104,28 @@ import type { CreditBalance } from './credits.js'
 
 /** 一个渠道的临期折算实现（`ProviderRuntime.expiry` 的非空形态）。 */
 export type ProviderExpiry = NonNullable<ProviderRuntime['expiry']>
+
+/**
+ * 建表所需的**装配层依赖**（可选 —— 省略时行为与升级前一致）。
+ *
+ * ⚠️ 为什么不像 `createProviderCredits` 那样必填：本表有**几十处既有单测**
+ *    直接 `createProviderExpiry()` 建表验折算值（`aggregate-expiry.spec.ts` /
+ *    `officeace-expiry.spec.ts` / `zcode-expiry-exhausted.spec.ts` / …），
+ *    给它们全部补参数是无收益的机械改动。省略时不传该 deps 的那几家
+ *    （目前只有 minimax 系需要它）走各自「无 xff」的回落路径 ——
+ *    那与中国版的实际行为**完全一致**，只对国际站少一层绕行。
+ */
+export interface ProviderExpiryDeps {
+  /**
+   * MiniMax 国际站的 `X-Forwarded-For` 绕行头（**惰性**读，用户随时可改）。
+   *
+   * ⚠️ **必须惰性**：与 `createProviderCredits` 的同名字段同因 —— 注册时固化
+   *    成一个字符串会让「改设置后不生效」。
+   * ⚠️ 省略 ⇒ `minimaxExpiry` 收 `undefined` ⇒ **中国版行为不变**，
+   *    国际站在被地理分流到中国站时折算失败（那正是 IKMEVG 的形态）。
+   */
+  readonly minimaxXff?: () => string | undefined
+}
 
 /**
  * buddy 系的折算（**两个产品共用同一个原语**，只换 product 配置）。
@@ -123,7 +155,7 @@ function buddyFamilyExpiry(product: BuddyProduct): ProviderExpiry {
  * ⚠️ 返回**新对象**（不是模块级单例）：调用方（`index.ts` 与单测）各自持有一份，
  * 互不影响；表本身是**无状态**的（每个值只是一层转发闭包），故无共享状态风险。
  */
-export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>> {
+export function createProviderExpiry(deps: ProviderExpiryDeps = {}): Readonly<Record<string, ProviderExpiry>> {
   return {
     // ⚠️ 两个 buddy 系产品：原语相同、product 不同（`CODEBUDDY` / `WORKBUDDY`）。
     buddy: buddyFamilyExpiry(CODEBUDDY),
@@ -193,5 +225,60 @@ export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>>
           : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
       ),
     },
+    // ⚠️ **AStudio**（讯飞 AstronStudio，2026-10-20）：与 **buddy 系同形**
+    //    （三池各带 `*NextExpireTime` ⇒ 逐包真实到期时刻，`astudioExpiry` 走
+    //    `sharedPackageExpiry` 取最早那包）。
+    //    ⚠️ 三处必须同改（本表 + `WIRED_EXPIRY_PROVIDERS` + 折算原语）——
+    //    这是该陷阱的第 **5** 次复发（cline → accio → officeace → autoclaw → astudio），
+    //    漏任何一处的症状都是**静默**的（用户在聚合轮换列表里看不到该渠道，
+    //    零报错零日志）。
+    //    ⚠️ **必须走 `cachedBalance`**：与 buddy / trae / modelscope 同款 ——
+    //    聚合每轮折算会对同一账号反复提问，没有共享读数就白发大量重复请求。
+    astudio: {
+      credentialExpiry: (c, context) => astudioExpiry(
+        c as AstudioCredential,
+        ASTUDIO,
+        context?.cachedBalance === undefined
+          ? undefined
+          : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      ),
+    },
+    // ⚠️ **MiniMax Code**（中国版 / 国际版，2026-10-20）：两家共用同一个原语
+    //    （只换 product），与 buddy / workbuddy 同款 —— 单独抽 `minimaxFamilyExpiry`
+    //    是为了让「它们只差一个 product」一眼可见（同族各写一份判据 = 分叉的开始）。
+    //    ⚠️ 三处必须同改（本表 + `WIRED_EXPIRY_PROVIDERS` + 折算原语）——
+    //    这是该陷阱的第 **6** 次复发（cline → accio → officeace → autoclaw
+    //    → astudio → minimax），漏任何一处的症状都是**静默**的
+    //    （用户在聚合轮换列表里看不到该渠道，零报错零日志）。
+    //    ⚠️ **必须走 `cachedBalance`**：与 buddy / trae / modelscope / astudio 同款
+    //    —— 聚合每轮折算会对同一账号反复提问，没有共享读数就白发大量重复请求。
+    minimax: minimaxFamilyExpiry(MINIMAX, deps),
+    minimaxintl: minimaxFamilyExpiry(MINIMAX_INTL, deps),
+  }
+}
+
+/**
+ * MiniMax 系的折算（**两个产品共用同一个原语**，只换 product 配置）。
+ *
+ * ⚠️ 与 {@link buddyFamilyExpiry} 的关键差别：本家还要透传 `deps.minimaxXff`。
+ *    国际站按出口 IP 做地理分流（`agent.minimax.io` 307 到中国站，而中国站
+ *    不认国际站 token ⇒ `401 invalid access token`，与「凭据真失效」逐字同形，
+ *    issue IKMEVG）⇒ 不带 xff 时国际站账号的折算**恒失败**，该渠道在聚合轮换里
+ *    被静默剔除（面板却还能正常刷新 —— 两条链路各走各的 xff 取值）。
+ *
+ * ⚠️ `deps.minimaxXff` **在每次折算时现读**（不是建表时固化成一个字符串）：
+ *    用户随时可能在设置里改 XFF，固化会让改动不生效（与 `createProviderCredits`
+ *    的同名字段同一纪律）。
+ */
+function minimaxFamilyExpiry(product: MinimaxProduct, deps: ProviderExpiryDeps): ProviderExpiry {
+  return {
+    credentialExpiry: (c, context) => minimaxExpiry(
+      c as MinimaxCredential,
+      product,
+      context?.cachedBalance === undefined
+        ? undefined
+        : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      deps.minimaxXff?.(),
+    ),
   }
 }

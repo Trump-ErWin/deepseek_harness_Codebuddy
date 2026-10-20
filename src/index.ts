@@ -62,6 +62,17 @@ import type { LobsteraiCredential } from './lobsterai.js'
 // deductionEndTime}`，故把各家的 fetch 指给同一个选择器即可（见各自接线处）。
 import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
 import { fetchTraeCreditBalance } from './trae-credits.js'
+// ⚠️ astudio 的 `fetchAstudioCreditBalance` 是 2026-10-20 为「永久积分锁定」新增的
+//    薄封装（压平 `fetchAstudioBalanceDetailed` 的 `{balance, error?}` 成
+//    `CreditBalance | null`，因为 `BuddyBalanceSelector` 的 `fetchBalance` 契约
+//    只要余额、不要原因）。**不要**在选号路径上直接调 Detailed —— 那会丢掉
+//    「为什么查不到」的分流（会话失效 / 服务不可用 / 形状不认识）。
+import { fetchAstudioCreditBalance } from './astudio-credits.js'
+// ⚠️ MiniMax 两站的 `fetchMinimaxCreditBalance`（2026-10-20，同为「永久积分锁定」新增）：
+//    它是 `fetchMinimaxCreditBalanceDetailed` 的薄封装（压平 `{balance, error?}` 成
+//    `CreditBalance | null`），因为 `BuddyBalanceSelector` 的 `fetchBalance` 契约
+//    只要余额、不要原因。**不要**在选号路径上改调 Detailed。
+import { fetchMinimaxCreditBalance } from './minimax-credits.js'
 import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
 import type { ClineCredential } from './cline.js'
@@ -118,6 +129,9 @@ import type { AccioCredential } from './accio.js'
 import { AstudioAuth } from './astudio-auth.js'
 import { registerAstudioLlm } from './astudio-adapter.js'
 import { ASTUDIO } from './astudio-product.js'
+// ⚠️ 类型必须在**类型位置**导入：`verbatimModuleSyntax` 下漏了它会在
+//    `resolveAstudioCredentialByRef` 的返回标注处报 TS2552（2026-10-20 实测）。
+import type { AstudioCredential } from './astudio.js'
 // ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
 // 见 `docs/agent-notes/providers-modelscope.md` 与 `src/modelscope-product.ts` 模块头的逐条出处表。
 import { ModelscopeAuth } from './modelscope-auth.js'
@@ -1116,6 +1130,152 @@ export function apply(ctx: Context): void {
     }
 
   /**
+   * AStudio 的「锁定永久积分 + 无可用账号」报错文案。
+   *
+   * ⚠️ **不是漏抽 `buddyLockedError`**，而是本家口径**必须**不同：
+   * buddy 系的「临期」指「服务端资源包 `DeductionEndTime` 距今 < 15 天」，
+   * 而 AStudio 的三个池语义是**会员 / 购买 / 赠送（活动）积分**，
+   * 只有「赠送积分」实测带 `activityNextExpireTime`（会员与购买两池实测
+   * 为 `null`，即长期有效）。用户按 buddy 那句「等待资源包到期后重新发放额度」
+   * 去排查会找不到对应的东西。
+   *
+   * ⚠️ 若将来 `astudio-credits.ts` 的池分类变了（例如会员池也开始下发改期），
+   * 本函数里的池名要跟着改 —— 它是**唯一**被用户看到的池名清单。
+   *
+   * ⚠️ 错误码取 `QUOTA_EXCEEDED`（与 buddy 系一致：这确实是额度问题，
+   * 且不会像 `AUTH` 那样在部分客户端把 message 吞掉）。
+   *
+   * ⚠️ **本函数放在这里（`buddyLockedError` 之后、`loomyLockedError` 之前）是
+   *    历史的偶然，不是约束**：它只用 `BuddyNoAccountReason`，与 buddy 三份同族，
+   *    放哪都不影响正确性。**不要**为了让某个按位置切片做断言的既有用例通过而
+   *    调整本函数的声明顺序 —— 2026-10-20 我一度这么做（那时
+   *    `loomy-balance-error-contract.spec.ts` 的 `lockedErrorBody()` 用
+   *    `indexOf('const buddy = new BuddyAuth')` 当切片终点，恰好把本函数圈了进去，
+   *    于是本家 `QUOTA_EXCEEDED` 被当成 Loomy 的码核对而变红）。
+   *    正确修法是**把那条断言的切片终点改精确**（改成「下一个同级 `const`」），
+   *    已在该 spec 里改并写明理由。断言描述的是「这个函数用了哪些码」，
+   *    不是「这个函数后面跟着谁」。
+   */
+  const astudioLockedError =
+    (displayName: string) =>
+    (reason: BuddyNoAccountReason): Error => {
+      const days = buddyExpiringWindowDays()
+      if (reason.kind === 'unknown') {
+        return new LlmError(
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
+          + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
+          + '的积分 —— 请重试，或在 Jet Hub 的 AStudio 面板检查凭据是否失效'
+          + '（AStudio 的凭据是本机客户端会话的拷贝，客户端退出登录会让它失效）。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'no-candidates') {
+        return new LlmError(
+          `${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+          + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+          + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+          + '或改用其它 provider / 模型，或解锁永久积分后重试。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'credential-only') {
+        // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+        //    撤回地烧掉永久积分，而本情形的根因在凭据、与积分无关。
+        return new LlmError(
+          `${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+          + '有可用积分的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+          + '⚠️ 这与「积分用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地烧掉它们）。'
+          + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据；AStudio 没有 OAuth 授权页，`
+          + '需要在 AStudio 客户端登录后用「导入本机会话」重建凭据。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      /**
+       * ⚠️⚠️ **穷尽性守卫**（与 buddy / Loomy 两份同型）：走到这里**只允许**是
+       * `{ kind: 'exhausted' }`。把 `reason` 赋给单成员类型，将来
+       * `BuddyNoAccountReason` 加了新档位却忘写文案时，`tsc` 当场报 `TS2322`，
+       * 而不是静默落进「积分都已用尽」—— 那句会把用户推向不可撤回的解锁操作。
+       */
+      const exhaustedOnly: { kind: 'exhausted' } = reason
+      void exhaustedOnly
+      return new LlmError(
+        `${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
+        + '积分（AStudio 的**赠送/活动积分**池）都已用尽。'
+        + '会员积分与购买积分通常是长期有效的，锁定状态下动不到它们。'
+        + `请在 Jet Hub 的 ${displayName} 面板解锁永久积分，或等待活动积分到期后重新发放。`,
+        'QUOTA_EXCEEDED',
+      )
+    }
+
+  /**
+   * MiniMax Code 的「锁定永久积分 + 无可用账号」报错文案。
+   *
+   * ⚠️ **不是漏抽 `buddyLockedError`**，而是本家口径**必须**不同：
+   * buddy 系的「临期」指服务端**资源包**（`DeductionEndTime`），
+   * 而 MiniMax 的到期来自 `/minimax-cloud/api/v1/credit/details` 的
+   * **每条明细各自带 `expire_at_ms`**（2026-10-20 实测真实账号 20 条全部有值，
+   * 到期时刻 = 发放时刻 + 30 天）。buddy 那句「等待资源包到期后重新发放额度」
+   * 在 MiniMax **没有对应物** —— 它的额度来自**每日签到**与活动发放，
+   * 用户按 buddy 的口径去排查会找不到那个「资源包」。
+   *
+   * ⚠️ 两个产品（`minimax` / `minimaxintl`）**共用本函数**，只换 `displayName`：
+   * 两站的积分语义与端点形状逐字相同（同一个 `fetchMinimaxCreditBalanceDetailed`，
+   * 差异只在 `MINIMAX_INTL` 的主机与 ref 前缀），各写一遍 = 改一处漏一处。
+   * 但 `displayName` **必须**逐站区分：两站账号不互通，用户要知道去哪个面板解锁。
+   */
+  const minimaxLockedError = (displayName: string) =>
+    (reason: BuddyNoAccountReason): Error => {
+      const days = buddyExpiringWindowDays()
+      if (reason.kind === 'unknown') {
+        return new LlmError(
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
+          + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
+          + '的积分 —— 请重试，或在 Jet Hub 的对应面板检查凭据是否失效。'
+          + '⚠️ **国际站**另有地理分流风险：`agent.minimax.io` 会按出口 IP 把大陆来源'
+          + ' 307 到中国站，而中国站不认国际站 token ⇒ 表现为余额查询恒失败'
+          + '（issue IKMEVG）；可在面板设置里填 `X-Forwarded-For`。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'no-candidates') {
+        return new LlmError(
+          `${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+          + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+          + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+          + '或改用其它 provider / 模型，或解锁永久积分后重试。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'credential-only') {
+        // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+        //    撤回地烧掉永久积分，而本情形的根因在凭据、与积分无关。
+        return new LlmError(
+          `${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+          + '有可用积分的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+          + '⚠️ 这与「积分用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地烧掉它们）。'
+          + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据，必要时重新登录。`,
+          'QUOTA_EXCEEDED',
+        )
+      }
+      /**
+       * ⚠️⚠️ **穷尽性守卫**（与 buddy / Loomy / AStudio 三份同型）：走到这里
+       * **只允许**是 `{ kind: 'exhausted' }`。把 `reason` 赋给单成员类型，
+       * 将来 `BuddyNoAccountReason` 加了新档位却忘写文案时，`tsc` 当场报
+       * `TS2322`，而不是静默落进「积分都已用尽」—— 那句会把用户推向
+       * **不可撤回**的解锁操作。
+       */
+      const exhaustedOnly: { kind: 'exhausted' } = reason
+      void exhaustedOnly
+      return new LlmError(
+        `${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
+        + '积分（MiniMax 的**签到 / 活动发放**额度，每条明细自带 30 天有效期）都已用尽。'
+        + '长期有效的部分在锁定状态下动不到它们。'
+        + `请在 Jet Hub 的 ${displayName} 面板解锁永久积分，或等待下一次签到 / 活动发放。`,
+        'QUOTA_EXCEEDED',
+      )
+    }
+
+  /**
    * Loomy 的「锁定永久积分 + 无可用账号」报错文案（issue IKMCOO 缺陷 2/3）。
    *
    * ⚠️ **与 buddy 那份分开**（不是漏抽）：Loomy 的口径是「**今日赠送额度**」
@@ -1993,6 +2153,57 @@ export function apply(ctx: Context): void {
   //
   // 服务名由 MinimaxAuth 依 product.id 派生，注册为 ctx.minimaxAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 MiniMax 面板。
+  /**
+   * 按凭据 ref 解析 MiniMax 凭据（**两个产品共用**）。
+   *
+   * ⚠️ 拆成具名函数（原先是两处内联的匿名箭头，逐字重复）：选号器的
+   * `resolveCredential` 与注册项的 `readCredential` 必须是**同一个**解析器 ——
+   * 写两份、强度不一致 = 改一处漏一处（本仓库在 LobsterAI / TRAE / AStudio
+   * 三处都踩过这个形态）。
+   *
+   * ⚠️ **保持裸 `JSON.parse` 的历史形态，不在此处加形状校验**：那会是行为变更
+   * （与 raccoon / gemini 同款）；本函数只做「抽出来共用」这一件事。
+   */
+  const resolveMinimaxCredentialByRef = async (
+    refName: string,
+  ): Promise<MinimaxCredential | undefined> => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      return JSON.parse(resolved.value) as unknown as MinimaxCredential
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * MiniMax 两站的**按「积分何时作废」分档选号器**（为「锁定永久积分」提供依据）。
+   *
+   * ⚠️ 复用 `BuddyBalanceSelector` 而不是新写一个：分档判据
+   * （`splitBuddyCreditsByExpiry`）只读通用的
+   * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
+   * `fetchMinimaxCreditBalanceDetailed` 自 2026-10-20 起把每条明细的
+   * `expire_at_ms`（毫秒时间戳，实测无需 ×1000）归一化到 `deductionEndTime`。
+   *
+   * ⚠️ **两站各一个实例**：选择器内含按账号 id 的余额缓存，共用会串味
+   *（两站账号不互通、主机也不同）。
+   *
+   * ⚠️⚠️ **国际站必须透传 XFF**（与 `creditsTable` / `expiryTable` 那两处同因）：
+   * `agent.minimax.io` 按出口 IP 把大陆来源 307 到中国站，而中国站不认国际站
+   * token ⇒ 折算恒失败 ⇒ 该渠道在聚合轮换里被**静默**剔除（面板却还能刷新，
+   * 因为那走的是另一条带了 XFF 的链路）。`pool.minimaxXff()` **每次现读**，
+   * 不固化成字符串 —— 用户随时可能改设置。
+   */
+  const minimaxBalanceSelector = new BuddyBalanceSelector({
+    product: MINIMAX,
+    resolveCredential: resolveMinimaxCredentialByRef,
+    fetchBalance: (credential, product) => fetchMinimaxCreditBalance(credential, fetch, product),
+  })
+  const minimaxIntlBalanceSelector = new BuddyBalanceSelector({
+    product: MINIMAX_INTL,
+    resolveCredential: resolveMinimaxCredentialByRef,
+    fetchBalance: (credential, product) =>
+      fetchMinimaxCreditBalance(credential, fetch, product, pool.minimaxXff()),
+  })
   const minimax = new MinimaxAuth(ctx)
   const minimaxAdapter = registerMinimaxLlm(ctx, {
     credentialRef: credentialRef(MINIMAX.defaultCredentialRef),
@@ -2004,16 +2215,39 @@ export function apply(ctx: Context): void {
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(MINIMAX.id, id) } },
       {
         product: MINIMAX,
-        // ⚠️ 与 raccoon / gemini 同款：兜底是**裸 `JSON.parse`**（历史形态，
-        // 本 Task 逐字保留，不在此处加形状校验 —— 那会是行为变更）。
-        readCredential: async (refName) => {
-          const resolved = await ctx.credentials.resolve(credentialRef(refName))
-          if (!resolved) return undefined
-          try {
-            return JSON.parse(resolved.value) as unknown as MinimaxCredential
-          } catch {
-            return undefined
-          }
+        // ⚠️ 与选号器**共用同一个**解析器（原先这里是一份内联的匿名箭头，
+        //    与下面 MINIMAX_INTL 那份逐字重复 ⇒ 改一处漏一处；已抽成
+        //    `resolveMinimaxCredentialByRef`）。历史形态是**裸 `JSON.parse`**，
+        //    逐字保留，不在此处加形状校验（那会是行为变更）。
+        readCredential: resolveMinimaxCredentialByRef,
+        /**
+         * ⚠️ **2026-10-20 新增**（用户报障：「MiniMax Code 积分也有到期时间，
+         * 也应当有相同功能」）。
+         *
+         * 此前本家**不传 `balance`** ⇒ 走 `getAvailableAccount` 的「手动序第一个
+         * 启用账号」，**与到期时间无关** ⇒ 既没有「临期优先」，也没有任何东西
+         * 可供「锁定永久积分」判断 ⇒ 锁上了也不知道该不该拦。
+         *
+         * ⚠️ 本家**没有**免费模型概念（`MinimaxAdapter` 不实现 `isFreeModel`），
+         * 故不传该字段 —— 缺省 `undefined` 走常规分档路径（正确行为）。
+         */
+        balance: {
+          kind: 'buddy',
+          selector: minimaxBalanceSelector,
+          lockedError: minimaxLockedError('MiniMax Code (中国版)'),
+          /**
+           * ⚠️⚠️ **刻意不写 `reportPickedAccount: false`**（与 buddy 系那两处**相反**）。
+           *
+           * `reportPickedAccount: false` 是**buddy 系旧闭包的历史不对称**
+           *（它们只在池兜底那一支回报），本 Task 逐字保留。而 MiniMax 的旧闭包
+           * 是**纯池选号**（本就无余额分档）⇒ 它的账本**一直在回报**。
+           * 若照抄 buddy 写 `false`，本节新增的 `balance` 会让「分档选中」那支
+           * 不再回报 ⇒ **账本归属静默丢失**（token 用量记不到这个渠道上）。
+           * 该形态由 `tests/unit/credential-resolver.spec.ts` 的
+           * 「<provider>：池命中时回报 token 账本」逐家驱动 `apply()` 守着 ——
+           * minimax / minimaxintl 正在那份名单里（它们此前**可达**）。
+           */
+          reportPickedAccount: true,
         },
         fallback: { kind: 'ref', refName: MINIMAX.defaultCredentialRef },
         // 区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
@@ -2088,14 +2322,21 @@ export function apply(ctx: Context): void {
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(MINIMAX_INTL.id, id) } },
       {
         product: MINIMAX_INTL,
-        readCredential: async (refName) => {
-          const resolved = await ctx.credentials.resolve(credentialRef(refName))
-          if (!resolved) return undefined
-          try {
-            return JSON.parse(resolved.value) as unknown as MinimaxCredential
-          } catch {
-            return undefined
-          }
+        // ⚠️ 与中国版**共用同一个**解析器（见 `resolveMinimaxCredentialByRef` 的说明）。
+        //    两站凭据形状逐字相同（同一套 OAuth 实现，只换主机与 ref 前缀）。
+        readCredential: resolveMinimaxCredentialByRef,
+        // ⚠️ 与中国版**同因同日**新增（2026-10-20）：两站共用同一个
+        //    `fetchMinimaxCreditBalanceDetailed`。
+        //    ⚠️⚠️ 但**选号器必须是国际站那一个实例** —— 它透传 `pool.minimaxXff()`
+        //    （绕地理分流，issue IKMEVG）；误用国内站实例会让国际站余额查询
+        //    恒失败 ⇒ 该渠道在聚合轮换里被静默剔除。
+        balance: {
+          kind: 'buddy',
+          selector: minimaxIntlBalanceSelector,
+          lockedError: minimaxLockedError('MiniMax Code (国际版)'),
+          // ⚠️ 与中国版**同因**：本家旧闭包是纯池选号、账本一直在回报 ⇒
+          //    必须 `true`，写 `false` 会让 token 用量记不到国际站上（见中国版处说明）。
+          reportPickedAccount: true,
         },
         fallback: { kind: 'ref', refName: MINIMAX_INTL.defaultCredentialRef },
         throwIfAllRateLimited: throwIfAllAccountsRateLimited,
@@ -2364,12 +2605,118 @@ export function apply(ctx: Context): void {
   // 故这里**不需要**再 ctx.provide('astudioAuth' / 'astudioLlm')。
   // 不注册斜杠命令：入口在 Jet Hub 的 AStudio 面板。
   const astudio = new AstudioAuth(ctx)
+  /**
+   * 按凭据 ref 解析 AStudio 凭据（供**选号器查余额**与最终取凭据共用）。
+   *
+   * ⚠️ 形状校验必须与 `astudio-auth.ts` 的 `parseAstudioCredential` 对齐
+   *（判 `typeof access_token === 'string'`）。裸 `JSON.parse` 会让
+   * `{"foo":1}` 这种损坏凭据被当成有效凭据返回，随后适配器的
+   * `credential.access_token.length` 抛 **TypeError**（不可诊断），
+   * 且发生在选号之后 —— 不在余额查询的 try/catch 覆盖范围内。
+   * 这条注释与 LobsterAI / TRAE 那两处同因（写两遍、强度不一致 = 改一处漏一处）。
+   *
+   * 实测凭据字段（两个账号，2026-10-20）：`access_token`(65 字符) /
+   * `account_id` / `uid` / `nickname` / `sso_session_id` / `token` /
+   * `login_method` / `logged_in_at` / `source`。分档判据只用到
+   * `access_token`（作为 `Cookie: ssoSessionId=` 的值去查 `/points/balance`）。
+   */
+  const resolveAstudioCredentialByRef = async (
+    refName: string,
+  ): Promise<AstudioCredential | undefined> => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      const parsed = JSON.parse(resolved.value)
+      return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+        ? (parsed as AstudioCredential)
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * AStudio 的**按「积分何时作废」分档选号器**（为「锁定永久积分」提供依据）。
+   *
+   * ⚠️ 复用 `BuddyBalanceSelector` 而不是新写一个：分档判据
+   * （`splitBuddyCreditsByExpiry`）只读通用的
+   * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
+   * AStudio 的 `buildAstudioBalance` 自 2026-10-20 起把
+   * `{member,buy,activity}NextExpireTime`（不带时区的本地时间串，实测形如
+   * `"2026-11-20T01:50:14"`）归一化到 `deductionEndTime`（毫秒），故结构一致。
+   *
+   * ⚠️ **缓存不能跨站共用**（选择器内含按账号 id 的缓存），故每家一个实例。
+   *
+   * ⚠️ 到期时间缺失的包归入**永久桶**（`splitBuddyCreditsByExpiry` 的保守方向）：
+   * 宁用锁定时少用一个号，也不要把长期积分误当快到期烧掉。
+   */
+  const astudioBalanceSelector = new BuddyBalanceSelector({
+    product: ASTUDIO,
+    resolveCredential: resolveAstudioCredentialByRef,
+    fetchBalance: (credential, product) => fetchAstudioCreditBalance(credential, product),
+  })
+  /**
+   * AStudio 的凭据编排（候选筛选 → 余额分档 → 取凭据 → 回退）。
+   *
+   * ⚠️ 单独取名而不是内联，因为下面 `registerAstudioLlm` 的 `resolveCredential`
+   * 是**零参**签名，必须先拿到这个带参函数再包一层（见那处注释）。
+   */
+  const astudioCredentialPlan = createCredentialResolver<AstudioCredential>(
+    {
+      pool,
+      reportAccount: (id) => {
+        if (id !== undefined) reportLedgerAccount(ASTUDIO.id, id)
+      },
+    },
+    {
+      product: ASTUDIO,
+      // ⚠️ 必须传 ASTUDIO 自己的解析器（buddy 系那份虽然形状恰好兼容 ——
+      //    同样判 `access_token` 是字符串 —— 但两家凭据字段不同：astudio 带
+      //    `sso_session_id` / `login_method` / `source`，且将来任一方加校验就会分叉）。
+      readCredential: resolveAstudioCredentialByRef,
+      balance: {
+        kind: 'buddy',
+        selector: astudioBalanceSelector,
+        // ⚠️ 本家**没有**免费模型概念（`AstudioAdapter` 不实现 `isFreeModel`），
+        //    故不传该字段 —— 缺省 `undefined` 会让 `createCredentialResolver`
+        //    走「免费模型短路」之外的常规分档路径（正确行为）。
+        lockedError: astudioLockedError('AStudio'),
+        // 与 buddy 系一致：分档选中时**不**回报账本（本家旧闭包也没有回报）。
+        reportPickedAccount: false,
+      },
+      fallback: { kind: 'ref', refName: ASTUDIO.defaultCredentialRef },
+      // 退到单凭据 ref 之前先证明失败原因：全被模型限流时报明确的限流错误，
+      // 而不是降级成误导性的 MISSING_CREDENTIAL（见 throwIfAllAccountsRateLimited）。
+      throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+    },
+  )
   const astudioAdapter = registerAstudioLlm(ctx, {
+    // ⚠️ **2026-10-20 新增**：此前本家不传 `resolveCredential`，适配器走
+    //    `auth.currentCredential()` ⇒ **单凭据、无选号**，于是：
+    //    · 「锁定永久积分」开关即使打开也**毫无作用**（没有选号层可拦）；
+    //    · 多账号时永远只用池里「第一个可用」的那个，第二个号的临期额度用不上。
+    //    接上 `createCredentialResolver`（与 buddy/lobsterai/trae 同一套编排）后，
+    //    候选先按 `enabled` + 模型限流筛，再按「15 天内到期优先」分档。
+    //
+    // ⚠️⚠️ **必须包一层转成零参签名**：`createCredentialResolver` 返回的是
+    //    `(modelId?: string) => Promise<TCredential | undefined>`，而
+    //    `AstudioAdapterOptions.resolveCredential` 声明的是
+    //    `() => Promise<AstudioCredential | undefined>`（**零参**）。
+    //    直接把带参函数传过去会 TS2322（参数个数不兼容）。
+    //    ⚠️ 传 `''` 而不是省参数：空串意味着「不按模型筛候选」——
+    //    `candidatesOf` 对空 `modelId` 跳过 `modelRateLimits` 过滤，
+    //    这与本家适配器（`requestLevelRotation` 关闭、不按模型换号）的语义一致；
+    //    若将来接上请求级换号，这里应改为透传真实 modelId。
+    resolveCredential: () => astudioCredentialPlan(''),
     // ⚠️ AstudioAdapterOptions 只有 product / fetchImpl / auth / resolveCredential /
     //    refresh / fetchRemoteModels / onCatalogLoaded / warn 八项 —— **没有**
     //    accountPool 与 readImage（与上面 accio 那两处不同，多传必 TS2353：
     //    本家适配器刻意不做请求级换号，且实测六个模型的 input_modalities 全是
     //    text，图片通路不成立）。
+    //    ⚠️ 同样**没有** `credentialRef`：`registerAstudioLlm` 内部会用
+    //    `auth.currentCredential()` 作为「池里无账号」时的回退，不需要外部传 ref
+    //    （传了必 TS2353，2026-10-20 实测踩到）。
+    //    ⚠️ 但「请求级换号」与「按余额分档选号」是**两件事**：前者是 429 后换号
+    //    （本家确实没有），后者是「该用哪个号」（上面刚接上）。两者互不依赖。
     // ⚠️ **不传 onCatalogLoaded**：registerAstudioLlm 内部已注入唯一的
     //    broadcastCatalogChanged(ctx)，这里再传就是第二份广播。
     // ⚠️ 传 auth 即可拿到三个默认回调（currentCredential / refreshOnce /
@@ -3747,7 +4094,18 @@ async function fetchBalanceReading(
    *
    * ⚠️ 用 `expiryOf` 而非下标（原型链键误判），与 `creditsOf` 同因。
    */
-  const expiryTable = createProviderExpiry()
+  const expiryTable = createProviderExpiry({
+    // ⚠️⚠️ **MiniMax 国际站的 XFF 必须在这里也接上**（2026-10-20，与 L3858 那处
+    //    `creditsTable` 的 `minimaxXff` **同因**）。
+    //
+    // `ProviderRuntime.credits` 与 `ProviderRuntime.expiry` 是**两个独立消费域**
+    //（前者喂积分面板，后者喂聚合候选排序），两者的 xff 通道**各走各的**：
+    // 只接 credits 那处的话，症状正是「面板能刷新、聚合候选却恒折算失败」
+    //（本仓库在 2026-10-17 审计里已对 `creditsTable` 记录过同型缺陷）。
+    //
+    // ⚠️ 惰性读（用户随时可能改设置），不能固化成字符串。
+    minimaxXff: () => pool.minimaxXff(),
+  })
 
 
   // ===== 能力注册表（设计文档 §3.3）=====

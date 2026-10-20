@@ -35,11 +35,14 @@ describe('autoCheckinExcluded：宿主消费取决于 registry', () => {
 })
 
 describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry', () => {
-  it('恰好是 registry 里 usesExpiryWindow === true 的 6 家（officeace 2026-10-12、autoclaw 2026-10-17 加入）', () => {
+  it('恰好是 registry 里 usesExpiryWindow === true 的 9 家（officeace 2026-10-12、autoclaw 2026-10-17、astudio/minimax 2026-10-20 加入）', () => {
     const withWindow = PROVIDER_REGISTRY
       .filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
-    expect(withWindow).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    expect(withWindow).toEqual([
+      'astudio', 'autoclaw', 'buddy', 'lobsterai', 'minimax', 'minimaxintl',
+      'officeace', 'trae', 'workbuddy',
+    ])
   })
 
   it('支持锁定的渠道 ⊆ usesExpiryWindow ∪ {loomy}（loomy 无窗口概念）', () => {
@@ -49,7 +52,13 @@ describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry
     const viaWindow = PROVIDER_REGISTRY
       .filter((d) => d.permanentLock === true && d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
-    expect(viaWindow).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ minimax / minimaxintl 2026-10-20 加入：与 astudio 同批，两处同时登记
+    //   （只加 permanentLock 不加 usesExpiryWindow ⇒ 分档行不渲染但锁按钮在，
+    //   是 AStudio 首次报障时踩过的半残形态）。
+    expect(viaWindow).toEqual([
+      'astudio', 'buddy', 'lobsterai', 'minimax', 'minimaxintl',
+      'officeace', 'trae', 'workbuddy',
+    ])
     expect(locked).toEqual([...viaWindow, 'loomy'].sort())
   })
 })

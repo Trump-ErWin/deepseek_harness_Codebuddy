@@ -479,6 +479,10 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       // 固定 ref（`AUTOCLAW_ACCESS_TOKEN`），而 Jet Hub 登录只写
       // `AUTOCLAW_ACCOUNT_XXX` ⇒ 池被筛空时会误报「请先登录」。
       'AUTOCLAW',
+      // ⚠️ **ASTUDIO 必须在内**（2026-10-20）：同形 —— 兜底是固定 ref
+      // （`ASTUDIO.defaultCredentialRef`），Jet Hub 导入本机会话只写
+      // `ASTUDIO_ACCOUNT_XXX` ⇒ 池被筛空时会误报「请先登录」。
+      'ASTUDIO',
       // ⚠️ **刻意不含 ZCODE** —— 它是唯一「不接判定也算对」的一家，
       // 见下方「zcode 同型缺陷判定」段。
     ]
