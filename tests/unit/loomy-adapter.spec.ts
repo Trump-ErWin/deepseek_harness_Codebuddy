@@ -7,6 +7,7 @@ import {
 import { classifyRaccoonFailure } from '../../src/raccoon-adapter.js'
 import { LOOMY, loomyContextWindow } from '../../src/loomy-product.js'
 import { allAccountsRateLimitedForModel } from '../../src/account-pool.js'
+import { isLoomyAuthBusinessCode, LOOMY_PROBE_BACKOFF_MS } from '../../src/loomy-adapter.js'
 import { nextUtc8DayStartMs } from '../../src/model-queue.js'
 import type { LoomyCredential } from '../../src/loomy.js'
 
@@ -1353,3 +1354,378 @@ describe('★★★ 401/403 分支的探测失败也不得打断整轮（审计�
   })
 })
 
+/**
+ * ★★ 探测非终态失败后的**退避**：不得每轮都白等 60 秒（2026-10-20 审计 E-3）。
+ *
+ * ## 缺陷形态
+ *
+ * `isLoomyExpired` 读本地 `expires_at`（登录时刻 +14 天推算**写下**，服务端不下发，
+ * 本插件**永不改写**）⇒ 本地判过期后，前置探测分支**每一轮**都会进。而探测的
+ * 超时上限是 `LOOMY_REQUEST_TIMEOUT_MS` = 60 秒，且 `probeCredential` 用的是
+ * **独立**的 `AbortSignal.timeout`、不联动调用方 `signal` ⇒ 最坏情况是
+ * 「每轮首 token 前白等 60 秒」，用户点停止也打断不了。
+ *
+ * 审计实测：`refresh` 永挂 ⇒ 8 秒后仍未返回；缩短到 250ms 后
+ * `perTurnMs=[316,315,310]`（**每轮各等一次**）。
+ *
+ * ## 判据
+ *
+ * 退避窗口（{@link LOOMY_PROBE_BACKOFF_MS}，5 分钟）内**不再调用** `refresh`，
+ * 但仍然**照常发业务请求**；探测成功时立刻清掉退避。
+ * ⚠️ 变异：删掉 `if (!this.probeBackedOff(...))` 那一层 ⇒ 本组必红。
+ */
+describe('★★ 探测失败后的退避：不得每轮都白等探测超时（审计 E-3）', () => {
+  const EXPIRED: LoomyCredential = { ...CRED, expires_at: '1' }
+  const SSE = [
+    'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n',
+    'data: [DONE]\n\n',
+  ].join('')
+
+  function okFetch() {
+    let calls = 0
+    const fn = (async () => {
+      calls += 1
+      return new Response(SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }) as unknown as typeof fetch
+    return { fn, calls: () => calls }
+  }
+
+  async function drain(adapter: LoomyAdapter) {
+    for await (const _chunk of adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3', messages: [{ role: 'user', content: 'hi' }],
+    } as never)) { /* drain */ }
+  }
+
+  it('★★ 第 1 轮探测失败 ⇒ 第 2 轮**不再探测**，但业务请求照发', async () => {
+    const f = okFetch()
+    let refreshCalls = 0
+    let now = 1_000
+    const adapter = makeAdapter({
+      resolveCredential: async () => EXPIRED,
+      refresh: async () => { refreshCalls += 1; throw new Error('Loomy 凭据探测失败：系统内部错误') },
+      warn: () => {},
+      fetchImpl: f.fn,
+      now: () => now,
+    })
+
+    await drain(adapter)
+    expect(refreshCalls, '第 1 轮必须真的探测过').toBe(1)
+    expect(f.calls(), '业务请求必须照发（探测失败不阻断）').toBe(1)
+
+    // 第 2 轮：仍在退避窗口内（未推进时间）
+    await drain(adapter)
+    expect(refreshCalls, '退避窗口内不得再探测（否则每轮白等 60 秒）').toBe(1)
+    expect(f.calls(), '业务请求仍要照发').toBe(2)
+  })
+
+  it('★★ 退避窗口过期后必须重新探测（上游恢复要能纠正）', async () => {
+    const f = okFetch()
+    let refreshCalls = 0
+    let fail = true
+    let now = 1_000
+    const adapter = makeAdapter({
+      resolveCredential: async () => EXPIRED,
+      refresh: async () => {
+        refreshCalls += 1
+        if (fail) throw new Error('Loomy 凭据探测失败：系统内部错误')
+      },
+      warn: () => {},
+      fetchImpl: f.fn,
+      now: () => now,
+    })
+
+    await drain(adapter)
+    expect(refreshCalls).toBe(1)
+
+    fail = false
+    now += LOOMY_PROBE_BACKOFF_MS + 1
+    await drain(adapter)
+    expect(refreshCalls, '窗口过期后必须重探').toBe(2)
+  })
+
+  it('★★ 探测**成功**时立刻清退避（没理由继续跳过）', async () => {
+    const f = okFetch()
+    let refreshCalls = 0
+    let fail = true
+    let now = 1_000
+    const adapter = makeAdapter({
+      resolveCredential: async () => EXPIRED,
+      refresh: async () => {
+        refreshCalls += 1
+        if (fail) throw new Error('Loomy 凭据探测失败：系统内部错误')
+      },
+      warn: () => {},
+      fetchImpl: f.fn,
+      now: () => now,
+    })
+
+    await drain(adapter)
+    expect(refreshCalls).toBe(1) // 失败 ⇒ 进退避
+
+    // 未推进时间，但这次探测成功 ⇒ 必须**清掉**退避
+    fail = false
+    // 先手动把退避窗口推过一点，让「清掉」这件事可观测：
+    // ⚠️ 若不推进时间，窗口内根本不会再探测，测不到「清掉」。
+    now += LOOMY_PROBE_BACKOFF_MS + 1
+    await drain(adapter)
+    expect(refreshCalls, '窗口过期后重探且成功').toBe(2)
+
+    // 成功之后**不需要**再等一个完整窗口：下一次（哪怕时间没动）仍会探测。
+    await drain(adapter)
+    expect(refreshCalls, '成功后必须清退避 ⇒ 下一轮照常探测').toBe(3)
+  })
+
+  it('★★ 反向对照：终态仍必须抛，且不产生退避（终态是「请重新登录」）', async () => {
+    const f = okFetch()
+    let refreshCalls = 0
+    const adapter = makeAdapter({
+      resolveCredential: async () => EXPIRED,
+      refresh: async () => {
+        refreshCalls += 1
+        const error = new Error('Loomy 凭证已失效，请重新登录（缺少 token）')
+        error.name = 'RefreshTokenExpiredError'
+        throw error
+      },
+      warn: () => {},
+      fetchImpl: f.fn,
+    })
+
+    await expect(drain(adapter)).rejects.toThrow('凭证已失效')
+    // ⚠️ 终态不进退避（它每一轮都该抛，用户据此去重新登录）；
+    //    故第二次仍会探测 —— 这里只断言「不会静默放行」。
+    await expect(drain(adapter)).rejects.toThrow('凭证已失效')
+    expect(refreshCalls).toBe(2)
+    expect(f.calls(), '终态不得发出业务请求').toBe(0)
+  })
+})
+/**
+ * ★★ `HTTP 200 + 业务码 100002` 也必须能换号（2026-10-20 审计 E-1，**既有缺陷**）。
+ *
+ * ## 缺陷形态
+ *
+ * Loomy 的业务失败**恒 HTTP 200**（`src/loomy.ts` 的协议说明：
+ * 「带错的那个 → HTTP 200 + `{"code":"100002","desc":"缺少 token"}`」），
+ * 而请求级换号循环写在 `if (!response.ok)` 里 ⇒ 200 的认证失败**一次都不换号**。
+ * 多账号场景下**从未尝试过好号**，终错是 `SERVER`（「响应不是 SSE」）而非 `AUTH`。
+ *
+ * 实测（基线 `b5dab83` 同样）：
+ * ```
+ * classifyLoomyFailure('100002', 200)  ⇒ 'other'  rotate=false
+ * classifyLoomyFailure('100002', 401)  ⇒ 'auth'   rotate=true
+ * ```
+ *
+ * ## ⚠️ 为什么判据**不进** `classifyLoomyFailure`
+ *
+ * 那个分类器与 `classifyRaccoonFailure` 明文规定「必须逐格同构」，并由本文件的
+ * 「与 raccoon 对拍」用例逐条守着；而 `100002` 是 Loomy 独有码。
+ * 塞进去会当场把对拍用例变红，或逼着给 raccoon 编一个它没有的码。
+ * ⇒ 业务码这一腿留在本家自己的 {@link isLoomyAuthBusinessCode} 里。
+ */
+describe('★★ 200 + 业务码 100002 也要能换号（审计 E-1）', () => {
+  const CRED_A: LoomyCredential = { access_token: 'tok-A', userid: 'ua', phone: '13800000001' }
+  const CRED_B: LoomyCredential = { access_token: 'tok-B', userid: 'ub', phone: '13800000002' }
+  const SSE = 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+
+  async function drain(adapter: LoomyAdapter) {
+    for await (const _chunk of adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3', messages: [{ role: 'user', content: 'hi' }],
+    } as never)) { /* drain */ }
+  }
+
+  it('★★ 判据本身：只有 100002 是认证业务码，别的业务码不是', () => {
+    expect(isLoomyAuthBusinessCode({ ok: false, code: '100002' })).toBe(true)
+    expect(isLoomyAuthBusinessCode({ ok: false, code: '100001' })).toBe(false) // 参数错误
+    expect(isLoomyAuthBusinessCode({ ok: false, code: '200003' })).toBe(false)
+    expect(isLoomyAuthBusinessCode({ ok: true, code: '0' })).toBe(false)
+  })
+
+  it('★★★ A 回「200 + 100002」、池里 B 正常 ⇒ 必须换到 B 成功', async () => {
+    const auths: string[] = []
+    const warmed: string[] = []
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      const auth = String(new Headers(init?.headers).get('Authorization') ?? '')
+      auths.push(auth)
+      if (auth.includes('tok-A')) {
+        // ⚠️ **HTTP 200** + JSON 认证信封 —— 这正是 Loomy 表达「token 缺失」的主通道
+        return new Response(
+          JSON.stringify({ code: '100002', desc: '缺少 token' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      return new Response(SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }) as unknown as typeof fetch
+    const adapter = makeAdapter({
+      resolveCredential: async () => CRED_A,
+      refresh: async () => {},
+      warn: (m) => warmed.push(m),
+      fetchImpl,
+      accountPool: {
+        findAccountIdByCredential: async (_p: string, tok: string) => (tok === 'tok-A' ? 'acc-A' : 'acc-B'),
+        getAvailableAccount: async () => ({ entry: { id: 'acc-B' }, credential: CRED_B }),
+        updateModelRateLimit: async () => { /* 认证类不该写冷却 */ },
+      } as never,
+    })
+
+    await expect(drain(adapter)).resolves.toBeUndefined()
+    expect(auths.some((a) => a.includes('tok-B')), '必须换到 B').toBe(true)
+    expect(warmed.some((m) => m.includes('100002')), '必须留痕（否则静默换号）').toBe(true)
+  })
+
+  it('★★ 反向对照：非认证业务码（100001 参数错误）**不得**被当成认证失败换号', async () => {
+    const auths: string[] = []
+    let picks = 0
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      auths.push(String(new Headers(init?.headers).get('Authorization') ?? ''))
+      // ⚠️ 100001 = 参数错误，换号无益 ⇒ 必须原样报错、**不换号**
+      return new Response(
+        JSON.stringify({ code: '100001', desc: 'params error' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }) as unknown as typeof fetch
+    const adapter = makeAdapter({
+      resolveCredential: async () => CRED_A,
+      refresh: async () => {},
+      warn: () => {},
+      fetchImpl,
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-A',
+        getAvailableAccount: async () => { picks += 1; return { entry: { id: 'acc-B' }, credential: CRED_B } },
+        updateModelRateLimit: async () => {},
+      } as never,
+    })
+
+    // 非 SSE ⇒ 报「响应不是 SSE」；关键是**不得换号**
+    await expect(drain(adapter)).rejects.toThrow()
+    expect(picks, '非认证业务码不得换号（换谁都会失败，白烧候选）').toBe(0)
+    expect(auths, '只该发一次').toHaveLength(1)
+  })
+
+  it('★★ 声明 JSON 但**不是**认证码 ⇒ 响应体必须原样交回下游（不得读干）', async () => {
+    // ⚠️⚠️ 这条守的是「`text()` 读完 body 之后**必须**重建响应」。
+    //    否则下游拿到一个已消耗的流：`consumeOpenAiSse` 会报
+    //    「响应不是 SSE（没有任何 data: 帧）」并**丢掉上游原话**。
+    //    实测（我第一版实现就是这个形态）：变异「读完不重建」⇒
+    //    错误文案从上游业务码退化成空流，用户看不到真实原因。
+    const adapter = makeAdapter({
+      resolveCredential: async () => CRED_A,
+      refresh: async () => {},
+      fetchImpl: (async () => new Response(
+        JSON.stringify({ code: '200003', desc: '上游原话必须可见' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )) as unknown as typeof fetch,
+    })
+    // 非认证码 ⇒ 不换号、不转 401；但 body 必须还能被下游读到。
+    const message = await adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3', messages: [{ role: 'user', content: 'hi' }],
+    } as never).next().then(() => '').catch((e: Error) => String(e.message))
+    // ⚠️ 断言「上游原话仍在文案里」——这是「没读干」的可观测判据。
+    expect(message, '上游业务码原话必须保留（body 未被读干）').toContain('200003')
+  })
+
+  it('★★ 反向对照：SSE 正文不得被这条腿吃掉（content-type 不是 JSON 就零成本跳过）', async () => {
+    const adapter = makeAdapter({
+      resolveCredential: async () => CRED_A,
+      refresh: async () => {},
+      fetchImpl: (async () => new Response(SSE, {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      })) as unknown as typeof fetch,
+    })
+    // 能正常读出正文内容 ⇒ 说明没有在中间被 text() 读干
+    const chunks: string[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3', messages: [{ role: 'user', content: 'hi' }],
+    } as never)) {
+      // ⚠️ 正文走的是 `text-delta`（实测 chunk 形状：
+      //    block-start → text-delta{text:"ok"} → block-end → finish）。
+      const c = chunk as { type?: string; text?: string }
+      if (c.type === 'text-delta') chunks.push(String(c.text))
+    }
+    expect(chunks.join(''), 'SSE 正文必须完整到达（不能被 100002 那条腿读干）').toContain('ok')
+  })
+})
+/**
+ * ★★ 探测必须针对「**本轮要用的**那份凭据」，而不是「池默认号」
+ * （2026-10-20 审计 E-2，**既有缺陷**）。
+ *
+ * ## 缺陷形态
+ *
+ * 热路径把 `refresh()` 的结果当作「**本轮**凭据能不能用」的裁决，而接线层原先
+ * 恒探测 `pool.getAvailableAccount(LOOMY.id, '')` = **池默认号** ⇒ 二者可能
+ * 不是同一个号。后果：本轮要用的号**完全可用**，仅因**另一个号**报终态，
+ * 整轮就被打死（实测：业务请求 0 次）。
+ *
+ * 这与 `401` 分支注释里自己写过的「二者可能不是同一个号」是同一个坑：
+ * 那处讨论的是**冷却标记记错号**，这处是**裁决打死错的人**。
+ *
+ * ## 修法
+ *
+ * `refresh(forCredential?)` 多一个可选参数；适配器把**本轮凭据**传下去，
+ * 接线层按 access_token 反查它自己的 ref 再探测。
+ * ⚠️ 反查失败要**退回原行为**（探测默认号），不许凭空跳过探测。
+ */
+describe('★★ 探测针对本轮凭据，而非池默认号（审计 E-2）', () => {
+  const FRESH: LoomyCredential = { access_token: 'tok-mine', userid: 'um', phone: '13800000009' }
+  const OTHER: LoomyCredential = { access_token: 'tok-other', userid: 'uo', phone: '13800000008' }
+  const SSE = 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+
+  async function drain(adapter: LoomyAdapter) {
+    for await (const _chunk of adapter.stream({
+      provider: 'loomy', model: 'MiniMax-M3', messages: [{ role: 'user', content: 'hi' }],
+    } as never)) { /* drain */ }
+  }
+
+  it('★★ 适配器必须把**本轮凭据**传给 refresh（否则接线层只能猜）', async () => {
+    let received: LoomyCredential | undefined
+    const adapter = makeAdapter({
+      // 本地判过期 ⇒ 走前置探测分支（这样才会调 refresh）
+      resolveCredential: async () => ({ ...FRESH, expires_at: '1' }),
+      refresh: async (forCredential) => { received = forCredential },
+      fetchImpl: (async () => new Response(SSE, {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      })) as unknown as typeof fetch,
+    })
+
+    await drain(adapter)
+    expect(received, '必须把本轮凭据传下去（否则接线层只能探测池默认号）').toBeDefined()
+    expect(received?.access_token, '传的必须是**本轮**那一份').toBe('tok-mine')
+  })
+
+  it('★★ 反向对照：探测报终态且**针对的是本轮凭据** ⇒ 仍然抛（该重登的是我）', async () => {
+    const adapter = makeAdapter({
+      resolveCredential: async () => ({ ...FRESH, expires_at: '1' }),
+      refresh: async (forCredential) => {
+        // ⚠️ 只有「探测对象就是本轮这份」时才该把终态算到本轮头上
+        expect(forCredential?.access_token).toBe('tok-mine')
+        const error = new Error('Loomy 凭证已失效，请重新登录（缺少 token）')
+        error.name = 'RefreshTokenExpiredError'
+        throw error
+      },
+      fetchImpl: (async () => new Response(SSE, {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      })) as unknown as typeof fetch,
+    })
+
+    await expect(drain(adapter)).rejects.toThrow('凭证已失效')
+  })
+
+  it('★★ OTHER 号的存在不改变行为：本轮凭据决定一切', async () => {
+    // 这条锁的是「参数传递的语义」：无论池里还有谁，传给 refresh 的都必须是本轮这份。
+    const seen: string[] = []
+    const adapter = makeAdapter({
+      resolveCredential: async () => ({ ...FRESH, expires_at: '1' }),
+      refresh: async (forCredential) => { seen.push(forCredential?.access_token ?? '(none)') },
+      fetchImpl: (async () => new Response(SSE, {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      })) as unknown as typeof fetch,
+      accountPool: {
+        // 池里有另一个号（OTHER），且它是「默认号」—— 旧实现会探测它
+        findAccountIdByCredential: async () => '',
+        getAvailableAccount: async () => ({ entry: { id: 'acc-other' }, credential: OTHER }),
+        updateModelRateLimit: async () => {},
+      } as never,
+    })
+
+    await drain(adapter)
+    expect(seen, '传下去的必须是本轮凭据，而不是池默认号').toEqual(['tok-mine'])
+  })
+})

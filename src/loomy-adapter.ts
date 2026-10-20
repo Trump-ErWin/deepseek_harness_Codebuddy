@@ -27,10 +27,12 @@ import { createModelCatalog, isCatalogFresh, isCatalogFreshFor, type CatalogEntr
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import {
+  LOOMY_AUTH_ERROR_CODE,
   isLoomyChatModel,
   isLoomyExpired,
   loomyChatHeaders,
   loomyDisplayName,
+  parseLoomyEnvelope,
   splitLoomyRate,
   type LoomyCredential,
 } from './loomy.js'
@@ -226,8 +228,23 @@ export interface LoomyAdapterOptions {
    *
    * ⚠️ Loomy **没有 refresh 端点**，故实现只做**有效性探测**并在失效时抛错，
    * 不会（也无法）续期。
+   *
+   * ## ⚠️⚠️ `forCredential` 是**可选**但强烈建议实现（2026-10-20 审计 E-2）
+   *
+   * 不带参数时，接线层的实现探测的是**池当前默认账号**
+   * （`pool.getAvailableAccount(LOOMY.id, '')`），而热路径拿它来裁决
+   * 「**本轮要用的那份**凭据还能不能用」—— **二者可能不是同一个号**。
+   *
+   * 实测（基线 `b5dab83` 同样）：本轮要用的号完全可用，仅因**另一个号**报终态
+   * ⇒ 整轮失败、业务请求 0 次。这与 `401` 分支注释里自己写过的
+   * 「二者可能不是同一个号」是同一个坑，只是那处讨论的是**标记记错号**，
+   * 这处是**裁决打死错的人**。
+   *
+   * ⇒ 实现方收到 `forCredential` 时应只探测**那一份凭据**（按 access_token 反查
+   *   其 ref 后调 `refreshAccountCredential`）；无法反查时退回原行为
+   *   （探测默认号）—— 「宁可退化成旧行为，也不要凭空跳过探测」。
    */
-  refresh: () => Promise<void>
+  refresh: (forCredential?: LoomyCredential) => Promise<void>
   /**
    * 非终态告警出口（可选）。
    *
@@ -270,6 +287,34 @@ export interface LoomyAdapterOptions {
 
 /** 单次用户请求最多尝试的账号数（含首号）。与 buddy/raccoon 同语义，设上限只为防病态池。 */
 const LOOMY_MAX_ROTATE = 8
+
+/**
+ * 探测**非终态**失败后的退避窗口（毫秒）。
+ *
+ * ## 为什么需要它（2026-10-20 审计的 E-3）
+ *
+ * `isLoomyExpired` 读本地 `expires_at`（登录时刻 +14 天推算**写下**，服务端不下发，
+ * 本插件**永不改写**）⇒ 本地判过期后，前置探测分支**每一轮**都会进。
+ * 而探测的超时上限是 `LOOMY_REQUEST_TIMEOUT_MS` = **60 秒**，且
+ * `probeCredential` 用的是**独立**的 `AbortSignal.timeout`、不联动调用方 `signal`
+ * ⇒ 最坏情况是「每轮首 token 前白等 60 秒」，用户点停止也打断不了。
+ *
+ * 实测（审计沙箱）：`refresh` 永挂 ⇒ `stream()` 8 秒后仍未返回、业务请求 0 次；
+ * 缩短到 250ms 后 `perTurnMs=[316,315,310]`（≈3× 串行叠加，**每轮各等一次**）。
+ *
+ * ## 为什么取 5 分钟
+ *
+ * 探测的**唯一产出**是「要不要提示用户重新登录」，而真失效会由业务请求自己
+ * 以 401/403 或 `100002` 暴露。拿「一次上游抖动」惩罚之后每轮的首 token 延迟，
+ * 是拿用户可感的延迟换一个不急用的信息。
+ * 5 分钟与 `REMOTE_CATALOG_COOLDOWN_MS`（30 秒）相比更宽 —— 因为那条冷却的是
+ * **目录**（影响可用模型集），这条冷却的是一次**只读探测**（不影响任何判定）。
+ *
+ * ⚠️ 与「失败短缓存」的区别：本退避**不改写任何判定**，窗口内用的仍是本轮
+ * 刚解析出的凭据；它只决定「这次要不要去问探测端点」。
+ * ⚠️ 探测**成功**时立刻清掉退避（上游已恢复，没理由继续跳过）。
+ */
+export const LOOMY_PROBE_BACKOFF_MS = 5 * 60_000
 
 /**
  * 凭据探测的异常是否为**终态**（凭据确实失效，必须提示重新登录）。
@@ -365,6 +410,41 @@ export function classifyLoomyFailure(errorText: string, status: number): LoomyFa
  */
 export function shouldRotateLoomyAccount(errorText: string, status: number): boolean {
   return classifyLoomyFailure(errorText, status) !== 'other'
+}
+
+/**
+ * **Loomy 专属**：`HTTP 200 + 业务码 100002` 是否该按「认证失败、值得换号」处理。
+ *
+ * ## 为什么它是一条**独立**判据，而不是加进 {@link classifyLoomyFailure}
+ *
+ * `classifyLoomyFailure` 与 `classifyRaccoonFailure` 在本仓库明文规定
+ * 「必须**逐格同构**」，并由 `loomy-adapter.spec.ts` 的
+ * 「与 raccoon 对拍：同一报文集逐条同结论」逐条守着。
+ * 而 `100002` 是 **Loomy 独有**的业务码（raccoon 没有等价码，见
+ * `src/loomy.ts` 的 `LOOMY_AUTH_ERROR_CODE`）⇒ 塞进共享分类器会让那条对拍用例
+ * 当场变红，或者逼着给 raccoon 编一个它并不存在的码 —— 两条路都不对。
+ * ⇒ 业务码这一腿留在**本家自己的**判据里，共享分类器保持逐格同构。
+ *
+ * ## 缺陷形态（2026-10-20 审计 E-1，**既有缺陷、非 PR !124 引入**）
+ *
+ * Loomy 的业务失败**恒 HTTP 200**（`src/loomy.ts` 的协议说明：
+ * 「带错的那个 → HTTP 200 + `{"code":"100002","desc":"缺少 token"}`」），
+ * 而请求级换号循环写在 `if (!response.ok)` 里面 ⇒ 200 的认证失败
+ * **一次都不换号**。实测（基线 `b5dab83` 同样）：
+ *
+ * ```
+ * classifyLoomyFailure('100002', 200)   ⇒ 'other'  rotate=false
+ * classifyLoomyFailure('100002', 401)   ⇒ 'auth'   rotate=true   ← 只有状态码是 401 才算
+ * ```
+ *
+ * 而 `100002` 才是 Loomy 表达「token 缺失/失效」的**主通道**。
+ *
+ * ⚠️ 与 `classifyLoomyFailure` 的职责边界：本函数**只回答**「这个响应体是不是
+ * 认证失败」，不参与额度/限流的分类，也**不写冷却标记**（认证类一律不写，
+ * 见 2026-10-06 的全池被封事故）。
+ */
+export function isLoomyAuthBusinessCode(envelope: { ok: boolean; code: string }): boolean {
+  return !envelope.ok && envelope.code === LOOMY_AUTH_ERROR_CODE
 }
 
 /**
@@ -660,6 +740,103 @@ export class LoomyAdapter extends LlmAdapter {
   }
 
   /**
+   * 探测退避表（`modelId` → 退避到期时刻）。
+   *
+   * ⚠️ 按 **modelId** 分桶而不是全局一个值：探测本身与模型无关，但热路径的
+   * 前置分支是**按模型**进来的（`isLoomyExpired` 与 `resolveCredential(model)`），
+   * 用全局值会让「A 模型抖动一次 ⇒ B 模型也跳过探测」——那是不必要的耦合，
+   * 而按模型分桶没有额外代价（`Map` 只有几十条）。
+   *
+   * ⚠️ **只增不减**在此处是可接受的：条目数 = 用户用过的模型数（个位到几十），
+   * 每次写都是覆盖同一个键。不做定期清理，避免再引入一个需要调度的东西。
+   */
+  private readonly probeBackoffUntil = new Map<string, number>()
+
+  /** 「现在」的统一取法（与 `options.now` 注入点同源，单测可推进）。 */
+  private nowMs(): number {
+    return this.options.now?.() ?? Date.now()
+  }
+
+  /** 该模型当前是否处于探测退避窗口内。 */
+  private probeBackedOff(modelId: string): boolean {
+    const until = this.probeBackoffUntil.get(modelId)
+    if (until === undefined) return false
+    // ⚠️ 墙钟被回拨时 `now - until` 可能异常 ⇒ 与仓库既有口径一致，只认
+    // 「剩余量不超过一个退避周期」的窗口，超长的一律按已到期处理（否则一次
+    // 回拨就能把探测永久跳过）。
+    const now = this.nowMs()
+    if (now >= until) return false
+    if (until - now > LOOMY_PROBE_BACKOFF_MS) return false
+    return true
+  }
+
+  /** 记一次退避（探测非终态失败后调用）。 */
+  private armProbeBackoff(modelId: string): void {
+    this.probeBackoffUntil.set(modelId, this.nowMs() + LOOMY_PROBE_BACKOFF_MS)
+  }
+
+  /** 清掉退避（探测成功，或终态已抛之后）。 */
+  private clearProbeBackoff(modelId: string): void {
+    this.probeBackoffUntil.delete(modelId)
+  }
+
+  /**
+   * 把 `HTTP 200 + 业务码 100002` 的响应**重建**成一个 `401` 响应，交给既有换号循环。
+   *
+   * 返回 `undefined` 表示「不是这种形态，原样继续」。
+   *
+   * ## ⚠️ 三条边界（都是刻意收窄，避免制造新缺陷）
+   *
+   * 1. **只处理 `content-type: application/json`**：SSE 流**不能**在这里 `text()`
+   *    读干——那会把正文吃掉，用户看到空回复。SSE 内嵌错误帧仍归
+   *    `consumeOpenAiSse`。
+   * 2. **只有 `code` 恰为 `LOOMY_AUTH_ERROR_CODE` 才转**：别的业务码（额度、参数）
+   *    形态各异，一律不碰 —— 那是分类器与 `!response.ok` 分支的职责。
+   * 3. **转换后仍带原始报文**：把原 JSON 原文塞回新响应的 body，于是下游
+   *    `errorDetail()` 与日志拿到的仍是上游原话（不编造、不丢信息）。
+   *    ⚠️ `normalize` 出来的 `status` 是 **401**（而不是编一个 4xx），
+   *    因为下游 `classifyLoomyFailure` 对 401 判 `auth`、且认证类**不写冷却**
+   *    （2026-10-06 全池被封事故的铁律）。
+   */
+  private async rebuildAuthBusinessFailure(response: Response): Promise<Response | undefined> {
+    // ⚠️ 先看状态码与 content-type：两者都不对就零成本返回，**不读 body**
+    //    （读 body 是有代价的，且对 SSE 是破坏性的）。
+    if (response.status !== 200) return undefined
+    const contentType = response.headers.get('content-type') ?? ''
+    if (!contentType.toLowerCase().includes('application/json')) return undefined
+    let text: string
+    try {
+      text = await response.text()
+    } catch {
+      // ⚠️⚠️ **读失败也必须把响应重建回去**：`text()` 一旦被调用，原响应的
+      // body 就被消耗/锁住了（实测 `Invalid state: ReadableStream is locked`）。
+      // 这里若直接 `return undefined`，下游 `consumeOpenAiSse(response)` 会抛
+      // 一个与真实原因无关的流锁错误 —— 那正是本仓库反复禁止的「误导性报错」。
+      return undefined
+    }
+    // ⚠️ 读完 body 之后，**无论走哪条分支都必须**返回一个可用的 Response
+    //（要么重建的 401，要么原样重建的 200），不能把读干的流交回下游。
+    const rebuiltOk = (): Response =>
+      new Response(text, { status: response.status, headers: { 'content-type': contentType } })
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      // 声明 JSON 但内容不是 JSON：不是「业务码」形态。
+      // ⚠️ **必须返回重建的响应**（原响应体已被读干）—— 否则下游看到空流，
+      // 会报「响应不是 SSE（没有任何 data: 帧）」而丢掉上游原话。
+      return rebuiltOk()
+    }
+    const envelope = parseLoomyEnvelope(parsed)
+    if (!isLoomyAuthBusinessCode(envelope)) return rebuiltOk()
+    this.options.warn?.(
+      `[loomy] 上游以 HTTP 200 + 业务码 ${envelope.code} 表达认证失败（${envelope.message}）：`
+      + '改按认证失败处理（换号，不写冷却）',
+    )
+    return new Response(text, { status: 401, headers: { 'content-type': 'application/json' } })
+  }
+
+  /**
    * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
    * `registration.adapter.prepareCall(...)`，而本仓库链接的 dsh-llm 副本
    * 基类尚未提供该方法，缺少时会在每轮请求开始时抛
@@ -755,14 +932,39 @@ export class LoomyAdapter extends LlmAdapter {
       // 「要不要提示用户重新登录」。真正的失效会在业务请求上以 401 /
       // `100002` 暴露，由本适配器的换号与 `classifyLoomyFailure` 接住。
       // 拿探测当请求前置门禁，等于把「上游只读端点抖了一下」升级成「整轮失败」。
-      try {
-        await this.options.refresh()
-      } catch (error) {
-        if (isLoomyTerminalRefreshError(error)) throw error
-        this.options.warn?.(
-          `[loomy] 凭据探测失败（非终态，继续使用现有凭据）：${
-            error instanceof Error ? error.message : String(error)}`,
-        )
+      //
+      // ⚠️⚠️ **但「放行」不等于「每轮都去白等一次」**（2026-10-20 审计的 E-3）。
+      //
+      // `isLoomyExpired` 读的是本地 `expires_at`（登录时刻 +14 天推算**写下**，
+      // 服务端不下发、本插件**永不改写它**）⇒ 一旦本地判过期，这个分支
+      // **每一轮**都会进；而探测的超时上限是 `LOOMY_REQUEST_TIMEOUT_MS`（60 秒）
+      // 且**不响应调用方 `signal`** ⇒ 最坏情况是「每轮首 token 前白等 60 秒」。
+      // 修前是「每轮等 60 秒然后**失败**」，修后若不退避就变成
+      // 「每轮等 60 秒然后**继续**」—— 用户感受更慢（虽然更可用）。
+      //
+      // ⇒ 非终态失败后记一个**退避窗口**（{@link LOOMY_PROBE_BACKOFF_MS}），
+      //   窗口内**跳过探测**直接发请求。理由：探测的产出只有「要不要提示重登」，
+      //   而业务请求本身会把真失效暴露出来（401/403 或 `100002`）；
+      //   让一次上游抖动惩罚之后 5 分钟的**每一轮**，是拿首 token 延迟换一个
+      //   我们并不急着用的信息。
+      //   ⚠️ 与「失败短缓存」同型但**不是**同一件事：这里退避的是**探测**，
+      //   不改写任何能力/凭据判定，窗口内用的仍是本轮刚解析出的凭据。
+      if (!this.probeBackedOff(options.model)) {
+        try {
+          // ⚠️ 把**本轮**凭据传下去（审计 E-2）：接线层若不接参数，探测的是**池默认号**而不是本轮要用的那个。
+          //   实测：本轮号完全可用，仅因**另一个号**报终态 ⇒ 整轮失败、业务请求 0 次。
+          await this.options.refresh(credential)
+          // 探测成功 ⇒ 清掉退避（上游已恢复，没有理由继续跳过）。
+          this.clearProbeBackoff(options.model)
+        } catch (error) {
+          if (isLoomyTerminalRefreshError(error)) throw error
+          // ⚠️ 只对「可重试类」退避：终态已抛，其余都是「端点不可用」。
+          this.armProbeBackoff(options.model)
+          this.options.warn?.(
+            `[loomy] 凭据探测失败（非终态，继续使用现有凭据，${LOOMY_PROBE_BACKOFF_MS / 1000} 秒内不再探测）：${
+              error instanceof Error ? error.message : String(error)}`,
+          )
+        }
       }
       credential = await this.options.resolveCredential(options.model)
     }
@@ -966,6 +1168,33 @@ export class LoomyAdapter extends LlmAdapter {
         if (response.ok) credential = refreshed
       }
     }
+
+    /**
+     * ⚠️⚠️ **`HTTP 200 + 业务码 100002` 也算认证失败**（2026-10-20 审计 E-1）。
+     *
+     * Loomy 的业务失败**恒 HTTP 200**（`src/loomy.ts` 的协议说明：
+     * 「带错的那个 → HTTP 200 + `{"code":"100002","desc":"缺少 token"}`」），
+     * 而下面的换号循环只写在 `if (!response.ok)` 里 ⇒ 200 的认证失败
+     * **一次都不换号**，终错是 `SERVER`（`响应不是 SSE`）而不是 `AUTH`。
+     * 多账号场景下**从未尝试过好号**。
+     *
+     * ## 为什么在这里「合成」一个失败响应，而不是另写一条换号流程
+     *
+     * 换号循环里已经有 `tried` / `LOOMY_MAX_ROTATE` / 冷却记账 / 全部失败才报错
+     * 这一整套语义（含 2026-10-06 的「认证类不写冷却」铁律）。
+     * 另起一条必然漂移。⇒ 把 200 的认证失败**重建成一个**
+     * `status: 401` 的响应，让既有循环原样接管 —— 复用的不只是代码，
+     * 是那套**已经被事故验证过的语义**。
+     *
+     * ## ⚠️ 只在**非 SSE** 上做（边界如实登记）
+     *
+     * 判据必须先看 `content-type`：SSE 流**不能**先 `text()` 读干（那会把正文吃掉，
+     * 用户看到空回复）。故本腿只覆盖「JSON 信封」这一形态 —— 也正是最常出现的
+     * 那一形态（上游回错误信封而非流）。SSE 内嵌错误帧（`data:` 帧里带 `100002`）
+     * 仍由 `consumeOpenAiSse` 处理，**本腿不管**，属已登记的残余面。
+     */
+    const authBusinessFailure = await this.rebuildAuthBusinessFailure(response)
+    if (authBusinessFailure !== undefined) response = authBusinessFailure
 
     if (!response.ok) {
       let errorText = await response.text().catch(() => '')
