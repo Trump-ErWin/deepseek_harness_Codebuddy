@@ -116,13 +116,40 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
    *      但**不**与倒计时并排显示 —— 那正是误导的来源。
    */
   let earliestExpiringAmount = 0;
+  /**
+   * **独立池**的剩余量（`> 0` 时才填）。
+   *
+   * ⚠️ 为什么单独摘出来（2026-10-21 用户报障「没标注星火专属」）：
+   *    本家（AStudio）服务端给**两个互不相通**的池 —— 主池（会员/购买/赠送）
+   *    与星火池。星火那 25000 混进 `permanent` 桶后，主行只显示「永久 25000」，
+   *    用户会以为那是**能随便用的通用积分**，而它其实只能用于特定场景。
+   *    「能不能通用」这个信息只存在于**池名**里（`buildAstudioBalance` 起的名字
+   *    就叫「星火积分（独立池，不参与主池合计）」），而分桶按金额聚合、天然丢池名。
+   *
+   * ⚠️ 判据是**池名含「独立池」**，不是 provider 白名单：那个名字由
+   *    `src/astudio-credits.ts` 单一持有（上游自己写明了「不参与主池合计」），
+   *    认名字就不必为本仓每一种多池渠道各加一个分支。
+   */
+  let exclusivePoolRemaining = 0;
   for (const pkg of packages) {
     // 失效包跳过：服务端仍会返回它的余额，但那部分扣不到。
     if (!pkg || pkg.active !== true) continue;
     const remaining = Number(pkg.remaining);
     if (!Number.isFinite(remaining) || remaining <= 0) continue;
-    const end = Number(pkg.deductionEndTime);
-    const known = Number.isFinite(end) && end > 0;
+    // ⚠️⚠️ 必须走 {@link packageExpiryMs}（`deductionEndTime` > `expiredTime` 兜底），
+    //    不能直接读 `pkg.deductionEndTime` —— 本仓红线「同一语义不得两套判据」：
+    //    AStudio 的包**只给 `expiredTime`**（字符串，未归一化），直读会让全部包
+    //    落进 `permanent` 桶 ⇒ astudio 的分桶行整条不渲染（用户报障：
+    //    「25000 星火积分不显示」）。而 `formatPackageExpiry` / 包列表**排序**
+    //    早就走 packageExpiryMs，两边不一致会出现「显示说 11/01 到期、分桶说永久」。
+    // ⚠️ 独立池**先摘出再分桶**：它不参与三档中的任何一档（否则「永久 25000」
+    //    会被读成通用积分）。顺序必须在分桶之前 —— 摘出来后仍要 `continue`。
+    if (isExclusivePool(pkg)) {
+      exclusivePoolRemaining += remaining;
+      continue;
+    }
+    const end = packageExpiryMs(pkg);
+    const known = end !== null;
     if (!known) {
       // 服务端没给到期时间 ⇒ 真·永久（保守方向：宁可少用，不可误烧长期积分）。
       permanent += remaining;
@@ -137,7 +164,6 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
       //    **整段倒计时消失**，尽管桶里还有一笔钱几天后作废。
       //    ⚠️ 可达性不是假设：TRAE 的 `active` 是**硬编码 true**
       //    （`trae-credits.ts`），压根不反映是否过期。
-      //    `trae-credits.ts`），压根不反映是否过期。
       //    方向：宁可少显示倒计时，不可显示一个错的。
       if (end > at && (earliestExpiringAt === null || end < earliestExpiringAt)) {
         // ⚠️ 出现**更早**的批次 ⇒ 该量取代之前的（两批不是同一批，不能相加）。
@@ -151,7 +177,7 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
       longTerm += remaining;
     }
   }
-  return { expiring, longTerm, permanent, earliestExpiringAt, earliestExpiringAmount };
+  return { expiring, longTerm, permanent, earliestExpiringAt, earliestExpiringAmount, exclusivePoolRemaining };
 }
 
 /** 这个包属于哪一桶的中文标签（tooltip 前缀用）。 */
@@ -392,6 +418,22 @@ export function formatNamedPoolLine(packages, format) {
     parts.push(`${short} ${value}`);
   }
   return parts.length === 0 ? null : parts.join(' · ');
+}
+
+/**
+ * 这个包是不是**独立池**（不参与主池合计）。
+ *
+ * ⚠️ 判据是池名含「独立池」—— 该名字由 `src/astudio-credits.ts` 的
+ * `buildAstudioBalance` 单一持有（上游原话「独立池，不参与主池合计」）。
+ * 认名字而不是 provider 白名单：将来别家也有独立池时，只要后端照这个口径
+ * 命名就自动生效，不必为每家加分支。
+ *
+ * @param pkg - 资源包。
+ * @returns 是独立池则为 `true`。
+ */
+export function isExclusivePool(pkg) {
+  const name = pkg && typeof pkg.name === 'string' ? pkg.name : '';
+  return name.includes('独立池');
 }
 
 /**

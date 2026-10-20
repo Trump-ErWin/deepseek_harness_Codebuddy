@@ -80,18 +80,18 @@ function reduceFrontendToBackend(frontend: { expiring: number; longTerm: number;
 describe('splitCreditsByExpiry（前端三档分桶）', () => {
   it('15 天内到期算临期，更久算长期，无到期时间算永久', () => {
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 9 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 9 * DAY, earliestExpiringAmount: 100 })
+      .toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 9 * DAY, earliestExpiringAmount: 100, exclusivePoolRemaining: 0 })
     // ⚠️ 3008 天有**明确到期时间** ⇒ 长期（黄），不是永久（绿）。
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 3008 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0 })
+      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0, exclusivePoolRemaining: 0 })
     // 只有**服务端没给到期时间**才是真·永久。
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: undefined })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, longTerm: 0, permanent: 100, earliestExpiringAt: null, earliestExpiringAmount: 0 })
+      .toEqual({ expiring: 0, longTerm: 0, permanent: 100, earliestExpiringAt: null, earliestExpiringAmount: 0, exclusivePoolRemaining: 0 })
   })
 
   it('恰好 15 天归长期（判据是"不足 15 天"）', () => {
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 15 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0 })
+      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0, exclusivePoolRemaining: 0 })
   })
 
   it('失效包与零余额包不计入', () => {
@@ -99,7 +99,7 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
       pkg({ active: false, remaining: 999, deductionEndTime: NOW + DAY }),
       pkg({ remaining: 0 }),
       pkg({ remaining: 100, deductionEndTime: NOW + 20 * DAY }),
-    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0 })
+    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0, exclusivePoolRemaining: 0 })
   })
 
   it('到期时间未知归永久（保守方向）', () => {
@@ -107,7 +107,74 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
       pkg({ deductionEndTime: undefined }),
       pkg({ deductionEndTime: 0 }),
       pkg({ deductionEndTime: Number.NaN }),
-    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 0, permanent: 300, earliestExpiringAt: null, earliestExpiringAmount: 0 })
+    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 0, permanent: 300, earliestExpiringAt: null, earliestExpiringAmount: 0, exclusivePoolRemaining: 0 })
+  })
+
+  /**
+   * ⚠️ **独立池不进三档**（2026-10-21 用户报障「没标注星火专属」）。
+   *
+   * AStudio 的星火积分是服务端下发的独立池（`buildAstudioBalance` 的池名原话
+   * 「独立池，不参与主池合计」）。它若混进 `permanent`，主行只显示「永久 25000」
+   * ⇒ 用户会以为那是能随便用的通用积分，而它只能用于特定场景。
+   *
+   * ⇒ 摘出来单独给 `exclusivePoolRemaining`，三档一个子都不多算。
+   */
+  it('独立池（池名含「独立池」）摘出到 exclusivePoolRemaining，不进三档', () => {
+    expect(splitCreditsByExpiry([
+      pkg({ name: '赠送积分', remaining: 1900, deductionEndTime: NOW + 11 * DAY }),
+      pkg({ name: '星火积分（独立池，不参与主池合计）', remaining: 25000, deductionEndTime: undefined }),
+    ], WINDOW_DAYS, NOW)).toEqual({
+      expiring: 1900,
+      longTerm: 0,
+      permanent: 0,
+      earliestExpiringAt: NOW + 11 * DAY,
+      earliestExpiringAmount: 1900,
+      exclusivePoolRemaining: 25000,
+    })
+  })
+
+  it('独立池有到期时间也不进三档（判据只看池名，不看字段）', () => {
+    // 即便上游将来给独立池补了到期字段，它仍不是主池的一部分 ⇒ 仍须摘出。
+    expect(splitCreditsByExpiry([
+      pkg({ name: '赠送积分', remaining: 1900, deductionEndTime: NOW + 11 * DAY }),
+      pkg({ name: '星火积分（独立池，不参与主池合计）', remaining: 25000, deductionEndTime: NOW + 3 * DAY }),
+    ], WINDOW_DAYS, NOW)).toEqual({
+      expiring: 1900,
+      longTerm: 0,
+      permanent: 0,
+      earliestExpiringAt: NOW + 11 * DAY,
+      earliestExpiringAmount: 1900,
+      exclusivePoolRemaining: 25000,
+    })
+  })
+
+  it('失效的独立池不计入（active=false 与零余额都不算）', () => {
+    expect(splitCreditsByExpiry([
+      pkg({ name: '赠送积分', remaining: 1900, deductionEndTime: NOW + 11 * DAY }),
+      pkg({ name: '星火积分（独立池，不参与主池合计）', active: false, remaining: 25000 }),
+      pkg({ name: '另一独立池', remaining: 0 }),
+    ], WINDOW_DAYS, NOW)).toEqual({
+      expiring: 1900,
+      longTerm: 0,
+      permanent: 0,
+      earliestExpiringAt: NOW + 11 * DAY,
+      earliestExpiringAmount: 1900,
+      exclusivePoolRemaining: 0,
+    })
+  })
+
+  it('没有独立池时 exclusivePoolRemaining 为 0（现有 provider 逐字不变）', () => {
+    expect(splitCreditsByExpiry([
+      pkg({ name: '会员积分', remaining: 100, deductionEndTime: NOW + 11 * DAY }),
+      pkg({ name: 'Bonus Pack', remaining: 200, deductionEndTime: undefined }),
+    ], WINDOW_DAYS, NOW)).toEqual({
+      expiring: 100,
+      longTerm: 0,
+      permanent: 200,
+      earliestExpiringAt: NOW + 11 * DAY,
+      earliestExpiringAmount: 100,
+      exclusivePoolRemaining: 0,
+    })
   })
 
   /**
@@ -314,7 +381,7 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
     // 40 秒后越过 15 天线
     const later = NOW + 40_000
     const after = splitCreditsByExpiry(packages, WINDOW_DAYS, later)
-    expect(after).toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 15 * DAY + 30_000, earliestExpiringAmount: 100 })
+    expect(after).toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 15 * DAY + 30_000, earliestExpiringAmount: 100, exclusivePoolRemaining: 0 })
     expect(reduceFrontendToBackend(after!)).toEqual(backendSplit(packages, WINDOW_DAYS, later))
   })
 
@@ -342,7 +409,7 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
       pkg({ name: '签到奖励', remaining: 150, deductionEndTime: base + 30 * DAY }),
     ]
     expect(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base))
-      .toEqual({ expiring: 500, longTerm: 450, permanent: 0, earliestExpiringAt: base + 1 * DAY, earliestExpiringAmount: 500 })
+      .toEqual({ expiring: 500, longTerm: 450, permanent: 0, earliestExpiringAt: base + 1 * DAY, earliestExpiringAmount: 500, exclusivePoolRemaining: 0 })
     expect(formatExpirySplitLine(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base), v => String(v)))
       .toBe('长期 450 · 临期 500')
     // 与后端同规则（TRAE 复用 buddy 的分桶判据，不存在第二套标准）——
