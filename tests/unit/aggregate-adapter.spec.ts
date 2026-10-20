@@ -2935,11 +2935,16 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
       .toBe(1_000_000)
   })
 
-  it('★ 解析失败不得被缓存成「无窗口」（否则一次瞬时故障会固化 60 秒）', async () => {
-    // ⚠️ 与 `AGENTS.md` 的「`refreshable` 单向门」同一形态：把**这一次**没问出来
-    //    的结果缓存住，会让瞬时故障变成持续错误。方向必须是「失败不写缓存」。
+  it('★ 退化判决只活 30 秒：到期后上游恢复必须能拿到真值（不得固化成 60 秒）', async () => {
+    // ⚠️ 与 `AGENTS.md` 的「`refreshable` 单向门」同一形态：把**这一次**没问出来的
+    //    结果缓存住太久，会让瞬时故障变成持续错误。
+    //    ⚠️⚠️ 但**完全不缓存**同样是缺陷（用户 2026-10-20 报障）：候选池里只要有一个
+    //    渠道持续故障，每一轮请求都要重试它并等满超时（实测 8–16 秒/轮）。
+    //    ⇒ 现行契约：退化判决**也**记忆化，但只活
+    //    `AGGREGATE_CONTEXT_WINDOW_DEGRADED_TTL_MS`（30 秒），远短于目录 TTL。
     let fail = true
     let calls = 0
+    let fakeNow = 1_000
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
@@ -2953,28 +2958,36 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
         stream: () => { throw new Error('本用例不应调用 stream') },
       },
     } as never
-    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool(), now: () => fakeNow })
 
     await warmCatalog(adapter)
     // ① 抖动期间 ⇒ 兜底值。
     expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
       .toBe(200_000)
 
-    // ② 上游恢复。⚠️ 这里**不能**靠 `refreshCatalog` 清缓存（那会掩盖缺陷）——
-    //    必须证明「同一份目录下，下一次解析就能拿到真值」。
+    // ② 上游恢复，但**还没到**退化 TTL ⇒ 仍复用退化判决（这一条正是修复的收益：
+    //    不必每一轮都去重试那个坏候选）。
     fail = false
+    const before = calls
+    expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+      .toBe(200_000)
+    expect(calls, '退化判决有效期内不得重新解析候选').toBe(before)
+
+    // ③ 推过退化 TTL ⇒ 必须重新解析并采信真值。
+    //    ⚠️ 这里**不能**靠 `refreshCatalog` 清缓存（那会掩盖缺陷）——
+    //    必须证明「同一份目录下，TTL 一过就能拿到真值」。
+    fakeNow += 30_001
     expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
       .toBe(1_000_000)
-    expect(calls).toBeGreaterThanOrEqual(2)
   })
 
   it('★ 候选窗口能取到时，不因**另一个**候选解析失败而记忆化兜底值', async () => {
     // ⚠️ 与上一条同型但更隐蔽的第二面：窗口缓存的键是**虚拟模型**，与「哪个候选
-    //    失败了」无关 ⇒ 若失败也写缓存，**一个**候选的瞬时故障会污染整个虚拟模型
-    //    的声明值。这里让 codearts 一直失败、buddy 正常（1M）：
-    //    第一次就该给出 1M（可用候选的窗口），且**必须**在下一轮重新尝试 codearts
-    //    （上游恢复后它可能带来更大的窗口）。
+    //    失败了」无关 ⇒ 若失败时把**兜底值**写进缓存，**一个**候选的瞬时故障会污染
+    //    整个虚拟模型的声明值。这里让 codearts 一直失败、buddy 正常（1M）：
+    //    第一次就该给出 1M（可用候选的窗口），而不是 200K 兜底值。
     let codeartsFails = true
+    let fakeNow = 1_000
     const windows: Record<string, number | undefined> = {
       'buddy/deepseek-v4.1-flash': 1_000_000,
       'codearts/deepseek-v4.1-flash': 2_000_000,
@@ -2998,19 +3011,138 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
         stream: () => { throw new Error('本用例不应调用 stream') },
       },
     } as never
-    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool(), now: () => fakeNow })
 
     await warmCatalog(adapter)
     // ① codearts 抖动 ⇒ 用可用候选里的最大值（buddy 的 1M），不是兜底的 200K。
     expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
       .toBe(1_000_000)
 
-    // ② codearts 恢复 ⇒ 必须重试并采信它更大的窗口（证明上一步没被记忆化）。
+    // ② codearts 恢复，但退化 TTL 未到 ⇒ 仍是 1M（退化判决有效期内不重试）。
     codeartsFails = false
+    expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+      .toBe(1_000_000)
+
+    // ③ 推过退化 TTL ⇒ 必须重试并采信 codearts 更大的窗口。
+    fakeNow += 30_001
     const before = calls
     expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
       .toBe(2_000_000)
     expect(calls, '必须重新解析候选，而不是复用「失败时算出的」结果').toBeGreaterThan(before)
+  })
+
+  it('★★ 候选能力必须**并发**解析（串行时总耗时是全部候选之和）', async () => {
+    // ⚠️ 用户报障 2026-10-20：`aggregate/deepseek-v4-1-flash` 的候选池有 13 家，
+    //    串行解析时总耗时 = 各候选之和；其中一家（实测 autoclaw）在 DNS/TCP 层挂住
+    //    就把整轮拖满。本用例用「8 家各 60ms」把串行与并发区分开：
+    //    串行 ⇒ ≥480ms；并发 ⇒ ≈60ms。峰值在飞数是最稳的判据（不受机器快慢影响）。
+    const PROVIDERS = ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline']
+    const DELAY = 60
+    let inFlight = 0
+    let peak = 0
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => PROVIDERS.map((id) => ({ id, name: id })),
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async (provider: string, id: string) => {
+          inFlight += 1
+          peak = Math.max(peak, inFlight)
+          await new Promise((resolve) => setTimeout(resolve, DELAY))
+          inFlight -= 1
+          return { provider, id, context: { contextWindow: 1_000_000 } }
+        },
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, { accountPool: makePool() })
+
+    await warmCatalog(adapter)
+    const startedAt = Date.now()
+    const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    const elapsed = Date.now() - startedAt
+
+    expect(info.context?.contextWindow).toBe(1_000_000)
+    expect(peak, '候选之间必须并发（峰值在飞数应等于候选数）').toBe(PROVIDERS.length)
+    expect(elapsed, '并发时总耗时约等于单个候选的耗时，而不是它们的和').toBeLessThan(DELAY * 4)
+  })
+
+  it('★★ 单个候选的解析有独立预算：一家挂住不得拖满整轮', async () => {
+    // ⚠️ 用户报障 2026-10-20：autoclaw 的目录端点 ETIMEDOUT 21.6 秒，而它自己的
+    //    8 秒 `AbortController` 管不到 DNS/TCP 层 ⇒ 每轮请求都白等。
+    //    ⇒ `capabilityOf` 必须有**自己的**预算（默认 3 秒），不能等渠道自己的超时。
+    //    这里注入 40ms 预算 + 一个永不 resolve 的候选，断言整轮在预算量级内结束。
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }, { id: 'autoclaw', name: 'a' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async (provider: string, id: string) => {
+          // ⚠️ autoclaw 永不 resolve（模拟 DNS/TCP 层挂死，AbortController 管不到）。
+          if (provider === 'autoclaw') return new Promise(() => {})
+          return { provider, id, context: { contextWindow: 1_000_000 } }
+        },
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: makePool(),
+      capabilityTimeoutMs: 40,
+    })
+
+    await warmCatalog(adapter)
+    const startedAt = Date.now()
+    const info = await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    const elapsed = Date.now() - startedAt
+
+    // ① 预算内结束（不是无限等待）。
+    expect(elapsed, '挂住的候选必须在预算内被放弃').toBeLessThan(2_000)
+    // ② 结论仍取**已解析成功**那部分的最大值，不退化成兜底值。
+    expect(info.context?.contextWindow).toBe(1_000_000)
+  })
+
+  it('★★ 坏候选进 30 秒失败短缓存：TTL 内不再重复等它超时', async () => {
+    // ⚠️ 与上一条配对：只加预算不记失败 ⇒ 每轮仍白等一次预算（实测 8 秒/轮）。
+    //    本用例断言「同一 TTL 内第二次**不再调用**那个坏候选」。
+    let badCalls = 0
+    let fakeNow = 1_000
+    const ctx = {
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      llm: {
+        listProviders: () => [{ id: 'buddy', name: 'b' }, { id: 'autoclaw', name: 'a' }],
+        listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+        resolveModelInfo: async (provider: string, id: string) => {
+          if (provider === 'autoclaw') {
+            badCalls += 1
+            throw new Error('目录服务抖动')
+          }
+          return { provider, id, context: { contextWindow: 1_000_000 } }
+        },
+        stream: () => { throw new Error('本用例不应调用 stream') },
+      },
+    } as never
+    const adapter = new AggregateAdapter(ctx, {
+      accountPool: makePool(),
+      now: () => fakeNow,
+      // ⚠️ 窗口缓存的退化判决也是 30 秒 —— 两条路径都验证「不再重复解析」。
+      contextWindowDegradedTtlMs: 30_000,
+    })
+
+    await warmCatalog(adapter)
+    expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+      .toBe(1_000_000)
+    const afterFirst = badCalls
+    expect(afterFirst, '第一次必须真的问过那个坏候选').toBeGreaterThan(0)
+
+    // ② 直接问那个坏候选（绕开窗口缓存，只测失败短缓存本身）。
+    expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+      .toBe(1_000_000)
+    expect(badCalls, 'TTL 内的重复询问不得再打那个坏候选').toBe(afterFirst)
+
+    // ③ 推过失败 TTL ⇒ 必须重新尝试（上游恢复后要能纠正）。
+    fakeNow += 30_001
+    await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+    expect(badCalls, '失败 TTL 到期后必须重新解析').toBeGreaterThan(afterFirst)
   })
 
   it('★ 源码守卫：聚合适配器里不得再出现写死的 200_000 窗口', async () => {
