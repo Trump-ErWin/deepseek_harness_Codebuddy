@@ -1189,9 +1189,14 @@ const STYLES = `
    POC（2026-10-17）：本插件此前**只有弹窗内部**有 3 处 media 查询，主布局
    .dim-jh-layout 是写死的左右两栏且 .dim-jh-rail 固定 228px —— 手机宽度约
    400px 时右面板只剩约 76px 可用，于是面板被压成一条窄缝、操作按钮被裁断、
-   中文提示逐字竖排（用户报障「手机端界面割裂」）。
+   中文提示逐字竖排。
    修法：窄屏下改为**上下两段** —— 左栏降级为顶部横向可滑动的标签条，
    右面板获得整宽。**只新增本块，不改任何既有规则**（故 228px 那条断言不受影响）。
+   ⚠️ **范围限定**（2026-10-20 审计订正）：本块只解决**本插件 settings 面板
+   自身**的两栏布局问题。装了「把 DSH Web 包成手机 App」的外壳插件（如
+   dsh-mobile）时，外壳接管的是**页面级**布局（替换宿主 root 槽位），本插件
+   面板会以 drawer / surface 的形态呈现 —— 那种场景下的整体观感不由本块决定。
+   故原描述里「解决手机端界面割裂」这个全局宣称已收窄。
    ⚠️ 本文件是模板字符串，本注释内不得出现反引号。 */
 @media (max-width: 720px) {
   .dim-jh-layout { flex-direction: column; }
@@ -1213,61 +1218,82 @@ const STYLES = `
 }
 
 /* ── 窄屏：用量浮层（聊天输入区那枚徽标展开的面板）──
-   POC（2026-10-17，报障「对话框的这里 ui 也需要适配」，附窄屏截图）：
-   现象是浮层**左边缘被裁** —— 账号名首部被吃掉、分桶说明只剩右半截、
-   按钮文案被截断。
-   根因（无头 Edge 实测，徽标靠左时）：
-     VW=492 badge=134~151 pop=-89~151 w=240 L_OVER=true
-   即 .dim-jh-badgePop 的内联定位 right:0 以**徽标**为锚点向左展开
-   （见 usage-badge.js 的 POPOVER_ANCHOR_STYLE），而窄屏下徽标位于 composer
-   左侧 ⇒ 向左展开必然越出视口左边界。
-   ⚠️ 内联样式优先级高于普通规则，故这里**必须**用 !important 才能覆盖它
-   （这也是该浮层唯一一处需要 !important 的地方）。
-   ⚠️⚠️ **必须同时覆盖 bottom** —— 这是实测出来的，不是推理：
-   内联那份是 bottom: calc(100% + 8px)，它相对**定位祖先**计算。一旦改成
-   position: fixed，那个百分比的含义就从「composer 高度」变成「视口高度」，
-   实测浮层被推到 top=-193（OFFSCREEN=true，整块飞出屏幕上方）。
-   ⇒ 窄屏下改为视口锚定：左右各留 8px（横向永不越界），
-   纵向**停在输入区上方**（bottom 留出 composer 高度），而不是贴屏幕底 ——
-   贴底会盖住输入框，那是另一个形态的「割裂」（原设计本就是浮在输入区上方）。
-   88px 是手机端 composer（一行输入 + 工具条）的实测高度量级，
-   再加 safe-area 让全面屏底部手势区不压到浮层。
-   修法后实测（VW=492x808）：
-   pop L=8 R=484 T=525 B=800 z=300，H_CUT=false V_CUT=false，
-   合计读数与账号名两端均完整。
+   POC（2026-10-17，报障「对话框的这里 ui 也需要适配」，附窄屏截图）。
+   ⚠️ 2026-10-20 审计整改：本块的**根因描述与 z-index 论证都被推翻重写**，
+   下面每一段都标了「已订正」。原描述保留在末尾的「历史」段里供追溯。
+
+   ## 已订正 ①：真正的失效机制不是「左边缘被裁」
+   原描述说窄屏下浮层左边缘越出视口 89px。按宿主**真实** composer 布局复刻
+   PRE-PR 形态实测：徽标在 .uV2eYG_trailing 里（该行有 margin-left: auto）
+   ⇒ 徽标靠**右**（VW=492 时 L=334 R=468），浮层向左展开 220px 得
+   popL=248 ⇒ **完全没有越界**。原描述里 badge=134~151（靠左）在宿主布局中
+   不成立。⇒ 本块的真实收益是「浮层改为视口锚定、不再跟着徽标跑，且更宽」，
+   不是「修裁切」。
+
+   ## 已订正 ②：真正需要 CSS 兜底的是**旧内核的 containing block 偏差**
+   宿主 composer 工具行 .uV2eYG_row 带 container-type: inline-size，而徽标
+   是它的后代。实测两引擎行为不同：
+     - Chromium 154：inline-size containment 只含 inline 轴，**不**创建 fixed
+       的 containing block ⇒ fixed 仍按视口锚定（符合规范）；
+     - Edge 122：把它当 layout containment ⇒ fixed 改为**相对该祖先**定位
+       ⇒ left/right/bottom 全变成「相对 composer 行」的坐标，浮层跟着 composer
+       跑、宽度被压缩（实测 popLeft 24→124、width 476→344）。
+   ⇒ 只靠 CSS 无法在旧内核上做视口锚定，故窄屏浮层改由 usage-badge.js
+   **portal 到 document.body**（body 之上无 containment 祖先，两引擎都按视口
+   锚定）。本块仍保留全部承重声明作**兜底**：内联样式一旦被改坏，这里还能挡住。
+
+   ## 已订正 ③：bottom 必须用宿主的 composer 高度变量，不能硬编码
+   宿主用 ResizeObserver 把真实 composer 高度写进 --dsh-composer-height
+   （dsh-client-ui-conversation 的 ConversationContent），其 CSS fallback 是
+   **152px**（宿主三处都写 var(--dsh-composer-height,152px)）。
+   原实现硬编码 88px —— 实测 composer=152px 时浮层**压住输入区 64px**，并
+   **盖住「用量」徽标按钮**（命中测试点到的不是按钮，是浮层内的 DIV）
+   ⇒ 用户点不到。改用变量后 gap=0、徽标可点（两引擎、多档 composer 高度均实测）。
+   ⚠️ 该变量能被浮层继承：CSS 变量沿 **DOM 祖先链**继承，与定位方式无关；
+   portal 到 body 后 body 仍在 scroller 的**兄弟**位置？—— 不是，body 是共同祖先，
+   故变量照样继承得到（已实测 popover 侧 getComputedStyle 读到 152px/220px）。
+
+   ## 已订正 ④：z-index 的区间是 (1101, 3000)，不是 (250, 1000)
+   原论证的下限 250 只考虑了**外部外壳**（dsh-mobile），漏了**宿主自己**：
+     - 宿主 79 处 z-index 里有 **6 处 1100**（chat 的 bRhRbq_panel、
+       conversation 的 JObwrW_panel【composer 里的 ContextMeter，与徽标同一行】、
+       model-selection 的 _7KE1Ra_menu【与徽标同一行的模型选择菜单】、
+       plugin-manager、schedule ×2）；
+     - 另有 **3 处全屏 overlay**：attachment 1000、settings-general 1000、
+       settings-account 1001（还有 onboarding 900）。
+   浮层若取 300，上述任一出现就把浮层整块盖住。
+   原上限 1000 的锚点 .dim-jh-loginOverlay 是**死规则**：全仓 className 用法
+   0 命中、git 历史从未渲染过（只剩一条 CSS + 注释）；且它与浮层**不在同一
+   stacking context**（分属 settings 页树与 composer 树，两树中间的
+   .dim-jh-page/.dim-jh-layout/.dim-jh-rail/.dim-jh-panel 全无 z-index）
+   ⇒ z-index 本就不可比。
+   ⇒ 改为按**真正同族**的 .dim-jh-modalOverlay(3000) 定上限，按宿主最高
+   overlay(1001) 与 ContextMeter(1100) 定下限 ⇒ 取 **1200**（(1101, 3000) 内）。
+   另注：dsh-mobile 的 [data-shell-overlay] 恰好是 z-index:300（带 !important），
+   原取值与它**完全相等** ⇒ 同层级时后出现的 DOM 胜出，不可预测；1200 也消除了这点。
+
    ⚠️ 本注释内**不得出现反引号**：本文件整体是模板字符串，反引号会提前闭合它
    （AGENTS.md 红线；本文件的 usage-badge-client.spec.ts 有专条用例逐块扫描注释）。
 
-   ⚠️⚠️ **z-index 为什么是 300**（不是随手取的数）：
-   本插件常与「把 DSH Web 包成手机 App」的**外壳类插件**同用（不在本仓库，
-   例如 dsh-mobile，其仓库为 github.com/saya-ch/dsh-mobile）。这类外壳在窄屏下
-   会**接管整个页面布局**，并自带两套层级：
-
-     ① 服务端替换 layout 模块那一套（.dshm-shell 体系）：
-        scrim 65 / drawer 70 / details 80 / overlay 90；
-     ② App 适配模式那一套（NATIVE_MOBILE_STYLES，全带 !important）：
-        backdrop 235 / sidebar 240 / sidebar-root 241 / details 250 / toast 330。
-
-   浮层内联只有 40，两套都比它高 ⇒ 抽屉一拉开就把浮层盖住。取 **300** 的判据是
-   **两头都要满足**：
-     - 下限：> 250（压过 ② 里最高的 details），否则 App 适配模式下仍被盖；
-     - 上限：< 1000（本文件的 .dim-jh-loginOverlay 是 1000、.dim-jh-modalOverlay
-       是 3000）—— 浮层绝不能盖住自己的登录页与设置弹窗。
-   区间 (250, 1000) 内的取值即可；300 取在下沿附近，给宿主侧将来插入新层留余量。
-   ⚠️ 证据等级：65/70/80/90 与 235/240/241/250 是**读源码实测**（dsh-mobile 0.6.12）；
-   「在真机上浮层是否真的不被盖」**未在真机量化验证**，只做过无头浏览器视口模拟
-   （页面左侧压一个 z-index 70 的抽屉时 ABOVE=true）。 */
+   ## 历史（已推翻，勿据此改回）
+   原描述：根因是「VW=492 badge=134~151 pop=-89~151 L_OVER=true」；取 300 的
+   理由是「下限 > 250 压过 dsh-mobile details、上限 < 1000 因为
+   .dim-jh-loginOverlay 是 1000」；bottom 硬编码 88px。上述三处均已订正。 */
 @media (max-width: 720px) {
   .dim-jh-badgePop {
     position: fixed !important;
     left: 8px !important;
     right: 8px !important;
     top: auto !important;
-    bottom: calc(env(safe-area-inset-bottom, 0px) + 88px) !important;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + var(--dsh-composer-height, 152px)) !important;
     width: auto !important;
     max-width: none !important;
-    max-height: calc(100vh - 140px) !important;
-    z-index: 300 !important;
+    /* ⚠️ 100dvh 而不是 100vh：移动端地址栏收放会让 100vh 与真实可视高度脱节。
+       外加 max(120px, ...) 下限 —— 原写法在 vh<=140 时算出 0 或负值，实测
+       vh=120 时 max-height 被压成 0px（浮层完全不可见却仍占位）、
+       vh=60 时整块飞出屏幕上方。 */
+    max-height: max(120px, calc(100dvh - 160px)) !important;
+    z-index: 1200 !important;
   }
 }
 

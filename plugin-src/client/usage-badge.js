@@ -26,6 +26,7 @@
  */
 
 import * as React from 'react';
+import { createPortal } from 'react-dom';
 
 import { supportsCreditBalance, supportsDailyCheckin, checkinProviders } from './credits-capabilities.js';
 import { AGGREGATE_PROVIDER_ID, AUTO_PROVIDER_ID, resolveBadgeProvider } from './badge-model.js';
@@ -78,6 +79,125 @@ const POPOVER_ANCHOR_STYLE = Object.freeze({
   overflowY: 'auto',
   zIndex: 40,
 });
+
+/**
+ * 窄屏断点：**必须与样式表里的 `@media (max-width: 720px)` 逐字一致**。
+ *
+ * ⚠️⚠️ 这是**两处同义判据**（JS 常量 + CSS media），本仓库对这类重复有明令：
+ * 要么合并、要么写一条对拍用例锁住。这里**不能合并** —— CSS 的 media 查询
+ * 与 JS 的 `matchMedia` 是两个运行时的两个机制，无法共用一个字面量。
+ * ⇒ 由 `usage-badge-client.spec.ts` 的「窄屏断点两处一致」用例对拍锁死
+ * （从 `jet-hub-styles.js` 正则取出 720px，与本常量比对）。
+ *
+ * ⚠️ **为什么窄屏要走 portal**（Issue IKP38Q 审计，2026-10-20）：
+ * 宿主 composer 的工具行 `.uV2eYG_row` 带 `container-type: inline-size`
+ * （见 `dsh-client-ui-conversation` 的 `InputBar.module.css`），而徽标挂在
+ * `conversation.input.right` 槽位、正是它的后代。
+ *
+ * - **Chromium 154**：`inline-size` containment 只含 inline 轴，**不**创建
+ *   fixed 的 containing block ⇒ `position: fixed` 仍按视口锚定。
+ * - **Edge 122（以及同代国产内核 / 旧 Android WebView）**：实测把
+ *   `container-type: inline-size` 当成 layout containment ⇒ `position: fixed`
+ *   改为**相对该祖先**定位 ⇒ 窄屏那套 `left/right: 8px` + `bottom: …`
+ *   全部变成「相对 composer 行」的坐标，浮层跟着 composer 跑、宽度被压缩。
+ *   实测读数：`popLeft` 24→124、`width` 476→344（祖先平移 100px 时），
+ *   而 Chromium 154 上位移恒为 0。
+ *
+ * ⇒ **只靠 CSS 无法在旧内核上做视口锚定**，故窄屏改为 portal 到
+ * `document.body`：body 之上没有任何带 containment/transform 的祖先，
+ * 两种引擎下 `fixed` 都按视口锚定。
+ *
+ * ⚠️ **宽屏刻意不 portal**：宽屏浮层靠内联的 `right: 0` 锚在徽标上
+ * （`POPOVER_ANCHOR_STYLE`），一旦挂到 body，这个锚定就失效、必须改成
+ * JS 计算坐标 —— 那是把一个「已知工作正常」的路径换成需要持续跟随滚动/
+ * resize 的实现，风险大于收益。宽屏的祖先链上没有 fixed 依赖，保持原样。
+ */
+export const NARROW_BREAKPOINT_PX = 720;
+
+/** `@media (max-width: 720px)` 的 JS 镜像判据（供 portal 决策用）。 */
+function isNarrowViewport() {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  return window.matchMedia(`(max-width: ${NARROW_BREAKPOINT_PX}px)`).matches;
+}
+
+/**
+ * 窄屏浮层的**视口锚定内联样式**（portal 到 body 后使用）。
+ *
+ * ⚠️ 这里**不用 `!important`**：一旦 portal 到 body，浮层就不再是
+ * `.dim-jh-badgePop` 在徽标子树里的那个实例，而是 body 的直接子节点 ——
+ * 样式表里那些「窄屏覆盖」规则（`.dim-jh-badgePop { … !important }`）
+ * **照样命中**（类名没变、选择器是全局的），但内联样式优先级更高，
+ * 故此处必须把窄屏需要的每一条都内联齐全，不能依赖样式表。
+ *
+ * 与样式表窄屏块的**分工**（刻意重复一部分，理由如下）：
+ * - 定位与尺寸的**承重条**（position/left/right/top/bottom/width/maxWidth/
+ *   maxHeight/zIndex）**两处都写** —— 内联保证「样式表缺失时也不撑坏宿主」
+ *   （IKKGYN 老事故），样式表保证「内联被改坏时仍有兜底」。
+ * - 纯外观（圆角/背景/阴影/padding）仍只在样式表里。
+ *
+ * ⚠️ `bottom` 必须用宿主的 `--dsh-composer-height`（fallback 152px）：
+ * 宿主用 ResizeObserver 把 `seat.offsetHeight` 实时写进该变量
+ * （`dsh-client-ui-conversation` 的 `ConversationContent`）。硬编码任何数字
+ * 都会与真实 composer 高度脱节 —— 实测 composer=152px 时写死 88px 会让
+ * 浮层压住输入区 64px，并**盖住「用量」徽标按钮**（命中测试点到的不是按钮）。
+ *
+ * ⚠️⚠️ **portal 会让这个变量读不到**（实测，必须靠 {@link readComposerHeightPx} 补救）：
+ * 宿主把变量写在 `seat.parentElement` 的**内联 style** 上（见宿主的
+ * `seatResizeRef`），而 CSS 变量只沿 **DOM 祖先链**继承。浮层 portal 到
+ * `document.body` 后，那个 scroller 是它的**兄弟**而非祖先 ⇒ `var()`
+ * 取不到值、只能落 fallback 152px（实测：portal 后 computed 变量为空）。
+ * 故 portal 时把实测值写成浮层自己的内联 `--dsh-composer-height`。
+ */
+const NARROW_POPOVER_STYLE = Object.freeze({
+  position: 'fixed',
+  left: 8,
+  right: 8,
+  top: 'auto',
+  bottom: 'calc(env(safe-area-inset-bottom, 0px) + var(--dsh-composer-height, 152px))',
+  width: 'auto',
+  maxWidth: 'none',
+  maxHeight: 'max(120px, calc(100dvh - 160px))',
+  overflowY: 'auto',
+  zIndex: 1200,
+});
+
+/** 宿主变量缺失时的兜底高度（与宿主 CSS 的 fallback 逐字一致）。 */
+const COMPOSER_HEIGHT_FALLBACK_PX = 152;
+
+/**
+ * 从**祖先链**上读宿主的 composer 高度（px）。
+ *
+ * ⚠️ 为什么不能只靠 CSS `var()`：见 {@link NARROW_POPOVER_STYLE} 的注释 ——
+ * portal 到 body 后浮层不在宿主 scroller 的子树里，变量继承断链。
+ *
+ * ⚠️ 为什么从 `anchor` 往上找而不是读 `document.body`：宿主把变量写在
+ * `seat.parentElement`（一个普通 div）的**内联 style** 上，不是 `:root`。
+ * 故必须沿祖先链逐级 `getComputedStyle` 找第一个有值的元素。
+ *
+ * ⚠️ **必须用 `getComputedStyle` 而不是 `element.style.getPropertyValue`**：
+ * 宿主写的是内联 style，理论上两者都读得到；但上游（或别的插件）也可能
+ * 通过样式表设置它，`getComputedStyle` 是唯一能同时覆盖两种来源的读法。
+ *
+ * @param anchor 徽标根节点（宿主 scroller 在它的祖先链上）。
+ * @returns 高度（px）；读不到时返回 {@link COMPOSER_HEIGHT_FALLBACK_PX}。
+ */
+function readComposerHeightPx(anchor) {
+  if (typeof window === 'undefined' || typeof window.getComputedStyle !== 'function') {
+    return COMPOSER_HEIGHT_FALLBACK_PX;
+  }
+  let node = anchor;
+  while (node !== null && node !== undefined) {
+    const raw = window.getComputedStyle(node).getPropertyValue('--dsh-composer-height').trim();
+    if (raw !== '') {
+      const parsed = Number.parseFloat(raw);
+      // ⚠️ 只接受有限正数：宿主在首帧可能写入 '0px' 或空串，那会让浮层贴底
+      // （盖住输入框），比 fallback 更糟。
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    node = node.parentElement;
+  }
+  return COMPOSER_HEIGHT_FALLBACK_PX;
+}
 
 /**
  * 轮询间隔：60 秒。宿主侧还有 TTL 缓存（成功 120s / 全部失败 15s），故真实的
@@ -525,16 +645,26 @@ function UsageBadgeActive(props) {
    * 本机 CDP 实测：删掉签名样式表后，关掉再打开浮层、切 provider 重挂载，
    * 样式表都是 0 份，只有整页重载才恢复。
    *
-   * ⚠️ 定位自检**独立于样式表**：定位已内联（{@link POPOVER_ANCHOR_STYLE}），
-   * 这里断言的是「内联那几条确实生效」—— 不成立就说明有人改坏了它们，
-   * 早报一条 warn 比等用户截图便宜得多。
+   * ⚠️ 定位自检**独立于样式表**：定位已内联（宽屏 {@link POPOVER_ANCHOR_STYLE}、
+   * 窄屏 {@link NARROW_POPOVER_STYLE}），这里断言的是「内联那几条确实生效」——
+   * 不成立就说明有人改坏了它们，早报一条 warn 比等用户截图便宜得多。
+   *
+   * ⚠️⚠️ **两种定位都是合法的**（Issue IKP38Q 审计修复）：窄屏浮层 portal 到
+   * `document.body` 并用 `position: fixed` 做视口锚定 ⇒ 旧判据
+   * （只认 `absolute`）会在**每一次**打开浮层时打一条「检查
+   * POPOVER_ANCHOR_STYLE 是否被改坏」的假 warn，把真正的改坏淹没掉。
+   * 判据改为「`absolute` 或 `fixed` 均可」—— 两者都脱离了普通文档流，
+   * 都不会撑高宿主输入区（IKKGYN 要防的正是「退化成普通块」）。
+   * 真正的危险形态是 `static` / `relative` / 空值，那些仍然会报。
    */
   React.useEffect(() => {
     ensureJetHubStyles();
     if (!open) return;
     const element = popRef.current;
-    if (element !== null && window.getComputedStyle(element).position !== 'absolute') {
-      console.warn('[jet-hub] 浮层未处于绝对定位：会撑高输入区（检查 POPOVER_ANCHOR_STYLE 是否被改坏）');
+    if (element === null) return;
+    const position = window.getComputedStyle(element).position;
+    if (position !== 'absolute' && position !== 'fixed') {
+      console.warn(`[jet-hub] 浮层定位异常（position=${position}）：会撑高输入区（检查 POPOVER_ANCHOR_STYLE / NARROW_POPOVER_STYLE 是否被改坏）`);
     }
   }, [open]);
 
@@ -611,8 +741,23 @@ function UsageBadgeActive(props) {
   // 点弹窗外面 / 按 Esc 关闭（仅在展开时挂监听）。
   React.useEffect(() => {
     if (!open) return undefined;
+    /**
+     * ⚠️⚠️ 「点里面」的判据**必须同时看浮层自己**（Issue IKP38Q 审计修复）。
+     *
+     * 窄屏浮层已 portal 到 `document.body`，它**不再是 `root`（`.dim-jh-badge`）
+     * 的 DOM 后代** ⇒ 只看 `root.current.contains(event.target)` 会把
+     * 「点浮层内部」误判成「点外面」⇒ 浮层里**任何一次点击都立刻关闭它**，
+     * 签到按钮 / 刷新按钮 / 偏好切换**全部点不动**。
+     *
+     * 故判据改为「既不在 root 内、也不在浮层内」才算点外面。
+     * 宽屏浮层仍在 root 子树内，`root.contains` 一条就够 —— 但两条并集对
+     * 两种形态都正确，故不按视口分叉（少一个同义判据）。
+     */
     const onDown = (event) => {
-      if (root.current !== null && event.target instanceof Node && !root.current.contains(event.target)) setOpen(false);
+      if (!(event.target instanceof Node)) return;
+      const insideRoot = root.current !== null && root.current.contains(event.target);
+      const insidePop = popRef.current !== null && popRef.current.contains(event.target);
+      if (!insideRoot && !insidePop) setOpen(false);
     };
     const onKey = (event) => { if (event.key === 'Escape') setOpen(false); };
     document.addEventListener('mousedown', onDown);
@@ -1037,14 +1182,62 @@ function UsageBadgeActive(props) {
         : '正在读取用量…（首次要逐账号查询，可能要几秒）'));
       // 签到不依赖本渠道的读数，故首屏也放出来（用户可能就是想先签到）。
       children.push(renderClaim());
-      return React.createElement('div', { className: 'dim-jh-badgePop', style: POPOVER_ANCHOR_STYLE, ref: popRef }, children);
+      return wrapPopover(children);
     }
 
     children.push(renderSubscription());
     children.push(renderCredits());
     children.push(renderClaim());
     children.push(renderFoot());
-    return React.createElement('div', { className: 'dim-jh-badgePop', style: POPOVER_ANCHOR_STYLE, ref: popRef }, children);
+    return wrapPopover(children);
+  }
+
+  /**
+   * 把浮层内容包成 DOM，并按视口宽窄决定**挂在哪棵树上**。
+   *
+   * | 视口 | 锚定方式 | 挂载点 | 理由 |
+   * |---|---|---|---|
+   * | 宽屏 | 内联 `absolute; right:0`，锚在徽标上 | 徽标子树内（原样） | 已知工作正常，不引入坐标计算 |
+   * | 窄屏 | 内联 `fixed` + 视口四边 | **portal 到 `document.body`** | 见 {@link NARROW_BREAKPOINT_PX} 的长注释：旧内核会把祖先的 `container-type` 当 layout containment ⇒ 子树内的 `fixed` 会相对 composer 定位 |
+   *
+   * ⚠️ **portal 必须带 `key`**：React 的 portal 是一个合法的 child，但在
+   * 数组里与普通元素混排时要能稳定 reconcile，否则开关浮层会重建 DOM 树。
+   *
+   * ⚠️ **`document.body` 不存在时回退子树内渲染**：客户端模块在 SSR /
+   * 预渲染阶段可能拿到 `undefined`，直接 `createPortal(node, undefined)` 会抛。
+   * 回退是安全的 —— 那种环境没有真实布局，视口锚定无从谈起。
+   *
+   * ⚠️⚠️ **portal 后必须把 composer 高度显式补到浮层自己身上**
+   * （见 {@link readComposerHeightPx}）：宿主的 `--dsh-composer-height` 写在
+   * `seat.parentElement` 的内联 style 上，而浮层挂到 body 后**不再继承**它
+   * ⇒ `var()` 只能落 fallback 152px，真实 composer 更高时浮层会压住输入区。
+   * 故这里把实测值写成浮层的内联自定义属性（内联变量优先于继承值，
+   * 两种渲染路径都正确）。
+   */
+  function wrapPopover(children) {
+    const narrow = isNarrowViewport();
+    if (!narrow) {
+      return React.createElement('div', {
+        className: 'dim-jh-badgePop',
+        style: POPOVER_ANCHOR_STYLE,
+        ref: popRef,
+      }, children);
+    }
+    // 窄屏：先把宿主 composer 高度读到浮层自己身上，再 portal。
+    const composerHeight = readComposerHeightPx(root.current);
+    const style = {
+      ...NARROW_POPOVER_STYLE,
+      // ⚠️ React 的内联样式对自定义属性（`--x`）是原样下发的，故这里可以
+      // 直接用 CSS 变量名作 key。
+      '--dsh-composer-height': `${composerHeight}px`,
+    };
+    const node = React.createElement('div', {
+      className: 'dim-jh-badgePop',
+      style,
+      ref: popRef,
+    }, children);
+    if (typeof document === 'undefined' || document.body === null || document.body === undefined) return node;
+    return createPortal(node, document.body, 'jet-hub-badge-pop');
   }
 
   /**

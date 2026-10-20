@@ -49,7 +49,22 @@ function panelBody(): string {
  * 后者在宽屏区出现一次、窄屏区又一次，按它切会把宽屏那份也吞进来，
  * 于是「窄屏里不得出现 228px」的反向断言会**恒假红**。
  *
- * @returns 从窄屏注释标题起、到该 media 块结束的规则文本（不含宽屏部分）。
+ * ## ⚠️⚠️ 2026-10-20 审计整改：本 helper 原版有 3 处假绿
+ *
+ * 变异测试实测（变异后 154 条用例**全绿**）暴露的问题与修法：
+ *
+ * 1. **整段被 `/* *\/` 注释掉 ⇒ 全绿**；**media 条件改成 `max-width: 1px`
+ *    （永不命中）或 `min-width: 720px`（笔误）⇒ 全绿**。
+ *    ⇒ 修法：返回**已剥注释**的文本，并由调用方显式断言 media 条件。
+ * 2. **空块时反向断言恒绿**。⇒ 锚点守卫保留，且正向断言先跑。
+ *
+ * ⚠️ 还有一条**不在本 helper 里**、但同源的假绿：原用例的
+ * `toMatch(/\.dim-jh-rail \{[\s\S]*?width: auto/)` 的 `[\s\S]*?` 会**越过
+ * 选择器的闭合花括号**，命中的是块内后面 `.dim-jh-provider { width: auto }`
+ * 的字面量 ⇒ 删掉 rail 的 `width: auto` 全绿。⇒ 修法见调用方：改用
+ * `[^}]*`（不跨花括号）做块内匹配。
+ *
+ * @returns 从窄屏注释标题起、到下一段注释标题前的**已剥注释**规则文本。
  */
 function narrowScreenBlock(styles: string): string {
   const start = styles.indexOf('── 窄屏（手机')
@@ -57,7 +72,32 @@ function narrowScreenBlock(styles: string): string {
   // 结束锚点取「用量浮层那一段的注释标题」——它紧随其后，是**下一个**独立段落。
   const end = styles.indexOf('── 窄屏：用量浮层', start)
   expect(end, '找不到浮层窄屏段的注释标题（用于界定上一段的结束）').toBeGreaterThan(start)
-  return styles.slice(start, end)
+  return stripCssComments(styles.slice(start, end))
+}
+
+/** 剥掉 CSS 注释：注释掉的规则不生效，文本断言不得把它当证据。 */
+function stripCssComments(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, '')
+}
+
+/**
+ * 取**某条 CSS 规则**在给定文本里的声明体（**不跨选择器**）。
+ *
+ * ⚠️⚠️ 这是审计实测的假绿根因：`/\.dim-jh-rail \{[\s\S]*?width: auto/` 的
+ * `[\s\S]*?` 会一路吃到块内**后面**的 `.dim-jh-provider { width: auto }`，
+ * 于是「rail 有没有 width: auto」这个判据**实际在测另一个选择器**。
+ * 实测后果：删掉 rail 的 `width: auto` 后 154 条用例全绿，而 rail 真的退回
+ * 228px、右面板可用宽度从 444px 掉到 216px（正是本 PR 要修的症状）。
+ *
+ * 判据用 `[^}]*`：CSS 声明体内部不会出现裸 `}`，故不会跨规则边界。
+ *
+ * @returns 该规则的声明体（不含选择器与花括号）；规则不存在时返回 null。
+ */
+function cssRuleBody(block: string, selector: string): string | null {
+  // 选择器按字面量转义（本文件只用 `.dim-jh-*` 这类简单选择器）。
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`).exec(block)
+  return match === null ? null : match[1]
 }
 
 describe('groupProviders（左侧分组）', () => {
@@ -455,17 +495,32 @@ describe('供应商开关的样式约束（源码级回归）', () => {
    */
   it('⚠️ 窄屏主布局：rail 降级为顶部横滑标签条 + 分组展平（用户报障 2026-10-17）', () => {
     const block = narrowScreenBlock(styles)
-    expect(block, '窄屏块里必须有 .dim-jh-layout 的列方向切换').toMatch(
-      /\.dim-jh-layout \{ flex-direction: column; \}/,
-    )
-    expect(block, '标签条必须可横向滑动，否则供应商一多就撑破屏幕').toMatch(
-      /\.dim-jh-rail \{[\s\S]*?overflow-x: auto/,
-    )
-    expect(block, 'railGroup 必须 display: contents，否则分组各占一整行').toMatch(
-      /\.dim-jh-railGroup \{ display: contents; \}/,
-    )
+
+    // ⓪ 媒体条件必须真的生效 —— 审计实测的假绿之一：把条件改成
+    //    `max-width: 1px`（永不命中）或 `min-width: 720px`（笔误）时原用例全绿。
+    expect(block, '窄屏主布局块必须用 max-width 断点').toMatch(/@media \(max-width: 720px\)/)
+    expect(block, '不得出现 min-width（min/max 笔误会让窄屏永远不命中）').not.toMatch(/min-width/)
+
+    // ① 两栏改两段。
+    const layout = cssRuleBody(block, '.dim-jh-layout')
+    expect(layout, '窄屏块里必须有 .dim-jh-layout 规则').not.toBeNull()
+    expect(layout, '.dim-jh-layout 必须切到列方向（两栏改两段）').toMatch(/flex-direction: column/)
+
+    // ② rail 降级为横向标签条 —— 每条腿都用**块内匹配**（[^}]*），
+    //    不能用 [\s\S]*?（那会跨到后面的 .dim-jh-provider 去，见 helper 注释）。
+    const rail = cssRuleBody(block, '.dim-jh-rail')
+    expect(rail, '窄屏块里必须有 .dim-jh-rail 规则').not.toBeNull()
+    expect(rail, '标签条必须可横向滑动，否则供应商一多就撑破屏幕').toMatch(/overflow-x: auto/)
+    expect(rail, '标签条必须是横向 flex（否则退回基础规则的 grid 竖排）').toMatch(/display: flex/)
+    expect(rail, '标签条必须显式 flex-direction: row').toMatch(/flex-direction: row/)
+    // ③ 分组外壳展平。
+    const group = cssRuleBody(block, '.dim-jh-railGroup')
+    expect(group, '窄屏块里必须有 .dim-jh-railGroup 规则').not.toBeNull()
+    expect(group, 'railGroup 必须 display: contents，否则分组各占一整行').toMatch(/display: contents/)
     // 竖排退回的反向断言：分组标题在横排标签条里必须隐藏。
-    expect(block).toMatch(/\.dim-jh-railGroupTitle \{ display: none; \}/)
+    const title = cssRuleBody(block, '.dim-jh-railGroupTitle')
+    expect(title, '窄屏块里必须有 .dim-jh-railGroupTitle 规则').not.toBeNull()
+    expect(title).toMatch(/display: none/)
   })
 
   /**
@@ -477,14 +532,57 @@ describe('供应商开关的样式约束（源码级回归）', () => {
    *
    * ⚠️ 判据用「窄屏块内不得出现 width: 228px」而不是「全文不得出现」：
    * 宽屏那条规则**必须**保留（上面已逐个锁住）。
+   *
+   * ## ⚠️⚠️ 2026-10-20 审计整改
+   *
+   * 原用例的**两条断言都是假绿**，实测（变异后 154 条全绿）：
+   * - `toMatch(/\.dim-jh-rail \{[\s\S]*?width: auto/)` 的 `[\s\S]*?` 会跨到块内
+   *   后面的 `.dim-jh-provider { width: auto }` ⇒ **删掉 rail 的 `width: auto`
+   *   全绿**（而 rail 真的退回 228px、右面板从 444px 掉到 216px）。
+   * - `not.toMatch(/width: 228px/)` 只认「带空格的 `width: 228px`」这一种字面
+   *   ⇒ 写成 `width:228px`（无空格）或 `flex: 0 0 228px` 都能绕过。
+   * ⇒ 修法：正向用 {@link cssRuleBody} 做块内取值；反向**同时**排掉
+   *   固定宽度的三种常见写法。
    */
   it('⚠️ 窄屏块内不得把 rail 写回固定宽度（228px 只属于宽屏）', () => {
     const block = narrowScreenBlock(styles)
-    expect(block).not.toMatch(/\.dim-jh-rail \{[^}]*width: 228px/)
-    // 窄屏必须显式写 width: auto 才能盖掉基础规则的 228px（特异性相同 ⇒ 靠源顺序）。
-    expect(block, '窄屏 rail 必须 width: auto 覆盖基础规则的 228px').toMatch(
-      /\.dim-jh-rail \{[\s\S]*?width: auto/,
-    )
+    const rail = cssRuleBody(block, '.dim-jh-rail')
+    expect(rail, '窄屏块里必须有 .dim-jh-rail 规则').not.toBeNull()
+
+    // 正向：必须显式 width: auto（才能盖掉基础规则的 228px）。
+    expect(rail, '窄屏 rail 必须 width: auto 覆盖基础规则的 228px').toMatch(/width:\s*auto/)
+
+    // 反向：三种把宽度写死的形态都要排掉（空格、无空格、flex 简写）。
+    expect(rail, '不得写 width: 228px（含无空格写法）').not.toMatch(/width:\s*228px/)
+    expect(rail, '不得用 flex 简写写死宽度（flex: 0 0 228px）').not.toMatch(/flex:\s*0\s+0\s+\d+px/)
+    expect(rail, '不得用 flex-basis 写死宽度').not.toMatch(/flex-basis:\s*\d+px/)
+  })
+
+  /**
+   * ⚠️⚠️ **「靠源顺序覆盖」这个前提本身必须有守卫**（2026-10-20 审计新增）。
+   *
+   * 窄屏块能盖掉基础规则，靠的是**同特异性 + 源顺序在后**（CSS 层没有别的机制）。
+   * 审计实测：把基础 `.dim-jh-rail { width: 228px; … }` 规则挪到窄屏 media
+   * **之后** ⇒ 窄屏覆盖完全失效（rail 退回 228px + `display: grid` 竖排），
+   * 而当时 4 条用例**全绿** —— 这个前提写进了注释却没有任何断言守着。
+   *
+   * ⚠️ 判据只对 `.dim-jh-rail` 成立，**不要**对 `.dim-jh-layout` 照搬：
+   * 基础 `.dim-jh-layout { display:flex; flex:1; overflow:hidden }` 里**没有**
+   * `flex-direction`，与窄屏声明**属性不重叠** ⇒ 把它挪后不影响几何
+   * （审计初稿曾把它也算作缺陷，实测几何不变，已订正）。
+   */
+  it('⚠️ 窄屏 media 块必须排在基础 .dim-jh-rail 规则之后（源顺序是覆盖的唯一依据）', () => {
+    const baseRailIndex = styles.indexOf('.dim-jh-rail { width: 228px;')
+    expect(baseRailIndex, '找不到基础 .dim-jh-rail 规则（228px）').toBeGreaterThan(-1)
+    const narrowIndex = styles.indexOf('── 窄屏（手机')
+    expect(narrowIndex, '找不到窄屏块注释标题').toBeGreaterThan(-1)
+    const narrowMediaIndex = styles.indexOf('@media (max-width: 720px)', narrowIndex)
+    expect(narrowMediaIndex, '找不到窄屏 media 块').toBeGreaterThan(-1)
+    expect(
+      narrowMediaIndex,
+      '窄屏 media 块必须排在基础 .dim-jh-rail 规则**之后**：两者特异性相同，'
+      + '靠源顺序后者胜出。挪到前面会让窄屏的 width:auto 完全失效（rail 退回 228px）',
+    ).toBeGreaterThan(baseRailIndex)
   })
 
   it('弹窗里的开关保持 flex: none（目标控件不参与收缩）', () => {
