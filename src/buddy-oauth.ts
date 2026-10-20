@@ -242,7 +242,10 @@ export async function getAccount(
 ): Promise<BuddyAccount> {
   const fetcher = options.fetcher ?? fetch
   const product = options.product ?? CODEBUDDY
-  const url = `${product.endpoint}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`
+  // 国内版 account-scoped 流程读取当前账号，不使用旧版登录账号轮询端点。
+  const url = product.accountScoped
+    ? `${product.endpoint}/v2/plugin/account`
+    : `${product.endpoint}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`
   const headers: Record<string, string> = {
     // ⚠️ `||` 而非裸 `token.domain`：token 由 `parseTokenData` → `readStringField`
     // 产出，该函数在字段缺失/类型不符时返回**空串**（不是 `undefined`），裸用会
@@ -393,6 +396,16 @@ export async function fetchModels(
     // 故保持常量；随产品变化的是 X-Product-Code。
     [HTTP_HEADER_PRODUCT]: BUDDY_DEPLOYMENT_TYPE,
     [HTTP_HEADER_PRODUCT_CODE]: product.productCode,
+  }
+
+  // 国内版客户端使用自己的 cli 目录和促销，不能合并 CodeBuddy 的产品目录。
+  if (product.catalogSource === 'config') {
+    const config = await requestConfig(headers, fetcher, signal, product)
+    if (outcome !== undefined) {
+      outcome.scopedOk = false
+      outcome.configOk = config.ok
+    }
+    return applyPromotions(config.models.filter((model) => model.agentReferenced === true), config.promotions)
   }
 
   // 第一优先：企业模型端点（/console/enterprises/{scope}/models）。
@@ -586,13 +599,18 @@ async function defaultOpenBrowser(url: string): Promise<void> {
  * 服务端日志追踪（实测无校验语义，故每次登录生成新值均可）。
  * 其余产品原样返回。
  *
- * 注意：只追加参数，不得重建 URL —— platform/state/路径全部来自服务端
- * auth/state 下发的 authUrl。
+ * platform/state/路径保留服务端下发值；国内版按官方流程对齐可信登录域。
  */
 export function decorateLoginUrl(authUrl: string, product: BuddyProduct): string {
   if (!product.appendSessionParams) return authUrl
   try {
     const url = new URL(authUrl)
+    // 对齐国内版官方登录流程：仅把可信国内 API 域的登录页对齐到本产品端点。
+    if (product.accountScoped && ['www.workbuddy.cn', 'copilot.tencent.com', 'wb.tencentbuddy.com'].includes(url.hostname)) {
+      const endpoint = new URL(product.endpoint)
+      url.protocol = endpoint.protocol
+      url.host = endpoint.host
+    }
     if (product.pluginVersion !== undefined && product.pluginVersion.length > 0) {
       url.searchParams.set('version', product.pluginVersion)
     }

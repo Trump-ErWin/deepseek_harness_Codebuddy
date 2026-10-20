@@ -1292,6 +1292,7 @@ export class AggregateAdapter extends LlmAdapter {
     'codearts',
     'buddy',
     'workbuddy',
+    'workbuddycn',
     'lobsterai',
     'qoder',
     'qodercn',

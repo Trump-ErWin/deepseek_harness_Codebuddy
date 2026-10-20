@@ -144,7 +144,7 @@
  */
 
 /** 受影响的 provider：腾讯系两个后端（`buddy` = CodeBuddy 中国版，`workbuddy` = WorkBuddy 国际版）。 */
-const TENCENT_PROVIDERS: readonly string[] = ['buddy', 'workbuddy']
+const TENCENT_PROVIDERS: readonly string[] = ['buddy', 'workbuddy', 'workbuddycn']
 
 interface ContentFingerprint {
   /** 被拦的**字面量**（匹配时**大小写不敏感**，但不做任何模式泛化）。 */

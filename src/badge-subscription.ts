@@ -92,6 +92,7 @@ const qoderPlanSelector: BadgePlanSelector = Object.freeze({
 export const BADGE_PLAN_SELECTORS: Readonly<Record<string, BadgePlanSelector>> = Object.freeze({
   buddy: planPackageSelector,
   workbuddy: planPackageSelector,
+  workbuddycn: planPackageSelector,
   qoder: qoderPlanSelector,
   qodercn: qoderPlanSelector,
   zcode: Object.freeze({ kind: 'balance' }) as BadgePlanSelector,

@@ -93,7 +93,7 @@ export const AUTO_CHOICE_TTL_MS = 60_000
  * 其余 provider（qoder / trae / cline / …）结构上留好接口但不接入：它们没有跨账号
  * 的到期余额探测端点，接进来只能算成 Infinity 永远垫底，不如先不放。
  */
-export const AUTO_PROVIDERS = ['codearts', 'loomy', 'zcode', 'buddy', 'workbuddy'] as const
+export const AUTO_PROVIDERS = ['codearts', 'loomy', 'zcode', 'buddy', 'workbuddy', 'workbuddycn'] as const
 
 /** 一次选型的结果：目标 provider + 目标模型 id。 */
 interface AutoChoice {

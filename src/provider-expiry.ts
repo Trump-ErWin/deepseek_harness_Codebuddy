@@ -78,7 +78,7 @@ import { AUTOCLAW } from './autoclaw-product.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import type { AccioCredential } from './accio.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
-import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
+import { CODEBUDDY, WORKBUDDY, WORKBUDDY_CN, type BuddyProduct } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE } from './trae-product.js'
 import type { BuddyCredential } from './buddy.js'
@@ -128,6 +128,7 @@ export function createProviderExpiry(): Readonly<Record<string, ProviderExpiry>>
     // ⚠️ 两个 buddy 系产品：原语相同、product 不同（`CODEBUDDY` / `WORKBUDDY`）。
     buddy: buddyFamilyExpiry(CODEBUDDY),
     workbuddy: buddyFamilyExpiry(WORKBUDDY),
+    workbuddycn: buddyFamilyExpiry(WORKBUDDY_CN),
     loomy: { credentialExpiry: (c) => loomyExpiry(c as LoomyCredential) },
     codearts: { credentialExpiry: (c) => codeArtsExpiry(c as CodeArtsCredential) },
     zcode: { credentialExpiry: (c, context) => zcodeExpiry(c as ZcodeCredential, context) },

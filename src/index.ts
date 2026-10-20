@@ -36,7 +36,7 @@ import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES, type ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc, type JetHubAuthLike } from './jet-hub-rpc.js'
-import { ALL_PRODUCTS, CODEBUDDY, WORKBUDDY } from './product.js'
+import { ALL_PRODUCTS, CODEBUDDY, WORKBUDDY, WORKBUDDY_CN } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { installLoopResume } from './loop-recovery.js'
 import { installWebNative } from './web-native.js'
@@ -429,6 +429,14 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
       resolveCredential: async () => credential as BuddyCredential,
       refresh: async () => {},
       product: WORKBUDDY,
+    }),
+  },
+  workbuddycn: {
+    createProbeAdapter: (ref, credential) => new BuddyAdapter({
+      credentialRef: credentialRef(ref),
+      resolveCredential: async () => credential as BuddyCredential,
+      refresh: async () => {},
+      product: WORKBUDDY_CN,
     }),
   },
   // LobsterAI → 自己的端点与头族。
@@ -971,6 +979,10 @@ export function apply(ctx: Context): void {
     product: CODEBUDDY,
     resolveCredential: resolveBuddyCredentialByRef,
   })
+  const workbuddycnBalanceSelector = new BuddyBalanceSelector({
+    product: WORKBUDDY_CN,
+    resolveCredential: resolveBuddyCredentialByRef,
+  })
   const workbuddyBalanceSelector = new BuddyBalanceSelector({
     product: WORKBUDDY,
     resolveCredential: resolveBuddyCredentialByRef,
@@ -1274,6 +1286,36 @@ export function apply(ctx: Context): void {
     readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: WORKBUDDY,
+  })
+
+  // 国内版共享腾讯系实现，但目录、凭据和请求归属独立。
+  const workbuddycn = new BuddyAuth(ctx, { product: WORKBUDDY_CN })
+  workbuddycn.lastCatalogOutcome = { scopedOk: false, configOk: false }
+  const workbuddycnAdapter = registerBuddyLlm(ctx, {
+    credentialRef: credentialRef(WORKBUDDY_CN.defaultCredentialRef),
+    resolveCredential: createCredentialResolver<BuddyCredential>(
+      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(WORKBUDDY_CN.id, id) } },
+      {
+        product: WORKBUDDY_CN,
+        readCredential: resolveBuddyCredentialByRef,
+        balance: {
+          kind: 'buddy',
+          selector: workbuddycnBalanceSelector,
+          lockedError: buddyLockedError('WorkBuddy 国内版'),
+          isFreeModel: (modelId) => workbuddycnAdapter.isFreeModel(modelId),
+          reportPickedAccount: false,
+        },
+        fallback: { kind: 'ref', refName: WORKBUDDY_CN.defaultCredentialRef },
+        throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+      },
+    ),
+    refresh: createPoolRefresh(pool, WORKBUDDY_CN.id, workbuddycn),
+    fetchRemoteModels: () => workbuddycn.fetchModels(pool),
+    catalogComplete: () => workbuddycn.lastCatalogOutcome?.configOk,
+    readImage: makeReadImage(ctx),
+    readImageRequest: makeReadImageRequest(ctx),
+    accountPool: pool,
+    product: WORKBUDDY_CN,
   })
 
   // ===== LobsterAI (有道龙虾) 服务 =====
@@ -2936,6 +2978,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     service.stop()
     buddy.stop()
     workbuddy.stop()
+    workbuddycn.stop()
     lobsterai.stop()
     qoder.stop()
     qoderCn.stop()
@@ -2955,6 +2998,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     service.stop()
     buddy.stop()
     workbuddy.stop()
+    workbuddycn.stop()
     lobsterai.stop()
     qoder.stop()
     qoderCn.stop()
@@ -3490,6 +3534,7 @@ async function fetchBalanceReading(
     codearts: pruned(CODEARTS_PROVIDER, codearts),
     buddy: pruned('buddy', buddyAdapter),
     workbuddy: pruned('workbuddy', workbuddyAdapter),
+    workbuddycn: pruned('workbuddycn', workbuddycnAdapter),
     lobsterai: pruned(LOBSTERAI.id, lobsteraiAdapter),
     qoder: pruned(QODER.id, qoderAdapter),
     qodercn: pruned(QODER_CN.id, qoderCnAdapter),
@@ -3804,6 +3849,7 @@ async function fetchBalanceReading(
       ['codearts', service],
       ['buddy', buddy],
       ['workbuddy', workbuddy],
+      ['workbuddycn', workbuddycn],
       ['lobsterai', lobsterai],
       ['qoder', qoder],
       ['qodercn', qoderCn],
@@ -3930,7 +3976,7 @@ async function fetchBalanceReading(
 
   registerJetHubRpc(ctx, pool, {
     codearts: service,
-    buddy, workbuddy, lobsterai, qoder,
+    buddy, workbuddy, workbuddycn, lobsterai, qoder,
     qodercn: qoderCn,
     trae, cline, loomy, raccoon, minimax,
     // ⚠️ 键是 **provider id** `minimaxintl`，值是变量 `minimaxIntl`
@@ -3978,6 +4024,7 @@ async function fetchBalanceReading(
     {
       buddy: buddyAdapter,
       workbuddy: workbuddyAdapter,
+      workbuddycn: workbuddycnAdapter,
       qoder: qoderAdapter,
       qodercn: qoderCnAdapter,
     },
