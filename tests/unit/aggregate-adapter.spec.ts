@@ -3156,6 +3156,153 @@ describe('★★ 上下文窗口：候选集的**最大值**（真实缺陷：�
     expect(code).not.toMatch(/contextWindow:\s*200_000/)
     expect(code).not.toMatch(/contextWindow:\s*AGGREGATE_FALLBACK_CONTEXT_WINDOW/)
   })
+
+  /**
+   * ★★★ 失败短缓存的**独立**判别力（2026-10-20 变异测试补的缺口）。
+   *
+   * 上面那条「坏候选进 30 秒失败短缓存」走的是 `resolveModel` → `contextWindowFor`，
+   * 而 `contextWindowFor` 自己也会把退化判决记忆化 ⇒ **两个缓存互相遮蔽**：
+   * 只删 `capabilityFailureCache.set(...)` 时它仍绿（变异 1 曾实测「仍绿」）。
+   *
+   * 本组用例把两条路径**分别**钉死，任一条单独失效都会红：
+   * - `candidatesFor` 里逐候选 `capabilityOf`（不走 `contextWindowFor`）
+   * - `contextWindowFor` 的退化记忆化（把失败短缓存关掉也能独立工作）
+   */
+  describe('★★★ 失败短缓存的独立判别力（两个缓存不得互相遮蔽）', () => {
+    /** 造一个双渠道世界：`autoclaw` 恒定失败，`buddy` 正常。 */
+    const makeBadWorld = () => {
+      const state = { badCalls: 0, fakeNow: 1_000 }
+      const ctx = {
+        logger: { warn: () => {}, info: () => {}, error: () => {} },
+        llm: {
+          listProviders: () => [{ id: 'buddy', name: 'b' }, { id: 'autoclaw', name: 'a' }],
+          listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+          resolveModelInfo: async (provider: string, id: string) => {
+            if (provider === 'autoclaw') {
+              state.badCalls += 1
+              throw new Error('目录服务抖动')
+            }
+            return { provider, id, context: { contextWindow: 1_000_000 } }
+          },
+          stream: () => { throw new Error('本用例不应调用 stream') },
+        },
+      } as never
+      return { state, ctx }
+    }
+
+    it('★★ `candidatesFor` 路径：失败短缓存 TTL 内不得重复解析坏候选', async () => {
+      // ⚠️ 这条**不经过** `contextWindowFor`，故只可能由 `capabilityFailureCache` 兜住。
+      //    删掉 `capabilityFailureCache.set(key, now)` ⇒ 本用例必红。
+      //
+      // ⚠️⚠️ **不能靠推进时间让选型缓存失效**：`AGGREGATE_TTL_MS`（60 秒）本来就比
+      //    失败短缓存（30 秒）长，推过 60 秒时失败记录必然也过期 —— 那样测不到东西。
+      //    正确手法是 `clearChoiceCache()`（RPC 清缓存的真实路径），只让选型缓存失效。
+      const { state, ctx } = makeBadWorld()
+      const adapter = new AggregateAdapter(ctx, {
+        accountPool: makePool(),
+        expiryProbe: async () => Number.POSITIVE_INFINITY,
+        now: () => state.fakeNow,
+      })
+      await warmCatalog(adapter)
+
+      await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      const afterFirst = state.badCalls
+      expect(afterFirst, '第一次必须真的问过那个坏候选').toBeGreaterThan(0)
+
+      // 只清选型缓存（失败记录仍在 30 秒窗口内）⇒ 必须重建候选序，
+      // 但重建时**不得**再打那个坏候选。
+      adapter.clearChoiceCache()
+      state.fakeNow += 5_000
+      await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      expect(state.badCalls, '失败短缓存 TTL 内不得再打那个坏候选').toBe(afterFirst)
+
+      // 推过失败短缓存 ⇒ 必须重试（上游恢复后要能纠正）。
+      adapter.clearChoiceCache()
+      state.fakeNow += 30_001
+      await adapter.prepareCall(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      expect(state.badCalls, '失败短缓存到期后必须重新解析').toBeGreaterThan(afterFirst)
+    })
+
+    it('★★ `contextWindowFor` 路径：关掉失败短缓存也能靠退化记忆化兜住', async () => {
+      // ⚠️ 这条把 `capabilityFailureTtlMs` 设成 0（等价于禁用失败短缓存），
+      //    验证「退化判决也记忆化」这条独立防线确实在工作。
+      //    把 `contextWindowCache.set(...)` 改回「全成功才写」⇒ 本用例必红。
+      const { state, ctx } = makeBadWorld()
+      const adapter = new AggregateAdapter(ctx, {
+        accountPool: makePool(),
+        expiryProbe: async () => Number.POSITIVE_INFINITY,
+        now: () => state.fakeNow,
+        capabilityFailureTtlMs: 0,
+        contextWindowDegradedTtlMs: 30_000,
+      })
+      await warmCatalog(adapter)
+
+      expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+        .toBe(1_000_000)
+      const afterFirst = state.badCalls
+
+      // 失败短缓存已禁用 ⇒ 唯一能拦住重复解析的就是退化记忆化。
+      state.fakeNow += 10_000
+      await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      expect(state.badCalls, '退化记忆化必须拦住重复解析（失败短缓存已关）').toBe(afterFirst)
+
+      // 推过退化 TTL ⇒ 必须重试并采信真值（上游恢复后要能纠正）。
+      state.fakeNow += 30_001
+      await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      expect(state.badCalls, '退化 TTL 到期后必须重新解析').toBeGreaterThan(afterFirst)
+    })
+
+    it('★★ 上游恢复后能拿到真值（成功写入后失败记录不再生效）', async () => {
+      // ⚠️ 本条**不**声称在测「成功即清失败记录」——变异测试实测：
+      //    删掉 `capabilityFailureCache.delete(key)` 本用例仍绿，因为
+      //    `capabilityCache` 在 `capabilityOf` 开头就先查，成功写入后失败记录
+      //    再也不会被读到。那条 `delete` 是防御性的（见源码注释），没有独立判别力。
+      //
+      // 本条真正钉的是**用户可见的契约**：上游恢复后，推过失败短缓存就能拿到真值。
+      let broken = true
+      let badCalls = 0
+      let fakeNow = 1_000
+      const ctx = {
+        logger: { warn: () => {}, info: () => {}, error: () => {} },
+        llm: {
+          listProviders: () => [{ id: 'buddy', name: 'b' }, { id: 'autoclaw', name: 'a' }],
+          listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+          resolveModelInfo: async (provider: string, id: string) => {
+            if (provider === 'autoclaw') {
+              badCalls += 1
+              if (broken) throw new Error('目录服务抖动')
+              return { provider, id, context: { contextWindow: 2_000_000 } }
+            }
+            return { provider, id, context: { contextWindow: 1_000_000 } }
+          },
+          stream: () => { throw new Error('本用例不应调用 stream') },
+        },
+      } as never
+      const adapter = new AggregateAdapter(ctx, {
+        accountPool: makePool(),
+        expiryProbe: async () => Number.POSITIVE_INFINITY,
+        now: () => fakeNow,
+        // 退化 TTL 设 0 ⇒ 每次 `contextWindowFor` 都重算，逼它去问 `capabilityOf`。
+        contextWindowDegradedTtlMs: 0,
+      })
+      await warmCatalog(adapter)
+
+      // ① 坏着问一次 ⇒ 失败记录落盘。
+      await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      const afterBroken = badCalls
+      expect(afterBroken).toBeGreaterThan(0)
+
+      // ② 上游恢复。**不推进时间** ⇒ 仍在失败短缓存 TTL 内，不得重复打。
+      broken = false
+      await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')
+      expect(badCalls, 'TTL 内不该再问（失败记录生效）').toBe(afterBroken)
+
+      // ③ 推过失败 TTL ⇒ 恢复后必须拿到 autoclaw 更大的窗口（2M）。
+      fakeNow += 30_001
+      expect((await adapter.resolveModel(AGGREGATE_PROVIDER, 'deepseek-v4-1-flash')).context?.contextWindow)
+        .toBe(2_000_000)
+    })
+  })
 })
 
 /**

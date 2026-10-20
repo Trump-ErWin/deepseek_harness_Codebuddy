@@ -2308,7 +2308,12 @@ export class AggregateAdapter extends LlmAdapter {
         ...info.context === undefined ? {} : { contextWindow: info.context.contextWindow },
       }
       this.capabilityCache.set(key, capability)
-      // ⚠️ **成功即清失败记录**：上游恢复后不必等 TTL 到期（见 `capabilityFailureCache`）。
+      // ⚠️ 清掉失败记录。**当前这一步没有行为效果**（变异测试实测：删掉它全部用例仍绿）：
+      //    `capabilityCache` 在方法开头就先查，成功写入后失败记录再也不会被读到
+      //    （唯一会清 `capabilityCache` 的 `refreshCatalog` 同时清本表）。
+      //    保留它是**防御性**的：①内存卫生（不留 30 秒的死条目）；
+      //    ②若将来有人调整两个缓存的查询优先级，这里不会变成「成功之后仍被
+      //    30 秒前的失败记录压住」的静默缺陷。
       this.capabilityFailureCache.delete(key)
       return capability
     } catch (error) {
