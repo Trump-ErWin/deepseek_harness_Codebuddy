@@ -124,8 +124,35 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
     const end = Number(pkg.deductionEndTime);
     const known = Number.isFinite(end) && end > 0;
     if (!known) {
-      // 服务端没给到期时间 ⇒ 真·永久（保守方向：宁可少用，不可误烧长期积分）。
-      permanent += remaining;
+      /**
+       * 服务端没给到期时间 ⇒ 默认是**真·永久**（保守方向：宁可少用，
+       * 不可误烧长期积分）。
+       *
+       * ⚠️ **但 CodeArts 的赠送包是例外**（2026-10-20）：它没有逐笔到期
+       * 时刻，上游只在该分类 metric 上给一个「其中 N 即将到期」的标量。
+       * 那个标量被解析到 `pkg.expiringRemaining` ⇒ 拆开算：
+       *
+       * ```
+       * 临期桶 += expiringRemaining
+       * 永久桶 += remaining - expiringRemaining
+       * ```
+       *
+       * 不拆的话，那 25000 分（含 2000 快作废的）会整包进永久桶，卡片上
+       * 「永久 25000」与「另有 2000 即将到期」同时出现、互相矛盾
+       * （用户 2026-10-20 报障：「2000+500临期不应该是2500嘛」）。
+       *
+       * ⚠️ 这类包**没有倒计时**（上游不给日期，绝不编一个）⇒ 不参与
+       * `earliestExpiringAt` 的选取。
+       */
+      const expiringPart = Number(pkg.expiringRemaining);
+      const hasExpiring = Number.isFinite(expiringPart) && expiringPart > 0;
+      if (hasExpiring) {
+        const capped = Math.min(expiringPart, remaining);
+        expiring += capped;
+        permanent += remaining - capped;
+      } else {
+        permanent += remaining;
+      }
       continue;
     }
     if (end - at < windowMs) {

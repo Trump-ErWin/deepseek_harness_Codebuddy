@@ -811,7 +811,17 @@ describe('永久积分锁定能力', () => {
     })
 
     it('未登记的 provider 回落到 Loomy 口径而不是崩（面板共用同一段代码）', () => {
-      expect(permanentLockCopy('codearts').lockedNotice).toContain('每日赠送额度')
+      // ⚠️ 2026-10-20：原来这里用 `codearts` 当「未登记」的样本，但 codearts
+      // 现在已有 `usesExpiryWindow: true`（三档分档 + 永久锁）⇒ 它走的是带天数
+      // 那套文案，不再回落。改用一个**确实未登记**的 id，测的才是回落本身。
+      expect(permanentLockCopy('modelscope').lockedNotice).toContain('每日赠送额度')
+      expect(permanentLockCopy('__not_registered__').lockedNotice).toContain('每日赠送额度')
+    })
+
+    it('codearts 现在走带天数的文案，不再回落（三档分档生效后必须如此）', () => {
+      const copy = permanentLockCopy('codearts', 15)
+      expect(copy.lockedNotice).toContain('15 天内到期')
+      expect(copy.lockedNotice).not.toContain('每日赠送额度')
     })
   })
 })
