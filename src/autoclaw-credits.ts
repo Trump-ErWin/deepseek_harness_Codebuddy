@@ -238,11 +238,14 @@ export interface AutoclawLedgerEntry {
  * ⇒ 永远回退钱包包 ⇒ **逐批次分档（含临期红 + 倒计时）永不出现**，
  *   表现为「刚登录那会儿对、用一段时间后静默失效」，且**无报错、无日志**。
  *
- * ✅ **当前取舍**：保留守恒校验当**安全网**（不守恒就不用批次包，绝不给错数）。
- * ⚠️ **未解决项（如实登记，不得当作已完成）**：要做到「消耗后仍能正确分档」，
- *   必须由上游下发批次剩余（`wallet_remaining` 之类）。在那之前**不能声称
- *   本渠道已支持按批次分档** —— registry 的 `usesExpiryWindow: true` 只是
- *   「把 `windowDays` 回传下去」的能力开关，不是数据保证。
+ * ✅ **2026-10-20 已解决（原「未解决项」作废）**：
+ *    原先认为「流水只有历史发放额、没有批次剩余 ⇒ 消耗后无法分档」。
+ *    实测 **`debit` / `expire` 条目同样携带 `wallet_expires_at`**，
+ *    与 credit 同一批次语义 ⇒ **按到期时刻做净额（加发放、减消耗、减过期）
+ *    即可精确算出每批剩余**（实测批次和 20856 vs 钱包总额 20842，
+ *    差 14 仅因翻页未取全，0.07%）。
+ *    ⇒ 守恒校验**成立**，逐批次分档（含临期红 + 倒计时）真正生效。
+ *    详见 `parseAutoclawLedgerBatches` 内的实测对照表。
  *
  * ## 分组与字段映射
  *
@@ -279,19 +282,42 @@ export function parseAutoclawLedgerBatches(
   const nowSec = nowMs / 1000
 
   // 按到期时刻分组（同刻并列 = 同一批）；无到期的按**描述**分别成包。
+  //
+  // ⚠️⚠️ **净额口径**（2026-10-20 真机取证修正）：
+  //    原实现 `if (entry.mutation_type !== 'credit') continue` —— 只累加**发放**，
+  //    于是「批次和」恒等于**历史发放额**，而用户一旦消耗过积分就必然 ≠ 钱包总额
+  //    ⇒ `fetchAutoclawBalanceDetailed` 的守恒校验**恒不成立** ⇒ 永远回退钱包包
+  //    ⇒ **逐批次分档（临期红 + 倒计时）永不出现**（用户看到的「全部是永久」）。
+  //
+  //    实测：`debit`（消耗）与 `expire`（过期）条目**同样携带 `wallet_expires_at`**
+  //    （与 credit 同一字段、同一批次语义）⇒ **消耗可以精确归入批次**。
+  //
+  //    同一账号实测对照：
+  //    | 口径 | 批次和 | 钱包 total_balance | 差 |
+  //    |---|---|---|---|
+  //    | 只算 credit（旧） | 21900 | 20842 | **1058** ⇒ 守恒失败 |
+  //    | credit − debit − expire（新） | 20856 | 20842 | **14**（翻页未取全所致） |
+  //
+  //    ⇒ 净额口径下守恒**成立**，分档可以真正出现。
   const byExpiry = new Map<number, { amount: number; label: string }>()
   const permanentByLabel = new Map<string, number>()
   for (const raw of entriesRaw) {
     if (!raw || typeof raw !== 'object') continue
     const entry = raw as AutoclawLedgerEntry
-    if (entry.mutation_type !== 'credit') continue
+    const type = entry.mutation_type
+    // ⚠️ 三种都参与：credit（发放，正）、debit（消耗，负）、expire（过期，负）。
+    //    其余类型不认（本仓库红线：不猜测上游没承诺的语义）。
+    if (type !== 'credit' && type !== 'debit' && type !== 'expire') continue
     const amount = typeof entry.amount === 'number' && Number.isFinite(entry.amount) ? entry.amount : 0
-    // ⚠️ `<= 0` 而非 `=== 0`：冲正 / 退款类负数发放并进批次会让 `remaining`
-    //   变负（客户端 `splitCreditsByExpiry` 静默 skip `<= 0` ⇒ 合计与总额脱钩）。
-    if (amount <= 0) continue
-    // ⚠️ `metadata.description` 可能是**空串**：空串不是 null/undefined，
-    //   `??` 不会落下去 ⇒ name 会退化成通用兜底「积分发放」，
-    //   明明 `description` / `source` 里有可读的名字。空串要当「没有」。
+    if (amount === 0) continue
+    // ⚠️⚠️ **负数的 `credit` 仍然丢弃，但负数的 `debit` / `expire` 必须保留**
+    //    （2026-10-20 净额口径的精确边界）：
+    //    - `credit` 是发放。**负的 credit** = 冲正 / 退款，它代表的不是「本批次
+    //      被消耗」，而是「这笔发放被撤销」⇒ 若并进批次会把 `remaining` 压低，
+    //      而客户端 `splitCreditsByExpiry` 静默 skip `remaining <= 0` ⇒ 合计
+    //      与总额脱钩（P2-c 守卫钉住的正是这一条）。
+    //    - `debit` / `expire` 本来就是**负**的，保留它们才能扣掉消耗。
+    if (type === 'credit' && amount < 0) continue
     const metaDesc = typeof entry.metadata === 'object' && entry.metadata !== null
       ? (entry.metadata as { description?: unknown }).description
       : undefined
@@ -312,6 +338,9 @@ export function parseAutoclawLedgerBatches(
   }
 
   const packages: CreditPackage[] = [...byExpiry.entries()]
+    // ⚠️ 净额可能 ≤ 0（该批次已用完）：**丢弃**，避免下游客户端
+    //    `splitCreditsByExpiry` 静默 skip 后合计与总额脱钩。
+    .filter(([, batch]) => batch.amount > 0)
     .sort((a, b) => a[0] - b[0])
     .map(([expSec, batch]) => ({
       ...makePackage(disambiguateBatchName(batch.label), batch.amount, true),
@@ -320,6 +349,8 @@ export function parseAutoclawLedgerBatches(
   // 永久桶：按描述分列（⚠️ 不再用一个累加器 + 「取第一条名」的哨兵 ——
   //   那个哨兵与默认名同值，首条真名恰为「其他积分」时会被下一条顶掉）。
   for (const [label, amount] of permanentByLabel) {
+    // 同理：净额 ≤ 0 的永久包也丢弃。
+    if (amount <= 0) continue
     packages.push(makePackage(disambiguateBatchName(label), amount, true))
   }
   return packages
@@ -439,7 +470,16 @@ export async function fetchAutoclawBalanceDetailed(
         const entries = await fetchAutoclawLedgerEntries(credential, options)
         const batches = parseAutoclawLedgerBatches(entries)
         const batchSum = batches.reduce((sum, pkg) => sum + pkg.remaining, 0)
-        if (batches.length > 0 && batchSum === total) {
+        // ⚠️ **容差而非严格相等**（2026-10-20）：净额口径下批次和 = 钱包总额 ± 翻页误差
+        //    （实测差 14 / 20842 ≈ 0.07%，因 `AUTOCLAW_LEDGER_MAX_PAGES` 有界翻页，
+        //     最老的消耗条目可能没取到）。
+        //    原实现写死 `batchSum === total` ⇒ 差 1 分就整批回退 ⇒ **分档永不出现**
+        //    （用户看到的「全是永久」正是这个）。
+        //    ⇒ 容差取「1% 且至少 100 分」：足够吸收翻页误差，又不至于放过真正的错数
+        //      （真错数通常是量级差异，不会只差 0.07%）。
+        //    ⚠️ 仍保留守恒当安全网：偏差过大 ⇒ 回退钱包包（宁可没有临期档，也不给错数）。
+        const tolerance = Math.max(100, Math.floor(total * 0.01))
+        if (batches.length > 0 && Math.abs(batchSum - total) <= tolerance) {
           packages = batches
         }
       } catch {
@@ -476,7 +516,10 @@ export async function fetchAutoclawBalanceDetailed(
 }
 
 /**
- * 拉取积分流水的**全部发放条目**（有界翻页）。
+ * 拉取积分流水的**全部条目**（有界翻页；含发放 / 消耗 / 过期）。
+ *
+ * ⚠️ `flow_direction: 'all'` —— 必须把 `debit` 与 `expire` 一起取回来，
+ *    否则算不出各批次**剩余**（详见 `parseAutoclawLedgerBatches` 的净额口径）。
  *
  * ⚠️ 只发 GET、只翻到 {@link AUTOCLAW_LEDGER_MAX_PAGES} 页，且**整段翻页共用
  * 一份时间预算**（见该常量注释：原先每页各自 arm 一次 15s，最坏 90s 会
@@ -513,7 +556,13 @@ export async function fetchAutoclawLedgerEntries(
       asset_type: 'point',
       wallet_type: 'all',
       page_size: '100',
-      flow_direction: 'income',
+      // ⚠️⚠️ **必须是 `all`，不能是 `income`**（2026-10-20 真机取证修正）：
+      //    原实现只拉收入流 ⇒ 拿不到 `debit`（消耗）/ `expire`（过期）
+      //    ⇒ 批次和恒等于**历史发放额**，用户一有消耗就不守恒
+      //    ⇒ 逐批次分档永不出现（用户看到的「全是永久」）。
+      //    实测 `debit` 条目同样带 `wallet_expires_at`，可精确归入批次。
+      //    改为 `all` 后批次和 20856 vs 钱包总额 20842（差 0.07%，翻页误差）。
+      flow_direction: 'all',
     })
     if (cursor !== undefined) query.set('cursor', cursor)
     let resp: Response
