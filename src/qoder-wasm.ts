@@ -746,8 +746,8 @@ export async function generateRuntimeAuthFields(user: QoderWasmUserInfo): Promis
  * 这个报错看起来像「密文损坏」，实际是缺参数。
  * 该值由本插件生成并随凭据持久化（`QoderCredential.machine_id`）。
  *
- * 仅用于离线读取本机缓存做核对/排查；线上模型列表仍走兜底表
- * （目录端点需 WASM 签名，见 `qoder-adapter.ts` 的 `listModels`）。
+ * 本函数仅用于离线核对缓存；线上目录走签名请求与 decryptQoderServerResponse，
+ * 不读取本机官方客户端的目录缓存。
  */
 export async function decryptModelCatalog(encrypted: string, machineId: string): Promise<unknown> {
   const g = await getGlue()
@@ -759,6 +759,20 @@ export async function decryptModelCatalog(encrypted: string, machineId: string):
     g.exports.model_cache_decrypt!(stack, a, aLen, b, bLen)
   })
   return JSON.parse(raw)
+}
+
+/** 解码目录接口的 Encode=1 响应；服务端返回明文时沿用官方客户端的原样回退。 */
+export async function decryptQoderServerResponse(text: string): Promise<string> {
+  const g = await getGlue()
+  try {
+    return g.callString((stack) => {
+      const input = g.writeString(text)
+      const length = g.lastLength()
+      g.exports.decrypt_server_response!(stack, input, length)
+    })
+  } catch {
+    return text
+  }
 }
 
 /**

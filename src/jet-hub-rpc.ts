@@ -1501,6 +1501,8 @@ export function registerJetHubRpc(
  */
 export interface ModelCatalogSource {
   listAllModels(): readonly { id: string; name: string; isFree?: boolean }[]
+  /** 可选的远端刷新入口，目前由 Qoder 两版提供。 */
+  refreshModels?(): Promise<void>
   /**
    * 聚合目录（**可选** —— 只有聚合适配器实现它）。
    *
@@ -6244,6 +6246,12 @@ trae, cline, loomy, raccoon, minimax,
         }
         let models: Array<{ id: string; name: string }>
         try {
+          // 只对已接入远端目录的 Qoder 两版启用，普通读取继续复用实例内存。
+          if (req.refresh === true && (req.provider === 'qoder' || req.provider === 'qodercn')) {
+            const source = modelAdapters?.[req.provider]
+            if (source?.refreshModels === undefined) throw new Error('当前适配器不支持远端模型刷新')
+            await source.refreshModels()
+          }
           models = await llm.listModels(req.provider)
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)

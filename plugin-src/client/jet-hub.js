@@ -1041,11 +1041,15 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const [groupBusy, setGroupBusy] = React.useState(null);
   const mounted = React.useRef(true);
 
-  const load = React.useCallback(async () => {
+  const load = React.useCallback(async (refresh = false) => {
     setPhase('loading');
     setError(null);
     try {
-      const res = await rpcCall('model.list', { provider });
+      // Qoder 两版手动刷新才重新请求上游，打开弹窗时优先复用宿主内存。
+      const res = await rpcCall('model.list', {
+        provider,
+        ...(refresh === true && (provider === 'qoder' || provider === 'qodercn') ? { refresh: true } : {}),
+      });
       if (!mounted.current) return;
       setModels(res.models || []);
       setPhase('ready');
@@ -1303,7 +1307,7 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
           React.createElement('button', {
             className: 'dim-jh-btn',
             disabled: phase === 'loading',
-            onClick: () => void load(),
+            onClick: () => void load(true),
           }, phase === 'loading' ? '读取中…' : '刷新'),
           React.createElement('button', {
             className: 'dim-jh-btn',
