@@ -228,6 +228,14 @@ export interface LoomyAdapterOptions {
    * 不会（也无法）续期。
    */
   refresh: () => Promise<void>
+  /**
+   * 非终态告警出口（可选）。
+   *
+   * ⚠️ 目前只有一处消费：请求热路径上「凭据探测失败但按非终态处理」时留痕。
+   * 缺省静默 —— 但接线层**必须**注入，否则本渠道会退化成本仓库反复记录的
+   * 「静默失败」（用户看到整轮成功、实际探测一直在失败）。
+   */
+  warn?: (message: string) => void
   /** 拉取远端模型目录；失败时适配器回退兜底表。 */
   fetchRemoteModels?: () => Promise<LoomyRemoteModel[]>
   /**
@@ -262,6 +270,22 @@ export interface LoomyAdapterOptions {
 
 /** 单次用户请求最多尝试的账号数（含首号）。与 buddy/raccoon 同语义，设上限只为防病态池。 */
 const LOOMY_MAX_ROTATE = 8
+
+/**
+ * 凭据探测的异常是否为**终态**（凭据确实失效，必须提示重新登录）。
+ *
+ * ⚠️ 按 `name` 判定，不按 `instanceof`：`RefreshTokenExpiredError` 定义在
+ * `loomy-auth.ts`，而该类自身的注释已把「`name` 必须恰为 `RefreshTokenExpiredError`」
+ * 写成契约（宿主与其它 provider 也按名判定）。`instanceof` 在打包/多副本下
+ * 会因类身份不同而**假阴性** —— 那会把「请重新登录」误降级成「继续用」，
+ * 症状比原缺陷更难排查。同款双重判据见 `astudio-adapter.ts`。
+ *
+ * 反过来说：**任何别的异常都不是终态**。网络超时、上游 `系统内部错误`、
+ * 非 JSON 响应都属于「探测端点不可用」，与凭据无关。
+ */
+function isLoomyTerminalRefreshError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'RefreshTokenExpiredError'
+}
 /** 429 限流冷却：1 小时（与 trae soft-rate 同档）。 */
 const LOOMY_RATE_LIMIT_COOLDOWN_MS = 3_600_000
 
@@ -711,7 +735,35 @@ export class LoomyAdapter extends LlmAdapter {
     // 过滤账号（限流按模型记），再按余额分档。传空串会让模型级限流失效。
     let credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || isLoomyExpired(credential)) {
-      await this.options.refresh()
+      // ⚠️⚠️ 探测失败**只有一种**是终态：凭据确实失效（`RefreshTokenExpiredError`）。
+      // 其余（网络超时、上游 5xx、`系统内部错误` 这类业务错误、非 JSON 响应）
+      // **一律不得打断本轮** —— 它们说明的是「只读探测端点不可用」，
+      // 与「这份凭据还能不能用」是两件事。
+      //
+      // 这条口径**不是新造的**：`LoomyAuth.refreshAll()` 早已如此（那里只把
+      // 终态记 warn、其余记 warn 后继续下一个账号）。热路径与它不一致，
+      // 是同一仓库里两套同义判据（AGENTS.md 记过 PR !62 的同型缺陷）。
+      //
+      // 真实伤情（2026-10-20，会话 `session-bfb9b616`）：同一渠道第 4、5 轮
+      // 相隔 27 分钟两次整轮失败，文案分别是
+      // `Loomy 凭据探测失败：系统内部错误` 与
+      // `Loomy 凭据探测网络失败：The operation was aborted due to timeout`
+      // —— 而同一时刻 Jet Hub 面板三个账号的余额全部读得到（渠道是活的）。
+      // 探测是 60s 超时，最坏情况下用户还要先白等一分钟才拿到失败。
+      //
+      // 为什么放行是安全的：Loomy **没有续期端点**，探测的唯一产出是
+      // 「要不要提示用户重新登录」。真正的失效会在业务请求上以 401 /
+      // `100002` 暴露，由本适配器的换号与 `classifyLoomyFailure` 接住。
+      // 拿探测当请求前置门禁，等于把「上游只读端点抖了一下」升级成「整轮失败」。
+      try {
+        await this.options.refresh()
+      } catch (error) {
+        if (isLoomyTerminalRefreshError(error)) throw error
+        this.options.warn?.(
+          `[loomy] 凭据探测失败（非终态，继续使用现有凭据）：${
+            error instanceof Error ? error.message : String(error)}`,
+        )
+      }
       credential = await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || credential.access_token.length === 0) {

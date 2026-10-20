@@ -1100,3 +1100,103 @@ describe('LoomyAdapter 图片能力覆盖（2026-10-14 远端漏报）', () => {
     expect(entry?.inputModalities, '闸门读的字段').toContain('image')
   })
 })
+
+/**
+ * ★★ 凭据探测失败**不得**打断本轮（Gitee 报障，会话 `session-bfb9b616`，2026-10-20）
+ *
+ * ## 缺陷形态
+ *
+ * 只读探测端点 `GET /points/records` 与「凭据是否有效」是两件事，但适配器把
+ * 探测抛出的**任何**异常都当终态：
+ *
+ * ```
+ * if (credential === undefined || isLoomyExpired(credential)) {
+ *   await this.options.refresh()   // ← 抛出即整轮失败
+ * }
+ * ```
+ *
+ * 真实伤情：同一渠道第 4、5 轮相隔 27 分钟两次整轮失败，文案分别是
+ * `Loomy 凭据探测失败：系统内部错误`（业务错误）与
+ * `Loomy 凭据探测网络失败：The operation was aborted due to timeout`（60s 超时），
+ * 而**同一时刻面板三个账号余额全部读得到** —— 渠道是活的，死的只是探测。
+ *
+ * ## 修法边界
+ *
+ * 只放过**非终态**；`RefreshTokenExpiredError` 仍必须抛（否则「请重新登录」
+ * 这条唯一出路会被吞掉）。最后一条用例是**反向对照** —— 没有它，
+ * 「凡错就放过」也能让前两条全绿。
+ */
+describe('★★ 凭据探测失败不得打断本轮（2026-10-20 报障）', () => {
+  const EXPIRED: LoomyCredential = { ...CRED, expires_at: '1' }
+  const SSE = [
+    'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n',
+    'data: [DONE]\n\n',
+  ].join('')
+
+  function fetchSpy(captured: { auth: string[] }) {
+    return (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      captured.auth.push(String(new Headers(init?.headers).get('Authorization') ?? ''))
+      return new Response(SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }) as unknown as typeof fetch
+  }
+
+  async function run(adapter: LoomyAdapter) {
+    for await (const _chunk of adapter.stream({
+      provider: 'loomy',
+      model: 'MiniMax-M3',
+      messages: [{ role: 'user', content: 'hi' }],
+    } as never)) {
+      // 只为把请求发出去
+    }
+  }
+
+  it('探测抛业务错误（系统内部错误）→ 继续用现有凭据发请求，并留告警', async () => {
+    const captured = { auth: [] as string[] }
+    const warns: string[] = []
+    const adapter = makeAdapter({
+      resolveCredential: async () => EXPIRED,
+      refresh: async () => { throw new Error('Loomy 凭据探测失败：系统内部错误') },
+      warn: (message) => warns.push(message),
+      fetchImpl: fetchSpy(captured),
+    })
+
+    await expect(run(adapter)).resolves.toBeUndefined()
+    expect(captured.auth, '请求必须真的发出一次').toHaveLength(1)
+    expect(captured.auth[0], '用的仍是那份（本地判过期的）凭据').toContain(EXPIRED.access_token)
+    expect(warns, '非终态失败必须留痕，不能静默').toHaveLength(1)
+    expect(warns[0]).toContain('系统内部错误')
+  })
+
+  it('探测超时（aborted due to timeout）→ 同样放行', async () => {
+    const captured = { auth: [] as string[] }
+    const warns: string[] = []
+    const adapter = makeAdapter({
+      resolveCredential: async () => EXPIRED,
+      refresh: async () => {
+        throw new Error('Loomy 凭据探测网络失败：The operation was aborted due to timeout')
+      },
+      warn: (message) => warns.push(message),
+      fetchImpl: fetchSpy(captured),
+    })
+
+    await expect(run(adapter)).resolves.toBeUndefined()
+    expect(captured.auth).toHaveLength(1)
+    expect(warns[0]).toContain('timeout')
+  })
+
+  it('反向对照：凭据确实失效（RefreshTokenExpiredError）→ 仍然抛错', async () => {
+    const captured = { auth: [] as string[] }
+    const adapter = makeAdapter({
+      resolveCredential: async () => EXPIRED,
+      refresh: async () => {
+        const error = new Error('Loomy 凭证已失效，请重新登录（缺少 token）')
+        error.name = 'RefreshTokenExpiredError'
+        throw error
+      },
+      fetchImpl: fetchSpy(captured),
+    })
+
+    await expect(run(adapter)).rejects.toThrow('凭证已失效')
+    expect(captured.auth, '终态失败不该再发业务请求').toHaveLength(0)
+  })
+})
