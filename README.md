@@ -101,6 +101,10 @@ dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codea
 `add` 以 git 仓库方式安装（pnpm 内部走 `git+https:` 协议），会运行本包的 `prepare`
 脚本自动构建 `lib/`，无需手动 `pnpm build`。
 
+⚠️ `prepare` **不依赖任何包管理器**（它直接内联 `tsc` / `node`）：pnpm 在 clone
+目录里跑 `prepare` 时，**pnpm 10 / 11 不会把 npm 注入 PATH**（只有 pnpm ≥ 12 会）
+⇒ 若 `prepare` 里写 `npm run …`，那两代上安装会直接失败。
+
 ⚠️ pnpm 10 起会拦截依赖的构建脚本，必须先在 profile 的 `pnpm-workspace.yaml`
 （路径形如 `~/.dsh/profiles/<name>/pnpm-workspace.yaml`）里放行；而**放行键的写法
 在 pnpm 10 与 pnpm 11 之间互不兼容**，写错就装不上。
