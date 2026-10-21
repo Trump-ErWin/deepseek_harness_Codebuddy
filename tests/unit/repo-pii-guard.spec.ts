@@ -117,6 +117,17 @@ function trackedTextFilesIncludingTests(): Array<{ path: string; text: string }>
  * ⚠️ 这些**只拦形态**、不判断有效性 ⇒ 零误报风险。
  * ⚠️ 手机号形态的**掩码残留**（`用户` + uid 片段）**刻意不拦** ——
  * 用户已确认它属于「可公开的实测记录」范围（2026-10-21 用户裁定）。
+ *
+ * ## ⚠️ 本文件自己会出现在 `scripts/audit-repo-secrets.mjs` 的 P1 里
+ *
+ * 那支审计脚本（**未入库**，只在本地 `scripts/`）会把它自己的**自证样例**与
+ * **白名单条目**当成「疑似真实凭据」报出来 —— 2026-10-21 实测 **7 条**
+ * （`PEM 私钥` ×2、`JWT` ×2、`sk-` ×3），全在本文件。
+ *
+ * ⇒ **它们是刻意的构造样例**（判据必须有「能命中的样例」才自证有牙），
+ *    且**逐条登记在** {@link CREDENTIAL_CONSTRUCTOR_SAMPLES} 里。
+ * ⇒ 复核审计结果时**直接跳过**这些，别当成新发现的泄漏去追 ——
+ *    真要判「有没有真的塞进凭据」，看本文件的白名单**是否被人改宽**。
  */
 const PEM_PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g
 const SK_STYLE_KEY = /\bsk-[A-Za-z0-9_-]{16,}/g
