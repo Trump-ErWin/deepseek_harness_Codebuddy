@@ -69,6 +69,7 @@ import {
 // 「供应商 → 模型列表」统一管理页的判定（跨供应商那一层：哪些分组该出现、
 // 未加载怎么算、总览怎么计）。模型级筛选仍复用上面的 model-filter.js。
 import {
+  centerBulkState,
   centerPendingProviderIds,
   centerTotals,
   visibleCenterSections,
@@ -5815,8 +5816,23 @@ function ModelCenterPanel({ providers, rpcCall, statuses }) {
 
   // 卸载后不再 setState：一轮「加载全部」会跨多个 await，中途关掉弹窗会把状态
   // 写进已卸载的组件（React 18 不警告，但白留一份闭包）。
+  //
+  // ⚠️⚠️ **挂载时必须复位 `mounted.current = true`**（2026-10-21 合并审计发现）：
+  // React 18 StrictMode 的双挂载序列是「mount → effect → cleanup → effect」，
+  // cleanup 把 `mounted.current` 置 `false`，**第二次 effect 若不复位**，
+  // 之后所有 `if (!mounted.current) return` 恒成立 ⇒ RPC 结果全被丢弃
+  // ⇒ 界面永远停在「正在读取该供应商的模型列表…」，且懒加载会因 state 不更新
+  // 而**再发一次** `model.list`。
+  //
+  // ⚠️ 本文件既有的 `ModelListPanel`（`:1110`）**有**这一行 ⇒ 同一个文件里
+  // 两套写法，本屏是漏掉的那套 ⇒ 按同构补齐。
+  // ⚠️ 可达性：宿主 web bundle 里 `StrictMode` 无实际使用点 ⇒ **当前不可达**
+  // （属「差一行复位」的脆弱绿，不是现行缺陷）。
   const mounted = React.useRef(true);
-  React.useEffect(() => () => { mounted.current = false; }, []);
+  React.useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   /**
    * 读一家的目录。
@@ -5853,7 +5869,9 @@ function ModelCenterPanel({ providers, rpcCall, statuses }) {
 
   const filtering = isFilterActive({ query, status: statusFilter });
   const sections = visibleCenterSections(providers, states, { query, status: statusFilter });
-  const totals = centerTotals(sections);
+  // ⚠ 注意：`centerTotals` 统计的是「**全部已加载的分组**」而不是「筛选后可见的」
+  // ⇒ 必须直接传 `providers` + `states`（否则搜索一不匹配就显示「已读取 0 / N 家」）。
+  const totals = centerTotals(providers, states);
   const pending = centerPendingProviderIds(providers, states);
   const providerCount = Array.isArray(providers) ? providers.length : 0;
 
@@ -6013,9 +6031,13 @@ function ModelCenterPanel({ providers, rpcCall, statuses }) {
         : `${section.summary.total} 个 · 已关闭 ${section.summary.disabled}`
           + (section.summary.dead > 0 ? ` · 已下架 ${section.summary.dead}` : '');
     const countText = providerClosed ? `${phrase}（该供应商已关闭）` : phrase;
-    const allDisabled = section.loaded && section.summary.total > 0
-      && section.summary.disabled >= section.summary.total;
-    const noneDisabled = section.loaded && section.summary.disabled === 0;
+    // ⚠ ⚠ **判据走 `centerBulkState`**（排除 dead 条目）：
+    // 服务端的写入集不含 dead 模型（它们被 `withDeadModelPruning` 剔除）
+    // ⇒ 用含 dead 的 `summary.total` 做比较会让「全关」按钮永不禁用（点下去服务端走幂等短路、
+    // 界面上一个数字都不变 ⇒ 观感为「按钮坏了」）。
+    const bulk = centerBulkState(section.models);
+    const allDisabled = section.loaded && bulk.allDisabled;
+    const noneDisabled = section.loaded && bulk.noneDisabled;
     return React.createElement('div', { key: section.id, className: 'dim-jh-modelGroup' },
       React.createElement('div', { className: 'dim-jh-modelGroupHead' },
         React.createElement('button', {
