@@ -53,6 +53,7 @@ import {
   formatExpirySplitLine,
   formatPoolSplitLine,
   splitCreditsByExpiry,
+  isExclusivePool,
 } from './credit-expiry.js';
 import { ensureJetHubStyles } from './jet-hub-styles.js';
 
@@ -1653,7 +1654,27 @@ function splitParts(balance, windowDays, provider) {
   // 当日池（loomy / raccoon）：池按名字分，没有到期维度 ⇒ 单段无色。
   if (poolText !== null) return [{ key: 'pool', text: poolText, tone: 'muted' }];
   // 其余渠道：按到期时间分**三档**，逐段带色（永久绿 / 长期黄 / 临期红 + 倒计时）。
-  return expirySplitParts(splitCreditsByExpiry(packages, windowDays, Date.now()), format, Date.now());
+  const now = Date.now();
+  const parts = expirySplitParts(splitCreditsByExpiry(packages, windowDays, now), format, now);
+  /**
+   * **独立池**（AStudio 星火积分等）追加一段无色说明。
+   *
+   * ⚠️ 为什么这里也要加（2026-10-21 真实缺陷）：设置页的账号卡片（`jet-hub.js`
+   *    的 `CreditBalanceRow`）与**本弹窗**是**两套独立渲染代码** —— 前者改了
+   *    后者没改，用户看到「设置页有、徽标弹窗没有」。本仓反复记录过这种
+   *    「同一语义两处渲染」的漂移，故两处必须同时改。
+   *
+   * ⚠️ `splitCreditsByExpiry` 已把独立池**摘出**三档（不进 `permanent`），
+   *    故这里从 `packages` 现算，不能从 `split` 里取。
+   */
+  const exclusive = packages.reduce(
+    (sum, pkg) => sum + (pkg && isExclusivePool(pkg) && pkg.active !== false ? (Number(pkg.remaining) || 0) : 0),
+    0,
+  );
+  if (exclusive > 0) {
+    parts.push({ key: 'exclusive', text: `另有 ${format(exclusive)} 专属（不计入）`, tone: 'muted' });
+  }
+  return parts;
 }
 
 /**
