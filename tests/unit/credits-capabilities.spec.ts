@@ -27,6 +27,12 @@ import { LOOMY } from '../../src/loomy-product.js'
 import { TRAE } from '../../src/trae-product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
 import { OFFICEACE } from '../../src/officeace-product.js'
+import { QODER, QODER_CN } from '../../src/qoder-product.js'
+import { ASTUDIO } from '../../src/astudio-product.js'
+import { MINIMAX, MINIMAX_INTL } from '../../src/minimax-product.js'
+// ⚠️ AutoClaw 两站（2026-10-21，用户要求「补锁定开关」）：本家**确实有**永久桶
+//    （活动赠送的永久分不带 `deductionEndTime`）⇒ 两站各占一项。
+import { AUTOCLAW, AUTOCLAW_INTL } from '../../src/autoclaw-product.js'
 
 /**
  * 积分能力矩阵的回归测试。
@@ -682,10 +688,38 @@ describe('永久积分锁定能力', () => {
    * 归一化到 `deductionEndTime` 后即可用同一个 `splitBuddyCreditsByExpiry` 分桶。
    * ⚠️ 2026-10-12 新增 OfficeAce（华为 MaaS）：creditGroups 自带 expiresAt
    *（订阅套餐包无固定到期 = 永久桶，签到 / 活动包有明确到期），同款判据可分桶。
+   *
+   * ⚠️ 2026-10-20 新增 Qoder 国际版 / 中国版（用户要求补齐三档分档 + 永久锁）：
+   *   `/sash/api/v2/me/usage` 的 `usage.expiresAt` 在个人版下发的恒是**永久哨兵**
+   *   `253402214400000`（`9999-12-31`）—— `qoder-credits.ts` 判定为哨兵时
+   *   **不写** `deductionEndTime`（未知到期 ⇒ 落永久桶），真实时间戳才写。
+   *   ⚠️ 判据是「不写」而非「写一个远期时刻」：后者会让面板渲染出
+   *   `9999-12-31（约 2900000 天后）` 这种荒谬文案（见
+   *   `tests/unit/qoder-lock-wiring.spec.ts` 的 `packageExpiryMs` 断言）。
+   *   ⚠️ **同样必须各占一项**（共用一个 `QoderAuth` 不等于共用一个 id）。
+   *
+   * ⚠️ 2026-10-20 新增 AStudio（讯飞 AstronStudio）：`/points/balance` 三池各带
+   *   `*NextExpireTime`（不带时区的本地时间串），已由 `astudio-credits.ts` 的
+   *   `astudioLocalTimeMs` 归一化到 `deductionEndTime`；且已接上
+   *   `createCredentialResolver` 的 `kind: 'buddy'` 选号（锁定才真能拦）。
+   *
+   * ⚠️ 2026-10-20 新增 MiniMax Code 中国版 / 国际版（用户报障：「MiniMax Code
+   *   积分也有到期时间，也应当有相同功能」）：`/minimax-cloud/api/v1/credit/details`
+   *   的每条 `details[]` 带 `expire_at_ms`（毫秒时间戳，无需换算），已直接写进
+   *   `deductionEndTime`；同日接上同一个 `kind: 'buddy'` 选号。
+   *   ⚠️ **是两个渠道 id，必须各占一项**（共用一个 `MinimaxAuth` 不等于共用一个 id）。
    */
-  const SUPPORTED = [LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id]
+  const SUPPORTED = [
+    LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id,
+    QODER.id, QODER_CN.id,
+    ASTUDIO.id, MINIMAX.id, MINIMAX_INTL.id,
+    // ⚠️ autoclaw / autoclawintl（2026-10-21 用户要求「补锁定开关」）：
+    //    本家批次映射里「无到期字段的发放（活动赠送的永久分）」⇒ 永久桶存在
+    //    ⇒ 需要锁定能力。两站**各占一项**（账号不互通）。
+    AUTOCLAW.id, AUTOCLAW_INTL.id,
+  ]
   const UNSUPPORTED = [
-    'codearts', 'qoder', 'qodercn', 'cline', 'raccoon',
+    'codearts', 'cline', 'raccoon',
   ]
 
   it('前后端的支持面完全一致（逐个 provider 对账）', () => {
@@ -778,7 +812,17 @@ describe('永久积分锁定能力', () => {
     })
 
     it('未登记的 provider 回落到 Loomy 口径而不是崩（面板共用同一段代码）', () => {
-      expect(permanentLockCopy('codearts').lockedNotice).toContain('每日赠送额度')
+      // ⚠️ 2026-10-20：原来这里用 `codearts` 当「未登记」的样本，但 codearts
+      // 现在已有 `usesExpiryWindow: true`（三档分档 + 永久锁）⇒ 它走的是带天数
+      // 那套文案，不再回落。改用一个**确实未登记**的 id，测的才是回落本身。
+      expect(permanentLockCopy('modelscope').lockedNotice).toContain('每日赠送额度')
+      expect(permanentLockCopy('__not_registered__').lockedNotice).toContain('每日赠送额度')
+    })
+
+    it('codearts 现在走带天数的文案，不再回落（三档分档生效后必须如此）', () => {
+      const copy = permanentLockCopy('codearts', 15)
+      expect(copy.lockedNotice).toContain('15 天内到期')
+      expect(copy.lockedNotice).not.toContain('每日赠送额度')
     })
   })
 })

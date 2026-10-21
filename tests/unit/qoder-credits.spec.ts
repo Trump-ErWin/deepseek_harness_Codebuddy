@@ -70,6 +70,143 @@ describe('Qoder 积分余额', () => {
     expect(balance!.total).toBe(140)
   })
 
+  /**
+   * ★★ **`dedicatedResourcePackages` 的永久哨兵也必须被拦住**
+   * （2026-10-21 合并审计发现，真实缺陷）。
+   *
+   * ## 缺陷
+   *
+   * PR !131 只对 `userQuota` 那一路的数字 `expiresAt` 做了哨兵识别，判定为永久后
+   * **直接落到 `expiredTime` 字符串那一路**（`dedicatedResourcePackages[]` 走的正是
+   * 它），而**那一路没有哨兵判据**。本机账号该字段实测是 `undefined` ⇒ 这条路径
+   * **没有真机样本**，缺陷因此从未暴露。
+   *
+   * 实测后果（本用例固化）：
+   * 1. `deductionEndTime` 被写成 `253402214400000` ⇒ 客户端
+   *    `formatPackageExpiry` 渲染出 **「9999-12-31（2912150 天后）」**；
+   * 2. 该包落 **`longTerm`** 而不是 `permanent`，而 `longTerm` 在**锁定永久积分时
+   *    仍然可选** ⇒ 「锁住的永久积分」在这一路径上照样被烧，锁定形同虚设。
+   *
+   * ⚠️ 本用例**必须断言 `deductionEndTime` 不存在**，不能只断言 `total` ——
+   *    上面那条既有用例只断言 `total`，改坏哨兵判据它照样绿（这就是它没抓到
+   *    本缺陷的原因）。
+   */
+  it('★★ dedicatedResourcePackages 的 9999 哨兵不得写进 deductionEndTime', async () => {
+    const fetcher = vi.fn(async () => usageResponse({
+      userQuota: { total: 0, used: 0, remaining: 0, unit: 'credits' },
+      dedicatedResourcePackages: [
+        {
+          id: 'p1',
+          name: '包A',
+          total: 100,
+          used: 0,
+          remaining: 100,
+          unit: 'credits',
+          expiresAt: '9999-12-31T00:00:00.000Z',
+        },
+      ],
+    })) as unknown as typeof fetch
+    const balance = await fetchQoderCreditBalance(cred, QODER, fetcher)
+    const pkg = balance!.packages.find((p) => p.name === '包A')
+    expect(pkg, '包A 应被解析出来').toBeDefined()
+    expect(
+      pkg!.deductionEndTime,
+      '★ 9999 哨兵不得写进 deductionEndTime（否则渲染成「9999-12-31（约 290 万天后）」）',
+    ).toBeUndefined()
+    // 余额照常计入（哨兵只影响「何时作废」，不影响「有多少」）。
+    // ⚠️ `usageResponse` 的默认报文里 `addOnQuota` 带 100 ⇒ 合计 100 + 100。
+    expect(balance!.total).toBe(200)
+  })
+
+  it('★★ 同上，纯日期形态 "9999-12-31" 与 9999 年内其它日期也要挡', async () => {
+    for (const raw of ['9999-12-31', '9999-01-01', '9999-06-15T12:00:00.000Z']) {
+      const fetcher = vi.fn(async () => usageResponse({
+        userQuota: { total: 0, used: 0, remaining: 0, unit: 'credits' },
+        dedicatedResourcePackages: [
+          { id: 'p', name: 'P', total: 10, used: 0, remaining: 10, unit: 'credits', expiresAt: raw },
+        ],
+      })) as unknown as typeof fetch
+      const balance = await fetchQoderCreditBalance(cred, QODER, fetcher)
+      expect(
+        balance!.packages.find((p) => p.name === 'P')!.deductionEndTime,
+        `${raw} 必须被识别为哨兵`,
+      ).toBeUndefined()
+    }
+  })
+
+  /**
+   * ★★ **哨兵命中时 `expiredTime` 也必须清空**（2026-10-21 对抗性审计发现，P1）。
+   *
+   * ## 缺陷：只挡 `deductionEndTime` 是**不完整的修复**
+   *
+   * 客户端 `credit-expiry.js` 的 `packageExpiryMs()` 是**两段回落**：
+   * 先读 `deductionEndTime`（数字），读不到再读 `expiredTime`（字符串，
+   * `Date.parse`）。⇒ 即使上一版已把 `deductionEndTime` 正确清空，
+   * 只要 `expiredTime` 还留着原串，tooltip 照样渲染哨兵日期。
+   *
+   * 实测（本机，构造报文）：
+   * ```
+   * { deductionEndTime: undefined, expiredTime: '9999-12-31T00:00:00.000Z' }
+   * → packageExpiryMs    = 253402214400000
+   * → formatPackageExpiry = "9999-12-31（2912150 天后）"
+   * ```
+   * ⇒ 正是本 PR 声称「已消灭」的那句荒谬文案，**换了个字段入口又回来**。
+   *   分桶不受影响（`permanent`，锁定会拦），但三档行说「永久」、hover 里说
+   *   「9999-12-31 到期」，**同一个包两句话互相矛盾**。
+   *
+   * ⚠️ 这条用例**必须断言 `expiredTime` 为空串** —— 只断言
+   *    `deductionEndTime === undefined`（上面两条）抓不到本缺陷。
+   */
+  it('★★ 哨兵命中时 expiredTime 也必须清空（否则前端回落到它，照样渲染 9999）', async () => {
+    const fetcher = vi.fn(async () => usageResponse({
+      userQuota: { total: 0, used: 0, remaining: 0, unit: 'credits' },
+      dedicatedResourcePackages: [
+        {
+          id: 'p', name: 'P', total: 100, used: 0, remaining: 100,
+          unit: 'credits', expiresAt: '9999-12-31T00:00:00.000Z',
+        },
+      ],
+    })) as unknown as typeof fetch
+    const balance = await fetchQoderCreditBalance(cred, QODER, fetcher)
+    const pkg = balance!.packages.find((p) => p.name === 'P')!
+    expect(
+      pkg.expiredTime,
+      '★ 哨兵串不得留在 expiredTime 里 —— 前端 packageExpiryMs 会回落到它并渲染「9999-12-31（约 290 万天后）」',
+    ).toBe('')
+  })
+
+  it('★ 反面对照：真实日期的 expiredTime 必须原样保留（tooltip 要显示上游原文）', async () => {
+    // 若把 `expiredTime` 一律清空，上面那条会绿而真实原文丢失 —— 这是反向对照。
+    const raw = '2026-11-19T00:00:00.000Z'
+    const fetcher = vi.fn(async () => usageResponse({
+      userQuota: { total: 0, used: 0, remaining: 0, unit: 'credits' },
+      dedicatedResourcePackages: [
+        { id: 'p', name: 'P', total: 100, used: 0, remaining: 100, unit: 'credits', expiresAt: raw },
+      ],
+    })) as unknown as typeof fetch
+    const balance = await fetchQoderCreditBalance(cred, QODER, fetcher)
+    const pkg = balance!.packages.find((p) => p.name === 'P')!
+    expect(pkg.expiredTime).toBe(raw)
+    expect(pkg.deductionEndTime).toBe(Date.parse(raw))
+  })
+
+  it('★ 反面对照：dedicatedResourcePackages 的**真实**到期日期仍要写进 deductionEndTime', async () => {
+    // 若把哨兵判据写成「一律不写」，上面两条会全绿而真实日期丢失 ——
+    // 这条是那个方向的反面对照（本仓库红线：守卫必须有反向对照）。
+    const fetcher = vi.fn(async () => usageResponse({
+      userQuota: { total: 0, used: 0, remaining: 0, unit: 'credits' },
+      dedicatedResourcePackages: [
+        {
+          id: 'p', name: '真实包', total: 100, used: 0, remaining: 100,
+          unit: 'credits', expiresAt: '2026-11-19T00:00:00.000Z',
+        },
+      ],
+    })) as unknown as typeof fetch
+    const balance = await fetchQoderCreditBalance(cred, QODER, fetcher)
+    const pkg = balance!.packages.find((p) => p.name === '真实包')!
+    expect(pkg.deductionEndTime).toBe(Date.parse('2026-11-19T00:00:00.000Z'))
+  })
+
   it('企业版（displayMode=enterprise）返回带原因的 null，而非 0', async () => {
     // 「查不到」与「余额为 0」必须严格区分（AGENTS.md 约定）
     const fetcher = vi.fn(async () => new Response(JSON.stringify({

@@ -6117,7 +6117,29 @@ function registerJetHubEndpoints(
               ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
             })
           }
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+          /**
+           * ⚠️⚠️ **必须回传 `windowDays`**（2026-10-20 补，真实缺口）。
+           *
+           * 客户端 `plugin-src/client/credit-expiry.js` 的 `normalizeWindowDays`：
+           * ```
+           * if (windowDays === undefined || windowDays === null || windowDays === '') return null
+           * ```
+           * ⇒ 缺该字段会让**整个三档分桶行静默不渲染**（胶囊只有合计、
+           * 没有「永久 / 长期 / 临期」三行）—— 即 registry 的
+           * `usesExpiryWindow: true` 只是闸门的**一半**，本字段是另一半。
+           *
+           * ⚠️ 本分支是**特例短路**（不走下面的查表分派），故不能靠通用逻辑
+           *    补上，必须像 officeace 分支那样显式回传。同文件 `:5929-5933`
+           *    的注释已点名过这个坑（实测症状：`officeace 必须回传 windowDays`）。
+           * ⚠️ 两站共用本分支（`isQoderFamily`），故一处修复两站同时受益。
+           */
+          return {
+            ok: true,
+            value: {
+              accounts: values,
+              windowDays: buddyExpiringWindowDays(),
+            } satisfies RpcCreditsBalancesResponse,
+          }
         }
 
         // ── OfficeAce（华为 ModelArts MaaS）──

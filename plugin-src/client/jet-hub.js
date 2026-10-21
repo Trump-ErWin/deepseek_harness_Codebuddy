@@ -622,6 +622,15 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     balance.expiredTotal > 0
       ? React.createElement('span', { className: 'dim-jh-creditExpired' },
           `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)
+      : null,
+    /**
+     * 失效额度单独提示：它们仍在服务端响应里，但不计入上面的数字
+     * ⚠️ 配额单位下恒不渲染（`expiredTotal` 就是 0），留着分支只为不改变
+     * 其它 provider 的行为。
+     */
+    balance.expiredTotal > 0
+      ? React.createElement('span', { className: 'dim-jh-creditExpired' },
+          `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)
       : null));
 }
 
@@ -6348,10 +6357,39 @@ function GatewayPanel({ status, busy, notice, onToggle, onToggleAllowLan, onRelo
  * ⚠️⚠️ **本清单存的是 provider id，不是显示名** —— 显示名一律经
  * `providerLabel(id)` 现查（L192）。这样「id → label」只有一处真相源
  * （registry），本名单与自己都不抄名字 ⇒ 改名/新增 provider 时**零改动**。
+ *
+ * ⚠️ **Qoder 中国版 / 国际版**（2026-10-20，该陷阱第 7 次复发）：两家都是
+ * `AGGREGATE_CHANNELS` 的成员，同日接入 `WIRED_EXPIRY_PROVIDERS`
+ *（折算原语 `qoderExpiry` 走共享的 `sharedPackageExpiry`）。
+ * ⚠️ 同样**是两个渠道 id，必须各占一项**（两站共用同一个 `QoderAdapter` 类
+ * 与同一份 `fetchQoderCreditBalance`，差异只在 `qoder-product.ts` 的
+ * `QODER` / `QODER_CN` 常量）—— 漏掉中国版 ⇒ 只用中国站的用户仍看到错话。
+ *
+ * ⚠️ 但**如实标注本家的实际形态**，本行文案不要被读成「Qoder 也有临期档」：
+ * Qoder 上游 `/sash/api/v2/me/usage` **只下发聚合标量**（`userQuota` /
+ * `addOnQuota` 各一个 `total/used/remaining`），**逐包到期拿不到**
+ *（逐包明细端点只对浏览器登录态开放；`dedicatedResourcePackages` 才是唯一带
+ * 真实 `expiresAt` 的字段，本机账号实测为 `undefined`）⇒ 它的**临期桶恒为 0**、
+ * 全部额度进「永久（未知到期）」桶。这**不影响本行必须列出它** ——
+ * 本行的语义是「哪些渠道参与了跨渠道临期优先路由的候选表」，而 Qoder
+ * 确实已接入该表（`aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`）。
+ * 指「有没有临期积分可排序」是另一回事，由上游给不给逐包日期决定。
+ * ⚠️ **AStudio**（讯飞 AstronStudio，2026-10-20）：`/points/balance` 的
+ * member / buy / activity 三池各带 `*NextExpireTime` ⇒ 已进
+ * `WIRED_EXPIRY_PROVIDERS`，这里必须同改（漏改会让只登了 AStudio 的账号在
+ * 聚合面板看到「请先在……登录账号」这句错话）。
+ *
+ * ⚠️ **MiniMax Code 中国版 / 国际版**（2026-10-20，第 6 次复发）：两家都是
+ * `AGGREGATE_CHANNELS` 的成员，且 `/minimax-cloud/api/v1/credit/details` 的
+ * 每条 `details[]` 带 `expire_at_ms` ⇒ 同日接入 `WIRED_EXPIRY_PROVIDERS`，
+ * 这里必须同改。⚠️ **是两个渠道 id，必须各占一项**（共用一个 `MinimaxAuth`
+ * 不等于共用一个 id）；漏掉国际版 ⇒ 只登国际站的用户仍看到错话。
  */
 const AGG_WIRED_CHANNEL_IDS = [
   'buddy', 'workbuddy', 'loomy', 'codearts', 'zcode', 'lobsterai', 'trae',
   'accio', 'officeace', 'modelscope', 'autoclaw', 'autoclawintl',
+  'qoder', 'qodercn',
+  'astudio', 'minimax', 'minimaxintl',
 ];
 
 /**
