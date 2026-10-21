@@ -20,6 +20,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  EXPIRY_PROBE_BUDGET_MS,
   WIRED_EXPIRY_PROVIDERS,
   codeArtsExpiry,
   createExpiryProbe,
@@ -1011,4 +1012,84 @@ describe('★ clear() 必须挡住在途探测（陈旧值不得活过 clear）'
     await probe('lobsterai')
     expect(calls, 'TTL 内应命中缓存').toBe(afterFirst)
   })
+})
+
+describe('EXPIRY_PROBE_BUDGET_MS 常量', () => {
+  it('导出 8 秒，且小于「用户认为卡死」的 10 秒', () => {
+    expect(EXPIRY_PROBE_BUDGET_MS).toBe(8_000)
+    expect(EXPIRY_PROBE_BUDGET_MS).toBeLessThan(10_000)
+  })
+})
+
+describe('★ 预算真的封顶（断言 1）', () => {
+  it(
+    '7 个账号全部挂死 ⇒ 在预算附近收工，不是 7×30s',
+    async () => {
+      stubFetchHangs()
+      // ⚠️ 用**真实时钟**：fake timers 会让「计时器没保持事件循环活跃」这条
+      //    缺陷测不出来（见文件头）。
+      const probe = createExpiryProbe(poolWith(7), async () => 'deepseek-v4.1-flash')
+      const startedAt = Date.now()
+      const value = await probe('lobsterai')
+      const elapsed = Date.now() - startedAt
+
+      expect(value, '全部账号都查不到 ⇒ 必须剔除，不能判成「可用但不临期」').toBe(UNUSABLE)
+      expect(value, '绝不能是 NEVER（Infinity）—— 那会被排序当成永久可用').not.toBe(NEVER)
+      // 上界留足余量（CI 抖动）；下界只需证明它不是 210 s。
+      expect(elapsed, '预算必须封顶：7 个账号 × 30s = 210s 是升级前的实际耗时').toBeLessThan(EXPIRY_PROBE_BUDGET_MS + 5_000)
+    },
+    EXPIRY_PROBE_BUDGET_MS + 10_000,
+  )
+
+  it(
+    'budgetMs: 0 ⇒ 不封顶（断言 3：升级前行为被保留）',
+    async () => {
+      stubFetchHangs()
+      const probe = createExpiryProbe(poolWith(2), async () => 'deepseek-v4.1-flash', { budgetMs: 0 })
+      // 不封顶时 2 个账号各吃满自己的 30 s 超时 ⇒ 断言它**没有**在 8 s 内结束。
+      // ⚠️ 这条用短超时桩会更快，但那就测不到「不封顶」这个语义了。
+      const startedAt = Date.now()
+      await probe('lobsterai')
+      expect(Date.now() - startedAt, 'budgetMs: 0 必须保留旧的「等到上游自己超时」语义')
+        .toBeGreaterThan(EXPIRY_PROBE_BUDGET_MS)
+    },
+    90_000,
+  )
+})
+
+describe('★ 预算耗尽时保留已成功的观测值（断言 2）', () => {
+  it(
+    '第 1 个账号成功、其余挂死 ⇒ 返回第 1 个的真实到期时刻，不判 UNUSABLE',
+    async () => {
+      const expiry = Date.now() + 86_400_000
+      let call = 0
+      vi.stubGlobal('fetch', ((_input: unknown, init?: { signal?: AbortSignal }) => {
+        call += 1
+        if (call === 1) {
+          return Promise.resolve(new Response(JSON.stringify({
+            code: 0,
+            data: { Response: { Data: { Accounts: [
+              { Status: 1, CycleCapacityRemain: 10, DeductionEndTime: expiry },
+            ] } } },
+          }), { status: 200, headers: { 'content-type': 'application/json' } }))
+        }
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            const error = new Error('aborted')
+            error.name = 'AbortError'
+            reject(error)
+          })
+        })
+      }) as unknown as typeof fetch)
+
+      const probe = createExpiryProbe(poolWith(7), async () => 'deepseek-v4.1-flash')
+      const startedAt = Date.now()
+      const value = await probe('lobsterai')
+      const elapsed = Date.now() - startedAt
+
+      expect(value, '预算耗尽时已成功的账号仍是有效观测 —— 不能把整个渠道剔掉').toBe(expiry)
+      expect(elapsed, '仍然必须在预算附近收工').toBeLessThan(EXPIRY_PROBE_BUDGET_MS + 5_000)
+    },
+    EXPIRY_PROBE_BUDGET_MS + 10_000,
+  )
 })
