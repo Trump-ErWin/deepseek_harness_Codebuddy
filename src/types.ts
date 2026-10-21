@@ -1662,6 +1662,36 @@ export interface RpcNativeSearchSetEnabledResponse {
 }
 
 /**
+ * RPC: 「侧栏入口」开关的读取响应（Jet Hub 页头的「侧栏」开关）。
+ *
+ * 语义：`true` = 在**主导航**里显示「Jet Hub」入口（点它把 Jet Hub 页渲染进
+ * 中央主面板）；`false` = 只保留「设置 → Jet Hub」这一条进入路径。
+ *
+ * ⚠️ 为什么这个偏好住**宿主**（`state.json`）而不是浏览器 `localStorage`：
+ * 本插件的三条进入路径（Web / 桌面 / headless）共用同一份 `~/.dsh` 状态，
+ * 而 Web 侧的 origin 是 `127.0.0.1:<随机端口>` —— **每次启动端口都变**，
+ * `localStorage` 会随旧 origin 一起被抛弃，表现为「关掉的入口下次启动又回来了」。
+ */
+export interface RpcSidebarEntryGetEnabledResponse {
+  enabled: boolean
+}
+
+/** RPC: 「侧栏入口」开关写入请求。 */
+export interface RpcSidebarEntrySetEnabledRequest {
+  enabled: boolean
+}
+
+/**
+ * RPC: 「侧栏入口」开关写入响应。
+ *
+ * ⚠️ 与 `nativeSearch.setEnabled` 同取向：回传的是**落盘后重读的值**，
+ * 客户端一律以后端回传为准，不做乐观更新（宿主侧可能因为脏文档把值归一）。
+ */
+export interface RpcSidebarEntrySetEnabledResponse {
+  enabled: boolean
+}
+
+/**
  * RPC: MiniMax 国际站 `X-Forwarded-For` 设置的读取响应（issue IKMEVG）。
  *
  * ⚠️ `xff` 是**归一后的实际值**，空串表示「未设置 / 不附头」。
