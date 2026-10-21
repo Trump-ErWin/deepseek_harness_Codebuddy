@@ -11,7 +11,9 @@
  *           model.list / model.setDisabled /
  *           captcha.demand / captcha.carrierUrl / captcha.contribute（内部载体，
  *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
- *           backup.export / backup.import / backup.status
+ *           backup.export / backup.import / backup.status /
+ *           nativeSearch.getEnabled / nativeSearch.setEnabled /
+ *           sidebarEntry.getEnabled / sidebarEntry.setEnabled /
  * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
  * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
  */
@@ -346,6 +348,9 @@ import type {
   RpcNativeSearchGetEnabledResponse,
   RpcNativeSearchSetEnabledRequest,
   RpcNativeSearchSetEnabledResponse,
+  RpcSidebarEntryGetEnabledResponse,
+  RpcSidebarEntrySetEnabledRequest,
+  RpcSidebarEntrySetEnabledResponse,
   RpcGatewayModel,
   RpcCaptchaDemandResponse,
   RpcCaptchaCarrierUrlResponse,
@@ -7653,6 +7658,38 @@ function registerJetHubEndpoints(
           + `${req.enabled ? '' : '（所有渠道改用 DeepSeek 官方搜索）'}`,
         )
         const value: RpcNativeSearchSetEnabledResponse = { enabled: pool.nativeWebSearchEnabled() }
+        return { ok: true, value }
+      }
+
+      // ── 「侧栏入口」开关（Jet Hub 页头的「侧栏」开关）──
+      //
+      // 语义：**开** = 主导航（`sidebar.panellist`）里显示「Jet Hub」一行，
+      // 点它把 Jet Hub 页渲染进中央主面板（`main` 槽的 `jet-hub` key）；
+      // **关** = 该行消失，进入路径只剩「设置 → Jet Hub」。
+      //
+      // 消费方是客户端：`plugin-src/client/sidebar-entry.js` 在 `apply` 里先读
+      // 一次本端点，再决定注不注入那行；页头开关写回后由同一份进程内副本
+      // 通知两侧（设置页与主面板）重新渲染。
+      case 'sidebarEntry.getEnabled': {
+        const value: RpcSidebarEntryGetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
+        return { ok: true, value }
+      }
+
+      case 'sidebarEntry.setEnabled': {
+        const req = payload as RpcSidebarEntrySetEnabledRequest
+        // ⚠️ 与 `nativeSearch.setEnabled` 同约定：**不做默认值猜测** ——
+        // 默认成 true 会静默打开用户特意关闭的入口。
+        if (typeof req.enabled !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        }
+        await pool.setSidebarEntryEnabled(req.enabled)
+        // 不刷新任何缓存：客户端的注册逻辑读的是**同一个**进程内副本，
+        // 写完由客户端自己按返回值（落盘后重读）同步两侧 UI。
+        ctx.logger.info(
+          `[jet-hub] ${req.enabled ? '显示' : '隐藏'}主导航侧栏入口`
+          + `${req.enabled ? '' : '（仍可从「设置 → Jet Hub」进入）'}`,
+        )
+        const value: RpcSidebarEntrySetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
         return { ok: true, value }
       }
 
