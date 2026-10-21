@@ -53,6 +53,7 @@ import {
   formatExpirySplitLine,
   formatPoolSplitLine,
   splitCreditsByExpiry,
+  exclusivePoolRemainingOf,
   isExclusivePool,
 } from './credit-expiry.js';
 import { ensureJetHubStyles } from './jet-hub-styles.js';
@@ -1667,10 +1668,7 @@ function splitParts(balance, windowDays, provider) {
    * ⚠️ `splitCreditsByExpiry` 已把独立池**摘出**三档（不进 `permanent`），
    *    故这里从 `packages` 现算，不能从 `split` 里取。
    */
-  const exclusive = packages.reduce(
-    (sum, pkg) => sum + (pkg && isExclusivePool(pkg) && pkg.active !== false ? (Number(pkg.remaining) || 0) : 0),
-    0,
-  );
+  const exclusive = exclusivePoolRemainingOf(packages);
   if (exclusive > 0) {
     parts.push({ key: 'exclusive', text: `另有 ${format(exclusive)} 专属（不计入）`, tone: 'muted' });
   }

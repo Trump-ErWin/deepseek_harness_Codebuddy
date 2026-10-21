@@ -2138,6 +2138,39 @@ describe('model.list / model.setDisabled 端点', () => {
     const warningsOf = (result: unknown): string[] =>
       ((result as { value?: { warnings?: string[] } }).value?.warnings) ?? []
 
+    /**
+     * ⚠️⚠️ **批量端点的 `warnings` 恒为空，这是正确的**（2026-10-21 合并审计定论）。
+     *
+     * ⚠️ 合并审计最初判这条是「重要缺陷」（`model.setAllDisabled` 不调
+     * `catalogWarnings` ⇒ 客户端的提示通道恒空）。**实测证明那是误判**：
+     * `catalogWarnings` 的判据是「`ids` 里不在 `known` 的」，而批量端点传的
+     * `ids` 本就是 `catalog.ids`，而 `readableCatalogIds` 的 `known` 是
+     * `new Set(catalog.ids)` **并回黑名单** ⇒ `known ⊇ catalog.ids` **恒成立**
+     * ⇒ `missing` 恒为空。
+     *
+     * ⇒ 而这正是**语义正确**的：批量关闭的对象是「目录里的全部模型」—— 它们
+     * **本来就在目录里**，不存在「关了但没有效果」的那个 id（那是**逐条开关**
+     * 的语义）。所以批量路径**无事可警告**。
+     *
+     * ⚠️ 本用例把这条**钉住**：将来若有人给批量路径加上 `catalogWarnings`（看起来
+     * 「补齐提示通道」），它会**恒空** ⇒ 本条会红 ⇒ 提醒他那是死代码。
+     */
+    it('★ 批量端点的 warnings 恒为空（批量关闭的对象本就在目录里 ⇒ 无事可警告）', async () => {
+      const { call } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+        disabledModels: { buddy: { 'gone-model': true } },
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(true)
+      expect(
+        warningsOf(result),
+        '★ 批量路径的 warnings 应恒空（`known ⊇ catalog.ids` ⇒ missing 恒空）',
+      ).toEqual([])
+    })
+
     it('关闭一个不在目录里的 id → 仍写入黑名单，但 warnings 点名说明它不在目录', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
@@ -4249,6 +4282,84 @@ describe('provider.status / provider.setEnabled 端点', () => {
         '★★ 「关闭全部模型」没落意图 ⇒ 目录变长后翻回「已打开」（IKP8OF 第二入口）',
       ).toBe(true)
     })
+
+    /**
+     * ★★ **模型级的「全关」不得落「供应商整体关闭」意图**（2026-10-21 合并审计发现，阻断级）。
+     *
+     * ## 问题
+     *
+     * PR !120 新增的「供应商 → 模型列表」统一管理屏，它的「全关」调
+     * `model.setAllDisabled(true)` —— 而该端点原本**无条件落「供应商整体关闭意图」**
+     * （与 `provider.setEnabled(false)` 同一条路径）。
+     *
+     * ⇒ 意图的三个后果：
+     * ① `provider.status` 报 `closed: true` ⇒ 左侧分组变成「已关闭」；
+     * ② 各适配器的 `listModels` 直接返回 `[]` ⇒ 该家模型在选择器里**一个都没有**；
+     * ③ **打开任意一个模型会顺带把整个供应商打开**（打开方向会清意图）。
+     *
+     * ⇒ 两头都与用户意图相反，且**零提示**。
+     *
+     * ## ⚠️⚠️ 判据**不是** `provider.status` 的 `closed`（这里踩过一次）
+     *
+     * `closed` 有**两条腿**（`jet-hub-rpc.ts` 的 `provider.status` 分支）：
+     * ① **派生**：`total > 0 && disabled === total`（用户把该家的模型**逐条关光**也算关闭）
+     * ② **意图**：`providerClosedFor(provider)`（持久化，抗目录增长）
+     *
+     * ⇒ 「全关模型」之后，派生腿**本来就为真** ⇒ `closed` 必然是 `true`，
+     * **无论有没有落意图**。故拿 `closed` 判这条是**测不出差别**的
+     * （第一次写这条用例时就是这么写错的，当场变红）。
+     *
+     * ## 真正的差别：**目录增长之后**
+     *
+     * - 落了意图 ⇒ 派生腿翻回 false 时，意图腿仍把它按住 ⇒ 仍报「已关闭」；
+     * - 没落意图 ⇒ 目录一长，新 id 不在黑名单里 ⇒ 派生腿翻回 false
+     *   ⇒ 回到「已打开」、新模型**仍可选**（= 模型级语义，用户预期如此）。
+     *
+     * ⚠️ 这正是 IKP8OF 的两条腿：意图腿是**供应商级**按钮的语义，
+     * 模型级的「全关」**不该**继承它。
+     */
+    it('★★ 模型级「全关」（closeProvider: false）不落供应商关闭意图 ⇒ 目录变长后回到「已打开」', async () => {
+      const catalog = [...CATALOG]
+      const { call } = setup({ catalog })
+      const shut = await call('model.setAllDisabled', {
+        provider: 'buddy',
+        disabled: true,
+        closeProvider: false,
+      })
+      expect(shut.ok).toBe(true)
+
+      // 目录异步补齐（模拟上游新增模型）—— 派生腿在此翻回 false。
+      catalog.push(LATE_MODEL)
+
+      const after = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { closed: boolean }> }
+      expect(
+        after.statuses.buddy.closed,
+        '★★ 模型级「全关」不该落供应商关闭意图（否则目录一变长就永久关闭，用户只想关模型）',
+      ).toBe(false)
+    })
+
+    /**
+     * ★★ **反向对照**：**供应商级**的「关闭全部模型」**仍要**落意图。
+     *
+     * ⚠️ 缺省 `closeProvider` 为 `true`（保持既有语义）⇒ 上面的新参数**不能**
+     * 把 IKP8OF 的第二入口（目录变长后翻回「已打开」）重新打开。
+     */
+    it('★★ 反向对照：缺省（不传 closeProvider）仍落意图 ⇒ 目录变长后仍为「已关闭」', async () => {
+      const catalog = [...CATALOG]
+      const { call } = setup({ catalog })
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      catalog.push(LATE_MODEL)
+
+      const after = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { closed: boolean }> }
+      expect(
+        after.statuses.buddy.closed,
+        '★★ 缺省语义不得变（IKP8OF 第二入口）',
+      ).toBe(true)
+    })
+
 
     /**
      * ⚠️ **「逐条关光」这条既有语义不得被新判据挤掉**。

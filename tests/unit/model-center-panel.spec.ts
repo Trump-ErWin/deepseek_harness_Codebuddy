@@ -84,8 +84,27 @@ describe('ModelCenterPanel 的数据通路', () => {
 
   it('三个写端点都接了，且各自用途不混', () => {
     expect(panel).toContain("rpcCall('model.setDisabled', { provider: providerId, modelId, disabled })")
-    expect(panel).toContain("rpcCall('model.setAllDisabled', { provider: providerId, disabled })")
     expect(panel).toContain("rpcCall('model.clearDead', { provider: providerId, modelId })")
+    // ⚠️ 批量端点的调用形态变了（多了 `closeProvider: false`）⇒ 不能用整行字面量断言，
+    // 拆成「端点名」+「参数」两段（见下面那条用例）。
+    expect(panel).toContain("rpcCall('model.setAllDisabled'")
+  })
+
+  /**
+   * ★★ **模型级的「全关」必须显式传 `closeProvider: false`**（2026-10-21 合并审计发现，阻断级）。
+   *
+   * 服务端 `model.setAllDisabled(true)` 的**缺省**语义是「关闭该供应商」
+   * （落「供应商整体关闭意图」，与 `provider.setEnabled(false)` 同一条路径）。
+   * 本屏是**模型级**管理，用户的意图是「关这家模型」——
+   *
+   * ⇒ 缺省会把**整个供应商**也关掉：`provider.status` 报 closed、选择器里一个
+   * 模型都没有；再打开**任意一个**模型，供应商被顺带打开。两头都与用户意图相反，
+   * 且**零提示**。
+   */
+  it('★★ 整家全关必须显式传 closeProvider: false（不得落供应商关闭意图）', () => {
+    expect(panel).toContain('closeProvider: false')
+    // ⚠️ 反向断言：不得出现 `closeProvider: true`（那会显式落意图）。
+    expect(panel).not.toContain('closeProvider: true')
   })
 
   it('★ 整家全开/全关用 setAllDisabled，不用 setDisabledMany', () => {
