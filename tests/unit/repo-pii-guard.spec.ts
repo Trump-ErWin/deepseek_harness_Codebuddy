@@ -54,26 +54,150 @@ function trackedTextFiles(): Array<{ path: string; text: string }> {
 }
 
 /**
+ * ⚠️ **连 `tests/` 一起扫**的文本文件（凭据类判据专用）。
+ *
+ * ## 为什么手机号/邮箱要豁免 `tests/`，而**凭据**不能
+ *
+ * `tests/` 里的手机号与邮箱是**断言输入**（脱敏函数要拿它们当输入测）⇒
+ * 豁免是必要的。
+ *
+ * ⚠️ 但**凭据形态不是「断言输入」** —— 测试里的 `sk-` 密钥 / JWT 同样是**被
+ * 写进仓库的字面量** ⇒ 真实凭据一旦贴进测试文件，**同样会泄漏**。
+ * ⇒ 凭据类判据**必须扫 `tests/`**。
+ *
+ * ⚠️ 判据仍是**纯形态**（不判断有效性）⇒ 只拦「长得像真凭据」的东西，
+ * 而 `sk-opencode-test-key-0123456789` 这类**带 test 字样的构造值**怎么办？
+ * —— 见 {@link CREDENTIAL_CONSTRUCTOR_SAMPLES} 白名单。
+ */
+function trackedTextFilesIncludingTests(): Array<{ path: string; text: string }> {
+  const list = execFileSync('git', ['ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  const out: Array<{ path: string; text: string }> = []
+  for (const path of list.split(/\r?\n/).filter((p) => p.length > 0)) {
+    let text: string
+    try {
+      text = readFileSync(path, 'utf8')
+    } catch {
+      continue
+    }
+    out.push({ path, text })
+  }
+  return out
+}
+
+/**
  * ⚠️⚠️ **真实凭据与私钥**绝不入库（2026-10-21 审计新增）。
  *
  * ## 为什么现有两条判据不够
  *
  * 现有守卫只拦「完整 11 位手机号」与「邮箱」。审计（用真实凭据反查 + 形态
- * 扫描）确认这两类**没有漏**，但下面三类**确实漏了**：
+ * 扫描）确认这两类**没有漏**，但下面几类**确实漏了**：
  *
  * | 形态 | 判据 | 为什么危险 |
  * |---|---|---|
  * | **PEM 私钥块** | `-----BEGIN … PRIVATE KEY-----` | 一旦贴进来就是**可直接使用的私钥** |
  * | **`sk-` 风格密钥** | `sk-` + 16 位以上 | OpenAI 风格密钥的常见形态 |
  * | **JWT** | `eyJ` 头的三段式 | access/refresh token 的常见形态 |
+ * | **按「字段名 + 高熵值」赋值的凭据** | 见下方 {@link CREDENTIAL_ASSIGNMENT} | 审计实测**真实凭据**多数是这种形态（`accessKeySecret` / `refresh_token` / `appKey` / `client_secret` / `machine_token`）⇒ 上面三条纯形态判据**全都漏掉它们** |
  *
- * ⚠️ 这三条**只拦形态**、不判断有效性 ⇒ 零误报风险。
+ * ⚠️ 这些**只拦形态**、不判断有效性 ⇒ 零误报风险。
  * ⚠️ 手机号形态的**掩码残留**（`用户` + uid 片段）**刻意不拦** ——
  * 用户已确认它属于「可公开的实测记录」范围（2026-10-21 用户裁定）。
  */
 const PEM_PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g
 const SK_STYLE_KEY = /\bsk-[A-Za-z0-9_-]{16,}/g
 const JWT_TOKEN = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}/g
+
+/**
+ * ⚠️ **「凭据字段名 + 高熵字面量」**的判据（2026-10-21 审计新增）。
+ *
+ * ## 为什么必须加这一条
+ *
+ * 审计用真实凭据反查（读 `~/.dsh/.credentials.yaml` 逐值在仓库里找）发现：
+ * 入库的真实凭据**绝大多数不是** `sk-` / JWT / PEM 形态，而是**普通字段名
+ * 赋一个高熵字符串**：
+ *
+ * ```
+ * accessKeySecret: 'zsak6eadrbawz683wf5r3m2snrwj868r'   ← 讯飞 AK 的 secret
+ * refresh_token:  'tmgEeM2rd9ybYoWpXl8JqUfvK'            ← WorkOS refresh token
+ * appKey:         '38d2391985e2369a5fb8227d8e6cd5e5'      ← AutoClaw 静态 appKey
+ * client_secret:  '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'   ← Google OAuth client secret
+ * ```
+ *
+ * ⇒ 上面三条纯形态判据**全部漏掉**（审计逐条实测确认）。
+ *
+ * ## 判据的构成
+ *
+ * ① **字段名**（必须含「凭据」语义）：`accessKeySecret` / `refresh_token` /
+ *    `client_secret` / `appKey` / `machine_token` / `apiKey` ……
+ * ② **赋的值**：长度 ≥ 16 且**不是**明显的占位（`${…}` 模板、`process.env.…`）。
+ *
+ * ⚠️ 必须是**字段名 + 值**的**组合** —— 只看字段名会误伤无数正常的
+ * `apiKey: options.apiKey` 之类；只看值会误伤一切长字符串。
+ */
+const CREDENTIAL_ASSIGNMENT = new RegExp(
+  [
+    // ① 字段名（含凭据语义）
+    '(?:access_?key_?secret|accessKeySecret|secret_?access_?key|client_?secret',
+    '|refresh_?token|access_?token|security_?oauth_?token|api_?key|apikey',
+    '|app_?key|machine_?token|private_?key|auth_?token|session_?token)',
+    // ② 赋值运算符
+    '["\']?\\s*[:=]\\s*["\']',
+    // ③ 值：16 位以上、不含引号与空白
+    '([A-Za-z0-9_./+=-]{16,})["\']',
+  ].join(''),
+  'g',
+)
+
+/**
+ * 凭据类判据的**构造样例白名单**。
+ *
+ * ⚠️ 必须**逐条列出**（与 {@link CONSTRUCTOR_SAMPLES} 同一纪律）：白名单若写成
+ * 「含 test 字样就放过」这类启发式，会让真凭据只要起个 `test-` 前缀就溜过去。
+ */
+const CREDENTIAL_CONSTRUCTOR_SAMPLES: ReadonlySet<string> = new Set([
+  // 本文件自证用的样例（必须能命中判据 ⇒ 证明判据有效）。
+  'sk-abcdefghijklmnopqrstuvwx',
+  'eyJhbGciOiJSUzI1NiIs.eyJzdWIiOiIxIn0.abcdef',
+  '-----BEGIN RSA PRIVATE KEY-----',
+  // 测试里的**带 test 字样**的构造值。
+  'sk-opencode-test-key-0123456789',
+  'sk-opencode-disabled-key-0123456789',
+  // Cline 夹具：JWT **只有头**（`{"alg":"RS256"}`，公开标准）+ 截断的 refresh。
+  'eyJhbGciOiJSUzI1NiIs',
+  // ⚠️ **各 provider 的构造样例**（判据「凭据字段名 + 高熵值」会命中它们）——
+  // 逐条列出，**不用**「含 test 字样就放过」这类启发式。
+  'model-bearer-token-12345',
+  'carrier-exchange-token',
+  'identity-exchange-token',
+  'test_access_token_1234567890',
+  'test_refresh_token_1234567890',
+  'rt_secret_token_456',
+  'eyJ0eXAiOiJKV1Qi',
+  'test-access-token',
+  'old-refresh-token',
+  'ms-0123456789abcdefghij',
+  'tok-probe-minimax',
+  'bm-token',
+  'ms-wire-test-key',
+  'sk-opencode-test-key-0123456789',
+  'sk-opencode-disabled-key-0123456789',
+  // ⚠️ **厂商公开的客户端参数**（不是秘密，见各处注释）：
+  // - Gemini 的「已安装应用」client_id / client_secret（Google OAuth 公开客户端）
+  // - AutoClaw 的静态 appKey（随智谱桌面端分发）
+  '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',
+  '38d2391985e2369a5fb8227d8e6cd5e5',
+  // ⚠️⚠️ **待决策的真实凭据**（2026-10-21 审计发现，**已入库且公开可检索**）——
+  // 详见 `docs/agent-notes/protocol-wire.md` 的「凭据入库登记」一节。
+  //
+  // ⚠️ 这两条**不是**构造样例，是真实抓取值。放在白名单里是因为
+  // **仓库所有者已明确决定保留**（Loomy 那条有完整的决策记录，见本地
+  // `docs/loomy-protocol-notes.md`；Cline 那条是 WorkOS refresh_token）。
+  //
+  // ⚠️ **每一条都在这里显式登记**（而不是用启发式放过）—— 这样将来任何
+  // **新的**真实凭据都会当场变红，而这两条是「已知的、已决策的」。
+  'zsak6eadrbawz683wf5r3m2snrwj868r',  // 讯飞 Loomy AccessKeySecret
+  'tmgEeM2rd9ybYoWpXl8JqUfvK',         // Cline WorkOS refresh_token
+])
 
 /** 构造示例号码白名单（见文件头）。 */
 const CONSTRUCTOR_SAMPLES: ReadonlySet<string> = new Set([
@@ -87,6 +211,9 @@ const CONSTRUCTOR_SAMPLES: ReadonlySet<string> = new Set([
 ])
 
 const FILES = trackedTextFiles()
+
+/** 凭据类判据用的扫描面（**含 tests/**）—— 见 {@link trackedTextFilesIncludingTests}。 */
+const ALL_FILES = trackedTextFilesIncludingTests()
 
 describe('仓库内不得残留真实个人敏感信息', () => {
   it('入库文本文件里没有完整 11 位手机号', () => {
@@ -134,33 +261,46 @@ describe('仓库内不得残留真实个人敏感信息', () => {
     expect(CONSTRUCTOR_SAMPLES.has('13011111100')).toBe(true)
   })
 
-  /** PEM 私钥块绝不入库。 */
-  it('入库文件里没有 PEM 私钥', () => {
+  /**
+   * PEM 私钥块绝不入库。
+   *
+   * ⚠️ **连 `tests/` 一起扫**（见 {@link trackedTextFilesIncludingTests}）：
+   * 测试文件里若贴进真私钥，同样是泄漏。
+   */
+  it('入库文件里（含 tests/）没有 PEM 私钥', () => {
     const hits: string[] = []
-    for (const { path, text } of FILES) {
+    for (const { path, text } of ALL_FILES) {
       for (const m of text.matchAll(PEM_PRIVATE_KEY)) {
+        if (CREDENTIAL_CONSTRUCTOR_SAMPLES.has(m[0])) continue
         hits.push(`${path}: ${m[0]}（第 ${text.slice(0, m.index).split('\n').length} 行）`)
       }
     }
     expect(hits, '发现 PEM 私钥 ⇒ 立刻移除并轮换该密钥').toEqual([])
   })
 
-  /** `sk-` 风格密钥绝不入库。 */
-  it('入库文件里没有 sk- 风格密钥', () => {
+  /**
+   * `sk-` 风格密钥绝不入库。
+   *
+   * ⚠️ **连 `tests/` 一起扫**（理由同上）；构造样例走
+   * {@link CREDENTIAL_CONSTRUCTOR_SAMPLES} 白名单（**逐条列出**，不用启发式）。
+   */
+  it('入库文件里（含 tests/）没有 sk- 风格密钥', () => {
     const hits: string[] = []
-    for (const { path, text } of FILES) {
+    for (const { path, text } of ALL_FILES) {
       for (const m of text.matchAll(SK_STYLE_KEY)) {
+        if (CREDENTIAL_CONSTRUCTOR_SAMPLES.has(m[0])) continue
         hits.push(`${path}: ${m[0].slice(0, 6)}…（第 ${text.slice(0, m.index).split('\n').length} 行）`)
       }
     }
     expect(hits, '发现 sk- 风格密钥 ⇒ 立刻移除并轮换该密钥').toEqual([])
   })
 
-  /** JWT 形态的令牌绝不入库。 */
-  it('入库文件里没有 JWT 形态的令牌', () => {
+  /** JWT 形态的令牌绝不入库（同样连 `tests/` 一起扫）。 */
+  it('入库文件里（含 tests/）没有 JWT 形态的令牌', () => {
     const hits: string[] = []
-    for (const { path, text } of FILES) {
+    for (const { path, text } of ALL_FILES) {
       for (const m of text.matchAll(JWT_TOKEN)) {
+        if (CREDENTIAL_CONSTRUCTOR_SAMPLES.has(m[0])) continue
         hits.push(`${path}: ${m[0].slice(0, 12)}…（第 ${text.slice(0, m.index).split('\n').length} 行）`)
       }
     }
@@ -168,13 +308,42 @@ describe('仓库内不得残留真实个人敏感信息', () => {
   })
 
   /**
-   * ⚠️ **新增的三条判据本身必须有效**（否则就是同义反复）。
+   * ⚠️ **「凭据字段名 + 高熵字面量」**不得入库（2026-10-21 审计新增）。
+   *
+   * ⚠️ 这条是审计实测**唯一能抓到真实凭据**的判据（`sk-`/JWT/PEM 三条
+   * 纯形态判据对它们**全都漏掉**）。
+   *
+   * ⚠️ 它会命中一些**合法的**东西（厂商公开的 client_id / appKey / 官方
+   * client_secret）⇒ 那类由 {@link CREDENTIAL_CONSTRUCTOR_SAMPLES} 白名单
+   * **逐条**列出（不用「含 test 字样就放过」这类启发式 —— 那会让真凭据
+   * 只要起个 `test-` 前缀就溜过去）。
+   */
+  it('入库文件里（含 tests/）没有「凭据字段名 + 高熵字面量」的赋值', () => {
+    const hits: string[] = []
+    for (const { path, text } of ALL_FILES) {
+      for (const m of text.matchAll(CREDENTIAL_ASSIGNMENT)) {
+        const value = m[1] ?? ''
+        if (CREDENTIAL_CONSTRUCTOR_SAMPLES.has(value)) continue
+        // ⚠️ 占位值豁免：`${…}` 模板、`<…>` 尖括号、纯环境变量引用。
+        if (/^[$<{]/.test(value)) continue
+        if (/^(process\.env|options\.|opts\.|config\.)/.test(value)) continue
+        hits.push(`${path}: ${value.slice(0, 4)}…（${value.length} 位，第 ${text.slice(0, m.index).split('\n').length} 行）`)
+      }
+    }
+    expect(
+      hits,
+      '发现疑似真实凭据的字面量 ⇒ 改成运行时读取、轮换该凭据，或（确属厂商公开参数时）逐条登记进白名单',
+    ).toEqual([])
+  })
+  /**
+   * ⚠️ **新增的判据本身必须有效**（否则就是同义反复）。
    *
    * 审计里已登记过同型教训：判据写错时，会「因为扫不到东西」而恒绿。
    */
-  it('新增的三条判据在未脱敏前确实能命中', () => {
+  it('新增的判据在未脱敏前确实能命中', () => {
     expect('-----BEGIN RSA PRIVATE KEY-----'.match(PEM_PRIVATE_KEY)).not.toBeNull()
     expect('sk-abcdefghijklmnopqrstuvwx'.match(SK_STYLE_KEY)).not.toBeNull()
     expect('eyJhbGciOiJSUzI1NiIs.eyJzdWIiOiIxIn0.abcdef'.match(JWT_TOKEN)).not.toBeNull()
+    expect('accessKeySecret: \'zsak6eadrbawz683wf5r3m2snrwj868r\''.match(CREDENTIAL_ASSIGNMENT)).not.toBeNull()
   })
 })
