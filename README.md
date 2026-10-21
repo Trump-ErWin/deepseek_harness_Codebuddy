@@ -101,6 +101,10 @@ dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codea
 `add` 以 git 仓库方式安装（pnpm 内部走 `git+https:` 协议），会运行本包的 `prepare`
 脚本自动构建 `lib/`，无需手动 `pnpm build`。
 
+⚠️ `prepare` **不依赖任何包管理器**（它直接内联 `tsc` / `node`）：pnpm 在 clone
+目录里跑 `prepare` 时，**pnpm 10 / 11 不会把 npm 注入 PATH**（只有 pnpm ≥ 12 会）
+⇒ 若 `prepare` 里写 `npm run …`，那两代上安装会直接失败。
+
 ⚠️ pnpm 10 起会拦截依赖的构建脚本，必须先在 profile 的 `pnpm-workspace.yaml`
 （路径形如 `~/.dsh/profiles/<name>/pnpm-workspace.yaml`）里放行；而**放行键的写法
 在 pnpm 10 与 pnpm 11 之间互不兼容**，写错就装不上。
@@ -177,10 +181,14 @@ dsh plugin --profile <name> install <path-to-this-repo>
 
 基本流程：
 
-1. 打开 Jet Hub 设置页（侧边 rail 选择要用的渠道）；
+1. 打开 Jet Hub（点主导航里的 **Jet Hub** 一行；也可从「设置 → 插件 → Jet Hub」
+   进入 —— 两条路径渲染的是**同一个页面**）；
 2. 点「**+ 新建账号**」→ 浏览器打开授权页 → 完成登录；
 3. 需要多个账号时重复第 2 步（账号池会自动选号）；
 4. 回到 dsh 的模型选择器，选中该渠道的模型即可开始对话。
+
+页头的「**侧栏**」开关可以随时把那一行从主导航里收起来（设置页入口照旧）；偏好
+存在宿主侧而不是浏览器存储，重启后保持 —— 理由见 `docs/agent-notes/client-ui.md`。
 
 「+ 新建账号」是**两步式**的：先返回 `loginUrl` 由前端弹窗打开，后台再轮询换取
 令牌 —— 这样不会阻塞浏览器手势窗口，弹窗不会被拦截。

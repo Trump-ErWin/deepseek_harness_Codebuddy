@@ -11,7 +11,9 @@
  *           model.list / model.setDisabled /
  *           captcha.demand / captcha.carrierUrl / captcha.contribute（内部载体，
  *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
- *           backup.export / backup.import / backup.status
+ *           backup.export / backup.import / backup.status /
+ *           nativeSearch.getEnabled / nativeSearch.setEnabled /
+ *           sidebarEntry.getEnabled / sidebarEntry.setEnabled /
  * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
  * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
  */
@@ -159,7 +161,7 @@ import {
   withQoderNickname,
 } from './qoder.js'
 import type { QoderCredential } from './qoder.js'
-import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits.js'
+import { claimQoderDailyCheckin, fetchQoderBalanceDetailed } from './qoder-credits.js'
 import { isTraeRefreshable, traeCredentialExpiresAtMs, traeDisplayNickname } from './trae.js'
 import type { TraeCredential } from './trae.js'
 import { fetchClineUsageLimits } from './cline-quota.js'
@@ -349,6 +351,9 @@ import type {
   RpcNativeSearchGetEnabledResponse,
   RpcNativeSearchSetEnabledRequest,
   RpcNativeSearchSetEnabledResponse,
+  RpcSidebarEntryGetEnabledResponse,
+  RpcSidebarEntrySetEnabledRequest,
+  RpcSidebarEntrySetEnabledResponse,
   RpcGatewayModel,
   RpcCaptchaDemandResponse,
   RpcCaptchaCarrierUrlResponse,
@@ -6089,34 +6094,56 @@ function registerJetHubEndpoints(
           // `fetchQoderCreditBalance` 只吃 QoderCredential，故这里不用
           // collectCreditBalances 的泛型（它会把产品配置转发给 fetchBalance）。
           const values: RpcCreditsBalancesResponse['accounts'] = []
-          for (const account of accounts) {
+          /**
+           * ⚠️⚠️ **必须并发**（2026-10-21 改，真实报障「一直读取中」）。
+           *
+           * 原实现是 `for (const account of accounts) { await ... }` —— **串行**。
+           * 单账号在墙外时实测 10.7s 才失败（undici 自己的 connect timeout
+           * 先于 `AbortSignal.timeout(15s)` 触发），两个账号就是 **22s**；
+           * 前端 `callManagementRpc` **不设超时** ⇒ 整段时间面板只显示
+           * 「读取中…」，用户以为卡死。
+           *
+           * ⚠️ 并发不改变**输出顺序**：`Promise.all` 保序，每个槽位自己算，
+           *    不是按完成顺序 push。
+           * ⚠️ 也不改变**失败隔离**：每格自己返回 `{ balance: null, error }`，
+           *    一个账号炸不影响别人（`fetchQoderBalanceDetailed` 本身不抛）。
+           */
+          values.push(...await Promise.all(accounts.map(async (account) => {
             const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
             if (!resolved) {
-              values.push({
+              return {
                 accountId: account.id, nickname: account.nickname,
                 balance: null, error: '凭据未配置',
-              })
-              continue
+              }
             }
             let credential: QoderCredential
             try {
               credential = JSON.parse(resolved.value) as QoderCredential
             } catch {
-              values.push({
+              return {
                 accountId: account.id, nickname: account.nickname,
                 balance: null, error: '凭据解析失败',
-              })
-              continue
+              }
             }
-            const balance = await fetchQoderCreditBalance(credential, product)
-            values.push({
+            // ⚠️ 用**带原因**的变体 `fetchQoderBalanceDetailed`，不用
+            // `fetchQoderCreditBalance`：后者只回 `null`，四种完全不同的处境
+            // （网络不通 / 401 / 响应变形 / 企业版无数字）被压成同一句
+            // 「积分查询失败（凭据失效或响应异常）」，用户无从下手。
+            // 实测本机 Qoder 国际版：`openapi.qoder.sh` 的 TCP 443 通（93ms）
+            // 但 TLS ClientHello 被丢（12s 无响应）⇒ fetch 必在 10.7s 后报
+            // `UND_ERR_CONNECT_TIMEOUT`。这是**环境问题**，必须点名主机与出路，
+            // 否则用户只会以为「凭据坏了」，反复重新登录。
+            const detailed = await fetchQoderBalanceDetailed(credential, product)
+            return {
               accountId: account.id,
               nickname: account.nickname,
-              balance,
+              balance: detailed.balance,
               // 查不到时带上原因，卡片显示原因而非 0（与其它 provider 同约定）。
-              ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
-            })
-          }
+              ...detailed.balance === null
+                ? { error: detailed.error ?? '积分查询失败（原因未知）' }
+                : {},
+            }
+          })))
           /**
            * ⚠️⚠️ **必须回传 `windowDays`**（2026-10-20 补，真实缺口）。
            *
@@ -6815,9 +6842,19 @@ function registerJetHubEndpoints(
             error: { code: 'bad-request', message: 'provider 与 disabled（布尔）必填' },
           }
         }
-        if (req.disabled) {
+        /**
+         * 全量目录（关闭方向用它写黑名单；两个方向都用它算 `warnings`）。
+         *
+         * ⚠️ 打开方向**不读目录**（见该分支的注释：目录故障时用户仍应能全打开）⇒
+         * `catalog` 在打开方向可能是 `undefined`，`warnings` 随之为空 —— 这是
+         * **正确**的（打开方向的 warnings 只在「这个 id 已从上游消失」时才有意义，
+         * 而那恰恰需要目录才能判定）。
+         */
+        const catalog = req.disabled
+          ? await fullCatalogIds(ctx, modelAdapters, req.provider)
+          : undefined
+        if (req.disabled && catalog !== undefined) {
           // 关闭全部：先取全量目录，再一次性写入黑名单。
-          const catalog = await fullCatalogIds(ctx, modelAdapters, req.provider)
           // ⚠️⚠️ **判据顺序是语义的一部分**，四条分支按「能否在目录不完整时
           // 安全作答」从强到弱排列（下面逐条给理由，别重排）：
           //
@@ -6894,8 +6931,22 @@ function registerJetHubEndpoints(
             //
             // ⚠️ 与关闭方向同理，**黑名单与意图必须同一次落盘**
             //   （见 `writeModelsWithProviderClosed` 的注释：分两次会留下半套状态）。
-            await pool.writeModelsWithProviderClosed(req.provider, pending, true)
-            ctx.logger.info(`[jet-hub] 关闭 ${req.provider} 的 ${pending.length} 个模型`)
+            //
+            // ⚠️⚠️ **但「是否落意图」由 `closeProvider` 决定**（2026-10-21 合并审计
+            //   发现，阻断级）：默认 `true` 保持既有语义（「关闭全部模型」≡
+            //   「关闭该供应商」），而**模型级**的批量关闭（PR !120 的「模型列表」
+            //   统一管理屏）传 `false` ⇒ 只改黑名单、不落意图。
+            //
+            //   ⇒ 否则用户在模型列表屏点一次「全关」（只想关这家模型）会把**整个
+            //   供应商**也关掉（`provider.status` 报 closed、选择器里一个模型都没有）
+            //   ；再打开**任意一个**模型，供应商又被顺带打开（`setModelDisabled` 的
+            //   打开方向会清意图）⇒ 两头都与用户意图相反，且**零提示**。
+            const closeProvider = req.closeProvider !== false
+            await pool.writeModelsWithProviderClosed(req.provider, pending, closeProvider)
+            ctx.logger.info(
+              `[jet-hub] 关闭 ${req.provider} 的 ${pending.length} 个模型`
+              + (closeProvider ? '' : '（不落供应商关闭意图）'),
+            )
           }
         } else {
           // 打开全部：纯本地操作，不读目录 —— 目录故障时用户仍应能把开关全打开。
@@ -6913,6 +6964,25 @@ function registerJetHubEndpoints(
         // ⚠️ 命中「本就已全部关闭」的幂等短路时也照样失效一次 —— 那是用户点了一个
         // 开关、期望看到最新的代价（一次上游目录读取），比「界面纹丝不动」划算。
         invalidateCatalogCache(req.provider)
+        /**
+         * ⚠️⚠️ **本端点的 `warnings` 恒为空，这是正确的**（2026-10-21 合并审计定论）。
+         *
+         * ⚠️ 合并审计最初建议「批量路径也调 `catalogWarnings`」—— **实测证明那是死代码**：
+         * `catalogWarnings` 的判据是「`ids` 里不在 `known` 的」，而本端点传的 `ids`
+         * 本就是 `catalog.ids`，而 `readableCatalogIds` 的 `known` 是
+         * `new Set(catalog.ids)` **并回黑名单** ⇒ `known ⊇ catalog.ids` **恒成立**
+         * ⇒ `missing` 恒为空 ⇒ warnings 恒 `[]`。
+         *
+         * ⇒ 而这正是**语义正确**的：批量关闭的对象是「目录里的全部模型」——它们
+         * **本来就在目录里**，不存在「关了但没有效果」的那个 id（那是**逐条开关**
+         * 的语义）。所以批量路径**无事可警告**。
+         *
+         * ⚠️ 不能把它拿来给「已下架的模型」报警：失效模型被 `withDeadModelPruning`
+         * 剔除、但 `model.list` 又把它们补回目录（带 `dead:true`）⇒ 它们**不在**
+         * `catalog.ids` 里 ⇒ **不会**被这个批量关闭涉及。
+         *
+         * ⚠️ 故客户端读 `result?.warnings` 在这条路径上恒空是**正确的**（无事可警）。
+         */
         const value: RpcModelSetAllDisabledResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
@@ -7798,6 +7868,38 @@ function registerJetHubEndpoints(
           + `${req.enabled ? '' : '（所有渠道改用 DeepSeek 官方搜索）'}`,
         )
         const value: RpcNativeSearchSetEnabledResponse = { enabled: pool.nativeWebSearchEnabled() }
+        return { ok: true, value }
+      }
+
+      // ── 「侧栏入口」开关（Jet Hub 页头的「侧栏」开关）──
+      //
+      // 语义：**开** = 主导航（`sidebar.panellist`）里显示「Jet Hub」一行，
+      // 点它把 Jet Hub 页渲染进中央主面板（`main` 槽的 `jet-hub` key）；
+      // **关** = 该行消失，进入路径只剩「设置 → Jet Hub」。
+      //
+      // 消费方是客户端：`plugin-src/client/sidebar-entry.js` 在 `apply` 里先读
+      // 一次本端点，再决定注不注入那行；页头开关写回后由同一份进程内副本
+      // 通知两侧（设置页与主面板）重新渲染。
+      case 'sidebarEntry.getEnabled': {
+        const value: RpcSidebarEntryGetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
+        return { ok: true, value }
+      }
+
+      case 'sidebarEntry.setEnabled': {
+        const req = payload as RpcSidebarEntrySetEnabledRequest
+        // ⚠️ 与 `nativeSearch.setEnabled` 同约定：**不做默认值猜测** ——
+        // 默认成 true 会静默打开用户特意关闭的入口。
+        if (typeof req.enabled !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        }
+        await pool.setSidebarEntryEnabled(req.enabled)
+        // 不刷新任何缓存：客户端的注册逻辑读的是**同一个**进程内副本，
+        // 写完由客户端自己按返回值（落盘后重读）同步两侧 UI。
+        ctx.logger.info(
+          `[jet-hub] ${req.enabled ? '显示' : '隐藏'}主导航侧栏入口`
+          + `${req.enabled ? '' : '（仍可从「设置 → Jet Hub」进入）'}`,
+        )
+        const value: RpcSidebarEntrySetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
         return { ok: true, value }
       }
 

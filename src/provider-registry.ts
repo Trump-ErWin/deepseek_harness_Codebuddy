@@ -649,6 +649,11 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     // ⇒ 胶囊只剩「合计」，永久绿/长期黄/临期红三行一个都不渲染。
     // ⚠️ 漏登记的症状是**静默的**（无报错、无日志），与 officeace / autoclaw
     //    当初同一根因；新增带到期时间的渠道时必须一并登记本字段。
+    // ⚠️ PR !134 独立补登了同一字段（2026-10-21 用户报障「星火 25000 不显示」，
+    //    注释称「四个池都带 `*NextExpireTime`」—— member / buy / activity / spark）。
+    //    合并时保留 master 这份（依据 `/points/balance` 实测原文），并保留
+    //    PR !134 带来的**客户端侧**修法（`packageExpiryMs` 归一 + 独立池摘出）——
+    //    那两处才是「25000 不显示」的另一半根因，registry 登记只是另一半。
     usesExpiryWindow: true,
     // ⚠️ **2026-10-20 补登记：永久积分锁定**。
     //
