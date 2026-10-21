@@ -693,8 +693,7 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     // ⚠️ 2026-10-19 **本 fork** 并入 codely（Unity，usage/summary）⇒ 15 → 16。
     //    它是全仓首例 balance:true + channel:false（登录/余额均为自由函数，
     //    无 auth 服务；runtime 守卫只查已注册 runtime，codely 被跳过）。
-    expect(expected.length).toBe(16)
-    expect(expected.length).toBe(17)
+    expect(expected.length).toBe(18)
     // ⚠️ **关键集合判据必须对「生产真正调用的那种形态」也成立**（2026-10-08 复审 C1）：
     //    上面那次是 `createProviderCredits()`（无 deps），而端点与 `index.ts` 调的
     //    都是 `createProviderCredits({ loomy, raccoon, zcode })`。deps 只应影响**实现**，

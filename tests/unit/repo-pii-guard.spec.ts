@@ -223,6 +223,12 @@ const CREDENTIAL_CONSTRUCTOR_SAMPLES: ReadonlySet<string> = new Set([
   // **新的**真实凭据都会当场变红，而这两条是「已知的、已决策的」。
   'zsak6eadrbawz683wf5r3m2snrwj868r',  // 讯飞 Loomy AccessKeySecret
   'tmgEeM2rd9ybYoWpXl8JqUfvK',         // Cline WorkOS refresh_token
+  // ⚠️ **PR #3（codely）新增的两个测试夹具**（2026-10-22 合并审计补登记）。
+  //    它们在 `codely-adapter.spec.ts:40-41` 与 `codely-checkin.spec.ts:24-25` 里，
+  //    值形如 `access-token-abc` / `refresh-token-abc` —— **明显构造**（`-abc` 后缀），
+  //    不是真实凭据。按本仓纪律**逐条登记**，不用「含 token 字样就放过」这类启发式。
+  'access-token-abc',
+  'refresh-token-abc',
 ])
 
 /** 构造示例号码白名单（见文件头）。 */

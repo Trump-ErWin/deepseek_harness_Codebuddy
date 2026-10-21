@@ -173,7 +173,7 @@ import * as officeaceAuth from './officeace-auth.js'
 // 自签直连，`codely-sign.ts`；`CodelyAdapter` 同时供 `probeById` 探测用）。
 import { CodelyAdapter, registerCodelyLlm } from './codely-adapter.js'
 import { CODERLY } from './codely-product.js'
-import { readCodelyCredential, type CodelyCredential } from './codely-auth.js'
+import { CODELY_PROVIDER_ID, readCodelyCredential, type CodelyCredential } from './codely-auth.js'
 // 「锁定永久积分」在 officeace 上的**唯一执行实现**（issue IKLTHB 第 ① 条：
 // 该渠道登记了 `permanentLock: true`，而原先全仓没有任何代码读这张锁定表）。
 import { createOfficeAceCredentialProvider } from './officeace-lock.js'
@@ -5212,6 +5212,57 @@ async function fetchBalanceReading(
         )
       }
     }
+
+  /**
+   * ⚠️⚠️ **codely 的 runtime 必须单独注册**（2026-10-22 合并审计修，真实可达缺陷）。
+   *
+   * ## 缺陷（实测）
+   *
+   * `probeById.codely` 已登记（上面那个模块级常量里键存在），但 `probe` 域
+   * **只在上面的 `for (const [id, auth] of registry)` 循环体内**被挂上
+   * （`...Object.hasOwn(probeById, id) ? { probe: probeById[id] } : {}`），
+   * 而 codely **不在**那个 20 项 `registry` 数组里（它是 `channel:false`、无 auth 服务）
+   * ⇒ `runtimeOf('codely') === undefined` ⇒ `adapterForProbe()` 抛
+   * 「codely 没有探测适配器（该 provider 不支持重测）」。
+   *
+   * 实测后果：
+   * - `account.retest`（重测）**恒抛错**，冒泡成「操作失败：codely 没有探测适配器」；
+   * - `account.test`（测试）返回 `{"ok":false,"message":"无法确认：codely 没有探测适配器…"}`；
+   * - 只有 `account.reset` 能用（它不需要 probe）。
+   *
+   * ⚠️ 而 `probeById.codely` 的头注释与 `provider-registry.ts` 的 codely 条目
+   * 都写着「『重测 / 重置』有真实作用对象」—— **只有「重置」成立**，本次一并订正。
+   *
+   * ## 为什么不在 `registry` 数组里加一行
+   *
+   * 那个数组元素类型是 `readonly [string, JetHubAuthLike]`，而 codely **没有 auth
+   * 服务**（登录与余额都是自由函数）。硬塞一个假 auth 会让 `auths.codely` 出现、
+   * 进而让 `expectedProviderIdsWithAuth()` 派生出的**一批**守卫变红，且
+   * `account.refresh` 会对一个没有 refresh 实现的渠道开绿灯。
+   * ⇒ 用「**只注册 runtime、不带 auth**」这一最小形态：`ProviderRuntime.auth` 本就是
+   * 可选字段（`provider-runtime.ts` 的 `readonly auth?:`），opencode 同样没有它。
+   *
+   * ## ⚠️ 守卫（本次一并补）
+   *
+   * `provider-runtime-wiring.spec.ts` 新增「`probeById` 的每一项都真的挂到了
+   * runtime」—— 原来的存在性守卫只比 `Object.keys(probeById)` 与期望集合，
+   * **不查「这一项是否真被挂上」** ⇒ `probeById.codely` 存在即算通过，尽管它
+   * 永远不可达（`opencode` 是同一盲区的**存量**受害者，本次一并覆盖）。
+   */
+
+  const codelyRuntimeDescriptor = descriptorOf(CODELY_PROVIDER_ID)
+  if (codelyRuntimeDescriptor !== undefined && Object.hasOwn(probeById, CODELY_PROVIDER_ID)) {
+    registerProviderRuntime({
+      descriptor: codelyRuntimeDescriptor,
+      // ⚠️ **刻意不给 `auth`**：codely 目前无 auth 服务（`channel:false`），续期链
+      //    是已知待接项（见 `provider-registry.ts` 的 codely 条目清单）。
+      //    给空 auth 会让 `account.refresh` 谎称支持续期。
+      credits: creditsOf(creditsTable, CODELY_PROVIDER_ID),
+      expiry: expiryOf(expiryTable, CODELY_PROVIDER_ID),
+      probe: probeById[CODELY_PROVIDER_ID],
+    })
+  }
+
   }
 
   /**

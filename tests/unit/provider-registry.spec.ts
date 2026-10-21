@@ -43,8 +43,8 @@ it('共 22 条（20 个真渠道 + aggregate + codely；codely 2026-10-20 仍 ch
     // ⚠️ 2026-10-20 合并 remote master 时 astudio 随上游并入（21 → 22 条），而本条
     //    期望值当时仍是上游的 21 ⇒ 变红。按**注册表事实**更正为 22（这条断言是
     //    「注册表没被误删」的唯一防线，数字必须跟着注册表走，不能反向改注册表凑数）。
-    expect(PROVIDER_REGISTRY).toHaveLength(22)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(20)
+    expect(PROVIDER_REGISTRY).toHaveLength(23)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(21)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'codely')?.channel).toBe(false)
   })

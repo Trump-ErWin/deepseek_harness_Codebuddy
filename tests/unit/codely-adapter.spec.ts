@@ -56,6 +56,31 @@ function adapterWith(options: Partial<Pick<CodelyAdapterOptions, 'fetchImpl'>> =
  *    或 readline 提前关闭时它可能不来 ⇒ 没有兜底会让整条用例挂死到超时，
  *    失败信息变成一句无意义的 "test timed out"。
  */
+/**
+ * 喂给 `cliEnv` 的「惰性但真实存在」的可执行文件路径。
+ *
+ * ## ⚠️⚠️ 为什么必须有它（2026-10-22 合并审计修 —— 5 条用例在任何干净克隆上必红）
+ *
+ * `runCodelyCli` 在调用 **spawner 之前**先过 `resolveCodelyCliPath` 的 `existsSync`
+ * 闸门（`codely-cli.ts:159-166`）：env `DSH_CODERLY_CLI_PATH` → 硬编码的
+ * `D:\Program File\Tuanjie Cowork\...\codely.exe` → 都不存在就抛
+ * 「未找到官方 Codely 客户端」。
+ *
+ * ⇒ `fakeCli()` 只替身了 `cliSpawner`、**没替身 `existsSync`** ⇒ 闸门先抛、
+ *   替身永不被调用 ⇒ 5 条用例在**没装 Codely 桌面端**的机器（= 干净克隆 / CI）
+ *   **100% 必红**。实测本机：`exists=false` ⇒ 5 failed / 9 passed。
+ *
+ * ⚠️ 决定性对照（实测）：`DSH_CODERLY_CLI_PATH=C:\Windows\System32\cmd.exe`
+ *    跑**同一份代码** ⇒ **14/14 全绿**。
+ *
+ * ⚠️ 刻意用 `cmd.exe`（Windows 恒存在）而**不是**真实 `codely.exe`：spawner 已被
+ *   替身 ⇒ 它**绝不会被真正执行**；若指向真客户端、而某条路径漏了替身，就会在
+ *   仓库 cwd 里**真起一个 `--approval-mode yolo` 的 CLI 进程**去读写文件。
+ */
+const EXISTING_INERT_EXECUTABLE = process.platform === 'win32'
+  ? 'C:\\Windows\\System32\\cmd.exe'
+  : '/bin/sh'
+
 function fakeCli(options: {
   stdout?: string
   stderr?: string
@@ -213,7 +238,10 @@ describe('Codely 适配器：推理（驱动官方 CLI）', () => {
         '{"type":"result","status":"success","stats":{"total_tokens":10,"duration_ms":2000}}',
       ].join('\n'),
     })
-    const adapter = new CodelyAdapter({ cliSpawner: spawner })
+    const adapter = new CodelyAdapter({
+      cliSpawner: spawner,
+      cliEnv: { [CODERLY_CLI_PATH_ENV]: EXISTING_INERT_EXECUTABLE },
+    })
     const chunks = await collect(adapter, {
       model: 'codely-basic',
       messages: [{ role: 'user', content: 'hi' }],
@@ -228,7 +256,10 @@ describe('Codely 适配器：推理（驱动官方 CLI）', () => {
 
   it('② 多轮历史被文本化成单条 prompt（role 前缀，顺序不丢）', async () => {
     const { spawner, args } = fakeCli({ stdout: '' })
-    const adapter = new CodelyAdapter({ cliSpawner: spawner })
+    const adapter = new CodelyAdapter({
+      cliSpawner: spawner,
+      cliEnv: { [CODERLY_CLI_PATH_ENV]: EXISTING_INERT_EXECUTABLE },
+    })
     // 空 stdout ⇒ 无内容 ⇒ 抛 EMPTY_RESPONSE；本条只关心传给 CLI 的入参。
     await collect(adapter, {
       model: 'codely-basic',
@@ -250,7 +281,10 @@ describe('Codely 适配器：推理（驱动官方 CLI）', () => {
 
   it('③ 图片等非文本输入 ⇒ 明确报 UNSUPPORTED_CONTENT（不静默丢弃）', async () => {
     const { spawner } = fakeCli({ stdout: '' })
-    const adapter = new CodelyAdapter({ cliSpawner: spawner })
+    const adapter = new CodelyAdapter({
+      cliSpawner: spawner,
+      cliEnv: { [CODERLY_CLI_PATH_ENV]: EXISTING_INERT_EXECUTABLE },
+    })
     await expect(collect(adapter, {
       model: 'codely-vl',
       messages: [{ role: 'user', content: [{ type: 'image', imageId: 'i1' }] }],
@@ -259,7 +293,10 @@ describe('Codely 适配器：推理（驱动官方 CLI）', () => {
 
   it('④ CLI 未产出任何内容 ⇒ 报错，而不是返回空流', async () => {
     const { spawner } = fakeCli({ stdout: '' })
-    const adapter = new CodelyAdapter({ cliSpawner: spawner })
+    const adapter = new CodelyAdapter({
+      cliSpawner: spawner,
+      cliEnv: { [CODERLY_CLI_PATH_ENV]: EXISTING_INERT_EXECUTABLE },
+    })
     await expect(collect(adapter, {
       model: 'codely-basic',
       messages: [{ role: 'user', content: 'hi' }],
@@ -268,7 +305,10 @@ describe('Codely 适配器：推理（驱动官方 CLI）', () => {
 
   it('⑤ CLI 非 0 退出 ⇒ 报错且带上 stderr 尾部（不静默空流）', async () => {
     const { spawner } = fakeCli({ stdout: '', stderr: 'No credentials found', exitCode: 1 })
-    const adapter = new CodelyAdapter({ cliSpawner: spawner })
+    const adapter = new CodelyAdapter({
+      cliSpawner: spawner,
+      cliEnv: { [CODERLY_CLI_PATH_ENV]: EXISTING_INERT_EXECUTABLE },
+    })
     await expect(collect(adapter, {
       model: 'codely-basic',
       messages: [{ role: 'user', content: 'hi' }],
@@ -291,7 +331,10 @@ describe('Codely 适配器：推理（驱动官方 CLI）', () => {
 
   it('⑦ 取消 ⇒ 杀掉子进程（不留孤儿进程）', async () => {
     const { spawner, wasKilled } = fakeCli({ stdout: '' })
-    const adapter = new CodelyAdapter({ cliSpawner: spawner })
+    const adapter = new CodelyAdapter({
+      cliSpawner: spawner,
+      cliEnv: { [CODERLY_CLI_PATH_ENV]: EXISTING_INERT_EXECUTABLE },
+    })
     const controller = new AbortController()
     const running = collect(adapter, {
       model: 'codely-basic',
