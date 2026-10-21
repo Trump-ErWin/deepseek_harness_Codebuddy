@@ -445,6 +445,108 @@ describe('腾讯系内容级风控指纹改写（IKLYCT）：Claude Code 反馈�
   })
 })
 
+/**
+ * 第四条指纹：**DSH 自己的 system 身份首句**（2026-10-20 登记；2026-10-21 换措辞）。
+ *
+ * ## 它与前三条的本质差别
+ *
+ * 前三条都是**别的客户端**注进来的模板句（换会话 / 清历史可绕）；这一条是 DSH
+ * `base` 段每轮必带的**首句** ⇒ 绕不掉，只能靠 `tencent-fingerprint.ts` 这张表。
+ * 它此前**零用例**（本节是它的第一个守卫）。
+ *
+ * ## 2026-10-21 换措辞的依据：**CodeBuddy 自己的会话**（不是读源码推的）
+ *
+ * 本机一条真实 CodeBuddy 会话（标题「AI编程助手介绍」，id
+ * `8c9dbeb10e2846d7b0fa569b14aa4335`）的落盘记录里，assistant 的 reasoning
+ * 逐字复述了它自己的 system：`an AI coding assistant, powered by Hy4 preview model`；
+ * 客户端提示词**资产**（`extensions/genie/product.json` 的 `craft-agent-prompt`）
+ * 首行是 `You are an AI coding assistant,{{ ModelNamePrompt }}.`，该变量渲染成
+ * `" powered by <模型展示名> model"` —— 两条独立来源拼出的字节一致：
+ *
+ *   `You are an AI coding assistant, powered by Hy4 preview model.`
+ *
+ * ⇒ 与我们那句**结构完全同形**（`You are <名词> powered by <Y>`），差别只在
+ *   **Y 填什么**：官方填**模型展示名**，我们填**harness 名**。
+ *
+ * ⚠️ 本文件里留了这句字面量（与上面 Claude 那条同理）：改写已覆盖 `system` 与
+ * `assistant` 正文两处，不再有「观察者污染实验对象」的风险。
+ *
+ * ## ⚠️ 这一节锁得住什么、锁不住什么
+ *
+ * 锁得住：**我们改谁、改成什么、出站文本里不许残留 `DeepSeek Harness`**。
+ * **锁不住新措辞在上游是否放行** —— 那一格只有 e2e 能验，见
+ * `tests/e2e/buddy-fingerprint-roles.e2e.spec.ts` 第 4 节（改 `replace` 必须跑它）。
+ */
+const DSH_TRIGGER = 'You are an AI agent powered by DeepSeek Harness'
+/** 官方**原生兜底**措辞（模型名缺失时官方资产渲染出来的就是这个形态）。 */
+const DSH_REWRITE = 'You are an AI coding assistant, powered by a large language model'
+
+describe('腾讯系内容级风控指纹改写（2026-10-21）：DSH 身份首句', () => {
+  it('★ 首句改成官方同形措辞，且出站文本里**不再有 `DeepSeek Harness`**', () => {
+    // 后半句才是本条的**真正收益**，所以写成不变式而不是只断言等值：
+    // 旧的等义改写（`…built on the DeepSeek Harness runtime`）把这个 token
+    // 原样留着，上游一旦把名单从「整句逐字符」放宽成关键词就立刻失效。
+    const out = rewriteTencentContentFingerprints(DSH_TRIGGER, 'buddy')
+    expect(out).toBe(DSH_REWRITE)
+    expect(out).not.toContain('DeepSeek Harness')
+    // 反向对照：输入必须真的变了（防「两边写成同一个字面量」这类恒真断言）。
+    expect(out).not.toBe(DSH_TRIGGER)
+    expect(rewriteTencentContentFingerprints(DSH_TRIGGER, 'workbuddy')).toBe(DSH_REWRITE)
+  })
+
+  it('★ `find` 不带尾句点 ⇒ 带句点 / 后接正文两种形态都被改，且只改一次', () => {
+    expect(rewriteTencentContentFingerprints(`${DSH_TRIGGER}.`, 'buddy'))
+      .toBe(`${DSH_REWRITE}.`)
+    const withBody = `${DSH_TRIGGER}.\n\nYou are a coding agent. 用中文回答。`
+    const out = rewriteTencentContentFingerprints(withBody, 'buddy')
+    expect(out).toBe(`${DSH_REWRITE}.\n\nYou are a coding agent. 用中文回答。`)
+    expect(out).not.toContain('DeepSeek Harness')
+    // 幂等：改写后的文本再跑一次**逐字节不变**（新串不得再命中任何一条 find）。
+    expect(rewriteTencentContentFingerprints(out, 'buddy')).toBe(out)
+  })
+
+  it('★ 大小写不敏感（实测全大写同样被拦）', () => {
+    expect(rewriteTencentContentFingerprints(DSH_TRIGGER.toUpperCase(), 'buddy'))
+      .toBe(DSH_REWRITE)
+    expect(rewriteTencentContentFingerprints(DSH_TRIGGER.toLowerCase(), 'workbuddy'))
+      .toBe(DSH_REWRITE)
+  })
+
+  it('★ 整段真实 system：只改首句，其余段落与行数逐字节不变', () => {
+    // 现场形状：本句是 system 的**绝对首行**，后面跟着真正的行为约定与语言约束
+    // —— 那些**不能**被碰（改了会篡改用户提示词并破坏上游的前缀缓存）。
+    const realSystem = [
+      `${DSH_TRIGGER}.`,
+      '',
+      'You are a coding agent. Use the tools to resolve the request.',
+      '',
+      '# 语言约束',
+      '- 推理输出一律使用中文。',
+      '- 正文输出一律使用中文。',
+    ].join('\n')
+    const out = rewriteTencentContentFingerprints(realSystem, 'buddy')
+    expect(out.startsWith(`${DSH_REWRITE}.`)).toBe(true)
+    expect(out).not.toContain('DeepSeek Harness')
+    expect(out).toContain('# 语言约束')
+    expect(out).toContain('- 正文输出一律使用中文。')
+    expect(out.split('\n')).toHaveLength(realSystem.split('\n').length)
+  })
+
+  it('★ 四条指纹互不干扰（任一条的 find/replace 变更都会在这里露出来）', () => {
+    const all = [TRIGGER, CLAUDE_TRIGGER, FEEDBACK_TRIGGER, DSH_TRIGGER].join('\n')
+    const out = rewriteTencentContentFingerprints(all, 'workbuddy')
+    expect(out).toBe([REWRITE, CLAUDE_REWRITE, FEEDBACK_REWRITE, DSH_REWRITE].join('\n'))
+    // 无状态残留：`g` 正则的 lastIndex 不留痕（连续两次调用结果一致）。
+    expect(rewriteTencentContentFingerprints(all, 'workbuddy')).toBe(out)
+  })
+
+  it('★ 非腾讯系：逐字节不变（别替别家上游改写自家提示词）', () => {
+    for (const provider of ['qoder', 'qodercn', 'trae', 'codearts', 'lobsterai', '']) {
+      expect(rewriteTencentContentFingerprints(DSH_TRIGGER, provider)).toBe(DSH_TRIGGER)
+    }
+  })
+})
+
 describe('OpenAI 网关 Chat 路径：改 system 与 assistant 正文，其余角色一概不碰', () => {
   it('★ workbuddy：system 被改写', async () => {
     const options = await toGenerateOptions({
