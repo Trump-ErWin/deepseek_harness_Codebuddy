@@ -9,6 +9,7 @@ import {
   describeRun,
   isAutoCheckinExcluded,
   isUnsupportedCheckin,
+  msUntilNextCatchupUtc8,
   sanitizeAutoCheckin,
   shouldMarkToday,
   utc8DateString,
@@ -303,20 +304,27 @@ describe('自动签到：开关与启动排定', () => {
     expect(store.current().lastDate).toBe('2026-10-02')
   })
 
-  it('start() 按延迟排定一次；stop() 能取消', async () => {
+  it('start() 按延迟排定一轮 + 每日 10:05 补跑；stop() 两个都能取消', async () => {
     const { runner, scheduled, calls } = makeRunner({ delayMs: 30_000 })
     runner.start()
-    expect(scheduled).toHaveLength(1)
+    // ⚠️ 2026-10-21 起是**两个**定时器：启动轮（30s）+ 每日 10:05（UTC+8）补跑。
+    //   NOON_UTC8 = 12:00 ⇒ 今天的 10:05 已过 ⇒ 补跑排到**明天** 10:05
+    //   （12:00 → 次日 10:05 = 22h05m = 79_500_000ms，写死是锚点不是推算）。
+    expect(scheduled).toHaveLength(2)
     expect(scheduled[0]!.ms).toBe(30_000)
+    expect(scheduled[1]!.ms).toBe(79_500_000)
     runner.stop()
     expect(scheduled[0]!.cancelled).toBe(true)
+    expect(scheduled[1]!.cancelled).toBe(true)
     expect(calls).toEqual([])
   })
 
-  it('延迟为 0 时立刻跑（不经过调度器）', async () => {
+  it('延迟为 0 时立刻跑（不经过启动调度器；每日补跑定时器仍要排）', async () => {
     const { runner, scheduled, calls } = makeRunner({ delayMs: 0 })
     runner.start()
-    expect(scheduled).toEqual([])
+    // 启动轮不经过调度器 ⇒ 剩下那一个就是每日 10:05 补跑（12:00 排到明天）
+    expect(scheduled).toHaveLength(1)
+    expect(scheduled[0]!.ms).toBe(79_500_000)
     await runner.runIfDue()
     expect(calls).toEqual(['buddy', 'qoder'])
   })
@@ -325,7 +333,8 @@ describe('自动签到：开关与启动排定', () => {
     const { runner, scheduled } = makeRunner({ delayMs: 1_000 })
     runner.start()
     runner.start()
-    expect(scheduled).toHaveLength(1)
+    // 两个定时器（启动轮 + 每日补跑）；重复 start() 不得叠加出第三、四个
+    expect(scheduled).toHaveLength(2)
   })
 })
 
@@ -623,5 +632,148 @@ describe('自动签到：排除「签到有代价」的渠道', () => {
     ).toEqual(['zcode'])
     // ⚠️ 写死 `['zcode']` 是**有意**的：新增同样要产 captcha 的家时，
     //    这条会先红，逼作者复核「它是不是也该进排除表」（而不是静默漏掉）。
+  })
+})
+
+/**
+ * ⚠️⚠️ **2026-10-21 真实缺陷回归：整轮 `lastDate` 的粒度缺口**。
+ *
+ * 实测现场（用户 `~/.dsh/jet-hub/auto-checkin.json`）：00:48:41 那轮里
+ * buddy/lobsterai/minimax/trae 四家 `coversToday=true`，qoder/qodercn 如实标
+ * `coversToday=false`（「非今日轮次」），但整轮聚合 `coversToday=4>0` ⇒
+ * `lastDate` 写成当天 ⇒ **Qoder 10:00（UTC+8）刷新出的新额度整天没人领**，
+ * 重启 DSH 也过不了 `lastDate === today` 的闸。当天 22:52 官方客户端仍显示可领取。
+ *
+ * 修法两件套（见 `src/auto-checkin.ts` 文件头「记账粒度」）：
+ * 1. `channelsDone` 逐渠道记账 —— 只有「覆盖今天」与两类跳过入账；
+ * 2. 每日 10:05（UTC+8）补跑定时器 —— 长驻 DSH 也有第二次机会。
+ */
+describe('自动签到：逐渠道记账与每日补跑（2026-10-21）', () => {
+  /** 构造 qoder 两轮不同结果的 claim（第一轮「非今日轮次」，第二轮覆盖今天）。 */
+  function qoderFreshensLater(options: { providers?: string[] } = {}) {
+    let qoderRounds = 0
+    const calls: string[] = []
+    const runner = makeRunner({
+      providers: options.providers ?? ['buddy', 'qoder'],
+      claim: async (provider) => {
+        calls.push(provider)
+        if (provider === 'buddy') return ok({ claimed: 1, totalCredit: 100, coversToday: 1 })
+        qoderRounds += 1
+        // 第一轮 = 00:48 那种「刷新前领到昨天那轮」；第二轮 = 10:05 补跑，覆盖今天
+        return ok({ claimed: 1, totalCredit: 100, coversToday: qoderRounds === 1 ? 0 : 1 })
+      },
+    })
+    return { ...runner, calls }
+  }
+
+  it('★ 多渠道混跑：其他渠道覆盖今天，不得封掉「非今日轮次」渠道的补跑权', async () => {
+    const { runner, store, calls } = qoderFreshensLater()
+    await runner.runIfDue()
+    // 核心一格：buddy 记账、qoder（非今日轮次）**不记** —— 修复前整轮聚合把
+    // qoder 一起封进 `lastDate`，当天 10:00 刷新的额度整天漏领
+    expect(store.current().channelsDone).toEqual({ buddy: '2026-10-02' })
+    expect(store.current().lastDate).toBe('2026-10-02')
+    // 同一天再跑（生产里由 10:05 补跑触发）：只补欠账的 qoder，buddy 不重领
+    calls.length = 0
+    await runner.runIfDue()
+    expect(calls).toEqual(['qoder'])
+    // qoder 这轮覆盖了今天 ⇒ 入账
+    expect(store.current().channelsDone).toEqual({ buddy: '2026-10-02', qoder: '2026-10-02' })
+  })
+
+  it('★ 补跑轮的逐渠道展示要**合并**（面板不丢早上那几行）', async () => {
+    const { runner } = qoderFreshensLater()
+    await runner.runIfDue()
+    expect(runner.state().channels).toHaveLength(2)
+    await runner.runIfDue()
+    // 补跑只跑了 qoder ⇒ buddy 那行必须保留，qoder 行被本轮新行替换
+    expect(runner.state().channels.map((entry) => entry.provider)).toEqual(['buddy', 'qoder'])
+  })
+
+  it('失败渠道不入账 ⇒ 下次补跑只重试它（成功渠道不被重领）', async () => {
+    let qoderAttempts = 0
+    const { runner, calls, store } = makeRunner({
+      providers: ['buddy', 'qoder'],
+      claim: async (provider) => {
+        calls.push(provider)
+        if (provider === 'buddy') return ok({ claimed: 1, totalCredit: 100, coversToday: 1 })
+        qoderAttempts += 1
+        if (qoderAttempts === 1) return { ok: false, error: { code: 'unauthorized', message: '凭据已过期' } }
+        return ok({ claimed: 1, totalCredit: 100, coversToday: 1 })
+      },
+    })
+    await runner.runIfDue()
+    // qoder 失败不入账（与「整轮零成功不记账⇒重试」同一方向，落到渠道粒度）
+    expect(store.current().channelsDone).toEqual({ buddy: '2026-10-02' })
+    calls.length = 0
+    await runner.runIfDue()
+    expect(calls).toEqual(['qoder'])
+    expect(store.current().channelsDone).toEqual({ buddy: '2026-10-02', qoder: '2026-10-02' })
+  })
+
+  it('跳过类渠道（排除表 / 无签到接口）与覆盖今天的渠道同轮入账', async () => {
+    const { runner, store } = makeRunner({
+      providers: ['buddy', 'cline', 'zcode'],
+      claim: async (provider) => {
+        if (provider === 'cline') return unsupported()
+        return ok({ claimed: 1, totalCredit: 100, coversToday: 1 })
+      },
+    })
+    await runner.runIfDue()
+    expect(store.current().channelsDone).toEqual({
+      buddy: '2026-10-02',
+      cline: '2026-10-02',
+      zcode: '2026-10-02',
+    })
+  })
+
+  it('全部失败 ⇒ 不写盘（channelsDone 与 lastDate 都不动，下次启动重试）', async () => {
+    const { runner, store } = makeRunner({
+      claim: async () => ({ ok: false, error: { code: 'unauthorized', message: '凭据已过期' } }),
+    })
+    await runner.runIfDue()
+    expect(store.saves).toEqual([])
+  })
+
+  it('旧文档迁移：lastDate=今天且 channelsDone 为空 ⇒ 视为整轮已记（升级首启不重跑）', async () => {
+    // 旧粒度文档没有 channelsDone；升级当天若按逐渠道判会**全部欠账** ⇒
+    // 首启把当天重跑一遍（幂等但多余，且违背「不多次重复触发」）。
+    const { runner, calls } = makeRunner({ initial: { lastDate: '2026-10-02' } })
+    await runner.runIfDue()
+    expect(calls).toEqual([])
+  })
+
+  it('channelsDone 归一化：非日期值整键丢弃（方向安全：欠账最多多跑一轮幂等请求）', () => {
+    const doc = sanitizeAutoCheckin({
+      channelsDone: { buddy: '2026-10-02', qoder: 'not-a-date', '': '2026-10-02', qodercn: 42 },
+    })
+    expect(doc.channelsDone).toEqual({ buddy: '2026-10-02' })
+    // 缺字段（旧文档）⇒ 空表
+    expect(sanitizeAutoCheckin({}).channelsDone).toEqual({})
+    // 整体不是对象（数组 / 标量）⇒ 空表
+    expect(sanitizeAutoCheckin({ channelsDone: ['buddy'] }).channelsDone).toEqual({})
+  })
+
+  it('msUntilNextCatchupUtc8：今天 10:05 未到 ⇒ 今天；已过 ⇒ 明天（自续）', () => {
+    // 09:00（UTC+8）→ 今天 10:05 还有 1h05m
+    expect(msUntilNextCatchupUtc8(Date.UTC(2026, 9, 2, 1, 0, 0))).toBe(3_900_000)
+    // 12:00 → 今天已过 ⇒ 明天 10:05（22h05m）
+    expect(msUntilNextCatchupUtc8(NOON_UTC8)).toBe(79_500_000)
+    // 10:05 整点本身 ⇒ 视为已过 ⇒ 明天（避免 0ms 自旋）
+    expect(msUntilNextCatchupUtc8(Date.UTC(2026, 9, 2, 2, 5, 0))).toBe(86_400_000)
+    // 15:59（UTC+8）⇒ 明天 10:05（18h06m）—— 只认 UTC+8 平移，不认本机时区
+    expect(msUntilNextCatchupUtc8(Date.UTC(2026, 9, 2, 7, 59, 0))).toBe(
+      Date.UTC(2026, 9, 3, 2, 5, 0) - Date.UTC(2026, 9, 2, 7, 59, 0),
+    )
+  })
+
+  it('start() 在刷新边界前启动 ⇒ 补跑定时器落在**今天** 10:05', () => {
+    const { runner, scheduled } = makeRunner({
+      delayMs: 30_000,
+      now: () => Date.UTC(2026, 9, 2, 1, 0, 0), // 09:00（UTC+8）
+    })
+    runner.start()
+    expect(scheduled).toHaveLength(2)
+    expect(scheduled[1]!.ms).toBe(3_900_000)
   })
 })

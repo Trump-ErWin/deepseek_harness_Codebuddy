@@ -5,7 +5,8 @@
  *
  * DSH 启动后延迟一小段（默认 30 秒，见下），若这个开关开着、且**今天（UTC+8）
  * 还没跑过**，就串行遍历「账号池里真的有账号的渠道」，逐个调内部
- * `credits.claimAll`；跑完把日期与**逐渠道结果**写进文档 ⇒ **当天不再触发**。
+ * `credits.claimAll`；跑完把日期与**逐渠道结果**写进文档 ⇒ **当天不再触发**
+ * （2026-10-21 起细化为**逐渠道**封盘 + 每日 10:05 补跑，见下）。
  * 用户手动点「全部渠道签到」不受此限（那是显式操作，永远放行）。
  *
  * ⚠️ **开关默认打开**（用户 2026-10-02 明确要求：「自动签到默认保持打开状态」）。
@@ -32,6 +33,39 @@
  * `ClaimOutcome.coversToday` 声明出来的 `summary.coversToday`
  * （真实缺陷，2026-10-02 审查 PR !33 定位：Qoder 活动每日 10:00（UTC+8）才刷新，
  * 上午那轮看到的 `CLAIMED` 属于**昨天**，拿它记账会让当天额度**整天漏领**）。
+ *
+ * ## ⚠️⚠️ 记账粒度：整轮 `lastDate` 的缺口与逐渠道 `channelsDone`（2026-10-21）
+ *
+ * `lastDate` 的粒度是「**整轮**」：一轮跑完且 `shouldMarkToday` 为真 ⇒ 当天封盘。
+ * 但**各渠道的每日刷新时刻不同** —— Qoder 系活动每日 10:00（UTC+8）才刷新
+ * （`qoder-credits.ts` 的 `QODER_CAMPAIGN_REFRESH_HOUR_UTC8`），其余多数 00:00。
+ * 「启动即签」撞上「10:00 刷新」的真实后果（2026-10-21 用户实测）：00:48 那轮里
+ * buddy 等 4 家 `coversToday=true`，qoder/qodercn 如实标了「非今日轮次」
+ * （`coversToday=false`），**但整轮的 `coversToday` 已被前者顶成 >0** ⇒
+ * `lastDate` 写成当天 ⇒ 10:00 刷新出的 Qoder 新额度**整天没人领** —— 当天
+ * 22:52 官方客户端仍显示可领取，且重启 DSH 也过不了 `lastDate === today` 的闸。
+ * PR !33 的守卫只覆盖了「整轮只有 Qoder」的极端情形（单测就是这么写的），
+ * 多渠道混跑时守卫被其他渠道的 `coversToday` 投票否决。
+ *
+ * 修法两层：
+ * 1. **逐渠道记账 `channelsDone`**（provider id → 最近一次覆盖今天的 UTC+8 日期）：
+ *    只记「本轮已处理」的渠道 —— 覆盖今天的（`coversToday > 0`）与两类跳过
+ *    （排除表 / 无签到接口，跳过 = 已处理，处理结果是「不参与」）。
+ *    **失败与「非今日轮次」刻意不记** ⇒ 下次 `runIfDue`（含补跑）只补它们。
+ *    `lastDate` / `ranToday` / 状态灯的原语义**全部保留**，客户端零改动；
+ * 2. **每日 10:05（UTC+8）补跑定时器**：长驻的 DSH 没有第二次启动，
+ *    单靠「下次启动重试」救不了它。10:05 取「已知最晚刷新边界 10:00 + 5 分钟
+ *    缓冲」，**刻意不 import** 那个常量 —— 本模块不认任何具体渠道（同
+ *    `isUnsupportedCheckin` 的窄短语，属于**有意的第二份事实**；上游若改刷新
+ *    时刻，这里要跟着调，漂移风险在此注明）。触发后**自续下一天** —— 顺带修掉
+ *    「DSH 长驻不重启时第二天整轮不跑」的老缺口（此前跨天只靠重启）。
+ *
+ * ⚠️ **兼容（旧文档迁移）**：旧文档没有 `channelsDone`。升级当天出现
+ * 「`lastDate` === 今天 且 `channelsDone` 为空」的组合 ⇒ 视为「旧粒度下整轮
+ * 已记」，全部渠道当天视为已处理（见 `dueProvidersNow`），避免升级首启把当天
+ * **重跑一遍**（幂等但多余，且违背「不多次重复触发」）。新代码**不会**产出该
+ * 组合 —— `lastDate` 与 `channelsDone` 永远同写（`shouldMarkToday` 为真时
+ * `doneToday` 必非空）。
  *
  * ## 为什么单独一份文档，而不是塞进 ui-preferences.json
  *
@@ -91,7 +125,12 @@ export interface AutoCheckinDoc {
    * `enabled !== false` 惯例一致。
    */
   enabled: boolean
-  /** 上次**完成**自动签到的 UTC+8 日期（`YYYY-MM-DD`）；空串 = 从未跑过。 */
+  /**
+   * 上次**完成**自动签到的 UTC+8 日期（`YYYY-MM-DD`）；空串 = 从未跑过。
+   *
+   * ⚠️ 2026-10-21 起它只承载**展示语义**（`ranToday` / 状态灯）——
+   * 执行闸门改由逐渠道的 {@link channelsDone} 承担（粒度缺口见文件头）。
+   */
   lastDate: string
   /** 上次结果摘要（中文短句，展示在状态灯提示里）。 */
   lastResult: string
@@ -99,6 +138,16 @@ export interface AutoCheckinDoc {
   lastAt: number
   /** 逐渠道结果（顺序即遍历顺序）；空数组 = 没有可展示的逐渠道信息。 */
   channels: Array<{ provider: string; text: string }>
+  /**
+   * 逐渠道记账：provider id → 最近一次**覆盖今天**（`coversToday > 0`）或
+   * 「已处理」（两类跳过）的 UTC+8 日期（`YYYY-MM-DD`）。
+   *
+   * ⚠️ **失败与「非今日轮次」刻意不记** —— 不记 ⇒ 下次 `runIfDue`（含每日
+   * 10:05 补跑）会只补这些渠道（粒度缺口与修法见文件头）。
+   * ⚠️ 旧文档没有该字段 ⇒ 按 `{}` 处理；「`lastDate` = 今天且本表为空」的
+   * 组合按「旧粒度下整轮已记」迁移（见 `dueProvidersNow`）。
+   */
+  channelsDone: Record<string, string>
   /**
    * 用户点过「关闭」的那一轮（存的是那一刻的 `lastAt`）。
    *
@@ -115,6 +164,7 @@ export const DEFAULT_AUTO_CHECKIN: AutoCheckinDoc = {
   lastResult: '',
   lastAt: 0,
   channels: [],
+  channelsDone: {},
   dismissedRunAt: 0,
 }
 
@@ -139,13 +189,31 @@ function sanitizeChannels(raw: unknown): Array<{ provider: string; text: string 
 }
 
 /**
+ * 归一化逐渠道记账表（脏数据不撑大文档）。
+ *
+ * 键必须非空、值必须是 `YYYY-MM-DD`；其余整键丢弃（回落成「该渠道今天欠账」，
+ * 方向安全 —— 最多多跑一轮幂等请求，不会漏签）。
+ */
+function sanitizeChannelsDone(raw: unknown): Record<string, string> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (key.length === 0 || typeof value !== 'string' || !DATE_RE.test(value)) continue
+    out[key] = value
+  }
+  return out
+}
+
+/**
  * 归一化文档：非法值一律回落默认值（**不抛错**）。
  *
  * ⚠️ 与 RPC 写入路径的严格校验**不冲突**：那条路径面对用户输入，要拒绝非法值；
  * 这条路径面对**磁盘上的脏数据**（手工编辑过、被旧版本写坏），回落比整机不可用
  * 更合理 —— 判据口径与 `sanitizeBadgePreference` 一致。
- * ⚠️ 缺新字段的**旧文档**（没有 `channels` / `lastAt` / `enabled`）必须照常读出来：
- * 前两个是本功能上线后追加的，而 `enabled` 缺失要按**默认打开**处理（不是关闭）。
+ * ⚠️ 缺新字段的**旧文档**（没有 `channels` / `lastAt` / `enabled` /
+ * `channelsDone`）必须照常读出来：前几个是本功能上线后追加的，而 `enabled`
+ * 缺失要按**默认打开**处理（不是关闭）、`channelsDone` 缺失按「旧粒度文档」
+ * 迁移（见 `dueProvidersNow`）。
  */
 export function sanitizeAutoCheckin(raw: unknown): AutoCheckinDoc {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { ...DEFAULT_AUTO_CHECKIN }
@@ -161,6 +229,7 @@ export function sanitizeAutoCheckin(raw: unknown): AutoCheckinDoc {
     lastResult: typeof record.lastResult === 'string' ? record.lastResult : '',
     lastAt: ms(record.lastAt),
     channels: sanitizeChannels(record.channels),
+    channelsDone: sanitizeChannelsDone(record.channelsDone),
     dismissedRunAt: ms(record.dismissedRunAt),
   }
 }
@@ -184,12 +253,39 @@ export const DSH_JET_HUB_AUTO_CHECKIN_DELAY_MS = 'DSH_JET_HUB_AUTO_CHECKIN_DELAY
 export const AUTO_CHECKIN_DELAY_MS = 30_000
 
 /**
- * 读延迟配置。
+ * 每日补跑时刻（UTC+8）的时与分。
  *
- * ⚠️ 不能写成 `Number(env.X) || 默认值`：`0` 是**合法**值（立刻执行），
- * 而 `0` 是 falsy 会被静默换成 30 秒 —— 与本仓库 `DSH_JET_HUB_BADGE_TTL_MS`、
- * `DSH_QODER_QUEUE_TIMEOUT_MS` 记过的是同一个坑。
+ * ⚠️ **10:05 的来历**：已知最晚的渠道刷新边界是 Qoder 系活动的每日 10:00
+ * （`qoder-credits.ts` 的 `QODER_CAMPAIGN_REFRESH_HOUR_UTC8`，服务端活动描述
+ * 原文「每日 10:00（UTC+8）刷新」）—— 本模块**刻意不 import** 它（不认任何
+ * 具体渠道，见文件头），故这里是一份**有意的第二份事实**：上游改刷新时刻时
+ * 两处要一起调。+5 分钟是刷新边界后的缓冲（不给上游整点添堵，也避开
+ * 「整点任务挤在一起」的既有惯例）。
  */
+export const CATCHUP_HOUR_UTC8 = 10
+export const CATCHUP_MINUTE_UTC8 = 5
+
+/**
+ * 距下一个补跑时刻（UTC+8 的 10:05）的毫秒数。
+ *
+ * 已过今天的 10:05 ⇒ 返回**明天** 10:05 的差值（补跑定时器是**自续**的：
+ * 每次触发后重新排下一天 —— 这样长驻不重启的 DSH 每天都有一轮机会，
+ * 见文件头「记账粒度」第 2 条）。
+ *
+ * ⚠️ 与 `utc8DateString` 同一份算术平移口径，不读本机时区。
+ */
+export function msUntilNextCatchupUtc8(nowMs: number = Date.now()): number {
+  const shifted = new Date(nowMs + QODER_BILLING_UTC_OFFSET_MS)
+  const todayTargetUtc = Date.UTC(
+    shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate(),
+    CATCHUP_HOUR_UTC8, CATCHUP_MINUTE_UTC8, 0, 0,
+  )
+  const todayTarget = todayTargetUtc - QODER_BILLING_UTC_OFFSET_MS
+  const nextTarget = todayTarget > nowMs ? todayTarget : todayTarget + 86_400_000
+  return nextTarget - nowMs
+}
+
+/** 读延迟配置。 */
 export function autoCheckinDelayMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env[DSH_JET_HUB_AUTO_CHECKIN_DELAY_MS]
   if (typeof raw !== 'string' || raw.trim().length === 0) return AUTO_CHECKIN_DELAY_MS
@@ -254,6 +350,7 @@ class FileAutoCheckinStore implements AutoCheckinStore {
       lastResult: doc.lastResult,
       lastAt: doc.lastAt,
       channels: doc.channels,
+      channelsDone: doc.channelsDone,
       dismissedRunAt: doc.dismissedRunAt,
     }, null, 2), 'utf-8')
     renameSync(tmp, this.path)
@@ -294,6 +391,11 @@ interface RunTotals {
    * `claimed + alreadyClaimed`：那两项里混着「刷新前那一轮」的痕迹
    * （Qoder 活动 10:00 UTC+8 才刷新），拿它们记账会让当天新额度整天漏领。
    * 字段语义见 `src/credits.ts` 的 `ClaimOutcomeCommon.coversToday`。
+   *
+   * ⚠️⚠️ 2026-10-21 起它的**决策地位下降**：它仍决定「整轮要不要写
+   * `lastDate`」（展示语义），但「哪些渠道当天还要补」改由逐渠道的
+   * `channelsDone` 承担（见文件头「记账粒度」）—— 整轮聚合会把
+   * 「Qoder 还没刷新」被其他渠道的覆盖票否决掉。
    */
   coversToday: number
   /** 渠道级：不支持签到（`claimAll` 未发上游请求就返回的那些）。 */
@@ -383,6 +485,13 @@ export function describeRun(totals: RunTotals): string {
  * —— 记成「今天已跑」之后，当天 10 点刷新出来的新额度**整天不会再被领**，
  * 而且界面还显示「1 个今天已领」，用户毫无提示。渠道自己用
  * `ClaimOutcome.coversToday` 标出「这条不算今天」，本函数只负责数。
+ *
+ * ⚠️⚠️ **2026-10-21 补记（本函数已不是唯一防线）**：本判据是**整轮聚合**，
+ * 多渠道混跑时「Qoder 还没刷新」会被其他渠道的 `coversToday` **投票否决**
+ * （PR !33 的守卫只覆盖「整轮只有 Qoder」的极端情形）。逐渠道的缺口由
+ * `channelsDone` + 每日 10:05 补跑接管（见文件头「记账粒度」），本函数退居
+ * 「`lastDate` / 状态灯要不要写」的展示语义判据。下面的反例分析仍然成立，
+ * 只是「不记 ⇒ 下次启动重试」升级成了「不记 ⇒ 逐渠道欠账，补跑/下次启动都只补它」。
  *
  * 反例（不记、下次启动重试）：
  * - 整轮零成功零已领（凭据全过期 / 网络不通 / 启动太早抢在续期之前）——
@@ -481,9 +590,9 @@ export interface AutoCheckin {
    * 故下一轮跑出新结果时它会重新出现。
    */
   dismiss(): Promise<RpcUsageAutoCheckinState>
-  /** 启动时调用一次：延迟后排定一轮（内部自己判开关与当天是否已跑）。 */
+  /** 启动时调用一次：延迟后排定一轮 + 每日 10:05 补跑（内部自己判开关与当天是否已跑）。 */
   start(): void
-  /** 立刻按判据跑一轮（供「刚打开开关」与单测用）。 */
+  /** 立刻按判据跑一轮（供「刚打开开关」、补跑定时器与单测用）。 */
   runIfDue(): Promise<void>
   /** 取消尚未执行的延迟任务（不打断已开始的一轮）。 */
   stop(): void
@@ -497,6 +606,16 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
   /** 在飞去重：`setEnabled(true)` 与启动排定可能同时想跑。 */
   let inflight: Promise<void> | null = null
   let pending: { cancel(): void } | null = null
+  /** 每日 10:05 补跑定时器（自续）；与 `pending` 分开记，`stop()` 两个都要取消。 */
+  let catchupPending: { cancel(): void } | null = null
+  /**
+   * `start()` 幂等闸。
+   *
+   * ⚠️ 不再用原判据 `pending !== null`：补跑定时器加进来后 `pending` 在启动轮
+   * 触发后就会归零，而补跑定时器**永远**在排 —— 用「轮」判重会把补跑误当启动轮。
+   * 用一次性布尔（原语义 = 进程内只排定一次；插件热替换走的是新实例 + `stop()`）。
+   */
+  let started = false
 
   const today = (): string => utc8DateString(now())
 
@@ -514,23 +633,45 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
     }
   }
 
-  async function performRun(): Promise<void> {
-    const totals = emptyTotals()
-    let providers: string[] = []
+  /**
+   * 今天还**欠账**的渠道（`channelsDone` 里没有今天的记录的那些）。
+   *
+   * ⚠️ 池读取失败的告警从 `performRun` 挪到这里：闸门本身要读池才能判
+   * 「谁欠账」，读不到就谁都不跑（与原语义同向 —— 不把「读不到」当「跑过了」）。
+   * ⚠️ 旧文档迁移的同步快闸在 `runIfDue` 里（要在置 `running` 之前拦住），
+   * 这里不再重复判 —— 两处都判会漂移成两套同义判据。
+   */
+  async function dueProvidersNow(): Promise<string[]> {
+    let ids: string[]
     try {
-      providers = [...new Set(await deps.listProviderIds())].sort()
+      ids = [...new Set(await deps.listProviderIds())].sort()
     } catch (error) {
-      // 账号池读不出来：不记日期，下次启动重试。
       deps.warn?.(`[jet-hub] 自动签到：读取账号池失败，本次跳过: ${String(error)}`)
-      return
+      return []
     }
+    const t = today()
+    return ids.filter((provider) => doc.channelsDone[provider] !== t)
+  }
+
+  async function performRun(targets: string[]): Promise<void> {
+    const totals = emptyTotals()
+    /**
+     * 本轮里「已处理」的渠道：覆盖今天的（`coversToday > 0`）与两类跳过
+     * （排除表 / 无签到接口 —— 跳过 = 已处理，处理结果是「不参与」）。
+     *
+     * ⚠️ **失败与「非今日轮次」刻意不入**：入了就会被 `channelsDone` 封盘，
+     * 「凭据还没续上」「Qoder 还没刷新」的渠道当天再也补不了 —— 那正是
+     * 2026-10-21 缺陷的成因。不记的代价只是下次 `runIfDue` 多一轮幂等请求。
+     */
+    const doneToday = new Set<string>()
     const channels: Array<{ provider: string; text: string }> = []
-    for (const provider of providers) {
+    for (const provider of targets) {
       // ⚠️ 排除表先于**任何**上游请求生效（见 isAutoCheckinExcluded 的说明）：
       // zcode 的代价发生在**调用期间**（拉起浏览器产 captcha），事后再判断已经
       // 太晚 —— 必须在调 `claim` 之前就把它摘掉。
       if (isAutoCheckinExcluded(provider)) {
         totals.skipped += 1
+        doneToday.add(provider)
         channels.push({ provider, text: '需手动签到' })
         continue
       }
@@ -547,6 +688,7 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
         const message = typeof result.error?.message === 'string' ? result.error.message : ''
         if (isUnsupportedCheckin(message)) {
           totals.skipped += 1
+          doneToday.add(provider)
           channels.push({ provider, text: '无签到接口' })
           continue
         }
@@ -574,28 +716,49 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       // ⚠️ 记账口径**只认**这一项：渠道用 `coversToday` 自己声明「这条痕迹是不是
       // 今天这一轮的」。缺省回落到 `claimed + alreadyClaimed`，是为了兼容尚未
       // 上报该字段的旧响应（缺字段 ≠ 0，否则整轮会被判成「什么都没证明」）。
-      totals.coversToday += summary.coversToday ?? (summary.claimed + summary.alreadyClaimed)
+      const coversToday = summary.coversToday ?? (summary.claimed + summary.alreadyClaimed)
+      totals.coversToday += coversToday
+      // ★ 逐渠道记账：只有「覆盖今天」的渠道才算当天已处理；「非今日轮次」
+      //   （Qoder 刷新前领到昨天那轮）欠着，等 10:05 补跑或下次启动。
+      if (coversToday > 0) doneToday.add(provider)
       channels.push({ provider, text: describeChannel(summary) })
     }
 
     if (!shouldMarkToday(totals)) {
       // ⚠️ 刻意**不写** lastDate：让「凭据还没续上 / 网络不通 / 赶在渠道刷新前
       // 跑的那一轮」能在下次启动重试，而不是当天就此放弃（判据见 shouldMarkToday）。
+      // ⚠️ 同时**不写** channelsDone（`tests/unit/auto-checkin.spec.ts` 的
+      // 「只有 zcode 一个渠道时：不记账」锁死）—— 纯跳过轮不产生任何持久状态，
+      // 跳过类渠道每轮重新判定（零上游请求，代价可忽略）。
       deps.warn?.(
         `[jet-hub] 自动签到未记入今日（下次启动会重试）：${describeRun(totals)}`,
       )
       return
     }
 
+    // ★ 逐渠道记账写入（与 lastDate **同写** —— 「lastDate=今天且表空」是旧文档
+    //   的迁移标记，新代码不得产出，见 dueProvidersNow）。
+    const channelsDone = { ...doc.channelsDone }
+    for (const provider of doneToday) channelsDone[provider] = today()
+    // ⚠️ 补跑轮只跑了**欠账**渠道 ⇒ 逐渠道展示要**合并**（其他渠道早上那几行
+    //   保留），否则面板会从 18 行缩成补跑的两行，用户丢失全景。
+    //   同渠道的旧行被本轮新行替换（补跑后的 qoder 状态覆盖早上那行 —— 那正是
+    //   用户要看的最新事实）。
+    const targetSet = new Set(targets)
+    const mergedChannels = [
+      ...doc.channels.filter((entry) => !targetSet.has(entry.provider)),
+      ...channels,
+    ]
     doc = {
       ...doc,
       lastDate: today(),
       lastResult: describeRun(totals),
       lastAt: now(),
-      channels,
+      channels: mergedChannels,
       // ⚠️ 新一轮跑完要**清掉上一次的「已关闭」标记**：否则用户关过一次后，
       // 明天的新结果会被旧标记静默藏住（`dismissed` 的判据是 lastAt 相等）。
       dismissedRunAt: 0,
+      channelsDone,
     }
     try {
       await deps.store.save(doc)
@@ -606,17 +769,41 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
     deps.warn?.(`[jet-hub] 自动签到完成（${today()}）：${doc.lastResult}`)
   }
 
+  /**
+   * 立刻按判据跑一轮。
+   *
+   * ⚠️⚠️ 在飞去重必须**同步**落位：`dueProvidersNow` 是异步的（读账号池），
+   * 若先 `await` 闸门再设 `inflight`，三个并发 `runIfDue` 会各自过闸、各跑一轮
+   * （原闸门是同步判定，没这个坑 —— 并发用例 `Promise.all` 靠的就是同步设标记）。
+   * 故整个轮次包进一个**不 reject** 的 async 体（异常走 warn），`inflight` 在
+   * 同步段就指向它。
+   *
+   * ⚠️ `running` 只能在**同步快闸通过之后**才置真：它是「一轮真的在跑」的 UI
+   * 信号 —— 「今天已跑过时打开开关」（`ranToday=true` 那条用例）锁死了
+   * `running` 不得闪真。能同步判的闸（旧文档迁移形态：`lastDate` = 今天且
+   * `channelsDone` 为空 = 旧粒度整轮已记，新代码两者永同写，见文件头）就在
+   * 这里拦；逐渠道闸必须读池（异步），那一小段 `running` 会短暂为真 ——
+   * 属于「正在判定欠账」的真实中间态，可接受。
+   */
   function runIfDue(): Promise<void> {
     if (inflight !== null) return inflight
     if (!doc.enabled) return Promise.resolve()
-    if (doc.lastDate !== '' && doc.lastDate === today()) return Promise.resolve()
+    if (doc.lastDate === today() && Object.keys(doc.channelsDone).length === 0) {
+      return Promise.resolve()
+    }
     running = true
-    const task = performRun().catch((error: unknown) => {
-      deps.warn?.(`[jet-hub] 自动签到异常: ${String(error)}`)
-    }).finally(() => {
-      running = false
-      inflight = null
-    })
+    const task = (async () => {
+      try {
+        const due = await dueProvidersNow()
+        if (due.length === 0) return
+        await performRun(due)
+      } catch (error: unknown) {
+        deps.warn?.(`[jet-hub] 自动签到异常: ${String(error)}`)
+      } finally {
+        running = false
+        inflight = null
+      }
+    })()
     inflight = task
     return task
   }
@@ -633,18 +820,29 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       return state()
     },
     start() {
-      if (pending !== null) return
+      if (started) return
+      started = true
       const ms = deps.delayMs ?? autoCheckinDelayMs()
       const fire = (): void => {
-        pending = null
         void runIfDue()
       }
       // 延迟为 0 = 立刻跑（单测的默认形态，也是用户把环境变量设成 0 时的语义）。
       if (ms <= 0) {
         fire()
-        return
+      } else {
+        pending = (deps.schedule ?? defaultSchedule)(fire, ms)
       }
-      pending = (deps.schedule ?? defaultSchedule)(fire, ms)
+      // ★ 每日 10:05（UTC+8）补跑（见文件头「记账粒度」第 2 条）：
+      //   触发后**自续下一天** —— 长驻的 DSH 每天都有一轮机会（跨天缺口顺带修掉）。
+      //   到点后 `runIfDue` 自己重算欠账渠道：都处理过了就是一次零请求的空转。
+      const armCatchup = (): void => {
+        catchupPending = (deps.schedule ?? defaultSchedule)(() => {
+          catchupPending = null
+          fire()
+          armCatchup()
+        }, msUntilNextCatchupUtc8(now()))
+      }
+      armCatchup()
     },
     runIfDue,
     async dismiss() {
@@ -661,6 +859,8 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
     stop() {
       pending?.cancel()
       pending = null
+      catchupPending?.cancel()
+      catchupPending = null
     },
   }
 }
@@ -670,6 +870,7 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
  *
  * ⚠️ `unref()` 是必须的：否则一个 30 秒的待执行定时器会**拖住宿主进程退出**
  *（用户关掉 DSH 后进程还要多活半分钟）。与 `index.ts` 的续期定时器同一处理。
+ * 补跑定时器动辄以**小时**计，更不能拖住进程。
  */
 function defaultSchedule(fn: () => void, ms: number): { cancel(): void } {
   const timer = setTimeout(fn, ms)
