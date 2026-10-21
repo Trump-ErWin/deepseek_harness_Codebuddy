@@ -135,6 +135,26 @@ describe('ModelCenterPanel 的数据通路', () => {
     expect(panel).toContain('providerBusy.has(section.id)')
     expect(panel).toMatch(/busy:\s*sectionBusy \|\| busyIds\.has\(busyKey\(section\.id, model\.id\)\)/)
   })
+
+  /**
+   * ★★ **`mounted` ref 必须在挂载时复位**（2026-10-21 合并审计发现）。
+   *
+   * React 18 StrictMode 的双挂载序列是「mount → effect → cleanup → effect」：
+   * cleanup 把 `mounted.current` 置 `false`，**第二次 effect 若不复位** ⇒
+   * 之后所有 `if (!mounted.current) return` 恒成立 ⇒ RPC 结果全被丢弃
+   * ⇒ 界面永远停在「正在读取该供应商的模型列表…」，且懒加载会因 state 不更新
+   * 而**再发一次** `model.list`。
+   *
+   * ⚠️ 本文件既有的 `ModelListPanel`（`jet-hub.js:1110`）**有**这一行
+   * ⇒ 同一个文件里两套写法，本屏原先是漏掉的那套。
+   * ⚠️ 可达性：宿主 web bundle 里 `StrictMode` 无实际使用点 ⇒ **当前不可达**
+   * （属「差一行复位」的脆弱绿，不是现行缺陷）。
+   */
+  it('★★ mounted ref 在挂载时复位（StrictMode 双挂载形态）', () => {
+    // ⚠️ 判据是「effect 体里有 `mounted.current = true`」—— 不能只断言
+    // `mounted.current` 出现过（cleanup 里那行也满足）。
+    expect(panel).toMatch(/React\.useEffect\(\(\) => \{[^}]*mounted\.current = true;/)
+  })
 })
 
 describe('★ 不能破的结构约束', () => {
@@ -179,7 +199,11 @@ describe('★ 不能破的结构约束', () => {
 
   it('计数口径写明「已读取 N / M 家」—— 未加载的不能算成 0 个模型', () => {
     expect(panel).toContain('已读取 ')
-    expect(panel).toContain('centerTotals(sections)')
+    // ⚠️ ⚠️ **必须传 `providers` + `states`，不能传 `sections`**
+    // （2026-10-21 合并审计发现）：`sections` 是**筛选后**的集合 ⇒
+    // 用户输入任意不匹配的搜索词 ⇒ 顶部立刻变成「已读取 0 / N 家」。
+    expect(panel).toContain('centerTotals(providers, states)')
+    expect(panel).not.toContain('centerTotals(sections)')
   })
 })
 

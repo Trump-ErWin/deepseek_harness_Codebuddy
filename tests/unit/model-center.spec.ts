@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  centerBulkState,
   centerPendingProviderIds,
   centerSectionFor,
   centerTotals,
@@ -109,6 +110,26 @@ describe('centerSectionFor（单个分组的展示态）', () => {
     expect(onlyDisabled.models.map(m => m.id)).toEqual(['kimi-k3'])
   })
 
+  /**
+   * ★★ **供应商名命中时不得因「状态筛选」把整家隐掉**（2026-10-21 合并审计发现）。
+   *
+   * ⚠️ `nameHit` 使该家的模型全部参与展示（只再按状态筛）；但若该家**没有**
+   * 已关闭的模型、而用户选的恰好是「已关闭」过滤器 ⇒ `models` 为空
+   * ⇒ 原判据（`models.length > 0`）会把**整家隐掉**
+   * ⇒ 用户明明搜到了这家，它却消失了 —— 而这正是本屏**最核心的用法**
+   * （跨供应商找「已关闭的模型」）。
+   */
+  it('★★ 供应商名命中 + 状态筛不到任何模型 ⇒ 该组仍须可见（hit=true）', () => {
+    const models = [model('glm-5.3')] // 全部是「已打开」
+    const section = centerSectionFor(provider, ready(models), { query: 'WorkBuddy', status: 'disabled' })
+    expect(section.nameHit).toBe(true)
+    expect(section.models, '（对照）状态筛确实没留下任何模型').toEqual([])
+    expect(
+      section.hit,
+      '★★ 用户搜到了这家 ⇒ 该组必须仍在列表里（否则跨供应商找「已关闭的模型」无从下手）',
+    ).toBe(true)
+  })
+
   it('状态筛选生效：enabled / disabled 各留一半', () => {
     const models = [model('a'), model('b', { disabled: true })]
     expect(centerSectionFor(provider, ready(models), { status: 'enabled' }).models.map(m => m.id)).toEqual(['a'])
@@ -157,23 +178,54 @@ describe('visibleCenterSections（整页分组）', () => {
 })
 
 describe('centerTotals（跨分组总览）', () => {
-  const section = (loaded: boolean, total: number, disabled: number) => ({
-    loaded,
-    summary: { total, disabled, dead: 0 },
-  })
+  /**
+   * ⚠️⚠️ **签名是 `(providers, states)`，不是 `(sections)`**
+   * （2026-10-21 合并审计发现：原实现吃**筛选后**的 sections ⇒ 有筛选时
+   * 「已读取 N / M 家」恒显示 0 —— 而两家其实都读过了）。
+   */
+  const providers = [{ id: 'a' }, { id: 'b' }, { id: 'c' }]
 
   it('只统计已加载的组', () => {
-    const totals = centerTotals([section(true, 10, 3), section(false, 999, 999), section(true, 5, 1)])
-    expect(totals).toEqual({ loaded: 2, total: 15, disabled: 4 })
+    const states = {
+      a: ready([model('a1'), model('a2', { disabled: true })]),
+      b: { phase: 'idle', models: [] },
+      c: ready([model('c1')]),
+    }
+    expect(centerTotals(providers, states)).toEqual({ loaded: 2, total: 3, disabled: 1 })
   })
 
   it('一个都没加载时是 0/0/0 —— 界面据此写「已读取 0 / N 家」，不能谎报「全部已打开」', () => {
-    expect(centerTotals([section(false, 100, 50)])).toEqual({ loaded: 0, total: 0, disabled: 0 })
+    expect(centerTotals(providers, { a: { phase: 'idle', models: [] } }))
+      .toEqual({ loaded: 0, total: 0, disabled: 0 })
   })
 
   it('非数组与缺字段都安全', () => {
-    expect(centerTotals(null)).toEqual({ loaded: 0, total: 0, disabled: 0 })
-    expect(centerTotals([{}, { loaded: true }])).toEqual({ loaded: 1, total: 0, disabled: 0 })
+    expect(centerTotals(null, {})).toEqual({ loaded: 0, total: 0, disabled: 0 })
+    expect(centerTotals(undefined, undefined)).toEqual({ loaded: 0, total: 0, disabled: 0 })
+    expect(centerTotals([{ id: 'a' }], { a: { phase: 'ready' } }))
+      .toEqual({ loaded: 1, total: 0, disabled: 0 })
+  })
+
+  /**
+   * ★★ **有筛选时「已读取 N / M 家」不得恒显示 0**（2026-10-21 合并审计发现）。
+   *
+   * ⚠️ 原实现吃 `visibleCenterSections(...)` 的返回值 —— 而它**已经把
+   * `hit === false` 的组整组剔掉** ⇒ 用户输入任意不匹配的搜索词 ⇒
+   * 顶部立刻变成「已读取 0 / 2 家」。
+   */
+  it('★★ 有筛选时仍统计全部已加载的组（不因搜索词而归零）', () => {
+    const states = {
+      a: ready([model('a1')]),
+      b: ready([model('b1')]),
+    }
+    const all = [{ id: 'a' }, { id: 'b' }]
+    // ⚠️ 走**真实调用路径**：centerTotals(providers, states)，不是手搓的 section 数组。
+    const filtered = visibleCenterSections(all, states, { query: 'zzz', status: 'all' })
+    expect(filtered, '（对照）搜索词不匹配时可见组为 0').toEqual([])
+    expect(
+      centerTotals(all, states),
+      '★★ 「已读取 N / M 家」必须统计全部已加载的组，不受筛选影响',
+    ).toEqual({ loaded: 2, total: 2, disabled: 0 })
   })
 })
 
@@ -191,5 +243,41 @@ describe('centerPendingProviderIds（加载全部时补哪些）', () => {
 
   it('states 传 null 时全部待加载', () => {
     expect(centerPendingProviderIds(providers, null)).toEqual(['a', 'b', 'c', 'd'])
+  })
+})
+
+describe('centerBulkState（整家「全开 / 全关」按钮的禁用判据）', () => {
+  /**
+   * ⚠️⚠️ **必须排除 dead 条目**（2026-10-21 合并审计发现）。
+   *
+   * 服务端的写入集（`fullCatalogIds` 的并集）**不含** dead 模型
+   * （被 `withDeadModelPruning` 剔除），而客户端的 `summary.total` **含** dead
+   * （`model.list` 把 dead 表里的 id 补回目录）⇒ 用 `total` 比较会让
+   * 「全关」按钮**永不禁用**，而点下去服务端走幂等短路、界面一个数字都不变
+   * ⇒ 观感为「按钮坏了」。
+   */
+  it('★★ 除 dead 外全部已关闭 ⇒ 「全关」按钮必须禁用', () => {
+    const models = [
+      model('a', { disabled: true }),
+      model('b', { disabled: true }),
+      model('c', { dead: true }),
+    ]
+    // ⚠️ 对照：旧判据（用含 dead 的 total）会算出 disabled(2) < total(3) ⇒ 不禁用。
+    expect(centerBulkState(models)).toEqual({ allDisabled: true, noneDisabled: false })
+  })
+
+  it('全部已打开 ⇒ 「全开」按钮禁用、「全关」可用', () => {
+    const models = [model('a'), model('b', { dead: true })]
+    expect(centerBulkState(models)).toEqual({ allDisabled: false, noneDisabled: true })
+  })
+
+  it('空列表 ⇒ 两个按钮都可用（没有模型可管时不宣称「已全开/已全关」）', () => {
+    expect(centerBulkState([])).toEqual({ allDisabled: false, noneDisabled: false })
+    expect(centerBulkState(null)).toEqual({ allDisabled: false, noneDisabled: false })
+  })
+
+  it('dead 是唯一条目 ⇒ 同样不算「已全关」（它不受开关控制）', () => {
+    expect(centerBulkState([model('x', { dead: true })]))
+      .toEqual({ allDisabled: false, noneDisabled: false })
   })
 })
