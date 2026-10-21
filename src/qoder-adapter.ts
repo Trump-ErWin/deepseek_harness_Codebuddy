@@ -1066,7 +1066,42 @@ export class QoderAdapter extends LlmAdapter {
   async isFreeModel(modelId: string | undefined): Promise<boolean> {
     if (typeof modelId !== 'string' || modelId.length === 0) return false
     await this.ensureRemoteModels()
-    return this.catalogSource().find((model) => model.id === modelId)?.isFree === true
+    // ⚠️⚠️ **必须走 `catalogModel()`（远端 ∪ 静态表），不得走 `catalogSource()`**
+    // （2026-10-21 合并审计发现，阻断级；本节实现初版就是 `catalogSource().find(…)`
+    //  —— 与 {@link catalogModel} 的注释里记过的那个「缺陷 1」**逐字同型**）。
+    //
+    // ## 为什么
+    //
+    // 远端目录是**按账号**下发的：免费额度号实测只拿到 **2 条**
+    // （`qfmodel` + `dfmodel`，见 `docs/agent-notes/providers-qoder.md`）。
+    // 而 `catalogSource()` 是 `remoteModels ?? fallbackModels` —— 远端**一旦落地
+    // 就把静态表整体顶掉** ⇒ 静态表里其余那些标了 `isFree: true` 的模型被判成
+    // 「未知 ⇒ 非免费」。
+    //
+    // ## 后果（实测复现，2026-10-21）
+    //
+    // 免费模型被判收费 ⇒ 跳过 `credential-resolver.ts` 的「免费模型不受锁定约束」
+    // 短路 ⇒ 锁定永久积分时被 `allowPermanent=false` 拦下、报出
+    // 「额度都属于永久」这类**与事实相反**的错误 —— 正是本家 2026-10-21
+    // 真实报障（`src/index.ts` 的 qoder 文案把用户推向「解锁永久积分」）
+    // **原地复发**，且**零日志**。
+    //
+    // 实测（`lib/` 重建后真跑 `isFreeModel`）：
+    // ```
+    // ①远端收缩目录（无免费） isFreeModel(qmodel_38max) = false   ★ 应为 true
+    // ①远端收缩目录（无免费） isFreeModel(qfmodel)       = false   ★ 应为 true
+    // ②远端只含 qmodel_38max isFreeModel(qfmodel)       = false   ★ 应为 true
+    // ③未接线远端            isFreeModel(qmodel_38max) = true    ✓
+    // ```
+    //
+    // ⚠️ 同一模型的两条判据自相矛盾：`resolveModel()`（走并集）会正常给出
+    //    `Qwen3.8-Flash`，而本方法说它「不是免费」。
+    //
+    // ⚠️ 方向是不对称的：判**收费**只是让用户用不上（可恢复）；
+    //    判**免费**会绕过锁定**真烧掉永久积分**（不可逆）。
+    //    故这里用并集是「远端优先、静态表兜底」——**不会**把收费模型判成免费
+    //    （兜底表的 `isFree` 是策展过的显式标记，不是推断）。
+    return this.catalogModel(modelId)?.isFree === true
   }
 
   /**

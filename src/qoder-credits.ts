@@ -642,7 +642,29 @@ export async function fetchQoderBalanceDetailed(
   const fetcher = options.fetcher ?? fetch
   const timeoutMs = options.timeoutMs ?? QODER_CREDITS_TIMEOUT_MS
   const url = `${product.openApiBase}${QODER_USAGE_PATH}`
-  const headers = await creditsHeaders(credential, product)
+  /**
+   * ⚠️⚠️ **构造请求头必须在 try 内**（2026-10-21 合并审计发现，!136 引入的回归）。
+   *
+   * `creditsHeaders` 会抛（凭据形状异常等），而本函数的契约是「**本身不抛**」——
+   * 它一抛，`src/jet-hub-rpc.ts` 的 `Promise.all` 失败隔离就失效：
+   * 一个坏账号让**整批** `credits.balances` 变成 `ok:false`，客户端把同一句
+   * message 盖到该 provider 的**每一个**账号卡片上 —— 按账号给原因的能力
+   * 在异常路径上一次性全丢。
+   *
+   * ⚠️ 并发改造**之前**是串行 `for` + 每格自己的错误分支，所以那时抛不出去；
+   *    改成 `Promise.all` 时必须把这条腿一起包进来。实测对照：
+   *    BASE（改动前）同一路径返回 `null`，HEAD 抛出 ⇒ 隔离确实被打破。
+   *
+   * ⚠️ 文案**不要**复用下面那条「网络异常」——凭据构造失败不是网络问题，
+   *    照实说「凭据不可用」并带上根因（别吞 message）。
+   */
+  let headers: Record<string, string>
+  try {
+    headers = await creditsHeaders(credential, product)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    return { balance: null, error: `积分查询失败（凭据不可用）：${reason}` }
+  }
 
   let response: Response
   // 自己 arm 的超时是否真的触发 —— `AbortSignal.timeout()` 超时**不带** `UND_ERR_*`
@@ -658,8 +680,20 @@ export async function fetchQoderBalanceDetailed(
       error,
       aborted: timeoutSignal.aborted,
       subject: product.openApiBase,
-      remedy: '插件进程不走系统代理，Qoder 国际版端点在本机被阻断'
-        + '（TCP 能连通、TLS 握手被丢）。请在能直接访问该地址的网络下使用，'
+      /**
+       * ⚠️ **只给出路，不断言机制**（2026-10-21 合并审计发现）。
+       *
+       * 旧文案写死「Qoder **国际版**端点在本机被阻断（TCP 能连通、TLS 握手被丢）」，
+       * 两处都错：
+       * ① 本分支被 `isQoderFamily` **两站共用** ⇒ 中国版用户在自己公司网络里失败时，
+       *    会读到与同一句里打印的主机名（`product.openApiBase`）**自相矛盾**的结论；
+       * ② `remedy` 是常量 ⇒ 不论命中哪个码照发，而对 `ENOTFOUND`（DNS 解析不到）
+       *    说「TCP 能连通」是**事实性错误**。
+       * ⇒ 站点已由 `subject`（主机名）点名，机制留给用户自己看码；
+       *    这里只保证**出路**是可操作的（本插件目前**没有**按账号配代理的按钮，
+       *    故只能说「换网络 / 启动前导出 HTTPS_PROXY」）。
+       */
+      remedy: '插件进程不走系统代理；请在能直接访问该地址的网络下使用，'
         + '或为插件进程配置出口代理后在启动 DSH 前导出 HTTPS_PROXY。',
     })
     if (hint !== undefined) return { balance: null, error: hint }

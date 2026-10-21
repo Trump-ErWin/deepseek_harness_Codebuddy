@@ -1464,7 +1464,20 @@ function UsageBadgeActive(props) {
         key: part.key,
         className: 'dim-jh-badgeNotePart',
         'data-tone': part.tone,
-        ...(part.countdown === undefined ? {} : { title: `最早作废：${part.countdown}后` }),
+        // ⚠️⚠️ **不得无条件追加「后」**（2026-10-21 合并审计发现，!135 引入的回归）。
+        //
+        // `expirySplitParts` 的 `countdown` 已从「裸时长」改为「**可能是完整短语**」：
+        // 倒计时只覆盖其中一批时它是 `其中 500 于 6 天 0 小时后到期`。旧代码在这里
+        // 无条件拼 `后` ⇒ 实测得到残句：
+        //   `最早作废：其中 500 于 6 天 0 小时后到期后`
+        // （!135 只改了生产者、没同步这个消费者；本处此前**零用例**，变异实测全绿。）
+        //
+        // ⇒ 直接用它，两种形态都自洽：
+        //   `最早作废：6 天 0 小时`                    ← 倒计时覆盖全部临期时
+        //   `最早作废：其中 500 于 6 天 0 小时后到期`  ← 只覆盖其中一批时
+        // ⚠️ **不要**在这里按「短语/时长」分支 —— 那是在消费方复制生产者才知道的
+        //   形态知识，必然再次漂移（本仓头号缺陷形态）。
+        ...(part.countdown === undefined ? {} : { title: `最早作废：${part.countdown}` }),
       }, part.countdown === undefined ? part.text : `${part.text}（${part.countdown}）`));
     });
     return React.createElement('div', { key: 'note', className: 'dim-jh-badgeRowNote' }, children);

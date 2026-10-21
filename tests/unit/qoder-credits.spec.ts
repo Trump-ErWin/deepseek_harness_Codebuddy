@@ -354,6 +354,63 @@ describe('fetchQoderBalanceDetailed（带原因的余额查询）', () => {
     expect(detail.error).toContain('qoderUsage')
   })
 
+  /**
+   * ★★ **凭据不可用时必须「返回失败」而不是「抛」**
+   * （2026-10-21 合并审计发现，!136 引入的回归）。
+   *
+   * ## 为什么这条是承重件
+   *
+   * `src/jet-hub-rpc.ts` 的 qoder 分支用 `Promise.all` 并发查 N 个账号，其
+   * **失败隔离**正是建立在「本函数本身不抛」之上（该处注释原话：
+   * 「一个账号炸不影响别人（`fetchQoderBalanceDetailed` 本身不抛）」）。
+   *
+   * ⚠️ 原实现把 `await creditsHeaders(...)` 放在 try **之外** ⇒ 凭据形状异常
+   * （例如解码出字面 `null`）时它抛 `TypeError` ⇒ `Promise.all` reject
+   * ⇒ **整批** `credits.balances` 变 `ok:false` ⇒ 客户端把同一句 message
+   * 盖到该 provider 的**每一个**账号卡片上，「按账号给原因」一把全丢。
+   *
+   * 实测（修前）：本用例红，抛出
+   * `TypeError: Cannot read properties of null (reading 'security_oauth_token')`。
+   * 变异：把 `creditsHeaders` 移出 try ⇒ 本条红。
+   */
+  it('★★ 凭据形状异常（null）⇒ 返回失败，不得抛（否则一个坏账号拖垮整批并发）', async () => {
+    const fetcher = vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch
+    // `null` 是最狠的形态：`creditsHeaders` 里要读 `credential.security_oauth_token`。
+    const broken = JSON.parse('null') as unknown as QoderCredential
+    await expect(
+      fetchQoderBalanceDetailed(broken, QODER, { fetcher }),
+      '★★ 本函数的契约是「本身不抛」—— Promise.all 的失败隔离建立在它之上',
+    ).resolves.toMatchObject({ balance: null })
+  })
+
+  /**
+   * ★ **失败文案必须点名「哪个站点」的主机，且不得串味**
+   * （2026-10-21 合并审计发现）。
+   *
+   * `networkBlockedHint` 的 `subject` 传的是 `product.openApiBase`，
+   * 而旧 `remedy` 写死「Qoder **国际版**端点在本机被阻断」——本分支被
+   * `isQoderFamily` **两站共用** ⇒ 中国版用户会读到与同一句里主机名
+   * 自相矛盾的结论。变异「国际版 → 中国版」实测 86 条全绿（零守卫），
+   * 故本条把两个方向都钉住。
+   */
+  it('★ 中国版失败文案点名中国版主机、且不出现「国际版」', async () => {
+    const fetcher = vi.fn(async () => {
+      throw new TypeError('fetch failed', {
+        cause: Object.assign(new Error('x'), { code: 'UND_ERR_CONNECT_TIMEOUT' }),
+      })
+    }) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER_CN, { fetcher })
+    expect(detail.balance).toBeNull()
+    expect(detail.error, '必须点名中国版主机（用户据此判断该找谁）')
+      .toContain('https://openapi.qoder.com.cn')
+    expect(detail.error, '⚠️ 中国版失败不得说「国际版」（两站共用同一段代码）')
+      .not.toContain('国际版')
+    // ⚠️ 反向：国际版那条同理（避免为了过上面一条而把文案整段删掉）
+    const intl = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(intl.error).toContain('https://openapi.qoder.sh')
+    expect(intl.error).not.toContain('中国版')
+  })
+
   it('薄封装与详细变体解析结果**逐字段一致**（同一份 parse，不许各解一套）', async () => {
     const fetcher = vi.fn(async () => usageResponse({
       userQuota: { total: 500, used: 200, remaining: 300, unit: 'credits' },

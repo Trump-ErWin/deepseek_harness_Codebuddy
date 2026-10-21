@@ -89,18 +89,47 @@ describe('① 类型层：isFreeModel 是必填字段', () => {
     expect(code).toMatch(/export const NO_FREE_MODEL\s*=\s*\(\):\s*false\s*=>\s*false/)
   })
 
-  it('⚠️ 缺字段是**编译错误**（用 @ts-expect-error 固定住，去掉它能编译就说明又变回可选了）', () => {
-    // ⚠️ 本文件不在 `tsconfig.tests.json` 的 include 里 ⇒ 该断言**不会**被任何
-    //    命令执行。保留它是为了让将来把它加进 include 时立刻生效，同时也是
-    //    一份可执行的文档（读代码的人能看到「漏写会报错」）。
-    //    真正生效的守卫是下面的 ③。
-    const plan = {
-      kind: 'buddy' as const,
-      selector: { select: async () => ({ kind: 'none' as const }) },
-      lockedError: () => new Error('x'),
-      // @ts-expect-error isFreeModel 是必填字段，故意漏写
-    }
-    expect(Object.hasOwn(plan, 'isFreeModel'), '本对象故意不含 isFreeModel').toBe(false)
+  /**
+   * ⚠️ **字段在类型上必须是必填**（源码级判据）。
+   *
+   * ## ⚠️⚠️ 这里原先是一个**不可执行的** `@ts-expect-error` + 一条**同义反复**
+   * （2026-10-21 合并审计发现）
+   *
+   * 原实现是：
+   * ```ts
+   * const plan = { kind:'buddy' as const, selector:…, lockedError:…,
+   *   // @ts-expect-error isFreeModel 是必填字段，故意漏写
+   * }
+   * expect(Object.hasOwn(plan, 'isFreeModel')).toBe(false)
+   * ```
+   *
+   * 两处都无效：
+   * ① `plan` **没有上下文类型**（不是 `BuddyBalancePlan`）⇒ 漏写字段**根本不报错**
+   *    ⇒ 该指令无处可用。实测把它纳入 tsc 会报
+   *    `TS2578: Unused '@ts-expect-error' directive` ⇒ 将来有人把它加进
+   *    `tsconfig.tests.json`，`pnpm test`（`pretest` → `typecheck:tests`）会**直接失败**，
+   *    恰好与原注释声称的「加进去就立刻生效」**方向相反**。
+   * ② `Object.hasOwn(plan, …)` 断言的是**本处六行之前自己定义的字面量**
+   *    ⇒ 与生产代码**无关**，恒真。
+   *
+   * ## 真正生效的编译闸门在哪
+   *
+   * `pnpm typecheck`（`tsc -p tsconfig.json`）覆盖全部 `src/**` ⇒
+   * 「新 provider 漏写 `isFreeModel`」在那里变成 `TS2322`（**实测已验**：
+   * 删掉任何一处接线 ⇒ `Property 'isFreeModel' is missing … but required
+   * in type 'BuddyBalancePlan'`）。
+   *
+   * ⚠️ 本文件不在 `tsconfig.tests.json` 的 include 里（`pnpm typecheck:tests`
+   *    只覆盖 8 个文件）⇒ **测试文件**里的漏写不会被编译拦住 —— 这里补一条
+   *    **可执行**的源码级判据当第二道，而不是留一个跑不到的指令。
+   */
+  it('⚠️ 类型声明里 `isFreeModel` 必须是必填（不得带 `?`）', () => {
+    const code = readSrc('credential-resolver.ts')
+    // 正：声明存在且签名一致
+    expect(code).toMatch(/readonly isFreeModel:\s*\(modelId\?: string\)/)
+    // 反：**不得**退回可选 —— 那是三周静默失效的根因
+    expect(code, '退回 `isFreeModel?:` 会让漏接重新变成静默失效')
+      .not.toMatch(/readonly isFreeModel\?/)
   })
 })
 
@@ -116,8 +145,27 @@ describe('② 契约层：消费侧不再为 undefined 兜底', () => {
   it('★ 即便运行期被塞进 undefined，也不得**静默**当成「不免费」', async () => {
     // 这条不是「允许 undefined」，而是把「字段缺失时会发生什么」钉死成**可见的
     // 崩溃**（TypeError）而不是静默放过 —— 静默放过正是三周没被发现的原因。
+    //
+    // ⚠️⚠️ **替身必须实现真实池的每一条腿**（2026-10-21 合并审计发现，I1）：
+    // 原替身只有 `{ listAccounts, readCredential }`，缺 `listAccountsByProvider`
+    // ⇒ 一旦消费侧恢复 `=== undefined ? false` 兜底（= 缺陷态），「静默放过」之后
+    // 必然在**下一步**抛 `pool.listAccountsByProvider is not a function`
+    // ⇒ `rejects.toThrow(TypeError)` **照样通过**，红因与被测语义无关。
+    // 实测：变异「恢复兜底」后该断言仍绿，错误 message 从
+    // `plan.isFreeModel is not a function` 变成
+    // `pool.listAccountsByProvider is not a function` —— 正是本仓记过的
+    // 「替身缺一条真实实现里有的腿 ⇒ 对应变异全体无牙」。
+    //
+    // ⇒ 修法两条一起做：① 补齐替身腿；② 断言**错误内容**必须点名 isFreeModel。
+    const pool = {
+      listAccounts: async () => [],
+      listAccountsByProvider: () => [],
+      readCredential: async () => undefined,
+      permanentLocked: () => false,
+      getAvailableAccount: () => undefined,
+    }
     const resolve = createCredentialResolver(
-      { pool: { listAccounts: async () => [], readCredential: async () => undefined } as never },
+      { pool: pool as never },
       {
         product: { id: 'buddy', displayName: 'CodeBuddy' },
         readCredential: async () => undefined,
@@ -130,7 +178,8 @@ describe('② 契约层：消费侧不再为 undefined 兜底', () => {
         fallback: { kind: 'ref', refName: 'FALLBACK' },
       },
     )
-    await expect(resolve('m')).rejects.toThrow(TypeError)
+    // ⚠️ 断言**内容**而不只是「抛了 TypeError」——后者会被替身自己的缺陷满足。
+    await expect(resolve('m')).rejects.toThrow(/isFreeModel is not a function/)
   })
 })
 
