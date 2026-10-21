@@ -191,7 +191,10 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
       expect(splitCreditsByExpiry([
         pkg({ remaining: 25000, total: 25000, deductionEndTime: undefined, expiringRemaining: 2000 }),
       ], WINDOW_DAYS, NOW)).toEqual({
-        expiring: 2000, longTerm: 0, permanent: 23000, earliestExpiringAt: null,
+        expiring: 2000, longTerm: 0, permanent: 23000, earliestExpiringAt: null, earliestExpiringAmount: 0,
+        // ⚠️ PR !134 合并时补：该字段是「独立池」摘出量（PR !134 新增）。
+        //    本仓的 `toEqual` 是**全等**断言 ⇒ 少一个字段就会红。
+        exclusivePoolRemaining: 0,
       })
     })
 
@@ -210,7 +213,8 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
       expect(splitCreditsByExpiry([
         pkg({ remaining: 100, deductionEndTime: undefined, expiringRemaining: 999 }),
       ], WINDOW_DAYS, NOW)).toEqual({
-        expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: null,
+        expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0,
+        exclusivePoolRemaining: 0,
       })
     })
 
@@ -218,7 +222,8 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
       expect(splitCreditsByExpiry([
         pkg({ remaining: 100, deductionEndTime: NOW + 60 * DAY, expiringRemaining: 50 }),
       ], WINDOW_DAYS, NOW)).toEqual({
-        expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null,
+        expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0,
+        exclusivePoolRemaining: 0,
       })
     })
   })
@@ -1028,7 +1033,12 @@ describe('supportsCreditPackageList 的门控', () => {
   })
 
   it('其余 provider 与未知值一律为假（默认关闭）', () => {
-    for (const p of ['codearts', 'cline', 'raccoon', '', undefined]) {
+    // ⚠️ **codearts 已移出本名单**（2026-10-20 合并审计）：PR !123 让它的
+    //    `packages[]` 真正有内容（`expiringRemaining` 拆包 + 基础包
+    //    `deductionEndTime`），并登记了 `creditPackages: true` ——
+    //    `provider-registry.spec.ts` 的「usesExpiryWindow 必须有 creditPackages」
+    //    守卫强制两者一致。它**不**开 `permanentLock`，与本用例无关。
+    for (const p of ['cline', 'raccoon', '', undefined]) {
       expect(supportsCreditPackageList(p as never), String(p)).toBe(false)
     }
   })
