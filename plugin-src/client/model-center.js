@@ -44,6 +44,43 @@ export function providerModelSummary(models) {
 }
 
 /**
+ * 整家「全开 / 全关」两个按钮的**禁用判据**。
+ *
+ * ## ⚠️⚠️ 为什么必须**排除 dead 条目**（2026-10-21 合并审计发现）
+ *
+ * 服务端 `model.setAllDisabled(true)` 的写入集 = `fullCatalogIds` 的**并集**，
+ * 而 dead 模型被 `withDeadModelPruning` 剔除 ⇒ **不在并集里 ⇒ 不会被关**。
+ *
+ * ⚠️ 但客户端的 `summary.total` 来自 `model.list`（服务端**显式把 dead 表里的
+ * id 补回目录**）⇒ **`total` 含 dead，`disabled` 不含**。
+ *
+ * ⇒ 数值实测：`[{disabled:true},{disabled:true},{dead:true}]`
+ * ⇒ `total=3, disabled=2` ⇒ `disabled >= total` **恒 false**
+ * ⇒ 即使「除 dead 外全部已关」，「全关」按钮**仍显示可点**；用户点下去服务端
+ * 走**幂等短路**（`pending.length === 0`）返回成功，但**界面上一个数字都不变**
+ * ⇒ 观感为「按钮坏了」。
+ *
+ * @param models - 该供应商的全量模型条目。
+ * @returns `{ allDisabled, noneDisabled }` —— 两个布尔（禁用判据）。
+ */
+export function centerBulkState(models) {
+  const list = Array.isArray(models) ? models : []
+  let controllable = 0
+  let disabled = 0
+  for (const model of list) {
+    if (model === null || typeof model !== 'object') continue
+    // ⚠️ dead（上游已下架）**不受用户开关控制** ⇒ 不计入「可关」的集合。
+    if (model.dead === true) continue
+    controllable += 1
+    if (model.disabled === true) disabled += 1
+  }
+  return {
+    allDisabled: controllable > 0 && disabled >= controllable,
+    noneDisabled: controllable > 0 && disabled === 0,
+  }
+}
+
+/**
  * 供应商名或 id 是否命中搜索词。
  *
  * 空词恒 `false` —— 「空搜索」不该让每一家都算「名字命中」，否则下面的
@@ -82,7 +119,13 @@ export function centerSectionFor(provider, state, options = {}) {
   const models = loaded
     ? filterModels(all, { query: nameHit ? '' : options?.query, status: options?.status })
     : []
-  const hit = !filtering || !loaded ? true : models.length > 0
+  // ⚠⚠ **`nameHit` 时不得因「状态筛选」把整家隐掉**
+  // 用户搜「WorkBuddy」时，`nameHit` 使该家的模型全部参与展示（只再按状态筛）。
+  // 但若该家**没有已关闭的模型**，而用户选的恰好是「已关闭」过滤器 ⇒
+  // `models` 为空 ⇒ 原判据会把**整家隐掉**
+  // ⇒ 用户明明搜到了这家，它却消失了——而这正是本屏**最核心的用法**
+  // （跨供应商找「已关闭的模型」）。
+  const hit = !filtering || !loaded || nameHit ? true : models.length > 0
   return {
     id: typeof provider?.id === 'string' ? provider.id : '',
     label: typeof provider?.label === 'string' ? provider.label : '',
@@ -117,21 +160,43 @@ export function visibleCenterSections(providers, states, options = {}) {
 }
 
 /**
- * 跨分组总览。
+ * 跨分组总览（**统计全部已加载的分组**，不是「筛选后可见的」）。
  *
- * ⚠️ **只统计已加载的分组**。把未加载的算成 0 会谎报「共 0 个模型，全部打开」，
- * 用户会以为已经在管全部模型了。`loaded` 字段就是给界面写「已读取 3 / 20 家」用的。
+ * ## ⚠⚠⚠ 为什么不能吃「筛选后的 sections」（2026-10-21 合并审计发现，重现实测）
+ *
+ * 界面写的是「已读取 N / M 家」—— 这个 N 应该是「你目前**真的**读了多少家」，
+ * 而**不是**「当前筛选结果里出现了多少家」。
+ *
+ * ⚠ 原实现吃的是 `visibleCenterSections(...)` 的返回值 —— 而它**已经把
+ * `hit === false` 的组整组剔掉**了。
+ * ⇒ 用户输入任意一个不匹配的搜索词 ⇒ 顶部立刻变成「**已读取 0 / 2 家**」、
+ *   「共 0 个模型，已关闭 0 个」—— 而两家其实都读过了。
+ *
+ * ⚠ 与此**相反**的是本函数原来说的「只统计已加载的分组」：把**未加载**的算成 0
+ * 会谎报「共 0 个模型，全部打开」，用户会以为已经在管全部模型了。`loaded` 字段
+ * 就是给界面写「已读取 3 / 20 家」用的。
+ * ⇒ 本函数改为**直接遍历 `providers` + `states`**（不经筛选），
+ *   「只统计已加载」这一半仍然成立。
+ *
+ * @param providers - `PROVIDERS` 的全量元素。
+ * @param states - `{ [providerId]: state }`。
+ * @returns `{ loaded, total, disabled }`。
  */
-export function centerTotals(sections) {
-  const list = Array.isArray(sections) ? sections : []
+export function centerTotals(providers, states) {
+  const list = Array.isArray(providers) ? providers : []
+  const map = states !== null && typeof states === 'object' ? states : {}
   let loaded = 0
   let total = 0
   let disabled = 0
-  for (const section of list) {
-    if (section?.loaded !== true) continue
+  for (const provider of list) {
+    const id = typeof provider?.id === 'string' ? provider.id : ''
+    if (id.length === 0) continue
+    const state = map[id]
+    if (state?.phase !== 'ready') continue
     loaded += 1
-    total += section.summary?.total ?? 0
-    disabled += section.summary?.disabled ?? 0
+    const summary = providerModelSummary(state.models)
+    total += summary.total
+    disabled += summary.disabled
   }
   return { loaded, total, disabled }
 }
