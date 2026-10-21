@@ -1211,20 +1211,38 @@ describe('单位归一：宿主与客户端同一口径', () => {
  *    文案 —— 只断言文案会让「改了文案但删了逻辑」这种改法溜过去。
  */
 describe('独立池（AStudio 星火积分）：设置页与徽标弹窗两处渲染同步', () => {
-  const badge = read('plugin-src/client/usage-badge.js')
-  const jetHub = read('plugin-src/client/jet-hub.js')
+  // ⚠⚠ 断言必须基于 **`codeOf`（剥掉注释）**。
+  //
+  // ⚠⚠⚠ **为什么（合并审计发现，B4）**：本文件原先的断言用的是 **`read()`
+  // 的原始文本**（未剥注释）⇒ 字面量在**注释里也存在** ⇒ 把真条件改成
+  // `false && …`（死分支短路，本仓已记录过 6 次同型复发）依然全绿。
+  //
+  // 实测（变异验证）：
+  // - `usage-badge.js` 的 `if (false && exclusive > 0)` → 76 条全绿；
+  // - `jet-hub.js` 的 `false && exclusiveRemaining > 0` → 76 条全绿。
+  //
+  // ⚠ 同一文件的 `codeOf` helper 就在第 33 行，**新用例却没用它**。
+  const badge = codeOf(read('plugin-src/client/usage-badge.js'))
+  const jetHub = codeOf(read('plugin-src/client/jet-hub.js'))
 
   it('徽标弹窗的 splitParts 追加独立池段（无色 muted）', () => {
-    // 必须走 isExclusivePool（与 credit-expiry.js 同一判据），不能各写一套
-    expect(badge).toContain('isExclusivePool')
+    // 必须走**唯一的判据函数**（与 credit-expiry.js 同一份），不能各写一套
+    expect(badge).toContain('exclusivePoolRemainingOf')
     // 追加的是**分段**，故 key 与 tone 都要对（tone 用 muted：不是告警，是事实说明）
     expect(badge).toContain("key: 'exclusive'")
     expect(badge).toContain("tone: 'muted'")
   })
 
   it('设置页的 CreditBalanceRow 同样渲染独立池提示', () => {
-    expect(jetHub).toContain('isExclusivePool')
+    expect(jetHub).toContain('exclusivePoolRemainingOf')
     expect(jetHub).toContain('exclusiveRemaining > 0')
+  })
+
+  it('两处都**调用**同一个纯函数（不是只 import 了它）', () => {
+    // ⚠ 两处都必须**调函数**（而不只是 import 名字）—— 只坐实「import 了它」
+    // 未就等于「用了它」。
+    expect(badge).toContain('exclusivePoolRemainingOf(')
+    expect(jetHub).toContain('exclusivePoolRemainingOf(')
   })
 
   it('两处共用同一个 isExclusivePool 判据（不是各写一套）', async () => {

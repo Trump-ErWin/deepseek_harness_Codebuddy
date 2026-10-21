@@ -28,6 +28,7 @@ import {
   expirySplitParts,
   expiryBucketLabel,
   daysUntilExpiry,
+  exclusivePoolRemainingOf,
   isExclusivePool,
 } from './credit-expiry.js';
 import {
@@ -476,12 +477,12 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
    * ⚠️ 数字与池名都来自 `balance.packages`（单一来源），不在这里重新算；
    *    0 时不渲染（没有独立池的 provider 逐字不变）。
    */
-  const exclusiveRemaining = all.reduce(
-    (sum, pkg) => sum + (pkg && isExclusivePool(pkg) && pkg.active !== false ? (Number(pkg.remaining) || 0) : 0),
-    0,
-  );
+  const exclusiveRemaining = exclusivePoolRemainingOf(all);
+  // ⚠ 同口径（与 `exclusivePoolRemainingOf` 逐格一致）：
+  // `active === true` 且 `remaining > 0`，不是 `active !== false`。
   const exclusiveNames = all
-    .filter((pkg) => pkg && isExclusivePool(pkg) && pkg.active !== false && (Number(pkg.remaining) || 0) > 0)
+    .filter((pkg) => pkg && pkg.active === true && isExclusivePool(pkg)
+      && Number.isFinite(Number(pkg.remaining)) && Number(pkg.remaining) > 0)
     .map((pkg) => pkg.name)
     .join('、');
   // 明细放进 title，不占版面；账号卡片本身已经信息密集了
@@ -5954,7 +5955,21 @@ function ModelCenterPanel({ providers, rpcCall, statuses }) {
     setToggleWarnings([]);
     setProviderBusy(prev => { const next = new Set(prev); next.add(providerId); return next; });
     try {
-      const result = await rpcCall('model.setAllDisabled', { provider: providerId, disabled });
+      // ⚠⚠⚠ **`closeProvider: false`**（2026-10-21 合并审计发现，阻断级）：
+      // 本屏是**模型级**管理，用户的意图是「关这家模型」，不是「关掉这个供应商」。
+      //
+      // ⚠⚠ 服务端默认 `closeProvider` 为 `true`（既有语义：「关闭全部模型」≡
+      // 「关闭该供应商」，与 `provider.setEnabled(false)` 同一条路径）⇒ 若不显式传
+      // `false`，点一次「全关」会把**整个供应商**也关掉：
+      // ① `provider.status` 报 `closed: true` ⇒ 左侧分组变成「已关闭」；
+      // ② 各适配器的 `listModels` 直接返回 `[]` ⇒ 该家在选择器里一个模型都没有；
+      // ③ **再打开任意一个模型，供应商被顺带打开**（打开方向会清意图）。
+      // ⇒ 两头都与用户意图相反，且**零提示**。
+      const result = await rpcCall('model.setAllDisabled', {
+        provider: providerId,
+        disabled,
+        closeProvider: false,
+      });
       if (mounted.current) setToggleWarnings(Array.isArray(result?.warnings) ? result.warnings : []);
       // 批量动作会改动整张黑名单，逐项翻不可靠 ⇒ 重载这一家。
       await loadProvider(providerId);

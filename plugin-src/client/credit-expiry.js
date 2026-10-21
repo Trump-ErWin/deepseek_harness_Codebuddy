@@ -464,6 +464,45 @@ export function isExclusivePool(pkg) {
 }
 
 /**
+ * 独立池的剩余量（`> 0` 时才值。
+ *
+ * ## ⚠⚠⚠ 为什么要单独抽出一个函数（2026-10-21 合并审计发现）
+ *
+ * * 三处同义（前端 `splitCreditsByExpiry`、设置页 `CreditBalanceRow`、
+ * *   徽标弹窗 `splitParts`）各写了一份独立池的汇总，而判据很接近但**不完全相同**：
+ * *   `split` 用 `pkg.active === true` 且跳过 `remaining <= 0`；
+ * *   两处渲染用 `pkg.active !== false`（一个 `undefined` 就算有效）且**不过滤负余额**
+ * *   （autoclaw 的冲正 / 退款会下发负数）。
+ * * 
+ * * ⚠ 实测：`packages: [{active:undefined, remaining:-5}, {active:true, remaining:100}]`
+ * *   → `split.exclusivePoolRemaining` = 100，而两处渲染的 reduce = 95 → **同一屏上两个数**。
+ * *
+ * * ⇒ 本函数是**唯一一份判据**；三处都调它 ⇒ 不可能再分开。
+ * *
+ * * ## 为什么不直接用 `split.exclusivePoolRemaining`
+ * *
+ * * `split` **可能为 `null`**（无 `windowDays` 时整体返回 `null`）⇒ 独立池段会整段不渲染。
+ * * ⇒ 独立池的显示**不应该被窗口天数带走** ⇒ 本函数独立计算。
+ * *
+ * * @param packages - `balance.packages`
+ * * @returns 独立池的剩余量（非正数归 0）。
+ * */
+export function exclusivePoolRemainingOf(packages) {
+  if (!Array.isArray(packages)) return 0;
+  let sum = 0;
+  for (const pkg of packages) {
+    // ⚠ 判据与 `splitCreditsByExpiry` 的循环**逐格同款**：
+    // `active === true`（不是 `!== false`）且 `remaining > 0`。
+    if (!pkg || pkg.active !== true) continue;
+    if (!isExclusivePool(pkg)) continue;
+    const remaining = Number(pkg.remaining);
+    if (!Number.isFinite(remaining) || remaining <= 0) continue;
+    sum += remaining;
+  }
+  return sum;
+}
+
+/**
  * 取出包的到期时刻（毫秒）；**拿不到返回 null**（= 没有到期概念）。
  *
  * ⚠️ 这是 `formatPackageExpiry` 与包列表**排序**共用的唯一判据来源 ——
