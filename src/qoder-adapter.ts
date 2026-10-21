@@ -1024,6 +1024,52 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   /**
+   * 该模型是否**消耗 0 积分**（免费额度模型）。
+   *
+   * ## 为什么必须有这个方法（真实报障 2026-10-21）
+   *
+   * 用户开着「锁定永久积分」，用**免费模型**（CN `Qwen3.8-Flash` / `DeepSeek-Flash`、
+   * 国际版 `Qwen3.8-Max` / `Qwen3.8-Flash`）请求，却报「没有可用账号 ⋯ 当前账号的
+   * 额度都属于长期 / 永久」。
+   *
+   * 根因：`src/credential-resolver.ts:368` 的免费短路**只在 `plan.isFreeModel`
+   * 存在时**才可能命中。本家装配层（`src/index.ts` 的两处 `balance:`）**从未传
+   * `isFreeModel`** ⇒ 免费模型与付费模型走同一条余额分档路 ⇒ 锁定期间被
+   * `allowPermanent=false` 一并拦下。报出的错误还**自相矛盾**：免费模型既不扣
+   * 临时也不扣永久积分，说它「额度都是永久的」毫无意义。
+   *
+   * 这与 buddy / trae 的成文教训是同一个（`credential-resolver.ts:359-365` 的
+   * 长注释记录了 buddy 那次报障）：**保护永久积分的闸门不该拦免费模型**。
+   *
+   * ## 判据：只认目录里明确的 `isFree`
+   *
+   * - 两条来源（远端目录 / 编译期兜底表）**同源**：`src/qoder-catalog.ts` 的
+   *   `qoderRemoteModelToFallback()` 已把远端 `is_free` 归一成 `isFree` 并透出
+   *   （`:425`），与兜底表的 `isFree: true` 是同一个字段 ⇒ 不存在「远端少了字段
+   *   于是判不出免费」这种分叉。
+   * - ⚠️ **不用 `priceFactor === 0` 代替**：`priceFactor` 是「计费倍率」，它等于 0
+   *   与「这个模型免费」在本家是两条独立信号（CN `dfmodel` 就是
+   *   `priceFactor: 0` + `isFree: true`，而国际版 `qmodel_38max` 是
+   *   `isFree: true` + `priceFactor: 0.2` —— **免费但倍率非 0**）。用倍率推断免费
+   *   会漏掉后者、并把倍率解析失败（undefined）误判成免费。
+   * - **只在确定免费时返回 true**：查不到目录 / 解析失败一律 false。方向保守 ——
+   *   宁可多走一次余额门（用户至多多一次网络请求），也不要把付费模型误判成免费
+   *   （那会**真的烧掉永久积分**，是不可逆损失）。与 `BuddyAdapter.isFreeModel`
+   *   同一约定。
+   * - ⚠️ 远端目录懒加载，**必须先 `await ensureRemoteModels()`**：否则「直接进
+   *   会话」等路径尚未加载目录，会静默退回被拦截的行为（trae 的同款教训见
+   *   `TraeAdapter.isFreeModel` 的注释）。
+   *
+   * @param modelId - 模型 id（目录 key，如 `qfmodel`）。
+   * @returns true 仅当目录明确标记 `is_free`。
+   */
+  async isFreeModel(modelId: string | undefined): Promise<boolean> {
+    if (typeof modelId !== 'string' || modelId.length === 0) return false
+    await this.ensureRemoteModels()
+    return this.catalogSource().find((model) => model.id === modelId)?.isFree === true
+  }
+
+  /**
    * 懒加载远端模型目录（**每 20 分钟**一次；失败/空结果走闸门冷却）。
    *
    * 三条口径与其余 12 家逐字同构：
