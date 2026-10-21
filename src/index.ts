@@ -3119,8 +3119,33 @@ export function apply(ctx: Context): void {
         //    故不传该字段 —— 缺省 `undefined` 会让 `createCredentialResolver`
         //    走「免费模型短路」之外的常规分档路径（正确行为）。
         lockedError: astudioLockedError('AStudio'),
-        // 与 buddy 系一致：分档选中时**不**回报账本（本家旧闭包也没有回报）。
-        reportPickedAccount: false,
+        // ⚠️⚠️ **必须是 `true`**（2026-10-21 合并审计发现：PR !119 原写的 `false`
+        //    让上面 `reportAccount` 成了**不可达的死接线**）。
+        //
+        // **原注释错在哪**：原文「与 buddy 系一致：本家旧闭包也没有回报」是**类比错误** ——
+        // buddy 系能写 `false` 是因为它们的**适配器自己回报**（`buddy-adapter.ts` /
+        // `trae-adapter.ts` / `lobsterai-adapter.ts` 都调 `reportLedgerAccount`），
+        // 而 **AStudio 适配器全文零回报**（grep 实测 0 处），且 master 上它压根没有
+        // `reportAccount` 接线 ⇒「旧闭包也没有回报」描述的是**一个缺陷状态**。
+        //
+        // **实测这行是死代码**（`credential-resolver.ts` 三条回报点：①免费短路 ——
+        // astudio 无 `isFreeModel` 不进；②分档选中 `:388` 被 `!== false` 拦住；
+        // ③池选号 `:454` —— ②里已 `return picked.credential`，走不到）：
+        // ```
+        // reportPickedAccount=false     → cred=true reports=[]     poolReached=false
+        // reportPickedAccount=true      → cred=true reports=["a1"] poolReached=false
+        // reportPickedAccount=undefined → cred=true reports=["a1"] poolReached=false
+        // ```
+        // ⇒ `false` 时**零回报**，而那正是 `reportAccount: (id) => reportLedgerAccount(...)`
+        // 唯一的调用来源 ⇒ 那行接线永不执行。
+        //
+        // **后果**：`token-ledger.ts` 拿不到 `accountId` ⇒ 整笔用量归到 `'-'`（未归属）桶
+        // ⇒ AStudio 账号卡片看不到自己的 token 用量，多账号时无法区分谁在烧。零报错零日志。
+        //
+        // **为什么改 `true` 是纯增益**：master 上 astudio 走 `auth.currentCredential()`
+        // （单凭据、从未回报归属）⇒「有归属」是新增能力不是回退，它**没有旧闭包要保真**
+        // （该分支在 master 上根本不存在）。⚠️ 与 buddy 系的取舍**不同源**，别照抄那两行。
+        reportPickedAccount: true,
       },
       fallback: { kind: 'ref', refName: ASTUDIO.defaultCredentialRef },
       // 退到单凭据 ref 之前先证明失败原因：全被模型限流时报明确的限流错误，
