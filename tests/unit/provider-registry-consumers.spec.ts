@@ -65,9 +65,12 @@ describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry
     // ⚠️ minimax / minimaxintl / astudio 2026-10-20 加入：与 astudio 同批，
     //    两处同时登记（只加 permanentLock 不加 usesExpiryWindow ⇒ 分档行不渲染
     //    但锁按钮在，是 AStudio 首次报障时踩过的半残形态）。
+    // ⚠️ autoclaw / autoclawintl 2026-10-21 加入（用户要求「补锁定开关」）：
+    //    两站**同日同时**登记两个字段（本家早有 `usesExpiryWindow`，本次补
+    //    `permanentLock` + `balance` 接线）。⚠️ 两站各占一项。
     expect(viaWindow).toEqual([
-      'astudio', 'buddy', 'lobsterai', 'minimax', 'minimaxintl',
-      'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
+      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
     ])
     expect(locked).toEqual([...viaWindow, 'loomy'].sort())
   })

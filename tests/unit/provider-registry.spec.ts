@@ -145,7 +145,7 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(Object.isFrozen(PROVIDER_REGISTRY), 'registry 数组应冻结').toBe(true)
   })
 
-  it('permanentLock 恰好是 9 家（officeace 2026-10-12、astudio/minimax/minimaxintl 2026-10-20、qoder/qodercn 2026-10-20 加入）', () => {
+  it('permanentLock 恰好是 13 家（officeace 2026-10-12、astudio/minimax/minimaxintl/qoder/qodercn/autoclaw/autoclawintl 2026-10-2x 加入）', () => {
     const locked = PROVIDER_REGISTRY.filter((d) => d.permanentLock === true)
       .map((d) => d.id).sort()
     // ⚠️ qoder / qodercn 2026-10-20 加入（用户要求补齐三档分档 + 永久锁）。判据见
@@ -161,13 +161,18 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     //    到期时间，也应当有相同功能」）：`/minimax-cloud/api/v1/credit/details` 的
     //    每条 `details[]` 都带 `expire_at_ms`（毫秒时间戳）⇒ 可分三档；同日接上
     //    `createCredentialResolver` 的 `kind: 'buddy'` 选号，锁定才真能拦。
+    // ⚠️ autoclaw / autoclawintl 2026-10-21 加入（用户要求「补锁定开关」）：
+    //    `autoclaw-credits.ts` 的批次映射明确「**无到期字段的发放**（活动赠送的
+    //    永久分）⇒ 不带 `deductionEndTime`（= 永久桶）」⇒ 本家**确实有**永久桶。
+    //    ⚠️ 与 buddy 系**不同源**：本家 `rateLimit: false`、刻意不做请求级换号，
+    //    锁定只作用于「按余额分档选号」这一层。**两站各占一项**。
     expect(locked).toEqual([
-      'astudio', 'buddy', 'lobsterai', 'loomy', 'minimax', 'minimaxintl',
-      'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
+      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'loomy',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
     ])
   })
 
-  it('usesExpiryWindow 恰好是 12 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17、qoder/qodercn/astudio/minimax/minimaxintl/codearts 2026-10-20 加入）', () => {
+  it('usesExpiryWindow 恰好是 13 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17、qoder/qodercn/astudio/minimax/minimaxintl/codearts 2026-10-20 加入）', () => {
     const win = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
     // ⚠️ autoclaw 2026-10-17 加入：流水每笔发放带 `wallet_expires_at`，未过期批次

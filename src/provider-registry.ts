@@ -688,6 +688,50 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    流水批次的包名取服务端描述（实测「每日签到」**不等于**「每日积分」）
     //    ⇒ 两条路径都不再命中那份名单，「每日 0」红字消失。
     usesExpiryWindow: true,
+    /**
+     * ⚠️ **2026-10-21 补齐**（用户明确要求「补锁定开关」）。
+     *
+     * ## 为什么本家需要它
+     *
+     * `autoclaw-credits.ts` 的批次映射里有一条**代码分支**：`wallet_expires_at`
+     * 缺失 / `<= 0` 的发放 ⇒ 进 `permanentByLabel` ⇒ **不带 `deductionEndTime`**
+     * （= 永久桶）。⇒ 只要上游下发那种条目，就有永不作废的积分需要保护。
+     * 补登记前：`supportsPermanentLock()` 为 false ⇒ 按钮**不渲染**、
+     * `credits.permanentLock` RPC 直接 `bad-request` ⇒ 用户无从保护。
+     *
+     * ⚠️⚠️ **前提强度如实标注（2026-10-21 二轮审计）**：该分支**结构上可达、
+     * 但零实测**。仓库内唯一一次流水字段完整性实测（`5fbe7ab`）结论是
+     * 「**28/28 全带 `wallet_expires_at`**」，方向上**否定**该形态存在。
+     * ⇒ 若上游恒带到期字段，本家的永久桶**恒为空**，这个开关**永不产生实际效果**
+     *（但也不会出错 —— 它只是把已存在的分档能力接上，与仓库 11 家同构）。
+     * **不得**据此声称「本家确实有永久桶」。
+     *
+     * ## ⚠️⚠️ 与 buddy 系的取舍**不同源**，别照抄那两行
+     *
+     * | | buddy 系 | AutoClaw |
+     * |---|---|---|
+     * | `rateLimit` | 省缺（true） | **false**（不写 `modelRateLimits`、不在 `probeById`） |
+     * | 请求级换号 | 有 | **刻意没有** |
+     * | 账户「每日红」语义 | 有 | **不适用**（每日签到积分是发放进余额、按批次到期） |
+     *
+     * ⇒ 本家的锁定只作用于「**按余额分档选号**」这一层，不涉及换号冷却
+     *   （它本来就没有）。这正是 `balance: { kind: 'buddy' }` 能直接套用的原因：
+     *   分档判据（`splitBuddyCreditsByExpiry`）只读通用的
+     *   `packages[].{active, remaining, deductionEndTime}`，**与 provider 无关**。
+     *
+     * ## 四处同改（缺一即静默失效或假开关）
+     *
+     * 1. **本行**（`permanentLock`）——决定按钮是否渲染、RPC 是否放行；
+     * 2. `src/index.ts` 的 `balance: { kind: 'buddy', selector, lockedError }` 接线
+     *    ——**缺它按钮在、点了不拦**（假开关，比没有按钮更糟：`credential-resolver`
+     *    的 `allowPermanent` 读不到，锁定对选号完全无影响）；
+     * 3. `autoclawLockedError` 文案（本家池名与 buddy 的「服务端资源包」不同）；
+     * 4. `tests/unit/autoclaw-lock-wiring.spec.ts` 的三层守卫。
+     *
+     * ⚠️ `autoclawintl` **同因同状态**（两站共用全部实现，只差 product 常量），
+     *    两处必须同时登记 —— 漏国际站的症状是「只登国际站的用户没有锁定按钮」。
+     */
+    permanentLock: true,
     rateLimit: false,
     settingsNamespace: 'llm-autoclaw',
     channel: true,
@@ -737,6 +781,12 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     creditPackages: true,
     // 分档 / 临期逻辑与国内同源（同一份 `autoclaw-credits.ts`）。
     usesExpiryWindow: true,
+    // ⚠️ **与国内站同因同日补齐**（2026-10-21，用户要求「补锁定开关」）。
+    //    两站共用全部实现，只差 product 常量 ⇒ 有没有永久桶、要不要锁**逐字相同**
+    //    （见国内站那一段的长注释，不重复）。
+    //    ⚠️ **两站必须各占一项**：`PERMANENT_LOCK_PROVIDERS` 按 provider id，
+    //    漏 `autoclawintl` 会让**只登国际站**的用户没有锁定按钮（与 minimaxintl 同因）。
+    permanentLock: true,
     rateLimit: false,
     settingsNamespace: 'llm-autoclawintl',
     channel: true,
