@@ -124,8 +124,35 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
     const end = Number(pkg.deductionEndTime);
     const known = Number.isFinite(end) && end > 0;
     if (!known) {
-      // 服务端没给到期时间 ⇒ 真·永久（保守方向：宁可少用，不可误烧长期积分）。
-      permanent += remaining;
+      /**
+       * 服务端没给到期时间 ⇒ 默认是**真·永久**（保守方向：宁可少用，
+       * 不可误烧长期积分）。
+       *
+       * ⚠️ **但 CodeArts 的赠送包是例外**（2026-10-20）：它没有逐笔到期
+       * 时刻，上游只在该分类 metric 上给一个「其中 N 即将到期」的标量。
+       * 那个标量被解析到 `pkg.expiringRemaining` ⇒ 拆开算：
+       *
+       * ```
+       * 临期桶 += expiringRemaining
+       * 永久桶 += remaining - expiringRemaining
+       * ```
+       *
+       * 不拆的话，那 25000 分（含 2000 快作废的）会整包进永久桶，卡片上
+       * 「永久 25000」与「另有 2000 即将到期」同时出现、互相矛盾
+       * （用户 2026-10-20 报障：「2000+500临期不应该是2500嘛」）。
+       *
+       * ⚠️ 这类包**没有倒计时**（上游不给日期，绝不编一个）⇒ 不参与
+       * `earliestExpiringAt` 的选取。
+       */
+      const expiringPart = Number(pkg.expiringRemaining);
+      const hasExpiring = Number.isFinite(expiringPart) && expiringPart > 0;
+      if (hasExpiring) {
+        const capped = Math.min(expiringPart, remaining);
+        expiring += capped;
+        permanent += remaining - capped;
+      } else {
+        permanent += remaining;
+      }
       continue;
     }
     if (end - at < windowMs) {
@@ -403,6 +430,45 @@ export function formatNamedPoolLine(packages, format) {
  * 来源优先序：`deductionEndTime`（毫秒，各 provider 后端已归一化）>
  * `expiredTime`（字符串，如 "2026-11-01 00:00:00"，给未归一化的包兜底）。
  *
+ * ## ⚠️⚠️ **架构性缺口（2026-10-21 第二轮审计登记，未修）**：`expiredTime` 兜底**不认哨兵**
+ *
+ * `deductionEndTime` 那条由**各个后端**在写入前过滤永久哨兵（Qoder 的
+ * `isPermanentSentinelMs`、codearts 的「有 `deductionEndTime` 就不写 `expiredTime`」），
+ * 但**本函数自己的 `expiredTime` 兜底路径没有任何哨兵判据**。实测后果：
+ * ```
+ * { expiredTime: '9999-12-31T00:00:00.000Z' }
+ *   → packageExpiryMs    = 253402214400000
+ *   → formatPackageExpiry = "9999-12-31（2912150 天后）"
+ * ```
+ * 而**目前仍有多个渠道会把上游字符串原样透传到 `expiredTime`**（2026-10-21 全仓清点，
+ * `grep 'expiredTime:'` 后逐格判断「是否来自已归一的 `deductionEndTime`」）：
+ *
+ * | 来源 | 是否可能带哨兵 |
+ * |---|---|
+ * | `astudio-credits.ts` **星火池**（`readAstudioLocalTime(...)`） | ✅ 上游原样串 |
+ * | `lobsterai-credits.ts`（`expiredTime: expiresAt`） | ✅ 上游原样串 |
+ * | `jet-hub-rpc.ts`（officeace 的 `group.expiresAt`） | ✅ 上游原样串 |
+ * | `provider-credits.ts` 两处（`bucket.expiresAt` / `result.expiresAt`） | ✅ 上游原样串 |
+ * | `codearts-credits.ts`（`new Date(deductionEndTime).toISOString()`） | ❌ 从已过滤的 `deductionEndTime` 反推 |
+ * | `minimax-credits.ts`（`new Date(expires).toISOString()`） | ❌ 同理（`expire_at_ms` 非哨兵形态） |
+ * | `qoder-credits.ts`（`expIsPermanent ? '' : raw`） | ❌ 已在本轮修复时过滤 |
+ *
+ * ⚠️ **初版这段注释只写了「两个渠道」**（astudio / lobsterai），那是**漏数** ——
+ * 只看了 `src/*-credits.ts`，漏掉了 `jet-hub-rpc.ts` 与 `provider-credits.ts`。
+ * 「数一遍」必须覆盖**全仓**，不能只看命名符合直觉的那些文件。
+ *
+ * **当前是否可达**：**不可达** —— 上述上游实测都**不发** 9999 哨兵
+ *（astudio 的 `*NextExpireTime` 实测形如 `"2026-11-20T01:50:14"`；
+ * lobsterai / officeace 的 `expiresAt` 实测是当年的 ISO 串）。
+ * 所以这是**前向防御缺口**，不是现存缺陷（如实标注，不夸大）。
+ *
+ * **为什么现在不改本函数**：它是**所有 provider 共用**的显示判据（不只是
+ * `usesExpiryWindow` 那 13 家 —— 任何带 `expiredTime` 的包都会走到这里），
+ * 在这里加「年份 >= 9999 就当没有到期」会**改变全部渠道**的展示语义，
+ * 且那种「遥远处到期」在别的渠道可能是**真实**的。正确修法是**在写
+ * `expiredTime` 的那几个调用点各自过滤**（与 Qoder 的 `isPermanentSentinelMs`
+ * 同型 —— 一份判据、多个入口）。已登记，待上游取证后处理。
+ *
  * @param pkg - 资源包。
  * @returns 毫秒时间戳；`null` = 没有到期时间（显示「长期」）。
  */
@@ -423,8 +489,14 @@ export function packageExpiryMs(pkg) {
  * ⚠️ 到期时间取自 {@link packageExpiryMs}（与排序同一判据）。
  *
  * ⚠️ 「长期」的判据是**服务端没给任何到期字段**。Qoder 的套餐额度/资源包
- * 就没有独立到期（统一"领取后 30 天"是活动规则而非包字段），显示"长期"
- * 比编造一个错误日期好。
+ * 就是这种情形 —— 显示"长期"比编造一个错误日期好。
+ *
+ * ⚠️ **`qoderUsage.expiresAt` 不算「给了到期字段」**（2026-10-20 真机取证订正）：
+ * 那个字段确实在 `userQuota` 那一层存在，但个人版实测恒为永久哨兵
+ * `253402214400000`（= `9999-12-31`）。若把它透出成 `deductionEndTime`，
+ * 本函数会渲染成「9999-12-31（约 2900000 天后）」—— 也就是说**闸门在
+ * `null` 这一侧**：哨兵必须被后端挡掉、不写进 `deductionEndTime`，
+ * 才轮到这里正确地显示「长期」。两条判据缺一不可。
  */
 export function formatPackageExpiry(pkg, now) {
   const end = packageExpiryMs(pkg);
