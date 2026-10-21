@@ -138,6 +138,30 @@ export const QODER_CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns'
 export const QODER_PERMANENT_EXPIRY_MS = 253402214400000
 
 /**
+ * 该毫秒值是否是 Qoder 的**永久哨兵**（`9999-12-31` 那一族）。
+ *
+ * ⚠️ **两条支路共用本判据**（本仓库红线：同一语义只留一份实现）：
+ * - 支路 A（`userQuota` 的数字 `expiresAt`）—— `qoderUsage.expiresAt`；
+ * - 支路 B（`dedicatedResourcePackages[].expiresAt` 的 ISO 字符串，解析后）。
+ *
+ * 上一版只判了支路 A，于是支路 B 的哨兵会原样写进 `deductionEndTime` ⇒
+ * 客户端渲染「9999-12-31（约 290 万天后）」，且该包被判成 `longTerm`
+ * 而不是 `permanent`（锁定时**照样可选** ⇒ 锁定形同虚设）。
+ * 详见 `toPackage` 里 `expIsPermanent` 那一段的实测记录。
+ *
+ * 判据三条（任一命中即哨兵）：
+ * 1. `>= QODER_PERMANENT_EXPIRY_MS`（`9999-12-31T00:00:00Z` 及更晚）；
+ * 2. 解析出的 **UTC 年份 >= 9999**（兜住 `9999-01-01`~`9999-12-30`，
+ *    它们小于上面的常量但同样是哨兵）；
+ * 3. 非有限值 —— 返回 `false`（「解析失败」不是哨兵，由调用方按「未知到期」
+ *    处理；两者最终都落永久桶，但语义不同，不要混在一个判据里）。
+ */
+export function isPermanentSentinelMs(ms: number): boolean {
+  if (!Number.isFinite(ms) || ms <= 0) return false
+  return ms >= QODER_PERMANENT_EXPIRY_MS || new Date(ms).getUTCFullYear() >= 9999
+}
+
+/**
  * 每日活动**刷新时刻**（UTC+8 的小时）。来源是服务端自己下发的原文：
  * `description: "每日 10:00（UTC+8）刷新，领取后 30 天有效"`（见文件头）。
  *
@@ -453,18 +477,85 @@ function toPackage(
    */
   const explicitMs = options.expiresAtMs
   const explicitUsable = typeof explicitMs === 'number' && Number.isFinite(explicitMs) && explicitMs > 0
-  // ⚠️ 年份判据兜住「小于常量但同样是哨兵」的取值（`9999-01-01`~
-  //    `9999-12-30` ⇒ `253370764800000`~`253402214399999`）。
-  const explicitIsPermanent = explicitUsable && (
-    explicitMs >= QODER_PERMANENT_EXPIRY_MS
-    || new Date(explicitMs).getUTCFullYear() >= 9999
-  )
+  // ⚠️ 与支路 B 共用 `isPermanentSentinelMs` 一份判据（含「年份 >= 9999」兜底，
+  //    兜住 `9999-01-01`~`9999-12-30` 这些小于常量但同样是哨兵的取值）。
+  const explicitIsPermanent = explicitUsable && isPermanentSentinelMs(explicitMs)
   const expMs = options.expiredTime && options.expiredTime.length > 0
     ? Date.parse(options.expiredTime.replace(' ', 'T'))
     : Number.NaN
+  /**
+   * ⚠️⚠️ **支路 B 也要过永久哨兵判据**（2026-10-21 合并审计发现，真实缺陷）。
+   *
+   * ## 缺陷是什么
+   *
+   * 上一版只对**支路 A**（`userQuota` 的数字 `expiresAt`）做了哨兵识别，
+   * 判定为永久后**直接落到支路 B**（`expiredTime` 字符串）。而支路 B 服务的是
+   * `dedicatedResourcePackages[].expiresAt` —— 那个字段**同样可能下发 9999 哨兵**，
+   * 且本机账号恰好没有样本（`undefined`），所以这条路径从未被真机数据验证过。
+   *
+   * 实测（本机，构造报文）：
+   * ```
+   * toPackage('专用资源包', {total:100,used:0,remaining:100},
+   *           { expiredTime: '9999-12-31T00:00:00.000Z' })
+   *   → deductionEndTime = 253402214400000
+   *   → 客户端 formatPackageExpiry 渲染成「9999-12-31（2912150 天后）」
+   * ```
+   * 这正是本 PR 在 `userQuota` 那一路**声称已消灭**的荒谬文案 ——
+   * 只堵了一个入口，另一个入口原样漏着。
+   *
+   * ## 两个可观测后果（第二个更严重）
+   *
+   * 1. **荒谬展示**：卡片上出现「9999-12-31（约 290 万天后）」。
+   * 2. **分桶错位**：该包落进 `longTerm`（约 290 万天后 ⇒ 远超 15 天窗口），
+   *    而它的语义是**未知到期**（应落 `permanent`）。⚠️ 这两个桶**选号行为不同**：
+   *    `longTerm` 在锁定永久积分时**仍然可选**，而 `permanent` 会被拦 ——
+   *    于是「锁住的永久积分」在这一路径上**照样被烧**，锁定形同虚设。
+   *
+   * ## 修法
+   *
+   * 把「哨兵识别」抽成对**毫秒值**的纯判据 `isPermanentSentinelMs()`，两条支路
+   * 共用同一份实现（本仓库红线：同一语义只留一处判据）。支路 B 解析出 `expMs`
+   * 后先过它，命中就**不写** `deductionEndTime`（= 永久桶 = 前端「长期」）。
+   *
+   * ⚠️ 字符串里的「年份 >= 9999」也要认 —— 上游若发 `"9999-12-31"` 这种**纯日期**
+   *    （不带 `T00:00:00Z`），`Date.parse` 仍能解析，落到同一个毫秒判据上。
+   */
+  const expIsPermanent = isPermanentSentinelMs(expMs)
   const deductionEndTime = explicitUsable && !explicitIsPermanent
     ? explicitMs
-    : (Number.isFinite(expMs) ? expMs : undefined)
+    : (Number.isFinite(expMs) && !expIsPermanent ? expMs : undefined)
+  /**
+   * ⚠️⚠️ **`expiredTime` 也必须过滤哨兵**（2026-10-21 对抗性审计发现，P1：
+   * 上一版只挡住了 `deductionEndTime`，这条泄漏仍然存在）。
+   *
+   * ## 为什么挡住 `deductionEndTime` 还不够
+   *
+   * 客户端 `credit-expiry.js` 的 `packageExpiryMs()` 是**两段回落**：
+   * ```js
+   * // 1) 先读 deductionEndTime（数字）
+   * // 2) 读不到 ⇒ 回落到 expiredTime（字符串，Date.parse）
+   * ```
+   * 于是即使 `deductionEndTime` 被正确清空，只要 `expiredTime` 里还留着原串，
+   * tooltip 仍会渲染出哨兵日期。实测（本机，构造报文）：
+   * ```
+   * { deductionEndTime: undefined,
+   *   expiredTime: '9999-12-31T00:00:00.000Z' }
+   * → packageExpiryMs    = 253402214400000
+   * → formatPackageExpiry = "9999-12-31（2912150 天后）"
+   * ```
+   * ⇒ 正是 `toPackage` 上方注释声称「已消灭」的那句荒谬文案，**换了个字段入口
+   *   又回来了**。分桶不受影响（`permanent`，锁定会拦），但用户看到的明细
+   *   仍然自相矛盾：三档行说「永久」、hover 里说「9999-12-31 到期」。
+   *
+   * ## 修法
+   *
+   * 哨兵命中时**连 `expiredTime` 一起清空**（置 `''`）。二者必须是同一份判据的
+   * 两个出口 —— 只清一个就留了另一半泄漏。
+   *
+   * ⚠️ 非哨兵的真实日期**照旧原样透出**（tooltip 要显示上游原文），
+   *    `undefined`（解析失败）也照旧透出（它不是哨兵，只是我们认不出）。
+   */
+  const expiredTimeRaw = options.expiredTime ?? ''
   return {
     name,
     unit: readString(quota, 'unit') ?? 'credits',
@@ -474,7 +565,7 @@ function toPackage(
     active: options.active ?? true,
     cycleStartTime: '',
     cycleEndTime: '',
-    expiredTime: options.expiredTime ?? '',
+    expiredTime: expIsPermanent ? '' : expiredTimeRaw,
     ...(deductionEndTime !== undefined ? { deductionEndTime } : {}),
   }
 }
