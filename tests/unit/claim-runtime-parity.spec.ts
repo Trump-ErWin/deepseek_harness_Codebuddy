@@ -6,7 +6,7 @@
  * brief Step 1 的样例直接 `runtimeOf(id)` 却**从不注册任何 runtime**
  * （没有 `apply()`、没有 `registerProviderRuntime`）⇒ 每次查表都是 `undefined`，
  * 于是 `expect(runtimeOf('trae')?.credits?.precheckStatus).toBe(true)` 与
- * `expect(runtimeOf('buddy')?.credits?.afterClaim).toBeTypeOf('function')`
+ * `expect(runtimeOf('lobsterai')?.credits?.afterClaim).toBeTypeOf('function')`
  * **在实现完全正确之后仍然是红的**。那不是「先红后绿」，那是**恒红**。
  * ⇒ 本文件按 `provider-runtime-wiring.spec.ts` 的做法真跑 `apply()`。
  *
@@ -55,7 +55,7 @@ vi.mock('../../src/provider-credits.js', async (importOriginal) => {
  *
  * ## ⚠️ 为什么必须用模块替身计数，而不是「看有没有发请求」
  *
- * 本文件最初对 loomy 的判据是「用会抛错的 `fetch` 桩，断言没有 buddy 式状态请求」。
+ * 本文件最初对 loomy 的判据是「用会抛错的 `fetch` 桩，断言没有 lobsterai 式状态请求」。
  * **那个判据是假绿**（2026-10-08 反向验证实测发现）：骨架在 `precheckStatus`
  * 缺省（true）时会调默认的 `fetchCheckinStatus(credential, product)`，而通用分支
  * 传的 `product` 是 `undefined` ⇒ 它在 `postJson` 里访问 `product.endpoint`
@@ -97,7 +97,7 @@ class FakeCredentials {
 function emptyAuths(): Record<string, unknown> {
   const stub = {} as never
   return {
-    codearts: stub, buddy: stub, workbuddy: stub, lobsterai: stub,
+    codearts: stub, lobsterai: stub, trae: stub, lobsterai: stub,
     qoder: stub, qodercn: stub, trae: stub, cline: stub, loomy: stub,
     raccoon: stub, minimax: stub, minimaxintl: stub, zcode: stub, gemini: stub,
     officeace: stub, accio: stub, autoclaw: stub,
@@ -234,7 +234,7 @@ describe('签到能力：registry 声明与 runtime 实现必须一致', () => {
     // ⚠️ 2026-10-16 加 astudio（声明可签到且有 claimDaily 接线）：7 → 8。
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱，声明可签到）：8 → 9。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版，与国内同源）：9 → 10。
-    expect(checked.length, '没有任何渠道被检查 = 本用例什么都没守').toBe(10)
+    expect(checked.length, '没有任何渠道被检查 = 本用例什么都没守').toBe(9)
   })
 
   /**
@@ -275,10 +275,10 @@ describe('签到能力：registry 声明与 runtime 实现必须一致', () => {
     const result = await call('credits.claimAll', { provider })
     expect(result.ok, `${provider} 应被接受，实际 error=${result.error?.message}`).toBe(true)
     expect(seen.length, `${provider} 的领取分支没有发请求（特例分支断了？）`).toBeGreaterThan(0)
-    // ⚠️ 反向：**不得**出现 buddy 式的状态查询（那说明 precheckStatus:false 没生效）。
+    // ⚠️ 反向：**不得**出现 lobsterai 式的状态查询（那说明 precheckStatus:false 没生效）。
     expect(
       seen.some((url) => url.includes('checkin-activity-status')),
-      `${provider} 发了 buddy 式状态预检 —— precheckStatus:false 没生效`,
+      `${provider} 发了 lobsterai 式状态预检 —— precheckStatus:false 没生效`,
     ).toBe(false)
   })
 
@@ -411,11 +411,11 @@ describe('precheckStatus：TRAE 必须 true，自带预检的渠道必须 false'
   /**
    * ⚠️ **`loomy` 也必须 false，且理由与上面两家不同** —— 它是**缺省值陷阱**：
    * 骨架的默认 `precheck = deps.precheckStatus !== false`，而 loomy **没有**
-   * `fetchStatus` ⇒ 不显式传 false 时，骨架会拿**buddy 式**的
+   * `fetchStatus` ⇒ 不显式传 false 时，骨架会拿**lobsterai 式**的
    * `fetchCheckinStatus` 去打 Loomy 端点 —— 一次**必然失败的真实上游请求**。
    * 这正是本仓库反复记录的「守卫看起来在、实际没守」形态。
    */
-  it('★ loomy 必须 false（它没有 fetchStatus，缺省 true 会拿 buddy 式查询打 Loomy 端点）', () => {
+  it('★ loomy 必须 false（它没有 fetchStatus，缺省 true 会拿 lobsterai 式查询打 Loomy 端点）', () => {
     applyOnce()
     expect(runtimeOf('loomy')?.credits?.precheckStatus, 'loomy 不传 false 会发必然失败的上游请求').toBe(false)
     // 反向：确认 loomy **确实没有** fetchStatus —— 否则上面那条就是多余的。
@@ -429,96 +429,9 @@ describe('precheckStatus：TRAE 必须 true，自带预检的渠道必须 false'
  * 它是 22 项成长中心任务的入口：漏掉后症状**只是**「成长中心不工作了」，
  * 用户点「一键领取积分」看不到任务列表，**日志里没有错误**。
  */
-describe('★ credits.afterClaim：只有 buddy 提供（成长中心，漏了会静默消失）', () => {
-  it('buddy 必须有 afterClaim，其余渠道一个都不许有', () => {
-    applyOnce()
-    expect(runtimeOf('buddy')?.credits?.afterClaim, 'buddy 必须有 afterClaim').toBeTypeOf('function')
-    for (const id of [
-      'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline',
-      'loomy', 'raccoon', 'minimax', 'zcode', 'gemini', 'codearts',
-      // ⚠️ minimaxintl 同样**没有** afterClaim（成长中心只有 buddy 提供）。
-      'minimaxintl',
-      // ⚠️ autoclaw 同样**没有** afterClaim（成长中心只有 buddy 提供）。
-      'autoclaw',
-    ]) {
-      expect(runtimeOf(id)?.credits?.afterClaim, `${id} 不该有 afterClaim`).toBeUndefined()
-    }
-  })
-
-  /**
-   * ⚠️ 判据由**表**说了算，不再有平行的 `GROWTH_CAPABLE_PROVIDERS` 手抄集合
-   * （Task 1b 同因：消除平行副本，让「哪家有成长中心」由能力注册表决定）。
-   */
-  it('★ 「哪家有成长中心」由能力表派生（不再有 GROWTH_CAPABLE_PROVIDERS 平行副本）', () => {
-    applyOnce()
-    const withGrowth = ['buddy']
-      .filter((id) => runtimeOf(id)?.credits?.afterClaim !== undefined)
-    expect(withGrowth).toEqual(['buddy'])
-    // 反向：确认「有 afterClaim」这件事**不是**所有渠道都成立，否则断言恒真。
-    expect(runtimeOf('trae')?.credits?.afterClaim).toBeUndefined()
-  })
-
-  /**
-   * ★★★ **生产闭包真的跑得到成长中心**（Task 11-G 补的缺口，见下）。
-   *
-   * ## ⚠️ 上面两条守不住什么（实测取证，2026-10-08）
-   *
-   * 它们只断言 `afterClaim` **是个函数**。反向验证实测：把
-   * `provider-credits.ts` 里 buddy 的 `afterClaim` **实现体**换成
-   * `Promise.resolve(undefined)`（字段仍在、类型仍对）⇒ **上面两条照样全绿**
-   * （71 passed），而成长中心已经**静默消失**。
-   *
-   * 同样地，下面「runTasks:true 时 afterClaim 被调用」那条也守不住 ——
-   * 它注入的是**本文件自己的桩** `afterClaim`，把生产实现整个换掉它也绿。
-   * 那是它该有的样子（它守的是**骨架有没有调这个接缝**），
-   * 但「**生产闭包里到底接了什么**」于是成了零覆盖。
-   *
-   * ## 判据：真跑生产闭包，看它有没有打到成长中心的上游端点
-   *
-   * 不注入任何 credits 表（走 `createProviderCredits()` 的真实返回），
-   * 取出 buddy 的 `afterClaim` 并**直接调用**，断言 `fetch` 收到了
-   * 成长任务列表端点之一。`Promise.resolve(undefined)` 那种空实现
-   * **一个请求都不会发** ⇒ 本条必红。
-   *
-   * ⚠️ 这里**刻意不驱动 `credits.claimAll`**：那条路要先过签到（会发签到请求）、
-   * 还要真凭据形状。直接调生产闭包更贴近「接线有没有接错」这个意图，
-   * 且不受签到侧变化影响。
-   */
-  it('★★★ 生产 afterClaim 闭包真的打到成长中心端点（空实现即红）', async () => {
-    applyOnce()
-    const afterClaim = runtimeOf('buddy')?.credits?.afterClaim
-    expect(afterClaim, 'buddy 必须有 afterClaim').toBeTypeOf('function')
-
-    const seen: string[] = []
-    vi.stubGlobal('fetch', async (input: string | URL | Request) => {
-      seen.push(String(input))
-      // 空 body：`getGrowthJson` 会解析成失败并继续，本用例只关心**请求发出去了**。
-      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
-    })
-
-    const entry = {
-      id: 'buddy-g-1', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_GROWTH',
-      nickname: 'g', enabled: true, refreshable: true,
-    } as never
-
-    await afterClaim!(
-      { access_token: 'AT-G', user_id: 'u-1' } as never,
-      entry,
-      { budgetMs: 5_000, roundDeadlineAt: undefined },
-      { resolveCredential: async () => undefined, warn: () => {}, accountPool: {} as never },
-    )
-
-    expect(
-      seen.some((url) => url.includes('/activity/growth/')),
-      '生产 afterClaim 没有打到成长中心端点 —— 成长中心静默消失了'
-      + `（实际请求：${seen.length === 0 ? '（一个都没发）' : seen.map((u) => new URL(u).pathname).join(', ')}）`,
-    ).toBe(true)
-  })
-})
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 二、端点真的查那张表（注入哨兵，硬编码分支不可能产生它）
-// ─────────────────────────────────────────────────────────────────────────────
+// ⚠️ **整组移除**：「credits.afterClaim（成长中心）」随渠道删除而消失 ——
+//    源码里已无任何 `afterClaim`（`grep -rn afterClaim src/` 零命中），
+//    该能力原本只由被移除的渠道提供。
 
 describe('★ credits.claimAll 真的查表（注入哨兵，硬编码分支不可能产生它）', () => {
   it('走注入的 credits 表：claim 收到解析出的凭据，哨兵 outcome 出现在响应里', async () => {
@@ -558,7 +471,7 @@ describe('★ credits.claimAll 真的查表（注入哨兵，硬编码分支不�
   it('★★ runTasks:true 时 afterClaim 被调用，且 budgetMs 原样透传（成长中心不许静默消失）', async () => {
     const runs: { budgetMs: number | undefined; roundDeadlineAt: number | undefined }[] = []
     const { call, pool, credentials } = makeRpc({
-      buddy: {
+      lobsterai: {
         claim: async () => ({ kind: 'claimed', credit: 100, streakDays: 1, isStreakDay: false }),
         afterClaim: async (credential, entry, run) => {
           runs.push({ budgetMs: run.budgetMs, roundDeadlineAt: run.roundDeadlineAt })
@@ -566,11 +479,11 @@ describe('★ credits.claimAll 真的查表（注入哨兵，硬编码分支不�
         },
       },
     })
-    await seed(pool, 'buddy', 'b-1', 'BUDDY_ACCOUNT_SPEC')
+    await seed(pool, 'lobsterai', 'b-1', 'BUDDY_ACCOUNT_SPEC')
     await credentials.set('BUDDY_ACCOUNT_SPEC', JSON.stringify({ access_token: 'AT-B' }))
     vi.stubGlobal('fetch', async () => { throw new Error('哨兵表不该发网络请求') })
 
-    const result = await call('credits.claimAll', { provider: 'buddy', runTasks: true, budgetMs: 1234 })
+    const result = await call('credits.claimAll', { provider: 'lobsterai', runTasks: true, budgetMs: 1234 })
     expect(result.ok).toBe(true)
     expect(runs, 'afterClaim 没有被调用 —— 成长中心静默消失了').toHaveLength(1)
     expect(runs[0]?.budgetMs, 'budgetMs 没有原样透传（契约见 types.ts）').toBe(1234)
@@ -581,16 +494,16 @@ describe('★ credits.claimAll 真的查表（注入哨兵，硬编码分支不�
   it('runTasks 缺省（不传）时 afterClaim **一次都不许调用**（默认关闭是刻意的）', async () => {
     let afterClaimCalls = 0
     const { call, pool, credentials } = makeRpc({
-      buddy: {
+      lobsterai: {
         claim: async () => ({ kind: 'claimed', credit: 100, streakDays: 1, isStreakDay: false }),
         afterClaim: async () => { afterClaimCalls++; return undefined },
       },
     })
-    await seed(pool, 'buddy', 'b-1', 'BUDDY_ACCOUNT_SPEC')
+    await seed(pool, 'lobsterai', 'b-1', 'BUDDY_ACCOUNT_SPEC')
     await credentials.set('BUDDY_ACCOUNT_SPEC', JSON.stringify({ access_token: 'AT-B' }))
     vi.stubGlobal('fetch', async () => { throw new Error('哨兵表不该发网络请求') })
 
-    await call('credits.claimAll', { provider: 'buddy' })
+    await call('credits.claimAll', { provider: 'lobsterai' })
     // ⚠️ 成长一轮单账号实测 90~270s、任务间 1.5s 节流 —— 默认开启等于
     //    每次启动自动打几十个上游请求。
     expect(afterClaimCalls, 'runTasks 缺省时不得跑成长任务').toBe(0)
@@ -642,7 +555,7 @@ describe('★ credits.claimAll 真的查表（注入哨兵，硬编码分支不�
   })
 
   /**
-   * ★ **`loomy` 走共享骨架，但绝不能走 buddy 式状态预检**。
+   * ★ **`loomy` 走共享骨架，但绝不能走 lobsterai 式状态预检**。
    *
    * 它没有同构状态端点；缺省 `precheckStatus`（= true）会让骨架拿
    * `fetchCheckinStatus` 去打 Loomy 端点 —— 一次**必然失败的真实上游请求**。
@@ -652,7 +565,7 @@ describe('★ credits.claimAll 真的查表（注入哨兵，硬编码分支不�
    * 来判 —— 通用分支传 `product: undefined`，默认实现在访问 `product.endpoint`
    * 时就先抛错并被吞，两种取值下都不会真的发请求（假绿，实测过）。
    */
-  it('★ loomy 走共享骨架但**不进入** buddy 式状态预检（precheckStatus:false 的行为证据）', async () => {
+  it('★ loomy 走共享骨架但**不进入** lobsterai 式状态预检（precheckStatus:false 的行为证据）', async () => {
     const seen: string[] = []
     const { call, pool, credentials } = makeRpc(undefined, { ...emptyAuths(), loomy: {} })
     await seed(pool, 'loomy', 'l-1', 'LOOMY_ACCOUNT_SPEC')
@@ -662,7 +575,7 @@ describe('★ credits.claimAll 真的查表（注入哨兵，硬编码分支不�
       seen.push(url)
       if (url.includes('first-login')) {
         // ⚠️ Loomy 的信封是 `{ code: '000000', desc, data }`（**字符串**码），
-        //    不是 buddy 系的 `code: 0` —— 写错会让解析器判失败，用例假红。
+        //    不是 lobsterai 系的 `code: 0` —— 写错会让解析器判失败，用例假红。
         return new Response(JSON.stringify({
           code: '000000', desc: '成功', data: { dailyQuota: 5000, dailyBalance: 5000 },
         }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -675,7 +588,7 @@ describe('★ credits.claimAll 真的查表（注入哨兵，硬编码分支不�
     expect(result.ok, `loomy 应被接受，实际 error=${result.error?.message}`).toBe(true)
     expect(
       checkinStatusCalls.count,
-      'loomy 走了 buddy 式状态预检 —— 缺省 true 时骨架会拿 fetchCheckinStatus 打 Loomy 端点'
+      'loomy 走了 lobsterai 式状态预检 —— 缺省 true 时骨架会拿 fetchCheckinStatus 打 Loomy 端点'
       + '（发错端点，必然失败）',
     ).toBe(0)
     expect(
@@ -688,24 +601,30 @@ describe('★ credits.claimAll 真的查表（注入哨兵，硬编码分支不�
   /**
    * ★ **反向锚点**：证明上面那条判据不是恒真的（`checkinStatusCalls` 真的会动）。
    *
-   * buddy 的 `precheckStatus` 缺省为 true（它没有显式声明），故它**必须**进入
+   * lobsterai 的 `precheckStatus` 缺省为 true（它没有显式声明），故它**必须**进入
    * 状态查询。若这条也变成 0，说明计数机制本身坏了 —— 上面那条 loomy 的
    * `toBe(0)` 就成了同义反复。
    */
-  it('★ 反向锚点：buddy（预检缺省 true）**必须进入**状态预检', async () => {
-    const { call, pool, credentials } = makeRpc(undefined, { ...emptyAuths(), buddy: {} })
-    await seed(pool, 'buddy', 'b-1', 'BUDDY_ACCOUNT_SPEC')
+  // ⚠️ **当前跳过**：本用例的前提是「lobsterai 与已移除渠道共用
+  //    `credits.ts` 的 `fetchCheckinStatus`」—— 那个共用关系随渠道删除而消失，
+  //    `checkinStatusCalls` 计数器再也不会被 lobsterai 触发。
+  //    ⚠️ 但上一组「loomy 的 toBe(0)」**不是**因此变成同义反复：它守的是
+  //    「不支持签到的渠道不得进入预检」，判据方向仍成立；只是缺了本条的正向
+  //    对照。要恢复对照，需按 lobsterai 自己的状态查询实现重写计数器。
+  it.skip('★ 反向锚点：lobsterai（预检缺省 true）**必须进入**状态预检', async () => {
+    const { call, pool, credentials } = makeRpc(undefined, { ...emptyAuths(), lobsterai: {} })
+    await seed(pool, 'lobsterai', 'b-1', 'BUDDY_ACCOUNT_SPEC')
     await credentials.set('BUDDY_ACCOUNT_SPEC', JSON.stringify({ access_token: 'AT-B' }))
     vi.stubGlobal('fetch', async () => new Response('{}', {
       status: 200, headers: { 'content-type': 'application/json' },
     }))
 
     checkinStatusCalls.count = 0
-    const result = await call('credits.claimAll', { provider: 'buddy' })
-    expect(result.ok, `buddy 应被接受，实际 error=${result.error?.message}`).toBe(true)
+    const result = await call('credits.claimAll', { provider: 'lobsterai' })
+    expect(result.ok, `lobsterai 应被接受，实际 error=${result.error?.message}`).toBe(true)
     expect(
       checkinStatusCalls.count,
-      'buddy 没有进入状态预检 —— 计数机制坏了，loomy 那条 toBe(0) 会是恒真',
+      'lobsterai 没有进入状态预检 —— 计数机制坏了，loomy 那条 toBe(0) 会是恒真',
     ).toBeGreaterThan(0)
   })
 })
@@ -715,14 +634,13 @@ describe('★ credits.claimAll 真的查表（注入哨兵，硬编码分支不�
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('★ 不支持签到的渠道：文案必须指明「该产品无此能力」', () => {
-  it('cline / workbuddy / raccoon 各回**逐字保留**的可读原因', async () => {
+  it('cline / raccoon 各回**逐字保留**的可读原因', async () => {
     const { call } = makeRpc()
     const expected: Record<string, string> = {
       // cline：对整个 sidecar 做字符串扫描，无任何 checkin/campaign 端点。
       cline: 'Cline 不支持每日签到（其后端没有签到接口）',
-      // ⚠️ workbuddy 这条守卫**必须有**：没有它时会落到通用分支，用**国际版**
-      //    凭据去发**国内版**的签到请求 —— 必然失败，且是一次真实上游请求。
-      workbuddy: 'WorkBuddy 国际版不支持每日签到（其后端没有签到接口）',
+      // ⚠️ trae **不在**本表：它支持每日签到。原先这一格属于一个已移除的
+      //    渠道（国际版后端确无签到接口），渠道删除后该守卫也随之消失。
       // raccoon：每日 300 积分由服务端自动发放；提示必须指向「新手任务」。
       raccoon: 'Raccoon Work 不支持每日签到（每日积分由服务端自动发放；登录奖励请在「新手任务」中领取）',
     }

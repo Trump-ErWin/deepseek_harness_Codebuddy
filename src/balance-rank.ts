@@ -1,11 +1,11 @@
 /**
- * CodeBuddy / WorkBuddy 账号按「积分何时作废」分档排序（负载均衡 + 永久积分锁定）。
+ * 会员制渠道的账号按「积分何时作废」分档排序（负载均衡 + 永久积分锁定）。
  *
  * ## 它与 Loomy 那份（`loomy-balance-rank.ts`）的关系
  *
  * **同构但判据不同**，故刻意不共用实现：
  *
- * | | Loomy | 两个 buddy |
+ * | | Loomy | 两个腾讯系渠道 |
  * |---|---|---|
  * | 临时积分 | `dailyBalance` —— 服务端**直接给了一个字段** | 需要**自己算**：遍历资源包，取 `DeductionEndTime` 距今 **< 15 天** 的那几包余额之和 |
  * | 永久积分 | `balance`（注册奖励 + 新手任务，不过期） | 其余资源包（`DeductionEndTime` ≥ 15 天或未下发）的余额之和 |
@@ -21,10 +21,10 @@
  *
  * | 包 | `DeductionEndTime` 距今 | `CycleEndTime` 距今 | 归入 |
  * |---|---|---|---|
- * | WorkBuddy「Bonus Pack」 | 9 天 | 9 天 | **临时** |
- * | WorkBuddy「Free Plan Subscription」 | 3008 天 | **2 天** | **永久** |
- * | CodeBuddy「个人体验版」 | 3008 天 | 已过期 | 永久（本周期已无余额） |
- * | CodeBuddy「拉新权益包 / 国内运营裂变包」 | 17～208 天 | 同左 | ≥15 天者永久、<15 天者临时 |
+ * | 「Bonus Pack」 | 9 天 | 9 天 | **临时** |
+ * | 「Free Plan Subscription」 | 3008 天 | **2 天** | **永久** |
+ * | 「个人体验版」 | 3008 天 | 已过期 | 永久（本周期已无余额） |
+ * | 「拉新权益包 / 国内运营裂变包」 | 17～208 天 | 同左 | ≥15 天者永久、<15 天者临时 |
  *
  * 套餐包的**计量周期**虽短（月度），但扣费截止在 8 年后 —— 取 `CycleEndTime`
  * 会把每月刷新的套餐判成「马上作废」，锁定永久积分就形同虚设。
@@ -56,10 +56,10 @@ import { isExclusiveCreditPool, type CreditBalance } from './credits.js'
  * 积分可被消耗，故实测里「裂变包全部还有 17 天以上」的账号在锁定期间
  * **等同于无可用账号**（不是缺陷，正是该判据的直接推论）。
  */
-export const BUDDY_EXPIRING_WINDOW_DAYS = 15
+export const EXPIRING_WINDOW_DAYS = 15
 
 /** 由天数换算的毫秒窗口（导出供单测按同一口径构造时间戳）。 */
-export const BUDDY_EXPIRING_WINDOW_MS = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
+export const EXPIRING_WINDOW_MS = EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
 
 /**
  * 覆盖窗口的环境变量名。
@@ -70,16 +70,16 @@ export const BUDDY_EXPIRING_WINDOW_MS = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 6
  *
  * | 池 | 实测形状 | 锁定的后果 |
  * |---|---|---|
- * | WorkBuddy 5 个号 | Bonus Pack 250（8～9 天）+ Free Plan 100（3008 天） | 4 个号仍可用，1 个（Bonus Pack 已耗尽）不可用 —— 正是期望效果 |
- * | CodeBuddy 中国版 1 个号 | 裂变包共 10064.6，**距到期最少 17 天** | **立刻「无可用账号」**（17 天 > 15 天 ⇒ 全算永久） |
+ * | 某渠道 5 个号 | Bonus Pack 250（8～9 天）+ Free Plan 100（3008 天） | 4 个号仍可用，1 个（Bonus Pack 已耗尽）不可用 —— 正是期望效果 |
+ * | 某渠道 1 个号 | 裂变包共 10064.6，**距到期最少 17 天** | **立刻「无可用账号」**（17 天 > 15 天 ⇒ 全算永久） |
  *
  * 中国版的包是按 30 天发放的，所以"距到期"天然落在 17～30 天区间 ——
- * 判据本身没错，但这类池想用锁定就得把窗口放宽（如 `DSH_BUDDY_EXPIRING_WINDOW_DAYS=31`，
+ * 判据本身没错，但这类池想用锁定就得把窗口放宽（如 `DSH_EXPIRING_WINDOW_DAYS=31`，
  * 让"本批包"整体算临时）。
  *
  * ⚠️ 窗口只能由**用户显式**改：默认值必须是用户定的 15 天。
  */
-export const DSH_BUDDY_EXPIRING_WINDOW_DAYS = 'DSH_BUDDY_EXPIRING_WINDOW_DAYS'
+export const DSH_EXPIRING_WINDOW_DAYS = 'DSH_EXPIRING_WINDOW_DAYS'
 
 /**
  * 当前生效的「临时积分」窗口（天）。
@@ -91,21 +91,21 @@ export const DSH_BUDDY_EXPIRING_WINDOW_DAYS = 'DSH_BUDDY_EXPIRING_WINDOW_DAYS'
  * 非法值（空 / 非数字 / 负数）一律回落到默认窗口，不报错：这是展示与选号的
  * 辅助判据，配置写错不该让插件起不来。
  */
-export function buddyExpiringWindowDays(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[DSH_BUDDY_EXPIRING_WINDOW_DAYS]
-  if (typeof raw !== 'string' || raw.trim().length === 0) return BUDDY_EXPIRING_WINDOW_DAYS
+export function expiringWindowDays(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[DSH_EXPIRING_WINDOW_DAYS]
+  if (typeof raw !== 'string' || raw.trim().length === 0) return EXPIRING_WINDOW_DAYS
   const parsed = Number(raw.trim())
-  if (!Number.isFinite(parsed) || parsed < 0) return BUDDY_EXPIRING_WINDOW_DAYS
+  if (!Number.isFinite(parsed) || parsed < 0) return EXPIRING_WINDOW_DAYS
   return parsed
 }
 
 /** 当前生效的窗口（毫秒）。 */
-export function buddyExpiringWindowMs(env: NodeJS.ProcessEnv = process.env): number {
-  return buddyExpiringWindowDays(env) * 24 * 60 * 60 * 1000
+export function expiringWindowMs(env: NodeJS.ProcessEnv = process.env): number {
+  return expiringWindowDays(env) * 24 * 60 * 60 * 1000
 }
 
 /** 账号余额档位。数字越小越优先。 */
-export const BUDDY_BALANCE_TIER = Object.freeze({
+export const BALANCE_TIER = Object.freeze({
   /** 有 15 天内到期的积分 —— 优先消耗（再不用就作废）。 */
   expiring: 0,
   /** 只剩永久积分（≥ 15 天后到期）。 */
@@ -114,10 +114,10 @@ export const BUDDY_BALANCE_TIER = Object.freeze({
   none: 2,
 } as const)
 
-export type BuddyBalanceTier = (typeof BUDDY_BALANCE_TIER)[keyof typeof BUDDY_BALANCE_TIER]
+export type BalanceTier = (typeof BALANCE_TIER)[keyof typeof BALANCE_TIER]
 
 /** 两类余额的拆分结果。 */
-export interface BuddyCreditSplit {
+export interface CreditSplit {
   /** 15 天内到期的积分合计（本计费周期口径）。 */
   expiring: number
   /** 其余积分合计（≥ 15 天后到期，或到期时间未知）。 */
@@ -125,7 +125,7 @@ export interface BuddyCreditSplit {
 }
 
 /** 参与分档的账号（两个字段缺失表示查询失败）。 */
-export interface BuddyAccountBalance {
+export interface AccountBalance {
   id: string
   /** 15 天内到期的积分；`undefined` = 查询失败。 */
   expiringBalance?: number
@@ -137,8 +137,8 @@ export interface BuddyAccountBalance {
  * 把一个账号的积分余额拆成「快到期」与「永久」两桶。
  *
  * ⚠️ **口径是 `remaining`（= `CycleCapacityRemain`，本计费周期剩余）**，与
- * CodeBuddy IDE 顶部的 Credits Balance 一致。用户选定该口径的理由：实测
- * CodeBuddy 体验版套餐的**终身**剩余是 500 而**本周期**剩余是 0 ——
+ * 官方客户端顶部的 Credits Balance 一致。用户选定该口径的理由：实测
+ * 体验版套餐的**终身**剩余是 500 而**本周期**剩余是 0 ——
  * 那 500 实际扣不到，算进可用余额会让账号「看起来有钱却用不了」。
  *
  * ⚠️ **`active === false` 的包一律跳过**：失效包的服务端仍会返回余额，
@@ -150,14 +150,14 @@ export interface BuddyAccountBalance {
  *
  * @param balance - `fetchCreditBalance` 的结果；`null`（查询失败）返回 `undefined`。
  * @param now - 当前时刻（毫秒），注入以便单测断言边界。
- * @param windowMs - 窗口，默认 {@link BUDDY_EXPIRING_WINDOW_MS}。
+ * @param windowMs - 窗口，默认 {@link EXPIRING_WINDOW_MS}。
  * @returns 两桶合计；`balance` 为 null/undefined 时返回 `undefined`（= 查询失败）。
  */
-export function splitBuddyCreditsByExpiry(
+export function splitBalanceByExpiry(
   balance: CreditBalance | null | undefined,
   now: number = Date.now(),
-  windowMs: number = BUDDY_EXPIRING_WINDOW_MS,
-): BuddyCreditSplit | undefined {
+  windowMs: number = EXPIRING_WINDOW_MS,
+): CreditSplit | undefined {
   if (balance === null || balance === undefined) return undefined
   let expiring = 0
   let permanent = 0
@@ -165,13 +165,13 @@ export function splitBuddyCreditsByExpiry(
     /**
      * ⚠️ **必须挡 `null`/`undefined` 元素**（2026-10-21 对抗性审计发现，P2）。
      *
-     * 前端 `splitCreditsByExpiry`（`credit-expiry.js`）第一句就是
+     * 前端 `splitBalanceByExpiry`（`credit-expiry.js`）第一句就是
      * `if (!pkg || pkg.active !== true) continue`，而这里原来直接读
      * `pkg.active` ⇒ `packages: [null]` 会让本函数抛**裸 TypeError**
      *（`Cannot read properties of null (reading 'active')`）。
      *
      * 后果不是「无可用账号」那句文案，而是一个未捕获异常穿出 `select()`
-     *（`BuddyBalanceSelector.select` 没有 try/catch）⇒ 用户看到的是
+     *（`BalanceSelector.select` 没有 try/catch）⇒ 用户看到的是
      * 内部错误，而池里可能还有别的健康账号。
      *
      * 可达性：各 provider 目前都在 push 前过滤了非对象条目，故**当前不可达**；
@@ -186,13 +186,13 @@ export function splitBuddyCreditsByExpiry(
      * ⚠️⚠️ **独立池不进任何一桶**（2026-10-21 合并审计发现，阻断级）。
      *
      * AStudio 的星火池是服务端下发的**独立池**（不参与主池合计、也不能当
-     * 通用积分消耗）。前端 `splitCreditsByExpiry`（PR !134）已把它从三档里
+     * 通用积分消耗）。前端 `splitBalanceByExpiry`（PR !134）已把它从三档里
      * 摘出，而这里原先**完全不看 `pkg.name`** ⇒ 两侧口径分叉：
      * 同一份数据前端说「永久 0」、后端说「永久 25000」。
      *
      * ⇒ 用户可见症状：AStudio 账号只剩星火池时，面板显示「另有 25000 专属
      * （不计入）」而三档不渲染（看起来「没积分」），但后端把 25000 算成
-     * **临期** ⇒ `buddyBalanceTier` 判 `expiring` ⇒ **锁定永久积分时该账号
+     * **临期** ⇒ `balanceTier` 判 `expiring` ⇒ **锁定永久积分时该账号
      * 仍被判「可用」** ⇒ 选号把请求发给一个只有专属池的账号 ⇒ 上游按主池
      * 计费 ⇒ 请求失败。
      *
@@ -210,14 +210,14 @@ export function splitBuddyCreditsByExpiry(
      *    那是**过度声称** —— 全仓还有多处 `Date.parse` 型同义判据
      *   （`astudio-credits.ts` 的 `astudioLocalTimeMs` 与前端 `packageExpiryMs`
      *    都是 `Date.parse(raw.replace(' ', 'T'))`；`credits.ts` 的失效判定、
-     *    `buddy.ts` / `cline.ts` / `codearts-credits.ts` 各有 `Date.parse`）。
+     *    `cline.ts` / `codearts-credits.ts` 各有 `Date.parse`）。
      *    准确的说法是：**在「同一份 `packages[]` 被前端展示与后端选号各读一遍」
      *    这条特定链路上**，只有这一处判据不一致。
      *    ⇒ 「唯一」这类断言必须先**全仓清点**，不能凭本轮改到的范围下结论。
      *
      * ## 两侧原来不同判
      *
-     * | 输入 `deductionEndTime` | 前端 `splitCreditsByExpiry` | 后端（旧） |
+     * | 输入 `deductionEndTime` | 前端 `splitBalanceByExpiry` | 后端（旧） |
      * |---|---|---|
      * | `1760432000000`（number） | 临期 | 临期 |
      * | `"1760432000000"`（**数字字符串**） | **临期**（用 `Number()`） | **永久**（`typeof` 不是 number）|
@@ -275,7 +275,7 @@ export function splitBuddyCreditsByExpiry(
        *
        * ⚠️ **但 CodeArts 的赠送/按需包是例外**（2026-10-20）：上游不给逐笔
        * 日期，只在该分类 metric 上给「其中 N 即将到期」的标量，已被解析成
-       * `pkg.expiringRemaining`。必须与前端 `splitCreditsByExpiry` **同规则**
+       * `pkg.expiringRemaining`。必须与前端 `splitBalanceByExpiry` **同规则**
        * 拆开，否则前后端漂移：
        *
        * - 前端把整包算永久 ⇒ 卡片显示「永久 25000」与新加的「临期 2500」矛盾；
@@ -304,7 +304,7 @@ export function splitBuddyCreditsByExpiry(
 }
 
 /** 分档选项。 */
-export interface BuddyTierOptions {
+export interface TierOptions {
   /** 是否允许消耗永久积分。默认 `true`（解锁）。 */
   allowPermanent?: boolean
   /** 当前时刻（毫秒），测试注入用。 */
@@ -322,14 +322,14 @@ export interface BuddyTierOptions {
  * ⚠️ **锁定永久积分时（`allowPermanent: false`）**：永久积分不参与判定 ——
  * 只剩永久积分的账号直接落入 `none`（不可用），而不是降到 `permanent` 档。
  */
-export function buddyBalanceTier(
+export function balanceTier(
   balance: { expiringBalance?: number; permanentBalance?: number },
-  options: BuddyTierOptions = {},
-): BuddyBalanceTier {
-  if (positiveOrZero(balance.expiringBalance) > 0) return BUDDY_BALANCE_TIER.expiring
-  if (options.allowPermanent === false) return BUDDY_BALANCE_TIER.none
-  if (positiveOrZero(balance.permanentBalance) > 0) return BUDDY_BALANCE_TIER.permanent
-  return BUDDY_BALANCE_TIER.none
+  options: TierOptions = {},
+): BalanceTier {
+  if (positiveOrZero(balance.expiringBalance) > 0) return BALANCE_TIER.expiring
+  if (options.allowPermanent === false) return BALANCE_TIER.none
+  if (positiveOrZero(balance.permanentBalance) > 0) return BALANCE_TIER.permanent
+  return BALANCE_TIER.none
 }
 
 /**
@@ -337,8 +337,8 @@ export function buddyBalanceTier(
  *
  * `none` 档不可用 —— 调用方据此判断「真的没有可用账号」并报明确错误。
  */
-export function buddyTierUsable(tier: BuddyBalanceTier): boolean {
-  return tier !== BUDDY_BALANCE_TIER.none
+export function tierUsable(tier: BalanceTier): boolean {
+  return tier !== BALANCE_TIER.none
 }
 
 /** 把任意值归一化为安全正数；非法值（`NaN` / 负数 / `undefined`）归 0。 */
@@ -357,12 +357,12 @@ function positiveOrZero(value: unknown): number {
  * @param options - 分档选项（`allowPermanent` = 是否允许消耗永久积分）。
  * @returns **新数组**（不修改入参）。
  */
-export function rankBuddyAccountsByBalance<T extends BuddyAccountBalance>(
+export function rankAccountsByBalance<T extends AccountBalance>(
   accounts: readonly T[],
-  options: BuddyTierOptions = {},
+  options: TierOptions = {},
 ): T[] {
   return accounts
-    .map((account, index) => ({ account, index, tier: buddyBalanceTier(account, options) }))
+    .map((account, index) => ({ account, index, tier: balanceTier(account, options) }))
     .sort((a, b) => (a.tier - b.tier) || (a.index - b.index))
     .map((entry) => entry.account)
 }
@@ -373,9 +373,9 @@ export function rankBuddyAccountsByBalance<T extends BuddyAccountBalance>(
  * ⚠️ 两个桶都为 0 时返回「无可用积分」而不是「临时 0 / 永久 0」——
  * 用户读后者需要自己推断，前者一眼可见。
  */
-export function describeBuddyCreditSplit(
-  split: BuddyCreditSplit | undefined,
-  windowDays: number = BUDDY_EXPIRING_WINDOW_DAYS,
+export function describeCreditSplit(
+  split: CreditSplit | undefined,
+  windowDays: number = EXPIRING_WINDOW_DAYS,
 ): string {
   if (split === undefined) return '余额查询失败'
   const expiring = roundCreditsInline(split.expiring)

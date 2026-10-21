@@ -339,11 +339,11 @@ export async function fetchAstudioBalanceDetailed(
 }
 
 /**
- * 供 `BuddyBalanceSelector` 用的 `fetchBalance`（**丢失原因**的薄封装）。
+ * 供 `BalanceSelector` 用的 `fetchBalance`（**丢失原因**的薄封装）。
  *
  * ## 为什么需要它
  *
- * `BuddyBalanceSelector` 的 `deps.fetchBalance` 契约是
+ * `BalanceSelector` 的 `deps.fetchBalance` 契约是
  * `(credential, product) => Promise<CreditBalance | null>` —— 只回余额、不回原因
  * （分档逻辑对「为什么查不到」不感兴趣，一律归入最后一档）。
  * 而本文件的权威入口 {@link fetchAstudioBalanceDetailed} 回的是

@@ -5,7 +5,7 @@
  *
  * 重构前，`src/aggregate-expiry.ts` 的 `credentialExpiry(provider, credential)`
  * 是一个 7-case `switch`，而**每个分支体都只是「调一个原语」**
- *（`buddyExpiry` / `loomyExpiry` / `codeArtsExpiry` / `zcodeExpiry` /
+ *（`sharedExpiry` / `loomyExpiry` / `codeArtsExpiry` / `zcodeExpiry` /
  * `lobsteraiExpiry` / `traeExpiry`）—— 与 `account.refresh` 的 13 个同构 case
  * 完全同型。那 7 个分支体里**没有一行协议逻辑**，只有「选哪个原语」。
  *
@@ -25,8 +25,8 @@
  *
  * 各家 `*Expiry` 函数（判据不同、量纲不同）原样保留在 `aggregate-expiry.ts`，
  * 本表只是把它们挂到一张可查的表上（设计文档 §3.5.3 / §3.6）。
- * `buddy` 与 `workbuddy` **共用** `buddyExpiry`、只换 product 配置 ——
- * 与 `BuddyProduct` 驱动其余差异同款，避免同族分叉。
+ * `buddy` 与 `workbuddy` **共用** `sharedExpiry`、只换 product 配置 ——
+ * 与 `ProviderProduct` 驱动其余差异同款，避免同族分叉。
  *
  * ## ⚠️ 只覆盖**已接入临期折算**的渠道（刻意不在此写数字：权威是
  * `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`，抄一份必然漂移）
@@ -58,7 +58,7 @@
 
 import {
   accioExpiry,
-  buddyExpiry,
+  sharedExpiry,
   codeArtsExpiry,
   lobsteraiExpiry,
   loomyExpiry,
@@ -95,10 +95,8 @@ import { MINIMAX, MINIMAX_INTL, type MinimaxProduct } from './minimax-product.js
 import type { MinimaxCredential } from './minimax.js'
 import type { AccioCredential } from './accio.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
-import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE } from './trae-product.js'
-import type { BuddyCredential } from './buddy.js'
 import type { CodeArtsCredential } from './types.js'
 import type { LoomyCredential } from './loomy.js'
 import type { LobsteraiCredential } from './lobsterai.js'
@@ -108,6 +106,7 @@ import type { ProviderRuntime } from './provider-runtime.js'
 // ⚠️ 只导入**类型**（`CreditBalance` 是取数原语的返回形状）：本表只是「选哪个原语」，
 //    不解释余额内容（那个判据在 `aggregate-expiry.ts` 的各家原语里）。
 import type { CreditBalance } from './credits.js'
+import type { ChannelCredential, ProviderProduct } from './jwt-utils.js'
 
 /** 一个渠道的临期折算实现（`ProviderRuntime.expiry` 的非空形态）。 */
 export type ProviderExpiry = NonNullable<ProviderRuntime['expiry']>
@@ -144,17 +143,6 @@ export interface ProviderExpiryDeps {
  * 那样「吃共享读数」这条能力**只在这一处**声明，四家自动一致
  *（各写一遍必然有一家漏掉 ⇒ 静默多发一次上游请求）。
  */
-function buddyFamilyExpiry(product: BuddyProduct): ProviderExpiry {
-  return {
-    credentialExpiry: (c, context) => buddyExpiry(
-      product,
-      c as BuddyCredential,
-      context?.cachedBalance === undefined
-        ? undefined
-        : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
-    ),
-  }
-}
 
 /**
  * 构造「id → 临期折算」的表。
@@ -164,9 +152,6 @@ function buddyFamilyExpiry(product: BuddyProduct): ProviderExpiry {
  */
 export function createProviderExpiry(deps: ProviderExpiryDeps = {}): Readonly<Record<string, ProviderExpiry>> {
   return {
-    // ⚠️ 两个 buddy 系产品：原语相同、product 不同（`CODEBUDDY` / `WORKBUDDY`）。
-    buddy: buddyFamilyExpiry(CODEBUDDY),
-    workbuddy: buddyFamilyExpiry(WORKBUDDY),
     loomy: { credentialExpiry: (c) => loomyExpiry(c as LoomyCredential) },
     codearts: { credentialExpiry: (c) => codeArtsExpiry(c as CodeArtsCredential) },
     zcode: { credentialExpiry: (c, context) => zcodeExpiry(c as ZcodeCredential, context) },

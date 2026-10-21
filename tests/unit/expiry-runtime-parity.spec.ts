@@ -45,7 +45,7 @@ import { readFileSync } from 'node:fs'
 // ⚠️ 2026-10-13 合并审计加入 accio：用户要求「聚合的 qwen3.8-flash 轮换列表里要有
 //    accio」，而**决定候选表可见性的是这张表**（不是 AGGREGATE_CHANNELS）⇒
 //    只把它加进 AGGREGATE_CHANNELS 是无效接线（模型层归并了，候选层被剔除）。
-// ⚠️ 2026-10-13 加入 officeace：用户要求「officeace 加入聚合轮换」。它与 buddy 系
+// ⚠️ 2026-10-13 加入 officeace：用户要求「officeace 加入聚合轮换」。它与免费额度渠道
 //    **同形**（订阅的每个积分桶都带 `expiresAt`），折算原语见 `officeaceExpiry`。
 // ⚠️ 2026-10-17 **本 fork** 加入 modelscope：用户要求「魔塔加入无临期积分的那类轮换」。
 //    它属「有余额但不下发到期时间」那一类（有余额即 `NEVER`、烧光即 `UNUSABLE`）。
@@ -77,9 +77,9 @@ const EXPECTED_WIRED = [
   //    国际站 token）⇒ 折算原语必须透传 `xff`，否则「面板能刷新、聚合候选
   //    却恒折算失败」。两家共用一个 `MinimaxAuth`，但**是两个渠道 id**，
   //    故必须各占一项。
-  'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts',
+  'accio', 'astudio', 'autoclaw', 'autoclawintl', 'codearts',
   'lobsterai', 'loomy', 'minimax', 'minimaxintl', 'modelscope', 'officeace',
-  'qoder', 'qodercn', 'trae', 'workbuddy', 'zcode',
+  'qoder', 'qodercn', 'trae', 'zcode',
 ]
 
 class FakeCredentials {
@@ -323,14 +323,14 @@ describe('★★ 不变式二：折算真的分派给 runtime（哨兵注入，�
     //（查不到、剔除）语义相反，压成一个就是本模块头警告的「把未知当可用」。
     clearProviderRuntimes()
     registerProviderRuntime({
-      descriptor: descriptorOf('buddy')!,
+      descriptor: descriptorOf('astudio')!,
       expiry: { credentialExpiry: async () => NEVER },
     })
     registerProviderRuntime({
       descriptor: descriptorOf('zcode')!,
       expiry: { credentialExpiry: async () => UNUSABLE },
     })
-    expect(await createExpiryProbe(poolWithAccount(), async () => 'm1')('buddy')).toBe(NEVER)
+    expect(await createExpiryProbe(poolWithAccount(), async () => 'm1')('astudio')).toBe(NEVER)
     // zcode 的实现回 UNUSABLE ⇒ 该账号被跳过 ⇒ 一个都没成功 ⇒ 渠道级 UNUSABLE。
     expect(await createExpiryProbe(poolWithAccount(), async () => 'm1')('zcode')).toBe(UNUSABLE)
   })
@@ -352,18 +352,18 @@ describe('★★ 不变式二：折算真的分派给 runtime（哨兵注入，�
     // **最前**并选中它 —— 而该渠道可能压根没有可用账号。
     clearProviderRuntimes()
     // ⚠️ 只注册 descriptor，**刻意不挂** `expiry` 域（这就是②）。
-    registerProviderRuntime({ descriptor: descriptorOf('buddy')! })
+    registerProviderRuntime({ descriptor: descriptorOf('astudio')! })
     // 前置条件必须显式断言：否则「渠道不在清单里」时本用例会退化成
     // 「又测了一遍短路分支」—— 绿得毫无意义（本仓库记录过的同义反复形态）。
-    expect(WIRED_EXPIRY_PROVIDERS, '前置条件①：buddy 必须在清单里').toContain('buddy')
-    expect(runtimeOf('buddy')?.expiry, '前置条件②：buddy 的 runtime 必须**没有** expiry 域')
+    expect(WIRED_EXPIRY_PROVIDERS, '前置条件①：astudio 必须在清单里').toContain('astudio')
+    expect(runtimeOf('astudio')?.expiry, '前置条件②：astudio 的 runtime 必须**没有** expiry 域')
       .toBeUndefined()
 
     // 池里有可用账号 ⇒ 探测不会在「无可用账号」处提前返回，真的走到分派那一行。
     const probe = createExpiryProbe(poolWithAccount(), async () => 'm1')
     expect(
-      await probe('buddy'),
-      'buddy 在清单里、runtime 却没有 expiry 域 ⇒ 必须 `UNUSABLE`（剔除该候选）。'
+      await probe('astudio'),
+      'astudio 在清单里、runtime 却没有 expiry 域 ⇒ 必须 `UNUSABLE`（剔除该候选）。'
       + '返回 `NEVER` 会让这个「我们一无所知」的渠道被排在候选最前并当选',
     ).toBe(UNUSABLE)
   })

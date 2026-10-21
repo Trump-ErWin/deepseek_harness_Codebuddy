@@ -11,10 +11,10 @@
  * - 兜底模型表：`trae2api/internal/server/handler.go:247-280` 的 staticModels；
  * - 登录 URL 格式：`trae2api/internal/server/login.go` 的 `BuildLoginURL`。
  *
- * ## 为什么是独立接口而非复用 BuddyProduct/LobsteraiProduct
+ * ## 为什么是独立接口而非复用 ProviderProduct/LobsteraiProduct
  *
  * TRAE 与二者都不同源：
- * - 与 BuddyProduct 差异：认证用 ExchangeToken（轮换 refreshToken）而非 external-link 轮询；
+ * - 与 ProviderProduct 差异：认证用 ExchangeToken（轮换 refreshToken）而非 external-link 轮询；
  *   请求头用 `Cloud-IDE-JWT` 而非 `Bearer`；chat 端点需要 payload 格式转换；
  *   SSE 格式自定（非 OpenAI 标准），需独立解析。
  * - 与 LobsteraiProduct 差异：chat 端点使用 POST + JSON body + 自定义 SSE；
@@ -46,7 +46,7 @@ export interface TraeFallbackModel {
 /**
  * TRAE 产品配置。
  *
- * 与 `LobsteraiProduct` / `BuddyProduct` 平行，字段全部为 TRAE 实际需要的。
+ * 与 `LobsteraiProduct` / `ProviderProduct` 平行，字段全部为 TRAE 实际需要的。
  */
 export interface TraeProduct {
   /** provider 标识：注册到 `ctx.llm` 的路由名，也是账号列表的 provider 字段值。 */

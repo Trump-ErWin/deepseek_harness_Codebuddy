@@ -198,9 +198,9 @@ describe('★★ 聚合关闭后不得被动态目录长大重新打开', () => 
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
         listProviders: () => (extraChannel
-          ? [{ id: 'buddy' }, { id: 'codearts' }]
-          : [{ id: 'buddy' }]),
-        listModels: async (provider: string) => (provider === 'buddy'
+          ? [{ id: 'loomy' }, { id: 'codearts' }]
+          : [{ id: 'loomy' }]),
+        listModels: async (provider: string) => (provider === 'loomy'
           ? [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }]
           : [{ id: 'glm-5.3', name: 'GLM-5.3' }]),
         resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),

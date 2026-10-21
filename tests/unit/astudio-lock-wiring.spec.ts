@@ -3,7 +3,7 @@
  *
  * ## 为什么单独守这个（而不是复用 `buddy-permanent-lock.spec.ts`）
  *
- * 那个文件守的是「`BuddyBalanceSelector` 的四家怎么建实例」。而 AStudio 的缺陷
+ * 那个文件守的是「`BalanceSelector` 的四家怎么建实例」。而 AStudio 的缺陷
  * 不是建错了实例，是**根本没有选号层** —— 2026-10-20 之前
  * `src/index.ts` 的 `registerAstudioLlm` 只传 `auth` / `product` / `refresh` /
  * `warn`，适配器走 `auth.currentCredential()`（单凭据）⇒ 即使
@@ -24,7 +24,7 @@
  *    （缺后者 ⇒ 客户端 `splitCreditsByExpiry` 整体返回 `null` ⇒ 三行分档不渲染，
  *    症状**静默**：胶囊只剩合计）。
  * 3. **分档行为**：把真实上游报文结构（三池各带 `*NextExpireTime`）喂给
- *    `buildAstudioBalance`，再用 `splitBuddyCreditsByExpiry` / `buddyBalanceTier`
+ *    `buildAstudioBalance`，再用 `splitCreditsByExpiry` / `balanceTier`
  *    验证「锁定后只剩永久积分 ⇒ 该号不可用」。这一层直接驱动生产判据，
  *    不是复述实现。
  *
@@ -39,12 +39,12 @@ import { PROVIDER_REGISTRY, descriptorOf } from '../../src/provider-registry.js'
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
 import { buildAstudioBalance } from '../../src/astudio-credits.js'
 import {
-  BUDDY_BALANCE_TIER,
-  BUDDY_EXPIRING_WINDOW_DAYS,
-  buddyBalanceTier,
-  buddyTierUsable,
-  splitBuddyCreditsByExpiry,
-} from '../../src/buddy-balance-rank.js'
+  BALANCE_TIER,
+  EXPIRING_WINDOW_DAYS,
+  balanceTier,
+  tierUsable,
+  splitBalanceByExpiry as splitCreditsByExpiry,
+} from '../../src/balance-rank.js'
 import { ASTUDIO } from '../../src/astudio-product.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -144,7 +144,7 @@ describe('★ AStudio：`permanentLock` 的 registry 契约', () => {
 describe('★ AStudio：`index.ts` 的接线（源码级，守纯文本形态的约定）', () => {
   it('建了 astudio 自己的选号器并交给工厂的 balance.selector', () => {
     expect(indexCode).toMatch(
-      /const astudioBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: ASTUDIO,/,
+      /const astudioBalanceSelector = new BalanceSelector\(\{\s*\n\s*product: ASTUDIO,/,
     )
     expect(planCode, 'balance.selector 必须指向 astudioBalanceSelector')
       .toMatch(/kind:\s*'buddy',\s*\n\s*selector:\s*astudioBalanceSelector,/)
@@ -242,56 +242,56 @@ describe('★★ AStudio：分档行为（驱动生产判据，不是复述实�
   it('★ 锁定后只剩「长期」积分 ⇒ 该号不可用（tier = none）', () => {
     const { balance } = activityPackage('2026-11-20T01:50:14')
     const now = Date.parse('2026-10-20T00:00:00')
-    const windowMs = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
-    const split = splitBuddyCreditsByExpiry(balance, now, windowMs)
+    const windowMs = EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    const split = splitCreditsByExpiry(balance, now, windowMs)
     // 31 天 > 15 天窗口 ⇒ 落永久桶（不是临期）。
     expect(split, '2026-11-20 距 2026-10-20 约 31 天 ⇒ 应落永久桶').toEqual({ expiring: 0, permanent: 1100 })
 
-    // ⚠️ `buddyBalanceTier` 吃的**不是** `CreditBalance`，而是分桶后的账号摘要
+    // ⚠️ `balanceTier` 吃的**不是** `CreditBalance`，而是分桶后的账号摘要
     //    `{ expiringBalance, permanentBalance }` —— 生产链是
-    //    `BuddyBalanceSelector.classify()`：先 `splitBuddyCreditsByExpiry` 拿两桶，
+    //    `BalanceSelector.classify()`：先 `splitCreditsByExpiry` 拿两桶，
     //    填成 `entry`（`expiringBalance: split.expiring` / `permanentBalance: split.permanent`）
-    //    再交给 `buddyBalanceTier(entry, { now, windowMs })`。
+    //    再交给 `balanceTier(entry, { now, windowMs })`。
     //    直接传 `balance` 会因字段名对不上而恒得 `none`（写本用例时实测踩到）。
     const entry = { id: 'a', expiringBalance: split!.expiring, permanentBalance: split!.permanent }
 
     // 未锁定：长期额度可用（tier = permanent）。
-    expect(buddyBalanceTier(entry, { allowPermanent: true, windowMs }))
-      .toBe(BUDDY_BALANCE_TIER.permanent)
+    expect(balanceTier(entry, { allowPermanent: true, windowMs }))
+      .toBe(BALANCE_TIER.permanent)
     // ★ 锁定：只剩长期 ⇒ 明确不可用。这就是「锁定真的会拦」的那一步。
     expect(
-      buddyBalanceTier(entry, { allowPermanent: false, windowMs }),
+      balanceTier(entry, { allowPermanent: false, windowMs }),
       '锁定后只剩永久积分 ⇒ 必须落 none（否则锁定形同虚设）',
-    ).toBe(BUDDY_BALANCE_TIER.none)
-    // 再补一条「可承载请求」的语义断言：`buddyTierUsable` 是调用方真正看的那一步
-    // （`select()` 里 `if (allowPermanent === false && !buddyTierUsable(...))`）。
-    expect(buddyTierUsable(buddyBalanceTier(entry, { allowPermanent: false, windowMs }))).toBe(false)
-    expect(buddyTierUsable(buddyBalanceTier(entry, { allowPermanent: true, windowMs }))).toBe(true)
+    ).toBe(BALANCE_TIER.none)
+    // 再补一条「可承载请求」的语义断言：`tierUsable` 是调用方真正看的那一步
+    // （`select()` 里 `if (allowPermanent === false && !tierUsable(...))`）。
+    expect(tierUsable(balanceTier(entry, { allowPermanent: false, windowMs }))).toBe(false)
+    expect(tierUsable(balanceTier(entry, { allowPermanent: true, windowMs }))).toBe(true)
   })
 
   it('★ 有临期积分时锁定仍可用（锁定只挡永久桶，不挡临期桶）', () => {
     // 造一个 10 天到期（< 15 天窗口 ⇒ 临期桶）的余额。
     const balance = buildAstudioBalance(balancePayload('2026-10-30T00:00:00') as never)
     const now = Date.parse('2026-10-20T00:00:00')
-    const windowMs = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
-    const split = splitBuddyCreditsByExpiry(balance, now, windowMs)
+    const windowMs = EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    const split = splitCreditsByExpiry(balance, now, windowMs)
     expect(split!.expiring, '10 天到期应落临期桶').toBe(1100)
     const entry = { id: 'a', expiringBalance: split!.expiring, permanentBalance: split!.permanent }
-    expect(buddyBalanceTier(entry, { allowPermanent: false, windowMs }))
-      .toBe(BUDDY_BALANCE_TIER.expiring)
+    expect(balanceTier(entry, { allowPermanent: false, windowMs }))
+      .toBe(BALANCE_TIER.expiring)
   })
 
   it('★ 窗口天数与前端/后端同源（15 天常量；env 覆盖由 permanent-lock-execution 守）', () => {
     // 数字写岔会让用户看到「提示说只烧 8 天内的，实际按 15 天筛号」。
-    expect(BUDDY_EXPIRING_WINDOW_DAYS).toBe(15)
-    // AStudio 的选号器与 buddy 系共用 `BuddyBalanceSelector`，故窗口也共用一份
-    // 判据（`buddy-balance-rank.ts` 是唯一真源）。
+    expect(EXPIRING_WINDOW_DAYS).toBe(15)
+    // AStudio 的选号器与 buddy 系共用 `BalanceSelector`，故窗口也共用一份
+    // 判据（`balance-rank.ts` 是唯一真源）。
     //
     // ⚠️ **本用例只断言常量**（2026-10-21 审计指出原标题「可用环境变量覆盖」**超发**）：
-    //    把 `buddyExpiringWindowDays` 的 env 参数完全废掉（`void env`），本文件 +
+    //    把 `expiringWindowDays` 的 env 参数完全废掉（`void env`），本文件 +
     //    minimax + lockexec 三份 **38 条全绿** ⇒ 本文件对该能力零牙。
     //    真正守 env 覆盖的是 `permanent-lock-execution.spec.ts` 的 ⑥
-    //    （设 `DSH_BUDDY_EXPIRING_WINDOW_DAYS=31` 并断言读到 31）。
+    //    （设 `DSH_EXPIRING_WINDOW_DAYS=31` 并断言读到 31）。
     //    ⇒ 标题改成如实描述，别让它看起来比实际强。
   })
 
@@ -360,7 +360,7 @@ describe('★★ AStudio：分档行为（驱动生产判据，不是复述实�
   })
 
   it('端点常量指向 AStudio 自己的地址（不是 buddy 系）', () => {
-    // ⚠️ `BuddyBalanceSelector` 的 `fetchSource` 里有一条防御：
+    // ⚠️ `BalanceSelector` 的 `fetchSource` 里有一条防御：
     //    「非 buddy 系必须注入 `fetchBalance`」（否则会用 product.endpoint 拼出
     //    错误的余额 URL）。本家已注入，故这条只钉住 product 常量本身。
     expect(ASTUDIO.id).toBe('astudio')
@@ -370,7 +370,7 @@ describe('★★ AStudio：分档行为（驱动生产判据，不是复述实�
   /**
    * ★★ **`fetchBalance` 闭包必须透传 `product` 形参**（2026-10-21 审计发现：零覆盖）。
    *
-   * `BuddyBalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
+   * `BalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
    * ⇒ 闭包里忽略形参、写死常量会让取数用错产品配置。
    * 审计实测：把 astudio 的闭包改成 `async () => null`，本文件 **13 条全绿**。
    *
@@ -379,7 +379,7 @@ describe('★★ AStudio：分档行为（驱动生产判据，不是复述实�
    *    余额恒 `null` ⇒ 锁定态永远「没有可用账号」。故仍要钉住「调的是本家的 fetch」。
    */
   it('★★ fetchBalance 闭包必须调本家的 fetchAstudioCreditBalance 并透传 product', () => {
-    const start = indexCode.indexOf('const astudioBalanceSelector = new BuddyBalanceSelector({')
+    const start = indexCode.indexOf('const astudioBalanceSelector = new BalanceSelector({')
     expect(start, '找不到 astudio 的选号器').toBeGreaterThan(-1)
     // ⚠️ 终点取下一个同级 `const`：块内可能有多行箭头函数的 `})`。
     const end = indexCode.indexOf('\n  const ', start + 10)

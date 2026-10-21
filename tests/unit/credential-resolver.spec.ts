@@ -204,11 +204,11 @@ describe('createCredentialResolver · 骨架 A（纯池选号）', () => {
 
 describe('createCredentialResolver · 骨架 C（buddy 协议分档）', () => {
   /**
-   * 余额分档的假选择器 —— 形状必须与**真实** `BuddySelectionResult` 一致
+   * 余额分档的假选择器 —— 形状必须与**真实** `SelectionResult` 一致
    *（`{ ok: true, account, balance }` / `{ ok: false, reason }`），因为
-   * `pickBuddyAccount` 判的是 `picked.ok`。
+   * `pickAccount` 判的是 `picked.ok`。
    *
-   * ⚠️ 写成 `{ kind: 'exhausted' }` 会让 `pickBuddyAccount` 认为「没选中」，
+   * ⚠️ 写成 `{ kind: 'exhausted' }` 会让 `pickAccount` 认为「没选中」，
    * 于是 `tried` 恒空 —— 那会**静默**把好几条用例变成同义反复
    *（写本文件时实测到：`exhausted` 那条断言 `exclude` 恒为 `''`）。
    */
@@ -360,7 +360,7 @@ describe('createCredentialResolver · 骨架 C（buddy 协议分档）', () => {
     const resolve = make({
       pool,
       selector: fakeSelector({ pick: PICK_A1 }),
-      // 分档选中的 a1 凭据坏 ⇒ `pickBuddyAccount` 把它记进 `tried` 并耗尽候选；
+      // 分档选中的 a1 凭据坏 ⇒ `pickAccount` 把它记进 `tried` 并耗尽候选；
       // 但池兜底读的是**同一个** ref ⇒ 这里也让它坏，才测得到 exclude。
       readCredential: async () => undefined,
     })
@@ -394,7 +394,7 @@ describe('createCredentialResolver · 骨架 C（buddy 协议分档）', () => {
    * ★ 真实报障 2026-10-13（CodeBuddy：`明明有积分却显示不可用`）。
    *
    * 全部启用账号被**目标模型**限流 ⇒ `candidatesOf` 把它们全滤掉 ⇒ 候选空集
-   * ⇒ 余额分档一次都没跑 ⇒ `pickBuddyAccount` 返回 `locked`（reason 缺席）。
+   * ⇒ 余额分档一次都没跑 ⇒ `pickAccount` 返回 `locked`（reason 缺席）。
    * 修复前这里直接 `throw plan.lockedError({kind:'exhausted'})`，把**限流**
    * 谎报成「积分都已用尽」，用户据此去解锁永久积分 —— 方向完全错，
    * 而解禁时刻就在池里。
@@ -434,7 +434,7 @@ describe('createCredentialResolver · 骨架 C（buddy 协议分档）', () => {
     let called = 0
     const resolve = make({
       pool: poolOf(ENTRIES, { R1: '{}' }, true),
-      // 候选非空，但凭据读不出来 ⇒ `pickBuddyAccount` 耗尽候选后返回 locked。
+      // 候选非空，但凭据读不出来 ⇒ `pickAccount` 耗尽候选后返回 locked。
       selector: fakeSelector({ pick: PICK_A1 }),
       readCredential: async () => undefined,
       throwIfAllRateLimited: () => { called++; throw new Error('不该判限流') },
@@ -556,7 +556,7 @@ describe('createCredentialResolver · 骨架 D（loomy 协议分档）', () => {
   })
 
   it('⚠️ 选中账号凭据坏 ⇒ **不换号、不问池**，直接退固定 ref', async () => {
-    // 变异：把 loomy 分支改成调 `pickBuddyAccount` ⇒ 红（会多调一次 select）。
+    // 变异：把 loomy 分支改成调 `pickAccount` ⇒ 红（会多调一次 select）。
     const pool = poolOf([...ENTRIES, { id: 'a2', provider: 'loomy', credentialRef: 'R2' }], { R2: '{}' })
     let selectCalls = 0
     const resolve = make({
@@ -629,7 +629,7 @@ describe('★ 接线层：apply() 出来的真实闭包（替代源码文本断�
    * 1. 带余额分档的四家（buddy 协议：buddy / workbuddy / lobsterai / trae）会先问
    *    `isFreeModel()` —— buddy / trae 的适配器内部要 `ensureRemoteModels()`
    *    拉远端目录；
-   * 2. 同四家的 `BuddyBalanceSelector.balanceOf` 会查上游余额端点。
+   * 2. 同四家的 `BalanceSelector.balanceOf` 会查上游余额端点。
    *
    * ⚠️ **实测代价**（复审用临时 `NODE_OPTIONS` 探针量到，未改仓库）：不桩时本组
    * 真的出网 —— `lobsterai` 打 `…/api/user/profile-summary` ×1、`loomy` 打
@@ -784,7 +784,9 @@ describe('★ 接线层：apply() 出来的真实闭包（替代源码文本断�
   ] as const
 
   /** 有 `reportAccount` 注册项、但账本分支结构上不可达的两家（见上）。 */
-  const LEDGER_UNREACHABLE = ['buddy', 'workbuddy'] as const
+  // ⚠️ **当前为空**：本名单指「账本回报不可达、但注册项仍必须在」的渠道。
+  //    原列的两家已从插件移除，其注册项随之消失（这是正确结果，不是漏接线）。
+  const LEDGER_UNREACHABLE: readonly string[] = []
 
   /**
    * ⚠️ provider id → 它在 `src/index.ts` 里用的**产品常量名**。
@@ -794,8 +796,6 @@ describe('★ 接线层：apply() 出来的真实闭包（替代源码文本断�
    * `BUDDY` / `QODERCN` 两个**不存在**的标识符 ⇒ 自检静默失效（实测踩到）。
    */
   const PRODUCT_CONST: Readonly<Record<string, string>> = {
-    buddy: 'CODEBUDDY',
-    workbuddy: 'WORKBUDDY',
     lobsterai: 'LOBSTERAI',
     qoder: 'QODER',
     qodercn: 'QODER_CN',
@@ -913,7 +913,7 @@ describe('★ 接线层：apply() 出来的真实闭包（替代源码文本断�
    * - 走**裸 parse**（buddy 那份）⇒ 被接受 ⇒ 直接交出 `{broken:1}`。
    *
    * ⚠️ LobsterAI **没有** `isFreeModel`（它的模型表不带倍率字段），故这里走的是
-   * **余额分档**那一支 —— 但那一支同样经 `config.readCredential`（`pickBuddyAccount`
+   * **余额分档**那一支 —— 但那一支同样经 `config.readCredential`（`pickAccount`
    * 的 `resolveCredential`），所以它守的正是「工厂拿到的是哪一份解析器」。
    * 余额查询被本组的 `fetch` 桩打死 ⇒ 分档把该账号判为「查不到余额」，
    * 未锁定 ⇒ 仍然会去解析它的凭据，判据因此可达。

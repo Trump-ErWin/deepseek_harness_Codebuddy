@@ -71,7 +71,7 @@ const WORKBUDDY_UA_INTL = 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2'
 const WORKBUDDY_UA_CN = 'WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2'
 
 /** 一个 CodeBuddy 系产品的全部差异配置。 */
-export interface BuddyProduct {
+export interface ProviderProduct {
   /** provider 标识：注册到 ctx.llm 的路由名，也是账号列表的 provider 字段值 */
   id: 'buddy' | 'workbuddy'
   /** auth/state 的 platform 查询参数 */
@@ -130,7 +130,7 @@ export interface BuddyProduct {
    * 两类模型都归因正确。
    *
    * 匹配规则：`match` 为模型 id 前缀（大小写敏感，与模型 id 一致）；
-   * 空数组或未提供时全部回退到 {@link BuddyProduct.userAgent}。
+   * 空数组或未提供时全部回退到 {@link ProviderProduct.userAgent}。
    */
   userAgentByModelFamily?: readonly BuddyUserAgentRule[]
   /**
@@ -323,7 +323,7 @@ const CODEBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
   },
 ]
 
-export const CODEBUDDY: BuddyProduct = {
+export const CODEBUDDY: ProviderProduct = {
   id: 'buddy',
   platform: 'ide',
   endpoint: 'https://copilot.tencent.com',
@@ -489,7 +489,7 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
  * 该产品**没有**每日签到积分接口（内核中只有 `/v2/billing/meter/get-dosage-notify`），
  * 因此 Jet Hub 不为其渲染「一键领取积分」按钮；积分领取在 CodeBuddy 侧完成。
  *
- * ⚠️ 下面的 `claimBase` / `webBase` 是**占位值**（为满足 `BuddyProduct` 的必填形状），
+ * ⚠️ 下面的 `claimBase` / `webBase` 是**占位值**（为满足 `ProviderProduct` 的必填形状），
  * 本产品**没有任何代码路径会读取它们** —— 原因有两层：
  *
  * 1. 成长任务的唯一入口是「一键领取积分」按钮，而该按钮由
@@ -505,10 +505,10 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
  *    集合，**已删除** —— 「哪家有成长中心」现在由「该家是否提供 `credits.afterClaim`」
  *    回答（能力注册表说了算，不再有第二份可漂移的名单）。
  *
- * 两个字段保留是因为 `BuddyProduct` 把它们声明为必填；若将来类型放宽为可选，
+ * 两个字段保留是因为 `ProviderProduct` 把它们声明为必填；若将来类型放宽为可选，
  * 这里可以删掉（`claimBaseOf` / `webBaseOf` 已能正确处理空值并给出可读错误）。
  */
-export const WORKBUDDY: BuddyProduct = {
+export const WORKBUDDY: ProviderProduct = {
   id: 'workbuddy',
   platform: 'workbuddy-ai',
   endpoint: 'https://www.workbuddy.ai',
@@ -551,10 +551,10 @@ export const WORKBUDDY: BuddyProduct = {
 }
 
 /** 全部产品配置，供按 id 查询与遍历注册使用。 */
-export const ALL_PRODUCTS: readonly BuddyProduct[] = [CODEBUDDY, WORKBUDDY]
+export const ALL_PRODUCTS: readonly ProviderProduct[] = [CODEBUDDY, WORKBUDDY]
 
 /** 按 provider id 取产品配置；未知 id 返回 undefined。 */
-export function productById(id: string): BuddyProduct | undefined {
+export function productById(id: string): ProviderProduct | undefined {
   return ALL_PRODUCTS.find((product) => product.id === id)
 }
 
@@ -568,7 +568,7 @@ export function productById(id: string): BuddyProduct | undefined {
  * @param product - 产品配置
  * @param model - 模型 id（如 `gpt-5.6-sol` / `glm-5.2`）
  */
-export function resolveUserAgent(product: BuddyProduct, model: string): string {
+export function resolveUserAgent(product: ProviderProduct, model: string): string {
   for (const rule of product.userAgentByModelFamily ?? []) {
     if (model.startsWith(rule.match)) return rule.ua
   }

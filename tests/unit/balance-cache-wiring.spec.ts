@@ -15,9 +15,9 @@
  */
 import { afterEach, describe, expect, it } from 'vitest'
 import { createBalanceCache } from '../../src/balance-cache.js'
-import { buddyExpiry, lobsteraiExpiry, traeExpiry } from '../../src/aggregate-expiry.js'
+import { sharedExpiry, lobsteraiExpiry, traeExpiry } from '../../src/aggregate-expiry.js'
 import type { CreditBalance } from '../../src/credits.js'
-import { CODEBUDDY } from '../../src/product.js'
+import { LOBSTERAI } from '../../src/lobsterai-product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
 import { TRAE } from '../../src/trae-product.js'
 
@@ -53,7 +53,7 @@ describe('★ buddy 系四家吃共享读数（命中时不再打上游）', () 
   it('★★ 缓存命中 ⇒ 用缓存里的余额折算（不查上游的能力由 `fetchBalanceWithCache` 的接线用例覆盖）', async () => {
     // ⚠️⚠️ **本条能测什么、不能测什么**（2026-10-16 对抗审计发现 + 我复核）：
     //
-    //    `buddyExpiry` 只有**三个**参数（`product` / `credential` / `cached?`）——
+    //    `sharedExpiry` 只有**三个**参数（`product` / `credential` / `cached?`）——
     //    **fallback 不是参数**，它在函数内部固定是 `fetchCreditBalance(...)`。
     //    ⇒ 单测里**注入不了** fallback ⇒ 「缓存命中时不打上游」这条**无法在本用例断言**。
     //
@@ -70,8 +70,8 @@ describe('★ buddy 系四家吃共享读数（命中时不再打上游）', () 
     //      两个参数，其行为由下面「★ 共享读数缺席 ⇒ 回落自己发请求」等同文件用例覆盖
     //      （那些用例传的是 `cached` 桩，能精确控制「有没有共享读数」）。
     const expiry = 1_700_000_000_000
-    const result = await buddyExpiry(
-      CODEBUDDY,
+    const result = await sharedExpiry(
+      LOBSTERAI,
       credential,
       async () => balanceWith(expiry),
     )
@@ -93,7 +93,7 @@ describe('★ buddy 系四家吃共享读数（命中时不再打上游）', () 
     // 折算侧：`cached` 返回 undefined ⇒ 必须回落（这里用一个真实值证明回落生效）
     let fallbackCalls = 0
     const expiry = 1_700_000_000_001
-    const result = await buddyExpiry(CODEBUDDY, credential, async () => {
+    const result = await sharedExpiry(LOBSTERAI, credential, async () => {
       fallbackCalls += 1
       return balanceWith(expiry)
     })
@@ -117,7 +117,7 @@ describe('★ buddy 系四家吃共享读数（命中时不再打上游）', () 
     expect(shared).toBeUndefined()
 
     const expiry = 1_700_000_000_002
-    const result = await buddyExpiry(CODEBUDDY, credential, async () => balanceWith(expiry))
+    const result = await sharedExpiry(LOBSTERAI, credential, async () => balanceWith(expiry))
     expect(result, '★ 失败读数必须让折算回落，而不是判死').toBe(expiry)
   })
 
@@ -125,13 +125,13 @@ describe('★ buddy 系四家吃共享读数（命中时不再打上游）', () 
     // ⚠️ 与上一条相反的方向：`null` 是「共享读数明确说：查询失败/无余额」⇒
     //    不该转头再打一次上游（那会让一次失败变成双倍请求）。
     let fallbackCalls = 0
-    const result = await buddyExpiry(CODEBUDDY, credential, async () => {
+    const result = await sharedExpiry(LOBSTERAI, credential, async () => {
       fallbackCalls += 1
       return balanceWith(1)
     })
     expect(result).toBe(1)
     // 下面这条才是 `null` 的判据
-    const withNull = await buddyExpiry(CODEBUDDY, credential, async () => null)
+    const withNull = await sharedExpiry(LOBSTERAI, credential, async () => null)
     expect(withNull, 'null ⇒ sharedPackageExpiry 判 UNUSABLE').toBe(-1)
     expect(fallbackCalls, '★ null 不得触发 fallback 重查').toBe(1)
   })
@@ -145,13 +145,13 @@ describe('★ buddy 系四家吃共享读数（命中时不再打上游）', () 
       { total: 5, packages: [{ name: 'p', unit: 'u', remaining: 5, total: 5, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '' }] } as unknown as CreditBalance,
     ]
     for (const [index, balance] of cases.entries()) {
-      const withoutCache = await buddyExpiry(CODEBUDDY, credential)
-      // ⚠️ 用**桩**返回固定余额（`buddyExpiry` 的 fallback 在无 cached 时不走桩，
+      const withoutCache = await sharedExpiry(LOBSTERAI, credential)
+      // ⚠️ 用**桩**返回固定余额（`sharedExpiry` 的 fallback 在无 cached 时不走桩，
       //    故这里改为「传 cached 且 fallback 恒抛」来隔离出折算判据本身）。
-      const withCache = await buddyExpiry(CODEBUDDY, credential, async () => balance)
+      const withCache = await sharedExpiry(LOBSTERAI, credential, async () => balance)
       // 不传 cached 时它会真发请求（单测环境无网络）⇒ 结果是 UNUSABLE；
       // 故对照的是「同一份余额经共享读数 vs 经 fallback」——两者必须同值。
-      const viaFallback = await buddyExpiry(CODEBUDDY, credential, async () => undefined)
+      const viaFallback = await sharedExpiry(LOBSTERAI, credential, async () => undefined)
         .catch(() => 'threw')
       void withoutCache
       void viaFallback
@@ -195,7 +195,7 @@ describe('★★ 接线的**透传**腿（`provider-expiry.ts` 的 `context.cach
    *    少一家（漏接线）都必须是红灯。这就是本表存在的意义。
    */
   const CACHED_BALANCE_PROVIDERS = [
-    'buddy', 'workbuddy', 'lobsterai', 'trae', 'modelscope',
+    'lobsterai', 'trae', 'modelscope',
     'autoclaw', 'autoclawintl', 'qoder', 'qodercn',
     // ⚠️ PR !119（2026-10-20）新增的三家：astudio 走 `astudioExpiry`、
     //    minimax / minimaxintl 走 `minimaxFamilyExpiry`，三者在
@@ -208,7 +208,7 @@ describe('★★ 接线的**透传**腿（`provider-expiry.ts` 的 `context.cach
 
   it('★★ 所有接了 `cachedBalance` 透传的渠道都必须真的透传（本表即清单）', async () => {
     // ⚠️⚠️ **这条是本任务唯一能抓「透传漏了」的判据**（变异验证实测）：
-    //    上面那些用例直接调 `buddyExpiry(product, credential, cached)` —— 它们证明
+    //    上面那些用例直接调 `sharedExpiry(product, credential, cached)` —— 它们证明
     //    原语**支持**共享读数，但**完全绕过了** `provider-expiry.ts` 的透传。
     //    实测：把 `buddyFamilyExpiry` 里的 `cachedBalance` 透传整段删掉，
     //    本文件**11 条全绿**（无牙）—— 而生产症状是「四家仍然各打一次上游」，
@@ -262,7 +262,7 @@ describe('★★ 接线的**透传**腿（`provider-expiry.ts` 的 `context.cach
     const table = createProviderExpiry()
     // 只断言「不抛 TypeError」—— 未接线时它走自己的取数路径（单测无网络 ⇒ 失败），
     // 关键是**不得**因为读了 `context.cachedBalance` 而下标 undefined。
-    await expect(table.buddy!.credentialExpiry({ access_token: 't' } as never, {}))
+    await expect(table.lobsterai!.credentialExpiry({ access_token: 't' } as never, {}))
       .resolves.toBeTypeOf('number')
   })
 })

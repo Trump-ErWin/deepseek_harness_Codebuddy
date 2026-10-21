@@ -45,11 +45,11 @@
  * | `expired === true` 的桶 | **跳过**（服务端仍会返回余额，计入会虚增可用额度） |
  * | `remaining <= 0` 的桶 | **跳过** |
  * | `expiresAt` 可解析，且 `expiresAt - now < 窗口` | 「临期」桶（锁定期间**唯一**可消耗的额度） |
- * | 其余（到期时间 ≥ 窗口，或**没给**到期时间） | 「永久」桶 —— ⚠️ **拿不到到期时间时归永久是保守方向**：最坏结果是锁定时少用一个号，而不是把长期积分误当临期烧掉（与 `splitBuddyCreditsByExpiry` 同款取舍） |
+ * | 其余（到期时间 ≥ 窗口，或**没给**到期时间） | 「永久」桶 —— ⚠️ **拿不到到期时间时归永久是保守方向**：最坏结果是锁定时少用一个号，而不是把长期积分误当临期烧掉（与 `splitCreditsByExpiry` 同款取舍） |
  *
- * ⚠️ 窗口复用 `buddyExpiringWindowMs()`（`DSH_BUDDY_EXPIRING_WINDOW_DAYS`，默认 15 天）：
+ * ⚠️ 窗口复用 `expiringWindowMs()`（`DSH_EXPIRING_WINDOW_DAYS`，默认 15 天）：
  *    Jet Hub 的 `credits.permanentLock` RPC 对**所有 `usesExpiryWindow: true` 的渠道**
- *    回传的正是 `buddyExpiringWindowDays()` ⇒ 面板文案与实际筛号必须是**同一个数**。
+ *    回传的正是 `expiringWindowDays()` ⇒ 面板文案与实际筛号必须是**同一个数**。
  *
  * ⚠️ **已知取舍：试点包（`.trial` SKU）会被判成「永久」。**
  *    `fetchCloudSubscriptionFor` 有意丢弃 trial SKU 的到期时间
@@ -60,12 +60,12 @@
  *
  * ## ⚠️ 锁定时**绝不回落**（与 buddy/loomy 逐字同规）
  *
- * `pickBuddyAccount` 的注释写得很清楚：锁定时落到池兜底 = 绕过锁定、照样消耗永久
+ * `pickAccount` 的注释写得很清楚：锁定时落到池兜底 = 绕过锁定、照样消耗永久
  * 积分 ⇒ 锁定形同虚设。故本文件在「锁定 + 无临期额度」时**只抛错**，
  * 连 `resolveUnlocked()` 那条旧路径都不碰（那条路径里有池兜底）。
  */
 
-import { buddyExpiringWindowMs } from './buddy-balance-rank.js'
+import { expiringWindowMs } from './balance-rank.js'
 import type { OfficeAceCredential, OfficeAceSubscriptionSummary } from './officeace-auth.js'
 
 /** 池内一个候选账号的最小形状（结构类型，便于单测注入替身）。 */
@@ -126,7 +126,7 @@ export interface OfficeAceLockDeps {
   readonly summaryOf: (credential: OfficeAceCredential, ref: string | undefined) => Promise<OfficeAceSummaryRead>
   /** 当前时刻（毫秒），单测注入用。 */
   readonly now?: () => number
-  /** 临期窗口（毫秒），默认 `buddyExpiringWindowMs()`。 */
+  /** 临期窗口（毫秒），默认 `expiringWindowMs()`。 */
   readonly windowMs?: () => number
 }
 
@@ -141,7 +141,7 @@ export interface OfficeAceCreditSplit {
 /**
  * 把一个订阅读取结果拆成「临期」与「永久」两桶。
  *
- * ⚠️ 判据与 `splitBuddyCreditsByExpiry` **逐格同构**（含边界方向
+ * ⚠️ 判据与 `splitCreditsByExpiry` **逐格同构**（含边界方向
  * `end - now < windowMs`、含「到期时间未知 ⇒ 永久」）。两处的差异只有**数据形状**
  * （buddy 读 `packages[].deductionEndTime` 数值，officeace 读 `creditGroups[].expiresAt`
  * ISO 字符串）：前者是 `active` 布尔，后者是 `expired` 布尔（语义相反，故这里取反）。
@@ -150,7 +150,7 @@ export interface OfficeAceCreditSplit {
  * @param now - 当前时刻（毫秒）。
  * @param windowMs - 本次生效的窗口（毫秒）。⚠️ **必填**：生产上恒由调用方显式传入
  *   （装配处传 `windowMs()`，也就是与面板、取号**同一个**窗口）。原来这里有
- *   `= buddyExpiringWindowMs()` 默认值，第二轮对抗性审计实测**把它改成常数 15 天
+ *   `= expiringWindowMs()` 默认值，第二轮对抗性审计实测**把它改成常数 15 天
  *   仍然全绿** ⇒ 它是死代码，却又是「一条判据两份取值」的潜入口（谁少传一次，
  *   筛号窗口就与文案窗口分叉，且**不会有任何红**）。删掉默认值让「忘了传」变成
  *   编译错误。
@@ -216,7 +216,7 @@ export function createOfficeAceCredentialProvider(
   deps: OfficeAceLockDeps,
 ): () => Promise<OfficeAceCredential | undefined> {
   const now = (): number => deps.now?.() ?? Date.now()
-  const windowMs = (): number => deps.windowMs?.() ?? buddyExpiringWindowMs()
+  const windowMs = (): number => deps.windowMs?.() ?? expiringWindowMs()
   /** 只存**不花额度**的结论（见 `OFFICEACE_LOCK_PERMANENT_TTL_MS` 的表）。 */
   const cache = new Map<string, LockCacheEntry>()
 
@@ -319,7 +319,7 @@ export function createOfficeAceCredentialProvider(
  * ## ⚠️ 窗口天数**必须由调用方传进来**（不许在本函数里另算一份）
  *
  * 本仓库红线「一文件两套同义判据」：筛号用的是 `deps.windowMs()`，若文案自己再调
- * `buddyExpiringWindowMs()`，注入场景下就会出现「按 1 天窗口拒绝、报文却说 15 天」
+ * `expiringWindowMs()`，注入场景下就会出现「按 1 天窗口拒绝、报文却说 15 天」
  * —— 用户照着报文去核对会得到相反的结论。故 `windowMs` 是**入参**，
  * `createOfficeAceCredentialProvider` 把**同一个**取值传进来（第一轮审计「轻微 1」）。
  *
@@ -327,13 +327,13 @@ export function createOfficeAceCredentialProvider(
  * @param windowMs - 本次筛号实际生效的窗口（毫秒）。⚠️ **必填**（第二轮对抗性审计
  *   实测：这里的默认值改成常数 15 天后 22 条单测**全绿** ⇒ 生产装配恒显式传参，
  *   默认值纯属死代码，却为「一条判据两份取值」留了后门）。**非法值**（NaN/≤0）
- *   仍回落到 `buddyExpiringWindowMs()`：那是防御，不是「忘了传」的兜底 —— 由 ⑩ 钉住。
+ *   仍回落到 `expiringWindowMs()`：那是防御，不是「忘了传」的兜底 —— 由 ⑩ 钉住。
  */
 export function officeaceLockedError(
   reason: OfficeAceNoAccountReason,
   windowMs: number,
 ): Error {
-  const effective = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : buddyExpiringWindowMs()
+  const effective = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : expiringWindowMs()
   const days = Math.round(effective / (24 * 60 * 60 * 1000))
   if (reason.kind === 'unknown') {
     return new Error(

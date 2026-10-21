@@ -3,7 +3,7 @@
  *
  * ## 为什么新建 `RaccoonProduct` 而不复用既有类型
  *
- * `BuddyProduct` / `LobsteraiProduct` / `QoderProduct` / `LoomyProduct` 的字段
+ * `ProviderProduct` / `LobsteraiProduct` / `QoderProduct` / `LoomyProduct` 的字段
  * 全部围绕各自协议设计（归属头、refresh 载荷、WASM 签名参数、讯飞 AccessKey…），
  * 对 raccoon 无一有意义。raccoon 需要的是：一套 API 前缀、桌面端身份标识、
  * 手机号加密密钥、阿里云验证码配置，以及一张兜底模型表。

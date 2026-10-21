@@ -26,7 +26,7 @@
  *
  * ## 本文件守住什么
  *
- * 核心用例走 `buddyExpiry` 的**真实实现**（含 `fetchBalanceWithCache`
+ * 核心用例走 `sharedExpiry` 的**真实实现**（含 `fetchBalanceWithCache`
  * 与 `sharedPackageExpiry`），判据是**折算返回值**与**上游 fallback 的调用
  * 次数**（都是可观测量），**不是**源码文本 —— 判据方向与生产一致。
  *
@@ -34,6 +34,14 @@
  * 那类判据在 `if (false)` 死分支里恒绿。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+/** 测试用产品配置替身（只要求 id/endpoint 等通用字段）。 */
+const TEST_PRODUCT = {
+  id: 'testchannel',
+  displayName: '测试渠道',
+  endpoint: 'https://example.invalid',
+}
+
 
 /**
  * ⚠️⚠️ **这是 `src/index.ts` 里 `balanceOf` 的镜像，不是它的引用。**
@@ -83,9 +91,8 @@ vi.mock('../../src/credits.js', async (importOriginal) => {
 })
 
 const { createBalanceCache } = await import('../../src/balance-cache.js')
-const { buddyExpiry } = await import('../../src/aggregate-expiry.js')
+const { sharedExpiry } = await import('../../src/aggregate-expiry.js')
 const { UNUSABLE } = await import('../../src/aggregate-core.js')
-const { CODEBUDDY } = await import('../../src/product.js')
 type CreditBalance = import('../../src/credits.js').CreditBalance
 
 /** 造一份「有临期包」的余额（判据与 `sharedPackageExpiry` 的输入同形）。 */
@@ -111,8 +118,8 @@ async function balanceOfViaCache(
 async function convertViaRealChain(
   cache: ReturnType<typeof createBalanceCache>,
 ): Promise<number> {
-  return await buddyExpiry(
-    CODEBUDDY,
+  return await sharedExpiry(
+    TEST_PRODUCT,
     credential,
     async () => await balanceOfViaCache(cache, 'buddy', 'a1', credential),
   )
@@ -186,7 +193,7 @@ describe('★★ 聚合折算：陈旧读数判不可用', () => {
 })
 
 /**
- * ★★ 端到端：`balanceOf` 的产物喂进**真实的 `buddyExpiry`**。
+ * ★★ 端到端：`balanceOf` 的产物喂进**真实的 `sharedExpiry`**。
  *
  * ⚠️ 这是本文件**对真实语义有约束力**的那一段：判据是**折算返回值**与
  * **上游 fallback 的调用次数**，而折算走真实的 `fetchBalanceWithCache` +
@@ -219,7 +226,7 @@ describe('★★ 真实折算链：陈旧读数不得参与排序', () => {
   it('★★ 对照：`undefined` 会**回落重查**（证明上一条不是恒真）', async () => {
     // ⚠️ 反向对照：把生产那行写成 `undefined` 时，折算**不会**判 `UNUSABLE`，
     //   而是回落自己打一次上游并采用上游的值 ⇒ 那正是本任务要消灭的行为。
-    const expiry = await buddyExpiry(CODEBUDDY, credential, async () => undefined)
+    const expiry = await sharedExpiry(TEST_PRODUCT, credential, async () => undefined)
     expect(expiry, 'undefined ⇒ 回落并采用上游的值（≠ UNUSABLE）').toBe(UPSTREAM_END)
     expect(
       upstreamFetch.mock.calls.length,

@@ -129,3 +129,4 @@ docs/zcode-protocol-notes.md
 # ⚠️ 这是**知识库**而非运行时依赖：`src/` 不引用它。
 # 需要改动实现、排查协议问题或重新校准结论时读它。
 docs/implementation-notes.md
+.dsh-backup/

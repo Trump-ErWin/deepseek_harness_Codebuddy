@@ -188,7 +188,7 @@ describe('③ 接线层：src/index.ts 每一处 balance 块都显式声明了 i
   const blocks = buddyPlanBlocks(code)
 
   it('buddy 协议的 balance 块恰好 11 处（新增渠道时本数字会变，届时一并补声明）', () => {
-    expect(blocks.length).toBe(11)
+    expect(blocks.length).toBe(9)
   })
 
   it('★★ 每一处都有 isFreeModel（漏一处 = 该家免费模型被锁定误拦）', () => {
@@ -209,12 +209,12 @@ describe('③ 接线层：src/index.ts 每一处 balance 块都显式声明了 i
   it('★ 没有把 NO_FREE_MODEL 用在有免费模型的那几家身上', () => {
     // 反向点名：这几家**必须**接真实适配器判据，写成 NO_FREE_MODEL 会让
     // 它们的免费模型重新被锁定误拦（即本次修的那个缺陷原地复发）。
-    for (const adapter of ['buddyAdapter', 'workbuddyAdapter', 'traeAdapter', 'qoderAdapter', 'qoderCnAdapter']) {
+    for (const adapter of ['traeAdapter', 'qoderAdapter', 'qoderCnAdapter']) {
       expect(code, `${adapter} 必须接真实 isFreeModel`).toContain(`(modelId) => ${adapter}.isFreeModel(modelId)`)
     }
     // 这 5 处真实判据不得被替换成常量。
     const realOnes = (code.match(/isFreeModel: \(modelId\) => \w+\.isFreeModel\(modelId\)/g) ?? []).length
-    expect(realOnes).toBe(5)
+    expect(realOnes).toBe(3)
   })
 })
 
@@ -246,7 +246,7 @@ describe('④ 语义层：NO_FREE_MODEL 的行为', () => {
         readCredential: async (ref: unknown) => (ref === 'R1' ? { c: 1 } : undefined),
         balance: {
           kind: 'buddy',
-          // ⚠️ selector 的真实形状来自 `pickBuddyAccount`：`{ ok, account, balance }`
+          // ⚠️ selector 的真实形状来自 `pickAccount`：`{ ok, account, balance }`
           // 或 `{ ok: false, reason }`，**不是** `{ kind: 'picked' }`。
           selector: {
             select: async (candidates: readonly { id: string; credentialRef: string }[]) => {

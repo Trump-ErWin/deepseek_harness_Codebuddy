@@ -34,9 +34,7 @@
 
 import type { AccountPool } from './account-pool.js'
 import { NEVER, UNUSABLE, type ExpiryProbe } from './aggregate-core.js'
-import type { BuddyCredential } from './buddy.js'
 import { fetchCreditBalance, isExclusiveCreditPool } from './credits.js'
-import { CODEBUDDY } from './product.js'
 import { LOOMY } from './loomy-product.js'
 import type { LoomyCredential } from './loomy.js'
 import { fetchLoomyCreditDetail } from './loomy-credits.js'
@@ -85,6 +83,7 @@ import { fetchMinimaxCreditBalanceDetailed } from './minimax-credits.js'
 import type { MinimaxProduct } from './minimax-product.js'
 import type { MinimaxCredential } from './minimax.js'
 import { runtimeOf, type ProviderExpiryContext } from './provider-runtime.js'
+import type { ChannelCredential, ProviderProduct } from './jwt-utils.js'
 
 /**
  * 真实临期探针：**每个渠道折算成一个「最早失效时刻」**。
@@ -183,8 +182,6 @@ import { runtimeOf, type ProviderExpiryContext } from './provider-runtime.js'
  *「有人加了 runtime 注册却忘了加清单」（或反之），**不是**同义反复。
  */
 export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
-  'buddy',
-  'workbuddy',
   'loomy',
   'codearts',
   'zcode',
@@ -297,7 +294,7 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
  *
  * ## 为什么是 60
  *
- * - 与既有的 {@link BUDDY_BALANCE_CACHE_TTL_MS}（余额选号器，`60_000`）**同值** ——
+ * - 与既有的 {@link BALANCE_CACHE_TTL_MS}（余额选号器，`60_000`）**同值** ——
  *   两处节奏一致，不会出现「选号用 30 秒前的数据、排序用 90 秒前的」这种分叉；
  * - 临期判据的最小粒度是**天**（资源包到期以天计）⇒ 60 秒滞后在语义上无害；
  * - 最短 ⇒ 用户改完渠道侧配置后最坏等待最短。90/120 只省极少量请求
@@ -785,10 +782,10 @@ function isAbortError(error: unknown): boolean {
   return (error as { name?: unknown }).name === 'AbortError'
 }
 
-/** buddy 系：有效资源包 `deductionEndTime` 的最小值；无有效包 → NEVER。 */
-export async function buddyExpiry(
-  product: typeof CODEBUDDY,
-  credential: BuddyCredential,
+/** 有效资源包 `deductionEndTime` 的最小值；无有效包 → NEVER。 */
+export async function sharedExpiry(
+  product: ProviderProduct,
+  credential: ChannelCredential,
   /**
    * 共享读数入口（2026-10-15，规格 §5.7 的「buddy 系四家吃同一份读数」）。
    *
@@ -869,8 +866,8 @@ async function fetchBalanceWithCache(
  * 且 buddy / workbuddy 都在 `AUTO_PROVIDERS`（`auto-adapter.ts`）里。
  *
  * ⚠️ 本仓库对「余额为 0」早有明确判据，旧实现与它**矛盾**：
- * `buddy-balance-rank.ts` 的 `buddyBalanceTier` 在余额全为 0 时返回
- * `BUDDY_BALANCE_TIER.none`，而 `buddyTierUsable` 明写
+ * `buddy-balance-rank.ts` 的 `balanceTier` 在余额全为 0 时返回
+ * `BALANCE_TIER.none`，而 `tierUsable` 明写
  * **`none` 档不可用**。选号器判「不可用」、折算层判「可当选」= 同一语义两套判据
  *（AGENTS.md 首条红线）⇒ 现在两侧**同构**。
  *

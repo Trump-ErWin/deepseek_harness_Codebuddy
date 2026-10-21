@@ -34,7 +34,6 @@ import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { runtimeOf } from './provider-runtime.js'
 // ⚠️ 这些类型仍被 `ProbeCredential` 联合使用（探测入参的**形状**仍由本文件约束），
 //    只是**不再**由本文件构造适配器（那是 `index.ts` 的 `probe.createProbeAdapter`）。
-import type { BuddyCredential } from './buddy.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
 import type { ClineCredential } from './cline.js'
@@ -50,6 +49,7 @@ import type {
   RpcRetestResponse,
   RpcTestAccountResponse,
 } from './types.js'
+import type { ChannelCredential, ProviderProduct } from './jwt-utils.js'
 
 /**
  * 探测可能涉及的凭据联合类型。
@@ -59,7 +59,7 @@ import type {
  */
 type ProbeCredential =
   | CodeArtsCredential
-  | BuddyCredential
+  | ChannelCredential
   | LobsteraiCredential
   | QoderCredential
   | ClineCredential

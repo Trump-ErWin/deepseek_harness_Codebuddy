@@ -340,22 +340,22 @@ describe('createUsageBadge：订阅读数', () => {
     expect(result.ok && result.value.subscription).toBeUndefined()
   })
 
-  it('套餐式（buddy）：逐账号折算成套餐行', async () => {
+  it('套餐式（qoder）：逐账号折算成套餐行', async () => {
     const { badge } = harness({
       balances: {
         accounts: [
-          balanceRow('a', balance([pkg('Bonus Pack', 20), pkg('Free Plan Subscription', 300, 500)])),
+          balanceRow('a', balance([pkg('Bonus Pack', 20), pkg('套餐额度', 300, 500)])),
         ],
       },
     })
-    const result = await badge.read('buddy')
+    const result = await badge.read('qoder')
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.value.subscription?.kind).toBe('plan')
     const rows = result.value.subscription?.kind === 'plan' ? result.value.subscription.accounts : []
     // ⚠️ unit 是**归一后**的展示口径（'credit'），不是包上的原值（'credits'）——
     // 否则客户端会把 credit / credits 拆成两组（真实缺陷，2026-10-03）。
-    expect(rows).toEqual([{ accountId: 'a', nickname: 'a', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credit' } }])
+    expect(rows).toEqual([{ accountId: 'a', nickname: 'a', plan: { name: '套餐额度', remaining: 300, total: 500, unit: 'credit' } }])
   })
 
   it('该渠道没有订阅形态时**不带** subscription 字段', async () => {

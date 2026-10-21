@@ -23,7 +23,7 @@
  *
  * | 探针 | 结果 |
  * |---|---|
- * | A.`buddyExpiry` 的 `cached()` 抛 `AbortError` | **被吞成 `-1`（UNUSABLE）** ← 本文件要锁的缺陷 |
+ * | A.`sharedExpiry` 的 `cached()` 抛 `AbortError` | **被吞成 `-1`（UNUSABLE）** ← 本文件要锁的缺陷 |
  * | B.`balanceCache.readOne` 上游抛中止 | **原样上抛**（`src/balance-cache.ts:402`） |
  * | C.真实 buddy 腿 `fetchCreditBalance` | `postJson` 把中止压成 `{ok:false}` ⇒ **该腿不抛中止** |
  *
@@ -35,10 +35,18 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { buddyExpiry } from '../../src/aggregate-expiry.js'
-import { CODEBUDDY } from '../../src/product.js'
+import { sharedExpiry } from '../../src/aggregate-expiry.js'
+import { TEST_PRODUCT } from '../../src/lobsterai-product.js'
 import { UNUSABLE, NEVER } from '../../src/aggregate-core.js'
 import { createExpiryProbe } from '../../src/aggregate-expiry.js'
+
+/** 测试用产品配置替身（只要求 id/endpoint 等通用字段）。 */
+const TEST_PRODUCT = {
+  id: 'testchannel',
+  displayName: '测试渠道',
+  endpoint: 'https://example.invalid',
+}
+
 
 /** 造一个 `name === 'AbortError'` 的错误（与 `isAbortError` 的判据同形）。 */
 function abortError(): Error {
@@ -59,7 +67,7 @@ describe('★ 中止不得被折算成 UNUSABLE（sharedPackageExpiry 的裸 cat
     //    ⇒ 实测报错 `promise resolved "-1" instead of rejecting`。
     //    修复后（`src/aggregate-expiry.ts:861` 的 `isAbortError` 判定）本用例转绿。
     await expect(
-      buddyExpiry(CODEBUDDY, { access_token: 't' } as never, async () => { throw abortError() }),
+      sharedExpiry(TEST_PRODUCT, { access_token: 't' } as never, async () => { throw abortError() }),
       '中止被折算成 UNUSABLE ⇒ 取消一次就让该渠道消失 60 秒（单候选模型直接报「没有候选」）',
     ).rejects.toThrow(/abort/i)
   })
@@ -67,8 +75,8 @@ describe('★ 中止不得被折算成 UNUSABLE（sharedPackageExpiry 的裸 cat
   it('★ 反向对照：普通网络故障**仍**折算成 UNUSABLE（本次只改中止，不改故障语义）', async () => {
     // ⚠️ 没有这条，「凡错误都上抛」的实现也会全绿 —— 而它会推翻
     //    `aggregate-expiry.spec.ts` 已登记的有意取舍（「不能把『不知道』当『可用』」）。
-    const value = await buddyExpiry(
-      CODEBUDDY,
+    const value = await sharedExpiry(
+      TEST_PRODUCT,
       { access_token: 't' } as never,
       async () => { throw new Error('network down') },
     )

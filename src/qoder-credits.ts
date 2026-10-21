@@ -473,7 +473,7 @@ function toPackage(
    * 既不是缺陷也不是本任务的新增能力）。它服务的是 `dedicatedResourcePackages[]`
    * —— 全上游**唯一**带真实逐包到期的字段，仍照旧精确折算。
    *
-   * ⚠️ 「不写」是**保守方向**：`splitBuddyCreditsByExpiry` 对缺
+   * ⚠️ 「不写」是**保守方向**：`splitCreditsByExpiry` 对缺
    * `deductionEndTime` 的包按**永久桶**处理 —— 未知到期假定为长期，
    * 而临期判据宁可漏报也不瞎报（本仓库红线「绝不编造日期」）。
    */
@@ -612,7 +612,7 @@ export interface QoderBalanceOptions {
  * ## 为什么需要这个并列函数（而不是改造上面那个）
  *
  * `fetchQoderCreditBalance` 的契约是「查不到就 `null`」—— 它服务于
- * `BuddyBalanceSelector`（选号/分档，只关心金额）与 `sharedPackageExpiry`
+ * `BalanceSelector`（选号/分档，只关心金额）与 `sharedPackageExpiry`
  * （折算到期，只关心日期）。那两处**不需要**原因，硬塞原因会让 20 多处
  * `balance!.total` 断言全破。
  *

@@ -1,7 +1,7 @@
 /**
  * Qoder 产品配置。
  *
- * ## 为什么不复用 `BuddyProduct` / `LobsteraiProduct`
+ * ## 为什么不复用 `ProviderProduct` / `LobsteraiProduct`
  *
  * Qoder 的协议与现有四个 provider **都不同源**：
  *
@@ -11,7 +11,7 @@
  * | 续期 | refresh_token | refresh_token | refresh_token + 身份字段 | refresh_token + machine_id |
  * | 签名 | HMAC-SHA256 | 无 | 无 | 无（推理） |
  *
- * 且 `BuddyProduct.id` 是字面量联合 `'buddy' | 'workbuddy'`，加值会牵动
+ * 且 `ProviderProduct.id` 是字面量联合 `'buddy' | 'workbuddy'`，加值会牵动
  * `productById` / `registerBuddyLlm` 一串调用点。故这里定义**平行**的
  * `QoderProduct` —— 共用的是架构**模式**（产品差异收敛到单一真相源），
  * 不是那个类型。
@@ -238,7 +238,7 @@ export interface QoderModelPromotion {
 /**
  * Qoder 产品配置。
  *
- * 与 `BuddyProduct` / `LobsteraiProduct` 平行，字段全部为 Qoder 实际需要的。
+ * 与 `ProviderProduct` / `LobsteraiProduct` 平行，字段全部为 Qoder 实际需要的。
  */
 export interface QoderProduct {
   /**

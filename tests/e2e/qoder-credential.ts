@@ -1,7 +1,7 @@
 /**
  * Qoder 探针的凭据读取工具。
  *
- * 复用 `workbuddy-credential.ts` 里已经过实测的 YAML 解析（折行还原、
+ * 复用 `dsh-credential.ts` 里已经过实测的 YAML 解析（折行还原、
  * 引号转义、双引号硬续行的奇偶性判定）—— 那套逻辑处理的是 **DSH 的 YAML
  * writer 行为**，与 provider 无关，重写一遍只会引入新的偏差。
  *
@@ -15,7 +15,7 @@ import {
   CREDENTIALS_PATH,
   extractYamlScalar,
   readCredentialsFile,
-} from './workbuddy-credential.js'
+} from './dsh-credential.js'
 import type { QoderCredential } from '../../src/qoder.js'
 
 /**

@@ -2,7 +2,7 @@
  * Qoder（国际版 `qoder` / 中国版 `qodercn`）的
  * 「永久/长期/临期三档分档 + 锁定永久积分」**接线**回归。
  *
- * ## 为什么单独守这个（而不是复用 `buddy-permanent-lock.spec.ts`）
+ * ## 为什么单独守这个（而不是复用 `balance-rank.spec.ts`）
  *
  * 那份守的是「怎么建选号器」这一层通用约定。Qoder 的形态**不同**，
  * 且差异正好落在**最容易写错的两处**：
@@ -12,7 +12,7 @@
  *    在个人版下发的恒是 `253402214400000`（= `9999-12-31T00:00:00.000Z`）。
  *    ⚠️ 若把它**原样**写进 `deductionEndTime`，前端 `formatPackageExpiry`
  *    会渲染成「9999-12-31（约 2900000 天后）」—— 荒谬文案；而且该包会被
- *    `splitBuddyCreditsByExpiry` 判成「到期还早 ⇒ 长期」，于是**锁定永久积分
+ *    `splitCreditsByExpiry` 判成「到期还早 ⇒ 长期」，于是**锁定永久积分
  *    对它就失效了**（锁了也照烧）。⇒ 判据必须是「**不写**」，让未知到期
  *    落进永久桶（本仓库红线：绝不编造日期）。
  * 2. **两站是两个渠道 id、两个 product、两个域名。**
@@ -26,8 +26,8 @@
  *    `product:` 正确、各自接进 `balance.selector`、`lockedError` 逐站点名、
  *    `reportPickedAccount: true` 两处齐备。
  * 3. **行为层**：把**真实上游报文形状**喂给生产解析器
- *    `fetchQoderCreditBalance`，再用 `splitBuddyCreditsByExpiry` /
- *    `buddyBalanceTier` / 前端 `packageExpiryMs` 验证**用户可见后果**。
+ *    `fetchQoderCreditBalance`，再用 `splitCreditsByExpiry` /
+ *    `balanceTier` / 前端 `packageExpiryMs` 验证**用户可见后果**。
  *
  * ⚠️ **不做**的事：不发真实网络（`fetcher` 全部注入假实现）、不读真实凭据。
  * ⚠️ 国际版 `openapi.qoder.sh` 在本机**网络不可达**（实测 ~10.7s）——
@@ -45,12 +45,12 @@ import {
 } from '../../src/qoder-credits.js'
 import { QODER, QODER_CN } from '../../src/qoder-product.js'
 import {
-  BUDDY_BALANCE_TIER,
-  BUDDY_EXPIRING_WINDOW_DAYS,
-  buddyBalanceTier,
-  buddyTierUsable,
-  splitBuddyCreditsByExpiry,
-} from '../../src/buddy-balance-rank.js'
+  BALANCE_TIER,
+  EXPIRING_WINDOW_DAYS,
+  balanceTier,
+  tierUsable,
+  splitBalanceByExpiry as backendSplit,
+} from '../../src/balance-rank.js'
 import {
   formatPackageExpiry,
   packageExpiryMs,
@@ -67,7 +67,7 @@ const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8').re
  *
  * ⚠️ 接线断言不能因为「注释里提到了某个符号」就通过：本仓库注释大量解释
  * 「为什么不能走某条兜底」，对兜底的**否定**断言必须只看代码（与
- * `buddy-permanent-lock.spec.ts` 同一约定）。
+ * `balance-rank.spec.ts` 同一约定）。
  */
 function codeOnly(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
@@ -126,7 +126,7 @@ const REAL_USAGE = {
  * 同一份真实报文的**非零套餐额度**变体（`userQuota` 有余额）。
  *
  * ⚠️ 为什么需要它：真实报文里 `userQuota.remaining === 0`，而
- * `splitBuddyCreditsByExpiry` 会**跳过 `remaining <= 0` 的包** ⇒ 直接拿真实
+ * `splitCreditsByExpiry` 会**跳过 `remaining <= 0` 的包** ⇒ 直接拿真实
  * 报文测分桶会「全桶都是 0」，断言变成同义反复。故只把**额度数字**改非零，
  * 到期字段逐字不动（哨兵仍是哨兵）—— 这样测的仍是「哨兵包如何分桶」。
  */
@@ -180,10 +180,10 @@ describe('★ Qoder：`permanentLock` / `usesExpiryWindow` 的 registry 契约',
 describe('★ Qoder：`index.ts` 的接线（源码级，守纯文本形态的约定）', () => {
   it('两站各建一个选号器，且各自接到工厂的 balance.selector', () => {
     expect(indexCode).toMatch(
-      /const qoderBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: QODER,/,
+      /const qoderBalanceSelector = new BalanceSelector\(\{\s*\n\s*product: QODER,/,
     )
     expect(indexCode).toMatch(
-      /const qoderCnBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: QODER_CN,/,
+      /const qoderCnBalanceSelector = new BalanceSelector\(\{\s*\n\s*product: QODER_CN,/,
     )
     // 建了不用 = 死代码，锁定仍无执行路径。
     expect(indexCode, '国际版的 balance.selector 必须指向 qoderBalanceSelector')
@@ -199,7 +199,7 @@ describe('★ Qoder：`index.ts` 的接线（源码级，守纯文本形态的�
       ['qoderBalanceSelector', 'QODER', 'QODER_CN'],
       ['qoderCnBalanceSelector', 'QODER_CN', 'QODER'],
     ] as const) {
-      const start = indexCode.indexOf(`const ${name} = new BuddyBalanceSelector({`)
+      const start = indexCode.indexOf(`const ${name} = new BalanceSelector({`)
       expect(start, `index.ts 里找不到 ${name}`).toBeGreaterThan(-1)
       const block = indexCode.slice(start, indexCode.indexOf('})', start))
       expect(block, `${name} 必须用 product: ${product}`).toMatch(
@@ -294,15 +294,15 @@ describe('★ Qoder：`index.ts` 的接线（源码级，守纯文本形态的�
     // `agent.minimax.io` 会按出口 IP 307 到中国站；Qoder 两站各有独立域名
     // 且互不 307 ⇒ 多传一个头反而可能被判签名/设备不符。
     for (const name of ['qoderBalanceSelector', 'qoderCnBalanceSelector']) {
-      const start = indexCode.indexOf(`const ${name} = new BuddyBalanceSelector({`)
+      const start = indexCode.indexOf(`const ${name} = new BalanceSelector({`)
       const block = indexCode.slice(start, indexCode.indexOf('})', start))
       expect(block, `${name} 不得传 minimaxXff`).not.toMatch(/minimaxXff/)
     }
   })
 
-  it('★ 锁定文案本家独有（不与 buddy 系共用）', () => {
-    // buddy 系口径是「服务端资源包 N 天内到期」，Qoder 是「套餐额度 / 个人资源包，
-    // 上游只给聚合标量、逐包到期拿不到」—— 按 buddy 那句去排查会找不到东西。
+  it('★ 锁定文案本家独有（不与其它渠道共用）', () => {
+    // 其它渠道的口径是「服务端资源包 N 天内到期」，Qoder 是「套餐额度 / 个人资源包，
+    // 上游只给聚合标量、逐包到期拿不到」—— 按那句去排查会找不到东西。
     expect(indexCode, 'qoder 必须有独立的 lockedError 文案构造器')
       .toContain('const qoderLockedError =')
     const start = indexCode.indexOf('const qoderLockedError =')
@@ -334,12 +334,12 @@ describe('★ Qoder：`index.ts` 的接线（源码级，守纯文本形态的�
    *
    * ## 缺陷（实测可打穿）
    *
-   * `BuddyBalanceSelector` 有**两条**取数腿：构造参数 `product` 与注入的
+   * `BalanceSelector` 有**两条**取数腿：构造参数 `product` 与注入的
    * `fetchBalance(credential, product)`。上面那些用例只钉前者（`product: QODER,`），
    * 而把闭包写成 `fetchQoderCreditBalance(credential, QODER_CN)`（**写死对方站点**）
    * 后，本文件 **22 条全绿** —— 审计员实测确认。
    *
-   * 而 `BuddyBalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
+   * 而 `BalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
    * ⇒ 闭包里若忽略形参、写死常量，请求就会打到**对方站点**：
    * ```
    * 正常    → fetch 打到 openapi.qoder.sh        ✓
@@ -360,7 +360,7 @@ describe('★ Qoder：`index.ts` 的接线（源码级，守纯文本形态的�
       ['qoderCnBalanceSelector', 'QODER_CN', 'QODER'],
     ] as const
     for (const [name, own, other] of cases) {
-      const start = indexCode.indexOf(`const ${name} = new BuddyBalanceSelector({`)
+      const start = indexCode.indexOf(`const ${name} = new BalanceSelector({`)
       expect(start, `找不到 ${name}`).toBeGreaterThan(-1)
       const block = indexCode.slice(start, indexCode.indexOf('\n  })', start))
       expect(block.length, `${name} 的构造块切成了空——判据会变成同义反复`).toBeGreaterThan(60)
@@ -458,8 +458,8 @@ describe('★★ Qoder：分档行为（驱动生产判据，不是复述实现�
   it('★★ 分桶：哨兵包全进 **permanent** 桶、expiring 为 0', async () => {
     const balance = await balanceOf(usageWithPlanQuota(1000, QODER_PERMANENT_EXPIRY_MS))
     const now = Date.now()
-    const windowMs = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
-    const split = splitBuddyCreditsByExpiry(balance, now, windowMs)
+    const windowMs = EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    const split = backendSplit(balance, now, windowMs)
     expect(split, '应能分桶').toBeDefined()
     expect(split!.expiring, '哨兵包不得落临期桶').toBe(0)
     // 1000（套餐额度）+ 2000（资源包）= 3000，全部进永久桶。
@@ -467,14 +467,14 @@ describe('★★ Qoder：分档行为（驱动生产判据，不是复述实现�
   })
 
   it('★ 前后端**同规则**分桶（漂移会让「面板说有临期、选号说没号」）', async () => {
-    // ⚠️ 后端 `splitBuddyCreditsByExpiry`（选号判据）与前端 `splitCreditsByExpiry`
+    // ⚠️ 后端 `splitCreditsByExpiry`（选号判据）与前端 `splitCreditsByExpiry`
     //    （展示）是两份实现，对同一份 `CreditPackage` 必须同结论。
     const balance = await balanceOf(usageWithPlanQuota(1000, QODER_PERMANENT_EXPIRY_MS))
     const now = Date.now()
-    const windowMs = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
-    const backend = splitBuddyCreditsByExpiry(balance, now, windowMs)!
+    const windowMs = EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    const backend = backendSplit(balance, now, windowMs)!
     const frontend = splitCreditsByExpiry(
-      balance.packages, BUDDY_EXPIRING_WINDOW_DAYS, now,
+      balance.packages, EXPIRING_WINDOW_DAYS, now,
     ) as { expiring: number; permanent: number } | null
     expect(frontend, '前端分桶不应返回 null（窗口合法）').not.toBeNull()
     expect(frontend!.expiring, '前后端临期桶必须一致').toBe(backend.expiring)
@@ -484,21 +484,21 @@ describe('★★ Qoder：分档行为（驱动生产判据，不是复述实现�
   it('★★ 锁定后只剩永久积分 ⇒ 该号不可用（tier = none）', async () => {
     const balance = await balanceOf(usageWithPlanQuota(1000, QODER_PERMANENT_EXPIRY_MS))
     const now = Date.now()
-    const windowMs = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
-    const split = splitBuddyCreditsByExpiry(balance, now, windowMs)!
-    // ⚠️ `buddyBalanceTier` 吃的**不是** `CreditBalance`，而是分桶后的账号摘要
+    const windowMs = EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    const split = backendSplit(balance, now, windowMs)!
+    // ⚠️ `balanceTier` 吃的**不是** `CreditBalance`，而是分桶后的账号摘要
     //    `{ expiringBalance, permanentBalance }` —— 生产链是
-    //    `BuddyBalanceSelector.classify()`。直接传 `balance` 会因字段名对不上
+    //    `BalanceSelector.classify()`。直接传 `balance` 会因字段名对不上
     //    而恒得 `none`。
     const entry = { id: 'a', expiringBalance: split.expiring, permanentBalance: split.permanent }
     // 未锁定：长期额度可用。
-    expect(buddyBalanceTier(entry, { allowPermanent: true, windowMs }))
-      .toBe(BUDDY_BALANCE_TIER.permanent)
+    expect(balanceTier(entry, { allowPermanent: true, windowMs }))
+      .toBe(BALANCE_TIER.permanent)
     // ★ 锁定：只剩长期 ⇒ 明确不可用。这就是「锁定真的会拦」的那一步。
-    const locked = buddyBalanceTier(entry, { allowPermanent: false, windowMs })
+    const locked = balanceTier(entry, { allowPermanent: false, windowMs })
     expect(locked, '锁定后只剩永久积分 ⇒ 必须落 none（否则锁定形同虚设）')
-      .toBe(BUDDY_BALANCE_TIER.none)
-    expect(buddyTierUsable(locked)).toBe(false)
+      .toBe(BALANCE_TIER.none)
+    expect(tierUsable(locked)).toBe(false)
   })
 
   it('⚠️ 本家的临期桶恒为 0（上游不给逐包到期，如实记录代价）', async () => {
@@ -509,8 +509,8 @@ describe('★★ Qoder：分档行为（驱动生产判据，不是复述实现�
     //    本用例锁住这个**已知代价**，防止有人为了「让面板好看」编造一个到期时刻。
     const balance = await balanceOf(REAL_USAGE)
     const now = Date.now()
-    const windowMs = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
-    const split = splitBuddyCreditsByExpiry(balance, now, windowMs)!
+    const windowMs = EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    const split = backendSplit(balance, now, windowMs)!
     expect(split.expiring).toBe(0)
     expect(split.permanent).toBe(2000)
     // 全量包都不得带到期时刻（含 `dedicatedResourcePackages` 缺失这一真实形态）。

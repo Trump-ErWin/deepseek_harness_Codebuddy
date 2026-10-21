@@ -126,8 +126,8 @@ export interface ProviderDescriptor {
   /**
    * 是否按**到期时间分桶**（决定「锁定永久积分」是否回传 `windowDays`）。
    *
-   * ⚠️ 判据是「是否走 `splitBuddyCreditsByExpiry`」，**不是「是不是 buddy」**：
-   * TRAE 与 LobsterAI 走同一套、同样受 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 影响；
+   * ⚠️ 判据是「是否走 `splitCreditsByExpiry`」，**不是「是不是 buddy」**：
+   * TRAE 与 LobsterAI 走同一套、同样受 `DSH_EXPIRING_WINDOW_DAYS` 影响；
    * 而 loomy 是**服务端直接给两个命名池**、没有窗口概念，故不在内。
    */
   readonly usesExpiryWindow?: boolean
@@ -219,31 +219,6 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
-    id: 'buddy',
-    label: 'CodeBuddy (腾讯)',
-    displayName: 'CodeBuddy (腾讯)',
-    logoClass: 'buddy',
-    credits: { balance: true, dailyCheckin: true },
-    creditPackages: true,
-    permanentLock: true,
-    usesExpiryWindow: true,
-    settingsNamespace: 'llm-buddy',
-    channel: true,
-  },
-  {
-    id: 'workbuddy',
-    label: 'WorkBuddy (国际版)',
-    displayName: 'WorkBuddy (国际版)',
-    logoClass: 'workbuddy',
-    // ⚠️ 国际版后端**没有**签到接口（内核里只有 `get-dosage-notify` 用量通知）。
-    credits: { balance: true, dailyCheckin: false },
-    creditPackages: true,
-    permanentLock: true,
-    usesExpiryWindow: true,
-    settingsNamespace: 'llm-workbuddy',
-    channel: true,
-  },
-  {
     id: 'lobsterai',
     label: 'LobsterAI (有道)',
     displayName: 'LobsterAI (有道)',
@@ -286,7 +261,7 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
      *
      * ⇒ 当前账号形态下 `packages[]` 里**没有任何真实的逐包到期时刻**，
      *   `qoder-credits.ts` 的 `toPackage()` 因此**不写** `deductionEndTime`
-     *   ⇒ `splitBuddyCreditsByExpiry` 只得到一个「永久（未知到期）」桶 ⇒
+     *   ⇒ `splitCreditsByExpiry` 只得到一个「永久（未知到期）」桶 ⇒
      *   **临期桶恒为 0**。这**不是缺陷**，是「上游不下发 ⇒ 我们不编造」的如实结果
      *   （本仓库红线）。只有上游真的给了 `dedicatedResourcePackages` 的账号
      *   才会出现临期档。
@@ -559,8 +534,8 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    都必须有一条真的会读锁定表的执行路径」。
     permanentLock: true,
     // ⚠️ 判据是「逐包到期时间是否距今天数 < 窗口」，与 buddy 系**同口径**
-    //    （`splitOfficeAceCreditsByExpiry` 与 `splitBuddyCreditsByExpiry` 逐格同构）；
-    //    窗口复用 `DSH_BUDDY_EXPIRING_WINDOW_DAYS`（默认 15 天），
+    //    （`splitOfficeAceCreditsByExpiry` 与 `splitCreditsByExpiry` 逐格同构）；
+    //    窗口复用 `DSH_EXPIRING_WINDOW_DAYS`（默认 15 天），
     //    与 `credits.permanentLock` RPC 回传给面板的 `windowDays` **同源**
     //    （面板文案与实际筛号必须是同一个数）。
     usesExpiryWindow: true,
@@ -695,7 +670,7 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    聚合折算恒为 `NEVER`（钱包包无 `deductionEndTime`），两处不冲突。
     creditPackages: true,
     // ⚠️ 与 buddy / officeace 同口径（按到期时间分桶，窗口复用
-    //    `DSH_BUDDY_EXPIRING_WINDOW_DAYS`）。**必须登记**：查表分派只认这个
+    //    `DSH_EXPIRING_WINDOW_DAYS`）。**必须登记**：查表分派只认这个
     //    标记回传 `windowDays`，漏登记的症状是「胶囊只有合计、没有三档带色行」
     //    —— 与 officeace 当初（`officeace 必须回传 windowDays`）同一根因。
     // ⚠️ 「每日红 + 刷新倒计时」**不适用于本渠道**：那套语义
@@ -734,7 +709,7 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
      *
      * ⇒ 本家的锁定只作用于「**按余额分档选号**」这一层，不涉及换号冷却
      *   （它本来就没有）。这正是 `balance: { kind: 'buddy' }` 能直接套用的原因：
-     *   分档判据（`splitBuddyCreditsByExpiry`）只读通用的
+     *   分档判据（`splitCreditsByExpiry`）只读通用的
      *   `packages[].{active, remaining, deductionEndTime}`，**与 provider 无关**。
      *
      * ## 四处同改（缺一即静默失效或假开关）

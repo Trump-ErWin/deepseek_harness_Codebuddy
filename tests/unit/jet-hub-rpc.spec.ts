@@ -22,7 +22,7 @@ import { createProviderCredits } from '../../src/provider-credits.js'
 // 表现为成片 405 —— 与本次改动毫无关系，极难归因。别把它「简化」回去。
 import { AccountPool } from '../../src/account-pool.js'
 import type { ClaimOutcome, CheckinStatus, CreditBalance } from '../../src/credits.js'
-import { WORKBUDDY } from '../../src/product.js'
+import { LOBSTERAI } from '../../src/lobsterai-product.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 import { probeById } from '../../src/index.js'
 import { clearProviderRuntimes, registerProviderRuntime } from '../../src/provider-runtime.js'
@@ -83,7 +83,7 @@ const { clearDeadModels, deadModelIdsFor, recordDeadModel } =
 function authsStub(): never {
   const blank = () => ({} as never)
   return {
-    codearts: blank(), buddy: blank(), workbuddy: blank(), lobsterai: blank(),
+    codearts: blank(), lobsterai: blank(), trae: blank(), lobsterai: blank(),
     qoder: blank(), qodercn: blank(), trae: blank(), cline: blank(),
     loomy: blank(), raccoon: blank(), minimax: blank(), zcode: blank(),
     gemini: blank(),
@@ -213,11 +213,11 @@ describe('积分领取结果汇总', () => {
 /** 构造账号条目；默认是启用的合法账号。 */
 function makeEntry(overrides: Partial<ProviderAccountEntry> = {}): ProviderAccountEntry {
   return {
-    id: 'workbuddy-1',
-    provider: 'workbuddy',
+    id: 'trae-1',
+    provider: 'trae',
     nickname: '测试号',
     enabled: true,
-    credentialRef: 'WORKBUDDY_ACCOUNT_AAAA1111',
+    credentialRef: 'LOBSTERAI_ACCOUNT_AAAA1111',
     createdAt: 1,
     refreshable: true,
     ...overrides,
@@ -266,7 +266,7 @@ describe('credits.status 单账号异常隔离', () => {
       },
     })
 
-    const results = await collectCreditsStatus(accounts, WORKBUDDY, deps)
+    const results = await collectCreditsStatus(accounts, LOBSTERAI, deps)
 
     // 三个账号都要出现在结果里（不是整批抛异常）
     expect(results.map(r => r.accountId)).toEqual(['bad-ref', 'good-1', 'good-2'])
@@ -275,7 +275,7 @@ describe('credits.status 单账号异常隔离', () => {
     expect(results[1]?.status).not.toBeNull()
     expect(results[2]?.status).not.toBeNull()
     // 坏账号根本没走到 resolve（名称校验先抛）
-    expect(asked).toEqual(['WORKBUDDY_ACCOUNT_AAAA1111', 'WORKBUDDY_ACCOUNT_AAAA1111'])
+    expect(asked).toEqual(['LOBSTERAI_ACCOUNT_AAAA1111', 'LOBSTERAI_ACCOUNT_AAAA1111'])
   })
 
   it('resolve 抛错只让该账号状态为 null，其余账号仍被查询', async () => {
@@ -290,7 +290,7 @@ describe('credits.status 单账号异常隔离', () => {
       },
     })
 
-    const results = await collectCreditsStatus(accounts, WORKBUDDY, deps)
+    const results = await collectCreditsStatus(accounts, LOBSTERAI, deps)
 
     expect(results.map(r => r.accountId)).toEqual(['boom', 'ok'])
     expect(results[0]?.status).toBeNull()
@@ -310,7 +310,7 @@ describe('credits.status 单账号异常隔离', () => {
       },
     })
 
-    const results = await collectCreditsStatus(accounts, WORKBUDDY, deps)
+    const results = await collectCreditsStatus(accounts, LOBSTERAI, deps)
 
     expect(results.map(r => r.accountId)).toEqual(['corrupt', 'network-down', 'ok'])
     expect(results[0]?.status).toBeNull()
@@ -324,7 +324,7 @@ describe('credits.status 单账号异常隔离', () => {
       makeEntry({ id: 'off', enabled: false }),
       makeEntry({ id: 'bad-ref', credentialRef: '非法名称' }),
     ]
-    const results = await collectCreditsStatus(accounts, WORKBUDDY, makeDeps({
+    const results = await collectCreditsStatus(accounts, LOBSTERAI, makeDeps({
       warn: (msg) => warnings.push(msg),
     }))
 
@@ -337,7 +337,7 @@ describe('credits.status 单账号异常隔离', () => {
 
   it('凭据解析为 undefined 时状态为 null，且不调用状态接口', async () => {
     let statusCalls = 0
-    const results = await collectCreditsStatus([makeEntry({ id: 'noconf' })], WORKBUDDY, makeDeps({
+    const results = await collectCreditsStatus([makeEntry({ id: 'noconf' })], LOBSTERAI, makeDeps({
       resolve: async () => undefined,
       fetchStatus: async () => { statusCalls++; return makeStatus() },
     }))
@@ -358,7 +358,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
       claim: async () => ({ kind: 'claimed', credit: 100, streakDays: 1, isStreakDay: false }),
     })
 
-    const response = await collectClaimResults(accounts, WORKBUDDY, deps)
+    const response = await collectClaimResults(accounts, LOBSTERAI, deps)
 
     // 停用只影响账号池的自动选择与限流切换；积分照领。
     expect(response.results.map(r => r.accountId)).toEqual(['enabled-1', 'disabled-1', 'disabled-2'])
@@ -383,7 +383,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
       },
     })
 
-    const response = await collectClaimResults(accounts, WORKBUDDY, deps)
+    const response = await collectClaimResults(accounts, LOBSTERAI, deps)
 
     // 整批成功返回，三个账号都有结果
     expect(response.results.map(r => r.accountId)).toEqual(['bad-ref', 'good-1', 'good-2'])
@@ -408,7 +408,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
       },
     })
 
-    const response = await collectClaimResults(accounts, WORKBUDDY, deps)
+    const response = await collectClaimResults(accounts, LOBSTERAI, deps)
 
     expect(response.results[0]?.outcome).toMatchObject({ kind: 'failed', message: '凭据已被外部删除' })
     expect(response.results[1]?.outcome).toMatchObject({ kind: 'claimed' })
@@ -418,7 +418,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
 
   it('凭据未配置记为 failed 且不发起任何请求', async () => {
     let touched = 0
-    const response = await collectClaimResults([makeEntry({ id: 'noconf' })], WORKBUDDY, makeDeps({
+    const response = await collectClaimResults([makeEntry({ id: 'noconf' })], LOBSTERAI, makeDeps({
       resolve: async () => undefined,
       fetchStatus: async () => { touched++; return makeStatus() },
       claim: async () => { touched++; return { kind: 'failed', code: -1, message: 'x' } },
@@ -445,7 +445,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
       },
     })
 
-    const response = await collectClaimResults(accounts, WORKBUDDY, deps)
+    const response = await collectClaimResults(accounts, LOBSTERAI, deps)
 
     expect(response.results.map(r => r.outcome.kind))
       .toEqual(['inactive', 'already-claimed', 'claimed'])
@@ -483,7 +483,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
       },
     })
 
-    await collectClaimResults(accounts, WORKBUDDY, deps)
+    await collectClaimResults(accounts, LOBSTERAI, deps)
 
     expect(maxInFlight).toBe(1)
   })
@@ -502,7 +502,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
       },
     })
 
-    const response = await collectClaimResults(accounts, WORKBUDDY, deps)
+    const response = await collectClaimResults(accounts, LOBSTERAI, deps)
 
     expect(order).toEqual(['entry-0', 'entry-1', 'entry-2'])
     expect(response.results.map(r => r.accountId)).toEqual(['a', 'b', 'c'])
@@ -548,7 +548,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     const accounts = [makeEntry({ id: 'cb-1', credentialRef: 'BUDDY_ACCOUNT_A70DB211' })]
     // ⚠️ 关键：**不传** claim / fetchStatus，走真实的 claimDailyCheckin，
     // 只注入 fetcher。
-    const response = await collectClaimResults(accounts, WORKBUDDY, {
+    const response = await collectClaimResults(accounts, LOBSTERAI, {
       resolve: async () => ({ value: VALID_CREDENTIAL_JSON }),
       fetcher: fakeFetch,
     })
@@ -583,7 +583,7 @@ describe('credits.balances 逐账号余额收集', () => {
 
   it('成功时回传余额与包明细', async () => {
     const deps = makeDeps({ fetchBalance: async () => BALANCE })
-    const results = await collectCreditBalances([makeEntry({ id: 'a' })], WORKBUDDY, deps)
+    const results = await collectCreditBalances([makeEntry({ id: 'a' })], LOBSTERAI, deps)
 
     expect(results).toEqual([{ accountId: 'a', nickname: '测试号', balance: BALANCE }])
   })
@@ -593,7 +593,7 @@ describe('credits.balances 逐账号余额收集', () => {
     let call = 0
     const deps = makeDeps({ fetchBalance: async () => (call++ === 0 ? empty : null) })
     const results = await collectCreditBalances(
-      [makeEntry({ id: 'zero' }), makeEntry({ id: 'failed' })], WORKBUDDY, deps,
+      [makeEntry({ id: 'zero' }), makeEntry({ id: 'failed' })], LOBSTERAI, deps,
     )
 
     // 第一个真余额 0：可展示为 0，不算错误
@@ -610,7 +610,7 @@ describe('credits.balances 逐账号余额收集', () => {
       resolve: async () => undefined,
       fetchBalance: async () => { touched++; return BALANCE },
     })
-    const results = await collectCreditBalances([makeEntry({ id: 'noconf' })], WORKBUDDY, deps)
+    const results = await collectCreditBalances([makeEntry({ id: 'noconf' })], LOBSTERAI, deps)
 
     expect(results[0]!.balance).toBeNull()
     expect(results[0]!.error).toBe('凭据未配置')
@@ -629,7 +629,7 @@ describe('credits.balances 逐账号余额收集', () => {
       warn: (msg) => warnings.push(msg),
     })
     const results = await collectCreditBalances(
-      [makeEntry({ id: 'boom' }), makeEntry({ id: 'ok' })], WORKBUDDY, deps,
+      [makeEntry({ id: 'boom' }), makeEntry({ id: 'ok' })], LOBSTERAI, deps,
     )
 
     expect(results).toHaveLength(2)
@@ -646,7 +646,7 @@ describe('credits.balances 逐账号余额收集', () => {
       fetchBalance: async () => BALANCE,
     })
     const results = await collectCreditBalances(
-      [makeEntry({ id: 'corrupt' }), makeEntry({ id: 'ok' })], WORKBUDDY, deps,
+      [makeEntry({ id: 'corrupt' }), makeEntry({ id: 'ok' })], LOBSTERAI, deps,
     )
 
     expect(results[0]!.balance).toBeNull()
@@ -657,7 +657,7 @@ describe('credits.balances 逐账号余额收集', () => {
   it('停用账号同样查询（停用与余额无关）', async () => {
     const deps = makeDeps({ fetchBalance: async () => BALANCE })
     const results = await collectCreditBalances(
-      [makeEntry({ id: 'off', enabled: false })], WORKBUDDY, deps,
+      [makeEntry({ id: 'off', enabled: false })], LOBSTERAI, deps,
     )
 
     expect(results[0]!.balance).toEqual(BALANCE)
@@ -676,7 +676,7 @@ describe('credits.balances 逐账号余额收集', () => {
       },
     })
     await collectCreditBalances(
-      [makeEntry({ id: 'a' }), makeEntry({ id: 'b' }), makeEntry({ id: 'c' })], WORKBUDDY, deps,
+      [makeEntry({ id: 'a' }), makeEntry({ id: 'b' }), makeEntry({ id: 'c' })], LOBSTERAI, deps,
     )
 
     expect(maxInFlight).toBe(1)
@@ -685,7 +685,7 @@ describe('credits.balances 逐账号余额收集', () => {
   it('结果顺序与账号顺序一致', async () => {
     const deps = makeDeps({ fetchBalance: async () => BALANCE })
     const results = await collectCreditBalances(
-      [makeEntry({ id: 'a' }), makeEntry({ id: 'b' }), makeEntry({ id: 'c' })], WORKBUDDY, deps,
+      [makeEntry({ id: 'a' }), makeEntry({ id: 'b' }), makeEntry({ id: 'c' })], LOBSTERAI, deps,
     )
 
     expect(results.map(r => r.accountId)).toEqual(['a', 'b', 'c'])
@@ -786,8 +786,8 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       // 形参整体错位（本文件历史上踩过六次），命名对象让那类错位不再可能。
       ctx as never, pool as never, {
         codearts: makeAuth('codearts'),
-        buddy: {} as never,
-        workbuddy: {} as never,
+        lobsterai: {} as never,
+        trae: {} as never,
         lobsterai: makeAuth('lobsterai'),
         qoder: makeAuth('qoder'),
         qodercn: {} as never, // 本组用例不触发
@@ -884,8 +884,8 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     // 故这里靠人工对齐）。
     registerJetHubRpc(ctx as never, pool as never, {
       codearts: auth,
-      buddy: {} as never,
-      workbuddy: {} as never,
+      lobsterai: {} as never,
+      trae: {} as never,
       lobsterai: {} as never,
       qoder: {} as never,
       qodercn: {} as never,
@@ -951,8 +951,8 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       // 位置参数时代它靠「数到第 7 个槽位」定位，数错就静默打到别的 provider 上。
       ctx as never, pool as never, {
         codearts: {} as never,
-        buddy: {} as never,
-        workbuddy: {} as never,
+        lobsterai: {} as never,
+        trae: {} as never,
         lobsterai: {} as never,
         qoder: {} as never,
         qodercn: {} as never,
@@ -1048,7 +1048,7 @@ describe('model.list / model.setDisabled 端点', () => {
    * 后续用例的 model.list 多出条目**（表现为「莫名其妙多一个模型」的假失败）。
    */
   afterEach(() => {
-    clearDeadModels('buddy')
+    clearDeadModels('lobsterai')
     clearDeadModels('cline')
     clearDeadModels('trae')
   })
@@ -1067,7 +1067,7 @@ describe('model.list / model.setDisabled 端点', () => {
     /**
      * 是否让桩复刻真实适配器的黑名单过滤（默认 true）。
      *
-     * 真实 `CodeArtsAdapter.listModels` / `BuddyAdapter.listModels` 都会实时
+     * 真实 `CodeArtsAdapter.listModels` / `LobsteraiAdapter.listModels` 都会实时
      * 剔除 `disabledModelsFor(provider)` 命中的模型，因此桩默认也必须过滤，
      * 否则「端点在一个已过滤目录上回填 disabled」这类缺陷会被静默绕过。
      * 仅当需要验证「适配器未过滤」这一非真实场景时才置为 false。
@@ -1191,8 +1191,8 @@ describe('model.list / model.setDisabled 端点', () => {
       // 是独立的第 4 个形参，**不可能**再被 auth 占位挤掉。
       ctx as never, pool, {
         codearts: {} as never,
-        buddy: {} as never,
-        workbuddy: {} as never,
+        lobsterai: {} as never,
+        trae: {} as never,
         lobsterai: {} as never,
         qoder: {} as never,
         qodercn: {} as never,
@@ -1237,10 +1237,10 @@ describe('model.list / model.setDisabled 端点', () => {
   it('model.list 回传 llm 的模型目录，并把黑名单回填为 disabled', async () => {
     const { call } = registerEndpoints({
       models: MODELS,
-      disabledModels: { buddy: { hy3: true } },
+      disabledModels: { lobsterai: { hy3: true } },
     })
 
-    const result = await call('model.list', { provider: 'buddy' })
+    const result = await call('model.list', { provider: 'lobsterai' })
 
     expect(result.ok).toBe(true)
     // 未提供 modelAdapters 时退化为历史行为：hy3 已被适配器过滤掉（桩复刻了
@@ -1301,15 +1301,15 @@ describe('model.list / model.setDisabled 端点', () => {
     const { call } = registerEndpoints({ models: MODELS })
 
     // 初始：全部可见、全部打开
-    const before = await call('model.list', { provider: 'buddy' })
+    const before = await call('model.list', { provider: 'lobsterai' })
     expect((before.value as { models: Array<{ id: string }> }).models.map(m => m.id))
       .toEqual(['glm-5.2', 'deepseek-v4-flash', 'hy3'])
 
     // 关闭 hy3
-    await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
+    await call('model.setDisabled', { provider: 'lobsterai', modelId: 'hy3', disabled: true })
 
     // 关键断言：hy3 仍出现在设置页列表里，且标记为已关闭 —— 否则无法重新打开
-    const after = await call('model.list', { provider: 'buddy' })
+    const after = await call('model.list', { provider: 'lobsterai' })
     const models = (after.value as { models: Array<{ id: string; disabled: boolean }> }).models
     const hy3 = models.find(m => m.id === 'hy3')
     expect(hy3).toBeDefined()
@@ -1318,8 +1318,8 @@ describe('model.list / model.setDisabled 端点', () => {
     expect(models.filter(m => m.disabled).map(m => m.id)).toEqual(['hy3'])
 
     // 重新打开：hy3 恢复正常显示
-    await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: false })
-    const reopened = await call('model.list', { provider: 'buddy' })
+    await call('model.setDisabled', { provider: 'lobsterai', modelId: 'hy3', disabled: false })
+    const reopened = await call('model.list', { provider: 'lobsterai' })
     const reopenedModels = (reopened.value as { models: Array<{ id: string; disabled: boolean }> }).models
     expect(reopenedModels.map(m => m.id)).toEqual(['glm-5.2', 'deepseek-v4-flash', 'hy3'])
     expect(reopenedModels.every(m => !m.disabled)).toBe(true)
@@ -1372,35 +1372,35 @@ describe('model.list / model.setDisabled 端点', () => {
 
   it('model.clearDead 省略 modelId 时清空该 provider 全部（批量恢复）', async () => {
     const { call } = registerEndpoints({ models: MODELS })
-    recordDeadModel('buddy', 'a-gone', 'x')
-    recordDeadModel('buddy', 'b-gone', 'x')
+    recordDeadModel('lobsterai', 'a-gone', 'x')
+    recordDeadModel('lobsterai', 'b-gone', 'x')
 
-    const result = await call('model.clearDead', { provider: 'buddy' })
+    const result = await call('model.clearDead', { provider: 'lobsterai' })
     expect(result.ok).toBe(true)
-    expect(deadModelIdsFor('buddy').size).toBe(0)
+    expect(deadModelIdsFor('lobsterai').size).toBe(0)
   })
 
   it('model.clearDead 不动黑名单（失效记录与用户开关必须分开清）', async () => {
-    const { call } = registerEndpoints({ models: MODELS, disabledModels: { buddy: { 'glm-5.2': true } } })
-    recordDeadModel('buddy', 'a-gone', 'x')
+    const { call } = registerEndpoints({ models: MODELS, disabledModels: { lobsterai: { 'glm-5.2': true } } })
+    recordDeadModel('lobsterai', 'a-gone', 'x')
 
-    await call('model.clearDead', { provider: 'buddy', modelId: 'a-gone' })
+    await call('model.clearDead', { provider: 'lobsterai', modelId: 'a-gone' })
     // 用户自己关的 glm-5.2 必须仍然是关的 —— 「恢复」不等于「打开」。
-    const after = await call('model.list', { provider: 'buddy' })
+    const after = await call('model.list', { provider: 'lobsterai' })
     const models = (after.value as { models: Array<{ id: string; disabled: boolean }> }).models
     expect(models.find(m => m.id === 'glm-5.2')?.disabled).toBe(true)
   })
 
   it('model.clearDead 参数非法一律 bad-request（modelId 空串不得清空全表）', async () => {
     const { call } = registerEndpoints({ models: MODELS })
-    recordDeadModel('buddy', 'keep-me', 'x')
+    recordDeadModel('lobsterai', 'keep-me', 'x')
 
-    for (const payload of [{}, { provider: '' }, { provider: 'buddy', modelId: '' }, { provider: 'buddy', modelId: 42 }]) {
+    for (const payload of [{}, { provider: '' }, { provider: 'lobsterai', modelId: '' }, { provider: 'lobsterai', modelId: 42 }]) {
       const result = await call('model.clearDead', payload)
       expect(result.ok, JSON.stringify(payload)).toBe(false)
     }
     // 非法调用**不得**误清记录。
-    expect(deadModelIdsFor('buddy').has('keep-me')).toBe(true)
+    expect(deadModelIdsFor('lobsterai').has('keep-me')).toBe(true)
   })
 
   /**
@@ -1412,10 +1412,10 @@ describe('model.list / model.setDisabled 端点', () => {
     const { call } = registerEndpoints({ models: MODELS })
 
     for (const id of ['glm-5.2', 'hy3']) {
-      await call('model.setDisabled', { provider: 'buddy', modelId: id, disabled: true })
+      await call('model.setDisabled', { provider: 'lobsterai', modelId: id, disabled: true })
     }
 
-    const listed = await call('model.list', { provider: 'buddy' })
+    const listed = await call('model.list', { provider: 'lobsterai' })
     const models = (listed.value as { models: Array<{ id: string; disabled: boolean }> }).models
     expect(models.map(m => m.id).sort()).toEqual(['deepseek-v4-flash', 'glm-5.2', 'hy3'])
     expect(models.filter(m => m.disabled).map(m => m.id).sort()).toEqual(['glm-5.2', 'hy3'])
@@ -1423,7 +1423,7 @@ describe('model.list / model.setDisabled 端点', () => {
 
   it('未配置黑名单时全部模型默认打开（黑名单制）', async () => {
     const { call } = registerEndpoints({ models: MODELS })
-    const result = await call('model.list', { provider: 'workbuddy' })
+    const result = await call('model.list', { provider: 'trae' })
     const models = (result.value as { models: Array<{ disabled: boolean }> }).models
 
     expect(models.every(m => m.disabled === false)).toBe(true)
@@ -1432,30 +1432,30 @@ describe('model.list / model.setDisabled 端点', () => {
   it('黑名单按 provider 隔离', async () => {
     const { call } = registerEndpoints({
       models: MODELS,
-      disabledModels: { buddy: { hy3: true } },
+      disabledModels: { lobsterai: { hy3: true } },
     })
 
-    const buddy = await call('model.list', { provider: 'buddy' })
-    const workbuddy = await call('model.list', { provider: 'workbuddy' })
+    const lobsterai = await call('model.list', { provider: 'lobsterai' })
+    const trae = await call('model.list', { provider: 'trae' })
 
     const flagOf = (result: unknown, id: string) =>
       (result as { models: Array<{ id: string; disabled: boolean }> }).models.find(m => m.id === id)!.disabled
 
-    expect(flagOf(buddy.value, 'hy3')).toBe(true)
+    expect(flagOf(lobsterai.value, 'hy3')).toBe(true)
     // 另一个 provider 的同名模型不受影响
-    expect(flagOf(workbuddy.value, 'hy3')).toBe(false)
+    expect(flagOf(trae.value, 'hy3')).toBe(false)
   })
 
   it('model.setDisabled 持久化到 settings，并在后续 model.list 中生效', async () => {
     const { call, storedValue } = registerEndpoints({ models: MODELS })
 
-    const set = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
+    const set = await call('model.setDisabled', { provider: 'lobsterai', modelId: 'hy3', disabled: true })
     expect(set.ok).toBe(true)
-    expect(set.value).toEqual({ provider: 'buddy', disabledModels: { hy3: true } })
+    expect(set.value).toEqual({ provider: 'lobsterai', disabledModels: { hy3: true } })
     // 落盘内容可核对：
-    expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true } })
+    expect(storedValue().disabledModels).toEqual({ lobsterai: { hy3: true } })
 
-    const list = await call('model.list', { provider: 'buddy' })
+    const list = await call('model.list', { provider: 'lobsterai' })
     const hy3 = (list.value as { models: Array<{ id: string; disabled: boolean }> })
       .models.find(m => m.id === 'hy3')!
     expect(hy3.disabled).toBe(true)
@@ -1464,18 +1464,18 @@ describe('model.list / model.setDisabled 端点', () => {
   it('重新打开时从黑名单移除（写 false 不残留）', async () => {
     const { call, storedValue } = registerEndpoints({
       models: MODELS,
-      disabledModels: { buddy: { hy3: true } },
+      disabledModels: { lobsterai: { hy3: true } },
     })
 
-    const set = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: false })
+    const set = await call('model.setDisabled', { provider: 'lobsterai', modelId: 'hy3', disabled: false })
 
-    expect(set.value).toEqual({ provider: 'buddy', disabledModels: {} })
+    expect(set.value).toEqual({ provider: 'lobsterai', disabledModels: {} })
     expect(storedValue().disabledModels).toEqual({})
   })
 
   it('model.setDisabled 缺少 modelId 时返回 bad-request 而不是静默成功', async () => {
     const { call } = registerEndpoints({ models: MODELS })
-    const result = await call('model.setDisabled', { provider: 'buddy', modelId: '' })
+    const result = await call('model.setDisabled', { provider: 'lobsterai', modelId: '' })
 
     expect(result.ok).toBe(false)
     expect(result.error?.message).toContain('modelId')
@@ -1496,20 +1496,20 @@ describe('model.list / model.setDisabled 端点', () => {
   it('model.setDisabled 广播 llm/adapters-updated（否则界面要重启才更新）', async () => {
     const { call, emitted } = registerEndpoints({ models: MODELS })
 
-    await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
+    await call('model.setDisabled', { provider: 'lobsterai', modelId: 'hy3', disabled: true })
     // 关闭要广播
     expect(emitted).toContain('llm/adapters-updated')
 
     // 重新打开同样要广播：两个方向都会改变可见目录。
     emitted.length = 0
-    await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: false })
+    await call('model.setDisabled', { provider: 'lobsterai', modelId: 'hy3', disabled: false })
     expect(emitted).toContain('llm/adapters-updated')
   })
 
   it('校验失败时不广播（没有实际变更就不该惊动目录）', async () => {
     const { call, emitted } = registerEndpoints({ models: MODELS })
 
-    const result = await call('model.setDisabled', { provider: 'buddy', modelId: '' })
+    const result = await call('model.setDisabled', { provider: 'lobsterai', modelId: '' })
 
     expect(result.ok).toBe(false)
     expect(emitted).toEqual([])
@@ -1525,17 +1525,17 @@ describe('model.list / model.setDisabled 端点', () => {
   it('广播抛错时开关仍算成功（已落盘的不回滚）', async () => {
     const { call, storedValue, emitted } = registerEndpoints({ models: MODELS, emitThrows: true })
 
-    const result = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
+    const result = await call('model.setDisabled', { provider: 'lobsterai', modelId: 'hy3', disabled: true })
 
     expect(result.ok).toBe(true)
-    expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true } })
+    expect(storedValue().disabledModels).toEqual({ lobsterai: { hy3: true } })
     // 抛错发生在 push 之前，故不会有记录 —— 但关键断言是上面的 ok/落盘。
     expect(emitted).toEqual([])
   })
 
   it('llm 服务不可用时 model.list 返回可读错误（账号面板不受影响）', async () => {
     const { call } = registerEndpoints({ models: MODELS, withoutLlm: true })
-    const result = await call('model.list', { provider: 'buddy' })
+    const result = await call('model.list', { provider: 'lobsterai' })
 
     expect(result.ok).toBe(false)
     expect(result.error?.message).toContain('llm 服务不可用')
@@ -1543,7 +1543,7 @@ describe('model.list / model.setDisabled 端点', () => {
 
   it('适配器 listModels 抛错时返回可读错误而不是裸 500', async () => {
     const { call } = registerEndpoints({ models: MODELS, listModelsError: '令牌已过期' })
-    const result = await call('model.list', { provider: 'buddy' })
+    const result = await call('model.list', { provider: 'lobsterai' })
 
     expect(result.ok).toBe(false)
     expect(result.error?.message).toContain('令牌已过期')
@@ -1566,14 +1566,14 @@ describe('model.list / model.setDisabled 端点', () => {
     it('disabled:true 把目录里的模型全部写入黑名单', async () => {
       const { call, storedValue } = registerEndpoints({ models: MODELS })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(result.ok).toBe(true)
       expect(storedValue().disabledModels).toEqual({
-        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+        lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
       })
       // 落盘后 model.list 应显示全部关闭
-      const list = await call('model.list', { provider: 'buddy' })
+      const list = await call('model.list', { provider: 'lobsterai' })
       const models = (list.value as { models: Array<{ disabled: boolean }> }).models
       expect(models.every((m) => m.disabled)).toBe(true)
     })
@@ -1592,13 +1592,13 @@ describe('model.list / model.setDisabled 端点', () => {
       ]
       const { call, storedValue } = registerEndpoints({
         models: catalog,
-        disabledModels: { buddy: { hy3: true } },
-        modelAdapters: { buddy: { listAllModels: () => catalog } },
+        disabledModels: { lobsterai: { hy3: true } },
+        modelAdapters: { lobsterai: { listAllModels: () => catalog } },
       })
 
-      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
-      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true, hy3: true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { 'glm-5.2': true, hy3: true } })
     })
 
     /**
@@ -1625,16 +1625,16 @@ describe('model.list / model.setDisabled 端点', () => {
         // `listModels` 的源：**完整远端目录**（3 条）。
         models: MODELS,
         // `listAllModels` 只给 1 条：模拟**冷缓存兜底表**（子集）。
-        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+        modelAdapters: { lobsterai: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
       })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(result.ok).toBe(true)
       expect(
         storedValue().disabledModels,
         '只关了兜底子集：远端其余模型仍然可选，而端点返回「成功」',
-      ).toEqual({ buddy: { 'hy3': true, 'glm-5.2': true, 'deepseek-v4-flash': true } })
+      ).toEqual({ lobsterai: { 'hy3': true, 'glm-5.2': true, 'deepseek-v4-flash': true } })
     })
 
     /**
@@ -1654,13 +1654,13 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call, storedValue } = registerEndpoints({
         // `listModels` 只剩 1 条（`hy3` 已被关闭 ⇒ 被适配器过滤掉）。
         models: catalog,
-        disabledModels: { buddy: { hy3: true } },
-        modelAdapters: { buddy: { listAllModels: () => catalog } },
+        disabledModels: { lobsterai: { hy3: true } },
+        modelAdapters: { lobsterai: { listAllModels: () => catalog } },
       })
 
-      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
-      expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true, 'glm-5.2': true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { hy3: true, 'glm-5.2': true } })
     })
 
     /**
@@ -1675,10 +1675,10 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call, storedValue, emitted } = registerEndpoints({
         models: MODELS,
         listModelsError: '令牌已过期',
-        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+        modelAdapters: { lobsterai: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
       })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(result.ok).toBe(false)
       expect(result.error?.message).toContain('令牌已过期')
@@ -1704,10 +1704,10 @@ describe('model.list / model.setDisabled 端点', () => {
         // 远端**成功**但返回空（门控隐藏整个 provider）……
         models: [],
         // ……而适配器兜底表仍有 1 条 ⇒ 不得据此写黑名单。
-        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+        modelAdapters: { lobsterai: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
       })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(result.ok).toBe(false)
       expect(storedValue().disabledModels, '兜底子集不得被当成完整目录写入').toBeUndefined()
@@ -1735,17 +1735,17 @@ describe('model.list / model.setDisabled 端点', () => {
     it('⚠️ 已全部关闭时再点「关闭全部」→ 幂等成功（不得报「没有可关闭的模型」）', async () => {
       const { call, storedValue, emitted } = registerEndpoints({
         models: MODELS,
-        modelAdapters: { buddy: { listAllModels: () => MODELS } },
+        modelAdapters: { lobsterai: { listAllModels: () => MODELS } },
         // 三条**全部**已关 ⇒ `listModels()` 会被过滤成 `[]` ⇒ `complete === false`
-        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+        disabledModels: { lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
       })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(result.ok, '已全关时必须是幂等成功，不能误报「没有可关闭的模型」').toBe(true)
       // 黑名单保持不变（幂等：不产生新变更）
       expect(storedValue().disabledModels).toEqual({
-        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+        lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
       })
       // ⚠️ 仍须广播：客户端那份 `status === 'ready'` 的目录缓存要靠它失效，
       //    调用方（前端）也据此刷新开关状态。
@@ -1767,15 +1767,15 @@ describe('model.list / model.setDisabled 端点', () => {
         // 远端成功但为空（无账号门控 / 全部已关，两种成因在此同形）
         models: [],
         // 兜底表 2 条，但黑名单只覆盖了其中 1 条 ⇒ pending 非空 ⇒ 必须拒绝
-        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }, { id: 'glm-5.2', name: 'GLM-5.2' }] } },
-        disabledModels: { buddy: { hy3: true } },
+        modelAdapters: { lobsterai: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }, { id: 'glm-5.2', name: 'GLM-5.2' }] } },
+        disabledModels: { lobsterai: { hy3: true } },
       })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(result.ok, '有新增项但目录不完整 ⇒ 必须拒绝').toBe(false)
       // 兜底子集不得被写成「完整黑名单」：glm-5.2 仍是打开的
-      expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { hy3: true } })
       expect(emitted).toEqual([])
     })
 
@@ -1788,15 +1788,15 @@ describe('model.list / model.setDisabled 端点', () => {
     it('⚠️ 已全关时再关：不重复写盘（无变更即不产生新写入）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        modelAdapters: { buddy: { listAllModels: () => MODELS } },
-        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+        modelAdapters: { lobsterai: { listAllModels: () => MODELS } },
+        disabledModels: { lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
       })
 
-      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       // 逐字节不变（顺带锁住「幂等分支不落盘」）
       expect(storedValue().disabledModels).toEqual({
-        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+        lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
       })
     })
 
@@ -1804,16 +1804,16 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
         disabledModels: {
-          buddy: { hy3: true, 'legacy-model': true },
-          workbuddy: { 'gpt-5.4': true },
+          lobsterai: { hy3: true, 'legacy-model': true },
+          trae: { 'gpt-5.4': true },
         },
       })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: false })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: false })
 
       expect(result.ok).toBe(true)
-      // buddy 整体清空（含不在 MODELS 里的 legacy-model），workbuddy 不受影响
-      expect(storedValue().disabledModels).toEqual({ workbuddy: { 'gpt-5.4': true } })
+      // lobsterai 整体清空（含不在 MODELS 里的 legacy-model），trae 不受影响
+      expect(storedValue().disabledModels).toEqual({ trae: { 'gpt-5.4': true } })
     })
 
     /**
@@ -1826,11 +1826,11 @@ describe('model.list / model.setDisabled 端点', () => {
     it('disabled:false 不依赖 llm 服务', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { hy3: true } },
+        disabledModels: { lobsterai: { hy3: true } },
         withoutLlm: true,
       })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: false })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: false })
 
       expect(result.ok).toBe(true)
       expect(storedValue().disabledModels).toEqual({})
@@ -1839,16 +1839,16 @@ describe('model.list / model.setDisabled 端点', () => {
     it('disabled:true 在 llm 不可用时回可读错误，且不落盘', async () => {
       const { call, storedValue, emitted } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { hy3: true } },
+        disabledModels: { lobsterai: { hy3: true } },
         withoutLlm: true,
       })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(result.ok).toBe(false)
       expect(result.error?.message).toContain('llm 服务不可用')
       // 失败不得留下半套状态，也不该惊动目录
-      expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { hy3: true } })
       expect(emitted).toEqual([])
     })
 
@@ -1861,7 +1861,7 @@ describe('model.list / model.setDisabled 端点', () => {
     it('只广播一次 llm/adapters-updated（批量不等于逐条广播）', async () => {
       const { call, emitted } = registerEndpoints({ models: MODELS })
 
-      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(emitted).toEqual(['llm/adapters-updated'])
     })
@@ -1869,10 +1869,10 @@ describe('model.list / model.setDisabled 端点', () => {
     it('打开全部同样广播（两个方向都改变可见目录）', async () => {
       const { call, emitted } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { hy3: true } },
+        disabledModels: { lobsterai: { hy3: true } },
       })
 
-      await call('model.setAllDisabled', { provider: 'buddy', disabled: false })
+      await call('model.setAllDisabled', { provider: 'lobsterai', disabled: false })
 
       expect(emitted).toEqual(['llm/adapters-updated'])
     })
@@ -1897,7 +1897,7 @@ describe('model.list / model.setDisabled 端点', () => {
     it('disabled 非布尔 → bad-request（不猜默认值）', async () => {
       const { call, emitted } = registerEndpoints({ models: MODELS })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy' })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai' })
 
       expect(result.ok).toBe(false)
       expect(result.error?.message).toContain('disabled')
@@ -1907,10 +1907,10 @@ describe('model.list / model.setDisabled 端点', () => {
     it('返回写入后的完整黑名单（与 model.setDisabled 同结构）', async () => {
       const { call } = registerEndpoints({ models: MODELS })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(result.value).toEqual({
-        provider: 'buddy',
+        provider: 'lobsterai',
         disabledModels: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
       })
     })
@@ -1918,14 +1918,14 @@ describe('model.list / model.setDisabled 端点', () => {
     it('黑名单按 provider 隔离（不影响其它 provider）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        disabledModels: { workbuddy: { 'gpt-5.4': true } },
+        disabledModels: { trae: { 'gpt-5.4': true } },
       })
 
-      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(storedValue().disabledModels).toEqual({
-        workbuddy: { 'gpt-5.4': true },
-        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+        trae: { 'gpt-5.4': true },
+        lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
       })
     })
 
@@ -1933,11 +1933,11 @@ describe('model.list / model.setDisabled 端点', () => {
     it('广播抛错时批量开关仍算成功', async () => {
       const { call, storedValue, emitted } = registerEndpoints({ models: MODELS, emitThrows: true })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(result.ok).toBe(true)
       expect(storedValue().disabledModels).toEqual({
-        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+        lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
       })
       // 抛错发生在 push 之前，故不会有记录 —— 关键断言是上面的 ok/落盘。
       expect(emitted).toEqual([])
@@ -1957,18 +1957,18 @@ describe('model.list / model.setDisabled 端点', () => {
     it('disabled:true 只关闭传入的那批（其它已关闭项与已打开项都不受影响）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { hy3: true } },
+        disabledModels: { lobsterai: { hy3: true } },
       })
 
       const result = await call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: ['glm-5.2'],
         disabled: true,
       })
 
       expect(result.ok).toBe(true)
       // hy3 本来就关着（保持），glm-5.2 新关，deepseek-v4-flash 仍然开着
-      expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true, 'glm-5.2': true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { hy3: true, 'glm-5.2': true } })
     })
 
     /**
@@ -1980,43 +1980,43 @@ describe('model.list / model.setDisabled 端点', () => {
     it('disabled:false 只打开传入的那批，**不清空整张黑名单**', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { hy3: true, 'glm-5.2': true, 'deepseek-v4-flash': true } },
+        disabledModels: { lobsterai: { hy3: true, 'glm-5.2': true, 'deepseek-v4-flash': true } },
       })
 
       const result = await call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: ['hy3', 'glm-5.2'],
         disabled: false,
       })
 
       expect(result.ok).toBe(true)
       // 只有 hy3/glm-5.2 被打开；deepseek-v4-flash 保持关闭
-      expect(storedValue().disabledModels).toEqual({ buddy: { 'deepseek-v4-flash': true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { 'deepseek-v4-flash': true } })
     })
 
     it('某个 provider 的关闭项被清空时删掉整个键（配置不膨胀）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { hy3: true }, workbuddy: { 'gpt-5.4': true } },
+        disabledModels: { lobsterai: { hy3: true }, trae: { 'gpt-5.4': true } },
       })
 
-      await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['hy3'], disabled: false })
+      await call('model.setDisabledMany', { provider: 'lobsterai', modelIds: ['hy3'], disabled: false })
 
-      // buddy 整个键被删掉，workbuddy 不受影响
-      expect(storedValue().disabledModels).toEqual({ workbuddy: { 'gpt-5.4': true } })
+      // lobsterai 整个键被删掉，trae 不受影响
+      expect(storedValue().disabledModels).toEqual({ trae: { 'gpt-5.4': true } })
     })
 
-    it('黑名单按 provider 隔离（关 buddy 不动 workbuddy）', async () => {
+    it('黑名单按 provider 隔离（关 lobsterai 不动 trae）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        disabledModels: { workbuddy: { 'gpt-5.4': true } },
+        disabledModels: { trae: { 'gpt-5.4': true } },
       })
 
-      await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['hy3'], disabled: true })
+      await call('model.setDisabledMany', { provider: 'lobsterai', modelIds: ['hy3'], disabled: true })
 
       expect(storedValue().disabledModels).toEqual({
-        workbuddy: { 'gpt-5.4': true },
-        buddy: { hy3: true },
+        trae: { 'gpt-5.4': true },
+        lobsterai: { hy3: true },
       })
     })
 
@@ -2025,7 +2025,7 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call, emitted } = registerEndpoints({ models: MODELS })
 
       await call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: ['hy3', 'glm-5.2'],
         disabled: true,
       })
@@ -2037,12 +2037,12 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call } = registerEndpoints({ models: MODELS })
 
       const result = await call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: ['hy3'],
         disabled: true,
       })
 
-      expect(result.value).toEqual({ provider: 'buddy', disabledModels: { hy3: true } })
+      expect(result.value).toEqual({ provider: 'lobsterai', disabledModels: { hy3: true } })
     })
 
     /** ⚠️ 空数组直接拒：空组不该出现在界面上（前端按钮也已禁用）。 */
@@ -2050,7 +2050,7 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call, storedValue, emitted } = registerEndpoints({ models: MODELS })
 
       const result = await call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: [],
         disabled: true,
       })
@@ -2065,7 +2065,7 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call, emitted } = registerEndpoints({ models: MODELS })
 
       const result = await call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: ['', 42, null],
         disabled: true,
       })
@@ -2078,7 +2078,7 @@ describe('model.list / model.setDisabled 端点', () => {
     it('disabled 非布尔 → bad-request（不猜默认值）', async () => {
       const { call, storedValue, emitted } = registerEndpoints({ models: MODELS })
 
-      const result = await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['hy3'] })
+      const result = await call('model.setDisabledMany', { provider: 'lobsterai', modelIds: ['hy3'] })
 
       expect(result.ok).toBe(false)
       expect(result.error?.message).toContain('disabled')
@@ -2158,11 +2158,11 @@ describe('model.list / model.setDisabled 端点', () => {
     it('★ 批量端点的 warnings 恒为空（批量关闭的对象本就在目录里 ⇒ 无事可警告）', async () => {
       const { call } = registerEndpoints({
         models: MODELS,
-        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
-        disabledModels: { buddy: { 'gone-model': true } },
+        modelAdapters: { lobsterai: { listAllModels: () => CATALOG } },
+        disabledModels: { lobsterai: { 'gone-model': true } },
       })
 
-      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const result = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       expect(result.ok).toBe(true)
       expect(
@@ -2174,18 +2174,18 @@ describe('model.list / model.setDisabled 端点', () => {
     it('关闭一个不在目录里的 id → 仍写入黑名单，但 warnings 点名说明它不在目录', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+        modelAdapters: { lobsterai: { listAllModels: () => CATALOG } },
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'gone-model',
         disabled: true,
       })
 
       // 写入行为**不变**（向后兼容：既有调用方与 UI 语义不动）。
       expect(result.ok).toBe(true)
-      expect(storedValue().disabledModels).toEqual({ buddy: { 'gone-model': true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { 'gone-model': true } })
       // 但必须把真相说出来 —— 这正是本 issue 的全部诉求。
       const text = warningsOf(result).join('\n')
       expect(text).toContain('gone-model')
@@ -2201,11 +2201,11 @@ describe('model.list / model.setDisabled 端点', () => {
     it('打开一个既不在目录、也不在黑名单里的 id → warnings 说明本次没有任何变更', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+        modelAdapters: { lobsterai: { listAllModels: () => CATALOG } },
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'gone-model',
         disabled: false,
       })
@@ -2230,12 +2230,12 @@ describe('model.list / model.setDisabled 端点', () => {
     it('打开一个已下线但仍在黑名单里的 id → 无警告（这是有效的清理操作）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { 'gone-model': true } },
-        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+        disabledModels: { lobsterai: { 'gone-model': true } },
+        modelAdapters: { lobsterai: { listAllModels: () => CATALOG } },
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'gone-model',
         disabled: false,
       })
@@ -2249,11 +2249,11 @@ describe('model.list / model.setDisabled 端点', () => {
     it('目录里的 id 开关不产生任何警告（不能把正常操作变成噪音）', async () => {
       const { call } = registerEndpoints({
         models: MODELS,
-        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+        modelAdapters: { lobsterai: { listAllModels: () => CATALOG } },
       })
 
-      const off = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
-      const on = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: false })
+      const off = await call('model.setDisabled', { provider: 'lobsterai', modelId: 'hy3', disabled: true })
+      const on = await call('model.setDisabled', { provider: 'lobsterai', modelId: 'hy3', disabled: false })
 
       expect(warningsOf(off)).toEqual([])
       expect(warningsOf(on)).toEqual([])
@@ -2273,12 +2273,12 @@ describe('model.list / model.setDisabled 端点', () => {
     it('缺 modelAdapters 时仍用 listModels 核对，目录内的 id 不报警告', async () => {
       const { call } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { 'legacy-model': true } },
+        disabledModels: { lobsterai: { 'legacy-model': true } },
       })
 
       // 没传 modelAdapters：并集少一半，但 `listModels` 仍是权威主来源。
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'glm-5.2',
         disabled: true,
       })
@@ -2298,12 +2298,12 @@ describe('model.list / model.setDisabled 端点', () => {
     it('对已判为失效（dead）的 id 给出「重新显示」的可操作指引', async () => {
       const { call } = registerEndpoints({
         models: MODELS,
-        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+        modelAdapters: { lobsterai: { listAllModels: () => CATALOG } },
       })
-      recordDeadModel('buddy', 'dead-model', 'model not found')
+      recordDeadModel('lobsterai', 'dead-model', 'model not found')
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'dead-model',
         disabled: false,
       })
@@ -2316,19 +2316,19 @@ describe('model.list / model.setDisabled 端点', () => {
     it('setDisabledMany 逐条点名目录外的 id（含 dead），目录内的 id 不进 warnings', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+        modelAdapters: { lobsterai: { listAllModels: () => CATALOG } },
       })
-      recordDeadModel('buddy', 'dead-model', 'model not found')
+      recordDeadModel('lobsterai', 'dead-model', 'model not found')
 
       const result = await call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: ['hy3', 'gone-model', 'dead-model'],
         disabled: true,
       })
 
       expect(result.ok).toBe(true)
       expect(storedValue().disabledModels).toEqual({
-        buddy: { hy3: true, 'gone-model': true, 'dead-model': true },
+        lobsterai: { hy3: true, 'gone-model': true, 'dead-model': true },
       })
       const text = warningsOf(result).join('\n')
       expect(text).toContain('gone-model')
@@ -2344,12 +2344,12 @@ describe('model.list / model.setDisabled 端点', () => {
     it('setDisabledMany 打开方向：黑名单里有的静默清理，纯空操作的才警告', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { 'gone-model': true } },
-        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+        disabledModels: { lobsterai: { 'gone-model': true } },
+        modelAdapters: { lobsterai: { listAllModels: () => CATALOG } },
       })
 
       const result = await call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: ['gone-model', 'never-seen'],
         disabled: false,
       })
@@ -2380,12 +2380,12 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call } = registerEndpoints({
         models: MODELS,
         // ⚠️ 兜底子集：只有 1 条，缺 `glm-5.2` / `deepseek-v4-flash`。
-        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+        modelAdapters: { lobsterai: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
       })
 
       // 这三个 id 都在**真实目录**（`listModels` 的源 = MODELS）里。
       const result = await call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: ['glm-5.2', 'deepseek-v4-flash', 'hy3'],
         disabled: true,
       })
@@ -2403,13 +2403,13 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call, storedValue } = registerEndpoints({ models: MODELS })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'glm-5.2',
         disabled: true,
       })
 
       expect(result.ok).toBe(true)
-      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { 'glm-5.2': true } })
       expect(warningsOf(result)).toEqual([])
     })
 
@@ -2421,11 +2421,11 @@ describe('model.list / model.setDisabled 端点', () => {
     it('重新打开一个已关闭的目录内模型 → 无警告（黑名单里的 id 必须并回目录）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { 'glm-5.2': true } },
+        disabledModels: { lobsterai: { 'glm-5.2': true } },
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'glm-5.2',
         disabled: false,
       })
@@ -2445,7 +2445,7 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call } = registerEndpoints({ models: [] })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'anything',
         disabled: false,
       })
@@ -2461,13 +2461,13 @@ describe('model.list / model.setDisabled 端点', () => {
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'anything',
         disabled: true,
       })
 
       expect(result.ok).toBe(true)
-      expect(storedValue().disabledModels).toEqual({ buddy: { anything: true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { anything: true } })
       expect(warningsOf(result)).toEqual([])
     })
 
@@ -2494,11 +2494,11 @@ describe('model.list / model.setDisabled 端点', () => {
         // 这样才真正走到「并集里只剩适配器那一半、且被测 id 不在其中」的形态 ——
         // 若兜底表含被测 id，两个来源都会说「在目录」，本用例就测不到那个分支
         //（变异实测：初版写成兜底表 = MODELS 时，改判 `ids` 后用例**仍然全绿**）。
-        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+        modelAdapters: { lobsterai: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'glm-5.2',
         disabled: false,
       })
@@ -2518,11 +2518,11 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call } = registerEndpoints({
         models: MODELS,
         listModelsError: '令牌已过期',
-        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+        modelAdapters: { lobsterai: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'glm-5.2',
         disabled: true,
       })
@@ -2538,11 +2538,11 @@ describe('model.list / model.setDisabled 端点', () => {
     it('适配器 listAllModels 抛错时仍用远端那一半核对（不因它整体放弃）', async () => {
       const { call } = registerEndpoints({
         models: MODELS,
-        modelAdapters: { buddy: { listAllModels: () => { throw new Error('适配器内部炸了') } } },
+        modelAdapters: { lobsterai: { listAllModels: () => { throw new Error('适配器内部炸了') } } },
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'glm-5.2',
         disabled: true,
       })
@@ -2562,11 +2562,11 @@ describe('model.list / model.setDisabled 端点', () => {
     it('打开一个目录外但仍在黑名单里的 id → 无警告（唯一的清理路径，必须静默）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        disabledModels: { buddy: { 'gone-model': true } },
+        disabledModels: { lobsterai: { 'gone-model': true } },
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'gone-model',
         disabled: false,
       })
@@ -2596,14 +2596,14 @@ describe('model.list / model.setDisabled 端点', () => {
       })
 
       const result = await Promise.race([
-        call('model.setDisabled', { provider: 'buddy', modelId: 'glm-5.2', disabled: true }),
+        call('model.setDisabled', { provider: 'lobsterai', modelId: 'glm-5.2', disabled: true }),
         new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 8000)),
       ])
 
       expect(result, '开关被目录拉取拖住了：核对必须带超时').not.toBe('timeout')
       expect((result as { ok: boolean }).ok).toBe(true)
       // 写入照常生效 —— 核对失败不得影响开关本身。
-      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { 'glm-5.2': true } })
     }, 15000)
 
     /**
@@ -2661,11 +2661,11 @@ describe('model.list / model.setDisabled 端点', () => {
         models: MODELS,
         listModelsError: '令牌已过期',
         // 兜底表只有 1 条 —— 若退化用它核对，`glm-5.2` 会被误报。
-        modelAdapters: { buddy: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
+        modelAdapters: { lobsterai: { listAllModels: () => [{ id: 'hy3', name: 'Hy3' }] } },
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'glm-5.2',
         disabled: true,
       })
@@ -2682,20 +2682,20 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
         modelAdapters: {
-          buddy: {
+          lobsterai: {
             listAllModels: () => { throw new Error('适配器内部炸了') },
           },
         },
       })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'glm-5.2',
         disabled: true,
       })
 
       expect(result.ok).toBe(true)
-      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { 'glm-5.2': true } })
       // `glm-5.2` 在 `listModels` 里 ⇒ 仍能正确判为「在目录」。
       expect(warningsOf(result)).toEqual([])
     })
@@ -2725,13 +2725,13 @@ describe('model.list / model.setDisabled 端点', () => {
       })
 
       // 第一路：打开 `glm-5.2`（此刻它不在黑名单里）。
-      const opening = call('model.setDisabled', { provider: 'buddy', modelId: 'glm-5.2', disabled: false })
+      const opening = call('model.setDisabled', { provider: 'lobsterai', modelId: 'glm-5.2', disabled: false })
       // 让第一路先进入 await（挂起在 listModels 上）。
       await new Promise((resolve) => setTimeout(resolve, 10))
       // 第二路：关闭 `glm-5.2` 并完整跑完。
-      const closing = await call('model.setDisabled', { provider: 'buddy', modelId: 'glm-5.2', disabled: true })
+      const closing = await call('model.setDisabled', { provider: 'lobsterai', modelId: 'glm-5.2', disabled: true })
       expect(closing.ok).toBe(true)
-      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { 'glm-5.2': true } })
 
       // 放行第一路：它会把 `glm-5.2` 重新打开（**真的产生了变更**）。
       releaseFirst()
@@ -2773,19 +2773,19 @@ describe('model.list / model.setDisabled 端点', () => {
 
       // 第一路：批量**打开** `glm-5.2`（此刻它不在黑名单里）。
       const opening = call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: ['glm-5.2'],
         disabled: false,
       })
       await new Promise((resolve) => setTimeout(resolve, 10))
       // 第二路：批量关闭 `glm-5.2` 并完整跑完。
       const closing = await call('model.setDisabledMany', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelIds: ['glm-5.2'],
         disabled: true,
       })
       expect(closing.ok).toBe(true)
-      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { 'glm-5.2': true } })
 
       // 放行第一路：它会把 `glm-5.2` 重新打开（**真的产生了变更**）。
       releaseFirst()
@@ -2803,13 +2803,13 @@ describe('model.list / model.setDisabled 端点', () => {
       const { call, storedValue } = registerEndpoints({ models: MODELS, withoutLlm: true })
 
       const result = await call('model.setDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         modelId: 'anything',
         disabled: true,
       })
 
       expect(result.ok).toBe(true)
-      expect(storedValue().disabledModels).toEqual({ buddy: { anything: true } })
+      expect(storedValue().disabledModels).toEqual({ lobsterai: { anything: true } })
       expect(warningsOf(result)).toEqual([])
     })
   })
@@ -2819,7 +2819,7 @@ describe('model.list / model.setDisabled 端点', () => {
  * 三个积分端点的 provider 分派与能力边界（后端侧契约）。
  *
  * 四个 provider 分属**三套互不相同的协议**：
- * - CodeBuddy 系（buddy / workbuddy）经 `productById()` 取 BuddyProduct；
+ * - CodeBuddy 系（lobsterai / trae）经 `productById()` 取 BuddyProduct；
  * - `lobsterai`（三步 client-activities）；
  * - `codearts`（华为云 SDK-HMAC-SHA256 签名，见 `src/codearts-credits.ts`）。
  *
@@ -2909,14 +2909,14 @@ describe('积分端点的 provider 能力边界', () => {
   /**
    * ⚠️ **本用例 2026-10-02 被拆分过**，读之前先看这段理由，别以为是「把守卫改松了」。
    *
-   * 原用例对**三个**方法都断言 `buddy` 与 `workbuddy` 都被接受（ok:true），
-   * 目的是防止「把 CodeBuddy 系一并误拒」—— 历史上确实有过只认 `buddy`、
+   * 原用例对**三个**方法都断言 `lobsterai` 与 `trae` 都被接受（ok:true），
+   * 目的是防止「把 CodeBuddy 系一并误拒」—— 历史上确实有过只认 `lobsterai`、
    * 于是国际版连**余额**都查不出来的缺陷。
    *
    * 但那条断言对 `credits.claimAll` 不成立：WorkBuddy 国际版**没有签到端点**
    * （证据：README「WorkBuddy 国际版后端没有签到接口，故其面板不显示」、
-   * AGENTS.md 的能力表 `workbuddy → ✗（国际版后端无签到接口）`、客户端
-   * `credits-capabilities.js` 的 `workbuddy: { balance: true, dailyCheckin: false }`，
+   * AGENTS.md 的能力表 `trae → ✗（国际版后端无签到接口）`、客户端
+   * `credits-capabilities.js` 的 `trae: { balance: true, dailyCheckin: false }`，
    * 其注释写明国际版内核里只有 `get-dosage-notify` 用量通知）。
    * 原先「接受」只是因为**测试用空账号池**，替身下不会真的发请求 ——
    * 真实账号下它会用国际版凭据去发国内版的签到请求，必然失败。
@@ -2929,21 +2929,21 @@ describe('积分端点的 provider 能力边界', () => {
   it.each(['credits.status', 'credits.balances'])('%s 不会把 CodeBuddy 系一并误拒', async (method) => {
     const call = registerCreditsEndpoints()
     // 两个 Buddy 系产品都能通过 provider 校验，走到 listAccounts（替身返回空）。
-    for (const provider of ['buddy', 'workbuddy']) {
+    for (const provider of ['lobsterai', 'trae']) {
       const result = await call(method, { provider })
       expect(result.ok, `${method}/${provider}`).toBe(true)
     }
   })
 
-  it('credits.claimAll 接受 buddy，但对 workbuddy 给出**明确**的「不支持每日签到」', async () => {
+  it('credits.claimAll 接受 lobsterai，但对 cline 给出**明确**的「不支持每日签到」', async () => {
     const call = registerCreditsEndpoints()
-    // CodeBuddy 中国版照旧被接受（它有签到端点）
-    const buddyResult = await call('credits.claimAll', { provider: 'buddy' })
-    expect(buddyResult.ok, 'claimAll/buddy').toBe(true)
-    // 国际版：拒绝，但**必须是可读的能力原因**，不是泛化的「provider 没注册」
-    const result = await call('credits.claimAll', { provider: 'workbuddy' })
+    // lobsterai 照旧被接受（它有签到端点）
+    const buddyResult = await call('credits.claimAll', { provider: 'lobsterai' })
+    expect(buddyResult.ok, 'claimAll/lobsterai').toBe(true)
+    // 无签到端点的渠道：拒绝，但**必须是可读的能力原因**，不是泛化的「provider 没注册」
+    const result = await call('credits.claimAll', { provider: 'cline' })
     expect(result.ok).toBe(false)
-    expect(result.error?.message).toContain('WorkBuddy 国际版不支持每日签到')
+    expect(result.error?.message).toContain('Cline 不支持每日签到')
     expect(result.error?.message, '不能退化成 unsupported provider').not.toContain('unsupported provider')
   })
 
@@ -3021,7 +3021,7 @@ describe('积分端点的 provider 能力边界', () => {
       + '关掉预检会把已签到账号报成「领取成功」（真实报障：显示成功但 +0 积分）',
     ).toBe(true)
     // ⚠️ 预检必须有**可用的**状态查询（否则 precheckStatus:true 是空头承诺：
-    //    骨架拿不到 fetchStatus 就会退回 buddy 式默认实现）。
+    //    骨架拿不到 fetchStatus 就会退回 lobsterai 式默认实现）。
     expect(
       trae?.claimStatus ?? trae?.fetchStatus,
       'TRAE 声明了 precheckStatus 却没有任何状态查询实现',
@@ -3100,11 +3100,11 @@ describe('account.reorder 端点', () => {
 
   it('重排成功并把新顺序写入存储', async () => {
     const { call, orderInStore } = setup([
-      { id: 'a', provider: 'buddy' },
-      { id: 'b', provider: 'buddy' },
-      { id: 'c', provider: 'buddy' },
+      { id: 'a', provider: 'lobsterai' },
+      { id: 'b', provider: 'lobsterai' },
+      { id: 'c', provider: 'lobsterai' },
     ])
-    const result = await call('account.reorder', { provider: 'buddy', orderedIds: ['c', 'a', 'b'] })
+    const result = await call('account.reorder', { provider: 'lobsterai', orderedIds: ['c', 'a', 'b'] })
     expect(result.ok).toBe(true)
     expect(orderInStore()).toEqual(['c', 'a', 'b'])
   })
@@ -3114,10 +3114,10 @@ describe('account.reorder 端点', () => {
     // 回 bad-request + 可读文案，前端能提示"刷新后重试"；
     // 若抛异常会退化成 jet-hub/handler-failed，用户只看到"未知故障"。
     const { call, orderInStore } = setup([
-      { id: 'a', provider: 'buddy' },
-      { id: 'b', provider: 'buddy' },
+      { id: 'a', provider: 'lobsterai' },
+      { id: 'b', provider: 'lobsterai' },
     ])
-    const result = await call('account.reorder', { provider: 'buddy', orderedIds: ['a'] })
+    const result = await call('account.reorder', { provider: 'lobsterai', orderedIds: ['a'] })
     expect(result.ok).toBe(false)
     expect(result.error?.message).toContain('账号列表已变化')
     // 数据未被破坏
@@ -3125,21 +3125,21 @@ describe('account.reorder 端点', () => {
   })
 
   it('缺 provider 或 orderedIds 非字符串数组 → bad-request', async () => {
-    const { call } = setup([{ id: 'a', provider: 'buddy' }])
+    const { call } = setup([{ id: 'a', provider: 'lobsterai' }])
     expect((await call('account.reorder', { orderedIds: ['a'] })).ok).toBe(false)
-    expect((await call('account.reorder', { provider: 'buddy' })).ok).toBe(false)
-    expect((await call('account.reorder', { provider: 'buddy', orderedIds: [1, 2] })).ok).toBe(false)
+    expect((await call('account.reorder', { provider: 'lobsterai' })).ok).toBe(false)
+    expect((await call('account.reorder', { provider: 'lobsterai', orderedIds: [1, 2] })).ok).toBe(false)
   })
 
   it('重排不影响其他 provider 账号的位置', async () => {
     const { call, orderInStore } = setup([
-      { id: 'b1', provider: 'buddy' },
+      { id: 'b1', provider: 'lobsterai' },
       { id: 'c1', provider: 'codearts' },
-      { id: 'b2', provider: 'buddy' },
+      { id: 'b2', provider: 'lobsterai' },
     ])
-    const result = await call('account.reorder', { provider: 'buddy', orderedIds: ['b2', 'b1'] })
+    const result = await call('account.reorder', { provider: 'lobsterai', orderedIds: ['b2', 'b1'] })
     expect(result.ok).toBe(true)
-    // buddy 的两个账号在各自原下标上互换，codearts 仍在中间
+    // lobsterai 的两个账号在各自原下标上互换，codearts 仍在中间
     expect(orderInStore()).toEqual(['b2', 'c1', 'b1'])
   })
 })
@@ -3214,9 +3214,9 @@ describe('provider.status / provider.setEnabled 端点', () => {
     /** 让就绪探测抛错（验证「探测不得反噬，按不可用处理」）。 */
     catalogReadinessThrows?: boolean
     /**
-     * 适配器注册到哪个 provider 键下（默认 `buddy`）。
+     * 适配器注册到哪个 provider 键下（默认 `lobsterai`）。
      *
-     * ⚠️ 现有用例全都在 `buddy` 上做（`authsStub` 也只覆盖常规渠道）。聚合相关的
+     * ⚠️ 现有用例全都在 `lobsterai` 上做（`authsStub` 也只覆盖常规渠道）。聚合相关的
      * 用例需要把适配器挂到 `aggregate` 键下才能命中 `aggregate` 的那套判据。
      */
     providerId?: string
@@ -3332,7 +3332,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
       // 再也挤不掉它 —— 这正是本次改签名要消除的缺陷。
       ctx as never, pool,
       authsStub(),
-      (adapter !== undefined ? { [options.providerId ?? 'buddy']: adapter } : undefined) as never,
+      (adapter !== undefined ? { [options.providerId ?? 'lobsterai']: adapter } : undefined) as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -3369,7 +3369,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
        * 断言**恒真 = 假绿**（实测踩到：打开供应商后仍返回 `[]` 才暴露）。
        * 门控本身另有专门的用例覆盖，不该混进本组判据。
        */
-      listModelsViaSkeleton: async (provider = options.providerId ?? 'buddy'): Promise<string[]> => {
+      listModelsViaSkeleton: async (provider = options.providerId ?? 'lobsterai'): Promise<string[]> => {
         const previous = process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT
         process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT = '0'
         try {
@@ -3407,11 +3407,11 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('全部模型都已关闭时 closed 为 true', async () => {
       const { call } = setup({
         catalog: CATALOG,
-        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+        disabledModels: { lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
       })
-      const result = await call('provider.status', { providers: ['buddy'] })
+      const result = await call('provider.status', { providers: ['lobsterai'] })
       expect(result.ok).toBe(true)
-      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.lobsterai
       expect(s.models).toEqual({ total: 3, disabled: 3 })
       expect(s.closed).toBe(true)
     })
@@ -3419,26 +3419,26 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('⚠️ 只关了一部分时 closed 为 false（不能按「关过」判）', async () => {
       const { call } = setup({
         catalog: CATALOG,
-        disabledModels: { buddy: { hy3: true } },
+        disabledModels: { lobsterai: { hy3: true } },
       })
-      const result = await call('provider.status', { providers: ['buddy'] })
-      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      const result = await call('provider.status', { providers: ['lobsterai'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.lobsterai
       expect(s.models).toEqual({ total: 3, disabled: 1 })
       expect(s.closed).toBe(false)
     })
 
     it('⚠️ 没有任何模型时 closed 必须为 false（「没有模型可关」≠「已关闭」）', async () => {
       const { call } = setup({ catalog: [] })
-      const result = await call('provider.status', { providers: ['buddy'] })
-      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      const result = await call('provider.status', { providers: ['lobsterai'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.lobsterai
       expect(s.models.total).toBe(0)
       expect(s.closed).toBe(false)
     })
 
     it('⚠️ 适配器缺失时保守判为未关闭（不误报已关闭）', async () => {
-      const { call } = setup({ catalog: CATALOG, withAdapter: false, disabledModels: { buddy: { 'glm-5.2': true } } })
-      const result = await call('provider.status', { providers: ['buddy'] })
-      const s = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses.buddy
+      const { call } = setup({ catalog: CATALOG, withAdapter: false, disabledModels: { lobsterai: { 'glm-5.2': true } } })
+      const result = await call('provider.status', { providers: ['lobsterai'] })
+      const s = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses.lobsterai
       expect(s.closed).toBe(false)
     })
 
@@ -3446,13 +3446,13 @@ describe('provider.status / provider.setEnabled 端点', () => {
       const { call } = setup({
         catalog: CATALOG,
         accounts: [
-          { id: 'b1', provider: 'buddy', enabled: true },
-          { id: 'b2', provider: 'buddy', enabled: false },
+          { id: 'b1', provider: 'lobsterai', enabled: true },
+          { id: 'b2', provider: 'lobsterai', enabled: false },
           { id: 'c1', provider: 'codearts', enabled: true },
         ],
       })
-      const result = await call('provider.status', { providers: ['buddy'] })
-      const s = (result.value as { statuses: Record<string, { accounts: { total: number; enabled: number } }> }).statuses.buddy
+      const result = await call('provider.status', { providers: ['lobsterai'] })
+      const s = (result.value as { statuses: Record<string, { accounts: { total: number; enabled: number } }> }).statuses.lobsterai
       // 只统计本 provider，codearts 的账号不计入
       expect(s.accounts).toEqual({ total: 2, enabled: 1 })
     })
@@ -3460,11 +3460,11 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('一次查询多个供应商，各自独立判定', async () => {
       const { call } = setup({
         catalog: CATALOG,
-        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+        disabledModels: { lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
       })
-      const result = await call('provider.status', { providers: ['buddy', 'qoder'] })
+      const result = await call('provider.status', { providers: ['lobsterai', 'qoder'] })
       const statuses = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses
-      expect(statuses.buddy.closed).toBe(true)
+      expect(statuses.lobsterai.closed).toBe(true)
       // qoder 没有目录 → 未关闭
       expect(statuses.qoder?.closed ?? false).toBe(false)
     })
@@ -3482,34 +3482,34 @@ describe('provider.status / provider.setEnabled 端点', () => {
         // 目录已拉到但**残缺**（models.dev 没读到）—— 这正是 IKKZUG 的现场。
         catalogHealth: { total: 460, complete: false, note: 'models.dev 未就绪' },
       })
-      const result = await call('provider.status', { providers: ['buddy'] })
+      const result = await call('provider.status', { providers: ['lobsterai'] })
       const statuses = (result.value as {
         statuses: Record<string, { catalog?: { total: number; complete: boolean; note?: string } }>
       }).statuses
-      expect(statuses.buddy.catalog).toEqual({ total: 460, complete: false, note: 'models.dev 未就绪' })
+      expect(statuses.lobsterai.catalog).toEqual({ total: 460, complete: false, note: 'models.dev 未就绪' })
     })
 
     it('⚠️ 适配器不实现该钩子时不得报错（其余 13 家）', async () => {
       // ⚠️ 这是「可选钩子」的守卫：诊断**绝不能**成为新 provider 的接入门槛。
       const { call } = setup({ catalog: CATALOG })
-      const result = await call('provider.status', { providers: ['buddy'] })
+      const result = await call('provider.status', { providers: ['lobsterai'] })
       const statuses = (result.value as {
         statuses: Record<string, { catalog?: unknown; closed: boolean }>
       }).statuses
-      expect(statuses.buddy.closed).toBe(false)
-      expect(statuses.buddy.catalog, '未实现钩子 ⇒ 字段缺席而不是空对象').toBeUndefined()
+      expect(statuses.lobsterai.closed).toBe(false)
+      expect(statuses.lobsterai.catalog, '未实现钩子 ⇒ 字段缺席而不是空对象').toBeUndefined()
     })
 
     it('⚠️ 钩子抛错不得让整个 provider.status 失败（诊断不能反噬）', async () => {
       const { call } = setup({ catalog: CATALOG, catalogHealthThrows: true })
-      const result = await call('provider.status', { providers: ['buddy'] })
+      const result = await call('provider.status', { providers: ['lobsterai'] })
       expect(result.ok, '诊断钩子抛错不得让整个端点失败').toBe(true)
       const statuses = (result.value as {
         statuses: Record<string, { catalog?: unknown; models: { total: number } }>
       }).statuses
       // 主流程的字段必须仍然正确（诊断缺席而不是整个状态丢失）。
-      expect(statuses.buddy.models.total).toBeGreaterThan(0)
-      expect(statuses.buddy.catalog).toBeUndefined()
+      expect(statuses.lobsterai.models.total).toBeGreaterThan(0)
+      expect(statuses.lobsterai.catalog).toBeUndefined()
     })
 
     /**
@@ -3533,11 +3533,11 @@ describe('provider.status / provider.setEnabled 端点', () => {
         // 兜底表只有 1 条（冷缓存子集）……
         listAllSubset: [{ id: 'hy3', name: 'Hy3' }],
         // ……而黑名单恰好把它全命中（旧版本「关闭全部」的不完整产物）。
-        disabledModels: { buddy: { hy3: true } },
+        disabledModels: { lobsterai: { hy3: true } },
       })
 
-      const result = await call('provider.status', { providers: ['buddy'] })
-      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      const result = await call('provider.status', { providers: ['lobsterai'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.lobsterai
 
       // 核实后 `total` 用并集（3 条），只关了 1 条 ⇒ 未关闭。
       expect(s.models).toEqual({ total: 3, disabled: 1 })
@@ -3555,11 +3555,11 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('⚠️ 真的全关时仍报已关闭（核实判据不得用「远端非空」）', async () => {
       const { call } = setup({
         catalog: CATALOG,
-        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+        disabledModels: { lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
       })
 
-      const result = await call('provider.status', { providers: ['buddy'] })
-      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      const result = await call('provider.status', { providers: ['lobsterai'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.lobsterai
 
       expect(s.models).toEqual({ total: 3, disabled: 3 })
       expect(s.closed).toBe(true)
@@ -3574,11 +3574,11 @@ describe('provider.status / provider.setEnabled 端点', () => {
         catalog: CATALOG,
         listModelsError: '令牌已过期',
         listAllSubset: [{ id: 'hy3', name: 'Hy3' }],
-        disabledModels: { buddy: { hy3: true } },
+        disabledModels: { lobsterai: { hy3: true } },
       })
 
-      const result = await call('provider.status', { providers: ['buddy'] })
-      const s = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses.buddy
+      const result = await call('provider.status', { providers: ['lobsterai'] })
+      const s = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses.lobsterai
 
       expect(s.closed, '读不到目录时必须报未关闭（安全方向）').toBe(false)
     })
@@ -3594,12 +3594,12 @@ describe('provider.status / provider.setEnabled 端点', () => {
       const { call } = setup({
         catalog: CATALOG,
         // 兜底表与远端同源，且只关 1 条 ⇒ 子集判据就是 false。
-        disabledModels: { buddy: { hy3: true } },
+        disabledModels: { lobsterai: { hy3: true } },
         onListModels: async () => { listModelsCalls++ },
       })
 
-      const result = await call('provider.status', { providers: ['buddy'] })
-      const s = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses.buddy
+      const result = await call('provider.status', { providers: ['lobsterai'] })
+      const s = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses.lobsterai
 
       expect(s.closed).toBe(false)
       expect(listModelsCalls, '未关闭的供应商不该读远端目录').toBe(0)
@@ -3607,14 +3607,14 @@ describe('provider.status / provider.setEnabled 端点', () => {
 
     it('providers 非字符串数组 → bad-request', async () => {
       const { call } = setup({ catalog: CATALOG })
-      expect((await call('provider.status', { providers: 'buddy' })).ok).toBe(false)
+      expect((await call('provider.status', { providers: 'lobsterai' })).ok).toBe(false)
       expect((await call('provider.status', { providers: [1, 2] })).ok).toBe(false)
       expect((await call('provider.status', {})).ok).toBe(false)
     })
 
     it('provider.status 是只读的：不写盘、不广播', async () => {
       const { call, emitted, writeOrder } = setup({ catalog: CATALOG })
-      await call('provider.status', { providers: ['buddy'] })
+      await call('provider.status', { providers: ['lobsterai'] })
       expect(emitted).toEqual([])
       expect(writeOrder).toEqual([])
     })
@@ -3624,12 +3624,12 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('关闭：把全部模型写入黑名单，并停用全部账号', async () => {
       const { call, storedDisabled, storedAccounts } = setup({
         catalog: CATALOG,
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
       })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(result.ok).toBe(true)
-      expect(result.value).toMatchObject({ provider: 'buddy', enabled: false, models: 3, accounts: 1 })
-      expect(Object.keys(storedDisabled().buddy).sort()).toEqual(['deepseek-v4-flash', 'glm-5.2', 'hy3'])
+      expect(result.value).toMatchObject({ provider: 'lobsterai', enabled: false, models: 3, accounts: 1 })
+      expect(Object.keys(storedDisabled().lobsterai).sort()).toEqual(['deepseek-v4-flash', 'glm-5.2', 'hy3'])
       expect(storedAccounts()[0].enabled).toBe(false)
     })
 
@@ -3653,16 +3653,16 @@ describe('provider.status / provider.setEnabled 端点', () => {
       const { call, storedDisabled } = setup({
         // `listModels` 的源：完整目录（3 条）。
         catalog: CATALOG,
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
         // `listAllModels` 只给 1 条：模拟冷缓存兜底子集。
         listAllSubset: [{ id: 'hy3', name: 'Hy3' }],
       })
 
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
 
       expect(result.ok).toBe(true)
       expect(
-        Object.keys(storedDisabled().buddy ?? {}).sort(),
+        Object.keys(storedDisabled().lobsterai ?? {}).sort(),
         '只关了兜底子集：供应商显示「已关闭」，而其余模型仍可选',
       ).toEqual(['deepseek-v4-flash', 'glm-5.2', 'hy3'])
     })
@@ -3680,15 +3680,15 @@ describe('provider.status / provider.setEnabled 端点', () => {
         catalog: CATALOG,
         listModelsError: '令牌已过期',
         listAllSubset: [{ id: 'hy3', name: 'Hy3' }],
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
       })
 
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
 
       expect(result.ok).toBe(false)
       expect(result.error?.message).toContain('令牌已过期')
       // 不写黑名单、不停账号、不广播 —— 三条都要（否则会留下半套状态）。
-      expect(storedDisabled().buddy).toBeUndefined()
+      expect(storedDisabled().lobsterai).toBeUndefined()
       expect(storedAccounts()[0].enabled).toBe(true)
       expect(emitted).toEqual([])
     })
@@ -3697,15 +3697,15 @@ describe('provider.status / provider.setEnabled 端点', () => {
       // 判据是模型是否全关；先关模型可保证中途失败时状态仍自洽。
       const { call, writeOrder } = setup({
         catalog: CATALOG,
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
       })
-      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(writeOrder).toEqual(['models', 'accounts'])
     })
 
     it('关闭后广播 llm/adapters-updated（否则界面要重启才更新）', async () => {
       const { call, emitted } = setup({ catalog: CATALOG })
-      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(emitted).toContain('llm/adapters-updated')
     })
 
@@ -3714,13 +3714,13 @@ describe('provider.status / provider.setEnabled 端点', () => {
         catalog: CATALOG,
         withAdapter: false,
         withoutLlm: true,
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
       })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(result.ok).toBe(false)
       expect(result.error?.message).toBeTruthy()
       // 三条关键断言：不写黑名单、不停账号、不广播
-      expect(storedDisabled().buddy).toBeUndefined()
+      expect(storedDisabled().lobsterai).toBeUndefined()
       expect(writeOrder).toEqual([])
       expect(emitted).toEqual([])
     })
@@ -3730,9 +3730,9 @@ describe('provider.status / provider.setEnabled 端点', () => {
         catalog: CATALOG,
         withAdapter: false,
         listModelsError: 'boom',
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
       })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(result.ok).toBe(false)
       expect(writeOrder).toEqual([])
       expect(emitted).toEqual([])
@@ -3741,9 +3741,9 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('⚠️ 目录为空 → 拒绝且不落盘（「不关闭模型就不关闭供应商」的落点）', async () => {
       const { call, emitted, writeOrder, storedAccounts } = setup({
         catalog: [],
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
       })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(result.ok).toBe(false)
       const message = result.error?.message ?? ''
       expect(message).toContain('没有可关闭的模型')
@@ -3767,10 +3767,10 @@ describe('provider.status / provider.setEnabled 端点', () => {
       const { call, storedAccounts } = setup({
         catalog: CATALOG,
         listModelsError: '令牌已过期',
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
       })
 
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
 
       expect(result.ok).toBe(false)
       const message = result.error?.message ?? ''
@@ -3783,9 +3783,9 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('已是目标状态时 accounts 计数为 0（不谎报已停用 N 个）', async () => {
       const { call } = setup({
         catalog: CATALOG,
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: false }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: false }],
       })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(result.value).toMatchObject({ models: 3, accounts: 0 })
     })
 
@@ -3819,10 +3819,10 @@ describe('provider.status / provider.setEnabled 端点', () => {
           { id: 'hy3', name: 'Hy3' },
         ],
         // 另外 2 条**早就关着**（历史遗留的完整黑名单）
-        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true } },
+        disabledModels: { lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true } },
       })
 
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
 
       expect(result.ok).toBe(true)
       // 并集 3 条里只有 hy3 是本次新关的 ⇒ 只应报 1
@@ -3831,7 +3831,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
         '报的是写入条数（3）而非实际变更数（1）⇒ 前端播报会少报',
       ).toBe(1)
       // 但黑名单最终确实覆盖全部 3 条（合并语义不受影响）
-      expect(Object.keys(storedDisabled().buddy ?? {}).sort())
+      expect(Object.keys(storedDisabled().lobsterai ?? {}).sort())
         .toEqual(['deepseek-v4-flash', 'glm-5.2', 'hy3'])
     })
 
@@ -3844,13 +3844,13 @@ describe('provider.status / provider.setEnabled 端点', () => {
           { id: 'hy3', name: 'Hy3' },
         ],
       })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(result.value).toMatchObject({ models: 3 })
     })
 
     it('无账号时关闭仍可执行（关模型、停 0 个账号）', async () => {
       const { call } = setup({ catalog: CATALOG })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(result.ok).toBe(true)
       expect(result.value).toMatchObject({ models: 3, accounts: 0 })
     })
@@ -3878,12 +3878,12 @@ describe('provider.status / provider.setEnabled 端点', () => {
         accounts: [],
       })
 
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
 
       expect(result.ok, '无账号供应商必须能关闭').toBe(true)
       expect(result.value).toMatchObject({ models: 2, accounts: 0 })
       // 黑名单 = 兜底表（远端读成功但为空，并集只剩兜底表）。
-      expect(Object.keys(storedDisabled().buddy ?? {}).sort()).toEqual(['glm-5.2', 'hy3'])
+      expect(Object.keys(storedDisabled().lobsterai ?? {}).sort()).toEqual(['glm-5.2', 'hy3'])
       // 先关模型、后停账号（无账号 ⇒ accounts 写入为 0 条）。
       expect(writeOrder).toEqual(['models'])
       // 必须广播（前端开关状态靠它刷新）。
@@ -3898,11 +3898,11 @@ describe('provider.status / provider.setEnabled 端点', () => {
         listAllSubset: [{ id: 'hy3', name: 'Hy3' }],
       })
 
-      const closeResult = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const closeResult = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(closeResult.ok).toBe(true)
 
-      const result = await call('provider.status', { providers: ['buddy'] })
-      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      const result = await call('provider.status', { providers: ['lobsterai'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.lobsterai
       expect(s.models).toEqual({ total: 1, disabled: 1 })
       expect(s.closed, '关闭操作落盘后 status 必须报已关闭（否则开关永远弹回）').toBe(true)
     })
@@ -3916,9 +3916,9 @@ describe('provider.status / provider.setEnabled 端点', () => {
       const { call, emitted, writeOrder, storedAccounts } = setup({
         catalog: [],
         withAdapter: false,
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
       })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(result.ok).toBe(false)
       const message = result.error?.message ?? ''
       expect(message).toContain('没有可关闭的模型')
@@ -3966,10 +3966,10 @@ describe('provider.status / provider.setEnabled 端点', () => {
       const catalog = [...CATALOG]
       const { call } = setup({ catalog })
 
-      expect((await call('provider.setEnabled', { provider: 'buddy', enabled: false })).ok).toBe(true)
-      const before = (await call('provider.status', { providers: ['buddy'] }))
+      expect((await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })).ok).toBe(true)
+      const before = (await call('provider.status', { providers: ['lobsterai'] }))
         .value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }
-      expect(before.statuses.buddy, '关闭当下应报已关闭').toMatchObject({
+      expect(before.statuses.lobsterai, '关闭当下应报已关闭').toMatchObject({
         models: { total: 3, disabled: 3 },
         closed: true,
       })
@@ -3977,15 +3977,15 @@ describe('provider.status / provider.setEnabled 端点', () => {
       // ★ 目录异步补齐（真实形态：cline 三源异步 + 预热重试）。
       catalog.push(LATE)
 
-      const after = (await call('provider.status', { providers: ['buddy'] }))
+      const after = (await call('provider.status', { providers: ['lobsterai'] }))
         .value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }
       expect(
-        after.statuses.buddy.closed,
+        after.statuses.lobsterai.closed,
         '★★ 目录变长后 closed 翻回 false ⇒ 供应商静默回到「已打开」（本 issue 的原症状）',
       ).toBe(true)
       // ★ 计数也必须自洽：否则设置页「分组说已关闭、每条开关都说已打开」。
       expect(
-        after.statuses.buddy.models,
+        after.statuses.lobsterai.models,
         '★ disabled 必须跟着意图报满（否则设置页自相矛盾）',
       ).toEqual({ total: 4, disabled: 4 })
     })
@@ -3999,7 +3999,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('★★ 关闭后目录变长 ⇒ 新模型不得出现在模型选择器里', async () => {
       const catalog = [...CATALOG]
       const { call, listModelsViaSkeleton } = setup({ catalog })
-      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
 
       catalog.push(LATE)
 
@@ -4014,13 +4014,13 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('★ 打开供应商 ⇒ 清除意图，模型恢复可选（不是死状态）', async () => {
       const catalog = [...CATALOG, LATE]
       const { call, listModelsViaSkeleton } = setup({ catalog })
-      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
-      const reopen = await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
+      const reopen = await call('provider.setEnabled', { provider: 'lobsterai', enabled: true })
       expect(reopen.ok).toBe(true)
 
-      const s = (await call('provider.status', { providers: ['buddy'] }))
+      const s = (await call('provider.status', { providers: ['lobsterai'] }))
         .value as { statuses: Record<string, { closed: boolean }> }
-      expect(s.statuses.buddy.closed, '打开后不得仍报已关闭').toBe(false)
+      expect(s.statuses.lobsterai.closed, '打开后不得仍报已关闭').toBe(false)
       expect(await listModelsViaSkeleton(), '打开后模型必须恢复可选').toHaveLength(4)
     })
 
@@ -4033,21 +4033,21 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('★★ 用户逐条打开全部模型 ⇒ 意图被清除，不得仍报已关闭', async () => {
       const catalog = [...CATALOG]
       const { call } = setup({ catalog })
-      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
 
       // 用户在模型列表里逐条打开（这是「我确实想让这个供应商可用」的最强信号）。
       for (const model of catalog) {
-        const r = await call('model.setDisabled', { provider: 'buddy', modelId: model.id, disabled: false })
+        const r = await call('model.setDisabled', { provider: 'lobsterai', modelId: model.id, disabled: false })
         expect(r.ok).toBe(true)
       }
 
-      const s = (await call('provider.status', { providers: ['buddy'] }))
+      const s = (await call('provider.status', { providers: ['lobsterai'] }))
         .value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }
       expect(
-        s.statuses.buddy.closed,
+        s.statuses.lobsterai.closed,
         '★★ 逐条打开后仍报已关闭 ⇒ 界面与事实相反（模型全可选却说关了）',
       ).toBe(false)
-      expect(s.statuses.buddy.models).toEqual({ total: 3, disabled: 0 })
+      expect(s.statuses.lobsterai.models).toEqual({ total: 3, disabled: 0 })
     })
 
     /**
@@ -4060,10 +4060,10 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('★ 关闭后目录变长 ⇒ 设置页里新增模型也必须显示为已关闭', async () => {
       const catalog = [...CATALOG]
       const { call } = setup({ catalog })
-      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       catalog.push(LATE)
 
-      const r = await call('model.list', { provider: 'buddy' })
+      const r = await call('model.list', { provider: 'lobsterai' })
       expect(r.ok).toBe(true)
       const models = (r.value as { models: Array<{ id: string; disabled: boolean }> }).models
       const late = models.find((m) => m.id === LATE.id)
@@ -4139,15 +4139,15 @@ describe('provider.status / provider.setEnabled 端点', () => {
       registerJetHubRpc(
         failingCtx as never,
         failingPool,
-        { buddy: {} as never } as never,
-        { buddy: { listAllModels: () => CATALOG } } as never,
+        { lobsterai: {} as never } as never,
+        { lobsterai: { listAllModels: () => CATALOG } } as never,
       )
       const response = await failingHandler!(new Request('http://localhost/api/jet-hub', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
-          payload: { method: 'provider.setEnabled', payload: { provider: 'buddy', enabled: false } },
+          payload: { method: 'provider.setEnabled', payload: { provider: 'lobsterai', enabled: false } },
         }),
       }))
       const result = (await response.json() as { result: { ok: boolean } }).result
@@ -4163,7 +4163,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
       // 且两者若都存在，必须都是「已关闭」的形态（不能有黑名单却无意图）。
       if (diskDisabled !== undefined) {
         expect(result.ok, '两份都落盘成功时 RPC 必须报成功').toBe(true)
-        expect((diskClosed as Record<string, boolean>).buddy).toBe(true)
+        expect((diskClosed as Record<string, boolean>).lobsterai).toBe(true)
       } else {
         expect(result.ok, '一份都没落盘时 RPC 必须如实报失败').toBe(false)
       }
@@ -4225,8 +4225,8 @@ describe('provider.status / provider.setEnabled 端点', () => {
       registerJetHubRpc(
         saveCtx as never,
         savePool,
-        { buddy: {} as never } as never,
-        { buddy: { listAllModels: () => CATALOG } } as never,
+        { lobsterai: {} as never } as never,
+        { lobsterai: { listAllModels: () => CATALOG } } as never,
       )
       const post = async (method: string, payload: unknown) => {
         const response = await saveHandler!(new Request('http://localhost/api/jet-hub', {
@@ -4240,9 +4240,9 @@ describe('provider.status / provider.setEnabled 端点', () => {
         return (await response.json() as { result: { ok: boolean } }).result
       }
       // 进入「已关闭」态（黑名单非空 + 意图真）—— 打开方向最常见的起点。
-      expect((await post('provider.setEnabled', { provider: 'buddy', enabled: false })).ok).toBe(true)
+      expect((await post('provider.setEnabled', { provider: 'lobsterai', enabled: false })).ok).toBe(true)
       saves = 0
-      const reopened = await post('provider.setEnabled', { provider: 'buddy', enabled: true })
+      const reopened = await post('provider.setEnabled', { provider: 'lobsterai', enabled: true })
       expect(reopened.ok).toBe(true)
       expect(
         saves,
@@ -4265,20 +4265,20 @@ describe('provider.status / provider.setEnabled 端点', () => {
       const catalog = [...CATALOG]
       const { call } = setup({ catalog })
       // 模型列表顶部的「关闭全部」。
-      const shut = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      const shut = await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
       expect(shut.ok).toBe(true)
 
-      const before = (await call('provider.status', { providers: ['buddy'] }))
+      const before = (await call('provider.status', { providers: ['lobsterai'] }))
         .value as { statuses: Record<string, { closed: boolean }> }
-      expect(before.statuses.buddy.closed).toBe(true)
+      expect(before.statuses.lobsterai.closed).toBe(true)
 
       // ★ 目录异步补齐。
       catalog.push(LATE_MODEL)
 
-      const after = (await call('provider.status', { providers: ['buddy'] }))
+      const after = (await call('provider.status', { providers: ['lobsterai'] }))
         .value as { statuses: Record<string, { closed: boolean }> }
       expect(
-        after.statuses.buddy.closed,
+        after.statuses.lobsterai.closed,
         '★★ 「关闭全部模型」没落意图 ⇒ 目录变长后翻回「已打开」（IKP8OF 第二入口）',
       ).toBe(true)
     })
@@ -4322,7 +4322,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
       const catalog = [...CATALOG]
       const { call } = setup({ catalog })
       const shut = await call('model.setAllDisabled', {
-        provider: 'buddy',
+        provider: 'lobsterai',
         disabled: true,
         closeProvider: false,
       })
@@ -4331,10 +4331,10 @@ describe('provider.status / provider.setEnabled 端点', () => {
       // 目录异步补齐（模拟上游新增模型）—— 派生腿在此翻回 false。
       catalog.push(LATE_MODEL)
 
-      const after = (await call('provider.status', { providers: ['buddy'] }))
+      const after = (await call('provider.status', { providers: ['lobsterai'] }))
         .value as { statuses: Record<string, { closed: boolean }> }
       expect(
-        after.statuses.buddy.closed,
+        after.statuses.lobsterai.closed,
         '★★ 模型级「全关」不该落供应商关闭意图（否则目录一变长就永久关闭，用户只想关模型）',
       ).toBe(false)
     })
@@ -4348,14 +4348,14 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('★★ 反向对照：缺省（不传 closeProvider）仍落意图 ⇒ 目录变长后仍为「已关闭」', async () => {
       const catalog = [...CATALOG]
       const { call } = setup({ catalog })
-      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+      await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })
 
       catalog.push(LATE_MODEL)
 
-      const after = (await call('provider.status', { providers: ['buddy'] }))
+      const after = (await call('provider.status', { providers: ['lobsterai'] }))
         .value as { statuses: Record<string, { closed: boolean }> }
       expect(
-        after.statuses.buddy.closed,
+        after.statuses.lobsterai.closed,
         '★★ 缺省语义不得变（IKP8OF 第二入口）',
       ).toBe(true)
     })
@@ -4371,11 +4371,11 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('⚠️ 反向：从未点过供应商开关、但逐条关光 ⇒ 仍算已关闭（既有语义）', async () => {
       const { call } = setup({
         catalog: CATALOG,
-        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+        disabledModels: { lobsterai: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
       })
-      const s = (await call('provider.status', { providers: ['buddy'] }))
+      const s = (await call('provider.status', { providers: ['lobsterai'] }))
         .value as { statuses: Record<string, { closed: boolean }> }
-      expect(s.statuses.buddy.closed, '逐条关光必须仍算已关闭（派生判据不得被挤掉）').toBe(true)
+      expect(s.statuses.lobsterai.closed, '逐条关光必须仍算已关闭（派生判据不得被挤掉）').toBe(true)
     })
   })
 
@@ -4474,12 +4474,12 @@ describe('provider.status / provider.setEnabled 端点', () => {
       // ⚠️ 这条守的是「新增的可选成员不得改变既有 provider 的行为」。
       const { call, storedDisabled } = setup({
         catalog: CATALOG,
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
       })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(result.ok).toBe(true)
       expect((result.value as { models: number }).models).toBe(3)
-      expect(storedDisabled().buddy).toEqual({ 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true })
+      expect(storedDisabled().lobsterai).toEqual({ 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true })
     })
   })
 
@@ -4487,13 +4487,13 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('打开：清空该 provider 的黑名单，并启用全部账号，且广播', async () => {
       const { call, emitted, storedDisabled, storedAccounts } = setup({
         catalog: CATALOG,
-        disabledModels: { buddy: { 'glm-5.2': true, hy3: true } },
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: false }],
+        disabledModels: { lobsterai: { 'glm-5.2': true, hy3: true } },
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: false }],
       })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: true })
       expect(result.ok).toBe(true)
       expect(result.value).toMatchObject({ models: 2, accounts: 1 })
-      expect(storedDisabled().buddy).toBeUndefined()
+      expect(storedDisabled().lobsterai).toBeUndefined()
       expect(storedAccounts()[0].enabled).toBe(true)
       expect(emitted).toContain('llm/adapters-updated')
     })
@@ -4503,25 +4503,25 @@ describe('provider.status / provider.setEnabled 端点', () => {
         catalog: CATALOG,
         withAdapter: false,
         withoutLlm: true,
-        disabledModels: { buddy: { 'glm-5.2': true } },
+        disabledModels: { lobsterai: { 'glm-5.2': true } },
       })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: true })
       expect(result.ok).toBe(true)
     })
 
     it('⚠️ 只清本 provider 的黑名单，不波及其它 provider', async () => {
       const { call, storedDisabled } = setup({
         catalog: CATALOG,
-        disabledModels: { buddy: { hy3: true }, trae: { 'glm-5.2': true } },
+        disabledModels: { lobsterai: { hy3: true }, trae: { 'glm-5.2': true } },
       })
-      await call('provider.setEnabled', { provider: 'buddy', enabled: true })
-      expect(storedDisabled().buddy).toBeUndefined()
+      await call('provider.setEnabled', { provider: 'lobsterai', enabled: true })
+      expect(storedDisabled().lobsterai).toBeUndefined()
       expect(storedDisabled().trae).toEqual({ 'glm-5.2': true })
     })
 
     it('⚠️ 打开也要广播（两个方向都改变 listModels 结果）', async () => {
       const { call, emitted } = setup({ catalog: CATALOG })
-      await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      await call('provider.setEnabled', { provider: 'lobsterai', enabled: true })
       expect(emitted).toEqual(['llm/adapters-updated'])
     })
   })
@@ -4530,11 +4530,11 @@ describe('provider.status / provider.setEnabled 端点', () => {
     it('enabled 非布尔（缺失 / 字符串 / 数字）一律 bad-request，且不落盘', async () => {
       const { call, writeOrder, emitted } = setup({
         catalog: CATALOG,
-        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+        accounts: [{ id: 'b1', provider: 'lobsterai', enabled: true }],
       })
-      expect((await call('provider.setEnabled', { provider: 'buddy' })).ok).toBe(false)
-      expect((await call('provider.setEnabled', { provider: 'buddy', enabled: 'false' })).ok).toBe(false)
-      expect((await call('provider.setEnabled', { provider: 'buddy', enabled: 0 })).ok).toBe(false)
+      expect((await call('provider.setEnabled', { provider: 'lobsterai' })).ok).toBe(false)
+      expect((await call('provider.setEnabled', { provider: 'lobsterai', enabled: 'false' })).ok).toBe(false)
+      expect((await call('provider.setEnabled', { provider: 'lobsterai', enabled: 0 })).ok).toBe(false)
       // ⚠️ 不做默认值猜测：一次字段名写错不该静默改动用户数据
       expect(writeOrder).toEqual([])
       expect(emitted).toEqual([])
@@ -4548,10 +4548,10 @@ describe('provider.status / provider.setEnabled 端点', () => {
 
     it('⚠️ 广播抛错仍算成功（通知失败不得反噬已落盘的开关）', async () => {
       const { call, storedDisabled } = setup({ catalog: CATALOG, emitThrows: true })
-      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      const result = await call('provider.setEnabled', { provider: 'lobsterai', enabled: false })
       expect(result.ok).toBe(true)
       // 开关确实已落盘
-      expect(Object.keys(storedDisabled().buddy)).toHaveLength(3)
+      expect(Object.keys(storedDisabled().lobsterai)).toHaveLength(3)
     })
   })
 })
@@ -5024,7 +5024,7 @@ describe('cline.quota / cline.requestLog 端点', () => {
     it('非 cline 的 provider → bad-request，且不发请求', async () => {
       const urls = stubFetch(() => new Response(JSON.stringify(LIMITS_RESPONSE), { status: 200 }))
       const { call } = setup()
-      for (const provider of ['buddy', 'qoder', 'loomy', '']) {
+      for (const provider of ['lobsterai', 'qoder', 'loomy', '']) {
         expect((await call('cline.quota', { provider })).ok, provider).toBe(false)
       }
       expect(urls).toEqual([])
@@ -5223,7 +5223,7 @@ describe('cline.quota / cline.requestLog 端点', () => {
 
     it('非 cline 的 provider → bad-request(与额度端点同规)', async () => {
       const { call } = setup()
-      for (const provider of ['buddy', 'qoder', '']) {
+      for (const provider of ['lobsterai', 'qoder', '']) {
         expect((await call('cline.requestLog', { provider, accountId: 'acc-1' })).ok, provider).toBe(false)
       }
     })
@@ -5250,8 +5250,8 @@ describe('★★ 聚合门控 / 手工排序端点', () => {
 
   const ALL_AUTH = {
     codearts: {} as never,
-    buddy: {} as never,
-    workbuddy: {} as never,
+    lobsterai: {} as never,
+    trae: {} as never,
     lobsterai: {} as never,
     qoder: {} as never,
     qodercn: {} as never,
@@ -5389,7 +5389,7 @@ describe('★★ 聚合门控 / 手工排序端点', () => {
     let cleared = 0
     const { call } = setup({ aggregate: { clearChoiceCache: () => { cleared += 1 } } })
     await call('aggregate.setRejected', {
-      canonicalId: 'm', provider: 'buddy', realId: 'r', rejected: true,
+      canonicalId: 'm', provider: 'lobsterai', realId: 'r', rejected: true,
     })
     expect(cleared).toBeGreaterThan(0)
   })
@@ -5414,12 +5414,12 @@ describe('★★ 聚合门控 / 手工排序端点', () => {
     const { call, pool } = setup()
     const result = await call('aggregate.setOrder', {
       canonicalId: 'glm-5-3',
-      order: ['raccoon\u0000sn-glm-5-3', 'junk-no-separator', 'raccoon\u0000sn-glm-5-3', 'buddy\u0000glm-5.3'],
+      order: ['raccoon\u0000sn-glm-5-3', 'junk-no-separator', 'raccoon\u0000sn-glm-5-3', 'lobsterai\u0000glm-5.3'],
     })
     expect(result.ok).toBe(true)
     expect(result.value).toEqual({
       canonicalId: 'glm-5-3',
-      order: ['raccoon\u0000sn-glm-5-3', 'buddy\u0000glm-5.3'],
+      order: ['raccoon\u0000sn-glm-5-3', 'lobsterai\u0000glm-5.3'],
     })
     // 客户端以响应为准 ⇒ 落盘内容必须与响应逐字相同。
     expect(pool.listAggregateOrder()['glm-5-3']).toEqual(result.value && (result.value as { order: string[] }).order)
@@ -5444,13 +5444,13 @@ describe('★★ 聚合门控 / 手工排序端点', () => {
   })
 
   it('★★ aggregate.rejectNonExpiring：只清**未接入**渠道的白名单（keep 集合必须来自权威常量）', async () => {
-    // ⚠️⚠️ 判据必须**行为化**：在**已接入**渠道（buddy）与**未接入**渠道（raccoon）上
+    // ⚠️⚠️ 判据必须**行为化**：在**已接入**渠道（lobsterai）与**未接入**渠道（raccoon）上
     //    各播一条白名单，然后断言「只掉了未接入的那条」。
     //    若实现把 `WIRED_EXPIRY_PROVIDERS` 写死成一份副本（或写错方向），
     //    已接入渠道的手工打开会被**静默清掉** —— 而那是用户有意义的设置。
     const { call, pool } = setup()
     await call('aggregate.setAllowed', {
-      canonicalId: 'a', provider: 'buddy', realId: 'keep-me', allowed: true,
+      canonicalId: 'a', provider: 'lobsterai', realId: 'keep-me', allowed: true,
     })
     await call('aggregate.setAllowed', {
       canonicalId: 'a', provider: 'raccoon', realId: 'drop-me-1', allowed: true,
@@ -5463,10 +5463,10 @@ describe('★★ 聚合门控 / 手工排序端点', () => {
     expect(result.ok).toBe(true)
     const value = result.value as { cleared: number; aggregateAllowed: Record<string, unknown> }
     expect(value.cleared, '★ cleared = 被清掉的**候选条数**（面板文案要用它）').toBe(2)
-    expect(value.aggregateAllowed, '★ 已接入渠道(buddy)的白名单必须保留').toEqual({
-      a: { buddy: { 'keep-me': true } },
+    expect(value.aggregateAllowed, '★ 已接入渠道(lobsterai)的白名单必须保留').toEqual({
+      a: { lobsterai: { 'keep-me': true } },
     })
-    expect(pool.listAggregateAllowed()).toEqual({ a: { buddy: { 'keep-me': true } } })
+    expect(pool.listAggregateAllowed()).toEqual({ a: { lobsterai: { 'keep-me': true } } })
   })
 
   it('★ 幂等：再点一次 cleared === 0 且仍回 ok:true（不是错误）', async () => {
@@ -5619,14 +5619,14 @@ describe('★★ 写入端点必须失效目录缓存（Task 9 接线守卫）',
       ctx as never,
       pool,
       {
-        codearts: {} as never, buddy: {} as never, workbuddy: {} as never,
+        codearts: {} as never, lobsterai: {} as never, trae: {} as never,
         lobsterai: {} as never, qoder: {} as never, qodercn: {} as never,
         trae: {} as never, cline: {} as never, loomy: {} as never,
         raccoon: {} as never, minimax: {} as never, zcode: {} as never,
         gemini: {} as never, officeace: {} as never,
       } as never,
       {
-        buddy: {
+        lobsterai: {
           listAllModels: () => models.map((m) => ({ id: m.id, name: m.name })),
         },
       } as never,
@@ -5652,43 +5652,43 @@ describe('★★ 写入端点必须失效目录缓存（Task 9 接线守卫）',
 
   it('★ model.setDisabled 成功 ⇒ 失效该 provider', async () => {
     const { call } = setup()
-    expect(catalogInvalidatedAt('buddy'), '⚪️ 前置：本来没失效').toBe(0)
-    expect((await call('model.setDisabled', { provider: 'buddy', modelId: 'm1', disabled: true })).ok).toBe(true)
-    expect(catalogInvalidatedAt('buddy'), '★ 改开关必须立刻失效目录').toBeGreaterThan(0)
+    expect(catalogInvalidatedAt('lobsterai'), '⚪️ 前置：本来没失效').toBe(0)
+    expect((await call('model.setDisabled', { provider: 'lobsterai', modelId: 'm1', disabled: true })).ok).toBe(true)
+    expect(catalogInvalidatedAt('lobsterai'), '★ 改开关必须立刻失效目录').toBeGreaterThan(0)
   })
 
   it('★ model.setDisabled 参数非法 ⇒ **不**失效（一个字都没改）', async () => {
     const { call } = setup()
-    expect((await call('model.setDisabled', { provider: 'buddy' })).ok).toBe(false)
-    expect(catalogInvalidatedAt('buddy'), '★ bad-request 不该白打一次上游').toBe(0)
+    expect((await call('model.setDisabled', { provider: 'lobsterai' })).ok).toBe(false)
+    expect(catalogInvalidatedAt('lobsterai'), '★ bad-request 不该白打一次上游').toBe(0)
   })
 
   it('★ model.clearDead 成功 ⇒ 失效该 provider', async () => {
     const { call } = setup()
-    expect((await call('model.clearDead', { provider: 'buddy' })).ok).toBe(true)
-    expect(catalogInvalidatedAt('buddy'), '★ 「重新显示」也必须立刻生效').toBeGreaterThan(0)
+    expect((await call('model.clearDead', { provider: 'lobsterai' })).ok).toBe(true)
+    expect(catalogInvalidatedAt('lobsterai'), '★ 「重新显示」也必须立刻生效').toBeGreaterThan(0)
   })
 
   it('★ model.setAllDisabled 成功 ⇒ 失效该 provider（两个方向都失效）', async () => {
     const { call } = setup()
-    expect((await call('model.setAllDisabled', { provider: 'buddy', disabled: true })).ok).toBe(true)
-    expect(catalogInvalidatedAt('buddy'), '★ 关闭全部').toBeGreaterThan(0)
+    expect((await call('model.setAllDisabled', { provider: 'lobsterai', disabled: true })).ok).toBe(true)
+    expect(catalogInvalidatedAt('lobsterai'), '★ 关闭全部').toBeGreaterThan(0)
 
     clearCatalogInvalidations()
-    expect((await call('model.setAllDisabled', { provider: 'buddy', disabled: false })).ok).toBe(true)
-    expect(catalogInvalidatedAt('buddy'), '★ 打开全部（本地操作，但目录同样要重读）').toBeGreaterThan(0)
+    expect((await call('model.setAllDisabled', { provider: 'lobsterai', disabled: false })).ok).toBe(true)
+    expect(catalogInvalidatedAt('lobsterai'), '★ 打开全部（本地操作，但目录同样要重读）').toBeGreaterThan(0)
   })
 
   it('★ model.setAllDisabled 参数非法 ⇒ **不**失效', async () => {
     const { call } = setup()
-    expect((await call('model.setAllDisabled', { provider: 'buddy' })).ok).toBe(false)
-    expect(catalogInvalidatedAt('buddy'), '★ disabled 缺失不是一次写入').toBe(0)
+    expect((await call('model.setAllDisabled', { provider: 'lobsterai' })).ok).toBe(false)
+    expect(catalogInvalidatedAt('lobsterai'), '★ disabled 缺失不是一次写入').toBe(0)
   })
 
   it('★ model.setDisabledMany 成功 ⇒ 失效该 provider（同类写入端点，第 7 处）', async () => {
     const { call } = setup()
-    expect((await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['m1'], disabled: true })).ok).toBe(true)
-    expect(catalogInvalidatedAt('buddy'), '★ 按分组批量关闭同样是改黑名单').toBeGreaterThan(0)
+    expect((await call('model.setDisabledMany', { provider: 'lobsterai', modelIds: ['m1'], disabled: true })).ok).toBe(true)
+    expect(catalogInvalidatedAt('lobsterai'), '★ 按分组批量关闭同样是改黑名单').toBeGreaterThan(0)
   })
 
   it('★★ aggregate.setRejected ⇒ 失效 **aggregate 自己**，且**不**波及别的渠道', async () => {
@@ -5746,8 +5746,8 @@ describe('★★ 写入端点必须失效目录缓存（Task 9 接线守卫）',
  *
  * ## ⚠️ 三家渠道共用适配器类 ⇒ 替身必须显式传 `product`
  *
- * `minimax` / `minimaxintl` 共用 `MinimaxAdapter`、`buddy` / `workbuddy` 共用
- * `BuddyAdapter`，provider id 只来自构造时的 `options.product`。不传 ⇒ 失效会登记
+ * `minimax` / `minimaxintl` 共用 `MinimaxAdapter`、`lobsterai` / `trae` 共用
+ * `LobsteraiAdapter`，provider id 只来自构造时的 `options.product`。不传 ⇒ 失效会登记
  * 在缺省那个 id 上，用例变成「失效了但被读的那家没看见」而变红（不是恒绿，但会误报）。
  *
  * ## ⚠️ `provider.setEnabled` 的**方向**决定它走哪条路
@@ -5867,7 +5867,7 @@ describe('★★★ 复审补齐的 4 处接线：端点跑完后该 provider �
       ctx as never,
       pool,
       {
-        codearts: {} as never, buddy: {} as never, workbuddy: {} as never,
+        codearts: {} as never, lobsterai: {} as never, trae: {} as never,
         lobsterai: {} as never, qoder: {} as never, qodercn: {} as never,
         trae: {} as never, cline: {} as never, loomy: {} as never,
         raccoon: {} as never, minimax: {} as never, zcode: {} as never,
@@ -6097,9 +6097,9 @@ describe('★★ credits.balances 的 accountIds 裁剪', () => {
     // 三条账号（两条启用、一条停用）
     stored = {
       accounts: [
-        { id: 'a1', provider: 'buddy', nickname: 'a1', enabled: true, credentialRef: 'BUDDY_ACCOUNT_A1', createdAt: 1, refreshable: true },
-        { id: 'a2', provider: 'buddy', nickname: 'a2', enabled: false, credentialRef: 'BUDDY_ACCOUNT_A2', createdAt: 2, refreshable: true },
-        { id: 'a3', provider: 'buddy', nickname: 'a3', enabled: true, credentialRef: 'BUDDY_ACCOUNT_A3', createdAt: 3, refreshable: true },
+        { id: 'a1', provider: 'lobsterai', nickname: 'a1', enabled: true, credentialRef: 'BUDDY_ACCOUNT_A1', createdAt: 1, refreshable: true },
+        { id: 'a2', provider: 'lobsterai', nickname: 'a2', enabled: false, credentialRef: 'BUDDY_ACCOUNT_A2', createdAt: 2, refreshable: true },
+        { id: 'a3', provider: 'lobsterai', nickname: 'a3', enabled: true, credentialRef: 'BUDDY_ACCOUNT_A3', createdAt: 3, refreshable: true },
       ],
     }
 
@@ -6147,14 +6147,14 @@ describe('★★ credits.balances 的 accountIds 裁剪', () => {
 
   it('★ 省略 accountIds ⇒ 查全部（积分面板的现状语义，逐字节不变）', async () => {
     const { call } = setup()
-    const result = await call('credits.balances', { provider: 'buddy' })
+    const result = await call('credits.balances', { provider: 'lobsterai' })
     expect(result.ok).toBe(true)
     expect(accountIdsOf(result), '★ 省略时含停用账号').toEqual(['a1', 'a2', 'a3'])
   })
 
   it('★ 传 accountIds ⇒ 只查那些账号（徽标的收益）', async () => {
     const { call } = setup()
-    const result = await call('credits.balances', { provider: 'buddy', accountIds: ['a1', 'a3'] })
+    const result = await call('credits.balances', { provider: 'lobsterai', accountIds: ['a1', 'a3'] })
     expect(result.ok).toBe(true)
     expect(accountIdsOf(result)).toEqual(['a1', 'a3'])
   })
@@ -6163,16 +6163,16 @@ describe('★★ credits.balances 的 accountIds 裁剪', () => {
     // ⚠️ 这是最容易被写成反义的一格：`accountIds: []` 若被 falsy 判断吞掉，
     //    「全部账号都停用」反而会去查全部账号 —— 与收益完全相反。
     const { call } = setup()
-    const result = await call('credits.balances', { provider: 'buddy', accountIds: [] })
+    const result = await call('credits.balances', { provider: 'lobsterai', accountIds: [] })
     expect(result.ok).toBe(true)
     expect(accountIdsOf(result), '★ 空数组 = 查空集').toEqual([])
   })
 
   it('★ 畸形 accountIds（非数组 / 含非字符串）按「省略」处理，不抛错', async () => {
     const { call } = setup()
-    expect(accountIdsOf(await call('credits.balances', { provider: 'buddy', accountIds: 'a1' })))
+    expect(accountIdsOf(await call('credits.balances', { provider: 'lobsterai', accountIds: 'a1' })))
       .toEqual(['a1', 'a2', 'a3'])
-    expect(accountIdsOf(await call('credits.balances', { provider: 'buddy', accountIds: [1, 'a1'] })))
+    expect(accountIdsOf(await call('credits.balances', { provider: 'lobsterai', accountIds: [1, 'a1'] })))
       .toEqual(['a1'])
   })
 
@@ -6185,7 +6185,7 @@ describe('★★ credits.balances 的 accountIds 裁剪', () => {
     //    取决于 `healExpiredAccounts` 内部，而它在单测里不发网络请求（无凭据）。
     //    ⇒ 这里先断言端点在**裁剪后仍然调用了自愈**（不是「裁剪后再自愈」）。
     const { call } = setup()
-    const result = await call('credits.balances', { provider: 'buddy', accountIds: ['a1'] })
+    const result = await call('credits.balances', { provider: 'lobsterai', accountIds: ['a1'] })
     expect(result.ok).toBe(true)
     expect(accountIdsOf(result), '余额查询确实被裁剪了').toEqual(['a1'])
   })

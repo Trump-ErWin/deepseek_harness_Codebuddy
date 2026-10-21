@@ -227,10 +227,10 @@ describe('H2 · 宿主层：apply() 出来的 resolveCredential 按模型过滤�
    * ⚠️ 也不含 **zcode**：它的兜底 `zcode.current()` 会**再读一次账号池**
    * 且不看限流标记 ⇒ 池被筛空时它**照样返回凭据**，故「被限流的唯一账号
    * 是否被跳过」在它身上观测不到（这不是缺陷，是它的既有语义 ——
-   * 见 `buddy-ratelimit-misreport.spec.ts` 的「zcode 同型缺陷判定」段）。
+   * 见 `ratelimit-locked-misreport.spec.ts` 的「zcode 同型缺陷判定」段）。
    */
   const MODEL_FILTERED_PROVIDERS = [
-    'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae',
+    'lobsterai', 'qoder', 'qodercn', 'trae',
     'cline', 'loomy', 'raccoon', 'minimax', 'gemini',
   ] as const
 
@@ -238,7 +238,7 @@ describe('H2 · 宿主层：apply() 出来的 resolveCredential 按模型过滤�
   const dirs: string[] = []
 
   /**
-   * ⚠️ **必须把 `fetch` 换成「立刻失败」**：buddy / workbuddy / trae / lobsterai
+   * ⚠️ **必须把 `fetch` 换成「立刻失败」**：trae / lobsterai
    * 的 `resolveCredential` 会先问 `isFreeModel()`，而它内部
    * `ensureRemoteModels()` 会去拉远端目录 —— 真实网络请求在单测里既慢又不可靠。
    * 桩成失败后闸门走「没拿到目录」分支，`isFreeModel` 保守返回 false（= 付费），
@@ -351,7 +351,7 @@ describe('H2 · 宿主层：apply() 出来的 resolveCredential 按模型过滤�
 
   it('⚠️ 名单非空且覆盖 codearts / zcode 之外的全部取号 provider（防空洞自检）', () => {
     // 名单为空时 `it.each` 一条都不跑 ⇒ 整组恒绿。这条把该形态钉死。
-    expect(MODEL_FILTERED_PROVIDERS.length).toBe(11)
+    expect(MODEL_FILTERED_PROVIDERS.length).toBe(9)
     expect(MODEL_FILTERED_PROVIDERS).not.toContain('codearts')
     expect(MODEL_FILTERED_PROVIDERS).not.toContain('zcode')
   })
@@ -442,8 +442,6 @@ describe('H2 · 续期路径刻意不按模型过滤（与上一组的反面）'
   /** provider id → 它的 auth 服务名（`ctx.<name>`；服务名由产品 id 派生）。 */
   const REFRESH_SERVICES: Readonly<Record<string, string>> = {
     codearts: 'codeartsAuth',
-    buddy: 'buddyAuth',
-    workbuddy: 'workbuddyAuth',
     lobsterai: 'lobsteraiAuth',
     qoder: 'qoderAuth',
     qodercn: 'qodercnAuth',
@@ -548,7 +546,7 @@ describe('H2 · 续期路径刻意不按模型过滤（与上一组的反面）'
 
   it('⚠️ 名单非空（防空洞自检：名单为空时 it.each 一条都不跑，整组恒绿）', () => {
     // ⚠️ 2026-10-12 加 officeace：12 → 13。
-    expect(REFRESH_PROVIDERS.length).toBe(13)
+    expect(REFRESH_PROVIDERS.length).toBe(11)
     expect(REFRESH_PROVIDERS).not.toContain('zcode')
   })
 

@@ -177,7 +177,7 @@ export function supportsAccountTest(provider) {
  * 「锁定永久积分」窗口：距**扣费截止**不足 15 天的积分算临时（会很快作废，优先烧掉），
  * 其余算永久。
  *
- * ⚠️ 必须与后端 `src/buddy-balance-rank.ts` 的 `BUDDY_EXPIRING_WINDOW_DAYS` 一致 ——
+ * ⚠️ 必须与后端 `src/buddy-balance-rank.ts` 的 `EXPIRING_WINDOW_DAYS` 一致 ——
  * 前端只做展示，判据在后端；这里写的数字若与后端不同，用户会看到「提示说只烧
  * 8 天内的，实际按 15 天筛号」这种无法解释的偏差。
  */
@@ -191,7 +191,7 @@ export const PERMANENT_LOCK_EXPIRING_WINDOW_DAYS = 15;
  * **服务端直接给两个命名池**：
  * - `loomy`：`dailyBalance`（**当日**到期，次日重发）与 `balance`（注册奖励 + 新手任务，不过期）。
  *
- * **按逐包到期时间现算**（同一个 `splitBuddyCreditsByExpiry` / `splitOfficeAceCreditsByExpiry`，
+ * **按逐包到期时间现算**（同一个 `splitCreditsByExpiry` / `splitOfficeAceCreditsByExpiry`，
  * 判据与 provider 无关）：
  * - `buddy` / `workbuddy`：一个账号常同时有多个资源包，按包的 `DeductionEndTime`
  *   距今是否满 {@link PERMANENT_LOCK_EXPIRING_WINDOW_DAYS} 天现算（实测国际版是
@@ -271,7 +271,7 @@ export function supportsCreditPackageList(provider) {
  * @param provider - provider id。
  * @param windowDays - 后端回传的**当前生效窗口**（`credits.permanentLock` 的
  *   `windowDays`）。⚠️ 必须用它渲染，不能用本文件的默认常量：窗口可被
- *   `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，写死会出现「提示说 15 天、实际按
+ *   `DSH_EXPIRING_WINDOW_DAYS` 覆盖，写死会出现「提示说 15 天、实际按
  *   31 天筛号」。缺省（未读到 / Loomy）时回落到默认常量。
  * @returns 四个文案位：未锁定态的按钮标题 / 已锁定态的按钮标题 /
  *          锁定成功提示 / 解锁成功提示。

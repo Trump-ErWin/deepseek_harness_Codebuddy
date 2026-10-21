@@ -61,7 +61,7 @@ import { expectedProviderIdsWithAuth } from './provider-sets.js'
  *（`aggregate` 由 `channel: false` 自然排除）。
  */
 export const REFRESH_PROVIDERS = [
-  'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn',
+  'codearts', 'lobsterai', 'qoder', 'qodercn',
   'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini',
   // officeace（2026-10-12）：华为云 OAuth 单账号，`refreshAccountCredential`
   // 重读并续期那一份凭据（见 `officeace-auth.ts` 的该函数注释）。

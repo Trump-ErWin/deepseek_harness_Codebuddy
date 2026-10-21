@@ -1290,8 +1290,6 @@ export class AggregateAdapter extends LlmAdapter {
    */
   private static readonly AGGREGATE_CHANNELS: readonly string[] = Object.freeze([
     'codearts',
-    'buddy',
-    'workbuddy',
     'lobsterai',
     'qoder',
     'qodercn',

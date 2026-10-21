@@ -25,17 +25,16 @@ function codeOnly(source: string): string {
 const indexSource = codeOnly(read('src/index.ts'))
 const rpcSource = codeOnly(read('src/jet-hub-rpc.ts'))
 
-/** 十个 auth 文件（`buddy-auth.ts` 一份实现同时服务 buddy 与 workbuddy）。 */
+/** auth 文件清单（每个 provider 一份实现）。 */
 const AUTH_FILES = [
   'src/service.ts',
-  'src/buddy-auth.ts',
   'src/lobsterai-auth.ts',
   'src/qoder-auth.ts',
   'src/trae-auth.ts',
   'src/cline-auth.ts',
   'src/loomy-auth.ts',
   'src/raccoon-auth.ts',
-  // ⚠️ MiniMax 是第 9 个 auth 文件（buddy-auth 一份服务两个 provider）。
+  // ⚠️ MiniMax 是第 8 个 auth 文件。
   // 加它之前本清单**漏了 minimax** —— 于是「续期必须带 pool/accountId 且调
   // `syncAccountExpiry`」这条契约对 minimax **不被强制**（Spec 盲区）。
   // 该契约正是「续期成功但界面没反应」那个缺陷的回归防线，
@@ -147,7 +146,7 @@ describe('续期调度器：启动必须先跑一轮', () => {
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：17 → 18；
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19；
     //    2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
-    expect(expected, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(20)
+    expect(expected, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(18)
     // ⚠️ 反方向：期望集里的每一个都必须**确实**在 registry 里有声明（防手抄漂移）。
     for (const id of expected) {
       expect(PROVIDER_REGISTRY.some((d) => d.id === id), `registry 缺少声明：${id}`).toBe(true)
@@ -332,14 +331,8 @@ describe('按需续期必须回写账号池的有效期', () => {
     }
   })
 
-  it('createPoolRefresh（CodeBuddy 系发消息途中的按需续期）也回写账号池', () => {
-    // 这条路径由 `buddy-adapter.ts` 的 401/403 分支调用，触发频率远高于
-    // RPC `account.refresh`；漏传 pool 就意味着 buddy/workbuddy 的
-    // 「已过期」显示在实际续期成功后仍然挂着。
-    const source = codeOnly(read('src/buddy-auth.ts'))
-    const body = source.slice(source.indexOf('export function createPoolRefresh'))
-    expect(body).toMatch(
-      /refreshAccountCredential\(\s*available\.entry\.credentialRef,\s*pool,\s*available\.entry\.id/,
-    )
-  })
+  // ⚠️ 「createPoolRefresh 也回写账号池」这条用例随 `buddy-auth.ts` 一并移除：
+  //    该助手原是腾讯系专属的按需续期路径，渠道删除后源码中已无此函数
+  //    （`grep -rn createPoolRefresh src/` 零命中）。其余渠道走的是
+  //    `refreshAccountCredential(...pool...)` 那条通用路径，由上一节覆盖。
 })

@@ -90,8 +90,6 @@ const qoderPlanSelector: BadgePlanSelector = Object.freeze({
  * 渠道 → 套餐形态。**未登记的渠道＝没有订阅**（默认关闭）。
  */
 export const BADGE_PLAN_SELECTORS: Readonly<Record<string, BadgePlanSelector>> = Object.freeze({
-  buddy: planPackageSelector,
-  workbuddy: planPackageSelector,
   qoder: qoderPlanSelector,
   qodercn: qoderPlanSelector,
   zcode: Object.freeze({ kind: 'balance' }) as BadgePlanSelector,

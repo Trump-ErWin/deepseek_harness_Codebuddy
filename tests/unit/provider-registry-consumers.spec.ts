@@ -5,7 +5,7 @@ import { isAutoCheckinExcluded } from '../../src/auto-checkin.js'
 import { JET_HUB_API_PATH, PERMANENT_LOCK_PROVIDERS, registerJetHubRpc } from '../../src/jet-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { apply } from '../../src/index.js'
-import { buddyExpiringWindowDays } from '../../src/buddy-balance-rank.js'
+import { expiringWindowDays } from '../../src/balance-rank.js'
 
 /**
  * ⚠️ 本文件锁「registry 是**真的**唯一真相源」—— 即改 registry 会**真的**
@@ -47,10 +47,9 @@ describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry
     //    `end_date` 到期），赠送/按需包走 `expiringTotal`。它**不**开
     //    `permanentLock` —— 下面那条「支持锁定的渠道」断言因此不受影响。
     expect(withWindow).toEqual([
-      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts', 'lobsterai',
+      'astudio', 'autoclaw', 'autoclawintl', 'codearts', 'lobsterai',
       'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae',
-      'workbuddy',
-    ])
+      ])
   })
 
   it('支持锁定的渠道 ⊆ usesExpiryWindow ∪ {loomy}（loomy 无窗口概念）', () => {
@@ -69,9 +68,8 @@ describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry
     //    两站**同日同时**登记两个字段（本家早有 `usesExpiryWindow`，本次补
     //    `permanentLock` + `balance` 接线）。⚠️ 两站各占一项。
     expect(viaWindow).toEqual([
-      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai',
-      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
-    ])
+      'astudio', 'autoclaw', 'autoclawintl', 'lobsterai',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', ])
     expect(locked).toEqual([...viaWindow, 'loomy'].sort())
   })
 })
@@ -87,8 +85,8 @@ describe('settingsNamespace：registerProviderSettings 的清单取决于 regist
       .filter((d) => d.settingsNamespace !== undefined)
       .map((d) => d.id).sort()
     expect(withNs).toEqual([
-      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy',
-      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'zcode',
     ])
     expect(descriptorOf('opencode')?.settingsNamespace).toBeUndefined()
     expect(descriptorOf('aggregate')?.settingsNamespace).toBeUndefined()
@@ -98,8 +96,6 @@ describe('settingsNamespace：registerProviderSettings 的清单取决于 regist
     // ⚠️ 必须断**值**：只断数量会漏掉「两个 provider 的 namespace 写反了」
     //    这类错位（那会让设置页把 A 的配置写到 B 上）。
     expect(descriptorOf('codearts')?.settingsNamespace).toBe('llm-codearts')
-    expect(descriptorOf('buddy')?.settingsNamespace).toBe('llm-buddy')
-    expect(descriptorOf('workbuddy')?.settingsNamespace).toBe('llm-workbuddy')
     expect(descriptorOf('lobsterai')?.settingsNamespace).toBe('llm-lobsterai')
     expect(descriptorOf('qoder')?.settingsNamespace).toBe('llm-qoder')
     expect(descriptorOf('qodercn')?.settingsNamespace).toBe('llm-qodercn')
@@ -171,7 +167,7 @@ describe('registerProviderSettings：index.ts 真的按 registry 注册（行为
     // ⚠️ 与上面「19 家声明了 namespace」那条**同源**：registry 里声明了 namespace 的家数。
     //    数字写成常量是有意的（防止有人给 registry 加工 `settingsNamespace` 而
     //    悄悄改变插件注册的设置项集合）。
-    expect(want).toHaveLength(19)
+    expect(want).toHaveLength(17)
     // 只取 `llm-*`：settings 里还有本插件自己的 `jet-hub` 条目，与 provider 无关。
     const got = registeredNamespaces().filter((ns) => ns.startsWith('llm-')).sort()
     // ⚠️ 断言**集合相等**而非顺序：注册顺序不影响 `describe()` 的语义（它按 ns 查、
@@ -273,7 +269,7 @@ describe('usesExpiryWindow：credits.permanentLock 的响应体取决于 registr
           : `${d.id} 不该回传 windowDays（它没有窗口概念）`,
       ).toBe(d.usesExpiryWindow === true)
       if (d.usesExpiryWindow === true) {
-        expect(result.value?.windowDays, `${d.id} 的窗口天数应为当前生效值`).toBe(buddyExpiringWindowDays())
+        expect(result.value?.windowDays, `${d.id} 的窗口天数应为当前生效值`).toBe(expiringWindowDays())
       }
     }
   })

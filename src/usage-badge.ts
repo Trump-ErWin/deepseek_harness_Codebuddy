@@ -76,7 +76,7 @@ export const BADGE_FAILURE_TTL_MS = 15_000
  *
  * ⚠️ **不能写成 `Number(raw) || 默认值`**：`0` 是合法值（表示「不缓存、每次都
  * 重新读」），而 `0` 是 falsy 会被 `||` 静默换成默认值 —— 与本仓库
- * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` / `DSH_QODER_QUEUE_TIMEOUT_MS` 同一个坑。
+ * `DSH_EXPIRING_WINDOW_DAYS` / `DSH_QODER_QUEUE_TIMEOUT_MS` 同一个坑。
  */
 export function badgeTtlMs(env: NodeJS.ProcessEnv = process.env): number {
   return nonNegativeMs(env[DSH_JET_HUB_BADGE_TTL_MS], BADGE_TTL_MS)

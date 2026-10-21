@@ -26,7 +26,7 @@
  *    本仓库已实测两次无牙）。
  * 3. **分档行为**：把**真实上游报文形状**（钱包 + 流水批次，`wallet_expires_at`
  *    是**秒**级）喂给生产解析器 `parseAutoclawLedgerBatches`，再用
- *    `splitBuddyCreditsByExpiry` / `buddyBalanceTier` 验证「锁定后只剩永久积分
+ *    `splitCreditsByExpiry` / `balanceTier` 验证「锁定后只剩永久积分
  *    ⇒ 该号不可用」。这一层驱动生产判据，不是复述实现。
  *
  * ⚠️ **不做**的事：不发真实网络（`fetcher` 全部注入假实现）、不读真实凭据。
@@ -40,14 +40,14 @@ import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
 import { parseAutoclawLedgerBatches } from '../../src/autoclaw-credits.js'
 import { fetchAutoclawBalanceDetailed } from '../../src/autoclaw-credits.js'
 // ⚠️ 2026-10-21 二轮审计：验证「流水降级不得谎报积分用尽」需要真跑选号器
-import { BuddyBalanceSelector } from '../../src/buddy-balance-selector.js'
+import { BalanceSelector } from '../../src/balance-selector.js'
 import {
-  BUDDY_BALANCE_TIER,
-  BUDDY_EXPIRING_WINDOW_DAYS,
-  buddyBalanceTier,
-  buddyTierUsable,
-  splitBuddyCreditsByExpiry,
-} from '../../src/buddy-balance-rank.js'
+  BALANCE_TIER,
+  EXPIRING_WINDOW_DAYS,
+  balanceTier,
+  tierUsable,
+  splitBalanceByExpiry as splitCreditsByExpiry,
+} from '../../src/balance-rank.js'
 import { AUTOCLAW, AUTOCLAW_INTL } from '../../src/autoclaw-product.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -133,10 +133,10 @@ describe('★ AutoClaw：`permanentLock` 的 registry 契约', () => {
 describe('★ AutoClaw：`index.ts` 的接线（源码级，按渠道切片）', () => {
   it('两站各建一个选号器，且各自接到工厂的 balance.selector', () => {
     expect(indexCode).toMatch(
-      /const autoclawBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: AUTOCLAW,/,
+      /const autoclawBalanceSelector = new BalanceSelector\(\{\s*\n\s*product: AUTOCLAW,/,
     )
     expect(indexCode).toMatch(
-      /const autoclawIntlBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: AUTOCLAW_INTL,/,
+      /const autoclawIntlBalanceSelector = new BalanceSelector\(\{\s*\n\s*product: AUTOCLAW_INTL,/,
     )
     // 建了不用 = 死代码，锁定仍无执行路径。
     expect(selectorBlock('autoclawBalanceSelector'), '中国版的 balance.selector 必须指向 autoclawBalanceSelector')
@@ -172,7 +172,7 @@ describe('★ AutoClaw：`index.ts` 的接线（源码级，按渠道切片）',
   })
 
   it('★★ 两站的 fetchBalance 闭包必须透传 product 形参（不得写死对方站点）', () => {
-    // `BuddyBalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
+    // `BalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
     // ⇒ 闭包里忽略形参、写死站点常量就会打到**对方站点**（余额恒 null，静默）。
     // ⚠️ 本家的 `fetchAutoclawCreditBalance` 第二参是 `{ product }`（对象），
     //    与 qoder 那份的 `(credential, product)` 位置顺序**不同**。
@@ -185,8 +185,8 @@ describe('★ AutoClaw：`index.ts` 的接线（源码级，按渠道切片）',
       // 闭包可能在 selector 之后（在 balance 块里）—— 两个位置都接受，
       // 但要求**恰有一处**且引用 product 形参。
       const ctor = indexCode.slice(
-        indexCode.indexOf(`const ${name} = new BuddyBalanceSelector({`),
-        indexCode.indexOf('\n  const ', indexCode.indexOf(`const ${name} = new BuddyBalanceSelector({`) + 10),
+        indexCode.indexOf(`const ${name} = new BalanceSelector({`),
+        indexCode.indexOf('\n  const ', indexCode.indexOf(`const ${name} = new BalanceSelector({`) + 10),
       )
       const line = ctor.match(/fetchBalance:[^\n]*/)
       expect(line, `${name} 的构造函数里必须注入 fetchBalance`).not.toBeNull()
@@ -232,7 +232,7 @@ describe('★★ AutoClaw：分档行为（驱动生产判据，不复述实现�
       batches[0]!.deductionEndTime,
       '无 wallet_expires_at ⇒ 不带 deductionEndTime（= 永久桶）',
     ).toBeUndefined()
-    const split = splitBuddyCreditsByExpiry({ packages: batches }, NOW_MS)
+    const split = splitCreditsByExpiry({ packages: batches }, NOW_MS)
     expect(split, '永久桶应被识别').toEqual({ expiring: 0, permanent: 5000 })
   })
 
@@ -240,18 +240,18 @@ describe('★★ AutoClaw：分档行为（驱动生产判据，不复述实现�
     const batches = parseAutoclawLedgerBatches([
       { mutation_type: 'credit', amount: 5000, description: '活动赠送' },
     ], NOW_MS)
-    const split = splitBuddyCreditsByExpiry({ packages: batches }, NOW_MS)
+    const split = splitCreditsByExpiry({ packages: batches }, NOW_MS)
     const entry = { id: 'a', expiringBalance: split!.expiring, permanentBalance: split!.permanent }
-    const windowMs = BUDDY_EXPIRING_WINDOW_DAYS * 86400_000
+    const windowMs = EXPIRING_WINDOW_DAYS * 86400_000
     // 未锁定：长期额度可用。
-    expect(buddyBalanceTier(entry, { allowPermanent: true, windowMs }))
-      .toBe(BUDDY_BALANCE_TIER.permanent)
+    expect(balanceTier(entry, { allowPermanent: true, windowMs }))
+      .toBe(BALANCE_TIER.permanent)
     // ★ 锁定：只剩长期 ⇒ 明确不可用。这就是「锁定真的会拦」的那一步。
     expect(
-      buddyBalanceTier(entry, { allowPermanent: false, windowMs }),
+      balanceTier(entry, { allowPermanent: false, windowMs }),
       '锁定后只剩永久积分 ⇒ 必须落 none（否则锁定形同虚设）',
-    ).toBe(BUDDY_BALANCE_TIER.none)
-    expect(buddyTierUsable(buddyBalanceTier(entry, { allowPermanent: false, windowMs }))).toBe(false)
+    ).toBe(BALANCE_TIER.none)
+    expect(tierUsable(balanceTier(entry, { allowPermanent: false, windowMs }))).toBe(false)
   })
 
   it('★ 有临期批次时锁定仍可用（锁定只挡永久桶，不挡临期桶）', () => {
@@ -260,14 +260,14 @@ describe('★★ AutoClaw：分档行为（驱动生产判据，不复述实现�
       { mutation_type: 'credit', amount: 300, wallet_expires_at: NOW_S + 10 * DAY_S, description: '每日签到' },
       { mutation_type: 'credit', amount: 5000, description: '活动赠送' },
     ], NOW_MS)
-    const split = splitBuddyCreditsByExpiry({ packages: batches }, NOW_MS)
+    const split = splitCreditsByExpiry({ packages: batches }, NOW_MS)
     expect(split!.expiring, '10 天后的批次应进临期桶').toBe(300)
     expect(split!.permanent, '无到期字段的应进永久桶').toBe(5000)
     const entry = { id: 'a', expiringBalance: split!.expiring, permanentBalance: split!.permanent }
     expect(
-      buddyBalanceTier(entry, { allowPermanent: false, windowMs: BUDDY_EXPIRING_WINDOW_DAYS * 86400_000 }),
+      balanceTier(entry, { allowPermanent: false, windowMs: EXPIRING_WINDOW_DAYS * 86400_000 }),
       '锁定状态下有临期额度 ⇒ 仍可用',
-    ).toBe(BUDDY_BALANCE_TIER.expiring)
+    ).toBe(BALANCE_TIER.expiring)
   })
 
   it('★ 消耗（debit）后永久桶按净额，不是按历史发放额', () => {
@@ -277,7 +277,7 @@ describe('★★ AutoClaw：分档行为（驱动生产判据，不复述实现�
       { mutation_type: 'credit', amount: 5000, description: '活动赠送' },
       { mutation_type: 'debit', amount: -1200, description: '活动赠送' },
     ], NOW_MS)
-    const split = splitBuddyCreditsByExpiry({ packages: batches }, NOW_MS)
+    const split = splitCreditsByExpiry({ packages: batches }, NOW_MS)
     expect(split!.permanent, '净额 = 5000 - 1200').toBe(3800)
   })
 
@@ -300,7 +300,7 @@ describe('★★ AutoClaw：分档行为（驱动生产判据，不复述实现�
  * 流水失败 / 守恒不成立时 `fetchAutoclawBalanceDetailed` **静默回退钱包包** ——
  * 总额对，但**逐包到期全部丢失**（钱包包没有 `deductionEndTime`）。
  *
- * 而 `splitBuddyCreditsByExpiry` 把「没有到期时刻」判成**永久桶**（对真·永久是对的）
+ * 而 `splitCreditsByExpiry` 把「没有到期时刻」判成**永久桶**（对真·永久是对的）
  * ⇒ 一次流水抖动会让「有临期积分的账号」被判成**只剩永久积分** ⇒
  * 锁定状态下报「积分都已用尽」—— **那句会把用户推向不可撤回的解锁**
  *（`credential-resolver.ts` 的注释原话：「会把用户推向解锁永久积分（不可撤回地烧钱）」）。
@@ -315,7 +315,7 @@ describe('★★ AutoClaw：分档行为（驱动生产判据，不复述实现�
  * ## 修法
  *
  * `CreditBalance.degraded`（可选）——「总额读到了、明细丢了」；
- * `BuddyBalanceSelector` 把它透传到 `BuddyAccountBalanceEntry.degraded`，
+ * `BalanceSelector` 把它透传到 `AccountBalanceEntry.degraded`，
  * `noAccountReason` 把降级**与失败同等对待**（归 `unknown`，不归 `exhausted`）。
  */
 describe('★★ AutoClaw：流水降级不得谎报「积分都已用尽」', () => {
@@ -352,7 +352,7 @@ describe('★★ AutoClaw：流水降级不得谎报「积分都已用尽」', (
   }
 
   function selectorWith(ledgerFails: boolean) {
-    return new BuddyBalanceSelector({
+    return new BalanceSelector({
       product: { id: 'autoclaw', endpoint: 'https://x.invalid' } as never,
       resolveCredential: async () => ({ access_token: 't'.repeat(40) }) as never,
       fetchBalance: async (cred) =>
@@ -455,7 +455,7 @@ describe('★ AutoClaw：降级结果的缓存 TTL 必须与错误同档（短�
   it('流水失败后 5 秒内复用、超过 5 秒重查（不按 60 秒长 TTL 缓存）', async () => {
     let ledgerCalls = 0
     let nowMs = 1_700_000_000_000
-    const selector = new BuddyBalanceSelector({
+    const selector = new BalanceSelector({
       product: { id: 'autoclaw', endpoint: 'https://x.invalid' } as never,
       resolveCredential: async () => ({ access_token: 't'.repeat(40) }) as never,
       now: () => nowMs,

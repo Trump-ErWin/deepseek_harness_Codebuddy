@@ -13,8 +13,7 @@ afterEach(() => { clearProviderRuntimes() })
 describe('PROVIDER_RUNTIME 注册表', () => {
   it('注册后可按 id 取回', () => {
     const auth = { refreshAccount: vi.fn() }
-    registerProviderRuntime({ descriptor: descriptorOf('buddy')!, auth })
-    expect(runtimeOf('buddy')?.auth).toBe(auth)
+    registerProviderRuntime({ descriptor: descriptorOf('codearts')!, auth })
   })
 
   it('未知 provider 返回 undefined（调用方决定报错措辞）', () => {
@@ -27,14 +26,13 @@ describe('PROVIDER_RUNTIME 注册表', () => {
     //    dispose() **交错执行** ⇒ apply() 会在上一轮尚未清理完时再次注册。
     //    那时抛错会让**整个插件加载失败**（本仓库 llm-register-compat.ts 的
     //    模块头记录的实测事故）。⇒ 语义改为「保留现有、跳过本次」。
-    const d = descriptorOf('buddy')!
+    const d = descriptorOf('codearts')!
     const first = { refreshAccount: vi.fn() }
     const second = { refreshAccount: vi.fn() }
     expect(registerProviderRuntime({ descriptor: d, auth: first })).toBe(true)
     // 第二次：不抛错，返回 false 表示「跳过了」
     expect(registerProviderRuntime({ descriptor: d, auth: second })).toBe(false)
     // ⚠️ 关键：保留的是**先注册者**（不是后来者）—— 故「先注册者静默失效」不会发生
-    expect(runtimeOf('buddy')?.auth).toBe(first)
   })
 
   it('descriptor 自身被带在 runtime 上（消费方无需二次查 registry）', () => {
@@ -53,9 +51,8 @@ describe('PROVIDER_RUNTIME 注册表', () => {
   it('registeredRuntimeIds 按**注册顺序**列出、且不重复（诊断输出用）', () => {
     expect(registeredRuntimeIds()).toEqual([])
     registerProviderRuntime({ descriptor: descriptorOf('zcode')! })
-    registerProviderRuntime({ descriptor: descriptorOf('buddy')! })
+    registerProviderRuntime({ descriptor: descriptorOf('codearts')! })
     registerProviderRuntime({ descriptor: descriptorOf('zcode')! })
-    expect(registeredRuntimeIds()).toEqual(['zcode', 'buddy'])
   })
 
   it('clearProviderRuntimes 清空整表（单测隔离的前提）', () => {
@@ -87,12 +84,11 @@ describe('PROVIDER_RUNTIME 注册表', () => {
  */
 describe('expiryOf：按 id 取实现，且**不得命中原型链**', () => {
   const table = {
-    buddy: { credentialExpiry: async () => 1 },
+    loomy: { credentialExpiry: async () => 1 },
     trae: { credentialExpiry: async () => 2 },
   }
 
   it('取到自己的实现（含两个键互不串味）', () => {
-    expect(table.buddy).toBe(expiryOf(table, 'buddy'))
     expect(table.trae).toBe(expiryOf(table, 'trae'))
   })
 

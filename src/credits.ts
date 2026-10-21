@@ -1,7 +1,8 @@
+import type { ChannelCredential, ProviderProduct } from './jwt-utils.js'
 /**
- * WorkBuddy 每日签到（领取积分）客户端。
+ * 免费额度渠道的每日签到（领取积分）客户端。
  *
- * 端点与格式均来自对 WorkBuddy 5.5.6 的逆向 + 真实请求实测（2026-09-14）：
+ * 端点与格式均来自对官方客户端的实测（2026-09-14）：
  *
  *   状态查询  POST /v2/billing/meter/checkin-activity-status   body {}
  *   领取      POST /v2/billing/meter/daily-checkin             body {}
@@ -20,14 +21,12 @@
  * 判定以响应体 code 为准 —— 不能只看 HTTP 状态。
  */
 
-import {
-  BUDDY_DEPLOYMENT_TYPE,
-  HTTP_HEADER_DOMAIN,
-  HTTP_HEADER_PRODUCT,
-  HTTP_HEADER_PRODUCT_CODE,
-} from './buddy.js'
-import type { BuddyCredential } from './buddy.js'
-import type { BuddyProduct } from './product.js'
+/** 请求头名（各渠道协议同形；取值见官方客户端实测）。 */
+const HTTP_HEADER_DOMAIN = 'X-Domain'
+const HTTP_HEADER_PRODUCT = 'X-Product'
+const HTTP_HEADER_PRODUCT_CODE = 'X-Product-Code'
+/** 部署类型标识（免费额度渠道共用同一取值）。 */
+const DEPLOYMENT_TYPE = 'SaaS'
 
 /** 签到状态查询端点（权威状态源）。 */
 export const CHECKIN_ACTIVITY_STATUS_PATH = '/v2/billing/meter/checkin-activity-status'
@@ -36,8 +35,8 @@ export const DAILY_CHECKIN_PATH = '/v2/billing/meter/daily-checkin'
 /**
  * 积分余额查询端点。
  *
- * **两个产品通用**（2026-09-15 实测）：CodeBuddy 中国版
- * （copilot.tencent.com）与 WorkBuddy 国际版（www.workbuddy.ai）都实现该端点，
+ * **两个产品通用**（2026-09-15 实测）：国内版
+ * 与国际版都实现该端点，
  * 请求头与响应结构完全一致，只有 baseURL 不同（随 `product.endpoint` 切换）。
  *
  * 这与签到能力形成对比 —— **签到**只有中国版有（国际版内核里连
@@ -80,7 +79,7 @@ export interface CheckinStatus {
   checkinDates: string[]
   /** 活动名（如「开学季」） */
   activityName: string
-  /** 主题名（如「Buddy加油站」） */
+  /** 主题名 */
   themeName: string
   /** 活动结束时间 */
   endTime: string
@@ -172,7 +171,7 @@ export type ClaimOutcome =
  * ## 一个账号为什么有多个包
  *
  * 每个包是**一份独立的积分授予**（套餐 + 若干运营活动赠包），各自有独立的
- * 计量周期与到期时间。实测某 CodeBuddy 账号有 5 个包：1 个体验版套餐 +
+ * 计量周期与到期时间。实测某账号有 5 个包：1 个体验版套餐 +
  * 4 份「国内运营裂变包」，其中 2 份已过期、1 份本周期已耗尽、2 份可用。
  * 所以界面上「5 个资源包」不等于 5 份额度，需要区分有效与失效。
  *
@@ -191,7 +190,7 @@ export type ClaimOutcome =
  * 一大截，且用户无从核对。
  */
 export interface CreditPackage {
-  /** 包名（如 'Bonus Pack' / 'CodeBuddy个人体验版'） */
+  /** 包名（如 'Bonus Pack' / '个人体验版'） */
   name: string
   /** 额度单位（'credit' / 'credits'） */
   unit: string
@@ -225,10 +224,10 @@ export interface CreditPackage {
    *
    * | 包 | `DeductionEndTime` 距今 | `CycleEndTime` 距今 |
    * |---|---|---|
-   * | WorkBuddy「Bonus Pack」 | 9 天 | 9 天 |
-   * | WorkBuddy「Free Plan Subscription」 | **3008 天** | 2 天 |
-   * | CodeBuddy「拉新权益包 / 国内运营裂变包」 | 17～208 天 | 同左或更长 |
-   * | CodeBuddy「个人体验版」 | 3008 天 | 已到期 |
+   * | 「Bonus Pack」 | 9 天 | 9 天 |
+   * | 「Free Plan Subscription」 | **3008 天** | 2 天 |
+   * | 「拉新权益包 / 国内运营裂变包」 | 17～208 天 | 同左或更长 |
+   * | 「个人体验版」 | 3008 天 | 已到期 |
    *
    * ⇒ 判「会不会近期作废」**只能用本字段**：套餐（订阅）包的周期虽短，
    * 扣费截止却在 8 年后，取 `CycleEndTime` 会把每月刷新的套餐误判成快作废。
@@ -283,9 +282,9 @@ export interface CreditPackage {
 
  * PR !134 只在**客户端**（`plugin-src/client/credit-expiry.js`）把独立池从
 
- * 三档里摘出，后端选号侧（`src/buddy-balance-rank.ts` 的
+ * 三档里摘出，后端选号侧（`src/balance-rank.ts` 的
 
- * `splitBuddyCreditsByExpiry`）**完全不看 `pkg.name`** ⇒ **两侧口径分叉**：
+ * `splitCreditsByExpiry`）**完全不看 `pkg.name`** ⇒ **两侧口径分叉**：
 
  * 同一份数据，前端说「永久 0」，后端说「永久 25000」。
 
@@ -293,7 +292,7 @@ export interface CreditPackage {
 
  * 面板显示「另有 25000 专属（不计入）」而三档一行不渲染（看起来「没积分」），
 
- * 但后端把 25000 算成**临期** ⇒ `buddyBalanceTier` 判 `expiring` ⇒
+ * 但后端把 25000 算成**临期** ⇒ `balanceTier` 判 `expiring` ⇒
 
  * **锁定永久积分时该账号仍被判「可用」** ⇒ 选号把请求发给一个只有专属池的
 
@@ -361,7 +360,7 @@ export interface CreditBalance {
    *
    * ## 为什么需要这个字段（而不是只靠 `packages[].deductionEndTime`）
    *
-   * 绝大多数 provider 的到期信息是**逐包**的（CodeBuddy 的 `DeductionEndTime`、
+   * 绝大多数 provider 的到期信息是**逐包**的（上游的 `DeductionEndTime`、
    * AStudio 的 `*NextExpireTime`、MiniMax 的 `expire_at_ms`），故分档
    * （永久 / 长期 / 临期）只需读 `packages` 即可。
    *
@@ -404,7 +403,7 @@ export interface CreditBalance {
    * 明细失败时实现会**静默回退**到「钱包包」——总额正确，但**逐包到期时刻全部丢失**
    * （回退包没有 `deductionEndTime`）。
    *
-   * 而 `splitBuddyCreditsByExpiry` 对「没有到期时刻」的判据是**永久桶**（保守方向，
+   * 而 `splitCreditsByExpiry` 对「没有到期时刻」的判据是**永久桶**（保守方向，
    * 对「真·永久积分」是对的）。⇒ 一次明细抖动会让「有临期积分的账号」被判成
    * **只剩永久积分** ⇒ 锁定状态下报「积分都已用尽」—— 那句会把用户推向
    * **不可撤回的解锁**（本仓库红线级误导）。
@@ -430,20 +429,20 @@ export interface CreditBalance {
  *
  * `X-Domain` **以产品配置为准**，而不是优先用凭据里的 `credential.domain`：
  * 凭据的 domain 是"登录时用的域名"的快照，若它系从另一个产品遗留/迁移而来
- * （典型场景：早期 workbuddy 指向中国版，改造成国际版后旧凭据仍写着
+ * （典型场景：早期渠道指向国内版，改造成国际版后旧凭据仍写着
  * copilot.tencent.com），跟着凭据走就会把请求的身份标识发错区域。请求的
  * baseURL 来自 `product.endpoint`，X-Domain 必须与之一致，否则前后矛盾。
  *
  * 保留凭据 domain 仅作为产品未声明 apiDomain 时的兜底。
  */
-function checkinHeaders(credential: BuddyCredential, product: BuddyProduct): Headers {
+function checkinHeaders(credential: ChannelCredential, product: ProviderProduct): Headers {
   const headers = new Headers()
   headers.set('Authorization', `Bearer ${credential.access_token}`)
   headers.set('Accept', 'application/json')
   headers.set('Content-Type', 'application/json')
   headers.set(HTTP_HEADER_DOMAIN, product.apiDomain || credential.domain || '')
-  headers.set(HTTP_HEADER_PRODUCT, BUDDY_DEPLOYMENT_TYPE)
-  headers.set(HTTP_HEADER_PRODUCT_CODE, product.productCode)
+  headers.set(HTTP_HEADER_PRODUCT, DEPLOYMENT_TYPE)
+  if (product.productCode !== undefined) headers.set(HTTP_HEADER_PRODUCT_CODE, product.productCode)
   if (credential.user_id !== undefined && credential.user_id.length > 0) {
     headers.set('X-User-Id', credential.user_id)
   }
@@ -451,7 +450,7 @@ function checkinHeaders(credential: BuddyCredential, product: BuddyProduct): Hea
     headers.set('X-Enterprise-Id', credential.enterprise_id)
     headers.set('X-Tenant-Id', credential.enterprise_id)
   }
-  headers.set('User-Agent', product.userAgent)
+  if (product.userAgent !== undefined) headers.set('User-Agent', product.userAgent)
   return headers
 }
 
@@ -503,8 +502,8 @@ const UNPARSABLE_RESPONSE_MESSAGE = '请求失败或响应无法解析'
  */
 async function postJson(
   path: string,
-  credential: BuddyCredential,
-  product: BuddyProduct,
+  credential: ChannelCredential,
+  product: ProviderProduct,
   fetcher: typeof fetch,
 ): Promise<PostResult> {
   try {
@@ -555,8 +554,8 @@ function describeNonJsonResponse(status: number, text: string): string {
  * 网络失败、响应非法或业务码非 0 时返回 null。
  */
 export async function fetchCheckinStatus(
-  credential: BuddyCredential,
-  product: BuddyProduct,
+  credential: ChannelCredential,
+  product: ProviderProduct,
   fetcher: typeof fetch = fetch,
 ): Promise<CheckinStatus | null> {
   const result = await postJson(CHECKIN_ACTIVITY_STATUS_PATH, credential, product, fetcher)
@@ -589,8 +588,8 @@ export async function fetchCheckinStatus(
  * 只看状态码会把幂等情况误报为失败）。
  */
 export async function claimDailyCheckin(
-  credential: BuddyCredential,
-  product: BuddyProduct,
+  credential: ChannelCredential,
+  product: ProviderProduct,
   fetcher: typeof fetch = fetch,
 ): Promise<ClaimOutcome> {
   const result = await postJson(DAILY_CHECKIN_PATH, credential, product, fetcher)
@@ -645,7 +644,7 @@ function readPreciseNumber(source: Record<string, unknown>, baseKey: string): nu
 /**
  * 服务端标记「该资源包已过期」的 Status 值（实测）。
  *
- * 实测某 CodeBuddy 账号的 5 个包里，两个带 `ExpiredTime`（2026-06-02 /
+ * 实测某账号的 5 个包里，两个带 `ExpiredTime`（2026-06-02 /
  * 2026-06-06）的条目 Status 均为 3，三个有效条目为 0。故把 3 视为失效；
  * 其他未知取值一律当成有效（宁可多显示一个额度，也不要把能用的额度藏起来）。
  */
@@ -701,8 +700,8 @@ function parseCreditPackage(entry: Record<string, unknown>): CreditPackage {
  * 单层 `data` 结构不同，是本接口最容易解析错的地方。
  */
 export async function fetchCreditBalance(
-  credential: BuddyCredential,
-  product: BuddyProduct,
+  credential: ChannelCredential,
+  product: ProviderProduct,
   fetcher: typeof fetch = fetch,
 ): Promise<CreditBalance | null> {
   const result = await postJson(USER_RESOURCE_PATH, credential, product, fetcher)
@@ -758,8 +757,8 @@ export function roundCredits(value: number): number {
  *
  * ## 为什么需要它（真实缺陷，2026-10-03）
  *
- * 用户报障：WorkBuddy 国际版有**两个账号**，用量徽标却显示
- * `WorkBuddy (国际版) • 341.78积分 · 100积分`（两个数并排），账号再多就成一长串。
+ * 用户报障：某渠道有**两个账号**，用量徽标却显示
+ * `渠道名 • 341.78积分 · 100积分`（两个数并排），账号再多就成一长串。
  *
  * 根因不在「多账号没法合计」，而在**服务端把同一个单位拼成两种写法**（实测逐包
  * 原值）：账号 `…01CC739A` 的包是 `CapacityUnit: 'credit'`（Bonus Pack 241.78）

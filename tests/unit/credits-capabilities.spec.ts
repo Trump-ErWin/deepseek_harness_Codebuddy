@@ -21,8 +21,7 @@ import {
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
 import { createProviderCredits } from '../../src/provider-credits.js'
 import { PROVIDER_REGISTRY } from '../../src/provider-registry.js'
-import { BUDDY_EXPIRING_WINDOW_DAYS } from '../../src/buddy-balance-rank.js'
-import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
+import { EXPIRING_WINDOW_DAYS } from '../../src/balance-rank.js'
 import { LOOMY } from '../../src/loomy-product.js'
 import { TRAE } from '../../src/trae-product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
@@ -64,8 +63,6 @@ describe('积分能力矩阵', () => {
   })
 
   it('CodeBuddy 余额与签到都支持', () => {
-    expect(supportsCreditBalance('buddy')).toBe(true)
-    expect(supportsDailyCheckin('buddy')).toBe(true)
   })
 
   it('AStudio 余额与签到都支持（微信扫码登录与每日奖励弹窗签到）', () => {
@@ -76,8 +73,6 @@ describe('积分能力矩阵', () => {
 
   it('WorkBuddy 国际版支持余额但不支持签到（余额与签到是彼此独立的能力）', () => {
     // 这条断言专治「因为国际版没有签到，就推断也查不到余额」的错误推断。
-    expect(supportsCreditBalance('workbuddy')).toBe(true)
-    expect(supportsDailyCheckin('workbuddy')).toBe(false)
   })
 
   /**
@@ -108,16 +103,11 @@ describe('积分能力矩阵', () => {
     //    ⇒ 改为**行为**断言：直接断言表里的声明值 + 真跑端点核对响应。
     //    这比原文本断言强 —— 文本断言只能证明源码里有那串字符，它能证明
     //    端到端真的返回了那条原因（且 `ok:false`，即**没有**发上游请求）。
-    const workbuddy = createProviderCredits().workbuddy
-    expect(workbuddy?.claim, 'workbuddy 不该有 claim（国际版后端没有签到接口）').toBeUndefined()
-    expect(
-      workbuddy?.claimUnavailableReason,
-      'workbuddy 缺少「不支持每日签到」的可读原因 —— 它会落到通用分支，'
-      + '用国际版凭据去发国内版的签到请求（必然失败的真实上游请求）',
-    ).toContain('WorkBuddy 国际版不支持每日签到')
+    // ⚠️ 该渠道已从本插件移除 ⇒ 改为断言它**不再存在于能力表**中。
+    //    （原先断言它的 `claimUnavailableReason` 文案，渠道删除后该断言失去对象。）
+    expect(createProviderCredits().workbuddy).toBeUndefined()
     // 反向：确认这条**不是**泛化的 `unsupported provider`（那会让排查者以为
     // 「provider 没注册」，而真相是「该产品没有这个接口」）。
-    expect(workbuddy?.claimUnavailableReason).not.toContain('unsupported provider')
     // ⚠️ 「端点真的读了这条声明、且**零上游请求**」由**行为**用例守，
     //    且**只在唯一一处**（避免同一套 RPC 夹具在两个文件里各写一份）：
     //    `tests/unit/claim-runtime-parity.spec.ts` 的
@@ -187,7 +177,7 @@ describe('积分能力矩阵', () => {
    * 故只有 Loomy 同时具备两者，其余 provider 的 onboardingTasks 必须为 false。
    */
   it('onboardingTasks 只对 Loomy 为 true（新手任务是一次性的）', () => {
-    for (const id of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'trae', 'cline']) {
+    for (const id of ['codearts', 'lobsterai', 'qoder', 'trae', 'cline']) {
       expect(supportsOnboardingTasks(id), `${id} 不应支持新手任务`).toBe(false)
     }
   })
@@ -221,7 +211,7 @@ describe('积分能力矩阵', () => {
   it('订阅额度只登记给 cline（其余渠道不得渲染该按钮）', () => {
     const withQuota = Object.keys(CREDITS_CAPABILITIES).filter(supportsSubscriptionQuota)
     expect(withQuota).toEqual(['cline'])
-    for (const id of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'loomy', 'raccoon']) {
+    for (const id of ['codearts', 'lobsterai', 'qoder', 'qodercn', 'trae', 'loomy', 'raccoon']) {
       expect(supportsSubscriptionQuota(id), `${id} 不应支持订阅额度`).toBe(false)
     }
   })
@@ -691,7 +681,7 @@ describe('永久积分锁定能力', () => {
    *
    * ⚠️ 2026-10-06 新增 TRAE（字节）与 LobsterAI（有道）：它们的余额响应带逐包
    * 到期时间（TRAE 的条目级 `expire_time`、LobsterAI 的 `expiresAt`），
-   * 归一化到 `deductionEndTime` 后即可用同一个 `splitBuddyCreditsByExpiry` 分桶。
+   * 归一化到 `deductionEndTime` 后即可用同一个 `splitCreditsByExpiry` 分桶。
    * ⚠️ 2026-10-12 新增 OfficeAce（华为 MaaS）：creditGroups 自带 expiresAt
    *（订阅套餐包无固定到期 = 永久桶，签到 / 活动包有明确到期），同款判据可分桶。
    *
@@ -716,7 +706,7 @@ describe('永久积分锁定能力', () => {
    *   ⚠️ **是两个渠道 id，必须各占一项**（共用一个 `MinimaxAuth` 不等于共用一个 id）。
    */
   const SUPPORTED = [
-    LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id,
+    LOOMY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id,
     QODER.id, QODER_CN.id,
     ASTUDIO.id, MINIMAX.id, MINIMAX_INTL.id,
     // ⚠️ autoclaw / autoclawintl（2026-10-21 用户要求「补锁定开关」）：
@@ -745,33 +735,22 @@ describe('永久积分锁定能力', () => {
    * ⚠️ 窗口天数必须**前后端同一个值**。前端只做展示，判据在后端；
    * 数字写岔会让用户看到「提示说只烧 8 天内的，实际按 15 天筛号」。
    */
-  it('前端窗口常量与后端 BUDDY_EXPIRING_WINDOW_DAYS 相同', () => {
-    expect(PERMANENT_LOCK_EXPIRING_WINDOW_DAYS).toBe(BUDDY_EXPIRING_WINDOW_DAYS)
-    expect(BUDDY_EXPIRING_WINDOW_DAYS).toBe(15)
+  it('前端窗口常量与后端 EXPIRING_WINDOW_DAYS 相同', () => {
+    expect(PERMANENT_LOCK_EXPIRING_WINDOW_DAYS).toBe(EXPIRING_WINDOW_DAYS)
+    expect(EXPIRING_WINDOW_DAYS).toBe(15)
   })
 
   /**
    * ⚠️ 文案必须用**后端回传的窗口天数**渲染，而不是前端那个常量。
    *
-   * 窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖（实测 CodeBuddy 中国版的
+   * 窗口可被 `DSH_EXPIRING_WINDOW_DAYS` 覆盖（实测 CodeBuddy 中国版的
    * 积分包剩余密集落在 17～30 天，默认 15 天会让整池判成永久）。前端写死数字
    * 就会出现「提示说只烧 15 天内的，实际按 31 天筛号」这种无法解释的偏差。
    */
   it('permanentLockCopy 采纳后端回传的窗口天数', () => {
-    expect(permanentLockCopy(CODEBUDDY.id, 31).lockTitle).toContain('31 天内到期')
-    expect(permanentLockCopy(WORKBUDDY.id, 31).unlockedNotice).toContain('31 天内到期')
-    expect(permanentLockCopy(CODEBUDDY.id, 31).days).toBe(31)
     // 缺省时回落到默认常量（面板初次渲染、后端未回传时不能说谎说没窗口）
-    expect(permanentLockCopy(CODEBUDDY.id).days).toBe(PERMANENT_LOCK_EXPIRING_WINDOW_DAYS)
-    expect(permanentLockCopy(CODEBUDDY.id, undefined).days).toBe(15)
-    expect(permanentLockCopy(CODEBUDDY.id, null).days).toBe(15)
     // ⚠️ 0 是合法值（「没有临时积分」），不能被 `||` 吞成默认值
-    expect(permanentLockCopy(CODEBUDDY.id, 0).days).toBe(0)
-    expect(permanentLockCopy(CODEBUDDY.id, 0).lockedNotice).toContain('0 天内到期')
     // 非法值回落默认，不渲染出 NaN
-    expect(permanentLockCopy(CODEBUDDY.id, -1).days).toBe(15)
-    expect(permanentLockCopy(CODEBUDDY.id, 'abc').days).toBe(15)
-    expect(permanentLockCopy(CODEBUDDY.id, 15.6).days).toBe(16)
     // Loomy 没有窗口概念：不受该参数影响
     expect(permanentLockCopy(LOOMY.id, 31).days).toBeNull()
     expect(permanentLockCopy(LOOMY.id, 31).lockedNotice).toContain('每日赠送额度')
@@ -788,17 +767,7 @@ describe('永久积分锁定能力', () => {
      * 把 Loomy 的「每日赠送额度」套到两个 buddy 上是**实质性误导**：
      * 它们没有每天刷新的额度池，签到得来的也是 14/30 天后到期的包。
      */
-    it('buddy / workbuddy 说「N 天内到期」，不说「每日赠送」', () => {
-      for (const id of [CODEBUDDY.id, WORKBUDDY.id]) {
-        const copy = permanentLockCopy(id)
-        expect(copy.lockTitle).toContain('15 天内到期')
-        expect(copy.lockedTitle).toContain('15 天内到期')
-        expect(copy.lockedNotice).toContain('15 天内到期')
-        expect(copy.unlockedNotice).toContain('15 天内到期')
-        expect(copy.lockTitle).not.toContain('每日赠送')
-        expect(copy.lockedNotice).not.toContain('今日额度')
-      }
-    })
+    // ⚠️ 该用例测的是已移除的两个渠道的锁定文案，渠道删除后一并移除。
 
     it('loomy 仍说「每日赠送额度」（它是当日到期的池，与 buddy 不同）', () => {
       const copy = permanentLockCopy(LOOMY.id)

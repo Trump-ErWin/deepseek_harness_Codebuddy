@@ -64,8 +64,6 @@ import {
  */
 const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   ['codearts', 'codeartsAuth'],
-  ['buddy', 'buddyAuth'],
-  ['workbuddy', 'workbuddyAuth'],
   ['lobsterai', 'lobsteraiAuth'],
   ['qoder', 'qoderAuth'],
   ['qodercn', 'qodercnAuth'],
@@ -320,9 +318,6 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
    */
   it('重复 apply() 不抛错（fiber 重启竞态：保留先注册者、跳过本次）', () => {
     const first = applyOnce()
-    const firstBuddy = first.buddyAuth
-    expect(firstBuddy).toBeDefined()
-    expect(runtimeOf('buddy')?.auth).toBeDefined()
 
     // 第二个 ctx 同样要备齐服务替身，否则抛的是
     // `Cannot read properties of undefined (reading 'registerAdapter')`
@@ -336,10 +331,7 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
 
     // ⚠️ 保留的是**先注册者**（第一个 ctx 的实例），不是后来者 ——
     //    这正是「先注册者静默失效」不会发生的那一半证据。
-    expect(runtimeOf('buddy')?.descriptor).toBe(descriptorOf('buddy'))
-    expect(second.buddyAuth).not.toBe(firstBuddy)
     // 第二次 apply 的实例**确实**建出来了（否则上面那条 `not.toBe` 是同义反复）。
-    expect(second.buddyAuth).toBeDefined()
   })
 
   /**
@@ -376,7 +368,7 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    再加 astudio（本 fork 与上游各登记一次）⇒ 19 → 20 个真渠道，
     //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20 个 auth 键。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(20)
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(18)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
@@ -408,7 +400,6 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
    * 将来该文件真的加了写点，那条用例会红并要求填上 provider。
    */
   const WRITE_SITE_FILES: ReadonlyArray<readonly [string, readonly string[]]> = [
-    ['buddy-adapter.ts', ['buddy', 'workbuddy']],
     ['lobsterai-adapter.ts', ['lobsterai']],
     ['qoder-adapter.ts', ['qoder', 'qodercn']],
     ['cline-adapter.ts', ['cline']],

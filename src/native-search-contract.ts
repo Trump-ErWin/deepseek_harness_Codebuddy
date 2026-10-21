@@ -24,6 +24,7 @@
  */
 
 import { HarnessError } from '@deepseek-ai/dsh-llm'
+import type { ChannelCredential } from './jwt-utils.js'
 
 /**
  * 原生搜索链路的失败。
@@ -146,7 +147,7 @@ export interface NativeSearchAdapter {
   /**
    * 用聊天链路**同一套**编排解析凭据。
    *
-   * ⚠️ 返回 `unknown` 而不是具体凭据类型：腾讯是 `BuddyCredential`、Qoder 是
+   * ⚠️ 返回 `unknown` 而不是具体凭据类型：腾讯是 `ChannelCredential`、Qoder 是
    * `QoderCredential`，形状完全不同。**由各适配器自己收窄**（见 `searchOnce`），
    * 工具层只负责「透传」。
    *

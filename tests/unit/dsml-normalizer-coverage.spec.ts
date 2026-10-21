@@ -50,7 +50,6 @@ describe('DSML 归一化接线覆盖（防回归）', () => {
       emitters.sort(),
       `正文出口清单变了（${emitters.length} 个）：${emitters.join(', ')}。若新增出口，必须同时接入 DSML 归一化。`,
     ).toEqual([
-      'buddy-adapter.ts',
       'gemini-messages.ts',
       'llm-adapter.ts',
       'lobsterai-adapter.ts',

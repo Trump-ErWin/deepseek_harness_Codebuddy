@@ -49,8 +49,6 @@
  *（三者都没传 `fetchImpl`）逐字等价，故生产行为不变。
  */
 
-import { CODEBUDDY, WORKBUDDY } from './product.js'
-import type { BuddyCredential } from './buddy.js'
 import { CLINE } from './cline-product.js'
 import { GEMINI } from './gemini.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -78,7 +76,6 @@ import { fetchAstudioBalanceDetailed, claimDaily } from './astudio-credits.js'
 import { fetchAutoclawBalanceDetailed, claimAutoclawDailyQuota } from './autoclaw-credits.js'
 import { AUTOCLAW_INTL } from './autoclaw-product.js'
 import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
-import { collectBuddyGrowth } from './buddy-growth.js'
 import { fetchZcodeBalance, type ZcodeBalanceResult } from './zcode-upstream.js'
 import {
   claimDailyCheckin,
@@ -103,6 +100,7 @@ import type { RaccoonCredential } from './raccoon.js'
 import type { TraeCredential } from './trae.js'
 import { participateTraeLottery } from './trae-lottery.js'
 import type { ZcodeCredential } from './zcode.js'
+import type { ChannelCredential } from './jwt-utils.js'
 
 /**
  * 三家「余额查询挂在 auth 实例上」的渠道所需的最小接口。
@@ -712,49 +710,7 @@ export function createProviderCredits(
       },
     },
 
-    buddy: {
-      fetchBalance: (credential) =>
-        fetchCreditBalance(credential as BuddyCredential, CODEBUDDY),
-      fetchStatus: (credential) =>
-        fetchCheckinStatus(credential as BuddyCredential, CODEBUDDY),
-      // 预检与面板读数是同一个端点 ⇒ 只声明 `fetchStatus`（端点回落到它），
-      // 不再写一份 `claimStatus`（两处声明同一实现必然漂移）。
-      claim: (credential) =>
-        claimDailyCheckin(credential as BuddyCredential, CODEBUDDY),
-      /**
-       * ⚠️ **成长中心（22 项任务）的唯一入口** —— 只有 CodeBuddy 中国版提供。
-       *
-       * ⚠️ 产品配置由**本闭包捕获**（`CODEBUDDY`），不从调用侧转发：通用分支
-       * 拿不到 product（它传 `undefined`），转发过去就是
-       * `collectBuddyGrowth(credential, undefined, …)`，成长中心当场打坏。
-       *
-       * ⚠️ `workbuddy`（国际版）**刻意不提供**：contributor 在 !62 复审中实测确认
-       * `www.workbuddy.ai` 后端**根本没有成长中心**（无任务列表、无 claim 端点）。
-       */
-      afterClaim: (credential, entry, run) =>
-        collectBuddyGrowth(
-          credential as BuddyCredential, CODEBUDDY, entry, run.budgetMs, run.roundDeadlineAt,
-        ),
-    },
 
-    workbuddy: {
-      fetchBalance: (credential) =>
-        fetchCreditBalance(credential as BuddyCredential, WORKBUDDY),
-      // ⚠️ 国际版**没有签到接口**，但**状态端点**与余额一样存在（两个产品通用），
-      // 故这里注册 fetchStatus。真正禁止的是 `claimAll`（那由能力表与
-      // `credits.claimAll` 的显式守卫成对拦住）。
-      fetchStatus: (credential) =>
-        fetchCheckinStatus(credential as BuddyCredential, WORKBUDDY),
-      /**
-       * ⚠️ **这条守卫是载荷性的，必须有**：没有它时 `workbuddy` 会落到
-       * `credits.claimAll` 的通用分支，用**国际版**凭据去发**国内版**的签到
-       * 请求 —— 必然失败，而且是一次**真实的上游请求**。而「每日首次启动自动
-       * 签到」（`src/auto-checkin.ts`）正是靠「调 `claimAll`、按返回的信封判
-       * 跳过」来决定遍历范围的，它**不维护第二份能力名单** ⇒ 这里漏一个守卫，
-       * 它就会真去发一轮必然失败的请求。
-       */
-      claimUnavailableReason: 'WorkBuddy 国际版不支持每日签到（其后端没有签到接口）',
-    },
   }
 }
 

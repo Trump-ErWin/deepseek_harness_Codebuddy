@@ -1,7 +1,5 @@
 import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import type { BuddyCredential } from './buddy.js'
-import type { BuddyProduct } from './product.js'
 import { createJetHubStore, clearRejectionLayer, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeAggregateAllowed, sanitizeAggregateOrder, sanitizeAggregateOrderMode, sanitizeAggregateRejections, sanitizeDisabledModels, sanitizeMinimaxXff, sanitizePermanentLocks, sanitizeProviderClosed, withAllowed, withoutAllowed } from './jet-hub-store.js'
 import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, AggregateRejectionMap, JetHubStore, JetHubState, ModelDisableMap, PermanentLockMap, ProviderClosedMap } from './jet-hub-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
@@ -14,6 +12,7 @@ import type {
   ProviderAccountEntry,
   ProviderAccountStatus,
 } from './types.js'
+import type { ChannelCredential, ProviderProduct } from './jwt-utils.js'
 
 // 兼容既有的导入路径：命名空间名与黑名单类型原本定义在本模块。
 export { JET_HUB_NS } from './jet-hub-store.js'
@@ -98,7 +97,7 @@ export const DSH_RATE_LIMIT_SINK = 'DSH_RATE_LIMIT_SINK'
  * ⚠️ **不能写成 `Boolean(env[...])` 之类的 falsy 判据**：本开关的**默认值是
  * 开启**，而「未设置」与「显式关闭」必须区分开 —— `Boolean(undefined)` 与
  * `Boolean('0')` 都为 false，会把默认开启变成默认关闭（与 Qoder 排队超时、
- * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 那几个坑同型）。
+ * `DSH_EXPIRING_WINDOW_DAYS` 那几个坑同型）。
  *
  * 判据取「显式写了 `0` / `false` / `off` / `no` 才算关」，其余（含未设置、
  * 空串、无法识别的值）一律按默认开启。
@@ -1626,7 +1625,7 @@ export class AccountPool {
    * @returns 被删除的账号 id 列表（供调用方记日志）。
    */
   async pruneAccountsWithForeignDomain(
-    product: BuddyProduct,
+    product: ProviderProduct,
     foreignDomains: readonly string[] = [],
   ): Promise<string[]> {
     const removed: string[] = []
@@ -2123,12 +2122,12 @@ export class AccountPool {
    */
   async resolveCredentialForAccount(
     id: string,
-  ): Promise<CodeArtsCredential | BuddyCredential | undefined> {
+  ): Promise<CodeArtsCredential | ChannelCredential | undefined> {
     const entry = this.findAccount(id)
     if (entry === undefined) return undefined
     const parsed = await this.resolveCredentialByRef(entry.credentialRef)
     if (parsed === undefined) return undefined
-    return parsed as unknown as CodeArtsCredential | BuddyCredential
+    return parsed as unknown as CodeArtsCredential | ChannelCredential
   }
 
   /**
@@ -2194,7 +2193,7 @@ export class AccountPool {
    *
    * ## ⚠️ 为什么带类型参数 `TCredential`（2026-10-08，Task 11）
    *
-   * 返回类型原先写死成 `CodeArtsCredential | BuddyCredential` 这个**两家的联合**，
+   * 返回类型原先写死成 `CodeArtsCredential | ChannelCredential` 这个**两家的联合**，
    * 而本池服务 **13 家**，各家凭据形状互不相同 ⇒ 每个调用方都得在结果处
    * 写一个向具体凭据类型的断言才能用。
    *
@@ -2206,7 +2205,7 @@ export class AccountPool {
    *       grep -E '^-[^-].*\bas [A-Z][A-Za-z]*Credential\b'
    *
    * 命中 **22** 行，其中 **21** 行形如 `<x>.credential as <X>Credential`
-   *（唯一的例外是池内 `JSON.parse(...) as CodeArtsCredential | BuddyCredential`，
+   *（唯一的例外是池内 `JSON.parse(...) as CodeArtsCredential | ChannelCredential`，
    * 它是**被改成** `as TCredential`、不是被删）。逐处核对过上游 API：
    * **21 处的上游全部是 `getAvailableAccount`**（`lobsterai-adapter.ts` 那处
    * 因上下文窗口较窄未被正则识别，人工核对确认同源）。
@@ -2222,11 +2221,11 @@ export class AccountPool {
    * （函数体一行未改，`JSON.parse` 的结果照旧不做形状校验 —— 校验是各家
    * `parseCredential` 的职责，见 `credential-resolver.ts` 的头注）。
    *
-   * ⚠️ 默认值 `CodeArtsCredential | BuddyCredential` **刻意保留**：13 家之外
+   * ⚠️ 默认值 `CodeArtsCredential | ChannelCredential` **刻意保留**：13 家之外
    * 还有测试桩与 `ResolverPool` 这类结构化替身，去掉默认值会让它们全部编译失败，
    * 而它们本就不关心具体形状。
    */
-  async getAvailableAccount<TCredential = CodeArtsCredential | BuddyCredential>(
+  async getAvailableAccount<TCredential = CodeArtsCredential | ChannelCredential>(
     provider: string,
     modelId: string,
     excludeAccountIds?: ReadonlySet<string>,

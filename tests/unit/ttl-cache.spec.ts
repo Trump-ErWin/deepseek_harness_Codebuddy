@@ -6,7 +6,7 @@ import { TtlCache } from '../../src/ttl-cache.js'
  *
  * 本文件在 2026-10-01 新增 `ttlFor`（按结果决定这一条自己的有效期）之后编写：
  * 需求来自「用量徽标」——**成功读数缓存久、全部失败缓存短**，与
- * `buddy-balance-selector.ts` 的「成功 60s / 失败 5s」同源。
+ * `balance-selector.ts` 的「成功 60s / 失败 5s」同源。
  *
  * ⚠️ 反向验证（防止用例写成同义反复）：
  * - 把 `peek()` 改回用构造参数 `ttlMs` 比较 → 「失败短 TTL」用例变红；

@@ -83,7 +83,7 @@ import type { OfficeAceCredential } from './officeace-auth.js'
  * ⚠️ **允许写 `0`**：`0` = **关闭熔断**（每次都真发请求）。
  *    需要它是因为熔断会「让渠道提前消失」—— 若某次误判（例如华为侧短暂抖动
  *    连回两个 401），用户至少有一条不用改代码的出路。与
- *    `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 同型。
+ *    `DSH_EXPIRING_WINDOW_DAYS` 同型。
  */
 export const DSH_OFFICEACE_BREAKER_MINUTES = 'DSH_OFFICEACE_BREAKER_MINUTES'
 
@@ -105,7 +105,7 @@ export function officeaceBreakerMinutes(env: NodeJS.ProcessEnv = process.env): n
   if (typeof raw !== 'string' || raw.trim().length === 0) return OFFICEACE_BREAKER_DEFAULT_MINUTES
   const parsed = Number(raw.trim())
   // ⚠️ **不能写成 `Number(raw) || 默认值`**：`0` 是合法值（关闭熔断）却是 falsy，
-  //    会被静默换成默认值 —— 与 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 同一个坑。
+  //    会被静默换成默认值 —— 与 `DSH_EXPIRING_WINDOW_DAYS` 同一个坑。
   if (!Number.isFinite(parsed) || parsed < 0) return OFFICEACE_BREAKER_DEFAULT_MINUTES
   return parsed
 }

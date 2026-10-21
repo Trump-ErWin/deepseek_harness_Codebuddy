@@ -1,9 +1,9 @@
 /**
  * LobsterAI（有道龙虾）产品配置。
  *
- * ## 为什么不复用 `BuddyProduct`
+ * ## 为什么不复用 `ProviderProduct`
  *
- * `src/product.ts` 的 `BuddyProduct` 是**围绕 CodeBuddy 系协议**设计的，
+ * `src/product.ts` 的 `ProviderProduct` 是**围绕 CodeBuddy 系协议**设计的，
  * 它的这些字段对 LobsterAI 完全无意义：
  *
  * - `productCode` / `attributionName` / `clientVersion` / `cliVersion`
@@ -13,7 +13,7 @@
  * - `userAgentByModelFamily` —— 那是腾讯后台按 UA 归因的机制；
  * - `appendSessionParams` / `pluginVersion` —— WorkBuddy 登录 URL 的后缀参数。
  *
- * 且 `BuddyProduct.id` 是字面量联合 `'buddy' | 'workbuddy'`，加第三个值会牵动
+ * 且 `ProviderProduct.id` 是字面量联合 `'buddy' | 'workbuddy'`，加第三个值会牵动
  * `productById` / `registerBuddyLlm` / `reconcileWithFallback` 一串调用点。
  *
  * 因此这里定义**平行**的 `LobsteraiProduct`：共用的是架构**模式**
@@ -133,7 +133,7 @@ export const LOBSTERAI_USER_AGENT = 'LobsterAI/0.1.0'
 /**
  * LobsterAI 产品配置。
  *
- * 与 `BuddyProduct` 平行，字段全部为 LobsterAI 实际需要的。
+ * 与 `ProviderProduct` 平行，字段全部为 LobsterAI 实际需要的。
  */
 export interface LobsteraiProduct {
   /** provider 标识：注册到 `ctx.llm` 的路由名，也是账号列表的 provider 字段值。 */

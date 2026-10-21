@@ -2,7 +2,6 @@ import { Context } from '@deepseek-ai/cordis'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { apply } from '../../src/index.js'
 import { CodeArtsAuth } from '../../src/service.js'
-import { BuddyAuth } from '../../src/buddy-auth.js'
 import { LobsteraiAuth } from '../../src/lobsterai-auth.js'
 import { QoderAuth } from '../../src/qoder-auth.js'
 import { TraeAuth } from '../../src/trae-auth.js'
@@ -82,7 +81,7 @@ async function settle(times = 4): Promise<void> {
 
 /** 所有 Auth 类（去重，buddy/workbuddy 与 qoder/qodercn 各共用一个类）。 */
 const AUTH_CLASSES = [
-  CodeArtsAuth, BuddyAuth, LobsteraiAuth, QoderAuth, TraeAuth,
+  CodeArtsAuth, LobsteraiAuth, QoderAuth, TraeAuth,
   ClineAuth, LoomyAuth, RaccoonAuth, MinimaxAuth, ZcodeAuth, GeminiAuth,
 ] as const
 

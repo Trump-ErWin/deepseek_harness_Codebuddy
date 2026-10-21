@@ -15,7 +15,7 @@
  * ## 与后端的关系
  *
  * 分桶判据的权威实现是后端 `src/buddy-balance-rank.ts` 的
- * `splitBuddyCreditsByExpiry()`（选号用它）。本文件是它的**展示侧同规则复刻**
+ * `splitCreditsByExpiry()`（选号用它）。本文件是它的**展示侧同规则复刻**
  * —— 两者必须逐条一致，否则用户会看到「面板说还有 250 临时积分，选号却说没号可用」。
  *
  * ⚠️ 一致性由 `tests/unit/credit-expiry.spec.ts` 的**对账用例**锁死（同一组
@@ -24,7 +24,7 @@
  * ## 窗口天数从哪来
  *
  * 只能由**后端回传**（`credits.balances` 的 `windowDays`）：它可被
- * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖。前端不得写死 15 —— 那会出现
+ * `DSH_EXPIRING_WINDOW_DAYS` 覆盖。前端不得写死 15 —— 那会出现
  * 「提示说只烧 15 天内的、实际按 31 天筛号」。
  */
 
@@ -38,7 +38,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * "会不会作废"这个维度）会被当成"窗口 0 天"、在卡片上凭空渲染出一行
  * 假的「临时 0 · 长期 N」。
  *
- * 窗口实际由后端写死为 15 天（或经 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 放宽），
+ * 窗口实际由后端写死为 15 天（或经 `DSH_EXPIRING_WINDOW_DAYS` 放宽），
  * 这里只做防御性归一，不假设任何特定取值。
  */
 function normalizeWindowDays(windowDays) {

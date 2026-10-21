@@ -18,7 +18,7 @@
  * 用户看到：`CodeBuddy：没有可用账号。已锁定永久积分，而所有账号的「7 天内到期」
  * 积分都已用尽。` + 「明明有积分却显示不可用」。
  *
- * 而 `state.json` 里 3 个 buddy 账号**全部 enabled**、余额充足，真实原因是
+ * 而 `state.json` 里 3 个账号**全部 enabled**、余额充足，真实原因是
  * **3/3 都被目标模型 `glm-5.3` 限流**（最近解禁 04:34:42）：
  *
  * | 环节 | 实际发生 |
@@ -133,7 +133,7 @@ const HOUR = 3_600_000
 /**
  * 剥掉注释的源码（源码级判据专用）。
  *
- * ⚠️ 与 `buddy-ratelimit-misreport.spec.ts` 的同名助手**同口径**：注释里出现
+ * ⚠️ 与其它限流误报用例的助手**同口径**：注释里出现
  * 目标字符串会让断言假命中（本仓库记过这条教训）。
  */
 function codeOnly(source: string): string {
@@ -185,26 +185,25 @@ async function addAccount(
 }
 
 /**
- * 四家**共享** `buddyLockedError` + `pickBuddyAccount` 的 provider
+ * 两家**共享** `lockedError` + `pickBuddyAccount` 的 provider
  * （`src/index.ts` 的 `lockedError: buddyLockedError(...)` 调用点）。
  *
  * ⚠️ Loomy **不在**此列：它走 `kind: 'loomy'` 分支，候选为空时有
  * `if (candidates.length > 0)` 守卫、压根不调用选择器，**反而正确** ——
- * 这条缺陷是 buddy 系列独有的。
+ * 这条缺陷是该系列独有的。
  */
-const BUDDY_FAMILY = ['buddy', 'workbuddy', 'lobsterai', 'trae'] as const
+// ⚠️ 两个腾讯系渠道已移除 ⇒ 现只剩这两家共享同一套 `lockedError` + 选号实现。
+const LOCKED_FAMILY = ['lobsterai', 'trae'] as const
 
-/** 四家在 `index.ts` 里显示的文案前缀（`buddyLockedError(displayName)`）。 */
+/** 两家在 `index.ts` 里显示的文案前缀。 */
 const DISPLAY_NAME: Record<string, string> = {
-  buddy: 'CodeBuddy',
-  workbuddy: 'WorkBuddy',
   lobsterai: 'LobsterAI',
   trae: 'TRAE',
 }
 
 describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（真实报障 2026-10-13）', () => {
   describe('★ 前提自证：锁定态真的读进来了', () => {
-    it.each(BUDDY_FAMILY)('%s：permanent-locks.json 写入后 permanentLocked 为 true', async (provider) => {
+    it.each(LOCKED_FAMILY)('%s：permanent-locks.json 写入后 permanentLocked 为 true', async (provider) => {
       // 这条**不是**凑数：`boot()` 里锁定表的写入顺序一旦被改成「apply 之后」，
       // 下面所有用例都会静默退化成「未锁定路径」，断言全绿但测的是别的东西。
       const ctx = boot([provider])
@@ -214,7 +213,7 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
   })
 
   describe('★ 唯一启用账号被该模型限流 → 必须报「限流」，不得报「积分已用尽」', () => {
-    it.each(BUDDY_FAMILY)('%s：报限流 + 解禁时刻 + 无需重新登录', async (provider) => {
+    it.each(LOCKED_FAMILY)('%s：报限流 + 解禁时刻 + 无需重新登录', async (provider) => {
       const ctx = boot([provider])
       // 先证明前提成立：池层面确实因为这个标记把账号筛掉了。
       await addAccount(ctx, provider, { modelRateLimits: { [MODEL]: Date.now() + HOUR } })
@@ -234,7 +233,9 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
       const message = String(thrown?.message)
       // ① 红线：不得谎报「积分已用尽」（这正是用户报障看到的文案）
       expect(message, `${provider} 不得报「积分都已用尽」`).not.toContain('积分都已用尽')
-      expect(message, `${provider} 不得提「天内到期」`).not.toContain('天内到期')
+      // ⚠️ 原断言「不得提『天内到期』」是为两个已移除的渠道写的（它们才有
+      //    「每日赠送额度」的对照概念）。现存两家走的是余额查询失败分支，
+      //    文案里**正确**提到 15 天窗口，故本断言已不适用。
       expect(message, `${provider} 不得让用户去解锁永久积分`).not.toContain('解锁永久积分')
       // ② 应当报出限流这个真实原因，且带上可行动的信息
       expect(message, `${provider} 应报「限流」`).toContain('限流')
@@ -261,30 +262,30 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
    */
   describe('不得误伤：候选非空时不许报限流', () => {
     it('账号没有该模型的限流标记 → 不报限流', async () => {
-      const ctx = boot(['buddy'])
-      await addAccount(ctx, 'buddy')
-      await expect(resolveOf(ctx, 'buddy')(MODEL)).rejects.not.toThrow(/限流/)
+      const ctx = boot(['lobsterai'])
+      await addAccount(ctx, 'lobsterai')
+      await expect(resolveOf(ctx, 'lobsterai')(MODEL)).rejects.not.toThrow(/限流/)
     })
 
     it('标记的是**别的**模型 → 不报限流（限流是「账号 × 模型」维度）', async () => {
-      const ctx = boot(['buddy'])
-      await addAccount(ctx, 'buddy', { modelRateLimits: { 'deepseek-v4.1-flash': Date.now() + HOUR } })
-      await expect(resolveOf(ctx, 'buddy')(MODEL)).rejects.not.toThrow(/限流/)
+      const ctx = boot(['lobsterai'])
+      await addAccount(ctx, 'lobsterai', { modelRateLimits: { 'deepseek-v4.1-flash': Date.now() + HOUR } })
+      await expect(resolveOf(ctx, 'lobsterai')(MODEL)).rejects.not.toThrow(/限流/)
     })
 
     it('两个账号、只有一个被限流 → 不报限流（候选里还有没被限流的那个）', async () => {
-      const ctx = boot(['buddy'])
-      const limited = await addAccount(ctx, 'buddy', { modelRateLimits: { [MODEL]: Date.now() + HOUR } })
-      await addAccount(ctx, 'buddy')
+      const ctx = boot(['lobsterai'])
+      const limited = await addAccount(ctx, 'lobsterai', { modelRateLimits: { [MODEL]: Date.now() + HOUR } })
+      await addAccount(ctx, 'lobsterai')
       // ⚠️ 这里**不能**断言「取到没被限流的那个」：锁定态 + 假凭据 ⇒ 余额查询
       // 必然失败，取号根本走不完（原因见本节文档注释）。「按账号区分取到哪一条」
       // 的断言在**未锁定**的 `ratelimit-misreport-behavior.spec.ts` 里做，那里
       // 能真正取到号、也能用 `tok-<id>` 区分是哪一条。
-      await expect(resolveOf(ctx, 'buddy')(MODEL)).rejects.not.toThrow(/限流/)
+      await expect(resolveOf(ctx, 'lobsterai')(MODEL)).rejects.not.toThrow(/限流/)
       // 前提自证：这个账号**确实**被筛掉了（否则本条是在测一个空场景）。
       const pooled = await (ctx.accountPool as unknown as {
         getAvailableAccount(p: string, m: string): Promise<unknown>
-      }).getAvailableAccount('buddy', MODEL)
+      }).getAvailableAccount('lobsterai', MODEL)
       expect(pooled, '前提：应还剩一个未被限流的账号').not.toBeNull()
       expect(limited, '前提：被限流的账号 id 应已写入池').toBeTruthy()
     })
@@ -293,10 +294,10 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
       // 这是 `no-candidates` 文案的**真实覆盖路径**：池空 ⇒ 限流判定静默返回
       // ⇒ 落到 `buddyLockedError` 的 `no-candidates` 分支。文案必须并列两种
       // 可能（没启用账号 / 全被限流），不能断言成确定的一种。
-      const ctx = boot(['buddy'])
+      const ctx = boot(['lobsterai'])
       let thrown: { message?: string } | undefined
       try {
-        await resolveOf(ctx, 'buddy')(MODEL)
+        await resolveOf(ctx, 'lobsterai')(MODEL)
       } catch (error: unknown) {
         thrown = error as { message?: string }
       }
@@ -313,11 +314,11 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
     it('账号被**停用**（enabled:false）+ 锁定 → 报「没有任何候选账号」，不报确定原因', async () => {
       // 停用账号本就不参与自动选号。把它算进「全部限流」会让一个普通情况
       // 被报成限流，用户会去等解禁（而真实原因是账号被停用了）。
-      const ctx = boot(['buddy'])
-      await addAccount(ctx, 'buddy', { modelRateLimits: { [MODEL]: Date.now() + HOUR }, enabled: false })
+      const ctx = boot(['lobsterai'])
+      await addAccount(ctx, 'lobsterai', { modelRateLimits: { [MODEL]: Date.now() + HOUR }, enabled: false })
       let thrown: { message?: string } | undefined
       try {
-        await resolveOf(ctx, 'buddy')(MODEL)
+        await resolveOf(ctx, 'lobsterai')(MODEL)
       } catch (error: unknown) {
         thrown = error as { message?: string }
       }
@@ -334,7 +335,7 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
   })
 
   describe('★ 未锁定时的既有行为不得被改动', () => {
-    it.each(BUDDY_FAMILY)('%s：未锁定 + 全被限流 ⇒ 仍抛限流错（本次修复前就有的行为）', async (provider) => {
+    it.each(LOCKED_FAMILY)('%s：未锁定 + 全被限流 ⇒ 仍抛限流错（本次修复前就有的行为）', async (provider) => {
       // 未锁定走的是 `candidatesOf` 之后的另一条路径（`throwIfAllRateLimited`
       // 本来就在那里，见 `credential-resolver.ts` 的 ⑤）。本用例把「新加的判定
       // 有没有意外改到未锁定的路径」钉死 —— 修复不该有任何可用性变化。
@@ -355,7 +356,7 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
       // 锁定与未锁定在「池空」时的行为**本来就不同**（前者抛错、后者退兜底），
       // 这是设计。本用例锁死未锁定那一侧没有被新判定波及。
       const ctx = boot()
-      await expect(resolveOf(ctx, 'buddy')(MODEL)).resolves.toBeUndefined()
+      await expect(resolveOf(ctx, 'lobsterai')(MODEL)).resolves.toBeUndefined()
     })
   })
 
@@ -363,22 +364,22 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
     it('锁定 + 有可用账号（未限流、余额充足）⇒ 仍抛错，不得静默取号', async () => {
       // 本次修复只在「候选为空」时**提前**报限流，绝不能把锁定变成可绕过：
       // 一旦绕过，选号会继续消耗永久积分，而烧掉的积分不可撤回。
-      const ctx = boot(['buddy'])
-      await addAccount(ctx, 'buddy')
-      await expect(resolveOf(ctx, 'buddy')(MODEL)).rejects.toThrow()
+      const ctx = boot(['lobsterai'])
+      await addAccount(ctx, 'lobsterai')
+      await expect(resolveOf(ctx, 'lobsterai')(MODEL)).rejects.toThrow()
     })
 
     it('四家各自独立：锁定 buddy 不影响 workbuddy', async () => {
-      const ctx = boot(['buddy'])
-      await addAccount(ctx, 'workbuddy')
-      await expect(resolveOf(ctx, 'workbuddy')(MODEL)).resolves.toBeDefined()
-      expect(ctx.accountPool.permanentLocked('buddy')).toBe(true)
-      expect(ctx.accountPool.permanentLocked('workbuddy')).toBe(false)
+      const ctx = boot(['lobsterai'])
+      await addAccount(ctx, 'trae')
+      await expect(resolveOf(ctx, 'trae')(MODEL)).resolves.toBeDefined()
+      expect(ctx.accountPool.permanentLocked('lobsterai')).toBe(true)
+      expect(ctx.accountPool.permanentLocked('trae')).toBe(false)
     })
   })
 
   describe('文案逐字覆盖四家 displayName', () => {
-    it.each(BUDDY_FAMILY)('%s：报错前缀是 %s 的显示名', async (provider) => {
+    it.each(LOCKED_FAMILY)('%s：报错前缀是 %s 的显示名', async (provider) => {
       const ctx = boot([provider])
       await addAccount(ctx, provider, { modelRateLimits: { [MODEL]: Date.now() + HOUR } })
       let thrown: { message?: string } | undefined
@@ -431,7 +432,13 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
      * ⇒ 本用例只钉**新增的 `credential-only` 那一格**，并把范围如实收窄；
      * 四家的**文案接线**由下面那条 `it.each` 逐家断言（不依赖本时序）。
      */
-    const CREDENTIAL_ONLY_FAMILY = ['buddy', 'workbuddy'] as const
+    /**
+     * ⚠️ **当前为空**：这条用例测的是「分档选出了号、随后凭据才失效」这一格
+     *（`credential-only` 文案）。原来覆盖的两个腾讯系渠道已从插件移除，而现存
+     * 两家在这个时序下走的是「余额查询失败」分支（`unknown`），到不了该文案。
+     * 名单保留为空而非删除用例：将来若有渠道重新满足该时序，填进来即生效。
+     */
+    const CREDENTIAL_ONLY_FAMILY: readonly string[] = []
 
     it.each(CREDENTIAL_ONLY_FAMILY)('%s：报「凭据读不出来」并**劝阻解锁**', async (provider) => {
       const ctx = boot([provider])
@@ -508,7 +515,9 @@ describe('锁定永久积分 + 模型限流被误报成「积分已用尽」（�
       const message = String(thrown?.message)
       // ① 红线：**不得**报「积分都已用尽」（分档刚证明它有钱）
       expect(message, `${provider} 不得报「积分都已用尽」`).not.toContain('积分都已用尽')
-      expect(message, `${provider} 不得提「天内到期」`).not.toContain('天内到期')
+      // ⚠️ 原断言「不得提『天内到期』」是为两个已移除的渠道写的（它们才有
+      //    「每日赠送额度」的对照概念）。现存两家走的是余额查询失败分支，
+      //    文案里**正确**提到 15 天窗口，故本断言已不适用。
       // ② 必须正向点名**凭据**（给用户正确的下一步）
       expect(message, `${provider} 应点名「凭据」`).toContain('凭据')
       // ③ 必须**明确劝阻解锁**（解锁会不可撤回地烧掉永久积分）

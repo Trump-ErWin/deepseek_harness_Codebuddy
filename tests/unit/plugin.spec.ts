@@ -4,9 +4,7 @@ import type { CommandDefinition } from '@deepseek-ai/dsh-commands'
 import { apply, makeReadImage } from '../../src/index.js'
 import * as pluginEntry from '../../src/index.js'
 import { runLoginFlow, runOAuthFlow } from '../../src/login.js'
-import { runBuddyLoginFlow } from '../../src/buddy-oauth.js'
 import { CodeArtsAuth } from '../../src/service.js'
-import { BuddyAuth } from '../../src/buddy-auth.js'
 import { LobsteraiAuth } from '../../src/lobsterai-auth.js'
 import { TraeAuth } from '../../src/trae-auth.js'
 import { ZcodeAuth } from '../../src/zcode-auth.js'
@@ -24,14 +22,9 @@ vi.mock('../../src/login.js', () => ({
 // RefreshTokenExpiredError 必须保留真实实现：buddy-auth 的 RefreshScheduler
 // onError 回调以 `error instanceof RefreshTokenExpiredError` 判定续期是否
 // 彻底失效；mock 缺少该导出会让判定路径抛出 unhandled rejection。
-vi.mock('../../src/buddy-oauth.js', async (importOriginal) => ({
-  ...await importOriginal(),
-  runBuddyLoginFlow: vi.fn(),
-}))
 
 const mockedRunLoginFlow = vi.mocked(runLoginFlow)
 const mockedRunOAuthFlow = vi.mocked(runOAuthFlow)
-const mockedRunBuddyLoginFlow = vi.mocked(runBuddyLoginFlow)
 
 class FakeCredentials {
   private store = new Map<string, string>()
@@ -221,157 +214,7 @@ describe('0.1.7 settings 契约（SettingsForms，无 register）', () => {
   })
 })
 
-describe('buddy plugin entry', () => {
-  it('registers the buddyAuth service without slash commands', () => {
-    // 登录/状态/续期都在 Jet Hub 设置页完成，命令式入口已移除。
-    const { ctx, commands } = makeContext()
-    apply(ctx)
-    expect(ctx.buddyAuth).toBeInstanceOf(BuddyAuth)
-    const names = commands.definitions.map((d) => d.name)
-    expect(names).not.toContain('buddy-login')
-    expect(names).not.toContain('buddy-status')
-    expect(names).not.toContain('buddy-refresh')
-  })
-
-  it('registers the buddy LLM route', () => {
-    const { ctx, llm } = makeContext()
-    apply(ctx)
-    expect(llm.registeredProviders).toContain('buddy')
-    expect(llm.adapters).toContain('buddy')
-  })
-
-  it('stops the buddy refresh scheduler when the plugin context is disposed', async () => {
-    const { ctx } = makeContext()
-    apply(ctx)
-    const stopSpy = vi.spyOn(ctx.buddyAuth, 'stop')
-    await ctx.fiber.dispose()
-    expect(stopSpy).toHaveBeenCalled()
-  })
-})
-
-describe('WorkBuddy provider 注册', () => {
-  it('apply 时注册 buddy 与 workbuddy 两个 provider 路由', () => {
-    const ctx = createMockContext()
-    apply(ctx as never)
-    const registered = ctx.llm.registeredProviders
-    expect(registered).toContain('buddy')
-    expect(registered).toContain('workbuddy')
-  })
-
-  it('WorkBuddy 使用独立的凭据 ref', () => {
-    expect(WORKBUDDY.defaultCredentialRef).toBe('WORKBUDDY_ACCESS_TOKEN')
-  })
-
-  /**
-   * ⚠️ 2026-10-01（用户要求）：原先这里断言 WorkBuddy 在模型设置页的目录项与
-   * `settingsNs`。本插件已**刻意不再声明**可配置 provider —— 账号、模型开关与模型
-   * 目录都在 Jet Hub 设置页管理，声明只会在「设置 → 模型 → 提供商」留下无人使用的
-   * 行。机制与代价评估见 `src/llm-register-compat.ts` 模块头；此处改为反向断言，
-   * 防止日后误把声明加回来。
-   */
-  it('不向模型设置页声明 workbuddy 目录项（但路由与适配器照常注册）', () => {
-    const ctx = createMockContext()
-    apply(ctx as never)
-    expect(ctx.llm.configurableProviders).toEqual([])
-    expect(ctx.llm.registeredProviders).toContain('workbuddy')
-    expect(ctx.llm.adapters).toContain('workbuddy')
-  })
-
-  it('不注册任何 provider 的斜杠命令（入口都在 Jet Hub 设置页）', () => {
-    const ctx = createMockContext()
-    apply(ctx as never)
-    const names = ctx.commands.definitions.map((d) => d.name)
-    for (const removed of [
-      'buddy-login', 'buddy-status', 'buddy-refresh', 'workbuddy-login', 'workbuddy-status',
-      // CodeArts 的三个命令也已移除：登录/状态/续期统一在 Jet Hub 完成，
-      // 六个 provider 的做法现在完全一致。
-      'codearts-login', 'codearts-status', 'codearts-refresh', 'codearts-logout',
-    ]) {
-      expect(names, removed).not.toContain(removed)
-    }
-    // 命令名必须唯一，重复注册会让后注册的覆盖先注册的。
-    expect(new Set(names).size).toBe(names.length)
-  })
-
-  // cordis 的 Service 构造时按名称注册，同名第二次注册会抛
-  // `service "buddyAuth" has been registered`。两个产品必须各占一个服务名，
-  // 否则 apply() 直接抛错、插件完全无法加载。
-  it('同时暴露 buddyAuth 与 workbuddyAuth 两个独立实例，各读自己的凭据 ref', () => {
-    const ctx = createMockContext()
-    apply(ctx as never)
-    expect(ctx.buddyAuth).toBeInstanceOf(BuddyAuth)
-    expect(ctx.workbuddyAuth).toBeInstanceOf(BuddyAuth)
-    expect(ctx.buddyAuth).not.toBe(ctx.workbuddyAuth)
-    expect(ctx.buddyAuth.product.id).toBe('buddy')
-    expect(ctx.workbuddyAuth.product.id).toBe('workbuddy')
-    expect(ctx.buddyAuth.credentialRefName).toBe('BUDDY_ACCESS_TOKEN')
-    expect(ctx.workbuddyAuth.credentialRefName).toBe('WORKBUDDY_ACCESS_TOKEN')
-  })
-
-  it('workbuddyAuth 只读 WorkBuddy 自己的凭据 ref', async () => {
-    const ctx = createMockContext()
-    apply(ctx as never)
-    // 只写入 CodeBuddy 的 ref：WorkBuddy 必须报告未配置。
-    await ctx.credentials.set('BUDDY_ACCESS_TOKEN', JSON.stringify({
-      access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7_200_000),
-    }))
-    expect((await ctx.workbuddyAuth.status()).configured).toBe(false)
-
-    // 写入 WorkBuddy 自己的 ref 后变为已配置。
-    await ctx.credentials.set('WORKBUDDY_ACCESS_TOKEN', JSON.stringify({
-      access_token: 'AT2', refresh_token: 'RT2', expires_at: String(Date.now() + 7_200_000),
-    }))
-    expect((await ctx.workbuddyAuth.status()).configured).toBe(true)
-  })
-
-  it('buddyAuth 与 workbuddyAuth 的凭据互相隔离', async () => {
-    const ctx = createMockContext()
-    apply(ctx as never)
-    // 只写 CodeBuddy 的 ref：CodeBuddy 已配置、WorkBuddy 未配置。
-    await ctx.credentials.set('BUDDY_ACCESS_TOKEN', JSON.stringify({
-      access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7_200_000),
-    }))
-    expect((await ctx.buddyAuth.status()).configured).toBe(true)
-    expect((await ctx.workbuddyAuth.status()).configured).toBe(false)
-  })
-
-  it('dispose 时同时停止 Buddy 与 WorkBuddy 的续期调度', async () => {
-    const ctx = createMockContext()
-    apply(ctx as never)
-    const buddyStop = vi.spyOn(ctx.buddyAuth, 'stop')
-    const workbuddyStop = vi.spyOn(ctx.workbuddyAuth, 'stop')
-    await ctx.fiber.dispose()
-    expect(buddyStop).toHaveBeenCalled()
-    expect(workbuddyStop).toHaveBeenCalled()
-  })
-
-  /**
-   * `connection` **不得**出现在插件级静态 `inject` 里。
-   *
-   * 该服务只由 Web bundle（dsh-client-connection）提供，headless / CLI profile
-   * 中并不存在。静态 `inject` 会让本插件在那些 profile 里永久 pending，整个
-   * profile 因此以
-   * `plugin tree failed to load: 1 entry did not activate` 启动失败
-   * —— chicheng-cron 的 skill/agent 任务正是跑在 `dsh --profile headless` 下，
-   * 会全部 exit 1。
-   *
-   * 正确做法是 `registerJetHubRpc` 内部用惰性注入（`ctx.inject(['connection'], …)`）
-   * 挂载端点：Web 下正常注册，其余 profile 只是不注册 Jet Hub 端点。
-   *
-   * 这条断言锁住的是「**能不能加载**」而非某个功能细节，所以即便日后有人为了
-   * 让 UI 更"直接"而把 connection 加回静态 inject，也必须先看到这里失败。
-   */
-  it('静态 inject 不得包含 connection（否则 headless profile 启动失败）', () => {
-    const { inject } = pluginEntry as { inject?: readonly string[] }
-    expect(Array.isArray(inject)).toBe(true)
-    expect(inject).not.toContain('connection')
-    // 必需服务仍须声明，避免修 connection 时顺手把别的服务误删。
-    for (const required of ['credentials', 'commands', 'llm']) {
-      expect(inject, required).toContain(required)
-    }
-  })
-})
-
+// ⚠️ 「buddy plugin entry」与「WorkBuddy provider 注册」两组随渠道删除而移除。
 
 describe('LobsterAI provider 注册', () => {
   it('apply 时注册 lobsterai provider 路由与适配器', () => {
@@ -564,7 +407,7 @@ describe('模型设置页：不声明可配置 provider', () => {
     apply(ctx)
     expect(llm.configurableProviders).toEqual([])
     for (const provider of [
-      'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn',
+      'codearts', 'lobsterai', 'qoder', 'qodercn',
       'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode',
     ]) {
       expect(llm.registeredProviders, provider).toContain(provider)

@@ -4,7 +4,7 @@
  *
  * ## 本文件最重要的职责：与后端**对账**
  *
- * 判据的权威实现在后端 `src/buddy-balance-rank.ts`（选号用它），前端这份是
+ * 判据的权威实现在后端 `src/balance-rank.ts`（选号用它），前端这份是
  * 展示侧的同规则复刻。两者一旦漂移，用户就会看到「面板说还有 250 临时积分，
  * 选号却说没号可用」——而这类不一致**没有任何一条单侧用例能发现**。
  *
@@ -30,8 +30,8 @@ import {
   splitCreditsByExpiry,
 } from '../../plugin-src/client/credit-expiry.js'
 import { supportsCreditPackageList } from '../../plugin-src/client/credits-capabilities.js'
-import { splitBuddyCreditsByExpiry } from '../../src/buddy-balance-rank.js'
 import type { CreditBalance, CreditPackage } from '../../src/credits.js'
+import { splitBalanceByExpiry as backendSplitImpl } from '../../src/balance-rank.js'
 
 const DAY = 24 * 60 * 60 * 1000
 const NOW = Date.UTC(2026, 9, 1, 12, 0, 0)
@@ -55,7 +55,7 @@ function pkg(overrides: Partial<CreditPackage> = {}): CreditPackage {
 
 /** 后端签名：吃整份 CreditBalance + windowMs；前端：吃 packages + windowDays。 */
 function backendSplit(packages: CreditPackage[], windowDays = WINDOW_DAYS, now = NOW) {
-  return splitBuddyCreditsByExpiry(
+  return backendSplitImpl(
     { total: 0, packages, expiredTotal: 0 } as CreditBalance,
     now,
     windowDays * DAY,
@@ -66,7 +66,7 @@ function backendSplit(packages: CreditPackage[], windowDays = WINDOW_DAYS, now =
  * 把前端**三档**归约成后端的**两档**口径。
  *
  * ⚠️ 这是 2026-10-12 引入三档展示后的**必要适配**，不是放宽断言：
- * 后端 `splitBuddyCreditsByExpiry` 是**选号判据**（只关心「会不会近期作废」，
+ * 后端 `splitCreditsByExpiry` 是**选号判据**（只关心「会不会近期作废」，
  * 故只有 `expiring` / `permanent` 两桶）；前端 `splitCreditsByExpiry` 是
  * **展示口径**（用户要求把「真永久」与「到期还远」分开着色，故三桶）。
  *
@@ -397,7 +397,7 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
  * ⚠️ **对账**：同一组 fixture 喂前后端，两桶必须逐分不差。
  * 这是本文件存在的核心理由 —— 见文件头。
  */
-describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
+describe('与后端 splitCreditsByExpiry 对账', () => {
   const fixtures: Array<[string, CreditPackage[], number?]> = [
     ['9 天的 Bonus Pack', [pkg({ remaining: 250, deductionEndTime: NOW + 9 * DAY })]],
     ['3008 天的套餐', [pkg({ name: 'Free Plan Subscription', remaining: 100, deductionEndTime: NOW + 3008 * DAY })]],
@@ -1178,8 +1178,8 @@ describe('formatPackageTooltip（包列表）', () => {
  * 会出现「每日赠送 4992 / 4992 永久」—— 而那笔恰恰**当天就作废**，说反了。
  */
 describe('supportsCreditPackageList 的门控', () => {
-  it('buddy 系 + lobsterai + qoder/qodercn + trae 为真', () => {
-    for (const p of ['buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae']) {
+  it('lobsterai + qoder/qodercn + trae 为真', () => {
+    for (const p of ['lobsterai', 'qoder', 'qodercn', 'trae']) {
       expect(supportsCreditPackageList(p), p).toBe(true)
     }
   })

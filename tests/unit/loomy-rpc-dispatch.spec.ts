@@ -139,7 +139,7 @@ describe('Loomy RPC 分派', () => {
   /**
    * ⚠️ 两个 buddy 的响应必须**回传当前生效的窗口天数**。
    *
-   * 窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，前端文案若继续用写死的
+   * 窗口可被 `DSH_EXPIRING_WINDOW_DAYS` 覆盖，前端文案若继续用写死的
    * 15 就会出现「提示说只烧 15 天内的、实际按 31 天筛号」。Loomy 没有窗口
    * 概念，故只有 buddy 系带这个字段。
    */
@@ -151,8 +151,8 @@ describe('Loomy RPC 分派', () => {
     //    「哪些渠道真的回传 windowDays」由**真跑端点**的行为用例守：
     //    `provider-registry-consumers.spec.ts` 的
     //    「credits.permanentLock 的响应体取决于 registry」。
-    expect(rpcSource).toMatch(/windowDays: buddyExpiringWindowDays\(\)/)
-    expect(rpcSource).toContain("from './buddy-balance-rank.js'")
+    expect(rpcSource).toMatch(/windowDays: expiringWindowDays\(\)/)
+    expect(rpcSource).toContain("from './balance-rank.js'")
     expect(typesSource).toMatch(/interface RpcPermanentLockResponse \{[\s\S]*?windowDays\?: number/)
   })
 
@@ -160,7 +160,7 @@ describe('Loomy RPC 分派', () => {
    * ⚠️ **TRAE / LobsterAI 也必须回传窗口天数**（2026-10-06 PR !68 审计补齐）。
    *
    * 判据已从「是不是 buddy」改成「**是否按到期时间分桶**」，而这两家走的是同一个
-   * `splitBuddyCreditsByExpiry`、同样受 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 影响。
+   * `splitCreditsByExpiry`、同样受 `DSH_EXPIRING_WINDOW_DAYS` 影响。
    *
    * ⚠️ 上面那条用例的正则只覆盖 buddy 那一半：把 `|| provider === TRAE.id
    * || provider === LOBSTERAI.id` 整段删掉，全量单测**照样全绿** —— 而后果是
@@ -205,7 +205,7 @@ describe('Loomy RPC 分派', () => {
     //      「支持锁定的渠道 ⊆ usesExpiryWindow ∪ {loomy}」逐项对账，
     //      「前后端支持面一致」由 `credits-capabilities.spec.ts` 守 —— 本文件
     //      不重复那条不变式（重复会变成「同一语义两套判据」）。
-    for (const id of ['loomy', 'buddy', 'workbuddy']) {
+    for (const id of ['loomy', 'lobsterai', 'trae']) {
       expect(PERMANENT_LOCK_PROVIDERS.has(id), `${id} 应在永久积分锁定白名单里`).toBe(true)
     }
     /**

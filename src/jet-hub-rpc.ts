@@ -36,13 +36,12 @@ import {
 } from './openai-gateway/runtime.js'
 import type { CodeArtsAuth } from './service.js'
 import type { CodeArtsCredential } from './types.js'
-import type { BuddyAuth } from './buddy-auth.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
 import type { QoderAuth } from './qoder-auth.js'
 import type { TraeAuth } from './trae-auth.js'
 import type { ClineAuth } from './cline-auth.js'
 import { LOOMY } from './loomy-product.js'
-import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
+import { expiringWindowDays } from './balance-rank.js'
 // ⚠️ **值导入**（不是类型）：一键「拒绝非临期」要把这份清单传给账号池。
 //    它是一份**冻结的静态数组**（`Object.freeze([...])`），模块级求值安全 ——
 //    与 `WIRED_EXPIRY_PROVIDERS` 自己那条注释里说的「不要读 runtime 注册表」不矛盾
@@ -177,9 +176,7 @@ import {
   isClineRefreshable,
   type ClineCredential,
 } from './cline.js'
-import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
-import { credentialExpiresAtMs } from './buddy.js'
-import type { BuddyCredential } from './buddy.js'
+import { credentialExpiresAtMs } from './jwt-utils.js'
 import {
   claimDailyCheckin,
   claimUnitOf,
@@ -189,38 +186,6 @@ import {
   type ClaimOutcome,
   type CreditBalance,
 } from './credits.js'
-import { CODEBUDDY, productById, type BuddyProduct } from './product.js'
-// ⚠️ CodeBuddy 限时补偿积分（2026-10-16）：一次性活动，**不接自动签到**。
-// 端点走 buddy 的 `webBase`（`src/product.ts` 里是 `www.workbuddy.cn`；三个 host
-// 实测均可达，见该模块头）。
-import {
-  claimCompensation,
-  describeCompensationFailure,
-  fetchCompensationStatus,
-} from './buddy-compensation.js'
-import { collectBuddyGrowth } from './buddy-growth.js'
-/**
- * ⚠️ **`collectBuddyGrowth` 已搬到 `src/buddy-growth.ts`**（2026-10-08 Task 4），
- * 并在此**原样再导出**以保持既有调用点与用例的 import 路径不变。
- *
- * 搬家的理由（不是洁癖）：它是 `credits.afterClaim` 的实现，而 `afterClaim`
- * 由 `src/provider-credits.ts` 的能力表提供。留在本文件会让那张表必须 import
- * 本文件 ⇒ `provider-credits.ts ⇄ jet-hub-rpc.ts` **循环 import**（本文件已经
- * import 前者）。搬到 `buddy-growth.ts` 后依赖是单向的：
- * `jet-hub-rpc.ts` → `provider-credits.ts` → `buddy-growth.ts`。
- *
- * ⚠️ **本再导出是过渡形态**，不是接口：新代码应直接从 `buddy-growth.js` 取。
- * 它由 `tests/unit/buddy-growth.spec.ts` 的 import 覆盖（唯一的生产消费者是
- * `src/provider-credits.ts`，它**直接从 `buddy-growth.js` 取**，不经过本文件）。
- *
- * ⚠️ **2026-10-08 修正（Task 4 复审 Finding 1）**：本 import 原先还捎带了一个
- * 成长引擎的**死 import**（本文件零调用），本条注释一度把它写成「本文件与成长
- * 引擎的接缝」—— 那会让「谁调用成长引擎」这个问题在本文件里得到一个**假答案**。
- * 现已删除该名字，并改正本注释：本文件**不持有**任何成长引擎入口，成长任务的
- * 唯一生产入口是 `provider-credits.ts` 的 `afterClaim`（由 `credits.claimAll`
- * 消费）。别再回到这里找。
- */
-export { collectBuddyGrowth }
 
 /**
  * ⚠️ **`GROWTH_CAPABLE_PROVIDERS` 已删除**（2026-10-08 Task 4）。
@@ -291,15 +256,10 @@ import type {
   RpcCreditsStatusResponse,
   RpcCreditsClaimAllRequest,
   RpcCreditsClaimAllResponse,
-  RpcBuddyGrowthAccountResult,
   RpcCreditsClaimSummary,
   RpcCreditsBalancesRequest,
   RpcCreditsBalanceExtra,
   RpcCreditsBalancesResponse,
-  RpcBuddyClaimCompensationRequest,
-  RpcBuddyClaimCompensationResponse,
-  RpcBuddyCompensationStatusRequest,
-  RpcBuddyCompensationStatusResponse,
   RpcClineQuotaRequest,
   RpcClineQuotaResponse,
   RpcClineRequestLogRequest,
@@ -378,6 +338,7 @@ import {
 } from './badge-preferences.js'
 import { createUsageBadge, type BadgeRpcResult } from './usage-badge.js'
 import { createAutoCheckin, createAutoCheckinStore } from './auto-checkin.js'
+import type { ChannelCredential, ProviderProduct } from './jwt-utils.js'
 
 /** Jet Hub RPC API 路径 */
 export const JET_HUB_API_PATH = '/api/jet-hub'
@@ -526,9 +487,9 @@ export function normalizeZcodeLoginProvider(raw: string | undefined): ZcodeLogin
 }
 
 /** 解析 Buddy 凭据 JSON；解析失败返回 undefined。 */
-function parseBuddyCredential(raw: string): BuddyCredential | undefined {
+function parseBuddyCredential(raw: string): ChannelCredential | undefined {
   try {
-    const parsed = JSON.parse(raw) as BuddyCredential
+    const parsed = JSON.parse(raw) as ChannelCredential
     return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
       ? parsed
       : undefined
@@ -651,7 +612,7 @@ export function buildRaccoonNickname(
  *
  * 登记条件：**余额响应里能拿到逐包的到期时间**（归一化到 `deductionEndTime`），
  * 从而分出「快到期」与「不会马上作废」两桶。判据见
- * `buddy-balance-rank.ts` 的 `splitBuddyCreditsByExpiry` —— 它只读通用的
+ * `buddy-balance-rank.ts` 的 `splitBalanceByExpiry` —— 它只读通用的
  * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**。
  *
  * | provider | 分桶依据 |
@@ -664,7 +625,7 @@ export function buildRaccoonNickname(
  * ⚠️ TRAE / LobsterAI **不区分「每日额度」与「永久积分」两个命名池**，但同样能按
  * 到期时间分桶 —— 对锁定功能而言，判据只需「会不会马上作废」，与池的名字无关。
  * 拿不到到期时间的包归入**永久桶**（保守方向：宁可锁定时少用一个号，
- * 也不要把长期积分误当快到期烧掉，见 `splitBuddyCreditsByExpiry` 注释）。
+ * 也不要把长期积分误当快到期烧掉，见 `splitBalanceByExpiry` 注释）。
  *
  * 仍未登记的渠道（CodeArts / Qoder / Cline / Raccoon / Minimax / ZCode / Gemini /
  * OpenCode）：余额响应里没有逐包到期时间，或根本没有资源包列表 ——
@@ -755,8 +716,8 @@ export function computeClaimSummary(outcomes: readonly ClaimOutcome[]): RpcCredi
  * 默认类型参数保持 Buddy 系，故既有调用点与测试一行都不用改。
  */
 export interface CreditsEndpointDeps<
-  TCredential = BuddyCredential,
-  TProduct = BuddyProduct,
+  TCredential = ChannelCredential,
+  TProduct = ProviderProduct,
 > {
   /**
    * 解析凭据引用。
@@ -799,7 +760,7 @@ export interface CreditsEndpointDeps<
      * 无来由的失败。
      */
     roundDeadlineAt: number | undefined,
-  ) => Promise<RpcBuddyGrowthAccountResult | undefined>
+  ) => Promise<unknown>
   /**
    * 签到收尾的**附加提示**（可选；对 `claimed` 与 `already-claimed` **都会跑**）。
    *
@@ -947,7 +908,7 @@ export interface CreditsEndpointDeps<
  * 之外，任一账号的异常都会冒泡到 handleMethod 外层 catch，使整批请求以
  * `jet-hub/handler-failed` 失败——违背「单个账号失败不中断整体」的设计。
  */
-export async function collectCreditsStatus<TCredential = BuddyCredential, TProduct = BuddyProduct>(
+export async function collectCreditsStatus<TCredential = ChannelCredential, TProduct = ProviderProduct>(
   accounts: readonly ProviderAccountEntry[],
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
@@ -958,8 +919,8 @@ export async function collectCreditsStatus<TCredential = BuddyCredential, TProdu
   const fetchStatus = deps.fetchStatus
     ?? (async (credential: TCredential, product: TProduct): Promise<CheckinStatus | null> =>
       fetchCheckinStatus(
-        credential as unknown as BuddyCredential,
-        product as unknown as BuddyProduct,
+        credential as unknown as ChannelCredential,
+        product as unknown as ProviderProduct,
         fetcher,
       ))
   const results: RpcCreditsStatusResponse['accounts'] = []
@@ -995,7 +956,7 @@ export async function collectCreditsStatus<TCredential = BuddyCredential, TProdu
  * 与 collectCreditsStatus 同理：凭据解析位于每个账号自己的 try 之内，
  * 异常只让该账号记为 failed。
  */
-export async function collectClaimResults<TCredential = BuddyCredential, TProduct = BuddyProduct>(
+export async function collectClaimResults<TCredential = ChannelCredential, TProduct = ProviderProduct>(
   accounts: readonly ProviderAccountEntry[],
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
@@ -1015,15 +976,15 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
   const fetchStatus = deps.fetchStatus
     ?? (async (credential: TCredential, product: TProduct): Promise<CheckinStatus | null> =>
       fetchCheckinStatus(
-        credential as unknown as BuddyCredential,
-        product as unknown as BuddyProduct,
+        credential as unknown as ChannelCredential,
+        product as unknown as ProviderProduct,
         fetcher,
       ))
   const claim = deps.claim
     ?? (async (credential: TCredential, product: TProduct): Promise<ClaimOutcome> =>
       claimDailyCheckin(
-        credential as unknown as BuddyCredential,
-        product as unknown as BuddyProduct,
+        credential as unknown as ChannelCredential,
+        product as unknown as ProviderProduct,
         fetcher,
       ))
   // 默认保留预检（CodeBuddy 系需要）；LobsterAI 显式传 false 跳过。
@@ -1031,7 +992,7 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
   const results: RpcCreditsClaimAllResponse['results'] = []
   const outcomes: ClaimOutcome[] = []
   /** 仅在 deps.afterClaim 存在时非空；见该钩子的说明。 */
-  const growth: RpcBuddyGrowthAccountResult[] = []
+  const growth: unknown[] = []
   // 整轮共享截止时刻。0 / 负数 / 非有限值一律视为不限时（本地排障用）。
   const rawRound = deps.roundBudgetMs === undefined
     ? DEFAULT_ROUND_BUDGET_MS
@@ -1139,7 +1100,7 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
  * 凭据解析同样位于每个账号自己的 try 之内：单个账号的凭据缺失/损坏/名称非法
  * 都不会冒泡中断整批。
  */
-export async function collectCreditBalances<TCredential = BuddyCredential, TProduct = BuddyProduct>(
+export async function collectCreditBalances<TCredential = ChannelCredential, TProduct = ProviderProduct>(
   accounts: readonly ProviderAccountEntry[],
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
@@ -1149,8 +1110,8 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
   const fetchBalance = deps.fetchBalance
     ?? (async (credential: TCredential, product: TProduct): Promise<CreditBalance | null> =>
       fetchCreditBalance(
-        credential as unknown as BuddyCredential,
-        product as unknown as BuddyProduct,
+        credential as unknown as ChannelCredential,
+        product as unknown as ProviderProduct,
         fetcher,
       ))
   const fetchDetailed = deps.fetchBalanceDetailed
@@ -1380,8 +1341,6 @@ export interface JetHubAuthLike {
  */
 export interface JetHubAuths {
   readonly codearts: CodeArtsAuth
-  readonly buddy: BuddyAuth
-  readonly workbuddy: BuddyAuth
   readonly lobsterai: LobsteraiAuth
   readonly qoder: QoderAuth
   /** ⚠️ 键是 **provider id**（`qodercn`），值是 `index.ts` 里的 `qoderCn` 实例。 */
@@ -2085,7 +2044,7 @@ function registerJetHubEndpoints(
   //   ⚠️ 若写成 `qoderCn`（键=变量名）会**编译失败**（接口没有该键）——
   //   那正是我们要的：键必须是 id，否则 `authOf(auths, provider)` 查不到中国版。
   const {
-    codearts, buddy, workbuddy, lobsterai, qoder,
+    codearts, lobsterai, qoder,
     qodercn: qoderCn,
     trae, cline, loomy, raccoon, minimax,
     // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
@@ -2253,8 +2212,6 @@ function registerJetHubEndpoints(
    */
   const SELF_HEAL_REFRESHABLE_PROVIDERS: ReadonlySet<string> = new Set([
     'codearts',
-    'buddy',
-    'workbuddy',
     LOBSTERAI.id,
     QODER.id,
     QODER_CN.id,
@@ -3848,55 +3805,8 @@ function registerJetHubEndpoints(
         const suffix = shortId().toUpperCase()
         const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`
 
-        // CodeBuddy 系（buddy / workbuddy）共用两步登录流程：
-        // 只获取 loginUrl 和 state 立即返回，后台用同一个 state 异步执行
-        // 完整登录流程。两者的差异只在产品配置（platform、登录 URL 附加
-        // 参数、X-Product-Code、User-Agent），全部由 product 承载。
-        const product = productById(provider)
-        if (product !== undefined) {
-          let state: string
-          let authUrl: string
-          try {
-            const authState = await fetchAuthState(undefined, undefined, product)
-            state = authState.state
-            // WorkBuddy 的登录 URL 需要追加 version 与 loginSessionId
-            authUrl = decorateLoginUrl(authState.authUrl, product)
-          } catch (error) {
-            const reason = error instanceof Error ? error.message : String(error)
-            throw new Error(`无法获取 ${product.displayName} 登录地址（Host 网络请求失败）：${reason}`)
-          }
-          const ref = credentialRef(refName)
-          // 先在 pool 中添加启用的占位条目（无凭据），方便客户端 login.poll 检测到
-          await pool.addAccount({
-            id,
-            provider: product.id,
-            nickname: id,
-            enabled: true,
-            credentialRef: refName,
-            refreshable: false,
-            createdAt: Date.now(),
-          })
-          // 后台异步执行完整登录流程，使用同一个 state
-          runBuddyLoginFlow({ openBrowser: () => {}, state, product }).then(async (flow) => {
-            await ctx.credentials.set(ref, flow.access)
-            // 续期定时器归属该产品自己的服务实例
-            ;(product.id === CODEBUDDY.id ? buddy : workbuddy).scheduleRefresh()
-            const credential = parseBuddyCredential(flow.access)
-            await pool.updateAccount(id, {
-              nickname: credential?.nickname ?? id,
-              // Buddy 的 expires_at 是字符串形式的毫秒时间戳，
-              // 必须用 credentialExpiresAtMs 解析（Date.parse 对纯数字串会得到 NaN）。
-              expiresAt: credential ? credentialExpiresAtMs(credential) : undefined,
-              refreshable: Boolean(credential?.refresh_token),
-            })
-          }).catch((err) => {
-            ctx.logger.warn(`[jet-hub] background ${product.id} login failed for ${id}: ${err}`)
-            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
-            void failLogin(id, err)
-          })
-          return { ok: true, value: { accountId: id, loginUrl: authUrl } }
-        } else if (provider === 'codearts') {
-          // CodeArts 也是**回调式**登录（本地回调服务器收授权码），但同样必须
+        if (provider === 'codearts') {
+          // CodeArts 是**回调式**登录（本地回调服务器收授权码），但同样必须
           // 走两步式：先返回 loginUrl 让前端立刻 window.open，后台再等回调。
           //
           // 为什么不能像早期那样 await 整个流程（真实缺陷）：浏览器只在用户
@@ -5336,11 +5246,11 @@ function registerJetHubEndpoints(
          * 组装响应。
          *
          * ⚠️ **按到期时间分桶的 provider 必须回传当前生效的窗口天数**：窗口可被
-         * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，前端文案若继续写死 15 就会
+         * `DSH_EXPIRING_WINDOW_DAYS` 覆盖，前端文案若继续写死 15 就会
          * 与真实判据不一致（用户看到「只烧 15 天内的」而实际按 31 天筛号）。
          *
          * ⚠️ 判据是「**是否按到期时间分桶**」，不是「是不是 buddy」：TRAE 与
-         * LobsterAI 走同一套 `splitBuddyCreditsByExpiry`，同样受该窗口影响
+         * LobsterAI 走同一套 `splitBalanceByExpiry`，同样受该窗口影响
          * （它们的余额面板早已用同一个窗口分「长期 / 临时」，见 `credits.balances`
          * 分支的注释），故必须一并回传。
          *
@@ -5348,14 +5258,14 @@ function registerJetHubEndpoints(
          */
         // ⚠️ 2026-10-08 改：判据从四连 `||` 改为查 registry 的 `usesExpiryWindow`
         //   —— 判据**本身不变**（仍是「是否按到期时间分桶」，**不是**「是不是 buddy」：
-        //   TRAE 与 LobsterAI 走同一套 `splitBuddyCreditsByExpiry`，同样受
-        //   `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 影响）。改的只是**取值来源**。
+        //   TRAE 与 LobsterAI 走同一套 `splitBalanceByExpiry`，同样受
+        //   `DSH_EXPIRING_WINDOW_DAYS` 影响）。改的只是**取值来源**。
         //   ⚠️ loomy 刻意不在此列：它没有窗口概念（服务端直接给两个命名池）。
         const usesExpiryWindow = descriptorOf(provider)?.usesExpiryWindow === true
         const lockResponse = (): RpcPermanentLockResponse => ({
           provider,
           locked: pool.permanentLocked(provider),
-          ...(usesExpiryWindow ? { windowDays: buddyExpiringWindowDays() } : {}),
+          ...(usesExpiryWindow ? { windowDays: expiringWindowDays() } : {}),
         })
         if (req.locked === undefined) {
           return { ok: true, value: lockResponse() }
@@ -6017,7 +5927,7 @@ function registerJetHubEndpoints(
             ok: true,
             value: {
               accounts: values,
-              windowDays: buddyExpiringWindowDays(),
+              windowDays: expiringWindowDays(),
             } satisfies RpcCreditsBalancesResponse,
           }
         }
@@ -6033,7 +5943,7 @@ function registerJetHubEndpoints(
         //（`bonus_skus[]`），逐桶带 `expiresAt` —— 归一化到 `deductionEndTime`
         // 后由通用判据分成「永久 / 长期 / 临期」三档（`PERMANENT_LOCK_PROVIDERS` 同款）。
         //
-        // ⚠️ **必须回传 `windowDays`**：客户端 `splitCreditsByExpiry` 的
+        // ⚠️ **必须回传 `windowDays`**：客户端 `splitBalanceByExpiry` 的
         // `normalizeWindowDays` 对 `undefined` 返回 `null` ⇒ 整个分桶行静默不渲染
         //（真实症状：胶囊只有合计、没有「永久绿 / 长期黄 / 临期红」三行）。
         if (req.provider === OFFICEACE.id) {
@@ -6115,7 +6025,7 @@ function registerJetHubEndpoints(
               //    读数成功与否**无关**。只在成功路径带它会让「空账号池 / 查询
               //    失败」时形状不一致 —— 守卫用例遍历 registry 时正会红
               //（实测症状：`officeace 必须回传 windowDays`）。
-              windowDays: buddyExpiringWindowDays(),
+              windowDays: expiringWindowDays(),
             } satisfies RpcCreditsBalancesResponse,
           }
         }
@@ -6211,7 +6121,7 @@ function registerJetHubEndpoints(
         //    给两个命名池，没有窗口概念）。
         const usesWindow = descriptorOf(req.provider)?.usesExpiryWindow === true
         const value: RpcCreditsBalancesResponse = usesWindow
-          ? { accounts: values, windowDays: buddyExpiringWindowDays() }
+          ? { accounts: values, windowDays: expiringWindowDays() }
           : { accounts: values }
         return { ok: true, value }
       }
@@ -6316,110 +6226,6 @@ function registerJetHubEndpoints(
         }
       }
 
-      // ── CodeBuddy 限时补偿积分（2026-10-16 新增）──
-      //
-      // ⚠️ **不是签到**：这是一次性的限时活动（`end_time` 到期即作废）。
-      //    本仓库对「一次性 / 有代价动作」的既有铁律是**默认不自动执行**
-      //    （见 `buddy-growth.ts` 的 `runExotic`）。故这里只开两条**用户显式
-      //    触发**的 RPC：
-      //      ① `buddy.compensationStatus` —— 只读，面板挂载/刷新时调用；
-      //      ② `buddy.claimCompensation` —— 写操作，**只由面板按钮触发**。
-      //    **刻意不接进 `credits.claimAll` / auto-checkin**：那会把一次性动作
-      //    变成每日自动执行，违反上面的约定（且收益只有一次）。
-      //
-      // ⚠️ 端点走 `webBase`（buddy = `www.workbuddy.cn`），不是推理站
-      //    `copilot.tencent.com`（= `endpoint`）。三个 host 实测**均可达**，
-      //    故这是**取舍**不是「只有一个能通」。见 `src/buddy-compensation.ts` 模块头。
-      case 'buddy.compensationStatus': {
-        const req = payload as RpcBuddyCompensationStatusRequest
-        if (req.provider !== CODEBUDDY.id) {
-          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
-        }
-        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
-          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
-        }
-        const accounts = await pool.listAccounts(CODEBUDDY.id)
-        const account = accounts.find((entry) => entry.id === req.accountId)
-        if (account === undefined) {
-          return { ok: false, error: { code: 'bad-request', message: `账号不存在：${req.accountId}` } }
-        }
-        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
-        if (resolved === undefined) {
-          return { ok: false, error: { code: 'bad-request', message: '凭据不可用，请先重新登录该账号' } }
-        }
-        let credential: BuddyCredential
-        try {
-          credential = JSON.parse(resolved.value) as BuddyCredential
-        } catch {
-          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
-        }
-        const result = await fetchCompensationStatus(credential, CODEBUDDY)
-        if (!result.ok) {
-          // ⚠️ 失败**不包成 ok:true**（Issue IKJOZA 的铁律），且原文随行给出。
-          return { ok: false, error: { code: 'bad-request', message: describeCompensationFailure(result.failure) } }
-        }
-        return {
-          ok: true,
-          value: {
-            claimed: result.status.claimed,
-            active: result.status.active,
-            creditNum: result.status.creditNum,
-            ...result.status.validityPeriod === undefined ? {} : { validityPeriod: result.status.validityPeriod },
-            ...result.status.endTime === undefined ? {} : { endTime: result.status.endTime },
-          } satisfies RpcBuddyCompensationStatusResponse,
-        }
-      }
-      case 'buddy.claimCompensation': {
-        const req = payload as RpcBuddyClaimCompensationRequest
-        if (req.provider !== CODEBUDDY.id) {
-          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
-        }
-        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
-          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
-        }
-        const accounts = await pool.listAccounts(CODEBUDDY.id)
-        const account = accounts.find((entry) => entry.id === req.accountId)
-        if (account === undefined) {
-          return { ok: false, error: { code: 'bad-request', message: `账号不存在：${req.accountId}` } }
-        }
-        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
-        if (resolved === undefined) {
-          return { ok: false, error: { code: 'bad-request', message: '凭据不可用，请先重新登录该账号' } }
-        }
-        let claimCredential: BuddyCredential
-        try {
-          claimCredential = JSON.parse(resolved.value) as BuddyCredential
-        } catch {
-          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
-        }
-        const claimResult = await claimCompensation(claimCredential, CODEBUDDY)
-        if (!claimResult.ok) {
-          return { ok: false, error: { code: 'bad-request', message: describeCompensationFailure(claimResult.failure) } }
-        }
-        // ⚠️⚠️ **领取成功后必须让折算缓存失效**（2026-10-16 审计 P2-3）。
-        //
-        // 补偿领取改变的是**账号积分余额**，而聚合折算与 buddy 系共用
-        // `src/aggregate-expiry.ts` 的折算缓存（TTL 60 秒、`UNUSABLE` 会被
-        // 缓存更久）。不清的话用户点完「立即领取」会看到「领了但积分没涨」。
-        //
-        // ⚠️ 与 `credits.claimAll` 之后那次 `clearExpiryCache()`（见本函数的
-        //    `fetch` 处理器，`jet-hub-rpc.ts:2634`）是**同一条铁律的两个入口**：
-        //    任何让积分增加的写操作都必须让下游折算失效。
-        //
-        // ⚠️ **刻意不复用 `balanceCache.clear()`**：那是**整渠道**清空，会连带
-        //    作废该渠道其它账号正在被徽标/面板用的读数（`balance-cache.ts:274`
-        //    明确警告「别当成按渠道刷新的顺手动作」）。折算缓存才是这里真正
-        //    会骗人的那一层，按既有入口清它足够。
-        modelAdapters?.['aggregate']?.clearExpiryCache?.()
-        return { ok: true, value: {} satisfies RpcBuddyClaimCompensationResponse }
-      }
-
-      // ── 模型列表可见性（黑名单开关）──
-      //
-      // 列表来自 `ctx.llm.listModels()`——**适配器播报的权威目录**，正是
-      // 对话框模型选择器读的同一份数据（会话控制器的 buildModelCatalog）。
-      // 这样设置页展示的模型集合与实际可选集合永远一致，不会出现
-      // 「设置在某个模型上，选择器里却找不到它」。
       case 'model.list': {
         const req = payload as RpcModelListRequest
         const llm = llmServiceOf(ctx)

@@ -1,34 +1,24 @@
 /**
- * WorkBuddy 探针的凭据读取工具。
+ * e2e 凭据读取的**通用**工具（YAML 引号标量还原 + 文件读取）。
  *
- * 单独成模块（而非内联在 spec 里）的原因：这段解析逻辑需要被一次性验证脚本
- * 直接调用，而 spec 文件在顶层就会执行 vitest 的 `describe`。
+ * 这段解析逻辑与具体渠道无关 —— 它解决的是「DSH 的 YAML writer 会把超长标量
+ * 折行，直接切 JSON 会抛 `Bad control character in string literal`」这个通用问题。
+ * 本模块自原 `workbuddy-credential.ts` 抽出（该文件随渠道移除）。
  *
  * ## 为什么不用 `yaml` 库
  *
- * `yaml` 只在 DSH 自身的 profile 目录里（`~/.dsh/profiles/web/node_modules/yaml`），
- * 本项目既未声明该依赖、项目内及其所有上层目录也都没有它，`import 'yaml'` 在
- * e2e 运行时抛 ERR_MODULE_NOT_FOUND（已实测）。因此这里按 YAML 规范自行还原。
- *
- * ## 为什么要还原折行
- *
- * DSH 的 YAML writer 会把超长标量折行 —— 在 JSON 字符串**内部**插入真实的
- * 换行 + 缩进。按 YAML 规范，流式标量中的折行语义上等价于**一个空格**，
- * 所以把续行按空格拼回即可还原 writer 写入前的原文。
- *
- * 旧实现用逐字符花括号配对直接切 JSON 切片，会把折行换行当成字符串正文，
- * 于是 `JSON.parse` 抛裸 `SyntaxError: Bad control character in string literal`。
+ * `yaml` 只在 DSH 自身的 profile 目录里，本项目既未声明该依赖、上层目录也都没有它，
+ * `import 'yaml'` 在 e2e 运行时抛 `ERR_MODULE_NOT_FOUND`（已实测）。
  */
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { BuddyCredential } from '../../src/buddy.js'
 
 /** 凭据文件路径（DSH 默认位置）。 */
 export const CREDENTIALS_PATH = join(homedir(), '.dsh', '.credentials.yaml')
 
 /** 凭据不可用时的统一提示后缀。 */
-const HINT = '请先登录该账号，或设置 DSH_WORKBUDDY_CREDENTIAL_JSON'
+const HINT = '请先登录该账号，或设置对应的 DSH_*_CREDENTIAL_JSON 环境变量'
 
 /** 取出错误消息（抛出物可能是任意值）。 */
 function reason(error: unknown): string {
@@ -45,6 +35,7 @@ export function readCredentialsFile(path: string = CREDENTIALS_PATH): string {
 }
 
 /** 还原 YAML 引号标量的定界引号与转义。 */
+
 function unfoldQuotes(raw: string, ref: string): string {
   if (raw.startsWith("'")) {
     // 单引号标量：内容里的单引号写作 ''，定界引号是首尾各一个
@@ -109,46 +100,3 @@ export function extractYamlScalar(text: string, ref: string): string {
   throw new Error(`未找到凭据 ${ref}；${HINT}`)
 }
 
-/** 解析 JSON 形式的凭据；失败时给出带来源名的清晰错误，不抛裸 SyntaxError。 */
-export function parseCredentialJson(raw: string, source: string): BuddyCredential {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch (error) {
-    throw new Error(`${source} 不是合法 JSON：${reason(error)}`)
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`${source} 应为 JSON 对象`)
-  }
-  const credential = parsed as Partial<BuddyCredential>
-  if (typeof credential.access_token !== 'string' || credential.access_token.length === 0) {
-    throw new Error(`${source} 缺少非空的 access_token 字段`)
-  }
-  return credential as BuddyCredential
-}
-
-/** `loadWorkBuddyCredential` 的可选覆盖项（便于一次性验证脚本注入固定输入）。 */
-export interface LoadOptions {
-  /** 直接提供凭据 JSON（优先级最高）。 */
-  env?: string
-  /** 指定要读取的 ref；缺省取文件里首个 `WORKBUDDY_ACCOUNT_*`。 */
-  ref?: string
-  /** 覆盖凭据文件路径。 */
-  path?: string
-}
-
-/** 读取凭据：优先环境变量，其次本地 credentials.yaml 中的 WorkBuddy 账号。 */
-export function loadWorkBuddyCredential(options: LoadOptions = {}): BuddyCredential {
-  const fromEnv = options.env ?? process.env.DSH_WORKBUDDY_CREDENTIAL_JSON
-  if (fromEnv !== undefined && fromEnv.length > 0) {
-    return parseCredentialJson(fromEnv, 'DSH_WORKBUDDY_CREDENTIAL_JSON')
-  }
-
-  const text = readCredentialsFile(options.path)
-  const declared = [...text.matchAll(/^[ \t]*(WORKBUDDY_ACCOUNT_[A-Z0-9]+):/gm)].map((m) => m[1])
-  if (declared.length === 0) {
-    throw new Error(`未找到 WORKBUDDY_ACCOUNT_* 凭据；${HINT}`)
-  }
-  const ref = options.ref ?? process.env.DSH_WORKBUDDY_ACCOUNT_REF ?? declared[0]
-  return parseCredentialJson(extractYamlScalar(text, ref), `凭据 ${ref}`)
-}

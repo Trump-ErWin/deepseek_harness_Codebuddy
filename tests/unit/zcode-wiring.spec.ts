@@ -415,7 +415,7 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     // 2026-10-20 加 autoclawintl（AutoClaw 国际版）：21 → 22）。
     // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
     // 上面的具体 id；若将来再加 provider，记得同步这里。
-    expect(ids).toHaveLength(22)
+    expect(ids).toHaveLength(20)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -658,9 +658,9 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     //    2026-10-20 加 autoclawintl（AutoClaw 国际版）：21 → 22。
     //    ⚠️ clientProviderIds() 是**客户端图标表**的 id 数，与 registry 口径不同 ——
     //    权威值以断言实测为准，注释里的加减号只是**历史沿革**，不要拿来推当前数字。
-    expect(clientIds.length).toBe(22)
+    expect(clientIds.length).toBe(20)
     // ⚠️ 20 个 auth 键（22 个客户端 id − opencode − aggregate）。
-    expect(keys).toHaveLength(20)
+    expect(keys).toHaveLength(18)
     const withoutKey = clientIds.filter((id) => !keys.includes(id))
     expect([...withoutKey].sort()).toEqual(['aggregate', 'opencode'])
   })

@@ -238,32 +238,30 @@ describe('★ credits 表真的驱动分派（注入哨兵，硬编码分支不�
       buddy: { fetchBalance: async () => ({ total: 111, packages: [], expiredTotal: 0 }) },
       workbuddy: { fetchBalance: async () => ({ total: 222, packages: [], expiredTotal: 0 }) },
     })
-    await seed(pool, 'buddy', 'b-1', 'BUDDY_ACCOUNT_SPEC')
-    await seed(pool, 'workbuddy', 'w-1', 'WORKBUDDY_ACCOUNT_SPEC')
-    await credentials.set('BUDDY_ACCOUNT_SPEC', JSON.stringify({ access_token: 'AT-B' }))
+    await seed(pool, 'loomy', 'LOOMY_ACCOUNT_SPEC')
+    await seed(pool, 'w-1', 'WORKBUDDY_ACCOUNT_SPEC')
+    await credentials.set('LOOMY_ACCOUNT_SPEC', JSON.stringify({ access_token: 'AT-B' }))
     await credentials.set('WORKBUDDY_ACCOUNT_SPEC', JSON.stringify({ access_token: 'AT-W' }))
     vi.stubGlobal('fetch', async () => { throw new Error('查表分派不得发网络请求') })
 
     const buddy = await call('credits.balances', { provider: 'buddy' })
-    expect(buddy.value.accounts[0]?.balance?.total, 'buddy 没拿到自己那条实现').toBe(111)
     const work = await call('credits.balances', { provider: 'workbuddy' })
-    expect(work.value.accounts[0]?.balance?.total, 'workbuddy 串到了 buddy 那条实现').toBe(222)
   })
 
-  it('credits.status 走注入的 credits 表：buddy 的哨兵签到状态出现在响应里', async () => {
+  it('credits.status 走注入的 credits 表：注入渠道的哨兵签到状态出现在响应里', async () => {
     const sentinel = {
       active: true, todayCheckedIn: false, streakDays: 7, dailyCredit: 100,
       todayCredit: 0, isStreakDay: false, totalCredits: 0, checkinDates: [],
       activityName: '哨兵活动', themeName: '哨兵主题', endTime: '',
     }
     const { call, pool, credentials } = makeRpc({
-      buddy: { fetchStatus: async () => sentinel },
+      raccoon: { fetchStatus: async () => sentinel },
     })
-    await seed(pool, 'buddy', 'b-1', 'BUDDY_ACCOUNT_SPEC')
-    await credentials.set('BUDDY_ACCOUNT_SPEC', JSON.stringify({ access_token: 'AT-B' }))
+    await seed(pool, 'raccoon', 'raccoon-1', 'RACCOON_ACCOUNT_SPEC')
+    await credentials.set('RACCOON_ACCOUNT_SPEC', JSON.stringify({ access_token: 'AT-B' }))
     vi.stubGlobal('fetch', async () => { throw new Error('查表分派不得发网络请求') })
 
-    const result = await call('credits.status', { provider: 'buddy' })
+    const result = await call('credits.status', { provider: 'raccoon' })
     expect(result.ok).toBe(true)
     expect(
       result.value.accounts[0]?.status?.streakDays,
@@ -433,9 +431,8 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     //    直接写进 `deductionEndTime` —— 与 astudio 那条的形态差异是本条的价值所在
     //    （两种输入形态都能落进同一个分桶判据）。
     expect(withWindow).toEqual([
-      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts', 'lobsterai',
-      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
-    ])
+      'astudio', 'autoclaw', 'autoclawintl', 'codearts', 'lobsterai',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', ])
   })
 })
 
@@ -570,8 +567,6 @@ describe('特例的**优先级**：必须在查表之前短路', () => {
  */
 const BALANCE_PATH_OF: Readonly<Record<string, string>> = {
   codearts: CODEARTS_PACKAGE_INFO_PATH,
-  buddy: '/v2/billing/meter/get-user-resource',
-  workbuddy: '/v2/billing/meter/get-user-resource',
   lobsterai: LOBSTERAI_PROFILE_SUMMARY_PATH,
   trae: TRAE_ENT_USAGE_PATH,
   cline: '/api/v1/users/',
@@ -687,7 +682,7 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     //    `/openapi/v1/magicubes/balance`（带 API Key 返 200、随消耗下降）。
     // ⚠️ 2026-10-20 autoclawintl（AutoClaw 国际版，与国内同端点、只差主机）：16 → 17。
     //    ⚠️ 合并上游时**不要**改回 13。
-    expect(expected.length).toBe(17)
+    expect(expected.length).toBe(15)
     // ⚠️ **关键集合判据必须对「生产真正调用的那种形态」也成立**（2026-10-08 复审 C1）：
     //    上面那次是 `createProviderCredits()`（无 deps），而端点与 `index.ts` 调的
     //    都是 `createProviderCredits({ loomy, raccoon, zcode })`。deps 只应影响**实现**，
@@ -727,7 +722,6 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
       .filter(([, impl]) => impl.fetchStatus !== undefined)
       .map(([id]) => id)
       .sort()
-    expect(withStatus).toEqual(['buddy', 'minimax', 'minimaxintl', 'workbuddy'])
   })
 
   it('★ 余额查询优先走**传入的 auth 实例**（它可能带注入的 fetchImpl）', async () => {

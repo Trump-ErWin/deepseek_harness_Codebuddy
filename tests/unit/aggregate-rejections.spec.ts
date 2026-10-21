@@ -7,7 +7,7 @@ import { AccountPool } from '../../src/account-pool.js'
 
 describe('sanitizeAggregateRejections：只保留显式 true，空层不保留', () => {
   it('保留三层都是 true 的条目', () => {
-    const raw = { 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }
+    const raw = { 'deepseek-v4-1-flash': { officeace: { 'deepseek-v4.1-flash': true } } }
     expect(sanitizeAggregateRejections(raw)).toEqual(raw)
   })
 
@@ -16,16 +16,16 @@ describe('sanitizeAggregateRejections：只保留显式 true，空层不保留',
     //    宽松接受 truthy 会让 `"false"`（非空字符串）被当成拒绝，用户莫名其妙丢一个渠道。
     const raw = {
       m: {
-        buddy: { a: false, b: 1, c: 'true', d: null, e: true },
+        officeace: { a: false, b: 1, c: 'true', d: null, e: true },
       },
     }
-    expect(sanitizeAggregateRejections(raw)).toEqual({ m: { buddy: { e: true } } })
+    expect(sanitizeAggregateRejections(raw)).toEqual({ m: { officeace: { e: true } } })
   })
 
-  it('空层不保留（不留 { m: {} } / { m: { buddy: {} } } 这类噪音）', () => {
+  it('空层不保留（不留 { m: {} } / { m: { officeace: {} } } 这类噪音）', () => {
     expect(sanitizeAggregateRejections({ m: {} })).toEqual({})
-    expect(sanitizeAggregateRejections({ m: { buddy: {} } })).toEqual({})
-    expect(sanitizeAggregateRejections({ m: { buddy: { a: false } } })).toEqual({})
+    expect(sanitizeAggregateRejections({ m: { officeace: {} } })).toEqual({})
+    expect(sanitizeAggregateRejections({ m: { officeace: { a: false } } })).toEqual({})
   })
 
   it('畸形输入一律退化为空表（数组 / null / 字符串 / 数字）', () => {
@@ -35,7 +35,7 @@ describe('sanitizeAggregateRejections：只保留显式 true，空层不保留',
   })
 
   it('中间层畸形时跳过该层，不影响其它层', () => {
-    const raw = { m: { buddy: 'not-an-object', codearts: { x: true } } }
+    const raw = { m: { officeace: 'not-an-object', codearts: { x: true } } }
     expect(sanitizeAggregateRejections(raw)).toEqual({ m: { codearts: { x: true } } })
   })
 
@@ -57,7 +57,7 @@ describe('sanitizeAggregateRejections：只保留显式 true，空层不保留',
 
   it('★ 数组层被拒绝（不能把数组当成 map）', () => {
     // ⚠️ `typeof [] === 'object'`，只判 object 会让数组通过。
-    expect(sanitizeAggregateRejections({ m: { buddy: ['a'] } })).toEqual({})
+    expect(sanitizeAggregateRejections({ m: { officeace: ['a'] } })).toEqual({})
     expect(sanitizeAggregateRejections({ m: [] })).toEqual({})
   })
 })
@@ -70,8 +70,8 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
-        listProviders: () => [{ id: 'buddy' }, { id: 'codearts' }],
-        listModels: async (p: string) => (p === 'buddy'
+        listProviders: () => [{ id: 'officeace' }, { id: 'codearts' }],
+        listModels: async (p: string) => (p === 'officeace'
           ? [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }]
           : [{ id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash' }]),
         resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
@@ -85,10 +85,10 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
       disabledModelsFor: () => new Set<string>(),
       getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: {} }),
     } as never
-    // buddy 更临期 ⇒ 正常情况下它排第一
+    // officeace 更临期 ⇒ 正常情况下它排第一
     const adapter = new AggregateAdapter(ctx, {
       accountPool: pool,
-      expiryProbe: async (p: string) => (p === 'buddy' ? 100 : 900),
+      expiryProbe: async (p: string) => (p === 'officeace' ? 100 : 900),
       rejections,
     })
     return { adapter, sent }
@@ -103,26 +103,26 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
 
   it('拒绝临期更早的那个渠道 ⇒ 请求发给下一个候选', async () => {
     const { adapter, sent } = makeAdapter(() => ({
-      'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } },
+      'deepseek-v4-1-flash': { officeace: { 'deepseek-v4.1-flash': true } },
     }))
     await run(adapter, 'deepseek-v4-1-flash')
     expect(sent).toEqual(['codearts'])
   })
 
-  it('对照：不拒绝时临期更早的 buddy 排第一（证明差异来自拒绝，不是别的）', async () => {
+  it('对照：不拒绝时临期更早的 officeace 排第一（证明差异来自拒绝，不是别的）', async () => {
     const { adapter, sent } = makeAdapter(() => ({}))
     await run(adapter, 'deepseek-v4-1-flash')
-    expect(sent).toEqual(['buddy'])
+    expect(sent).toEqual(['officeace'])
   })
 
   it('拒绝只影响**指定的那个虚拟模型**（别的模型不受影响）', async () => {
     // ⚠️ 粒度是「虚拟模型 + 渠道 + realId」。若实现成「按渠道全局拒绝」，
-    //    buddy 在别的模型上也会被跳掉 —— 那是过度拒绝。
+    //    officeace 在别的模型上也会被跳掉 —— 那是过度拒绝。
     const { adapter, sent } = makeAdapter(() => ({
-      'some-other-model': { buddy: { 'deepseek-v4.1-flash': true } },
+      'some-other-model': { officeace: { 'deepseek-v4.1-flash': true } },
     }))
     await run(adapter, 'deepseek-v4-1-flash')
-    expect(sent).toEqual(['buddy'])
+    expect(sent).toEqual(['officeace'])
   })
 
   it('★ 拒绝只影响**指定的那个 realId**（同渠道的别的候选不受影响）', async () => {
@@ -134,7 +134,7 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
     //    会在 `deepseek-flash` ↔ `deepseek-v4-flash` 间切换，只锁 realId 会
     //    「一翻转就匹配不上、静默失效」）⇒ **两者直接冲突**，且旧断言依赖的正是
     //    D4 要消除的那个静默失效。
-    // ② 我第二版改用「workbuddy 的 `deepseek-v4.1-flash` 与 `-sg` 同键」——
+    // ② 我第二版改用「accio 的 `deepseek-v4.1-flash` 与 `-sg` 同键」——
     //    **那个前提是错的**（探针实测：`-sg` 归到**独立**虚拟键
     //    `deepseek-v4-1-flash-sg`，`normalizeModelKey` 不剥 `-sg`）；
     //    原注释里那句「同渠道多个 realId 归一到同一虚拟模型」因此是**误述**。
@@ -146,15 +146,15 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
       () => ({ 'deepseek-v4-1-flash': { codearts: { 'deepseek-v4.1-flash': true } } }),
     )
     await run(adapter, 'deepseek-v4-1-flash')
-    // buddy 更临期（桩里 buddy=100 < codearts=900），而 codearts 被精确拒绝
-    // ⇒ 只发往 buddy。若「拒绝」没有精确到 realId/渠道，会发往 codearts 或两条都发。
-    expect(sent).toEqual(['buddy'])
+    // officeace 更临期（桩里 officeace=100 < codearts=900），而 codearts 被精确拒绝
+    // ⇒ 只发往 officeace。若「拒绝」没有精确到 realId/渠道，会发往 codearts 或两条都发。
+    expect(sent).toEqual(['officeace'])
   })
 
   it('全部候选被拒 ⇒ 如实报零候选（不是静默成功）', async () => {
     const { adapter } = makeAdapter(() => ({
       'deepseek-v4-1-flash': {
-        buddy: { 'deepseek-v4.1-flash': true },
+        officeace: { 'deepseek-v4.1-flash': true },
         codearts: { 'deepseek-v4.1-flash': true },
       },
     }))
@@ -182,14 +182,14 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
    * 请求以 `InferHub.4291.200 insufficient quota`（benefit 额度）失败。
    */
   describe('★★ 候选可用性必须按 realId 复核（额度耗尽按模型记账）', () => {
-    /** 建一个「按 provider+modelId 判可用性」的池 + 两个渠道（buddy 更临期）。 */
+    /** 建一个「按 provider+modelId 判可用性」的池 + 两个渠道（officeace 更临期）。 */
     const makeGated = (blockedProvider: string, blockedModel: string, failing?: string) => {
       const sent: string[] = []
       const ctx = {
         logger: { warn: () => {}, info: () => {}, error: () => {} },
         llm: {
-          listProviders: () => [{ id: 'buddy' }, { id: 'codearts' }],
-          listModels: async (p: string) => (p === 'buddy'
+          listProviders: () => [{ id: 'officeace' }, { id: 'codearts' }],
+          listModels: async (p: string) => (p === 'officeace'
             ? [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }]
             : [{ id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash' }]),
           resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
@@ -216,18 +216,18 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
       } as never
       const adapter = new AggregateAdapter(ctx, {
         accountPool: pool,
-        expiryProbe: async (p: string) => (p === 'buddy' ? 100 : 900),
+        expiryProbe: async (p: string) => (p === 'officeace' ? 100 : 900),
         rejections: () => ({}),
       })
       return { adapter, sent }
     }
 
     it('★★ 更临期的渠道在**目标模型**上额度已尽 ⇒ 必须让位给下一个候选', async () => {
-      // buddy 临期更早（100 < 900），但它在 `deepseek-v4.1-flash` 上被标记额度耗尽
+      // officeace 临期更早（100 < 900），但它在 `deepseek-v4.1-flash` 上被标记额度耗尽
       // ⇒ 必须跳过它、发往 codearts。修复前：`expiryProbe` 只报临期值（100），
-      //    按 modelId 的可用性过滤对聚合路径失效 ⇒ 请求发往 buddy 必然失败
+      //    按 modelId 的可用性过滤对聚合路径失效 ⇒ 请求发往 officeace 必然失败
       //    （codearts 的 benefit 额度耗尽就是这种形态，`InferHub.4291.200`）。
-      const { adapter, sent } = makeGated('buddy', 'deepseek-v4.1-flash')
+      const { adapter, sent } = makeGated('officeace', 'deepseek-v4.1-flash')
       await run(adapter, 'deepseek-v4-1-flash')
       expect(sent, '额度已尽的渠道必须让位').toEqual(['codearts'])
     })
@@ -241,31 +241,31 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
       // 仍是 `NEVER` ⇒ **照样进入候选序**、只是排最后；而 `targets` 是**逐个尝试**
       // 的 ⇒ 前面的候选一失败，就**回落到那个额度已尽的候选**。
       //
-      // 实测（对抗审计探针）：buddy 可用 + codearts 额度已尽 ⇒ 候选序
-      // `[buddy, codearts]`；buddy 失败后请求**发往 codearts** —— 缺陷只是被
+      // 实测（对抗审计探针）：officeace 可用 + codearts 额度已尽 ⇒ 候选序
+      // `[officeace, codearts]`；officeace 失败后请求**发往 codearts** —— 缺陷只是被
       // **推迟**而非消除。修法：被剔除的候选必须显式 `expiry = UNUSABLE`。
       //
       // ⚠️ 我上一版的两条用例（让位 + 对照）都**抓不到**它 —— 因为那里第一个
       //    候选就成功了，从不触发回落。**必须让前面的候选失败**才能暴露。
-      const { adapter, sent } = makeGated('codearts', 'deepseek-v4.1-flash', 'buddy')
+      const { adapter, sent } = makeGated('codearts', 'deepseek-v4.1-flash', 'officeace')
       // ⚠️ 全部候选都失败时聚合会**如实抛出**最后一个错误 —— 这是正确行为
       //    （不是静默成功），故这里吞掉它、只断言「发往了谁」。
       try {
         await run(adapter, 'deepseek-v4-1-flash')
-      } catch { /* 预期：buddy 是唯一候选且它失败了 */ }
-      expect(sent, 'buddy 失败后不得回落到额度已尽的 codearts').toEqual(['buddy'])
+      } catch { /* 预期：officeace 是唯一候选且它失败了 */ }
+      expect(sent, 'officeace 失败后不得回落到额度已尽的 codearts').toEqual(['officeace'])
     })
 
-    it('★ 对照：不设额度标记时，临期更早的 buddy 正常当选', async () => {
+    it('★ 对照：不设额度标记时，临期更早的 officeace 正常当选', async () => {
       const { adapter, sent } = makeGated('__none__', '__none__')
       await run(adapter, 'deepseek-v4-1-flash')
-      expect(sent).toEqual(['buddy'])
+      expect(sent).toEqual(['officeace'])
     })
 
     it('★ 只标记**别的**模型 ⇒ 不影响本模型（过滤按 realId 精确匹配）', async () => {
-      const { adapter, sent } = makeGated('buddy', 'some-other-model')
+      const { adapter, sent } = makeGated('officeace', 'some-other-model')
       await run(adapter, 'deepseek-v4-1-flash')
-      expect(sent).toEqual(['buddy'])
+      expect(sent).toEqual(['officeace'])
     })
 
     it('★ 池未实现 `getAvailableAccount` ⇒ 跳过过滤（宁可少筛，不可误剔除整池）', async () => {
@@ -275,7 +275,7 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
       const ctx = {
         logger: { warn: () => {}, info: () => {}, error: () => {} },
         llm: {
-          listProviders: () => [{ id: 'buddy' }],
+          listProviders: () => [{ id: 'officeace' }],
           listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
           resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
           stream: (o: { provider: string }) => {
@@ -290,7 +290,7 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
         rejections: () => ({}),
       })
       await run(adapter, 'deepseek-v4-1-flash')
-      expect(sent).toEqual(['buddy'])
+      expect(sent).toEqual(['officeace'])
     })
 
     it('★ 池查询抛错 ⇒ 保留候选（一次查询异常不得让渠道整体消失）', async () => {
@@ -298,7 +298,7 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
       const ctx = {
         logger: { warn: () => {}, info: () => {}, error: () => {} },
         llm: {
-          listProviders: () => [{ id: 'buddy' }],
+          listProviders: () => [{ id: 'officeace' }],
           listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
           resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
           stream: (o: { provider: string }) => {
@@ -316,7 +316,7 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
         rejections: () => ({}),
       })
       await run(adapter, 'deepseek-v4-1-flash')
-      expect(sent, '查询异常 ⇒ 保留候选').toEqual(['buddy'])
+      expect(sent, '查询异常 ⇒ 保留候选').toEqual(['officeace'])
     })
   })
 
@@ -326,9 +326,9 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
     let table: RejectionTable = {}
     const { adapter, sent } = makeAdapter(() => table)
     await run(adapter, 'deepseek-v4-1-flash')
-    expect(sent).toEqual(['buddy'])
-    // 面板上关掉 buddy
-    table = { 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }
+    expect(sent).toEqual(['officeace'])
+    // 面板上关掉 officeace
+    table = { 'deepseek-v4-1-flash': { officeace: { 'deepseek-v4.1-flash': true } } }
     sent.length = 0
     await run(adapter, 'deepseek-v4-1-flash')
     expect(sent).toEqual(['codearts'])
@@ -340,9 +340,9 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
     let table: RejectionTable = {}
     const { adapter, sent } = makeAdapter(() => table)
     await run(adapter, 'deepseek-v4-1-flash')   // 填缓存
-    expect(sent).toEqual(['buddy'])
+    expect(sent).toEqual(['officeace'])
     // 模拟 RPC 改完拒绝表后清缓存（Task 3 的端点会调它）
-    table = { 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }
+    table = { 'deepseek-v4-1-flash': { officeace: { 'deepseek-v4.1-flash': true } } }
     adapter.clearChoiceCache()
     sent.length = 0
     await run(adapter, 'deepseek-v4-1-flash')
@@ -356,8 +356,8 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
-        listProviders: () => [{ id: 'buddy' }, { id: 'codearts' }],
-        listModels: async (p: string) => [{ id: p === 'buddy' ? 'deepseek-v4.1-flash' : 'deepseek-v4.1-flash', name: 'M' }],
+        listProviders: () => [{ id: 'officeace' }, { id: 'codearts' }],
+        listModels: async (p: string) => [{ id: p === 'officeace' ? 'deepseek-v4.1-flash' : 'deepseek-v4.1-flash', name: 'M' }],
         resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
         stream: () => (async function* () { yield { type: 'text', text: 'ok' } })(),
       },
@@ -372,7 +372,7 @@ describe('★ 拒绝必须真的生效：被拒候选不得出现在候选序里
       rejections: () => ({ 'deepseek-v4-1-flash': { codearts: { 'deepseek-v4.1-flash': true } } }),
     })
     await run(adapter, 'deepseek-v4-1-flash')
-    expect(probed).toEqual(['buddy'])
+    expect(probed).toEqual(['officeace'])
   })
 })
 
@@ -381,7 +381,7 @@ describe('★ aggregate.catalog 的组装（只读、零余额查询）', () => 
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
-        listProviders: () => [{ id: 'buddy' }],
+        listProviders: () => [{ id: 'officeace' }],
         listModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · x0.15' }],
         resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
         stream: () => (async function* () { /* noop */ })(),
@@ -400,7 +400,7 @@ describe('★ aggregate.catalog 的组装（只读、零余额查询）', () => 
 
   it('每个候选都带 provider / realId / realName / 倍率 / 是否补丁 / 三态 / 是否接入折算', async () => {
     const adapter = makeAdapter(
-      () => ({ 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }),
+      () => ({ 'deepseek-v4-1-flash': { officeace: { 'deepseek-v4.1-flash': true } } }),
       () => {},
     )
     const catalog = await adapter.describeCatalog()
@@ -409,7 +409,7 @@ describe('★ aggregate.catalog 的组装（只读、零余额查询）', () => 
     expect(entry!.name).toBe('DeepSeek V4.1 Flash')
     expect(entry!.candidates).toEqual([
       {
-        provider: 'buddy',
+        provider: 'officeace',
         realId: 'deepseek-v4.1-flash',
         realName: 'Deepseek-V4.1-Flash · x0.15',
         price: 0.15,
@@ -457,7 +457,7 @@ describe('★ aggregate.catalog 的组装（只读、零余额查询）', () => 
     //      故这张表**目前在轮换里不起任何作用**，面板上的 `⚠️补丁` 标记也看不到。
     //      是否给 lobsterai 接入折算由用户决定（见规格 §9.1 的接入清单）。
     const virtual = buildVirtualModels({
-      buddy: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
+      officeace: [{ id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash' }],
       // lobsterai 的 deepseek-flash 靠**显式补丁**归一（id/name 两通道都命中不了）
       lobsterai: [{ id: 'deepseek-flash', name: 'DeepSeek Flash' }],
     })
@@ -470,7 +470,7 @@ describe('★ aggregate.catalog 的组装（只读、零余额查询）', () => 
   })
 
   it('★ 只读：describeCatalog 不得改动拒绝表', async () => {
-    const table = { 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }
+    const table = { 'deepseek-v4-1-flash': { officeace: { 'deepseek-v4.1-flash': true } } }
     const before = JSON.stringify(table)
     const adapter = makeAdapter(() => table, () => {})
     await adapter.describeCatalog()
@@ -487,7 +487,7 @@ describe('★ aggregate.catalog 的组装（只读、零余额查询）', () => 
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
-        listProviders: () => [{ id: 'buddy' }],
+        listProviders: () => [{ id: 'officeace' }],
         listModels: async () => {
           listModelsCalls += 1
           return phase === 1
@@ -538,7 +538,7 @@ describe('★★ 未接入渠道的候选：可见、默认不参与、可手工
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
-        listProviders: () => [{ id: 'buddy' }, { id: 'lobsterai' }, { id: 'raccoon' }],
+        listProviders: () => [{ id: 'officeace' }, { id: 'lobsterai' }, { id: 'raccoon' }],
         listModels: async (provider: string) => [
           { id: 'deepseek-v4.1-flash', name: `Deepseek-V4.1-Flash · ${provider}` },
         ],
@@ -556,9 +556,9 @@ describe('★★ 未接入渠道的候选：可见、默认不参与、可手工
   it('★ 候选**全部**列出（含未接入的 raccoon），并逐条带三态', async () => {
     const catalog = await makeMixed().describeCatalog()
     const entry = catalog.models.find((m) => m.canonicalId === 'deepseek-v4-1-flash')
-    expect(entry, '该模型应存在（buddy 已接入）').toBeDefined()
+    expect(entry, '该模型应存在（officeace 已接入）').toBeDefined()
     const providers = entry!.candidates.map((c) => c.provider)
-    expect(providers).toContain('buddy')
+    expect(providers).toContain('officeace')
     expect(providers, '★ raccoon 未接入折算，但**仍要列出来**（用户要手工打开它）').toContain('raccoon')
     expect(providers).toContain('lobsterai')
     // 逐条三态：已接入 ⇒ allowed；未接入 ⇒ default-rejected（**默认不参与**）
@@ -568,7 +568,7 @@ describe('★★ 未接入渠道的候选：可见、默认不参与、可手工
     expect(WIRED_EXPIRY_PROVIDERS, '前置事实：lobsterai 已接入').toContain('lobsterai')
     expect(WIRED_EXPIRY_PROVIDERS, '前置事实：raccoon 未接入').not.toContain('raccoon')
     const byProvider = Object.fromEntries(entry!.candidates.map((c) => [c.provider, c.state]))
-    expect(byProvider.buddy).toBe('allowed')
+    expect(byProvider.officeace).toBe('allowed')
     expect(byProvider.lobsterai).toBe('allowed')
     expect(byProvider.raccoon).toBe('default-rejected')
   })
@@ -580,16 +580,16 @@ describe('★★ 未接入渠道的候选：可见、默认不参与、可手工
     expect(raccoon.rejected).toBe(true)
     expect(raccoon.expiryWired).toBe(false)
     // 已接入的候选相反：参与、且标为已接入。
-    const buddy = entry!.candidates.find((c) => c.provider === 'buddy')!
-    expect(buddy.rejected).toBe(false)
-    expect(buddy.expiryWired).toBe(true)
+    const officeace = entry!.candidates.find((c) => c.provider === 'officeace')!
+    expect(officeace.rejected).toBe(false)
+    expect(officeace.expiryWired).toBe(true)
   })
 
   it('★ 手工打开某条未接入候选 ⇒ 它变成 allowed（白名单真的被读）', async () => {
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
-        listProviders: () => [{ id: 'buddy' }, { id: 'raccoon' }],
+        listProviders: () => [{ id: 'officeace' }, { id: 'raccoon' }],
         listModels: async (provider: string) => [
           { id: 'deepseek-v4.1-flash', name: `Deepseek-V4.1-Flash · ${provider}` },
         ],
@@ -619,8 +619,8 @@ describe('★★ 未接入渠道的候选：可见、默认不参与、可手工
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
-        listProviders: () => [{ id: 'buddy' }, { id: 'lobsterai' }],
-        listModels: async (provider: string) => (provider === 'buddy'
+        listProviders: () => [{ id: 'officeace' }, { id: 'lobsterai' }],
+        listModels: async (provider: string) => (provider === 'officeace'
           ? [{ id: 'glm-5.3', name: 'GLM-5.3' }]
           : [{ id: 'sn-only-model', name: 'SN Only' }]),
         resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
@@ -648,12 +648,12 @@ describe('★★ 未接入渠道的候选：可见、默认不参与、可手工
     const adapter = makeMixed()
     const catalog = await adapter.describeCatalog()
     const listed = new Set(catalog.models.flatMap((m) => m.candidates.map((c) => c.provider)))
-    expect([...listed].sort()).toEqual(['buddy', 'lobsterai', 'raccoon'])
+    expect([...listed].sort()).toEqual(['lobsterai', 'officeace', 'raccoon'])
     // 参与集必须恰好是已接入的那些（未接入的默认不参与）。
     const participating = new Set(
       catalog.models.flatMap((m) => m.candidates.filter((c) => c.state === 'allowed').map((c) => c.provider)),
     )
-    const expected = ['buddy', 'lobsterai', 'raccoon'].filter((p) => WIRED_EXPIRY_PROVIDERS.includes(p))
+    const expected = ['lobsterai', 'officeace', 'raccoon'].filter((p) => WIRED_EXPIRY_PROVIDERS.includes(p))
     expect([...participating].sort()).toEqual(expected.sort())
     // 防「白名单把三个都收了」让这条变成恒真：raccoon 必须**不在**白名单里。
     expect(WIRED_EXPIRY_PROVIDERS).not.toContain('raccoon')
@@ -665,7 +665,7 @@ describe('★ describeExpiryOrder：「按临期排序」的探测（唯一会�
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
-        listProviders: () => [{ id: 'buddy' }, { id: 'codearts' }, { id: 'raccoon' }],
+        listProviders: () => [{ id: 'officeace' }, { id: 'codearts' }, { id: 'raccoon' }],
         listModels: async (provider: string) => [
           { id: 'deepseek-v4.1-flash', name: `m-${provider}` },
           { id: 'glm-5.3', name: `g-${provider}` },
@@ -686,30 +686,30 @@ describe('★ describeExpiryOrder：「按临期排序」的探测（唯一会�
 
   it('★ 按渠道去重：同一渠道只探一次（不重复打上游）', async () => {
     const calls: string[] = []
-    const adapter = makeAdapter(async (p) => (p === 'buddy' ? 1_000 : 9_000), calls)
+    const adapter = makeAdapter(async (p) => (p === 'officeace' ? 1_000 : 9_000), calls)
     const order = await adapter.describeExpiryOrder()
-    // 三个渠道各探一次 —— 尽管 buddy 在**两个**虚拟模型下都出现
-    expect(calls.sort()).toEqual(['buddy', 'codearts'])
-    expect(order).toEqual({ buddy: 1_000, codearts: 9_000 })
+    // 三个渠道各探一次 —— 尽管 officeace 在**两个**虚拟模型下都出现
+    expect(calls.sort()).toEqual(['codearts', 'officeace'])
+    expect(order).toEqual({ officeace: 1_000, codearts: 9_000 })
   })
 
   it('★ 只探「已接入临期折算」的渠道（raccoon 不探）', async () => {
     const calls: string[] = []
     const adapter = makeAdapter(async () => 1_000, calls)
     const order = await adapter.describeExpiryOrder()
-    expect(Object.keys(order).sort()).toEqual(['buddy', 'codearts'])
+    expect(Object.keys(order).sort()).toEqual(['codearts', 'officeace'])
     expect(calls).not.toContain('raccoon')
   })
 
   it('★ 探测失败如实返回该值（不假装成功）', async () => {
     const calls: string[] = []
     const adapter = makeAdapter(async (p) => {
-      if (p === 'buddy') throw new Error('boom')
+      if (p === 'officeace') throw new Error('boom')
       return 5_000
     }, calls)
     const order = await adapter.describeExpiryOrder()
-    // buddy 抛错 ⇒ 记 UNUSABLE（-1），其余正常
-    expect(order.buddy).toBe(-1)
+    // officeace 抛错 ⇒ 记 UNUSABLE（-1），其余正常
+    expect(order.officeace).toBe(-1)
     expect(order.codearts).toBe(5_000)
   })
 
@@ -751,7 +751,7 @@ describe('★ describeExpiryOrder：「按临期排序」的探测（唯一会�
 
   it('★ 只读：不得改动拒绝表', async () => {
     const calls: string[] = []
-    const table = { 'deepseek-v4-1-flash': { buddy: { 'deepseek-v4.1-flash': true } } }
+    const table = { 'deepseek-v4-1-flash': { officeace: { 'deepseek-v4.1-flash': true } } }
     const before = JSON.stringify(table)
     const adapter = makeAdapter(async () => 1_000, calls)
     await adapter.describeExpiryOrder()
@@ -807,11 +807,11 @@ describe('★ D4：拒绝记录的 realId 漂移 ⇒ 降级为渠道级', () => 
 
   it('★ 精确命中 ⇒ 只拒那一条（不降级）', async () => {
     const adapter = makeAdapter(
-      { buddy: [{ id: 'm1', name: 'M1' }] },
-      { m1: { buddy: { m1: true } } },
+      { officeace: [{ id: 'm1', name: 'M1' }] },
+      { m1: { officeace: { m1: true } } },
     )
-    const virtual = { key: 'm1', candidates: [{ provider: 'buddy', realId: 'm1' }] }
-    expect([...adapter.rejectedFor(virtual)]).toEqual(['buddy\u0000m1'])
+    const virtual = { key: 'm1', candidates: [{ provider: 'officeace', realId: 'm1' }] }
+    expect([...adapter.rejectedFor(virtual)]).toEqual(['officeace\u0000m1'])
   })
 
   it('★ 记录里的 realId 已漂移走 ⇒ 降级为**渠道级**（该渠道全部候选都被拒）', async () => {
@@ -830,32 +830,32 @@ describe('★ D4：拒绝记录的 realId 漂移 ⇒ 降级为渠道级', () => 
 
   it('★ 但「无精确命中 + 无漂移」不得降级（记录里的 id 就是当前候选之一 ⇒ 那是精确命中）', async () => {
     const adapter = makeAdapter(
-      { buddy: [{ id: 'm1', name: 'M1' }, { id: 'm2', name: 'M2' }] },
-      { m1: { buddy: { m2: true } } },
+      { officeace: [{ id: 'm1', name: 'M1' }, { id: 'm2', name: 'M2' }] },
+      { m1: { officeace: { m2: true } } },
     )
     const virtual = {
       key: 'm1',
-      candidates: [{ provider: 'buddy', realId: 'm1' }, { provider: 'buddy', realId: 'm2' }],
+      candidates: [{ provider: 'officeace', realId: 'm1' }, { provider: 'officeace', realId: 'm2' }],
     }
     // 只拒 m2（精确），m1 仍参与
-    expect([...adapter.rejectedFor(virtual)].sort()).toEqual(['buddy\u0000m2'])
+    expect([...adapter.rejectedFor(virtual)].sort()).toEqual(['officeace\u0000m2'])
   })
 
   it('★ 另一渠道有记录、本渠道无记录 ⇒ 不得把本渠道也拒掉', async () => {
     const adapter = makeAdapter(
-      { buddy: [{ id: 'm1', name: 'M1' }], zcode: [{ id: 'm1', name: 'M1' }] },
+      { officeace: [{ id: 'm1', name: 'M1' }], zcode: [{ id: 'm1', name: 'M1' }] },
       // ⚠️ 键必须**带引号**：`{ gone-id: true }` 会被 JS 解析成减法表达式
       //（对象字面量的键不能含连字符）—— 我第一版就这么写，导致整份文件语法错误
       //（`no tests` + esbuild 报 `Expected "}" but found "-"`）。
-      { m1: { buddy: { 'gone-id': true } } },
+      { m1: { officeace: { 'gone-id': true } } },
     )
     const virtual = {
       key: 'm1',
-      candidates: [{ provider: 'buddy', realId: 'm1' }, { provider: 'zcode', realId: 'm1' }],
+      candidates: [{ provider: 'officeace', realId: 'm1' }, { provider: 'zcode', realId: 'm1' }],
     }
     const rejected = [...adapter.rejectedFor(virtual)]
-    // buddy 降级（被拒）、zcode **不受影响**
-    expect(rejected).toEqual(['buddy\u0000m1'])
+    // officeace 降级（被拒）、zcode **不受影响**
+    expect(rejected).toEqual(['officeace\u0000m1'])
   })
 
   it('★ 降级必须产生一条 warn（可排查：用户不知道自己的拒绝为何"还在生效"）', async () => {
@@ -1004,8 +1004,8 @@ describe('★ hasDrifted 闸门：层存在但无 `true` 记录 ⇒ **不得**�
   //    （`src/aggregate-adapter.ts:247`）删掉后 **101/101 全绿** ⇒ 声称它是死代码。
   //
   //    ⚠️ 但**实测证明它承重**（探针）：
-  //    - 层存在但**空对象** `{buddy:{}}`      ⇒ `hasDrifted=false` ⇒ 不降级（`[]`）
-  //    - 层存在但**只有 `false`** `{buddy:{m1:false}}` ⇒ 同上
+  //    - 层存在但**空对象** `{officeace:{}}`      ⇒ `hasDrifted=false` ⇒ 不降级（`[]`）
+  //    - 层存在但**只有 `false`** `{officeace:{m1:false}}` ⇒ 同上
   //    若删掉该行，这两种情形都会**降级并拒掉全部当前候选** —— 而用户
   //    **从未拒绝过任何东西**（`false` 是「未拒绝」的显式写法）⇒ **严重过拒**。
   //
@@ -1017,7 +1017,7 @@ describe('★ hasDrifted 闸门：层存在但无 `true` 记录 ⇒ **不得**�
     const ctx = {
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       llm: {
-        listProviders: () => [{ id: 'buddy', name: 'b' }],
+        listProviders: () => [{ id: 'officeace', name: 'b' }],
         listModels: async () => [{ id: 'm1', name: 'M1' }],
         resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
         stream: () => (async function* () { /* noop */ })(),
@@ -1031,23 +1031,23 @@ describe('★ hasDrifted 闸门：层存在但无 `true` 记录 ⇒ **不得**�
       accountPool: pool, expiryProbe: async () => 100, rejections: () => rejections,
     })
   }
-  const virtual = { key: 'm1', candidates: [{ provider: 'buddy', realId: 'm1' }] }
+  const virtual = { key: 'm1', candidates: [{ provider: 'officeace', realId: 'm1' }] }
 
   it('★ 层是**空对象** ⇒ 不降级（用户从未拒绝过任何东西）', () => {
-    expect([...makeAdapter({ m1: { buddy: {} } }).rejectedFor(virtual)]).toEqual([])
+    expect([...makeAdapter({ m1: { officeace: {} } }).rejectedFor(virtual)]).toEqual([])
   })
 
   it('★ 层里**只有 `false`** ⇒ 不降级（`false` 是「未拒绝」的显式写法）', () => {
-    expect([...makeAdapter({ m1: { buddy: { m1: false } } }).rejectedFor(virtual)]).toEqual([])
+    expect([...makeAdapter({ m1: { officeace: { m1: false } } }).rejectedFor(virtual)]).toEqual([])
   })
 
   it('★ 层里有**已漂移的 `true`** ⇒ 才降级（对照：证明闸门不挡真降级）', () => {
-    expect([...makeAdapter({ m1: { buddy: { ghost: true } } }).rejectedFor(virtual)])
-      .toEqual(['buddy\u0000m1'])
+    expect([...makeAdapter({ m1: { officeace: { ghost: true } } }).rejectedFor(virtual)])
+      .toEqual(['officeace\u0000m1'])
   })
 
   it('★ 已漂移 `true` + 当前 `false` ⇒ 仍降级（`true` 一旦写入就不会被 `false` 抵消）', () => {
-    expect([...makeAdapter({ m1: { buddy: { ghost: true, m1: false } } }).rejectedFor(virtual)])
-      .toEqual(['buddy\u0000m1'])
+    expect([...makeAdapter({ m1: { officeace: { ghost: true, m1: false } } }).rejectedFor(virtual)])
+      .toEqual(['officeace\u0000m1'])
   })
 })

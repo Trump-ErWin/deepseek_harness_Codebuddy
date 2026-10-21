@@ -1,9 +1,9 @@
 /**
- * CodeBuddy / WorkBuddy 账号余额缓存 + 按「积分何时作废」优先的选号。
+ * 会员制渠道的账号余额缓存 + 按「积分何时作废」优先的选号。
  *
  * ## 它解决什么
  *
- * 两个 buddy 的账号池里，一个号常同时持有多种资源包（实测 WorkBuddy 每个号都有
+ * 两个腾讯系渠道 的账号池里，一个号常同时持有多种资源包（实测 WorkBuddy 每个号都有
  * 「Bonus Pack（14 天到期）」+「Free Plan Subscription（扣费截止 8 年后）」），
  * 而**服务端扣哪个包不由我们决定**。插件能做的是决定**用哪个号**：
  *
@@ -36,23 +36,22 @@
  * 里面不含「按 now 现算」的成分，所以它没有这个问题 —— 不是漏改。
  */
 
-import type { BuddyCredential } from './buddy.js'
-import type { BuddyProduct } from './product.js'
+import type { ChannelCredential, ProviderProduct } from './jwt-utils.js'
 import { fetchCreditBalance, type CreditBalance } from './credits.js'
 import {
-  buddyExpiringWindowDays,
-  buddyBalanceTier,
-  buddyTierUsable,
-  rankBuddyAccountsByBalance,
-  splitBuddyCreditsByExpiry,
-  type BuddyAccountBalance,
-  type BuddyBalanceTier,
-  type BuddyCreditSplit,
-  type BuddyTierOptions,
-} from './buddy-balance-rank.js'
+  expiringWindowDays,
+  balanceTier,
+  tierUsable,
+  rankAccountsByBalance,
+  splitBalanceByExpiry,
+  type AccountBalance,
+  type BalanceTier,
+  type CreditSplit,
+  type TierOptions,
+} from './balance-rank.js'
 
 /** 余额缓存 TTL（毫秒），与 Loomy 同值。 */
-export const BUDDY_BALANCE_CACHE_TTL_MS = 60_000
+export const BALANCE_CACHE_TTL_MS = 60_000
 
 /**
  * **失败**结果的缓存 TTL（毫秒）—— 比成功短一个数量级。
@@ -62,18 +61,18 @@ export const BUDDY_BALANCE_CACHE_TTL_MS = 60_000
  * 用户被告知「额度已用尽」而实际号里都有钱。失败是瞬时状态，
  * 不该被当成一个持续一分钟的事实。
  */
-export const BUDDY_BALANCE_ERROR_CACHE_TTL_MS = 5_000
+export const BALANCE_ERROR_CACHE_TTL_MS = 5_000
 
 /** 单个账号的余额（含查询失败标记）。 */
-export interface BuddyAccountBalanceEntry extends BuddyAccountBalance {
+export interface AccountBalanceEntry extends AccountBalance {
   /** 查询是否成功；false 时两个余额字段均为 undefined。 */
   ok: boolean
   /** 查询失败原因（诊断用）。 */
   error?: string
   /** 分到的档位（查询后即刻算出，供日志与 UI 直接读取）。 */
-  tier?: BuddyBalanceTier
+  tier?: BalanceTier
   /** 原始拆分结果（展示「15 天内到期 X · 永久 Y」用）。 */
-  split?: BuddyCreditSplit
+  split?: CreditSplit
   /**
    * ⚠️ **本次读数是「降级结果」**（`balance.degraded === true`）。
    *
@@ -85,7 +84,7 @@ export interface BuddyAccountBalanceEntry extends BuddyAccountBalance {
 }
 
 /** 一条待选账号（调用方从账号池取出）。 */
-export interface BuddyCandidateAccount {
+export interface CandidateAccount {
   id: string
   credentialRef: string
 }
@@ -97,7 +96,7 @@ export interface BuddyCandidateAccount {
  * 会让一次网络抖动伪装成"钱花完了"，用户于是去解锁、或白等到明天 ——
  * 而号其实有钱。
  */
-export type BuddyNoAccountReason =
+export type NoAccountReason =
   /** 所有候选都查到了余额，且可用那类积分确实都是 0。 */
   | { kind: 'exhausted' }
   /** 至少一个候选**查询失败**，无法判定它是否真的没额度。 */
@@ -118,7 +117,7 @@ export type BuddyNoAccountReason =
    *
    * ⚠️ 这一档同样是**必须**的，而且它比 `no-candidates` 更隐蔽（2026-10-14 审计
    * 实测打穿）：分档返回 `ok: true` 这一事实**本身就证明**该号有可用的临期积分
-   * （锁定时 `buddyTierUsable` 只对 `expiring` 为真），所以此时**恰恰不能**说
+   * （锁定时 `tierUsable` 只对 `expiring` 为真），所以此时**恰恰不能**说
    * 「积分都已用尽」—— 我们刚刚查到它有钱，矛盾出在**凭据**上。
    *
    * 可达时序（三条都是真实路径，不是理论构造）：
@@ -134,14 +133,14 @@ export type BuddyNoAccountReason =
   | { kind: 'credential-only' }
 
 /** 选号结果：选中，或「为什么没选中」。 */
-export type BuddySelectionResult
-  = { ok: true; account: BuddyCandidateAccount; balance: BuddyAccountBalanceEntry }
-  | { ok: false; reason: BuddyNoAccountReason }
+export type SelectionResult
+  = { ok: true; account: CandidateAccount; balance: AccountBalanceEntry }
+  | { ok: false; reason: NoAccountReason }
 
 /**
  * `fetchBalance` 的**条件必填**规则（2026-10-06 PR !68 审计）。
  *
- * 只有 buddy 系能省略它（凭据结构相同，缺省实现直接调 `fetchCreditBalance`）。
+ * 只有 腾讯系能省略它（凭据结构相同，缺省实现直接调 `fetchCreditBalance`）。
  * **其它 provider 必须显式传入** —— 否则编译器无从发现「忘了传」。
  *
  * ⚠️ 这不是洁癖：已实测漏传时 `tsc` **零报错**，而 `fetchCreditBalance` 会拿
@@ -149,7 +148,7 @@ export type BuddySelectionResult
  * `undefined/...` 的畸形请求 → 余额恒查不到 → 未锁定时换号优化静默失效、
  * 锁定时永远报「无法确认是否有可用账号」。这条漏洞比烧积分更难归因。
  */
-type FetchBalanceRule<TProduct, TCredential> = TProduct extends BuddyProduct
+type FetchBalanceRule<TProduct, TCredential> = TProduct extends ProviderProduct
   ? {
     /** 余额查询（缺省走真实的 `fetchCreditBalance`）。 */
     fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
@@ -168,11 +167,11 @@ type FetchBalanceRule<TProduct, TCredential> = TProduct extends BuddyProduct
  * 保留自己的精确类型（缺省仍是 buddy，既有调用点无需改动）。
  *
  * ⚠️ 唯一要求：`fetchBalance` 返回的 `CreditBalance.packages[]` 必须带
- * `deductionEndTime`（拿不到就归入永久桶，见 `splitBuddyCreditsByExpiry`）。
+ * `deductionEndTime`（拿不到就归入永久桶，见 `splitBalanceByExpiry`）。
  */
-export type BuddySelectionDeps<
-  TProduct = BuddyProduct,
-  TCredential = BuddyCredential,
+export type SelectionDeps<
+  TProduct = ProviderProduct,
+  TCredential = ChannelCredential,
 > = {
   product: TProduct
   /** 解析某账号的凭据；返回 undefined 表示不可用。 */
@@ -212,16 +211,16 @@ interface CacheEntry {
  * 生命周期与 provider 的适配器注册一致（**每个 provider 各一个实例**），
  * 故不存在跨站缓存互相串味的可能。
  *
- * ⚠️ 泛型参数见 {@link BuddySelectionDeps}；缺省仍是 buddy 系，
+ * ⚠️ 泛型参数见 {@link SelectionDeps}；缺省仍是 腾讯系，
  * 既有调用点（CodeBuddy / WorkBuddy）无需改动。
  */
-export class BuddyBalanceSelector<
-  TProduct = BuddyProduct,
-  TCredential = BuddyCredential,
+export class BalanceSelector<
+  TProduct = ProviderProduct,
+  TCredential = ChannelCredential,
 > {
   private readonly cache = new Map<string, CacheEntry>()
 
-  constructor(private readonly deps: BuddySelectionDeps<TProduct, TCredential>) {}
+  constructor(private readonly deps: SelectionDeps<TProduct, TCredential>) {}
 
   /** 清空缓存（凭据变化、手动刷新余额、领取积分后调用）。 */
   invalidate(accountId?: string): void {
@@ -236,7 +235,7 @@ export class BuddyBalanceSelector<
    * 而提示文案与选号判据必须取同一个值 —— 缓存会让两者在不同时刻分裂。
    */
   private windowMs(): number {
-    return this.deps.windowMs ?? buddyExpiringWindowDays() * 24 * 60 * 60 * 1000
+    return this.deps.windowMs ?? expiringWindowDays() * 24 * 60 * 60 * 1000
   }
 
   /**
@@ -253,10 +252,10 @@ export class BuddyBalanceSelector<
    * 此时应继续用别的号，而不是把错误抛给用户）。
    *
    * ⚠️ **失败结果的 TTL 短一个数量级**（与 Loomy 那份同一修复，见
-   * `BUDDY_BALANCE_ERROR_CACHE_TTL_MS`）：把一次抖动缓存满 60 秒，会让
+   * `BALANCE_ERROR_CACHE_TTL_MS`）：把一次抖动缓存满 60 秒，会让
    * 「查不到」伪装成「额度用尽」整整一分钟。
    */
-  async balanceOf(account: BuddyCandidateAccount): Promise<BuddyAccountBalanceEntry> {
+  async balanceOf(account: CandidateAccount): Promise<AccountBalanceEntry> {
     const now = this.deps.now?.() ?? Date.now()
     const cached = this.cache.get(account.id)
     if (cached !== undefined) {
@@ -276,8 +275,8 @@ export class BuddyBalanceSelector<
        */
       const degradedSource = cached.source.ok && cached.source.balance.degraded === true
       const ttl = cached.source.ok && !degradedSource
-        ? (this.deps.ttlMs ?? BUDDY_BALANCE_CACHE_TTL_MS)
-        : (this.deps.errorTtlMs ?? BUDDY_BALANCE_ERROR_CACHE_TTL_MS)
+        ? (this.deps.ttlMs ?? BALANCE_CACHE_TTL_MS)
+        : (this.deps.errorTtlMs ?? BALANCE_ERROR_CACHE_TTL_MS)
       if (now - cached.at < ttl) {
         return this.classify(account.id, cached.source, now)
       }
@@ -297,12 +296,12 @@ export class BuddyBalanceSelector<
     id: string,
     source: BalanceSource,
     now: number,
-  ): BuddyAccountBalanceEntry {
+  ): AccountBalanceEntry {
     if (source.ok !== true) return failedEntry(id, source.error)
     const windowMs = this.windowMs()
-    const split = splitBuddyCreditsByExpiry(source.balance, now, windowMs)
+    const split = splitBalanceByExpiry(source.balance, now, windowMs)
     if (split === undefined) return failedEntry(id, '余额响应无法解析出积分池')
-    const entry: BuddyAccountBalanceEntry = {
+    const entry: AccountBalanceEntry = {
       id,
       ok: true,
       expiringBalance: split.expiring,
@@ -311,12 +310,12 @@ export class BuddyBalanceSelector<
       // ⚠️ 透传「降级」：总额可信、明细不可达 ⇒ 下游不得据此断言 exhausted。
       ...(source.balance.degraded === true ? { degraded: true } : {}),
     }
-    entry.tier = buddyBalanceTier(entry, { now, windowMs })
+    entry.tier = balanceTier(entry, { now, windowMs })
     return entry
   }
 
   /** 发一次请求取原料（不做任何分类）。 */
-  private async fetchSource(account: BuddyCandidateAccount): Promise<BalanceSource> {
+  private async fetchSource(account: CandidateAccount): Promise<BalanceSource> {
     let credential: TCredential | undefined
     try {
       credential = await this.deps.resolveCredential(account.credentialRef)
@@ -329,7 +328,7 @@ export class BuddyBalanceSelector<
 
     let balance: CreditBalance | null
     try {
-      // ⚠️ 缺省实现只适用于 buddy 系（凭据结构相同）。其它 provider 的
+      // ⚠️ 缺省实现只适用于 腾讯系（凭据结构相同）。其它 provider 的
       // `fetchBalance` 由 {@link FetchBalanceRule} 在**编译期**强制必填；
       // 这里再加一道运行时防御 —— 万一有人用 `as` 绕过了类型，
       // 宁可立刻抛一条能指认到原因的错，也不要发出 `undefined/...` 的畸形请求
@@ -343,7 +342,7 @@ export class BuddyBalanceSelector<
       }
       balance = await (injected
         ?? ((cred: TCredential, product: TProduct) =>
-          fetchCreditBalance(cred as unknown as BuddyCredential, product as unknown as BuddyProduct, this.deps.fetcher ?? fetch)))(
+          fetchCreditBalance(cred as unknown as ChannelCredential, product as unknown as ProviderProduct, this.deps.fetcher ?? fetch)))(
         credential, this.deps.product,
       )
     } catch (error) {
@@ -358,7 +357,7 @@ export class BuddyBalanceSelector<
   /**
    * 从候选账号中按「快到期优先」选一个。
    *
-   * 排序规则见 `rankBuddyAccountsByBalance`：
+   * 排序规则见 `rankAccountsByBalance`：
    * 有快到期积分 → 只剩永久 → 无余额/查不到。**档内保持传入顺序**（= 手动顺序）。
    *
    * ⚠️ **锁定永久积分时（`allowPermanent: false`）**：只剩永久积分的账号落入
@@ -372,9 +371,9 @@ export class BuddyBalanceSelector<
    * @param options - `allowPermanent` 为 false 时禁止消耗永久积分。
    */
   async select(
-    candidates: readonly BuddyCandidateAccount[],
-    options: BuddyTierOptions = {},
-  ): Promise<BuddySelectionResult> {
+    candidates: readonly CandidateAccount[],
+    options: TierOptions = {},
+  ): Promise<SelectionResult> {
     if (candidates.length === 0) {
       // ⚠️ 空候选 = **压根没查过余额**，不能报 `exhausted`（那是在替服务端
       //    断言「积分是 0」）。见 `no-candidates` 的说明。
@@ -385,7 +384,7 @@ export class BuddyBalanceSelector<
     const balances = await Promise.all(candidates.map((c) => this.balanceOf(c)))
     const byId = new Map(candidates.map((c, i) => [c.id, { account: c, balance: balances[i]! }]))
 
-    const ranked = rankBuddyAccountsByBalance(balances, options)
+    const ranked = rankAccountsByBalance(balances, options)
     const first = ranked[0]
     if (first === undefined) {
       return { ok: false, reason: noAccountReason(balances) }
@@ -393,7 +392,7 @@ export class BuddyBalanceSelector<
 
     // ⚠️ 排序只保证「可用的在前」，**不保证第一个可用** —— 未锁定时 none 档
     // 也参与排序（作为兜底），故只在锁定情况下才把「全部不可用」判成无可用账号。
-    if (options.allowPermanent === false && !buddyTierUsable(buddyBalanceTier(first, options))) {
+    if (options.allowPermanent === false && !tierUsable(balanceTier(first, options))) {
       return { ok: false, reason: noAccountReason(balances) }
     }
 
@@ -409,7 +408,7 @@ export class BuddyBalanceSelector<
  * 只要有任何一个候选是查询失败，就不能断言"额度都已用尽"—— 我们对它的余额
  * 其实一无所知。混报会让用户去解锁或白等一天，而号其实有钱。
  */
-function noAccountReason(balances: readonly BuddyAccountBalanceEntry[]): BuddyNoAccountReason {
+function noAccountReason(balances: readonly AccountBalanceEntry[]): NoAccountReason {
   const errors = balances.filter(b => !b.ok).map(b => b.error ?? '未知原因')
   if (errors.length > 0) return { kind: 'unknown', errors }
   /**
@@ -419,7 +418,7 @@ function noAccountReason(balances: readonly BuddyAccountBalanceEntry[]): BuddyNo
    * **总额拿到了、明细丢了**（`balance.degraded === true`）—— 例如 AutoClaw
    * 的流水端点抖动时静默回退钱包包，回退包**没有 `deductionEndTime`**。
    *
-   * 而 `splitBuddyCreditsByExpiry` 把「没有到期时刻」判成**永久桶**（对真·永久是对的）
+   * 而 `splitBalanceByExpiry` 把「没有到期时刻」判成**永久桶**（对真·永久是对的）
    * ⇒ 一次明细抖动会让「有临期积分的账号」被判成**只剩永久积分** ⇒
    * 锁定时报「积分都已用尽」—— **那句会把用户推向不可撤回的解锁**。
    *
@@ -441,32 +440,32 @@ function noAccountReason(balances: readonly BuddyAccountBalanceEntry[]): BuddyNo
 }
 
 /** 构造一个「查询失败」的余额条目。 */
-function failedEntry(id: string, error: string): BuddyAccountBalanceEntry {
+function failedEntry(id: string, error: string): AccountBalanceEntry {
   return { id, ok: false, error }
 }
 
 /**
- * `select` 的**结构化**形状（`BuddyBalanceSelector` 满足它，无需继承）。
+ * `select` 的**结构化**形状（`BalanceSelector` 满足它，无需继承）。
  *
- * ## 为什么不是直接收 `BuddyBalanceSelector`
+ * ## 为什么不是直接收 `BalanceSelector`
  *
- * `BuddyBalanceSelector` 带 `private` 成员 ⇒ 它是**名义类型**：任何结构等价的
+ * `BalanceSelector` 带 `private` 成员 ⇒ 它是**名义类型**：任何结构等价的
  * 替身都**不能**赋给它。而 `credential-resolver.ts` 必须能在单测里注入替身
  *（否则选号编排的每一格都得起一台真适配器）。
  *
  * ⚠️ 这是**纯放宽**：`select` 的签名本就不提及 `TProduct` / `TCredential`
- *（它只吃 `BuddyCandidateAccount[]` 与 `BuddyTierOptions`），故真实例天然满足
+ *（它只吃 `CandidateAccount[]` 与 `TierOptions`），故真实例天然满足
  * 本接口 —— 既有调用点一个都不用改。
  */
-export interface BuddySelectorLike {
+export interface SelectorLike {
   select(
-    candidates: readonly BuddyCandidateAccount[],
-    options?: BuddyTierOptions,
-  ): Promise<BuddySelectionResult>
+    candidates: readonly CandidateAccount[],
+    options?: TierOptions,
+  ): Promise<SelectionResult>
 }
 
 /**
- * 选号 + 取凭据的完整编排（供 `src/index.ts` 的 buddy 系 provider 调用）。
+ * 选号 + 取凭据的完整编排（供 `src/index.ts` 的 腾讯系 provider 调用）。
  *
  * ## 为什么需要这一层
  *
@@ -482,28 +481,28 @@ export interface BuddySelectorLike {
  *   从而**继续尝试池里的其余账号**（既有行为）。
  *
  * @param selector - 该 provider 专属的选号器（缓存不能跨站共用）。
- *   ⚠️ 只要求 {@link BuddySelectorLike} 这个**结构**形状，不要求具体类 ——
+ *   ⚠️ 只要求 {@link SelectorLike} 这个**结构**形状，不要求具体类 ——
  *   具体类带 `private` 成员（名义类型），会让 `credential-resolver.ts` 的
  *   测试替身无法传入。真实例天然满足该接口，既有调用点不受影响。
  * @param candidates - 已按 `enabled` + 模型限流过滤的候选。
  * @param options - 锁定标志与凭据解析器。
  */
-export async function pickBuddyAccount<TCredential = BuddyCredential>(
-  selector: BuddySelectorLike,
-  candidates: readonly BuddyCandidateAccount[],
+export async function pickAccount<TCredential = ChannelCredential>(
+  selector: SelectorLike,
+  candidates: readonly CandidateAccount[],
   options: {
     /** 是否允许消耗永久积分（= 未锁定）。 */
     allowPermanent: boolean
     /** 按凭据 ref 取凭据；undefined 表示该账号不可用。 */
     resolveCredential: (credentialRef: string) => Promise<TCredential | undefined>
     /** 分档选项透传（测试注入时间用）。 */
-    tierOptions?: BuddyTierOptions
+    tierOptions?: TierOptions
   },
 ): Promise<
   | {
     kind: 'account'
-    account: BuddyCandidateAccount
-    balance: BuddyAccountBalanceEntry
+    account: CandidateAccount
+    balance: AccountBalanceEntry
     credential: TCredential
     /** 本次因为**凭据不可解析**而被跳过的账号（选中项不在其中）。 */
     tried: ReadonlySet<string>
@@ -517,7 +516,7 @@ export async function pickBuddyAccount<TCredential = BuddyCredential>(
      * 「真的用尽」/「查不到」/「凭据全坏」再报错 —— 混报会把用户引向
      * 「解锁永久积分」这个不可撤回的错动作。
      */
-    reason: BuddyNoAccountReason
+    reason: NoAccountReason
   }
 > {
   const tried = new Set<string>()
@@ -529,7 +528,7 @@ export async function pickBuddyAccount<TCredential = BuddyCredential>(
    * 筛空」**凭空**断言成「积分都已用尽」，用户据此去解锁永久积分 ——
    * 而解禁时刻其实就写在 `modelRateLimits` 里。
    */
-  let reason: BuddyNoAccountReason | undefined
+  let reason: NoAccountReason | undefined
     = candidates.length === 0 ? { kind: 'no-candidates' } : undefined
   // 循环上界取候选数：每次迭代至少排除一个账号，故必然终止。
   for (let remaining = candidates; remaining.length > 0;) {

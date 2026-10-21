@@ -35,7 +35,7 @@ import {
   type TraeCredential,
   type TraeRemoteModel,
 } from './trae.js'
-import { jwtExpiresAtMs } from './buddy.js'
+import { jwtExpiresAtMs } from './jwt-utils.js'
 import { TRAE, type TraeProduct } from './trae-product.js'
 import {
   buildTraeLoginURL,

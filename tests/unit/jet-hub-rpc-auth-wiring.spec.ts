@@ -52,8 +52,6 @@ import { AUTH_EXEMPT, expectedProviderIdsWithAuth } from '../helpers/provider-se
  */
 const AUTH_SERVICE: Readonly<Record<string, string>> = {
   codearts: 'codeartsAuth',
-  buddy: 'buddyAuth',
-  workbuddy: 'workbuddyAuth',
   lobsterai: 'lobsteraiAuth',
   qoder: 'qoderAuth',
   qodercn: 'qodercnAuth',
@@ -295,7 +293,7 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：17 → 18；
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
-    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(20)
+    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(18)
     // 另一方向（原断言的**全部**证明力都在这条上，单独留着免得它随上面那条一起消失）：
     // 表里的每个键都必须是 registry 里真实存在的 provider id（防拼写错误造成的僵尸项）。
     for (const id of Object.keys(AUTH_SERVICE)) {

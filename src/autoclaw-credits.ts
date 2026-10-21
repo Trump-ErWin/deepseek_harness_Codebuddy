@@ -472,7 +472,7 @@ export async function fetchAutoclawBalanceDetailed(
      * 流水失败 / 守恒不成立时**静默回退钱包包** —— 总额对，但**逐包到期全部丢失**
      * （钱包包没有 `deductionEndTime`）。
      *
-     * 而 `splitBuddyCreditsByExpiry` 把「没有到期时刻」判成**永久桶**（对「真·永久」
+     * 而 `splitCreditsByExpiry` 把「没有到期时刻」判成**永久桶**（对「真·永久」
      * 是对的）⇒ 一次流水抖动会让「有临期积分的账号」被判成**只剩永久积分** ⇒
      * 锁定状态下报「积分都已用尽」—— **那句会把用户推向不可撤回的解锁**。
      *
@@ -518,7 +518,7 @@ export async function fetchAutoclawBalanceDetailed(
       //   原先无条件造出 `makePackage('奖励积分', total, true)` ⇒ 凭空多出
       //   一个「奖励积分」包。
       //   - `total === 0` ⇒ 造出来的是 `remaining: 0` 的死包，纯噪声，
-      //     还会让下游 `splitBuddyCreditsByExpiry` / `sharedPackageExpiry`
+      //     还会让下游 `splitCreditsByExpiry` / `sharedPackageExpiry`
       //     多走一轮无效遍历；
       //   - `total > 0` 但一个可见池都没有 ⇒ 余额读数本身是对的，兜底包
       //     保留「总额可见」这一信息（`packages` 为空会让合计行空着）。

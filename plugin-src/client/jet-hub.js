@@ -2863,7 +2863,7 @@ function ProviderPanel({ provider, rpcCall }) {
   /**
    * 后端回传的「临时积分」窗口（天）—— 仅 CodeBuddy / WorkBuddy 有值。
    *
-   * 两个来源写同一个值（同一后端函数解析 `DSH_BUDDY_EXPIRING_WINDOW_DAYS`）：
+   * 两个来源写同一个值（同一后端函数解析 `DSH_EXPIRING_WINDOW_DAYS`）：
    * `credits.balances`（积分行的分桶显示）与 `credits.permanentLock`
    * （按钮文案）。互为备份：不支持余额查询时按钮 tooltip 仍有正确天数。
    *
@@ -3263,7 +3263,7 @@ function ProviderPanel({ provider, rpcCall }) {
    */
   const canLockPermanent = supportsPermanentLock(provider);
   // 窗口天数用上面与余额共用的 `expiryWindowDays`（两个来源同值，互为备份）。
-  // ⚠️ 文案必须用它渲染：窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，
+  // ⚠️ 文案必须用它渲染：窗口可被 `DSH_EXPIRING_WINDOW_DAYS` 覆盖，
   // 前端写死 15 就会出现「提示说只烧 15 天内的、实际按 31 天筛号」。
   const lockCopy = permanentLockCopy(provider, expiryWindowDays);
   const [permanentLocked, setPermanentLocked] = React.useState(false);
@@ -6812,7 +6812,7 @@ function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
  * 不等于共用一个 id）；漏掉国际版 ⇒ 只登国际站的用户仍看到错话。
  */
 const AGG_WIRED_CHANNEL_IDS = [
-  'buddy', 'workbuddy', 'loomy', 'codearts', 'zcode', 'lobsterai', 'trae',
+  'loomy', 'codearts', 'zcode', 'lobsterai', 'trae',
   'accio', 'officeace', 'modelscope', 'autoclaw', 'autoclawintl',
   'qoder', 'qodercn',
   'astudio', 'minimax', 'minimaxintl',

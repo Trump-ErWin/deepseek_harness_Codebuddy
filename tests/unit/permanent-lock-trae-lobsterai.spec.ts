@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { BuddyBalanceSelector, pickBuddyAccount } from '../../src/buddy-balance-selector.js'
-import { BUDDY_BALANCE_TIER, splitBuddyCreditsByExpiry, buddyBalanceTier } from '../../src/buddy-balance-rank.js'
+import { BalanceSelector, pickAccount } from '../../src/balance-selector.js'
+import { BALANCE_TIER, splitBalanceByExpiry, balanceTier } from '../../src/balance-rank.js'
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
 import { supportsPermanentLock, permanentLockCopy } from '../../plugin-src/client/credits-capabilities.js'
 import { fetchTraeCreditBalance } from '../../src/trae-credits.js'
@@ -16,7 +16,7 @@ import type { CreditBalance } from '../../src/credits.js'
  *
  * ## 为什么这两家能加进来
  *
- * 分档判据 `splitBuddyCreditsByExpiry` 只读通用的
+ * 分档判据 `splitBalanceByExpiry` 只读通用的
  * `packages[].{ active, remaining, deductionEndTime }`，**与 provider 无关**：
  * - TRAE 的条目级 `expire_time`（秒级 Unix）已归一化到 `deductionEndTime`；
  * - LobsterAI 的 `expiresAt`（ISO 8601）同样已归一化。
@@ -37,7 +37,7 @@ function traeBalance(packages: CreditBalance['packages']): CreditBalance {
 
 describe('TRAE（字节）—— 按到期时间分桶', () => {
   it('签到奖励（3 天后到期）归「快到期」、每月赠送（25 天后）归「永久」', () => {
-    const split = splitBuddyCreditsByExpiry(traeBalance([
+    const split = splitBalanceByExpiry(traeBalance([
       { name: '签到奖励', unit: 'credits', remaining: 150, total: 150, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '', deductionEndTime: NOW + 3 * DAY },
       { name: '每月登录赠送', unit: 'credits', remaining: 500, total: 500, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '', deductionEndTime: NOW + 25 * DAY },
     ]), NOW, WINDOW)
@@ -47,26 +47,26 @@ describe('TRAE（字节）—— 按到期时间分桶', () => {
   it('★ 拿不到 expire_time（不设 deductionEndTime）归入**永久**桶（保守方向）', () => {
     // `src/trae-credits.ts`：expire_time 为 0 / 缺失时不设 deductionEndTime。
     // 宁可当「不会马上作废」（锁定时少用一个号），也不要把长期积分误当快到期烧掉。
-    const split = splitBuddyCreditsByExpiry(traeBalance([
+    const split = splitBalanceByExpiry(traeBalance([
       { name: '免费', unit: 'credits', remaining: 300, total: 300, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '' },
     ]), NOW, WINDOW)
     expect(split).toEqual({ expiring: 0, permanent: 300 })
   })
 
   it('★ 只剩永久积分时，锁定必须判为不可用（none 档）', () => {
-    const split = splitBuddyCreditsByExpiry(traeBalance([
+    const split = splitBalanceByExpiry(traeBalance([
       { name: '每月登录赠送', unit: 'credits', remaining: 500, total: 500, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '', deductionEndTime: NOW + 25 * DAY },
     ]), NOW, WINDOW)!
-    expect(buddyBalanceTier({ expiringBalance: split.expiring, permanentBalance: split.permanent }))
-      .toBe(BUDDY_BALANCE_TIER.permanent)
-    expect(buddyBalanceTier({ expiringBalance: split.expiring, permanentBalance: split.permanent }, { allowPermanent: false }))
-      .toBe(BUDDY_BALANCE_TIER.none)
+    expect(balanceTier({ expiringBalance: split.expiring, permanentBalance: split.permanent }))
+      .toBe(BALANCE_TIER.permanent)
+    expect(balanceTier({ expiringBalance: split.expiring, permanentBalance: split.permanent }, { allowPermanent: false }))
+      .toBe(BALANCE_TIER.none)
   })
 })
 
 describe('LobsterAI（有道）—— 按到期时间分桶', () => {
   it('每日登录奖励（3/4 天后）归「快到期」、新手礼包（45 天后）归「永久」', () => {
-    const split = splitBuddyCreditsByExpiry(traeBalance([
+    const split = splitBalanceByExpiry(traeBalance([
       { name: '每日登录奖励', unit: 'credit', remaining: 100, total: 0, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '', deductionEndTime: NOW + 3 * DAY },
       { name: '每日登录奖励', unit: 'credit', remaining: 100, total: 0, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '', deductionEndTime: NOW + 4 * DAY },
       { name: '新手礼包', unit: 'credit', remaining: 100, total: 0, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '', deductionEndTime: NOW + 45 * DAY },
@@ -76,7 +76,7 @@ describe('LobsterAI（有道）—— 按到期时间分桶', () => {
 
   it('★ 已过期包（active:false）不得计入任何一桶', () => {
     // 失效包的服务端仍会返回余额，并进任何一桶都会虚增可用额度。
-    const split = splitBuddyCreditsByExpiry(traeBalance([
+    const split = splitBalanceByExpiry(traeBalance([
       { name: '每日登录奖励', unit: 'credit', remaining: 100, total: 0, used: 0, active: false, cycleStartTime: '', cycleEndTime: '', expiredTime: '', deductionEndTime: NOW - 1 * DAY },
       { name: '新手礼包', unit: 'credit', remaining: 50, total: 0, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '', deductionEndTime: NOW + 40 * DAY },
     ]), NOW, WINDOW)
@@ -90,13 +90,13 @@ describe('窗口天数对两家的影响（共用 DSH_BUDDY_EXPIRING_WINDOW_DAYS
       { name: 'a', unit: 'credit', remaining: 100, total: 0, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '', deductionEndTime: NOW + 5 * DAY },
       { name: 'b', unit: 'credit', remaining: 500, total: 0, used: 0, active: true, cycleStartTime: '', cycleEndTime: '', expiredTime: '', deductionEndTime: NOW + 9 * DAY },
     ])
-    expect(splitBuddyCreditsByExpiry(balance, NOW, 7 * DAY)).toEqual({ expiring: 100, permanent: 500 })
-    expect(splitBuddyCreditsByExpiry(balance, NOW, 15 * DAY)).toEqual({ expiring: 600, permanent: 0 })
+    expect(splitBalanceByExpiry(balance, NOW, 7 * DAY)).toEqual({ expiring: 100, permanent: 500 })
+    expect(splitBalanceByExpiry(balance, NOW, 15 * DAY)).toEqual({ expiring: 600, permanent: 0 })
   })
 
   it('查询失败（null）返回 undefined，由调用方归入最后一档', () => {
-    expect(splitBuddyCreditsByExpiry(null, NOW, WINDOW)).toBeUndefined()
-    expect(splitBuddyCreditsByExpiry(undefined, NOW, WINDOW)).toBeUndefined()
+    expect(splitBalanceByExpiry(null, NOW, WINDOW)).toBeUndefined()
+    expect(splitBalanceByExpiry(undefined, NOW, WINDOW)).toBeUndefined()
   })
 })
 
@@ -125,13 +125,13 @@ describe('选号器泛型化后对两家的实际行为', () => {
     product: TProduct,
     balanceById: Record<string, CreditBalance>,
   ) {
-    return new BuddyBalanceSelector<TProduct, TCredential>({
+    return new BalanceSelector<TProduct, TCredential>({
       product,
       resolveCredential: async (ref) => ({ token: `cred-${ref}` }) as TCredential,
       fetchBalance: async (credential) => balanceById[credential.token.replace('cred-', '')] ?? null,
       // ⚠️ **必须钉住窗口**（实测：不钉则读真实环境变量，设
       // `DSH_BUDDY_EXPIRING_WINDOW_DAYS=0` —— 一个*合法*值，见
-      // `buddy-balance-rank.ts` 对 0 的支持 —— 会让这 2 条用例假红）。
+      // `balance-rank.ts` 对 0 的支持 —— 会让这 2 条用例假红）。
       // 本节 BALANCES 用「3 天 vs 30 天」构造，窗口取 15 天才与断言一致。
       windowMs: 15 * DAY,
     })
@@ -154,7 +154,7 @@ describe('选号器泛型化后对两家的实际行为', () => {
   for (const label of ['TRAE', 'LobsterAI']) {
     it(`${label}：未锁定 → 优先选有快到期积分的号（哪怕它排在后面）`, async () => {
       const selector = makeSelector<{ id: string }, { token: string }>({ id: label }, BALANCES)
-      const picked = await pickBuddyAccount(selector, CANDIDATES, {
+      const picked = await pickAccount(selector, CANDIDATES, {
         allowPermanent: true,
         resolveCredential: async (ref) => ({ token: `cred-${ref}` }),
       })
@@ -164,7 +164,7 @@ describe('选号器泛型化后对两家的实际行为', () => {
 
     it(`${label}：★ 已锁定 + 只剩永久积分 → locked（不消耗永久积分）`, async () => {
       const selector = makeSelector<{ id: string }, { token: string }>({ id: label }, BALANCES)
-      const picked = await pickBuddyAccount(selector, [CANDIDATES[0]!], {
+      const picked = await pickAccount(selector, [CANDIDATES[0]!], {
         allowPermanent: false,
         resolveCredential: async (ref) => ({ token: `cred-${ref}` }),
       })
@@ -173,7 +173,7 @@ describe('选号器泛型化后对两家的实际行为', () => {
 
     it(`${label}：未锁定 + 只剩永久积分 → 可用（解锁生效）`, async () => {
       const selector = makeSelector<{ id: string }, { token: string }>({ id: label }, BALANCES)
-      const picked = await pickBuddyAccount(selector, [CANDIDATES[0]!], {
+      const picked = await pickAccount(selector, [CANDIDATES[0]!], {
         allowPermanent: true,
         resolveCredential: async (ref) => ({ token: `cred-${ref}` }),
       })
@@ -188,8 +188,9 @@ describe('前后端能力声明一致（trae / lobsterai）', () => {
     expect(PERMANENT_LOCK_PROVIDERS.has('lobsterai')).toBe(true)
     // 原有三家不得丢失
     expect(PERMANENT_LOCK_PROVIDERS.has('loomy')).toBe(true)
-    expect(PERMANENT_LOCK_PROVIDERS.has('buddy')).toBe(true)
-    expect(PERMANENT_LOCK_PROVIDERS.has('workbuddy')).toBe(true)
+    // ⚠️ 两个腾讯系渠道已从本插件移除 ⇒ 若它们仍在白名单里，说明清理不彻底。
+    expect(PERMANENT_LOCK_PROVIDERS.has('buddy')).toBe(false)
+    expect(PERMANENT_LOCK_PROVIDERS.has('workbuddy')).toBe(false)
     // ⚠️ cline 没有逐包到期时间，加进来开关无效
     expect(PERMANENT_LOCK_PROVIDERS.has('cline')).toBe(false)
     // ⚠️ qoder / qodercn **已于 2026-10-20 加入**（用户要求补齐三档分档 + 永久锁）：
@@ -207,14 +208,14 @@ describe('前后端能力声明一致（trae / lobsterai）', () => {
     //    `permanentLock: true`）；留着会让本用例红 —— 这是正确的红灯，
     //    不许靠放宽断言绕过。
     // ⚠️ minimax / minimaxintl / astudio 同理（三家均于 2026-10-20 登记）。
-    for (const id of ['cline', 'raccoon', 'zcode', 'codearts']) {
+    for (const id of ['cline', 'raccoon', 'zcode', 'codearts', 'buddy', 'workbuddy']) {
       expect(supportsPermanentLock(id), id).toBe(false)
     }
   })
 
   it('★ 两家走「带天数」的文案（不得落到 Loomy 那套「每日赠送额度」）', () => {
     // ⚠️ 这是真实易错点：它们没有「每日额度」概念，落到 Loomy 文案会说反。
-    for (const id of ['trae', 'lobsterai', 'buddy', 'workbuddy']) {
+    for (const id of ['trae', 'lobsterai']) {
       const copy = permanentLockCopy(id, 7)
       expect(copy.days, id).toBe(7)
       expect(copy.lockTitle, id).toContain('7 天内到期')
@@ -261,7 +262,7 @@ describe('真实 fetchBalance 链路：各家响应形状 → 同一套分桶', 
       }],
     }))
     expect(balance, 'TRAE 余额应可解析').not.toBeNull()
-    const split = splitBuddyCreditsByExpiry(balance!, Date.now(), 15 * DAY)
+    const split = splitBalanceByExpiry(balance!, Date.now(), 15 * DAY)
     // 3 天内到期 ⇒ 必须落「快到期」桶，否则锁定时永远选不中它
     expect(split).toEqual({ expiring: 150, permanent: 0 })
   })
@@ -278,7 +279,7 @@ describe('真实 fetchBalance 链路：各家响应形状 → 同一套分桶', 
       },
     }))
     expect(balance, 'LobsterAI 余额应可解析').not.toBeNull()
-    const split = splitBuddyCreditsByExpiry(balance!, Date.now(), 15 * DAY)
+    const split = splitBalanceByExpiry(balance!, Date.now(), 15 * DAY)
     expect(split).toEqual({ expiring: 100, permanent: 0 })
   })
 

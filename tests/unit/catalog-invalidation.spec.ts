@@ -44,13 +44,13 @@ import {
 } from '../../src/model-catalog.js'
 import { AccioAdapter } from '../../src/accio-adapter.js'
 import { AggregateAdapter } from '../../src/aggregate-adapter.js'
-import { BuddyAdapter } from '../../src/buddy-adapter.js'
+import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
 import { CodeArtsAdapter } from '../../src/llm-adapter.js'
 import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
 import { LoomyAdapter } from '../../src/loomy-adapter.js'
 import { MinimaxAdapter } from '../../src/minimax-adapter.js'
 import { MINIMAX, MINIMAX_INTL } from '../../src/minimax-product.js'
-import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
+import { LOBSTERAI, LOBSTERAI } from '../../src/lobsterai-product.js'
 import { RaccoonAdapter } from '../../src/raccoon-adapter.js'
 import { TraeAdapter } from '../../src/trae-adapter.js'
 import { ZcodeAdapter } from '../../src/zcode-adapter.js'
@@ -95,7 +95,7 @@ function baseOptions(
  * ## ⚠️⚠️ 两个「共用类、双站」的组必须显式传 `product`
  *
  * `minimax` / `minimaxintl` 与 `buddy` / `workbuddy` **各共用一个适配器类**，
- * provider id 只来自构造时的 `options.product`（缺省分别是 `MINIMAX` / `CODEBUDDY`）。
+ * provider id 只来自构造时的 `options.product`（缺省分别是 `MINIMAX` / `LOBSTERAI`）。
  * 不传 `product` 时两个实例都登记在**缺省那个 id** 上 ⇒ 用例会把「第二个实例」
  * 的 TTL 短路误读成「失效没生效」。这本身正是要守的东西：
  * **登记键是实例的 `product.id`，不是类名**。
@@ -162,16 +162,10 @@ const WIRED: readonly {
     build: (o) => new CodeArtsAdapter({ ...o, catalogComplete: () => true } as never),
   },
   {
-    id: 'buddy',
+    id: 'lobsterai',
     remoteModel: { id: 'remote-only-model', name: 'R', supportsImages: true },
     remoteId: 'remote-only-model',
-    build: (o) => new BuddyAdapter({ ...o, product: CODEBUDDY, catalogComplete: () => true } as never),
-  },
-  {
-    id: 'workbuddy',
-    remoteModel: { id: 'remote-only-model', name: 'R', supportsImages: true },
-    remoteId: 'remote-only-model',
-    build: (o) => new BuddyAdapter({ ...o, product: WORKBUDDY, catalogComplete: () => true } as never),
+    build: (o) => new LobsteraiAdapter({ ...o, product: LOBSTERAI, catalogComplete: () => true } as never),
   },
 ]
 
@@ -318,25 +312,23 @@ describe('★ 按 provider 粒度', () => {
   })
 
   it('★ buddy / workbuddy 的复用类按各自 product.id 分键', async () => {
-    // ⚠️ 这一组同样**共用一个类**，provider id 只能来自构造时的 `options.product`
-    //    （缺省是 `CODEBUDDY`）。本用例证明「登记的是实例的 product.id 而不是类名」
-    //    —— 若实现按类名登记，两个站会挤成同一个键，失效一个连带作废另一个。
+    // ⚠️ **本用例已简化**：原先用「同一个类、两个 product」证明「登记的是实例的
+    //    product.id 而不是类名」—— 那一形态随渠道移除而消失（现存渠道各有独立适配器类）。
+    //    现改为验证**等价的不变式**：失效 A 渠道不得连带作废 B 渠道的目录缓存。
     const clock = makeClock()
-    const fetchBuddy = vi.fn(async () => [{ id: 'b1', name: 'B', supportsImages: true }])
-    const fetchWork = vi.fn(async () => [{ id: 'w1', name: 'W', supportsImages: true }])
-    const buddy = new BuddyAdapter({
-      ...baseOptions(fetchBuddy, clock.now), product: CODEBUDDY, catalogComplete: () => true,
+    const fetchA = vi.fn(async () => [{ id: 'a1', name: 'A' }])
+    const fetchB = vi.fn(async () => [{ id: 'b1', name: 'B' }])
+    const a = new CodeArtsAdapter({ ...baseOptions(fetchA, clock.now), catalogComplete: () => true } as never)
+    const b = new LobsteraiAdapter({
+      ...baseOptions(fetchB, clock.now), product: LOBSTERAI, catalogComplete: () => true,
     } as never)
-    const work = new BuddyAdapter({
-      ...baseOptions(fetchWork, clock.now), product: WORKBUDDY, catalogComplete: () => true,
-    } as never)
-    await buddy.listModels('buddy')
-    await work.listModels('workbuddy')
-    invalidateCatalogCache('buddy', clock.now())
-    await buddy.listModels('buddy')
-    await work.listModels('workbuddy')
-    expect(fetchBuddy.mock.calls.length, '★ buddy 被失效 ⇒ 重拉').toBe(2)
-    expect(fetchWork.mock.calls.length, '★ workbuddy 不受牵连（两站是不同 provider id）').toBe(1)
+    await a.listModels('codearts')
+    await b.listModels('lobsterai')
+    invalidateCatalogCache('codearts', clock.now())
+    await a.listModels('codearts')
+    await b.listModels('lobsterai')
+    expect(fetchA.mock.calls.length, '★ codearts 被失效 ⇒ 重拉').toBe(2)
+    expect(fetchB.mock.calls.length, '★ lobsterai 不受牵连（不同 provider id）').toBe(1)
   })
 })
 

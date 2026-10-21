@@ -1,5 +1,5 @@
 /**
- * CodeBuddy / WorkBuddy 的余额缓存选号器（`src/buddy-balance-selector.ts`）。
+ * CodeBuddy / WorkBuddy 的余额缓存选号器（`src/balance-selector.ts`）。
  *
  * ## 本文件锁死什么
  *
@@ -8,20 +8,29 @@
  * 2. **失败不抛错**：一个号查不到不至于让整个选号失败（凭据过期是最常见原因）。
  * 3. **锁定语义**：只剩永久积分的账号在锁定期间**不被选中**；解锁时不改变既有
  *    行为（全部无余额仍返回第一个，让上游去报真实原因）。
- * 4. **`pickBuddyAccount` 的收尾**：锁定 → `locked`（调用方必须报错，绝不回落，
+ * 4. **`pickAccount` 的收尾**：锁定 → `locked`（调用方必须报错，绝不回落，
  *    否则锁定形同虚设）；未锁定 → `exhausted` + tried（调用方继续走池的兜底）。
  */
 import { describe, expect, it } from 'vitest'
 import {
-  BUDDY_BALANCE_CACHE_TTL_MS,
-  BUDDY_BALANCE_ERROR_CACHE_TTL_MS,
-  BuddyBalanceSelector,
-  pickBuddyAccount,
-  type BuddyCandidateAccount,
-} from '../../src/buddy-balance-selector.js'
-import { CODEBUDDY } from '../../src/product.js'
-import type { BuddyCredential } from '../../src/buddy.js'
+  BALANCE_CACHE_TTL_MS,
+  BALANCE_ERROR_CACHE_TTL_MS,
+  BalanceSelector,
+  pickAccount,
+  type CandidateAccount,
+} from '../../src/balance-selector.js'
 import type { CreditBalance, CreditPackage } from '../../src/credits.js'
+
+/**
+ * 测试用的产品配置替身。选号器只要求「产品对象」具备 id / 展示名等字段，
+ * 具体渠道的细节与选号逻辑无关。
+ */
+const CODEBUDDY = {
+  id: 'testchannel',
+  displayName: '测试渠道',
+  endpoint: 'https://example.invalid',
+  defaultCredentialRef: 'TEST_ACCESS_TOKEN',
+}
 
 const DAY = 24 * 60 * 60 * 1000
 const NOW = Date.UTC(2026, 9, 1, 12, 0, 0)
@@ -65,14 +74,14 @@ function makeSelector(
 ) {
   const calls: string[] = []
   const clock = options.clock ?? { value: NOW }
-  const selector = new BuddyBalanceSelector({
+  const selector = new BalanceSelector({
     product: CODEBUDDY,
     now: () => clock.value,
     ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
     ...(options.errorTtlMs === undefined ? {} : { errorTtlMs: options.errorTtlMs }),
     resolveCredential: async (ref) => {
       if (options.brokenRefs?.includes(ref)) return undefined
-      return { access_token: `token-of-${ref}` } as BuddyCredential
+      return { access_token: `token-of-${ref}` } as ChannelCredential
     },
     fetchBalance: async (credential) => {
       const ref = String((credential as { access_token: string }).access_token).replace('token-of-', '')
@@ -85,16 +94,16 @@ function makeSelector(
   return { selector, calls, clock }
 }
 
-const account = (id: string): BuddyCandidateAccount => ({ id, credentialRef: id })
+const account = (id: string): CandidateAccount => ({ id, credentialRef: id })
 
 /**
  * `select()` 现在返回判别联合（`{ok:true,…} | {ok:false,reason}`），
  * 断言"选中了谁"统一走这个取值器；断言"为什么没选中"则直接看 `reason`。
  */
-const pickedId = (result: Awaited<ReturnType<BuddyBalanceSelector['select']>>): string | undefined =>
+const pickedId = (result: Awaited<ReturnType<BalanceSelector['select']>>): string | undefined =>
   result.ok ? result.account.id : undefined
 
-describe('BuddyBalanceSelector.balanceOf（带 TTL 的余额查询）', () => {
+describe('BalanceSelector.balanceOf（带 TTL 的余额查询）', () => {
   it('TTL 内不重复请求，过期后重查', async () => {
     const { selector, calls, clock } = makeSelector({
       a1: balance(pkg({ remaining: 250, deductionEndTime: NOW + 9 * DAY })),
@@ -103,7 +112,7 @@ describe('BuddyBalanceSelector.balanceOf（带 TTL 的余额查询）', () => {
     await selector.balanceOf(account('a1'))
     expect(calls).toEqual(['a1'])
 
-    clock.value += BUDDY_BALANCE_CACHE_TTL_MS + 1
+    clock.value += BALANCE_CACHE_TTL_MS + 1
     await selector.balanceOf(account('a1'))
     expect(calls).toEqual(['a1', 'a1'])
   })
@@ -123,7 +132,7 @@ describe('BuddyBalanceSelector.balanceOf（带 TTL 的余额查询）', () => {
     expect(first.ok).toBe(false)
 
     // 6 秒后（< 60 秒成功 TTL，> 5 秒失败 TTL）：应该重新查一次
-    clock.value += BUDDY_BALANCE_ERROR_CACHE_TTL_MS + 1_000
+    clock.value += BALANCE_ERROR_CACHE_TTL_MS + 1_000
     flaky.a1 = balance(pkg({ remaining: 5000, deductionEndTime: NOW + 9 * DAY }))
     const second = await selector.balanceOf(account('a1'))
     expect(second.ok).toBe(true)
@@ -135,7 +144,7 @@ describe('BuddyBalanceSelector.balanceOf（带 TTL 的余额查询）', () => {
     const clock = { value: NOW }
     const { selector, calls } = makeSelector({ a1: null }, { clock })
     await selector.balanceOf(account('a1'))
-    clock.value += BUDDY_BALANCE_ERROR_CACHE_TTL_MS - 1_000
+    clock.value += BALANCE_ERROR_CACHE_TTL_MS - 1_000
     await selector.balanceOf(account('a1'))
     expect(calls).toEqual(['a1'])
   })
@@ -258,45 +267,45 @@ describe('BuddyBalanceSelector.balanceOf（带 TTL 的余额查询）', () => {
   })
 
   /**
-   * 窗口同样每次重读：用户改了 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 不该等 TTL 过期。
+   * 窗口同样每次重读：用户改了 `DSH_EXPIRING_WINDOW_DAYS` 不该等 TTL 过期。
    * 提示文案（运行时解析 env）与选号判据必须同一时刻取到同一个值。
    */
   it('改窗口 env 后立即生效（不必等缓存过期）', async () => {
-    const previous = process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS
+    const previous = process.env.DSH_EXPIRING_WINDOW_DAYS
     try {
-      delete process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS
+      delete process.env.DSH_EXPIRING_WINDOW_DAYS
       const { selector } = makeSelector({
         a1: balance(pkg({ remaining: 100, deductionEndTime: NOW + 17 * DAY })),
       })
       expect((await selector.balanceOf(account('a1'))).split).toEqual({ expiring: 0, permanent: 100 })
 
-      process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS = '31'
+      process.env.DSH_EXPIRING_WINDOW_DAYS = '31'
       expect((await selector.balanceOf(account('a1'))).split).toEqual({ expiring: 100, permanent: 0 })
     } finally {
-      if (previous === undefined) delete process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS
-      else process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS = previous
+      if (previous === undefined) delete process.env.DSH_EXPIRING_WINDOW_DAYS
+      else process.env.DSH_EXPIRING_WINDOW_DAYS = previous
     }
   })
 
-  it('未注入 windowMs 时按 DSH_BUDDY_EXPIRING_WINDOW_DAYS 解析', async () => {
-    const previous = process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS
+  it('未注入 windowMs 时按 DSH_EXPIRING_WINDOW_DAYS 解析', async () => {
+    const previous = process.env.DSH_EXPIRING_WINDOW_DAYS
     try {
-      process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS = '31'
+      process.env.DSH_EXPIRING_WINDOW_DAYS = '31'
       const { selector } = makeSelector({
         a1: balance(pkg({ remaining: 100, deductionEndTime: NOW + 17 * DAY })),
       })
       const entry = await selector.balanceOf(account('a1'))
       expect(entry.split).toEqual({ expiring: 100, permanent: 0 })
     } finally {
-      if (previous === undefined) delete process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS
-      else process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS = previous
+      if (previous === undefined) delete process.env.DSH_EXPIRING_WINDOW_DAYS
+      else process.env.DSH_EXPIRING_WINDOW_DAYS = previous
     }
   })
 
   it('默认窗口（15 天）下同一笔包算永久', async () => {
-    const previous = process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS
+    const previous = process.env.DSH_EXPIRING_WINDOW_DAYS
     try {
-      delete process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS
+      delete process.env.DSH_EXPIRING_WINDOW_DAYS
       const { selector } = makeSelector({
         a1: balance(pkg({ remaining: 100, deductionEndTime: NOW + 17 * DAY })),
       })
@@ -306,12 +315,12 @@ describe('BuddyBalanceSelector.balanceOf（带 TTL 的余额查询）', () => {
       const picked = await selector.select([account('a1')], { allowPermanent: false })
       expect(picked.ok).toBe(false)
     } finally {
-      if (previous !== undefined) process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS = previous
+      if (previous !== undefined) process.env.DSH_EXPIRING_WINDOW_DAYS = previous
     }
   })
 })
 
-describe('BuddyBalanceSelector.select（分档选号）', () => {
+describe('BalanceSelector.select（分档选号）', () => {
   /**
    * ⚠️ **空候选的原因必须与「查到了、确实是 0」分开**（真实报障 2026-10-13）。
    *
@@ -425,14 +434,14 @@ describe('BuddyBalanceSelector.select（分档选号）', () => {
   })
 })
 
-describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
+describe('pickAccount（选号 + 取凭据的编排）', () => {
   /** 编排层的凭据解析器（与 selector 内部那份可以不同）。 */
   const resolver = (broken: readonly string[] = []) => async (ref: string) =>
-    broken.includes(ref) ? undefined : ({ access_token: `t-${ref}` } as BuddyCredential)
+    broken.includes(ref) ? undefined : ({ access_token: `t-${ref}` } as ChannelCredential)
 
   it('选中账号后返回其凭据', async () => {
     const { selector } = makeSelector({ a1: balance(pkg({ remaining: 250, deductionEndTime: NOW + 9 * DAY })) })
-    const result = await pickBuddyAccount(selector, [account('a1')], {
+    const result = await pickAccount(selector, [account('a1')], {
       allowPermanent: true,
       resolveCredential: resolver(),
     })
@@ -449,7 +458,7 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
       a1: balance(pkg({ remaining: 250, deductionEndTime: NOW + 9 * DAY })),
       a2: balance(pkg({ remaining: 100, deductionEndTime: NOW + 10 * DAY })),
     })
-    const result = await pickBuddyAccount(selector, [account('a1'), account('a2')], {
+    const result = await pickAccount(selector, [account('a1'), account('a2')], {
       allowPermanent: true,
       resolveCredential: resolver(['a1']),
     })
@@ -461,7 +470,7 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
 
   it('未锁定且全部凭据不可解析 → exhausted 并带上 tried（调用方继续走池兜底）', async () => {
     const { selector } = makeSelector({ a1: balance(), a2: balance() })
-    const result = await pickBuddyAccount(selector, [account('a1'), account('a2')], {
+    const result = await pickAccount(selector, [account('a1'), account('a2')], {
       allowPermanent: true,
       resolveCredential: resolver(['a1', 'a2']),
     })
@@ -478,7 +487,7 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
       a1: balance(pkg({ remaining: 100, deductionEndTime: NOW + 3008 * DAY })),
       a2: balance(pkg({ remaining: 50, deductionEndTime: NOW + 30 * DAY })),
     })
-    const result = await pickBuddyAccount(selector, [account('a1'), account('a2')], {
+    const result = await pickAccount(selector, [account('a1'), account('a2')], {
       allowPermanent: false,
       resolveCredential: resolver(),
     })
@@ -492,7 +501,7 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
       a2: balance(pkg({ remaining: 30, deductionEndTime: NOW + 14 * DAY })),
       a3: balance(pkg({ remaining: 100, deductionEndTime: NOW + 3008 * DAY })),
     })
-    const result = await pickBuddyAccount(selector, [account('a1'), account('a2'), account('a3')], {
+    const result = await pickAccount(selector, [account('a1'), account('a2'), account('a3')], {
       allowPermanent: false,
       resolveCredential: resolver(['a1']),
     })
@@ -508,7 +517,7 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
       a1: balance(pkg({ remaining: 250, deductionEndTime: NOW + 9 * DAY })),
       a2: balance(pkg({ remaining: 100, deductionEndTime: NOW + 3008 * DAY })),
     })
-    const result = await pickBuddyAccount(selector, [account('a1'), account('a2')], {
+    const result = await pickAccount(selector, [account('a1'), account('a2')], {
       allowPermanent: false,
       resolveCredential: resolver(['a1']),
     })
@@ -519,12 +528,12 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
   /**
    * ⚠️ 空候选**不查余额**（一次网络都不发），且原因与「查到了、确实是 0」分开。
    *
-   * 变异：去掉 `pickBuddyAccount` 开头对 `candidates.length === 0` 的定因
+   * 变异：去掉 `pickAccount` 开头对 `candidates.length === 0` 的定因
    * （让 `reason` 保持 `undefined`）⇒ 本条红（`reason` 变 undefined）。
    */
   it('空候选不查余额，且带上 no-candidates 原因（未锁定也如此）', async () => {
     const { selector, calls } = makeSelector({ a1: balance() })
-    const result = await pickBuddyAccount(selector, [], {
+    const result = await pickAccount(selector, [], {
       allowPermanent: true,
       resolveCredential: resolver(),
     })
@@ -556,7 +565,7 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
       a1: balance(pkg({ remaining: 250, deductionEndTime: NOW + 9 * DAY })),
       a2: balance(pkg({ remaining: 240, deductionEndTime: NOW + 8 * DAY })),
     })
-    const result = await pickBuddyAccount(selector, [account('a1'), account('a2')], {
+    const result = await pickAccount(selector, [account('a1'), account('a2')], {
       allowPermanent: false,
       // 凭据一律解析不出来 —— 但余额**确实查到了**（下面的 `calls` 自证）。
       resolveCredential: resolver(['a1', 'a2']),
@@ -575,7 +584,7 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
     const { selector, calls } = makeSelector({
       a1: balance(pkg({ remaining: 250, deductionEndTime: NOW + 9 * DAY })),
     })
-    const result = await pickBuddyAccount(selector, [account('a1')], {
+    const result = await pickAccount(selector, [account('a1')], {
       allowPermanent: false,
       resolveCredential: resolver(['a1']),
     })
@@ -597,7 +606,7 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
       // 只有永久积分 + 锁定 ⇒ `select()` 判 none 档，返回 ok:false
       a1: balance(pkg({ remaining: 100, deductionEndTime: NOW + 3008 * DAY })),
     })
-    const result = await pickBuddyAccount(selector, [account('a1')], {
+    const result = await pickAccount(selector, [account('a1')], {
       allowPermanent: false,
       resolveCredential: resolver(),
     })

@@ -84,7 +84,7 @@ function makeRpc(modelAdapters: Record<string, unknown> | undefined) {
   registerJetHubRpc(
     ctx, pool,
     {
-      codearts: {} as never, buddy: {} as never, workbuddy: {} as never, lobsterai: {} as never,
+      codearts: {} as never, loomy: {} as never, zcode: {} as never, lobsterai: {} as never,
       qoder: {} as never, qodercn: {} as never, trae: {} as never, cline: {} as never,
       loomy: {} as never, raccoon: {} as never, minimax: {} as never, zcode: {} as never,
       gemini: {} as never,
@@ -193,7 +193,7 @@ describe('★ 用量徽标：usage.badge 的 auto 改写接线（真跑端点）
     expect(result.error?.message).toContain('适配器未挂载')
   })
 
-  it('★ 非 auto 渠道原样透传（buddy 不会被改写）', async () => {
+  it('★ 非 auto 渠道原样透传（loomy 不会被改写）', async () => {
     const { call } = makeRpc({ [AUTO_PROVIDER]: adapterStub() })
     const result = await call('usage.badge', { provider: 'opencode', force: true })
     // opencode 无账号 ⇒ 空读数是正常的；关键是它**不该**带 autoActual。
@@ -216,7 +216,7 @@ describe('★ 用量徽标：usage.badge 的 auto 改写接线（真跑端点）
   it('★★ 其余渠道逐字不变：全部 provider 都不被改写、也不带 auto 专属字段', async () => {
     // 与客户端 `PROVIDERS` / 宿主注册表一致的 15 家（auto 之外的全体）。
     const providers = [
-      'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn',
+      'codearts', 'loomy', 'zcode', 'lobsterai', 'qoder', 'qodercn',
       'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini', 'opencode',
       // `aggregate` 也走本分支（它的改写由客户端重定向负责，不在这里）。
       'aggregate',
@@ -276,7 +276,7 @@ describe('★ 用量徽标：usage.badge 的 auto 改写接线（真跑端点）
    *
    * ```
    * 快照时 lastWinnerExpiryAt      = undefined
-   * selectProvider 返回            = buddy/m1
+   * selectProvider 返回            = loomy/m1
    * 适配器真实 lastWinnerExpiryAt  = 100
    * ★ 但快照里的值仍是             = undefined   ⇒ autoExpiryAt 缺席
    * ```
@@ -287,7 +287,7 @@ describe('★ 用量徽标：usage.badge 的 auto 改写接线（真跑端点）
     const adapter = new AutoAdapter({
       logger: { warn: () => {}, error: () => {} },
       llm: {
-        listModels: async (provider: string) => (provider === 'buddy'
+        listModels: async (provider: string) => (provider === 'loomy'
           ? [{ id: 'm1', name: 'M1 · x0.1', inputModalities: ['text'] }]
           : []),
         resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
@@ -301,16 +301,16 @@ describe('★ 用量徽标：usage.badge 的 auto 改写接线（真跑端点）
       now: () => 1_000,
       ttlMs: 0,
     })
-    /** 主胜者 buddy 的临期时刻（本用例要观察的就是它）。 */
+    /** 主胜者 loomy 的临期时刻（本用例要观察的就是它）。 */
     const WINNER_EXPIRY = 100
-    adapter.expiryOf = async (provider: string) => (provider === 'buddy' ? WINNER_EXPIRY : -1)
+    adapter.expiryOf = async (provider: string) => (provider === 'loomy' ? WINNER_EXPIRY : -1)
 
     // ⚠️ 严格复刻 `jet-hub-rpc.ts` 的调用序：先取快照，再让它去选型。
     const state = adapter.autoState()
     const rewrite = await resolveAutoBadgeRewrite(AUTO_PROVIDER, AUTO_PROVIDER, state as never)
 
     expect(rewrite.kind, JSON.stringify(rewrite)).toBe('rewrite')
-    expect(rewrite.kind === 'rewrite' && rewrite.autoActual?.provider).toBe('buddy')
+    expect(rewrite.kind === 'rewrite' && rewrite.autoActual?.provider).toBe('loomy')
     // ⛔ 值快照实现下这里是 `undefined`（倒计时恒缺席）。
     expect(
       rewrite.kind === 'rewrite' ? rewrite.autoExpiryAt : undefined,
@@ -328,7 +328,7 @@ describe('★ 用量徽标：usage.badge 的 auto 改写接线（真跑端点）
    *
    * ```
    * expiryCountdownText(-1, now)         -> "1/1 07:59过期"
-   * autoBadgeName({ expiryAt: -1 })      -> "自动 → buddy GLM-5.3-Flash · 1/1 07:59过期"
+   * autoBadgeName({ expiryAt: -1 })      -> "自动 → loomy GLM-5.3-Flash · 1/1 07:59过期"
    * ```
    *
    * 本用例直接断言「哨兵不会进入响应」，从而在**边界处**挡住它（而不是在客户端
@@ -388,7 +388,7 @@ describe('★ 用量徽标：usage.badge 的 auto 改写接线（真跑端点）
     const adapter = new AutoAdapter({
       logger: { warn: () => {}, error: () => {} },
       llm: {
-        listModels: async (provider: string) => (provider === 'buddy'
+        listModels: async (provider: string) => (provider === 'loomy'
           ? [{ id: 'm1', name: 'M1', inputModalities: ['text'] }]
           : []),
         // ⚠️ 刻意**不**碰 signal 且正常返回：把中止的出口**只**留给被测的那段 catch。
@@ -417,7 +417,7 @@ describe('★ 用量徽标：usage.badge 的 auto 改写接线（真跑端点）
         throw abort
       }
       probed.add(provider)
-      return provider === 'buddy' ? 100 : -1
+      return provider === 'loomy' ? 100 : -1
     }
 
     await expect(

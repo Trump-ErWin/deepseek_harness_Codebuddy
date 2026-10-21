@@ -19,7 +19,7 @@ import {
   classifyTraeCheckinError,
 } from '../../src/trae-credits.js'
 import { TRAE } from '../../src/trae-product.js'
-import { BuddyBalanceSelector, pickBuddyAccount } from '../../src/buddy-balance-selector.js'
+import { BalanceSelector, pickAccount } from '../../src/balance-selector.js'
 import type { TraeCredential } from '../../src/trae.js'
 
 function makeCredential(overrides: Partial<TraeCredential> = {}): TraeCredential {
@@ -197,7 +197,7 @@ describe('fetchTraeCheckinStatus / fetchTraeCreditBalance', () => {
 
   it('★ 空列表在锁定时必须报「已用尽」而不是「查不到」（真实链路回归）', async () => {
     // 走选择器 → 编排的**真实链路**，断言用户可见的文案分叉。
-    const selector = new BuddyBalanceSelector({
+    const selector = new BalanceSelector({
       product: TRAE,
       resolveCredential: async () => makeCredential(),
       fetchBalance: async () => {
@@ -205,7 +205,7 @@ describe('fetchTraeCheckinStatus / fetchTraeCreditBalance', () => {
         return fetchTraeCreditBalance(makeCredential(), TRAE, fetcher)
       },
     })
-    const picked = await pickBuddyAccount(
+    const picked = await pickAccount(
       selector,
       [{ id: 'a1', credentialRef: 'a1' }],
       { allowPermanent: false, resolveCredential: async () => makeCredential() },

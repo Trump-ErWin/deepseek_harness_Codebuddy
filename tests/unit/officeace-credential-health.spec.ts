@@ -205,7 +205,7 @@ describe('熔断生命周期', () => {
   })
 
   it('★ ⑦ 非法/缺省值回落默认；`0` **不得**被 falsy 陷阱换成默认', () => {
-    // ⚠️ 与 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 同一个坑：`Number(x) || default` 会把
+    // ⚠️ 与 `DSH_EXPIRING_WINDOW_DAYS` 同一个坑：`Number(x) || default` 会把
     //    合法的 0 静默换成默认值。
     expect(officeaceBreakerMinutes({})).toBe(OFFICEACE_BREAKER_DEFAULT_MINUTES)
     expect(officeaceBreakerMinutes({ [DSH_OFFICEACE_BREAKER_MINUTES]: '' })).toBe(OFFICEACE_BREAKER_DEFAULT_MINUTES)

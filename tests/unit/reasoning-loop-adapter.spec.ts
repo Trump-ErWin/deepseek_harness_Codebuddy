@@ -34,7 +34,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { consumeOpenAiSse } from '../../src/openai-compat.js'
 import { reasoningLoopFailure } from '../../src/sse.js'
-import { BuddyAdapter } from '../../src/buddy-adapter.js'
+import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
 import { CodeArtsAdapter } from '../../src/llm-adapter.js'
 import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
@@ -351,12 +351,12 @@ describe('思考死循环中断（真实缺陷回归）', () => {
 })
 
 /** 用真实适配器跑一段 reasoning SSE，返回全部 chunk。 */
-async function collectBuddy(sse: string | Response): Promise<Array<Record<string, unknown>>> {
-  const adapter = new BuddyAdapter({
+async function collectViaAdapter(sse: string | Response): Promise<Array<Record<string, unknown>>> {
+  const adapter = new LobsteraiAdapter({
     credentialRef: 'TEST_REF' as never,
     resolveCredential: async () => ({ access_token: 'stub', refresh_token: 'stub', expires_at: 0 }) as never,
     refresh: async () => {},
-    product: WORKBUDDY,
+    product: LOBSTERAI,
     fetchImpl: (async () => typeof sse === 'string' ? new Response(sse, {
       status: 200, headers: { 'content-type': 'text/event-stream' },
     }) : sse) as never,
@@ -370,10 +370,10 @@ async function collectBuddy(sse: string | Response): Promise<Array<Record<string
   return out
 }
 
-describe('思考死循环中断（workbuddy，用户实际报障路径）', () => {
+describe('思考死循环中断（真实报障路径）', () => {
   it('命中后截断思考并报有分辨力的 REASONING_LOOP 错误', async () => {
     const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
-    const chunks = await collectBuddy(reasoningFrames(loop))
+    const chunks = await collectViaAdapter(reasoningFrames(loop))
     const reasoningEnd = chunks.find(
       (c) => c.type === 'block-end' && (c.block as { type?: string }).type === 'reasoning',
     )
@@ -385,7 +385,7 @@ describe('思考死循环中断（workbuddy，用户实际报障路径）', () =
 
   it('正常思考不受影响', async () => {
     const normal = readFileSync(join(FIXTURES, 'reasoning-normal.txt'), 'utf8')
-    const chunks = await collectBuddy(reasoningFrames(normal))
+    const chunks = await collectViaAdapter(reasoningFrames(normal))
     const reasoningEnd = chunks.find(
       (c) => c.type === 'block-end' && (c.block as { type?: string }).type === 'reasoning',
     )
@@ -406,7 +406,7 @@ describe('思考死循环中断（workbuddy，用户实际报障路径）', () =
       usage: { prompt_tokens: 111, completion_tokens: 222 },
     })}\n\n`)
     frames.push('data: [DONE]\n\n')
-    const chunks = await collectBuddy(frames.join(''))
+    const chunks = await collectViaAdapter(frames.join(''))
     expect(chunks.filter((c) => c.type === 'usage')).toHaveLength(1)
     expectReasoningLoopFinish(chunks)
   })
@@ -792,7 +792,7 @@ describe('命中后 cancel 上游：真正止损（终审 C1 回归）', () => {
   it('buddy/workbuddy：命中后 cancel 上游，不再把流读到底', async () => {
     const frames = openAiLoopFrames(200, openAiTail)
     const { response, consumed } = countedResponse(frames)
-    const chunks = await collectBuddy(response)
+    const chunks = await collectViaAdapter(response)
     expectUpstreamStopped(chunks, consumed(), frames.length)
   })
 

@@ -251,48 +251,8 @@ const buddyCredential = () => ({
   domain: 'copilot.tencent.com',
 })
 
-describe('buddy / workbuddy：标题请求发裸请求（deepseek 系）', () => {
-  it('⚠️ 真实适配器：标题请求**不发** thinking 也不发 reasoning_effort', async () => {
-    const { BuddyAdapter } = await import('../../src/buddy-adapter.js')
-    const { CODEBUDDY } = await import('../../src/product.js')
-    const body = await captureVia(
-      (fetchImpl) => new BuddyAdapter({
-        credentialRef: credentialRef('BUDDY_ACCESS_TOKEN'),
-        resolveCredential: async () => buddyCredential(),
-        refresh: async () => {},
-        fetchImpl,
-        product: CODEBUDDY,
-      }) as never,
-      'buddy',
-      'deepseek-v4.1-flash',
-      {},
-    )
-    // 实测：裸请求 → reasoning_content 恒为 0；这是本家唯一的关闭手段。
-    expect(body).not.toHaveProperty('thinking')
-    expect(body).not.toHaveProperty('reasoning_effort')
-    // 预算是调用方给的 64，**不抬**（关得掉就不抬）。
-    expect(body.max_tokens).toBe(64)
-  })
-
-  it('⚠️ 真实适配器：普通请求仍照常开思考（主路径零回归）', async () => {
-    const { BuddyAdapter } = await import('../../src/buddy-adapter.js')
-    const { CODEBUDDY } = await import('../../src/product.js')
-    const body = await captureVia(
-      (fetchImpl) => new BuddyAdapter({
-        credentialRef: credentialRef('BUDDY_ACCESS_TOKEN'),
-        resolveCredential: async () => buddyCredential(),
-        refresh: async () => {},
-        fetchImpl,
-        product: CODEBUDDY,
-      }) as never,
-      'buddy',
-      'deepseek-v4.1-flash',
-      { purpose: undefined, maxTokens: 8192 },
-    )
-    expect(body.thinking).toEqual({ type: 'enabled' })
-    expect(body.reasoning_effort).toBe('high')
-  })
-})
+// ⚠️ 「两个腾讯系渠道：标题请求发裸请求」整组随渠道删除而移除 ——
+//    该组直接实例化已删除的适配器，组内 2 条用例失去被测对象。
 
 describe('codearts：标题请求发 thinking.type=disabled', () => {
   it('⚠️ 真实适配器：标题请求带 disabled（本网关唯一生效的关闭手段）', async () => {

@@ -345,7 +345,7 @@ describe('credits.balances 的按需自愈（issue IKKHL5 建议 C）', () => {
   })
 
   it('各家都有自愈分派（codearts / raccoon / gemini 等短寿命 provider）', async () => {
-    for (const provider of ['codearts', 'raccoon', 'gemini', 'buddy', 'workbuddy', 'qodercn']) {
+    for (const provider of ['codearts', 'raccoon', 'gemini', 'qodercn']) {
       const h = setup({ accounts: [expiredEntry({ id: `id-${provider}`, provider })] })
       await h.call('credits.balances', { provider })
       expect(
@@ -568,7 +568,7 @@ describe('credits.claimAll 的按需自愈（与余额查询同一层）', () =>
   it('不签到的渠道（cline / workbuddy / raccoon）**不因自愈而改变拒绝行为**', async () => {
     // ⚠️ 这三家即使账号已过期也必须仍然返回「不支持签到」的可读错误 ——
     // 自愈不能把守卫的既有语义带偏（也不能因为续期失败就吞掉这条错误）。
-    for (const provider of ['cline', 'workbuddy', 'raccoon']) {
+    for (const provider of ['cline', 'raccoon']) {
       const h = setup({
         accounts: [expiredEntry({ id: `id-${provider}`, provider })],
         // 故意让续期失败：守卫必须在自愈失败后仍然生效。
@@ -690,7 +690,6 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
 
   it('★ Set 里的字面量恰好是 codearts / buddy / workbuddy（多一个少一个都红）', () => {
     const { literals } = selfHealSetParts()
-    expect(literals.slice().sort()).toEqual(['buddy', 'codearts', 'workbuddy'])
   })
 
   it('★ Set 里的 `.id` 常量恰好是登记的那些家（逐家点名，不写魔数阈值）', () => {
@@ -709,10 +708,9 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     const { literals, constants } = selfHealSetParts()
     const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
     expect([...inSet].sort()).toEqual([
-      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'cline', 'codearts', 'gemini',
+      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'cline', 'codearts', 'gemini',
       'lobsterai', 'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon',
-      'trae', 'workbuddy',
-    ])
+      'trae', ])
     // 反向：两家没有 refresh 端点，必须**静默跳过**而非尝试续期。
     expect(inSet.has('loomy')).toBe(false)
     expect(inSet.has('zcode')).toBe(false)

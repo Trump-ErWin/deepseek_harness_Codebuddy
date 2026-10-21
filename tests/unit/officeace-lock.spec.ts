@@ -34,7 +34,7 @@ import {
   type OfficeAceLockDeps,
   type OfficeAceSummaryRead,
 } from '../../src/officeace-lock.js'
-import { buddyExpiringWindowDays } from '../../src/buddy-balance-rank.js'
+import { expiringWindowDays } from '../../src/balance-rank.js'
 import type { OfficeAceCredential, OfficeAceSubscriptionSummary } from '../../src/officeace-auth.js'
 
 const DAY = 24 * 60 * 60 * 1000
@@ -148,7 +148,7 @@ function harness(options: {
   unlocked?: OfficeAceCredential | undefined
   windowMs?: number
   /**
-   * ⚠️ 不注入 `windowMs`，走**生产那条** `buddyExpiringWindowMs()`（读 env）。
+   * ⚠️ 不注入 `windowMs`，走**生产那条** `expiringWindowMs()`（读 env）。
    *    只有这一格能测出「窗口天数是不是真的同源」—— 注入了就等于把被测判据
    *    换成了测试自己给的值（见 ⑨）。
    */
@@ -348,13 +348,13 @@ describe('锁定态执行路径（issue IKLTHB 第 ① 条）', () => {
   it('★ ⑨ 窗口**与面板文案同源**：改环境变量 ⇒ 筛号与文案同时跟着变', async () => {
     // ⚠️ 这条是为一个**真实无牙**的缺口写的（第一轮审计「中等 1」）：
     //    「窗口天数与面板文案同源」原先只有「> 0」一句断言，而所有期望值都是
-    //    `buddyExpiringWindowDays()` **现算**的 ⇒ 把筛号或文案里的窗口**写死 15 天**，
+    //    `expiringWindowDays()` **现算**的 ⇒ 把筛号或文案里的窗口**写死 15 天**，
     //    默认 env 下全部用例仍然绿。判据必须让 env 走**非默认值**，并同时看两件事：
     //    ① 5 天后到期的额度在 3 天窗口下必须被当成**永久桶**（拒绝）；
     //    ② 报错文案必须说「3 天」——把天数写死在任意一侧都会被这条抓住。
-    vi.stubEnv('DSH_BUDDY_EXPIRING_WINDOW_DAYS', '3')
+    vi.stubEnv('DSH_EXPIRING_WINDOW_DAYS', '3')
     try {
-      expect(buddyExpiringWindowDays(), 'env 必须真的被读到').toBe(3)
+      expect(expiringWindowDays(), 'env 必须真的被读到').toBe(3)
       const h = harness({
         locked: true,
         accounts: [{ id: 'a1', credentialRef: 'R1' }],
@@ -380,14 +380,14 @@ describe('锁定态执行路径（issue IKLTHB 第 ① 条）', () => {
   it('★ ⑩ 文案里的天数**必须用调用方给的窗口**（不是另算一份）', () => {
     // ⚠️ 与 ⑨ 互补：⑨ 证明「没有注入时读 env」，这条证明「注入时用注入值」。
     //    两条合起来才排掉「同一条判据两份取值」（本仓库红线）——
-    //    原先文案自己调 `buddyExpiringWindowMs()`，注入 1 天窗口筛号、文案却说 15 天。
+    //    原先文案自己调 `expiringWindowMs()`，注入 1 天窗口筛号、文案却说 15 天。
     expect(officeaceLockedError({ kind: 'exhausted' }, 2 * DAY).message).toContain('2 天内到期')
-    // 非法值 ⇒ 回落 env（同 `buddyExpiringWindowDays()`），不是 0 天。
+    // 非法值 ⇒ 回落 env（同 `expiringWindowDays()`），不是 0 天。
     // ⚠️ 这是**防御腿**，不是「忘了传参」的兜底：`windowMs` 已是**必填**参数
     //    （第二轮审计实测那个默认值改坏后 22 条全绿 ⇒ 它是死代码），
     //    所以这一格只能**显式**传 NaN 才走得到。
     const fallback = officeaceLockedError({ kind: 'exhausted' }, Number.NaN).message
-    expect(fallback).toContain(`${buddyExpiringWindowDays()} 天内到期`)
+    expect(fallback).toContain(`${expiringWindowDays()} 天内到期`)
   })
 })
 

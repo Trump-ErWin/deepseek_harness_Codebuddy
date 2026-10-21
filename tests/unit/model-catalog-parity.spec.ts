@@ -61,7 +61,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { createModelCatalog, type CatalogEntry } from '../../src/model-catalog.js'
-import { BuddyAdapter } from '../../src/buddy-adapter.js'
 import { AccioAdapter } from '../../src/accio-adapter.js'
 import { AutoclawAdapter } from '../../src/autoclaw-adapter.js'
 // ⚠️ AutoClaw 国际版（2026-10-20）：与国内同一适配器类，只差 product。
@@ -537,8 +536,6 @@ describe('端到端对拍：**全 provider 表驱动**（15 家，2026-10-08 复
    * 它的构造形状不同（需要 `identitySlots`），已在下表单列。
    */
   const CASES: ReadonlyArray<{ id: string; make: () => unknown }> = [
-    { id: 'buddy', make: () => new BuddyAdapter({ ...NO_CRED, product: CODEBUDDY } as never) },
-    { id: 'workbuddy', make: () => new BuddyAdapter({ ...NO_CRED, product: WORKBUDDY } as never) },
     {
       id: 'cline',
       make: () => new ClineAdapter({
@@ -723,7 +720,7 @@ id: 'autoclaw',
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    expect(CASES).toHaveLength(21)
+    expect(CASES).toHaveLength(19)
   })
 
   it('★★ `catalog` 具备 `refresh` 的家，适配器上必须**存在** `refresh` 成员（转发接线）', () => {
@@ -778,10 +775,10 @@ id: 'autoclaw',
     //       **共用适配器类**，因此同样继承了 config 回调与转发（实测由本断言自己找出）。
     expect(
       forwarding.sort(),
-      '这 14 家必须都接入后台刷新（改这条名单前请先读 be42b25 与本轮修正的注释）',
+      '这 12 家必须都接入后台刷新（改这条名单前请先读 be42b25 与本轮修正的注释）',
     ).toEqual([
-      'accio', 'astudio', 'buddy', 'codearts', 'lobsterai', 'loomy',
-      'minimax', 'minimaxintl', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'accio', 'astudio', 'codearts', 'lobsterai', 'loomy',
+      'minimax', 'minimaxintl', 'qoder', 'qodercn', 'raccoon', 'trae', 'zcode',
     ])
   })
 

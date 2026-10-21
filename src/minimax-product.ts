@@ -3,7 +3,7 @@
  *
  * ## 为什么新建 `MinimaxProduct` 而不复用既有类型
  *
- * `BuddyProduct` / `LobsteraiProduct` / `QoderProduct` / `LoomyProduct` /
+ * `ProviderProduct` / `LobsteraiProduct` / `QoderProduct` / `LoomyProduct` /
  * `RaccoonProduct` 的字段全部围绕各自协议设计（归属头、WASM 签名参数、
  * 手机号加密密钥、倍率…），对 MiniMax 无一有意义。
  * MiniMax 需要的是：**一组 OAuth 端点 + 目录 region/buildEnv + 兜底模型表**。

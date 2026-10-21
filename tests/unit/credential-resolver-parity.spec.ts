@@ -28,7 +28,7 @@
  * 十二处 —— 本仓库已记录过这类事故）。
  */
 import { describe, expect, it } from 'vitest'
-import { BuddyBalanceSelector } from '../../src/buddy-balance-selector.js'
+import { BalanceSelector } from '../../src/balance-selector.js'
 import { createCredentialResolver, NO_FREE_MODEL } from '../../src/credential-resolver.js'
 import type { BuddyCredential } from '../../src/buddy.js'
 import type { CreditBalance } from '../../src/credits.js'
@@ -418,8 +418,8 @@ describe('createCredentialResolver 与旧闭包对拍', () => {
    * 参照实现 = 旧 buddy 系编排闭包的函数体 + 旧调用方闭包的尾巴。
    * ⚠️ 该闭包已在 Task 6 删除，故此处**不复写它的符号名**（「锚点已消失」类核对
    * 会 grep 到注释而假命中；名字见 git 历史 `d35d9e3`）。
-   * 用**真实** `BuddyBalanceSelector`（注入 `fetchBalance`），因为
-   * `pickBuddyAccount` 是共享实现，对拍必须覆盖它。
+   * 用**真实** `BalanceSelector`（注入 `fetchBalance`），因为
+   * `pickAccount` 是共享实现，对拍必须覆盖它。
    */
   describe('骨架 C：余额分档 + 免费短路 + 锁定抛错（buddy / workbuddy / lobsterai / trae）', () => {
     const PRODUCT = { id: 'buddy', displayName: 'CodeBuddy' }
@@ -438,7 +438,7 @@ describe('createCredentialResolver 与旧闭包对拍', () => {
       }
     }
 
-    /** 与 `src/index.ts` 逐字一致的锁定文案（含 `buddyExpiringWindowDays()` = 15）。 */
+    /** 与 `src/index.ts` 逐字一致的锁定文案（含 `expiringWindowDays()` = 15）。 */
     function lockedError(reason: { kind: string; errors?: string[] }): Error {
       const days = 15
       if (reason.kind === 'unknown') {
@@ -477,7 +477,7 @@ describe('createCredentialResolver 与旧闭包对拍', () => {
         },
         ...config.locked === undefined ? {} : { locked: config.locked },
       })
-      const selector = new BuddyBalanceSelector({
+      const selector = new BalanceSelector({
         product: { id: 'buddy' } as never,
         resolveCredential: async (ref: string) => ({ access_token: ref }) as unknown as BuddyCredential,
         fetchBalance: async (credential) => config.balances[credential.access_token] ?? null,
@@ -531,8 +531,8 @@ describe('createCredentialResolver 与旧闭包对拍', () => {
         }
 
         const allowPermanent = !pool.permanentLocked(PRODUCT.id)
-        const { pickBuddyAccount } = await import('../../src/buddy-balance-selector.js')
-        const picked = await pickBuddyAccount(selector, candidates, {
+        const { pickAccount } = await import('../../src/balance-selector.js')
+        const picked = await pickAccount(selector, candidates, {
           allowPermanent,
           resolveCredential: readCredential,
         })
@@ -599,7 +599,7 @@ describe('createCredentialResolver 与旧闭包对拍', () => {
     })
 
     it('⚠️ 首位凭据损坏 ⇒ 两者都换下一个候选（分档编排的循环语义）', async () => {
-      // 变异：把 `pickBuddyAccount` 换成 `selector.select` + 单次 resolve ⇒ 本条红。
+      // 变异：把 `pickAccount` 换成 `selector.select` + 单次 resolve ⇒ 本条红。
       const { legacy, next } = pair({
         entries: [account('a1', 'buddy'), account('a2', 'buddy')],
         balances: { BUDDY_ACCOUNT_A1: balance(250), BUDDY_ACCOUNT_A2: balance(100, 10) },
@@ -754,7 +754,7 @@ describe('createCredentialResolver 与旧闭包对拍', () => {
    * ⚠️ 与骨架 C 的**关键差异**（裁定 3：loomy 走自己的适配分支）：
    * loomy 的余额分档**自己就是完整的选号** —— 选中的账号凭据坏掉时它
    * **不换号、也不问池**，直接退单凭据。旧闭包里根本没有池取号调用。
-   * 把 loomy 并进 `pickBuddyAccount` 会同时引入 ① 换号重试、② 池兜底
+   * 把 loomy 并进 `pickAccount` 会同时引入 ① 换号重试、② 池兜底
    * 两个行为变更，故它必须走自己的分支。
    */
   describe('骨架 D：loomy（自己的分档协议 + 不回落池）', () => {
@@ -882,7 +882,7 @@ describe('createCredentialResolver 与旧闭包对拍', () => {
     })
 
     it('⚠️ 选中的账号凭据坏掉 ⇒ 两者**都不换号、也不问池**，直接退单凭据', async () => {
-      // 变异：把 loomy 分支换成 buddy 分支（`pickBuddyAccount`）⇒ 本条红
+      // 变异：把 loomy 分支换成 buddy 分支（`pickAccount`）⇒ 本条红
       //（会换号选中 a2、且会多调一次 select）。
       const { pool, selector, legacy, next } = pair({
         entries: [account('a1', 'loomy'), account('a2', 'loomy')],

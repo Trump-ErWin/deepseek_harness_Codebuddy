@@ -27,7 +27,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-  it('共 22 条（21 个真渠道 + aggregate）', () => {
+  it('共 20 条（19 个真渠道 + aggregate）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
@@ -40,8 +40,8 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     //    ⇒ 与 minimaxintl 同款判据（实测国内 token 打国际基址 → `401 Invalid token`）。
     //    ⚠️ 合并上游时**不要**把这里改回上游数字 —— 那会让两个声明都失去守卫
     //    （条数断言是「注册表没被误删」的唯一防线）。
-    expect(PROVIDER_REGISTRY).toHaveLength(22)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(21)
+    expect(PROVIDER_REGISTRY).toHaveLength(20)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(19)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
   })
 
@@ -73,7 +73,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     const { sortOpenProvidersByOrder } = await import('../../plugin-src/client/provider-toggle.js')
     const ids = PROVIDER_REGISTRY.map((d) => ({ id: d.id }))
     // 复刻本机实测的 providerOrder：自定义但**不含** aggregate / modelscope
-    const order = ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'trae', 'cline',
+    const order = ['codearts', 'lobsterai', 'trae', 'cline',
       'loomy', 'raccoon', 'minimax', 'zcode', 'opencode', 'gemini', 'qoder', 'qodercn']
     const sorted = sortOpenProvidersByOrder(ids, order).map((p) => p.id)
     expect(sorted.indexOf('modelscope'),
@@ -81,7 +81,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
   })
 
   it('descriptorOf 按 id 取；未知返回 undefined', () => {
-    expect(descriptorOf('buddy')?.label).toBe('CodeBuddy (腾讯)')
+    expect(descriptorOf('buddy')).toBeUndefined()
     expect(descriptorOf('nope')).toBeUndefined()
   })
 })
@@ -90,8 +90,6 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
   it('CREDITS 派生结果与既有 7 条 toEqual 断言一致（astudio 2026-10-16 加入）', () => {
     const caps = creditCapabilitiesOf()
     expect(caps.codearts).toEqual({ balance: true, dailyCheckin: true })
-    expect(caps.buddy).toEqual({ balance: true, dailyCheckin: true })
-    expect(caps.workbuddy).toEqual({ balance: true, dailyCheckin: false })
     expect(caps.qoder).toEqual({ balance: true, dailyCheckin: true })
     expect(caps.qodercn).toEqual({ balance: true, dailyCheckin: true })
     expect(caps.loomy).toEqual({ balance: true, dailyCheckin: true, onboardingTasks: true })
@@ -167,9 +165,8 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     //    ⚠️ 与 buddy 系**不同源**：本家 `rateLimit: false`、刻意不做请求级换号，
     //    锁定只作用于「按余额分档选号」这一层。**两站各占一项**。
     expect(locked).toEqual([
-      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'loomy',
-      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
-    ])
+      'astudio', 'autoclaw', 'autoclawintl', 'lobsterai', 'loomy',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', ])
   })
 
   it('usesExpiryWindow 恰好是 13 家（loomy 不在内，它没有窗口概念；autoclaw 2026-10-17、qoder/qodercn/astudio/minimax/minimaxintl/codearts 2026-10-20 加入）', () => {
@@ -194,10 +191,9 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     //    ⚠️ 与其余 6 家**不同**：它不开 `permanentLock` —— CodeArts 没有任何
     //    「永不作废」的池，开锁会与「锁住就不作废」的语义错位。
     expect(win).toEqual([
-      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts', 'lobsterai',
+      'astudio', 'autoclaw', 'autoclawintl', 'codearts', 'lobsterai',
       'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae',
-      'workbuddy',
-    ])
+      ])
   })
 
   it('rateLimit === false 恰好是 7 家（astudio 2026-10-18 加入；accio 2026-10-18 退出）', () => {
@@ -279,8 +275,8 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     const withNs = PROVIDER_REGISTRY.filter((d) => d.settingsNamespace !== undefined)
       .map((d) => d.id).sort()
     expect(withNs).toEqual([
-      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy',
-      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'zcode',
     ])
   })
 })

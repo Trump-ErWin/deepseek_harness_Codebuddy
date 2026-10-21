@@ -3,7 +3,7 @@
  *
  * ## 为什么新建 `LoomyProduct` 而不复用既有类型
  *
- * `BuddyProduct` / `LobsteraiProduct` / `QoderProduct` 的字段全部围绕各自
+ * `ProviderProduct` / `LobsteraiProduct` / `QoderProduct` 的字段全部围绕各自
  * 协议设计（归属头、refresh 载荷、WASM 签名参数…），对 Loomy 无一有意义。
  * Loomy 需要的是：两个 base URL（账号 vs 业务）、讯飞 AccessKey、
  * 以及一张兜底模型表。故定义**平行**的接口 —— 共用的是架构**模式**

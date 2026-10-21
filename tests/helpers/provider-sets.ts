@@ -268,7 +268,7 @@ export const PROBE_EXEMPT: ReadonlyMap<string, string> = new Map()
  * 而不是静默通过。
  */
 export const WRITES_RATE_LIMIT_PROVIDERS: readonly string[] = Object.freeze([
-  'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'cline',
+  'lobsterai', 'qoder', 'qodercn', 'cline',
   'zcode', 'trae', 'gemini', 'codearts', 'loomy', 'raccoon', 'opencode',
   'minimax',
 // ⚠️ minimaxintl（MiniMax Code 国际版，2026-10-15）：与 `minimax` **共用同一个

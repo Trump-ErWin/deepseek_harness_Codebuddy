@@ -115,17 +115,17 @@ describe('account.refresh 分派（T7 回归）', () => {
     expect(
       EXPECTED_REFRESH_PROVIDER_IDS,
       'channel 集合变了，请复核 opencode 豁免是否仍成立（见 AUTH_EXEMPT）',
-    ).toHaveLength(20)
+    ).toHaveLength(18)
   })
 
   it('buddy 账号刷新**自己的** credentialRef，而不是默认单凭据 ref', async () => {
     // 缺陷 2 的回归：原实现调 buddy.refresh()（读 BUDDY_ACCESS_TOKEN），
     // 刷的是另一个凭据。
-    const harness = refreshHarness([entry('buddy', 'BUDDY_ACCOUNT_AAAA1111')])
-    const result = await harness.call('buddy-1')
+    const harness = refreshHarness([entry('lobsterai', 'LOBSTERAI_ACCOUNT_AAAA1111')])
+    const result = await harness.call('lobsterai-1')
     const calls = harness.calls.map((c) => ({ service: c.provider, credentialRef: c.ref }))
     expect(okValue(result).success).toBe(true)
-    expect(calls).toEqual([{ service: 'buddy', credentialRef: 'BUDDY_ACCOUNT_AAAA1111' }])
+    expect(calls).toEqual([{ service: 'lobsterai', credentialRef: 'LOBSTERAI_ACCOUNT_AAAA1111' }])
     // ⚠️ 2026-10-08 改（Task 2 复审 Finding 3）：这里原先是
     //    `expect(calls.some((c) => c.service.includes('refresh(default)'))).toBe(false)`
     //    —— 在**旧**夹具下有意义（旧桩同时有 `refresh()`，它会记一条
@@ -138,21 +138,20 @@ describe('account.refresh 分派（T7 回归）', () => {
     //    ⚠️ 若将来有人给桩补上 `refresh`，本行会红 —— 那正是要的信号：
     //    届时必须把上面那条「恒真」断言换成真正的行为断言。
     expect(
-      typeof (harness.auths['buddy'] as { refresh?: unknown }).refresh,
+      typeof (harness.auths['lobsterai'] as { refresh?: unknown }).refresh,
       '夹具的桩新增了 refresh()：上面那条「不得刷默认凭据」的行为断言必须重写',
     ).toBe('undefined')
   })
 
-  it('workbuddy 账号可刷新且不再抛 Unknown provider（缺陷 1 的回归）', async () => {
-    // 原实现只判 codearts / buddy，workbuddy 落到 else 抛
-    // `Unknown provider: workbuddy`。
+  it('trae 账号可刷新且不再抛 Unknown provider（缺陷 1 的回归）', async () => {
+    // 原实现只判有限的几家，其余落到 else 抛 `Unknown provider`。
     const { calls, result } = await callRefresh(
-      [entry('workbuddy', 'WORKBUDDY_ACCOUNT_BBBB2222')], 'workbuddy-1',
+      [entry('trae', 'TRAE_ACCOUNT_BBBB2222')], 'trae-1',
     )
     expect(okValue(result).success).toBe(true)
     // 成功路径不得带 `error`（issue IKJOZA 后失败走 `ok:false`，成功必须干净）。
     expect((result as { error?: unknown }).error).toBeUndefined()
-    expect(calls).toEqual([{ service: 'workbuddy', credentialRef: 'WORKBUDDY_ACCOUNT_BBBB2222' }])
+    expect(calls).toEqual([{ service: 'trae', credentialRef: 'TRAE_ACCOUNT_BBBB2222' }])
   })
 
   it('lobsterai 账号刷新自己的 credentialRef（新增 provider 不得重蹈覆辙）', async () => {
@@ -219,11 +218,9 @@ describe('account.refresh 分派（T7 回归）', () => {
     expect(calls).toEqual([{ service: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_DDDD4444' }])
   })
 
-  it('七个 provider 各自分派到对应服务（互不串用）', async () => {
+  it('五个 provider 各自分派到对应服务（互不串用）', async () => {
     const accounts = [
       entry('codearts', 'CODEARTS_ACCOUNT_1'),
-      entry('buddy', 'BUDDY_ACCOUNT_1'),
-      entry('workbuddy', 'WORKBUDDY_ACCOUNT_1'),
       entry('lobsterai', 'LOBSTERAI_ACCOUNT_1'),
       entry('qoder', 'QODER_ACCOUNT_1'),
       entry('qodercn', 'QODERCN_ACCOUNT_1'),
@@ -383,7 +380,7 @@ describe('account.refresh 失败语义（issue IKJOZA）', () => {
 
   it('成功路径不受影响：仍是 ok:true + value.success:true', async () => {
     // 防止「为了让失败变红」把成功也一起改成 ok:false。
-    const { result } = await callRefresh([entry('buddy', 'BUDDY_ACCOUNT_1')], 'buddy-1')
+    const { result } = await callRefresh([entry('lobsterai', 'LOBSTERAI_ACCOUNT_1')], 'lobsterai-1')
     expect(result.ok).toBe(true)
     expect(result.value?.success).toBe(true)
   })

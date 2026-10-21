@@ -117,14 +117,15 @@
  *    有专门一条锁死这个现状）。
  */
 
-import type { BuddyNoAccountReason, BuddySelectorLike } from './buddy-balance-selector.js'
-import { pickBuddyAccount } from './buddy-balance-selector.js'
 import type {
   LoomyCandidateAccount,
   LoomyNoAccountReason,
   LoomySelectionResult,
 } from './loomy-balance-selector.js'
 import type { LoomyTierOptions } from './loomy-balance-rank.js'
+import type { ChannelCredential } from './jwt-utils.js'
+import { pickAccount } from './balance-selector.js'
+import type { NoAccountReason, SelectorLike } from './balance-selector.js'
 
 /**
  * 编排用到的那部分账号池（**结构化**，便于单测注入替身）。
@@ -183,8 +184,8 @@ export interface CredentialResolverDeps<TCredential = unknown> {
 /**
  * loomy 选号器的**结构化**形状。
  *
- * ⚠️ 与 {@link BuddySelectorLike} 分开声明，不合并成一个「通用选号器」接口：
- * 两者的 `reason` 类型（`LoomyNoAccountReason` vs `BuddyNoAccountReason`）与
+ * ⚠️ 与 {@link SelectorLike} 分开声明，不合并成一个「通用选号器」接口：
+ * 两者的 `reason` 类型（`LoomyNoAccountReason` vs `NoAccountReason`）与
  * 余额语义（`dailyBalance` vs `expiring/permanent`）都不同。设计边界是
  * **抽象编排、不抽象协议** —— 强行合并会丢掉「今日赠送额度」这层语义。
  */
@@ -220,12 +221,12 @@ export const NO_FREE_MODEL = (): false => false
 /**
  * **buddy 协议**的余额分档计划（buddy / workbuddy / lobsterai / trae 四家共用）。
  *
- * 编排本身直接复用 `pickBuddyAccount`（**已导出的共享实现**），本模块不再手写
+ * 编排本身直接复用 `pickAccount`（**已导出的共享实现**），本模块不再手写
  * 一份候选循环 —— 那正是本 Task 要消除的重复。
  */
 export interface BuddyBalancePlan {
   readonly kind: 'buddy'
-  readonly selector: BuddySelectorLike
+  readonly selector: SelectorLike
   /**
    * 锁定且无可用账号时的报错文案（各家不同，**必须由调用方逐字提供**）。
    *
@@ -233,7 +234,7 @@ export interface BuddyBalancePlan {
    * 报成「额度已用尽」，用户会去解锁或白等，而号其实有钱；
    * 把「凭据全坏」也报成「额度已用尽」同样是**自相矛盾**（分档刚证明它有钱）。
    */
-  readonly lockedError: (reason: BuddyNoAccountReason) => Error
+  readonly lockedError: (reason: NoAccountReason) => Error
   /**
    * 本次请求的模型是否**免费**（消耗 0 积分）。免费时**跳过**余额分档。
    *
@@ -263,7 +264,7 @@ export interface BuddyBalancePlan {
  * ⚠️ 与 {@link BuddyBalancePlan} 的**关键差异**（本 Task 的裁定 3）：
  * loomy 的分档**自己就是完整的选号** —— 选中的账号凭据坏掉时它
  * **不换号、也不回落池**，直接退单凭据（旧闭包里根本没有池取号调用）。
- * 把它并进 `pickBuddyAccount` 会同时引入「换号重试」与「池兜底」两个行为变更。
+ * 把它并进 `pickAccount` 会同时引入「换号重试」与「池兜底」两个行为变更。
  */
 export interface LoomyBalancePlan {
   readonly kind: 'loomy'
@@ -405,9 +406,9 @@ export function createCredentialResolver<TCredential>(
         //（凭据问题应报「凭据不可用」，而不是被误报成「额度已用尽」）。
       }
 
-      // ② 余额分档编排（共享实现 `pickBuddyAccount`，**不要**在本文件再手写一份）。
+      // ② 余额分档编排（共享实现 `pickAccount`，**不要**在本文件再手写一份）。
       const allowPermanent = !deps.pool.permanentLocked(providerId)
-      const picked = await pickBuddyAccount<TCredential>(plan.selector, candidates, {
+      const picked = await pickAccount<TCredential>(plan.selector, candidates, {
         allowPermanent,
         resolveCredential: config.readCredential,
       })
@@ -436,7 +437,7 @@ export function createCredentialResolver<TCredential>(
         //    是不是限流，再退兜底」。本处只是把它补到锁定分支上。
         if (candidates.length === 0) config.throwIfAllRateLimited?.(config.product, modelId)
         // ⚠️ **不再写 `?? { kind: 'exhausted' }` 兜底**（2026-10-14 审计实测打穿的
-        //    漏网路径）。`pickBuddyAccount` 的返回类型已收紧为 `reason` **必填**，
+        //    漏网路径）。`pickAccount` 的返回类型已收紧为 `reason` **必填**，
         //    而它缺席时**只有一个**成因 —— 候选非空、每次 `select()` 都 `ok:true`，
         //    但那些号的凭据全解析不出来（详见 `credential-only` 的说明）。此时
         //    `ok:true` 已证明该号落在可用档（有钱），报「积分都已用尽」是
@@ -495,7 +496,7 @@ export function createCredentialResolver<TCredential>(
      *
      * ## 为什么本模块**不得不**写它
      *
-     * 池的取号方法返回的是**联合类型** `CodeArtsCredential | BuddyCredential`
+     * 池的取号方法返回的是**联合类型** `CodeArtsCredential | ChannelCredential`
      *（历史遗留：`src/account-pool.ts` 的 `getAvailableAccount` 早于多 provider
      * 泛型化），而本模块对池只声明了 {@link ResolverPool} 这个**结构化**接口
      *（`credential: unknown`，好让单测注入替身、且不必构造整个池）。

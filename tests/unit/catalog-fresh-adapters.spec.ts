@@ -24,7 +24,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { CATALOG_REFRESH_INTERVAL_MS } from '../../src/model-catalog.js'
 import { AccioAdapter } from '../../src/accio-adapter.js'
-import { BuddyAdapter } from '../../src/buddy-adapter.js'
+import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
 import { CodeArtsAdapter } from '../../src/llm-adapter.js'
 import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
 import { LoomyAdapter } from '../../src/loomy-adapter.js'
@@ -359,7 +359,7 @@ describe('B 类：目录缓存的 20 分钟 TTL', () => {
 /**
  * buddy：重测与日常保鲜是**两条路**。
  *
- * ⚠️ 入口说明：本家的 `refreshCatalog()` 是**公开方法**（`BuddyAdapter` 上），
+ * ⚠️ 入口说明：本家的 `refreshCatalog()` 是**公开方法**（`LobsteraiAdapter` 上），
  *    不必绕 `registerBuddyLlm` 的回调。
  *    ⚠️⚠️ **真实的生产调用点只有一个**：`stream()` 里「该模型贴图能力未知时」
  *    补拉一次目录（`buddy-adapter.ts` 的图片分支）。
@@ -370,97 +370,7 @@ describe('B 类：目录缓存的 20 分钟 TTL', () => {
  *    **但用例本身有效**：它守的是「`refreshCatalog` 无条件清字段 + 越过节流后
  *    必重拉」这条不变量，而不是某条 UI 路径的存在性。
  */
-describe('buddy：重测与日常保鲜是两条路', () => {
-  it('⚠️ refreshCatalog 无视 TTL，强制重拉（无条件的重拉路径不得变哑）', async () => {
-    const clock = makeClock()
-    const fetchRemoteModels = vi.fn(async () => [{ id: 'm1', name: 'M1', supportsImages: true }])
-    const adapter = new BuddyAdapter({
-      credentialRef: 'CRED' as never,
-      resolveCredential: async () => ({ token: 't' } as never),
-      refresh: async () => {},
-      fetchRemoteModels: fetchRemoteModels as never,
-      catalogComplete: () => true,
-      now: clock.now,
-    } as never)
-    await adapter.listModels('buddy')
-    expect(fetchRemoteModels, '⚠️ 冷缓存首拉').toHaveBeenCalledTimes(1)
-
-    // ⚠️ **只推 11 秒** —— 越过「距上次尝试 ≥10 秒」的节流，却**远在 20 分钟 TTL
-    //    之内**。这正是让断言可识别的窗口：若 refreshCatalog 也带 TTL 判据，
-    //    此刻 `catalogAt` 未超期 ⇒ 会被短路 ⇒ 这条变红。
-    //    （「推 11 秒就重拉」与下面「10 秒内不重拉」不矛盾：量的正是两条判据的分工。）
-    clock.advance(11_000)
-    await adapter.refreshCatalog()
-    expect(
-      fetchRemoteModels,
-      '⚠️ 周期内点重测也必须重拉（这条变绿说明 TTL 吞掉了用户主动操作）',
-    ).toHaveBeenCalledTimes(2)
-  })
-
-  it('⚠️ 日常保鲜仍受 TTL 约束（重测路径不得反向污染 ensureRemoteModels）', async () => {
-    const clock = makeClock()
-    const fetchRemoteModels = vi.fn(async () => [{ id: 'm1', name: 'M1', supportsImages: true }])
-    const adapter = new BuddyAdapter({
-      credentialRef: 'CRED' as never,
-      resolveCredential: async () => ({ token: 't' } as never),
-      refresh: async () => {},
-      fetchRemoteModels: fetchRemoteModels as never,
-      catalogComplete: () => true,
-      now: clock.now,
-    } as never)
-    await adapter.listModels('buddy')
-    await adapter.listModels('buddy')
-    await adapter.resolveModel('buddy', 'm1')
-    expect(
-      fetchRemoteModels,
-      '⚠️ listModels/resolveModel 共用同一条保鲜路径，周期内零额外请求',
-    ).toHaveBeenCalledTimes(1)
-    clock.advance(CATALOG_REFRESH_INTERVAL_MS)
-    await adapter.listModels('buddy')
-    expect(fetchRemoteModels, '⚠️ 超 20 分钟后日常路径必须重拉').toHaveBeenCalledTimes(2)
-  })
-
-  it('⚠️ 重测后拉取失败仍保住*旧*目录（不得把列表清空）', async () => {
-    const clock = makeClock()
-    let broken = false
-    const fetchRemoteModels = vi.fn(async () => {
-      if (broken) throw new Error('目录端点挂了')
-      return [{ id: 'm1', name: 'M1', supportsImages: true }]
-    })
-    const adapter = new BuddyAdapter({
-      credentialRef: 'CRED' as never,
-      resolveCredential: async () => ({ token: 't' } as never),
-      refresh: async () => {},
-      fetchRemoteModels: fetchRemoteModels as never,
-      catalogComplete: () => true,
-      now: clock.now,
-    } as never)
-    const before = await adapter.listModels('buddy')
-    clock.advance(CATALOG_REFRESH_INTERVAL_MS + 1)
-    broken = true
-    await adapter.refreshCatalog()
-    const after = await adapter.listModels('buddy')
-    expect(after.length, '⚠️ 重测失败后目录不得被清空').toBeGreaterThan(0)
-    expect(after.length, '⚠️ 重测失败后仍应是上次那份').toBe(before.length)
-  })
-
-  it('⚠️ 重测仍受「距上次尝试 ≥10 秒」节流约束（用户定的规则不得被绕过）', async () => {
-    const clock = makeClock()
-    const fetchRemoteModels = vi.fn(async () => [{ id: 'm1', name: 'M1', supportsImages: true }])
-    const adapter = new BuddyAdapter({
-      credentialRef: 'CRED' as never,
-      resolveCredential: async () => ({ token: 't' } as never),
-      refresh: async () => {},
-      fetchRemoteModels: fetchRemoteModels as never,
-      catalogComplete: () => true,
-      now: clock.now,
-    } as never)
-    await adapter.listModels('buddy')
-    expect(fetchRemoteModels).toHaveBeenCalledTimes(1)
-    // ⚠️ 不推时钟 ⇒ 距上次尝试不足 10 秒 ⇒ 节流命中，**不得**重拉。
-    //    这条与上面那条「周期内必须重拉」看似矛盾，量的正是**两条判据的分工**：
-    //    节流（10s，拉取频率）与 TTL（20min，缓存保鲜）是**两件事**。
-    await adapter.refreshCatalog()
-    expect(fetchRemoteModels, '⚠️ 10 秒节流内不得重复拉取').toHaveBeenCalledTimes(1)
-  })
-})
+// ⚠️ **整组移除**：「重测与日常保鲜是两条路」原以已删除的适配器为样本（
+//    它的 `refreshCatalog` 是当时唯一实现「无视 TTL 强制重拉」的路径）。
+//    ⚠️ 覆盖缺口如实登记：`refreshCatalog` 的「无视 TTL / 失败保旧目录 / 10 秒节流」
+//    三条判据现无适配器级覆盖。

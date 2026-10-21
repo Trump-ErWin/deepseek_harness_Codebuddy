@@ -57,7 +57,6 @@ import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { CheckinStatus, ClaimOutcome, CreditBalance } from './credits.js'
 import type {
   ProviderAccountEntry,
-  RpcBuddyGrowthAccountResult,
   RpcCreditsBalanceExtra,
   RpcOnboardingClaimResponse,
   RpcOnboardingStatusResponse,
@@ -633,7 +632,7 @@ export interface ProviderCredits {
     entry: ProviderAccountEntry,
     run: GrowthRunOptions,
     call: ProviderCallContext,
-  ): Promise<RpcBuddyGrowthAccountResult | undefined>
+  ): Promise<unknown>
   /**
    * 签到收尾的**附加提示**（可选）。
    *

@@ -39,7 +39,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
 import { descriptorOf } from '../../src/provider-registry.js'
-import { buddyExpiringWindowDays } from '../../src/buddy-balance-rank.js'
+import { expiringWindowDays } from '../../src/balance-rank.js'
 import { permanentLockCopy } from '../../plugin-src/client/credits-capabilities.js'
 
 // ⚠️ 必须 mock 掉余额入口：它内部会打云侧 V11 签名请求（真网络）。
@@ -91,28 +91,18 @@ const LOCK_EXECUTION_PATHS: Record<
   }
 > = {
   // buddy 系四家（含 trae / lobsterai）：`createCredentialResolver` 的 buddy 分支
-  // 读 `pool.permanentLocked(providerId)` ⇒ `pickBuddyAccount({ allowPermanent })`
+  // 读 `pool.permanentLocked(providerId)` ⇒ `pickAccount({ allowPermanent })`
   // ⇒ 锁定且只剩永久桶时报 `plan.lockedError(...)`。行为守卫见那张 spec 的
   // 「锁定的真实行为（驱动 apply()）」一节（四家各有自己的 selector 与文案）。
-  buddy: {
-    module: 'src/buddy-balance-selector.ts',
-    spec: 'tests/unit/buddy-permanent-lock.spec.ts',
-    drives: 'pickBuddyAccount',
-  },
-  workbuddy: {
-    module: 'src/buddy-balance-selector.ts',
-    spec: 'tests/unit/buddy-permanent-lock.spec.ts',
-    drives: 'pickBuddyAccount',
-  },
   trae: {
-    module: 'src/buddy-balance-selector.ts',
-    spec: 'tests/unit/buddy-permanent-lock.spec.ts',
-    drives: 'pickBuddyAccount',
+    module: 'src/balance-selector.ts',
+    spec: 'tests/unit/permanent-lock-trae-lobsterai.spec.ts',
+    drives: 'pickAccount',
   },
   lobsterai: {
-    module: 'src/buddy-balance-selector.ts',
-    spec: 'tests/unit/buddy-permanent-lock.spec.ts',
-    drives: 'pickBuddyAccount',
+    module: 'src/balance-selector.ts',
+    spec: 'tests/unit/permanent-lock-trae-lobsterai.spec.ts',
+    drives: 'pickAccount',
   },
   // Loomy：`credential-resolver.ts` 的 loomy 分支（`loomyBalanceTier` 的
   // `allowPermanent:false` ⇒ `none`）。文案与接线由这两张 spec 守。
@@ -130,7 +120,7 @@ const LOCK_EXECUTION_PATHS: Record<
   },
   // ⚠️ qoder / qodercn（2026-10-20）：与 buddy 系四家**同一条**执行路径
   //    （`createCredentialResolver` 的 `kind: 'buddy'` 分支 ⇒
-  //    `pool.permanentLocked(providerId)` ⇒ `pickBuddyAccount({ allowPermanent })`
+  //    `pool.permanentLocked(providerId)` ⇒ `pickAccount({ allowPermanent })`
   //    ⇒ 落 `plan.lockedError(...)`）。判别符号取 `qoderLockedError` ——
   //    它本家独有（共用 `buddyLockedError` 等于没点名）。
   //    ⚠️ 两家**共用**这个构造器（只差 `displayName`），故两行写同一个符号是
@@ -153,7 +143,7 @@ const LOCK_EXECUTION_PATHS: Record<
   // ⚠️ astudio（2026-10-20）：与 buddy 系四家**同一条**执行路径 ——
   //    `src/index.ts` 的 astudio 注册段接了 `createCredentialResolver` 的
   //    `kind: 'buddy'` 分支（`credential-resolver.ts` 读
-  //    `pool.permanentLocked(providerId)` ⇒ `pickBuddyAccount({ allowPermanent })`）。
+  //    `pool.permanentLocked(providerId)` ⇒ `pickAccount({ allowPermanent })`）。
   //    判别符号取 `astudioLockedError` —— 它**本家独有**（buddy 系四家共用
   //    `buddyLockedError`，写那个等于没点名），且只在本 PR 新增的这段里出现。
   astudio: {
@@ -183,7 +173,7 @@ const LOCK_EXECUTION_PATHS: Record<
   },
   // ⚠️ autoclaw / autoclawintl（2026-10-21，用户要求「补锁定开关」）：
   //    与 astudio / minimax 同一条执行路径（`createCredentialResolver` 的
-  //    `kind: 'buddy'` 分支 ⇒ `pickBuddyAccount({ allowPermanent })`）。
+  //    `kind: 'buddy'` 分支 ⇒ `pickAccount({ allowPermanent })`）。
   //    判别符号取 `autoclawLockedError` —— 它本家独有（共用 `buddyLockedError`
   //    等于没点名）。
   //    ⚠️ **两站的锚点必须带各自的 `displayName`**：两站共用同一个构造器，
@@ -336,7 +326,7 @@ describe('★ 普查：凡登记 permanentLock 的渠道，都必须有一条执
  * ## B：officeace 的执行路径**真的会拒**（驱动真实 `apply()`）
  *
  * ⚠️ `ctx.llm.registerAdapter` 拿到的那个对象是**若干层 Proxy**，但
- *    `options` 是直通的（`buddy-permanent-lock.spec.ts` 同款取法已在跑）⇒
+ *    `options` 是直通的（`balance-selector.spec.ts` 同款取法已在跑）⇒
  *    这里取到的是 `apply()` 里**真的**交给适配器的那个 `credentialProvider`。
  */
 describe('★ officeace：锁定真的被执行（驱动 apply()，真读 permanent-locks.json）', () => {
@@ -494,7 +484,7 @@ describe('★ officeace：锁定真的被执行（驱动 apply()，真读 perman
   it('⑤ 锁定状态只按 provider 读：锁 officeace 不影响 buddy 的行为', async () => {
     // ⚠️ 判据是「读的是不是本 provider 的那一格」。若有人把它写成全局开关，
     //    officeace 与 buddy 会一起被锁 —— 本用例只钉 officeace 这一侧
-    //    （buddy 侧由 `buddy-permanent-lock.spec.ts` 钉）。
+    //    （buddy 侧由 `balance-selector.spec.ts` 钉）。
     const ctx = boot()
     await ctx.accountPool.setPermanentLocked('buddy', true)
     await addAccount(ctx, 'a')
@@ -506,19 +496,19 @@ describe('★ officeace：锁定真的被执行（驱动 apply()，真读 perman
   it('⑥ 窗口天数与面板文案同源（同一个环境变量，且非默认值也跟随）', () => {
     // 面板的 `windowDays` 与实际筛号必须同一个数，否则文案会承诺一个筛不出来
     // 的窗口（`credits.permanentLock` RPC 也回传同一个函数）。
-    expect(buddyExpiringWindowDays()).toBeGreaterThan(0)
+    expect(expiringWindowDays()).toBeGreaterThan(0)
     // ⚠️ 只断言「> 0」是**无牙**的（第一轮审计「中等 1」）：那样即使把窗口写死成
     //    15 天也全绿。这里钉住「env 真的被读到、非默认值真的生效」；
     //    「筛号与文案同时跟随」由 `officeace-lock.spec.ts` 的 ⑨ 驱动真实 provider 钉。
-    const before = process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS
+    const before = process.env.DSH_EXPIRING_WINDOW_DAYS
     try {
-      process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS = '31'
-      expect(buddyExpiringWindowDays(), '面板回传的窗口必须读 env，不能写死').toBe(31)
-      expect(permanentLockCopy('officeace', buddyExpiringWindowDays()).lockedTitle)
+      process.env.DSH_EXPIRING_WINDOW_DAYS = '31'
+      expect(expiringWindowDays(), '面板回传的窗口必须读 env，不能写死').toBe(31)
+      expect(permanentLockCopy('officeace', expiringWindowDays()).lockedTitle)
         .toContain('31 天内到期')
     } finally {
-      if (before === undefined) delete process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS
-      else process.env.DSH_BUDDY_EXPIRING_WINDOW_DAYS = before
+      if (before === undefined) delete process.env.DSH_EXPIRING_WINDOW_DAYS
+      else process.env.DSH_EXPIRING_WINDOW_DAYS = before
     }
   })
 

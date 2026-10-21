@@ -44,7 +44,7 @@ import { describe, expect, it } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { resolveEmptyResponseReason, isCourseLeakStripEnabled } from '../../src/sse.js'
 import { consumeOpenAiSse } from '../../src/openai-compat.js'
-import { BuddyAdapter } from '../../src/buddy-adapter.js'
+import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
 import { CodeArtsAdapter } from '../../src/llm-adapter.js'
 import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
@@ -52,7 +52,7 @@ import { QoderAdapter } from '../../src/qoder-adapter.js'
 import { QODER } from '../../src/qoder-product.js'
 import { TraeAdapter } from '../../src/trae-adapter.js'
 import { TRAE } from '../../src/trae-product.js'
-import { WORKBUDDY } from '../../src/product.js'
+import { LOBSTERAI } from '../../src/lobsterai-product.js'
 import { buildQoderCredential, parseQoderTokenPayload } from '../../src/qoder.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 import type { FinishReason, GenerateOptions } from '@deepseek-ai/dsh-llm'
@@ -306,13 +306,13 @@ function collectQoder(sse: string): Promise<Array<Record<string, unknown>>> {
   } as never))
 }
 
-/** buddy / workbuddy：真实 `BuddyAdapter`（用户实际报障路径）。 */
+/** buddy / workbuddy：真实 `LobsteraiAdapter`（用户实际报障路径）。 */
 function collectBuddy(sse: string): Promise<Array<Record<string, unknown>>> {
-  const adapter = new BuddyAdapter({
+  const adapter = new LobsteraiAdapter({
     credentialRef: 'TEST_REF' as never,
     resolveCredential: async () => ({ access_token: 'stub', refresh_token: 'stub', expires_at: 0 }) as never,
     refresh: async () => {},
-    product: WORKBUDDY,
+    product: LOBSTERAI,
     fetchImpl: (async () => streamedResponse(sse)) as never,
   })
   return drain(adapter.stream({

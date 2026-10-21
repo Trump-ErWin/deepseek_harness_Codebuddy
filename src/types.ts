@@ -574,54 +574,6 @@ export interface RpcCreditsClaimAllResponse {
    * 的处置不同（完成 / 需客户端 / 失败），折进一句文案就丢掉了逐项判据 ——
    * 而那正是排查「为什么这项没涨」的唯一线索。
    */
-  growth?: RpcBuddyGrowthAccountResult[]
-}
-
-/** RPC: 成长中心任务一键全自动化请求 */
-export interface RpcBuddyGrowthTasksRequest {
-  provider: string
-  /**
-   * 单账号时间预算（毫秒）。缺省由实现取 10 分钟；传 0 或负数表示不限时。
-   * 该值会**原样**透传给 `runGrowthTaskCompletions` 的 `budgetMs`。
-   */
-  budgetMs?: number
-}
-/** 单个成长任务的完成结果 */
-export interface RpcBuddyGrowthTaskResult {
-  taskCode: string
-  ok: boolean
-  message: string
-  /** 判据在服务端推不动、如实归为「需客户端」而非「失败」。 */
-  clientOnly?: boolean
-}
-/** 单个账号的成长任务执行结果 */
-export interface RpcBuddyGrowthAccountResult {
-  accountId: string
-  nickname: string
-  /**
-   * 执行是否成功完成整轮。
-   *
-   * `ok:false` 表示有任务失败或时间预算用尽 —— 逐项明细看 `tasks`。
-   */
-  ok: boolean
-  completed: number
-  /** 需客户端动作的项数（微信动作、夜窗未到、判据推不动）。 */
-  clientOnly: number
-  failed: number
-  /** 扫尾自动领到的任务数。 */
-  claimedCount: number
-  /** 扫尾自动领到的积分。 */
-  claimedCredit: number
-  /** 时间预算用尽、本轮提前收住。 */
-  timedOut: boolean
-  /** 逐项明细（含事件数 / progress / 失败原因）。 */
-  tasks: RpcBuddyGrowthTaskResult[]
-  /** 执行失败原因（凭据失效、任务列表查询失败等）。 */
-  error?: string
-}
-/** RPC: 成长中心任务一键全自动化响应 */
-export interface RpcBuddyGrowthTasksResponse {
-  results: RpcBuddyGrowthAccountResult[]
 }
 
 /**
@@ -721,7 +673,7 @@ export interface RpcPermanentLockResponse {
   /**
    * 当前生效的「临时积分」窗口（天）—— **仅两个 buddy 返回**。
    *
-   * ⚠️ 必须回传而不是让前端写死：窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS`
+   * ⚠️ 必须回传而不是让前端写死：窗口可被 `DSH_EXPIRING_WINDOW_DAYS`
    * 覆盖，前端写死 15 就会出现「提示说只烧 15 天内的，实际按 31 天筛号」。
    * Loomy 没有窗口概念（它看服务端的当日池），故不带该字段。
    */
@@ -782,7 +734,7 @@ export interface RpcCreditsBalancesResponse {
    * 让越线的包继续被当成长期（宿主长期开着，时间只向前流）。
    *
    * ⚠️ 为什么由后端回传而不是前端写死：窗口可被
-   * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，前端写死就会出现
+   * `DSH_EXPIRING_WINDOW_DAYS` 覆盖，前端写死就会出现
    * 「提示说只烧 15 天内的、实际按 31 天筛号」。
    * Loomy / Raccoon **不带**该字段：它们的积分由服务端按语义分成多个池下发
    * （其中有「每日刷新」池），走的是**池名分桶**（`formatPoolSplitLine`），
@@ -820,51 +772,6 @@ export interface RpcCreditsBalancesResponse {
  */
 
 /** RPC: 查询某 provider 的**订阅额度窗口**（当前只有 Cline 支持）。 */
-/** RPC: 查询某账号的 **CodeBuddy 限时补偿积分**状态（2026-10-16 新增）。
- *
- * ⚠️ 这是**一次性限时活动**，不是每日签到能力 ⇒ **不接 `credits.claimAll`**。
- * ⚠️ 端点走 buddy 的 **`webBase`** —— `src/product.ts` 里该值是
- * `https://www.workbuddy.cn`；`www.codebuddy.cn` 只是三个实测可达 host 之一，
- * **不是 `webBase` 本身**（PR !106 初版把两者混为一谈，2026-10-16 审计更正）。
- * 三个 host 均可达这件事见 `src/buddy-compensation.ts` 模块头。
- *
- * ⚠️⚠️ **客户端契约**：`rpcCall` 成功时返回的是**解包后的 `value`**（**没有
- * `ok` 字段**），失败时**抛错**（`plugin-src/management-rpc.mjs` 的
- * `unwrapRpcResult`）⇒ 消费方**判 `res.ok` 恒假**，必须走字段判据 + try/catch。
- * 见 `plugin-src/client/compensation-panel-logic.js` 模块头。
- */
-export interface RpcBuddyCompensationStatusRequest {
-  /** 目前只有 `'buddy'`（CodeBuddy 中国版）。 */
-  provider: string
-  /** 目标账号 id（补偿是**按账号**的，不是全局）。 */
-  accountId: string
-}
-
-/** RPC: CodeBuddy 补偿状态响应。字段名**逐字对应上游**，不做重命名。 */
-export interface RpcBuddyCompensationStatusResponse {
-  /** 本账号是否已领取。 */
-  claimed: boolean
-  /** 活动是否仍在进行。 */
-  active: boolean
-  /** 可领取的积分数（上游 `credit_num`）。 */
-  creditNum: number
-  /** 上游 `validity_period`，含义未说明，**原样透传**。 */
-  validityPeriod?: number
-  /** 截止时间（上游原样字符串，如 `"2026-10-22 23:59:59"`）。 */
-  endTime?: string
-}
-
-/** RPC: 领取某账号的 CodeBuddy 补偿积分（**写操作，只能成功一次**）。
- *
- * ⚠️ **只由面板按钮显式触发**，不得接进定时器 / 自动签到（见模块头）。
- */
-export interface RpcBuddyClaimCompensationRequest {
-  provider: string
-  accountId: string
-}
-
-/** RPC: 领取响应。成功即空对象（领取后由调用方重新查询状态刷新展示）。 */
-export interface RpcBuddyClaimCompensationResponse {}
 
 /** RPC: 查询某 provider 的**订阅额度窗口**（当前只有 Cline 支持）。 */
 export interface RpcClineQuotaRequest {
@@ -1767,12 +1674,6 @@ export interface LoginFlowOptions {
   /** 登录流程选择：'oauth'（默认）或 'ticket'（旧流程回退）。 */
   flow?: 'oauth' | 'ticket'
 }
-
-/**
- * buddy (腾讯 CodeBuddy) 凭据，存储在 BUDDY_ACCESS_TOKEN 下。
- * 定义与解析工具放在 buddy.ts（与 CodeBuddy 协议常量同处一处）。
- */
-export type { BuddyCredential } from './buddy.js'
 
 /**
  * ========================================

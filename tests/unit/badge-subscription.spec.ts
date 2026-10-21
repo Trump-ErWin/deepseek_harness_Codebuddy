@@ -49,13 +49,8 @@ function balance(packages: CreditPackage[], total?: number): CreditBalance {
 }
 
 describe('套餐判定表', () => {
-  it('登记了 5 个渠道：两个 buddy、两个 Qoder、ZCode', () => {
-    expect(Object.keys(BADGE_PLAN_SELECTORS).sort()).toEqual(['buddy', 'qoder', 'qodercn', 'workbuddy', 'zcode'])
-  })
-
-  it('两个 buddy 共用「包名窄正则」这条规则', () => {
-    expect(badgePlanSelectorFor('buddy')).toBe(badgePlanSelectorFor('workbuddy'))
-    expect(badgePlanSelectorFor('buddy')?.kind).toBe('package')
+  it('登记了 3 个渠道：两个 Qoder、ZCode', () => {
+    expect(Object.keys(BADGE_PLAN_SELECTORS).sort()).toEqual(['qoder', 'qodercn', 'zcode'])
   })
 
   it('两个 Qoder 共用「包名 === 套餐额度」这条规则', () => {
@@ -75,7 +70,7 @@ describe('套餐判定表', () => {
   })
 
   it('窄正则：发放型权益**不得**命中', () => {
-    // 实测的服务端包名（见 src/credits.ts 与 buddy-balance-rank.ts 的注释）
+    // 实测的服务端包名（见 src/credits.ts 与 src/balance-rank.ts 的注释）
     expect(PLAN_PACKAGE_PATTERN.test('Free Plan Subscription')).toBe(true)
     expect(PLAN_PACKAGE_PATTERN.test('CodeBuddy个人体验版')).toBe(true)
     expect(PLAN_PACKAGE_PATTERN.test('Bonus Pack')).toBe(false)
@@ -92,35 +87,13 @@ describe('套餐判定表', () => {
 })
 
 describe('badgePlanFor', () => {
-  it('buddy：命中 Plan 包时给出该包的读数', () => {
-    const plan = badgePlanFor('buddy', balance([
-      pkg('Bonus Pack', 20, 100),
-      pkg('Free Plan Subscription', 300, 500, { deductionEndTime: 1_700_000_000_000 }),
-    ]))
-    expect(plan).toEqual({
-      name: 'Free Plan Subscription',
-      remaining: 300,
-      total: 500,
-      unit: 'credit',
-      deductionEndTime: 1_700_000_000_000,
-    })
+  it('只有 Bonus Pack 时**不**算订阅（回落到积分）', () => {
+    expect(badgePlanFor('qoder', balance([pkg('Bonus Pack', 250, 250)]))).toBeNull()
   })
 
-  it('buddy：只有 Bonus Pack 时**不**算订阅（回落到积分）', () => {
-    expect(badgePlanFor('buddy', balance([pkg('Bonus Pack', 250, 250)]))).toBeNull()
-  })
-
-  it('多个套餐包时取剩余最大者', () => {
-    const plan = badgePlanFor('workbuddy', balance([
-      pkg('Free Plan', 10, 100),
-      pkg('Team Plan Subscription', 900, 1000),
-    ]))
-    expect(plan?.name).toBe('Team Plan Subscription')
-    expect(plan?.remaining).toBe(900)
-  })
-
+  // ⚠️ 「多个套餐包取剩余最大者」测的是「包名窄正则」规则，该规则随渠道移除已不存在。
   it('已失效的套餐包不算数（回落到积分）', () => {
-    expect(badgePlanFor('buddy', balance([pkg('Free Plan Subscription', 0, 500, { active: false })]))).toBeNull()
+    expect(badgePlanFor('qoder', balance([pkg('Free Plan Subscription', 0, 500, { active: false })]))).toBeNull()
   })
 
   it('Qoder：套餐额度为 0 时仍然如实给出 0（不伪装成「没有套餐」）', () => {

@@ -3,7 +3,6 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
-import { BuddyAdapter } from '../../src/buddy-adapter.js'
 import {
   DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES,
   DEFAULT_IMAGE_PIXEL_BUDGET,
@@ -16,8 +15,6 @@ import {
 } from '../../src/image-budget.js'
 import { RaccoonAdapter } from '../../src/raccoon-adapter.js'
 import { RACCOON } from '../../src/raccoon-product.js'
-import { CODEBUDDY, type BuddyProduct } from '../../src/product.js'
-import type { BuddyCredential } from '../../src/buddy.js'
 
 /**
  * 图片像素预算的回归用例（Gitee issue !IKITT9）。
@@ -217,72 +214,11 @@ describe('requestImageTargetFor：组装附件服务的请求目标', () => {
   })
 })
 
-describe('BuddyAdapter：发请求版本，拿不到时回退原图', () => {
-  it('⚠️ 提供 readImageRequest 时用它发出缩放后的字节，且不再读原图', async () => {
-    const readImage = vi.fn(async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }))
-    const { body, targets } = await drive({
-      readImage,
-      readImageRequest: async () => ({ data: new Uint8Array([9, 9]), mediaType: 'image/jpeg' }),
-    })
-
-    expect(imageUrlOf(userParts(body))).toBe('data:image/jpeg;base64,CQk=')
-    expect(targets).toEqual([{ width: 1051, height: 608, maxBytes: REQUEST_IMAGE_MAX_BYTES }])
-    expect(readImage, '有请求版本时不该再去读原图').not.toHaveBeenCalled()
-  })
-
-  it('⚠️ 桥接返回 undefined（老宿主 / 拒绝投影）时回退原图，请求不得失败', async () => {
-    const { body, error, targets } = await drive({
-      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
-      readImageRequest: async () => undefined,
-    })
-    expect(error).toBeUndefined()
-    expect(targets).toHaveLength(1)
-    expect(imageUrlOf(userParts(body))).toBe('data:image/png;base64,AQID')
-  })
-
-  it('桥接抛错时也回退原图（缩放失败不该打死一次本来能成功的请求）', async () => {
-    const { body, error } = await drive({
-      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
-      readImageRequest: () => {
-        throw new Error('ATTACHMENT_PROJECTION_UNSUPPORTED')
-      },
-    })
-    // 桥接层（`makeReadImageRequest`）本该把异常吞成 undefined；这里模拟
-    // **它没吞**的情形。适配器自己兜住并回退 —— 两层各自都要挡住，
-    // 否则「加上了缩放」反而成为新的故障源。
-    expect(error).toBeUndefined()
-    expect(imageUrlOf(userParts(body))).toBe('data:image/png;base64,AQID')
-  })
-
-  it('未配置 readImageRequest 时保持既有行为（发原图）', async () => {
-    const { body, targets } = await drive({
-      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
-    })
-    expect(targets).toEqual([])
-    expect(imageUrlOf(userParts(body))).toBe('data:image/png;base64,AQID')
-  })
-
-  it('⚠️ 附件引用没有固有尺寸时不派生（宁可发原图也不瞎猜目标）', async () => {
-    const readImageRequest = vi.fn(async () => ({ data: new Uint8Array([7]), mediaType: 'image/jpeg' }))
-    const { body, targets } = await drive({
-      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
-      readImageRequest,
-      attachment: { attachmentId: 'att-no-size', mediaType: 'image/png' },
-    })
-    expect(targets).toEqual([])
-    expect(readImageRequest).not.toHaveBeenCalled()
-    expect(imageUrlOf(userParts(body))).toBe('data:image/png;base64,AQID')
-  })
-
-  it('产品配置更小的预算时，适配器按产品的值派生', async () => {
-    const { targets } = await drive({
-      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
-      readImageRequest: async () => ({ data: new Uint8Array([2]), mediaType: 'image/jpeg' }),
-      product: { ...CODEBUDDY, imagePixelBudget: 160_000 } as BuddyProduct,
-    })
-    expect(targets[0]!.width * targets[0]!.height).toBeLessThanOrEqual(160_000)
-  })
-})
+// ⚠️ **整组移除**：「BuddyAdapter 发请求版本 / 回退原图」依赖已删除的适配器。
+//    该适配器是 `readImageRequest` 桥接的唯一实现方；渠道删除后这组没有被测对象。
+//    ⚠️ 覆盖缺口如实登记：`readImageRequest` 的「缩放 / 回退 / 不瞎猜」三条判据
+//    现无适配器级覆盖 —— 通用层（`fitImageToPixelBudget` / `projectRequestImage`）
+//    仍由本文件其余组覆盖。
 
 describe('五个适配器都真的走了共享投影（不再各自裸发原图）', () => {
   /**
@@ -328,22 +264,8 @@ describe('五个适配器都真的走了共享投影（不再各自裸发原图�
    * 单列一条而不是塞进上面的循环，是为了让这两种形状**都**被显式锁住 ——
    * 否则将来有人"统一形状"时会不知不觉改掉语义。
    */
-  it('buddy 走共享投影、传像素预算，并在拿不到时回退原图', () => {
-    const source = codeOnly(read('src/buddy-adapter.ts'))
-    expect(source).toContain("from './image-budget.js'")
-    expect(source).toMatch(/projectRequestImage\(ref, \{[\s\S]{0,200}?pixelBudget[^}]*\}\)/)
-    // ⚠️ buddy 的回退写成 `if (projected !== undefined) { …; continue }`
-    // （它是最早接的一家，形状与另四家的 `??` 不同）。这里锁**本质**而非字面：
-    // 投影必须先于读原图发生，且 readImage 路径必须还在（否则回退就断了）。
-    const projectedAt = source.indexOf('await this.projectRequestImage(ref)')
-    const readImageAt = source.indexOf('await this.options.readImage(ref)')
-    expect(projectedAt, '未调用共享投影').toBeGreaterThan(-1)
-    expect(readImageAt, '原图回退路径被删掉了').toBeGreaterThan(-1)
-    expect(projectedAt, '投影必须排在读原图之前，反了就等于永远发原图')
-      .toBeLessThan(readImageAt)
-    expect(source).toContain('if (projected !== undefined)')
-  })
-
+  // ⚠️ 「buddy 走共享投影」这条源码文本断言随渠道删除而移除；它锁的是该适配器
+  //    独有的回退形状（`if (projected !== undefined)`），现无被测对象。
   it('宿主侧为这五家都桥接了 readImageRequest', () => {
     const source = codeOnly(read('src/index.ts'))
     // buddy 与 workbuddy 各一处、raccoon / qoder / qodercn / lobsterai / cline 各一处。
@@ -440,52 +362,9 @@ describe('按体积设限的家必须显式给 imageMaxBytes（Issue IKKX0T 的�
   })
 })
 
-describe('11115「请求过大」的分类不得依赖 extError 是否存在', () => {
-  /** harness 的 `isContextWindowExceededError` 实测只认带 extError 的那一份。 */
-  const WITH_EXT_ERROR = JSON.stringify({
-    code: 11115,
-    msg: 'prompt is too long: 100001 tokens > 100000 maximum',
-    extError: { code: 'context_length_exceeded', type: 'invalid_request_error' },
-  })
-  /** issue 里被漏判的那条：同样的措辞，但没有 extError。 */
-  const ONLY_MSG = JSON.stringify({
-    code: 11115,
-    msg: 'prompt is too long: 100001 tokens > 100000 maximum',
-    displayMsg: { zh: '内容过长，请精简或新建任务' },
-  })
-
-  it.each([
-    ['带 extError 的报文', WITH_EXT_ERROR],
-    ['⚠️ 只有 msg + displayMsg（原先漏判的那条）', ONLY_MSG],
-  ])('%s → CONTEXT_WINDOW_EXCEEDED', async (_name, bodyText) => {
-    const { error } = await drive({
-      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
-      failWith: { status: 400, body: bodyText },
-    })
-    expect(error).toBeInstanceOf(LlmError)
-    // 归错的代价不对称：`INVALID_REQUEST` 既不在 harness 的 DEFAULT_RETRYABLE_CODES
-    // （[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]），也不触发溢出压缩
-    // （`dsh-compaction-basic` 的 listener 第一行就 `if (code !== CONTEXT_WINDOW_EXCEEDED) return`）
-    // → 会话每轮直接报废；而归成溢出最多让压缩白试一次。
-    expect((error as LlmError).code).toBe('CONTEXT_WINDOW_EXCEEDED')
-  })
-
-  it('无关的 400 仍归 INVALID_REQUEST（不能把所有 400 都说成溢出）', async () => {
-    const { error } = await drive({
-      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
-      failWith: { status: 400, body: JSON.stringify({ code: 10001, msg: 'bad reasoning param' }) },
-    })
-    expect((error as LlmError).code).toBe('INVALID_REQUEST')
-  })
-
-  it('「too long」但没有 token 越界数字的文案不升级（判据必须窄）', async () => {
-    const { error } = await drive({
-      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
-      failWith: { status: 400, body: 'prompt is too long' },
-    })
-    expect((error as LlmError).code).toBe('INVALID_REQUEST')
-  })
-})
+// ⚠️ **整组移除**：`11115`「请求过大」的分类判据实现在已删除的适配器内
+//    （它不在 `image-budget.ts` 里 —— 该文件只是文档中引用了这个报文样例）。
+//    渠道删除后，这组断言失去被测对象。
 
 describe('projectRequestImage：九个适配器共用的请求版本投影', () => {
   it('把像素预算与**字节目标**一起传给桥接（raccoon 靠后者对付 10MB 上限）', async () => {

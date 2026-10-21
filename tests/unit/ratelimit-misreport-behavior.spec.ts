@@ -4,7 +4,7 @@
  *
  * ## 为什么要有这份「行为级」用例（源码级断言不够，真实缺陷，2026-10-05）
  *
- * `buddy-ratelimit-misreport.spec.ts` 里的接线断言是**源码级**的（读 `index.ts`
+ * `lobsterai-ratelimit-misreport.spec.ts` 里的接线断言是**源码级**的（读 `index.ts`
  * 找调用点）。它挡得住「有人把接线删了」，但**挡不住接线写错位置**：比如把判定
  * 放到了 `getAvailableAccount` **之前**，池里明明还有号也会被报成限流。
  *
@@ -175,7 +175,7 @@ async function addAccount(
  * `updateModelRateLimit` 只改到第一条（同 id 的旧条目），造成难查的串扰。
  */
 const PAIRED_PROVIDERS = [
-  'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae',
+  'lobsterai', 'trae', 'lobsterai', 'qoder', 'qodercn', 'trae',
   'cline', 'loomy', 'raccoon', 'minimax', 'gemini',
 ] as const
 
@@ -216,7 +216,7 @@ describe('模型级限流被误报成「未登录」（IKJOZ9）', () => {
      * ⇒ **纯超时，判据本身是对的**。
      *
      * 根因不在判据：本组取号会真的走 `createCredentialResolver` 的
-     * `kind: 'buddy'` 分档路径 ⇒ `fetchQoderCreditBalance` 真发请求 ⇒
+     * `kind: 'lobsterai'` 分档路径 ⇒ `fetchQoderCreditBalance` 真发请求 ⇒
      * 本机 `openapi.qoder.sh` **不可达**（实测 ~10.7s 才失败）。
      * ⚠️ 这是**测试基建没跟上生产接线**，不是生产缺陷；但不桩的话本文件
      * 在断网机器上恒红（CI 里表现为 flaky）。

@@ -117,9 +117,9 @@ describe('auto：模型目录全空 / 全被关闭时不得发出别的 provider
     const disabled = new Set(['GLM-5.3-Flash', 'GLM-5.3'])
     const { sent, error } = await dispatchThrough({
       // 真实 `listModels` 内部已 filter(!disabled) ⇒ 全关时返回空目录
-      catalogs: { zcode: [], buddy: [{ id: 'deepseek-v4-flash', name: 'DS v4 Flash' }] },
+      catalogs: { zcode: [], loomy: [{ id: 'deepseek-v4-flash', name: 'DS v4 Flash' }] },
       disabled: { zcode: disabled },
-      expiries: { zcode: 5, buddy: 9 },
+      expiries: { zcode: 5, loomy: 9 },
     })
 
     // ⛔ 回归前：sent = ['zcode/auto']（把字符串 'auto' 当成 zcode 的模型发出去）。
@@ -147,23 +147,23 @@ describe('auto：模型目录全空 / 全被关闭时不得发出别的 provider
 describe('auto：账号都正常只是没有临期额度时，不得报「请先登录」', () => {
   it('全部 provider 都是永久/长期积分（NEVER）时，报错文案不误导为未登录', async () => {
     const { sent, error } = await dispatchThrough({
-      catalogs: { buddy: [{ id: 'deepseek-v4-flash', name: 'DS v4 Flash' }] },
-      expiries: { buddy: Number.POSITIVE_INFINITY },
+      catalogs: { loomy: [{ id: 'deepseek-v4-flash', name: 'DS v4 Flash' }] },
+      expiries: { loomy: Number.POSITIVE_INFINITY },
     })
     // 账号正常 ⇒ 必须能发出请求（而不是 MISSING_CREDENTIAL）。
     expect(error?.code).not.toBe('MISSING_CREDENTIAL')
-    expect(sent).toContain('buddy/deepseek-v4-flash')
+    expect(sent).toContain('loomy/deepseek-v4-flash')
   })
 
   it('排序：全部 NEVER 时仍应选出一个（只有 UNUSABLE 才剔除）', () => {
     // ❌ 回归前：全 NEVER ⇒ best 恒为 undefined ⇒ 整个 auto 不可用。
-    expect(pickSoonestProvider([['buddy', Number.POSITIVE_INFINITY]])).toBe('buddy')
-    expect(pickSoonestProvider([['buddy', Number.POSITIVE_INFINITY], ['loomy', Number.POSITIVE_INFINITY]]))
-      .toBe('buddy')
+    expect(pickSoonestProvider([['loomy', Number.POSITIVE_INFINITY]])).toBe('loomy')
+    expect(pickSoonestProvider([['loomy', Number.POSITIVE_INFINITY], ['loomy', Number.POSITIVE_INFINITY]]))
+      .toBe('loomy')
     // UNUSABLE(-1) 仍然必须被剔除 —— 这是与上一条配套的另一半约定。
-    expect(pickSoonestProvider([['buddy', -1], ['loomy', -1]])).toBeUndefined()
+    expect(pickSoonestProvider([['loomy', -1], ['loomy', -1]])).toBeUndefined()
     // 临期优先的主约定不能被破坏。
-    expect(pickSoonestProvider([['buddy', 900], ['loomy', 100]])).toBe('loomy')
+    expect(pickSoonestProvider([['loomy', 900], ['loomy', 100]])).toBe('loomy')
   })
 })
 
@@ -228,7 +228,7 @@ describe('auto：倍率解析必须有分隔符，不得把模型名里的 x 当
     // 无标注的模型名（不该被误判）
     expect(priceFactorFromName('GLM-5.3-Flash')).toBe(Number.POSITIVE_INFINITY)
     expect(priceFactorFromName('Hy4 preview')).toBe(Number.POSITIVE_INFINITY)
-    // 促销形态（`formatCreditsRate`，buddy.ts:701）：取**促销后**的实际计费倍率。
+    // 促销形态（`formatCreditsRate`，loomy.ts:701）：取**促销后**的实际计费倍率。
     expect(priceFactorFromName('Deepseek-V4.1-Flash · x0.17→x0.03')).toBeCloseTo(0.03)
   })
 
@@ -271,7 +271,7 @@ describe('auto：代表账号必须跳过正在限流的账号', () => {
       { accountPool: pool as never, now: () => 1_000, ttlMs: 0 },
     )
     // ⚠️ 不打桩 expiryOf：本条就是要验「探测阶段」的取号参数。
-    await adapter.expiryOf('buddy')
+    await adapter.expiryOf('loomy')
     expect(modelIds).toHaveLength(1)
     // ⛔ 回归前：modelIds = [''] ⇒ `if (modelId.length === 0) return true`
     //           ⇒ modelRateLimits 里所有限流标记被跳过（account-pool.ts:1049-1055）。
@@ -534,11 +534,11 @@ describe('★★ auto：`dispatchTargetOf` 的 catch 也必须让 499 中止逃�
  * 但 `prepareCall` 里选 `imageTarget` 的那个循环**漏了** ⇒ 一个「支持图片但额度
  * 已尽」的渠道仍会被选成改道目标，带图请求发出去必然失败。
  *
- * 可达性真实：buddy 既声明 `['text','image']`（`buddy-adapter.ts:1272`）
+ * 可达性真实：loomy 既声明 `['text','image']`（`loomy-adapter.ts:1272`）
  * **又**会写 `modelRateLimits`（`:1922`）。
  */
 describe('★★ auto：带图改道路径也必须按派发模型复核可用性', () => {
-  /** buddy 不支持图片（当胜者）、codearts 支持图片但额度已尽。 */
+  /** loomy 不支持图片（当胜者）、codearts 支持图片但额度已尽。 */
   const makeImageWorld = (codeartsBlocked: boolean) => {
     const sent: string[] = []
     const ctx = {
@@ -570,8 +570,8 @@ describe('★★ auto：带图改道路径也必须按派发模型复核可用�
       now: () => 1_000,
       ttlMs: 0,
     })
-    // buddy 临期更早 ⇒ 它当选（但它不支持图片）；codearts 是唯一能收图的候选。
-    adapter.expiryOf = async (provider: string) => (provider === 'buddy' ? 100 : 900)
+    // loomy 临期更早 ⇒ 它当选（但它不支持图片）；codearts 是唯一能收图的候选。
+    adapter.expiryOf = async (provider: string) => (provider === 'loomy' ? 100 : 900)
     return { adapter, sent }
   }
 
@@ -855,7 +855,7 @@ describe('★★ auto：零输出撞墙时改道下一个 provider（B 方案）
  * 而 12:00 其实是 CodeBuddy 的额度作废时间，据此做的「先烧哪个」判断是错的。
  *
  * 实测（修前）：改道到 codearts（真实临期 `900`）后，徽标拿到的 `expiryAt` 是主胜者
- * buddy 的 `100`。
+ * loomy 的 `100`。
  *
  * ## 为什么必须驱动真实调用链
  *
@@ -863,7 +863,7 @@ describe('★★ auto：零输出撞墙时改道下一个 provider（B 方案）
  * （PR !66 的教训）。故这里用 `prepareCall` + 带图消息触发改道。
  */
 describe('★★ auto：徽标倒计时必须属于实际发往的渠道（带图改道不张冠李戴）', () => {
-  /** buddy 不支持图片（当主胜者）；codearts 支持图片（当改道目标）。 */
+  /** loomy 不支持图片（当主胜者）；codearts 支持图片（当改道目标）。 */
   const makeImageWorld = () => {
     const sent: string[] = []
     const ctx = {
@@ -887,9 +887,9 @@ describe('★★ auto：徽标倒计时必须属于实际发往的渠道（带�
       now: () => 1_000,
       ttlMs: 0,
     })
-    // ⚠️ 两个渠道的临期**刻意不同**：buddy(主胜者)=100、codearts(改道目标)=900。
+    // ⚠️ 两个渠道的临期**刻意不同**：loomy(主胜者)=100、codearts(改道目标)=900。
     //    只有它们不同，才能区分「倒计时取自谁」。
-    adapter.expiryOf = async (provider: string) => (provider === 'buddy' ? 100 : 900)
+    adapter.expiryOf = async (provider: string) => (provider === 'loomy' ? 100 : 900)
     return { adapter, sent }
   }
 
@@ -916,10 +916,10 @@ describe('★★ auto：徽标倒计时必须属于实际发往的渠道（带�
     const state = adapter.autoState()
     expect(state.lastDecision?.provider).toBe('codearts')
     expect(state.lastDecision?.viaImageFallback).toBe(true)
-    // ⛔ 修前这里拿到 100（主胜者 buddy 的），徽标会显示 buddy 的到期时间。
+    // ⛔ 修前这里拿到 100（主胜者 loomy 的），徽标会显示 loomy 的到期时间。
     expect(state.lastDecision?.expiryAt, '倒计时必须属于实际发往的 codearts').toBe(900)
     // ⚠️ 同时确认主胜者的时刻**没有被污染**（两个字段语义不同，不能混用）。
-    expect(state.lastWinnerExpiryAt, '主胜者时刻仍是 buddy 的').toBe(100)
+    expect(state.lastWinnerExpiryAt, '主胜者时刻仍是 loomy 的').toBe(100)
   })
 
   it('★ 对照：不带图 ⇒ 正常路径，倒计时就是主胜者的', async () => {
@@ -927,10 +927,10 @@ describe('★★ auto：徽标倒计时必须属于实际发往的渠道（带�
     const call = await adapter.prepareCall('jet-hub-auto', 'auto')
     for await (const _ of call.stream({ messages: [userMessage()] } as never)) { /* drain */ }
 
-    expect(sent, '不带图 ⇒ 主胜者 buddy 当选').toEqual(['buddy/text-model'])
+    expect(sent, '不带图 ⇒ 主胜者 loomy 当选').toEqual(['loomy/text-model'])
     const state = adapter.autoState()
-    expect(state.lastDecision?.provider).toBe('buddy')
-    expect(state.lastDecision?.expiryAt, '正常路径两者同源（都是 buddy）').toBe(100)
+    expect(state.lastDecision?.provider).toBe('loomy')
+    expect(state.lastDecision?.expiryAt, '正常路径两者同源（都是 loomy）').toBe(100)
   })
 })
 
@@ -944,19 +944,19 @@ describe('★★ auto：徽标倒计时必须属于实际发往的渠道（带�
  *
  * | 变异 | 后果 |
  * |---|---|
- * | `rememberPrice` 的键丢掉 provider 前缀 | **同名模型跨渠道串价**（buddy 的 x0.29 被当成 codearts 的价） |
+ * | `rememberPrice` 的键丢掉 provider 前缀 | **同名模型跨渠道串价**（loomy 的 x0.29 被当成 codearts 的价） |
  * | `priceOf` 的读侧丢掉 provider 前缀 | 同上（读写两侧**必须**同构） |
  * | `autoState()` 里 `priceOf` 不转发 | 徽标**永远没有倍率** —— 正是用户报障「没倍率显示？」的形态 |
  *
- * ⚠️ 「同名模型跨渠道串价」是真实可达的：buddy / codearts / loomy / zcode 的目录里
+ * ⚠️ 「同名模型跨渠道串价」是真实可达的：loomy / codearts / loomy / zcode 的目录里
  * 都有 `deepseek-v4.1-flash`、`glm-5.3-flash` 这类**同名**模型，而它们的倍率不同
- *（例如 buddy x0.29 / codearts x0.03）。表键不含渠道时，先写入的那家会把另一家的
+ *（例如 loomy x0.29 / codearts x0.03）。表键不含渠道时，先写入的那家会把另一家的
  * 价覆盖掉 —— 徽标于是显示一个**不属于实际渠道**的倍率（与「编造倍率」同类的误导）。
  */
 describe('★★ auto：徽标倍率表必须按「渠道 + 模型」键控（不得跨渠道串价）', () => {
   /** 两个渠道各有同名模型，倍率刻意不同。 */
   const CATALOG = {
-    buddy: [{ id: 'shared-model', name: 'Shared · x0.29', inputModalities: ['text'] }],
+    loomy: [{ id: 'shared-model', name: 'Shared · x0.29', inputModalities: ['text'] }],
     codearts: [{ id: 'shared-model', name: 'Shared · x0.03', inputModalities: ['text'] }],
   }
 
@@ -990,8 +990,8 @@ describe('★★ auto：徽标倍率表必须按「渠道 + 模型」键控（�
     // ⚠️ 选型会为**每个候选渠道**探测（`selectProvider` 遍历 `AUTO_PROVIDERS`），
     //    故两家都会被记下 —— 关键是**各自的价互不覆盖**。
     expect(adapter.priceOf('codearts', 'shared-model'), 'codearts 的倍率').toBeCloseTo(0.03)
-    // ⛔ 键不含渠道时，这一格会**串成 codearts 的 0.03**（buddy 明明是 x0.29）。
-    expect(adapter.priceOf('buddy', 'shared-model'), 'buddy 必须仍是自己的 x0.29').toBeCloseTo(0.29)
+    // ⛔ 键不含渠道时，这一格会**串成 codearts 的 0.03**（loomy 明明是 x0.29）。
+    expect(adapter.priceOf('loomy', 'shared-model'), 'loomy 必须仍是自己的 x0.29').toBeCloseTo(0.29)
   })
 
   it('★★ autoState() 必须转发 priceOf（否则徽标永远没有倍率）', async () => {
@@ -1002,13 +1002,13 @@ describe('★★ auto：徽标倍率表必须按「渠道 + 模型」键控（�
     // ⛔ 这一格是用户报障「没倍率显示？」的直接根因形态。
     expect(state.priceOf('codearts', 'shared-model'), 'autoState 必须转发倍率查询').toBeCloseTo(0.03)
     // 且**逐渠道区分**：同一个 modelId 在另一家上是另一个价（串价就会两者相等）。
-    expect(state.priceOf('buddy', 'shared-model'), '同名模型不得跨渠道串价').toBeCloseTo(0.29)
+    expect(state.priceOf('loomy', 'shared-model'), '同名模型不得跨渠道串价').toBeCloseTo(0.29)
   })
 
   it('★ 未记过的「渠道 + 模型」组合回 undefined（不猜、不回落）', () => {
     const adapter = makeAdapter()
     // 表是空的：刚重启、还没走过选型 —— 属**正常**情形，调用方据此不显示倍率。
-    expect(adapter.priceOf('buddy', 'never-seen')).toBeUndefined()
+    expect(adapter.priceOf('loomy', 'never-seen')).toBeUndefined()
     expect(adapter.autoState().priceOf('codearts', 'never-seen')).toBeUndefined()
   })
 })
@@ -1032,7 +1032,7 @@ describe('★★ auto：目录契约与 lastDispatch 的 model 字段', () => {
     const ctx = {
       logger: { warn: () => {}, error: () => {} },
       llm: {
-        listModels: async (p: string) => (p === 'buddy'
+        listModels: async (p: string) => (p === 'loomy'
           ? [{ id: 'real-model-id', name: 'Real Model · x0.1', inputModalities: ['text'] }]
           : []),
         resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
@@ -1047,7 +1047,7 @@ describe('★★ auto：目录契约与 lastDispatch 的 model 字段', () => {
       now: () => 1_000,
       ttlMs: 0,
     })
-    adapter.expiryOf = async (provider: string) => (provider === 'buddy' ? 100 : -1)
+    adapter.expiryOf = async (provider: string) => (provider === 'loomy' ? 100 : -1)
     return adapter
   }
 
@@ -1067,8 +1067,8 @@ describe('★★ auto：目录契约与 lastDispatch 的 model 字段', () => {
     for await (const _ of call.stream({ messages: [userMessage()] } as never)) { /* drain */ }
 
     const decided = adapter.autoState().lastDecision
-    expect(decided?.provider).toBe('buddy')
-    // ⛔ 恒空串时这里是 `''` —— 胶囊会显示「自动 → buddy」而没有模型名。
+    expect(decided?.provider).toBe('loomy')
+    // ⛔ 恒空串时这里是 `''` —— 胶囊会显示「自动 → loomy」而没有模型名。
     expect(decided?.model, '必须记下真实 modelId（不是空串）').toBe('real-model-id')
   })
 })
@@ -1134,9 +1134,9 @@ const REAL_INFO_CONTEXT_WINDOW = 123_456
 
 interface AutoCatalogWorld {
   /**
-   * provider → 目录。默认只有 `buddy` 有一个模型（其余渠道空目录 ⇒ 不可调用）。
+   * provider → 目录。默认只有 `loomy` 有一个模型（其余渠道空目录 ⇒ 不可调用）。
    *
-   * ⚠️ 渠道必须取自 `AUTO_PROVIDERS`（codearts / loomy / zcode / buddy / workbuddy）
+   * ⚠️ 渠道必须取自 `AUTO_PROVIDERS`（codearts / loomy / zcode / loomy / zcode）
    * —— 别的 provider（trae / cline / …）**不在候选表里**，选型永远不会走到它们
    * （本组第一版用 trae，`prepareCall` 直接报「没有已登录的 provider」）。
    */
@@ -1174,7 +1174,7 @@ interface AutoCatalogWorld {
  */
 function makeAutoAdapter(world: AutoCatalogWorld = {}): { adapter: AutoAdapter; sent: string[] } {
   const sent: string[] = []
-  const catalogs = world.catalogs ?? { buddy: [{ id: 'm1', name: 'M1 · x0.5' }] }
+  const catalogs = world.catalogs ?? { loomy: [{ id: 'm1', name: 'M1 · x0.5' }] }
   const ctx = {
     logger: { warn: () => {}, error: () => {} },
     llm: {
@@ -1205,7 +1205,7 @@ function makeAutoAdapter(world: AutoCatalogWorld = {}): { adapter: AutoAdapter; 
     ...(world.ttlMs === undefined ? {} : { ttlMs: world.ttlMs }),
   })
   adapter.expiryOf = world.expiryOf
-    ?? (async (provider: string) => (provider === 'buddy' ? 100 : -1))
+    ?? (async (provider: string) => (provider === 'loomy' ? 100 : -1))
   return { adapter, sent }
 }
 
@@ -1276,20 +1276,20 @@ describe('auto：目录加载不得被选型阻塞', () => {
   it('★★ 缓存项进入零输出冷却后不得再算「新鲜」（否则冷却被选型缓存架空）', async () => {
     const { adapter, sent } = makeAutoAdapter({
       catalogs: {
-        buddy: [{ id: 'm1', name: 'M1 · x0.5' }],
+        loomy: [{ id: 'm1', name: 'M1 · x0.5' }],
         zcode: [{ id: 'g1', name: 'G1 · x0.8' }],
       },
-      expiryOf: async (provider: string) => (provider === 'buddy' ? 100 : provider === 'zcode' ? 200 : -1),
-      // `buddy` 收下请求却零输出（issue IKJW31 的失败形态）⇒ 它会被记 10 分钟冷却。
-      streamChunks: (provider: string) => (provider === 'buddy'
+      expiryOf: async (provider: string) => (provider === 'loomy' ? 100 : provider === 'zcode' ? 200 : -1),
+      // `loomy` 收下请求却零输出（issue IKJW31 的失败形态）⇒ 它会被记 10 分钟冷却。
+      streamChunks: (provider: string) => (provider === 'loomy'
         ? [{ type: 'usage' }, { type: 'finish', reason: { kind: 'max-tokens' } }]
         : [{ type: 'finish', reason: { kind: 'stop' } }]),
     })
 
-    // 先走一次真实请求：既把 `buddy/m1` 写进选型缓存，又把它推进冷却。
+    // 先走一次真实请求：既把 `loomy/m1` 写进选型缓存，又把它推进冷却。
     const call = await adapter.prepareCall(AUTO_PROVIDER, AUTO_MODEL)
     for await (const _ of call.stream({ messages: [userMessage()] } as never)) { /* drain */ }
-    expect(sent, '前置：撞墙后应改道到 zcode').toEqual(['buddy/m1', 'zcode/g1'])
+    expect(sent, '前置：撞墙后应改道到 zcode').toEqual(['loomy/m1', 'zcode/g1'])
 
     // 时钟未动 ⇒ 缓存**仍在 TTL 窗口内**，唯一能让它失效的理由就是冷却。
     const info = await adapter.resolveModel()

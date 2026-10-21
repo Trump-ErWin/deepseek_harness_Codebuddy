@@ -2,7 +2,7 @@
  * MiniMax Code（中国版 `minimax` / 国际版 `minimaxintl`）的
  * 「永久/长期/临期三档分档 + 锁定永久积分」**接线**回归。
  *
- * ## 为什么单独守这个（而不是复用 `buddy-permanent-lock.spec.ts` / `astudio-lock-wiring.spec.ts`）
+ * ## 为什么单独守这个（而不是复用 `lobsterai-permanent-lock.spec.ts` / `astudio-lock-wiring.spec.ts`）
  *
  * 那两份守的是「怎么建选号器」与「AStudio 那一条执行路径」。MiniMax 的缺陷是
  * **第三种形态**（2026-10-20 用户报障：「MiniMax Code积分也有到期时间，也应当有
@@ -26,7 +26,7 @@
  * 2. **registry 契约**：两站都 `permanentLock === true` 且 `usesExpiryWindow === true`。
  * 3. **分档行为**：把**真实上游报文形状**（`details[]` 每条带 `expire_at_ms`
  *    毫秒时间戳）喂给生产解析器 `fetchMinimaxCreditBalance`，再用
- *    `splitBuddyCreditsByExpiry` / `buddyBalanceTier` 验证「锁定后只剩长期积分
+ *    `splitCreditsByExpiry` / `balanceTier` 验证「锁定后只剩长期积分
  *    ⇒ 该号不可用」。这一层驱动生产判据，不是复述实现。
  *
  * ⚠️ **不做**的事：不发真实网络（`fetcher` 全部注入假实现）、不读真实凭据。
@@ -39,12 +39,12 @@ import { PROVIDER_REGISTRY, descriptorOf } from '../../src/provider-registry.js'
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
 import { fetchMinimaxCreditBalance } from '../../src/minimax-credits.js'
 import {
-  BUDDY_BALANCE_TIER,
-  BUDDY_EXPIRING_WINDOW_DAYS,
-  buddyBalanceTier,
-  buddyTierUsable,
-  splitBuddyCreditsByExpiry,
-} from '../../src/buddy-balance-rank.js'
+  BALANCE_TIER,
+  EXPIRING_WINDOW_DAYS,
+  balanceTier,
+  tierUsable,
+  splitBalanceByExpiry as splitCreditsByExpiry,
+} from '../../src/balance-rank.js'
 import { MINIMAX, MINIMAX_INTL } from '../../src/minimax-product.js'
 import type { MinimaxCredential } from '../../src/minimax.js'
 
@@ -56,7 +56,7 @@ const indexSource = readFileSync(resolve(here, '../../src/index.ts'), 'utf8').re
  *
  * ⚠️ 接线断言不能因为「注释里提到了某个符号」就通过：本仓库注释大量解释
  * 「为什么不能走某条兜底」，对兜底的**否定**断言必须只看代码（与
- * `buddy-permanent-lock.spec.ts` 的 `codeOnly` 同一约定）。
+ * `lobsterai-permanent-lock.spec.ts` 的 `codeOnly` 同一约定）。
  */
 function codeOnly(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
@@ -129,10 +129,10 @@ describe('★ MiniMax：`permanentLock` / `usesExpiryWindow` 的 registry 契约
 describe('★ MiniMax：`index.ts` 的接线（源码级，守纯文本形态的约定）', () => {
   it('两站各建一个选号器，且各自接到工厂的 balance.selector', () => {
     expect(indexCode).toMatch(
-      /const minimaxBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: MINIMAX,/,
+      /const minimaxBalanceSelector = new BalanceSelector\(\{\s*\n\s*product: MINIMAX,/,
     )
     expect(indexCode).toMatch(
-      /const minimaxIntlBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: MINIMAX_INTL,/,
+      /const minimaxIntlBalanceSelector = new BalanceSelector\(\{\s*\n\s*product: MINIMAX_INTL,/,
     )
     // 建了不用 = 死代码，锁定仍无执行路径。
     expect(indexCode, '中国版的 balance.selector 必须指向 minimaxBalanceSelector')
@@ -179,7 +179,7 @@ describe('★ MiniMax：`index.ts` 的接线（源码级，守纯文本形态的
   /**
    * ⚠️ 两站都必须 `reportPickedAccount: true`（账本归属不能因新增 balance 而丢）。
    *
-   * ⚠️ 这是**真实踩点**：buddy 系那两处写的是 `false`（旧闭包的历史不对称），
+   * ⚠️ 这是**真实踩点**：lobsterai 系那两处写的是 `false`（旧闭包的历史不对称），
    *    而 MiniMax 的旧闭包是**纯池选号**、账本**一直在回报**。照抄 `false` 会让
    *    「分档选中」那一支不再回报 ⇒ token 用量记不到这个渠道上（静默）。
    *
@@ -227,19 +227,19 @@ describe('★ MiniMax：`index.ts` 的接线（源码级，守纯文本形态的
   it('★ 国际站选号器必须透传 XFF（不做 ⇒ 聚合候选被静默剔除）', () => {
     // `agent.minimax.io` 按出口 IP 把大陆来源 307 到中国站，而中国站不认国际站
     // token ⇒ 折算恒失败。`pool.minimaxXff()` **每次现读**，不固化成字符串。
-    const start = indexCode.indexOf('const minimaxIntlBalanceSelector = new BuddyBalanceSelector({')
+    const start = indexCode.indexOf('const minimaxIntlBalanceSelector = new BalanceSelector({')
     expect(start, 'index.ts 里找不到国际站选号器').toBeGreaterThan(-1)
     const block = indexCode.slice(start, indexCode.indexOf('})', start))
     expect(block, '国际站选号器必须传 pool.minimaxXff()').toMatch(/pool\.minimaxXff\(\)/)
     // 中国版**不得**传 xff（它的主机本就在境内，多传一个头会被上游判签名不符）。
-    const cnStart = indexCode.indexOf('const minimaxBalanceSelector = new BuddyBalanceSelector({')
+    const cnStart = indexCode.indexOf('const minimaxBalanceSelector = new BalanceSelector({')
     const cnBlock = indexCode.slice(cnStart, indexCode.indexOf('})', cnStart))
     expect(cnBlock, '中国版不得传 xff').not.toMatch(/minimaxXff/)
   })
 
-  it('★ 锁定文案与 buddy 系分开（MiniMax 没有「资源包」这个概念）', () => {
-    // buddy 系口径是「服务端资源包 N 天内到期」，MiniMax 是「每日签到 / 活动发放、
-    // 每条明细自带 30 天有效期」—— 按 buddy 那句去排查会找不到那个「资源包」。
+  it('★ 锁定文案与 lobsterai 系分开（MiniMax 没有「资源包」这个概念）', () => {
+    // lobsterai 系口径是「服务端资源包 N 天内到期」，MiniMax 是「每日签到 / 活动发放、
+    // 每条明细自带 30 天有效期」—— 按 lobsterai 那句去排查会找不到那个「资源包」。
     expect(indexCode, 'minimax 必须有独立的 lockedError 文案构造器')
       .toContain('const minimaxLockedError =')
     const start = indexCode.indexOf('const minimaxLockedError =')
@@ -258,7 +258,7 @@ describe('★ MiniMax：`index.ts` 的接线（源码级，守纯文本形态的
   /**
    * ★★ **`fetchBalance` 闭包内必须透传 `product` 形参**（2026-10-21 审计发现：零覆盖）。
    *
-   * `BuddyBalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
+   * `BalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
    * ⇒ 闭包里若忽略形参、写死站点常量，请求会打到**对方站点**：
    * ```
    * 正常          → 用 deps.product      ✓
@@ -275,7 +275,7 @@ describe('★ MiniMax：`index.ts` 的接线（源码级，守纯文本形态的
       ['minimaxIntlBalanceSelector', 'MINIMAX,'],
     ] as const
     for (const [name, other] of cases) {
-      const start = indexCode.indexOf(`const ${name} = new BuddyBalanceSelector({`)
+      const start = indexCode.indexOf(`const ${name} = new BalanceSelector({`)
       expect(start, `找不到 ${name}`).toBeGreaterThan(-1)
       // ⚠️ 终点不能取 `\n  })`：minimax 的`fetchBalance` 闭包体里就有同样缩进的
       //    `})` 收尾（多行箭头函数），会提前截断 ⇒ 实测 `fetchBalance` 都取不到。
@@ -327,39 +327,39 @@ describe('★★ MiniMax：分档行为（驱动生产判据，不是复述实�
   it('★ 锁定后只剩长期积分（30 天 > 15 天窗口）⇒ 该号不可用（tier = none）', async () => {
     const balance = await balanceExpiringIn(30)
     const now = Date.now()
-    const windowMs = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
-    const split = splitBuddyCreditsByExpiry(balance, now, windowMs)
+    const windowMs = EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    const split = splitCreditsByExpiry(balance, now, windowMs)
     expect(split, '应能分桶').toBeDefined()
     // 30 天 > 15 天窗口 ⇒ 落永久桶（不是临期）。
     expect(split!.expiring, '30 天到期不该落临期桶').toBe(0)
     expect(split!.permanent).toBeGreaterThan(0)
 
-    // ⚠️ `buddyBalanceTier` 吃的**不是** `CreditBalance`，而是分桶后的账号摘要
+    // ⚠️ `balanceTier` 吃的**不是** `CreditBalance`，而是分桶后的账号摘要
     //    `{ expiringBalance, permanentBalance }` —— 生产链是
-    //    `BuddyBalanceSelector.classify()`。直接传 `balance` 会因字段名对不上
+    //    `BalanceSelector.classify()`。直接传 `balance` 会因字段名对不上
     //    而恒得 `none`（写 astudio 那份用例时实测踩到）。
     const entry = { id: 'a', expiringBalance: split!.expiring, permanentBalance: split!.permanent }
     // 未锁定：长期额度可用。
-    expect(buddyBalanceTier(entry, { allowPermanent: true, windowMs }))
-      .toBe(BUDDY_BALANCE_TIER.permanent)
+    expect(balanceTier(entry, { allowPermanent: true, windowMs }))
+      .toBe(BALANCE_TIER.permanent)
     // ★ 锁定：只剩长期 ⇒ 明确不可用。这就是「锁定真的会拦」的那一步。
     expect(
-      buddyBalanceTier(entry, { allowPermanent: false, windowMs }),
+      balanceTier(entry, { allowPermanent: false, windowMs }),
       '锁定后只剩永久积分 ⇒ 必须落 none（否则锁定形同虚设）',
-    ).toBe(BUDDY_BALANCE_TIER.none)
-    expect(buddyTierUsable(buddyBalanceTier(entry, { allowPermanent: false, windowMs }))).toBe(false)
+    ).toBe(BALANCE_TIER.none)
+    expect(tierUsable(balanceTier(entry, { allowPermanent: false, windowMs }))).toBe(false)
   })
 
   it('★ 有临期积分时锁定仍可用（锁定只挡永久桶，不挡临期桶）', async () => {
     const balance = await balanceExpiringIn(10)
     const now = Date.now()
-    const windowMs = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
-    const split = splitBuddyCreditsByExpiry(balance, now, windowMs)
+    const windowMs = EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    const split = splitCreditsByExpiry(balance, now, windowMs)
     expect(split!.expiring, '10 天到期应落临期桶').toBeGreaterThan(0)
     const entry = { id: 'a', expiringBalance: split!.expiring, permanentBalance: split!.permanent }
-    expect(buddyBalanceTier(entry, { allowPermanent: false, windowMs }))
-      .toBe(BUDDY_BALANCE_TIER.expiring)
-    expect(buddyTierUsable(buddyBalanceTier(entry, { allowPermanent: false, windowMs }))).toBe(true)
+    expect(balanceTier(entry, { allowPermanent: false, windowMs }))
+      .toBe(BALANCE_TIER.expiring)
+    expect(tierUsable(balanceTier(entry, { allowPermanent: false, windowMs }))).toBe(true)
   })
 
   it('★ 混合桶（一临期 + 一长期）锁定后仍可用（临期桶非空即放行）', async () => {
@@ -368,26 +368,26 @@ describe('★★ MiniMax：分档行为（驱动生产判据，不是复述实�
       json(detailsPayload([now + 5 * 86400_000, now + 60 * 86400_000])),
     )
     const balance = await fetchMinimaxCreditBalance(CRED, fetcher as never)
-    const windowMs = BUDDY_EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
-    const split = splitBuddyCreditsByExpiry(balance!, now, windowMs)
+    const windowMs = EXPIRING_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    const split = splitCreditsByExpiry(balance!, now, windowMs)
     const entry = { id: 'a', expiringBalance: split!.expiring, permanentBalance: split!.permanent }
     // 5 天 ⇒ 临期；60 天 ⇒ 永久。锁定只挡永久桶 ⇒ 仍可用。
     expect(split!.expiring).toBeGreaterThan(0)
     expect(split!.permanent).toBeGreaterThan(0)
-    expect(buddyBalanceTier(entry, { allowPermanent: false, windowMs }))
-      .toBe(BUDDY_BALANCE_TIER.expiring)
+    expect(balanceTier(entry, { allowPermanent: false, windowMs }))
+      .toBe(BALANCE_TIER.expiring)
   })
 
   it('★ 窗口天数与前端/后端同源（15 天）', () => {
     // 数字写岔会让用户看到「提示说只烧 8 天内的，实际按 15 天筛号」。
-    // 两站的选号器与 buddy 系共用 `BuddyBalanceSelector`，故窗口也共用一份判据
-    //（`buddy-balance-rank.ts` 是唯一真源）。
-    expect(BUDDY_EXPIRING_WINDOW_DAYS).toBe(15)
+    // 两站的选号器与 lobsterai 系共用 `BalanceSelector`，故窗口也共用一份判据
+    //（`balance-rank.ts` 是唯一真源）。
+    expect(EXPIRING_WINDOW_DAYS).toBe(15)
   })
 
-  it('端点常量指向两家自己的主机（不是 buddy 系、两站也不同）', () => {
-    // ⚠️ `BuddyBalanceSelector` 的 `fetchSource` 里有一条防御：
-    //    「非 buddy 系必须注入 `fetchBalance`」（否则会用 product.endpoint 拼出
+  it('端点常量指向两家自己的主机（不是 lobsterai 系、两站也不同）', () => {
+    // ⚠️ `BalanceSelector` 的 `fetchSource` 里有一条防御：
+    //    「非 lobsterai 系必须注入 `fetchBalance`」（否则会用 product.endpoint 拼出
     //    错误的余额 URL）。本家已注入，故这条只钉住 product 常量本身。
     expect(MINIMAX.apiHost).toContain('minimax.cn')
     expect(MINIMAX_INTL.apiHost).toContain('minimax.io')

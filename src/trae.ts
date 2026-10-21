@@ -36,7 +36,7 @@
 
 import { createHash } from 'node:crypto'
 import type { TokenUsage } from '@deepseek-ai/dsh-llm'
-import { jwtExpiresAtMs } from './buddy.js'
+import { jwtExpiresAtMs } from './jwt-utils.js'
 import { TRAE_CHANNELS, type TraeProduct } from './trae-product.js'
 
 // ── 端点路径 ──
@@ -92,7 +92,7 @@ export const TRAE_LOGIN_TIMEOUT_MS = 10 * 60 * 1000
  * 持久化的 TRAE 凭据。
  *
  * 与 `TraeCredential` 的字段名与 Go 端 `auth.Auth` 结构对齐，
- * 但这里用 `snake_case` 保持与 `BuddyCredential` / `LobsteraiCredential` 一致。
+ * 但这里用 `snake_case` 保持与 `ChannelCredential` / `LobsteraiCredential` 一致。
  *
  * ## 关键持久化字段
  *
@@ -111,7 +111,7 @@ export interface TraeCredential {
   /**
    * 过期时间（**毫秒时间戳字符串**）。
    *
-   * 统一存毫秒字符串而非秒/ISO：与 `BuddyCredential.expires_at` 的存储约定
+   * 统一存毫秒字符串而非秒/ISO：与 `ChannelCredential.expires_at` 的存储约定
    * 保持一致，`credentialExpiresAtMs` 一套解析逻辑可通用于两者。
    * Go 端存储的是 Unix 秒（`int64`），这里转换时需 `expiresAt * 1000`。
    */

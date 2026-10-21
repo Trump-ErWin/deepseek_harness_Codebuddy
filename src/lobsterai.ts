@@ -23,7 +23,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { jwtExpiresAtMs } from './buddy.js'
+import { jwtExpiresAtMs } from './jwt-utils.js'
 import type { LobsteraiProduct } from './lobsterai-product.js'
 
 // ── 端点路径 ──
@@ -81,12 +81,12 @@ export const LOBSTERAI_MAX_NUMERIC_FIELD = 1e15
 /**
  * 持久化的 LobsterAI 凭据。
  *
- * 字段名刻意保持 `snake_case`，与 `BuddyCredential` 一致 ——
+ * 字段名刻意保持 `snake_case`，与 `ChannelCredential` 一致 ——
  * `AccountPool.findAccountIdByCredential`（`src/account-pool.ts`）
  * 对非 codearts 的 provider 统一取 `access_token` 作身份标识，
  * 命名一致才能直接复用，无需改那个函数。
  *
- * ## 与 `BuddyCredential` 的关键结构差异
+ * ## 与 `ChannelCredential` 的关键结构差异
  *
  * LobsterAI 的 **refresh 请求体不是只带 refreshToken**，还要带
  * `firstKeyfrom` / `latestKeyfrom` / `uuid`（`auth.go:37-50` +
@@ -106,7 +106,7 @@ export interface LobsteraiCredential {
   /**
    * 过期时间（**毫秒时间戳字符串**）。
    *
-   * 统一存毫秒字符串而非秒/ISO：与 `BuddyCredential.expires_at` 的存储约定
+   * 统一存毫秒字符串而非秒/ISO：与 `ChannelCredential.expires_at` 的存储约定
    * 保持一致，`credentialExpiresAtMs` 一套解析逻辑可通用于两者。
    */
   expires_at?: string

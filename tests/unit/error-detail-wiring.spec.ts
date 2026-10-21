@@ -73,7 +73,7 @@ describe('★ errorDetail 的 detail 腿必须逐处接线（Issue IKLBSH A1 审
     return bodies
   }
 
-  it('★ src/ 下恰好有 6 份 errorDetail（新增一份会红，提醒同步接线）', async () => {
+  it('★ src/ 下恰好有 5 份 errorDetail（新增一份会红，提醒同步接线）', async () => {
     const fs = await import('node:fs/promises')
     const files = (await fs.readdir(SRC_DIR, { recursive: true }))
       .filter((f) => typeof f === 'string' && f.endsWith('.ts'))
@@ -89,7 +89,7 @@ describe('★ errorDetail 的 detail 腿必须逐处接线（Issue IKLBSH A1 审
     }
     // ⚠️ 计数是**刻意的**：本仓库 6 份同义实现是「同一语义多套判据」的既成事实，
     // 数量变化意味着又有人复制第七份（或删了一份）—— 两者都要人来看一眼。
-    expect(total, `实际分布：${where.join(', ')}`).toBe(6)
+    expect(total, `实际分布：${where.join(', ')}`).toBe(5)
   })
 
   it('★★ 每一份 errorDetail 都必须接 detailFieldText（漏一处即红）', async () => {
@@ -105,7 +105,7 @@ describe('★ errorDetail 的 detail 腿必须逐处接线（Issue IKLBSH A1 审
         if (!body.includes('detailFieldText(')) missing.push(file)
       }
     }
-    expect(checked, '应恰好检查 6 份（与上一条同源）').toBe(6)
+    expect(checked, '应恰好检查 5 份（与上一条同源）').toBe(5)
     // ⚠️ 这条断言是本次审计的**核心产出**：改坏任何一处接线都会红。
     expect(missing, '这些 errorDetail 没接 detailFieldText（A1 的 detail 腿漏了）').toEqual([])
   })
@@ -124,8 +124,8 @@ describe('★ errorDetail 的 detail 腿必须逐处接线（Issue IKLBSH A1 审
     // ⚠️ 「一文件两套同义判据」是本仓库首条红线：这条腿**只留一份实现**，
     // 其余 5 份必须 import 它。各写一份会在上游改报文形态时分别漂移。
     expect(definers, 'detailFieldText 的实现只允许有一份').toEqual(['openai-compat.ts'])
-    // 5 份 import 它（6 份 errorDetail 减去 openai-compat 自己那份）。
-    expect(callers.length).toBe(5)
+    // 4 份 import 它（5 份 errorDetail 减去 openai-compat 自己那份）。
+    expect(callers.length).toBe(4)
   })
 
   /**
