@@ -192,6 +192,9 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
         pkg({ remaining: 25000, total: 25000, deductionEndTime: undefined, expiringRemaining: 2000 }),
       ], WINDOW_DAYS, NOW)).toEqual({
         expiring: 2000, longTerm: 0, permanent: 23000, earliestExpiringAt: null, earliestExpiringAmount: 0,
+        // ⚠️ PR !134 合并时补：该字段是「独立池」摘出量（PR !134 新增）。
+        //    本仓的 `toEqual` 是**全等**断言 ⇒ 少一个字段就会红。
+        exclusivePoolRemaining: 0,
       })
     })
 
@@ -211,6 +214,7 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
         pkg({ remaining: 100, deductionEndTime: undefined, expiringRemaining: 999 }),
       ], WINDOW_DAYS, NOW)).toEqual({
         expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0,
+        exclusivePoolRemaining: 0,
       })
     })
 
@@ -219,6 +223,7 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
         pkg({ remaining: 100, deductionEndTime: NOW + 60 * DAY, expiringRemaining: 50 }),
       ], WINDOW_DAYS, NOW)).toEqual({
         expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0,
+        exclusivePoolRemaining: 0,
       })
     })
   })
