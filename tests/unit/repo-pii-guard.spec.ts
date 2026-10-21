@@ -53,6 +53,28 @@ function trackedTextFiles(): Array<{ path: string; text: string }> {
   return out
 }
 
+/**
+ * ⚠️⚠️ **真实凭据与私钥**绝不入库（2026-10-21 审计新增）。
+ *
+ * ## 为什么现有两条判据不够
+ *
+ * 现有守卫只拦「完整 11 位手机号」与「邮箱」。审计（用真实凭据反查 + 形态
+ * 扫描）确认这两类**没有漏**，但下面三类**确实漏了**：
+ *
+ * | 形态 | 判据 | 为什么危险 |
+ * |---|---|---|
+ * | **PEM 私钥块** | `-----BEGIN … PRIVATE KEY-----` | 一旦贴进来就是**可直接使用的私钥** |
+ * | **`sk-` 风格密钥** | `sk-` + 16 位以上 | OpenAI 风格密钥的常见形态 |
+ * | **JWT** | `eyJ` 头的三段式 | access/refresh token 的常见形态 |
+ *
+ * ⚠️ 这三条**只拦形态**、不判断有效性 ⇒ 零误报风险。
+ * ⚠️ 手机号形态的**掩码残留**（`用户` + uid 片段）**刻意不拦** ——
+ * 用户已确认它属于「可公开的实测记录」范围（2026-10-21 用户裁定）。
+ */
+const PEM_PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g
+const SK_STYLE_KEY = /\bsk-[A-Za-z0-9_-]{16,}/g
+const JWT_TOKEN = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}/g
+
 /** 构造示例号码白名单（见文件头）。 */
 const CONSTRUCTOR_SAMPLES: ReadonlySet<string> = new Set([
   '13011111100',
@@ -110,5 +132,49 @@ describe('仓库内不得残留真实个人敏感信息', () => {
     expect('yinghaolin521@gmail.com'.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/)).not.toBeNull()
     // ⚠️ 豁免清单本身也要被验证，否则白名单可能悄悄放过真号码。
     expect(CONSTRUCTOR_SAMPLES.has('13011111100')).toBe(true)
+  })
+
+  /** PEM 私钥块绝不入库。 */
+  it('入库文件里没有 PEM 私钥', () => {
+    const hits: string[] = []
+    for (const { path, text } of FILES) {
+      for (const m of text.matchAll(PEM_PRIVATE_KEY)) {
+        hits.push(`${path}: ${m[0]}（第 ${text.slice(0, m.index).split('\n').length} 行）`)
+      }
+    }
+    expect(hits, '发现 PEM 私钥 ⇒ 立刻移除并轮换该密钥').toEqual([])
+  })
+
+  /** `sk-` 风格密钥绝不入库。 */
+  it('入库文件里没有 sk- 风格密钥', () => {
+    const hits: string[] = []
+    for (const { path, text } of FILES) {
+      for (const m of text.matchAll(SK_STYLE_KEY)) {
+        hits.push(`${path}: ${m[0].slice(0, 6)}…（第 ${text.slice(0, m.index).split('\n').length} 行）`)
+      }
+    }
+    expect(hits, '发现 sk- 风格密钥 ⇒ 立刻移除并轮换该密钥').toEqual([])
+  })
+
+  /** JWT 形态的令牌绝不入库。 */
+  it('入库文件里没有 JWT 形态的令牌', () => {
+    const hits: string[] = []
+    for (const { path, text } of FILES) {
+      for (const m of text.matchAll(JWT_TOKEN)) {
+        hits.push(`${path}: ${m[0].slice(0, 12)}…（第 ${text.slice(0, m.index).split('\n').length} 行）`)
+      }
+    }
+    expect(hits, '发现 JWT 形态令牌 ⇒ 立刻移除并轮换该令牌').toEqual([])
+  })
+
+  /**
+   * ⚠️ **新增的三条判据本身必须有效**（否则就是同义反复）。
+   *
+   * 审计里已登记过同型教训：判据写错时，会「因为扫不到东西」而恒绿。
+   */
+  it('新增的三条判据在未脱敏前确实能命中', () => {
+    expect('-----BEGIN RSA PRIVATE KEY-----'.match(PEM_PRIVATE_KEY)).not.toBeNull()
+    expect('sk-abcdefghijklmnopqrstuvwx'.match(SK_STYLE_KEY)).not.toBeNull()
+    expect('eyJhbGciOiJSUzI1NiIs.eyJzdWIiOiIxIn0.abcdef'.match(JWT_TOKEN)).not.toBeNull()
   })
 })
