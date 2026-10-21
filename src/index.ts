@@ -50,7 +50,7 @@ import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 import { BuddyBalanceSelector } from './buddy-balance-selector.js'
 import type { BuddyNoAccountReason } from './buddy-balance-selector.js'
 import type { LoomyNoAccountReason } from './loomy-balance-selector.js'
-import { createCredentialResolver } from './credential-resolver.js'
+import { createCredentialResolver, NO_FREE_MODEL } from './credential-resolver.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
@@ -2040,8 +2040,12 @@ export function apply(ctx: Context): void {
           kind: 'buddy',
           selector: lobsteraiBalanceSelector,
           lockedError: buddyLockedError('LobsterAI'),
-          // ⚠️ LobsterAI **没有** `isFreeModel`（只有 buddy / trae 的适配器有）：
-          // 它的模型表不带倍率字段，判不出「免费」—— 缺省即「从不跳过锁定」。
+          // ⚠️ LobsterAI 的「免费」是**钱包**概念不是**模型**概念，没有模型级免费：
+          //   `lobsterai-credits.ts:340` 的 `/api/user/quota` 只给
+          //   `freeCreditsTotal=300`（免费**积分额度**），`lobsterai-errors.ts`
+          //   里的 `freecreditsused` 是**错误码**。模型表本身不带倍率字段
+          //   ⇒ 判不出、也不该判（见 `NO_FREE_MODEL` 的说明）。
+          isFreeModel: NO_FREE_MODEL,
         },
         fallback: { kind: 'ref', refName: LOBSTERAI.defaultCredentialRef },
         // 退到单凭据 ref 之前先证明失败原因（见 `throwIfAllAccountsRateLimited`
@@ -2848,6 +2852,8 @@ export function apply(ctx: Context): void {
           kind: 'buddy',
           selector: minimaxBalanceSelector,
           lockedError: minimaxLockedError('MiniMax Code (中国版)'),
+          // ⚠️ 本家没有模型级免费概念（产品表零 `isFree` 字段，上游目录也不返回）。
+          isFreeModel: NO_FREE_MODEL,
           /**
            * ⚠️⚠️ **刻意不写 `reportPickedAccount: false`**（与 buddy 系那两处**相反**）。
            *
@@ -2947,6 +2953,8 @@ export function apply(ctx: Context): void {
           kind: 'buddy',
           selector: minimaxIntlBalanceSelector,
           lockedError: minimaxLockedError('MiniMax Code (国际版)'),
+          // ⚠️ 本家没有模型级免费概念（产品表零 `isFree` 字段，上游目录也不返回）。
+          isFreeModel: NO_FREE_MODEL,
           // ⚠️ 与中国版**同因**：本家旧闭包是纯池选号、账本一直在回报 ⇒
           //    必须 `true`，写 `false` 会让 token 用量记不到国际站上（见中国版处说明）。
           reportPickedAccount: true,
@@ -3199,6 +3207,11 @@ export function apply(ctx: Context): void {
           selector: autoclawBalanceSelector,
           // ⚠️ 本家独有文案（池名是「钱包流水批次」而不是 buddy 的「资源包」）。
           lockedError: autoclawLockedError('AutoClaw'),
+          // ⚠️⚠️ 本家**曾**标过 `isFree: true`，那是**错的**（2026-10-21 二轮审计订正）：
+          //   初版把「远端目录里没有它、但直接调用能用」误当成「不扣费」，而真机
+          //   实测它**每次都扣积分**（`docs/autoclaw-models.md:25`）。现有 4 个模型
+          //   全是 `isFree: false` ⇒ 本家确实没有模型级免费，显式表态即可。
+          isFreeModel: NO_FREE_MODEL,
           reportPickedAccount: true,
         },
         // ⚠️ **必须接**（与 accio 同因）：本工厂的兜底是**固定 ref**
@@ -3270,6 +3283,8 @@ export function apply(ctx: Context): void {
           kind: 'buddy',
           selector: autoclawIntlBalanceSelector,
           lockedError: autoclawLockedError('AutoClaw (国际版)'),
+          // ⚠️ 同国内版：本家无模型级免费（`isFree` 全为 false，见那处说明）。
+          isFreeModel: NO_FREE_MODEL,
           reportPickedAccount: true,
         },
         throwIfAllRateLimited: throwIfAllAccountsRateLimited,
@@ -3440,9 +3455,10 @@ export function apply(ctx: Context): void {
       balance: {
         kind: 'buddy',
         selector: astudioBalanceSelector,
-        // ⚠️ 本家**没有**免费模型概念（`AstudioAdapter` 不实现 `isFreeModel`），
-        //    故不传该字段 —— 缺省 `undefined` 会让 `createCredentialResolver`
-        //    走「免费模型短路」之外的常规分档路径（正确行为）。
+        // ⚠️ 本家**没有**免费模型概念（`AstudioAdapter` 只在 `listAllModels`
+        //    的返回类型里声明了 `isFree?`，兜底表零个 `isFree: true`，
+        //    上游目录也不返回该字段）⇒ 显式表态，不要删字段（见 `NO_FREE_MODEL`）。
+        isFreeModel: NO_FREE_MODEL,
         lockedError: astudioLockedError('AStudio'),
         // ⚠️⚠️ **必须是 `true`**（2026-10-21 合并审计发现：PR !119 原写的 `false`
         //    让上面 `reportAccount` 成了**不可达的死接线**）。
