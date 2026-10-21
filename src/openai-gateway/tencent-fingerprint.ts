@@ -252,7 +252,7 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
     // "inherits the base system prompt, including the ... identity"）。
     //
     // ⚠️⚠️ 本条的匹配语义是**行首锚定**（与 Claude Code 身份句同族，与另两条相反）：
-    // 本机 2026-10-20 对 `copilot.tencent.com` + 账号 15338123620 逐格实测——
+    // 本机 2026-10-20 对 `copilot.tencent.com` + 账号 A 逐格实测——
     //
     //   | 形态 | 结果 |
     //   |---|---|
