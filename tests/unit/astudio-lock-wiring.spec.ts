@@ -62,6 +62,26 @@ function codeOnly(source: string): string {
 }
 const indexCode = codeOnly(indexSource)
 
+/**
+ * astudio 那段 `createCredentialResolver` 调用（**已剥注释**），供源码级断言使用。
+ *
+ * ⚠️⚠️ **切片终点不能用 `indexOf('\n  )')`**（2026-10-21 合并审计实测踩到）：
+ * 该调用的第一个参数块里就有 `reportAccount: (id) => {` 这类**带缩进大括号**
+ * 的箭头函数，`\n  )` 会在更早的位置命中 nowhere 而截断在函数体中间；即便
+ * 不命中，也会把 `balance:` 那一段整段切掉 ⇒ 所有针对它的断言变成**空字符串
+ * 匹配失败**（红因误导：看起来像接线错了，其实是切片错了）。
+ *
+ * ⇒ 终点取**下一段注册**（`const astudioAdapter = registerAstudioLlm(`）——
+ *    它与本段是同一作用域里紧邻的两段，不依赖括号嵌套。
+ */
+const planCode = (() => {
+  const start = indexCode.indexOf('const astudioCredentialPlan = createCredentialResolver<AstudioCredential>(')
+  expect(start, '找不到 astudio 的 createCredentialResolver 调用').toBeGreaterThan(-1)
+  const end = indexCode.indexOf('const astudioAdapter = registerAstudioLlm(', start)
+  expect(end, '找不到 astudio 的 registerAstudioLlm（切片终点）').toBeGreaterThan(start)
+  return indexCode.slice(start, end)
+})()
+
 /** 真实上游 `/points/balance` 的 `data`（2026-10-20 实测两账号，结构一致）。 */
 function balancePayload(activityExpire: string | null) {
   return {
@@ -126,16 +146,52 @@ describe('★ AStudio：`index.ts` 的接线（源码级，守纯文本形态的
     expect(indexCode).toMatch(
       /const astudioBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: ASTUDIO,/,
     )
-    // 选号器必须真的接到工厂里（建了不用 = 死代码，锁定仍无执行路径）。
+    expect(planCode, 'balance.selector 必须指向 astudioBalanceSelector')
+      .toMatch(/kind:\s*'buddy',\s*\n\s*selector:\s*astudioBalanceSelector,/)
+    expect(planCode, '必须传 lockedError（否则锁定时报通用错误）')
+      .toMatch(/lockedError:\s*astudioLockedError\('AStudio'\)/)
+    expect(planCode, '必须接限流判定（池被筛空时会误报「请先登录」）')
+      .toMatch(/throwIfAllRateLimited:\s*throwIfAllAccountsRateLimited/)
+  })
+
+  /**
+   * ★★ **`reportPickedAccount` 必须是 `true`**（2026-10-21 合并审计发现）。
+   *
+   * ## 缺陷
+   *
+   * PR !119 原先写的是 `reportPickedAccount: false`，理由「与 buddy 系一致：
+   * 本家旧闭包也没有回报」。那是**类比错误**：
+   * - buddy 系能写 `false`，是因为它们的**适配器自己回报**
+   *   （`buddy-adapter.ts` / `trae-adapter.ts` / `lobsterai-adapter.ts` 都调
+   *   `reportLedgerAccount`）；
+   * - **AStudio 适配器全文零回报**，且 master 上它压根没有 `reportAccount` 接线
+   *   ⇒「旧闭包也没有回报」描述的是**一个缺陷状态**，不是有意行为。
+   *
+   * ## 为什么那行是死代码（实测）
+   *
+   * `credential-resolver.ts` 三条回报点里，②被 `!== false` 拦住、③被 ② 的
+   * `return` 短路 ⇒ `false` 时**零回报** ⇒ `src/index.ts` 那行
+   * `reportAccount: (id) => reportLedgerAccount(ASTUDIO.id, id)` **永不执行**。
+   *
+   * 用 `lib/credential-resolver.js` 真跑（`getAvailableAccount` 设成「被调用就记
+   * 标记」）：`false → reports=[]`、`true → reports=["a1"]`，两者 `poolReached`
+   * 都是 `false`（证明池兜底那条无条件回报确实走不到）。
+   *
+   * ## 后果
+   *
+   * `token-ledger.ts` 拿不到 `accountId` ⇒ 整笔用量归到 `'-'`（未归属）桶 ⇒
+   * Jet Hub 的 AStudio 账号卡片看不到自己的 token 用量。**零报错、零日志**。
+   */
+  it('★★ `reportPickedAccount` 必须是 true（false 会让 reportAccount 成为死代码）', () => {
     const planStart = indexCode.indexOf('const astudioCredentialPlan = createCredentialResolver<AstudioCredential>(')
     expect(planStart, '找不到 astudio 的 createCredentialResolver 调用').toBeGreaterThan(-1)
     const plan = indexCode.slice(planStart, indexCode.indexOf('\n  )', planStart))
-    expect(plan, 'balance.selector 必须指向 astudioBalanceSelector')
-      .toMatch(/kind:\s*'buddy',\s*\n\s*selector:\s*astudioBalanceSelector,/)
-    expect(plan, '必须传 lockedError（否则锁定时报通用错误）')
-      .toMatch(/lockedError:\s*astudioLockedError\('AStudio'\)/)
-    expect(plan, '必须接限流判定（池被筛空时会误报「请先登录」）')
-      .toMatch(/throwIfAllRateLimited:\s*throwIfAllAccountsRateLimited/)
+    expect(
+      plan,
+      '★ astudio 必须 reportPickedAccount: true —— 它的适配器不自报账本，false 会让'
+      + ' reportAccount 成为不可达的死接线（token 用量全落「未归属」桶）',
+    ).toMatch(/reportPickedAccount:\s*true,/)
+    expect(plan, '不得残留 false（那是死接线的成因）').not.toMatch(/reportPickedAccount:\s*false,/)
   })
 
   it('`readCredential` 用本家解析器，且形状校验与 parseAstudioCredential 对齐', () => {
