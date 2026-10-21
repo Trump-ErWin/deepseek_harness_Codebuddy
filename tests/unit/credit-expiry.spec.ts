@@ -194,10 +194,21 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
     // ★ 数字必须只反映最早那批 —— 这才是「4 天 20 小时后会掉多少」
     expect(split?.earliestExpiringAmount, '★ 用总额会让「N 天后掉 X」读成全部同时到期')
       .toBe(19656)
-    // 渲染侧：临期文本取 earliestExpiringAmount
+    /**
+     * 渲染侧：**数字用总额（合计守恒），倒计时限定它只覆盖其中一批**。
+     *
+     * ⚠️ 这里曾断言 `text === '临期 19656'`（2026-10-20）。那个形态修了
+     *    「全部同时到期」的误读，却让三档**不再等于 `total`**
+     *    （22000 + 19656 ≠ 25500 那类算不平，用户 2026-10-21 报障）。
+     *    ⇒ 现形态：数字 20856（= 总额）+ 「其中 19656 于…后到期」。
+     */
     const parts = expirySplitParts(split, (v) => String(v), NOW)
     const expiringPart = parts.find((p) => p.key === 'expiring')
-    expect(expiringPart?.text).toBe('临期 19656')
+    expect(expiringPart?.text).toBe('临期 20856')
+    // 夹具里最早那批是 NOW + 5 DAY ⇒ 倒计时 5 天 0 小时（原文案里的
+    // 「4 天 20 小时」来自 autoclaw 真机数据，与本夹具的时刻无关）。
+    expect(expiringPart?.countdown, '倒计时必须限定它只覆盖最早那批')
+      .toBe('其中 19656 于 5 天 0 小时后到期')
   })
 
   it('★ 同一到期时刻的多个包 ⇒ earliestExpiringAmount 累加（同批）', () => {
@@ -539,6 +550,134 @@ describe('expirySplitParts（三档带色分段）', () => {
       .toEqual([{ key: 'expiring', text: '临期 50', tone: 'error' }])
     expect(expirySplitParts({ permanent: 0, longTerm: 0, expiring: 50, earliestExpiringAt: NOW_MS - DAY }, format, NOW_MS))
       .toEqual([{ key: 'expiring', text: '临期 50', tone: 'error' }])
+  })
+
+  /**
+   * ## ★★ 三档合计必须恒等于 `total`（2026-10-21 用户报障）
+   *
+   * 用户报障截图（CodeArts 账号卡片）原文：
+   * `积分 25500  永久 22000 · 临期 500（5 天 20 小时）`
+   * ⇒ `22000 + 500 = 22500 ≠ 25500`，**差的 3000 在任何地方都没出现**。
+   *
+   * 根因：本函数曾用 `earliestExpiringAmount`（只统计**带 `deductionEndTime`
+   * 的批次**）作为临期段数字，而 CodeArts 赠送包那 3000 只有
+   * `expiringRemaining` 标量、**没有日期** ⇒ 不进 Election ⇒ 不显示。
+   *
+   * ⚠️ 这个不变量**此前没有任何一条用例守卫** —— 分桶层有对账用例
+   * （`reduceFrontendToBackend`），但分桶正确就会被显示层改错，两层各自正确
+   * 不蕴含合起来正确。故这里直接在**渲染层**断言守恒。
+   */
+  describe('★★ 三档合计恒等于 total（可见数字不许凭空消失）', () => {
+    /** 从 `text`（形如 `永久 22000`）里取回数字。 */
+    const numberOf = (text: string) => Number(/(\d+)/.exec(text)?.[1] ?? 'NaN')
+
+    /** 真实数据：`CODEARTS_ACCOUNT_A3294816` 实测（2026-10-21）。 */
+    const codeArtsPackages = () => [
+      // 基础积分包：有确切到期时刻（套餐 10-27 结束）
+      pkg({ name: '基础积分包', remaining: 500, total: 500, deductionEndTime: NOW + 6 * DAY }),
+      // 赠送积分包：**无日期**，只有「其中 3000 即将到期」的标量
+      pkg({ name: '赠送积分包', remaining: 25000, total: 25000, deductionEndTime: undefined, expiringRemaining: 3000 }),
+    ]
+
+    it('★ 真实 CodeArts 数据：永久 + 临期 = total（3000 不许消失）', () => {
+      const split = splitCreditsByExpiry(codeArtsPackages(), WINDOW_DAYS, NOW)
+      expect(split).not.toBeNull()
+      // 分桶层本身是对的（这里先钉住前提）
+      expect(split!.expiring, '基础 500 + 赠送无日期 3000').toBe(3500)
+      expect(split!.permanent).toBe(22000)
+      expect(split!.expiring + split!.longTerm + split!.permanent, '分桶层守恒').toBe(25500)
+
+      const parts = expirySplitParts(split, format, NOW)
+      const visible = parts.reduce((acc, p) => acc + numberOf(p.text), 0)
+      // ★ 缺陷现场：修前这里是 22500（少了 3000）
+      expect(visible, '★ 卡片可见数字合计必须等于 total，否则用户一加就发现少了')
+        .toBe(25500)
+      expect(parts.find((p) => p.key === 'expiring')?.text).toBe('临期 3500')
+    })
+
+    it('★ 倒计时只覆盖其中一批时必须写明「其中 N」', () => {
+      const parts = expirySplitParts(
+        splitCreditsByExpiry(codeArtsPackages(), WINDOW_DAYS, NOW),
+        format,
+        NOW,
+      )
+      const expiring = parts.find((p) => p.key === 'expiring')
+      // 3500 里只有带日期的 500 能倒计时 ⇒ 必须限定，否则读成「3500 一起掉」
+      expect(expiring?.countdown).toBe('其中 500 于 6 天 0 小时后到期')
+    })
+
+    it('倒计时**正好覆盖全部临期**时不加「其中」（那两个字是废话）', () => {
+      const parts = expirySplitParts(
+        { permanent: 0, longTerm: 0, expiring: 500, earliestExpiringAt: NOW_MS + 3 * DAY, earliestExpiringAmount: 500 },
+        format,
+        NOW_MS,
+      )
+      expect(parts).toEqual([
+        { key: 'expiring', text: '临期 500', tone: 'error', countdown: '3 天 0 小时' },
+      ])
+    })
+
+    it('临期**全部无日期**（earliestExpiringAmount=0）时只给金额，不编造倒计时', () => {
+      const parts = expirySplitParts(
+        { permanent: 22000, longTerm: 0, expiring: 3000, earliestExpiringAt: null, earliestExpiringAmount: 0 },
+        format,
+        NOW_MS,
+      )
+      expect(parts).toEqual([
+        { key: 'permanent', text: '永久 22000', tone: 'ok' },
+        { key: 'expiring', text: '临期 3000', tone: 'error' },
+      ])
+    })
+
+    /**
+     * ⚠️ `format` 可能带千分位（CodeArts 用 `formatUnits` 就是这么渲染的）。
+     * 若拿**格式化后的字符串**做 `<` 比较，`"3,500"` 会隐式转成 `NaN`
+     * ⇒ `partial` 恒 false ⇒ 倒计时丢掉「其中 N」限定，静默退回误读形态。
+     */
+    it('format 带千分位时仍能正确判定「其中」（数值比较不许走字符串）', () => {
+      const parts = expirySplitParts(
+        { permanent: 22000, longTerm: 0, expiring: 3500, earliestExpiringAt: NOW_MS + 3 * DAY, earliestExpiringAmount: 500 },
+        (v) => v.toLocaleString('en-US'),
+        NOW_MS,
+      )
+      const expiring = parts.find((p) => p.key === 'expiring')
+      expect(expiring?.text, '数字仍带千分位').toBe('临期 3,500')
+      expect(expiring?.countdown, '★ 千分位不许把「其中」限定弄丢')
+        .toBe('其中 500 于 3 天 0 小时后到期')
+    })
+
+    /**
+     * ⚠️ **字符串版与分段版必须同口径**（都是窗口内总额）。
+     *
+     * 两者是同一个数的两种呈现：`formatExpirySplitLine` 出单行文本、
+     * `expirySplitParts` 出逐段带色。若只改其中一个，同一条数据在
+     * 「卡片单行」和「胶囊分段」两处会显示不同的临期数字 —— 用户对比
+     * 两个界面就会看到矛盾。
+     */
+    it('★ 字符串版与分段版的临期数字必须一致（同一数据的两种呈现）', () => {
+      const split = splitCreditsByExpiry(codeArtsPackages(), WINDOW_DAYS, NOW)!
+      expect(formatExpirySplitLine(split, format), '字符串版用窗口内总额').toBe('永久 22000 · 临期 3500')
+      expect(expirySplitParts(split, format, NOW).find((p) => p.key === 'expiring')?.text)
+        .toBe('临期 3500')
+    })
+
+    /**
+     * ⚠️ **倒计时时刻无效时绝不出「其中 …于 后到期」这种残句**。
+     *
+     * 正常分桶下 `earliestExpiringAmount > 0` 必然蕴含 `earliestExpiringAt`
+     * 有效，但本函数是对外公开的纯函数（`usage-badge` 等直接传对象）。
+     * 一旦调用方手搓 `split` 时两字段不同步，`countdown` 会是空串 ——
+     * 此时若仍走「其中」分支，文案就成了 `其中 500 于 后到期`。
+     */
+    it('★ earliestExpiringAt 无效但 earliestExpiringAmount>0 时不产生残句', () => {
+      const parts = expirySplitParts(
+        { permanent: 0, longTerm: 0, expiring: 3500, earliestExpiringAt: null, earliestExpiringAmount: 500 },
+        format,
+        NOW_MS,
+      )
+      // 无倒计时可给 ⇒ 只给金额，且**不许**留「其中 …于」的空壳
+      expect(parts).toEqual([{ key: 'expiring', text: '临期 3500', tone: 'error' }])
+    })
   })
 })
 
