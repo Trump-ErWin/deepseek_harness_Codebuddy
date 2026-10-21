@@ -110,6 +110,9 @@ describe('index.ts 的接线（源码级，仅守纯文本形态的约定）', (
     'MINIMAX', 'MINIMAX_INTL',
     // ⚠️ QODER / QODER_CN（PR131，2026-10-20）：两站各一个选号器。
     'QODER', 'QODER_CN',
+    // ⚠️ AUTOCLAW / AUTOCLAW_INTL（2026-10-21，用户要求「补锁定开关」）：
+    //    两站各一个（选择器内含按账号 id 的缓存，跨站共用会让一站读数污染另一站）。
+    'AUTOCLAW', 'AUTOCLAW_INTL',
   ] as const
   it('每个支持锁定的 provider 各建一个选号器', () => {
     const expected = [
@@ -126,6 +129,11 @@ describe('index.ts 的接线（源码级，仅守纯文本形态的约定）', (
       //    同样必须各建一个选号器（传错会让选号读到对方站点）。
       ['qoderBalanceSelector', 'QODER'],
       ['qoderCnBalanceSelector', 'QODER_CN'],
+      // ⚠️ AUTOCLAW / AUTOCLAW_INTL 2026-10-21 加入（用户要求「补锁定开关」）：
+      //    本家**确实有永久桶**（活动赠送的永久分不带 `deductionEndTime`）⇒ 需要
+      //    锁定能力。两站必须各建一个（传错 product 会让选号读到对方站点，余额恒 null）。
+      ['autoclawBalanceSelector', 'AUTOCLAW'],
+      ['autoclawIntlBalanceSelector', 'AUTOCLAW_INTL'],
     ] as const
     for (const [name, product] of expected) {
       // ⚠️ `new ` 前面要留出空格边界：`astudioBalanceSelector` 与

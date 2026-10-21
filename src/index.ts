@@ -87,6 +87,14 @@ import type { ClineCredential } from './cline.js'
 import type { LoomyCredential } from './loomy.js'
 // ⚠️ 2026-10-16：loomy 选号吃共享读数时需要 `CreditBalance` 形状（两池）。
 import type { CreditBalance } from './credits.js'
+// ⚠️ AutoClaw 两站（2026-10-21，用户要求「补锁定开关」）：`fetchAutoclawCreditBalance`
+//    是 `fetchAutoclawBalanceDetailed` 的薄封装（压平 `{balance, error?}` 成
+//    `CreditBalance | null`，因为 `BuddyBalanceSelector` 的 `fetchBalance` 契约
+//    只要余额、不要原因）。**不要**在选号路径上改调 Detailed —— 那会在选号路径上
+//    重写一套失败分类，与本文件「同义判据只留一处」的纪律冲突。
+//    ⚠️ 它的第二参是 `options?: AutoclawCreditsOptions`（`{ product, fetcher? }`），
+//    与 qoder 那份的 `(credential, product)` 位置顺序**不同**，别照抄。
+import { fetchAutoclawCreditBalance } from './autoclaw-credits.js'
 import type { RaccoonCredential } from './raccoon.js'
 import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
@@ -1657,6 +1665,151 @@ export function apply(ctx: Context): void {
     }
 
   /**
+   * AutoClaw（国内站 / 国际版）的「锁定永久积分 + 无可用账号」报错文案。
+   *
+   * ⚠️ **不是漏抽 `buddyLockedError`**，而是本家池名**必须**不同：
+   * buddy 系的「临期」指**服务端资源包**（`DeductionEndTime`），而 AutoClaw 的
+   * 批次来自**钱包流水**（`wallets` + `wallet_expires_at`），且**永久桶按描述分组**
+   * （`autoclaw-credits.ts` 的 `permanentByLabel`）—— 上游给什么描述就是什么包名。
+   * 照抄 buddy 那句会让用户去钱包里找一个叫「资源包」的东西，而
+   * AutoClaw 面板上根本没这个名字。
+   *
+   * ⚠️⚠️ **本函数文案不得点名具体池名**（2026-10-21 二轮审计，P1）：
+   * 初版写过「活动赠送」「注册奖励」，那两个名字**没有任何实测来源**（详见
+   * `exhausted` 档的注释）。仓库内实测到的真实包名是
+   * 「`AutoClaw 用户登录奖励积分，7天有效`」「`每日签到`」这类**上游原样字符串**，
+   * 编一个分组名会让用户照着去找、一无所获。
+   *
+   * ## 四档（与 buddy / minimax 同形，措辞按本家重写）
+   *
+   * `unknown` / `no-candidates` / `credential-only` / `exhausted` ——
+   * 四者的**必要性**见 `BuddyNoAccountReason` 的定义注释，不在本处重复。
+   *
+   * ## ⚠️ 与 minimax 的关键差别：**没有 XFF / 地理分流**
+   *
+   * AutoClaw 两站各有独立域名（国内 `autoglm-api`、国际 `autoglm-api.autoglm.ai`），
+   * **互不 307** ⇒ 本家文案**不得**照抄 minimax 那段「填 X-Forwarded-For」的指引
+   * （照抄会让用户去改一个**不生效**的设置）。这句已写进 `unknown` 档的反面：
+   * 只说「检查凭据」，不说 XFF。
+   *
+   * ## 错误码取 `QUOTA_EXCEEDED`
+   *
+   * 与 buddy / Loomy / minimax 一致：这确实是额度问题，且它**不在**宿主
+   * `DEFAULT_RETRYABLE_CODES` 里 ⇒ 不会被白重试（锁定是**确定性**结果）。
+   *
+   * ⚠️⚠️ **但 `unknown` 档存在一处全仓既有的自相矛盾**（2026-10-21 二轮审计指出，登记不修）：
+   *
+   * 该档文案写「**请重试**」，而错误码 `QUOTA_EXCEEDED` **不可重试** ⇒ 用户按文案
+   * 去重试，宿主不会自动重试、手动重试大概率仍是同一失败。
+   *
+   * 实测全仓口径（`grep` 六份 `lockedError` 的 `unknown` 档）：
+   *
+   * | 函数 | 码 | 可重试 | 文案 |
+   * |---|---|---|---|
+   * | `buddyLockedError` / `qoderLockedError` / `astudioLockedError` / `minimaxLockedError` / **`autoclawLockedError`** | `QUOTA_EXCEEDED` | ❌ | 「请重试」 |
+   * | `loomyLockedError` | **`TRANSPORT`** | ✅ | 「请稍后重试」 |
+   *
+   * ⇒ **五家一致、Loomy 独异**。这不是本次引入的回归（本函数只是跟随了多数派），
+   *   而是**既有的一致性缺口**。
+   *
+   * **为什么不修**：改错误码要碰红线 —— `AUTH` / `QUOTA` 类码在部分客户端会
+   * **连 message 一起吞掉**（IKLBSH 复发形态），`QUOTA_EXCEEDED` 是刻意选的
+   * （`QUOTA` 会被 harness 换成固定文案）。改文案（去掉「请重试」）又要同步五家
+   * + 相关断言，属独立任务。⇒ 登记，不捎带。
+   *
+   * ⚠️ 两站共用本函数，只换 `displayName`；`displayName` **必须**逐站区分
+   * （两站账号不互通，用户要知道去哪个面板解锁）。
+   *
+   * ## ⚠️ 位置约束（与 astudio 那处同理）
+   *
+   * 本函数放在 `loomyLockedError` **之前**是有意的：`loomy-balance-error-contract.spec.ts`
+   * 用「`const loomyLockedError` 到 `const buddy = new BuddyAuth`」切片来核对 Loomy 的
+   * 错误码（Loomy 用可重试的 `TRANSPORT`，本家必须用不可重试的 `QUOTA_EXCEEDED`）。
+   * 插进那个区间会让该用例把本家的码当成 Loomy 的核对而**必然变红**。
+   */
+  const autoclawLockedError = (displayName: string) =>
+    (reason: BuddyNoAccountReason): Error => {
+      const days = buddyExpiringWindowDays()
+      if (reason.kind === 'unknown') {
+        return new LlmError(
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
+          + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
+          + '的积分 —— 请重试。'
+          + `⚠️ 若持续失败，请在 Jet Hub 的 ${displayName} 面板检查凭据是否失效`
+          + '（AutoClaw 的 access_token 是**明文 JWT、寿命恒 24h**，过期后需要重新登录）。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'no-candidates') {
+        return new LlmError(
+          `${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
+          + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
+          + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
+          + '或改用其它 provider / 模型，或解锁永久积分后重试。',
+          'QUOTA_EXCEEDED',
+        )
+      }
+      if (reason.kind === 'credential-only') {
+        // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
+        //    撤回地消耗永久积分（流水里那些**不带到期时间**的发放批次），
+        //    而本情形的根因在凭据、与积分无关。
+        return new LlmError(
+          `${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
+          + '有可用积分的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
+          + '⚠️ 这与「积分用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地消耗它们）。'
+          + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据，必要时重新登录。`,
+          'QUOTA_EXCEEDED',
+        )
+      }
+      /**
+       * ⚠️⚠️ **穷尽性守卫**（与 buddy / Loomy / AStudio / MiniMax 四份同型）：
+       * 走到这里**只允许**是 `{ kind: 'exhausted' }`。把 `reason` 赋给单成员类型，
+       * 将来 `BuddyNoAccountReason` 加了新档位却忘写文案时，`tsc` 当场报
+       * `TS2322`，而不是静默落进「积分都已用尽」—— 那句会把用户推向
+       * **不可撤回**的解锁操作。
+       */
+      const exhaustedOnly: { kind: 'exhausted' } = reason
+      void exhaustedOnly
+      /**
+       * ⚠️⚠️ **本档文案已按「可核实的池名」重写**（2026-10-21 二轮审计，P1 文案失实）。
+       *
+       * ## 原文案错在哪
+       *
+       * 初版写「**永久桶**（**「活动赠送」「注册奖励」** 等不带到期时间的批次）」。
+       * 审计员逐层考古后确认：**这两个名字没有任何实测来源**，是编的。
+       *
+       * 事实链：
+       * - `parseAutoclawLedgerBatches` 的包名取 `metadata.description > description > source`，
+       *   即**上游给什么就是什么**，可能是任意字符串；
+       * - 仓库内**唯一**的实测包名样本是「`AutoClaw 用户登录奖励积分，7天有效`」
+       *   与「`每日签到`」（`tests/unit/autoclaw-credits.spec.ts` 的 fixture 注明为实测形状）；
+       * - 「活动赠送 / 注册奖励」的最早出处是 `autoclaw-credits.ts` 里**描述代码分支**的
+       *   一句注释（「无到期字段的发放（活动赠送的永久分）」），随后经
+       *   registry 注释 → 审计报告 → 本次提交 → 本函数文案 **五层转述**，
+       *   从未有一次报文支撑。
+       *
+       * ## 用户可见后果（改前）
+       *
+       * 用户拿着「去找叫『活动赠送』『注册奖励』的分组」去翻钱包流水，
+       * **一无所获**（真实名字是「AutoClaw 用户登录奖励积分，7天有效」这类长句）。
+       *
+       * ## 改法
+       *
+       * **不再点名任何具体池名**，改为描述**判据本身**（「流水里不带到期时间的发放」）
+       * —— 判据是代码里可核实的，池名不是。
+       */
+      return new LlmError(
+        `${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
+        + '积分（AutoClaw 的**带到期时间的发放批次** —— 钱包流水里那些'
+        + '带有效期的「每日签到 / 登录奖励」等发放）都已用尽。'
+        + '**永久桶**（流水里**不带到期时间**的那些发放）在锁定状态下动不到它们'
+        + ' —— 这是锁定的预期效果。'
+        + `请在 Jet Hub 的 ${displayName} 面板解锁永久积分，或等待下一次签到 / 活动发放。`,
+        'QUOTA_EXCEEDED',
+      )
+    }
+
+  /**
    * Loomy 的「锁定永久积分 + 无可用账号」报错文案（issue IKMCOO 缺陷 2/3）。
    *
    * ⚠️ **与 buddy 那份分开**（不是漏抽）：Loomy 的口径是「**今日赠送额度**」
@@ -2927,22 +3080,116 @@ export function apply(ctx: Context): void {
   // 服务名由 AccioAuth 依 product.id 派生，注册为 ctx.accioAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 Accio 面板。
   // ===== AutoClaw（智谱清言）=====
+  /**
+   * 按凭据 ref 解析 AutoClaw 凭据（供选号器查余额与最终取凭据共用）。
+   *
+   * ⚠️ **两站共用这一份**（`autoclaw` / `autoclawintl` 的凭据形状逐字相同：
+   * 同一套协议实现，差异只在主机与 ref 前缀）—— 与 qoder 那份同因，
+   * 各写一遍 = 改一处漏一处。
+   *
+   * ⚠️ **逐字保留历史上的裸 `JSON.parse` 形态**（不在此处加形状校验）：
+   * 加校验是一次**行为变更**（此前被接受的损坏凭据会变成被拒），不在本任务范围内。
+   */
+  const resolveAutoclawCredentialByRef = async (refName: string) => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      return JSON.parse(resolved.value) as unknown as AutoclawCredential
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * AutoClaw 两站的**按「额度何时作废」分档选号器**（2026-10-21，
+   * 用户要求「补锁定开关」）。
+   *
+   * ## 为什么本家需要它
+   *
+   * `autoclaw-credits.ts` 的批次映射里有一条**代码分支**：`wallet_expires_at`
+   * 缺失 / `<= 0` 的发放 ⇒ 进 `permanentByLabel` ⇒ **不带 `deductionEndTime`**
+   * （= 永久桶）。⇒ 只要上游下发那种条目，用户钱包里就会有永不作废的积分，
+   * 需要能保护它们。补登记 `permanentLock` **必须同时接上本选号器**，
+   * 否则就是**假开关**（按钮在、点了不拦 —— `credential-resolver.ts` 的
+   * `allowPermanent` 只在 `balance` 计划存在时才被读到）。
+   *
+   * ⚠️⚠️ **前提强度如实标注（2026-10-21 二轮审计）**：上述「永久桶」分支
+   * **结构上可达、但零实测**。仓库内唯一一次针对流水字段完整性的实测
+   *（`5fbe7ab` 的 commit message）结论是「**28/28 全带 `wallet_expires_at`**」——
+   * 方向上**否定**该形态存在。若上游确实恒带到期字段，则本家的永久桶**恒为空**
+   * ⇒ `allowPermanent` 为 true/false 行为完全相同 ⇒ 这个开关**永不产生实际效果**
+   *（但也不会出错：它只是把「已存在的分档能力」接上）。
+   *
+   * ⇒ 保留本接线（成本为零、与仓库 11 家同构、上游一旦下发无到期条目即生效），
+   *   但**不得**声称「本家确实有永久桶」。可核实的验证方法见审计报告 §十三。
+   *
+   * ## 为什么复用 `BuddyBalanceSelector`
+   *
+   * 分档判据（`splitBuddyCreditsByExpiry`）只读通用的
+   * `packages[].{active, remaining, deductionEndTime}`，**与 provider 无关**；
+   * `autoclaw-credits.ts` 的批次包正是这个形状（`deductionEndTime` 由
+   * `wallet_expires_at` 秒级归一成毫秒）。
+   *
+   * ## ⚠️ 与 buddy 系的**关键差异**（别照抄那两行）
+   *
+   * | | buddy 系 | AutoClaw |
+   * |---|---|---|
+   * | `rateLimit` | 省缺 true | **false**（不写 `modelRateLimits`、不在 `probeById`）|
+   * | 请求级换号 | 有 | **刻意没有** |
+   * | 「每日红」池语义 | 有 | **不适用**（签到积分是发放进余额、按批次到期）|
+   *
+   * ⇒ 本家的锁定只作用于「按余额分档选号」这一层，不涉及换号冷却（本来就没有）。
+   *
+   * ## ⚠️ 两家各建一个实例，不得合并
+   *
+   * 选择器内含**按账号 id 的缓存**，跨站共用会让一站的读数污染另一站
+   * （与 minimax / qoder 两站同因）。
+   *
+   * ## ⚠️ 必须各传自己的 `product`
+   *
+   * `AUTOCLAW` 指向国内基址、`AUTOCLAW_INTL` 指向国际基址（`autoglm-api.autoglm.ai`）
+   * —— 互换的后果**不是报错**而是静默：对方站点不认本站 token ⇒ 余额恒 `null`
+   * ⇒ 未锁定时换号优化失效、锁定时永远报「没有可用账号」。
+   */
+  const autoclawBalanceSelector = new BuddyBalanceSelector({
+    product: AUTOCLAW,
+    resolveCredential: resolveAutoclawCredentialByRef,
+    fetchBalance: (credential, product) => fetchAutoclawCreditBalance(credential, { product }),
+  })
+  const autoclawIntlBalanceSelector = new BuddyBalanceSelector({
+    product: AUTOCLAW_INTL,
+    resolveCredential: resolveAutoclawCredentialByRef,
+    fetchBalance: (credential, product) => fetchAutoclawCreditBalance(credential, { product }),
+  })
   const autoclaw = new AutoclawAuth(ctx)
   const autoclawAdapter = registerAutoclawLlm(ctx, {
     resolveCredential: createCredentialResolver<AutoclawCredential>(
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(AUTOCLAW.id, id) } },
       {
         product: AUTOCLAW,
-        readCredential: async (refName) => {
-          const resolved = await ctx.credentials.resolve(credentialRef(refName))
-          if (!resolved) return undefined
-          try {
-            return JSON.parse(resolved.value) as unknown as AutoclawCredential
-          } catch {
-            return undefined
-          }
-        },
+        // ⚠️ 2026-10-21：改用上面共用的 `resolveAutoclawCredentialByRef`
+        //    （原先这里是一份内联的逐字重复实现，两站各一份）。
+        readCredential: resolveAutoclawCredentialByRef,
         fallback: { kind: 'ref', refName: AUTOCLAW.defaultCredentialRef },
+        /**
+         * ⚠️ **必须接 `balance`**（2026-10-21，用户要求「补锁定开关」）。
+         *
+         * registry 里登记 `permanentLock: true` 只让**按钮渲染**、RPC 放行；
+         * 真正的拦截在 `credential-resolver.ts` 读
+         * `pool.permanentLocked(providerId)` ⇒ 传给 `pickBuddyAccount`
+         * 的 `allowPermanent`。**没有本段就是假开关**：按钮在、点了不拦。
+         *
+         * ⚠️ `reportPickedAccount: true` 是**必须的**（与 qoder / minimax 同因）：
+         * 本家的旧闭包是**纯池选号**、账本**一直在回报**（见下面
+         * `reportAccount` 那行）。接上 `balance` 后「分档选中」那一支若不回报
+         * ⇒ token 用量记不到本渠道上（静默）。
+         */
+        balance: {
+          kind: 'buddy',
+          selector: autoclawBalanceSelector,
+          // ⚠️ 本家独有文案（池名是「钱包流水批次」而不是 buddy 的「资源包」）。
+          lockedError: autoclawLockedError('AutoClaw'),
+          reportPickedAccount: true,
+        },
         // ⚠️ **必须接**（与 accio 同因）：本工厂的兜底是**固定 ref**
         //    （`AUTOCLAW_ACCESS_TOKEN`），而 Jet Hub 登录只写
         //    `AUTOCLAW_ACCOUNT_XXX` ⇒ 池被筛空时它会退到那个**从不被写入**的
@@ -3002,16 +3249,18 @@ export function apply(ctx: Context): void {
       { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(AUTOCLAW_INTL.id, id) } },
       {
         product: AUTOCLAW_INTL,
-        readCredential: async (refName) => {
-          const resolved = await ctx.credentials.resolve(credentialRef(refName))
-          if (!resolved) return undefined
-          try {
-            return JSON.parse(resolved.value) as unknown as AutoclawCredential
-          } catch {
-            return undefined
-          }
-        },
+        // ⚠️ 与国内版共用同一个解析器（两站凭据形状逐字相同）。
+        readCredential: resolveAutoclawCredentialByRef,
         fallback: { kind: 'ref', refName: AUTOCLAW_INTL.defaultCredentialRef },
+        // ⚠️ **必须接 `balance`**（与国内版同因同日，见那一段的长注释）。
+        //    ⚠️ `selector` 必须是**国际站自己**那个实例（缓存不跨站共用）；
+        //    `displayName` **必须**逐站区分（两站账号不互通，用户要知道去哪个面板解锁）。
+        balance: {
+          kind: 'buddy',
+          selector: autoclawIntlBalanceSelector,
+          lockedError: autoclawLockedError('AutoClaw (国际版)'),
+          reportPickedAccount: true,
+        },
         throwIfAllRateLimited: throwIfAllAccountsRateLimited,
       },
     ),

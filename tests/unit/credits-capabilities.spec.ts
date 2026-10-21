@@ -30,6 +30,9 @@ import { OFFICEACE } from '../../src/officeace-product.js'
 import { QODER, QODER_CN } from '../../src/qoder-product.js'
 import { ASTUDIO } from '../../src/astudio-product.js'
 import { MINIMAX, MINIMAX_INTL } from '../../src/minimax-product.js'
+// ⚠️ AutoClaw 两站（2026-10-21，用户要求「补锁定开关」）：本家**确实有**永久桶
+//    （活动赠送的永久分不带 `deductionEndTime`）⇒ 两站各占一项。
+import { AUTOCLAW, AUTOCLAW_INTL } from '../../src/autoclaw-product.js'
 
 /**
  * 积分能力矩阵的回归测试。
@@ -716,6 +719,10 @@ describe('永久积分锁定能力', () => {
     LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id,
     QODER.id, QODER_CN.id,
     ASTUDIO.id, MINIMAX.id, MINIMAX_INTL.id,
+    // ⚠️ autoclaw / autoclawintl（2026-10-21 用户要求「补锁定开关」）：
+    //    本家批次映射里「无到期字段的发放（活动赠送的永久分）」⇒ 永久桶存在
+    //    ⇒ 需要锁定能力。两站**各占一项**（账号不互通）。
+    AUTOCLAW.id, AUTOCLAW_INTL.id,
   ]
   const UNSUPPORTED = [
     'codearts', 'cline', 'raccoon',
