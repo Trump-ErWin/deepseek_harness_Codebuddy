@@ -676,9 +676,113 @@ describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：DSH 身份�
     expectContentBlocked(r)
   }, 60_000)
 
-  it('★ 整段形态：首句换成新措辞、后面跟长正文 ⇒ **放行**（改写后真的能发出去）', async () => {
+  it('★ 身份句改写后 + 长正文 ⇒ **放行**（⚠️ 本格**只覆盖身份句**，多出现位置见第 5 节）', async () => {
+    // ⚠️⚠️ 这一格曾经用 `'padding. '.repeat(200)` 冒充「长正文」，于是**自以为**覆盖了
+    // 「真实整段」——而真实整段里 `DeepSeek Harness` 还有另外两处（其中 Web 运行面那句
+    // **单独就能拦**）⇒ 2026-10-21 的真实报障正是从这里漏过去的。
+    // 本格现在只声明它真正测到的东西：**身份句**改写后能过；
+    // 「多出现位置」那一格由第 5 节的 `★★` 用例负责（那一格才是报障者的原话）。
     const system = `${DSH_REWRITE}.\n\nYou are a coding agent. Use the tools.\n\n${'padding. '.repeat(200)}`
     const r = await probe([{ role: 'system', content: system }, { role: 'user', content: 'reply OK' }])
     expect(r.kind, `改写后的整段 system 应放行；拿到 ${r.detail}`).toBe('OK')
   }, 60_000)
+})
+
+/**
+ * ## 第五条指纹：**DSH Web 运行面的开头两句**（2026-10-21 真实报障）
+ *
+ * 出自 `@deepseek-ai/dsh-harness-dev-context` 的 `WEB_SURFACE_PROMPT`；
+ * 该插件**只在 Web 运行时挂载**（它 README 原话：`--help` 与非 Web 组合从不挂载）
+ * ⇒ CLI / 桌面面的 system 里**没有这句**，任何取自那些面的「真实整段」都测不到它。
+ *
+ * ## ⚠️⚠️ 本节要害 = 「多出现位置」那一格（`★★`）
+ *
+ * 报障者的原话是「**只测单句的用例永远抓不到这一格**」—— 完全正确：
+ * 第 4 节发的是**单句**载荷，而真实 system 里 `DeepSeek Harness` 出现 **3 次**，
+ * **只改第 1 行**的形态在 buddy 站**仍被整轮 400/11128**（本节 `★★` 复现的就是它）。
+ *
+ * ⚠️ 载荷是**同形**文字（逐字节取自真实 system，但与 DSH 的源码解耦）：
+ * 它锁得住「换了措辞会被拦」，**锁不住**「DSH 改了那两句而 `find` 没跟上」——
+ * 后者的守卫是单测里那条**读本机会话落盘**的漂移用例。
+ *
+ * 跑法：`pnpm test:e2e:buddy-fingerprint`。
+ */
+describe.skipIf(!ENABLED || !CONFIRMED)('腾讯系内容级风控：DSH Web 运行面两句（2026-10-21 实测依据）', () => {
+  /** 真实 system 里那两句（221 字符）。⚠️ 与单测里的誊写互为对照。 */
+  const WEB_TRIGGER = 'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.'
+  /** 去掉品牌串的等义形态（212 字符）。 */
+  const WEB_REWRITE = 'You are interacting with the user through the harness Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.'
+  /** 第 4 条已验的**身份句**改写形态，用来拼「多出现」载荷。 */
+  const IDENTITY_REWRITE = 'You are an AI coding assistant, powered by a large language model'
+  /** 实测只有 buddy 拦（与第 4 条同型）。上游若把名单铺到国际站，这一格会红。 */
+  const WEB_BLOCKING_SITES: readonly string[] = ['buddy']
+
+  const sys = (content: string) => [{ role: 'system', content }, { role: 'user', content: 'reply OK' }]
+
+  it.each(SITES.map((s) => [s.name, s] as const))(
+    '★ %s：本字面量的实测结论（拦 / 不拦），且**改写后必须干净 200**',
+    async (name, site) => {
+      const raw = await probe(sys(WEB_TRIGGER), site)
+      if (WEB_BLOCKING_SITES.includes(name)) {
+        expect(raw.blocked, `${name}: 本字面量实测应被拦，但拿到的是 ${raw.detail}`).toBe(true)
+        expectContentBlocked(raw)
+      } else {
+        expect(raw.kind, `${name}: 本字面量 2026-10-21 实测**放行**；若红了说明上游改了名单 ⇒ `
+          + `把 ${name} 移进 WEB_BLOCKING_SITES（拿到的是 ${raw.detail}）`).toBe('OK')
+      }
+      const fixed = await probe(sys(WEB_REWRITE), site)
+      expect(fixed.kind, `${name}: 改写后应拿到干净的 200；拿到 ${fixed.detail}`).toBe('OK')
+    }, 120_000)
+
+  it('★ `find` 长度判据：**前 220 字符**实测放行（写短了 = 静默空跑）', async () => {
+    const r = await probe(sys(WEB_TRIGGER.slice(0, 220)))
+    expect(r.kind, `220 字符前缀实测放行；拿到 ${r.detail}`).toBe('OK')
+    // 反向对照（221 = 整条必须被拦）在上一格 `it.each` 里。
+  }, 60_000)
+
+  it('★ 位置无关：前接中性前言**仍被拦**（与第 4 条的行首锚定**相反**）', async () => {
+    const r = await probe(sys(`You are a helpful assistant.\n\n${WEB_TRIGGER}`))
+    expect(r.blocked, `位置无关应仍被拦，但拿到的是 ${r.detail}`).toBe(true)
+    expectContentBlocked(r)
+  }, 60_000)
+
+  it('★ assistant **正文**放本字面量也被拦（故现有改写范围已覆盖）', async () => {
+    const r = await probe([
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: WEB_TRIGGER },
+      { role: 'user', content: 'reply OK' },
+    ])
+    expect(r.blocked, `assistant 正文应被拦，但拿到的是 ${r.detail}`).toBe(true)
+    expectContentBlocked(r)
+  }, 60_000)
+
+  it('★ 旧版形态（`…Web GUI at <url>.`）实测**放行** ⇒ 刻意不登记它', async () => {
+    // 反向断言：多登记一条 = 替上游无谓改写提示词并破坏前缀缓存。
+    // 若哪天它开始被拦，这里会红 —— 那时才该把它加进表。
+    const r = await probe(sys(
+      'You are interacting with the user through the DeepSeek Harness Web GUI at http://127.0.0.1:3080.'))
+    expect(r.kind, `旧形态实测放行；拿到 ${r.detail}`).toBe('OK')
+  }, 60_000)
+
+  it('★★ 多出现位置（本节要害）：只改第 1 行**仍被拦**，两处都改才放行', async () => {
+    // 2026-10-21 报障的现场形态：插件当时只登记了身份句（第 1 行），
+    // 而真实 system 里 `DeepSeek Harness` 还有 Web 运行面那一处 ⇒ 整轮 400。
+    const shape = (identity: string, web: string) => [
+      `${identity}.`,
+      '',
+      'You are a coding agent. Use the tools to resolve the request.',
+      '',
+      web,
+      '',
+      '尾注。',
+    ].join('\n')
+
+    const before = await probe(sys(shape(IDENTITY_REWRITE, WEB_TRIGGER)))
+    expect(before.blocked, `只改第 1 行应**仍被拦**（报障现场）；拿到的是 ${before.detail}`).toBe(true)
+    expectContentBlocked(before)
+
+    const after = await probe(sys(shape(IDENTITY_REWRITE, WEB_REWRITE)))
+    expect(after.kind, `两处都改应放行；拿到 ${after.detail}`).toBe('OK')
+  }, 120_000)
 })
