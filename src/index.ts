@@ -1144,6 +1144,15 @@ export function apply(ctx: Context): void {
       return outcome === undefined ? undefined : isRemoteCatalogComplete(outcome)
     },
     accountPool: pool,
+    // 图片字节桥接（2026-10-21 接通）。
+    //
+    // ⚠️ 复用**同一个** `makeReadImage(ctx)` —— 不另写第二套（其余 14 家全走它）。
+    //
+    // ⚠️ 只有 VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）能收图，实测文本模型
+    //    发图回 `InferHub.001001020.406 The request model is not multimodal`。
+    //    适配器内部按 `codeartsAcceptsImage(model)` 判定，非 VL 模型**根本不读字节**
+    //    （见 `stream()` 的注释），故这里不必再加一层判据。
+    readImage: makeReadImage(ctx),
   })
 
   // ===== Buddy (腾讯 CodeBuddy) 服务 =====

@@ -137,8 +137,16 @@ export interface ModelCatalogConfig {
    * 反之若把 `buddy` 统一成 `['text']`，会**静默关掉图片能力**（见
    * `CatalogEntry.inputModalities` 的说明）。
    * ⇒ **两个方向都会出真缺陷，故本回调必须逐家提供**，骨架不替各家决定。
+   *
+   * ⚠️⚠️ **必须传 `modelId`**（2026-10-21 接 codearts 图片时踩到）：`codearts` 的
+   * VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）**刻意不进对话目录**（上下文小、
+   * 不支持工具调用），但它们**能收图**、且识图工具要按 id 借它们 ⇒ 它们走的正是
+   * 本回调这条「目录外」路径。不传 id 就只能在「恒 `['text']`」与「全都给 image」
+   * 之间二选一：前者让 VL 模型永远声明不了 image（DSH 在入库阶段拒图，真缺陷），
+   * 后者让文本模型也能被发图（上游 406，每轮都失败）。
+   * ⇒ 传 id 后实现方才能**按 id 判能力**，两个方向都正确。
    */
-  unknownModelInputModalities?(): readonly ('text' | 'image')[] | undefined
+  unknownModelInputModalities?(modelId: string): readonly ('text' | 'image')[] | undefined
   /**
    * **目录里没有该 id** 时 `resolveModel` 该报什么思考档位。
    *
@@ -679,7 +687,9 @@ export function createModelCatalog(
         // ⇒ 家数**只在上面那个接口字段的表格里维护**，这里**刻意不抄数字**
         // （原先抄了个「10 家」并写成只有 `buddy` 省略，与那张表**互相矛盾**，
         // 正是「同一事实写多处 ⇒ 必有一处先腐坏」）。
-        const unknownModalities = config.unknownModelInputModalities?.()
+        // ⚠️ **必须把 `model` 传进去**：`codearts` 的 VL 模型刻意不在目录里，
+        //    却仍要按 id 声明 `image`（见该回调的注释）。
+        const unknownModalities = config.unknownModelInputModalities?.(model)
         if (unknownModalities !== undefined) resolved.inputModalities = unknownModalities
       }
       // ⚠️ 未知模型**默认不编造** context（宁可让 DSH 用默认值，也不报一个假窗口）。
