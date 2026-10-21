@@ -72,7 +72,23 @@ const DAY = 24 * 60 * 60 * 1000
  */
 const LOCK_EXECUTION_PATHS: Record<
   string,
-  { module: string; spec: string; drives: string }
+  {
+    module: string
+    spec: string
+    drives: string
+    /**
+     * ⚠️ **带上下文的接线锚点**（2026-10-21 合并审计补）。
+     *
+     * `drives` 是**裸符号**，对 `src/index.ts` 那五项**无牙** ——
+     * 符号的定义还在文件里，删掉使用点照样 `includes` 为真。
+     * 本字段存「调用形态」的片段（如 `lockedError: astudioLockedError('AStudio'),`），
+     * 只有真的接在被测渠道上才会命中。
+     *
+     * ⚠️ **`module === 'src/index.ts'` 的登记项必须填本字段**（本文件末尾有一条
+     *    普查断言强制这件事），否则该渠道的「执行路径」判据退化成恒真。
+     */
+    anchor?: string
+  }
 > = {
   // buddy 系四家（含 trae / lobsterai）：`createCredentialResolver` 的 buddy 分支
   // 读 `pool.permanentLocked(providerId)` ⇒ `pickBuddyAccount({ allowPermanent })`
@@ -124,11 +140,15 @@ const LOCK_EXECUTION_PATHS: Record<
     module: 'src/index.ts',
     spec: 'tests/unit/qoder-lock-wiring.spec.ts',
     drives: 'qoderLockedError',
+    anchor: "lockedError: qoderLockedError('Qoder'),",
   },
   qodercn: {
     module: 'src/index.ts',
     spec: 'tests/unit/qoder-lock-wiring.spec.ts',
     drives: 'qoderLockedError',
+    // ⚠️ 两站**共用** `qoderLockedError` 构造器，只差 `displayName` ⇒ 锚点必须
+    //    带各自的 `displayName` 才能区分「中国版接了」与「国际版接了」。
+    anchor: "lockedError: qoderLockedError('Qoder (中国版)'),",
   },
   // ⚠️ astudio（2026-10-20）：与 buddy 系四家**同一条**执行路径 ——
   //    `src/index.ts` 的 astudio 注册段接了 `createCredentialResolver` 的
@@ -140,6 +160,7 @@ const LOCK_EXECUTION_PATHS: Record<
     module: 'src/index.ts',
     spec: 'tests/unit/astudio-lock-wiring.spec.ts',
     drives: 'astudioLockedError',
+    anchor: "lockedError: astudioLockedError('AStudio'),",
   },
   // ⚠️ minimax / minimaxintl（2026-10-20）：与 astudio **同一条**执行路径
   //    （`createCredentialResolver` 的 `kind: 'buddy'` 分支），但判别符号必须
@@ -152,11 +173,13 @@ const LOCK_EXECUTION_PATHS: Record<
     module: 'src/index.ts',
     spec: 'tests/unit/minimax-lock-wiring.spec.ts',
     drives: 'minimaxLockedError',
+    anchor: "lockedError: minimaxLockedError('MiniMax Code (中国版)'),",
   },
   minimaxintl: {
     module: 'src/index.ts',
     spec: 'tests/unit/minimax-lock-wiring.spec.ts',
     drives: 'minimaxLockedError',
+    anchor: "lockedError: minimaxLockedError('MiniMax Code (国际版)'),",
   },
 }
 
@@ -194,6 +217,39 @@ describe('★ 普查：凡登记 permanentLock 的渠道，都必须有一条执
         readFileSync(module, 'utf8').includes(path.drives),
         `${path.drives} 不在 ${path.module} 里 —— 登记表的「判别符号」写错了`,
       ).toBe(true)
+      /**
+       * ⚠️⚠️ **`anchor` 是这个判据的「带牙」版本**（2026-10-21 合并审计补）。
+       *
+       * ## 为什么光有 `drives` 不够
+       *
+       * 五个登记项（qoder / qodercn / astudio / minimax / minimaxintl）的
+       * `module` 都是 `src/index.ts`，而 `drives` 是**裸符号**
+       *（`qoderLockedError` / `astudioLockedError` / `minimaxLockedError`）。
+       * 这些符号在 `index.ts` 里**各有定义 + 使用**两处 ⇒ 只做 `includes` 时，
+       * **删掉使用点、定义仍在 ⇒ 恒真**。
+       *
+       * 实测三重变异（审计员独立复现，`permanent-lock-execution` 全部 10 passed = 无牙）：
+       *
+       * | 变异 | 只查 `drives` | 查 `anchor` |
+       * |---|---|---|
+       * | 删 `lockedError: astudioLockedError('AStudio')` 行 | **绿** | 红 |
+       * | 整段删掉 astudio 的 `balance:{…}` 计划 | **绿** | 红 |
+       * | 把 `selector` 换成不读锁定表的假实现 | **绿** | 红 |
+       *
+       * ⇒ `anchor` 必须是**带上下文的片段**（含调用形态），使「符号提到过」
+       *   升级为「**该渠道的接线上真的用了它**」。
+       *   缺 `anchor` 的旧登记退化成只看 `drives`（向后兼容），
+       *   但 **`src/index.ts` 那五项必须填** —— 否则它们的判据是恒真的。
+       */
+      if (path.anchor !== undefined) {
+        expect(
+          readFileSync(module, 'utf8').includes(path.anchor),
+          `${provider} 的接线锚点缺失：${path.module} 里找不到 \`${path.anchor}\`\n`
+          + '  ⇒ 该渠道的 lockedError 或 balance 计划被删/被改成别的实现'
+          + '（锁定仍会「显示已锁」，但没有任何执行路径可拦 —— 假开关）。\n'
+          + '  ⚠️ 只查裸符号（`drives`）抓不到这种删除：符号的**定义**还在文件里。',
+        ).toBe(true)
+      }
 
       const specSource = readFileSync(spec, 'utf8')
       expect(
@@ -209,6 +265,31 @@ describe('★ 普查：凡登记 permanentLock 的渠道，都必须有一条执
         + '（它可能只是「提到了这个渠道」，并没有驱动那条路径）',
       ).toBe(true)
     }
+  })
+
+  /**
+   * ★★ **`module === 'src/index.ts'` 的登记项必须填 `anchor`**
+   * （2026-10-21 合并审计补，防「判据悄悄退化成恒真」）。
+   *
+   * 五家（qoder / qodercn / astudio / minimax / minimaxintl）的执行路径都在
+   * `src/index.ts`，而它们的 `drives` 是裸符号 —— 符号在那里**既有定义又有使用**，
+   * 只查 `includes` 时**删掉使用点仍然为真**（实测三重变异全绿）。
+   *
+   * 修复不会靠「记得填」：本用例强制要求。将来再加一个 `index.ts` 类登记项却
+   * 忘了 `anchor` ⇒ 当场红，而不是静默变回无牙。
+   */
+  it('★★ `index.ts` 类登记项必须填 `anchor`（否则判据退化成「符号在文件里」）', () => {
+    const missing = Object.entries(LOCK_EXECUTION_PATHS)
+      .filter(([, path]) => path.module === 'src/index.ts' && path.anchor === undefined)
+      .map(([provider]) => provider)
+    expect(
+      missing,
+      '这些渠道的执行路径在 src/index.ts，但登记表没填 `anchor` ⇒ '
+      + '删除接线后本普查仍会绿（裸符号的定义还在文件里）',
+    ).toEqual([])
+    // 自检：确实存在 index.ts 类登记项（否则本用例是同义反复）。
+    const indexEntries = Object.values(LOCK_EXECUTION_PATHS).filter((p) => p.module === 'src/index.ts')
+    expect(indexEntries.length, '列表为空 ⇒ 上面那条恒真').toBeGreaterThan(0)
   })
 
   it('③ 窗口文案的判据与注册表**同出一个字段**（`usesExpiryWindow`）', () => {
