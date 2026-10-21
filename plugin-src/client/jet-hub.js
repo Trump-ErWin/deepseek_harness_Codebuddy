@@ -28,6 +28,7 @@ import {
   expirySplitParts,
   expiryBucketLabel,
   daysUntilExpiry,
+  isExclusivePool,
 } from './credit-expiry.js';
 import {
   allModelsDisabled,
@@ -467,6 +468,22 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
    * 是为了让 React 逐段设 `data-tone` —— 单个字符串只能整体一个颜色。
    */
   const expiryParts = expirySplitParts(split, formatForUnit, now);
+  /**
+   * **独立池**（如 AStudio 的星火积分）：服务端给的是两个互不相通的池，
+   * 那笔钱**不能**当通用积分用。分桶按金额聚合、天然丢池名 ⇒ 单独摘出来标注，
+   * 否则主行一句「永久 25000」会被读成「我有 25000 通用积分」。
+   *
+   * ⚠️ 数字与池名都来自 `balance.packages`（单一来源），不在这里重新算；
+   *    0 时不渲染（没有独立池的 provider 逐字不变）。
+   */
+  const exclusiveRemaining = all.reduce(
+    (sum, pkg) => sum + (pkg && isExclusivePool(pkg) && pkg.active !== false ? (Number(pkg.remaining) || 0) : 0),
+    0,
+  );
+  const exclusiveNames = all
+    .filter((pkg) => pkg && isExclusivePool(pkg) && pkg.active !== false && (Number(pkg.remaining) || 0) > 0)
+    .map((pkg) => pkg.name)
+    .join('、');
   // 明细放进 title，不占版面；账号卡片本身已经信息密集了
   const detail = [
     all.length > 1 ? `共 ${all.length} 个资源包，${activeCount} 个有效` : null,
@@ -599,6 +616,22 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
             ? [node]
             : [React.createElement('span', { key: `sep-${part.key}`, className: 'dim-jh-creditPoolSep' }, ' · '), node];
         }))
+      : null,
+    /**
+     * **独立池**提示（2026-10-21 用户报障「没标注星火专属」）。
+     *
+     * 为什么不塞进上面那行：三档分桶是按**金额**聚合的，塞进去就只能写成
+     * 「永久 25000」—— 而那正是误导的来源（用户会以为是通用积分）。
+     * 单独一行 + 「不计入」字样，才能既显示这笔钱存在、又说明它不能混用。
+     *
+     * ⚠️ `exclusiveRemaining === 0` 时不渲染 ⇒ 没有独立池的 provider
+     *    （现有全部）行为**逐字不变**。
+     */
+    exclusiveRemaining > 0
+      ? React.createElement('span', {
+          className: 'dim-jh-creditExclusive',
+          title: `${exclusiveNames}：服务端下发的独立池，与上方主池分开结算，不参与主池合计、也不能当通用积分消耗。`,
+        }, `另有 ${formatUnits(exclusiveRemaining, unit) ?? exclusiveRemaining} 专属（不计入）`)
       : null,
     // ⚠️ 配额单位（Gemini）下**不渲染**这句：它的两个「包」是 5 小时窗口与
     // 周窗口，不是资源包 —— 说「2/2 个资源包有效」既没信息量又误导
