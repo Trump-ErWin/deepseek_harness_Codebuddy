@@ -301,6 +301,39 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
  *  （面板与排序都不是高频路径），却让「刚登录的账号不出现在排序里」的窗口更长。
  */
 export const EXPIRY_CACHE_TTL_MS = 60_000
+/**
+ * **单渠道折算的总预算**（毫秒）。
+ *
+ * ## 为什么必须封顶（真实故障，2026-10-19）
+ *
+ * 用户报障「重启后配置一直加载不出来」。实测 `session/modelCatalog` 冷启动
+ * **290 000 ms / 222 000 ms / 54 000 ms**（中位 222 秒），而同一时刻
+ * `settings/describe` 只要 68 ms —— 事件循环没被堵，是本函数在**逐账号串行**
+ * 等上游。
+ *
+ * 算式：`candidatesFor` 对每个渠道 `await probe(provider)`，本函数内部
+ * `for (const item of credentials)` **串行**折算，单账号上游超时 30 s
+ * （`credits.ts` 的 `REQUEST_TIMEOUT_MS`）。该机账号池 workbuddy 7 个号、
+ * buddy 8 个号 ⇒ 最坏 `7×30 + 8×30 = 450 s`。
+ *
+ * 账号数在 2026-10-17 23:00 到 10-18 00:30 之间从 17 个涨到 31 个
+ * ⇒ 用户感受到「昨天还能忍、今天撞墙」。
+ *
+ * ## 为什么是 8 秒
+ *
+ * - 目录是**首屏阻塞**路径（`buildModelCatalog` 会 `await` 它），超过 10 秒
+ *   用户已经认为卡死；8 秒留余量；
+ * - 正常情况下一个渠道折算**远低于** 8 秒（同机实测 codearts 357 ms、
+ *   raccoon 779 ms、trae 1164 ms、zcode 491 ms）—— 8 秒只截断
+ *   「上游在超时边缘」的渠道；
+ * - 被截断的渠道按**保守方向**处理，与本文件铁律
+ *   「宁可少一个候选，不可把未知当可用」一致。
+ *
+ * ⚠️ 截断**不是**把结果写成 `NEVER`：那会让一个我们其实没查清的渠道以
+ *   「永久可用」身份参与排序。已成功折算的账号仍按**真实观测值**返回；
+ *   一个都没成时才 `UNUSABLE`。
+ */
+export const EXPIRY_PROBE_BUDGET_MS = 8_000
 
 /**
  * `createExpiryProbe` 的返回类型：临期探针 **+ 缓存失效入口**。
@@ -320,6 +353,16 @@ export type ExpiryProbeWithCache = ExpiryProbe & { clear: () => void }
   now?: () => number
   /** 缓存时长（毫秒）；默认 {@link EXPIRY_CACHE_TTL_MS}。 */
   ttlMs?: number
+
+  /**
+   * 单渠道折算的**总预算**（毫秒）；默认 {@link EXPIRY_PROBE_BUDGET_MS}。
+   *
+   * `0` 表示**不封顶**（保留升级前行为，供需要精确结果的调用方与单测使用）。
+   *
+   * ⚠️ 这是**每渠道**预算，不是全局预算：`candidatesFor` 逐渠道 `await`，
+   * 每个渠道独立计时 —— 一个渠道慢不会连坐其它渠道。
+   */
+  budgetMs?: number
   /**
    * 该渠道的**全部目录模型 id**（可选的加强依赖，2026-10-12 加入）。
    *
@@ -627,8 +670,49 @@ export function createExpiryProbe(
      * 后者会让实现方白走一次「查缓存 → 未命中」的分支（行为相同，但多一层间接）。
      */
     const cachedBalanceOf = options.balanceOf
+    const budgetMs = options.budgetMs ?? EXPIRY_PROBE_BUDGET_MS
+    /**
+     * 把一次「单账号折算」限制在剩余预算内。
+     *
+     * ⚠️ **超时返回哨兵值而不是抛错**：这不是调用方中止，而是我们自己的预算用完。
+     * 抛 `AbortError` 会被上层误判成「用户取消」并冒泡成 `MISSING_CREDENTIAL`；
+     * 返回 `UNUSABLE` 才符合「本轮剔除该账号」的语义。
+     *
+     * ⚠️ 超时**不取消**在途的 fetch（各 `*Expiry` 内部自带自己的超时信号，
+     * 它们会在自己的超时后结束）。这里只是**不再等它** —— 让它自然结束，
+     * 避免把上游连接强行掐断引发重试风暴。
+     *
+     * ⚠️ 计时器**不能 `unref()`**（实测踩到）：调用方正 `await` 这次折算，
+     * 若计时器不保持进程活跃，Node 会判定「没有待办」直接退出 ——
+     * 独立验证时进程以 `Warning: Detected unsettled top-level await` 静默结束。
+     * 这与后台写盘的 `unref` 场景不同：这里的计时器是**前台等待**的一部分。
+     */
+    const withinBudget = async <T>(remainingMs: number, task: Promise<T>): Promise<T | typeof UNUSABLE> => {
+      if (budgetMs === 0 || remainingMs <= 0) return budgetMs === 0 ? await task : UNUSABLE
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const timeout = new Promise<typeof UNUSABLE>((resolve) => {
+        timer = setTimeout(() => resolve(UNUSABLE), remainingMs)
+      })
+      try {
+        return await Promise.race([task, timeout])
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
+    }
+    // ⚠️ **本渠道的预算起点**（见 `EXPIRY_PROBE_BUDGET_MS` 的长注释）：
+    //    账号是**串行**折算的，工作伙伴池里 workbuddy 7 个号 × 30 s 超时 = 210 s、
+    //    buddy 8 个号 = 240 s，叠起来就是用户实测的「目录 33 万毫秒」。
+    //    预算用完即停止本渠道，按保守方向折算。
+    const deadline = budgetMs === 0 ? Number.POSITIVE_INFINITY : now() + budgetMs
     for (const item of credentials) {
       signal?.throwIfAborted()
+      const remaining = deadline - now()
+      // ⚠️ 预算耗尽：**停止**本渠道，不再为后续账号付 30 s 的超时。
+      //    此处不 `continue`（那会继续循环并逐个撞超时墙），也不直接
+      //    `return UNUSABLE`（已折算成功的账号仍是有效信息 —— 若前面已有
+      //    `earliest` 就照常返回）。语义：拿到的部分结果比没有强，但**不能**
+      //    因为「没探完」就把整个渠道剔掉 —— 那会让账号多的渠道**永远**不可见。
+      if (remaining <= 0) break
       const credential = item.credential
       let value
       try {
@@ -640,7 +724,7 @@ export function createExpiryProbe(
          * ⚠️ `catalogIds` 在这里**不求值**（传的是个函数）：只有 zcode 会调它，
          * 其余 6 家每轮因此**零额外目录读取**（那是本仓库反复强调的成本）。
          */
-        value = await credentialExpiry(provider, credential, {
+        value = await withinBudget(remaining, credentialExpiry(provider, credential, {
           ...item.entry.id === undefined ? {} : { accountId: item.entry.id },
           // ⚠️ officeace 的余额查询**必须**拿到 ref 才走云侧直读（见该字段注释）；
           //    其余家忽略它。
@@ -660,7 +744,7 @@ export function createExpiryProbe(
             : {
                 cachedBalance: () => cachedBalanceOf(provider, item.entry.id as string, credential),
               },
-        })
+        }))
       } catch (error) {
         // 中止仍必须逃逸（与上面的 `try` 同一口径）。
         signal?.throwIfAborted()
@@ -728,8 +812,8 @@ async function legacySingleCredential(
  * 能力注册表回答（设计文档 §3.5.3）。
  *
  * ⚠️ **各家原语函数原样保留** —— 它们是**真实差异**（判据不同、量纲不同：
- * loomy 是命名池、codearts 无到期概念、zcode 分桶按秒、buddy 系按资源包）。
- * 本函数只负责「选哪个」，**不**抽象「原语内部做什么」（§3.6 的边界）。
+ * loomy 是命名池、codearts 无到期概念、zcode 分桶按秒、buddy 系按��源包）。
+ * 本函数只负责「���哪个」，**不**抽象「原语内部做什么」（§3.6 的边界）。
  *
  * ⚠️ 层次方向：本模块**只**能依赖底座（见模块头）。`provider-runtime.ts` 不
  * import 本文件、也不 import 聚合适配器，故无环 —— 但**别**在这里 import
@@ -1027,7 +1111,7 @@ export async function traeExpiry(
  *
  * ## ⚠️⚠️ 与其它家的**根本差异**：额度耗尽**不会被自动跳过**
  *
- * buddy 系能折算出临期时刻、从而在耗尽前把账号剔出轮换；魔搭**做不到** ——
+ * buddy 系能折算出临期时刻、从而在���尽前把账号剔出轮换；魔搭**做不到** ——
  * 它既没有「配额何时重置」字段（每日发放是平台侧行为，实测报文字段里没有），
  * 也无法查询余额之外的东西（`/api/v1/quota/status` 经实测是**任务奖励**、
  * 不是额度，详见 `modelscope-credits.ts`）。
@@ -1338,7 +1422,7 @@ export async function accioExpiry(credential: AccioCredential): Promise<number> 
  * officeace：与 **buddy 系同形**（订阅的每个积分桶都带 `expiresAt` ⇒ 归一化到
  * `deductionEndTime`），故折算口径与 `sharedPackageExpiry` **逐格一致**。
  *
- * ## 为什么单独一条原语（而不是直接复用 `sharedPackageExpiry`）
+ * ## 为��么单独一条原语（而不是直接复用 `sharedPackageExpiry`）
  *
  * 那个共享实现吃的是 `fetchBalance: () => Promise<CreditBalance | null>`，而
  * officeace 的余额入口是 {@link fetchSubscriptionSummary}：签名是
@@ -1607,7 +1691,7 @@ export async function zcodeExpiry(
   // 企业版（`displayMode: 'enterprise'`）返回的是 `{ enterprise: true, buckets: [],
   // remaining: 0, total: 0, claimablePlans: [] }` —— 它与「额度已用光」在**数值上
   // 完全同形**（都是 0 个桶 + `remaining: 0`），故按下面的判据会被算成 `UNUSABLE`
-  // ⇒ **一个能正常推理的企业版账号被永久排除出 auto 候选**。
+  // ⇒ **一个能正常推理的企��版账号被永久排除出 auto 候选**。
   //
   // ⚠️ 上游在 `zcode-upstream.ts` 已就此**明文警告**：
   //    「企业版不下发额度数字、只给外部链接 —— 此时返回 `{enterprise:true,buckets:[]}`，
