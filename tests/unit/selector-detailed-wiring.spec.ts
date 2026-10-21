@@ -126,9 +126,15 @@ describe('★★ 选号器必须接上 fetchBalanceDetailed（否则锁定时说
    * 不重复守 `fetchBalance` 那条腿（`qoder-lock-wiring.spec.ts` 已守）。
    */
   it('★ 详细变体必须透传各自的 product（两站不许共用一个）', () => {
+    // ⚠️ 2026-10-21 起 Qoder 两家多传了第三参 `{ fetcher: … }`（per-账号出口
+    // 代理）⇒ 正则把第三参写成**可选组**，本条的职责仍是「前两参是
+    // `credential, product`」这一个判断。「fetcher 那层在位」由
+    // `tests/unit/qoder-proxy.spec.ts` 单独守 —— 两处各守一件事，避免一处
+    // 形态变动把两条不变式一起打红（也就分不清是哪条坏了）。
+    const qoderDetailed = /fetchQoderBalanceDetailed\(credential, product(?:,[\s\S]*?\{\s*fetcher:[\s\S]*?\})?\)/
     const perProduct: Array<[string, RegExp]> = [
-      ['qoderBalanceSelector', /fetchQoderBalanceDetailed\(credential, product\)/],
-      ['qoderCnBalanceSelector', /fetchQoderBalanceDetailed\(credential, product\)/],
+      ['qoderBalanceSelector', qoderDetailed],
+      ['qoderCnBalanceSelector', qoderDetailed],
       ['minimaxIntlBalanceSelector', /fetchMinimaxCreditBalanceDetailed\(credential, fetch, product, pool\.minimaxXff\(\)\)/],
       ['autoclawIntlBalanceSelector', /fetchAutoclawBalanceDetailed\(credential, \{ product \}\)/],
       ['astudioBalanceSelector', /fetchAstudioBalanceDetailed\(credential, product === undefined \? \{\} : \{ product \}\)/],

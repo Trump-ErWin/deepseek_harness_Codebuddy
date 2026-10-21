@@ -263,9 +263,11 @@ import { pickTestModel,
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
 import { geminiFetchForAccount } from './gemini-proxy.js'
+import { qoderFetchForAccount } from './qoder-proxy.js'
 import { minimaxIntlFetchForAccount } from './minimax-proxy.js'
 import { normalizeProxy } from './minimax-proxy.js'
 import { handleGeminiRpc } from './gemini-rpc.js'
+import { handleQoderRpc } from './qoder-rpc.js'
 import { handleMinimaxIntlRpc } from './minimax-rpc.js'
 import { handleModelscopeRpc } from './modelscope-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
@@ -3965,6 +3967,13 @@ function registerJetHubEndpoints(
       const handled = await handleGeminiRpc(ctx, pool, method, payload)
       if (handled !== undefined) return handled
     }
+    // ⚠️ 真实报障 2026-10-21：Qoder 国际版 `openapi.qoder.sh` 被 SNI 阻断，
+    //    而它此前是**唯一有墙外端点却没有 per-账号代理按钮**的渠道
+    //    （opencode / Gemini 都有）。⇒ `qoder.*` 走同样的前缀改道。
+    if (method.startsWith('qoder.')) {
+      const handled = await handleQoderRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
     // ⚠️ MiniMax 国际站的**出口代理**端点同款前缀改道（写 `setMinimaxIntlProxy`）。
     //    前缀用 `minimaxintl.` 而不是 `minimax.`：① 与 provider id 逐字一致；
     //    ② `minimax.` 前缀一旦被这里接管，将来中国站若加同名端点就会被本分支
@@ -4246,7 +4255,40 @@ function registerJetHubEndpoints(
           // ⚠️ 分支内一律用 `product` / `auth`，**不要**出现 `QODER` 字面量 ——
           // 否则中国版会拿国际版的域名与 client_id 发请求。
           const { product, auth } = requireQoderFamily(provider)
-          const started = await auth.startLogin({ refName })
+          /**
+           * ⚠️⚠️ **必须在 `startLogin` 之前把代理预置进池**（真实报障 2026-10-21）。
+           *
+           * `startQoderLoginFlow` 的**第一步就是打设备码端点**（`openapi.qoder.sh`，
+           * 与国际版余额/推理**同一台被 SNI 阻断的主机**）⇒ 墙外环境下没有出口
+           * 连登录都起不来。而出口是账号维度的、只能从池里那条**占位条目**读
+           * ⇒ 顺序必须是「先入库（带代理）→ 再 startLogin」。
+           *
+           * ⚠️ 原实现是**先 `startLogin`、后 `addAccount`** —— 那时池里没有这个
+           * 账号，解析器只能拿空 id 去查 `QODER_PENDING_PROXY_KEY`（登录取不到
+           * 代理时的唯一兜底）。两处都失效（用户没配 pending + 条目还没入库）
+           * ⇒ 国际版登录**恒失败**，报的还是 `UND_ERR_CONNECT_TIMEOUT`，与
+           * 「凭据失效」在 UI 上完全同形 ⇒ 用户只会反复重登。
+           *
+           * ⚠️ 代理来源两级（与 gemini 分支同款取舍）：
+           * ① 载荷显式带（将来 UI 提供「在此输入代理」时用）；
+           * ② **从同 provider 的已有账号继承** —— 当前实际生效路径，因为
+           *    「refresh_token 失效 ⇒ 删号重登」是面板明示的既定动作，而重登
+           *    造的是**全新 id** ⇒ 旧号上的代理必然丢失。
+           *    继承只在**恰好一个账号带代理**时生效（多个时无法判断该继承哪个，
+           *    宁可直连也不要猜错出口把凭据发到错误的代理上）。
+           */
+          const existingQoderProxies = new Set(
+            (await pool.listAccountsByProvider(provider))
+              .map((e) => asProxyText(e.qoderProxy))
+              .filter((p) => p.trim() !== ''),
+          )
+          const requestedQoderProxy = typeof req.qoderProxy === 'string' ? req.qoderProxy.trim() : ''
+          const inheritedQoderProxy = existingQoderProxies.size === 1
+            ? [...existingQoderProxies][0]!
+            : ''
+          const qoderProxyInput = requestedQoderProxy !== ''
+            ? requestedQoderProxy
+            : inheritedQoderProxy
           // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
           // 登录成功后再回填昵称/有效期等真实字段。
           await pool.addAccount({
@@ -4258,6 +4300,12 @@ function registerJetHubEndpoints(
             refreshable: false,
             createdAt: Date.now(),
           })
+          // ⚠️ 走 `setQoderProxy` 而不是直接往 `addAccount` 塞字段：那里有
+          // 「空串删键 + 最新快照合并」的既有口径，直接塞会绕过它们。
+          if (qoderProxyInput !== '') await pool.setQoderProxy(id, qoderProxyInput)
+          // ⚠️ **现在才 startLogin**（顺序见上）：池里已有带代理的占位条目，
+          // 解析器按 `accountId` 就能取到出口。
+          const started = await auth.startLogin({ refName, accountId: id })
           started.result.then(async (loginResult) => {
             const credential = parseQoderCredential(loginResult.access)
             // ⚠️ 设备码轮询响应**不带 `user_name`**，故 `credential.nickname` 恒为空
@@ -4268,7 +4316,14 @@ function registerJetHubEndpoints(
             //（与 `toLoginFlowResult` 对过期时间的处理同原则）。
             let nickname = credential?.nickname
             if ((nickname === undefined || nickname.length === 0) && credential !== undefined) {
-              nickname = await fetchQoderUserNickname(credential, product)
+              // ⚠️ **userinfo 也在 `openapi.qoder.sh` 上 ⇒ 必须走该账号的出口代理**
+              // （真实缺口，2026-10-21 随代理接线发现）。漏接的症状极具误导性：
+              // 国际版账号登录**本身成功了**（登录走 `startLogin` 的 fetcher，已接），
+              // 卡片却永远显示 `qoder-xxxx` 而不是真实昵称 —— 看起来像「上游没下发
+              // 用户名」，实则是这一次 userinfo 直连超时、被 `fetchQoderUserNickname`
+              // 按设计安静吞掉（它失败返回 `undefined`，不抛错）。
+              // 代理按**账号 id** 取：此刻占位条目已入库（见上文顺序说明）。
+              nickname = await fetchQoderUserNickname(credential, product, qoderFetchForAccount(id))
               // 写回**凭据**（不只账号条目）：账号条目会随 Jet Hub 的账号操作
               // 整体重写，而凭据里存一份才能在续期后与其它面板都稳定拿到。
               if (nickname !== undefined && loginResult.access.length > 0) {
@@ -6092,7 +6147,16 @@ function registerJetHubEndpoints(
           const { product } = requireQoderFamily(req.provider)
           const value = await collectClaimResults<QoderCredential, undefined>(accounts, undefined, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential) => claimQoderDailyCheckin(credential, product),
+            // ⚠️ 第三参是每个账号自己的 `entry`（不是 `fetcher` —— 那个
+            // 错位正是 2026-10-08「一键领取 4 个 CodeBuddy 账号全失败：
+            // TypeError: fetcher is not a function」的成因，见
+            // `collectClaimResults` 方法头的长注释）。
+            //
+            // 签到端点同样走 `openapi.qoder.sh` ⇒ 国际版**必须**有出口代理，
+            // 否则一键领取对 qoder 恒失败、对中国版恒成功，看上去像「厂商
+            // 不让我们领」。代理按账号取，与中国版直连互不干扰。
+            claim: (credential, _product, entry) =>
+              claimQoderDailyCheckin(credential, product, qoderFetchForAccount(entry.id)),
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
@@ -6426,7 +6490,14 @@ function registerJetHubEndpoints(
             // 但 TLS ClientHello 被丢（12s 无响应）⇒ fetch 必在 10.7s 后报
             // `UND_ERR_CONNECT_TIMEOUT`。这是**环境问题**，必须点名主机与出路，
             // 否则用户只会以为「凭据坏了」，反复重新登录。
-            const detailed = await fetchQoderBalanceDetailed(credential, product)
+            // ⚠️ **必须按账号取出口代理**（真实报障 2026-10-21）：国际版
+            // `openapi.qoder.sh` 被 SNI 阻断，直连恒 10.7s 超时。而**中国版**
+            // 直连只要 160ms ⇒ 只能按账号配，不能用全局环境变量（那会让
+            // 中国版也一起去挤代理）。配了代理却没接这一格的症状是
+            // 「面板里 10.8 秒才报错、报的还是没有代理的超时」——割裂且极难对应。
+            const detailed = await fetchQoderBalanceDetailed(credential, product, {
+              fetcher: qoderFetchForAccount(account.id),
+            })
             return {
               accountId: account.id,
               nickname: account.nickname,

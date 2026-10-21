@@ -609,6 +609,22 @@ export interface QoderAdapterOptions {
   /** 注入的 fetch（测试用）。 */
   fetchImpl?: typeof fetch
   /**
+   * **按账号**取出口代理的 fetcher（真实报障 2026-10-21）。
+   *
+   * ⚠️ 国际版 `openapi.qoder.sh` 在本机被 SNI 阻断（TLS ClientHello 被丢，
+   * 而 TCP 443 握手正常），实测两个真实账号的**推理通道**同样 10.7s
+   * `TRANSPORT: fetch failed` ⇒ 整个渠道没有实际推理能力。中国版
+   * （`openapi.qoder.com.cn`）直连 434ms 就通 ⇒ 只能按账号配。
+   *
+   * ⚠️ **为什么是「按账号取」而不是构造期一份常量**：适配器在一轮请求内会
+   * **换号**（`switchAccountOnQuota`，见额度/限流/上游故障三条分支），出口必须
+   * 跟着 `activeAccountId` 换 —— 固化会让换号后**仍走旧账号的出口**，
+   * 症状是「换了号还是超时」且**无任何报错**，属最难查的一类静默失效。
+   *
+   * ⚠️ 不传 ⇒ 恒直连（与既有行为逐字一致，所有单测不受影响）。
+   */
+  fetchFor?: (accountId: string) => typeof fetch
+  /**
    * 当前生效账号的 id（额度受限时用于**标记该账号**）。
    *
    * ⚠️ 做成**回调**而不是构造期常量：账号会在 `refreshAll` / 限流切换 /
@@ -665,6 +681,32 @@ export class QoderAdapter extends LlmAdapter {
   private readonly product: QoderProduct
   private readonly fetchImpl: typeof fetch
   /**
+   * 按账号取出口 fetcher（`undefined` = 恒直连）。
+   *
+   * ⚠️ 与 `fetchImpl` **并存不是替代**：`fetchImpl` 是单测替身（优先级最高），
+   * 本字段是生产代理。两者的优先级在 {@link fetcherForAccount} 里定死。
+   */
+  private readonly fetchFor: ((accountId: string) => typeof fetch) | undefined
+  /**
+   * 出口 fetcher 是否被**单测替身**顶掉了（= 注入的 `fetchImpl` 不等于全局 `fetch`）。
+   *
+   * ⚠️ 为什么用「`!==` 全局 `fetch`」而**不是**在构造期记一个
+   * `options.fetchImpl !== undefined` 布尔：`ratelimit-misreport-behavior.spec.ts`
+   * 这类既有用例是**构造后直接 `adapter.fetchImpl = 替身`** 的（拿不到构造参数），
+   * 构造期布尔对它恒为 false ⇒ 实现落到 `fetchFor` / 全局 `fetch` ⇒ 真发网络，
+   * 全量跑起来表现为 `expected 'TRANSPORT' to be 'QUOTA_EXCEEDED'`（本轮实测）。
+   * 而「引用不等于全局 `fetch`」这一判据**同时覆盖**「构造期注入」与「事后赋值」。
+   *
+   * ⚠️ 也不能只把两个分支调序了事 —— `fetchImpl` 在构造期已被 `?? fetch` 填满，
+   * 靠判空无法区分「注入」与「默认」。
+   *
+   * ⚠️ 残余弱点（如实登记）：调用方注入一份**恰好等于全局 `fetch` 的引用**时会被
+   * 判成「未注入」—— 但那时两种语义**没有可观察差异**，不构成缺陷。
+   */
+  private get hasInjectedFetchImpl(): boolean {
+    return this.fetchImpl !== fetch
+  }
+  /**
    * ⚠️ **2026-10-08 Task 7b：三个方法收敛到共享骨架** `createModelCatalog`。
    * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
    * 现在只剩 `toCatalogEntry`（本家私有形状 + 静态表判据 + 倍率格式）。
@@ -703,6 +745,7 @@ export class QoderAdapter extends LlmAdapter {
     super()
     this.product = options.product ?? QODER
     this.fetchImpl = options.fetchImpl ?? fetch
+    this.fetchFor = options.fetchFor
     this.catalogGate = new RemoteCatalogGate(
       options.onCatalogLoaded === undefined ? {} : { onLoaded: options.onCatalogLoaded },
     )
@@ -871,9 +914,24 @@ export class QoderAdapter extends LlmAdapter {
       const req = client.prepareRequest(host, '/api/v1/webSearch/oneSearch', 'POST', 'auth', bodyJson, undefined)
 
       // ④ 发送（headers 原样透传；`X-Session-ID` 跟随官方行为）
-      // ⚠️ 用 `this.fetchImpl`（可注入）而不是模块级 `fetch`：单测要拦上游，
+      // ⚠️ 用**可注入** fetcher 而不是模块级 `fetch`：单测要拦上游，
       //    而这一层**必须**用真 WASM 生成签名（签名无法 mock），故只能换 fetch。
       //
+      // ⚠️ **必须按账号取出口**（真实报障 2026-10-21）：本端点的 host 是
+      //    `encryptedInferBase`，与国际版的推理通道**同一个墙外域**（SNI 阻断）。
+      //    这一层漏接代理的症状是「聊天通了、联网搜索恒 10.7s 超时」——
+      //    看起来像搜索功能坏了，实则是出口没走代理。故与推理通道同源取 fetcher。
+      //    这里用 `currentAccountId()` 而不是循环里的 `activeAccountId`：
+      //    搜索是**独立一次调用**（不在 `_stream` 的换号循环里），没有那个变量。
+      //
+      // ⚠️ 优先级与推理主路径**必须一致**（`fetchImpl` 注入 > `fetchFor` > 全局）：
+      //    两处判序不同会让「推理走了代理、搜索没走」这类半接状态无从察觉。
+      const searchFetcher = this.hasInjectedFetchImpl
+        ? this.fetchImpl
+        : this.fetchFor === undefined
+          ? this.fetchImpl
+          : this.fetchFor(this.options.currentAccountId?.() ?? '')
+
       // ⚠️⚠️ **必须自己 arm 一份预算**（PR95 审计修正的真实缺口）：本模块此前
       //    只透传 `signal`，于是 `NativeSearchCodes.timeout` / `aborted` 在 Qoder
       //    路径**永不产生**，而契约注释却声称「各适配器的 20s 预算小于官方 30s」
@@ -884,7 +942,7 @@ export class QoderAdapter extends LlmAdapter {
 
       let response: Response
       try {
-        response = await this.fetchImpl(req.url, {
+        response = await searchFetcher(req.url, {
           method: 'POST',
           headers: { ...req.headers, 'X-Session-ID': randomUUID() },
           body: req.body,
@@ -1596,6 +1654,31 @@ export class QoderAdapter extends LlmAdapter {
     if (activeAccountId !== undefined && activeAccountId.length > 0) {
       triedAccounts.add(activeAccountId)
     }
+    /**
+     * 取**当前生效账号**该走的 fetcher（真实报障 2026-10-21）。
+     *
+     * ⚠️ **在循环内按 `activeAccountId` 现取**（每次发送前调一次，不缓存）：
+     * 换号后出口必须跟着换 —— 循环外固化一份会让换号后**仍走旧账号的代理**，
+     * 症状是「换了号还是超时」且**无任何报错**，属最难查的一类静默失效
+     * （与 `gemini-adapter.ts` 的同名函数同因，见其注释）。
+     *
+     * ⚠️ 优先级：`fetchImpl`（单测替身，**且必须是显式注入**）> `fetchFor`（生产代理）
+     * > 全局 `fetch`。单测只要传了 `fetchImpl` 就完全绕过代理，不必关心池子。
+     *
+     * ⚠️ 判「是否注入」必须靠 {@link hasInjectedFetchImpl}，**不能**写成
+     * `this.fetchImpl !== fetch`：调用方注入一份**包着全局 fetch 的包装器**时
+     * 两者引用不同，该判据会误判成已注入 ⇒ 生产出口被单测替身顶掉。
+     * ⚠️ 也不能只把两个分支调序了事 —— `fetchImpl` 在构造期已被 `?? fetch`
+     * 填满，调序后 `fetchFor` 反而**永远**轮不到（生产代理全失效）。
+     *
+     * ⚠️ `activeAccountId === undefined` ⇒ 传空串给解析器：它会去查
+     * `QODER_PENDING_PROXY_KEY`（登录预置那条），查不到就直连。
+     */
+    const fetcherForCurrentAccount = (): typeof fetch => {
+      if (this.hasInjectedFetchImpl) return this.fetchImpl
+      if (this.fetchFor === undefined) return this.fetchImpl
+      return this.fetchFor(activeAccountId ?? '')
+    }
     // 4. 剥掉加密端点的响应信封，交给统一的 OpenAI SSE 消费器。
     //
     // ⚠️ **必须放在重试循环内**：排队错误的**第二种**下发形态是
@@ -1624,7 +1707,7 @@ export class QoderAdapter extends LlmAdapter {
     //   国际版的输出**逐字节不变**，中国版从此说自己的名字。
     const label = this.product.id
     for (;;) {
-      response = await this.sendEncrypted(await buildRequest(credential), options)
+      response = await this.sendEncrypted(await buildRequest(credential), options, fetcherForCurrentAccount())
 
       if (!response.ok && (response.status === 401 || response.status === 403)) {
         // ⚠️ 必须**先读体再判断**，且 body 只能读一次 —— 排队信息就藏在
@@ -1941,15 +2024,21 @@ export class QoderAdapter extends LlmAdapter {
     )
   }
 
-  /** 发送一次**加密**推理请求（`agent_chat_generation`）。 */
+  /** 发送一次**加密**推理请求（`agent_chat_generation`）。
+   *
+   * @param fetcher 本次要走的 fetcher（由调用方按**当前生效账号**现取）。
+   *   ⚠️ **必须由调用方传**而不是方法内自己取：换号后出口要跟着换，
+   *   而 `this` 上没有任何字段能反映「循环里当前是哪个账号」。
+   */
   private async sendEncrypted(
     request: { url: string; headers: Record<string, string>; body: string },
     options: GenerateOptions,
+    fetcher: typeof fetch,
   ): Promise<Response> {
     const headers = new Headers(request.headers)
     headers.set('Accept', 'text/event-stream')
     try {
-      return await this.fetchImpl(request.url, {
+      return await fetcher(request.url, {
         method: 'POST',
         headers,
         body: request.body,

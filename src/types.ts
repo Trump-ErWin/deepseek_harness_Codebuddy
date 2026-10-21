@@ -150,6 +150,42 @@ export interface ProviderAccountEntry {
    */
   geminiProxy?: string
   /**
+   * **Qoder**（国际版 `openapi.qoder.sh`）账号的出口代理（空/缺省 = 直连）。
+   *
+   * ## 为什么必须有（真实报障 2026-10-21）
+   *
+   * 国际版整站被阻断：DNS 正常、TCP 443 握手正常，但 **TLS ClientHello 被丢**
+   * （SNI 阻断，典型 GFW 行为）。实测两个真实账号：
+   *
+   * - 余额端点 `GET /sash/api/v2/me/usage` ⇒ 10.7–11.3s 后 `UND_ERR_CONNECT_TIMEOUT`；
+   * - 推理通道 `/api/v1/agent_chat_generation` ⇒ 同样 10.7s `TRANSPORT: fetch failed`。
+   *
+   * ⇒ 整个渠道**没有实际推理能力**，不只是「查不到余额」。中国版
+   * （`openapi.qoder.com.cn`）完全正常（余额 160ms、推理 434ms）。
+   *
+   * ## ⚠️ 为什么此前只能靠导出 `HTTPS_PROXY`
+   *
+   * 本字段存在之前，Qoder 是**唯一**有「墙外端点」却没有 per-账号代理入口的渠道
+   * （opencode 有、Gemini 有）—— 用户唯一出路是在启动 DSH 前导出环境变量，
+   * 而那会**让所有渠道一起走代理**（包括本来直连更快的中国版）。
+   *
+   * ## 作用范围：余额查询 + 推理通道（**两条腿都要**）
+   *
+   * 只接推理不接余额 ⇒ 面板照旧 10.8s 才报错、锁定时照旧判「无法确认」；
+   * 只接余额不接推理 ⇒ 面板显示正常但一发请求就超时。两者都必须过代理。
+   *
+   * ⚠️ 与 `opencodeProxy` / `geminiProxy` **刻意分成三个字段**：三者的语义不同
+   * （opencode = 多账号分份额度，Gemini = 墙外授权，Qoder = 国际版整站阻断），
+   * 共用会让「清掉 Qoder 的代理」连带清掉其它渠道的出口配置。
+   *
+   * 空串是合法值（= 用户显式清除，回到直连），**不可**用 falsy 判据把它与
+   * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
+   *
+   * ⚠️ **中国版账号配了也照用**：没人拦着用户给 `qodercn` 配代理（他的网络
+   * 环境可能恰好相反）。判据不按 provider 分叉，只看该账号有没有配。
+   */
+  qoderProxy?: string
+  /**
    * **minimaxintl**（MiniMax 国际站）账号的出口代理（空/缺省 = 直连）。
    *
    * ⚠️ `agent.minimax.io` 按**出口 IP 所在国家**分流：中国大陆来源会被 307 到
@@ -301,6 +337,24 @@ export interface RpcCreateAccountRequest {
    * ⚠️ 缺省 = 空串 = 直连，与既有行为**逐字一致**。
    */
   geminiProxy?: string
+  /**
+   * 出口代理（**仅 Qoder 需要**；真实报障 2026-10-21）。
+   *
+   * ## ⚠️ 为什么登录载荷要带它（与 `geminiProxy` 逐字同因的死锁）
+   *
+   * Qoder 国际版 `openapi.qoder.sh` 被 SNI 阻断，**登录的设备码端点也在同一台
+   * 主机上** ⇒ 墙外环境下没有出口就**连登录都起不来**。而出口是账号维度的，
+   * 只能从池里那条**占位条目**读 ⇒ 占位条目不带代理时第 3 步（换 token）恒直连
+   * ⇒ 登录恒失败；用户又**没法给一个还不存在的账号配代理**（面板的「代理」
+   * 按钮按 `accountId` 打开）⇒ **死锁**。
+   *
+   * 与 Gemini 那份的唯一差别：Qoder 的登录流程在拿到 `accountId` 之前就会发
+   * 设备码请求，所以 `qoder-proxy.ts` 额外有一条 `QODER_PENDING_PROXY_KEY`
+   * 兜底（见那里的注释）。本字段负责的是「`accountId` 已存在」那一半。
+   *
+   * ⚠️ 缺省 = 空串 = 直连，与既有行为**逐字一致**。
+   */
+  qoderProxy?: string
 }
 export interface RpcCreateAccountResponse {
   accountId: string

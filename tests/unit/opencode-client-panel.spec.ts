@@ -186,22 +186,22 @@ describe('弹窗必须是 React 组件（hooks 规则，真实事故 2026-10-02�
     // ⚠️ 2026-10-18：代理弹窗改成按 provider 三元选择
     // （`proxyModal.provider === 'gemini' ? GeminiProxyModal : OpencodeProxyModal`），
     // 逐字串 `React.createElement(OpencodeProxyModal, {` 因此消失。
-    // ⇒ 断言改为「**createElement 的第一个实参是选择器**，且两个弹窗都在其中」
+    // ⇒ 断言改为「**createElement 的第一个实参是选择器**，且各家弹窗都在其中」
     // —— 这比逐字串更强：它同时锁住「用了 createElement」与「没漏掉任一弹窗」。
     //
     // ⚠️ 2026-10-24（MiniMax 国际站账号代理）：选择器抽成了 `proxyModalComponent(provider)`
     // 辅助函数（第三家弹窗加入后，内联三元在两处出现会漂移）。断言同步为
-    // 「createElement 的第一个实参是该函数」，「三家弹窗都被该函数覆盖」
-    // 的判据移到 `minimax-proxy.spec.ts` ⑥ 组（`proxyModalComponent` 逐家点名）。
+    // 「createElement 的第一个实参是该函数」，「各家弹窗都被该函数覆盖」
+    // 的判据移到下面的 `proxyModalComponent` 用例（逐家点名配对）。
     expect(hub).toMatch(
       /React\.createElement\(\s*proxyModalComponent\(proxyModal\.provider\),\s*\{/,
     )
     // 直接调用形态必须消失
     expect(hub).not.toMatch(/\?\s*renderOpencode/)
-    expect(hub).not.toMatch(/\?\s*(?:Opencode|Gemini|MinimaxIntl)(?:Proxy|Key)Modal\(\{/)
+    expect(hub).not.toMatch(/\?\s*(?:Opencode|Gemini|MinimaxIntl|Qoder)(?:Proxy|Key)Modal\(\{/)
   })
 
-  it('⚠️ proxyModalComponent 必须三家齐全，且**每个 provider 映射到正确的弹窗**', () => {
+  it('⚠️ proxyModalComponent 必须四家齐全，且**每个 provider 映射到正确的弹窗**', () => {
     /**
      * ⚠️⚠️ **必须判「配对」而不是「各自出现过」**（PR !145 审计修法）。
      *
@@ -216,6 +216,12 @@ describe('弹窗必须是 React 组件（hooks 规则，真实事故 2026-10-02�
      *
      * ⇒ 改成**逐分支配对断言**：把每个 `if (provider === 'X') return Y;` 抽出来，
      * 判 `X → Y` 的映射，而不是判「两个字符串都在」。
+     *
+     * ⚠️ 2026-10-25（本 fork 的 Qoder 代理合入）：分支从 2 条变 4 条 ——
+     * `qoder` 与 `qodercn` **各占一条 `if`**（都返回 `QoderProxyModal`）。
+     * 两站分开写在 `proxyModalComponent` 里是刻意的：合并成 `||` 后，
+     * 本用例的正则只能匹配到前一站，第二站从此**不设防**（把 `qodercn`
+     * 那个分支改成返回别家，用例仍绿）—— 那正是上面 ② 号变异的老毛病。
      */
     const selector = hub.match(/function proxyModalComponent\([\s\S]*?\n\}/)?.[0]
     expect(selector, '找不到 proxyModalComponent 函数体').toBeDefined()
@@ -223,12 +229,14 @@ describe('弹窗必须是 React 组件（hooks 规则，真实事故 2026-10-02�
     const pairs = [...selector!.matchAll(
       /provider === '([a-z]+)'\)\s*return\s+(\w+);/g,
     )].map((m) => [m[1]!, m[2]!] as const)
-    expect(pairs.length, 'proxyModalComponent 的分支数不是 2 —— 判据会退化成同义反复')
-      .toBe(2)
+    expect(pairs.length, 'proxyModalComponent 的分支数不是 4 —— 判据会退化成同义反复')
+      .toBe(4)
     // ⚠️ 映射必须**逐格正确**：错一格就是「该家按钮打开别家弹窗、保存到别家端点」。
     expect(pairs, 'provider → 弹窗 的映射错了（串端点）').toEqual([
       ['gemini', 'GeminiProxyModal'],
       ['minimaxintl', 'MinimaxIntlProxyModal'],
+      ['qoder', 'QoderProxyModal'],
+      ['qodercn', 'QoderProxyModal'],
     ])
     // 缺省回落 OpencodeProxyModal（未知 provider 的既有行为不可变更）。
     expect(selector!).toContain('return OpencodeProxyModal')

@@ -692,6 +692,71 @@ describe('QoderAdapter 请求构造（加密端点）', () => {
   })
 })
 
+describe('出口 fetcher 的优先级（`fetchImpl` 注入 > `fetchFor` > 全局）', () => {
+  // ⚠️ 本组守的是**注释与实现相反**的一类缺陷（本轮真实发生）：推理主路径一度写成
+  //    `this.fetchFor === undefined ? this.fetchImpl : this.fetchFor(...)`，
+  //    即生产代理压过单测替身 —— 与它自己上方注释
+  //    「`fetchImpl`（单测替身）> `fetchFor`（生产代理）」字字相反。
+  //    ⚠️ 单靠源码断言守不住这种「两边都写了、但语义反了」的形态 ⇒ 必须行为断言。
+  //    ⚠️ 也**不能**只把两个分支调序了事：`fetchImpl` 在构造期已被 `?? fetch` 填满，
+  //    调序后 `fetchFor` 反而永远轮不到（生产代理全失效）⇒ 故实现里另存
+  //    `hasInjectedFetchImpl` 标志，本组同时钉住该标志的语义。
+
+  it('⚠️ 同时传 fetchImpl 与 fetchFor ⇒ fetchImpl 胜出（单测替身不许被生产代理顶掉）', async () => {
+    const injected = vi.fn(async () => envelopeResponse([textFrame('hi'), finishFrame])) as unknown as typeof fetch
+    const proxy = vi.fn(async () => envelopeResponse([textFrame('hi'), finishFrame])) as unknown as typeof fetch
+    await collect(makeAdapter({ fetchImpl: injected, fetchFor: () => proxy }))
+    expect(injected, '注入的 fetchImpl 必须被调用').toHaveBeenCalled()
+    expect(proxy, 'fetchFor 不得压过注入的 fetchImpl').not.toHaveBeenCalled()
+  })
+
+  it('⚠️ 未注入 fetchImpl ⇒ 走 fetchFor（这条腿不能因为调序而失效）', async () => {
+    const proxy = vi.fn(async () => envelopeResponse([textFrame('hi'), finishFrame])) as unknown as typeof fetch
+    // ⚠️ 不能让「代理没被调用」这件事表现为**真发网络 + 5s 超时**（实测「恒 true」与
+    //    「调序不加标志」两个变异都是这么红的）：那种红只有个 `Test timed out`，
+    //    看不出真因。故给一个 2s 的有界等待，超时后给出带渠道名的断言失败。
+    //    同时把全局 fetch 也替成 spy —— 万一实现落到末档，也不会真打网络。
+    const globalSpy = vi.fn(async () => envelopeResponse([textFrame('hi'), finishFrame])) as unknown as typeof fetch
+    const original = globalThis.fetch
+    // @ts-expect-error —— 故意替换全局 fetch，避免变异态下真发 HTTPS。
+    globalThis.fetch = globalSpy
+    try {
+      const started = Date.now()
+      const drained = collect(makeAdapter({ fetchFor: () => proxy }))
+      const settled = await Promise.race([
+        drained.then(() => 'done' as const),
+        new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 2000)),
+      ])
+      expect(settled, `fetchFor 在 ${Date.now() - started}ms 内没被用上（请求走去了别处）`).toBe('done')
+      expect(proxy, '生产代理必须被调用').toHaveBeenCalled()
+      expect(globalSpy, '不得回落到全局 fetch').not.toHaveBeenCalled()
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+
+  it('两者都未传 ⇒ 落到全局 fetch（不崩、不抛）', async () => {
+    // 判据只要求「构造成功且 stream 走到发请求那一步」：真发全局 fetch 会打网络，
+    // 故注入一个**替身**作为全局 fetch 的替位，再看它是否被用上。
+    const globalSpy = vi.fn(async () => envelopeResponse([textFrame('hi'), finishFrame])) as unknown as typeof fetch
+    const original = globalThis.fetch
+    // @ts-expect-error —— 故意替换全局 fetch 以观测「末档兜底」是否还在。
+    globalThis.fetch = globalSpy
+    try {
+      const adapter = new QoderAdapter({
+        credentialRef: { name: 'QODER_ACCESS_TOKEN' } as never,
+        resolveCredential: async () => cred,
+        refresh: async () => {},
+        product: QODER,
+      })
+      await collect(adapter)
+      expect(globalSpy, '末档必须仍是全局 fetch').toHaveBeenCalled()
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+})
+
 describe('QoderAdapter 鉴权与重试', () => {
   it('401 时刷新一次凭据后重试', async () => {
     let calls = 0
