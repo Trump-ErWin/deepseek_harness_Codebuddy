@@ -25,7 +25,7 @@
     "build:assets": "node scripts/copy-assets.mjs",
     "qoder:wasm": "node scripts/extract-qoder-wasm.mjs",
     "build:all": "tsc -p tsconfig.json && node scripts/copy-assets.mjs && node plugin-src/client/build.mjs",
-    "prepare": "npm run build:all",
+    "prepare": "tsc -p tsconfig.json && node scripts/copy-assets.mjs && node plugin-src/client/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:tests": "tsc -p tsconfig.tests.json",
     "pretest": "npm run typecheck:tests",

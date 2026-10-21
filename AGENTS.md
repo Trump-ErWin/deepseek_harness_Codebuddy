@@ -39,8 +39,15 @@
 - **Node.js**：`^22.19.0 || >=24.0.0`
 - **构建系统**：宿主侧用 TypeScript `tsc` 编译到 `lib/`；客户端 bundle 用
   `esbuild`（`plugin-src/client/build.mjs`）打包到 `lib/client/jet-hub.js`。
-  两者都产出到已 gitignore 的 `lib/`，`prepare` 执行 `pnpm build:all` 保证
-  git 安装时两侧产物齐全。
+  两者都产出到已 gitignore 的 `lib/`，`prepare` 保证 git 安装时两侧产物齐全。
+  ⚠️⚠️ **`prepare` 必须内联真实命令**（`tsc -p tsconfig.json && node
+  scripts/copy-assets.mjs && node plugin-src/client/build.mjs`），
+  **不得出现 `pnpm` / `npm` / `yarn` 任何一个名字**（2026-10-21 合并审计实测）：
+  DSH 只用 pnpm 装插件、pnpm 在 clone 目录里跑 `prepare`，而 **pnpm 10 / 11
+  不会把 npm 注入 PATH**（只有 pnpm ≥ 12 才会）⇒ `prepare` 里写 `npm run …`
+  在 pnpm 10/11 上**必然安装失败**（实测三档：10.20.0 / 11.0.0 失败、12.8.2 成功）。
+  ⇒ 守卫见 `tests/unit/package-install-scripts.spec.ts`。
+  ⚠️ `pretest` 仍用 `npm run`（纯开发期路径，那时包管理器必然在）—— 刻意不同。
   ⚠️ **`tsc` 不清理「源文件已删除」的产物**：改名/删文件后 `lib/` 会留着旧的
   `.js` / `.d.ts` / `.map`（2026-10-01 把 `cline-modalities.ts` 换成
   `cline-models-dev.ts` 时实测到，`lib/cline-modalities.*` 四个文件仍在，
