@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import { fetchQoderCreditBalance, QODER_USAGE_PATH } from '../../src/qoder-credits.js'
-import { QODER } from '../../src/qoder-product.js'
+import { fetchQoderBalanceDetailed, fetchQoderCreditBalance, QODER_USAGE_PATH } from '../../src/qoder-credits.js'
+import { QODER, QODER_CN } from '../../src/qoder-product.js'
 import { buildQoderCredential, parseQoderTokenPayload, type QoderCredential } from '../../src/qoder.js'
 
 const cred: QoderCredential = buildQoderCredential(
@@ -231,5 +231,138 @@ describe('Qoder 积分余额', () => {
   it('响应形状非法时返回 null（不误报 0）', async () => {
     const fetcher = vi.fn(async () => new Response('{"displayMode":"qoder"}', { status: 200 })) as unknown as typeof fetch
     await expect(fetchQoderCreditBalance(cred, QODER, fetcher)).resolves.toBeNull()
+  })
+})
+
+/**
+ * `fetchQoderBalanceDetailed` —— 面板用的**带原因**变体。
+ *
+ * ## 这些用例守的不变式
+ *
+ * 原实现把四种完全不同的处境压成同一句「积分查询失败（凭据失效或响应异常）」：
+ *
+ * | 真实原因 | 用户该做什么 |
+ * |---|---|
+ * | 网络出不去（SNI 阻断） | 配代理 / 换网络 |
+ * | 401 | 重新登录 |
+ * | 服务端 500 | 等一会儿再试 |
+ * | 企业版无数字 | 去网页端看（**什么也不用修**） |
+ *
+ * ⇒ 判据是「**这四个原因必须产生四句不同的话**」，而不只是「有 error 字段」。
+ * 只断言 `error !== undefined` 的用例对下列任意单点退化都无牙（都还会通过）。
+ */
+describe('fetchQoderBalanceDetailed（带原因的余额查询）', () => {
+  it('成功时 balance 有值且不带 error', async () => {
+    const fetcher = vi.fn(async () => usageResponse()) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(detail.balance?.total).toBe(100)
+    expect(detail.error).toBeUndefined()
+  })
+
+  it('★ 网络出不去：点名**实际主机**并给出口路（不是「凭据失效」）', async () => {
+    const cause = Object.assign(new Error('getaddrinfo'), { code: 'UND_ERR_CONNECT_TIMEOUT' })
+    const fetcher = vi.fn(async () => { throw new TypeError('fetch failed', { cause }) }) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(detail.balance).toBeNull()
+    // 必须点名主机 —— 用户据此判断「是不是这个域名不通」
+    expect(detail.error).toContain('https://openapi.qoder.sh')
+    // 必须带根因码
+    expect(detail.error).toContain('UND_ERR_CONNECT_TIMEOUT')
+    // ⚠️ 必须给出路；且**不得**提「凭据失效」这种会把人带偏的结论
+    expect(detail.error).toContain('HTTPS_PROXY')
+    expect(detail.error).not.toContain('凭据失效')
+  })
+
+  it('★ 中国版要点名中国版主机（同族两站不许串）', async () => {
+    const cause = Object.assign(new Error('timeout'), { code: 'UND_ERR_CONNECT_TIMEOUT' })
+    const fetcher = vi.fn(async () => { throw new TypeError('fetch failed', { cause }) }) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER_CN, { fetcher })
+    expect(detail.error).toContain('https://openapi.qoder.com.cn')
+    expect(detail.error).not.toContain('openapi.qoder.sh')
+  })
+
+  it('★ 非网络异常：带原始 message（不吞），且不冒充「出不去」', async () => {
+    const fetcher = vi.fn(async () => { throw new Error('socket hang up') }) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(detail.balance).toBeNull()
+    expect(detail.error).toContain('socket hang up')
+    expect(detail.error).not.toContain('HTTPS_PROXY')
+  })
+
+  it('★ 401：明确指向「重新登录」，不指向代理', async () => {
+    const fetcher = vi.fn(async () => new Response('unauthorized', { status: 401 })) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(detail.balance).toBeNull()
+    expect(detail.error).toContain('401')
+    expect(detail.error).toContain('重新登录')
+    expect(detail.error).not.toContain('HTTPS_PROXY')
+  })
+
+  it('★ 403 与 401 同属凭据问题，但文案保留状态码（不合并成「凭据失效」）', async () => {
+    const fetcher = vi.fn(async () => new Response('forbidden', { status: 403 })) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(detail.error).toContain('403')
+    expect(detail.error).toContain('重新登录')
+  })
+
+  it('★ 5xx：带状态码、不提登录也不提代理（用户无事可做）', async () => {
+    const fetcher = vi.fn(async () => new Response('boom', { status: 500 })) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(detail.error).toContain('500')
+    expect(detail.error).not.toContain('重新登录')
+    expect(detail.error).not.toContain('HTTPS_PROXY')
+  })
+
+  it('★ 企业版：说清「上游不给数字、去网页端」，不许说成故障', async () => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      displayMode: 'enterprise',
+      enterpriseUsage: { openMode: 'externalBrowser', detailUrl: 'https://qoder.com/x' },
+    }), { status: 200 })) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(detail.balance).toBeNull()
+    expect(detail.error).toContain('企业版')
+    expect(detail.error).not.toContain('失败')
+  })
+
+  it('★ 四种处境的文案两两不同（防「又退回同一句话」）', async () => {
+    const mk = (impl: () => Promise<Response>) => vi.fn(impl) as unknown as typeof fetch
+    const blocked = await fetchQoderBalanceDetailed(cred, QODER, {
+      fetcher: mk(async () => { throw new TypeError('fetch failed', { cause: Object.assign(new Error('x'), { code: 'UND_ERR_CONNECT_TIMEOUT' }) }) }),
+    })
+    const unauthorized = await fetchQoderBalanceDetailed(cred, QODER, {
+      fetcher: mk(async () => new Response('x', { status: 401 })),
+    })
+    const serverError = await fetchQoderBalanceDetailed(cred, QODER, {
+      fetcher: mk(async () => new Response('x', { status: 502 })),
+    })
+    const enterprise = await fetchQoderBalanceDetailed(cred, QODER, {
+      fetcher: mk(async () => new Response(JSON.stringify({ displayMode: 'enterprise' }), { status: 200 })),
+    })
+    const messages = [blocked.error, unauthorized.error, serverError.error, enterprise.error]
+    expect(new Set(messages).size, `四种原因必须四句不同的话，实际：${JSON.stringify(messages)}`).toBe(4)
+  })
+
+  it('★ 非 JSON 响应：原因指向「响应不是 JSON」', async () => {
+    const fetcher = vi.fn(async () => new Response('<html>', { status: 200 })) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(detail.error).toContain('不是 JSON')
+  })
+
+  it('★ 缺 qoderUsage：原因指向缺字段（不误报 0 余额）', async () => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({ displayMode: 'qoder' }), { status: 200 })) as unknown as typeof fetch
+    const detail = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(detail.error).toContain('qoderUsage')
+  })
+
+  it('薄封装与详细变体解析结果**逐字段一致**（同一份 parse，不许各解一套）', async () => {
+    const fetcher = vi.fn(async () => usageResponse({
+      userQuota: { total: 500, used: 200, remaining: 300, unit: 'credits' },
+      dedicatedResourcePackages: [
+        { id: 'p1', name: '包A', total: 50, used: 10, remaining: 40, unit: 'credits' },
+      ],
+    })) as unknown as typeof fetch
+    const thin = await fetchQoderCreditBalance(cred, QODER, fetcher)
+    const detailed = await fetchQoderBalanceDetailed(cred, QODER, { fetcher })
+    expect(detailed.balance).toEqual(thin)
   })
 })
