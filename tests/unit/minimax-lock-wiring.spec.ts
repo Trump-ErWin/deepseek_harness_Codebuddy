@@ -145,24 +145,81 @@ describe('★ MiniMax：`index.ts` 的接线（源码级，守纯文本形态的
       .not.toMatch(/product: MINIMAX,[\s\S]{0,400}selector:\s*minimaxIntlBalanceSelector,/)
     expect(indexCode).toMatch(/lockedError:\s*minimaxLockedError\('MiniMax Code \(中国版\)'\)/)
     expect(indexCode).toMatch(/lockedError:\s*minimaxLockedError\('MiniMax Code \(国际版\)'\)/)
-    expect(indexCode, '必须接限流判定（池被筛空时会误报「请先登录」）')
-      .toMatch(/throwIfAllRateLimited:\s*throwIfAllAccountsRateLimited/)
+    for (const [selector, display] of [
+      ['minimaxBalanceSelector', "minimaxLockedError('MiniMax Code (中国版)')"],
+      ['minimaxIntlBalanceSelector', "minimaxLockedError('MiniMax Code (国际版)')"],
+    ] as const) {
+      const at = indexCode.indexOf(`selector: ${selector},`)
+      expect(at, `找不到 selector: ${selector},`).toBeGreaterThan(-1)
+      const candidates = [
+        indexCode.indexOf('selector: minimaxBalanceSelector,', at + 1),
+        indexCode.indexOf('selector: minimaxIntlBalanceSelector,', at + 1),
+        indexCode.indexOf('\n  const ', at + 1),
+        indexCode.indexOf('registerMinimaxLlm(', at + 1),
+      ].filter((i) => i > at)
+      let end = candidates.length > 0 ? Math.min(...candidates) : undefined
+      // ⚠️ 收紧：若区间内出现 `throwIfAllRateLimited`，就把它所在的那个
+      //    `balance` 块收尾（下一个同级 `},`）当作终点 —— 避免把下一站
+      //    的 balance 块也圈进来（否则报错时点名的渠道会错位）。
+      const withRate = indexCode.indexOf('throwIfAllRateLimited:', at)
+      if (withRate !== -1 && (end === undefined || withRate < end)) {
+        const close = indexCode.indexOf('\n      },', withRate)
+        if (close !== -1 && (end === undefined || close < end)) end = close
+      }
+      const block = indexCode.slice(at, end)
+      expect(block.length, `${selector} 的接线区间切成了空——判据会变成同义反复`).toBeGreaterThan(50)
+      expect(block, `${selector} 的区间必须含 lockedError: ${display}`).toContain(`lockedError: ${display}`)
+      expect(
+        block,
+        `${selector} 必须接 throwIfAllRateLimited（池被本模型限流时会误报「请先登录」）`,
+      ).toMatch(/throwIfAllRateLimited:\s*throwIfAllAccountsRateLimited/)
+    }
   })
 
-  it('⚠️ 两站都必须 `reportPickedAccount: true`（账本归属不能因新增 balance 而丢）', () => {
-    // ⚠️ 这是一个**真实踩点**：buddy 系那两处写的是 `false`（旧闭包的历史不对称），
-    //    而 MiniMax 的旧闭包是**纯池选号**、账本**一直在回报**。照抄 `false` 会让
-    //    「分档选中」那一支不再回报 ⇒ token 用量记不到这个渠道上（静默）。
-    //    该形态由 `tests/unit/credential-resolver.spec.ts` 的
-    //    「<provider>：池命中时回报 token 账本」逐家驱动 `apply()` 守着。
-    const occurrences = indexCode.match(/reportPickedAccount:\s*true,/g) ?? []
-    expect(occurrences.length, '两站各需一处 reportPickedAccount: true').toBeGreaterThanOrEqual(2)
-    // 反面对照：本家的定义块里不得出现 `false`。
-    for (const anchor of ['const minimax = new MinimaxAuth(ctx)', 'const minimaxIntl = new MinimaxAuth(ctx, { product: MINIMAX_INTL })']) {
-      const start = indexCode.indexOf(anchor)
-      expect(start, `找不到 ${anchor}`).toBeGreaterThan(-1)
-      const block = indexCode.slice(start, indexCode.indexOf('product: MINIMAX', start) + 400)
-      expect(block, `${anchor} 的注册段不得写 reportPickedAccount: false`)
+  /**
+   * ⚠️ 两站都必须 `reportPickedAccount: true`（账本归属不能因新增 balance 而丢）。
+   *
+   * ⚠️ 这是**真实踩点**：buddy 系那两处写的是 `false`（旧闭包的历史不对称），
+   *    而 MiniMax 的旧闭包是**纯池选号**、账本**一直在回报**。照抄 `false` 会让
+   *    「分档选中」那一支不再回报 ⇒ token 用量记不到这个渠道上（静默）。
+   *
+   * ⚠️⚠️ **原判据是「全局出现次数 >= 2」⇒ 无牙**（2026-10-21 审计实测）：
+   *    全局有 **4 处** `reportPickedAccount: true`（qoder 两站 + minimax 两站），
+   *    把国际站那处改成 `false` 后仍有 3 处 ⇒ `>= 2` 照样成立 ⇒ **全绿**。
+   *    反向对照的 `block` 切片（`indexOf('product: MINIMAX', start) + 400`）
+   *    也**不含 balance 块**（实测该区间既无 true 也无 false）⇒ 同样恒绿。
+   *
+   * ⇒ 改成逐站切片（与 `throwIfAllRateLimited` 那条同款）。
+   */
+  it('⚠️ 两站都必须 `reportPickedAccount: true`（逐站切片，不得只数全局次数）', () => {
+    for (const [selector, display] of [
+      ['minimaxBalanceSelector', "minimaxLockedError('MiniMax Code (中国版)')"],
+      ['minimaxIntlBalanceSelector', "minimaxLockedError('MiniMax Code (国际版)')"],
+    ] as const) {
+      const at = indexCode.indexOf(`selector: ${selector},`)
+      expect(at, `找不到 selector: ${selector},`).toBeGreaterThan(-1)
+      const candidates = [
+        indexCode.indexOf('selector: minimaxBalanceSelector,', at + 1),
+        indexCode.indexOf('selector: minimaxIntlBalanceSelector,', at + 1),
+        indexCode.indexOf('\n  const ', at + 1),
+        indexCode.indexOf('registerMinimaxLlm(', at + 1),
+      ].filter((i) => i > at)
+      let end = candidates.length > 0 ? Math.min(...candidates) : undefined
+      // ⚠️ 收紧：若区间内出现 `throwIfAllRateLimited`，就把它所在的那个
+      //    `balance` 块收尾（下一个同级 `},`）当作终点 —— 避免把下一站
+      //    的 balance 块也圈进来（否则报错时点名的渠道会错位）。
+      const withRate = indexCode.indexOf('throwIfAllRateLimited:', at)
+      if (withRate !== -1 && (end === undefined || withRate < end)) {
+        const close = indexCode.indexOf('\n      },', withRate)
+        if (close !== -1 && (end === undefined || close < end)) end = close
+      }
+      const block = indexCode.slice(at, end)
+      expect(block.length, `${selector} 的接线区间切成了空——判据会变成同义反复`).toBeGreaterThan(50)
+      expect(block, `${selector} 所在的 balance 块必须 lockedError: ${display}`)
+        .toContain(`lockedError: ${display}`)
+      expect(block, `${selector} 必须 reportPickedAccount: true（否则账本归属丢失）`)
+        .toMatch(/reportPickedAccount:\s*true,/)
+      expect(block, `${selector} 不得写 reportPickedAccount: false`)
         .not.toMatch(/reportPickedAccount:\s*false/)
     }
   })
@@ -196,6 +253,46 @@ describe('★ MiniMax：`index.ts` 的接线（源码级，守纯文本形态的
     // 错误码必须是宿主可分类的那种（QUOTA_EXCEEDED），不能是裸 Error。
     expect(block, '必须用 LlmError 而非裸 Error（裸 Error 没有 code）').toContain('new LlmError(')
     expect(block, '两站共用本函数，displayName 必须逐站区分').toContain('displayName')
+  })
+
+  /**
+   * ★★ **`fetchBalance` 闭包内必须透传 `product` 形参**（2026-10-21 审计发现：零覆盖）。
+   *
+   * `BuddyBalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
+   * ⇒ 闭包里若忽略形参、写死站点常量，请求会打到**对方站点**：
+   * ```
+   * 正常          → 用 deps.product      ✓
+   * 写死 MINIMAX  → 中国版常量           ✗ 打错站点 ⇒ 余额恒 null
+   * ```
+   * 后果：未锁定时换号优化失效、锁定时永远报「没有可用账号」（静默）。
+   *
+   * 审计实测：把中国版的闭包恒传 `MINIMAX_INTL`，本文件 **14 条全绿** —— 零覆盖。
+   * ⇒ 按构造块切片断言（全局正则会命中别人家）。
+   */
+  it('★★ 两站的 fetchBalance 闭包必须透传 product 形参（不得写死对方站点）', () => {
+    const cases = [
+      ['minimaxBalanceSelector', 'MINIMAX_INTL'],
+      ['minimaxIntlBalanceSelector', 'MINIMAX,'],
+    ] as const
+    for (const [name, other] of cases) {
+      const start = indexCode.indexOf(`const ${name} = new BuddyBalanceSelector({`)
+      expect(start, `找不到 ${name}`).toBeGreaterThan(-1)
+      // ⚠️ 终点不能取 `\n  })`：minimax 的`fetchBalance` 闭包体里就有同样缩进的
+      //    `})` 收尾（多行箭头函数），会提前截断 ⇒ 实测 `fetchBalance` 都取不到。
+      //    改取下一个同级 `const` 声明。
+      const end = indexCode.indexOf('\n  const ', start + 10)
+      const block = indexCode.slice(start, end === -1 ? undefined : end)
+      expect(block.length, `${name} 的构造块切成了空——判据会变成同义反复`).toBeGreaterThan(60)
+      const lines = block.match(/fetchBalance:[\s\S]*?(?=\n\s*\}\)|$)/)
+      expect(lines, `${name} 必须注入 fetchBalance`).not.toBeNull()
+      // 形参必须叫 product 且被传给 fetchMinimaxCreditBalance。
+      expect(lines![0], `${name} 的 fetchBalance 必须含 (credential, product) =>`)
+        .toMatch(/\(credential, product\)\s*=>/)
+      expect(lines![0], `${name} 必须把 product 形参传给 fetchMinimaxCreditBalance`)
+        .toMatch(/fetchMinimaxCreditBalance\(credential, fetch, product/)
+      expect(lines![0], `★ ${name} 的 fetchBalance 不得写死 ${other}（会打到对方站点）`)
+        .not.toContain(other)
+    }
   })
 })
 

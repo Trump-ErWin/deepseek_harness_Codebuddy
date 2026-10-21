@@ -247,10 +247,47 @@ describe('★ Qoder：`index.ts` 的接线（源码级，守纯文本形态的�
     expect(occurrences.length, '至少两处（两站各一）').toBeGreaterThanOrEqual(2)
   })
 
-  it('★ 两站都接限流判定（池被筛空时会误报「请先登录」）', () => {
-    // Gitee IKJOZ9 的原症状就在 qoder 上：唯一账号被该模型限流 ⇒ 候选空 ⇒
-    // 误报「请先登录」。接线不能因为新增 balance 而丢。
-    expect(indexCode).toMatch(/throwIfAllRateLimited:\s*throwIfAllAccountsRateLimited/)
+  /**
+   * ★ 两站都接限流判定（池被筛空时会误报「请先登录」，Gitee IKJOZ9）。
+   *
+   * ⚠️⚠️ **判据必须按渠道切片**（2026-10-21 审计实测：原版**无牙**）。
+   *
+   * 原版是一句**全局** `expect(indexCode).toMatch(/throwIfAllRateLimited: …/)`，
+   * 而 `src/index.ts` 里有 **16 处**该字段 ⇒ 删掉 qoder（或 qodercn）自己那一处，
+   * 全局正则**照样命中别人家的** ⇒ 永远绿。审计员实测：分别删中国版 / 国际站
+   * 各一处，**两次都全绿**。
+   *
+   * ⇒ 改成「在**该站的选号器接线区间内**断言」。区间取法：
+   *    从 `selector: <该站选号器>,` 起，到**下一个** `selector: <另一站选号器>,` /
+   *    `const ` 级声明 / `registerQoderLlm` 调用之前。
+   *    ⚠️ 不能取裸 `'},'` 作终点：`fallback: { kind: 'ref', … }` 里也有 `},`，
+   *    而 `throwIfAllRateLimited` 恰好排在 `fallback` **之后** ⇒ 会切成空区间
+   *    （这正是上一版无牙的另一种形态）。
+   */
+  it('★ 两站都接限流判定（按渠道切片，不得用全局正则）', () => {
+    for (const [selector, display] of [
+      ['qoderBalanceSelector', "qoderLockedError('Qoder')"],
+      ['qoderCnBalanceSelector', "qoderLockedError('Qoder (中国版)')"],
+    ] as const) {
+      const at = indexCode.indexOf(`selector: ${selector},`)
+      expect(at, `找不到 selector: ${selector},`).toBeGreaterThan(-1)
+      // 终点：下一站选号器 / 下一段 const / 适配器注册，三者谁先到取谁。
+      const candidates = [
+        indexCode.indexOf('selector: qoderBalanceSelector,', at + 1),
+        indexCode.indexOf('selector: qoderCnBalanceSelector,', at + 1),
+        indexCode.indexOf('\n  const ', at + 1),
+        indexCode.indexOf('registerQoderLlm(', at + 1),
+      ].filter((i) => i > at)
+      const end = candidates.length > 0 ? Math.min(...candidates) : undefined
+      const block = indexCode.slice(at, end)
+      expect(block.length, `${selector} 的接线区间切成了空——判据会变成同义反复`).toBeGreaterThan(50)
+      expect(block, `${selector} 的区间必须含 lockedError: ${display}`).toContain(`lockedError: ${display}`)
+      expect(
+        block,
+        `${selector} 必须接 throwIfAllRateLimited —— 否则该号被本模型限流、池被筛空时`
+        + '会误报「请先登录」（Gitee IKJOZ9 的原症状）',
+      ).toMatch(/throwIfAllRateLimited:\s*throwIfAllAccountsRateLimited/)
+    }
   })
 
   it('★ 两站都**不传** XFF（与 MiniMax 国际站的关键差异）', () => {
@@ -289,6 +326,51 @@ describe('★ Qoder：`index.ts` 的接线（源码级，守纯文本形态的�
     )
     expect(credentialOnly, 'credential-only 档不得编造「N 天内到期」')
       .not.toContain('天内到期')
+  })
+
+  /**
+   * ★★ **`fetchBalance` 闭包内必须透传 `product` 形参，不得写死站点常量**
+   * （2026-10-21 审计发现：三份 spec 对这一格**零覆盖**，而它正是本文件头警告的那件事）。
+   *
+   * ## 缺陷（实测可打穿）
+   *
+   * `BuddyBalanceSelector` 有**两条**取数腿：构造参数 `product` 与注入的
+   * `fetchBalance(credential, product)`。上面那些用例只钉前者（`product: QODER,`），
+   * 而把闭包写成 `fetchQoderCreditBalance(credential, QODER_CN)`（**写死对方站点**）
+   * 后，本文件 **22 条全绿** —— 审计员实测确认。
+   *
+   * 而 `BuddyBalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
+   * ⇒ 闭包里若忽略形参、写死常量，请求就会打到**对方站点**：
+   * ```
+   * 正常    → fetch 打到 openapi.qoder.sh        ✓
+   * 写死 CN → fetch 打到 openapi.qoder.com.cn    ✗ 打错站点
+   * ```
+   * 后果（本文件头已逐字写明）：对方站点不认本站 token ⇒ 余额恒 `null`
+   * ⇒ 未锁定时换号优化失效、锁定时永远报「没有可用账号」。
+   *
+   * ## 判据
+   *
+   * 按**该站选号器的构造块**切片，断言 `fetchBalance:` 那一行**引用了 `product` 形参**
+   * 且**不出现另一站的常量**。这是源码级判据，因此必须切片 + 长度自检
+   * （全局正则会命中别人家，正是刚修掉的那类无牙）。
+   */
+  it('★★ 两站的 fetchBalance 闭包必须透传 product 形参（不得写死对方站点）', () => {
+    const cases = [
+      ['qoderBalanceSelector', 'QODER', 'QODER_CN'],
+      ['qoderCnBalanceSelector', 'QODER_CN', 'QODER'],
+    ] as const
+    for (const [name, own, other] of cases) {
+      const start = indexCode.indexOf(`const ${name} = new BuddyBalanceSelector({`)
+      expect(start, `找不到 ${name}`).toBeGreaterThan(-1)
+      const block = indexCode.slice(start, indexCode.indexOf('\n  })', start))
+      expect(block.length, `${name} 的构造块切成了空——判据会变成同义反复`).toBeGreaterThan(60)
+      const line = block.match(/fetchBalance:[^\n]*/)
+      expect(line, `${name} 必须注入 fetchBalance`).not.toBeNull()
+      expect(line![0], `${name} 的 fetchBalance 必须透传 product 形参`)
+        .toMatch(/\(credential, product\)\s*=>\s*fetchQoderCreditBalance\(credential, product\)/)
+      expect(line![0], `★ ${name} 的 fetchBalance 不得写死 ${other}（会打到对方站点，余额恒 null）`)
+        .not.toContain(`${other}`)
+    }
   })
 })
 

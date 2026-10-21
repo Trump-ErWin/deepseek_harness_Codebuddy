@@ -281,11 +281,82 @@ describe('★★ AStudio：分档行为（驱动生产判据，不是复述实�
       .toBe(BUDDY_BALANCE_TIER.expiring)
   })
 
-  it('★ 窗口天数与前端/后端同源（15 天，可用环境变量覆盖）', () => {
+  it('★ 窗口天数与前端/后端同源（15 天常量；env 覆盖由 permanent-lock-execution 守）', () => {
     // 数字写岔会让用户看到「提示说只烧 8 天内的，实际按 15 天筛号」。
     expect(BUDDY_EXPIRING_WINDOW_DAYS).toBe(15)
     // AStudio 的选号器与 buddy 系共用 `BuddyBalanceSelector`，故窗口也共用一份
     // 判据（`buddy-balance-rank.ts` 是唯一真源）。
+    //
+    // ⚠️ **本用例只断言常量**（2026-10-21 审计指出原标题「可用环境变量覆盖」**超发**）：
+    //    把 `buddyExpiringWindowDays` 的 env 参数完全废掉（`void env`），本文件 +
+    //    minimax + lockexec 三份 **38 条全绿** ⇒ 本文件对该能力零牙。
+    //    真正守 env 覆盖的是 `permanent-lock-execution.spec.ts` 的 ⑥
+    //    （设 `DSH_BUDDY_EXPIRING_WINDOW_DAYS=31` 并断言读到 31）。
+    //    ⇒ 标题改成如实描述，别让它看起来比实际强。
+  })
+
+  /**
+   * ★★ **空格形态与 `T` 形态必须给出相同毫秒**（2026-10-21 审计指出：原**零覆盖**）。
+   *
+   * ## 这条守的是「契约」，不是 `replace` 那一行
+   *
+   * `astudioLocalTimeMs` 用 `Date.parse(raw.replace(' ', 'T'))` 收进 ISO 规范形式。
+   * 但审计实测：**当前 V8 对空格形态非常宽容**（甚至多空格也认），
+   * 所以把 `replace` 删掉，本机 109 条相关用例**仍然全绿** —— 那是**实测无牙**，
+   * 已在源码注释里如实登记（不为它编恒真用例）。
+   *
+   * ⇒ 本用例锁的是**两形态必须等价**这个契约：
+   * 换引擎（JSC / SpiderMonkey）或 V8 收紧解析时，空格形态会静默变 `NaN`
+   * ⇒ 该包**静默落永久桶** ⇒ 永久锁对它失效。本用例会当场红。
+   */
+  it('★★ 空格形态与 T 形态给出相同的毫秒（守两形态等价的契约）', () => {
+    const mk = (expire: string) => ({
+      ...balancePayload(null),
+      activityNextExpireTime: expire,
+    })
+    const tForm = buildAstudioBalance(mk('2026-11-20T01:50:14'))
+    const spaceForm = buildAstudioBalance(mk('2026-11-20 01:50:14'))
+    const activityOf = (b: ReturnType<typeof buildAstudioBalance>) =>
+      b!.packages.find((p) => p.name.includes('赠送'))!
+    expect(
+      activityOf(spaceForm).deductionEndTime,
+      '★ 空格形态必须与 T 形态同值 —— 删掉 replace 会让空格形态解析失败 ⇒ 静默落永久桶',
+    ).toBe(activityOf(tForm).deductionEndTime)
+    // 自检：两者都必须真的解析出了值（否则「都为 undefined」也会通过上面那条）。
+    expect(activityOf(tForm).deductionEndTime).toBe(Date.parse('2026-11-20T01:50:14'))
+  })
+
+  /**
+   * ★★ **星火池的到期归一化必须有覆盖**（2026-10-21 审计发现：**零覆盖 / 死代码区间**）。
+   *
+   * ## 缺陷
+   *
+   * `buildAstudioBalance` 里有一段专门处理星火池（独立池、不参与主池合计）：
+   * ```js
+   * const sparkDeductionEndTime = astudioLocalTimeMs(data, 'sparkNextExpireTime')
+   * ... ...(sparkDeductionEndTime === undefined ? {} : { deductionEndTime: sparkDeductionEndTime }),
+   * ```
+   * 但 `balancePayload()` 的两个夹具都填 `sparkTotalBalance: 0` 且**不给**
+   * `sparkNextExpireTime` ⇒ `pushPool` 根本不 push 星火池 ⇒ **那 12 行从未被执行**。
+   * 实测：删掉写 `deductionEndTime` 的那一行，**13 条全绿**。
+   *
+   * ⇒ 补一条有星火余额 + 星火到期时间的夹具。
+   */
+  it('★★ 星火池也归一化 deductionEndTime（且仍不进主池合计）', () => {
+    const balance = buildAstudioBalance({
+      ...balancePayload('2026-11-20T01:50:14'),
+      sparkTotalAmount: 500,
+      sparkTotalBalance: 500,
+      sparkNextExpireTime: '2026-11-01T00:00:00',
+    })
+    const spark = balance!.packages.find((p) => p.name.includes('星火'))!
+    expect(spark, '星火池有余额时应产出一个包').toBeDefined()
+    expect(
+      spark.deductionEndTime,
+      '★ 星火池的 sparkNextExpireTime 也必须归一化到 deductionEndTime（否则落永久桶、锁定时拦不住）',
+    ).toBe(Date.parse('2026-11-01T00:00:00'))
+    // ⚠️ 星火池**不参与主池合计**（它的名字里自陈），故 total 仍只算三池。
+    expect(balance!.total).toBe(1100)
   })
 
   it('端点常量指向 AStudio 自己的地址（不是 buddy 系）', () => {
@@ -294,5 +365,31 @@ describe('★★ AStudio：分档行为（驱动生产判据，不是复述实�
     //    错误的余额 URL）。本家已注入，故这条只钉住 product 常量本身。
     expect(ASTUDIO.id).toBe('astudio')
     expect(ASTUDIO.maasBaseUrl).toContain('astronstudio')
+  })
+
+  /**
+   * ★★ **`fetchBalance` 闭包必须透传 `product` 形参**（2026-10-21 审计发现：零覆盖）。
+   *
+   * `BuddyBalanceSelector.select` 调的是 `injected(credential, this.deps.product)`
+   * ⇒ 闭包里忽略形参、写死常量会让取数用错产品配置。
+   * 审计实测：把 astudio 的闭包改成 `async () => null`，本文件 **13 条全绿**。
+   *
+   * ⚠️ astudio 只有**一个** product，故「写死对方站点」不成立；但
+   *    **整个闭包被换掉**（返 `null` / 调别的渠道的 fetch）同样会静默 ——
+   *    余额恒 `null` ⇒ 锁定态永远「没有可用账号」。故仍要钉住「调的是本家的 fetch」。
+   */
+  it('★★ fetchBalance 闭包必须调本家的 fetchAstudioCreditBalance 并透传 product', () => {
+    const start = indexCode.indexOf('const astudioBalanceSelector = new BuddyBalanceSelector({')
+    expect(start, '找不到 astudio 的选号器').toBeGreaterThan(-1)
+    // ⚠️ 终点取下一个同级 `const`：块内可能有多行箭头函数的 `})`。
+    const end = indexCode.indexOf('\n  const ', start + 10)
+    const block = indexCode.slice(start, end === -1 ? undefined : end)
+    expect(block.length, 'astudio 选号器的构造块切成了空——判据会变成同义反复').toBeGreaterThan(60)
+    const line = block.match(/fetchBalance:[^\n]*/)
+    expect(line, 'astudio 必须注入 fetchBalance').not.toBeNull()
+    expect(line![0], '★ 闭包必须调本家的 fetchAstudioCreditBalance（换成别的/恒 null 会让余额恒查不到）')
+      .toContain('fetchAstudioCreditBalance')
+    expect(line![0], '★ 闭包必须透传 product 形参（不能写死或忽略）')
+      .toMatch(/\(credential, product\)\s*=>\s*fetchAstudioCreditBalance\(credential, product\)/)
   })
 })
