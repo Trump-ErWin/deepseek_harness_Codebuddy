@@ -4,6 +4,11 @@
 
 const STYLES = `
 .dim-jh-page { display: flex; flex-direction: column; height: 100%; }
+/* 「侧栏」面板的宿主（main 槽）：中央面板自己不留白，只给顶部一条 28px 的
+   标题带（插件市场页同款）。设置页里的 .dim-jh-page 则由 SettingsRoot 缩进，
+   两条入口共用同一个组件、靠这一层补丁拉开差别。 */
+.dim-jh-panelHost { box-sizing: border-box; height: 100%; min-height: 0; display: flex; flex-direction: column; padding: calc(28px + var(--dsh-frame-top-clearance, 0px)) 24px 24px; }
+.dim-jh-panelHost > .dim-jh-page { flex: 1 1 auto; min-height: 0; }
 /* ⚠️ 左右 padding 为 0（2026-10-14）：宿主 SettingsRoot 已经把整个 section
    内容区按 padding 0 24px 24px 缩进了一层（类名 .wCInkW_options，见
    @deepseek-ai/dsh-client-ui-settings-general/SettingsRoot.module.css）。
@@ -215,6 +220,11 @@ const STYLES = `
 /* 面板标题区：标题独占一行，操作按钮另起一行。
    此前用单行 space-between 把标题与 5 个按钮挤在一起，面板一窄就溢出被裁掉。 */
 .dim-jh-panelHead { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 16px; }
+/* 账号列表容器：panelHead 是 column flex 且 align-items 为 flex-start，容器作为
+   flex item 默认收缩到内容宽度 —— 单个账号时卡片会缩成 ~257px 的窄条（多账号时
+   被那句排序提示撑宽，所以只有单账号暴露）。stretch 让宽度与账号数量无关。 */
+.dim-jh-accountList { align-self: stretch; min-width: 0; }
+.dim-jh-accountList > .dim-jh-accountCard { width: 100%; box-sizing: border-box; }
 .dim-jh-panelTitle { margin: 0; font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
 
 /* 面板标题下方的操作按钮组（显示列表 / 刷新积分 / 一键领取积分 / 重测所有 / 重置所有 / 新建账号）。
