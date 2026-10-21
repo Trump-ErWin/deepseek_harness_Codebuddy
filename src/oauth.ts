@@ -92,6 +92,67 @@ export class RefreshTokenExpiredError extends Error {
   }
 }
 
+/**
+ * 从 JWT 载荷里读 `exp` / `iat`（秒级 → 毫秒）。
+ *
+ * ⚠️ **不解签名**：这里只用于「本地估算还剩多久」的调度判据，不作任何信任判断；
+ * 真正的信任判定由服务端在续期请求时做。若解析失败一律返回 `undefined`，
+ * 调用方必须按「读不到」处理（不得 fail-closed 成「已过期」）。
+ *
+ * ⚠️ 用 `atob` 而非 `Buffer`：本函数必须在**客户端 bundle**（`plugin-src/client`）
+ * 之外也可用，而 `atob` 在 Node 22+ 与浏览器里都是全局的，不需要 import。
+ */
+function readJwtTime(token: string, claim: 'exp' | 'iat'): number | undefined {
+  const parts = token.split('.')
+  if (parts.length !== 3) return undefined
+  const payload = parts[1]
+  if (payload === undefined || payload.length === 0) return undefined
+  try {
+    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = base64.length % 4 === 2 ? `${base64}==`
+      : base64.length % 4 === 3 ? `${base64}=`
+        : base64
+    const json = decodeURIComponent(
+      atob(padded).split('').map((c) => `%${`00${c.charCodeAt(0).toString(16)}`.slice(-2)}`).join(''),
+    )
+    const value = (JSON.parse(json) as Record<string, unknown>)[claim]
+    if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+    // ⚠️ 防御：秒级时间戳乘 1000 后不应超过 1e14（远超公元 5138 年）；
+    // 若拿到这种值说明载荷不是我们认的形状，按「读不到」处理。
+    const ms = value * 1000
+    return Math.abs(ms) > 1e14 ? undefined : ms
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * refresh_token 的到期时刻（毫秒）；读不到返回 `undefined`。
+ *
+ * ## 为什么需要它（2026-10-18 实测两个账号同时报废的根因）
+ *
+ * 华为 STS 的 refresh_token JWT 里，`exp` **恒等于「登录时刻 + 30 天」**，
+ * **续期不会延长它** —— 解开该账号全部历史凭据的 JWT 逐个核对，09-25 / 10-16×3 /
+ * 10-18 五次续期签发的 refresh_token，`exp` 全都收敛到同一个值。
+ * 而 access_token 寿命恒为 2 小时。
+ *
+ * ⇒ 最后一天出现「access 剩 2 小时、refresh 只剩约 50 分钟」的不对称，
+ * 而 lead-time 判据原本**只看 access**，会在 refresh 死线之后才放行，
+ * 那一轮续期必然失败，账号彻底不可用。
+ *
+ * 供 `expiry-sync.ts` 的 lead-time 判据补第二条腿（提前续期）使用。
+ */
+export function refreshTokenExpiresAt(credential: {
+  refresh_token?: string
+}): number | undefined {
+  const token = credential.refresh_token
+  if (typeof token !== 'string' || token.length === 0) return undefined
+  return readJwtTime(token, 'exp')
+}
+
+/** 导出给单测：直接解一个 JWT 的 `exp`/`iat`（毫秒）。 */
+export const __readJwtTimeForTest = readJwtTime
+
 /** 向 STS token 端点发起一次带 DPoP 的 token 请求。 */
 export async function requestToken(
   body: Record<string, string>,
@@ -121,14 +182,20 @@ export async function requestToken(
   }
   if (!response.ok || !data?.credentials) {
     const message = `CodeArts token request failed: ${response.status}${data ? ` ${JSON.stringify(data)}` : ''}`
-    // 终态判定：invalid_grant 或后端错误码明确为 refresh_token 失效/DPoP 非法时，
-    // 都视为 refresh_token 已失效（停止调度、refreshable:false、提示重新登录），
-    // 避免 error_code 为 InvalidDPoPHeader 时每 10 分钟无限重试。
+    // 终态判定：**只认 refresh_token 自己失效的那两种信号**。
+    //
+    // ⚠️ `InvalidDPoPHeader` 已从这里**移除**（真实缺陷：CodeArts 账号被永久标成
+    // 「不可续期」、重启也不自愈）。它说的是「这次 DPoP proof 没通过校验」
+    // —— 时钟偏差让 `iat` 落在窗口外、proof 被判定重放、网关抖动，全都是
+    // **一次请求层面**的拒绝，跟「refresh_token 还能不能用」无关。
+    // 把它当终态的代价是把账号材料完好（refresh_token 还有十几天寿命、
+    // code_verifier 与 DPoP 私钥都在）的账号一步标死，用户只能重新登录；
+    // 而把它当普通失败的代价只是 10 分钟后再试一次一个 HTTP 请求。
+    // 两相对比，这里选择后者。
     const errorCode = String(data?.error_code ?? '')
     if (
       data?.error === 'invalid_grant'
       || errorCode.includes('ExpiredRefreshToken')
-      || errorCode.includes('InvalidDPoPHeader')
     ) {
       throw new RefreshTokenExpiredError(message)
     }
