@@ -46,6 +46,15 @@
   `cline-models-dev.ts` 时实测到，`lib/cline-modalities.*` 四个文件仍在，
   并随文件拷贝式安装一起进了 profile）。**删改源文件后手动清一次 `lib/`**
   （或整目录重建），否则残留模块虽无人 import 却会一直跟着发布。
+  ⚠️⚠️ **`lib/` 陈旧会让你「跑通了一个不存在的验证」**（2026-10-21 合并审计实测）：
+  用 `node --input-type=module -e "import ... from './lib/xxx.js'"` 做端到端对账时，
+  若 `lib/` 是旧产物，**源码里的新判据根本不参与**，你会得到一份看似成功、
+  实则验证的是旧代码的结论。实测经过：PR !123 给 `splitBuddyCreditsByExpiry`
+  加了 `expiringRemaining` 拆包，而 `lib/buddy-balance-rank.js` 里该符号
+  **0 处**（源码 3 处）⇒ 那次「前后端逐分一致」的 5 组对账全跑在旧实现上，
+  第一组直接给出 `expiring` 2500 vs 500 的**假不一致**，差点被当成真缺陷。
+  ⇒ **凡是用 `lib/` 而不是 `src/` 做的验证，先 `pnpm build`（或 `pnpm build:all`）**；
+  更稳的做法是**让 vitest 直接 import `src/`**（单测本来就那样，不含构建产物）。
   ⚠️ **`plugin-src/client/jet-hub-styles.js` 里的 `STYLES` 是模板字符串 ——
   CSS 注释内绝不能出现反引号**。用它给属性名加强调（`` `min-width: 0` ``）会
   **提前闭合模板**，esbuild 报 `Expected ";" but found "min"` 并把指针指到注释那一行，
