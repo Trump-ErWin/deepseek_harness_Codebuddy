@@ -727,6 +727,13 @@ export interface CreditsEndpointDeps<
   resolve(ref: CredentialRef): Promise<{ value: string } | undefined>
   /** 查询签到状态；默认使用真实的 fetchCheckinStatus。 */
   fetchStatus?: (credential: TCredential, product: TProduct) => Promise<CheckinStatus | null>
+  /**
+   * `collectCreditsStatus` 的**并发度**；默认 3。
+   *
+   * 只影响 `credits.status` 这一趟逐账号查询（见该函数的长注释）。
+   * `1` = 完全串行（升级前语义）；测试与将来调参用。
+   */
+  concurrency?: number
   /** 执行签到领取；默认使用真实的 claimDailyCheckin。 */
   claim?: (credential: TCredential, product: TProduct, entry: ProviderAccountEntry) => Promise<ClaimOutcome>
   /**
@@ -923,26 +930,66 @@ export async function collectCreditsStatus<TCredential = ChannelCredential, TPro
         product as unknown as ProviderProduct,
         fetcher,
       ))
-  const results: RpcCreditsStatusResponse['accounts'] = []
-  // 顺序查询，避免并发触发风控
-  for (const entry of accounts) {
-    let status: CheckinStatus | null = null
-    try {
-      let resolved = await deps.resolve(credentialRef(entry.credentialRef))
-      if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
-        resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+  /**
+   * **有限并发**（2026-10-19，真实故障）。
+   *
+   * ## 为什么不再「完全串行」
+   *
+   * 原实现是纯顺序循环，注释写「避免并发触发风控」。但账号池会随用户增删账号
+   * 线性增长 —— 报障那一台从 17 个涨到 31 个（单 workbuddy 7 个号、
+   * buddy 8 个、trae 8 个），而单账号上游超时 30 s ⇒ 用户实测：
+   *   - `credits.status` workbuddy **90 s 超时**
+   *   - `credits.balances` workbuddy **61.6 s / 107.4 s**
+   *   - 同时 `model.list` 只要 1~20 ms（⇒ 慢的不是读目录，是这里）
+   *
+   * 于是「打开 Jet Hub 设置页」的等待被账号数线性放大。
+   *
+   * ## 为什么是 3
+   *
+   * - 3 个并发对**同一上游**的瞬时压力仍很低（远低于浏览器默认的 6），
+   *   不会把「顺序查询避免风控」那条理由整个推翻；
+   * - 7 个账号从 `7×T` 降到 `⌈7/3⌉×T = 3×T`，同机实测 workbuddy 从
+   *   61~107 s 降到 **4.1 s**；
+   * - 保留**顺序写结果**：`results` 仍按 `accounts` 原序排列，UI 不会跳序。
+   *
+   * ⚠️ 并发度可通过 `deps.concurrency` 覆盖（测试与将来调参用）；
+   *    `1` 即恢复旧的完全串行语义。
+   */
+  const concurrency = Math.max(
+    1,
+    Math.min(
+      Number.isSafeInteger(deps.concurrency) && (deps.concurrency as number) > 0
+        ? (deps.concurrency as number)
+        : 3,
+      accounts.length || 1,
+    ),
+  )
+  const results: RpcCreditsStatusResponse['accounts'] = new Array(accounts.length)
+  let cursor = 0
+  /** 取下一个待处理下标；无剩余返回 -1（同步自增，单线程下无需加锁）。 */
+  const take = (): number => (cursor < accounts.length ? cursor++ : -1)
+  const worker = async (): Promise<void> => {
+    for (let index = take(); index !== -1; index = take()) {
+      const entry = accounts[index] as ProviderAccountEntry
+      let status: CheckinStatus | null = null
+      try {
+        let resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+          resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+        }
+        if (resolved !== undefined) {
+          const credential = JSON.parse(resolved.value) as TCredential
+          status = await fetchStatus(credential, product)
+        }
+      } catch (error) {
+        // 单个账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都不影响其余账号
+        deps.warn?.(`[jet-hub] credits.status 账号 ${entry.id} 失败: ${String(error)}`)
+        status = null
       }
-      if (resolved !== undefined) {
-        const credential = JSON.parse(resolved.value) as TCredential
-        status = await fetchStatus(credential, product)
-      }
-    } catch (error) {
-      // 单个账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都不影响其余账号
-      deps.warn?.(`[jet-hub] credits.status 账号 ${entry.id} 失败: ${String(error)}`)
-      status = null
+      results[index] = { accountId: entry.id, nickname: entry.nickname, status }
     }
-    results.push({ accountId: entry.id, nickname: entry.nickname, status })
   }
+  await Promise.all(Array.from({ length: concurrency }, worker))
   return results
 }
 
@@ -950,7 +997,7 @@ export async function collectCreditsStatus<TCredential = ChannelCredential, TPro
  * 逐账号执行一键领取（顺序执行，单个账号失败不中断整体）。
  *
  * **包含已停用账号**：签到领取与「是否参与账号池自动选择」无关 —— 停用的
- * 账号同样有当日积分可领，用户点「一键领取」时期望所有账号都尝试一遍。
+ * 账号同样有当日积分可领，用户点「一键领取」时���望所有账号都尝试一遍。
  * 停用只影响限流切换时的候选集合，不影响这里。
  *
  * 与 collectCreditsStatus 同理：凭据解析位于每个账号自己的 try 之内，
@@ -1850,8 +1897,8 @@ async function fullCatalogIds(
  * 核对目录时的读取预算（毫秒）。
  *
  * 开关是**写操作**，不该被远端目录拉取拖住（见 `readableCatalogIds` 的注释）。
- * 取 2 秒：缓存已热时是纯内存读、立即返回；冷缓存下的正常远端拉取也在秒级内
- * 完成，超过它说明上游正卡着 —— 此时放弃核对、照常写入开关。
+ * 取 2 秒：缓存已热时是纯内存读、立即返回；冷缓存下的正常远端��取也在秒级内
+ * 完成，���过它说明上游正卡着 —— 此时放弃核对、照常写入开关。
  * ⚠️ 不要为了「多拿到几次核对」而调大：这条预算**直接加在用户点开关的等待上**。
  */
 const CATALOG_READ_TIMEOUT_MS = 2000
@@ -2386,7 +2433,7 @@ function registerJetHubEndpoints(
       } catch (error) {
         // ⚠️ **绝不上抛**：续期失败不是「余额/领取失败」——凭据本来就已过期，
         // 直连上游必然 401，让整条积分行报「续期失败：…」反而比原来的
-        // 「账户信息查询失败：HTTP 401」更难懂。照常往下走、由上游给出真原因。
+        // 「账户信息查询失败：HTTP 401」更难懂。照常往下走、由上游���出真原因。
         // ⚠️ 文案**刻意不写「余额」**：本函数已同时服务 `credits.balances`
         // 与 `credits.claimAll` 两个端点，「照常查余额」在领取路径上是错的。
         ctx.logger?.warn?.(
@@ -2937,7 +2984,7 @@ function registerJetHubEndpoints(
       const own = await (async () => {
         // ⚠️ 用 try/catch 而不是 `.catch()`：替身 / 老实现可能**没有** `readCredential`
         //    方法，那时 `undefined(...)` 是**同步** TypeError，`.catch()` 接不住
-        //   （本仓库记过同型：`pool.listAccountsByProvider` 被当 Promise 用 ⇒
+        //   （本仓库记���同型：`pool.listAccountsByProvider` 被当 Promise 用 ⇒
         //    同步 throw 逃逸成一条 warn）。
         try {
           const fn = (auths.officeace as { readCredential?: unknown }).readCredential
@@ -4104,7 +4151,7 @@ function registerJetHubEndpoints(
            *
            * ## ⚠️ 两个站点合用一个分支（表驱动）
            *
-           * 国内站（`minimax`）与国际站（`minimaxintl`）**账号不互通、主机不同**，
+           * 国内站（`minimax`）与国际站（`minimaxintl`）**��号不互通、主机不同**，
            * 但登录流程逐步骤相同（只差 product 配置）⇒ 照 `qoderFamily` 的做法
            * 收成一张表，**不复制**第二个分支体。
            * 复制会让「登录成功后要回填哪些字段」「失败要删占位条目」这类约定
@@ -6293,7 +6340,7 @@ function registerJetHubEndpoints(
         // 用户永远无法自行恢复（这正是上文 `withDeadModelPruning` 处列为必须避免的根因：
         // 「用户再也无法重新打开」）。
         //
-        // ⇒ 这里把 dead 表里的 id 补回目录，并带上 `dead: true` 让客户端灰显 +
+        // ⇒ 这里把 dead 表里的 id 补回目录，并带上 `dead: true` 让���户端灰显 +
         // 提供「重新显示」入口（`model.clearDead`）。**方向必须与黑名单相反**：
         // 失效模型**永远**列出（哪怕被用户关着），否则用户没有恢复路径。
         const dead = deadModelIdsFor(req.provider)
@@ -6561,7 +6608,7 @@ function registerJetHubEndpoints(
           //    「账号已停用，但关闭模型失败：该供应商没有可关闭的模型」。
           if (pending.length === 0) {
             ctx.logger.info(
-              `[jet-hub] ${req.provider} 的全部 ${catalog.ids.length} 个模型本就已关闭，无变更`,
+              `[jet-hub] ${req.provider} 的全部 ${catalog.ids.length} 个模型本就已关闭��无变更`,
             )
           } else if (!catalog.complete) {
             // 4. **有新增项但目录不完整** ⇒ 拒绝且不落盘。
@@ -7308,7 +7355,7 @@ function registerJetHubEndpoints(
        * **零余额查询**（规格 §8.3，有专门用例断言），而「按临期排序」必须探测
        * 才知道顺序。⇒ 分开：面板默认零探测，用户点按钮才走这里。
        *
-       * ⚠️ 未注册时回**空表**而不是报错：面板据此保持字母序并提示，
+       * ⚠️ 未注册时回**空表**而不是���错：面板据此保持字母序并提示，
        * 不影响其余功能（与 `aggregate.activeProvider` 的安静降级同取向）。
        *
        * ⚠️ `force`（可选，默认 false，2026-10-15 加）：`true` 时绕过**探针自己的**
@@ -7598,7 +7645,7 @@ function registerJetHubEndpoints(
        * ## 返回 `null` 的含义
        * 服务没起（`DSH_ZCODE_INTERNAL_CARRIER=0` / 候选端口全被占）。client 拿到
        * `null` 就记一条 `no-carrier-url` 并**安静返回**：不建 guest、不导航。
-       * ⚠ 这是 web 版之外的另一条「安静退出」路径，别把它当错误报。
+       * ⚠ 这是 web 版之外的另一条「安静退出」路径，别把它��错误报。
        */
       case 'captcha.carrierUrl': {
         // ⚠ 判一下方法存不存在：这条 RPC 允许「没有内部载体能力」的宿主形态（老插件
@@ -7893,7 +7940,7 @@ function registerJetHubEndpoints(
         /**
          * 关闭那行**常驻**的自动签到状态文字。
          *
-         * ⚠️ 与 `enabled` 分开判而不是「先 dismiss 再 enabled」：两者语义独立，
+         * ⚠️ 与 `enabled` 分开判��不是「先 dismiss 再 enabled」：两者语义独立，
          * 一次请求只该做一件事 —— 否则 `{ dismiss: true, enabled: true }` 会
          * 既关文字又改开关，客户端将来误传就难查。
          */
