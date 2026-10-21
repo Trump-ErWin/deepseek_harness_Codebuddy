@@ -486,6 +486,10 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       //    **逐字相同**（本用例按该字段匹配工厂配置块，写成 `AUTOCLAWINTL`
       //    会「找不到块」而不是「少一家」—— 两种红的原因不同，别混淆）。
       'AUTOCLAW_INTL',
+      // ⚠️ **ASTUDIO 必须在内**（2026-10-20）：同形 —— 兜底是固定 ref
+      // （`ASTUDIO.defaultCredentialRef`），Jet Hub 导入本机会话只写
+      // `ASTUDIO_ACCOUNT_XXX` ⇒ 池被筛空时会误报「请先登录」。
+      'ASTUDIO',
       // ⚠️ **刻意不含 ZCODE** —— 它是唯一「不接判定也算对」的一家，
       // 见下方「zcode 同型缺陷判定」段。
     ]

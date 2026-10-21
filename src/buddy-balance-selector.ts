@@ -74,6 +74,14 @@ export interface BuddyAccountBalanceEntry extends BuddyAccountBalance {
   tier?: BuddyBalanceTier
   /** 原始拆分结果（展示「15 天内到期 X · 永久 Y」用）。 */
   split?: BuddyCreditSplit
+  /**
+   * ⚠️ **本次读数是「降级结果」**（`balance.degraded === true`）。
+   *
+   * 语义：**总额读到了、逐包明细丢了** ⇒ 拆分出的「永久桶」可能其实是
+   * 「明明有临期、但我们看不到」。此时**不得**断言 `exhausted`（见
+   * `noAccountReason` 的注释与实测）。
+   */
+  degraded?: boolean
 }
 
 /** 一条待选账号（调用方从账号池取出）。 */
@@ -252,7 +260,22 @@ export class BuddyBalanceSelector<
     const now = this.deps.now?.() ?? Date.now()
     const cached = this.cache.get(account.id)
     if (cached !== undefined) {
-      const ttl = cached.source.ok
+      /**
+       * ⚠️⚠️ **降级结果必须走「错误」那档短 TTL**（2026-10-21 二轮审计，P2）。
+       *
+       * `ok: true` + `degraded: true` 的组合语义是「总额读到了、逐包明细丢了」——
+       * 它**不是一个稳定的成功读数**，而是一次**瞬态不确定性**（例如流水端点抖动）。
+       *
+       * 若按 `ok` 走 60 秒长 TTL：一次抖动 ⇒ **60 秒内每次选号都报 `unknown`**
+       *（修前更糟：60 秒内报「积分都已用尽」）。
+       * ⇒ 降级与失败同等对待，走 `errorTtlMs`（默认 5 秒）⇒ 抖动一过即自愈。
+       *
+       * ⚠️ 判据必须读 `cached.source.balance.degraded`（**原料**），不是
+       * `classify()` 之后的条目 —— `classify` 依赖 `now`，而这里是在**决定
+       * 要不要重算**，必须看「当时取到的原料」。
+       */
+      const degradedSource = cached.source.ok && cached.source.balance.degraded === true
+      const ttl = cached.source.ok && !degradedSource
         ? (this.deps.ttlMs ?? BUDDY_BALANCE_CACHE_TTL_MS)
         : (this.deps.errorTtlMs ?? BUDDY_BALANCE_ERROR_CACHE_TTL_MS)
       if (now - cached.at < ttl) {
@@ -285,6 +308,8 @@ export class BuddyBalanceSelector<
       expiringBalance: split.expiring,
       permanentBalance: split.permanent,
       split,
+      // ⚠️ 透传「降级」：总额可信、明细不可达 ⇒ 下游不得据此断言 exhausted。
+      ...(source.balance.degraded === true ? { degraded: true } : {}),
     }
     entry.tier = buddyBalanceTier(entry, { now, windowMs })
     return entry
@@ -386,7 +411,33 @@ export class BuddyBalanceSelector<
  */
 function noAccountReason(balances: readonly BuddyAccountBalanceEntry[]): BuddyNoAccountReason {
   const errors = balances.filter(b => !b.ok).map(b => b.error ?? '未知原因')
-  return errors.length > 0 ? { kind: 'unknown', errors } : { kind: 'exhausted' }
+  if (errors.length > 0) return { kind: 'unknown', errors }
+  /**
+   * ⚠️⚠️ **「明细不可达」也不能断言 `exhausted`**（2026-10-21 二轮审计 P1）。
+   *
+   * `ok: false` 只覆盖「连总额都没拿到」。还有一类更隐蔽的：
+   * **总额拿到了、明细丢了**（`balance.degraded === true`）—— 例如 AutoClaw
+   * 的流水端点抖动时静默回退钱包包，回退包**没有 `deductionEndTime`**。
+   *
+   * 而 `splitBuddyCreditsByExpiry` 把「没有到期时刻」判成**永久桶**（对真·永久是对的）
+   * ⇒ 一次明细抖动会让「有临期积分的账号」被判成**只剩永久积分** ⇒
+   * 锁定时报「积分都已用尽」—— **那句会把用户推向不可撤回的解锁**。
+   *
+   * 实测（AutoClaw，同一账号同一 5000 余额，只改流水端点是否 500）：
+   * ```
+   * 流水正常 → split={expiring:5000} tier=expiring（可用）✅
+   * 流水 500 → split={permanent:5000} tier=none（「积分都已用尽」）❌
+   * ```
+   * ⇒ **降级必须与失败同等对待**：都归 `unknown`（「无法确认」），不归 `exhausted`。
+   */
+  const degraded = balances.filter((b) => b.ok && b.degraded === true)
+  if (degraded.length > 0) {
+    return {
+      kind: 'unknown',
+      errors: [`${degraded.length} 个账号的**逐包明细**不可用（总额已读到，但没有到期时刻）`],
+    }
+  }
+  return { kind: 'exhausted' }
 }
 
 /** 构造一个「查询失败」的余额条目。 */
