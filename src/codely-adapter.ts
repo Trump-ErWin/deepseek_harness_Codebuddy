@@ -204,6 +204,13 @@ export interface CodelyAdapterOptions {
   /** 目录可用后回调 —— 接线层注入 `broadcastCatalogChanged(ctx)`。 */
   onCatalogLoaded?: () => void
   /**
+   * 告警出口（接线层注入 `ctx.logger.warn`；缺省静默）。
+   *
+   * ⚠️ 2026-10-22 对抗审计加：目录「远端读到但被团队前缀过滤成空」这一格必须留
+   *    一行 warn —— 否则线上表现为「面板 0 个模型」，**无日志无报错**。
+   */
+  warn?: (message: string) => void
+  /**
    * 推理用的官方 CLI 路径（缺省按 `DSH_CODERLY_CLI_PATH` → 默认安装路径解析）。
    * 测试注入；生产不传。
    */
@@ -611,6 +618,13 @@ export class CodelyAdapter extends LlmAdapter {
     if (currentAccountId !== '') tried.add(currentAccountId)
     let res: Response | undefined
     let detail = ''
+    /**
+     * 是否**至少有一次**因为「换发 `cli_api_key` 失败」而退出循环。
+     *
+     * ⚠️ 用来与「一次请求都没发起」区分开：两者 `res` 都是 `undefined`，
+     *    但错误码与文案必须不同（凭据不可用 vs 内部错误）。
+     */
+    let exchangeFailedOut = false
     for (let round = 0; ; round += 1) {
       // ⚠️ 每个请求换发一次 `cli_api_key`：它与后面 `Bearer` 必须**成对**
       //    （签名由它派生，用 A 签 B 会 401，见 `codely-auth.ts` 的注释）。
@@ -619,12 +633,60 @@ export class CodelyAdapter extends LlmAdapter {
         ...this.options.fetchImpl === undefined ? {} : { fetcher: this.options.fetchImpl },
         ...options.signal === undefined ? {} : { signal: options.signal },
       })
+      /**
+       * ⚠️⚠️ **换发失败必须换号，不能直接抛**（2026-10-22 对抗审计 P0）。
+       *
+       * ## 原实现为什么错
+       *
+       * `fetchCodelyCliApiKey` 在**任何非 2xx**（含 401/403/429/5xx）**与网络异常**时
+       * 一律返回 `undefined`（`codely-auth.ts` 的 `if (!res.ok) return undefined` +
+       * `catch { return undefined }`）⇒ 这一格会命中**远超「token 过期」**的情形。
+       *
+       * 而原实现对它**直接 `throw`**：既不走下面 `isCodelyRotatableFailure(...)` 的
+       * 换号判据，也不 `continue` 到下一个账号 ⇒ **池里明明还有能用的号，一个都不试**。
+       *
+       * 实测（池 2 个账号，acc-1 的 token 过期、acc-2 正常）：
+       * ```
+       * 修复前：CALLS=["exchange:Bearer EXPIRED"]                    ERROR=PERMISSION_DENIED  CHATTED=false
+       * 修复后：CALLS=["exchange:EXPIRED","exchange:GOOD","chat"]                              CHATTED=true
+       * ```
+       * ⇒ 这正是作者在循环头注释里记的那句用户报障「**用完积分怎么不自动切换账号**」
+       *   的**第二个入口**（第一个 402 已修）。
+       *
+       * ## 为什么是「记账 + 换号」而不是只换个错误码
+       *
+       * 归 `PERMISSION_DENIED` 的后果是宿主**不重试也不换号**、用户只看到一句
+       * 「去点续期」—— 而 `account.refresh` 对 codely 当前**报「不支持续期」**
+       *（续期链是已知待接项）⇒ 那一句指到的是死路。
+       *
+       * ⚠️ **不改变**作者的分档意图：401/403 类「同一堵墙」仍不该在**同一个号**上重试；
+       *   这里只做「**换下一个号**」，与 402/429 走同一条换号路径。
+       * ⚠️ 记账沿用下面 402/429 那处**同一写点口径**（`updateModelRateLimit`），否则
+       *   「这个号换发不动」不会被任何地方记住，下次仍被选中、又撞一次同样的墙。
+       */
       if (exchanged === undefined) {
-        throw new LlmError(
-          'codely: 换发 cli_api_key 失败（访问令牌可能已过期）'
-          + '。请在 Jet Hub 的「账号池」里对该账号点「续期」；仍失败再重新登录',
-          'PERMISSION_DENIED',
-        )
+        // ⚠️ `pool` 在本函数里是**可选**的（`accountPool` 可缺省）；没有池就没有
+        //    「下一个号」可换 ⇒ 直接 `break` 落到末尾那句如实报错。
+        exchangeFailedOut = true
+        if (pool === undefined) break
+        try {
+          await pool.updateModelRateLimit(currentAccountId, model, nextUtc8DayStartMs())
+        } catch {
+          // ③ 记账失败不中断换号（与下面 402/429 那处同一取向）。
+        }
+        // 换号预算用尽 ⇒ 停止轮换，走最后那句「都不可用」的如实报错。
+        exchangeFailedOut = true
+        if (round >= CODERLY_MAX_ROTATE - 1) break
+        let nextAccount = await pool.getAvailableAccount<CodelyCredential>(CODERLY.id, model, tried)
+        while (nextAccount !== null && !usableCodelyCredential(nextAccount.credential)) {
+          tried.add(nextAccount.entry.id)
+          nextAccount = await pool.getAvailableAccount<CodelyCredential>(CODERLY.id, model, tried)
+        }
+        if (nextAccount === null) break
+        tried.add(nextAccount.entry.id)
+        credential = nextAccount.credential
+        currentAccountId = nextAccount.entry.id
+        continue
       }
 
       const url = `${CODERLY.chatHost}/chat/completions`
@@ -714,6 +776,19 @@ export class CodelyAdapter extends LlmAdapter {
 
     // ── 统一分类（循环正常退出只可能携带一次真实响应）──
     if (res === undefined) {
+      // ⚠️ **两种 `undefined` 必须分开**（2026-10-22 对抗审计 P0 的后半）：
+      //    - 全部账号都**换发失败** ⇒ 凭据维度问题（`PERMISSION_DENIED`）；
+      //      文案必须给**走得通**的出路 —— `account.refresh` 对 codely 当前
+      //      报「不支持续期」，所以「去点续期」是死路，真正可执行的是重新登录；
+      //    - 一次请求都没发起（池空 / 无当前账号）⇒ 内部错误（`SERVER`）。
+      if (exchangeFailedOut) {
+        throw new LlmError(
+          'codely: 换发 cli_api_key 失败（访问令牌可能已过期）'
+          + `，已尝试 ${tried.size} 个账号均不可用`
+          + '。请删除该账号后重新「+ 新建账号」登录',
+          'PERMISSION_DENIED',
+        )
+      }
       throw new LlmError('codely: 内部错误：未发起任何请求', 'SERVER')
     }
     if (!res.ok) {
@@ -841,7 +916,35 @@ export class CodelyAdapter extends LlmAdapter {
               id?: unknown
               function?: { name?: unknown; arguments?: unknown }
             }
-            const idx = typeof record.index === 'number' ? record.index : 0
+            /**
+             * ⚠️⚠️ **必须把上游的 0 起 index 抬到 2 之后**（2026-10-22 对抗审计 P0）。
+             *
+             * 上游 `delta.tool_calls[].index` 是**工具自己的** 0 起序号，而本适配器
+             * 的正文块固定 `index: 0`、推理块固定 `REASONING_INDEX = 1`
+             * （见上面那句「工具从 2 起（不与正文抢 index）」的注释 —— 原实现
+             * **写了注释但没做**）。
+             *
+             * `BlockAssembler`（`@deepseek-ai/dsh-llm`）的 `block-start` 只在
+             * index **未见过**时才建 partial，且**不更新 `blockType`**；
+             * `block-end` 走「first close wins」⇒ 同一 index 的第二种块
+             * 被**整条吞掉**。
+             *
+             * 实测（真实 `BlockAssembler` 喂本适配器输出）：
+             * | 上游形态            | 修复前组装结果        |
+             * |--------------------|---------------------|
+             * | 正文 + 1 工具       | `[text]`（工具消失） |
+             * | 推理 + 正文 + 1 工具 | `[reasoning,text]`  |
+             * | 正文 + 2 工具       | `[text, tool(c1)]`（丢 c0） |
+             * | 只有 1 工具         | `[tool]` ✅          |
+             * ⇒ 只有「本轮没有任何正文/推理块、且工具从 0 连续」才正常。
+             * ⚠️ `finish` 仍报 `tool-calls` ⇒ 宿主以为调了工具、blocks 里一个都没有
+             *   ⇒ 回合停住、工具永不执行。
+             *
+             * ⚠️ `idx` 同时是 `toolAccs` 的键与 `announcedTools` 的元素，两者都只用
+             * 这个值 ⇒ **在这里抬高一次即可**，下面 1015 行的收尾回放自动一致
+             *（只改 `block-start` 不改 `block-end` 会造成两套编号）。
+             */
+            const idx = 2 + (typeof record.index === 'number' ? record.index : 0)
             const acc = toolAccs.get(idx) ?? { id: '', name: '', text: '', announced: false }
             if (typeof record.id === 'string' && record.id.length > 0) acc.id = record.id
             const fn = record.function
@@ -1165,9 +1268,49 @@ export class CodelyAdapter extends LlmAdapter {
     const source = this.remoteModels === undefined
       ? CODERLY.fallbackModels
       : this.remoteModels
-    return source
+    const filtered = source
       .filter((model) => model.id.toLowerCase().startsWith(`${CODERLY.id.toLowerCase()}-`))
       .map((model) => this.toCatalogEntry(model))
+    /**
+     * ⚠️⚠️ **「远端读到了、但过滤后为空」必须回退兜底表**（2026-10-22 对抗审计 P1）。
+     *
+     * ## 缺陷
+     *
+     * 上面那句出口过滤按**前缀**（`codely-`）剔掉非本团队的模型，而
+     * `ensureRemoteModels` 的成功判据是「**原始** `models.length > 0`」⇒ 一旦上游
+     * 改了命名、或该团队只被授权公共模型（`DeepSeek-*` / `GLM-*`…），就会：
+     * `remoteModels` 非空（全是公共模型）⇒ 过滤后 `[]` ⇒ **兜底表永不生效**。
+     *
+     * 实测（远端下发 `[{modelGroup:'DeepSeek-V4.1-Flash'},{modelGroup:'GLM-5.3-FLASH'}]`）：
+     * ```
+     * listModels    = []
+     * listAllModels = []
+     * ```
+     * 对比「远端下发空数组」⇒ 正确回退兜底表。⇒「**远端读到了但过滤后为空**」与
+     * 「模型全下架」**同形**，面板显示「0 个模型」= 与本仓反复记录的
+     * 「空返回与无账号同形」完全同型；用户侧是「昨天还好好的，今天一个模型都没有」，
+     * **无日志无报错**。
+     *
+     * ## 判据
+     *
+     * 过滤结果为空 ⇒ 视为**读失败**（回退兜底表），并留一行 warn 说明「远端 N 条
+     * 全部被团队前缀过滤掉」—— 否则线上没人看得出发生了什么。
+     * ⚠️ 只在「确实用了远端」时才 warn（`source` 是兜底表时过滤结果不可能为空）。
+     */
+    if (filtered.length === 0 && this.remoteModels !== undefined) {
+      this.options.warn?.(
+        `[jet-hub] codely: 远端目录 ${this.remoteModels.length} 条全部被团队前缀`
+        + `（${CODERLY.id}-）过滤掉 ⇒ 回退编译期兜底表（面板不会显示 0 个模型）`,
+      )
+      // ⚠️ **回退也必须过同一道前缀过滤** —— 兜底表本身就含公共模型
+      //    （`DeepSeek-V4.1-Flash` / `GLM-5.3-FLASH` / `KIMI-K3`，共 8 条），
+      //    直接 `map` 会把它们也放进来 ⇒ 与「按团队前缀过滤」这条口径分叉。
+      //    过滤后是 5 条 `codely-*`（兜底表 8 条里那 5 条）。
+      return CODERLY.fallbackModels
+        .filter((model) => model.id.toLowerCase().startsWith(`${CODERLY.id.toLowerCase()}-`))
+        .map((model) => this.toCatalogEntry(model))
+    }
+    return filtered
   }
 
   /**
@@ -1332,7 +1475,13 @@ export function registerCodelyLlm(
   ctx: Context,
   options: CodelyAdapterOptions = {},
 ): CodelyAdapter {
-  const adapter = new CodelyAdapter(options)
+  const adapter = new CodelyAdapter({
+    // ⚠️ 告警出口默认接到 `ctx.logger.warn`（调用方可显式覆盖）：
+    //    「远端目录被团队前缀过滤成空」那一格必须留一行日志，否则线上表现为
+    //    「面板 0 个模型」而**无日志无报错**（2026-10-22 对抗审计 P1）。
+    warn: options.warn ?? ((message: string) => ctx.logger?.warn?.(message)),
+    ...options,
+  })
   // ⚠️ **返回 `adapter` 而不是 `registerAdapterIdempotent` 的返回值**：
   //    后者在重复注册时返回 `undefined`、非重复时返回宿主句柄（**不是**适配器），
   //    接线层要把它放进 `modelAdapters` 调 `listAllModels()`（与 officeace /

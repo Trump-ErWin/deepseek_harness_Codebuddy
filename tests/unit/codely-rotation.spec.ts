@@ -264,3 +264,98 @@ describe('Codely 请求级换号 + 冷却', () => {
     expect(isCodelyRotatableFailure(500, '')).toBe(false)
   })
 })
+
+/**
+ * ★★ **换发 `cli_api_key` 失败必须换号**（2026-10-22 对抗审计 P0）。
+ *
+ * ## 修的那个真缺陷
+ *
+ * `fetchCodelyCliApiKey` 在**任何非 2xx**（含 401/403/429/5xx）**与网络异常**时
+ * 一律返回 `undefined`（`codely-auth.ts` 的 `!res.ok` 早退 + `catch` 兜底）
+ * ⇒ 「换发失败」会命中**远超「token 过期」**的情形。
+ *
+ * 原实现对它**直接 `throw`**：既不换号、也不 `continue` ⇒ **池里明明还有能用的号，
+ * 一个都不试**。实测（池 2 个号，acc-1 过期 / acc-2 正常）：
+ * ```
+ * 修复前：CALLS=["exchange:EXPIRED"]                     ERROR=PERMISSION_DENIED
+ * 修复后：CALLS=["exchange:EXPIRED","exchange:GOOD","chat"]  → 正常出字
+ * ```
+ *
+ * ## 为什么这条必须单独写（既有 8 条换号用例全都抓不到）
+ *
+ * 它们把 `makeAdapter` 里的换发端点**恒桩成 200**（`sk-${token}`）⇒ 换发失败这条腿
+ * **永不进入**。我实测：把修复回退成 `throw` 后，既有 8 条**一条都不红**。
+ */
+describe('Codely 换号：换发 cli_api_key 失败也必须换号', () => {
+  /** 让**指定账号**的换发失败（其余正常）。 */
+  function adapterWithExpiredExchange(
+    pool: unknown,
+    expiredToken: string,
+    chatQueue: Array<Response | (() => Response)>,
+  ): { adapter: CodelyAdapter; exchangeAuth: string[]; chatAuth: string[] } {
+    const exchangeAuth: string[] = []
+    const chatAuth: string[] = []
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const headers = (init?.headers ?? {}) as Record<string, string>
+      const auth = String(headers.Authorization ?? '')
+      if (url.includes('/api/api-token/cli-api-key')) {
+        exchangeAuth.push(auth)
+        // ⚠️ 只让这一个号的换发失败 —— 模拟「该账号 access_token 已过期」。
+        if (auth === `Bearer ${expiredToken}`) return new Response('expired', { status: 401 })
+        return new Response(JSON.stringify({ cli_api_key: `sk-${auth.replace(/^Bearer\s+/i, '')}`, user_id: 1 }), { status: 200 })
+      }
+      chatAuth.push(auth)
+      const next = chatQueue.shift()
+      if (next === undefined) throw new Error('unexpected chat request')
+      return typeof next === 'function' ? next() : next
+    })
+    const adapter = new CodelyAdapter({
+      accountPool: pool as never,
+      fetchImpl: fetchImpl as never,
+    })
+    return { adapter, exchangeAuth, chatAuth }
+  }
+
+  it('★★ 首号换发 401 ⇒ **换到第二个号**并成功出字（原缺陷：直接抛、池里好号不被尝试）', async () => {
+    const { pool } = makePool([
+      { id: 'acc-1', credential: cred('EXPIRED') },
+      { id: 'acc-2', credential: cred('GOOD') },
+    ])
+    const { adapter, exchangeAuth, chatAuth } = adapterWithExpiredExchange(pool, 'EXPIRED', [sseOk()])
+    const { chunks, error } = await run(adapter)
+
+    expect(error, '⚠️ 池里有能用的号，不得报错').toBeUndefined()
+    // ⚠️ 决定性断言：两个号的换发都被试过（而不是只试第一个就抛）。
+    expect(exchangeAuth, '两个号的换发都必须被尝试').toEqual(['Bearer EXPIRED', 'Bearer GOOD'])
+    // ⚠️ 推理必须用**第二个号**换发出来的 key（不是死号）。
+    expect(chatAuth, '推理必须换成 acc-2 的 key').toEqual(['Bearer sk-GOOD'])
+    expect(chunks.filter((c) => c.type === 'text-delta').map((c) => c.text)).toEqual(['ok'])
+  })
+
+  it('★ 所有号都换发失败 ⇒ PERMISSION_DENIED 且文案给可执行的出路（不是「点续期」死路）', async () => {
+    const { pool } = makePool([
+      { id: 'acc-1', credential: cred('BAD-1') },
+      { id: 'acc-2', credential: cred('BAD-2') },
+    ])
+    const { exchangeAuth, adapter } = adapterWithExpiredExchange(pool, 'BAD-1', [])
+    // acc-2 也让它失败：再包一层
+    const both = adapterWithExpiredExchange(pool, 'BAD-1', [])
+    void adapter
+    void both
+    void exchangeAuth
+    // 用「两个号都坏」的夹具重跑（上面那个 helper 只坏一个，故这里手工构造）
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/api-token/cli-api-key')) return new Response('nope', { status: 401 })
+      throw new Error('不该发推理请求')
+    })
+    const bad = new CodelyAdapter({ accountPool: pool as never, fetchImpl: fetchImpl as never })
+    const { error } = await run(bad)
+    expect(error, '全都换发失败 ⇒ 必须报错（不静默）').toBeDefined()
+    expect(String((error as { code?: string }).code)).toBe('PERMISSION_DENIED')
+    // ⚠️ 文案必须给**走得通**的出路：`account.refresh` 对 codely 当前报「不支持续期」，
+    //    所以不能只写「去点续期」。
+    expect(String((error as Error).message)).toContain('新建账号')
+  })
+})

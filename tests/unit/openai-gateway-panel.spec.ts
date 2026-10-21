@@ -1523,3 +1523,55 @@ describe('「允许局域网访问」开关的判定与文案', () => {
     expect(lines.join('\n')).not.toContain('局域网 IP')
   })
 })
+
+/**
+ * ★★ **「已选择允许局域网、但网关没在监听」不得谎报「已监听」**（2026-10-22 对抗审计 P2）。
+ *
+ * ## 修的那个真缺陷
+ *
+ * `gatewayAllowLanHint` 原来只判 `status.allowLan`，不判 `status.running` ⇒ 用户打开
+ * 开关但**网关总开关关着 / 端口被占 / env 停用**时，它输出「**已监听**全部网卡」——
+ * 这是**错误的安全陈述**（谎报暴露），且与同一弹窗里另外两条文案直接矛盾：
+ * - `gatewayStatusLines` 说「网关已关闭，不会监听任何端口」；
+ * - `gatewayFootnote` 说「网关只绑定 127.0.0.1」。
+ *
+ * ⇒ 三条文案对「现在到底在不在监听」给出**三种答案**。
+ * ⚠️ 这正是本仓 IKL7UN 反复记的那种「面板输出它自己声称要消除的错误安全陈述」，
+ *   只是方向反了（谎报暴露而非谎报安全）。
+ * ⚠️ 同文件 `gatewayAllowLanToggleNotice` **已经**判了 `running` ⇒ 这是
+ *   「同一语义两套判据」的实例，本次把 hint 补齐到同口径。
+ *
+ * ⚠️ 既有那条「提示文案按状态分支」的用例用的 `base` 是 `running: true`
+ * ⇒ **只覆盖了「已在监听」那一格**，对「已选择但未监听」零判别力（我实测：
+ *    把 `&& status.running` 去掉后它仍 107 passed）。
+ */
+describe('★ 局域网开关：已选择但未监听时不得谎报「已监听」', () => {
+  it('★★ allowLan=true 且 running=false ⇒ 不得出现「已监听」，必须说「还没生效」', () => {
+    const hint = gatewayAllowLanHint({
+      enabled: false,
+      running: false,
+      blockedByEnv: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: null,
+    } as never)
+    expect(hint, '⚠️⚠️ 网关没在监听，绝不能说「已监听」').not.toContain('已监听')
+    expect(hint, '必须如实说「没有在监听」').toContain('没有在监听')
+    expect(hint, '必须给出可执行的出路（打开总开关）').toContain('总开关')
+    // 与另外两条文案不矛盾的核验：这句不得断言「已绑定」。
+    expect(hint).not.toContain('已改绑')
+  })
+
+  it('★ allowLan=true 且 running=true ⇒ 仍然说「已监听」（修复不得削掉正向那一格）', () => {
+    const hint = gatewayAllowLanHint({
+      enabled: true,
+      running: true,
+      blockedByEnv: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: { host: '0.0.0.0', port: 8326 },
+    } as never)
+    expect(hint).toContain('已监听')
+    expect(hint).toContain('0.0.0.0')
+  })
+})

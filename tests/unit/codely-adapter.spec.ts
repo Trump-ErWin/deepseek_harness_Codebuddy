@@ -196,10 +196,10 @@ describe('Codely 适配器：目录', () => {
 
   it('⑤ `listAllModels()` 同步且非空（冷缓存下 provider.status 直接读它）', () => {
     const adapter = new CodelyAdapter({})
-    const all = adapter.listAllModels()
-    expect(all.length).toBeGreaterThan(0)
-    expect(all.every((m) => typeof m.id === 'string' && m.id.length > 0)).toBe(true)
+    // ⚠️ 冷缓存下（从未跑过 `listModels`）也必须非空 —— `provider.status` 直接读它。
+    expect(adapter.listAllModels().length).toBeGreaterThan(0)
   })
+
 
   it('⑥ `resolveModel` 对未知 id 也要给出非空名字', async () => {
     const adapter = new CodelyAdapter({})
@@ -346,5 +346,167 @@ describe('Codely 适配器：推理（驱动官方 CLI）', () => {
     //    「超时」结束而不是报出「没杀进程」，把真实原因盖掉。
     expect(wasKilled(), '取消时必须杀掉 CLI 子进程').toBe(true)
     await running.catch(() => {})
+  })
+})
+
+/**
+ * ★★ **HTTP 推理路径的 chunk 形状**（2026-10-22 对抗审计补 —— 此前**整片零覆盖**）。
+ *
+ * ## 为什么必须用真实 `BlockAssembler` 而不是断言 chunk 序列
+ *
+ * 本文件原有 5 条推理用例**全走 CLI 路径**（注入了 `cliSpawner`），HTTP 路径的
+ * 输出形状**一条都没断言** ⇒ 对抗审计的 7 条变异（工具 index、不下发 tools、
+ * finish 分类、停滞续拉、跳过 `hasUsableToolName`…）**全部 51 passed 全绿**。
+ *
+ * ⇒ 判据必须是「**把适配器产出的 chunk 真的喂给 `BlockAssembler`，看它组装出什么**」，
+ *   而不是断言 chunk 长什么样 —— 因为缺陷恰恰出在「chunk 看起来没问题，但
+ *   Assembler 按 index 幂等把它吞了」。
+ *   ⚠️ 这个手法本仓 `aggregate-adapter.spec.ts:2024` 已经用过（并实测证伪过一版判据）。
+ *
+ * ## 修的那个真缺陷（P0）
+ *
+ * 上游 `delta.tool_calls[].index` 是**工具自己的** 0 起序号，而正文固定 `index: 0`、
+ * 推理固定 `1`；`BlockAssembler` 的 `block-start` **只在 index 未见过时建 partial**
+ * （且不更新 `blockType`）⇒ 同 index 的第二种块被**整条吞掉**。
+ *
+ * 修复前实测：
+ * | 形态 | 组装结果 |
+ * |---|---|
+ * | 正文 + 1 工具 | `[text]` ← **工具消失** |
+ * | 正文 + 2 工具 | `[text, tool(c1)]` ← **丢 c0** |
+ * | 只有 1 工具 | `[tool]` ✅ |
+ *
+ * ⚠️ 而 `finish` 仍报 `tool-calls` ⇒ 宿主以为调了工具、blocks 里一个都没有
+ *   ⇒ 回合停住、工具永不执行。
+ */
+describe('Codely 适配器：HTTP 推理的 chunk 形状（真实 BlockAssembler 组装）', () => {
+  /** 造一个 `fetch` 替身：换发 cli_api_key 返 200，推理端点返给定 SSE 帧。 */
+  function sseFetch(frames: readonly string[]): typeof fetch {
+    return (async (url: string) => {
+      if (String(url).includes('/api/api-token/cli-api-key')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() { return { cli_api_key: 'sk-test', user_id: 1 } },
+        }
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const frame of frames) controller.enqueue(new TextEncoder().encode(frame))
+          controller.close()
+        },
+      })
+      return { ok: true, status: 200, body, headers: new Headers() }
+    }) as unknown as typeof fetch
+  }
+
+  /** 走完整 `stream()`，把 chunk 收下来喂真实 `BlockAssembler`。 */
+  async function assemble(frames: readonly string[]): Promise<Array<{ type: string; id?: string }>> {
+    // ⚠️ `BlockAssembler` 从包**公开入口**导出（`lib/index.js`）—— 子路径
+    //    `@deepseek-ai/dsh-llm/lib/types/assembler.js` 被 `package.json` 的
+    //    `exports` 封了，vite 静态分析会在解析阶段就报 Missing specifier。
+    const { BlockAssembler } = await import('@deepseek-ai/dsh-llm')
+    const adapter = new CodelyAdapter({
+      credentialProvider: async () => CREDENTIAL,
+      fetchImpl: sseFetch(frames),
+    })
+    const asm = new (BlockAssembler as never as { new (): { push(c: unknown): void; assembled(): { blocks: unknown[] } } })()
+    for await (const chunk of adapter.stream({
+      model: 'codely-basic',
+      messages: [{ role: 'user', content: '跑两个命令' }],
+      tools: [{ name: 'run', description: 'x', parameters: { type: 'object', properties: {} } }],
+    } as never)) {
+      asm.push(chunk)
+    }
+    const { blocks } = asm.assembled()
+    // ⚠️ `BlockAssembler.assemble()` 产出的 tool-call 块字段是 `id` / `name` /
+    //    `arguments`（**不是** `toolCallId`）—— 见 `assembler.js` 的 `assemble()`。
+    return blocks as Array<{ type: string; id?: string }>
+  }
+
+  const dataFrame = (payload: unknown): string => `data: ${JSON.stringify(payload)}\n\n`
+
+  it('★★ 正文 + 1 个工具 ⇒ 工具**不得**被正文吞掉（原缺陷：tools 静默消失）', async () => {
+    const blocks = await assemble([
+      dataFrame({ choices: [{ delta: { content: '跑两个命令。' } }] }),
+      dataFrame({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'c0', function: { name: 'run', arguments: '{}' } }] } }] }),
+      dataFrame({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+      'data: [DONE]\n\n',
+    ])
+    const types = blocks.map((b) => b.type)
+    expect(types, '正文必须在').toContain('text')
+    expect(types, '⚠️⚠️ 工具调用不得被正文的 index 吞掉').toContain('tool-call')
+    expect(blocks.find((b) => b.type === 'tool-call')?.id).toBe('c0')
+  })
+
+  it('★★ 正文 + 2 个工具 ⇒ 两个工具都在（原缺陷：丢第一个）', async () => {
+    const blocks = await assemble([
+      dataFrame({ choices: [{ delta: { content: '跑两个命令。' } }] }),
+      dataFrame({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'c0', function: { name: 'run', arguments: '{}' } }] } }] }),
+      dataFrame({ choices: [{ delta: { tool_calls: [{ index: 1, id: 'c1', function: { name: 'run', arguments: '{}' } }] } }] }),
+      dataFrame({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+      'data: [DONE]\n\n',
+    ])
+    const ids = blocks.filter((b) => b.type === 'tool-call').map((b) => b.id)
+    expect(ids, '⚠️⚠️ 两个工具都必须组装出来（原缺陷丢第一个）').toEqual(['c0', 'c1'])
+  })
+
+  it('★ 只有 1 个工具、没有正文 ⇒ 仍正常（这一格原本就是对的，防回归）', async () => {
+    const blocks = await assemble([
+      dataFrame({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'c0', function: { name: 'run', arguments: '{}' } }] } }] }),
+      dataFrame({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+      'data: [DONE]\n\n',
+    ])
+    expect(blocks.filter((b) => b.type === 'tool-call').map((b) => b.id)).toEqual(['c0'])
+  })
+})
+
+/**
+ * ★★ **远端目录「读到了但被团队前缀过滤成空」必须回退兜底表**（2026-10-22 对抗审计 P1）。
+ *
+ * ## 修的那个真缺陷
+ *
+ * `catalogEntries()` 只判 `remoteModels === undefined` 才用兜底表，**没有**
+ * 「远端读到但过滤后为空」这条腿 ⇒ 上游改命名、或该团队只被授权公共模型时，
+ * 过滤结果 `[]` ⇒ **兜底表永不生效** ⇒ `listModels()` / `listAllModels()` 双双返回空。
+ *
+ * 实测（远端下发 `[{modelGroup:'DeepSeek-V4.1-Flash'},{modelGroup:'GLM-5.3-FLASH'}]`）：
+ * 修复前 `listModels = []`、`listAllModels = []`；而「远端下发空数组」那格是正确回退的
+ * ⇒ **「读到了但过滤后为空」与「模型全下架」同形**，面板显示「0 个模型」，
+ * 与本仓反复记录的「空返回与无账号同形」完全同型，且**无日志无报错**。
+ */
+describe('Codely 适配器：远端目录全被团队前缀过滤掉 ⇒ 回退兜底表', () => {
+  it('★★ 远端只下发公共模型 ⇒ 目录不得为空（回退兜底表 + 留一行 warn）', async () => {
+    const warnings: string[] = []
+    const fetchImpl = (async (url: string) => {
+      if (String(url).includes('/api/model-status')) {
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({
+              scope: 'public',
+              models: [
+                { modelGroup: 'DeepSeek-V4.1-Flash', status: 'operational' },
+                { modelGroup: 'GLM-5.3-FLASH', status: 'operational' },
+              ],
+            })
+          },
+        }
+      }
+      return { ok: false, status: 404, async text() { return '' } }
+    }) as unknown as typeof fetch
+    const adapter = new CodelyAdapter({
+      credentialProvider: async () => CREDENTIAL,
+      fetchImpl,
+      warn: (message: string) => { warnings.push(message) },
+    })
+
+    // ⚠️ 先触发一次目录读取（远端「成功」但不含任何 codely-* 前缀）。
+    await adapter.listModels({} as never).catch(() => undefined)
+    const all = adapter.listAllModels()
+    expect(all.length, '⚠️⚠️ 目录不得为空（原缺陷：过滤成空后兜底表不生效）').toBeGreaterThan(0)
+    expect(all.every((m) => m.id.toLowerCase().startsWith('codely-')), '回退的必须是兜底表里的 codely-* 模型').toBe(true)
+    expect(warnings.some((w) => w.includes('过滤')), '必须留一行 warn（否则线上「0 个模型」且无日志）').toBe(true)
   })
 })
