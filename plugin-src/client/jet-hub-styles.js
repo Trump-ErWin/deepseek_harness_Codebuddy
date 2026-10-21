@@ -218,11 +218,37 @@ const STYLES = `
 .dim-jh-ttlBadge { display: inline-block; padding: 1px 8px; border-radius: 999px; background: rgb(227 116 0 / 10%); color: #b45309; font-size: 11px; line-height: 17px; font-weight: 500; }
 
 /* 面板标题区：标题独占一行，操作按钮另起一行。
-   此前用单行 space-between 把标题与 5 个按钮挤在一起，面板一窄就溢出被裁掉。 */
-.dim-jh-panelHead { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 16px; }
-/* 账号列表容器：panelHead 是 column flex 且 align-items 为 flex-start，容器作为
-   flex item 默认收缩到内容宽度 —— 单个账号时卡片会缩成 ~257px 的窄条（多账号时
-   被那句排序提示撑宽，所以只有单账号暴露）。stretch 让宽度与账号数量无关。 */
+   此前用单行 space-between 把标题与 5 个按钮挤在一起，面板一窄就溢出被裁掉。
+
+   ⚠️⚠️ **刻意不写 align-items（= 默认 stretch）**（2026-10-21 合并审计的**根因修法**）。
+
+   原先这里是 align-items: flex-start ⇒ panelHead 是 column flex、交叉轴是**水平**
+   ⇒ 每个子项按 fit-content 收缩到 **max-content**。后果是**一整类**「窄条/贴左」缺陷，
+   而不只是账号卡片那一格：
+
+   - .dim-jh-accountList：单账号时卡片缩成 ~257px 窄条（多账号时被那句约 1200px 长的
+     排序提示撑宽，所以只有单账号暴露）—— 这是用户真机看到的那一格；
+   - .dim-jh-probeNotice / .dim-jh-empty / 补偿卡片：**短文案**时渲染成带边框背景的
+     **窄药丸**；其中 .dim-jh-empty 的加载文案 正在读取账号列表… 还带
+     text-align: center ⇒ 每次开面板都看到一句**贴左**的加载提示（最常被看到的一格）。
+
+   ⇒ 去掉 align-items 让全部子项 stretch 到面板宽，**一次修好账号列表 + 7 个兄弟**。
+
+   ⚠️ **本次唯一的可见行为变化**：.dim-jh-headerActions 有 justify-content: center，
+   而它此前是 max-content 宽（没有空余可分配 ⇒ 居中不生效、观感贴左）；现在它整宽 ⇒
+   按钮总宽小于面板宽时**真的居中**（这正是它声明 center 的本意）。
+
+   ⚠️ **不要**把它改回 flex-start：那会同时复发上面那一整类缺陷
+   （而下面 .dim-jh-accountList 那两条规则只能兜住账号列表这一格）。 */
+.dim-jh-panelHead { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+/* 账号列表容器：宽度与账号数量无关。
+   ⚠️ 根因已在上面 .dim-jh-panelHead 修掉（去掉 align-items: flex-start），
+      故 align-self 现在是**冗余兜底** —— 保留是刻意的：万一有人把
+      align-items: flex-start 改回来，账号列表（用户唯一明确报障过的那一格）仍正确。
+   ⚠️ min-width: 0 在本容器（column flex 的**交叉轴**方向）**是惰性声明** ——
+      min-width: auto 的自动最小尺寸只在**主轴**生效，而主轴是纵向（对应 min-height）。
+      保留它只为「将来 panelHead 改成 flex-direction: row」时承重；
+      **不要**把它当成「账号列表靠它才整宽」—— 那样清理时会先删错那一行。 */
 .dim-jh-accountList { align-self: stretch; min-width: 0; }
 .dim-jh-accountList > .dim-jh-accountCard { width: 100%; box-sizing: border-box; }
 .dim-jh-panelTitle { margin: 0; font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }

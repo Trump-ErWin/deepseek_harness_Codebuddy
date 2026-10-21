@@ -4737,11 +4737,14 @@ function ProviderPanel({ provider, rpcCall }) {
                     React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。')))
           : React.createElement('div', { className: 'dim-jh-accountList' },
               // ⚠️ **必须有 className**（2026-10-21 修）：本行的父级是
-              // `.dim-jh-panelHead`（column flex + `align-items: flex-start`），
-              // 无类名的 div 作为 flex item 会**收缩到内容宽度** —— 只有单个账号
-              // 时卡片会缩成 ~257px 的窄条（多账号时被那句 654px 长的排序提示
-              // 撑宽，所以看起来正常）。`.dim-jh-accountList` 用 `align-self: stretch`
-              // 强制满宽，与账号数量无关。
+              // `.dim-jh-panelHead`（column flex），而它原先带 `align-items: flex-start`
+              // ⇒ 无类名的 div 作为 flex item 会**收缩到内容宽度** —— 只有单个账号时
+              // 卡片缩成 ~257px 的窄条（多账号时被那句排序提示撑宽，所以看起来正常）。
+              // `.dim-jh-accountList` 用 `align-self: stretch` 强制满宽，与账号数量无关。
+              // ⚠️ **根因已另修**（`jet-hub-styles.js` 的 `.dim-jh-panelHead` 去掉了
+              // `align-items: flex-start` ⇒ 全部子项 stretch）⇒ 本条规则现在是冗余兜底。
+              // ⚠️ 注释里原先写的「654px 长的排序提示」是**错的**（2026-10-21 实测：
+              // 那句是两段拼接、共 100 字符、12px 字号 ⇒ max-content **约 1200px**）。
               // ⚠️ opencode 专属策略提示：必须说清「多账号 ≠ 多额度」——
               // 匿名通道按出口 IP 限流，同一出口下的多个账号共用一份额度。
               // 不解释的话，用户加了 5 个号却只看到一份配额，会以为功能坏了。
