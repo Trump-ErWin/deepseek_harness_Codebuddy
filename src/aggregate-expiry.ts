@@ -35,7 +35,7 @@
 import type { AccountPool } from './account-pool.js'
 import { NEVER, UNUSABLE, type ExpiryProbe } from './aggregate-core.js'
 import type { BuddyCredential } from './buddy.js'
-import { fetchCreditBalance } from './credits.js'
+import { fetchCreditBalance, isExclusiveCreditPool } from './credits.js'
 import { CODEBUDDY } from './product.js'
 import { LOOMY } from './loomy-product.js'
 import type { LoomyCredential } from './loomy.js'
@@ -948,6 +948,20 @@ async function sharedPackageExpiry(
   for (const pkg of balance.packages) {
     if (pkg.active !== true) continue
     if (!(typeof pkg.remaining === 'number' && pkg.remaining > 0)) continue
+    /**
+     * ⚠️⚠️ **独立池不进折算**（2026-10-21 合并审计发现）。
+     *
+     * AStudio 的星火池是服务端下发的**独立池**（不参与主池合计、也不能当
+     * 通用积分消耗）。若把它算进来：
+     * ① `hasAnyCredit` 会因它为真 ⇒ 主池全空时也判「有余额」⇒ 账号**不被
+     * 剔除** ⇒ 聚合把请求发给一个只有专属池的账号 ⇒ 上游按主池计费 ⇒ 失败；
+     * ② `earliest` 会取**它**的到期时刻 ⇒ 星火池先过期时整个账号被判「马上
+     * 作废」⇒ 聚合把它排到最前 ⇒ **提前烧掉主池的长期积分**。
+     *
+     * ⚠️ 判据与后端选号侧（`buddy-balance-rank.ts`）同源（同一份
+     * `isExclusiveCreditPool`）⇒ 两侧口径一致。
+     */
+    if (isExclusiveCreditPool(pkg)) continue
     hasAnyCredit = true
     const end = pkg.deductionEndTime
     if (typeof end === 'number' && Number.isFinite(end) && end > 0 && end < earliest) earliest = end
