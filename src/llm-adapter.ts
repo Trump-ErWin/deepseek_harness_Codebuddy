@@ -168,20 +168,100 @@ const DEFAULT_MODELS: readonly string[] = [
 
 /**
  * 模型上下文窗口（最大合并请求+响应 token 数）。
- * - GLM-5.2：202752（对齐 CodeArts Agent IDE 模型卡标注）。
- * - glm-5.3-flash：1048576（1M，逆向自 IDE gateway/config，对齐 deveco-code-rust 90aeb17d）。
- * - deepseek-v4-flash / deepseek-v4-pro：1048576（1M，UI 标注）。
- * - deepseek-v4.1-flash：1000000（对齐 IDE 下发的 inferhub-provider 模型配置，
- *   2026-09 kernel 日志；对齐 deveco-code-rust fb1b4a2）。
- * - 其余模型未公开上下文容量，留 undefined 让后端默认裁剪。
+ *
+ * ## 权威来源与取证（2026-10-21 重取证）
+ *
+ * ⚠️⚠️ **不是从 HTTP 端点读的** —— 本家两个目录端点**都不下发窗口**：
+ * `snap-access /v1/model/builtin` 的条目键全集实测只有
+ * `channel_source, credit, display_enabled, enable, intervals, model_category,
+ *  model_desc, model_id, model_name, model_sku, provider, supports_images, time_slots`
+ * （**无任何 context/window/length/token 类字段**）；`opengw gateway/config`
+ * 本机 4 个账号全回 `4000 invalid channel, group not found`。
+ *
+ * 权威来源是 **CodeArts Agent IDE 自己下发的 provider 配置**：
+ * 内核日志 `cag-global-server` 的 `provider models replace body is {…}` 里
+ * `provider["inferhub-provider"].models[*].limit.context`。
+ * 本机取证范围 **2026-09-11 ~ 2026-10-21，42 份内核日志**，按日期收敛：
+ *
+ * | 模型 | `limit.context` | 取值历史 |
+ * |---|---|---|
+ * | `GLM-5.2` | **1_048_576** | 09-11~10-20 是 `202_752`，**10-21 起上游改成 1M** |
+ * | `glm-5.3` | **1_048_576** | 同上（09 月表里没有它，10-17 起出现，先 202752 后 1M） |
+ * | `glm-5.2-sft-harmony` | **202_752** | 全期稳定（09-11~10-21） |
+ * | `openpangu-2.0-flash` / `-pro` | **524_288** | 全期稳定 |
+ * | `deepseek-v4.1-flash` | **1_048_576** | 全期稳定（本表原先写 1_000_000，**已按 IDE 权威值改正**） |
+ * | `glm-5.3-flash` | **1_048_576** | 逆向自 IDE gateway/config（对齐 deveco-code-rust 90aeb17d） |
+ * | `deepseek-v4-flash` / `-pro` | **1_048_576** | UI 标注「每日 1000 万免费 Tokens」同批（对齐 fb1b4a2） |
+ *
+ * ⚠️ **`GLM-5.2` 的 202_752 已过期**（那是 10-20 及以前的配置）。留着它有两个
+ * 真实后果，且都是**静默**的：① 占用比被封顶成 100%（分母小 5 倍）；
+ * ② 自动压缩阈值 = `0.8 × 202752 ≈ 162K` ⇒ **1M 的能力永远吃不到**
+ * （与 `officeace-product.ts` 那次「估值偏小 5.3 倍」逐字同因）。
+ *
+ * ⚠️ **本表查不到时不再省略 `context`** —— 见 {@link CODEARTS_FALLBACK_CONTEXT_WINDOW}。
  */
 const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
-  ['GLM-5.2', 202752],
+  ['GLM-5.2', 1_048_576],
+  ['glm-5.3', 1_048_576],
   ['glm-5.3-flash', 1_048_576],
-  ['deepseek-v4-flash', 1048576],
-  ['deepseek-v4-pro', 1048576],
-  ['deepseek-v4.1-flash', 1_000_000],
+  ['glm-5.2-sft-harmony', 202_752],
+  ['openpangu-2.0-flash', 524_288],
+  ['openpangu-2.0-pro', 524_288],
+  ['deepseek-v4-flash', 1_048_576],
+  ['deepseek-v4-pro', 1_048_576],
+  ['deepseek-v4.1-flash', 1_048_576],
 ])
+
+/**
+ * 本表查不到时**必须**给的那个窗口（`undefined` 在本家是不可接受的）。
+ *
+ * ## 为什么不能「查不到就省略」（真实报障，2026-10-21）
+ *
+ * 用户报障「codearts 对话后，DSH 下方本该显示上下文占用比的地方没有显示」。
+ * 判据链在宿主侧：
+ * 1. `dsh-client-ui-conversation/lib/client.js` 的 `contextOccupancy()`：
+ *    `if (usedTokens === void 0 || pressure?.contextWindow === void 0) return null`，
+ *    而 `ContextMeter` 在 `context === null` 时 **`return null`** ⇒
+ *    整个环 + 百分比 + 弹层**都不渲染**（不是显示 0%，是**根本不出现**）；
+ * 2. 分母 `contextWindow` 来自 `dsh-agent-loop` 写入的 `request/context` 事件，
+ *    值就是适配器 `resolveModel()` 返回的 `context.contextWindow`。
+ *
+ * ⇒ **本家任何一条目录条目缺窗口，用户就少一个占用条**。实测当时 7 条目录里
+ * 只有 2 条有窗口（`glm-5.3` / `openpangu-*` / `glm-5.2-sft-harmony` 全缺）。
+ * 会话落盘对照（`session-fd3e2786`，同一会话内切模型）：
+ * `{"model":"deepseek-v4.1-flash","contextWindow":1000000}` 有 ⇒ 条在；
+ * `{"model":"glm-5.3"}` 无 ⇒ 条消失。
+ *
+ * ## 为什么是「具名兜底」而不是继续省略
+ *
+ * 仓内先例：`aggregate-adapter.ts` 的 `AGGREGATE_COLD_CONTEXT_WINDOW` —— 同一个
+ * 宿主约束（`dsh-compaction-basic` 在 `info.context === undefined` 时抛
+ * `TargetPressureConfigError: no context capacity for …`）⇒ 纪律是
+ * 「**宁给具名兜底，不省略**」。本家是直连适配器，省略即同时丢掉占用条与
+ * 压缩阈值的唯一输入。
+ *
+ * ## 取值 524_288 的取舍（用户 2026-10-21 选定）
+ *
+ * 取**当前目录里最小的真实窗口**（`openpangu-*` 实测值）：
+ * - 偏小 ⇒ 对 1M 模型会**偏早**触发自动压缩（代价：多压一次，不报错）；
+ * - 偏大 ⇒ 若某未知模型其实更小，就变成**上游溢出报错**而不是自动压缩
+ *   （代价：一轮对话报废）。
+ * ⇒ 取偏小一侧。⚠️ **本值不是「实测的该模型窗口」**，只是安全边界；
+ * 命名与注释都不得声称它是真值（与 `AGGREGATE_COLD_CONTEXT_WINDOW` 同纪律）。
+ */
+export const CODEARTS_FALLBACK_CONTEXT_WINDOW = 524_288
+
+/**
+ * 取某模型的上下文窗口：**静态表优先、查不到用具名兜底**（恒返回正数）。
+ *
+ * ⚠️ 兜底**必须**在 `resolveModel` 与目录两条路径上都生效 —— 只改一条会让
+ * 「选择器里显示了」与「对话里不显示」分叉（本家目录与 `resolveModel`
+ * 共用 `CONTEXT_WINDOWS`，故收敛到这里）。
+ */
+export function codeartsContextWindow(modelId: string): number {
+  const known = CONTEXT_WINDOWS.get(modelId)
+  return known !== undefined && known > 0 ? known : CODEARTS_FALLBACK_CONTEXT_WINDOW
+}
 
 /**
  * 把上游 `ratio_display` 原串转成**仓内倍率口径**（`x0.7`）。
@@ -226,8 +306,10 @@ export function codeartsRateSuffix(display: string): string | undefined {
  * 都有该 id，极易张冠李戴）。
  *
  * ⚠️ 这是**全 provider 统一**的边界，不是逐模型表：本适配器的出站点只有一个，
- * 而 `CONTEXT_WINDOWS` 之上方已注明「其余模型未公开上下文容量」——
+ * 而 `CONTEXT_WINDOWS` 之上方已注明「窗口的权威来源是 IDE 下发的 provider 配置」——
  * 拿不到实测就不该臆造更小的值。故凡走本适配器的模型一律收敛到此上限。
+ * ⚠️ 与窗口**不是同一件事**：窗口缺失走的是 `CODEARTS_FALLBACK_CONTEXT_WINDOW`
+ * （有兜底），输出上限这里是**恒定收敛**（无兜底分支）。
  */
 const CODEARTS_MAX_OUTPUT_TOKENS = 65_536
 
@@ -1028,6 +1110,24 @@ export class CodeArtsAdapter extends LlmAdapter {
           defaultEffort: ReasoningEffortId(CODEARTS_DEFAULT_EFFORT),
         }),
         /**
+         * ⚠️ **未知 id 也给窗口**（用户手填模型 id 时否则永远没有上下文占用条）。
+         *
+         * 与 `unknownModelInputModalities` / `unknownModelReasoning` **同一形态**：
+         * 本家这两项都与「具体模型」无关（纯文本网关 / 顶层 `thinking.type`），
+         * 窗口这一项在本家同样有本地兜底可用（目录窗口本就全来自静态表）。
+         *
+         * ⚠️⚠️ **必须走 `codeartsContextWindow(modelId)`，不能直接返回常数兜底**
+         *    （2026-10-21 全量测试实测踩到）：`glm-5.3` 在静态窗口表里是 1M，
+         *    但**不在静态兜底目录**（`DEFAULT_MODELS`）里 ⇒ 远端失败时它算
+         *    「目录外 id」⇒ 直接返回常数会让它拿到 524_288（**分母错 2 倍**），
+         *    而它**正是用户报障的那个模型**。
+         *
+         * ⚠️ **不要推广到别家**：多数家的窗口来自远端该模型的配置，对未知 id
+         *    编一个就是**假窗口**（分母错 ⇒ 占用比与压缩阈值一起错）。
+         *    取值理由见 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 的长注释。
+         */
+        unknownModelContextWindow: (modelId) => codeartsContextWindow(modelId),
+        /**
          * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
          *
          * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFreshFor` 判据
@@ -1179,7 +1279,9 @@ export class CodeArtsAdapter extends LlmAdapter {
    * ⚠️ 本家三处**真实差异**（不要「顺手统一」）：
    * 1. **VL 多模态不参与目录**（`-VL-` / `-VL` 结尾的 id 被滤掉）——
    *    这是本家的可见性判据，骨架不认识；
-   * 2. `contextWindow` 来自静态 `CONTEXT_WINDOWS` 表（不是远端字段）；
+   * 2. `contextWindow` 来自静态 `CONTEXT_WINDOWS` 表（不是远端字段 ——
+   *    本家两个目录端点都**不下发**窗口，取证见该表的注释），表里查不到时
+   *    走具名兜底 {@link CODEARTS_FALLBACK_CONTEXT_WINDOW}（**恒有值**）；
    * 3. `reasoning` 是**恒声明**的两档（关闭/开启，**强度序**），与 entry 无关 ——
    *    实测（2026-09-29）：本网关**唯一**真正生效的思考控制是顶层
    *    `thinking.type`，`reasoning_effort`（含 low/high/none/minimal）与嵌套
@@ -1188,7 +1290,9 @@ export class CodeArtsAdapter extends LlmAdapter {
    *    故**不**臆造 low/high/max 强度阶梯。
    */
   private toCatalogEntry(model: { id: string; name: string; rateLabel?: string }): CatalogEntry {
-    const contextWindow = CONTEXT_WINDOWS.get(model.id)
+    // ⚠️ **恒有值**（表内优先、查不到走具名兜底）—— 缺它用户就没有上下文占用条，
+    //    见 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 的长注释（真实报障 2026-10-21）。
+    const contextWindow = codeartsContextWindow(model.id)
     // ⚠️ 倍率拼进 `name`（与 officeace / buddy / loomy / raccoon 同款：
     //    `name` 带倍率、`resolveModel` 用裸名，骨架只认 `name`）。
     //
@@ -1224,7 +1328,9 @@ export class CodeArtsAdapter extends LlmAdapter {
       bareName: model.name,
       // ⚠️ 本家恒声明 `['text']`（CodeArts 是纯文本网关；VL 模型上面已滤掉）。
       inputModalities: ['text'] as const,
-      ...contextWindow !== undefined ? { contextWindow } : {},
+      // ⚠️ **无条件落键**（`codeartsContextWindow` 恒返回正数）—— 写成
+      //    `...contextWindow !== undefined ? {...} : {}` 就是本缺陷的成因。
+      contextWindow,
       reasoning: {
         // ⚠️ 顺序 = **强度序（弱 → 强）**，逐条理由见 `CODEARTS_REASONING_EFFORTS`
         // 的长注释（Issue IKLIDV）—— 简言之：DSH 把该数组当展示顺序、客户端不排序，
