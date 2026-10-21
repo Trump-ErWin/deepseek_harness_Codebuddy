@@ -1198,3 +1198,42 @@ describe('单位归一：宿主与客户端同一口径', () => {
     }
   })
 })
+
+/**
+ * ★★ **同一语义的两处渲染必须同时改**（2026-10-21 真实缺陷）。
+ *
+ * 设置页账号卡片（`jet-hub.js` 的 `CreditBalanceRow`）与**本徽标弹窗**
+ * （`usage-badge.js` 的 `splitParts`）是**两套独立渲染代码** —— 6d7f47a 只改了
+ * 前者，于是用户看到「设置页有「另有 25000 专属」、弹窗没有」。
+ *
+ * ⇒ 这里用源码级断言把**两处都锁住**：任一侧漏改都会红，而不是静默漂移。
+ *    ⚠️ 判据用 `isExclusivePool`（`credit-expiry.js` 单一持有）而不是各自的
+ *    文案 —— 只断言文案会让「改了文案但删了逻辑」这种改法溜过去。
+ */
+describe('独立池（AStudio 星火积分）：设置页与徽标弹窗两处渲染同步', () => {
+  const badge = read('plugin-src/client/usage-badge.js')
+  const jetHub = read('plugin-src/client/jet-hub.js')
+
+  it('徽标弹窗的 splitParts 追加独立池段（无色 muted）', () => {
+    // 必须走 isExclusivePool（与 credit-expiry.js 同一判据），不能各写一套
+    expect(badge).toContain('isExclusivePool')
+    // 追加的是**分段**，故 key 与 tone 都要对（tone 用 muted：不是告警，是事实说明）
+    expect(badge).toContain("key: 'exclusive'")
+    expect(badge).toContain("tone: 'muted'")
+  })
+
+  it('设置页的 CreditBalanceRow 同样渲染独立池提示', () => {
+    expect(jetHub).toContain('isExclusivePool')
+    expect(jetHub).toContain('exclusiveRemaining > 0')
+  })
+
+  it('两处共用同一个 isExclusivePool 判据（不是各写一套）', async () => {
+    // 单一真相源：两处都从 credit-expiry.js import，而不是各自实现「独立池」匹配。
+    const { isExclusivePool } = await import('../../plugin-src/client/credit-expiry.js')
+    expect(isExclusivePool({ name: '星火积分（独立池，不参与主池合计）' })).toBe(true)
+    expect(isExclusivePool({ name: '赠送积分' })).toBe(false)
+    // 没有 name / name 不是字符串 ⇒ false（不抛，避免渲染整行崩掉）
+    expect(isExclusivePool({})).toBe(false)
+    expect(isExclusivePool(undefined)).toBe(false)
+  })
+})
