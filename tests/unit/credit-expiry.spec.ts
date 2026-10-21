@@ -428,6 +428,23 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
     ['expiringRemaining 为 0（等同未标）', [
       pkg({ remaining: 6000, deductionEndTime: undefined, expiringRemaining: 0 }),
     ]],
+    /**
+     * ★ **独立池**（AStudio 星火池，2026-10-21 合并审计发现，阻断级）。
+     *
+     * PR !134 只在**客户端**把独立池从三档里摘出，后端选号侧不看 `pkg.name`
+     * ⇒ **两侧口径分叉** ⇒ 锁定永久积分时选号判据与面板数字相反。
+     *
+     * ⚠️ 这条 fixture 是**修复前后唯一会变红**的那条 —— 修好后两侧都把独立池
+     * 排除在两桶之外（`expiring` 0 / `permanent` 0）。
+     */
+     ['独立池不进任何一桶（前后端同判）', [
+      pkg({ name: '赠送积分', remaining: 1900, deductionEndTime: NOW + 11 * DAY }),
+      pkg({ name: '星火积分（独立池，不参与主池合计）', remaining: 25000, deductionEndTime: undefined }),
+    ]],
+    ['只有独立池（主池全空）', [
+      pkg({ name: '会员积分', remaining: 0, deductionEndTime: NOW + 200 * DAY }),
+      pkg({ name: '星火积分（独立池，不参与主池合计）', remaining: 25000, deductionEndTime: NOW + 3 * DAY }),
+    ]],
   ]
 
   for (const [label, packages, windowDays] of fixtures) {
@@ -1077,3 +1094,68 @@ describe('包列表排序的覆盖面（源码级）', () => {
 })
 
 
+
+
+/**
+ * ⚠️⚠️ **独立池判据必须两侧同源**（2026-10-21 合并审计发现的**假绿**）。
+ *
+ * ## 背景
+ *
+ * PR !134 的 `isExclusivePool`（客户端）与宿主侧的池名（`src/astudio-credits.ts`）
+ * **不共享模块图**（AGENTS.md 明示）⇒ 两处各存一份判据。
+ *
+ * ⚠️ 而 PR !134 自带的守卫只断言**客户端自己写死的那个字符串**
+ * （`isExclusivePool({ name: '星火积分（独立池，不参与主池合计）' })` 为 true），
+ * **不碰宿主侧真正产出的池名** ⇒ **把宿主侧的池名改掉，判据立刻恒 false，
+ * 而全部单测仍然全绿**（合并审计实测：改池名 ⇒ 全量 vitest 仅剩那条与本次
+ * 无关的既有失败）。
+ *
+ * ## 本段做什么
+ *
+ * 用**宿主侧真实产出的池**（`buildAstudioBalance` 的输出）去喂**客户端的判据**
+ * ⇒ 两侧任一侧改了池名/判据，本段当场变红。
+ */
+describe('独立池判据必须两侧同源（宿主侧真实池名 → 客户端判据）', () => {
+  it('宿主侧产出的星火池必须命中客户端的 isExclusivePool', async () => {
+    // ⚠️ 用**真实报文**走 `buildAstudioBalance`，而不是手抄一个池名 ——
+    // 手抄的那份正是「锁客户端字面量」的假绿写法。
+    const { buildAstudioBalance } = await import('../../src/astudio-credits.js')
+    const { isExclusivePool } = await import('../../plugin-src/client/credit-expiry.js')
+    const balance = buildAstudioBalance({
+      totalBalance: 1900,
+      totalAmount: 1900,
+      memberTotal: 500, memberBalance: 500, memberNextExpireTime: '2026-11-20T01:50:14',
+      buyTotal: 700, buyBalance: 700, buyNextExpireTime: '2026-11-20T01:50:14',
+      activityTotal: 700, activityBalance: 700, activityNextExpireTime: '2026-11-01T00:00:00',
+      sparkTotalAmount: 500, sparkTotalBalance: 500, sparkNextExpireTime: '2026-11-01T00:00:00',
+    } as never)
+    expect(balance).not.toBeNull()
+    const spark = balance!.packages.find((p) => p.remaining === 500 && p.name.includes('星火'))
+    expect(spark, '宿主侧应产出星火池').toBeDefined()
+    // ⚠️ 这一行是本段的全部价值：宿主池名 → 客户端判据。
+    expect(
+      isExclusivePool(spark!),
+      `宿主侧池名「${spark!.name}」必须命中客户端的独立池判据（两侧不共享模块图，靠本条锁住）`,
+    ).toBe(true)
+    // 反向对照：主池**不得**被误判成独立池。
+    for (const p of balance!.packages) {
+      if (p.name.includes('星火')) continue
+      expect(isExclusivePool(p), `主池「${p.name}」不该被误判成独立池`).toBe(false)
+    }
+  })
+
+  it('宿主侧的 isExclusiveCreditPool 与客户端判据对同一批池名给出相同结论', async () => {
+    const { isExclusiveCreditPool } = await import('../../src/credits.js')
+    const { isExclusivePool } = await import('../../plugin-src/client/credit-expiry.js')
+    const names = [
+      '星火积分（独立池，不参与主池合计）',
+      '会员积分', '购买积分', '赠送积分', 'Bonus Pack', '',
+    ]
+    for (const name of names) {
+      expect(
+        isExclusiveCreditPool({ name }),
+        `两侧对「${name}」的判定必须一致（宿主侧 ${isExclusiveCreditPool({ name })} vs 客户端 ${isExclusivePool({ name })})`,
+      ).toBe(isExclusivePool({ name }))
+    }
+  })
+})
