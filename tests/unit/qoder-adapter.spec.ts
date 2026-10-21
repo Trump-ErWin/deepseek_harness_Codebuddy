@@ -1704,3 +1704,152 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
     })
   })
 })
+
+/**
+ * ## 真实报障（用户 2026-10-21 贴出的原始文案）
+ *
+ * ```
+ * 本轮运行失败aggregate: qodercn（dfmodel）上游失败：
+ *   qoder: Error in upstream response (provider_error/model_error) code=SERVER
+ * ```
+ *
+ * ⚠️ **同一句里出现了两个渠道名**：外层是聚合层写的 `qodercn`（东八区中国版），
+ * 内层却是 `qoder`（国际版）。两个渠道的**凭据、端点、额度池完全不同**，
+ * 排查时看到 `qoder:` 会去查国际版的账号 —— 而真实故障在中国版上。
+ *
+ * 根因：`QoderAdapter` 是**两站共用**的一个类（只靠 `options.product` 区分），
+ * 而三处报错前缀全被写成了字面量 `'qoder'`：
+ * ① 两个 HTTP 失败分支；② 信封剥离函数的第二个实参；③ SSE 消费器的 `label` 选项。
+ *
+ * ⇒ 修法：统一取 `this.product.id`。国际版输出**逐字节不变**，中国版从此说自己的名字。
+ *
+ * ⚠️ 这个缺陷**不影响功能**（错误照样抛、照样可重试、聚合照样换候选），
+ * 只影响**归因**。但本仓库反复出现的正是这类「功能对、归因错」的坑
+ * （见 AGENTS.md 第 9 条 qoder `110` 被归 `SERVER` 的案例）——故必须有守卫。
+ */
+describe('报错前缀必须取自 product.id（不许硬编码 qoder）', () => {
+  /** 让 HTTP 层失败：回 500（`httpErrorCode` 映射成 `SERVER`）。 */
+  function failResponse(status: number, body = 'upstream boom'): Response {
+    return new Response(body, { status, headers: { 'Content-Type': 'text/plain' } })
+  }
+
+  /** 让 SSE 层失败：HTTP 200 + 内嵌错误帧（与真实链路同形态）。 */
+  function sseErrorResponse(inner: string): Response {
+    const payload = `data:${JSON.stringify({
+      headers: { 'Content-Type': ['application/json'] },
+      body: inner,
+      statusCodeValue: 200,
+      statusCode: 'OK',
+    })}\n\n`
+    return new Response(payload, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  it.each([
+    ['qoder', QODER],
+    ['qodercn', QODER_CN],
+  ] as const)('%s：HTTP 层失败的文案用 %s 开头', async (providerId, product) => {
+    const adapter = makeAdapter({
+      product,
+      fetchImpl: (async () => failResponse(500)) as unknown as typeof fetch,
+    })
+    await expect(collectWith(adapter, { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+      .rejects.toMatchObject({
+        message: expect.stringContaining(`${providerId}: `) as never,
+      })
+  })
+
+  it('★ 中国版 HTTP 层失败：文案是 qodercn，绝不能是 qoder', async () => {
+    const adapter = makeAdapter({
+      product: QODER_CN,
+      fetchImpl: (async () => failResponse(500)) as unknown as typeof fetch,
+    })
+    let message = ''
+    try {
+      await collectWith(adapter, { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+    } catch (error) {
+      message = (error as Error).message
+    }
+    // ⚠️ 两个断言都要有：第一条守「说对了」，第二条守「没再说错」。
+    // 只写第一条时，`qodercn: … qoder: …` 这种**同时含两个名字**的文案会漏过。
+    expect(message, '中国版的报错必须自称 qodercn').toContain('qodercn: ')
+    expect(message, '中国版的报错不得出现 qoder: 前缀（那会指向国际版）')
+      .not.toMatch(/(?:^|\s)qoder: /)
+  })
+
+  it('★ 真实形态：SSE 内嵌 provider_error 帧，文案带对的渠道名', async () => {
+    // 用户贴出的真实内层帧（`code` 为空、`type` 为 `model_error`，
+    // 故 `openai-compat` 拼出的后缀恰好是 `provider_error/model_error`）。
+    const inner = JSON.stringify({
+      code: 'provider_error',
+      message: 'Error in upstream response',
+      type: 'model_error',
+    })
+    const adapter = makeAdapter({
+      product: QODER_CN,
+      fetchImpl: (async () => sseErrorResponse(inner)) as unknown as typeof fetch,
+    })
+    let message = ''
+    try {
+      await collectWith(adapter, { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message, 'SSE 消费器的 label 也必须取自 product.id').toContain('qodercn: ')
+    expect(message).not.toMatch(/(?:^|\s)qoder: /)
+    // 上游原文必须保真（本仓「错误保真」红线）
+    expect(message).toContain('Error in upstream response')
+    expect(message).toContain('provider_error/model_error')
+  })
+
+  it('★ 国际版输出逐字节不变（改名不得改变既有文案）', async () => {
+    const adapter = makeAdapter({
+      product: QODER,
+      fetchImpl: (async () => failResponse(500, 'upstream boom')) as unknown as typeof fetch,
+    })
+    let message = ''
+    try {
+      await collectWith(adapter, { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message, '国际版的既有文案必须保持原样').toBe('qoder: upstream boom')
+  })
+
+  it('★ 续期后凭据仍为空：AUTH 分支的文案也带对的渠道名', async () => {
+    // 走到那条 AUTH 需要一个特定序列：401 → 续期 → **续期后仍拿不到凭据**。
+    // 这是「凭据彻底失效」的真实形态（refresh 成功但服务端不再发 token）。
+    let call = 0
+    const adapter = makeAdapter({
+      product: QODER_CN,
+      // 第一次返回 cred（供入口取号），之后一律返回「空 token」的凭据。
+      resolveCredential: async () => {
+        call += 1
+        return call === 1 ? cred : { ...cred, access_token: '' }
+      },
+      fetchImpl: (async () => failResponse(401, 'auth failed')) as unknown as typeof fetch,
+    })
+    let message = ''
+    try {
+      await collectWith(adapter, { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message, 'AUTH 分支必须自称 qodercn').toContain('qodercn: credential expired and refresh failed')
+    expect(message).not.toMatch(/(?:^|\s)qoder: /)
+  })
+
+  it('源码里不得再有硬编码的三处 qoder 前缀（反向守卫，防改回去）', () => {
+    const code = readFileSync(resolve(here, '../../src/qoder-adapter.ts'), 'utf8')
+    // ① 两个 HTTP 失败分支曾写 `qoder: ${errorDetail(...)}`
+    expect(code, 'HTTP 失败文案又硬编码了 qoder')
+      .not.toContain('`qoder: ${errorDetail(')
+    // ② 曾写 `unwrapQoderEnvelopeStream(response, \'qoder\')`
+    expect(code, '信封标签又硬编码了 qoder')
+      .not.toContain("unwrapQoderEnvelopeStream(response, 'qoder')")
+    // ③ 曾写 `label: 'qoder',`
+    expect(code, 'SSE 消费器标签又硬编码了 qoder')
+      .not.toMatch(/label:\s*'qoder'/)
+    // 且必须真的从 product.id 取（正向断言，否则删掉那一行也会全绿）
+    expect(code, '必须从 product.id 取标签').toContain('const label = this.product.id')
+  })
+})

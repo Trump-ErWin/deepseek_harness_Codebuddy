@@ -1454,6 +1454,26 @@ export class QoderAdapter extends LlmAdapter {
     // 2026-09-27 —— 第一版修复只覆盖了 HTTP 403 形态，于是这条路径被
     // SSE 消费器归为 `SERVER` 直接抛给 harness，以 500…8000ms 快退避重试
     // 5 次，而服务端要求等 30 秒，**永远等不到**）。
+    // ⚠️⚠️ **报错前缀必须取自 `this.product.id`，绝不能硬编码 `'qoder'`**
+    //（真实报障，2026-10-21 用户贴出：
+    //  `aggregate: qodercn（dfmodel）上游失败：qoder: Error in upstream response
+    //   (provider_error/model_error) code=SERVER`）。
+    //
+    // 中国版与国际版**共用本适配器类**（`QoderAdapter` 只靠 `options.product` 区分，
+    // 见构造函数 `this.product = options.product ?? QODER`），而旧实现把三处前缀
+    // 全写成了字面量 `'qoder'`：
+    //
+    // ① 两个 HTTP 失败分支（`QUOTA_EXCEEDED` / `httpErrorCode`）；
+    // ② 信封剥离函数的第二个实参（渠道标签）；
+    // ③ SSE 消费器选项里的 `label` 字段。
+    //
+    // 后果：**中国版**（`qodercn`）的报错看起来像国际版（`qoder`）的问题 ——
+    // 聚合层已经把渠道名（`qodercn`）写在**外层**，内层又冒出另一个渠道名，
+    // 排查时会一头雾水（两个渠道的凭据、端点、额度池**完全不同**）。
+    //
+    // ⇒ 用 `this.product.id`（取值恰好是 `'qoder'` / `'qodercn'`），
+    //   国际版的输出**逐字节不变**，中国版从此说自己的名字。
+    const label = this.product.id
     for (;;) {
       response = await this.sendEncrypted(await buildRequest(credential), options)
 
@@ -1481,7 +1501,7 @@ export class QoderAdapter extends LlmAdapter {
             authRefreshed = false // 新账号可再续期一次
             continue
           }
-          throw new LlmError(`qoder: ${errorDetail(errorText)}`, 'QUOTA_EXCEEDED', { status: response.status })
+          throw new LlmError(`${label}: ${errorDetail(errorText)}`, 'QUOTA_EXCEEDED', { status: response.status })
         }
 
         // 非排队：认证失败才续期（且每次请求最多一次，避免刷爆 userinfo）。
@@ -1490,12 +1510,12 @@ export class QoderAdapter extends LlmAdapter {
           await this.options.refresh()
           const refreshed = await this.options.resolveCredential(options.model)
           if (refreshed === undefined || refreshed.access_token.length === 0) {
-            throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status })
+            throw new LlmError(`${label}: credential expired and refresh failed`, 'AUTH', { status: response.status })
           }
           credential = await this.ensureUid(refreshed)
           continue
         }
-        throw new LlmError(`qoder: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+        throw new LlmError(`${label}: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
       }
 
       // 重复请求（客户端 `duplicate_request`）：凭据没问题，重发一次即可。
@@ -1506,17 +1526,17 @@ export class QoderAdapter extends LlmAdapter {
 
       if (!response.ok) {
         const errorText = await response.text().catch(() => '')
-        throw new LlmError(`qoder: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+        throw new LlmError(`${label}: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
       }
 
       // ⚠️ 消费 SSE 时**捕获流内排队错误**，走与 HTTP 层**完全相同**的等待逻辑。
       // `consumeOpenAiSse` 是生成器：无法「try 一次再重试」，故这里手动迭代，
       // 捕获到排队就等待后重发整条请求（排队期间未产出任何 chunk，可安全重放）。
       const inner = consumeOpenAiSse(
-        unwrapQoderEnvelopeStream(response, 'qoder'),
+        unwrapQoderEnvelopeStream(response, label),
         { signal: options.signal },
         {
-          label: 'qoder',
+          label,
           firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
           chunkTimeoutMs: resolveChunkTimeoutMs(),
           ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
