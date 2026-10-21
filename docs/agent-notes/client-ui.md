@@ -3086,12 +3086,17 @@ origin 一起被抛弃，症状是「关掉的入口下次启动又回来了」�
 
 ### ⚠️⚠️ 4. 单账号卡片不占满：`column flex + align-items: flex-start` 的收缩
 
-`.dim-jh-panelHead` 是 `display:flex; flex-direction:column; align-items:flex-start`，
-账号列表容器是它的 flex item ⇒ 宽度 = **max-content**。多账号时那句 654px 的
-「拖动卡片可调整顺序…」提示把容器撑宽，所以缺陷**只在单账号**暴露成 ~257px 窄条。
+`.dim-jh-panelHead` 原是 `display:flex; flex-direction:column; align-items:flex-start`，
+账号列表容器是它的 flex item ⇒ 宽度 = **max-content**。多账号时那句排序提示把容器撑宽，
+所以缺陷**只在单账号**暴露成 ~257px 窄条。
+
+⚠️ **那提示的实际长度**（2026-10-21 实测）：它是 `jet-hub.js` 里**两段拼接**的文案、
+共 **100 字符**，而 `.dim-jh-orderHint` 是 `font-size:12px` ⇒ max-content **约 1200px**
+（初版注释写的「654px」**是错的**，已订正）。⇒「只有单账号暴露」是**有条件**的：
+列表宽 = `min(约1200px, 面板可用宽)`，面板宽超过约 1200px 时多账号同样是窄条（只是没那么夸张）。
 
 修复**不是**给卡片加 `width:100%` —— 那只是等于父容器的 max-content，量出来仍是 257。
-正确做法是给容器拉伸（本 PR）：
+先给容器拉伸（原 PR 的点补丁）：
 
 ```css
 .dim-jh-accountList { align-self: stretch; min-width: 0; }
