@@ -430,6 +430,45 @@ export function formatNamedPoolLine(packages, format) {
  * 来源优先序：`deductionEndTime`（毫秒，各 provider 后端已归一化）>
  * `expiredTime`（字符串，如 "2026-11-01 00:00:00"，给未归一化的包兜底）。
  *
+ * ## ⚠️⚠️ **架构性缺口（2026-10-21 第二轮审计登记，未修）**：`expiredTime` 兜底**不认哨兵**
+ *
+ * `deductionEndTime` 那条由**各个后端**在写入前过滤永久哨兵（Qoder 的
+ * `isPermanentSentinelMs`、codearts 的「有 `deductionEndTime` 就不写 `expiredTime`」），
+ * 但**本函数自己的 `expiredTime` 兜底路径没有任何哨兵判据**。实测后果：
+ * ```
+ * { expiredTime: '9999-12-31T00:00:00.000Z' }
+ *   → packageExpiryMs    = 253402214400000
+ *   → formatPackageExpiry = "9999-12-31（2912150 天后）"
+ * ```
+ * 而**目前仍有多个渠道会把上游字符串原样透传到 `expiredTime`**（2026-10-21 全仓清点，
+ * `grep 'expiredTime:'` 后逐格判断「是否来自已归一的 `deductionEndTime`」）：
+ *
+ * | 来源 | 是否可能带哨兵 |
+ * |---|---|
+ * | `astudio-credits.ts` **星火池**（`readAstudioLocalTime(...)`） | ✅ 上游原样串 |
+ * | `lobsterai-credits.ts`（`expiredTime: expiresAt`） | ✅ 上游原样串 |
+ * | `jet-hub-rpc.ts`（officeace 的 `group.expiresAt`） | ✅ 上游原样串 |
+ * | `provider-credits.ts` 两处（`bucket.expiresAt` / `result.expiresAt`） | ✅ 上游原样串 |
+ * | `codearts-credits.ts`（`new Date(deductionEndTime).toISOString()`） | ❌ 从已过滤的 `deductionEndTime` 反推 |
+ * | `minimax-credits.ts`（`new Date(expires).toISOString()`） | ❌ 同理（`expire_at_ms` 非哨兵形态） |
+ * | `qoder-credits.ts`（`expIsPermanent ? '' : raw`） | ❌ 已在本轮修复时过滤 |
+ *
+ * ⚠️ **初版这段注释只写了「两个渠道」**（astudio / lobsterai），那是**漏数** ——
+ * 只看了 `src/*-credits.ts`，漏掉了 `jet-hub-rpc.ts` 与 `provider-credits.ts`。
+ * 「数一遍」必须覆盖**全仓**，不能只看命名符合直觉的那些文件。
+ *
+ * **当前是否可达**：**不可达** —— 上述上游实测都**不发** 9999 哨兵
+ *（astudio 的 `*NextExpireTime` 实测形如 `"2026-11-20T01:50:14"`；
+ * lobsterai / officeace 的 `expiresAt` 实测是当年的 ISO 串）。
+ * 所以这是**前向防御缺口**，不是现存缺陷（如实标注，不夸大）。
+ *
+ * **为什么现在不改本函数**：它是**所有 provider 共用**的显示判据（不只是
+ * `usesExpiryWindow` 那 13 家 —— 任何带 `expiredTime` 的包都会走到这里），
+ * 在这里加「年份 >= 9999 就当没有到期」会**改变全部渠道**的展示语义，
+ * 且那种「遥远处到期」在别的渠道可能是**真实**的。正确修法是**在写
+ * `expiredTime` 的那几个调用点各自过滤**（与 Qoder 的 `isPermanentSentinelMs`
+ * 同型 —— 一份判据、多个入口）。已登记，待上游取证后处理。
+ *
  * @param pkg - 资源包。
  * @returns 毫秒时间戳；`null` = 没有到期时间（显示「长期」）。
  */
