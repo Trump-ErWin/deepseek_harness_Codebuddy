@@ -170,6 +170,51 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     displayName: 'CodeArts (华为云)',
     logoClass: 'codearts',
     credits: { balance: true, dailyCheckin: true },
+    /**
+     * 三档分档覆盖**两个来源**（2026-10-20）：
+     *
+     * - **基础积分包**（`usageBasicPackageCredit`）随套餐周期到期，响应顶层
+     *   给了 `end_date`（纯日期，如 `2026-10-27`）⇒ 有确切时刻，已写进
+     *   `packages[].deductionEndTime`，可正常分档。
+     * - **赠送积分包**（签到/活动，逐笔「发放日 +30 天」）与**按需包**没有
+     *   逐包到期字段，但上游在该分类 metric 上给了
+     *   `package_credit_expiring_amount`（「其中 N 分即将到期」的标量）
+     *   ⇒ 已解析到 `packages[].expiringRemaining`，**拆开**进两个桶：
+     *   临期 += `expiringRemaining`，永久 += 余下部分。
+     *
+     * 于是三档合计恒等于 `credits.total`，不再出现「永久 25000」旁边
+     * 又写「另有 2000 即将到期」这种对不上的数字（用户 2026-10-20 报障）。
+     *
+     * ⚠️ 拆出来的那部分**没有倒计时** —— 上游不给逐笔日期，绝不编造。
+     * ⚠️ 赠送包整体仍是**会到期**的性质，只是其中一段时间窗口内的部分被
+     *   标成「即将到期」；余下部分归入永久桶是**保守方向**（宁可少用）。
+     */
+    usesExpiryWindow: true,
+    /**
+     * ⚠️ 不开 `permanentLock`：CodeArts 的积分**没有「永久」这一档**。
+     *
+     * 依据（官方计费文档 + 实测）：
+     * - 基础积分包随套餐周期作废（体验版虽自动免费续期，但基础包额度按周期重置）；
+     * - 赠送积分包逐笔「发放日 +30 天」；
+     * - 按需包按消费实时结算。
+     *
+     * 三类的共同点是**都会到期**，没有「永不作废」的池。开永久锁会让用户
+     * 误以为「锁住就不会作废」，而实际只是把这批号从选号里摘出去 ——
+     * 语义错位，故不登记。
+     */
+    /**
+     * ⚠️ **必须与 `usesExpiryWindow` 同时登记**（2026-10-20 合并审计发现，
+     * 与 minimax 两站同因）：`provider-registry.spec.ts` 有一条从**能力事实
+     * 派生**的守卫「`usesExpiryWindow` 的家必须有 `creditPackages`（同一份数据）」
+     * —— 两者读的是同一批 `packages[]`。只开前者会让账号卡片**不展示逐包列表**，
+     * 用户看得到「永久 / 长期 / 临期」三档合计，却看不到是**哪几笔**构成的。
+     *
+     * ⚠️ 本家补上是有实据的：`codearts-credits.ts` 已把上游的
+     * `package_credit_expiring_amount` 聚合标量**拆到逐包**
+     * （`packages[].expiringRemaining`），基础包还带 `deductionEndTime`
+     * （取自套餐周期 `end_date`）—— 「N/M 个资源包有效」这句因此有真实内容。
+     */
+    creditPackages: true,
     settingsNamespace: 'llm-codearts',
     channel: true,
   },
@@ -217,6 +262,61 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     logoClass: 'qoder',
     credits: { balance: true, dailyCheckin: true },
     creditPackages: true,
+    /**
+     * ⚠️ **2026-10-20 补登记：三档分档（永久 / 长期 / 临期）与永久锁此前完全没生效。**
+     *
+     * 这两项此前缺失导致**两个静默故障**（与 minimax / astudio 那两次逐字同因）：
+     * - 缺 `usesExpiryWindow` ⇒ `jet-hub-rpc.ts` 的判据
+     *   `descriptorOf(req.provider)?.usesExpiryWindow === true` 为 false ⇒
+     *   响应里没有 `windowDays` ⇒ 客户端 `splitCreditsByExpiry` 收 `undefined`
+     *   ⇒ 面板上「永久 X · 长期 Y · 临期 Z」那整行**不渲染**；
+     * - 缺 `permanentLock` ⇒ 客户端 `supportsPermanentLock()` 为 false ⇒
+     *   「锁定永久积分」开关**整个不渲染**（不是灰掉，是不存在）。
+     *
+     * ⚠️⚠️ **但这两项对本家是「能力开关」，不是数据保证 —— 逐包到期拿不到。**
+     *
+     * 实测（2026-10-20，两个真实 qodercn 账号）
+     * `GET /sash/api/v2/me/usage` 只下发三个额度块：
+     * - `userQuota`（套餐额度，实测 `{total:0,used:0,remaining:0}`）；
+     * - `addOnQuota`（用户截图里的「个人资源包 1,900」）—— **只给聚合标量**
+     *   （`total` / `used` / `remaining`）加一个 `detailUrl` 网页链接，
+     *   **没有任何日期字段**；
+     * - `dedicatedResourcePackages` —— **唯一**带真实逐包到期（`expiresAt`
+     *   字符串）的那一项，而本机账号实测为 `undefined`。
+     *
+     * ⇒ 当前账号形态下 `packages[]` 里**没有任何真实的逐包到期时刻**，
+     *   `qoder-credits.ts` 的 `toPackage()` 因此**不写** `deductionEndTime`
+     *   ⇒ `splitBuddyCreditsByExpiry` 只得到一个「永久（未知到期）」桶 ⇒
+     *   **临期桶恒为 0**。这**不是缺陷**，是「上游不下发 ⇒ 我们不编造」的如实结果
+     *   （本仓库红线）。只有上游真的给了 `dedicatedResourcePackages` 的账号
+     *   才会出现临期档。
+     *
+     * ⚠️ 顺带澄清一个**反例**：顶层 `qoderUsage.expiresAt` 实测
+     *   `253402214400000`（= `9999-12-31T00:00:00.000Z`）**不是**到期时刻 ——
+     *   它是 Qoder 对 `userQuota`（套餐额度）下发的**永久哨兵**：官方客户端
+     *   asar 的用量面板里只有 `userQuota.expiresAt` 走 `renewson`
+     *   （文案「将于 {{date}} 刷新」，语义是**订阅刷新日**），而
+     *   `addOnQuota` 那一格**只渲染 used/total/remaining、不给任何日期**。
+     *   把它当真实到期写进 `deductionEndTime` 会把整个套餐额度伪造成
+     *   「9999 年到期」的临期档，故 `qoder-credits.ts` 用
+     *   `QODER_PERMANENT_EXPIRY_MS` 显式识别并**不写**。
+     *   （活动的 `validity = {mode:'RELATIVE_DAYS', days:30}` 只描述
+     *   「领取后 30 天有效」的**语义**，同样不是任何一笔已知时刻。）
+     *
+     * ⚠️ **`permanentLock` 因此锁的正是「未知到期」那一桶**：
+     *   `credential-resolver.ts` 的 `allowPermanent` 拦掉永久桶的可消耗性。
+     *   对「上游只给聚合标量」的账号，锁定后确实把该桶保了下来 ——
+     *   语义如实，**不是假开关**（Qoder 的 `dedicatedResourcePackages` 一旦下发，
+     *   其真实临期包与永久桶的分档同样成立）。
+     *
+     * ⚠️ 三处必须同改（本文件 + `provider-expiry.ts` 的 `createProviderExpiry()`
+     * + `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`），由
+     * `expiry-runtime-parity.spec.ts` 真跑 `apply()` 锁一致 ——
+     * 这是该陷阱的**第 7 次复发**（cline → accio → officeace → autoclaw
+     * → astudio → minimax → qoder），漏任何一处的症状都是**静默**的。
+     */
+    permanentLock: true,
+    usesExpiryWindow: true,
     settingsNamespace: 'llm-qoder',
     channel: true,
   },
@@ -227,6 +327,22 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     logoClass: 'qodercn',
     credits: { balance: true, dailyCheckin: true },
     creditPackages: true,
+    // ⚠️ 与上面的国际版**同因同日**补登记（2026-10-20）：两站共用全部
+    //    `src/qoder*.ts` 实现（适配器 / 认证 / 积分），余额响应形状逐字段同形，
+    //    差异只在 `src/qoder-product.ts` 的 `QODER_CN` 常量（域名 / client_id /
+    //    模型表）。⇒ 分档与永久锁的理由、以及「逐包到期拿不到」那条限制，
+    //    与国际版**逐字相同**（见上一条的长注释，不重复）。
+    //    ⚠️ 唯一需要单独记一笔的差异：**本次真机取证用的正是中国版账号**
+    //    （`openapi.qoder.com.cn`），而国际版 `openapi.qoder.sh` 在本机
+    //    **网络不可达**（`fetch failed` ~10.7s）⇒ 国际版的实际响应形状
+    //    **未在本次实测覆盖**。实现必须对「取不到」保守：
+    //    `fetchQoderCreditBalance` 网络失败/非 2xx/形状非法一律返回 `null`
+    //    ⇒ 聚合折算得 `UNUSABLE`（剔除该候选），**绝不**退化成「有余额」。
+    //    ⚠️ 两家必须各占一项：`WIRED_EXPIRY_PROVIDERS` 是按 **provider id**
+    //    的清单，漏掉 `qodercn` 会让中国版在聚合候选层被静默剔掉
+    //    （与 minimax / minimaxintl 同因）。
+    permanentLock: true,
+    usesExpiryWindow: true,
     settingsNamespace: 'llm-qodercn',
     channel: true,
   },
@@ -290,6 +406,42 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     displayName: 'MiniMax Code (中国版)',
     logoClass: 'minimax',
     credits: { balance: true, dailyCheckin: true },
+    /**
+     * ⚠️ **2026-10-20 补登记**（用户报障：「MiniMax Code 积分也有到期时间，
+     * 也应当有相同功能」，并附 AStudio 面板截图作参照）。
+     *
+     * 这两项此前**空缺导致两个静默故障**：
+     * - 缺 `usesExpiryWindow` ⇒ `jet-hub-rpc.ts` 的 `usesWindow` 为 false ⇒
+     *   响应里没有 `windowDays` ⇒ 客户端 `splitCreditsByExpiry` 收 `null` ⇒
+     *   面板上「永久 X · 长期 Y · 临期 Z」那整行**不渲染**。
+     * - 缺 `permanentLock` ⇒ 客户端 `supportsPermanentLock()` 为 false ⇒
+     *   「锁定永久积分」按钮**整个不渲染**（不是灰掉，是不存在）。
+     *
+     * ⚠️ 补登记的前提是**上游确实下发到期时间**：`/minimax-cloud/api/v1/credit/details`
+     * 的每条 `details[]` 都带 `expire_at_ms`（毫秒时间戳，无需换算）。
+     * 此前 `fetchMinimaxCreditBalance` 把 `packages` 硬编码成 `[]`，聚合侧据此
+     * 把本家归为「查不到到期时间」—— **那是「我们没解析」，不是「上游不下发」**。
+     * 该函数已于同日补齐解析。
+     *
+     * ⚠️ 三处必须同改（本文件 + `provider-expiry.ts` + `aggregate-expiry.ts` 的
+     * `WIRED_EXPIRY_PROVIDERS`），由 `expiry-runtime-parity.spec.ts` 真跑
+     * `apply()` 锁一致。
+     */
+    usesExpiryWindow: true,
+    permanentLock: true,
+    /**
+     * ⚠️ **必须与 `usesExpiryWindow` 同时登记**（2026-10-20 合并审计发现）。
+     *
+     * `provider-registry.spec.ts` 有一条从**能力事实派生**的守卫：
+     * 「`usesExpiryWindow` 的家必须有 `creditPackages`（同一份数据）」——
+     * 两者读的是同一批 `packages[]`，只开前者会让账号卡片**不展示逐包列表**，
+     * 用户看得到「永久 / 长期 / 临期」三档合计，却看不到是**哪几笔**构成的。
+     *
+     * ⚠️ 本次补上是有实据的：`minimax-credits.ts` 已把 `packages[]` 从硬编码
+     * `[]` 改为**逐条 `details[]` 各成一包**（带 `deductionEndTime`），
+     * 卡片上「2/2 个资源包有效」这句因此有了真实内容。
+     */
+    creditPackages: true,
     settingsNamespace: 'llm-minimax',
     channel: true,
   },
@@ -318,6 +470,20 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     displayName: 'MiniMax Code (国际版)',
     logoClass: 'minimaxintl',
     credits: { balance: true, dailyCheckin: true },
+    // ⚠️ 与中国版**同因同日**补登记（2026-10-20）：两站共用同一个
+    //    `fetchMinimaxCreditBalanceDetailed`，后端解析补齐后两边都该亮分档与锁定。
+    //    ⚠️ 国际站另有**地理分流**风险：`agent.minimax.io` 会 307 到中国站，
+    //    而中国站不认国际站 token ⇒ 余额查询恒失败。故折算原语 `minimaxExpiry`
+    //    必须透传 `xff`（见 `aggregate-expiry.ts` 该函数的注释与
+    //    `src/index.ts` 的 `minimaxXff: () => pool.minimaxXff()`）——
+    //    漏传的后果正是「面板能刷新、聚合候选却恒折算失败」。
+    usesExpiryWindow: true,
+    permanentLock: true,
+    // ⚠️ 同国内站：`usesExpiryWindow` 必须与 `creditPackages` 同时登记
+    //    （`provider-registry.spec.ts` 有从能力事实派生的守卫，只开前者会让
+    //    账号卡片不展示逐包列表）。两站共用同一个 `MinimaxAdapter` 与同一份
+    //    `fetchMinimaxCreditBalance`，`packages[]` 已由逐条 `details[]` 产出。
+    creditPackages: true,
     settingsNamespace: 'llm-minimaxintl',
     channel: true,
   },
@@ -472,6 +638,31 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    到期时间（`member` / `buy` / `activity` / `spark` 各自的 `*NextExpireTime`）
     //    ⇒ 数据本来就齐，此前只是没声明。
     creditPackages: true,
+    // ⚠️ **2026-10-20 补登记：三档分档（永久/长期/临期）此前完全没生效**。
+    //
+    // `/points/balance` 实测**确实下发**到期时间：`activityNextExpireTime`
+    // = `"2026-11-20T01:50:14"`（会员/购买两池同形，字段名 `*NextExpireTime`）。
+    // 但漏登记本字段会让 `jet-hub-rpc.ts` 不回传 `windowDays`
+    // （判据 `descriptorOf(req.provider)?.usesExpiryWindow === true`），
+    // 客户端 `splitCreditsByExpiry` 拿到 `windowDays === undefined` ⇒
+    // `normalizeWindowDays2` 返回 `null` ⇒ **整个分档返回 `null`**
+    // ⇒ 胶囊只剩「合计」，永久绿/长期黄/临期红三行一个都不渲染。
+    // ⚠️ 漏登记的症状是**静默的**（无报错、无日志），与 officeace / autoclaw
+    //    当初同一根因；新增带到期时间的渠道时必须一并登记本字段。
+    usesExpiryWindow: true,
+    // ⚠️ **2026-10-20 补登记：永久积分锁定**。
+    //
+    // 判据同 buddy 系（`permanentLock` ⇒ Jet Hub 账号卡片出现「锁定永久积分」开关，
+    // 锁后 `credential-resolver.ts` 的 `allowPermanent` 变 false ⇒ 只有「窗口内到期」
+    // 的积分包可消耗，长期/永久积分被保住）。astudio 的三个池**各自带到期时间**
+    // ⇒ 与 buddy 系同形，该语义可如实成立（不是假开关）。
+    // ⚠️ 与 `usesExpiryWindow` / `WIRED_EXPIRY_PROVIDERS` / `createProviderExpiry()`
+    //    的 `astudioExpiry` 是**四件不同的事**，不能互相替代：
+    //    · `usesExpiryWindow` ⇒ 面板三行分档
+    //    · `permanentLock`     ⇒ 锁定开关 + 选号时的 `allowPermanent`
+    //    · `WIRED_EXPIRY_PROVIDERS` ⇒ 聚合候选可见性
+    //    · `astudioExpiry`     ⇒ 聚合时如何折算到期时刻
+    permanentLock: true,
     settingsNamespace: 'llm-astudio',
     channel: true,
   },
@@ -510,6 +701,50 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    流水批次的包名取服务端描述（实测「每日签到」**不等于**「每日积分」）
     //    ⇒ 两条路径都不再命中那份名单，「每日 0」红字消失。
     usesExpiryWindow: true,
+    /**
+     * ⚠️ **2026-10-21 补齐**（用户明确要求「补锁定开关」）。
+     *
+     * ## 为什么本家需要它
+     *
+     * `autoclaw-credits.ts` 的批次映射里有一条**代码分支**：`wallet_expires_at`
+     * 缺失 / `<= 0` 的发放 ⇒ 进 `permanentByLabel` ⇒ **不带 `deductionEndTime`**
+     * （= 永久桶）。⇒ 只要上游下发那种条目，就有永不作废的积分需要保护。
+     * 补登记前：`supportsPermanentLock()` 为 false ⇒ 按钮**不渲染**、
+     * `credits.permanentLock` RPC 直接 `bad-request` ⇒ 用户无从保护。
+     *
+     * ⚠️⚠️ **前提强度如实标注（2026-10-21 二轮审计）**：该分支**结构上可达、
+     * 但零实测**。仓库内唯一一次流水字段完整性实测（`5fbe7ab`）结论是
+     * 「**28/28 全带 `wallet_expires_at`**」，方向上**否定**该形态存在。
+     * ⇒ 若上游恒带到期字段，本家的永久桶**恒为空**，这个开关**永不产生实际效果**
+     *（但也不会出错 —— 它只是把已存在的分档能力接上，与仓库 11 家同构）。
+     * **不得**据此声称「本家确实有永久桶」。
+     *
+     * ## ⚠️⚠️ 与 buddy 系的取舍**不同源**，别照抄那两行
+     *
+     * | | buddy 系 | AutoClaw |
+     * |---|---|---|
+     * | `rateLimit` | 省缺（true） | **false**（不写 `modelRateLimits`、不在 `probeById`） |
+     * | 请求级换号 | 有 | **刻意没有** |
+     * | 账户「每日红」语义 | 有 | **不适用**（每日签到积分是发放进余额、按批次到期） |
+     *
+     * ⇒ 本家的锁定只作用于「**按余额分档选号**」这一层，不涉及换号冷却
+     *   （它本来就没有）。这正是 `balance: { kind: 'buddy' }` 能直接套用的原因：
+     *   分档判据（`splitBuddyCreditsByExpiry`）只读通用的
+     *   `packages[].{active, remaining, deductionEndTime}`，**与 provider 无关**。
+     *
+     * ## 四处同改（缺一即静默失效或假开关）
+     *
+     * 1. **本行**（`permanentLock`）——决定按钮是否渲染、RPC 是否放行；
+     * 2. `src/index.ts` 的 `balance: { kind: 'buddy', selector, lockedError }` 接线
+     *    ——**缺它按钮在、点了不拦**（假开关，比没有按钮更糟：`credential-resolver`
+     *    的 `allowPermanent` 读不到，锁定对选号完全无影响）；
+     * 3. `autoclawLockedError` 文案（本家池名与 buddy 的「服务端资源包」不同）；
+     * 4. `tests/unit/autoclaw-lock-wiring.spec.ts` 的三层守卫。
+     *
+     * ⚠️ `autoclawintl` **同因同状态**（两站共用全部实现，只差 product 常量），
+     *    两处必须同时登记 —— 漏国际站的症状是「只登国际站的用户没有锁定按钮」。
+     */
+    permanentLock: true,
     rateLimit: false,
     settingsNamespace: 'llm-autoclaw',
     channel: true,
@@ -559,6 +794,12 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     creditPackages: true,
     // 分档 / 临期逻辑与国内同源（同一份 `autoclaw-credits.ts`）。
     usesExpiryWindow: true,
+    // ⚠️ **与国内站同因同日补齐**（2026-10-21，用户要求「补锁定开关」）。
+    //    两站共用全部实现，只差 product 常量 ⇒ 有没有永久桶、要不要锁**逐字相同**
+    //    （见国内站那一段的长注释，不重复）。
+    //    ⚠️ **两站必须各占一项**：`PERMANENT_LOCK_PROVIDERS` 按 provider id，
+    //    漏 `autoclawintl` 会让**只登国际站**的用户没有锁定按钮（与 minimaxintl 同因）。
+    permanentLock: true,
     rateLimit: false,
     settingsNamespace: 'llm-autoclawintl',
     channel: true,

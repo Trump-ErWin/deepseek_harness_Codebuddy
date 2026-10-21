@@ -111,6 +111,52 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
   })
 
   /**
+   * ## ★ `expiringRemaining`：无日期的包也要拆出临期部分
+   *
+   * 用户 2026-10-20 报障（逐字）：`2000+500临期不应该是2500嘛`。
+   *
+   * CodeArts 赠送包没有逐笔到期时刻，上游只给「其中 N 即将到期」的标量
+   * ⇒ 解析到 `pkg.expiringRemaining`。若不拆，整包进永久桶，卡片上
+   * 「永久 25000」与「临期 500」并存，用户算不平（应为 永久 23000 + 临期 2500）。
+   */
+  describe('expiringRemaining（无到期日期但上游标了「即将到期」）', () => {
+    it('★ 拆成 临期 expiringRemaining + 永久 余下部分', () => {
+      expect(splitCreditsByExpiry([
+        pkg({ remaining: 25000, total: 25000, deductionEndTime: undefined, expiringRemaining: 2000 }),
+      ], WINDOW_DAYS, NOW)).toEqual({
+        expiring: 2000, longTerm: 0, permanent: 23000, earliestExpiringAt: null, earliestExpiringAmount: 0,
+      })
+    })
+
+    it('★ 拆出的临期部分**不**参与倒计时（没有日期，绝不编造）', () => {
+      const split = splitCreditsByExpiry([
+        pkg({ remaining: 25000, deductionEndTime: undefined, expiringRemaining: 2000 }),
+        pkg({ remaining: 500, deductionEndTime: NOW + 7 * DAY }),
+      ], WINDOW_DAYS, NOW)
+      // 只有带真实日期的那个包能进 earliestExpiringAt。
+      expect(split?.earliestExpiringAt).toBe(NOW + 7 * DAY)
+      expect(split?.expiring).toBe(2500)
+      expect(split?.permanent).toBe(23000)
+    })
+
+    it('expiringRemaining 超过 remaining 时夹到 remaining', () => {
+      expect(splitCreditsByExpiry([
+        pkg({ remaining: 100, deductionEndTime: undefined, expiringRemaining: 999 }),
+      ], WINDOW_DAYS, NOW)).toEqual({
+        expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0,
+      })
+    })
+
+    it('有真实到期日期的包**不读** expiringRemaining（日期更权威）', () => {
+      expect(splitCreditsByExpiry([
+        pkg({ remaining: 100, deductionEndTime: NOW + 60 * DAY, expiringRemaining: 50 }),
+      ], WINDOW_DAYS, NOW)).toEqual({
+        expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0,
+      })
+    })
+  })
+
+  /**
    * ⚠️ 临期桶要带回**最早**的作废时刻 —— 它是倒计时的数据源（用户 2026-10-12 要求
    * 「临期 100（倒计时）」）。多个临期包时取最早的那个：那才是用户真正会先失去的额度。
    */
@@ -290,6 +336,26 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
     ]],
     ['空列表', []],
     ['窗口放宽到 31 天', [pkg({ remaining: 100, deductionEndTime: NOW + 17 * DAY })], 31],
+    /**
+     * ★ `expiringRemaining` 场景（CodeArts 赠送包，2026-10-20）。
+     *
+     * 这是**最需要前后端对账**的一组：前端拆错的后果是数字对不上，
+     * 后端拆错的后果更严重 —— 锁定永久积分时该账号被判 `none` 不可用，
+     * 尽管它其实还有临期积分可用，直接报「积分已用尽」。
+     */
+    ['expiringRemaining 拆包（临期 + 永久）', [
+      pkg({ name: '赠送积分包', remaining: 25000, total: 25000, deductionEndTime: undefined, expiringRemaining: 2000 }),
+    ]],
+    ['expiringRemaining 与真实日期包共存', [
+      pkg({ name: '基础积分包', remaining: 500, deductionEndTime: NOW + 7 * DAY }),
+      pkg({ name: '赠送积分包', remaining: 25000, deductionEndTime: undefined, expiringRemaining: 2000 }),
+    ]],
+    ['expiringRemaining 超过 remain（夹取）', [
+      pkg({ remaining: 100, deductionEndTime: undefined, expiringRemaining: 999 }),
+    ]],
+    ['expiringRemaining 为 0（等同未标）', [
+      pkg({ remaining: 6000, deductionEndTime: undefined, expiringRemaining: 0 }),
+    ]],
   ]
 
   for (const [label, packages, windowDays] of fixtures) {
@@ -895,7 +961,12 @@ describe('supportsCreditPackageList 的门控', () => {
   })
 
   it('其余 provider 与未知值一律为假（默认关闭）', () => {
-    for (const p of ['codearts', 'cline', 'raccoon', '', undefined]) {
+    // ⚠️ **codearts 已移出本名单**（2026-10-20 合并审计）：PR !123 让它的
+    //    `packages[]` 真正有内容（`expiringRemaining` 拆包 + 基础包
+    //    `deductionEndTime`），并登记了 `creditPackages: true` ——
+    //    `provider-registry.spec.ts` 的「usesExpiryWindow 必须有 creditPackages」
+    //    守卫强制两者一致。它**不**开 `permanentLock`，与本用例无关。
+    for (const p of ['cline', 'raccoon', '', undefined]) {
       expect(supportsCreditPackageList(p as never), String(p)).toBe(false)
     }
   })
