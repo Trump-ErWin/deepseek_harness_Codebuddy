@@ -2186,6 +2186,15 @@ export function apply(ctx: Context): void {
           selector: qoderBalanceSelector,
           lockedError: qoderLockedError('Qoder'),
           reportPickedAccount: true,
+          // ⚠️ 免费模型**必须**跳过「锁定 + 临期积分」这道门（与 buddy / trae
+          //    同因，见 `credential-resolver.ts:359-365` 的长注释）：
+          //    锁定保护的是永久积分，而免费模型既不扣临时也不扣永久积分 ——
+          //    不传这个钩子，免费模型会和付费模型走同一条余额分档路，锁定期间
+          //    被 `allowPermanent=false` 一并拦下，报出「额度都属于永久」这种
+          //    与事实相反的错误（真实报障 2026-10-21）。
+          // ⚠️ 判据在适配器里（读远端目录的 `is_free`，远端/兜底同源），
+          //    本处只透传 —— 不要在这里另写一份。
+          isFreeModel: (modelId) => qoderAdapter.isFreeModel(modelId),
         },
         fallback: { kind: 'ref', refName: QODER.defaultCredentialRef },
         // 区分「全部限流」与「没登录」（见该助手的说明）—— 否则用户会去
@@ -2268,6 +2277,8 @@ export function apply(ctx: Context): void {
           selector: qoderCnBalanceSelector,
           lockedError: qoderLockedError('Qoder (中国版)'),
           reportPickedAccount: true,
+          // 同国际版：免费模型不受「锁定永久积分」约束（判据在适配器里）。
+          isFreeModel: (modelId) => qoderCnAdapter.isFreeModel(modelId),
         },
         fallback: { kind: 'ref', refName: QODER_CN.defaultCredentialRef },
         // 同国际版：区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
