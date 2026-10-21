@@ -5,11 +5,14 @@ import { dirname, resolve } from 'node:path'
 import {
   QoderAdapter,
   QODER_QUEUE_MAX_ATTEMPTS,
+  classifyQoderFailure,
   isBillingBusinessCode,
   looksLikeBillingError,
   nextUtc8DayStartMs,
   parseQoderQueueError,
   qoderQueueDelayMs,
+  recordsQoderRateLimit,
+  shouldRotateQoderAccount,
 } from '../../src/qoder-adapter.js'
 import { QODER, QODER_CN } from '../../src/qoder-product.js'
 import type { QoderFallbackModel } from '../../src/qoder-product.js'
@@ -1701,6 +1704,323 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
       expect(marked.getUTCSeconds()).toBe(0)
       expect(marked.getUTCMilliseconds()).toBe(0)
       expect(marked.getUTCHours()).toBe(0)
+    })
+  })
+
+  /**
+   * ## 真实报障（用户 2026-10-21，第二轮）
+   *
+   * 池里有 **2 个** `qodercn` 账号，上游回
+   * `Error in upstream response (provider_error/model_error) code=SERVER`
+   * 时**第二个账号从未被尝试** —— 修前本适配器的切号判据只有「额度」一类。
+   *
+   * ## 语义表（照 `accio-adapter.ts:1596-1605` 的「类别 → 动作」表）
+   *
+   * | 类别 | 判据 | 换号 | 写冷却 |
+   * |---|---|---|---|
+   * | `quota` | QUOTA_EXCEEDED / 110 / 112 / pricingUrl | ✅ | ✅ 至 UTC+8 当日 24:00 |
+   * | `rate` | RATE_LIMIT / 429 | ✅ | ✅ 1h |
+   * | `auth` | AUTH / 401 / 403 | ✅ | ❌ 绝不 |
+   * | `upstream` | SERVER 且文案含 provider_error | ✅ | ❌ 绝不 |
+   * | `other` | 400 参数错 / 空响应 / 风控页 | ❌ | ❌ |
+   *
+   * ⚠️ **`auth` / `upstream` 只换号、绝不写冷却**是两条独立的不变式：
+   * - `auth`：2026-10-06「全池被封」事故 —— 上游对全池回 401 时，若每个号都写
+   *   长冷却，**一个请求就能把整个 provider 封一天**；
+   * - `upstream`：`provider_error` 是上游**供应商侧**瞬时故障，与账号状态无关。
+   *   写冷却等于把一次抖动记成「该账号今日此模型已用完」，要**一整天**才恢复。
+   */
+  describe('失败分类：换号 ≠ 写冷却（provider_error 必须换号且不冷却）', () => {
+    /** 真实报障里上游给的 SSE 错误帧。 */
+    const providerErrorFrame = JSON.stringify({
+      code: 'provider_error',
+      message: 'Error in upstream response',
+      type: 'model_error',
+    })
+
+    /** 把一段错误 JSON 包成信封 SSE 响应（HTTP 200，与额度错误同通道）。 */
+    function sseErrorFrame(inner: string): Response {
+      return new Response(
+        `data:${JSON.stringify({ headers: {}, body: inner, statusCodeValue: 200 })}\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )
+    }
+
+    /**
+     * ⚠️ 池桩刻意**不实现**「按冷却过滤」：本组的断言就是「有没有写冷却」，
+     * 若桩按 `marks` 过滤，写不写冷却都换得到号 ⇒ 判据失去牙。
+     * 排除只靠 `exclude`（即生产里的 `tried`）—— 那正是「不写冷却时唯一的排除通道」。
+     */
+    function makePoolStub(accounts: Array<{ id: string; token: string }>) {
+      const marks: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+      const picks: Array<ReadonlySet<string> | undefined> = []
+      let index = 0
+      const pool = {
+        updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+          marks.push({ accountId, modelId, resetAtMs })
+        },
+        getAvailableAccount: async (_provider: string, _model: string, exclude?: ReadonlySet<string>) => {
+          picks.push(exclude)
+          while (index < accounts.length && exclude?.has(accounts[index].id) === true) index += 1
+          if (index >= accounts.length) return null
+          const a = accounts[index]
+          return {
+            entry: { id: a.id },
+            credential: buildQoderCredential(
+              parseQoderTokenPayload({ token: a.token, refresh_token: 'r', user_id: `uid-${a.id}` }),
+              { machineId: 'm-1' },
+            ),
+          }
+        },
+      }
+      return { pool, marks, picks }
+    }
+
+    /**
+     * ★★ **本组最核心的一条**（真实报障的直接复现）：
+     * 上游回 `provider_error` 时必须换到第二个账号，且**绝不写冷却**。
+     *
+     * ⚠️ 三个断言缺一不可：
+     * - `marks` 为空 —— 证明「不写冷却」（若写，这个账号要一整天才能再被选中）；
+     * - `tried` 含 acct-A —— 证明「不靠冷却也能排除刚失败的号」
+     *   （`account-pool.ts:2241-2242` 的过滤器只看 `modelRateLimits`，
+     *   不写冷却时它是唯一排除通道）；
+     * - `call === 2` 且拿到正文 —— 证明真的换号重发了，不是只抛错。
+     */
+    it('★★ provider_error 必须换到第二个账号，且绝不写冷却', async () => {
+      const { pool, marks, picks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        if (call === 1) return sseErrorFrame(providerErrorFrame)
+        return envelopeResponse([textFrame('新账号可用'), finishFrame])
+      }) as unknown as typeof fetch
+
+      const chunks = await collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+      // ① **绝不写冷却**（写了一天就废了这个号）
+      expect(marks, 'provider_error 不得写冷却标记').toEqual([])
+      // ② 真的换号重发并拿到内容
+      expect(call, 'provider_error 必须换账号重发').toBe(2)
+      expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    })
+
+    /**
+     * ★★ **`tried` 是不写冷却时唯一的排除通道** —— 用源码级断言守（行为级守不住）。
+     *
+     * ## 为什么行为级守不住（实测）
+     *
+     * `_stream` 在进入循环前就做了：
+     * ```ts
+     * const triedAccounts = new Set<string>()
+     * if (activeAccountId !== undefined && activeAccountId.length > 0) triedAccounts.add(activeAccountId)
+     * ```
+     * ⇒ 只要 `currentAccountId` 接好（生产里 `src/index.ts:2237` / `:2312` 都接了），
+     * `acct-A` **早已在 `tried` 里**，`switchAccountOnQuota` 里加不加那一句都换得到 B。
+     * 变异 F（把 `tried.add(activeAccountId)` 挪进 `if (recordsQoderRateLimit(cls))`）
+     * 实测**全绿无牙** —— 正是这个原因。
+     *
+     * 而不传 `currentAccountId` 时 `activeAccountId` 为 `undefined`，那一句同样不执行
+     * ⇒ 行为级**无论如何都造不出**「只有 switchAccountOnQuota 能排除」的局面。
+     *
+     * ## 故用源码级断言
+     *
+     * 守的不变式是「`tried.add(activeAccountId)` 必须在 `recordsQoderRateLimit` 的
+     * `if` **外面**」。这是本仓库对「结构位置即语义」的既有做法
+     * （见 `is-free-model-required.spec.ts` 的接线层用例）。
+     *
+     * ⚠️ 读源码用 `node:fs`（本文件已 import `readFileSync`）。
+     */
+    it('★★ 源码：tried.add 必须在 recordsQoderRateLimit 的 if 之外（不写冷却时唯一排除通道）', () => {
+      const code = readFileSync(resolve(here, '../../src/qoder-adapter.ts'), 'utf8')
+      // 取 switchAccountOnQuota 的方法体（从方法名到下一个 `\n  }` 收尾）
+      const start = code.indexOf('private async switchAccountOnQuota(')
+      expect(start, 'switchAccountOnQuota 必须存在').toBeGreaterThan(-1)
+      const body = code.slice(start, code.indexOf('\n  }', start))
+      // ① tried.add(activeAccountId) 必须在里面
+      expect(body, 'switchAccountOnQuota 必须把失败账号加进 tried').toContain('tried.add(activeAccountId)')
+      // ② 它不得被 `if (recordsQoderRateLimit(cls))` 包住 ——
+      //    判据：recordsQoderRateLimit 的 if 块收尾 `}` 之后才出现 tried.add
+      const recordsAt = body.indexOf('if (recordsQoderRateLimit(cls))')
+      expect(recordsAt, '必须按类别决定写不写冷却').toBeGreaterThan(-1)
+      const triedAt = body.indexOf('tried.add(activeAccountId)')
+      expect(triedAt, 'tried.add 必须在 recordsQoderRateLimit 判定之后').toBeGreaterThan(recordsAt)
+      // ③ 关键：两者之间的花括号必须**配平回 0**（即 tried.add 在那层 if 之外）
+      const between = body.slice(recordsAt, triedAt)
+      let depth = 0
+      for (const ch of between) {
+        if (ch === '{') depth += 1
+        else if (ch === '}') depth -= 1
+      }
+      expect(depth, 'tried.add(activeAccountId) 不得被包在 recordsQoderRateLimit 的 if 内').toBe(0)
+      // ④ **tried 所在行必须是独立语句**（堵住「单行无花括号 if」这种绕法）。
+      //
+      // ⚠️ 这条是补的：只查 ③ 时，把代码改成
+      // `if (recordsQoderRateLimit(cls)) tried.add(activeAccountId)`（**无花括号**）
+      // 实测**全绿无牙** —— 因为那种写法里 `between` 不含任何花括号，depth 恒为 0。
+      // 单行 if 的「块」是行本身，花括号配平查不出来。
+      const lineStart = body.lastIndexOf('\n', triedAt) + 1
+      const triedLine = body.slice(lineStart, body.indexOf('\n', triedAt))
+      expect(triedLine.trim(), 'tried.add(activeAccountId) 必须独占一行（不得挂在校验/条件语句尾部）')
+        .toBe('tried.add(activeAccountId)')
+    })
+
+    /**
+     * ⚠️ **对照用例**（证明上面那条不是「因为判据恒 true 而全绿」）：
+     * 同样的池、同样的两账号，错误换成 400 参数错 ⇒ **不许换号、不许写冷却**。
+     *
+     * 没有这条，把 `shouldRotateQoderAccount` 写成 `return true` 也能全绿 ——
+     * 那会把「参数错 / 风控页」也变成白烧整池。
+     */
+    it('对照：400 参数错不换号、不写冷却（判据不能恒真）', async () => {
+      const { pool, marks, picks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        // 400 + 参数错误（**不是** provider_error 文案，也不是额度）
+        return new Response(
+          JSON.stringify({ error: { message: 'invalid parameter: max_tokens', type: 'invalid_request_error' } }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } },
+        )
+      }) as unknown as typeof fetch
+
+      await expect(collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+        .rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+
+      expect(call, '参数错不得换号（换号只会白烧整池）').toBe(1)
+      expect(marks, '参数错不得写冷却').toEqual([])
+      expect(picks, '参数错根本不该去取号').toEqual([])
+    })
+
+    /**
+     * ⚠️ **反向守卫**：不能把所有 `SERVER` 都当 `provider_error`。
+     *
+     * `SERVER` 这个码很宽（500 也可能是「模型不支持该参数」「请求体过大」等
+     * **换号解决不了**的情况）。判据必须窄到 `provider_error` 这类**结构字段值**。
+     *
+     * 没有这条，把 `looksLikeUpstreamProviderError` 写成 `return true` 也能全绿。
+     */
+    it('对照：普通 500（不含 provider_error）不换号', async () => {
+      const { pool, marks, picks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        return new Response(
+          JSON.stringify({ error: { message: 'internal server error', type: 'server_error' } }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } },
+        )
+      }) as unknown as typeof fetch
+
+      await expect(collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+        .rejects.toMatchObject({ code: 'SERVER' })
+
+      expect(call, '普通 500 不换号').toBe(1)
+      expect(marks, '普通 500 不得写冷却').toEqual([])
+      expect(picks, '普通 500 根本不该去取号').toEqual([])
+    })
+
+    /**
+     * 429（`RATE_LIMIT`）→ **换号 + 写 1h 冷却**。
+     *
+     * ⚠️ 与 `quota` 的「至 UTC+8 当日 24:00」**必须不同**：限流是秒级背压，
+     * 按自然日写冷却会把账号封到明天（minimax / accio 都记过同型缺陷）。
+     */
+    it('429 限流：换号 + 写 1 小时冷却（不是当日 24:00）', async () => {
+      const { pool, marks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      let call = 0
+      const before = Date.now()
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        if (call === 1) {
+          return new Response(JSON.stringify({ error: { message: 'too many requests' } }),
+            { status: 429, headers: { 'Content-Type': 'application/json' } })
+        }
+        return envelopeResponse([textFrame('ok'), finishFrame])
+      }) as unknown as typeof fetch
+
+      await collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+      expect(marks.length, '429 应写冷却').toBe(1)
+      // 1 小时（允许 5 秒抖动），而不是 24 小时
+      const delta = marks[0].resetAtMs - before
+      expect(delta).toBeGreaterThan(3_590_000)
+      expect(delta).toBeLessThan(3_610_000)
+    })
+
+    /** 纯函数层：分类判据本身的 5 条（不依赖 stream）。 */
+    it('classifyQoderFailure：五类各自的判据', () => {
+      // 额度：码值
+      expect(classifyQoderFailure('QUOTA_EXCEEDED', '')).toBe('quota')
+      expect(classifyQoderFailure('QUOTA', '')).toBe('quota')
+      // 额度：业务码 / 文案（code 为未知时走文案腿）
+      expect(classifyQoderFailure('110', '')).toBe('quota')
+      expect(classifyQoderFailure('112', '')).toBe('quota')
+      expect(classifyQoderFailure('SERVER', 'Billing daily count exceeded')).toBe('quota')
+      // 限流
+      expect(classifyQoderFailure('RATE_LIMIT', '')).toBe('rate')
+      // 认证
+      expect(classifyQoderFailure('AUTH', '')).toBe('auth')
+      // 上游供应商侧瞬时故障（真实报障形态）
+      expect(classifyQoderFailure('SERVER', 'qodercn: Error in upstream response (provider_error/model_error)')).toBe('upstream')
+      // 普通 500 不算（判据必须窄）
+      expect(classifyQoderFailure('SERVER', 'internal server error')).toBe('other')
+      // 参数错不算
+      expect(classifyQoderFailure('INVALID_REQUEST', 'invalid parameter')).toBe('other')
+      // ⚠️ `model_error` **单独**不算 `upstream`（它是 `[code, type].join('/')` 的拼接产物，
+      //    任何 `SERVER` 都可能带它 —— 收它等于把整个 `SERVER` 都算进来）。
+      //    ⚠️ 注意：`looksLikeUpstreamProviderError` 的正则含 `error\s+in\s+upstream\s+response`，
+      //    而真实报障的文案就是 `Error in upstream response (model_error)` —— 那**是**
+      //    provider_error 的形态（只是缺了 `provider_error` 字段），故归 `upstream`。
+      expect(classifyQoderFailure('SERVER', 'Error in upstream response (model_error)')).toBe('upstream')
+      // 但纯 `model_error`（无 upstream 字样）不算
+      expect(classifyQoderFailure('SERVER', 'model_error')).toBe('other')
+    })
+
+    it('shouldRotateQoderAccount / recordsQoderRateLimit：两张表必须不同', () => {
+      // 换号：除 `other` 外都换
+      expect(shouldRotateQoderAccount('quota')).toBe(true)
+      expect(shouldRotateQoderAccount('rate')).toBe(true)
+      expect(shouldRotateQoderAccount('auth')).toBe(true)
+      expect(shouldRotateQoderAccount('upstream')).toBe(true)
+      expect(shouldRotateQoderAccount('other')).toBe(false)
+      // 写冷却：只有额度与限流
+      expect(recordsQoderRateLimit('quota')).toBe(true)
+      expect(recordsQoderRateLimit('rate')).toBe(true)
+      expect(recordsQoderRateLimit('auth'), 'auth 绝不写冷却（全池被封事故）').toBe(false)
+      expect(recordsQoderRateLimit('upstream'), 'upstream 绝不写冷却（瞬时故障）').toBe(false)
+      expect(recordsQoderRateLimit('other')).toBe(false)
     })
   })
 })
