@@ -218,7 +218,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 
 要点：
 
-- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13011111100`，
+- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13999991100`，
   `profile-summary` 返回的就是完整号码）与已脱敏的露 4 位形态，输出都是
   `130******00`。幂等意味着老账号无需重新登录、重复运行不产生新写入
 - ⚠️ **判据只认「像手机号」的形态**：`/^1\d{10}$/`（完整）或
@@ -237,7 +237,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 排查 / 验证：
 
 - `scripts/probe-lobsterai-profile.mjs` —— 打印 `profile-summary` 的完整响应
-  （**发现 `nickname` 在这里是完整号码 `13011111100`**，与登录响应的脱敏形态不同）
+  （**发现 `nickname` 在这里是完整号码 `13999991100`**，与登录响应的脱敏形态不同）
 - `scripts/verify-lobsterai-nickname.mjs` —— 用真实账号跑一遍
   `repairAccountNicknames` 并打印修复前后昵称（⚠️ **会写真实账号池昵称**）
 - `tests/unit/lobsterai.spec.ts` 的「手机号掩码（只露末 2 位）」段（8 条，
@@ -1557,7 +1557,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 
 要点：
 
-- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13011111100`，
+- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13999991100`，
   `profile-summary` 返回的就是完整号码）与已脱敏的露 4 位形态，输出都是
   `130******00`。幂等意味着老账号无需重新登录、重复运行不产生新写入
 - ⚠️ **判据只认「像手机号」的形态**：`/^1\d{10}$/`（完整）或
@@ -1576,7 +1576,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 排查 / 验证：
 
 - `scripts/probe-lobsterai-profile.mjs` —— 打印 `profile-summary` 的完整响应
-  （**发现 `nickname` 在这里是完整号码 `13011111100`**，与登录响应的脱敏形态不同）
+  （**发现 `nickname` 在这里是完整号码 `13999991100`**，与登录响应的脱敏形态不同）
 - `scripts/verify-lobsterai-nickname.mjs` —— 用真实账号跑一遍
   `repairAccountNicknames` 并打印修复前后昵称（⚠️ **会写真实账号池昵称**）
 - `tests/unit/lobsterai.spec.ts` 的「手机号掩码（只露末 2 位）」段（8 条，
