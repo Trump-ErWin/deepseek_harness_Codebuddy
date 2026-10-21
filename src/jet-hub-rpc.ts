@@ -157,7 +157,7 @@ import {
   withQoderNickname,
 } from './qoder.js'
 import type { QoderCredential } from './qoder.js'
-import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits.js'
+import { claimQoderDailyCheckin, fetchQoderBalanceDetailed } from './qoder-credits.js'
 import { isTraeRefreshable, traeCredentialExpiresAtMs, traeDisplayNickname } from './trae.js'
 import type { TraeCredential } from './trae.js'
 import { fetchClineUsageLimits } from './cline-quota.js'
@@ -5942,34 +5942,56 @@ function registerJetHubEndpoints(
           // `fetchQoderCreditBalance` 只吃 QoderCredential，故这里不用
           // collectCreditBalances 的泛型（它会把产品配置转发给 fetchBalance）。
           const values: RpcCreditsBalancesResponse['accounts'] = []
-          for (const account of accounts) {
+          /**
+           * ⚠️⚠️ **必须并发**（2026-10-21 改，真实报障「一直读取中」）。
+           *
+           * 原实现是 `for (const account of accounts) { await ... }` —— **串行**。
+           * 单账号在墙外时实测 10.7s 才失败（undici 自己的 connect timeout
+           * 先于 `AbortSignal.timeout(15s)` 触发），两个账号就是 **22s**；
+           * 前端 `callManagementRpc` **不设超时** ⇒ 整段时间面板只显示
+           * 「读取中…」，用户以为卡死。
+           *
+           * ⚠️ 并发不改变**输出顺序**：`Promise.all` 保序，每个槽位自己算，
+           *    不是按完成顺序 push。
+           * ⚠️ 也不改变**失败隔离**：每格自己返回 `{ balance: null, error }`，
+           *    一个账号炸不影响别人（`fetchQoderBalanceDetailed` 本身不抛）。
+           */
+          values.push(...await Promise.all(accounts.map(async (account) => {
             const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
             if (!resolved) {
-              values.push({
+              return {
                 accountId: account.id, nickname: account.nickname,
                 balance: null, error: '凭据未配置',
-              })
-              continue
+              }
             }
             let credential: QoderCredential
             try {
               credential = JSON.parse(resolved.value) as QoderCredential
             } catch {
-              values.push({
+              return {
                 accountId: account.id, nickname: account.nickname,
                 balance: null, error: '凭据解析失败',
-              })
-              continue
+              }
             }
-            const balance = await fetchQoderCreditBalance(credential, product)
-            values.push({
+            // ⚠️ 用**带原因**的变体 `fetchQoderBalanceDetailed`，不用
+            // `fetchQoderCreditBalance`：后者只回 `null`，四种完全不同的处境
+            // （网络不通 / 401 / 响应变形 / 企业版无数字）被压成同一句
+            // 「积分查询失败（凭据失效或响应异常）」，用户无从下手。
+            // 实测本机 Qoder 国际版：`openapi.qoder.sh` 的 TCP 443 通（93ms）
+            // 但 TLS ClientHello 被丢（12s 无响应）⇒ fetch 必在 10.7s 后报
+            // `UND_ERR_CONNECT_TIMEOUT`。这是**环境问题**，必须点名主机与出路，
+            // 否则用户只会以为「凭据坏了」，反复重新登录。
+            const detailed = await fetchQoderBalanceDetailed(credential, product)
+            return {
               accountId: account.id,
               nickname: account.nickname,
-              balance,
+              balance: detailed.balance,
               // 查不到时带上原因，卡片显示原因而非 0（与其它 provider 同约定）。
-              ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
-            })
-          }
+              ...detailed.balance === null
+                ? { error: detailed.error ?? '积分查询失败（原因未知）' }
+                : {},
+            }
+          })))
           /**
            * ⚠️⚠️ **必须回传 `windowDays`**（2026-10-20 补，真实缺口）。
            *
