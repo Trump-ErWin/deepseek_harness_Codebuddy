@@ -6668,9 +6668,19 @@ function registerJetHubEndpoints(
             error: { code: 'bad-request', message: 'provider 与 disabled（布尔）必填' },
           }
         }
-        if (req.disabled) {
+        /**
+         * 全量目录（关闭方向用它写黑名单；两个方向都用它算 `warnings`）。
+         *
+         * ⚠️ 打开方向**不读目录**（见该分支的注释：目录故障时用户仍应能全打开）⇒
+         * `catalog` 在打开方向可能是 `undefined`，`warnings` 随之为空 —— 这是
+         * **正确**的（打开方向的 warnings 只在「这个 id 已从上游消失」时才有意义，
+         * 而那恰恰需要目录才能判定）。
+         */
+        const catalog = req.disabled
+          ? await fullCatalogIds(ctx, modelAdapters, req.provider)
+          : undefined
+        if (req.disabled && catalog !== undefined) {
           // 关闭全部：先取全量目录，再一次性写入黑名单。
-          const catalog = await fullCatalogIds(ctx, modelAdapters, req.provider)
           // ⚠️⚠️ **判据顺序是语义的一部分**，四条分支按「能否在目录不完整时
           // 安全作答」从强到弱排列（下面逐条给理由，别重排）：
           //
@@ -6747,8 +6757,22 @@ function registerJetHubEndpoints(
             //
             // ⚠️ 与关闭方向同理，**黑名单与意图必须同一次落盘**
             //   （见 `writeModelsWithProviderClosed` 的注释：分两次会留下半套状态）。
-            await pool.writeModelsWithProviderClosed(req.provider, pending, true)
-            ctx.logger.info(`[jet-hub] 关闭 ${req.provider} 的 ${pending.length} 个模型`)
+            //
+            // ⚠️⚠️ **但「是否落意图」由 `closeProvider` 决定**（2026-10-21 合并审计
+            //   发现，阻断级）：默认 `true` 保持既有语义（「关闭全部模型」≡
+            //   「关闭该供应商」），而**模型级**的批量关闭（PR !120 的「模型列表」
+            //   统一管理屏）传 `false` ⇒ 只改黑名单、不落意图。
+            //
+            //   ⇒ 否则用户在模型列表屏点一次「全关」（只想关这家模型）会把**整个
+            //   供应商**也关掉（`provider.status` 报 closed、选择器里一个模型都没有）
+            //   ；再打开**任意一个**模型，供应商又被顺带打开（`setModelDisabled` 的
+            //   打开方向会清意图）⇒ 两头都与用户意图相反，且**零提示**。
+            const closeProvider = req.closeProvider !== false
+            await pool.writeModelsWithProviderClosed(req.provider, pending, closeProvider)
+            ctx.logger.info(
+              `[jet-hub] 关闭 ${req.provider} 的 ${pending.length} 个模型`
+              + (closeProvider ? '' : '（不落供应商关闭意图）'),
+            )
           }
         } else {
           // 打开全部：纯本地操作，不读目录 —— 目录故障时用户仍应能把开关全打开。
@@ -6766,6 +6790,25 @@ function registerJetHubEndpoints(
         // ⚠️ 命中「本就已全部关闭」的幂等短路时也照样失效一次 —— 那是用户点了一个
         // 开关、期望看到最新的代价（一次上游目录读取），比「界面纹丝不动」划算。
         invalidateCatalogCache(req.provider)
+        /**
+         * ⚠️⚠️ **本端点的 `warnings` 恒为空，这是正确的**（2026-10-21 合并审计定论）。
+         *
+         * ⚠️ 合并审计最初建议「批量路径也调 `catalogWarnings`」—— **实测证明那是死代码**：
+         * `catalogWarnings` 的判据是「`ids` 里不在 `known` 的」，而本端点传的 `ids`
+         * 本就是 `catalog.ids`，而 `readableCatalogIds` 的 `known` 是
+         * `new Set(catalog.ids)` **并回黑名单** ⇒ `known ⊇ catalog.ids` **恒成立**
+         * ⇒ `missing` 恒为空 ⇒ warnings 恒 `[]`。
+         *
+         * ⇒ 而这正是**语义正确**的：批量关闭的对象是「目录里的全部模型」——它们
+         * **本来就在目录里**，不存在「关了但没有效果」的那个 id（那是**逐条开关**
+         * 的语义）。所以批量路径**无事可警告**。
+         *
+         * ⚠️ 不能把它拿来给「已下架的模型」报警：失效模型被 `withDeadModelPruning`
+         * 剔除、但 `model.list` 又把它们补回目录（带 `dead:true`）⇒ 它们**不在**
+         * `catalog.ids` 里 ⇒ **不会**被这个批量关闭涉及。
+         *
+         * ⚠️ 故客户端读 `result?.warnings` 在这条路径上恒空是**正确的**（无事可警）。
+         */
         const value: RpcModelSetAllDisabledResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),

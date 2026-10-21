@@ -25,6 +25,7 @@ import {
   formatPackageExpiry,
   formatPackageTooltip,
   formatPoolSplitLine,
+  exclusivePoolRemainingOf,
   packageExpiryMs,
   splitCreditsByExpiry,
 } from '../../plugin-src/client/credit-expiry.js'
@@ -1157,5 +1158,67 @@ describe('独立池判据必须两侧同源（宿主侧真实池名 → 客户�
         `两侧对「${name}」的判定必须一致（宿主侧 ${isExclusiveCreditPool({ name })} vs 客户端 ${isExclusivePool({ name })})`,
       ).toBe(isExclusivePool({ name }))
     }
+  })
+})
+
+
+/**
+ * ⚠️ `exclusivePoolRemainingOf`（2026-10-21 合并审计发现 B4 的修法）。
+ *
+ * ## 为什么需要它
+ *
+ * PR !134 让**三处**各写了一份「独立池剩余量」的汇总（前端 `split`、设置页
+ * `CreditBalanceRow`、徽标弹窗 `splitParts`），而三份的判据**很接近但不相同**：
+ * `split` 用 `active === true` 且跳过 `remaining <= 0`，两处渲染用
+ * `active !== false` 且**不过滤负余额**。
+ *
+ * ⇒ 合并审计实测：`packages: [{active:undefined, remaining:-5}, {active:true, remaining:100}]`
+ * ⇒ `split.exclusivePoolRemaining` = 100，而渲染层 = 95 ⇒ **同一屏上两个数**。
+ *
+ * ## 本段锁住的口径
+ *
+ * - `active === true`（**不是** `!== false`）：`undefined` 不算有效；
+ * - `remaining > 0`（负余额是 autoclaw 的冲正/退款，**不得**加进合计）；
+ * - 只累加独立池。
+ */
+describe('exclusivePoolRemainingOf（独立池剩余量的唯一判据）', () => {
+  const spark = (over: Partial<CreditPackage> = {}) => pkg({
+    name: '星火积分（独立池，不参与主池合计）',
+    remaining: 25000,
+    deductionEndTime: undefined,
+    ...over,
+  })
+
+  it('只累加独立池，且与 split.exclusivePoolRemaining 同值', () => {
+    const packages = [
+      pkg({ name: '赠送积分', remaining: 1900, deductionEndTime: NOW + 11 * DAY }),
+      spark(),
+    ]
+    expect(exclusivePoolRemainingOf(packages)).toBe(25000)
+    // ⚠️ 与前端三档的那一份**逐分相同**（同一份判据的必然结果）。
+    expect(splitCreditsByExpiry(packages, WINDOW_DAYS, NOW)?.exclusivePoolRemaining).toBe(25000)
+  })
+
+  it('active 未定义（undefined）不算有效 —— 与 split 的循环逐格同判', () => {
+    // ⚠️ `active !== false` 会把 `undefined` 当有效（错），`active === true` 不会。
+    const packages = [spark({ active: undefined as never, remaining: 100 })]
+    expect(exclusivePoolRemainingOf(packages)).toBe(0)
+    expect(splitCreditsByExpiry(packages, WINDOW_DAYS, NOW)?.exclusivePoolRemaining).toBe(0)
+  })
+
+  it('负余额（冲正/退款）不加进合计', () => {
+    const packages = [spark({ remaining: -5 }), spark({ remaining: 100 })]
+    expect(exclusivePoolRemainingOf(packages)).toBe(100)
+    expect(splitCreditsByExpiry(packages, WINDOW_DAYS, NOW)?.exclusivePoolRemaining).toBe(100)
+  })
+
+  it('非数组 / 空数组 ⇒ 0（不抛错）', () => {
+    expect(exclusivePoolRemainingOf(undefined)).toBe(0)
+    expect(exclusivePoolRemainingOf(null)).toBe(0)
+    expect(exclusivePoolRemainingOf([])).toBe(0)
+  })
+
+  it('主池不计入', () => {
+    expect(exclusivePoolRemainingOf([pkg({ name: '赠送积分', remaining: 1900 })])).toBe(0)
   })
 })
