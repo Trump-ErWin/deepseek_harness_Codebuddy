@@ -465,6 +465,25 @@ export async function fetchAutoclawBalanceDetailed(
     //   不守恒时回退钱包包是对的（宁可没有临期档，也不给错数）——
     //   但**不得**据此声称本渠道已支持按批次分档。
     let packages = walletPackages
+    /**
+     * ⚠️⚠️ **`degraded` 标记**（2026-10-21 二轮审计发现，P1）。
+     *
+     * 本家余额有**两条数据源**：钱包端点（必成，给总额）+ 流水端点（给逐批次到期）。
+     * 流水失败 / 守恒不成立时**静默回退钱包包** —— 总额对，但**逐包到期全部丢失**
+     * （钱包包没有 `deductionEndTime`）。
+     *
+     * 而 `splitBuddyCreditsByExpiry` 把「没有到期时刻」判成**永久桶**（对「真·永久」
+     * 是对的）⇒ 一次流水抖动会让「有临期积分的账号」被判成**只剩永久积分** ⇒
+     * 锁定状态下报「积分都已用尽」—— **那句会把用户推向不可撤回的解锁**。
+     *
+     * 实测（同一账号、同一 5000 余额，只改流水端点是否 500）：
+     * ```
+     * 流水正常 → split={expiring:5000} tier=expiring（可用）✅
+     * 流水 500 → split={permanent:5000} tier=none（「积分都已用尽」）❌
+     * ```
+     * ⇒ 回退时必须打出标记，让选号层把「读不到明细」归到 `unknown` 而不是 `exhausted`。
+     */
+    let degraded = false
     if (total > 0) {
       try {
         const entries = await fetchAutoclawLedgerEntries(credential, options)
@@ -481,9 +500,15 @@ export async function fetchAutoclawBalanceDetailed(
         const tolerance = Math.max(100, Math.floor(total * 0.01))
         if (batches.length > 0 && Math.abs(batchSum - total) <= tolerance) {
           packages = batches
+        } else {
+          // ⚠️ 守恒不成立 / 一个批次都没有 ⇒ 回退钱包包 ⇒ **明细不可用**。
+          degraded = true
         }
       } catch {
         // 流水不可达：静默回退钱包包（总额与长期数仍正确，只是没有临期档）。
+        // ⚠️ **但必须打 `degraded` 标记**：否则「读不到明细」会被下游当成
+        //    「用户只剩永久积分」，进而在锁定时报「积分都已用尽」（见上）。
+        degraded = true
       }
     }
 
@@ -505,6 +530,9 @@ export async function fetchAutoclawBalanceDetailed(
       total,
       packages,
       expiredTotal: 0,
+      // ⚠️ 只有**真的降级**时才带上该键（`undefined` 不写 ⇒ 与既有响应逐字节相同，
+      //    避免让所有消费者都去处理一个恒为 `false` 的字段）。
+      ...(degraded ? { degraded: true } : {}),
     }
     return { balance }
   } catch (error) {
@@ -706,3 +734,4 @@ export async function claimAutoclawDailyQuota(
     }
   }
 }
+

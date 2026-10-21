@@ -181,6 +181,25 @@ const LOCK_EXECUTION_PATHS: Record<
     drives: 'minimaxLockedError',
     anchor: "lockedError: minimaxLockedError('MiniMax Code (国际版)'),",
   },
+  // ⚠️ autoclaw / autoclawintl（2026-10-21，用户要求「补锁定开关」）：
+  //    与 astudio / minimax 同一条执行路径（`createCredentialResolver` 的
+  //    `kind: 'buddy'` 分支 ⇒ `pickBuddyAccount({ allowPermanent })`）。
+  //    判别符号取 `autoclawLockedError` —— 它本家独有（共用 `buddyLockedError`
+  //    等于没点名）。
+  //    ⚠️ **两站的锚点必须带各自的 `displayName`**：两站共用同一个构造器，
+  //    只查裸符号会让「一站的接线在」使另一站也绿。
+  autoclaw: {
+    module: 'src/index.ts',
+    spec: 'tests/unit/autoclaw-lock-wiring.spec.ts',
+    drives: 'autoclawLockedError',
+    anchor: "lockedError: autoclawLockedError('AutoClaw'),",
+  },
+  autoclawintl: {
+    module: 'src/index.ts',
+    spec: 'tests/unit/autoclaw-lock-wiring.spec.ts',
+    drives: 'autoclawLockedError',
+    anchor: "lockedError: autoclawLockedError('AutoClaw (国际版)'),",
+  },
 }
 
 describe('★ 普查：凡登记 permanentLock 的渠道，都必须有一条执行路径', () => {
