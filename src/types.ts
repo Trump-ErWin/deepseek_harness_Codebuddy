@@ -786,7 +786,19 @@ export interface RpcCreditsBalancesResponse {
    * 「提示说只烧 15 天内的、实际按 31 天筛号」。
    * Loomy / Raccoon **不带**该字段：它们的积分由服务端按语义分成多个池下发
    * （其中有「每日刷新」池），走的是**池名分桶**（`formatPoolSplitLine`），
-   * 不是到期时间分桶。Qoder 虽有包到期字段但未接入分桶展示（仅 hover 明细）。
+   * 不是到期时间分桶。
+   *
+   * ⚠️ **Qoder（`qoder` / `qodercn`）2026-10-20 起已接入分桶展示** ——
+   * 此前那句「虽有包到期字段但未接入分桶展示（仅 hover 明细）」是上一版实现的
+   * **失实**表述（既低估了能力，也漏了 `windowDays` 这个渲染闸门；
+   * 缺口本体与修复见 `jet-hub-rpc.ts` 里 qoder 分支的长注释）。
+   *
+   * ⚠️ 但**如实标注其实际分档形态**，勿读成「面板一定是三行数字」：
+   * Qoder 的**逐包到期上游拿不到**（`addOnQuota` 只给聚合标量；逐包明细端点
+   * 只对浏览器登录态开放；`dedicatedResourcePackages` 是唯一带真实 `expiresAt`
+   * 的字段，本机账号实测为 `undefined`）⇒ `packages[]` 全员进
+   * **永久（未知到期）**桶 ⇒ **临期桶只在真有 `dedicatedResourcePackages`
+   * 的账号上才非 0**。这不是缺陷，是「上游不下发 ⇒ 不编造」的如实结果（本仓库红线）。
    */
   windowDays?: number
 }

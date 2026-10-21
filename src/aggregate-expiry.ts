@@ -63,9 +63,27 @@ import { AUTOCLAW } from './autoclaw-product.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import type { AccioCredential } from './accio.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
+// ⚠️ AStudio（讯飞 AstronStudio）：三池各带 `*NextExpireTime` ⇒ 可精确折算
+//    （2026-10-20 新增）。判据链与 autoclaw 同形，只是时间字段确实存在。
+import { fetchAstudioBalanceDetailed } from './astudio-credits.js'
+import { ASTUDIO } from './astudio-product.js'
+import type { AstudioCredential } from './astudio.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
 import { fetchSubscriptionSummary } from './officeace-auth.js'
 import { officeaceBreakerOpen } from './officeace-credential-health.js'
+// ⚠️ Qoder（中国版 / 国际版）：与 **buddy 系同形**（`CreditPackage` 都带
+//    `deductionEndTime`）⇒ 本原语直接复用 `sharedPackageExpiry`，不另写判据
+//    （2026-10-20 新增）。用 `QoderProduct` 而不是 `typeof QODER`，因为本原语
+//    **两站共用**、`product` 由调用方传入。
+import { fetchQoderCreditBalance } from './qoder-credits.js'
+import type { QoderProduct } from './qoder-product.js'
+import type { QoderCredential } from './qoder.js'
+// ⚠️ MiniMax Code（中国版 / 国际版）：每条积分明细各带 `expire_at_ms` ⇒ 可精确折算
+//    （2026-10-20 新增）。用 `MinimaxProduct` 而不是 `typeof MINIMAX`，
+//    因为本原语**两家共用**、`product` 由调用方传入。
+import { fetchMinimaxCreditBalanceDetailed } from './minimax-credits.js'
+import type { MinimaxProduct } from './minimax-product.js'
+import type { MinimaxCredential } from './minimax.js'
 import { runtimeOf, type ProviderExpiryContext } from './provider-runtime.js'
 
 /**
@@ -219,6 +237,58 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
   //    （⚠️ 那里必须传 `AUTOCLAW_INTL`，否则会用国内基址查国际账号余额）
   //    + 折算原语（`autoclawExpiry` 本身产品无关，无需改）。
   'autoclawintl',
+  // ⚠️ **Qoder**（中国版 / 国际版，2026-10-20，用户要求补齐三档分档 + 永久锁）。
+  //    折算原语见 `qoderExpiry`（两站共用，只换 product）。
+  //
+  //    取证（2026-10-20，两个真实 qodercn 账号，`/sash/api/v2/me/usage`）：
+  //    - `userQuota` 只有顶层 `expiresAt`，且恒为**永久哨兵**（见下）；
+  //    - `addOnQuota` **无任何日期字段，只给聚合标量**；
+  //    - `dedicatedResourcePackages` 是**唯一**带真实逐包 `expiresAt` 的字段，
+  //      但本机账号为 `undefined`。
+  //
+  //    - 顶层 `qoderUsage.expiresAt = 253402214400000`（`9999-12-31T00:00:00Z`），
+  //      是 Qoder 给 `userQuota` 下发的**永久哨兵**、**不是**到期时刻。
+  //    - 实际后果：`qoder-credits.ts` 对哨兵**不写** `deductionEndTime`
+  //      （写进去会让客户端渲染出「9999-12-31（约 2900000 天后）」荒谬文案）
+  //      ⇒ 有余额 ⇒ `NEVER`（长期，排最后但可当选）。
+  //    - ⚠️ 国际站 `openapi.qoder.sh` 本机**网络不可达**（`fetch failed` ~10.7s），
+  //      ⇒ 对「取不到」保守：`fetchQoderCreditBalance` 返回 `null` ⇒ `UNUSABLE`。
+  //
+  //    ⚠️⚠️ **这是该陷阱的第 7 次复发**（cline → accio → officeace → autoclaw
+  //    → astudio → minimax → qoder），症状恒定**静默**：**决定候选表可见性的
+  //    是本表**，只改 `aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS` 等于没接 ——
+  //    折算恒 `UNUSABLE`，用户在聚合轮换列表里**永远看不到 qoder / qodercn**。
+  //    ⚠️ 两家**各占一行**：本表按 provider id，漏 `qodercn` 会让中国版单独被剔。
+  'qoder',
+  'qodercn',
+  // ⚠️ **AStudio**（讯飞 AstronStudio，2026-10-20）：折算原语见 `astudioExpiry`。
+  //    三池（会员 / 购买 / 赠送）各下发 `*NextExpireTime`（不带时区的本地时间串），
+  //    已由 `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到
+  //    `packages[].deductionEndTime`（毫秒）⇒ 与 buddy 系同一套
+  //    `sharedPackageExpiry` 折算即可，不需要自写原语。
+  //    ⚠️⚠️ **这是该陷阱的第 5 次复发**（cline → accio → officeace → autoclaw
+  //    → astudio），症状恒定**静默**：PR 只加了 `aggregate-adapter.ts` 的
+  //    `AGGREGATE_CHANNELS`（模型层归并会发生、看起来接好了），而**决定候选表
+  //    可见性的是本表** —— 漏加它 ⇒ 折算恒 `UNUSABLE`，用户在聚合轮换列表里
+  //    **永远看不到 astudio**，且**无报错、无日志**。
+  //    ⚠️ 三处必须同改：本表 + `provider-expiry.ts` 的 `createProviderExpiry()`
+  //    + 折算原语（后两者的一致性由 `expiry-runtime-parity.spec.ts` 真跑
+  //    `apply()` 锁一致）。
+  'astudio',
+  // ⚠️ **MiniMax Code**（中国版 / 国际版，2026-10-20，用户报障
+  //    「MiniMax Code 积分也有到期时间，也应当有相同功能」）。
+  //    折算原语见 `minimaxExpiry`（两家共用，只换 product）。
+  //    `/minimax-cloud/api/v1/credit/details` 的每条 `details[]` 都带
+  //    `expire_at_ms`（毫秒时间戳）⇒ 可精确折算，无已知代价。
+  //    ⚠️ 国际站必须透传 `xff`（`pool.minimaxXff()`），否则 `agent.minimax.io`
+  //    307 到中国站、token 不被认 ⇒ 折算恒失败（IKMEVG）。
+  //    ⚠️⚠️ **这是该陷阱的第 6 次复发**（cline → accio → officeace → autoclaw
+  //    → astudio → minimax），症状恒定**静默**：**决定候选表可见性的是本表**，
+  //    只改 `aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS` 等于没接。
+  //    ⚠️ 三处必须同改：本表 + `provider-expiry.ts` 的 `createProviderExpiry()`
+  //    + `provider-registry.ts` 的 `usesExpiryWindow` / `permanentLock`。
+  'minimax',
+  'minimaxintl',
 ])
 
 /**
@@ -1022,6 +1092,172 @@ export async function autoclawExpiry(
     },
   ))
 }
+
+/**
+ * **Qoder**（`qoder` 国际版 / `qodercn` 中国版，**共用**本原语，只换 product）：
+ * 与 **buddy 系同形**（`CreditPackage` 都带 `deductionEndTime`）⇒ 判据直接复用
+ * `sharedPackageExpiry`，**不另写解析逻辑**（两站共用同一个原语，避免同族分叉）。
+ *
+ * ## ⚠️⚠️ **本家与其它「已接入」渠道的本质不同：上游不给逐包到期时刻**
+ *
+ * 2026-10-20 取证（两个真实 qodercn 账号，`GET /sash/api/v2/me/usage`）：
+ *
+ * | 字段 | 实测 | 是否带日期 |
+ * |---|---|---|
+ * | `userQuota`（套餐额度） | `{total:0,used:0,remaining:0}` | 只有顶层 `expiresAt`，且恒为**永久哨兵** |
+ * | `addOnQuota`（资源包） | `{total:2000,…remaining:2000,detailUrl:…}` | **无任何日期字段，只给聚合标量** |
+ * | `dedicatedResourcePackages` | `undefined`（本机账号） | **唯一**带真实逐包 `expiresAt`（字符串）的字段 |
+ *
+ * 顶层 `qoderUsage.expiresAt = 253402214400000`（`9999-12-31T00:00:00Z`）是
+ * Qoder 给 `userQuota` 下发的**永久哨兵**、**不是**到期时刻。权威旁证是官方
+ * 客户端 asar 的 `buildUsageItemGroups()`：`addOnQuota` 那一档**只渲染
+ * used/total/remaining、不给任何日期**；只有 `userQuota.expiresAt` 走
+ * `renewson`（「将于 {{date}} 刷新」= **订阅刷新**），
+ * `dedicatedResourcePackages` 才走 `expiresOn`（「有效期至 {{date}}」）。
+ *
+ * ⇒ `qoder-credits.ts` 的 `toPackage()` 用常量
+ * `QODER_PERMANENT_EXPIRY_MS` 识别哨兵并**不写** `deductionEndTime`
+ * （写进去会让客户端 `formatPackageExpiry` 渲染出
+ * `9999-12-31（约 2900000 天后）` 这种荒谬文案）。
+ *
+ * ## 折算结果（如实，不是打折）
+ *
+ * | 情形 | 折算值 | 依据 |
+ * |---|---|---|
+ * | 有余额但**无**逐包到期（本次实测的账号形态） | `NEVER`（长期：排最后但不剔除） | `sharedPackageExpiry` 的「有余额但无到期时间」那一档 |
+ * | 有余额且有 `dedicatedResourcePackages` 的真实到期 | 该时刻（取最早那包） | 同上（`Math.min`） |
+ * | 一个 `remaining > 0` 的有效包都没有 | `UNUSABLE`（剔除） | 同上 |
+ * | 查询失败（含国际版不可达）/ 未登录 | `UNUSABLE` | 同上（`null` ⇒ 不猜） |
+ *
+ * ⚠️ **已知限制（必须如实标注）**：无 `dedicatedResourcePackages` 时
+ * **临期桶恒为 0** —— 三档分档只剩「永久（未知到期）」一档 + 上游聚合标量。
+ * 这**不是**缺陷，是「上游不下发 ⇒ 我们不编造」的必然结果（本仓库红线）。
+ * 逐包明细端点已穷举失败：`/sash/api/v2/me/*` → 404；
+ * `qoder.cn/api/v1/me/quotas/{key}/histories` →
+ * `/api/v1/me/usages/big_model_credits/histories` → qoder.cn 下 **401**
+ * （需浏览器登录态 cookie，插件 OAuth token 拿不到）、在 openapi 下 **404**。
+ *
+ * ## 为什么必须走 `cachedBalance`
+ *
+ * 聚合每轮折算会对同一账号反复提问；没有共享读数就会白发大量重复请求
+ * （与 buddy / trae / modelscope / autoclaw / astudio / minimax 同款理由）。
+ *
+ * ⚠️ **不加 XFF 需求**：与 minimax 国际站不同，Qoder 没有已知的地理分流，
+ * ⇒ **刻意不加** `minimaxXff` 那类透传参数（凭空多一个参数只会让人以为有分流）。
+ */
+export async function qoderExpiry(
+  credential: QoderCredential,
+  product: QoderProduct,
+  /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+  cached?: () => Promise<CreditBalance | null | undefined>,
+): Promise<number> {
+  return sharedPackageExpiry(() => fetchBalanceWithCache(
+    cached,
+    () => fetchQoderCreditBalance(credential, product),
+  ))
+}
+
+/**
+ * astudio（讯飞 AstronStudio）：三池各带到期时间 ⇒ **可精确折算**，无已知代价。
+ *
+ * ## 与 autoclaw 的差别（为何这里能算出真实时刻）
+ *
+ * autoclaw 的钱包报文里**没有任何时间字段**（只有流水批次才带 `deductionEndTime`），
+ * 故它只能「有余额即 `NEVER`」。astudio 的 `/points/balance` 实测直接下发
+ * `{member,buy,activity}NextExpireTime`（形如 `"2026-11-20T01:50:14"`，
+ * **不带时区的本地时间串**），已由 `astudio-credits.ts` 的
+ * `astudioLocalTimeMs` 用 `Date.parse(raw.replace(' ', 'T'))` 归一化到
+ * `packages[].deductionEndTime`（毫秒）⇒ 直接复用
+ * `sharedPackageExpiry`（取**最早**到期的那一包 = `Math.min`）。
+ *
+ * ## 为什么走 `sharedPackageExpiry` 而不是自己遍历
+ *
+ * 它把三件容易写错的事收敛在一处：①异常按 `isAbortError` 分流（用户取消要
+ * 继续抛，不能吞成 `UNUSABLE`）；②`null` ⇒ `UNUSABLE`；③**所有**候选都折算
+ * 失败时（`anyConverted === false`）返回 `UNUSABLE` 而不是 `NEVER`
+ * —— `NEVER` 意味着「永不过期」，会被聚合排在最后但仍然**可选中**，
+ * 那是把「查不到」谎报成「长期有效」（本仓库红线）。
+ *
+ * ## 为什么必须走 `cachedBalance`
+ *
+ * 聚合每轮折算会对同一账号反复提问；没有共享读数就会白发大量重复请求
+ * （与 buddy / trae / modelscope / autoclaw 同款理由）。
+ */
+export async function astudioExpiry(
+  credential: AstudioCredential,
+  product: typeof ASTUDIO,
+  /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+  cached?: () => Promise<CreditBalance | null | undefined>,
+): Promise<number> {
+  return sharedPackageExpiry(() => fetchBalanceWithCache(
+    cached,
+    async () => {
+      const result = await fetchAstudioBalanceDetailed(credential, { product })
+      // ⚠️ 同 autoclaw：`fetchBalanceDetailed` 的失败形态是 `balance: null + error`，
+      //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
+      return result.balance
+    },
+  ))
+}
+
+/**
+ * minimax（MiniMax Code，中国版 / 国际版共用本原语，只换 product）：
+ * **每条积分明细各带自己的到期时刻** ⇒ 可精确折算，无已知代价。
+ *
+ * ## 与 astudio 的差别（字段形态，判据一致）
+ *
+ * | 渠道 | 到期字段 | 形态 | 是否需要归一化 |
+ * |---|---|---|---|
+ * | astudio | `{member,buy,activity}NextExpireTime` | **不带时区的本地时间串** | 需要（`Date.parse(raw.replace(' ','T'))`） |
+ * | minimax | `details[].expire_at_ms` | **毫秒时间戳** | 不需要（直接是 epoch ms） |
+ *
+ * 两者最终都落到 `packages[].deductionEndTime`（毫秒）⇒ 折算口径逐格一致，
+ * 都复用同一条 `sharedPackageExpiry`（取最早到期的那一包）。
+ *
+ * ## 为什么能算（此前判「不可折算」的依据已被实测推翻）
+ *
+ * 2026-10-20 用户报障「MiniMax Code 积分也有到期时间，也应当有相同功能」，
+ * 并附 AStudio 面板截图作参照。实测（真实凭据，两站各取账号）确认：
+ * `GET /minimax-cloud/api/v1/credit/details` 的**每条** `details[]` 都带
+ * `expire_at_ms`（中国版 20/20 条、15/15 条全部有值），
+ * 且到期时刻 = 发放日 + 30 天的零点（如 2026-10-20 发放 → 2026-11-19 到期）。
+ *
+ * ⚠️ 在此之前 `fetchMinimaxCreditBalance` 把 `packages` **硬编码成 `[]`**，
+ * 聚合侧据此把本家归为「查不到到期时间」一类。那个结论**不是**
+ * 「上游不下发」，而是「我们没解析」—— 这两件事在注释里被混同过，是本次
+ * 报障的根因。
+ *
+ * ## 为什么必须走 `cachedBalance`
+ *
+ * 聚合每轮折算会对同一账号反复提问；没有共享读数就会白发大量重复请求
+ * （与 buddy / trae / modelscope / autoclaw / astudio 同款理由）。
+ */
+export async function minimaxExpiry(
+  credential: MinimaxCredential,
+  product: MinimaxProduct,
+  /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
+  cached?: () => Promise<CreditBalance | null | undefined>,
+  /**
+   * 国际站的 `X-Forwarded-For` 绕行头（见 `src/minimax.ts` 的 `withMinimaxXff`）。
+   *
+   * ⚠️ 必须透传：国际站按出口 IP 做地理分流，`agent.minimax.io` 会 307 到
+   * 中国站，而**跟随后中国站不认国际站 token**（`401 invalid access token`，
+   * 与「凭据真失效」逐字同形，issue IKMEVG）。不带 xff ⇒ 国际站账号的
+   * 到期折算恒失败 ⇒ 该渠道在聚合轮换里被静默剔除。
+   */
+  xff?: string,
+): Promise<number> {
+  return sharedPackageExpiry(() => fetchBalanceWithCache(
+    cached,
+    async () => {
+      const result = await fetchMinimaxCreditBalanceDetailed(credential, fetch, product, xff)
+      // ⚠️ 同 autoclaw / astudio：失败形态是 `balance: null + error`，
+      //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
+      return result.balance
+    },
+  ))
+}
+
 
 /** loomy：有今日赠送 → 当日 24:00；只剩永久 → NEVER。 */
 export async function loomyExpiry(credential: LoomyCredential): Promise<number> {
