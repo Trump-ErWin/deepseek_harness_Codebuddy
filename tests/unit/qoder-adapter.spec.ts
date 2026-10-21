@@ -205,6 +205,55 @@ describe('QoderAdapter 模型目录', () => {
         await expect(adapter.isFreeModel('dmodel')).resolves.toBe(false)
       })
 
+      /**
+       * ★★ **远端目录「按账号收缩」时，静态表里的免费模型仍必须判免费**
+       * （2026-10-21 合并审计发现，!137 引入的回归）。
+       *
+       * ## 真实场景
+       *
+       * 远端目录是**按账号**下发的：免费额度号上游**只给 2 条**
+       * （`qfmodel` + `dfmodel`，见 `docs/agent-notes/providers-qoder.md`），
+       * 其余 17 条不在远端目录里。
+       *
+       * ## 缺陷
+       *
+       * 判据原写成 `this.catalogSource().find(...)`，而 `catalogSource()` 是
+       * `remoteModels ?? fallbackModels` —— **远端一旦落地就把静态表整体顶掉**
+       * ⇒ 静态表里标了 `isFree: true` 的 `qmodel_38max` 被判成「未知 ⇒ 非免费」
+       * ⇒ 跳过 `credential-resolver.ts` 的「免费模型不受锁定约束」短路
+       * ⇒ 锁定永久积分时被 `allowPermanent=false` 拦下、报出「额度都属于永久」
+       * 这类**与事实相反**的错误 —— 本家 2026-10-21 真实报障**原地复发**，零日志。
+       *
+       * ⚠️ 同文件 `catalogModel()` 的注释**逐字记过同一个反模式**
+       * （「第一版把它写成 `catalogSource().find(...)`，被独立审计打穿」）——
+       * 能力/元数据判据早已改用并集，**免费判据当时漏了**。
+       *
+       * ⚠️ 与上一条「未接线远端」的区别：那格 `remoteModels` 仍是 `undefined`，
+       * `catalogSource()` 恰好等于静态表 ⇒ **测不出**本条缺陷
+       * （实测：本缺陷存在时本条红、那条绿）。
+       *
+       * 变异：判据改回 `this.catalogSource().find(...)` ⇒ 本条红
+       * （实测：修前 `isFreeModel('qmodel_38max') = false`）。
+       */
+      it('★★ 远端目录按账号收缩时，静态表里的免费模型仍判免费（不许只查远端）', async () => {
+        const shrunk: QoderFallbackModel[] = [
+          { id: 'fast', name: 'Fast', contextWindow: 200_000, isFree: false },
+        ]
+        const adapter = makeAdapter({ fetchRemoteModels: async () => shrunk })
+        // ⚠️ **必须先让远端真的落地**，否则测的是「未接线」那一格（那格恰好全绿）。
+        await adapter.listModels('qoder')
+
+        await expect(
+          adapter.isFreeModel('qmodel_38max'),
+          '★★ 静态表标了 isFree:true ⇒ 远端收缩时仍须判免费（否则免费模型撞锁定闸门，报出「额度都属于永久」）',
+        ).resolves.toBe(true)
+        await expect(adapter.isFreeModel('qfmodel')).resolves.toBe(true)
+        // ⚠️ **反向必须同时存在**：并集不得把真付费模型判成免费
+        //（那个方向会绕开锁定**真烧永久积分**，不可逆）。
+        await expect(adapter.isFreeModel('dmodel')).resolves.toBe(false)
+        await expect(adapter.isFreeModel('fast')).resolves.toBe(false)
+      })
+
       it('⚠️ 必须 await 远端目录加载（否则「直接进会话」路径判据静默失效）', async () => {
         // 变异：删掉判据里的 `await this.ensureRemoteModels()` ⇒ 远端尚未加载，
         // 落到兜底表 ⇒ `remote-only-free` 查不到 ⇒ 返回 false ⇒ 本条红。

@@ -1255,3 +1255,39 @@ describe('独立池（AStudio 星火积分）：设置页与徽标弹窗两处�
     expect(isExclusivePool(undefined)).toBe(false)
   })
 })
+
+/**
+ * ⚠️⚠️ **徽标 tooltip 的「最早作废」标题不得对短语再拼后缀**
+ * （2026-10-21 合并审计发现，!135 引入的回归）。
+ *
+ * ## 缺陷
+ *
+ * !135 把 `expirySplitParts` 的 `countdown` 从「裸时长」改成「**可能是完整短语**」
+ * （倒计时只覆盖其中一批时为 `其中 500 于 6 天 0 小时后到期`），而**消费方**这一行
+ * 仍无条件拼 `后` ⇒ 实测残句：
+ *
+ * ```
+ * 最早作废：其中 500 于 6 天 0 小时后到期后
+ * ```
+ *
+ * ⚠️ 本处此前**零用例**：把整条 title 换成垃圾串，全量测试**零新增失败**。
+ *
+ * ## 判据为什么是源码级
+ *
+ * title 拼在 `renderSplitNote` 的 JSX 字面量里，没有可独立调用的纯函数。
+ * ⇒ 沿用本文件既有的 `codeOf`（**剥注释**）口径 —— 否则新增的解释性注释里若
+ * 提到 `countdown}后`（本文档上面就提到了一次）会把断言判成违规。
+ * ⚠️ 抽查那条 `\${part.countdown}` 的**正**断言同时存在，避免「只要不含 A」被
+ *    改写成删掉整条 title 也全绿。
+ */
+describe('徽标 tooltip 标题：短语不得再拼后缀（!135 回归的守卫）', () => {
+  const badge = codeOf(read('plugin-src/client/usage-badge.js'))
+
+  it('title 直接用 countdown，不再拼「后」', () => {
+    // 正：title 由 countdown 直接构成
+    expect(badge, 'title 必须来自 part.countdown').toContain('最早作废：${part.countdown}')
+    // 反：不得出现「拼了后缀」的形态
+    expect(badge, '不得对 countdown 再拼「后」（混合批次时它是完整短语）')
+      .not.toContain('${part.countdown}后')
+  })
+})
