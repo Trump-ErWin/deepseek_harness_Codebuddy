@@ -184,6 +184,39 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
 ])
 
 /**
+ * 把上游 `ratio_display` 原串转成**仓内倍率口径**（`x0.7`）。
+ *
+ * ## 为什么必须转（2026-10-21 合并审计发现）
+ *
+ * 上游 `/v1/model/builtin` 的 `ratio_display` 是 `0.7x`（**x 在数字后**），
+ * 而全仓其余各家的展示名是 ` · x{n}`（**x 在数字前**）：buddy（`x0.29`）、
+ * loomy（`x0.1`）、trae（`x0.08`）、accio（`x0.013`）、lobsterai（`x1.08`）。
+ *
+ * ⚠️ 而 `src/aggregate-core.ts` 的 `priceFactorFromName` 是**全仓唯一的倍率解析口**
+ * （聚合的「同临期档内倍率升序」与选择器的 `· 最低 x{n}` 都走它），它的正则
+ * `·\s*[×x]?\s*(\d+(?:\.\d+)?)...$` 把 `[×x]?` 放在数字**之前** ⇒
+ * ` · 0.18x` **匹配不上** ⇒ 恒返回 `Infinity`。
+ *
+ * ⇒ 后果：codearts 是聚合渠道（`AGGREGATE_CHANNELS` 第 1 位），它的候选价格
+ *   恒为 `Infinity` ⇒ 聚合**永远挑不到 codearts**（同临期档内它排最后），
+ *   选择器的「· 最低 x{n}」也漏掉它。
+ *
+ * ## 转换的边界（红线：绝不臆造）
+ *
+ * - **只改形态，不改数值** —— 数值仍逐字取自上游 `ratio_display`；
+ * - **认不出就返回 `undefined`**（调用方据此不显示倍率，**不用占位值冒充**）；
+ * - ⚠️ 上游若改形态（比如也改成 `x0.7`）⇒ 这里认不出 ⇒ 不显示倍率
+ *   （**保守方向**：少显示好过显示一个错的数）。此时应更新本函数与
+ *   `RemoteModel.rateLabel` 的注释。
+ */
+export function codeartsRateSuffix(display: string): string | undefined {
+  if (typeof display !== 'string') return undefined
+  const m = /^\s*(\d+(?:\.\d+)?)\s*x\s*$/i.exec(display)
+  if (m === null) return undefined
+  return `x${m[1]}`
+}
+
+/**
  * 单次请求输出上限的安全边界。
  *
  * ⚠️ 取值依据是**本文件下方出站处的实测**（参考实现 deveco-code-rust e2e：
@@ -1158,14 +1191,37 @@ export class CodeArtsAdapter extends LlmAdapter {
     const contextWindow = CONTEXT_WINDOWS.get(model.id)
     // ⚠️ 倍率拼进 `name`（与 officeace / buddy / loomy / raccoon 同款：
     //    `name` 带倍率、`resolveModel` 用裸名，骨架只认 `name`）。
-    //    ⚠️ 用的是上游 `ratio_display` 原串（`0.7x`），**不**自己拼 `x{n}` ——
-    //    见 `RemoteModel.rateLabel` 的注释：那样会显示上游从未出现过的数。
-    const name = model.rateLabel !== undefined
-      ? `${model.name} · ${model.rateLabel}`
-      : model.name
+    //
+    // ⚠️⚠️ **必须同时给 `bareName`**（2026-10-21 合并审计发现）：共享骨架
+    //    `model-catalog.ts:640` 的取值是 `entry?.bareName ?? entry?.name ?? model`
+    //    ⇒ 省略 `bareName` 就回退到**带倍率**的 `name` ⇒ `resolveModel().name`
+    //    会带上倍率。全仓其余六家拼倍率的渠道（loomy / raccoon / accio /
+    //    lobsterai / trae / buddy）**全部**提供了 `bareName`，本家是唯一例外。
+    //    ⚠️ 本家比别家更严重：倍率**随时间变**（错峰档 21:00–次日 08:00）⇒
+    //    同一个模型的 `resolveModel().name` 一天变两次（`· 0.09x` ↔ `· 0.18x`）。
+    //
+    // ⚠️ **形态必须转成仓内口径 ` · x{n}`**（2026-10-21 合并审计发现）：
+    //    上游 `ratio_display` 原串是 `0.7x`（**x 在数字后**），而全仓其余各家
+    //    是 ` · x{n}`（**x 在数字前**），且 `src/aggregate-core.ts` 的
+    //    `priceFactorFromName` 的正则把 `[×x]?` 放在数字**之前** ⇒ ` · 0.18x`
+    //    **解析不出** ⇒ 恒返回 `Infinity`。
+    //    ⇒ 后果：codearts 是聚合渠道（`AGGREGATE_CHANNELS` 第 1 位），
+    //      它的候选价格恒为 `Infinity` ⇒ `rankCandidates` 的第三判据
+    //      「同临期档内倍率升序」永远挑不到 codearts，`pickerNameOf` 的
+    //      `· 最低 x{n}` 也漏掉它。
+    //    ⚠️ 转换**只改形态、不改数值**（数值仍来自上游 `ratio_display`，
+    //    绝不臆造上游未下发的数 —— 见 `RemoteModel.rateLabel` 的注释）。
+    const rate = model.rateLabel !== undefined
+      ? codeartsRateSuffix(model.rateLabel)
+      : undefined
+    const name = rate !== undefined ? `${model.name} · ${rate}` : model.name
     return {
       id: model.id,
       name,
+      // ⚠️ `resolveModel` 用的**裸名**（不含倍率）—— 价格只属于选择列表语境
+      //    （与 loomy / raccoon / trae / lobsterai 同款，见 `model-catalog.ts`
+      //    的 `bareName` 字段注释）。
+      bareName: model.name,
       // ⚠️ 本家恒声明 `['text']`（CodeArts 是纯文本网关；VL 模型上面已滤掉）。
       inputModalities: ['text'] as const,
       ...contextWindow !== undefined ? { contextWindow } : {},
