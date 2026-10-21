@@ -202,6 +202,19 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
      * 误以为「锁住就不会作废」，而实际只是把这批号从选号里摘出去 ——
      * 语义错位，故不登记。
      */
+    /**
+     * ⚠️ **必须与 `usesExpiryWindow` 同时登记**（2026-10-20 合并审计发现，
+     * 与 minimax 两站同因）：`provider-registry.spec.ts` 有一条从**能力事实
+     * 派生**的守卫「`usesExpiryWindow` 的家必须有 `creditPackages`（同一份数据）」
+     * —— 两者读的是同一批 `packages[]`。只开前者会让账号卡片**不展示逐包列表**，
+     * 用户看得到「永久 / 长期 / 临期」三档合计，却看不到是**哪几笔**构成的。
+     *
+     * ⚠️ 本家补上是有实据的：`codearts-credits.ts` 已把上游的
+     * `package_credit_expiring_amount` 聚合标量**拆到逐包**
+     * （`packages[].expiringRemaining`），基础包还带 `deductionEndTime`
+     * （取自套餐周期 `end_date`）—— 「N/M 个资源包有效」这句因此有真实内容。
+     */
+    creditPackages: true,
     settingsNamespace: 'llm-codearts',
     channel: true,
   },
