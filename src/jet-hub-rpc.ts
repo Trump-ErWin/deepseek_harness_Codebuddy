@@ -905,7 +905,66 @@ export interface CreditsEndpointDeps<
 }
 
 /**
- * 逐账号收集签到状态（顺序执行，避免并发触发风控）。
+ * `credits.status` 逐账号查询的**默认并发度**。
+ *
+ * 3 的依据与代价见 `collectCreditsStatus` 函数体内那段注释（**不要**用「浏览器
+ * 默认 6」来论证 —— 那是不同量纲）。
+ */
+export const DEFAULT_CREDITS_STATUS_CONCURRENCY = 3
+
+/**
+ * `credits.status` 逐账号查询的**并发硬上界**。
+ *
+ * ## ⚠️ 为什么必须有它（2026-10-22 审计打穿）
+ *
+ * 初版的上界是 `accounts.length`：
+ *
+ * ```ts
+ * Math.max(1, Math.min(deps.concurrency ?? 3, accounts.length || 1))
+ * ```
+ *
+ * 于是 `deps.concurrency = 1e10`（任何 ≥ 账号数的安全整数）⇒ 并发度 = 账号数
+ * ⇒ **31 个账号 = 31 个并发请求打同一上游**（实测峰值 31）。注释说的「3 个并发
+ * 压力很低」这个保护**只由 `accounts.length` 约束，没有任何硬顶**。
+ *
+ * ⇒ 上界改为本常量。它同时给「将来有人把默认值调大」加了一道闸。
+ *
+ * ⚠️ 取值 8：足够覆盖「账号很多」的正常情形（3 是默认，8 是天花板），且远低于
+ * 任何一家上游会当成爬虫的量级。调它需要重新核对 `fetchStatus` 各家的限流策略。
+ */
+export const MAX_CREDITS_STATUS_CONCURRENCY = 8
+
+/**
+ * 解析 `credits.status` 的并发度（**纯函数，可直接单测**）。
+ *
+ * 逐格行为（2026-10-22 审计逐格实测确认）：
+ *
+ * | 传入 | 结果 | 说明 |
+ * |---|---|---|
+ * | `undefined` / `0` / `-1` / `NaN` / `1.5` / `Infinity` / 字符串 | 3 | 非「正整数」一律回落默认 |
+ * | `1` | 1 | 恢复旧的完全串行语义 |
+ * | `4` | 4 | |
+ * | `1e10` / `MAX_SAFE_INTEGER` | **8** | 被 {@link MAX_CREDITS_STATUS_CONCURRENCY} 硬顶（初版这里会变成账号数） |
+ * | `accounts.length === 0` | 1 | 起 1 个 worker 立刻返回 -1（**不能**是 0 —— 那会让 `results` 全是空洞） |
+ *
+ * ⚠️ `concurrency: 0` 的语义是「**回落默认 3**」，**不是**「串行」——要串行请传 `1`。
+ *    这条在初版注释里没写，是审计点出来的语义空隙。
+ */
+export function resolveCreditsStatusConcurrency(raw: unknown, accountCount: number): number {
+  const wanted = typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0
+    ? raw
+    : DEFAULT_CREDITS_STATUS_CONCURRENCY
+  const capped = Math.min(wanted, MAX_CREDITS_STATUS_CONCURRENCY)
+  // ⚠️ `Math.max(1, …)` 不可省：账号数为 0 时 `Array.from({length: 0})` 会让
+  //    `Promise.all([])` 立即 resolve，`results` 保持全空洞（返回 `[undefined,…]`）。
+  return Math.max(1, Math.min(capped, accountCount || 1))
+}
+
+/**
+ * 逐账号收集签到状态（**有限并发**，默认 3；见函数体内 `concurrency` 的说明）。
+ *
+ * ⚠️ **原实现是纯串行**，注释写「顺序执行，避免并发触发风控」。2026-10-22 改成
+ * 有限并发，理由与代价见函数体内那段长注释 —— **别再照旧注释改回串行**。
  *
  * **包含已停用账号**：停用只影响账号池的自动选择与限流切换，不改变账号本身
  * 是否已签到。用户要看到的是「这个账号今天领了没」，因此这里不过滤 enabled。
@@ -931,39 +990,43 @@ export async function collectCreditsStatus<TCredential = ChannelCredential, TPro
         fetcher,
       ))
   /**
-   * **有限并发**（2026-10-19，真实故障）。
+   * **有限并发**（2026-10-22，真实故障）。
    *
    * ## 为什么不再「完全串行」
    *
-   * 原实现是纯顺序循环，注释写「避免并发触发风控」。但账号池会随用户增删账号
-   * 线性增长 —— 报障那一台从 17 个涨到 31 个（单 workbuddy 7 个号、
-   * buddy 8 个、trae 8 个），而单账号上游超时 30 s ⇒ 用户实测：
-   *   - `credits.status` workbuddy **90 s 超时**
-   *   - `credits.balances` workbuddy **61.6 s / 107.4 s**
-   *   - 同时 `model.list` 只要 1~20 ms（⇒ 慢的不是读目录，是这里）
+   * 原实现是纯顺序循环，注释写「避免并发触发风控」。但账号池随用户增删账号
+   * **线性增长**，而单账号上游超时是 30 s 级 ⇒ 单渠道耗时 = 账号数 × 单账号耗时
+   * ⇒ 「打开 Jet Hub 设置页」的等待被账号数线性放大。同一时刻 `model.list` 只要
+   * 毫秒级（⇒ 慢的不是读目录，是这里）。
    *
-   * 于是「打开 Jet Hub 设置页」的等待被账号数线性放大。
+   * ## 为什么是 3（以及**推翻**了哪条既有理由）
    *
-   * ## 为什么是 3
+   * 原注释的理由是「顺序查询避免并发触发风控」。逐项核对后的**真实依据**是：
    *
-   * - 3 个并发对**同一上游**的瞬时压力仍很低（远低于浏览器默认的 6），
-   *   不会把「顺序查询避免风控」那条理由整个推翻；
-   * - 7 个账号从 `7×T` 降到 `⌈7/3⌉×T = 3×T`，同机实测 workbuddy 从
-   *   61~107 s 降到 **4.1 s**；
-   * - 保留**顺序写结果**：`results` 仍按 `accounts` 原序排列，UI 不会跳序。
+   * - **实际能走到这里的渠道极少**：只有注册了 `ProviderCredits.fetchStatus` 的
+   *   渠道才会调本函数（`credits.status` 端点先判 `statusImpl?.fetchStatus`），
+   *   当前是 `minimax` / `minimaxintl` 两家，且都是**只读 GET、一次/账号**；
+   *   其余渠道走「如实回 null」的短路分支，**零请求**；
+   * - **429 不会被放大**：minimax 的 `minimaxFetchWithRetry` 只重试**传输错误**，
+   *   不重试 HTTP 状态（429 原样失败）⇒ 3 并发撞限流只是 3 条同时失败，
+   *   不会变成重试风暴；
+   * - 签到（**写操作**）走的是 `collectClaimResults`，那里**仍是串行**，本改动不碰它。
+   *
+   * ⚠️ 因此**不要**照「3 远低于浏览器默认的 6」那条类比来论证安全性（浏览器并发
+   * 与服务端风控不是同一量纲，那是初版注释的推理错误）。要论证就按上面三条。
+   *
+   * ## 顺序与逃逸
+   *
+   * - 结果**按 `accounts` 原序**写回（`new Array(len)` + 下标），UI 不跳序；
+   * - 单账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都只影响它自己；
+   * - ⚠️ `deps.warn` 抛错**不得**逃逸成整批失败（初版会：它在 catch 里调用，
+   *   一抛就把 worker 的 promise reject 掉）⇒ 已包 try。
    *
    * ⚠️ 并发度可通过 `deps.concurrency` 覆盖（测试与将来调参用）；
-   *    `1` 即恢复旧的完全串行语义。
+   *    `1` 即恢复旧的完全串行语义。上界是 {@link MAX_CREDITS_STATUS_CONCURRENCY}
+   *    （**不是** `accounts.length` —— 那会让 31 个账号变成 31 并发）。
    */
-  const concurrency = Math.max(
-    1,
-    Math.min(
-      Number.isSafeInteger(deps.concurrency) && (deps.concurrency as number) > 0
-        ? (deps.concurrency as number)
-        : 3,
-      accounts.length || 1,
-    ),
-  )
+  const concurrency = resolveCreditsStatusConcurrency(deps.concurrency, accounts.length)
   const results: RpcCreditsStatusResponse['accounts'] = new Array(accounts.length)
   let cursor = 0
   /** 取下一个待处理下标；无剩余返回 -1（同步自增，单线程下无需加锁）。 */
@@ -971,8 +1034,19 @@ export async function collectCreditsStatus<TCredential = ChannelCredential, TPro
   const worker = async (): Promise<void> => {
     for (let index = take(); index !== -1; index = take()) {
       const entry = accounts[index] as ProviderAccountEntry
+      /**
+       * ⚠️ `accountId` / `nickname` 必须在 try **之外**取也会抛（`entry` 是外部对象，
+       * 可能是带 getter 的代理 / 冻结对象）。初版把它们的读取放在 `results[index] = …`
+       * 那一行 —— 而那一行在 catch **之后**、不受保护 ⇒ 一次抛错就让 worker 的
+       * promise reject ⇒ `Promise.all` 短路 ⇒ **整批失败**（违背本函数的设计约定）。
+       * ⇒ 先取到局部变量并各自兜底，写结果那一行只做纯赋值。
+       */
+      let accountId: string | undefined
+      let nickname: string | undefined
       let status: CheckinStatus | null = null
       try {
+        accountId = entry.id
+        nickname = entry.nickname
         let resolved = await deps.resolve(credentialRef(entry.credentialRef))
         if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
           resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
@@ -982,11 +1056,18 @@ export async function collectCreditsStatus<TCredential = ChannelCredential, TPro
           status = await fetchStatus(credential, product)
         }
       } catch (error) {
-        // 单个账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都不影响其余账号
-        deps.warn?.(`[jet-hub] credits.status 账号 ${entry.id} 失败: ${String(error)}`)
+        // 单个账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都不影响其余账号。
+        // ⚠️ `deps.warn` 自己抛错也**不得**逃逸（初版会让整批失败）——
+        //    告警是尽力而为，它坏了不该让用户看不到其余账号的签到状态。
         status = null
+        try {
+          deps.warn?.(`[jet-hub] credits.status 账号 ${String(accountId ?? entry.id)} 失败: ${String(error)}`)
+        } catch {
+          // 告警失败只能静默：这里已经没有更外层的可观测通道了。
+        }
       }
-      results[index] = { accountId: entry.id, nickname: entry.nickname, status }
+      // ⚠️ 纯赋值，不得再抛（`Promise.all` 会因 worker reject 而短路整批）。
+      results[index] = { accountId, nickname, status } as RpcCreditsStatusResponse['accounts'][number]
     }
   }
   await Promise.all(Array.from({ length: concurrency }, worker))
@@ -997,7 +1078,7 @@ export async function collectCreditsStatus<TCredential = ChannelCredential, TPro
  * 逐账号执行一键领取（顺序执行，单个账号失败不中断整体）。
  *
  * **包含已停用账号**：签到领取与「是否参与账号池自动选择」无关 —— 停用的
- * 账号同样有当日积分可领，用户点「一键领取」时���望所有账号都尝试一遍。
+ * 账号同样有当日积分可领，用户点「一键领取」时期望所有账号都尝试一遍。
  * 停用只影响限流切换时的候选集合，不影响这里。
  *
  * 与 collectCreditsStatus 同理：凭据解析位于每个账号自己的 try 之内，
@@ -1163,7 +1244,19 @@ export async function collectCreditBalances<TCredential = ChannelCredential, TPr
       ))
   const fetchDetailed = deps.fetchBalanceDetailed
   const results: RpcCreditsBalancesResponse['accounts'] = []
-  // 顺序查询，避免并发触发风控
+  /**
+   * ⚠️ **这里仍是串行**（与 `collectCreditsStatus` 的有限并发**刻意不同**）。
+   *
+   * `collectCreditsStatus` 于 2026-10-22 改成有限并发（默认 3），本函数**没有**跟着改，
+   * 理由是两者接的上游不同：那个只服务 `minimax` / `minimaxintl` 的**只读 GET**，
+   * 而本函数是面板「刷新积分」的主路径，各家余额接口都有速率限制（且部分带写语义，
+   * 例如 astudio 的 `importLocalSession`、minimax 的积分端点），并发收益不明而风险
+   * 更高。⇒ 要改这里必须**逐家**核对限流策略，不能因为「隔壁改了」就跟着改。
+   *
+   * ⚠️ 也别把「顺序查询避免并发触发风控」当成通用铁律 —— 它对**写操作**
+   * （`collectClaimResults`，签到）与**余额查询**（本函数）成立，对
+   * `credits.status` 那种只读单发的状态查询不成立（依据见 `collectCreditsStatus`）。
+   */
   for (const entry of accounts) {
     let balance: CreditBalance | null = null
     let error: string | undefined
@@ -1897,8 +1990,8 @@ async function fullCatalogIds(
  * 核对目录时的读取预算（毫秒）。
  *
  * 开关是**写操作**，不该被远端目录拉取拖住（见 `readableCatalogIds` 的注释）。
- * 取 2 秒：缓存已热时是纯内存读、立即返回；冷缓存下的正常远端��取也在秒级内
- * 完成，���过它说明上游正卡着 —— 此时放弃核对、照常写入开关。
+ * 取 2 秒：缓存已热时是纯内存读、立即返回；冷缓存下的正常远端读取也在秒级内
+ * 完成，超过它说明上游正卡着 —— 此时放弃核对、照常写入开关。
  * ⚠️ 不要为了「多拿到几次核对」而调大：这条预算**直接加在用户点开关的等待上**。
  */
 const CATALOG_READ_TIMEOUT_MS = 2000
@@ -2433,7 +2526,7 @@ function registerJetHubEndpoints(
       } catch (error) {
         // ⚠️ **绝不上抛**：续期失败不是「余额/领取失败」——凭据本来就已过期，
         // 直连上游必然 401，让整条积分行报「续期失败：…」反而比原来的
-        // 「账户信息查询失败：HTTP 401」更难懂。照常往下走、由上游���出真原因。
+        // 「账户信息查询失败：HTTP 401」更难懂。照常往下走、由上游给出真原因。
         // ⚠️ 文案**刻意不写「余额」**：本函数已同时服务 `credits.balances`
         // 与 `credits.claimAll` 两个端点，「照常查余额」在领取路径上是错的。
         ctx.logger?.warn?.(
@@ -2984,7 +3077,7 @@ function registerJetHubEndpoints(
       const own = await (async () => {
         // ⚠️ 用 try/catch 而不是 `.catch()`：替身 / 老实现可能**没有** `readCredential`
         //    方法，那时 `undefined(...)` 是**同步** TypeError，`.catch()` 接不住
-        //   （本仓库记���同型：`pool.listAccountsByProvider` 被当 Promise 用 ⇒
+        //   （本仓库记过同型：`pool.listAccountsByProvider` 被当 Promise 用 ⇒
         //    同步 throw 逃逸成一条 warn）。
         try {
           const fn = (auths.officeace as { readCredential?: unknown }).readCredential
@@ -4151,7 +4244,7 @@ function registerJetHubEndpoints(
            *
            * ## ⚠️ 两个站点合用一个分支（表驱动）
            *
-           * 国内站（`minimax`）与国际站（`minimaxintl`）**��号不互通、主机不同**，
+           * 国内站（`minimax`）与国际站（`minimaxintl`）**账号不互通、主机不同**，
            * 但登录流程逐步骤相同（只差 product 配置）⇒ 照 `qoderFamily` 的做法
            * 收成一张表，**不复制**第二个分支体。
            * 复制会让「登录成功后要回填哪些字段」「失败要删占位条目」这类约定
@@ -5539,7 +5632,13 @@ function registerJetHubEndpoints(
         }
 
         // ⚠️ `collectCreditsStatus` 逐账号 try/catch —— 单账号失败**不中断整体**，
-        //    这与「顺序查询避免并发风控」同属该骨架已验证的语义，**不要重写**。
+        //    这是该骨架已验证的语义，**不要重写**。
+        //
+        // ⚠️⚠️ **它已不是「顺序查询」了**（2026-10-22 改成有限并发，默认 3）：
+        //    原注释写「这与『顺序查询避免并发风控』同属该骨架已验证的语义，不要重写」
+        //    —— 而函数**就在那之后被重写了**，那条注释因此变成误导（下一个读者会照它
+        //    改回串行）。并发度的依据与代价见 `collectCreditsStatus` 函数体内那段注释。
+        //    签到（写操作）仍在 `collectClaimResults` 里**串行**，那一条没变。
         //
         // ⚠️ 第二参（product）统一传 `undefined`：它**只被透传给 `fetchStatus`**，
         //    而 `fetchStatus` 现在由 credits 表提供、自带各自的 product 配置，
@@ -6340,7 +6439,7 @@ function registerJetHubEndpoints(
         // 用户永远无法自行恢复（这正是上文 `withDeadModelPruning` 处列为必须避免的根因：
         // 「用户再也无法重新打开」）。
         //
-        // ⇒ 这里把 dead 表里的 id 补回目录，并带上 `dead: true` 让���户端灰显 +
+        // ⇒ 这里把 dead 表里的 id 补回目录，并带上 `dead: true` 让客户端灰显 +
         // 提供「重新显示」入口（`model.clearDead`）。**方向必须与黑名单相反**：
         // 失效模型**永远**列出（哪怕被用户关着），否则用户没有恢复路径。
         const dead = deadModelIdsFor(req.provider)
@@ -6608,7 +6707,7 @@ function registerJetHubEndpoints(
           //    「账号已停用，但关闭模型失败：该供应商没有可关闭的模型」。
           if (pending.length === 0) {
             ctx.logger.info(
-              `[jet-hub] ${req.provider} 的全部 ${catalog.ids.length} 个模型本就已关闭��无变更`,
+              `[jet-hub] ${req.provider} 的全部 ${catalog.ids.length} 个模型本就已关闭，无变更`,
             )
           } else if (!catalog.complete) {
             // 4. **有新增项但目录不完整** ⇒ 拒绝且不落盘。
@@ -7355,7 +7454,7 @@ function registerJetHubEndpoints(
        * **零余额查询**（规格 §8.3，有专门用例断言），而「按临期排序」必须探测
        * 才知道顺序。⇒ 分开：面板默认零探测，用户点按钮才走这里。
        *
-       * ⚠️ 未注册时回**空表**而不是���错：面板据此保持字母序并提示，
+       * ⚠️ 未注册时回**空表**而不是报错：面板据此保持字母序并提示，
        * 不影响其余功能（与 `aggregate.activeProvider` 的安静降级同取向）。
        *
        * ⚠️ `force`（可选，默认 false，2026-10-15 加）：`true` 时绕过**探针自己的**
@@ -7645,7 +7744,7 @@ function registerJetHubEndpoints(
        * ## 返回 `null` 的含义
        * 服务没起（`DSH_ZCODE_INTERNAL_CARRIER=0` / 候选端口全被占）。client 拿到
        * `null` 就记一条 `no-carrier-url` 并**安静返回**：不建 guest、不导航。
-       * ⚠ 这是 web 版之外的另一条「安静退出」路径，别把它��错误报。
+       * ⚠ 这是 web 版之外的另一条「安静退出」路径，别把它当错误报。
        */
       case 'captcha.carrierUrl': {
         // ⚠ 判一下方法存不存在：这条 RPC 允许「没有内部载体能力」的宿主形态（老插件
@@ -7940,7 +8039,7 @@ function registerJetHubEndpoints(
         /**
          * 关闭那行**常驻**的自动签到状态文字。
          *
-         * ⚠️ 与 `enabled` 分开判��不是「先 dismiss 再 enabled」：两者语义独立，
+         * ⚠️ 与 `enabled` 分开判而不是「先 dismiss 再 enabled」：两者语义独立，
          * 一次请求只该做一件事 —— 否则 `{ dismiss: true, enabled: true }` 会
          * 既关文字又改开关，客户端将来误传就难查。
          */
