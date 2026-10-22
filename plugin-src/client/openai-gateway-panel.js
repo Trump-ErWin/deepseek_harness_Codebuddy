@@ -29,6 +29,9 @@
  * @property {boolean} enabled 用户在设置页里的选择
  * @property {boolean} running 当前是否真的在监听端口
  * @property {boolean} blockedByEnv 是否被环境变量显式停用
+ * @property {boolean} allowLan 「允许局域网访问」开关（用户的选择，持久化）
+ * @property {boolean} hostFromEnv env 是否显式给了 DSH_OPENAI_GATEWAY_HOST
+ *   （此时局域网开关不生效，UI 必须禁用并说明）
  * @property {{ host: string, port: number } | null} address 实际监听地址
  * @property {ApiKeyInfo | null} [apiKey] 正在使用的凭据
  */
@@ -62,7 +65,7 @@ import { isFilterActive, matchesModelQuery } from './model-filter.js';
 // 「已对外暴露」，面板于是输出它自己声称要消除的那种**错误安全陈述**
 // （两轮独立审计各自实测到，2026-10-13）。
 // ⚠️ 该模块必须**零 node import**（它同时被 esbuild 打进浏览器 bundle）。
-import { formatGatewayHost, gatewayHttpUrl, isLoopbackHost } from '../../src/openai-gateway/config.js';
+import { formatGatewayHost, gatewayHttpUrl, isLoopbackHost, isWildcardHost } from '../../src/openai-gateway/config.js';
 
 export async function copyToClipboard(value) {
   try {
@@ -634,6 +637,28 @@ export function gatewayLoopbackOnly(status) {
 }
 
 /**
+ * `running: true` 但 `address === null`。
+ *
+ * ⚠️ **这是合法组合**（2026-10-22 对抗审计 m-1）：宿主侧 `running`（`isGatewayRunning()`）
+ * 与 `address`（`gatewayAddress()`）是**两次独立 `degrade`**，任一次抛错都会让对应字段为空
+ * ⇒「在跑」与「拿不到地址」可以同时成立。
+ *
+ * 旧实现在这种情况下会：
+ * - `isWildcardHost(undefined)` 抛 `TypeError` ⇒ **整个状态面板崩**（已修：
+ *   `normalizeHostForCompare` 对非字符串返回空串）；
+ * - 修了不崩之后仍会输出「只绑定 127.0.0.1」—— 而开关可能是**开着的**
+ *   ⇒ 又一条与事实相反的安全声明（IKL7UN 那条纪律：暴露面变了就必须明说）。
+ *
+ * ⇒ 判据：**地址未知时不得声称任何暴露面**，只能如实说「拿不到地址」。
+ */
+function gatewayAddressUnknown(status) {
+  if (status?.running !== true) return false;
+  const address = status?.address;
+  return address === null || address === undefined
+    || typeof (address).host !== 'string' || (address).host.trim() === '';
+}
+
+/**
  * 绑了**非回环**地址时的提示行（issue IKL7UN）。
  *
  * ## 为什么这条必须存在
@@ -664,9 +689,9 @@ export function gatewayLoopbackOnly(status) {
 export function nonLoopbackNotice(status) {
   const address = status?.address;
   const host = typeof address?.host === 'string' && address.host.trim() !== '' ? address.host : '非回环地址';
-  return `监听地址是 ${host}（不再是本机回环）：只应在容器/端口映射场景使用，`
-    + '此时同一容器网络内的其它容器与宿主都能连到这个端口。仅本机使用时把 '
-    + 'DSH_OPENAI_GATEWAY_HOST 改回 127.0.0.1（或删除该环境变量）并重启。';
+  return `监听地址是 ${host}（不再是本机回环）：只应在容器/端口映射或局域网共享场景使用，`
+    + '此时同一网络内的其它设备与宿主都能连到这个端口。仅本机使用时关掉「允许局域网访问」'
+    + '开关即可立即恢复；若地址来自 DSH_OPENAI_GATEWAY_HOST，把它改回 127.0.0.1 并重启。';
 }
 
 /**
@@ -691,11 +716,18 @@ export function nonLoopbackNotice(status) {
  * @returns {string}
  */
 export function gatewayFootnote(status) {
+  // ⚠️ **地址未知时不得声称任何暴露面**（2026-10-22 m-1）：
+  //    旧实现会落到最后那句「只绑定 127.0.0.1」，而开关可能开着 ⇒
+  //   与事实相反的安全声明。
+  if (gatewayAddressUnknown(status)) {
+    return '网关正在运行，但本次读不到它的监听地址 —— 无法确认它只绑了回环。'
+      + '若你打开了「允许局域网访问」，请按已开启对待（隔离只靠密钥）。';
+  }
   if (status?.running && !gatewayLoopbackOnly(status)) {
     const host = typeof status.address?.host === 'string' ? status.address.host : '非回环地址';
-    return `网关绑定在 ${host}，同一容器网络内的其它容器与宿主都能连到该端口 —— 隔离只靠密钥，`
-      + '不要把它配置进任何浏览器端工具或扩展。仅本机使用时把 DSH_OPENAI_GATEWAY_HOST '
-      + '改回 127.0.0.1（或删除该环境变量）并重启。';
+    return `网关绑定在 ${host}，同一网络内的其它设备与宿主都能连到该端口 —— 隔离只靠密钥，`
+      + '不要把它配置进任何浏览器端工具或扩展。仅本机使用时关掉「允许局域网访问」'
+      + '开关即可恢复；若地址来自 DSH_OPENAI_GATEWAY_HOST，把它改回 127.0.0.1 并重启。';
   }
   return '网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 —— 真正的隔离靠密钥，'
     + '不要把它配置进任何浏览器端工具或扩展。';
@@ -727,6 +759,12 @@ export function gatewayStatusLines(status) {
       '协议支持：OpenAI Chat Completions 与 OpenAI Responses API。',
       // 地址单列一行（带端口），它是用户要抄走的东西。
       endpoint ? `API 请求地址：${endpoint}` : '',
+      // ⚠️ 绑 0.0.0.0（局域网开关）时，抄走的字面量在任何设备上都连不上
+      // （0.0.0.0 不是一台具体设备的地址）——必须当场说明要换成什么。
+      // 判据复用宿主侧 isWildcardHost（与本文件其它 host 判据同源）。
+      isWildcardHost(status.address?.host)
+        ? '其它设备请把地址里的 0.0.0.0 换成本机的局域网 IP（ipconfig 可查）。'
+        : '',
       // ⚠️ 暴露面变了必须**明说**（issue IKL7UN）。原先「只绑定 127.0.0.1」是
       // 常量文案，host 可配之后它就是错误陈述 —— 用户会以为「外面连不上是
       // 设计如此」而放弃排查。反之，回环部署下**不加这句**，避免把刚精简过的
@@ -755,6 +793,87 @@ export function gatewayStatusLines(status) {
 export function gatewaySwitchDisabled(status) {
   if (!status) return true
   return status.blockedByEnv
+}
+
+/**
+ * 「允许局域网访问」开关是否可点。
+ *
+ * ⚠️ **只在 env 显式给了 `DSH_OPENAI_GATEWAY_HOST` 时禁用**：那一刻开关翻成
+ * 什么都改变不了监听地址（env 是运维口径，优先级更高），「打开了却没生效」比
+ * 「禁用并解释」更让人困惑 —— 与主开关被 `blockedByEnv` 禁用的同一取舍。
+ * 网关总开关关闭时**不禁用**：用户可以先选好，打开总开关时立即生效。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {boolean}
+ */
+export function gatewayAllowLanSwitchDisabled(status) {
+  if (!status) return true
+  return status.hostFromEnv === true
+}
+
+/**
+ * 「允许局域网访问」开关行下的说明文案。
+ *
+ * ⚠️ 两件事必须说清，否则用户要么不知道暴露面变了多大，要么不知道隔离靠什么：
+ * 1. 打开 = 绑 **0.0.0.0**（全部网卡），同一局域网的设备都能连到网关；
+ * 2. 隔离**只靠 API Key** —— 浏览器端工具/扩展不要配（面板脚注同款警告）。
+ *
+ * ⚠️ 纯文本，不得出现 `**`（会原样显示星号，见 `nonLoopbackNotice` 的同条理由）。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {string}
+ */
+export function gatewayAllowLanHint(status) {
+  if (!status) return ''
+  if (status.hostFromEnv) {
+    return '已由环境变量 DSH_OPENAI_GATEWAY_HOST 显式指定监听地址，本开关此刻不生效；'
+      + '删除该环境变量并重启 DSH 后才能用这里的选择。'
+  }
+  // ⚠️⚠️ **必须同时判 `running`**（2026-10-22 对抗审计 P2）。
+  //
+  // 只判 `allowLan` 会在「用户打开了开关、但网关总开关关着 / 端口被占 / env 停用」时
+  // 输出「**已监听**全部网卡」—— 而那是**错误的安全陈述**（谎报暴露），并把它与同一
+  // 弹窗里另外两条文案直接矛盾起来：
+  //   - `gatewayStatusLines` 说「网关已关闭，不会监听任何端口」；
+  //   - `gatewayFootnote` 说「网关只绑定 127.0.0.1」。
+  // ⇒ 三条文案对「现在到底在不在监听」给出三种答案。
+  //
+  // ⚠️ 这正是本仓 IKL7UN 反复记的那种「面板输出它自己声称要消除的错误安全陈述」，
+  //   只是方向反了（这次是**谎报暴露**而不是谎报安全）。
+  // ⚠️ 同一文件里 `gatewayAllowLanToggleNotice` **已经**判了 `running` ⇒ 这是
+  //   「同一语义两套判据」的实例，本次把 hint 这条补齐到同口径。
+  if (status.allowLan && status.running) {
+    return '已监听全部网卡（0.0.0.0）：同一局域网内的设备都能连到网关，隔离只靠 API Key'
+      + '——不要把它配置进任何浏览器端工具或扩展。'
+  }
+  if (status.allowLan) {
+    // 已选择但**没在监听** ⇒ 如实说「还没生效」，绝不谎报「已监听」。
+    return '已选择允许局域网访问（0.0.0.0），但网关当前没有在监听：'
+      + '打开网关总开关后才会真正绑定全部网卡。'
+  }
+  return '默认只绑定 127.0.0.1，仅本机能访问。打开后网关改绑 0.0.0.0，'
+    + '同一局域网内的设备可凭 API Key 连到网关。'
+}
+
+/**
+ * 局域网开关切换成功后的一句提示。
+ *
+ * @param {GatewayStatus | null | undefined} status 切换后的状态
+ * @param {boolean} nextAllowLan 用户想要的状态
+ * @returns {string}
+ */
+export function gatewayAllowLanToggleNotice(status, nextAllowLan) {
+  if (status?.hostFromEnv) {
+    return '选择已保存，但 DSH_OPENAI_GATEWAY_HOST 已显式指定监听地址，本开关此刻不生效。'
+  }
+  if (!nextAllowLan) {
+    if (status?.running) return `已恢复默认监听：${gatewayEndpoint(status)}`
+    return '已恢复只绑定 127.0.0.1（网关当前未在监听）。'
+  }
+  if (status?.running) {
+    return '已改绑 0.0.0.0：其它设备用「这台电脑的局域网 IP:8326/v1」+ API Key 访问。'
+  }
+  return '已选择允许局域网访问，但网关当前没有在监听（先打开网关总开关）。'
 }
 
 /**

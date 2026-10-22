@@ -25,13 +25,14 @@ import { AccountPool, asProxyText } from './account-pool.js'
 import { AUTO_PROVIDER as AUTO_PROVIDER_ID } from './auto-adapter.js'
 import { resolveAutoBadgeRewrite, type AutoBadgeState } from './auto-badge.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
-import { isGatewayEnabled } from './openai-gateway/config.js'
+import { isGatewayEnabled, isGatewayHostFromEnv } from './openai-gateway/config.js'
 import { collectGatewayEffortViews, collectGatewayModels, toGatewayModelIds, type GatewayModelSource } from './openai-gateway/models.js'
 import {
   applyGatewayDesiredState,
   gatewayAddress,
   gatewayApiKey,
   isGatewayRunning,
+  setGatewayDesiredAllowLan,
   setGatewayDesiredEnabled,
 } from './openai-gateway/runtime.js'
 import type { CodeArtsAuth } from './service.js'
@@ -135,6 +136,9 @@ import {
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import { MODELSCOPE } from './modelscope-product.js'
 import { maskModelscopeKey } from './modelscope.js'
+import { CODELY_PROVIDER_ID, startCodelyDeviceLogin, decodeCodelyJwtExpMs } from './codely-auth.js'
+import type { CodelyAuth } from './codely-auth-service.js'
+import { CODERLY } from './codely-product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -343,6 +347,7 @@ import type {
   RpcProviderSetEnabledResponse,
   RpcGatewayStatusResponse,
   RpcGatewaySetEnabledRequest,
+  RpcGatewaySetAllowLanRequest,
   RpcMinimaxXffRequest,
   RpcMinimaxXffResponse,
   RpcNativeSearchGetEnabledResponse,
@@ -1401,6 +1406,25 @@ export interface JetHubAuths {
    * 而按 id 查表（`authOf`）会把国际站账号分派到**国内站实例**上。
    */
   readonly minimaxintl: MinimaxAuth
+  /**
+   * Codely（Unity）的续期实例 —— **可选键**（2026-10-22 A6 接线）。
+   *
+   * ⚠️ 为何是**可选**而不是必填：它的接线需要同时改到 `index.ts` 的
+   * `auths` 对象、`SELF_HEAL_REFRESHABLE_PROVIDERS`、`jet-hub-store.ts` 的前缀表，
+   * 以及多张从注册表派生的守卫。写成**必填**会让下一个加 provider 的人
+   * 被迫同时改所有消费方（而那些消费方本来就应该按 `channel` 派生）。
+   * 缺它时：存在的 `refreshAccountCredential` / `refreshAll` 路径会跳过 codely（与各家同形）。
+   */
+  readonly codely?: CodelyAuth
+  /**
+   * ⚠️ **Codely 的键暂不在此声明**（2026-10-20）：接线必须**四处同时**做——
+   * ① 本接口加 `codely`；② `index.ts` 的 auths 对象传值；
+   * ③ `SELF_HEAL_REFRESHABLE_PROVIDERS` 加 `CODERLY.id`；
+   * ④ `jet-hub-rpc-auth-wiring.spec` 的 17→18 与 `refreshAll` 14→15 计数。
+   * 缺任一处都会让「接口↔运行时交叉校验」变红（本轮实测：只加接口 ⇒ 2 条红）。
+   * 续期实现已就绪（`src/codely-auth-service.ts` 的 `CodelyAuth`），
+   * 推理与目录都不依赖它 ⇒ 不接也不影响使用。
+   */
   readonly zcode: ZcodeAuth
   readonly gemini: GeminiAuth
   /**
@@ -2301,6 +2325,16 @@ function registerJetHubEndpoints(
     //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
     //    只需一次 refresh，且**日志零字**。
     AUTOCLAW_INTL.id,
+    // ⚠️⚠️ codely（Unity，2026-10-22 A6 接线）：**有**真实 refresh 端点
+    //    `POST /auth/refresh {refresh_token}`（实测 200，且 `refresh_token` **不轮换**）
+    //    ⇒ 不属 loomy / zcode 那类「设计上没有 refresh 端点」的豁免。
+    //    凭据形态：`access_token` 是 JWT（实测寿命约 365 天）+ `refresh_token`，
+    //    与各家同形 ⇒ 过期后靠本表自愈，而不是用户手动重登。
+    //    ⚠️ 漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
+    //    只需一次 refresh，且**日志零字**。
+    //    ⚠️ 它之前不在本表里的**真正**原因不是「不需要」，而是「`CodelyAuth` 当时连
+    //    契约都没对上（`refreshAll` 是 2 参）」—— 见 A5 的修。
+    CODERLY.id,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
     //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
     //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
@@ -3838,6 +3872,40 @@ function registerJetHubEndpoints(
             void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
           }
         }
+        // ⚠️ **Codely 自愈回填**（2026-10-19，OfficeAce 同款「列表时补算」）：
+        //    `expiresAt` 回填是修复「卡片恒显示未知」时加的，修复前登录的
+        //    池条目缺这个字段（凭据里也没有 `expires_at`）。判据有两层：
+        //    ① 新凭据（修复后落盘）带 `expires_at`（ISO 字符串）⇒ 直接解析；
+        //    ② 旧凭据（修复前落盘）没有该字段 ⇒ 解码 access_token 的 JWT
+        //       `exp`（上游自己签发的权威过期时刻，不是猜测）。
+        //    两层都拿不到才跳过（绝不写 NaN / 0，那会让卡片显示「已过期」）。
+        // ⚠️ 与 OfficeAce 同款纪律：**逐账号按自己的 ref resolve**（多账号
+        //    广播 = A 的有效期显示成 B 的，本仓库已复发过 7 次的那类错位）。
+        if (req.provider === CODELY_PROVIDER_ID && accounts.some((a) => a.expiresAt === undefined)) {
+          for (const account of accounts) {
+            if (account.expiresAt !== undefined) continue
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+              .catch(() => null)
+            if (!resolved) continue
+            let expiresAt = Number.NaN
+            try {
+              const credential = JSON.parse(resolved.value) as { expires_at?: unknown; access_token?: unknown }
+              if (typeof credential.expires_at === 'string') {
+                expiresAt = Date.parse(credential.expires_at)
+              }
+              // 旧凭据没有 expires_at：退回解码 access_token 的 JWT exp。
+              if (!Number.isFinite(expiresAt) || expiresAt <= 0) {
+                const decoded = typeof credential.access_token === 'string'
+                  ? decodeCodelyJwtExpMs(credential.access_token)
+                  : undefined
+                if (decoded !== undefined) expiresAt = decoded
+              }
+            } catch { /* 凭据不是合法 JSON ⇒ 跳过该账号 */ }
+            if (!Number.isFinite(expiresAt) || expiresAt <= 0) continue
+            account.expiresAt = expiresAt
+            void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
+          }
+        }
         return { ok: true, value: { accounts: await enrichAccountIdentity(accounts, req.provider) } }
       }
 
@@ -3932,7 +4000,49 @@ function registerJetHubEndpoints(
             // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
             void failLogin(id, error)
           })
-          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+
+          // ⚠️⚠️ **宿主侧直接拉起无痕窗口**（2026-10-21，用户报障「新建账号会缓存
+          //    上一个账号的登录信息并自动登录」）：与 OfficeAce（2026-10-13）**完全
+          //    同型** —— CodeArts 的授权页也在华为云 SSO 域（新式 IAM OAuth 是
+          //    `codearts.huaweicloud.com/portal/authorize`，老 ticket 流程则是
+          //    `auth.huaweicloud.com/authui/login.html`），华为 authui 会**静默复用
+          //    浏览器已有会话** ⇒ 客户端 `window.open` 带着上一账号的 cookie 打开
+          //    授权页直接放行、看不到登录框 ⇒「新建账号」永远只能建出同一个号。
+          //
+          //    ## 为什么无痕窗口 = 本需求里的「彻底清除缓存与登录状态」
+          //
+          //    授权页会话的全部载体（cookie、localStorage、sessionStorage、HTTP
+          //    cache）都活在 **cookie jar（profile 目录）**里 ⇒ 换 jar = 清零：
+          //    独立 `--user-data-dir` + `--incognito` 的全新 profile 里这些存储
+          //    **天生为空**（不是「事后删」，是「从未有过」），上一账号的任何信息
+          //    都不可能被复用或自动填充。
+          //
+          //    ## 刻意**不做**的两件事（与 OfficeAce 同款取舍）
+          //
+          //    - **不清账号池/凭据**：已登录的 CodeArts 账号照常可用，本修复只保证
+          //      「新建」这一条流程是全新会话 —— 清凭据会把用户在用的账号一起毁掉；
+          //    - **不走 `authui/logout`**：它的作用域是整个华为云域（实测
+          //      `Set-Cookie` 含 `cloud_verify_ticket` 清除、`IAMIdentity` 重写），
+          //      会**连带登出用户日常浏览器里的华为云控制台**。
+          //
+          //    ## 时机与顺序（两步式不变）
+          //
+          //    `startLogin`（生成 PKCE / 回调端口）→ `addAccount` 占位 → 注册后台
+          //    收口 → **此处同步拉起无痕窗**（仍在用户点击的 transient activation
+          //    窗口内，无额外等待）→ 返回 `loginUrl + incognitoOpened`。客户端按
+          //    `incognitoOpened === true` 跳过自己的 `window.open`、直接进入轮询。
+          //
+          //    ⚠️ 客户端**无法**自己做这件事：`window.open` 不能请求无痕模式（那是
+          //    进程级启动参数），故必须由宿主 `spawn` 浏览器可执行文件。
+          //    ⚠️ 打开失败（读不到默认浏览器 / spawn 失败）时返回 `false`，客户端
+          //    据此回退到自己的 `window.open` —— 不让「换个打开方式」变成
+          //    「开不了窗口」。
+          const incognitoOpened = openIncognitoWindow(started.loginUrl)
+
+          return {
+            ok: true,
+            value: { accountId: id, loginUrl: started.loginUrl, incognitoOpened },
+          }
         } else if (provider === LOBSTERAI.id) {
           // LobsterAI 与 codearts 同款：回调式登录 + 两步式返回，
           // 理由见上面的 codearts 分支（弹窗拦截导致主页面被跳转）。
@@ -4793,6 +4903,65 @@ function registerJetHubEndpoints(
             })
 
           return { ok: true, value: { accountId: id, loginUrl: astudioStarted.loginUrl } }
+        } else if (provider === CODELY_PROVIDER_ID) {
+          // Codely（Unity 团结引擎）是**设备码轮询**登录（与 Qoder / Cline 同款：
+          // 不开本地回调服务器，用户在浏览器完成 Unity 账号授权）。
+          // 协议三步：initiate → poll（status 状态机）→ exchange，
+          // 证据与字段名见 `src/codely-auth.ts` 的模块头（2026-10-19 实测/逆向）。
+          //
+          // ⚠️ 两步式（先返回 loginUrl 再后台轮询）理由与 codearts 同款：
+          //    `window.open` 只在用户手势窗口内有效。loginUrl 用
+          //    `verification_uri_complete`（带 user_code，用户免手输）。
+          //
+          // ⚠️ **本分支没有 XxxAuth 服务**（registry 里 codely `channel:false`、
+          //    `JetHubAuths` 无键）：登录本身不依赖 auth 服务，直接调
+          //    `startCodelyDeviceLogin` 纯函数，凭据也由它落盘（传完整 ref）。
+          //    接线清单见 `provider-registry.ts` 里 codely 条目的注释。
+          const started = await (async () => {
+            try {
+              return await startCodelyDeviceLogin({
+                ref: credentialRef(refName),
+                credentials: ctx.credentials,
+              })
+            } catch (error) {
+              // initiate 本身就失败（网络不可达 / 服务端异常）：此时占位条目
+              // **尚未登记**，直接报错即可，不留任何需要清理的中间态。
+              // 文案点明 provider，排障者不用猜是哪一跳失败（与 codearts /
+              // accio 分支的包装同款）。
+              const reason = error instanceof Error ? error.message : String(error)
+              throw new Error(`无法启动 Codely 登录（设备码授权请求失败）：${reason}`)
+            }
+          })()
+          // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
+          // 登录成功后再回填昵称等真实字段。
+          await pool.addAccount({
+            id,
+            provider: CODELY_PROVIDER_ID,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          started.result.then(async (loginResult) => {
+            await pool.updateAccount(id, {
+              nickname: loginResult.nickname !== undefined && loginResult.nickname.length > 0
+                ? loginResult.nickname
+                : id,
+              // ⚠️ access_token 的 JWT `exp`（见 decodeCodelyJwtExpMs）——
+              //    缺省时**不写**（卡片如实显示「未知」，不编造过期时间）。
+              ...(loginResult.expiresAt === undefined ? {} : { expiresAt: loginResult.expiresAt }),
+              // ⚠️ `refreshable` 刻意恒 false：`account.refresh` 的分派查
+              //    `authOf(auths, 'codely')`（`JetHubAuths` 的键），现在没有 ——
+              //    置 true 会让续期按钮发出必然报「不支持续期」的请求。
+              //    适配器接线、`JetHubAuths` 加键时一并改（见 registry 注释清单）。
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background codely login failed for ${id}: ${String(error)}`)
+            // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
+            void failLogin(id, error)
+          })
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -7560,6 +7729,9 @@ function registerJetHubEndpoints(
           enabled: await degrade('开关状态', () => pool.gatewayEnabled(), true),
           running: await degrade('运行态', () => isGatewayRunning(), false),
           blockedByEnv,
+          // 局域网开关与其是否被 env host 覆盖（UI 据此禁用开关并说明原因）。
+          allowLan: await degrade('局域网开关', () => pool.gatewayAllowLan(), false),
+          hostFromEnv: await degrade('env host', () => isGatewayHostFromEnv(process.env), false),
           // 被 env 停用时即使 `enabled` 为真也不会监听，此时**不**回显地址，
           // 否则设置页会显示一个根本连不上的 URL。
           address,
@@ -7624,6 +7796,66 @@ function registerJetHubEndpoints(
           enabled: req.enabled,
           running: isGatewayRunning(),
           blockedByEnv,
+          allowLan: pool.gatewayAllowLan(),
+          hostFromEnv: isGatewayHostFromEnv(process.env),
+          address: blockedByEnv ? null : gatewayAddress() ?? null,
+          apiKey: key === null ? null : { value: key.value, fromEnv: key.fromEnv, path: key.path },
+          models,
+          modelsSource,
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * ── 「允许局域网访问」开关（2026-10-20）──
+       *
+       * 语义：**开** = 网关绑 `0.0.0.0`（全部网卡，局域网可达）；**关** = 只绑
+       * 回环/env 配置的本机地址。⚠️ env 显式给了 `DSH_OPENAI_GATEWAY_HOST` 时
+       * 本开关**不生效**（env 是运维口径，优先级更高）——此时仍照常落盘用户的
+       * 选择，但日志与 status 的 `hostFromEnv` 会把这件事带回 UI。
+       */
+      case 'gateway.setAllowLan': {
+        const req = payload as RpcGatewaySetAllowLanRequest
+        // ⚠️ 与 `gateway.setEnabled` 同约定：不做默认值猜测 —— 默认成 true 会
+        // 静默把网关暴露给整个网络。
+        if (typeof req.allowLan !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 allowLan 必填' } }
+        }
+        // 先落盘再换绑（与 `gateway.setEnabled` 同序）：换绑失败（端口被旧连接
+        // 占用等）不该让已写入的选择回滚成「看起来没生效」。
+        await pool.setGatewayAllowLan(req.allowLan)
+        setGatewayDesiredAllowLan(req.allowLan)
+        await applyGatewayDesiredState()
+        const blockedByEnv = !isGatewayEnabled(process.env)
+        const hostFromEnv = isGatewayHostFromEnv(process.env)
+        ctx.logger.info(
+          `[jet-hub] ${req.allowLan ? '打开' : '关闭'}网关「允许局域网访问」`
+            + `${hostFromEnv ? '（已被 DSH_OPENAI_GATEWAY_HOST 覆盖，本开关不生效）' : ''}`
+            + `${blockedByEnv ? '（网关整体已被 DSH_OPENAI_GATEWAY_ENABLED 停用）' : isGatewayRunning() ? '' : '（网关未在监听）'}`,
+        )
+        const key = gatewayApiKey()
+        const llm = llmServiceOf(ctx)
+        // 网关在跑 ⇒ 实例可能刚被重建，目录照 setEnabled 的口径重新采集；
+        // 网关没跑（被关/env 停用）时开关只落盘，不采目录。
+        const gatewayOn = !blockedByEnv && pool.gatewayEnabled()
+        const providers = gatewayOn ? providerIdsOf(llm, modelAdapters) : undefined
+        const modelsSource: RpcGatewayStatusResponse['modelsSource'] = !gatewayOn
+          ? 'none'
+          : (llm?.listProviders !== undefined ? 'catalog' : (Object.keys(modelAdapters ?? {}).length > 0 ? 'adapters' : 'none'))
+        const models = providers === undefined
+          ? []
+          : await collectGatewayCatalog(llm, providers, (provider, error) => {
+            ctx.logger.warn(`[jet-hub] ${provider} 模型目录读取失败，已从网关列表跳过：${String(error)}`)
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] gateway.setAllowLan 的模型目录刷新失败：${String(error)}`)
+            return [] as RpcGatewayModel[]
+          })
+        const value: RpcGatewayStatusResponse = {
+          enabled: pool.gatewayEnabled(),
+          running: isGatewayRunning(),
+          blockedByEnv,
+          allowLan: pool.gatewayAllowLan(),
+          hostFromEnv,
           address: blockedByEnv ? null : gatewayAddress() ?? null,
           apiKey: key === null ? null : { value: key.value, fromEnv: key.fromEnv, path: key.path },
           models,

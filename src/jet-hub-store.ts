@@ -178,6 +178,19 @@ export interface JetHubState {
    */
   gatewayEnabled?: boolean
   /**
+   * 「允许局域网访问」开关（2026-10-20）：`true` = 网关绑 `0.0.0.0`（全部网卡，
+   * 局域网可达）；`false`/缺键 = 只绑回环或 env 配置的本机地址。
+   *
+   * ⚠️ 缺键语义为**关闭**（与 `gatewayEnabled` 的「缺键即启用」**刻意相反**）：
+   * 暴露面变大必须是用户的显式选择——老文档没有这个键、被手工改坏、或旧版本
+   * 代码整体重写时丢了本键，都必须回到「只绑回环」的安全默认。丢键的后果仅是
+   * 用户重新打开一次开关（可逆），而反方向的丢键（静默回到全网卡监听）是
+   * 未授权暴露。
+   *
+   * ⚠️ 与 `gatewayEnabled` 同级、可以住在这里：丢键后果可逆且用户可见。
+   */
+  gatewayAllowLan?: boolean
+  /**
    * 渠道原生搜索总开关（`false` = 全部搜索回官方 provider）。
    *
    * 「原生搜索」指支持它的渠道（CodeBuddy / WorkBuddy）用**自己后端的搜索接口**
@@ -336,6 +349,8 @@ const jetHubSchema = Schema.object({
   disabledModels: Schema.dict(Schema.any()).default({}),
   loomyPermanentLocked: Schema.boolean().default(false),
   gatewayEnabled: Schema.boolean().default(true),
+  // 「允许局域网访问」：默认关闭（暴露面变大必须是显式选择）。
+  gatewayAllowLan: Schema.boolean().default(false),
   nativeWebSearchEnabled: Schema.boolean().default(true),
   // 缺键 = 显示侧栏入口（升级前的行为是「没有这一行」，但缺键时显示它
   // 才是用户装上就看到入口的默认；关掉是一个显式动作，见 `sanitizeSidebarEntryEnabled`）。
@@ -364,6 +379,19 @@ const jetHubSchema = Schema.object({
  */
 export function sanitizeGatewayEnabled(raw: unknown): boolean {
   return raw !== false
+}
+
+/**
+ * 归一化「允许局域网访问」开关。
+ *
+ * ⚠️ 方向与 {@link sanitizeGatewayEnabled} **刻意相反**：只有显式 `true` 才算
+ * 打开，其余（缺键 / `false` / 字符串 / 对象 / 数组）一律按**关闭**处理。
+ * 理由：它把网关暴露给整个网络，丢失/脏值必须回到「只绑回环」的安全默认——
+ * 反过来（缺键即开启）会让任何一次读取失败都变成**未授权暴露**，而用户对此
+ * 毫无知觉。
+ */
+export function sanitizeGatewayAllowLan(raw: unknown): boolean {
+  return raw === true
 }
 
 /**
@@ -942,6 +970,7 @@ class SettingsStore implements JetHubStore {
         aggregateOrderMode?: unknown
         loomyPermanentLocked?: unknown
         gatewayEnabled?: unknown
+        gatewayAllowLan?: unknown
         nativeWebSearchEnabled?: unknown
         sidebarEntryEnabled?: unknown
         providerOrder?: unknown
@@ -963,6 +992,8 @@ class SettingsStore implements JetHubStore {
       loomyPermanentLocked: value.loomyPermanentLocked === true,
       // 老文档没这个键 → 启用，与升级前行为一致。
       gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+      // 老文档没这个键 → 关闭（安全默认：暴露面变大必须是显式选择）。
+      gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
       // 老文档没这个键 → 启用（原生搜索本就是新功能，默认开启才符合「装上就能用」）。
       nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
       // 老文档没这个键 → 显示侧栏入口（见 `sanitizeSidebarEntryEnabled` 的方向说明）。
@@ -1004,6 +1035,10 @@ class SettingsStore implements JetHubStore {
       loomyPermanentLocked: state.loomyPermanentLocked === true,
       // 开关丢失只会让网关回到默认启用（可逆），故接受老版本重写时丢掉本键。
       gatewayEnabled: state.gatewayEnabled !== false,
+      // ⚠️ **必须带上本键**（与上一行同因）：`replace` 是整体替换语义 —— 漏键会让
+      // 用户打开的「允许局域网访问」在任何一次其它写入时被抹掉，重启后**静默
+      // 回到只绑回环**（可逆但用户会以为坏了）。缺键语义为关闭（安全默认）。
+      gatewayAllowLan: state.gatewayAllowLan === true,
       // ⚠️ **必须带上本键**（真实缺陷，PR95 审计实测证伪）：
       //    `replace` 是**整体替换**语义 —— 漏掉本键会让用户明确关闭的「渠道原生
       //    搜索」在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
@@ -1138,6 +1173,11 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   // 漏加 = `ASTUDIO_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
   ['ASTUDIO', 'astudio'],
+  // ⚠️ Codely（Unity，2026-10-19）：**UI 先行阶段**就提前登记（registry 里该条
+  //    `channel: false`，但恢复表守卫按**全量** registry 派生、只豁免 aggregate
+  //    —— 漏加会让 `jet-hub-store.spec.ts` 的派生用例变红）。账号 ref 形态沿用
+  //    统一规则 `CODELY_ACCOUNT_${suffix}`（`account.create` 的前缀规则）。
+  ['CODELY', 'codely'],
   // ⚠️ 第 19 个 provider（autoclawintl，2026-10-20）—— 同款坑第 **七** 次。
   // 漏加 = `AUTOCLAWINTL_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
@@ -1253,6 +1293,7 @@ class FileStore implements JetHubStore {
         aggregateOrderMode?: unknown
         loomyPermanentLocked?: unknown
         gatewayEnabled?: unknown
+        gatewayAllowLan?: unknown
         nativeWebSearchEnabled?: unknown
         sidebarEntryEnabled?: unknown
         providerOrder?: unknown
@@ -1272,6 +1313,8 @@ class FileStore implements JetHubStore {
         loomyPermanentLocked: value.loomyPermanentLocked === true,
         // 老文档没这个键 → 启用，与升级前行为一致。
         gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+        // 老文档没这个键 → 关闭（安全默认，与读站点 A 同判据）。
+        gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
         // 老文档没这个键 → 启用，与升级前行为一致。
         nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
         // 老文档没这个键 → 显示侧栏入口（与 `SettingsStore` 同一判据）。
@@ -1333,6 +1376,8 @@ class FileStore implements JetHubStore {
         loomyPermanentLocked: false,
         // 恢复出的文档本来就不含任何开关信息 → 启用（与全新安装一致）。
         gatewayEnabled: true,
+        // 同上：恢复出的文档不含局域网开关信息 → 关闭（安全默认，与全新安装一致）。
+        gatewayAllowLan: false,
         // 同上：恢复出的文档不含原生搜索开关信息 → 启用（与全新安装一致）。
         nativeWebSearchEnabled: true,
         // 同上：恢复出的文档不含侧栏入口开关信息 → 显示入口（与全新安装一致）。

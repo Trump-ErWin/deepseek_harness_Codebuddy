@@ -345,6 +345,14 @@ export class AccountPool {
    */
   private gatewayEnabledCache = true
   /**
+   * 「允许局域网访问」开关的进程内副本（2026-10-20）。
+   *
+   * 缺键语义为**关闭**（与 {@link gatewayEnabledCache} 的「缺键即启用」刻意
+   * 相反）：暴露面变大必须是用户的显式选择，任何读取失败/丢键都回到只绑回环。
+   * 丢失后果可逆（重开一次开关），不需要独立文档。
+   */
+  private gatewayAllowLanCache = false
+  /**
    * 「渠道原生搜索」总开关的进程内副本（`false` = 全部搜索回官方 provider）。
    *
    * 缺键语义是**启用**（与 {@link gatewayEnabledCache} 同一方向）：老文档没有
@@ -477,6 +485,9 @@ export class AccountPool {
       this.aggregateOrderModeCache = state.aggregateOrderMode === 'manual' ? 'manual' : 'expiry'
       // 网关开关同理：老文档没有该键 → 保持默认启用。
       this.gatewayEnabledCache = state.gatewayEnabled !== false
+      // 局域网开关同理：老文档没有该键 → 保持默认关闭（安全默认，暴露面变大
+      // 必须是显式选择）。与 store 侧 `sanitizeGatewayAllowLan` 同一判据。
+      this.gatewayAllowLanCache = state.gatewayAllowLan === true
       // 原生搜索总开关同理：老文档没有该键 → 保持默认启用。
       this.nativeWebSearchCache = state.nativeWebSearchEnabled !== false
       // 侧栏入口开关同理：老文档没有该键 → 保持默认显示入口。
@@ -579,6 +590,10 @@ export class AccountPool {
         // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
         // 分两次快照会让同一份文档里的字段互相矛盾。
         gatewayEnabled: this.gatewayEnabledCache,
+        // ⚠️ 必须与上面取自同一时刻的快照（replace 是整体替换语义）：
+        //    漏键 ⇒ 用户打开的「允许局域网访问」在任何一次其它写入时被抹掉，
+        //    重启后静默回到只绑回环（用户会以为开关坏了）。
+        gatewayAllowLan: this.gatewayAllowLanCache,
         nativeWebSearchEnabled: this.nativeWebSearchCache,
         // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
         //    漏键会让用户关掉的侧栏入口在**任何**一次账号/黑名单/网关/顺序写入时
@@ -1029,6 +1044,36 @@ export class AccountPool {
     this.loaded = true
     if (this.store.kind === 'memory') {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，网关开关仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
+  }
+
+  /**
+   * 「允许局域网访问」开关当前是否打开。
+   *
+   * 缺键语义为**关闭**（安全默认：暴露面变大必须是显式选择），见
+   * {@link gatewayAllowLanCache}。
+   */
+  gatewayAllowLan(): boolean {
+    this.ensureLoaded()
+    return this.gatewayAllowLanCache
+  }
+
+  /**
+   * 打开/关闭「允许局域网访问」并落盘。
+   *
+   * ⚠️ 与 {@link setGatewayEnabled} 同约定：只改状态，不重建 HTTP server ——
+   * 换绑（关旧实例 → 建新实例）由 `src/openai-gateway/runtime.ts` 在调用方
+   * 做完持久化后接手。
+   */
+  async setGatewayAllowLan(allowLan: boolean): Promise<void> {
+    this.ensureLoaded()
+    if (this.gatewayAllowLanCache === allowLan) return
+    this.gatewayAllowLanCache = allowLan
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，局域网开关仅本次会话有效')
       return
     }
     await this.queueStoreSave()

@@ -272,6 +272,16 @@ const ASTUDIO_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53
  */
 const AUTOCLAW_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0Ij48cmVjdCB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHJ4PSI1IiBmaWxsPSIjNDM2MWVlIi8+PHBhdGggZD0iTTcgOGwzIDNsLTItNG00IDBsMyA0bC0yLTNtNCAwbDMgNWwtMi00IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PC9zdmc+';
 
+/**
+ * Codely（Unity 团结引擎）面板图标（内联 SVG data URL，手绘）。
+ *
+ * ⚠️ **本 fork 独有**的 provider（UI 先行阶段，见 registry 里 codely 条目的注释）。
+ * 与 Qoder / ModelScope 同款做法：走内联 SVG（体积小、无色差、20×20 下清晰）。
+ * 图形：深灰圆角方块 + 白色 U 字形 + 右上一枚 Unity 风格的浅绿点。
+ * ⚠️ 图形自带不透明底 ⇒ `jet-hub-styles.js` 里对应 logoClass 用 transparent 容器。
+ */
+const CODELY_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzI0MjQyNCIvPjxwYXRoIGQ9Ik03IDZ2OGE1IDUgMCAwIDAgMTAgMFY2aC0yLjV2Ny44YTIuNSAyLjUgMCAwIDEtNSAwVjZaIiBmaWxsPSIjZmZmIi8+PGNpcmNsZSBjeD0iMTYuNiIgY3k9IjcuMiIgcj0iMS4zIiBmaWxsPSIjOUFFMjJFIi8+PC9zdmc+';
+
 export const PROVIDER_ICONS = {
   codearts: CODEARTS_ICON,
   buddy: CODEBUDDY_ICON,
@@ -301,4 +311,15 @@ export const PROVIDER_ICONS = {
   autoclawintl: AUTOCLAW_ICON,
   modelscope: MODELSCOPE_ICON,
   aggregate: AGGREGATE_ICON,
+  // ⚠️ Codely（Unity，本 fork 独有）：UI 先行阶段（registry 里 channel:false），
+  //    但图标键集合守卫按**全量** registry 比对 —— 漏加这行会红（而非渲染空白图标）。
+  //
+  //    ⚠️⚠️ **本行必须留在 `}` 之前、且不得与上面的键重复**（2026-10-22 合并审计）：
+  //    PR #1 的 `b69e6736 feat(codely)` 在追加本行时，把 `autoclaw` / `modelscope` /
+  //    `aggregate` 三个键**又抄了一遍**（缩进也丢了）。重复键在 JS 里是「后者胜」，
+  //    键集合不变 ⇒ **上面那条 `Object.keys()` 守卫照样全绿**，只有 esbuild 的
+  //    `duplicate-object-key` 警告能发现它。三个值恰好相同所以当时没有功能后果，
+  //    但「守卫全绿 + 有警告」这种组合正是本仓库记过的「假绿」形态：
+  //    一旦哪天两处值不同，就会变成静默用错图标而无人报警。
+  codely: CODELY_ICON,
 };

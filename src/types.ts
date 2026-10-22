@@ -1547,6 +1547,19 @@ export interface RpcGatewayStatusResponse {
   running: boolean
   /** 是否被 `DSH_OPENAI_GATEWAY_ENABLED` 显式停用（此时设置页改开关无效）。 */
   blockedByEnv: boolean
+  /**
+   * 「允许局域网访问」开关（持久化状态，2026-10-20）。
+   *
+   * `true` = 用户选择绑 `0.0.0.0`；`false` = 只绑回环/env 地址。⚠️ 与
+   * {@link hostFromEnv} 同看：env 显式给了 host 时本开关不生效，UI 必须明说。
+   */
+  allowLan: boolean
+  /**
+   * env 是否显式给了 `DSH_OPENAI_GATEWAY_HOST`（运维口径，优先于上面的开关）。
+   * 为 `true` 时设置页应禁用局域网开关并说明原因——「打开了却没生效」比
+   * 「禁用并解释」更让人困惑（与 `blockedByEnv` 禁用主开关的同一取舍）。
+   */
+  hostFromEnv: boolean
   /** 实际监听地址；未运行或被 env 停用时为 `null`。 */
   address: { host: string; port: number } | null
   /**
@@ -1638,6 +1651,11 @@ export interface RpcGatewayModel {
 /** RPC: 本机 OpenAI 网关开关写入请求。 */
 export interface RpcGatewaySetEnabledRequest {
   enabled: boolean
+}
+
+/** RPC: 「允许局域网访问」开关写入请求（响应 = 整份 {@link RpcGatewayStatusResponse}）。 */
+export interface RpcGatewaySetAllowLanRequest {
+  allowLan: boolean
 }
 
 /** RPC: 「渠道原生搜索」开关的读取响应。 */

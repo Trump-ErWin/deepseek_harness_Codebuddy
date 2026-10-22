@@ -5,6 +5,9 @@ import { fileURLToPath } from 'node:url'
 import {
   copyToClipboard,
   formatModelIdList,
+  gatewayAllowLanHint,
+  gatewayAllowLanSwitchDisabled,
+  gatewayAllowLanToggleNotice,
   gatewayApiKeyHint,
   gatewayButtonLabel,
   gatewayButtonTitle,
@@ -182,6 +185,42 @@ describe('本机网关面板的文案与判定', () => {
    *
    * 判据用**真实函数的返回值**（而不是源码文本），对实现方式中立。
    */
+  /**
+   * ★★ **`running: true` + `address: null` 不得崩、也不得说反话**
+   * （2026-10-22 对抗审计 m-1）。
+   *
+   * ## 为什么这是**合法组合**而不是脏数据
+   *
+   * 宿主侧 `running`（`isGatewayRunning()`）与 `address`（`gatewayAddress()`）是
+   * **两次独立 `degrade`**，任一次抛错都让对应字段为空。
+   *
+   * ## 两条真缺陷（实测）
+   *
+   * 1. **崩**：`isWildcardHost(undefined)` 走 `normalizeHostForCompare` 抛
+   *    `TypeError: Cannot read properties of undefined (reading 'normalize')`
+   *    ⇒ 整个网关状态面板直接不渲染（用户只看到一片空白）。
+   * 2. **说反话**：修了不崩之后，`gatewayFootnote` 仍落到「只绑定 127.0.0.1」
+   *    那句，而「允许局域网访问」开关可能是**开着的** ⇒ 又一条与事实
+   *    相反的安全声明（正是 IKL7UN 那条纪律要消除的）。
+   *
+   * ⚠️ 判据分两层：**不崩**（两个函数都能返回）+ **不说反话**
+   * （不得出现「只绑定 127.0.0.1」）。只测第一层会让第二条漏掉。
+   */
+  it('★★ running:true + address:null 不崩、且不得声称「只绑定 127.0.0.1」', () => {
+    const unknown = { ...RUNNING, allowLan: true, address: null }
+    // ① 不崩（两个入口都要跑一遍）
+    expect(() => gatewayFootnote(unknown)).not.toThrow()
+    expect(() => gatewayStatusLines(unknown)).not.toThrow()
+    // ② 不得说反话
+    expect(
+      gatewayFootnote(unknown),
+      '地址未知时不得声称只绑了回环（开关可能开着）',
+    ).not.toContain('只绑定 127.0.0.1')
+    // ③ 修法本身也要有城市：必须如实说「读不到地址」
+    expect(gatewayFootnote(unknown)).toContain('读不到它的监听地址')
+    // ④ 反向对照：正常回环仍必须说「只绑定 127.0.0.1」
+    expect(gatewayFootnote(RUNNING), '不得把回环那句改掉').toContain('只绑定 127.0.0.1')
+  })
   it('★★ 面板文案一律不得含 markdown 标记（星号会原样显示）', () => {
     const bridged = { ...RUNNING, address: { host: '172.21.0.8', port: 8326 } }
     const texts = [
@@ -1433,5 +1472,142 @@ describe('供应商卡片的折叠', () => {
   it('脏输入退化为展开（宁可多显示，也不要藏起来）', () => {
     expect(gatewayCardExpanded(null)).toBe(true)
     expect(gatewayCardExpanded({})).toBe(true)
+  })
+})
+
+/**
+ * 「允许局域网访问」开关（2026-10-20）的判定与文案。
+ *
+ * ⚠️ 安全文案的两条既有规矩在这里继续生效：
+ * 1. **不得出现 `**`**（React 文本节点会原样显示星号）；
+ * 2. 非回环警告**必须点名宿主**（红队 netns 实测宿主可达，只说「同网络设备」
+ *    会把它漏掉 —— 既有用例守着这条）。
+ */
+describe('「允许局域网访问」开关的判定与文案', () => {
+  const base = { enabled: true, running: true, blockedByEnv: false } as const
+
+  it('★ 只在 env 显式给了 host 时禁用（那一刻翻开关改变不了监听地址）', () => {
+    expect(gatewayAllowLanSwitchDisabled(null)).toBe(true)
+    expect(gatewayAllowLanSwitchDisabled({ ...base, allowLan: false, hostFromEnv: false, address: null })).toBe(false)
+    expect(gatewayAllowLanSwitchDisabled({ ...base, allowLan: false, hostFromEnv: true, address: null })).toBe(true)
+    // ⚠️ 网关总开关关闭时**不禁用**：用户可以先选好，打开总开关时立即生效。
+    expect(gatewayAllowLanSwitchDisabled({
+      ...base, enabled: false, allowLan: false, hostFromEnv: false, address: null,
+    })).toBe(false)
+  })
+
+  it('★ 提示文案按状态分支，且不得出现 markdown 星号', () => {
+    const off = gatewayAllowLanHint({ ...base, allowLan: false, hostFromEnv: false, address: null })
+    const on = gatewayAllowLanHint({ ...base, allowLan: true, hostFromEnv: false, address: null })
+    const overridden = gatewayAllowLanHint({ ...base, allowLan: true, hostFromEnv: true, address: null })
+    expect(off).toContain('127.0.0.1')
+    expect(off).not.toContain('**')
+    expect(on).toContain('0.0.0.0')
+    expect(on).toContain('API Key')
+    expect(on).not.toContain('**')
+    // env 覆盖时必须明说「不生效」——「打开了却没反应」比禁用并解释更让人困惑。
+    expect(overridden).toContain('DSH_OPENAI_GATEWAY_HOST')
+    expect(overridden).toContain('不生效')
+  })
+
+  it('★ 切换通知按结果分支', () => {
+    expect(gatewayAllowLanToggleNotice({ ...base, allowLan: true, hostFromEnv: true, address: null }, true))
+      .toContain('不生效')
+    expect(gatewayAllowLanToggleNotice({
+      ...base, allowLan: true, hostFromEnv: false, address: { host: '0.0.0.0', port: 8326 },
+    }, true)).toContain('局域网 IP')
+    expect(gatewayAllowLanToggleNotice({
+      ...base, allowLan: false, hostFromEnv: false, address: { host: '127.0.0.1', port: 8326 },
+    }, false)).toContain('127.0.0.1')
+    // 网关没在监听时不得谎称「已改绑」。
+    expect(gatewayAllowLanToggleNotice({
+      ...base, running: false, allowLan: true, hostFromEnv: false, address: null,
+    }, true)).toContain('没有在监听')
+  })
+
+  it('★ 绑 0.0.0.0 时状态行必须教用户把地址换成局域网 IP（0.0.0.0 抄走连不上）', () => {
+    const lines = gatewayStatusLines({
+      enabled: true,
+      running: true,
+      blockedByEnv: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: { host: '0.0.0.0', port: 8326 },
+      apiKey: null,
+      models: [],
+      modelsSource: 'none',
+    })
+    const joined = lines.join('\n')
+    expect(joined).toContain('0.0.0.0')
+    expect(joined).toContain('局域网 IP')
+    // 非回环警告必须点名宿主（既有守卫，见脚注用例的同条理由）。
+    expect(joined).toContain('宿主')
+  })
+
+  it('★ 回环部署的状态行不出现局域网指引（避免把精简过的文案重新撑肿）', () => {
+    const lines = gatewayStatusLines({
+      enabled: true,
+      running: true,
+      blockedByEnv: false,
+      allowLan: false,
+      hostFromEnv: false,
+      address: { host: '127.0.0.1', port: 8326 },
+      apiKey: null,
+      models: [],
+      modelsSource: 'none',
+    })
+    expect(lines.join('\n')).not.toContain('局域网 IP')
+  })
+})
+
+/**
+ * ★★ **「已选择允许局域网、但网关没在监听」不得谎报「已监听」**（2026-10-22 对抗审计 P2）。
+ *
+ * ## 修的那个真缺陷
+ *
+ * `gatewayAllowLanHint` 原来只判 `status.allowLan`，不判 `status.running` ⇒ 用户打开
+ * 开关但**网关总开关关着 / 端口被占 / env 停用**时，它输出「**已监听**全部网卡」——
+ * 这是**错误的安全陈述**（谎报暴露），且与同一弹窗里另外两条文案直接矛盾：
+ * - `gatewayStatusLines` 说「网关已关闭，不会监听任何端口」；
+ * - `gatewayFootnote` 说「网关只绑定 127.0.0.1」。
+ *
+ * ⇒ 三条文案对「现在到底在不在监听」给出**三种答案**。
+ * ⚠️ 这正是本仓 IKL7UN 反复记的那种「面板输出它自己声称要消除的错误安全陈述」，
+ *   只是方向反了（谎报暴露而非谎报安全）。
+ * ⚠️ 同文件 `gatewayAllowLanToggleNotice` **已经**判了 `running` ⇒ 这是
+ *   「同一语义两套判据」的实例，本次把 hint 补齐到同口径。
+ *
+ * ⚠️ 既有那条「提示文案按状态分支」的用例用的 `base` 是 `running: true`
+ * ⇒ **只覆盖了「已在监听」那一格**，对「已选择但未监听」零判别力（我实测：
+ *    把 `&& status.running` 去掉后它仍 107 passed）。
+ */
+describe('★ 局域网开关：已选择但未监听时不得谎报「已监听」', () => {
+  it('★★ allowLan=true 且 running=false ⇒ 不得出现「已监听」，必须说「还没生效」', () => {
+    const hint = gatewayAllowLanHint({
+      enabled: false,
+      running: false,
+      blockedByEnv: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: null,
+    } as never)
+    expect(hint, '⚠️⚠️ 网关没在监听，绝不能说「已监听」').not.toContain('已监听')
+    expect(hint, '必须如实说「没有在监听」').toContain('没有在监听')
+    expect(hint, '必须给出可执行的出路（打开总开关）').toContain('总开关')
+    // 与另外两条文案不矛盾的核验：这句不得断言「已绑定」。
+    expect(hint).not.toContain('已改绑')
+  })
+
+  it('★ allowLan=true 且 running=true ⇒ 仍然说「已监听」（修复不得削掉正向那一格）', () => {
+    const hint = gatewayAllowLanHint({
+      enabled: true,
+      running: true,
+      blockedByEnv: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: { host: '0.0.0.0', port: 8326 },
+    } as never)
+    expect(hint).toContain('已监听')
+    expect(hint).toContain('0.0.0.0')
   })
 })
