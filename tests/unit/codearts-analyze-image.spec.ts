@@ -35,6 +35,8 @@ import {
   shouldOfferAnalyzeImage,
   type AnalyzeImageDeps,
 } from '../../src/analyze-image.js'
+// ⚠️ 守卫 ⑪~⑬ 直接测共享序列化层（缺陷就在那一层，不在工具里）。
+import { serializeMessages } from '../../src/openai-compat.js'
 
 /** 造一条带图的 user 消息。 */
 function userWithImages(
@@ -218,5 +220,84 @@ describe('analyzeImage：执行路径', () => {
   /** 工具名与 IDE 同名（模型在 IDE 语境下已熟悉）。 */
   it('⑩ 工具名是 analyzeImage（与 IDE 同名）', () => {
     expect(ANALYZE_IMAGE_TOOL).toBe('analyzeImage')
+  })
+})
+
+/**
+ * ⚠️⚠️ **已拼好的 `image_url` 块必须能穿过序列化层**（2026-10-22 真实缺陷）。
+ *
+ * ## 缺陷经过（真机验收时发现，不是审计想出来的）
+ *
+ * `analyzeImage` 的识图请求由**插件自己**构造：`describeWithVision` 把图片拼成
+ * 上游要的 `{type:'image_url', image_url:{url}}` 后交给 `adapter.stream()`。
+ * 而共享序列化器 `userContentParts` 当时**只认 harness 原生**
+ * `{type:'image', attachment}`（去 `imageUrls` 表里查字节），对 `image_url`
+ * **零命中** ⇒ 该块被**静默丢弃**。
+ *
+ * 症状极具误导性：HTTP 200、正文正常、上游无任何报错，只是 VL 模型回答
+ * 「我看不到图片」—— 因为图确实没发出去。
+ *
+ * 另有一处同因的门禁：`serializeMessages` 里 `imageUrls === undefined` 时
+ * **整段跳过** `userContentParts`，而识图请求**不传** `imageUrls` ⇒ 即使认了
+ * `image_url` 也走不到。两处必须同修。
+ *
+ * ## 为什么原有用例没抓到
+ *
+ * 它们只测 `{type:'image', attachment}` 这条路（配 `imageUrls` 表）。
+ * 「已拼好的块」是**另一条入口**，没有断言 ⇒ 缺陷从缝里漏过。
+ */
+describe('analyzeImage：已拼好的 image_url 必须穿过序列化层（真实缺陷）', () => {
+  const url = 'data:image/png;base64,iVBORw0KGgo='
+
+  /**
+   * 守卫 ⑪：**不传 `imageUrls`**（识图请求的真实形态）时，`image_url` 块仍要到达 wire。
+   *
+   * ⚠️ 判据是「wire 里出现了那个 url」，不是「没报错」——后者恒真。
+   */
+  it('⑪ 不传 imageUrls 时 image_url 块仍出现在 wire 里', () => {
+    const wire = serializeMessages([{
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url } },
+        { type: 'text', text: '这是什么颜色？' },
+      ],
+    }])
+    const userMessage = wire.find((m) => m['role'] === 'user') as { content: unknown }
+    const parts = userMessage.content as Array<{ type: string; image_url?: { url?: string }; text?: string }>
+    expect(Array.isArray(parts)).toBe(true)
+    // ⚠️ 判别力就在这里：块被丢弃时 parts 里只剩 text。
+    expect(parts.some((p) => p.type === 'image_url' && p.image_url?.url === url)).toBe(true)
+    expect(parts.some((p) => p.type === 'text' && p.text === '这是什么颜色？')).toBe(true)
+  })
+
+  /**
+   * 守卫 ⑫：**原生 `{type:'image'}` 路径逐字节不变**（回归）。
+   *
+   * ⚠️ 修 ⑪ 时动了 `imageUrls === undefined` 那条门禁，必须证明老路径没被带坏。
+   */
+  it('⑫ 原生 image 块（配 imageUrls）仍产出 image_url', () => {
+    const wire = serializeMessages([{
+      role: 'user',
+      content: [
+        { type: 'image', attachment: { attachmentId: 'att-1', mediaType: 'image/png' } },
+        { type: 'text', text: '看图' },
+      ],
+    }], new Map([['att-1', url]]))
+    const userMessage = wire.find((m) => m['role'] === 'user') as { content: unknown }
+    const parts = userMessage.content as Array<{ type: string; image_url?: { url?: string } }>
+    expect(parts.some((p) => p.type === 'image_url' && p.image_url?.url === url)).toBe(true)
+  })
+
+  /**
+   * 守卫 ⑬：**纯文本消息仍是字符串形态**（上游会 400 拒收包装形态）。
+   *
+   * ⚠️ 这条防的是「为了修图片而把所有消息都包装成 parts」——实测上游
+   * `model_param_invalid` 400 拒收整个请求。
+   */
+  it('⑬ 纯文本 user 消息仍保持字符串 content（不因本次修复被包装）', () => {
+    const wire = serializeMessages([{ role: 'user', content: [{ type: 'text', text: '只有文字' }] }])
+    const userMessage = wire.find((m) => m['role'] === 'user') as { content: unknown }
+    expect(typeof userMessage.content).toBe('string')
+    expect(userMessage.content).toBe('只有文字')
   })
 })
