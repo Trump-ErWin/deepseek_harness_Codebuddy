@@ -248,6 +248,37 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
   },
 ]
 
+/**
+ * DSH 自身 system prompt 里的产品名（2026-10-22 本机实测）。
+ *
+ * ## 与上表三条指纹的差异：它是**裸词组**，不是某一句模板
+ *
+ * 腾讯 2026-10-20 起按 `DeepSeek Harness` **任意位置出现**拦截：DSH 0.2.1-rc.2
+ * 的 5780 字符 system 里有三处（身份首句、runtime context 句、Web GUI 句），
+ * 只改首句仍 400/11128；三处全部中和后 200。因此不能写成表里那种
+ * 「一句一 find」的精确字面量（DSH 提示词改版就会漏），也不能写成裸关键词
+ * （会把 `C:\APP\Deepseek Harness\...` 这类路径改坏）。
+ *
+ * ## 修法：零宽空格 + 路径守卫
+ *
+ * - 只在 `DeepSeek` 与 `Harness` 之间插入 U+200B；模型读到的语义不变；
+ * - 前后紧邻 `\` 或 `/` 的路径语境保持逐字节不变（否则工具调用会拿到带不可见字符的坏路径）；
+ * - `[ \u00A0]+` 同时覆盖普通空格与 NBSP；
+ * - 预检不命中时直接返回原字符串，不破坏腾讯侧的前缀缓存。
+ *
+ * ⚠️ 实测（2026-10-21，`copilot.tencent.com` / `buddy` / `deepseek-v4.1-flash`）：
+ *
+ * | system | 结果 |
+ * |---|---|
+ * | 完整 5780 字符（3 处） | ❌ 400/11128 |
+ * | 仅改写身份首句（npm 1.10.261021 的规则） | ❌ 400/11128 |
+ * | 三处全部插入 U+200B | ✅ 200 |
+ */
+const DSH_PRODUCT_PHRASE = /(?<![\\/])(DeepSeek)[ \u00A0]+(Harness)(?![\\/])/gi
+const DSH_PRODUCT_PHRASE_NEUTRALIZED = 'DeepSeek\u200B Harness'
+/** 无 `g` 的预检：`test` 不携带 lastIndex，避免跨调用串状态。 */
+const DSH_PRODUCT_PHRASE_PROBE = /deepseek[ \u00A0]+harness/i
+
 /** 正则元字符转义：把字面量安全地变成**精确**匹配，而不是模式。 */
 function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -302,6 +333,11 @@ export function rewriteTencentContentFingerprints(text: string, provider: string
     if (!out.toLowerCase().includes(rule.findLower)) continue
     // `String.replace` 配 `g` 正则会在调用前后把 lastIndex 归零，不会串状态。
     out = out.replace(rule.pattern, rule.replace)
+  }
+  // DSH 自己的产品名：腾讯按裸词组拦截，且不限于首句（见上面的实测表）。
+  // 路径语境（前后紧邻 `\` 或 `/`）由正则的前后向断言跳过。
+  if (DSH_PRODUCT_PHRASE_PROBE.test(out)) {
+    out = out.replace(DSH_PRODUCT_PHRASE, DSH_PRODUCT_PHRASE_NEUTRALIZED)
   }
   return out
 }

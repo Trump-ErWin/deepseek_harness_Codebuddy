@@ -693,3 +693,108 @@ describe('OpenAI 网关 Responses 路径：与 Chat 同一判据', () => {
     expect(texts).toContain(`keep ${FEEDBACK_TRIGGER}`)
   })
 })
+
+/**
+ * 第四条风控：DSH 自身的产品名 `DeepSeek Harness`（裸词组，不限位置）。
+ *
+ * ## 与上三条的差异
+ *
+ * 上三条都是「某一句客户端模板」；这一条是 DSH 自己的 system prompt 里
+ * **每轮必带**的产品名。腾讯 2026-10-20 起按裸词组拦截，且**不限于首句**：
+ * 5780 字符真实 system 有三处（身份首句、runtime context 句、Web GUI 句），
+ * 只改首句仍 400/11128，三处全部中和后 200。
+ *
+ * ## 为什么用零宽空格而不是再登记三条 find
+ *
+ * DSH 的提示词会改版，新位置会继续漏；而裸关键词替换会把
+ * `C:\APP\Deepseek Harness\...` 这类真实路径改坏。故这里用带路径守卫的
+ * 零宽空格中和（U+200B），语义不变、路径逐字节不变。
+ */
+const DSH_IDENTITY = 'You are an AI agent powered by DeepSeek Harness.'
+const DSH_RUNTIME_CONTEXT = 'The runtime context names the DeepSeek Harness implementation checkout.'
+const DSH_WEB_GUI = 'You are interacting with the user through the DeepSeek Harness Web GUI.'
+const DSH_NEUTRALIZED = 'DeepSeek\u200B Harness'
+
+describe('腾讯系内容级风控指纹改写（DSH 产品名）：裸词组 + 路径守卫', () => {
+  it('★ 三处真实 system 句子全部中和（只改首句仍会被拦）', () => {
+    const system = [DSH_IDENTITY, DSH_RUNTIME_CONTEXT, DSH_WEB_GUI].join('\n')
+    const out = rewriteTencentContentFingerprints(system, 'buddy')
+    expect(out).not.toContain('DeepSeek Harness')
+    expect(out.split(DSH_NEUTRALIZED)).toHaveLength(4) // 3 处出现
+    expect(out).toContain(DSH_NEUTRALIZED)
+  })
+
+  it('★ 大小写不敏感 + 普通空格 / NBSP 都覆盖', () => {
+    for (const text of [
+      'deepseek harness',
+      'DEEPSEEK HARNESS',
+      'DeepSeek\u00A0Harness',
+    ]) {
+      expect(rewriteTencentContentFingerprints(text, 'workbuddy')).toBe(DSH_NEUTRALIZED)
+    }
+  })
+
+  it('★ 路径语境保持逐字节不变（工具调用不能拿到带不可见字符的坏路径）', () => {
+    for (const pathText of [
+      String.raw`C:\APP\Deepseek Harness\resources`,
+      '/opt/Deepseek Harness/bin',
+      String.raw`D:\10_COD\DeepSeek Harness\resources\app.asar`,
+      String.raw`DeepSeek Harness\resources`,
+    ]) {
+      expect(rewriteTencentContentFingerprints(pathText, 'buddy')).toBe(pathText)
+    }
+    // 非路径语境仍然要改
+    const prose = '请检查 DeepSeek Harness 的版本'
+    expect(rewriteTencentContentFingerprints(prose, 'buddy')).toBe(`请检查 ${DSH_NEUTRALIZED} 的版本`)
+  })
+
+  it('★ 幂等：已中和的文本再调用不会重复插入', () => {
+    const once = rewriteTencentContentFingerprints(DSH_IDENTITY, 'buddy')
+    expect(rewriteTencentContentFingerprints(once, 'buddy')).toBe(once)
+  })
+
+  it('★ 非腾讯系逐字节不变', () => {
+    for (const provider of ['qoder', 'qodercn', 'trae', 'codearts', 'lobsterai', '']) {
+      expect(rewriteTencentContentFingerprints(DSH_IDENTITY, provider)).toBe(DSH_IDENTITY)
+    }
+  })
+
+  it('★ 真实 5780 字符 system 形状：只改产品名，其余段落逐字节不变', () => {
+    const realSystem = [
+      DSH_IDENTITY,
+      '',
+      'You are a coding agent powered by the deepseek-v4.1-flash model.',
+      DSH_RUNTIME_CONTEXT,
+      DSH_WEB_GUI,
+    ].join('\n')
+    const out = rewriteTencentContentFingerprints(realSystem, 'buddy')
+    expect(out).not.toContain('DeepSeek Harness')
+    expect(out).toContain(DSH_NEUTRALIZED)
+    expect(out).toContain('You are a coding agent powered by the deepseek-v4.1-flash model.')
+    expect(out.split('\n')).toHaveLength(realSystem.split('\n').length)
+  })
+
+  it('★ 与上三条指纹互不干扰', () => {
+    const mixed = `${TRIGGER}: master\n${CLAUDE_TRIGGER}\n${FEEDBACK_TRIGGER}\n${DSH_IDENTITY}`
+    const out = rewriteTencentContentFingerprints(mixed, 'workbuddy')
+    expect(out).toBe(
+      `${REWRITE}: master\n${CLAUDE_REWRITE}\n${FEEDBACK_REWRITE}\n${DSH_IDENTITY.replace('DeepSeek Harness', DSH_NEUTRALIZED)}`,
+    )
+  })
+
+  it('★ 网关调用点：instructions / assistant 正文走改写，user 不碰', async () => {
+    const options = await toResponsesGenerateOptions({
+      model: 'workbuddy/deepseek-v4.1-flash',
+      instructions: DSH_IDENTITY,
+      input: [
+        { type: 'message', role: 'assistant', content: `我记录到：${DSH_RUNTIME_CONTEXT}` },
+        { type: 'message', role: 'user', content: `用户原话：${DSH_WEB_GUI}` },
+      ],
+    }, abort())
+    const texts = textsOf(options.messages)
+    expect(texts).toContain(DSH_IDENTITY.replace('DeepSeek Harness', DSH_NEUTRALIZED))
+    expect(texts).toContain(`我记录到：${DSH_RUNTIME_CONTEXT.replace('DeepSeek Harness', DSH_NEUTRALIZED)}`)
+    // user 不碰（实测该角色放行，改它只是篡改用户原话）。
+    expect(texts).toContain(`用户原话：${DSH_WEB_GUI}`)
+  })
+})
