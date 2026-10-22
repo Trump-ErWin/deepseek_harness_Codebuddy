@@ -5,7 +5,9 @@ import Schema from '@deepseek-ai/schemastery'
 // Codely 的续期服务对象（2026-10-20：推理已走 HTTP 自签，这里只负责续期）
 import { CodelyAuth } from './codely-auth-service.js'
 import { createHash } from 'node:crypto'
-import { registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
+import { codeartsImagePart, codeartsVisionModel, registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
+// ⚠️ `analyzeImage`：让纯文本模型也能看图（2026-10-21）。模块头有完整判据链。
+import { installAnalyzeImage } from './analyze-image.js'
 import { startCatalogPrewarm } from './catalog-prewarm.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
@@ -1167,7 +1169,82 @@ export function apply(ctx: Context): void {
       return outcome === undefined ? undefined : isRemoteCatalogComplete(outcome)
     },
     accountPool: pool,
+    // 图片字节桥接（2026-10-21 接通）。
+    //
+    // ⚠️ 复用**同一个** `makeReadImage(ctx)` —— 不另写第二套（其余 14 家全走它）。
+    //
+    // ⚠️ 只有 VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）能收图，实测文本模型
+    //    发图回 `InferHub.001001020.406 The request model is not multimodal`。
+    //    适配器内部按 `codeartsAcceptsImage(model)` 判定，非 VL 模型**根本不读字节**
+    //    （见 `stream()` 的注释），故这里不必再加一层判据。
+    readImage: makeReadImage(ctx),
   })
+
+  /**
+   * `analyzeImage`：让**纯文本模型**也能看图（2026-10-21，用户诉求）。
+   *
+   * ## 为什么走适配器自己的 `stream()` 而不是 `ctx.llm.stream()`
+   *
+   * 直接用本适配器实例有三个好处，且都是**必须**的：
+   * 1. 复用同一套凭据解析与**请求级换号**（池里哪个号能用、撞额度怎么换）；
+   * 2. 复用 `codeartsAcceptsImage` 的读图闸门与 `image_url` 序列化（同一份实现）；
+   * 3. 不经过 `ctx.llm` 的路由投影 —— 那条路会按**目标模型**的模态再判一遍。
+   *
+   * ## ⚠️ 每次识图是**一次独立的、非会话的**上游请求
+   *
+   * 它不写进会话历史、不占会话的 tool 轮次，与 IDE 的 `analyzeImage` 同构。
+   * 故这里手工构造 `messages`（不传 `tools`、不传 system）。
+   */
+  const describeWithVision = async (
+    imageDataUrls: readonly string[],
+    prompt: string,
+    signal: AbortSignal,
+  ): Promise<string> => {
+    const visionModel = codeartsVisionModel()
+    const parts: Array<Record<string, unknown>> = [
+      ...imageDataUrls.map((url) => codeartsImagePart(url)),
+      { type: 'text', text: prompt },
+    ]
+    let text = ''
+    for await (const chunk of codearts.stream({
+      provider: CODEARTS_PROVIDER,
+      model: visionModel,
+      messages: [{ role: 'user', content: parts }],
+      signal,
+    } as never)) {
+      const typed = chunk as { type?: string; text?: unknown }
+      if (typed.type === 'text-delta' && typeof typed.text === 'string') text += typed.text
+    }
+    if (text.trim().length === 0) {
+      // ⚠️ 空正文要**明确报错**而不是返回空串：空串会让主模型以为"图上什么都没有"，
+      // 从而给用户一个自信的错误答案（本仓对「空响应」一贯如此处理）。
+      throw new Error(
+        `analyzeImage: 识图模型（${visionModel}）没有返回任何文字；`
+        + '可能是上游排队或图片格式不被接受，请稍后重试。',
+      )
+    }
+    return text
+  }
+
+  installAnalyzeImage(
+    ctx,
+    { readImage: makeReadImage(ctx), describe: describeWithVision },
+    (exec) => {
+      // 与官方 `read_image` 的 `assertImageCapableRoute` 同一手法：
+      // 先读会话已折叠的 `request/header` 路由，再回退到 agent options。
+      const agent = (exec as {
+        agent?: {
+          options?: { provider?: string; model?: string }
+          session?: { requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined }
+        }
+      }).agent
+      const routed = agent?.session?.requestHeader?.()?.config
+      return {
+        provider: routed?.provider ?? agent?.options?.provider,
+        model: routed?.model ?? agent?.options?.model,
+      }
+    },
+  )
 
   // ===== Buddy (腾讯 CodeBuddy) 服务 =====
   // 不注册斜杠命令：登录/状态/续期都在 Jet Hub 设置页完成（多账号 + 账号池），
