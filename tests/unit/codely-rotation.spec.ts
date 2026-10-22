@@ -354,8 +354,141 @@ describe('Codely 换号：换发 cli_api_key 失败也必须换号', () => {
     const { error } = await run(bad)
     expect(error, '全都换发失败 ⇒ 必须报错（不静默）').toBeDefined()
     expect(String((error as { code?: string }).code)).toBe('PERMISSION_DENIED')
-    // ⚠️ 文案必须给**走得通**的出路：`account.refresh` 对 codely 当前报「不支持续期」，
-    //    所以不能只写「去点续期」。
-    expect(String((error as Error).message)).toContain('新建账号')
+    // ⚠️ 文案必须给**可逆**的出路，且**明确劝阻删号**（2026-10-22 A1 修）：
+    //    删号不可逆，而「换发端点拒了」不等于「凭据在本地坏了」。
+    expect(String((error as Error).message)).toContain('重测')
+    expect(String((error as Error).message)).toContain('不要急着删除账号')
+  })
+})
+
+/**
+ * ★★ **换发失败必须按 `kind` 分档**（2026-10-22 对抗审计 A1，P0 修复的守卫）。
+ *
+ * ## 守的两条真缺陷（原实现同一处代码、两条用户可见后果）
+ *
+ * ① **一次网络抖动锁死整池**：旧实现把「网络异常 / 5xx / 401」全挤成同一个
+ *    `undefined`，然后无条件 `updateModelRateLimit(…, nextUtc8DayStartMs())`
+ *    ⇒ 一次 5 秒的 DNS 抖动让池里**每个**号被锁到 UTC+8 次日 0 点（实测 11.15h）。
+ * ② **文案引导删号**：旧文案写「请**删除该账号**后重新新建」—— 删除不可逆，
+ *    而凭据其实完好。
+ *
+ * ## 判据为什么打在「记账」与「错误码」上（而不是只断言不抛错）
+ *
+ * 只断言「抛错了」是**恒真**的（旧实现也抛）。有判别力的是：
+ * - `marks`（池里真被写了几笔、时刻是多少）—— ① 的唯一可观测出口；
+ * - `error.code` 与 `message` —— ② 的唯一可观测出口；
+ * - `chatCalls` / `exchangeAuth` —— 证明「transient **不该**换号」。
+ */
+describe('Codely 换发失败分档：transient 不得锁号、不得引导删号', () => {
+  /** 让换发端点按给定行为响应；推理端点记录调用。 */
+  function adapterWithExchangeBehaviour(
+    pool: unknown,
+    exchange: () => Response | Promise<Response>,
+  ): { adapter: CodelyAdapter; exchangeCalls: () => number; chatCalls: () => number } {
+    let exchangeCalls = 0
+    let chatCalls = 0
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/api-token/cli-api-key')) {
+        exchangeCalls += 1
+        return exchange()
+      }
+      chatCalls += 1
+      return new Response('should not chat', { status: 500 })
+    })
+    const adapter = new CodelyAdapter({
+      accountPool: pool as never,
+      fetchImpl: fetchImpl as never,
+    })
+    return { adapter, exchangeCalls: () => exchangeCalls, chatCalls: () => chatCalls }
+  }
+
+  it('★★ 网络异常（fetch 抛 ECONNRESET）⇒ 零记账、SERVER、文案劝阻删号', async () => {
+    const { pool, marks } = makePool([
+      { id: 'acc-1', credential: cred('A') },
+      { id: 'acc-2', credential: cred('B') },
+    ])
+    const { adapter, exchangeCalls } = adapterWithExchangeBehaviour(pool, () => {
+      throw Object.assign(new Error('fetch failed'), { cause: new Error('read ECONNRESET') })
+    })
+    const { error } = await run(adapter)
+
+    // ① 决定性断言：**一个号都不许被记账**（原缺陷：两个号全锁到次日 0 点）
+    expect(marks, '网络抖动不得写任何限流标记（原缺陷：整池锁到次日 0 点）').toEqual([])
+    // ② 错误码必须是 SERVER（宿主可重试），且不是 AUTH（会吞掉文案）
+    expect(String((error as { code?: string }).code)).toBe('SERVER')
+    const message = String((error as Error).message)
+    expect(message, '文案必须说清是网络/上游问题').toContain('网络异常')
+    expect(message, '文案必须明确劝阻删号').toContain('不要删除账号')
+    expect(message, '文案不得再引导删号（旧缺陷）').not.toContain('删除该账号后重新')
+    // ③ transient **不换号**：只试了第一个号（换号只会撞同一个上游故障）
+    expect(exchangeCalls(), 'transient 不该换号（换了也是白烧整池）').toBe(1)
+  })
+
+  it('★★ 上游 500 ⇒ 零记账、SERVER（不得被当成「这个号今天不行了」）', async () => {
+    const { pool, marks } = makePool([{ id: 'acc-1', credential: cred('A') }])
+    const { adapter } = adapterWithExchangeBehaviour(pool, () => new Response('boom', { status: 500 }))
+    const { error } = await run(adapter)
+
+    expect(marks, '5xx 是上游故障，不得写账号级冷却').toEqual([])
+    expect(String((error as { code?: string }).code)).toBe('SERVER')
+    expect(String((error as Error).message)).toContain('上游 HTTP 500')
+  })
+
+  it('★ 换发端点 429 ⇒ transient（网关限流 ≠ 该号没额度）', async () => {
+    const { pool, marks } = makePool([{ id: 'acc-1', credential: cred('A') }])
+    const { adapter } = adapterWithExchangeBehaviour(pool, () => new Response('slow down', { status: 429 }))
+    const { error } = await run(adapter)
+
+    expect(marks, '换发端点的 429 是网关限流，不得写账号冷却').toEqual([])
+    expect(String((error as { code?: string }).code)).toBe('SERVER')
+  })
+
+  it('★ 2xx 但缺 cli_api_key ⇒ malformed：零记账、SERVER（协议变更不是账号问题）', async () => {
+    const { pool, marks } = makePool([{ id: 'acc-1', credential: cred('A') }])
+    const { adapter } = adapterWithExchangeBehaviour(
+      pool,
+      () => new Response(JSON.stringify({ user_id: 1 }), { status: 200 }),
+    )
+    const { error } = await run(adapter)
+
+    expect(marks, '协议变更不得写账号冷却').toEqual([])
+    expect(String((error as { code?: string }).code)).toBe('SERVER')
+    expect(String((error as Error).message)).toContain('cli_api_key')
+  })
+
+  it('★★ 反向对照：401 仍必须换号 + 记账（上一轮 P0 修复不得被本轮改坏）', async () => {
+    const { pool, marks } = makePool([
+      { id: 'acc-1', credential: cred('BAD') },
+      { id: 'acc-2', credential: cred('GOOD') },
+    ])
+    const exchangeAuth: string[] = []
+    const chatAuth: string[] = []
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const headers = (init?.headers ?? {}) as Record<string, string>
+      const auth = String(headers.Authorization ?? '')
+      if (url.includes('/api/api-token/cli-api-key')) {
+        exchangeAuth.push(auth)
+        if (auth === 'Bearer BAD') return new Response('expired', { status: 401 })
+        return new Response(JSON.stringify({ cli_api_key: `sk-${auth.replace(/^Bearer\s+/i, '')}` }), { status: 200 })
+      }
+      chatAuth.push(auth)
+      return sseOk()()
+    })
+    const adapter = new CodelyAdapter({ accountPool: pool as never, fetchImpl: fetchImpl as never })
+    const { error } = await run(adapter)
+
+    expect(error, '池里有能用的号 ⇒ 不得报错').toBeUndefined()
+    // ① 401 必须换号（两个号的换发都被试过）
+    expect(exchangeAuth, '401 必须换到第二个号').toEqual(['Bearer BAD', 'Bearer GOOD'])
+    // ② 401 必须记账（该号确实不可用）
+    expect(marks.length, '401 必须记账（否则下次又选中它）').toBe(1)
+    expect(marks[0]!.accountId).toBe('acc-1')
+    // ③ 记账时刻必须是「次日 0 点」档（不是 1h，也不是不记）
+    expect(marks[0]!.resetAtMs, '凭据类失败沿用 402 那档（UTC+8 次日 0 点）')
+      .toBe(nextUtc8DayStartMs())
+    // ④ 推理用的是第二个号的 key
+    expect(chatAuth).toEqual(['Bearer sk-GOOD'])
   })
 })

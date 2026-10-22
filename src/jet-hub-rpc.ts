@@ -137,6 +137,8 @@ import {
 import { MODELSCOPE } from './modelscope-product.js'
 import { maskModelscopeKey } from './modelscope.js'
 import { CODELY_PROVIDER_ID, startCodelyDeviceLogin, decodeCodelyJwtExpMs } from './codely-auth.js'
+import type { CodelyAuth } from './codely-auth-service.js'
+import { CODERLY } from './codely-product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -1405,6 +1407,16 @@ export interface JetHubAuths {
    */
   readonly minimaxintl: MinimaxAuth
   /**
+   * Codely（Unity）的续期实例 —— **可选键**（2026-10-22 A6 接线）。
+   *
+   * ⚠️ 为何是**可选**而不是必填：它的接线需要同时改到 `index.ts` 的
+   * `auths` 对象、`SELF_HEAL_REFRESHABLE_PROVIDERS`、`jet-hub-store.ts` 的前缀表，
+   * 以及多张从注册表派生的守卫。写成**必填**会让下一个加 provider 的人
+   * 被迫同时改所有消费方（而那些消费方本来就应该按 `channel` 派生）。
+   * 缺它时：存在的 `refreshAccountCredential` / `refreshAll` 路径会跳过 codely（与各家同形）。
+   */
+  readonly codely?: CodelyAuth
+  /**
    * ⚠️ **Codely 的键暂不在此声明**（2026-10-20）：接线必须**四处同时**做——
    * ① 本接口加 `codely`；② `index.ts` 的 auths 对象传值；
    * ③ `SELF_HEAL_REFRESHABLE_PROVIDERS` 加 `CODERLY.id`；
@@ -2313,6 +2325,16 @@ function registerJetHubEndpoints(
     //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
     //    只需一次 refresh，且**日志零字**。
     AUTOCLAW_INTL.id,
+    // ⚠️⚠️ codely（Unity，2026-10-22 A6 接线）：**有**真实 refresh 端点
+    //    `POST /auth/refresh {refresh_token}`（实测 200，且 `refresh_token` **不轮换**）
+    //    ⇒ 不属 loomy / zcode 那类「设计上没有 refresh 端点」的豁免。
+    //    凭据形态：`access_token` 是 JWT（实测寿命约 365 天）+ `refresh_token`，
+    //    与各家同形 ⇒ 过期后靠本表自愈，而不是用户手动重登。
+    //    ⚠️ 漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
+    //    只需一次 refresh，且**日志零字**。
+    //    ⚠️ 它之前不在本表里的**真正**原因不是「不需要」，而是「`CodelyAuth` 当时连
+    //    契约都没对上（`refreshAll` 是 2 参）」—— 见 A5 的修。
+    CODERLY.id,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
     //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
     //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点

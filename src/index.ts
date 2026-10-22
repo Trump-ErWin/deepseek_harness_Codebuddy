@@ -4415,6 +4415,30 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 冷启动也广播一次：首次目录在注册后异步就绪，不补这一发就只能等用户重启。
   ctx.emit('llm/adapters-updated')
 
+  /**
+   * Codely 的续期实例（2026-10-22 A6 接线）。
+   *
+   * ⚠️⚠️ **三个必选依赖都必须传**，少一个都是静默失效：
+   * - `credentials`：不传 ⇒ `refreshAccountCredential` 第一行就 `return`（续期一次都不发）；
+   * - `writebackExpiry`：不传 ⇒ 池里 `expiresAt` 不回写，界面「有效期」停在旧值
+   *   （officeace 记过同款）；
+   * - `fetcher`：传真实 `fetch` 即可（默认值就是），故省略。
+   *
+   * ⚠️ `writebackExpiry` 必须走 `pool.updateAccount`（与各家同形）—— 直接写
+   *   `credentialRef` 对应的凭据不行：那份凭据已在 `refreshAccountCredential`
+   *   里写回过，这里只补「池条目的有效期字段」。
+   */
+  const codelyAuth = new CodelyAuth(ctx, {
+    credentials: ctx.credentials as never,
+    writebackExpiry: async (accountId, expiresAtMs) => {
+      await pool.updateAccount(accountId, {
+        // ⚠️ `ProviderAccountEntry.expiresAt` 是**毫秒数值**（`number`），不是 ISO 字符串
+        //    —— 写成 `toISOString()` 会直接编译失败（TS2345）。
+        ...expiresAtMs === undefined ? {} : { expiresAt: expiresAtMs },
+      })
+    },
+  })
+
   // ===== OpenCode Zen（账号槽 + 匿名槽平权混合池）=====
   //
   // 形态与前面所有 provider 相同：进程内 LlmAdapter 直发远端，无子进程、无端口。
@@ -5331,10 +5355,22 @@ async function fetchBalanceReading(
   if (codelyRuntimeDescriptor !== undefined && Object.hasOwn(probeById, CODELY_PROVIDER_ID)) {
     registerProviderRuntime({
       descriptor: codelyRuntimeDescriptor,
-      // ⚠️ **刻意不给 `auth`**：codely 目前无 auth 服务（`channel:false`），续期链
-      //    是已知待接项（见 `provider-registry.ts` 的 codely 条目清单）。
-      //    给空 auth 会让 `account.refresh` 谎称支持续期。
+      // ✅ **给 `auth`**（2026-10-22 A6）：`CodelyAuth` 已改为 `extends Service`、签名已符合
+      //    `JetHubAuthLike`（单参 `refreshAll(pool)`），且真有 refresh 端点。
+      //    ⚠️ **必须给**：`wiredRefreshTargets()` 遍历的是 runtime 里的 `auth.refreshAll`，
+      //    不给它 ⇒ codely 永不进批量续期表 ⇒ 凭据过期后积分行报「未登录」且日志零字
+      //    （issue IKKHL5 形态）。
+      auth: {
+        // ⚠️ 必须包一层（与上面主循环同因）：直接挂方法引用会丢 `this`。
+        refreshAccount: (refName, pool, accountId) =>
+          codelyAuth.refreshAccountCredential(refName, pool, accountId),
+        refreshAll: (pool) => codelyAuth.refreshAll(pool),
+      },
+      // ⚠️ 这两行不能少：`creditsOf` 返回 `undefined` 时，
+      //    `provider-runtime-wiring` 那条「声明了 balance 就必须挂 credits 域」就会点名。
       credits: creditsOf(creditsTable, CODELY_PROVIDER_ID),
+      // ⚠️ codely **未接临期折算**（上游不下发到期时间）⇒ 本行取到 `undefined`。
+      //    这与 `expiry-runtime-parity.spec.ts` 的显式豁免表一致。
       expiry: expiryOf(expiryTable, CODELY_PROVIDER_ID),
       probe: probeById[CODELY_PROVIDER_ID],
     })
@@ -5375,10 +5411,12 @@ async function fetchBalanceReading(
     // OfficeAce（华为 ModelArts MaaS 云端直连）：值是 **auth 服务形状的包装对象**
     //（纯函数集合 + 统一 auth 契约），不是 Service 实例。
     officeace: officeaceAuthService as never,
-    // ⚠️ Codely 的续期对象**暂未挂**（2026-10-20）：`JetHubAuths.codely` 是
-    //    **可选**键，实现见 `codely-auth-service.ts`（`CodelyAuth`）。
-    //    接线时**必须同时**补齐 `jet-hub-rpc-auth-wiring` 的 17→18 与
-    //    `refreshAll` 14→15 两处计数，否则守卫按「键位恰好 17 家」变红。\n    //    （推理与目录都不依赖它 ⇒ 不挂也不影响使用。）
+    // ✅ **Codely 的续期对象已接**（2026-10-22 A6）：`CodelyAuth` 签名已改成
+    //    契约的**单参** `refreshAll(pool)`（与各家同形，见 A5 的修）。
+    //    ⚠️ 它同时进了 `SELF_HEAL_REFRESHABLE_PROVIDERS`（`jet-hub-rpc.ts`）——
+    //    两处**缺一不可**：只挂 auths 而不进自愈表 ⇒ 积分行过期后报「未登录」
+    //    且日志零字（issue IKKHL5 形态，均已复发四次）。
+    codely: codelyAuth,
     autoclaw,
     // ⚠️ 键是 **provider id** `autoclawintl`，值是变量 `autoclawIntl` ——
     //    两者不同名（id 全小写、变量带驼峰），写成简写会引用不存在的变量。

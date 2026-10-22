@@ -185,6 +185,42 @@ describe('本机网关面板的文案与判定', () => {
    *
    * 判据用**真实函数的返回值**（而不是源码文本），对实现方式中立。
    */
+  /**
+   * ★★ **`running: true` + `address: null` 不得崩、也不得说反话**
+   * （2026-10-22 对抗审计 m-1）。
+   *
+   * ## 为什么这是**合法组合**而不是脏数据
+   *
+   * 宿主侧 `running`（`isGatewayRunning()`）与 `address`（`gatewayAddress()`）是
+   * **两次独立 `degrade`**，任一次抛错都让对应字段为空。
+   *
+   * ## 两条真缺陷（实测）
+   *
+   * 1. **崩**：`isWildcardHost(undefined)` 走 `normalizeHostForCompare` 抛
+   *    `TypeError: Cannot read properties of undefined (reading 'normalize')`
+   *    ⇒ 整个网关状态面板直接不渲染（用户只看到一片空白）。
+   * 2. **说反话**：修了不崩之后，`gatewayFootnote` 仍落到「只绑定 127.0.0.1」
+   *    那句，而「允许局域网访问」开关可能是**开着的** ⇒ 又一条与事实
+   *    相反的安全声明（正是 IKL7UN 那条纪律要消除的）。
+   *
+   * ⚠️ 判据分两层：**不崩**（两个函数都能返回）+ **不说反话**
+   * （不得出现「只绑定 127.0.0.1」）。只测第一层会让第二条漏掉。
+   */
+  it('★★ running:true + address:null 不崩、且不得声称「只绑定 127.0.0.1」', () => {
+    const unknown = { ...RUNNING, allowLan: true, address: null }
+    // ① 不崩（两个入口都要跑一遍）
+    expect(() => gatewayFootnote(unknown)).not.toThrow()
+    expect(() => gatewayStatusLines(unknown)).not.toThrow()
+    // ② 不得说反话
+    expect(
+      gatewayFootnote(unknown),
+      '地址未知时不得声称只绑了回环（开关可能开着）',
+    ).not.toContain('只绑定 127.0.0.1')
+    // ③ 修法本身也要有城市：必须如实说「读不到地址」
+    expect(gatewayFootnote(unknown)).toContain('读不到它的监听地址')
+    // ④ 反向对照：正常回环仍必须说「只绑定 127.0.0.1」
+    expect(gatewayFootnote(RUNNING), '不得把回环那句改掉').toContain('只绑定 127.0.0.1')
+  })
   it('★★ 面板文案一律不得含 markdown 标记（星号会原样显示）', () => {
     const bridged = { ...RUNNING, address: { host: '172.21.0.8', port: 8326 } }
     const texts = [

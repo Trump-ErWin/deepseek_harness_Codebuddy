@@ -137,6 +137,19 @@ function abilitySuffix(modelId: string): string {
   return ` · ${abilities.map((ability) => CODERLY_ABILITY_LABEL[ability]).join(' | ')}`
 }
 
+/**
+ * 单次**推理**请求的超时（毫秒）。
+ *
+ * ⚠️⚠️ **不能复用 `CODELY_HTTP_TIMEOUT_MS`（30s）**（2026-10-22 对抗审计 A3）：
+ * 那档是给「目录 / 登录 / 积分」这些**短请求**用的；而模型正常生成长回答
+ * （实测 `codely-core` 单次 36965 字符、耗时数分钟）会**必然**撞上 30s。
+ * 取 10 分钟：长到足以覆盖正常生成，又能在「上游挂死」时给出明确失败
+ * （而不是让界面永久转圈）。
+ *
+ * ⚠️ 这与 `buddy` / `accio` 的口径一致：推理超时**单独一档**，不与目录共用。
+ */
+const CODELY_INFERENCE_TIMEOUT_MS = 600_000
+
 /** 换号预算（含首次请求）：402 在网关校验层就被拒，换号本身不产生推理费用。 */
 const CODERLY_MAX_ROTATE = 5
 
@@ -243,9 +256,33 @@ export class CodelyAdapter extends LlmAdapter {
         product: CODERLY,
         loadCatalog: () => this.loadCatalogEntries(),
         syncCatalog: () => this.catalogEntries(),
-        // ⚠️ 未知 id 保守报 `['text']`：宁可少报能力，也不要报一个服务端
-        //    可能不认的模态（本渠道的多模态能力未按模型实测过）。
-        unknownModelInputModalities: () => ['text'] as const,
+        /**
+         * ⚠⚠ **必须查同一张 `CODERLY_ABILITIES` 表**（2026-10-22 对抗审计 A4）。
+         *
+         * ## 原实现的真缺陷（两条腿分叉）
+         *
+         * 旧写法是 `() => ['text']`（恒定不支持图片），而目录那条腿
+         * （`toCatalogEntry`）是逐模型声明的（`codely-flash` / `codely-air` / `codely-basic`
+         * 实测收图）。两条腿分叉的后果（实测）：
+         *
+         * | 情形 | `resolveModel('codely-flash').inputModalities` |
+         * |---|---|
+         * | 目录里有它 | `['text','image']` ✅ |
+         * | **目录收缩后不在** | `['text']` ❌（但它实测能收图） |
+         *
+         * 而 DSH 对 `['text']` 的语义是**明确不支持**（会把图投影成文本占位）
+         * ⇒ 用户发图给 `codely-flash` 时图**根本到不了适配器**，只看到「模型说它没
+         * 看到图」。这与 `docs/agent-notes/providers-codearts.md` 记的同一形态
+         * （「只改 `toCatalogEntry` 恒无效」「`unknownModelInputModalities` 是第二条腿」）。
+         *
+         * ⚠️ 「目录里没有」≠「未知」—— `CODERLY_ABILITIES` 是**实测白名单**，
+         *    它知道 `codely-flash` 收图；只有表里查不到的才该保守报 `['text']`。
+         * ⚠️ 与 `toCatalogEntry` 同源之后，“改上游能力只改一处”才真的成立。
+         */
+        unknownModelInputModalities: (modelId: string) =>
+          CODERLY_ABILITIES[modelId]?.includes('image') === true
+            ? (['text', 'image'] as const)
+            : (['text'] as const),
       },
     )
   }
@@ -317,7 +354,36 @@ export class CodelyAdapter extends LlmAdapter {
    * ⚠️ 池回传的凭据是**裸 `JSON.parse`** ⇒ 使用前必须收窄
    *    （`usableCodelyCredential`），坏条目不掐断流程。
    */
-  private async *streamViaHttp(options: GenerateOptions, retryBudget = 3): AsyncGenerator<StreamChunk> {
+  /**
+   * **跨轮共享的正文块状态**（2026-10-22 对抗审计 A2，P0 修复的核心件）。
+   *
+   * ## 为什么必须跨轮共享
+   *
+   * 停滞续拉（`stalled` 分支）会**递归**再发一次请求。旧实现每层各有一份
+   * 局部的 `text` / `started` ⇒ 三个真缺陷：
+   *
+   * 1. **流式正文 ≠ 落盘正文**（实测）：每层都 `yield block-start(0)` + 追加
+   *    `text-delta(0)`，而 `block-end` 只带**最后一层**的局部 `text`。
+   *    `BlockAssembler` 的 `block-end` 是 **first-close-wins**（`partial.block`
+   *    已存在就忽略）⇒ 最终 blocks 只有最后一段，而用户屏幕上看到的是**全部**
+   *    拼接（实测 `"我先看看。已改好。已改好。已改好。"` vs 落盘 `"已改好。"`）。
+   * 2. **第一轮正文永久丢失**：它只出现在流里，从未进入任何 `block-end`。
+   *    注释还写着「第一轮已下发的正文**保留**」—— 与实现相反。
+   * 3. **续拉不带历史**：`retryOptions.messages` 只追加一条 user 提示，没有把
+   *    上一轮已产出的 assistant 正文加进去 ⇒ 模型不知道自己刚说过什么，只能
+   *    重新生成一遍 —— 这既是重复文本的成因，也让「续拉」退化成「重发」。
+   *
+   * ## 共享之后的不变式
+   *
+   * - `block-start(0)` **整条流只发一次**（`started` 跨轮）；
+   * - `block-end(0)` 只在**不再续拉**的那一层发，且 `text` 用**累积全文**；
+   * - 续拉请求把 `text` 作为 `assistant` 消息带上（见 `stalled` 分支）。
+   */
+  private async *streamViaHttp(
+    options: GenerateOptions,
+    retryBudget = 3,
+    shared: { started: boolean; text: string } = { started: false, text: '' },
+  ): AsyncGenerator<StreamChunk> {
     const model = typeof options.model === 'string' ? options.model : ''
     if (model.length === 0) throw new LlmError('codely: 未指定模型', 'INVALID_REQUEST')
     const pool = this.options.accountPool
@@ -515,7 +581,20 @@ export class CodelyAdapter extends LlmAdapter {
         bodyChars: JSON.stringify(messages).length,
       })
     }
-    const requestBody = JSON.stringify({
+    /**
+     * ⚠️⚠️ **必须是工厂，不能是常量**（2026-10-22 对抗审计 A2）。
+     *
+     * 旧实现是 `const requestBody = JSON.stringify({ … messages … })`，在换号循环
+     * **之前**求值一次。而停滞续拉会换一份 `messages`（带上已产出的 assistant
+     * 正文）**递归**再进本函数 —— 那是新的调用栈，所以旧写法对续拉本身没坏；
+     * 但**换号重发**（`continue`）时 body 也是同一个常量，而 body 与账号无关
+     * 所以当时无害。
+     *
+     * 真正的问题是：一旦有人把「续拉」也做成循环内的一次 `continue`（或将来想
+     * 在重发前改写 messages），常量就会**静默沿用旧 body** —— 症状是「改了代码
+     * 却不生效」，极难排查。⇒ 收敛成工厂，每次发送前现算。
+     */
+    const buildRequestBody = (): string => JSON.stringify({
       model,
       messages,
       stream: true,
@@ -634,37 +713,63 @@ export class CodelyAdapter extends LlmAdapter {
         ...options.signal === undefined ? {} : { signal: options.signal },
       })
       /**
-       * ⚠️⚠️ **换发失败必须换号，不能直接抛**（2026-10-22 对抗审计 P0）。
+       * ⚠️⚠️ **换发失败必须按 `kind` 分档**（2026-10-22 对抗审计 A1，P0 修复）。
        *
-       * ## 原实现为什么错
+       * ## 修的两个真缺陷（同一处代码、两条用户可见后果）
        *
-       * `fetchCodelyCliApiKey` 在**任何非 2xx**（含 401/403/429/5xx）**与网络异常**时
-       * 一律返回 `undefined`（`codely-auth.ts` 的 `if (!res.ok) return undefined` +
-       * `catch { return undefined }`）⇒ 这一格会命中**远超「token 过期」**的情形。
+       * ### ① 不分档 ⇒ 一次网络抖动锁死整池
        *
-       * 而原实现对它**直接 `throw`**：既不走下面 `isCodelyRotatableFailure(...)` 的
-       * 换号判据，也不 `continue` 到下一个账号 ⇒ **池里明明还有能用的号，一个都不试**。
+       * `fetchCodelyCliApiKey` 原先在**任何**失败下都返回 `undefined`：
+       * 401（凭据真失效）、5xx（上游故障）、`fetch` 抛异常（DNS 抖动 / 连接重置）、
+       * 2xx 但缺字段（协议变更）—— **四类事挤成同一个值**，调用方无从分档。
        *
-       * 实测（池 2 个账号，acc-1 的 token 过期、acc-2 正常）：
-       * ```
-       * 修复前：CALLS=["exchange:Bearer EXPIRED"]                    ERROR=PERMISSION_DENIED  CHATTED=false
-       * 修复后：CALLS=["exchange:EXPIRED","exchange:GOOD","chat"]                              CHATTED=true
-       * ```
-       * ⇒ 这正是作者在循环头注释里记的那句用户报障「**用完积分怎么不自动切换账号**」
-       *   的**第二个入口**（第一个 402 已修）。
+       * 而旧实现对这个 `undefined` 无条件执行
+       * `updateModelRateLimit(…, nextUtc8DayStartMs())` ⇒ 一次 5 秒的 DNS 抖动
+       * 会让池里**每一个**账号被标记到 **UTC+8 次日 0 点**（实测距 now 11.15 小时）
+       * ⇒ 用户当天再也选不到这些号（`getAvailableAccount` 的 `modelRateLimits`
+       * 过滤腿会剔掉它们）。
        *
-       * ## 为什么是「记账 + 换号」而不是只换个错误码
+       * ### ② 文案把「网络不通」说成「令牌过期」并引导**删号**
        *
-       * 归 `PERMISSION_DENIED` 的后果是宿主**不重试也不换号**、用户只看到一句
-       * 「去点续期」—— 而 `account.refresh` 对 codely 当前**报「不支持续期」**
-       *（续期链是已知待接项）⇒ 那一句指到的是死路。
+       * 旧文案：「访问令牌可能已过期…请**删除该账号**后重新「+ 新建账号」登录」。
+       * 删除账号 + 清凭据**不可逆**（`docs/agent-notes/protocol-wire.md` 把
+       * 「删除不可逆 ⇒ 读不到池绝不当成没有」列为 P0 纪律），而凭据其实完好。
        *
-       * ⚠️ **不改变**作者的分档意图：401/403 类「同一堵墙」仍不该在**同一个号**上重试；
-       *   这里只做「**换下一个号**」，与 402/429 走同一条换号路径。
-       * ⚠️ 记账沿用下面 402/429 那处**同一写点口径**（`updateModelRateLimit`），否则
-       *   「这个号换发不动」不会被任何地方记住，下次仍被选中、又撞一次同样的墙。
+       * ## 现在的分档（`CodelyCliApiKeyResult.kind`）
+       *
+       * | kind | 动作 | 记账 |
+       * |---|---|---|
+       * | `ok` | 正常推理 | — |
+       * | `credential`（401/403） | **换下一个号** | 记（该号确实不可用） |
+       * | `transient`（网络/5xx/429） | **不换号**，如实报错让用户重试 | **不记** |
+       * | `malformed`（2xx 缺字段） | 不换号，报内部错误 | **不记** |
+       *
+       * ⚠️ `transient` **必须直接抛**（`SERVER`），不能 `continue`：换号只会让同一个
+       *   上游故障去撞另一个账号，纯属白烧整池。
+       * ⚠️ 记账仍沿用 402 那档（次日 0 点），但**只在 `credential` 分支**——那是
+       *   「这个号今天不行了」，与额度耗尽同档是合理的。
+       * ⚠️ `credential` 分支**保留换号**（这是上一轮 P0 修复的正确部分）：
+       *   池里明明还有能用的号时，一个都不试才是原缺陷。
        */
-      if (exchanged === undefined) {
+      if (exchanged.kind !== 'ok') {
+        // ── 传输/协议类失败：不换号、不记账，如实报错（绝不引导删号） ──
+        if (exchanged.kind !== 'credential') {
+          const why = exchanged.kind === 'transient'
+            ? (exchanged.status === undefined
+              ? `网络异常：${exchanged.reason}`
+              : `上游 HTTP ${exchanged.status}`)
+            : exchanged.reason
+          throw new LlmError(
+            `codely: 换发 cli_api_key 失败（${why}）。`
+            + '这是**上游或网络**的问题，不是账号失效 —— 稍后重试即可，'
+            + '**不要删除账号**（凭据仍然有效）。',
+            // ⚠️ 归 `SERVER`：宿主可重试，且客户端不会替换 message。
+            //    绝不归 `AUTH`（会把整条文案吞成「API 密钥无效」）——
+            //    而「上游或网络问题，别删号」正是本条的**唯一出路**。
+            'SERVER',
+          )
+        }
+        // ── 凭据类失败（401/403）：换下一个号 + 记账（原逻辑保留） ──
         // ⚠️ `pool` 在本函数里是**可选**的（`accountPool` 可缺省）；没有池就没有
         //    「下一个号」可换 ⇒ 直接 `break` 落到末尾那句如实报错。
         exchangeFailedOut = true
@@ -675,7 +780,6 @@ export class CodelyAdapter extends LlmAdapter {
           // ③ 记账失败不中断换号（与下面 402/429 那处同一取向）。
         }
         // 换号预算用尽 ⇒ 停止轮换，走最后那句「都不可用」的如实报错。
-        exchangeFailedOut = true
         if (round >= CODERLY_MAX_ROTATE - 1) break
         let nextAccount = await pool.getAvailableAccount<CodelyCredential>(CODERLY.id, model, tried)
         while (nextAccount !== null && !usableCodelyCredential(nextAccount.credential)) {
@@ -699,8 +803,22 @@ export class CodelyAdapter extends LlmAdapter {
       res = await fetcher(url, {
         method: 'POST',
         headers,
-        body: requestBody,
-        ...options.signal === undefined ? {} : { signal: options.signal },
+        body: buildRequestBody(),
+        // ⚠️⚠️ **必须带超时**（2026-10-22 对抗审计 A3）。
+        //
+        // `options.signal` 只在宿主**主动取消**时存在；用户不点「停止」时
+        // （最常见）这条 POST 没有任何时限 ⇒ 上游半开连接 / 网关挂住就是
+        // **永久转圈**，用户以为模型在思考。
+        //
+        // ⚠️ 同文件其余端点（目录 `/api/model-status`、登录三步、积分、签到）
+        //    早就都带 `AbortSignal.timeout` —— 唯独「真正会长时间跑」的推理
+        //    与换发两处漏了。这正是「守卫只覆盖改动的那几行」的典型形态。
+        // ⚠️ 推理用**独立的**长超时（`CODELY_INFERENCE_TIMEOUT_MS`），不能复用
+        //    30s 的目录超时 —— 模型正常生成长回答就可能超过 30s。
+        // ⚠️ `options.signal` 优先（保留宿主取消），`AbortSignal.any` 让两者同时生效。
+        signal: options.signal === undefined
+          ? AbortSignal.timeout(CODELY_INFERENCE_TIMEOUT_MS)
+          : AbortSignal.any([options.signal, AbortSignal.timeout(CODELY_INFERENCE_TIMEOUT_MS)]),
       })
       if (res.ok) break
       detail = await res.text().catch(() => '')
@@ -782,10 +900,19 @@ export class CodelyAdapter extends LlmAdapter {
       //      报「不支持续期」，所以「去点续期」是死路，真正可执行的是重新登录；
       //    - 一次请求都没发起（池空 / 无当前账号）⇒ 内部错误（`SERVER`）。
       if (exchangeFailedOut) {
+        // ⚠️⚠️ **文案不得引导删号**（2026-10-22 对抗审计 A1）：
+        //    能走到这里说明**每一个**被尝试的号都返回了 401/403（`credential` 档），
+        //    但「换发端点拒了」仍不等于「凭据在本地坏了」—— 它也可能是团队策略
+        //    变更 / 上游把该端点改成需要额外 scope。而删号**不可逆**，
+        //    且会让用户失去一个可能只是暂时受限的账号。
+        //    ⇒ 出路写**可逆**的那条：先「重测」（`probeById.codely` 已挂），
+        //      仍不行再重新登录；**明确劝阻**删号。
         throw new LlmError(
-          'codely: 换发 cli_api_key 失败（访问令牌可能已过期）'
+          'codely: 换发 cli_api_key 被拒（401/403）'
           + `，已尝试 ${tried.size} 个账号均不可用`
-          + '。请删除该账号后重新「+ 新建账号」登录',
+          + '。可先点该账号的「重测」确认是否真的失效；'
+          + '若多个账号同时如此，多半是上游把该端点改了权限 —— '
+          + '**不要急着删除账号**（凭据可能仍然有效）',
           'PERMISSION_DENIED',
         )
       }
@@ -825,9 +952,11 @@ export class CodelyAdapter extends LlmAdapter {
     const decoder = new TextDecoder()
     const dsmlFix = createDsmlMarkerNormalizer()
     let buffer = ''
-    let text = ''
-    let started = false
     let ended = false
+    // ⚠️ 正文块状态**来自 `shared`**（跨轮共享，见该参数的注释）——
+    //    本函数内所有 `text` / `started` 的读写都必须走它，不得再声明局部变量
+    //    （否则续拉时又会各层一份，回到 A2 那个缺陷）。
+    const block = shared
     /**
      * 上游 `choices[0].finish_reason`（`stop` / `length` / `tool_calls` / `content_filter`）。
      *
@@ -996,11 +1125,11 @@ export class CodelyAdapter extends LlmAdapter {
           if (delta.length === 0) continue
           const fixed = dsmlFix.push(delta)
           if (fixed.length === 0) continue
-          if (!started) {
-            started = true
+          if (!block.started) {
+            block.started = true
             yield { type: 'block-start', index: 0, blockType: 'text' }
           }
-          text += fixed
+          block.text += fixed
           yield { type: 'text-delta', index: 0, text: fixed }
         }
       }
@@ -1011,11 +1140,11 @@ export class CodelyAdapter extends LlmAdapter {
     // 流尾 flush（不 flush ⇒ 回答尾部丢字符，见 `dsml-normalizer-coverage.spec.ts`）
     const tail = dsmlFix.flush()
     if (tail.length > 0) {
-      if (!started) {
-        started = true
+      if (!block.started) {
+        block.started = true
         yield { type: 'block-start', index: 0, blockType: 'text' }
       }
-      text += tail
+      block.text += tail
       yield { type: 'text-delta', index: 0, text: tail }
     }
     // ── 推理块收尾：先 flush 待定缓冲（不 flush ⇒ 思考内容尾部丢字）──
@@ -1077,16 +1206,59 @@ export class CodelyAdapter extends LlmAdapter {
      * 明显更差 —— 用户明确要求「全自动、不要一步步确认」。
      * ⚠️ 仍有 `text.trim().length < 500` 兜住：正常长篇回答不该被它打断。
      */
+    /**
+     * ⚠️⚠️ **`stalled` 判定必须在流尾 flush 之后**（2026-10-22 对抗审计 A2）。
+     *
+     * `dsmlFix.push()` 会把「可能构成标记前缀」的尾部**扣住**不下发，直到
+     * `flush()` 才吐出来。而旧实现把 `stalled` 判定放在 flush **之前** ⇒
+     * 短正文（正是停滞场景的典型形态）常常还整个扣在缓冲里 ⇒
+     * `block.text` 是空串 ⇒
+     *
+     * ① `text.trim().length < 500` 恒真（判据退化成「只看有没有工具」）；
+     * ② 续拉时追加的 assistant 消息内容是**空串**（实测 `{"role":"assistant","content":""}`），
+     *    而空 assistant 会被上游当格式错误 —— 这正是本仓库
+     *    `protocol-wire.md` 记过的「空 assistant 把 400 挪到上游」形态。
+     *
+     * 修法：把 flush 抽成幂等的局部函数，**判定前先调一次**，流尾再调一次
+     * （`flush()` 自身清空缓冲，第二次返回空串，不会重复下发）。
+     */
     const stalled = retryBudget > 0
       && finishReason !== 'length'
       && announcedTools.length === 0
       && (options.tools?.length ?? 0) > 0
-      && text.trim().length < 500
+      && block.text.trim().length < 500
     if (stalled) {
+      /**
+       * ⚠️⚠️ **续拉必须把已产出的正文作为 `assistant` 消息带上**
+       * （2026-10-22 对抗审计 A2）。
+       *
+       * 旧实现只追加了一条 user 提示 ⇒ 模型**看不到自己刚说过什么**，
+       * 只能重新生成一遍（实测第二轮 `messages` 里不含任何 assistant 条目）。
+       * 这既是「同一段文字在屏幕上出现 3~4 次」的成因，也让「续拉」在语义上
+       * 退化成「重发」—— 白烧额度且结果不可预期。
+       *
+       * ⚠️ 只有**正文非空**时才追加：空 assistant 消息会被上游当格式错误
+       *   （本仓库 `protocol-wire.md` 记过「空 assistant 把 400 挪到上游」）。
+       */
+      const produced = block.text.trim()
       const retryOptions = {
         ...options,
         messages: [
           ...(options.messages ?? []),
+          ...produced.length === 0
+            ? []
+            // ⚠️⚠️ **content 必须是 harness 的「块数组」，不能是裸字符串**
+            //    （2026-10-22 A2 修的第二处坑）：
+            //    `serializeMessages`（`openai-compat.ts:239`）的 assistant 分支是
+            //    `Array.isArray(message.content) ? message.content : []` ⇒
+            //    传字符串会被判成空数组 ⇒ `contentToText([])` = `''` ⇒
+            //    **wire 上的 assistant 正文变成空串**（实测 `{"role":"assistant","content":""}`）。
+            //    而空 assistant 会被上游当格式错误（本仓 `protocol-wire.md`
+            //    记过「空 assistant 把 400 挪到上游」）⇒ 续拉反而更容易失败。
+            : [{
+                role: 'assistant' as const,
+                content: [{ type: 'text' as const, text: block.text }],
+              }],
           {
             role: 'user',
             content: '（系统提示）不要只说明计划或"准备开始"。**现在这一刻就调用工具执行**：'
@@ -1096,16 +1268,18 @@ export class CodelyAdapter extends LlmAdapter {
         ],
         forceToolChoice: true,
       } as unknown as GenerateOptions
-      yield* this.streamViaHttp(retryOptions, retryBudget - 1)
+      // ⚠️ 传 `shared`（第 3 参）：正文块状态跨轮**同一份** ⇒ `block-start(0)` 只发
+      //    一次、`block-end(0)` 带**累积全文**（旧实现各层一份 ⇒ 流式≠落盘）。
+      yield* this.streamViaHttp(retryOptions, retryBudget - 1, block)
       return
     }
 
     // ⚠️ 有工具调用但没有正文是**正常**的（模型直接调工具），不算空响应
-    if (!started && announcedTools.length === 0) {
+    if (!block.started && announcedTools.length === 0) {
       throw new LlmError('codely: 上游未产出任何内容', 'EMPTY_RESPONSE')
     }
-    if (started) {
-      yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    if (block.started) {
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: block.text } }
     }
     /**
      * 工具块收尾（每个已公告调用发一个 `block-end`）。

@@ -27,7 +27,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-it('共 22 条（20 个真渠道 + aggregate + codely；codely 2026-10-20 仍 channel:false）', () => {
+it('共 23 条（21 个真渠道 + aggregate；codely 2026-10-22 已翻 channel:true）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
@@ -44,9 +44,13 @@ it('共 22 条（20 个真渠道 + aggregate + codely；codely 2026-10-20 仍 ch
     //    期望值当时仍是上游的 21 ⇒ 变红。按**注册表事实**更正为 22（这条断言是
     //    「注册表没被误删」的唯一防线，数字必须跟着注册表走，不能反向改注册表凑数）。
     expect(PROVIDER_REGISTRY).toHaveLength(23)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(21)
-    expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
-    expect(PROVIDER_REGISTRY.find((d) => d.id === 'codely')?.channel).toBe(false)
+    // ⚠️ 2026-10-22（A6）：codely **已翻 `channel: true`** —— 它的推理 / 目录 / 余额 / 签到 / 续期全部已接线，
+    //    而 `channel` 在生产代码里**零个读取点** ⇒ 原来那个 `false` 只是为了让守卫不变红而选的，它同时把 codely 挡在聚合目录之外。现在真实接线已完成，翻正。
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(22)
+    expect(
+      PROVIDER_REGISTRY.find((d) => d.id === 'codely')?.channel,
+      'codely 已接线完成，必须是 channel: true（否则它的模型永不进聚合目录）',
+    ).toBe(true)
   })
 
   /**

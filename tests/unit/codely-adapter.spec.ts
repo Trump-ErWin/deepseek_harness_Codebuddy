@@ -510,3 +510,381 @@ describe('Codely 适配器：远端目录全被团队前缀过滤掉 ⇒ 回退�
     expect(warnings.some((w) => w.includes('过滤')), '必须留一行 warn（否则线上「0 个模型」且无日志）').toBe(true)
   })
 })
+
+/**
+ * ★★ **停滞续拉不得让「流式正文」与「落盘正文」分叉**（2026-10-22 对抗审计 A2，P0）。
+ *
+ * ## 修的三条真缺陷（同一处代码）
+ *
+ * ① 每层递归各有一份局部 `text` / `started` ⇒ 每层都发 `block-start(0)` 并追加
+ *    `text-delta(0)`，而 `block-end` 只带**最后一层**的局部 `text`。而
+ *    `BlockAssembler` 的 `block-end` 是 **first-close-wins**（`partial.block` 已存在
+ *    就忽略）⇒ 最终 blocks 只有最后一段。
+ *    实测（修复前）：流式累计 `"我先看看。已改好。已改好。已改好。"`，
+ *    落盘 `"已改好。"` —— 用户截图/复制的内容与重开会话看到的不一致。
+ * ② 第一轮正文**永久丢失**（它只出现在流里，从未进入任何 `block-end`），
+ *    而注释还写着「第一轮已下发的正文**保留**」。
+ * ③ 续拉请求**不带**上一轮 assistant 正文 ⇒ 模型看不到自己刚说过什么，
+ *    只能重新生成（这也是 ① 的重复文本成因）。
+ *
+ * ## 判据为什么用**真实 `BlockAssembler`**（不是自己拼字符串）
+ *
+ * 「流式累计」与「组装结果」是否一致，只有真组装器说了算 —— 它的
+ * `block-start` 幂等 + `block-end` first-close-wins 语义正是本缺陷的放大器。
+ * 自己拼字符串会得到一个**恒真**的断言（两边都是我写的）。
+ */
+describe('Codely 停滞续拉：流式正文必须等于落盘正文', () => {
+  /** 第 N 轮固定回一段短正文（触发 `stalled`：有工具 + 零调用 + 正文 < 500 字）。 */
+  function adapterWithRounds(texts: string[], seenMessages: unknown[][]): CodelyAdapter {
+    let round = 0
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('/api/api-token/cli-api-key')) {
+        return new Response(JSON.stringify({ cli_api_key: 'sk-x', user_id: 1 }), { status: 200 })
+      }
+      const body = JSON.parse(String(init?.body ?? '{}')) as { messages?: unknown[] }
+      seenMessages.push(body.messages ?? [])
+      const text = texts[Math.min(round, texts.length - 1)]!
+      round += 1
+      return new Response(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: text }, finish_reason: 'stop' }] })}\n\n`
+        + 'data: [DONE]\n\n',
+        { status: 200 },
+      )
+    }) as never
+    return new CodelyAdapter({
+      credentialProvider: async () => ({ access_token: 't', refresh_token: 'r' } as never),
+      fetchImpl,
+    } as CodelyAdapterOptions)
+  }
+
+  const TOOLS = [{ name: 'write_file', description: 'w', parameters: { type: 'object', properties: {} } }]
+
+  it('★★ 三轮都停滞 ⇒ 组装结果必须包含**全部**三轮正文（修复前只剩最后一轮）', async () => {
+    const { BlockAssembler } = await import('@deepseek-ai/dsh-llm')
+    const seen: unknown[][] = []
+    const adapter = adapterWithRounds(['我先看看。', '已改好。', '已改好。', '已改好。'], seen)
+    const assembler = new BlockAssembler()
+    let streamed = ''
+    for await (const chunk of adapter.stream({
+      model: 'codely-flash',
+      messages: [{ role: 'user', content: 'go' }],
+      tools: TOOLS,
+    } as never)) {
+      assembler.push(chunk as never)
+      if (chunk.type === 'text-delta') streamed += chunk.text
+    }
+    const blocks = (assembler as unknown as { blocks(): Array<{ type: string; text?: string }> }).blocks()
+    const persisted = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('')
+
+    // ① 决定性断言：流式累计 == 落盘正文（修复前：前者 4 段、后者 1 段）
+    expect(persisted, '流式正文与落盘正文必须逐字节一致（A2 原缺陷：只剩最后一轮）')
+      .toBe(streamed)
+    // ② 第一轮正文不得丢失（修复前它从未进入任何 block-end）
+    expect(persisted, '第一轮正文「我先看看。」不得丢失').toContain('我先看看。')
+    // ③ 整条流只能有一个 text 块（多轮各发 block-start(0) 是缺陷形态）
+    expect(blocks.filter((b) => b.type === 'text').length, '整条流只能有一个 text 块').toBe(1)
+  })
+
+  it('★★ 续拉请求必须把上一轮 assistant 正文带进 messages（修复前不带 ⇒ 模型不知自己说过什么）', async () => {
+    const seen: unknown[][] = []
+    const adapter = adapterWithRounds(['我先看看。', '已改好。'], seen)
+    for await (const _chunk of adapter.stream({
+      model: 'codely-flash',
+      messages: [{ role: 'user', content: 'go' }],
+      tools: TOOLS,
+    } as never)) { /* 消费完 */ }
+
+    expect(seen.length, '必须真的发生了续拉（至少 2 轮）').toBeGreaterThanOrEqual(2)
+    const second = seen[1] ?? []
+    const hasAssistant = second.some((m) => {
+      const role = (m as { role?: unknown }).role
+      const content = (m as { content?: unknown }).content
+      return role === 'assistant' && typeof content === 'string' && content.includes('我先看看。')
+    })
+    expect(hasAssistant, '第二轮 messages 必须含上一轮的 assistant 正文（A2 缺陷 ③）').toBe(true)
+  })
+})
+
+/**
+ * ★★ **推理与换发两个端点都必须带超时**（2026-10-22 对抗审计 A3）。
+ *
+ * ## 守的真缺陷
+ *
+ * `options.signal` 只在宿主**主动取消**时存在。用户不点「停止」时（最常见），
+ * 两处 fetch 都**没有任何时限** ⇒ 上游半开连接 / 网关挂住 = 界面**永久转圈**，
+ * 用户以为模型在思考。
+ *
+ * ⚠️ 而同文件其余 5 处（登录三步 / me / 目录 / 积分 / 签到）早就都带
+ * `AbortSignal.timeout` —— 唯独「真正会长时间跑」的这两处漏了。
+ * 这正是审计那轮「守卫只覆盖改动的那几行、不覆盖它依赖的调用链」的典型。
+ *
+ * ## 判据
+ *
+ * 直接读 `fetch` 的 `init.signal` —— 它是**唯一**可观测出口（超时本身不可测，
+ * 除非真等 10 分钟）。同时断言两处的超时**不是同一个常量值**（推理必须更长）。
+ */
+describe('Codely 推理与换发必须带超时', () => {
+  it('★★ 推理 POST 与换发 GET 都必须有 signal（用户不取消时也要有上限）', async () => {
+    const signals: Array<{ url: string; signal: unknown }> = []
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      signals.push({ url, signal: init?.signal })
+      if (url.includes('/api/api-token/cli-api-key')) {
+        return new Response(JSON.stringify({ cli_api_key: 'sk-x' }), { status: 200 })
+      }
+      return new Response(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] })}\n\n`
+        + 'data: [DONE]\n\n',
+        { status: 200 },
+      )
+    }) as never
+    const adapter = new CodelyAdapter({
+      credentialProvider: async () => ({ access_token: 't', refresh_token: 'r' } as never),
+      fetchImpl,
+    } as CodelyAdapterOptions)
+    for await (const _chunk of adapter.stream({
+      model: 'codely-flash',
+      messages: [{ role: 'user', content: 'hi' }],
+    } as never)) { /* 消费完 */ }
+
+    const exchange = signals.find((s) => s.url.includes('/api/api-token/cli-api-key'))
+    const chat = signals.find((s) => s.url.includes('/chat/completions'))
+    expect(exchange, '必须真发过换发请求').toBeDefined()
+    expect(chat, '必须真发过推理请求').toBeDefined()
+    // ⚠️ 决定性断言：两处都必须有 signal（A3 原缺陷：两处都是 ABSENT）
+    expect(exchange!.signal, '换发请求必须带 signal（否则上游挂住即永久转圈）').toBeDefined()
+    expect(chat!.signal, '推理请求必须带 signal（否则上游挂住即永久转圈）').toBeDefined()
+  })
+
+  it('★ 推理超时必须长于目录/登录那档（30s 撑不住正常长回答）', async () => {
+    // 读源码常量：两个值不可相同（这是「共用一档」缺陷的判据）。
+    const { readFileSync } = await import('node:fs')
+    const adapterSrc = readFileSync(
+      new URL('../../src/codely-adapter.ts', import.meta.url),
+      'utf8',
+    )
+    const authSrc = readFileSync(
+      new URL('../../src/codely-auth.ts', import.meta.url),
+      'utf8',
+    )
+    const inference = /const CODELY_INFERENCE_TIMEOUT_MS = ([\d_]+)/.exec(adapterSrc)?.[1]
+    const http = /export const CODELY_HTTP_TIMEOUT_MS = ([\d_]+)/.exec(authSrc)?.[1]
+    expect(inference, '找不到 CODELY_INFERENCE_TIMEOUT_MS —— 判据锚点失效').toBeDefined()
+    expect(http, '找不到 CODELY_HTTP_TIMEOUT_MS —— 判据锚点失效').toBeDefined()
+    const inferenceMs = Number(inference!.replace(/_/g, ''))
+    const httpMs = Number(http!.replace(/_/g, ''))
+    expect(inferenceMs, '推理超时必须显著长于 30s 的目录/登录档（实测单次可跑数分钟）')
+      .toBeGreaterThan(httpMs * 3)
+  })
+})
+
+/**
+ * ★★ **图片能力的两个出口必须同源**（2026-10-22 对抗审计 A4）。
+ *
+ * ## 守的真缺陷
+ *
+ * `toCatalogEntry`（目录腿）逐模型声明了实测能力，而
+ * `unknownModelInputModalities`（`resolveModel` 对「目录里没有该 id」的兜底腿）
+ * 恒报 `['text']`。两腿分叉 ⇒ **目录收缩时，实测能收图的模型被硬拒图片**：
+ *
+ * | 情形 | `resolveModel('codely-flash').inputModalities` |
+ * |---|---|
+ * | 目录里有它 | `['text','image']` ✅ |
+ * | **目录收缩后不在** | `['text']` ❌（而它实测能收图） |
+ *
+ * DSH 对 `['text']` 的语义是**明确不支持**（把图投影成文本占位）⇒ 图**根本
+ * 到不了适配器**，用户只看到「模型说它没看到图」。
+ *
+ * ⚠️ 这是 `docs/agent-notes/providers-codearts.md` 记过的**同一条形态**
+ * （「只改 `toCatalogEntry` 恒无效」「`unknownModelInputModalities` 是第二条腿」）
+ * —— codely 当时正好是**反过来的那一半**。
+ *
+ * ## 判据为什么必须「目录里没有它」
+ *
+ * 目录里有时走的是 `toCatalogEntry`（本来就对），**测不出**这个缺陷。
+ * 必须先把远端目录收缩成一条，再 `resolveModel` 一个不在目录里但实测能收图的 id。
+ */
+describe('Codely 图片能力：目录腿与兜底腿必须同源', () => {
+  function adapterWithShrunkCatalog(remoteIds: string[]): CodelyAdapter {
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/api-token/cli-api-key')) {
+        return new Response(JSON.stringify({ cli_api_key: 'sk-x' }), { status: 200 })
+      }
+      // 目录端点：只下发给定 id
+      // ⚠️ 字段名必须是 `modelGroup`（上游原始报文形状，见 `codely-adapter.ts:1576`）
+      //    —— 写成 `id` 会解析出 0 条 ⇒ 回退兜底表 ⇒ 「目录里没有它」这个前提不成立（判据会假绿）。
+      return new Response(JSON.stringify({ models: remoteIds.map((modelGroup) => ({ modelGroup, status: 'active' })) }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }) as never
+    return new CodelyAdapter({
+      credentialProvider: async () => ({ access_token: 't', refresh_token: 'r' } as never),
+      fetchImpl,
+    } as CodelyAdapterOptions)
+  }
+
+  it('★★ 目录收缩后，实测能收图的模型仍必须声明 image（修复前退化成 text）', async () => {
+    // 远端只给 codely-core ⇒ codely-flash / codely-air 不在目录里
+    const adapter = adapterWithShrunkCatalog(['codely-core'])
+    await adapter.listModels().catch(() => undefined)
+
+    for (const id of ['codely-flash', 'codely-air', 'codely-basic']) {
+      // ⚠️ `resolveModel` 是 **(provider, model) 两个参数**（骨架签名）——
+      //    只传一个会把 id 当成 provider、model 为 `undefined`，判据会**假绿**。
+      const resolved = await adapter.resolveModel('codely', id).catch(() => undefined) as
+        | { inputModalities?: readonly string[] }
+        | undefined
+      expect(resolved, `${id} 的 resolveModel 不该失败`).toBeDefined()
+      expect(
+        resolved!.inputModalities,
+        `${id} 实测能收图（CODERLY_ABILITIES 白名单），目录里没有它时也必须声明 image —— `
+        + '否则 DSH 把图投影成占位，图根本到不了适配器（A4 缺陷）',
+      ).toContain('image')
+    }
+  })
+
+  it('★ 反向对照：实测**不**收图的模型仍必须报 text（不得因为「同源」就一律放行）', async () => {
+    const adapter = adapterWithShrunkCatalog(['codely-core'])
+    await adapter.listModels().catch(() => undefined)
+
+    for (const id of ['codely-core', 'codely-vl']) {
+      // 实测：codely-core 回 400「Model only supports text」；codely-vl 收图反而 400
+      // ⚠️ `resolveModel` 是 **(provider, model) 两个参数**（骨架签名）——
+      //    只传一个会把 id 当成 provider、model 为 `undefined`，判据会**假绿**。
+      const resolved = await adapter.resolveModel('codely', id).catch(() => undefined) as
+        | { inputModalities?: readonly string[] }
+        | undefined
+      expect(resolved!.inputModalities, `${id} 实测不收图（拒图），必须报 text`).not.toContain('image')
+    }
+  })
+})
+
+/**
+ * ★★ **`finish_reason` 的分类必须真的生效**（2026-10-22 对抗审计 M-13）。
+ *
+ * ## 守的真缺陷
+ *
+ * `finish_reason === 'length'` 必须报 `max-tokens`（让宿主知道“被截断了”，它会续写 / 压缩）。
+ * 而实测：把该判据改成**恒假**，全部 28 条用例**仍然全绿** ——
+ * 即「这件事根本没人守」。而它的真实后果是 2026-10-20 的报障：
+ * 模型说「开始写游戏页面骨架：」后 12 秒静默结束、大段 HTML 没出来，
+ * 而界面告诉用户的是“正常说完”。
+ *
+ * ## 判据为什么必须看 `finish.reason.kind`
+ *
+ * 它是唯一可观测出口（落盘与续写都由它驱动）。只断言“正文正确”是恒真的。
+ */
+describe('Codely finish_reason 分类', () => {
+  function adapterWithFinish(finishReason: string | undefined): CodelyAdapter {
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      if (String(input).includes('/api/api-token/cli-api-key')) {
+        return new Response(JSON.stringify({ cli_api_key: 'sk-x' }), { status: 200 })
+      }
+      const choice: Record<string, unknown> = { delta: { content: 'ok' } }
+      if (finishReason !== undefined) choice.finish_reason = finishReason
+      return new Response(
+        `data: ${JSON.stringify({ choices: [choice] })}\n\n` + 'data: [DONE]\n\n',
+        { status: 200 },
+      )
+    }) as never
+    return new CodelyAdapter({
+      credentialProvider: async () => ({ access_token: 't', refresh_token: 'r' } as never),
+      fetchImpl,
+    } as CodelyAdapterOptions)
+  }
+
+  it('★★ length ⇒ max-tokens（宿主据此续写/压缩）', async () => {
+    const kinds: unknown[] = []
+    for await (const chunk of adapterWithFinish('length').stream({
+      model: 'codely-flash', messages: [{ role: 'user', content: 'go' }],
+    } as never)) {
+      if (chunk.type === 'finish') kinds.push(chunk.reason.kind)
+    }
+    expect(kinds, 'finish_reason=length 必须报 max-tokens（否则用户只看到“说一半就没了”）')
+      .toEqual(['max-tokens'])
+  })
+
+  it('★ stop ⇒ stop（不得把正常回答报成截断）', async () => {
+    const kinds: unknown[] = []
+    for await (const chunk of adapterWithFinish('stop').stream({
+      model: 'codely-flash', messages: [{ role: 'user', content: 'go' }],
+    } as never)) {
+      if (chunk.type === 'finish') kinds.push(chunk.reason.kind)
+    }
+    expect(kinds).toEqual(['stop'])
+  })
+})
+
+/**
+ * ★★ **远端读到但为空 ≠ 成功**（2026-10-22 对抗审计 M-25）。
+ *
+ * `ensureRemoteModels` 的成功判据是 `models.length > 0`。把它去掉（空数组也算成功）
+ * 后实测 **18 条全绿** ⇒ 无人守。而后果是：上游一旦返回空目录，
+ * 模型选择器变成**一个模型都没有**（与「无账号」同形），而兜底表本可以兑底。
+ */
+describe('Codely 目录：远端空数组必须回退兜底表', () => {
+  it('★★ 远端回 {models:[]} ⇒ listModels 仍有兜底表那几个模型', async () => {
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      if (String(input).includes('/api/api-token/cli-api-key')) {
+        return new Response(JSON.stringify({ cli_api_key: 'sk-x' }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ models: [] }), { status: 200 })
+    }) as never
+    const adapter = new CodelyAdapter({
+      credentialProvider: async () => ({ access_token: 't', refresh_token: 'r' } as never),
+      fetchImpl,
+    } as CodelyAdapterOptions)
+    const models = await adapter.listModels()
+    expect(
+      models.length,
+      '远端明明读到了但为空 ⇒ 必须回退兜底表（否则选择器一个模型都没有）',
+    ).toBeGreaterThan(0)
+  })
+
+  /**
+   * ⚠️⚠️ **上一条存在一层遮蔽（2026-10-22 自查发现）**：
+   *
+   * `catalogEntries()` 还有一道「**过滤后为空则回退兜底表**」的保底
+   * （它本是为“远端全是公共模型”那个 P1 加的）；`listAllModels()` 走的
+   * 也是同一条 `catalogEntries` ⇒ **两个公开出口都被遮蔽**。
+   *
+   * 实测：把 `ensureRemoteModels` 里的 `models.length === 0` 删掉（**空数组也算成功**），
+   * 上一条仍然全绿 —— 因为空目录进了 `remoteModels`、过滤后为空、
+   * 于是那道保底又把它兜回了兜底表。
+   *
+   * ## 判据为何改用 `onCatalogLoaded` 通知（两次订正后的结论）
+   *
+   * - 初版写「第二次 `listModels()` 应再请一次」—— 在**修复态**下就失败：
+   *   `RemoteCatalogGate` 失败后**故意**置冷却防密集重试 ⇒ 那是设计正确行为；
+   * - 二版写「计数 > 1」—— 与实际计数不符，**无牙**。
+   *
+   * ⇒ 用 **`onCatalogLoaded` 回调是否被调用**做判据：它**只在** `catalogGate.run`
+   * 返回 `true`（真正落地了一份目录）时才发出 ⇒ 空数组若算成功就会
+   * 多一次通知；算失败就一次也没有。这是行为判据（不读源码文本）。
+   */
+  it('★★ 远端空数组**不算读成功**（不得目录已加载）', async () => {
+    let loaded = 0
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      if (String(input).includes('/api/api-token/cli-api-key')) {
+        return new Response(JSON.stringify({ cli_api_key: 'sk-x' }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ models: [] }), { status: 200 })
+    }) as never
+    const adapter = new CodelyAdapter({
+      credentialProvider: async () => ({ access_token: 't', refresh_token: 'r' } as never),
+      fetchImpl,
+      onCatalogLoaded: () => { loaded += 1 },
+    } as CodelyAdapterOptions)
+    const models = await adapter.listModels()
+    // ① 行为结果：必须回退兜底表（而不是 0 个模型）
+    expect(models.length, '远端空数组 ⇒ 必须回退兜底表（否则选择器一个模型都没有）')
+      .toBeGreaterThan(0)
+    // ② 关键：空数组**不得**触发「目录已加载」通知
+    expect(
+      loaded,
+      '空数组被当成「读成功」了 ⇒ 它应该算失败（否则一次抖动会把目录永久置空）',
+    ).toBe(0)
+  })
+})

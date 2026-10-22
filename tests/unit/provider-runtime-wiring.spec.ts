@@ -412,7 +412,8 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    再加 astudio（本 fork 与上游各登记一次）⇒ 19 → 20 个真渠道，
     //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20 个 auth 键。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(20)
+    // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(21)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
@@ -422,7 +423,10 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //   那个 `registry` 数组里 ⇒ `runtimeOf('codely') === undefined` ⇒ 用户点
     //   「重测」必报「codely 没有探测适配器」）。⇒ 反向断言同样要把它算进来，
     //   否则「修好了」这件事本身会让本条变红。理由与上面那条用例同源。
-    ).toEqual([...shouldRegister, 'codely'].sort())
+    // ⚠️ 2026-10-22（A6）：codely 现已翻 `channel: true` 并接入 auth ⇒ 它**已在**
+    //    `shouldRegister` 里，不得再额外加 `'codely'`（会重复。旧写法是它当时
+    //    无 auth 却有 runtime 的补丁；现在两者同源）。
+    ).toEqual([...shouldRegister].sort())
   })
 })
 
