@@ -176,8 +176,10 @@ function readSignal() {
  * @returns {Promise<'sidebar' | 'settings'>} 读到的值；失败时沿用当前状态（兜底仅侧栏）
  */
 export function loadPanelEntry(rpcCall) {
+  // 已有在飞的请求就复用：复用同一份 Promise，调用方拿到的值与「自己发一次」
+  // 逐字节一致（同一个网络回包）。
   if (inflight !== null) return inflight;
-  inflight = (async () => {
+  const task = (async () => {
     try {
       const result = await rpcCall('panelEntry.get', {}, readSignal());
       const next = normalize(result?.entry);
@@ -192,11 +194,14 @@ export function loadPanelEntry(rpcCall) {
       console.warn('[jet-hub] 读取面板入口偏好失败，按仅侧栏处理', caught);
       publish(entry ?? FALLBACK_ENTRY, true);
     } finally {
+      // ⚠️ 清空必须放在整个函数**最后**：先算出返回值再清，否则并发的第二个
+      //    调用方可能在 `inflight` 已置空、本次尚未 return 的窗口里再发一次。
       inflight = null;
     }
     return entry ?? FALLBACK_ENTRY;
   })();
-  return inflight;
+  inflight = task;
+  return task;
 }
 
 /**

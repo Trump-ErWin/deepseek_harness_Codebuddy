@@ -30,6 +30,7 @@ import * as React from 'react';
 import { IconChevronDownOutlineRegular, Menu } from '@deepseek-ai/dsh-client-ui-primitives';
 
 import {
+  loadPanelEntry,
   panelEntry,
   panelEntryReadFailed,
   setPanelEntry,
@@ -88,6 +89,20 @@ export function JetHubPanelEntryCard({ rpcCall }) {
     setEntry(currentEntry());
     setFailed(panelEntryReadFailed());
   }), []);
+
+  // ⚠️ 挂载时**自己读一次**，不能只依赖 `panel-entry.js` 那两处。
+  //
+  // 那两处只在「对应槽位被 inject」时才跑；若宿主某天不再提供其中一个槽位
+  // （或本插件只在详情页被打开、两处 inject 都还没触发），卡片就会永远停在
+  // 默认值上，而下拉显示的却是「仅侧栏」——用户会以为自己的设置丢了。
+  // store 的 `loadPanelEntry` 自带并发去重，这次调用不会多打一次 RPC。
+  React.useEffect(() => {
+    if (typeof rpcCall !== 'function') return;
+    void loadPanelEntry(rpcCall).then(() => {
+      setEntry(currentEntry());
+      setFailed(panelEntryReadFailed());
+    });
+  }, [rpcCall]);
 
   const selectedLabel = OPTIONS.find((option) => option.id === entry)?.label ?? OPTIONS[0].label;
 

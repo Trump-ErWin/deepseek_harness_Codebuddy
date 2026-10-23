@@ -171,8 +171,16 @@ export function registerJetHubPanelEntries(ctx, rpcCall) {
     const unsubscribe = subscribePanelEntry(() => sync(panelEntryShowsSidebar()));
     // 启动时先等一次宿主读值：`panelEntry()` 为 `null` 期间本函数按「仅侧栏」
     // 兜底（见 store 的 `panelEntryShowsSidebar`），故这里只需读一次。
-    void loadPanelEntry(rpcCall).then(() => sync(panelEntryShowsSidebar()));
+    //
+    // ⚠️ `disposed` 守卫**必需**：本槽位被宿主 dispose 之后，在飞的那次读取仍会
+    //    resolve，那时再调 `sync` 就会往一个已销毁的作用域里重新注册（热替换时
+    //    留下双份注册，表现为侧栏出现两行）。
+    let disposed = false;
+    void loadPanelEntry(rpcCall).then(() => {
+      if (!disposed) sync(panelEntryShowsSidebar());
+    });
     return () => {
+      disposed = true;
       unsubscribe();
       if (stopRow !== undefined) {
         const stop = stopRow;
@@ -218,8 +226,13 @@ export function registerJetHubPanelEntries(ctx, rpcCall) {
     // ⚠️ 与侧栏行相反：`panelEntry()` 为 `null`（还没读到）时本函数返回 false，
     //    所以首次读值**必须**等回来再判 —— 否则「仅设置页」的用户每次启动都
     //    会看到设置节晚一拍出现。
-    void loadPanelEntry(rpcCall).then(() => sync(panelEntryShowsSettings()));
+    // ⚠️ `disposed` 守卫同侧栏行那条：dispose 之后在飞的读取仍会 resolve。
+    let disposed = false;
+    void loadPanelEntry(rpcCall).then(() => {
+      if (!disposed) sync(panelEntryShowsSettings());
+    });
     return () => {
+      disposed = true;
       unsubscribe();
       if (stopSection !== undefined) {
         const stop = stopSection;
