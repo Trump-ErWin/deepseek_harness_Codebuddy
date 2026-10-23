@@ -32,6 +32,16 @@ describe('插件详情页槽位接线', () => {
     expect(indexSource).toContain('inject: () => ({ rpcCall })')
   })
 
+  it('⚠️ 注册选项里**确实带了 key**（不只是源码某处出现这串字，复核 M2）', () => {
+    const start = indexSource.indexOf("ctx.slots.inject('plugins.bundle.config'")
+    expect(start).toBeGreaterThan(-1)
+    const block = indexSource.slice(start, indexSource.indexOf('}, JetHubPanelEntryCard)', start))
+    expect(block, 'bundle.config 注册块里没有 key 选项').toMatch(/key:\s*'[^']+'/)
+    expect(block).toContain(`key: '${pkg.name}'`)
+    // 槽位名也必须逐字出现在同一个注册块里。
+    expect(block).toContain("name: 'plugins.bundle.config'")
+  })
+
   it('⚠️ settings.section 不再在 apply 里无条件注册（改由注册器按枚举增删）', () => {
     expect(indexSource).not.toMatch(/ctx\.slots\.inject\('settings\.section'/)
   })
@@ -48,6 +58,51 @@ describe('插件详情页槽位接线', () => {
     // `packages/client/AGENTS.md`：PLATFORM_MODULES 是隐式 external 基座，
     // 重复声明会造成「同一模块有两个提供方」。
     expect(pkg.dsh.client.external ?? []).not.toContain('@deepseek-ai/dsh-client-ui-primitives')
+  })
+})
+
+/**
+ * ⚠️ **跨语言对拍**（2026-10-24 复核 M7）：合法取值在宿主是 TS、在客户端是 JS，
+ * 跨语言无法 import，所以是**两份字面量**。将来加第三项时漏改一侧的后果是
+ * 「客户端把合法值当非法」——读取被丢弃、写入被宿主以 `bad-request` 拒。
+ * 本仓库对这类「两份真源」一贯用源码文本对拍（见 `client-registration-id.spec.ts`）。
+ */
+describe('PanelEntry 合法取值：宿主与客户端必须逐字一致', () => {
+  /**
+   * 从源码文本里抽出「同一行内、锚点之后」那个数组字面量的字符串元素。
+   *
+   * ⚠️ 只截到**行尾**：宿主的声明是
+   * `export const PANEL_ENTRY_VALUES: readonly PanelEntry[] = ['sidebar', 'settings']`
+   * —— 类型注解里的 `[]` 会让「找第一个 `[`」提前闭合（实测假红）。
+   */
+  const entriesOf = (text: string, anchor: string): string[] => {
+    const at = text.indexOf(anchor)
+    expect(at, `找不到锚点 ${anchor}`).toBeGreaterThan(-1)
+    const lineEnd = text.indexOf('\n', at)
+    const line = text.slice(at, lineEnd === -1 ? text.length : lineEnd)
+    const open = line.indexOf('= [')
+    expect(open, `锚点 ${anchor} 所在行找不到 "= ["`).toBeGreaterThan(-1)
+    return [...line.slice(open).matchAll(/'([^']+)'/g)].map((m) => m[1])
+  }
+
+  it('宿主的 PANEL_ENTRY_VALUES 与客户端的 VALID_ENTRIES 完全相同', () => {
+    const host = entriesOf(read('src/jet-hub-store.ts'), 'PANEL_ENTRY_VALUES: readonly')
+    const client = entriesOf(read('plugin-src/client/panel-entry-store.js'), 'VALID_ENTRIES =')
+
+    expect(host.length, '宿主枚举为空，抽词失败').toBeGreaterThan(0)
+    expect(client).toEqual(host)
+  })
+
+  it('宿主默认值是枚举之一', () => {
+    const host = entriesOf(read('src/jet-hub-store.ts'), 'PANEL_ENTRY_VALUES: readonly')
+    // ⚠️ 默认值是**标量**声明（`export const DEFAULT_PANEL_ENTRY: PanelEntry = 'sidebar'`），
+    //    不是数组，所以单独抽。
+    const at = read('src/jet-hub-store.ts').indexOf('DEFAULT_PANEL_ENTRY: PanelEntry =')
+    expect(at, '找不到 DEFAULT_PANEL_ENTRY 声明').toBeGreaterThan(-1)
+    const line = read('src/jet-hub-store.ts').slice(at, read('src/jet-hub-store.ts').indexOf('\n', at))
+    const value = /'([^']+)'/.exec(line)?.[1]
+    expect(value, 'DEFAULT_PANEL_ENTRY 不是字符串字面量').toBeDefined()
+    expect(host, `默认值 ${value} 不在枚举里`).toContain(value)
   })
 })
 

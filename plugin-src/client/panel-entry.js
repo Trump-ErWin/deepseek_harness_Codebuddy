@@ -12,7 +12,8 @@
  *
  * - 主导航里的一行（`sidebar.panellist` 的 `jet-hub`），点它由宿主
  *   `layout.selectPanel('jet-hub')` 把页面渲染进中央主面板；
- * - 设置里的 `settings.section#jet-hub`（宿主 `SettingsRoot` 给左右内边距）。
+ * - 设置里的 `settings.section#jet-hub`（宿主 `SettingsRoot` 给左右内边距）
+ *   —— ⚠️ 这一节**只在取值为 `'settings'` 时存在**，默认 `'sidebar'` 下它是注销的。
  *
  * 两条路径通向同一页 ⇒ 同时存在只是重复入口。卡片里的「面板入口」下拉让用户
  * 二选一：**严格互斥，任一时刻只有一个入口存在**。选 `'sidebar'` 时

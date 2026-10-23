@@ -1361,7 +1361,10 @@ const STYLES = `
    （Switch 用 opacity 0.5，SegmentedControl 用 0.4）。 */
 .dim-jh-cardSelector:disabled { cursor: default; opacity: 0.5; }
 .dim-jh-cardChevron { flex: none; }
-.dim-jh-cardSelector:focus-visible { outline: var(--dsw-focus-ring-width, 2px) solid var(--dsw-alias-state-business-primary); outline-offset: 1px; }
+/* 焦点环：跟随本文件既有约定（outline:none + box-shadow），与 .dim-jh-switch /
+   .dim-jh-zcSelect 一致。官方设置页的选择器**没有** outline 规则，故这里也不加，
+   否则同一张插件页上本卡片会比其他控件多一圈描边。 */
+.dim-jh-cardSelector:focus-visible { outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 30%, transparent); }
 
 `
 

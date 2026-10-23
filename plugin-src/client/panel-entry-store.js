@@ -62,6 +62,16 @@ let readFailed = false;
 /** 正在飞的那次读取（并发去重用；`null` = 没有在飞）。 */
 let inflight = null;
 
+/**
+ * 写入次数（单调递增）。读取在**发起时**记下当时的值，回包时再比一次：
+ * 若期间用户写入过，这个回包携带的是**写之前**的宿主状态，丢弃它。
+ *
+ * ⚠️ 不这么做的真实症状（2026-10-24 复核 I3 实测）：读请求在飞（慢）→ 用户选
+ * 「仅设置页」写入成功 → 那个慢读回包带着写之前的 `'sidebar'` 到达 → 覆盖回
+ * `'sidebar'`。界面表现为「刚改完又自己跳回去了」，而且会一直跳到下次读取为止。
+ */
+let writeSeq = 0;
+
 /** 订阅者集合：卡片与两处槽位注册共用同一份状态。 */
 const listeners = new Set();
 
@@ -179,10 +189,15 @@ export function loadPanelEntry(rpcCall) {
   // 已有在飞的请求就复用：复用同一份 Promise，调用方拿到的值与「自己发一次」
   // 逐字节一致（同一个网络回包）。
   if (inflight !== null) return inflight;
+  // ⚠️ 发起时记下写入序号：回包时若它变了，说明期间用户改过，本回包已过期。
+  const seqAtStart = writeSeq;
   const task = (async () => {
     try {
       const result = await rpcCall('panelEntry.get', {}, readSignal());
       const next = normalize(result?.entry);
+      // ⚠️ 防倒灌（复核 I3）：期间有写入就丢弃本次读回包 —— 它携带的是写之前
+      //    的宿主状态，落地会覆盖用户刚做的选择。
+      if (writeSeq !== seqAtStart) return entry ?? FALLBACK_ENTRY;
       if (next !== null) {
         // 宿主明确给了合法值：清掉失败标记。
         publish(next, false);
@@ -192,7 +207,8 @@ export function loadPanelEntry(rpcCall) {
       }
     } catch (caught) {
       console.warn('[jet-hub] 读取面板入口偏好失败，按仅侧栏处理', caught);
-      publish(entry ?? FALLBACK_ENTRY, true);
+      // 失败标记同理：期间若用户写入成功，不该再挂一个「读失败」的降级文案。
+      if (writeSeq === seqAtStart) publish(entry ?? FALLBACK_ENTRY, true);
     }
     return entry ?? FALLBACK_ENTRY;
   })();
@@ -233,6 +249,9 @@ export async function setPanelEntry(rpcCall, next) {
   if (confirmed === null) {
     throw new Error('面板入口偏好没有返回合法 entry');
   }
+  // ⚠️ 序号只在**写入成功**后递增：失败时用户的意图没落地，在飞的读回包仍然
+  //    有效（它带的就是真实的旧值），不该被丢弃。
+  writeSeq += 1;
   publish(confirmed, false);
   return confirmed;
 }

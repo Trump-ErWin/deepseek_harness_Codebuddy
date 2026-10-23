@@ -45,9 +45,27 @@ describe('插件详情页设置卡片', () => {
   })
 
   it('⚠️ 写入不做乐观更新：失败要回滚到宿主的实际值', () => {
-    // 本地先改会造成「下拉看着改了、重启后又变回来」，只有跨进程重启才暴露。
-    expect(source).toMatch(/panelEntry\(\)/)
-    expect(source).toMatch(/catch/)
+    // ⚠️ 这两条断言曾经是**恒真的**（只查 /panelEntry()/ 与 /catch/，把 setEntry
+    // 改成乐观更新、把 catch 换成空壳都照样绿）—— 2026-10-24 复核 M1。改成查
+    // 具体的失败路径形态。
+    expect(source).toMatch(/setEntry\(currentEntry\(\)\)/)
+    expect(source).toContain('catch')
+    // 成功路径里不得出现「先乐观改 setEntry(next)」这种形态。
+    expect(source).not.toMatch(/setEntry\(next\)/)
+  })
+
+  it('⚠️ 读失败与写失败必须是两个标记、两句文案（复核 I5）', () => {
+    // 共用一个标记会让**写失败**时显示「未能读取当前设置…显示的是默认值」，
+    // 既不准也把用户引向错误的排查方向。
+    expect(source).toContain('readFailed')
+    expect(source).toContain('writeFailed')
+    expect(source).toContain('CARD_DESC_READ_FAILED')
+    expect(source).toContain('CARD_DESC_WRITE_FAILED')
+  })
+
+  it('⚠️ 写入回调自带重入闸门（busy 挡不住 Menu.onSelect，复核 I4）', () => {
+    expect(source).toContain('busyRef')
+    expect(source).toMatch(/if\s*\(\s*busyRef\.current\s*\)\s*return/)
   })
 
   it('卡片自己不注册槽位，也不碰包名（key 在 index.js 里）', () => {
@@ -57,5 +75,9 @@ describe('插件详情页设置卡片', () => {
 
   it('读取失败只换文案、不禁用控件（否则一次抖动就没法自救）', () => {
     expect(source).toContain('panelEntryReadFailed')
+  })
+
+  it('⚠️ 卡片挂载时自己读一次（不依赖两处槽位 inject 是否触发）', () => {
+    expect(source).toContain('loadPanelEntry')
   })
 })

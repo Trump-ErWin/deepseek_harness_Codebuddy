@@ -25,9 +25,17 @@ describe('panel-entry 注册器', () => {
   it('⚠️ main key 无条件注册（关掉入口后宿主 selectPanel 仍会命中它）', () => {
     const start = source.indexOf("ctx.slots.inject('main'")
     expect(start, 'missing main slot injection').toBeGreaterThan(-1)
-    const block = source.slice(start, start + 400)
+    // ⚠️ 用 `main` 注册的**闭合处**作结束锚点，不用 `start + 400` 这种魔数窗口
+    //    （2026-10-24 复核 M3：往注入块上加几行注释，`if (` 就会被挤出窗口，
+    //    断言静默失效；反向同理，块内真加了 `if` 也可能落在窗口外）。
+    //    ⚠️ 不能用「下一个 ctx.inject」作锚点 —— 紧随其后的 `ctx.inject(['layout']`
+    //    回调里本来就有一个 `if`，那样锚点会把无关代码算进来（实测假红）。
+    const end = source.indexOf('}, JetHubMainPanel))', start)
+    expect(end, '找不到 main 注册的闭合处').toBeGreaterThan(start)
+    const block = source.slice(start, end)
     // 该注入块里不得出现条件判断：它必须读一次值就注册。
     expect(block).not.toMatch(/\bif\s*\(/)
+    expect(block).toContain('JET_HUB_PANEL_KEY')
   })
 
   it('两个入口槽位都存在', () => {

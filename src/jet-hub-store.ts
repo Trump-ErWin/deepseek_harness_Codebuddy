@@ -362,14 +362,21 @@ interface SettingsScopeLike {
   replace(section: object): Promise<void>
 }
 
-/** 老契约的 schema：必须是 schemastery（`plainSchema` 会调 `toJSON()`）。 */
 /**
  * 持久化文档的 schema（两种后端共用）。
  *
- * ⚠️ **导出仅供测试**：老契约后端（SettingsStore）的 `scope.get()` 会过一遍
- * 本 schema，而单测里那些 `scope.get()` 替身默认不过。`tests/unit/jet-hub-store.spec.ts`
+ * ⚠️ 必须是 schemastery（`plainSchema` 会调它的 `toJSON()`）。
+ *
+ * ⚠️ **导出仅供测试**：老契约后端（SettingsStore，**≤0.1.6 的
+ * `settings.register` 契约**）的 `scope.get()` 按「schema defaults →
+ * registrant 的 base → 用户文档」三层解析，也就是**会过一遍本 schema**；
+ * 而单测里那些 `scope.get()` 替身默认不过。`tests/unit/jet-hub-store.spec.ts`
  * 的「老契约后端」组用本导出复刻真实行为 —— 否则「schema 的 `.default()` 把
  * 迁移短路」这类缺陷会整组躲过去（2026-10-24 复核 C1 实测如此）。
+ *
+ * ⚠️ 上面的版本限定是必要的：0.1.7 起 `settings` 换成 `SettingsForms`（没有
+ * `register`），本插件在那里走 FileStore，**不经过**本 schema。
+ *
  * 生产代码不要直接用它做校验，走 sanitize 函数。
  */
 export const jetHubSchema = Schema.object({

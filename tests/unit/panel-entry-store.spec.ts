@@ -198,6 +198,36 @@ describe('面板入口客户端状态', () => {
     expect(store.panelEntryReadFailed()).toBe(false)
   })
 
+  it('⚠️⚠️ 慢读回包不得把用户刚写入的值倒灌回旧值（复核 I3）', async () => {
+    // 时序：读请求在飞（慢）→ 用户选「仅设置页」写入成功 → 那个慢读回包带着
+    // **写之前**的 'sidebar' 到达 → 若无防倒灌，它会覆盖回 sidebar，
+    // 界面表现为「刚改完又自己跳回去了」。
+    const store = await freshModule()
+    let releaseRead
+    const slowRead = new Promise((resolve) => {
+      releaseRead = resolve
+    })
+    const rpc = async (endpoint, payload) => {
+      if (endpoint === 'panelEntry.get') {
+        await slowRead
+        // ⚠️ 这个回包携带的是**写入之前**的宿主状态。
+        return { entry: 'sidebar' }
+      }
+      return { entry: payload.entry }
+    }
+
+    // 发起慢读（不 await），随后完成一次写入。
+    const inflightRead = store.loadPanelEntry(rpc)
+    await store.setPanelEntry(rpc, 'settings')
+    expect(store.panelEntry()).toBe('settings')
+
+    // 让慢读回包落地，它不该把值倒灌回 sidebar。
+    releaseRead()
+    await inflightRead
+
+    expect(store.panelEntry(), '慢读回包倒灌了用户刚写入的值').toBe('settings')
+  })
+
   it('退订之后不再收到通知（槽位撤销后不得再被旧监听器碰）', async () => {    const store = await freshModule()
     const seen: boolean[] = []
     const unsubscribe = store.subscribePanelEntry(() => seen.push(true))
