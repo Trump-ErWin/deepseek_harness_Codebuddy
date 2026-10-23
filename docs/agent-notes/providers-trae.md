@@ -655,7 +655,7 @@ CN 项目每 3~5 次请求主动换 `machine_id` 以「降低 IDE 端点风控�
 
 故该能力**默认关闭**，仅在显式设 `DSH_TRAE_ROTATE_MACHINE_ID=1` 时按每 4 次
 请求递增一代（`deriveRotatingMachineId`）。它是出现**集中 401/风控**时的第一个
-可尝试开关。
+可尝试开关。
 
 ## TRAE（字节跳动）协议要点（五个易踩的坑）
 
