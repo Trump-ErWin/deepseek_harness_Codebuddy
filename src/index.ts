@@ -4079,6 +4079,37 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     ctx.logger.warn(`[jet-hub] 修正 Gemini 账号显示名失败：${String(error)}`)
   })
 
+  // 一次性修复**老 MiniMax 账号**的展示名（Gitee issue IKP8UA 修法 ③）。
+  //
+  // 成因见 `minimax-auth.ts` 的 `repairAccountNicknames`：MiniMax 的
+  // `access_token` **不是 JWT**，而旧昵称判据走 `decodeJwtSub` ⇒ 恒空 ⇒
+  // 账号卡片恒显示插件内部 id（`minimax-6395cf64`），多账号无法分辨。
+  // 光改登录路径**不会自愈存量账号**（本机实测 7 条全是内部 id），故补这一次。
+  //
+  // ⚠️ 两个站点**各一条**（它们共用同一个 auth 类、但 product 不同 ⇒
+  //    `apiHost` 与 XFF 判据都不同，见 `minimax-identity.ts`）。
+  //    漏一处即该站静默不自愈（本仓库的既有纪律：双站点每处都要到位）。
+  // ⚠️ 幂等 + 失败不阻塞启动（`repairAccountNicknames` 内部逐账号 catch）。
+  void minimax.repairAccountNicknames(pool).then((repaired) => {
+    if (repaired.length > 0) {
+      ctx.logger.info(
+        `[jet-hub] 已修正 ${repaired.length} 个 MiniMax 账号的显示名（改用上游账号名）：${repaired.join(', ')}`,
+      )
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[jet-hub] 修正 MiniMax 账号显示名失败：${String(error)}`)
+  })
+
+  void minimaxIntl.repairAccountNicknames(pool).then((repaired) => {
+    if (repaired.length > 0) {
+      ctx.logger.info(
+        `[jet-hub] 已修正 ${repaired.length} 个 MiniMax 国际版账号的显示名（改用上游账号名）：${repaired.join(', ')}`,
+      )
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[jet-hub] 修正 MiniMax 国际版账号显示名失败：${String(error)}`)
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次

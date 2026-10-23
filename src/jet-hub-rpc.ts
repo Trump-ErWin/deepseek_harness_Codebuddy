@@ -4494,19 +4494,29 @@ function registerJetHubEndpoints(
              * 昵称：两站必须可区分（同一面板左右没有，但**账号列表与用量徽标**
              * 都会显示它，而两站账号可能出现在同一个聚合候选里）。
              *
-             * ⚠️ **国内站逐字节保持原行为**（`result.accountId` 对真实凭据恒
-             * `undefined` ⇒ 退化为 `id`）：改它会让存量用户的账号名变化。
-             * 国际站是**新增**的，加标记不构成行为回退。
+             * ## ⚠️⚠️ 2026-10-23（Gitee IKP8UA）：昵称来源已改为**真身份查询**
+             *
+             * 原实现在这里退化成内部 id，理由写的是「`accountId` 对真实凭据恒
+             * `undefined`，这是预期行为」—— 那句话说对了一半：`access_token`
+             * 确实**不是 JWT**（`mmoat_` 前缀、60 字符、0 个点，`decodeJwtSub` 恒空），
+             * 但**账号名是拿得到的**（`GET /v1/api/user/info`，真机实测两站都有）。
+             * ⇒ 「已知拿不到身份」的正确处置是**另找来源**，而不是把内部 id 当展示名。
+             *
+             * 现在身份由 `persistLogin` 内部查询并回传（`result.nickname`），
+             * 登录路径与启动自愈共用那一份实现。
+             *
+             * 三级回退（**顺序不可颠倒**）：
+             * ① `result.nickname`（真身份，最常见）；
+             * ② 老形态的 `accountId`（万一上游改发 JWT）；
+             * ③ 内部 id（含国际站的 `MiniMax 国际版` 前缀，与既有口径一致）。
              */
-            const nickname = result.accountId === undefined
-              ? (provider === MINIMAX_INTL.id ? `MiniMax 国际版 ${id}` : id)
-              : `MiniMax ${result.accountId.slice(0, 8)}`
+            const nickname = result.nickname
+              ?? (result.accountId === undefined
+                ? (provider === MINIMAX_INTL.id ? `MiniMax 国际版 ${id}` : id)
+                : `MiniMax ${result.accountId.slice(0, 8)}`)
             await pool.updateAccount(id, {
-              // ⚠️ `persistLogin` 的 `accountId` 对真实凭据**恒为 `undefined`** ——
-              // MiniMax 的 `access_token` **不是 JWT**（`mmoat_` 前缀、60 字符、
-              // 0 个点），故 `decodeJwtSub` 恒不命中、`account_id` 不会被写入。
-              // 这是**预期行为**（账号 id 由本层生成），不是缺陷：此时退化为 `id`。
-              // 一旦上游改发 JWT，这里会自动用上服务端的 account_id。
+              // ⚠️ `result.accountId` 对真实凭据**恒为 `undefined`**（token 非 JWT），
+              // 故实际生效的是 `result.nickname` 或内部 id。
               nickname,
               // ⚠️ **必须用 `minimaxCredentialExpiresAtMs`**（优先 `expires_at`，
               // 它由 OAuth 响应的 `expires_in` 自算）—— 不能指望从 token 解 JWT，
