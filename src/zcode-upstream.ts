@@ -290,6 +290,50 @@ export interface ZcodeBalanceResult {
    * 绝不能让它影响 `remaining`/`total` 本身。
    */
   claimablePlans: ZcodeClaimablePlanSummary[]
+  /**
+   * ★★ **已领取、但还没到生效时刻**的计划（实测 2026-10-23）。
+   *
+   * ## 现象（用户报障）
+   *
+   * 领完 1024 活动后，签到结果显示「+500.00MToken 领取成功」，
+   * **但随后查额度仍是 0** ⇒ 用户以为白领了。
+   *
+   * ## 真因（不是 bug）
+   *
+   * 上游 `billing/balance` 对「已领未生效」的账号返回：
+   *
+   * ```json
+   * { "balances": [],
+   *   "plans": [{ "plan_id": "zcode-v3-start-plan-1024", "status": "active",
+   *               "entitlements": [{ "grant_units": 300000000, "effective_at": 1792767600 },
+   *                                { "grant_units": 200000000, "effective_at": 1792767600 }] }] }
+   * ```
+   *
+   * ⇒ 额度已锁定在 `plans` 里，但 `balances` 桶**还是空的** ——
+   * 桶要等 `effective_at`（实测 **23:00**）才建。
+   * 官方成功弹窗的文案也正是「**将于 … 生效**」。
+   *
+   * ## 为什么必须单独一个字段（不能混进 `buckets`）
+   *
+   * `buckets` 是「**现在就能用**的额度」⇒ 把它算进 `remaining` 会让
+   * 折算层（`aggregate-expiry.ts` 的 `zcodeExpiry`）判成「有额度」⇒
+   * **在生效前就把渠道派发出去**（发出去必然失败：额度还不存在）。
+   * ⇒ 二者必须分开：`buckets` = 现在能用；`pendingPlans` = 已领、等生效。
+   */
+  pendingPlans: ZcodePendingPlan[]
+}
+
+/** 「已领但未生效」的计划（`status: active` 且 `effective_at` 未到）。 */
+export interface ZcodePendingPlan {
+  planId: string
+  name?: string
+  /** 合计额度（同 `unitType` 才相加，规则同营销投放那条）。 */
+  grantUnits?: number
+  unitType?: string
+  /** 生效时刻（Unix 秒）。 */
+  effectiveAt?: number
+  /** 到期时刻（Unix 秒）。 */
+  endsAt?: number
 }
 
 /** 一次可领活动。 */
@@ -449,7 +493,7 @@ export async function fetchZcodeBalance(
   if (data === undefined) return undefined
   if (typeof data.displayMode === 'string' && data.displayMode === 'enterprise') {
     // ⚠ 企业版**不下发额度数字**，也就没有可领活动 ⇒ 不发 preview 请求。
-    return { enterprise: true, buckets: [], remaining: 0, total: 0, claimablePlans: [] }
+    return { enterprise: true, buckets: [], remaining: 0, total: 0, claimablePlans: [], pendingPlans: [] }
   }
 
   const rawBuckets = Array.isArray(data.balances) ? data.balances : []
@@ -495,7 +539,70 @@ export async function fetchZcodeBalance(
     expiresAt,
     planName: buckets[0]?.showName,
     claimablePlans: await fetchClaimablePlans(credential, fetchImpl),
+    pendingPlans: pendingPlansOf(data.plans),
   }
+}
+
+/**
+ * 从 `billing/balance` 的 `plans[]` 里挑出「**已领、但还没生效**」的计划。
+ *
+ * ## 判据（三条，缺一不可）
+ *
+ * | 条件 | 为什么 |
+ * |---|---|
+ * | `status === 'active'` | 只有 active 的计划是「已领到、未作废」 |
+ * | 有 `entitlements[].effective_at` | **生效时刻**；缺它就无法判断「还没生效」 |
+ * | `effective_at` **晚于现在** | 已生效的计划会变成 `balances` 里的桶 ⇒ 不该重复计入 |
+ *
+ * ⚠ **只统计 `effective_at` 未到的那部分 entitlement**（不是整个 plan）：
+ *   同一 plan 里可能混着已生效与未生效的条目。
+ * ⚠ **额度按同 `unit_type` 求和**（与营销投放那条同规则），单位不同不混加。
+ *
+ * @param nowUnixSeconds 「现在」（Unix 秒）。留成参数是为了可测。
+ */
+export function pendingPlansOf(
+  rawPlans: unknown,
+  nowUnixSeconds: number = Math.floor(Date.now() / 1000),
+): ZcodePendingPlan[] {
+  if (!Array.isArray(rawPlans)) return []
+  const out: ZcodePendingPlan[] = []
+  for (const item of rawPlans) {
+    if (item === null || typeof item !== 'object') continue
+    const record = item as Record<string, unknown>
+    if (record.status !== 'active') continue
+    const ents = Array.isArray(record.entitlements) ? record.entitlements : []
+    let units = 0
+    let unitType: string | undefined
+    let effectiveAt: number | undefined
+    let saw = false
+    for (const ent of ents) {
+      if (ent === null || typeof ent !== 'object') continue
+      const entRecord = ent as Record<string, unknown>
+      const eff = num(entRecord.effective_at)
+      // ⚠ 已生效（effective_at 已到）的条目不在这里算 —— 它已变成 balances 桶。
+      if (eff === undefined || eff <= nowUnixSeconds) continue
+      const grant = num(entRecord.grant_units)
+      if (grant === undefined) continue
+      const type = typeof entRecord.unit_type === 'string' && entRecord.unit_type.length > 0
+        ? entRecord.unit_type
+        : undefined
+      if (unitType === undefined) unitType = type
+      if (type !== unitType) continue
+      units += grant
+      effectiveAt = effectiveAt === undefined ? eff : Math.min(effectiveAt, eff)
+      saw = true
+    }
+    if (!saw) continue
+    out.push({
+      planId: typeof record.plan_id === 'string' ? record.plan_id : '',
+      ...typeof record.name === 'string' ? { name: record.name } : {},
+      grantUnits: units,
+      ...unitType === undefined ? {} : { unitType },
+      effectiveAt,
+      endsAt: num(record.ends_at),
+    })
+  }
+  return out
 }
 
 /** `ZcodeBalanceResult` 里由 `preview` 带出的可领活动。 */

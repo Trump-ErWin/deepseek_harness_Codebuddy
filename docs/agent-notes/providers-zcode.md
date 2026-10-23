@@ -2474,6 +2474,117 @@ node scripts/verify-zcode-marketing-claim-live.mjs [账号id]
 （zcode 无 refresh 端点）。②③ 会真实领取额度，且每发消耗一个**设备级**
 captcha 配额 —— 别当只读工具反复跑。
 
+---
+
+## ⚠️⚠️ 领取后「额度仍是 0」的真相：**已领但还没到生效时刻**（2026-10-23 21:19）
+
+**用户报障原文**：
+
+> 「我重启后用 zcode 领取显示 2 个成功 2 个已领取，**但是我查询额度后还是 0**」
+
+截图里 ZCode 两行都是「**+500.00MToken 领取成功**」，而额度查询是 0。
+
+### 一、结论：**不是缺陷**，是上游的 `effective_at`
+
+上游 `billing/balance` 对「已领未生效」的账号返回（**实测原文**）：
+
+```json
+{ "balances": [],                                  ← 桶是空的 ⇒ 「剩余 0」
+  "plans": [{ "plan_id": "zcode-v3-start-plan-1024", "status": "active",
+              "entitlements": [
+                { "show_name": "GLM-5.3-Flash", "unit_type": "token",
+                  "grant_units": 300000000, "effective_at": 1792767600 },
+                { "show_name": "GLM-5.3",       "unit_type": "token",
+                  "grant_units": 200000000, "effective_at": 1792767600 } ] }] }
+```
+
+`1792767600` = **2026-10-23 23:00 UTC+8**（报障时是 21:19 ⇒ 还差 83 分钟）。
+
+⇒ 额度**已锁定在 `plans` 里**，但 `balances` 桶**要等 23:00 才建**。
+官方成功弹窗的文案也正是「**将于 … 生效**」（实测 `description` 里是
+「… 将于 … 生效」）。
+
+⚠ **判据**：上游 `data.plan.status === 'active'` + `entitlements[].effective_at`
+**晚于现在** ⇒ 就是「已领未生效」。**这不是「领取失败」**，更不是「白领了」。
+
+### 二、⚠️⚠️ 由此暴露的**真缺口**：插件**没有把这个中间态显示出来**
+
+用户只能看到「领取成功」+「额度 0」⇒ **看起来像白领了**。
+
+⇒ 修法（**两个字段，两个入口**）：
+
+| 位置 | 改动 | 为什么 |
+|---|---|---|
+| `src/zcode-upstream.ts` | `ZcodeBalanceResult` 新增 `pendingPlans`；`fetchZcodeBalance` 用 `pendingPlansOf(data.plans)` 填充 | 「已领、等生效」是**独立于桶**的一态 |
+| `src/provider-credits.ts` | `buildZcodeBalance` 把它做成**独立包**，`remaining/total` 都给 **0**，`cycleStartTime` 携带**生效时刻**，`active: false` | 见下 |
+
+⚠⚠ **绝不能把它并进 `remaining` / `total`**（`total` 是折算层的判据）：
+
+`aggregate-expiry.ts` 的 `zcodeExpiry` 判据是 **`balance.remaining > 0`**
+（`aggregate-expiry.ts` 的注释明写「判据是 `remaining`（**已拥有**的余额）」）
+⇒ 并进去 ⇒ 折算判成「有额度」⇒ **在 23:00 之前就把 zcode 派发出去**
+（必然失败：额度还不存在）。
+⇒ 故：**桶 = 现在能用；`pendingPlans` = 已领、等生效**；`zcodeExpiry` **不读**它
+（实测 `zcodeExpiry` 源码里 `pendingPlans` 命中 **0** 处）。
+
+### 三、⚠️⚠️ 国际版（`zai`）**同样能领**——「只有中国版有」是**界面/入口**差异
+
+**用户追问**：「2 个旅行者账号应该是国际版账号，但我看有个旅行者账号也领取成功了，
+应该只有中国版才有」。
+
+**实测（`scripts/probe-zcode-account-channel.mjs` + `probe-zcode-intl-vs-cn-activity.mjs`）**：
+
+| 账号 | 渠道（凭据字段） | `billing/balance` 的 1024 plan |
+|---|---|---|
+| sysenxde / xrbwohf3 | 中国版 `bigmodel`（`user_channel=WECHAT_OPEN`） | `status: active` |
+| **旅行者9665 / 旅行者6665** | **国际版 `zai`**（只有 `zai_access_token`） | **`status: active`** ★ |
+
+⇒ **服务端在额度层面完全不按 OAuth 渠道区分**：两个国际版账号拿到的是**同一个**
+`zcode-v3-start-plan-1024`（3 亿 + 2 亿）。
+
+⚠ 补一条**反直觉**的实测：用**渠道专属 token**（`zai_access_token` /
+`bigmodel_access_token`）当 Bearer 查 `billing/balance` ⇒ **HTTP 401**；
+只有 `zcode_jwt` 能用 ⇒ 该端点**只认 `zcode_jwt`**，与渠道无关。
+
+⚠ `X-Client-Language` 取 `zh-CN` / `en-US` **不影响**投放（两组都是 `code 0`、
+`deliveries` 相同）。
+
+⇒ 「只有中国版有」的观感来自**官方客户端的界面**：
+官方「奖励中心」页是**分站**的 —— `isTrustedRewardsUrl` 的判据是
+`/^\/(cn|en)\/rewards\/?$/`（`app.asar` → `out/main/chunk-XYX2CJ3H.js`），
+且 marketing touch 的 `baseUrl` **恒为 `zcode.z.ai`**（中国版域）。
+⇒ **国际版用户看不到那个入口，但额度本身拿得到**（实测两个旅行者账号都拿到了）。
+
+⚠ **本仓库不做渠道特判**：投放由服务端决定，我们只按实测拿到的 plan 领取
+（与「不猜上游」的既有纪律一致）。
+
+### 四、回归与反向验证（`tests/unit/zcode-pending-effective.spec.ts`，11 条）
+
+三个变异逐条实跑（`scripts/mutate-zcode-guard.mjs`，每个都自证「变异已注入 ✓」、
+跑完自动还原）：
+
+| 变异 | 结果 |
+|---|---|
+| 把待生效额度**并进 `total`** | **红 1 条**（「总量不含待生效」那格） |
+| pending 包的 `active` 改成 `true` | **红 1 条** |
+| 「已到生效时刻」的也计入 `pendingPlans` | **红 2 条** |
+
+⚠ 其中「总量不含待生效」那一格是**最关键的**：它是「23:00 之前不派发 zcode」
+这条不变式的**唯一**守卫（折算层只读 `total`/`remaining`）。
+
+### 五、可复现的探针（本轮新增）
+
+```bash
+# 只读：领取后上游到底返回什么（桶 / 计划 / 生效时刻）
+node scripts/probe-zcode-post-claim-balance.mjs
+
+# 只读：每个账号是中国版（bigmodel）还是国际版（zai）
+node scripts/probe-zcode-account-channel.mjs
+
+# 只读：同一端点用「渠道 token」与「zcode_jwt」的差异 + 语言变量
+node scripts/probe-zcode-intl-vs-cn-activity.mjs
+```
+
 
 
 
