@@ -1,6 +1,14 @@
 import type { DpopPrivateJwk } from './oauth.js'
 import type { BadgePreference } from './badge-preferences.js'
 import type { TokenLedgerSnapshot, TokenLedgerHistoryDay, TokenLedgerModelRow } from './token-ledger.js'
+/**
+ * ⚠️ 反向的类型环，但是安全的：`jet-hub-store.ts` 以 `import type` 引入本模块的
+ * `ProviderAccountEntry`，这里也以 `import type` 引入它的 `PanelEntry`。
+ * 两处都是 type-only ⇒ 编译后**完全擦除**，不产生运行时边，也没有初始化顺序问题。
+ * 定义留在 `jet-hub-store.ts`：那里同时持有该枚举的运行时取值表与 sanitize，
+ * 拆开会让「三个真源分居两个文件」，正是本仓库反复记录的漂移形态。
+ */
+import type { PanelEntry } from './jet-hub-store.js'
 
 /** snap-manager ticket 端点响应的传输格式。 */
 export interface CodeArtsCredentialResponse {
@@ -1680,33 +1688,34 @@ export interface RpcNativeSearchSetEnabledResponse {
 }
 
 /**
- * RPC: 「侧栏入口」开关的读取响应（Jet Hub 页头的「侧栏」开关）。
+ * RPC: 「面板入口」的读取响应（插件详情页设置卡片里的下拉）。
  *
- * 语义：`true` = 在**主导航**里显示「Jet Hub」入口（点它把 Jet Hub 页渲染进
- * 中央主面板）；`false` = 只保留「设置 → Jet Hub」这一条进入路径。
+ * 语义：Jet Hub 的**唯一**入口位置，两个取值严格互斥 ——
+ * `'sidebar'` = 主导航里那一行（`settings.section` 那一节注销）；
+ * `'settings'` = 只剩「设置 → 插件 → Jet Hub」（主导航那一行注销）。
  *
  * ⚠️ 为什么这个偏好住**宿主**（`state.json`）而不是浏览器 `localStorage`：
  * 本插件的三条进入路径（Web / 桌面 / headless）共用同一份 `~/.dsh` 状态，
  * 而 Web 侧的 origin 是 `127.0.0.1:<随机端口>` —— **每次启动端口都变**，
- * `localStorage` 会随旧 origin 一起被抛弃，表现为「关掉的入口下次启动又回来了」。
+ * `localStorage` 会随旧 origin 一起被抛弃，表现为「改掉的入口下次启动又变回来了」。
  */
-export interface RpcSidebarEntryGetEnabledResponse {
-  enabled: boolean
+export interface RpcPanelEntryGetResponse {
+  entry: PanelEntry
 }
 
-/** RPC: 「侧栏入口」开关写入请求。 */
-export interface RpcSidebarEntrySetEnabledRequest {
-  enabled: boolean
+/** RPC: 「面板入口」写入请求。 */
+export interface RpcPanelEntrySetRequest {
+  entry: PanelEntry
 }
 
 /**
- * RPC: 「侧栏入口」开关写入响应。
+ * RPC: 「面板入口」写入响应。
  *
  * ⚠️ 与 `nativeSearch.setEnabled` 同取向：回传的是**落盘后重读的值**，
  * 客户端一律以后端回传为准，不做乐观更新（宿主侧可能因为脏文档把值归一）。
  */
-export interface RpcSidebarEntrySetEnabledResponse {
-  enabled: boolean
+export interface RpcPanelEntrySetResponse {
+  entry: PanelEntry
 }
 
 /**
