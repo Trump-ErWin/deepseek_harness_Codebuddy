@@ -497,17 +497,38 @@ describe.skipIf(dshToolsEntry === null)('analyzeImage：工具注册必须过宿
   })
 
   /**
-   * 守卫 ⑯：`parameters: {}` 是**合法**的空参数 schema。
+   * 守卫 ⑯：`parameters` 必须是**完整的空对象 schema**，且既过宿主校验、也过上游校验。
    *
-   * ⚠️ 这格容易被「顺手补齐」改坏：有人看到 `parameters: {}` 觉得不完整，
-   * 补成 `{ type: 'object', required: ['…'] }` 而没有对应 properties ⇒
-   * 宿主报 `required names "…" which is not in properties`。
-   * 本工具**不接受任何参数**（图片从会话历史取），空对象就是正确形态。
+   * ⚠️⚠️ **这一格在 2026-10-23 被推翻重写**，原因值得记住：
+   *
+   *   - **旧版断言 `toEqual({})` 是错的**，它把一个真实缺陷**钉死**了：注释写着
+   *     「空对象就是正确形态、别顺手补齐」，依据是宿主校验器
+   *     `assertSupportedJsonSchema({})` 不抛错 ⇒ **19 条全绿，而 buddy/workbuddy
+   *     每轮 400**。
+   *   - **「宿主接受」≠「上游接受」**：空 `{}` 过得了宿主那一格，但腾讯两站
+   *     （`copilot.tencent.com` / `www.workbuddy.ai`）会校验工具定义并回
+   *     `{"code":11129,"msg":"invalid function call parameters"}`。
+   *     真机 A/B（`scripts/probe-buddy-tool-schema.mts`，两站各自复现）：
+   *     `{}` → 400，`{type:'object',properties:{}}` → 200；整份 280 工具清单只改
+   *     这一处就从 400 变 200。
+   *
+   * ⇒ 所以这里**两个判据都要有**：宿主那一格（证明注册不会中断）**与**
+   * 「声明了 object 类型」（证明上游会收）。缺任一条都抓不住这次的回归 ——
+   * 只保留宿主那格 = 旧版的假绿。
    */
-  it('⑯ parameters 是空对象 schema（本工具不收参数），且合法', async () => {
+  it('⑯ parameters 是完整的空对象 schema：既过宿主校验、也满足上游的 object 类型要求', async () => {
     const { assertSupportedJsonSchema } = await importDshTools()
     const tool = registerWithRealValidator(assertSupportedJsonSchema)
-    expect(tool.parameters).toEqual({})
+
+    // ① 本工具**不接受任何参数**（图片从会话历史取）⇒ 必须是零属性的 object。
+    expect(tool.parameters).toEqual({ type: 'object', properties: {} })
+    // ② 过宿主校验（否则 `tools.register()` 中断、工具静默消失）。
     expect(() => assertSupportedJsonSchema(tool.parameters)).not.toThrow()
+    // ③ 声明了 object 类型 —— 这一格**只能由真实上游报文固定**，单测锁不住
+    //    「腾讯到底收哪种形状」（见文件头与 scripts/probe-buddy-tool-schema.mts）。
+    expect((tool.parameters as { type: string }).type).toBe('object')
+    // ④ 反向对照：`{}`（旧版形状）**不满足**这一格 —— 若哪天实现退回空对象，
+    //    这一格会红，而不是再次「19 条全绿 + 上游 400」。
+    expect(({} as { type: string }).type).not.toBe('object')
   })
 })

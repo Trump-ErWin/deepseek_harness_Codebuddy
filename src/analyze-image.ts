@@ -45,12 +45,16 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { codeartsAcceptsImage, codeartsVisionModel, PROVIDER } from './llm-adapter.js'
+// ⚠️ 工具名与「该不该给这个路由」的判据**唯一定义在叶子模块** `codearts-vision.ts`：
+//    注册期包装（`llm-register-compat.ts` 逐请求从非 codearts 路由的工具表里摘掉
+//    本工具）要用同一份判据，而它不能 import 本文件/`llm-adapter.ts`（会成环）。
+//    此处只做转出，既有导入路径（`from './analyze-image.js'`）保持不变。
+import {
+  ANALYZE_IMAGE_TOOL,
+  shouldOfferAnalyzeImage,
+} from './codearts-vision.js'
 
-/**
- * 工具名。与 IDE 的同名工具保持一致 —— 模型在 IDE 语境下已熟悉这个名字，
- * 换名会让它在已有对话历史里找不到对应关系。
- */
-export const ANALYZE_IMAGE_TOOL = 'analyzeImage'
+export { ANALYZE_IMAGE_TOOL, shouldOfferAnalyzeImage }
 
 /** 单次调用最多分析几张图（防止模型一次塞几十张把上游打爆）。 */
 export const ANALYZE_IMAGE_MAX_IMAGES = 8
@@ -158,6 +162,9 @@ export function imageDataUrl(data: Uint8Array, mediaType: string): string {
 /**
  * 判断是否该给当前路由挂这个工具。
  *
+ * ⚠️ **实现已下沉到 `codearts-vision.ts`**（`shouldOfferAnalyzeImage`），因为注册期
+ * 包装需要同一份判据而不能 import 本文件。本函数保留为**转出**，既有调用方不变。
+ *
  * 判据三条，缺一不可：
  * 1. 路由 provider 是 `codearts`（别家的图片直发上游，不需要这个中转）；
  * 2. 该模型**收不了图**（VL 模型自己就能看，给它这个工具是多余的）；
@@ -167,15 +174,6 @@ export function imageDataUrl(data: Uint8Array, mediaType: string): string {
  * @param model - 当前会话路由的 model id
  * @param acceptsImage - 「该模型能否收图」的判据（默认用 codearts 的实现；注入以便单测）
  */
-export function shouldOfferAnalyzeImage(
-  provider: string | undefined,
-  model: string | undefined,
-  acceptsImage: (id: string) => boolean = codeartsAcceptsImage,
-): boolean {
-  if (provider !== PROVIDER) return false
-  if (model === undefined || model.length === 0) return false
-  return !acceptsImage(model)
-}
 
 /** 识图依赖（注入以便单测；生产由 {@link installAnalyzeImage} 从 ctx 取）。 */
 export interface AnalyzeImageDeps {
@@ -270,7 +268,21 @@ export function installAnalyzeImage(
         'Analyse image or images the user attached in this turn and return a text description '
         + '(OCR text, objects, layout, colors). Use it when the current model cannot read images '
         + 'directly and the user attached a picture.',
-      parameters: {},
+      // ⚠️⚠️ 这里**必须**是完整的空对象 schema `{type:'object',properties:{}}`，
+      //    **不能**写 `{}`（2026-10-23 真实报障，buddy/workbuddy 每轮 400）。
+      //
+      //    取证链：① 落盘 `request/header` 里 280 个工具**唯一**一个 parameters
+      //    不是 `{type:'object',…}` 的就是本工具；② 同会话同一份 283 工具清单，
+      //    qoder/codearts/loomy 全部正常、只有 buddy/workbuddy 硬 400；③ 真机 A/B
+      //    （`scripts/probe-buddy-tool-schema.mts`）：同账号同消息，`{}` → 400
+      //    `invalid function call parameters`，`{type:'object',properties:{}}` → 200，
+      //    两站各自复现；④ 整份 280 工具清单原样 400、只改这一个 schema 就 200。
+      //
+      //    上游原文把「工具定义的参数结构不合规」直接点了名：
+      //    `{"code":11129,"msg":"invalid function call parameters"}`。
+      //    ⚠️ 宿主校验器 `assertSupportedJsonSchema({})` **不报错** —— 「宿主接受」
+      //    与「上游接受」是两件事，别再用宿主那一格当证据。
+      parameters: { type: 'object', properties: {} },
       output: {
         schema: {
           type: 'object',
