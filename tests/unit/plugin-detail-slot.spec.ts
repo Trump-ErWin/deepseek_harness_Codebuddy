@@ -50,3 +50,18 @@ describe('插件详情页槽位接线', () => {
     expect(pkg.dsh.client.external ?? []).not.toContain('@deepseek-ai/dsh-client-ui-primitives')
   })
 })
+
+describe('页头开关的下线', () => {
+  const pageSource = read('plugin-src/client/jet-hub.js')
+
+  it('⚠️ 页头「侧栏」开关已删除，下拉成为唯一入口', () => {
+    expect(pageSource).not.toContain('toggleSidebarEntry')
+    expect(pageSource).not.toContain('sidebarEntryOn')
+    expect(pageSource).not.toContain('sidebar-entry-store.js')
+  })
+
+  it('⚠️ 「渠道原生搜索」开关必须原样保留', () => {
+    expect(pageSource).toContain('渠道原生搜索')
+    expect(pageSource).toContain('toggleNativeSearch')
+  })
+})
