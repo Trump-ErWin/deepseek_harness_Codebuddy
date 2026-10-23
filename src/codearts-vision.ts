@@ -37,6 +37,34 @@
  * 这个工具」是**作用域缺陷**（本模块负责）。两者都要修：只修 schema 的话，腾讯之外的
  * 严格上游、以及模型误调用（执行期必然抛「不属于 codearts」）仍然会发生。
  *
+ * ## ⚠️⚠️⚠️ 同一个根因在**三个**上游复现，错误码/文案/失败形态各不相同（2026-10-23 实测）
+ *
+ * 用户先报 buddy/workbuddy，随后报 TRAE 的 `4027`。**那是同一个缺陷**，只是各家的
+ * 校验器说法不同 —— 而**失败形态**的差异会直接改变排查难度：
+ *
+ * | 渠道 | 错误码 | 文案 | HTTP | 藏在哪 |
+ * |---|---|---|---|---|
+ * | buddy `copilot.tencent.com` | `11129` | `invalid function call parameters` | **400** | HTTP 体 |
+ * | workbuddy `www.workbuddy.ai` | `11129` | 同上（`displayMsg.zh` = 工具定义不合规） | **400** | HTTP 体 |
+ * | **trae** | **`4027`** | **`tools.0.function.parameters must be a JSON Schema of type object`** | **200** | **流内**（`event:progress_notice` 之后） |
+ *
+ * 三条可推广的教训：
+ *
+ * 1. **`tools.0` 不是「第 0 个工具有问题」的通例，而是「问题工具恰好排在第 0 位」** ——
+ *    本仓工具按名排序，`analyzeImage` 恰在首位 ⇒ 换 20 个 provider 它都是
+ *    `tools.0`。排查时**必须**先解出 `tools.N` 是哪个工具，别被 `0` 误导成
+ *    「工具表整体非法」。
+ * 2. **只看 HTTP 码会把 TRAE 这类误判成成功**：它的 4027 是 HTTP 200 + 流内错误，
+ *    与本仓 TRAE 那条「流内 `code=4006` 不得归 SERVER」（见
+ *    `docs/agent-notes/providers-trae.md`）**同一形态** ⇒ 判「成功」必须看流是否
+ *    产出了正文，而不是状态码。
+ * 3. **判别力来自「只改那一个变量」**：TRAE 上同样跑了 A/B（原样清单 → 逐字复现 4027；
+ *    只把 `analyzeImage` 换成 `{type:'object',properties:{}}` → 正常收尾），
+ *    并复核了作用域摘除后**实发 279/280 且未修清单也不再被拒**。
+ *
+ * ⚠️ 与 TRAE 的既有笔记不冲突：`providers-trae.md` 记的是 `4001`（auth）/
+ * `4006`（体积超限）两个码，`4027`（工具定义不合规）是**第三个**，此前无记载。
+ *
  * ## ⚠️⚠️ 为什么不是「按 agent 作用域 restrict」—— 时序上做不到
  *
  * `dsh-tools` 确实有 `restrict({deny:[…]})`（按调用者作用域收窄**全局**工具），
