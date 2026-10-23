@@ -363,7 +363,16 @@ interface SettingsScopeLike {
 }
 
 /** 老契约的 schema：必须是 schemastery（`plainSchema` 会调 `toJSON()`）。 */
-const jetHubSchema = Schema.object({
+/**
+ * 持久化文档的 schema（两种后端共用）。
+ *
+ * ⚠️ **导出仅供测试**：老契约后端（SettingsStore）的 `scope.get()` 会过一遍
+ * 本 schema，而单测里那些 `scope.get()` 替身默认不过。`tests/unit/jet-hub-store.spec.ts`
+ * 的「老契约后端」组用本导出复刻真实行为 —— 否则「schema 的 `.default()` 把
+ * 迁移短路」这类缺陷会整组躲过去（2026-10-24 复核 C1 实测如此）。
+ * 生产代码不要直接用它做校验，走 sanitize 函数。
+ */
+export const jetHubSchema = Schema.object({
   accounts: Schema.array(Schema.any()).default([]),
   disabledModels: Schema.dict(Schema.any()).default({}),
   loomyPermanentLocked: Schema.boolean().default(false),
@@ -375,7 +384,17 @@ const jetHubSchema = Schema.object({
   // ⚠️ 用 `Schema.string()` 而不是 `Schema.union([...])`：schema 只负责类型，
   // 取值合法性由 `sanitizePanelEntry` 在**读写两侧**统一判（老契约后端不经过
   // schema，只靠那个函数；两处用同一份判据才不会漂移）。与下面 `minimaxXff` 同款。
-  panelEntry: Schema.string().default(DEFAULT_PANEL_ENTRY),
+  //
+  // ⚠️⚠️ **绝不能加 `.default()`**（真实缺陷，2026-10-24 复核实测）：
+  //    schemastery 的 `.default()` 会在 `scope.get()` 返回的文档里**填入**默认值，
+  //    于是 `sanitizePanelEntry(value.panelEntry, …)` 第一层（新键合法即返回）
+  //    直接命中，第二层的**老布尔迁移永远不执行** ⇒ 老用户明确关掉的侧栏入口
+  //    在升级后静默变回「仅侧栏」，且此后每次 save() 都把 `'sidebar'` 写进文档，
+  //    原设置**永久丢失**。
+  //    实测（schemastery 3.18.4）：`{ sidebarEntryEnabled: false }` 经 `.default()`
+  //    后 `panelEntry === 'sidebar'`（错误），去掉后经 sanitize 得 `'settings'`（正确）。
+  //    缺键时由 `sanitizePanelEntry` 自己兜底成 `DEFAULT_PANEL_ENTRY`，不需要这里再给。
+  panelEntry: Schema.string(),
   providerOrder: Schema.array(Schema.string()).default([]),
   // ⚠️ 用 `Schema.string()` 而不是自定义 IP 校验：schema 只负责类型，
   // 取值合法性由 `sanitizeMinimaxXff` 在**读写两侧**统一判（老契约后端不经过

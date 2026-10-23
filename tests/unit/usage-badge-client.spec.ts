@@ -70,7 +70,8 @@ function narrowPopBlock(styles: string): string {
   // ⚠️ 结束锚点必须是一个**独立段落**的标题，不能用模板闭合反引号 ——
   // 后者会把「本段之后、模板结束之前」的一切都算进本段（见上面第 3 条）。
   // 本段（窄屏浮层）之后紧跟的是「插件详情页设置卡片」段（2026-10-24 新增），
-  // 故锚点取那一段的标题；模板闭合只作为兜底，防止该段被改名后静默跨段。
+  // 故锚点取那一段的标题。该标题若被改名，下面的 expect 会直接红 —— 不设兜底，
+  // 兜底会让断言静默跨段（那正是上面第 3 条记录过的假绿）。
   const end = styles.indexOf('── 插件详情页', start)
   expect(end, '找不到紧随「窄屏浮层」之后的「插件详情页」段落标题：请改 narrowPopBlock 的结束锚点').toBeGreaterThan(start)
   const raw = styles.slice(start, end)

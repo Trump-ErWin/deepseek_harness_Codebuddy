@@ -23,6 +23,7 @@ import {
   sanitizePermanentLocks,
   sanitizeProviderClosed,
   sanitizeProviderOrder,
+  jetHubSchema as storeSchema,
   sanitizePanelEntry,
   withAllowed,
   withoutAllowed,
@@ -133,6 +134,49 @@ describe('后端选路', () => {
 
   it('settings 服务缺失时仍走文件后端（headless 也可持久化）', () => {
     expect(createJetHubStore(makeCtx(undefined)).kind).toBe('file')
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷守卫（2026-10-24 复核 C1）**：老布尔迁移必须在
+   * **过 schema 的** SettingsStore 路径上也成立。
+   *
+   * 上面那些 `scope.get()` 都是**裸替身**（直接返回对象、不经过 schemastery），
+   * 于是它们绕开了「schema 给缺键填默认值」这一步 —— 而真实 SettingsStore 的
+   * `scope.get()` 会过一遍 schema。
+   *
+   * 当时的写法 `Schema.string().default(DEFAULT_PANEL_ENTRY)` 正是在这里出问题：
+   * schema 把 `panelEntry` 填成 `'sidebar'`，`sanitizePanelEntry` 第一层（新键
+   * 合法即返回）随即命中，第二层的老布尔迁移**永远不执行** ⇒ 老用户明确关掉的
+   * 侧栏入口升级后静默变回「仅侧栏」，且此后每次 save 都写死 `'sidebar'`。
+   *
+   * 本用例用**真实的 store schema** 编解码，因此 `schema.default` 的回归会立刻变红。
+   */
+  it('⚠️ 老契约后端：老布尔 false 经 schema 后仍迁移成「仅设置页」', () => {
+    const written: Record<string, unknown>[] = []
+    let raw: unknown = { accounts: [], disabledModels: {}, sidebarEntryEnabled: false }
+    const store = createJetHubStore(makeCtx({
+      register: () => ({
+        // ⚠️ 关键：`get()` 走真实 schema，复刻 SettingsStore 的行为。
+        get: () => storeSchema(raw),
+        replace: async (value: object) => {
+          written.push(value as Record<string, unknown>)
+          raw = value
+        },
+      }),
+      describe: () => [],
+    }))
+
+    expect(store.load()?.panelEntry).toBe('settings')
+  })
+
+  it('⚠️ 老契约后端：没有新键也没有旧键时经 schema 回默认「仅侧栏」', () => {
+    const raw: unknown = { accounts: [], disabledModels: {} }
+    const store = createJetHubStore(makeCtx({
+      register: () => ({ get: () => storeSchema(raw), replace: async () => {} }),
+      describe: () => [],
+    }))
+
+    expect(store.load()?.panelEntry).toBe('sidebar')
   })
 })
 

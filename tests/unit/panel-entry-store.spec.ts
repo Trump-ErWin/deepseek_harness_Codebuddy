@@ -161,8 +161,44 @@ describe('面板入口客户端状态', () => {
     expect(sent).toBe(1)
   })
 
-  it('退订之后不再收到通知（槽位撤销后不得再被旧监听器碰）', async () => {
+  it('⚠️⚠️ rpcCall **同步**抛错后不得让 inflight 永久泄漏（复核 C2）', async () => {
+    // 真实缺陷形态：清理逻辑原先挂在 async 体的 finally 里，而
+    // `inflight = task` 在 IIFE 之后才赋值 —— 同步抛错时 finally 先跑被置空，
+    // 随后又被覆盖成一个**已 settle** 的 Promise，此后每次读取都复用它、
+    // 再也不发请求，也永远读不到宿主的新值。
     const store = await freshModule()
+    let sent = 0
+    // ⚠️ 故意是**普通函数**（不是 async），这样 rpcCall 会同步抛错。
+    const throwing = () => {
+      sent += 1
+      throw new Error('同步炸了')
+    }
+
+    // 第一次：失败并留下失败标记。
+    expect(await store.loadPanelEntry(throwing)).toBe('sidebar')
+    expect(store.panelEntryReadFailed()).toBe(true)
+    expect(sent).toBe(1)
+
+    // 第二次：必须**真的再发一次请求**，而不是复用那个已 settle 的旧 Promise。
+    expect(await store.loadPanelEntry(throwing)).toBe('sidebar')
+    expect(sent, 'inflight 泄漏了：第二次读取没有真正发出请求').toBe(2)
+  })
+
+  it('⚠️ 一次失败的读取之后，后续成功读取能恢复（inflight 已正确清空）', async () => {
+    const store = await freshModule()
+    const throwing = () => {
+      throw new Error('同步炸了')
+    }
+    await store.loadPanelEntry(throwing)
+    expect(store.panelEntryReadFailed()).toBe(true)
+
+    await store.loadPanelEntry(makeRpc({ get: async () => ({ entry: 'settings' }) }).rpc)
+
+    expect(store.panelEntry()).toBe('settings')
+    expect(store.panelEntryReadFailed()).toBe(false)
+  })
+
+  it('退订之后不再收到通知（槽位撤销后不得再被旧监听器碰）', async () => {    const store = await freshModule()
     const seen: boolean[] = []
     const unsubscribe = store.subscribePanelEntry(() => seen.push(true))
 

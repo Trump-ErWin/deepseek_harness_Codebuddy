@@ -193,14 +193,26 @@ export function loadPanelEntry(rpcCall) {
     } catch (caught) {
       console.warn('[jet-hub] 读取面板入口偏好失败，按仅侧栏处理', caught);
       publish(entry ?? FALLBACK_ENTRY, true);
-    } finally {
-      // ⚠️ 清空必须放在整个函数**最后**：先算出返回值再清，否则并发的第二个
-      //    调用方可能在 `inflight` 已置空、本次尚未 return 的窗口里再发一次。
-      inflight = null;
     }
     return entry ?? FALLBACK_ENTRY;
   })();
   inflight = task;
+  // ⚠️⚠️ 清理**必须挂在 async 体外面**（2026-10-24 复核 C2）。
+  //
+  //    先前的写法把它放在 async 体的 `finally` 里，而 `inflight = task` 在
+  //    IIFE **之后**才执行 —— `rpcCall` 若**同步**抛错，`finally` 会先跑
+  //    （`inflight = null`），随后被 `inflight = task` 覆盖 ⇒ 一个已 settle 的
+  //    Promise 永久留在 `inflight` 上，此后每次 `loadPanelEntry` 都复用它、
+  //    再也**不发请求**、也永远读不到宿主的新值。
+  //    生产里 `rpcCall` 是 async 函数（同步抛错会变成 rejected Promise），所以
+  //    实际难以触发；但测试替身就是普通函数，且这段逻辑本身不该对入参形态敏感。
+  //
+  //    双参 `then` 同时覆盖 resolve 与 reject；`inflight === task` 判等是为了
+  //    不误清一次「已经换成新请求」的 inflight。
+  const clear = () => {
+    if (inflight === task) inflight = null;
+  };
+  void task.then(clear, clear);
   return task;
 }
 

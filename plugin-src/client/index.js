@@ -1,10 +1,20 @@
 /**
  * Jet Hub 管理页面客户端插件。
  *
- * 注册两处：
- * 1. `settings.section` —— Jet Hub 设置页面；
- * 2. `conversation.input.right`（list 槽，会话作用域）—— 模型选择器旁的
+ * 注册**五处**槽位：
+ * 1. `main`（keyed，key = `jet-hub`）—— 中央主面板的 Jet Hub 页渲染体。
+ *    **无条件**注册：它只提供渲染体，不是入口。
+ * 2. `sidebar.panellist`（list）—— 主导航里「Jet Hub」那一行。按「面板入口」
+ *    偏好增删（`'sidebar'` 时有、`'settings'` 时无）。
+ * 3. `settings.section` —— 设置弹层里的 Jet Hub 整页。**条件注册**：
+ *    `'settings'` 时有、`'sidebar'` 时整条注销。⚠️ 与第 2 条互斥。
+ * 4. `plugins.bundle.config`（keyed，key = 本包名）—— **插件详情页**上的自有
+ *    设置卡片（「面板入口」下拉）。⚠️ **始终常驻**，是改回来的唯一路径。
+ * 5. `conversation.input.right`（list 槽，会话作用域）—— 模型选择器旁的
  *    **用量徽标**（订阅优先 / 积分兜底，点击展开明细）。
+ *
+ * 第 1/2/3 条都由 `panel-entry.js` 的 `registerJetHubPanelEntries` 一次管完
+ * （它们读的是同一份「面板入口」偏好，拆开写必然出现两份判据）。
  *
  * ## ⚠⚠️ 刻意**不**注册 `settings.models.provider-card`（Gitee issue IKJLHQ）
  *
