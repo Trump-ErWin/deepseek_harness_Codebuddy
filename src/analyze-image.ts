@@ -276,8 +276,16 @@ export function installAnalyzeImage(
           type: 'object',
           additionalProperties: false,
           properties: {
-            description: { type: 'string', required: true },
+            description: { type: 'string' },
           },
+          // ⚠️⚠️ `required` 是 **object 节点**的关键字，取值是**字符串数组**；
+          //   写在 `type: 'string'` 的子节点上不合法。宿主
+          //   `dsh-tools/lib/index.js` 的 `checkSchemaNode()` 有一张
+          //   「关键字 → 允许类型」对照表（`required: ['object']`），逐节点检查后抛
+          //   `JsonSchemaError: schema.properties.description.required is not supported
+          //   on type "string"` ⇒ `tools.register()` 整个中断 ⇒ 工具不可用
+          //   （Gitee IKPZW7，2026-10-23；症状是启动日志一条 error、工具静默消失）。
+          required: ['description'],
         },
         render: (_args: unknown, value: { description: string }) => value.description,
       },
