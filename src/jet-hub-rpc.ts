@@ -13,7 +13,7 @@
  *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
  *           backup.export / backup.import / backup.status /
  *           nativeSearch.getEnabled / nativeSearch.setEnabled /
- *           sidebarEntry.getEnabled / sidebarEntry.setEnabled /
+ *           panelEntry.get / panelEntry.set /
  * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
  * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
  */
