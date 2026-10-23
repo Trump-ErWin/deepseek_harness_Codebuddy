@@ -219,7 +219,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 | `raccoon` | Raccoon Work（商汤） | 微信扫码 / 短信 | 余额 + 一次性登录奖励 |
 | `minimax` | MiniMax Code (中国版) | OAuth 设备码 + PKCE | 余额 + 每日签到 |
 | `minimaxintl` | MiniMax Code (国际版) | 同上（共用实现） | 余额 + 每日签到 |
-| `zcode` | ZCode（智谱 z.ai） | OAuth 设备码 | 余额 + 每日领取 |
+| `zcode` | ZCode（智谱 z.ai） | OAuth 设备码 | 余额 + 每日领取（含**营销活动**投放，如 1024 程序员节 5 亿 token） |
 | `opencode` | OpenCode | — | 余额 |
 | `gemini` | Gemini Code Assist | 浏览器回调 | 余额 |
 | `officeace` | OfficeAce（华为 MaaS / 果办） | 华为云 OAuth PKCE | 余额 + 自动领取（**无手动签到入口**） |
@@ -243,6 +243,26 @@ dsh plugin --profile <name> install <path-to-this-repo>
   不带验证头先发一发，被 `3007` 拒了才产）；一旦服务端翻成 `false`，
   插件会**自动改为首发直接带上**，不再白吃那发注定失败的往返
   （判据是三态：缺席 = 不知道 = 保持先探，见 `requiresCaptchaUpfront`）。
+- **`zcode` 的领取有「两个来源」，签到会同时查、一起去领**（2026-10-23）：
+  ① 每日赠送 —— `GET /api/v1/zcode-plan/billing/preview` 的 `plans`；
+  ② **营销活动投放** —— `GET /api/v1/marketing/touch` 里横幅按钮的
+  `claim_zcode_plan`。后者就是官方客户端那类「限时可领取」横幅（如
+  **1024 程序员节 5 亿 token**），它**不在** `preview` 里 —— 只查 preview 时
+  它与「今天没有活动」在报文上**完全同形**（都是 `plans: []`）。
+  ⚠️ **营销端点与领取端点都按客户端版本门控**：插件凭据里记的是自己的版本号
+  （如 `3.14.3`）；用它查投放会拿到**空投放**，用它**领取**则回
+  `400 / code 1004 no permission`（官方文案：「当前账号或**客户端版本**不满足
+  领取条件」—— 极易被误读成「这个账号没资格」）。两条请求都会**按需抬到
+  `3.16.3`**（`ZCODE_VERSION_GATED_MIN_APP_VERSION`；实测同一账号、其余头完全相同，
+  只改这一个字段：查投放 `3.14.3` → `deliveries: []` / `3.16.3` → 有投放；
+  领取 `3.14.3` → `1004` / `3.16.2` → `code 0`）。该覆盖**只作用于这两条请求**，
+  不影响推理与额度两条已实测路径。
+  ✅ **真机验收**（2026-10-23，走插件自己的生产路径）：`{"kind":"claimed",
+  "credit":500000000,"unit":"token"}` —— 5 亿 token 领取成功
+  （活动 23:00 起生效，故当时余额仍显示 0，属预期）。
+  ⚠️ 领取成功后插件会回报一次 `POST /marketing/touch/action`（`confirm`），
+  否则服务端会**反复投放同一个活动** ⇒ 每轮签到白烧一个验证参数
+  （阿里云验证是**设备级**配额）。失败时**绝不**回报 —— 那会让用户白丢一次机会。
 - **`qoder` / `qodercn`** 共用同一套实现，差异仅在产品配置。
 - **`minimax` / `minimaxintl`** 共用同一套实现（**唯一**的 Anthropic Messages
   协议族渠道），差异仅在产品配置。⚠️ 两站的**账号不互通、API 主机也不同**，
