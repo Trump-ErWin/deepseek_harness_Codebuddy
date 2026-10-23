@@ -286,10 +286,25 @@ describe('★ MiniMax：`index.ts` 的接线（源码级，守纯文本形态的
       const lines = block.match(/fetchBalance:[\s\S]*?(?=\n\s*\}\)|$)/)
       expect(lines, `${name} 必须注入 fetchBalance`).not.toBeNull()
       // 形参必须叫 product 且被传给 fetchMinimaxCreditBalance。
+      //
+      // ⚠️ 2026-10-24（国际站账号代理）：`minimaxIntlBalanceSelector` 的闭包
+      // **允许**带第三个形参 `ctx`（`BalanceFetchContext`：按账号取出口）——
+      // 余额端点也在 `agent.minimax.io` 上，不给账号上下文则配了代理的账号
+      // 恒查不到余额 ⇒ 在聚合轮换里被**静默剔除**（选号器知道账号 id，
+      // 不传下去代理就没接上）。判据放宽为 `(credential, product[, …])`，
+      // 但**「product 必须被透传」与「不得写死对方站点」两格不变**。
       expect(lines![0], `${name} 的 fetchBalance 必须含 (credential, product) =>`)
-        .toMatch(/\(credential, product\)\s*=>/)
-      expect(lines![0], `${name} 必须把 product 形参传给 fetchMinimaxCreditBalance`)
-        .toMatch(/fetchMinimaxCreditBalance\(credential, fetch, product/)
+        .toMatch(/\(credential, product[,)]/)
+      // ⚠️ 闭包体可能是多行的（国际站版要把 ctx 的出口解析进去），
+      // 故「product 被透传」不锚定到 `fetchMinimaxCreditBalance(credential, …)`
+      // 的单行形态，而是判「调用点存在 + product 作为实参出现」。
+      // 形参名与实参名恰好都叫 product，故实参形态是 `fetch, product` /
+      // `product,` / `, product)` / `product)` 之一 —— 用 `\bproduct\b` 在
+      // **调用点行**上判（形参已在第一格判过，不会重复计）。
+      expect(lines![0], `${name} 必须调用 fetchMinimaxCreditBalance`)
+        .toContain('fetchMinimaxCreditBalance(')
+      expect(lines![0], `${name} 的调用点必须透传 product`)
+        .toMatch(/\bproduct\b/)
       expect(lines![0], `★ ${name} 的 fetchBalance 不得写死 ${other}（会打到对方站点）`)
         .not.toContain(other)
     }

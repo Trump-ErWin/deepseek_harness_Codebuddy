@@ -2829,6 +2829,56 @@ export class AccountPool {
   }
 
   /**
+   * 设置/清除某 **minimaxintl**（MiniMax 国际站）账号的出口代理。
+   *
+   * ## 为什么它与 `setGeminiProxy` 形状逐字同构却不共用
+   *
+   * 三家的**存在理由各不相同**：
+   * - opencode = 多账号要**分份额度**（不设代理 = 共用一份配额）；
+   * - Gemini = 墙外**能不能连通**（不设代理 = 根本连不上）；
+   * - minimaxintl = 绕开**按出口 IP 国别的分流**（不设代理 = 被 307 到中国站）。
+   *
+   * 合成一份会让「清掉其中一家的代理」连带清掉别家的出口配置 —— 本仓库
+   * 已反复记录这类「同义判据两份实现」的漂移，故**字段与实现都分开**。
+   *
+   * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+   * 早退。清除时**删键**而非写空串（空串与「未设置」在 UI 上是两种状态）。
+   */
+  async setMinimaxIntlProxy(accountId: string, proxy: string): Promise<void> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] setMinimaxIntlProxy: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const next = [...accounts]
+    const entry = { ...next[idx]! }
+    if (proxy.trim().length === 0) delete entry.minimaxIntlProxy
+    else entry.minimaxIntlProxy = proxy
+    next[idx] = entry
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 账号 ${accountId} MiniMax 国际站代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+    )
+  }
+
+  /**
+   * 读取某 minimaxintl 账号的代理（未设置时为空串 = 直连）。
+   *
+   * ⚠️ **必须过 `asProxyText`**（与 `geminiProxyFor` 同款实测缺陷）：该字段来自
+   * **用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}` 原样透传、
+   * 不校验形状 ⇒ 池里可能存在 `"minimaxIntlProxy": 12345`。下游 `normalizeProxy`
+   * 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛 `TypeError`，该账号
+   * **永久不可用且无自愈**（症状与「代理配置坏了」同形，日志只有一句 TypeError）。
+   */
+  minimaxIntlProxyFor(accountId: string): string {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    return asProxyText(entry?.minimaxIntlProxy)
+  }
+
+  /**
    * 记录 opencode 指纹轮换代次。
    *
    * ⚠️ 只接受**比现值更大**的代次：乱序/重复回调把代次写回小值会让用户
