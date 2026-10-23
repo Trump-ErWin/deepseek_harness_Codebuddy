@@ -141,6 +141,24 @@ export interface ProviderAccountEntry {
    * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
    */
   geminiProxy?: string
+  /**
+   * **minimaxintl**（MiniMax 国际站）账号的出口代理（空/缺省 = 直连）。
+   *
+   * ⚠️ `agent.minimax.io` 按**出口 IP 所在国家**分流：中国大陆来源会被 307 到
+   * 中国站 `agent.minimaxi.com`，而中国站不认国际站 token ⇒ 报出与「凭据失效」
+   * **逐字同形**的 401（issue IKMEVG）。本字段存在的理由就是换一个海外出口。
+   *
+   * ⚠️ 与既有的 `X-Forwarded-For` 设置（`pool.minimaxXff()`）**互补而非替代**：
+   * XFF 只是**声明**一个海外 IP（上游若不信任该头即失效），本字段是**真正**
+   * 改出口。两者可叠加。
+   *
+   * ⚠️ 与 `geminiProxy` / `opencodeProxy` **刻意分成三个字段**：三家语义不同
+   * （分份额度 / 能不能连通 / 绕地理分流），共用会让「清掉一家」连带清掉别家。
+   *
+   * 空串是合法值（= 用户显式清除，回到直连），**不可**用 falsy 判据把它与
+   * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
+   */
+  minimaxIntlProxy?: string
 }
 
 /** 账号详细状态（返回给 Client 展示） */
@@ -224,6 +242,21 @@ export interface RpcCreateAccountRequest {
    * 行为必须逐字节不变。
    */
   zcodeProvider?: 'bigmodel' | 'zai'
+  /**
+   * **minimaxintl** 账号的出口代理（**仅 MiniMax 国际站需要**）。
+   *
+   * ⚠️ 用途是**登录期**：换 token 那一次请求发生在凭据落盘**之前**，此时只有
+   * 池里那条**占位条目**认得这个账号 ⇒ 代理只能从载荷带（或从同 provider 的
+   * 既有账号继承，见 `jet-hub-rpc.ts` 的 minimax 分支）。不带 ⇒ 大陆网络下
+   * 国际站**登录恒失败**，而用户**没法给一个还不存在的账号配代理** ⇒ 死锁。
+   *
+   * ⚠️ 与 `ProviderAccountEntry.minimaxIntlProxy` 是**同一个语义的两个入口**：
+   * 那一个是「账号存在后」的面板设置，本字段是「账号还没建立时」的一次性输入。
+   *
+   * ⚠️ 来自客户端自报的 RPC 载荷（无 schema 校验）⇒ 读取侧必须过
+   * `normalizeProxy` 归一，非法值一律拒绝（与 `accioRegion` 同一条纪律）。
+   */
+  minimaxIntlProxy?: string
   /**
    * 登录区域（**仅 Accio 需要**）。
    *
