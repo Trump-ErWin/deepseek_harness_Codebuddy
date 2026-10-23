@@ -661,10 +661,17 @@ id: 'autoclaw',
       id: 'opencode',
       make: () => new OpencodeAdapter({
         ...NO_CRED,
-        // ⚠️ opencode 的目录不来自 `createModelCatalog`（5 处协议级差异），
-        //    它需要整个 `identitySlots` 序列与池的代理映射。
+        // ⚠️⚠️ 2026-10-23 迁移后 opencode **也走 `createModelCatalog`** 了
+        //    （用户要求「实体 provider 一律走共享骨架」）⇒ 它的 `accountPool`
+        //    必须实现骨架消费的 `disabledModelsFor` / `providerClosedFor`，
+        //    只给 `opencodeProxyFor` 会抛
+        //    `deps.accountPool?.disabledModelsFor is not a function`（实测）。
         identitySlots: async () => [{ refName: 'OPENCODE_A', slotId: 's1' }],
-        accountPool: { opencodeProxyFor: () => undefined } as never,
+        accountPool: {
+          opencodeProxyFor: () => undefined,
+          disabledModelsFor: () => new Set<string>(),
+          providerClosedFor: () => false,
+        } as never,
       } as never),
     },
     {

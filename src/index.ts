@@ -3339,13 +3339,13 @@ export function apply(ctx: Context): void {
     //    ⚠️ 刻意**不接** `readImageRequest` 缩放桥接：智谱侧对单图字节上限
     //    无实测依据，编一个预算是凭空造数字（同 modelscope 的取舍）。
     readImage: makeReadImage(ctx),
-    // ⚠️⚠️ **必须接 `disabledModels` 与 `providerClosed`**（2026-10-20，IKP8OF）：
-    //    本家手写 `listModels`、不走共享骨架，而这两条回调此前**一个都没传** ⇒
-    //    用户在 Jet Hub 里关掉的 autoclaw 模型**照样出现在选择器里**（实测形态与
-    //    modelscope 那条「接线层漏实参」逐字相同：字段与消费点都在，只缺实参）。
-    //    `providerClosed` 另外覆盖「关闭之后才新增的模型」（黑名单里没有它们）。
-    disabledModels: () => pool.disabledModelsFor(AUTOCLAW.id),
-    providerClosed: () => pool.providerClosedFor(AUTOCLAW.id),
+    // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+    //
+    // 本家此前**手写** `listModels`，故需要分别传 `disabledModels` / `providerClosed`
+    // 两个回调（2026-10-20 那次就是靠这两行兜住的）。用户定稿「实体 provider 一律走
+    // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
+    // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线）。
+    accountPool: pool,
   })
 
   // ===== AutoClaw 国际版（autoclawintl）=====
@@ -3394,10 +3394,9 @@ export function apply(ctx: Context): void {
     //    查不到自己的账号（本插件在 workbuddy 上踩过同类坑）。
     product: AUTOCLAW_INTL,
     readImage: makeReadImage(ctx),
-    // ⚠️⚠️ 同国内版（IKP8OF）：本家手写 `listModels`，两条回调必须显式接线。
-    //    两个站点各一条，漏一处即该站静默失效（本仓库的既有纪律）。
-    disabledModels: () => pool.disabledModelsFor(AUTOCLAW_INTL.id),
-    providerClosed: () => pool.providerClosedFor(AUTOCLAW_INTL.id),
+    // ⚠️⚠️ 同国内版（2026-10-23 迁移）：黑名单与关闭意图由共享骨架从账号池读。
+    //    两个站点**各一条** `accountPool`，漏一处即该站静默失效（本仓库的既有纪律）。
+    accountPool: pool,
   })
 
   const accio = new AccioAuth(ctx)
@@ -3723,18 +3722,16 @@ export function apply(ctx: Context): void {
     //    （它按「像素预算发请求版本」的形态只在 opencode / accio 那几家实现）。
     //    魔搭的图片走 `readImage` 单一路径，逐模型按 `supportsImage` 声明模态。
     readImage: makeReadImage(ctx),
-    // ⚠️⚠️ **必须接 `disabledModels`**（2026-10-17 审计发现）：模型黑名单是
-    //    「设置页 → 显示列表」逐 id 开关的产物，而**模型选择器读的正是这份黑名单**
-    //    （`ModelscopeAdapter.listModels` 读 `options.disabledModels?.()`）。
-    //    ⚠️ 本回调此前**没有传** ⇒ 黑名单完全失效 ⇒ 用户在「显示列表」里关掉的模型
-    //    **照样出现在模型选择器里**（实测：只开了 V4.1 Flash，选择器仍列全部 36 个）。
-    //    ⚠️ 典型形态：适配器**支持**该能力（字段与消费点都在），只是**接线层漏了实参**
-    //    ⇒ 无报错、无日志，纯静默。
-    disabledModels: () => pool.disabledModelsFor(MODELSCOPE.id),
-    // ⚠️⚠️ **必须接 `providerClosed`**（Gitee issue IKP8OF）：本家不走共享骨架
-    //    （`model-catalog.ts`），故「整个供应商关闭」这条判据必须在这里显式接线，
-    //    否则关闭后**新长出来的模型**仍会出现在选择器里（黑名单里没有它们）。
-    providerClosed: () => pool.providerClosedFor(MODELSCOPE.id),
+    // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+    //
+    // 本家此前**手写** `listModels`，故需要在这里分别传 `disabledModels` 与
+    // `providerClosed` 两个回调（2026-10-17 / IKP8OF 两次实测都栽在「漏传实参」
+    // 上：适配器支持该能力、消费点也对，只是接线层漏了 ⇒ 纯静默失效）。
+    //
+    // 用户定稿「实体 provider 一律走共享骨架」后，那两个回调**已删除**：
+    // `ModelscopeAdapter.listModels` 改为委托 `createModelCatalog`，黑名单与
+    // 关闭意图统一从上面那个 `accountPool` 读。⚠️ **不要把回调加回来** ——
+    // 那会让「同一语义两套判据」重现（本仓库红线），且会掩盖池没接上的缺陷。
   })
 
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
@@ -4298,9 +4295,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   }
 
   const officeAceAdapter = registerOfficeAceLlm(ctx, {
-    disabledModels: () => pool.disabledModelsFor(OFFICEACE.id),
-    // ⚠️⚠️ 同上（IKP8OF）：本家手写 `listModels`，不走共享骨架。
-    providerClosed: () => pool.providerClosedFor(OFFICEACE.id),
+    // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+    //
+    // 本家此前**手写** `listModels`，故需要分别传 `disabledModels` / `providerClosed`
+    // 两个回调（IKP8OF 那次就是靠这两行兜住的）。用户定稿「实体 provider 一律走
+    // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
+    // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线）。
+    accountPool: pool,
     // ⚠️ **按当前选中账号的 ref 取凭据**（2026-10-13）：凭据存在 DSH 凭据库里
     //    按 `credentialRef` 索引（与 gemini / raccoon 同款）。缺省会读兼容文件
     //    `session.json`，那份是**所有账号共用**的 ⇒ 号池轮换形同虚设。
@@ -4506,9 +4507,14 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         ? AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)
         : AbortSignal.any([signal, AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)]),
     }),
-    disabledModels: () => pool.disabledModelsFor(OPENCODE.id),
-    // ⚠️⚠️ 同上（IKP8OF）：本家手写 `listModels`，不走共享骨架。
-    providerClosed: () => pool.providerClosedFor(OPENCODE.id),
+    // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+    //
+    // 本家此前**手写** `listModels`，故需要分别传 `disabledModels` / `providerClosed`
+    // 两个回调（IKP8OF 那次就是靠这两行兜住的）。用户定稿「实体 provider 一律走
+    // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
+    // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线），
+    // 并掩盖池没接上这类缺陷。
+    accountPool: pool,
     markLimited: async (slotId, modelId, resetAtMs) => {
       // 匿名条目同样落盘：它是池里的一条普通条目，限额标记在面板可见、
       // 可用「重测/清除」恢复（早期把匿名槽当进程内状态，重启即丢）。
