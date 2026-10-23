@@ -32,8 +32,10 @@ import { homedir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import {
+  ANALYZE_IMAGE_DISABLE_ENV,
   ANALYZE_IMAGE_MAX_IMAGES,
   ANALYZE_IMAGE_TOOL,
+  analyzeImageDisabledByEnv,
   collectTurnImages,
   imageDataUrl,
   installAnalyzeImage,
@@ -383,6 +385,33 @@ interface CapturedTool {
  * @returns 捕获到的工具字面量
  * @throws 宿主校验器抛出的 `JsonSchemaError`（原样，不吞）
  */
+/** 跑一次接线、返回捕获到的工具（**不**跑宿主 schema 校验）。 */
+function registerCapturing(log?: { info?: (message: string) => void }): CapturedTool | undefined {
+  let captured: CapturedTool | undefined
+  const scope = {
+    tools: {
+      register(tool: CapturedTool) {
+        const output = tool.output
+        if (output === undefined || typeof output !== 'object' || typeof output.render !== 'function') {
+          throw new TypeError(`tool "${tool.name}" must declare output { schema, render, presentationMeta? }`)
+        }
+        captured = tool
+      },
+    },
+    attachments: {},
+  }
+  const ctx = {
+    inject(_deps: string[], callback: (s: unknown) => void) { callback(scope) },
+  }
+  installAnalyzeImage(
+    ctx as never,
+    { readImage: async () => ({ data: new Uint8Array(), mediaType: 'image/png' }), describe: async () => 'x' },
+    () => undefined,
+    log,
+  )
+  return captured
+}
+
 function registerWithRealValidator(
   assertSupported: (schema: unknown) => void,
 ): CapturedTool {
@@ -407,6 +436,7 @@ function registerWithRealValidator(
     ctx as never,
     { readImage: async () => ({ data: new Uint8Array(), mediaType: 'image/png' }), describe: async () => 'x' },
     () => undefined,
+    { info: () => undefined },
   )
   if (captured === undefined) throw new Error('installAnalyzeImage 没有注册任何工具')
   return captured
@@ -530,5 +560,59 @@ describe.skipIf(dshToolsEntry === null)('analyzeImage：工具注册必须过宿
     // ④ 反向对照：`{}`（旧版形状）**不满足**这一格 —— 若哪天实现退回空对象，
     //    这一格会红，而不是再次「19 条全绿 + 上游 400」。
     expect(({} as { type: string }).type).not.toBe('object')
+  })
+})
+
+/**
+ * 应急闸 `DSH_DISABLE_ANALYZE_IMAGE`（2026-10-23，用户要求「临时禁用」）。
+ *
+ * ## 为什么要「不注册」而不是「请求时摘除」
+ *
+ * 作用域摘除（`codearts-vision.ts`）只改**发给上游的 options**，harness 侧的
+ * 工具表（落盘 `request/header` 里的那份）仍含该工具 ⇒ 用户在界面上看到的
+ * `tools=281 / analyzeImage=true` 不变，无法用它验证「工具数是否是慢的成因」。
+ * 应急闸走**注册期**：关闸时工具根本不存在，任何一侧都干净。
+ */
+describe('analyzeImage 的应急禁用闸', () => {
+  it('闸关着 ⇒ 根本不注册，且**必须留一条日志**', () => {
+    const lines: string[] = []
+    const before = process.env[ANALYZE_IMAGE_DISABLE_ENV]
+    process.env[ANALYZE_IMAGE_DISABLE_ENV] = '1'
+    try {
+      const captured = registerCapturing({ info: (m) => lines.push(m) })
+      expect(captured, '闸关着时不得注册任何工具').toBeUndefined()
+    } finally {
+      if (before === undefined) delete process.env[ANALYZE_IMAGE_DISABLE_ENV]
+      else process.env[ANALYZE_IMAGE_DISABLE_ENV] = before
+    }
+    // ⚠️ 这格是「关闸」与「注册静默失败」的**唯一**区别（本工具栽过一次：
+    //    `tools.register()` 因 schema 不合法中断 ⇒ 工具消失、**日志零字**）。
+    //    没有它，「工具不见了」与「闸关着」同形，无法排查。
+    expect(lines.join('\n')).toContain(ANALYZE_IMAGE_DISABLE_ENV)
+  })
+
+  it('闸未设 / 取值不认 ⇒ 正常注册（不得把工具误关）', () => {
+    const before = process.env[ANALYZE_IMAGE_DISABLE_ENV]
+    try {
+      for (const value of [undefined, '', '0', 'false', 'no', 'off']) {
+        if (value === undefined) delete process.env[ANALYZE_IMAGE_DISABLE_ENV]
+        else process.env[ANALYZE_IMAGE_DISABLE_ENV] = value
+        expect(registerCapturing()?.name, `取值 ${JSON.stringify(value)} 应当照常注册`).toBe(ANALYZE_IMAGE_TOOL)
+      }
+    } finally {
+      if (before === undefined) delete process.env[ANALYZE_IMAGE_DISABLE_ENV]
+      else process.env[ANALYZE_IMAGE_DISABLE_ENV] = before
+    }
+  })
+
+  it('取值判据：1/true/yes 大小写不敏感，其余（含 2/on）都不关', () => {
+    for (const v of ['1', 'true', 'TRUE', ' yes ', 'Yes']) {
+      expect(analyzeImageDisabledByEnv({ [ANALYZE_IMAGE_DISABLE_ENV]: v }), `取值 ${JSON.stringify(v)} 应当关闸`).toBe(true)
+    }
+    for (const v of [undefined, '', '0', 'false', '2', 'on', 'enabled', 'no']) {
+      expect(analyzeImageDisabledByEnv({ [ANALYZE_IMAGE_DISABLE_ENV]: v }), `取值 ${JSON.stringify(v)} 不该关闸`).toBe(false)
+    }
+    // 反向对照：老写法 `=== '1'` 会把 'true'/'yes' 判成「没关」⇒ 用户设了却仍在跑
+    expect('true' === '1').toBe(false)
   })
 })

@@ -235,6 +235,26 @@ export async function runAnalyzeImage(exec: AnalyzeExec, deps: AnalyzeImageDeps)
 }
 
 /**
+ * 临时禁用开关的环境变量名。
+ *
+ * ⚠️ **这是应急闸，不是长期配置**（2026-10-23 应用户要求加）：
+ * 设成 `1` / `true` / `yes` 时**根本不注册**该工具（而不是「注册了但请求时摘除」）。
+ * 用途：① 线上出问题时能立刻把嫌疑项摘干净；② 验证「工具数是否是慢的成因」。
+ * 长期形态仍以 {@link installAnalyzeImage} 的无条件注册 + 逐请求作用域摘除为准。
+ */
+export const ANALYZE_IMAGE_DISABLE_ENV = 'DSH_DISABLE_ANALYZE_IMAGE'
+
+/** 读该开关（`1` / `true` / `yes` 大小写不敏感 ⇒ 禁用）。 */
+export function analyzeImageDisabledByEnv(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  const raw = env[ANALYZE_IMAGE_DISABLE_ENV]
+  if (raw === undefined) return false
+  const key = raw.trim().toLowerCase()
+  return key === '1' || key === 'true' || key === 'yes'
+}
+
+/**
  * 把 `analyzeImage` 注册到宿主。
  *
  * ## ⚠️ 为什么用 `ctx.inject(['tools', 'attachments'])`
@@ -253,15 +273,25 @@ export async function runAnalyzeImage(exec: AnalyzeExec, deps: AnalyzeImageDeps)
  * @param ctx - 插件上下文
  * @param deps - 识图依赖
  * @param routeOf - 读当前会话路由（provider/model）；返回 undefined 表示不可判定
+ * @param log - 可选日志（禁用时记一条，便于事后确认是「闸关着」而不是「注册失败」）
  */
 export function installAnalyzeImage(
   ctx: Context,
   deps: AnalyzeImageDeps,
   routeOf: (exec: AnalyzeExec) => { provider?: string; model?: string } | undefined,
+  log?: { info?: (message: string) => void },
 ): void {
   ctx.inject(['tools', 'attachments'], (scope) => {
     const tools = (scope as unknown as { tools: ToolRegistrar }).tools
     if (tools === undefined || typeof tools.register !== 'function') return
+    if (analyzeImageDisabledByEnv()) {
+      // ⚠️ 必须**留一条日志**：否则「工具不见了」与「注册静默失败」两种形态同形，
+      //    而后者正是本工具栽过一次的坑（`tools.register()` 中断 ⇒ 零日志）。
+      log?.info?.(
+        `[codearts-auth] ${ANALYZE_IMAGE_TOOL} 已按 ${ANALYZE_IMAGE_DISABLE_ENV} 跳过注册（临时禁用）。`,
+      )
+      return
+    }
     tools.register(defineToolLiteral({
       name: ANALYZE_IMAGE_TOOL,
       description:
