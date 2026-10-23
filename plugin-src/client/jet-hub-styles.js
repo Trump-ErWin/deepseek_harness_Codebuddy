@@ -1341,6 +1341,76 @@ const STYLES = `
   }
 }
 
+/* ── 移动端（≤768px）：左侧 rail 改为页头按钮呼出的抽屉 ─────────────────
+   用户报障（2026-10-24）：移动端供应商太多，常驻 rail 把账号列表挤到只剩
+   「划来划去」。此处三条诉求：呼出按钮、靠左竖向列表、自动收起。
+
+   ⚠️ JS 侧不读 window.innerWidth / 不挂 resize 监听 —— 桌面/移动的分界**只**
+   由这里的媒体查询承担；抽屉节点只在 mobileNavOpen 为 true 时挂载，桌面端
+   状态恒 false ⇒ 抽屉与呼出按钮在桌面端连 DOM 都不出现，无残留。 */
+@media (max-width: 768px) {
+  /* ① 呼出按钮：仅移动端可见（桌面端连 DOM 都没有，这里是双保险）。 */
+  .dim-jh-mobileNavBtn { display: inline-flex; }
+
+  /* ② 常驻 rail 收进抽屉：display: none 而不是 visibility —— 不占格、
+     不参与 .dim-jh-layout 的 flex 布局，右侧面板独占整行。 */
+  .dim-jh-layout > .dim-jh-rail { display: none; }
+
+  /* ③ 抽屉容器：fixed 覆盖层，位于既有 modal（3000）之下、页面内容之上。
+     ⚠️ 不用 100dvh 布局 trick —— inset: 0 即可视区，地址栏收放由浏览器处理。 */
+  .dim-jh-mobileNavWrap { position: fixed; inset: 0; z-index: 2000; }
+
+  /* 遮罩：吃掉抽屉外的一切点击（点击 = 收起，JS 侧 onClick）。 */
+  .dim-jh-mobileNavScrim { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.32); }
+
+  /* ④ 抽屉本体：靠左、竖向列表。复用 rail 的既有按钮样式（.dim-jh-provider），
+     只重定义容器几何；宽 = min(78vw, 300px)——78vw 是 360px 屏上约 280px，
+     与 rail 桌面宽 228px 同量级，窄屏（320px）时 78vw 兜底不出屏。
+
+     ⚠️ **必须压过上方 720px 窄屏块**：那块把 .dim-jh-layout > .dim-jh-rail 改成
+     顶部横向标签条、并把 .dim-jh-railGroup 展平成 display: contents —— 抽屉
+     复用 .dim-jh-rail 类名，≤720px 时整段继承，抽屉里就会出现「横向排 + 分组
+     标题消失 + 按钮被拉高」的混合态。故这里逐项显式恢复：grid 纵向 + 分组
+     标题可见 + 行恢复块级。 */
+  .dim-jh-mobileNavWrap .dim-jh-rail {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(78vw, 300px);
+    max-width: 86vw;
+    box-sizing: border-box;
+    display: grid;
+    align-content: start;
+    gap: 8px;
+    flex-direction: initial;
+    align-items: initial;
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding: max(6px, env(safe-area-inset-top, 0px)) 6px max(6px, env(safe-area-inset-bottom, 0px));
+    border-right: 1px solid var(--dsw-alias-border-default, #e5e5e5);
+    border-bottom: none;
+    background: var(--dsw-alias-bg-layer-1, #fff);
+    box-shadow: 8px 0 24px rgba(0, 0, 0, 0.14);
+    /* 触屏滚动惯性 + 遮罩下滚动穿透防护；超出部分内部滚动，不撑出屏幕 */
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .dim-jh-mobileNavWrap .dim-jh-railGroup { display: grid; gap: 8px; }
+  .dim-jh-mobileNavWrap .dim-jh-railGroup + .dim-jh-railGroup { margin-top: 10px; }
+  .dim-jh-mobileNavWrap .dim-jh-railGroupTitle { display: block; }
+  .dim-jh-mobileNavWrap .dim-jh-provider { width: 100%; min-height: 44px; }
+  .dim-jh-mobileNavWrap .dim-jh-providerRow { flex: initial; width: 100%; }
+}
+
+/* 桌面端（>768px）：呼出按钮与抽屉容器一律隐藏。抽屉容器在桌面端**永不挂载**
+   （mobileNavOpen 恒 false），这条是热更新/状态残留的双保险；
+   呼出按钮的 DOM 桌面端真实存在（页头里），必须 display: none。 */
+@media (min-width: 769px) {
+  .dim-jh-mobileNavBtn { display: none; }
+  .dim-jh-mobileNavWrap { display: none; }
+}
+
 `
 
 /**

@@ -7599,6 +7599,19 @@ export function JetHubPage({ rpcCall }) {
    * 无谓的渲染；状态本身由页面级 `providerStatuses` 提供，不额外发请求。
    */
   const [showProviderSwitches, setShowProviderSwitches] = React.useState(false);
+  /**
+   * 移动端「供应商列表」抽屉的展开状态（≤768px，CSS 媒体查询驱动显示）。
+   *
+   * 背景（用户 2026-10-24 报障）：移动端上常驻左侧 rail 太占竖向空间，
+   * 账号列表被挤成「划来划去」。改为页头按钮呼出靠左抽屉，选中 / 遮罩点击 /
+   * Escape 三路自动收起。
+   *
+   * 桌面端该状态恒为 false：呼出按钮 `display: none`，永远没有入口；
+   * `selectProvider` 里多出的那次 setState 无副作用（False → False 不触发重渲）。
+   */
+  const [mobileNavOpen, setMobileNavOpen] = React.useState(false);
+  /** 移动端抽屉打开时把焦点移进首个供应商按钮（见其 effect）。 */
+  const mobileNavRef = React.useRef(null);
   /** 正在提交的供应商 id 集合：只禁用被点的那一个开关。 */
   const [providerBusy, setProviderBusy] = React.useState(() => new Set());
   /**
@@ -7862,7 +7875,39 @@ export function JetHubPage({ rpcCall }) {
     providerTouchedRef.current = true;
     setSelected(id);
     setVersion(v => v + 1);
+    // 移动端：选中即收起抽屉（req#4 自动收起）。桌面端恒为 false，这次
+    // setState 是 False → False，不产生任何重渲或副作用。
+    setMobileNavOpen(false);
   };
+
+  /**
+   * 移动端抽屉的 Escape 关闭。
+   *
+   * ⚠️ 挂 document 而非抽屉节点 —— 焦点可能在右侧面板的任意控件上
+   * （与 ProviderSwitchPanel 同因同解）。抽屉关闭时不挂载 → effect 卸载，
+   * 监听自动摘除，不会与既有弹窗的 Escape 监听叠加。
+   */
+  React.useEffect(() => {
+    if (!mobileNavOpen) return;
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') setMobileNavOpen(false);
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [mobileNavOpen]);
+
+  /**
+   * 移动端抽屉打开时把焦点移进首个供应商按钮。
+   *
+   * 键盘 / 读屏用户按 Escape 收起后，焦点应回到触发按钮 —— 这里先进抽屉、
+   * 收起时靠 `mobileNavOpen` 由 false 驱动按钮重新渲染，浏览器把焦点还给
+   * 文档；触发按钮本身不加 autofocus（避免桌面端误触发滚动）。
+   */
+  React.useEffect(() => {
+    if (!mobileNavOpen) return;
+    const first = mobileNavRef.current?.querySelector('button');
+    first?.focus();
+  }, [mobileNavOpen]);
 
   /**
    * 供应商级一键开关。
@@ -8236,6 +8281,18 @@ export function JetHubPage({ rpcCall }) {
     //    aria-label 与宿主左侧「Jet Hub」导航项承担，不丢。
     React.createElement('header', { className: 'dim-jh-header' },
       React.createElement('div', { className: 'dim-jh-headerActions' },
+        // 移动端（≤768px）专属的「供应商列表」呼出按钮：左侧 rail 改为抽屉，
+        // 桌面端由 CSS `display: none` 隐藏（见 jet-hub-styles.js 的媒体查询段）。
+        // 刻意放页头**首位** —— 「选哪个供应商」是抽屉模式下所有操作的入口。
+        // aria-expanded 与 `mobileNavOpen` 同步；抽屉关闭时不挂载（同「供应商
+        // 开关」的取舍），故打开态的 aria-expanded 必然先于抽屉出现。
+        React.createElement('button', {
+          className: 'dim-jh-mobileNavBtn',
+          'aria-expanded': mobileNavOpen ? 'true' : 'false',
+          'aria-controls': 'dim-jh-mobileNav',
+          title: '供应商列表：展开/收起左侧供应商导航（移动端）。',
+          onClick: () => setMobileNavOpen(open => !open),
+        }, '供应商'),
         // 「供应商开关」在页头，而不是左侧每个供应商行尾（!25 的原形态）：
         // 它是破坏性批量操作，与「选择看哪个供应商」这个高频无害动作分开摆放，
         // 误点的可能性归零，也让左侧窄栏回到纯导航。见 `ProviderSwitchPanel`。
@@ -8373,6 +8430,28 @@ export function JetHubPage({ rpcCall }) {
         }, React.createElement('div', null, providerNotice.text))
       : null,
     React.createElement('div', { className: 'dim-jh-layout' },
+      // 移动端（≤768px）抽屉：与既有弹窗同型 —— 关闭即不挂载。桌面端本节点
+      // 永不渲染（mobileNavOpen 恒 false），rail 常驻；行为完全由 CSS 媒体查询
+      // 分流，JS 不读 window.innerWidth（无 resize 监听、无 SSR 隐患）。
+      mobileNavOpen
+        ? React.createElement('div', {
+            className: 'dim-jh-mobileNavWrap',
+            key: 'mobile-nav',
+            id: 'dim-jh-mobileNav',
+          },
+          // 遮罩：点它收起（req#4 的第二条关闭路径）。z-index 与既有弹窗同段，
+          // 但低于弹窗 3000 —— 抽屉是轻量导航，供应商开关弹窗要从它上面压过。
+          React.createElement('div', {
+            className: 'dim-jh-mobileNavScrim',
+            onClick: () => setMobileNavOpen(false),
+          }),
+          React.createElement('nav', {
+            className: 'dim-jh-rail',
+            role: 'tablist',
+            'aria-label': 'Provider 导航',
+            ref: mobileNavRef,
+          }, renderRail()))
+        : null,
       React.createElement('nav', { className: 'dim-jh-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
         renderRail()),
       React.createElement('main', {
