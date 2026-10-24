@@ -43,6 +43,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { normalizeProxy } from './gemini-proxy.js'
 import { proxyFetch } from './opencode-proxy.js'
 import { describeFetchError } from './opencode-rpc.js'
+import { targetsProxyEntry } from './network-hint.js'
 import { QODER_USAGE_PATH } from './qoder-credits.js'
 import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
 
@@ -164,11 +165,34 @@ export async function handleQoderRpc(
         } catch (error) {
           // ⚠️ **必须把 `cause` 带出来**（同 IKK4BY 第 2 点）：`error.message`
           // 恒为 `fetch failed`，真因只在 `cause` 上。
+          const detail = controller.signal.aborted ? '连接超时' : describeFetchError(error)
+          /**
+           * ⚠️⚠️ **归因必须分道：不得把「代理软件没启动」说成目标站点的事**
+           * （2026-10-22 真实报障）。`ECONNREFUSED 127.0.0.1:7897` 与「站点
+           * 连不上」在 `NETWORK_BLOCKED_CODE_RE` 里是**同一类**，但处置相反：
+           *
+           * - 被拒的是**用户填的代理入口** ⇒ 那个端口上没有程序在监听 ⇒
+           *   该做的是「启动代理软件 / 核对地址端口」；
+           * - 被拒的才是**目标站点** ⇒ 才该换出口、换线路或换站点。
+           *
+           * 旧文案对前者也照抄「国际版被 SNI 阻断」，用户于是去查网络、
+           * 换账号，而正确动作只是**把代理软件打开**。判据只有一份实现
+           * （`network-hint.ts` 的 `targetsProxyEntry`），这里只做分道。
+           */
+          if (targetsProxyEntry(error, normalized.proxy.url)) {
+            return fail(
+              `测试失败：${detail}。代理 ${normalized.proxy.label}（${normalized.proxy.url}）`
+              + '没有在监听（连接被拒绝）—— 先启动代理软件、核对地址与端口，'
+              + '或清空代理回到直连（两个站点直连都能通）。',
+            )
+          }
           return fail(
-            `测试失败：${controller.signal.aborted ? '连接超时' : describeFetchError(error)}`
+            `测试失败：${detail}`
             + `。探测目标是 ${product.openApiBase}；`
             + (product.id === QODER.id
-              ? '国际版在本机被 SNI 阻断（TCP 能连、TLS 握手被丢），必须配出口代理或改用中国版。'
+              // ⚠️ 不得断言机制：SNI 阻断只是**可能**之一，本地代理/分流规则
+              // 把该域名转给不通的节点同样会长成这样（2026-10-23 实测的真凶）。
+              ? '国际版可能在本机被 SNI 阻断（TCP 能连、TLS 握手被丢），也可能是本地代理/分流规则把它转给了不通的节点 —— 换条线路、清空代理重试，或改用中国版。'
               : '中国版通常直连就通；若这条代理不通，清空代理回到直连即可。'),
           )
         } finally {

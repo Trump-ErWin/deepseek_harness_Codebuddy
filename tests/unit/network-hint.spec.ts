@@ -17,8 +17,10 @@ import { describe, expect, it } from 'vitest'
 import {
   NETWORK_BLOCKED_CODE_RE,
   collectCauseCodes,
+  collectRefusedTargets,
   isNetworkBlocked,
   networkBlockedHint,
+  targetsProxyEntry,
 } from '../../src/network-hint.js'
 
 /** 造一个带 cause 链的 `fetch failed`（Node/undici 的真实形态）。 */
@@ -93,6 +95,143 @@ describe('isNetworkBlocked（判「出不去」）', () => {
     // 反例守卫：若实现改成读 message，这条会红。读 message 会把「服务端
     // 恰好回了这段文字」误判成网络故障。
     expect(isNetworkBlocked(new Error('ENOTFOUND in a log line'), false)).toBe(false)
+  })
+})
+
+describe('collectRefusedTargets（定位失败目标）', () => {
+  /** Node「真实形态」的 `ErrnoException`：结构化字段齐全。 */
+  function refused(host: string, port?: number): Error {
+    const message = port === undefined
+      ? `getaddrinfo ENOTFOUND ${host}`
+      : `connect ECONNREFUSED ${host}:${port}`
+    return Object.assign(new Error(message), {
+      code: port === undefined ? 'ENOTFOUND' : 'ECONNREFUSED',
+      address: host,
+      ...(port === undefined ? {} : { port }),
+    })
+  }
+
+  it('从**结构化字段**取目标（`fetch failed` 包了一层也能取到）', () => {
+    const error = new TypeError('fetch failed', { cause: refused('127.0.0.1', 7897) })
+    expect(collectRefusedTargets(error)).toEqual([{ host: '127.0.0.1', port: 7897 }])
+  })
+
+  it('包装层只剩 message 时**退回报文解析**（SOCKS 握手 / 自建 dispatcher 的形态）', () => {
+    // 没有任何 address / port 字段，只有一句人写的报文。
+    const error = new TypeError('fetch failed', {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:7897'), { code: 'ECONNREFUSED' }),
+    })
+    expect(collectRefusedTargets(error)).toEqual([{ host: '127.0.0.1', port: 7897 }])
+  })
+
+  it('⚠️ 只剩**结构化字段**时也要取到（包装层把 message 改写过，地址只在 errno 字段上）', () => {
+    // 反例守卫：这条专打「结构化字段」那条腿 —— 上面那条的 message 里
+    // 自带地址，报文解析能兜住，**取不到结构化腿失效**。
+    const rewritten = Object.assign(new Error('socket hang up'), {
+      code: 'ECONNREFUSED',
+      address: '127.0.0.1',
+      port: 7897,
+    })
+    expect(collectRefusedTargets(rewritten)).toEqual([{ host: '127.0.0.1', port: 7897 }])
+  })
+
+  it('⚠️ **只有「目标确定」的码才收**：连接超时带着 address 也不算「没人监听」', () => {
+    // 反例守卫：`UND_ERR_CONNECT_TIMEOUT` 说明连接**还没建立**（对端可能只是慢），
+    // 把它算成「端口无人监听」会把用户赶去关代理 —— 与我们要修的误归因同型。
+    const timeout = Object.assign(new Error('Connect Timeout Error'), {
+      code: 'UND_ERR_CONNECT_TIMEOUT',
+      address: '127.0.0.1',
+      port: 7897,
+    })
+    expect(collectRefusedTargets(timeout)).toEqual([])
+  })
+
+  it('⚠️ `ECONNRESET` 同样不收（本地代理在跑，是它后面的节点被切断）', () => {
+    const reset = Object.assign(new Error('socket hang up'), {
+      code: 'ECONNRESET',
+      address: '127.0.0.1',
+      port: 7897,
+    })
+    expect(collectRefusedTargets(reset)).toEqual([])
+  })
+
+  it('读不到任何目标时返回**空数组**而不是 undefined', () => {
+    const targets = collectRefusedTargets(new Error('HTTP 500'))
+    expect(Array.isArray(targets)).toBe(true)
+    expect(targets).toEqual([])
+  })
+
+  it('只有一个目标时也能解析 IPv6 方括号形态', () => {
+    const error = Object.assign(new Error('connect ECONNREFUSED ::1:7897'), { code: 'ECONNREFUSED' })
+    expect(collectRefusedTargets(error)).toEqual([{ host: '::1', port: 7897 }])
+  })
+
+  it('去重：同一目标在 cause 链里出现两次只算一个', () => {
+    const inner = refused('127.0.0.1', 7897)
+    const error = new TypeError('fetch failed', {
+      cause: Object.assign(new TypeError('mid', { cause: inner }), {
+        code: 'ECONNREFUSED',
+        address: '127.0.0.1',
+        port: 7897,
+      }),
+    })
+    expect(collectRefusedTargets(error)).toHaveLength(1)
+  })
+
+  it('病态自引用链不会死循环', () => {
+    const loop: Error & { cause?: unknown } = Object.assign(new Error('loop'), { code: 'ECONNREFUSED' })
+    loop.cause = loop
+    expect(() => collectRefusedTargets(loop)).not.toThrow()
+  })
+})
+
+describe('targetsProxyEntry（判「是不是代理入口自己没人监听」）', () => {
+  /** 造一个「连代理入口被拒」的完整 cause 链（插件真实拿到的形状）。 */
+  function refusedAt(host: string, port: number): Error {
+    const leaf = Object.assign(new Error(`connect ECONNREFUSED ${host}:${port}`), {
+      code: 'ECONNREFUSED',
+      address: host,
+      port,
+    })
+    return new TypeError('fetch failed', { cause: leaf })
+  }
+
+  it('命中：被拒的正是用户填的代理入口', () => {
+    expect(targetsProxyEntry(refusedAt('127.0.0.1', 7897), 'http://127.0.0.1:7897')).toBe(true)
+  })
+
+  it('`localhost` 与 `127.0.0.1` 视为同一族（DNS 解析会让报文与输入不同名）', () => {
+    expect(targetsProxyEntry(refusedAt('127.0.0.1', 7897), 'http://localhost:7897')).toBe(true)
+    expect(targetsProxyEntry(refusedAt('localhost', 7897), 'http://127.0.0.1:7897')).toBe(true)
+  })
+
+  it('⚠️ 端口不同 ⇒ **不算**（不得把「目标站点连不上」说成「你的代理没启动」）', () => {
+    // 反例守卫：误报会让用户去关代理，而关掉代理可能让另一个本来能通的渠道一起断。
+    expect(targetsProxyEntry(refusedAt('127.0.0.1', 7898), 'http://127.0.0.1:7897')).toBe(false)
+  })
+
+  it('⚠️ 主机不同 ⇒ **不算**（被拒的是目标站点，处置是换出口而不是启动代理）', () => {
+    expect(targetsProxyEntry(refusedAt('8.222.87.223', 443), 'http://127.0.0.1:7897')).toBe(false)
+  })
+
+  it('⚠️ 主机不同但**端口相同**也只是巧合 ⇒ 不算（专打「主机不比对」那条腿）', () => {
+    // 反例守卫：上面那条的端口也不同，光靠端口比对就能挡住 ⇒ 取不到
+    // 「主机不比对」的变异。这里让端口一致，只有主机判据能挡住。
+    expect(targetsProxyEntry(refusedAt('10.0.0.5', 7897), 'http://127.0.0.1:7897')).toBe(false)
+  })
+
+  it('⚠️ 代理入口**在跑**、是它后面的节点被切断（ECONNRESET）⇒ 不算', () => {
+    const reset = Object.assign(new Error('Client network socket disconnected'), {
+      code: 'ECONNRESET',
+      address: '127.0.0.1',
+      port: 7897,
+    })
+    const error = new TypeError('fetch failed', { cause: reset })
+    expect(targetsProxyEntry(error, 'http://127.0.0.1:7897')).toBe(false)
+  })
+
+  it('代理地址解析不了 ⇒ 不算（交回调用方的通用文案，不猜）', () => {
+    expect(targetsProxyEntry(refusedAt('127.0.0.1', 7897), 'not a url')).toBe(false)
   })
 })
 

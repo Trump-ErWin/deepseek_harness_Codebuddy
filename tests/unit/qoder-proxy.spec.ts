@@ -539,11 +539,17 @@ describe('⑤ testProxy 的探活语义', () => {
       proxy: '127.0.0.1:7897',
     })
     const intlMsg = (intl as { error: { message: string } }).error.message
-    // ⚠️ 三条都断：根因码 / 探测目标主机 / SNI 阻断的解释。
-    //    只断「含根因码」会放过「丢掉 describeFetchError 但手工拼了码」的半吊子。
+    // ⚠️ 四条都断：根因码 / 探测目标主机 / SNI 阻断的解释 / **另一条同样常见的机制**。
+    //    只断「含根因码」会放过「丢掉 describeFetchError 但手工拼了码」的半吊子；
+    //    只断「含 SNI」会放过「把机制写死成 SNI」的旧文案 —— 而 2026-10-23 实测
+    //    的真凶是本地分流规则，写死会把人导向「换网络 / 换账号」这两个错误动作。
     expect(intlMsg).toContain('UND_ERR_CONNECT_TIMEOUT')
     expect(intlMsg).toContain(QODER.openApiBase)
     expect(intlMsg).toMatch(/SNI/)
+    // ⚠️ 还必须给出**第二条**机制（本地代理 / 分流规则）：机制写死成 SNI 是
+    //    这条缺陷的原始形态，而 2026-10-23 实测的真凶正是本地分流规则。
+    expect(intlMsg).toMatch(/分流规则/)
+    expect(intlMsg, '不得把机制断言成必然').not.toMatch(/必须配出口代理/)
 
     const cn = await handle({} as never, { setQoderProxy: vi.fn() }, 'qoder.testProxy', {
       proxy: '127.0.0.1:7897', provider: QODER_CN.id,
@@ -554,6 +560,79 @@ describe('⑤ testProxy 的探活语义', () => {
     //    去怀疑网络，而真实原因是这条代理本身不通。
     expect(cnMsg).not.toMatch(/SNI/)
     expect(cnMsg).toMatch(/直连/)
+  })
+
+  it('⚠️⚠️ 代理入口端口无人监听时**必须**说「启动代理软件」，不得说成 SNI 阻断', async () => {
+    // 真实报障（2026-10-22）：本机 Clash Verge 没启动、7897 无人监听，
+    // 面板说的是「国际版在本机被 SNI 阻断……必须配出口代理或改用中国版」——
+    // 用户于是去查网络、换账号，而正确动作只是**把代理软件打开**。
+    const leaf = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:7897'), {
+      code: 'ECONNREFUSED', address: '127.0.0.1', port: 7897,
+    })
+    const { handle } = await withMockedProxyFetch(async () => {
+      throw new TypeError('fetch failed', { cause: leaf })
+    })
+
+    const intl = await handle({} as never, { setQoderProxy: vi.fn() }, 'qoder.testProxy', {
+      proxy: 'http://127.0.0.1:7897',
+    })
+    const msg = (intl as { error: { message: string } }).error.message
+    // ① 必须把根因码与**具体入口**说出来
+    expect(msg).toContain('ECONNREFUSED')
+    expect(msg).toContain('127.0.0.1:7897')
+    // ② 必须给出正确处置
+    expect(msg).toMatch(/没有在监听|不在监听/)
+    expect(msg).toMatch(/启动代理/)
+    // ③ ⚠️ **不得**再提 SNI：那是目标站点的事，与本故障无关，
+    //    提了就会把用户导向「换网络 / 换账号」这两个错误动作。
+    expect(msg).not.toMatch(/SNI/)
+    // ④ 也不得出现「探测目标是 …；国际版…」那套站点解释
+    expect(msg).not.toContain(QODER.openApiBase)
+  })
+
+  it('⚠️ 同一条 ECONNREFUSED：被拒的不是代理入口 ⇒ 走站点文案（不误报「你的代理没启动」）', async () => {
+    // 反例守卫：误报会让用户去关代理，而关掉代理可能让另一个本来能通的渠道一起断。
+    const leaf = Object.assign(new Error('connect ECONNREFUSED 8.222.87.223:443'), {
+      code: 'ECONNREFUSED', address: '8.222.87.223', port: 443,
+    })
+    const { handle } = await withMockedProxyFetch(async () => {
+      throw new TypeError('fetch failed', { cause: leaf })
+    })
+    const res = await handle({} as never, { setQoderProxy: vi.fn() }, 'qoder.testProxy', {
+      proxy: 'http://127.0.0.1:7897',
+    })
+    const msg = (res as { error: { message: string } }).error.message
+    expect(msg).toContain(QODER.openApiBase)
+    expect(msg).toMatch(/SNI/)
+    expect(msg).not.toMatch(/没有在监听|不在监听/)
+  })
+
+  it('⚠️ 端口不同也不算代理入口（本地 7898 被拒、用户填的是 7897）', async () => {
+    const leaf = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:7898'), {
+      code: 'ECONNREFUSED', address: '127.0.0.1', port: 7898,
+    })
+    const { handle } = await withMockedProxyFetch(async () => {
+      throw new TypeError('fetch failed', { cause: leaf })
+    })
+    const res = await handle({} as never, { setQoderProxy: vi.fn() }, 'qoder.testProxy', {
+      proxy: 'http://127.0.0.1:7897',
+    })
+    expect((res as { error: { message: string } }).error.message).not.toMatch(/启动代理/)
+  })
+
+  it('⚠️ 代理**在跑**、是它后面的节点被切断（ECONNRESET）⇒ 仍走站点文案', async () => {
+    // ECONNRESET 是「连接已建立后被对面切断」，本地代理明明起来了 ——
+    // 说成「代理没启动」会让用户把它关掉。
+    const leaf = Object.assign(new Error('Client network socket disconnected before secure TLS connection was established'), {
+      code: 'ECONNRESET', address: '127.0.0.1', port: 7897,
+    })
+    const { handle } = await withMockedProxyFetch(async () => {
+      throw new TypeError('fetch failed', { cause: leaf })
+    })
+    const res = await handle({} as never, { setQoderProxy: vi.fn() }, 'qoder.testProxy', {
+      proxy: 'http://127.0.0.1:7897',
+    })
+    expect((res as { error: { message: string } }).error.message).not.toMatch(/启动代理/)
   })
 })
 
