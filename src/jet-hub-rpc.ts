@@ -263,6 +263,8 @@ import { pickTestModel,
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
 import { geminiFetchForAccount } from './gemini-proxy.js'
+import { minimaxIntlFetchForAccount } from './minimax-proxy.js'
+import { normalizeProxy } from './minimax-proxy.js'
 import { handleGeminiRpc } from './gemini-rpc.js'
 import { handleMinimaxIntlRpc } from './minimax-rpc.js'
 import { handleModelscopeRpc } from './modelscope-rpc.js'
@@ -2299,6 +2301,14 @@ function registerJetHubEndpoints(
     // 是**用户点一下就等**的主路径，配了账号代理却不接 ⇒ 积分行恒报
     // 「配额查询网络失败」，而推理路径却正常 —— 症状割裂、极难对应。
     geminiFetchFor: (accountId) => geminiFetchForAccount(accountId),
+    // ⚠️⚠️ **MiniMax 国际站的按账号 fetcher**（PR !145 审计 P0 修法）：
+    // 与上面 `geminiFetchFor` **逐格同因** —— 积分行是用户点一下就等的主路径，
+    // 而 `agent.minimax.io` 按出口 IP 国别分流（大陆直连恒 307 → 中国站 → 401）。
+    // 不接它 ⇒ 配好代理后对话能用、**积分行与一键签到却仍失败**，
+    // 症状与 issue IKMEVG 逐字相同。
+    // ⚠️ 与 `src/index.ts` 的 `creditsTable` 是**两个独立调用**，必须同改
+    //（本仓库记过「只接一处」的复发形态：minimaxXff 就漏过一次）。
+    minimaxIntlFetchFor: (accountId) => minimaxIntlFetchForAccount(accountId),
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -4531,7 +4541,44 @@ function registerJetHubEndpoints(
               ? [...existingIntlProxies][0]!
               : ''
             const intlProxyInput = requestedIntlProxy !== '' ? requestedIntlProxy : inheritedIntlProxy
-            if (intlProxyInput !== '') await pool.setMinimaxIntlProxy(id, intlProxyInput)
+            /**
+             * ⚠️⚠️ **必须过 `normalizeProxy` 才能写池**（PR !145 审计 P1 修法）。
+             *
+             * `types.ts` 的 `RpcCreateAccountRequest.minimaxIntlProxy` 注释明文承诺
+             * 「来自客户端自报的 RPC 载荷（无 schema 校验）⇒ 读取侧必须过
+             * `normalizeProxy` 归一，非法值一律拒绝（与 `accioRegion` 同一条纪律）」，
+             * 而原实现只 `trim()` 就写池 —— **注释与实现相反**。
+             *
+             * 后果（**不可自愈**）：非法串（如 `ftp://host:21`）落盘后，该账号的
+             * **每一条链路**（登录 / 续期 / 目录 / 身份 / 推理 / 积分 / 探测）都会在
+             * `createMinimaxFetcherResolver` 的 `normalizeProxy` 处**抛错**
+             * （见 `minimax-proxy.ts` 的模块头：那里刻意选择抛错而非静默直连）。
+             * 用户只能手动改代理或删号重登；而登录期那条抛错还会被 `catch` 成
+             * 「无法启动 MiniMax 登录（设备码申请失败）」——**文案指错了方向**。
+             *
+             * ⚠️ 与 `minimaxintl.setProxy` 端点（`minimax-rpc.ts`）**必须同口径**：
+             * 那里早就归一化了。同一字段两个写入入口两套判据，正是本仓库
+             * 「同义判据两份实现必然漂移」红线。
+             *
+             * ⚠️ 继承来的值来自池、而池里的值已由 `setProxy` 归一化 ⇒ 它**必然合法**，
+             * 故归一化失败只可能是载荷那条腿（用户/脚本手填），
+             * 此时**拒绝整个登录**并给出可操作原因，而不是把脏值写进池。
+             */
+            if (intlProxyInput !== '') {
+              const normalized = normalizeProxy(intlProxyInput)
+              if (!normalized.ok) {
+                // ⚠️ 删掉刚建的占位条目：不留「有账号但配置非法」的幽灵卡片。
+                void pool.removeAccount(id).catch(() => {})
+                return {
+                  ok: false,
+                  error: {
+                    code: 'bad-request',
+                    message: `出口代理地址无效：${normalized.reason}`,
+                  },
+                }
+              }
+              await pool.setMinimaxIntlProxy(id, normalized.proxy.url)
+            }
           }
 
           let minimaxStarted: StartedMinimaxLoginFlow

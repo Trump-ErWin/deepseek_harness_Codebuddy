@@ -201,12 +201,35 @@ describe('弹窗必须是 React 组件（hooks 规则，真实事故 2026-10-02�
     expect(hub).not.toMatch(/\?\s*(?:Opencode|Gemini|MinimaxIntl)(?:Proxy|Key)Modal\(\{/)
   })
 
-  it('⚠️ proxyModalComponent 必须三家齐全（漏一家 = 该家按钮点了渲染错弹窗）', () => {
+  it('⚠️ proxyModalComponent 必须三家齐全，且**每个 provider 映射到正确的弹窗**', () => {
+    /**
+     * ⚠️⚠️ **必须判「配对」而不是「各自出现过」**（PR !145 审计修法）。
+     *
+     * 初版三条 `toContain` 只要求「`provider === 'gemini'` 与
+     * `provider === 'minimaxintl'` 都出现在函数体里」+「有 `return OpencodeProxyModal`」——
+     * **完全不判哪个分支返回哪个组件**。实测两个变异全绿：
+     *
+     * ① `if (provider === 'minimaxintl') return OpencodeProxyModal;`
+     *    （= 本用例标题说的「渲染错弹窗」，minimaxintl 的「代理」按钮会打开
+     *     opencode 的弹窗并保存到 `opencode.setProxy` 端点）；
+     * ② gemini 与 minimaxintl 的返回值互换（两家互相串端点）。
+     *
+     * ⇒ 改成**逐分支配对断言**：把每个 `if (provider === 'X') return Y;` 抽出来，
+     * 判 `X → Y` 的映射，而不是判「两个字符串都在」。
+     */
     const selector = hub.match(/function proxyModalComponent\([\s\S]*?\n\}/)?.[0]
-      ?? hub.match(/function proxyModalComponent\([\s\S]*?return OpencodeProxyModal;\s*\}/)?.[0]
     expect(selector, '找不到 proxyModalComponent 函数体').toBeDefined()
-    expect(selector!).toContain("provider === 'gemini'")
-    expect(selector!).toContain("provider === 'minimaxintl'")
+    // 逐分支抽取 `provider === 'X'` → `return Y` 的配对。
+    const pairs = [...selector!.matchAll(
+      /provider === '([a-z]+)'\)\s*return\s+(\w+);/g,
+    )].map((m) => [m[1]!, m[2]!] as const)
+    expect(pairs.length, 'proxyModalComponent 的分支数不是 2 —— 判据会退化成同义反复')
+      .toBe(2)
+    // ⚠️ 映射必须**逐格正确**：错一格就是「该家按钮打开别家弹窗、保存到别家端点」。
+    expect(pairs, 'provider → 弹窗 的映射错了（串端点）').toEqual([
+      ['gemini', 'GeminiProxyModal'],
+      ['minimaxintl', 'MinimaxIntlProxyModal'],
+    ])
     // 缺省回落 OpencodeProxyModal（未知 provider 的既有行为不可变更）。
     expect(selector!).toContain('return OpencodeProxyModal')
   })

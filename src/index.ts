@@ -105,21 +105,19 @@ import { registerMinimaxLlm } from './minimax-adapter.js'
 // ⚠️ MiniMax 国际站的**账号出口代理**解析器（与 gemini 同款：实例住在被依赖
 //    方向的下游，避免 `index → jet-hub-rpc → index` 的 ESM 环 —— 那条环会把
 //    引用变成 TDZ ⇒ 静默恒直连）。
-import { minimaxIntlFetchForAccount, setMinimaxProxyPool } from './minimax-proxy.js'
-
-/**
- * 探测槽用的 XFF 取值函数（**可后填**，与 `minimaxIntlFetchForAccount` 同一模式）。
- *
- * `probeById` 是模块级常量、在 `apply()` 之前就可能被求值，而 `pool` 那时还不
- * 存在 ⇒ 不能直接闭包引用 `pool.minimaxXff()`。这里经可变引用现读：池就绪前
- * 返回 `undefined`（不附 XFF = 既有行为），`apply()` 里 `setMinimaxProxyPool(pool)`
- * 之后自动接通。
- */
-function minimaxIntlXffForProbe(): string | undefined {
-  const poolRef = (globalThis as { __jetHubMinimaxXffPool?: { minimaxXff(): string | undefined } })
-    .__jetHubMinimaxXffPool
-  return typeof poolRef?.minimaxXff === 'function' ? poolRef.minimaxXff() : undefined
-}
+//
+// ⚠️ `minimaxIntlXffForProbe` 也住在那里（PR !145 审计 P1 修法）：初版在**本文件**
+//    另开了一个 `globalThis.__jetHubMinimaxXffPool` 全局槽来给探测槽取 XFF ——
+//    同一个「池在 `apply()` 才就绪」的问题，代理用模块级 ref、XFF 用全局槽，
+//    两套机制。全局槽还有两个模块级 `let` 没有的代价：跨包副本串号
+//    （两个路径的包各有一份模块实例，但 `globalThis` 共享）、以及 dispose 后
+//    永不清理（`setMinimaxProxyPool(undefined)` 清不掉它）。
+//    ⇒ 收敛到 `minimax-proxy.ts` 的同一个 `minimaxPoolRef`，与 gemini 逐格同构。
+import {
+  minimaxIntlFetchForAccount,
+  minimaxIntlXffForProbe,
+  setMinimaxProxyPool,
+} from './minimax-proxy.js'
 import { MINIMAX, MINIMAX_INTL } from './minimax-product.js'
 // ⚠️ `PROVIDER_REGISTRY` 供 namespace 清单派生（`registerProviderSettings` 的实参）；
 //    `descriptorOf` 供**能力注册表**逐项取元数据（见下面的注册段）。
@@ -3171,10 +3169,14 @@ export function apply(ctx: Context): void {
   // 这里接上**按账号取 fetcher** 的解析器（与 `probeById` 共用同一份）。
   // ⚠️ 与 Gemini 同款：池子在 `apply()` 里才就绪，而 `probeById` 是模块级常量
   //    （可能在 `apply()` 之前就被求值）⇒ 走可变引用，未注入时恒直连。
+  //
+  // ⚠️ 一次注入同时喂**两条腿**（PR !145 审计 P1 修法）：
+  //    ① 按账号取出口（`minimaxIntlFetchForAccount`）；
+  //    ② 探测槽的 XFF（`minimaxIntlXffForProbe`）。
+  //    初版给 ② 另开了 `globalThis.__jetHubMinimaxXffPool`，两套机制、且 dispose
+  //    后不清理。现在两者共用 `minimaxPoolRef` —— **传 `undefined` 即可整体重置**
+  //    （插件卸载路径若将来需要，直接调 `setMinimaxProxyPool(undefined)`）。
   setMinimaxProxyPool(pool)
-  // 探测槽的 XFF 引用同款「可后填」：池就绪后探测路径即可读到用户设置。
-  ;(globalThis as { __jetHubMinimaxXffPool?: { minimaxXff(): string | undefined } })
-    .__jetHubMinimaxXffPool = pool
   setGeminiProxyPool(pool)
   const gemini = new GeminiAuth(ctx, { fetchFor: geminiFetchForAccount })
   const geminiSigStore = createGeminiSigStore(ctx)
@@ -5179,6 +5181,12 @@ async function fetchBalanceReading(
     // 否则「面板能刷新、聚合候选却恒折算失败」—— 与上面 minimaxXff 同型陷阱
     // （这里也正是它第一次被引入的同一个 `createProviderCredits` 调用）。
     geminiFetchFor: geminiFetchForAccount,
+    // ⚠️⚠️ **MiniMax 国际站的按账号 fetcher**（PR !145 审计 P0 修法，真实缺陷）：
+    // 与上面 `geminiFetchFor` **逐格同因** —— 积分行是用户点一下就等的主路径，
+    // 而 `agent.minimax.io` 按出口 IP 国别分流（大陆直连恒 307 → 中国站 → 401）。
+    // 不接它 ⇒ 用户配好代理后对话能用、**积分行却仍报「余额查询失败」**，
+    // 症状与 issue IKMEVG 逐字相同（PR !145 当时只接了选号器，本文件这处漏了）。
+    minimaxIntlFetchFor: minimaxIntlFetchForAccount,
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -5226,6 +5234,13 @@ async function fetchBalanceReading(
     //
     // ⚠️ 惰性读（用户随时可能改设置），不能固化成字符串。
     minimaxXff: () => pool.minimaxXff(),
+    // ⚠️⚠️ **按账号出口也必须在这里接**（PR !145 审计 P0 修法，与上面
+    //    `minimaxXff` **逐格同因**）。`credits` 与 `expiry` 是两个独立消费域，
+    //    通道各走各的：只接 credits 那处 ⇒ 积分行能刷新、**聚合候选却恒折算失败**；
+    //    只接 expiry 那处 ⇒ 反过来。
+    //    ⇒ 两条腿缺一不可，这正是本仓库记过 6 次的那类静默陷阱。
+    //    ⚠️ 惰性（按 `accountId` 现取），不能固化成一份 fetcher。
+    minimaxIntlFetchFor: minimaxIntlFetchForAccount,
   })
 
 

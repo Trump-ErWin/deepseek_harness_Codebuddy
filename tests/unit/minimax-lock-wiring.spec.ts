@@ -295,16 +295,36 @@ describe('★ MiniMax：`index.ts` 的接线（源码级，守纯文本形态的
       // 但**「product 必须被透传」与「不得写死对方站点」两格不变**。
       expect(lines![0], `${name} 的 fetchBalance 必须含 (credential, product) =>`)
         .toMatch(/\(credential, product[,)]/)
-      // ⚠️ 闭包体可能是多行的（国际站版要把 ctx 的出口解析进去），
-      // 故「product 被透传」不锚定到 `fetchMinimaxCreditBalance(credential, …)`
-      // 的单行形态，而是判「调用点存在 + product 作为实参出现」。
-      // 形参名与实参名恰好都叫 product，故实参形态是 `fetch, product` /
-      // `product,` / `, product)` / `product)` 之一 —— 用 `\bproduct\b` 在
-      // **调用点行**上判（形参已在第一格判过，不会重复计）。
-      expect(lines![0], `${name} 必须调用 fetchMinimaxCreditBalance`)
-        .toContain('fetchMinimaxCreditBalance(')
-      expect(lines![0], `${name} 的调用点必须透传 product`)
-        .toMatch(/\bproduct\b/)
+      /**
+       * ⚠️⚠️ **「product 被透传」必须锚在「调用点的实参」上**（PR !145 审计修法）。
+       *
+       * 初版写成 `expect(lines![0]).toMatch(/\bproduct\b/)` —— 而 `lines![0]`
+       * 就是**形参行** `fetchBalance: (credential, product, ctx) =>`，
+       * `\bproduct\b` **必然命中那个形参名** ⇒ 判据**恒真**，与实参无关。
+       *
+       * 实测「能通过但实际错误」的写法（全部全绿）：
+       *
+       *     fetchBalance: (credential, product, ctx) => {
+       *       const station = MINIMAX          // 中国站常量！
+       *       return fetchMinimaxCreditBalance(credential, ctx?.fetchFor?.(…) ?? fetch, station, …)
+       *     }
+       *
+       * ⇒ 改为**两条腿**：
+       * ① 调用点的第三实参必须**逐字是 `product`**（锚在 `fetchMinimaxCreditBalance(`
+       *    之后到行尾的那一段，避开形参）；
+       * ② `not.toContain(other)` 保留（写死对方站点常量会红）。
+       *    但**别名绕不过 ①** —— 那正是初版被打穿的那一格。
+       */
+      const callStart = lines![0].indexOf('fetchMinimaxCreditBalance(')
+      expect(callStart, `${name} 必须调用 fetchMinimaxCreditBalance`).toBeGreaterThan(-1)
+      const callArgs = lines![0].slice(callStart)
+      // 第三实参：`credential` / `fetcher` / `product` 三格里的最后一格。
+      // 允许跨行（国际站版是多行），故在**整段** `lines![0]` 的调用区间里判。
+      expect(
+        callArgs,
+        `${name} 的调用点必须把形参 product 作为**站点实参**透传`
+        + `（写成别的常量/别名会打到错的站点，而用户看不到任何报错）`,
+      ).toMatch(/,\s*product\s*[,)]/)
       expect(lines![0], `★ ${name} 的 fetchBalance 不得写死 ${other}（会打到对方站点）`)
         .not.toContain(other)
     }

@@ -130,9 +130,32 @@ export function setMinimaxProxyPool(pool: MinimaxProxyPoolLike | undefined): voi
   minimaxPoolRef = pool
 }
 
-/** 本模块需要的池子能力（结构化类型，便于单测注入替身）。 */
+/**
+ * 本模块需要的池子能力（结构化类型，便于单测注入替身）。
+ */
 export interface MinimaxProxyPoolLike {
   minimaxIntlProxyFor(accountId: string): string
+  /**
+   * MiniMax 国际站的 `X-Forwarded-For`（**可选**）。
+   *
+   * ## ⚠️ 为什么把 XFF 也挂进这个 ref（PR !145 审计 P1 修法）
+   *
+   * 初版给 XFF 另开了一个 **`globalThis.__jetHubMinimaxXffPool`** 全局槽 ——
+   * 而代理用的是模块级 `let`。同一个「池在 `apply()` 才就绪」的问题、
+   * 同一个文件里**两套机制**，正是本仓库「同义判据两份实现必然漂移」的红线。
+   *
+   * 全局槽的额外代价（模块级 `let` 没有）：
+   * ① **跨包副本串号**：两个不同路径的包各有一份模块实例（`let` 各自独立），
+   *    但 `globalThis` 是共享的 ⇒ 后加载的那个覆盖前一个；
+   * ② **永不清理**：插件 dispose / `apply` 失败后槽位仍持强引用指向已死的池
+   *    ⇒ 探测读到旧池的 XFF（`setMinimaxProxyPool(undefined)` 清不掉它）。
+   *
+   * ⇒ 收敛到本接口 + {@link setMinimaxProxyPool} 一处，与 `gemini-proxy.ts`
+   * 的 `geminiPoolRef` **逐格同构**。
+   *
+   * ⚠️ 声明成可选：探测槽只需要它，而单测替身常常只实现 `minimaxIntlProxyFor`。
+   */
+  minimaxXff?(): string | undefined
 }
 
 /**
@@ -145,3 +168,37 @@ export const minimaxIntlFetchForAccount: MinimaxFetcherResolver = createMinimaxF
   (accountId: string): string =>
     (minimaxPoolRef === undefined ? '' : asProxyText(minimaxPoolRef.minimaxIntlProxyFor(accountId))),
 )
+
+/**
+ * 探测槽用的 XFF 取值（**每次调用现读**，池未就绪 ⇒ `undefined` = 不附头）。
+ *
+ * ## ⚠️ 为什么探测需要它
+ *
+ * 探测适配器**刻意不传 `accountPool`**（`account-probe.ts` 的既定语义：只测
+ * 这一个账号、不写任何标记）⇒ 适配器里「从池读 `minimaxXff()`」那条腿在探测
+ * 路径上**恒空** ⇒ 用户设好的 XFF 在「测试 / 重测」上不生效 ⇒ 大陆出口的探测
+ * 恒 307 → 401，报错文案与「凭据失效」同形（2026-10-24 活体实测：真机报文
+ * `{"error":"invalid access token"}`），用户会去误删好号。
+ *
+ * XFF 是**只读**的展示性设置，探测带它不违反「探测不写任何状态」的语义
+ * （与 `accountIdOverride` 同一条界线：显式传值，不挂编排）。
+ *
+ * ## ⚠️ 为什么是函数而不是常量（初版踩过）
+ *
+ * `probeById` 是**模块级常量**，`createProbeAdapter` 在每次探测时才调用 ⇒
+ * 本函数在**那一次调用时**才求值，池那时已由 `apply()` 注入。
+ * 若写成 `const xff = pool.minimaxXff()`（模块求值时算一次），池还没就绪
+ * ⇒ 恒 `undefined` 且**永不更新**。
+ *
+ * ## ⚠️ 为什么放在本文件（而不是 `index.ts` 里的 globalThis 槽）
+ *
+ * 初版是 `globalThis.__jetHubMinimaxXffPool`（全仓唯一的 globalThis 注入槽）。
+ * 代价见 {@link MinimaxProxyPoolLike.minimaxXff} 的注释：跨包副本串号、
+ * dispose 后不清理、与代理侧两套机制。⇒ 收敛到同一个 `minimaxPoolRef`。
+ */
+export function minimaxIntlXffForProbe(): string | undefined {
+  if (minimaxPoolRef === undefined) return undefined
+  return typeof minimaxPoolRef.minimaxXff === 'function'
+    ? minimaxPoolRef.minimaxXff()
+    : undefined
+}

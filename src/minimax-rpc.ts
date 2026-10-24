@@ -48,6 +48,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { MINIMAX_INTL, MINIMAX_MODELS_PATH } from './minimax-product.js'
 import { normalizeProxy } from './minimax-proxy.js'
+import { hasHostSuffix } from './minimax.js'
 import { proxyFetch } from './opencode-proxy.js'
 import { describeFetchError } from './opencode-rpc.js'
 
@@ -83,8 +84,8 @@ export interface MinimaxIntlPoolLike {
 /** 探测连接用的超时（测试按钮不能无限等）。 */
 const TEST_TIMEOUT_MS = 15_000
 
-/** 中国站主机后缀（观测到 3xx 指向它 ⇒ 出口被判为大陆）。 */
-const CN_HOST_SUFFIX = '.minimaxi.com'
+/** 中国站主域（观测到 3xx 指向它 ⇒ 出口被判为大陆）。 */
+const CN_HOST = 'minimaxi.com'
 
 /**
  * 探测目标：国际站**目录端点**（公开，无需凭据）。
@@ -94,17 +95,71 @@ const CN_HOST_SUFFIX = '.minimaxi.com'
  */
 const PROBE_URL = `${MINIMAX_INTL.apiHost}${MINIMAX_MODELS_PATH}?region=${MINIMAX_INTL.region}`
 
-/** 从 `Location` 判「是不是被分流到中国站」（相对 Location 也认）。 */
-function pointsToChinaStation(location: string | null): boolean {
+/**
+ * 这次探测的响应是否表示「出口仍被判定为中国大陆」。
+ *
+ * ## ⚠️⚠️ 判据必须与 `minimax.ts` 的 `isMinimaxGeoRoute` **同源**（PR !145 审计修法）
+ *
+ * 初版在这里**另写了一份** `hostname.endsWith('.minimaxi.com')` ——
+ * 而 `minimax.ts` 的 `hasHostSuffix` 注释明写「这是『后缀匹配』的**唯一实现处，
+ * 不许在别处再抄一份**」，并记录了真实缺陷：裸 `endsWith` 曾让
+ * `evilminimaxi.com` 被当成中国站。抄第二份就是让它再犯一次。
+ *
+ * 实测两版**已经分歧**：
+ *
+ * | `Location` | 初版（裸 endsWith） | `hasHostSuffix`（权威） |
+ * |---|---|---|
+ * | `https://agent.minimaxi.com/x` | true | true |
+ * | `https://minimaxi.com/x`（**裸域**） | **false（漏报）** | true |
+ * | `//agent.minimaxi.com/x`（协议相对） | **false（漏报）** | true |
+ *
+ * 漏报的后果正是本模块头要消灭的那种**假阳性**：UI 显示绿色「出口已在海外」，
+ * 用户以为配好了，实际照样 401。
+ *
+ * ## ⚠️⚠️ 必须校验状态码（初版漏了，是**假阳性**的另一来源）
+ *
+ * 初版只看 `Location` 头，**完全不看 `status`** ⇒ 一个**正常的 200 响应只要带了
+ * `Location` 头**（某些 CDN / 网关会带）就会被判成「被分流」，给出橙色的错误警告。
+ * 实测可复现（本地 200 + Location 头 ⇒ 初版判 `geoRouted: true`）。
+ *
+ * ⇒ 判据收敛成：**先判是 307/308，再判目标主机**，与 `isMinimaxGeoRoute`
+ * 的语义**逐格一致**（那个函数也是先 `status !== 307 && status !== 308 ⇒ false`）。
+ *
+ * @param status   响应的 HTTP 状态码。
+ * @param location `Location` 头的值（可为 null）。
+ */
+function pointsToChinaStation(status: number, location: string | null): boolean {
+  // ⚠️ 只有 307/308 才可能承载「地理分流」这一跳；301/302/303 是普通跳转，
+  //    200 更不该带 Location。判据与 `isMinimaxGeoRoute` 同源。
+  if (status !== 307 && status !== 308) return false
   if (location === null || location.length === 0) return false
-  const raw = location.trim().toLowerCase()
-  // ⚠️ 相对 Location（`/xxx`）也可能是同主机跳转，但它**不含中国站主机**
-  // ⇒ 按「认不出来就不判分流」处理（宁可少报，也不谎报）。
+  const raw = location.trim()
+  /**
+   * ⚠️ **协议相对 Location（`//host/path`）必须当绝对 URL 解析**（实测缺陷）。
+   *
+   * `new URL('//agent.minimaxi.com/x')` **无 base 时抛 `ERR_INVALID_URL`**
+   * ⇒ 落进下面的 catch ⇒ 判 false ⇒ **漏报**（用户看到绿色但实际照样 401）。
+   * 而 RFC 7231 **允许**服务端发协议相对 Location，故这一格必须显式补一个
+   * scheme 再解析（原协议未知，但**主机名**才是判据要的东西）。
+   *
+   * ⚠️ 单斜杠（`/xxx`）是**同主机**路径 ⇒ 不可能指向中国站，直接 false。
+   */
+  if (raw.startsWith('//')) {
+    try {
+      return hasHostSuffix(new URL(`https:${raw}`).hostname, CN_HOST)
+    } catch {
+      return false
+    }
+  }
   if (raw.startsWith('/')) return false
   try {
-    return new URL(raw).hostname.endsWith(CN_HOST_SUFFIX)
+    return hasHostSuffix(new URL(raw).hostname, CN_HOST)
   } catch {
-    return raw.includes(CN_HOST_SUFFIX)
+    // ⚠️ 解析不了 ⇒ **不判分流**（宁可少报，也不谎报）。
+    //    初版这里用 `raw.includes(CN_HOST_SUFFIX)` 兜底，会把
+    //    `evilminimaxi.com/x` 这类垃圾串判成中国站 —— 与 hasHostSuffix
+    //    的边界语义相反。既然解析失败就没有可信主机，一律 false。
+    return false
   }
 }
 
@@ -169,7 +224,9 @@ export async function handleMinimaxIntlRpc(
           return done({
             status: response.status,
             latencyMs: Date.now() - startedAt,
-            geoRouted: pointsToChinaStation(response.headers.get('location')),
+            // ⚠️ 判据收 `status`（初版只读 Location ⇒ 正常 200 带 Location 头
+            //    会被误判成分流，是假阳性）。
+            geoRouted: pointsToChinaStation(response.status, response.headers.get('location')),
           } satisfies RpcMinimaxIntlTestProxyResponse)
         } catch (error) {
           // ⚠️ **必须把 `cause` 带出来**（同 IKK4BY 第 2 点）：`error.message`

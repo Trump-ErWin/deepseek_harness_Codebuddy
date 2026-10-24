@@ -26,6 +26,7 @@ import { dirname, join } from 'node:path'
 import {
   createMinimaxFetcherResolver,
   minimaxIntlFetchForAccount,
+  minimaxIntlXffForProbe,
   setMinimaxProxyPool,
 } from '../../src/minimax-proxy.js'
 import { handleMinimaxIntlRpc } from '../../src/minimax-rpc.js'
@@ -98,18 +99,67 @@ describe('① fetcher 解析器：按账号取出口', () => {
 })
 
 describe('② 接线：每个消费点都必须接上按账号的 fetcher（源码级，剥注释后）', () => {
-  it('⚠️ MinimaxAuth 登录 / 续期 / 目录 / 身份四条腿都接了 fetcherFor', () => {
-    // 登录（设备码申请 + 轮询）、续期、目录、身份 —— 少一条腿就是「这条路径
-    // 永远直连」的静默失效（gemini 踩过的同型）。
-    expect((authSource.match(/this\.fetcherFor\(/g) ?? []).length).toBeGreaterThanOrEqual(4)
+  /**
+   * ⚠️⚠️ **本组用「精确计数」而不是 `toBeGreaterThanOrEqual`**（PR !145 审计修法）。
+   *
+   * 初版写的是 `toBeGreaterThanOrEqual(4)`（实际 6）、`>= 3`（实际 5）——
+   * 留的余量正好等于「可以悄悄删掉几条腿」。实测后果（对抗审计逐条验证）：
+   *
+   * | 变异 | 初版 |
+   * |---|---|
+   * | 删自愈腿 + 续期腿（6→4） | **全绿** |
+   * | 再删登录注入 + 推理注入（5→3） | **全绿** |
+   *
+   * ⇒ 改成**精确计数**：多一条少一条都变红。这仍然只是「接线点在不在」的
+   * 粗判据（源码文本断言对死分支无感），故**行为级判据在 ⑦ / ⑨ 组**；
+   * 本组只负责「别把腿删了还不响」。
+   */
+  it('⚠️ MinimaxAuth 登录 / 续期 / 目录 / 身份四条腿都接了 fetcherFor（精确计数）', () => {
+    // 4 处调用点：183（设备码）、212（轮询）、451（续期）、534（目录）、670（身份）
+    // —— 逐条点名而不是只数总数，删掉任意一条都能立刻看出是哪条。
+    expect(authSource).toContain('startMinimaxDeviceAuthorization(this.fetcherFor(accountId ?? \'\')')
+    expect(authSource).toContain('fetcher: this.fetcherFor(options.accountId ?? \'\')')
+    expect(authSource).toContain('this.fetcherFor(accountId ?? \'\')')      // refreshCredentialFor
+    expect(authSource).toContain('fetcher: this.fetcherFor(accountId ?? \'\')') // fetchRawModels
+    expect(authSource).toContain('this.fetcherFor(entry.id)')              // 自愈身份
+    // 总数兜底（防止有人用别的写法绕开上面的锚点后总数却变少）。
+    expect((authSource.match(/this\.fetcherFor\(/g) ?? []).length).toBe(6)
   })
 
   it('⚠️ MinimaxAdapter 推理主路径走 fetcherFor(activeAccountId)，且在 send() 里现取', () => {
     expect(adapterSource).toContain('fetcher: this.fetcherFor(activeAccountId)')
   })
 
-  it('⚠️ index.ts：国际站两个实例都注入了 minimaxIntlFetchForAccount', () => {
-    expect((indexSource.match(/minimaxIntlFetchForAccount/g) ?? []).length).toBeGreaterThanOrEqual(3)
+  it('⚠️ index.ts：国际站各消费点都注入了 minimaxIntlFetchForAccount（逐点精确）', () => {
+    /**
+     * ⚠️⚠️ **逐点断言，不只数总数**（PR !145 审计 P0 修法）。
+     *
+     * 初版是 `toBeGreaterThanOrEqual(3)`（实际 5）—— 余量正好允许悄悄漏掉
+     * 两处，而那两处正是 **`creditsTable`（积分）与 `expiryTable`（聚合折算）**：
+     * 漏掉它们的症状是「配好代理后对话能用、积分行仍失败、渠道仍被剔出轮换」。
+     *
+     * ⇒ 逐点断言「某个具体装配处必须带这个键」，漏哪一处都能一眼看出是哪一处。
+     * （`fetchFor:` 是 MinimaxAuth / MinimaxAdapter / probeById 的键，
+     *  `minimaxIntlFetchFor:` 是两张 deps 表的键 —— 两个键名不同，不能混数。）
+     */
+    // ① probeById 的探测适配器（出口 + 显式 accountIdOverride）
+    expect(indexSource).toContain('fetchFor: minimaxIntlFetchForAccount')
+    // ② 余额选号器（BuddyBalanceSelector 的 deps.fetchFor）
+    // ③ MinimaxAuth（登录 / 续期 / 目录 / 身份四条腿的 fetchFor）
+    // ④ MinimaxAdapter（推理主路径的 fetchFor）
+    // ⑤ **creditsTable**（积分面板三条链路）—— PR !145 审计补
+    // ⑥ **expiryTable**（聚合折算）—— PR !145 审计补
+    expect(indexSource).toContain('minimaxIntlFetchFor: minimaxIntlFetchForAccount')
+    // 两处 deps 表各一次（credits + expiry）：精确计数锁住「补了一处漏另一处」。
+    expect(
+      (indexSource.match(/minimaxIntlFetchFor: minimaxIntlFetchForAccount/g) ?? []).length,
+      'creditsTable 与 expiryTable 必须**都**接（只接一处 = 另一条链路静默直连）',
+    ).toBe(2)
+    // `fetchFor:` 三处（probeById / MinimaxAuth / MinimaxAdapter）+ 选号器一处 = 4
+    expect(
+      (indexSource.match(/fetchFor: minimaxIntlFetchForAccount/g) ?? []).length,
+      '探测 / 选号器 / auth / adapter 四处都必须接',
+    ).toBe(4)
   })
 
   it('⚠️ index.ts：中国站实例**刻意不注入**（直连才是最优）', () => {
@@ -359,5 +409,253 @@ describe('⑥ 客户端接线（源码级，剥注释后）', () => {
 
   it('⚠️ AccountCard 的 tooltip 分支覆盖三家（当前值 → 修改；未设置 → 语义说明）', () => {
     expect(clientSource).toContain('account.minimaxIntlProxy')
+  })
+})
+
+/**
+ * ⑦ **积分 / 签到 / 聚合折算三条链路必须真的走账号出口**（PR !145 审计 P0 修法）。
+ *
+ * ## ⚠️⚠️ 为什么这一组必须是**行为**断言，不能是源码文本断言
+ *
+ * PR !145 原来的 ② 组全是 `toContain('this.fetcherFor(')` 这类文本断言，而且
+ * 计数写成 `toBeGreaterThanOrEqual(4)`（实际 6）—— 留了余量。实测后果：
+ *
+ * | 变异 | 原 ② 组 |
+ * |---|---|
+ * | `MinimaxAdapter.fetcherFor()` 掏空成 `return fetch`（**代理彻底失效**） | 全绿 |
+ * | 删掉自愈腿 + 续期腿（6→4） | 全绿 |
+ * | 再删掉登录注入 + 推理注入（5→3） | 全绿 |
+ *
+ * ⇒ 本组改为**注入替身并断言它被调用、且拿到了正确的 accountId**。
+ * 判据打在「谁被问到了什么」上，而不是「源码里有没有那个字面量」。
+ */
+describe('⑦ ★★ 三条链路真走账号出口（行为级，取代无牙的源码计数）', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.doUnmock('../../src/minimax-credits.js')
+  })
+
+  /** 造一个记账用的 fetcher 替身：被调用即记下「哪个账号的出口被用到」。 */
+  function spyFetcherFor(log: string[]): (accountId: string) => typeof fetch {
+    return (accountId: string) => {
+      log.push(accountId)
+      // 返回一个「不会真发请求」的 fetch：抛错即证明它被选中了。
+      return (() => Promise.reject(new Error(`proxied:${accountId}`))) as unknown as typeof fetch
+    }
+  }
+
+  it('★★ 积分余额（credits 表 fetchBalanceDetailed）按 call.accountId 取出口', async () => {
+    const log: string[] = []
+    const { createProviderCredits } = await import('../../src/provider-credits.js')
+    const table = createProviderCredits({ minimaxIntlFetchFor: spyFetcherFor(log) })
+    const impl = table.minimaxintl
+    expect(impl?.fetchBalanceDetailed, 'minimaxintl 必须实现 fetchBalanceDetailed').toBeDefined()
+    // 该实现会真发请求（我们注入的 fetcher 立刻 reject），故只断言「出口被问到」。
+    await impl!.fetchBalanceDetailed!({ access_token: 't' }, {
+      resolveCredential: async () => undefined,
+      warn: () => {},
+      accountPool: {} as never,
+      accountId: 'acct-intl-1',
+    }).catch(() => undefined)
+    expect(log, '积分余额链路没有按账号取出口 —— 代理被绕过').toEqual(['acct-intl-1'])
+  })
+
+  it('★★ 签到领取（credits 表 claim）按 entry.id 取出口', async () => {
+    const log: string[] = []
+    const { createProviderCredits } = await import('../../src/provider-credits.js')
+    const table = createProviderCredits({ minimaxIntlFetchFor: spyFetcherFor(log) })
+    const impl = table.minimaxintl
+    expect(impl?.claim, 'minimaxintl 必须实现 claim').toBeDefined()
+    await impl!.claim!(
+      { access_token: 't' },
+      { id: 'acct-intl-2', provider: 'minimaxintl', credentialRef: 'r', enabled: true, refreshable: true, nickname: 'n', createdAt: 0 },
+      { resolveCredential: async () => undefined, warn: () => {}, accountPool: {} as never },
+    ).catch(() => undefined)
+    expect(log, '签到领取链路没有按账号取出口').toEqual(['acct-intl-2'])
+  })
+
+  it('★★ 聚合折算（createProviderExpiry 的 minimaxintl）按 context.accountId 取出口', async () => {
+    const log: string[] = []
+    const { createProviderExpiry } = await import('../../src/provider-expiry.js')
+    const table = createProviderExpiry({ minimaxIntlFetchFor: spyFetcherFor(log) })
+    const impl = table.minimaxintl
+    expect(impl?.credentialExpiry, 'minimaxintl 必须接入临期折算').toBeDefined()
+    await impl!.credentialExpiry(
+      { access_token: 't' },
+      { accountId: 'acct-intl-3' } as never,
+    ).catch(() => undefined)
+    expect(log, '聚合折算链路没有按账号取出口 —— 该渠道仍会被静默剔出轮换')
+      .toEqual(['acct-intl-3'])
+  })
+
+  it('★ 中国版**刻意不取出口**（直连才是最优，给了代理反而绕境外一圈）', async () => {
+    const log: string[] = []
+    const { createProviderExpiry } = await import('../../src/provider-expiry.js')
+    const table = createProviderExpiry({ minimaxIntlFetchFor: spyFetcherFor(log) })
+    await table.minimax.credentialExpiry(
+      { access_token: 't' },
+      { accountId: 'acct-cn-1' } as never,
+    ).catch(() => undefined)
+    expect(log, '中国版不该取国际站的出口').toEqual([])
+  })
+
+  it('★ 未注入 `minimaxIntlFetchFor` ⇒ 退回全局 fetch（与修复前逐字节等价）', async () => {
+    const log: string[] = []
+    const { createProviderCredits } = await import('../../src/provider-credits.js')
+    const table = createProviderCredits()   // 刻意不注入
+    await table.minimaxintl!.fetchBalanceDetailed!({ access_token: 't' }, {
+      resolveCredential: async () => undefined,
+      warn: () => {},
+      accountPool: {} as never,
+      accountId: 'acct-intl-4',
+    }).catch(() => undefined)
+    // 没有注入器可记账 ⇒ 只能断言「不抛 TypeError」这一层（真发请求被网络拦下）。
+    expect(log).toEqual([])
+  })
+})
+
+/**
+ * ⑧ **`geoRouted` 判据的两条独立修正**（PR !145 审计 P1 修法）。
+ *
+ * 初版有两个假阳性来源：
+ * 1. 只看 `Location`、**不看状态码** ⇒ 正常 200 响应带 Location 头就判分流；
+ * 2. 自己抄了一份裸 `endsWith('.minimaxi.com')`，**漏掉裸域与协议相对**
+ *   （`minimax.ts` 的 `hasHostSuffix` 是权威实现，其注释明写不许再抄一份）。
+ */
+describe('⑧ ★★ geoRouted 判据（状态码 + 权威后缀判据）', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.doUnmock('../../src/opencode-proxy.js')
+  })
+
+  async function probeWith(status: number, headers: Record<string, string>) {
+    const spy = vi.fn(async () => new Response('', { status, headers }))
+    vi.resetModules()
+    vi.doMock('../../src/opencode-proxy.js', () => ({
+      proxyFetch: spy,
+      buildProxyDispatcher: () => ({}),
+      closeAllProxyDispatchers: async () => {},
+      proxyCacheSize: () => 0,
+      resolveConnectPort: () => 443,
+      buildSocks5Handshake: () => new Uint8Array(),
+    }))
+    const mod = await import('../../src/minimax-rpc.js')
+    return mod.handleMinimaxIntlRpc({} as never, { setMinimaxIntlProxy: vi.fn() }, 'minimaxintl.testProxy', {
+      proxy: 'http://127.0.0.1:7890',
+    }) as Promise<{ ok: true; value: { status: number; geoRouted: boolean } }>
+  }
+
+  it('⚠️⚠️ 200 响应即使带 Location 头也**不得**判分流（初版会谎报）', async () => {
+    // 某些 CDN / 网关会在 200 上带 Location 头 —— 那不是重定向。
+    const res = await probeWith(200, { Location: 'https://agent.minimaxi.com/x' })
+    expect(res.value.status).toBe(200)
+    expect(res.value.geoRouted, '200 带 Location 被误判成分流 ⇒ 用户看到假警告').toBe(false)
+  })
+
+  it('⚠️⚠️ 307 指向**裸域** minimaxi.com 必须判分流（初版裸 endsWith 漏报）', async () => {
+    const res = await probeWith(307, { Location: 'https://minimaxi.com/x' })
+    expect(res.value.geoRouted, '裸域漏报 ⇒ UI 显示绿色但实际照样 401').toBe(true)
+  })
+
+  it('⚠️⚠️ 307 指向**协议相对** //host 必须判分流（初版漏报）', async () => {
+    const res = await probeWith(307, { Location: '//agent.minimaxi.com/x' })
+    expect(res.value.geoRouted, '协议相对 Location 漏报').toBe(true)
+  })
+
+  it('⚠️ 308 也算分流（与 isMinimaxGeoRoute 同口径）', async () => {
+    const res = await probeWith(308, { Location: 'https://agent.minimaxi.com/x' })
+    expect(res.value.geoRouted).toBe(true)
+  })
+
+  it('⚠️ 仿冒域不得判分流（evilminimaxi.com / 后缀伪装）', async () => {
+    for (const loc of [
+      'https://evilminimaxi.com/x',
+      'https://agent.minimaxi.com.attacker.com/x',
+    ]) {
+      const res = await probeWith(307, { Location: loc })
+      expect(res.value.geoRouted, `${loc} 被误判成中国站`).toBe(false)
+    }
+  })
+
+  it('⚠️ 302 指向中国站**不**算分流（普通跳转，与 isMinimaxGeoRoute 同口径）', async () => {
+    // ⚠️ 这一格是**判据收紧后**的行为变更：初版只要 Location 命中就判分流。
+    //    与 `isMinimaxGeoRoute` 的「只认 307/308」对齐 —— 那才是「地理分流」的语义。
+    const res = await probeWith(302, { Location: 'https://agent.minimaxi.com/x' })
+    expect(res.value.geoRouted).toBe(false)
+  })
+})
+
+/**
+ * ⑨ **探测槽的 XFF 取值与池重置**（PR !145 审计 P1 修法）。
+ *
+ * 初版用 `globalThis.__jetHubMinimaxXffPool` 全局槽，模块级 `let` 能做而它做不到的
+ * 一件事是**整体重置**（dispose 后清不掉）。本组锁住「传 undefined 即重置」。
+ */
+describe('⑨ ★ 探测槽 XFF：可后填、可重置（不再是 globalThis 魔法槽）', () => {
+  afterEach(() => {
+    setMinimaxProxyPool(undefined)
+  })
+
+  /**
+   * ⚠️⚠️ **本组必须用文件顶部的静态 import，不能 `await import(...)`**。
+   *
+   * 前面 ⑧ 组用了 `vi.resetModules()` + `vi.doMock` —— 那会让**后续**
+   * `await import('.../minimax-proxy.js')` 拿到一份**全新的模块实例**，
+   * 而 `setMinimaxProxyPool`（静态 import 的那份）注入的是**另一个**实例的
+   * `minimaxPoolRef`。症状是「注入了但读不到」，看起来像实现有 bug。
+   * （实测踩过：本组三条用例全红，而实现是对的。）
+   */
+  it('⚠️ 池未注入 ⇒ undefined（不附头 = 既有行为）', () => {
+    setMinimaxProxyPool(undefined)
+    expect(minimaxIntlXffForProbe()).toBeUndefined()
+  })
+
+  it('⚠️ 池注入后现读（用户改设置立即生效，不是模块求值时的快照）', () => {
+    let xff = '203.0.113.7'
+    setMinimaxProxyPool({
+      minimaxIntlProxyFor: () => '',
+      minimaxXff: () => xff,
+    })
+    expect(minimaxIntlXffForProbe()).toBe('203.0.113.7')
+    xff = '198.51.100.9'
+    expect(minimaxIntlXffForProbe(), 'XFF 被固化成快照了').toBe('198.51.100.9')
+  })
+
+  it('⚠️⚠️ 传 undefined 必须**真的重置**（初版的 globalThis 槽做不到）', () => {
+    setMinimaxProxyPool({ minimaxIntlProxyFor: () => '', minimaxXff: () => '203.0.113.7' })
+    expect(minimaxIntlXffForProbe()).toBe('203.0.113.7')
+    setMinimaxProxyPool(undefined)
+    expect(minimaxIntlXffForProbe(), 'dispose 后仍读到旧池的 XFF').toBeUndefined()
+  })
+
+  it('⚠️ 池替身没有 minimaxXff 方法 ⇒ undefined（不抛 TypeError）', () => {
+    setMinimaxProxyPool({ minimaxIntlProxyFor: () => '' })
+    expect(minimaxIntlXffForProbe()).toBeUndefined()
+  })
+})
+
+/**
+ * ⑩ **`account.create` 载荷入口必须过 `normalizeProxy`**（PR !145 审计 P1 修法）。
+ *
+ * `types.ts` 明文承诺「读取侧必须过 normalizeProxy 归一，非法值一律拒绝」，
+ * 而初版只 `trim()` 就写池 ⇒ 非法串落盘后该账号**每条链路都抛错且不自愈**。
+ *
+ * ⚠️ 这里只做**源码级**守卫（判据锚在 `normalizeProxy(intlProxyInput)` 这个
+ * 具体表达式上，不是「文件里有没有 normalizeProxy 这个词」）——
+ * 端到端跑 `account.create` 需要完整 ctx/池/凭据编排，成本远高于收益。
+ */
+describe('⑩ ★ account.create 的代理载荷必须归一化', () => {
+  it('⚠️ 写池前必须过 normalizeProxy（且失败要拒绝，不能把脏值写进去）', () => {
+    const rpc = stripComments(readFileSync(join(here, '../../src/jet-hub-rpc.ts'), 'utf8'))
+    // 锚在**具体表达式**上：`normalizeProxy(intlProxyInput)`。
+    expect(rpc, '载荷入口没过 normalizeProxy ⇒ 非法串会写进池且永不自愈')
+      .toContain('normalizeProxy(intlProxyInput)')
+    // 失败必须拒绝（`return` 一个 ok:false），不能 `await setMinimaxIntlProxy` 了事。
+    const block = rpc.slice(
+      rpc.indexOf('normalizeProxy(intlProxyInput)'),
+      rpc.indexOf('normalizeProxy(intlProxyInput)') + 700,
+    )
+    expect(block, '归一化失败时没有拒绝路径').toMatch(/normalized\.ok/)
+    expect(block, '归一化失败时必须回 ok:false').toContain('ok: false')
   })
 })
