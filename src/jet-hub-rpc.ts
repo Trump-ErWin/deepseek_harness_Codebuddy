@@ -4525,13 +4525,101 @@ function registerJetHubEndpoints(
               // ⚠️ MiniMax **有** refresh 端点（与 Loomy 恒 false 不同）。
               refreshable: isMinimaxRefreshable(credential),
             })
+            /**
+             * ★★ **同账号去重**（2026-10-24）。
+             *
+             * ## 为什么 minimax 必须有（它是唯一缺这条的 provider）
+             *
+             * `zcode` / `officeace` / `autoclaw` 都有这段，minimax 没有 ⇒ 同一个号
+             * 点两次「新建账号」就是**两张卡片、两份 token**，各自参与选号与续期。
+             * 而 MiniMax 的授权页会**静默复用浏览器已有会话**（见下方
+             * `forcedLoginUrl` 的注释）⇒「点了两次」在本家几乎是**常态**。
+             *
+             * ## 判据必须是 `user_id`
+             *
+             * `access_token` / `refresh_token` 每次登录都变；`nickname` 可改可重复。
+             * `user_id` 是服务端下发的稳定标识（`persistLogin` 里落进凭据）。
+             * ⚠️ 拿不到 `user_id`（老凭据 / 身份查询失败）时**放弃去重**，绝不猜。
+             *
+             * ## 处置照 `zcode`：**不删条目**，标停用 + 改名
+             *
+             * `login.poll` 靠「条目在 + 凭据已写」判成功；删掉会让它显示成
+             * 「登录失败」，而事实恰恰相反（登录成功了，只是这个号已经有了）。
+             * ⚠️ 保留**原来那张**（它可能已承载排序/改名/限流记录），新条目停用。
+             */
+            const userId = result.userId
+            if (userId !== undefined && userId.length > 0) {
+              try {
+                const existingId = await pool.findAccountIdByIdentityField(
+                  minimaxProduct.id,
+                  'user_id',
+                  userId,
+                )
+                if (existingId.length > 0 && existingId !== id) {
+                  ctx.logger.warn(
+                    `[jet-hub] ${minimaxProduct.id} 该账号（user_id=${userId}）已存在于 `
+                    + `${existingId}，新条目 ${id} 已自动停用（不参与选号）`,
+                  )
+                  await pool.updateAccount(id, {
+                    nickname: `${nickname}（重复，已停用）`,
+                    enabled: false,
+                  })
+                }
+              } catch (error) {
+                // ⚠️ 查重失败**不得**影响登录结论（与 officeace 同一取向：
+                //    读不到 ≠ 没有）。这里只留日志。
+                ctx.logger.warn(
+                  `[jet-hub] ${minimaxProduct.id} 查重失败（按 user_id 读账号池）`
+                  + `⇒ 本次不做去重、照常回填：${String(error)}`,
+                )
+              }
+            }
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${minimaxProduct.id} login failed for ${id}: ${String(error)}`)
             // 登录失败：记终态原因（供 login.poll 报给前端）+ 移除占位条目，不留幽灵账号
             void failLogin(id, error)
           })
 
-          return { ok: true, value: { accountId: id, loginUrl: minimaxStarted.loginUrl } }
+          /**
+           * ⚠️⚠️ **宿主侧拉起无痕窗口**（2026-10-24，用户报障「登录链接一打开就
+           * 自带旧 session 登录态」）。
+           *
+           * ## 与 OfficeAce / CodeArts 同型，但会话载体不同
+           *
+           * 那两家是**服务端**复用了华为 / 阿里的 SSO 会话；MiniMax 是**页面脚本**
+           * 读自己的网页会话（`/oauth2/device/authorize` 带 cookie 即放行），症状
+           * 逐字相同：点「新建账号」→ 打开授权页 → 直接显示上一个号的「授权」按钮。
+           *
+           * ## ⚠️⚠️ 本分支**刻意不调 `openIncognitoWindow`**（2026-10-24 用户决策）
+           *
+           * 用户明确要求：「宿主开窗那一套废弃掉，只要 token 过期这件工作」。
+           *
+           * 现实原因（本轮真实事故）：**宿主能开窗 ≠ 用户能看见窗口**。本机是
+           * 无头部署（只有 Xvfb `:99`，用户经隧道用远端浏览器访问），宿主开窗后
+           * 返回 `incognitoOpened: true`，客户端照契约**跳过自己的 `window.open`**
+           * ⇒ 窗口画在没人看的虚拟屏上 ⇒ 用户报「点击新增账号不会跳转登录页了」。
+           *
+           * ⇒ 只下发 `forcedLoginUrl`，由**客户端在用户自己的浏览器里**打开：
+           *   - 它解决了「登录链接自带旧会话」（上游「切换账号」等价链接 —— 普通
+           *     窗口打开也一定会要求重新登录，因为服务端无 cookie 时回的是
+           *     `401 login_required` + `login_url`）；
+           *   - 它**根除**了「宿主认领开窗」这一类事故（返回值里不再有
+           *     `incognitoOpened` ⇒ 客户端恒走既有 `window.open` 通用路径，
+           *     与其余 12 家 provider 完全一致）。
+           *
+           * ⚠️ 为什么不用 `loginUrl`：其 `user_code` 不含身份，带旧 cookie 打开
+           * 就复用旧账号（本 bug 的根因）。
+           */
+          return {
+            ok: true,
+            value: {
+              accountId: id,
+              loginUrl: minimaxStarted.loginUrl,
+              ...minimaxStarted.forcedLoginUrl === undefined
+                ? {}
+                : { forcedLoginUrl: minimaxStarted.forcedLoginUrl },
+            },
+          }
         } else if (provider === ZCODE.id) {
           /**
            * zcode 走**两步式**（与 codearts / qoder 等同型）：

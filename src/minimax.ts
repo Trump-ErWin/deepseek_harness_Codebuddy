@@ -44,8 +44,29 @@ export interface MinimaxCredential {
    * 故该字段对当前凭据**恒为 undefined**。保留仅为兼容上游将来改发 JWT。
    */
   account_id?: string
-  /** 展示名。 */
+  /**
+   * 展示名。
+   *
+   * ⚠️ 不是令牌字段 —— 续期响应里**没有**它，必须由
+   * `inheritMinimaxIdentity`（`minimax-auth.ts`）在续期时继承，否则每续期一次
+   * 账号卡片就退回内部 id（IKP8UA）。
+   */
   nickname?: string
+  /**
+   * 上游稳定身份（`GET /v1/api/user/info` 的 `data.userInfo.userID`）。
+   *
+   * ## 为什么必须有它（2026-10-24）
+   *
+   * 同账号去重**只能**用这个值：`access_token` / `refresh_token` 每次登录都变，
+   * `nickname` 用户可改、也可能重复；而 `userID` 是服务端下发的稳定标识
+   * （真机实测两站都有：国内 `RZwmwvOBJEGE`、国际 `RzLpobdyqZlm`）。
+   *
+   * ⚠️ 与 `account_id` **不是**一回事：后者是「若 `access_token` 是 JWT 时的 `sub`」，
+   * 而 MiniMax 的 token 实测**不是 JWT** ⇒ `account_id` 恒 undefined。
+   *
+   * ⚠️ 同样**不是令牌字段** ⇒ 续期必须由 `inheritMinimaxIdentity` 继承。
+   */
+  user_id?: string
 }
 
 /**
@@ -803,4 +824,38 @@ export function minimaxFallbackEntries(
   product: MinimaxProduct = MINIMAX,
 ): readonly MinimaxModelEntry[] {
   return product.fallbackModels.map(fallbackToEntry)
+}
+
+/**
+ * 把**不属于令牌**的身份字段从旧凭据继承到新凭据上。
+ *
+ * ## 为什么需要它（2026-10-24，两个真实后果）
+ *
+ * `parseMinimaxTokenGrant` 只认识 OAuth 令牌五件套
+ *（`access_token` / `refresh_token` / `token_type` / `expires_at` / `scope`），
+ * 而续期结果会被 `ctx.credentials.set` **整体覆盖**旧凭据 ⇒ 每续期一次就丢一次：
+ *
+ * | 字段 | 丢失后的症状 |
+ * |---|---|
+ * | `nickname` | 账号卡片退回内部 id `minimax-xxxx`（IKP8UA 复发） |
+ * | `user_id` | **同账号去重失去唯一判据** ⇒ 同一个号可以无限建卡片、各持一份 token |
+ *
+ * 定时续期是 30 分钟一轮、`SELF_HEAL` 还会在积分查询前补一次 ⇒ 这个丢失
+ * **必然发生**，不是边角情况。（本机实测：`MINIMAX_ACCOUNT_*` 三份凭据里
+ * 只有一份带 `nickname`、**零份**带 `user_id`。）
+ *
+ * @param refreshed 续期响应构造出的新凭据（只有令牌字段）。
+ * @param previous 续期前的旧凭据（身份字段的来源）。
+ * @returns 合并后的凭据；新凭据**已有的字段一律以新凭据为准**。
+ */
+export function inheritMinimaxIdentity(
+  refreshed: MinimaxCredential,
+  previous: MinimaxCredential,
+): MinimaxCredential {
+  const merged: MinimaxCredential = { ...refreshed }
+  const nickname = refreshed.nickname ?? previous.nickname
+  const userId = refreshed.user_id ?? previous.user_id
+  if (nickname !== undefined) merged.nickname = nickname
+  if (userId !== undefined) merged.user_id = userId
+  return merged
 }

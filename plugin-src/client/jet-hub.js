@@ -3768,11 +3768,30 @@ function ProviderPanel({ provider, rpcCall }) {
         //
         // `loginWindow` 两种打开方式都要持有：轮询结束时用它关窗。
         let loginWindow = null;
+        /**
+         * ⚠️⚠️ **`incognitoOpened === true` 时也要自己开窗**（2026-10-24 修复真实事故）。
+         *
+         * 原逻辑是「宿主已开好无痕窗 ⇒ 只打日志、不 `window.open`」。该契约在
+         * **本机这种无头部署里是错的**：宿主只有 Xvfb `:99` 虚拟屏，用户是经隧道
+         * 用**自己的**远端浏览器访问的 ⇒ 窗口画在没人看的屏上，而客户端又不去开
+         * ⇒ 用户报「点击新增账号不会跳转登录页了」。
+         *
+         * ⇒ 判据改为：**只要宿主没有替我们在用户屏幕上打开，就自己开**。
+         * 由于 `window.open` 幂等性无关紧要（多开一个标签页远胜于「什么都不发生」），
+         * 这里**始终**执行 `window.open`；`incognitoOpened` 只用来**记日志**
+         * （排障时区分「宿主也开过」与「只有客户端开过」）。
+         *
+         * ⚠️ 这与「宿主能不能开窗」无关：即便将来宿主真的能开在用户可见的桌面上，
+         * 多一个我们自己开的窗口也只是冗余，不会导致「看不到登录页」。
+         * ⚠️ 服务端已决定 **minimax 不再返回 `incognitoOpened`**（改走
+         * `forcedLoginUrl` + 客户端开窗），故本改动主要兜住 codearts/officeace
+         * 在无头机器上的同型风险。
+         */
         if (res.incognitoOpened === true) {
-          // 宿主已开好无痕窗，这里只记日志以便排障（不打印 URL，见上面的信息泄露注释）。
-          console.log('[jet-hub] account.create 已由宿主以无痕窗口打开授权页');
-        } else {
-          // 回退路径（其余 provider，或无痕窗口没拉起来）：
+          // 宿主也开过一次（可能是无头虚拟屏）—— 记日志便于排障，但**仍然自己开**。
+          console.log('[jet-hub] 宿主也以无痕窗口打开过授权页（仍在本机浏览器再开一次）');
+        }
+        {
           // 登录页在**新窗口**中打开。这里必须能成功弹出：
           // 后端对全部 provider 都是「先返回 loginUrl、后台再等回调」的两步式，
           // 因此本行紧跟用户点击、仍处于浏览器的 transient activation 窗口内。
@@ -3784,15 +3803,48 @@ function ProviderPanel({ provider, rpcCall }) {
           // 授权完成才返回），拿到 URL 时手势早已过期、window.open 必被拦截，
           // 于是每次都命中那个跳转兜底。根因已在后端修掉（改为两步式），
           // 这里也不再保留那条破坏性兜底。
-          loginWindow = window.open(loginUrl, '_blank', 'width=800,height=600');
-          if (!loginWindow || loginWindow.closed) {
-            // 弹窗被拦截：展示可点击链接让用户自行打开，而不是劫持当前页面。
-            // 轮询照常进行，用户手动打开也能完成登录。
-            //
-            // 这里**不**调 setError：本函数运行时 phase 是 'ready'，错误文案只在
-            // 'error' 阶段渲染，设了也看不见；提示由下面的 loginUrlForManual 区块负责。
-            setLoginUrlForManual(loginUrl);
-            setLoginLinkCopied(null);
+          //
+          // ⚠️⚠️ **MiniMax：优先用「保证需要登录」的链接**（2026-10-24）。
+          //
+          // 用户报障「登录链接一打开就自带旧 session 登录态」的根因是
+          // `loginUrl` 里的 `user_code` **不含身份**，身份全在浏览器 cookie ——
+          // 带已有会话打开就直接复用上一个号（上游不认任何 `prompt=*` 强制参数）。
+          //
+          // 宿主用**无 cookie** 的服务端请求换出了上游「切换账号」那个链接
+          // （`/unified-login?login_redirect=<授权页>`）：登录完自动回到授权页并放行
+          // **新**账号。它**不依赖**无痕能力 ⇒ 在「手机/远端浏览器经隧道访问、
+          // 宿主根本没有你的浏览器」这种部署里，这才是**唯一**有效的路径。
+          //
+          // ⚠️ 判据用 `typeof === 'string' && length > 0` 精确判：老宿主不返回该字段
+          // （`undefined`），必须让它退回 `loginUrl`（升级期安全阀，与
+          // `incognitoOpened` 同一取向）。
+          //
+          // ⚠️⚠️ **回退分支必须保持字面形态**（`window.open(loginUrl, …)` +
+          // `setLoginUrlForManual(loginUrl)`）：那两条是**其余所有 provider** 的
+          // 唯一登录通路，且被 `codearts-incognito-login.spec.ts` ④ 与
+          // `login-link-copy.spec.ts` 当作锚点。本次修法**只在其前插一层分流**，
+          // 不替换它们 —— 替换会让那两条守卫变红（本轮实测过一次）。
+          const forcedLoginUrl = typeof res.forcedLoginUrl === 'string' && res.forcedLoginUrl.length > 0
+            ? res.forcedLoginUrl
+            : '';
+          if (forcedLoginUrl !== '') {
+            // MiniMax 专用：宿主已换出「保证需要登录」的链接（详见上方注释）。
+            loginWindow = window.open(forcedLoginUrl, '_blank', 'width=800,height=600');
+            if (!loginWindow || loginWindow.closed) {
+              setLoginUrlForManual(forcedLoginUrl);
+              setLoginLinkCopied(null);
+            }
+          } else {
+            loginWindow = window.open(loginUrl, '_blank', 'width=800,height=600');
+            if (!loginWindow || loginWindow.closed) {
+              // 弹窗被拦截：展示可点击链接让用户自行打开，而不是劫持当前页面。
+              // 轮询照常进行，用户手动打开也能完成登录。
+              //
+              // 这里**不**调 setError：本函数运行时 phase 是 'ready'，错误文案只在
+              // 'error' 阶段渲染，设了也看不见；提示由下面的 loginUrlForManual 区块负责。
+              setLoginUrlForManual(loginUrl);
+              setLoginLinkCopied(null);
+            }
           }
         }
         // 轮询等待登录完成。

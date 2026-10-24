@@ -294,6 +294,26 @@ export interface RpcCreateAccountResponse {
    * 比反过来假设「空串必是错误」更稳，且不必为一次能力下线去改前端渲染分支。
    */
   reused?: boolean
+  /**
+   * MiniMax：**保证需要重新登录**的授权链接（2026-10-24）。
+   *
+   * ## 为什么 `loginUrl` 不够
+   *
+   * `loginUrl`（`/oauth-authorize?user_code=…`）**不含身份**，身份全在浏览器
+   * cookie ⇒ 带已有会话打开就直接复用上一个账号（上游不认任何 `prompt=*`
+   * 强制参数，实测五个参数全被忽略）。
+   *
+   * 本字段是上游「切换账号」按钮的等价物：`/unified-login?login_redirect=<授权页>`，
+   * 由宿主用**无 cookie** 的服务端请求换来，登录完自动回到授权页放行**新**账号。
+   *
+   * ## 三条纪律
+   *
+   * 1. **可选**：拿不到时**不填**（客户端退回 `loginUrl`，行为与从前逐字节相同）；
+   * 2. 客户端判据必须是 `typeof === 'string' && length > 0`（老宿主 `undefined`）；
+   * 3. 它**不消耗凭据**（纯 GET，无 `Authorization`）⇒ 与
+   *    「诊断脚本不得对真实凭据发起 refresh」那条铁律不冲突。
+   */
+  forcedLoginUrl?: string
 }
 
 export interface RpcPollLoginRequest {

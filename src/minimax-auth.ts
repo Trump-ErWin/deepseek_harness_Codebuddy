@@ -24,6 +24,7 @@ import {
 } from './minimax-product.js'
 import { fetchMinimaxUserIdentity } from './minimax-identity.js'
 import {
+  inheritMinimaxIdentity,
   fallbackToEntry,
   isMinimaxRefreshable,
   minimaxCredentialExpiresAtMs,
@@ -39,6 +40,7 @@ import {
   pollMinimaxDeviceToken,
   refreshMinimaxCredential,
   startMinimaxDeviceAuthorization,
+  fetchMinimaxForcedLoginUrl,
   type MinimaxDeviceAuthorization,
 } from './minimax-oauth.js'
 
@@ -113,6 +115,22 @@ export interface MinimaxAuthOptions {
 export interface StartedMinimaxLoginFlow {
   /** 用户点开的授权链接（**含 user_code**）。 */
   loginUrl: string
+  /**
+   * 「保证走一遍登录」的链接（**可能为 undefined**）。
+   *
+   * ## 为什么登录链接需要两个版本（2026-10-24，用户报障「一打开就自带旧 session」）
+   *
+   * `loginUrl` 里的 `user_code` **不含身份**，身份全在浏览器 cookie ⇒ 用已有
+   * 会话的浏览器打开就直接复用旧账号（上游不认任何 `prompt=*` 强制参数，实测）。
+   * 本字段是上游「切换账号」按钮的等价物：`/unified-login?login_redirect=<授权页>`，
+   * 由 {@link fetchMinimaxForcedLoginUrl} 用**无 cookie** 的服务端请求换来，
+   * 登录完自动回到授权页放行**新**账号。
+   *
+   * ⚠️ 它**不依赖**无痕窗口能力 ⇒ 在「手机/远端浏览器经隧道访问、宿主没有你的
+   * 浏览器」这种部署里，这是**唯一**生效的路径。
+   * ⚠️ 可选字段：拿不到时调用方退回 {@link loginUrl}（行为与从前逐字节相同）。
+   */
+  forcedLoginUrl?: string
   /** 授权完成后的凭据。 */
   result: Promise<MinimaxCredential>
   /** 放弃本次登录。 */
@@ -168,8 +186,22 @@ export class MinimaxAuth extends Service {
     // 会 reject（用户关掉登录弹窗就是这条路径）。缺这一句时，
     // 若调用方在 `await result` 之前就放弃，Node 会报 `unhandledRejection`。
     result.catch(() => {})
+    /**
+     * ⚠️⚠️ 2026-10-24：**额外**去换一条「保证需要登录」的链接。
+     *
+     * 用户报障：「登录链接一打开就自带旧 session 登录态」。`loginUrl` 的
+     * `user_code` 不含身份、身份全在浏览器 cookie；上游不认 `prompt=*`，
+     * 但它的「切换账号」按钮走 `/oauth2/device/authorize`（无 cookie ⇒
+     * `401 login_required` + `login_url`）⇒ 服务端已替我们拼好「登录完回到授权页」。
+     *
+     * ⚠️ 它**不消耗任何凭据**（纯 GET、无 `Authorization`），可安全地在每次
+     * 「新建账号」时调用 —— 本仓库有过「诊断请求烧掉 refresh_token」的事故。
+     * ⚠️ 该函数**永不抛错**（失败退回本地兜底；再失败返回 undefined）。
+     */
+    const forcedLoginUrl = await fetchMinimaxForcedLoginUrl(auth, this.fetchImpl, this.product)
     return {
       loginUrl: auth.verificationUriComplete,
+      ...forcedLoginUrl === undefined ? {} : { forcedLoginUrl },
       result,
       close: () => {
         aborted = true
@@ -210,7 +242,7 @@ export class MinimaxAuth extends Service {
   async persistLogin(
     credential: MinimaxCredential,
     options: { refName: string; nickname?: string },
-  ): Promise<{ accountId?: string; nickname?: string }> {
+  ): Promise<{ accountId?: string; nickname?: string; userId?: string }> {
     // ⚠️ 与 `fetchModels` 同一份 XFF 取法（`typeof` 判一下：单测/旧接线可能传
     //    只实现部分方法的池替身，直接 `.minimaxXff()` 会抛 TypeError）。
     const pool = this.ctx.accountPool
@@ -224,12 +256,18 @@ export class MinimaxAuth extends Service {
     const payload: MinimaxCredential = {
       ...credential,
       ...nickname === undefined ? {} : { nickname },
+      // ⚠️ 稳定身份必须落进凭据 —— 它是「同账号去重」的**唯一**判据
+      //    （`account.create` 的 minimax 分支按它查 `findAccountIdByIdentityField`）。
+      //    `identity.userId` 一直拿得到（`GET /v1/api/user/info` 的 `userID`），
+      //    但此前**只用来拼昵称、随后被丢弃** ⇒ 去重无从下手。
+      ...identity?.userId === undefined ? {} : { user_id: identity.userId },
     }
     await this.ctx.credentials.set(credentialRef(options.refName), JSON.stringify(payload))
     this.lastRefreshError = undefined
     return {
       ...credential.account_id === undefined ? {} : { accountId: credential.account_id },
       ...nickname === undefined ? {} : { nickname },
+      ...identity?.userId === undefined ? {} : { userId: identity.userId },
     }
   }
 
@@ -375,8 +413,9 @@ export class MinimaxAuth extends Service {
     if (!isMinimaxRefreshable(credential)) {
       throw new MinimaxRefreshTokenExpiredError('凭据缺少 refresh_token，请重新登录')
     }
+    let refreshed: MinimaxCredential
     try {
-      return await refreshMinimaxCredential(
+      refreshed = await refreshMinimaxCredential(
         credential.refresh_token as string,
         this.fetchImpl,
         this.product,
@@ -388,6 +427,19 @@ export class MinimaxAuth extends Service {
       }
       throw error
     }
+    /**
+     * ⚠️⚠️ 续期**必须继承**身份字段（2026-10-24）。
+     *
+     * `parseMinimaxTokenGrant` 只构造令牌五件套（`access_token` / `refresh_token` /
+     * `token_type` / `expires_at` / `scope`），**不认识** `nickname` / `user_id`；
+     * 而续期结果会被整体覆盖落盘 ⇒ 每续期一次丢一次：`nickname` 丢了账号卡片退回
+     * 内部 id（IKP8UA 复发），`user_id` 丢了**同账号去重失去唯一判据**。
+     * 定时续期 30 分钟一轮、SELF_HEAL 还会补一次 ⇒ 这个丢失**必然发生**。
+     *
+     * ⚠️ 收口在**唯一**的续期出口（本方法）：本文件有 4 条续期路径，在各调用点
+     *    分别补必然漏一处。
+     */
+    return inheritMinimaxIdentity(refreshed, credential)
   }
 
   /**
