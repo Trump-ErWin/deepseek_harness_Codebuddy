@@ -676,6 +676,58 @@ ev.errorCode === 1005 || ev.errorCode === 4008 ? 'QUOTA_EXCEEDED' : 'SERVER'
 ⚠️ **仍未定值**：4006 的**归类**已修，但 trae 的 `imageMaxBytes` **仍未接** ——
 issue 是第三方实测，按本仓库规矩须用**自己的账号与 fixture** 复测后再定
 （入口 `pnpm test:e2e:image-bisect`，见 `protocol-wire.md` 的说明）。
+
+### ⚠️ 流内 `event:error` 的类别必须走**结构化码**入口，不能喂文案表（2026-10-24 真实报障）
+
+**现场**：用户只看到一行 `trae:  (code=1005)`（冒号后**两个空格**）+ 徽章
+`QUOTA_EXCEEDED`，两个 TRAE 账号同被同一模型（`kimi-k3.1-pro`）拒，而插件侧
+**一点退避都没有** —— 宿主日志 `~/.dsh/logs/desktop-next-*.jsonl` 的 `agent.failed`
+与 `[jet-hub] 已记录限流: 账号 <id> 模型 kimi-k3.1-pro 重置于 <失败同一秒>` 同时出现。
+
+**机制**：上游用 HTTP 200 + SSE `event:error` 下发 `code=1005`，而 **`message`
+是空串**。换号循环里拿 `JSON.stringify({ code, message })` 去喂 `classifyTraeError`
+⇒ 文案表的 `hard-plan` 还要求 `plan` 关键词（对齐 Go 端 `Classify`，且被
+`tests/unit/trae-errors.spec.ts` 显式锁死）⇒ 判成 `'none'` ⇒
+`traeCooldownFor('none')` = **0ms** ⇒ 限流标记写在**失败那一瞬间**、下次选号
+**立刻又选回同一个号**（换号形同虚设）；池里账号全被该模型拒后，外层如实抛
+`QUOTA_EXCEEDED`。
+
+**修法**：`src/trae-errors.ts` 新增**结构化码**入口（与文案表并列，同一张判据表
+不许两处各写一份）：
+
+| 流内码 | 类别 | 冷却 |
+|---|---|---|
+| `1005` | `hard-plan` | 12h（与 `trae-credits.ts` 的 `200 + code === 1005 ⇒ PlanLimit(12h)` 同值） |
+| `4008` | `quota-exceeded` | 24h |
+| `4011` | `soft-rate` | 60s |
+
+`classifyTraeStreamCode(code, message)` **码优先、文案兜底**（表外码仍喂文案表，
+保持既有行为）；`isRotatableTraeStreamCode(code)` 与它**共用同一张表** ——
+`trae-adapter.ts` 里那个本地 `isRotatableStreamError`（1005/4008/4011 硬编码）
+已删除，免得「可换号集合」与「类别表」两处漂移。
+
+⚠️ **为什么不改 `classifyTraeError` 本身**：① 它锁死了「仅 `{"code":1005}` 不判
+`hard-plan`」—— 正文里**恰好出现**的数字 `1005` 不算证据（同仓 `zcode-adapter.ts`
+的裸子串判据就因此把两个可用账号换掉过）；② 流内给的是**上游枚举码**，与响应体
+原文的可信度不同，故两个入口分开。
+
+⚠️ **它为什么能潜伏**：既有回归用例的夹具是
+`{ code: 1005, message: 'plan 权益不足' }` —— 那个 `plan` **恰好**满足了文案表的
+第二腿，于是走 `hard-plan(12h)`，**0ms 那条路径一次都没被走到**。新用例把
+`message` 置空，逐字复刻报障现场。
+
+⚠️ **仍未修（已登记）**：流内分支**没有** HTTP 层那条 `recordsTraeRateLimit(kind)`
+守卫（HTTP 层不记 `server`/`client` 的标记，流内会记）。本次刻意不动 —— 能走到该
+分支的码全来自 `TRAE_STREAM_ERROR_KINDS`、三类都该记，加守卫属**行为变更**，
+另开 PR 更清楚。
+
+回归：`tests/unit/trae-errors.spec.ts` 六条（含「1005 的冷却必须是 12h」与「表外码
+回落文案表」）+ `tests/unit/trae-adapter.spec.ts` 两条（★ `message` 为空 ⇒ 12h；
+★ 用户所见文案逐字 `trae:  (code=1005)`）。
+⚠️ **已做反向验证**（逐条独立变异）：把换号循环改回「喂 JSON 给文案表」⇒ **1 条**
+变红，报错 `expected 0 to be greater than 39600000`；把 `1005` 从码表删掉 ⇒
+`trae-errors.spec.ts` **4 条**变红。两次变异后源文件哈希均与变异前一致
+（`src/trae-adapter.ts` `56CAA23D…`、`src/trae-errors.ts` `EFDCE7C5…`）。
 ### 机器指纹轮换默认**关闭**（`DSH_TRAE_ROTATE_MACHINE_ID`）
 
 CN 项目每 3~5 次请求主动换 `machine_id` 以「降低 IDE 端点风控」
