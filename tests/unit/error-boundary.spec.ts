@@ -129,7 +129,11 @@ describe('withErrorBoundary', () => {
 
     // 首次渲染：getDerivedStateFromError 未被触发 ⇒ 直接透传。
     const instance = new Guarded({ rpcCall: 'x' })
-    expect(instance.state.error).toBeNull()
+    // ⚠️ 这里**不**断言 `instance.state.error === null`（2026-10-24 修）：
+    //    那是**实现细节**，而且「无错误」的表示法**必须**能与「真的抛了 null」
+    //    区分开（见 `error-boundary.js` 的哨兵说明）。把初始态锁成 `null`
+    //    会让正确修法（换成 Symbol 哨兵）被这条断言判死 —— 即守卫阻塞修复。
+    //    判据只打在行为上：无错误时 render() 必须渲染 Inner（下面两行）。
     // ⚠️ `render()` 返回的是**元素描述**（`createElement` 是惰性的），必须再展开
     //    一层才拿到函数组件的返回值 —— 直接读 `out.marker` 会是 undefined。
     const out = renderElement(instance.render())
@@ -240,14 +244,98 @@ describe('withErrorBoundary', () => {
     }
   })
 
-  it('⚠️ 组件身份稳定：同一 label 两次调用产出**不同**类（各槽位必须各自持有常量）', async () => {
+  /**
+   * ⚠️⚠️ **这里原来有一条「组件身份稳定」用例，已删除**（2026-10-24 对抗审计）。
+   *
+   * 它断言的是 `expect(A).not.toBe(B)`（同一 label 两次调用必须产出**不同**类）。
+   * 实测：给工厂加一层「按 (Inner, label) 记忆化」—— 那会让代码**更**安全 ——
+   * 会让它变红。也就是说它锁的是「工厂**不做**记忆化」这个**实现细节**，
+   * 而**不是**它标题所声称的「调用方必须持有模块级常量」：后者描述的是
+   * **调用点**，而这个断言只观察**工厂**，对调用点零判别力。
+   *
+   * 换句话说：把 `panel-entry.js` 的两个常量改成「每次 render 新建」，
+   * 这条用例**照样全绿**（实测 8/8）—— 而那个改动会让 React 每帧卸载重挂整棵
+   * Jet Hub 子树、面板内所有本地状态丢失。**它守错了层。**
+   *
+   * ⇒ 按仓库纪律「无牙要如实登记，绝不为它编恒真用例」，此处不保留任何替身断言；
+   * 「身份必须稳定」这条性质改由 **`tests/unit/panel-entry-wiring.spec.ts`
+   * 在调用点行为级**守卫（连续两次渲染槽位，断言拿到同一个组件类型）。
+   */
+
+  it('★ throw null 也必须进 fallback（「无错误」哨兵不得用 null）', async () => {
     const { withErrorBoundary } = await loadWithFakeReact()
-    const Boom = () => null
-    const A = withErrorBoundary(Boom, { label: 'L' })
-    const B = withErrorBoundary(Boom, { label: 'L' })
-    // 工厂每次都新建类 ⇒ 调用方**必须**在模块级持有常量，否则每次 render
-    // 都换一个组件类型，React 会卸载重挂整棵子树（状态全丢）。
-    expect(A).not.toBe(B)
+
+    const BoomNull = () => {
+      throw null
+    }
+    const Guarded = withErrorBoundary(BoomNull, { label: '空值面板' })
+    const instance = new Guarded({})
+
+    // ⚠️ 「抛了 null」与「没抛」必须是两件事：用 `didThrow` 区分，不能只看值。
+    let didThrow = false
+    let thrown
+    try {
+      renderElement(instance.render())
+    } catch (caught) {
+      didThrow = true
+      thrown = caught
+    }
+    expect(didThrow, '被测组件自身应当抛错（否则本用例测不到哨兵）').toBe(true)
+    expect(thrown, '抛出的值就是 null').toBeNull()
+
+    // 真机症状（2026-10-24）：哨兵若用 `null`，`getDerivedStateFromError(null)`
+    // 落进 state 后 `render()` 会认为「没出错」⇒ 又去渲染 Inner ⇒ 边界**失效**，
+    // 实测整个容器被清空、兄弟节点一并消失（＝原始 P0 症状原样复发）。
+    instance.setState(Guarded.getDerivedStateFromError(null))
+    const out = instance.render()
+    expect(out.type, 'throw null 之后边界又去渲染 Inner ⇒ 边界失效（原始 P0 症状）')
+      .not.toBe(BoomNull)
+    expect(collectText(out).join(' | '), 'throw null 之后没有产出 fallback 文案')
+      .toContain('空值面板')
+  })
+
+  it('★★ fallback 自身永不抛错（抛出值不可字符串化时也必须产出文案）', async () => {
+    const { withErrorBoundary } = await loadWithFakeReact()
+
+    const Boom = () => {
+      throw new Error('x')
+    }
+    const Guarded = withErrorBoundary(Boom, { label: '不可序列化面板' })
+
+    // ⚠️ 真机实证（2026-10-24）：`String(Object.create(null))` 抛
+    //    `TypeError: Cannot convert object to primitive value`；
+    //    `{ get message() { throw … } }` 读属性即抛。
+    //    若 fallback 因此抛错，React 会**再卸一次树** ⇒ 边界在「错误值不可
+    //    字符串化」时**与没有边界完全等价** —— 而那正是它存在的唯一场景。
+    const hostile = [
+      ['无原型对象', Object.create(null)],
+      ['抛错的 message getter', { get message() { throw new Error('getter boom') } }],
+      ['toString 抛错', { toString() { throw new Error('toString boom') } }],
+      ['Symbol', Symbol('s')],
+    ]
+
+    for (const [name, value] of hostile) {
+      const instance = new Guarded({})
+      instance.setState(Guarded.getDerivedStateFromError(value))
+      let rendered
+      expect(() => { rendered = instance.render() }, `${name}：fallback 自身抛错了`).not.toThrow()
+      const flat = collectText(rendered).join(' | ')
+      expect(flat, `${name}：fallback 没有产出 label`).toContain('不可序列化面板')
+      expect(flat, `${name}：fallback 没有产出「已拦住」提示`).toContain('已拦住')
+    }
+  })
+
+  it('⚠️ options 传 null 时工厂自身不得抛（默认参数只覆盖 undefined）', async () => {
+    const { withErrorBoundary } = await loadWithFakeReact()
+
+    const Inner = () => null
+    let Guarded
+    expect(() => { Guarded = withErrorBoundary(Inner, null) },
+      'null options 让工厂期抛 TypeError（默认参数只覆盖 undefined）').not.toThrow()
+
+    const instance = new Guarded({})
+    instance.setState(Guarded.getDerivedStateFromError(new Error('x')))
+    expect(collectText(instance.render()).join(' | ')).toContain('这个面板')
   })
 
   it('displayName 可辨认（调试面板里能看出是哪一层的边界）', async () => {

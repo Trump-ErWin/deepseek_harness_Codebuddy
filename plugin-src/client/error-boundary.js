@@ -34,27 +34,107 @@
  * 本插件的凭据从不下发到客户端，见 `jet-hub-rpc.ts` 的 `enrichAccountIdentity`），
  * 用户截个图就能定位。
  *
+ * ## ⚠️⚠️ 能力边界 —— **这些它拦不住**（别把它当万能兜底）
+ *
+ * 错误边界只捕获**渲染期**异常（子组件渲染、constructor、生命周期方法）。
+ * 以下四类**完全不受保护**，发生时仍会卸载整棵树或直接崩掉：
+ *
+ * 1. **事件回调里的异常**（`onClick` / `onChange` 等）—— React 不把它们算作
+ *    渲染期异常，`getDerivedStateFromError` / `componentDidCatch` **不会被调用**
+ *    （2026-10-24 真机实测：`window.onerror` 触发、容器内容不变、边界零介入）；
+ * 2. **异步回调 / `await` 之后的异常**（Promise、`setTimeout`、订阅回调）——
+ *    真机实测同样零介入；
+ * 3. **模块求值期（import 时）的异常** —— 那时 React 还没开始渲染；
+ *    本文件被 import 时求值 `React.Component` 就属于这一类；
+ * 4. **渲染进程级崩溃** —— 发生在 React 之外。
+ *
+ * ⇒ 反向推论同样重要：**不要把取数/解析逻辑挪进渲染路径**、**不要依赖边界去
+ * 接住异步流程里的错误**。它在这里的职责只有一个：把「一次失误 = 白屏」降级成
+ * 「一次失误 = 一块报错」。
+ *
+ * ## ⚠️⚠️ fallback 自身必须**永不抛错**（2026-10-24 对抗审计，真机实证）
+ *
+ * fallback 里要读 `error.message`、还要 `String(error)` —— **这两步都可能抛**：
+ *
+ * - `error.message` 可能是**抛错的 getter**；
+ * - `String(error)` 对 `Object.create(null)` 抛
+ *   `TypeError: Cannot convert object to primitive value`。
+ *
+ * 一旦 fallback 自身抛错，React 会**再卸一次树** ⇒ 边界在「错误值不可字符串化」
+ * 时**与没有边界完全等价**（真机实测容器被清空、兄弟节点一并消失）——
+ * 而那恰恰是它存在的唯一场景。⇒ 文案计算全部收进 `describeThrown()`。
+ *
  * @module plugin-src/client/error-boundary.js
  */
 import * as React from 'react';
 
 /**
+ * 「没有错误」的**专用哨兵**。
+ *
+ * ⚠️⚠️ **不能用 `null`**（2026-10-24 对抗审计实测的真缺陷）：`null` 同时是
+ * 「初始态」和**合法抛出值**，`getDerivedStateFromError(null)` 返回
+ * `{ error: null }` ⇒ `render()` 会认为「没出错」⇒ 边界**不产出 fallback**。
+ * 真机实测（Chromium + react-dom）：抛 `null` 的子组件让**整个容器被清空**、
+ * 兄弟节点一并消失 —— **与没有边界同形**，即原始 P0 症状原样复发。
+ *
+ * `Symbol` 不会与真实错误值撞车（`Symbol()` 每次调用都是唯一值），
+ * 所以这个判据是可靠的。
+ */
+const NO_ERROR = Symbol('jet-hub:no-error');
+
+/**
+ * 把任意抛出值安全地转成一行可读文本。**保证不抛**（这是它的全部契约）。
+ *
+ * 三级降级：`error.message` → `String(error)` → 固定文案。
+ * ⚠️ 前两级各自包一层 `try`：报错 getter 与无原型对象都会在这里抛
+ * （见文件头「fallback 自身必须永不抛错」）。
+ *
+ * @param {unknown} error 被 `throw` 出来的任意值
+ * @returns {string} 一定可渲染的文本
+ */
+function describeThrown(error) {
+  // ① `Error` 是最常见的形状；`message` 非空串才有信息量。
+  //    ⚠️ 读取 `.message` 本身就可能抛（getter），所以整个判断都在 try 里。
+  try {
+    if (error !== null && error !== undefined
+      && typeof error.message === 'string' && error.message.length > 0) {
+      return error.message;
+    }
+  } catch {
+    // 抛错的 getter：忽略，继续走 ②
+  }
+  // ② 退到 `String(error)`。⚠️ `Object.create(null)` 等无原型的值会抛。
+  try {
+    return String(error);
+  } catch {
+    return '（抛出值无法转为文本，请查看控制台）';
+  }
+}
+
+/**
  * 包一层错误边界，返回可注册到槽位的组件。
+ *
+ * ⚠️ **调用方必须在模块级持有返回值**（不要每次 render 新建）：本工厂每次调用
+ * 都产生一个**新的类**，而组件身份必须稳定 —— 否则槽位每次重渲染都换一个组件
+ * 类型，React 会把整棵子树卸载重挂（面板内所有本地状态丢失）。
  *
  * @template {object} P
  * @param {React.ComponentType<P>} Inner 被保护的组件。
- * @param {{ label?: string }} [options] `label` 用于 fallback 文案（标明是哪块坏了）。
+ * @param {{ label?: string } | null | undefined} [options] `label` 用于 fallback
+ *   文案（标明是哪块坏了）。⚠️ 显式允许 `null`：默认参数只覆盖 `undefined`，
+ *   传 `null` 时若直接读 `.label` 会在**工厂期**抛 TypeError（2026-10-24 审计）。
  * @returns {React.ComponentType<P>}
  */
-export function withErrorBoundary(Inner, options = {}) {
-  const label = typeof options.label === 'string' && options.label.length > 0
+export function withErrorBoundary(Inner, options) {
+  const label = options !== null && typeof options === 'object'
+    && typeof options.label === 'string' && options.label.length > 0
     ? options.label
     : '这个面板';
 
   class PanelErrorBoundary extends React.Component {
     constructor(props) {
       super(props);
-      this.state = { error: null };
+      this.state = { error: NO_ERROR };
     }
 
     static getDerivedStateFromError(error) {
@@ -69,10 +149,8 @@ export function withErrorBoundary(Inner, options = {}) {
 
     render() {
       const error = this.state.error;
-      if (error === null) return React.createElement(Inner, this.props);
-      const message = error && typeof error.message === 'string' && error.message.length > 0
-        ? error.message
-        : String(error);
+      if (error === NO_ERROR) return React.createElement(Inner, this.props);
+      const message = describeThrown(error);
       return React.createElement('div', {
         className: 'dim-jh-probeNotice',
         'data-tone': 'error',

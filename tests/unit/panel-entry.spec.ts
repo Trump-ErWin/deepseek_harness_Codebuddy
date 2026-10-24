@@ -138,46 +138,24 @@ describe('panel-entry 注册器', () => {
   })
 
   /**
-   * ⚠️⚠️ **两处槽位注册的必须是包了错误边界的组件**（PR #10，2026-10-22 整页白屏事故）。
+   * ⚠️⚠️ **「两处槽位注册的必须是错误边界」已改为行为级守卫**（2026-10-24）。
    *
-   * ## 这条守卫为什么必须存在（实测无牙的证据）
+   * 这里原来是一条**源码文本**断言（要求源码里出现 `withErrorBoundary(JetHubPage, …)`
+   * 与两个特定字面量）。对抗审计实测打穿它，且同时对正确重构假红：
    *
-   * 把本文件的 `JetHubPageForSettings` / `JetHubPageForMain` 两个标识符**整个改回**
-   * 裸 `JetHubPage`（＝完全拆掉错误边界，事故原样复发），实测
-   * `panel-entry.spec.ts` 8 条 + `plugin-detail-slot.spec.ts` 11 条**全绿** ——
-   * 合并 PR #10 时若不补，这块补强就是**零守卫**。
+   * | 手法 | 后果 | 原文本断言 |
+   * |---|---|---|
+   * | 局部 `const JetHubPageForMain = JetHubPage` 遮蔽模块级常量（+2 行） | 两处边界**全拆** | **全绿** |
+   * | `if (false)` 供货锚点 + 真注册换裸组件 | 保护被拆除 | **全绿** |
+   * | 常量下沉到组件体内（每帧新建类） | 面板内所有本地状态每帧丢失 | **全绿** |
+   * | label 互换 | fallback 指向错的面板 | **全绿** |
+   * | `import { withErrorBoundary as guard }` / 单引号改双引号 | （保护完好） | **假红** |
    *
-   * ## 判据为什么是「两个不同的标识符」而不是「含 withErrorBoundary」
+   * ⇒ 判据搬到 `tests/unit/panel-entry-wiring.spec.ts`，改问**运行结果**：
+   * 「注册进去的组件能不能捕获渲染期异常」「两次渲染是不是同一个组件类型」
+   * 「label 与槽位配对是否正确」。
    *
-   * 只断言文件里出现 `withErrorBoundary` 会被「定义了但没用」骗过（本仓库
-   * `if (false)` 短路陷阱的同型）。这里要求：① 两个槽位的**注册实参**都是
-   * `withErrorBoundary(...)` 的产物标识符；② 两个标识符**不是同一个**
-   * —— fallback 文案靠 `label` 区分「哪块坏了」，共用一个常量会让设置页报错
-   * 时写成「Jet Hub 面板」。
+   * ⚠️ 这不是「放宽判据」—— 新守卫**更强**：它抓得住上表全部四条绕过，
+   * 而文本断言一条都抓不住，且不再对等价重构假红。
    */
-  it('⚠️⚠️ 两处槽位都注册错误边界组件，且各自独立', () => {
-    // 剥注释：本次修复的注释里逐字引用了 `JetHubPage`，不剥会假绿/假红。
-    const code = source
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/(^|[^:])\/\/.*$/gm, '$1')
-
-    // ① 两个边界常量都由 withErrorBoundary 产出，且各自绑定不同的 label。
-    const decls = [...code.matchAll(/const\s+(JetHubPageFor\w+)\s*=\s*withErrorBoundary\(\s*JetHubPage\s*,\s*\{\s*label:\s*'([^']+)'/g)]
-    expect(decls.map((m) => m[1]).sort(), '两个错误边界常量缺失或未用 withErrorBoundary 产出')
-      .toEqual(['JetHubPageForMain', 'JetHubPageForSettings'])
-    const labels = decls.map((m) => m[2])
-    expect(new Set(labels).size, `两个边界的 label 不得相同（实测 ${labels.join(' / ')}）`).toBe(2)
-
-    // ② main 槽渲染的是那个边界组件，不是裸 JetHubPage。
-    expect(code, 'main 槽渲染了裸 JetHubPage —— 渲染期异常会卸载整棵树')
-      .toContain('React.createElement(JetHubPageForMain, { rpcCall })')
-
-    // ③ settings.section 注册的是那个边界组件，不是裸 JetHubPage。
-    expect(code, 'settings.section 注册了裸 JetHubPage —— 渲染期异常会卸载整棵设置页')
-      .toContain('}, JetHubPageForSettings)')
-
-    // ④ 反向：这两处**不得**出现裸 JetHubPage（并列断言用计数，见本仓库教训）。
-    expect(code, 'main 槽仍存在裸 JetHubPage').not.toMatch(/React\.createElement\(JetHubPage,/)
-    expect(code, 'settings.section 仍注册裸 JetHubPage').not.toMatch(/\},\s*JetHubPage\s*\)/)
-  })
 })
