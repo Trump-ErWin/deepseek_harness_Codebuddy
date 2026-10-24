@@ -13,7 +13,7 @@ import {
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
-import { OpencodeKeyModal, OpencodeProxyModal, GeminiProxyModal } from './opencode-proxy-modal.js';
+import { OpencodeKeyModal, OpencodeProxyModal, GeminiProxyModal, MinimaxIntlProxyModal } from './opencode-proxy-modal.js';
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
 //    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
 //    ⚠️ 本 import 此前**不存在** ⇒ `modelscope-key-modal.js` 整份 140 行从未进 bundle，
@@ -687,6 +687,25 @@ function isAnonymousAccountId(accountId) {
   return String(accountId || '').indexOf('opencode-anon-') === 0;
 }
 
+/**
+ * 「出口代理」弹窗按 provider 选组件。
+ *
+ * ## ⚠️ 为什么三家各一个组件而不是一个组件换文案
+ *
+ * 它们**形态相同、语义与「不设置会怎样」完全不同**，而那句解释正是本功能
+ * 存在的理由 —— 塞进一个函数按 provider 分支，正是本仓库反复记录的
+ * 「同一判据两份实现」的漂移形态。故独立成组件，**复用**输入预设，
+ * **不复用**组件本体。
+ *
+ * ⚠️ 未知 provider 一律回落 `OpencodeProxyModal`（既有行为，不可变更）：
+ * 当前只有 opencode / gemini / minimaxintl 三家会打开这个弹窗。
+ */
+function proxyModalComponent(provider) {
+  if (provider === 'gemini') return GeminiProxyModal;
+  if (provider === 'minimaxintl') return MinimaxIntlProxyModal;
+  return OpencodeProxyModal;
+}
+
 function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onTest, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
   // ⚠️ opencode 专属：传了才渲染「代理」「指纹」两个按钮（见按钮区注释）。
   // 前者额外需要 current 代理串，故签名与 onRetest 略有不同。
@@ -937,18 +956,29 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
       onOpenProxy
         ? React.createElement('button', {
             className: 'dim-jh-btn',
-            // ⚠️ tooltip 必须解释「不设置会怎样」。两家语义不同，故按
-            // `account.geminiProxy !== undefined` 分流文案：opencode 是
-            // 「共用出口 = 共用额度」，gemini 是「出不去 = 恒连不上」。
+            // ⚠️ tooltip 必须解释「不设置会怎样」。三家语义不同，故按各自的
+            // 池字段分流文案：
+            // - opencode：共用出口 = 共用额度；
+            // - gemini：出不去 = 墙外恒连不上；
+            // - minimaxintl：出口在大陆 = 被 307 到中国站（**连得上但用不了**）。
+            // ⚠️ minimaxintl 的判断**必须放在 gemini 之后**：它的池字段同样是
+            // 「未设置 = undefined、已清除 = 空串」，顺序反了会误读成 gemini 那句。
             title: account.opencodeProxy
               ? '出口代理：' + account.opencodeProxy + '（点击修改）'
-              : account.geminiProxy !== undefined
-                ? '出口代理：' + (account.geminiProxy || '直连') + '（点击修改）'
-                : '设置该账号的出口代理；'
-                  + (account.geminiProxy !== undefined
-                    ? '不设置则直连本机（出不去墙外服务）'
-                    : '不设置则与其它未设代理的账号共享本机出口 IP'),
-            onClick: () => onOpenProxy(account.id, account.opencodeProxy || account.geminiProxy || ''),
+              : account.minimaxIntlProxy !== undefined
+                ? '出口代理：' + (account.minimaxIntlProxy || '直连') + '（点击修改）'
+                : account.geminiProxy !== undefined
+                  ? '出口代理：' + (account.geminiProxy || '直连') + '（点击修改）'
+                  : '设置该账号的出口代理；'
+                    + (account.minimaxIntlProxy !== undefined
+                      ? '不设置则直连本机（国际站会把大陆来源转到中国站）'
+                      : account.geminiProxy !== undefined
+                        ? '不设置则直连本机（出不去墙外服务）'
+                        : '不设置则与其它未设代理的账号共享本机出口 IP'),
+            onClick: () => onOpenProxy(
+              account.id,
+              account.opencodeProxy || account.minimaxIntlProxy || account.geminiProxy || '',
+            ),
           }, '代理')
         : null,
       onRotateFingerprint
@@ -4835,6 +4865,17 @@ function ProviderPanel({ provider, rpcCall }) {
                       onOpenProxy: (id, current) => setProxyModal({ provider, accountId: id, current }),
                     }
                   : {}),
+                // ⚠️ **MiniMax 国际站也要「代理」按钮**：`agent.minimax.io` 按出口
+                // IP 国别分流，大陆来源会被 307 到中国站 ⇒ 与「凭据失效」同形的
+                // 401。给它配一个海外出口是根治手段（既有的 X-Forwarded-For
+                // 只是声明来源 IP，上游不认即失效）。
+                // ⚠️ 同样**刻意分成独立回调**：它读的是 `minimaxIntlProxy` 字段、
+                // 调 `minimaxintl.*` 端点，与上面两家共用会互相清掉配置。
+                ...(provider === 'minimaxintl'
+                  ? {
+                      onOpenProxy: (id, current) => setProxyModal({ provider, accountId: id, current }),
+                    }
+                  : {}),
                 // ⚠️ **本 fork 独有**（modelscope，2026-10-17）：编辑访问令牌。
                 // 同样只在该 provider 下传，靠「props 存在性」决定是否渲染按钮。
                 ...(provider === 'modelscope'
@@ -4891,7 +4932,7 @@ function ProviderPanel({ provider, rpcCall }) {
     // 整个设置页崩成白屏。仓库其它弹窗（ModelListPanel / BackupPanel /
     // ClineQuotaPanel）都是 `createElement` 形式，正是这个原因。
     proxyModal
-      ? React.createElement(proxyModal.provider === 'gemini' ? GeminiProxyModal : OpencodeProxyModal, {
+      ? React.createElement(proxyModalComponent(proxyModal.provider), {
           // ⚠️ 传最小 ctx 门面而不是整个面板：弹窗只需要 rpc，
           // 这样它在单测/复用时不必拖上整个 ProviderPanel 的依赖。
           ctx: { rpc: (payload) => rpcCall(payload.method, payload.payload) },

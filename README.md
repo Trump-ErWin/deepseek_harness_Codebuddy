@@ -232,7 +232,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 | `raccoon` | Raccoon Work（商汤） | 微信扫码 / 短信 | 余额 + 一次性登录奖励 |
 | `minimax` | MiniMax Code (中国版) | OAuth 设备码 + PKCE | 余额 + 每日签到 |
 | `minimaxintl` | MiniMax Code (国际版) | 同上（共用实现） | 余额 + 每日签到 |
-| `zcode` | ZCode（智谱 z.ai） | OAuth 设备码 | 余额 + 每日领取 |
+| `zcode` | ZCode（智谱 z.ai） | OAuth 设备码 | 余额 + 每日领取（含**营销活动**投放，如 1024 程序员节 5 亿 token） |
 | `opencode` | OpenCode | — | 余额 |
 | `gemini` | Gemini Code Assist | 浏览器回调 | 余额 |
 | `officeace` | OfficeAce（华为 MaaS / 果办） | 华为云 OAuth PKCE | 余额 + 自动领取（**无手动签到入口**） |
@@ -256,6 +256,50 @@ dsh plugin --profile <name> install <path-to-this-repo>
   不带验证头先发一发，被 `3007` 拒了才产）；一旦服务端翻成 `false`，
   插件会**自动改为首发直接带上**，不再白吃那发注定失败的往返
   （判据是三态：缺席 = 不知道 = 保持先探，见 `requiresCaptchaUpfront`）。
+  ⚠️ **找不到浏览器时用 `ZCODE_CHROME_PATH` 指定**（Gitee issue IKQ4JN）：
+  这是该链路**唯一**的人工出口，值是 chromium 内核浏览器的**绝对路径**
+  （如 `C:\Program Files\Google\Chrome\Application\chrome.exe`）。
+  候选链按优先级为 `ZCODE_CHROME_PATH` → `SCOOP` / `SCOOP_GLOBAL` →
+  **从 `PATH` 反推的 scoop 根** → `~/scoop` → 系统 Chrome / Chromium /
+  **Brave** / Edge。
+  ⚠️ **设完必须重启 `dsh web`，且新进程要继承新环境** —— 从**旧终端**重启时
+  新进程继承的仍是旧 shell 的环境快照，变量实际为空。找不到浏览器时的报错
+  会回显「本进程看到的 `ZCODE_CHROME_PATH` = …」与**逐条候选路径**，
+  照着它能立刻分清「变量没生效」与「路径写错」。
+  ⚠️ **scoop 装在非默认根时不必设变量**：从 `PATH` 的 `<root>\shims` 反推
+  已覆盖（用 `root_path` 把 scoop 挪到 D 盘的机器上 `SCOOP` 是空的，
+  旧版因此一个 chromium 都找不到）。
+  ⚠️ **不支持两类「看着能用」的封装**：Chrome++ 之类**外层 exe 启动后自行退出**
+  （CDP 端口会正常起来，但退出码 0 被判为异常退出）；以及
+  `chrome-headless-shell`（headless 一律 `F001`，必须 headful）。
+- **`zcode` 的领取有「两个来源」，签到会同时查、一起去领**（2026-10-23）：
+  ① 每日赠送 —— `GET /api/v1/zcode-plan/billing/preview` 的 `plans`；
+  ② **营销活动投放** —— `GET /api/v1/marketing/touch` 里横幅按钮的
+  `claim_zcode_plan`。后者就是官方客户端那类「限时可领取」横幅（如
+  **1024 程序员节 5 亿 token**），它**不在** `preview` 里 —— 只查 preview 时
+  它与「今天没有活动」在报文上**完全同形**（都是 `plans: []`）。
+  ⚠️ **营销端点与领取端点都按客户端版本门控**：插件凭据里记的是自己的版本号
+  （如 `3.14.3`）；用它查投放会拿到**空投放**，用它**领取**则回
+  `400 / code 1004 no permission`（官方文案：「当前账号或**客户端版本**不满足
+  领取条件」—— 极易被误读成「这个账号没资格」）。两条请求都会**按需抬到
+  `3.16.3`**（`ZCODE_VERSION_GATED_MIN_APP_VERSION`；实测同一账号、其余头完全相同，
+  只改这一个字段：查投放 `3.14.3` → `deliveries: []` / `3.16.3` → 有投放；
+  领取 `3.14.3` → `1004` / `3.16.2` → `code 0`）。该覆盖**只作用于这两条请求**，
+  不影响推理与额度两条已实测路径。
+  ✅ **真机验收**（2026-10-23，走插件自己的生产路径）：`{"kind":"claimed",
+  "credit":500000000,"unit":"token"}` —— 5 亿 token 领取成功。
+  ⚠️ **「领取成功但额度仍是 0」是正常的**：活动的 `effective_at` 是 **23:00**
+  （UTC+8），而额度桶要等那个时刻才建（上游 `plans[].status:"active"` 里
+  额度已锁定，`balances` 仍是空的）。插件会把它单独显示成一个
+  「**待生效**」的包并带出生效时刻，**不并进当前可用额度** ——
+  并进去会让折算层在生效前就把 zcode 派发出去（必然失败）。
+  ⚠️ **国际版（`zai`）账号同样能领到**（2026-10-23 实测：4 个账号含 2 个
+  国际版都拿到同一个 1024 计划）⇒ 服务端**不按 OAuth 渠道区分**；
+  「只有中国版有」是官方客户端**奖励中心分站**（`/cn/rewards` vs `/en/rewards`）
+  造成的**入口**差异，插件不做渠道特判。
+  ⚠️ 领取成功后插件会回报一次 `POST /marketing/touch/action`（`confirm`），
+  否则服务端会**反复投放同一个活动** ⇒ 每轮签到白烧一个验证参数
+  （阿里云验证是**设备级**配额）。失败时**绝不**回报 —— 那会让用户白丢一次机会。
 - **`qoder` / `qodercn`** 共用同一套实现，差异仅在产品配置。
 - **`minimax` / `minimaxintl`** 共用同一套实现（**唯一**的 Anthropic Messages
   协议族渠道），差异仅在产品配置。⚠️ 两站的**账号不互通、API 主机也不同**，
