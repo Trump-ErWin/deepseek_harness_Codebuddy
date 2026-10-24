@@ -21,6 +21,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
 
+import { BrowserStartupError } from '../../src/chromium-session.js'
 import { ZcodeAuth } from '../../src/zcode-auth.js'
 import { CAPTCHA_CONFIG_TTL_MS } from '../../src/captcha-backoff.js'
 import type { ZcodeCredential } from '../../src/zcode.js'
@@ -179,6 +180,75 @@ describe('ZCode captcha 的观测（对齐官方 traceless/interactive 计数）
      */
     await expect(auth.mintCaptcha({ region: 'cn', prefix: 'p', sceneId: 's' }))
       .rejects.toThrow(/冷却中/)
+  })
+
+  /**
+   * ★★ **启动期失败不记账**（Gitee issue IKQ4JN）。
+   *
+   * ## 守的是什么（用户报障的真实形态）
+   *
+   * 用户机器上 scoop 装在非默认根 ⇒ 候选链找不到浏览器。他**连点了很多次**，
+   * 于是第 1~3 次看到的是「找不到可用的浏览器」（真因），
+   * 第 4 次起只剩「设备信誉不足，继续重试只会让信誉更差」（**假因**）。
+   *
+   * ## 为什么必须用「连点 N 次」而**不是**单次断言
+   *
+   * 单次点：记账与不记账都会抛同一条错，**判据区分不出来**（这条用例第一版
+   * 就是这么写的，反向验证时发现删掉 `instanceof` 分支仍然全绿）。
+   * 只有连点到阈值以上、再看**第 4 次是否还被冷却闸门拦住**，判据才有牙：
+   *
+   * - 记账 ⇒ 第 4 次抛「冷却中」（旧行为，红）
+   * - 不记账 ⇒ 第 4 次仍抛「找不到浏览器」（新行为，绿）
+   */
+  it('★★ 启动期失败（找不到浏览器）**不**计入退避：连点 10 次仍报真因，不报冷却', async () => {
+    const { auth, mintCalls } = makeAuth({
+      mintImpl: async () => {
+        // 与真实抛出的类型一致（文案不重要，**类型**才是判据）。
+        throw new BrowserStartupError('zcode: 找不到可用的浏览器（用于产出阿里云 captcha）。')
+      },
+    })
+
+    const messages: string[] = []
+    for (let i = 0; i < 10; i += 1) {
+      await auth.mintCaptcha({ region: 'cn', prefix: 'p', sceneId: 's' })
+        .then(() => { throw new Error('不该成功') })
+        .catch((error: Error) => { messages.push(error.message) })
+    }
+
+    // ★ 关键断言①：第 4 次起**不得**出现冷却文案（阈值是 3）。
+    expect(messages.filter((m) => m.includes('冷却中'))).toHaveLength(0)
+    // ★ 关键断言②：每一次都必须给出那条可执行的出路。
+    for (const message of messages) expect(message).toContain('找不到可用的浏览器')
+
+    // ★ 关键断言③：streak 与 cooldown 都没被这两类失败推高 ——
+    // 否则下一次真正的产出失败会被冤枉成「连续第 N 次」。
+    const snap = auth.captchaObservability()
+    expect(snap.failureStreak).toBe(0)
+    expect(snap.cooldownRemainingMs).toBe(0)
+    /**
+     * `failed` 仍要如实计数（它只是观测，不是退避状态）：
+     * 用户排查时「失败过 10 次」是有用的事实，不该因为不进退避就一起抹掉。
+     */
+    expect(snap.failed).toBe(10)
+    // 且每一次都**真的发起了** mint（没有被闸门提前拦下）。
+    expect(mintCalls()).toBe(10)
+  })
+
+  /**
+   * ★ 反向看守：**非**启动期失败必须照旧记账（别把整条退避一起关掉）。
+   *
+   * 与上一条互为对照 —— 只有两条同时存在，才能证明判据是「按类型分道」，
+   * 而不是「退避被整体删除」。
+   */
+  it('★ 反面：产出失败（F001 等）仍然记账并进入冷却', async () => {
+    const { auth } = makeAuth({
+      mintImpl: async () => { throw new Error('zcode: captcha 产出失败（stage=fail, verifyCode="F001"）') },
+    })
+    for (let i = 0; i < 3; i += 1) {
+      await expect(auth.mintCaptcha({ region: 'cn', prefix: 'p', sceneId: 's' })).rejects.toThrow()
+    }
+    expect(auth.captchaObservability().failureStreak).toBe(3)
+    await expect(auth.mintCaptcha({ region: 'cn', prefix: 'p', sceneId: 's' })).rejects.toThrow(/冷却中/)
   })
 })
 

@@ -84,12 +84,14 @@ import { CdpConnection, ChromiumSession, sleep } from './chromium-session.js'
  */
 export {
   browserCandidates,
+  BrowserStartupError,
   browserNotFoundMessage,
   buildLinuxSkipTaskbarArgs,
   buildMacosMiniaturizeArgs,
   findBrowserExecutable,
   isEdgeExecutable,
   parseWmctrlList,
+  scoopRootFromPath,
 } from './chromium-session.js'
 
 /** 阿里云 captcha 配置（服务端下发；此处为实测兜底值）。 */

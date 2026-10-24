@@ -2593,3 +2593,95 @@ node scripts/probe-zcode-intl-vs-cn-activity.mjs
 
 
 
+
+## ⚠️⚠️ Scoop 装在**非默认根**时探测不到浏览器（真实报障，2026-10-24，Gitee issue IKQ4JN）
+
+### 一、报障形态（两条错误**指向相反方向**）
+
+```
+zcode: 找不到可用的浏览器（用于产出阿里云 captcha）。
+已尝试 scoop chromium / Chrome / Chromium / Edge；可用 ZCODE_CHROME_PATH 显式指定 chrome.exe 路径。
+```
+
+再点几次，错误**换成另一个**：
+
+```
+zcode: captcha 产出处于冷却中（连续 3 次失败），约 30 秒后可重试。
+这通常意味着设备信誉不足（上游把无感验证降级为滑块），继续重试只会让信誉更差 —— 请稍后再试。
+```
+
+用户的原话是「我当时确实点了挺多次的」—— **点得越多，越只能看到第二条**，
+而第二条把「你还没装 chromium」说成了「设备信誉不足」。本次排查最耗时的就是这一步。
+
+### 二、根因①：候选链取 scoop 根的来源缺一档
+
+`windowsBrowserCandidates()` 只有两个来源：`$SCOOP` / `$SCOOP_GLOBAL`（显式声明）
+与硬编码的 `~/scoop`。而 scoop 用 `root_path` 装在别处时（实测
+`D:\System_Tools\Scoop`），环境变量**是空的**、`~/scoop` **不存在** ⇒ 两条同时落空。
+
+scoop 自己的解析顺序（`apps/scoop/current/lib/core.ps1:1375`）是四档：
+`$env:SCOOP` → `config.json` 的 `ROOT_PATH` → 相对路径 → `~/scoop`。
+⇒ **候选链只抄了第 1 档和第 4 档**。
+
+### 三、修法：从 PATH 反推（不是读 config.json）
+
+**不能**直接读 `~/.config/scoop/config.json`：配置文件的**位置本身取决于根**
+（便携布局在 `<root>\config.json`，常规布局在 `~/.config/scoop/config.json`）——
+要读它得先猜根，循环论证。
+
+而 **`<root>\shims` 一定在 PATH 里**（否则 `scoop` 命令都用不了），它就是根的直接证据。
+新增 `scoopRootFromPath(env)`：按 PATH 原序找 `basename === 'shims'` 的目录，
+**并要求该目录里确实有 `scoop.cmd` / `scoop.ps1`**。
+
+⚠ 第二条判据不能省：本机 PATH 里就有 `persist\uv\tools\shims`、
+`persist\uv\python\shims` 两个同名干扰项，只认目录名会拼出必然不存在的候选。
+
+⚠ **必须幂等**：默认布局时 PATH 反推出的就是 `~/scoop` —— 若插进去，
+`zcode-browser-macos.spec.ts` 那条「win32 候选链**逐字不变**」会在**装了 scoop 的
+开发机**上红、在 CI 上绿（同一条用例两副面孔）。故按大小写不敏感去重。
+
+### 四、根因②：启动期失败被计入 captcha 退避
+
+`zcode-auth.ts` 的 `catch` 无差别调 `noteFailure()`，于是「找不到浏览器 / 起不来 /
+起来就退」也累计 streak，3 次后进冷却。而这三类与「产不出来」归因**完全不同**：
+
+| 失败 | 归因 | 重试有用吗 |
+|---|---|---|
+| 没装 / 路径不对 | 本机**部署**问题 | ❌ 一万次也不会好 |
+| 起来就退（壳程序/权限/自更新） | 同上 | ❌ |
+| SDK `F001` / 超时 / 降级产物 | 本机产出能力 / 设备信誉 | ⚠ 冷却后可能 |
+
+⇒ 新增 `BrowserStartupError` 基类，三处启动失败抛它；`zcode-auth.ts` 见到它
+**直接上抛、不记账**。判据用**类型而非文案**（文案随时会改）。
+`captchaStats.failed` 仍照常 +1 —— 它是观测不是退避状态。
+
+### 五、回归与反向验证
+
+- `tests/unit/zcode-browser-scoop-root.spec.ts`（13 条）：PATH 反推、干扰项、
+  去重、顺序（`$SCOOP` → PATH → `~/scoop`）、默认布局 9 条逐字不变、
+  以及「找到的错误确实是 `BrowserStartupError`」。
+- `tests/unit/zcode-captcha-guard.spec.ts` 新增 2 条：**连点 10 次仍报真因**
+  （旧行为是第 4 次起只剩冷却）+ **反面**（`F001` 仍照旧记账，证明退避没被整体删掉）。
+
+⚠ **反向验证实跑**（删掉 `instanceof BrowserStartupError` 那三行）：
+新用例变红、信息是 `expected [ …(7) ] to have a length of +0 but got 7`，
+其余 7 条仍绿 ⇒ 判据**只**认这一处、且真的有牙。还原后 8/8 绿。
+
+⚠ 第一版用例**是假绿**：它只点一次，那时记账与不记账都抛同一条错，
+判据区分不出来（删掉修法仍全绿）。**只有连点到阈值以上、看第 4 次有没有冷却**才有牙。
+
+### 六、真机验收
+
+用户机器（Windows 11，scoop 在 `D:\System_Tools\Scoop`，系统里只有
+Playwright 自带的 chromium）：修好后 `findBrowserExecutable()` 直接选中
+`D:\System_Tools\Scoop\apps\chromium\current\chrome.exe`（此前是 `undefined`），
+`ZcodeCaptchaBrowser.mintWithOutcome()` 连续 3 轮 `len=280 / valid=true`，
+点「一键领取」成功。
+
+### 七、两个「看着能用、实际不能用」的坑（别再往候选链里加）
+
+| 路径 | 表象 | 实际 |
+|---|---|---|
+| Chrome++ 封装的 `…\Chrome\App\Chrome.exe` | CDP `/json/version` **517ms 就绪** | 外层 exe **9ms 内 exit code 0** 后拉起独立进程 ⇒ `child.once('exit')` 判为「异常退出」，浏览器明明跑着却被判死 |
+| `chrome-headless-shell.exe` | 能起、端口正常 | 实跑 `verifyCode: "F001"`（headless 一律失败，源码注释已写明） |
+
