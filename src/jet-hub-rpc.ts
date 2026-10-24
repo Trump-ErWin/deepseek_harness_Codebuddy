@@ -13,7 +13,7 @@
  *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
  *           backup.export / backup.import / backup.status /
  *           nativeSearch.getEnabled / nativeSearch.setEnabled /
- *           sidebarEntry.getEnabled / sidebarEntry.setEnabled /
+ *           panelEntry.get / panelEntry.set /
  * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
  * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
  */
@@ -99,7 +99,7 @@ import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js
 // ⚠️ `sanitizeMinimaxXff` 与存储层**同一份判据**：RPC 层必须在写盘**之前**用它
 //    判合法性（非法即不写），否则「先写后判」会静默清掉用户原有的有效设置。
 //    ⚠️ 不要在这里另写一份 IP 校验（同义判据分两处必然漂移）。
-import { sanitizeMinimaxXff } from './jet-hub-store.js'
+import { PANEL_ENTRY_VALUES, sanitizeMinimaxXff } from './jet-hub-store.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
 // OfficeAce（华为 MaaS 云端直连）：面板状态探测 / 登录流程 / 余额查询所需的
@@ -356,9 +356,9 @@ import type {
   RpcNativeSearchGetEnabledResponse,
   RpcNativeSearchSetEnabledRequest,
   RpcNativeSearchSetEnabledResponse,
-  RpcSidebarEntryGetEnabledResponse,
-  RpcSidebarEntrySetEnabledRequest,
-  RpcSidebarEntrySetEnabledResponse,
+  RpcPanelEntryGetResponse,
+  RpcPanelEntrySetRequest,
+  RpcPanelEntrySetResponse,
   RpcGatewayModel,
   RpcCaptchaDemandResponse,
   RpcCaptchaCarrierUrlResponse,
@@ -8164,35 +8164,39 @@ function registerJetHubEndpoints(
         return { ok: true, value }
       }
 
-      // ── 「侧栏入口」开关（Jet Hub 页头的「侧栏」开关）──
+      // ── 「面板入口」（插件详情页设置卡片里的下拉）──
       //
-      // 语义：**开** = 主导航（`sidebar.panellist`）里显示「Jet Hub」一行，
-      // 点它把 Jet Hub 页渲染进中央主面板（`main` 槽的 `jet-hub` key）；
-      // **关** = 该行消失，进入路径只剩「设置 → Jet Hub」。
+      // 语义：Jet Hub 的**唯一**入口位置，两个取值严格互斥 ——
+      // `'sidebar'` = 主导航（`sidebar.panellist`）里显示「Jet Hub」一行，点它把
+      // 页面渲染进中央主面板（`main` 槽的 `jet-hub` key），同时 `settings.section`
+      // 那一节注销；`'settings'` = 该行注销，进入路径只剩「设置 → 插件 → Jet Hub」。
       //
-      // 消费方是客户端：`plugin-src/client/sidebar-entry.js` 在 `apply` 里先读
-      // 一次本端点，再决定注不注入那行；页头开关写回后由同一份进程内副本
-      // 通知两侧（设置页与主面板）重新渲染。
-      case 'sidebarEntry.getEnabled': {
-        const value: RpcSidebarEntryGetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
+      // 消费方是客户端：`plugin-src/client/panel-entry.js` 在 `apply` 里先读一次
+      // 本端点，再决定注不注入那两处入口；卡片写回后由同一份进程内副本通知两处
+      // 注册逻辑重新求值。
+      case 'panelEntry.get': {
+        const value: RpcPanelEntryGetResponse = { entry: pool.panelEntry() }
         return { ok: true, value }
       }
 
-      case 'sidebarEntry.setEnabled': {
-        const req = payload as RpcSidebarEntrySetEnabledRequest
+      case 'panelEntry.set': {
+        const req = payload as RpcPanelEntrySetRequest
         // ⚠️ 与 `nativeSearch.setEnabled` 同约定：**不做默认值猜测** ——
-        // 默认成 true 会静默打开用户特意关闭的入口。
-        if (typeof req.enabled !== 'boolean') {
-          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        // 把非法值当成某个合法值会静默改掉用户的入口。校验表用
+        // `PANEL_ENTRY_VALUES`（与 store 的 sanitize 同一份真源），不在这里
+        // 另写一套字面量比较。
+        if (!PANEL_ENTRY_VALUES.includes(req.entry)) {
+          return { ok: false, error: { code: 'bad-request', message: 'entry 必须是 sidebar 或 settings' } }
         }
-        await pool.setSidebarEntryEnabled(req.enabled)
+        await pool.setPanelEntry(req.entry)
         // 不刷新任何缓存：客户端的注册逻辑读的是**同一个**进程内副本，
-        // 写完由客户端自己按返回值（落盘后重读）同步两侧 UI。
+        // 写完由客户端自己按返回值（落盘后重读）同步两处 UI。
         ctx.logger.info(
-          `[jet-hub] ${req.enabled ? '显示' : '隐藏'}主导航侧栏入口`
-          + `${req.enabled ? '' : '（仍可从「设置 → Jet Hub」进入）'}`,
+          req.entry === 'sidebar'
+            ? '[jet-hub] 面板入口：仅侧栏（主导航一行；设置页那一节已注销）'
+            : '[jet-hub] 面板入口：仅设置页（主导航那一行已注销）',
         )
-        const value: RpcSidebarEntrySetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
+        const value: RpcPanelEntrySetResponse = { entry: pool.panelEntry() }
         return { ok: true, value }
       }
 

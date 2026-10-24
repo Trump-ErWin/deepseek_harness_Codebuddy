@@ -13,12 +13,6 @@ import {
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
-import {
-  setSidebarEntry,
-  sidebarEntryReadFailed,
-  sidebarEntryVisible,
-  subscribeSidebarEntry,
-} from './sidebar-entry-store.js';
 import { OpencodeKeyModal, OpencodeProxyModal, GeminiProxyModal, MinimaxIntlProxyModal } from './opencode-proxy-modal.js';
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
 //    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
@@ -8226,45 +8220,11 @@ export function JetHubPage({ rpcCall }) {
 
   React.useEffect(() => { void loadNativeSearchStatus(); }, [loadNativeSearchStatus]);
 
-  /**
-   * 「侧栏」开关：主导航里显不显示 Jet Hub 入口。
-   *
-   * 与上面那个原生搜索开关的两点不同：
-   * 1. 它改的是**客户端自己的槽注册**（`sidebar.panellist` 那一行），立刻生效；
-   * 2. 偏好落盘在**宿主侧**（`sidebarEntry.setEnabled`）—— Web 端 origin 的端口
-   *    每次启动都变，浏览器本地存储留不住（理由见 `sidebar-entry-store.js`）。
-   *
-   * ⚠️ 与 `toggleGateway` 同取向：**不做乐观更新**，宿主回什么就显示什么 ——
-   * 本地先改会让界面显示「已隐藏」而侧栏其实还在。
-   */
-  const [sidebarEntryOn, setSidebarEntryOn] = React.useState(() => sidebarEntryVisible());
-  const [sidebarEntryBusy, setSidebarEntryBusy] = React.useState(false);
-  const [sidebarEntryFailed, setSidebarEntryFailed] = React.useState(() => sidebarEntryReadFailed());
-
-  // 与「侧栏行」共用同一份进程内状态：任何一侧改完，两侧的开关一起更新
-  // （主面板与设置页可能同时挂着两个 JetHubPage 实例）。
-  React.useEffect(() => subscribeSidebarEntry(() => {
-    setSidebarEntryOn(sidebarEntryVisible());
-    setSidebarEntryFailed(sidebarEntryReadFailed());
-  }), []);
-
-  const toggleSidebarEntry = React.useCallback(async (nextEnabled) => {
-    setSidebarEntryBusy(true);
-    try {
-      const value = await setSidebarEntry(rpcCall, nextEnabled);
-      if (!mounted.current) return;
-      setSidebarEntryOn(value);
-      setSidebarEntryFailed(false);
-    } catch (caught) {
-      console.error('[jet-hub] toggle sidebar entry failed:', caught);
-      if (!mounted.current) return;
-      // 保留宿主的实际状态：失败时把开关拉回进程内副本，别停在用户点出来的位置上。
-      setSidebarEntryOn(sidebarEntryVisible());
-      setSidebarEntryFailed(true);
-    } finally {
-      if (mounted.current) setSidebarEntryBusy(false);
-    }
-  }, [rpcCall]);
+  // ⚠️ 页头原有的「侧栏」开关已**整块删除**（2026-10-24）：「面板入口」改由
+  //    **插件详情页**的自有设置卡片（`plugins.bundle.config`）承担，那里是一个
+  //    「仅侧栏 / 仅设置页」下拉。不要加回来 —— 两处控件管同一个偏好会形成
+  //    「一份状态两套判据」，而且页头那个开关只能表达两态、无法承载互斥语义。
+  //    卡片实现见 `plugin-src/client/settings-card.js`。
 
   return React.createElement('section', { className: 'dim-jh-page', 'aria-label': 'Jet Hub Provider 设置' },
     // ⚠️ 页头左侧的「Jet Hub」标题块已**整块删除**（用户 2026-10-07 要求：
@@ -8361,29 +8321,7 @@ export function JetHubPage({ rpcCall }) {
             disabled: nativeSearchBusy,
             onChange: (event) => void toggleNativeSearch(event.target.checked),
           }),
-          React.createElement('span', null, '渠道原生搜索')),
-        // 「侧栏」开关：主导航里显不显示 Jet Hub 入口。
-        //
-        // 语义：开 = 主侧栏多一行「Jet Hub」，点它把本页渲染进中央主面板；
-        // 关 = 那一行消失，进入路径只剩「设置 → 插件 → Jet Hub」（本页仍在）。
-        // 与上面那个原生搜索开关同款外观，刻意并列在页头最右侧。
-        React.createElement('label', {
-          className: 'dim-jh-nativeSearch',
-          title: (sidebarEntryFailed
-            ? '⚠️ 侧栏开关状态读取失败，当前显示的是默认值（显示）。点击即可重新提交一次。'
-            : '侧栏入口：在左侧主导航里显示「Jet Hub」一行，点它直接在中央面板打开本页。'
-              + '关闭后该行消失，仍可从「设置 → 插件 → Jet Hub」进入，不影响任何功能。'),
-        },
-          React.createElement('input', {
-            type: 'checkbox',
-            className: 'dim-jh-switch',
-            checked: sidebarEntryOn,
-            // ⚠️ 与原生搜索开关同一取向：**只**因提交中而禁用；读取失败时不禁用，
-            //    否则一次抖动就让用户失去「点一下重新提交」的自救路径。
-            disabled: sidebarEntryBusy,
-            onChange: (event) => void toggleSidebarEntry(event.target.checked),
-          }),
-          React.createElement('span', null, '侧栏')))),
+          React.createElement('span', null, '渠道原生搜索')))),
     // 签到结果放在页头下方横跨整宽：页头是 flex 且不换行，塞进去会挤压按钮。
     // `flex: none` 是必需的 —— `dim-jh-page` 是 column flex 且 `dim-jh-layout`
     // 带 `flex: 1`，不锁住的话提示条会被压扁（与 modal 内同款做法）。
