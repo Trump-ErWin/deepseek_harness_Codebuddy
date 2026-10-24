@@ -135,7 +135,14 @@ describe('★★ 选号器必须接上 fetchBalanceDetailed（否则锁定时说
     const perProduct: Array<[string, RegExp]> = [
       ['qoderBalanceSelector', qoderDetailed],
       ['qoderCnBalanceSelector', qoderDetailed],
-      ['minimaxIntlBalanceSelector', /fetchMinimaxCreditBalanceDetailed\(credential, fetch, product, pool\.minimaxXff\(\)\)/],
+      // ⚠️ 2026-10-25（上游 `bdccce0` 起）：第二实参不再是裸 `fetch`，而是
+      // **按账号取出口**的 `ctx?.fetchFor?.(ctx.accountId ?? '') ?? fetch` ——
+      // 国际站余额端点也在 `agent.minimax.io` 上，大陆出口恒 307。
+      // 本条职责仍是「**product 作为第三参透传**」（写死 `MINIMAX_INTL` 会让
+      // 国际站余额恒查不到而静默剔除）；「fetchFor 那层真在位」由
+      // `tests/unit/minimax-proxy.spec.ts` 的「credits 表 fetchBalanceDetailed
+      // 按 call.accountId 取出口」**行为级**守着 —— 与上面 Qoder 的注释同一个分工。
+      ['minimaxIntlBalanceSelector', /fetchMinimaxCreditBalanceDetailed\(\s*credential,\s*[\s\S]*?\bproduct,\s*pool\.minimaxXff\(\),?\s*\)/],
       ['autoclawIntlBalanceSelector', /fetchAutoclawBalanceDetailed\(credential, \{ product \}\)/],
       ['astudioBalanceSelector', /fetchAstudioBalanceDetailed\(credential, product === undefined \? \{\} : \{ product \}\)/],
     ]
