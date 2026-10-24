@@ -42,7 +42,7 @@ import {
   type TraeRemoteModel,
 } from './trae.js'
 import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.js'
-import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
+import { classifyTraeError, classifyTraeStreamCode, isRotatableTraeStreamCode, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
 import { traeCooldownFor } from './trae-cooldown-table.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
@@ -205,21 +205,6 @@ class TraeStreamErrorCause extends Error {
     super(message)
     this.name = 'TraeStreamErrorCause'
   }
-}
-
-/**
- * 流内错误是否**值得换号**。
- *
- * 与 HTTP 层共用同一张判据表（{@link classifyTraeError}），避免两处各写一套
- * 而逐渐分叉 —— 这正是本次缺陷的成因（流内分支当年自己写了一套「一律
- * 不可重试」的判据）。
- *
- * 对齐既有类别：`hard-plan`(1005) / `soft-rate`(4011/429) /
- * `quota-exceeded`(4008) 都换号；`4001`（模型不可调用）换号无意义
- * —— 换账号也是同一个模型被拒，故**不换号**，直接如实报错。
- */
-function isRotatableStreamError(code: number): boolean {
-  return code === 1005 || code === 4008 || code === 4011
 }
 
 /**
@@ -1488,9 +1473,16 @@ export class TraeAdapter extends LlmAdapter {
           //
           // ⚠️ 冷却时长必须**按类别**取（2026-10-05 修）：从哨兵错误的
           // `cause` 里取回流内 errorCode，重分类后走与 HTTP 层**同一张**
-          // `traeCooldownFor` 表——quota-exceeded 24h、hard-plan 7d、
-          // soft-rate 1h。旧实现一律 1h 兜底，额度耗尽的账号 1 小时后被
-          // 选回、又 4008（同款缺陷的流内第二实例，见抛出点注释）。
+          // `traeCooldownFor` 表——quota-exceeded 24h、hard-plan 12h、
+          // soft-rate 60s（取值以 `trae-cooldown-table.ts` 为准，别再凭印象写）。
+          // 旧实现一律 1h 兜底，额度耗尽的账号 1 小时后被选回、又 4008
+          // （同款缺陷的流内第二实例，见抛出点注释）。
+          //
+          // ⚠️ 重分类必须走 {@link classifyTraeStreamCode}（**结构化码**入口），
+          // 不能拿 `classifyTraeError` 喂 JSON（2026-10-24 修）：文案表判
+          // `hard-plan` 还要求 `plan` 关键词，而流内 `message` 可能是**空串**
+          // ⇒ 判成 `none` ⇒ 冷却 **0ms** ⇒ 标记写不下去、换号形同虚设
+          // （真实报障：`trae:  (code=1005)`，两个账号同被同一模型拒）。
           if (currentAccountId.length > 0) {
             // ⚠️ instanceof 收窄一次、两个字段都从收窄后的引用取（PR #64 审查 1）：
             // 对 `unknown` 的行内可选链不做窄化，`cause?.message` 会报 TS2339 挡构建。
@@ -1498,7 +1490,7 @@ export class TraeAdapter extends LlmAdapter {
               ? (error as { cause?: TraeStreamErrorCause }).cause
               : undefined
             const kind = streamErr !== undefined
-              ? classifyTraeError(0, JSON.stringify({ code: streamErr.code, message: streamErr.message }))
+              ? classifyTraeStreamCode(streamErr.code, streamErr.message)
               : undefined
             const cooldownMs = kind !== undefined ? traeCooldownFor(kind) : TRAE_RATE_LIMIT_FALLBACK_MS
             await this.options.accountPool.updateModelRateLimit(
@@ -1881,9 +1873,9 @@ export class TraeAdapter extends LlmAdapter {
                   // 已有输出则如实抛真实错误码（绝不重放，防重复计费）。
                   if (ev.errorCode !== undefined && ev.errorMessage !== undefined) {
                     const message = traeStreamErrorMessage(ev.errorCode, ev.errorMessage, options.model)
-                    if (isRotatableStreamError(ev.errorCode) && !gotAnyContent) {
+                    if (isRotatableTraeStreamCode(ev.errorCode) && !gotAnyContent) {
                       // ⚠️ **errorCode 必须随哨兵带出**（2026-10-05 修）：外层标记
-                      // 冷却时长按类别取（quota 24h / soft 1h）。`LlmErrorOptions`
+                      // 冷却时长按类别取（quota 24h / hard-plan 12h / soft 60s）。`LlmErrorOptions`
                       // 是**官方校验契约**（只有 status/providerRetryAfterMs/requestId，
                       // 塞自由字段会被 `LlmError` 构造器拒绝）⇒ 走 `cause` 通道：
                       // Error.cause 本就用于「附加结构化诊断」，把 errorCode 编码进

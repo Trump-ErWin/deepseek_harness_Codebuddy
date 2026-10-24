@@ -1501,6 +1501,80 @@ describe('TRAE 适配器 · 流内错误换号（真实缺陷回归）', () => {
   })
 
   /**
+   * ★★ 2026-10-24 真实报障的**逐字复刻**。
+   *
+   * 现场：上游用 HTTP 200 + SSE `event:error` 下发 `code=1005` 而 **`message`
+   * 为空**（用户看到的是 `trae:  (code=1005)`，冒号后**两个空格**）。
+   *
+   * ⚠️ 上面那条 1005 用例的 `message` 里**恰好含 `plan` 字样**，于是文案表的
+   * 第二腿被满足、判成 `hard-plan(12h)` —— **0ms 冷却那条路径从未被走到**，
+   * 这正是该缺陷能长期潜伏的原因。本用例把 `message` 置空。
+   */
+  it('★★ 流内 event:error 1005 且 message 为空 ⇒ 冷却 12h（旧实现是 0ms）', async () => {
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: vi.fn(async () => ({
+        entry: { id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_2' },
+        credential: makeCredential({ access_token: 'AT2' }),
+      })),
+    }
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        // 逐字复刻报障现场：message 为空字符串（不是省略字段）
+        sseResponse(soloSse(['error', { code: 1005, message: '' }])),
+        sseResponse(soloSse(
+          ['output', { response: '从第二个账号返回' }],
+          ['done', { finish_reason: 'stop' }],
+        )),
+      ],
+    })
+
+    const chunks = await collect(adapter, BASIC_OPTIONS)
+
+    // 枢轴断言：仍要真的换号重发（换号本身没坏，坏的是退避时长）
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    const markCall = vi.mocked(pool.updateModelRateLimit).mock.calls[0]
+    expect(markCall[0]).toBe('trae-1')
+    const cooldown = markCall[2] - Date.now()
+    // ⚠️ 0ms 会让坏号在下一次选号时**立刻又被选回**（换号形同虚设，用户看到
+    //    的正是「轮换好像不行」）。反向验证：把实现改回 classifyTraeError
+    //    喂 JSON 时，这里的差值退化成 ~0 ⇒ 本断言变红。
+    expect(cooldown).toBeGreaterThan(11 * 3_600_000)
+    expect(cooldown).toBeLessThanOrEqual(12 * 3_600_000)
+  })
+
+  /**
+   * ★ 用户**实际看到的那行字**（截图与宿主日志都是这一行）。
+   *
+   * 全部账号被同一模型拒时，外层如实抛流内错误、带硬编码的 `QUOTA_EXCEEDED`
+   * —— 用户据此以为「额度用完了」，而真实成因是**该模型不被这个账号的套餐
+   * 接受**（1005 = Plan 权益不足）。文案与码都锁住，避免以后悄悄改成别的说法。
+   */
+  it('★ 全部账号被同一模型拒时的报错与用户所见一致（trae:  (code=1005)）', async () => {
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      // 池里没有其它可用账号
+      getAvailableAccount: vi.fn(async () => null),
+    }
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [sseResponse(soloSse(['error', { code: 1005, message: '' }]))],
+    })
+
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(Error)
+    // 冒号后**两个**空格：`message` 为空串被原样插进模板
+    expect((error as Error).message).toBe('trae:  (code=1005)')
+    expect((error as { code?: string }).code).toBe('QUOTA_EXCEEDED')
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  })
+
+  /**
    * ⚠️ **安全边界**：已经产出正文后**绝不重发**。
    *
    * 重放会让上游**重复计费**，并且若已发出工具调用还会**重复执行工具**。

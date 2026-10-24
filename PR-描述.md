@@ -1,195 +1,164 @@
-# PR：MiniMax Code **国际版**渠道 + MiniMax 请求的**传输级重试**
+# PR：TRAE 流内 `event:error` 改走**结构化码**分类 —— 修 `1005` 被判成 `none` ⇒ 冷却 **0ms** ⇒ 换号形同虚设
 
-一个功能 + 一个健壮性修复，合并为**单个提交**，便于一次性审阅：
+单提交：
 
 ```
-feat(minimax): 新增国际站渠道（双站点共用实现）+ 传输级重试
+fix(trae): 流内 event:error 改走结构化码分类，修 1005 冷却为 0ms
 ```
 
 ---
 
 ## 一、为什么做
 
-原 `minimax` 渠道只覆盖 **MiniMax Code 中国版**（`agent.minimax.cn`）。而 MiniMax Code
-**国际版是独立的账号体系与独立的 API 主机**（`agent.minimax.io`），且国际站同样有
-「每日签到送积分」的活动 —— 也就是说，只用中国版会**少一个可用渠道、也少一份每日积分**。
+### 报障现场（2026-10-24，本机宿主）
 
-本 PR 把国际版作为**并列渠道**加上。
+用户界面上只有一行：
 
-### ⚠️ 关键设计决策（请重点审阅）：为什么用**两个 provider id**，而不是
-「单 id + 站点落在凭据里」
+```
+trae:  (code=1005)      ← 冒号后是两个空格（message 为空串）
+```
 
-需求沟通过程中我先做过「同 id」方案，被否掉，最终确认走**双 id**。理由是**实测的**，
-不是偏好：
+右侧徽章 `QUOTA_EXCEEDED`，标题「本轮运行失败」。同一时刻宿主日志里有两条成对记录
+（`~/.dsh/logs/desktop-next-*.jsonl`，`time` 为 UTC）：
 
-1. **模型目录按 provider 缓存一份**。单 id 下两个站点会**争用同一份目录缓存**，
-   于是另一站的模型要么进不了列表、要么被静默回退成本站模型；
-2. **且 MiniMax 对不存在的模型名回 `HTTP 200` + 静默回退**（不是报错）——
-   这意味着「回退错了」在界面上**完全看不出来**，用户会在国际站面板里看到中国站的
-   模型名并以为可用。
+```
+agent.failed   error.message = "trae:  (code=****"        ← 日志脱敏，数字被打码
+[jet-hub] 已记录限流: 账号 <trae-号-1> 模型 kimi-k3.1-pro 重置于 <与失败同一秒>
+[jet-hub] 已记录限流: 账号 <trae-号-2> 模型 kimi-k3.1-pro 重置于 <与失败同一秒>
+```
 
-⇒ 两个站点必须是两个 provider id：`minimax`（中国版，原有）、`minimaxintl`（国际版，新增）。
-它们**共用同一套实现**（同一个适配器类、同一套 OAuth、同一套积分逻辑），
-差异**全部**收敛在 `src/minimax-product.ts` 的一份产品常量里（只差 6 个字段：
-`id` / `displayName` / `accountHost` / `apiHost` / `region` / `defaultCredentialRef`）。
+⚠️ **那两行「重置于」的时间戳就是失败发生的**同一秒** —— 也就是说限流标记写在了
+**过去**，等于**没有退避**：下一次选号**立刻又选回同一个号**，两个账号都被同一模型
+拒后如实抛错。用户看到的是「轮换好像不行」，实际机制是**冷却时长取到了 0**。
+
+### 机制（一句话）
+
+上游用 **HTTP 200 + SSE `event:error`** 下发 `code=1005`，而同一个事件里的
+**`message` 是空串**。换号循环里把 `{ code, message }` 序列化成 JSON 去喂
+**文案表** `classifyTraeError`：
+
+```ts
+// 旧实现（src/trae-adapter.ts 换号循环）
+classifyTraeError(0, JSON.stringify({ code: streamErr.code, message: streamErr.message }))
+```
+
+而文案表的 `hard-plan` 判定**还要求 `plan` 关键词**（对齐 Go 端 `Classify`，且被
+`tests/unit/trae-errors.spec.ts` 显式锁死）：
+
+```ts
+// src/trae-errors.ts PLAN_LIMIT_MARKERS
+if (body.includes(marker) && (body.includes('plan') || lower.includes('plan'))) return 'hard-plan'
+```
+
+`{"code":1005,"message":""}` 里**没有 `plan` 字样** ⇒ 落到最后一行 => `'none'` ⇒
+`traeCooldownFor('none')` = **0ms**。
+
+### ⚠️ 关键设计决策（请重点审阅）：**不改** `classifyTraeError`，另开一个入口
+
+直觉的修法是「把 1005 从文案表里解放出来」。**本 PR 刻意不这么做**，两条理由都是
+仓库里已有的教训：
+
+1. **那条限制是有理由的，而且已被用例锁死**：`tests/unit/trae-errors.spec.ts` 明确断言
+   `classifyTraeError(400, '{"code":1005}') === 'client'`，注释写着「避免把无关的
+   code 1005 误判成权益不足」。改文案表会打红它，且违背其意图。
+2. **同仓 `zcode-adapter.ts` 的裸子串判据就是这么翻车的**：`body.includes('1005')`
+   会命中边缘页里的 `<title>1005</title>` / `width:1005px`，**实测把两个完全可用的
+   账号换掉并封到次日**（见其行内注释）。
+
+⇒ 两个入口的**输入类型不同**，可信度也不同，故分开：
+
+| 入口 | 输入 | 判据 |
+|---|---|---|
+| `classifyTraeError`（HTTP 层，既有） | **响应体原文** | 子串匹配；`hard-plan` 还要求 `plan` 关键词 |
+| `classifyTraeStreamCode`（流内 `event:error`，新增） | **上游下发的枚举码** | 码**就是**证据，不要求 `plan`；表外码回落文案表 |
 
 ---
 
 ## 二、做了什么
 
-### 1. 新增国际站渠道 `minimaxintl`
+### 接线点清单
 
-`src/minimax-product.ts` 新增 `MINIMAX_INTL` 常量：
-
-| 字段 | 中国版 `minimax` | 国际版 `minimaxintl` |
+| # | 文件 | 改动 |
 |---|---|---|
-| `accountHost` | `account.minimax.cn` | **`account.minimax.io`** |
-| `apiHost` | `agent.minimax.cn` | **`agent.minimax.io`** |
-| `region` | `cn` | **`en`** |
-| `defaultCredentialRef` | `MINIMAX_ACCESS_TOKEN` | **`MINIMAXINTL_ACCESS_TOKEN`** |
-| 显示名 | `MiniMax Code (中国版)` | `MiniMax Code (国际版)` |
+| 1 | `src/trae-errors.ts` | 新增 `TRAE_STREAM_ERROR_KINDS`（**唯一一份**码→类别表）+ `classifyTraeStreamCode(code, message = '')` + `isRotatableTraeStreamCode(code)`（L135-199）；文件头新增「## 两个入口，别混用」节 |
+| 2 | `src/trae-adapter.ts:1493` | 换号循环的**重分类**改为 `classifyTraeStreamCode(streamErr.code, streamErr.message)` |
+| 3 | `src/trae-adapter.ts:1876` | 抛出点的可换号判据改用 `isRotatableTraeStreamCode(ev.errorCode)` |
+| 4 | `src/trae-adapter.ts` | **删除**本地 `function isRotatableStreamError(code)`（原 1005/4008/4011 硬编码一份）—— 现在「可换号集合」与「类别表」是**同一张表**，不会再漂移 |
+| 5 | `src/trae-adapter.ts:1476-1489`、`:1878` | 更正**陈旧注释**：原文写「quota-exceeded 24h、hard-plan **7d**、soft-rate **1h**」，与 `trae-cooldown-table.ts` **逐格不符**（实为 12h / 60s），并注明取值以冷却表为准 |
+| 6 | `docs/agent-notes/providers-trae.md` | 新增一节，登记机制、码表、潜伏原因、未修项 |
+| 7 | `tests/unit/trae-errors.spec.ts` +6 条 · `tests/unit/trae-adapter.spec.ts` +2 条 | 见下 |
 
-（账号凭据实际落在 `MINIMAX_ACCOUNT_*` / `MINIMAXINTL_ACCOUNT_*`，
-上面的 `defaultCredentialRef` 只是单凭据时代的兼容缺省值。）
+码表（`TRAE_STREAM_ERROR_KINDS`）：
 
-⚠️ **两个站点的账号不互通、API 主机也不同**（均已实测：跨站互打一律 401），
-故它们是**两个独立面板** —— 各自在自己的面板里点「+ 新建账号」即可，**无需选择站点**。
+| 流内码 | 类别 | 冷却 | 依据 |
+|---|---|---|---|
+| `1005` | `hard-plan` | 12h | 与 `src/trae-credits.ts` 的 `200 + code === 1005 ⇒ PlanLimit(12h)` **同值**（那里同样**不要求** `plan` 关键词） |
+| `4008` | `quota-exceeded` | 24h | 既有定义（`ide_credits` 日配额） |
+| `4011` | `soft-rate` | 60s | 既有定义（频率超限） |
 
-### 2. ⚠️⚠️ 两站共用实现的**代价：一串接线点必须逐个到位**（请重点审阅）
+`4001`（模型不可调用）与 `4006`（载荷超限）**刻意不在表内** ⇒ 不换号：前者换账号也是
+同一个模型被拒，后者另有专用出口（`streamErrorCode` ⇒ `CONTEXT_WINDOW_EXCEEDED`）。
 
-这是本 PR **最容易出错的地方**，也是需求里明确的告警点：
+### 刻意的「不改」（避免审阅时误以为漏了）
 
-> 两站共用适配器类 ⇒ `probeById` / `WRITES_RATE_LIMIT_PROVIDERS` / `SELF_HEAL` /
-> ref 前缀表 / 积分表**每处都要两站到位**，漏一处**静默失效**。
-
-本 PR 逐处补齐（**7 个宿主侧文件 + 2 个客户端文件**）：
-
-| 接线点 | 文件 | 漏掉的症状 |
-|---|---|---|
-| 渠道声明 | `src/provider-registry.ts` | 面板**根本不出现** |
-| 探测（「重测」按钮） | `src/index.ts` 的 `probeById` | ⚠️ 用**错误的主机**发探测 ⇒ 必然 401 ⇒ 限流标记**永远清不掉** |
-| 适配器实例 + 续期目标 + `auths` 对象 | `src/index.ts` | 渠道不可推理 / 账号不自愈 |
-| 自愈续期清单 + auth 接口 | `src/jet-hub-rpc.ts` | 过期账号在积分端点**永不自愈**（报「未登录」而上游只需一次 refresh），且**日志零字** |
-| 凭据 ref 前缀表 | `src/jet-hub-store.ts` | 凭据读不出 / 归属错站 |
-| 积分能力表 | `src/provider-credits.ts` | 积分行不显示 |
-| 聚合参与渠道清单 | `src/aggregate-adapter.ts` | 它的模型**永不进聚合目录、静默不可见** |
-| 客户端图标 | `plugin-src/client/provider-icons.js` | 图标缺失 |
-| 客户端样式 | `plugin-src/client/jet-hub-styles.js` | 样式不生效 |
-
-⚠️ 这些**都不是「看起来像坏了」的失败，而是静默失效**（界面缺项或功能不工作、
-没有任何报错），故本 PR 的用例对它们**逐键点名**（见下「测试」）。
-
-📌 **一处刻意的「不改」**：`src/provider-runtime.ts` **不需要**为国际版加条目 ——
-它从 `PROVIDER_REGISTRY` 派生。加一份反而是多余的第二份真源。
-
-### 3. 传输级重试（`fetch failed` 的真实缺陷）
-
-**报障现象**：「模型连接测试失败，显示 `fetch failed`」「积分查询及领取失败」。
-
-**本机取证**（同一凭据、同一端点、连打 10 次）：
-
-```
-签到 (signin/status): 成功 5/10 —— 失败全是
-  fetch failed ← self-signed certificate in certificate chain [SELF_SIGNED_CERT_IN_CHAIN]
-目录 (models)       : 成功 10/10
-```
-
-⇒ 环境里的 **HTTPS 检查代理**（企业 / 杀软 / 代理软件的 MITM 证书）约 **50%** 概率
-打断到本家的请求。**这是环境问题，但症状落在插件上**：一次偶发中断 = 整轮请求失败。
-
-**修法**：`src/minimax.ts` 新增 `minimaxFetchWithRetry` + `isMinimaxTransportError`，
-**三处共用同一份**（不各写一份 —— 同义判据分两处必然漂移）：
-
-- 推理（`src/minimax-adapter.ts` 的 `send()`）
-- 目录（`src/minimax-auth.ts` 的 `fetchRawModels`）
-- 签到 / 积分（`src/minimax-credits.ts` 的 `requestEnvelope`）
-
-**效果实测**：裸 `fetch` **5/10** → 走本函数（插件真实代码路径）**10/10**。
-
-**四条边界**（每条都做了变异验证，见下）：
-
-1. **只重试传输错误，绝不重试 HTTP 状态错误** —— 4xx/5xx 是服务端的**明确答复**
-   （401 要续期、402 要充值、429 要冷却），重发只会原样失败且掩盖真因；
-2. **abort 绝不重试** —— 用户点了停止还继续发是**不可接受**的行为；
-3. **真因在 `cause` 里** —— undici 把底层错误包成一句 `TypeError: fetch failed`，
-   判据必须**沿 `cause` 链**找；只读 `message` 会漏掉
-   `SELF_SIGNED_CERT_IN_CHAIN` / `UND_ERR_*` / `ECONNRESET`
-   （变异验证：改成只读 `message` ⇒ **4 条用例变红**）；
-4. **重试耗尽时抛最后一次的原错误对象** —— 保住 `cause` 链，真因仍可见
-   （换成自定义文案会让用户再也看不到「自签证书」这类唯一出路）。
+1. **`classifyTraeError` 的文案表一字未动**（理由见上）；
+2. **`streamErrorCode(code)` 的 harness 归码表未动**（4006→`CONTEXT_WINDOW_EXCEEDED`、
+   1005/4008→`QUOTA_EXCEEDED`、其余 `SERVER`）—— 那是**给 harness 看的**码，与本次
+   「该不该换号、冷却多久」是两件事；
+3. **L1480 / L1521 的 `throw new LlmError(error.message, 'QUOTA_EXCEEDED')` 未动** ——
+   该码是硬编码的既有形态，改它属于**面向用户语义**的变更（1005 的真实含义是「该模型
+   不被这个账号的套餐接受」而非「额度用完」），本次只在用例里把它**锁住**，另开 PR 更清楚；
+4. ⚠️ **已登记未修**：流内分支**没有** HTTP 层那条 `recordsTraeRateLimit(kind)` 守卫
+   （HTTP 层不记 `server`/`client` 的标记，流内会记）。本次不动 —— 能走到该分支的码
+   全部来自 `TRAE_STREAM_ERROR_KINDS`、三类都该记，加守卫属**行为变更**。
 
 ---
 
-## 三、真机验证（国际版可用性）
+## 三、真机取证（本次报障的现场）
 
-⚠️ 提 PR 前必须说清一件事：**中途我曾把一次上游故障窗口误判为「国际站要求网关签名、
-不可用」**，并据此写下过错误结论。该结论**已被证伪**，原因与教训已写进
-`docs/agent-notes/providers-loomy-raccoon-minimax.md`：
-
-> 决定性证据是**官方客户端自己也连不上**（`Code: 50112` = 官方 mcode 的
-> `LLM_AUTH_ERROR` 枚举），且探针抓到的官方推理请求头**也只有 `Authorization: Bearer`**
-> —— 与本插件实现逐字相同。故障恢复后，同样的请求**全部 200**。
-
-改用真实国际站账号逐端点实测的结果：
-
-| 端点 | 结果 |
+| 证据 | 内容 |
 |---|---|
-| `POST /mavis/api/v1/llm/v1/messages`（推理） | ✅ **200 + 真实 SSE**（认证只需 `Authorization: Bearer`） |
-| `GET /minimax-cloud/api/v1/signin/status`（签到） | ✅ **200**（真实签到面板） |
-| `GET /minimax-cloud/api/v1/credit/details`（积分） | ✅ **200**（真实余额） |
-| `GET /mavis/api/v1/models?region=en&buildEnv=prod`（目录） | ✅ **200**（4 个模型） |
+| 宿主日志 `agent.failed` | `error.message = "trae:  (code=****"`（脱敏），两个失败会话各一条 |
+| 同秒 jet-hub 限流记录 | `账号 <id> 模型 kimi-k3.1-pro 重置于 <失败同一秒>` ×2（**这正是 0ms 的直接证据**） |
+| 状态文件 `~/.dsh/jet-hub/state.json` | 两个 trae 账号的 `kimi-k3.1-pro` 标记值 = 失败那一刻的毫秒时间戳（**不是** +12h） |
+| 上游形态 | HTTP **200** + SSE `event:error`，`code=1005`、`message` **空串** |
 
-⇒ 国际站与国内站**协议同形**，「两站只差 6 个字段、共用实现」成立。
-
-⚠️ **但有一条判据必须记牢**：国际站的**目录端点当前是公开的**（无 token、垃圾 token
-都返回 200，与国内站不同）⇒ **「能看到模型列表」不构成凭据有效的证据**。
-凭据证据看**签到 / 积分 / 推理**三处。本 PR 的 e2e 探针把这一条写成了显式告警。
+⚠️ **诚实说明**：修复后的**同一路径真机复现未主动触发** —— 再打一次上游 1005 会让两个
+账号在该模型上进入 **12h 冷却**（这正是修复的正确行为，但不是本次应当替用户决定的
+副作用）。故本 PR 的判别力来自下面**变异验证过**的单元用例，而不是真机复跑。
 
 ---
 
 ## 四、测试
 
-### 新增单测（37 条）
+### 新增（8 条）
 
 | 文件 | 条数 | 覆盖 |
 |---|---|---|
-| `tests/unit/minimax-intl.spec.ts` | 23 | 两站产品常量差异（含「除 6 个字段外逐字段相同」）、ref 前缀反查（含**超串前缀**经典坑）、登录 / 续期 / 目录 / 积分 / 推理**各自打对主机**、跨站实例隔离（「各刷各的实例」） |
-| `tests/unit/minimax-transport-retry.spec.ts` | 14 | 重试策略与**四条边界**（含 3 条反向断言：非传输错误不重试 / abort 不重试 / 认 `cause` 链） |
+| `tests/unit/trae-errors.spec.ts` | 6 | 空 `message` 的 1005 ⇒ `hard-plan`（含 `message` 缺省）；**1005 的冷却必须是 12h**；4008/4011 与冷却表逐格对齐；表外码回落文案表（含「不得凭空升级成权益不足」）；`4001`/`4006` 刻意不换号；**换号判据与类别表同源** |
+| `tests/unit/trae-adapter.spec.ts` | 2 | ★★ 逐字复刻报障形状（`message: ''`）⇒ 仍换号**且**冷却 ∈ (11h, 12h]；★ 全部账号被拒时的报错文案与用户所见一致（`trae:  (code=1005)`，冒号后**两个空格**）与码 `QUOTA_EXCEEDED` |
 
-### 扩展既有守卫（18 个文件，逐键点名国际版）
+### ⚠️ 既有用例为什么没抓到（本 PR 的叙事要点）
 
-⚠️ 光加新用例**守不住**上面那张接线表 —— 那些守卫是**既有的**「逐 provider 点名」
-型用例，本 PR 把国际版**加进它们的期望集合**：
+既有回归用例的夹具是：
 
-`provider-registry` / `provider-registry-consumers` / `provider-runtime-wiring` /
-`refresh-bootstrap-wiring` / `jet-hub-rpc-auth-wiring` / `jet-hub-rpc-signature` /
-`credits-runtime-parity` / `claim-runtime-parity` / `credits-balance-self-heal` /
-`model-catalog-parity` / `credential-resolver` / `minimax-adapter` / `minimax-rpc` /
-`buddy-ratelimit-misreport` / `lobsterai-rpc-dispatch` / `zcode-wiring`
-＋ 两个 helper（`tests/helpers/provider-sets.ts` / `rpc-refresh.ts`）。
+```ts
+{ code: 1005, message: 'plan 权益不足' }     // tests/unit/trae-adapter.spec.ts:1491
+```
 
-**判别力说明**：这些用例的期望集合**从 `PROVIDER_REGISTRY` 派生或逐键枚举** ——
-少加一站的登记，它们会**变红**（这正是它们存在的意义）。本 PR 只改期望值、
-不改被测源码，故「全绿」在这里是**有意义的**（不是把断言放宽换来的）。
-
-### 新增 e2e 探针（有闸门，默认跳过）
-
-| 文件 | 说明 |
-|---|---|
-| `tests/e2e/minimaxintl-probe.e2e.spec.ts` | **只读**：目录 + 签到状态 + 积分余额（**不领取**） |
-| `tests/e2e/minimaxintl-claim-probe.e2e.spec.ts` | 真实领取签到积分（状态先行，已领则跳过，不白烧当天机会） |
-
-⚠️ 两个探针**刻意不硬断言**「恰好 4 个模型」：国际站远端模型集与国内站不同，
-硬断言会在上游调整模型时假红；判据只到「请求发出去了、并拿到了可解读的响应」，
-实际内容**打印**给人核对。
+那个 `plan` **恰好**满足了文案表的第二腿 ⇒ 判 `hard-plan(12h)` ⇒ **0ms 那条路径
+一次都没被走到**。新用例把 `message` 置空，逐字复刻现场。（原用例**保留未改** ——
+它守的是另一件事：1005 也必须换号。）
 
 ### 反向验证（变异必须变红）
 
-| 变异 | 结果 |
+| 变异（锚点已自证存在） | 结果 |
 |---|---|
-| 去掉「只重试传输错误」闸门 | 1 条变红 |
-| 删掉 abort 判断 | 1 条变红 |
-| 判据改为只读顶层 `message`（不走 `cause` 链） | **4 条变红** |
+| 把换号循环改回 `classifyTraeError(0, JSON.stringify({ code, message }))` | **1 条变红**：`AssertionError: expected 0 to be greater than 39600000`（`tests/unit/trae-adapter.spec.ts` 的新用例） |
+| 把 `1005` 从 `TRAE_STREAM_ERROR_KINDS` 删掉 | **4 条变红**（`tests/unit/trae-errors.spec.ts`） |
+
+两次变异均在 `finally` 里还原，**还原后文件哈希与变异前逐字节一致**
+（`src/trae-adapter.ts` `56CAA23D…`、`src/trae-errors.ts` `EFDCE7C5…`）。
 
 ---
 
@@ -198,20 +167,21 @@ feat(minimax): 新增国际站渠道（双站点共用实现）+ 传输级重试
 | 项 | 结果 |
 |---|---|
 | `tsc -p tsconfig.json --noEmit` | 通过 |
-| `tsc -p tsconfig.tests.json` | 通过 |
-| `pnpm test` 全量 | **8401 passed / 0 failed / 21 skipped** |
-| 国际版 e2e 探针（真机） | **4/4 通过** |
-| `pnpm build:all`（tsc + copy-assets + client 打包） | 通过 |
+| `tsc -p tsconfig.tests.json`（`pnpm test` 的 pretest） | 通过 |
+| `pnpm test` 全量 | **10578 passed / 1 failed / 18 skipped**（10597） |
+| `pnpm build:all` | 通过 |
+| e2e 探针 | 未跑：本次没有新增网络路径，按仓库规矩 e2e 默认跳过 |
 
-⚠️ 全量测试的 `21 skipped` 是本仓库**既有的**按 provider 分列的 e2e 闸门（默认跳过），
-不是本 PR 引入的。
+⚠️ **那 1 条失败与本次改动无关，且不是本 PR 引入的**：
+`tests/unit/jet-hub-styles-ownership.spec.ts:469`（客户端样式归属）。取证方式：把工作区
+**清空到 HEAD**（`git stash`）后单独复跑该文件，**同样 1 failed / 14 passed** ⇒ 属
+**既有的**、与本机环境（Node v24.21.0）相关的失败。本 PR 的四个改动文件与该用例无关。
 
 ---
 
 ## 六、说明
 
-- 本 PR 基于最新的 `origin/master`（已合并全部 13 个上游提交，无冲突遗留）。
-- 不含任何本机路径、用户名、凭据或 token —— 文档里出现的 `~/.minimax/auth/...`
-  一类均为**通用 Home 相对路径**。
-- `docs/agent-notes/providers-loomy-raccoon-minimax.md` 里同时登记了
-  本次的**误判与教训**（上面第三节），供后来者不要再走同一条弯路。
+- 基于最新 `origin/master`（`e8d14c6`）拉分支，**单个提交**。
+- 不含任何本机路径、用户名、凭据或 token —— 上面出现的宿主日志摘录里，
+  账号 id 一律写成 `<id>`，且**上游错误码是公开协议字段、非隐私**。
+- 回写 `docs/agent-notes/providers-trae.md`（新发现 + 未修项登记）。
