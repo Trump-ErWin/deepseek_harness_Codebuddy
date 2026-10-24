@@ -37,6 +37,11 @@
 import * as React from 'react';
 
 import { JetHubPage } from './jet-hub.js';
+// ⚠️ 2026-10-22 整页白屏事故的结构性补强（PR #10）：本文件注册的**两处槽位**
+//    都直接渲染 `JetHubPage`，任一渲染期异常都会被 React 当成「整棵树出错」而
+//    卸载整棵设置页/主面板（用户症状：「页面直接清空、切页无效、只能重启」）。
+//    故两个入口都必须注册**包了边界的**组件，见 `error-boundary.js` 的文件头。
+import { withErrorBoundary } from './error-boundary.js';
 import {
   JET_HUB_PANEL_KEY,
   JET_HUB_SIDEBAR_ORDER,
@@ -45,6 +50,22 @@ import {
   panelEntryShowsSidebar,
   subscribePanelEntry,
 } from './panel-entry-store.js';
+
+/**
+ * `settings.section`（设置弹层那一节）里渲染的 `JetHubPage`。
+ *
+ * ⚠️ **模块级常量**而不是每次注册时新建：组件身份必须稳定。槽位每次重渲染若拿到
+ * 一个新组件类型，React 会卸载重挂整棵子树（页面里所有本地状态丢失）。
+ */
+const JetHubPageForSettings = withErrorBoundary(JetHubPage, { label: 'Jet Hub 设置页' });
+
+/**
+ * `main` 槽（中央主面板）里渲染的 `JetHubPage`。
+ *
+ * ⚠️ 与设置页那条**分开两个常量**：`withErrorBoundary` 的 `label` 要能区分
+ * 「哪块坏了」（fallback 文案直接读它），而组件身份仍各自稳定。
+ */
+const JetHubPageForMain = withErrorBoundary(JetHubPage, { label: 'Jet Hub 面板' });
 
 /**
  * 侧栏行的图标：六边形环 + 中心点。
@@ -94,7 +115,7 @@ export function JetHubMainPanel({ rpcCall }) {
   return React.createElement(
     'div',
     { className: 'dim-jh-panelHost', 'data-plugin': 'dsh-providers-hub' },
-    React.createElement(JetHubPage, { rpcCall }),
+    React.createElement(JetHubPageForMain, { rpcCall }),
   );
 }
 
@@ -240,7 +261,7 @@ export function registerJetHubPanelEntries(ctx, rpcCall) {
           order: 50,
           label: () => 'Jet Hub',
           inject: () => ({ rpcCall }),
-        }, JetHubPage);
+        }, JetHubPageForSettings);
         return;
       }
       if (!visible && stopSection !== undefined) {
