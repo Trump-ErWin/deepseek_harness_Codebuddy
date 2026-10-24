@@ -50,6 +50,7 @@ import {
 import { ZCODE, type ZcodeProduct, type ZcodeRemoteModelLike } from './zcode-product.js'
 import type { ZcodeClaimablePlan } from './zcode-upstream.js'
 import {
+  BrowserStartupError,
   ZcodeCaptchaBrowser,
   ZCODE_CAPTCHA_FALLBACK,
   validateCaptchaParam,
@@ -1079,6 +1080,22 @@ export class ZcodeAuth extends Service {
           return outcome.param
         } catch (error) {
           this.captchaStats.failed += 1
+          /**
+           * ★★ **启动期失败不记账**（Gitee issue IKQ4JN）。
+           *
+           * 「找不到浏览器 / 起不来 / 起来就退」是本机**部署**问题 —— 重试一万次
+           * 也不会好，把设备信誉的退避套在它头上只会得到两条错误结论：
+           *
+           * 1. 用户第二次点击看到的是「设备信誉不足，继续重试只会让信誉更差」，
+           *    而真因是「你还没装 chromium」。实测连点 3 次后第 4 次起只剩冷却文案。
+           * 2. 那条唯一可执行的出路（装浏览器 / 设 `ZCODE_CHROME_PATH`）被冷却闸门盖住。
+           *
+           * 判据用**类型**而不是文案（文案随时会改，且 i18n 风险高）。
+           * 归因纪律见 `captcha-backoff.ts` 文件头那条「不要混淆归因」。
+           */
+          if (error instanceof BrowserStartupError) {
+            throw error
+          }
           const until = this.captchaBackoff.noteFailure()
           if (until > 0) {
             this.ctx.logger?.warn?.(

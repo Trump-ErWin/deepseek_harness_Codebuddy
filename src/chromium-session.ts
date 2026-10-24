@@ -33,7 +33,35 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
-import { basename, isAbsolute, join, posix } from 'node:path'
+import { basename, dirname, isAbsolute, join, posix } from 'node:path'
+
+/**
+ * **启动期**失败：找不到浏览器 / 起不来（`ENOENT` `EACCES` `EPERM`）/ 起来就退。
+ *
+ * ## 为什么需要单独一个类型（Gitee issue IKQ4JN）
+ *
+ * 这三种失败与「captcha 产不出来」**归因完全不同**：
+ *
+ * | 失败 | 归因 | 重试有用吗 |
+ * |---|---|---|
+ * | 浏览器**没装** / 路径不对 | 本机**部署**问题（要用户装个 chromium 或设 `ZCODE_CHROME_PATH`） | ❌ 一万次也不会好 |
+ * | 浏览器起来就退（壳程序/权限/自更新） | 同上 | ❌ |
+ * | 页面跑起来但 SDK 回 `F001` / 超时 / 降级产物 | 本机产出能力 / 设备信誉 | ⚠ 冷却后可能 |
+ *
+ * 而 `captcha-backoff.ts` 的退避只该管**最后一行**：把前两种也记进去，
+ * 用户会看到「设备信誉不足，继续重试只会让信誉更差」这种**方向相反**的结论，
+ * 而且那条唯一可执行的出路（去装浏览器）被冷却闸门整个盖住。
+ * 实测：连点 3 次后第 4 次起就只能看到冷却文案。
+ *
+ * ⇒ 用类型把它分出来，由调用方（`zcode-auth.ts`）**跳过记账**。
+ * 文案逐字不变（既有回归用例断言的就是那些字），只多挂一个类型。
+ */
+export class BrowserStartupError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BrowserStartupError'
+  }
+}
 
 /**
  * macOS 的浏览器包名 → 包内可执行文件名。
@@ -48,6 +76,71 @@ const MAC_BROWSER_BUNDLES: ReadonlyArray<readonly [bundle: string, exe: string]>
   ['Brave Browser.app', 'Brave Browser'],
 ]
 
+/**
+ * 从 PATH 反推 **scoop 的根目录**（Gitee issue IKQ4JN）。
+ *
+ * ## 为什么必须多这一档
+ *
+ * Windows 候选链取 scoop 根的位置只有两处：`$SCOOP` / `$SCOOP_GLOBAL`（用户显式声明）
+ * 与硬编码的 `~/scoop`。而 **scoop 装在非默认根、且没有设 `SCOOP`** 是完全正常的形态
+ * （实测：`root_path` 在 `<root>\config.json` 里，环境变量为空）——
+ * 那两个来源于是同时落空，用户装了 chromium 也探测不到，captcha 产出恒失败：
+ *
+ * ```
+ * zcode: 找不到可用的浏览器（用于产出阿里云 captcha）。
+ * 已尝试 scoop chromium / Chrome / Chromium / Edge；可用 ZCODE_CHROME_PATH 显式指定 chrome.exe 路径。
+ * ```
+ *
+ * ## 为什么用 PATH，而不是读 scoop 的 config.json
+ *
+ * 配置文件的**位置本身就取决于根**：便携布局在 `<root>\config.json`，
+ * 常规布局在 `~/.config/scoop/config.json`（scoop 的 `core.ps1` 按
+ * `XDG_CONFIG_HOME` → `%USERPROFILE%\.config` → portable 复位的顺序找）。
+ * 要读它得先猜根，等于循环论证。而 **`<root>\shims` 一定在 PATH 里**
+ * （否则 `scoop` 命令都用不了），它就是根的直接证据。
+ *
+ * ## 判据（两个条件缺一不可）
+ *
+ * 1. 目录名是 `shims`；
+ * 2. 该目录里**确实有 scoop 自己的 shim**（`scoop.cmd` / `scoop.ps1`）。
+ *
+ * 第 2 条不能省：别的工具也会建 `shims` 目录（实测本机 PATH 里就有
+ * `persist\uv\tools\shims`、`persist\uv\python\shims`），只认名字会拼出
+ * `…\uv\tools\apps\chromium\current\chrome.exe` 这种必然不存在的候选 ——
+ * 无害但会污染「已尝试」的诊断列表。
+ *
+ * ⚠ 顺序按 PATH 原序：PATH 里靠前的 scoop 根优先，与「显式声明优先」同源。
+ */
+export function scoopRootFromPath(
+  env: Record<string, string | undefined>,
+): string | undefined {
+  /**
+   * ⚠ 取 PATH 的方式在 Windows 上**大小写不敏感**（实测 `process.env.PATH` 与
+   * `process.env.Path` 是同一个值），但注入的 env 字典不保证 —— 两者都看，
+   * 且按 PATH 原序处理（不要合并成两份去重，那会打乱优先级）。
+   */
+  const pathValue = env.PATH ?? env.Path
+  if (typeof pathValue !== 'string' || pathValue.length === 0) return undefined
+  /**
+   * ⚠ 分隔符只按 `;` 切：本函数只服务 Windows 候选链
+   * （调用点见 {@link browserCandidates} 的 win32 分支）。
+   * POSIX 的 `:` 不在这里处理 —— 那一侧本来也不需要 scoop。
+   */
+  for (const raw of pathValue.split(';')) {
+    const dir = raw.trim()
+    if (dir.length === 0) continue
+    if (basename(dir).toLowerCase() !== 'shims') continue
+    /**
+     * ⚠ 只认 `scoop.cmd` / `scoop.ps1`：`scoop shim` 自己那套 `scoop.ps1` 在
+     * `apps\scoop\current\bin` 下，而 shims 里放的是**转发用的**那两个入口。
+     * 存在其一即认定这是 scoop 的 shims。
+     */
+    if (!existsSync(join(dir, 'scoop.cmd')) && !existsSync(join(dir, 'scoop.ps1'))) continue
+    return dirname(dir)
+  }
+  return undefined
+}
+
 /** Windows 候选链（逐字保留自重构前，⚠️ 改这里等于动本仓库绝大多数用户）。 */
 function windowsBrowserCandidates(
   env: Record<string, string | undefined>,
@@ -56,6 +149,28 @@ function windowsBrowserCandidates(
   const localAppData = env.LOCALAPPDATA ?? ''
   const programFiles = env.PROGRAMFILES ?? ''
   const programFilesX86 = env['PROGRAMFILES(X86)'] ?? ''
+  /**
+   * ⚠ 在**函数内**现算（而不是从 {@link browserCandidates} 传进来）：
+   * 候选链是纯字符串计算、要能在任意平台被单测断言；把「读 PATH」这件事
+   * 留在**纯函数内部**，注入 `env` 就能测（见 `zcode-browser-scoop-root.spec.ts`）。
+   * 代价是该函数会 `existsSync` 几次 —— 与 `findBrowserExecutable` 本来就在做的事同量级。
+   */
+  const scoopRoot = scoopRootFromPath(env)
+  /**
+   * ⚠ **默认布局的机器上不要多这一条**：scoop 装在 `~/scoop` 时，
+   * `scoopRootFromPath()` 反推出的就是它 —— 插进去会得到**重复候选**，
+   * 并让「候选链逐字不变」那条回归（`zcode-browser-macos.spec.ts`）在
+   * **装了 scoop 的开发机**上红、在 CI 上绿（同一条用例两副面孔）。
+   * 故按**大小写不敏感**去重（Windows 路径不区分大小写）。
+   */
+  const defaultScoopChrome = join(home, 'scoop', 'apps', 'chromium', 'current', 'chrome.exe')
+  const viaPath = scoopRoot === undefined
+    ? undefined
+    : join(scoopRoot, 'apps', 'chromium', 'current', 'chrome.exe')
+  const scoopViaPath = viaPath !== undefined
+    && viaPath.toLowerCase() !== defaultScoopChrome.toLowerCase()
+    ? viaPath
+    : undefined
   return [
     /**
      * ① scoop 的 **显式声明的**根目录优先于默认推导。
@@ -70,16 +185,23 @@ function windowsBrowserCandidates(
     ...(env.SCOOP_GLOBAL !== undefined && env.SCOOP_GLOBAL.trim().length > 0
       ? [join(env.SCOOP_GLOBAL.trim(), 'apps', 'chromium', 'current', 'chrome.exe')]
       : []),
-    // ② scoop 默认根目录（`~/scoop`）。实测可用。
-    join(home, 'scoop', 'apps', 'chromium', 'current', 'chrome.exe'),
-    // ③ 系统 Chrome。
+    /**
+     * ② scoop 装在了**非默认根**、且没设 `SCOOP`（Gitee issue IKQ4JN）。
+     *
+     * 排在 `~` 之前、`$SCOOP` 之后：`$SCOOP` 是用户**显式**声明的，仍最优先；
+     * 而这一档是**从 PATH 实测出来的**根，比 `~/scoop` 这个「猜」更可信。
+     */
+    ...(scoopViaPath !== undefined ? [scoopViaPath] : []),
+    // ③ scoop 默认根目录（`~/scoop`）。实测可用。
+    defaultScoopChrome,
+    // ④ 系统 Chrome。
     join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
     join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
     join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-    // ④ Chromium。
+    // ⑤ Chromium。
     join(localAppData, 'Chromium', 'Application', 'chrome.exe'),
     join(programFiles, 'Chromium', 'Application', 'chrome.exe'),
-    // ⑤ Edge（Chromium 内核，系统普遍自带）。
+    // ⑥ Edge（Chromium 内核，系统普遍自带）。
     join(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
     join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
     join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
@@ -923,7 +1045,7 @@ export class ChromiumSession {
        * 显式指定 chrome.exe 路径」—— 在 macOS 上 scoop 不存在、`chrome.exe`
        * 也不是那个文件名，Mac 用户照着做只会更懵。口径见 {@link browserNotFoundMessage}。
        */
-      throw new Error(
+      throw new BrowserStartupError(
         `${label}: 找不到可用的浏览器${this.options.notFoundHint ?? ''}。` +
           browserNotFoundMessage(process.platform, envName),
       )
@@ -1045,7 +1167,7 @@ export class ChromiumSession {
        * 直接抛会变成「循环外的 promise rejection」，而 `start()` 仍会等满
        * `readyTimeoutMs` 才返回。存下来让循环**下一轮立刻**失败（见下）。
        */
-      this.spawnFailure = new Error(
+      this.spawnFailure = new BrowserStartupError(
         `${label}: 浏览器无法启动（${executable}）：${error.message}` +
         `。可安装 Chrome/Chromium，或用 ${envName} 指定其它 chromium 内核浏览器。`,
       )
@@ -1062,7 +1184,7 @@ export class ChromiumSession {
       const how = signal !== null && signal !== undefined
         ? `signal=${signal}`
         : `code=${String(code)}`
-      this.spawnFailure ??= new Error(
+      this.spawnFailure ??= new BrowserStartupError(
         `${label}: 浏览器进程异常退出（${executable}，${how}）` +
         `。请重试，或用 ${envName} 指定其它 chromium 内核浏览器。`,
       )
