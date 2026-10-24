@@ -136,4 +136,26 @@ describe('panel-entry 注册器', () => {
     expect(source).not.toContain('sidebar-entry-store.js')
     expect(source).not.toContain('sidebarEntryVisible')
   })
+
+  /**
+   * ⚠️⚠️ **「两处槽位注册的必须是错误边界」已改为行为级守卫**（2026-10-24）。
+   *
+   * 这里原来是一条**源码文本**断言（要求源码里出现 `withErrorBoundary(JetHubPage, …)`
+   * 与两个特定字面量）。对抗审计实测打穿它，且同时对正确重构假红：
+   *
+   * | 手法 | 后果 | 原文本断言 |
+   * |---|---|---|
+   * | 局部 `const JetHubPageForMain = JetHubPage` 遮蔽模块级常量（+2 行） | 两处边界**全拆** | **全绿** |
+   * | `if (false)` 供货锚点 + 真注册换裸组件 | 保护被拆除 | **全绿** |
+   * | 常量下沉到组件体内（每帧新建类） | 面板内所有本地状态每帧丢失 | **全绿** |
+   * | label 互换 | fallback 指向错的面板 | **全绿** |
+   * | `import { withErrorBoundary as guard }` / 单引号改双引号 | （保护完好） | **假红** |
+   *
+   * ⇒ 判据搬到 `tests/unit/panel-entry-wiring.spec.ts`，改问**运行结果**：
+   * 「注册进去的组件能不能捕获渲染期异常」「两次渲染是不是同一个组件类型」
+   * 「label 与槽位配对是否正确」。
+   *
+   * ⚠️ 这不是「放宽判据」—— 新守卫**更强**：它抓得住上表全部四条绕过，
+   * 而文本断言一条都抓不住，且不再对等价重构假红。
+   */
 })

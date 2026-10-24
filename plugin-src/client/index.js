@@ -121,6 +121,11 @@ export function apply(ctx) {
    *
    * ⚠️ 别把注册器包进 `ctx.effect`：槽注册自己就是可撤销的，`slots.inject`
    * 的返回值交给调用方即可，多包一层只会在热替换时留下双份注册。
+   *
+   * ⚠️⚠️ **错误边界已移进 `panel-entry.js`**（2026-10-22 整页白屏事故补强，PR #10）：
+   * 那两处槽位现在注册的都是**包了 `withErrorBoundary` 的**组件。本文件不再持有
+   * 任何 `JetHubPage` 引用 —— 入口与渲染体的注册都归注册器了，在这里复制一份
+   * 就会变成「同一个组件两条注册路径」，正是该文件头警告的那种分叉。
    */
   registerJetHubPanelEntries(ctx, rpcCall)
 
