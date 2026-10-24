@@ -93,7 +93,12 @@ import { phoneFromUserId, isUsableZcodeCredential } from './zcode.js'
 import { ZCODE_LOGIN_PROVIDER, type ZcodeLoginProvider } from './zcode-login.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
-import { MINIMAX, MINIMAX_INTL, type MinimaxProduct } from './minimax-product.js'
+import {
+  MINIMAX,
+  MINIMAX_INTL,
+  MINIMAX_WEB_LOGOUT_PATH,
+  type MinimaxProduct,
+} from './minimax-product.js'
 import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
 // ⚠️ `sanitizeMinimaxXff` 与存储层**同一份判据**：RPC 层必须在写盘**之前**用它
@@ -4610,6 +4615,23 @@ function registerJetHubEndpoints(
            * ⚠️ 为什么不用 `loginUrl`：其 `user_code` 不含身份，带旧 cookie 打开
            * 就复用旧账号（本 bug 的根因）。
            */
+          /**
+           * ⚠️⚠️ **登出地址**（方案 A：「登出 → 授权页」两跳，2026-10-24 用户决策）
+           *
+           * 为什么 `forcedLoginUrl` 还不够：它只保证这条链接**要求**登录，却
+           * **不注销**浏览器里已存在的会话。用户实测症状是「登录完成后要手动清理
+           * 浏览器 token，不然还是会带上个账号的登录态」—— 那正是旧 `_sid` 仍在。
+           *
+           * 上游 `GET {accountHost}/oauth2/logout`（两站同形，实测 2026-10-24）：
+           * `302 → /unified-login` + `Set-Cookie: _sid=; …; HttpOnly`。
+           * ⚠️ 它**不接受回跳参数**（11 个参数名全被忽略，`Location` 恒为
+           * `/unified-login`）⇒ 只能两跳，客户端负责顺序。
+           * ⚠️ 它清的是**整个 account 域**的网页会话（会连带登出用户的 MiniMax 网页版）
+           * ⇒ 客户端**必须先给提示**再执行，不得静默。
+           * ⚠️ 只在「新建账号」这条路径下发；其它 provider 的授权页不在该 cookie 域。
+           */
+          const logoutUrl = `${minimaxProduct.accountHost}${MINIMAX_WEB_LOGOUT_PATH}`
+
           return {
             ok: true,
             value: {
@@ -4618,6 +4640,9 @@ function registerJetHubEndpoints(
               ...minimaxStarted.forcedLoginUrl === undefined
                 ? {}
                 : { forcedLoginUrl: minimaxStarted.forcedLoginUrl },
+              // ⚠️ 只有真的拿到了 `forcedLoginUrl` 才给登出地址：否则登出完却没有
+              //    可去的授权页，等于把用户登出后留在空白登录页（更糟）。
+              ...minimaxStarted.forcedLoginUrl === undefined ? {} : { logoutUrl },
             },
           }
         } else if (provider === ZCODE.id) {

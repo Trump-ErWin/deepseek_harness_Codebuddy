@@ -104,6 +104,70 @@ GET https://account.minimax.cn/oauth2/device/authorize?user_code=<UC>     ← �
 - 不改 `src/login.ts`、不改 `defaultBrowserExecutable()`、不加 Linux 浏览器候选链。
 - 不含任何供应商列表 / 移动端导航 / 抽屉等 UI 改动。
 
+## 三之二、方案 A：先登出、再打开授权页（2026-10-24 追加，用户报障驱动）
+
+> 「登录完成后浏览器的 cookie 可以删掉吗？现在要手动清理浏览器 token 不然还是会带上个账号登录态」
+
+### 为什么 `forcedLoginUrl` 不够
+
+`forcedLoginUrl` 只保证「这条链接**要求**登录」（CDP 实测：全新浏览器打开它停在
+`/unified-login`，显示微信扫码 / 手机号 / 账号密码登录表单，**无「授权」按钮**）。
+但它**不主动注销**浏览器里已存在的会话 —— 用户的实际症状正是旧 `_sid` 仍在：
+登录完成后新会话覆盖旧的，下次又带「上一个号」，只能手动清 cookie。
+
+### 修法（两跳）
+
+上游登出端点（**两个站点都有**，实测 2026-10-24）：
+
+```
+GET https://account.minimax.cn/oauth2/logout
+  → 302 Location: /unified-login
+  → Set-Cookie: _sid=; path=/; HttpOnly; secure; SameSite=Lax
+GET https://account.minimax.io/oauth2/logout      （国际站同形）
+```
+
+⚠️ 它**不接受任何回跳参数**（实测 11 个参数名：`redirect` / `redirect_url` /
+`return_to` / `returnTo` / `url` / `service` / `target` / `to` / `continue` /
+`next_url` / `next`，`Location` 恒为 `/unified-login`）⇒ **必须两跳**，由客户端负责顺序。
+
+客户端行为（`plugin-src/client/jet-hub.js`）：
+
+1. 若宿主下发了 `logoutUrl`，**先弹确认**（`confirm`）；
+2. 确认后 `window.open(logoutUrl)`（**导航**而非 `fetch` —— 要真实写入那个清 `_sid` 的 `Set-Cookie`）；
+3. 延迟 **900ms**（实测登出全链路 0.19s、冷启动 2.9s ⇒ 900ms 覆盖慢网；跨源拿不到 load 回调）；
+4. 再 `window.open(forcedLoginUrl)`；
+5. 用户**取消**则跳过登出、直接开 `forcedLoginUrl`（仍是有效修法，只是可能带回旧会话）。
+
+### ⚠️⚠️ 副作用（必须让用户知道，故不得静默）
+
+登出的作用域是**整个 `account.minimax.cn` 网页会话** ⇒ 用户在同一浏览器里登录的
+MiniMax **网页版**会被一起登出（登录完成后新会话立即重建，影响很小但真实存在）。
+⇒ 客户端**先 `confirm` 再执行**，文案明确写「将退出 MiniMax 网页登录（含网页版会话）」。
+
+### 两站各用各的域
+
+`logoutUrl` 由 `${minimaxProduct.accountHost}${MINIMAX_WEB_LOGOUT_PATH}` 拼出，
+**不写死 `.cn`** —— 国际站账号在 `.io` 域，写死会让国际站用户清不到 cookie。
+
+### 只在「新建账号」路径
+
+其它 provider 的授权页不在该 cookie 域，登出无意义且有害 ⇒ 仅 minimax 系下发；
+且**只有真的拿到了 `forcedLoginUrl` 才给 `logoutUrl`**（否则登出后无处可去，
+用户停在空白登录页，比不登出更糟）。
+
+### 验证
+
+- CDP 实测（无会话浏览器）：`forcedLoginUrl` → 停在 `/unified-login`，登录表单可见
+  （微信扫码 / 手机号 / 账号密码 / 获取验证码 / 立即登录），**无「授权」字样**。
+- `logout` 端点两站实测：均 `302 → /unified-login` + `Set-Cookie: _sid=; …; HttpOnly`。
+- 4 个变异全部**有牙**：客户端不读 `logoutUrl`（2 红）／登出与授权页顺序颠倒（1 红）／
+  去掉 `confirm` 变静默（1 红）／服务端不下发 `logoutUrl`（2 红）。
+
+> ⚠️ **未验证的一半（如实登记）**：我没有用户的 MiniMax 账号，**无法构造合法的
+> 既有会话**（`_sid` 是 HttpOnly，只能由真实登录产生）⇒ 「已有旧会话时 `forcedLoginUrl`
+> 是否仍要求重登」这一格**未实测**。方案 A 正是为覆盖这一格而加（登出把旧会话清掉，
+> 之后无论原行为如何都必然要求登录）。
+
 ## 四、客户端改动（`plugin-src/client/jet-hub.js`）
 
 ```js

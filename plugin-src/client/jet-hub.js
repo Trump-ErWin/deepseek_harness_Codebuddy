@@ -3829,6 +3829,41 @@ function ProviderPanel({ provider, rpcCall }) {
             : '';
           if (forcedLoginUrl !== '') {
             // MiniMax 专用：宿主已换出「保证需要登录」的链接（详见上方注释）。
+            //
+            // ⚠️⚠️ **方案 A：先登出，再打开授权页**（2026-10-24 用户决策）。
+            //
+            // 为什么必须多跳一次：`forcedLoginUrl` 只保证「这条链接要求登录」，
+            // 但**不注销**浏览器里已存在的会话。用户实测症状——
+            // 「登录完成后要手动清理浏览器 token，不然还是会带上个账号的登录态」——
+            // 正是旧 `_sid` 还在。
+            //
+            // 上游 `GET {accountHost}/oauth2/logout` 会 `302 → /unified-login` 并回
+            // `Set-Cookie: _sid=; …; HttpOnly`（两站同形，实测）。⚠️ 它**不接受
+            // 回跳参数**（测了 11 个参数名，Location 恒为 /unified-login）⇒ 只能两跳。
+            //
+            // ⚠️⚠️ **副作用告知**：该登出清的是**整个 account 域**的网页会话 ——
+            // 用户在同一浏览器里登录的 MiniMax **网页版**会被一起登出（登录完成后
+            // 新会话立即重建）。所以这里**必须先弹确认**，不得静默执行；
+            // 用户取消就退回「只开强制登录链接」（仍是有效修法，只是可能带回旧会话）。
+            //
+            // ⚠️ 时序：先开登出页，再**延迟**开授权页。用固定 900ms 是因为实测
+            // 登出全链路 0.19s（冷启动 2.9s）⇒ 900ms 覆盖慢网；跨源拿不到 load 回调，
+            // 不能等事件。⚠️ 两个窗口都要持有：轮询结束时关掉的是**授权页**那个。
+            const logoutUrl = typeof res.logoutUrl === 'string' && res.logoutUrl.length > 0
+              ? res.logoutUrl
+              : '';
+            if (logoutUrl !== '') {
+              const okToLogout = confirm(
+                '为了不再带上一个账号的登录态，将先退出 MiniMax 网页登录'
+                + '（含你在本浏览器里的 MiniMax 网页版会话），然后打开授权页让你重新登录。\n\n'
+                + '继续吗？（取消 = 不清会话，直接打开授权页）',
+              );
+              if (okToLogout) {
+                // 第一跳：清 `_sid`。**必须是导航**（真实写入 Set-Cookie），不能用 fetch。
+                try { window.open(logoutUrl, '_blank', 'width=800,height=600'); } catch { /* 第二跳仍执行 */ }
+                await new Promise((r) => setTimeout(r, 900));
+              }
+            }
             loginWindow = window.open(forcedLoginUrl, '_blank', 'width=800,height=600');
             if (!loginWindow || loginWindow.closed) {
               setLoginUrlForManual(forcedLoginUrl);

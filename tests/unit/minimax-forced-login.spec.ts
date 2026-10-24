@@ -51,6 +51,17 @@ const here = dirname(fileURLToPath(import.meta.url))
 const rpcSource = readFileSync(resolve(here, '../../src/jet-hub-rpc.ts'), 'utf8')
 const clientSource = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
 
+  /** 截取 `account.create` 里 minimax 分支（从分支头到其 return）。 */
+function minimaxBranch(): string {
+    const start = rpcSource.indexOf(
+      '} else if (provider === MINIMAX.id || provider === MINIMAX_INTL.id) {',
+    )
+    expect(start, 'jet-hub-rpc.ts 找不到 minimax 分支（被改名/移动了？）').toBeGreaterThan(-1)
+    const end = rpcSource.indexOf('} else if (provider === ZCODE.id) {', start + 10)
+    return rpcSource.slice(start, end > start ? end : undefined)
+  }
+
+
 const SITE = MINIMAX.accountHost
 const HOST = new URL(SITE).origin
 const CODE = 'QJNX-CZXV'
@@ -240,16 +251,58 @@ describe('③ startLogin 把 forcedLoginUrl 带出来（可选字段）', () => 
   })
 })
 
+describe('④b 方案 A：先登出、再打开授权页（2026-10-24 用户决策）', () => {
+  it('★ 宿主必须下发 logoutUrl（否则客户端只能靠 forcedLoginUrl，旧会话仍在）', () => {
+    // ⚠️ 只在**返回值**里找：`logoutUrl` 这个标识符在分支里还有定义处，
+    //    全局查会让「定义在、但没下发」也通过（假绿）。
+    const branch = minimaxBranch()
+    const ret = branch.slice(branch.lastIndexOf('return {'))
+    expect(ret, '返回值里没有 logoutUrl ⇒ 「登录完仍带上个账号」复发').toContain('logoutUrl')
+    // 地址必须由 accountHost 派生（两站各用各的域，不能写死 .cn）
+    expect(branch, '登出地址必须由 accountHost + MINIMAX_WEB_LOGOUT_PATH 拼出')
+      .toContain('MINIMAX_WEB_LOGOUT_PATH')
+    expect(branch).toMatch(/\$\{minimaxProduct\.accountHost\}\$\{MINIMAX_WEB_LOGOUT_PATH\}/)
+  })
+
+  it('★★ 没有 forcedLoginUrl 时**不得**给 logoutUrl（登出后无处可去更糟）', () => {
+    const branch = minimaxBranch()
+    const ret = branch.slice(branch.lastIndexOf('return {'))
+    // 取「最后一个 spread 三元」——它必须把 logoutUrl 收在「拿到了 forcedLoginUrl」的分支里。
+    const spreads = [...ret.matchAll(/forcedLoginUrl === undefined\s*\?\s*\{\}\s*:\s*\{\s*([^}]*)\}/g)]
+    const withLogout = spreads.filter((m) => m[1].includes('logoutUrl'))
+    expect(
+      withLogout.length,
+      'logoutUrl 必须与 forcedLoginUrl 同条件下发：否则登出后用户停在空白登录页',
+    ).toBeGreaterThan(0)
+  })
+
+  it('★★ 客户端必须先开登出、再开授权页（顺序反了等于没登出）', () => {
+    const i = clientSource.indexOf('const logoutUrl = typeof res.logoutUrl')
+    expect(i, '客户端没读 res.logoutUrl ⇒ 服务端下发了也不生效').toBeGreaterThan(-1)
+    const seg = clientSource.slice(i, i + 2600)
+    const logoutAt = seg.indexOf('window.open(logoutUrl')
+    const forcedAt = seg.indexOf('window.open(forcedLoginUrl')
+    expect(logoutAt, '没有打开登出地址').toBeGreaterThan(-1)
+    expect(forcedAt, '没有打开强制登录地址').toBeGreaterThan(-1)
+    expect(logoutAt, '★ 登出必须在授权页**之前**').toBeLessThan(forcedAt)
+  })
+
+  it('★★ 登出前必须弹确认（它会连带登出用户的 MiniMax 网页版，不得静默）', () => {
+    const i = clientSource.indexOf('const logoutUrl = typeof res.logoutUrl')
+    const seg = clientSource.slice(i, i + 2600)
+    expect(seg, '★ 静默登出会连带清掉用户网页版会话 —— 必须 confirm 告知')
+      .toContain('confirm(')
+    expect(seg, '文案必须说明会退出网页登录').toMatch(/退出\s*MiniMax\s*网页登录/)
+  })
+
+  it('⚠️ 登出必须用**导航**而不是 fetch（要真实写入 Set-Cookie）', () => {
+    const i = clientSource.indexOf('const logoutUrl = typeof res.logoutUrl')
+    const seg = clientSource.slice(i, i + 2600)
+    expect(seg, '登出用了 fetch ⇒ HttpOnly cookie 未必被清除').not.toMatch(/fetch\(\s*logoutUrl/)
+  })
+})
+
 describe('④ 接线：RPC 分支的无痕窗口用 forcedLoginUrl，客户端优先用它', () => {
-  /** 截取 `account.create` 里 minimax 分支（从分支头到其 return）。 */
-  function minimaxBranch(): string {
-    const start = rpcSource.indexOf(
-      '} else if (provider === MINIMAX.id || provider === MINIMAX_INTL.id) {',
-    )
-    expect(start, 'jet-hub-rpc.ts 找不到 minimax 分支（被改名/移动了？）').toBeGreaterThan(-1)
-    const end = rpcSource.indexOf('} else if (provider === ZCODE.id) {', start + 10)
-    return rpcSource.slice(start, end > start ? end : undefined)
-  }
 
   /**
    * ⚠️⚠️ **2026-10-24 用户决策：宿主开窗那一套废弃**，只要 token 过期这件工作。
