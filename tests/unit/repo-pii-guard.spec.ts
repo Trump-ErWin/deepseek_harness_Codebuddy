@@ -229,6 +229,16 @@ const CREDENTIAL_CONSTRUCTOR_SAMPLES: ReadonlySet<string> = new Set([
   //    不是真实凭据。按本仓纪律**逐条登记**，不用「含 token 字样就放过」这类启发式。
   'access-token-abc',
   'refresh-token-abc',
+  // ⚠️ **`minimax-identity.spec.ts` 的夹具**（2026-10-23 补登记，Gitee IKP8UA 引入）。
+  //
+  // `access_token: 'mmoat_test_token'` 恰好 16 位（判据的下限），故被
+  // 「凭据字段名 + 高熵字面量」命中。**它是构造值不是真凭据**：
+  // `mmoat_` 是 MiniMax 的 token **前缀**（实测真 token 为该前缀 + 60 字符），
+  // 而这里后半段就是字面的 `test_token`（10 个字符，零随机性）。
+  //
+  // ⚠️ 不用「含 `_test_` 就放过」这类启发式 —— 那会让真凭据起个 `mmoat_test_`
+  // 前缀就溜过去。按本仓纪律**逐条登记**。
+  'mmoat_test_token',
 ])
 
 /** 构造示例号码白名单（见文件头）。 */

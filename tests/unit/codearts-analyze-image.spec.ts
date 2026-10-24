@@ -25,12 +25,20 @@
  * | ③ 路由判据：只给 codearts 的**文本**模型 | 给 VL 模型/别家也挂 ⇒ 多余往返或必然失败 | 四组输入逐格断言 |
  * | ④ 本轮没图时返回**可操作的文案** | 抛错或空串 ⇒ 模型不知道怎么办 | 断言含「重新附上」这类出路 |
  */
+import { existsSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { dirname, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { pathToFileURL } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import {
+  ANALYZE_IMAGE_DISABLE_ENV,
   ANALYZE_IMAGE_MAX_IMAGES,
   ANALYZE_IMAGE_TOOL,
+  analyzeImageDisabledByEnv,
   collectTurnImages,
   imageDataUrl,
+  installAnalyzeImage,
   runAnalyzeImage,
   shouldOfferAnalyzeImage,
   type AnalyzeImageDeps,
@@ -299,5 +307,312 @@ describe('analyzeImage：已拼好的 image_url 必须穿过序列化层（真�
     const userMessage = wire.find((m) => m['role'] === 'user') as { content: unknown }
     expect(typeof userMessage.content).toBe('string')
     expect(userMessage.content).toBe('只有文字')
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// 工具注册：`output.schema` 必须过宿主的真实校验器（Gitee IKPZW7）
+// ────────────────────────────────────────────────────────────────────────────
+
+const requireFromTest = createRequire(import.meta.url)
+
+/**
+ * 定位宿主的 `@deepseek-ai/dsh-tools`。
+ *
+ * 搜索顺序（命中即返回）：① 本仓库依赖树；② 全局安装；③ 用户 profile
+ * （共享层在前、逐 profile 层在后 —— 本机实测宿主包在 `profiles/node_modules`）。
+ *
+ * ⚠️ 本仓库 devDependencies **不含** `dsh-tools`（见模块头「本插件不依赖该包」），
+ * 故干净克隆 / CI 下定位不到 ⇒ 本组用例整体 skip，**不是**通过。
+ *
+ * @returns 该包 `lib/index.js` 的绝对路径；找不到则 `null`。
+ */
+function locateDshTools(): string | null {
+  const candidates: string[] = []
+  try {
+    const pkg = requireFromTest.resolve('@deepseek-ai/dsh-tools/package.json')
+    candidates.push(join(dirname(pkg), 'lib', 'index.js'))
+  } catch {
+    // 未从本仓库解析到，继续看别处
+  }
+  const home = process.env['USERPROFILE'] ?? process.env['HOME'] ?? homedir()
+  const dshHome = process.env['DSH_HOME'] ?? join(home, '.dsh')
+  const roots = [
+    join(dirname(process.execPath), 'node_modules'),
+    join(dshHome, 'profiles', 'node_modules'),
+    ...['web', 'desktop', 'tui', 'headless', 'default'].map(p => join(dshHome, 'profiles', p, 'node_modules')),
+    // 全局 `@deepseek-ai/dsh` 自带一层 `node_modules/@deepseek-ai/*`
+    join(dirname(process.execPath), 'node_modules', '@deepseek-ai', 'dsh', 'node_modules'),
+  ]
+  for (const root of roots) {
+    const entry = join(root, '@deepseek-ai', 'dsh-tools', 'lib', 'index.js')
+    if (existsSync(entry)) candidates.push(entry)
+  }
+  return candidates.find(p => existsSync(p)) ?? null
+}
+
+const dshToolsEntry = locateDshTools()
+
+/**
+ * 从真实安装位置 import 宿主的 `dsh-tools`。
+ *
+ * ⚠️ 用**绝对 file URL**：该包在仓库外，Vite 的模块图解析对裸标识符不适用。
+ */
+async function importDshTools(): Promise<{
+  assertSupportedJsonSchema: (schema: unknown) => void
+  validateJsonSchemaValue: (schema: unknown, value: unknown, path: string) => string[]
+}> {
+  return await import(/* @vite-ignore */ pathToFileURL(dshToolsEntry!).href) as never
+}
+
+/** `installAnalyzeImage` 捕获到的工具字面量（只取本组断言用到的字段）。 */
+interface CapturedTool {
+  name: string
+  parameters: unknown
+  output: { schema: Record<string, unknown>; render: (args: unknown, value: unknown) => unknown }
+}
+
+/**
+ * 用**真实宿主校验器**跑一次注册，返回捕获到的工具。
+ *
+ * ⚠️ 这里刻意**复刻 `ToolRuntime.register()` 的校验顺序**（`dsh-tools/lib/index.js`
+ * 的 `register()`：先查 `output { schema, render }` 形状，再
+ * `assertSupportedJsonSchema(output.schema)`，然后才 insert）。复刻的理由是本插件
+ * 不依赖该包、拿不到 `ToolRuntime` 实例；但**校验器本身是宿主那一份真货**，
+ * 不是手写的近似判据 —— 手写正则/结构断言抓不到「关键字放在错类型的节点上」。
+ *
+ * @param assertSupported - 宿主的 `assertSupportedJsonSchema`
+ * @returns 捕获到的工具字面量
+ * @throws 宿主校验器抛出的 `JsonSchemaError`（原样，不吞）
+ */
+/** 跑一次接线、返回捕获到的工具（**不**跑宿主 schema 校验）。 */
+function registerCapturing(log?: { info?: (message: string) => void }): CapturedTool | undefined {
+  let captured: CapturedTool | undefined
+  const scope = {
+    tools: {
+      register(tool: CapturedTool) {
+        const output = tool.output
+        if (output === undefined || typeof output !== 'object' || typeof output.render !== 'function') {
+          throw new TypeError(`tool "${tool.name}" must declare output { schema, render, presentationMeta? }`)
+        }
+        captured = tool
+      },
+    },
+    attachments: {},
+  }
+  const ctx = {
+    inject(_deps: string[], callback: (s: unknown) => void) { callback(scope) },
+  }
+  installAnalyzeImage(
+    ctx as never,
+    { readImage: async () => ({ data: new Uint8Array(), mediaType: 'image/png' }), describe: async () => 'x' },
+    () => undefined,
+    log,
+  )
+  return captured
+}
+
+function registerWithRealValidator(
+  assertSupported: (schema: unknown) => void,
+): CapturedTool {
+  let captured: CapturedTool | undefined
+  const scope = {
+    tools: {
+      register(tool: CapturedTool) {
+        const output = tool.output
+        if (output === undefined || typeof output !== 'object' || typeof output.render !== 'function') {
+          throw new TypeError(`tool "${tool.name}" must declare output { schema, render, presentationMeta? }`)
+        }
+        assertSupported(output.schema)
+        captured = tool
+      },
+    },
+    attachments: {},
+  }
+  const ctx = {
+    inject(_deps: string[], callback: (s: unknown) => void) { callback(scope) },
+  }
+  installAnalyzeImage(
+    ctx as never,
+    { readImage: async () => ({ data: new Uint8Array(), mediaType: 'image/png' }), describe: async () => 'x' },
+    () => undefined,
+    { info: () => undefined },
+  )
+  if (captured === undefined) throw new Error('installAnalyzeImage 没有注册任何工具')
+  return captured
+}
+
+/**
+ * ⚠️⚠️ **Gitee IKPZW7**：`output.schema` 曾把 `required: true` 写在
+ * `type: 'string'` 的子节点上（`properties.description`）。
+ *
+ * ## 为什么原有 15 条用例全绿却漏掉它
+ *
+ * 它们**没有一条调用 `installAnalyzeImage`** —— 全部只测纯函数
+ * （`collectTurnImages` / `shouldOfferAnalyzeImage` / `runAnalyzeImage` /
+ * `imageDataUrl`）。工具字面量是**注册那一刻**才被宿主校验的，而不测注册就永远
+ * 看不到这条错误。典型「守卫看着有牙、实际没咬到」。
+ *
+ * ## 缺陷后果（本机实测）
+ *
+ * 宿主 `dsh-tools/lib/index.js` 的 `checkSchemaNode()` 有一张「关键字 → 允许类型」
+ * 对照表，其中 `required: ['object']`；逐节点检查后抛
+ * `JsonSchemaError: unsupported JSON schema: schema.properties.description.required
+ * is not supported on type "string"` ⇒ `tools.register()` 抛错 ⇒ 该 `ctx.inject`
+ * 子插件整体失败 ⇒ **`analyzeImage` 静默消失**（其余渠道与调度器不受影响，
+ * 因为 `installAnalyzeImage` 是独立注入的）。
+ *
+ * ## 判别力
+ *
+ * 判据打在**宿主那一份真校验器**上：把 `required` 挪回 `properties.description`
+ * 内部，第 ⑭ 条立刻变红（实测：`JsonSchemaError: … is not supported on type "string"`）。
+ * 若只断言「`required` 是数组」这类结构形状，错位的写法也能通过 ⇒ 那是恒真断言。
+ */
+describe.skipIf(dshToolsEntry === null)('analyzeImage：工具注册必须过宿主真实 schema 校验（IKPZW7）', () => {
+  /** 防止「宿主包没定位到 → 整组静默 skip」被误读成「验证通过」。 */
+  it('宿主 dsh-tools 已定位（否则本组整体 skip，不是通过）', () => {
+    expect(dshToolsEntry).not.toBeNull()
+    expect(existsSync(dshToolsEntry!)).toBe(true)
+  })
+
+  /**
+   * 守卫 ⑭：**注册本身不得抛错**，且 `output.schema` 能过宿主的
+   * `assertSupportedJsonSchema`。
+   *
+   * ⚠️ 这条是缺陷的**直接判据** —— 缺陷态下它抛 `JsonSchemaError`。
+   */
+  it('⑭ 注册成功：output.schema 过宿主 assertSupportedJsonSchema（缺陷态此处抛 JsonSchemaError）', async () => {
+    const { assertSupportedJsonSchema } = await importDshTools()
+    const tool = registerWithRealValidator(assertSupportedJsonSchema)
+    expect(tool.name).toBe('analyzeImage')
+    // 再独立校验一次：证明「注册成功」不是因为桩放宽了校验。
+    expect(() => assertSupportedJsonSchema(tool.output.schema)).not.toThrow()
+  })
+
+  /**
+   * 守卫 ⑮：**`required` 的位置与语义都对**。
+   *
+   * 两件事必须同时成立，缺任一条都不是正确修法：
+   * 1. 位置：`required` 在 **object 根节点**上、是 `['description']`，而
+   *    `properties.description` 里**没有** `required` 这个键（错位写法在这里被点名）；
+   * 2. 语义：宿主的 `validateJsonSchemaValue()` 真按它判 —— 缺 `description`
+   *    报 `missing required property`，`description` 不是字符串报类型错，
+   *    正常值零违规。
+   *
+   * ⚠️ 只断言第 1 条是不够的：把 `required` 删干净（而不是挪对位置）也能通过位置
+   * 断言，但工具就变成「可以返回空对象」—— 第 2 条把这条路堵住。
+   */
+  it('⑮ required 在 object 根节点、且真被宿主校验器执行（缺字段即违规）', async () => {
+    const { assertSupportedJsonSchema, validateJsonSchemaValue } = await importDshTools()
+    const tool = registerWithRealValidator(assertSupportedJsonSchema)
+    const schema = tool.output.schema
+
+    // ① 位置：根节点是 object，required 是字符串数组且只点名 description。
+    expect(schema['type']).toBe('object')
+    expect(schema['required']).toEqual(['description'])
+    // ② 位置：子节点里**不得**出现 required（缺陷就是写在这）。
+    const properties = schema['properties'] as Record<string, Record<string, unknown>>
+    expect(properties['description']).toEqual({ type: 'string' })
+    expect(Object.hasOwn(properties['description']!, 'required')).toBe(false)
+
+    // ③ 语义：宿主校验器真按 required 判（不是「声明了但没人读」）。
+    expect(validateJsonSchemaValue(schema, { description: '一只猫' }, '')).toEqual([])
+    expect(validateJsonSchemaValue(schema, {}, ''))
+      .toContain('missing required property "description"')
+    expect(validateJsonSchemaValue(schema, { description: 1 }, ''))
+      .toContain('"description" must be a string')
+    // ④ `additionalProperties: false` 仍在（多返回字段要被拒，避免模型塞垃圾）。
+    expect(schema['additionalProperties']).toBe(false)
+    expect(validateJsonSchemaValue(schema, { description: 'x', extra: 1 }, '')).toHaveLength(1)
+  })
+
+  /**
+   * 守卫 ⑯：`parameters` 必须是**完整的空对象 schema**，且既过宿主校验、也过上游校验。
+   *
+   * ⚠️⚠️ **这一格在 2026-10-23 被推翻重写**，原因值得记住：
+   *
+   *   - **旧版断言 `toEqual({})` 是错的**，它把一个真实缺陷**钉死**了：注释写着
+   *     「空对象就是正确形态、别顺手补齐」，依据是宿主校验器
+   *     `assertSupportedJsonSchema({})` 不抛错 ⇒ **19 条全绿，而 buddy/workbuddy
+   *     每轮 400**。
+   *   - **「宿主接受」≠「上游接受」**：空 `{}` 过得了宿主那一格，但腾讯两站
+   *     （`copilot.tencent.com` / `www.workbuddy.ai`）会校验工具定义并回
+   *     `{"code":11129,"msg":"invalid function call parameters"}`。
+   *     真机 A/B（`scripts/probe-buddy-tool-schema.mts`，两站各自复现）：
+   *     `{}` → 400，`{type:'object',properties:{}}` → 200；整份 280 工具清单只改
+   *     这一处就从 400 变 200。
+   *
+   * ⇒ 所以这里**两个判据都要有**：宿主那一格（证明注册不会中断）**与**
+   * 「声明了 object 类型」（证明上游会收）。缺任一条都抓不住这次的回归 ——
+   * 只保留宿主那格 = 旧版的假绿。
+   */
+  it('⑯ parameters 是完整的空对象 schema：既过宿主校验、也满足上游的 object 类型要求', async () => {
+    const { assertSupportedJsonSchema } = await importDshTools()
+    const tool = registerWithRealValidator(assertSupportedJsonSchema)
+
+    // ① 本工具**不接受任何参数**（图片从会话历史取）⇒ 必须是零属性的 object。
+    expect(tool.parameters).toEqual({ type: 'object', properties: {} })
+    // ② 过宿主校验（否则 `tools.register()` 中断、工具静默消失）。
+    expect(() => assertSupportedJsonSchema(tool.parameters)).not.toThrow()
+    // ③ 声明了 object 类型 —— 这一格**只能由真实上游报文固定**，单测锁不住
+    //    「腾讯到底收哪种形状」（见文件头与 scripts/probe-buddy-tool-schema.mts）。
+    expect((tool.parameters as { type: string }).type).toBe('object')
+    // ④ 反向对照：`{}`（旧版形状）**不满足**这一格 —— 若哪天实现退回空对象，
+    //    这一格会红，而不是再次「19 条全绿 + 上游 400」。
+    expect(({} as { type: string }).type).not.toBe('object')
+  })
+})
+
+/**
+ * 应急闸 `DSH_DISABLE_ANALYZE_IMAGE`（2026-10-23，用户要求「临时禁用」）。
+ *
+ * ## 为什么要「不注册」而不是「请求时摘除」
+ *
+ * 作用域摘除（`codearts-vision.ts`）只改**发给上游的 options**，harness 侧的
+ * 工具表（落盘 `request/header` 里的那份）仍含该工具 ⇒ 用户在界面上看到的
+ * `tools=281 / analyzeImage=true` 不变，无法用它验证「工具数是否是慢的成因」。
+ * 应急闸走**注册期**：关闸时工具根本不存在，任何一侧都干净。
+ */
+describe('analyzeImage 的应急禁用闸', () => {
+  it('闸关着 ⇒ 根本不注册，且**必须留一条日志**', () => {
+    const lines: string[] = []
+    const before = process.env[ANALYZE_IMAGE_DISABLE_ENV]
+    process.env[ANALYZE_IMAGE_DISABLE_ENV] = '1'
+    try {
+      const captured = registerCapturing({ info: (m) => lines.push(m) })
+      expect(captured, '闸关着时不得注册任何工具').toBeUndefined()
+    } finally {
+      if (before === undefined) delete process.env[ANALYZE_IMAGE_DISABLE_ENV]
+      else process.env[ANALYZE_IMAGE_DISABLE_ENV] = before
+    }
+    // ⚠️ 这格是「关闸」与「注册静默失败」的**唯一**区别（本工具栽过一次：
+    //    `tools.register()` 因 schema 不合法中断 ⇒ 工具消失、**日志零字**）。
+    //    没有它，「工具不见了」与「闸关着」同形，无法排查。
+    expect(lines.join('\n')).toContain(ANALYZE_IMAGE_DISABLE_ENV)
+  })
+
+  it('闸未设 / 取值不认 ⇒ 正常注册（不得把工具误关）', () => {
+    const before = process.env[ANALYZE_IMAGE_DISABLE_ENV]
+    try {
+      for (const value of [undefined, '', '0', 'false', 'no', 'off']) {
+        if (value === undefined) delete process.env[ANALYZE_IMAGE_DISABLE_ENV]
+        else process.env[ANALYZE_IMAGE_DISABLE_ENV] = value
+        expect(registerCapturing()?.name, `取值 ${JSON.stringify(value)} 应当照常注册`).toBe(ANALYZE_IMAGE_TOOL)
+      }
+    } finally {
+      if (before === undefined) delete process.env[ANALYZE_IMAGE_DISABLE_ENV]
+      else process.env[ANALYZE_IMAGE_DISABLE_ENV] = before
+    }
+  })
+
+  it('取值判据：1/true/yes 大小写不敏感，其余（含 2/on）都不关', () => {
+    for (const v of ['1', 'true', 'TRUE', ' yes ', 'Yes']) {
+      expect(analyzeImageDisabledByEnv({ [ANALYZE_IMAGE_DISABLE_ENV]: v }), `取值 ${JSON.stringify(v)} 应当关闸`).toBe(true)
+    }
+    for (const v of [undefined, '', '0', 'false', '2', 'on', 'enabled', 'no']) {
+      expect(analyzeImageDisabledByEnv({ [ANALYZE_IMAGE_DISABLE_ENV]: v }), `取值 ${JSON.stringify(v)} 不该关闸`).toBe(false)
+    }
+    // 反向对照：老写法 `=== '1'` 会把 'true'/'yes' 判成「没关」⇒ 用户设了却仍在跑
+    expect('true' === '1').toBe(false)
   })
 })

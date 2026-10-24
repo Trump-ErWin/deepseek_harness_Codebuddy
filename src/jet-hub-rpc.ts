@@ -263,7 +263,10 @@ import { pickTestModel,
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
 import { geminiFetchForAccount } from './gemini-proxy.js'
+import { minimaxIntlFetchForAccount } from './minimax-proxy.js'
+import { normalizeProxy } from './minimax-proxy.js'
 import { handleGeminiRpc } from './gemini-rpc.js'
+import { handleMinimaxIntlRpc } from './minimax-rpc.js'
 import { handleModelscopeRpc } from './modelscope-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
@@ -2298,6 +2301,14 @@ function registerJetHubEndpoints(
     // 是**用户点一下就等**的主路径，配了账号代理却不接 ⇒ 积分行恒报
     // 「配额查询网络失败」，而推理路径却正常 —— 症状割裂、极难对应。
     geminiFetchFor: (accountId) => geminiFetchForAccount(accountId),
+    // ⚠️⚠️ **MiniMax 国际站的按账号 fetcher**（PR !145 审计 P0 修法）：
+    // 与上面 `geminiFetchFor` **逐格同因** —— 积分行是用户点一下就等的主路径，
+    // 而 `agent.minimax.io` 按出口 IP 国别分流（大陆直连恒 307 → 中国站 → 401）。
+    // 不接它 ⇒ 配好代理后对话能用、**积分行与一键签到却仍失败**，
+    // 症状与 issue IKMEVG 逐字相同。
+    // ⚠️ 与 `src/index.ts` 的 `creditsTable` 是**两个独立调用**，必须同改
+    //（本仓库记过「只接一处」的复发形态：minimaxXff 就漏过一次）。
+    minimaxIntlFetchFor: (accountId) => minimaxIntlFetchForAccount(accountId),
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -3954,6 +3965,14 @@ function registerJetHubEndpoints(
       const handled = await handleGeminiRpc(ctx, pool, method, payload)
       if (handled !== undefined) return handled
     }
+    // ⚠️ MiniMax 国际站的**出口代理**端点同款前缀改道（写 `setMinimaxIntlProxy`）。
+    //    前缀用 `minimaxintl.` 而不是 `minimax.`：① 与 provider id 逐字一致；
+    //    ② `minimax.` 前缀一旦被这里接管，将来中国站若加同名端点就会被本分支
+    //    误吞（两家语义不同，见 `minimax-proxy.ts` 的模块头）。
+    if (method.startsWith('minimaxintl.')) {
+      const handled = await handleMinimaxIntlRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 审计 P0 修复）：魔搭与 opencode
     //    同属「不跳浏览器、手工粘贴 API Key」的 provider ⇒ 走各自的前缀改道分支。
     //    ⚠️ 本分支此前**不存在**，而 `handleModelscopeRpc` 已导出却零调用点 ⇒
@@ -4478,9 +4497,96 @@ function registerJetHubEndpoints(
             createdAt: Date.now(),
           })
 
+          /**
+           * ⚠️⚠️ **国际站：登录前必须让占位条目带上代理**（与 Gemini 的
+           * IKLTZ2 审计 P2-1 是同一个死锁形态）。
+           *
+           * 设备码申请与轮询换 token 都发生在凭据落盘**之前**，此时**只有这条
+           * 占位条目**认得这个账号 ⇒ 代理只能从这里读。不带 ⇒ 大陆网络下国际站
+           * **登录恒失败**，而用户**没法给一个还不存在的账号配代理**（面板的
+           * 「代理」按钮按 `accountId` 打开）⇒ 只能导出 `HTTPS_PROXY` 绕过。
+           *
+           * 触发路径很常见：refresh_token 失效的既定动作就是「删号重登」，
+           * 而重登造的是**全新 id** ⇒ 旧号上的代理配置必然丢失。
+           *
+           * **代理来源两级**（与 Gemini 同款）：
+           * ① 载荷显式带（将来 UI 提供输入时用）；
+           * ② **从同 provider 的已有账号继承** —— 当前的实际生效路径。
+           *    ⚠️ 只在**恰好一个账号带代理**时生效（多账号时无法判断该继承
+           *    哪个，宁可直连也不要猜错出口把凭据发到错误的代理上）。
+           *
+           * ⚠️ **只对国际站做**（中国站直连才是最优），且走
+           * `setMinimaxIntlProxy` 而不是直接塞字段：那里有「空串删键」的口径。
+           *
+           * ⚠️ 查池必须过 `typeof pool.listAccountsByProvider === 'function'`
+           * （与 `minimaxXff` 同款防御）：单测/旧接线可能传**只实现了一部分方法**
+           * 的池替身，直接调会在那种替身上抛 `TypeError`（实测：
+           * `minimax-intl.spec.ts` 的登录组替身只有 `listAccounts`）——
+           * 读不到池时**宁可跳过继承**，也不能让登录直接崩。
+           */
+          if (minimaxProduct.id === MINIMAX_INTL.id
+            && typeof pool.listAccountsByProvider === 'function') {
+            const existingIntlProxies = new Set(
+              (await pool.listAccountsByProvider(MINIMAX_INTL.id))
+                .map((e) => asProxyText(e.minimaxIntlProxy))
+                .filter((p) => p.trim() !== ''),
+            )
+            // ⚠️ `typeof` 与 `trim()` 是**防御**：载荷无 schema 校验
+            // （同 `accioRegion` 的注释）。不传时 `req.minimaxIntlProxy`
+            // 是 `undefined` ⇒ 走继承那一级。
+            const requestedIntlProxy = typeof req.minimaxIntlProxy === 'string'
+              ? req.minimaxIntlProxy.trim()
+              : ''
+            const inheritedIntlProxy = existingIntlProxies.size === 1
+              ? [...existingIntlProxies][0]!
+              : ''
+            const intlProxyInput = requestedIntlProxy !== '' ? requestedIntlProxy : inheritedIntlProxy
+            /**
+             * ⚠️⚠️ **必须过 `normalizeProxy` 才能写池**（PR !145 审计 P1 修法）。
+             *
+             * `types.ts` 的 `RpcCreateAccountRequest.minimaxIntlProxy` 注释明文承诺
+             * 「来自客户端自报的 RPC 载荷（无 schema 校验）⇒ 读取侧必须过
+             * `normalizeProxy` 归一，非法值一律拒绝（与 `accioRegion` 同一条纪律）」，
+             * 而原实现只 `trim()` 就写池 —— **注释与实现相反**。
+             *
+             * 后果（**不可自愈**）：非法串（如 `ftp://host:21`）落盘后，该账号的
+             * **每一条链路**（登录 / 续期 / 目录 / 身份 / 推理 / 积分 / 探测）都会在
+             * `createMinimaxFetcherResolver` 的 `normalizeProxy` 处**抛错**
+             * （见 `minimax-proxy.ts` 的模块头：那里刻意选择抛错而非静默直连）。
+             * 用户只能手动改代理或删号重登；而登录期那条抛错还会被 `catch` 成
+             * 「无法启动 MiniMax 登录（设备码申请失败）」——**文案指错了方向**。
+             *
+             * ⚠️ 与 `minimaxintl.setProxy` 端点（`minimax-rpc.ts`）**必须同口径**：
+             * 那里早就归一化了。同一字段两个写入入口两套判据，正是本仓库
+             * 「同义判据两份实现必然漂移」红线。
+             *
+             * ⚠️ 继承来的值来自池、而池里的值已由 `setProxy` 归一化 ⇒ 它**必然合法**，
+             * 故归一化失败只可能是载荷那条腿（用户/脚本手填），
+             * 此时**拒绝整个登录**并给出可操作原因，而不是把脏值写进池。
+             */
+            if (intlProxyInput !== '') {
+              const normalized = normalizeProxy(intlProxyInput)
+              if (!normalized.ok) {
+                // ⚠️ 删掉刚建的占位条目：不留「有账号但配置非法」的幽灵卡片。
+                void pool.removeAccount(id).catch(() => {})
+                return {
+                  ok: false,
+                  error: {
+                    code: 'bad-request',
+                    message: `出口代理地址无效：${normalized.reason}`,
+                  },
+                }
+              }
+              await pool.setMinimaxIntlProxy(id, normalized.proxy.url)
+            }
+          }
+
           let minimaxStarted: StartedMinimaxLoginFlow
           try {
-            minimaxStarted = await minimaxAuth.startLogin()
+            // ⚠️ **必须传 `accountId`**：换 token 那一次请求发生在凭据落盘
+            // **之前**，此时只有池里的占位条目认得这个账号 —— 不传就拿不到它的
+            // 代理 ⇒ 大陆网络下国际站**登录恒失败**，症状与「凭据无效」同形。
+            minimaxStarted = await minimaxAuth.startLogin({ accountId: id })
           } catch (error) {
             // 设备码申请失败：删掉占位条目，不留幽灵账号。
             void pool.removeAccount(id).catch(() => {})
@@ -4489,7 +4595,8 @@ function registerJetHubEndpoints(
           }
 
           minimaxStarted.result.then(async (credential) => {
-            const result = await minimaxAuth.persistLogin(credential, { refName })
+            // ⚠️ 同 `startLogin`：身份查询也要走该账号的出口。
+            const result = await minimaxAuth.persistLogin(credential, { refName, accountId: id })
             /**
              * 昵称：两站必须可区分（同一面板左右没有，但**账号列表与用量徽标**
              * 都会显示它，而两站账号可能出现在同一个聚合候选里）。
