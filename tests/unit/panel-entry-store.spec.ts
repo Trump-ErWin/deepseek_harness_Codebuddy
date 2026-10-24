@@ -198,6 +198,41 @@ describe('面板入口客户端状态', () => {
     expect(store.panelEntryReadFailed()).toBe(false)
   })
 
+  /**
+   * ⚠️⚠️ **读请求必须带超时信号，且老内核也有兜底**（2026-10-24 审计 M1）。
+   *
+   * 原实现：缺 `AbortSignal.timeout`（`build.mjs` 的 `target: ['chrome100']`，
+   * 该 API 是 Chrome 103+）时 `readSignal()` 返回 `undefined` ⇒ **超时保护
+   * 整个消失** ⇒ 宿主 RPC 永不 settle 时读取永久挂起，叠加 `inflight` 复用
+   * ⇒ 此后永远读不到宿主真实值。
+   *
+   * ⚠️ 判据必须**真的把原生 API 摘掉**再调，不能只断言源码里有 `AbortController`
+   *    —— 那种查字面量的写法对「忘了写兜底分支」完全失明。
+   */
+  it('⚠️⚠️ 原生 AbortSignal.timeout 缺失时，读取仍带自建超时信号', async () => {
+    const store = await freshModule()
+    const realTimeout = (AbortSignal as unknown as { timeout?: unknown }).timeout
+    expect(typeof realTimeout, '本环境的 AbortSignal.timeout 不是函数，用例前提不成立').toBe('function')
+
+    // 模拟老内核：把原生 API 摘掉。
+    ;(AbortSignal as unknown as { timeout?: unknown }).timeout = undefined
+    try {
+      let receivedSignal: unknown = 'NOT-CALLED'
+      const rpc = async (_endpoint: string, _payload: unknown, signal?: unknown) => {
+        receivedSignal = signal
+        return { entry: 'sidebar' }
+      }
+      await store.loadPanelEntry(rpc as never)
+      // 关键：不能是 undefined（那正是原实现的缺陷形态）。
+      expect(receivedSignal, '缺原生 API 时没有自建超时 ⇒ 读取可无限悬挂')
+        .not.toBeUndefined()
+      expect(receivedSignal).not.toBe('NOT-CALLED')
+      expect((receivedSignal as AbortSignal).aborted, '自建信号应当尚未触发').toBe(false)
+    } finally {
+      ;(AbortSignal as unknown as { timeout?: unknown }).timeout = realTimeout
+    }
+  })
+
   it('⚠️⚠️ 慢读回包不得把用户刚写入的值倒灌回旧值（复核 I3）', async () => {
     // 时序：读请求在飞（慢）→ 用户选「仅设置页」写入成功 → 那个慢读回包带着
     // **写之前**的 'sidebar' 到达 → 若无防倒灌，它会覆盖回 sidebar，

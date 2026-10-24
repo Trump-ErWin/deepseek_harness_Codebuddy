@@ -1393,7 +1393,17 @@ class FileStore implements JetHubStore {
   }
 
   async save(state: JetHubState): Promise<void> {
-    this.write(state)
+    // ⚠️ **过一遍 sanitize，与 `SettingsStore.save` 对齐**（2026-10-24 审计 M7）。
+    //
+    // 两个后端写的是同一份文档形状，但此前只有 `SettingsStore.save` 归一化入参，
+    // 本方法原样落盘 ⇒ 同一语义两套判据（本仓库红线 PR !62 的幼苗形态）。
+    // 生产影响低（`AccountPool.queueStoreSave` 传入的都是已归一的缓存），
+    // 但「脏值只可能从读路径进来」这个假设不该靠约定维持 —— 读侧有
+    // `sanitizePanelEntry`，写侧也必须有。
+    //
+    // ⚠️ 只归一**本键**：其余键的归一化各有自己的守卫与事故史（见
+    // `SettingsStore.save` 的逐键注释），在这里顺手全做会越过那些判据。
+    this.write({ ...state, panelEntry: sanitizePanelEntry(state.panelEntry) })
   }
 
   private write(state: JetHubState): void {

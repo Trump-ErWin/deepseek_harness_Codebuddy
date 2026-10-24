@@ -170,8 +170,28 @@ export function registerJetHubPanelEntries(ctx, rpcCall) {
     };
 
     const unsubscribe = subscribePanelEntry(() => sync(panelEntryShowsSidebar()));
-    // 启动时先等一次宿主读值：`panelEntry()` 为 `null` 期间本函数按「仅侧栏」
-    // 兜底（见 store 的 `panelEntryShowsSidebar`），故这里只需读一次。
+
+    /**
+     * ⚠️⚠️ **注册当下必须先按当前取值同步一次**（2026-10-24 审计 M1，P1 真缺陷）。
+     *
+     * 原来这里**没有**这一行，只靠 ①`subscribePanelEntry` 回调（要 `publish()`
+     * 先发生）②`loadPanelEntry().then(...)`。而读值未 settle 前 `sync` 从未被
+     * 调用 ⇒ **两处入口一个都不注册**，界面空白，用户以为插件坏了。
+     *
+     * 「`null` 期间按仅侧栏兜底」这句话写在 `panelEntryShowsSidebar` 的谓词里，
+     * 但谓词只在 `sync` **被调用时**求值 —— 不调用等于兜底不执行。**谓词层成立、
+     * 接线层不成立**，而 store 的单测只看谓词，看不见这个缺口。
+     *
+     * 触发条件：`readSignal()` 在缺 `AbortSignal.timeout` 时返回 `undefined`
+     * （`build.mjs` 的 `target: ['chrome100']`，该 API 是 Chrome 103+）⇒ 读取
+     * 可无限悬挂；叠加 `inflight` 复用 ⇒ 一次悬挂让后续每次读取都复用永不
+     * settle 的 Promise，**永久**两处皆无。
+     *
+     * ⇒ 先同步一次（`null` ⇒ 注册侧栏行），再等宿主读值回来纠正。
+     */
+    sync(panelEntryShowsSidebar());
+
+    // 读到宿主偏好之后再同步一次：它可能把上面那次「兜底的注册」纠正成撤销。
     //
     // ⚠️ `disposed` 守卫**必需**：本槽位被宿主 dispose 之后，在飞的那次读取仍会
     //    resolve，那时再调 `sync` 就会往一个已销毁的作用域里重新注册（热替换时
@@ -194,8 +214,15 @@ export function registerJetHubPanelEntries(ctx, rpcCall) {
   // ── 入口二：设置弹层里的那一节 ──
   //
   // ⚠️ 与上面那条**互斥**：选「仅侧栏」时本槽位整条注销，设置弹层里不再有
-  //    「Jet Hub」一节（`SettingsRoot` 的关闭按钮随之消失，用户仍可点弹层外
-  //    空白处收起）。这是下拉语义的直接后果，不是缺陷。
+  //    「Jet Hub」一节。这是下拉语义的直接后果，不是缺陷。
+  //
+  // ⚠️ **弹层不会卡住、× 也不会消失**（2026-10-24 审计纠正，两轮都指出这处）：
+  //    那个 × 由 `SettingsPanel` 自己渲染（`dsh-client-ui-settings-general` 的
+  //    `className: …close` / `onClick: onClose`），**不属于** `settings.section`
+  //    这一节 ⇒ 本行此前写的「关闭按钮随之消失」是**事实错误**。
+  //    另外 `SettingsPanel` 的 `const active = rows.find(r => r.id === activeId)?.id
+  //    ?? rows[0]?.id` ⇒ 本节注销时会**回落到首节**，所以弹层既不空白也不卡住，
+  //    只是内容会静默跳走（同样无提示，属可接受）。
   ctx.slots.inject('settings.section', () => {
     /** 当前设置节的 disposer；`undefined` = 还没注册（或已撤销）。 */
     let stopSection;
@@ -224,6 +251,17 @@ export function registerJetHubPanelEntries(ctx, rpcCall) {
     };
 
     const unsubscribe = subscribePanelEntry(() => sync(panelEntryShowsSettings()));
+
+    /**
+     * ⚠️ 注册当下也先同步一次（与侧栏行同款，2026-10-24 审计 M1）。
+     *
+     * 与侧栏行的差别：`null`（还没读到）时 `panelEntryShowsSettings()` 返回
+     * **false** ⇒ 这次 `sync(false)` 是**空操作**，不会错误地放出设置节。
+     * 但若模块状态里**已有**上次读到的值（热替换 / 二次 inject），这一行就能
+     * 立刻把设置节放对位置，不必等一次网络往返。
+     */
+    sync(panelEntryShowsSettings());
+
     // ⚠️ 与侧栏行相反：`panelEntry()` 为 `null`（还没读到）时本函数返回 false，
     //    所以首次读值**必须**等回来再判 —— 否则「仅设置页」的用户每次启动都
     //    会看到设置节晚一拍出现。

@@ -69,6 +69,19 @@ describe('插件详情页槽位接线', () => {
  */
 describe('PanelEntry 合法取值：宿主与客户端必须逐字一致', () => {
   /**
+   * 去掉行注释（`//` 到行尾）与块注释（`/* … *\/`），**再**做锚点查找。
+   *
+   * ⚠️⚠️ 必须剥注释（2026-10-24 审计 M3）：原实现用 `text.indexOf(anchor)`，
+   * 而 `indexOf` **认注释**。实测：把 `VALID_ENTRIES` 真改成 `['sidebar']`，
+   * 同时在上一行写 `// 说明：const VALID_ENTRIES = ['sidebar', 'settings'];`
+   * ⇒ 跨语言对拍那条**全绿**（`indexOf` 命中的是注释那一行，抽出的仍是
+   * 两个正确值）。注释诱饵在本 PR 里三处全中，这是其中一处。
+   */
+  const stripComments = (text: string): string => text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '')
+
+  /**
    * 从源码文本里抽出「同一行内、锚点之后」那个数组字面量的字符串元素。
    *
    * ⚠️ 只截到**行尾**：宿主的声明是
@@ -76,10 +89,15 @@ describe('PanelEntry 合法取值：宿主与客户端必须逐字一致', () =>
    * —— 类型注解里的 `[]` 会让「找第一个 `[`」提前闭合（实测假红）。
    */
   const entriesOf = (text: string, anchor: string): string[] => {
-    const at = text.indexOf(anchor)
+    const stripped = stripComments(text)
+    const at = stripped.indexOf(anchor)
     expect(at, `找不到锚点 ${anchor}`).toBeGreaterThan(-1)
-    const lineEnd = text.indexOf('\n', at)
-    const line = text.slice(at, lineEnd === -1 ? text.length : lineEnd)
+    // ⚠️ 自证：剥注释后锚点必须**只出现一次**。出现多次说明有第二个同形声明
+    //    （或剥注释逻辑失效），此时 indexOf 会静默取第一个 —— 那正是 M3 的形态。
+    const hits = stripped.split(anchor).length - 1
+    expect(hits, `锚点 ${anchor} 在剥注释后的源码里出现 ${hits} 次（必须恰好 1 次）`).toBe(1)
+    const lineEnd = stripped.indexOf('\n', at)
+    const line = stripped.slice(at, lineEnd === -1 ? stripped.length : lineEnd)
     const open = line.indexOf('= [')
     expect(open, `锚点 ${anchor} 所在行找不到 "= ["`).toBeGreaterThan(-1)
     return [...line.slice(open).matchAll(/'([^']+)'/g)].map((m) => m[1])

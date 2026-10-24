@@ -164,13 +164,37 @@ function publish(nextEntry, nextFailed) {
 }
 
 /**
- * 组装读取用的 AbortSignal；老内核没有 `AbortSignal.timeout` 就不带信号。
+ * 组装读取用的 AbortSignal。
+ *
+ * ⚠️⚠️ **必须自己造超时，不能只依赖 `AbortSignal.timeout`**（2026-10-24 审计 M1）。
+ *
+ * `build.mjs` 的 esbuild `target: ['chrome100']`，而 `AbortSignal.timeout` 是
+ * **Chrome 103+ / Node 17.3+** 才有的 API。原实现「没有该 API 就返回 `undefined`」
+ * 等于**把超时保护整个摘掉**：宿主 RPC 永不 settle 时 `loadPanelEntry` 永久挂起，
+ * 叠加 `inflight` 复用 ⇒ 后续每次读取都复用那个永不 settle 的 Promise，
+ * **此后永远读不到宿主真实值**。
+ *
+ * 修法：有原生 API 就用（更精确）；没有就用 `AbortController` + `setTimeout`
+ * 等价实现 —— 后者只需 `AbortController`（Chrome 66+），覆盖面足够。
  *
  * @returns {AbortSignal | undefined}
  */
 function readSignal() {
-  if (typeof AbortSignal === 'undefined' || typeof AbortSignal.timeout !== 'function') return undefined;
-  return AbortSignal.timeout(PANEL_ENTRY_READ_TIMEOUT_MS);
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    return AbortSignal.timeout(PANEL_ENTRY_READ_TIMEOUT_MS);
+  }
+  // 老内核兜底：自建超时。`AbortController` 也不存在时只能放弃信号，退化为「可能
+  // 悬挂」；但这种内核连 fetch 的取消都不支持，已超出本插件的运行基线。
+  if (typeof AbortController !== 'function') return undefined;
+  const controller = new AbortController();
+  // ⚠️ 触发后清掉定时器，避免每次读取都留一个悬挂 timer（Node 侧还会让进程晚退）。
+  const timer = setTimeout(() => controller.abort(), PANEL_ENTRY_READ_TIMEOUT_MS);
+  if (typeof timer === 'object' && timer !== null && typeof timer.unref === 'function') {
+    // Node 下不阻止进程退出；浏览器里 timer 是 number，走不到这里。
+    timer.unref();
+  }
+  controller.signal?.addEventListener?.('abort', () => clearTimeout(timer), { once: true });
+  return controller.signal;
 }
 
 /**

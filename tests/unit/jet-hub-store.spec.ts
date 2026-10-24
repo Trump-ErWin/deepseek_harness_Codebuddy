@@ -522,6 +522,24 @@ describe('文件后端（FileStore）', () => {
   })
 
   /**
+   * ⚠️⚠️ **落盘前必须过 sanitize**（2026-10-24 审计 M7）。
+   *
+   * 两个后端的 `save` 写的是同一份文档形状，但此前只有 `SettingsStore.save`
+   * 归一化入参，`FileStore.save` **原样落盘** ⇒ 脏值被写进文档、下次启动再被
+   * 读侧 sanitize 纠正。写侧没判据时，「脏值只可能来自读路径」这个假设全靠
+   * 调用方约定维持（本仓库红线 PR !62 的幼苗形态）。
+   *
+   * ⚠️ 判据必须**真的写一次脏值再读文件**，不能只查源码里有没有
+   *    `sanitizePanelEntry` —— 那种写法对「只加在注释里」完全失明。
+   */
+  it('⚠️⚠️ FileStore 落盘前归一化 panelEntry（脏值不得写进文档）', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, panelEntry: 'GARBAGE' as never })
+    const raw = JSON.parse(readFileSync(join(dir, 'jet-hub', 'state.json'), 'utf-8')) as Record<string, unknown>
+    expect(raw.panelEntry, '脏值被原样写进了 state.json ⇒ 写侧缺 sanitize').toBe('sidebar')
+  })
+
+  /**
    * ⚠️ 中间版本曾把 `permanentLocks` 写进这份**共享文档**，那批磁盘状态如今
    * 可能还带着它。新版必须**忽略**它（不读、不因此改变镜像值）—— 否则
    * 「读一份随时会被旧版本抹掉的文档」这条错误路径又被允许了。
