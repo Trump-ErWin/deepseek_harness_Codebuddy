@@ -20,6 +20,9 @@ import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 //      整份客户端 bundle 打包失败（症状：面板全白）。
 //    - origin/master：`opencode-proxy-modal` 新增 `MinimaxIntlProxyModal`（minimax
 //      国际版出口代理）⇒ 必须保留在解构列表里，漏掉即 `undefined is not a component`。
+//    ⚠️ 2026-10-24 二次合并（`pr_144_new` = 作者自己的 master 合并 a40496b）：
+//      作者那份合并在同一位置**做了完全相同的取舍**（删旧 sidebar import、留
+//      MinimaxIntlProxyModal），只是没留注释 —— 两侧实际代码一致，冲突纯属文本层。
 import { OpencodeKeyModal, OpencodeProxyModal, GeminiProxyModal, MinimaxIntlProxyModal } from './opencode-proxy-modal.js';
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
 //    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
