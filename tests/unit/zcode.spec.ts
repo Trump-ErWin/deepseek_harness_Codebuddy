@@ -41,6 +41,7 @@ import {
   buildZcodeHeaders,
   ZCODE_BILLING_BALANCE_URL,
   ZCODE_PLAN_MESSAGES_URL,
+  ZCODE_VERSION_GATED_MIN_APP_VERSION,
 } from '../../src/zcode-upstream.js'
 import {
   describeUpstreamError,
@@ -438,6 +439,34 @@ describe('ZCode 请求头与错误映射', () => {
   it('JSON 头默认带，可用 json:false 关掉', () => {
     expect(buildZcodeHeaders(credential)['Content-Type']).toBe('application/json')
     expect(buildZcodeHeaders(credential, { json: false })).not.toHaveProperty('Content-Type')
+  })
+
+  it('★ 版本号必须抬到门槛 —— 报旧版本会被上游判成异常客户端', () => {
+    // 依据（2026-10-25 真机取证）：官方客户端 2026-10-23 升级到 3.16.3 之后，
+    // 插件的**推理**请求开始稳定 `405 + request has been blocked due to
+    // unusual activity`（跨账号、跨会话；官方客户端同账号同网络正常）。
+    // 当时身份块已逐字对齐、官方 11 个头（`Suc` 全量）也全部对齐，
+    // **版本号是唯一与官方不一致的请求特征**。
+    //
+    // 反面：改回 `credential.app_version ?? ZCODE_APP_VERSION_FALLBACK`
+    // 会让本用例变红（凭据写的是 3.14.3）。
+    const headers = buildZcodeHeaders({ ...credential, app_version: '3.14.3' })
+    expect(headers['X-ZCode-App-Version']).toBe(ZCODE_VERSION_GATED_MIN_APP_VERSION)
+    expect(headers['User-Agent']).toBe(`ZCode/${ZCODE_VERSION_GATED_MIN_APP_VERSION}`)
+  })
+
+  it('凭据版本比门槛高时用凭据自己的（向前兼容，不把用户降级）', () => {
+    const headers = buildZcodeHeaders({ ...credential, app_version: '3.17.0' })
+    expect(headers['X-ZCode-App-Version']).toBe('3.17.0')
+    expect(headers['User-Agent']).toBe('ZCode/3.17.0')
+  })
+
+  it('显式 appVersion 覆盖优先于凭据与门槛两者', () => {
+    const headers = buildZcodeHeaders(
+      { ...credential, app_version: '3.17.0' },
+      { appVersion: '3.16.3' },
+    )
+    expect(headers['X-ZCode-App-Version']).toBe('3.16.3')
   })
 
   it('端点常量是实测值', () => {
