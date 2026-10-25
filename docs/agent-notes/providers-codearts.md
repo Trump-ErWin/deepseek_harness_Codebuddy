@@ -257,3 +257,62 @@ HTTP 200、正文正常、上游零报错 —— 因为**图根本没发出去**
 **真机验收（2026-10-22）**：16×16 纯绿 PNG，`glm-5.3`（文本模型）经工具识图，
 返回「整个画面为**亮绿色**（近似荧光绿，RGB 可能接近 #00FF00）… 图片中没有任何文字」
 ⇒ 图真的到了上游，且描述准确。
+
+## ⚠️⚠️ bili 压缩代理的「拒发改写请求」（Gitee IKQ7AP，2026-10-25 修）
+
+长会话触发上下文压缩后，请求体被改写，而 SDK-HMAC-SHA256 签名**覆盖正文** ⇒
+本机压缩代理 bili（billion-context）按 compress-or-refuse contract **拒发**，
+回 HTTP 403 + `{"error":{"type":"signed_request_requires_resign",
+"code":"bili_resign_unavailable","message":"bili refused to forward this
+sdk-hmac-sha256 …-signed request: the signature covers the request body, and any
+rewrite (context compression) would invalidate it upstream (401 APIG.0301 /
+SignatureDoesNotMatch). No re-sign credential was available for this scheme."}}`
+
+**修复前的连锁反应**（`src/llm-adapter.ts`）：
+
+1. `isTransientSignatureFailure` 只认 `body hash mismatch` ⇒ bili 不命中；
+2. `isAuthError` 对 401/403 恒真 ⇒ **白刷一次 refresh**（真实 STS 网络往返）；
+3. 重试仍被拒 ⇒ `httpErrorCode` 归 `AUTH` ⇒ 客户端把 message 整条换成
+   「API 密钥无效」⇒ 唯一指路的「No re-sign credential」丢失。
+4. 实测四格：code=AUTH / refresh 1 次 / message 只剩
+   `codearts: model request failed with HTTP 403` / `bili_resign_unavailable` 不可搜。
+
+**修法**：新增 `isProxyResignRefusal`（只认 bili **三个独有 marker**）+
+`PROXY_REFUSED_SIGNED` 独立码 + `proxyResignRefusalFailure`（文案带两条可执行
+出路）+ **三处接线**（`isAuthError` 排除 / `httpErrorCode` 单列 / chat 循环**独立
+早退**：不刷新、不重发、不换号）。
+
+### ⚠️ 判据刻意**不认** `APIG.0301` / `SignatureDoesNotMatch`
+
+bili 的 message 里**恰好引用**了这两个词（描述它为什么拒发）⇒ 按它们放宽会把
+**真凭据问题**误判成代理拒发。只认三个 bili 独有串。
+
+### ⚠️ 为什么「不换号」是对的
+
+bili 拦的是 fetch 层**改写后的请求**；改写（压缩）与账号无关，且判据
+（`isProxyResignRefusal`）只看 status+body、账号 id 根本不入参 ⇒ 账号 B 同样被拒
+⇒ 换号必然再撞。早退抛错时 `rateLimitTried` 只有 1 个账号（三处 `add` 都在早退
+之后），且早退**不调** `updateModelRateLimit` ⇒ issue 附言里「另一插件把账号
+永久禁用」的教训**没有重演**。
+
+### ⚠️ 变异验证的教训：单删早退**前面**的腿是全绿的
+
+`isAuthError` 排除腿 / `httpErrorCode` 单列腿单独删 ⇒ **全绿**（早退在两者之前，
+不可达）。必须用**组合变异**（删早退 + 删其中一腿，模拟「重构把早退挪走」）
+才有牙（各 4 红）。⇒ **防御性冗余的腿要靠组合变异验证**，单删会误判「无牙」。
+
+### ⚠️ 登记未修：bili 若改用 HTTP 200 下发拒发（无本机证据，不修）
+
+| 形态 | 现实现落点 |
+|---|---|
+| 200 + SSE 嵌套 `error{}` | 不可见（`consumeSse` 只读顶层 `error_code`）⇒ `EMPTY_RESPONSE` |
+| 200 + SSE 顶层 `error_code` | `INVALID_REQUEST`（message 含原文但码错） |
+| 200 + 裸 JSON | 同第一行 ⇒ `EMPTY_RESPONSE` |
+
+**不修的三条理由**：① bili 是本机代理，拒发发生在 fetch 建连阶段，契约下只能是
+HTTP 层拒绝，200 **无本机证据**（bili 未装、文档不可得）；② 任务建议的
+「放宽状态闸门」实测**打在不存在的调用点上**（`consumeSse` 的 `error_code` 分流
+不调 `isProxyResignRefusal`），真要修须**新建通道**（嵌套 `error.code` 解析）；
+③ 误判面已实测：agent 正常回答若引用这三个 marker（本仓库源码自身含 13 次），
+200 通道版判据**全部 TRUE** ⇒ 把正常回答变成硬失败，还会给出「重新登录无用」的
+**假指路**。收益/风险不对称，按仓库「不据构造的报文改分类」的纪律仅登记。

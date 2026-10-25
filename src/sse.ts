@@ -544,11 +544,28 @@ export const TOOL_ARGS_INVALID_CODE = 'TOOL_ARGS_INVALID'
  *
  * ## 判据与落盘口径**同源**
  *
- * 这里直接用 `normalizeToolArguments(text) !== '{}' || text.trim() === ''`：
- * 它天然与 `block-end` 那行「非截断一律过 `normalizeToolArguments`」是同一份
- * 判据，不另写一遍（否则又是一处「同一语义两套判据」）。
- * 空串单独放行（无参数工具的合法形态，`normalizeToolArguments('')` 也是 `'{}'`，
- * 但它在本仓库语义里是**可用**的）。
+ * 这里解析后按「是不是**非空对象**」判，而不是拿 `normalizeToolArguments` 的
+ * 产物与字面量 `'{}'` 比：
+ *
+ * ⚠️⚠️ **第一版正是 `normalizeToolArguments(raw) !== '{}'`，那是比错对象**
+ * （对抗审计实测的 P1）：`normalizeToolArguments` 对合法对象返回的是
+ * **trim 后的原文**（见该函数 `return trimmed` 那一支）⇒
+ *
+ * | 输入 | 解析后语义 | 第一版判定 |
+ * |---|---|---|
+ * | `'{}'` | 空对象（无参工具的常见形态） | **不可用** ← 错 |
+ * | `' {} '` | 空对象 | **不可用** ← 错 |
+ * | `'{ }'` | 空对象 | 可用 |
+ *
+ * `'{}'` 与 `'{ }'` 语义**完全相同**、结论相反 ⇒ 自证是比错对象而非取舍。
+ *
+ * 端到端后果：坏块 + 一个参数为 `'{}'` 的合法无参调用 ⇒ 四家全部报
+ * **`TOOL_ARGS_INVALID`**（不在 harness 可重试集合 ⇒ 硬失败），而本该报
+ * `max-tokens`（保住那个可用调用）。`'{}'` 是无参工具最常见的形态，
+ * 触发面不小 —— 故定 P1 而非 P2。
+ *
+ * ⚠️ 「空串」单独放行：无参工具也可能只下发一个空分片，那在本仓库语义里
+ * **是**可用的。
  *
  * ⚠️ 本函数**只用于**「是否还有另一个可用调用」这条门禁，**不用于**判断
  * 「要不要报 `TOOL_ARGS_INVALID`」——后者看 `classifyToolArguments === 'invalid'`。
@@ -558,7 +575,17 @@ export const TOOL_ARGS_INVALID_CODE = 'TOOL_ARGS_INVALID'
  */
 export function isUsableToolArguments(raw: string): boolean {
   if (raw.trim().length === 0) return true
-  return normalizeToolArguments(raw) !== '{}'
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    // 解析不了 ⇒ 不可用（调用方另有 classifyToolArguments 管「坏」的归类）。
+    return false
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+  // 空对象（`{}` / `{ }` / `{"":""}` 之外的一切）都算可用 —— 只要工具自己
+  // 能接受空参数包即可；harness 的 schema 校验会拦「缺必填字段」。
+  return true
 }
 
 /**

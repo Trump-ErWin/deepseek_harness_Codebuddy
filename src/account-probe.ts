@@ -345,6 +345,20 @@ async function probeWithAdapter(
       // 是本仓库在此约束下的最优解；该表达式由本文件与 buddy 两侧的用例共同锁住
       // （任一侧少了 explicit 腿，那条「服务端给了时刻以它为准」的用例就会红）。
       const parsed = parseRateLimitError(message, modelId)
+      //
+      // ⚠️⚠️ **入参是「适配器压平后的 message」，不是原始报文** —— 这带来一条
+      // 已实测的窄风险（对抗审计 2026-10-25 登记，未修）：
+      // `isCreditExhausted` 有一条**文案腿**（`积分|额度|余额` + `不足|耗尽|用尽`），
+      // 它扫的是这段被包装过的文本。实测一条**普通限流**报文
+      // `{"code":429,"msg":"所有账号的「15 天内到期」积分都已用尽…"}` 命中
+      // `积分.{0,4}用尽` ⇒ 被判「额度耗尽」⇒ 写下**自然日**冷却，
+      // 而它本该走 `+1h` / 服务端时刻。
+      //
+      // 触发面窄（要求 429 正文含那几句确定性格式），故**仅登记不改判据**：
+      // 收窄文案腿会让「上游改措辞」时漏判（更常见的失败形态），
+      // 而收窄的收益只是这一格。若将来实测到该形态，正确修法是
+      // **让探测腿能拿到原始报文**（在 `ProbeModelResult` 上加一个原始 body 字段），
+      // 而不是继续在压平文本上加正则。
       const creditExhausted = isCreditExhausted(message)
       const resetTimeMs = creditExhausted
         ? explicitRateResetAtMs(message) ?? creditExhaustedResetAtMs()

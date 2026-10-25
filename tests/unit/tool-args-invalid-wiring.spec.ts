@@ -78,6 +78,7 @@ function expectBaseline(cases: {
   truncated: Record<string, any>
   withProse: Record<string, any>
   withUsableCall: Record<string, any>
+  withEmptyObjectArgs: Record<string, any>
   finishedByLength: Record<string, any>
 }): void {
   // ① 坏 JSON（结构闭合但非法）+ 零正文 + 无可用调用 ⇒ 独立错误码
@@ -93,7 +94,16 @@ function expectBaseline(cases: {
   expect(cases.withProse.kind).toBe('max-tokens')
   // ⑤ 另有参数可解析的可用调用 ⇒ max-tokens（不一起作废）
   expect(cases.withUsableCall.kind).toBe('max-tokens')
-  // ⑥ finish=length ⇒ max-tokens（上游已宣告截断，新码必须让位）
+  // ⑥ 另一调用的参数是**空对象 `{}`** ⇒ 也算可用调用 ⇒ max-tokens。
+  //
+  // ⚠️⚠️ 本格是**对抗审计实测的 P1**（第一版漏了它）：`isUsableToolArguments`
+  // 曾用 `normalizeToolArguments(raw) !== '{}'` 比字面量，而后者对合法对象返回
+  // **trim 后的原文** ⇒ `'{}'` 被判「不可用」而 `'{ }'` 判「可用」（语义相同、
+  // 结论相反 ⇒ 自证比错对象）。后果：坏块 + 一个参数为 `{}` 的合法无参调用
+  // 会报 **`TOOL_ARGS_INVALID`**（不在可重试集合 ⇒ 硬失败），而本该报
+  // max-tokens 保住那个调用。`{}` 是无参工具最常见的形态，触发面不小。
+  expect(cases.withEmptyObjectArgs.kind, '空对象参数的调用也是可用调用').toBe('max-tokens')
+  // ⑦ finish=length ⇒ max-tokens（上游已宣告截断，新码必须让位）
   expect(cases.finishedByLength.kind).toBe('max-tokens')
 }
 
@@ -122,6 +132,14 @@ describe('TOOL_ARGS_INVALID · openai-compat（共享链路，覆盖面最宽）
       withUsableCall: await consume([
         tool('compress', REAL_BAD_ARGS, 0),
         tool('read', '{"file_path":"a.md"}', 1),
+        frame({}, 'tool_calls'), 'data: [DONE]\n\n',
+      ]),
+      // ⚠️ 空对象参数（无参工具最常见形态）⇒ 也是可用调用 ⇒ 应报 max-tokens。
+      // 本格是对抗审计实测的 P1 补丁：判据曾把 `{}` 误判「不可用」（详见
+      // `sse.ts` 的 `isUsableToolArguments` 注释）。
+      withEmptyObjectArgs: await consume([
+        tool('compress', REAL_BAD_ARGS, 0),
+        tool('list_dir', '{}', 1),
         frame({}, 'tool_calls'), 'data: [DONE]\n\n',
       ]),
       finishedByLength: await consume([tool('compress', REAL_BAD_ARGS), frame({}, 'length'), 'data: [DONE]\n\n']),
@@ -201,6 +219,14 @@ data: ${JSON.stringify(data)}
       withUsableCall: await consume([
         tool('compress', REAL_BAD_ARGS, 0), tool('read', '{"file_path":"a.md"}', 1), finish('tool_calls'),
       ]),
+      // ⚠️ 空对象参数（无参工具最常见形态）⇒ 也是可用调用 ⇒ 应报 max-tokens。
+      // 本格是对抗审计实测的 P1 补丁：判据曾把 `{}` 误判「不可用」（详见
+      // `sse.ts` 的 `isUsableToolArguments` 注释）。
+      withEmptyObjectArgs: await consume([
+        tool('compress', REAL_BAD_ARGS, 0),
+        tool('list_dir', '{}', 1),
+        finish('tool_calls'),
+      ]),
       finishedByLength: await consume([tool('compress', REAL_BAD_ARGS), finish('length')]),
     })
   })
@@ -241,6 +267,14 @@ describe('TOOL_ARGS_INVALID · lobsterai', () => {
       withUsableCall: await consume([
         tool('compress', REAL_BAD_ARGS, 0),
         tool('read', '{"file_path":"a.md"}', 1),
+        frame({}, 'tool_calls'), 'data: [DONE]\n\n',
+      ]),
+      // ⚠️ 空对象参数（无参工具最常见形态）⇒ 也是可用调用 ⇒ 应报 max-tokens。
+      // 本格是对抗审计实测的 P1 补丁：判据曾把 `{}` 误判「不可用」（详见
+      // `sse.ts` 的 `isUsableToolArguments` 注释）。
+      withEmptyObjectArgs: await consume([
+        tool('compress', REAL_BAD_ARGS, 0),
+        tool('list_dir', '{}', 1),
         frame({}, 'tool_calls'), 'data: [DONE]\n\n',
       ]),
       finishedByLength: await consume([tool('compress', REAL_BAD_ARGS), frame({}, 'length'), 'data: [DONE]\n\n']),
