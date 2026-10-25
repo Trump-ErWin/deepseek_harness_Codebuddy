@@ -341,7 +341,19 @@ export class MinimaxAuth extends Service {
     return parseMinimaxCredential(resolved.value)
   }
 
-  /** 续期默认单凭据。 */
+  /**
+   * 续期**默认单凭据**。
+   *
+   * ⚠️⚠️ **这是第 5 条续期路径，且必须同样继承身份**（2026-10-25 合并审计）：
+   * PR !147 声称「收口在**唯一**出口 `refreshCredentialFor`」，但本方法在生产上
+   * **可达**（`src/index.ts` 的 `getAvailableAccount()` 返回空时就走这里 ——
+   * 而「返回空」正是去重把两张卡都停用后的形态），且它此前直接
+   * `set(refreshMinimaxCredential(...))` ⇒ `nickname` / `user_id` **双双消失**
+   * （实测：续期后落盘只剩令牌五件套）。后果是 IKP8UA（昵称退回内部 id）+
+   * 去重失去唯一判据，**每 30 分钟一轮**，必然复现。
+   *
+   * ⇒ 与 `refreshCredentialFor` 共用同一个纯函数 `inheritMinimaxIdentity`。
+   */
   async refresh(): Promise<void> {
     const credential = await this.resolveDefaultCredential()
     if (credential === undefined) {
@@ -351,11 +363,13 @@ export class MinimaxAuth extends Service {
       throw new MinimaxRefreshTokenExpiredError('凭据缺少 refresh_token，请重新登录')
     }
     try {
-      const next = await refreshMinimaxCredential(
+      const refreshed = await refreshMinimaxCredential(
         credential.refresh_token as string,
         this.fetchImpl,
         this.product,
       )
+      // ⚠️ 与 `refreshCredentialFor` **同一份**继承判据（同义判据分两处必然漂移）。
+      const next = inheritMinimaxIdentity(refreshed, credential)
       await this.ctx.credentials.set(credentialRef(this.credentialRefName), JSON.stringify(next))
       this.lastRefreshError = undefined
     } catch (error) {
@@ -736,11 +750,30 @@ export class MinimaxAuth extends Service {
           await pool.updateAccount(entry.id, { nickname: identity.name })
           repaired.push(entry.id)
         }
-        // 顺带把身份写进凭据（`persistLogin` 的读取侧约定见该方法注释）。
-        if ((credential as { nickname?: string }).nickname !== identity.name) {
+        /**
+         * 顺带把身份写进凭据（`persistLogin` 的读取侧约定见该方法注释）。
+         *
+         * ⚠️⚠️ **必须连 `user_id` 一起补写**（2026-10-25 合并审计打穿）：
+         * 改前这里只写 `nickname`，而 `identity.userId` **就在手上**却被丢掉 ⇒
+         * 存量凭据（PR 之前登录的）永远没有 `user_id` ⇒ `account.create` 的
+         * 同账号去重**永不命中**（`findAccountIdByIdentityField` 对缺失字段是
+         * **跳过**，不是「不匹配」）⇒ 一个号仍可无限建卡、各持一份 token。
+         *
+         * 这条自愈是**唯一**能给存量账号补身份的地方：`persistLogin` 只写新账号，
+         * `inheritMinimaxIdentity` 只能继承「已有的」，救不了「从来没有的」。
+         * 本机三份 `MINIMAX_ACCOUNT_*` 凭据实测**零份**带 `user_id` ⇒ 不是边角情况。
+         */
+        const needsNicknameBackfill = (credential as { nickname?: string }).nickname !== identity.name
+        const needsUserIdBackfill = identity.userId !== undefined
+          && (credential as { user_id?: string }).user_id !== identity.userId
+        if (needsNicknameBackfill || needsUserIdBackfill) {
           await this.ctx.credentials.set(
             ref,
-            JSON.stringify({ ...credential, nickname: identity.name }),
+            JSON.stringify({
+              ...credential,
+              nickname: identity.name,
+              ...identity.userId === undefined ? {} : { user_id: identity.userId },
+            }),
           )
         }
       } catch (error) {

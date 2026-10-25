@@ -1449,8 +1449,8 @@ export function apply(ctx: Context): void {
       const days = buddyExpiringWindowDays()
       if (reason.kind === 'unknown') {
         return new Error(
-          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
-          + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而本次余额查询未能全部完成`
+          + `（${foldReasonErrors(reason.errors)}）。这些账号**可能仍有**「${days} 天内到期」`
           + '的积分 —— 请重试，或在 Jet Hub 对应面板检查凭据是否失效。',
         )
       }
@@ -1692,8 +1692,8 @@ export function apply(ctx: Context): void {
       const days = buddyExpiringWindowDays()
       if (reason.kind === 'unknown') {
         return new LlmError(
-          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
-          + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而本次余额查询未能全部完成`
+          + `（${foldReasonErrors(reason.errors)}）。这些账号**可能仍有**「${days} 天内到期」`
           + '的积分 —— 请重试，或在 Jet Hub 的 AStudio 面板检查凭据是否失效'
           + '（AStudio 的凭据是本机客户端会话的拷贝，客户端退出登录会让它失效）。',
           'QUOTA_EXCEEDED',
@@ -1796,8 +1796,8 @@ export function apply(ctx: Context): void {
       const days = buddyExpiringWindowDays()
       if (reason.kind === 'unknown') {
         return new LlmError(
-          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
-          + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而本次余额查询未能全部完成`
+          + `（${foldReasonErrors(reason.errors)}）。这些账号**可能仍有**「${days} 天内到期」`
           + '的积分 —— 请重试，或在 Jet Hub 的对应面板检查凭据是否失效。'
           + '⚠️ **国际站**另有地理分流风险：`agent.minimax.io` 会按出口 IP 把大陆来源'
           + ' 307 到中国站，而中国站不认国际站 token ⇒ 表现为余额查询恒失败'
@@ -1911,8 +1911,8 @@ export function apply(ctx: Context): void {
       const days = buddyExpiringWindowDays()
       if (reason.kind === 'unknown') {
         return new LlmError(
-          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
-          + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而本次余额查询未能全部完成`
+          + `（${foldReasonErrors(reason.errors)}）。这些账号**可能仍有**「${days} 天内到期」`
           + '的积分 —— 请重试。'
           + `⚠️ 若持续失败，请在 Jet Hub 的 ${displayName} 面板检查凭据是否失效`
           + '（AutoClaw 的 access_token 是**明文 JWT、寿命恒 24h**，过期后需要重新登录）。',
@@ -2016,7 +2016,7 @@ export function apply(ctx: Context): void {
    *   「换渠道 / 稍后再试」这句指路文案。
    */
   const loomyLockedError = (reason: LoomyNoAccountReason): Error => {
-    const details = reason.kind === 'exhausted' ? '' : `（${reason.errors.slice(0, 2).join('；')}）`
+    const details = reason.kind === 'exhausted' ? '' : `（${foldReasonErrors(reason.errors)}）`
     if (reason.kind === 'all-unknown') {
       return new LlmError(
         'Loomy：无法确认是否有可用账号。已锁定永久积分，而**所有**账号的余额查询都失败了'

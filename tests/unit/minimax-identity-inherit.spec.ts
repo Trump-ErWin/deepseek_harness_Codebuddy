@@ -127,12 +127,19 @@ describe('inheritMinimaxIdentity：纯函数判据', () => {
 
 /**
  * ⚠️ 下面这格需要 `@deepseek-ai/cordis`（`MinimaxAuth extends Service`）。
- * 本工作区的 `node_modules` 只有 `esbuild` / `tsx` / `vitest` ⇒ 依赖不齐时
- * **必须 SKIP 而不是 PASS**（仓库铁律：无依赖时 SKIP，不许让「没跑」冒充「通过」）。
+ * 依赖不齐时**必须 SKIP 而不是 PASS**（仓库铁律：无依赖时 SKIP，不许让「没跑」冒充「通过」）。
+ *
+ * ⚠️⚠️ 探针必须是 `await import()`（2026-10-25 审计实测）：改前用的
+ * `import.meta.resolve(...)` 在 Vite SSR 下**恒抛** `TypeError`
+ *（`__vite_ssr_import_meta__.resolve is not a function`）⇒ 恒 `false` ⇒
+ * 这两条**最承重**的行为用例**永久 SKIP**，而本机 cordis 其实是装着的、
+ * 用例体自己的 `await import('@deepseek-ai/cordis')` 也一直能成功 ——
+ * 探针与用例体用不同加载方式，就会得出「依赖不齐」的错误结论。
  */
-const cordisAvailable = (() => {
+const cordisAvailable = await (async (): Promise<boolean> => {
   try {
-    return import.meta.resolve('@deepseek-ai/cordis').length > 0
+    await import('@deepseek-ai/cordis')
+    return true
   } catch {
     return false
   }
@@ -218,5 +225,139 @@ describe('★★ 真跑一次续期：落盘凭据里身份必须还在（行为
     expect(body, '★ 继承必须作用在**新**凭据与**旧**凭据之间').toMatch(
       /inheritMinimaxIdentity\(\s*refreshed\s*,\s*credential\s*\)/,
     )
+  })
+})
+
+/**
+ * ★★ **第 5 条续期路径**：`refresh()`（无参、单凭据兜底）。
+ *
+ * ## 为什么必须单独钉住（2026-10-25 合并审计）
+ *
+ * PR !147 的说明写的是「收口在**唯一**出口 `refreshCredentialFor`」，但
+ * `src/index.ts` 的 `getAvailableAccount()` 返回空时走的是 `minimax.refresh()`
+ * —— 而「返回空」恰好是**同账号去重把两张卡都停用**之后的形态。该路径此前直接
+ * `set(refreshMinimaxCredential(...))`，实测续期后落盘只剩令牌五件套
+ * （`nickname` / `user_id` 双双消失）⇒ IKP8UA 复发 + 去重失去判据，
+ * 且每 30 分钟一轮必然复现。
+ *
+ * ⚠️ 判据必须看**落盘内容**（不是看函数有没有调用继承）：只断言「调了」的写法
+ * 在「调了但没用返回值」时仍然绿。
+ */
+describe('★★ refresh()：单凭据兜底路径也必须继承身份', () => {
+  it.skipIf(!cordisAvailable)('★★ refresh() 之后 nickname 与 user_id 都还在（落盘判据）', async () => {
+    const { Context } = await import('@deepseek-ai/cordis')
+    const store = new Map<string, string>()
+    store.set(MINIMAX.defaultCredentialRef, JSON.stringify(WITH_IDENTITY))
+    const ctx = new Context() as never as Record<string, unknown>
+    ;(ctx as { provide: (n: string, v: unknown) => void }).provide('credentials', {
+      resolve: async (ref: unknown) => {
+        const name = typeof ref === 'string' ? ref : String((ref as { name?: unknown })?.name ?? '')
+        const value = store.get(name)
+        return value === undefined ? undefined : { value }
+      },
+      set: async (ref: unknown, value: string) => {
+        const name = typeof ref === 'string' ? ref : String((ref as { name?: unknown })?.name ?? '')
+        store.set(name, value)
+      },
+    })
+    ;(ctx as { provide: (n: string, v: unknown) => void }).provide('logger', {
+      warn: () => {}, info: () => {}, debug: () => {},
+    })
+
+    const { MinimaxAuth } = await import('../../src/minimax-auth.js')
+    const auth = new MinimaxAuth(ctx as never, {
+      fetchImpl: (async () => refreshResponse()) as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    await auth.refresh()
+
+    const after = parseCred(store.get(MINIMAX.defaultCredentialRef) as string)
+    expect(after, '续期后的凭据必须仍能解析').toBeDefined()
+    expect(after?.access_token, '令牌必须是新的（否则本用例压根没续期）')
+      .not.toBe(WITH_IDENTITY.access_token)
+    expect(after?.nickname, '★ refresh() 路径丢了 nickname ⇒ 账号卡片退回内部 id')
+      .toBe('MiniMax523348')
+    expect(after?.user_id, '★★ refresh() 路径丢了 user_id ⇒ 同账号去重失去唯一判据')
+      .toBe('RZwmwvOBJEGE')
+  })
+})
+
+/**
+ * ★★ **存量账号的 `user_id` 自愈**（2026-10-25 合并审计打穿）。
+ *
+ * ## 缺陷
+ *
+ * `user_id` 全仓只有 `persistLogin` 一处写入（只写**新**账号）。而 PR 之前登录的
+ * 存量凭据**没有** `user_id`（本机三份 `MINIMAX_ACCOUNT_*` 实测零份带它）⇒
+ * `findAccountIdByIdentityField` 对缺失字段是**跳过**（不是「不匹配」）⇒
+ * 同账号去重对存量用户**永不触发**，一个号照旧可无限建卡。
+ *
+ * 唯一能给存量账号补身份的地方是启动自愈 `repairAccountNicknames` —— 它本来
+ * 就已经把 `identity.userId` 拿到手，却只写了 `nickname`（`identity.userId` 被丢弃）。
+ *
+ * ## 判据
+ *
+ * 真跑一次 `repairAccountNicknames`，断言**落盘凭据里出现 `user_id`**。
+ * ⚠️ 不能只断言「调用了某个函数」：这条缺陷的形态正是「数据拿到了但没写下去」。
+ */
+describe('★★ 存量账号自愈：repairAccountNicknames 必须把 user_id 写进凭据', () => {
+  it.skipIf(!cordisAvailable)('★★ 凭据里原本没有 user_id ⇒ 修完后必须有', async () => {
+    const { Context } = await import('@deepseek-ai/cordis')
+    const store = new Map<string, string>()
+    // 存量形态：有 nickname、**没有** user_id。
+    store.set('MINIMAX_ACCOUNT_OLD', JSON.stringify({
+      access_token: 'mmoat_' + 'o'.repeat(54),
+      refresh_token: 'mmort_' + 'r'.repeat(54),
+      token_type: 'Bearer',
+      expires_at: String(Date.now() + 3_600_000),
+      scope: 'agent.default',
+      nickname: 'MiniMax523348',
+    }))
+    const ctx = new Context() as never as Record<string, unknown>
+    const provide = (ctx as { provide: (n: string, v: unknown) => void }).provide.bind(ctx)
+    provide('credentials', {
+      resolve: async (ref: unknown) => {
+        const name = typeof ref === 'string' ? ref : String((ref as { name?: unknown })?.name ?? '')
+        const value = store.get(name)
+        return value === undefined ? undefined : { value }
+      },
+      set: async (ref: unknown, value: string) => {
+        const name = typeof ref === 'string' ? ref : String((ref as { name?: unknown })?.name ?? '')
+        store.set(name, value)
+      },
+    })
+    provide('logger', { warn: () => {}, info: () => {}, debug: () => {} })
+
+    const { MinimaxAuth } = await import('../../src/minimax-auth.js')
+    const identity = {
+      name: 'MiniMax523348',
+      userId: 'RZwmwvOBJEGE',
+    }
+    const auth = new MinimaxAuth(ctx as never, {
+      // 身份端点回真实形态（`data.userInfo.userID`），**不发真实网络**。
+      fetchImpl: (async () => new Response(JSON.stringify({
+        data: { userInfo: { name: identity.name, userID: identity.userId } },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+
+    const pool = {
+      listAccounts: async () => [{
+        id: 'minimax-old',
+        provider: 'minimax',
+        credentialRef: 'MINIMAX_ACCOUNT_OLD',
+        nickname: 'MiniMax523348',
+        enabled: true,
+        refreshable: true,
+      }],
+      updateAccount: async () => {},
+    }
+    await auth.repairAccountNicknames(pool as never)
+
+    const after = parseCred(store.get('MINIMAX_ACCOUNT_OLD') as string)
+    expect(after?.user_id, '★★ 存量凭据仍没有 user_id ⇒ 同账号去重对它永不触发（PR 的前提场景没被覆盖）')
+      .toBe('RZwmwvOBJEGE')
+    expect(after?.nickname).toBe('MiniMax523348')
+    expect(after?.access_token, '自愈只补身份，绝不能动令牌').toBeTruthy()
   })
 })

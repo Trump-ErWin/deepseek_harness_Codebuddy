@@ -49,6 +49,8 @@ let cursor = 0
 let writes: Array<{ index: number; value: unknown }> = []
 /** 本次渲染期间传进 `useCallback` 的回调（用于真实调用、观察写入形态）。 */
 let callbacks: unknown[] = []
+/** 本次渲染产出的 React 元素（只留 props：`onClick` 之类挂在这里）。 */
+let elements: Array<{ type: unknown; props: unknown }> = []
 
 function slot<T>(initial: T | (() => T)): { v: T } {
   const key = cursor++
@@ -71,7 +73,13 @@ const reactStub = {
     ]
   },
   useRef<T>(initial: T) {
-    return slot(initial)
+    // ⚠️ 组件里读的是 `ref.current`，不是 `.v`（`slot` 给 useState 用的是后者）。
+    // 改前这里直接返回 `slot(initial)` ⇒ `pollRef.current` 恒 `undefined` ⇒
+    // 「上一次登录仍在进行中」那条守卫**恒真** ⇒ 所有「新建账号」路径提前 return，
+    // 接线层根本走不到（2026-10-25 补「登录开窗」用例时实测）。
+    const s = slot(initial) as { v: T; current?: T }
+    if (!('current' in s)) s.current = s.v
+    return s as unknown as { current: T }
   },
   useEffect() {},
   useLayoutEffect() {},
@@ -86,7 +94,9 @@ const reactStub = {
   useMemo<T>(fn: () => T): T {
     return fn()
   },
-  createElement: () => null,
+  // ⚠️ 记录每次 createElement 的 props：`createAccount` 是**普通函数**（不走 useCallback），
+  // 只能从它被挂上去的 onClick 拿到（否则接线层永远够不着「新建账号」这条路径）。
+  createElement: (type: unknown, props: unknown) => { elements.push({ type, props }); return null },
   Fragment: 'Fragment',
   StrictMode: 'StrictMode',
   Component: class {},
@@ -96,6 +106,7 @@ vi.mock('react', () => reactStub)
 
 /** 一次「渲染」：重置槽位与写入记录。 */
 function resetRender(): void {
+  elements = []
   hooks = []
   cursor = 0
   writes = []
@@ -113,7 +124,10 @@ type RenderResult =
  * 的模块命名空间取不到。这里用 `rpcCall` 桩驱动它走「添加账号」路径 ——
  * 该路径正是事故现场（`res.existed` 分支曾传裸字符串）。
  */
-async function renderPanel(rpcCall: (method: string, payload?: unknown) => Promise<unknown>): Promise<RenderResult> {
+async function renderPanel(
+  rpcCall: (method: string, payload?: unknown) => Promise<unknown>,
+  provider = 'opencode',
+): Promise<RenderResult> {
   resetRender()
   try {
     const mod = await import('../../plugin-src/client/jet-hub.js')
@@ -125,7 +139,7 @@ async function renderPanel(rpcCall: (method: string, payload?: unknown) => Promi
       // 逃生口未接线 ⇒ 明确失败，绝不静默跳过（否则整个文件会变成集体的假绿）
       return { ok: false, error: new Error('__providersPanelForTest 未导出：接线层无法被行为级守卫覆盖') }
     }
-    panel({ provider: 'opencode', rpcCall })
+    panel({ provider, rpcCall })
     return { ok: true, writes, callbacks }
   } catch (error) {
     return { ok: false, error }
@@ -220,5 +234,136 @@ describe('ProviderPanel 接线层（行为级）', () => {
         `state[${w.index}] 读 .details.length 会抛 ⇒ 整页白屏`,
       ).not.toThrow()
     }
+  })
+})
+
+/**
+ * ★★ **`incognitoOpened === true` 时必须先问用户**（2026-10-25 合并审计的 P1）。
+ *
+ * ## 缺陷（`!147` 引入）
+ *
+ * 2026-10-24 那版把「宿主已开无痕窗 ⇒ 客户端不再开」改成「无条件再开一个」，
+ * 理由是修无头部署（宿主窗口画在 Xvfb 上、用户看不到）。但它**静默**放回了
+ * codearts / officeace 的老缺陷：那两家授权页在华为云 SSO 域，**普通浏览器里的
+ * 会话会被静默复用** ⇒ 用户点开我们自己开的窗口、授权、登进去的还是上一个号
+ * （「新建账号还是同一个号」）。
+ *
+ * ## 判据
+ *
+ * 真渲染 `ProviderPanel`、真调用回调，观察 `window.open` 与 `window.confirm`：
+ * - 用户**取消** ⇒ 不得再开（只剩宿主的无痕窗，登录仍可完成）；
+ * - 用户**确认** ⇒ 必须开（无头部署的用户要靠它）。
+ *
+ * ⚠️ 两条都要测：只测「取消」会让「反正永远不开」也全绿（那会把无头部署的
+ * 真实报障原样放回来）。
+ */
+describe('登录开窗：宿主开过无痕窗时的用户裁决策略', () => {
+  /** ⚠️ 面板里**不止这一处** confirm（`runLimitAction` 等）⇒ 只认登录开窗那条文案。 */
+  const LOGIN_CONFIRM_MARKER = '无痕窗口'
+  const loginConfirms = (calls: unknown[][]): unknown[][] =>
+    calls.filter(args => String(args[0] ?? '').includes(LOGIN_CONFIRM_MARKER))
+  function withWindow<T>(impl: { confirm: (message: string) => boolean; open: (...args: unknown[]) => unknown }, fn: () => Promise<T>): Promise<T> {
+    const host = globalThis as unknown as { window?: unknown; confirm?: unknown; alert?: unknown }
+    const previousWindow = host.window
+    const previousConfirm = host.confirm
+    const previousAlert = host.alert
+    host.window = impl
+    // ⚠️ 客户端里既有 `window.confirm` 也有**裸 `confirm`**（`runLimitAction` 就是裸调用）——
+    // 本环境没有 DOM ⇒ 裸调用会抛 ReferenceError 并变成 unhandled rejection（vitest 报错）。
+    // 两个都垫上，测试才不会污染报告（也顺带覆盖那条「限流重测」路径的早退）。
+    host.confirm = (message: string) => impl.confirm(message)
+    host.alert = () => {}
+    return fn().finally(() => {
+      host.window = previousWindow
+      host.confirm = previousConfirm
+      host.alert = previousAlert
+    })
+  }
+
+  async function driveCreateAccount(
+    providerName: string,
+    confirmAnswer: boolean,
+  ): Promise<{ open: unknown[][]; confirm: unknown[][] }> {
+    const open: unknown[][] = []
+    const confirmCalls: unknown[][] = []
+    const rpcCalls: string[] = []
+    const rpcCall = async (method: string) => {
+      rpcCalls.push(method)
+      if (method === 'account.create') {
+        return {
+          ok: true,
+          loginUrl: 'https://auth.huaweicloud.com/authui/login?state=AAA',
+          incognitoOpened: true,
+        }
+      }
+      return { ok: true, order: [], statuses: {} }
+    }
+    const r = await renderPanel(rpcCall, providerName)
+    expect(r.ok, r.ok ? '' : `渲染抛错：${String((r as { error: unknown }).error)}`).toBe(true)
+    if (!r.ok) return { open, confirm: confirmCalls }
+    // 触发「新建账号」：它的 onClick 是**无参**回调。逐个喂 undefined，
+    // 由 `rpcCall('account.create')` 是否被调到来判断探针有没有命中。
+    const errors: string[] = []
+    // 1) `createAccount` 是普通函数 ⇒ 从它被挂上的 onClick 里取。
+    const clickHandlers: Array<(arg?: unknown) => unknown> = []
+    for (const element of elements) {
+      const props = element.props as { onClick?: unknown } | null | undefined
+      if (typeof props?.onClick === 'function') clickHandlers.push(props.onClick as never)
+    }
+    await withWindow({
+      confirm: (...args: unknown[]) => { confirmCalls.push(args); return confirmAnswer },
+      open: (...args: unknown[]) => { open.push(args); return { closed: false } },
+    }, async () => {
+      for (const cb of [...clickHandlers]) {
+        try { await cb(undefined) } catch (error) { errors.push(String(error)) }
+      }
+    })
+    expect(rpcCalls, `探针没触发 account.create ⇒ 本用例无牙（回调抛错：${errors.join(' | ') || '无'}）`).toContain('account.create')
+    return { open, confirm: confirmCalls }
+  }
+
+  it('★★ 用户取消 ⇒ 不再开普通窗口（否则静默复用旧 SSO 会话 = 老缺陷复发）', async () => {
+    const seen = await driveCreateAccount('codearts', false)
+    expect(loginConfirms(seen.confirm).length, '根本没用 confirm 问过用户 ⇒ 仍然是无条件再开').toBeGreaterThan(0)
+    const openedLogin = seen.open.filter(args => String(args[0] ?? '').includes('authui'))
+    expect(openedLogin, '用户已经拒绝，仍开了普通窗口 ⇒ codearts 的「新建账号还是同一个号」复发')
+      .toEqual([])
+  })
+
+  it('★★ 用户确认 ⇒ 必须开（无头部署的用户只能靠它，别把 2026-10-24 的报障放回来）', async () => {
+    const seen = await driveCreateAccount('codearts', true)
+    expect(loginConfirms(seen.confirm).length, '根本没问过用户 ⇒ 策略没接上').toBeGreaterThan(0)
+    const openedLogin = seen.open.filter(args => String(args[0] ?? '').includes('authui'))
+    expect(openedLogin.length, '用户明确要求「在本机浏览器再开一个」，却没有开 ⇒ 无头部署下窗口根本不出现')
+      .toBeGreaterThan(0)
+  })
+
+  it('★ 宿主没开无痕窗（incognitoOpened 缺省）⇒ 直接开，且**不得**多问一句', async () => {
+    const open: unknown[][] = []
+    const confirmCalls: unknown[][] = []
+    const rpcCalls: string[] = []
+    const rpcCall = async (method: string) => {
+      rpcCalls.push(method)
+      if (method === 'account.create') return { ok: true, loginUrl: 'https://auth.huaweicloud.com/authui/login?state=BBB' }
+      return { ok: true, order: [], statuses: {} }
+    }
+    const r = await renderPanel(rpcCall, 'codearts')
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    const clickHandlers: Array<(arg?: unknown) => unknown> = []
+    for (const element of elements) {
+      const props = element.props as { onClick?: unknown } | null | undefined
+      if (typeof props?.onClick === 'function') clickHandlers.push(props.onClick as never)
+    }
+    await withWindow({
+      confirm: (...args: unknown[]) => { confirmCalls.push(args); return false },
+      open: (...args: unknown[]) => { open.push(args); return { closed: false } },
+    }, async () => {
+      for (const cb of clickHandlers) { try { await cb(undefined) } catch { /* 其它回调 */ } }
+    })
+    expect(rpcCalls).toContain('account.create')
+    // 老宿主不返回该字段 ⇒ 必须走回退分支：直接开，且**不问**（升级期不能多一次弹窗）
+    expect(loginConfirms(confirmCalls), '宿主没开过无痕窗却弹了确认框 ⇒ 升级期体验倒退').toEqual([])
+    expect(open.filter(args => String(args[0] ?? '').includes('authui')).length).toBeGreaterThan(0)
   })
 })

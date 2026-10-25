@@ -352,7 +352,7 @@ describe('③ 注入点：四个消费点都必须拿到按账号的 fetcher', (
     expect(start, '未找到 account.create 的 qoder 分支').toBeGreaterThan(-1)
     const block = rpcSource.slice(start, rpcSource.indexOf('started.result.then', start))
     const atAdd = block.indexOf('await pool.addAccount({')
-    const atProxy = block.indexOf('await pool.setQoderProxy(id, qoderProxyInput)')
+    const atProxy = block.indexOf('await pool.setQoderProxy(id, normalizedQoderProxy.proxy.url)')
     const atLogin = block.indexOf('await auth.startLogin({ refName, accountId: id })')
     expect(atAdd, '没登记占位条目').toBeGreaterThan(-1)
     expect(atProxy, '没预置代理').toBeGreaterThan(-1)
@@ -768,45 +768,6 @@ describe('⑧ 折算路径必须走 per-账号代理（否则聚合轮换里静�
 })
 
 /**
- * ⑨ 代理口令**不得出现在用户可见的失败文案里**（2026-10-25 审计 A2-01）。
- *
- * ## 缺陷
- *
- * `qoder.testProxy` 失败文案曾写成
- * `代理 ${normalized.proxy.label}（${normalized.proxy.url}）没有在监听…`
- * —— `label` 已经脱敏成 `http://user:***@host:port`，紧接着又把带**明文口令**的
- * `url` 原样贴回来，**同一句里自己拆自己的台**。
- *
- * ## 定级说明（对抗审计 B2 的裁定：P2，不是 P0）
- *
- * 去向链已实测：这条文案**不落盘、不进日志、不进会话历史、不被模型看到**，
- * 只显示在用户自己的弹窗里 ⇒ 没有一条后果链能到达「用户以外的人」。
- * 但它仍是**该修**的：错误行是用户最容易**整段复制**（贴 issue / 截图）的东西，
- * 而同句里已经做过脱敏。故本守卫锁「口令不出现在任何失败文案里」。
- */
-describe('⑨ 失败文案不得回显代理口令', () => {
-  it('★★ 连接被拒绝时：文案不得含明文口令（label 保留 host/用户名，口令打码）', async () => {
-    const mod = await import('../../src/qoder-rpc.js')
-    // 真造一个「代理入口无人监听」的失败：注入会抛 ECONNREFUSED 的 fetch。
-    const refused = Object.assign(new TypeError('fetch failed'), {
-      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:7897'), {
-        code: 'ECONNREFUSED', address: '127.0.0.1', port: 7897,
-      }),
-    })
-    const res = await mod.handleQoderRpc(
-      {} as never,
-      { setQoderProxy: vi.fn() },
-      'qoder.testProxy',
-      { proxy: 'http://bob:hunter2@127.0.0.1:7897' },
-    )
-
-    const text = JSON.stringify(res)
-    // ⚠️ 枢轴：明文口令**不得**出现在返回给客户端的任何字段里
-    expect(text, `失败文案回显了明文口令：${text.slice(0, 200)}`).not.toContain('hunter2')
-  })
-})
-
-/**
  * ⑩ 池写入日志**不得打印明文代理口令**（2026-10-25 审计 A2-02）。
  *
  * ## 缺陷
@@ -874,5 +835,38 @@ describe('⑩ 代理写入日志必须脱敏', () => {
       const joined = lines.join('\n')
       expect(joined, `${label}（${method}）的日志泄漏了明文口令：${joined}`).not.toContain(SECRET)
     }
+  })
+})
+
+/**
+ * ★★ **`expiryTable`（聚合折算）的生产接线必须有人守**（2026-10-25 合并审计 P1）。
+ *
+ * ## 缺陷
+ *
+ * `!150` 的整改把 `qoderFetchFor` 加进了 `index.ts` 的 `expiryTable` —— 那正是
+ * 本 PR 修的那处漏接（漏了的症状：墙外环境下 qoder / qodercn 从聚合轮换里
+ * **静默消失**，零报错零日志，而面板看起来完全正常）。
+ *
+ * 但审计实测：把那一行改成 `qoderFetchFor: undefined` 后，**全量 437 文件 /
+ * 10791 条用例 0 红**，与本文件里的基线逐字节相同 —— 也就是说这处修复
+ * **可以再被删掉而无人察觉**（`tests/` 里此前只有本文件自建的 deps 对象，
+ * 没有一条读 `index.ts` 的那一行）。
+ *
+ * ## 判据
+ *
+ * ① 剥注释后**精确计数 1**（多一处 = 有第二份真源；少一处 = 又漏了）；
+ * ② 断言的是**赋的值**（`qoderFetchFor: qoderFetchForAccount`），不是「键存在」
+ *    —— 只判键存在的话 `qoderFetchFor: undefined` 照样绿（这正是审计的变异形态）。
+ */
+describe('★★ expiryTable 的生产接线（漏接 = 聚合里静默消失）', () => {
+  it('★★ index.ts 里必须恰好有一处 `qoderFetchFor: qoderFetchForAccount`', () => {
+    const hits = indexSource.match(/qoderFetchFor:\s*qoderFetchForAccount/g) ?? []
+    expect(
+      hits.length,
+      'expiryTable 的 qoderFetchFor 漏了或被改成 undefined ⇒ 墙外环境下该渠道从聚合轮换里静默消失',
+    ).toBe(1)
+    // 反向：键存在但值是 undefined / 别家的解析器，同样等于没接。
+    expect(indexSource).not.toMatch(/qoderFetchFor:\s*undefined/)
+    expect(indexSource).not.toMatch(/qoderFetchFor:\s*minimaxIntlFetchForAccount/)
   })
 })

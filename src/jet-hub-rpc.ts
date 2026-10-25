@@ -20,6 +20,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
+import { dedupeMinimaxAccount } from './minimax-dedup.js'
 import { openIncognitoWindow } from './login.js'
 import { AccountPool, asProxyText } from './account-pool.js'
 import { AUTO_PROVIDER as AUTO_PROVIDER_ID } from './auto-adapter.js'
@@ -4305,9 +4306,38 @@ function registerJetHubEndpoints(
             refreshable: false,
             createdAt: Date.now(),
           })
-          // ⚠️ 走 `setQoderProxy` 而不是直接往 `addAccount` 塞字段：那里有
-          // 「空串删键 + 最新快照合并」的既有口径，直接塞会绕过它们。
-          if (qoderProxyInput !== '') await pool.setQoderProxy(id, qoderProxyInput)
+          /**
+           * ⚠️⚠️ **写池前必须过 `normalizeProxy`**（2026-10-25 合并审计 P2 修法）。
+           *
+           * 改前这里只 `trim()` 就把载荷写进池。而 `types.ts` 的
+           * `RpcCreateAccountRequest.qoderProxy` 注释**明文承诺**「来自客户端自报的
+           * RPC 载荷（无 schema 校验）⇒ 读取侧必须过 `normalizeProxy` 归一」——
+           * 注释与实现相反（与 PR !145 审计修过的 minimaxintl 那条**逐格同因**）。
+           *
+           * 后果（**不可自愈**）：`ftp://host:21` 这类串落盘后，该账号**每一条链路**
+           * 取 fetcher 时都抛「代理地址无效 — 不支持的协议 ftp」⇒ 该账号永久不可用，
+           * 且面板上看不出原因。当前客户端不传该字段，但它是**已文档化的入参**。
+           *
+           * ⚠️ 与 minimaxintl 分支同一处置：**拒绝整轮登录**并给出可操作原因
+           * （而不是静默降级直连 —— 用户明确想走代理时，静默直连会让他以为配好了）。
+           */
+          if (qoderProxyInput !== '') {
+            const normalizedQoderProxy = normalizeProxy(qoderProxyInput)
+            if (!normalizedQoderProxy.ok) {
+              // 删掉刚建的占位条目：不留「有账号但配置非法」的幽灵卡片。
+              void pool.removeAccount(id).catch(() => {})
+              return {
+                ok: false,
+                error: {
+                  code: 'bad-request',
+                  message: `出口代理地址无效：${normalizedQoderProxy.reason}`,
+                },
+              }
+            }
+            // ⚠️ 走 `setQoderProxy` 而不是直接往 `addAccount` 塞字段：那里有
+            // 「空串删键 + 最新快照合并」的既有口径，直接塞会绕过它们。
+            await pool.setQoderProxy(id, normalizedQoderProxy.proxy.url)
+          }
           // ⚠️ **现在才 startLogin**（顺序见上）：池里已有带代理的占位条目，
           // 解析器按 `accountId` 就能取到出口。
           const started = await auth.startLogin({ refName, accountId: id })
@@ -4715,31 +4745,38 @@ function registerJetHubEndpoints(
              * ⚠️ 保留**原来那张**（它可能已承载排序/改名/限流记录），新条目停用。
              */
             const userId = result.userId
-            if (userId !== undefined && userId.length > 0) {
-              try {
-                const existingId = await pool.findAccountIdByIdentityField(
-                  minimaxProduct.id,
-                  'user_id',
-                  userId,
-                )
-                if (existingId.length > 0 && existingId !== id) {
-                  ctx.logger.warn(
-                    `[jet-hub] ${minimaxProduct.id} 该账号（user_id=${userId}）已存在于 `
-                    + `${existingId}，新条目 ${id} 已自动停用（不参与选号）`,
-                  )
-                  await pool.updateAccount(id, {
-                    nickname: `${nickname}（重复，已停用）`,
-                    enabled: false,
-                  })
-                }
-              } catch (error) {
-                // ⚠️ 查重失败**不得**影响登录结论（与 officeace 同一取向：
-                //    读不到 ≠ 没有）。这里只留日志。
-                ctx.logger.warn(
-                  `[jet-hub] ${minimaxProduct.id} 查重失败（按 user_id 读账号池）`
-                  + `⇒ 本次不做去重、照常回填：${String(error)}`,
-                )
-              }
+            /**
+             * ⚠️⚠️ **整块交给 `dedupeMinimaxAccount`**（2026-10-25 合并审计补修）。
+             *
+             * 改前这里只做了 officeace 三件套的**第 1 件**（查重 + 新卡停用），
+             * 缺「新鲜凭据转写回保留卡」「清重复卡凭据」「原卡已停用则反转」。
+             * 后果实测两条：
+             * ① 原卡被用户手动停用 ⇒ 两张卡全停用 ⇒ `getAvailableAccount()`
+             *    返回 `null`（它按 `enabled` 过滤），而 `login.poll` 报登录成功
+             *    ⇒ 该渠道**零可用号**；
+             * ② 续期调度器**不看 `enabled`** ⇒ 同一上游账号两条续期链，
+             *    refresh_token 轮换时互相作废（正是本 PR 要治的「旧号掉登录」）。
+             *
+             * ⚠️ 该函数**永不抛错**（登录已成功，去重失败不得改写结论）；
+             *    仍包一层 try 是防御性的（例如池替身缺 `findAccount`）。
+             */
+            try {
+              await dedupeMinimaxAccount(
+                { pool, credentials: ctx.credentials, logger: ctx.logger },
+                {
+                  providerId: minimaxProduct.id,
+                  newAccountId: id,
+                  newCredentialRefName: refName,
+                  identity: userId,
+                  nickname,
+                  expiresAtMs: minimaxCredentialExpiresAtMs(credential),
+                  refreshable: isMinimaxRefreshable(credential),
+                },
+              )
+            } catch (error) {
+              ctx.logger.warn(
+                `[jet-hub] ${minimaxProduct.id} 去重流程异常（不影响登录结论）：${String(error)}`,
+              )
             }
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${minimaxProduct.id} login failed for ${id}: ${String(error)}`)
@@ -5402,7 +5439,34 @@ function registerJetHubEndpoints(
 
       case 'account.update': {
         const req = payload as RpcUpdateAccountRequest
-        await pool.updateAccount(req.accountId, req.patch)
+        /**
+         * ⚠️⚠️ **patch 必须白名单化**（2026-10-25 合并审计 P2 修法）。
+         *
+         * `RpcUpdateAccountRequest.patch` 在**类型**上只有
+         * `nickname / enabled / expiresAt / refreshable` 四个键，但它是**无 schema
+         * 校验的客户端载荷**：`{qoderProxy:'ftp://host:21'}` 会被
+         * `AccountPool.updateAccount` 的 `{...entry, ...patch}` **原样展开进池**
+         * ⇒ 绕过 `sanitizeAccounts` 的代理 scheme 闸 ⇒ 该账号此后取 fetcher 恒抛
+         * 「代理地址无效」（实测：`AFTER-UPDATE qoderProxyFor = "ftp://host:21"`）。
+         *
+         * ⇒ 只放行那四个键。多余键**丢字段而不是丢请求**（删一个字段可逆，
+         * 删一条账号不可逆），并留一条 warn 便于发现 UI 打错。
+         */
+        const allowed = ['nickname', 'enabled', 'expiresAt', 'refreshable'] as const
+        const safePatch: Record<string, unknown> = {}
+        for (const key of allowed) {
+          const value = (req.patch as Record<string, unknown> | undefined)?.[key]
+          if (value !== undefined) safePatch[key] = value
+        }
+        const dropped = Object.keys((req.patch ?? {}) as Record<string, unknown>)
+          .filter((key) => !(allowed as readonly string[]).includes(key))
+        if (dropped.length > 0) {
+          ctx.logger.warn(
+            `[jet-hub] account.update 收到不支持的字段，已忽略：${dropped.join(', ')}`
+            + '（这类字段必须走各自专用端点，否则会绕过写入闸门）',
+          )
+        }
+        await pool.updateAccount(req.accountId, safePatch as never)
         return { ok: true, value: undefined }
       }
 

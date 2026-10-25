@@ -66,6 +66,31 @@ const SITE = MINIMAX.accountHost
 const HOST = new URL(SITE).origin
 const CODE = 'QJNX-CZXV'
 
+/**
+ * ⚠️ 本格需要 `@deepseek-ai/cordis`（`MinimaxAuth extends Service`）。
+ *
+ * ## ⚠️⚠️ 探针必须是 `await import()`，不能是 `import.meta.resolve`
+ *
+ * 改前写的是 `import.meta.resolve('@deepseek-ai/cordis')`，注释还写着
+ * 「完整安装的 checkout 里它会真跑」—— **两句话都不成立**（2026-10-25 审计实测）：
+ * Vite SSR 下 `import.meta` 被改写成 `__vite_ssr_import_meta__`，它**没有
+ * `resolve` 方法** ⇒ 恒抛 `TypeError` ⇒ `cordisAvailable` 恒 `false` ⇒
+ * 这条**最承重的行为用例永久 SKIP**，与是否安装依赖毫无关系。
+ * 而本机 `@deepseek-ai/cordis@4.0.5` 是**装着**的，同目录的
+ * `minimax-login-nickname-rpc.spec.ts` 用 `await import()` 一直能真跑。
+ *
+ * ⇒ 探针与用例体用**同一种**加载方式（`await import`），SKIP 才真正代表
+ *   「依赖不齐」。SKIP ≠ PASS 仍然成立（仓库铁律）。
+ */
+const cordisAvailable = await (async (): Promise<boolean> => {
+  try {
+    await import('@deepseek-ai/cordis')
+    return true
+  } catch {
+    return false
+  }
+})()
+
 /** 真机形态的 401 响应体（实测原文，见 `MINIMAX_DEVICE_AUTHORIZE_PATH` 注释）。 */
 function loginRequiredBody(userCode = CODE): { login_url: string } {
   return {
@@ -188,21 +213,6 @@ describe('② fetchMinimaxForcedLoginUrl：任何失败都退回本地兜底', (
 })
 
 describe('③ startLogin 把 forcedLoginUrl 带出来（可选字段）', () => {
-  /**
-   * ⚠️ 本格需要 `@deepseek-ai/cordis`（`MinimaxAuth extends Service`）。
-   * 本工作区的 `node_modules` 只装了 `esbuild` / `tsx` / `vitest`，**没有**
-   * `@deepseek-ai/*` ⇒ 按仓库铁律「依赖不齐时必须 SKIP，不得 PASS」
-   *（曾因「返回 0 条被当作合法空结果」让一次 HTTP 400 蒙混过关）。
-   * 在完整安装的 checkout 里（`pnpm install` 后）它会真跑。
-   */
-  const cordisAvailable = (() => {
-    try {
-      // 用 resolve 而不是 import：只是为了判存在，不该触发副作用。
-      return import.meta.resolve('@deepseek-ai/cordis').length > 0
-    } catch {
-      return false
-    }
-  })()
 
   it.skipIf(!cordisAvailable)('★ 拿得到时必须填（客户端靠它绕开旧会话）', async () => {
     const { Context } = await import('@deepseek-ai/cordis')
@@ -334,23 +344,25 @@ describe('④ 接线：RPC 分支的无痕窗口用 forcedLoginUrl，客户端�
     expect(minimaxBranch()).toContain('forcedLoginUrl: minimaxStarted.forcedLoginUrl')
   })
 
-  it('★ 客户端在 incognitoOpened === true 时**仍然自己开窗**（无头宿主的兜底）', () => {
-    // 判据：`window.open` 调用不得被包在 `else` 里（那正是「只打日志不开窗」的形态）。
+  it('★ incognitoOpened === true 时必须先问用户（不得无条件再开，也不得一律不开）', () => {
+    /**
+     * 2026-10-25 合并审计改成「先确认」：无条件再开会把 codearts/officeace 的
+     * 「新建账号还是同一个号」静默放回来（普通浏览器里有华为云 SSO 会话）；
+     * 而一律不开又会让无头部署的用户看不到窗口（2026-10-24 的真实报障）。
+     * 两条诉求只能由用户裁决 ⇒ 必须问，并按答案分流。
+     *
+     * ⚠️ 行为级判据在 `jet-hub-panel-wiring.spec.ts`（真渲染 + 真调 onClick +
+     *    断言 window.open 有没有被调用）；这里只做「接线没被整体重写」的轻量哨兵。
+     */
     const idx = clientSource.indexOf('res.incognitoOpened === true')
     expect(idx, '客户端的 incognitoOpened 判据不见了（被整体重写了？）').toBeGreaterThan(-1)
-    const after = clientSource.slice(idx, idx + 3000)
-    // 判据：紧接其后的语句块里必须出现 window.open，且**不得**形如
-    //   `if (res.incognitoOpened === true) { …只打日志… } else { window.open(…) }`
-    // 即：window.open 不能排在某个 `} else {` 之后（那是「宿主说我开了就不开」的形态）。
-    const elseIdx = after.indexOf('} else {')
-    const openIdx = after.indexOf('window.open(')
-    expect(openIdx, '★ 那段代码里没有 window.open ⇒ 用户点「新建账号」不会跳转').toBeGreaterThan(-1)
-    if (elseIdx !== -1) {
-      expect(
-        openIdx,
-        '★ window.open 仍被放在 else 分支里 ⇒ 宿主一说「我开了」客户端就不开（本次事故原样复发）',
-      ).toBeLessThan(elseIdx)
-    }
+    const after = clientSource.slice(idx, idx + 4000)
+    // ① 必须真的问用户（不是只打一行日志）
+    expect(after, '宿主说「我开了」时没有征求用户意见 ⇒ 静默再开（老缺陷复发）或静默不开（无头看不到窗口）')
+      .toContain('window.confirm(')
+    // ② 必须有分流闸门，且开窗不在 incognito 分支内无条件执行
+    expect(after, '缺少「用户拒绝就不再开」的闸门').toContain('skipClientOpen')
+    expect(clientSource, '开窗没有被闸门包住 ⇒ 闸门是死代码').toContain('if (!skipClientOpen)')
   })
 
   it('★ 客户端必须优先用 res.forcedLoginUrl，且判据是精确的 string 非空', () => {

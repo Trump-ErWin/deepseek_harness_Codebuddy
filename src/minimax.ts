@@ -847,15 +847,30 @@ export function minimaxFallbackEntries(
  * @param refreshed 续期响应构造出的新凭据（只有令牌字段）。
  * @param previous 续期前的旧凭据（身份字段的来源）。
  * @returns 合并后的凭据；新凭据**已有的字段一律以新凭据为准**。
+ *
+ * ## ⚠️⚠️ 为什么是「保留旧字段 + 新字段覆盖」而不是白名单两个字段
+ *
+ * 初版是白名单 `nickname` + `user_id` 两个字段 —— 那等于**每加一个非令牌字段
+ * 都要记得回来改这里**，忘了就静默丢弃（2026-10-25 合并审计登记的 P3）。
+ * 而本函数修的正是「静默丢字段」这一类缺陷，用同一类缺陷的形态去修它不合适。
+ *
+ * ⇒ 改为 `{ ...previous, ...refreshed }`：令牌五件套由 `refreshed` 覆盖，
+ *   其余字段沿用旧凭据。**令牌三件套再显式兜一次**（`?? previous`）——
+ *   上游若把某个令牌字段省掉（响应里显式 `undefined` 时展开会覆盖），
+ *   宁可留旧的也不要把凭据写成半残（半残 = 该账号直接不可用）。
  */
 export function inheritMinimaxIdentity(
   refreshed: MinimaxCredential,
   previous: MinimaxCredential,
 ): MinimaxCredential {
-  const merged: MinimaxCredential = { ...refreshed }
-  const nickname = refreshed.nickname ?? previous.nickname
-  const userId = refreshed.user_id ?? previous.user_id
-  if (nickname !== undefined) merged.nickname = nickname
-  if (userId !== undefined) merged.user_id = userId
+  const merged: MinimaxCredential = { ...previous, ...refreshed }
+  // 令牌材料绝不退化成 undefined（展开一个显式 undefined 字段会覆盖旧值）。
+  merged.access_token = refreshed.access_token ?? previous.access_token
+  if ((refreshed.refresh_token ?? previous.refresh_token) !== undefined) {
+    merged.refresh_token = refreshed.refresh_token ?? previous.refresh_token
+  }
+  if ((refreshed.expires_at ?? previous.expires_at) !== undefined) {
+    merged.expires_at = refreshed.expires_at ?? previous.expires_at
+  }
   return merged
 }
