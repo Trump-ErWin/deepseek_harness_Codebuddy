@@ -1160,3 +1160,79 @@ describe('★ 三个新键必须在两个后端都能跨实例读回（不是只
     expect(state?.aggregateOrderMode).toBe('expiry')
   })
 })
+
+/**
+ * ★★ P2（2026-10-25 审计 B2-1）：备份文件里的**非法代理字符串**必须在
+ * `sanitizeAccounts` 处就被挡下。
+ *
+ * ## 缺陷链（真跑端点实测）
+ *
+ * `sanitizeAccounts` 用 `{ ...candidate }` **原样透传**代理字段，只限「是不是
+ * 字符串」、不限「是不是合法代理」。于是：
+ *
+ * ```
+ * backup.import（载荷 accounts[0].qoderProxy = "ftp://host:21"）
+ *   → RPC 返回 ok:true、账号落池
+ *   → 此后该账号每次取 fetcher 都抛「代理地址无效 — 不支持的协议 ftp」
+ *   → 该账号**永久不可用**
+ * ```
+ *
+ * ⚠️ 而客户端**有**导入按钮（`jet-hub.js` 的 `backup.import`）⇒ 这条路径
+ * **UI 可达**（A2 只找到 `account.create` 那条「零客户端写入点」的腿，B2-1 找到了真正可达的入口）。
+ * 池自己的注释也早已把备份文件当**不可信输入**（`qoderProxyFor` 明写「池里可能
+ * 存在 `"qoderProxy": 12345`」），却只防了非字符串。
+ *
+ * ## 为什么修在 `sanitizeAccounts`（而不是各 provider 的读取侧）
+ *
+ * 四个 provider（opencode / gemini / minimaxintl / qoder）的解析器**同形**地
+ * 在读取侧 `throw`。改读取侧要四处同改、且会让三家分叉；而 `sanitizeAccounts`
+ * 是「外部数据 → 池」的**唯一闸门**（`state.json` 读取与 `backup.import` 都过它）
+ * ⇒ 一处修复，四个字段同时受益，四个 provider 的读取侧永远遇不到脏值。
+ *
+ * ## 处置：清掉该字段（降级直连），**不是**丢弃整条账号
+ *
+ * 丢账号会让用户「导入后少了几个号」且不知道为什么；清字段只是让该账号回到
+ * 「直连」，面板上「当前：直连」一眼可见、可重填。**删一个字段比删一条账号可逆得多。**
+ */
+describe('★ sanitizeAccounts：非法代理字符串必须被挡下（不是原样透传）', () => {
+  const proxies = ['opencodeProxy', 'geminiProxy', 'minimaxIntlProxy', 'qoderProxy'] as const
+
+  it('★★ 非法 scheme（ftp://…）⇒ 清掉该字段，但保留账号', () => {
+    for (const field of proxies) {
+      const accounts = sanitizeAccounts([
+        { id: 'a', provider: 'qoder', credentialRef: 'QODER_ACCOUNT_A', [field]: 'ftp://host:21' },
+      ])
+      // ⚠️ 账号必须还在（丢账号比丢字段糟得多）
+      expect(accounts, field).toHaveLength(1)
+      // ⚠️ 枢轴：脏值不得进池（否则该账号每次取 fetcher 都抛 ⇒ 永久不可用）
+      expect((accounts[0] as Record<string, unknown>)[field], field).toBeUndefined()
+    }
+  })
+
+  it('★★ 合法代理必须逐字保留（不能把好值一起清掉）', () => {
+    const good = [
+      'http://127.0.0.1:7897',
+      'https://user:pass@proxy.example:8443',
+      'socks5://127.0.0.1:1080',
+    ]
+    for (const field of proxies) {
+      for (const url of good) {
+        const accounts = sanitizeAccounts([
+          { id: 'a', provider: 'qoder', credentialRef: 'QODER_ACCOUNT_A', [field]: url },
+        ])
+        expect((accounts[0] as Record<string, unknown>)[field], `${field} ${url}`).toBe(url)
+      }
+    }
+  })
+
+  it('⚠️ 非字符串脏值仍然照旧降级（既有行为不变）', () => {
+    for (const dirty of [12345, {}, [], true, null]) {
+      const accounts = sanitizeAccounts([
+        { id: 'a', provider: 'qoder', credentialRef: 'QODER_ACCOUNT_A', qoderProxy: dirty },
+      ])
+      // 非字符串：既有行为是原样透传后由读取侧 `asProxyText` 降级 —— 这里只要求
+      // 「不崩、账号在」。取值形态不收紧（避免与既有断言冲突）。
+      expect(accounts, JSON.stringify(dirty)).toHaveLength(1)
+    }
+  })
+})

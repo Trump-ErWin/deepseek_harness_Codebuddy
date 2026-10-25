@@ -152,6 +152,32 @@ export interface ProviderExpiryDeps {
    * ⚠️ 必须**惰性**调用（按 `accountId` 现取）：账号可能随时在面板里改代理。
    */
   readonly minimaxIntlFetchFor?: (accountId: string) => typeof fetch
+  /**
+   * Qoder（**两站共用**）的按账号 fetcher（2026-10-25 审计 A2-17，B2 判「合入前必须补」）。
+   *
+   * ## ⚠️⚠️ 为什么必须有它（与 {@link minimaxIntlFetchFor} 同因，但**本 PR 漏接了**）
+   *
+   * Qoder **国际版**全部端点在墙外被 SNI 阻断，唯一出路是 per-账号出口代理。
+   * 那套代理在 `618a090` 里接了**四条腿**：推理、原生搜索、余额选号、登录/续期/目录。
+   * 但**折算路径一行没改** —— `qoderExpiry` 内部调
+   * `fetchQoderCreditBalance(credential, product)`（**不带 fetcher**）⇒ 走全局 `fetch`
+   * ⇒ 墙外环境下折算**恒失败** ⇒ `aggregate-expiry` 拿到 `undefined`
+   * ⇒ 该渠道折算成 `UNUSABLE` ⇒ 被 `rankCandidates` 剔除
+   * ⇒ **用户在聚合轮换列表里永远看不到 qoder / qodercn**，且**零报错、零日志**；
+   * 而面板（走选号器那条腿）看起来完全正常。
+   *
+   * ⚠️ 这不是「与本 PR 无关的既有缺口」：`index.ts` 明写
+   * 「`credits` 与 `expiry` 是两个独立消费域……**两条腿缺一不可**，
+   * 这正是本仓库记过 6 次的那类静默陷阱」，而本 PR 恰好只接了 credits 一侧。
+   * {@link minimaxIntlFetchFor} 的注释也逐字点了同一个症状
+   * （「只把 fetcher 接进了选号器与适配器 —— 折算路径一行没改」）。
+   *
+   * ⚠️ 与 {@link minimaxIntlFetchFor} **分开两个键**而不是共用一个：两家的解析器
+   *    是不同实例（`minimaxIntlFetchForAccount` / `qoderFetchForAccount`），
+   *    合成一个会让「只接了一家」静默通过。
+   * ⚠️ 必须**惰性**调用（按 `accountId` 现取）：账号可能随时在面板里改代理。
+   */
+  readonly qoderFetchFor?: (accountId: string) => typeof fetch
 }
 
 /**
@@ -319,8 +345,8 @@ export function createProviderExpiry(deps: ProviderExpiryDeps = {}): Readonly<Re
      *    ⚠️ **两站各占一项**：`credentialExpiry` 的分派按 provider id，漏
      *    `qodercn` 会让中国版单独恒 `UNUSABLE`（与 minimaxintl 同因）。
      */
-    qoder: qoderFamilyExpiry(QODER),
-    qodercn: qoderFamilyExpiry(QODER_CN),
+    qoder: qoderFamilyExpiry(QODER, deps),
+    qodercn: qoderFamilyExpiry(QODER_CN, deps),
     // ⚠️ **MiniMax Code**（中国版 / 国际版，2026-10-20）：两家共用同一个原语
     //    （只换 product），与 buddy / workbuddy 同款 —— 单独抽 `minimaxFamilyExpiry`
     //    是为了让「它们只差一个 product」一眼可见（同族各写一份判据 = 分叉的开始）。
@@ -344,7 +370,7 @@ export function createProviderExpiry(deps: ProviderExpiryDeps = {}): Readonly<Re
  * ⚠️ `context.cachedBalance` **在每次折算时现读**（不是建表时固化）：
  *    与 `createProviderCredits` 的同名字段同一纪律。
  */
-function qoderFamilyExpiry(product: QoderProduct): ProviderExpiry {
+function qoderFamilyExpiry(product: QoderProduct, deps: ProviderExpiryDeps): ProviderExpiry {
   return {
     credentialExpiry: (c, context) => qoderExpiry(
       c as QoderCredential,
@@ -352,6 +378,12 @@ function qoderFamilyExpiry(product: QoderProduct): ProviderExpiry {
       context?.cachedBalance === undefined
         ? undefined
         : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+      // ⚠️ **按 `accountId` 现取**（与 `minimaxIntl` 同款）：账号可能随时改代理。
+      //    `context.accountId` 缺失时传空串 —— 与解析器的契约一致
+      //    （空 id 会去查「登录预置」那条，查不到则直连）。
+      deps.qoderFetchFor === undefined
+        ? undefined
+        : deps.qoderFetchFor(context?.accountId ?? ''),
     ),
   }
 }

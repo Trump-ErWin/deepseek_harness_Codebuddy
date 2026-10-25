@@ -538,3 +538,134 @@ describe('★★ Qoder：分档行为（驱动生产判据，不是复述实现�
       .toEqual(cn.packages.map((p) => p.deductionEndTime))
   })
 })
+
+/**
+ * ★★★ P1（2026-10-25 审计 A3-M3）：`qoderLockedError` 的**错误码**必须被守住。
+ *
+ * ## 为什么这是「全 PR 价值归零」的一格
+ *
+ * 本 PR 的整个卖点是「锁定报错要说清**为什么**查不到」——
+ * 而这句话（`reason.errors` 里的逐账号真实原因）是**靠 message 传递**的。
+ * 仓库 AGENTS.md 明确记载：`AUTH` / `QUOTA` / `ACCOUNT_QUOTA` 这三个码会被
+ * 客户端 `failureMessage()` **丢掉 message 换成固定文案**
+ * （宿主 `dsh-client-ui-chat` 的实测：只有 `QUOTA` / `ACCOUNT_QUOTA` / `AUTH`
+ * 被替换，`QUOTA_EXCEEDED` **不在**替换表里）。
+ *
+ * ⇒ 把码从 `'QUOTA_EXCEEDED'` 改成 `'QUOTA'` 或 `'AUTH'`，用户就只剩
+ * 「当前请求的额度已用尽」/「API 密钥无效」这类**与真实成因无关**的一句话，
+ * 辛苦收集的逐账号原因**一个字都到不了用户眼前**。
+ *
+ * ## 缺陷：这一格**零守卫**
+ *
+ * 对抗审计实测：把 `qoderLockedError` 的码改成 `QUOTA` 或 `AUTH` ⇒
+ * **全量 10734 passed / 0 failed**（`ratelimit-locked-misreport.spec.ts:243`
+ * 虽然断言了 `toBe('QUOTA_EXCEEDED')`，但它测的是**限流那条独立文案**，
+ * 不覆盖 `qoderLockedError` 的 4 个构造点）。
+ *
+ * ## 判据为什么不是「字面量存在性」
+ *
+ * 只判「文件里有 `'QUOTA_EXCEEDED'`」是弱判据（字面量留在注释/死分支里也绿）。
+ * 这里判的是**每个 `new LlmError(...)` 构造点的第二实参**——即
+ * 「这个函数**实际用了哪些码**」。⚠️ 切片必须精确到**下一个同级 `const`**
+ * （`loomy-balance-error-contract.spec.ts` 曾用「某个具体符号」当切片终点而
+ * 误圈进邻函数，本文件不重蹈：见下面 `nextTopLevelConst` 的注释）。
+ */
+describe('★ qoderLockedError 的错误码（防「码被换成会吞 message 的那三个」）', () => {
+  /** 剥注释：本仓库反例——注释里逐字引用错误写法会让判据假红。 */
+  function codeOnly(source: string): string {
+    return source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .filter((l) => !l.trim().startsWith('//'))
+      .join('\n')
+  }
+
+  /**
+   * 取 `const <name> = …` 的函数体，终点是**下一个同级（两空格缩进）`const`**。
+   *
+   * ⚠️ 不用「某个具体符号」当终点：那个写法在邻函数插入/重排后会**静默圈错范围**
+   * （本仓库 2026-10-20 真实踩过，见 `src/index.ts` 里 `astudioLockedError` 的注释）。
+   */
+  function lockedErrorBody(source: string, name: string): string {
+    const at = source.indexOf(`  const ${name} =`)
+    expect(at, `找不到 ${name}`).toBeGreaterThan(-1)
+    const rest = source.slice(at + 10)
+    const next = rest.search(/\n  const [A-Za-z]/)
+    return next === -1 ? rest : rest.slice(0, next)
+  }
+
+  it('★★★ 每个 `new LlmError(...)` 的码都必须是字面量 QUOTA_EXCEEDED', () => {
+    const indexSource = codeOnly(readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../../src/index.ts'),
+      'utf8',
+    ))
+    const body = lockedErrorBody(indexSource, 'qoderLockedError')
+
+    // ⚠️ 先自证切片抓对了函数（否则下面全绿是假绿）
+    expect(body, '切片没抓到 qoderLockedError 的文案').toContain('已锁定永久积分')
+
+    // 逐个构造点取「第二实参」
+    const codes = [...body.matchAll(/new LlmError\([\s\S]*?^\s*'([A-Z_]+)',/gm)].map((m) => m[1]!)
+    expect(codes.length, '一个构造点都没抓到 ⇒ 判据失效').toBeGreaterThanOrEqual(4)
+    for (const code of codes) {
+      expect(
+        code,
+        `码 ${code} 会被客户端丢掉 message（换成与真实成因无关的固定文案）`
+        + ' ⇒ 本 PR「说清为什么查不到」的价值归零',
+      ).toBe('QUOTA_EXCEEDED')
+    }
+    // ⚠️ 显式点名被禁的那三个（防有人把它们写成变量绕过上面那条）
+    expect(body).not.toMatch(/'AUTH'|'ACCOUNT_QUOTA'/)
+  })
+})
+
+/**
+ * ★★ P1（2026-10-25 审计 A3-1）：锁定时那句报错里的**逐账号原因必须折叠**。
+ *
+ * ## 缺陷
+ *
+ * 报错直接 `reason.errors.slice(0, 2).join('；')`，而 `errors` 是**逐账号**的。
+ * 同一个故障在每个账号上各产生一条**逐字相同**的串 ⇒ 实测 3 个账号同样 401：
+ *
+ * ```
+ * （积分查询失败（HTTP 401）；积分查询失败（HTTP 401））
+ * ```
+ *
+ * 第二条信息量为零，却占掉仅有的 2 个名额 ⇒ 若第 3 个账号是**另一种**原因
+ * （如 `UND_ERR_CONNECT_TIMEOUT`），那条**唯一不同的线索**会被挤掉。
+ */
+describe('★★ 锁定报错的原因折叠（去重 + 同因合并，且先去重后截断）', () => {
+  it('★★ 三个账号同一原因 ⇒ 折叠成一条并报出账号数（不再出现两条一样的串）', async () => {
+    const { foldReasonErrors } = await import('../../src/locked-error-text.js')
+    const text = foldReasonErrors([
+      '积分查询失败（HTTP 401）',
+      '积分查询失败（HTTP 401）',
+      '积分查询失败（HTTP 401）',
+    ])
+    expect(text).toBe('积分查询失败（HTTP 401）（共 3 个账号）')
+    // ⚠️ 反向：不得出现两条相同的串（旧行为）
+    expect(text.split('；')).toHaveLength(1)
+  })
+
+  it('★★ 先去重后截断：重复串不得把「唯一不同的线索」挤掉', async () => {
+    const { foldReasonErrors } = await import('../../src/locked-error-text.js')
+    // 前两条相同、第三条不同 —— 旧实现会取前两条（都是同样的 401）而丢掉真实的另一因
+    const text = foldReasonErrors([
+      '积分查询失败（HTTP 401）',
+      '积分查询失败（HTTP 401）',
+      '连不上 https://openapi.qoder.sh（UND_ERR_CONNECT_TIMEOUT）',
+    ])
+    expect(text, '唯一不同的那条线索被重复串挤掉了').toContain('UND_ERR_CONNECT_TIMEOUT')
+    expect(text).toContain('共 2 个账号')
+  })
+
+  it('⚠️ 空数组给诚实兜底（不编造原因）', async () => {
+    const { foldReasonErrors } = await import('../../src/locked-error-text.js')
+    expect(foldReasonErrors([])).toBe('未提供具体原因')
+  })
+
+  it('⚠️ 单条不同原因保持原样（不能给每条都加账号数）', async () => {
+    const { foldReasonErrors } = await import('../../src/locked-error-text.js')
+    expect(foldReasonErrors(['某个原因'])).toBe('某个原因')
+  })
+})

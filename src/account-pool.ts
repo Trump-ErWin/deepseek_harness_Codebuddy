@@ -7,6 +7,7 @@ import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, Aggreg
 import { createPermanentLockStore } from './permanent-lock-store.js'
 import type { PermanentLockStore } from './permanent-lock-store.js'
 import { normalizeOpencodeGeneration } from './opencode-auth.js'
+import { maskProxyPassword } from './proxy-mask.js'
 // ⚠️ `model-queue.ts` **零 import**（纯函数模块，见其模块头）⇒ 不引入环。
 import { nextUtc8DayStartMs } from './model-queue.js'
 import type {
@@ -257,6 +258,34 @@ export function sinkAccountToProviderEnd(
  */
 export function asProxyText(value: unknown): string {
   return typeof value === 'string' ? value : ''
+}
+
+/**
+ * 写「代理已更新」日志时的**展示文本**（2026-10-25 审计 A2-02）。
+ *
+ * ## 为什么必须有它
+ *
+ * 四家 `set*Proxy` 原先都把**原始 URL** 拼进日志：
+ * `` `[jet-hub] 账号 ${id} Qoder 代理 → ${proxy}` `` —— 而代理 URL 常含
+ * `user:pass@host` ⇒ **口令明文进日志**，而日志是用户排障时会随手打包、
+ * 粘贴进 issue、上传给别人的东西。
+ *
+ * 对抗审计逐家实测：opencode / gemini / minimaxintl **早已同形**，
+ * qoder 只是第 4 个实例（不是本 PR 新增的机制）⇒ 四家一并修。
+ *
+ * ## ⚠️ 判据复用 `proxy-mask.ts`，不在这里再写一份
+ *
+ * 池**不能** import provider 实现（`opencode.ts` 在依赖图上层，会成环），
+ * 而复制一份正则到这里就正是本仓库的红线——**同一语义两套判据**。
+ * ⇒ 脱敏实现住在双方都能依赖的中立文件里。
+ *
+ * @param value 池字段原始值（可能是脏值 —— 备份文件原样透传）。
+ * @returns 空串 → `直连`；否则脱敏后的 label（保留 scheme/user/host/port）。
+ */
+export function proxyLogText(value: unknown): string {
+  const raw = asProxyText(value).trim()
+  if (raw.length === 0) return '直连'
+  return maskProxyPassword(raw)
 }
 
 export class AccountPool {
@@ -2778,7 +2807,7 @@ export class AccountPool {
     next[idx] = entry
     await this.writeAccounts(next)
     this.ctx.logger?.info?.(
-      `[jet-hub] 账号 ${accountId} 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+      `[jet-hub] 账号 ${accountId} 代理 → ${proxyLogText(proxy)}`,
     )
   }
 
@@ -2814,7 +2843,7 @@ export class AccountPool {
     next[idx] = entry
     await this.writeAccounts(next)
     this.ctx.logger?.info?.(
-      `[jet-hub] 账号 ${accountId} Gemini 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+      `[jet-hub] 账号 ${accountId} Gemini 代理 → ${proxyLogText(proxy)}`,
     )
   }
 
@@ -2859,7 +2888,11 @@ export class AccountPool {
     next[idx] = entry
     await this.writeAccounts(next)
     this.ctx.logger?.info?.(
-      `[jet-hub] 账号 ${accountId} Qoder 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+      // ⚠️ **只打脱敏后的 `label`，绝不打原始 `proxy`**（2026-10-25 审计 A2-02）：
+      //    代理 URL 常含 `user:pass@host`，明文进日志等于把口令写进用户
+      //    会随手粘贴/上报的文件；而 `label` 保留 host:port 与用户名、口令打码，
+      //    排查时完全够用。
+      `[jet-hub] 账号 ${accountId} Qoder 代理 → ${proxyLogText(proxy)}`,
     )
   }
 
@@ -2895,7 +2928,7 @@ export class AccountPool {
     next[idx] = entry
     await this.writeAccounts(next)
     this.ctx.logger?.info?.(
-      `[jet-hub] 账号 ${accountId} MiniMax 国际站代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+      `[jet-hub] 账号 ${accountId} MiniMax 国际站代理 → ${proxyLogText(proxy)}`,
     )
   }
 

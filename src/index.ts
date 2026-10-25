@@ -38,6 +38,7 @@ import type { CarrierOutcome } from './captcha-carrier.js'
 import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
 import { geminiFetchForAccount, setGeminiProxyPool } from './gemini-proxy.js'
 import { qoderFetchForAccount, setQoderProxyPool } from './qoder-proxy.js'
+import { foldReasonErrors } from './locked-error-text.js'
 import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES, type ImageRequestTarget } from './image-budget.js'
@@ -1556,8 +1557,18 @@ export function apply(ctx: Context): void {
     (reason: BuddyNoAccountReason): Error => {
       if (reason.kind === 'unknown') {
         return new LlmError(
-          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
-          + `（${reason.errors.slice(0, 2).join('；')}）。`
+          // ⚠️⚠️ **不得声称「部分账号」**（2026-10-25 审计 A3-2）：
+          // `BuddyNoAccountReason` 的 `unknown` 只带 `errors`、**没有候选总数**
+          // ⇒ 无法区分「部分失败」与「全部失败」，而实测 3 个账号全失败时这里
+          // 照样写「而**部分**账号的余额查询失败」——**事实性错误**，用户会以为
+          // 还有账号没查（于是去等 / 反复重试）。改成中性措辞。
+          //
+          // ⚠️ 另一处（A3-1）：`errors` 是**逐账号**的，同一故障在每个账号上各
+          // 产生一条**逐字相同**的串；旧实现 `slice(0, 2).join('；')` 让第二条
+          // 信息量为零、并挤掉「唯一不同的线索」⇒ 经 {@link foldReasonErrors}
+          // **先去重、再折叠、后截断**。
+          `${displayName}：无法确认是否有可用账号。已锁定永久积分，而有账号的余额查询失败`
+          + `（${foldReasonErrors(reason.errors)}）。`
           + '这些账号**可能仍有**可消耗的额度 —— 请重试，'
           + `或在 Jet Hub 的 ${displayName} 面板检查凭据是否失效`
           + '（Qoder 的凭据有有效期，失效后需要重新登录该账号）。'
@@ -5363,6 +5374,15 @@ async function fetchBalanceReading(
     //    ⇒ 两条腿缺一不可，这正是本仓库记过 6 次的那类静默陷阱。
     //    ⚠️ 惰性（按 `accountId` 现取），不能固化成一份 fetcher。
     minimaxIntlFetchFor: minimaxIntlFetchForAccount,
+    // ⚠️⚠️ **Qoder 的按账号出口同样必须在这里接**（2026-10-25 审计 A2-17）。
+    //    上面那条注释讲的「两条腿缺一不可」，本 PR（`618a090` 的四条腿）恰好
+    //    又漏了这一处：推理/搜索/选号/登录都接了代理，**折算这处没接**
+    //    ⇒ 国际版在墙外折算恒失败 ⇒ `UNUSABLE` ⇒ 被 `rankCandidates` 剔除
+    //    ⇒ **用户在聚合轮换列表里永远看不到 qoder / qodercn**，零报错、零日志，
+    //    而面板（走选号器那条腿）看起来完全正常。
+    //    ⚠️ 与 minimax 分两个键（两家的解析器是不同实例，合成一个会让
+    //    「只接了一家」静默通过）。
+    qoderFetchFor: qoderFetchForAccount,
   })
 
 

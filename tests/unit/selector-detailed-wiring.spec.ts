@@ -28,7 +28,20 @@ import { describe, expect, it } from 'vitest'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = resolve(HERE, '../../src')
 
-const INDEX = readFileSync(resolve(SRC, 'index.ts'), 'utf8')
+/**
+ * ⚠️ **必须剥注释**（2026-10-25 审计 A3-3）。
+ *
+ * 本文件的判据是「`(?)` 块里有没有 `fetchBalanceDetailed:` 这个键」。若读**未剥注释**
+ * 的源码，把整行**注释掉**、只把字面量留在注释里，判据照样命中 ⇒
+ * 实测该绕过能让本文件 **47 passed 全绿**。同族范本
+ * （`loomy-balance-error-contract.spec.ts:30`）一直是剥的，本文件漏了。
+ */
+const INDEX = stripComments(readFileSync(resolve(SRC, 'index.ts'), 'utf8'))
+
+/** 剥掉注释（接线断言不该因为「注释里提到了某个符号」而通过）。 */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
 
 /**
  * ★★ **本表即清单**：`src/index.ts` 里所有 `new BuddyBalanceSelector({...})`
@@ -62,6 +75,38 @@ const SELECTORS: ReadonlyArray<{
   { name: 'astudioBalanceSelector', mustDetailed: true },
 ]
 
+/**
+ * 「这个键**真的**接线了吗」—— 不只看键名存在（2026-10-25 审计 A3-3）。
+ *
+ * ## ⚠️⚠️ 为什么「键存在」不够
+ *
+ * 实测三种绕过都能让旧判据（`/\bfetchBalanceDetailed\s*:/`）全绿：
+ *
+ * | 绕过 | 形态 | 为什么逃得掉 |
+ * |---|---|---|
+ * | 值假 | `fetchBalanceDetailed: undefined as never` | 键名在，值不是函数 |
+ * | 注释掉 | 整行删掉、字面量留在注释里 | 判据扫到注释（现已剥注释） |
+ * | 死条件展开 | `...(false ? { fetchBalanceDetailed } : {})` | 键名在文本里 |
+ *
+ * ⇒ 判据改成「键后面**不是** `undefined` / `false` / `null` / 空」，且
+ * 「该块里**不得**出现 `?...{}...:` 这种把键藏进死分支的展开形态」。
+ * ⚠️ 仍**不是**行为级（那要真跑 `apply()` 并构造锁定场景，见
+ * `permanent-lock-execution.spec.ts` 的 B 段范式）；本函数只把「文本级」
+ * 从「键名在不在」提升到「键名 + 值形态」。
+ */
+function isReallyWired(block: string, key: string): boolean {
+  // ① 键后面必须跟一个**看着像值**的东西（不能是 undefined / false / null / 空）
+  const m = new RegExp(`\\b${key}\\s*:\\s*([^,\\n}]*)`).exec(block)
+  if (m === null) return false
+  const value = m[1]!.trim()
+  if (value.length === 0) return false
+  if (/^(?:undefined|false|null)\b/.test(value)) return false
+  // ② 不得把键藏进**死条件展开**（`...(false ? {...} : {})` 之类）
+  const spread = new RegExp(`\\.\\.\\.\\s*\\(?\\s*(?:false|0)\\s*\\?`).test(block)
+  if (spread && block.includes(key)) return false
+  return true
+}
+
 /** 取 `const <name> = new BuddyBalanceSelector({…})` 的对象字面量正文（大括号配平）。 */
 function selectorBlockOf(name: string): string | undefined {
   const marker = `const ${name} = new BuddyBalanceSelector({`
@@ -91,7 +136,7 @@ describe('★★ 选号器必须接上 fetchBalanceDetailed（否则锁定时说
     for (const entry of SELECTORS) {
       const block = selectorBlockOf(entry.name)
       expect(block, `★ 找不到 ${entry.name} 的定义（改名了？本表要跟上）`).toBeDefined()
-      const wired = /\bfetchBalanceDetailed\s*:/.test(block!)
+      const wired = isReallyWired(block!, 'fetchBalanceDetailed')
       if (entry.mustDetailed && !wired) missing.push(entry.name)
       // 豁免的实例**不得**接：接了说明上游已经补了带原因变体，本表要改成 mustDetailed。
       if (!entry.mustDetailed && wired) {
@@ -113,8 +158,8 @@ describe('★★ 选号器必须接上 fetchBalanceDetailed（否则锁定时说
     for (const entry of SELECTORS) {
       if (!entry.mustDetailed) continue
       const block = selectorBlockOf(entry.name)!
-      expect(block, `★ ${entry.name} 缺 fetchBalance`).toMatch(/\bfetchBalance\s*:/)
-      expect(block, `★ ${entry.name} 缺 fetchBalanceDetailed`).toMatch(/\bfetchBalanceDetailed\s*:/)
+      expect(isReallyWired(block, 'fetchBalance'), `★ ${entry.name} 缺 fetchBalance`).toBe(true)
+      expect(isReallyWired(block, 'fetchBalanceDetailed'), `★ ${entry.name} 缺 fetchBalanceDetailed`).toBe(true)
     }
   })
 
@@ -166,5 +211,48 @@ describe('★★ 选号器必须接上 fetchBalanceDetailed（否则锁定时说
     // 中国站不得带 xff（那是国际站的地理分流）。
     const cn = selectorBlockOf('minimaxBalanceSelector')!
     expect(cn).not.toContain('minimaxXff')
+  })
+})
+
+/**
+ * ★★ 判据**自证有牙**（2026-10-25 审计 A3-3）。
+ *
+ * ⚠️ 这三条是本文件最重要的部分：`isReallyWired` 是文本级判据，而文本级判据
+ * 最常见的失败模式是「看起来在判，其实任何写法都能过」。实测旧判据
+ * （`/\bfetchBalanceDetailed\s*:/`）对下面三种绕过**全部放行**（47 passed 全绿），
+ * 而它们在运行时**都等于没接**：
+ *
+ * | 绕过 | 形态 | 运行时后果 |
+ * |---|---|---|
+ * | 值假 | `fetchBalanceDetailed: undefined as never` | 传了 `undefined` ⇒ 与没传等价 |
+ * | 注释掉 | `// fetchBalanceDetailed: fn` | 键根本不存在 |
+ * | 死条件展开 | `...(false ? { fetchBalanceDetailed } : {})` | 展开结果恒空 |
+ *
+ * ⇒ 用内联字符串直接喂判据，锁住「这三种必须被判为**没接**」。
+ */
+describe('★★ isReallyWired 判据自证（三种已知绕过必须全被判为「没接」）', () => {
+  it('★★ 值假 / 注释掉 / 死条件展开 —— 三种都必须判为「没接」', () => {
+    // ① 正常接线（必须判为「接了」—— 否则判据恒假、把好代码也拦住）
+    expect(isReallyWired('{ fetchBalanceDetailed: realFn, }', 'fetchBalanceDetailed')).toBe(true)
+    // ② 值假
+    expect(isReallyWired('{ fetchBalanceDetailed: undefined as never, }', 'fetchBalanceDetailed')).toBe(false)
+    expect(isReallyWired('{ fetchBalanceDetailed: undefined, }', 'fetchBalanceDetailed')).toBe(false)
+    expect(isReallyWired('{ fetchBalanceDetailed: null, }', 'fetchBalanceDetailed')).toBe(false)
+    expect(isReallyWired('{ fetchBalanceDetailed: false, }', 'fetchBalanceDetailed')).toBe(false)
+    // ③ 死条件展开
+    expect(
+      isReallyWired('{ ...(false ? { fetchBalanceDetailed } : {}), }', 'fetchBalanceDetailed'),
+      '死条件展开被判为已接线 —— 运行时展开恒空，等于没接',
+    ).toBe(false)
+    // ④ 键不存在
+    expect(isReallyWired('{ fetchBalance: thinFn, }', 'fetchBalanceDetailed')).toBe(false)
+    // ⑤ 键存在但值为空
+    expect(isReallyWired('{ fetchBalanceDetailed: , }', 'fetchBalanceDetailed')).toBe(false)
+  })
+
+  it('★★ 剥注释后，注释里的键名不得让判据通过（A3-3 的第二种绕过）', () => {
+    const commented = stripComments('{\n  // fetchBalanceDetailed: realFn,\n  fetchBalance: thinFn,\n}')
+    expect(commented, '剥注释没生效 ⇒ 注释里的键名会让判据假绿').not.toContain('fetchBalanceDetailed')
+    expect(isReallyWired(commented, 'fetchBalanceDetailed')).toBe(false)
   })
 })

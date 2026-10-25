@@ -2073,6 +2073,51 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
       expect(classifyQoderFailure('SERVER', 'model_error')).toBe('other')
     })
 
+    /**
+     * ★★★ P1（2026-10-25 审计 B1-1）：**网关 5xx 必须换号**。
+     *
+     * ## 为什么这条比 `provider_error` 更重要
+     *
+     * 对抗审计扫了本机**全部 1374 个会话 / 163 条真实 qoder 失败**，按形态计数：
+     *
+     * | 真实形态 | 次数 |
+     * |---|---|
+     * | `qoder: <html>…504 Gateway Time-out…</html>` | **74** |
+     * | `First Token Timeout or Upstream Timeout (504/model_error)` | **6** |
+     * | `Error in upstream response (provider_error/model_error)` | 16 |
+     *
+     * 而旧判据（`looksLikeUpstreamProviderError`）**只认 `provider_error` 那类短语**
+     * ⇒ 前两种（共 **80 次**，占主导）都落 `other` ⇒ **不换号**，且终态是
+     * `SERVER`（在宿主 `DEFAULT_RETRYABLE_CODES` 里）⇒ **白重试 5 次**。
+     * 本 PR 修的是较少见的 16 次，主导形态反而没修。
+     *
+     * ⚠️ 判据必须**窄**：只收「明确的网关/上游故障短语」，不能收到 `SERVER` 全体
+     *   （那会把 400 参数错也变成可换号）。
+     * ⚠️ 两个方向都要用例：`504 Gateway Time-out` 要换号；`504 + billing 文案`
+     *   仍必须归 `quota`（额度腿优先，不能被新判据抢走）。
+     */
+    it('★★★ P1：网关 5xx（504 HTML / 上游超时）必须归 upstream（换号、不写冷却）', () => {
+      // 真实形态 ①（74 次）：网关 HTML 错误页
+      const html504 = 'qoder: <html><head><title>504 Gateway Time-out</title></head><body>…</body></html>'
+      expect(classifyQoderFailure('SERVER', html504), '504 HTML 未归 upstream').toBe('upstream')
+      // 真实形态 ②（6 次）：上游首 token 超时
+      const upstreamTimeout = 'qoder: First Token Timeout or Upstream Timeout (504/model_error)'
+      expect(classifyQoderFailure('SERVER', upstreamTimeout), '上游超时未归 upstream').toBe('upstream')
+      // 同族的其它网关形态
+      expect(classifyQoderFailure('SERVER', '<html>502 Bad Gateway</html>')).toBe('upstream')
+      expect(classifyQoderFailure('SERVER', '503 Service Unavailable')).toBe('upstream')
+
+      // ⚠️ 反向 ①：新判据**不得**把额度腿抢走
+      expect(classifyQoderFailure('SERVER', '504 Gateway Time-out: Billing daily count exceeded'))
+        .toBe('quota')
+      // ⚠️ 反向 ②：仍必须是窄判据 —— 泛化 5xx/错误词不得变成 upstream
+      expect(classifyQoderFailure('SERVER', 'internal server error')).toBe('other')
+      expect(classifyQoderFailure('SERVER', 'request timeout')).toBe('other')
+      expect(classifyQoderFailure('SERVER', 'upstream connection reset by peer')).toBe('other')
+      // ⚠️ 反向 ③：非 SERVER 码即使带这句话也不认（与 provider_error 同纪律）
+      expect(classifyQoderFailure('INVALID_REQUEST', '504 Gateway Time-out')).toBe('other')
+    })
+
     it('shouldRotateQoderAccount / recordsQoderRateLimit：两张表必须不同', () => {
       // 换号：除 `other` 外都换
       expect(shouldRotateQoderAccount('quota')).toBe(true)

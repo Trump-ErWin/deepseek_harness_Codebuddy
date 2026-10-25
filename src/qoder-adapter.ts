@@ -182,9 +182,38 @@ function failureCallOf(error: unknown): { code: string; text: string } {
  * ⚠️ **不收 `model_error`**：它是 `openai-compat.ts:929` 的**拼接产物**
  * （`[code, type].join('/')`），单独出现时可能来自任何 `SERVER` 错误，
  * 收它等于把整个 `SERVER` 都算进来 —— 那正是本判据要避免的过宽。
+ *
+ * ## ⚠️⚠️ 网关 5xx 也必须收（2026-10-25 审计 P1，B1-1）
+ *
+ * 上面那张词表**只认 `provider_error` 那类短语**。但对抗审计扫了本机全部
+ * **1374 个会话 / 163 条真实 qoder 失败**，按形态计数后发现真正**主导**的是
+ * 另外两种，而它们都落 `other` ⇒ **不换号**、还因终态是 `SERVER`
+ * （在宿主 `DEFAULT_RETRYABLE_CODES` 里）**白重试 5 次**：
+ *
+ * | 真实形态 | 次数 |
+ * |---|---|
+ * | `qoder: <html>…504 Gateway Time-out…</html>` | **74** |
+ * | `First Token Timeout or Upstream Timeout (504/model_error)` | **6** |
+ * | `Error in upstream response (provider_error/model_error)` | 16 |
+ *
+ * ⇒ 本 PR 原以为的核心目标（16 次）其实不是主导形态；把网关 5xx 一并收进来
+ * 才真正覆盖了「登录 N 个账号 ≠ N 倍可用性」这个缺陷。
+ *
+ * ⚠️ 仍然要**窄**：只收「明确的网关/上游故障短语」——
+ * `gateway time-out` / `bad gateway` / `service unavailable` /
+ * `(first token|upstream) timeout`。**不收**泛化的 `server error` /
+ * `timeout` / `upstream connection reset`：那些可能是请求侧或本地网络问题，
+ * 收进来会让 400 参数错也变成可换号（白烧整池）。
+ * ⚠️ 顺序不变：**额度腿优先**（见 `classifyQoderFailure`），
+ * 故「504 + billing 文案」仍归 `quota`。
  */
 export function looksLikeUpstreamProviderError(text: string): boolean {
-  return /provider_error|provider\s+error|upstream\s+(?:provider\s+)?error|error\s+in\s+upstream\s+response/i.test(
+  if (/provider_error|provider\s+error|upstream\s+(?:provider\s+)?error|error\s+in\s+upstream\s+response/i.test(
+    text,
+  )) return true
+  // 网关 5xx：HTML 错误页（`504 Gateway Time-out` / `502 Bad Gateway`）与
+  // 上游超时（`First Token Timeout or Upstream Timeout`）。
+  return /gateway\s+time-?out|bad\s+gateway|service\s+(?:temporarily\s+)?unavailable|(?:first\s+token|upstream)\s+timeout/i.test(
     text,
   )
 }

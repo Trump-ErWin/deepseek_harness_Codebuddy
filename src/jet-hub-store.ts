@@ -923,9 +923,75 @@ export function sanitizeAccounts(raw: unknown): ProviderAccountEntry[] {
       // 无有效项时写 `undefined`：`JSON.stringify` 会整个丢弃该键，
       // 故落盘/传输形态与「从未有过标记」完全一致（不留 `{}` 噪音）。
       modelRateLimits: limits,
+      // ⚠️ 四个代理字段统一过闸（2026-10-25 审计 B2-1，见 `PROXY_FIELDS` 的注释）。
+      // 与 `modelRateLimits` 同款：**显式写键名并置于展开之后**，否则
+      // `candidate` 里的脏值会把清理结果整个覆盖回去（本文件第一版正是如此）。
+      ...sanitizeProxyFields(candidate),
     } as ProviderAccountEntry)
   }
   return accounts
+}
+
+/**
+ * 四个出口代理字段 —— 备份/状态文件里**唯一**需要「取值校验而非形状校验」的一类。
+ *
+ * ## ⚠️⚠️ 为什么必须在 `sanitizeAccounts` 这一处挡（2026-10-25 审计 B2-1）
+ *
+ * `sanitizeAccounts` 是「外部数据 → 池」的**唯一闸门**（`state.json` 读取与
+ * `backup.import` 都过它），而它原先用 `{ ...candidate }` **原样透传**代理字段 ——
+ * 只限「是不是字符串」、不限「是不是合法代理」。后果链（真跑端点实测）：
+ *
+ * ```
+ * backup.import（载荷 qoderProxy = "ftp://host:21"）→ ok:true、账号落池
+ *   → 此后该账号每次取 fetcher 都抛「代理地址无效 — 不支持的协议 ftp」
+ *   → 该账号【永久不可用】
+ * ```
+ *
+ * ⚠️ 而客户端**有**导入按钮（`jet-hub.js` 的 `backup.import`）⇒ 这条路径
+ * **UI 可达**。池自己的注释也早把备份文件当不可信输入（`qoderProxyFor` 明写
+ * 「池里可能存在 `"qoderProxy": 12345`」），却只防了非字符串。
+ *
+ * ## 为什么修在这里，而不是各 provider 的读取侧
+ *
+ * 四个 provider 的解析器**同形**地在读取侧 `throw`
+ * （`opencode.ts` / `gemini-proxy.ts` / `minimax-proxy.ts` / `qoder-proxy.ts`）。
+ * 改读取侧要四处同改、且很容易只改一家而让三家分叉；修在这个唯一闸门上，
+ * 四个字段同时受益，**四个 provider 的读取侧永远遇不到脏值**。
+ *
+ * ## 处置：清掉该字段（降级直连），不是丢弃整条账号
+ *
+ * 丢账号会让用户「导入后少了几个号」且不知道为什么；清字段只让该账号回到
+ * 「直连」，面板上「当前：直连」一眼可见、可重填。**删一个字段比删一条账号可逆得多。**
+ *
+ * ## ⚠️ 判据为什么只查 scheme（而不是搬 `normalizeProxy` 进来）
+ *
+ * `normalizeProxy` 住在 `opencode.ts`（provider 实现层），而本文件是**底层**
+ * store —— 反向依赖会成环。故这里只做**最小形状闸**：scheme 必须是三家
+ * 支持的之一（`http` / `https` / `socks5`）。它足以挡住「导出/导入往返里混进
+ * 的 `ftp://` / 少 scheme / 垃圾串」这类会**让账号永久不可用**的值，
+ * 而更细的校验（端口范围、authority 形态）留给真正建连接时的 `normalizeProxy`
+ * —— 那时即使失败也只是**一次请求**失败，不再是「账号永久不可用」。
+ */
+const PROXY_FIELDS = ['opencodeProxy', 'geminiProxy', 'minimaxIntlProxy', 'qoderProxy'] as const
+
+/** 三家解析器共同支持的 scheme。 */
+const PROXY_SCHEME_RE = /^(?:https?|socks5):\/\/\S+$/i
+
+/**
+ * 清掉四个代理字段里的**非法值**（返回的键值对会覆盖 `...candidate` 的脏值）。
+ *
+ * ⚠️ 用 `undefined` 而不是 `delete`：本函数返回的是**展开进新对象**的键值对，
+ * `undefined` 让 `JSON.stringify` 整个丢弃该键（与 `modelRateLimits` 同款口径）。
+ */
+function sanitizeProxyFields(candidate: Partial<ProviderAccountEntry>): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = {}
+  for (const field of PROXY_FIELDS) {
+    const raw = (candidate as Record<string, unknown>)[field]
+    if (raw === undefined) continue
+    const text = typeof raw === 'string' ? raw.trim() : ''
+    out[field] = PROXY_SCHEME_RE.test(text) ? text : undefined
+  }
+  return out
 }
 
 /**

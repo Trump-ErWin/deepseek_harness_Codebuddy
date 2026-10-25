@@ -696,3 +696,183 @@ describe('⑦ 回归：解析器返回的 fetcher 真的能发请求', () => {
     await expect(resolver('qoder-1')('http://127.0.0.1:1/x', {})).rejects.toThrow()
   })
 })
+
+/**
+ * ⑧ 折算路径（聚合轮换的候选可见性）也必须走 per-账号代理。
+ *
+ * ## ⚠️⚠️ 为什么这条是 P1（2026-10-25 审计 A2-17 / B2 判定「合入前必须补」）
+ *
+ * 本 PR 给 qoder 接了**四条腿**（推理 / 原生搜索 / 余额选号 / 登录续期目录），
+ * 但**折算路径一行没改** —— `qoderExpiry` 的签名只有
+ * `(credential, product, cached?)`，内部 `fetchQoderCreditBalance(credential, product)`
+ * **不带 fetcher** ⇒ 走全局 `fetch` ⇒ 墙外环境下折算**恒失败**
+ * ⇒ 该渠道折算成 `UNUSABLE` ⇒ 被 `rankCandidates` 剔除
+ * ⇒ **用户在聚合轮换列表里永远看不到 qoder / qodercn**，且**零报错、零日志**。
+ * 而面板（走选号器那条腿）看起来完全正常 —— 这正是本仓库记过 6 次的那类静默陷阱。
+ *
+ * ⚠️ 仓库的**紧邻先例**已把同形缺口判 P0：`provider-expiry.ts` 的
+ * `minimaxIntlFetchFor` 注释逐字写着「只把 fetcher 接进了选号器与适配器 ——
+ * 折算路径一行没改」，且 `index.ts` 明写「credits 与 expiry 两条腿缺一不可」。
+ *
+ * ## 判据为什么必须是**行为级**
+ *
+ * 同族先例（`minimax-proxy.spec.ts:152`）用的是源码文本断言
+ * （`expect(indexSource).toContain('minimaxIntlFetchFor: …')`）。本仓库已多次实测
+ * 源码文本断言对「字面量留在 `if (false)` 死分支里」完全无感 ⇒ 这里改为
+ * **真跑折算、断言注入的 fetcher 被调用**。
+ */
+describe('⑧ 折算路径必须走 per-账号代理（否则聚合轮换里静默消失）', () => {
+  it('★★ qoder 的 credentialExpiry 必须使用注入的 fetcher，而不是全局 fetch', async () => {
+    const { createProviderExpiry } = await import('../../src/provider-expiry.js')
+    // ⚠️ 注入的是**解析器**（`(accountId) => typeof fetch`），不是 fetch 本身 ——
+    //    这与 `minimaxIntlFetchFor` 的契约一致：代理按账号现取。
+    const used = vi.fn()
+    const accountFetch = vi.fn(async () => new Response('{}', { status: 200 }))
+    const resolver = (accountId: string): typeof fetch => {
+      used(accountId)
+      return accountFetch as unknown as typeof fetch
+    }
+    const expiry = createProviderExpiry({ qoderFetchFor: resolver })
+
+    // 真跑折算：像真实调用那样带上 accountId。
+    await expiry.qoder!.credentialExpiry(
+      { access_token: 'AT', refresh_token: 'RT', uid: 'u1' } as never,
+      { accountId: 'qoder-acct-1' } as never,
+    )
+
+    // ⚠️ 枢轴：**必须**按该账号问过解析器（走代理）。修复前这里是 0 次。
+    expect(used, '折算没走 per-账号代理 ⇒ 墙外环境下该渠道从聚合轮换里静默消失')
+      .toHaveBeenCalledWith('qoder-acct-1')
+    // ⚠️ 且解析器返回的 fetch 必须**真的被用去发请求**（不能只是问一声）
+    expect(accountFetch, '解析器被问了但没用它发请求').toHaveBeenCalled()
+  })
+
+  it('★★ qodercn 同样必须走（两站共用原语，别只接一站）', async () => {
+    const { createProviderExpiry } = await import('../../src/provider-expiry.js')
+    const used = vi.fn()
+    const accountFetch = vi.fn(async () => new Response('{}', { status: 200 }))
+    const resolver = (accountId: string): typeof fetch => {
+      used(accountId)
+      return accountFetch as unknown as typeof fetch
+    }
+    const expiry = createProviderExpiry({ qoderFetchFor: resolver })
+
+    await expiry.qodercn!.credentialExpiry(
+      { access_token: 'AT', refresh_token: 'RT', uid: 'u2' } as never,
+      { accountId: 'qodercn-acct-1' } as never,
+    )
+
+    expect(used, '中国版折算没走代理').toHaveBeenCalledWith('qodercn-acct-1')
+    expect(accountFetch).toHaveBeenCalled()
+  })
+})
+
+/**
+ * ⑨ 代理口令**不得出现在用户可见的失败文案里**（2026-10-25 审计 A2-01）。
+ *
+ * ## 缺陷
+ *
+ * `qoder.testProxy` 失败文案曾写成
+ * `代理 ${normalized.proxy.label}（${normalized.proxy.url}）没有在监听…`
+ * —— `label` 已经脱敏成 `http://user:***@host:port`，紧接着又把带**明文口令**的
+ * `url` 原样贴回来，**同一句里自己拆自己的台**。
+ *
+ * ## 定级说明（对抗审计 B2 的裁定：P2，不是 P0）
+ *
+ * 去向链已实测：这条文案**不落盘、不进日志、不进会话历史、不被模型看到**，
+ * 只显示在用户自己的弹窗里 ⇒ 没有一条后果链能到达「用户以外的人」。
+ * 但它仍是**该修**的：错误行是用户最容易**整段复制**（贴 issue / 截图）的东西，
+ * 而同句里已经做过脱敏。故本守卫锁「口令不出现在任何失败文案里」。
+ */
+describe('⑨ 失败文案不得回显代理口令', () => {
+  it('★★ 连接被拒绝时：文案不得含明文口令（label 保留 host/用户名，口令打码）', async () => {
+    const mod = await import('../../src/qoder-rpc.js')
+    // 真造一个「代理入口无人监听」的失败：注入会抛 ECONNREFUSED 的 fetch。
+    const refused = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:7897'), {
+        code: 'ECONNREFUSED', address: '127.0.0.1', port: 7897,
+      }),
+    })
+    const res = await mod.handleQoderRpc(
+      {} as never,
+      { setQoderProxy: vi.fn() },
+      'qoder.testProxy',
+      { proxy: 'http://bob:hunter2@127.0.0.1:7897' },
+    )
+
+    const text = JSON.stringify(res)
+    // ⚠️ 枢轴：明文口令**不得**出现在返回给客户端的任何字段里
+    expect(text, `失败文案回显了明文口令：${text.slice(0, 200)}`).not.toContain('hunter2')
+  })
+})
+
+/**
+ * ⑩ 池写入日志**不得打印明文代理口令**（2026-10-25 审计 A2-02）。
+ *
+ * ## 缺陷
+ *
+ * 四家 provider 的 `set*Proxy` 都用同一形态打日志：
+ * `` `[jet-hub] 账号 ${id} Qoder 代理 → ${proxy}` `` —— 直接拼**原始 URL**。
+ * 而代理 URL 常含 `user:pass@host` ⇒ 口令明文进日志文件，而日志是用户
+ * 排障时会随手打包、粘贴、上传的东西。
+ *
+ * ## 为什么四家一起修
+ *
+ * 对抗审计逐家实测：opencode / gemini / minimaxintl **早已同形**，qoder 只是
+ * **第 4 个实例**（不是本 PR 新增的机制）。只修 qoder 会让「同一语义两套判据」
+ * 的红线在此处成立 ⇒ 一并修，并加一条**逐家点名**的守卫。
+ */
+describe('⑩ 代理写入日志必须脱敏', () => {
+  const SECRET = 'hunter2'
+  const PROXY = `http://bob:${SECRET}@127.0.0.1:7897`
+
+  /** 造一个会把日志收进数组的池（真 `AccountPool`，真读池）。 */
+  async function poolWithLogs() {
+    const { AccountPool } = await import('../../src/account-pool.js')
+    const lines: string[] = []
+    const ctx = {
+      logger: { info: (m: string) => { lines.push(m) }, warn: (m: string) => { lines.push(m) } },
+      credentials: {
+        describe: async () => ({ configured: true, source: 'test', writable: true }),
+        resolve: async () => ({ value: '{}', source: 'test' }),
+        set: async () => {},
+        unset: async () => {},
+      },
+    }
+    const pool = new AccountPool(ctx as never)
+    await pool.addAccount({
+      id: 'acct-1', provider: 'qoder', nickname: 'a', enabled: true,
+      credentialRef: 'QODER_ACCOUNT_A', refreshable: false, createdAt: 1,
+    } as never)
+    return { pool, lines }
+  }
+
+  it('★★ setQoderProxy 的日志必须只打脱敏 label', async () => {
+    const { pool, lines } = await poolWithLogs()
+    await pool.setQoderProxy('acct-1', PROXY)
+    const joined = lines.join('\n')
+    expect(joined.length, '日志一行都没产生 ⇒ 判据失效（可能字段名写错）').toBeGreaterThan(0)
+    expect(joined, `日志泄漏了明文口令：${joined}`).not.toContain(SECRET)
+    // ⚠️ 但要保留可排查信息：host:port 与用户名必须还在
+    expect(joined).toContain('127.0.0.1:7897')
+    expect(joined).toContain('bob')
+  })
+
+  it('★★ 四家（opencode / gemini / minimaxintl / qoder）的日志都必须脱敏', async () => {
+    const { pool, lines } = await poolWithLogs()
+    const setters = [
+      ['setOpencodeProxy', 'opencode'],
+      ['setGeminiProxy', 'gemini'],
+      ['setMinimaxIntlProxy', 'minimaxintl'],
+      ['setQoderProxy', 'qoder'],
+    ] as const
+    for (const [method, label] of setters) {
+      const fn = (pool as unknown as Record<string, (id: string, p: string) => Promise<void>>)[method]
+      if (typeof fn !== 'function') continue
+      lines.length = 0
+      await fn.call(pool, 'acct-1', PROXY)
+      const joined = lines.join('\n')
+      expect(joined, `${label}（${method}）的日志泄漏了明文口令：${joined}`).not.toContain(SECRET)
+    }
+  })
+})

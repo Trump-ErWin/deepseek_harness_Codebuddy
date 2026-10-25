@@ -181,7 +181,12 @@ export async function handleQoderRpc(
            */
           if (targetsProxyEntry(error, normalized.proxy.url)) {
             return fail(
-              `测试失败：${detail}。代理 ${normalized.proxy.label}（${normalized.proxy.url}）`
+              // ⚠️⚠️ **只回显 `label`（已脱敏），绝不回显 `url`**（2026-10-25 审计 A2-01）。
+              //    旧写法是 `代理 ${label}（${url}）没有在监听` —— 同一句里先脱敏、
+              //    紧接着又把带明文口令的 `url` 贴回来，**自己拆自己的台**。
+              //    该文案是用户在弹窗里最容易**整段复制粘贴**的东西（贴进 issue / 截图），
+              //    而 label 已经够用：它保留了 host:port 与用户名、只把口令打成 `***`。
+              `测试失败：${detail}。代理 ${normalized.proxy.label}`
               + '没有在监听（连接被拒绝）—— 先启动代理软件、核对地址与端口，'
               + '或清空代理回到直连（两个站点直连都能通）。',
             )

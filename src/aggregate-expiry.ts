@@ -1487,10 +1487,21 @@ export async function qoderExpiry(
   product: QoderProduct,
   /** 共享读数入口（见 {@link buddyExpiry} 的同名参数）。 */
   cached?: () => Promise<CreditBalance | null | undefined>,
+  /**
+   * 该账号的出口代理 fetcher（2026-10-25 审计 A2-17）。
+   *
+   * ⚠️⚠️ **折算路径不接代理 ⇒ 墙外环境下该渠道从聚合轮换里静默消失**：
+   * 国际版整站在墙外被 SNI 阻断，只能用 per-账号代理出去。本 PR 把代理接进了
+   * 推理/搜索/选号/登录四条腿，**折算这条漏了** ⇒ 折算恒失败 ⇒ `UNUSABLE`
+   * ⇒ 被 `rankCandidates` 剔除，**零报错、零日志**，而面板看起来正常。
+   *
+   * 省略 ⇒ 回落全局 `fetch`（= 修复前的行为，供不需要代理的调用方使用）。
+   */
+  fetcher?: typeof fetch,
 ): Promise<number> {
   return sharedPackageExpiry(() => fetchBalanceWithCache(
     cached,
-    () => fetchQoderCreditBalance(credential, product),
+    () => fetchQoderCreditBalance(credential, product, fetcher),
   ))
 }
 
