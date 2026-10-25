@@ -389,6 +389,70 @@ export interface RpcCreateAccountResponse {
    * 比反过来假设「空串必是错误」更稳，且不必为一次能力下线去改前端渲染分支。
    */
   reused?: boolean
+  /**
+   * MiniMax：**保证需要重新登录**的授权链接（2026-10-24）。
+   *
+   * ## 为什么 `loginUrl` 不够
+   *
+   * `loginUrl`（`/oauth-authorize?user_code=…`）**不含身份**，身份全在浏览器
+   * cookie ⇒ 带已有会话打开就直接复用上一个账号（上游不认任何 `prompt=*`
+   * 强制参数，实测五个参数全被忽略）。
+   *
+   * 本字段是上游「切换账号」按钮的等价物：`/unified-login?login_redirect=<授权页>`，
+   * 由宿主用**无 cookie** 的服务端请求换来，登录完自动回到授权页放行**新**账号。
+   *
+   * ## 三条纪律
+   *
+   * 1. **可选**：拿不到时**不填**（客户端退回 `loginUrl`，行为与从前逐字节相同）；
+   * 2. 客户端判据必须是 `typeof === 'string' && length > 0`（老宿主 `undefined`）；
+   * 3. 它**不消耗凭据**（纯 GET，无 `Authorization`）⇒ 与
+   *    「诊断脚本不得对真实凭据发起 refresh」那条铁律不冲突。
+   */
+  forcedLoginUrl?: string
+  /**
+   * MiniMax：打开 `forcedLoginUrl` **之前**应当先访问一次的上游**登出**地址
+   * （2026-10-24，方案 A：「登出 → 授权页」两跳）。
+   *
+   * ## 为什么有了 `forcedLoginUrl` 还需要它
+   *
+   * `forcedLoginUrl` 只保证「这条链接**要求**登录」（我实测：全新浏览器打开它
+   * 会显示登录表单 —— 微信扫码 / 手机号 / 账号密码，无「授权」按钮）。
+   * 但它**不主动注销**浏览器里已存在的会话：
+   *
+   * - 若用户浏览器里已有 `account.minimax.cn` 的 `_sid`，统一登录页可能**直接
+   *   放行**（实测未能覆盖这一半 —— 我没有用户账号，无法构造合法的旧会话）；
+   * - 更糟的是**登录完成后的新会话会覆盖旧的**，用户下次又带着「上一个号」。
+   *
+   * 用户的实际症状正是这个：「要手动清理浏览器 token 不然还是会带上个账号登录态」。
+   *
+   * ## 上游登出端点（实测 2026-10-24，两站都有）
+   *
+   * ```
+   * GET https://account.minimax.cn/oauth2/logout
+   *   → 302 Location: /unified-login
+   *   → Set-Cookie: _sid=; path=/; HttpOnly; secure; SameSite=Lax
+   * GET https://account.minimax.io/oauth2/logout    （国际站同形）
+   * ```
+   *
+   * ⚠️ 它**不接受任何回跳参数**（实测 `redirect` / `redirect_url` / `return_to` /
+   * `returnTo` / `url` / `service` / `target` / `to` / `continue` / `next_url` /
+   * `next` 共 11 个参数名，`Location` 恒为 `/unified-login`）⇒ 所以必须**两跳**：
+   * 先访问本地址，再打开 `forcedLoginUrl`。
+   *
+   * ⚠️⚠️ **副作用必须让用户知道**：作用域是整个 `account.minimax.cn` 网页会话 ——
+   * 用户在同一浏览器里登录的 MiniMax **网页版**会被一起登出（登录完成后新会话
+   * 立即重建，影响很小但真实存在）。故客户端打开前**必须**给出提示，不得静默执行。
+   *
+   * ## 纪律
+   *
+   * 1. **可选**：拿不到时不填，客户端退化为只开 `forcedLoginUrl`（旧行为）；
+   * 2. 客户端**先登出、再打开** `forcedLoginUrl`，中间留一个短延迟（见客户端注释）；
+   * 3. 它是**普通页面**（导航即可），不要用 `fetch` —— 需要浏览器**真正写入**
+   *    那个清 cookie 的 `Set-Cookie`，而 `fetch` 在无 `credentials` 时可能不落地；
+   * 4. 仅对 `minimax` / `minimaxintl` 下发，且**只在「新建账号」**路径（其它 provider
+   *    的授权页不在该 cookie 域，登出无意义且有害）。
+   */
+  logoutUrl?: string
 }
 
 export interface RpcPollLoginRequest {
