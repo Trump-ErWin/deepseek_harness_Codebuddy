@@ -1445,31 +1445,34 @@ export function apply(ctx: Context): void {
    * @param displayName - 产品名（用户据此知道去哪个面板解锁）。
    */
   const buddyLockedError = (displayName: string) =>
-    (reason: BuddyNoAccountReason): Error => {
+    (reason: BuddyNoAccountReason): LlmError => {
       const days = buddyExpiringWindowDays()
       if (reason.kind === 'unknown') {
-        return new Error(
+        return new LlmError(
           `${displayName}：无法确认是否有可用账号。已锁定永久积分，而本次余额查询未能全部完成`
           + `（${foldReasonErrors(reason.errors)}）。这些账号**可能仍有**「${days} 天内到期」`
           + '的积分 —— 请重试，或在 Jet Hub 对应面板检查凭据是否失效。',
+          'QUOTA_EXCEEDED',
         )
       }
       if (reason.kind === 'no-candidates') {
-        return new Error(
+        return new LlmError(
           `${displayName}：没有可用账号。已锁定永久积分，而本次**没有任何候选账号**`
           + '（该 provider 下没有启用中的账号，或全部账号都在本次请求的模型上受限）。'
           + `请在 Jet Hub 的 ${displayName} 面板确认账号已启用、且未全部处于限流中；`
           + '或改用其它 provider / 模型，或解锁永久积分后重试。',
+          'QUOTA_EXCEEDED',
         )
       }
       if (reason.kind === 'credential-only') {
         // ⚠️ **必须与「积分用尽」逐字分开**，且要**明确劝阻解锁**：解锁会不可
         //    撤回地烧掉永久积分，而本情形的根因在凭据、与积分无关。
-        return new Error(
+        return new LlmError(
           `${displayName}：无法使用任何账号。已锁定永久积分，而余额分档**确实选出了**`
           + '有可用积分的账号 —— 但它们的**凭据读不出来**（凭据缺失 / 已失效 / 被并发续期覆盖）。'
           + '⚠️ 这与「积分用尽」是两件事，**不要去解锁永久积分**（解锁会不可撤回地烧掉它们）。'
           + `请在 Jet Hub 的 ${displayName} 面板检查这些账号的凭据，必要时重新登录。`,
+          'QUOTA_EXCEEDED',
         )
       }
       /**
@@ -1488,10 +1491,11 @@ export function apply(ctx: Context): void {
        */
       const exhaustedOnly: { kind: 'exhausted' } = reason
       void exhaustedOnly
-      return new Error(
+      return new LlmError(
         `${displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
         + '积分都已用尽。请在 Jet Hub 的 '
         + `${displayName} 面板解锁永久积分，或等待资源包到期后重新发放额度。`,
+        'QUOTA_EXCEEDED',
       )
     }
 

@@ -2873,6 +2873,183 @@ const RESET_TIME_PATTERN = /(?:将在|reset at)\s+([\d-]+\s+[\d:]+)\s+(UTC[+-]\d
 export const RATE_LIMIT_FALLBACK_MS = 3_600_000
 
 /**
+ * 额度耗尽的业务码（CodeBuddy 系实测值）。
+ *
+ * ⚠️ 与 {@link RATE_LIMIT_BUSINESS_CODE}（6004 = 频率限流）**不可合并**：
+ * 两者动作相同但**冷却终点相反**（见 {@link isCreditExhausted} 的表）。
+ */
+export const CREDIT_EXHAUSTED_BUSINESS_CODE = 14018
+
+/**
+ * 额度耗尽的文案兜底判据（`14018` 的码值腿之外的唯一通道）。
+ *
+ * 上游原话（`www.workbuddy.ai`，HTTP 429）：
+ * `Credits exhausted. Please visit the link below to purchase add-on packs…`
+ *
+ * ⚠️ **关键词必须窄**：`insufficient` 单独出现**过宽**（见
+ * {@link isCreditExhausted} 的说明）。
+ */
+const CREDIT_EXHAUSTED_PATTERN =
+  /credits?\s+exhausted|quota\s+exhausted|积分.{0,4}(?:不足|耗尽|用尽)|额度.{0,4}(?:不足|耗尽|用尽)|余额.{0,4}(?:不足|耗尽|用尽)/i
+
+/**
+ * 额度**耗尽**（不是频率限流）的判据 —— 「钱用光了」，不是「发太快」。
+ *
+ * ## ⚠️⚠️ 为什么必须与 {@link isRateLimited} 分开（真实缺陷，Gitee IKQ6HJ）
+ *
+ * 两者的**动作完全相同**（换号 + 写冷却标记），但**冷却终点的语义相反**：
+ *
+ * | | 频率限流（6004 / 429） | 额度耗尽（14018 / Credits exhausted） |
+ * |---|---|---|
+ * | 恢复方式 | 时间到了就恢复（分钟级滚动窗口） | **等次日配额 / 充值** |
+ * | 冷却终点 | 服务端声明时刻，否则 +1h 兜底 | **UTC+8 当日 24:00** |
+ * | 写成 +1h 的后果 | 无（本来就该 1 小时） | **每小时被重新选中一次、必然再失败** |
+ *
+ * 用户侧症状（原始报障）：「面板说可以用了，一试又不行」——面板的『限额重置』
+ * 显示的是失败时刻 + 1 小时，到点后账号被重新选中，必然再失败一次，再写一条
+ * 1 小时标记，**循环往复**。而真实出路是等次日配额或充值。
+ *
+ * ## 为什么是「UTC+8 当日 24:00」而不是「+24h」
+ *
+ * 与 `loomyCooldownResetAtMs`（Gitee IKL80H 那起事故）**同一条纪律**：
+ * 额度按 UTC+8 自然日结算，用滑动 24h 会让 23:50 烧光的账号被封到**次日 23:50**
+ * ——用户 0 点后上游明明已放行、插件仍说「没到重置时间」，白等近一整天。
+ * 四家同口径的既有实现：`loomyCooldownResetAtMs` / `qoder-adapter` /
+ * `zcode-adapter` / `llm-adapter` 的 codearts 分支。
+ *
+ * ## 判据刻意**窄**
+ *
+ * 只认 `14018` 码值与 `credits exhausted` 完整短语。**不收** `insufficient` 这类
+ * 泛词 —— 上下文超长报文里的 `the context window is insufficient for this model`
+ * 会被误伤，而那是「换号无益」的另一类失败（同类误伤在
+ * `classifyLoomyFailure` / `classifyRaccoonFailure` 各踩过一次）；
+ * 中文侧同样只收「额度/积分/余额 + 不足/耗尽」的**确定性组合**。
+ *
+ * ⚠️ **本函数只看响应体，不看状态码**：14018 实测回 **HTTP 429**，但它与
+ * 频率限流共用 429 ⇒ 状态码对这一格**没有判别力**，只能靠码值/文案。
+ *
+ * @param body - 响应体（可能为空串）。
+ */
+export function isCreditExhausted(body: string): boolean {
+  if (body.length === 0) return false
+  // ① 结构化业务码：只认 JSON 的 `code` 字段（与 `hasRateLimitBusinessCode` 同一
+  //    取舍 —— 全文搜 `14018` 会被 UUID 里的数字子串误命中）。
+  //
+  //    ⚠️ **必须同时认嵌套形态**：buddy 系的真实报文是
+  //    `{"error":{"data":{"code":14018,"msg":"…"}}}`（码在**第二层**），
+  //    只看顶层 `code` 会让码值腿在这家**恒不命中**、只剩英文文案腿 ——
+  //    而上游一改文案就静默失效（同族教训：`channelVerificationUpstreamId`
+  //    的注释记录了「判据认了某字段、出口却提不出该字段」的漂移）。
+  try {
+    const data = JSON.parse(body) as Record<string, unknown>
+    const inner = typeof data.error === 'object' && data.error !== null
+      ? data.error as Record<string, unknown>
+      : undefined
+    const nested = typeof inner?.data === 'object' && inner.data !== null
+      ? inner.data as Record<string, unknown>
+      : undefined
+    const codes = [data.code, inner?.code, nested?.code]
+    if (codes.some(code => code === CREDIT_EXHAUSTED_BUSINESS_CODE
+      || code === String(CREDIT_EXHAUSTED_BUSINESS_CODE))) {
+      return true
+    }
+  } catch {
+    // 非 JSON：交给文案腿。
+  }
+  // ② 文案腿（网关包装过的 200/400、纯文本错误页、以及 `errorDetail` 产物）。
+  return CREDIT_EXHAUSTED_PATTERN.test(body)
+}
+
+/**
+ * 额度耗尽的冷却终点：**UTC+8 当日 24:00**。
+ *
+ * 与 {@link isCreditExhausted} 配套，供 `buddy-adapter` 的换号记账分支与
+ * `account-probe` 的重测回写共用 —— **只留一份实现**，两处各算一次必然漂移
+ * （本仓库首条红线「同一语义两套判据」）。
+ *
+ * ⚠️ **必须放在本文件（共享层）而不是某个渠道的适配器里**：`account-probe.ts`
+ * 也要用它（重测时把同一时刻回传给存储），而探测层不得反向依赖某个渠道的
+ * 适配器 —— `tests/unit/account-probe-adapter.spec.ts` 普遍
+ * `vi.mock('../../src/buddy-adapter.js')`，形成依赖后那个 mock 会把该函数
+ * 一起变成 `undefined`（Gitee IKQ6HJ 报告里记录的同一处陷阱）。
+ *
+ * @param nowMs - 当前时刻（注入以便单测）。
+ */
+export function creditExhaustedResetAtMs(nowMs: number = Date.now()): number {
+  return nextUtc8DayStartMs(nowMs)
+}
+
+/**
+ * 只取**服务端显式声明**的重置时刻；解析不到就返回 `undefined`（**不兜底**）。
+ *
+ * ## 为什么必须与 {@link parseRateLimitError} 并存
+ *
+ * `parseRateLimitError` 的语义是「调用方需要一个可写的标记」，故它**必然**
+ * 给出一个时刻（解析不到就 `+1h`）。而额度耗尽那一格需要区分
+ * 「服务端真给了时刻」与「它压根没给」：
+ *
+ * - 服务端给了 ⇒ **以它为准**（上游比我们更清楚何时恢复）；
+ * - 服务端没给 ⇒ 走 {@link creditExhaustedResetAtMs} 的 UTC+8 自然日，
+ *   **不是** `+1h`。
+ *
+ * 两者混用会让 14018 继续落进 1 小时兜底（正是 Gitee IKQ6HJ 的缺陷形态）。
+ *
+ * @param body - 响应体（可能为空串）。
+ * @returns 服务端声明的重置时刻（epoch ms），无则 `undefined`。
+ */
+export function explicitRateResetAtMs(body: string): number | undefined {
+  try {
+    const data = JSON.parse(body) as Record<string, unknown>
+    // ⚠️ 只读 `msg`（与 `parseRateLimitError` **同源**：两句真实文案都写在该字段里）。
+    // 若哪天上游把时刻挪到别的字段，两处必须**同批**改，不能只改一处。
+    //
+    // ⚠️ 嵌套形态也要认（`{"error":{"data":{"msg":"… reset at …"}}}`）：
+    // 只读顶层会让本函数在 buddy 系的真实报文形态上恒为 `undefined` —— 那不会
+    // 报错，只会静默退回自然日终点（「服务端给了时刻却不采用」）。
+    const inner = typeof data.error === 'object' && data.error !== null
+      ? data.error as Record<string, unknown>
+      : undefined
+    const nested = typeof inner?.data === 'object' && inner.data !== null
+      ? inner.data as Record<string, unknown>
+      : undefined
+    const candidates = [data.msg, inner?.msg, nested?.msg]
+    for (const candidate of candidates) {
+      if (typeof candidate !== 'string') continue
+      const resetMatch = RESET_TIME_PATTERN.exec(candidate)
+      if (!resetMatch) continue
+      const resetMs = Date.parse(`${resetMatch[1]} ${resetMatch[2]}`)
+      if (!Number.isNaN(resetMs)) return resetMs
+    }
+    return undefined
+  } catch {
+    // ⚠️⚠️ **非 JSON（纯文本）也必须扫一遍** —— 这不是兜底洁癖，是**真实主路径**
+    // （对抗审计实测打穿的缺陷）：
+    //
+    // `account-probe.ts` 拿到的 `message` 是**适配器抛出的 `LlmError.message`**，
+    // 而适配器早已把上游报文压平成纯文本：
+    // `workbuddy: Credits exhausted. Your quota will reset at 2099-12-31 23:59:59 UTC+8`
+    // ⇒ `JSON.parse` 必然失败 ⇒ 本函数恒 `undefined` ⇒ 探测腿永远退回自然日，
+    // 而推理腿（拿**原始报文**）能取到显式时刻 ⇒ 两条腿对同一条报文算出两个值。
+    //
+    // 实测三格（同一份 `14018 + reset at 2099` 报文）：
+    // | 输入形态 | 修前 | 修后 |
+    // |---|---|---|
+    // | 原始 JSON（推理腿） | 2099 | 2099 |
+    // | 压平后的 message（探测腿） | **undefined** ⇒ 自然日 | **2099** |
+    //
+    // ⚠️ 直接扫整段文本是安全的：`RESET_TIME_PATTERN` 要求「将在/reset at +
+    // 日期 + 时区」三件齐备，正常正文里凑不出这个形状（与 `parseRateLimitError`
+    // 对非 JSON 体走 `status === 429` 兜底的保守方向一致）。
+    const bareMatch = RESET_TIME_PATTERN.exec(body)
+    if (bareMatch !== null) {
+      const bareMs = Date.parse(`${bareMatch[1]} ${bareMatch[2]}`)
+      if (!Number.isNaN(bareMs)) return bareMs
+    }
+    return undefined
+  }
+}
+
+/**
  * 从限流错误中提取重置时间；体里没有时间时返回 {@link RATE_LIMIT_FALLBACK_MS} 兜底。
  *
  * @param status - HTTP 状态码（可选）。为 `429` 时即使**体为空、或无任何可识别文案**
