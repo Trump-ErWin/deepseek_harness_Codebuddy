@@ -32,6 +32,9 @@
  * 所以要领额度必须**先补两条事件**，再查 preview，再 claim。
  */
 
+import { randomUUID } from 'node:crypto'
+import { release as osRelease } from 'node:os'
+
 import type { ZcodeCredential } from './zcode.js'
 import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js'
 import {
@@ -145,11 +148,36 @@ export const ZCODE_MARKETING_ACTION_URL = `${ZCODE_ORIGIN}/api/v1/marketing/touc
 export const ZCODE_VERSION_GATED_MIN_APP_VERSION = '3.16.3'
 
 /**
+ * 进程级稳定的伪会话 id。
+ *
+ * ⚠ 官方每个会话一个 uuid（抓包实测 `x-session-id: df5db422-…`，同会话内恒定）。
+ * 插件没有「会话」这一层，故退而求其次：**每个进程一个**、请求间复用 ——
+ * 比每请求换新更接近真实客户端。
+ */
+const ZCODE_STABLE_SESSION_ID = randomUUID()
+
+/**
  * 构造 ZCode 的「来源标识」请求头。
  *
- * ⚠ 这些头是官方客户端在真实流量里发的。实测**它们不是 3012 的判据**
- * （判据是请求体里的 system 内容），但它们仍是「像官方客户端」的一部分，
- * 且 `X-Device-Mid` **是硬需求**（缺它 billing 全家桶回 400）。
+ * ## ★ 这些头的值以官方客户端的真实抓包为准（2026-10-25 逐字对齐）
+ *
+ * 官方 GUI 的一次 `/v1/messages` 带 **18 个头**。本函数此前只发 10 个，
+ * 且其中**两个的值与官方不符**：
+ *
+ * | 头 | 官方 | 本函数（改前） |
+ * |---|---|---|
+ * | `x-release-channel` | `production` | `stable` ✗ |
+ * | `x-platform` | `win32-x64` | `win32` ✗ |
+ *
+ * 并缺 7 个官方每次都带的头：`x-title` / `x-os-version` / `x-zcode-agent` /
+ * `x-session-id` / `x-zcode-session-type` / `x-request-id` / `x-zcode-trace-id`。
+ *
+ * ⚠ 旧注释写「实测它们不是 3012 的判据」—— 那是**旧版客户端**上取到的结论。
+ * 上游在 2026-10-23 升级到 `3.16.3` 之后，`405 + unusual activity` 开始在
+ * **所有**插件请求上稳定出现（跨账号、跨会话），而官方客户端同账号同网络正常
+ * ⇒ 头的形状重新成为首要嫌疑，故此处逐字对齐抓包。
+ *
+ * ⚠ `X-Device-Mid` **仍是硬需求**（缺它 billing 全家桶回 400）。
  */
 export function buildZcodeHeaders(
   credential: Pick<ZcodeCredential, 'device_mid' | 'app_version'>,
@@ -164,23 +192,38 @@ export function buildZcodeHeaders(
      * （见 {@link ZCODE_VERSION_GATED_MIN_APP_VERSION}）：
      * ① 营销投放查询 `fetchZcodeMarketingPlans`（版本低 ⇒ 投放为空）；
      * ② **领取** `claimZcodePlan`（版本低 ⇒ `1004 no permission`，真机一发定音）。
-     * 两者都必须按请求覆盖，**不得**改凭据本身
-     * （那会让推理路径的既有实测结论一起作废）。
+     * 两者都必须按请求覆盖，**不得**改凭据本身。
+     *
+     * ★ 未显式覆盖时走 {@link zcodeVersionGatedAppVersion}（凭据版本与
+     * `3.16.3` 取较大者），**不再直接回落到凭据里的旧版本**。
+     *
+     * 依据（2026-10-25 真机取证）：官方客户端在 2026-10-23 升级到 `3.16.3`
+     * 之后，本插件发的**推理**请求开始稳定 `405 + request has been blocked
+     * due to unusual activity`（跨账号、跨会话；官方客户端同账号同网络正常）。
+     * 版本号是当时**唯一**与官方不一致的请求特征 —— 身份块已逐字对齐（2632
+     * 字符）、其余 11 个官方头（`Suc` 全量）也全部对齐 ⇒ 版本号成为首要嫌疑。
      */
     appVersion?: string
   } = {},
 ): Record<string, string> {
-  const appVersion = options.appVersion ?? credential.app_version ?? ZCODE_APP_VERSION_FALLBACK
+  const appVersion = options.appVersion ?? zcodeVersionGatedAppVersion(credential)
   const headers: Record<string, string> = {
     'User-Agent': `ZCode/${appVersion}`,
     'HTTP-Referer': ZCODE_ORIGIN,
+    'X-Title': 'Z Code@electron',
     'X-ZCode-App-Version': appVersion,
-    'X-Release-Channel': 'stable',
+    'X-Release-Channel': 'production',
     'X-Client-Language': 'zh-CN',
     'X-Client-Timezone': 'Asia/Shanghai',
     'X-Device-Mid': credential.device_mid,
-    'X-Platform': 'win32',
+    'X-Platform': 'win32-x64',
     'X-Os-Category': 'windows',
+    'X-Os-Version': osRelease(),
+    'X-ZCode-Agent': 'glm',
+    'X-Session-Id': ZCODE_STABLE_SESSION_ID,
+    'X-ZCode-Session-Type': 'other',
+    'X-Request-Id': randomUUID(),
+    'X-ZCode-Trace-Id': randomUUID(),
     'anthropic-version': '2023-06-01',
   }
   if (options.json !== false) headers['Content-Type'] = 'application/json'
