@@ -189,6 +189,47 @@ type FetchBalanceRule<TProduct, TCredential> = TProduct extends BuddyProduct
   }
 
 /**
+ * **带原因**的余额查询（可选能力）—— 传了它就用它的 `error`，不再一律报
+ * `'余额查询失败（凭据失效或响应异常）'`。
+ *
+ * ## 为什么必须有这一条（真实报障 2026-10-21，Qoder）
+ *
+ * 用户看到的报错：
+ * ```
+ * Qoder：无法确认是否有可用账号。……（余额查询失败（凭据失效或响应异常）；
+ *         余额查询失败（凭据失效或响应异常））……
+ * ```
+ * 而**同一时刻**，Jet Hub 面板上两张账号卡片的积分行写的是完整原因
+ * （`连不上 https://openapi.qoder.sh（UND_ERR_CONNECT_TIMEOUT）：……请导出 HTTPS_PROXY`）
+ * —— 用户据此问「面板说得明明白白，为什么报错里反而不知道？」。
+ *
+ * 根因：`fetchBalance` 的返回类型是 `Promise<CreditBalance | null>`，
+ * **`null` 把「网络不通 / 401 / 响应缺字段 / 不是 JSON」四件事抹成同一格**
+ * （这正是 `src/qoder-credits.ts` 那个 `fetchQoderBalanceDetailed` 存在的原因）。
+ * 面板那条腿走的是 `credits.balances` RPC，它已经改用详细变体；
+ * 而**选号这条腿**（本类）仍在用丢原因的薄封装 ⇒ **同一语义两套判据**
+ * （AGENTS.md 首条红线），且症状是最坏的一种：**把可操作的原因替换成一句
+ * 无从下手的猜测**，用户于是去查凭据 —— 而真实原因是网络。
+ *
+ * ⚠️ **可选**，不是必填：buddy 系（CodeBuddy / WorkBuddy）的余额腿本来就
+ * 只返回 `CreditBalance | null`，强制必填会让所有既有调用点都要造一个
+ * 假的详细变体。未传时退化为原行为（那句概括文案），**语义不变**。
+ *
+ * ⚠️ 返回形状与 `src/provider-runtime.ts` 的 `ProviderBalanceDetail` **刻意一致**
+ * （`balance: T | null` + `error?: string`）：本仓库已有该形状的三处使用
+ * （`fetchBalanceDetailed` / `fetchAstudioBalanceDetailed` / `credits.balances`），
+ * 再发明一个只会多一处漂移。此处**不 import 那个类型**是为了不让
+ * `buddy-balance-selector.ts`（被 buddy 系共用）反向依赖 provider-runtime 的装配域
+ * —— 结构化同构足够，且下面 `FetchBalanceRule` 已经证明了这种「形状对齐、不引类型」
+ * 的写法在本文件是既有惯例。
+ */
+export interface BalanceQueryDetail<TBalance> {
+  balance: TBalance | null
+  /** 查不到时的**可操作**原因（点名主机 / HTTP 状态 / 缺哪个字段）。 */
+  error?: string
+}
+
+/**
  * 选号依赖（便于单测注入）。
  *
  * ⚠️ **泛型化**（2026-10-06）：分档判据只读通用的
@@ -216,6 +257,25 @@ export type BuddySelectionDeps<
   errorTtlMs?: number
   /** 「临时积分」窗口覆盖（测试用）。 */
   windowMs?: number
+  /**
+   * **带原因**的余额查询（可选，传了就优先用它）。
+   *
+   * 见 {@link BalanceQueryDetail} 的长注释：`fetchBalance` 的 `null` 把四种
+   * 完全不同的失败抹成同一格，而锁定时那句概括文案会把用户引向「查凭据」，
+   * 真实原因可能是网络不通。**两者都传时本字段优先**（它是 `fetchBalance`
+   * 的严格超集：能拿到 `balance`，也能拿到为什么拿不到）。
+   *
+   * ⚠️ **第三参与 `fetchBalance` 同款**（{@link BalanceFetchContext}）：详细变体
+   * 优先意味着它一旦注入，`fetchBalance` 整个不再执行 —— 若这里不给 `ctx`，
+   * 那些「必须按账号换出口」的渠道（MiniMax 国际站）会**只在详细变体这条腿上
+   * 丢掉出口**，症状是余额恒查不到、渠道被静默剔除，而 `fetchBalance` 上
+   * 明明接好了。故两者必须同时收 `ctx`，缺一不可。
+   */
+  fetchBalanceDetailed?: (
+    credential: TCredential,
+    product: TProduct,
+    ctx?: BalanceFetchContext,
+  ) => Promise<BalanceQueryDetail<CreditBalance>>
   /**
    * 按**账号 id** 取出口（可选；仅「端点按出口 IP 分流」的渠道需要，
    * 如 MiniMax 国际站）。未注入时不出现在 {@link BalanceFetchContext} 里，
@@ -369,6 +429,28 @@ export class BuddyBalanceSelector<
       // 这里再加一道运行时防御 —— 万一有人用 `as` 绕过了类型，
       // 宁可立刻抛一条能指认到原因的错，也不要发出 `undefined/...` 的畸形请求
       // 让它变成一句无法归因的「余额查询失败」。
+      //
+      // ⚠️ **详细变体优先**（见 {@link BalanceQueryDetail}）：它返回
+      // `{ balance, error? }`，能同时给出「有没有余额」和「为什么查不到」。
+      // 传了它就不再走 `fetchBalance` —— 两者都传时详细变体是严格超集。
+      const detailed = this.deps.fetchBalanceDetailed
+      if (detailed !== undefined) {
+        /**
+         * ⚠️ **同样要传第三参**：详细变体优先于 `fetchBalance`，若此处不给
+         * `ctx`，那些「按出口 IP 分流」的渠道会在这条腿上丢掉出口配置
+         * （详见 {@link BuddySelectionDeps.fetchBalanceDetailed} 的注释）。
+         */
+        const result = await detailed(credential, this.deps.product, {
+          accountId: account.id,
+          ...this.deps.fetchFor === undefined ? {} : { fetchFor: this.deps.fetchFor },
+        })
+        if (result.balance === null) {
+          // ⚠️ `error` 缺失时仍给一句**能指认到「未知」**的话，而不是
+          //    回落到那句会把用户引向凭据的概括文案 —— 后者是确定的错误归因。
+          return { ok: false, error: result.error ?? '余额查询失败（未提供具体原因）' }
+        }
+        return { ok: true, balance: result.balance }
+      }
       const injected = this.deps.fetchBalance
       if (injected === undefined && typeof (this.deps.product as { endpoint?: unknown }).endpoint !== 'string') {
         throw new Error(

@@ -364,10 +364,18 @@ describe('★ Qoder：`index.ts` 的接线（源码级，守纯文本形态的�
       expect(start, `找不到 ${name}`).toBeGreaterThan(-1)
       const block = indexCode.slice(start, indexCode.indexOf('\n  })', start))
       expect(block.length, `${name} 的构造块切成了空——判据会变成同义反复`).toBeGreaterThan(60)
-      const line = block.match(/fetchBalance:[^\n]*/)
+      // ⚠️ 2026-10-21 改：不能只取一行。余额查询现在要**按账号取出口代理**
+      // （国际版 `openapi.qoder.sh` 被 SNI 阻断），于是箭头函数体换行了：
+      // ```
+      // fetchBalance: async (credential, product) =>
+      //   fetchQoderCreditBalance(credential, product, await fetcherForQoderCredential(credential)),
+      // ```
+      // 单行正则 `/fetchBalance:[^\n]*/` 会在 `=>` 处截断，判据变成
+      // 「有没有这半行字」= 无牙。改为切到下一个 4 空格缩进的属性/注释为止。
+      const line = block.match(/fetchBalance:[\s\S]*?(?=\n {4}\S)/)
       expect(line, `${name} 必须注入 fetchBalance`).not.toBeNull()
       expect(line![0], `${name} 的 fetchBalance 必须透传 product 形参`)
-        .toMatch(/\(credential, product\)\s*=>\s*fetchQoderCreditBalance\(credential, product\)/)
+        .toMatch(/\(credential, product\)\s*=>\s*fetchQoderCreditBalance\(credential, product,/)
       expect(line![0], `★ ${name} 的 fetchBalance 不得写死 ${other}（会打到对方站点，余额恒 null）`)
         .not.toContain(`${other}`)
     }

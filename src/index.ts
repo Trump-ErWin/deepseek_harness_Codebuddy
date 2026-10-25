@@ -37,6 +37,7 @@ import { ZCODE_CAPTCHA_FALLBACK, type ZcodeCaptchaConfig } from './zcode-captcha
 import type { CarrierOutcome } from './captcha-carrier.js'
 import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
 import { geminiFetchForAccount, setGeminiProxyPool } from './gemini-proxy.js'
+import { qoderFetchForAccount, setQoderProxyPool } from './qoder-proxy.js'
 import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES, type ImageRequestTarget } from './image-budget.js'
@@ -65,6 +66,21 @@ import type { LobsteraiCredential } from './lobsterai.js'
 // 「锁定永久积分」的余额分档需要各家的余额查询函数：分档判据
 // （`splitBuddyCreditsByExpiry`）只读通用的 `packages[].{active, remaining,
 // deductionEndTime}`，故把各家的 fetch 指给同一个选择器即可（见各自接线处）。
+//
+// ⚠️⚠️ **每条腿都要接两样**（2026-10-21 真实报障，Qoder）：
+//   - `fetchBalance`（薄封装，`CreditBalance | null`）—— 分档器读它算桶；
+//   - `fetchBalanceDetailed`（带 `error`）—— 锁定时那句报错用它说**为什么**查不到。
+//
+// 只接 `fetchBalance` 的后果不是报错，而是**把可操作的原因换成一句无从下手的猜测**：
+// 用户看到「余额查询失败（凭据失效或响应异常）」于是去查凭据，真实原因却是网络不通
+// （Qoder 国际版 `openapi.qoder.sh` 被 SNI 阻断时**每次都**查不到，耗时 ~10.8s）。
+// 而**同一个插件**的 Jet Hub 面板走 `credits.balances`，早就用详细变体报出了
+// 「连不上 https://openapi.qoder.sh（UND_ERR_CONNECT_TIMEOUT）…请导出 HTTPS_PROXY」
+// —— 两条腿口径不一致 = 同一语义两套判据（AGENTS.md 首条红线）。
+//
+// ⚠️ 因此下面每家的注释里那句「**不要**在选号路径上改调 Detailed」已**作废**：
+// 那句话成立的前提是「选号只要余额、不要原因」，而锁定状态下**必须**有原因才能
+// 让报错指向正确方向。详细变体是薄封装的严格超集（同样能拿到 `balance`）。
 import { fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
 import { fetchTraeCreditBalance } from './trae-credits.js'
 // ⚠️ Qoder **两站**的 `fetchQoderCreditBalance`（2026-10-20，同为「永久积分锁定」新增）：
@@ -73,18 +89,19 @@ import { fetchTraeCreditBalance } from './trae-credits.js'
 //    ⚠️⚠️ 两站**必须各传自己的 product**：`QODER` 指向 `openapi.qoder.sh`、
 //    `QODER_CN` 指向 `openapi.qoder.com.cn` —— 传错会让选号读到对方站点、
 //    余额恒查不到（未锁定 ⇒ 换号优化静默失效；锁定 ⇒ 永远报「没有可用账号」）。
-import { fetchQoderCreditBalance } from './qoder-credits.js'
+//
+//    ⚠️ `fetchQoderBalanceDetailed` 是**同一次请求**的带原因变体（可选 `timeoutMs`），
+//    两家 selector 都接了它 —— 详见上面那段长注释。
+import { fetchQoderBalanceDetailed, fetchQoderCreditBalance } from './qoder-credits.js'
 // ⚠️ astudio 的 `fetchAstudioCreditBalance` 是 2026-10-20 为「永久积分锁定」新增的
 //    薄封装（压平 `fetchAstudioBalanceDetailed` 的 `{balance, error?}` 成
-//    `CreditBalance | null`，因为 `BuddyBalanceSelector` 的 `fetchBalance` 契约
-//    只要余额、不要原因）。**不要**在选号路径上直接调 Detailed —— 那会丢掉
-//    「为什么查不到」的分流（会话失效 / 服务不可用 / 形状不认识）。
-import { fetchAstudioCreditBalance } from './astudio-credits.js'
+//    `CreditBalance | null`）。两个变体**都接**（见上方长注释），选号器优先用 Detailed。
+import { fetchAstudioBalanceDetailed, fetchAstudioCreditBalance } from './astudio-credits.js'
 // ⚠️ MiniMax 两站的 `fetchMinimaxCreditBalance`（2026-10-20，同为「永久积分锁定」新增）：
-//    它是 `fetchMinimaxCreditBalanceDetailed` 的薄封装（压平 `{balance, error?}` 成
-//    `CreditBalance | null`），因为 `BuddyBalanceSelector` 的 `fetchBalance` 契约
-//    只要余额、不要原因。**不要**在选号路径上改调 Detailed。
-import { fetchMinimaxCreditBalance } from './minimax-credits.js'
+//    它是 `fetchMinimaxCreditBalanceDetailed` 的薄封装。两个变体**都接**。
+//    ⚠️ 注意两站的 Detailed 签名带 `xff`（国际站要伪造 X-Forwarded-For），
+//       故接线时必须逐站传各自的 `pool.minimaxXff()`，不能照抄一个。
+import { fetchMinimaxCreditBalance, fetchMinimaxCreditBalanceDetailed } from './minimax-credits.js'
 import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
 import type { ClineCredential } from './cline.js'
@@ -92,13 +109,10 @@ import type { LoomyCredential } from './loomy.js'
 // ⚠️ 2026-10-16：loomy 选号吃共享读数时需要 `CreditBalance` 形状（两池）。
 import type { CreditBalance } from './credits.js'
 // ⚠️ AutoClaw 两站（2026-10-21，用户要求「补锁定开关」）：`fetchAutoclawCreditBalance`
-//    是 `fetchAutoclawBalanceDetailed` 的薄封装（压平 `{balance, error?}` 成
-//    `CreditBalance | null`，因为 `BuddyBalanceSelector` 的 `fetchBalance` 契约
-//    只要余额、不要原因）。**不要**在选号路径上改调 Detailed —— 那会在选号路径上
-//    重写一套失败分类，与本文件「同义判据只留一处」的纪律冲突。
+//    是 `fetchAutoclawBalanceDetailed` 的薄封装。两个变体**都接**（见上方长注释）。
 //    ⚠️ 它的第二参是 `options?: AutoclawCreditsOptions`（`{ product, fetcher? }`），
 //    与 qoder 那份的 `(credential, product)` 位置顺序**不同**，别照抄。
-import { fetchAutoclawCreditBalance } from './autoclaw-credits.js'
+import { fetchAutoclawBalanceDetailed, fetchAutoclawCreditBalance } from './autoclaw-credits.js'
 import type { RaccoonCredential } from './raccoon.js'
 import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
@@ -639,19 +653,36 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
   // 工具/图片，故除了 product 之外无需注入其它钩子；`uid` 由凭据自身携带
   //（旧凭据缺 uid 时适配器会明确报错，而不是发出必然失败的请求）。
   qoder: {
-    createProbeAdapter: (ref, credential) => new QoderAdapter({
+    // ⚠️ **第三个形参 `entry` 不能丢**（与 gemini 的同款缺口，IKLTZ2 审计 P1-1）：
+    //    探测路径**刻意不传 `accountPool`**（`account-probe.ts` 的既定语义：
+    //    只测这一个账号、且不写任何标记）⇒ 适配器内「按凭据反查账号 id」那条路
+    //    **根本不存在** ⇒ 出口解析器拿到空 id、按「直连」处理 ⇒
+    //    **该账号配的代理被完全绕过**。症状与 issue 原话同形：墙外环境下
+    //    「测试 / 重测」**恒失败**，而这个失败与「账号已失效」在 UI 上完全同形
+    //    ⇒ 用户会去误删好号。
+    //
+    // ⚠️ 用 `currentAccountId` 而不是新加一个 `accountIdOverride`：`QoderAdapter`
+    //    的取号权威本来就是那个回调（推理通道按 `activeAccountId` 现取、原生
+    //    搜索也走它），为探测再造一个 override 字段会让两条路分叉。
+    //    探测只有这一个账号 ⇒ 回调恒返回它，与生产语义一致。
+    createProbeAdapter: (ref, credential, entry) => new QoderAdapter({
       credentialRef: credentialRef(ref),
       resolveCredential: async () => credential as QoderCredential,
       refresh: async () => {},
       product: QODER,
+      fetchFor: qoderFetchForAccount,
+      currentAccountId: () => entry?.id ?? '',
     }),
   },
   qodercn: {
-    createProbeAdapter: (ref, credential) => new QoderAdapter({
+    // 同上：两站共用同一个适配器类，只换 product。
+    createProbeAdapter: (ref, credential, entry) => new QoderAdapter({
       credentialRef: credentialRef(ref),
       resolveCredential: async () => credential as QoderCredential,
       refresh: async () => {},
       product: QODER_CN,
+      fetchFor: qoderFetchForAccount,
+      currentAccountId: () => entry?.id ?? '',
     }),
   },
   // Cline → WorkOS 凭据 + 自己的端点。
@@ -2222,7 +2253,13 @@ export function apply(ctx: Context): void {
   // （不起本地回调服务器，见 src/qoder-oauth.ts）。
   // 服务名由产品 id 派生，注册为 ctx.qoderAuth。
   // 与其它 provider 一样不注册斜杠命令：入口在 Jet Hub 的 Qoder 面板。
-  const qoder = new QoderAuth(ctx)
+  // ⚠️ **必须在建 QoderAuth / 适配器之前注入池子**（真实报障 2026-10-21）：
+  //    国际版 `openapi.qoder.sh` 被 SNI 阻断，推理与余额两条腿都要按账号取代理。
+  //    本调用在 `apply()` 里，而模块级常量（如 `probeById.qoder`）会在它之前求值
+  //    ⇒ 那之前解析器读到的是 `undefined` 池子、退直连；那是**可接受**的
+  //    （探测目标是中国版直连就够，而国际版探测本来也得先配代理才能测）。
+  setQoderProxyPool(pool)
+  const qoder = new QoderAuth(ctx, { fetchFor: qoderFetchForAccount })
   /**
    * 按凭据 ref 解析 Qoder 凭据（供选号器查余额与最终取凭据共用）。
    *
@@ -2245,6 +2282,36 @@ export function apply(ctx: Context): void {
     }
   }
   /**
+   * 按**凭据**解析该账号该走的 fetcher（余额查询专用，真实报障 2026-10-21）。
+   *
+   * ## 为什么要反查账号
+   *
+   * 余额查询的入口是 `fetchQoderCreditBalance(credential, product, fetcher)` ——
+   * 手上只有凭据、没有账号 id。而出口代理是**账号维度**的（`AccountPool.qoderProxyFor`）。
+   * 故用池的既有能力 `findAccountIdByCredential` 反查（Gemini 那份同款）。
+   *
+   * ⚠️ **反查不到 ⇒ 空串**，`qoderFetchForAccount('')` 会再试
+   * `QODER_PENDING_PROXY_KEY`（登录预置那条），都没有就直连。
+   * **绝不**回落到「随便挑一个配了代理的账号」—— 那会把 A 的出口用于 B，
+   * 症状是「偶尔能通偶尔超时」，比失败更难查。
+   *
+   * ⚠️ **本函数是异步的，调用方必须 `await`**（余额查询本身就是 async，
+   * 顺理成章）。不要试图把它塞进同步的 `typeof fetch` 形参 —— 那只能靠
+   * 「先返回一个假 fetcher，内部再补」之类的花招，而花招会引入
+   * 「第一次发请求时账号还没查出来」的竞态。
+   *
+   * ⚠️ 两站都查：`findAccountIdByCredential` 按 provider 过滤，传错一家会
+   * 静默返回空串（退直连）。同一个凭据只可能属于一站，故顺序试、谁命中用谁。
+   */
+  const fetcherForQoderCredential = async (credential: QoderCredential): Promise<typeof fetch> => {
+    const identity = typeof credential.access_token === 'string' ? credential.access_token : ''
+    if (identity.length === 0) return qoderFetchForAccount('')
+    const hit = await pool.findAccountIdByCredential(QODER.id, identity).catch(() => '')
+    if (hit.length > 0) return qoderFetchForAccount(hit)
+    const hitCn = await pool.findAccountIdByCredential(QODER_CN.id, identity).catch(() => '')
+    return qoderFetchForAccount(hitCn)
+  }
+  /**
    * Qoder 两站的**按「额度何时作废」分档选号器**（为「锁定永久积分」提供依据）。
    *
    * ⚠️ 复用 `BuddyBalanceSelector` 而不是新写一个：分档判据
@@ -2262,12 +2329,35 @@ export function apply(ctx: Context): void {
   const qoderBalanceSelector = new BuddyBalanceSelector({
     product: QODER,
     resolveCredential: resolveQoderCredentialByRef,
-    fetchBalance: (credential, product) => fetchQoderCreditBalance(credential, product),
+    // ⚠️ **余额查询也必须走该账号的出口代理**（真实报障 2026-10-21）：
+    //    国际版 `openapi.qoder.sh` 被 SNI 阻断，直连恒 10.7s 超时 ⇒ 余额恒 null
+    //    ⇒ 锁定时永远报「无法确认是否有可用账号」，即使配了代理也一样
+    //    （因为这里不读代理）。中国版直连 160ms 就通，故判据必须**按账号**取。
+    fetchBalance: async (credential, product) =>
+      fetchQoderCreditBalance(credential, product, await fetcherForQoderCredential(credential)),
+    // ⚠️⚠️ **必须两条腿都接**（真实报障 2026-10-21）：面板走的 `credits.balances`
+    //    早已改用 `fetchQoderBalanceDetailed`，会对国际版报出
+    //    「连不上 https://openapi.qoder.sh（UND_ERR_CONNECT_TIMEOUT）…请导出 HTTPS_PROXY」；
+    //    而**选号这条腿**原先只用丢原因的 `fetchQoderCreditBalance` ⇒ 锁定时报
+    //    「余额查询失败（凭据失效或响应异常）」，用户于是去查凭据，真实原因是网络。
+    //    同一语义两套判据 = AGENTS.md 首条红线；且症状是最坏的一种：把**可操作**的
+    //    原因换成一句**无从下手**的猜测。
+    fetchBalanceDetailed: async (credential, product) =>
+      fetchQoderBalanceDetailed(credential, product, {
+        fetcher: await fetcherForQoderCredential(credential),
+      }),
   })
   const qoderCnBalanceSelector = new BuddyBalanceSelector({
     product: QODER_CN,
     resolveCredential: resolveQoderCredentialByRef,
-    fetchBalance: (credential, product) => fetchQoderCreditBalance(credential, product),
+    fetchBalance: async (credential, product) =>
+      fetchQoderCreditBalance(credential, product, await fetcherForQoderCredential(credential)),
+    // ⚠️ 中国版同样要接（同因）；它通常查得到，但**401 / 响应缺 qoderUsage** 时
+    //    同样只有详细变体能说清是哪一种。
+    fetchBalanceDetailed: async (credential, product) =>
+      fetchQoderBalanceDetailed(credential, product, {
+        fetcher: await fetcherForQoderCredential(credential),
+      }),
   })
   /**
    * 「本次实际使用的账号 id」跟踪表（provider id → 账号 id）。
@@ -2372,6 +2462,12 @@ export function apply(ctx: Context): void {
     fetchRemoteModels: () => qoder.fetchModels(pool),
     // 额度受限时标记「本次实际使用的账号」（理由见 `activeQoderAccountId` 注释）。
     currentAccountId: () => activeQoderAccountId.get(QODER.id),
+    // ⚠️ **推理通道也必须走该账号的出口代理**（真实报障 2026-10-21）：
+    //    国际版整站被 SNI 阻断，实测推理同样 10.7s `TRANSPORT: fetch failed`
+    //    ⇒ 只接余额不接推理的话，面板显示正常但一发请求就超时。
+    //    适配器内部会按**循环里当前账号**（换号后跟着变）现取，见其
+    //    `fetcherForCurrentAccount`。
+    fetchFor: qoderFetchForAccount,
   })
 
   // ===== Qoder 中国版（qodercn）=====
@@ -2383,7 +2479,7 @@ export function apply(ctx: Context): void {
   // 服务名由 `${product.id}Auth` 派生，注册为 `ctx.qodercnAuth`（product id
   // `qodercn` 全小写、不带连字符 —— 按变量名驼峰惯例拼会得到大小写不符的名字）。
   // 不注册斜杠命令：入口在 Jet Hub 的「Qoder (中国版)」面板。
-  const qoderCn = new QoderAuth(ctx, { product: QODER_CN })
+  const qoderCn = new QoderAuth(ctx, { product: QODER_CN, fetchFor: qoderFetchForAccount })
   const qoderCnAdapter = registerQoderLlm(ctx, {
     credentialRef: credentialRef(QODER_CN.defaultCredentialRef),
     // 只取中国版自己账号池的账号，回退到 QODERCN_ACCESS_TOKEN。
@@ -2447,6 +2543,8 @@ export function apply(ctx: Context): void {
     // ⚠️ 取「**本次实际使用**的账号」而非池里默认那一个：池的默认账号可能与之
     // 不同（例如本账号被限流、池已切到别的账号），标错就会让标记落在无辜账号上。
     currentAccountId: () => activeQoderAccountId.get(QODER_CN.id),
+    // 同国际版：推理通道也要走该账号的出口代理（两站共用同一个适配器类）。
+    fetchFor: qoderFetchForAccount,
   })
 
   // ===== TRAE（字节 TRAE IDE）服务 =====
@@ -2951,6 +3049,9 @@ export function apply(ctx: Context): void {
     product: MINIMAX,
     resolveCredential: resolveMinimaxCredentialByRef,
     fetchBalance: (credential, product) => fetchMinimaxCreditBalance(credential, fetch, product),
+    // ⚠️ 带原因变体（见文件头长注释）。中国站不传 xff（那是国际站的地理分流）。
+    fetchBalanceDetailed: (credential, product) =>
+      fetchMinimaxCreditBalanceDetailed(credential, fetch, product),
   })
   const minimaxIntlBalanceSelector = new BuddyBalanceSelector({
     product: MINIMAX_INTL,
@@ -2961,6 +3062,18 @@ export function apply(ctx: Context): void {
     fetchFor: minimaxIntlFetchForAccount,
     fetchBalance: (credential, product, ctx) =>
       fetchMinimaxCreditBalance(
+        credential,
+        ctx?.fetchFor?.(ctx.accountId ?? '') ?? fetch,
+        product,
+        pool.minimaxXff(),
+      ),
+    // ⚠️ **必须逐站传各自的 `xff`**：国际站的余额端点按 X-Forwarded-For 分流，
+    //    不传会让请求落到别的区域 ⇒ 余额恒查不到（与 fetchBalance 那条腿同因）。
+    // ⚠️ 出口代理由第三参 `ctx.fetchFor` 传入：详细变体**优先于** `fetchBalance`，
+    //    若这里仍用裸 `fetch`，上面那条 `fetchFor` 会被整体短路 ⇒ 上游修的
+    //    「大陆出口恒 307 静默剔除」在本分支复发（两处必须同时接）。
+    fetchBalanceDetailed: (credential, product, ctx) =>
+      fetchMinimaxCreditBalanceDetailed(
         credential,
         ctx?.fetchFor?.(ctx.accountId ?? '') ?? fetch,
         product,
@@ -3341,11 +3454,15 @@ export function apply(ctx: Context): void {
     product: AUTOCLAW,
     resolveCredential: resolveAutoclawCredentialByRef,
     fetchBalance: (credential, product) => fetchAutoclawCreditBalance(credential, { product }),
+    // ⚠️ 带原因变体（见文件头长注释）。
+    fetchBalanceDetailed: (credential, product) => fetchAutoclawBalanceDetailed(credential, { product }),
   })
   const autoclawIntlBalanceSelector = new BuddyBalanceSelector({
     product: AUTOCLAW_INTL,
     resolveCredential: resolveAutoclawCredentialByRef,
     fetchBalance: (credential, product) => fetchAutoclawCreditBalance(credential, { product }),
+    // ⚠️ 两站各建实例、各传自己的 product（缓存与端点都必须分开）。
+    fetchBalanceDetailed: (credential, product) => fetchAutoclawBalanceDetailed(credential, { product }),
   })
   const autoclaw = new AutoclawAuth(ctx)
   const autoclawAdapter = registerAutoclawLlm(ctx, {
@@ -3599,6 +3716,11 @@ export function apply(ctx: Context): void {
     product: ASTUDIO,
     resolveCredential: resolveAstudioCredentialByRef,
     fetchBalance: (credential, product) => fetchAstudioCreditBalance(credential, product),
+    // ⚠️ 带原因变体（见文件头那段长注释）：AStudio 的失败分流有四档
+    // （未登录 / 会话失效需重登 / 服务不可用 / 响应缺字段），薄封装全压成 `null`
+    // ⇒ 锁定时只能报「凭据失效或响应异常」，而那四档的处置**完全不同**。
+    fetchBalanceDetailed: (credential, product) =>
+      fetchAstudioBalanceDetailed(credential, product === undefined ? {} : { product }),
   })
   /**
    * AStudio 的凭据编排（候选筛选 → 余额分档 → 取凭据 → 回退）。

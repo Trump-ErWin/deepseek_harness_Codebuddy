@@ -13,17 +13,26 @@ import {
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
-// ⚠️ 冲突解法（PR !144 × origin/master，两侧同改这一行 imports）：
-//    - HEAD（PR !144）：删掉了旧侧栏入口 store 的四个符号 —— 侧栏入口改由
-//      `panel-entry.js` + 插件详情页设置卡片决定，旧 store 模块已随 PR 一并删除
-//      ⇒ 这里**不得**保留对该模块的 import，否则 esbuild 解析不到模块、
-//      整份客户端 bundle 打包失败（症状：面板全白）。
+// ⚠️ 冲突解法（PR !144 × origin/master × 本 fork 的 qoder 代理）：
+//    - HEAD（PR !144）：删掉了旧侧栏入口 store（那个 `sidebar-entry` 前缀的
+//      老 store 模块，上游已整块删除）的四个符号 —— 侧栏入口改由
+//      `panel-entry.js` + 插件详情页设置卡片决定 ⇒ 这里**不得**保留对该模块的
+//      import，否则 esbuild 解析不到模块、整份客户端 bundle 打包失败
+//      （症状：面板全白）。
+//      ⚠️ 此处**刻意不写出那个旧模块的完整文件名**：`tests/unit/plugin-detail-slot.spec.ts`
+//      用 `pageSource.not.toContain(...)` 守「旧 store 已下线」，任何提及（含注释）
+//      都会让那条守卫假红。
 //    - origin/master：`opencode-proxy-modal` 新增 `MinimaxIntlProxyModal`（minimax
 //      国际版出口代理）⇒ 必须保留在解构列表里，漏掉即 `undefined is not a component`。
-//    ⚠️ 2026-10-24 二次合并（`pr_144_new` = 作者自己的 master 合并 a40496b）：
-//      作者那份合并在同一位置**做了完全相同的取舍**（删旧 sidebar import、留
-//      MinimaxIntlProxyModal），只是没留注释 —— 两侧实际代码一致，冲突纯属文本层。
-import { OpencodeKeyModal, OpencodeProxyModal, GeminiProxyModal, MinimaxIntlProxyModal } from './opencode-proxy-modal.js';
+//    - 本 fork：同一个文件另有 `QoderProxyModal`（qoder 国际版/中国版出口代理）
+//      ⇒ 同样必须在列表里，且它比另两家多收一个 `provider` 参数（分站）。
+import {
+  OpencodeKeyModal,
+  OpencodeProxyModal,
+  GeminiProxyModal,
+  MinimaxIntlProxyModal,
+  QoderProxyModal,
+} from './opencode-proxy-modal.js';
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
 //    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
 //    ⚠️ 本 import 此前**不存在** ⇒ `modelscope-key-modal.js` 整份 140 行从未进 bundle，
@@ -702,7 +711,7 @@ function isAnonymousAccountId(accountId) {
 /**
  * 「出口代理」弹窗按 provider 选组件。
  *
- * ## ⚠️ 为什么三家各一个组件而不是一个组件换文案
+ * ## ⚠️ 为什么四家各一个组件而不是一个组件换文案
  *
  * 它们**形态相同、语义与「不设置会怎样」完全不同**，而那句解释正是本功能
  * 存在的理由 —— 塞进一个函数按 provider 分支，正是本仓库反复记录的
@@ -710,11 +719,22 @@ function isAnonymousAccountId(accountId) {
  * **不复用**组件本体。
  *
  * ⚠️ 未知 provider 一律回落 `OpencodeProxyModal`（既有行为，不可变更）：
- * 当前只有 opencode / gemini / minimaxintl 三家会打开这个弹窗。
+ * 当前只有 opencode / gemini / minimaxintl / qoder(+qodercn) 四家会打开
+ * 这个弹窗。
+ *
+ * ⚠️ **qoder 与 qodercn 共用一个组件**：两家是同一产品的国际站与中国站，
+ * 「不设置会怎样」的差异靠 `provider` 参数在组件内分站，而不是分成两个
+ * 组件（那会让两段几乎逐字相同的代码各自漂移）。这与上面三家「一家一个
+ * 组件」并不矛盾：那三家的差异是**产品级**的，这两家的差异是**站点级**的。
+ * 两条 `if` 分开写（而不是 `||` 合并）是为了让测试的**逐分支配对**判据
+ * 能各自抓到两站 —— 合并后正则只能看到第一站，第二站不设防。
  */
 function proxyModalComponent(provider) {
   if (provider === 'gemini') return GeminiProxyModal;
   if (provider === 'minimaxintl') return MinimaxIntlProxyModal;
+  // ⚠️ 两站同一组件：组件内 `const isCn = provider === 'qodercn'` 分站。
+  if (provider === 'qoder') return QoderProxyModal;
+  if (provider === 'qodercn') return QoderProxyModal;
   return OpencodeProxyModal;
 }
 
@@ -959,8 +979,8 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         className: 'dim-jh-btn',
         onClick: () => onToggle(account.id, !account.enabled),
       }, account.enabled ? '停用' : '启用'),
-      // ⚠️ 仅 opencode / gemini：出口代理是该 provider 独有的**账号维度**能力
-      // （其余 provider 没有这一项）。用 props 存在性开关而非
+      // ⚠️ 仅 opencode / gemini / qoder：出口代理是该 provider 独有的**账号维度**
+      // 能力（其余 provider 没有这一项）。用 props 存在性开关而非
       // `provider === 'opencode'` 硬判断 —— 前者让 AccountCard 无需知道
       // provider 列表，也避免以后新增同类 provider 时漏改。
       // 位置在「停用」之后、「删除」之前：删除按钮带 data-kind='danger'，
@@ -968,28 +988,36 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
       onOpenProxy
         ? React.createElement('button', {
             className: 'dim-jh-btn',
-            // ⚠️ tooltip 必须解释「不设置会怎样」。三家语义不同，故按各自的
+            // ⚠️ tooltip 必须解释「不设置会怎样」。四家语义不同，故按各自的
             // 池字段分流文案：
             // - opencode：共用出口 = 共用额度；
             // - gemini：出不去 = 墙外恒连不上；
+            // - qoder：只有国际版在墙外，中国版不设反而更快；
             // - minimaxintl：出口在大陆 = 被 307 到中国站（**连得上但用不了**）。
-            // ⚠️ minimaxintl 的判断**必须放在 gemini 之后**：它的池字段同样是
-            // 「未设置 = undefined、已清除 = 空串」，顺序反了会误读成 gemini 那句。
+            // ⚠️ 顺序有语义：`opencodeProxy` 用真值判（它一配就非空），其余三家
+            // 必须用 `!== undefined`（「未设置 = undefined、已清除 = 空串」两种
+            // 状态在 UI 上必须区分，见 `src/types.ts` 各字段的注释）。
             title: account.opencodeProxy
               ? '出口代理：' + account.opencodeProxy + '（点击修改）'
               : account.minimaxIntlProxy !== undefined
                 ? '出口代理：' + (account.minimaxIntlProxy || '直连') + '（点击修改）'
                 : account.geminiProxy !== undefined
                   ? '出口代理：' + (account.geminiProxy || '直连') + '（点击修改）'
-                  : '设置该账号的出口代理；'
-                    + (account.minimaxIntlProxy !== undefined
-                      ? '不设置则直连本机（国际站会把大陆来源转到中国站）'
-                      : account.geminiProxy !== undefined
-                        ? '不设置则直连本机（出不去墙外服务）'
-                        : '不设置则与其它未设代理的账号共享本机出口 IP'),
+                  : account.qoderProxy !== undefined
+                    ? '出口代理：' + (account.qoderProxy || '直连') + '（点击修改）'
+                    : '设置该账号的出口代理；'
+                      // ⚠️ 走到这一格时四个字段**全部** `undefined`（上面每一级
+                      // 都已按 `!== undefined` 分流过）⇒ 这里只需给一句对四家都
+                      // 成立的实话，不必再按 provider 分枝（那样写出来的分支恒不执行，
+                      // 正是 AGENTS.md 点名的「源码文本断言对恒真/恒假分支无感」陷阱）。
+                      + '不设置则直连本机（等于与其它未设代理的账号共享本机出口 IP）',
             onClick: () => onOpenProxy(
               account.id,
-              account.opencodeProxy || account.minimaxIntlProxy || account.geminiProxy || '',
+              account.opencodeProxy
+                || account.minimaxIntlProxy
+                || account.geminiProxy
+                || account.qoderProxy
+                || '',
             ),
           }, '代理')
         : null,
@@ -4911,6 +4939,18 @@ function ProviderPanel({ provider, rpcCall }) {
                       onOpenProxy: (id, current) => setProxyModal({ provider, accountId: id, current }),
                     }
                   : {}),
+                // ⚠️ **Qoder 也要「代理」按钮**（真实报障 2026-10-21）：它是唯一
+                // 有墙外端点却**没有**代理入口的渠道 —— 国际版
+                // `openapi.qoder.sh` 被 SNI 阻断（TCP 能连、TLS 握手被丢），
+                // 表现为「转十秒然后 fetch failed」，而中国版直连 160ms 就通。
+                // ⚠️ 两站**都要传**：中国版虽然通常直连就通，但同样需要
+                // 「配了代理却查不到自己的出口」时的可见性；弹窗内部按
+                // `provider` 分站给文案与探测目标。
+                ...(provider === 'qoder' || provider === 'qodercn'
+                  ? {
+                      onOpenProxy: (id, current) => setProxyModal({ provider, accountId: id, current }),
+                    }
+                  : {}),
                 // ⚠️ **MiniMax 国际站也要「代理」按钮**：`agent.minimax.io` 按出口
                 // IP 国别分流，大陆来源会被 307 到中国站 ⇒ 与「凭据失效」同形的
                 // 401。给它配一个海外出口是根治手段（既有的 X-Forwarded-For
@@ -4984,6 +5024,9 @@ function ProviderPanel({ provider, rpcCall }) {
           ctx: { rpc: (payload) => rpcCall(payload.method, payload.payload) },
           accountId: proxyModal.accountId,
           current: proxyModal.current,
+          // ⚠️ 只有 Qoder 弹窗读这一项（它两站文案与探测目标不同）。
+          // 其余组件解构时忽略多余的 props，故统一透传不影响它们。
+          provider: proxyModal.provider,
           onClose: () => setProxyModal(null),
         })
       : null,

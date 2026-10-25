@@ -2834,6 +2834,36 @@ export class AccountPool {
   }
 
   /**
+   * 设置/清除某 **qoder** 账号的出口代理（真实报障 2026-10-21）。
+   *
+   * ⚠️ **刻意与另外两份分开成三份实现**，理由与字段同款：三者语义不同。
+   * Qoder 这里补的是「国际版整站被 SNI 阻断」—— 在本字段之前，用户唯一出路
+   * 是启动 DSH 前导出环境变量，而那会让中国版（本来直连 160ms）也一起去挤代理。
+   *
+   * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+   * 早退（与另两份同款，见 `setOpencodeProxy` 的注释）。清除时删键而非写空串。
+   */
+  async setQoderProxy(accountId: string, proxy: string): Promise<void> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] setQoderProxy: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const next = [...accounts]
+    const entry = { ...next[idx]! }
+    if (proxy.trim().length === 0) delete entry.qoderProxy
+    else entry.qoderProxy = proxy
+    next[idx] = entry
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 账号 ${accountId} Qoder 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+    )
+  }
+
+  /**
    * 设置/清除某 **minimaxintl**（MiniMax 国际站）账号的出口代理。
    *
    * ## 为什么它与 `setGeminiProxy` 形状逐字同构却不共用
@@ -2867,6 +2897,20 @@ export class AccountPool {
     this.ctx.logger?.info?.(
       `[jet-hub] 账号 ${accountId} MiniMax 国际站代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
     )
+  }
+
+  /**
+   * 读取某 qoder 账号的代理（未设置时为空串 = 直连）。
+   *
+   * ⚠️ **必须过 `asProxyText`**（与 `geminiProxyFor` 同因）：该字段来自
+   * **用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}`
+   * 原样透传、不校验形状 ⇒ 池里可能存在 `"qoderProxy": 12345`。下游
+   * `normalizeProxy` 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛
+   * `TypeError: raw.trim is not a function`，该账号**永久不可用且无自愈**。
+   */
+  qoderProxyFor(accountId: string): string {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    return asProxyText(entry?.qoderProxy)
   }
 
   /**

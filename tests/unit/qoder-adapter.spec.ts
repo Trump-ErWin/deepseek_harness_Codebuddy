@@ -5,11 +5,14 @@ import { dirname, resolve } from 'node:path'
 import {
   QoderAdapter,
   QODER_QUEUE_MAX_ATTEMPTS,
+  classifyQoderFailure,
   isBillingBusinessCode,
   looksLikeBillingError,
   nextUtc8DayStartMs,
   parseQoderQueueError,
   qoderQueueDelayMs,
+  recordsQoderRateLimit,
+  shouldRotateQoderAccount,
 } from '../../src/qoder-adapter.js'
 import { QODER, QODER_CN } from '../../src/qoder-product.js'
 import type { QoderFallbackModel } from '../../src/qoder-product.js'
@@ -686,6 +689,71 @@ describe('QoderAdapter 请求构造（加密端点）', () => {
 
     // 有 system 时密文更长（内容确实进了请求）
     expect(withSystem.length).toBeGreaterThan(withoutSystem.length)
+  })
+})
+
+describe('出口 fetcher 的优先级（`fetchImpl` 注入 > `fetchFor` > 全局）', () => {
+  // ⚠️ 本组守的是**注释与实现相反**的一类缺陷（本轮真实发生）：推理主路径一度写成
+  //    `this.fetchFor === undefined ? this.fetchImpl : this.fetchFor(...)`，
+  //    即生产代理压过单测替身 —— 与它自己上方注释
+  //    「`fetchImpl`（单测替身）> `fetchFor`（生产代理）」字字相反。
+  //    ⚠️ 单靠源码断言守不住这种「两边都写了、但语义反了」的形态 ⇒ 必须行为断言。
+  //    ⚠️ 也**不能**只把两个分支调序了事：`fetchImpl` 在构造期已被 `?? fetch` 填满，
+  //    调序后 `fetchFor` 反而永远轮不到（生产代理全失效）⇒ 故实现里另存
+  //    `hasInjectedFetchImpl` 标志，本组同时钉住该标志的语义。
+
+  it('⚠️ 同时传 fetchImpl 与 fetchFor ⇒ fetchImpl 胜出（单测替身不许被生产代理顶掉）', async () => {
+    const injected = vi.fn(async () => envelopeResponse([textFrame('hi'), finishFrame])) as unknown as typeof fetch
+    const proxy = vi.fn(async () => envelopeResponse([textFrame('hi'), finishFrame])) as unknown as typeof fetch
+    await collect(makeAdapter({ fetchImpl: injected, fetchFor: () => proxy }))
+    expect(injected, '注入的 fetchImpl 必须被调用').toHaveBeenCalled()
+    expect(proxy, 'fetchFor 不得压过注入的 fetchImpl').not.toHaveBeenCalled()
+  })
+
+  it('⚠️ 未注入 fetchImpl ⇒ 走 fetchFor（这条腿不能因为调序而失效）', async () => {
+    const proxy = vi.fn(async () => envelopeResponse([textFrame('hi'), finishFrame])) as unknown as typeof fetch
+    // ⚠️ 不能让「代理没被调用」这件事表现为**真发网络 + 5s 超时**（实测「恒 true」与
+    //    「调序不加标志」两个变异都是这么红的）：那种红只有个 `Test timed out`，
+    //    看不出真因。故给一个 2s 的有界等待，超时后给出带渠道名的断言失败。
+    //    同时把全局 fetch 也替成 spy —— 万一实现落到末档，也不会真打网络。
+    const globalSpy = vi.fn(async () => envelopeResponse([textFrame('hi'), finishFrame])) as unknown as typeof fetch
+    const original = globalThis.fetch
+    // @ts-expect-error —— 故意替换全局 fetch，避免变异态下真发 HTTPS。
+    globalThis.fetch = globalSpy
+    try {
+      const started = Date.now()
+      const drained = collect(makeAdapter({ fetchFor: () => proxy }))
+      const settled = await Promise.race([
+        drained.then(() => 'done' as const),
+        new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 2000)),
+      ])
+      expect(settled, `fetchFor 在 ${Date.now() - started}ms 内没被用上（请求走去了别处）`).toBe('done')
+      expect(proxy, '生产代理必须被调用').toHaveBeenCalled()
+      expect(globalSpy, '不得回落到全局 fetch').not.toHaveBeenCalled()
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+
+  it('两者都未传 ⇒ 落到全局 fetch（不崩、不抛）', async () => {
+    // 判据只要求「构造成功且 stream 走到发请求那一步」：真发全局 fetch 会打网络，
+    // 故注入一个**替身**作为全局 fetch 的替位，再看它是否被用上。
+    const globalSpy = vi.fn(async () => envelopeResponse([textFrame('hi'), finishFrame])) as unknown as typeof fetch
+    const original = globalThis.fetch
+    // @ts-expect-error —— 故意替换全局 fetch 以观测「末档兜底」是否还在。
+    globalThis.fetch = globalSpy
+    try {
+      const adapter = new QoderAdapter({
+        credentialRef: { name: 'QODER_ACCESS_TOKEN' } as never,
+        resolveCredential: async () => cred,
+        refresh: async () => {},
+        product: QODER,
+      })
+      await collect(adapter)
+      expect(globalSpy, '末档必须仍是全局 fetch').toHaveBeenCalled()
+    } finally {
+      globalThis.fetch = original
+    }
   })
 })
 
@@ -1702,5 +1770,471 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
       expect(marked.getUTCMilliseconds()).toBe(0)
       expect(marked.getUTCHours()).toBe(0)
     })
+  })
+
+  /**
+   * ## 真实报障（用户 2026-10-21，第二轮）
+   *
+   * 池里有 **2 个** `qodercn` 账号，上游回
+   * `Error in upstream response (provider_error/model_error) code=SERVER`
+   * 时**第二个账号从未被尝试** —— 修前本适配器的切号判据只有「额度」一类。
+   *
+   * ## 语义表（照 `accio-adapter.ts:1596-1605` 的「类别 → 动作」表）
+   *
+   * | 类别 | 判据 | 换号 | 写冷却 |
+   * |---|---|---|---|
+   * | `quota` | QUOTA_EXCEEDED / 110 / 112 / pricingUrl | ✅ | ✅ 至 UTC+8 当日 24:00 |
+   * | `rate` | RATE_LIMIT / 429 | ✅ | ✅ 1h |
+   * | `auth` | AUTH / 401 / 403 | ✅ | ❌ 绝不 |
+   * | `upstream` | SERVER 且文案含 provider_error | ✅ | ❌ 绝不 |
+   * | `other` | 400 参数错 / 空响应 / 风控页 | ❌ | ❌ |
+   *
+   * ⚠️ **`auth` / `upstream` 只换号、绝不写冷却**是两条独立的不变式：
+   * - `auth`：2026-10-06「全池被封」事故 —— 上游对全池回 401 时，若每个号都写
+   *   长冷却，**一个请求就能把整个 provider 封一天**；
+   * - `upstream`：`provider_error` 是上游**供应商侧**瞬时故障，与账号状态无关。
+   *   写冷却等于把一次抖动记成「该账号今日此模型已用完」，要**一整天**才恢复。
+   */
+  describe('失败分类：换号 ≠ 写冷却（provider_error 必须换号且不冷却）', () => {
+    /** 真实报障里上游给的 SSE 错误帧。 */
+    const providerErrorFrame = JSON.stringify({
+      code: 'provider_error',
+      message: 'Error in upstream response',
+      type: 'model_error',
+    })
+
+    /** 把一段错误 JSON 包成信封 SSE 响应（HTTP 200，与额度错误同通道）。 */
+    function sseErrorFrame(inner: string): Response {
+      return new Response(
+        `data:${JSON.stringify({ headers: {}, body: inner, statusCodeValue: 200 })}\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )
+    }
+
+    /**
+     * ⚠️ 池桩刻意**不实现**「按冷却过滤」：本组的断言就是「有没有写冷却」，
+     * 若桩按 `marks` 过滤，写不写冷却都换得到号 ⇒ 判据失去牙。
+     * 排除只靠 `exclude`（即生产里的 `tried`）—— 那正是「不写冷却时唯一的排除通道」。
+     */
+    function makePoolStub(accounts: Array<{ id: string; token: string }>) {
+      const marks: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+      const picks: Array<ReadonlySet<string> | undefined> = []
+      let index = 0
+      const pool = {
+        updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+          marks.push({ accountId, modelId, resetAtMs })
+        },
+        getAvailableAccount: async (_provider: string, _model: string, exclude?: ReadonlySet<string>) => {
+          picks.push(exclude)
+          while (index < accounts.length && exclude?.has(accounts[index].id) === true) index += 1
+          if (index >= accounts.length) return null
+          const a = accounts[index]
+          return {
+            entry: { id: a.id },
+            credential: buildQoderCredential(
+              parseQoderTokenPayload({ token: a.token, refresh_token: 'r', user_id: `uid-${a.id}` }),
+              { machineId: 'm-1' },
+            ),
+          }
+        },
+      }
+      return { pool, marks, picks }
+    }
+
+    /**
+     * ★★ **本组最核心的一条**（真实报障的直接复现）：
+     * 上游回 `provider_error` 时必须换到第二个账号，且**绝不写冷却**。
+     *
+     * ⚠️ 三个断言缺一不可：
+     * - `marks` 为空 —— 证明「不写冷却」（若写，这个账号要一整天才能再被选中）；
+     * - `tried` 含 acct-A —— 证明「不靠冷却也能排除刚失败的号」
+     *   （`account-pool.ts:2241-2242` 的过滤器只看 `modelRateLimits`，
+     *   不写冷却时它是唯一排除通道）；
+     * - `call === 2` 且拿到正文 —— 证明真的换号重发了，不是只抛错。
+     */
+    it('★★ provider_error 必须换到第二个账号，且绝不写冷却', async () => {
+      const { pool, marks, picks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        if (call === 1) return sseErrorFrame(providerErrorFrame)
+        return envelopeResponse([textFrame('新账号可用'), finishFrame])
+      }) as unknown as typeof fetch
+
+      const chunks = await collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+      // ① **绝不写冷却**（写了一天就废了这个号）
+      expect(marks, 'provider_error 不得写冷却标记').toEqual([])
+      // ② 真的换号重发并拿到内容
+      expect(call, 'provider_error 必须换账号重发').toBe(2)
+      expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    })
+
+    /**
+     * ★★ **`tried` 是不写冷却时唯一的排除通道** —— 用源码级断言守（行为级守不住）。
+     *
+     * ## 为什么行为级守不住（实测）
+     *
+     * `_stream` 在进入循环前就做了：
+     * ```ts
+     * const triedAccounts = new Set<string>()
+     * if (activeAccountId !== undefined && activeAccountId.length > 0) triedAccounts.add(activeAccountId)
+     * ```
+     * ⇒ 只要 `currentAccountId` 接好（生产里 `src/index.ts:2237` / `:2312` 都接了），
+     * `acct-A` **早已在 `tried` 里**，`switchAccountOnQuota` 里加不加那一句都换得到 B。
+     * 变异 F（把 `tried.add(activeAccountId)` 挪进 `if (recordsQoderRateLimit(cls))`）
+     * 实测**全绿无牙** —— 正是这个原因。
+     *
+     * 而不传 `currentAccountId` 时 `activeAccountId` 为 `undefined`，那一句同样不执行
+     * ⇒ 行为级**无论如何都造不出**「只有 switchAccountOnQuota 能排除」的局面。
+     *
+     * ## 故用源码级断言
+     *
+     * 守的不变式是「`tried.add(activeAccountId)` 必须在 `recordsQoderRateLimit` 的
+     * `if` **外面**」。这是本仓库对「结构位置即语义」的既有做法
+     * （见 `is-free-model-required.spec.ts` 的接线层用例）。
+     *
+     * ⚠️ 读源码用 `node:fs`（本文件已 import `readFileSync`）。
+     */
+    it('★★ 源码：tried.add 必须在 recordsQoderRateLimit 的 if 之外（不写冷却时唯一排除通道）', () => {
+      const code = readFileSync(resolve(here, '../../src/qoder-adapter.ts'), 'utf8')
+      // 取 switchAccountOnQuota 的方法体（从方法名到下一个 `\n  }` 收尾）
+      const start = code.indexOf('private async switchAccountOnQuota(')
+      expect(start, 'switchAccountOnQuota 必须存在').toBeGreaterThan(-1)
+      const body = code.slice(start, code.indexOf('\n  }', start))
+      // ① tried.add(activeAccountId) 必须在里面
+      expect(body, 'switchAccountOnQuota 必须把失败账号加进 tried').toContain('tried.add(activeAccountId)')
+      // ② 它不得被 `if (recordsQoderRateLimit(cls))` 包住 ——
+      //    判据：recordsQoderRateLimit 的 if 块收尾 `}` 之后才出现 tried.add
+      const recordsAt = body.indexOf('if (recordsQoderRateLimit(cls))')
+      expect(recordsAt, '必须按类别决定写不写冷却').toBeGreaterThan(-1)
+      const triedAt = body.indexOf('tried.add(activeAccountId)')
+      expect(triedAt, 'tried.add 必须在 recordsQoderRateLimit 判定之后').toBeGreaterThan(recordsAt)
+      // ③ 关键：两者之间的花括号必须**配平回 0**（即 tried.add 在那层 if 之外）
+      const between = body.slice(recordsAt, triedAt)
+      let depth = 0
+      for (const ch of between) {
+        if (ch === '{') depth += 1
+        else if (ch === '}') depth -= 1
+      }
+      expect(depth, 'tried.add(activeAccountId) 不得被包在 recordsQoderRateLimit 的 if 内').toBe(0)
+      // ④ **tried 所在行必须是独立语句**（堵住「单行无花括号 if」这种绕法）。
+      //
+      // ⚠️ 这条是补的：只查 ③ 时，把代码改成
+      // `if (recordsQoderRateLimit(cls)) tried.add(activeAccountId)`（**无花括号**）
+      // 实测**全绿无牙** —— 因为那种写法里 `between` 不含任何花括号，depth 恒为 0。
+      // 单行 if 的「块」是行本身，花括号配平查不出来。
+      const lineStart = body.lastIndexOf('\n', triedAt) + 1
+      const triedLine = body.slice(lineStart, body.indexOf('\n', triedAt))
+      expect(triedLine.trim(), 'tried.add(activeAccountId) 必须独占一行（不得挂在校验/条件语句尾部）')
+        .toBe('tried.add(activeAccountId)')
+    })
+
+    /**
+     * ⚠️ **对照用例**（证明上面那条不是「因为判据恒 true 而全绿」）：
+     * 同样的池、同样的两账号，错误换成 400 参数错 ⇒ **不许换号、不许写冷却**。
+     *
+     * 没有这条，把 `shouldRotateQoderAccount` 写成 `return true` 也能全绿 ——
+     * 那会把「参数错 / 风控页」也变成白烧整池。
+     */
+    it('对照：400 参数错不换号、不写冷却（判据不能恒真）', async () => {
+      const { pool, marks, picks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        // 400 + 参数错误（**不是** provider_error 文案，也不是额度）
+        return new Response(
+          JSON.stringify({ error: { message: 'invalid parameter: max_tokens', type: 'invalid_request_error' } }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } },
+        )
+      }) as unknown as typeof fetch
+
+      await expect(collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+        .rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+
+      expect(call, '参数错不得换号（换号只会白烧整池）').toBe(1)
+      expect(marks, '参数错不得写冷却').toEqual([])
+      expect(picks, '参数错根本不该去取号').toEqual([])
+    })
+
+    /**
+     * ⚠️ **反向守卫**：不能把所有 `SERVER` 都当 `provider_error`。
+     *
+     * `SERVER` 这个码很宽（500 也可能是「模型不支持该参数」「请求体过大」等
+     * **换号解决不了**的情况）。判据必须窄到 `provider_error` 这类**结构字段值**。
+     *
+     * 没有这条，把 `looksLikeUpstreamProviderError` 写成 `return true` 也能全绿。
+     */
+    it('对照：普通 500（不含 provider_error）不换号', async () => {
+      const { pool, marks, picks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        return new Response(
+          JSON.stringify({ error: { message: 'internal server error', type: 'server_error' } }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } },
+        )
+      }) as unknown as typeof fetch
+
+      await expect(collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+        .rejects.toMatchObject({ code: 'SERVER' })
+
+      expect(call, '普通 500 不换号').toBe(1)
+      expect(marks, '普通 500 不得写冷却').toEqual([])
+      expect(picks, '普通 500 根本不该去取号').toEqual([])
+    })
+
+    /**
+     * 429（`RATE_LIMIT`）→ **换号 + 写 1h 冷却**。
+     *
+     * ⚠️ 与 `quota` 的「至 UTC+8 当日 24:00」**必须不同**：限流是秒级背压，
+     * 按自然日写冷却会把账号封到明天（minimax / accio 都记过同型缺陷）。
+     */
+    it('429 限流：换号 + 写 1 小时冷却（不是当日 24:00）', async () => {
+      const { pool, marks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      let call = 0
+      const before = Date.now()
+      const fetchImpl = vi.fn(async () => {
+        call += 1
+        if (call === 1) {
+          return new Response(JSON.stringify({ error: { message: 'too many requests' } }),
+            { status: 429, headers: { 'Content-Type': 'application/json' } })
+        }
+        return envelopeResponse([textFrame('ok'), finishFrame])
+      }) as unknown as typeof fetch
+
+      await collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+      expect(marks.length, '429 应写冷却').toBe(1)
+      // 1 小时（允许 5 秒抖动），而不是 24 小时
+      const delta = marks[0].resetAtMs - before
+      expect(delta).toBeGreaterThan(3_590_000)
+      expect(delta).toBeLessThan(3_610_000)
+    })
+
+    /** 纯函数层：分类判据本身的 5 条（不依赖 stream）。 */
+    it('classifyQoderFailure：五类各自的判据', () => {
+      // 额度：码值
+      expect(classifyQoderFailure('QUOTA_EXCEEDED', '')).toBe('quota')
+      expect(classifyQoderFailure('QUOTA', '')).toBe('quota')
+      // 额度：业务码 / 文案（code 为未知时走文案腿）
+      expect(classifyQoderFailure('110', '')).toBe('quota')
+      expect(classifyQoderFailure('112', '')).toBe('quota')
+      expect(classifyQoderFailure('SERVER', 'Billing daily count exceeded')).toBe('quota')
+      // 限流
+      expect(classifyQoderFailure('RATE_LIMIT', '')).toBe('rate')
+      // 认证
+      expect(classifyQoderFailure('AUTH', '')).toBe('auth')
+      // 上游供应商侧瞬时故障（真实报障形态）
+      expect(classifyQoderFailure('SERVER', 'qodercn: Error in upstream response (provider_error/model_error)')).toBe('upstream')
+      // 普通 500 不算（判据必须窄）
+      expect(classifyQoderFailure('SERVER', 'internal server error')).toBe('other')
+      // 参数错不算
+      expect(classifyQoderFailure('INVALID_REQUEST', 'invalid parameter')).toBe('other')
+      // ⚠️ `model_error` **单独**不算 `upstream`（它是 `[code, type].join('/')` 的拼接产物，
+      //    任何 `SERVER` 都可能带它 —— 收它等于把整个 `SERVER` 都算进来）。
+      //    ⚠️ 注意：`looksLikeUpstreamProviderError` 的正则含 `error\s+in\s+upstream\s+response`，
+      //    而真实报障的文案就是 `Error in upstream response (model_error)` —— 那**是**
+      //    provider_error 的形态（只是缺了 `provider_error` 字段），故归 `upstream`。
+      expect(classifyQoderFailure('SERVER', 'Error in upstream response (model_error)')).toBe('upstream')
+      // 但纯 `model_error`（无 upstream 字样）不算
+      expect(classifyQoderFailure('SERVER', 'model_error')).toBe('other')
+    })
+
+    it('shouldRotateQoderAccount / recordsQoderRateLimit：两张表必须不同', () => {
+      // 换号：除 `other` 外都换
+      expect(shouldRotateQoderAccount('quota')).toBe(true)
+      expect(shouldRotateQoderAccount('rate')).toBe(true)
+      expect(shouldRotateQoderAccount('auth')).toBe(true)
+      expect(shouldRotateQoderAccount('upstream')).toBe(true)
+      expect(shouldRotateQoderAccount('other')).toBe(false)
+      // 写冷却：只有额度与限流
+      expect(recordsQoderRateLimit('quota')).toBe(true)
+      expect(recordsQoderRateLimit('rate')).toBe(true)
+      expect(recordsQoderRateLimit('auth'), 'auth 绝不写冷却（全池被封事故）').toBe(false)
+      expect(recordsQoderRateLimit('upstream'), 'upstream 绝不写冷却（瞬时故障）').toBe(false)
+      expect(recordsQoderRateLimit('other')).toBe(false)
+    })
+  })
+})
+
+/**
+ * ## 真实报障（用户 2026-10-21 贴出的原始文案）
+ *
+ * ```
+ * 本轮运行失败aggregate: qodercn（dfmodel）上游失败：
+ *   qoder: Error in upstream response (provider_error/model_error) code=SERVER
+ * ```
+ *
+ * ⚠️ **同一句里出现了两个渠道名**：外层是聚合层写的 `qodercn`（东八区中国版），
+ * 内层却是 `qoder`（国际版）。两个渠道的**凭据、端点、额度池完全不同**，
+ * 排查时看到 `qoder:` 会去查国际版的账号 —— 而真实故障在中国版上。
+ *
+ * 根因：`QoderAdapter` 是**两站共用**的一个类（只靠 `options.product` 区分），
+ * 而三处报错前缀全被写成了字面量 `'qoder'`：
+ * ① 两个 HTTP 失败分支；② 信封剥离函数的第二个实参；③ SSE 消费器的 `label` 选项。
+ *
+ * ⇒ 修法：统一取 `this.product.id`。国际版输出**逐字节不变**，中国版从此说自己的名字。
+ *
+ * ⚠️ 这个缺陷**不影响功能**（错误照样抛、照样可重试、聚合照样换候选），
+ * 只影响**归因**。但本仓库反复出现的正是这类「功能对、归因错」的坑
+ * （见 AGENTS.md 第 9 条 qoder `110` 被归 `SERVER` 的案例）——故必须有守卫。
+ */
+describe('报错前缀必须取自 product.id（不许硬编码 qoder）', () => {
+  /** 让 HTTP 层失败：回 500（`httpErrorCode` 映射成 `SERVER`）。 */
+  function failResponse(status: number, body = 'upstream boom'): Response {
+    return new Response(body, { status, headers: { 'Content-Type': 'text/plain' } })
+  }
+
+  /** 让 SSE 层失败：HTTP 200 + 内嵌错误帧（与真实链路同形态）。 */
+  function sseErrorResponse(inner: string): Response {
+    const payload = `data:${JSON.stringify({
+      headers: { 'Content-Type': ['application/json'] },
+      body: inner,
+      statusCodeValue: 200,
+      statusCode: 'OK',
+    })}\n\n`
+    return new Response(payload, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  it.each([
+    ['qoder', QODER],
+    ['qodercn', QODER_CN],
+  ] as const)('%s：HTTP 层失败的文案用 %s 开头', async (providerId, product) => {
+    const adapter = makeAdapter({
+      product,
+      fetchImpl: (async () => failResponse(500)) as unknown as typeof fetch,
+    })
+    await expect(collectWith(adapter, { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+      .rejects.toMatchObject({
+        message: expect.stringContaining(`${providerId}: `) as never,
+      })
+  })
+
+  it('★ 中国版 HTTP 层失败：文案是 qodercn，绝不能是 qoder', async () => {
+    const adapter = makeAdapter({
+      product: QODER_CN,
+      fetchImpl: (async () => failResponse(500)) as unknown as typeof fetch,
+    })
+    let message = ''
+    try {
+      await collectWith(adapter, { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+    } catch (error) {
+      message = (error as Error).message
+    }
+    // ⚠️ 两个断言都要有：第一条守「说对了」，第二条守「没再说错」。
+    // 只写第一条时，`qodercn: … qoder: …` 这种**同时含两个名字**的文案会漏过。
+    expect(message, '中国版的报错必须自称 qodercn').toContain('qodercn: ')
+    expect(message, '中国版的报错不得出现 qoder: 前缀（那会指向国际版）')
+      .not.toMatch(/(?:^|\s)qoder: /)
+  })
+
+  it('★ 真实形态：SSE 内嵌 provider_error 帧，文案带对的渠道名', async () => {
+    // 用户贴出的真实内层帧（`code` 为空、`type` 为 `model_error`，
+    // 故 `openai-compat` 拼出的后缀恰好是 `provider_error/model_error`）。
+    const inner = JSON.stringify({
+      code: 'provider_error',
+      message: 'Error in upstream response',
+      type: 'model_error',
+    })
+    const adapter = makeAdapter({
+      product: QODER_CN,
+      fetchImpl: (async () => sseErrorResponse(inner)) as unknown as typeof fetch,
+    })
+    let message = ''
+    try {
+      await collectWith(adapter, { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message, 'SSE 消费器的 label 也必须取自 product.id').toContain('qodercn: ')
+    expect(message).not.toMatch(/(?:^|\s)qoder: /)
+    // 上游原文必须保真（本仓「错误保真」红线）
+    expect(message).toContain('Error in upstream response')
+    expect(message).toContain('provider_error/model_error')
+  })
+
+  it('★ 国际版输出逐字节不变（改名不得改变既有文案）', async () => {
+    const adapter = makeAdapter({
+      product: QODER,
+      fetchImpl: (async () => failResponse(500, 'upstream boom')) as unknown as typeof fetch,
+    })
+    let message = ''
+    try {
+      await collectWith(adapter, { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message, '国际版的既有文案必须保持原样').toBe('qoder: upstream boom')
+  })
+
+  it('★ 续期后凭据仍为空：AUTH 分支的文案也带对的渠道名', async () => {
+    // 走到那条 AUTH 需要一个特定序列：401 → 续期 → **续期后仍拿不到凭据**。
+    // 这是「凭据彻底失效」的真实形态（refresh 成功但服务端不再发 token）。
+    let call = 0
+    const adapter = makeAdapter({
+      product: QODER_CN,
+      // 第一次返回 cred（供入口取号），之后一律返回「空 token」的凭据。
+      resolveCredential: async () => {
+        call += 1
+        return call === 1 ? cred : { ...cred, access_token: '' }
+      },
+      fetchImpl: (async () => failResponse(401, 'auth failed')) as unknown as typeof fetch,
+    })
+    let message = ''
+    try {
+      await collectWith(adapter, { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message, 'AUTH 分支必须自称 qodercn').toContain('qodercn: credential expired and refresh failed')
+    expect(message).not.toMatch(/(?:^|\s)qoder: /)
+  })
+
+  it('源码里不得再有硬编码的三处 qoder 前缀（反向守卫，防改回去）', () => {
+    const code = readFileSync(resolve(here, '../../src/qoder-adapter.ts'), 'utf8')
+    // ① 两个 HTTP 失败分支曾写 `qoder: ${errorDetail(...)}`
+    expect(code, 'HTTP 失败文案又硬编码了 qoder')
+      .not.toContain('`qoder: ${errorDetail(')
+    // ② 曾写 `unwrapQoderEnvelopeStream(response, \'qoder\')`
+    expect(code, '信封标签又硬编码了 qoder')
+      .not.toContain("unwrapQoderEnvelopeStream(response, 'qoder')")
+    // ③ 曾写 `label: 'qoder',`
+    expect(code, 'SSE 消费器标签又硬编码了 qoder')
+      .not.toMatch(/label:\s*'qoder'/)
+    // 且必须真的从 product.id 取（正向断言，否则删掉那一行也会全绿）
+    expect(code, '必须从 product.id 取标签').toContain('const label = this.product.id')
   })
 })

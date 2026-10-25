@@ -881,6 +881,13 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       updateAccount: async () => {},
       removeAccount: async () => {},
       listAccounts: async () => [],
+      // ⚠️ `account.create` 的 qoder 分支会查「同 provider 已有账号的出口代理」
+      // 来决定是否继承（墙外环境一次配置、后续账号免重填）。替身缺这一格会让
+      // `account.create` 抛 TypeError ⇒ 端点回 ok:false，而失败信息会被那条
+      // 「不阻塞」的断言读成「阻塞了」，与本用例要守的东西完全无关。
+      listAccountsByProvider: async () => [],
+      // 代理为空串时不会写池，补齐以免将来 qoderProxyInput 非空时崩。
+      setQoderProxy: async () => {},
     }
 
     const ctx = {
