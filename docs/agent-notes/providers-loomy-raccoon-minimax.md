@@ -1727,3 +1727,33 @@ loomy, raccoon, minimax, zcode`）。
 ⚠️ **根治方向**（尚未做）：把它改成**具名参数对象**（`{ auth: {...}, modelAdapters }`）。
 已复发五次说明「靠注释提醒补占位」不足以防住 —— 但那是独立重构，
 需要同时改 `src/index.ts` 与全部测试调用点，不要顺手做。
+
+## ⚠️⚠️ minimax 同账号去重的「三件套」不可只做第一件（2026-10-25 合并审计）
+
+`!147` 补了 minimax 的同账号去重（按 `user_id` 查池、命中则**不删条目**、标停用+改名）。
+方向对，但只搬了 officeace 三件套的**第 1 件**。实测两个后果：
+
+| 缺的腿 | 后果（实测） |
+|---|---|
+| 新鲜凭据**转写回保留卡** + 清重复卡凭据 | 续期调度器**刻意不看 `enabled`** ⇒ 同一上游账号挂**两条续期链**。MiniMax 的 refresh_token 是轮换式的 ⇒ 两条链互相作废，症状正是「旧的那条掉登录」（本 PR 要治的形态） |
+| 命中**已停用**原卡时反转 | 用户手动停用过这个号 → 同号重登 → **两张卡全停用** ⇒ `getAvailableAccount()` 返回 `null`（它按 `enabled` 过滤）而 `login.poll` 报登录成功 ⇒ **零可用号**（officeace 2026-10-17 修过同一格） |
+
+⚠️ 还有一个**前置**缺陷：`user_id` 全仓只有 `persistLogin` 一处写入，而它只写**新**账号。
+存量凭据（PR 之前登录的）**没有** `user_id`（本机三份实测零份带它），而
+`findAccountIdByIdentityField` 对缺失字段是**跳过**（不是「不匹配」）⇒ 去重对存量用户
+**永不触发**。唯一能补的地方是启动自愈 `repairAccountNicknames` —— 它本来就把
+`identity.userId` 拿到了手，却只写了 `nickname`。
+
+⇒ 现行实现：`src/minimax-dedup.ts`（`dedupeMinimaxAccount`，四种结局逐格可测）+
+`repairAccountNicknames` 一并补写 `user_id` + `refresh()`（第 5 条续期路径，
+`index.ts` 在 `getAvailableAccount()` 返回空时走它）也继承身份。
+守卫：`tests/unit/minimax-dedup.spec.ts`（6 条）、`minimax-identity-inherit.spec.ts`（9 条）。
+
+⚠️ 「收口在**唯一**出口」这类声明要按**调用点**数，不要按注释数：本 PR 声称 4 条续期路径
+收口到 `refreshCredentialFor`，实际还有第 5 条 `refresh()`，且它此前直接把续期结果落盘
+（`nickname`/`user_id` 双双消失，每 30 分钟一轮必然复现）。
+
+⚠️ 两个新 spec 的 cordis 闸门曾用 `import.meta.resolve('@deepseek-ai/cordis')` ——
+**Vite SSR 下恒抛**（`__vite_ssr_import_meta__.resolve is not a function`）⇒ 两条最承重的
+行为用例**永久 SKIP**，而 PR 说明写着「完整安装的 checkout 里会真跑」（假的）。
+探针必须与用例体用**同一种**加载方式（`await import()`）；SKIP≠PASS 仍然成立。

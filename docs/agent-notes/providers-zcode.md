@@ -2593,3 +2593,36 @@ node scripts/probe-zcode-intl-vs-cn-activity.mjs
 
 
 
+
+## ⚠️⚠️ 405 的判据是「system 恰好 3 块」，而这条不变式曾**零守卫**（2026-10-25 合并审计）
+
+`!151` 用三轮对照证明：**第 4 个 `system` 块会让请求必然 405 + 3012**，与它多长无关
+（2 062 字符照样 405）；把调用方 system 挪进首轮 user 消息后同一请求 200，且模型照样
+遵守那段约定。落地方向完全正确。
+
+**但审计实测**：把这处修复**原样放回去**（适配器里 `system.push({type:'text',text:options.system})`
++ 删掉 `withCallerSystem`）后，**871 条 zcode 用例 + 双 tsc 全绿**。原因：当时的用例只测
+`buildZcodeSystemBlocks()` 的返回值（它已经没有 caller 形参，断言近乎恒真），**从不过适配器**；
+全仓只有 `zcode-throttle.spec.ts:439` 读过真实请求体，且只断言 `tools` 的断点。
+
+⇒ 现有守卫：`tests/unit/zcode-wire-invariants.spec.ts` —— 让 `ZcodeAdapter.stream()` 真跑一次、
+截 `fetchImpl` 收到的 `init.body`，断言 `system.length===3` / caller 零次在 system / 恰好一次在
+messages 且排在日期块之后。**改 zcode 适配器装配时它必须绿。**
+
+⚠️ 同一轮审计还挖出「同姓」的四处自相矛盾（都已修，但结论要记）：
+① `X-Platform`/`X-Os-Category` 硬编码 windows 而 `X-Os-Version` 取真实 `os.release()`
+⇒ 非 Windows 宿主上「windows 类别 + Darwin 内核号」，任何官方客户端都不会发；
+② 头走门控版（3.16.3）而 query/body 走凭据版（3.14.3）⇒ 同一请求两个版本号；
+③ `X-Session-Id` 是**模块级常量** ⇒ 池里所有账号共用一个 session id（真实客户端是每会话一个）；
+④ `app_version` 不做格式校验 ⇒ `3.16.3-beta.1` / `3.016.3` 会被 `compareZcodeAppVersion`
+当成「更大」而**绕过**门控，`\r\n` 注入会让 `Headers()` 抛 `TypeError`。
+⇒ 判据：`zcodeClientPlatform()` 三值同源且**平台与内核版本都可入参**（本机 `os.release()`
+恰好等于伪装值 `10.0.26100`，不注入就永远测不出①）；带 query `app_version` 的站点必须把
+同一个值显式传给 `buildZcodeHeaders`。
+
+⚠️ 另：`buildZcodeHeaders` 被 `zcode-transport.ts` 复用，所以 `coding-plan` 腿（`api.z.ai`）
+现在也从 10 头变 18 头 —— 作者只在 `/v1/messages` 上实测过，`api.z.ai` 未实测（已登记）。
+
+⚠️ 方法论：`zcode-identity.ts` 头注释原写「判据是身份块是否存在，**不是**块数多少」，
+与现行不变式**正面冲突**。这类过期注释就是下一次回归的引信（谁按它把第 4 块加回来，
+测试不会红）。改代码时**必须连注释一起改**，否则等于留下一个静默的骗局。
