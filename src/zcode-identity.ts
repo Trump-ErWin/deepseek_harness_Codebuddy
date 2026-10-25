@@ -19,6 +19,13 @@
  * ⇒ **判据是「身份块是否存在」**，不是「块数多少」或「字符数够不够」，
  * 也与 HTTP 头、运行时（Electron / curl / Node）无关。上游 curl 带完整块同样 200。
  *
+ * ⚠⚠⚠ **上面这两句已被 2026-10-25 的对照实验推翻一半，改本文件前必须连它一起读**
+ * （见 {@link buildZcodeSystemBlocks} 头注释的表）：身份块**仍**是必要条件
+ * （缺了必然 405），但「**块数不是判据**」是**错的** —— 在 3 块之上再追加第 4 块
+ * 会让请求**必然** 405 + 3012，且与第 4 块的长度无关。⇒ 现行不变量是
+ * 「**system 恒为官方的 3 类**」，调用方 system 走 messages。
+ * 保留原文只为留下「这条结论曾经怎么来的」；**不要**据此把第 4 块加回来。
+ *
  * ⚠⚠ **2026-10-03 复测修正了两条旧说法**（issue IKJI0Y 驱动，本机三个账号、
  * 17 次请求）。**改本文件前先读那两条**：
  *
@@ -114,7 +121,7 @@ export interface ZcodeTextBlock {
  *
  * | system 块数 | 请求体 | 结果 |
  * |---|---|---|
- * | 3 块 `42 + 2590 + 253` | 只有一句话 | **HTTP 200** |
+ * | 3 块 `42 + 2590 + 275` | 只有一句话 | **HTTP 200** |
  * | 4 块（第 4 块 = caller system） | 同上 | **HTTP 405 + 3012** |
  * | 3 块（caller system 改放进 messages） | 同上 | **HTTP 200** |
  *
@@ -161,16 +168,20 @@ export function buildZcodeSystemBlocks(
    *
    * ## 依据二：断点有**数量上限**（Anthropic：单请求最多 4 个）
    *
-   * 本函数产出 3-4 块（调用方的 system 存在时是 4 块）——「每块都打」正好**用满**
-   * 4 个预算，于是 tools 再也打不了点（见 `zcode-adapter.ts` 的
+   * 本函数**恒产出 3 块**（2026-10-25 起调用方 system 不再进 system）——
+   * 若改回「每块都打」则正好**用满** 4 个预算，于是 tools 再也打不了点（见 `zcode-adapter.ts` 的
    * `withToolCacheBreakpoint`：DSH 每步带 24 个工具、约 19KB schema）。
    * 收敛成 1 个后，预算留给 tools，**总断点数 2 ≤ 4**。
    *
-   * ## 依据三：调用方 system 必须落在断点内（本项目特有）
+   * ## 依据三（⚠ 已随 2026-10-25 的修法失效，保留说明）
    *
-   * `callerSystem` 是 DSH 的完整规范（本仓库的 `AGENTS.md` 就有数十 KB）。
-   * 断点若不在它之后，这段**每步都要重算 prefill** —— 而它恰恰是最大的可缓存前缀。
-   * 只给最后一块打点天然满足这一点（有 `callerSystem` 时最后一块就是它）。
+   * 这条原本写的是「调用方 system 是最大的可缓存前缀，所以断点必须落在它之后」。
+   * **调用方 system 现在不进 `system`**（走 messages），所以：
+   * - 前缀断点覆盖的是 `cliPrefix + stable + environment` 这 3 块；
+   * - 调用方 system 落在**首轮 user 消息**里，不在任何 `system` 断点之内 ——
+   *   这是**刻意接受的代价**：4 块必然 405，而 405 比多算一次 prefill 严重得多。
+   *   ⚠ 别为了「让 caller 进缓存」把第 4 块加回来（全量测试**不会**变红，
+   *   见 `tests/unit/zcode-wire-invariants.spec.ts` 是唯一钉住它的地方）。
    *
    * ⚠ 与官方「逐块打点」的形态有偏差，但**不影响准入**：3012 的判据是
    * 身份块的**内容与结构**存在（`AGENTS.md` 与 `OFFICIAL_*` 注释都记过），
@@ -326,9 +337,21 @@ export function withContextPrefix<T extends { role: string; content: unknown }>(
  * - 插到**首轮 user 消息** `content` 数组的**末尾之后**（若已有日期块，
  *   排在它后面；否则排在最前）
  * - 纯文本 content 转成块数组
- * - `role !== 'user'` 或无消息时**原样返回**（不抛错）
  * - 空 / 纯空白 ⇒ 原样返回（不塞空块）
  * - **幂等**：调用方内容已存在则不重复插
+ *
+ * ## ⚠⚠ 首条不是 user 时：退化为「插到**第一条 user 消息**」
+ *
+ * 改前这里是 `if (first.role !== 'user') return out` —— 也就是说 DSH 的整份
+ * system（含 `AGENTS.md` 规则）会**静默蒸发**，无日志、无报错（2026-10-25 审计）。
+ * 而改前它进 `system[]` 时与首条 role **无关**，任何形态都不会丢 ⇒ 这是本修法
+ * 引入的**能力回退**，必须补上。
+ *
+ * ⇒ 现在的语义：
+ * - 首条是 user ⇒ 插首条（既有行为）；
+ * - 首条不是 user ⇒ 插**第一条 user 消息**；
+ * - 一条 user 消息都没有 ⇒ 仍然原样返回（没有合法落点，无从注入；此时
+ *   `serializeMessages` 那条路径本身也产不出可用的对话）。
  */
 export function withCallerSystem(
   messages: readonly Record<string, unknown>[],
@@ -336,22 +359,32 @@ export function withCallerSystem(
 ): Array<Record<string, unknown>> {
   const out = messages.map((message) => ({ ...message }))
   if (typeof callerSystem !== 'string' || callerSystem.trim().length === 0) return out
+  /**
+   * ⚠ 落点选择：首条 user 优先；否则第一条 user。
+   *   幂等判据只看**落点那条**消息（不是「全局找一遍」）——
+   *   后者会在多轮里把同一条 caller 重复计入。
+   */
   const first = out[0]
-  if (first === undefined || first.role !== 'user') return out
+  const targetIndex = first !== undefined && first.role === 'user'
+    ? 0
+    : out.findIndex((message) => message.role === 'user')
+  if (targetIndex < 0) return out
+  const target = out[targetIndex]
+  if (target === undefined) return out
 
   const block: ZcodeTextBlock = { type: 'text', text: callerSystem }
-  const content = first.content
+  const content = target.content
   if (Array.isArray(content)) {
     const already = content.some(
       (item) => (item as { text?: unknown } | undefined)?.text === callerSystem,
     )
     if (already) return out
-    first.content = [...content, block]
+    target.content = [...content, block]
   } else if (typeof content === 'string') {
     if (content === callerSystem) return out
-    first.content = [{ type: 'text', text: content }, block]
+    target.content = [{ type: 'text', text: content }, block]
   } else {
-    first.content = [block]
+    target.content = [block]
   }
   return out
 }

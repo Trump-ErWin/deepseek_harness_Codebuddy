@@ -739,6 +739,14 @@ export function formatZcodeDiagnostic(input: ZcodeDiagnosticInput): string {
   const shapeParts = input.shape === undefined
     ? []
     : [
+      /**
+       * ⚠⚠ **块数必须渲染出来**（2026-10-25 审计打穿）：405 的判据就是
+       * 「system 是否为官方那 3 块」，而 `systemBlocks` 此前只被赋值、
+       * **从没被渲染** ⇒ 3 块与 4 块构造出的诊断行**逐字相同**，
+       * 下一次 405 报障完全看不出「是不是又变 4 块了」。
+       * 这是排查该缺陷**唯一**的现成出口，别删。
+       */
+      `system ${input.shape.systemBlocks} 块`,
       `身份块 ${input.shape.identityChars} 字符(${
         input.shape.identityBlockChars.length > 0
           ? input.shape.identityBlockChars.join('+')
