@@ -657,6 +657,26 @@ function traeStreamErrorMessage(code: number, message: string, model: string): s
     return `${base} —— 本次请求的内容过大：多为一次携带的图片过多/过大。`
       + '请减少本轮的图片数量或改用更小的截图后重试。'
   }
+  if (code === 1005) {
+    // ⚠️ **必须给出「换模型」这条出路**（2026-10-25 审计 P2-10）。
+    //
+    // 1005 = **套餐权益不足**：该模型不被这个账号的套餐接受。上游 `message`
+    // 常常是**空串**，于是旧实现给用户的全部信息就是 `trae:  (code=1005)`
+    // —— 一个字都不指向他能做的事。
+    //
+    // ⚠️ 引导必须指向**换模型**，不能指向签到/充值：换号也没用（换账号还是
+    // 同一个模型被拒，故 1005 不在「值得换号」之外的语义里），而额度对
+    // 「套餐不含此模型」是完全无效的解药。这一点审计实测确认过。
+    return `${base} —— 当前账号的套餐不包含模型「${model}」：`
+      + '请换一个模型重试（被拒的是这个模型，不是额度，等额度也不会好）。'
+  }
+  if (code === 4008) {
+    // 4008 = `ide_credits` 日配额耗尽 ⇒ 这条**确实**该引导等重置/签到。
+    // 与 1005 分开写，避免把两种完全不同的成因混成一句（旧实现两者共用
+    // 裸码文案，用户无法区分是该换模型还是该等额度）。
+    return `${base} —— 当前账号的今日额度已用尽：`
+      + '请等额度重置后重试，或改用其它模型/其它账号。'
+  }
   if (code !== 4001) return base
   return `${base} —— 模型「${model}」不被上游接受：它通常是「仅可见但不可调用」的`
     + '自定义模型（需先在 TRAE IDE 内自行配置供应商），请改用模型列表中的其它模型'
@@ -1449,6 +1469,18 @@ export class TraeAdapter extends LlmAdapter {
     // 错误只在首个事件前抛；流内错误则由 `!gotAnyContent` 把关。因此不存在
     // 「已经吐了一半再重放」的重复计费与重复执行工具风险（对齐 CN 项目的
     // `TRAE_REMOTE_WORK_FALLBACK` 语义）。
+    //
+    // ⚠️⚠️ **「任何 chunk」是字面意思，不是「正文」**（2026-10-25 审计 P0 修复）：
+    // 旧实现只在 `ev.response` 非空时置 `gotAnyContent`，于是「已发出思考」与
+    // 「已发出工具调用」两种情况仍会被判成「尚未产出」⇒ 换号重发。而重试循环
+    // 在**本函数内部**，harness 只看到一条连续流 ⇒ 第一次 attempt 的
+    // `tool-call-delta` 会变成**幽灵调用**：`BlockAssembler.assembled()` 只在
+    // `max-tokens` 时丢弃 tool-call（**不过滤**没有 `block-end` 的 partial），
+    // `dsh-agent-loop` 也不去重 ⇒ harness 会执行一个模型已经放弃的工具调用。
+    // ⇒ 三个发射点（`text-delta` / `reasoning-delta` / `tool-call-delta`）
+    // **必须都**置真，且只在**真正 yield 之后**（被 suppressor / 死循环守卫 /
+    // 空名字拦下的分片一个 chunk 都没发，重发不产生幽灵调用）。
+    // 守卫：`tests/unit/trae-adapter.spec.ts` 的两条 `★★★ P0` 用例。
     const triedStreamAccounts = new Set<string>()
     if (currentAccountId.length > 0) triedStreamAccounts.add(currentAccountId)
     let rotateBudget = TRAE_MAX_ROTATE - 1
@@ -1460,13 +1492,17 @@ export class TraeAdapter extends LlmAdapter {
       } catch (error) {
         // ② 流内可换号错误 → 标记当前账号 + 取下一个账号重发。
         if (error instanceof LlmError && error.code === TRAE_ROTATABLE_STREAM_ERROR) {
-          // 无账号池、或换号预算用尽 → 如实抛出（去掉哨兵码，换真实语义）。
-          if (this.options.accountPool === undefined || rotateBudget <= 0) {
+          // 无账号池 → 无从换号，如实抛出（去掉哨兵码，换真实语义）。
+          //
+          // ⚠️⚠️ **`rotateBudget <= 0` 的抛出不能放在这里**（2026-10-25 审计 P1）：
+          // 旧实现在此直接 `throw`，于是「预算刚好用尽」的那一次**当前账号
+          // 一个冷却标记都不写**就抛出了 —— 用 3 个账号的池实测，第一轮只标
+          // 2 个，那个漏标的账号下次选号时没有任何标记可过滤 ⇒ **立刻又被选回**
+          // （正是「轮换好像不行」的第三个成因）。故先标记、再判预算。
+          if (this.options.accountPool === undefined) {
             throw new LlmError(error.message, 'QUOTA_EXCEEDED')
           }
           if (options.signal?.aborted) throw error
-
-          rotateBudget -= 1
           // 标记当前账号在本模型上受限（UI 据此亮「限额重置」徽章）。
           //
           // ⚠️ 与 HTTP 层同款：只标记**该模型**，该账号在别的模型上仍可用。
@@ -1483,6 +1519,11 @@ export class TraeAdapter extends LlmAdapter {
           // `hard-plan` 还要求 `plan` 关键词，而流内 `message` 可能是**空串**
           // ⇒ 判成 `none` ⇒ 冷却 **0ms** ⇒ 标记写不下去、换号形同虚设
           // （真实报障：`trae:  (code=1005)`，两个账号同被同一模型拒）。
+          //
+          // ⚠️ 该入口**只查码表**（2026-10-25 审计 F-02 起）：它不再接受
+          // `message`、也不回落文案表 —— 那个回落腿在生成路径上不可达，且
+          // 复活的正是上面这条缺陷的形态。表外码在这里拿到 `undefined`，
+          // 由下一行的 `TRAE_RATE_LIMIT_FALLBACK_MS` 兜底。
           if (currentAccountId.length > 0) {
             // ⚠️ instanceof 收窄一次、两个字段都从收窄后的引用取（PR #64 审查 1）：
             // 对 `unknown` 的行内可选链不做窄化，`cause?.message` 会报 TS2339 挡构建。
@@ -1490,7 +1531,7 @@ export class TraeAdapter extends LlmAdapter {
               ? (error as { cause?: TraeStreamErrorCause }).cause
               : undefined
             const kind = streamErr !== undefined
-              ? classifyTraeStreamCode(streamErr.code, streamErr.message)
+              ? classifyTraeStreamCode(streamErr.code)
               : undefined
             const cooldownMs = kind !== undefined ? traeCooldownFor(kind) : TRAE_RATE_LIMIT_FALLBACK_MS
             await this.options.accountPool.updateModelRateLimit(
@@ -1499,6 +1540,12 @@ export class TraeAdapter extends LlmAdapter {
               Date.now() + cooldownMs,
             )
           }
+          // ⚠️ **标记之后**才判预算（2026-10-25 审计 P1，见上面那条注释）：
+          // 预算用尽时当前账号已经写好冷却，此处抛出不会漏标。
+          if (rotateBudget <= 0) {
+            throw new LlmError(error.message, 'QUOTA_EXCEEDED')
+          }
+          rotateBudget -= 1
           // 取下一个账号。
           //
           // ⚠️ **必须传真实 modelId 且传 `tried`**：
@@ -1663,7 +1710,29 @@ export class TraeAdapter extends LlmAdapter {
     // SSE 事件累积状态（跨行累积 event + data）
     let currentEvent = ''
     let currentData = ''
-    // 会话 id（从 metadata 事件获取，但非必需）
+    /**
+     * 是否**已经向上游消费者发出过任何模型产出**（正文 / 思考 / 工具调用）。
+     *
+     * ## ⚠️⚠️ P0：它不能只看正文（2026-10-25 审计 B2）
+     *
+     * 旧实现**只在 `ev.response` 非空时**置真（正文分片）。于是「已发出思考」
+     * 与「已发出工具调用」两种情况下本标记仍是 `false` ⇒ 流内 `event:error`
+     * 仍然整轮**换号重发**。而重试循环在 `stream()` **内部**，harness 只看到
+     * **一条连续流** ⇒ 第一次 attempt 的 `tool-call-delta` 会变成**幽灵调用**：
+     *
+     * - `BlockAssembler.assembled()` **只在 `max-tokens` 时**丢弃 tool-call，
+     *   **不过滤**没有 `block-end` 的 partial；
+     * - `dsh-agent-loop` 直接 `filter(b => b.type === 'tool-call')` 后执行，
+     *   **零去重**。
+     *
+     * 后果：模型在第二轮的答话里说「直接回答、不用跑命令」，而 harness 仍会
+     * 执行第一轮那个工具；分片中断时参数还可能是**截断的非法 JSON**。
+     *
+     * ⇒ 判据必须是「**有没有发出过 chunk**」，而不是「有没有正文」。故三处
+     * 发射点（`text-delta` / `reasoning-delta` / `tool-call-delta`）都要置真，
+     * 且**只在真正 yield 之后**（被 suppressor / 死循环守卫 / 空名字拦下的分片
+     * 一个 chunk 都没发，重发不会造成幽灵调用）。
+     */
     let gotAnyContent = false
     /**
      * 是否收到过**任何**可解析的上游事件。
@@ -1756,6 +1825,7 @@ export class TraeAdapter extends LlmAdapter {
                         const fixedDelta = dsmlFix.push(delta.content as string)
                         block.text += fixedDelta
                         if (fixedDelta.length > 0) {
+                          gotAnyContent = true
                           yield { type: 'text-delta', index: block.index, text: fixedDelta }
                         }
                       }
@@ -1790,6 +1860,7 @@ export class TraeAdapter extends LlmAdapter {
                           }
                           // ⚠️ **整块回写**（赋值，不是 `+=`）：helper 内部已累积全部文本。
                           block.text = suppressor.text()
+                          gotAnyContent = true
                           yield { type: 'reasoning-delta', index: block.index, text: emit }
                         }
                       }
@@ -1821,6 +1892,7 @@ export class TraeAdapter extends LlmAdapter {
                           if (!hasUsableToolName(block.name)) continue
                           block.announced = true
                           toolOrder.push(block.index)
+                          gotAnyContent = true
                           yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
                           yield {
                             type: 'tool-call-delta',

@@ -1245,7 +1245,47 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   ['AUTOCLAWINTL', 'autoclawintl'],
 ]
 
-/** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */
+/**
+ * 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{SUFFIX}`（前缀由单一真相源派生）。
+ *
+ * ## 尾段判据为什么不能只是 `[0-9A-Fa-f]{6,}`（2026-10-25 审计 A1-F4 / B1）
+ *
+ * 大多数 provider 的尾段确实是纯 hex（`${provider}_ACCOUNT_${randomHex}`）。
+ * 但 **opencode 的尾段不是**：它在 key 尾 8 位含 `-`/`.` 时会生成
+ * `OPENCODE_ACCOUNT_<剥完非法字符>_<8 位 hex>`
+ * （`opencode-rpc.ts` 的 `slotNamesOf`）—— 尾段含 `_`，**永远不是纯 hex**。
+ *
+ * 旧判据下 `providerOfAccountRef` 对这类 ref 返回 `undefined`，后果**两条**：
+ *
+ * 1. `state.json` 缺失时该账号**静默消失**（凭据还在、索引建不出来）；
+ * 2. ⚠️ 更严重：`backup.ts` 的跨 provider 校验把 `undefined` 当「不是账号 ref」
+ *    **放行**（fail-open）⇒ 一份 `provider:'buddy'` 却引用 `OPENCODE_ACCOUNT_*`
+ *    的备份会被**采纳**（实测 `imported=1`），而同一误用在合法 hex 尾 ref 下
+ *    会被拒（`imported=0`）。同一份校验对两种 ref 形态给出**相反**结论，
+ *    正是「一文件两套同义判据」的变体。
+ *
+ * ⇒ 尾段放宽为「字母数字/下划线 + 可选的 `_<8 位 hex>` 后缀」：
+ * `([0-9A-Za-z]{6,}(?:_[0-9A-Fa-f]{8})?|[0-9A-Za-z]*_[0-9A-Fa-f]{8})`。
+ *
+ * ⚠️ 三条并列分支，缺一不可（都是 `slotNamesOf` **真实会产出**的形态）：
+ *
+ * | 形态 | 例 | 为什么需要单独一条 |
+ * |---|---|---|
+ * | `[0-9A-Za-z]{6,}` | `OPENCODE_ACCOUNT_AAAAAA` | 存量纯 hex / 合法字母尾段 |
+ * | `[0-9A-Za-z]{6,}_[0-9A-F]{8}` | `OPENCODE_ACCOUNT_AAAABCD_6480DB97` | 归一化 + hash |
+ * | `[0-9A-Za-z]*_[0-9A-F]{8}` | `OPENCODE_ACCOUNT__9ABB433E` | 尾段**全是非法字符**时剥完为空，长度不足 6 |
+ *
+ * 另外「合法尾段本身可含 `_`」也是一种真实形态（`OPENCODE_ACCOUNT_AAAAB_CD`
+ * —— 尾 8 位 `aaaab_cd` 全合法、走合法分支且不带 hash）⇒ 纯 hex 判据
+ * **从一开始就漏掉它**，与本次归一化无关。故第一条分支也接受 `_`。
+ *
+ * ⚠️ **识别面只增不减**：纯 hex 仍匹配（存量 ref 逐字节不受影响），新形态也匹配。
+ * ⚠️ 两个捕获组的语义保持不变（`[1]` = 前缀、`[2]` = 尾段），
+ * `accountFromCredentialRef` 用尾段合成 id —— 它会把尾段小写后拼进 id，
+ * 对 `AAAABCD_6480DB97` 得到 `opencode-aaaabcd_6480db97`（与 `slotNamesOf`
+ * 的 id 前缀一致性**不要求逐字相同**：那条 id 是首次添加时算的，恢复路径
+ * 只在 `state.json` 缺失时兜底，且两端都以「尾段」为身份锚点）。
+ */
 const ACCOUNT_REF_RE = new RegExp(
   // ⚠️ 按前缀长度**降序**排列：`QODERCN` 必须排在 `QODER` 之前。虽然正则的
   // 回溯最终仍能让 `QODERCN_*` 匹配成功（所以顺序错了也**暂时**看不出问题），
@@ -1255,7 +1295,7 @@ const ACCOUNT_REF_RE = new RegExp(
   `^(${REF_PREFIX_TO_PROVIDER
     .map(([prefix]) => prefix)
     .sort((a, b) => b.length - a.length)
-    .join('|')})_ACCOUNT_([0-9A-Fa-f]{6,})$`,
+    .join('|')})_ACCOUNT_([0-9A-Za-z_]{6,}|[0-9A-Za-z]*_[0-9A-Fa-f]{8})$`,
 )
 
 /**

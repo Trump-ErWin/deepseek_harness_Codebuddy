@@ -1553,7 +1553,22 @@ describe('TRAE 适配器 · 流内错误换号（真实缺陷回归）', () => {
    * —— 用户据此以为「额度用完了」，而真实成因是**该模型不被这个账号的套餐
    * 接受**（1005 = Plan 权益不足）。文案与码都锁住，避免以后悄悄改成别的说法。
    */
-  it('★ 全部账号被同一模型拒时的报错与用户所见一致（trae:  (code=1005)）', async () => {
+  /**
+   * ★ 用户**实际看到的那行字**（截图与宿主日志都是它）。
+   *
+   * ## 为什么码保留 `QUOTA_EXCEEDED`（2026-10-25 审计 B2 的 REFUTED）
+   *
+   * 1005 的真实含义是「该模型不被这个账号的套餐接受」，不是「额度耗尽」，
+   * 所以码本身**语义不准**。但审计实测证明**不能改码**：
+   * `account-probe.ts` 的 `isRateLimitFailure` 认 `QUOTA_EXCEEDED`/`QUOTA`，
+   * **不认** `PERMISSION_DENIED` ⇒ 改码会让面板「重测」从**「仍受限」退化为
+   * 「无法确认」**，用户会误以为凭据坏了去删号。两个码都不触发重试/压缩、
+   * 都不被客户端替换文案 ⇒ 改码**换不来任何用户可见改善**。
+   *
+   * ⇒ 修的是**文案**：裸 `trae:  (code=1005)` 对用户毫无指引力（他唯一能做
+   * 的动作是「换一个模型」，而原文一个字都没提）。码保持不动。
+   */
+  it('★ 全部账号被同一模型拒时：码保留 QUOTA_EXCEEDED，但文案必须给出「换模型」这条出路', async () => {
     const pool = {
       findAccountIdByCredential: async () => 'trae-1',
       updateModelRateLimit: vi.fn(async () => {}),
@@ -1568,10 +1583,152 @@ describe('TRAE 适配器 · 流内错误换号（真实缺陷回归）', () => {
     const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
 
     expect(error).toBeInstanceOf(Error)
-    // 冒号后**两个**空格：`message` 为空串被原样插进模板
-    expect((error as Error).message).toBe('trae:  (code=1005)')
+    const text = (error as Error).message
+    // 保留了上游原文与码（排查时要能对上游报文）
+    expect(text).toContain('(code=1005)')
+    // ⚠️ 枢轴：必须给出**可操作**的出路。1005 = 套餐不接受该模型 ⇒
+    // 用户能做的是换模型（不是签到、不是换号 —— 换号也是同一个模型被拒）。
+    expect(text).toContain('换一个模型')
+    // ⚠️ 不得把用户引向错误动作：签到/买额度对本错误无效
+    expect(text).not.toContain('签到')
+    expect(text).not.toContain('充值')
+    // 码不动（见上面注释里的 REFUTED 理由）
     expect((error as { code?: string }).code).toBe('QUOTA_EXCEEDED')
     expect(fetcher).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * ★★★ P0（2026-10-25 审计 B2）：已发出工具调用后**绝不允许整轮重发**。
+   *
+   * ## 为什么这是 P0 而不是「换号失效」
+   *
+   * 审计实测的后果链（三环都已独立复核）：
+   * 1. 重试循环在 `stream()` **内部** ⇒ harness 只看到**一条连续流**，
+   *    两次 attempt 的 chunk 会拼进**同一条 assistant 消息**；
+   * 2. `BlockAssembler.assembled()` **只在 `max-tokens` 时**丢弃 tool-call，
+   *    **不过滤**没有 `block-end` 的 partial
+   *    （`dsh-llm/lib/index.js` 的 `assembled()`）；
+   * 3. `dsh-agent-loop` 直接 `content.filter(b => b.type === 'tool-call')`
+   *    后 `executeToolCalls`，**零去重**。
+   *
+   * ⇒ attempt 1 已发出的 `tool-call-delta` 会变成**幽灵调用**：模型可能在
+   * 第二次 answer 里说「直接回答、不用跑命令」，而 harness 仍会执行第一轮
+   * 那个工具。分片中断时参数还可能是**截断的非法 JSON**。
+   *
+   * ⚠️ 修复前本用例**必须变红**（`fetcher` 会被调用 2 次）。这条路径此前
+   * **零守卫** —— 把缺陷真修掉，146 条既有 trae 用例仍然全绿。
+   */
+  it('★★★ P0：已发出 tool-call 后收到 1005 ⇒ 绝不重发（防幽灵工具调用）', async () => {
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: vi.fn(async () => ({
+        entry: { id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_2' },
+        credential: makeCredential({ access_token: 'AT2' }),
+      })),
+    }
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        // 第一个账号：先吐一个**名字可用**的工具调用（block-start + delta 已发），
+        // 然后同一轮里上游报 1005。
+        sseResponse(soloSse(
+          ['output', { tool_calls: [{ index: 0, id: 'call_a', function: { name: 'bash', arguments: '{"command":"rm -rf /tmp/victim"}' } }] }],
+          ['error', { code: 1005, message: '' }],
+        )),
+        // 若实现仍重发，就会吃掉这个响应 ⇒ 幽灵调用成立
+        sseResponse(soloSse(
+          ['output', { response: '我直接回答，不用跑命令。' }],
+          ['done', { finish_reason: 'stop' }],
+        )),
+      ],
+    })
+
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
+
+    // 枢轴断言 1：**绝不重发**。修复前这里是 2。
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    // 枢轴断言 2：如实抛错（而不是静默把两轮拼起来）
+    expect(error).toBeInstanceOf(Error)
+    // 枢轴断言 3：不得写冷却标记（本轮没有换号，标记无意义）
+    expect(vi.mocked(pool.updateModelRateLimit)).not.toHaveBeenCalled()
+  })
+
+  /**
+   * ★★★ 同上，但用 `reasoning_content`（思考分片）触发。
+   *
+   * 与工具调用分开测：两者走**不同**的 delta 字段，若实现只修了
+   * `tool_calls` 一处，这条会独立变红。
+   */
+  it('★★★ P0：已发出 reasoning 后收到 1005 ⇒ 同样绝不重发', async () => {
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: vi.fn(async () => ({
+        entry: { id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_2' },
+        credential: makeCredential({ access_token: 'AT2' }),
+      })),
+    }
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        sseResponse(soloSse(
+          ['output', { reasoning_content: '先想一下这个问题的要点……' }],
+          ['error', { code: 1005, message: '' }],
+        )),
+        sseResponse(soloSse(
+          ['output', { response: '不该出现的第二轮' }],
+          ['done', { finish_reason: 'stop' }],
+        )),
+      ],
+    })
+
+    await collect(adapter, BASIC_OPTIONS).catch(() => undefined)
+
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(pool.updateModelRateLimit)).not.toHaveBeenCalled()
+  })
+
+  /**
+   * ★★ P1（2026-10-25 审计 B2-5）：**撞到的最后一个账号也必须写冷却**。
+   *
+   * ## 缺陷
+   *
+   * 旧实现的 `rotateBudget <= 0 → throw` 排在 `updateModelRateLimit(...)`
+   * **之前** ⇒ 预算刚好用尽的那一次，当前账号**一个标记都不写**就抛出了。
+   * 用 3 个账号的池实测：第一轮只标了 2 个，要第二轮请求才补齐第 3 个 ⇒
+   * 那个账号下一次选号时没有任何标记可过滤，**立刻又被选回**。
+   *
+   * ## 判据
+   *
+   * 3 个账号全部被同一模型拒（每个都回 1005）⇒ 池里 3 个账号
+   * **全部**必须被 `updateModelRateLimit` 标记，一个不漏。
+   */
+  it('★★ P1：全池账号逐个撞限流 ⇒ 每一个都必须写冷却（含最后被抛出的那个）', async () => {
+    const marked: string[] = []
+    // ⚠️ 队列必须建在**回调外**：写在回调里会让每次调用都拿到同一个「第二个账号」，
+    //    于是第三发仍然打 trae-2，测不出「最后那个账号漏标」。
+    const remaining = [
+      { entry: { id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_2' }, credential: makeCredential({ access_token: 'AT2' }) },
+      { entry: { id: 'trae-3', credentialRef: 'TRAE_ACCOUNT_3' }, credential: makeCredential({ access_token: 'AT3' }) },
+    ]
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async (id: string) => { marked.push(id) }),
+      getAvailableAccount: async () => remaining.shift() ?? null,
+    }
+    const rejected = soloSse(['error', { code: 1005, message: '' }])
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [sseResponse(rejected), sseResponse(rejected), sseResponse(rejected)],
+    })
+
+    await collect(adapter, BASIC_OPTIONS).catch(() => undefined)
+
+    // 三个账号都被真实打到过（1 + 2 次换号）
+    expect(fetcher).toHaveBeenCalledTimes(3)
+    // 枢轴断言：3 个账号**全部**被标记。修复前只有 2 个（`trae-3` 漏标）。
+    expect(marked).toEqual(['trae-1', 'trae-2', 'trae-3'])
   })
 
   /**

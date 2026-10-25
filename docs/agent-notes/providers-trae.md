@@ -605,9 +605,23 @@ res.writeHead(400, ...); res.end(...); return   // ← 没有 resolve 也没有 
 用 `sawAnyUpstreamEvent` 标记是否收到过**任何**可解析事件，并在**一个都没有**时
 抛 `TRANSPORT`（可重试），由 `stream()` 重试**一次**。
 
-- ⚠️ **一旦已有 output / usage / tool_calls 事件就绝不重放**：重放会让上游
+- ⚠️ **一旦已向上游消费者发出过任何 chunk 就绝不重放**：重放会让上游
   **重复计费**，并可能**重复执行工具**（对齐 CN 项目的
   `TRAE_REMOTE_WORK_FALLBACK` 语义）
+
+  ⚠️⚠️ **判据是「已发出 chunk」，不是「已收到 output 事件」（2026-10-25 审计 P0 修复）**：
+  旧实现把 `gotAnyContent` **只在正文分片（`ev.response`）非空时**置真，于是
+  「已发出**思考**」与「已发出**工具调用**」两种情况仍被判成「尚未产出」⇒
+  流内 `event:error` 照样**换号重放**。而重试循环在 `stream()` **内部**，
+  harness 只看到**一条连续流** ⇒ 第一次 attempt 的 `tool-call-delta` 变成
+  **幽灵调用**：`BlockAssembler.assembled()` **只在 `max-tokens` 时**丢弃
+  tool-call（不过滤没有 `block-end` 的 partial），`dsh-agent-loop` 也**不去重**
+  ⇒ harness 会执行一个模型已经放弃的工具（分片中断时参数还可能是**截断的非法
+  JSON**）。真实后果：模型在第二轮说「直接回答、不用跑命令」，而工具仍被执行。
+  ⇒ 三个发射点（`text-delta` / `reasoning-delta` / `tool-call-delta`）**都**置真，
+  且只在**真正 yield 之后**（被 suppressor / 死循环守卫 / 空名字拦下的分片一个
+  chunk 都没发，重发不产生幽灵调用）。这条路径此前**零守卫** —— 把缺陷真修掉，
+  146 条既有 trae 用例仍然全绿。
 - ⚠️ **不能把空响应当成正常的空 finish**：那会让用户看到「模型回复为空」这种
   毫无线索的结果，且不触发任何重试
 
@@ -716,10 +730,27 @@ issue 是第三方实测，按本仓库规矩须用**自己的账号与 fixture*
 第二腿，于是走 `hard-plan(12h)`，**0ms 那条路径一次都没被走到**。新用例把
 `message` 置空，逐字复刻报障现场。
 
-⚠️ **仍未修（已登记）**：流内分支**没有** HTTP 层那条 `recordsTraeRateLimit(kind)`
-守卫（HTTP 层不记 `server`/`client` 的标记，流内会记）。本次刻意不动 —— 能走到该
-分支的码全来自 `TRAE_STREAM_ERROR_KINDS`、三类都该记，加守卫属**行为变更**，
-另开 PR 更清楚。
+⚠️ **已核实为不可达的伪问题**（2026-10-25 审计 B2-4）：流内分支「没有 HTTP 层那条
+`recordsTraeRateLimit(kind)` 守卫」曾被登记为未修项。但能走到该分支的码全来自
+`TRAE_STREAM_ERROR_KINDS`，而三类（`hard-plan`/`quota-exceeded`/`soft-rate`）
+**全部**在 `recordsTraeRateLimit` 的 true 集合里 ⇒ 加守卫后行为**逐字节不变**
+（审计实测：加上它，146 条 trae 用例全绿）。故不是遗留缺陷，**不要为它另开 PR**。
+
+### 2026-10-25 审计补齐（均已修 + 有守卫）
+
+| 项 | 缺陷 | 修法 |
+|---|---|---|
+| **最后一个账号漏标冷却（P1）** | `rotateBudget <= 0 → throw` 排在 `updateModelRateLimit` **之前** ⇒ 预算刚好用尽的那一次，当前账号**一个标记都不写**就抛出了。3 账号池实测第一轮只标 2 个，需第二轮才补齐 ⇒ 那个账号下次选号无标记可过滤、**立刻又被选回** | 把预算判断**移到标记之后**（先写冷却，再判预算） |
+| **表外码回落分支是死代码（P2）** | `classifyTraeStreamCode` 的「表外码 ⇒ `classifyTraeError(0, JSON.stringify({code,message}))`」在生成路径上**不可达**（唯一调用点前已被同一张表过滤），且它复活的正是「拿 JSON 喂文案表 ⇒ 判 `none` ⇒ 冷却 0ms」这个本 PR 要消灭的形态 | 改为**纯表查找**：表外码返回 `undefined`，由调用方用 `TRAE_RATE_LIMIT_FALLBACK_MS` 兜底；函数**删掉 `message` 参数**（留着会让人以为文案仍参与判据） |
+| **1005/4008 文案无指引力（P2）** | 上游 `message` 常为空串 ⇒ 用户只看到 `trae:  (code=1005)`，一个字都不指向他能做的事 | 1005 ⇒ 「套餐不包含模型 X，请换一个模型（被拒的是模型不是额度）」；4008 ⇒ 「今日额度已用尽，等重置或换模型/账号」。⚠️ **码保持 `QUOTA_EXCEEDED` 不动**（见下） |
+
+⚠️⚠️ **为什么 1005 的码不改（审计 B2 的 REFUTED，推翻了一个看起来更"正确"的建议）**：
+1005 的真实含义是「该模型不被这个账号的套餐接受」而非「额度耗尽」，所以码**语义不准**。
+但实测**不能改**：`account-probe.ts` 的 `isRateLimitFailure` 认 `QUOTA_EXCEEDED`/`QUOTA`、
+**不认** `PERMISSION_DENIED` ⇒ 改码会让面板「重测」从**「仍受限」退化为「无法确认」**，
+用户会误以为凭据坏了去删号。两个码都不触发重试/压缩、都不被客户端替换文案
+（`dsh-client-ui-chat` 的 `failureMessage` 只替换 `QUOTA`/`ACCOUNT_QUOTA`/`AUTH`/
+`INTERRUPTED`/`ACCOUNT_*`）⇒ 改码**换不来任何用户可见改善**。**修文案，别动码。**
 
 回归：`tests/unit/trae-errors.spec.ts` 六条（含「1005 的冷却必须是 12h」与「表外码
 回落文案表」）+ `tests/unit/trae-adapter.spec.ts` 两条（★ `message` 为空 ⇒ 12h；
@@ -1483,9 +1514,23 @@ res.writeHead(400, ...); res.end(...); return   // ← 没有 resolve 也没有 
 用 `sawAnyUpstreamEvent` 标记是否收到过**任何**可解析事件，并在**一个都没有**时
 抛 `TRANSPORT`（可重试），由 `stream()` 重试**一次**。
 
-- ⚠️ **一旦已有 output / usage / tool_calls 事件就绝不重放**：重放会让上游
+- ⚠️ **一旦已向上游消费者发出过任何 chunk 就绝不重放**：重放会让上游
   **重复计费**，并可能**重复执行工具**（对齐 CN 项目的
   `TRAE_REMOTE_WORK_FALLBACK` 语义）
+
+  ⚠️⚠️ **判据是「已发出 chunk」，不是「已收到 output 事件」（2026-10-25 审计 P0 修复）**：
+  旧实现把 `gotAnyContent` **只在正文分片（`ev.response`）非空时**置真，于是
+  「已发出**思考**」与「已发出**工具调用**」两种情况仍被判成「尚未产出」⇒
+  流内 `event:error` 照样**换号重放**。而重试循环在 `stream()` **内部**，
+  harness 只看到**一条连续流** ⇒ 第一次 attempt 的 `tool-call-delta` 变成
+  **幽灵调用**：`BlockAssembler.assembled()` **只在 `max-tokens` 时**丢弃
+  tool-call（不过滤没有 `block-end` 的 partial），`dsh-agent-loop` 也**不去重**
+  ⇒ harness 会执行一个模型已经放弃的工具（分片中断时参数还可能是**截断的非法
+  JSON**）。真实后果：模型在第二轮说「直接回答、不用跑命令」，而工具仍被执行。
+  ⇒ 三个发射点（`text-delta` / `reasoning-delta` / `tool-call-delta`）**都**置真，
+  且只在**真正 yield 之后**（被 suppressor / 死循环守卫 / 空名字拦下的分片一个
+  chunk 都没发，重发不产生幽灵调用）。这条路径此前**零守卫** —— 把缺陷真修掉，
+  146 条既有 trae 用例仍然全绿。
 - ⚠️ **不能把空响应当成正常的空 finish**：那会让用户看到「模型回复为空」这种
   毫无线索的结果，且不触发任何重试
 

@@ -7651,6 +7651,22 @@ function AggregatePanel({ rpcCall }) {
  * 「渠道原生搜索」开关取代（关闭途径仍有设置面板右上角的 × 与点击空白处）。
  * 将来若要做「从 Jet Hub 直接启动会话」，需要把它加回签名。
  */
+/**
+ * ⚠️ **仅供测试的逃生口**（2026-10-25 审计 P1-3）。
+ *
+ * `ProviderPanel` 是内部组件、原本不导出。而 2026-10-22 白屏事故的整条
+ * **接线层**（写入端归一化 + 渲染端读 `.details`）只有**行为级**守卫才拦得住
+ * —— 三条源码文本断言实测各有一个真实旁路（三元字面量 / `['length']` /
+ * `if (false)` 包归一化），三者同时注入时 41 条相关用例全绿。
+ *
+ * ⇒ 导出内部组件，让 `tests/unit/jet-hub-panel-wiring.spec.ts` 能用替身 React
+ * **真正渲染**它。这不是公共 API：客户端 bundle 内部使用，外部不要依赖。
+ *
+ * ⚠️ 与 `JetHubPage` 一起导出而不是拆文件：`ProviderPanel` 与它共享同一个
+ * 模块作用域里的 `PROVIDERS` / 十几个 provider 判据函数，拆出去会引入循环依赖。
+ */
+export const __providersPanelForTest = ProviderPanel;
+
 export function JetHubPage({ rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts

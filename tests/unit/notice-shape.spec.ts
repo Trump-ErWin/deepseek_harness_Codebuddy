@@ -30,10 +30,29 @@
  * | C | **源码级**：`jet-hub.js` 里不得再出现「裸字符串喂 setProbeNotice」 |
  * | D | **源码级**：渲染端不得再裸读 `probeNotice.details.length` |
  *
- * ⚠️ C/D 组是**源码断言**而非运行断言：单测环境是 `node`，`react` 是宿主注入
- * 的 external（`node_modules` 里没有），`jet-hub.js` 根本 import 不了，
- * 组件无法渲染。本仓库同款先例见 `tests/unit/new-account-dialog.spec.ts` 的
- * 「为什么 A 组一半靠源码断言」。
+ * ⚠️⚠️ **C/D 组只是辅助，不是这条防线的承重腿**（2026-10-25 审计 A3-1/B3）。
+ *
+ * 它们曾经声称「`jet-hub.js` 根本 import 不了，组件无法渲染」——**那是错的**：
+ * 本仓库 `tests/unit/jet-hub-tdz.spec.ts:99` 早就用 `vi.mock('react', …)` +
+ * 真实 `await import('../../plugin-src/client/jet-hub.js')` 跑过运行时渲染。
+ * 那个错误前提正当化了「接线层不用行为级测试」，而代价是实测出来的：
+ *
+ * | 旁路 | 形态 | 结果 |
+ * |---|---|---|
+ * | 三元字面量 | `setProbeNotice(x ? 'a' : 'b')` | C1 **漏检**（正则要求 `(` 后紧跟引号） |
+ * | 下标读取 | `probeNotice.details['length']` | D1 **漏检** |
+ * | 死分支包装 | `if (false) { setState(normalize(x)) }` | C2 **漏检**（`toMatch` 在死分支里照样命中） |
+ *
+ * 三者**同时**注入（= 完整白屏回归态）时，本文件 15 条 + 相关 26 条**全绿**，
+ * 而同一份代码执行时确实抛 `TypeError`。
+ *
+ * ⇒ **真正的守卫在 `tests/unit/jet-hub-panel-wiring.spec.ts`**（行为级：真渲染
+ * `ProviderPanel`、真调用 `useCallback` 传进来的回调、看写进 state 的形状）。
+ * 实测：该文件在 M22 完整回归态下**变红**，而本文件全绿。
+ *
+ * ⚠️ 还发现反向伤害：D1 抓不住 `['length']`，却会把**完全正确的等价重构**
+ * （内联 `Array.isArray(…)?…:[]`）判成**假红**。故 C/D 组保留只为「留下线索」，
+ * 判据强度以行为级那份为准。
  *
  * @see plugin-src/client/notice-shape.js
  */

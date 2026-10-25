@@ -89,30 +89,35 @@ describe('TRAE 错误分类', () => {
  * ⇒ 限流标记写在失败那一瞬间、下次选号**立刻又选回同一个号**。
  */
 describe('TRAE 流内结构化码分类（2026-10-24 真实报障回归）', () => {
-  it('1005 即使 message 为空也判 hard-plan（不再依赖 plan 关键词）', () => {
-    expect(classifyTraeStreamCode(1005, '')).toBe('hard-plan')
-    // message 缺省（本函数默认参数）时同样成立：上游省略 message 字段也走这条
+  it('1005 判 hard-plan（只查码表，不看 message）', () => {
     expect(classifyTraeStreamCode(1005)).toBe('hard-plan')
   })
 
   it('★ 1005 的冷却必须是 12h，绝不是 0ms（换号形同虚设的根因）', () => {
     // 旧实现：classifyTraeError(0, '{"code":1005,"message":""}') ⇒ 'none' ⇒ 0ms
-    expect(traeCooldownFor(classifyTraeStreamCode(1005, ''))).toBe(12 * 3_600_000)
+    expect(traeCooldownFor(classifyTraeStreamCode(1005)!)).toBe(12 * 3_600_000)
   })
 
   it('4008 / 4011 精确映射（与冷却表逐格对齐）', () => {
-    expect(classifyTraeStreamCode(4008, '')).toBe('quota-exceeded')
-    expect(traeCooldownFor(classifyTraeStreamCode(4008, ''))).toBe(24 * 3_600_000)
-    expect(classifyTraeStreamCode(4011, '')).toBe('soft-rate')
-    expect(traeCooldownFor(classifyTraeStreamCode(4011, ''))).toBe(60_000)
+    expect(classifyTraeStreamCode(4008)).toBe('quota-exceeded')
+    expect(traeCooldownFor(classifyTraeStreamCode(4008))).toBe(24 * 3_600_000)
+    expect(classifyTraeStreamCode(4011)).toBe('soft-rate')
+    expect(traeCooldownFor(classifyTraeStreamCode(4011))).toBe(60_000)
   })
 
-  it('表外码回落文案表（保持既有行为，不吞掉文案里的证据）', () => {
-    // 表外码 + 文案里有 `exceeded the quota` ⇒ 仍按文案判 quota-exceeded
-    expect(classifyTraeStreamCode(4006, 'exceeded the quota')).toBe('quota-exceeded')
-    // 表外码 + 文案无任何证据 ⇒ 'none'：不得凭空把任意码升级成权益不足
-    // （这正是文案表当初加 `plan` 关键词要防的事，见上面那条既有用例）
-    expect(classifyTraeStreamCode(4006, 'payload too large')).toBe('none')
+  it('表外码**没有类别**（不得回落文案表，也不得凭空升级）', () => {
+    // ⚠️ 2026-10-25 审计 F-02：旧实现的「表外码回落文案表」在生成路径上
+    // **不可达**（唯一的调用点前已被同一张表过滤），而它恰恰把 `{code,message}`
+    // 序列化成 JSON 再喂**文案表** —— 那是本 PR 要消灭的形态（旧缺陷正是
+    // 「拿 JSON 喂文案表 ⇒ 判 none ⇒ 冷却 0ms」）。死代码 + 复活旧形态 ⇒ 删掉。
+    //
+    // 新契约：**只认表**。表外码返回 `undefined`，由调用方决定兜底冷却，
+    // 绝不尝试从 `message` 文案里猜类别。
+    expect(classifyTraeStreamCode(4006)).toBeUndefined()
+    expect(classifyTraeStreamCode(4001)).toBeUndefined()
+    expect(classifyTraeStreamCode(9999)).toBeUndefined()
+    // 反向对照：表内码仍然必须给出类别（删回落不得连带削掉正路）
+    expect(classifyTraeStreamCode(1005)).toBe('hard-plan')
   })
 
   it('isRotatableTraeStreamCode：表内 3 个换号，4001 / 4006 刻意不换号', () => {
@@ -129,8 +134,9 @@ describe('TRAE 流内结构化码分类（2026-10-24 真实报障回归）', () 
     // 反向验证：把 isRotatableTraeStreamCode 改成查一张独立表，此用例仍可能绿 ⇒
     // 故这里同时断言「表内码的类别都该换号」，两腿一起钉住。
     for (const code of [1005, 4008, 4011]) {
-      const kind = classifyTraeStreamCode(code, '')
-      expect(shouldRotateTraeAccount(kind), String(code)).toBe(true)
+      const kind = classifyTraeStreamCode(code)
+      expect(kind, String(code)).toBeDefined()
+      expect(shouldRotateTraeAccount(kind!), String(code)).toBe(true)
       expect(isRotatableTraeStreamCode(code), String(code)).toBe(true)
     }
   })

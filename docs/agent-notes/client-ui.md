@@ -3129,3 +3129,119 @@ react 的客户端模块都**无法单测**。故把偏好状态拆成 `panel-en
 （`settings-card.js`）也只 import store。顺带避免了
 `panel-entry.js → jet-hub.js → panel-entry.js` 的循环。
 
+
+## ⚠️⚠️ `notice` 类状态必须是对象形状；**接线层的守卫只能靠行为级**（2026-10-22 报障 + 2026-10-25 审计）
+
+### 事故
+
+用户报障：**「魔搭社区的令牌我一保存，页面直接清空，切换页面无效，只能重启 dsh」**。
+
+根因（`ProviderPanel`）：渲染端按**对象**读三个字段
+
+```js
+'data-tone': probeNotice.tone,
+React.createElement('div', null, probeNotice.text),
+probeNotice.details.length > 0 ? … : null
+```
+
+而两处调用把 `probeNotice` 写成了**裸字符串**（`submitModelscopeKeyEdit` 的三元、
+`submitOpencodeEntry` 的 `res.existed` 分支）。字符串没有 `.details` ⇒
+`undefined.length` 抛 `TypeError` ⇒ React 卸载整棵设置页子树。
+
+修法是**三层**（真正的修复在源头，后两层是纵深）：
+
+1. 源头：两处调用改成 `{ tone, text, details: [] }`；
+2. 渲染端：`details` 过 `safeNoticeDetails()`（`Array.isArray` 保护）；
+3. 写入端：`setProbeNotice` 包装成经 `normalizeProbeNotice()` 归一。
+
+⚠️ 第 3 层**不能**用来解释「所以源头可以写错」：它防的是回归，不是免责。
+
+### ⚠️⚠️ 三条源码文本断言**各有真实旁路**（实测，别再重复）
+
+新增的 `tests/unit/notice-shape.spec.ts` C1/C2/D1 是源码文本断言。审计用**完整白屏
+回归态**实测：
+
+| 旁路 | 形态 | 为什么逃得掉 |
+|---|---|---|
+| 三元字面量 | `setProbeNotice(x ? 'a' : 'b')` | C1 正则要求 `(` 后**紧跟**引号 |
+| 下标读取 | `probeNotice.details['length']` | D1 只匹配 `.details.length` |
+| 死分支包装 | `if (false) { setState(normalize(x)) }` | C2 的 `toMatch` 在死分支里照样命中 |
+
+三者**同时**注入时，41 条相关用例**全绿**，而同一份代码执行时**确实抛**
+`TypeError: Cannot read properties of undefined (reading 'length')`（可执行证明）。
+
+⚠️ 还发现**反向伤害**：D1 抓不住 `['length']`，却会把**完全正确的等价重构**
+（内联 `Array.isArray(…) ? … : []`）判成**假红** ⇒ 既漏检又误伤。
+
+### ⚠️⚠️ 那个「无法行为级测试」的前提是**错的**（本次最贵的单条缺陷）
+
+三条断言曾经声称：「单测环境是 `node`，`react` 是宿主注入的 external，
+`jet-hub.js` **根本 import 不了**，组件无法渲染」。
+
+**这是假的** —— 仓库自己的 `tests/unit/jet-hub-tdz.spec.ts:99` 早就用
+`vi.mock('react', …)` 注入替身 + 真实 `await import('../../plugin-src/client/jet-hub.js')`
+跑过运行时渲染。那个错误前提**正当化**了「接线层不用行为级测试」，并让三条无牙断言
+看起来足够。
+
+⇒ 真正的守卫是 `tests/unit/jet-hub-panel-wiring.spec.ts`（**行为级**）：
+真渲染 `ProviderPanel`、把渲染时传进 `useCallback` 的每个回调**真调用**、喂一个
+裸字符串，然后断言 **state 里不得留下字符串**。实测：
+
+| 状态 | 本文件 | `jet-hub-panel-wiring.spec.ts` |
+|---|---|---|
+| 现实现 | 15 passed | 4 passed |
+| M22（三旁路同时注入） | **全绿** | **1 failed**（「有回调把裸字符串原样写进 state」） |
+
+**教训可推广**：用一个**未经验证的「无法测试」断言**去正当化弱判据，比没有判据更危险
+—— 它会让人停止寻找真正可行的测法。要断言「测不了」之前，先 grep 仓库里有没有
+**已经在测**的先例。
+
+### ⚠️ React 错误边界的能力边界（`plugin-src/client/error-boundary.js`）
+
+2026-10-24 真机实测（`window.onerror` 触发、容器内容不变、边界零介入）：错误边界
+**只捕获渲染期**（子组件渲染 / constructor / 生命周期）。以下四类**完全不受保护**：
+
+1. **事件回调里的异常**（`onClick` / `onChange`）—— React 不把它们算渲染期；
+2. **异步回调 / `await` 之后**（Promise、`setTimeout`、订阅回调）；
+3. **模块求值期（import 时）**—— 那时 React 还没开始渲染；
+4. **渲染进程级崩溃**。
+
+⇒ 反向推论同样重要：**不要把取数/解析逻辑挪进渲染路径**、**不要依赖边界去接住异步
+错误**。加边界只是把「一次失误 = 白屏」降级成「一次失误 = 一块报错」，**不是修复**。
+
+⚠️ fallback 自身**必须永不抛错**（否则 React 再卸一次树，边界与没有边界等价）：
+`error.message` 可能是**抛错的 getter**、`String(Object.create(null))` 会抛
+⇒ 文案计算全部收进 `describeThrown()`，三级降级各自包 `try`。
+⚠️ 判据不能用 `null` 当「没出错」的哨兵：`null` 是**合法抛出值**，
+`getDerivedStateFromError(null)` 返回 `{error:null}` ⇒ 边界**不产出 fallback**、
+容器被清空（真机实测，与没有边界同形）⇒ 用 `Symbol` 哨兵。
+
+### ⚠️⚠️ 宿主**本来就为每个 slot entry 自带错误边界**（别把归因写错）
+
+`@deepseek-ai/dsh-client-ui-renderer` 的 `SlotErrorBoundary` **从该包最早版本
+`0.1.0-rc.8`（2026-08-19）起**就为每个 slot entry 包裹（审计拉了 5 个历史版本实测：
+`0.1.0-rc.8` / `0.1.1-rc.1` / `0.1.2-rc.1` / `0.1.7-rc.2` / `0.2.0-rc.1` 全部有）。
+它渲染 `<div data-slot-error>` 并 `reportEntryError` 到插件运行状态页。
+
+⇒ **「插件内没有 ErrorBoundary ⇒ 整页清空」这条归因不成立**，写文档/复盘时不要这么写。
+
+那本插件的边界还有什么用？**三样**（都不是「防白屏」）：
+
+1. **可读的报错文案** —— 宿主的 crash face 是空元素 + 无文案，用户什么也看不到；
+2. ⚠️ **可恢复** —— 宿主对**非 chain** 槽会**abdicate**（`reportEntryError(…, {abdicate: kind !== 'chain'})`），
+   而失败记录只在**插件重载/卸载**时清除（`dsh-cordis-client-runner` 的 `this.failures.delete(...)`
+   分别发生在「装载成功」「teardown」「编排计划」三处，**视图切换路径上没有**）⇒
+   **切页不会恢复**；而插件内边界只覆盖**子树** ⇒ 重挂载即可恢复；
+3. **非 slot 路径**（例如 `JetHubMainPanel` 自己那层）。
+
+⚠️ 用户报障里的「切页无效」正是 abdicate 永久性造成的，**不需要**假设「宿主缺边界」。
+
+### ⚠️ fallback 的恢复路径：**「不必重启」是成立的**，但不要写成「已修好」
+
+宿主 `SettingsPanel` 在 `open === false` 时**整棵不挂载**（`open && <SettingsPanel>`），
+`main` 是 **keyed** 槽、靠 `entryKey` 切 key ⇒ 「关掉设置再打开」与「切走再切回」
+**都能恢复**。故 fallback 文案里的「不必重启」**不是虚假陈述**。
+
+⚠️ 但真实缺陷仍在（P2 级）：**恢复路径不可发现**。fallback 只写「已拦住，其余页面
+仍可正常使用」，没告诉用户「关掉这一节再打开就恢复」。⇒ 若要改，改的是**可发现性**
+（加一句「关掉再打开这一节即可恢复」或加重试按钮），**不是**「文案在撒谎」。

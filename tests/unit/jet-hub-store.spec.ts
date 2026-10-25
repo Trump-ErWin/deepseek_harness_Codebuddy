@@ -24,6 +24,7 @@ import {
   sanitizeProviderClosed,
   sanitizeProviderOrder,
   jetHubSchema as storeSchema,
+  providerOfAccountRef,
   sanitizePanelEntry,
   withAllowed,
   withoutAllowed,
@@ -650,6 +651,43 @@ describe('文件后端（FileStore）', () => {
 
     const recovered = createJetHubStore(makeCtx(undefined)).load()?.accounts ?? []
     expect(recovered.map(a => [a.credentialRef, a.provider])).toEqual(cases)
+  })
+
+  /**
+   * ★★ P2（2026-10-25 审计 A1-F4 / B1）：**归一化的 opencode ref 也必须能恢复**。
+   *
+   * ## 缺陷
+   *
+   * `ACCOUNT_REF_RE` 的尾段判据是 `[0-9A-Fa-f]{6,}`（**纯 hex**），而
+   * `opencode-rpc.ts` 在尾段含 `-`/`.` 时会生成
+   * `OPENCODE_ACCOUNT_<剥完非法字符>_<8 位 hex>` —— 尾段含 `_` ⇒ **永远不是纯 hex**
+   * ⇒ `providerOfAccountRef` 返回 `undefined`。后果有两层：
+   *
+   * 1. `state.json` 缺失（重装/迁移/profile 重建）时该账号**静默消失**
+   *    （凭据还在，索引建不出来，用户只能重新登录）；
+   * 2. ⚠️ **更严重**：`backup.ts` 的跨 provider 校验拿 `undefined` 时**放行**
+   *    （fail-open）⇒ 一份 `provider:'buddy'` 却引用 `OPENCODE_ACCOUNT_*` 的
+   *    备份会被**采纳**，而合法 hex 尾 ref 的同类误用会被拒。审计实测：
+   *    前者 `imported=1`、后者 `imported=0`。
+   *
+   * ## 修法
+   *
+   * 尾段放宽为「字母数字 + 可选的 `_<8 位 hex>` 后缀」。⚠️ **不能只放宽成
+   * `[0-9A-Za-z]{6,}` 就完事** —— 那仍然匹配不到 `…_<8HEX>` 这种**带下划线**的形态。
+   * 同时保留原有 hex 行为（存量 ref 的识别面**只增不减**）。
+   */
+  it('★★ P2：归一化 opencode ref（`…_<8HEX>`）必须被识别为 opencode 账号', () => {
+    const cases: Array<[string, string]> = [
+      ['OPENCODE_ACCOUNT_AAAABCD_6480DB97', 'opencode'],
+      ['OPENCODE_ACCOUNT__9ABB433E', 'opencode'],
+      ['OPENCODE_ACCOUNT_AAAAB_CD', 'opencode'],
+      // 存量合法形态必须继续可用（识别面只增不减）
+      ['OPENCODE_ACCOUNT_AAAAAA', 'opencode'],
+      ['CODEARTS_ACCOUNT_AAAAAA', 'codearts'],
+    ]
+    for (const [ref, provider] of cases) {
+      expect(providerOfAccountRef(ref), ref).toBe(provider)
+    }
   })
 
   /**

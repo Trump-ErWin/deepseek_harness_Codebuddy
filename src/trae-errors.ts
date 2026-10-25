@@ -149,7 +149,7 @@ const TRAE_STREAM_ERROR_KINDS: Readonly<Record<number, TraeErrorKind>> = {
 }
 
 /**
- * 按流内 `event:error` 的**结构化码**判定类别（码优先、文案兜底）。
+ * 按流内 `event:error` 的**结构化码**判定类别（**只查表，不猜文案**）。
  *
  * ## 为什么必须单独开一个入口，不能直接把它喂给 `classifyTraeError`
  *
@@ -171,19 +171,32 @@ const TRAE_STREAM_ERROR_KINDS: Readonly<Record<number, TraeErrorKind>> = {
  *   （`message` 为空 ⇒ 冒号后**两个空格**）并带 `'QUOTA_EXCEEDED'`，
  *   用户只看到「本轮运行失败」，而插件侧**一点退避都没有**。
  *
- * 故这里**码优先、文案兜底**：{@link TRAE_STREAM_ERROR_KINDS} 登记过的码直接
- * 给出类别（不要求 `plan` 关键词），表外的码回落文案表以保持既有行为。
- * 与本仓 `trae-credits.ts` 的 `200 + code === 1005` ⇒ `PlanLimit(12h)` 逐格
- * 一致 —— 那里同样**不要求** `plan` 关键词。
+ * 故这里**只认这张表**：{@link TRAE_STREAM_ERROR_KINDS} 登记过的码直接给出
+ * 类别（不要求 `plan` 关键词，也不看 `message`）。与本仓 `trae-credits.ts` 的
+ * `200 + code === 1005` ⇒ `PlanLimit(12h)` 逐格一致 —— 那里同样**不要求**
+ * `plan` 关键词。
+ *
+ * ## ⚠️ 表外码为什么返回 `undefined` 而不是回落文案表（2026-10-25 审计 F-02）
+ *
+ * 旧实现有「表外码 ⇒ `classifyTraeError(0, JSON.stringify({code,message}))`」
+ * 的回落腿，它有两个问题：
+ *
+ * 1. **在生成路径上不可达** —— 唯一的调用点（`trae-adapter.ts` 的换号循环）
+ *    前面已经用 {@link isRotatableTraeStreamCode}（**同一张表**）过滤过，
+ *    能走到分类的码必然在表内；
+ * 2. **它复活的正是本次要消灭的形态** —— 把 `{code,message}` 序列化成 JSON
+ *    再喂**文案表**，那个「JSON 里没有 `plan` 字样 ⇒ 判 `none` ⇒ 冷却 0ms」
+ *    的缺陷就是它造成的。
+ *
+ * ⇒ 死代码 + 复活旧缺陷形态，删掉。表外码由调用方决定兜底冷却
+ * （`trae-adapter.ts` 用 `TRAE_RATE_LIMIT_FALLBACK_MS`）。本函数也因此
+ * **不再需要 `message` 参数** —— 留着它只会让人以为文案仍参与判据。
  *
  * @param code 流内事件的 `code` 字段（结构化数值，**不做子串匹配**）
- * @param message 同一事件的 `message`；可能为空，仅参与表外码的文案兜底
+ * @returns 表内码的类别；**表外码返回 `undefined`**
  */
-export function classifyTraeStreamCode(code: number, message = ''): TraeErrorKind {
-  const known = TRAE_STREAM_ERROR_KINDS[code]
-  if (known !== undefined) return known
-  // 表外码：保持既有行为（拿 JSON 形态喂文案表）。
-  return classifyTraeError(0, JSON.stringify({ code, message }))
+export function classifyTraeStreamCode(code: number): TraeErrorKind | undefined {
+  return TRAE_STREAM_ERROR_KINDS[code]
 }
 
 /**
