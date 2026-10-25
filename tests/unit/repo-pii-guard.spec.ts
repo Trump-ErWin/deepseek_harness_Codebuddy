@@ -131,6 +131,18 @@ function trackedTextFilesIncludingTests(): Array<{ path: string; text: string }>
  */
 const PEM_PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g
 const SK_STYLE_KEY = /\bsk-[A-Za-z0-9_-]{16,}/g
+/**
+ * ⚠️ **`oc_sk_` 风格密钥**（2026-10-25 审计 A1-F8）。
+ *
+ * opencode 2026-10-22 起签发的 key 是 `oc_sk_…` 形态。本 PR 放宽了**入库闸门**
+ * （形状校验不再绑死 `sk-`），却**没有同步仓库卫生闸门** ⇒ 实测一条形态真实的
+ * `oc_sk_…` 在 `SK_STYLE_KEY` 下**零命中**，即「能被真 key 塞进凭据」而扫描器
+ * 一声不响。放宽入库面必须同步放宽泄漏面 —— 否则新形态的 key 泄漏是**静默的**。
+ *
+ * ⚠️ 与 `SK_STYLE_KEY` **并列而不是合并**：两者的前缀不同，合成一条正则会让
+ * 「只命中其一」的回归无法归因。
+ */
+const OC_SK_STYLE_KEY = /\boc_sk_[A-Za-z0-9_-]{16,}/g
 const JWT_TOKEN = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}/g
 
 /**
@@ -183,6 +195,10 @@ const CREDENTIAL_ASSIGNMENT = new RegExp(
 const CREDENTIAL_CONSTRUCTOR_SAMPLES: ReadonlySet<string> = new Set([
   // 本文件自证用的样例（必须能命中判据 ⇒ 证明判据有效）。
   'sk-abcdefghijklmnopqrstuvwx',
+  // ⚠️ **`oc_sk_` 新形态的自证样例**（2026-10-25 审计 A1-F8）：本文件用它验证
+  // `OC_SK_STYLE_KEY` 有牙。字符串本身是**手写的假值**（`1a2b3c4d5e6f` + 顺序字母
+  // `A1b2C3…`），不含任何真实凭据；与上一条 `sk-…` 样例同性质。
+  'oc_sk_1a2b3c4d5e6f_A1b2C3d4E5f6G7h8',
   'eyJhbGciOiJSUzI1NiIs.eyJzdWIiOiIxIn0.abcdef',
   '-----BEGIN RSA PRIVATE KEY-----',
   // 测试里的**带 test 字样**的构造值。
@@ -347,6 +363,18 @@ describe('仓库内不得残留真实个人敏感信息', () => {
     expect(hits, '发现 sk- 风格密钥 ⇒ 立刻移除并轮换该密钥').toEqual([])
   })
 
+  /** `oc_sk_` 风格密钥同样绝不入库（与上一条并列，见 `OC_SK_STYLE_KEY` 注释）。 */
+  it('入库文件里（含 tests/）没有 oc_sk_ 风格密钥', () => {
+    const hits: string[] = []
+    for (const { path, text } of ALL_FILES) {
+      for (const m of text.matchAll(OC_SK_STYLE_KEY)) {
+        if (CREDENTIAL_CONSTRUCTOR_SAMPLES.has(m[0])) continue
+        hits.push(`${path}: ${m[0].slice(0, 9)}…（第 ${text.slice(0, m.index).split('\n').length} 行）`)
+      }
+    }
+    expect(hits, '发现 oc_sk_ 风格密钥 ⇒ 立刻移除并轮换该密钥').toEqual([])
+  })
+
   /** JWT 形态的令牌绝不入库（同样连 `tests/` 一起扫）。 */
   it('入库文件里（含 tests/）没有 JWT 形态的令牌', () => {
     const hits: string[] = []
@@ -446,6 +474,11 @@ describe('仓库内不得残留真实个人敏感信息', () => {
   it('新增的判据在未脱敏前确实能命中', () => {
     expect('-----BEGIN RSA PRIVATE KEY-----'.match(PEM_PRIVATE_KEY)).not.toBeNull()
     expect('sk-abcdefghijklmnopqrstuvwx'.match(SK_STYLE_KEY)).not.toBeNull()
+    // ⚠️ 新形态判据必须自证有牙（否则「没发现泄漏」可能只是判据不认它）
+    expect('oc_sk_1a2b3c4d5e6f_A1b2C3d4E5f6G7h8'.match(OC_SK_STYLE_KEY)).not.toBeNull()
+    // 反向：`sk-` 判据**不得**把 `oc_sk_` 也当成命中（两者是不同形态，
+    // 归因要能分开；否则删掉 oc_sk_ 判据时这条自证仍绿 ⇒ 假绿）
+    expect('oc_sk_1a2b3c4d5e6f_A1b2C3d4E5f6G7h8'.match(SK_STYLE_KEY)).toBeNull()
     expect('eyJhbGciOiJSUzI1NiIs.eyJzdWIiOiIxIn0.abcdef'.match(JWT_TOKEN)).not.toBeNull()
     expect('accessKeySecret: \'zsak6eadrbawz683wf5r3m2snrwj868r\''.match(CREDENTIAL_ASSIGNMENT)).not.toBeNull()
   })

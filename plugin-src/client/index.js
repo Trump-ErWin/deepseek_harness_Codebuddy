@@ -86,6 +86,22 @@ import { startCarrierContribution } from './zcode-carrier.js'
 import { UsageBadge } from './usage-badge.js'
 import { registerJetHubPanelEntries } from './panel-entry.js'
 import { JetHubPanelEntryCard } from './settings-card.js'
+// ⚠️ 本文件注册的另外两处槽位也要包边界（2026-10-25 审计 A3-3）：
+// 2026-10-22 之前只有 `panel-entry.js` 那两处（main / settings.section）包了，
+// 而 `plugins.bundle.config` 与 `conversation.input.right` 注册的是**裸组件**
+// —— 任一处渲染期异常仍会整块消失（插件详情卡片 / 用量徽标）。
+import { withErrorBoundary } from './error-boundary.js'
+
+/**
+ * ⚠️ **模块级常量，不要在 `apply()` 或 `inject` 回调里新建**（2026-10-25 审计 A3-3）。
+ *
+ * `withErrorBoundary` 每次调用都产生一个**新的类**。若写在 `inject` 回调里，
+ * 宿主每次渲染都拿到新的组件类型 ⇒ React 把整棵子树卸载重挂 ⇒ 徽标/卡片内
+ * 所有本地状态（含「刚刚展开的详情」）每次都丢。`panel-entry.js` 那两处
+ * 已有同款注释与守卫（`panel-entry-wiring.spec.ts` 的 M21）。
+ */
+const JetHubPanelEntryCardGuarded = withErrorBoundary(JetHubPanelEntryCard, { label: '插件详情页卡片' })
+const UsageBadgeGuarded = withErrorBoundary(UsageBadge, { label: '用量徽标' })
 
 export function apply(ctx) {
   ctx.effect(() => installJetHubStyles(), 'jet-hub: install styles')
@@ -160,7 +176,7 @@ export function apply(ctx) {
     name: 'plugins.bundle.config',
     key: 'dsh-providers-hub',
     inject: () => ({ rpcCall }),
-  }, JetHubPanelEntryCard))
+  }, JetHubPanelEntryCardGuarded))
 
   /**
    * 模型选择器旁的**用量徽标**（`conversation.input.right`）。
@@ -257,5 +273,5 @@ export function apply(ctx) {
       claimCredits: (provider, runTasks, budgetMs) =>
         rpcCall('credits.claimAll', { provider, runTasks, budgetMs }),
     }),
-  }, UsageBadge))
+  }, UsageBadgeGuarded))
 }

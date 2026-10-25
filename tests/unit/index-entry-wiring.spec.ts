@@ -35,6 +35,30 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 
+/**
+ * ⚠️ **必须 mock `react`**（2026-10-25 审计 A3-3 后新增的依赖链）。
+ *
+ * `index.js` 现在 import `error-boundary.js`（因为它给
+ * `plugins.bundle.config` 与 `conversation.input.right` 两处槽位套了边界），
+ * 而那个文件 `import * as React from 'react'`。本仓库 devDependencies **没有
+ * react**（它是宿主注入的 external）⇒ 不 mock 就整份 spec 加载失败
+ * （`Cannot find package 'react'`），一条用例都跑不了。
+ *
+ * 替身只需最小面：本文件不渲染任何组件，只关心 `apply()` 有没有接线。
+ */
+vi.mock('react', () => ({
+  createElement: () => null,
+  Component: class {},
+  Fragment: 'Fragment',
+  StrictMode: 'StrictMode',
+  useState: (v) => [typeof v === 'function' ? v() : v, () => {}],
+  useRef: (v) => ({ current: v }),
+  useEffect: () => {},
+  useLayoutEffect: () => {},
+  useCallback: (fn) => fn,
+  useMemo: (fn) => fn(),
+}))
+
 // ── 注册器：本文件的被测对象是「有没有被调用」，故做成 spy ──
 const registerSpy = vi.hoisted(() => vi.fn())
 
@@ -76,9 +100,19 @@ const { apply } = await import('../../plugin-src/client/index.js')
 function makeCtx() {
   const effects = []
   const slotInjections = []
+  /**
+   * ⚠️ `inject` 的**回调**必须被记住（不能就地调用）：宿主只在**渲染该槽位时**
+   * 才求值它，而 `register` 只会在那之后被调用。故这里存 `{slot, callback}`，
+   * 由用例显式驱动 —— 与 `panel-entry-wiring.spec.ts` 同款。
+   */
+  const injections = []
+  /** `slots.register(spec, Component)` 的登记记录（用来断言注册的是哪个组件）。 */
+  const registrations = []
   return {
     effects,
     slotInjections,
+    injections,
+    registrations,
     ctx: {
       connection: { send: async () => ({}) },
       effect(callback, name) {
@@ -90,14 +124,21 @@ function makeCtx() {
       slots: {
         inject(slot, callback) {
           slotInjections.push(slot)
+          injections.push({ slot, callback })
           return () => {}
         },
-        register() {
+        register(spec, component) {
+          registrations.push({ slot: spec?.name, component })
           return () => {}
         },
       },
     },
   }
+}
+
+/** 取某几个槽位**真正被 register 的组件**（本文件断言边界包装的入口）。 */
+function slotsRegisteredFor(harness, slots) {
+  return harness.registrations.filter((r) => slots.includes(r.slot))
 }
 
 describe('index.js 接线（行为级）', () => {
@@ -123,6 +164,42 @@ describe('index.js 接线（行为级）', () => {
     const [passedCtx, passedRpcCall] = call
     expect(passedCtx, '注册器拿到的不是本插件的 ctx').toBe(ctx)
     expect(typeof passedRpcCall, '注册器没有拿到 rpcCall 函数').toBe('function')
+  })
+
+  /**
+   * ★★ P2（2026-10-25 审计 A3-3）：**四处槽位都必须注册「包了边界」的组件**。
+   *
+   * 2026-10-22 之前只有 `panel-entry.js` 的两处（`main` / `settings.section`）
+   * 包了边界，而本文件这两处（`plugins.bundle.config` 插件详情卡片、
+   * `conversation.input.right` 用量徽标）注册的是**裸组件** ⇒ 任一处渲染期
+   * 异常仍会整块消失。
+   *
+   * ## 判据为什么打在 `displayName` 上
+   *
+   * `withErrorBoundary` 会给边界类设 `displayName = withErrorBoundary(...)`
+   * （见 `error-boundary.js`）。而 `slots.register(…, Component)` 的**第二个
+   * 参数**就是被注册的组件 ⇒ 直接断言它的 `displayName` 含 `withErrorBoundary`。
+   *
+   * ⚠️ 这比「源码里有 `withErrorBoundary(`」强：后者在
+   * `if (false) { … }` 死分支里照样命中（本仓库已复发多次）。
+   * 这里断言的是**真正传给 `register` 的那个对象**。
+   */
+  it('★★ 两处裸组件槽位（插件详情卡片 / 用量徽标）也必须包错误边界', () => {
+    const harness = makeCtx()
+    apply(harness.ctx)
+    // 驱动这两个槽位的 inject 回调（宿主渲染时才这么做）
+    for (const { slot, callback } of harness.injections) {
+      if (slot === 'plugins.bundle.config' || slot === 'conversation.input.right') callback()
+    }
+
+    const guarded = slotsRegisteredFor(harness, ['plugins.bundle.config', 'conversation.input.right'])
+    expect(guarded, '这两个槽位没有被注册').toHaveLength(2)
+    for (const { slot, component } of guarded) {
+      expect(
+        String(component?.displayName ?? component?.name ?? ''),
+        `${slot} 注册的是裸组件 ⇒ 该槽位渲染期异常会让整块消失（应包 withErrorBoundary）`,
+      ).toContain('withErrorBoundary')
+    }
   })
 
   it('⚠️ 样式安装与载体贡献循环都已挂上（防止 effect 被整体删除）', () => {

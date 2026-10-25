@@ -605,9 +605,23 @@ res.writeHead(400, ...); res.end(...); return   // ← 没有 resolve 也没有 
 用 `sawAnyUpstreamEvent` 标记是否收到过**任何**可解析事件，并在**一个都没有**时
 抛 `TRANSPORT`（可重试），由 `stream()` 重试**一次**。
 
-- ⚠️ **一旦已有 output / usage / tool_calls 事件就绝不重放**：重放会让上游
+- ⚠️ **一旦已向上游消费者发出过任何 chunk 就绝不重放**：重放会让上游
   **重复计费**，并可能**重复执行工具**（对齐 CN 项目的
   `TRAE_REMOTE_WORK_FALLBACK` 语义）
+
+  ⚠️⚠️ **判据是「已发出 chunk」，不是「已收到 output 事件」（2026-10-25 审计 P0 修复）**：
+  旧实现把 `gotAnyContent` **只在正文分片（`ev.response`）非空时**置真，于是
+  「已发出**思考**」与「已发出**工具调用**」两种情况仍被判成「尚未产出」⇒
+  流内 `event:error` 照样**换号重放**。而重试循环在 `stream()` **内部**，
+  harness 只看到**一条连续流** ⇒ 第一次 attempt 的 `tool-call-delta` 变成
+  **幽灵调用**：`BlockAssembler.assembled()` **只在 `max-tokens` 时**丢弃
+  tool-call（不过滤没有 `block-end` 的 partial），`dsh-agent-loop` 也**不去重**
+  ⇒ harness 会执行一个模型已经放弃的工具（分片中断时参数还可能是**截断的非法
+  JSON**）。真实后果：模型在第二轮说「直接回答、不用跑命令」，而工具仍被执行。
+  ⇒ 三个发射点（`text-delta` / `reasoning-delta` / `tool-call-delta`）**都**置真，
+  且只在**真正 yield 之后**（被 suppressor / 死循环守卫 / 空名字拦下的分片一个
+  chunk 都没发，重发不产生幽灵调用）。这条路径此前**零守卫** —— 把缺陷真修掉，
+  146 条既有 trae 用例仍然全绿。
 - ⚠️ **不能把空响应当成正常的空 finish**：那会让用户看到「模型回复为空」这种
   毫无线索的结果，且不触发任何重试
 
@@ -676,6 +690,75 @@ ev.errorCode === 1005 || ev.errorCode === 4008 ? 'QUOTA_EXCEEDED' : 'SERVER'
 ⚠️ **仍未定值**：4006 的**归类**已修，但 trae 的 `imageMaxBytes` **仍未接** ——
 issue 是第三方实测，按本仓库规矩须用**自己的账号与 fixture** 复测后再定
 （入口 `pnpm test:e2e:image-bisect`，见 `protocol-wire.md` 的说明）。
+
+### ⚠️ 流内 `event:error` 的类别必须走**结构化码**入口，不能喂文案表（2026-10-24 真实报障）
+
+**现场**：用户只看到一行 `trae:  (code=1005)`（冒号后**两个空格**）+ 徽章
+`QUOTA_EXCEEDED`，两个 TRAE 账号同被同一模型（`kimi-k3.1-pro`）拒，而插件侧
+**一点退避都没有** —— 宿主日志 `~/.dsh/logs/desktop-next-*.jsonl` 的 `agent.failed`
+与 `[jet-hub] 已记录限流: 账号 <id> 模型 kimi-k3.1-pro 重置于 <失败同一秒>` 同时出现。
+
+**机制**：上游用 HTTP 200 + SSE `event:error` 下发 `code=1005`，而 **`message`
+是空串**。换号循环里拿 `JSON.stringify({ code, message })` 去喂 `classifyTraeError`
+⇒ 文案表的 `hard-plan` 还要求 `plan` 关键词（对齐 Go 端 `Classify`，且被
+`tests/unit/trae-errors.spec.ts` 显式锁死）⇒ 判成 `'none'` ⇒
+`traeCooldownFor('none')` = **0ms** ⇒ 限流标记写在**失败那一瞬间**、下次选号
+**立刻又选回同一个号**（换号形同虚设）；池里账号全被该模型拒后，外层如实抛
+`QUOTA_EXCEEDED`。
+
+**修法**：`src/trae-errors.ts` 新增**结构化码**入口（与文案表并列，同一张判据表
+不许两处各写一份）：
+
+| 流内码 | 类别 | 冷却 |
+|---|---|---|
+| `1005` | `hard-plan` | 12h（与 `trae-credits.ts` 的 `200 + code === 1005 ⇒ PlanLimit(12h)` 同值） |
+| `4008` | `quota-exceeded` | 24h |
+| `4011` | `soft-rate` | 60s |
+
+`classifyTraeStreamCode(code, message)` **码优先、文案兜底**（表外码仍喂文案表，
+保持既有行为）；`isRotatableTraeStreamCode(code)` 与它**共用同一张表** ——
+`trae-adapter.ts` 里那个本地 `isRotatableStreamError`（1005/4008/4011 硬编码）
+已删除，免得「可换号集合」与「类别表」两处漂移。
+
+⚠️ **为什么不改 `classifyTraeError` 本身**：① 它锁死了「仅 `{"code":1005}` 不判
+`hard-plan`」—— 正文里**恰好出现**的数字 `1005` 不算证据（同仓 `zcode-adapter.ts`
+的裸子串判据就因此把两个可用账号换掉过）；② 流内给的是**上游枚举码**，与响应体
+原文的可信度不同，故两个入口分开。
+
+⚠️ **它为什么能潜伏**：既有回归用例的夹具是
+`{ code: 1005, message: 'plan 权益不足' }` —— 那个 `plan` **恰好**满足了文案表的
+第二腿，于是走 `hard-plan(12h)`，**0ms 那条路径一次都没被走到**。新用例把
+`message` 置空，逐字复刻报障现场。
+
+⚠️ **已核实为不可达的伪问题**（2026-10-25 审计 B2-4）：流内分支「没有 HTTP 层那条
+`recordsTraeRateLimit(kind)` 守卫」曾被登记为未修项。但能走到该分支的码全来自
+`TRAE_STREAM_ERROR_KINDS`，而三类（`hard-plan`/`quota-exceeded`/`soft-rate`）
+**全部**在 `recordsTraeRateLimit` 的 true 集合里 ⇒ 加守卫后行为**逐字节不变**
+（审计实测：加上它，146 条 trae 用例全绿）。故不是遗留缺陷，**不要为它另开 PR**。
+
+### 2026-10-25 审计补齐（均已修 + 有守卫）
+
+| 项 | 缺陷 | 修法 |
+|---|---|---|
+| **最后一个账号漏标冷却（P1）** | `rotateBudget <= 0 → throw` 排在 `updateModelRateLimit` **之前** ⇒ 预算刚好用尽的那一次，当前账号**一个标记都不写**就抛出了。3 账号池实测第一轮只标 2 个，需第二轮才补齐 ⇒ 那个账号下次选号无标记可过滤、**立刻又被选回** | 把预算判断**移到标记之后**（先写冷却，再判预算） |
+| **表外码回落分支是死代码（P2）** | `classifyTraeStreamCode` 的「表外码 ⇒ `classifyTraeError(0, JSON.stringify({code,message}))`」在生成路径上**不可达**（唯一调用点前已被同一张表过滤），且它复活的正是「拿 JSON 喂文案表 ⇒ 判 `none` ⇒ 冷却 0ms」这个本 PR 要消灭的形态 | 改为**纯表查找**：表外码返回 `undefined`，由调用方用 `TRAE_RATE_LIMIT_FALLBACK_MS` 兜底；函数**删掉 `message` 参数**（留着会让人以为文案仍参与判据） |
+| **1005/4008 文案无指引力（P2）** | 上游 `message` 常为空串 ⇒ 用户只看到 `trae:  (code=1005)`，一个字都不指向他能做的事 | 1005 ⇒ 「套餐不包含模型 X，请换一个模型（被拒的是模型不是额度）」；4008 ⇒ 「今日额度已用尽，等重置或换模型/账号」。⚠️ **码保持 `QUOTA_EXCEEDED` 不动**（见下） |
+
+⚠️⚠️ **为什么 1005 的码不改（审计 B2 的 REFUTED，推翻了一个看起来更"正确"的建议）**：
+1005 的真实含义是「该模型不被这个账号的套餐接受」而非「额度耗尽」，所以码**语义不准**。
+但实测**不能改**：`account-probe.ts` 的 `isRateLimitFailure` 认 `QUOTA_EXCEEDED`/`QUOTA`、
+**不认** `PERMISSION_DENIED` ⇒ 改码会让面板「重测」从**「仍受限」退化为「无法确认」**，
+用户会误以为凭据坏了去删号。两个码都不触发重试/压缩、都不被客户端替换文案
+（`dsh-client-ui-chat` 的 `failureMessage` 只替换 `QUOTA`/`ACCOUNT_QUOTA`/`AUTH`/
+`INTERRUPTED`/`ACCOUNT_*`）⇒ 改码**换不来任何用户可见改善**。**修文案，别动码。**
+
+回归：`tests/unit/trae-errors.spec.ts` 六条（含「1005 的冷却必须是 12h」与「表外码
+回落文案表」）+ `tests/unit/trae-adapter.spec.ts` 两条（★ `message` 为空 ⇒ 12h；
+★ 用户所见文案逐字 `trae:  (code=1005)`）。
+⚠️ **已做反向验证**（逐条独立变异）：把换号循环改回「喂 JSON 给文案表」⇒ **1 条**
+变红，报错 `expected 0 to be greater than 39600000`；把 `1005` 从码表删掉 ⇒
+`trae-errors.spec.ts` **4 条**变红。两次变异后源文件哈希均与变异前一致
+（`src/trae-adapter.ts` `56CAA23D…`、`src/trae-errors.ts` `EFDCE7C5…`）。
 ### 机器指纹轮换默认**关闭**（`DSH_TRAE_ROTATE_MACHINE_ID`）
 
 CN 项目每 3~5 次请求主动换 `machine_id` 以「降低 IDE 端点风控」
@@ -1431,9 +1514,23 @@ res.writeHead(400, ...); res.end(...); return   // ← 没有 resolve 也没有 
 用 `sawAnyUpstreamEvent` 标记是否收到过**任何**可解析事件，并在**一个都没有**时
 抛 `TRANSPORT`（可重试），由 `stream()` 重试**一次**。
 
-- ⚠️ **一旦已有 output / usage / tool_calls 事件就绝不重放**：重放会让上游
+- ⚠️ **一旦已向上游消费者发出过任何 chunk 就绝不重放**：重放会让上游
   **重复计费**，并可能**重复执行工具**（对齐 CN 项目的
   `TRAE_REMOTE_WORK_FALLBACK` 语义）
+
+  ⚠️⚠️ **判据是「已发出 chunk」，不是「已收到 output 事件」（2026-10-25 审计 P0 修复）**：
+  旧实现把 `gotAnyContent` **只在正文分片（`ev.response`）非空时**置真，于是
+  「已发出**思考**」与「已发出**工具调用**」两种情况仍被判成「尚未产出」⇒
+  流内 `event:error` 照样**换号重放**。而重试循环在 `stream()` **内部**，
+  harness 只看到**一条连续流** ⇒ 第一次 attempt 的 `tool-call-delta` 变成
+  **幽灵调用**：`BlockAssembler.assembled()` **只在 `max-tokens` 时**丢弃
+  tool-call（不过滤没有 `block-end` 的 partial），`dsh-agent-loop` 也**不去重**
+  ⇒ harness 会执行一个模型已经放弃的工具（分片中断时参数还可能是**截断的非法
+  JSON**）。真实后果：模型在第二轮说「直接回答、不用跑命令」，而工具仍被执行。
+  ⇒ 三个发射点（`text-delta` / `reasoning-delta` / `tool-call-delta`）**都**置真，
+  且只在**真正 yield 之后**（被 suppressor / 死循环守卫 / 空名字拦下的分片一个
+  chunk 都没发，重发不产生幽灵调用）。这条路径此前**零守卫** —— 把缺陷真修掉，
+  146 条既有 trae 用例仍然全绿。
 - ⚠️ **不能把空响应当成正常的空 finish**：那会让用户看到「模型回复为空」这种
   毫无线索的结果，且不触发任何重试
 

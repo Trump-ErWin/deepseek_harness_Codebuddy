@@ -120,6 +120,20 @@ function collectText(node, out = []) {
   return out
 }
 
+/** 深度优先找一个满足判据的元素节点（用于断言「fallback 里有可点的按钮」）。 */
+function findElement(node, predicate) {
+  if (node === null || node === undefined || typeof node !== 'object') return undefined
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = findElement(child, predicate)
+      if (hit !== undefined) return hit
+    }
+    return undefined
+  }
+  if (predicate(node)) return node
+  return findElement(node.props?.children, predicate)
+}
+
 describe('withErrorBoundary', () => {
   it('正常时原样渲染被保护的组件（不吞掉正常输出）', async () => {
     const { withErrorBoundary } = await loadWithFakeReact()
@@ -336,6 +350,42 @@ describe('withErrorBoundary', () => {
     const instance = new Guarded({})
     instance.setState(Guarded.getDerivedStateFromError(new Error('x')))
     expect(collectText(instance.render()).join(' | ')).toContain('这个面板')
+  })
+
+  /**
+   * ★★ P2（2026-10-25 审计 A3-2 / B3）：fallback 必须给出**可自我恢复**的出路。
+   *
+   * ## 真实约束（审计实测，两边都要满足）
+   *
+   * 1. fallback 是**粘性**的：无 `key`、无 `componentDidUpdate` 重置 ⇒ 一旦进
+   *    error，**同一实例**永远渲染 fallback（数据恢复了也不回来）；
+   * 2. 但用户**不需要重启**：宿主 `SettingsPanel` 在 `open === false` 时整棵不挂载、
+   *    `main` 是 keyed 槽 ⇒ **「关掉设置再打开」/「切走再切回」都能恢复**。
+   *
+   * ⇒ 故「不必重启」这句**是成立的**，但**恢复路径不可发现**才是真缺陷：
+   * 用户看到一块报错，不知道「关掉再打开」就能好，只能去重启。
+   *
+   * 修法：fallback 里加一个**重试按钮**（`setState` 回 `NO_ERROR`，就地重挂载
+   * 子树），并把恢复路径写出来。本用例锁这两件事。
+   */
+  it('★★ P2：fallback 提供「重试」按钮并可就地恢复（不必重启，且路径可发现）', async () => {
+    const { withErrorBoundary } = await loadWithFakeReact()
+    const Inner = () => null
+    const Guarded = withErrorBoundary(Inner, { label: '可恢复面板' })
+    const instance = new Guarded({})
+    instance.setState(Guarded.getDerivedStateFromError(new Error('boom')))
+
+    const rendered = instance.render()
+    const flat = collectText(rendered).join(' | ')
+    // ① 可发现：必须告诉用户怎么恢复（关掉再打开 / 点重试）
+    expect(flat, 'fallback 没有告诉用户如何恢复').toMatch(/重试|关掉|重新打开/)
+
+    // ② 可操作：必须真的有一个按钮，且点了能回到「没出错」状态
+    const button = findElement(rendered, (el) => el.props?.onClick !== undefined)
+    expect(button, 'fallback 没有任何可点击元素 ⇒ 用户无从恢复').toBeDefined()
+    button!.props.onClick()
+    // 恢复后必须重新渲染 Inner（而不是仍显示 fallback）
+    expect(collectText(instance.render()).join(' | ')).not.toContain('已拦住')
   })
 
   it('displayName 可辨认（调试面板里能看出是哪一层的边界）', async () => {

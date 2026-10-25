@@ -159,6 +159,30 @@ export function withErrorBoundary(Inner, options) {
       },
         React.createElement('div', null, `${label}渲染失败，已拦住 —— 其余页面仍可正常使用，不必重启。`),
         React.createElement('div', { style: { marginTop: '6px', fontFamily: 'monospace', fontSize: '12px' } }, message),
+        // ⚠️ **必须给出可自我恢复的出路**（2026-10-25 审计 A3-2）。
+        //
+        // 本 fallback 是**粘性**的：没有 `key`、也没有 `componentDidUpdate`
+        // 重置 ⇒ 同一实例一旦进 error 就永远显示 fallback（数据恢复了也不回来）。
+        // 审计实测：数据恢复后仍显示 fallback，只有**新建实例**才恢复。
+        //
+        // 而用户其实**不必重启**：宿主 `SettingsPanel` 在 `open === false` 时整棵
+        // 不挂载、`main` 是 keyed 槽 ⇒「关掉设置再打开」/「切走再切回」都能恢复。
+        // 但**这条路径不可发现** —— 用户看到一块报错，不知道关掉再打开就能好。
+        //
+        // ⇒ 两件事：①给一个**就地重试**（`setState` 回 `NO_ERROR`，子树随即重挂载，
+        // 比让用户摸索「关掉再打开」快得多）；②把那条路径**写出来**当兜底。
+        React.createElement('div', { style: { marginTop: '8px' } },
+          React.createElement('button', {
+            type: 'button',
+            className: 'dim-jh-btn',
+            onClick: () => {
+              // ⚠️ 只重置错误状态，**不**清其它 state：子树会重新渲染，
+              //    若缺陷仍在就再进一次 error（可接受，用户能再点一次）。
+              this.setState({ error: NO_ERROR });
+            },
+          }, '重试'),
+          React.createElement('span', { style: { marginLeft: '8px', opacity: 0.75 } },
+            '也可以关掉这一节再重新打开（或切到别的页面再切回来）来恢复。')),
         React.createElement('div', { style: { marginTop: '6px' } },
           '这是插件的缺陷，不是你操作错了。把上面这行报错连同「当时点了什么」一起反馈即可。'));
     }
