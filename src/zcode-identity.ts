@@ -99,16 +99,35 @@ export interface ZcodeTextBlock {
  * block[0] = cliPrefix（42 字符）          ← 准入必需
  * block[1] = stable（2590 字符）           ← 准入必需
  * block[2] = "# Environment" 段
- * block[3..] = 调用方的 system（追加在最后）
  * ```
  *
- * ⚠ **调用方内容必须追加在最后** —— 官方身份块必须处在开头位置
- * （上游的检查看的是前缀结构）。
+ * ⚠ **恒为 3 块，绝不多也不少。**
  *
- * ⚠ 每个块都带 `cache_control: {type:'ephemeral'}`（官方如此，
- * 且利于上游缓存命中）。
+ * ## ★ 为什么不把调用方的 system 追加进来（2026-10-25 实测修复）
  *
- * @param callerSystem 调用方的 system（DSH 的完整 prompt / AGENTS.md 规则）
+ * 本函数**此前**会把 `callerSystem` 追加成 `block[3]`，注释里写的理由是
+ * 「官方身份块必须处在开头位置」。**那个理由是错的** —— 上游的判据不是
+ * 「身份块在开头」，而是「**system 数组的形状像不像官方客户端**」。
+ *
+ * 三轮对照实验（同一时间、同一账号、同一 URL 与全部 18 个请求头，
+ * 只改请求体）：
+ *
+ * | system 块数 | 请求体 | 结果 |
+ * |---|---|---|
+ * | 3 块 `42 + 2590 + 253` | 只有一句话 | **HTTP 200** |
+ * | 4 块（第 4 块 = caller system） | 同上 | **HTTP 405 + 3012** |
+ * | 3 块（caller system 改放进 messages） | 同上 | **HTTP 200** |
+ *
+ * 追加的第 4 块**与它的长度无关**：2 062 字符照样 405，25 428 字符也 405 ——
+ * 只要它在，就 405。而把它挪进首轮 user 消息后，模型**照样读到了**那段约定
+ * （实测 thinking 里明确复述「The user has set up a workspace convention
+ * specifying Simplified Chinese」），**功能没有任何损失**。
+ *
+ * ⇒ 结论：**调用方内容走 messages，system 恒为官方的 3 类。**
+ * 注入见 {@link withCallerSystem}。
+ *
+ * ⚠ 只有**最后一块**带 `cache_control: {type:'ephemeral'}`。
+ *
  * @param options.cwd  工作目录。
  *        官方实现声明「cwd is never "unknown" in real traffic」，
  *        故调用方必须给真值。
@@ -116,7 +135,6 @@ export interface ZcodeTextBlock {
  * @param options.model 模型名（进 environment 段的 poweredByLine）。
  */
 export function buildZcodeSystemBlocks(
-  callerSystem: string | undefined,
   options: {
     cwd: string
     provider?: string
@@ -132,9 +150,6 @@ export function buildZcodeSystemBlocks(
     { type: 'text', text: stable },
     { type: 'text', text: buildEnvironmentSection(options) },
   ]
-  if (typeof callerSystem === 'string' && callerSystem.trim().length > 0) {
-    blocks.push({ type: 'text', text: callerSystem })
-  }
   /**
    * ★ **只在最后一块**打 prompt caching 断点（2026-09-30 调整；此前是每块都打）。
    *
@@ -270,6 +285,9 @@ function startsWithSystemReminder(content: unknown): boolean {
  * - 只处理第一条消息，且它必须是 `role === 'user'`
  * - **幂等**：已以 `<system-reminder>` 开头则不重复插
  * - 纯文本 content 会被转成块数组（官方就是数组形态）
+ *
+ * ⚠ `callerSystem` 见 {@link withCallerSystem} —— 它同样插在首轮 user 消息上，
+ * 但**排在日期块之后**（官方形态是日期块打头）。
  */
 export function withContextPrefix<T extends { role: string; content: unknown }>(
   messages: readonly T[],
@@ -288,6 +306,52 @@ export function withContextPrefix<T extends { role: string; content: unknown }>(
     first.content = [prefix, { type: 'text', text: content }]
   } else {
     first.content = [prefix]
+  }
+  return out
+}
+
+/**
+ * 把调用方的 system（DSH 的完整 prompt / AGENTS.md 规则）作为**首轮 user
+ * 消息的一个 text 块**注入。
+ *
+ * ## ★ 为什么不放进 `system` 数组（2026-10-25 实测）
+ *
+ * 见 {@link buildZcodeSystemBlocks} 头注释的对照实验表：把调用方内容追加成
+ * `system[3]` 会让请求**必然**收到 `405 + 3012 unusual activity`，
+ * 而与它多长无关（2 KB 与 25 KB 一样 405）；改成注入 messages 后同一请求
+ * **200**，且模型照样遵循了那段约定。
+ *
+ * ## 形态（与日期块同族的做法）
+ *
+ * - 插到**首轮 user 消息** `content` 数组的**末尾之后**（若已有日期块，
+ *   排在它后面；否则排在最前）
+ * - 纯文本 content 转成块数组
+ * - `role !== 'user'` 或无消息时**原样返回**（不抛错）
+ * - 空 / 纯空白 ⇒ 原样返回（不塞空块）
+ * - **幂等**：调用方内容已存在则不重复插
+ */
+export function withCallerSystem(
+  messages: readonly Record<string, unknown>[],
+  callerSystem: string | undefined,
+): Array<Record<string, unknown>> {
+  const out = messages.map((message) => ({ ...message }))
+  if (typeof callerSystem !== 'string' || callerSystem.trim().length === 0) return out
+  const first = out[0]
+  if (first === undefined || first.role !== 'user') return out
+
+  const block: ZcodeTextBlock = { type: 'text', text: callerSystem }
+  const content = first.content
+  if (Array.isArray(content)) {
+    const already = content.some(
+      (item) => (item as { text?: unknown } | undefined)?.text === callerSystem,
+    )
+    if (already) return out
+    first.content = [...content, block]
+  } else if (typeof content === 'string') {
+    if (content === callerSystem) return out
+    first.content = [{ type: 'text', text: content }, block]
+  } else {
+    first.content = [block]
   }
   return out
 }

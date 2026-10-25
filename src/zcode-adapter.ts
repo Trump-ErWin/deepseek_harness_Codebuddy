@@ -79,6 +79,7 @@ import {
 } from './zcode-transport.js'
 import {
   buildZcodeSystemBlocks,
+  withCallerSystem,
   withContextPrefix,
 } from './zcode-identity.js'
 import {
@@ -919,8 +920,17 @@ export class ZcodeAdapter extends LlmAdapter {
      *   - `tools` 是**扁平** `input_schema` 形态（不是 OpenAI 的嵌套 `function`）
      */
     const wire = serializeMessages(options.messages, imageUrls)
-    const messages = withContextPrefix(toAnthropicMessages(wire))
-    const system = buildZcodeSystemBlocks(options.system, {
+    /**
+     * ⚠ **`options.system` 不进 `system`，而是注入首轮 user 消息**
+     * （2026-10-25 实测修复）：追加成 `system[3]` 会让请求**必然**收到
+     * `405 + 3012`，与它多长无关。详见 `zcode-identity.ts` 的
+     * `buildZcodeSystemBlocks` 头注释对照实验表。
+     */
+    const messages = withCallerSystem(
+      withContextPrefix(toAnthropicMessages(wire)),
+      options.system,
+    )
+    const system = buildZcodeSystemBlocks({
       cwd: process.cwd(),
       provider: this.product.id,
       model: options.model,

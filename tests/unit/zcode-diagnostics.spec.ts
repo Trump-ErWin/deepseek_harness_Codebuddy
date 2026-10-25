@@ -24,7 +24,7 @@ import {
   noteZcodeRequestSent,
   resetZcodeDiagnostics,
 } from '../../src/zcode-diagnostics.js'
-import { buildZcodeSystemBlocks, withContextPrefix } from '../../src/zcode-identity.js'
+import { buildZcodeSystemBlocks, withCallerSystem, withContextPrefix } from '../../src/zcode-identity.js'
 import { describeUpstreamError, httpErrorCodeForZcode } from '../../src/zcode-adapter.js'
 
 /** 源码接线断言用（与 `zcode-captcha-upfront.spec.ts` 同一套定位法）。 */
@@ -37,12 +37,16 @@ function stripComments(source: string): string {
 
 /** 走真实构造路径拿一份请求体形态（与 `stream()` 里用的是同一批函数）。 */
 function realShape(): ReturnType<typeof describeZcodeRequestShape> {
-  const system = buildZcodeSystemBlocks('You are DSH, a coding agent.', {
+  const system = buildZcodeSystemBlocks({
     cwd: process.cwd(),
     provider: 'zcode',
     model: 'GLM-5.3-Flash',
   })
-  const messages = withContextPrefix([{ role: 'user', content: '你好' }])
+  // ⚠ 调用方 system 注入 messages（不进 system 数组）—— 2026-10-25 实测修复。
+  const messages = withCallerSystem(
+    withContextPrefix([{ role: 'user', content: '你好' }]),
+    'You are DSH, a coding agent.',
+  )
   return describeZcodeRequestShape(system, messages)
 }
 
@@ -97,7 +101,7 @@ describe('ZCode 3012 可观测诊断（issue IKJI0Y）', () => {
 
     it('日期块有无被如实识别（去掉日期块即报「无」）', () => {
       const without = describeZcodeRequestShape(
-        buildZcodeSystemBlocks(undefined, { cwd: '.' }),
+        buildZcodeSystemBlocks({ cwd: '.' }),
         [{ role: 'user', content: '裸文本' }],
       )
       expect(without.hasDateBlock).toBe(false)
